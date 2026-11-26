@@ -1259,17 +1259,26 @@ export class Store {
   private initConfirmationGuards() {
     if (!this.tableExists('findings') || !this.tableExists('replay_specs')) return
     const guard = (name: string, event: 'INSERT' | 'UPDATE OF verification_class, replay_spec_id, finding, verification_tier') => `
-      CREATE TRIGGER IF NOT EXISTS ${name}
+      DROP TRIGGER IF EXISTS ${name};
+      CREATE TRIGGER ${name}
       BEFORE ${event} ON findings
       WHEN NEW.verification_class = 'runtime_confirmed'
         AND json_extract(NEW.finding, '$.status') = 'confirmed'
         AND coalesce(NEW.finding_kind, '') <> 'baseline_check'
         AND coalesce(NEW.verification_tier, json_extract(NEW.finding, '$.verificationTier'), '') <> 'baseline_confirmed'
-        AND coalesce(json_extract(NEW.finding, '$.verification'), '') NOT LIKE 'ProofReceipt%'
         AND NOT EXISTS (
           SELECT 1 FROM replay_specs s
           WHERE s.id = NEW.replay_spec_id
-            AND json_extract(s.last_verification_diff, '$.verdict') = 'confirmed'
+            AND (
+              json_extract(s.last_verification_diff, '$.verdict') = 'confirmed'
+              OR (
+                json_extract(s.last_verification_diff, '$.verdict') IS NULL
+                AND (
+                  json_extract(s.proof_receipt, '$.verification.confirmed') = 1
+                  OR json_extract(s.proof_receipt, '$.compositeVerification.confirmed') = 1
+                )
+              )
+            )
         )
         ${this.tableExists('events') ? `AND NOT EXISTS (
           SELECT 1 FROM events e

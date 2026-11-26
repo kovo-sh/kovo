@@ -5,6 +5,7 @@ import { useEffect, useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
 import { canReviewScope, maxBudgetRequests, maxRpsPerOriginCeiling, maxScopeHosts } from '../../../domain.ts'
 import type { ApprovalPolicy, CapabilityTier } from '../../../domain.ts'
+import { publicSuffixRules } from '../../../server/public-suffix-list.ts'
 import { approvalPolicyMeta, capabilityTierMeta } from '../../run-state.ts'
 import { Dialog, DialogContent, DialogTitle } from '../../ui/dialog.tsx'
 import { useRun } from '../data.tsx'
@@ -48,6 +49,273 @@ interface Draft {
   maxRpsPerOrigin: number
 }
 
+const PSL_RULES: ReadonlySet<string> = new Set(
+  publicSuffixRules
+    .split('\n')
+    .map(line => line.trim())
+    .filter(Boolean),
+)
+
+const PSL_ICANN_GENERIC_MULTI_TLDS = new Set(['aero', 'arpa', 'edu', 'gov', 'int', 'mil', 'museum', 'pro'])
+const PSL_ICANN_CC_SLDS = new Set([
+  'co', 'com', 'net', 'org', 'gov', 'edu', 'ac', 'mil', 'int', 'sch', 'ltd', 'plc',
+  'go', 'or', 'ne', 'ed', 'ad', 'gr', 'lg', 'gob', 'gouv', 'asso', 'tm', 'nom', 'name',
+  'info', 'biz', 'pro', 'id', 'me', 'med', 'art', 'firm', 'store', 'web', 'rec', 'ind',
+  'gen', 'cri', 'geek', 'school', 'govt', 'health', 'parliament', 'nhs', 'police', 'mod',
+  'nic', 'coop', 'ngo', 'priv', 'presse', 'asn', 'conf', 'oz', 'csiro', 'iwi', 'maori', 'kiwi',
+  'k12', 'lib', 'cc', 'fed', 'isa', 'nsn', 'dni', 'museum', 'law', 'eng', 'vet', 'bio', 'agr',
+  'adm', 'adv', 'am', 'arq', 'ato', 'bmd', 'cim', 'cng', 'cnt', 'ecn', 'esp', 'etc', 'eti',
+  'far', 'flog', 'fm', 'fnd', 'fot', 'fst', 'g12', 'ggf', 'imb', 'inf', 'jor', 'jus', 'leg',
+  'lel', 'mat', 'mp', 'mus', 'not', 'ntr', 'odo', 'ppg', 'psc', 'psi', 'qsl', 'radio', 'slg',
+  'srv', 'taxi', 'teo', 'tmp', 'trd', 'tur', 'tv', 'vlog', 'wiki', 'zlg', 'in', 'ai', 'sc',
+  'act', 'nsw', 'nt', 'qld', 'sa', 'tas', 'vic', 'wa', 'ab', 'bc', 'mb', 'nb', 'nf', 'nl',
+  'ns', 'nu', 'on', 'pe', 'qc', 'sk', 'yk', 'pp', 'spb', 'msk', 'its', 'res', 'sld', 'fin',
+  'per', 'nat', 'pol', 'soc', 'sci', 'tec', 'ong', 'red', 'gub', 'city', 'pref', 'metro',
+  'state', 'council', 'service', 'api', 'campaign',
+])
+const PSL_COMMERCIAL_CC_SLDS = new Set(['co', 'com', 'net', 'org', 'biz', 'info', 'web', 'me', 'nom', 'name'])
+const PSL_GEO_CCTLDS = new Set([
+  'jp', 'no', 'it', 'pl', 'ua', 'cn', 'us', 'ru', 'br', 'kr', 'tw', 'au', 'ca', 'in', 'za', 'nz',
+  'ar', 'mx', 'cl', 'pe', 've', 'id', 'my', 'ph', 'th', 'vn', 'tr', 'il', 'sa', 'ae', 'eg', 'ng',
+  'ke', 'gr', 'es', 'fr', 'de', 'nl', 'be', 'ch', 'at', 'se', 'dk', 'fi', 'ie', 'pt', 'hu', 'ro',
+  'bg', 'hr', 'si', 'sk', 'cz', 'ee', 'lv', 'lt', 'by', 'kz',
+])
+const PSL_MUNICIPAL_CCTLDS = new Set(['jp', 'no', 'it', 'pl', 'ua'])
+const PSL_GOV_EDU_SLDS = new Set(['gov', 'edu', 'ac', 'mil', 'sch', 'gob', 'gouv', 'k12', 'lg', 'city', 'pref', 'state'])
+const PSL_GOV_EDU_SUBLABELS = new Set([
+  'service', 'api', 'campaign', 'k12', 'lib', 'cc', 'city', 'pref',
+  'nsw', 'vic', 'qld', 'wa', 'sa', 'tas', 'act', 'nt', 'gov', 'edu', 'ac',
+])
+const PSL_SUPPLEMENTAL_MULTI_TENANT_ROOTS = ['amazonaws.com', 'railway.app', 'glitch.me']
+
+function isPrivatePslRule(rule: string): boolean {
+  if (rule.startsWith('!')) return false
+  const isWild = rule.startsWith('*.')
+  const bare = isWild ? rule.slice(2) : rule
+  const labels = bare.split('.')
+  if (labels.length < 2) return false
+  const tld = labels[labels.length - 1]!
+  if (tld.length > 2 && !tld.startsWith('xn--')) return !PSL_ICANN_GENERIC_MULTI_TLDS.has(tld)
+  if (tld.startsWith('xn--')) return labels.length > 2
+  if (isWild) {
+    const sld = labels[labels.length - 2]!
+    return !(PSL_ICANN_CC_SLDS.has(sld) && !PSL_COMMERCIAL_CC_SLDS.has(sld))
+  }
+  if (labels.length === 2) {
+    const sld = labels[0]!
+    if (PSL_ICANN_CC_SLDS.has(sld)) return false
+    if (sld.length === 2 && PSL_GEO_CCTLDS.has(tld)) return false
+    if (PSL_MUNICIPAL_CCTLDS.has(tld)) return false
+    return true
+  }
+  const sld = labels[labels.length - 2]!
+  if (PSL_COMMERCIAL_CC_SLDS.has(sld)) return true
+  if (PSL_GOV_EDU_SLDS.has(sld)) {
+    const first = labels[0]!
+    if (PSL_GOV_EDU_SUBLABELS.has(first)) return false
+    if (labels.length === 3 && (sld === 'gov' || sld === 'edu' || sld === 'ac' || sld === 'mil' || sld === 'gob' || sld === 'gouv')) {
+      return false
+    }
+  }
+  if ((PSL_MUNICIPAL_CCTLDS.has(tld) || tld === 'us') && labels.length === 3 && !labels[0]!.includes('-')) {
+    return false
+  }
+  return true
+}
+
+const PSL_PRIVATE_RULES: ReadonlySet<string> = new Set([...PSL_RULES].filter(isPrivatePslRule))
+
+function normalizeHostBrowserSafe(hostname: string): string {
+  const trimmed = hostname.trim().toLowerCase().replace(/\.+$/, '')
+  if (!trimmed || trimmed.includes(':')) return trimmed
+  try {
+    return new URL(`http://${trimmed}`).hostname.toLowerCase()
+  } catch {
+    return trimmed
+  }
+}
+
+function isIpLiteralBrowserSafe(hostname: string): boolean {
+  const bare = hostname.replace(/^\[|\]$/g, '')
+  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(bare)) {
+    return bare.split('.').every(part => Number(part) <= 255)
+  }
+  return bare.includes(':') && /^[0-9a-f:.]+$/i.test(bare)
+}
+
+function extractHostFromOrigin(raw: string): string {
+  const trimmed = raw.trim()
+  if (!trimmed) return ''
+  let host = trimmed
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed)) {
+    try {
+      host = new URL(trimmed).hostname
+    } catch {
+      return ''
+    }
+  } else if (trimmed.includes('/') || (trimmed.includes(':') && !trimmed.startsWith('[') && trimmed.indexOf(':') === trimmed.lastIndexOf(':'))) {
+    host = trimmed.replace(/\/.*$/, '').replace(/:\d+$/, '')
+  }
+  return normalizeHostBrowserSafe(host)
+}
+
+function matchPublicSuffixClient(labels: readonly string[]): { labelCount: number; section: 'icann' | 'private' } {
+  const n = labels.length
+  let bestCount = 1
+  let bestRule: string | null = null
+  for (let i = 0; i < n; i += 1) {
+    const candidate = labels.slice(i).join('.')
+    if (PSL_RULES.has(`!${candidate}`)) {
+      const excRule = `!${candidate}`
+      return {
+        labelCount: Math.max(1, n - i - 1),
+        section: PSL_PRIVATE_RULES.has(excRule) ? 'private' : 'icann',
+      }
+    }
+    if (PSL_RULES.has(candidate) && n - i > bestCount) {
+      bestCount = n - i
+      bestRule = candidate
+    }
+    if (i < n - 1) {
+      const wildRule = `*.${labels.slice(i + 1).join('.')}`
+      if (PSL_RULES.has(wildRule) && n - i > bestCount) {
+        bestCount = n - i
+        bestRule = wildRule
+      }
+    }
+  }
+  return {
+    labelCount: bestCount,
+    section: bestRule !== null && PSL_PRIVATE_RULES.has(bestRule) ? 'private' : 'icann',
+  }
+}
+
+export function isMultiTenantPublicSuffix(hostname: string): boolean {
+  const host = normalizeHostBrowserSafe(hostname)
+  if (!host || isIpLiteralBrowserSafe(host)) return false
+  const labels = host.split('.').filter(Boolean)
+  if (labels.length < 2) return false
+  if (matchPublicSuffixClient(labels).section === 'private') return true
+  return PSL_SUPPLEMENTAL_MULTI_TENANT_ROOTS.some(root => host === root || host.endsWith(`.${root}`))
+}
+
+export function registrableApex(hostOrOrigin: string): string | null {
+  const host = extractHostFromOrigin(hostOrOrigin)
+  if (!host || host === 'localhost' || isIpLiteralBrowserSafe(host)) return null
+  const labels = host.split('.').filter(Boolean)
+  if (labels.length < 2) return null
+  const suffixCount = matchPublicSuffixClient(labels).labelCount
+  if (labels.length <= suffixCount) return null
+  return labels.slice(-(suffixCount + 1)).join('.')
+}
+
+const SCOPE_TIER1 = new Set([
+  'api', 'app', 'auth', 'admin', 'billing', 'oauth', 'sso', 'login', 'portal',
+  'dashboard', 'console', 'graphql', 'gateway', 'accounts', 'account',
+])
+const SCOPE_TIER2 = new Set([
+  'www', 'pay', 'payments', 'checkout', 'mcp', 'cloud', 'engine', 'internal',
+  'staging', 'stage', 'dev', 'beta', 'sandbox', 'studio', 'web', 'my', 'id',
+  'identity', 'token', 'webhooks', 'webhook', 'docs', 'blog', 'status',
+])
+
+function isSprawlPrefix(prefix: string): boolean {
+  for (const label of prefix.split('.')) {
+    if (/^(?:pr|deploy-preview|preview)-\d+$/.test(label)) return true
+    if (/^[a-z0-9-]+-\d{3,}$/.test(label)) return true
+    const hexDeploy = /^[a-z0-9-]+-([0-9a-f]{7,})$/.exec(label)
+    if (hexDeploy && /\d/.test(hexDeploy[1]!)) return true
+  }
+  return false
+}
+
+export function rankScopeAssets<T extends { id?: string; origin: string; source?: string; thirdParty?: boolean; dnsSource?: unknown }>(
+  assets: readonly T[],
+  seedOrigins: readonly string[],
+  options: { maxAssets?: number } = {},
+): Array<{ asset: T; score: number; apex: string | null; sameApexAsSeed: boolean; depth: number; noisy: boolean }> {
+  const canonicalOrigin = (origin: string): string => {
+    try {
+      return new URL(origin).origin.toLowerCase()
+    } catch {
+      return origin.trim().toLowerCase().replace(/\/+$/, '')
+    }
+  }
+  const isDiscovered = (source?: string): boolean =>
+    source === 'subdomain_discovery' || source === 'phase0_ct_discovery' || source === 'phase0_subdomain_discovery'
+
+  const seedOriginSet = new Set(seedOrigins.map(canonicalOrigin))
+  const seedHostSet = new Set(seedOrigins.map(extractHostFromOrigin).filter(Boolean))
+  const seedApexes = new Set<string>()
+  for (const seed of seedOrigins) {
+    const seedHost = extractHostFromOrigin(seed)
+    if (!seedHost || isMultiTenantPublicSuffix(seedHost)) continue
+    const apex = registrableApex(seed)
+    if (apex && !isMultiTenantPublicSuffix(apex)) seedApexes.add(apex)
+  }
+
+  const ranked: Array<{ asset: T; score: number; apex: string | null; sameApexAsSeed: boolean; depth: number; noisy: boolean; _idx: number; _hostLen: number }> = []
+  for (let idx = 0; idx < assets.length; idx += 1) {
+    const asset = assets[idx]!
+    const hostName = extractHostFromOrigin(asset.origin)
+    const apex = registrableApex(asset.origin)
+    const isExactSeed = seedOriginSet.has(canonicalOrigin(asset.origin)) || (seedHostSet.has(hostName) && !isDiscovered(asset.source))
+    const isSharedTenant = hostName ? isMultiTenantPublicSuffix(hostName) : false
+    const sameApexAsSeed = isExactSeed || (!isSharedTenant && apex !== null && seedApexes.has(apex))
+
+    let relativePrefix = ''
+    let depth = 0
+    if (apex && hostName === apex) {
+      depth = 0
+    } else if (apex && hostName.endsWith(`.${apex}`)) {
+      relativePrefix = hostName.slice(0, -(apex.length + 1))
+      depth = relativePrefix.split('.').filter(Boolean).length
+    } else if (hostName) {
+      const parts = hostName.split('.').filter(Boolean)
+      depth = Math.max(0, parts.length - 2)
+      relativePrefix = depth > 0 ? parts.slice(0, depth).join('.') : ''
+    }
+
+    const firstLabel = relativePrefix ? (relativePrefix.split('.')[0] ?? '') : ''
+    const noisy = relativePrefix ? isSprawlPrefix(relativePrefix) : false
+    const src = (asset.source ?? '').toLowerCase()
+    let score: number
+    if (isExactSeed || src === 'project seed' || (!asset.dnsSource && !isDiscovered(asset.source) && src === '')) {
+      score = 1000
+    } else if (/repo|spec|openapi|swagger|github|graphql/.test(src)) {
+      score = 850
+    } else if (depth === 0 && sameApexAsSeed) {
+      score = 760
+    } else if (noisy) {
+      score = 50
+    } else if (SCOPE_TIER1.has(firstLabel)) {
+      score = Math.max(300, 700 - Math.max(0, depth - 1) * 40)
+    } else if (SCOPE_TIER2.has(firstLabel)) {
+      score = Math.max(200, 550 - Math.max(0, depth - 1) * 40)
+    } else {
+      score = Math.max(100, 440 - depth * 40)
+    }
+    if (seedOrigins.length > 0 && !sameApexAsSeed) score -= 200
+    if (asset.thirdParty) score -= 500
+
+    ranked.push({ asset, score, apex, sameApexAsSeed, depth, noisy, _idx: idx, _hostLen: hostName.length })
+  }
+
+  ranked.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score
+    if (a.depth !== b.depth) return a.depth - b.depth
+    if (a._hostLen !== b._hostLen) return a._hostLen - b._hostLen
+    const cmp = a.asset.origin.localeCompare(b.asset.origin)
+    return cmp !== 0 ? cmp : a._idx - b._idx
+  })
+  const limited = options.maxAssets !== undefined
+    ? ranked.slice(0, Math.max(0, Math.floor(options.maxAssets)))
+    : ranked
+  return limited.map(({ asset, score, apex, sameApexAsSeed, depth, noisy }) => ({
+    asset, score, apex, sameApexAsSeed, depth, noisy,
+  }))
+}
+
 /**
  * Resolve default checked candidate IDs for scope review.
  * - Honors `run.approved` when `scopeRevision > 0`.
@@ -55,7 +323,7 @@ interface Draft {
  * - Does NOT exclude `subdomain_discovery` or `phase0_ct_discovery` hosts via `!a.dnsSource`;
  *   only bulk BIND DNS zone imports and third-party CNAMEs stay unchecked by default.
  * - When a parent seed has `includeSubdomains: true`, pre-selects first-party live subdomains
- *   up to Top 30 ranked by signal (seeds, repo/spec matches, and high-value prefixes first).
+ *   up to Top 30 ranked by PSL-backed `rankScopeAssets` (seeds, repo/spec matches, and high-value prefixes first).
  */
 export function defaultScopeAssetIds(
   run: {
@@ -88,10 +356,17 @@ export function defaultScopeAssetIds(
     }
   }
 
-  const apexForOrigin = (origin: string): string => {
+  const resolveApex = (origin: string): string | null => {
+    if (typeof registrableApex === 'function') return registrableApex(origin)
     const h = extractHostname(origin)
-    return h.startsWith('www.') && h.split('.').length >= 3 ? h.slice(4) : h
+    if (!h) return null
+    const parts = h.split('.').filter(Boolean)
+    if (parts.length < 2) return null
+    return parts.slice(-2).join('.')
   }
+
+  const isMultiTenant = (hostname: string): boolean =>
+    typeof isMultiTenantPublicSuffix === 'function' ? isMultiTenantPublicSuffix(hostname) : false
 
   const isDiscoveredSubdomain = (source?: string): boolean =>
     source === 'subdomain_discovery' || source === 'phase0_ct_discovery' || source === 'phase0_subdomain_discovery'
@@ -99,58 +374,56 @@ export function defaultScopeAssetIds(
   const isBulkDnsImport = (c: { source?: string; dnsSource?: unknown }): boolean =>
     Boolean(c.dnsSource) && !isDiscoveredSubdomain(c.source)
 
+  const seedOriginsForRank: string[] = []
   const wildcardApexes = new Set<string>()
   for (const origin of options?.includeSubdomainOrigins ?? []) {
-    const apex = apexForOrigin(origin)
+    seedOriginsForRank.push(origin)
+    const apex = resolveApex(origin)
     if (apex) wildcardApexes.add(apex)
   }
   for (const c of run.candidates) {
     if (c.includeSubdomains && !c.thirdParty) {
-      const apex = apexForOrigin(c.origin)
+      seedOriginsForRank.push(c.origin)
+      const apex = resolveApex(c.origin)
       if (apex) wildcardApexes.add(apex)
+    } else if (!c.thirdParty && !isBulkDnsImport(c) && !isDiscoveredSubdomain(c.source)) {
+      seedOriginsForRank.push(c.origin)
     }
   }
 
   const matchesWildcardParent = (origin: string): boolean => {
     if (wildcardApexes.size === 0) return false
     const h = extractHostname(origin)
-    for (const apex of wildcardApexes) {
-      if (h === apex || h.endsWith(`.${apex}`)) return true
+    const apex = resolveApex(origin)
+    if (apex && wildcardApexes.has(apex)) return true
+    if (isMultiTenant(h)) return false
+    for (const wApex of wildcardApexes) {
+      if (h === wApex || h.endsWith(`.${wApex}`)) return true
     }
     return false
   }
 
-  const HIGH_VALUE_TIER1 = new Set([
-    'api', 'app', 'auth', 'admin', 'billing', 'oauth', 'sso', 'login', 'portal', 'dashboard', 'console', 'graphql', 'gateway', 'accounts', 'account',
-  ])
-  const HIGH_VALUE_TIER2 = new Set([
-    'www', 'pay', 'payments', 'checkout', 'mcp', 'cloud', 'engine', 'internal', 'staging', 'stage', 'dev', 'beta', 'sandbox', 'studio', 'web', 'my', 'id', 'identity', 'token', 'webhooks', 'webhook',
-  ])
-  const NOISY_SUBDOMAIN_RE = /^(?:pr-\d+|deploy-preview-\d+|preview-\d+|[a-z0-9-]+-\d{3,})(?:\.|$)/i
-
-  const signalRank = (c: { origin: string; source?: string; dnsSource?: unknown }): number => {
-    const src = (c.source ?? '').toLowerCase()
-    if (src === 'project seed' || (!c.dnsSource && !isDiscoveredSubdomain(c.source))) return 1000
-    if (/repo|spec|openapi|swagger|github|graphql/.test(src)) return 850
-    const h = extractHostname(c.origin)
-    const firstLabel = h.split('.')[0] ?? ''
-    if (NOISY_SUBDOMAIN_RE.test(h)) return 50
-    if (HIGH_VALUE_TIER1.has(firstLabel)) return 700
-    if (HIGH_VALUE_TIER2.has(firstLabel)) return 550
-    const depth = h.split('.').length
-    return Math.max(100, 400 - depth * 40)
-  }
-
   const pickRanked = (
-    list: readonly { id: string; origin: string; source?: string; dnsSource?: unknown }[],
+    list: readonly { id: string; origin: string; source?: string; thirdParty?: boolean; dnsSource?: unknown }[],
     limit: number,
   ): string[] => {
     if (list.length <= limit) return list.map(c => c.id)
-    const ranked = list
-      .map((c, idx) => ({ id: c.id, score: signalRank(c), idx }))
-      .sort((a, b) => (b.score - a.score) || (a.idx - b.idx))
-      .slice(0, limit)
-    const chosen = new Set(ranked.map(r => r.id))
+    if (typeof rankScopeAssets === 'function') {
+      const chosen = new Set(rankScopeAssets(list, seedOriginsForRank, { maxAssets: limit }).map(r => r.asset.id))
+      return list.filter(c => chosen.has(c.id)).map(c => c.id)
+    }
+    const t1 = new Set(['api', 'app', 'auth', 'admin', 'billing', 'oauth', 'sso', 'login', 'portal', 'dashboard', 'console', 'graphql', 'gateway', 'accounts', 'account'])
+    const noisyRe = /^(?:pr-\d+|deploy-preview-\d+|preview-\d+|[a-z0-9-]+-\d{3,})(?:\.|$)/i
+    const scoreOf = (c: { origin: string; source?: string; dnsSource?: unknown }) => {
+      const src = (c.source ?? '').toLowerCase()
+      if (src === 'project seed' || (!c.dnsSource && !isDiscoveredSubdomain(c.source))) return 1000
+      const h = extractHostname(c.origin)
+      if (noisyRe.test(h)) return 50
+      return t1.has(h.split('.')[0] ?? '') ? 700 : 300
+    }
+    const chosen = new Set(
+      list.map((c, idx) => ({ id: c.id, score: scoreOf(c), idx })).sort((a, b) => (b.score - a.score) || (a.idx - b.idx)).slice(0, limit).map(r => r.id),
+    )
     return list.filter(c => chosen.has(c.id)).map(c => c.id)
   }
 

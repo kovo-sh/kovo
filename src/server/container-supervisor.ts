@@ -15,6 +15,7 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  readlinkSync,
   renameSync,
   unlinkSync,
   writeFileSync,
@@ -34,6 +35,41 @@ import {
 import type { DockerRunner, LabConfig, LabServiceSpec } from './lab-proxy.ts'
 
 export const LAB_OWNER_PID_LABEL = 'dev.kovo.owner-pid'
+export const LAB_OWNER_PID_NS_LABEL = 'dev.kovo.owner-pid-ns'
+export const LAB_OWNER_START_TIME_LABEL = 'dev.kovo.owner-start-time'
+export const LAB_OWNER_SESSION_LABEL = 'dev.kovo.owner-session'
+export const DEFAULT_LAB_FOREIGN_OWNER_TTL_MS = 30 * 60_000
+
+const SUPERVISOR_SESSION_ID = randomUUID()
+
+function readSupervisorPidNamespace(): string | null {
+  try {
+    const link = readlinkSync('/proc/self/ns/pid').trim()
+    return link || null
+  } catch {
+    return null
+  }
+}
+
+function readSupervisorStartTicks(pid: number | 'self' = 'self'): string | null {
+  try {
+    const raw = readFileSync(`/proc/${pid}/stat`, 'utf8')
+    const closeParen = raw.lastIndexOf(')')
+    if (closeParen < 0) return null
+    const rest = raw.slice(closeParen + 1).trim().split(/\s+/)
+    const ticks = rest[19]
+    return ticks && /^\d+$/.test(ticks) ? ticks : null
+  } catch {
+    return null
+  }
+}
+
+function normalizeLabelValue(raw: string | undefined): string | null {
+  if (!raw) return null
+  const trimmed = raw.trim()
+  if (!trimmed || trimmed === '<no value>') return null
+  return trimmed
+}
 
 const MAX_RECOVERED_RUNS = 32
 
@@ -81,6 +117,9 @@ export interface LabRunRecord {
   startedAt: number
   updatedAt: number
   pid: number
+  pidNs?: string | null
+  pidStartTime?: string | null
+  sessionId?: string
 }
 
 export interface LabRecoveryResult {
@@ -301,8 +340,16 @@ export interface ContainerSupervisorOptions {
   env?: NodeJS.ProcessEnv
   /** Owner process PID written to container labels and used to detect stale crash leftovers. */
   ownerPid?: number
+  /** Owner Linux PID namespace (`pid:[...]`) for cross-namespace orphan safety. */
+  ownerPidNs?: string | null
+  /** Owner process start ticks (`/proc/<pid>/stat` field 22) to detect PID reuse. */
+  ownerStartTime?: string | null
   /** Optional PID liveness predicate for deterministic unit testing. */
   isPidAlive?: (pid: number) => boolean
+  /** Optional start-ticks reader for deterministic PID-reuse testing. */
+  readPidStartTime?: (pid: number) => string | null
+  /** TTL before a foreign-namespace lab container may be swept as abandoned (default 30 min). */
+  foreignOwnerTtlMs?: number
 }
 
 export class ContainerSupervisor {
@@ -310,7 +357,11 @@ export class ContainerSupervisor {
   readonly stateDir: string
   readonly env: NodeJS.ProcessEnv
   readonly ownerPid: number
+  readonly ownerPidNs: string | null
+  readonly ownerStartTime: string | null
   private readonly isPidAliveFn: (pid: number) => boolean
+  private readonly readPidStartTimeFn: (pid: number) => string | null
+  private readonly foreignOwnerTtlMs: number
   private readonly active = new Map<string, SupervisedTargetState>()
   private readonly inFlightBootIds = new Set<string>()
   private startupRecoveryInFlight: Promise<LabRecoveryResult[]> | null = null
@@ -320,11 +371,20 @@ export class ContainerSupervisor {
     this.env = options.env ?? process.env
     this.stateDir = options.stateDir ?? labStateDir(this.env)
     this.ownerPid = options.ownerPid ?? process.pid
+    this.ownerPidNs = options.ownerPidNs !== undefined ? options.ownerPidNs : readSupervisorPidNamespace()
+    this.ownerStartTime = options.ownerStartTime !== undefined ? options.ownerStartTime : readSupervisorStartTicks('self')
     this.isPidAliveFn = options.isPidAlive ?? defaultIsPidAlive
+    this.readPidStartTimeFn = options.readPidStartTime ?? readSupervisorStartTicks
+    this.foreignOwnerTtlMs = Math.max(0, options.foreignOwnerTtlMs ?? DEFAULT_LAB_FOREIGN_OWNER_TTL_MS)
   }
 
   ownerExtraLabels(): Record<string, string> {
-    return { [LAB_OWNER_PID_LABEL]: String(this.ownerPid) }
+    return {
+      [LAB_OWNER_PID_LABEL]: String(this.ownerPid),
+      ...(this.ownerPidNs ? { [LAB_OWNER_PID_NS_LABEL]: this.ownerPidNs } : {}),
+      ...(this.ownerStartTime ? { [LAB_OWNER_START_TIME_LABEL]: this.ownerStartTime } : {}),
+      [LAB_OWNER_SESSION_LABEL]: SUPERVISOR_SESSION_ID,
+    }
   }
 
   hasActiveRun(runId: string): boolean {
@@ -405,6 +465,9 @@ export class ContainerSupervisor {
       startedAt: state.handle.startedAt,
       updatedAt: Date.now(),
       pid: this.ownerPid,
+      pidNs: this.ownerPidNs,
+      pidStartTime: this.ownerStartTime,
+      sessionId: SUPERVISOR_SESSION_ID,
     }
   }
 
@@ -721,9 +784,42 @@ export class ContainerSupervisor {
   }
 
   /**
+   * Namespace-safe owner liveness predicate (H-31):
+   * - Foreign PID namespace (`pidNs` present and != `this.ownerPidNs`): never probe local PID
+   *   table (even for PID 1); spare until `foreignOwnerTtlMs` has elapsed.
+   * - Same PID namespace (or legacy unlabeled record): check `isPidAlive` AND start-time when
+   *   present so recycled PIDs are detected and reaped.
+   */
+  private isOwnerLiveOrProtected(input: {
+    pid: number
+    pidNs?: string | null
+    startTime?: string | null
+    createdAtMs?: number | null
+  }): boolean {
+    if (input.pid <= 0) return false
+    const pidNs = normalizeLabelValue(input.pidNs ?? undefined)
+    if (pidNs !== null && (!this.ownerPidNs || pidNs !== this.ownerPidNs)) {
+      if (input.createdAtMs === null || input.createdAtMs === undefined || !Number.isFinite(input.createdAtMs)) {
+        return true
+      }
+      return Date.now() - input.createdAtMs < this.foreignOwnerTtlMs
+    }
+    if (input.pid === this.ownerPid) {
+      return false
+    }
+    if (!this.isPidAliveFn(input.pid)) return false
+    const startTime = normalizeLabelValue(input.startTime ?? undefined)
+    if (startTime !== null) {
+      const liveStart = this.readPidStartTimeFn(input.pid)
+      if (liveStart !== null && liveStart !== startTime) return false
+    }
+    return true
+  }
+
+  /**
    * Recover every orphaned run found in persisted crash records, Docker `dev.kovo.lab=1` label
-   * scans (skipping containers owned by a different still-alive PID or currently booting), and
-   * optional `LabContainerStore` / pre-collected persisted rows.
+   * scans (skipping containers owned by a different still-alive PID or foreign PID namespace
+   * within TTL or currently booting), and optional `LabContainerStore` / pre-collected persisted rows.
    */
   async recoverAll(
     storage?: LabContainerStore,
@@ -759,13 +855,23 @@ export class ContainerSupervisor {
           const parsed = JSON.parse(readFileSync(join(this.stateDir, entry), 'utf8')) as {
             runId?: unknown
             pid?: unknown
+            pidNs?: unknown
+            pidStartTime?: unknown
+            updatedAt?: unknown
+            startedAt?: unknown
           }
           const pid = typeof parsed.pid === 'number' ? parsed.pid : 0
+          const createdAtMs = typeof parsed.updatedAt === 'number'
+            ? parsed.updatedAt
+            : (typeof parsed.startedAt === 'number' ? parsed.startedAt : null)
           if (
             !options.includeLiveOwners
-            && pid > 0
-            && pid !== this.ownerPid
-            && this.isPidAliveFn(pid)
+            && this.isOwnerLiveOrProtected({
+              pid,
+              pidNs: typeof parsed.pidNs === 'string' ? parsed.pidNs : null,
+              startTime: typeof parsed.pidStartTime === 'string' ? parsed.pidStartTime : null,
+              createdAtMs,
+            })
           ) {
             if (typeof parsed.runId === 'string') liveOwnerRunIds.add(parsed.runId)
             continue
@@ -788,7 +894,7 @@ export class ContainerSupervisor {
       }
     }
 
-    // 3. Docker label scan (`dev.kovo.lab=1`), checking `dev.kovo.owner-pid` when present
+    // 3. Docker label scan (`dev.kovo.lab=1`), checking `dev.kovo.owner-pid` + namespace/start-time when present
     try {
       const ids = (await this.docker(['ps', '-aq', '--filter', `label=${LAB_LABELS.lab}=1`], AbortSignal.timeout(10_000)))
         .trim()
@@ -800,7 +906,7 @@ export class ContainerSupervisor {
           [
             'inspect',
             '-f',
-            `{{index .Config.Labels "${LAB_LABELS.run}"}}\t{{index .Config.Labels "${LAB_OWNER_PID_LABEL}"}}`,
+            `{{index .Config.Labels "${LAB_LABELS.run}"}}\t{{index .Config.Labels "${LAB_OWNER_PID_LABEL}"}}\t{{index .Config.Labels "${LAB_OWNER_PID_NS_LABEL}"}}\t{{index .Config.Labels "${LAB_OWNER_START_TIME_LABEL}"}}\t{{.CreatedAt}}`,
             ...ids,
           ],
           AbortSignal.timeout(10_000),
@@ -808,14 +914,17 @@ export class ContainerSupervisor {
         const lines = labels.split('\n').map(l => l.trim()).filter(Boolean)
         for (let i = 0; i < lines.length; i += 1) {
           const line = lines[i]
-          const tabIdx = line.indexOf('\t')
-          const runId = (tabIdx >= 0 ? line.slice(0, tabIdx) : line).trim()
-          const ownerPidRaw = (tabIdx >= 0 ? line.slice(tabIdx + 1) : '').trim()
-          const ownerPidNum = /^\d+$/.test(ownerPidRaw) ? Number(ownerPidRaw) : 0
+          const [rawRunId = '', ownerPidRaw = '', ownerPidNsRaw = '', ownerStartTimeRaw = '', createdAtRaw = ''] = line.split('\t')
+          const runId = rawRunId.trim()
+          const ownerPidNum = /^\d+$/.test(ownerPidRaw.trim()) ? Number(ownerPidRaw.trim()) : 0
+          const parsedCreatedAt = createdAtRaw.trim() ? Date.parse(createdAtRaw.trim()) : NaN
           const isOtherLiveOwner = !options.includeLiveOwners
-            && ownerPidNum > 0
-            && ownerPidNum !== this.ownerPid
-            && this.isPidAliveFn(ownerPidNum)
+            && this.isOwnerLiveOrProtected({
+              pid: ownerPidNum,
+              pidNs: ownerPidNsRaw,
+              startTime: ownerStartTimeRaw,
+              createdAtMs: Number.isFinite(parsedCreatedAt) ? parsedCreatedAt : null,
+            })
           if (isOtherLiveOwner) {
             if (runId && runId !== '<no value>') liveOwnerRunIds.add(runId)
             continue
