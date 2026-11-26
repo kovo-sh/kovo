@@ -328,6 +328,10 @@ export function guardConfirmedFindingMutation(
     blockedFields.push('category')
     delete sanitizedPatch.category
   }
+  if (patch.severity !== undefined && patch.severity !== existingFinding.severity) {
+    blockedFields.push('severity')
+    delete sanitizedPatch.severity
+  }
   if (patch.fingerprintHash !== undefined && patch.fingerprintHash !== existingFinding.fingerprintHash) {
     blockedFields.push('fingerprintHash')
     delete sanitizedPatch.fingerprintHash
@@ -777,18 +781,34 @@ function extractExistingFindingEndpointsForSupersession(
   return fallback ? [fallback] : []
 }
 
+const SHARED_AUTH_UTILITY_ROUTE_RE =
+  /^(?:\/(?:api|v\d+)(?:\/v\d+)?)?(?:\/(?:login|logout|me|health|healthz|token|session)|\/oauth\/token|\/auth(?:\/.*)?)$/i
+
+export function isGenericSharedAuthOrUtilityEndpoint(normalizedEndpoint: string): boolean {
+  const trimmed = normalizedEndpoint.trim()
+  if (!trimmed) return false
+  const clean = trimmed.length > 1 ? trimmed.replace(/\/+$/, '') : trimmed
+  return SHARED_AUTH_UTILITY_ROUTE_RE.test(clean)
+}
+
 export function isEndpointSubsetOfUpstream(
   earlierEndpoints: readonly SupersessionEndpointSpec[],
   upstreamEndpoints: readonly SupersessionEndpointSpec[],
 ): boolean {
   if (!earlierEndpoints.length || !upstreamEndpoints.length) return false
-  return earlierEndpoints.every(ep =>
-    upstreamEndpoints.some(up =>
+  const nonGenericUpstream = upstreamEndpoints.filter(up => !isGenericSharedAuthOrUtilityEndpoint(up.normalizedEndpoint))
+  if (!nonGenericUpstream.length) return false
+  const matchesUpstream = (ep: SupersessionEndpointSpec, candidates: readonly SupersessionEndpointSpec[]) =>
+    candidates.some(up =>
       ep.normalizedEndpoint === up.normalizedEndpoint
       && methodsCompatibleForAgentProofDedupe(ep.method, up.method)
       && originsEquivalentForAgentProofDedupe(ep.origin, up.origin, ep.normalizedEndpoint),
-    ),
+    )
+  const hasNonGenericMatch = earlierEndpoints.some(
+    ep => !isGenericSharedAuthOrUtilityEndpoint(ep.normalizedEndpoint) && matchesUpstream(ep, nonGenericUpstream),
   )
+  if (!hasNonGenericMatch) return false
+  return earlierEndpoints.every(ep => matchesUpstream(ep, upstreamEndpoints))
 }
 
 /**
@@ -1873,7 +1893,39 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       evidenceIds: [...new Set([...(existing?.finding.evidenceIds ?? []), evidence.id])],
       scopeRevision: run.scopeRevision,
     }
+    const emitOobReceiptConfirmed = () => {
+      try {
+        this.storage.event(run.id, 'oob.receipt_confirmed',
+          `Late ${input.vulnClass.toUpperCase()} callback promoted to a runtime_confirmed finding (${input.verification.reason.slice(0, 200)}).`, {
+            findingId,
+            oobSubscriptionId: input.subscriptionId,
+            exchangeId: input.carrier.id,
+            rule: input.verification.rule,
+          })
+      } catch { /* metrics/coverage are best-effort */ }
+    }
+    emitOobReceiptConfirmed()
     if (specRow) {
+      const existingProof = this.storage.replaySpecProof(run.id, specRow.id)
+      const receiptRow = serializeProofReceiptRow({ receipt: input.receipt, verification: input.verification })
+      if (existingProof) {
+        this.storage.setReplaySpecProof(run.id, specRow.id, {
+          ...existingProof,
+          verdict: 'confirmed',
+          receipt: receiptRow,
+        })
+      } else {
+        this.storage.setReplaySpecProof(run.id, specRow.id, {
+          replaySpecId: specRow.id,
+          findingId,
+          verdict: 'confirmed',
+          runtime: 'ts',
+          scriptSha256: specRow.specSha256,
+          artifactId: evidence.id,
+          receipt: receiptRow,
+          createdAt: Date.now(),
+        })
+      }
       this.storage.upsertChainFinding(run, asset.id, finding, specRow.id, specRow.sourceOrigins)
     } else if (existing) {
       this.storage.db.update(findings).set({
@@ -1906,13 +1958,6 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
         summary: `Confirmed async ${input.vulnClass.toUpperCase()} via ProofReceipt ${input.subscriptionId}`,
         linkedFindingId: findingId,
       })
-      this.storage.event(run.id, 'oob.receipt_confirmed',
-        `Late ${input.vulnClass.toUpperCase()} callback promoted to a runtime_confirmed finding (${input.verification.reason.slice(0, 200)}).`, {
-          findingId,
-          oobSubscriptionId: input.subscriptionId,
-          exchangeId: input.carrier.id,
-          rule: input.verification.rule,
-        })
     } catch { /* metrics/coverage are best-effort */ }
     return true
   }
@@ -2377,7 +2422,10 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
     const upstreamEndpoints = extractCompositeUpstreamEndpoints(receipt)
     if (!upstreamEndpoints.length) return []
 
-    const rows = this.storage.db.select().from(findings).where(eq(findings.runId, run.id)).all()
+    const rows = this.storage.db.select().from(findings).where(and(
+      eq(findings.runId, run.id),
+      eq(findings.goalRevision, run.goalRevision),
+    )).all()
     if (!rows.length) return []
 
     const allSpecs = this.storage.listReplaySpecs(run.id)
@@ -2703,6 +2751,16 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
             exchangeIds: nextFinding.exchangeIds,
           },
         })
+        const dependentRows = this.storage.db.select().from(findings).where(and(
+          eq(findings.runId, run.id),
+          eq(findings.goalRevision, run.goalRevision),
+          eq(findings.supersededByFindingId, findingRow.id),
+        )).all()
+        for (const dep of dependentRows) {
+          this.storage.updateProposedFinding(run, dep.id, {
+            supersededByFindingId: null,
+          })
+        }
       }
     }
     this.host.postVerificationVerdict(run, {

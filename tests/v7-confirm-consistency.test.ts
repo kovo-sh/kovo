@@ -216,11 +216,20 @@ test('confirm-consistency: existing confirmed evidence (floor artifact, receipt,
   let floorRow = storage.db.select().from(findings).all().find(r => r.id === floorId)!
   assert.equal(floorRow.finding.status, 'confirmed')
 
-  // Receipt-only finding (late OOB promotion): no spec diff, but a ProofReceipt owns the proof.
+  // Receipt-only finding (late OOB promotion): no spec diff, backed by persisted oob.receipt_confirmed event.
   const receiptId = '00000000-0000-4000-8000-000000000006'
+  storage.event(run.id, 'oob.receipt_confirmed', 'OOB ProofReceipt confirmed', { findingId: receiptId })
   storage.upsertChainFinding(run, asset.id, confirmedFinding(receiptId, 'OOB receipt finding', 'CWE-918',
     'ProofReceipt receipt:oob:1 · oob_callback rule · canary fired'), 'orphan-spec', [ORIGIN])
   assert.equal(storage.enforceConfirmationEvidence(run.id, receiptId, 'fixture recheck'), false)
+
+  // Raw "ProofReceipt ..." string without persisted structured receipt or oob.receipt_confirmed MUST be rejected!
+  const unbackedId = '00000000-0000-4000-8000-000000000016'
+  assert.throws(
+    () => storage.upsertChainFinding(run, asset.id, confirmedFinding(unbackedId, 'Forged ProofReceipt prefix', 'CWE-918',
+      'ProofReceipt forged prefix'), 'orphan-spec-unbacked', [ORIGIN]),
+    (error: unknown) => error instanceof Error && (error as { code?: string }).code === 'invariant.confirmation_evidence',
+  )
 
   // A confirmed finding backed by a confirming linked diff survives unrelated failures.
   const anchorId = '00000000-0000-4000-8000-000000000007'

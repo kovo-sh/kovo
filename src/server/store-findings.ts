@@ -802,31 +802,48 @@ export class FindingsRepository {
     if (replayVerdictConfirmsRuntime(verdict)) {
       return { backed: true, contradicted: false, kind: 'spec', verdict, replaySpecId }
     }
-    const receipt = typeof input.verification === 'string' && input.verification.startsWith('ProofReceipt')
-      ? true
-      : Boolean(this.session.db.select({ id: tables.events.id }).from(tables.events).where(and(
-          eq(tables.events.runId, runId),
-          eq(tables.events.kind, 'oob.receipt_confirmed'),
-          sql`json_extract(${tables.events.detail}, '$.findingId') = ${input.findingId}`,
-        )).get())
-    if (receipt) return { backed: true, contradicted: false, kind: 'receipt', verdict, replaySpecId }
+    // An explicit non-confirming verdict on the linked replay spec always contradicts the claim
+    // (including prior ProofReceipt / OOB confirmations) so contradicting retries demote cleanly.
+    if (verdict !== null) {
+      return { backed: false, contradicted: true, kind: 'spec', verdict, replaySpecId }
+    }
+
+    const rawProofReceipt = spec?.proofReceipt as unknown as Record<string, unknown> | null | undefined
+    const singleReceiptConfirmed = Boolean(
+      rawProofReceipt
+      && typeof rawProofReceipt === 'object'
+      && rawProofReceipt.receipt
+      && typeof rawProofReceipt.receipt === 'object'
+      && (rawProofReceipt.verification as { confirmed?: unknown } | undefined)?.confirmed === true,
+    )
+    const compositeReceiptConfirmed = Boolean(
+      rawProofReceipt
+      && typeof rawProofReceipt === 'object'
+      && rawProofReceipt.compositeReceipt
+      && typeof rawProofReceipt.compositeReceipt === 'object'
+      && (rawProofReceipt.compositeVerification as { confirmed?: unknown } | undefined)?.confirmed === true,
+    )
+    const oobReceiptConfirmed = Boolean(this.session.db.select({ id: tables.events.id }).from(tables.events).where(and(
+      eq(tables.events.runId, runId),
+      eq(tables.events.kind, 'oob.receipt_confirmed'),
+      sql`json_extract(${tables.events.detail}, '$.findingId') = ${input.findingId}`,
+    )).get())
+    if (singleReceiptConfirmed || compositeReceiptConfirmed || oobReceiptConfirmed) {
+      return { backed: true, contradicted: false, kind: 'receipt', verdict, replaySpecId }
+    }
     // Legacy floor confirmations predate persisted spec diffs: their deterministic-engine event (or
     // the floor's own in-flight confirmation write) is the anchor. An explicit non-confirming diff
     // still wins (it is the later, contradicting write).
-    if (verdict === null) {
-      if (input.provenance === 'floor') {
-        return { backed: true, contradicted: false, kind: 'floor_artifact', verdict: null, replaySpecId }
-      }
-      const floorEvent = this.session.db.select({ id: tables.events.id }).from(tables.events).where(and(
-        eq(tables.events.runId, runId),
-        eq(tables.events.kind, 'deterministic_engine.confirmed'),
-        sql`json_extract(${tables.events.detail}, '$.findingId') = ${input.findingId}`,
-      )).get()
-      if (floorEvent) return { backed: true, contradicted: false, kind: 'floor_artifact', verdict: null, replaySpecId }
+    if (input.provenance === 'floor') {
+      return { backed: true, contradicted: false, kind: 'floor_artifact', verdict: null, replaySpecId }
     }
-    // An explicit non-confirming verdict is a contradiction. A missing verdict/spec is unknown
-    // (legacy rows and fixtures), not a conflict: there is nothing to contradict.
-    return { backed: false, contradicted: verdict !== null, kind: 'none', verdict, replaySpecId }
+    const floorEvent = this.session.db.select({ id: tables.events.id }).from(tables.events).where(and(
+      eq(tables.events.runId, runId),
+      eq(tables.events.kind, 'deterministic_engine.confirmed'),
+      sql`json_extract(${tables.events.detail}, '$.findingId') = ${input.findingId}`,
+    )).get()
+    if (floorEvent) return { backed: true, contradicted: false, kind: 'floor_artifact', verdict: null, replaySpecId }
+    return { backed: false, contradicted: false, kind: 'none', verdict, replaySpecId }
   }
 
   /**
@@ -1214,13 +1231,24 @@ export class FindingsRepository {
       return existing.finding
     }
 
+    const isExistingVerified = existing.finding.status === 'confirmed' || existing.finding.status === 'static_verified'
+    const rawIncomingFinding: Partial<Finding> = patch.finding ? { ...patch.finding } : {}
+    if (isExistingVerified) {
+      // H-4 / H-18: Never allow post-confirmation updates to mutate confirmed finding identity/severity/category.
+      delete rawIncomingFinding.cwe
+      delete rawIncomingFinding.origin
+      delete rawIncomingFinding.title
+      delete rawIncomingFinding.category
+      delete rawIncomingFinding.severity
+      delete rawIncomingFinding.fingerprintHash
+    }
     const mergedFinding: Finding = {
       ...existing.finding,
-      ...(patch.finding ?? {}),
+      ...rawIncomingFinding,
       id: existing.id,
       ...(patch.replaySpecId !== undefined ? { replaySpecId: patch.replaySpecId } : {}),
       ...(patch.verificationTier !== undefined ? { verificationTier: patch.verificationTier ?? undefined } : {}),
-      ...(patch.fingerprintHash !== undefined ? { fingerprintHash: patch.fingerprintHash } : {}),
+      ...(!isExistingVerified && patch.fingerprintHash !== undefined ? { fingerprintHash: patch.fingerprintHash } : {}),
       ...(patch.supersededByFindingId !== undefined ? { supersededByFindingId: patch.supersededByFindingId } : {}),
       ...(patch.counterevidence !== undefined ? { counterevidence: patch.counterevidence } : {}),
       ...(patch.confidenceRationale !== undefined ? { confidenceRationale: patch.confidenceRationale } : {}),

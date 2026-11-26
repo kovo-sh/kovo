@@ -72,7 +72,7 @@ import {
 } from './exec-exchange.ts'
 import { DETERMINISTIC_PARAM_HINT_RE } from './exec-floor-lane.ts'
 import type { ExecReconPlanner } from './exec-recon-planner.ts'
-import type { ExecVerifier } from './exec-verify.ts'
+import { guardConfirmedFindingMutation, type ExecVerifier } from './exec-verify.ts'
 import { resolveProfilePoolForRole, type ResolvedModelProfile } from './model-settings.ts'
 import type { PersonaAuthManager, PersonaSessionClone } from './persona-auth.ts'
 import { crawlStateGraph } from './phase0-recon.ts'
@@ -91,6 +91,14 @@ import { probeDifferential, probeSurface } from './surface-engine.ts'
 import type { WorkerBackend } from './worker-backend.ts'
 
 type Active = ExecActiveJob
+
+function stripUntrustedReplayEnvelopes(rawSpec: unknown): unknown {
+  if (!rawSpec || typeof rawSpec !== 'object' || Array.isArray(rawSpec)) return rawSpec
+  const copy = { ...(rawSpec as Record<string, unknown>) }
+  delete copy.recipe
+  delete copy.agentScript
+  return copy
+}
 
 export interface ExecProofObligationCounts {
   probedRoutes: number
@@ -585,7 +593,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
     // Warm-pool policy: run identity + persona credential generation. A rotation (or a new run or
     // tenant) retires the pool instead of handing an older container to this assignment.
     const generations = (grant.personas ? [...grant.personas.keys()] : []).sort().map(handle =>
-      `${handle}:${this.host.personaAuth.sessions.generation(handle)}`)
+      `${handle}:${this.host.personaAuth.sessions.generation(handle, run.id)}`)
     const secretEpoch = secretGenerationFingerprint(generations)
     const priorEpoch = this.host.warmSecretEpochByRun.get(run.id)
     if (priorEpoch !== undefined && priorEpoch !== secretEpoch) {
@@ -1146,7 +1154,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
           }
           const curRun = this.host.check(job)
           const currentApproved = this.host.approvedOriginsSet(curRun)
-          const parsed = declarativeReplaySpecSchema.parse(replaySpec)
+          const parsed = declarativeReplaySpecSchema.parse(stripUntrustedReplayEnvelopes(replaySpec))
           const specOrigins = replaySpecOrigins(parsed)
           if (specOrigins.some(o => !currentApproved.has(o))) {
             throw new BrokerDenied('Replay spec references an origin outside current approved scope.')
@@ -1390,8 +1398,32 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
           let parsedUpdatedSpec: DeclarativeReplaySpec | undefined
           let createdSpecRowId: string | undefined
 
+          const candidateFindingPatch = {
+            ...(args.title ? { title: args.title } : {}),
+            ...(args.summary ? { reason: args.summary } : {}),
+            ...(args.severity ? { severity: args.severity } : {}),
+          }
+          const guard = guardConfirmedFindingMutation(existingRow.finding, candidateFindingPatch)
+          if (isAlreadyVerified && (!guard.allowed || args.replaySpec !== undefined)) {
+            const blockedFields = [
+              ...guard.blockedFields,
+              ...(args.replaySpec !== undefined ? ['replaySpec'] : []),
+            ]
+            return {
+              findingId: existingRow.id,
+              replaySpecId: existingRow.replaySpecId,
+              status: existingRow.finding.status,
+              ...(existingRow.verificationTier ? { verificationTier: existingRow.verificationTier } : {}),
+              severity: existingRow.finding.severity,
+              blockedFields,
+              updated: false,
+              isError: true,
+              note: `Confirmed/static_verified finding identity is immutable; blocked post-confirmation edits (${blockedFields.join(', ')}).`,
+            }
+          }
+
           if (args.replaySpec) {
-            const parsed = declarativeReplaySpecSchema.parse(args.replaySpec)
+            const parsed = declarativeReplaySpecSchema.parse(stripUntrustedReplayEnvelopes(args.replaySpec))
             const specOrigins = replaySpecOrigins(parsed)
             if (specOrigins.some(o => !currentApproved.has(o))) {
               throw new BrokerDenied('Updated replay spec references an origin outside current approved scope.')
@@ -1401,7 +1433,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
             const priorSpecs = this.storage.listReplaySpecsForFinding(curRun.id, existingRow.id)
             const priorMaxAttempts = priorSpecs.length ? Math.max(...priorSpecs.map(r => r.attemptCount)) : 0
             const maxAttempts = 1 + maxInlineVerifyRetries
-            if (!isAlreadyVerified && priorMaxAttempts >= maxAttempts) {
+            if (priorMaxAttempts >= maxAttempts) {
               return {
                 findingId: existingRow.id,
                 replaySpecId: existingRow.replaySpecId,
@@ -1431,9 +1463,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
               JSON.stringify({ findingId: existingRow.id, replaySpecId: specRow.id, specSha256: specRow.specSha256, spec: parsed }, null, 2),
               undefined, currentSecrets())
             extraEvidenceIds.push(ev.id)
-            if (!isAlreadyVerified) {
-              nextReplaySpecId = specRow.id
-            }
+            nextReplaySpecId = specRow.id
           }
 
           const updated = this.storage.updateProposedFinding(curRun, existingRow.id, {
@@ -1444,9 +1474,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
             ...(args.severityChangeConditions !== undefined ? { severityChangeConditions: args.severityChangeConditions } : {}),
             ...(args.codeLocations !== undefined ? { codeLocations: args.codeLocations } : {}),
             finding: {
-              ...(args.title ? { title: args.title } : {}),
-              ...(args.summary ? { reason: args.summary } : {}),
-              ...(!isAlreadyVerified && args.severity ? { severity: args.severity } : {}),
+              ...guard.sanitizedPatch,
               ...(!isAlreadyVerified && args.replaySpec ? { status: 'pending' as const } : {}),
               ...(extraEvidenceIds.length ? { evidenceIds: extraEvidenceIds } : {}),
             },
