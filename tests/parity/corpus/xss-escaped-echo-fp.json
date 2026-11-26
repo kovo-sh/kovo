@@ -1,0 +1,67 @@
+{
+  "id": "xss-escaped-echo-fp",
+  "side": "fp",
+  "archetype": "xss-json-escaped-echo",
+  "description": "JSON API echoes markup characters inside a JSON string with application/json content-type; not executable browser markup.",
+  "canonicalLabel": {
+    "cwe": "CWE-79",
+    "category": "xss",
+    "title": "Reflected XSS in JSON echo endpoint",
+    "impact": "Markup characters echoed inside JSON response.",
+    "claimedImpact": "markup",
+    "claimedBoundary": "other",
+    "vulnClass": "xss_reflected"
+  },
+  "freeTextLabel": {
+    "title": "Cross-site scripting reflection in JSON echo response"
+  },
+  "paths": {
+    "replay": true,
+    "floorReceipt": true,
+    "evaluateClaims": true,
+    "composite": false,
+    "floorInjectionRecipe": false
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [],
+  "exchanges": [
+    {
+      "id": "ctl",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/echo?q=hello",
+      "persona": null,
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json", "x-content-type-options": "nosniff" },
+      "body": "{\"q\":\"hello\"}"
+    },
+    {
+      "id": "prb",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/echo?q=%3Csvg+onload%3DkovoCanary()%3E",
+      "persona": null,
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json", "x-content-type-options": "nosniff" },
+      "body": "{\"q\":\"<svg onload=kovoCanary()>\"}"
+    }
+  ],
+  "replaySpec": {
+    "assertionsJq": "{ controlPassed: (.steps.ctl.status == 200), confirmed: (.steps.prb.status == 200 and (.steps.prb.body | contains(\"<svg\"))), observed: .steps.prb.body, expected: \"escaped\" }"
+  },
+  "claims": [
+    { "kind": "status", "exchangeId": "ctl", "expected": 200 },
+    { "kind": "status", "exchangeId": "prb", "expected": 200 },
+    { "kind": "body_contains", "exchangeId": "prb", "text": "<svg onload=kovoCanary()>" }
+  ],
+  "bareClaims": [
+    { "kind": "status", "exchangeId": "prb", "expected": 200 },
+    { "kind": "body_contains", "exchangeId": "prb", "text": "<svg onload=kovoCanary()>" }
+  ]
+}

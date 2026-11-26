@@ -8,20 +8,12 @@
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { intersectStructuralDeltas, normalizeStructuralTokens, structuralDiffNormalized } from './verify-support.ts'
 import {
-  assessBoundary,
-  assessImpactEvidence,
-  assessMarkupImpact,
-  assessMfaBypass,
-  assessStatusOnlyDivergence,
-  flattenJson,
-  isMutatingMethod,
-  isReadMethod,
-  matchInjectionFingerprint,
-  normalizeRole,
-  parseRoleLabel,
-  assessReadDisclosure,
+  ACTIVE_MARKUP_RE, assessBoundary, assessImpactEvidence, assessMarkupImpact, assessMfaBypass,
+  assessReadDisclosure, assessStatusOnlyDivergence, classifyImpactDescriptor, flattenJson,
+  hasForeignTenantOrOwnerDisclosure, isMutatingMethod, isReadMethod,
+  matchStrippedInjectionFingerprint, normalizeRole, parseRoleLabel,
 } from './oracle-invariants.ts'
-import type { AmbientAuth, BoundaryClass, ImpactClass, ImpactStep, ActorIdentity } from './oracle-invariants.ts'
+import type { AmbientAuth, BoundaryClass, ImpactClass, ImpactStep, InjectionFamily, ActorIdentity } from './oracle-invariants.ts'
 import { isJobOrHandleStub } from './v8-oracle-families.ts'
 import { deriveAmbientAuthFromHeaders, resolveCanonicalArm, type HostFactLog } from './host-fact-log.ts'
 import { defaultHostMintedOracle } from './proof-receipt.ts'
@@ -511,6 +503,8 @@ export interface VerifyClaimContext {
   claimedBoundary?: BoundaryClass
   /** Optional immutable HostFactLog; when present, all step facts derive exclusively from it. */
   factLog?: HostFactLog
+  /** Optional CWE/descriptor/family hints for label-invariant class & family binding. */
+  cwe?: string | null; category?: string | null; title?: string | null; description?: string | null; injectionFamily?: InjectionFamily | null
 }
 
 export interface VerifyCanaryCheck {
@@ -1062,6 +1056,16 @@ function afterReadbackIsIntermediateOnly(beforeBody: string | undefined, afterRe
   return state && !existingMutated ? { isStub: true, pureJobStub: false, state } : { isStub: false, pureJobStub: false, state: null }
 }
 
+function probeHasForeignScopeField(probe: ImpactStep): boolean {
+  if (!probe.json || typeof probe.json !== 'object') return false
+  const pt = probe.actor.tenant?.toLowerCase() ?? null, ph = probe.actor.handle?.toLowerCase() ?? null
+  for (const [path, raw] of flattenJson(probe.json)) {
+    const leaf = (path.replace(/\[\d+\]/g, '').split('.').pop() ?? '').toLowerCase(), val = raw.trim().toLowerCase()
+    if (val && val !== 'null' && ((/^(?:tenant|org|organization|workspace)(?:_?id|slug)?$/.test(leaf) && pt && val !== pt) || (/^(?:owner|user)(?:_?id)?$/.test(leaf) && ph && val !== ph))) return true
+  }
+  return false
+}
+
 function evaluateBoundaryClaim(store: TranscriptStore, claim: Extract<VerifyClaim, { kind: 'boundary' }>, context: VerifyClaimContext): VerifyClaimCheck {
   const okId = (id: string) => (!context.allowedExchangeIds || context.allowedExchangeIds.has(id)) && Boolean(store.get(id))
   if (!okId(claim.controlExchangeId)) return { claim, passed: false, detail: `Unknown control exchange ${claim.controlExchangeId} for a boundary claim.` }
@@ -1079,6 +1083,12 @@ function evaluateBoundaryClaim(store: TranscriptStore, claim: Extract<VerifyClai
   if (assessment.required && assessment.satisfied) {
     const stub = detectIntermediateStub(store.get(claim.probeExchangeId), store.body(claim.probeExchangeId))
     if (stub.isStub) return stubRejection(claim, stub.state, assessment.evidence)
+    const anonCtrl = !control.actor.handle && control.actor.auth === 'unknown'
+    const authProbe = Boolean(probe.actor.handle) || probe.actor.auth !== 'unknown'
+    if (anonCtrl && authProbe && (claim.boundaryClass === 'auth' || isMutatingMethod(probe.method) ||
+        (!hasForeignTenantOrOwnerDisclosure([control, probe], probe, null) && !probeHasForeignScopeField(probe)))) {
+      return { claim, passed: false, detail: 'Anon-control boundary claim rejected: an unauthenticated 401/403 control only proves login enforcement, not an auth/authz crossing without foreign-tenant or foreign-owner disclosure.', observed: { ...assessment.evidence, anonControlAuthz: true, rejectedBy: 'anon_control_authz' } }
+    }
   }
   return { claim, passed: assessment.required && assessment.satisfied, detail: assessment.reason, observed: assessment.evidence }
 }
@@ -1197,7 +1207,9 @@ function implicitMarkupEvidence(
   claims: readonly VerifyClaim[],
   context: VerifyClaimContext,
 ): { satisfied: boolean; reason: string } {
-  const assessment = assessMarkupImpact({ impactClass: 'markup', steps: claimedSteps(store, claims, context), oracleEvents: [] })
+  const browserExecutionAttested = claims.some(c => c.kind === 'dom_sentinel' && c.mode === 'executed' &&
+    Boolean(store.get(c.exchangeId)?.artifact?.executedSentinels?.includes(c.sentinel)))
+  const assessment = assessMarkupImpact({ impactClass: 'markup', steps: claimedSteps(store, claims, context), oracleEvents: [], browserExecutionAttested })
   return { satisfied: assessment.satisfied, reason: assessment.reason }
 }
 
@@ -1231,6 +1243,11 @@ function implicitReadDisclosure(store: TranscriptStore, claims: readonly VerifyC
   if (!probe) return { satisfied: false, reason: 'no probe exchange carries a JSON body to inspect for an owner-scoped disclosure' }
   if (!isReadMethod(probe.method)) {
     return { satisfied: false, reason: 'the probe exchange is a state-changing request; a write needs a persisted-impact claim, not a read disclosure' }
+  }
+  const ctrls = steps.filter(s => s.arm === 'control')
+  if (ctrls.length > 0 && ctrls.every(c => !c.actor.handle && c.actor.auth === 'unknown' && (c.status === 401 || c.status === 403)) &&
+      (Boolean(probe.actor.handle) || probe.actor.auth !== 'unknown') && !hasForeignTenantOrOwnerDisclosure(steps, probe, null) && !probeHasForeignScopeField(probe)) {
+    return { satisfied: false, reason: 'an unauthenticated 401/403 control only proves login enforcement, not foreign-tenant or foreign-owner disclosure' }
   }
   const disclosure = assessReadDisclosure({ steps, probe })
   return { satisfied: disclosure.satisfied, reason: disclosure.reason }
@@ -1470,7 +1487,8 @@ export function evaluateClaim(
       const diffObs = { stableDelta: stableDelta.slice(0, 16), similarity: Number(cross.similarity.toFixed(4)), rounds: controls.length, stableControl: !unstableControl, stableVariant: !unstableVariant }
       if (distinct) {
         const vStubs = claim.variantIds.map((id, i) => detectIntermediateStub(store.get(id), variants[i]))
-        if (vStubs.every(s => s.isStub) && variants.every(b => matchInjectionFingerprint(b) === null) &&
+        const sdFamily = inferInjectionFamily(context, [claim])
+        if (vStubs.every(s => s.isStub) && claim.variantIds.every(id => { const s = toTranscriptStep(store, id, 'probe', { factLog: context.factLog }); return !s || matchStrippedInjectionFingerprint(s, sdFamily) === null }) &&
             (vStubs.every(s => s.pureJobStub) || claim.controlIds.every(id => (recordStatus(store.get(id)) ?? 0) >= 400))) {
           return stubRejection(claim, vStubs[0]?.state ?? 'draft', diffObs)
         }
@@ -1739,112 +1757,100 @@ function transcriptStatusSteps(store: TranscriptStore, factLog?: HostFactLog): I
   return out
 }
 
-/** Text a claim's exchange actually produced (for fingerprint detection). */
-function claimEvidenceText(store: TranscriptStore, check: VerifyClaimCheck): string {
-  const claim = check.claim
-  const ids: string[] = []
-  if (claim.kind === 'status' || claim.kind === 'header' || claim.kind === 'body_contains' ||
-      claim.kind === 'jsonpath' || claim.kind === 'css' || claim.kind === 'dom_sentinel') {
-    ids.push(claim.exchangeId)
-  } else if (claim.kind === 'structural_diff') {
-    ids.push(...claim.controlIds, ...claim.variantIds)
-  } else if (claim.kind === 'race') {
-    ids.push(...claim.exchangeIds)
-  } else if (claim.kind === 'impact') {
-    ids.push(claim.probeExchangeId, ...(claim.controlExchangeIds ?? []), ...(claim.afterExchangeId ? [claim.afterExchangeId] : []))
-  } else if (claim.kind === 'boundary') {
-    ids.push(claim.controlExchangeId, claim.probeExchangeId)
-  } else if (claim.kind === 'mfa') {
-    ids.push(claim.enrolledExchangeId, claim.preChallengeExchangeId, claim.postChallengeExchangeId)
-  } else if (claim.kind === 'composite_receipt') {
-    ids.push(...claim.exchangeIds)
-  } else if (claim.kind === 'host_evaluated_expression') {
-    ids.push(...claim.controlIds, ...claim.probeIds)
-  }
-  return ids.map(id => store.body(id) ?? '').join('\n').slice(0, 64 * 1024)
+/** Infer injection construct family from context/claims for family-bound fingerprint checks. */
+function inferInjectionFamily(context: VerifyClaimContext, claims: readonly VerifyClaim[]): InjectionFamily | null {
+  if (context.injectionFamily) return context.injectionFamily
+  const claimVc = claims.find((c): c is Extract<VerifyClaim, { vulnClass?: string }> => 'vulnClass' in c && typeof c.vulnClass === 'string')?.vulnClass ?? ''
+  const desc = `${context.cwe ?? ''} ${context.category ?? ''} ${context.title ?? ''} ${context.description ?? ''} ${claimVc}`
+  if (/\bCWE-(?:89|564)\b|\bsqli?\b|sql[-_ ]?injection/i.test(desc)) return 'sqli'
+  if (/\bCWE-943\b|\bnosql/i.test(desc)) return 'nosqli'
+  if (/\bCWE-(?:77|78)\b|\b(?:cmdi|command[-_ ]?injection|os[-_ ]?command)\b/i.test(desc)) return 'cmdi'
+  if (/\bCWE-(?:94|1336)\b|\b(?:ssti|template[-_ ]?injection)\b/i.test(desc)) return 'ssti'
+  if (/\bCWE-611\b|\bxxe\b/i.test(desc)) return 'xxe'
+  if (/\bCWE-22\b|\b(?:traversal|path[-_ ]?traversal|lfi)\b/i.test(desc)) return 'traversal'
+  return null
 }
 
-/**
- * True when a passing claim carries evidence that stands without the HTTP status. A body/header
- * claim is not enough on its own here: the *probe exchange* must carry an engine fingerprint, which
- * is checked separately from the signed transcript body.
- */
-function hasStatusIndependentEvidence(check: VerifyClaimCheck): boolean {
-  if (!check.passed) return false
-  switch (check.claim.kind) {
-    case 'structural_diff':
-    case 'timing':
-    case 'oob':
-    case 'race':
-    case 'impact':
-    case 'boundary':
-    case 'mfa':
-    case 'dom_sentinel':
-    case 'composite_receipt':
-    case 'host_evaluated_expression':
-      return true
-    default:
-      return false
-  }
+/** Stripped, family-bound, control-absent injection fingerprint check matching oracle-invariants.ts. */
+function claimHasStrippedFingerprint(store: TranscriptStore, check: VerifyClaimCheck, factLog: HostFactLog | undefined, family: InjectionFamily | null, steps: readonly ImpactStep[]): boolean {
+  const c = check.claim
+  const ids = c.kind === 'structural_diff' ? c.variantIds
+    : c.kind === 'host_evaluated_expression' ? c.probeIds
+      : c.kind === 'impact' || c.kind === 'boundary' ? [c.probeExchangeId]
+        : c.kind === 'race' || c.kind === 'composite_receipt' ? c.exchangeIds
+          : c.kind === 'timing' || c.kind === 'mfa' ? [] : [c.exchangeId]
+  const controls = steps.filter(s => s.arm === 'control')
+  return ids.some(id => {
+    if (store.get(id)?.request?.sessionRole === 'control') return false
+    const step = toTranscriptStep(store, id, 'probe', { factLog })
+    const fp = step ? matchStrippedInjectionFingerprint(step, family) : null
+    return Boolean(fp && !controls.some(ctrl => ctrl.route === step!.route && matchStrippedInjectionFingerprint(ctrl, fp.family) !== null))
+  })
 }
 
-export function evaluateClaims(
-  store: TranscriptStore,
-  claims: readonly VerifyClaim[],
-  context: VerifyClaimContext = {},
-): VerifyOracleResult {
+const STATUS_INDEPENDENT_KINDS = new Set<VerifyClaim['kind']>(['structural_diff', 'timing', 'oob', 'race', 'impact', 'boundary', 'mfa', 'dom_sentinel', 'composite_receipt', 'host_evaluated_expression'])
+const hasStatusIndependentEvidence = (check: VerifyClaimCheck): boolean => check.passed && STATUS_INDEPENDENT_KINDS.has(check.claim.kind)
+
+export function evaluateClaims(store: TranscriptStore, claims: readonly VerifyClaim[], context: VerifyClaimContext = {}): VerifyOracleResult {
   const checks = claims.map(claim => evaluateClaim(store, claim, context))
   const failures = checks.filter(c => !c.passed).map(c => `${c.claim.kind}: ${c.detail}`)
   const claimed = context.claimedImpact
-  // Universal status-only guard: a failing probe is never confirmation by itself. A 2xx -> 4xx/5xx
-  // transition must be backed by an engine/parser fingerprint, a structural differential, a timing
-  // arm, a state delta or an OOB callback; otherwise the claim is a bare availability/error signal.
+  const injectionFamily = inferInjectionFamily(context, claims)
   const statusSteps = transcriptStatusSteps(store, context.factLog)
   const statusOnly = assessStatusOnlyDivergence(statusSteps)
   if (statusOnly.statusOnly) {
-    const probeText = statusOnly.probeId ? store.body(statusOnly.probeId) ?? '' : ''
-    const fingerprintBacked = matchInjectionFingerprint(probeText) !== null
-    const backed = fingerprintBacked || checks.some(check => hasStatusIndependentEvidence(check))
-    if (!backed) {
+    const probeStep = statusOnly.probeId ? statusSteps.find(s => s.id === statusOnly.probeId) : undefined
+    const fingerprintBacked = Boolean(probeStep && matchStrippedInjectionFingerprint(probeStep, injectionFamily) !== null)
+    if (!fingerprintBacked && !checks.some(hasStatusIndependentEvidence)) {
       failures.push(`confirmation: ${statusOnly.reason} A status-only divergence cannot confirm injection, XSS, SSRF, traversal or any other class; cite an engine/parser fingerprint, a stable structural differential, a timing separation, a persisted state delta or an OOB callback.`)
     }
   }
-  const injectionEvidencePassed = checks.some(check =>
-    check.passed && (
-      check.claim.kind === 'impact' && check.claim.impactClass === 'injection' ||
-      check.claim.kind === 'host_evaluated_expression' ||
-      check.claim.kind === 'structural_diff' ||
-      check.claim.kind === 'timing' ||
-      check.claim.kind === 'oob' ||
-      matchInjectionFingerprint(claimEvidenceText(store, check)) !== null))
-  // A boundary claim substitutes for impact evidence only when it crossed an actual denial/challenge;
-  // an actor/precondition differential alone is not object-level impact.
-  const boundaryClaimPassed = checks.some(check =>
-    check.passed && check.claim.kind === 'boundary' &&
-    (check.observed as { arm?: unknown } | undefined)?.arm === 'control_denied')
-  const compositePassed = checks.some(check => check.passed && check.claim.kind === 'composite_receipt')
-  const compositeFailed = checks.some(check => !check.passed && check.claim.kind === 'composite_receipt')
-  const impactBacked = compositePassed || checks.some(check =>
-    check.passed && check.claim.kind === 'impact' &&
-    (check.claim.impactClass === claimed ||
-      ((claimed === 'bfla' || claimed === 'disclosure') && check.claim.impactClass === 'authorization')))
-  if (claimed && claimed !== 'other' && !impactBacked && !compositeFailed) {
-    if (claimed === 'authorization' || claimed === 'disclosure') {
+  const injectionEvidencePassed = checks.some(c => c.passed && (
+    (c.claim.kind === 'impact' && c.claim.impactClass === 'injection') ||
+    c.claim.kind === 'host_evaluated_expression' || c.claim.kind === 'structural_diff' ||
+    c.claim.kind === 'timing' || c.claim.kind === 'oob' ||
+    claimHasStrippedFingerprint(store, c, context.factLog, injectionFamily, statusSteps)))
+  const hasTerminalOracle = checks.some(c => c.passed && STATUS_INDEPENDENT_KINDS.has(c.claim.kind) && c.claim.kind !== 'structural_diff')
+  // Resolve effective class even when claimedImpact is 'other'/omitted so label permutations cannot bypass class gates.
+  let effectiveClaimed: Exclude<ImpactClass, 'other'> | undefined = claimed && claimed !== 'other' ? claimed : undefined
+  if (!effectiveClaimed && (context.cwe || context.category || context.title || context.description)) {
+    const fromDesc = classifyImpactDescriptor({ cwe: context.cwe, category: context.category, title: context.title, description: context.description })
+    if (fromDesc !== 'other') effectiveClaimed = fromDesc
+  }
+  if (!effectiveClaimed && !hasTerminalOracle && !injectionEvidencePassed) {
+    const hasActiveMarkupClaim = checks.some(c => c.passed && c.claim.kind === 'body_contains' && !c.claim.absent && ACTIVE_MARKUP_RE.test(c.claim.text))
+    const hasSelfEchoClaim = checks.some(c => {
+      if (!c.passed || c.claim.kind !== 'body_contains' || c.claim.absent || c.claim.text.length < 4) return false
+      const reqStr = `${store.get(c.claim.exchangeId)?.request?.pathAndQuery ?? ''}\n${store.requestBody(c.claim.exchangeId) ?? ''}`
+      let decoded = reqStr
+      try { decoded = decodeURIComponent(reqStr.replace(/\+/g, ' ')) } catch { /* keep raw */ }
+      return (reqStr.includes(c.claim.text) || decoded.includes(c.claim.text)) && statusSteps.some(s => s.arm === 'control')
+    })
+    const ctrls = statusSteps.filter(s => s.arm === 'control'), prbs = statusSteps.filter(s => s.arm === 'probe')
+    const hasAuthzShape = ctrls.length > 0 && prbs.length > 0 && (
+      ctrls.some(c => prbs.some(p => (c.actor.handle ?? null) !== (p.actor.handle ?? null) || (c.actor.tenant ?? null) !== (p.actor.tenant ?? null))) ||
+      ctrls.some(c => c.status === 401 || c.status === 403))
+    if (injectionFamily) effectiveClaimed = 'injection'
+    else if (hasActiveMarkupClaim) effectiveClaimed = 'markup'
+    else if (hasSelfEchoClaim) effectiveClaimed = 'injection'
+    else if (hasAuthzShape) effectiveClaimed = 'authorization'
+  }
+  const boundaryClaimPassed = checks.some(c => c.passed && c.claim.kind === 'boundary' && (c.observed as { arm?: unknown } | undefined)?.arm === 'control_denied')
+  const compositePassed = checks.some(c => c.passed && c.claim.kind === 'composite_receipt')
+  const compositeFailed = checks.some(c => !c.passed && c.claim.kind === 'composite_receipt')
+  const impactBacked = compositePassed || checks.some(c => c.passed && c.claim.kind === 'impact' &&
+    (c.claim.impactClass === effectiveClaimed || ((effectiveClaimed === 'bfla' || effectiveClaimed === 'disclosure') && c.claim.impactClass === 'authorization')))
+  if (effectiveClaimed && !impactBacked && !compositeFailed) {
+    if (effectiveClaimed === 'authorization' || effectiveClaimed === 'disclosure') {
       const disclosure = implicitReadDisclosure(store, claims, context)
-      if (!disclosure.satisfied && !boundaryClaimPassed) {
-        failures.push(`impact: ${claimed} claim dismissed — ${disclosure.reason}. A status/self-echo claim is not object-level disclosure.`)
-      }
-    } else if (claimed === 'markup') {
+      if (!disclosure.satisfied && !boundaryClaimPassed) failures.push(`impact: ${effectiveClaimed} claim dismissed — ${disclosure.reason}. A status/self-echo claim is not object-level disclosure.`)
+    } else if (effectiveClaimed === 'markup') {
       const markup = implicitMarkupEvidence(store, claims, context)
-      if (!markup.satisfied) {
-        failures.push(`impact: markup claim dismissed — ${markup.reason}`)
-      }
-    } else if (claimed === 'injection') {
-      if (!injectionEvidencePassed) {
-        failures.push('impact: injection claim requires a positive semantic oracle — an engine/dialect error fingerprint, a paired boolean differential with a stable structural delta, a >3x timing arm, a verified OOB callback, or the paired status-boolean contrast. A status-only 2xx -> 4xx/5xx divergence is not proof.')
-      }
+      if (!markup.satisfied) failures.push(`impact: markup claim dismissed — ${markup.reason}`)
+    } else if (effectiveClaimed === 'injection') {
+      if (!injectionEvidencePassed) failures.push('impact: injection claim requires a positive semantic oracle — an engine/dialect error fingerprint, a paired boolean differential with a stable structural delta, a >3x timing arm, a verified OOB callback, or the paired status-boolean contrast. A status-only 2xx -> 4xx/5xx divergence is not proof.')
     } else {
-      failures.push(`impact: ${claimed} claim requires a passing impact-evidence claim for its class (boundary differential, repeated transition, protected-field readback or invariant event); status and echo claims are insufficient.`)
+      failures.push(`impact: ${effectiveClaimed} claim requires a passing impact-evidence claim for its class (boundary differential, repeated transition, protected-field readback or invariant event); status and echo claims are insufficient.`)
     }
   }
   // Universal default-deny: authentication/bypass claims confirm only with a signed, challenged
@@ -1865,10 +1871,9 @@ export function evaluateClaims(
   }
   // Standalone intermediate-stub gate: reject non-composite proofs whose succeeding probes only
   // create or poll a draft/queued/pending object or handle stub with no terminal security impact.
-  const hasTerminalOracle = checks.some(c => c.passed && ['composite_receipt', 'host_evaluated_expression', 'oob', 'dom_sentinel', 'timing', 'mfa', 'race', 'impact', 'boundary'].includes(c.claim.kind))
   const hasEvaluatedOrFp = checks.some(p => {
     if (!p.passed) return false
-    if (matchInjectionFingerprint(claimEvidenceText(store, p)) !== null) return true
+    if (claimHasStrippedFingerprint(store, p, context.factLog, injectionFamily, statusSteps)) return true
     const pc = p.claim
     if (pc.kind !== 'body_contains' || pc.absent === true || pc.text.length < 4) return false
     return checks.some(a => a.passed && a.claim.kind === 'body_contains' && a.claim.absent === true && a.claim.text === pc.text &&

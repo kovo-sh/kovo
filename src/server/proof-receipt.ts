@@ -35,6 +35,7 @@ import {
   stepMutatesState,
 } from './oracle-invariants.ts'
 import type { BooleanDifferentialArm, BooleanDifferentialRound, ImpactClass, ImpactInput, ImpactStep, RoleName } from './oracle-invariants.ts'
+import { isJobOrHandleStub } from './v8-oracle-families.ts'
 
 export const receiptIdSchema = z.string().trim().min(1).max(128)
 
@@ -1219,6 +1220,17 @@ export function verifyReceipt(
   if (statusOnly.statusOnly) {
     return reject(receipt, rule, `Bare status-only divergence (${statusOnly.controlStatus ?? 'no control'} -> ${statusOnly.probeStatus}): ${statusOnly.reason} A 4xx/5xx probe is only supporting evidence; confirmation needs a fingerprint, structural differential, timing arm, state delta or OOB callback.`)
   }
+  if (
+    (impactClass === 'authorization' || impactClass === 'bfla' || impactClass === 'disclosure' ||
+      impactClass === 'business_logic' || impactClass === 'mass_assignment' || impactClass === 'csrf') &&
+    isPureJobOrHandleStubChain(steps)
+  ) {
+    return reject(
+      receipt,
+      rule,
+      'terminal_impact_unproven: probe response is only an intermediate job/handle/ack stub without substantive post-probe terminal impact.',
+    )
+  }
   // Bind the receipt target to the mutating exchange the claim actually made: a GET used as a
   // readback baseline must never become the finding's route for a write.
   const mutatingProbeEntry = citedEntries.find(entry =>
@@ -1286,6 +1298,47 @@ export function verifyReceipt(
           receipt,
           rule,
           `Bare collection GET (${readProbe.route ?? readProbe.pathAndQuery ?? '/'}) without an object identifier cannot confirm ${receipt.vulnClass} without explicit cross-tenant or foreign-owner data disclosure.`,
+        )
+      }
+    }
+  }
+  // Defense-in-depth anon-control authz guard: when every denied control is unauthenticated and
+  // there is no cross-tenant control read, an authenticated probe must prove foreign-tenant or
+  // foreign-owner data disclosure rather than merely proving the route enforces login.
+  if (impactClass === 'authorization' || impactClass === 'bfla') {
+    const stepHasAuth = (s: ImpactStep): boolean =>
+      Boolean(s.actor.handle) ||
+      ['cookie', 'bearer', 'header'].includes(s.actor.auth) ||
+      Boolean(headerValue(s.requestHeaders, 'authorization') || headerValue(s.requestHeaders, 'cookie'))
+    const deniedCtrls = steps.filter(s => s.arm === 'control' && (s.status === 401 || s.status === 403))
+    const okAuthProbes = steps.filter(s => s.arm === 'probe' && is2xxStatus(s.status) && stepHasAuth(s))
+    const hasAuthCtrl = steps.some(s => s.arm === 'control' && stepHasAuth(s))
+    if (deniedCtrls.length > 0 && !hasAuthCtrl && okAuthProbes.length > 0) {
+      const hasForeign = okAuthProbes.some(p => {
+        if (stepMutatesState(p)) return false
+        if (hasForeignTenantOrOwnerDisclosure(steps, p, receipt.resourceTenant ?? null)) return true
+        const obj = parseStepJson(p)
+        if (!obj || typeof obj !== 'object') return false
+        const pt = p.actor.tenant?.toLowerCase() ?? null, ph = p.actor.handle?.toLowerCase() ?? null
+        const visit = (v: unknown, d: number): boolean => {
+          if (d > 3 || !v || typeof v !== 'object') return false
+          if (Array.isArray(v)) return v.some(x => visit(x, d + 1))
+          for (const [k, x] of Object.entries(v as Record<string, unknown>)) {
+            if (typeof x === 'string' && x.trim()) {
+              const lk = k.toLowerCase(), lv = x.trim().toLowerCase()
+              if (/^(?:tenant|org|organization|workspace)(?:_?id|slug)?$/.test(lk) && pt && lv !== pt) return true
+              if (/^(?:owner|user)(?:_?id)?$/.test(lk) && ph && lv !== ph) return true
+            } else if (x && typeof x === 'object' && visit(x, d + 1)) return true
+          }
+          return false
+        }
+        return visit(obj, 0)
+      })
+      if (!hasForeign) {
+        return reject(
+          receipt,
+          rule,
+          'Anon-control authorization claim rejected: an unauthenticated 401/403 control only proves login enforcement, not that an authenticated actor crossed an authorization boundary without foreign-tenant or foreign-owner disclosure.',
         )
       }
     }
@@ -2203,6 +2256,10 @@ function verifyAuthBypassReceipt(
       }
       if (probeTrim === controlBodyRaw.trim()) {
         lastRejection = 'Auth bypass rejected: probe response body is identical to the denied control response.'
+        continue
+      }
+      if (isJobOrHandleStub(probe.step.json, probe.step.body, probe.step.status, probe.step.method, probe.step.route ?? probe.step.pathAndQuery)) {
+        lastRejection = 'Auth bypass rejected: probe returned only an intermediate job/handle/ack stub without substantive protected data.'
         continue
       }
       const parsedJson = parseStepJson(probe.step)
@@ -3455,6 +3512,30 @@ export function buildOobReceipt(input: {
   })
 }
 
+/**
+ * True when every 2xx probe step is a job/handle/ack stub (`isJobOrHandleStub`) and no subsequent
+ * non-stub readback step (GET/HEAD/OPTIONS) exposes substantive terminal state.
+ */
+export function isPureJobOrHandleStubChain(steps: readonly ImpactStep[]): boolean {
+  const okProbes: Array<{ step: ImpactStep; idx: number }> = []
+  for (let i = 0; i < steps.length; i += 1) {
+    const s = steps[i]!
+    if (s.arm === 'probe' && is2xxStatus(s.status)) okProbes.push({ step: s, idx: i })
+  }
+  if (okProbes.length === 0) return false
+  const allProbesStub = okProbes.every(({ step }) =>
+    isJobOrHandleStub(step.json, step.body, step.status, step.method, step.route ?? step.pathAndQuery))
+  if (!allProbesStub) return false
+  const firstProbeIdx = okProbes[0]!.idx
+  const hasNonStubReadbackAfter = steps.some((step, idx) =>
+    idx > firstProbeIdx &&
+    step.arm !== 'cleanup' &&
+    is2xxStatus(step.status) &&
+    /^(?:GET|HEAD|OPTIONS)$/i.test(step.method ?? '') &&
+    !isJobOrHandleStub(step.json, step.body, step.status, step.method, step.route ?? step.pathAndQuery))
+  return !hasNonStubReadbackAfter
+}
+
 export type ProofReceiptMode = 'off' | 'shadow' | 'strict'
 
 /**
@@ -3462,14 +3543,27 @@ export type ProofReceiptMode = 'off' | 'shadow' | 'strict'
  *  - `strict` (default): `verifyReceipt()` is the final confirmation gate and vetoes any
  *    unsubstantiated DSL confirmation (never widens a non-confirming verdict).
  *  - `shadow` / `advisory`: records the receipt without changing the DSL verdict (explicit env
- *    override for parity/regression tests).
- *  - `off` / `0` / `false` / `no`: disables receipt evaluation on legacy DSL replays.
+ *    override, allowed ONLY when `NODE_ENV === 'test'`).
+ *  - `off` / `0` / `false` / `no`: disables receipt evaluation on legacy DSL replays (allowed
+ *    ONLY when `NODE_ENV === 'test'`).
  */
 export function proofReceiptMode(env: NodeJS.ProcessEnv = process.env): ProofReceiptMode {
   const raw = (env.KOVO_PROOF_RECEIPT ?? '').trim().toLowerCase()
-  if (raw === '0' || raw === 'off' || raw === 'false' || raw === 'no') return 'off'
-  if (raw === 'shadow' || raw === 'advisory') return 'shadow'
-  return 'strict'
+  const requested: ProofReceiptMode =
+    raw === '0' || raw === 'off' || raw === 'false' || raw === 'no'
+      ? 'off'
+      : raw === 'shadow' || raw === 'advisory'
+        ? 'shadow'
+        : 'strict'
+  if (requested !== 'strict') {
+    const nodeEnv = (env.NODE_ENV ?? '').trim().toLowerCase()
+    if (nodeEnv !== 'test') {
+      throw new Error(
+        `KOVO_PROOF_RECEIPT=${raw} (${requested}) is rejected outside NODE_ENV=test; strict receipt confirmation is mandatory.`,
+      )
+    }
+  }
+  return requested
 }
 
 export const MAX_REPLAY_REGEX_PATTERN_LENGTH = 256

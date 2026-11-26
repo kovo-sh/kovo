@@ -1,0 +1,60 @@
+{
+  "id": "xss-reflection-tp",
+  "side": "tp",
+  "archetype": "xss-executable-reflection",
+  "description": "HTML endpoint reflects an unescaped executable script/event-handler markup payload with browser execution attestation.",
+  "canonicalLabel": {
+    "cwe": "CWE-79",
+    "category": "xss",
+    "title": "Reflected XSS in greeting banner",
+    "impact": "Active script markup executes in victim browser.",
+    "claimedImpact": "markup",
+    "claimedBoundary": "other",
+    "vulnClass": "xss_reflected"
+  },
+  "freeTextLabel": {
+    "title": "Cross-site scripting via unescaped greeting markup"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": false,
+    "evaluateClaims": true,
+    "composite": false,
+    "floorInjectionRecipe": false
+  },
+  "expected": {
+    "confirmed": true
+  },
+  "personas": [],
+  "exchanges": [
+    {
+      "id": "ctl",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/greet?name=alice",
+      "persona": null,
+      "status": 200,
+      "mediaType": "text/html",
+      "responseHeaders": { "content-type": "text/html; charset=utf-8" },
+      "body": "<html><body><h1>Hello alice</h1></body></html>"
+    },
+    {
+      "id": "prb",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/greet?name=%3Csvg+onload%3DkovoCanary()%3E",
+      "persona": null,
+      "status": 200,
+      "mediaType": "text/html",
+      "responseHeaders": { "content-type": "text/html; charset=utf-8" },
+      "body": "<html><body><h1>Hello <svg onload=kovoCanary()></h1></body></html>",
+      "executedSentinels": ["kovo-xss-sentinel"]
+    }
+  ],
+  "claims": [
+    { "kind": "status", "exchangeId": "prb", "expected": 200 },
+    { "kind": "dom_sentinel", "exchangeId": "prb", "sentinel": "kovo-xss-sentinel", "mode": "executed" }
+  ]
+}

@@ -1,0 +1,84 @@
+{
+  "id": "persisted-mutation-tp",
+  "side": "tp",
+  "archetype": "mass-assignment-persisted-mutation",
+  "description": "Mass assignment PATCH returns lightweight ok:true ack followed by substantive GET readback proving persisted protected owner_id change.",
+  "canonicalLabel": {
+    "cwe": "CWE-915",
+    "category": "mass-assignment",
+    "title": "Mass assignment overwrites invoice owner_id",
+    "impact": "Caller persists protected owner_id field verified via subsequent GET readback.",
+    "claimedImpact": "mass_assignment",
+    "claimedBoundary": "other",
+    "vulnClass": "mass_assignment"
+  },
+  "freeTextLabel": {
+    "title": "Mass assignment overpost updates invoice ownership"
+  },
+  "paths": {
+    "replay": true,
+    "floorReceipt": true,
+    "evaluateClaims": true,
+    "composite": false,
+    "floorInjectionRecipe": false
+  },
+  "expected": {
+    "confirmed": true
+  },
+  "personas": [
+    {
+      "handle": "member_a",
+      "roleLabel": "member (tenant-a)",
+      "role": "member",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-member-a-token"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "before",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/invoices/42",
+      "persona": "member_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"id\":\"42\",\"owner_id\":\"u1\",\"status\":\"open\",\"amount\":1500}"
+    },
+    {
+      "id": "prb",
+      "arm": "probe",
+      "role": "probe",
+      "method": "PATCH",
+      "pathAndQuery": "/api/invoices/42",
+      "persona": "member_a",
+      "requestJson": { "owner_id": "u2" },
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"ok\":true}"
+    },
+    {
+      "id": "after",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/invoices/42",
+      "persona": "member_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"id\":\"42\",\"owner_id\":\"u2\",\"status\":\"open\",\"amount\":1500}"
+    }
+  ],
+  "replaySpec": {
+    "assertionsJq": "{ controlPassed: (.steps.before.json.owner_id == \"u1\"), confirmed: (.steps.prb.status == 200 and .steps.after.json.owner_id == \"u2\"), observed: .steps.after.json.owner_id, expected: \"u1\" }"
+  },
+  "claims": [
+    { "kind": "impact", "impactClass": "mass_assignment", "beforeExchangeId": "before", "probeExchangeId": "prb", "afterExchangeId": "after" }
+  ]
+}

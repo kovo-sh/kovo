@@ -1,0 +1,74 @@
+{
+  "id": "sqli-echoed-error-fp",
+  "side": "fp",
+  "archetype": "sqli-echoed-error",
+  "description": "Probe sends an engine error string in query parameter and server merely echoes the request input back in JSON.",
+  "canonicalLabel": {
+    "cwe": "CWE-89",
+    "category": "sqli",
+    "title": "SQL injection via echoed error text in search",
+    "impact": "Server echoed query parameter containing error text.",
+    "claimedImpact": "injection",
+    "claimedBoundary": "other",
+    "vulnClass": "sqli",
+    "injectionFamily": "sqli"
+  },
+  "freeTextLabel": {
+    "title": "Reflected database error string in search response"
+  },
+  "paths": {
+    "replay": true,
+    "floorReceipt": true,
+    "evaluateClaims": true,
+    "composite": false,
+    "floorInjectionRecipe": true
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [],
+  "exchanges": [
+    {
+      "id": "ctl",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/search?q=books",
+      "persona": null,
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"query\":\"books\",\"items\":[]}"
+    },
+    {
+      "id": "prb",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/search?q=SQLITE_ERROR%3A+syntax+error",
+      "persona": null,
+      "status": 400,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"error\":\"Invalid query: SQLITE_ERROR: syntax error\"}"
+    }
+  ],
+  "replaySpec": {
+    "assertionsJq": "{ controlPassed: (.steps.ctl.status == 200), confirmed: (.steps.prb.body | contains(\"SQLITE_ERROR\")), observed: .steps.prb.body, expected: \"no error\" }"
+  },
+  "injectionRecipe": {
+    "param": "q",
+    "controlValue": "books",
+    "payload": "SQLITE_ERROR: syntax error",
+    "family": "sqli"
+  },
+  "claims": [
+    { "kind": "status", "exchangeId": "ctl", "expected": 200 },
+    { "kind": "status", "exchangeId": "prb", "expected": 400 },
+    { "kind": "body_contains", "exchangeId": "prb", "text": "SQLITE_ERROR: syntax error" }
+  ],
+  "bareClaims": [
+    { "kind": "status", "exchangeId": "ctl", "expected": 200 },
+    { "kind": "body_contains", "exchangeId": "prb", "text": "SQLITE_ERROR: syntax error" }
+  ]
+}

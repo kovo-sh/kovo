@@ -1,0 +1,97 @@
+{
+  "id": "cross-tenant-bola-public-fp",
+  "side": "fp",
+  "archetype": "public-catalog-bola-fp",
+  "description": "Public catalog resource returns identical JSON to anonymous caller and authenticated cross-tenant caller.",
+  "canonicalLabel": {
+    "cwe": "CWE-639",
+    "category": "bola",
+    "title": "Cross-tenant BOLA read on public catalog item",
+    "impact": "Reads catalog item across tenants.",
+    "claimedImpact": "authorization",
+    "claimedBoundary": "access",
+    "vulnClass": "bola"
+  },
+  "freeTextLabel": {
+    "title": "Cross-tenant unauthorized access to catalog item"
+  },
+  "paths": {
+    "replay": true,
+    "floorReceipt": true,
+    "evaluateClaims": true,
+    "composite": false,
+    "floorInjectionRecipe": false
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [
+    {
+      "handle": "owner_a",
+      "roleLabel": "owner (tenant-a)",
+      "role": "owner",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-owner-a-token"
+    },
+    {
+      "handle": "member_b",
+      "roleLabel": "member (tenant-b)",
+      "role": "member",
+      "tenant": "tenant-b",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-member-b-token"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "anon",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/catalog/item_7",
+      "persona": null,
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"id\":\"item_7\",\"name\":\"Standard Plan\",\"price\":25}"
+    },
+    {
+      "id": "owner_read",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/catalog/item_7",
+      "persona": "owner_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"id\":\"item_7\",\"name\":\"Standard Plan\",\"price\":25}"
+    },
+    {
+      "id": "prb",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/catalog/item_7",
+      "persona": "member_b",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"id\":\"item_7\",\"name\":\"Standard Plan\",\"price\":25}"
+    }
+  ],
+  "replaySpec": {
+    "assertionsJq": "{ controlPassed: (.steps.owner_read.status == 200), confirmed: (.steps.prb.status == 200 and .steps.prb.json.id == \"item_7\"), observed: .steps.prb.json.name, expected: \"403\" }"
+  },
+  "claims": [
+    { "kind": "impact", "impactClass": "authorization", "probeExchangeId": "prb", "controlExchangeIds": ["anon", "owner_read"] }
+  ],
+  "bareClaims": [
+    { "kind": "status", "exchangeId": "anon", "expected": 200 },
+    { "kind": "status", "exchangeId": "prb", "expected": 200 },
+    { "kind": "body_contains", "exchangeId": "prb", "text": "Standard Plan" }
+  ]
+}

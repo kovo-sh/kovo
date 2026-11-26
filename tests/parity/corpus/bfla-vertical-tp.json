@@ -1,0 +1,116 @@
+{
+  "id": "bfla-vertical-tp",
+  "side": "tp",
+  "archetype": "bfla-vertical",
+  "description": "Viewer invokes admin-only role promotion action that denies member control and persists protected role change to admin.",
+  "canonicalLabel": {
+    "cwe": "CWE-862",
+    "category": "bfla",
+    "title": "Vertical BFLA on admin user role promotion endpoint",
+    "impact": "Viewer executes admin-only role escalation state transition.",
+    "claimedImpact": "bfla",
+    "claimedBoundary": "access",
+    "vulnClass": "bfla"
+  },
+  "freeTextLabel": {
+    "title": "Vertical privilege escalation on function-level role promotion route"
+  },
+  "paths": {
+    "replay": true,
+    "floorReceipt": true,
+    "evaluateClaims": true,
+    "composite": false,
+    "floorInjectionRecipe": false
+  },
+  "expected": {
+    "confirmed": true
+  },
+  "personas": [
+    {
+      "handle": "admin_a",
+      "roleLabel": "admin (tenant-a)",
+      "role": "admin",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-admin-a-token"
+    },
+    {
+      "handle": "member_a",
+      "roleLabel": "member (tenant-a)",
+      "role": "member",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-member-a-token"
+    },
+    {
+      "handle": "viewer_a",
+      "roleLabel": "viewer (tenant-a)",
+      "role": "viewer",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-viewer-a-token"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "before",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/admin/users/u_55",
+      "persona": "admin_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"id\":\"u_55\",\"role\":\"member\",\"email\":\"target@tenant-a.example\"}"
+    },
+    {
+      "id": "denied",
+      "arm": "control",
+      "role": "control",
+      "method": "POST",
+      "pathAndQuery": "/api/admin/users/u_55/role",
+      "persona": "member_a",
+      "requestJson": { "role": "admin" },
+      "status": 403,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"error\":\"forbidden\"}"
+    },
+    {
+      "id": "prb",
+      "arm": "probe",
+      "role": "probe",
+      "method": "POST",
+      "pathAndQuery": "/api/admin/users/u_55/role",
+      "persona": "viewer_a",
+      "requestJson": { "role": "admin" },
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"id\":\"u_55\",\"role\":\"admin\",\"email\":\"target@tenant-a.example\"}"
+    },
+    {
+      "id": "after",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/admin/users/u_55",
+      "persona": "admin_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"id\":\"u_55\",\"role\":\"admin\",\"email\":\"target@tenant-a.example\"}"
+    }
+  ],
+  "replaySpec": {
+    "requiredRole": "admin",
+    "assertionsJq": "{ controlPassed: (.steps.before.json.role == \"member\" and .steps.denied.status == 403), confirmed: (.steps.prb.status == 200 and .steps.after.json.role == \"admin\"), observed: .steps.after.json.role, expected: \"member\" }"
+  },
+  "claims": [
+    { "kind": "impact", "impactClass": "bfla", "beforeExchangeId": "before", "probeExchangeId": "prb", "afterExchangeId": "after", "controlExchangeIds": ["before", "denied", "after"], "requiredRole": "admin" }
+  ]
+}

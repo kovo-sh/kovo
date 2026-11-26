@@ -1,0 +1,85 @@
+{
+  "id": "bfla-in-policy-fp",
+  "side": "fp",
+  "archetype": "bfla-in-policy-write",
+  "description": "Same-tenant admin executes an admin-privileged write; no role escalation differential exists.",
+  "canonicalLabel": {
+    "cwe": "CWE-862",
+    "category": "bfla",
+    "title": "Vertical BFLA on admin settings update",
+    "impact": "Admin updates same-tenant settings.",
+    "claimedImpact": "bfla",
+    "claimedBoundary": "access",
+    "vulnClass": "bfla"
+  },
+  "freeTextLabel": {
+    "title": "Vertical privilege escalation on settings update"
+  },
+  "paths": {
+    "replay": true,
+    "floorReceipt": true,
+    "evaluateClaims": true,
+    "composite": false,
+    "floorInjectionRecipe": false
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [
+    {
+      "handle": "admin_a",
+      "roleLabel": "admin (tenant-a)",
+      "role": "admin",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-admin-a-token"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "before",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/admin/settings",
+      "persona": "admin_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"theme\":\"light\",\"retention_days\":30}"
+    },
+    {
+      "id": "prb",
+      "arm": "probe",
+      "role": "probe",
+      "method": "PATCH",
+      "pathAndQuery": "/api/admin/settings",
+      "persona": "admin_a",
+      "requestJson": { "theme": "dark" },
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"theme\":\"dark\",\"retention_days\":30}"
+    },
+    {
+      "id": "after",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/admin/settings",
+      "persona": "admin_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"theme\":\"dark\",\"retention_days\":30}"
+    }
+  ],
+  "replaySpec": {
+    "requiredRole": "admin",
+    "assertionsJq": "{ controlPassed: (.steps.before.json.theme == \"light\"), confirmed: (.steps.prb.status == 200 and .steps.after.json.theme == \"dark\"), observed: .steps.after.json.theme, expected: \"light\" }"
+  },
+  "claims": [
+    { "kind": "impact", "impactClass": "bfla", "beforeExchangeId": "before", "probeExchangeId": "prb", "afterExchangeId": "after", "controlExchangeIds": ["before", "after"], "requiredRole": "admin" }
+  ]
+}

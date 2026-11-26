@@ -505,7 +505,7 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
         const stepSnapshots = snapshotHttpChainSteps(spec, stepsOut, stepExchanges)
         const proofStrength = assessHttpChainProofStrength(spec, stepSnapshots)
         const endpointBinding = assessHttpChainEndpointBinding(spec, stepRequests, stepExchanges)
-        if (proofStrength.claim === 'authorization' && !proofStrength.satisfied && !proofGuardFailure) {
+        if (!proofStrength.satisfied && !proofGuardFailure) {
           proofGuardFailure = proofStrength.reason
         }
         if (!endpointBinding.bound && !proofGuardFailure) {
@@ -644,11 +644,6 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
         }
         if (bflaImpact.required && !bflaImpact.satisfied && !forcedInconclusiveReason) {
           forcedInconclusiveReason = bflaImpact.reason
-        }
-        if (impactGate?.required && !impactGate.satisfied && !proofGuardFailure) {
-          // Vetoes only a would-be confirmation; a spec whose assertion already fails keeps its
-          // dismissed/fixed semantics (Verify Fix must still report `fixed`).
-          proofGuardFailure = impactGate.reason
         }
         if (boundaryGate?.required && !boundaryGate.satisfied && !proofGuardFailure) {
           proofGuardFailure = boundaryGate.reason

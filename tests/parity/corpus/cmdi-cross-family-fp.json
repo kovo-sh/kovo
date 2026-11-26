@@ -1,0 +1,74 @@
+{
+  "id": "cmdi-cross-family-fp",
+  "side": "fp",
+  "archetype": "cmdi-cross-family-mismatch",
+  "description": "Claim declares OS command injection (cmdi / CWE-78) while probe response carries an unrelated SQLite error fingerprint or echoed shell text.",
+  "canonicalLabel": {
+    "cwe": "CWE-78",
+    "category": "cmdi",
+    "title": "OS command injection in diagnostics parameter",
+    "impact": "Command injection claim backed only by unrelated database error.",
+    "claimedImpact": "injection",
+    "claimedBoundary": "other",
+    "vulnClass": "cmdi",
+    "injectionFamily": "cmdi"
+  },
+  "freeTextLabel": {
+    "title": "OS command injection on diagnostics route"
+  },
+  "paths": {
+    "replay": true,
+    "floorReceipt": true,
+    "evaluateClaims": true,
+    "composite": false,
+    "floorInjectionRecipe": true
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [],
+  "exchanges": [
+    {
+      "id": "ctl",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/diag?host=alpha",
+      "persona": null,
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"host\":\"alpha\",\"reachable\":true}"
+    },
+    {
+      "id": "prb",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/diag?host=sh%3A+1%3A+kovo_missing%3A+not+found",
+      "persona": null,
+      "status": 400,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"error\":\"Invalid host value: sh: 1: kovo_missing: not found\"}"
+    }
+  ],
+  "replaySpec": {
+    "assertionsJq": "{ controlPassed: (.steps.ctl.status == 200), confirmed: (.steps.prb.body | contains(\"not found\")), observed: .steps.prb.body, expected: \"200\" }"
+  },
+  "injectionRecipe": {
+    "param": "host",
+    "controlValue": "alpha",
+    "payload": "sh: 1: kovo_missing: not found",
+    "family": "cmdi"
+  },
+  "claims": [
+    { "kind": "status", "exchangeId": "ctl", "expected": 200 },
+    { "kind": "status", "exchangeId": "prb", "expected": 400 },
+    { "kind": "body_contains", "exchangeId": "prb", "text": "sh: 1: kovo_missing: not found" }
+  ],
+  "bareClaims": [
+    { "kind": "status", "exchangeId": "ctl", "expected": 200 },
+    { "kind": "body_contains", "exchangeId": "prb", "text": "sh: 1: kovo_missing: not found" }
+  ]
+}

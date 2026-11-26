@@ -1,0 +1,94 @@
+{
+  "id": "composite-stub-decoy-fp",
+  "side": "fp",
+  "archetype": "composite-stub-decoy",
+  "description": "Two-hop composite chain decoy whose terminal hop only returns a queued job/handle stub without substantive terminal impact.",
+  "canonicalLabel": {
+    "cwe": "CWE-639",
+    "category": "bola",
+    "title": "Multi-hop cross-tenant export stub decoy",
+    "impact": "Terminal hop only polls an export job stub with no data exposure.",
+    "claimedImpact": "authorization",
+    "claimedBoundary": "access",
+    "vulnClass": "bola"
+  },
+  "freeTextLabel": {
+    "title": "Two-hop cross-tenant queued job handle decoy"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": false,
+    "evaluateClaims": true,
+    "composite": true,
+    "floorInjectionRecipe": false
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [
+    {
+      "handle": "member_a",
+      "roleLabel": "member (tenant-a)",
+      "role": "member",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-member-a-token"
+    },
+    {
+      "handle": "viewer_a",
+      "roleLabel": "viewer (tenant-a)",
+      "role": "viewer",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-viewer-a-token"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "hop1_ex",
+      "arm": "setup",
+      "role": "setup",
+      "method": "POST",
+      "pathAndQuery": "/v1/exports/request",
+      "persona": "member_a",
+      "requestJson": { "tenant": "tenant-b", "scope": "ledger" },
+      "status": 201,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"jobId\":\"job_88\",\"downloadToken\":\"tok_stub_112233445566\"}"
+    },
+    {
+      "id": "hop2_ctl",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/v1/exports/status?token=invalid_tok",
+      "persona": "viewer_a",
+      "status": 403,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"error\":\"forbidden\"}"
+    },
+    {
+      "id": "hop2_prb",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/v1/exports/status?token=tok_stub_112233445566",
+      "persona": "member_a",
+      "status": 202,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"jobId\":\"job_88\",\"status\":\"queued\",\"tenant\":\"tenant-b\"}"
+    }
+  ],
+  "composite": {
+    "chainId": "PARITY-COMP-FP-1",
+    "terminalVulnClass": "bola",
+    "oracleFamily": "dual_tenant_abac",
+    "capabilityToken": "tok_stub_112233445566",
+    "claimedDelta": "Terminal hop only returned queued stub without terminal data."
+  }
+}

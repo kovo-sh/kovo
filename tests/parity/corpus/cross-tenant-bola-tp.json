@@ -1,0 +1,108 @@
+{
+  "id": "cross-tenant-bola-tp",
+  "side": "tp",
+  "archetype": "cross-tenant-bola",
+  "description": "Cross-tenant BOLA read where tenant-b member retrieves tenant-a owner invoice containing victim email and tenant scope.",
+  "canonicalLabel": {
+    "cwe": "CWE-639",
+    "category": "bola",
+    "title": "Cross-tenant BOLA read on victim invoice",
+    "impact": "Tenant-B member reads Tenant-A invoice record and victim email.",
+    "claimedImpact": "authorization",
+    "claimedBoundary": "access",
+    "vulnClass": "bola"
+  },
+  "freeTextLabel": {
+    "title": "Cross-tenant unauthorized access to another user's invoice record"
+  },
+  "paths": {
+    "replay": true,
+    "floorReceipt": true,
+    "evaluateClaims": true,
+    "composite": false,
+    "floorInjectionRecipe": false
+  },
+  "expected": {
+    "confirmed": true
+  },
+  "personas": [
+    {
+      "handle": "owner_a",
+      "roleLabel": "owner (tenant-a)",
+      "role": "owner",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-owner-a-token"
+    },
+    {
+      "handle": "viewer_b",
+      "roleLabel": "viewer (tenant-b)",
+      "role": "viewer",
+      "tenant": "tenant-b",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-viewer-b-token"
+    },
+    {
+      "handle": "member_b",
+      "roleLabel": "member (tenant-b)",
+      "role": "member",
+      "tenant": "tenant-b",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-member-b-token"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "entitled",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/invoices/inv_victim_9",
+      "persona": "owner_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"id\":\"inv_victim_9\",\"owner_id\":\"owner_a\",\"tenant_id\":\"tenant-a\",\"email\":\"billing@tenant-a.example\",\"amount_cents\":89000}"
+    },
+    {
+      "id": "denied",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/invoices/inv_victim_9",
+      "persona": "viewer_b",
+      "status": 403,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"error\":\"forbidden\"}"
+    },
+    {
+      "id": "prb",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/invoices/inv_victim_9",
+      "persona": "member_b",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"id\":\"inv_victim_9\",\"owner_id\":\"owner_a\",\"tenant_id\":\"tenant-a\",\"email\":\"billing@tenant-a.example\",\"amount_cents\":89000}"
+    }
+  ],
+  "replaySpec": {
+    "resourceTenant": "tenant-a",
+    "assertionsJq": "{ controlPassed: (.steps.entitled.status == 200 and .steps.denied.status == 403), confirmed: (.steps.prb.status == 200 and .steps.prb.json.email == .steps.entitled.json.email and .steps.prb.json.tenant_id == \"tenant-a\"), observed: .steps.prb.json.email, expected: \"403\" }"
+  },
+  "claims": [
+    { "kind": "impact", "impactClass": "authorization", "probeExchangeId": "prb", "controlExchangeIds": ["entitled", "denied"], "resourceTenant": "tenant-a" }
+  ],
+  "bareClaims": [
+    { "kind": "status", "exchangeId": "entitled", "expected": 200 },
+    { "kind": "status", "exchangeId": "denied", "expected": 403 },
+    { "kind": "status", "exchangeId": "prb", "expected": 200 },
+    { "kind": "body_contains", "exchangeId": "prb", "text": "billing@tenant-a.example" }
+  ]
+}

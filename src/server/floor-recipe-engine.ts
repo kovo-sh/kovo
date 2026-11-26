@@ -59,7 +59,7 @@ import type {
 import { actorFromPersona, assessBoundary, assessImpactEvidence, assessMassAssignmentImpact, assessMfaBypass, assessStatusOnlyDivergence, classifyBoundaryClaim, classifyImpactDescriptor, normalizeRole, parseRoleLabel } from './oracle-invariants.ts'
 import type { ActorIdentity, AmbientAuth, ImpactStep, PersonaCredentialSource, RoleName } from './oracle-invariants.ts'
 import { HostFactLog } from './host-fact-log.ts'
-import { proofReceiptMode } from './proof-receipt.ts'
+import { isPureJobOrHandleStubChain, proofReceiptMode } from './proof-receipt.ts'
 import type { ProofReceipt, ReceiptTranscript, ReceiptTranscriptEntry, ReceiptVerification } from './proof-receipt.ts'
 import { defaultTerminalOracleRegistry } from './terminal-oracle-registry.ts'
 import type { ProofReceiptMode, ReplayReceiptCheck, ReplayVerdict, ReplayVerificationResult, RetestVerdict } from './replay-verifier.ts'
@@ -2848,6 +2848,9 @@ interface HttpChainStepSnapshot {
   bodyBytes: number
   mediaType: string
   json: unknown
+  requestJson?: unknown
+  requestBody?: string
+  requestHeaders?: Record<string, string> | null
   secretMatches: number
 }
 
@@ -2879,6 +2882,9 @@ export function snapshotHttpChainSteps(
       bodyBytes: typeof entry.bodyBytes === 'number' ? entry.bodyBytes : Buffer.byteLength(body, 'utf8'),
       mediaType: typeof entry.mediaType === 'string' ? entry.mediaType : '',
       json: entry.json ?? null,
+      ...(step.request.jsonBody !== undefined ? { requestJson: step.request.jsonBody } : {}),
+      ...(typeof step.request.textBody === 'string' ? { requestBody: step.request.textBody } : {}),
+      ...(step.request.headers ? { requestHeaders: step.request.headers } : {}),
       secretMatches: exchange?.secretMatches?.length ?? 0,
     }
   })
@@ -2994,6 +3000,9 @@ export function assessHttpChainProofStrength(
         actor: actorFromPersona(snapshot.actor, []),
         json: snapshot.json,
         body: snapshot.body,
+        ...(snapshot.requestJson !== undefined ? { requestJson: snapshot.requestJson } : {}),
+        ...(snapshot.requestBody !== undefined ? { requestBody: snapshot.requestBody } : {}),
+        ...(snapshot.requestHeaders ? { requestHeaders: snapshot.requestHeaders } : {}),
       })),
     )
     if (statusOnly.statusOnly) {
@@ -3537,6 +3546,7 @@ export function buildReplayReceipt(input: {
   canaryStorage?: Store
 }): { receipt: ProofReceipt; transcript: ReceiptTranscript; factLog: HostFactLog; trustedOracleEvents: string[] } | null {
   const impactGate = input.evidencePayload.impactGate as { required?: boolean } | undefined
+  const bflaImpact = input.evidencePayload.bflaImpact as { required?: boolean } | undefined
   const boundaryGate = input.evidencePayload.boundaryGate as { required?: boolean; satisfied?: boolean; boundaryClass?: string } | undefined
   const evidenceClass = typeof input.evidencePayload.evidenceClass === 'string'
     ? input.evidencePayload.evidenceClass
@@ -3563,9 +3573,9 @@ export function buildReplayReceipt(input: {
     (vulnClass === 'webhook_forgery' && canary?.triggered === true)
   const isRedirect = vulnClass === 'open_redirect'
   const isWebhook = vulnClass === 'webhook_forgery' && !isOob
-  // Require a gated class (impactGate, OOB, redirect, webhook differential, or boundaryGate auth
+  // Require a gated class (impactGate, bflaImpact, OOB, redirect, webhook differential, or boundaryGate auth
   // bypass) to emit a receipt. Dedicated rules re-derive their evidence from the host transcript.
-  if (!isOob && !isRedirect && !isWebhook && !isBoundaryAuth && impactGate?.required !== true) return null
+  if (!isOob && !isRedirect && !isWebhook && !isBoundaryAuth && impactGate?.required !== true && bflaImpact?.required !== true) return null
   const stepsOut = (input.evidencePayload.steps ?? {}) as Record<string, unknown>
   const steps = impactStepsFromStepsOut(input.spec, stepsOut)
   if (steps.length === 0 && vulnClass !== 'ssrf' && vulnClass !== 'xxe') return null
@@ -3708,6 +3718,26 @@ export function applyReceiptGate(input: {
   return { verdict: input.verdict, outcome: input.outcome, check }
 }
 
+/**
+ * Explicit, bounded allowlist of host-persisted deterministic floor spec kinds that do not yet
+ * construct a dedicated ProofReceipt. Untrusted/inline specs and all other kinds (including
+ * `http_chain`, `sql_*`, `browser_chain`, `race_burst`, `rce_proof`, `agent_script`) ALWAYS fail
+ * closed in strict mode when no ProofReceipt can be built.
+ */
+export const RECEIPT_EXEMPT_HOST_SPEC_KINDS: ReadonlySet<DeclarativeReplaySpec['kind']> = new Set([
+  'cache_differential',
+  'auth_protocol_proof',
+  'upload_probe',
+  'ws_chain',
+])
+
+export function isReceiptExemptHostSpec(
+  spec: Pick<DeclarativeReplaySpec, 'kind'>,
+  envelopeTrust?: 'host_persisted' | 'untrusted',
+): boolean {
+  return envelopeTrust === 'host_persisted' && RECEIPT_EXEMPT_HOST_SPEC_KINDS.has(spec.kind)
+}
+
 export function receiptCheckForResult(input: {
   mode: ProofReceiptMode
   verdict: ReplayVerdict
@@ -3722,6 +3752,28 @@ export function receiptCheckForResult(input: {
   canaryStorage?: Store
 }): { verdict: ReplayVerdict; outcome: ReplayAssertionOutcome; check?: ReplayReceiptCheck } {
   if (input.mode === 'off' || input.verdict !== 'confirmed') return { verdict: input.verdict, outcome: input.outcome }
+  // Floor-path intermediate job/handle stub guard: even before receipt construction (or on exempt
+  // host-persisted kinds), a pure job/handle/ack stub chain with no substantive post-probe readback
+  // never confirms in strict mode.
+  if (input.mode === 'strict' && (input.spec.kind === 'http_chain' || input.spec.kind === 'auth_protocol_proof')) {
+    const stepsOut = (input.evidencePayload.steps ?? {}) as Record<string, unknown>
+    const floorSteps = impactStepsFromStepsOut(input.spec, stepsOut)
+    const specClass = receiptVulnClassFor(input.spec)
+    const isStubGuardedClass = specClass === null ||
+      (specClass !== 'ssrf' && specClass !== 'xxe' && specClass !== 'injection' &&
+        specClass !== 'open_redirect' && specClass !== 'webhook_forgery' &&
+        !specClass.startsWith('xss') && !specClass.startsWith('dom_'))
+    if (isStubGuardedClass && isPureJobOrHandleStubChain(floorSteps)) {
+      return {
+        verdict: 'inconclusive',
+        outcome: {
+          ...input.outcome,
+          confirmed: false,
+          reason: 'terminal_impact_unproven: floor probe returned only an intermediate job/handle/ack stub without substantive post-probe terminal impact.',
+        },
+      }
+    }
+  }
   const built = buildReplayReceipt({
     spec: input.spec,
     evidencePayload: input.evidencePayload,
@@ -3732,11 +3784,9 @@ export function receiptCheckForResult(input: {
     ...(input.canaryStorage ? { canaryStorage: input.canaryStorage } : {}),
   })
   // Fail closed in strict mode whenever a confirmed replay cannot construct a host-verified ProofReceipt,
-  // preserving only host-persisted dedicated non-http_chain deterministic floor kinds.
+  // preserving only the explicit host-persisted allowlist (`RECEIPT_EXEMPT_HOST_SPEC_KINDS`).
   if (!built) {
-    const hostNonReceiptFloorKind = input.envelopeTrust === 'host_persisted' &&
-      (input.spec.kind === 'cache_differential' || input.spec.kind === 'auth_protocol_proof' || input.spec.kind === 'upload_probe' || input.spec.kind === 'ws_chain')
-    if (input.mode === 'strict' && !hostNonReceiptFloorKind) {
+    if (input.mode === 'strict' && !isReceiptExemptHostSpec(input.spec, input.envelopeTrust)) {
       return {
         verdict: 'inconclusive',
         outcome: {
