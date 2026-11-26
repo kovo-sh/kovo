@@ -31,6 +31,11 @@ import type { DerivedCapabilityVault } from './derived-custody.ts'
 import { hasDynamicIdSegment, identifierFormsForRoute, intentFamily } from './deterministic-engine.ts'
 import type { ExecCoordinatorTask } from './exec-exchange.ts'
 import {
+  classifyProviderFailure,
+  type ProviderFailureError,
+  type ProviderFailureKind,
+} from './provider.ts'
+import {
   FrontierScheduler,
   MAX_CHAIN_DEPTH,
   MAX_CHECKPOINT_BRIEF_BYTES,
@@ -962,6 +967,7 @@ export type DispatchStopReason =
   | 'requests_exhausted'
   | 'wallclock_exhausted'
   | 'circuit_open'
+  | 'provider_paused'
   | 'run_paused'
   | 'run_stopped'
 
@@ -1055,6 +1061,8 @@ export function normalizeDispatchStopReason(reason: string | null | undefined): 
       return 'wallclock_exhausted'
     case 'circuit_open':
       return 'circuit_open'
+    case 'provider_paused':
+      return 'provider_paused'
     case 'paused':
       return 'run_paused'
     case 'stopped':
@@ -1092,12 +1100,80 @@ export function mapSessionStatusToStepStatus(sessionStatus: WorkerSessionExitSta
   }
 }
 
-const MODEL_FAILURE_ERROR_RE = /\b(?:model|provider|openrouter|anthropic|openai|rate[\s_-]?limit|429|502|503|504|context[\s_-]?length|token[\s_-]?limit|stream\s+stalled|invalid[\s_-]?json|llm)\b/i
-
-/** Classify an uncaught worker error into `model_failure` vs `infra_failed`. */
+/** Classify an uncaught worker error into `model_failure` vs `infra_failed` via the single typed provider classifier. */
 export function classifyWorkerErrorToStepStatus(error: unknown): 'model_failure' | 'infra_failed' {
-  const msg = error instanceof Error ? `${error.name} ${error.message}` : String(error ?? '')
-  return MODEL_FAILURE_ERROR_RE.test(msg) ? 'model_failure' : 'infra_failed'
+  return classifyProviderFailure(error) !== null ? 'model_failure' : 'infra_failed'
+}
+
+export interface TransientProviderRetryInput {
+  failure: ProviderFailureError
+  retryKey: string
+  priorKeyRetries: number
+  stepSkills: readonly string[]
+  stepTrialIndex?: number | null
+  assignmentAttempt: number
+  toolCallsExecutedInTurn: number
+  runStatus: string
+  runPhase: string
+  budgetExhausted: boolean
+  requestBudgetExhausted: boolean
+  wallClockExhausted: boolean
+  existingStepCount: number
+  effectiveStepCap: number
+  runProviderRetries: number
+}
+
+export interface TransientProviderRetryDecision {
+  retry: boolean
+  reason: string
+  retryKey: string
+  failureKind: ProviderFailureKind
+}
+
+/**
+ * Pure bounded transient-provider retry gate (`R2-13`).
+ *
+ * Enforces:
+ * - Only retryable transient provider kinds (`rate_limited`, `server`, `stall`, `stream_drop`).
+ * - Target-safety idempotency invariant: mid-stream retry (`failure.emitted === true`) is
+ *   allowed ONLY when `toolCallsExecutedInTurn === 0` on the dropped turn.
+ * - Strict 1-retry-per-key cap (`MAX_RETRYABLE_STEP_RETRIES`) charged to `RunSafetyBudgets`.
+ */
+export function evaluateTransientProviderRetry(
+  input: TransientProviderRetryInput,
+): TransientProviderRetryDecision {
+  const { failure, retryKey } = input
+  if (!failure.retryable) {
+    return { retry: false, reason: 'non_retryable_failure', retryKey, failureKind: failure.kind }
+  }
+  if (failure.emitted && input.toolCallsExecutedInTurn > 0) {
+    return { retry: false, reason: 'midstream_tool_call_executed', retryKey, failureKind: failure.kind }
+  }
+  if (
+    input.stepSkills.includes('r213:provider_retry:1')
+    || input.stepSkills.includes('cq5:retry:1')
+    || (input.stepTrialIndex ?? 0) > 0
+    || input.assignmentAttempt >= MAX_RETRYABLE_STEP_RETRIES
+    || input.priorKeyRetries >= MAX_RETRYABLE_STEP_RETRIES
+  ) {
+    return { retry: false, reason: 'retry_cap_reached', retryKey, failureKind: failure.kind }
+  }
+  if (input.runStatus !== 'running' || input.runPhase !== 'investigation') {
+    return { retry: false, reason: 'run_not_investigating', retryKey, failureKind: failure.kind }
+  }
+  if (input.budgetExhausted) {
+    return { retry: false, reason: 'budget_exhausted', retryKey, failureKind: failure.kind }
+  }
+  if (input.requestBudgetExhausted) {
+    return { retry: false, reason: 'request_budget_exhausted', retryKey, failureKind: failure.kind }
+  }
+  if (input.wallClockExhausted) {
+    return { retry: false, reason: 'wall_clock_exhausted', retryKey, failureKind: failure.kind }
+  }
+  if (input.existingStepCount + input.runProviderRetries >= input.effectiveStepCap) {
+    return { retry: false, reason: 'step_budget_exhausted', retryKey, failureKind: failure.kind }
+  }
+  return { retry: true, reason: 'transient_retry_allowed', retryKey, failureKind: failure.kind }
 }
 
 /** Structured `(origin, METHOD, route, class)` target bound at chain-step creation. */
