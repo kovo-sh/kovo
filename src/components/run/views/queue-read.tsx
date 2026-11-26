@@ -39,6 +39,63 @@ export function QGlyph({ it }: { it: QueueItem }) {
   return <span className="inline-flex size-3.5 flex-none items-center justify-center" title={SEV_LABEL[it.sev]}><SevGlyph sev={it.sev} /></span>
 }
 
+const REPLAY_INFRA_ERROR_RE =
+  /(?:Replay execution failed:|Worker session|timed out|timeout|ECONNREFUSED|ENOTFOUND|ETIMEDOUT|EHOSTUNREACH|socket hang up|Live replay verification is disabled|Tier 3 (?:approval|Safety Judge)|Replay jq assertion did not emit valid JSON|Invalid DeclarativeReplaySpec|Persisted proof script integrity|Legacy Python agent_script proof|not in approved scope|circuit breaker|BrokerDenied|execution error|sandbox|infrastructure)/i
+
+function unwrapReplayVerificationText(raw: string): string {
+  const trimmed = raw.trim()
+  const observedMatch = /observed:\s*(.+?)\)\.?$/i.exec(trimmed)
+  if (observedMatch?.[1]) return observedMatch[1].trim()
+  return trimmed
+}
+
+/**
+ * Extract a concise replay execution / infrastructure failure reason for unconfirmed or inconclusive
+ * findings so the UI can show an amber inline callout below "What happened" without replacing the
+ * vulnerability description itself.
+ */
+export function extractReplayInfraFailure(
+  finding: { status?: string; verification?: string | null },
+  replayDiff?: unknown,
+): string | null {
+  const norm = normFStatus(finding.status ?? '')
+  if (norm === 'confirmed' || norm === 'dismissed' || finding.status === 'static_verified') {
+    return null
+  }
+  const candidates: string[] = []
+  if (replayDiff && typeof replayDiff === 'object') {
+    const summary = (replayDiff as { assertionSummary?: { reason?: unknown; observed?: unknown } }).assertionSummary
+    if (typeof summary?.reason === 'string' && summary.reason.trim()) candidates.push(summary.reason.trim())
+    if (typeof summary?.observed === 'string' && summary.observed.trim()) candidates.push(summary.observed.trim())
+  } else if (typeof replayDiff === 'string' && replayDiff.trim()) {
+    candidates.push(replayDiff.trim())
+  }
+  if (typeof finding.verification === 'string' && finding.verification.trim()) {
+    candidates.push(unwrapReplayVerificationText(finding.verification))
+  }
+  for (const candidate of candidates) {
+    if (REPLAY_INFRA_ERROR_RE.test(candidate)) {
+      return candidate
+    }
+  }
+  return null
+}
+
+/** Compact amber inline callout rendered below "What happened" when live verification could not run. */
+export function ReplayFailureCallout({ reason }: { reason: string }) {
+  return <div
+    className="mb-3 flex items-start gap-2 rounded-[7px] bg-warn-soft px-2.5 py-2 text-[12px] leading-[17px] text-fg-muted shadow-[inset_0_0_0_1px_var(--warn-line)]"
+    role="status"
+    data-testid="replay-failure-callout"
+  >
+    <Icon name="alert" className="mt-0.5 flex-none text-warn" />
+    <div className="min-w-0">
+      <div className="font-medium text-fg">Live verification couldn&apos;t run</div>
+      <p className="m-0! mt-0.5! break-words text-[12px]! leading-[17px]! text-fg-muted!">{reason}</p>
+    </div>
+  </div>
+}
+
 /** Code locations list shared by Queue and Finding inspectors. */
 export function CodeLocations({ codeLocs }: { codeLocs: NonNullable<FindingRow['codeLocations']> }) {
   if (!codeLocs.length) return null
@@ -276,6 +333,8 @@ export function ReadFinding({ it }: { it: FindingItem }) {
     groups = [...g]
   }
   const obs = obsText(F.check?.observed)
+  const replay = model.detail.replaySpecs.find(r => (F.replaySpecId && r.id === F.replaySpecId) || r.findingId === F.id)
+  const replayInfraFailure = extractReplayInfraFailure(F, replay?.lastVerificationDiff)
   const techCount = [ev.ids.length ? plural(ev.ids.length, 'exchange') : '', ws.length ? plural(ws.length, 'worker') : ''].filter(Boolean).join(' · ')
   return <>
     <div className="mb-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-[12px] text-fg-subtle">
@@ -314,6 +373,7 @@ export function ReadFinding({ it }: { it: FindingItem }) {
         </div>)}
       </div>}
     </Section>}
+    {replayInfraFailure && <ReplayFailureCallout reason={replayInfraFailure} />}
 
     {F.impact && <Section title="Why it matters">
       <p>{F.impact}</p>

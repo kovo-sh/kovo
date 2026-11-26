@@ -23,6 +23,7 @@ import {
 import { DerivedCapabilityVault, type DerivedCapabilityMeta } from './derived-custody.ts'
 import { createEgressSanitizer, type EgressSanitizer } from './egress-sanitizer.ts'
 import { HostFactLog } from './host-fact-log.ts'
+import { parseRoleLabel } from './oracle-invariants.ts'
 import { buildAgentScriptReceipt } from './proof-receipt.ts'
 import type { ProofReceipt, ReceiptVerification, ScriptProofExchange } from './proof-receipt.ts'
 import { defaultTerminalOracleRegistry } from './terminal-oracle-registry.ts'
@@ -41,13 +42,18 @@ import {
 } from './worker-backend.ts'
 import type { ReplayVerificationResult, RetestReplayResult, VerifyReplaySpecParams } from './replay-verifier.ts'
 
-function resolveVerifyRpcHostDir(assignmentId: string, attempt: 1 | 2): string | undefined {
-  const dood = resolveDoodScratchConfig()
+export function resolveVerifyRpcHostDir(
+  assignmentId: string,
+  attempt: 1 | 2,
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  const dood = resolveDoodScratchConfig(env)
   if (dood) {
-    const safeAssignment = assignmentId.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 64) || 'verify'
-    return prepareSessionScratchDir(`rpc-${safeAssignment}-${attempt}-${randomUUID().slice(0, 8)}`)
+    const safeAssignment = assignmentId.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 48) || 'verify'
+    const sid = `${safeAssignment}-verify-${attempt}-${randomUUID().slice(0, 8)}`
+    return prepareSessionScratchDir(sid, 'rpc', env)
   }
-  const containerRaw = process.env.KOVO_CONTAINER_SCRATCH_DIR?.trim()
+  const containerRaw = env.KOVO_CONTAINER_SCRATCH_DIR?.trim()
   if (!containerRaw) return undefined
   if (/[\0,\r\n]/.test(containerRaw) || !containerRaw.startsWith('/') || containerRaw.split(/[\\/]+/).includes('..')) {
     throw new Error('Invalid KOVO_CONTAINER_SCRATCH_DIR path.')
@@ -58,6 +64,30 @@ function resolveVerifyRpcHostDir(assignmentId: string, attempt: 1 | 2): string |
   }
   mkdirSync(resolvedBase, { recursive: true, mode: 0o755 })
   return mkdtempSync(join(resolvedBase, 'kovo-verify-rpc-'))
+}
+
+export const PERSISTED_SCRIPT_INTEGRITY_ERROR =
+  'Persisted proof script integrity check failed (SHA-256 mismatch; script was redacted or modified after confirmation).'
+
+/**
+ * R2-H-16: Verify that a persisted executable proof script's SHA-256 matches its recorded
+ * `scriptSha256` (and optional proof-table `expectedSha256`) before re-execution. A mismatch
+ * (e.g. from legacy heuristic redaction or tampering) MUST fail closed as `inconclusive` — never
+ * `fixed` or `dismissed`.
+ */
+export function verifyPersistedScriptIntegrity(
+  envelope: Pick<AgentScriptProofEnvelope, 'script' | 'scriptSha256'>,
+  expectedSha256?: string | null,
+): { ok: true; actualSha256: string } | { ok: false; actualSha256: string; reason: string } {
+  const actualSha256 = createHash('sha256').update(envelope.script).digest('hex')
+  const recorded = typeof envelope.scriptSha256 === 'string' ? envelope.scriptSha256.trim().toLowerCase() : ''
+  if (!recorded || actualSha256 !== recorded) {
+    return { ok: false, actualSha256, reason: PERSISTED_SCRIPT_INTEGRITY_ERROR }
+  }
+  if (expectedSha256 && actualSha256 !== expectedSha256.trim().toLowerCase()) {
+    return { ok: false, actualSha256, reason: PERSISTED_SCRIPT_INTEGRITY_ERROR }
+  }
+  return { ok: true, actualSha256 }
 }
 
 export function persistedAgentScriptOf(spec: unknown): { envelope: AgentScriptProofEnvelope; origin: string } | null {
@@ -272,6 +302,38 @@ class CapturingVerifyRpcServer extends VerifyRpcServer {
   }
 }
 
+const PRIVILEGED_PERSONA_TOKEN_RE =
+  /(?:^|[\s:_-])(?:super[\s_-]?admin|org[\s_-]?admin|sys[\s_-]?admin|platform[\s_-]?admin|admin|owner|root|superuser|manager|staff|operator)(?:$|[\s:_-])/i
+
+/**
+ * H-11: Derive `CompositeVerifyOptions` attacker/forbidden-shortcut persona lists from the run's
+ * `Grant` whenever the caller did not supply explicit options.
+ */
+export function buildCompositeVerifyOptionsFromGrant(
+  grant: Pick<Grant, 'personas'>,
+): Omit<CompositeVerifyOptions, 'signingKey'> | undefined {
+  if (!grant.personas || grant.personas.size === 0) return undefined
+  const attackerPersonas: string[] = []
+  const forbiddenShortcutPersonas: string[] = []
+  for (const [handle, persona] of grant.personas.entries()) {
+    const parsed = parseRoleLabel(persona.roleLabel)
+    const isPrivileged = parsed.role === 'admin'
+      || parsed.role === 'owner'
+      || PRIVILEGED_PERSONA_TOKEN_RE.test(persona.roleLabel ?? '')
+      || PRIVILEGED_PERSONA_TOKEN_RE.test(handle)
+    if (isPrivileged) {
+      forbiddenShortcutPersonas.push(handle)
+    } else {
+      attackerPersonas.push(handle)
+    }
+  }
+  if (attackerPersonas.length === 0 && forbiddenShortcutPersonas.length === 0) return undefined
+  return {
+    ...(attackerPersonas.length ? { attackerPersonas } : {}),
+    ...(forbiddenShortcutPersonas.length ? { forbiddenShortcutPersonas } : {}),
+  }
+}
+
 export async function runAgentScriptProof(params: AgentScriptProofParams): Promise<AgentScriptProofResult> {
   if (params.runtime !== 'ts') {
     throw new Error(`Unsupported kovo_verify runtime: ${String(params.runtime)}. kovo_verify supports TypeScript only (runtime='ts').`)
@@ -329,6 +391,7 @@ export async function runAgentScriptProof(params: AgentScriptProofParams): Promi
       },
     })
     const rpcHostDir = resolveVerifyRpcHostDir(params.assignmentId, input.attempt)
+    const effectiveCompositeVerifyOptions = params.compositeVerifyOptions ?? buildCompositeVerifyOptionsFromGrant(params.grant)
     const server = new CapturingVerifyRpcServer({
       broker: observingBroker,
       grant: params.grant,
@@ -339,7 +402,7 @@ export async function runAgentScriptProof(params: AgentScriptProofParams): Promi
       capabilityVault: vault,
       ...(rpcHostDir ? { hostDir: rpcHostDir } : {}),
       ...(params.canaryBroker ? { canary: params.canaryBroker } : {}),
-      ...(params.compositeVerifyOptions ? { compositeVerifyOptions: params.compositeVerifyOptions } : {}),
+      ...(effectiveCompositeVerifyOptions ? { compositeVerifyOptions: effectiveCompositeVerifyOptions } : {}),
     })
     try {
       await server.start()
@@ -702,6 +765,38 @@ export async function retestPersistedAgentScript(
         digests: [],
         verdict: 'inconclusive',
         reason: 'legacy_python_unsupported',
+      })).digest('hex'),
+    }
+    return { verdict: 'inconclusive', replay }
+  }
+  const integrity = verifyPersistedScriptIntegrity(envelope)
+  if (!integrity.ok) {
+    const replay: ReplayVerificationResult = {
+      verdict: 'inconclusive',
+      outcome: {
+        confirmed: false,
+        controlPassed: false,
+        observed: integrity.reason,
+        expected: 'the persisted proof script SHA-256 matches its recorded confirmation digest',
+        reason: integrity.reason,
+      },
+      exchangeIds: [],
+      exchanges: [],
+      evidencePayload: {
+        mode: 'agent_script',
+        runtime: envelope.runtime,
+        scriptSha256: envelope.scriptSha256,
+        actualScriptSha256: integrity.actualSha256,
+        integrityMismatch: true,
+        transcriptDigests: [],
+        receipt: null,
+      },
+      evidenceSha256: createHash('sha256').update(JSON.stringify({
+        script: envelope.scriptSha256,
+        actual: integrity.actualSha256,
+        digests: [],
+        verdict: 'inconclusive',
+        reason: 'script_integrity_mismatch',
       })).digest('hex'),
     }
     return { verdict: 'inconclusive', replay }
