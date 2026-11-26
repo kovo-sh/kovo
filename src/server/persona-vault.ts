@@ -578,28 +578,182 @@ export function frameForSessionOrigin(
   }
 }
 
-/** All secret material inside a bundle (cookie values, sensitive header values, token-like storage). */
+/** Minimum length for exact-scrub persona secret needles (R3-H-10; raised from 4 to 8). */
+export const MIN_PERSONA_SECRET_NEEDLE_LENGTH = 8
+/** Minimum length for high-entropy values from non-auth-named generic cookies (R3-H-10). */
+export const MIN_GENERIC_COOKIE_NEEDLE_LENGTH = 16
+
+const PROTOCOL_AND_GENERIC_WORDS = new Set([
+  'user', 'auto', 'text', 'true', 'false', 'none', 'null', 'system', 'model', 'input', 'output',
+  'concise', 'detailed', 'assistant', 'developer', 'function', 'function_call',
+  'function_call_output', 'custom_tool_call', 'custom_tool_call_output', 'input_text',
+  'output_text', 'summary_text', 'tool_use', 'tool_result', 'tool_choice', 'required',
+  'optional', 'completed', 'in_progress', 'incomplete', 'disabled', 'enabled', 'adaptive',
+  'summarized', 'ephemeral', 'undefined', 'standard', 'default', 'anonymous', 'localhost',
+  'unused', 'ready', 'pending', 'error', 'aborted', 'browser_session', 'browser-session-state',
+  'application/json', 'text/html', 'text/plain', 'message', 'messages', 'reasoning', 'thinking',
+  'refusal', 'image', 'document', 'object', 'string', 'number', 'boolean', 'array', 'properties',
+  'strict', 'high', 'medium', 'low',
+])
+
+const JWT_LIKE_RE = /^eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]*)?$/
+const COOKIE_PAIR_SINGLE_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]{1,64}=[^;\r\n]*$/
+const SENSITIVE_HEADER_NAME_RE =
+  /^(?:authorization|proxy-authorization|cookie|set-cookie|x-xsrf-token|x-csrf-token)$/i
+const SENSITIVE_HEADER_STEM_RE = /csrf|xsrf|token|secret|api[-_]?key|session|auth/i
+const AUTH_COOKIE_STEM_RE =
+  /(?:^|[._-])(?:sid|sess|session|sessionid|jsessionid|phpsessid|aspsessionid|auth|token|jwt|access|refresh|csrf|xsrf|secret|key|apikey|cred|credential|oauth|oidc|saml|sso|bearer|ticket|nonce|remember|login|logged|client|passport|devise|warden|identity|principal|mfa|totp|otp|recovery|challenge|hmac|sig|signature|appsession|csrftoken)(?:$|[._-\d])/i
+const AUTH_COOKIE_SUBSTR_RE =
+  /(?:session|token|csrf|xsrf|auth|jwt|secret|apikey|phpsessid|jsessionid)/i
+const AUTH_COOKIE_FRAMEWORK_RE =
+  /^(?:__session|__client(?:_uat)?|sb-[a-z0-9._-]+|next-auth(?:\.[a-z0-9._-]+)?|authjs(?:\.[a-z0-9._-]+)?|better-auth(?:\.[a-z0-9._-]+)?|connect\.sid|\.aspnetcore\.[a-z0-9._-]+|asp\.net_sessionid|wordpress_(?:logged_in|sec)_[a-f0-9]+|cognitoidentityserviceprovider\.|cf_authorization|ory_kratos_session|a0:[a-z0-9._-]+|laravel_session|ci_session|rack\.session|express\.sid)$/i
+
+function shannonEntropyBitsPerChar(value: string): number {
+  if (!value) return 0
+  const counts = new Map<string, number>()
+  for (const ch of value) counts.set(ch, (counts.get(ch) ?? 0) + 1)
+  let entropy = 0
+  const len = value.length
+  for (const count of counts.values()) {
+    const p = count / len
+    entropy -= p * Math.log2(p)
+  }
+  return entropy
+}
+
+function distinctCharCount(value: string): number {
+  return new Set(value).size
+}
+
+function alnumClassCount(value: string): number {
+  let classes = 0
+  if (/[a-z]/.test(value)) classes += 1
+  if (/[A-Z]/.test(value)) classes += 1
+  if (/[0-9]/.test(value)) classes += 1
+  return classes
+}
+
+function isSensitiveHeaderName(name: string): boolean {
+  return SENSITIVE_HEADER_NAME_RE.test(name) || SENSITIVE_HEADER_STEM_RE.test(name)
+}
+
+/**
+ * Identifies cookie names associated with authentication, session state, CSRF/XSRF, or IdP tokens.
+ */
+export function isAuthRelevantCookieName(name: string): boolean {
+  const trimmed = name.trim()
+  if (!trimmed) return false
+  const stripped = trimmed.replace(/^__(?:Host|Secure)-/i, '')
+  return (
+    AUTH_COOKIE_FRAMEWORK_RE.test(trimmed) ||
+    AUTH_COOKIE_FRAMEWORK_RE.test(stripped) ||
+    AUTH_COOKIE_STEM_RE.test(stripped) ||
+    AUTH_COOKIE_SUBSTR_RE.test(stripped)
+  )
+}
+
+/**
+ * Checks whether a value has high-entropy token characteristics suitable for scrubbing even when
+ * carried under a generic (non-auth-named) cookie (R3-H-10).
+ */
+export function isHighEntropySecretValue(value: string): boolean {
+  const trimmed = value.trim()
+  if (!trimmed || /\s/.test(trimmed)) return false
+  if (JWT_LIKE_RE.test(trimmed)) return true
+  if (trimmed.length < MIN_GENERIC_COOKIE_NEEDLE_LENGTH) return false
+  if (PROTOCOL_AND_GENERIC_WORDS.has(trimmed.toLowerCase())) return false
+  const distinct = distinctCharCount(trimmed)
+  if (distinct < 6) return false
+  const entropy = shannonEntropyBitsPerChar(trimmed)
+  if (entropy < 3.0) return false
+  const classes = alnumClassCount(trimmed)
+  if (classes >= 2) return true
+  return trimmed.length >= 24 && entropy >= 3.3 && distinct >= 10
+}
+
+/**
+ * Quality gate for exact-scrub persona secret needles (R3-H-10):
+ *  - length >= 8 characters (blocks short words like `user`, `auto`, `text`, `true`, `none`)
+ *  - rejects protocol/generic dictionary tokens and trivial low-entropy strings
+ *  - for 8..11 char values, rejects plain lowercase/underscore dictionary words (e.g. `input_text`,
+ *    `standard`, `dark_mode`) while retaining real mixed-class tokens, passwords, and session IDs
+ */
+export function isAcceptableSecretNeedle(value: string): boolean {
+  const trimmed = value.trim()
+  if (trimmed.length < MIN_PERSONA_SECRET_NEEDLE_LENGTH) return false
+  if (JWT_LIKE_RE.test(trimmed)) return true
+  if (PROTOCOL_AND_GENERIC_WORDS.has(trimmed.toLowerCase())) return false
+  if (distinctCharCount(trimmed) < 4) return false
+  if (shannonEntropyBitsPerChar(trimmed) < 1.8) return false
+  if (trimmed.length < 12 && /^[a-z_]+$/.test(trimmed)) return false
+  return true
+}
+
+/**
+ * Decides whether a `(cookieName, cookieValue)` pair qualifies for the exact-scrub needle set:
+ *  - Auth/session-relevant cookie names require >= 8 chars + non-trivial needle quality.
+ *  - Arbitrary/preference cookie names require high-entropy tokens >= 16 chars (or JWTs).
+ */
+export function isScrubbableCookieNeedle(name: string, value: string): boolean {
+  const cleaned = value.trim().replace(/^["']|["']$/g, '')
+  if (cleaned.length < MIN_PERSONA_SECRET_NEEDLE_LENGTH) return false
+  if (PROTOCOL_AND_GENERIC_WORDS.has(cleaned.toLowerCase())) return false
+  if (isAuthRelevantCookieName(name)) {
+    return isAcceptableSecretNeedle(cleaned)
+  }
+  return isHighEntropySecretValue(cleaned)
+}
+
+function addCookieHeaderSecrets(cookieHeader: string, out: Set<string>, isSetCookie = false): void {
+  const trimmedHeader = cookieHeader.trim()
+  if (!trimmedHeader) return
+  const pairs = isSetCookie ? [trimmedHeader.split(';')[0] ?? ''] : trimmedHeader.split(';')
+  let matchedAny = false
+  for (const pair of pairs) {
+    const eq = pair.indexOf('=')
+    if (eq <= 0) continue
+    const cookieName = pair.slice(0, eq).trim()
+    const cookieValue = pair.slice(eq + 1).trim().replace(/^["']|["']$/g, '')
+    if (!cookieName || !isScrubbableCookieNeedle(cookieName, cookieValue)) continue
+    out.add(cookieValue)
+    matchedAny = true
+  }
+  if (matchedAny && trimmedHeader.length >= MIN_PERSONA_SECRET_NEEDLE_LENGTH) {
+    // Only register the full Cookie header string when at least one cookie inside it is a genuine
+    // scrubbable secret (prevents benign single-cookie pairs like `summary=concise` from seeding
+    // sub-value extraction in `redact.ts`).
+    out.add(isSetCookie ? pairs[0]!.trim() : trimmedHeader)
+  }
+}
+
+function looksLikeCookieHeaderString(raw: string): boolean {
+  const trimmed = raw.trim()
+  if (!trimmed || !trimmed.includes('=')) return false
+  if (COOKIE_PAIR_SINGLE_RE.test(trimmed)) return true
+  if (!trimmed.includes(';')) return false
+  const parts = trimmed.split(';').map(p => p.trim()).filter(Boolean)
+  if (parts.length === 0) return false
+  return parts.every(p => COOKIE_PAIR_SINGLE_RE.test(p))
+}
+
+/** All secret material inside a bundle (auth-relevant cookie values, sensitive headers, token-like storage). */
 export function bundleSecrets(bundle: PersonaCredentialBundle | undefined): string[] {
   if (!bundle) return []
   const out = new Set<string>()
-  const sensitiveHeader = (name: string) =>
-    /^(authorization|cookie|set-cookie|x-xsrf-token)$/i.test(name) ||
-    /csrf|xsrf|token|secret|api[-_]?key|session|auth/i.test(name)
   const addHeaderValue = (name: string, value: string) => {
-    if (!sensitiveHeader(name)) return
-    const trimmed = value.replace(/^Bearer\s+/i, '').trim()
-    if (trimmed.length >= 4) out.add(trimmed)
-    if (name.toLowerCase() === 'cookie') {
-      for (const pair of value.split(';')) {
-        const eq = pair.indexOf('=')
-        if (eq <= 0) continue
-        const cookieValue = pair.slice(eq + 1).trim().replace(/^["']|["']$/g, '')
-        if (cookieValue.length >= 8) out.add(cookieValue)
-      }
+    if (!isSensitiveHeaderName(name)) return
+    const lower = name.toLowerCase()
+    if (lower === 'cookie' || lower === 'set-cookie') {
+      addCookieHeaderSecrets(value, out, lower === 'set-cookie')
+      return
     }
+    const trimmed = value.replace(/^Bearer\s+/i, '').trim()
+    if (isAcceptableSecretNeedle(trimmed)) out.add(trimmed)
   }
   for (const cookie of bundle.cookies ?? []) {
-    if (cookie.value.length >= 4) out.add(cookie.value)
+    if (isScrubbableCookieNeedle(cookie.name, cookie.value)) {
+      out.add(cookie.value.trim().replace(/^["']|["']$/g, ''))
+    }
   }
   for (const [name, value] of Object.entries(bundle.headers ?? {})) {
     addHeaderValue(name, value)
@@ -607,7 +761,12 @@ export function bundleSecrets(bundle: PersonaCredentialBundle | undefined): stri
   const collectStorageSecrets = (snapshot: PersonaStorageSnapshot | undefined) => {
     for (const scope of [snapshot?.localStorage, snapshot?.sessionStorage]) {
       for (const [key, value] of Object.entries(scope ?? {})) {
-        if (value.length >= 4 && /token|jwt|auth|secret|key|session|credential/i.test(key)) out.add(value)
+        if (
+          isAcceptableSecretNeedle(value) &&
+          (/token|jwt|auth|secret|key|session|credential/i.test(key) || JWT_LIKE_RE.test(value.trim()))
+        ) {
+          out.add(value)
+        }
       }
     }
   }
@@ -902,16 +1061,18 @@ export function normalizeBrowserStorageBundle(
   }
 }
 
-/** Collect every sensitive token/cookie/header inside a `BrowserStorageBundle` for redaction. */
+/** Collect sensitive auth/session tokens, cookies, and headers inside a `BrowserStorageBundle` for redaction. */
 export function extractBrowserBundleSecrets(bundle: BrowserStorageBundle): string[] {
   const out = new Set<string>()
   for (const cookie of bundle.storageState.cookies) {
-    if (cookie.value.length >= 4) out.add(cookie.value)
+    if (isScrubbableCookieNeedle(cookie.name, cookie.value)) {
+      out.add(cookie.value.trim().replace(/^["']|["']$/g, ''))
+    }
   }
   for (const origin of bundle.storageState.origins) {
     for (const item of origin.localStorage) {
       if (
-        item.value.length >= 8 &&
+        isAcceptableSecretNeedle(item.value) &&
         (/token|jwt|auth|secret|key|session|credential|refresh|clerk|supabase/i.test(item.name) ||
           item.value.startsWith('eyJ'))
       ) {
@@ -921,16 +1082,14 @@ export function extractBrowserBundleSecrets(bundle: BrowserStorageBundle): strin
   }
   const addHeaderMap = (headers: Record<string, string> | undefined) => {
     for (const [name, value] of Object.entries(headers ?? {})) {
-      const trimmed = value.replace(/^Bearer\s+/i, '').trim()
-      if (trimmed.length >= 4) out.add(trimmed)
-      if (name.toLowerCase() === 'cookie') {
-        for (const pair of value.split(';')) {
-          const eq = pair.indexOf('=')
-          if (eq <= 0) continue
-          const val = pair.slice(eq + 1).trim()
-          if (val.length >= 8) out.add(val)
-        }
+      if (!isSensitiveHeaderName(name)) continue
+      const lower = name.toLowerCase()
+      if (lower === 'cookie' || lower === 'set-cookie') {
+        addCookieHeaderSecrets(value, out, lower === 'set-cookie')
+        continue
       }
+      const trimmed = value.replace(/^Bearer\s+/i, '').trim()
+      if (isAcceptableSecretNeedle(trimmed)) out.add(trimmed)
     }
   }
   addHeaderMap(bundle.observedHeaders)
@@ -1169,23 +1328,34 @@ export function writePersonaSessionFile(
   // so personaSecrets() always scrubs every prior & current token after rotation.
   const mergedScrub: string[] = []
   const seen = new Set<string>()
-  const addToken = (tok: string | undefined) => {
-    if (!tok || tok.length < 4 || seen.has(tok)) return
+  const pushUnique = (tok: string) => {
+    if (!tok || seen.has(tok)) return
     seen.add(tok)
     mergedScrub.push(tok)
+  }
+  const addToken = (tok: string | undefined, treatAsCookieHeader = false) => {
+    if (!tok) return
+    if (treatAsCookieHeader || looksLikeCookieHeaderString(tok)) {
+      const extracted = new Set<string>()
+      addCookieHeaderSecrets(tok, extracted)
+      for (const item of extracted) pushUnique(item)
+      return
+    }
+    if (!isAcceptableSecretNeedle(tok)) return
+    pushUnique(tok)
   }
 
   try {
     const existing = readVerifiedSessionFile(sessionPath)
     if (existing) {
-      addToken(existing.session.value)
+      addToken(existing.session.value, existing.session.headerType === 'cookie')
       for (const tok of existing.session.scrubTokens ?? []) addToken(tok)
     }
   } catch {
     // Ignore missing/unparseable prior session file.
   }
 
-  addToken(session.value)
+  addToken(session.value, session.headerType === 'cookie')
   for (const tok of session.scrubTokens ?? []) addToken(tok)
   const bundle = normalizePersonaBundle(session.bundle)
   for (const tok of bundleSecrets(bundle)) addToken(tok)
@@ -1774,12 +1944,20 @@ export function resolveRunPersonas(storage: Store, projectId: string, approvedPe
 export function personaSecrets(resolved: ReadonlyMap<string, ResolvedPersona>): NamedSecret[] {
   const out: NamedSecret[] = []
   const seen = new Set<string>()
-  const push = (placeholder: string, value: string) => {
-    if (!value || value.length < 4) return
+  const push = (placeholder: string, value: string, prevalidatedCookieHeader = false) => {
+    if (!value) return
+    if (!prevalidatedCookieHeader && !isAcceptableSecretNeedle(value)) return
     const key = `${placeholder}\0${value}`
     if (seen.has(key)) return
     seen.add(key)
     out.push({ value, placeholder })
+  }
+  const pushCookieHeader = (placeholder: string, rawCookieHeader: string) => {
+    const extracted = new Set<string>()
+    addCookieHeaderSecrets(rawCookieHeader, extracted)
+    for (const tok of extracted) {
+      push(placeholder, tok, true)
+    }
   }
   for (const persona of resolved.values()) {
     try {
@@ -1792,24 +1970,39 @@ export function personaSecrets(resolved: ReadonlyMap<string, ResolvedPersona>): 
       /* keep cached history if file permissions changed */
     }
     const placeholder = `[persona:${persona.handle}:secret]`
-    const values = new Set<string>([
-      persona.secret,
+
+    // 1. Primary static credential (cookie header for `cookie` personas, password/token for others).
+    if (persona.secret) {
+      if (persona.authKind === 'cookie') {
+        pushCookieHeader(placeholder, persona.secret)
+      } else {
+        push(placeholder, persona.secret)
+      }
+    }
+
+    // 2. Active minted session value.
+    if (persona.session?.value) {
+      if (persona.session.headerType === 'cookie') {
+        pushCookieHeader(placeholder, persona.session.value)
+      } else {
+        push(placeholder, persona.session.value)
+      }
+    }
+
+    // 3. Historical secrets, session scrubTokens, and bundle-derived secrets.
+    const extraValues = new Set<string>([
       ...(persona.secretHistory ?? []),
-      ...(persona.session?.value ? [persona.session.value] : []),
       ...(persona.session?.scrubTokens ?? []),
       ...bundleSecrets(persona.session?.bundle),
     ])
-    for (const raw of values) {
+    for (const raw of extraValues) {
       if (!raw) continue
-      push(placeholder, raw)
-      // Also scrub individual cookie values >= 8 chars (e.g., session tokens / rotated JWTs inside "sid=...; __session=<jwt>")
-      if (persona.authKind === 'cookie' || persona.authKind === 'login') {
-        for (const pair of raw.split(';')) {
-          const eq = pair.indexOf('=')
-          if (eq <= 0) continue
-          const cookieVal = pair.slice(eq + 1).trim().replace(/^["']|["']$/g, '')
-          if (cookieVal.length >= 8) push(placeholder, cookieVal)
-        }
+      // Never misparse a login password containing `=` as a cookie pair.
+      const isRawPassword = persona.authKind === 'login' && raw === persona.secret
+      if (!isRawPassword && (persona.authKind === 'cookie' || persona.authKind === 'login') && looksLikeCookieHeaderString(raw)) {
+        pushCookieHeader(placeholder, raw)
+      } else {
+        push(placeholder, raw)
       }
     }
   }
