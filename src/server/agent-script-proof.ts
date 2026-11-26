@@ -662,12 +662,12 @@ export async function runAgentScriptProof(params: AgentScriptProofParams): Promi
       const builtFallbackReceipt = !hasCompositeFailure && !drifted && hasCaptureWithClaims
         ? buildAgentScriptReceipt({ claims: latestCapture!.claims, exchanges, factLog: latestCapture!.factLog, origin: fallbackOrigin, title: params.title?.trim() || verdict.claimTitle || 'Agent script proof' })
         : null
+      const fallbackOracleCode = builtFallbackReceipt
+        ? defaultTerminalOracleRegistry.evaluate(builtFallbackReceipt.factLog, { kind: 'single_hop', receipt: builtFallbackReceipt.receipt, armOverrides: builtFallbackReceipt.armOverrides, ...(builtFallbackReceipt.evidenceRoleOverrides ? { evidenceRoleOverrides: builtFallbackReceipt.evidenceRoleOverrides } : {}) }, { strictHostDerivation: true, ...(builtFallbackReceipt.receipt.oracleEvents?.length ? { trustedOracleEvents: builtFallbackReceipt.receipt.oracleEvents } : {}) }).singleHop?.failureCode ?? null
+        : null
       typedVerdict = {
         ...verdict,
-        reason: classifyAgentScriptOracleFailure({
-          hasCompositeFailure, drifted, hasCaptureWithClaims, receiptBuilt: Boolean(builtFallbackReceipt),
-          verdictDetail: verdict.detail, attempts: verdict.attempts, exchanges, vulnClass: builtFallbackReceipt?.receipt.vulnClass ?? null,
-        }),
+        reason: classifyAgentScriptOracleFailure({ hasCompositeFailure, drifted, hasCaptureWithClaims, receiptBuilt: Boolean(builtFallbackReceipt), verdictReason: verdict.reason, oracleFailureCode: fallbackOracleCode, verdictDetail: verdict.detail, attempts: verdict.attempts, exchanges, vulnClass: builtFallbackReceipt?.receipt.vulnClass ?? null }),
       }
     }
     return {
@@ -748,8 +748,9 @@ export async function runAgentScriptProof(params: AgentScriptProofParams): Promi
   if (!verification.confirmed) {
     const reason = classifyAgentScriptOracleFailure({
       hasCompositeFailure: false, drifted: hasAuthenticated401(exchanges), hasCaptureWithClaims: true,
-      receiptBuilt: verification.rule !== 'none', verdictDetail: verification.reason,
-      attempts: verdict.attempts, exchanges, vulnClass: built.receipt.vulnClass,
+      receiptBuilt: verification.rule !== 'none', verdictReason: verdict.reason,
+      oracleFailureCode: verification.failureCode ?? null, rejectedByReceipt: true,
+      verdictDetail: verification.reason, attempts: verdict.attempts, exchanges, vulnClass: built.receipt.vulnClass,
     })
     return {
       verdict: {

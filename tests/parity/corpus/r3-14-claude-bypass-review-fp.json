@@ -1,0 +1,119 @@
+{
+  "id": "r3-14-claude-bypass-review-fp",
+  "side": "fp",
+  "source": "independent_review",
+  "archetype": "retest-agent-script-structural-receipt-rejection",
+  "description": "Independent review bypass variant (r3-05-rev-14 / claude-sonnet-5-5-high): healthy authenticated control (200) paired with a structural job-handle stub probe where a receipt IS built (rule=impact) and rejected structurally by the host receipt gate with failureCode=oracle_disagreement (no typed remediation code). Must never confirm across all confirmation paths and must stay inconclusive (never claim_not_reproduced/fixed) on retest.",
+  "covers": {
+    "files": [
+      "src/server/agent-script-proof.ts",
+      "src/server/retest-health.ts",
+      "src/server/proof-receipt.ts"
+    ],
+    "classes": [
+      "bola",
+      "retest",
+      "oracle_failure_classification"
+    ]
+  },
+  "canonicalLabel": {
+    "cwe": "CWE-639",
+    "category": "bola",
+    "title": "Structural job-handle stub receipt rejection must never confirm or be misread as remediation",
+    "impact": "Receipt gate rejects structurally with oracle_disagreement (no remediation code); must never confirm or map to fixed.",
+    "claimedImpact": "authorization",
+    "claimedBoundary": "access",
+    "vulnClass": "bola"
+  },
+  "freeTextLabel": {
+    "title": "Healthy control plus structural job-handle stub rejection must stay rejected and inconclusive"
+  },
+  "paths": {
+    "replay": true,
+    "floorReceipt": true,
+    "evaluateClaims": true,
+    "composite": false,
+    "floorInjectionRecipe": false,
+    "proofReceipt": true
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [
+    {
+      "handle": "owner_a",
+      "roleLabel": "owner (tenant-a)",
+      "role": "owner",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-r314-rev-owner-a-token"
+    },
+    {
+      "handle": "member_b",
+      "roleLabel": "member (tenant-b)",
+      "role": "member",
+      "tenant": "tenant-b",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-r314-rev-member-b-token"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "ctl",
+      "arm": "control",
+      "role": "control",
+      "method": "POST",
+      "pathAndQuery": "/api/invoices/inv_r314_rev_1/export",
+      "persona": "owner_a",
+      "requestJson": {
+        "format": "csv"
+      },
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"jobId\":\"job_ctrl_101\",\"status\":\"queued\"}"
+    },
+    {
+      "id": "prb",
+      "arm": "probe",
+      "role": "probe",
+      "method": "POST",
+      "pathAndQuery": "/api/invoices/inv_r314_rev_1/export",
+      "persona": "member_b",
+      "requestJson": {
+        "format": "csv"
+      },
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"jobId\":\"job_prb_102\",\"status\":\"queued\"}"
+    }
+  ],
+  "replaySpec": {
+    "resourceTenant": "tenant-a",
+    "assertionsJq": "{ controlPassed: (.steps.ctl.status == 200), confirmed: (.steps.prb.status == 200 and .steps.prb.json.jobId != null), observed: \"job_handle_stub\", expected: \"403\" }"
+  },
+  "proofReceipt": {
+    "vulnClass": "bola",
+    "targetMethod": "POST",
+    "targetPathAndQuery": "/api/invoices/inv_r314_rev_1/export",
+    "claimedDelta": "Pure job-handle stub without post-probe terminal impact must reject structurally with failureCode=oracle_disagreement."
+  },
+  "claims": [
+    {
+      "kind": "impact",
+      "impactClass": "authorization",
+      "probeExchangeId": "prb",
+      "controlExchangeIds": [
+        "ctl"
+      ],
+      "resourceTenant": "tenant-a"
+    }
+  ]
+}

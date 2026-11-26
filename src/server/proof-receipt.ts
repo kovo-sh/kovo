@@ -40,6 +40,7 @@ import {
 } from './oracle-invariants.ts'
 import type { BooleanDifferentialArm, BooleanDifferentialRound, ImpactClass, ImpactInput, ImpactStep, RoleName } from './oracle-invariants.ts'
 import { isJobOrHandleStub } from './v8-oracle-families.ts'
+import { deriveBooleanRemediationCode, deriveImpactRemediationCode, type OracleFailureCode } from './retry-governor.ts'
 import { assessSignedUrlMintDifferential, type SignedUrlMintExchange } from './verify-support.ts'
 
 export const receiptIdSchema = z.string().trim().min(1).max(128)
@@ -552,6 +553,8 @@ export interface ReceiptVerification {
   vulnClass: string
   /** Rule family used to validate the receipt. */
   rule: 'impact' | 'oob' | 'timing' | 'boolean' | 'status_differential' | 'browser' | 'redirect' | 'conserved_balance' | 'auth_bypass' | 'webhook' | 'none'
+  /** Closed-union host-emitted non-confirmation code (R3-14). Never sourced from worker/target prose. */
+  failureCode?: OracleFailureCode
   reason: string
   observed: string
   expected: string
@@ -634,15 +637,8 @@ export function receiptRuleFor(vulnClass: string, receipt?: Pick<ProofReceipt, '
   return { rule: 'none' }
 }
 
-function reject(receipt: ProofReceipt, rule: ReceiptVerification['rule'], reason: string): ReceiptVerification {
-  return {
-    confirmed: false,
-    vulnClass: receipt.vulnClass,
-    rule,
-    reason,
-    observed: receipt.claimedDelta,
-    expected: 'host-recorded evidence that substantiates the claimed delta',
-  }
+function reject(receipt: ProofReceipt, rule: ReceiptVerification['rule'], reason: string, failureCode: OracleFailureCode = 'oracle_disagreement'): ReceiptVerification {
+  return { confirmed: false, vulnClass: receipt.vulnClass, rule, failureCode, reason, observed: receipt.claimedDelta, expected: 'host-recorded evidence that substantiates the claimed delta' }
 }
 
 function normalizePath(value: string | undefined): string {
@@ -763,18 +759,15 @@ export function verifyReceipt(
   if (!parsed.success) {
     const issue = parsed.error.issues[0]
     return {
-      confirmed: false,
-      vulnClass: 'invalid',
-      rule: 'none',
+      confirmed: false, vulnClass: 'invalid', rule: 'none', failureCode: 'receipt_unbuildable',
       reason: `Receipt failed schema validation: ${issue?.path.join('.') || 'receipt'} ${issue?.message ?? ''}`.slice(0, 400),
-      observed: 'invalid receipt',
-      expected: 'a well-formed ProofReceipt',
+      observed: 'invalid receipt', expected: 'a well-formed ProofReceipt',
     }
   }
   const receipt = parsed.data
   const { rule, impactClass } = receiptRuleFor(receipt.vulnClass, receipt)
   if (rule === 'none') {
-    return reject(receipt, rule, `No confirmation rule for vulnerability class "${receipt.vulnClass}".`)
+    return reject(receipt, rule, `No confirmation rule for vulnerability class "${receipt.vulnClass}".`, 'receipt_unbuildable')
   }
 
   const entries = transcript.entries ?? []
@@ -949,11 +942,9 @@ export function verifyReceipt(
     const assessment = assessBooleanDifferential({ rounds, param })
     if (!assessment.satisfied) {
       return {
-        confirmed: false,
-        vulnClass: receipt.vulnClass,
-        rule,
-        reason: assessment.reason,
-        observed: receipt.claimedDelta,
+        confirmed: false, vulnClass: receipt.vulnClass, rule,
+        failureCode: deriveBooleanRemediationCode(assessment.evidence),
+        reason: assessment.reason, observed: receipt.claimedDelta,
         expected: 'a stable structural response difference between the two predicates',
         evidence: assessment.evidence,
       }
@@ -1226,7 +1217,7 @@ export function verifyReceipt(
     if (controlMs >= 1_000) return reject(receipt, rule, `The control took ${controlMs} ms, so a delay is not distinguishable from normal latency.`)
     const minProbeMs = Math.max(1_000, controlMs * 3, Math.floor(verifiedChallenge.delayMs * 0.7))
     if (probeMs < minProbeMs) {
-      return reject(receipt, rule, `Probe ${probeMs} ms is not a stable separation from the ${controlMs} ms zero-delay control (need >= ${minProbeMs} ms).`)
+      return reject(receipt, rule, `Probe ${probeMs} ms is not a stable separation from the ${controlMs} ms zero-delay control (need >= ${minProbeMs} ms).`, 'remediation_timing_no_separation')
     }
     return {
       confirmed: true,
@@ -1459,7 +1450,7 @@ export function verifyReceipt(
   }
   const statusOnly = assessStatusOnlyDivergence(steps)
   if (statusOnly.statusOnly) {
-    return reject(receipt, rule, `Bare status-only divergence (${statusOnly.controlStatus ?? 'no control'} -> ${statusOnly.probeStatus}): ${statusOnly.reason} A 4xx/5xx probe is only supporting evidence; confirmation needs a fingerprint, structural differential, timing arm, state delta or OOB callback.`)
+    return reject(receipt, rule, `Bare status-only divergence (${statusOnly.controlStatus ?? 'no control'} -> ${statusOnly.probeStatus}): ${statusOnly.reason} A 4xx/5xx probe is only supporting evidence; confirmation needs a fingerprint, structural differential, timing arm, state delta or OOB callback.`, deriveImpactRemediationCode(impactClass!, steps))
   }
   if (
     (impactClass === 'authorization' || impactClass === 'bfla' || impactClass === 'disclosure' ||
@@ -1516,11 +1507,9 @@ export function verifyReceipt(
       if (evaluated) return evaluated
     }
     return {
-      confirmed: false,
-      vulnClass: receipt.vulnClass,
-      rule,
-      reason: assessment.reason,
-      observed: receipt.claimedDelta,
+      confirmed: false, vulnClass: receipt.vulnClass, rule,
+      failureCode: deriveImpactRemediationCode(impactClass!, steps),
+      reason: assessment.reason, observed: receipt.claimedDelta,
       expected: 'persisted/observable impact that the recorded exchanges substantiate',
       evidence: assessment.evidence,
     }
@@ -2178,9 +2167,9 @@ function verifyConservedBalanceReceipt(
 
   if (!violationKind) {
     return reject(
-      receipt,
-      rule,
+      receipt, rule,
       `Numeric readbacks on "${conserved.field}" (${conserved.pre} -> ${conserved.post} across ${ackedBurst.length} acked burst mutations, expected debit ${expectedBurstDebit}) show no conservation violation (no under-debit, negative balance, cap overshoot, or over_credit >= 2*delta).`,
+      'remediation_balance_conserved',
     )
   }
 

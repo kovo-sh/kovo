@@ -47,6 +47,7 @@ import {
   classifyProviderFailure,
   evaluateRoleProviderCircuit,
 } from '../src/server/provider.ts'
+import { verifyReceipt } from '../src/server/proof-receipt.ts'
 import { retestPersistedAgentScript, runAgentScriptProof } from '../src/server/replay-verifier.ts'
 import {
   classifyAgentScriptOracleFailure,
@@ -57,10 +58,12 @@ import {
   RetryGovernor,
   computeProviderRetryBackoffMs,
   defaultRetryGovernor,
+  isPositiveRemediationOracleCode,
   isRunWallClockExhausted,
   isTypedOracleRemediationCode,
   noteLatestProviderFailureForProfile,
   shouldRetryProviderTransport,
+  type OracleFailureCode,
 } from '../src/server/retry-governor.ts'
 import { runAllRunDisposers } from '../src/server/run-disposers.ts'
 import { events } from '../src/server/schema.ts'
@@ -402,6 +405,8 @@ test('R3-14.3: agent-script-proof fails closed on unclassified/empty-claim/unhea
       drifted: false,
       hasCaptureWithClaims: true,
       receiptBuilt: true,
+      verdictReason: 'oracle_failed',
+      oracleFailureCode: 'remediation_access_denied',
       attempts: [{ exitCode: 1, signaturesValid: true, nonceMismatch: false, oraclePassed: false }],
       exchanges: [
         { exchangeId: 'c1', origin: ORIGIN, method: 'GET', pathAndQuery: '/a', status: 200, body: '{}', sessionRole: 'control', personaHandle: 'owner_a' },
@@ -411,6 +416,50 @@ test('R3-14.3: agent-script-proof fails closed on unclassified/empty-claim/unhea
     }),
     'baseline_unhealthy',
     'non-zero script exit must fail closed',
+  )
+  // F1 & F2 regression guard: healthy authenticated 200 control + 403 probe + built receipt (rule != none),
+  // but NO positive remediation OracleFailureCode (structural rejection / oracle_disagreement / omitted)
+  // MUST fail closed to receipt_unbuildable / probe_unhealthy — NEVER claim_not_reproduced/fixed!
+  const healthyBolaExchanges = [
+    { exchangeId: 'c1', origin: ORIGIN, method: 'GET', pathAndQuery: '/a', status: 200, body: '{}', sessionRole: 'control' as const, personaHandle: 'owner_a' },
+    { exchangeId: 'p1', origin: ORIGIN, method: 'GET', pathAndQuery: '/a', status: 403, body: '{}', sessionRole: 'probe' as const, personaHandle: 'member_b' },
+  ]
+  const cleanAttempt = [{ exitCode: 0, signaturesValid: true, nonceMismatch: false, oraclePassed: false }]
+  assert.equal(
+    classifyAgentScriptOracleFailure({
+      hasCompositeFailure: false, drifted: false, hasCaptureWithClaims: true, receiptBuilt: true,
+      verdictReason: 'oracle_failed', oracleFailureCode: 'oracle_disagreement', rejectedByReceipt: true,
+      attempts: cleanAttempt, exchanges: healthyBolaExchanges, vulnClass: 'bola',
+    }),
+    'receipt_unbuildable',
+    'F1: structural receipt rejection with healthy arms must stay receipt_unbuildable, never claim_not_reproduced',
+  )
+  assert.equal(
+    classifyAgentScriptOracleFailure({
+      hasCompositeFailure: false, drifted: false, hasCaptureWithClaims: true, receiptBuilt: true,
+      verdictReason: 'oracle_failed', oracleFailureCode: null, rejectedByReceipt: true,
+      attempts: cleanAttempt, exchanges: healthyBolaExchanges, vulnClass: 'bola',
+    }),
+    'receipt_unbuildable',
+    'F1: missing oracleFailureCode on receipt rejection with healthy arms must fail closed',
+  )
+  assert.equal(
+    classifyAgentScriptOracleFailure({
+      hasCompositeFailure: false, drifted: false, hasCaptureWithClaims: true, receiptBuilt: true,
+      verdictReason: 'oracle_failed', oracleFailureCode: null, rejectedByReceipt: false,
+      attempts: cleanAttempt, exchanges: healthyBolaExchanges, vulnClass: 'bola',
+    }),
+    'probe_unhealthy',
+    'F2: oracle_failed with healthy arms and no positive remediation code must fail closed',
+  )
+  assert.equal(
+    classifyAgentScriptOracleFailure({
+      hasCompositeFailure: false, drifted: false, hasCaptureWithClaims: true, receiptBuilt: true,
+      verdictReason: 'oracle_failed', oracleFailureCode: 'remediation_access_denied', rejectedByReceipt: false,
+      attempts: cleanAttempt, exchanges: healthyBolaExchanges, vulnClass: 'bola',
+    }),
+    'claim_not_reproduced',
+    'positive host remediation code plus healthy arms emits claim_not_reproduced',
   )
 
   // Live runAgentScriptProof + retestPersistedAgentScript checks
@@ -503,12 +552,12 @@ test('R3-14.3: agent-script-proof fails closed on unclassified/empty-claim/unhea
 // 4. Typed OracleFailureCode in retest-health.ts (wording-change invariant)
 // ============================================================================
 
-test('R3-14.4: classifyRetestHealth switches on typed OracleFailureCode (immune to prose wording changes, fails closed on unknown)', () => {
+test('R3-14.4: classifyRetestHealth switches strictly on top-level host OracleFailureCode (immune to prose & forged evidence.failureCode) and proof-receipt emits real typed codes', () => {
   const makeExec = (
     recipeId: 'boolean_or_timing' | 'persisted_mutation' | 'conserved_balance',
     rule: 'boolean' | 'timing' | 'impact' | 'conserved_balance',
     reason: string,
-    failureCode?: string,
+    failureCode?: OracleFailureCode,
     extraEvidence?: Record<string, unknown>,
   ): FloorRecipeExecution => ({
     result: {
@@ -525,13 +574,11 @@ test('R3-14.4: classifyRetestHealth switches on typed OracleFailureCode (immune 
         confirmed: false,
         vulnClass: 'sqli',
         rule,
+        ...(failureCode ? { failureCode } : {}),
         reason,
         observed: '',
         expected: '',
-        evidence: {
-          ...(failureCode ? { failureCode } : {}),
-          ...(extraEvidence ?? {}),
-        },
+        evidence: { ...(extraEvidence ?? {}) },
       },
     },
     receipt: { vulnClass: 'sqli', target: { origin: ORIGIN, method: 'GET', pathAndQuery: '/api/q' }, exchangeIds: ['c1', 'p1'], oobEventIds: [], browserTraceIds: [], claimedDelta: '' } as never,
@@ -541,7 +588,7 @@ test('R3-14.4: classifyRetestHealth switches on typed OracleFailureCode (immune 
   const typedPairs: ReadonlyArray<{
     recipeId: 'boolean_or_timing' | 'persisted_mutation' | 'conserved_balance'
     rule: 'boolean' | 'timing' | 'impact' | 'conserved_balance'
-    code: string
+    code: OracleFailureCode
     oldProse: string
   }> = [
     { recipeId: 'boolean_or_timing', rule: 'boolean', code: 'remediation_boolean_no_delta', oldProse: 'no structural response change' },
@@ -552,24 +599,25 @@ test('R3-14.4: classifyRetestHealth switches on typed OracleFailureCode (immune 
 
   for (const pair of typedPairs) {
     assert.equal(isTypedOracleRemediationCode(pair.recipeId, pair.rule, pair.code), true)
-    // Completely reworded prose with typed failureCode -> healthy / claim_not_reproduced!
+    assert.equal(isPositiveRemediationOracleCode(pair.code), true)
+    // Completely reworded prose with host top-level failureCode -> healthy / claim_not_reproduced!
     const reworded = classifyRetestHealth(
       makeExec(pair.recipeId, pair.rule, 'Arbitrary reworded diagnostic message #9981', pair.code),
     )
     assert.equal(reworded.healthy, true, `${pair.recipeId}/${pair.code} must remain healthy regardless of prose wording`)
     assert.equal(reworded.failureReason, 'claim_not_reproduced')
 
-    // Old English prose WITHOUT typed failureCode -> FAILS CLOSED to oracle_disagreement (inconclusive)!
-    const proseOnly = classifyRetestHealth(
-      makeExec(pair.recipeId, pair.rule, pair.oldProse),
+    // F3: Untrusted forged `evidence.failureCode` without top-level host `verification.failureCode` MUST FAIL CLOSED!
+    const forgedEvidence = classifyRetestHealth(
+      makeExec(pair.recipeId, pair.rule, pair.oldProse, undefined, { failureCode: pair.code }),
     )
-    assert.equal(proseOnly.healthy, false, `${pair.recipeId} without typed failureCode must fail closed`)
-    assert.equal(proseOnly.code, 'oracle_disagreement')
-    assert.equal(proseOnly.failureReason, 'probe_unhealthy')
+    assert.equal(forgedEvidence.healthy, false, `${pair.recipeId} must ignore untrusted evidence.failureCode`)
+    assert.equal(forgedEvidence.code, 'oracle_disagreement')
+    assert.equal(forgedEvidence.failureReason, 'probe_unhealthy')
 
     // Unknown typed code -> FAILS CLOSED!
     const unknownCode = classifyRetestHealth(
-      makeExec(pair.recipeId, pair.rule, pair.oldProse, 'unknown_future_code'),
+      makeExec(pair.recipeId, pair.rule, pair.oldProse, 'oracle_disagreement'),
     )
     assert.equal(unknownCode.healthy, false)
     assert.equal(unknownCode.code, 'oracle_disagreement')
@@ -581,6 +629,56 @@ test('R3-14.4: classifyRetestHealth switches on typed OracleFailureCode (immune 
   )
   assert.equal(compTyped.healthy, false)
   assert.equal(compTyped.failureReason, 'composite_stage_rejected')
+
+  // F4: recipe_error with non-empty exchangeIds still fails closed to baseline_unhealthy (never healthy/fixed).
+  const recipeErrExec = {
+    ...makeExec('persisted_mutation', 'impact', 'Receipt unbuildable in harness'),
+    failure: { code: 'recipe_error', message: 'Receipt unbuildable in harness', missingRoles: [] },
+  } as unknown as FloorRecipeExecution
+  const recipeErrHealth = classifyRetestHealth(recipeErrExec)
+  assert.equal(recipeErrHealth.healthy, false)
+  assert.equal(recipeErrHealth.failureReason, 'baseline_unhealthy')
+
+  // F3: Real host proof-receipt.ts verifyReceipt emits closed-union top-level failureCode!
+  const cleanBolaVer = verifyReceipt(
+    {
+      vulnClass: 'bola',
+      target: { origin: ORIGIN, method: 'GET', pathAndQuery: '/api/invoices/inv_1' },
+      exchangeIds: ['ctl', 'prb'],
+      oobEventIds: [],
+      browserTraceIds: [],
+      claimedDelta: 'Cross-tenant read',
+      resourceTenant: 'tenant-a',
+    },
+    {
+      entries: [
+        { exchangeId: 'ctl', origin: ORIGIN, step: { id: 'ctl', arm: 'control', method: 'GET', route: '/api/invoices/inv_1', pathAndQuery: '/api/invoices/inv_1', status: 200, actor: { handle: 'owner_a', role: 'owner', tenant: 'tenant-a', auth: 'bearer', sameSite: null }, json: { id: 'inv_1', tenant_id: 'tenant-a' } } },
+        { exchangeId: 'prb', origin: ORIGIN, step: { id: 'prb', arm: 'probe', method: 'GET', route: '/api/invoices/inv_1', pathAndQuery: '/api/invoices/inv_1', status: 403, actor: { handle: 'member_b', role: 'member', tenant: 'tenant-b', auth: 'bearer', sameSite: null }, json: { error: 'forbidden' } } },
+      ],
+    },
+  )
+  assert.equal(cleanBolaVer.confirmed, false)
+  assert.equal(cleanBolaVer.failureCode, 'remediation_access_denied')
+
+  const stubVer = verifyReceipt(
+    {
+      vulnClass: 'bola',
+      target: { origin: ORIGIN, method: 'POST', pathAndQuery: '/api/invoices/inv_1/export' },
+      exchangeIds: ['ctl', 'prb'],
+      oobEventIds: [],
+      browserTraceIds: [],
+      claimedDelta: 'Export stub',
+      resourceTenant: 'tenant-a',
+    },
+    {
+      entries: [
+        { exchangeId: 'ctl', origin: ORIGIN, step: { id: 'ctl', arm: 'control', method: 'POST', route: '/api/invoices/inv_1/export', pathAndQuery: '/api/invoices/inv_1/export', status: 200, actor: { handle: 'owner_a', role: 'owner', tenant: 'tenant-a', auth: 'bearer', sameSite: null }, json: { jobId: 'j1', status: 'queued' } } },
+        { exchangeId: 'prb', origin: ORIGIN, step: { id: 'prb', arm: 'probe', method: 'POST', route: '/api/invoices/inv_1/export', pathAndQuery: '/api/invoices/inv_1/export', status: 200, actor: { handle: 'member_b', role: 'member', tenant: 'tenant-b', auth: 'bearer', sameSite: null }, json: { jobId: 'j2', status: 'queued' } } },
+      ],
+    },
+  )
+  assert.equal(stubVer.confirmed, false)
+  assert.equal(stubVer.failureCode, 'oracle_disagreement')
 })
 
 // ============================================================================

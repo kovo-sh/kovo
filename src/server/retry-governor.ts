@@ -55,6 +55,7 @@ export type OracleFailureCode =
   | 'remediation_timing_no_separation'
   | 'remediation_mutation_idempotent'
   | 'remediation_balance_conserved'
+  | 'remediation_access_denied'
   | 'composite_stage_rejected'
   | 'receipt_unbuildable'
   | 'oracle_disagreement'
@@ -66,6 +67,26 @@ const REMEDIATION_CODE_BY_RECIPE: Readonly<Record<string, ReadonlySet<OracleFail
   ]),
   persisted_mutation: new Set<OracleFailureCode>(['remediation_mutation_idempotent']),
   conserved_balance: new Set<OracleFailureCode>(['remediation_balance_conserved']),
+  access_boundary: new Set<OracleFailureCode>(['remediation_access_denied']),
+  disclosure: new Set<OracleFailureCode>(['remediation_access_denied']),
+}
+
+const POSITIVE_REMEDIATION_ORACLE_CODES: ReadonlySet<OracleFailureCode> = new Set<OracleFailureCode>([
+  'remediation_boolean_no_delta',
+  'remediation_timing_no_separation',
+  'remediation_mutation_idempotent',
+  'remediation_balance_conserved',
+  'remediation_access_denied',
+])
+
+/**
+ * True ONLY when `code` is a host-emitted positive remediation observation code.
+ * Unknown, missing, or structural rejection codes ALWAYS return `false` (fail closed).
+ */
+export function isPositiveRemediationOracleCode(
+  code: OracleFailureCode | string | null | undefined,
+): code is OracleFailureCode {
+  return typeof code === 'string' && POSITIVE_REMEDIATION_ORACLE_CODES.has(code as OracleFailureCode)
 }
 
 /**
@@ -85,6 +106,60 @@ export function isTypedOracleRemediationCode(
   }
   const allowed = REMEDIATION_CODE_BY_RECIPE[recipeId]
   return Boolean(allowed && allowed.has(code as OracleFailureCode))
+}
+
+/**
+ * Derive host-owned `OracleFailureCode` from structured `assessBooleanDifferential` evidence.
+ * Returns `'remediation_boolean_no_delta'` ONLY when baseline/control/probe stability and
+ * true===baseline equivalence all passed and no structural differential existed.
+ */
+export function deriveBooleanRemediationCode(
+  evidence: Record<string, unknown> | undefined,
+): OracleFailureCode {
+  if (!evidence) return 'oracle_disagreement'
+  const stableTriangle = evidence.baselineStable === true
+    && evidence.controlStable === true
+    && evidence.probeStable === true
+    && evidence.trueMatchesBaseline === true
+  if (!stableTriangle) return 'oracle_disagreement'
+  const noDelta = evidence.echoedOnly === true
+    || (Array.isArray(evidence.changedPaths) && evidence.changedPaths.length === 0)
+  return noDelta ? 'remediation_boolean_no_delta' : 'oracle_disagreement'
+}
+
+/**
+ * Derive host-owned `OracleFailureCode` from structured impact verification steps when
+ * `assessImpactEvidence` did not confirm. Fails closed to `'oracle_disagreement'` unless
+ * host-observed arms positively prove denial or idempotent readback.
+ */
+export function deriveImpactRemediationCode(
+  impactClass: string,
+  steps: ReadonlyArray<{
+    arm: string
+    method: string
+    status: number | null
+    actor: { handle?: string | null }
+    json?: unknown
+  }>,
+): OracleFailureCode {
+  const controls = steps.filter(s => s.arm === 'control')
+  const probes = steps.filter(s => s.arm === 'probe')
+  if (controls.length === 0 || probes.length === 0) return 'oracle_disagreement'
+  const isDenied = (s: { status: number | null; actor: { handle?: string | null } }) =>
+    s.status === 403 || s.status === 404 || (!s.actor.handle && s.status === 401)
+  if (impactClass === 'authorization' || impactClass === 'bfla' || impactClass === 'disclosure') {
+    return probes.every(isDenied) ? 'remediation_access_denied' : 'oracle_disagreement'
+  }
+  if (impactClass === 'mass_assignment' || impactClass === 'business_logic' || impactClass === 'csrf') {
+    if (probes.every(isDenied)) return 'remediation_mutation_idempotent'
+    const reads = steps.filter(s => (s.method === 'GET' || s.method === 'HEAD') && s.status !== null && s.status >= 200 && s.status < 300 && s.json !== undefined)
+    if (reads.length >= 2) {
+      const first = JSON.stringify(reads[0]!.json)
+      const last = JSON.stringify(reads[reads.length - 1]!.json)
+      if (first === last) return 'remediation_mutation_idempotent'
+    }
+  }
+  return 'oracle_disagreement'
 }
 
 export function isCompositeRejectedOracleCode(code: string | null | undefined): boolean {

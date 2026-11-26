@@ -14,8 +14,10 @@ import type { FloorRecipeExecution } from './floor-recipes.ts'
 import type { ScriptProofExchange } from './proof-receipt.ts'
 import {
   isCompositeRejectedOracleCode,
+  isPositiveRemediationOracleCode,
   isTypedOracleRemediationCode,
   isUnbuildableReceiptOracleCode,
+  type OracleFailureCode,
 } from './retry-governor.ts'
 
 export type RetestFailureReason =
@@ -365,24 +367,12 @@ export function assessRetestHealth(
 function extractTypedOracleFailureCode(execution: FloorRecipeExecution): {
   rule: string
   reason: string
-  failureCode: string | null
+  failureCode: OracleFailureCode | null
   compositeFailedStage: string | null
 } {
-  const ver = execution.result.verification as unknown as {
-    rule: string
-    reason: string
-    failureCode?: unknown
-    evidence?: Record<string, unknown>
-  }
-  const failRec = execution.failure as unknown as { failureCode?: unknown } | undefined
-  const failureCode = typeof ver.failureCode === 'string'
-    ? ver.failureCode
-    : typeof ver.evidence?.failureCode === 'string'
-      ? ver.evidence.failureCode
-      : typeof failRec?.failureCode === 'string'
-        ? failRec.failureCode
-        : null
-  const compositeFailedStage = typeof ver.evidence?.failedStage === 'string'
+  const ver = execution.result.verification
+  const failureCode: OracleFailureCode | null = ver.failureCode ?? null
+  const compositeFailedStage = typeof ver.evidence?.failedStage === 'string' && ver.evidence.failedStage.trim().length > 0
     ? ver.evidence.failedStage
     : isCompositeRejectedOracleCode(failureCode)
       ? 'composite_receipt'
@@ -767,28 +757,47 @@ export function buildAgentScriptRetestInputs(input: {
 /**
  * R3-14 fail-closed classifier for non-confirming `agent-script-proof` oracle failures.
  *
- * Emits `'claim_not_reproduced'` ONLY when composite/session/receipt checks pass AND
- * canonical `assessRetestHealth(...)` confirms healthy control + definitive probe execution.
- * Any unrecognized, incomplete, or unhealthy failure defaults to a typed inconclusive reason
- * (`'receipt_unbuildable'`, `'session_drifted'`, `'composite_stage_rejected'`, `'baseline_unhealthy'`,
- * or `'probe_unhealthy'`) — NEVER fail-open `'claim_not_reproduced'`.
+ * Emits `'claim_not_reproduced'` ONLY when composite/session/receipt checks pass, the host
+ * receipt oracle emitted a positive remediation `OracleFailureCode`, AND canonical
+ * `assessRetestHealth(...)` confirms healthy control + definitive probe execution.
+ * Any missing, unknown, structural, or unhealthy failure fails closed to a typed inconclusive
+ * reason (`'receipt_unbuildable'`, `'session_drifted'`, `'composite_stage_rejected'`,
+ * `'baseline_unhealthy'`, or `'probe_unhealthy'`) — NEVER fail-open `'claim_not_reproduced'`.
  */
 export function classifyAgentScriptOracleFailure(input: {
   hasCompositeFailure: boolean
   drifted: boolean
   hasCaptureWithClaims: boolean
   receiptBuilt: boolean
+  verdictReason?: string | null
+  oracleFailureCode?: OracleFailureCode | null
+  rejectedByReceipt?: boolean
   verdictDetail?: string | null
   attempts: readonly { exitCode: number; signaturesValid: boolean; nonceMismatch: boolean; oraclePassed: boolean }[]
   exchanges: readonly ScriptProofExchange[]
   vulnClass?: string | null
 }): RetestFailureReason {
-  if (input.hasCompositeFailure) return 'composite_stage_rejected'
+  if (input.hasCompositeFailure || isCompositeRejectedOracleCode(input.oracleFailureCode)) {
+    return 'composite_stage_rejected'
+  }
   if (input.drifted) return 'session_drifted'
-  if (!input.hasCaptureWithClaims || !input.receiptBuilt) return 'receipt_unbuildable'
+  if (
+    !input.hasCaptureWithClaims
+    || !input.receiptBuilt
+    || input.verdictReason === 'claims_missing'
+    || input.verdictReason === 'receipt_unbuildable'
+    || isUnbuildableReceiptOracleCode(input.oracleFailureCode)
+  ) {
+    return 'receipt_unbuildable'
+  }
+  const hasPositiveRemediation = isPositiveRemediationOracleCode(input.oracleFailureCode)
   const candidateInputs = buildAgentScriptRetestInputs({
     confirmed: false,
-    verdictReason: 'claim_not_reproduced',
+    verdictReason: hasPositiveRemediation
+      ? 'claim_not_reproduced'
+      : (input.verdictReason === 'probe_unhealthy' || input.verdictReason === 'baseline_unhealthy')
+        ? input.verdictReason
+        : 'claim_not_reproduced',
     verdictDetail: input.verdictDetail ?? null,
     attempts: input.attempts,
     exchanges: input.exchanges,
@@ -799,5 +808,9 @@ export function classifyAgentScriptOracleFailure(input: {
     candidateInputs.probeArms,
     candidateInputs.session,
   )
-  return assessment.healthy ? 'claim_not_reproduced' : assessment.failureReason
+  if (!assessment.healthy) return assessment.failureReason
+  if (!hasPositiveRemediation) {
+    return input.rejectedByReceipt ? 'receipt_unbuildable' : 'probe_unhealthy'
+  }
+  return 'claim_not_reproduced'
 }
