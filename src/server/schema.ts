@@ -4,7 +4,7 @@ import type {
   ApprovalLeaseScope, ApprovalPolicy, ApprovedEndpointPattern, AssessmentCheckId, BenchmarkFunnel, BoardAuthorRole, BoardMemberRole, BoardMemberState,
   BoardMessageKind, CallerCompatibility, Candidate, CapabilityTier, CheckCoverage,
   CodeLocation, DnsSource, DynamicRetestVerdict, EndpointSource, EvidenceSummary, FailureTaxonomyBucket, Finding, InlineVerifyFeedback, LabConfig,
-  OwaspCategory, ParamLocation, PatchProposalStatus, PersonaAuthKind, PersonaLoginConfig, Phase,
+  OwaspCategory, ParamLocation, PatchProposalStatus, PersonaAuthKind, PersonaLoginConfig, PersonaPrivilege, Phase,
   PreparedObservation, ReportBody, ReviewPlan, RoleAffinity, RunStatus, SecondOrderCanaryStatus, SpecialistProfile, ThinkingLevel, ThreatModelSummary,
   VerificationTier, WorkerPhase, WorkerStatus,
 } from '../domain.ts'
@@ -83,6 +83,8 @@ export const personas = sqliteTable('personas', {
   workspaceId: text('workspace_id').notNull().references(() => workspaces.id),
   handle: text('handle').notNull(),
   roleLabel: text('role_label').notNull(),
+  tenantRef: text('tenant_ref'),
+  privilege: text('privilege').$type<PersonaPrivilege | null>(),
   originAllowlist: text('origin_allowlist', { mode: 'json' }).$type<string[]>().notNull(),
   authKind: text('auth_kind').$type<PersonaAuthKind>().notNull(),
   headerName: text('header_name'),

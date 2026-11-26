@@ -56,7 +56,7 @@ import type {
   PersistedMutationArgs,
   RaceBurstArgs,
 } from './floor-recipes.ts'
-import { actorFromPersona, assessBoundary, assessImpactEvidence, assessMassAssignmentImpact, assessMfaBypass, assessStatusOnlyDivergence, classifyBoundaryClaim, classifyImpactDescriptor, normalizeRole, parseRoleLabel } from './oracle-invariants.ts'
+import { actorFromPersona, assessBoundary, assessImpactEvidence, assessMassAssignmentImpact, assessMfaBypass, assessStatusOnlyDivergence, classifyBoundaryClaim, classifyImpactDescriptor, normalizeRole, parseRoleLabel, resolvePersonaIdentity } from './oracle-invariants.ts'
 import type { ActorIdentity, AmbientAuth, ImpactStep, PersonaCredentialSource, RoleName } from './oracle-invariants.ts'
 import { classifyRetestHealth } from './retest-health.ts'
 import type { RetestHealthAssessment } from './retest-health.ts'
@@ -160,13 +160,6 @@ export interface FloorRecipePlanInput {
 
 const ANONYMOUS_HANDLE = 'anon'
 
-function roleOf(persona: EnginePersona | undefined): RoleName | null {
-  if (!persona) return null
-  if (persona.privilege === 'admin') return 'admin'
-  if (persona.privilege === 'viewer') return 'viewer'
-  return 'member'
-}
-
 function personaOf(handle: string | null | undefined, personas: readonly EnginePersona[]): EnginePersona | undefined {
   if (!handle) return undefined
   return personas.find(persona => persona.handle === handle)
@@ -176,11 +169,22 @@ function personaOf(handle: string | null | undefined, personas: readonly EngineP
 export function floorActorFor(handle: string | null | undefined, personas: readonly EnginePersona[]): FloorActor {
   if (!handle) return { handle: ANONYMOUS_HANDLE, role: null, tenant: null, auth: 'unknown' }
   const persona = personaOf(handle, personas)
-  const parsed = parseRoleLabel(persona?.roleLabel ?? null)
+  // Legacy untyped EnginePersona mocks lacked `'owner'` and passed `privilege: 'member'` with
+  // `tenant: undefined` alongside an `owner@...` label; defer to the label only in that case.
+  const effectivePrivilege =
+    persona && !persona.tenant && persona.privilege === 'member' && parseRoleLabel(persona.roleLabel).role === 'owner'
+      ? null
+      : (persona?.privilege ?? null)
+  const identity = resolvePersonaIdentity({
+    roleLabel: persona?.roleLabel ?? null,
+    tenantRef: persona?.tenant ?? null,
+    privilege: effectivePrivilege,
+    handle,
+  })
   return {
     handle,
-    role: parsed.role ?? roleOf(persona),
-    tenant: persona?.tenant?.toLowerCase() ?? parsed.tenant ?? null,
+    role: identity.privilege,
+    tenant: identity.tenant,
     auth: 'cookie',
   }
 }

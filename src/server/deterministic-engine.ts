@@ -54,7 +54,7 @@ import {
   SENSITIVE_READ_ROUTE_RE,
   withoutIdentityFields,
 } from './floor-heuristics.ts'
-import { parseRoleLabel, parseRoleTenants } from './oracle-invariants.ts'
+import { resolvePersonaIdentity, type RoleName } from './oracle-invariants.ts'
 
 export type { EngineEndpoint, EngineHypothesis, EngineParam } from './deterministic-specs.ts'
 export {
@@ -121,7 +121,7 @@ export function deterministicEngineEnabled(env: NodeJS.ProcessEnv = process.env)
 export interface EnginePersona {
   handle: string
   roleLabel: string
-  privilege: 'admin' | 'viewer' | 'member'
+  privilege: RoleName | null
   tenant?: string
 }
 
@@ -1340,7 +1340,7 @@ function authzRequiredRoleFor(
   const controlRank = rolePrivilegeRank(control.privilege)
   const probeRank = rolePrivilegeRank(probe.privilege)
   if (controlRank === null || probeRank === null || controlRank <= probeRank) return undefined
-  return control.privilege
+  return control.privilege ?? undefined
 }
 
 export interface EnumerateOptions {
@@ -1437,15 +1437,24 @@ export function buildIdentityProfiles(
 }
 
 function personaTenantsOf(persona: EnginePersona): string[] {
-  const seen = new Set<string>()
-  if (persona.tenant?.trim()) seen.add(persona.tenant.trim().toLowerCase())
-  for (const tenant of parseRoleTenants(persona.roleLabel)) seen.add(tenant)
-  return [...seen]
+  const identity = resolvePersonaIdentity({
+    roleLabel: persona.roleLabel,
+    tenantRef: persona.tenant ?? null,
+    privilege: persona.privilege,
+    handle: persona.handle,
+  })
+  return [...identity.tenants]
 }
 
 function primaryTenantOf(persona: EnginePersona | undefined): string | undefined {
   if (!persona) return undefined
-  return persona.tenant?.trim() || parseRoleLabel(persona.roleLabel).tenant || undefined
+  const identity = resolvePersonaIdentity({
+    roleLabel: persona.roleLabel,
+    tenantRef: persona.tenant ?? null,
+    privilege: persona.privilege,
+    handle: persona.handle,
+  })
+  return identity.tenant ?? undefined
 }
 
 function personasShareTenant(a: EnginePersona, b: EnginePersona): boolean {
@@ -1470,7 +1479,7 @@ export function personaPicks(personas: readonly EnginePersona[]): {
   admin?: EnginePersona
 } {
   const members = personas.filter(p => p.privilege !== 'admin')
-  const owner = members.find(p => p.privilege === 'member') ?? members[0] ?? personas[0]
+  const owner = members.find(p => p.privilege === 'member' || p.privilege === 'owner') ?? members[0] ?? personas[0]
   const ownerTenants = owner ? personaTenantsOf(owner) : []
   const disjointCrossTenant = owner
     ? personas.find(p => p.handle !== owner.handle && p.privilege !== 'admin' && personasAreDisjointTenants(owner, p))

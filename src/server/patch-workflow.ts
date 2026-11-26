@@ -23,7 +23,7 @@ import { isSensitiveRepoEntry, isSensitiveRepoRelativePath } from './exec-verify
 import { hasVaultScrubbedToken, type HostExchangeFact, type HostFactLog } from './host-fact-log.ts'
 import { applyUnifiedDiffToDirectory, type LabRunner } from './lab-runner.ts'
 import { isProfileHealthy, resolveProfilePoolForRole, type ResolvedModelProfile } from './model-settings.ts'
-import { parseRoleLabel } from './oracle-invariants.ts'
+import { resolvePersonaIdentity } from './oracle-invariants.ts'
 import type { ImpactStep } from './proof-receipt.ts'
 import { providerOptionsFor } from './provider-runtime-policy.ts'
 import { providerPool, type TelemetryCallback, type UsageCallback } from './provider.ts'
@@ -2157,16 +2157,22 @@ function buildActorDescriptor(grant: Grant, personaHandle: string | null): Impac
   if (personaHandle) {
     const persona = grant.personas?.get(personaHandle)
     if (persona) {
-      const parsed = parseRoleLabel(persona.roleLabel)
+      const identity = resolvePersonaIdentity({
+        roleLabel: persona.roleLabel,
+        tenantRef: persona.tenantRef ?? null,
+        privilege: persona.privilege ?? null,
+        handle: persona.handle,
+      })
       return {
         handle: persona.handle,
-        role: parsed.role || 'member',
-        tenant: parsed.tenant || null,
+        role: identity.privilege,
+        tenant: identity.tenant,
+        ...(identity.tenants.length > 1 ? { tenants: identity.tenants } : {}),
         auth: persona.authKind === 'cookie' ? 'cookie' : persona.authKind === 'bearer' ? 'bearer' : 'header',
         sameSite: null,
       }
     }
-    return { handle: personaHandle, role: 'member', tenant: null, auth: 'bearer', sameSite: null }
+    return { handle: personaHandle, role: null, tenant: null, auth: 'bearer', sameSite: null }
   }
   return { handle: null, role: null, tenant: null, auth: 'unknown', sameSite: null }
 }

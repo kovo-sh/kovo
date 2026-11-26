@@ -49,12 +49,13 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 
 import type { BenchmarkFunnel, FailureTaxonomyBucket, SubmittedFinding, RunTelemetry } from '../benchmarks/realistic-bench/lib/types.ts'
 import { assertLocalLabAllowed } from '../benchmarks/realistic-bench/lib/safety.ts'
-import type { Finding } from '../src/domain.ts'
+import type { Finding, PersonaPrivilege } from '../src/domain.ts'
 import { CanaryBroker } from '../src/server/canary-broker.ts'
 import { Execution } from '../src/server/execution.ts'
 import { projectReposDir } from '../src/server/github-connector.ts'
 import { privateModelProfiles } from '../src/server/model-settings.ts'
 import type { ResolvedModelProfile } from '../src/server/model-settings.ts'
+import { normalizeRole } from '../src/server/oracle-invariants.ts'
 import { createProjectPersona } from '../src/server/persona-vault.ts'
 import type { NamedSecret } from '../src/server/redact.ts'
 import { redact, redactJsonValue } from '../src/server/redact.ts'
@@ -543,7 +544,7 @@ export interface ReasonCellPlan {
   briefing: ReasonBriefing
   loginPath: string | null
   openApi: { openapi: string; info: { title: string; version: string }; paths: Record<string, unknown> } | null
-  personas: Array<{ handle: string; roleLabel: string; email: string; password: string; canaryMarkers: string[] }>
+  personas: Array<{ handle: string; roleLabel: string; tenantRef: string | null; privilege: PersonaPrivilege | null; email: string; password: string; canaryMarkers: string[] }>
   capabilityTier: 3
   mission: string
 }
@@ -622,6 +623,8 @@ export function planCell(briefing: ReasonBriefing, loginPath: string | null): Re
     return {
       handle,
       roleLabel: `${p.role} (${p.tenant})`,
+      tenantRef: p.tenant.trim() || null,
+      privilege: normalizeRole(p.role),
       email: p.email,
       password: p.password,
       canaryMarkers: [] as string[],
@@ -1230,6 +1233,8 @@ export async function runCell(
             projectId,
             handle: p.handle,
             roleLabel: p.roleLabel,
+            tenantRef: p.tenantRef,
+            privilege: p.privilege,
             originAllowlist: [briefing.origin],
             authKind: 'login',
             loginConfig: {

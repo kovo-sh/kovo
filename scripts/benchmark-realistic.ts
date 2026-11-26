@@ -47,7 +47,7 @@ import { startRealisticApp, briefingFor, gradeRun, renderScorecard } from '../be
 import { assertLocalLabAllowed } from '../benchmarks/realistic-bench/lib/safety.ts'
 import { endpointMatches } from '../benchmarks/realistic-bench/grader/match.ts'
 import { maxRpsPerOriginCeiling } from '../src/domain.ts'
-import type { EndpointSource, Finding, ParamLocation } from '../src/domain.ts'
+import type { EndpointSource, Finding, ParamLocation, PersonaPrivilege } from '../src/domain.ts'
 import { CanaryBroker } from '../src/server/canary-broker.ts'
 import { resolveOobCallbackPorts, defaultWorkerConcurrency, resolveWorkerConcurrency, MAX_RUN_WORKER_CONCURRENCY } from './benchmark-env.ts'
 import {
@@ -58,6 +58,11 @@ import {
 import { projectReposDir } from '../src/server/github-connector.ts'
 import { inspectModelProfileLoad, privateModelProfiles } from '../src/server/model-settings.ts'
 import type { ResolvedModelProfile } from '../src/server/model-settings.ts'
+import {
+  getPersonaIdentityFallbackCount,
+  normalizeRole,
+  resetPersonaIdentityFallbackCount,
+} from '../src/server/oracle-invariants.ts'
 import { createProjectPersona, resolveRunPersonas } from '../src/server/persona-vault.ts'
 import type { NamedSecret } from '../src/server/redact.ts'
 import { redact, redactJsonValue } from '../src/server/redact.ts'
@@ -650,6 +655,8 @@ export interface CellPlan {
   personas: Array<{
     handle: string
     roleLabel: string
+    tenantRef: string | null
+    privilege: PersonaPrivilege | null
     email: string
     password: string
     canaryMarkers: string[]
@@ -679,6 +686,8 @@ export function planCell(briefing: Briefing, loginPath: string | null): CellPlan
     return {
       handle,
       roleLabel: `${p.role} (${p.tenant})`,
+      tenantRef: p.tenant.trim() || null,
+      privilege: normalizeRole(p.role),
       email: p.email,
       password: p.password,
       canaryMarkers: [] as string[],
@@ -3272,6 +3281,8 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
             projectId,
             handle: p.handle,
             roleLabel: p.roleLabel,
+            tenantRef: p.tenantRef,
+            privilege: p.privilege,
             originAllowlist: [briefing.origin],
             authKind: 'login',
             loginConfig: {
@@ -3525,6 +3536,7 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
       }
     }
 
+    resetPersonaIdentityFallbackCount()
     const wait = await waitForTerminal({
       storage,
       runId,
@@ -3532,6 +3544,7 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
       onTick: (status, phase) => log(`[${slug}] ${status}/${phase}`),
       onPhase0Complete: captureRecon,
     })
+    notes.push(`personaIdentityFallbacks=${getPersonaIdentityFallbackCount()}`)
     if (recon.requested && !recon.captured && !recon.hit) {
       // The poll can miss a very fast phase transition; recapture from the same boundary.
       // createdAt filters keep investigation/verification rows out either way.

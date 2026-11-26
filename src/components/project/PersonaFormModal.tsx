@@ -4,7 +4,7 @@ import {
   registerBrowserSessionPersona,
   updateBrowserSessionPersonaAction,
 } from '../../actions-auth-capture.ts'
-import type { PersonaAuthKind, PersonaLoginAdapter, PublicPersona } from '../../domain.ts'
+import type { PersonaAuthKind, PersonaLoginAdapter, PersonaPrivilege, PublicPersona } from '../../domain.ts'
 import { cn } from '../../lib/cn.ts'
 import { parseCurlOrHeaderInput } from '../../server/curl-parse.ts'
 import { FormError, useAction } from '../common.tsx'
@@ -209,6 +209,8 @@ export function PersonaFormModal({
   const [idpOriginsText, setIdpOriginsText] = useState('')
   const [selectedStartOrigin, setSelectedStartOrigin] = useState(() => defaultProjectOrigins[0] ?? '')
   const [roleLabel, setRoleLabel] = useState(() => suggestNextAccountLabel(existingPersonas))
+  const [tenantRef, setTenantRef] = useState('')
+  const [privilege, setPrivilege] = useState<PersonaPrivilege | ''>('')
   const [headerName, setHeaderName] = useState('')
   const [origins, setOrigins] = useState(() => defaultProjectOrigins.join('\n'))
   const [secret, setSecret] = useState('')
@@ -368,6 +370,8 @@ export function PersonaFormModal({
     setImportNote('')
     if (editingPersona) {
       setRoleLabel(editingPersona.roleLabel)
+      setTenantRef(editingPersona.tenantRef ?? '')
+      setPrivilege(editingPersona.privilege ?? '')
       setLoginEmail(editingPersona.loginConfig?.email ?? '')
       setLoginUrl(editingPersona.loginConfig?.loginUrl ?? '')
       const cfg = editingPersona.loginConfig
@@ -389,6 +393,8 @@ export function PersonaFormModal({
       return
     }
     setRoleLabel(suggestNextAccountLabel(existingPersonas))
+    setTenantRef('')
+    setPrivilege('')
     setHeaderName('')
     setLoginEmail('')
     setLoginUrl('')
@@ -513,6 +519,8 @@ export function PersonaFormModal({
   function resetForm() {
     void cancelActiveCaptureSession()
     setRoleLabel(suggestNextAccountLabel(existingPersonas))
+    setTenantRef('')
+    setPrivilege('')
     setHeaderName('')
     setAuthMode('browser_session')
     setStaticKind('cookie')
@@ -942,6 +950,8 @@ export function PersonaFormModal({
   function handleSubmit(event: React.FormEvent) {
     event.preventDefault()
     const cleanLabel = roleLabel.trim() || suggestNextAccountLabel(existingPersonas)
+    const cleanTenantRef = tenantRef.trim() || null
+    const cleanPrivilege: PersonaPrivilege | null = privilege || null
     const generatedHandle = deriveUniqueHandle(
       cleanLabel,
       existingPersonas.map(p => p.handle),
@@ -988,6 +998,8 @@ export function PersonaFormModal({
             projectId: project.id,
             personaId: editingPersona.id,
             roleLabel: cleanLabel,
+            tenantRef: cleanTenantRef,
+            privilege: cleanPrivilege,
             originAllowlist: allowlist,
             ...(token ? { captureToken: token } : storageState ? { storageState } : {}),
             ...(cleanVerifyPath ? { verifyPath: cleanVerifyPath } : {}),
@@ -1007,6 +1019,8 @@ export function PersonaFormModal({
           projectId: project.id,
           handle: generatedHandle,
           roleLabel: cleanLabel,
+          tenantRef: cleanTenantRef,
+          privilege: cleanPrivilege,
           originAllowlist: allowlist,
           ...(token ? { captureToken: token } : { storageState }),
           ...(cleanVerifyPath ? { verifyPath: cleanVerifyPath } : {}),
@@ -1031,6 +1045,8 @@ export function PersonaFormModal({
         projectId: project.id,
         personaId: editingPersona.id,
         roleLabel: cleanLabel,
+        tenantRef: cleanTenantRef,
+        privilege: cleanPrivilege,
         originAllowlist: allowlist,
         authKind: effectiveAuthKind,
         ...(effectiveAuthKind === 'header' && headerNameRaw ? { headerName: headerNameRaw } : {}),
@@ -1054,6 +1070,8 @@ export function PersonaFormModal({
       projectId: project.id,
       handle: generatedHandle,
       roleLabel: cleanLabel,
+      tenantRef: cleanTenantRef,
+      privilege: cleanPrivilege,
       originAllowlist: allowlist,
       authKind: effectiveAuthKind,
       ...(effectiveAuthKind === 'header' && headerNameRaw ? { headerName: headerNameRaw } : {}),
@@ -1373,18 +1391,53 @@ export function PersonaFormModal({
             </DialogHeader>
 
             <DialogBody className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto overflow-x-hidden p-4">
-              <label className="grid gap-1.5 text-[12px] font-medium text-fg-muted">
-                Account label
-                <Input
-                  className="w-full"
-                  name="roleLabel"
-                  required
-                  maxLength={160}
-                  placeholder="User A"
-                  value={roleLabel}
-                  onChange={e => setRoleLabel(e.target.value)}
-                />
-              </label>
+              <div className="grid gap-1.5">
+                <div className="grid grid-cols-1 items-start gap-2.5 sm:grid-cols-[minmax(0,1.25fr)_minmax(0,1fr)_minmax(0,1fr)]">
+                  <label className="grid min-w-0 gap-1.5 text-[12px] font-medium text-fg-muted">
+                    Account label
+                    <Input
+                      className="w-full min-w-0"
+                      name="roleLabel"
+                      required
+                      maxLength={160}
+                      placeholder="User A"
+                      value={roleLabel}
+                      onChange={e => setRoleLabel(e.target.value)}
+                    />
+                  </label>
+                  <label className="grid min-w-0 gap-1.5 text-[12px] font-medium text-fg-muted">
+                    Privilege role
+                    <NativeSelect
+                      className="w-full min-w-0"
+                      name="privilege"
+                      aria-label="Privilege role"
+                      value={privilege}
+                      onChange={e => setPrivilege(e.target.value as PersonaPrivilege | '')}
+                    >
+                      <option value="">Unspecified</option>
+                      <option value="viewer">Viewer</option>
+                      <option value="member">Member</option>
+                      <option value="admin">Admin</option>
+                      <option value="owner">Owner</option>
+                    </NativeSelect>
+                  </label>
+                  <label className="grid min-w-0 gap-1.5 text-[12px] font-medium text-fg-muted">
+                    Tenant / org
+                    <Input
+                      className="w-full min-w-0"
+                      name="tenantRef"
+                      maxLength={120}
+                      autoComplete="off"
+                      placeholder="e.g. acme"
+                      value={tenantRef}
+                      onChange={e => setTenantRef(e.target.value)}
+                    />
+                  </label>
+                </div>
+                <small className="text-[11.5px] font-normal leading-[16px] text-fg-subtle">
+                  Specify privilege and tenant/org so cross-tenant and role-escalation checks work with any account label.
+                </small>
+              </div>
 
               {/* Universal 3-Mode Auth Selector */}
               <div className="grid gap-2" role="radiogroup" aria-label="Authentication mode">
