@@ -196,8 +196,8 @@ function ProjectPageContent({ data }: { data: ProjectLoaderData }) {
   }
 
   return (
-    <main className="flex min-h-full flex-col bg-panel font-sans text-base text-fg antialiased">
-      <header className="sticky top-0 z-20 border-b border-line bg-panel px-3.5 md:px-[22px]">
+    <main className="flex min-h-0 flex-1 flex-col bg-panel font-sans text-base text-fg antialiased">
+      <header className="sticky top-0 z-20 flex-none border-b border-line bg-panel px-3.5 md:px-[22px]">
         <div className="flex h-11 min-w-0 items-center gap-2">
           <Link className="whitespace-nowrap text-[13px] text-fg-subtle transition-colors hover:text-fg" to="/">
             Projects
@@ -253,8 +253,8 @@ function ProjectPageContent({ data }: { data: ProjectLoaderData }) {
         </div>
       </header>
 
-      <div className="flex h-10 items-center gap-1.5 overflow-x-auto border-b border-line bg-panel px-3.5 [scrollbar-width:none] md:px-[22px]">
-        <nav className="flex items-center gap-0.5" role="tablist" aria-label="Project sections">
+      <div className="flex h-10 flex-none items-center gap-1.5 overflow-x-auto border-b border-line bg-panel px-3.5 [scrollbar-width:none] md:px-[22px]">
+        <nav className="flex h-full items-center gap-0.5" role="tablist" aria-label="Project sections">
           {PROJECT_TABS.map(tab => {
             const isActive = activeTab === tab.id
             const count = tabCounts[tab.id]
@@ -285,7 +285,7 @@ function ProjectPageContent({ data }: { data: ProjectLoaderData }) {
       {syncErrorBanner && (
         <div
           role="alert"
-          className="flex flex-wrap items-center gap-2.5 border-b border-warn-line bg-warn-soft px-3.5 py-2 text-[12.5px] text-fg md:px-[22px]"
+          className="flex flex-none flex-wrap items-center gap-2.5 border-b border-warn-line bg-warn-soft px-3.5 py-2 text-[12.5px] text-fg md:px-[22px]"
         >
           <Icon name="alert" size={14} className="flex-none text-warn" />
           <span className="min-w-0 flex-1">
@@ -314,51 +314,53 @@ function ProjectPageContent({ data }: { data: ProjectLoaderData }) {
         </div>
       )}
 
-      <div className="w-full max-w-[1020px] flex-1 px-3.5 pb-12 pt-4 md:px-6 md:pb-16 md:pt-[22px]">
-        {activeTab === 'overview' && (
-          <ProjectOverviewTab
-            key={project.id}
-            data={data}
-            onSelectTab={selectTab}
-          />
-        )}
-        {activeTab === 'runs' && (
-          <ProjectRunsTab
-            key={project.id}
-            data={data}
-            onNewRun={() => setNewRunOpen(true)}
-          />
-        )}
-        {activeTab === 'inventory' && (
-          <ProjectInventoryTab
-            key={project.id}
-            data={data}
-            onDeleteAsset={assetId =>
-              removeProjectAsset({ data: { requestId: crypto.randomUUID(), projectId: project.id, assetId } })
-            }
-          />
-        )}
-        {activeTab === 'personas' && (
-          <ProjectPersonasTab
-            key={project.id}
-            data={data}
-            personaTests={personaTests}
-            onTestPersona={persona => void handleTestPersonaAuth(persona)}
-            onPersonaCreated={created => {
-              setSelectedPersonaIds(prev => prev.includes(created.id) ? prev : [...prev, created.id])
-            }}
-            onPersonaUpdated={updated => {
-              setPersonaTests(prev => {
-                if (!(updated.id in prev)) return prev
-                const next = { ...prev }
-                delete next[updated.id]
-                return next
-              })
-            }}
-          />
-        )}
-        {activeTab === 'sources' && <ProjectSourcesTab key={project.id} data={data} />}
-        {activeTab === 'guardrails' && <ProjectGuardrailsTab key={project.id} data={data} />}
+      <div className="min-h-0 flex-1 overflow-auto">
+        <div className="w-full max-w-[1020px] px-3.5 pb-12 pt-4 md:px-6 md:pb-16 md:pt-[22px]">
+          {activeTab === 'overview' && (
+            <ProjectOverviewTab
+              key={project.id}
+              data={data}
+              onSelectTab={selectTab}
+            />
+          )}
+          {activeTab === 'runs' && (
+            <ProjectRunsTab
+              key={project.id}
+              data={data}
+              onNewRun={() => setNewRunOpen(true)}
+            />
+          )}
+          {activeTab === 'inventory' && (
+            <ProjectInventoryTab
+              key={project.id}
+              data={data}
+              onDeleteAsset={assetId =>
+                removeProjectAsset({ data: { requestId: crypto.randomUUID(), projectId: project.id, assetId } })
+              }
+            />
+          )}
+          {activeTab === 'personas' && (
+            <ProjectPersonasTab
+              key={project.id}
+              data={data}
+              personaTests={personaTests}
+              onTestPersona={persona => void handleTestPersonaAuth(persona)}
+              onPersonaCreated={created => {
+                setSelectedPersonaIds(prev => prev.includes(created.id) ? prev : [...prev, created.id])
+              }}
+              onPersonaUpdated={updated => {
+                setPersonaTests(prev => {
+                  if (!(updated.id in prev)) return prev
+                  const next = { ...prev }
+                  delete next[updated.id]
+                  return next
+                })
+              }}
+            />
+          )}
+          {activeTab === 'sources' && <ProjectSourcesTab key={project.id} data={data} />}
+          {activeTab === 'guardrails' && <ProjectGuardrailsTab key={project.id} data={data} />}
+        </div>
       </div>
 
       <ProjectNewRunSheet

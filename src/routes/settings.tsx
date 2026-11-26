@@ -738,7 +738,7 @@ function SettingsWorkbenchPage() {
   }
 
   return (
-    <main className="flex min-h-full flex-col bg-panel font-sans text-[13px] leading-5 tracking-[-0.003em] text-fg">
+    <main className="flex min-h-0 flex-1 flex-col bg-panel font-sans text-[13px] leading-5 tracking-[-0.003em] text-fg">
       <header className="sticky top-0 z-10 flex-none border-b border-line bg-panel px-4 sm:px-6">
         <div className="flex h-11 min-w-0 items-center gap-2.5">
           {runId ? (
@@ -788,7 +788,7 @@ function SettingsWorkbenchPage() {
       {poolAction.error && (
         <div
           role="alert"
-          className="flex items-center gap-2.5 border-b border-line bg-danger-soft px-4 py-2 text-[12.5px] text-danger sm:px-6"
+          className="flex flex-none items-center gap-2.5 border-b border-line bg-danger-soft px-4 py-2 text-[12.5px] text-danger sm:px-6"
         >
           <span className="min-w-0 flex-1">{poolAction.error}</span>
         </div>
@@ -796,7 +796,7 @@ function SettingsWorkbenchPage() {
       {pageStatus && !poolAction.error && (
         <div
           role="status"
-          className="flex items-center gap-2.5 border-b border-line bg-ok-soft px-4 py-2 text-[12.5px] text-ok sm:px-6"
+          className="flex flex-none items-center gap-2.5 border-b border-line bg-ok-soft px-4 py-2 text-[12.5px] text-ok sm:px-6"
         >
           <span className="min-w-0 flex-1">{pageStatus}</span>
           <Button
@@ -810,7 +810,8 @@ function SettingsWorkbenchPage() {
         </div>
       )}
 
-      <div className="mx-auto flex w-full max-w-[1040px] flex-1 flex-col gap-8 px-4 pt-6 pb-[72px] sm:px-6">
+      <div className="min-h-0 flex-1 overflow-auto">
+        <div className="mx-auto flex w-full max-w-[1040px] flex-col gap-8 px-4 pt-6 pb-[72px] sm:px-6">
         <section className="flex flex-col gap-3" aria-labelledby="model-pool-heading">
           <div className="flex flex-wrap items-end justify-between gap-4">
             <div>
@@ -1007,6 +1008,7 @@ function SettingsWorkbenchPage() {
 
         <GithubConnectionBand initialStatus={githubStatus} />
         <WorkspaceSettingsBand workspace={workspace} />
+        </div>
       </div>
 
       <ModelProfileSheet
