@@ -147,26 +147,23 @@ export const threatModels = sqliteTable('threat_models', {
   createdAt: integer('created_at').notNull(),
 }, table => [index('threat_models_run').on(table.runId)])
 
-export const chainStepActiveStatuses = ['pending', 'ready', 'running'] as const
-export const chainStepRetryableStatuses = ['turn_capped', 'nudged_out'] as const
-export const chainStepTerminalStatuses = [
-  'complete',
-  'blocked',
-  'tainted',
-  'canceled',
-  'infra_failed',
-  'turn_capped',
-  'nudged_out',
-  'rotated_partial',
-  'model_failure',
-] as const
-export const chainStepStatuses = [
-  ...chainStepActiveStatuses,
-  ...chainStepTerminalStatuses,
-] as const
-export type ChainStepStatus = typeof chainStepStatuses[number]
-export type ChainStepTerminalStatus = typeof chainStepTerminalStatuses[number]
-export type ChainStepRetryableStatus = typeof chainStepRetryableStatuses[number]
+import type { ChainStepStatus } from '../step-status.ts'
+export {
+  STEP_STATUS,
+  chainStepActiveStatuses,
+  chainStepContinuableStatuses,
+  chainStepLostWorkStatuses,
+  chainStepRetryableStatuses,
+  chainStepStatuses,
+  chainStepTerminalStatuses,
+  type ChainStepActiveStatus,
+  type ChainStepContinuableStatus,
+  type ChainStepLostWorkStatus,
+  type ChainStepRetryableStatus,
+  type ChainStepStatus,
+  type ChainStepTerminalStatus,
+  type StepStatusMeta,
+} from '../step-status.ts'
 
 export const chainSteps = sqliteTable('chain_steps', {
   id: text('id').primaryKey().notNull(),

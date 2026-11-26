@@ -74,11 +74,14 @@ import type { ServiceOriginMapping } from './program-graph.ts'
 import {
   chainStepRetryableStatuses,
   chainStepTerminalStatuses,
-  findings,
+  isRetryableStepStatus,
+  isTerminalStepStatus,
+  stepBlocksDependent,
   type ChainStepRetryableStatus,
   type ChainStepStatus,
   type ChainStepTerminalStatus,
-} from './schema.ts'
+} from '../step-status.ts'
+import { findings } from './schema.ts'
 import { dedupeCodeAuditSuspects } from './semantic-audit.ts'
 import {
   isOpaqueResourceId,
@@ -1063,20 +1066,14 @@ export function normalizeDispatchStopReason(reason: string | null | undefined): 
 
 export const TERMINAL_CHAIN_STEP_STATUSES: ReadonlySet<ChainStepStatus> = new Set<ChainStepStatus>(chainStepTerminalStatuses)
 export const RETRYABLE_CHAIN_STEP_STATUSES: ReadonlySet<ChainStepStatus> = new Set<ChainStepStatus>(chainStepRetryableStatuses)
-export const CONTINUABLE_CHAIN_STEP_STATUSES: ReadonlySet<ChainStepStatus> = new Set<ChainStepStatus>([
-  'complete',
-  'rotated_partial',
-  'turn_capped',
-  'nudged_out',
-])
 export const MAX_RETRYABLE_STEP_RETRIES = 1
 
 export function isTerminalChainStepStatus(status: string): status is ChainStepTerminalStatus {
-  return TERMINAL_CHAIN_STEP_STATUSES.has(status as ChainStepStatus)
+  return isTerminalStepStatus(status)
 }
 
 export function isRetryableChainStepStatus(status: string): status is ChainStepRetryableStatus {
-  return RETRYABLE_CHAIN_STEP_STATUSES.has(status as ChainStepStatus)
+  return isRetryableStepStatus(status)
 }
 
 export type WorkerSessionExitStatus = 'completed' | 'turn_limit' | 'nudged_out' | 'wall_clock_rotated'
@@ -1139,45 +1136,49 @@ export interface DispatchFunnelStep {
 
 /**
  * Pending steps whose declared dependencies can never resolve: a step dependency that is missing,
- * canceled, tainted, infra_failed, or model_failure, or (when the fact set is supplied) a fact id
- * that does not exist. These are permanently stranded — `refreshReadyChainSteps` can never promote
- * them — so the funnel reports them as `filteredDep` instead of losing them silently.
+ * has a terminal non-satisfying status per `STEP_STATUS` (or transitively depends on one), or
+ * (when the fact set is supplied) a fact id that does not exist. These are permanently stranded —
+ * `refreshReadyChainSteps` can never promote them — so the funnel reports them as `filteredDep`
+ * and `dispatchableReadySteps` excludes them from the O3 planner deferral gate.
  */
 export function permanentlyBlockedStepIds(
   steps: readonly DispatchFunnelStep[],
   knownFactIds?: ReadonlySet<string>,
 ): string[] {
   const byId = new Map(steps.map(step => [step.id, step]))
-  const blocked: string[] = []
-  for (const step of steps) {
-    if (step.status !== 'pending') continue
-    const deadStepDep = (step.dependsOnStepIds ?? []).some(id => {
-      const dep = byId.get(id)
-      return !dep
-        || dep.status === 'canceled'
-        || dep.status === 'tainted'
-        || dep.status === 'blocked'
-        || dep.status === 'infra_failed'
-        || dep.status === 'model_failure'
-    })
-    const missingFactDep = knownFactIds
-      ? (step.dependsOnFactIds ?? []).some(id => !knownFactIds.has(id))
-      : false
-    if (deadStepDep || missingFactDep) blocked.push(step.id)
+  const blockedSet = new Set<string>()
+  let changed = true
+  while (changed) {
+    changed = false
+    for (const step of steps) {
+      if (step.status !== 'pending' || blockedSet.has(step.id)) continue
+      const deadStepDep = (step.dependsOnStepIds ?? []).some(id => {
+        if (blockedSet.has(id)) return true
+        const dep = byId.get(id)
+        return !dep || stepBlocksDependent(dep.status)
+      })
+      const missingFactDep = knownFactIds
+        ? (step.dependsOnFactIds ?? []).some(id => !knownFactIds.has(id))
+        : false
+      if (deadStepDep || missingFactDep) {
+        blockedSet.add(step.id)
+        changed = true
+      }
+    }
   }
-  return blocked
+  return steps.filter(step => blockedSet.has(step.id)).map(step => step.id)
 }
 
 /** Steps the scheduler could still dispatch: `ready`, plus `pending` with satisfiable deps.
- *  All terminal statuses (`complete`, `infra_failed`, `turn_capped`, `nudged_out`,
- *  `rotated_partial`, `model_failure`, `blocked`, `tainted`, `canceled`) are excluded. */
+ *  All terminal statuses (derived from `STEP_STATUS`) and any pending step whose dependency is
+ *  terminal non-satisfying (directly or transitively) are excluded. */
 export function dispatchableReadySteps<T extends DispatchFunnelStep>(
   steps: readonly T[],
   knownFactIds?: ReadonlySet<string>,
 ): T[] {
   const blocked = new Set(permanentlyBlockedStepIds(steps, knownFactIds))
   return steps.filter(step =>
-    !isTerminalChainStepStatus(step.status)
+    !isTerminalStepStatus(step.status)
     && (step.status === 'ready' || (step.status === 'pending' && !blocked.has(step.id))),
   )
 }

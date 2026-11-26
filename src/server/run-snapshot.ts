@@ -24,6 +24,7 @@ import {
 import { join, resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
+import { isTerminalStepStatus } from '../step-status.ts'
 import { redactJsonValue } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
 import type { Store } from './store.ts'
@@ -369,7 +370,7 @@ function countDrySteps(storage: Store, runId: string): number {
     ).all(runId) as Array<{ status?: string }>
     let streak = 0
     for (const row of rows) {
-      if (row.status === 'complete' || row.status === 'canceled') streak += 1
+      if (isTerminalStepStatus(row.status)) streak += 1
       else break
     }
     return streak
