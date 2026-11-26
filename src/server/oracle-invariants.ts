@@ -18,6 +18,9 @@
  * Defensive QA framing: everything here is a *falsifier* for over-claims. It never invents impact.
  */
 
+import { createHash } from 'node:crypto'
+import { compileSafeClaimRegex, MAX_CLAIM_REGEX_HAYSTACK, runUntrustedRegex } from './safe-regex.ts'
+
 export type ImpactClass = 'authorization' | 'bfla' | 'mass_assignment' | 'csrf' | 'business_logic' | 'markup' | 'disclosure' | 'injection' | 'other'
 /** Orthogonal boundary class: what kind of gate must be demonstrated for a claim. */
 export type BoundaryClass = 'auth' | 'mfa' | 'access' | 'other'
@@ -235,6 +238,25 @@ export function actorFromPersona(
   }
 }
 
+/**
+ * Structured pre-redaction credential fingerprint (`H-17` / `R2-H-12`).
+ * Carries `(kind, fieldPath)` and optional owner attribution so header-sourced and rotating
+ * CSRF/session cookie fingerprints can be excluded and genuine victim secrets matched across
+ * authorization boundaries.
+ */
+export interface StructuredSecretFingerprint {
+  /** First 12+ hex chars of SHA-256(rawSecretValue). */
+  sha256Prefix: string
+  /** Match kind (`named_secret`, `credential`, `jwt`, `private_key`, `credential_header`, `bearer`, `key_value`). */
+  kind?: string | null
+  /** Observation location (`headers.<name>` or a JSON body path such as `body.items[0].apiKey`). */
+  fieldPath?: string | null
+  /** Owning persona handle when attributed to a known persona secret. */
+  ownerPersona?: string | null
+  /** Owning tenant when attributed to a known tenant secret. */
+  ownerTenant?: string | null
+}
+
 export interface ImpactStep {
   id: string
   /** Chain arm from the spec/claim (`control`, `probe`, `setup`, `cleanup`). */
@@ -249,10 +271,14 @@ export interface ImpactStep {
   body?: string
   /** Request body actually sent by the probe (used to distinguish injected fields from echoes). */
   requestJson?: unknown
+  /** Raw non-JSON request body (e.g. form-urlencoded, XML, multipart) for echo-stripping and differentials. */
+  requestBody?: string
   requestHeaders?: Record<string, string> | null
   responseHeaders?: Record<string, string> | null
   /** Pre-redaction credential fingerprints (sha256 prefixes only) observed in this exchange. */
   secretMatches?: readonly string[]
+  /** Structured pre-redaction credential fingerprints `(kind, fieldPath, ownerPersona)` for H-17/R2-H-12. */
+  structuredSecretMatches?: readonly StructuredSecretFingerprint[]
   /** Host-recorded wall-clock duration (timing-differential evidence). */
   durationMs?: number
   /**
@@ -302,8 +328,14 @@ export interface ImpactInput {
    * nothing.
    */
   credentialPatterns?: readonly string[] | null
+  /** Victim-held secret fingerprints known to the host for H-17/R2-H-12 cross-boundary matching. */
+  victimSecretFingerprints?: ReadonlyArray<string | StructuredSecretFingerprint> | null
   /** Runtime-registered canary / secret markers (with optional owning tenant) for this assessment. */
   canaryMarkers?: ReadonlyArray<string | RegisteredCanaryMarker> | null
+  /** Host-attested browser execution for markup/client-script claims (`R2-C-5`). */
+  browserExecutionAttested?: boolean
+  /** Host-minted probe nonce(s) for HTTP markup reflection/storage checks (`R2-C-5`). */
+  probeNonces?: readonly string[] | null
   /** Extra injection-arm evidence (boolean rounds, timing, OOB, status-boolean exception). */
   injection?: InjectionEvidence
 }
@@ -871,25 +903,20 @@ function hasOracle(events: readonly string[] | undefined, kinds: readonly string
   return events.some(event => wanted.has(event))
 }
 
-/** Reject patterns that would match anything: the host must re-observe the value, not trust a claim. */
+/** Reject patterns that would match anything or risk ReDoS (`R2-H-26` / `H-32`). */
 function isSpecificCredentialPattern(pattern: unknown): pattern is string {
   if (typeof pattern !== 'string') return false
   const value = pattern.trim()
   if (value.length < 8 || value.length > 200) return false
   if (/\.\*|\.\+|\\s\*|\\s\+|\(\?/.test(value)) return false
-  try {
-    // Must compile; a broken pattern is not evidence.
-    new RegExp(value)
-    return true
-  } catch {
-    return false
-  }
+  return compileSafeClaimRegex(value, { maxLength: 200 }).ok
 }
 
 /**
  * Credential-shaped values declared by the proof: a pattern that matches the probe response and no
- * control response. Returned patterns are the evidence; the caller still requires an authorization
- * boundary (a denied sibling arm or a role differential) before treating it as a disclosure.
+ * control response, routed through `runUntrustedRegex` with haystack capping (`R2-H-26`).
+ * Returned patterns are the evidence; the caller still requires an authorization boundary
+ * (a denied sibling arm or a role differential) before treating it as a disclosure.
  */
 function credentialPatternEvidence(
   patterns: readonly string[] | null | undefined,
@@ -899,16 +926,139 @@ function credentialPatternEvidence(
   if (!patterns?.length) return []
   const probeBody = typeof probe.body === 'string' ? probe.body : ''
   if (!probeBody) return []
-  const controlBodies = controls.map(control => (typeof control.body === 'string' ? control.body : '')).join('\n')
+  const controlBodies = controls
+    .map(control => (typeof control.body === 'string' ? control.body : ''))
+    .filter(Boolean)
   const matched: string[] = []
   for (const pattern of patterns) {
     if (!isSpecificCredentialPattern(pattern)) continue
-    const expression = new RegExp(pattern)
-    if (!expression.test(probeBody)) continue
-    if (controlBodies && expression.test(controlBodies)) continue
+    const probeRes = runUntrustedRegex(pattern.trim(), probeBody, {
+      maxPatternLen: 200,
+      maxHaystackLen: MAX_CLAIM_REGEX_HAYSTACK,
+    })
+    if (!probeRes.ok || !probeRes.matched) continue
+    const seenInControl = controlBodies.some(controlBody => {
+      const ctrlRes = runUntrustedRegex(pattern.trim(), controlBody, {
+        maxPatternLen: 200,
+        maxHaystackLen: MAX_CLAIM_REGEX_HAYSTACK,
+      })
+      return ctrlRes.ok && ctrlRes.matched
+    })
+    if (seenInControl) continue
     matched.push(pattern)
   }
   return matched.slice(0, 4)
+}
+
+/**
+ * Rotating CSRF/session/cookie field names that must never count as victim secret disclosure
+ * (`H-17` / `R2-H-12`).
+ */
+const ROTATING_SESSION_FIELD_RE = /^(?:[a-z0-9_-]*[_-])?(?:x[-_]?)?(?:csrf|xsrf|set[-_]?cookie|cookie|cookies|session(?:[-_]?id)?|sid|jsessionid|phpsessid|anticsrf|authenticity[-_]?token|__host-[a-z0-9_-]*|__secure-[a-z0-9_-]*|state|nonce)(?:[-_]?(?:token|key|id|value|secret))?$/i
+
+/**
+ * True when a structured secret fingerprint originates from a non-header, non-rotating-session
+ * body field and carries a substantive SHA-256 prefix (`H-17` / `R2-H-12`).
+ */
+export function isEligibleSecretFingerprint(fp: StructuredSecretFingerprint | null | undefined): boolean {
+  if (!fp || typeof fp.sha256Prefix !== 'string') return false
+  const digest = fp.sha256Prefix.trim()
+  if (digest.length < 8) return false
+  const kind = (fp.kind ?? '').trim().toLowerCase()
+  if (kind === 'credential_header') return false
+  const fieldPath = (fp.fieldPath ?? '').trim()
+  if (!fieldPath) return false
+  const lowerPath = fieldPath.toLowerCase()
+  if (lowerPath === 'headers' || lowerPath.startsWith('headers.')) return false
+  const segments = lowerPath.split(/[.\[\]]+/).filter(Boolean)
+  if (segments.length === 0) return false
+  for (const seg of segments) {
+    if (ROTATING_SESSION_FIELD_RE.test(seg)) return false
+  }
+  return true
+}
+
+/**
+ * Find eligible body-sourced structured secret fingerprints in `probe` that match a victim-held
+ * secret value (never header/cookie/CSRF rotation, never self-echo, never anonymous/public values).
+ */
+export function findVictimDisclosedFingerprints(args: {
+  probe: ImpactStep
+  controls: readonly ImpactStep[]
+  victimSecretFingerprints?: ReadonlyArray<string | StructuredSecretFingerprint> | null
+  crossTenantOnly?: boolean
+}): StructuredSecretFingerprint[] {
+  const { probe, controls, victimSecretFingerprints, crossTenantOnly = false } = args
+  const probeStructured = (probe.structuredSecretMatches ?? []).filter(isEligibleSecretFingerprint)
+  if (probeStructured.length === 0) return []
+
+  const probeHandle = probe.actor.handle?.toLowerCase() ?? null
+  const probeTenants = actorTenants(probe.actor)
+
+  // Any fingerprint served to an anonymous control is public, not a victim secret.
+  const anonymousDigests = new Set<string>()
+  for (const control of controls) {
+    if (control.actor.handle !== null || !isSuccess(control.status)) continue
+    for (const fp of control.structuredSecretMatches ?? []) {
+      if (fp.sha256Prefix) anonymousDigests.add(fp.sha256Prefix.trim().toLowerCase())
+    }
+    for (const raw of control.secretMatches ?? []) {
+      if (raw) anonymousDigests.add(raw.trim().toLowerCase())
+    }
+  }
+
+  // Victim-held secret digest set: host-supplied victim fingerprints + entitled different-actor
+  // control body fingerprints.
+  const victimDigests = new Set<string>()
+  for (const entry of victimSecretFingerprints ?? []) {
+    if (typeof entry === 'string') {
+      const digest = entry.trim().toLowerCase()
+      if (digest.length >= 8) victimDigests.add(digest)
+      continue
+    }
+    const digest = entry.sha256Prefix?.trim().toLowerCase() ?? ''
+    if (digest.length < 8) continue
+    if (entry.kind?.trim().toLowerCase() === 'credential_header') continue
+    if (entry.fieldPath && !isEligibleSecretFingerprint(entry)) continue
+    const ownerPersona = entry.ownerPersona?.trim().toLowerCase() ?? null
+    if (ownerPersona !== null && probeHandle !== null && ownerPersona === probeHandle) continue
+    const ownerTenant = entry.ownerTenant?.trim().toLowerCase() ?? null
+    if (crossTenantOnly && ownerTenant !== null && probeTenants.has(ownerTenant)) continue
+    victimDigests.add(digest)
+  }
+
+  for (const control of controls) {
+    if (control.arm !== 'control' || !isSuccess(control.status)) continue
+    const controlHandle = control.actor.handle?.toLowerCase() ?? null
+    if (controlHandle === null) continue
+    if (probeHandle !== null && controlHandle === probeHandle) continue
+    if (crossTenantOnly && !actorsAreCrossTenant(control.actor, probe.actor)) continue
+    for (const fp of control.structuredSecretMatches ?? []) {
+      if (!isEligibleSecretFingerprint(fp)) continue
+      const ownerPersona = fp.ownerPersona?.trim().toLowerCase() ?? null
+      if (ownerPersona !== null && probeHandle !== null && ownerPersona === probeHandle) continue
+      const ownerTenant = fp.ownerTenant?.trim().toLowerCase() ?? null
+      if (crossTenantOnly && ownerTenant !== null && probeTenants.has(ownerTenant)) continue
+      victimDigests.add(fp.sha256Prefix.trim().toLowerCase())
+    }
+  }
+
+  if (victimDigests.size === 0) return []
+
+  const matched: StructuredSecretFingerprint[] = []
+  const seen = new Set<string>()
+  for (const fp of probeStructured) {
+    const digest = fp.sha256Prefix.trim().toLowerCase()
+    if (seen.has(digest) || anonymousDigests.has(digest)) continue
+    const ownerPersona = fp.ownerPersona?.trim().toLowerCase() ?? null
+    if (ownerPersona !== null && probeHandle !== null && ownerPersona === probeHandle) continue
+    const ownerTenant = fp.ownerTenant?.trim().toLowerCase() ?? null
+    if (crossTenantOnly && ownerTenant !== null && probeTenants.has(ownerTenant)) continue
+    if (!victimDigests.has(digest)) continue
+    seen.add(digest)
+    matched.push(fp)
+  }
+  return matched
 }
 
 // ---------------------------------------------------------------------------
@@ -1334,7 +1484,16 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
       const probeFlat = probe.json !== undefined && probe.json !== null && typeof probe.json === 'object'
         ? flattenJson(probe.json)
         : null
-      const hasSecretMatch = (probe.secretMatches?.length ?? 0) > 0
+      // R2-H-12 / H-17: only a structured, non-header, non-CSRF/session secret matching a
+      // victim-held value may satisfy the cross-tenant publicness guard (never rotating cookies
+      // or bare unstructured secretMatches).
+      const victimSecrets = findVictimDisclosedFingerprints({
+        probe,
+        controls,
+        victimSecretFingerprints: input.victimSecretFingerprints,
+        crossTenantOnly: true,
+      })
+      const hasSecretMatch = victimSecrets.length > 0
       const hasPrincipalOrCanary = hasSecretMatch || (probeFlat
         ? [...probeFlat.entries()].some(([path, value]) => {
           if (!value || value === 'null') return false
@@ -1346,7 +1505,7 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
         return {
           required: true,
           satisfied: false,
-          reason: 'Cross-tenant claim dismissed (publicness): no same-route owner reference or denied control establishes non-publicness on this route, and the response exposes no owner-scoped principal identifier or tenant canary.',
+          reason: 'Cross-tenant claim dismissed (publicness): no same-route owner reference or denied control establishes non-publicness on this route, and the response exposes no owner-scoped principal identifier, tenant canary, or victim-held body secret.',
           evidence: base,
         }
       }
@@ -1358,14 +1517,21 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
       evidence: base,
     }
   }
-  const probeFingerprints = new Set<string>(probe.secretMatches ?? [])
-  const controlFingerprints = new Set<string>(controls.flatMap(control => [...(control.secretMatches ?? [])]))
-  const disclosedFingerprints = [...probeFingerprints].filter(fingerprint => !controlFingerprints.has(fingerprint))
-  if (disclosedFingerprints.length > 0) {
+  // H-17 / R2-H-12: filter credential fingerprints by structured `(kind, fieldPath)` excluding
+  // `headers.*` and rotating CSRF/session cookie fields, and require a match to a victim-held
+  // secret value across an authorization boundary (never an inverted "absent from control" check).
+  const disclosedVictimSecrets = findVictimDisclosedFingerprints({
+    probe,
+    controls,
+    victimSecretFingerprints: input.victimSecretFingerprints,
+    crossTenantOnly: false,
+  })
+  const hasSecretBoundary = crossTenant || roleDifferential || boundaryControlDenied
+  if (disclosedVictimSecrets.length > 0 && hasSecretBoundary) {
     return {
       required: true,
       satisfied: true,
-      reason: `Credential-shaped value(s) disclosed: ${disclosedFingerprints.length} pre-redaction secret fingerprint(s) appear in the probe response and not in any entitled control.`,
+      reason: `Victim-held credential value(s) disclosed across authorization boundary: ${disclosedVictimSecrets.length} structured body secret fingerprint(s) match a victim-held secret.`,
       evidence: base,
     }
   }
@@ -1653,13 +1819,21 @@ export interface BusinessLogicAssessment extends ImpactAssessment {
   }
 }
 
+function sameRequestBody(a: ImpactStep, b: ImpactStep): boolean {
+  const aJson = a.requestJson === undefined ? null : safeJson(a.requestJson)
+  const bJson = b.requestJson === undefined ? null : safeJson(b.requestJson)
+  if (aJson !== bJson) return false
+  const aRaw = a.requestBody === undefined ? null : a.requestBody
+  const bRaw = b.requestBody === undefined ? null : b.requestBody
+  return aRaw === bRaw
+}
+
 function sameMutatingRequest(a: ImpactStep, b: ImpactStep): boolean {
   if (!stepMutatesState(a) || !stepMutatesState(b)) return false
   if ((a.method ?? '').toUpperCase() !== (b.method ?? '').toUpperCase()) return false
   if ((a.route ?? '') === '' || a.route !== b.route) return false
-  const aBody = a.requestJson === undefined ? null : JSON.stringify(a.requestJson)
-  const bBody = b.requestJson === undefined ? null : JSON.stringify(b.requestJson)
-  return aBody === bBody
+  if (a.pathAndQuery !== undefined && b.pathAndQuery !== undefined && a.pathAndQuery !== b.pathAndQuery) return false
+  return sameRequestBody(a, b)
 }
 
 const RESOURCE_ID_KEY_RE = /^(?:id|_id|uuid|(?:job|order|item|resource|record|entity|invoice|task)_id)$/i
@@ -1684,11 +1858,81 @@ function pathAddressesResource(pathAndQuery: string | null | undefined, id: stri
 }
 
 /**
+ * Verify a repeated terminal transition (`R2-C-7` / `C-6`):
+ *  1. Two ordered successful identical mutations targeting an existing concrete resource ID
+ *     (never bare duplicate collection creates);
+ *  2. An intermediate post-state readback strictly between the two mutations on a related route
+ *     (and if a pre-first readback exists, it must differ from the intermediate readback);
+ *  3. A post-second readback strictly after the second mutation proving a verified second state delta.
+ */
+function findVerifiedRepeatedTransition(steps: readonly ImpactStep[]): {
+  verified: boolean
+  changedFields: string[]
+} {
+  for (let i = 0; i < steps.length; i += 1) {
+    const first = steps[i]!
+    if (!stepMutatesState(first) || !isSuccess(first.status)) continue
+    const firstBodyIds = resourceIdsInJson(first.requestJson)
+    const firstHasExistingResource = isObjectScopedRequest(first) || firstBodyIds.size > 0
+    if (!firstHasExistingResource) continue
+
+    for (let j = i + 1; j < steps.length; j += 1) {
+      const second = steps[j]!
+      if (first.arm !== 'probe' && second.arm !== 'probe') continue
+      if (!isSuccess(second.status) || !sameMutatingRequest(first, second)) continue
+
+      // Optional pre-first readback to ensure the first call actually moved the object into post-state.
+      let beforeFirst: ImpactStep | null = null
+      for (let k = i - 1; k >= 0; k -= 1) {
+        const candidate = steps[k]!
+        if (stepReadsState(candidate) && isSuccess(candidate.status) &&
+            candidate.json !== undefined && candidate.json !== null && relatedRoute(candidate, first)) {
+          beforeFirst = candidate
+          break
+        }
+      }
+
+      // Intermediate post-state readback strictly between `first` and `second`.
+      let midRead: ImpactStep | null = null
+      for (let m = i + 1; m < j; m += 1) {
+        const candidate = steps[m]!
+        if (!stepReadsState(candidate) || !isSuccess(candidate.status) ||
+            candidate.json === undefined || candidate.json === null || !relatedRoute(candidate, first)) continue
+        const midIds = resourceIdsInJson(candidate.json)
+        if (firstBodyIds.size > 0 && midIds.size > 0 && ![...firstBodyIds].some(id => midIds.has(id))) continue
+        if (beforeFirst) {
+          const d1 = stateDelta(beforeFirst.json, candidate.json, candidate.status)
+          if (!d1.deleted && d1.changed.length + d1.added.length + d1.removed.length === 0) continue
+        }
+        midRead = candidate
+        break
+      }
+      if (!midRead) continue
+
+      // Post-second readback strictly after `second` showing a verified second state delta.
+      for (let n = j + 1; n < steps.length; n += 1) {
+        const afterSecond = steps[n]!
+        if (!stepReadsState(afterSecond) || !relatedRoute(afterSecond, second)) continue
+        if (!isSuccess(afterSecond.status) && afterSecond.status !== 404 && afterSecond.status !== 410) continue
+        if (isSuccess(afterSecond.status) && (afterSecond.json === undefined || afterSecond.json === null)) continue
+        const d2 = stateDelta(midRead.json, afterSecond.json, afterSecond.status)
+        const changed2 = [...d2.changed, ...d2.added, ...d2.removed]
+        if (d2.deleted || changed2.length > 0) {
+          return { verified: true, changedFields: changed2 }
+        }
+      }
+    }
+  }
+  return { verified: false, changedFields: [] }
+}
+
+/**
  * Business-logic/workflow claims assert an invariant the server never modelled in HTTP evidence.
  * A self-service owner mutation of a field the caller is entitled to edit is in policy; impact
- * requires a host-recorded boundary (denied peer or entitled cross-tenant read), the same terminal
- * transition accepted twice, a persisted *protected* field change, or a declared invariant event.
- * Declared role/resource labels alone never establish the boundary.
+ * requires a host-recorded boundary (denied equal-or-higher peer or object-bound cross-tenant read)
+ * backed by persisted attributable state change, a verified repeated terminal transition with
+ * intermediate post-state readback and second state delta, a persisted *protected* field change,
+ * or a declared invariant event. `resourceBound` proves attribution only, never impact (`R2-C-7`).
  */
 export function assessBusinessLogicImpact(input: ImpactInput): BusinessLogicAssessment {
   const steps = input.steps
@@ -1710,63 +1954,9 @@ export function assessBusinessLogicImpact(input: ImpactInput): BusinessLogicAsse
       evidence: labels,
     }
   }
-  const probeTenants = actorTenants(mutatingProbe.actor)
-  const resourceTenant = input.resourceTenant?.toLowerCase() ?? null
-  const mirrorCorroborated = resourceTenant !== null && steps.some(step =>
-    step.arm === 'control' &&
-    actorTenants(step.actor).has(resourceTenant) &&
-    stepReadsState(step) &&
-    isSuccess(step.status) &&
-    relatedRoute(step, mutatingProbe))
-  const crossTenantWrite = resourceTenant !== null && probeTenants.size > 0 && !probeTenants.has(resourceTenant)
-  const peerDenial = (control: ImpactStep): boolean => {
-    const controlTenants = actorTenants(control.actor)
-    const unauthenticated = control.actor.handle === null && controlTenants.size === 0
-    // `anon=401` proves authentication, not authorization, for a cross-tenant write.
-    if (unauthenticated && crossTenantWrite) return false
-    if (controlTenants.size === 0 || probeTenants.size === 0) return true
-    return actorsShareTenant(control.actor, mutatingProbe.actor) ||
-      (mirrorCorroborated && resourceTenant !== null && controlTenants.has(resourceTenant) && !probeTenants.has(resourceTenant))
-  }
-  const boundaryControlDenied = steps.some(control =>
-    control.arm === 'control' &&
-    peerDenial(control) &&
-    isDenied(control.status) &&
-    sameRoute(control, mutatingProbe) &&
-    steps.indexOf(control) < steps.indexOf(mutatingProbe))
-  // Declared role/resource labels are model-supplied. A cross-tenant boundary counts only when a
-  // host-recorded entitled control actually read the same resource tree in the declared tenant.
-  const crossTenantControlRead = resourceTenant !== null && probeTenants.size > 0 &&
-    !probeTenants.has(resourceTenant) && steps.some(control =>
-      control.arm === 'control' &&
-      actorTenants(control.actor).has(resourceTenant) &&
-      stepReadsState(control) &&
-      isSuccess(control.status) &&
-      control.json !== undefined &&
-      relatedRoute(control, mutatingProbe))
-  labels.boundary = boundaryControlDenied || crossTenantControlRead
-  if (labels.boundary) {
-    return {
-      required: true,
-      satisfied: true,
-      reason: boundaryControlDenied
-        ? 'Business-logic impact: a host-recorded peer control was denied on the same route before the successful mutating probe.'
-        : 'Business-logic impact: a host-recorded entitled control read the resource in another tenant before the cross-tenant mutating probe succeeded.',
-      evidence: labels,
-    }
-  }
-  // The workflow step-skip shape: the identical terminal transition accepted a second time.
-  labels.repeatedTransition = steps.some(other =>
-    other !== mutatingProbe && isSuccess(other.status) && sameMutatingRequest(other, mutatingProbe))
-  if (labels.repeatedTransition) {
-    return {
-      required: true,
-      satisfied: true,
-      reason: 'A terminal transition was accepted a second time for the same resource (the object did not leave its prior state).',
-      evidence: labels,
-    }
-  }
-  const reads = steps.filter(step => isReadMethod(step.method) && step.json !== undefined && step.json !== null)
+
+  // Compute persistence and attribution up front so boundary paths never bypass state-delta proof.
+  const reads = steps.filter(step => stepReadsState(step) && step.json !== undefined && step.json !== null)
   const beforeRead = [...reads].reverse().find(step => steps.indexOf(step) < steps.indexOf(mutatingProbe) && isSuccess(step.status)) ?? null
   const afterRead = reads.find(step => steps.indexOf(step) > steps.indexOf(mutatingProbe) &&
     (isSuccess(step.status) || step.status === 404 || step.status === 410)) ?? null
@@ -1776,9 +1966,10 @@ export function assessBusinessLogicImpact(input: ImpactInput): BusinessLogicAsse
     labels.changedFields = [...delta.changed, ...delta.added, ...delta.removed]
   }
   labels.protectedFields = labels.changedFields.filter(isProtectedField)
-  // A creator step can establish ownership of a fresh resource id even when the later transition
-  // body is empty (or form-encoded). Bind that id through the mutation route and both readbacks so
-  // a concurrent writer on an unrelated object cannot supply the observed state delta.
+  labels.oracleDeclared = hasOracle(input.oracleEvents, ['invariant_violation', 'workflow_skip', 'race_double_spend', 'state_delta', 'privilege_escalation'])
+
+  // A creator step can establish ownership of a fresh resource id for *attribution* only (binding
+  // the delta to this replay rather than a concurrent writer). `resourceBound` is never impact.
   const createdResourceIds = new Set<string>()
   for (const step of steps) {
     if (step === mutatingProbe || steps.indexOf(step) >= steps.indexOf(mutatingProbe) ||
@@ -1790,8 +1981,7 @@ export function assessBusinessLogicImpact(input: ImpactInput): BusinessLogicAsse
   const afterResourceIds = afterRead ? resourceIdsInJson(afterRead.json) : new Set<string>()
   const resourceBound = Boolean(beforeRead && afterRead && [...createdResourceIds].some(id =>
     pathAddressesResource(mutatingProbe.pathAndQuery, id) && beforeResourceIds.has(id) && afterResourceIds.has(id)))
-  // K=6 cross-talk guard: a delta caused by another worker's write is not this probe's impact.
-  // The after-read must reflect a value this probe sent (or a marker it injected).
+
   const sent = new Set<string>()
   if (mutatingProbe.requestJson !== undefined) {
     for (const value of flattenJson(mutatingProbe.requestJson).values()) {
@@ -1799,11 +1989,85 @@ export function assessBusinessLogicImpact(input: ImpactInput): BusinessLogicAsse
       for (const token of value.slice(0, 256).match(/[A-Za-z0-9_-]{8,64}/g) ?? []) sent.add(token)
     }
   }
-  labels.oracleDeclared = hasOracle(input.oracleEvents, ['invariant_violation', 'workflow_skip', 'race_double_spend', 'state_delta', 'privilege_escalation'])
   const afterFields = afterRead?.json !== undefined ? flattenJson(afterRead.json) : new Map<string, string>()
   const attributable = labels.changedFields.some(path => sent.has(afterFields.get(path) ?? '')) ||
     (afterRead !== null && [...sent].some(token => String(afterRead.body ?? '').includes(token))) ||
     resourceBound
+
+  const probeTenants = actorTenants(mutatingProbe.actor)
+  const probeRank = roleRank(mutatingProbe.actor.role)
+  const resourceTenant = input.resourceTenant?.toLowerCase() ?? null
+  const mirrorCorroborated = resourceTenant !== null && steps.some(step =>
+    step.arm === 'control' &&
+    actorTenants(step.actor).has(resourceTenant) &&
+    stepReadsState(step) &&
+    isSuccess(step.status) &&
+    sameRoute(step, mutatingProbe))
+  // R2-C-7 / C-6: reject anonymous controls, drop missing-tenant fallback, require equal-or-higher
+  // peer role rank, and require the same request body.
+  const peerDenial = (control: ImpactStep): boolean => {
+    if (!control.actor.handle) return false
+    const controlTenants = actorTenants(control.actor)
+    if (controlTenants.size > 0 || probeTenants.size > 0) {
+      if (controlTenants.size === 0 || probeTenants.size === 0) return false
+      const sharedOrMirror = actorsShareTenant(control.actor, mutatingProbe.actor) ||
+        (mirrorCorroborated && resourceTenant !== null && controlTenants.has(resourceTenant) && !probeTenants.has(resourceTenant))
+      if (!sharedOrMirror) return false
+    }
+    const controlRank = roleRank(control.actor.role)
+    if (controlRank === null || probeRank === null || controlRank < probeRank) return false
+    if (!sameRequestBody(control, mutatingProbe)) return false
+    return true
+  }
+  const boundaryControlDenied = steps.some(control =>
+    control.arm === 'control' &&
+    peerDenial(control) &&
+    isDenied(control.status) &&
+    sameRoute(control, mutatingProbe) &&
+    !isBogusIdSelectivity404(control, mutatingProbe) &&
+    steps.indexOf(control) < steps.indexOf(mutatingProbe))
+  // Cross-tenant control read must bind to an object ID on the same object route (never a parent
+  // collection prefix) and be corroborated by a victim readback.
+  const probeIsObjectScoped = isObjectScopedRequest(mutatingProbe)
+  const crossTenantControlRead = probeIsObjectScoped && resourceTenant !== null && probeTenants.size > 0 &&
+    !probeTenants.has(resourceTenant) && steps.some(control =>
+      control.arm === 'control' &&
+      actorTenants(control.actor).has(resourceTenant) &&
+      stepReadsState(control) &&
+      isSuccess(control.status) &&
+      control.json !== undefined &&
+      sameRoute(control, mutatingProbe)) &&
+    Boolean(afterRead && actorTenants(afterRead.actor).has(resourceTenant) && sameRoute(afterRead, mutatingProbe))
+  labels.boundary = boundaryControlDenied || crossTenantControlRead
+  if (labels.boundary && ((labels.persisted && attributable) || labels.oracleDeclared)) {
+    return {
+      required: true,
+      satisfied: true,
+      reason: boundaryControlDenied
+        ? 'Business-logic impact: a host-recorded equal-or-higher peer control was denied on the same route and request body before the probe persisted an attributable state change.'
+        : 'Business-logic impact: a host-recorded victim-tenant control read the object before and after the cross-tenant mutating probe persisted an attributable state change.',
+      evidence: labels,
+    }
+  }
+
+  // Verified repeated terminal transition: existing resource ID + intermediate post-state readback
+  // + verified second state delta.
+  const repeated = findVerifiedRepeatedTransition(steps)
+  labels.repeatedTransition = repeated.verified
+  if (labels.repeatedTransition) {
+    if (repeated.changedFields.length > 0 && labels.changedFields.length === 0) {
+      labels.changedFields = repeated.changedFields
+      labels.protectedFields = repeated.changedFields.filter(isProtectedField)
+    }
+    labels.persisted = true
+    return {
+      required: true,
+      satisfied: true,
+      reason: 'A terminal transition on an existing resource was accepted a second time after an intermediate post-state readback and produced a verified second state delta.',
+      evidence: labels,
+    }
+  }
+
   if (labels.persisted && !attributable && !labels.oracleDeclared) {
     return {
       required: true,
@@ -1824,13 +2088,12 @@ export function assessBusinessLogicImpact(input: ImpactInput): BusinessLogicAsse
       evidence: labels,
     }
   }
-  if (labels.persisted && (labels.protectedFields.length > 0 || labels.oracleDeclared || resourceBound)) {
+  // R2-C-7: `resourceBound` is attribution-only and deliberately excluded from the impact gate.
+  if (labels.persisted && (labels.protectedFields.length > 0 || labels.oracleDeclared)) {
     return {
       required: true,
       satisfied: true,
-      reason: resourceBound
-        ? `A fresh resource created by this proof moved from its recorded initial state after the bound transition (${labels.changedFields.slice(0, 6).join(', ')}), so the skipped-prerequisite delta is attributable to this replay.`
-        : `Persisted ${labels.protectedFields.length ? `protected field(s) ${labels.protectedFields.slice(0, 6).join(', ')}` : 'state change with a declared invariant event'}${labels.oracleDeclared ? `; oracle ${input.oracleEvents!.join(',')}` : ''}`,
+      reason: `Persisted ${labels.protectedFields.length ? `protected field(s) ${labels.protectedFields.slice(0, 6).join(', ')}` : 'state change with a declared invariant event'}${labels.oracleDeclared ? `; oracle ${input.oracleEvents!.join(',')}` : ''}`,
       evidence: labels,
     }
   }
@@ -1838,7 +2101,7 @@ export function assessBusinessLogicImpact(input: ImpactInput): BusinessLogicAsse
     required: true,
     satisfied: false,
     reason: labels.persisted
-      ? `The mutation persisted only non-protected field(s) (${labels.changedFields.slice(0, 6).join(', ') || 'none'}) by an entitled actor in its own tenant: a self-service state change is not a business-invariant violation (no boundary, no repeated terminal transition, no protected field, no declared invariant event).`
+      ? `The mutation persisted only non-protected field(s) (${labels.changedFields.slice(0, 6).join(', ') || 'none'}) by an entitled actor in its own tenant: a self-service state change is not a business-invariant violation (no persisted peer boundary, no verified repeated terminal transition, no protected field, no declared invariant event).`
       : 'No before/after readback proves the asserted invariant moved; the mutation response echo is not a state delta.',
     evidence: labels,
   }
@@ -1855,6 +2118,12 @@ export function assessBusinessLogicImpact(input: ImpactInput): BusinessLogicAsse
 export interface BooleanDifferentialArm {
   status: number | null
   method?: string
+  /** Target origin of this arm (`C-7`: must match across baseline/true/false arms). */
+  origin?: string | null
+  /** Actor persona handle (`C-7`: must match across baseline/true/false arms). */
+  persona?: string | null
+  /** Host-derived auth credential digest (`C-7`: must match across baseline/true/false arms). */
+  authDigest?: string | null
   pathAndQuery?: string
   requestJson?: unknown
   /** Raw non-JSON request body (e.g. application/x-www-form-urlencoded or application/xml). */
@@ -1865,6 +2134,8 @@ export interface BooleanDifferentialArm {
 }
 
 export interface BooleanDifferentialRound {
+  /** Benign baseline arm (`C-7`: true-predicate arm must match baseline structure; false-predicate arm must diverge). */
+  baseline?: BooleanDifferentialArm
   control: BooleanDifferentialArm
   probe: BooleanDifferentialArm
 }
@@ -1881,6 +2152,9 @@ export interface BooleanDifferentialAssessment extends ImpactAssessment {
     predicateContrast: boolean
     changedPaths: string[]
     echoPaths: string[]
+    hasBaseline?: boolean
+    baselineStable?: boolean
+    trueMatchesBaseline?: boolean
   }
 }
 
@@ -2003,20 +2277,53 @@ function decodedText(value: string): string {
   try { return decodeURIComponent(value) } catch { return value }
 }
 
+function findXmlTagRange(text: string, tagName: string, fromIndex = 0): {
+  openEnd: number
+  closeStart: number
+  closeEnd: number
+} | null {
+  const lower = text.toLowerCase()
+  const needle = `<${tagName.toLowerCase()}`
+  const closeNeedle = `</${tagName.toLowerCase()}>`
+  let pos = fromIndex
+  while (pos < lower.length) {
+    const start = lower.indexOf(needle, pos)
+    if (start < 0) return null
+    const after = lower[start + needle.length]
+    if (after !== '>' && after !== ' ' && after !== '\t' && after !== '\n' && after !== '\r' && after !== '/') {
+      pos = start + needle.length
+      continue
+    }
+    const openEnd = lower.indexOf('>', start + needle.length)
+    if (openEnd < 0) return null
+    if (lower[openEnd - 1] === '/') {
+      pos = openEnd + 1
+      continue
+    }
+    const closeStart = lower.indexOf(closeNeedle, openEnd + 1)
+    if (closeStart < 0) return null
+    return { openEnd: openEnd + 1, closeStart, closeEnd: closeStart + closeNeedle.length }
+  }
+  return null
+}
+
+function decodeBasicXmlEntities(value: string): string {
+  return value
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&apos;|&#0*39;|&#x0*27;/gi, "'")
+    .replace(/&amp;/gi, '&')
+}
+
 function paramValueFromTextBody(rawBody: string | undefined, param: string): string | null {
   if (!rawBody || !rawBody.trim()) return null
-  const trimmed = rawBody.trim()
+  const trimmed = rawBody.trim().slice(0, 64 * 1024)
   const wanted = param.split('.').pop() ?? param
   if (trimmed.startsWith('<')) {
-    const esc = wanted.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    const match = new RegExp(`<${esc}(?:\\s[^>]*)?>([\\s\\S]*?)</${esc}>`, 'i').exec(trimmed)
-    if (match?.[1] !== undefined) {
-      return match[1]
-        .replace(/&lt;/g, '<')
-        .replace(/&gt;/g, '>')
-        .replace(/&quot;/g, '"')
-        .replace(/&apos;/g, "'")
-        .replace(/&amp;/g, '&')
+    const range = findXmlTagRange(trimmed, wanted)
+    if (range) {
+      return decodeBasicXmlEntities(trimmed.slice(range.openEnd, range.closeStart))
     }
   }
   if (trimmed.includes('=')) {
@@ -2031,11 +2338,23 @@ function paramValueFromTextBody(rawBody: string | undefined, param: string): str
 
 function maskTextBodyParam(rawBody: string | undefined, param: string): string | null {
   if (!rawBody || !rawBody.trim()) return null
-  const trimmed = rawBody.trim()
+  const trimmed = rawBody.trim().slice(0, 64 * 1024)
   const wanted = param.split('.').pop() ?? param
   if (trimmed.startsWith('<')) {
-    const esc = wanted.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    return trimmed.replace(new RegExp(`(<${esc}(?:\\s[^>]*)?>)[\\s\\S]*?(</${esc}>)`, 'gi'), '$1{{injected}}$2')
+    let out = ''
+    let cursor = 0
+    while (cursor < trimmed.length) {
+      const range = findXmlTagRange(trimmed, wanted, cursor)
+      if (!range) {
+        out += trimmed.slice(cursor)
+        break
+      }
+      out += trimmed.slice(cursor, range.openEnd)
+      out += '{{injected}}'
+      out += trimmed.slice(range.closeStart, range.closeEnd)
+      cursor = range.closeEnd
+    }
+    return out
   }
   if (trimmed.includes('=')) {
     try {
@@ -2062,16 +2381,15 @@ function injectedParamValue(arm: BooleanDifferentialArm, param: string): string 
 }
 
 /**
- * Evaluate only literal boolean predicates. A stable response difference between arbitrary values
- * ("red" vs "blue", short vs long) is not a SQL boolean oracle. Recognising a narrow literal subset
- * fails closed on expressions whose truth cannot be established without executing database code.
+ * Evaluate explicit boolean predicate expressions only (`C-7`).
+ * Bare literals (`1`/`0`, `true`/`false`) are deliberately rejected so ordinary filter flags and
+ * integer IDs (`in_stock=1` vs `in_stock=0`, `id=1` vs `id=0`) can never confirm boolean SQLi.
  */
-function booleanPredicateTruth(raw: string | null): boolean | null {
+export function booleanPredicateTruth(raw: string | null): boolean | null {
   if (raw === null) return null
   let text = decodedText(raw)
   text = text.replace(/--[^\r\n]*/g, ' ').replace(/\/\*[\s\S]*?\*\//g, ' ').trim()
-  if (/^(?:true|1)$/i.test(text)) return true
-  if (/^(?:false|0)$/i.test(text)) return false
+  if (!text) return null
 
   const numeric = [...text.matchAll(/\b(\d+)\s*(==|=|!=|<>)\s*(\d+)(?:\s*([+-])\s*(\d+))?\b/gi)]
   if (numeric.length === 1) {
@@ -2129,6 +2447,29 @@ function maskedPath(pathAndQuery: string | undefined, param: string): string {
   }
 }
 
+const AUTH_SHAPE_HEADERS = new Set(['authorization', 'cookie', 'proxy-authorization', 'x-api-key'])
+
+function computeAuthDigest(
+  headers: Record<string, string> | null | undefined,
+  explicitDigest?: string | null,
+  excludeHeader?: string | null,
+): string {
+  if (typeof explicitDigest === 'string' && explicitDigest.trim().length > 0) {
+    return explicitDigest.trim().toLowerCase()
+  }
+  const excluded = excludeHeader ? excludeHeader.toLowerCase() : null
+  const pairs: string[] = []
+  for (const [key, value] of Object.entries(headers ?? {})) {
+    const lower = key.toLowerCase()
+    if (!AUTH_SHAPE_HEADERS.has(lower)) continue
+    if (excluded && lower === excluded) continue
+    pairs.push(`${lower}=${value}`)
+  }
+  if (pairs.length === 0) return ''
+  pairs.sort()
+  return createHash('sha256').update(pairs.join('\n')).digest('hex').slice(0, 16)
+}
+
 function canonicalHeaders(headers: Record<string, string> | null | undefined, param?: string): Record<string, string> {
   const out: Record<string, string> = {}
   const injected = param ? param.toLowerCase() : null
@@ -2144,6 +2485,9 @@ function canonicalHeaders(headers: Record<string, string> | null | undefined, pa
 function requestShape(arm: BooleanDifferentialArm, param: string): string {
   const rawBody = rawTextBodyOf(arm)
   return JSON.stringify({
+    origin: (arm.origin ?? '').trim().toLowerCase(),
+    persona: (arm.persona ?? '').trim().toLowerCase(),
+    authDigest: computeAuthDigest(arm.requestHeaders, arm.authDigest, param),
     method: (arm.method ?? '').toUpperCase(),
     path: maskedPath(arm.pathAndQuery, param),
     json: arm.requestJson === undefined || typeof arm.requestJson === 'string' ? null : maskJsonParam(arm.requestJson, param),
@@ -2210,22 +2554,25 @@ function signatureMapKey(map: Map<string, string>): string {
 }
 
 /**
- * Paired boolean-differential oracle. Confirms only when:
- *  - at least two control/probe rounds exist;
- *  - each pair sends the same request shape (method, route with the injected parameter masked,
- *    body and non-volatile headers) and the same route as its sibling arm;
+ * Paired boolean-differential oracle (`C-7`). Confirms only when:
+ *  - at least two full `baseline / true-variant / false-variant` triangle rounds exist;
+ *  - each triangle sends the exact same request shape (method, origin, persona, authDigest,
+ *    route with injected parameter masked, body, and non-volatile headers);
  *  - no arm returned 5xx;
- *  - the control and probe structural signatures are each stable across rounds;
- *  - the control-vs-probe structural difference is non-empty and identical in every round;
- *  - both injected values are recognisable, opposite literal boolean predicates;
- *  - the difference survives token stripping (echo/nonce-only changes are rejected).
+ *  - the baseline carries a benign non-predicate value, and control/probe carry opposite,
+ *    explicit boolean predicate expressions (bare `1`/`0`, `true`/`false` are rejected);
+ *  - baseline, true-variant, and false-variant structural signatures are each stable across rounds;
+ *  - the true-variant signature matches the benign baseline signature in every round;
+ *  - the structural difference against the false-variant survives token stripping (bare
+ *    `structural_diff` alone never confirms).
  */
 export function assessBooleanDifferential(input: {
   rounds: readonly BooleanDifferentialRound[]
   param?: string | null
+  baseline?: BooleanDifferentialArm
 }): BooleanDifferentialAssessment {
   const param = input.param?.trim() || ''
-  const evidence = {
+  const evidence: BooleanDifferentialAssessment['evidence'] = {
     rounds: input.rounds.length,
     stable: false,
     controlStable: false,
@@ -2234,8 +2581,11 @@ export function assessBooleanDifferential(input: {
     serverErrors: false,
     echoedOnly: false,
     predicateContrast: false,
-    changedPaths: [] as string[],
-    echoPaths: [] as string[],
+    changedPaths: [],
+    echoPaths: [],
+    hasBaseline: false,
+    baselineStable: false,
+    trueMatchesBaseline: false,
   }
   const reject = (reason: string): BooleanDifferentialAssessment => ({
     required: true,
@@ -2245,38 +2595,64 @@ export function assessBooleanDifferential(input: {
   })
 
   if (!param) return reject('A boolean differential must name the injected parameter.')
-  if (input.rounds.length < 2) return reject('A boolean differential needs at least two paired control/probe rounds.')
+  if (input.rounds.length < 2) return reject('A boolean differential needs at least two paired baseline/true/false triangle rounds.')
+
+  const triangles: Array<{ baseline: BooleanDifferentialArm; trueArm: BooleanDifferentialArm; falseArm: BooleanDifferentialArm }> = []
   for (const round of input.rounds) {
+    const baseline = round.baseline ?? input.baseline
+    if (!baseline) {
+      return reject('A boolean differential requires a full baseline / true-variant / false-variant triangle in every round; bare two-arm structural_diff alone cannot confirm.')
+    }
+    const baselineVal = injectedParamValue(baseline, param)
+    if (baselineVal !== null && booleanPredicateTruth(baselineVal) !== null) {
+      return reject('The baseline arm must carry a benign non-predicate value, not an injected boolean expression.')
+    }
     const controlTruth = booleanPredicateTruth(injectedParamValue(round.control, param))
     const probeTruth = booleanPredicateTruth(injectedParamValue(round.probe, param))
     if (controlTruth === null || probeTruth === null || controlTruth === probeTruth) {
-      return reject('The control and probe arms must carry opposite, recognisable boolean predicates; an arbitrary two-value content/length difference is not a boolean oracle.')
+      return reject('The true and false variant arms must carry opposite, explicit boolean predicate expressions; bare literals (1/0, true/false) and arbitrary content differences are not a boolean oracle.')
     }
+    triangles.push({
+      baseline,
+      trueArm: controlTruth ? round.control : round.probe,
+      falseArm: controlTruth ? round.probe : round.control,
+    })
   }
+  evidence.hasBaseline = true
   evidence.predicateContrast = true
-  for (const round of input.rounds) {
-    if ((round.control.status ?? 0) >= 500 || (round.probe.status ?? 0) >= 500) {
+
+  for (const tri of triangles) {
+    if ((tri.baseline.status ?? 0) >= 500 || (tri.trueArm.status ?? 0) >= 500 || (tri.falseArm.status ?? 0) >= 500) {
       evidence.serverErrors = true
-      return reject('A boolean differential arm returned a server error (5xx); error behaviour is not proof.'
-      )
+      return reject('A boolean differential arm returned a server error (5xx); error behaviour is not proof.')
     }
   }
-  for (const round of input.rounds) {
-    if (requestShape(round.control, param) !== requestShape(round.probe, param)) {
+  for (const tri of triangles) {
+    const baseShape = requestShape(tri.baseline, param)
+    if (baseShape !== requestShape(tri.trueArm, param) || baseShape !== requestShape(tri.falseArm, param)) {
       evidence.requestShapeMismatch = true
-      return reject('The control and probe arms differ beyond the injected parameter (request shape mismatch).')
+      return reject('The baseline, true-variant, and false-variant arms differ beyond the injected parameter (origin, persona, auth, or request shape mismatch).')
     }
   }
 
+  const baselineSignatures = triangles.map(tri => signatureMapKey(bodySignature(tri.baseline, param)))
+  const trueSignatures = triangles.map(tri => signatureMapKey(bodySignature(tri.trueArm, param)))
+  const falseSignatures = triangles.map(tri => signatureMapKey(bodySignature(tri.falseArm, param)))
   const controlSignatures = input.rounds.map(round => signatureMapKey(bodySignature(round.control, param)))
   const probeSignatures = input.rounds.map(round => signatureMapKey(bodySignature(round.probe, param)))
+  evidence.baselineStable = new Set(baselineSignatures).size === 1
   evidence.controlStable = new Set(controlSignatures).size === 1
   evidence.probeStable = new Set(probeSignatures).size === 1
-  if (!evidence.controlStable || !evidence.probeStable) {
-    return reject('The control or probe response structure was unstable across rounds; a moving baseline is not a differential.')
+  if (!evidence.baselineStable || !evidence.controlStable || !evidence.probeStable) {
+    return reject('The baseline, true-variant, or false-variant response structure was unstable across rounds; a moving baseline is not a differential.')
   }
 
-  const roundDiffs = input.rounds.map(round => differentialPaths(round.control, round.probe, param))
+  evidence.trueMatchesBaseline = triangles.every((_, idx) => trueSignatures[idx] === baselineSignatures[idx])
+  if (!evidence.trueMatchesBaseline) {
+    return reject('The true-predicate variant did not match the benign baseline response structure; a bare structural_diff without true=baseline equivalence is not boolean evaluation.')
+  }
+
+  const roundDiffs = triangles.map(tri => differentialPaths(tri.trueArm, tri.falseArm, param))
   const structural = roundDiffs.map(diff => diff.echoed.length === diff.changed.length ? '' : [...diff.changed].filter(path => !diff.echoed.includes(path)).sort().join(','))
   const allEchoed = roundDiffs.every(diff => diff.changed.length > 0 && diff.echoed.length === diff.changed.length)
   evidence.echoPaths = [...new Set(roundDiffs.flatMap(diff => diff.echoed))]
@@ -2286,16 +2662,16 @@ export function assessBooleanDifferential(input: {
     return reject('The only difference was the injected predicate echoed back (or a rotating nonce); no structural response change.')
   }
   if (structural.some(value => value === '')) {
-    return reject('At least one round showed no structural response change; a boolean differential must reproduce every round.')
+    return reject('At least one round showed no structural response change between true and false variants; a boolean differential must reproduce every round.')
   }
-  if (new Set(structural).size !== 1) {
+  if (new Set(structural).size !== 1 || new Set(falseSignatures).size !== 1) {
     return reject('The structural response difference was unstable across rounds; the boolean differential must be identical each round.')
   }
   evidence.stable = true
   return {
     required: true,
     satisfied: true,
-    reason: `Opposite boolean predicates reproduced across ${input.rounds.length} rounds: structural change in ${evidence.changedPaths.slice(0, 6).join(', ')} after token stripping, with a stable true/false baseline and no 5xx.`,
+    reason: `Full baseline/true/false triangle reproduced across ${input.rounds.length} rounds (true matched baseline; false diverged in ${evidence.changedPaths.slice(0, 6).join(', ')}) after token stripping, with matching origin/persona/auth and no 5xx.`,
     evidence,
   }
 }
@@ -2315,22 +2691,27 @@ export interface InjectionFingerprintMatch {
 }
 
 /**
- * Engine/dialect-specific error strings. A generic HTTP 500 (`{"error":"Internal Server Error"}`) is
- * deliberately absent: only a fingerprint that names the injected construct's engine counts.
+ * Engine/dialect-specific error strings (`R2-H-10` / `H-16`).
+ * Generic HTTP 500s, input-validation/type-cast errors, duplicate-key constraint errors, and
+ * defensive refusal messages (DOCTYPE disallowed, external entity disabled, path traversal
+ * blocked, ENOENT/EACCES, bare library names) are deliberately excluded.
  */
 const INJECTION_FINGERPRINTS: ReadonlyArray<{ family: InjectionFamily; label: string; re: RegExp }> = [
-  { family: 'sqli', label: 'sqlite', re: /\bSQLITE_(?:ERROR|CONSTRAINT|MISUSE|NOTADB)\b|sqlite3\.(?:Operational|Programming|Database)Error/i },
-  { family: 'sqli', label: 'postgres', re: /\b(?:PostgreSQL|pg_query|psycopg2|PG::\w+Error|syntax error at or near|unterminated quoted string|invalid input syntax for)\b/i },
+  { family: 'sqli', label: 'sqlite', re: /\bSQLITE_(?:ERROR|MISUSE|NOTADB)\b|sqlite3\.(?:Operational|Programming|Database)Error/i },
+  { family: 'sqli', label: 'postgres', re: /\b(?:PostgreSQL|pg_query|psycopg2|PG::\w+Error|syntax error at or near|unterminated quoted string)\b/i },
   { family: 'sqli', label: 'mysql', re: /\b(?:MySqlException|MySQLSyntaxErrorException|ER_PARSE_ERROR|You have an error in your SQL syntax|check the manual that corresponds to your (?:MariaDB|MySQL) server)\b/i },
   { family: 'sqli', label: 'mssql', re: /\b(?:Microsoft OLE DB Provider for SQL Server|Incorrect syntax near|Unclosed quotation mark after the character string|SQLServerException)\b/i },
   { family: 'sqli', label: 'oracle', re: /\bORA-\d{4,5}\b/i },
   { family: 'sqli', label: 'orm', re: /\b(?:SQLAlchemy|sqlalchemy\.exc|PrismaClient(?:KnownRequest)?Error|SequelizeDatabaseError|Knex(?:Timeout)?Error)\b/i },
-  { family: 'nosqli', label: 'mongo', re: /\b(?:Mongo(?:Server|Parse|BulkWrite)Error|BSONTypeError|Cast to (?:ObjectId|number) failed|unknown top level operator|E11000 duplicate key)\b/i },
-  { family: 'ssti', label: 'template', re: /\b(?:TemplateSyntaxError|TemplateNotFound|jinja2\.exceptions|UndefinedError|freemarker\.(?:core|template)|FreeMarker template error|VelocityException|SpelEvaluationException|EL100[0-9]E|ognl\.|OGNL expression|Handlebars|Mustache|SmartyCompilerException|Twig\\Error|Thymeleaf|ERB)\b/i },
+  { family: 'nosqli', label: 'mongo', re: /\b(?:Mongo(?:Server|Parse|BulkWrite)Error|unknown top level operator)\b/i },
+  { family: 'ssti', label: 'template', re: /\b(?:TemplateSyntaxError|jinja2\.exceptions|UndefinedError|freemarker\.(?:core|template)|FreeMarker template error|VelocityException|SpelEvaluationException|EL100[0-9]E|ognl\.|OGNL expression|SmartyCompilerException|Twig\\Error)\b/i },
   { family: 'cmdi', label: 'shell', re: /(?:\/bin\/(?:ba)?sh: |sh: \d+: |command not found|unexpected EOF while looking for matching|syntax error near unexpected token)/i },
-  { family: 'xxe', label: 'xml', re: /\b(?:SAXParseException|XMLSyntaxError|lxml\.etree|org\.xml\.sax|XPathEvalError|DOCTYPE is disallowed|Entity .* not defined|external entity)\b/i },
-  { family: 'traversal', label: 'fs', re: /\b(?:ENOENT|EACCES|ELOOP|No such file or directory|PathTraversalException|path traversal)\b/i },
+  { family: 'xxe', label: 'xml', re: /\b(?:SAXParseException|XMLSyntaxError|lxml\.etree|org\.xml\.sax|XPathEvalError|Entity [^\r\n]{1,64} not defined)\b/i },
+  { family: 'traversal', label: 'fs', re: /\broot:[x*]:0:0:/ },
 ]
+
+/** Defensive refusal context indicators (WAF / hardened parser refusals, not exploitation). */
+const DEFENSIVE_REFUSAL_CONTEXT_RE = /\b(?:disallowed|disabled|blocked by|security policy|waf|firewall|not permitted|prohibited)\b/i
 
 /** First engine-specific fingerprint in `text`, optionally restricted to one construct family. */
 export function matchInjectionFingerprint(
@@ -2343,6 +2724,12 @@ export function matchInjectionFingerprint(
     if (family && family !== 'injection' && entry.family !== family) continue
     const match = entry.re.exec(bounded)
     if (!match) continue
+    if (entry.family === 'xxe') {
+      const start = Math.max(0, match.index - 80)
+      const end = Math.min(bounded.length, match.index + match[0].length + 80)
+      const snippet = bounded.slice(start, end)
+      if (DEFENSIVE_REFUSAL_CONTEXT_RE.test(snippet)) continue
+    }
     return { family: entry.family, label: entry.label, text: match[0].slice(0, 120) }
   }
   return null
@@ -2354,42 +2741,232 @@ function responseText(step: ImpactStep): string {
   return `${step.body ?? ''}\n${json}`.slice(0, 32 * 1024)
 }
 
-/** Request values that a generic validation/error response might reflect verbatim. */
+function decodeHtmlAndNumericEntities(input: string): string {
+  return input
+    .replace(/&#(\d{2,3});/g, (full, num) => {
+      const code = Number(num)
+      return code >= 32 && code <= 126 ? String.fromCharCode(code) : full
+    })
+    .replace(/&#x([0-9a-f]{2});/gi, (full, hex) => {
+      const code = Number.parseInt(hex, 16)
+      return code >= 32 && code <= 126 ? String.fromCharCode(code) : full
+    })
+    .replace(/&quot;/gi, '"')
+    .replace(/&apos;/gi, "'")
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&amp;/gi, '&')
+}
+
+/**
+ * Canonicalize text before echo comparison (`H-16` / `R2-H-10`): decodes HTML/numeric entities,
+ * percent-encoding, and common backslash escapes, collapses whitespace, and lowercases.
+ */
+function normalizeEchoComparable(value: string): string {
+  let out = decodeHtmlAndNumericEntities(value)
+  out = decodedText(out)
+  out = out
+    .replace(/\\(["'\\/])/g, '$1')
+    .replace(/\\[nrt]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase()
+  return out
+}
+
+function tokenizeNonJsonRequestBody(rawBody: string, add: (val: string | null | undefined) => void): void {
+  const bounded = rawBody.slice(0, 32 * 1024)
+  add(bounded)
+  const trimmed = bounded.trim()
+  if (!trimmed) return
+
+  // Multipart form-data: split on boundary lines and extract part bodies and quoted header params.
+  if (trimmed.startsWith('--') && /\r?\n\r?\n/.test(trimmed)) {
+    const firstNewline = trimmed.search(/\r?\n/)
+    const boundary = firstNewline > 2 ? trimmed.slice(0, firstNewline).trim() : null
+    if (boundary && boundary.length <= 128) {
+      const parts = trimmed.split(boundary)
+      for (const part of parts) {
+        const sepIdx = part.search(/\r?\n\r?\n/)
+        if (sepIdx >= 0) {
+          const headerPart = part.slice(0, sepIdx)
+          const bodyPart = part.slice(sepIdx).replace(/^\r?\n\r?\n/, '').replace(/\r?\n$/, '')
+          add(bodyPart)
+          for (const m of headerPart.matchAll(/(?:name|filename)="([^"]{1,512})"/gi)) {
+            add(m[1])
+          }
+        }
+      }
+    }
+  }
+
+  // XML / HTML body: extract element text nodes, attribute values, and CDATA contents.
+  if (trimmed.startsWith('<')) {
+    for (const m of trimmed.matchAll(/<!\[CDATA\[([\s\S]{1,4096}?)\]\]>/g)) add(m[1])
+    for (const m of trimmed.matchAll(/>([^<]{1,4096})</g)) {
+      const text = decodeHtmlAndNumericEntities(m[1]!.trim())
+      if (text) add(text)
+    }
+    for (const m of trimmed.matchAll(/=\s*(?:"([^"]{1,1024})"|'([^']{1,1024})')/g)) {
+      const attr = decodeHtmlAndNumericEntities((m[1] ?? m[2] ?? '').trim())
+      if (attr) add(attr)
+    }
+  }
+
+  // Form-urlencoded (`k=v&k2=v2`): extract values via URLSearchParams and raw `&`/`=` split.
+  if (trimmed.includes('=')) {
+    try {
+      const sp = new URLSearchParams(trimmed)
+      for (const [k, v] of sp.entries()) {
+        add(k)
+        add(v)
+      }
+    } catch { /* ignore */ }
+    for (const pair of trimmed.split('&')) {
+      const eq = pair.indexOf('=')
+      if (eq >= 0) {
+        const rawVal = pair.slice(eq + 1)
+        add(rawVal)
+        add(rawVal.replace(/\+/g, ' '))
+        add(decodedText(rawVal.replace(/\+/g, ' ')))
+      }
+    }
+  }
+}
+
+/**
+ * Request values across ALL carriers (path segments, query params, JSON leaves, form-urlencoded,
+ * XML, multipart, headers, and cookie sub-values) that an error page might echo back (`H-16`).
+ */
 function requestEchoTokens(step: ImpactStep): string[] {
   const tokens = new Set<string>()
   const add = (value: string | null | undefined): void => {
-    if (!value || value.length < 4) return
-    tokens.add(value)
-    tokens.add(decodedText(value))
+    if (!value) return
+    const trimmed = value.trim()
+    if (trimmed.length < 4) return
+    tokens.add(trimmed)
+    const dec = decodedText(trimmed)
+    if (dec.length >= 4) tokens.add(dec)
   }
   if (step.pathAndQuery) {
     add(step.pathAndQuery)
     try {
-      for (const value of new URL(step.pathAndQuery, 'http://kovo.invalid').searchParams.values()) add(value)
-    } catch { /* a path-carried probe is covered by the full target token */ }
+      const url = new URL(step.pathAndQuery, 'http://kovo.invalid')
+      for (const seg of url.pathname.split('/').filter(Boolean)) {
+        add(seg)
+        add(seg.replace(/\+/g, ' '))
+      }
+      for (const [key, value] of url.searchParams.entries()) {
+        add(key)
+        add(value)
+      }
+    } catch {
+      for (const seg of step.pathAndQuery.split('?')[0]!.split('/').filter(Boolean)) add(seg)
+    }
   }
   if (step.requestJson !== undefined) {
-    for (const value of flattenJson(step.requestJson).values()) add(value)
+    if (typeof step.requestJson === 'string') {
+      tokenizeNonJsonRequestBody(step.requestJson, add)
+    } else {
+      for (const value of flattenJson(step.requestJson).values()) add(value)
+    }
   }
-  for (const value of Object.values(step.requestHeaders ?? {})) add(value)
+  if (typeof step.requestBody === 'string' && step.requestBody.length > 0) {
+    tokenizeNonJsonRequestBody(step.requestBody, add)
+  }
+  for (const [headerName, headerVal] of Object.entries(step.requestHeaders ?? {})) {
+    add(headerVal)
+    if (headerName.toLowerCase() === 'cookie') {
+      for (const pair of headerVal.split(';')) {
+        const trimmedPair = pair.trim()
+        add(trimmedPair)
+        const eq = trimmedPair.indexOf('=')
+        if (eq >= 0) {
+          const val = trimmedPair.slice(eq + 1).trim()
+          add(val)
+          add(val.replace(/\+/g, ' '))
+        }
+      }
+    }
+  }
   return [...tokens].sort((a, b) => b.length - a.length)
 }
 
 /**
- * Remove echoed probe material before looking for engine/parser errors. A generic 400/500 that
- * quotes the attacker's input has not produced a semantic database/template/shell oracle.
+ * Remove echoed probe material before looking for engine/parser errors (`H-16` / `R2-H-10`).
+ * Normalizes case, whitespace, HTML/numeric entities, and backslash escapes before stripping so
+ * transformed reflections cannot masquerade as server-side engine errors.
  */
-function fingerprintResponseText(step: ImpactStep): string {
+export function stripRequestEchoes(step: ImpactStep): string {
   let text = responseText(step)
-  for (const token of requestEchoTokens(step)) {
+  const rawTokens = requestEchoTokens(step)
+  for (const token of rawTokens) {
     const escapedJson = JSON.stringify(token).slice(1, -1)
     const escapedHtml = token.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
       .replaceAll('"', '&quot;').replaceAll("'", '&#39;')
-    for (const variant of new Set([token, decodedText(token), encodeURIComponent(token), escapedJson, escapedHtml])) {
+    const escapedHtml039 = token.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
+      .replaceAll('"', '&quot;').replaceAll("'", '&#039;')
+    for (const variant of new Set([token, decodedText(token), encodeURIComponent(token), escapedJson, escapedHtml, escapedHtml039])) {
       if (variant.length >= 4) text = text.split(variant).join(' ')
     }
   }
-  return text
+  // Normalized pass: strip case/entity/escape/whitespace-transformed echoes.
+  let normalized = normalizeEchoComparable(text)
+  const normalizedTokens = [...new Set(rawTokens.map(normalizeEchoComparable).filter(t => t.length >= 4))]
+    .sort((a, b) => b.length - a.length)
+  for (const normToken of normalizedTokens) {
+    if (normalized.includes(normToken)) {
+      normalized = normalized.split(normToken).join(' ')
+    }
+  }
+  return normalized
+}
+
+function fingerprintResponseText(step: ImpactStep): string {
+  return stripRequestEchoes(step)
+}
+
+/**
+ * Match an injection fingerprint on `step`'s response AFTER echo-stripping and with a containment
+ * rule so even truncated, upper-cased, entity-encoded, or backslash-escaped echoes of request
+ * carriers never confirm (`H-16` / `R2-H-10`).
+ */
+export function matchStrippedInjectionFingerprint(
+  step: ImpactStep,
+  family?: InjectionFamily | null,
+): InjectionFingerprintMatch | null {
+  const stripped = stripRequestEchoes(step)
+  if (!stripped) return null
+  const normalizedRequestTokens = requestEchoTokens(step)
+    .map(normalizeEchoComparable)
+    .filter(token => token.length >= 4)
+
+  const bounded = stripped.slice(0, 32 * 1024)
+  for (const entry of INJECTION_FINGERPRINTS) {
+    if (family && family !== 'injection' && entry.family !== family) continue
+    let offset = 0
+    while (offset < bounded.length) {
+      const slice = bounded.slice(offset)
+      const match = entry.re.exec(slice)
+      if (!match) break
+      const matchedText = match[0]
+      const absIndex = offset + match.index
+      offset = absIndex + Math.max(1, matchedText.length)
+      const normMatch = normalizeEchoComparable(matchedText)
+      // Containment rule: if the matched fingerprint text already appeared anywhere inside a
+      // normalized request token, treat it as an echoed/truncated reflection, never an engine error.
+      if (normMatch.length >= 4 && normalizedRequestTokens.some(tok => tok.includes(normMatch))) {
+        continue
+      }
+      if (entry.family === 'xxe') {
+        const start = Math.max(0, absIndex - 80)
+        const end = Math.min(bounded.length, absIndex + matchedText.length + 80)
+        if (DEFENSIVE_REFUSAL_CONTEXT_RE.test(bounded.slice(start, end))) continue
+      }
+      return { family: entry.family, label: entry.label, text: matchedText.slice(0, 120) }
+    }
+  }
+  return null
 }
 
 function stepText(step: ImpactStep): string {
@@ -2458,7 +3035,7 @@ export function assessStatusOnlyDivergence(steps: readonly ImpactStep[]): Status
   }
   const controls = steps.filter(step => step.arm === 'control' || step.arm === 'setup')
   for (const probe of probes) {
-    const fingerprint = matchInjectionFingerprint(fingerprintResponseText(probe))
+    const fingerprint = matchStrippedInjectionFingerprint(probe)
     if (fingerprint) continue
     const route = routeFamily(probe.route ?? probe.pathAndQuery ?? '')
     const control = [...controls].reverse().find(step =>
@@ -2481,12 +3058,22 @@ export function assessStatusOnlyDivergence(steps: readonly ImpactStep[]): Status
     probeId: probes[0]?.id ?? null,
     controlStatus: null,
     probeStatus: probes[0]?.status ?? null,
-    fingerprint: matchInjectionFingerprint(responseText(probes[0]!)),
+    fingerprint: matchStrippedInjectionFingerprint(probes[0]!),
   }
 }
 
 function sameInjectionRoute(a: ImpactStep, b: ImpactStep): boolean {
-  return routeFamily(a.route ?? a.pathAndQuery ?? '') === routeFamily(b.route ?? b.pathAndQuery ?? '')
+  const left = routeFamily(a.route ?? a.pathAndQuery ?? '')
+  const right = routeFamily(b.route ?? b.pathAndQuery ?? '')
+  return left !== '' && left === right
+}
+
+function jsonStructureShape(value: unknown): unknown {
+  if (Array.isArray(value)) return { array: value.length }
+  if (!value || typeof value !== 'object') return '*'
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, child]) => [key, jsonStructureShape(child)]))
 }
 
 function requestEnvelopeShape(step: ImpactStep): string {
@@ -2497,31 +3084,75 @@ function requestEnvelopeShape(step: ImpactStep): string {
     pathname = url.pathname
     queryKeys = [...new Set([...url.searchParams.keys()])].sort()
   } catch { /* retain the raw target shape */ }
-  const jsonShape = (value: unknown): unknown => {
-    if (Array.isArray(value)) return { array: value.length }
-    if (!value || typeof value !== 'object') return '*'
-    return Object.fromEntries(Object.entries(value as Record<string, unknown>)
-      .sort(([a], [b]) => a.localeCompare(b))
-      .map(([key, child]) => [key, jsonShape(child)]))
-  }
   return JSON.stringify({
     method: step.method.toUpperCase(),
     pathname,
     queryKeys,
-    json: step.requestJson === undefined ? null : jsonShape(step.requestJson),
+    persona: (step.actor.handle ?? '').toLowerCase(),
+    authDigest: computeAuthDigest(step.requestHeaders),
+    json: step.requestJson === undefined ? null : jsonStructureShape(step.requestJson),
     headerNames: Object.keys(step.requestHeaders ?? {}).map(name => name.toLowerCase()).sort(),
   })
 }
 
+function formBodyKeys(rawBody: string | undefined): string[] | null {
+  if (!rawBody || !rawBody.trim() || rawBody.trim().startsWith('<')) return null
+  if (!rawBody.includes('=')) return null
+  try {
+    const keys = [...new Set([...new URLSearchParams(rawBody.trim()).keys()])].sort()
+    return keys.length > 0 ? keys : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Same-route / same-shape control check for injection fingerprints (`R2-H-10` / `H-16`).
+ * Prevents zero-control confirmation and rejects controls targeting a different method, route,
+ * query parameter set, or request body structure.
+ */
+function controlMatchesInjectionShape(control: ImpactStep, probe: ImpactStep): boolean {
+  if ((control.method ?? '').toUpperCase() !== (probe.method ?? '').toUpperCase()) return false
+  if (!sameInjectionRoute(control, probe)) return false
+  if (control.status === null || control.status >= 500) return false
+
+  if (control.pathAndQuery !== undefined && probe.pathAndQuery !== undefined) {
+    try {
+      const cKeys = [...new Set([...new URL(control.pathAndQuery, 'http://kovo.invalid').searchParams.keys()])].sort()
+      const pKeys = [...new Set([...new URL(probe.pathAndQuery, 'http://kovo.invalid').searchParams.keys()])].sort()
+      if (JSON.stringify(cKeys) !== JSON.stringify(pKeys)) return false
+    } catch { /* ignore malformed URLs */ }
+  }
+
+  const cIsJsonObj = control.requestJson !== undefined && control.requestJson !== null && typeof control.requestJson === 'object'
+  const pIsJsonObj = probe.requestJson !== undefined && probe.requestJson !== null && typeof probe.requestJson === 'object'
+  if (cIsJsonObj || pIsJsonObj) {
+    if (!cIsJsonObj || !pIsJsonObj) return false
+    if (JSON.stringify(jsonStructureShape(control.requestJson)) !== JSON.stringify(jsonStructureShape(probe.requestJson))) {
+      return false
+    }
+  }
+
+  const cRaw = typeof control.requestBody === 'string' ? control.requestBody : (typeof control.requestJson === 'string' ? control.requestJson : undefined)
+  const pRaw = typeof probe.requestBody === 'string' ? probe.requestBody : (typeof probe.requestJson === 'string' ? probe.requestJson : undefined)
+  const cForm = formBodyKeys(cRaw)
+  const pForm = formBodyKeys(pRaw)
+  if (cForm || pForm) {
+    if (!cForm || !pForm || JSON.stringify(cForm) !== JSON.stringify(pForm)) return false
+  }
+  return true
+}
+
 function booleanRequestTruth(step: ImpactStep): boolean | null {
-  const raw = `${step.pathAndQuery ?? ''}${safeJson(step.requestJson)}`
+  const raw = `${step.pathAndQuery ?? ''}${safeJson(step.requestJson)}${step.requestBody ?? ''}`
   return booleanPredicateTruth(decodedText(raw))
 }
 
 /**
  * Injection confirmation requires a positive semantic oracle:
- *  - an engine/dialect error fingerprint present in the probe and absent from every control;
- *  - a paired boolean differential with a stable structural delta across >=2 rounds;
+ *  - an engine/dialect error fingerprint present in the probe (after full-carrier echo stripping),
+ *    aligned with the claimed family when supplied, and absent from a same-route/same-shape control;
+ *  - a paired boolean differential triangle with a stable structural delta across >=2 rounds;
  *  - a timing arm outside the control envelope (>3x, control < 1s);
  *  - a verified out-of-band callback; or
  *  - the narrow status-only boolean exception (benign 2xx baseline + 2xx tautology + <500
@@ -2532,8 +3163,9 @@ export function assessInjectionImpact(input: ImpactInput): ImpactAssessment {
   const steps = input.steps
   const probes = steps.filter(step => step.arm === 'probe')
   const controls = steps.filter(step => step.arm === 'control')
+  const claimedFamily = input.injection?.family
   const evidence: Record<string, unknown> = {
-    family: input.injection?.family ?? 'injection',
+    family: claimedFamily ?? 'injection',
     fingerprint: null as InjectionFingerprintMatch | null,
     booleanRounds: input.injection?.rounds?.length ?? 0,
     timing: input.injection?.timing ?? null,
@@ -2543,22 +3175,28 @@ export function assessInjectionImpact(input: ImpactInput): ImpactAssessment {
   if (probes.length === 0) {
     return { required: true, satisfied: false, reason: 'Injection claim has no probe arm to assess.', evidence }
   }
-  const controlText = controls.map(fingerprintResponseText).join('\n')
   for (const probe of probes) {
-    const text = fingerprintResponseText(probe)
-    const fingerprint = matchInjectionFingerprint(text, input.injection?.family)
+    const fingerprint = matchStrippedInjectionFingerprint(probe, claimedFamily)
     if (!fingerprint) continue
+    // Enforce claimed-family alignment when supplied.
+    if (claimedFamily && claimedFamily !== 'injection' && fingerprint.family !== claimedFamily) continue
+    // R2-H-10 / H-16: require at least one same-route, same-shape control arm (never zero-control).
+    const matchingControls = controls.filter(control => controlMatchesInjectionShape(control, probe))
+    if (matchingControls.length === 0) continue
     // A control that produces the same engine error is broken infrastructure, not injection.
-    if (matchInjectionFingerprint(controlText, fingerprint.family)) continue
+    const controlHasSameFamilyError = matchingControls.some(control =>
+      matchInjectionFingerprint(responseText(control), fingerprint.family) !== null)
+    if (controlHasSameFamilyError) continue
     evidence.fingerprint = fingerprint
     return {
       required: true,
       satisfied: true,
-      reason: `The probe response carries a ${fingerprint.family}/${fingerprint.label} error fingerprint ("${fingerprint.text}") that no control arm produces; that is a semantic oracle, not a bare status change.`,
+      reason: `The probe response carries a ${fingerprint.family}/${fingerprint.label} error fingerprint ("${fingerprint.text}") absent from same-route/same-shape control arm(s); that is a semantic oracle, not a bare status change.`,
       evidence,
     }
   }
-  if (input.injection?.rounds && input.injection.rounds.length >= 2) {
+  const booleanFamilyAllowed = !claimedFamily || claimedFamily === 'injection' || claimedFamily === 'sqli' || claimedFamily === 'nosqli'
+  if (booleanFamilyAllowed && input.injection?.rounds && input.injection.rounds.length >= 2) {
     const assessment = assessBooleanDifferential({
       rounds: input.injection.rounds,
       param: input.injection.param ?? null,
@@ -2593,7 +3231,7 @@ export function assessInjectionImpact(input: ImpactInput): ImpactAssessment {
     }
   }
   const statusBoolean = input.injection?.statusBoolean
-  if (statusBoolean) {
+  if (booleanFamilyAllowed && statusBoolean) {
     const { benign, tautology, contradiction } = statusBoolean
     const benignOk = isSuccess(benign.status)
     const tautologyOk = isSuccess(tautology.status)
@@ -2622,71 +3260,323 @@ export function assessInjectionImpact(input: ImpactInput): ImpactAssessment {
   return {
     required: true,
     satisfied: false,
-    reason: `Injection claim has no positive semantic oracle: ${divergence.reason} Add an engine/dialect error fingerprint, a paired boolean differential with a stable structural delta, a >3x timing arm, a verified OOB callback, or the paired status-boolean contrast (benign 2xx baseline + 2xx tautology + <500 contradiction).`,
+    reason: `Injection claim has no positive semantic oracle: ${divergence.reason} Add an engine/dialect error fingerprint backed by a same-route/same-shape control, a paired boolean differential triangle with a stable structural delta, a >3x timing arm, a verified OOB callback, or the paired status-boolean contrast (benign 2xx baseline + 2xx tautology + <500 contradiction).`,
     evidence: { ...evidence, statusOnly: divergence.statusOnly, statusReason: divergence.reason },
   }
 }
 
 // ---------------------------------------------------------------------------
-// Markup / script execution
+// Markup / script execution (`R2-C-5`)
 // ---------------------------------------------------------------------------
 
 export interface MarkupAssessment extends ImpactAssessment {
-  evidence: { activeMarkup: boolean; oracleDeclared: boolean; bodies: number; plantedMarker: boolean }
+  evidence: {
+    activeMarkup: boolean
+    oracleDeclared: boolean
+    bodies: number
+    plantedMarker: boolean
+    browserAttested?: boolean
+    nonceBound?: boolean
+    htmlContentType?: boolean
+    controlVerified?: boolean
+  }
+}
+
+const PROBE_NONCE_RE = /^[A-Za-z0-9_-]{8,128}$/
+const HTML_CONTENT_TYPE_RE = /^\s*(?:text\/html|application\/xhtml\+xml|image\/svg\+xml)(?:\s*;|$)/i
+
+/** Strip HTML comments (`<!-- ... -->`) in strictly linear O(n) time without backtracking regexes. */
+function stripHtmlComments(html: string): string {
+  let out = ''
+  let pos = 0
+  while (pos < html.length) {
+    const start = html.indexOf('<!--', pos)
+    if (start < 0) {
+      out += html.slice(pos)
+      break
+    }
+    out += html.slice(pos, start)
+    const end = html.indexOf('-->', start + 4)
+    if (end < 0) break
+    pos = end + 3
+  }
+  return out
+}
+
+/** Strip inert raw-text elements (`<textarea>`, `<title>`, `<style>`, `<noscript>`, `<xmp>`) in linear time. */
+function stripInertRawTextElements(html: string): string {
+  const inertTags = ['textarea', 'title', 'style', 'noscript', 'xmp']
+  let current = html
+  for (const tag of inertTags) {
+    const lower = current.toLowerCase()
+    const openNeedle = `<${tag}`
+    const closeNeedle = `</${tag}`
+    let out = ''
+    let pos = 0
+    while (pos < current.length) {
+      const start = lower.indexOf(openNeedle, pos)
+      if (start < 0) {
+        out += current.slice(pos)
+        break
+      }
+      const next = lower[start + openNeedle.length]
+      if (next !== '>' && next !== ' ' && next !== '\t' && next !== '\n' && next !== '\r' && next !== '/') {
+        out += current.slice(pos, start + openNeedle.length)
+        pos = start + openNeedle.length
+        continue
+      }
+      const openEnd = lower.indexOf('>', start + openNeedle.length)
+      if (openEnd < 0) {
+        out += current.slice(pos)
+        break
+      }
+      out += current.slice(pos, start)
+      const closeStart = lower.indexOf(closeNeedle, openEnd + 1)
+      if (closeStart < 0) break
+      const closeEnd = lower.indexOf('>', closeStart + closeNeedle.length)
+      pos = closeEnd < 0 ? current.length : closeEnd + 1
+    }
+    current = out
+  }
+  return current
 }
 
 /**
- * Scripting claims need executable content. Unescaped presentation tags prove output-encoding debt,
- * not script execution; the payload must contain a script element, an inline event handler or a
- * javascript: URL in a probe response (or the endpoint's declared XSS impact event).
+ * True when `nonce` appears inside an unescaped executable markup context in `body`:
+ *  1. inside a `<script ...>...</script>` tag (open-tag attributes or script body);
+ *  2. inside an inline `on<event>=` attribute value on an unescaped HTML tag; or
+ *  3. inside an executable `javascript:` / `vbscript:` URI attribute value on an HTML tag.
+ * Plain text (`<p>nonce</p>`), entity-escaped markup (`&lt;script&gt;nonce&lt;/script&gt;`),
+ * comments, inert raw-text blocks, and unrelated static `<script src="/app.js">` tags return false.
+ */
+export function hasNonceInExecutableMarkupContext(body: string, nonce: string): boolean {
+  if (!body || !nonce) return false
+  const cleaned = stripInertRawTextElements(stripHtmlComments(body.slice(0, 256 * 1024)))
+  if (!cleaned.includes(nonce)) return false
+  const lower = cleaned.toLowerCase()
+  const lowerNonce = nonce.toLowerCase()
+
+  // 1. Inside <script ...> (tag attributes or body before </script>).
+  let pos = 0
+  while (pos < lower.length) {
+    const start = lower.indexOf('<script', pos)
+    if (start < 0) break
+    const after = lower[start + 7]
+    if (after !== '>' && after !== ' ' && after !== '\t' && after !== '\n' && after !== '\r' && after !== '/') {
+      pos = start + 7
+      continue
+    }
+    const openEnd = lower.indexOf('>', start + 7)
+    if (openEnd < 0) break
+    const openTag = lower.slice(start, openEnd + 1)
+    if (openTag.includes(lowerNonce)) return true
+    if (lower[openEnd - 1] !== '/') {
+      const closeStart = lower.indexOf('</script', openEnd + 1)
+      const scriptBody = closeStart >= 0 ? lower.slice(openEnd + 1, closeStart) : lower.slice(openEnd + 1)
+      if (scriptBody.includes(lowerNonce)) return true
+      pos = closeStart >= 0 ? closeStart + 8 : lower.length
+    } else {
+      pos = openEnd + 1
+    }
+  }
+
+  // 2 & 3. Scan individual unescaped HTML opening tags for `on<event>=` or `javascript:`/`vbscript:`
+  // attributes whose value carries `nonce`.
+  let tagPos = 0
+  while (tagPos < cleaned.length) {
+    const lt = cleaned.indexOf('<', tagPos)
+    if (lt < 0) break
+    const first = cleaned[lt + 1]
+    if (!first || !/[A-Za-z]/.test(first)) {
+      tagPos = lt + 1
+      continue
+    }
+    const gt = cleaned.indexOf('>', lt + 2)
+    if (gt < 0) break
+    const tagText = cleaned.slice(lt + 1, gt)
+    tagPos = gt + 1
+    if (!tagText.toLowerCase().includes(lowerNonce)) continue
+
+    // Parse attributes inside this single tag.
+    const attrRe = /\s([a-z][a-z0-9:_-]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/gi
+    let attrMatch: RegExpExecArray | null
+    while ((attrMatch = attrRe.exec(tagText)) !== null) {
+      const attrName = attrMatch[1]!.toLowerCase()
+      const attrVal = (attrMatch[2] ?? attrMatch[3] ?? attrMatch[4] ?? '').trim()
+      if (!attrVal.toLowerCase().includes(lowerNonce)) continue
+      if (/^on[a-z]{2,32}$/.test(attrName)) return true
+      if (/^(?:href|src|action|formaction|xlink:href|data)$/.test(attrName)) {
+        const decodedVal = decodeHtmlAndNumericEntities(attrVal).replace(/[\x00-\x20]+/g, '').toLowerCase()
+        if (decodedVal.startsWith('javascript:') || decodedVal.startsWith('vbscript:')) return true
+      }
+      if (attrName === 'srcdoc') {
+        const decodedDoc = decodeHtmlAndNumericEntities(attrVal)
+        if (hasNonceInExecutableMarkupContext(decodedDoc, nonce)) return true
+      }
+    }
+  }
+
+  return false
+}
+
+function stepRequestCarriesNonce(step: ImpactStep, nonce: string): boolean {
+  const parts: string[] = []
+  if (step.pathAndQuery) {
+    parts.push(step.pathAndQuery, decodedText(step.pathAndQuery))
+  }
+  if (step.requestJson !== undefined) {
+    const raw = typeof step.requestJson === 'string' ? step.requestJson : safeJson(step.requestJson)
+    parts.push(raw, decodedText(raw))
+  }
+  if (typeof step.requestBody === 'string' && step.requestBody.length > 0) {
+    parts.push(step.requestBody, decodedText(step.requestBody))
+  }
+  for (const val of Object.values(step.requestHeaders ?? {})) {
+    parts.push(val, decodedText(val))
+  }
+  return parts.some(part => part.includes(nonce))
+}
+
+/**
+ * Client-script / markup impact oracle (`R2-C-5`).
+ * Confirms ONLY when EITHER:
+ *  (A) Host-attested browser execution is recorded (`browserExecutionAttested: true` or a
+ *      host-trusted `browser_xss_executed`/`dom_xss_executed` event); OR
+ *  (B) For HTTP markup checks, ALL of the following hold simultaneously:
+ *      1. A host-minted probe nonce (`input.probeNonces`) was carried in the probe request (or a
+ *         preceding non-control mutating step for stored markup);
+ *      2. A same-route control response exists and the nonce is absent from every control response;
+ *      3. The probe response declares an HTML/XHTML/SVG `Content-Type`; and
+ *      4. That exact nonce appears inside an unescaped executable markup context in the probe body.
+ * Arbitrary static `<script>` tags and generic `plantedMarker` identifier harvesting are removed.
  */
 export function assessMarkupImpact(input: ImpactInput): MarkupAssessment {
   const probes = input.steps.filter(step => step.arm === 'probe' && isSuccess(step.status))
-  let activeMarkup = false
-  for (const probe of probes) {
-    if (typeof probe.body === 'string' && probe.body.length > 0 && ACTIVE_MARKUP_RE.test(probe.body)) {
-      activeMarkup = true
-      break
-    }
-  }
-  // Second-order stored injection: a nonce marker injected by a mutating step inside *this* spec is
-  // rendered back later and is absent from every control body. That is a stored-data flow the proof
-  // itself created (the procedural stored-XSS shape), not a pre-existing tag an unrelated request
-  // left behind (the K=6 over-claim shape).
-  const planted = new Set<string>()
-  for (const step of input.steps) {
-    if (step.arm === 'control' || !stepMutatesState(step) || !isSuccess(step.status) || step.requestJson === undefined) continue
-    for (const value of flattenJson(step.requestJson).values()) {
-      // A marker may be embedded in a payload (`gxssab12<b>`): take its identifier-shaped run.
-      for (const token of value.slice(0, 256).match(/[A-Za-z0-9_-]{8,64}/g) ?? []) planted.add(token)
-    }
-  }
-  let plantedMarker = false
-  if (planted.size > 0) {
-    const controlBodies = input.steps.filter(step => step.arm === 'control').map(step => String(step.body ?? '')).join('\n')
-    const candidates = [...planted].filter(marker => !controlBodies.includes(marker))
-    plantedMarker = probes.some(probe => typeof probe.body === 'string' &&
-      candidates.some(marker => probe.body!.includes(marker)))
-  }
-  const oracleDeclared = hasOracle(input.oracleEvents, ['stored_xss_rendered', 'reflected_xss_rendered'])
-  const labels = { activeMarkup, oracleDeclared, bodies: probes.length, plantedMarker }
-  if (activeMarkup || oracleDeclared || plantedMarker) {
+  const controls = input.steps.filter(step => step.arm === 'control')
+  const browserAttested = input.browserExecutionAttested === true ||
+    hasOracle(input.oracleEvents, ['browser_xss_executed', 'dom_xss_executed'])
+
+  if (browserAttested) {
     return {
       required: true,
       satisfied: true,
-      reason: activeMarkup
-        ? 'The probe response carries executable markup (script element, inline event handler or javascript: URL).'
-        : plantedMarker
-          ? 'A nonce marker injected by a mutating step inside this proof is rendered back on the stored read.'
-          : `The claim declares the endpoint's XSS impact event (${input.oracleEvents!.join(',')}).`,
-      evidence: labels,
+      reason: 'Host-attested browser execution confirmed client-side script execution.',
+      evidence: {
+        activeMarkup: false,
+        oracleDeclared: false,
+        bodies: probes.length,
+        plantedMarker: false,
+        browserAttested: true,
+        nonceBound: false,
+        htmlContentType: false,
+        controlVerified: false,
+      },
     }
   }
+
+  const validNonces = (input.probeNonces ?? [])
+    .map(n => (typeof n === 'string' ? n.trim() : ''))
+    .filter(n => PROBE_NONCE_RE.test(n))
+
+  if (validNonces.length === 0) {
+    return {
+      required: true,
+      satisfied: false,
+      reason: 'Markup/XSS claim dismissed: requires host-attested browser execution or a host-minted probe nonce verified in an HTML executable context (static script tags and generic planted-marker harvesting cannot confirm).',
+      evidence: {
+        activeMarkup: false,
+        oracleDeclared: false,
+        bodies: probes.length,
+        plantedMarker: false,
+        browserAttested: false,
+        nonceBound: false,
+        htmlContentType: false,
+        controlVerified: false,
+      },
+    }
+  }
+
+  let sawHtmlContentType = false
+  let sawSameRouteControl = false
+  let sawNonceInRequest = false
+  let sawNonceAbsentFromControls = false
+
+  for (const probe of probes) {
+    const body = typeof probe.body === 'string' ? probe.body : ''
+    if (!body) continue
+    const contentType = headerValue(probe.responseHeaders, 'content-type') ?? ''
+    if (!HTML_CONTENT_TYPE_RE.test(contentType)) continue
+    sawHtmlContentType = true
+
+    const probeFamily = routeFamily(probe.route ?? probe.pathAndQuery ?? '')
+    const sameRouteControls = controls.filter(control => {
+      if (control.status === null) return false
+      const ctrlFamily = routeFamily(control.route ?? control.pathAndQuery ?? '')
+      return probeFamily !== '' && ctrlFamily === probeFamily
+    })
+    if (sameRouteControls.length === 0) continue
+    sawSameRouteControl = true
+
+    const probeIdx = input.steps.indexOf(probe)
+    const requestSenders = [
+      probe,
+      ...input.steps.filter((step, idx) =>
+        idx < probeIdx && step.arm !== 'control' && stepMutatesState(step) && isSuccess(step.status)),
+    ]
+
+    for (const nonce of validNonces) {
+      if (!requestSenders.some(sender => stepRequestCarriesNonce(sender, nonce))) continue
+      sawNonceInRequest = true
+
+      const inAnyControl = controls.some(control =>
+        responseText(control).toLowerCase().includes(nonce.toLowerCase()))
+      if (inAnyControl) continue
+      sawNonceAbsentFromControls = true
+
+      if (hasNonceInExecutableMarkupContext(body, nonce)) {
+        return {
+          required: true,
+          satisfied: true,
+          reason: 'Host-minted probe nonce carried in the request was rendered inside an executable HTML markup context and was absent from the same-route control response.',
+          evidence: {
+            activeMarkup: true,
+            oracleDeclared: false,
+            bodies: probes.length,
+            plantedMarker: false,
+            browserAttested: false,
+            nonceBound: true,
+            htmlContentType: true,
+            controlVerified: true,
+          },
+        }
+      }
+    }
+  }
+
+  const failureDetail = !sawHtmlContentType
+    ? 'probe response does not carry an HTML media type'
+    : !sawSameRouteControl
+      ? 'no same-route control response exists to establish baseline absence'
+      : !sawNonceInRequest
+        ? 'no host-minted probe nonce was carried in the probe request'
+        : !sawNonceAbsentFromControls
+          ? 'the probe nonce also appeared in a control response'
+          : 'the host-minted probe nonce did not land inside an executable markup context'
+
   return {
     required: true,
     satisfied: false,
-    reason: 'The rendered markup carries no executable content and no marker planted inside this proof: unescaped presentation tags are output-encoding debt, not script execution.',
-    evidence: labels,
+    reason: `Markup/XSS claim dismissed: ${failureDetail}.`,
+    evidence: {
+      activeMarkup: false,
+      oracleDeclared: false,
+      bodies: probes.length,
+      plantedMarker: false,
+      browserAttested: false,
+      nonceBound: sawNonceInRequest,
+      htmlContentType: sawHtmlContentType,
+      controlVerified: sawSameRouteControl && sawNonceAbsentFromControls,
+    },
   }
 }
 
