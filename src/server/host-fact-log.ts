@@ -258,22 +258,29 @@ function buildCarrierText(
   pathAndQuery: string,
   requestHeaders: Readonly<Record<string, string>>,
   rawRequestBody: string | null,
-  rawResponseBody: string | null,
 ): string {
   const parts = [`${method.toUpperCase()} ${pathAndQuery}`]
   if (Object.keys(requestHeaders).length > 0) parts.push(JSON.stringify(requestHeaders))
   if (rawRequestBody) parts.push(rawRequestBody)
-  if (rawResponseBody) parts.push(rawResponseBody.slice(0, 32 * 1024))
   return parts.join('\n')
 }
 
-function parseBodyFromCarrierText(carrierText: string | undefined): string | null {
+function parseBodyFromCarrierText(
+  carrierText: string | undefined,
+  requestHeaders?: Readonly<Record<string, string>> | null,
+  rawResponseBody?: string | null,
+): string | null {
   if (!carrierText) return null
+  const hdrJson = requestHeaders && Object.keys(requestHeaders).length > 0 ? JSON.stringify(requestHeaders) : null
+  const respTrim = rawResponseBody?.trim() || null
   const lines = carrierText.split('\n').map(l => l.trim()).filter(Boolean)
   for (let i = lines.length - 1; i >= 0; i -= 1) {
     const line = lines[i]!
     if (/^(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+\//i.test(line)) continue
+    if (line.startsWith('/')) continue
     if (/^[A-Za-z0-9-]+:\s/.test(line)) continue
+    if (line === '{}' || (hdrJson && line === hdrJson)) continue
+    if (respTrim && (line === respTrim || line === respTrim.slice(0, 32 * 1024))) continue
     return line
   }
   return null
@@ -376,7 +383,7 @@ export class HostFactLog {
       ...(input.hostSignature !== undefined ? { hostSignature: input.hostSignature } : {}),
       ...(input.carrierText !== undefined
         ? { carrierText: input.carrierText }
-        : { carrierText: buildCarrierText(method, pathAndQuery, requestHeaders, rawRequestBody, rawResponseBody) }),
+        : { carrierText: buildCarrierText(method, pathAndQuery, requestHeaders, rawRequestBody) }),
       ...(input.secretMatches ? { secretMatches: freezeStringList(input.secretMatches) } : {}),
       ...(input.artifact !== undefined
         ? { artifact: input.artifact ? Object.freeze({ ...input.artifact }) : null }
@@ -604,9 +611,25 @@ export class HostFactLog {
     evidenceRoleOverrides?: ReadonlyMap<string, string>
   }): HostSignedTranscript {
     const entries: HostTranscriptEntry[] = this.orderedExchanges().map(fact => {
-      // A signature covers the original signed entry, not a later projection with derived defaults.
+      // A signature covers the original signed entry, not a later projection with derived defaults;
+      // only project overrides when explicitly requested and different from the signed entry.
       const signed = this.signedEntries.get(fact.exchangeId)
-      if (signed) return signed
+      const armOverride = options?.armOverrides?.get(fact.exchangeId)
+      const roleOverride = options?.evidenceRoleOverrides?.get(fact.exchangeId)
+      if (signed) {
+        const armDiffers = armOverride !== undefined && armOverride !== signed.step.arm
+        const roleDiffers = roleOverride !== undefined && roleOverride !== (signed.evidenceRole ?? signed.step.evidenceRole)
+        if (!armDiffers && !roleDiffers) return signed
+        return {
+          ...signed,
+          ...(roleDiffers ? { evidenceRole: roleOverride } : {}),
+          step: {
+            ...signed.step,
+            ...(armDiffers ? { arm: armOverride } : {}),
+            ...(roleDiffers ? { evidenceRole: roleOverride } : {}),
+          },
+        }
+      }
       const evidenceRole = options?.evidenceRoleOverrides?.get(fact.exchangeId) ?? fact.evidenceRole ?? fact.sessionRole ?? undefined
       const step = this.toImpactStep(fact.exchangeId, {
         ...(options?.armOverrides?.has(fact.exchangeId) ? { arm: options.armOverrides.get(fact.exchangeId)! } : {}),
@@ -664,14 +687,14 @@ export class HostFactLog {
     entries.forEach((rawEntry, index) => {
       const entry = rawEntry as HostTranscriptEntry
       const step = entry.step
-      const rawReq = step.requestJson !== undefined
-        ? (typeof step.requestJson === 'string' ? step.requestJson : JSON.stringify(step.requestJson))
-        : parseBodyFromCarrierText(entry.carrierText)
       const rawResp = typeof step.body === 'string'
         ? step.body
         : step.json !== undefined
           ? JSON.stringify(step.json)
           : null
+      const rawReq = step.requestJson !== undefined
+        ? (typeof step.requestJson === 'string' ? step.requestJson : JSON.stringify(step.requestJson))
+        : parseBodyFromCarrierText(entry.carrierText, step.requestHeaders ?? null, rawResp)
       log.recordExchange({
         seq: typeof entry.seq === 'number' && Number.isFinite(entry.seq) ? entry.seq : index + 1,
         exchangeId: entry.exchangeId,
@@ -832,6 +855,9 @@ export class HostFactLog {
             }
           : {}),
       })
+      if (hostEntry?.hostSignature && !log.signedEntries.has(record.exchangeId)) {
+        log.signedEntries.set(record.exchangeId, freezeHostEntry(hostEntry))
+      }
     }
     for (const oob of opts?.hostTranscript?.oobEvents ?? []) log.recordOobEvent(oob)
     for (const tr of opts?.hostTranscript?.browserTraces ?? []) log.recordBrowserTrace(tr)

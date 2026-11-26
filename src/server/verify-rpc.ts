@@ -58,7 +58,7 @@ import type {
   HostJwtAlg,
   InjectCapabilityTarget,
 } from './derived-custody.ts'
-import { signHostRecord, verifyCompositeReceipt } from './composite-receipt.ts'
+import { signHostRecord } from './composite-receipt.ts'
 import type {
   CompositeReceiptVerification,
   CompositeVerifyOptions,
@@ -69,6 +69,8 @@ import type {
   HostSignedTranscript,
   HostTranscriptEntry,
 } from './composite-receipt.ts'
+import { HostFactLog, deriveAmbientAuthFromHeaders } from './host-fact-log.ts'
+import { defaultTerminalOracleRegistry } from './terminal-oracle-registry.ts'
 import { isReadMethod, normalizeRole, parseRoleLabel } from './oracle-invariants.ts'
 import type { ImpactStep } from './oracle-invariants.ts'
 import {
@@ -393,12 +395,18 @@ export class VerifyRpcServer {
       mkdirSync(configured, { recursive: true, mode: 0o711 })
       this.hostDirValue = configured
     } else {
-      // Prefer a real tmpfs so the socket directory is memory-backed on the host too.
-      const tmpfsBase = existsSync('/dev/shm') ? '/dev/shm' : tmpdir()
-      try {
-        this.hostDirValue = mkdtempSync(join(tmpfsBase, 'kovo-verify-rpc-'))
-      } catch {
-        this.hostDirValue = mkdtempSync(join(tmpdir(), 'kovo-verify-rpc-'))
+      const containerScratch = process.env.KOVO_CONTAINER_SCRATCH_DIR?.trim() || ''
+      if (containerScratch && containerScratch.startsWith('/') && containerScratch !== '/' && !containerScratch.split('/').includes('..')) {
+        mkdirSync(containerScratch, { recursive: true, mode: 0o711 })
+        this.hostDirValue = mkdtempSync(join(containerScratch, 'kovo-verify-rpc-'))
+      } else {
+        // Prefer a real tmpfs so the socket directory is memory-backed on the host too.
+        const tmpfsBase = existsSync('/dev/shm') ? '/dev/shm' : tmpdir()
+        try {
+          this.hostDirValue = mkdtempSync(join(tmpfsBase, 'kovo-verify-rpc-'))
+        } catch {
+          this.hostDirValue = mkdtempSync(join(tmpdir(), 'kovo-verify-rpc-'))
+        }
       }
     }
     // 0711: the sandbox uid can traverse to the mounted files without listing the host directory.
@@ -2093,7 +2101,7 @@ export class VerifyRpcServer {
             handle,
             role,
             tenant,
-            auth: 'unknown',
+            auth: deriveAmbientAuthFromHeaders(record.request?.headers ?? null),
             sameSite: sameSiteFromRecord(record),
           },
           ...(parsedJson !== undefined ? { json: parsedJson } : {}),
@@ -2133,11 +2141,18 @@ export class VerifyRpcServer {
     options?: Omit<CompositeVerifyOptions, 'signingKey'>,
   ): CompositeReceiptVerification {
     const transcript = this.buildHostSignedTranscript()
-    return verifyCompositeReceipt(rawReceipt, transcript, {
-      ...this.options.compositeVerifyOptions,
-      ...options,
-      signingKey: this.compositeSigningKey,
-    })
+    const factLog = HostFactLog.fromTranscript(transcript)
+    const compositeOptions = { ...this.options.compositeVerifyOptions, ...options }
+    const res = defaultTerminalOracleRegistry.evaluate(
+      factLog,
+      { kind: 'composite', receipt: rawReceipt },
+      {
+        compositeOptions,
+        signingKey: this.compositeSigningKey,
+        strictHostDerivation: true,
+      },
+    )
+    return res.composite!
   }
 
   private handleCompositeVerify(args: Record<string, unknown>): unknown {

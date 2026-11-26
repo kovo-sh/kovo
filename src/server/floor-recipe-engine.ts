@@ -3539,6 +3539,7 @@ function vulnClassForImpactClass(impactClass: string | null | undefined): string
     case 'business_logic': return 'business_logic'
     case 'markup': return 'xss_stored'
     case 'disclosure': return 'info_disclosure'
+    case 'injection': return 'injection'
     default: return null
   }
 }
@@ -3555,7 +3556,7 @@ export function buildReplayReceipt(input: {
   evidencePayload: Record<string, unknown>
   exchangeIds: readonly string[]
   exchanges: readonly BrokerExchangeResult[]
-}): { receipt: ProofReceipt; transcript: ReceiptTranscript; factLog: HostFactLog } | null {
+}): { receipt: ProofReceipt; transcript: ReceiptTranscript; factLog: HostFactLog; trustedOracleEvents: string[] } | null {
   const impactGate = input.evidencePayload.impactGate as { required?: boolean } | undefined
   const boundaryGate = input.evidencePayload.boundaryGate as { required?: boolean; satisfied?: boolean; boundaryClass?: string } | undefined
   const evidenceClass = typeof input.evidencePayload.evidenceClass === 'string'
@@ -3566,8 +3567,26 @@ export function buildReplayReceipt(input: {
     boundaryGate?.required === true && boundaryGate.satisfied === true && boundaryGate.boundaryClass === 'auth'
   const vulnClass = baseVulnClass ?? (isBoundaryAuth ? 'auth_bypass' : null)
   if (!vulnClass) return null
+  const canary = input.evidencePayload.canary as {
+    triggered?: boolean
+    probeTriggered?: boolean
+    controlTriggered?: boolean
+    token?: string
+    callbackId?: string
+    stage?: 'immediate' | 'late'
+    receivedAtMs?: number
+  } | undefined
+  const hostCanaryVerified = Boolean(
+    canary?.triggered === true &&
+    canary.probeTriggered === true &&
+    canary.controlTriggered !== true &&
+    typeof canary.token === 'string' &&
+    replayCanaryTokenRe.test(canary.token) &&
+    typeof canary.callbackId === 'string' &&
+    canary.callbackId.trim().length > 0,
+  )
   const isOob = vulnClass === 'ssrf' || vulnClass === 'xxe' ||
-    (vulnClass === 'webhook_forgery' && (input.evidencePayload.canary as { triggered?: boolean } | undefined)?.triggered === true)
+    (vulnClass === 'webhook_forgery' && canary?.triggered === true)
   const isRedirect = vulnClass === 'open_redirect'
   const isWebhook = vulnClass === 'webhook_forgery' && !isOob
   // Require a gated class (impactGate, OOB, redirect, webhook differential, or boundaryGate auth
@@ -3606,9 +3625,11 @@ export function buildReplayReceipt(input: {
   }
 
   if (isOob) {
-    const carrying = entries.find(entry => replayCanaryTokenRe.test(entry.carrierText ?? ''))
+    // C-3: Never fabricate delivered=true OOB events without host CanaryBroker callback corroboration.
+    if (!hostCanaryVerified || !canary?.token || !canary.callbackId) return null
+    const token = canary.token
+    const carrying = entries.find(entry => (entry.carrierText ?? '').includes(token))
     if (!carrying) return null
-    const token = replayCanaryTokenRe.exec(carrying.carrierText ?? '')![0]
     const receipt = {
       vulnClass,
       target: {
@@ -3625,21 +3646,32 @@ export function buildReplayReceipt(input: {
       entries: [carrying],
       oobEvents: [{
         id: 'replay-canary',
-        callbackId: `replay:${carrying.exchangeId}`,
+        callbackId: canary.callbackId,
         token,
         targetOrigin: input.spec.origin,
         delivered: true,
-        stage: 'immediate',
-        receivedAtMs: Date.now(),
+        stage: canary.stage === 'late' ? 'late' : 'immediate',
+        receivedAtMs: typeof canary.receivedAtMs === 'number' && Number.isFinite(canary.receivedAtMs) ? canary.receivedAtMs : Date.now(),
       }],
       browserTraces: [],
     }
-    return { receipt: receipt as ProofReceipt, transcript, factLog: HostFactLog.fromTranscript(transcript) }
+    return { receipt: receipt as ProofReceipt, transcript, factLog: HostFactLog.fromTranscript(transcript), trustedOracleEvents: [] }
   }
 
   if (orderedIds.length === 0) return null
   const targetExchangeStep = steps.find(step => step.arm === 'probe') ?? steps[0]
   const targetEntry = entries.find(entry => entry.step === targetExchangeStep) ?? entries[0]
+  // H-1: Only derive trustedOracleEvents from host-observed controls (csrfBind verified against
+  // host cookie-authenticated probe headers), NEVER from raw model-authored spec.expectedImpactEvents.
+  const csrfModelled = 'steps' in input.spec && Array.isArray(input.spec.steps) &&
+    input.spec.steps.some(s => Boolean((s as { request?: { csrfBind?: unknown } }).request?.csrfBind))
+  const hasHostCookieProbe = entries.some(entry =>
+    entry.step.arm === 'probe' && (
+      entry.step.actor.auth === 'cookie' ||
+      Object.entries(entry.step.requestHeaders ?? {}).some(([k, v]) => k.toLowerCase() === 'cookie' && Boolean(v?.trim()))
+    ),
+  )
+  const trustedOracleEvents = csrfModelled && hasHostCookieProbe ? ['csrf_state_change'] : []
   const receipt = {
     vulnClass,
     target: {
@@ -3653,13 +3685,7 @@ export function buildReplayReceipt(input: {
     claimedDelta: (input.spec.expectedImpactEvents ?? []).length
       ? `Replay observed the declared impact: ${(input.spec.expectedImpactEvents ?? []).join(', ')}.`
       : `Replay moved state across the ${vulnClass} boundary described by "${input.spec.title.slice(0, 120)}".`,
-    ...(() => {
-      const declared = ((input.spec as { expectedImpactEvents?: string[] }).expectedImpactEvents ?? []).slice()
-      const csrfModelled = 'steps' in input.spec && Array.isArray(input.spec.steps) &&
-        input.spec.steps.some(s => Boolean((s as { request?: { csrfBind?: unknown } }).request?.csrfBind))
-      if (csrfModelled && !declared.includes('csrf_state_change')) declared.push('csrf_state_change')
-      return declared.length ? { oracleEvents: declared } : {}
-    })(),
+    ...(trustedOracleEvents.length ? { oracleEvents: trustedOracleEvents } : {}),
     ...('proofPatterns' in input.spec && Array.isArray(input.spec.proofPatterns) && input.spec.proofPatterns.length
       ? { proofPatterns: input.spec.proofPatterns as string[] }
       : {}),
@@ -3668,7 +3694,7 @@ export function buildReplayReceipt(input: {
     ...('expectControlDenied' in input.spec && input.spec.expectControlDenied ? { expectControlDenied: true } : {}),
   }
   const transcript: ReceiptTranscript = { entries }
-  return { receipt: receipt as ProofReceipt, transcript, factLog: HostFactLog.fromTranscript(transcript) }
+  return { receipt: receipt as ProofReceipt, transcript, factLog: HostFactLog.fromTranscript(transcript), trustedOracleEvents }
 }
 
 /**
@@ -3706,6 +3732,7 @@ export function receiptCheckForResult(input: {
   evidencePayload: Record<string, unknown>
   exchangeIds: readonly string[]
   exchanges: readonly BrokerExchangeResult[]
+  envelopeTrust?: 'host_persisted' | 'untrusted'
 }): { verdict: ReplayVerdict; outcome: ReplayAssertionOutcome; check?: ReplayReceiptCheck } {
   if (input.mode === 'off' || input.verdict !== 'confirmed') return { verdict: input.verdict, outcome: input.outcome }
   const built = buildReplayReceipt({
@@ -3714,9 +3741,12 @@ export function receiptCheckForResult(input: {
     exchangeIds: input.exchangeIds,
     exchanges: input.exchanges,
   })
-  // Fail closed in strict mode whenever a confirmed replay cannot construct a host-verified ProofReceipt.
+  // Fail closed in strict mode whenever a confirmed replay cannot construct a host-verified ProofReceipt,
+  // preserving only host-persisted dedicated non-http_chain deterministic floor kinds.
   if (!built) {
-    if (input.mode === 'strict') {
+    const hostNonReceiptFloorKind = input.envelopeTrust === 'host_persisted' &&
+      (input.spec.kind === 'cache_differential' || input.spec.kind === 'auth_protocol_proof' || input.spec.kind === 'upload_probe' || input.spec.kind === 'ws_chain')
+    if (input.mode === 'strict' && !hostNonReceiptFloorKind) {
       return {
         verdict: 'inconclusive',
         outcome: {
@@ -3732,8 +3762,10 @@ export function receiptCheckForResult(input: {
     built.factLog,
     { kind: 'single_hop', receipt: built.receipt },
     {
-      strictHostDerivation: true,
-      ...(built.receipt.oracleEvents?.length ? { trustedOracleEvents: built.receipt.oracleEvents } : {}),
+      // H-6: Preserve host-synthesized persona/tenant boundaries on host_persisted floor specs while
+      // enforcing strictHostDerivation=true on untrusted/inline specs; never trust raw expectedImpactEvents.
+      strictHostDerivation: input.envelopeTrust !== 'host_persisted',
+      ...(built.trustedOracleEvents.length ? { trustedOracleEvents: built.trustedOracleEvents } : {}),
     },
   )
   const verification: ReceiptVerification = oracleRes.singleHop ?? {

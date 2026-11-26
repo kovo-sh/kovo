@@ -11,6 +11,7 @@ import { chmodSync, copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync,
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 import { redact } from './redact.ts'
+import { HostFactLog } from './host-fact-log.ts'
 import { classifyBoundaryClaim, classifyImpactDescriptor } from './oracle-invariants.ts'
 import {
   VERIFY_NONCE_ENV,
@@ -467,7 +468,9 @@ async function runAttempt(
     }
     const descriptorText = `${safeTitle ?? ''} ${parsed.description ?? ''}`
     const declaredCwe = /\bCWE-\d{1,4}\b/i.exec(descriptorText)?.[0] ?? null
+    const factLog = HostFactLog.fromTranscriptStore(session.transcript)
     const oracle = evaluateClaims(session.transcript, parsed.claims, {
+      factLog,
       ...(options.canary ? { canary: options.canary } : {}),
       allowedExchangeIds: new Set(session.transcript.list().map(record => record.exchangeId)),
       claimedImpact: classifyImpactDescriptor({

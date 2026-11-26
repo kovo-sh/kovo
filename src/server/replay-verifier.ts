@@ -421,6 +421,10 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
               controlTriggered: controlCheck.triggered,
               probeDetail: probeWait.detail,
               controlDetail: controlCheck.detail,
+              token: prbCanary.token,
+              callbackId: probeWait.subscriptionId ?? `canary:${prbCanary.token}`,
+              stage: probeWait.stage === 'late' ? 'late' : 'immediate',
+              receivedAtMs: Date.now(),
             },
           }
         }
@@ -807,6 +811,7 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
     evidencePayload,
     exchangeIds,
     exchanges,
+    envelopeTrust: params.envelopeTrust,
   })
 
   return {
