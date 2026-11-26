@@ -465,7 +465,8 @@ test('packaging artifacts (Dockerfile, .dockerignore, docker-compose.yml, docker
 
   assert.match(workflow, /packages:\s*write/)
   assert.match(workflow, /attestations:\s*write/)
-  assert.match(workflow, /linux\/amd64,linux\/arm64/)
+  assert.match(workflow, /platform:\s*linux\/amd64/)
+  assert.match(workflow, /platform:\s*linux\/arm64/)
   assert.match(workflow, /actions\/attest-build-provenance@v2/)
   assert.match(workflow, /scripts\/docker-smoke\.sh/)
 })
