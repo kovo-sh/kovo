@@ -31,15 +31,34 @@ export async function diffCachePoisonDeception(ctx: DiffContext): Promise<DiffOu
       const simWarmRepeat = responseSimilarity(warm.ex.body, repeat.ex.body)
       const simFreshRepeat = responseSimilarity(fresh.ex.body, repeat.ex.body)
       const simWarmFresh = responseSimilarity(warm.ex.body, fresh.ex.body)
-      const ownerCanary = /rb[cs]_[a-z0-9]+_[0-9a-f]{12}/.exec(warm.ex.body)?.[0] ?? null
-      const ownerMarker = req.actorMarkers?.owner
-      const markerInWarm = ownerMarker ? warm.ex.body.includes(ownerMarker) : true
-      const markerInRepeat = ownerMarker ? repeat.ex.body.includes(ownerMarker) : true
-      const canaryRepeated = ownerCanary ? repeat.ex.body.includes(ownerCanary) && !fresh.ex.body.includes(ownerCanary) : false
+      // Fail closed unless an explicit caller-supplied owner marker (e.g. tenant/store/user handle)
+      // proves the warming actor's body was served to the second actor and is absent from its fresh
+      // response. Never fall back to fixture canary grammars or entropy regexes.
+      const ownerMarker = typeof req.actorMarkers?.owner === 'string' && req.actorMarkers.owner.trim().length > 0
+        ? req.actorMarkers.owner.trim()
+        : null
+      const markerInWarm = Boolean(ownerMarker && warm.ex.body.includes(ownerMarker))
+      const markerInRepeat = Boolean(ownerMarker && repeat.ex.body.includes(ownerMarker))
+      const markerAbsentInFresh = Boolean(ownerMarker && !fresh.ex.body.includes(ownerMarker))
+      const ownerMarkerRepeated = markerInWarm && markerInRepeat && markerAbsentInFresh
       const cacheHitObserved = simWarmRepeat >= 0.9 && simFreshRepeat < 0.95 && simWarmFresh < 0.95 &&
-        markerInWarm && markerInRepeat && canaryRepeated
-      crossActor.push({ path, freshPath: req.crossControlPath ?? null, simWarmRepeat, simFreshRepeat, simWarmFresh, ownerCanary: Boolean(ownerCanary), markerInRepeat, canaryRepeated, hit: cacheHitObserved })
-      notes.push(`cache cross-actor warm/repeat=${simWarmRepeat.toFixed(3)} fresh/repeat=${simFreshRepeat.toFixed(3)} hit=${cacheHitObserved}`)
+        ownerMarkerRepeated
+      crossActor.push({
+        path,
+        freshPath: req.crossControlPath ?? null,
+        simWarmRepeat,
+        simFreshRepeat,
+        simWarmFresh,
+        hasOwnerMarker: Boolean(ownerMarker),
+        markerInWarm,
+        markerInRepeat,
+        markerAbsentInFresh,
+        hit: cacheHitObserved,
+      })
+      notes.push(
+        `cache cross-actor warm/repeat=${simWarmRepeat.toFixed(3)} fresh/repeat=${simFreshRepeat.toFixed(3)} `
+        + `ownerMarker=${ownerMarker ? (ownerMarkerRepeated ? 'repeated' : 'mismatch') : 'missing_fail_closed'} hit=${cacheHitObserved}`,
+      )
       if (cacheHitObserved) {
         const basePath = path.split('?')[0] + (path.includes('?') ? `?${path.split('?').slice(1).join('?')}` : '')
         const controlBase = req.crossControlPath ?? basePath

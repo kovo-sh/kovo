@@ -15,6 +15,117 @@ import { groupUnits, reachableSubsets } from './subset.ts'
 
 const NOUN_REF = /\{noun:([a-zA-Z0-9_-]+)\}/g
 
+/**
+ * Neutral out-of-distribution roots used by `novelVocab` mode. Chosen to avoid generic REST/API
+ * domain vocabulary and scanner route/param heuristics so novel-vocabulary generalization is
+ * measured honestly against unseen entity, route, and parameter identifiers.
+ */
+const NOVEL_ROOTS: readonly string[] = [
+  'acorn', 'alder', 'amber', 'aspen', 'basalt', 'birch', 'breeze', 'cairn', 'cedar', 'chert',
+  'clover', 'coral', 'cove', 'creek', 'dune', 'elm', 'ember', 'fern', 'fjord', 'flint',
+  'glade', 'gneiss', 'granite', 'grove', 'hazel', 'heath', 'indigo', 'islet', 'ivory', 'jasper',
+  'juniper', 'kelp', 'kestrel', 'knoll', 'larch', 'lichen', 'linen', 'marble', 'meadow', 'moss',
+  'nectar', 'nimbus', 'ochre', 'opal', 'osier', 'pebble', 'pine', 'plume', 'quartz', 'quill',
+  'reed', 'ridge', 'sedge', 'shale', 'slate', 'spruce', 'tarn', 'thistle', 'timber', 'umber',
+  'upland', 'vale', 'vetch', 'weir', 'willow', 'wren', 'yarrow', 'yucca', 'zenith', 'zephyr',
+]
+
+export interface GenerateVariantOptions {
+  salt?: string
+  /**
+   * When true, deterministically substitutes non-pool, out-of-distribution API prefix, route
+   * entity nouns, and parameter names derived from the seed PRNG.
+   * When false or omitted, default blueprint pool generation is preserved bit-for-bit.
+   */
+  novelVocab?: boolean
+}
+
+function collectBlueprintPoolTokens(bp: AppBlueprint): Set<string> {
+  const pool = new Set<string>()
+  for (const prefix of bp.apiPrefixes) {
+    pool.add(prefix.toLowerCase())
+    for (const seg of prefix.split('/').filter(Boolean)) pool.add(seg.toLowerCase())
+  }
+  for (const [key, values] of Object.entries(bp.vocab)) {
+    pool.add(key.toLowerCase())
+    for (const v of values) pool.add(v.toLowerCase())
+  }
+  for (const [key, values] of Object.entries(bp.paramVocab)) {
+    pool.add(key.toLowerCase())
+    for (const v of values) pool.add(v.toLowerCase())
+  }
+  for (const tmpl of Object.values(bp.routes)) {
+    for (const seg of tmpl.path.split('/').filter(Boolean)) {
+      if (!seg.startsWith(':') && !seg.startsWith('{noun:')) pool.add(seg.toLowerCase())
+    }
+  }
+  return pool
+}
+
+function pickNovelApiPrefix(p: Prng, forbidden: ReadonlySet<string>): string {
+  const roots = p.shuffle(NOVEL_ROOTS)
+  for (const root of roots) {
+    const candidate = `/nv-${root}-${p.hex(2)}`
+    if (!forbidden.has(candidate) && !forbidden.has(candidate.slice(1))) return candidate
+  }
+  return `/nv-${p.hex(4)}`
+}
+
+function pickNovelVocab(
+  p: Prng,
+  vocab: Record<string, string[]>,
+  forbidden: ReadonlySet<string>,
+): Record<string, string> {
+  const roots = p.shuffle(NOVEL_ROOTS)
+  const out: Record<string, string> = {}
+  const used = new Set<string>()
+  let idx = 0
+  for (const key of Object.keys(vocab)) {
+    let candidate = ''
+    for (let tries = 0; tries < 32; tries++) {
+      const root = roots[(idx + tries) % roots.length]!
+      const next = `${root}-${p.hex(2)}`
+      if (!used.has(next) && !forbidden.has(next)) {
+        candidate = next
+        break
+      }
+    }
+    if (!candidate) candidate = `nv-${p.hex(4)}`
+    used.add(candidate)
+    out[key] = candidate
+    idx += 1
+  }
+  return out
+}
+
+function pickNovelParams(
+  p: Prng,
+  paramVocab: Record<string, string[]>,
+  forbidden: ReadonlySet<string>,
+): Record<string, string> {
+  const roots = p.shuffle(NOVEL_ROOTS)
+  const out: Record<string, string> = {}
+  const used = new Set<string>()
+  let idx = 0
+  for (const key of Object.keys(paramVocab)) {
+    let candidate = ''
+    for (let tries = 0; tries < 32; tries++) {
+      const root = roots[(idx + tries) % roots.length]!
+      // Valid JS / route-param identifier matching /^[a-z][a-zA-Z0-9_]*$/ without heuristic suffixes.
+      const next = `${root}X${p.hex(2)}`
+      if (!used.has(next) && !forbidden.has(next.toLowerCase())) {
+        candidate = next
+        break
+      }
+    }
+    if (!candidate) candidate = `nvX${p.hex(4)}`
+    used.add(candidate)
+    out[key] = candidate
+    idx += 1
+  }
+  return out
+}
+
 function pickVocab(p: Prng, vocab: Record<string, string[]>): Record<string, string> {
   const out: Record<string, string> = {}
   for (const key of Object.keys(vocab)) out[key] = p.pick(vocab[key]!)
@@ -97,18 +208,30 @@ function assignModes(p: Prng, bp: AppBlueprint): Record<string, SiteMode> {
 }
 
 /** Deterministically derive a VariantPlan from a blueprint + seed (+ held-out salt). */
-export function generateVariant(bp: AppBlueprint, seed: number, opts?: { salt?: string }): VariantPlan {
+export function generateVariant(bp: AppBlueprint, seed: number, opts?: GenerateVariantOptions): VariantPlan {
   validateBlueprint(bp)
   const { seedSet, prng } = resolveSeed(seed, opts?.salt)
 
-  const apiPrefix = prng.fork('apiPrefix').pick(bp.apiPrefixes)
-  const params = pickParams(prng.fork('params'), bp.paramVocab)
+  let apiPrefix: string
+  let params: Record<string, string>
   const idFormat = prng.fork('idFormat').pick(bp.idFormats)
-
   let routes: Record<string, RouteSpec> | null = null
-  for (let attempt = 0; attempt < 16 && !routes; attempt++) {
-    const vocab = pickVocab(prng.fork(attempt === 0 ? 'vocab' : `vocab:${attempt}`), bp.vocab)
-    routes = buildRoutes(bp, apiPrefix, vocab, params)
+
+  if (opts?.novelVocab) {
+    const forbidden = collectBlueprintPoolTokens(bp)
+    apiPrefix = pickNovelApiPrefix(prng.fork('novelApiPrefix'), forbidden)
+    params = pickNovelParams(prng.fork('novelParams'), bp.paramVocab, forbidden)
+    for (let attempt = 0; attempt < 16 && !routes; attempt++) {
+      const vocab = pickNovelVocab(prng.fork(attempt === 0 ? 'novelVocab' : `novelVocab:${attempt}`), bp.vocab, forbidden)
+      routes = buildRoutes(bp, apiPrefix, vocab, params)
+    }
+  } else {
+    apiPrefix = prng.fork('apiPrefix').pick(bp.apiPrefixes)
+    params = pickParams(prng.fork('params'), bp.paramVocab)
+    for (let attempt = 0; attempt < 16 && !routes; attempt++) {
+      const vocab = pickVocab(prng.fork(attempt === 0 ? 'vocab' : `vocab:${attempt}`), bp.vocab)
+      routes = buildRoutes(bp, apiPrefix, vocab, params)
+    }
   }
   if (!routes) throw new Error(`could not build collision-free routes for ${bp.app}`)
 

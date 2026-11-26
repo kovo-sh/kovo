@@ -41,8 +41,9 @@ fail=0
 step() { printf '\n== %s\n' "$1"; }
 run() { step "$1"; shift; if "$@"; then :; else echo "FAILED: $1" >&2; fail=1; fi; }
 
-# 1. Fast static lints & structural wiring invariants (<1s total).
+# 1. Fast static lints & structural wiring invariants (<2s total).
 run "v8 anti-contamination lint" node scripts/check-v8-contamination.ts
+run "fixture-contamination ratchet lint" node scripts/check-fixture-contamination.ts
 if [[ -n "${KOVO_CONTRACT_BASE:-}" ]]; then
   run "contract-change trailer lint" node scripts/check-contract-change.ts --base "$KOVO_CONTRACT_BASE"
 else
