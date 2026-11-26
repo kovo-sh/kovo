@@ -393,16 +393,22 @@ function seedThreeHopCompositeFinding(params: {
 // 1. Production Gate-6 Composite Retest — Genuine Fix (Fixed at Hop 3 + Export)
 // ============================================================================
 
-test('Q8-1: Production Gate-6 composite retest confirms genuine fix at hop-3, persists structured metadata, and exports without regex scraping', async (t) => {
+test('Q8-1: Production Gate-6 composite retest reproduces on unpatched lab, confirms genuine fix at hop-3, keeps Gate-6 proposal-scoped, and exports authoritative Verify Fix cleanly', async (t) => {
   const origin = 'http://127.0.0.1:4480'
   const { storage, run, worker } = makeStoreWithRun(t, origin)
   const { reposDir, liveDir, vulnCode, labRunner } = makeRepoAndLab(t, origin)
   const { finding, specRow, spec, compositeReceipt } = seedThreeHopCompositeFinding({ storage, run, worker, origin })
 
-  // Live patched target:
-  // - Hop 1 (directory) -> 200 OK (benign prefix preserved)
-  // - Hop 2 (export mint) -> 200 OK (benign prefix preserved)
-  // - Hop 3 (foreign download) -> 403 Forbidden (patch blocked the vulnerability!)
+  // Stateful lab target reflecting liveDir:
+  // - Before patch (unpatched control): pre-chain control returns 403, then hop-1 -> hop-2 -> hop-3 reproduces org-a leak (200)!
+  // - After candidate patch is applied to liveDir: hop-1 (200), hop-2 (200), hop-3 -> 403 Forbidden!
+  let mintCalled = false
+  const origRebuild = labRunner.rebuildWithPatch.bind(labRunner)
+  labRunner.rebuildWithPatch = async (runIdArg, diffArg, sigArg) => {
+    mintCalled = false
+    return origRebuild(runIdArg, diffArg, sigArg)
+  }
+  const isPatched = () => readFileSync(join(liveDir, 'src/export.ts'), 'utf8').includes('ownerTenant !== callerTenant')
   const broker = new RequestBroker({
     rejectUnauthorized: false,
     transport: async (url) => {
@@ -411,10 +417,14 @@ test('Q8-1: Production Gate-6 composite retest confirms genuine fix at hop-3, pe
         return { status: 200, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ tenant: 'org-b', directoryToken: 'dir-tok-fresh' }) }
       }
       if (path === '/api/v1/exports/mint') {
+        mintCalled = true
         return { status: 200, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ exportToken: 'exp-tok-fresh' }) }
       }
       if (path === '/api/v1/exports/exp-900/download') {
-        return { status: 403, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ error: 'forbidden_tenant_mismatch' }) }
+        if (isPatched() || !mintCalled) {
+          return { status: 403, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ error: 'forbidden_tenant_mismatch' }) }
+        }
+        return { status: 200, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ tenantId: 'org-a', invoiceId: 'inv-100', amount: 9500 }) }
       }
       return { status: 404, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ error: 'not_found' }) }
     },
@@ -453,11 +463,48 @@ test('Q8-1: Production Gate-6 composite retest confirms genuine fix at hop-3, pe
   assert.equal(res.patchBrokeHopId, 'hop-3')
   assert.equal(res.gates.find(g => g.gate === 6)?.passed, true)
   assert.ok(res.compositeRetestProof, 'compositeRetestProof must be attached to PatchProposalResult')
+  assert.equal(res.compositeRetestProof!.patchId, res.id)
+  assert.ok(res.labRevision && res.compositeRetestProof!.targetRevision === res.labRevision, 'Gate-6 proof must be tagged with lab revision')
   assert.equal(verifyCompositePatchRetestProofIntegrity(res.compositeRetestProof!), true)
   assert.deepEqual(res.compositeRetestProof!.benignPrefixHops, ['hop-1', 'hop-2'])
   assert.equal(readFileSync(join(liveDir, 'src/export.ts'), 'utf8'), vulnCode, 'clean Gate-6 rollback preserved')
 
-  // Verify structured metadata persisted in SQLite (retest_runs + replay_specs.proof_receipt + artifact)
+  // R4-H-10: Candidate-patch Gate-6 MUST NEVER write finding-level retest_runs or overwrite replay_specs.proof_receipt!
+  const rtRowsAfterGate6 = storage.db.select().from(retestRuns).where(eq(retestRuns.findingId, finding.id)).orderBy(desc(retestRuns.createdAt)).all()
+  assert.equal(rtRowsAfterGate6.length, 0, 'candidate-patch Gate-6 must not write finding retest_runs')
+  const specAfterGate6 = storage.getReplaySpec(run.id, specRow.id)
+  const storedProofAfterGate6 = specAfterGate6.proofReceipt as unknown as Record<string, unknown>
+  assert.equal(storedProofAfterGate6.patchBrokeHopId, undefined, 'candidate-patch Gate-6 must not mutate replay_specs.proof_receipt')
+  assert.equal(storedProofAfterGate6.compositeVerdict, undefined)
+
+  // Authoritative finding-level Verify Fix (no patchId, persistRetest: true) writes retest_runs + structured artifact and exports cleanly!
+  mintCalled = false
+  const unpatchedControl = await retestCompositeChainPatch({
+    receipt: compositeReceipt,
+    brokerContext: { broker, grant: makeGrant(origin), storage, runId: run.id, assignmentId: worker.id, findingId: finding.id, replaySpecId: specRow.id, hopActors: { 'hop-1': 'bob', 'hop-2': 'bob', 'hop-3': 'bob' } },
+    prePatchControlRun: true,
+  })
+  assert.equal(unpatchedControl.verdict, 'still_vulnerable')
+
+  // Simulate deployed fix on live target, then run authoritative Verify Fix retest
+  writeFileSync(join(liveDir, 'src/export.ts'), 'export function downloadExport(ownerTenant: string, callerTenant: string) {\n  if (ownerTenant !== callerTenant) return { ok: false, error: "forbidden" }\n  return { ok: true, ownerTenant }\n}\n')
+  const authProof = await retestCompositeChainPatch({
+    receipt: compositeReceipt,
+    prePatchProof: unpatchedControl,
+    brokerContext: {
+      broker,
+      grant: makeGrant(origin),
+      storage,
+      runId: run.id,
+      assignmentId: worker.id,
+      findingId: finding.id,
+      replaySpecId: specRow.id,
+      hopActors: { 'hop-1': 'bob', 'hop-2': 'bob', 'hop-3': 'bob' },
+      persistRetest: true,
+    },
+  })
+  assert.equal(authProof.verdict, 'fixed')
+
   const rtRows = storage.db.select().from(retestRuns).where(eq(retestRuns.findingId, finding.id)).orderBy(desc(retestRuns.createdAt)).all()
   assert.equal(rtRows.length, 1)
   assert.equal(rtRows[0]!.verdict, 'fixed')
@@ -467,12 +514,7 @@ test('Q8-1: Production Gate-6 composite retest confirms genuine fix at hop-3, pe
   assert.equal(retestArt.compositeVerdict, 'fixed')
   assert.equal(retestArt.patchBrokeHopId, 'hop-3')
 
-  const updatedSpec = storage.getReplaySpec(run.id, specRow.id)
-  const storedProofObj = updatedSpec.proofReceipt as unknown as Record<string, unknown>
-  assert.equal(storedProofObj.patchBrokeHopId, 'hop-3')
-  assert.equal(storedProofObj.compositeVerdict, 'fixed')
-
-  // Verify signed receipt bundle export reads structured patchBrokeHopId & compositeVerdict cleanly
+  // Verify signed receipt bundle export reads structured patchBrokeHopId & compositeVerdict cleanly from retest artifact
   const secret = 'q8-export-hmac-secret-test'
   const bundle = exportRunReceiptBundle(storage, run.id, {
     signing: { algorithm: 'hmac-sha256', secret },
@@ -487,29 +529,47 @@ test('Q8-1: Production Gate-6 composite retest confirms genuine fix at hop-3, pe
 })
 
 // ============================================================================
-// 2. Write-Only Multi-Hop Chain (Benign Prefix Preserves Gate-6) & 200-Sanitized Hop
+// 2. Write-Only Multi-Hop Chain (No Baseline -> Withheld, R4-H-9) & 200-Sanitized Hop
 // ============================================================================
 
-test('Q8-2: Write-only composite chain passes Gate-6 via benignPrefixHops and detects 200-sanitized intermediate hop fix', async (t) => {
+test('Q8-2: Write-only composite chain detects 200-sanitized intermediate hop fix but withholds Gate-6 without a read-only baseline caller (R4-H-9)', async (t) => {
   const origin = 'http://127.0.0.1:4481'
   const { storage, run, worker } = makeStoreWithRun(t, origin)
   const { reposDir, liveDir, labRunner } = makeRepoAndLab(t, origin)
   const { finding, specRow, spec } = seedThreeHopCompositeFinding({ storage, run, worker, origin, writeOnly: true })
 
-  // Patched target returns HTTP 200 on hop-1 (benign), and HTTP 200 with redacted/null exportToken on hop-2!
-  const requestedPaths: string[] = []
+  // Stateful target: unpatched reproduces 3-hop chain; patched returns HTTP 200 on hop-1 (benign)
+  // and HTTP 200 with redacted/null exportToken on hop-2!
+  const isPatched = () => readFileSync(join(liveDir, 'src/export.ts'), 'utf8').includes('ownerTenant !== callerTenant')
+  let mintCalled = false
+  const origRebuild2 = labRunner.rebuildWithPatch.bind(labRunner)
+  labRunner.rebuildWithPatch = async (runIdArg, diffArg, sigArg) => {
+    mintCalled = false
+    return origRebuild2(runIdArg, diffArg, sigArg)
+  }
+  const postPatchPaths: string[] = []
   const broker = new RequestBroker({
     rejectUnauthorized: false,
     transport: async (url) => {
       const path = new URL(url).pathname
-      requestedPaths.push(path)
+      if (isPatched()) postPatchPaths.push(path)
       if (path === '/api/v1/org/directory') {
         return { status: 200, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ tenant: 'org-b', directoryToken: 'dir-tok-2' }) }
       }
       if (path === '/api/v1/exports/mint') {
-        return { status: 200, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ status: 'ok', exportToken: '[redacted]' }) }
+        if (isPatched()) {
+          return { status: 200, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ status: 'ok', exportToken: '[redacted]' }) }
+        }
+        mintCalled = true
+        return { status: 200, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ exportToken: 'exp-tok-live' }) }
       }
-      return { status: 200, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ tenantId: 'org-a' }) }
+      if (path === '/api/v1/exports/exp-900/download') {
+        if (!mintCalled) {
+          return { status: 403, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ error: 'forbidden_before_mint' }) }
+        }
+        return { status: 200, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ tenantId: 'org-a', invoiceId: 'inv-100' }) }
+      }
+      return { status: 404, headers: { 'content-type': 'application/json' }, body: '{}' }
     },
   })
 
@@ -539,40 +599,28 @@ test('Q8-2: Write-only composite chain passes Gate-6 via benignPrefixHops and de
     },
   })
 
-  assert.equal(res.status, 'approved', res.reviewNotes)
-  assert.equal(res.dynamicRetestVerdict, 'fixed')
+  // R4-H-9: Never pass Gate 6 with no safe read-only baseline caller just because a benign prefix hop exists!
+  assert.equal(res.status, 'withheld', res.reviewNotes)
+  assert.equal(res.dynamicRetestVerdict, 'skipped')
   assert.equal(res.compositeVerdict, 'fixed')
-  assert.equal(res.patchBrokeHopId, 'hop-2')
+  assert.equal(res.compositeRetestProof?.patchBrokeHopId, 'hop-2')
   assert.deepEqual(res.compositeRetestProof?.benignPrefixHops, ['hop-1'])
   assert.equal(res.compositeRetestProof?.hopResults.find(h => h.hopId === 'hop-3')?.outcome, 'skipped_after_break')
-  assert.equal(res.gates.find(g => g.gate === 6)?.passed, true)
-  assert.match(res.dynamicRetestSummary ?? '', /benign prefix hops preserved/i)
+  assert.equal(res.gates.find(g => g.gate === 6)?.passed, false)
+  assert.match(res.dynamicRetestSummary ?? '', /no safe read-only\/idempotent baseline caller/i)
   // Downstream hop-3 must NOT be replayed after hop-2 stops emitting capability!
-  assert.equal(requestedPaths.filter(p => p === '/api/v1/exports/exp-900/download').length, 1, 'only pre-chain control should hit download endpoint, not probe hop-3')
+  assert.equal(postPatchPaths.filter(p => p === '/api/v1/exports/exp-900/download').length, 1, 'only pre-chain control should hit download endpoint on post-patch run, not probe hop-3')
 })
 
 // ============================================================================
 // 3. Fail-Closed Precondition Invariant (`precondition_changed` -> NEVER 'fixed')
 // ============================================================================
 
-test('Q8-3: Production Gate-6 composite retest fails closed on precondition_changed (HTTP 404/410 drift -> withheld & inconclusive, NEVER fixed)', async (t) => {
+test('Q8-3: Production Gate-6 composite retest fails closed on precondition_changed (HTTP 404/410 drift -> withheld & inconclusive, NEVER fixed, and never pollutes finding records)', async (t) => {
   const origin = 'http://127.0.0.1:4482'
   const { storage, run, worker } = makeStoreWithRun(t, origin)
   const { reposDir, liveDir, labRunner } = makeRepoAndLab(t, origin)
   const { finding, specRow, spec } = seedThreeHopCompositeFinding({ storage, run, worker, origin })
-
-  // Pre-seed a stale patchBrokeHopId on proof_receipt to verify precondition_changed clears it!
-  const beforeRow = storage.getReplaySpec(run.id, specRow.id)
-  storage.db
-    .update(replaySpecs)
-    .set({
-      proofReceipt: {
-        ...(beforeRow.proofReceipt as unknown as Record<string, unknown>),
-        patchBrokeHopId: 'stale-hop-from-earlier',
-      } as unknown as typeof beforeRow.proofReceipt,
-    })
-    .where(eq(replaySpecs.id, specRow.id))
-    .run()
 
   // Simulated environment drift: upstream setup hop-1 endpoint moved (HTTP 404 Cannot GET /api/v1/org/directory).
   const broker = new RequestBroker({
@@ -620,31 +668,19 @@ test('Q8-3: Production Gate-6 composite retest fails closed on precondition_chan
   assert.equal(res.gates.find(g => g.gate === 6)?.passed, false)
   assert.match(res.dynamicRetestSummary ?? '', /precondition_changed/i)
 
-  // Persisted retest_runs record MUST map precondition_changed -> 'inconclusive' (NEVER 'fixed')!
+  // R4-H-10: Candidate-patch Gate-6 MUST NOT pollute finding-level retest_runs or replay_specs.proof_receipt!
   const rtRows = storage.db.select().from(retestRuns).where(eq(retestRuns.findingId, finding.id)).orderBy(desc(retestRuns.createdAt)).all()
-  assert.equal(rtRows.length, 1)
-  assert.equal(rtRows[0]!.verdict, 'inconclusive')
-
-  // Persisted proof_receipt must clear stale patchBrokeHopId and record compositeVerdict='precondition_changed'.
+  assert.equal(rtRows.length, 0)
   const afterProof = storage.getReplaySpec(run.id, specRow.id).proofReceipt as unknown as Record<string, unknown>
-  assert.equal(afterProof.patchBrokeHopId, null)
-  assert.equal(afterProof.compositeVerdict, 'precondition_changed')
-
-  // Exported bundle MUST reflect fail-closed inconclusive + compositeVerdict='precondition_changed' + patchBrokeHopId=null.
-  const secret = 'q8-drift-hmac-secret'
-  const bundle = exportRunReceiptBundle(storage, run.id, { signing: { algorithm: 'hmac-sha256', secret } })
-  const exported = bundle.payload.compositeReceipts![0]!
-  assert.equal(exported.patchRetestVerdict, 'inconclusive')
-  assert.equal(exported.compositeVerdict, 'precondition_changed')
-  assert.equal(exported.patchBrokeHopId, null)
-  assert.equal(verifyProofReceiptBundle(bundle, { secret }).valid, true)
+  assert.equal(afterProof.patchBrokeHopId, undefined)
+  assert.equal(afterProof.compositeVerdict, undefined)
 })
 
 // ============================================================================
 // 4. Unpatched Target Still Reproducing (`still_vulnerable` -> Gate-6 Rejected)
 // ============================================================================
 
-test('Q8-4: Production Gate-6 composite retest detects still-reproducing chain (still_vulnerable -> rejected & reproduced)', async (t) => {
+test('Q8-4: Production Gate-6 composite retest detects still-reproducing chain (still_vulnerable -> rejected & reproduced, proposal-scoped)', async (t) => {
   const origin = 'http://127.0.0.1:4483'
   const { storage, run, worker } = makeStoreWithRun(t, origin)
   const { reposDir, liveDir, labRunner } = makeRepoAndLab(t, origin)
@@ -653,11 +689,17 @@ test('Q8-4: Production Gate-6 composite retest detects still-reproducing chain (
   // Unpatched target: pre-chain direct download is 403 (denied before minting), then hop-1 -> hop-2 -> hop-3
   // still discloses foreign tenant org-a data (200 OK)!
   let mintCalled = false
+  const origRebuild4 = labRunner.rebuildWithPatch.bind(labRunner)
+  labRunner.rebuildWithPatch = async (runIdArg, diffArg, sigArg) => {
+    mintCalled = false
+    return origRebuild4(runIdArg, diffArg, sigArg)
+  }
   const broker = new RequestBroker({
     rejectUnauthorized: false,
     transport: async (url) => {
       const path = new URL(url).pathname
       if (path === '/api/v1/org/directory') {
+        mintCalled = false
         return { status: 200, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ tenant: 'org-b', directoryToken: 'dir-tok-live' }) }
       }
       if (path === '/api/v1/exports/mint') {
@@ -706,9 +748,9 @@ test('Q8-4: Production Gate-6 composite retest detects still-reproducing chain (
   assert.equal(res.patchBrokeHopId, null)
   assert.equal(res.gates.find(g => g.gate === 6)?.passed, false)
 
+  // R4-H-10: Rejected Gate-6 candidate patch MUST NOT pollute finding-level retest_runs!
   const rtRows = storage.db.select().from(retestRuns).where(eq(retestRuns.findingId, finding.id)).orderBy(desc(retestRuns.createdAt)).all()
-  assert.equal(rtRows.length, 1)
-  assert.equal(rtRows[0]!.verdict, 'reproduced')
+  assert.equal(rtRows.length, 0)
 })
 
 // ============================================================================

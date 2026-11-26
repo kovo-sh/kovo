@@ -1558,6 +1558,9 @@ export class FindingsRepository {
     codeLocations: CodeLocation[]
     reviewNotes: string
     dynamicRetestVerdict?: DynamicRetestVerdict
+    labRevision?: string | null
+    compositeVerdict?: string | null
+    patchBrokeHopId?: string | null
     secrets?: readonly NamedSecret[]
   }): PatchProposal {
     this.assertTenantRun(input.runId)
@@ -1610,6 +1613,9 @@ export class FindingsRepository {
         status: saved.status,
         callerCompatibility: saved.callerCompatibility,
         dynamicRetestVerdict: saved.dynamicRetestVerdict,
+        ...(input.labRevision ? { labRevision: redact(input.labRevision, secrets) } : {}),
+        ...(input.compositeVerdict ? { compositeVerdict: input.compositeVerdict } : {}),
+        ...(input.patchBrokeHopId !== undefined ? { patchBrokeHopId: input.patchBrokeHopId ? redact(input.patchBrokeHopId, secrets) : null } : {}),
       })
       return saved
     }, { behavior: 'immediate' })

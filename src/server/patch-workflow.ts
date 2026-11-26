@@ -7,7 +7,6 @@ import {
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { extname, join, relative, resolve } from 'node:path'
-import { and, eq } from 'drizzle-orm'
 import { z } from 'zod'
 import type { Finding, HttpMethod } from '../domain.ts'
 import type { DeclarativeReplaySpec, ReplayStep } from '../replay-spec.ts'
@@ -21,6 +20,7 @@ import {
   type HostBrowserTrace, type HostOobEvent, type HostSignableRecord, type HostSignedTranscript, type HostTranscriptEntry,
 } from './composite-receipt.ts'
 import { isSensitiveRepoEntry, isSensitiveRepoRelativePath } from './exec-verify.ts'
+import { hasVaultScrubbedToken, type HostExchangeFact, type HostFactLog } from './host-fact-log.ts'
 import { applyUnifiedDiffToDirectory, type LabRunner } from './lab-runner.ts'
 import { isProfileHealthy, resolveProfilePoolForRole, type ResolvedModelProfile } from './model-settings.ts'
 import { parseRoleLabel } from './oracle-invariants.ts'
@@ -28,7 +28,7 @@ import type { ImpactStep } from './proof-receipt.ts'
 import { providerPool, type UsageCallback } from './provider.ts'
 import { redact, type NamedSecret } from './redact.ts'
 import { retestReplaySpec } from './replay-verifier.ts'
-import { replaySpecs } from './schema.ts'
+import { assessRetestHealth, type RetestArmObservation } from './retest-health.ts'
 import type { ScopedBrowser } from './scoped-browser.ts'
 import type { BrokerExchange } from './store-session.ts'
 import type { Store } from './store.ts'
@@ -70,7 +70,7 @@ export interface PatchProposalResult {
   codeLocations: PatchCodeLocation[]; coverageInventory: CoverageInventoryEntry[]; gates: PatchGateResult[]
   reviewNotes: string; dynamicRetestVerdict: DynamicRetestVerdict; dynamicRetestSummary?: string
   patchBrokeHopId?: string | null; compositeVerdict?: CompositePatchRetestVerdict | null
-  compositeRetestProof?: CompositePatchRetestProof
+  compositeRetestProof?: CompositePatchRetestProof; labRevision?: string
   createdAt: number; updatedAt: number
 }
 export type PatchLlmCall = (prompt: { systemPrompt: string; userPrompt: string }) => Promise<string>
@@ -78,11 +78,12 @@ export type PatchLlmCall = (prompt: { systemPrompt: string; userPrompt: string }
 export interface PatchLabRetestContext {
   labRunner: LabRunner; runId: string; sanitizedRepoDir?: string; replaySpec: DeclarativeReplaySpec
   replaySpecId?: string; envelopeTrust?: 'host_persisted' | 'untrusted'
-  broker: RequestBroker; browser?: ScopedBrowser; canaryBroker?: CanaryBroker
+  broker: RequestBroker; browser?: ScopedBrowser; canaryBroker?: CanaryBroker; factLog?: HostFactLog
   backend: WorkerBackend; grant: Grant; storage?: Store; assignmentId?: string
   baselineCaller?: BrokerHttpRequest; baselineExpectStatus?: number[]
   compositeReceipt?: CompositeProofReceipt; compositeRunner?: CompositePatchReplayRunner
   compositeVerifyOptions?: CompositeVerifyOptions; hopActors?: Readonly<Record<string, string | null>>
+  labRevision?: string; prePatchReproductionProof?: CompositePatchRetestProof
 }
 export interface PatchWorkflowParams {
   runId: string; finding: Finding & { codeLocations?: PatchCodeLocation[] }; repo: string; reposDir: string
@@ -562,8 +563,9 @@ const failApplicability = (error: string, output?: string): PatchApplicabilityRe
 export async function verifyPatchApplicability(params: {
   repoRoot: string; repo: string; reposDir: string; diff: string; fixBefore: string
   fixAfter?: string; codeLocations: readonly PatchCodeLocation[]; backend?: WorkerBackend; signal?: AbortSignal
+  runId?: string
 }): Promise<PatchApplicabilityResult> {
-  const { repoRoot, repo, reposDir, diff, fixBefore, fixAfter, codeLocations, backend, signal } = params
+  const { repoRoot, repo, reposDir, diff, fixBefore, fixAfter, codeLocations, backend, signal, runId } = params
   const primaryRelFile = codeLocations.length > 0 ? normalizeRepoRelPath(codeLocations[0]!.file) : null
   if (primaryRelFile && isSensitiveRepoRelativePath(primaryRelFile)) {
     return failApplicability(`Refusing access to sensitive repository path: ${primaryRelFile}.`, `Sensitive path denied: ${primaryRelFile}`)
@@ -631,7 +633,7 @@ export async function verifyPatchApplicability(params: {
         const res = await backend.run(
           { assignmentId: randomUUID(), files: scriptFiles, command: 'node /evidence/patch_syntax_check.mjs', outputs: [], timeoutMs: 30_000 },
           signal ?? AbortSignal.timeout(35_000),
-          { reposDir },
+          { reposDir, ...(runId ? { runId } : {}) },
         )
         const combinedOut = (res.stdout + '\n' + res.stderr).trim()
         if (res.exitCode !== 0) {
@@ -759,7 +761,7 @@ export async function runPatchAuthor(params: PatchWorkflowParams): Promise<Patch
     const content = safeReadRepoFile(repoRoot, locations[0]!.file)
     if (content !== null) diff = buildUnifiedDiffFromSnippet(locations[0]!.file, content, fixBefore, fixAfter, locations[0]!.startLine).diff
   }
-  const check = await verifyPatchApplicability({ repoRoot, repo: params.repo, reposDir: params.reposDir, diff, fixBefore, fixAfter, codeLocations: locations, backend: params.backend, signal: params.signal })
+  const check = await verifyPatchApplicability({ repoRoot, repo: params.repo, reposDir: params.reposDir, diff, fixBefore, fixAfter, codeLocations: locations, backend: params.backend, signal: params.signal, runId: params.runId })
   return { repo: params.repo, coverageInventory, fixBefore, fixAfter, diff, codeLocations: locations, rationale, syntaxCheck: check.syntaxCheck, applicability: check }
 }
 
@@ -965,11 +967,11 @@ export async function runPatchReviewer(params: {
   finding: Finding & { codeLocations?: PatchCodeLocation[] }; repo: string; reposDir: string
   authorOutput: PatchAuthorOutput; precomputedApplicability?: PatchApplicabilityResult
   backend?: WorkerBackend; reviewerLlmCall?: PatchLlmCall; modelProfiles?: readonly ResolvedModelProfile[]
-  signal?: AbortSignal; secrets?: readonly NamedSecret[]; onUsage?: UsageCallback
+  signal?: AbortSignal; secrets?: readonly NamedSecret[]; onUsage?: UsageCallback; runId?: string
 }): Promise<PatchReviewOutput> {
   const repoRoot = validateRepoPath(params.reposDir, params.repo)
   const applicability = params.precomputedApplicability ?? params.authorOutput.applicability
-    ?? await verifyPatchApplicability({ repoRoot, repo: params.repo, reposDir: params.reposDir, diff: params.authorOutput.diff, fixBefore: params.authorOutput.fixBefore, fixAfter: params.authorOutput.fixAfter, codeLocations: params.authorOutput.codeLocations, backend: params.backend, signal: params.signal })
+    ?? await verifyPatchApplicability({ repoRoot, repo: params.repo, reposDir: params.reposDir, diff: params.authorOutput.diff, fixBefore: params.authorOutput.fixBefore, fixAfter: params.authorOutput.fixAfter, codeLocations: params.authorOutput.codeLocations, backend: params.backend, signal: params.signal, ...(params.runId ? { runId: params.runId } : {}) })
 
   const reviewerCall = params.reviewerLlmCall
     ?? (params.modelProfiles?.length ? makeFreshProviderCall(params.modelProfiles, 'patch-reviewer', { signal: params.signal, secrets: params.secrets, onUsage: params.onUsage }) : undefined)
@@ -1314,7 +1316,7 @@ export async function generateAndReviewPatch(params: PatchWorkflowParams): Promi
     finding: params.finding, repo: params.repo, reposDir: params.reposDir, authorOutput,
     precomputedApplicability: authorOutput.applicability, backend: params.backend,
     reviewerLlmCall: params.reviewerLlmCall, modelProfiles: params.modelProfiles,
-    signal: params.signal, secrets: params.secrets, onUsage: params.onUsage,
+    signal: params.signal, secrets: params.secrets, onUsage: params.onUsage, runId: params.runId,
   })
 
   let finalStatus: PatchStatus = review.status
@@ -1323,6 +1325,7 @@ export async function generateAndReviewPatch(params: PatchWorkflowParams): Promi
   let patchBrokeHopId: string | null | undefined
   let compositeVerdict: CompositePatchRetestVerdict | null | undefined
   let compositeRetestProof: CompositePatchRetestProof | undefined
+  let labRevision: string | undefined
   const gates = [...review.gates]
 
   if (params.labRetest && finalStatus === 'approved') {
@@ -1336,101 +1339,202 @@ export async function generateAndReviewPatch(params: PatchWorkflowParams): Promi
         try { touchedPaths = parseUnifiedDiff(authorOutput.diff).map(fp => fp.normalizedPath) }
         catch { touchedPaths = authorOutput.applicability?.filesModified ?? [] }
 
-        if (sanitizedRepoDir && existsSync(sanitizedRepoDir)) {
-          scratchDir = mkdtempSync(join(tmpdir(), 'kovo-patch-gate6-work-'))
-          copyRepoTreeWithoutSymlinks(sanitizedRepoDir, scratchDir)
-          applyUnifiedDiffToDirectory(scratchDir, authorOutput.diff)
-          backupDir = mkdtempSync(join(tmpdir(), 'kovo-patch-gate6-backup-'))
-          copyRepoTreeWithoutSymlinks(sanitizedRepoDir, backupDir)
-        }
-
-        await lr.labRunner.rebuildWithPatch(lr.runId, authorOutput.diff, params.signal)
-        rebuildSucceeded = true
-
         const resolvedComposite = resolvePersistedCompositeProofForGate6(lr, params.finding)
         const gate6Trust = deriveGate6EnvelopeTrust(lr, params.finding)
 
         if (resolvedComposite) {
+          labRevision = lr.labRevision ?? `lab:${lr.runId}:${sha256Hex(authorOutput.diff).slice(0, 12)}`
           if (gate6Trust === 'untrusted') {
             dynamicRetestVerdict = 'skipped'; finalStatus = 'withheld'
             compositeVerdict = 'inconclusive'; patchBrokeHopId = null
             dynamicRetestSummary = 'Dynamic composite fix retest withheld (H-5): untrusted replay envelope cannot be verified as fixed.'
             gates[5] = { gate: 6, name: 'dynamic_retest', passed: false, detail: dynamicRetestSummary }
           } else {
-            const proof = await retestCompositeChainPatch({
-              receipt: resolvedComposite.receipt,
-              ...(lr.compositeRunner ? { runner: lr.compositeRunner } : {}),
-              brokerContext: {
-                broker: lr.broker,
-                grant: lr.grant,
-                storage: lr.storage,
-                runId: lr.runId,
-                assignmentId: lr.assignmentId,
+            const sharedBrokerCtx: BrokerCompositeReplayContext = {
+              broker: lr.broker,
+              grant: lr.grant,
+              storage: lr.storage,
+              runId: lr.runId,
+              assignmentId: lr.assignmentId,
+              findingId: params.finding.id,
+              replaySpecId: resolvedComposite.replaySpecId,
+              replaySpec: lr.replaySpec,
+              hopActors: resolvedComposite.hopActors,
+              browser: lr.browser,
+              canaryBroker: lr.canaryBroker,
+              factLog: lr.factLog,
+              labRevision,
+              // R4-H-10: Gate-6 candidate-patch trials MUST NEVER write finding-level retest_runs
+              // or overwrite replay_specs.proof_receipt.
+              persistRetest: false,
+            }
+
+            // R4-H-9: Mandatory unpatched reproduction control BEFORE applying the candidate patch.
+            // Accept "blocked" as "fixed" ONLY after the same runner proves it reproduces the chain
+            // on the pre-patch baseline lab (or an authoritative verified pre-patch proof is supplied).
+            let prePatchProof: CompositePatchRetestProof | null = null
+            if (
+              lr.prePatchReproductionProof
+              && lr.prePatchReproductionProof.verdict === 'still_vulnerable'
+              && lr.prePatchReproductionProof.chainId === resolvedComposite.receipt.chainId
+              && hasValidCompositeProofDigest(lr.prePatchReproductionProof)
+            ) {
+              prePatchProof = lr.prePatchReproductionProof
+            } else {
+              prePatchProof = await retestCompositeChainPatch({
+                receipt: resolvedComposite.receipt,
+                ...(lr.compositeRunner ? { runner: lr.compositeRunner } : {}),
+                brokerContext: sharedBrokerCtx,
+                ...(lr.compositeVerifyOptions ? { verifyOptions: lr.compositeVerifyOptions } : {}),
+                prePatchControlRun: true,
+                targetRevision: `pre-patch:${labRevision}`,
+                secrets: params.secrets,
+                signal: params.signal ?? AbortSignal.timeout(60_000),
+              })
+            }
+
+            if (prePatchProof.verdict !== 'still_vulnerable') {
+              const mappedVerdict: CompositePatchRetestVerdict = prePatchProof.verdict === 'precondition_changed'
+                ? 'precondition_changed'
+                : 'inconclusive'
+              const controlSummary = mappedVerdict === 'precondition_changed'
+                ? `Dynamic composite fix retest inconclusive (precondition_changed on unpatched control): ${prePatchProof.summary}`
+                : `Dynamic composite fix retest inconclusive: pre-patch reproduction control failed to reproduce the chain on the unpatched lab (${prePatchProof.summary})`
+              const baseProof: Omit<CompositePatchRetestProof, 'proofSha256'> = {
+                schemaVersion: 1,
+                retestId: randomUUID(),
+                chainId: resolvedComposite.receipt.chainId,
+                terminalVulnClass: resolvedComposite.receipt.terminalVulnClass,
+                terminalHopId: resolvedComposite.receipt.terminalImpact.terminalHopId,
+                verdict: mappedVerdict,
+                patchClosed: false,
+                patchBrokeHopId: null,
+                brokeCausalEdge: null,
+                brokeReason: null,
+                benignPrefixHops: [],
+                topoOrder: [...prePatchProof.topoOrder],
+                hopResults: [...prePatchProof.hopResults],
+                exchangeIds: [...prePatchProof.exchangeIds],
+                summary: redact(controlSummary, params.secrets),
+                ...(prePatchProof.compositeVerification ? { compositeVerification: prePatchProof.compositeVerification } : {}),
+                targetRevision: labRevision,
+                patchId: proposalId,
+                testedAt: new Date().toISOString(),
+              }
+              compositeRetestProof = { ...baseProof, proofSha256: computeCompositeRetestProofDigest(baseProof) }
+              dynamicRetestVerdict = 'skipped'; finalStatus = 'withheld'
+              compositeVerdict = mappedVerdict; patchBrokeHopId = null
+              dynamicRetestSummary = controlSummary
+              gates[5] = { gate: 6, name: 'dynamic_retest', passed: false, detail: dynamicRetestSummary }
+              persistProposalGate6CompositeArtifact(lr, {
+                patchId: proposalId,
                 findingId: params.finding.id,
                 replaySpecId: resolvedComposite.replaySpecId,
-                hopActors: resolvedComposite.hopActors,
-                persistRetest: true,
-              },
-              ...(lr.compositeVerifyOptions ? { verifyOptions: lr.compositeVerifyOptions } : {}),
-              patchId: proposalId,
-              secrets: params.secrets,
-              signal: params.signal ?? AbortSignal.timeout(60_000),
-            })
-            compositeRetestProof = proof
-            compositeVerdict = proof.verdict
-            patchBrokeHopId = proof.verdict === 'fixed' ? proof.patchBrokeHopId : null
-
-            if (proof.verdict === 'fixed') {
-              const resolvedBaseline = synthesizeGate6BaselineCaller({
-                explicitBaselineCaller: lr.baselineCaller, explicitExpectStatus: lr.baselineExpectStatus,
-                replaySpec: lr.replaySpec, finding: params.finding, storage: lr.storage, runId: lr.runId, grant: lr.grant,
+                labRevision,
+                status: finalStatus,
+                dynamicRetestVerdict,
+                proof: compositeRetestProof,
+                secrets: params.secrets,
               })
-              let baselineStatus: number | null = null, baselineOk = false
-              if (resolvedBaseline) {
-                try {
-                  const baseline = await lr.broker.executeHttp(resolvedBaseline.caller, lr.grant, params.signal ?? AbortSignal.timeout(30_000))
-                  baselineStatus = baseline.status
-                  baselineOk = resolvedBaseline.expectStatus.includes(baseline.status)
-                } catch { baselineOk = false }
+            } else {
+              if (sanitizedRepoDir && existsSync(sanitizedRepoDir)) {
+                scratchDir = mkdtempSync(join(tmpdir(), 'kovo-patch-gate6-work-'))
+                copyRepoTreeWithoutSymlinks(sanitizedRepoDir, scratchDir)
+                applyUnifiedDiffToDirectory(scratchDir, authorOutput.diff)
+                backupDir = mkdtempSync(join(tmpdir(), 'kovo-patch-gate6-backup-'))
+                copyRepoTreeWithoutSymlinks(sanitizedRepoDir, backupDir)
               }
 
-              if (resolvedBaseline && baselineOk) {
-                dynamicRetestVerdict = 'fixed'
-                const tag = resolvedBaseline.source === 'explicit' ? '' : ` [${resolvedBaseline.source}]`
-                dynamicRetestSummary = `Zero-LLM dynamic composite fix retest confirmed fixed at "${proof.patchBrokeHopId ?? 'unknown'}": ${proof.summary}; authorized baseline caller${tag} (${resolvedBaseline.caller.method} ${resolvedBaseline.caller.pathAndQuery}) still HTTP ${baselineStatus}`
-                gates[5] = { gate: 6, name: 'dynamic_retest', passed: true, detail: dynamicRetestSummary }
-              } else if (resolvedBaseline && !baselineOk) {
-                dynamicRetestVerdict = 'skipped'; finalStatus = 'rejected'
-                dynamicRetestSummary = `Composite chain retest reports fixed at "${proof.patchBrokeHopId ?? 'unknown'}", but the authorized baseline caller (${resolvedBaseline.caller.method} ${resolvedBaseline.caller.pathAndQuery}) regressed (HTTP ${baselineStatus ?? 'error'}); patch breaks legitimate traffic.`
+              await lr.labRunner.rebuildWithPatch(lr.runId, authorOutput.diff, params.signal)
+              rebuildSucceeded = true
+
+              const proof = await retestCompositeChainPatch({
+                receipt: resolvedComposite.receipt,
+                ...(lr.compositeRunner ? { runner: lr.compositeRunner } : {}),
+                brokerContext: sharedBrokerCtx,
+                ...(lr.compositeVerifyOptions ? { verifyOptions: lr.compositeVerifyOptions } : {}),
+                prePatchProof,
+                requireUnpatchedControl: true,
+                patchId: proposalId,
+                targetRevision: labRevision,
+                secrets: params.secrets,
+                signal: params.signal ?? AbortSignal.timeout(60_000),
+              })
+              compositeRetestProof = proof
+              compositeVerdict = proof.verdict
+              patchBrokeHopId = proof.verdict === 'fixed' ? proof.patchBrokeHopId : null
+
+              if (proof.verdict === 'fixed') {
+                const resolvedBaseline = synthesizeGate6BaselineCaller({
+                  explicitBaselineCaller: lr.baselineCaller, explicitExpectStatus: lr.baselineExpectStatus,
+                  replaySpec: lr.replaySpec, finding: params.finding, storage: lr.storage, runId: lr.runId, grant: lr.grant,
+                })
+                let baselineStatus: number | null = null, baselineOk = false
+                if (resolvedBaseline) {
+                  try {
+                    const baseline = await lr.broker.executeHttp(resolvedBaseline.caller, lr.grant, params.signal ?? AbortSignal.timeout(30_000))
+                    baselineStatus = baseline.status
+                    baselineOk = resolvedBaseline.expectStatus.includes(baseline.status)
+                  } catch { baselineOk = false }
+                }
+
+                if (resolvedBaseline && baselineOk) {
+                  dynamicRetestVerdict = 'fixed'
+                  const tag = resolvedBaseline.source === 'explicit' ? '' : ` [${resolvedBaseline.source}]`
+                  dynamicRetestSummary = `Zero-LLM dynamic composite fix retest confirmed reproduced → fixed at "${proof.patchBrokeHopId ?? 'unknown'}": ${proof.summary}; authorized baseline caller${tag} (${resolvedBaseline.caller.method} ${resolvedBaseline.caller.pathAndQuery}) still HTTP ${baselineStatus}`
+                  gates[5] = { gate: 6, name: 'dynamic_retest', passed: true, detail: dynamicRetestSummary }
+                } else if (resolvedBaseline && !baselineOk) {
+                  dynamicRetestVerdict = 'skipped'; finalStatus = 'rejected'; patchBrokeHopId = null
+                  dynamicRetestSummary = `Composite chain retest reports fixed at "${proof.patchBrokeHopId ?? 'unknown'}", but the authorized baseline caller (${resolvedBaseline.caller.method} ${resolvedBaseline.caller.pathAndQuery}) regressed (HTTP ${baselineStatus ?? 'error'}); patch breaks legitimate traffic.`
+                  gates[5] = { gate: 6, name: 'dynamic_retest', passed: false, detail: dynamicRetestSummary }
+                } else {
+                  // R4-H-9: Never pass Gate 6 with no baseline caller just because a benign prefix hop exists.
+                  dynamicRetestVerdict = 'skipped'; finalStatus = 'withheld'; patchBrokeHopId = null
+                  dynamicRetestSummary = 'Composite chain retest reports fixed, but Gate 6 is unverified: no safe read-only/idempotent baseline caller could be resolved to prove legitimate traffic still works.'
+                  gates[5] = { gate: 6, name: 'dynamic_retest', passed: false, detail: dynamicRetestSummary }
+                }
+              } else if (proof.verdict === 'still_vulnerable') {
+                dynamicRetestVerdict = 'reproduced'; finalStatus = 'rejected'
+                patchBrokeHopId = null
+                dynamicRetestSummary = `Multi-hop composite chain still reproduced after patch rebuild: ${proof.summary}`
                 gates[5] = { gate: 6, name: 'dynamic_retest', passed: false, detail: dynamicRetestSummary }
-              } else if (proof.benignPrefixHops.length > 0) {
-                dynamicRetestVerdict = 'fixed'
-                dynamicRetestSummary = `Zero-LLM dynamic composite fix retest confirmed fixed at "${proof.patchBrokeHopId ?? 'unknown'}": ${proof.summary}; benign prefix hops preserved (${proof.benignPrefixHops.join(' -> ')})`
-                gates[5] = { gate: 6, name: 'dynamic_retest', passed: true, detail: dynamicRetestSummary }
+              } else if (proof.verdict === 'precondition_changed') {
+                // Fail-closed invariant: precondition/environment drift MUST NEVER be marked 'fixed'.
+                dynamicRetestVerdict = 'skipped'; finalStatus = 'withheld'
+                patchBrokeHopId = null
+                dynamicRetestSummary = `Dynamic composite fix retest inconclusive (precondition_changed): ${proof.summary}`
+                gates[5] = { gate: 6, name: 'dynamic_retest', passed: false, detail: dynamicRetestSummary }
               } else {
                 dynamicRetestVerdict = 'skipped'; finalStatus = 'withheld'
-                dynamicRetestSummary = 'Composite chain retest reports fixed, but Gate 6 is unverified: no safe read-only baseline caller or benign prefix hop succeeded to prove legitimate traffic still works.'
+                patchBrokeHopId = null
+                dynamicRetestSummary = `Dynamic composite fix retest inconclusive: ${proof.summary}`
                 gates[5] = { gate: 6, name: 'dynamic_retest', passed: false, detail: dynamicRetestSummary }
               }
-            } else if (proof.verdict === 'still_vulnerable') {
-              dynamicRetestVerdict = 'reproduced'; finalStatus = 'rejected'
-              patchBrokeHopId = null
-              dynamicRetestSummary = `Multi-hop composite chain still reproduced after patch rebuild: ${proof.summary}`
-              gates[5] = { gate: 6, name: 'dynamic_retest', passed: false, detail: dynamicRetestSummary }
-            } else if (proof.verdict === 'precondition_changed') {
-              // Fail-closed invariant: precondition/environment drift MUST NEVER be marked 'fixed'.
-              dynamicRetestVerdict = 'skipped'; finalStatus = 'withheld'
-              patchBrokeHopId = null
-              dynamicRetestSummary = `Dynamic composite fix retest inconclusive (precondition_changed): ${proof.summary}`
-              gates[5] = { gate: 6, name: 'dynamic_retest', passed: false, detail: dynamicRetestSummary }
-            } else {
-              dynamicRetestVerdict = 'skipped'; finalStatus = 'withheld'
-              patchBrokeHopId = null
-              dynamicRetestSummary = `Dynamic composite fix retest inconclusive: ${proof.summary}`
-              gates[5] = { gate: 6, name: 'dynamic_retest', passed: false, detail: dynamicRetestSummary }
+
+              persistProposalGate6CompositeArtifact(lr, {
+                patchId: proposalId,
+                findingId: params.finding.id,
+                replaySpecId: resolvedComposite.replaySpecId,
+                labRevision,
+                status: finalStatus,
+                dynamicRetestVerdict,
+                proof,
+                secrets: params.secrets,
+              })
             }
           }
         } else {
+          if (sanitizedRepoDir && existsSync(sanitizedRepoDir)) {
+            scratchDir = mkdtempSync(join(tmpdir(), 'kovo-patch-gate6-work-'))
+            copyRepoTreeWithoutSymlinks(sanitizedRepoDir, scratchDir)
+            applyUnifiedDiffToDirectory(scratchDir, authorOutput.diff)
+            backupDir = mkdtempSync(join(tmpdir(), 'kovo-patch-gate6-backup-'))
+            copyRepoTreeWithoutSymlinks(sanitizedRepoDir, backupDir)
+          }
+
+          await lr.labRunner.rebuildWithPatch(lr.runId, authorOutput.diff, params.signal)
+          rebuildSucceeded = true
+
           const retest = await retestReplaySpec({
             spec: lr.replaySpec, broker: lr.broker, browser: lr.browser, canaryBroker: lr.canaryBroker,
             backend: lr.backend, grant: lr.grant, signal: params.signal ?? AbortSignal.timeout(60_000),
@@ -1529,6 +1633,7 @@ export async function generateAndReviewPatch(params: PatchWorkflowParams): Promi
     ...(patchBrokeHopId !== undefined ? { patchBrokeHopId } : {}),
     ...(compositeVerdict !== undefined ? { compositeVerdict } : {}),
     ...(compositeRetestProof ? { compositeRetestProof } : {}),
+    ...(labRevision ? { labRevision } : {}),
     createdAt: now, updatedAt: Date.now(),
   }
 }
@@ -1556,6 +1661,7 @@ export interface CompositeHopReplayResult {
   browserTraces?: readonly HostBrowserTrace[]; asyncPollRecords?: readonly HostAsyncPollRecord[]
   replayedExchangeIds?: readonly string[]; replayedOobEventIds?: readonly string[]; replayedBrowserTraceIds?: readonly string[]
   replayedAblationExchangeIds?: Readonly<Record<string, readonly string[]>>; replayedPollRecordIds?: Readonly<Record<string, string>>
+  reboundValueDigests?: Readonly<Record<string, string>>
   preChainControlExchangeIds?: readonly string[]; postChainReadbackExchangeIds?: readonly string[]
   reason?: string; errorCode?: string; httpStatus?: number | null
 }
@@ -1585,9 +1691,18 @@ export interface BrokerCompositeReplayContext {
   assignmentId?: string
   findingId?: string
   replaySpecId?: string
+  replaySpec?: DeclarativeReplaySpec
+  browser?: ScopedBrowser
+  canaryBroker?: CanaryBroker
+  factLog?: HostFactLog
+  labRevision?: string
   hopActors?: Readonly<Record<string, string | null>>
   hopRequestOverrides?: Readonly<Record<string, Partial<BrokerHttpRequest>>>
-  /** Persist structured patchBrokeHopId + compositeVerdict on retestRuns and replay_specs.proof_receipt (default: true). */
+  /**
+   * Persist authoritative finding-level retest row in `retest_runs` (default: false).
+   * R4-H-10: Ignored whenever `patchId` is set (candidate-patch trials are proposal-scoped
+   * and NEVER write finding-level `retest_runs` or mutate `replay_specs.proof_receipt`).
+   */
   persistRetest?: boolean
   /** Optional callback to record replayed exchanges; returns persisted exchangeId. */
   onExchange?: (ex: BrokerExchangeResult) => string | undefined
@@ -1597,6 +1712,12 @@ export interface RetestCompositeChainParams {
   runner?: CompositePatchReplayRunner
   brokerContext?: BrokerCompositeReplayContext
   verifyOptions?: CompositeVerifyOptions
+  /** Authoritative pre-patch reproduction proof from the same runner (verdict === 'still_vulnerable'). */
+  prePatchProof?: CompositePatchRetestProof
+  /** True when executing the pre-patch reproduction control itself on the unpatched target. */
+  prePatchControlRun?: boolean
+  /** Enforce pre-patch reproduction control before certifying 'fixed' (default: true for broker runs). */
+  requireUnpatchedControl?: boolean
   retestId?: string; targetRevision?: string; patchId?: string; secrets?: readonly NamedSecret[]; signal?: AbortSignal; now?: () => number
 }
 export interface CompositePatchRetestProof {
@@ -1620,8 +1741,8 @@ export interface CompositePatchClosureSummary {
 const TRANSPORT_ERR_RE = /^(?:ECONNREFUSED|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|EPIPE|EHOSTUNREACH|ENETUNREACH|UND_ERR_[A-Z_]+|TIMEOUT|ABORTED|ABORT_ERR|TLS_ERROR|AUTH_SETUP_FAILED)$/i
 const is2xx = (st: number | null | undefined) => typeof st === 'number' && st >= 200 && st < 300
 const isFiniteTs = (ts: unknown): ts is number => typeof ts === 'number' && Number.isFinite(ts) && ts >= 0
-const isTransportOr5xx = (st: number | null | undefined) => st == null || !Number.isFinite(st) || st === 0 || st === 429 || st >= 500
-const isSecurity4xx = (st: number | null | undefined) => typeof st === 'number' && st >= 400 && st < 500 && st !== 429
+const isTransportOr5xx = (st: number | null | undefined) => st == null || !Number.isFinite(st) || st === 0 || st === 408 || st === 429 || st >= 500
+const isSecurity4xx = (st: number | null | undefined) => typeof st === 'number' && st >= 400 && st < 500 && st !== 408 && st !== 429
 
 function canonicalProofJson(v: unknown): string {
   if (v === null || typeof v !== 'object') return JSON.stringify(v)
@@ -1632,8 +1753,11 @@ function canonicalProofJson(v: unknown): string {
 export const computeCompositeRetestProofDigest = (proof: Omit<CompositePatchRetestProof, 'proofSha256'> & { proofSha256?: string }): string =>
   sha256Hex(canonicalProofJson(proof))
 
-export const verifyCompositePatchRetestProofIntegrity = (proof: CompositePatchRetestProof): boolean =>
+const hasValidCompositeProofDigest = (proof: CompositePatchRetestProof): boolean =>
   Boolean(proof && typeof proof.proofSha256 === 'string' && /^[0-9a-f]{64}$/i.test(proof.proofSha256) && proof.proofSha256.toLowerCase() === computeCompositeRetestProofDigest(proof))
+
+export const verifyCompositePatchRetestProofIntegrity = (proof: CompositePatchRetestProof): boolean =>
+  hasValidCompositeProofDigest(proof)
 
 export const toPortablePatchRetestProof = (p: CompositePatchRetestProof): PortableCompositePatchRetestRecord => ({
   retestId: p.retestId, verdict: p.verdict === 'fixed' ? 'fixed' : p.verdict === 'still_vulnerable' ? 'reproduced' : 'inconclusive',
@@ -1754,13 +1878,20 @@ function collectEmitted(entries: readonly HostTranscriptEntry[], oob: readonly H
   return { caps, digests, hasTs }
 }
 
-function checkProducerEdge(edge: CausalEdgeBinding, fromHop: HopReceipt, art: HopArt): { ok: true } | { ok: false; reason: string } {
+function checkProducerEdge(
+  edge: CausalEdgeBinding,
+  fromHop: HopReceipt,
+  art: HopArt,
+  reboundValueDigests?: ReadonlyMap<string, string>,
+): { ok: true } | { ok: false; reason: string } {
   const he = art.entries.filter(e => art.exchangeIds.includes(e.exchangeId)), ho = art.oobEvents.filter(o => art.oobEventIds.includes(o.id)), ht = art.browserTraces.filter(t => art.browserTraceIds.includes(t.id))
   const { caps, digests, hasTs } = collectEmitted(he, ho, ht, [], true)
   if (edge.kind === 'value_binding') {
     if (!hasTs) return { ok: false, reason: `Hop "${fromHop.hopId}" produced no host-timestamped output for value_binding to "${edge.toHopId}".` }
     if (edge.capabilityHandle && !caps.has(edge.capabilityHandle)) return { ok: false, reason: `Hop "${fromHop.hopId}" no longer emits required capability "${edge.capabilityHandle}" for "${edge.toHopId}".` }
-    if (edge.valueDigest && !digests.has(edge.valueDigest.toLowerCase())) return { ok: false, reason: `Hop "${fromHop.hopId}" no longer emits required value digest for "${edge.toHopId}".` }
+    const edgeKey = `${edge.fromHopId}->${edge.toHopId}:${edge.kind}`
+    const expectedDigest = reboundValueDigests?.get(edgeKey) ?? edge.valueDigest?.toLowerCase()
+    if (expectedDigest && !digests.has(expectedDigest)) return { ok: false, reason: `Hop "${fromHop.hopId}" no longer emits required value digest for "${edge.toHopId}".` }
     return { ok: true }
   }
   if (edge.kind === 'derived_crypto_binding') return caps.has(edge.sourceCapabilityId) ? { ok: true } : { ok: false, reason: `Hop "${fromHop.hopId}" no longer emits signing material "${edge.sourceCapabilityId}" for derived_crypto_binding to "${edge.toHopId}".` }
@@ -1777,9 +1908,6 @@ const errCodeOf = (err: unknown): string | undefined => {
 const emptyHopSummary = (hopId: string, surface: HopSurface, outcome: CompositeHopReplaySummary['outcome'], reason?: string, errorCode?: string): CompositeHopReplaySummary =>
   ({ hopId, surface, outcome, httpStatuses: [], exchangeIds: [], oobEventIds: [], browserTraceIds: [], emittedCapabilities: [], consumedCapabilities: [], ...(reason ? { reason } : {}), ...(errorCode ? { errorCode } : {}) })
 
-const REPLAY_SKIP_HEADERS = new Set([
-  'authorization', 'cookie', 'host', 'content-length', 'connection', 'transfer-encoding', 'accept-encoding', 'x-api-key',
-])
 const ROUTE_DRIFT_MARKERS = [
   'cannot get ', 'cannot post ', 'cannot put ', 'cannot patch ', 'cannot delete ',
   'route_not_found', 'endpoint_moved', 'schema_changed', 'fixture_missing',
@@ -1798,27 +1926,215 @@ function normalizeReplayHttpMethod(raw: string | undefined): HttpMethod {
   return VALID_HTTP_METHODS.has(upper) ? upper : 'GET'
 }
 
-function sanitizeStoredReplayHeaders(
-  rawHeaders: Record<string, string> | undefined,
-  hasPersona: boolean,
-): Record<string, string> | undefined {
-  if (!rawHeaders) return undefined
+const TRANSPORT_SKIP_HEADERS = new Set([
+  'host', 'content-length', 'connection', 'transfer-encoding', 'accept-encoding',
+])
+const PERSONA_AUTH_HEADERS = new Set([
+  'authorization', 'cookie', 'x-api-key',
+])
+
+function rebuildStoredReplayHeaders(params: {
+  rawHeaders: Readonly<Record<string, string>> | undefined
+  personaHandle: string | null
+  grant: Grant
+  overrideHeaders?: Record<string, string>
+}): { headers: Record<string, string> | undefined; redactedHeaders: string[] } {
+  if (params.overrideHeaders) {
+    const redactedHeaders = Object.entries(params.overrideHeaders)
+      .filter(([, v]) => hasVaultScrubbedToken(v))
+      .map(([k]) => k)
+    return {
+      headers: Object.keys(params.overrideHeaders).length > 0 ? { ...params.overrideHeaders } : undefined,
+      redactedHeaders,
+    }
+  }
+  if (!params.rawHeaders) return { headers: undefined, redactedHeaders: [] }
+  const persona = params.personaHandle ? params.grant.personas?.get(params.personaHandle) : undefined
+  const personaHeaderLower = persona?.headerName?.trim().toLowerCase() || ''
   const out: Record<string, string> = {}
-  for (const [k, v] of Object.entries(rawHeaders)) {
+  const redactedHeaders: string[] = []
+  for (const [k, v] of Object.entries(params.rawHeaders)) {
     const lk = k.trim().toLowerCase()
-    if (!lk || !v || v.includes('[redacted:')) continue
-    if (REPLAY_SKIP_HEADERS.has(lk) && (hasPersona || lk === 'host' || lk === 'content-length' || lk === 'connection' || lk === 'transfer-encoding' || lk === 'accept-encoding')) {
+    if (!lk || !v) continue
+    if (TRANSPORT_SKIP_HEADERS.has(lk)) continue
+    const isPersonaSuppliedAuth = Boolean(persona) && (PERSONA_AUTH_HEADERS.has(lk) || (personaHeaderLower !== '' && lk === personaHeaderLower))
+    if (isPersonaSuppliedAuth) continue
+    if (hasVaultScrubbedToken(v)) {
+      redactedHeaders.push(k)
       continue
     }
     out[k] = v
   }
-  return Object.keys(out).length > 0 ? out : undefined
+  return { headers: Object.keys(out).length > 0 ? out : undefined, redactedHeaders }
 }
 
 function tryParseJsonBody(body: string): unknown {
   const trimmed = body.trim()
   if (!trimmed || (trimmed[0] !== '{' && trimmed[0] !== '[')) return undefined
   try { return JSON.parse(trimmed) } catch { return undefined }
+}
+
+interface ExtractedSlotToken {
+  source: 'json' | 'header' | 'body'
+  path: string
+  keyNorm: string
+  value: string
+  digest: string
+}
+
+function normalizeSlotName(raw: string): string {
+  return raw.toLowerCase().replace(/[^a-z0-9]/g, '')
+}
+
+function extractResponseSlotTokens(
+  body: string,
+  json: unknown,
+  headers: Readonly<Record<string, string>>,
+): ExtractedSlotToken[] {
+  const out: ExtractedSlotToken[] = []
+  const seen = new Set<string>()
+  const push = (source: ExtractedSlotToken['source'], path: string, value: string) => {
+    const trimmed = value.trim()
+    if (!trimmed || trimmed.length > 2048 || out.length >= 256) return
+    const key = `${source}:${path}:${trimmed}`
+    if (seen.has(key)) return
+    seen.add(key)
+    const leafName = path.split('.').pop() ?? path
+    out.push({ source, path, keyNorm: normalizeSlotName(leafName), value: trimmed, digest: sha256Hex(trimmed) })
+  }
+  const walk = (v: unknown, prefix: string, depth: number) => {
+    if (depth > 5 || v == null || out.length >= 256) return
+    if (typeof v === 'string') { if (prefix) push('json', prefix, v) }
+    else if (typeof v === 'number' || typeof v === 'boolean') { if (prefix) push('json', prefix, String(v)) }
+    else if (Array.isArray(v)) {
+      for (let i = 0; i < Math.min(v.length, 32); i += 1) walk(v[i], prefix ? `${prefix}.${i}` : String(i), depth + 1)
+    } else if (typeof v === 'object') {
+      for (const [k, child] of Object.entries(v as Record<string, unknown>)) {
+        walk(child, prefix ? `${prefix}.${k}` : k, depth + 1)
+      }
+    }
+  }
+  if (json !== undefined) walk(json, '', 0)
+  for (const [hk, hv] of Object.entries(headers)) {
+    const lk = hk.trim().toLowerCase()
+    const tv = hv.trim()
+    if (!lk || !tv) continue
+    push('header', lk, tv)
+    const m = /^(?:Bearer|Basic|Token|ApiKey)\s+(.+)$/i.exec(tv)
+    if (m?.[1]) push('header', `${lk}:token`, m[1].trim())
+    if (tv.includes('=')) {
+      for (const part of tv.split(';')) {
+        const eq = part.indexOf('=')
+        if (eq > 0 && part.slice(eq + 1).trim()) {
+          push('header', `${lk}:${part.slice(0, eq).trim().toLowerCase()}`, part.slice(eq + 1).trim())
+        }
+      }
+    }
+  }
+  if (json === undefined && body.trim() && body.trim().length <= 2048) {
+    push('body', '$body', body.trim())
+  }
+  return out
+}
+
+function readSlotValueFromResponse(
+  slot: { source: 'json' | 'header' | 'body'; path: string },
+  body: string,
+  json: unknown,
+  headers: Readonly<Record<string, string>>,
+): string | null | undefined {
+  if (slot.source === 'json') {
+    if (!json || typeof json !== 'object') return undefined
+    let cur: unknown = json
+    for (const seg of slot.path.split('.')) {
+      if (cur == null || typeof cur !== 'object') return undefined
+      if (Array.isArray(cur)) {
+        const idx = Number(seg)
+        if (!Number.isInteger(idx) || idx < 0 || idx >= cur.length) return undefined
+        cur = cur[idx]
+      } else {
+        if (!(seg in (cur as Record<string, unknown>))) return undefined
+        cur = (cur as Record<string, unknown>)[seg]
+      }
+    }
+    if (cur === null || cur === undefined || cur === false) return null
+    if (typeof cur === 'string') return cur
+    if (typeof cur === 'number' || typeof cur === 'boolean') return String(cur)
+    return undefined
+  }
+  if (slot.source === 'header') {
+    const colon = slot.path.indexOf(':')
+    const hName = colon >= 0 ? slot.path.slice(0, colon) : slot.path
+    const subKey = colon >= 0 ? slot.path.slice(colon + 1) : null
+    const raw = Object.entries(headers).find(([k]) => k.toLowerCase() === hName)?.[1]
+    if (raw === undefined) return undefined
+    if (!subKey) return raw
+    if (subKey === 'token') {
+      const m = /^(?:Bearer|Basic|Token|ApiKey)\s+(.+)$/i.exec(raw.trim())
+      return m?.[1]?.trim() ?? raw.trim()
+    }
+    for (const part of raw.split(';')) {
+      const eq = part.indexOf('=')
+      if (eq > 0 && part.slice(0, eq).trim().toLowerCase() === subKey) return part.slice(eq + 1).trim()
+    }
+    return undefined
+  }
+  return body.trim() || null
+}
+
+function isSanitizedTokenString(val: string | null | undefined): boolean {
+  if (val === null || val === undefined) return true
+  const t = val.trim().toLowerCase()
+  return !t || t === '[redacted]' || t === 'redacted' || t === '***' || hasVaultScrubbedToken(val)
+}
+
+function findReplaySpecStepBody(
+  spec: DeclarativeReplaySpec | undefined,
+  method: string,
+  pathAndQuery: string,
+): string | undefined {
+  if (!spec) return undefined
+  const m = method.toUpperCase()
+  const normPath = pathAndQuery.split('?')[0] ?? pathAndQuery
+  if ('steps' in spec && Array.isArray(spec.steps)) {
+    for (const st of spec.steps) {
+      if (!('request' in st) || !st.request) continue
+      const req = st.request
+      if (req.method.toUpperCase() !== m) continue
+      const stPath = req.pathAndQuery.split('?')[0] ?? req.pathAndQuery
+      if (req.pathAndQuery === pathAndQuery || stPath === normPath) {
+        if (typeof req.textBody === 'string') return req.textBody
+        if (req.jsonBody !== undefined) return JSON.stringify(req.jsonBody)
+      }
+    }
+  }
+  if (spec.recipe?.args && typeof spec.recipe.args === 'object') {
+    const args = spec.recipe.args as Record<string, unknown>
+    const argPath = typeof args.pathAndQuery === 'string' ? args.pathAndQuery.split('?')[0] : ''
+    if (argPath && argPath === normPath && args.body !== undefined) {
+      return typeof args.body === 'string' ? args.body : JSON.stringify(args.body)
+    }
+  }
+  return undefined
+}
+
+function replaceAllToken(text: string, from: string, to: string, urlEncode = false): { value: string; changed: boolean } {
+  if (!from || from === to) return { value: text, changed: false }
+  let out = text
+  let changed = false
+  if (out.includes(from)) {
+    out = out.split(from).join(to)
+    changed = true
+  }
+  if (urlEncode) {
+    const encFrom = encodeURIComponent(from)
+    const encTo = encodeURIComponent(to)
+    if (encFrom !== from && out.includes(encFrom)) {
+      out = out.split(encFrom).join(encTo)
+      changed = true
+    }
+  }
+  return { value: out, changed }
 }
 
 function buildActorDescriptor(grant: Grant, personaHandle: string | null): ImpactStep['actor'] {
@@ -1891,6 +2207,27 @@ function isCapabilityValueSanitized(json: unknown, body: string, capHandle: stri
   return false
 }
 
+interface OriginalValueSlot {
+  edgeKey: string
+  capabilityHandle?: string
+  originalValue: string
+  originalDigest: string
+  slotSource: 'json' | 'header' | 'body'
+  slotPath: string
+  appearsInConsumer: boolean
+}
+
+interface LiveReboundValue {
+  edgeKey: string
+  capabilityHandle?: string
+  originalValue: string | null
+  originalDigest: string | null
+  freshValue: string
+  freshDigest: string
+  slotPath: string
+  appearsInConsumer: boolean
+}
+
 function inferEmittedCapabilitiesForHop(
   hop: HopReceipt,
   outgoingEdges: readonly CausalEdgeBinding[],
@@ -1898,35 +2235,113 @@ function inferEmittedCapabilitiesForHop(
   body: string,
   json: unknown,
   respHeaders: Record<string, string>,
-): string[] {
-  if (!is2xx(status)) return []
+  origSlotsByEdge: ReadonlyMap<string, OriginalValueSlot>,
+): {
+  emitted: string[]
+  reboundByEdge: Map<string, LiveReboundValue>
+  observedDigests: string[]
+  unresolvedFreshValueReason: string | null
+} {
+  const reboundByEdge = new Map<string, LiveReboundValue>()
+  const observedDigests: string[] = []
+  if (!is2xx(status)) return { emitted: [], reboundByEdge, observedDigests, unresolvedFreshValueReason: null }
+
   const declared = new Set<string>(hop.producedCapabilities)
   const digestRequiredByCap = new Map<string, string>()
+  const tokens = extractResponseSlotTokens(body, json, respHeaders)
+  const leafDigests = new Set<string>(tokens.map(t => t.digest))
+  if (body.trim()) leafDigests.add(sha256Hex(body.trim()))
+
+  const reboundCapOk = new Set<string>()
+  const sanitizedCap = new Set<string>()
+  let unresolvedFreshValueReason: string | null = null
+
   for (const edge of outgoingEdges) {
-    if (edge.kind === 'value_binding' && edge.capabilityHandle) {
-      declared.add(edge.capabilityHandle)
-      if (edge.valueDigest) digestRequiredByCap.set(edge.capabilityHandle, edge.valueDigest.toLowerCase())
+    if (edge.kind === 'value_binding') {
+      const edgeKey = `${edge.fromHopId}->${edge.toHopId}:${edge.kind}`
+      if (edge.capabilityHandle) {
+        declared.add(edge.capabilityHandle)
+        if (edge.valueDigest) digestRequiredByCap.set(edge.capabilityHandle, edge.valueDigest.toLowerCase())
+      }
+      const origSlot = origSlotsByEdge.get(edgeKey)
+      let matchedToken: { value: string; digest: string; path: string } | null = null
+      let explicitlySanitized = false
+
+      if (origSlot) {
+        const freshRaw = readSlotValueFromResponse({ source: origSlot.slotSource, path: origSlot.slotPath }, body, json, respHeaders)
+        if (freshRaw === null || (typeof freshRaw === 'string' && isSanitizedTokenString(freshRaw))) {
+          explicitlySanitized = true
+        } else if (typeof freshRaw === 'string') {
+          matchedToken = { value: freshRaw.trim(), digest: sha256Hex(freshRaw.trim()), path: origSlot.slotPath }
+        } else if (edge.valueDigest && leafDigests.has(edge.valueDigest.toLowerCase())) {
+          const hit = tokens.find(t => t.digest === edge.valueDigest!.toLowerCase())
+          if (hit) matchedToken = { value: hit.value, digest: hit.digest, path: hit.path }
+        } else {
+          // Field completely omitted from JSON/headers after patch!
+          explicitlySanitized = true
+        }
+      } else {
+        // No original exchange stored for producer; match by exact digest or capability slot name.
+        if (edge.valueDigest && leafDigests.has(edge.valueDigest.toLowerCase())) {
+          const hit = tokens.find(t => t.digest === edge.valueDigest!.toLowerCase())
+          if (hit && !isSanitizedTokenString(hit.value)) matchedToken = { value: hit.value, digest: hit.digest, path: hit.path }
+        }
+        if (!matchedToken && edge.capabilityHandle) {
+          const capSlot = normalizeSlotName(edge.capabilityHandle.split(':').pop() ?? '')
+          if (capSlot.length >= 3) {
+            const slotHit = tokens.find(t => t.keyNorm === capSlot || t.keyNorm.endsWith(capSlot) || capSlot.endsWith(t.keyNorm))
+            if (slotHit) {
+              if (isSanitizedTokenString(slotHit.value)) explicitlySanitized = true
+              else matchedToken = { value: slotHit.value, digest: slotHit.digest, path: slotHit.path }
+            }
+          }
+        }
+        if (!matchedToken && !explicitlySanitized && edge.valueDigest) {
+          if (edge.capabilityHandle && isCapabilityValueSanitized(json, body, edge.capabilityHandle)) {
+            explicitlySanitized = true
+          } else if (tokens.length > 0) {
+            // Producer returned 2xx with non-sanitized data whose digest changed (likely a fresh nonce),
+            // but we have no original producer exchange to map the slot — fail closed as inconclusive!
+            unresolvedFreshValueReason = `Hop "${hop.hopId}" returned HTTP ${status} with fresh output that does not match stored valueDigest and cannot be structurally re-bound without host factLog/original producer capture.`
+          }
+        }
+      }
+
+      if (matchedToken) {
+        observedDigests.push(matchedToken.digest)
+        reboundByEdge.set(edgeKey, {
+          edgeKey,
+          capabilityHandle: edge.capabilityHandle,
+          originalValue: origSlot?.originalValue ?? null,
+          originalDigest: origSlot?.originalDigest ?? (edge.valueDigest?.toLowerCase() ?? null),
+          freshValue: matchedToken.value,
+          freshDigest: matchedToken.digest,
+          slotPath: matchedToken.path,
+          appearsInConsumer: origSlot?.appearsInConsumer ?? Boolean(edge.valueDigest),
+        })
+        if (edge.capabilityHandle) reboundCapOk.add(edge.capabilityHandle)
+      } else if (explicitlySanitized && edge.capabilityHandle) {
+        sanitizedCap.add(edge.capabilityHandle)
+      }
     } else if (edge.kind === 'derived_crypto_binding') {
       declared.add(edge.sourceCapabilityId)
     }
   }
-  if (declared.size === 0) return []
-  const leafDigests = new Set<string>()
-  if (digestRequiredByCap.size > 0) {
-    const leaves = new Set<string>()
-    collectLeafTokens(json, leaves)
-    collectHdrTokens(respHeaders, leaves)
-    if (body.trim()) leaves.add(body.trim())
-    for (const leaf of leaves) leafDigests.add(sha256Hex(leaf))
-  }
+
+  if (declared.size === 0) return { emitted: [], reboundByEdge, observedDigests, unresolvedFreshValueReason }
   const emitted: string[] = []
   for (const cap of declared) {
+    if (sanitizedCap.has(cap)) continue
+    if (reboundCapOk.has(cap)) {
+      emitted.push(cap)
+      continue
+    }
     const requiredDigest = digestRequiredByCap.get(cap)
     if (requiredDigest && !leafDigests.has(requiredDigest)) continue
     if (isCapabilityValueSanitized(json, body, cap)) continue
     emitted.push(cap)
   }
-  return emitted
+  return { emitted, reboundByEdge, observedDigests, unresolvedFreshValueReason }
 }
 
 function resolvePersistedCompositeProofForGate6(
@@ -1989,8 +2404,8 @@ function createBrokerCompositePatchReplayRunner(
   }
   const grantOpts = buildCompositeVerifyOptionsFromGrant(ctx.grant)
   const defaultAttackerPersona = grantOpts?.attackerPersonas?.[0] ?? null
-  const cachedOrigExchanges = new Map<string, BrokerExchange | null>()
-  const lookupOriginalExchange = (exId: string): BrokerExchange | null => {
+  const cachedOrigExchanges = new Map<string, (BrokerExchange & { body: string }) | null>()
+  const lookupOriginalExchange = (exId: string): (BrokerExchange & { body: string }) | null => {
     if (cachedOrigExchanges.has(exId)) return cachedOrigExchanges.get(exId) ?? null
     if (!ctx.storage || !ctx.runId) {
       cachedOrigExchanges.set(exId, null)
@@ -2003,6 +2418,84 @@ function createBrokerCompositePatchReplayRunner(
     } catch {
       cachedOrigExchanges.set(exId, null)
       return null
+    }
+  }
+  const lookupFact = (exId: string): HostExchangeFact | null => ctx.factLog?.getExchange(exId) ?? null
+
+  const liveRebindingsByEdge = new Map<string, LiveReboundValue>()
+  const origSlotsByEdge = new Map<string, OriginalValueSlot>()
+  const cryptoMaterialChangedEdges = new Set<string>()
+  const origDerivedTokensByEdge = new Map<string, { slotSource: 'json' | 'header' | 'body'; slotPath: string; originalValue: string }>()
+  let analyzedReceiptChainId: string | null = null
+
+  const ensureOriginalEdgeAnalysis = (receipt: CompositeProofReceipt) => {
+    if (analyzedReceiptChainId === receipt.chainId) return
+    analyzedReceiptChainId = receipt.chainId
+    const hopsById = new Map(receipt.hops.map(h => [h.hopId, h]))
+    for (const edge of receipt.causalEdges) {
+      const edgeKey = `${edge.fromHopId}->${edge.toHopId}:${edge.kind}`
+      const fromHop = hopsById.get(edge.fromHopId)
+      const toHop = hopsById.get(edge.toHopId)
+      const srcExId = (edge.kind === 'value_binding' ? edge.sourceExchangeId : undefined) ?? fromHop?.exchangeIds[0]
+      const tgtExId = (edge.kind === 'value_binding' ? edge.targetExchangeId : undefined) ?? toHop?.exchangeIds[0]
+      const srcFact = srcExId ? lookupFact(srcExId) : null
+      const srcRow = srcExId ? lookupOriginalExchange(srcExId) : null
+      const tgtFact = tgtExId ? lookupFact(tgtExId) : null
+      const tgtRow = tgtExId ? lookupOriginalExchange(tgtExId) : null
+      const srcBody = srcFact?.rawResponseBody ?? srcRow?.body ?? ''
+      const srcHeaders = srcFact?.responseHeaders ?? srcRow?.respHeaders ?? {}
+      const srcJson = tryParseJsonBody(srcBody)
+      const srcTokens = extractResponseSlotTokens(srcBody, srcJson, srcHeaders)
+      if (srcTokens.length === 0) continue
+
+      const tgtTextParts: string[] = []
+      if (tgtFact?.pathAndQuery) tgtTextParts.push(tgtFact.pathAndQuery)
+      else if (tgtRow?.pathAndQuery) tgtTextParts.push(tgtRow.pathAndQuery)
+      if (tgtFact?.rawRequestBody) tgtTextParts.push(tgtFact.rawRequestBody)
+      for (const hv of Object.values(tgtFact?.requestHeaders ?? tgtRow?.reqHeaders ?? {})) tgtTextParts.push(hv)
+      const tgtText = tgtTextParts.join('\n')
+
+      const tokenInConsumer = (val: string): boolean => {
+        if (val.length < 4 || !tgtText) return false
+        if (tgtText.includes(val)) return true
+        const enc = encodeURIComponent(val)
+        return enc !== val && tgtText.includes(enc)
+      }
+
+      if (edge.kind === 'value_binding') {
+        let picked: ExtractedSlotToken | undefined
+        if (edge.valueDigest) {
+          picked = srcTokens.find(t => t.digest === edge.valueDigest!.toLowerCase())
+        }
+        if (!picked) {
+          picked = srcTokens.find(t => t.value.length >= 6 && tokenInConsumer(t.value))
+        }
+        if (!picked && edge.capabilityHandle) {
+          const capSlot = normalizeSlotName(edge.capabilityHandle.split(':').pop() ?? '')
+          if (capSlot.length >= 3) {
+            picked = srcTokens.find(t => t.keyNorm === capSlot || t.keyNorm.endsWith(capSlot) || capSlot.endsWith(t.keyNorm))
+          }
+        }
+        if (picked) {
+          origSlotsByEdge.set(edgeKey, {
+            edgeKey,
+            capabilityHandle: edge.capabilityHandle,
+            originalValue: picked.value,
+            originalDigest: picked.digest,
+            slotSource: picked.source,
+            slotPath: picked.path,
+            appearsInConsumer: tokenInConsumer(picked.value),
+          })
+        }
+      } else if (edge.kind === 'derived_crypto_binding') {
+        const capSlot = normalizeSlotName(edge.sourceCapabilityId.split(':').pop() ?? '')
+        const picked = capSlot.length >= 3
+          ? srcTokens.find(t => t.keyNorm === capSlot || t.keyNorm.endsWith(capSlot) || capSlot.endsWith(t.keyNorm))
+          : undefined
+        if (picked) {
+          origDerivedTokensByEdge.set(edgeKey, { slotSource: picked.source, slotPath: picked.path, originalValue: picked.value })
+        }
+      }
     }
   }
 
@@ -2044,15 +2537,19 @@ function createBrokerCompositePatchReplayRunner(
     res: BrokerExchangeResult
     arm: ImpactStep['arm']
     personaHandle: string | null
+    requestBody?: string
     evidenceRole?: ImpactStep['evidenceRole']
     replayAttempt?: HostTranscriptEntry['replayAttempt']
     entityId?: string
     correlationIds?: string[]
     emittedCapabilities?: string[]
     consumedCapabilities?: string[]
+    observedResponseDigests?: string[]
+    injectedRequestDigests?: string[]
     cryptoAttestations?: HostTranscriptEntry['cryptoAttestations']
   }): HostTranscriptEntry => {
     const json = tryParseJsonBody(params.res.body)
+    const reqJson = params.requestBody !== undefined ? tryParseJsonBody(params.requestBody) : undefined
     const persona = params.personaHandle ? ctx.grant.personas?.get(params.personaHandle) : undefined
     const step: ImpactStep = {
       id: params.exchangeId,
@@ -2064,6 +2561,8 @@ function createBrokerCompositePatchReplayRunner(
       route: params.res.pathAndQuery.split('?')[0] || '/',
       ...(json !== undefined ? { json } : {}),
       ...(params.res.body ? { body: params.res.body } : {}),
+      ...(reqJson !== undefined ? { requestJson: reqJson } : {}),
+      ...(params.requestBody !== undefined ? { requestBody: params.requestBody } : {}),
       ...(Object.keys(params.res.reqHeaders).length ? { requestHeaders: params.res.reqHeaders } : {}),
       ...(Object.keys(params.res.respHeaders).length ? { responseHeaders: params.res.respHeaders } : {}),
       ...(params.evidenceRole ? { evidenceRole: params.evidenceRole } : {}),
@@ -2081,6 +2580,8 @@ function createBrokerCompositePatchReplayRunner(
       ...(params.correlationIds?.length ? { correlationIds: params.correlationIds } : {}),
       ...(params.emittedCapabilities?.length ? { emittedCapabilities: params.emittedCapabilities } : {}),
       ...(params.consumedCapabilities?.length ? { consumedCapabilities: params.consumedCapabilities } : {}),
+      ...(params.observedResponseDigests?.length ? { observedResponseDigests: [...new Set(params.observedResponseDigests)] } : {}),
+      ...(params.injectedRequestDigests?.length ? { injectedRequestDigests: [...new Set(params.injectedRequestDigests)] } : {}),
       ...(params.cryptoAttestations?.length ? { cryptoAttestations: params.cryptoAttestations } : {}),
     }
     return { ...base, hostSignature: signHostRecord(base, signingKey) }
@@ -2088,6 +2589,7 @@ function createBrokerCompositePatchReplayRunner(
 
   return {
     async preparePreconditions({ receipt, signal }) {
+      ensureOriginalEdgeAnalysis(receipt)
       const missingPersonas = new Set<string>()
       const checkPersona = (handle: string | null | undefined) => {
         if (!handle || !handle.trim()) return
@@ -2098,6 +2600,8 @@ function createBrokerCompositePatchReplayRunner(
       for (const hop of receipt.hops) {
         checkPersona(ctx.hopActors?.[hop.hopId])
         for (const exId of hop.exchangeIds) {
+          const fact = lookupFact(exId)
+          if (fact?.actor) checkPersona(fact.actor)
           const orig = lookupOriginalExchange(exId)
           if (orig?.personaHandle) checkPersona(orig.personaHandle)
         }
@@ -2113,15 +2617,33 @@ function createBrokerCompositePatchReplayRunner(
       const entries: HostTranscriptEntry[] = []
       const preCtrlIds: string[] = []
       for (const ctrlId of receipt.terminalImpact.preChainControlExchangeIds) {
+        const fact = lookupFact(ctrlId)
         const orig = lookupOriginalExchange(ctrlId)
-        if (!orig) continue
-        const persona = orig.personaHandle ?? defaultAttackerPersona
+        if (!fact && !orig) continue
+        const origin = fact?.origin ?? orig!.origin
+        const method = normalizeReplayHttpMethod(fact?.method ?? orig!.method)
+        const pathAndQuery = fact?.pathAndQuery ?? orig!.pathAndQuery
+        const persona = fact?.actor ?? orig?.personaHandle ?? defaultAttackerPersona
+        const { headers, redactedHeaders } = rebuildStoredReplayHeaders({
+          rawHeaders: fact?.requestHeaders ?? orig?.reqHeaders,
+          personaHandle: persona,
+          grant: ctx.grant,
+        })
+        if (redactedHeaders.length > 0 || hasVaultScrubbedToken(pathAndQuery)) {
+          return {
+            status: 'inconclusive',
+            errorCode: 'REDACTED_CONTROL_UNAVAILABLE',
+            reason: `Pre-chain control exchange "${ctrlId}" contains redacted request material unavailable in host factLog.`,
+          }
+        }
+        const body = fact?.rawRequestBody ?? findReplaySpecStepBody(ctx.replaySpec, method, pathAndQuery)
         const req: BrokerHttpRequest = {
-          origin: orig.origin,
-          method: normalizeReplayHttpMethod(orig.method),
-          pathAndQuery: orig.pathAndQuery,
+          origin,
+          method,
+          pathAndQuery,
           ...(persona ? { persona } : {}),
-          headers: sanitizeStoredReplayHeaders(orig.reqHeaders, Boolean(persona)),
+          ...(headers ? { headers } : {}),
+          ...(body !== undefined && body !== null ? { body } : {}),
           followRedirects: false,
           sessionGroupRole: 'control',
           ...(ctx.runId ? { runId: ctx.runId } : {}),
@@ -2145,20 +2667,37 @@ function createBrokerCompositePatchReplayRunner(
             reason: `Pre-chain control returned HTTP ${res.status}`,
           }
         }
-        if (is2xx(orig.status)) {
-          const drift = detectHttpPreconditionDrift({ status: res.status, body: res.body, isTerminalHop: false, hopIndex: 0, originalStatus: orig.status })
+        if (res.status === 401 && persona) {
+          return {
+            status: 'auth_setup_failed',
+            httpStatus: res.status,
+            errorCode: 'SESSION_DRIFTED',
+            reason: `Authenticated pre-chain control returned HTTP 401 (session drifted for persona "${persona}").`,
+          }
+        }
+        const origStatus = fact?.status ?? orig?.status ?? null
+        if (origStatus !== null && (origStatus === 401 || origStatus === 403 || origStatus === 404) && is2xx(res.status)) {
+          return {
+            status: 'precondition_changed',
+            httpStatus: res.status,
+            errorCode: 'CONTROL_STATE_DRIFT',
+            reason: `Pre-chain denied control ${method} ${pathAndQuery} returned HTTP ${res.status} instead of expected denial (HTTP ${origStatus}); target state drifted.`,
+          }
+        }
+        if (is2xx(origStatus)) {
+          const drift = detectHttpPreconditionDrift({ status: res.status, body: res.body, isTerminalHop: false, hopIndex: 0, originalStatus: origStatus })
           if (drift) {
             return {
               status: 'precondition_changed',
               httpStatus: res.status,
               errorCode: 'PRECONDITION_CHANGED',
-              reason: `Pre-chain control ${orig.method} ${orig.pathAndQuery}: ${drift}`,
+              reason: `Pre-chain control ${method} ${pathAndQuery}: ${drift}`,
             }
           }
         }
         const newId = recordReplayedExchange(res, 'prectrl')
         preCtrlIds.push(newId)
-        entries.push(buildSignedEntry({ exchangeId: newId, res, arm: 'control', personaHandle: persona, replayAttempt: 'mode_a' }))
+        entries.push(buildSignedEntry({ exchangeId: newId, res, arm: 'control', personaHandle: persona, ...(body ? { requestBody: body } : {}), replayAttempt: 'mode_a' }))
       }
       return {
         status: 'ok',
@@ -2168,13 +2707,49 @@ function createBrokerCompositePatchReplayRunner(
     },
 
     async replayHop(hopCtx) {
+      ensureOriginalEdgeAnalysis(hopCtx.receipt)
       const { receipt, hop, hopIndex, incomingEdges, outgoingEdges, availableCapabilities, signal } = hopCtx
       const isTerminalHop = hop.hopId === receipt.terminalImpact.terminalHopId
       const entries: HostTranscriptEntry[] = []
+      const oobEvents: HostOobEvent[] = []
+      const browserTraces: HostBrowserTrace[] = []
       const replayedExchangeIds: string[] = []
+      const replayedOobEventIds: string[] = []
+      const replayedBrowserTraceIds: string[] = []
       const asyncPollRecords: HostAsyncPollRecord[] = []
       const ablationByEdge: Record<string, string[]> = {}
       const pollByEdge: Record<string, string> = {}
+      const reboundValueDigests: Record<string, string> = {}
+
+      const needsBrowser = hop.surface === 'browser'
+        || hop.browserTraceIds.length > 0
+        || incomingEdges.some(e => e.kind === 'async_pivot_binding' && e.channel === 'browser_trace')
+        || outgoingEdges.some(e => e.kind === 'async_pivot_binding' && e.channel === 'browser_trace')
+      const needsOob = hop.oobEventIds.length > 0
+        || incomingEdges.some(e => e.kind === 'async_pivot_binding' && e.channel === 'oob_relay')
+        || outgoingEdges.some(e => e.kind === 'async_pivot_binding' && e.channel === 'oob_relay')
+
+      if (hop.surface === 'ws' || hop.surface === 'sse') {
+        return {
+          outcome: 'inconclusive',
+          errorCode: 'UNREPLAYABLE_SURFACE',
+          reason: `Hop "${hop.hopId}" uses surface "${hop.surface}" which cannot be faithfully replayed via HTTP broker; failing closed.`,
+        }
+      }
+      if (needsBrowser && !ctx.browser) {
+        return {
+          outcome: 'inconclusive',
+          errorCode: 'UNREPLAYABLE_BROWSER_HOP',
+          reason: `Hop "${hop.hopId}" requires ScopedBrowser execution, which is unavailable; failing closed as inconclusive.`,
+        }
+      }
+      if (needsOob && !ctx.canaryBroker) {
+        return {
+          outcome: 'inconclusive',
+          errorCode: 'UNREPLAYABLE_OOB_HOP',
+          reason: `Hop "${hop.hopId}" requires CanaryBroker OOB execution, which is unavailable; failing closed as inconclusive.`,
+        }
+      }
 
       // 1) Replay stored state_transition_binding ablation controls when available.
       for (const edge of incomingEdges) {
@@ -2182,16 +2757,29 @@ function createBrokerCompositePatchReplayRunner(
         const edgeKey = `${edge.fromHopId}->${edge.toHopId}:${edge.kind}`
         const replayedAblations: string[] = []
         for (const abId of edge.ablationExchangeIds) {
+          const abFact = lookupFact(abId)
           const orig = lookupOriginalExchange(abId)
-          if (!orig) continue
-          const persona = orig.personaHandle ?? defaultAttackerPersona
+          if (!abFact && !orig) continue
+          const persona = abFact?.actor ?? orig?.personaHandle ?? defaultAttackerPersona
+          const abMethod = normalizeReplayHttpMethod(abFact?.method ?? orig!.method)
+          const abPath = abFact?.pathAndQuery ?? orig!.pathAndQuery
+          const { headers: abHeaders, redactedHeaders } = rebuildStoredReplayHeaders({
+            rawHeaders: abFact?.requestHeaders ?? orig?.reqHeaders,
+            personaHandle: persona,
+            grant: ctx.grant,
+          })
+          if (redactedHeaders.length > 0 || hasVaultScrubbedToken(abPath)) {
+            return { outcome: 'inconclusive', errorCode: 'REDACTED_ABLATION_UNAVAILABLE', reason: `Ablation control "${abId}" for "${hop.hopId}" contains redacted request material unavailable in host factLog.` }
+          }
+          const abBody = abFact?.rawRequestBody ?? findReplaySpecStepBody(ctx.replaySpec, abMethod, abPath)
           try {
             const abRes = await ctx.broker.executeHttp({
-              origin: orig.origin,
-              method: normalizeReplayHttpMethod(orig.method),
-              pathAndQuery: orig.pathAndQuery,
+              origin: abFact?.origin ?? orig!.origin,
+              method: abMethod,
+              pathAndQuery: abPath,
               ...(persona ? { persona } : {}),
-              headers: sanitizeStoredReplayHeaders(orig.reqHeaders, Boolean(persona)),
+              ...(abHeaders ? { headers: abHeaders } : {}),
+              ...(abBody !== undefined && abBody !== null ? { body: abBody } : {}),
               followRedirects: false,
               sessionGroupRole: 'control',
               ...(ctx.runId ? { runId: ctx.runId } : {}),
@@ -2200,6 +2788,9 @@ function createBrokerCompositePatchReplayRunner(
             if (isTransportOr5xx(abRes.status)) {
               return { outcome: 'transport_error', httpStatus: abRes.status, errorCode: `HTTP_${abRes.status}`, reason: `Ablation control for "${hop.hopId}" returned HTTP ${abRes.status}.` }
             }
+            if (abRes.status === 401 && persona) {
+              return { outcome: 'auth_setup_failed', httpStatus: abRes.status, errorCode: 'SESSION_DRIFTED', reason: `Authenticated ablation control for "${hop.hopId}" returned HTTP 401 (session drifted).` }
+            }
             const newAbId = recordReplayedExchange(abRes, `${hop.hopId}-ab`)
             replayedAblations.push(newAbId)
             entries.push(buildSignedEntry({
@@ -2207,6 +2798,7 @@ function createBrokerCompositePatchReplayRunner(
               res: abRes,
               arm: 'control',
               personaHandle: persona,
+              ...(abBody ? { requestBody: abBody } : {}),
               replayAttempt: 'ablation_control',
               entityId: edge.entityId,
             }))
@@ -2217,52 +2809,284 @@ function createBrokerCompositePatchReplayRunner(
         if (replayedAblations.length > 0) ablationByEdge[edgeKey] = replayedAblations
       }
 
-      // 2) Build the hop's HTTP replay requests from stored exchanges (or hop.target fallback).
+      // 2) Route pure-browser hops directly through ScopedBrowser when available.
       const override = ctx.hopRequestOverrides?.[hop.hopId]
-      const hopTargets: Array<{ req: BrokerHttpRequest; originalStatus: number | null; arm: ImpactStep['arm']; persona: string | null }> = []
-      const preCtrlSet = new Set(receipt.terminalImpact.preChainControlExchangeIds)
-      for (const origExId of hop.exchangeIds) {
-        const orig = lookupOriginalExchange(origExId)
-        if (!orig) continue
-        const isCtrl = preCtrlSet.has(origExId)
-        const persona = override?.persona ?? orig.personaHandle ?? ctx.hopActors?.[hop.hopId] ?? defaultAttackerPersona
-        hopTargets.push({
-          req: {
-            origin: override?.origin ?? orig.origin,
-            method: override?.method ?? normalizeReplayHttpMethod(orig.method),
-            pathAndQuery: override?.pathAndQuery ?? orig.pathAndQuery,
+      const edgeCorrIds = [...new Set([
+        ...incomingEdges.filter(e => e.kind === 'async_pivot_binding').map(e => e.correlationId),
+        ...outgoingEdges.filter(e => e.kind === 'async_pivot_binding').map(e => e.correlationId),
+      ])]
+
+      if (needsBrowser && ctx.browser && hop.exchangeIds.length === 0) {
+        const persona = override?.persona ?? ctx.hopActors?.[hop.hopId] ?? defaultAttackerPersona
+        let visitPath = override?.pathAndQuery ?? hop.target.pathAndQuery ?? '/'
+        for (const edge of incomingEdges) {
+          if (edge.kind !== 'value_binding') continue
+          const binding = liveRebindingsByEdge.get(`${edge.fromHopId}->${edge.toHopId}:${edge.kind}`)
+          if (binding?.originalValue && binding.freshValue !== binding.originalValue) {
+            visitPath = replaceAllToken(visitPath, binding.originalValue, binding.freshValue, true).value
+          }
+        }
+        if (hasVaultScrubbedToken(visitPath)) {
+          return { outcome: 'inconclusive', errorCode: 'REDACTED_BROWSER_URL', reason: `Browser hop "${hop.hopId}" target path contains redacted tokens.` }
+        }
+        try {
+          const visit = await ctx.browser.visitPage({
+            origin: override?.origin ?? hop.target.origin,
+            pathAndQuery: visitPath,
             ...(persona ? { persona } : {}),
-            headers: override?.headers ?? sanitizeStoredReplayHeaders(orig.reqHeaders, Boolean(persona)),
-            ...(override?.body !== undefined ? { body: override.body } : {}),
-            followRedirects: false,
-            sessionGroupRole: isCtrl ? 'control' : 'probe',
-            ...(ctx.runId ? { runId: ctx.runId } : {}),
-            ...(ctx.assignmentId ? { assignmentId: ctx.assignmentId } : {}),
-          },
-          originalStatus: orig.status,
-          arm: isCtrl ? 'control' : 'probe',
-          persona,
+            ...(hop.canaryToken ? { canaryToken: hop.canaryToken } : {}),
+            enableSinkHook: true,
+          }, ctx.grant, signal ?? AbortSignal.timeout(30_000))
+          const traceId = `retest-trace-${hop.hopId}-${randomUUID().slice(0, 8)}`
+          const sinks = visit.attestedSinks?.length
+            ? [...visit.attestedSinks]
+            : visit.domSinkTraces.filter(s => s.containsCanary).map(s => s.sink)
+          const traceBase: Omit<HostBrowserTrace, 'hostSignature'> = {
+            id: traceId,
+            origin: visit.origin,
+            sinks,
+            timestampMs: nextTs(),
+            actorPersona: persona,
+            ...(edgeCorrIds.length ? { correlationIds: edgeCorrIds } : {}),
+          }
+          browserTraces.push({ ...traceBase, hostSignature: signHostRecord(traceBase, signingKey) })
+          replayedBrowserTraceIds.push(traceId)
+          return {
+            entries,
+            browserTraces,
+            replayedExchangeIds,
+            replayedBrowserTraceIds,
+            ...(visit.status !== null ? { httpStatus: visit.status } : {}),
+          }
+        } catch (err) {
+          return { outcome: 'inconclusive', errorCode: errCodeOf(err) ?? 'BROWSER_REPLAY_ERROR', reason: `ScopedBrowser replay failed for hop "${hop.hopId}": ${err instanceof Error ? err.message : String(err)}` }
+        }
+      }
+
+      // 3) Build the hop's HTTP replay requests faithfully from host factLog / stored exchanges (and re-bind fresh tokens).
+      interface FaithfulHopTarget {
+        req: BrokerHttpRequest
+        originalStatus: number | null
+        arm: ImpactStep['arm']
+        persona: string | null
+        bodyUnsealed: boolean
+        injectedDigests: string[]
+      }
+      const hopTargets: FaithfulHopTarget[] = []
+      const preCtrlSet = new Set(receipt.terminalImpact.preChainControlExchangeIds)
+
+      // Check if any incoming derived_crypto_binding had changing source material without a caller override.
+      for (const edge of incomingEdges) {
+        if (edge.kind === 'derived_crypto_binding') {
+          const ek = `${edge.fromHopId}->${edge.toHopId}:${edge.kind}`
+          if (cryptoMaterialChangedEdges.has(ek) && !override) {
+            return {
+              outcome: 'inconclusive',
+              errorCode: 'UNREBOUND_CRYPTO_EDGE',
+              reason: `Hop "${hop.hopId}" depends on derived_crypto_binding from "${edge.fromHopId}" whose source material rotated; cannot re-derive signature faithfully without custom runner.`,
+            }
+          }
+        }
+      }
+
+      const buildTargetFromSource = (params: {
+        origExId: string | null
+        fact: HostExchangeFact | null
+        orig: (BrokerExchange & { body: string }) | null
+        isCtrl: boolean
+      }): { ok: true; target: FaithfulHopTarget } | { ok: false; errorCode: string; reason: string } => {
+        const { origExId, fact, orig, isCtrl } = params
+        const persona = override?.persona ?? fact?.actor ?? orig?.personaHandle ?? ctx.hopActors?.[hop.hopId] ?? defaultAttackerPersona
+        const origin = override?.origin ?? fact?.origin ?? orig?.origin ?? hop.target.origin
+        const method = override?.method ?? normalizeReplayHttpMethod(fact?.method ?? orig?.method ?? hop.target.method)
+        let pathAndQuery = override?.pathAndQuery ?? fact?.pathAndQuery ?? orig?.pathAndQuery ?? hop.target.pathAndQuery ?? '/'
+        const specBody = findReplaySpecStepBody(ctx.replaySpec, method, pathAndQuery)
+        let body: string | undefined = override?.body !== undefined
+          ? override.body
+          : fact !== null
+            ? (fact.rawRequestBody ?? undefined)
+            : specBody
+        const hasSealedBody = override?.body !== undefined || fact !== null || specBody !== undefined
+        const origHeaders = fact?.requestHeaders ?? orig?.reqHeaders
+        const origHasBodyHeader = Boolean(origHeaders && Object.entries(origHeaders).some(([k, v]) => {
+          const lk = k.trim().toLowerCase()
+          if (lk === 'content-type' && v.trim().length > 0) return true
+          if (lk === 'content-length') {
+            const n = Number(v.trim())
+            return Number.isFinite(n) && n > 0
+          }
+          return false
+        }))
+        if (origHasBodyHeader && !hasSealedBody) {
+          return {
+            ok: false,
+            errorCode: 'MISSING_REQUEST_BODY',
+            reason: `Cannot rebuild hop "${hop.hopId}"${origExId ? ` (${origExId})` : ''} faithfully: original request carried a body (content-type/content-length) not available in host factLog or replay overrides.`,
+          }
+        }
+        const bodyUnsealed = !hasSealedBody && (method === 'POST' || method === 'PUT' || method === 'PATCH')
+
+        const rebuiltHdrs = rebuildStoredReplayHeaders({
+          rawHeaders: origHeaders,
+          personaHandle: persona,
+          grant: ctx.grant,
+          overrideHeaders: override?.headers,
         })
+        let headers = rebuiltHdrs.headers ? { ...rebuiltHdrs.headers } : undefined
+        const remainingRedacted = new Set(rebuiltHdrs.redactedHeaders)
+        const injectedDigests: string[] = []
+
+        // Dynamically re-bind incoming value_binding edges from replayed producer's fresh output.
+        for (const edge of incomingEdges) {
+          if (edge.kind !== 'value_binding') continue
+          const ek = `${edge.fromHopId}->${edge.toHopId}:${edge.kind}`
+          const binding = liveRebindingsByEdge.get(ek)
+          if (!binding) continue
+
+          if (binding.originalValue && binding.freshValue !== binding.originalValue) {
+            let substituted = false
+            const pRes = replaceAllToken(pathAndQuery, binding.originalValue, binding.freshValue, true)
+            if (pRes.changed) { pathAndQuery = pRes.value; substituted = true }
+            if (body !== undefined) {
+              const bRes = replaceAllToken(body, binding.originalValue, binding.freshValue, false)
+              if (bRes.changed) { body = bRes.value; substituted = true }
+            }
+            if (headers) {
+              for (const [hk, hv] of Object.entries(headers)) {
+                const hRes = replaceAllToken(hv, binding.originalValue, binding.freshValue, false)
+                if (hRes.changed) { headers[hk] = hRes.value; substituted = true }
+              }
+            }
+            // If a redacted header matched this capability slot, restore it with the fresh value!
+            if (remainingRedacted.size > 0) {
+              const slotNorm = normalizeSlotName(binding.slotPath.split('.').pop() ?? binding.capabilityHandle?.split(':').pop() ?? '')
+              for (const rk of [...remainingRedacted]) {
+                const rNorm = normalizeSlotName(rk)
+                if (slotNorm.length >= 3 && (rNorm === slotNorm || rNorm.endsWith(slotNorm) || slotNorm.endsWith(rNorm) || rNorm === 'authorization')) {
+                  headers = headers ?? {}
+                  headers[rk] = rNorm === 'authorization' && !/^bearer\s+/i.test(binding.freshValue)
+                    ? `Bearer ${binding.freshValue}`
+                    : binding.freshValue
+                  remainingRedacted.delete(rk)
+                  substituted = true
+                }
+              }
+            }
+            if (substituted) {
+              injectedDigests.push(binding.freshDigest)
+            } else if (!override && (binding.appearsInConsumer || Boolean(edge.valueDigest))) {
+              return {
+                ok: false,
+                errorCode: 'UNREBOUND_DYNAMIC_TOKEN',
+                reason: `Cannot faithfully re-bind fresh value from "${edge.fromHopId}" into consumer hop "${hop.hopId}": original token was not located in consumer request plane.`,
+              }
+            }
+          } else if (!binding.originalValue && edge.valueDigest && binding.freshDigest !== edge.valueDigest.toLowerCase() && !override) {
+            return {
+              ok: false,
+              errorCode: 'UNREBOUND_DYNAMIC_TOKEN',
+              reason: `Producer "${edge.fromHopId}" minted a fresh value whose original token is unavailable for substitution into consumer hop "${hop.hopId}"; failing closed.`,
+            }
+          } else if (binding.freshValue) {
+            const carried = pathAndQuery.includes(binding.freshValue)
+              || (body !== undefined && body.includes(binding.freshValue))
+              || Boolean(headers && Object.values(headers).some(v => v.includes(binding.freshValue)))
+            if (carried) injectedDigests.push(binding.freshDigest)
+          }
+        }
+
+        if (remainingRedacted.size > 0) {
+          return {
+            ok: false,
+            errorCode: 'REDACTED_HEADER_UNAVAILABLE',
+            reason: `Cannot rebuild hop "${hop.hopId}" faithfully: redacted request header(s) (${[...remainingRedacted].join(', ')}) unavailable in host factLog.`,
+          }
+        }
+        if (hasVaultScrubbedToken(pathAndQuery) || hasVaultScrubbedToken(body)) {
+          return {
+            ok: false,
+            errorCode: 'REDACTED_REQUEST_UNAVAILABLE',
+            reason: `Cannot rebuild hop "${hop.hopId}" faithfully: stored request URL or body contains redacted placeholders unavailable in host factLog.`,
+          }
+        }
+
+        return {
+          ok: true,
+          target: {
+            req: {
+              origin,
+              method,
+              pathAndQuery,
+              ...(persona ? { persona } : {}),
+              ...(headers ? { headers } : {}),
+              ...(body !== undefined ? { body } : {}),
+              followRedirects: false,
+              sessionGroupRole: isCtrl ? 'control' : 'probe',
+              ...(ctx.runId ? { runId: ctx.runId } : {}),
+              ...(ctx.assignmentId ? { assignmentId: ctx.assignmentId } : {}),
+            },
+            originalStatus: fact?.status ?? orig?.status ?? null,
+            arm: isCtrl ? 'control' : 'probe',
+            persona,
+            bodyUnsealed,
+            injectedDigests,
+          },
+        }
+      }
+
+      for (const origExId of hop.exchangeIds) {
+        const fact = lookupFact(origExId)
+        const orig = lookupOriginalExchange(origExId)
+        if (!fact && !orig) continue
+        const built = buildTargetFromSource({ origExId, fact, orig, isCtrl: preCtrlSet.has(origExId) })
+        if (!built.ok) return { outcome: 'inconclusive', errorCode: built.errorCode, reason: built.reason }
+        hopTargets.push(built.target)
       }
       if (hopTargets.length === 0) {
-        const persona = override?.persona ?? ctx.hopActors?.[hop.hopId] ?? defaultAttackerPersona
-        hopTargets.push({
-          req: {
-            origin: override?.origin ?? hop.target.origin,
-            method: override?.method ?? normalizeReplayHttpMethod(hop.target.method),
-            pathAndQuery: override?.pathAndQuery ?? hop.target.pathAndQuery ?? '/',
-            ...(persona ? { persona } : {}),
-            ...(override?.headers ? { headers: override.headers } : {}),
-            ...(override?.body !== undefined ? { body: override.body } : {}),
-            followRedirects: false,
-            sessionGroupRole: 'probe',
-            ...(ctx.runId ? { runId: ctx.runId } : {}),
-            ...(ctx.assignmentId ? { assignmentId: ctx.assignmentId } : {}),
-          },
-          originalStatus: null,
-          arm: 'probe',
-          persona,
-        })
+        const built = buildTargetFromSource({ origExId: null, fact: null, orig: null, isCtrl: false })
+        if (!built.ok) return { outcome: 'inconclusive', errorCode: built.errorCode, reason: built.reason }
+        hopTargets.push(built.target)
+      }
+
+      // If this hop requires OOB callback verification, mint a fresh canary and verify it can be injected faithfully.
+      let mintedOobCanary: { id: string; token: string; httpUrl: string; dnsHost: string } | null = null
+      if (needsOob && ctx.canaryBroker) {
+        if (!hop.canaryToken) {
+          return {
+            outcome: 'inconclusive',
+            errorCode: 'UNREPLAYABLE_OOB_HOP',
+            reason: `OOB hop "${hop.hopId}" lacks a recorded canaryToken for fresh canary substitution; failing closed as inconclusive.`,
+          }
+        }
+        const minted = ctx.canaryBroker.mintCanary(
+          ctx.runId ?? 'composite-retest',
+          `gate6-retest:${hop.hopId}`,
+          hop.target.origin,
+          { storage: ctx.storage, assignmentId: ctx.assignmentId },
+        )
+        let injectedCanary = false
+        for (const target of hopTargets) {
+          const pRes = replaceAllToken(target.req.pathAndQuery, hop.canaryToken, minted.token, true)
+          if (pRes.changed) { target.req.pathAndQuery = pRes.value; injectedCanary = true }
+          if (target.req.body !== undefined) {
+            const bRes = replaceAllToken(target.req.body, hop.canaryToken, minted.token, false)
+            if (bRes.changed) { target.req.body = bRes.value; injectedCanary = true }
+          }
+          if (target.req.headers) {
+            for (const [hk, hv] of Object.entries(target.req.headers)) {
+              const hRes = replaceAllToken(hv, hop.canaryToken, minted.token, false)
+              if (hRes.changed) { target.req.headers[hk] = hRes.value; injectedCanary = true }
+            }
+          }
+        }
+        if (!injectedCanary) {
+          return {
+            outcome: 'inconclusive',
+            errorCode: 'UNREPLAYABLE_OOB_HOP',
+            reason: `OOB hop "${hop.hopId}" original canaryToken could not be substituted into the replayed request; failing closed as inconclusive.`,
+          }
+        }
+        mintedOobCanary = minted
       }
 
       const availSet = new Set(availableCapabilities)
@@ -2273,10 +3097,6 @@ function createBrokerCompositePatchReplayRunner(
           : e.kind === 'derived_crypto_binding' && availSet.has(e.sourceCapabilityId)
             ? [e.sourceCapabilityId]
             : []),
-      ])]
-      const edgeCorrIds = [...new Set([
-        ...incomingEdges.filter(e => e.kind === 'async_pivot_binding').map(e => e.correlationId),
-        ...outgoingEdges.filter(e => e.kind === 'async_pivot_binding').map(e => e.correlationId),
       ])]
 
       let lastStatus: number | null = null
@@ -2304,7 +3124,7 @@ function createBrokerCompositePatchReplayRunner(
         replayedExchangeIds.push(newExId)
 
         if (isTransportOr5xx(res.status)) {
-          entries.push(buildSignedEntry({ exchangeId: newExId, res, arm: target.arm, personaHandle: target.persona, entityId: hop.entityId }))
+          entries.push(buildSignedEntry({ exchangeId: newExId, res, arm: target.arm, personaHandle: target.persona, ...(target.req.body !== undefined ? { requestBody: target.req.body } : {}), entityId: hop.entityId }))
           return {
             outcome: 'transport_error',
             httpStatus: res.status,
@@ -2312,6 +3132,32 @@ function createBrokerCompositePatchReplayRunner(
             entries,
             replayedExchangeIds,
             reason: `Hop "${hop.hopId}" returned HTTP ${res.status} (transport/server failure; failing closed).`,
+          }
+        }
+
+        // R2-04 / R4-H-9 alignment: authenticated 401 means session/credential drift, NEVER a verified fix.
+        if (res.status === 401 && target.persona) {
+          entries.push(buildSignedEntry({ exchangeId: newExId, res, arm: target.arm, personaHandle: target.persona, ...(target.req.body !== undefined ? { requestBody: target.req.body } : {}), entityId: hop.entityId }))
+          return {
+            outcome: 'auth_setup_failed',
+            httpStatus: res.status,
+            errorCode: 'SESSION_DRIFTED',
+            entries,
+            replayedExchangeIds,
+            reason: `Authenticated hop "${hop.hopId}" returned HTTP 401 (session drifted for persona "${target.persona}"; failing closed).`,
+          }
+        }
+
+        // R4-H-9: 400/415/422 on a body-bearing method replayed without sealed request body is a lossy replay, NEVER a fix!
+        if (target.bodyUnsealed && (res.status === 400 || res.status === 415 || res.status === 422)) {
+          entries.push(buildSignedEntry({ exchangeId: newExId, res, arm: target.arm, personaHandle: target.persona, entityId: hop.entityId }))
+          return {
+            outcome: 'inconclusive',
+            httpStatus: res.status,
+            errorCode: 'LOSSY_REPLAY_4XX',
+            entries,
+            replayedExchangeIds,
+            reason: `Hop "${hop.hopId}" returned HTTP ${res.status} when replayed without a host-sealed request body; failing closed as inconclusive.`,
           }
         }
 
@@ -2332,10 +3178,39 @@ function createBrokerCompositePatchReplayRunner(
         }
 
         const inspectJson = tryParseJsonBody(inspectBody)
-        const emittedCaps = target.arm === 'probe'
-          ? inferEmittedCapabilitiesForHop(hop, outgoingEdges, res.status, inspectBody, inspectJson, inspectHeaders)
-          : []
-        for (const c of emittedCaps) hopEmittedAll.add(c)
+        const inferred = target.arm === 'probe'
+          ? inferEmittedCapabilitiesForHop(hop, outgoingEdges, res.status, inspectBody, inspectJson, inspectHeaders, origSlotsByEdge)
+          : { emitted: [], reboundByEdge: new Map<string, LiveReboundValue>(), observedDigests: [], unresolvedFreshValueReason: null }
+        if (inferred.unresolvedFreshValueReason) {
+          entries.push(buildSignedEntry({ exchangeId: newExId, res, arm: target.arm, personaHandle: target.persona, ...(target.req.body !== undefined ? { requestBody: target.req.body } : {}), entityId: hop.entityId }))
+          return {
+            outcome: 'inconclusive',
+            httpStatus: res.status,
+            errorCode: 'UNREBOUND_PRODUCER_VALUE',
+            entries,
+            replayedExchangeIds,
+            reason: inferred.unresolvedFreshValueReason,
+          }
+        }
+        for (const [ek, rv] of inferred.reboundByEdge) {
+          liveRebindingsByEdge.set(ek, rv)
+          reboundValueDigests[ek] = rv.freshDigest
+        }
+        // Track derived_crypto_binding source rotation so downstream consumers fail closed rather than resending stale signatures.
+        if (target.arm === 'probe' && is2xx(res.status)) {
+          for (const oe of outgoingEdges) {
+            if (oe.kind !== 'derived_crypto_binding') continue
+            const ek = `${oe.fromHopId}->${oe.toHopId}:${oe.kind}`
+            const origMat = origDerivedTokensByEdge.get(ek)
+            if (origMat) {
+              const freshMat = readSlotValueFromResponse({ source: origMat.slotSource, path: origMat.slotPath }, inspectBody, inspectJson, inspectHeaders)
+              if (typeof freshMat === 'string' && freshMat.trim() && freshMat.trim() !== origMat.originalValue) {
+                cryptoMaterialChangedEdges.add(ek)
+              }
+            }
+          }
+        }
+        for (const c of inferred.emitted) hopEmittedAll.add(c)
 
         const matchedCorrIds = is2xx(res.status) && target.arm === 'probe'
           ? edgeCorrIds.filter(cid => inspectBody.includes(cid) || res.pathAndQuery.includes(cid) || Object.values(inspectHeaders).some(v => v.includes(cid)))
@@ -2358,10 +3233,13 @@ function createBrokerCompositePatchReplayRunner(
           res,
           arm: target.arm,
           personaHandle: target.persona,
+          ...(target.req.body !== undefined ? { requestBody: target.req.body } : {}),
           entityId: hop.entityId,
           correlationIds: matchedCorrIds,
-          emittedCapabilities: emittedCaps,
+          emittedCapabilities: inferred.emitted,
           consumedCapabilities: target.arm === 'probe' ? hopConsumedCaps : [],
+          observedResponseDigests: inferred.observedDigests,
+          injectedRequestDigests: target.injectedDigests,
           cryptoAttestations,
         }))
       }
@@ -2377,7 +3255,55 @@ function createBrokerCompositePatchReplayRunner(
         }
       }
 
-      // 3) Synthesize host-signed async poll records for converged incoming poll_convergence / async_job edges when 2xx succeeded.
+      // If this hop also requires a browser trace alongside HTTP exchanges, visit via ScopedBrowser now.
+      if (needsBrowser && ctx.browser && browserTraces.length === 0) {
+        const persona = override?.persona ?? ctx.hopActors?.[hop.hopId] ?? defaultAttackerPersona
+        try {
+          const visit = await ctx.browser.visitPage({
+            origin: override?.origin ?? hop.target.origin,
+            pathAndQuery: override?.pathAndQuery ?? hop.target.pathAndQuery ?? '/',
+            ...(persona ? { persona } : {}),
+            ...(hop.canaryToken ? { canaryToken: hop.canaryToken } : {}),
+            enableSinkHook: true,
+          }, ctx.grant, signal ?? AbortSignal.timeout(30_000))
+          const traceId = `retest-trace-${hop.hopId}-${randomUUID().slice(0, 8)}`
+          const sinks = visit.attestedSinks?.length
+            ? [...visit.attestedSinks]
+            : visit.domSinkTraces.filter(s => s.containsCanary).map(s => s.sink)
+          const traceBase: Omit<HostBrowserTrace, 'hostSignature'> = {
+            id: traceId,
+            origin: visit.origin,
+            sinks,
+            timestampMs: nextTs(),
+            actorPersona: persona,
+            ...(edgeCorrIds.length ? { correlationIds: edgeCorrIds } : {}),
+          }
+          browserTraces.push({ ...traceBase, hostSignature: signHostRecord(traceBase, signingKey) })
+          replayedBrowserTraceIds.push(traceId)
+        } catch (err) {
+          return { outcome: 'inconclusive', errorCode: errCodeOf(err) ?? 'BROWSER_REPLAY_ERROR', entries, replayedExchangeIds, reason: `ScopedBrowser trace failed for hop "${hop.hopId}": ${err instanceof Error ? err.message : String(err)}` }
+        }
+      }
+
+      // If this hop minted a fresh OOB canary, check CanaryBroker for callback delivery.
+      if (mintedOobCanary && ctx.canaryBroker) {
+        const check = ctx.canaryBroker.checkCanary(mintedOobCanary.token, { storage: ctx.storage, runId: ctx.runId })
+        if (check.hit) {
+          const oobId = `retest-oob-${hop.hopId}-${randomUUID().slice(0, 8)}`
+          const oobBase: Omit<HostOobEvent, 'hostSignature'> = {
+            id: oobId,
+            token: mintedOobCanary.token,
+            canaryId: mintedOobCanary.id,
+            delivered: true,
+            receivedAtMs: nextTs(),
+            ...(edgeCorrIds.length ? { correlationIds: edgeCorrIds } : {}),
+          }
+          oobEvents.push({ ...oobBase, hostSignature: signHostRecord(oobBase, signingKey) })
+          replayedOobEventIds.push(oobId)
+        }
+      }
+
+      // 4) Synthesize host-signed async poll records for converged incoming poll_convergence / async_job edges when 2xx succeeded.
       const hopProbeEntries = entries.filter(e => e.step.arm === 'probe')
       if (hopProbeEntries.some(e => is2xx(e.step.status))) {
         for (const edge of incomingEdges) {
@@ -2405,9 +3331,12 @@ function createBrokerCompositePatchReplayRunner(
       return {
         entries,
         replayedExchangeIds,
+        ...(oobEvents.length ? { oobEvents, replayedOobEventIds } : {}),
+        ...(browserTraces.length ? { browserTraces, replayedBrowserTraceIds } : {}),
         ...(asyncPollRecords.length ? { asyncPollRecords } : {}),
         ...(Object.keys(ablationByEdge).length ? { replayedAblationExchangeIds: ablationByEdge } : {}),
         ...(Object.keys(pollByEdge).length ? { replayedPollRecordIds: pollByEdge } : {}),
+        ...(Object.keys(reboundValueDigests).length ? { reboundValueDigests } : {}),
         ...(lastStatus !== null ? { httpStatus: lastStatus } : {}),
       }
     },
@@ -2416,17 +3345,30 @@ function createBrokerCompositePatchReplayRunner(
       const entries: HostTranscriptEntry[] = []
       const postRbIds: string[] = []
       for (const rbId of receipt.terminalImpact.postChainReadbackExchangeIds) {
+        const rbFact = lookupFact(rbId)
         const orig = lookupOriginalExchange(rbId)
-        if (!orig) continue
-        const persona = orig.personaHandle ?? defaultAttackerPersona
+        if (!rbFact && !orig) continue
+        const persona = rbFact?.actor ?? orig?.personaHandle ?? defaultAttackerPersona
+        const rbMethod = normalizeReplayHttpMethod(rbFact?.method ?? orig!.method)
+        const rbPath = rbFact?.pathAndQuery ?? orig!.pathAndQuery
+        const { headers: rbHeaders, redactedHeaders } = rebuildStoredReplayHeaders({
+          rawHeaders: rbFact?.requestHeaders ?? orig?.reqHeaders,
+          personaHandle: persona,
+          grant: ctx.grant,
+        })
+        if (redactedHeaders.length > 0 || hasVaultScrubbedToken(rbPath)) {
+          return { status: 'inconclusive', errorCode: 'REDACTED_READBACK_UNAVAILABLE', reason: `Terminal readback exchange "${rbId}" contains redacted request material unavailable in host factLog.` }
+        }
+        const rbBody = rbFact?.rawRequestBody ?? findReplaySpecStepBody(ctx.replaySpec, rbMethod, rbPath)
         let res: BrokerExchangeResult
         try {
           res = await ctx.broker.executeHttp({
-            origin: orig.origin,
-            method: normalizeReplayHttpMethod(orig.method),
-            pathAndQuery: orig.pathAndQuery,
+            origin: rbFact?.origin ?? orig!.origin,
+            method: rbMethod,
+            pathAndQuery: rbPath,
             ...(persona ? { persona } : {}),
-            headers: sanitizeStoredReplayHeaders(orig.reqHeaders, Boolean(persona)),
+            ...(rbHeaders ? { headers: rbHeaders } : {}),
+            ...(rbBody !== undefined && rbBody !== null ? { body: rbBody } : {}),
             followRedirects: false,
             sessionGroupRole: 'control',
             ...(ctx.runId ? { runId: ctx.runId } : {}),
@@ -2442,8 +3384,12 @@ function createBrokerCompositePatchReplayRunner(
         if (isTransportOr5xx(res.status)) {
           return { status: 'transport_error', httpStatus: res.status, errorCode: `HTTP_${res.status}`, reason: `Terminal readback returned HTTP ${res.status}` }
         }
-        if (is2xx(orig.status)) {
-          const drift = detectHttpPreconditionDrift({ status: res.status, body: res.body, isTerminalHop: false, hopIndex: 0, originalStatus: orig.status })
+        if (res.status === 401 && persona) {
+          return { status: 'inconclusive', httpStatus: res.status, errorCode: 'SESSION_DRIFTED', reason: `Authenticated terminal readback returned HTTP 401 (session drifted).` }
+        }
+        const origStatus = rbFact?.status ?? orig?.status ?? null
+        if (is2xx(origStatus)) {
+          const drift = detectHttpPreconditionDrift({ status: res.status, body: res.body, isTerminalHop: false, hopIndex: 0, originalStatus: origStatus })
           if (drift) return { status: 'precondition_changed', httpStatus: res.status, errorCode: 'PRECONDITION_CHANGED', reason: `Terminal readback: ${drift}` }
         }
         const newId = recordReplayedExchange(res, 'readback')
@@ -2454,6 +3400,7 @@ function createBrokerCompositePatchReplayRunner(
           arm: 'control',
           evidenceRole: 'post_chain_readback',
           personaHandle: persona,
+          ...(rbBody ? { requestBody: rbBody } : {}),
         }))
       }
       return {
@@ -2479,12 +3426,63 @@ function remapOracleInputIds(value: unknown, remapEx: (id: string) => string, de
   return value
 }
 
+function persistProposalGate6CompositeArtifact(
+  lr: PatchLabRetestContext,
+  input: {
+    patchId: string
+    findingId: string
+    replaySpecId?: string
+    labRevision: string
+    status: PatchStatus
+    dynamicRetestVerdict: DynamicRetestVerdict
+    proof: CompositePatchRetestProof
+    secrets?: readonly NamedSecret[]
+  },
+): void {
+  // R4-H-10: Persist Gate-6 candidate-patch composite metadata ONLY as a proposal-scoped
+  // `patch` artifact tagged with `patchId` and `labRevision` — NEVER into finding-level
+  // `retest_runs` or `replay_specs.proof_receipt`.
+  if (!lr.storage) return
+  try {
+    const run = lr.storage.run(lr.runId)
+    const assignment = (lr.assignmentId
+      ? lr.storage.workerList(run.id).find(w => w.id === lr.assignmentId)
+      : undefined) ?? lr.storage.workerList(run.id).at(-1)
+    if (!assignment) return
+    const portable = toPortablePatchRetestProof(input.proof)
+    lr.storage.addArtifact(
+      run,
+      assignment,
+      'patch',
+      `Patch proposal Gate-6 composite retest · ${input.patchId.slice(0, 8)} (${input.proof.verdict})`,
+      JSON.stringify({
+        kind: 'patch_proposal_gate6_retest',
+        patchId: input.patchId,
+        labRevision: input.labRevision,
+        findingId: input.findingId,
+        ...(input.replaySpecId ? { replaySpecId: input.replaySpecId } : {}),
+        proposalStatus: input.status,
+        dynamicRetestVerdict: input.dynamicRetestVerdict,
+        ...portable,
+      }, null, 2),
+      `patch-gate6-composite:${input.patchId}`,
+      input.secrets,
+    )
+  } catch {
+    // Non-fatal if caller supplied a partial/ephemeral mock store.
+  }
+}
+
 function persistCompositeRetestMetadata(
   ctx: BrokerCompositeReplayContext | undefined,
   proof: CompositePatchRetestProof,
   secrets?: readonly NamedSecret[],
 ): void {
-  if (!ctx || ctx.persistRetest === false || !ctx.storage || !ctx.runId || !ctx.findingId || !ctx.replaySpecId) return
+  // R4-H-10: Candidate-patch trials (carrying `patchId`) and default broker calls MUST NEVER
+  // write finding-level `retest_runs` or overwrite `replay_specs.proof_receipt`.
+  // Only an explicit authoritative finding-level Verify Fix call (`persistRetest === true` with NO `patchId`)
+  // records a finding-level `retest_runs` row + its linked structured artifact.
+  if (!ctx || ctx.persistRetest !== true || proof.patchId || !ctx.storage || !ctx.runId || !ctx.findingId || !ctx.replaySpecId) return
   try {
     const storage = ctx.storage
     const run = storage.run(ctx.runId)
@@ -2499,7 +3497,7 @@ function persistCompositeRetestMetadata(
         run,
         assignment,
         'replay',
-        `Composite patch retest · ${proof.chainId} (${proof.verdict})`,
+        `Composite Verify Fix retest · ${proof.chainId} (${proof.verdict})`,
         JSON.stringify({
           kind: 'composite_patch_retest',
           findingId: ctx.findingId,
@@ -2512,7 +3510,7 @@ function persistCompositeRetestMetadata(
       evidenceIds.push(artifact.id)
     }
 
-    const retestRow = storage.recordRetestRun(
+    storage.recordRetestRun(
       run,
       ctx.findingId,
       ctx.replaySpecId,
@@ -2521,30 +3519,36 @@ function persistCompositeRetestMetadata(
       evidenceIds,
       proof.exchangeIds,
     )
-
-    const specRow = storage.getReplaySpec(run.id, ctx.replaySpecId)
-    const existingProof = specRow.proofReceipt && typeof specRow.proofReceipt === 'object'
-      ? (specRow.proofReceipt as unknown as Record<string, unknown>)
-      : null
-    if (existingProof) {
-      const updatedProof = {
-        ...existingProof,
-        patchBrokeHopId: proof.verdict === 'fixed' ? proof.patchBrokeHopId : null,
-        compositeVerdict: proof.verdict,
-        compositeRetest: {
-          ...portable,
-          retestRunId: retestRow.id,
-        },
-      }
-      storage.db
-        .update(replaySpecs)
-        .set({ proofReceipt: updatedProof as unknown as typeof specRow.proofReceipt })
-        .where(and(eq(replaySpecs.runId, run.id), eq(replaySpecs.id, ctx.replaySpecId)))
-        .run()
-    }
   } catch {
     // Non-fatal if caller supplied a partial/ephemeral mock store without a persisted run/spec row.
   }
+}
+
+const UNBUILDABLE_TERMINAL_REASON_RE = /\b(?:absent from host transcript|missing|missing_denied_control\w*|missing_pivot_control\w*|missing_v8_oracle_input|clean_denied_control\w*|no terminal exchange|browser trace|oob event|unbuildable|cannot be rebuilt|requires .* evidence)\b/i
+
+function checkCompositeRetestHealth(
+  entries: readonly HostTranscriptEntry[],
+): { healthy: boolean; reason: string | null } {
+  const controlArms: RetestArmObservation[] = []
+  const probeArms: RetestArmObservation[] = []
+  for (const e of entries) {
+    const authenticated = Boolean(e.actorPersona && e.actorPersona.trim())
+    const arm: RetestArmObservation = {
+      role: e.step.evidenceRole ?? e.step.arm,
+      status: typeof e.step.status === 'number' ? e.step.status : null,
+      authenticated,
+      allowDenied: e.step.arm === 'control' || e.replayAttempt === 'ablation_control',
+      method: e.step.method,
+    }
+    if (e.step.arm === 'control' || e.replayAttempt === 'ablation_control') controlArms.push(arm)
+    else if (e.step.arm === 'probe') probeArms.push(arm)
+  }
+  const health = assessRetestHealth(
+    { controlArms, requireControlArm: false },
+    { arms: probeArms, requireProbeArm: false, allowRedirect: true, requireDefinitiveDenial: false },
+    { confirmed: false, failureReason: 'claim_not_reproduced' },
+  )
+  return { healthy: health.healthy, reason: health.reason }
 }
 
 export async function retestCompositeChainPatch(params: RetestCompositeChainParams): Promise<CompositePatchRetestProof> {
@@ -2579,6 +3583,17 @@ export async function retestCompositeChainPatch(params: RetestCompositeChainPara
   const receipt = parsed.data, dagRes = buildCompositeDag(receipt)
   if (!dagRes.ok) return finalize(receipt.chainId, receipt.terminalVulnClass, receipt.terminalImpact.terminalHopId, 'inconclusive', `Composite patch retest inconclusive: invalid DAG topology (${dagRes.reason})`)
 
+  const usesBrokerRunner = !params.runner && Boolean(params.brokerContext)
+  const requireUnpatchedControl = params.prePatchControlRun === true
+    ? false
+    : (params.requireUnpatchedControl ?? usesBrokerRunner)
+  const hasVerifiedPrePatchControl = Boolean(
+    params.prePatchProof
+    && params.prePatchProof.verdict === 'still_vulnerable'
+    && params.prePatchProof.chainId === receipt.chainId
+    && hasValidCompositeProofDigest(params.prePatchProof),
+  )
+
   let effectiveRunner = params.runner
   let effectiveVerifyOptions = params.verifyOptions
   if (!effectiveRunner) {
@@ -2601,8 +3616,35 @@ export async function retestCompositeChainPatch(params: RetestCompositeChainPara
   const allEntries: HostTranscriptEntry[] = [], allOob: HostOobEvent[] = [], allTraces: HostBrowserTrace[] = [], allPolls: HostAsyncPollRecord[] = []
   const extraPreCtrl: string[] = [], extraPostRb: string[] = [], hopResults: CompositeHopReplaySummary[] = []
   const priorHops: Record<string, CompositeHopReplaySummary> = {}, hopArtifacts = new Map<string, HopArt>(), availCaps = new Set<string>()
+  const reboundValueDigests = new Map<string, string>()
   const emit = (verdict: CompositePatchRetestVerdict, summary: string, extra: Parameters<typeof finalize>[5] = {}) =>
     finalize(receipt.chainId, receipt.terminalVulnClass, receipt.terminalImpact.terminalHopId, verdict, summary, { topoOrder: dag.topoOrder, hopResults, exchangeIds: allEntries.map(e => e.exchangeId), ...extra })
+
+  // R4-H-9 + R2-04: Centralized gate guarding EVERY transition to 'fixed'.
+  // Enforces (1) unpatched pre-patch reproduction control when required, and
+  // (2) canonical `assessRetestHealth` alignment so unhealthy/drifted retests NEVER emit 'fixed'.
+  const emitFixedOrFailClosed = (
+    summary: string,
+    extra: Parameters<typeof finalize>[5] = {},
+  ): CompositePatchRetestProof => {
+    if (params.prePatchControlRun) {
+      return emit('inconclusive', `Pre-patch reproduction control did not reproduce chain: ${summary}`, {
+        compositeVerification: extra.compositeVerification,
+      })
+    }
+    if (requireUnpatchedControl && !hasVerifiedPrePatchControl) {
+      return emit('inconclusive', `Composite patch retest inconclusive: cannot certify "fixed" without an authoritative pre-patch reproduction control from the same runner (${summary})`, {
+        compositeVerification: extra.compositeVerification,
+      })
+    }
+    const health = checkCompositeRetestHealth(allEntries)
+    if (!health.healthy) {
+      return emit('inconclusive', `Composite patch retest inconclusive (retest-health): ${health.reason ?? summary}`, {
+        compositeVerification: extra.compositeVerification,
+      })
+    }
+    return emit('fixed', summary, extra)
+  }
 
   if (params.signal?.aborted) return emit('inconclusive', 'Composite patch retest inconclusive: aborted during initialization.')
 
@@ -2639,6 +3681,9 @@ export async function retestCompositeChainPatch(params: RetestCompositeChainPara
     allEntries.push(...entries); allOob.push(...oob); allTraces.push(...traces); allPolls.push(...polls)
     if (rawResult.preChainControlExchangeIds) extraPreCtrl.push(...rawResult.preChainControlExchangeIds)
     if (rawResult.postChainReadbackExchangeIds) extraPostRb.push(...rawResult.postChainReadbackExchangeIds)
+    if (rawResult.reboundValueDigests) {
+      for (const [ek, d] of Object.entries(rawResult.reboundValueDigests)) reboundValueDigests.set(ek, d.toLowerCase())
+    }
 
     const eSet = new Set(entries.map(e => e.exchangeId)), oSet = new Set(oob.map(o => o.id)), tSet = new Set(traces.map(t => t.id))
     const hopExIds = rawResult.replayedExchangeIds ? [...rawResult.replayedExchangeIds] : (hop.exchangeIds.length && hop.exchangeIds.every(id => eSet.has(id)) ? [...hop.exchangeIds] : entries.filter(e => e.replayAttempt !== 'ablation_control').map(e => e.exchangeId))
@@ -2662,12 +3707,19 @@ export async function retestCompositeChainPatch(params: RetestCompositeChainPara
       outcome = 'precondition_changed'; reason ??= `Target route or schema changed before/during hop "${hopId}".`; errorCode ??= 'PRECONDITION_CHANGED'
     } else {
       const probes = entries.filter(e => e.step.arm === 'probe' && e.replayAttempt !== 'ablation_control')
-      const probe4xx = probes.length > 0 && probes.every(e => isSecurity4xx(e.step.status))
-      const hasEffect = emittedCaps.length > 0 || oob.some(o => o.delivered) || traces.some(t => (t.sinks?.length ?? 0) > 0 || (t.emittedCapabilities?.length ?? 0) > 0) || polls.some(p => p.converged)
-      if (rawResult.outcome === 'blocked' || (probe4xx && !hasEffect)) {
-        outcome = 'blocked'; blockedWith4xx = probe4xx || isSecurity4xx(rawResult.httpStatus)
-        const stList = probes.map(e => e.step.status).filter((s): s is number => typeof s === 'number').join(', ')
-        reason ??= `Hop "${hopId}" blocked by patched target${stList ? ` (HTTP ${stList})` : ''}.`
+      const authSessionDrifted = probes.some(e => e.step.status === 401 && Boolean(e.actorPersona && e.actorPersona.trim()))
+      if (authSessionDrifted) {
+        outcome = 'auth_setup_failed'
+        errorCode = 'SESSION_DRIFTED'
+        reason ??= `Authenticated probe hop "${hopId}" returned HTTP 401 (session drifted; failing closed).`
+      } else {
+        const probe4xx = probes.length > 0 && probes.every(e => isSecurity4xx(e.step.status))
+        const hasEffect = emittedCaps.length > 0 || oob.some(o => o.delivered) || traces.some(t => (t.sinks?.length ?? 0) > 0 || (t.emittedCapabilities?.length ?? 0) > 0) || polls.some(p => p.converged)
+        if (rawResult.outcome === 'blocked' || (probe4xx && !hasEffect)) {
+          outcome = 'blocked'; blockedWith4xx = probe4xx || isSecurity4xx(rawResult.httpStatus)
+          const stList = probes.map(e => e.step.status).filter((s): s is number => typeof s === 'number').join(', ')
+          reason ??= `Hop "${hopId}" blocked by patched target${stList ? ` (HTTP ${stList})` : ''}.`
+        }
       }
     }
 
@@ -2690,13 +3742,13 @@ export async function retestCompositeChainPatch(params: RetestCompositeChainPara
       const inc = dag.incomingByHop.get(hopId) ?? [], outg = dag.outgoingByHop.get(hopId) ?? []
       const ch = blockedWith4xx ? (inc[0] ?? outg[0]) : (outg[0] ?? inc[0])
       const brokeReason = reason ?? `Hop "${hopId}" was blocked by the patched target.`
-      return emit('fixed', `Fixed: multi-hop chain broke cleanly at "${hopId}"${pNote}: ${brokeReason}`, { patchBrokeHopId: hopId, brokeCausalEdge: ch ? { edgeIndex: ch.edgeIndex, kind: ch.edge.kind, fromHopId: ch.edge.fromHopId, toHopId: ch.edge.toHopId } : null, brokeReason, benignPrefixHops: benignPrefix })
+      return emitFixedOrFailClosed(`Fixed: multi-hop chain broke cleanly at "${hopId}"${pNote}: ${brokeReason}`, { patchBrokeHopId: hopId, brokeCausalEdge: ch ? { edgeIndex: ch.edgeIndex, kind: ch.edge.kind, fromHopId: ch.edge.fromHopId, toHopId: ch.edge.toHopId } : null, brokeReason, benignPrefixHops: benignPrefix })
     }
     for (const oe of dag.outgoingByHop.get(hopId) ?? []) {
-      const check = checkProducerEdge(oe.edge, hop, art)
+      const check = checkProducerEdge(oe.edge, hop, art, reboundValueDigests)
       if (!check.ok) {
         summaryRec.outcome = 'blocked'; summaryRec.reason = check.reason; skipRest()
-        return emit('fixed', `Fixed: multi-hop chain broke cleanly at "${hopId}"${pNote}: ${check.reason}`, { patchBrokeHopId: hopId, brokeCausalEdge: { edgeIndex: oe.edgeIndex, kind: oe.edge.kind, fromHopId: oe.edge.fromHopId, toHopId: oe.edge.toHopId }, brokeReason: check.reason, benignPrefixHops: benignPrefix })
+        return emitFixedOrFailClosed(`Fixed: multi-hop chain broke cleanly at "${hopId}"${pNote}: ${check.reason}`, { patchBrokeHopId: hopId, brokeCausalEdge: { edgeIndex: oe.edgeIndex, kind: oe.edge.kind, fromHopId: oe.edge.fromHopId, toHopId: oe.edge.toHopId }, brokeReason: check.reason, benignPrefixHops: benignPrefix })
       }
     }
     for (const cap of emittedCaps) availCaps.add(cap)
@@ -2736,7 +3788,13 @@ export async function retestCompositeChainPatch(params: RetestCompositeChainPara
     if (edge.kind === 'value_binding') {
       const src = edge.sourceExchangeId ? (exById.has(edge.sourceExchangeId) ? edge.sourceExchangeId : exMap.get(edge.sourceExchangeId)) : undefined
       const tgt = edge.targetExchangeId ? (exById.has(edge.targetExchangeId) ? edge.targetExchangeId : exMap.get(edge.targetExchangeId)) : undefined
-      return { ...edge, sourceExchangeId: src, targetExchangeId: tgt }
+      const freshDigest = reboundValueDigests.get(tk)
+      return {
+        ...edge,
+        ...(edge.valueDigest && freshDigest ? { valueDigest: freshDigest } : {}),
+        sourceExchangeId: src,
+        targetExchangeId: tgt,
+      }
     }
     if (edge.kind === 'state_transition_binding') {
       const exp = toArt?.ablationByEdge[tk] ?? toArt?.ablationByEdge[k], inf = (toArt?.entries ?? []).filter(e => e.replayAttempt === 'ablation_control').map(e => e.exchangeId)
@@ -2776,17 +3834,28 @@ export async function retestCompositeChainPatch(params: RetestCompositeChainPara
   if (verification.failedStage === 'edge_binding') {
     const fe = verification.verifiedEdges.find(e => !e.verified)
     if (fe) {
+      // R4-H-9: Do NOT blindly map edge_binding failures caused by replay/harness re-binding gaps or
+      // unhealthy ablation controls to 'fixed'. Fail closed as inconclusive.
+      const ablationUnhealthy = fe.kind === 'state_transition_binding' && /ablation/i.test(fe.reason)
+      const rebindGap = fe.kind === 'value_binding' && usesBrokerRunner && priorHops[fe.fromHopId]?.outcome === 'succeeded' && priorHops[fe.toHopId]?.outcome === 'succeeded'
+      if (ablationUnhealthy || rebindGap) {
+        return emit('inconclusive', `Composite patch retest inconclusive (edge_binding ${fe.fromHopId} -> ${fe.toHopId}): ${fe.reason}`, { compositeVerification: verification })
+      }
       const eObj = replayedReceipt.causalEdges[fe.edgeIndex], fArt = hopArtifacts.get(fe.fromHopId), fHop = dag.hopsById.get(fe.fromHopId)
-      const brokeHopId = (eObj && fArt && fHop ? checkProducerEdge(eObj, fHop, fArt).ok : true) ? fe.toHopId : fe.fromHopId
+      const brokeHopId = (eObj && fArt && fHop ? checkProducerEdge(eObj, fHop, fArt, reboundValueDigests).ok : true) ? fe.toHopId : fe.fromHopId
       const idx = dag.topoOrder.indexOf(brokeHopId), bp = idx > 0 ? dag.topoOrder.slice(0, idx).filter(id => priorHops[id]?.outcome === 'succeeded') : []
-      return emit('fixed', `Fixed: causal edge ${fe.fromHopId} -> ${fe.toHopId} (${fe.kind}) broke at "${brokeHopId}"${bp.length ? ` (benign prefix succeeded: ${bp.join(' -> ')})` : ''}: ${fe.reason}`, {
+      return emitFixedOrFailClosed(`Fixed: causal edge ${fe.fromHopId} -> ${fe.toHopId} (${fe.kind}) broke at "${brokeHopId}"${bp.length ? ` (benign prefix succeeded: ${bp.join(' -> ')})` : ''}: ${fe.reason}`, {
         patchBrokeHopId: brokeHopId, brokeCausalEdge: { edgeIndex: fe.edgeIndex, kind: fe.kind, fromHopId: fe.fromHopId, toHopId: fe.toHopId }, brokeReason: fe.reason, benignPrefixHops: bp, compositeVerification: verification,
       })
     }
+    return emit('inconclusive', `Composite patch retest inconclusive (edge_binding): ${verification.reason}`, { compositeVerification: verification })
+  }
+  if (UNBUILDABLE_TERMINAL_REASON_RE.test(verification.reason)) {
+    return emit('inconclusive', `Composite patch retest inconclusive (terminal_impact evidence unavailable): ${verification.reason}`, { compositeVerification: verification })
   }
   const termId = receipt.terminalImpact.terminalHopId, termIdx = dag.topoOrder.indexOf(termId)
   const bp = termIdx > 0 ? dag.topoOrder.slice(0, termIdx).filter(id => priorHops[id]?.outcome === 'succeeded') : []
-  return emit('fixed', `Fixed: terminal impact neutralized at "${termId}"${bp.length ? ` (benign prefix succeeded: ${bp.join(' -> ')})` : ''}: ${verification.reason}`, {
+  return emitFixedOrFailClosed(`Fixed: terminal impact neutralized at "${termId}"${bp.length ? ` (benign prefix succeeded: ${bp.join(' -> ')})` : ''}: ${verification.reason}`, {
     patchBrokeHopId: termId, brokeCausalEdge: null, brokeReason: verification.reason, benignPrefixHops: bp, compositeVerification: verification,
   })
 }
