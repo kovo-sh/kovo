@@ -18,8 +18,8 @@ Run `run_sast_scan` (`opengrep`, `ast-grep`, `bandit`) and inspect XML/SVG/SAML/
 
 ## 3. Safe Non-Destructive Runtime Verification
 - Mint a single-use Kovo Hunter canary via `mint_canary` (using Kovo Hunter’s self-hosted HTTP callback URL or authoritative DNS hostname when configured).
-- Compare a clean valid XML baseline control against a benign external-DTD canary reference check strictly within approved scope (Tier 2/3 as appropriate for `POST` / `upload_probe`), then poll `check_canary` for an authoritative callback correlated to the minted token.
-- Never request local files or internal IPs; confirm strictly via out-of-band Kovo Hunter canary hit (`rce_proof` `oob_canary` or `http_chain`) or static AST proof (`static_ast_proof` -> `static_verified`).
+- Compare a clean valid XML baseline control against a benign external-DTD canary reference check strictly within approved scope (Tier 2/3 as appropriate for `POST` XML endpoints), then poll `check_canary` for an authoritative callback correlated to the minted token.
+- Never request local files or internal IPs; confirm strictly via `kovo_verify` (`ctx.prove_oob_callback({ inject: async (canary) => ctx.http(...), timeoutMs: 6000 })` + `return ctx.result({ title })`) or static AST proof (`static_ast_proof` -> `static_verified`).
 
 ## 4. Closure & Remediation
 - **Remediation:** Disable DTD processing completely (`disallow-doctype-decl = true` / `defusedxml` / `resolve_entities=False, no_network=True`) on every XML parser across the repository.

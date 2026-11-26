@@ -19,7 +19,7 @@ Audit `/repos` (`middleware.*`, `auth.*`, webhook routes, JWT verification helpe
 - Use `analyze_artifact` (`tool: "jwt-inspect"`) or `run_offline_script` on redacted/synthetic token structures to verify claims and header discipline without printing live credentials.
 - Use `probe_differential` (`authz_matrix`) and `run_safe_templates` (`techTags: ["clerk", "auth0", "oidc"]`) to verify unauthenticated access, cross-tenant `orgId` isolation, and CORS origin reflection safely through `RequestBroker`.
 
-## 3. Closure & Replay Spec Discipline
-- Confirm live auth bypasses, missing webhook verification, or cross-origin session leaks via `http_chain` or `browser_chain` Replay Specs with negative controls and explicit `counterevidence`.
+## 3. Closure & `kovo_verify` Discipline
+- Confirm live auth bypasses, missing webhook verification, or cross-origin session leaks via `kovo_verify` (`ctx.prove_access_boundary({ boundaryClass: "auth", ... })`, `ctx.http` + `ctx.expect`, or `ctx.browser` + `ctx.expect.domSentinel` / `ctx.prove_composite` for multi-hop flows), finishing with `return ctx.result({ title })`.
 - Confirm static JWT/middleware gaps via `static_ast_proof` (`static_verified`) citing exact `file:line`.
 - Close clean auth flows via `record_coverage` (`status: "ruled_out"`, `enforcingControl: "<file:line or exchangeId>"`).

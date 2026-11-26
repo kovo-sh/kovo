@@ -23,7 +23,7 @@ Map the repository (`/repos`) via `run_sast_scan` (`engines: ["opengrep", "ast-g
 - Use `probe_differential` (`probeClass: "authz_matrix"`) with `owner`, `other_persona`, `anonymous`, and safe middleware-header controls to verify route authz and middleware enforcement.
 - Use `browser_visit` with `dom_xss_sink_hook` to inspect hydrated RSC payloads (`self.__next_f`) and client-side DOM sinks.
 
-## 4. Closure & Replay Spec Discipline
-- **Confirmed runtime gap:** Submit an `http_chain` Replay Spec with `spaCatchallControl: true`, an authenticated owner `control`, an unauthenticated/cross-tenant `probe`, and strict `assertionsJq` verifying non-error status (`requireControlNonError: true`).
+## 4. Closure & `kovo_verify` Discipline
+- **Confirmed runtime gap:** Run `kovo_verify` with `ctx.prove_access_boundary({ controlPersona, probePersona, route })` (or `ctx.http` + `ctx.expect.status` / `ctx.expect.jsonPath` / `ctx.expect.bodyContains` checking non-SPA JSON/RSC payload and status differential) + `return ctx.result({ title })`.
 - **Source-only confirmed gap:** Submit `static_ast_proof` (`static_verified` tier) citing exact `file:line`.
 - **Ruled out:** Record `record_coverage` with `status: "ruled_out"` quoting the exact `file:line` of the enforced auth/ownership guard or negative-control `exchangeId`.

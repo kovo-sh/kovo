@@ -27,6 +27,6 @@ Inspect `/repos` via `run_sast_scan` (`engines: ["opengrep", "bandit", "ast-grep
 - Use `probe_differential` (`authz_matrix`, `sqli_boolean`, `path_traversal_benign`, `ssrf_canary`) through `RequestBroker`.
 - For suspected mass assignment, verify at Tier 3 (or `local-lab`) with a benign non-destructive field control on a test persona record.
 
-## 4. Closure & Replay Spec Discipline
-- Prove runtime flaws via `http_chain`, `sql_boolean_diff`, or `upload_probe` Replay Specs with negative controls and explicit `counterevidence`.
+## 4. Closure & `kovo_verify` Discipline
+- Prove runtime flaws via `kovo_verify` (`ctx.prove_access_boundary`, `ctx.prove_boolean_or_timing_diff`, `ctx.prove_persisted_mutation`, or `ctx.http` + `ctx.expect`) + `return ctx.result({ title })`.
 - Close ruled-out routes by citing the exact `file:line` of the enforcing `Depends(...)` guard and tenant filter in `enforcingControl`.

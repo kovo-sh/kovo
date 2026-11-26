@@ -27,6 +27,6 @@ Test API and authenticated endpoints (NOT public static assets/fonts/marketing p
   - Does the endpoint accept `text/plain` or `application/x-www-form-urlencoded` (bypassing CORS preflight) instead of strictly enforcing `application/json`?
 - Never execute state-changing mutations at Tier 1/2; record structural CSRF evidence (`Set-Cookie` flags + missing `Origin`/`Referer`/CSRF token checks on safe `OPTIONS`/invalid-body probes) and request Tier 3 approval if active validation is warranted.
 
-## 4. Replay Spec Assertions
-- `kind: "http_chain"`: include `control` (benign origin or no origin) and `probe` (`Origin: https://attacker.example.invalid` or `null`).
-- `assertionsJq` must check exact header equality `acao == "https://attacker.example.invalid"` AND `acac == "true"` AND response status `200` with non-HTML API body (not SPA catch-all).
+## 4. `kovo_verify` Verification Assertions
+- Call `kovo_verify` with `ctx.http(path, { headers: { Origin: ... }, as? })` for a clean control (benign same-origin or no `Origin`) and probe (`Origin: "https://attacker.example.invalid"` or `"null"`).
+- Assert exact header equality via `ctx.expect.header(probe, "access-control-allow-origin", "https://attacker.example.invalid")`, `ctx.expect.header(probe, "access-control-allow-credentials", "true")`, `ctx.expect.status(probe, 200)`, and non-HTML API body (`ctx.expect.jsonPath` or `ctx.expect.bodyContains`), then `return ctx.result({ title })`.

@@ -3684,7 +3684,7 @@ export function convertCodeAuditSuspectsToChainSteps(
       item.hypothesisBody,
       promoteMultiHop
         ? 'Verify ALL stages in ONE cohesive kovo_verify script from ONE starting low-privilege persona (never use a target-tenant persona on the probe arm): run clean denied control BEFORE Stage 1, seal intermediate handles/tokens/keys with ctx.seal_capability, chain across sibling services (using ctx.hmac_sign/ctx.jwt_sign/ctx.await_async/ctx.prove_race_burst as needed), and confirm the full DAG via ctx.prove_composite (Mode A fresh_clean_replay) — never stop at an intermediate info-disclosure, job creation, cache prime, or token/link stub.'
-        : 'Verify live reachability with negative control + differential probe (and cross-persona BOLA check if Tier >= 2) and submit a DeclarativeReplaySpec if confirmed.',
+        : 'Verify live reachability via kovo_verify with a negative control + differential probe (and cross-persona BOLA check if Tier >= 2).',
     ]
     if (siblingBlock) hypothesisParts.push(siblingBlock)
 

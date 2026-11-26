@@ -5,7 +5,7 @@ Summary: Systematically track per-persona resource IDs across user_a, user_b, an
 ## 1. Preconditions & Safety Guardrails
 - **Multi-persona BOLA/IDOR** requires **Tier 2** (read/non-destructive verification) or **Tier 3** (operator-approved state-changing checks) with at least two opaque approved personas (e.g. `user_a` / `tenant_a` and `user_b` / `tenant_b`).
 - **Race bursts (`request_http_race`)** require **Tier 2 or Tier 3** and are strictly bounded to **2–10 synchronized concurrent requests** against approved origins. Never send destructive payloads, delete real accounts, or exceed the broker's concurrency and rate limits.
-- Never place raw `Authorization` or `Cookie` headers in tool calls or Replay Specs—always reference opaque `persona` handles.
+- Never place raw `Authorization` or `Cookie` headers in tool calls or `kovo_verify` scripts—always reference opaque `persona` handles (`as`).
 
 ## 2. Automated Multi-Persona Resource Tracking (`persona_resource`)
 1. **Harvest `user_a` Owned Resources:**
@@ -41,11 +41,6 @@ Target endpoints where concurrent execution can violate a single-use or quota in
    - **Real Race / TOCTOU:** Multiple concurrent requests succeed (`200`/`201`) with distinct created resource IDs or double-applied balance/quota changes where business logic permits at most one success.
    - **Not a Vulnerability:** Idempotent retries returning the exact same object/receipt (`distinctBodies === 1` with no duplicate side effect) or properly serialized `409 Conflict` / `429 Too Many Requests` rejections.
 
-## 4. Zero-LLM Replay Spec Schemas
-- **BOLA/IDOR (`kind: "http_chain"`):**
-  - Include `spaCatchallControl: true`, a `setup` step extracting `user_a`'s resource ID, a negative `control` step (unauthenticated or non-existent ID), and a `probe` step as `user_b`.
-- **Race / TOCTOU (`kind: "race_burst"`):**
-  - Fields: `version: 1`, `kind: "race_burst"`, `origin`, standard metadata + `assertionsJq`, optional `controlStep` (`ReplayStep`), `burst` (array of 2–10 `{ origin, method, pathAndQuery, headers?, persona?, jsonBody?, textBody?, followRedirects? }`), and optional `postCheckStep` (`ReplayStep`).
-  - `assertionsJq` evaluates `/evidence/replay-results.json`:
-    `{ kind, origin, replayedAt, control, burst: { summary: { total, statuses, statusCounts, distinctBodies, minDurationMs, maxDurationMs, spreadMs }, results }, postCheck, extractedVars }`.
-  - Assert that `control` behaved cleanly AND `([.burst.results[] | select(.status == 200 or .status == 201)] | length) > 1` (plus post-check state or distinct resource proof when applicable).
+## 4. `kovo_verify` Proof Patterns
+- **BOLA/IDOR (single-hop):** Call `ctx.prove_access_boundary({ controlPersona: null, probePersona: "<actor_low>", route: "/api/resources/<id>" })` (or `ctx.http` owner setup + negative control + cross-persona probe with `ctx.expect.status` / `ctx.expect.jsonPath` / `ctx.expect.bodyContains`, verifying non-SPA JSON), then `return ctx.result({ title })`. If the resource ID or token is harvested in an upstream hop, seal via `ctx.seal_capability` and finalize via `ctx.prove_composite({ replayMode: "fresh_clean_replay", ... })`.
+- **Race / TOCTOU (single-hop):** Call `ctx.prove_race_burst({ requests: [...], readRoute, balanceField, unitDebit, barrier: "auto" })` (2–10 synchronized requests; `readRoute` records baseline/post/serial control exchanges automatically), then `return ctx.result({ title })`. When preceded by setup hops, wrap the full chain in `ctx.prove_composite` (`terminalVulnClass: "economic_conservation"`).

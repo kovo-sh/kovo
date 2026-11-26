@@ -28,7 +28,7 @@ Inspect `/repos` via `run_sast_scan` (`engines: ["opengrep", "ast-grep"]`) befor
 - Run `run_safe_templates` (`techTags: ["springboot"]`) and `probe_surface` (`mode: "paths"`, `wordlist: "debug-actuator"`).
 - Use `probe_differential` (`authz_matrix`, `sqli_boolean`, `ssti_math` with benign `#{a*b}` prime math) strictly through `RequestBroker`.
 
-## 4. Closure & Replay Spec Discipline
-- Confirm dynamic findings via `http_chain`, `sql_boolean_diff`, or Tier-3 non-destructive `rce_proof` (`dynamic_math` only with HITL approval).
+## 4. Closure & `kovo_verify` Discipline
+- Confirm dynamic findings via `kovo_verify` (`ctx.prove_access_boundary`, `ctx.prove_boolean_or_timing_diff`, or Tier-3 non-destructive `ctx.prove_injection_differential`) + `return ctx.result({ title })`.
 - Never attempt destructive Actuator mutations (such as lifecycle-termination or runtime environment-mutation endpoints).
 - Record `ruled_out` only with exact `SecurityFilterChain` / `@PreAuthorize` `file:line` or negative-control `exchangeId`.

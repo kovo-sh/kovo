@@ -19,6 +19,6 @@ Summary: Deterministically verify dangling CNAME subdomain takeover risks, expir
    - Subject Alternative Names (`SANs`) matching the requested hostname (also check SANs for unexpected internal/staging hostnames and report new in-scope candidates via `suggest_candidate_host`).
 2. Inspect `Strict-Transport-Security` header (`max-age >= 31536000`, `includeSubDomains`).
 
-## 3. Declarative Replay Specs
-- For dangling CNAMEs: submit `kind: "dns_takeover"` with `targetOrigin`, `probePath: "/"`, and `assertionsJq` checking both CNAME provider match AND unclaimed body signature / NXDOMAIN.
-- For TLS defects: submit `kind: "tls_audit"` with `targetOrigin` and `assertionsJq` asserting the exact certificate/protocol violation.
+## 3. `kovo_verify` & Coverage Discipline
+- For HTTP-reachable dangling CNAMEs returning an unclaimed provider fingerprint: confirm via `kovo_verify` (`ctx.http("/", { followRedirects: false })` + `ctx.expect.status` / `ctx.expect.bodyContains` + `ctx.result`) alongside the `inspect_dns` evidence.
+- For pure DNS NXDOMAIN or TLS certificate/protocol defects observed via `inspect_dns` / `inspect_tls` / `analyze_artifact`: record structured facts (`record_fact`) and close coverage cleanly via `record_coverage`.

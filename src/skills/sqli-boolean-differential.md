@@ -1,6 +1,6 @@
 # SQL Parameterization Audit & Boolean Differential Verification
 Tags: sqli, sql, database, orm, parameterization, boolean-diff, verification, code-audit
-Summary: Audit database query builders and raw SQL sinks offline via SAST, then confirm unparameterized query handling strictly through Kovo Hunter’s non-destructive boolean differential engine and sql_boolean_diff Replay Specs.
+Summary: Audit database query builders and raw SQL sinks offline via SAST, then confirm unparameterized query handling strictly through Kovo Hunter’s non-destructive boolean/timing differential probes and kovo_verify (ctx.prove_boolean_or_timing_diff).
 
 ## 1. Source-First Parameterization Audit (`/repos`)
 Always audit `/repos` via `run_sast_scan` (`opengrep`, `ast-grep`, `bandit`) and `derive_evidence` before sending live probes:
@@ -16,8 +16,8 @@ Kovo Hunter strictly prohibits destructive database statements, data extraction 
 - Invoke Kovo Hunter’s host-side `probe_differential` (`probeClass: "sqli_boolean"`), which routes strictly through `RequestBroker` and compares a clean baseline response against randomized, side-effect-free boolean comparisons (`k=k` vs `k=k+1`) plus minimal syntax-boundary error fingerprinting.
 - Verify baseline stability across repeated clean requests and ensure SPA-catchall exclusion before trusting any divergence.
 
-## 3. Deterministic Zero-LLM Confirmation (`sql_boolean_diff`)
-- To promote a live finding to `runtime_confirmed`, submit a `sql_boolean_diff` Declarative Replay Spec specifying `targetOrigin`, `method`, `pathAndQuery`, `paramName`, `paramLocation`, `baselineValue`, and `quoteStyle`.
-- Kovo Hunter’s Replay Verifier independently mints **3 fresh unseen random integer pairs** and executes interleaved `(baseline, true, false)` triplets, confirming ONLY when `similarity(baseline, true) >= 0.90` AND `similarity(true, false) <= 0.75` (or deterministic non-5xx status divergence) holds across every round.
+## 3. Deterministic `kovo_verify` Confirmation
+- To promote a live finding to `runtime_confirmed`, run `kovo_verify` calling `ctx.prove_boolean_or_timing_diff({ control: { target, options }, variant: { target, options }, mode: "boolean", rounds: 3 })` (or `mode: "timing"` at Tier 3 / `local-lab`) and `return ctx.result({ title })`.
+- The host transcript oracle verifies multi-round structural/status divergence between paired control and variant requests without destructive payloads.
 - For unreachable/Tier-0 source sinks, submit `static_ast_proof` (`static_verified` tier) citing the exact `file:line`.
-- Always include non-empty `counterevidence` (checking whether an ORM cast, schema validator, or WAF alters behavior). Close properly parameterized queries via `record_coverage` (`status: "ruled_out"`, `enforcingControl: "<file:line>"`).
+- Close properly parameterized queries via `record_coverage` (`status: "ruled_out"`, `enforcingControl: "<file:line>"`).

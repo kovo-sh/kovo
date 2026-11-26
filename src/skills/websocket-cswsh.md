@@ -1,6 +1,6 @@
 # WebSocket Security & Cross-Site WebSocket Hijacking (CSWSH)
 Tags: websocket, cswsh, origin, csrf, realtime, authz, socket, streaming
-Summary: Audit WebSocket handshakes, Origin header validation, session/token authentication, and per-message channel authorization using Kovo Hunter’s brokered probe_websocket tool and ws_chain Replay Specs.
+Summary: Audit WebSocket handshakes, Origin header validation, session/token authentication, and per-message channel authorization using Kovo Hunter’s brokered probe_websocket tool and kovo_verify checks.
 
 ## 1. High-Risk WebSocket Attack Surfaces
 Map WebSocket servers and gateways in `/repos` (`ws`, `socket.io`, NestJS `@WebSocketGateway`, FastAPI `@app.websocket`, Django Channels, Rails ActionCable, Go `gorilla/websocket`) via `run_sast_scan` and `derive_evidence`:
@@ -20,6 +20,6 @@ Kovo Hunter’s `probe_websocket` routes 100% through `RequestBroker` with stric
 3. **Probe A (CSWSH Origin Check):** Connect with `persona: "user_a"` and `spoofOrigin: "https://evil.invalid"`. If upgrade succeeds (`101`) AND returns authenticated data or accepts privileged commands identically to Control 1, CSWSH is demonstrated.
 4. **Probe B (Cross-Tenant Subscription):** Connect with `persona: "user_b"` and send a benign read-only subscribe/query message referencing `user_a`'s room/resource ID.
 
-## 3. Closure & Replay Spec Discipline
-- Confirm dynamic CSWSH or WS BOLA with a deterministic `ws_chain` Replay Spec (containing `control` and `probe` steps + strict `assertionsJq`) and non-empty `counterevidence` (e.g., evaluating cookie `SameSite=Strict`/`Lax` browser behavior).
+## 3. Closure & `kovo_verify` Discipline
+- Confirm HTTP-layer handshake/upgrade origin-validation or WebSocket token-minting boundary flaws via `kovo_verify` (`ctx.prove_access_boundary` or `ctx.http` with clean same-origin control vs spoofed `Origin` probe + `ctx.expect.status` / `ctx.expect.header`, or `ctx.seal_capability` + `ctx.prove_composite` for token->channel chains), finishing with `return ctx.result({ title })`; capture socket frame evidence with `probe_websocket`.
 - Close protected endpoints via `record_coverage` (`status: "ruled_out"`, `enforcingControl: "<file:line of Origin/authz check or exchangeId>"`).

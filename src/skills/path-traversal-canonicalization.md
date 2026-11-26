@@ -22,4 +22,4 @@ Inspect `/repos` with `run_sast_scan` (`opengrep`, `ast-grep`, `bandit`) and `de
 
 ## 3. Closure & Remediation
 - **Remediation:** Prefer opaque database IDs mapped to server-controlled filenames. When filenames are required, validate against a strict basename allowlist, resolve symlinks, and enforce `resolvedPath.startsWith(canonicalBase + sep)`.
-- **Closure:** Confirm live boundary flaws via `http_chain` Replay Specs with a benign control and non-empty `counterevidence`; rule out safe handlers by quoting the exact canonicalization check `file:line` in `enforcingControl`.
+- **Closure:** Confirm live boundary flaws via `kovo_verify` (`ctx.prove_boolean_or_timing_diff`, `ctx.prove_access_boundary`, or `ctx.http` + `ctx.expect` comparing a benign control against the traversal probe) + `return ctx.result({ title })`; rule out safe handlers by quoting the exact canonicalization check `file:line` in `enforcingControl`.

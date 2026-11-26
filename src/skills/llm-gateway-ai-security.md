@@ -21,6 +21,6 @@ Summary: Audit LLM proxy APIs, model-routing gateways, streaming SSE endpoints, 
 - **Indirect Prompt Injection & Tool Boundaries:**
   - If the application passes fetched web content, user uploads, or chat history into a backend agent/tool pipeline, document trust-boundary gaps (e.g., missing output sanitization when rendering LLM markdown/HTML into DOM → pair with `client-side-xss-postmessage`).
 
-## 3. Replay Verification Rules
-- Use `kind: "http_chain"` with `spaCatchallControl: true`.
+## 3. `kovo_verify` Verification Rules
+- Use `kovo_verify` (`ctx.prove_access_boundary` or `ctx.http` + `ctx.expect` verifying non-SPA JSON API responses and cross-tenant isolation) + `return ctx.result({ title })`.
 - Never send expensive long-generation prompts or abusive load; use minimal `max_tokens: 1` or read-only metadata/error-handling probes, and require Tier 3 approval for any state-changing or billable mutation.

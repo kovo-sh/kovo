@@ -22,6 +22,6 @@ Inspect `/repos` (`firestore.rules`, `database.rules.json`, `storage.rules`, `fi
 - Verify whether any client-writable user profile document stores `role`, `isAdmin`, or `plan` fields read by security rules (`get(/databases/.../users/$(request.auth.uid)).data.role`).
 
 ## 3. Closure & Verification
-- For live approved Firebase/app endpoints, prove cross-tenant read leaks via read-only `http_chain` Replay Specs (`owner` vs `other_persona` vs `anonymous`).
+- For live approved Firebase/app endpoints, prove cross-tenant read leaks via `kovo_verify` (`ctx.prove_access_boundary` or `ctx.http` + `ctx.expect` comparing `owner` vs `other_persona` vs `anonymous`) and `return ctx.result({ title })`.
 - For static rule defects in `/repos`, submit `static_ast_proof` (`static_verified` tier) citing the exact rules file line range and `counterevidence` (checking whether an outer rule or App Check requirement alters impact).
 - Close properly scoped collections via `record_coverage` (`status: "ruled_out"`, `enforcingControl: "<rules-file:line>"`).

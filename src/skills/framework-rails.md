@@ -26,6 +26,6 @@ Audit `/repos` via `run_sast_scan` (`engines: ["opengrep", "ast-grep"]`) and `de
 - Run `run_safe_templates` (`techTags: ["rails"]`) and `probe_surface` (`mode: "paths"`).
 - Use `probe_differential` (`authz_matrix`, `sqli_boolean`, `ssti_math` with benign ERB prime-multiplication checks, `path_traversal_benign`) and `probe_websocket` (ActionCable `Origin` check) via `RequestBroker`.
 
-## 4. Closure & Replay Spec Discipline
-- Confirm dynamic flaws with `http_chain`, `sql_boolean_diff`, or `ws_chain` Replay Specs including negative controls and non-empty `counterevidence`.
+## 4. Closure & `kovo_verify` Discipline
+- Confirm dynamic flaws via `kovo_verify` (`ctx.prove_access_boundary`, `ctx.prove_boolean_or_timing_diff`, `ctx.http` + `ctx.expect`, or `ctx.prove_persisted_mutation`) + `return ctx.result({ title })`.
 - Close ruled-out controllers with `record_coverage` (`status: "ruled_out"`, `enforcingControl: "<file:line>"`).

@@ -22,7 +22,7 @@ Inspect `/repos` (`supabase/migrations/*.sql`, `supabase/functions/**`, `app/**`
 - When a Supabase project origin is in approved scope, verify exposed PostgREST tables (`/rest/v1/<table>?select=*&limit=1`) using `probe_differential` (`authz_matrix`) comparing `owner`, `other_persona`, and `anonymous` (`apikey` header only) with strict 3-way controls.
 - Never modify or delete production rows; keep Tier 1/2 checks read-only (`GET`/`HEAD`).
 
-## 3. Closure & Replay Spec Discipline
-- Confirm live cross-tenant PostgREST/RPC/Storage leaks with `http_chain` Replay Specs proving owner baseline 200 vs cross-persona/anon leak.
+## 3. Closure & `kovo_verify` Discipline
+- Confirm live cross-tenant PostgREST/RPC/Storage leaks via `kovo_verify` (`ctx.prove_access_boundary` or `ctx.http` + `ctx.expect` proving owner baseline `200` vs cross-persona/anonymous leak) + `return ctx.result({ title })`.
 - Confirm source-only migration/policy defects with `static_ast_proof` (`static_verified`) citing exact SQL migration `file:line`.
 - Rule out protected tables only by quoting the exact `ENABLE ROW LEVEL SECURITY` + `CREATE POLICY` `file:line` in `enforcingControl`.
