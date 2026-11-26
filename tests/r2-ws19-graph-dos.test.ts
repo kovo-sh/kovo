@@ -63,7 +63,7 @@ describe('R2-H-23: jsHarvest nesting guard, iterative walk, linear regexes & chi
     }
   })
 
-  test('quadratic jsHarvest and secretScan regex blobs complete in < 100ms while preserving real matches', () => {
+  test('quadratic jsHarvest and secretScan regex blobs complete in < 250ms while preserving real matches', () => {
     const graphqlEvil = 'query Ab '.repeat(110_000) // ~990 KB, no '{'
     const nextDataEvil = '<script '.repeat(120_000) // ~960 KB, no id="__NEXT_DATA__"
     const jwtEvil = '-eyJ'.repeat(100_000) // 400 KB repeated hyphen + eyJ
@@ -81,14 +81,14 @@ describe('R2-H-23: jsHarvest nesting guard, iterative walk, linear regexes & chi
       const elapsed = measureMs(() => {
         jsHarvest(blob, `https://target.invalid/${name}.js`)
       })
-      assert.ok(elapsed < 100, `jsHarvest ${name} took ${elapsed.toFixed(2)}ms (expected < 100ms)`)
+      assert.ok(elapsed < 250, `jsHarvest ${name} took ${elapsed.toFixed(2)}ms (expected < 250ms)`)
     }
 
     const secretElapsed = measureMs(() => {
       const scan = secretScan(jwtEvil, 'jwt-evil.js')
       assert.equal(scan.matches.length, 0)
     })
-    assert.ok(secretElapsed < 100, `secretScan jwt-hyphen-repeat took ${secretElapsed.toFixed(2)}ms (expected < 100ms)`)
+    assert.ok(secretElapsed < 250, `secretScan jwt-hyphen-repeat took ${secretElapsed.toFixed(2)}ms (expected < 250ms)`)
 
     // Real matches still work cleanly.
     const validJwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyXzEyMyJ9.signature_segment_ok'

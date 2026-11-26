@@ -174,7 +174,7 @@ function passRuns(): RealismRun[] {
     for (const confirmed of [10, 10, 10]) {
       runs.push(realismRun({ app, seed: 1, seedSet: 'dev', llm: 'deterministic-no-llm', confirmed }))
     }
-    runs.push(realismRun({ app, seed: 1_000_042, seedSet: 'held-out', llm: 'deterministic-no-llm', confirmed: 8 }))
+    runs.push(realismRun({ app, seed: 1_000_043, seedSet: 'held-out', llm: 'deterministic-no-llm', confirmed: 8 }))
     for (const [index, confirmed] of [12, 14, 16].entries()) {
       runs.push(realismRun({
         app, seed: 1, seedSet: 'dev', llm: 'agentic', confirmed, floorConfirmed: 10,
@@ -182,7 +182,7 @@ function passRuns(): RealismRun[] {
       }))
     }
     for (const confirmed of [12, 14]) {
-      runs.push(realismRun({ app, seed: 1_000_042, seedSet: 'held-out', llm: 'agentic', confirmed, floorConfirmed: 8 }))
+      runs.push(realismRun({ app, seed: 1_000_043, seedSet: 'held-out', llm: 'agentic', confirmed, floorConfirmed: 8 }))
     }
   }
   return runs

@@ -212,6 +212,7 @@ test('WarmWorkerPool stages 0o700/0o600 reposDir into 0o755/0o644 readable mount
         capacity: 1,
       })
 
+      let taken: string | null = null
       try {
         const warmed = await pool.warm()
         assert.ok(warmed, 'warm pool must prewarm container')
@@ -221,12 +222,16 @@ test('WarmWorkerPool stages 0o700/0o600 reposDir into 0o755/0o644 readable mount
         assert.equal(statSync(join(observedMountDir, 'index.ts')).mode & 0o777, 0o644)
 
         // Caller passing original reposDir still matches the warm pool signature.
-        const taken = await pool.take(AbortSignal.timeout(5_000), { reposDir })
+        taken = await pool.take(AbortSignal.timeout(5_000), { reposDir })
         assert.equal(taken, warmed, 'warm pool take() must match caller reposDir signature')
       } finally {
         await pool.close()
       }
-      assert.equal(existsSync(observedMountDir), false, 'WarmWorkerPool.close() must clean up staged /repos dir')
+      // Move Q1: close() defers staged /repos deletion while an active taken container is still
+      // outstanding, and cleans it up as soon as the last outstanding container is released.
+      assert.equal(existsSync(observedMountDir), true, 'WarmWorkerPool.close() must defer staged /repos cleanup while a container is still checked out')
+      if (taken) await pool.release(taken)
+      assert.equal(existsSync(observedMountDir), false, 'WarmWorkerPool must clean up staged /repos dir once outstanding containers are released')
     })
   } finally {
     rmSync(scratch, { recursive: true, force: true })
