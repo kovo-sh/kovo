@@ -6,7 +6,8 @@ import type { Socket as NetSocket } from 'node:net'
 import { connect as tlsConnect } from 'node:tls'
 import type { DetailedPeerCertificate, TLSSocket } from 'node:tls'
 import { referrerPolicies } from '../domain.ts'
-import { EgressDeniedError, EgressGateway } from './egress-gateway.ts'
+import ipaddr from 'ipaddr.js'
+import { EgressDeniedError, EgressGateway, isMetadataOrLinkLocalAddress } from './egress-gateway.ts'
 import { isIpLiteralHost } from './public-suffix.ts'
 import type { ApprovalPolicy, ApprovedEndpointPattern, CapabilityTier, HttpMethod, PreparedObservation } from '../domain.ts'
 import { cacheBusterValueRegex, containsWebshellSignature } from '../replay-spec.ts'
@@ -24,7 +25,9 @@ import {
   defaultRequestAdmissionEngine,
   hasDestructiveContent,
   isLocalLabEnabled,
+  isValidWebsocketSubprotocol,
   RequestAdmissionEngine,
+  validateCallerHeaders,
 } from './request-admission.ts'
 import type { AdmissionDecision, AdmissionRequest } from './request-admission.ts'
 import { globalKillSwitch, KillSwitchTrippedError } from './kill-switch.ts'
@@ -429,6 +432,10 @@ const wsGuid = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
 const sessionHandleRegex = /^[a-z0-9_-]{1,32}$/
 const csrfCookieNameRegex = /^(?:xsrf-token|csrf[_-]?token|_csrf|csrf)$/i
 const csrfInputNameRegex = /^(?:_csrf|csrf[_-]?token|csrfmiddlewaretoken|__RequestVerificationToken|authenticity_token|_token)$/i
+const crossOriginSensitiveHeaders = new Set([
+  'authorization', 'proxy-authorization', 'cookie', 'x-api-key', 'x-auth-token',
+])
+const postToGetContentHeaders = new Set(['content-type', 'content-encoding', 'content-length'])
 const canaryUrlRegex = /^\/c\/kovo-canary-[a-f0-9]{24}$/i
 /**
  * Cookie names that carry a server-side session handle. Excludes CSRF/tracking names: a stateless
@@ -1425,6 +1432,30 @@ function normalizeHeaders(headers: IncomingHttpHeaders | Record<string, string>)
   return out
 }
 
+function canonicalizeCallerHeaders(
+  headers: Record<string, string> | undefined,
+  options: { allowSelfMintedBearer?: boolean; stripPseudoHeaders?: boolean } = {},
+): Record<string, string> {
+  const checked = validateCallerHeaders(headers, options)
+  if (!checked.ok) throw new BrokerDenied(checked.reason)
+  return checked.headers
+}
+
+function stripRedirectHeaders(
+  headers: Record<string, string>,
+  crossOrigin: boolean,
+  postToGet: boolean,
+): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const [name, value] of Object.entries(headers)) {
+    const lower = name.toLowerCase()
+    if (crossOrigin && crossOriginSensitiveHeaders.has(lower)) continue
+    if (postToGet && postToGetContentHeaders.has(lower)) continue
+    out[lower] = value
+  }
+  return out
+}
+
 function collectSecrets(req: BrokerHttpRequest, grant: Grant): NamedSecret[] {
   const all: NamedSecret[] = []
   if (grant.personas) all.push(...personaSecrets(grant.personas))
@@ -1523,6 +1554,7 @@ export class RequestBroker {
   private readonly transportConfig: TransportConfig
   private readonly httpTransport: Transport
   private readonly admissionEngine: RequestAdmissionEngine
+  private readonly scopeHopAdmissionEngine: RequestAdmissionEngine
   /** Per-run scope revision floor so bumping Run A's scope never invalidates Run B. */
   private readonly latestScopeRevisionByRun = new Map<string, number>()
   private reauthHandler?: BrokerOptions['reauth']
@@ -1533,6 +1565,9 @@ export class RequestBroker {
     this.transportConfig = resolveTransportConfig(process.env, options.transportConfig)
     this.httpTransport = options.transport ?? createHttpTransport(this.transportConfig, defaultTransport)
     this.admissionEngine = options.admissionEngine ?? defaultRequestAdmissionEngine
+    this.scopeHopAdmissionEngine = new RequestAdmissionEngine({
+      scopeHopValidator: (url, redirectHop) => this.validateScopeHop(url, redirectHop),
+    })
   }
 
   getAdmissionEngine(): RequestAdmissionEngine {
@@ -2322,6 +2357,7 @@ export class RequestBroker {
       personaHandle: req.persona ?? req.personaHandle ?? null,
       authMutation: req.authMutation,
       scopeHook: req.scopeHook ?? null,
+      normalizedHeaders: canonicalizeCallerHeaders(req.headers, { allowSelfMintedBearer: true }),
       isRaceBurst: opts.raceBurst === true,
       runId: req.runId,
       assignmentId: req.assignmentId,
@@ -2405,6 +2441,17 @@ export class RequestBroker {
     grant.audit('denied', origin, undefined, cleanMeta)
   }
 
+  private validateScopeHop(url: URL, redirectHop: boolean): AdmissionDecision {
+    return this.scopeHopAdmissionEngine.admit({
+      kind: 'http',
+      origin: url.origin,
+      method: 'GET',
+      pathAndQuery: `${url.pathname}${url.search}`,
+      redirectHop,
+      checkCallerHeaders: false,
+    })
+  }
+
   private async resolveAndCheckAddresses(
     hostname: string,
     grant: Grant,
@@ -2452,6 +2499,9 @@ export class RequestBroker {
 
   async readPublicRoot(grant: Grant, signal: AbortSignal): Promise<PublicObservation> {
     if (!grant.origin) throw new BrokerDenied('Grant origin is required for readPublicRoot.')
+    if (process.env.KOVO_OFFLINE === '1' && !EgressGateway.isLoopbackLiteral(new URL(grant.origin).hostname)) {
+      throw new BrokerDenied('Public root discovery is disabled in offline mode for non-loopback origins.')
+    }
     const initial = this.admissionEngine.admit({ kind: 'public_root', origin: grant.origin, method: 'GET', pathAndQuery: '/', allowQuery: false }, grant)
     this.enforceAdmission(initial, { pathAndQuery: '/' }, grant)
 
@@ -2467,12 +2517,16 @@ export class RequestBroker {
       })
       throw new BrokerDenied(message)
     }
+    let redirect = 0
     const check = () => {
       deadline.throwIfAborted()
-      const hop = this.admissionEngine.admitScopeHop(url, grant, { allowQuery: false, requireTargetRole: true })
+      const hop = this.admissionEngine.admitScopeHop(url, grant, {
+        allowQuery: false,
+        requireTargetRole: true,
+      })
       if (!hop.allowed) deny(hop.reason)
     }
-    for (let redirect = 0; redirect <= 3; redirect += 1) {
+    for (redirect = 0; redirect <= 3; redirect += 1) {
       check()
       const addresses = await this.resolveAndCheckAddresses(url.hostname, grant, deadline, url.origin, {
         method: 'GET',
@@ -2593,7 +2647,7 @@ export class RequestBroker {
       ? this.resolvePersonaHeadersForRequest(req, grant, initialOrigin, personaHandle)
       : undefined
 
-    const cleanHeaders: Record<string, string> = { ...(req.headers ?? {}) }
+    const cleanHeaders = { ...(decision.normalizedHeaders ?? canonicalizeCallerHeaders(req.headers)) }
     const hasMultipart = Array.isArray(req.multipartParts) && req.multipartParts.length > 0
     let preparedBody = req.body
     if (hasMultipart) {
@@ -2603,7 +2657,7 @@ export class RequestBroker {
         for (const existingKey of Object.keys(cleanHeaders)) {
           if (existingKey.toLowerCase() === 'content-type') delete cleanHeaders[existingKey]
         }
-        cleanHeaders['Content-Type'] = encoded.contentType
+        cleanHeaders['content-type'] = encoded.contentType
       } catch (err) {
         const reason = err instanceof Error ? err.message : String(err)
         this.auditDenied(
@@ -2707,6 +2761,8 @@ export class RequestBroker {
       return { ...injected }
     }
     if (req.personaHeaders && Object.keys(req.personaHeaders).length > 0) {
+      // Persona headers are an approved credential source, not caller headers. They are still
+      // canonicalized/validated before transport, but may intentionally carry Authorization/Cookie.
       return { ...req.personaHeaders }
     }
     deny(`Persona "${personaHandle}" could not be resolved from run grant.`)
@@ -3005,6 +3061,9 @@ export class RequestBroker {
     const redirectPaths: string[] = []
     let activeMethod: BrokerHttpRequest['method'] = req.method
     let activeBody = prepared.preparedBody
+    let activeHeaders = { ...cleanHeaders }
+    let stripSensitiveHeaders = false
+    let stripEntityHeaders = false
     let includePersona = Boolean(personaHeaders && Object.keys(personaHeaders).length > 0)
 
     const defaultRps = (grant.tier ?? 1) === 3 ? 3 : 5
@@ -3022,10 +3081,14 @@ export class RequestBroker {
       )
       throw new BrokerDenied(message)
     }
+    let redirect = 0
     const check = () => {
       ks.assertAllowed(grant.tenantId ?? null)
       deadline.throwIfAborted()
-      const hop = this.admissionEngine.admitScopeHop(url, grant, { allowQuery: true })
+      const hop = this.admissionEngine.admitScopeHop(url, grant, {
+        allowQuery: true,
+        redirectHop: redirect > 0,
+      })
       if (!hop.allowed) {
         this.purgeSessionJars(req.runId ?? grant.scopePolicy?.runId ?? undefined, url.origin)
         deny(hop.reason)
@@ -3047,14 +3110,15 @@ export class RequestBroker {
         origin: target.origin,
         method: activeMethod,
         pathAndQuery: targetPathAndQuery,
-        headers: cleanHeaders,
+        headers: activeHeaders,
+        normalizedHeaders: activeHeaders,
+        checkCallerHeaders: false,
         body: multipart ? undefined : bodyForHop,
         multipartParts: multipart ? req.multipartParts : undefined,
         personaHandle: includePersona ? (personaHandle ?? null) : null,
         scopeHook: req.scopeHook ?? null,
         redirectHop: true,
         isRaceBurst: options.raceBurst === true,
-        checkCallerHeaders: false,
         runId: req.runId,
         assignmentId: req.assignmentId,
       }, grant)
@@ -3070,12 +3134,15 @@ export class RequestBroker {
       )
     }
 
-    for (let redirect = 0; redirect <= maxRedirects; redirect += 1) {
+    for (redirect = 0; redirect <= maxRedirects; redirect += 1) {
       check()
       redirectOrigins.add(url.origin)
       const isCrossOriginHop = url.origin !== initialOrigin
       // Hard invariant: NEVER forward persona credentials across cross-origin redirects.
-      if (isCrossOriginHop) includePersona = false
+      if (isCrossOriginHop) {
+        includePersona = false
+        stripSensitiveHeaders = true
+      }
 
       const addresses = redirect === 0 && options.preResolvedAddresses
         ? options.preResolvedAddresses
@@ -3087,22 +3154,20 @@ export class RequestBroker {
         })
       check()
 
-      const outboundHeaders: Record<string, string> = {
-        ...cleanHeaders,
-      }
+      const outboundHeaders = stripRedirectHeaders(activeHeaders, stripSensitiveHeaders, stripEntityHeaders)
       let personaCookieRaw: string | undefined
       if (includePersona && personaHeaders) {
         for (const [k, v] of Object.entries(personaHeaders)) {
           if (k.toLowerCase() === 'cookie') {
             personaCookieRaw = v
-          } else {
-            outboundHeaders[k] = v
+          } else if (!(stripSensitiveHeaders && crossOriginSensitiveHeaders.has(k.toLowerCase()))) {
+            outboundHeaders[k.toLowerCase()] = v
           }
         }
       }
 
       if (localLab && req.traceId && !/[\r\n\0]/.test(req.traceId)) {
-        outboundHeaders['X-Kovo-Trace-Id'] = req.traceId.slice(0, 128)
+        outboundHeaders['x-kovo-trace-id'] = req.traceId.slice(0, 128)
       }
 
       // Merge session jar cookies with Persona Vault cookies.
@@ -3150,7 +3215,7 @@ export class RequestBroker {
         mergedCookies.set(k, v)
       }
       if (mergedCookies.size > 0) {
-        outboundHeaders.Cookie = [...mergedCookies.entries()].map(([k, v]) => `${k}=${v}`).join('; ')
+        outboundHeaders.cookie = [...mergedCookies.entries()].map(([k, v]) => `${k}=${v}`).join('; ')
       }
 
       // Automatic CSRF token binding (same-origin only)
@@ -3204,7 +3269,7 @@ export class RequestBroker {
           )
           const hasHeaderAlready = Object.keys(outboundHeaders).some(k => k.toLowerCase() === headerName.toLowerCase())
           if (!hasHeaderAlready && !/[\r\n\0]/.test(headerName)) {
-            outboundHeaders[headerName] = csrfToken.value
+            outboundHeaders[headerName.toLowerCase()] = csrfToken.value
             injectedCsrfHeaderName = headerName.toLowerCase()
           }
           if (activeMethod === 'POST' || activeMethod === 'PUT' || activeMethod === 'PATCH' || activeMethod === 'DELETE') {
@@ -3250,7 +3315,7 @@ export class RequestBroker {
         for (const existingKey of Object.keys(outboundHeaders)) {
           if (existingKey.toLowerCase() === 'content-type') delete outboundHeaders[existingKey]
         }
-        outboundHeaders['Content-Type'] = hopContentType
+        outboundHeaders['content-type'] = hopContentType
       }
 
       const hopRouteTemplate = routeTemplateForPath(url.pathname)
@@ -3291,7 +3356,7 @@ export class RequestBroker {
         probeClass: req.probeClass,
       })
 
-      const requestOriginHeader = cleanHeaders['Origin'] ?? cleanHeaders['origin']
+      const requestOriginHeader = cleanHeaders.origin
       const obs = observed(initialOrigin, url, response, this.options.source ?? 'public response', requestOriginHeader)
       if (jar) {
         this.storeJarCookiesAndCsrf(jar, url, response, obs.mediaType)
@@ -3336,6 +3401,11 @@ export class RequestBroker {
         if (localLab && !isLocalLabAutoApprovalOrigin(url.origin)) {
           return deny('Local-lab requests may not follow redirects outside the isolated lab network.')
         }
+        const targetOrigin = url.origin
+        const nextIsCrossOrigin = targetOrigin !== initialOrigin
+        const nextIsPostToGet =
+          (response.status === 301 || response.status === 302 || response.status === 303) &&
+          activeMethod === 'POST'
         if (response.status === 301 || response.status === 302 || response.status === 303) {
           activeMethod = 'GET'
           activeBody = undefined
@@ -3344,6 +3414,9 @@ export class RequestBroker {
           // a single byte is sent there; fail closed with the target in BrokerApprovalRequired.
           authorizeRedirectTarget(url, hopBody ?? activeBody)
         }
+        activeHeaders = stripRedirectHeaders(activeHeaders, nextIsCrossOrigin, nextIsPostToGet)
+        stripSensitiveHeaders ||= nextIsCrossOrigin
+        stripEntityHeaders ||= nextIsPostToGet
         redirectPaths.push(`${url.pathname}${url.search}`)
         continue
       }
@@ -3624,6 +3697,20 @@ export class RequestBroker {
     const decision = this.admissionEngine.admit({ kind: 'dns', origin, method: 'DNS', pathAndQuery: '/' }, grant)
     this.enforceAdmission(decision, { pathAndQuery: '/' }, grant)
     const parsed = decision.parsedUrl
+    const offline = process.env.KOVO_OFFLINE === '1'
+    const hostname = parsed.hostname.replace(/^\[|\]$/g, '')
+    const literal = ipaddr.isValid(hostname) ? ipaddr.process(hostname) : null
+    if (offline && literal && isMetadataOrLinkLocalAddress(literal.toString())) {
+      throw new BrokerDenied('Metadata and link-local DNS inspection are disabled in offline mode.')
+    }
+    if (offline && !literal) {
+      this.auditDenied(grant, parsed.origin, {
+        reason: 'External DNS inspection is disabled in offline mode.',
+        method: 'DNS',
+        path: '/',
+      })
+      throw new BrokerDenied('External DNS inspection is disabled in offline mode.')
+    }
 
     const started = Date.now()
     const records = await this.withKillSwitch(signal, grant, async (ksSignal, ks) => {
@@ -3704,6 +3791,26 @@ export class RequestBroker {
     const tier = grant.tier ?? 1
     const personaHandle = req.persona ?? req.personaHandle
     const sendMessages = (req.sendMessages ?? []).slice(0, hardWsMaxFrames)
+    const turnMessages = (req.turns ?? []).flatMap(turn => turn.send === undefined ? [] : [turn.send])
+    const subprotocols = req.subprotocols ?? []
+    if (subprotocols.some(protocol => !isValidWebsocketSubprotocol(protocol))) {
+      this.auditDenied(grant, req.origin, {
+        reason: 'Invalid WebSocket subprotocol offer.',
+        method: 'WS',
+        path: req.pathAndQuery,
+        ...(personaHandle ? { persona: personaHandle } : {}),
+      }, req.secrets)
+      throw new BrokerDenied('Invalid WebSocket subprotocol offer.')
+    }
+    if (turnMessages.some(message => hasDestructiveContent(message))) {
+      this.auditDenied(grant, req.origin, {
+        reason: 'WebSocket turn payload blocked by the destructive denylist.',
+        method: 'WS',
+        path: req.pathAndQuery,
+        ...(personaHandle ? { persona: personaHandle } : {}),
+      }, req.secrets)
+      throw new BrokerDenied('WebSocket turn payload blocked by the destructive denylist.')
+    }
     const decision = this.admissionEngine.admit({
       kind: 'websocket',
       origin: req.origin,
@@ -3711,8 +3818,9 @@ export class RequestBroker {
       pathAndQuery: req.pathAndQuery,
       headers: req.headers,
       personaHandle: personaHandle ?? null,
-      wsSendMessages: sendMessages,
+      wsSendMessages: [...sendMessages, ...turnMessages],
       wsOriginHeader: req.originHeader,
+      wsSubprotocols: subprotocols,
     }, grant)
     this.enforceAdmission(decision, { pathAndQuery: req.pathAndQuery, persona: personaHandle, secrets: req.secrets }, grant)
 
@@ -3720,21 +3828,24 @@ export class RequestBroker {
     const url = decision.parsedUrl
     const localLab = Boolean(decision.localLab)
     const resolvedPersonaHeaders = personaHandle
-      ? this.resolvePersonaHeadersForRequest(
-          { method: 'WS' as HttpMethod, pathAndQuery: req.pathAndQuery, personaHeaders: req.personaHeaders, secrets: req.secrets },
-          grant,
-          initialOrigin,
-          personaHandle,
+      ? canonicalizeCallerHeaders(
+          this.resolvePersonaHeadersForRequest(
+            { method: 'WS' as HttpMethod, pathAndQuery: req.pathAndQuery, personaHeaders: req.personaHeaders, secrets: req.secrets },
+            grant,
+            initialOrigin,
+            personaHandle,
+          ),
+          { allowSelfMintedBearer: true },
         )
       : undefined
 
-    const cleanHeaders: Record<string, string> = { ...(req.headers ?? {}) }
-    const effectiveOriginHeader = req.originHeader ?? cleanHeaders.Origin ?? cleanHeaders.origin ?? initialOrigin
+    const cleanHeaders = { ...(decision.normalizedHeaders ?? canonicalizeCallerHeaders(req.headers)) }
+    const effectiveOriginHeader = req.originHeader ?? cleanHeaders.origin ?? initialOrigin
     if (/[\r\n\0]/.test(effectiveOriginHeader)) {
       this.auditDenied(grant, initialOrigin, { reason: 'Invalid WebSocket Origin header.', method: 'WS', path: req.pathAndQuery, ...(personaHandle ? { persona: personaHandle } : {}) }, req.secrets)
       throw new BrokerDenied('Invalid WebSocket Origin header.')
     }
-    cleanHeaders.Origin = effectiveOriginHeader
+    cleanHeaders.origin = effectiveOriginHeader
 
     const maxFrames = Math.max(1, Math.min(req.maxFrames ?? defaultWsMaxFrames, hardWsMaxFrames))
     const maxBytes = Math.max(1024, Math.min(req.maxBytes ?? defaultWsMaxBytes, defaultWsMaxBytes))
@@ -3867,7 +3978,7 @@ export class RequestBroker {
 
     return {
       origin: initialOrigin,
-      pathAndQuery: req.pathAndQuery,
+      pathAndQuery: decision.normalizedPath,
       personaHandle: personaHandle ?? null,
       originHeader: redact(effectiveOriginHeader, secrets),
       connected: raw.connected,
