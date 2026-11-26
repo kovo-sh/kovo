@@ -72,6 +72,7 @@ import type { VerifierBackendKind, WorkerImageIdentity } from './benchmark-backe
 import { resolveWorkerImageRef, selectVerifierBackend } from './benchmark-backend.ts'
 import { resolveOobCallbackPorts } from './benchmark-env.ts'
 import {
+  MISSING_OBSERVED_EFFECTIVE_CONFIG_HASH,
   PreflightError,
   acquireCredentialsDirEnv,
   assertAgenticPreflight,
@@ -83,6 +84,7 @@ import {
   linkSnapshotModelCredentials,
   openCellStore,
   prepareIsolatedDataDir,
+  resolveObservedEffectiveConfigForRunner,
   shouldIsolateDataDir,
   stopEngine,
   summarizeAssignments,
@@ -96,14 +98,15 @@ import type {
 } from './benchmark-realistic.ts'
 import {
   DEFAULT_LEDGER_PATH,
-  LEDGER_SCHEMA_VERSION,
-  appendLedgerRow,
+  appendPerRunLedgerRow,
   computeBenchmarkVersion,
-  computeEffectiveConfig,
   extractObservedEffectiveConfig,
+  promoteLedgerRows,
   resolveGitState,
   type EffectiveConfigSnapshot,
+  type LedgerRow,
 } from './bench-ledger.ts'
+import { buildLedgerRow } from './score-primitives.ts'
 
 // ---------------------------------------------------------------------------------------------
 // Lazy runtime contract with benchmarks/multihop-saas/run.ts
@@ -371,6 +374,7 @@ export interface MultihopArgs {
   jsonPath?: string
   mdPath?: string
   ledgerPath?: string
+  noLedger?: boolean
   listSeeds: boolean
   help: boolean
 }
@@ -414,6 +418,10 @@ Flags:
   --out-dir <path>          artifact directory (default: .kovo/multihop-saas)
   --json <path>             write aggregate structured JSON report here
   --md <path>               write aggregate Markdown report here
+  --ledger [path]           promote validated per-run ledger rows into committed ledger
+                            (default: ${DEFAULT_LEDGER_PATH}; per-run rows are emitted by default)
+  --promote-ledger [path]   alias for --ledger [path]
+  --no-ledger               disable default per-run ledger emission (ad-hoc scratch/dry-runs only)
   --list-seeds              print the multihop-saas seed catalogue as JSON and exit
   --help                    show this help
 
@@ -542,7 +550,7 @@ export function parseMultihopArgs(argv: string[], env: NodeJS.ProcessEnv = proce
     'data-dir', 'keep-data-dirs',
     'allow-inert-workers', 'snapshot-after-floor', 'resume-snapshot', 'snapshot-max-age-ms',
     'snapshot-refresh', 'allow-heldout-snapshot', 'floor-from', 'curve-from', 'out-dir',
-    'json', 'md', 'ledger', 'list-seeds', 'help',
+    'json', 'md', 'ledger', 'promote-ledger', 'no-ledger', 'list-seeds', 'help',
   ])
   for (const key of Object.keys(a)) {
     if (!known.has(key)) {
@@ -551,6 +559,9 @@ export function parseMultihopArgs(argv: string[], env: NodeJS.ProcessEnv = proce
       }
       fail(`unknown flag --${key}`)
     }
+  }
+  if (a['no-ledger'] === true && (a.ledger !== undefined || a['promote-ledger'] !== undefined)) {
+    fail('--no-ledger cannot be combined with --ledger or --promote-ledger')
   }
 
   if (a.help === true) {
@@ -702,11 +713,14 @@ export function parseMultihopArgs(argv: string[], env: NodeJS.ProcessEnv = proce
     curveFrom: parseDirList(stringFlag(a, 'curve-from')),
     ...(stringFlag(a, 'json') ? { jsonPath: resolve(stringFlag(a, 'json')!) } : {}),
     ...(stringFlag(a, 'md') ? { mdPath: resolve(stringFlag(a, 'md')!) } : {}),
-    ...(a.ledger === true
+    ...(a.ledger === true || a['promote-ledger'] === true
       ? { ledgerPath: DEFAULT_LEDGER_PATH }
-      : stringFlag(a, 'ledger')
-        ? { ledgerPath: stringFlag(a, 'ledger')! }
-        : {}),
+      : stringFlag(a, 'promote-ledger')
+        ? { ledgerPath: stringFlag(a, 'promote-ledger')! }
+        : stringFlag(a, 'ledger')
+          ? { ledgerPath: stringFlag(a, 'ledger')! }
+          : {}),
+    ...(a['no-ledger'] === true ? { noLedger: true } : {}),
     listSeeds: a['list-seeds'] === true,
     help: false,
   }
@@ -2759,17 +2773,23 @@ function unlockAndRemove(dir: string): void {
   rmSync(dir, { recursive: true, force: true })
 }
 
-async function waitForTerminal(input: {
+export async function waitForTerminal(input: {
   storage: Store
   runId: string
   deadlineAt: number
   onTick?: (status: string, phase: string) => void
+  isEngineStopped?: () => boolean
 }): Promise<{ timedOut: boolean; status: string; phase: string }> {
   const terminal = new Set(['complete', 'failed', 'stopped', 'paused', 'budget_paused'])
   let last = 0
   while (true) {
     const run = input.storage.run(input.runId)
     if (terminal.has(run.status)) return { timedOut: false, status: run.status, phase: run.phase }
+    if (input.isEngineStopped?.()) {
+      const latest = input.storage.run(input.runId)
+      if (terminal.has(latest.status)) return { timedOut: false, status: latest.status, phase: latest.phase }
+      throw new Error(`Execution engine stopped unexpectedly while run ${input.runId} was ${latest.status}/${latest.phase}`)
+    }
     if (nowMs() >= input.deadlineAt) {
       try {
         input.storage.command({ requestId: randomUUID(), runId: input.runId, action: 'stop' })
@@ -2959,12 +2979,24 @@ export async function runCell(
     }
   }
 
-  const unregisterCleanup = cleanup.add(async () => {
-    if (engine) { try { engineBusy = await stopEngine(engine) } catch { engineBusy = -1 } }
-    if (backend instanceof LinuxWorkerBackend) { try { await backend.reclaimInactive() } catch { /* best-effort */ } }
-    try { await canary.stopListener(); canaryStopped = true } catch { canaryStopped = false }
-    if (started) { appStopped = await stopStartedApp(started) }
-  })
+  let teardownPromise: Promise<void> | null = null
+  const teardownCell = (): Promise<void> => {
+    if (!teardownPromise) {
+      teardownPromise = (async () => {
+        const currentEngine = engine
+        const currentBackend = backend
+        const currentStarted = started
+        engine = undefined
+        started = undefined
+        if (currentEngine) { try { engineBusy = await stopEngine(currentEngine) } catch { engineBusy = -1 } }
+        if (currentBackend instanceof LinuxWorkerBackend) { try { await currentBackend.reclaimInactive() } catch { /* best-effort */ } }
+        try { await canary.stopListener(); canaryStopped = true } catch { canaryStopped = false }
+        if (currentStarted) { appStopped = await stopStartedApp(currentStarted) }
+      })()
+    }
+    return teardownPromise
+  }
+  const unregisterCleanup = cleanup.add(teardownCell)
 
   try {
     // --- Preflight (before booting any lab service): fail fast on missing model profile or local-jq ---
@@ -3022,6 +3054,8 @@ export async function runCell(
     backend = selected.kind === 'docker'
       ? new LinuxWorkerBackend({
           image: workerImage?.imageRef ?? resolvedWorkerImageRef,
+          imageId: workerImage?.imageId ?? null,
+          sourceHash: workerImage?.sourceHash ?? null,
           workspace: { id: storage.workspace.id, directory: storage.directory },
         })
       : selected.backend
@@ -3266,6 +3300,7 @@ export async function runCell(
       runId,
       deadlineAt: startedAt + args.maxDurationMs,
       onTick: (status, phase) => log(`[${slug}] ${status}/${phase}`),
+      isEngineStopped: () => engine?.isStopped === true,
     })
     if (wait.timedOut) notes.push(`wall-clock cap reached after ${args.maxDurationMs}ms; run stopped`)
 
@@ -3356,17 +3391,21 @@ export async function runCell(
     const { benchmarkVersion } = computeBenchmarkVersion('multihop-saas')
     const runEvents = storage.eventsAfter(runId, 0, 500)
     const observedEffectiveConfig = extractObservedEffectiveConfig(runEvents)
-    const { effectiveConfigHash, effectiveConfig } = computeEffectiveConfig({
+    const cfgResolved = resolveObservedEffectiveConfigForRunner({
       observed: observedEffectiveConfig,
       deterministicOnly: args.noLlm,
       environment: 'local-lab',
       approvalPolicy: 'auto_review',
       verifierBackend: backendKind,
       mode: args.mode,
-      ...(workerImage?.imageId ? { workerImageId: workerImage.imageId } : {}),
-      ...(workerImage?.sourceHash ? { workerSourceHash: workerImage.sourceHash } : {}),
+      workerImageId: workerImage?.imageId ?? null,
+      workerSourceHash: workerImage?.sourceHash ?? null,
       sdkVersion: VERIFY_RPC_SDK_VERSION,
     })
+    if (!cfgResolved.observed) {
+      notes.push('missing observed run.effective_config event (Execution-backed scorer requires observed config)')
+    }
+    const { effectiveConfigHash, effectiveConfig } = cfgResolved
     const costUsd = num(card.totalCostUsd, finalRun.spentUsd)
     const efficiency = computeEfficiencyMetrics({ confirmedChains: chainsConfirmed, costUsd, durationMs })
 
@@ -3401,15 +3440,15 @@ export async function runCell(
 
     const meta: MultihopCellMeta = {
       schemaVersion: 1,
-      status: inert ? 'INVALID' : 'VALID',
+      status: inert || !cfgResolved.observed ? 'INVALID' : 'VALID',
       benchmarkVersion,
       effectiveConfigHash,
-      effectiveConfig,
-      wordlistOn: effectiveConfig.wordlistOn,
-      reportable: !inert && !effectiveConfig.wordlistOn,
-      workerImageId: workerImage?.imageId ?? effectiveConfig.workerImageId ?? null,
-      workerSourceHash: workerImage?.sourceHash ?? effectiveConfig.workerSourceHash ?? null,
-      sdkVersion: effectiveConfig.sdkVersion ?? VERIFY_RPC_SDK_VERSION,
+      ...(effectiveConfig ? { effectiveConfig } : {}),
+      wordlistOn: effectiveConfig?.wordlistOn ?? false,
+      reportable: !inert && cfgResolved.observed && !effectiveConfig?.wordlistOn,
+      workerImageId: workerImage?.imageId ?? effectiveConfig?.workerImageId ?? null,
+      workerSourceHash: workerImage?.sourceHash ?? effectiveConfig?.workerSourceHash ?? null,
+      sdkVersion: effectiveConfig?.sdkVersion ?? VERIFY_RPC_SDK_VERSION,
       app,
       sealed,
       seed,
@@ -3528,24 +3567,20 @@ export async function runCell(
     writeOwnerOnly(jsonPath, `${runtime.renderScorecard(card, 'json')}\n`)
     writeOwnerOnly(mdPath, `${runtime.renderScorecard(card, 'md')}\n`)
 
-    if (engine) { try { engineBusy = await stopEngine(engine) } catch { engineBusy = -1 } }
-    if (backend instanceof LinuxWorkerBackend) { try { await backend.reclaimInactive() } catch { /* best-effort */ } }
-    try { await canary.stopListener(); canaryStopped = true } catch { canaryStopped = false }
-    if (started) { appStopped = await stopStartedApp(started) }
-    engine = undefined
-    started = undefined
+    await teardownCell()
+    unregisterCleanup()
     if (whiteBoxRoot) { try { unlockAndRemove(whiteBoxRoot) } catch { /* best-effort */ } }
     try { storage.close() } catch { /* already closed */ }
     if (isolated && !args.keepDataDirs) { try { unlockAndRemove(dataDir) } catch { /* best-effort */ } }
-    unregisterCleanup()
 
     meta.shutdown = { engineBusy, appStopped, canaryStopped }
     writeOwnerOnly(metaPath, `${JSON.stringify(redactJsonValue(meta, []), null, 2)}\n`)
     return { meta, scorecard: card, jsonPath, mdPath, metaPath }
   } finally {
-    if (engine || started) {
-      try { await cleanup.runAll() } catch { /* best-effort */ }
-    }
+    // Cell-local teardown ONLY — never call process-global cleanup.runAll() from a cell finally,
+    // which would tear down sibling cells running concurrently and hang their waitForTerminal loops.
+    try { await teardownCell() } catch { /* best-effort */ }
+    unregisterCleanup()
     if (whiteBoxRoot) { try { unlockAndRemove(whiteBoxRoot) } catch { /* best-effort */ } }
     try { storage.close() } catch { /* already closed */ }
     releaseCredentialsDir?.()
@@ -4036,6 +4071,111 @@ async function runWithConcurrency<T, R>(
   return results
 }
 
+/**
+ * Write multihop-saas cell rows to the gitignored per-run ledger by default
+ * (`KOVO_LEDGER_ROOT` / `benchmarks/results/runs/<run-id>.jsonl`), optionally promoting
+ * validated rows into `promoteLedgerPath`. Marks any cell without observed `effectiveConfig` INVALID.
+ */
+export function writeMultihopLedgerRows(input: {
+  cells: readonly MultihopCellMeta[]
+  recordedAt: string
+  gitSha: string
+  dirty: boolean
+  benchmarkVersion: string
+  noLedger?: boolean
+  promoteLedgerPath?: string
+  runId?: string
+  runsDir?: string
+  repoRoot?: string
+}): { perRunPath: string; rows: LedgerRow[] } {
+  if (input.noLedger || input.cells.length === 0) return { perRunPath: '', rows: [] }
+  const rows: LedgerRow[] = []
+  let perRunPath = ''
+  const runId = input.runId ?? `multihop-${input.recordedAt.replace(/[:.]/g, '-')}-${process.pid}`
+  for (const cellMeta of input.cells) {
+    const siteOutcomes: Record<string, string> = {}
+    for (const ch of cellMeta.chains) {
+      siteOutcomes[ch.chainId] = ch.twoSideConfirmed ? 'confirmed' : (ch.dropReason ?? 'missed')
+    }
+    const cellEffectiveConfig = cellMeta.effectiveConfig
+    const missingObserved = !cellEffectiveConfig
+    const notes = [...(cellMeta.notes ?? [])]
+    if (missingObserved && !notes.includes('missing_observed_effective_config')) {
+      notes.push('missing_observed_effective_config')
+    }
+    const row = buildLedgerRow({
+      cell: {
+        app: cellMeta.app,
+        seed: cellMeta.seed,
+        seedSet: cellMeta.seedSet,
+        sealed: cellMeta.sealed,
+        mode: cellMeta.mode,
+        llm: cellMeta.llm,
+        chainsTotal: cellMeta.chainsTotal,
+        chainsConfirmed: cellMeta.chainsConfirmed,
+        precision: cellMeta.precision,
+        hardenedTwinsTotal: cellMeta.hardenedTwinsTotal,
+        hardenedTwinDecoyFps: cellMeta.hardenedTwinDecoyFps,
+        unmatchedFalsePositives: cellMeta.unmatchedFalsePositives,
+        costUsd: cellMeta.costUsd,
+        durationMs: cellMeta.durationMs,
+        status: cellMeta.status,
+        inert: cellMeta.inert,
+      },
+      readMeta: {
+        failed: missingObserved || cellMeta.status === 'INVALID',
+        inert: cellMeta.inert,
+        app: cellMeta.app,
+        seed: cellMeta.seed,
+        split: cellMeta.sealed ? 'sealed' : cellMeta.seedSet,
+        mode: cellMeta.mode,
+        llm: cellMeta.llm,
+        durationMs: cellMeta.durationMs,
+        ...(missingObserved ? { error: 'missing_observed_effective_config' } : {}),
+      },
+      suite: 'multihop-saas',
+      recordedAt: input.recordedAt,
+      gitSha: input.gitSha,
+      dirty: input.dirty,
+      benchmarkVersion: cellMeta.benchmarkVersion ?? input.benchmarkVersion,
+      effectiveConfigHash: cellMeta.effectiveConfigHash ?? MISSING_OBSERVED_EFFECTIVE_CONFIG_HASH,
+      ...(cellEffectiveConfig ? { effectiveConfig: cellEffectiveConfig } : {}),
+      app: cellMeta.app,
+      split: cellMeta.sealed ? 'sealed' : cellMeta.seedSet,
+      mode: cellMeta.mode,
+      llm: cellMeta.llm,
+      seed: cellMeta.seed,
+      repeat: 1,
+      certifying: false,
+      reportable: !missingObserved && (cellMeta.reportable ?? (!cellMeta.inert && !cellEffectiveConfig.wordlistOn)),
+      costUsd: cellMeta.costUsd,
+      durationMs: cellMeta.durationMs,
+      siteOutcomes,
+      notes,
+    })
+    const stampedRow: LedgerRow = {
+      ...row,
+      workerImageId: cellMeta.workerImageId ?? cellEffectiveConfig?.workerImageId ?? null,
+      workerSourceHash: cellMeta.workerSourceHash ?? cellEffectiveConfig?.workerSourceHash ?? null,
+      sdkVersion: cellMeta.sdkVersion ?? cellEffectiveConfig?.sdkVersion ?? VERIFY_RPC_SDK_VERSION,
+    }
+    const appended = appendPerRunLedgerRow(stampedRow, {
+      runId,
+      runsDir: input.runsDir,
+      repoRoot: input.repoRoot,
+    })
+    perRunPath = appended.path
+    rows.push(appended.row)
+  }
+  if (input.promoteLedgerPath && perRunPath) {
+    promoteLedgerRows(perRunPath, {
+      targetLedgerPath: input.promoteLedgerPath,
+      repoRoot: input.repoRoot,
+    })
+  }
+  return { perRunPath, rows }
+}
+
 export async function main(argv: string[] = process.argv.slice(2)): Promise<number> {
   const args = parseMultihopArgs(argv)
   if (args.help) {
@@ -4087,28 +4227,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     const floorExtra = readMetaArtifacts(args.floorFrom).filter(c => c.llm === 'deterministic-no-llm')
     const curveExtra = readMetaArtifacts(args.curveFrom)
     const { benchmarkVersion } = computeBenchmarkVersion('multihop-saas')
-    const firstObservedCfg = currentMeta.find(c => c.effectiveConfig)?.effectiveConfig
-    const computedCfg = firstObservedCfg
-      ? {
-          effectiveConfigHash: currentMeta.find(c => c.effectiveConfigHash)?.effectiveConfigHash ?? computeEffectiveConfig({
-            observed: firstObservedCfg,
-            deterministicOnly: args.noLlm,
-            environment: 'local-lab',
-            approvalPolicy: 'auto_review',
-            verifierBackend: args.verifier,
-            mode: args.mode,
-          }).effectiveConfigHash,
-          effectiveConfig: firstObservedCfg,
-        }
-      : computeEffectiveConfig({
-          deterministicOnly: args.noLlm,
-          environment: 'local-lab',
-          approvalPolicy: 'auto_review',
-          verifierBackend: args.verifier,
-          mode: args.mode,
-          sdkVersion: VERIFY_RPC_SDK_VERSION,
-        })
-    const { effectiveConfigHash, effectiveConfig } = computedCfg
+    const firstObservedCell = currentMeta.find(c => Boolean(c.effectiveConfig))
+    const effectiveConfigHash = firstObservedCell?.effectiveConfigHash ?? MISSING_OBSERVED_EFFECTIVE_CONFIG_HASH
     const gitState = resolveGitState()
     const report = buildMultihopReport(
       currentMeta,
@@ -4124,47 +4244,15 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     writeOwnerOnly(mdPath, `${renderMultihopReport(report, 'md')}\n`)
     process.stdout.write(`\nwrote ${jsonPath}\nwrote ${mdPath}\n`)
 
-    if (args.ledgerPath) {
-      for (const cellMeta of currentMeta) {
-        const siteOutcomes: Record<string, string> = {}
-        for (const ch of cellMeta.chains) {
-          siteOutcomes[ch.chainId] = ch.twoSideConfirmed ? 'confirmed' : (ch.dropReason ?? 'missed')
-        }
-        const cellEffectiveConfig = cellMeta.effectiveConfig ?? effectiveConfig
-        appendLedgerRow({
-          schemaVersion: LEDGER_SCHEMA_VERSION,
-          recordedAt: report.generatedAt,
-          suite: 'multihop-saas',
-          gitSha: gitState.gitSha,
-          dirty: gitState.dirty,
-          benchmarkVersion: cellMeta.benchmarkVersion ?? benchmarkVersion,
-          effectiveConfigHash: cellMeta.effectiveConfigHash ?? effectiveConfigHash,
-          effectiveConfig: cellEffectiveConfig,
-          workerImageId: cellMeta.workerImageId ?? cellEffectiveConfig.workerImageId ?? null,
-          workerSourceHash: cellMeta.workerSourceHash ?? cellEffectiveConfig.workerSourceHash ?? null,
-          sdkVersion: cellMeta.sdkVersion ?? cellEffectiveConfig.sdkVersion ?? VERIFY_RPC_SDK_VERSION,
-          app: cellMeta.app,
-          split: cellMeta.sealed ? 'sealed' : cellMeta.seedSet,
-          mode: cellMeta.mode,
-          llm: cellMeta.llm,
-          seed: cellMeta.seed,
-          repeat: 1,
-          certifying: false,
-          reportable: cellMeta.reportable ?? (!cellMeta.inert && !cellEffectiveConfig.wordlistOn),
-          status: cellMeta.status ?? (cellMeta.inert ? 'INVALID' : 'VALID'),
-          targets: cellMeta.chainsTotal,
-          confirmed: cellMeta.chainsConfirmed,
-          recall: cellMeta.status === 'INVALID' || cellMeta.inert ? null : cellMeta.recall,
-          rawPrecision: cellMeta.precision,
-          strictPrecision: cellMeta.precision,
-          precision: cellMeta.precision,
-          decoyFalsePositives: cellMeta.hardenedTwinDecoyFps,
-          unmatchedFalsePositives: cellMeta.unmatchedFalsePositives,
-          costUsd: cellMeta.costUsd,
-          durationMs: cellMeta.durationMs,
-          siteOutcomes,
-        }, args.ledgerPath)
-      }
+    if (!args.noLedger && currentMeta.length > 0) {
+      writeMultihopLedgerRows({
+        cells: currentMeta,
+        recordedAt: report.generatedAt,
+        gitSha: gitState.gitSha,
+        dirty: gitState.dirty,
+        benchmarkVersion,
+        promoteLedgerPath: args.ledgerPath,
+      })
     }
 
     if (report.antiHeuristicGate && !report.antiHeuristicGate.passed) {

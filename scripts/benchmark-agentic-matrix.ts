@@ -30,15 +30,17 @@ import {
   rewriteProfileEndpoints,
 } from './benchmark-parallel.ts'
 import type { AimdStats } from './benchmark-parallel.ts'
-import { prepareIsolatedDataDir } from './benchmark-realistic.ts'
+import {
+  MISSING_OBSERVED_EFFECTIVE_CONFIG_HASH,
+  prepareIsolatedDataDir,
+  resolveObservedEffectiveConfigForRunner,
+} from './benchmark-realistic.ts'
 import {
   CERTIFYING_MIN_HELDOUT_SEEDS,
   DEFAULT_LEDGER_PATH,
-  appendLedgerRow,
   appendPerRunLedgerRow,
   assertNoBurnedSeeds,
   computeBenchmarkVersion,
-  computeEffectiveConfig,
   drawUnburnedHeldoutSeeds,
   promoteLedgerRows,
   resolveGitState,
@@ -104,10 +106,12 @@ export interface MatrixArgs {
   certifying?: boolean
   /** Reason the matrix is non-certifying (e.g. smoke-tier, burned-dev-seed, dev-only), or null. */
   nonCertifyingReason?: string | null
-  /** Optional ledger JSONL path to append cell rows after completion (in addition to default per-run ledger). */
+  /** Optional ledger JSONL path to promote validated per-run rows into (`--ledger [path]`). */
   ledgerPath?: string | null
   /** Optional target ledger path to promote validated per-run rows into (`--promote-ledger`). */
   promoteLedgerPath?: string | null
+  /** Escape hatch for ad-hoc scratch/dry-runs: disable default per-run ledger emission. */
+  noLedger?: boolean
   help: boolean
 }
 
@@ -178,6 +182,14 @@ export interface MatrixCellResult {
   lockError: boolean
   /** True when the cell failed closed on configuration (inert/worker/lock/profile). */
   configError: boolean
+  /** Observed run.effective_config metadata propagated from benchmark-realistic cell meta. */
+  effectiveConfigHash?: string | null
+  effectiveConfig?: EffectiveConfigSnapshot
+  effectiveConfigObserved?: boolean
+  workerImageId?: string | null
+  workerSourceHash?: string | null
+  sdkVersion?: string | null
+  wordlistOn?: boolean
 }
 
 export interface MatrixTotals {
@@ -230,6 +242,13 @@ interface RawMeta {
   durationMs?: unknown
   timedOut?: unknown
   terminalStatus?: unknown
+  effectiveConfigHash?: unknown
+  effectiveConfig?: unknown
+  effectiveConfigObserved?: unknown
+  workerImageId?: unknown
+  workerSourceHash?: unknown
+  sdkVersion?: unknown
+  wordlistOn?: unknown
 }
 
 function fail(message: string): never {
@@ -286,7 +305,7 @@ export function parseMatrixArgs(
     'out-dir', 'data-dir', 'no-llm', 'verifier', 'keep-data-dirs', 'smoke',
     'timeout-ms', 'min-free-gb', 'max-workers', 'no-warm-workers', 'warm-workers',
     'no-model-gate', 'model-gate', 'max-inflight-streams',
-    'held-out', 'certify', 'allow-burned-dev', 'ledger', 'promote-ledger', 'help',
+    'held-out', 'certify', 'allow-burned-dev', 'ledger', 'promote-ledger', 'no-ledger', 'help',
   ])
   for (const key of Object.keys(flags)) if (!known.has(key)) fail(`unknown flag --${key}`)
 
@@ -295,6 +314,10 @@ export function parseMatrixArgs(
   const heldOutFlag = flags['held-out'] === true
   const certifyFlag = flags.certify === true
   const allowBurnedDev = flags['allow-burned-dev'] === true
+  const noLedger = flags['no-ledger'] === true
+  if (noLedger && (flags.ledger !== undefined || flags['promote-ledger'] !== undefined)) {
+    fail('--no-ledger cannot be combined with --ledger or --promote-ledger')
+  }
   const ledgerPath = flags.ledger === true
     ? DEFAULT_LEDGER_PATH
     : (typeof flags.ledger === 'string' ? flags.ledger : null)
@@ -431,6 +454,7 @@ export function parseMatrixArgs(
     nonCertifyingReason,
     ledgerPath,
     promoteLedgerPath,
+    ...(noLedger ? { noLedger: true } : {}),
     help,
   }
 }
@@ -679,6 +703,26 @@ export function collectCellResult(
   const ok = normalized.state !== 'failed_inert'
   const precision = normalized.headlinePrecision
 
+  const rawEffCfg = meta?.effectiveConfig && typeof meta.effectiveConfig === 'object' && !Array.isArray(meta.effectiveConfig)
+    ? (meta.effectiveConfig as EffectiveConfigSnapshot)
+    : undefined
+  const effectiveConfigObserved = meta?.effectiveConfigObserved === true || Boolean(rawEffCfg)
+  const effectiveConfigHash = typeof meta?.effectiveConfigHash === 'string' && meta.effectiveConfigHash.trim()
+    ? meta.effectiveConfigHash.trim()
+    : null
+  const workerImageId = typeof meta?.workerImageId === 'string' && meta.workerImageId.trim()
+    ? meta.workerImageId.trim()
+    : (rawEffCfg?.workerImageId ?? null)
+  const workerSourceHash = typeof meta?.workerSourceHash === 'string' && meta.workerSourceHash.trim()
+    ? meta.workerSourceHash.trim()
+    : (rawEffCfg?.workerSourceHash ?? null)
+  const sdkVersion = typeof meta?.sdkVersion === 'string' && meta.sdkVersion.trim()
+    ? meta.sdkVersion.trim()
+    : (rawEffCfg?.sdkVersion ?? null)
+  const wordlistOn = typeof rawEffCfg?.wordlistOn === 'boolean'
+    ? rawEffCfg.wordlistOn
+    : (typeof meta?.wordlistOn === 'boolean' ? meta.wordlistOn : undefined)
+
   return {
     app: cell.app,
     seed: cell.seed,
@@ -717,6 +761,13 @@ export function collectCellResult(
     ...(error ? { error } : {}),
     lockError,
     configError,
+    ...(effectiveConfigHash ? { effectiveConfigHash } : {}),
+    ...(rawEffCfg ? { effectiveConfig: rawEffCfg } : {}),
+    effectiveConfigObserved,
+    ...(workerImageId !== null ? { workerImageId } : {}),
+    ...(workerSourceHash !== null ? { workerSourceHash } : {}),
+    ...(sdkVersion !== null ? { sdkVersion } : {}),
+    ...(wordlistOn !== undefined ? { wordlistOn } : {}),
   }
 }
 
@@ -889,7 +940,9 @@ Flags:
   --held-out              draw ${CERTIFYING_MIN_HELDOUT_SEEDS} fresh unburned salted seeds (1 in --smoke)
   --certify               require >= ${CERTIFYING_MIN_HELDOUT_SEEDS} fresh unburned held-out seeds (refuses --smoke/--allow-burned-dev)
   --allow-burned-dev      dev-2 debugging only: allow seeds in BURNED_SEEDS (stamps certifying=false)
-  --ledger [path]         append cell rows to versioned ledger (default: ${DEFAULT_LEDGER_PATH})
+  --ledger [path]         promote validated per-run rows to committed ledger (default: ${DEFAULT_LEDGER_PATH})
+  --promote-ledger [path] alias for --ledger [path]
+  --no-ledger             disable default per-run ledger emission (ad-hoc scratch/dry-runs only)
   --modes m,...           ${MATRIX_KNOWN_MODES.join(' | ')} (default: grey-box)
   --budget-usd <n>        per-cell USD budget (default: ${DEFAULT_MATRIX_BUDGET_USD})
   --max-duration-ms <n>   per-cell wall cap (default: ${DEFAULT_MATRIX_MAX_DURATION_MS})
@@ -964,13 +1017,18 @@ export function writeAgenticMatrixLedgerRows(input: {
   runsDir?: string
   ledgerPath?: string | null
   promoteLedgerPath?: string | null
+  noLedger?: boolean
   repoRoot?: string
 }): { perRunPath: string; rows: LedgerRow[] } {
+  if (input.noLedger) return { perRunPath: '', rows: [] }
   const rows: LedgerRow[] = []
   let perRunPath = ''
   const runId = input.runId ?? `agentic-matrix-${input.recordedAt.replace(/[:.]/g, '-')}-${process.pid}`
   for (const cellResult of input.results) {
     const llm = cellResult.modelMode === 'deterministic-no-llm' ? 'deterministic-no-llm' : 'agentic'
+    const cellEffectiveConfig = cellResult.effectiveConfig ?? input.effectiveConfig
+    const hasObservedConfig = Boolean(cellEffectiveConfig) && cellResult.effectiveConfigObserved !== false
+    const cellEffectiveConfigHash = cellResult.effectiveConfigHash ?? input.effectiveConfigHash
     const normalized = ScorecardReader.read(
       {
         app: cellResult.app,
@@ -998,40 +1056,48 @@ export function writeAgenticMatrixLedgerRows(input: {
         error: cellResult.error,
       },
     )
-    const row = buildLedgerRow({
+    const built = buildLedgerRow({
       cell: normalized,
       recordedAt: input.recordedAt,
       suite: 'realistic-bench',
       gitSha: input.gitSha,
       dirty: input.dirty,
       benchmarkVersion: input.benchmarkVersion,
-      effectiveConfigHash: input.effectiveConfigHash,
-      effectiveConfig: input.effectiveConfig,
+      effectiveConfigHash: cellEffectiveConfigHash,
+      ...(cellEffectiveConfig ? { effectiveConfig: cellEffectiveConfig } : {}),
       app: cellResult.app,
       split: cellResult.seedSet,
       mode: cellResult.mode,
       llm,
       seed: cellResult.seed,
       repeat: 1,
-      certifying: input.certifying && normalized.state !== 'failed_inert',
-      reportable: true,
+      certifying: input.certifying && hasObservedConfig && normalized.state !== 'failed_inert',
+      reportable: hasObservedConfig && !(cellEffectiveConfig?.wordlistOn ?? cellResult.wordlistOn ?? false),
       costUsd: cellResult.costUsd,
       durationMs: cellResult.wallMs,
+      ...(!hasObservedConfig ? { notes: ['missing_observed_effective_config'] } : {}),
     })
+    const row: LedgerRow = {
+      ...built,
+      ...(hasObservedConfig ? {} : { status: 'INVALID' as const, certifying: false, reportable: false, recall: null }),
+      workerImageId: cellResult.workerImageId ?? cellEffectiveConfig?.workerImageId ?? null,
+      workerSourceHash: cellResult.workerSourceHash ?? cellEffectiveConfig?.workerSourceHash ?? null,
+      ...(cellResult.sdkVersion ?? cellEffectiveConfig?.sdkVersion
+        ? { sdkVersion: cellResult.sdkVersion ?? cellEffectiveConfig?.sdkVersion ?? null }
+        : {}),
+    }
     const appended = appendPerRunLedgerRow(row, {
       runId,
       runsDir: input.runsDir,
       repoRoot: input.repoRoot,
     })
     perRunPath = appended.path
-    if (input.ledgerPath) {
-      appendLedgerRow(row, input.ledgerPath, input.repoRoot)
-    }
-    rows.push(row)
+    rows.push(appended.row)
   }
-  if (input.promoteLedgerPath && perRunPath) {
+  const promoteTarget = input.promoteLedgerPath ?? input.ledgerPath
+  if (promoteTarget && perRunPath) {
     promoteLedgerRows(perRunPath, {
-      targetLedgerPath: input.promoteLedgerPath,
+      targetLedgerPath: promoteTarget,
       repoRoot: input.repoRoot,
     })
   }
@@ -1092,14 +1158,22 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
     orphans = await reaper.orphans()
     const totals = summarizeMatrix(results)
     const { benchmarkVersion } = computeBenchmarkVersion('realistic-bench')
-    const { effectiveConfigHash, effectiveConfig } = computeEffectiveConfig({
+    const firstObservedCell = results.find(r => Boolean(r.effectiveConfig) && r.effectiveConfigObserved !== false)
+    const cfgResolved = resolveObservedEffectiveConfigForRunner({
+      observed: firstObservedCell?.effectiveConfig ?? null,
       deterministicOnly: args.noLlm,
       environment: 'local-lab',
       approvalPolicy: 'auto_review',
-      wordlistOn: false,
-      verifierBackend: args.verifier,
-      mode: args.modes.join(','),
+      verifierBackend: firstObservedCell?.verifierBackend && firstObservedCell.verifierBackend !== 'unknown'
+        ? firstObservedCell.verifierBackend
+        : args.verifier,
+      mode: firstObservedCell?.mode ?? args.modes.join(','),
+      workerImageId: firstObservedCell?.workerImageId ?? null,
+      workerSourceHash: firstObservedCell?.workerSourceHash ?? null,
+      sdkVersion: firstObservedCell?.sdkVersion ?? null,
     })
+    const effectiveConfigHash = firstObservedCell?.effectiveConfigHash ?? cfgResolved.effectiveConfigHash
+    const effectiveConfig = cfgResolved.effectiveConfig
     const gitState = resolveGitState()
     const matrix = {
       generatedAt: new Date().toISOString(),
@@ -1143,6 +1217,7 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
       certifying: Boolean(args.certifying),
       ledgerPath: args.ledgerPath,
       promoteLedgerPath: args.promoteLedgerPath,
+      noLedger: args.noLedger,
     })
     process.stdout.write(`[matrix] ${results.length} cell(s) -> ${outPath}\n`)
     process.stdout.write(`${renderMatrixTable(results)}\n${renderMatrixSummary(totals)}\n`)
