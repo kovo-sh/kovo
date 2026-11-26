@@ -6,7 +6,7 @@
  */
 import { createServerFn } from '@tanstack/react-start'
 import { z } from 'zod'
-import { id, personaHandle, scopedAssetOrigin, shortText } from './domain.ts'
+import { id, personaHandle, personaPrivilegeSchema, personaTenantRefSchema, scopedAssetOrigin, shortText } from './domain.ts'
 
 const MAX_STORAGE_STATE_JSON_CHARS = 2 * 1024 * 1024
 
@@ -48,6 +48,8 @@ export const createBrowserSessionPersonaSchema = z.object({
   projectId: id,
   handle: personaHandle,
   roleLabel: shortText,
+  tenantRef: personaTenantRefSchema,
+  privilege: personaPrivilegeSchema,
   originAllowlist: z.array(scopedAssetOrigin).min(1).max(64),
   captureToken: captureTokenSchema.optional(),
   storageState: storageStatePayloadSchema.optional(),
@@ -70,6 +72,8 @@ export const updateBrowserSessionPersonaSchema = z.object({
   projectId: id,
   personaId: id,
   roleLabel: shortText,
+  tenantRef: personaTenantRefSchema,
+  privilege: personaPrivilegeSchema,
   originAllowlist: z.array(scopedAssetOrigin).min(1).max(64),
   captureToken: captureTokenSchema.optional(),
   storageState: storageStatePayloadSchema.optional(),

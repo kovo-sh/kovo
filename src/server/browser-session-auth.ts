@@ -27,7 +27,7 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { and, eq } from 'drizzle-orm'
 import { assetOriginForEnvironment } from '../domain.ts'
-import type { PersonaLoginConfig } from '../domain.ts'
+import type { PersonaLoginConfig, PersonaPrivilege } from '../domain.ts'
 import {
   buildChromiumLaunchArgs,
   buildPlaywrightChromiumLaunchOptions,
@@ -2155,6 +2155,8 @@ export function registerBrowserSessionPersonaFromAction(
     projectId: string
     handle: string
     roleLabel: string
+    tenantRef?: string | null
+    privilege?: PersonaPrivilege | null
     originAllowlist: string[]
     captureToken?: string
     storageState?: unknown
@@ -2186,6 +2188,8 @@ export function registerBrowserSessionPersonaFromAction(
     projectId: data.projectId,
     handle: data.handle,
     roleLabel: data.roleLabel,
+    ...(data.tenantRef !== undefined ? { tenantRef: data.tenantRef } : {}),
+    ...(data.privilege !== undefined ? { privilege: data.privilege } : {}),
     originAllowlist,
     storageState: resolvedStorageState,
     observedHeaders: data.observedHeaders,
@@ -2214,6 +2218,8 @@ export function updateBrowserSessionPersonaFromAction(
     projectId: string
     personaId: string
     roleLabel: string
+    tenantRef?: string | null
+    privilege?: PersonaPrivilege | null
     originAllowlist: string[]
     captureToken?: string
     storageState?: unknown
@@ -2243,6 +2249,8 @@ export function updateBrowserSessionPersonaFromAction(
     projectId: data.projectId,
     personaId: data.personaId,
     roleLabel: data.roleLabel,
+    ...(data.tenantRef !== undefined ? { tenantRef: data.tenantRef } : {}),
+    ...(data.privilege !== undefined ? { privilege: data.privilege } : {}),
     originAllowlist,
     ...(resolvedStorageState !== undefined ? { storageState: resolvedStorageState } : {}),
     observedHeaders: data.observedHeaders,

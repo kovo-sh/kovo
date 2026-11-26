@@ -6,10 +6,11 @@ import { basename, join, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { pathToFileURL } from 'node:url'
 import { assetOriginForEnvironment, personaHandle } from '../src/domain.ts'
-import type { CapabilityTier, Finding } from '../src/domain.ts'
+import type { CapabilityTier, Finding, PersonaPrivilege } from '../src/domain.ts'
 import { Execution } from '../src/server/execution.ts'
 import { projectReposDir } from '../src/server/github-connector.ts'
 import { assertLocalLabAllowed, getSharedLabRunner, LabRunner } from '../src/server/lab-runner.ts'
+import { normalizeRole } from '../src/server/oracle-invariants.ts'
 import { createProjectPersona } from '../src/server/persona-vault.ts'
 import { exportReportMarkdown } from '../src/server/report-export.ts'
 import { exportReportSarif } from '../src/server/sarif-export.ts'
@@ -44,6 +45,8 @@ export interface CliOptions {
 export interface ParsedPersonaConfig {
   handle: string
   roleLabel: string
+  tenantRef?: string | null
+  privilege?: PersonaPrivilege | null
   authKind: 'cookie' | 'bearer' | 'header'
   headerName?: string
   originAllowlist: string[]
@@ -337,9 +340,13 @@ export function loadPersonaFile(
     if (!rawAllowlist.length) {
       throw new Error(`Persona "${handle}" requires at least one allowed origin (--origin or originAllowlist).`)
     }
+    const tenantRef = typeof parsed.tenantRef === 'string' && parsed.tenantRef.trim() ? parsed.tenantRef.trim() : null
+    const privilege = typeof parsed.privilege === 'string' ? normalizeRole(parsed.privilege) : null
     return {
       handle,
       roleLabel: typeof parsed.roleLabel === 'string' && parsed.roleLabel.trim() ? parsed.roleLabel.trim() : handle,
+      tenantRef,
+      privilege,
       authKind,
       headerName: typeof parsed.headerName === 'string' ? parsed.headerName : undefined,
       originAllowlist: rawAllowlist,
@@ -687,6 +694,8 @@ export async function runCli(argv: readonly string[]): Promise<0 | 1 | 2> {
         projectId,
         handle: p.handle,
         roleLabel: p.roleLabel,
+        ...(p.tenantRef !== undefined ? { tenantRef: p.tenantRef } : {}),
+        ...(p.privilege !== undefined ? { privilege: p.privilege } : {}),
         originAllowlist: p.originAllowlist,
         authKind: p.authKind,
         headerName: p.headerName,

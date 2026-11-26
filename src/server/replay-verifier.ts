@@ -243,6 +243,8 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
   const personaSources: PersonaCredentialSource[] = [...(grant.personas?.values() ?? [])].map(persona => ({
     handle: persona.handle,
     roleLabel: persona.roleLabel,
+    tenantRef: persona.tenantRef ?? null,
+    privilege: persona.privilege ?? null,
     authKind: persona.authKind,
     headerType: persona.session?.headerType ?? null,
     cookies: (persona.session?.bundle?.cookies ?? []).map(cookie => ({ name: cookie.name, sameSite: cookie.sameSite ?? null })),

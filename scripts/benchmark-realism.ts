@@ -45,13 +45,14 @@ import type {
 import { endpointMatches, gradeFindings, loadTruth } from '../benchmarks/realism-suite/lib/grade.ts'
 import { assertLocalLabAllowed } from '../benchmarks/realism-suite/lib/safety.ts'
 import { FIXTURES, briefingFor, startFixture } from '../benchmarks/realism-suite/run.ts'
-import type { Finding } from '../src/domain.ts'
+import type { Finding, PersonaPrivilege } from '../src/domain.ts'
 import { BrokerDenied, RequestBroker } from '../src/server/broker.ts'
 import type { BrokerExchangeResult, BrokerHttpRequest, BrokerRaceBurstResult, Grant } from '../src/server/broker.ts'
 import { CanaryBroker } from '../src/server/canary-broker.ts'
 import { Execution } from '../src/server/execution.ts'
 import { projectReposDir } from '../src/server/github-connector.ts'
 import { privateModelProfiles } from '../src/server/model-settings.ts'
+import { normalizeRole } from '../src/server/oracle-invariants.ts'
 import { ScopedBrowser, personaSessionBundle } from '../src/server/scoped-browser.ts'
 import { createProjectPersona, personaSecrets, resolveRunPersonas } from '../src/server/persona-vault.ts'
 import { buildProofReceipt, verifyReceipt } from '../src/server/proof-receipt.ts'
@@ -367,6 +368,8 @@ export function countOpenApiOperations(doc: OpenApiDoc | null): number {
 interface PlannedPersona {
   handle: string
   roleLabel: string
+  tenantRef: string | null
+  privilege: PersonaPrivilege | null
   authKind: 'bearer' | 'cookie'
   secret: string
   canaryMarkers: string[]
@@ -410,10 +413,14 @@ export function planCell(input: {
     return handle
   }
   for (const persona of briefing.personas) {
+    const tenantRef = persona.tenant.trim() || null
+    const privilege = normalizeRole(persona.role)
     if (persona.token) {
       personas.push({
         handle: uniqueHandle(persona.id),
         roleLabel: `${persona.role} (${persona.tenant})`,
+        tenantRef,
+        privilege,
         authKind: 'bearer',
         secret: persona.token.replace(/^Bearer\s+/i, ''),
         canaryMarkers: [],
@@ -424,6 +431,8 @@ export function planCell(input: {
         personas.push({
           handle: uniqueHandle(`${persona.id}-browser`),
           roleLabel: `${persona.role} (${persona.tenant}) browser session`,
+          tenantRef,
+          privilege,
           authKind: 'cookie',
           secret: input.browserCookie(persona.id),
           canaryMarkers: [],
@@ -3545,6 +3554,8 @@ export async function runCell(args: RealismArgs, fixtureName: string, signal: Ab
           projectId: project.id,
           handle: planned.handle,
           roleLabel: planned.roleLabel,
+          tenantRef: planned.tenantRef,
+          privilege: planned.privilege,
           originAllowlist: Object.values(briefing.origins).map(normalizeOrigin),
           authKind: planned.authKind,
           secret: planned.secret,

@@ -23,6 +23,7 @@ import {
   assessImpactEvidence,
   assessMassAssignmentImpact,
   assessMfaBypass,
+  normalizeRole,
 } from '../src/server/oracle-invariants.ts'
 import type { ActorIdentity, ImpactInput, ImpactStep } from '../src/server/oracle-invariants.ts'
 import { start as startZeroVulnTrap } from '../benchmarks/realism-suite/traps/zero-vuln.ts'
@@ -1454,6 +1455,8 @@ async function runTrapCell(plan: CellPlan, opts: SmokeArgs): Promise<CellMetrics
       secret: persona.token,
       authKind: 'bearer',
       roleLabel: `${persona.role} (${persona.tenant})`,
+      tenantRef: persona.tenant.trim() || null,
+      privilege: normalizeRole(persona.role),
       canaryMarkers: [],
     }, null, 2)}\n`, { mode: 0o600 })
     personaArgs.push('--persona', `${persona.id}:${credentialPath}`)

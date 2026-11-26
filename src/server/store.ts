@@ -375,6 +375,10 @@ function repairKnownSchemaDrift(client: DatabaseSync, jsonSupported: boolean): v
     ctx.ensureColumn('approval_leases', 'max_uses', 'INTEGER')
     ctx.ensureColumn('approval_leases', 'cross_persona', 'INTEGER NOT NULL DEFAULT 0')
   }
+  if (ctx.tableExists('personas')) {
+    ctx.ensureColumn('personas', 'tenant_ref', 'TEXT')
+    ctx.ensureColumn('personas', 'privilege', 'TEXT')
+  }
   // Always ensure confirmation triggers match the current strict R2-12 SQL definition.
   installConfirmationGuards(ctx, jsonSupported)
 }
@@ -519,6 +523,8 @@ const STORE_MIGRATIONS: readonly MigrationStep[] = [
           workspace_id TEXT NOT NULL REFERENCES workspaces(id),
           handle TEXT NOT NULL,
           role_label TEXT NOT NULL,
+          tenant_ref TEXT,
+          privilege TEXT,
           origin_allowlist TEXT NOT NULL,
           auth_kind TEXT NOT NULL,
           header_name TEXT,
@@ -1492,6 +1498,15 @@ const STORE_MIGRATIONS: readonly MigrationStep[] = [
         END
         WHERE max_uses IS NULL
       `).run(DEFAULT_ROUTE_LEASE_MAX_USES, DEFAULT_HOST_LEASE_MAX_USES)
+    },
+  },
+  {
+    version: 12,
+    name: 'v12_typed_persona_identity',
+    up(ctx) {
+      if (!ctx.tableExists('personas')) return
+      ctx.ensureColumn('personas', 'tenant_ref', 'TEXT')
+      ctx.ensureColumn('personas', 'privilege', 'TEXT')
     },
   },
 ]

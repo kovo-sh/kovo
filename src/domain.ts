@@ -865,11 +865,18 @@ export const personaLoginConfigSchema = z.object({
 })
 export type PersonaLoginConfig = z.output<typeof personaLoginConfigSchema>
 
+export const personaPrivileges = ['viewer', 'member', 'admin', 'owner'] as const
+export type PersonaPrivilege = typeof personaPrivileges[number]
+export const personaTenantRefSchema = z.string().trim().max(120).transform(v => (v.length > 0 ? v : null)).nullable().optional()
+export const personaPrivilegeSchema = z.enum(personaPrivileges).nullable().optional()
+
 export const createPersona = z.object({
   requestId: id,
   projectId: id,
   handle: personaHandle,
   roleLabel: shortText,
+  tenantRef: personaTenantRefSchema,
+  privilege: personaPrivilegeSchema,
   originAllowlist: z.array(scopedAssetOrigin).min(1).max(64),
   authKind: z.enum(personaAuthKinds),
   headerName: z.string().trim().regex(/^[A-Za-z0-9-]{1,64}$/).optional(),
@@ -911,6 +918,8 @@ export const updatePersona = z.object({
   projectId: id,
   personaId: id,
   roleLabel: shortText,
+  tenantRef: personaTenantRefSchema,
+  privilege: personaPrivilegeSchema,
   originAllowlist: z.array(scopedAssetOrigin).min(1).max(64),
   authKind: z.enum(personaAuthKinds),
   headerName: z.string().trim().regex(/^[A-Za-z0-9-]{1,64}$/).optional(),
@@ -1362,6 +1371,8 @@ export interface PublicPersona {
   projectId: string
   handle: string
   roleLabel: string
+  tenantRef?: string | null
+  privilege?: PersonaPrivilege | null
   originAllowlist: string[]
   authKind: PersonaAuthKind
   headerName: string | null

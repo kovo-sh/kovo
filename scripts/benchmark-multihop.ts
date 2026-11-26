@@ -51,6 +51,7 @@ import { Execution } from '../src/server/execution.ts'
 import { projectReposDir } from '../src/server/github-connector.ts'
 import { inspectModelProfileLoad } from '../src/server/model-settings.ts'
 import type { ResolvedModelProfile } from '../src/server/model-settings.ts'
+import { normalizeRole } from '../src/server/oracle-invariants.ts'
 import { createProjectPersona } from '../src/server/persona-vault.ts'
 import type { NamedSecret } from '../src/server/redact.ts'
 import { redact, redactJsonValue } from '../src/server/redact.ts'
@@ -3142,6 +3143,8 @@ export async function runCell(
             projectId,
             handle: p.handle,
             roleLabel: p.roleLabel,
+            tenantRef: p.tenantId || null,
+            privilege: normalizeRole(p.role),
             originAllowlist: plan.publicOrigins,
             authKind: 'login',
             loginConfig: {

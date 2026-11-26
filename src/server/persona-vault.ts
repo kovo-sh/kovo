@@ -16,6 +16,7 @@ import type { z } from 'zod'
 import type {
   PersonaAuthKind,
   PersonaLoginConfig,
+  PersonaPrivilege,
   PublicPersona,
   createPersona,
   deletePersona,
@@ -186,6 +187,8 @@ export interface ResolvedPersona {
   id: string
   handle: string
   roleLabel: string
+  tenantRef?: string | null
+  privilege?: PersonaPrivilege | null
   originAllowlist: string[]
   authKind: PersonaAuthKind
   headerName: string | null
@@ -1700,8 +1703,10 @@ export function listProjectPersonas(storage: Store, projectId: string): PublicPe
   return storage.db.select().from(personas)
     .where(and(eq(personas.projectId, projectId), eq(personas.workspaceId, storage.workspace.id)))
     .all()
-    .map(({ credentialId: _omit, workspaceId: _ws, loginConfig, ...pub }) => ({
+    .map(({ credentialId: _omit, workspaceId: _ws, loginConfig, tenantRef, privilege, ...pub }) => ({
       ...pub,
+      tenantRef: tenantRef ?? null,
+      privilege: privilege ?? null,
       loginConfig: loginConfig ?? null,
     }))
 }
@@ -1785,6 +1790,8 @@ export function createProjectPersona(storage: Store, input: z.output<typeof crea
         workspaceId: storage.workspace.id,
         handle: input.handle,
         roleLabel: input.roleLabel,
+        tenantRef: input.tenantRef ?? null,
+        privilege: input.privilege ?? null,
         originAllowlist: dedupedAllowlist,
         authKind: input.authKind,
         headerName: input.authKind === 'header' ? (input.headerName ?? 'X-Api-Key') : null,
@@ -1918,6 +1925,8 @@ export function updateProjectPersona(storage: Store, input: z.output<typeof upda
     try {
       storage.db.update(personas).set({
         roleLabel: input.roleLabel,
+        tenantRef: input.tenantRef !== undefined ? (input.tenantRef ?? null) : existing.tenantRef,
+        privilege: input.privilege !== undefined ? (input.privilege ?? null) : existing.privilege,
         originAllowlist: dedupedAllowlist,
         authKind: input.authKind,
         headerName: input.authKind === 'header' ? (input.headerName ?? 'X-Api-Key') : null,
@@ -1966,6 +1975,8 @@ export interface CreateBrowserSessionPersonaInput {
   projectId: string
   handle: string
   roleLabel: string
+  tenantRef?: string | null
+  privilege?: PersonaPrivilege | null
   originAllowlist: string[]
   /** Either a raw Playwright storageState object/JSON string or a wrapped BrowserStorageBundle. */
   storageState: unknown
@@ -2074,6 +2085,8 @@ export function createBrowserSessionPersona(
     projectId: input.projectId,
     handle: input.handle,
     roleLabel: input.roleLabel,
+    ...(input.tenantRef !== undefined ? { tenantRef: input.tenantRef } : {}),
+    ...(input.privilege !== undefined ? { privilege: input.privilege } : {}),
     originAllowlist: scopedAllowlist,
     authKind: 'login',
     loginConfig: {
@@ -2091,6 +2104,8 @@ export interface UpdateBrowserSessionPersonaInput {
   projectId: string
   personaId: string
   roleLabel: string
+  tenantRef?: string | null
+  privilege?: PersonaPrivilege | null
   originAllowlist: string[]
   /** Optional replacement Playwright storageState or BrowserStorageBundle; omit to keep existing. */
   storageState?: unknown
@@ -2114,6 +2129,8 @@ export function updateBrowserSessionPersona(
     projectId: input.projectId,
     personaId: input.personaId,
     roleLabel: input.roleLabel,
+    ...(input.tenantRef !== undefined ? { tenantRef: input.tenantRef } : {}),
+    ...(input.privilege !== undefined ? { privilege: input.privilege } : {}),
     originAllowlist: scopedAllowlist,
     authKind: 'login',
     loginConfig: {
@@ -2197,6 +2214,8 @@ export function resolveRunPersonas(storage: Store, projectId: string, approvedPe
           id: row.id,
           handle: row.handle,
           roleLabel: row.roleLabel,
+          tenantRef: row.tenantRef ?? null,
+          privilege: row.privilege ?? null,
           originAllowlist: row.originAllowlist,
           authKind: row.authKind,
           headerName: row.headerName,
@@ -2234,6 +2253,8 @@ export function resolveRunPersonas(storage: Store, projectId: string, approvedPe
         id: row.id,
         handle: row.handle,
         roleLabel: row.roleLabel,
+        tenantRef: row.tenantRef ?? null,
+        privilege: row.privilege ?? null,
         originAllowlist: row.originAllowlist,
         authKind: row.authKind,
         headerName: row.headerName,
@@ -2258,6 +2279,8 @@ export function resolveRunPersonas(storage: Store, projectId: string, approvedPe
       id: row.id,
       handle: row.handle,
       roleLabel: row.roleLabel,
+      tenantRef: row.tenantRef ?? null,
+      privilege: row.privilege ?? null,
       originAllowlist: row.originAllowlist,
       authKind: row.authKind,
       headerName: row.headerName,

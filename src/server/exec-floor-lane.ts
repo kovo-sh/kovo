@@ -31,6 +31,7 @@ import {
   type ExecCoreServices,
 } from './exec-exchange.ts'
 import { graphLeadTargets } from './graph-leads.ts'
+import { resolvePersonaIdentity } from './oracle-invariants.ts'
 import { resolveRunPersonas } from './persona-vault.ts'
 import { listEndpointsPaged } from './phase0-recon.ts'
 import type { ProbePlanRegistry } from './probe-plan.ts'
@@ -1027,23 +1028,22 @@ export class ExecFloorLane extends ExecServiceModule<ExecFloorLaneHost> {
       }
       if (!endpoints.length) return
 
-      const tenantOf = (roleLabel: string): string | undefined => {
-        const match = /\(([^()]+)\)\s*$/.exec(roleLabel)
-        return match?.[1]?.trim() || undefined
-      }
-      const privilegeOf = (roleLabel: string): EnginePersona['privilege'] => {
-        if (/admin|superuser|owner[-_ ]?admin/i.test(roleLabel)) return 'admin'
-        if (/viewer|read[-_ ]?only|readonly|guest|auditor|audit/i.test(roleLabel)) return 'viewer'
-        return 'member'
-      }
       const personas: EnginePersona[] = [...resolveRunPersonas(this.storage, current.projectId, current.approvedPersonaIds).values()]
         .filter(persona => persona.originAllowlist.some(origin => approvedOrigins.has(origin)))
-        .map(persona => ({
-          handle: persona.handle,
-          roleLabel: persona.roleLabel,
-          privilege: privilegeOf(persona.roleLabel),
-          tenant: tenantOf(persona.roleLabel),
-        }))
+        .map(persona => {
+          const identity = resolvePersonaIdentity({
+            roleLabel: persona.roleLabel,
+            tenantRef: persona.tenantRef ?? null,
+            privilege: persona.privilege ?? null,
+            handle: persona.handle,
+          })
+          return {
+            handle: persona.handle,
+            roleLabel: persona.roleLabel,
+            privilege: identity.privilege,
+            tenant: identity.tenant ?? undefined,
+          }
+        })
 
       // Phase A has its own allowance in split mode (`floorRequestBudget`), so the floor can never
       // spend the agents' requests. Legacy mode keeps the shared remainder as the only cap. The

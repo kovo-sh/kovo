@@ -157,8 +157,8 @@ test('R2-09 v11 migration: conservatively backfills legacy /x/** rows as route (
   const migrated = new Store(dir)
   t.after(() => { try { migrated.close() } catch { /* already closed */ } })
   const version = Number((migrated.client.prepare('PRAGMA user_version').get() as { user_version: number }).user_version)
-  assert.equal(version, 11)
-  assert.equal(STORE_SCHEMA_VERSION, 11)
+  assert.equal(version, STORE_SCHEMA_VERSION)
+  assert.equal(STORE_SCHEMA_VERSION, 12)
 
   const leases = migrated.listApprovalLeases(runId, 'active')
   const byId = new Map(leases.map(l => [l.id, l]))

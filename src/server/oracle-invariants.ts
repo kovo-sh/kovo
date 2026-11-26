@@ -146,9 +146,112 @@ export function parseRoleLabel(label: string | null | undefined): { role: RoleNa
   return { role: firstRole, tenant: firstTenant }
 }
 
+export interface PersonaIdentityInput {
+  roleLabel?: string | null
+  tenantRef?: string | null
+  privilege?: RoleName | string | null
+  handle?: string | null
+}
+
+export interface ResolvedPersonaIdentity {
+  privilege: RoleName | null
+  /** Alias for `privilege` for ergonomics alongside `parseRoleLabel` callers. */
+  role: RoleName | null
+  tenant: string | null
+  tenants: readonly string[]
+  source: 'typed' | 'label_fallback' | 'mixed' | 'empty'
+  usedLabelFallback: boolean
+}
+
+let personaIdentityFallbackCount = 0
+
+export function getPersonaIdentityFallbackCount(): number {
+  return personaIdentityFallbackCount
+}
+
+export function resetPersonaIdentityFallbackCount(): void {
+  personaIdentityFallbackCount = 0
+}
+
+/**
+ * Single authoritative persona identity resolver (R2-17 / cq-10 Stage 1).
+ * Typed `tenantRef` and `privilege` take precedence over `roleLabel`. When either typed
+ * field is absent, falls back to `parseRoleLabel(roleLabel)` and increments the structured
+ * fallback counter only if a non-null role or tenant was actually derived from the label.
+ * Fails closed (`privilege: null, tenant: null`) when both typed fields and label are empty.
+ */
+export function resolvePersonaIdentity(input: PersonaIdentityInput | null | undefined): ResolvedPersonaIdentity {
+  const typedPrivilege = normalizeRole(input?.privilege ?? null)
+  const rawTypedTenant = typeof input?.tenantRef === 'string' ? input.tenantRef.trim().toLowerCase() : ''
+  const typedTenant = rawTypedTenant.length > 0 ? rawTypedTenant : null
+
+  const label = typeof input?.roleLabel === 'string' ? input.roleLabel : null
+  const needLabelForPrivilege = typedPrivilege === null
+  const needLabelForTenant = typedTenant === null
+  const labelHasMultiMembership = Boolean(
+    label && (MEMBERSHIPS_ATTR_RE.test(label) || (label.includes('@') && /[,;]/.test(label))),
+  )
+
+  if (!needLabelForPrivilege && !needLabelForTenant) {
+    let tenants: string[] = [typedTenant!]
+    if (labelHasMultiMembership) {
+      const labelTenants = parseRoleTenants(label)
+      if (labelTenants.length > 1 && labelTenants.includes(typedTenant!)) {
+        tenants = [...new Set([typedTenant!, ...labelTenants])]
+      }
+    }
+    return {
+      privilege: typedPrivilege,
+      role: typedPrivilege,
+      tenant: typedTenant,
+      tenants,
+      source: 'typed',
+      usedLabelFallback: false,
+    }
+  }
+
+  const labelParsed = label ? parseRoleLabel(label) : { role: null, tenant: null }
+  const labelTenants = label ? parseRoleTenants(label) : []
+
+  const privilege = typedPrivilege ?? labelParsed.role
+  const tenant = typedTenant ?? labelParsed.tenant
+  const usedPrivilegeFallback = needLabelForPrivilege && labelParsed.role !== null
+  const usedTenantFallback = needLabelForTenant && labelParsed.tenant !== null
+  const usedLabelFallback = usedPrivilegeFallback || usedTenantFallback
+
+  if (usedLabelFallback) {
+    personaIdentityFallbackCount += 1
+  }
+
+  const tenants = tenant === null
+    ? []
+    : (typedTenant !== null && !labelHasMultiMembership
+        ? [typedTenant]
+        : [...new Set([tenant, ...labelTenants])])
+
+  const hasTyped = typedPrivilege !== null || typedTenant !== null
+  const source: ResolvedPersonaIdentity['source'] =
+    privilege === null && tenant === null
+      ? 'empty'
+      : usedLabelFallback
+        ? (hasTyped ? 'mixed' : 'label_fallback')
+        : 'typed'
+
+  return {
+    privilege,
+    role: privilege,
+    tenant,
+    tenants,
+    source,
+    usedLabelFallback,
+  }
+}
+
 export interface PersonaCredentialSource {
   handle: string
   roleLabel?: string | null
+  tenantRef?: string | null
+  privilege?: RoleName | string | null
   authKind?: string | null
   headerType?: string | null
   cookies?: ReadonlyArray<{ name?: string | null; sameSite?: string | null }>
@@ -221,12 +324,16 @@ export function actorFromPersona(
 ): ActorIdentity {
   if (!handle) return { ...EMPTY_ACTOR }
   const source = personas.find(persona => persona.handle === handle)
-  const parsed = parseRoleLabel(source?.roleLabel ?? null)
-  const role = normalizeRole(declared?.roles?.[handle] ?? null) ?? parsed.role ?? normalizeRole(handle)
+  const identity = resolvePersonaIdentity({
+    roleLabel: source?.roleLabel ?? null,
+    tenantRef: source?.tenantRef ?? null,
+    privilege: source?.privilege ?? null,
+    handle,
+  })
+  const role = normalizeRole(declared?.roles?.[handle] ?? null) ?? identity.privilege ?? normalizeRole(handle)
   const declaredTenant = declared?.tenants?.[handle]?.toLowerCase() ?? null
-  const tenant = declaredTenant ?? parsed.tenant
-  const parsedTenants = parseRoleTenants(source?.roleLabel ?? null)
-  const allTenants = [...new Set([...(declaredTenant ? [declaredTenant] : []), ...parsedTenants])]
+  const tenant = declaredTenant ?? identity.tenant
+  const allTenants = [...new Set([...(declaredTenant ? [declaredTenant] : []), ...identity.tenants])]
   const sameSite = source?.cookies?.find(cookie => cookie.sameSite)?.sameSite ?? null
   return {
     handle,
