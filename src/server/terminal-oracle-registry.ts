@@ -238,7 +238,14 @@ function defaultV8FamilyHandler(
   opts?: { econCtx?: EconomicAutoHydrateContext; fallbackSig?: string; verifySignature?: SignatureVerifier },
 ): V8OracleDecision {
   const transcript = factLog.toHostSignedTranscript()
-  const entriesById = new Map((transcript.entries ?? []).map(e => [e.exchangeId, e]))
+  const signedEntriesById = new Map((transcript.entries ?? []).map(e => [e.exchangeId, e]))
+  const entriesById = new Map([...signedEntriesById].map(([id, e]) => {
+    const rawRequest = factLog.getExchange(id)?.rawRequestBody
+    const entry = e.step.requestJson === undefined && rawRequest !== null && rawRequest !== undefined
+      ? { ...e, step: { ...e.step, requestJson: rawRequest } }
+      : e
+    return [id, entry] as const
+  }))
   const oobById = new Map((transcript.oobEvents ?? []).map(o => [o.id, o]))
   const tracesById = new Map((transcript.browserTraces ?? []).map(t => [t.id, t]))
   const pollsById = new Map((transcript.asyncPollRecords ?? []).map(p => [p.id, p]))
@@ -248,7 +255,8 @@ function defaultV8FamilyHandler(
     if (policy.allowedExchangeIds && entriesById.has(rec.id) && !policy.allowedExchangeIds.has(rec.id)) return false
     const e = entriesById.get(rec.id) ?? oobById.get(rec.id) ?? tracesById.get(rec.id) ?? pollsById.get(rec.id)
     if (!e) return false
-    if (policy.signingKey && (e.hostSignature !== rec.hostSignature || !verifyHostRecordSignature(e, policy.signingKey))) {
+    const signed = signedEntriesById.get(rec.id) ?? e
+    if (policy.signingKey && (signed.hostSignature !== rec.hostSignature || !verifyHostRecordSignature(signed, policy.signingKey))) {
       return false
     }
     return pollsById.has(rec.id) || matchesHydratedRecord(rec, idx, fallbackSig)
@@ -338,7 +346,7 @@ export class TerminalOracleRegistry {
         ...(policyContext.forbiddenShortcutPersonas ? { forbiddenShortcutPersonas: policyContext.forbiddenShortcutPersonas } : {}),
         ...(policyContext.benchmarkMode !== undefined ? { benchmarkMode: policyContext.benchmarkMode } : {}),
         ...(policyContext.requireCleanSessionFlag !== undefined ? { requireCleanSessionFlag: policyContext.requireCleanSessionFlag } : {}),
-        strictHostDerivation: policyContext.strictHostDerivation ?? true,
+        strictHostDerivation: true,
         factLog,
       })
       return {
@@ -429,7 +437,7 @@ export class TerminalOracleRegistry {
         ...(policyContext.forbiddenShortcutPersonas ? { forbiddenShortcutPersonas: policyContext.forbiddenShortcutPersonas } : {}),
         ...(policyContext.benchmarkMode !== undefined ? { benchmarkMode: policyContext.benchmarkMode } : {}),
         ...(policyContext.requireCleanSessionFlag !== undefined ? { requireCleanSessionFlag: policyContext.requireCleanSessionFlag } : {}),
-        strictHostDerivation: policyContext.strictHostDerivation ?? true,
+        strictHostDerivation: true,
         factLog,
       })
       const singleHop = compRes.terminalVerification ?? {

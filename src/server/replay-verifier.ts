@@ -422,9 +422,8 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
               probeDetail: probeWait.detail,
               controlDetail: controlCheck.detail,
               token: prbCanary.token,
-              callbackId: probeWait.subscriptionId ?? `canary:${prbCanary.token}`,
+              ...(probeWait.subscriptionId ? { callbackId: probeWait.subscriptionId } : {}),
               stage: probeWait.stage === 'late' ? 'late' : 'immediate',
-              receivedAtMs: Date.now(),
             },
           }
         }
@@ -812,6 +811,9 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
     exchangeIds,
     exchanges,
     envelopeTrust: params.envelopeTrust,
+    ...(params.canaryBroker ? { canaryBroker: params.canaryBroker } : {}),
+    canaryRunId: params.runId ?? 'replay-verifier',
+    ...(params.storage ? { canaryStorage: params.storage } : {}),
   })
 
   return {

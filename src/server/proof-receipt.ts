@@ -15,7 +15,7 @@
 import { createHmac } from 'node:crypto'
 import { z } from 'zod'
 import { scopedAssetOrigin } from '../domain.ts'
-import { HostFactLog, type HostExchangeFact } from './host-fact-log.ts'
+import { HostFactLog, parseBodyFromCarrierText, type HostExchangeFact } from './host-fact-log.ts'
 import {
   assessBooleanDifferential,
   assessImpactEvidence,
@@ -422,14 +422,10 @@ export function verifyReceipt(rawReceipt: unknown, transcript: ReceiptTranscript
     const extractCarrierRequestBody = (entry: ReceiptTranscriptEntry): string | undefined => {
       if (typeof entry.step.requestJson === 'string' && entry.step.requestJson.length > 0) return entry.step.requestJson
       if (entry.step.requestJson !== undefined || !entry.carrierText) return undefined
-      const lines = entry.carrierText.split('\n').map(l => l.trim()).filter(Boolean)
-      for (let i = lines.length - 1; i >= 0; i -= 1) {
-        const line = lines[i]!
-        if (/^(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+\//i.test(line)) continue
-        if (/^[A-Za-z0-9-]+:\s/.test(line)) continue
-        return line
-      }
-      return undefined
+      const response = typeof entry.step.body === 'string'
+        ? entry.step.body
+        : entry.step.json !== undefined ? JSON.stringify(entry.step.json) : null
+      return parseBodyFromCarrierText(entry.carrierText, entry.step.requestHeaders, response) ?? undefined
     }
     const toArm = (entry: ReceiptTranscriptEntry): BooleanDifferentialArm => {
       const requestBody = extractCarrierRequestBody(entry)
@@ -1544,6 +1540,14 @@ function verifyAuthBypassReceipt(
       const differential = authBypassRequestDifferential(control.step, probe.step)
       if (!differential) {
         lastRejection = 'Control and probe requests carry no distinct auth header, forged token, bypass parameter, or request body differential.'
+        continue
+      }
+      const controlHeaders = canonicalRequestHeaderMap(control.step.requestHeaders)
+      const authenticatedControl = normalizedAuthHandle(control.step.actor.handle) !== null ||
+        ['cookie', 'bearer', 'header'].includes(control.step.actor.auth) ||
+        Boolean(controlHeaders.cookie || controlHeaders.authorization || control.sessionId)
+      if (differential !== 'header' && (control.step.status !== 401 || authenticatedControl)) {
+        lastRejection = 'Auth bypass rejected: an authenticated/forbidden control changing only a query or body field is an authorization or ordinary request difference, not an authentication bypass.'
         continue
       }
       const probeBodyRaw = typeof probe.step.body === 'string'

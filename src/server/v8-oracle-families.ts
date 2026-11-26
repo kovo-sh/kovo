@@ -203,6 +203,7 @@ export function evaluateDualTenantAbac(input: DualTenantAbacInput): V8OracleDeci
     if (!isOk(input.postTransferReadback.status) || input.postTransferReadback.id === input.transferRecord.id) return deny(f, 'readback_not_accepted', sub)
     const aKey = normKey(input.actor.actorId), tAct = normKey(input.transferRecord.actorId), cAct = normKey(input.sourceControlDenied!.actorId)
     if ((tAct && tAct !== aKey) || (cAct && cAct !== aKey)) return deny(f, 'actor_record_mismatch', sub)
+    if (input.sourceControlDenied!.status === 401 && (!cAct || cAct !== aKey)) return deny(f, 'unauthenticated_baseline_control', sub)
     if (stubRec(input.postTransferReadback)) return deny(f, 'terminal_impact_unproven_intermediate_stub', sub)
     if (input.postTransferReadback.timestampMs < input.transferRecord.timestampMs) return deny(f, 'non_monotonic_readback_timestamp', sub)
     if (normKey(input.observedOwnerTenantId) !== dst) return deny(f, 'transfer_not_persisted_to_dest_tenant', sub)
@@ -222,7 +223,7 @@ export function evaluateDualTenantAbac(input: DualTenantAbacInput): V8OracleDeci
     if (!isOk(input.bledAccess.status)) return deny(f, 'bled_access_denied_or_failed', sub)
     const cRt = normRoute(input.baselineDeniedControl.route), bRt = normRoute(input.bledAccess.route)
     if (cRt && bRt && cRt !== bRt) return deny(f, 'baseline_control_and_bled_route_mismatch', sub)
-    if (input.baselineDeniedControl.status === 401 && normKey(input.bledAccess.actorId) && !normKey(input.baselineDeniedControl.actorId)) return deny(f, 'unauthenticated_baseline_control', sub)
+    if (input.baselineDeniedControl.status === 401 && normKey(input.baselineDeniedControl.actorId) !== normKey(input.actor.actorId)) return deny(f, 'unauthenticated_baseline_control', sub)
     if (!input.isolatedControl && input.primeAction.timestampMs < input.baselineDeniedControl.timestampMs) return deny(f, 'non_monotonic_prime_timestamp', sub)
     if (input.bledAccess.timestampMs < input.primeAction.timestampMs) return deny(f, 'non_monotonic_bled_timestamp', sub)
     const obsT = normKey(input.observedTenantId)
@@ -251,6 +252,8 @@ export function evaluateDualTenantAbac(input: DualTenantAbacInput): V8OracleDeci
     if (recErr) return deny(f, recErr, sub)
     if (!isDenied(input.singleForeignControlDenied.status)) return deny(f, 'single_foreign_control_not_denied', sub)
     if (!isOk(input.batchRequest.status)) return deny(f, 'batch_request_denied_or_failed', sub)
+    const cAct = normKey(input.singleForeignControlDenied.actorId), bAct = normKey(input.batchRequest.actorId)
+    if (input.singleForeignControlDenied.status === 401 && (!cAct || !bAct || cAct !== bAct)) return deny(f, 'unauthenticated_baseline_control', sub)
 
     const foreignRead = !stubRec(input.batchRequest) &&
       new Set((input.returnedForeignIds ?? []).map(normStr)).has(foreignId) &&
@@ -481,9 +484,9 @@ export function evaluateCryptographicScopeReplay(input: CryptographicScopeReplay
   if (!srcT || !srcS || !dstT || !dstS) return deny(f, 'missing_tenant_or_scope_context')
   if (srcT === dstT && srcS === dstS) return deny(f, 'same_tenant_and_scope_not_replay')
 
-  const tamperedDigest = normStr(input.tamperedSignatureDigest !== undefined ? input.tamperedSignatureDigest : input.tamperedSignatureControl.artifactDigest)
-  const validDigest = normStr(input.signatureDigest !== undefined ? input.signatureDigest : input.sourceValidIssuance.artifactDigest)
-  const replayedDigest = normStr(input.replayedSignatureDigest !== undefined ? input.replayedSignatureDigest : input.replayedAcceptance.artifactDigest)
+  const tamperedDigest = normStr(input.tamperedSignatureDigest)
+  const validDigest = normStr(input.signatureDigest)
+  const replayedDigest = normStr(input.replayedSignatureDigest)
   if (!tamperedDigest || !validDigest || !replayedDigest) return deny(f, 'missing_signature_digest_binding')
   if (tamperedDigest === validDigest) return deny(f, 'tampered_digest_matches_valid_signature')
   if (replayedDigest !== validDigest) return deny(f, 'replayed_signature_digest_mismatch')
@@ -520,7 +523,7 @@ export function evaluateParserCacheDifferential(input: ParserCacheDifferentialIn
   if (input.mode === 'parser_differential') {
     const sub = input.differentialKind
     if (!normStr(input.differentialFeature)) return deny(f, 'missing_differential_feature', sub)
-    if (input.canonicalValue !== undefined && input.variantValue !== undefined && input.canonicalValue === input.variantValue) {
+    if (input.canonicalValue === undefined || input.variantValue === undefined || input.canonicalValue === input.variantValue) {
       return deny(f, 'no_request_differential_between_control_and_probe', sub)
     }
 

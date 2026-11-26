@@ -3556,6 +3556,9 @@ export function buildReplayReceipt(input: {
   evidencePayload: Record<string, unknown>
   exchangeIds: readonly string[]
   exchanges: readonly BrokerExchangeResult[]
+  canaryBroker?: Pick<CanaryBroker, 'checkCanary'>
+  canaryRunId?: string
+  canaryStorage?: Store
 }): { receipt: ProofReceipt; transcript: ReceiptTranscript; factLog: HostFactLog; trustedOracleEvents: string[] } | null {
   const impactGate = input.evidencePayload.impactGate as { required?: boolean } | undefined
   const boundaryGate = input.evidencePayload.boundaryGate as { required?: boolean; satisfied?: boolean; boundaryClass?: string } | undefined
@@ -3576,15 +3579,6 @@ export function buildReplayReceipt(input: {
     stage?: 'immediate' | 'late'
     receivedAtMs?: number
   } | undefined
-  const hostCanaryVerified = Boolean(
-    canary?.triggered === true &&
-    canary.probeTriggered === true &&
-    canary.controlTriggered !== true &&
-    typeof canary.token === 'string' &&
-    replayCanaryTokenRe.test(canary.token) &&
-    typeof canary.callbackId === 'string' &&
-    canary.callbackId.trim().length > 0,
-  )
   const isOob = vulnClass === 'ssrf' || vulnClass === 'xxe' ||
     (vulnClass === 'webhook_forgery' && canary?.triggered === true)
   const isRedirect = vulnClass === 'open_redirect'
@@ -3625,9 +3619,19 @@ export function buildReplayReceipt(input: {
   }
 
   if (isOob) {
-    // C-3: Never fabricate delivered=true OOB events without host CanaryBroker callback corroboration.
-    if (!hostCanaryVerified || !canary?.token || !canary.callbackId) return null
-    const token = canary.token
+    // C-3: A delivered event requires an independently checked host CanaryBroker hit, never a plain evidence flag.
+    const token = canary?.token
+    if (!token || !replayCanaryTokenRe.test(token) || !canary.callbackId || canary.controlTriggered === true) return null
+    const hostCheck = input.canaryBroker?.checkCanary(token, {
+      ...(input.canaryStorage ? { storage: input.canaryStorage } : {}),
+      ...(input.canaryRunId ? { runId: input.canaryRunId } : {}),
+    })
+    if (!hostCheck?.hit || !hostCheck.hits.some(hit => hit.token === token)) return null
+    const detail = hostCheck.detail ?? {}
+    const receivedAtMs = typeof detail.timestamp === 'number' && Number.isFinite(detail.timestamp)
+      ? detail.timestamp
+      : typeof detail.receivedAt === 'string' ? Date.parse(detail.receivedAt) : Number.NaN
+    if (!Number.isFinite(receivedAtMs)) return null
     const carrying = entries.find(entry => (entry.carrierText ?? '').includes(token))
     if (!carrying) return null
     const receipt = {
@@ -3651,7 +3655,7 @@ export function buildReplayReceipt(input: {
         targetOrigin: input.spec.origin,
         delivered: true,
         stage: canary.stage === 'late' ? 'late' : 'immediate',
-        receivedAtMs: typeof canary.receivedAtMs === 'number' && Number.isFinite(canary.receivedAtMs) ? canary.receivedAtMs : Date.now(),
+        receivedAtMs,
       }],
       browserTraces: [],
     }
@@ -3663,7 +3667,7 @@ export function buildReplayReceipt(input: {
   const targetEntry = entries.find(entry => entry.step === targetExchangeStep) ?? entries[0]
   // H-1: Only derive trustedOracleEvents from host-observed controls (csrfBind verified against
   // host cookie-authenticated probe headers), NEVER from raw model-authored spec.expectedImpactEvents.
-  const csrfModelled = 'steps' in input.spec && Array.isArray(input.spec.steps) &&
+  const csrfModelled = vulnClass === 'csrf' && 'steps' in input.spec && Array.isArray(input.spec.steps) &&
     input.spec.steps.some(s => Boolean((s as { request?: { csrfBind?: unknown } }).request?.csrfBind))
   const hasHostCookieProbe = entries.some(entry =>
     entry.step.arm === 'probe' && (
@@ -3733,6 +3737,9 @@ export function receiptCheckForResult(input: {
   exchangeIds: readonly string[]
   exchanges: readonly BrokerExchangeResult[]
   envelopeTrust?: 'host_persisted' | 'untrusted'
+  canaryBroker?: Pick<CanaryBroker, 'checkCanary'>
+  canaryRunId?: string
+  canaryStorage?: Store
 }): { verdict: ReplayVerdict; outcome: ReplayAssertionOutcome; check?: ReplayReceiptCheck } {
   if (input.mode === 'off' || input.verdict !== 'confirmed') return { verdict: input.verdict, outcome: input.outcome }
   const built = buildReplayReceipt({
@@ -3740,6 +3747,9 @@ export function receiptCheckForResult(input: {
     evidencePayload: input.evidencePayload,
     exchangeIds: input.exchangeIds,
     exchanges: input.exchanges,
+    ...(input.canaryBroker ? { canaryBroker: input.canaryBroker } : {}),
+    ...(input.canaryRunId ? { canaryRunId: input.canaryRunId } : {}),
+    ...(input.canaryStorage ? { canaryStorage: input.canaryStorage } : {}),
   })
   // Fail closed in strict mode whenever a confirmed replay cannot construct a host-verified ProofReceipt,
   // preserving only host-persisted dedicated non-http_chain deterministic floor kinds.

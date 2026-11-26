@@ -288,7 +288,7 @@ function collectHopOutputs(hop: HopReceipt, idx: IndexedTranscript): HopOutputEv
   const out: HopOutputEvent[] = []
   for (const id of hop.exchangeIds) {
     const e = idx.entriesById.get(id)!
-    if (!isFiniteTs(e.timestampMs)) continue
+    if (e.step.arm !== 'probe' || !isFiniteTs(e.timestampMs)) continue
     const caps = new Set<string>(e.emittedCapabilities ?? [])
     for (const a of e.cryptoAttestations ?? []) if (a.derivedCapabilityId) caps.add(a.derivedCapabilityId)
     out.push({ sourceId: id, timestampMs: e.timestampMs, capabilities: caps, digests: collectEntryDigests(e, 'response') })
@@ -463,9 +463,12 @@ function verifyAsyncPivotBinding(
   }
   if (edge.channel === 'async_job') {
     for (const id of toHop.exchangeIds) {
-      const e = idx.entriesById.get(id)!
-      if (!is2xx(e.step.status) || !isFiniteTs(e.timestampMs) || !entryMatchesCorrelation(e, edge.correlationId)) continue
-      if (e.timestampMs < minTrigger) return edgeFail(base, `Async job readback "${id}" preceded trigger.`)
+      const e = idx.entriesById.get(id)!, body = serializeBodyText(e)
+      if (e.step.arm !== 'probe' || !is2xx(e.step.status) || !isFiniteTs(e.timestampMs) || !entryMatchesCorrelation(e, edge.correlationId)) continue
+      const stub = isJobOrHandleStub(e.step.json, e.step.body, e.step.status, e.step.method, e.step.route ?? e.step.pathAndQuery)
+      const submission = /^(?:POST|PUT|PATCH)$/i.test(e.step.method) && (e.step.status === 202 || stub)
+      if (!submission && !(stepReadsState(e.step) && body.trim())) continue
+      if (e.timestampMs <= minTrigger) return edgeFail(base, `Async job readback "${id}" did not follow trigger.`)
       return edgeOk(base, 'async_pivot_binding (async_job) verified.', { correlationId: edge.correlationId, targetExchangeId: id, tTrigger: minTrigger, tObserved: e.timestampMs })
     }
   }
@@ -570,8 +573,11 @@ function dispatchDefaultV8Oracle(
   const ti = receipt.terminalImpact, normCls = receipt.terminalVulnClass.trim().toLowerCase()
   const family = ti.oracleFamily ?? (V8_ORACLE_FAMILY_SET.has(normCls) ? normCls as V8OracleFamily : null)
   if (!family) return null
-  const policy = { signingKey: options.signingKey, strictHostDerivation: options.strictHostDerivation ?? true }
+  const policy = { signingKey: options.signingKey, strictHostDerivation: true }
   const rejectFam = (reason: string, missingEvidence: string[], rejectedBy = `v8_oracle_${family}`) => ({ ok: false as const, reason, rejectedBy, missingEvidence })
+  if (ti.oracleFamily && !ti.oracleInput) return rejectFam(`v8_oracle_failed (${family}): missing_v8_oracle_input — terminalImpact.oracleFamily requires terminalImpact.oracleInput.`, ['terminalImpact.oracleInput'])
+  if (family === 'dual_tenant_abac' && receipt.hops.length < 2) return rejectFam('v8_oracle_failed (dual_tenant_abac): multi_hop_causal_chain_required', ['upstream_causal_hop_or_oracle_input'])
+  if (family === 'dual_tenant_abac' && !terminalCtrl) return rejectFam('v8_oracle_failed (dual_tenant_abac): missing_denied_control_on_terminal_route', ['clean_denied_control_401_403_404'])
   const mapFail = (reason: string) => (reason === 'terminal_impact_unproven_intermediate_stub' || reason === 'bled_access_own_tenant_only')
     ? rejectFam(TERMINAL_IMPACT_UNPROVEN_HINT, [TERMINAL_IMPACT_UNPROVEN_HINT], 'terminal_impact_unproven')
     : rejectFam(`v8_oracle_failed (${family}): ${reason}`, [reason])
@@ -622,7 +628,7 @@ function verifyTerminalImpactGate(
   const termEndpoint = (termEx?.step.route ?? termEx?.step.pathAndQuery ?? termHop.target.pathAndQuery ?? '').trim(), termFam = normRouteFam(termEndpoint, termEx?.entityId ?? termHop.entityId)
   let terminalVerification: ReceiptVerification | undefined
   if (ti.proofReceipt) {
-    const shRes = defaultTerminalOracleRegistry.evaluate(factLog, { kind: 'single_hop', receipt: ti.proofReceipt }, { signingKey: options.signingKey, strictHostDerivation: options.strictHostDerivation ?? true })
+    const shRes = defaultTerminalOracleRegistry.evaluate(factLog, { kind: 'single_hop', receipt: ti.proofReceipt }, { signingKey: options.signingKey, strictHostDerivation: true })
     terminalVerification = shRes.singleHop ?? { confirmed: shRes.confirmed, vulnClass: ti.proofReceipt.vulnClass, rule: 'none', reason: shRes.reason, observed: ti.proofReceipt.claimedDelta, expected: 'host-custody verified terminal receipt' }
     if (!terminalVerification.confirmed) return { ok: false, reason: terminalVerification.reason, terminalVerification }
   }

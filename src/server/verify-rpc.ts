@@ -26,7 +26,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } 
 import { createServer } from 'node:http'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import type { BrokerExchangeResult, BrokerHttpRequest, Grant, RequestBroker } from './broker.ts'
 import { EgressDeniedError, EgressGateway } from './egress-gateway.ts'
 import { buildPersonaHeader, personaSecrets } from './persona-vault.ts'
@@ -396,9 +396,12 @@ export class VerifyRpcServer {
       this.hostDirValue = configured
     } else {
       const containerScratch = process.env.KOVO_CONTAINER_SCRATCH_DIR?.trim() || ''
-      if (containerScratch && containerScratch.startsWith('/') && containerScratch !== '/' && !containerScratch.split('/').includes('..')) {
-        mkdirSync(containerScratch, { recursive: true, mode: 0o711 })
-        this.hostDirValue = mkdtempSync(join(containerScratch, 'kovo-verify-rpc-'))
+      if (containerScratch) {
+        if (/[\0,\r\n]/.test(containerScratch) || !containerScratch.startsWith('/') || containerScratch.split('/').includes('..')) throw new Error('Invalid KOVO_CONTAINER_SCRATCH_DIR path.')
+        const scratchRoot = resolve(containerScratch)
+        if (scratchRoot === '/') throw new Error('KOVO_CONTAINER_SCRATCH_DIR must not be root "/".')
+        mkdirSync(scratchRoot, { recursive: true, mode: 0o711 })
+        this.hostDirValue = mkdtempSync(join(scratchRoot, 'kovo-verify-rpc-'))
       } else {
         // Prefer a real tmpfs so the socket directory is memory-backed on the host too.
         const tmpfsBase = existsSync('/dev/shm') ? '/dev/shm' : tmpdir()
