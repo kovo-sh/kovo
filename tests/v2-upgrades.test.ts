@@ -687,6 +687,7 @@ test('verifyReplaySpec & retestReplaySpec verify race_burst and browser_chain sp
     browser,
     backend,
     grant: tier2Grant,
+    envelopeTrust: 'host_persisted',
     signal: AbortSignal.timeout(30_000),
   })
   assert.equal(browserRes.verdict, 'confirmed', `Expected confirmed, got ${browserRes.verdict}: ${JSON.stringify(browserRes.outcome)}`)

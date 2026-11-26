@@ -187,6 +187,7 @@ function buildFourHopReceipt(options?: { scrambleHopOrder?: boolean }): Composit
     ],
     terminalImpact: {
       terminalHopId: 'hop-4',
+      summary: 'Unauthorized settlement transfer executed via forged derived signature',
       claimedImpact: 'Unauthorized settlement transfer executed via forged derived signature',
       preChainControlExchangeIds: [],
       postChainReadbackExchangeIds: [],
@@ -760,7 +761,17 @@ test('CompositePatchRetestProof redacts secrets and grades OSS M4 >= 80% closure
   const vulnReceipt = {
     ...receipt,
     hops: receipt.hops.map(h => h.hopId === 'hop-4' ? { ...h, exchangeIds: ['ex-ctrl-4', 'ex-4'] } : h),
-    terminalImpact: { ...receipt.terminalImpact, terminalExchangeId: 'ex-4', preChainControlExchangeIds: ['ex-ctrl-4'] },
+    terminalImpact: {
+      ...receipt.terminalImpact,
+      summary: 'Unauthorized settlement transfer executed via forged derived signature',
+      terminalExchangeId: 'ex-4',
+      preChainControlExchangeIds: ['ex-ctrl-4'],
+      oracleInput: {
+        tamperedSignatureControl: 'ex-ctrl-4',
+        sourceValidIssuance: 'ex-3',
+        replayedAcceptance: 'ex-4',
+      },
+    },
   }
   const vulnBaseRunner = makeUnpatchedRunner()
   const vulnProof = await retestCompositeChainPatch({
@@ -772,7 +783,15 @@ test('CompositePatchRetestProof redacts secrets and grades OSS M4 >= 80% closure
           return {
             ...res,
             entries: [
-              signedEntry('ex-ctrl-4', makeStep({ id: 'ex-ctrl-4', arm: 'control', method: 'POST', status: 403, pathAndQuery: '/api/v1/settlements/execute', json: { error: 'forbidden' } }), {
+              signedEntry('ex-ctrl-4', makeStep({
+                id: 'ex-ctrl-4',
+                arm: 'control',
+                method: 'POST',
+                status: 403,
+                pathAndQuery: '/api/v1/settlements/execute',
+                requestHeaders: { 'x-signature': 'tampered-settlement-sig-deadbeef' },
+                json: { error: 'forbidden' },
+              }), {
                 timestampMs: 900,
                 actorPersona: 'member_a',
               }),

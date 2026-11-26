@@ -1281,7 +1281,7 @@ test('clones full repos without .git/credentials, extracts deep lockfiles, and m
     err => {
       const msg = err instanceof Error ? err.message : String(err)
       assert.ok(!msg.includes(testPat), 'Raw PAT must never appear in git error messages.')
-      return /git clone failed/.test(msg)
+      return /git (?:clone|-c) failed/.test(msg)
     },
   )
   const expectedBasic = 'Basic ' + Buffer.from(`x-access-token:${testPat}`, 'utf8').toString('base64')
@@ -1351,6 +1351,7 @@ test('clones full repos without .git/credentials, extracts deep lockfiles, and m
     patPath,
     cloneDir: reposDir,
     gitBaseUrl: `file://${gitOriginParent}`,
+    allowLocalFileProtocol: true,
     stripGitMetadata: true,
   })
 

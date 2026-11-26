@@ -195,12 +195,14 @@ test('canonical strict camelCase options work end-to-end and legacy snake_case o
   )
 
   // Canonical camelCase object + positional forms (used by seam1 golden E2E) both succeed.
+  // R2-C-4: Sealed-key HMAC returns an opaque derived handle (never raw signature bytes).
   const payload = JSON.stringify({ action: 'export' })
-  const expectedSig = createHmac('sha256', SIGNING_KEY).update(payload).digest('hex')
   const sigObj = await ctx.hmac_sign({ secretHandle: keyCap.handle, payload, alg: 'sha256', encoding: 'hex' })
   const sigPos = await ctx.hmac_sign(keyCap.handle, payload)
-  assert.equal(sigObj.signature, expectedSig)
-  assert.equal(sigPos.signature, expectedSig)
+  assert.equal(sigObj.signature, undefined)
+  assert.equal(sigPos.signature, undefined)
+  assert.match(sigObj.derivedHandle, /^cap:hop_/)
+  assert.match(sigPos.derivedHandle, /^cap:hop_/)
 
   // Legacy snake_case secret_handle fails closed instead of silently translating.
   await assert.rejects(
@@ -219,7 +221,7 @@ test('canonical strict camelCase options work end-to-end and legacy snake_case o
     method: 'POST',
     as: 'member_b',
     role: 'probe',
-    headers: { 'x-signature': sigObj.signature, 'content-type': 'application/json' },
+    headers: { 'x-signature': sigObj.derivedHandle, 'content-type': 'application/json' },
     body: payload,
   })
   assert.equal(trig.status, 200)

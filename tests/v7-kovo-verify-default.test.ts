@@ -32,7 +32,12 @@ import { RequestBroker } from '../src/server/broker.ts'
 import type { Grant } from '../src/server/broker.ts'
 import { agentProofAttribution } from '../src/server/exec-verify.ts'
 import type { ResolvedPersona } from '../src/server/persona-vault.ts'
-import { buildAgentScriptReceipt, verifyReceipt, type ScriptProofExchange } from '../src/server/proof-receipt.ts'
+import {
+  buildAgentScriptReceipt,
+  defaultHostMintedOracle,
+  verifyReceipt,
+  type ScriptProofExchange,
+} from '../src/server/proof-receipt.ts'
 import {
   VERIFY_RPC_CONTEXT_NAME,
   VERIFY_RPC_TOKEN_NAME,
@@ -271,15 +276,16 @@ test('kovo_verify ProofReceipt cleanly supports BOLA (CWE-639) boundary claims a
   const bolaVerdict = verifyReceipt(bolaBuilt.receipt, bolaBuilt.transcript)
   assert.equal(bolaVerdict.confirmed, true, bolaVerdict.reason)
 
-  // 2. SSTI via ctx.prove_injection_differential (paired non-reflected `body_contains`)
+  // 2. SSTI via R2-C-6 host-minted evaluated expression (`kind: 'host_evaluated_expression'`)
+  const sstiChallenge = defaultHostMintedOracle.mintExpressionChallenge('ssti')
   const sstiExchanges: ScriptProofExchange[] = [
     {
       exchangeId: 'ex-c', method: 'GET', pathAndQuery: '/api/v1/reports/render?tpl=hello', origin: ORIGIN,
       status: 200, body: '<h1>hello</h1>',
     },
     {
-      exchangeId: 'ex-p', method: 'GET', pathAndQuery: '/api/v1/reports/render?tpl=%7B%7B739*740%7D%7D', origin: ORIGIN,
-      status: 200, body: '<h1>546860</h1>',
+      exchangeId: 'ex-p', method: 'GET', pathAndQuery: `/api/v1/reports/render?tpl=${encodeURIComponent(`{{${sstiChallenge.expressionSyntax}}}`)}`, origin: ORIGIN,
+      status: 200, body: `<h1>${sstiChallenge.expectedOutput}</h1>`,
     },
   ]
   const sstiBuilt = buildAgentScriptReceipt({
@@ -287,22 +293,27 @@ test('kovo_verify ProofReceipt cleanly supports BOLA (CWE-639) boundary claims a
     title: 'Report SSTI template evaluation',
     exchanges: sstiExchanges,
     claims: [
-      { kind: 'body_contains', exchangeId: 'ex-c', text: '546860', absent: true },
-      { kind: 'body_contains', exchangeId: 'ex-p', text: '546860', absent: false, message: 'ssti evaluated marker' },
+      {
+        kind: 'host_evaluated_expression',
+        controlIds: ['ex-c'],
+        probeIds: ['ex-p'],
+        hostMintedChallengeIds: [sstiChallenge.challengeId],
+      },
     ],
   })
-  assert.ok(sstiBuilt, 'paired evaluated-expression claims must build an SSTI ProofReceipt')
+  assert.ok(sstiBuilt, 'host-minted evaluated-expression claim must build an SSTI ProofReceipt')
   assert.equal(sstiBuilt.receipt.vulnClass, 'ssti')
   assert.equal(agentProofAttribution(sstiBuilt.receipt.vulnClass).cwe, 'CWE-1336')
   const sstiVerdict = verifyReceipt(sstiBuilt.receipt, sstiBuilt.transcript)
   assert.equal(sstiVerdict.confirmed, true, sstiVerdict.reason)
 
-  // 3. Anti-reflection: raw reflection where the request itself contained "546860" MUST fail closed
+  // 3. Anti-reflection: raw reflection where the request itself contained expectedOutput MUST fail closed,
+  // and plain `body_contains` pairs downgrade to unconfirmed leads (return null).
   const reflectedExchanges: ScriptProofExchange[] = [
     sstiExchanges[0]!,
     {
-      exchangeId: 'ex-p', method: 'GET', pathAndQuery: '/api/v1/reports/render?tpl=546860', origin: ORIGIN,
-      status: 200, body: '<h1>546860</h1>',
+      exchangeId: 'ex-p', method: 'GET', pathAndQuery: `/api/v1/reports/render?tpl=${sstiChallenge.expectedOutput}`, origin: ORIGIN,
+      status: 200, body: `<h1>${sstiChallenge.expectedOutput}</h1>`,
     },
   ]
   const reflectedBuilt = buildAgentScriptReceipt({
@@ -310,13 +321,28 @@ test('kovo_verify ProofReceipt cleanly supports BOLA (CWE-639) boundary claims a
     title: 'Reflected echo is not SSTI',
     exchanges: reflectedExchanges,
     claims: [
-      { kind: 'body_contains', exchangeId: 'ex-c', text: '546860', absent: true },
-      { kind: 'body_contains', exchangeId: 'ex-p', text: '546860', absent: false, message: 'ssti' },
+      {
+        kind: 'host_evaluated_expression',
+        controlIds: ['ex-c'],
+        probeIds: ['ex-p'],
+        hostMintedChallengeIds: [sstiChallenge.challengeId],
+      },
     ],
   })
   assert.ok(reflectedBuilt)
   const reflectedVerdict = verifyReceipt(reflectedBuilt.receipt, reflectedBuilt.transcript)
   assert.equal(reflectedVerdict.confirmed, false, 'raw reflection must fail closed')
+
+  const plainBodyContainsBuilt = buildAgentScriptReceipt({
+    origin: ORIGIN,
+    title: 'Plain body_contains marker is a lead only',
+    exchanges: sstiExchanges,
+    claims: [
+      { kind: 'body_contains', exchangeId: 'ex-c', text: sstiChallenge.expectedOutput, absent: true },
+      { kind: 'body_contains', exchangeId: 'ex-p', text: sstiChallenge.expectedOutput, absent: false, message: 'ssti' },
+    ],
+  })
+  assert.equal(plainBodyContainsBuilt, null, 'plain body_contains pair must downgrade to unconfirmed lead')
 })
 
 async function startBoundaryFixture(): Promise<{ origin: string; grant: Grant; close: () => Promise<void> }> {
