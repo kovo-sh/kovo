@@ -20,11 +20,15 @@
 import type { DerivedCapabilityMeta, DerivedCapabilityVault } from './derived-custody.ts'
 import { vaultScrubDescriptors } from './derived-custody.ts'
 import {
+  DEFAULT_MAX_EXACT_SECRETS,
   SENSITIVE_HTTP_HEADER_RE,
+  SecretMatcher,
   buildSecretEncodingVariants,
+  compileSecretMatcher,
   redact,
   redactExactValues,
   redactHeaders,
+  redactWithMatcher,
   type NamedSecret,
 } from './redact.ts'
 import { compileSafeClaimRegex } from './safe-regex.ts'
@@ -67,6 +71,8 @@ export interface EgressSanitizerOptions {
   minSecretLength?: number
   /** Minimum length for sealed capability values redacted on egress (default 8). */
   minCapabilityLength?: number
+  /** Maximum deduplicated secrets compiled into the exact-match automaton (default 5000). */
+  maxSecrets?: number
 }
 
 export interface RedactSecretsOptions {
@@ -74,12 +80,47 @@ export interface RedactSecretsOptions {
   capabilityVaults?: readonly DerivedCapabilityVault[]
   minSecretLength?: number
   minCapabilityLength?: number
+  maxSecrets?: number
 }
 
 function normalizeEphemeralCapPlaceholders(text: string): string {
   return text.includes('[persona:cap:hop_')
     ? text.replace(EPHEMERAL_CAP_PLACEHOLDER_RE, '[redacted:$1]')
     : text
+}
+
+function collectDedupedSecrets(
+  secrets: readonly NamedSecret[],
+  options: {
+    providerKey?: string
+    capabilityVaults?: readonly DerivedCapabilityVault[]
+    minSecretLength: number
+    minCapLength: number
+    maxSecrets: number
+  },
+): NamedSecret[] {
+  const combined: NamedSecret[] = []
+  const seenValues = new Set<string>()
+  const pushUnique = (entry: NamedSecret): void => {
+    if (!entry.value || seenValues.has(entry.value)) return
+    seenValues.add(entry.value)
+    combined.push(entry)
+  }
+
+  if (options.providerKey && options.providerKey.length >= 4) {
+    pushUnique({ value: options.providerKey, placeholder: '[redacted]' })
+  }
+  for (const vault of options.capabilityVaults ?? []) {
+    for (const desc of vaultScrubDescriptors(vault, options.minCapLength)) {
+      if (desc.value.length >= options.minCapLength) pushUnique(desc)
+    }
+  }
+  const secretLimit = Math.max(options.maxSecrets, combined.length)
+  for (const s of secrets) {
+    if (combined.length >= secretLimit) break
+    if (s.value && s.value.length >= options.minSecretLength) pushUnique(s)
+  }
+  return combined
 }
 
 /**
@@ -94,19 +135,17 @@ export function redactSecrets(
   if (!text) return text
   const minSecretLength = Math.max(1, options.minSecretLength ?? 4)
   const minCapLength = Math.max(1, options.minCapabilityLength ?? DEFAULT_MIN_CAPABILITY_SECRET_LENGTH)
-  const combined: NamedSecret[] = []
-  if (options.providerKey && options.providerKey.length >= 4) {
-    combined.push({ value: options.providerKey, placeholder: '[redacted]' })
-  }
-  for (const s of secrets) {
-    if (s.value && s.value.length >= minSecretLength) combined.push(s)
-  }
-  for (const vault of options.capabilityVaults ?? []) {
-    for (const desc of vaultScrubDescriptors(vault, minCapLength)) {
-      if (desc.value.length >= minCapLength) combined.push(desc)
-    }
-  }
-  return normalizeEphemeralCapPlaceholders(redactExactValues(text, combined, { minLength: 1 }))
+  const maxSecrets = Math.max(1, options.maxSecrets ?? DEFAULT_MAX_EXACT_SECRETS)
+  const combined = collectDedupedSecrets(secrets, {
+    ...(options.providerKey ? { providerKey: options.providerKey } : {}),
+    ...(options.capabilityVaults ? { capabilityVaults: options.capabilityVaults } : {}),
+    minSecretLength,
+    minCapLength,
+    maxSecrets,
+  })
+  if (combined.length === 0) return normalizeEphemeralCapPlaceholders(text)
+  const matcher = compileSecretMatcher(combined, { minLength: 1, maxSecrets: combined.length })
+  return normalizeEphemeralCapPlaceholders(matcher.redact(text))
 }
 
 /**
@@ -119,6 +158,17 @@ export function sanitizeHttpHeaders(
   secrets: readonly NamedSecret[] = [],
   options: RedactSecretsOptions = {},
 ): Record<string, string> {
+  const minSecretLength = Math.max(1, options.minSecretLength ?? 4)
+  const minCapLength = Math.max(1, options.minCapabilityLength ?? DEFAULT_MIN_CAPABILITY_SECRET_LENGTH)
+  const maxSecrets = Math.max(1, options.maxSecrets ?? DEFAULT_MAX_EXACT_SECRETS)
+  const combined = collectDedupedSecrets(secrets, {
+    ...(options.providerKey ? { providerKey: options.providerKey } : {}),
+    ...(options.capabilityVaults ? { capabilityVaults: options.capabilityVaults } : {}),
+    minSecretLength,
+    minCapLength,
+    maxSecrets,
+  })
+  const matcher = combined.length > 0 ? compileSecretMatcher(combined, { minLength: 1, maxSecrets: combined.length }) : undefined
   const out: Record<string, string> = {}
   for (const [key, rawValue] of Object.entries(headers)) {
     if (rawValue === undefined) continue
@@ -127,7 +177,7 @@ export function sanitizeHttpHeaders(
       out[key] = '[redacted]'
       continue
     }
-    const exactRedacted = redactSecrets(value, secrets, options)
+    const exactRedacted = normalizeEphemeralCapPlaceholders(matcher ? matcher.redact(value) : value)
     out[key] = redact(exactRedacted)
   }
   return out
@@ -406,12 +456,28 @@ function isPlainStringHeaderMap(value: unknown): value is Record<string, string 
   return true
 }
 
+interface SanitizerMatcherCache {
+  rawSecretsSnapshot: readonly NamedSecret[]
+  vaultDescriptorsSnapshot: readonly NamedSecret[]
+  matcher: SecretMatcher
+}
+
+function sameNamedSecretList(a: readonly NamedSecret[], b: readonly NamedSecret[]): boolean {
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i]!.value !== b[i]!.value || a[i]!.placeholder !== b[i]!.placeholder) return false
+  }
+  return true
+}
+
 export class EgressSanitizer {
   private readonly getSecretsFn: () => readonly NamedSecret[]
   private readonly getVaultsFn: () => readonly DerivedCapabilityVault[]
   private readonly providerKey?: string
   private readonly minSecretLength: number
   private readonly minCapabilityLength: number
+  private readonly maxSecrets: number
+  private cachedMatcher: SanitizerMatcherCache | null = null
 
   constructor(options: EgressSanitizerOptions = {}) {
     const rawSecrets = options.secrets
@@ -421,24 +487,114 @@ export class EgressSanitizer {
     this.providerKey = options.providerKey
     this.minSecretLength = Math.max(1, options.minSecretLength ?? 4)
     this.minCapabilityLength = Math.max(1, options.minCapabilityLength ?? DEFAULT_MIN_CAPABILITY_SECRET_LENGTH)
+    this.maxSecrets = Math.max(1, options.maxSecrets ?? DEFAULT_MAX_EXACT_SECRETS)
   }
 
-  private resolveOptions(): { secrets: readonly NamedSecret[]; opts: RedactSecretsOptions } {
-    return {
-      secrets: this.getSecretsFn(),
-      opts: {
-        ...(this.providerKey ? { providerKey: this.providerKey } : {}),
-        capabilityVaults: this.getVaultsFn(),
-        minSecretLength: this.minSecretLength,
-        minCapabilityLength: this.minCapabilityLength,
-      },
+  private getCompiledMatcher(): SecretMatcher {
+    const rawSecrets = this.getSecretsFn()
+    const vaults = this.getVaultsFn()
+    const vaultDescriptors: NamedSecret[] = []
+    for (const vault of vaults) {
+      for (const desc of vaultScrubDescriptors(vault, this.minCapabilityLength)) {
+        if (desc.value.length >= this.minCapabilityLength) vaultDescriptors.push(desc)
+      }
     }
+
+    if (
+      this.cachedMatcher &&
+      sameNamedSecretList(rawSecrets, this.cachedMatcher.rawSecretsSnapshot) &&
+      sameNamedSecretList(vaultDescriptors, this.cachedMatcher.vaultDescriptorsSnapshot)
+    ) {
+      return this.cachedMatcher.matcher
+    }
+
+    const combined = collectDedupedSecrets(rawSecrets, {
+      ...(this.providerKey ? { providerKey: this.providerKey } : {}),
+      ...(vaultDescriptors.length > 0 ? { capabilityVaults: vaults } : {}),
+      minSecretLength: this.minSecretLength,
+      minCapLength: this.minCapabilityLength,
+      maxSecrets: this.maxSecrets,
+    })
+    const matcher = compileSecretMatcher(combined, {
+      minLength: 1,
+      maxSecrets: Math.max(this.maxSecrets, combined.length),
+    })
+    this.cachedMatcher = {
+      rawSecretsSnapshot: rawSecrets.map(s => ({ value: s.value, placeholder: s.placeholder })),
+      vaultDescriptorsSnapshot: vaultDescriptors,
+      matcher,
+    }
+    return matcher
+  }
+
+  private redactExactWithMatcher(text: string, matcher: SecretMatcher): string {
+    if (!text) return text
+    return normalizeEphemeralCapPlaceholders(matcher.redact(text))
+  }
+
+  private redactTextWithMatcher(text: string, channel: EgressChannel, matcher: SecretMatcher): string {
+    if (!text) return text
+    const exact = this.redactExactWithMatcher(text, matcher)
+    if (channel === 'llm_tool_args') return exact
+    return normalizeEphemeralCapPlaceholders(redactWithMatcher(exact))
+  }
+
+  private sanitizeHttpHeadersWithMatcher(
+    headers: Record<string, string | string[] | undefined>,
+    channel: EgressChannel,
+    matcher: SecretMatcher,
+  ): Record<string, string> {
+    if (channel === 'llm_tool_args') {
+      const out: Record<string, string> = {}
+      for (const [k, rawValue] of Object.entries(headers)) {
+        if (rawValue === undefined) continue
+        const v = Array.isArray(rawValue) ? rawValue.join(', ') : String(rawValue)
+        out[this.redactExactWithMatcher(k, matcher)] = RAW_COOKIE_FIELD_RE.test(k)
+          ? '[redacted]'
+          : this.redactExactWithMatcher(v, matcher)
+      }
+      return out
+    }
+    const out: Record<string, string> = {}
+    for (const [key, rawValue] of Object.entries(headers)) {
+      if (rawValue === undefined) continue
+      const value = Array.isArray(rawValue) ? rawValue.join(', ') : String(rawValue)
+      if (SENSITIVE_HTTP_HEADER_RE.test(key)) {
+        out[key] = '[redacted]'
+        continue
+      }
+      const exactRedacted = this.redactExactWithMatcher(value, matcher)
+      out[key] = normalizeEphemeralCapPlaceholders(redactWithMatcher(exactRedacted))
+    }
+    return out
+  }
+
+  private sanitizeNode<T>(value: T, channel: EgressChannel, matcher: SecretMatcher): T {
+    if (typeof value === 'string') return this.redactTextWithMatcher(value, channel, matcher) as unknown as T
+    if (Array.isArray(value)) return value.map(item => this.sanitizeNode(item, channel, matcher)) as unknown as T
+    if (!value || typeof value !== 'object') return value
+    const out: Record<string, unknown> = {}
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+      const safeKey = channel === 'llm_tool_args'
+        ? this.redactExactWithMatcher(key, matcher)
+        : this.redactTextWithMatcher(key, channel, matcher)
+      if (channel === 'llm_tool_args') {
+        out[safeKey] = RAW_COOKIE_FIELD_RE.test(key) && typeof item === 'string'
+          ? '[redacted]'
+          : this.sanitizeNode(item, channel, matcher)
+      } else if (HEADER_OBJECT_KEYS.has(key) && isPlainStringHeaderMap(item)) {
+        out[safeKey] = this.sanitizeHttpHeadersWithMatcher(item, channel, matcher)
+      } else {
+        out[safeKey] = this.sanitizeNode(item, channel, matcher)
+      }
+    }
+    return out as T
   }
 
   /** Operation 1: Exact-value secret redaction ONLY (zero heuristic keyword regexes). */
   redactSecrets(text: string): string {
-    const { secrets, opts } = this.resolveOptions()
-    return redactSecrets(text, secrets, opts)
+    if (!text) return text
+    return this.redactExactWithMatcher(text, this.getCompiledMatcher())
   }
 
   /**
@@ -448,9 +604,7 @@ export class EgressSanitizer {
    */
   redactText(text: string, channel: EgressChannel = 'worker_rpc'): string {
     if (!text) return text
-    const exact = this.redactSecrets(text)
-    if (channel === 'llm_tool_args') return exact
-    return normalizeEphemeralCapPlaceholders(redact(exact))
+    return this.redactTextWithMatcher(text, channel, this.getCompiledMatcher())
   }
 
   /** Operation 2: Uniform structural HTTP header stripping across HTTP/1, HTTP/2, and Browser. */
@@ -458,17 +612,7 @@ export class EgressSanitizer {
     headers: Record<string, string | string[] | undefined>,
     channel: EgressChannel = 'worker_rpc',
   ): Record<string, string> {
-    if (channel === 'llm_tool_args') {
-      const out: Record<string, string> = {}
-      for (const [k, rawValue] of Object.entries(headers)) {
-        if (rawValue === undefined) continue
-        const v = Array.isArray(rawValue) ? rawValue.join(', ') : String(rawValue)
-        out[this.redactSecrets(k)] = RAW_COOKIE_FIELD_RE.test(k) ? '[redacted]' : this.redactSecrets(v)
-      }
-      return out
-    }
-    const { secrets, opts } = this.resolveOptions()
-    return sanitizeHttpHeaders(headers, secrets, opts)
+    return this.sanitizeHttpHeadersWithMatcher(headers, channel, this.getCompiledMatcher())
   }
 
   /**
@@ -480,23 +624,7 @@ export class EgressSanitizer {
    *   `redactText` (without clobbering benign structured fields like `canaryCheck.token`).
    */
   sanitizeValue<T>(value: T, channel: EgressChannel = 'worker_rpc'): T {
-    if (typeof value === 'string') return this.redactText(value, channel) as unknown as T
-    if (Array.isArray(value)) return value.map(item => this.sanitizeValue(item, channel)) as unknown as T
-    if (!value || typeof value !== 'object') return value
-    const out: Record<string, unknown> = {}
-    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
-      const safeKey = channel === 'llm_tool_args' ? this.redactSecrets(key) : this.redactText(key, channel)
-      if (channel === 'llm_tool_args') {
-        out[safeKey] = RAW_COOKIE_FIELD_RE.test(key) && typeof item === 'string'
-          ? '[redacted]'
-          : this.sanitizeValue(item, channel)
-      } else if (HEADER_OBJECT_KEYS.has(key) && isPlainStringHeaderMap(item)) {
-        out[safeKey] = this.sanitizeHttpHeaders(item, channel)
-      } else {
-        out[safeKey] = this.sanitizeValue(item, channel)
-      }
-    }
-    return out as T
+    return this.sanitizeNode(value, channel, this.getCompiledMatcher())
   }
 
   /** Dedicated typed choke point for all Browser tool results (H-8). */
