@@ -60,8 +60,8 @@ describe('conventional wordlist switch', () => {
   test('the product harness flag records the effective switch', () => {
     const off = parseRealisticArgs(['--app', 'acme-saas', '--no-conventional-wordlist'], {})
     assert.equal(off.conventionalWordlist, false)
-    const on = parseRealisticArgs(['--app', 'acme-saas'], {})
-    assert.equal(on.conventionalWordlist, true)
+    const def = parseRealisticArgs(['--app', 'acme-saas'], {})
+    assert.equal(def.conventionalWordlist, false)
   })
 
   test('renamed placeholders of one route collapse to a single triage endpoint', () => {

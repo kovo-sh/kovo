@@ -255,9 +255,9 @@ describe('hos-restore: shared-endpoint attribution', () => {
     const bola = scoreChallenge(challenge('bola', 'graphql_bola', 'user.invoices'), input)
     assert.equal(sqli.confirmed, true)
     assert.equal(bola.confirmed, false)
-    // The funnel still records that the hypothesis was formed and signalled on the route.
-    assert.equal(bola.hypothesisFormed, true)
-    assert.equal(bola.signalObserved, true)
+    // Cross-family sqli_boolean outcomes do not attribute to graphql_bola (cq-1 anchored classCompat).
+    assert.equal(bola.hypothesisFormed, false)
+    assert.equal(bola.signalObserved, false)
   })
 })
 

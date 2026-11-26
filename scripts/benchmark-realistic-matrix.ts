@@ -13,12 +13,21 @@
  * Held-out runs additionally need KOVO_RB_HELDOUT_SALT (>=16 chars, never committed).
  */
 import { spawn } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { availableParallelism } from 'node:os'
 import { resolve } from 'node:path'
 import {
   CellReaper, ResourceGuard, cellLabel, envFlagDisabled,
 } from './benchmark-parallel.ts'
+import {
+  DEFAULT_LEDGER_PATH,
+  LEDGER_SCHEMA_VERSION,
+  appendLedgerRow,
+  computeBenchmarkVersion,
+  computeEffectiveConfig,
+  resolveGitState,
+  type BenchmarkSuiteName,
+} from './bench-ledger.ts'
 
 interface Cell { app: string; seed: number }
 export interface CellResult {
@@ -66,6 +75,7 @@ function parseArgs(argv: readonly string[]): {
   outDir: string; timeoutMs: number; mode: string; profileMode: string
   maxRequests?: number; probeConcurrency?: number; verifyConcurrency?: number; slowProbes?: number
   minFreeMemGb: number; maxActiveWorkers: number; warmWorkers: boolean
+  ledgerPath?: string
 } {
   const out = {
     suite: 'realistic' as MatrixSuite,
@@ -81,6 +91,7 @@ function parseArgs(argv: readonly string[]): {
     maxActiveWorkers: Number(process.env.KOVO_MATRIX_MAX_WORKERS) >= 1
       ? Math.floor(Number(process.env.KOVO_MATRIX_MAX_WORKERS)) : DEFAULT_MAX_ACTIVE_WORKERS,
     warmWorkers: !envFlagDisabled(process.env, 'KOVO_WARM_WORKERS'),
+    ledgerPath: undefined as string | undefined,
   }
   const int = (arg: string, value: string, min: number, max: number): number => {
     const n = Number(value)
@@ -118,6 +129,14 @@ function parseArgs(argv: readonly string[]): {
       case '--min-free-gb': out.minFreeMemGb = int(arg, take(), 0, 1024); break
       case '--max-workers': out.maxActiveWorkers = int(arg, take(), 1, 256); break
       case '--no-warm-workers': out.warmWorkers = false; break
+      case '--ledger': {
+        if (value !== undefined && !value.startsWith('--')) {
+          out.ledgerPath = take()
+        } else {
+          out.ledgerPath = DEFAULT_LEDGER_PATH
+        }
+        break
+      }
       case '--help': case '-h':
         console.log('Usage: node scripts/benchmark-realistic-matrix.ts [--suite realistic|xben-25|held-out-saas] [--apps a,b] [--seeds 1,2] [--split dev|heldout] [--concurrency N] [--out-dir DIR] [--timeout-ms N] [--mode grey-box] [--profile-mode v4-full] [--max-requests N] [--probe-concurrency 1-8] [--verify-concurrency 1-4] [--slow-probes N] [--min-free-gb N] [--max-workers N] [--no-warm-workers]')
         process.exit(0)
@@ -327,6 +346,65 @@ async function main(): Promise<number> {
 
   results.sort((a, b) => a.app.localeCompare(b.app) || a.seed - b.seed)
   const totals = summarizeMatrix(results)
+  const suiteName: BenchmarkSuiteName = opts.suite === 'realistic' ? 'realistic-bench' : opts.suite
+  const { benchmarkVersion } = computeBenchmarkVersion(suiteName)
+  const { effectiveConfigHash, effectiveConfig } = computeEffectiveConfig({
+    deterministicOnly: true,
+    environment: 'local-lab',
+    approvalPolicy: 'auto_review',
+    wordlistOn: false,
+    mode: opts.mode,
+    extra: { profileMode: opts.profileMode },
+  })
+  const gitState = resolveGitState()
+  const recordedAt = new Date().toISOString()
+  writeFileSync(
+    resolve(opts.outDir, 'matrix-summary.json'),
+    `${JSON.stringify({
+      recordedAt,
+      gitSha: gitState.gitSha,
+      dirty: gitState.dirty,
+      suite: suiteName,
+      benchmarkVersion,
+      effectiveConfigHash,
+      totals,
+      cells: results,
+    }, null, 2)}\n`,
+    { mode: 0o600 },
+  )
+  if (opts.ledgerPath) {
+    for (const r of results) {
+      appendLedgerRow({
+        schemaVersion: LEDGER_SCHEMA_VERSION,
+        recordedAt,
+        suite: suiteName,
+        gitSha: gitState.gitSha,
+        dirty: gitState.dirty,
+        benchmarkVersion,
+        effectiveConfigHash,
+        effectiveConfig,
+        app: r.app,
+        split: opts.split === 'heldout' ? 'held-out' : 'dev',
+        mode: opts.mode,
+        llm: 'deterministic-no-llm',
+        seed: r.seed,
+        repeat: 1,
+        certifying: false,
+        reportable: true,
+        status: r.ok ? 'VALID' : 'INVALID',
+        targets: r.targets,
+        confirmed: r.confirmed,
+        recall: r.recall,
+        rawPrecision: r.precision,
+        strictPrecision: r.precision,
+        precision: r.precision,
+        decoyFalsePositives: r.decoyFp,
+        unmatchedFalsePositives: r.unmatchedFp,
+        costUsd: r.costUsd,
+        durationMs: r.runtimeMs,
+      }, opts.ledgerPath)
+    }
+  }
   const table = [
     '',
     ['cell'.padEnd(40), 'recall'.padEnd(11), 'prec'.padEnd(7), 'decoy/unmFP'.padEnd(12), 'wall'.padEnd(7), 'cost'.padEnd(8), 'status'].join(' '),

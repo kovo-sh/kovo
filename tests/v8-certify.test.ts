@@ -553,7 +553,7 @@ test('M2 FAIL: 1 hardened-twin decoy FP in 1 of 3 repeats fails worst-run precis
   assert.equal(report.verdict, 'FAIL')
   assert.equal(report.precision.passed, false)
   assert.equal(report.precision.totalHardenedTwinDecoyFps, 1)
-  assert.ok(report.precision.worstRunPrecision < 1)
+  assert.ok(report.precision.worstRunPrecision !== null && report.precision.worstRunPrecision < 1)
   assert.ok(report.failedChecks.some((c) => c.id === 'precision_worst_run'))
   assert.ok(report.failedChecks.some((c) => c.id === 'm2_dev_twin_fps'))
 })
