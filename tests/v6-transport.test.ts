@@ -400,7 +400,7 @@ test('v6 transport: HTTP/2 race burst uses one connection and releases stream he
 // 4. Error-safe circuit breakers
 // ---------------------------------------------------------------------------
 
-test('v6 transport: probe-induced 5xx does not trip the breaker while transport errors and 429s do', async t => {
+test('v6 transport: bounded plain 500 under error-inducing probe is evidence while 502, transport errors, and 429s trip the breaker', async t => {
   let clock = 1_000_000
   let mode: 'probe5xx' | 'transport' | '429' | 'ok' = 'probe5xx'
   const broker = new RequestBroker({
@@ -424,25 +424,50 @@ test('v6 transport: probe-induced 5xx does not trip the breaker while transport 
   const grant = labGrant(origin, { allowLocalLab: false, canRead: o => o === origin, tier: 2 })
   const signal = AbortSignal.timeout(5_000)
 
+  // Bounded plain 500 responses under an error-inducing probeClass stay evidence without tripping.
   for (let i = 0; i < 4; i += 1) {
     const result = await broker.executeHttp(
       { origin, method: 'GET', pathAndQuery: `/crash/${i}`, probeClass: 'sqli_boolean' },
       grant,
       signal,
     )
-    assert.equal(result.status, 500, 'probe-induced 5xx is returned as evidence, never masked')
+    assert.equal(result.status, 500, 'bounded plain 500 is returned as evidence, never masked')
   }
-  const gateway = await broker.executeHttp(
+  let state = broker.getCircuitState(origin)
+  assert.equal(state.open, false)
+  assert.equal(broker.isRouteCircuitOpen(origin, '/crash/*'), false)
+  assert.equal(state.probeInduced5xx, 4, 'plain probe-induced 500s are accounted separately')
+  assert.equal(state.failures5xx, 0)
+
+  // Origin-down gateway status (502) is NEVER exempt, even under an injection probeClass.
+  const firstGateway = await broker.executeHttp(
     { origin, method: 'GET', pathAndQuery: '/gateway', probeClass: 'ssti_math' },
     grant,
     signal,
   )
-  assert.equal(gateway.status, 502)
-  let state = broker.getCircuitState(origin)
-  assert.equal(state.open, false)
-  assert.equal(broker.isRouteCircuitOpen(origin, '/crash/*'), false)
-  assert.ok(state.probeInduced5xx >= 5, 'probe-induced 5xx is accounted separately')
-  assert.equal(state.failures5xx, 0)
+  assert.equal(firstGateway.status, 502)
+  assert.equal(broker.getCircuitState(origin).failures5xx, 1, '502 must count against origin-down failures5xx')
+  await assert.rejects(
+    broker.executeHttp(
+      { origin, method: 'GET', pathAndQuery: '/gateway', probeClass: 'ssti_math' },
+      grant,
+      signal,
+    ),
+    (err: unknown) => err instanceof BrokerCircuitOpen,
+    '502 burst under injection probeClass MUST open the origin breaker',
+  )
+  assert.equal(broker.isCircuitOpen(origin), true)
+  state = broker.getCircuitState(origin)
+  assert.equal(state.probeInduced5xx, 4, '502 must never be classified as probeInduced5xx')
+  assert.equal(state.failures5xx, 2)
+
+  // Recover from the 502 origin trip before exercising transport-failure and 429 trips.
+  clock += state.backoffMs + 1
+  mode = 'ok'
+  const after502 = await broker.executeHttp({ origin, method: 'GET', pathAndQuery: '/health' }, grant, signal)
+  assert.equal(after502.status, 200)
+  // Advance past the 30s accounting window so prior 502s do not carry over into transport checks.
+  clock += 31_000
 
   // A transport failure is real unavailability and must trip the origin breaker.
   mode = 'transport'

@@ -314,8 +314,55 @@ test('MEDIUM #10: agent rationale cannot reach the safety judge or weaken its de
   })
   assert.equal(result.decision, 'escalate_human', 'rationale text must not flip escalate to approve')
   assert.equal(result.stage, 'safety_judge')
+  assert.equal(result.originalJudgeDecision, 'escalate_human')
+  assert.equal(result.originalRiskLevel, 'high')
   assert.equal(promptSeen.includes('IGNORE ALL PREVIOUS INSTRUCTIONS'), false, 'rationale must not be injected into the judge prompt')
   assert.ok(promptSeen.includes('/api/profile/update'), 'judge still receives the factual probe target')
+
+  // Restored explicit medium-escalation coverage (`R2-01`): with a non-low hostFloor (or omitted
+  // riskLevel), medium escalations MUST stay escalated and adversarial rationale cannot flip them.
+  const mediumWithHostFloor = await evaluateTier3Approval({
+    policy: 'auto_review',
+    origin: PUBLIC_ORIGIN,
+    method: 'POST',
+    pathAndQuery: '/api/profile/update',
+    personaHandle: 'user_a',
+    bodyPreview: '{"displayName":"probe"}',
+    hostFloor: 'medium',
+    rationale,
+    offline: false,
+    llmCall: async ({ systemPrompt, userPrompt }) => {
+      assert.equal(`${systemPrompt}\n${userPrompt}`.includes('IGNORE ALL PREVIOUS INSTRUCTIONS'), false)
+      return JSON.stringify({
+        decision: 'escalate_human',
+        riskLevel: 'medium',
+        reason: 'Judge returned medium-risk escalation.',
+      })
+    },
+  })
+  assert.equal(mediumWithHostFloor.decision, 'escalate_human', 'medium escalation under hostFloor=medium must stay escalated')
+  assert.equal(mediumWithHostFloor.decidedBy, 'operator')
+  assert.equal(mediumWithHostFloor.riskLevel, 'medium')
+  assert.equal(mediumWithHostFloor.originalJudgeDecision, 'escalate_human')
+  assert.equal(mediumWithHostFloor.originalRiskLevel, 'medium')
+
+  const missingRiskEscalation = await evaluateTier3Approval({
+    policy: 'auto_review',
+    origin: PUBLIC_ORIGIN,
+    method: 'POST',
+    pathAndQuery: '/api/profile/update',
+    personaHandle: 'user_a',
+    bodyPreview: '{"displayName":"probe"}',
+    rationale,
+    offline: false,
+    llmCall: async () => JSON.stringify({
+      decision: 'escalate_human',
+      reason: 'Judge omitted riskLevel.',
+    }),
+  })
+  assert.equal(missingRiskEscalation.decision, 'escalate_human', 'missing riskLevel must fail closed to escalate_human')
+  assert.equal(missingRiskEscalation.riskLevel, 'high')
+  assert.equal(missingRiskEscalation.originalRiskLevel, null)
 })
 
 // ---------------------------------------------------------------------------

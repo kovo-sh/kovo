@@ -25,8 +25,8 @@ test('auto_review auto-approves unauthenticated auth-boundary POST/PUT/PATCH pro
     },
     {
       method: 'POST',
-      pathAndQuery: '/api/emails',
-      bodyPreview: '{"subject":"kovo-auth-boundary-probe"}',
+      pathAndQuery: '/api/comments',
+      bodyPreview: '{"body":"kovo-auth-boundary-probe"}',
       riskLevel: 'medium' as const,
     },
     {
@@ -64,8 +64,11 @@ test('auto_review auto-approves unauthenticated auth-boundary POST/PUT/PATCH pro
     })
 
     assert.equal(res.decision, 'approve', `Expected auto-approve for unauth ${probe.method} ${probe.pathAndQuery}`)
-    assert.equal(res.decidedBy, 'auto-review:judge')
+    assert.equal(res.decidedBy, 'auto-review:policy')
     assert.equal(res.riskLevel, probe.riskLevel)
+    assert.equal(res.originalJudgeDecision, 'escalate_human')
+    assert.equal(res.originalRiskLevel, probe.riskLevel)
+    assert.equal(res.hostFloor, 'low')
     assert.equal(res.stage, 'safety_judge')
     assert.equal(res.usedLlm, true)
     assert.match(res.reason, /auto_review/i)
@@ -230,6 +233,29 @@ test('auto_review still escalates external GitHub mutations and credential/token
     assert.equal(res.stage, 'safety_judge')
     assert.match(res.reason, tc.expectedSafeguard, `${tc.label}: reason should explain safeguard`)
   }
+
+  // Unauthenticated POST /api/emails matches domain HIGH_RISK_PATH_TOKENS (`emails`),
+  // so R2-01's host risk floor keeps it escalated even when Judge returns medium risk.
+  const highRiskEmailsRoute = await evaluateTier3Approval({
+    policy: 'auto_review',
+    origin: APP_ORIGIN,
+    method: 'POST',
+    pathAndQuery: '/api/emails',
+    personaHandle: null,
+    bodyPreview: '{"subject":"kovo-auth-boundary-probe"}',
+    offline: false,
+    llmCall: async () => JSON.stringify({
+      decision: 'escalate_human',
+      riskLevel: 'medium',
+      reason: 'Outbound email route probe.',
+    }),
+  })
+  assert.equal(highRiskEmailsRoute.decision, 'escalate_human')
+  assert.equal(highRiskEmailsRoute.decidedBy, 'operator')
+  assert.equal(highRiskEmailsRoute.riskLevel, 'high')
+  assert.equal(highRiskEmailsRoute.hostFloor, 'high')
+  assert.equal(highRiskEmailsRoute.originalJudgeDecision, 'escalate_human')
+  assert.equal(highRiskEmailsRoute.originalRiskLevel, 'medium')
 
   // Generic non-safeguard route with Judge returning riskLevel: 'high' ALWAYS stays escalated.
   const highRiskNonSafeguard = await evaluateTier3Approval({

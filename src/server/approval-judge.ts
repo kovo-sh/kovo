@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
 import { z } from 'zod'
+import { isHighRiskOrExternalMutationPath } from '../domain.ts'
 import type { ApprovalPolicy, ApprovedEndpointPattern } from '../domain.ts'
 import {
   computeApprovalHeadersDigest,
@@ -32,6 +33,7 @@ export type ApprovalDecisionKind = 'approve' | 'escalate_human' | 'deny'
 export type ApprovalDecidedBy =
   | 'auto-review:rule'
   | 'auto-review:judge'
+  | 'auto-review:policy'
   | 'auto-review:local-lab'
   | 'auto-review:environment'
   | 'auto-yolo'
@@ -56,6 +58,16 @@ export interface Tier3ApprovalInput {
   isRceProof?: boolean
   isRaceBurst?: boolean
   hasCompressedBody?: boolean
+  /**
+   * Host-derived minimum risk floor computed from request mutation classification
+   * (`isStructuralMutation`, `jsonrpc_destructive`, method/body) and domain `HIGH_RISK` tokens.
+   * Effective risk is `max(hostFloor, judgeRisk)`; Stage 2 auto_review NEVER auto-approves when
+   * `hostFloor > 'low'`.
+   */
+  hostFloor?: ApprovalRiskLevel
+  /** Optional mutation-classification hints passed from RequestAdmissionEngine. */
+  isStructuralMutation?: boolean
+  mutationKind?: string
   environment?: 'public' | 'local-lab'
   /**
    * v6 environment contract. When supplied, it replaces per-request keyword HITL as the primary
@@ -87,6 +99,12 @@ export interface Tier3ApprovalEvaluation {
   reason: string
   /** Optional explicit policy explanation when Stage 2 auto_review normalizes a low/medium verdict. */
   policyNote?: string
+  /** Raw decision returned by the Stage 2 Safety Judge before host policy normalization. */
+  originalJudgeDecision?: ApprovalDecisionKind
+  /** Raw riskLevel explicitly returned by the Stage 2 Safety Judge (`null` if omitted or invalid). */
+  originalRiskLevel?: ApprovalRiskLevel | null
+  /** Effective host-derived risk floor enforced during Stage 2 evaluation. */
+  hostFloor?: ApprovalRiskLevel
   usedLlm: boolean
   stage:
     | 'strict'
@@ -121,11 +139,28 @@ const MUTATION_BODY_HINT =
  */
 export const MAX_KEYWORD_SCAN_CHARS = 64 * 1024
 
+const RISK_LEVEL_RANK: Record<ApprovalRiskLevel, number> = {
+  low: 0,
+  medium: 1,
+  high: 2,
+}
+
+function maxApprovalRiskLevel(a: ApprovalRiskLevel, b: ApprovalRiskLevel): ApprovalRiskLevel {
+  return RISK_LEVEL_RANK[a] >= RISK_LEVEL_RANK[b] ? a : b
+}
+
+// Fail-closed Safety Judge response schema: NO `.default('medium')` on `riskLevel`.
+// Missing or invalid `riskLevel` is parsed as `null` (`originalRiskLevel: null`) and escalated
+// to effective `'high'` risk so an incomplete model reply can NEVER auto-approve.
 const safetyJudgeResponseSchema = z.object({
   decision: z.enum(['approve', 'escalate_human', 'deny']),
-  riskLevel: z.enum(['low', 'medium', 'high']).default('medium'),
+  riskLevel: z.unknown().optional(),
   reason: z.string().trim().min(1).max(400),
 })
+
+function parseExplicitJudgeRiskLevel(raw: unknown): ApprovalRiskLevel | null {
+  return raw === 'low' || raw === 'medium' || raw === 'high' ? raw : null
+}
 
 function parseIpv4Host(host: string): [number, number, number, number] | null {
   const match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host)
@@ -210,6 +245,8 @@ export interface StateChangeApprovalContext {
   hasMethodOverride?: boolean
   /** R2-H-1: Effective HTTP verb after accounting for override carriers. */
   effectiveMethod?: string
+  /** R2-01: Host-derived minimum risk floor computed from mutation classification + domain HIGH_RISK tokens. */
+  hostFloor?: ApprovalRiskLevel
   /** Optional assignment ID binding a grant to a specific worker assignment (`H-4`). */
   assignmentId?: string
 }
@@ -771,6 +808,121 @@ function detectAutoReviewHighImpactSafeguardReason(input: {
   return null
 }
 
+const JUDGE_JSONRPC_READ_METHOD_RE =
+  /^(?:[a-z][a-z0-9_-]*[./:])?(?:get|list|read|find|fetch|query|search|describe|inspect|show|view|check|ping|health|status|version|info|echo)(?:[A-Z_].*)?$/
+const JUDGE_JSONRPC_DESTRUCTIVE_METHOD_RE =
+  /(?:^|[./:_-])(?:delete|destroy|drop|purge|wipe|truncate|remove|revoke|reset|exec|eval|shell|shutdown|kill|nuke)(?:$|[./:_-]|[A-Z])/i
+
+function classifyJsonRpcRiskForJudge(
+  body: string | null | undefined,
+  headers?: Record<string, string>,
+): 'none' | 'read' | 'mutation' | 'destructive' | 'malformed' {
+  const trimmed = (body ?? '').trim()
+  if (!trimmed || (trimmed[0] !== '{' && trimmed[0] !== '[')) return 'none'
+  const contentType = (headerLookup(headers, 'content-type') ?? '').toLowerCase()
+  if (contentType && !contentType.includes('json')) return 'none'
+  const looksJsonRpcHint = /"jsonrpc"|"\\u006a/i.test(trimmed)
+  if (!looksJsonRpcHint) return 'none'
+  let parsed: unknown
+  try {
+    parsed = trimmed.startsWith('{') ? parseStrictJsonObject(trimmed) : JSON.parse(trimmed)
+    if (parsed === undefined) return 'malformed'
+  } catch {
+    return 'malformed'
+  }
+  const items = Array.isArray(parsed) ? parsed : [parsed]
+  if (items.length === 0) return 'none'
+  const hasJsonRpcField = items.some(
+    item => Boolean(item && typeof item === 'object' && !Array.isArray(item) && 'jsonrpc' in (item as Record<string, unknown>)),
+  )
+  if (!hasJsonRpcField) return 'none'
+  let hasMutation = false
+  for (const item of items) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return 'malformed'
+    const rec = item as Record<string, unknown>
+    if (rec.jsonrpc !== '2.0' || typeof rec.method !== 'string' || !rec.method.trim()) return 'malformed'
+    const rpcMethod = rec.method.trim()
+    if (JUDGE_JSONRPC_DESTRUCTIVE_METHOD_RE.test(rpcMethod)) return 'destructive'
+    if (!JUDGE_JSONRPC_READ_METHOD_RE.test(rpcMethod)) hasMutation = true
+  }
+  return hasMutation ? 'mutation' : 'read'
+}
+
+/**
+ * Host-derived minimum approval risk floor (`R2-01`) computed strictly from host-inspected
+ * request structure (`classifyRequestMutation` signals: `isStructuralMutation`, `jsonrpc_destructive`,
+ * method/body) + domain `HIGH_RISK_PATH_TOKENS` (`isHighRiskOrExternalMutationPath`) + Stage 2
+ * high-impact route safeguards.
+ *
+ * Shared by `RequestAdmissionEngine` and `evaluateTier3Approval` so the Safety Judge can never
+ * downgrade a host-classified high- or medium-risk request.
+ */
+export function computeHostApprovalRiskFloor(input: {
+  method: string
+  pathAndQuery: string
+  personaHandle?: string | null
+  bodyPreview?: string | null
+  headers?: Record<string, string>
+  hasMultipart?: boolean
+  isRceProof?: boolean
+  isRaceBurst?: boolean
+  hasCompressedBody?: boolean
+  hasMethodOverride?: boolean
+  isStructuralMutation?: boolean
+  mutationKind?: string
+}): ApprovalRiskLevel {
+  const method = (input.method || 'GET').toUpperCase()
+  const pathAndQuery = input.pathAndQuery || '/'
+  if (
+    input.isStructuralMutation === true ||
+    input.mutationKind === 'jsonrpc_destructive' ||
+    input.mutationKind === 'jsonrpc_malformed' ||
+    input.mutationKind === 'multipart_upload' ||
+    input.mutationKind === 'compressed_mutation' ||
+    Boolean(detectNonOverridableEscalationReason({
+      method,
+      pathAndQuery,
+      bodyPreview: input.bodyPreview,
+      headers: input.headers,
+      hasMultipart: input.hasMultipart,
+      isRceProof: input.isRceProof,
+      isRaceBurst: input.isRaceBurst,
+      hasCompressedBody: input.hasCompressedBody,
+      hasMethodOverride: input.hasMethodOverride,
+    })) ||
+    Boolean(detectRouteStructuralEscalationReason({
+      method,
+      pathAndQuery,
+      bodyPreview: input.bodyPreview,
+      headers: input.headers,
+      hasMultipart: input.hasMultipart,
+    })) ||
+    isHighRiskOrExternalMutationPath(pathAndQuery) ||
+    Boolean(detectAutoReviewHighImpactSafeguardReason({
+      method,
+      pathAndQuery,
+      personaHandle: input.personaHandle ?? null,
+      bodyPreview: input.bodyPreview,
+    }))
+  ) {
+    return 'high'
+  }
+
+  const jsonRpcRisk = classifyJsonRpcRiskForJudge(input.bodyPreview, input.headers)
+  if (jsonRpcRisk === 'destructive' || jsonRpcRisk === 'malformed') {
+    return 'high'
+  }
+  if (
+    input.mutationKind === 'jsonrpc_mutation' ||
+    input.mutationKind === 'graphql_mutation_or_unverified' ||
+    jsonRpcRisk === 'mutation'
+  ) {
+    return 'medium'
+  }
+
+  return 'low'
+}
+
 const SAFETY_JUDGE_SYSTEM_PROMPT = [
   'You are an independent, zero-context security safety judge for Kovo Hunter, an authorized defensive security testing platform.',
   'You are reviewing a single Tier 3 HTTP probe that is already within approved host scope and has passed hard broker invariants (no destructive SQL/shell payloads, no private-IP/SSRF access, no webshells, RPS capped).',
@@ -1075,6 +1227,24 @@ export async function evaluateTier3Approval(
     2,
   )
 
+  const derivedHostFloor = computeHostApprovalRiskFloor({
+    method,
+    pathAndQuery,
+    personaHandle: input.personaHandle ?? null,
+    bodyPreview: input.bodyPreview,
+    headers: input.headers,
+    hasMultipart: input.hasMultipart,
+    isRceProof: input.isRceProof,
+    isRaceBurst: input.isRaceBurst,
+    hasCompressedBody: input.hasCompressedBody,
+    hasMethodOverride: override.hasOverride,
+    isStructuralMutation: input.isStructuralMutation,
+    mutationKind: input.mutationKind,
+  })
+  const effectiveHostFloor = input.hostFloor
+    ? maxApprovalRiskLevel(input.hostFloor, derivedHostFloor)
+    : derivedHostFloor
+
   try {
     const raw = await llmCall({
       systemPrompt: SAFETY_JUDGE_SYSTEM_PROMPT,
@@ -1082,86 +1252,156 @@ export async function evaluateTier3Approval(
     })
     const parsed = safetyJudgeResponseSchema.parse(extractJsonObject(raw))
     const redactedReason = redact(parsed.reason, secrets)
-    if (parsed.decision === 'approve') {
-      return {
-        decision: 'approve',
-        decidedBy: 'auto-review:judge',
-        riskLevel: parsed.riskLevel,
-        reason: redactedReason,
-        usedLlm: true,
-        stage: 'safety_judge',
-      }
-    }
+    const originalJudgeDecision = parsed.decision
+    const originalRiskLevel = parseExplicitJudgeRiskLevel(parsed.riskLevel)
+    const riskLevelMissingOrInvalid = originalRiskLevel === null
+    // Fail-closed: missing or invalid Judge `riskLevel` is always treated as `'high'`.
+    const judgeRisk: ApprovalRiskLevel = originalRiskLevel ?? 'high'
+    const effectiveRisk = maxApprovalRiskLevel(effectiveHostFloor, judgeRisk)
+    const auditFields = {
+      originalJudgeDecision,
+      originalRiskLevel,
+      hostFloor: effectiveHostFloor,
+    } as const
+
     if (parsed.decision === 'deny') {
       return {
         decision: 'deny',
         decidedBy: 'auto-review:judge',
-        riskLevel: parsed.riskLevel,
+        riskLevel: effectiveRisk,
         reason: redactedReason,
+        ...auditFields,
         usedLlm: true,
         stage: 'safety_judge',
       }
     }
-    // Stage 2 deterministic `auto_review` verdict policy:
-    // Pause for human review ONLY on `high`-risk, destructive, structural, or external-side-effect
-    // actions. Auto-convert `low` and `medium` non-destructive escalations into `approve` when no
-    // non-overridable structural escalation, route structural escalation, or external/destructive
-    // safeguard applies.
-    if (parsed.riskLevel === 'low' || parsed.riskLevel === 'medium') {
-      const nonOverridableCheck = detectNonOverridableEscalationReason({
-        method,
-        pathAndQuery,
-        bodyPreview: input.bodyPreview,
-        headers: input.headers,
-        hasMultipart: input.hasMultipart,
-        isRceProof: input.isRceProof,
-        isRaceBurst: input.isRaceBurst,
-        hasCompressedBody: input.hasCompressedBody,
-      })
-      const routeStructuralCheck = detectRouteStructuralEscalationReason({
-        method,
-        pathAndQuery,
-        bodyPreview: input.bodyPreview,
-        headers: input.headers,
-        hasMultipart: input.hasMultipart,
-      })
-      const highImpactSafeguardReason = detectAutoReviewHighImpactSafeguardReason({
-        method,
-        pathAndQuery,
-        personaHandle: input.personaHandle ?? null,
-        bodyPreview: input.bodyPreview,
-      })
-      if (!nonOverridableCheck && !routeStructuralCheck && !highImpactSafeguardReason) {
-        const probeKind = input.personaHandle == null
-          ? 'unauthenticated auth-boundary probe'
-          : 'bounded non-destructive in-app probe'
-        const policyNote = `Auto-approved under auto_review (${parsed.riskLevel}-risk ${probeKind}; human review reserved for high-risk, destructive, structural, or external-side-effect actions). Judge note: ${redactedReason}`
-        return {
-          decision: 'approve',
-          decidedBy: 'auto-review:judge',
-          riskLevel: parsed.riskLevel,
-          reason: policyNote,
-          policyNote,
-          usedLlm: true,
-          stage: 'safety_judge',
-        }
-      }
-      if (highImpactSafeguardReason) {
+
+    if (parsed.decision === 'approve') {
+      // Never auto-approve when `riskLevel` was omitted/invalid, when `hostFloor > 'low'`,
+      // or when the Judge itself marked the request `'high'` risk.
+      if (riskLevelMissingOrInvalid) {
         return {
           decision: 'escalate_human',
           decidedBy: 'operator',
           riskLevel: 'high',
-          reason: `${redactedReason} (${highImpactSafeguardReason})`,
+          reason: `${redactedReason} (Safety Judge omitted or returned invalid riskLevel; failing closed to human review.)`,
+          ...auditFields,
           usedLlm: true,
           stage: 'safety_judge',
         }
+      }
+      if (effectiveHostFloor !== 'low' || effectiveRisk === 'high') {
+        const highImpactSafeguardReason = detectAutoReviewHighImpactSafeguardReason({
+          method,
+          pathAndQuery,
+          personaHandle: input.personaHandle ?? null,
+          bodyPreview: input.bodyPreview,
+        })
+        const detail = highImpactSafeguardReason
+          ?? `Host risk floor "${effectiveHostFloor}" prohibits auto-approval; escalating to human review.`
+        return {
+          decision: 'escalate_human',
+          decidedBy: 'operator',
+          riskLevel: effectiveRisk,
+          reason: `${redactedReason} (${detail})`,
+          ...auditFields,
+          usedLlm: true,
+          stage: 'safety_judge',
+        }
+      }
+      return {
+        decision: 'approve',
+        decidedBy: 'auto-review:judge',
+        riskLevel: effectiveRisk,
+        reason: redactedReason,
+        ...auditFields,
+        usedLlm: true,
+        stage: 'safety_judge',
+      }
+    }
+
+    // Stage 2 deterministic `auto_review` verdict policy (`parsed.decision === 'escalate_human'`):
+    // NEVER convert `escalate_human` -> `approve` unless `hostFloor === 'low'` AND the Judge
+    // explicitly supplied `riskLevel: 'low' | 'medium'` AND no structural or high-impact
+    // safeguard applies. When Stage 2 policy does normalize `escalate_human` -> `approve`,
+    // attribute `decidedBy: 'auto-review:policy'` and preserve `originalJudgeDecision` +
+    // `originalRiskLevel` as structured audit fields.
+    const nonOverridableCheck = detectNonOverridableEscalationReason({
+      method,
+      pathAndQuery,
+      bodyPreview: input.bodyPreview,
+      headers: input.headers,
+      hasMultipart: input.hasMultipart,
+      isRceProof: input.isRceProof,
+      isRaceBurst: input.isRaceBurst,
+      hasCompressedBody: input.hasCompressedBody,
+    })
+    const routeStructuralCheck = detectRouteStructuralEscalationReason({
+      method,
+      pathAndQuery,
+      bodyPreview: input.bodyPreview,
+      headers: input.headers,
+      hasMultipart: input.hasMultipart,
+    })
+    const highImpactSafeguardReason = detectAutoReviewHighImpactSafeguardReason({
+      method,
+      pathAndQuery,
+      personaHandle: input.personaHandle ?? null,
+      bodyPreview: input.bodyPreview,
+    })
+
+    if (
+      !riskLevelMissingOrInvalid &&
+      effectiveHostFloor === 'low' &&
+      (judgeRisk === 'low' || judgeRisk === 'medium') &&
+      !nonOverridableCheck &&
+      !routeStructuralCheck &&
+      !highImpactSafeguardReason
+    ) {
+      const probeKind = input.personaHandle == null
+        ? 'unauthenticated auth-boundary probe'
+        : 'bounded non-destructive in-app probe'
+      const policyNote = `Auto-approved under auto_review (${effectiveRisk}-risk ${probeKind}; human review reserved for high-risk, destructive, structural, or external-side-effect actions). Judge note: ${redactedReason}`
+      return {
+        decision: 'approve',
+        decidedBy: 'auto-review:policy',
+        riskLevel: effectiveRisk,
+        reason: policyNote,
+        policyNote,
+        ...auditFields,
+        usedLlm: true,
+        stage: 'safety_judge',
+      }
+    }
+
+    if (highImpactSafeguardReason) {
+      return {
+        decision: 'escalate_human',
+        decidedBy: 'operator',
+        riskLevel: 'high',
+        reason: `${redactedReason} (${highImpactSafeguardReason})`,
+        ...auditFields,
+        usedLlm: true,
+        stage: 'safety_judge',
+      }
+    }
+    if (riskLevelMissingOrInvalid) {
+      return {
+        decision: 'escalate_human',
+        decidedBy: 'operator',
+        riskLevel: 'high',
+        reason: `${redactedReason} (Safety Judge omitted or returned invalid riskLevel; failing closed to human review.)`,
+        ...auditFields,
+        usedLlm: true,
+        stage: 'safety_judge',
       }
     }
     return {
       decision: 'escalate_human',
       decidedBy: 'operator',
-      riskLevel: parsed.riskLevel,
+      riskLevel: effectiveRisk,
       reason: redactedReason,
+      ...auditFields,
       usedLlm: true,
       stage: 'safety_judge',
     }
@@ -1169,8 +1409,9 @@ export async function evaluateTier3Approval(
     return {
       decision: 'escalate_human',
       decidedBy: 'operator',
-      riskLevel: 'medium',
+      riskLevel: maxApprovalRiskLevel(effectiveHostFloor, 'high'),
       reason: 'Safety Judge call failed or returned invalid JSON; failing safe to human approval.',
+      hostFloor: effectiveHostFloor,
       usedLlm: true,
       stage: 'fail_safe',
     }

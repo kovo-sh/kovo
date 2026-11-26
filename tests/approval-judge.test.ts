@@ -104,17 +104,37 @@ test('auto_review Stage 1A always escalates DELETE, multipart, rce_proof, and co
   }
   assert.equal(llmCalls, 0)
 
-  // Retired keyword escalation (v6 M-32): English words in path/body no longer hard-escalate.
-  const keywordRes = await evaluateTier3Approval({
+  // Retired keyword escalation (v6 M-32): English words no longer short-circuit in Stage 1A,
+  // but R2-01 enforces a host-derived `HIGH_RISK_PATH_TOKENS` floor in Stage 2 so high-risk
+  // financial routes like `/api/billing/cancel` cannot be auto-approved even if the Judge says approve.
+  const billingRes = await evaluateTier3Approval({
     policy: 'auto_review',
     origin: 'https://app.example.com',
     method: 'POST',
     pathAndQuery: '/api/billing/cancel',
     personaHandle: 'user_a',
+    llmCall: async () => JSON.stringify({ decision: 'approve', riskLevel: 'low', reason: 'Judge approved route' }),
+  })
+  assert.equal(billingRes.decision, 'escalate_human')
+  assert.equal(billingRes.decidedBy, 'operator')
+  assert.equal(billingRes.riskLevel, 'high')
+  assert.equal(billingRes.hostFloor, 'high')
+  assert.equal(billingRes.originalJudgeDecision, 'approve')
+  assert.equal(billingRes.originalRiskLevel, 'low')
+  assert.equal(billingRes.stage, 'safety_judge')
+
+  // Non-high-risk route with explicit low-risk Judge approval still approves cleanly in Stage 2.
+  const benignStage2Res = await evaluateTier3Approval({
+    policy: 'auto_review',
+    origin: 'https://app.example.com',
+    method: 'POST',
+    pathAndQuery: '/api/notes/archive',
+    personaHandle: 'user_a',
     llmCall: async () => JSON.stringify({ decision: 'approve', riskLevel: 'low', reason: 'Judge approved benign route' }),
   })
-  assert.equal(keywordRes.decision, 'approve')
-  assert.equal(keywordRes.stage, 'safety_judge')
+  assert.equal(benignStage2Res.decision, 'approve')
+  assert.equal(benignStage2Res.decidedBy, 'auto-review:judge')
+  assert.equal(benignStage2Res.stage, 'safety_judge')
 })
 
 test('auto_review Stage 1B fast-paths benign unauth POST, read-only GraphQL/search, and approved patterns', async () => {
@@ -218,7 +238,7 @@ test('auto_review Stage 2 independent Safety Judge handles approve, escalate_hum
   assert.equal(approved.usedLlm, true)
   assert.equal(approved.stage, 'safety_judge')
 
-  // 2. Judge escalates uncertain probe
+  // 2. Judge escalates uncertain probe on high-impact route -> stays escalated with audit trail
   const escalated = await evaluateTier3Approval({
     policy: 'auto_review',
     origin: 'https://api.example.com',
@@ -235,7 +255,75 @@ test('auto_review Stage 2 independent Safety Judge handles approve, escalate_hum
   })
   assert.equal(escalated.decision, 'escalate_human')
   assert.equal(escalated.decidedBy, 'operator')
+  assert.equal(escalated.riskLevel, 'high')
+  assert.equal(escalated.originalJudgeDecision, 'escalate_human')
+  assert.equal(escalated.originalRiskLevel, 'medium')
   assert.equal(escalated.usedLlm, true)
+
+  // 2b. Explicit medium-risk escalation with hostFloor='medium' stays escalated (never auto-approved)
+  const mediumHostFloor = await evaluateTier3Approval({
+    policy: 'auto_review',
+    origin: 'https://api.example.com',
+    method: 'POST',
+    pathAndQuery: '/api/profile/update',
+    personaHandle: 'user_a',
+    bodyPreview: '{"displayName":"probe"}',
+    hostFloor: 'medium',
+    offline: false,
+    llmCall: async () => JSON.stringify({
+      decision: 'escalate_human',
+      riskLevel: 'medium',
+      reason: 'Medium-risk authenticated mutation.',
+    }),
+  })
+  assert.equal(mediumHostFloor.decision, 'escalate_human')
+  assert.equal(mediumHostFloor.decidedBy, 'operator')
+  assert.equal(mediumHostFloor.riskLevel, 'medium')
+  assert.equal(mediumHostFloor.hostFloor, 'medium')
+  assert.equal(mediumHostFloor.originalJudgeDecision, 'escalate_human')
+  assert.equal(mediumHostFloor.originalRiskLevel, 'medium')
+
+  // 2c. Missing riskLevel from Judge fails closed to high-risk escalate_human (never defaults to medium)
+  const missingRisk = await evaluateTier3Approval({
+    policy: 'auto_review',
+    origin: 'https://api.example.com',
+    method: 'POST',
+    pathAndQuery: '/api/profile/update',
+    personaHandle: 'user_a',
+    bodyPreview: '{"displayName":"probe"}',
+    offline: false,
+    llmCall: async () => JSON.stringify({
+      decision: 'escalate_human',
+      reason: 'Judge omitted riskLevel.',
+    }),
+  })
+  assert.equal(missingRisk.decision, 'escalate_human')
+  assert.equal(missingRisk.decidedBy, 'operator')
+  assert.equal(missingRisk.riskLevel, 'high')
+  assert.equal(missingRisk.originalJudgeDecision, 'escalate_human')
+  assert.equal(missingRisk.originalRiskLevel, null)
+
+  // 2d. Stage 2 policy normalization on hostFloor='low' attributes 'auto-review:policy' and preserves Judge verdict
+  const policyNormalized = await evaluateTier3Approval({
+    policy: 'auto_review',
+    origin: 'https://api.example.com',
+    method: 'POST',
+    pathAndQuery: '/api/profile/update',
+    personaHandle: 'user_a',
+    bodyPreview: '{"displayName":"probe"}',
+    offline: false,
+    llmCall: async () => JSON.stringify({
+      decision: 'escalate_human',
+      riskLevel: 'medium',
+      reason: 'Bounded reversible profile update.',
+    }),
+  })
+  assert.equal(policyNormalized.decision, 'approve')
+  assert.equal(policyNormalized.decidedBy, 'auto-review:policy')
+  assert.equal(policyNormalized.riskLevel, 'medium')
+  assert.equal(policyNormalized.hostFloor, 'low')
+  assert.equal(policyNormalized.originalJudgeDecision, 'escalate_human')
+  assert.equal(policyNormalized.originalRiskLevel, 'medium')
 
   // 3. Judge denies unsafe probe
   const denied = await evaluateTier3Approval({

@@ -15,7 +15,12 @@ import { createHash } from 'node:crypto'
 import type { ApprovalPolicy, ApprovedEndpointPattern, CapabilityTier } from '../domain.ts'
 import { containsDestructivePayload, containsWebshellSignature } from '../replay-spec.ts'
 import type { AuthMutation } from '../replay-spec.ts'
-import { computeStateChangeBodyHash, detectMultipartRequest, isLocalLabAutoApprovalOrigin } from './approval-judge.ts'
+import {
+  computeHostApprovalRiskFloor,
+  computeStateChangeBodyHash,
+  detectMultipartRequest,
+  isLocalLabAutoApprovalOrigin,
+} from './approval-judge.ts'
 import type { MultipartBodyPart, StateChangeApprovalContext } from './approval-judge.ts'
 import { computeApprovalHeadersDigest, normalizeOriginKey } from './approval-pattern.ts'
 import {
@@ -295,10 +300,17 @@ export interface RequestAdmissionEngineOptions {
   env?: NodeJS.ProcessEnv
 }
 
+export interface GrantApprovalDegradation {
+  kind: 'admission.env_mode_lookup_degraded'
+  runId: string
+  error: string
+}
+
 export interface GrantApprovalContext {
   effectivePolicy: ApprovalPolicy | undefined
   liveEnvironmentMode: EnvironmentMode | undefined
   explicitEnvironmentMode: boolean
+  degradation?: GrantApprovalDegradation
 }
 
 // ---------------------------------------------------------------------------
@@ -392,26 +404,54 @@ export function resolveGrantApprovalContext(grant: Pick<AdmissionGrant, 'approva
   let effectivePolicy = grant.approvalPolicy
   let liveEnvironmentMode: EnvironmentMode | undefined
   let explicitEnvironmentMode = false
+  let degradation: GrantApprovalDegradation | undefined
   const runId = grant.scopePolicy?.runId
   const store = grant.storage as {
     run?: (id: string) => { approvalPolicy?: ApprovalPolicy; environmentMode?: EnvironmentMode }
+    hasExplicitEnvironmentMode?: (id: string) => boolean
     eventsAfter?: (id: string, after: number, limit?: number) => Array<{ kind: string }>
+    event?: (runId: string, kind: string, message: string, detail?: Record<string, unknown>) => unknown
   } | undefined
   if (runId && store && typeof store.run === 'function') {
     try {
       const liveRun = store.run(runId)
       if (liveRun.approvalPolicy) effectivePolicy = liveRun.approvalPolicy
       if (liveRun.environmentMode) liveEnvironmentMode = liveRun.environmentMode
-      if (typeof store.eventsAfter === 'function') {
+      if (typeof store.hasExplicitEnvironmentMode === 'function') {
+        explicitEnvironmentMode = Boolean(store.hasExplicitEnvironmentMode(runId))
+      } else if (typeof store.eventsAfter === 'function') {
+        // Transitional fallback when `store` has not yet forwarded `hasExplicitEnvironmentMode`.
         explicitEnvironmentMode = store.eventsAfter(runId, 0, 500).some(e => e.kind === 'scope.environment_mode')
       }
-    } catch {
-      explicitEnvironmentMode = grant.approvalPolicy === undefined
+    } catch (err) {
+      // Fail closed (`R2-01`): a storage lookup failure MUST NEVER set `explicitEnvironmentMode = true`
+      // or widen approval onto `allowed_environment_contract`, even if `grant.approvalPolicy` is undefined.
+      explicitEnvironmentMode = false
+      const message = err instanceof Error ? err.message : String(err)
+      degradation = {
+        kind: 'admission.env_mode_lookup_degraded',
+        runId,
+        error: message,
+      }
+      if (typeof store.event === 'function') {
+        try {
+          store.event(
+            runId,
+            'admission.env_mode_lookup_degraded',
+            `Failed to resolve explicit environment mode for run ${runId}; failing closed (explicitEnvironmentMode=false).`,
+            { runId, explicitEnvironmentMode: false, error: message },
+          )
+        } catch {
+          // Best-effort persistence when storage itself is degraded.
+        }
+      }
     }
   } else {
     explicitEnvironmentMode = grant.approvalPolicy === undefined
   }
-  return { effectivePolicy, liveEnvironmentMode, explicitEnvironmentMode }
+  return degradation
+    ? { effectivePolicy, liveEnvironmentMode, explicitEnvironmentMode, degradation }
+    : { effectivePolicy, liveEnvironmentMode, explicitEnvironmentMode }
 }
 
 function isSyntheticInvalidBearerHeader(name: string, value: string): boolean {
@@ -1837,6 +1877,19 @@ export class RequestAdmissionEngine {
           hasMultipart: classification.hasMultipart,
           bodyPreview: hasMultipartParts ? null : (request.body ?? null),
         })
+        const hostFloor = computeHostApprovalRiskFloor({
+          method: normalizedMethod,
+          pathAndQuery: canonical,
+          personaHandle: request.personaHandle ?? null,
+          bodyPreview: hasMultipartParts ? null : (request.body ?? null),
+          headers: decisionHeaders,
+          hasMultipart: classification.hasMultipart,
+          isRaceBurst: request.isRaceBurst === true,
+          hasCompressedBody: classification.hasCompressedBody,
+          hasMethodOverride: classification.hasMethodOverride,
+          isStructuralMutation: classification.isStructuralMutation,
+          mutationKind: classification.kind,
+        })
         const approvalContext: StateChangeApprovalContext = {
           personaHandle: request.personaHandle ?? null,
           body: hasMultipartParts ? null : (request.body ?? null),
@@ -1849,6 +1902,7 @@ export class RequestAdmissionEngine {
           hasCompressedBody: classification.hasCompressedBody,
           hasMethodOverride: classification.hasMethodOverride,
           effectiveMethod: classification.effectiveMethod,
+          hostFloor,
           ...(request.assignmentId ? { assignmentId: request.assignmentId } : {}),
         }
         if (evaluateConsuming) {
