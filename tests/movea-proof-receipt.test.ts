@@ -105,7 +105,7 @@ function makeMockProveHost(
     async runOob(): Promise<unknown> {
       return {}
     },
-    async runHttpExchange(args: Record<string, unknown>, nonce: string): Promise<ProveHttpExchangeResult> {
+    async runHttpExchange(args: Record<string, unknown>, nonce: string, stamps?: { hostExpressionChallenge?: unknown; hostBooleanPair?: unknown }): Promise<ProveHttpExchangeResult> {
       const idx = httpCalls.length
       httpCalls.push(args)
       const res = responder(args, idx)
@@ -121,6 +121,8 @@ function makeMockProveHost(
         op: 'http',
         startedAt,
         durationMs,
+        ...(stamps?.hostExpressionChallenge ? { hostExpressionChallenge: stamps.hostExpressionChallenge as never } : {}),
+        ...(stamps?.hostBooleanPair ? { hostBooleanPair: stamps.hostBooleanPair as never } : {}),
         request: {
           origin,
           method,
@@ -334,9 +336,14 @@ test('R2-C-6: evaluated-expression oracle requires host-minted randomized operan
   assert.equal(hostEvalRes.ok, true)
   assert.equal(hostEvalRes.confirmed, true)
   assert.equal(hostEvalRes.evaluated, true)
-  const minted = hostEvalRes.hostMintedChallenges as Array<{ expectedOutput: string }>
+  const minted = hostEvalRes.hostMintedChallenges as Array<Record<string, unknown>>
   assert.equal(minted.length, 2)
-  assert.notEqual(minted[0]!.expectedOutput, minted[1]!.expectedOutput)
+  assert.notEqual(minted[0]!.challengeId, minted[1]!.challengeId)
+  // R4-C-2: handleProveInjection must NEVER return expectedOutput or operands to the worker.
+  assert.equal('expectedOutput' in minted[0]!, false)
+  assert.equal('expectedOutput' in minted[1]!, false)
+  assert.equal('operandA' in minted[0]!, false)
+  assert.equal('operandB' in minted[0]!, false)
 })
 
 // ============================================================================
