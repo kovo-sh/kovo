@@ -280,6 +280,42 @@ if [[ -n "$STREAM_REF" && "$STREAM_SHA" != "$BASE_SHA" ]]; then
   fi
 fi
 
+# 3b. Prepare build/ before worker-gate.sh so parallel Playwright suites never race on `npm run build`.
+# Rebuild when the merged diff touches frontend/SSR build inputs or REPO_ROOT/build is missing;
+# otherwise symlink REPO_ROOT/build (matching node_modules reuse above).
+if [[ -f "${WORKTREE_DIR}/package.json" && -e "${WORKTREE_DIR}/node_modules" && ! -e "${WORKTREE_DIR}/build" ]]; then
+  need_build=0
+  if [[ ! -f "${REPO_ROOT}/build/server/server.js" || ! -d "${REPO_ROOT}/build/client" ]]; then
+    need_build=1
+  elif [[ "$MERGED_SHA" != "$BASE_SHA" ]]; then
+    if git -C "$WORKTREE_DIR" diff --name-only "$BASE_SHA..$MERGED_SHA" \
+      | grep -Eq '^src/(components|routes|styles|root\.tsx|app\.css|entry\.|findings-view)|^(vite|react-router|tsconfig)\.config|^package\.json'; then
+      need_build=1
+    fi
+  fi
+  if (( need_build == 1 )); then
+    build_rc=0
+    set +e
+    if (( JSON_OUT == 1 )); then
+      (cd "$WORKTREE_DIR" && npm run build) >&2
+      build_rc=$?
+    else
+      echo "== merge-stream: building client/SSR bundle once in temp worktree"
+      (cd "$WORKTREE_DIR" && npm run build)
+      build_rc=$?
+    fi
+    set -e
+    if (( build_rc != 0 )); then
+      elapsed=$(( $(date +%s) - t0 ))
+      emit_result "GATE_FAILED" "false" "pre-gate npm run build exited ${build_rc}; '${BASE_REF}' left untouched at ${BASE_SHA:0:8}" "$BASE_SHA" "$MERGED_SHA" "$elapsed" "false"
+      exit "$build_rc"
+    fi
+  else
+    build_target="$(readlink -f "${REPO_ROOT}/build" 2>/dev/null || echo "${REPO_ROOT}/build")"
+    ln -s "$build_target" "${WORKTREE_DIR}/build"
+  fi
+fi
+
 # 4. Run the fast gate on the MERGED TREE (never skipped for tests/docs-only branches).
 gate_rc=0
 set +e
