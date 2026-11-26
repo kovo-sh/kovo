@@ -24,6 +24,18 @@ const PUBLIC_MAX_RPS_CAP = 20
 const MAX_AUTO_SELECT_HOSTS = 30
 const LARGE_HOST_FILTER_THRESHOLD = 8
 
+const DEFAULT_SCAN_MODE_GOALS: ReadonlySet<string> = new Set([
+  'Map endpoints, API routes, and client bundles, and verify read-only exposures and cross-account reads without state-changing requests.',
+  'Run safe active checks, auth/access-control probes, and high-impact proofs while pausing for human approval before risky state-changing actions.',
+  'Run all in-scope active probes, mutations, and race bursts automatically with full audit logs and no approval pauses.',
+])
+
+/** True when a run has an operator-authored goal distinct from the built-in scan mode presets. */
+export function isCustomRunGoal(goal: string | null | undefined): boolean {
+  const trimmed = (goal ?? '').trim()
+  return trimmed.length > 0 && !DEFAULT_SCAN_MODE_GOALS.has(trimmed)
+}
+
 type ScanModeKey = 'passive' | 'supervised' | 'autonomous'
 
 const SCAN_MODE_OPTIONS: readonly { key: ScanModeKey; label: string; summary: string }[] = [
@@ -36,6 +48,28 @@ function draftScanMode(d: { capabilityTier: CapabilityTier; approvalPolicy: Appr
   if (d.capabilityTier === 3 && d.approvalPolicy === 'yolo') return 'autonomous'
   if (d.capabilityTier === 3) return 'supervised'
   return 'passive'
+}
+
+/** Compact live summary shown on the left of the sticky Scope Review action bar. */
+export function consentStickySummary(input: {
+  discovery: boolean
+  hostCount: number
+  capabilityTier: CapabilityTier
+  approvalPolicy: ApprovalPolicy
+}): string {
+  if (input.discovery) {
+    return `${plural(input.hostCount, 'seed')} · Discovery`
+  }
+  const mode = draftScanMode({ capabilityTier: input.capabilityTier, approvalPolicy: input.approvalPolicy })
+  const modeLabel = mode === 'passive' ? 'Passive' : mode === 'autonomous' ? 'Autonomous' : 'Supervised'
+  const policyLabel = mode === 'passive'
+    ? 'Read-only'
+    : mode === 'autonomous'
+      ? 'Auto-approve in scope'
+      : input.approvalPolicy === 'strict'
+        ? 'Approve every write'
+        : 'Ask before risky actions'
+  return `${plural(input.hostCount, 'host')} · ${modeLabel} · ${policyLabel}`
 }
 
 interface Draft {
@@ -364,7 +398,7 @@ function ScopeCard({
   draft: Draft
   setDraft: (fn: (d: Draft) => Draft) => void
   onHostsTouched?: () => void
-  footer: ReactNode
+  footer?: ReactNode
   inDialog?: boolean
   scopeOnly?: boolean
 }) {
@@ -492,13 +526,13 @@ function ScopeCard({
       )}
     </div>
 
-    {/* (a) Compact Scan Config KV bar */}
-    <div className={cn('num grid border-b border-line', scopeOnly ? 'grid-cols-2' : 'grid-cols-3')}>
-      <div className="border-r border-line px-4 py-2.5">
+    {/* (a) Compact 2-column Scan Mode & Approval Policy grid */}
+    <div className="num grid grid-cols-1 border-b border-line md:grid-cols-2" data-testid="scope-controls-grid">
+      <div className="border-b border-line px-4 py-2.5 md:border-b-0 md:border-r">
         <div className="mb-1 text-[11.5px] text-fg-subtle">Scan mode</div>
         {canEditConfig
           ? <select
-              className="h-[22px] max-w-full cursor-pointer rounded-[5px] border-0 bg-sunk px-1.5 font-sans text-[12px] font-medium text-fg shadow-hairline outline-none"
+              className="h-[24px] w-full cursor-pointer rounded-[5px] border-0 bg-sunk px-2 font-sans text-[12px] font-medium text-fg shadow-hairline outline-none"
               value={scanMode}
               onChange={e => setScanMode(e.target.value as ScanModeKey)}
               aria-label="Scan mode"
@@ -522,101 +556,102 @@ function ScopeCard({
               {draft.approvedPersonaIds.length && draft.capabilityTier >= 2 ? plural(draft.approvedPersonaIds.length, 'test account') : 'None (anonymous)'}
             </div>
           </div>
-        : <>
-            <div className="border-r border-line px-4 py-2.5">
-              <div className="mb-1 flex items-center justify-between text-[11.5px] text-fg-subtle">
-                <span>Budget / RPS</span>
-                {canEditConfig && (
-                  <button
-                    type="button"
-                    className="cursor-pointer border-0 bg-transparent p-0 font-sans text-[11px] font-medium text-fg-subtle hover:text-fg"
-                    onClick={() => setEditingBudget(b => !b)}
-                  >
-                    {editingBudget ? 'Done' : 'Adjust'}
-                  </button>
-                )}
-              </div>
-              {canEditConfig && editingBudget
-                ? <div className="flex flex-wrap items-center gap-1.5 text-[12px] text-fg-muted">
-                    <label className="inline-flex items-center gap-1 rounded-[5px] bg-sunk px-1.5 py-[2px] shadow-hairline">
-                      <span className="text-fg-subtle">$</span>
-                      <input
-                        className="num w-[46px] border-0 bg-transparent p-0 font-sans text-[12px] font-medium text-fg outline-none"
-                        type="number"
-                        min={0.1}
-                        max={500}
-                        step="any"
-                        value={draft.budgetUsd}
-                        aria-label="Budget USD"
-                        onChange={e => setDraft(d => ({ ...d, budgetUsd: Number(e.target.value) }))}
-                      />
-                    </label>
-                    <label className="inline-flex items-center gap-1 rounded-[5px] bg-sunk px-1.5 py-[2px] shadow-hairline" title="Requests per second per origin">
-                      <input
-                        className="num w-[34px] border-0 bg-transparent p-0 font-sans text-[12px] font-medium text-fg outline-none"
-                        type="number"
-                        min={1}
-                        max={rpsMax}
-                        step={1}
-                        value={Math.min(draft.maxRpsPerOrigin, rpsMax)}
-                        aria-label="Requests per second per origin"
-                        onChange={e => setDraft(d => ({ ...d, maxRpsPerOrigin: Math.min(rpsMax, Math.max(1, Number(e.target.value))) }))}
-                      />
-                      <span className="text-fg-subtle">req/s</span>
-                    </label>
-                    <label className="inline-flex items-center gap-1 rounded-[5px] bg-sunk px-1.5 py-[2px] shadow-hairline" title="Request cap (0 = uncapped)">
-                      <input
-                        className="num w-[50px] border-0 bg-transparent p-0 font-sans text-[12px] font-medium text-fg outline-none"
-                        type="number"
-                        min={0}
-                        max={maxBudgetRequests}
-                        step={1}
-                        value={draft.budgetRequests}
-                        aria-label="Request cap (0 = uncapped)"
-                        onChange={e => setDraft(d => ({ ...d, budgetRequests: Number(e.target.value) }))}
-                      />
-                      <span className="text-fg-subtle">reqs</span>
-                    </label>
-                  </div>
-                : <button
-                    type="button"
-                    disabled={!canEditConfig}
-                    onClick={() => canEditConfig && setEditingBudget(true)}
-                    className={cn(
-                      'inline-flex items-center gap-1 border-0 bg-transparent p-0 text-left font-sans text-[12.5px] font-medium text-fg',
-                      canEditConfig && 'cursor-pointer rounded-[4px] hover:underline',
-                    )}
-                    title={canEditConfig ? 'Click to adjust budget, request cap, and rate limit' : undefined}
-                  >
-                    <span>{fmtUsd(draft.budgetUsd)}</span>
-                    <span className="text-fg-subtle">·</span>
-                    <span>{Math.min(draft.maxRpsPerOrigin, rpsMax)} req/s</span>
-                    {draft.budgetRequests > 0 && <><span className="text-fg-subtle">·</span><span>{fmtN(draft.budgetRequests)} reqs</span></>}
-                  </button>}
-            </div>
-
-            <div className="px-4 py-2.5">
-              <div className="mb-1 text-[11.5px] text-fg-subtle">Approvals</div>
-              {canEditConfig && scanMode === 'supervised'
-                ? <select
-                    className="h-[22px] max-w-full cursor-pointer rounded-[5px] border-0 bg-sunk px-1.5 font-sans text-[12px] font-medium text-fg shadow-hairline outline-none"
-                    value={draft.approvalPolicy === 'strict' ? 'strict' : 'auto_review'}
-                    onChange={e => setDraft(d => ({ ...d, approvalPolicy: e.target.value as ApprovalPolicy }))}
-                    aria-label="Approval policy"
-                  >
-                    <option value="auto_review">{approvalPolicyMeta.auto_review.label}</option>
-                    <option value="strict">{approvalPolicyMeta.strict.label}</option>
-                  </select>
-                : <div className="font-medium text-fg" title={modeSummary}>
-                    {scanMode === 'autonomous'
-                      ? 'Auto-approve in scope'
-                      : scanMode === 'supervised'
-                        ? approvalPolicyMeta[draft.approvalPolicy].label
-                        : <span className="font-normal text-fg-subtle">Not needed (read-only)</span>}
-                  </div>}
-            </div>
-          </>}
+        : <div className="px-4 py-2.5">
+            <div className="mb-1 text-[11.5px] text-fg-subtle">Approval policy</div>
+            {canEditConfig && scanMode === 'supervised'
+              ? <select
+                  className="h-[24px] w-full cursor-pointer rounded-[5px] border-0 bg-sunk px-2 font-sans text-[12px] font-medium text-fg shadow-hairline outline-none"
+                  value={draft.approvalPolicy === 'strict' ? 'strict' : 'auto_review'}
+                  onChange={e => setDraft(d => ({ ...d, approvalPolicy: e.target.value as ApprovalPolicy }))}
+                  aria-label="Approval policy"
+                >
+                  <option value="auto_review">{approvalPolicyMeta.auto_review.label} — Ask before risky actions</option>
+                  <option value="strict">{approvalPolicyMeta.strict.label} — Approve every write</option>
+                </select>
+              : <div className="font-medium text-fg" title={modeSummary}>
+                  {scanMode === 'autonomous'
+                    ? 'Auto-approve in scope'
+                    : scanMode === 'supervised'
+                      ? approvalPolicyMeta[draft.approvalPolicy].label
+                      : <span className="font-normal text-fg-subtle">Not needed (read-only)</span>}
+                </div>}
+          </div>}
     </div>
+
+    {/* Compact single-line Budget / RPS strip */}
+    {!scopeOnly && (
+      <div className="num flex flex-wrap items-center justify-between gap-2 border-b border-line bg-sunk/35 px-4 py-1.5 text-[12px]">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-[11.5px] text-fg-subtle">Budget / RPS</span>
+          {canEditConfig && editingBudget
+            ? <div className="flex flex-wrap items-center gap-1.5 text-[12px] text-fg-muted">
+                <label className="inline-flex items-center gap-1 rounded-[5px] bg-panel px-1.5 py-[2px] shadow-hairline">
+                  <span className="text-fg-subtle">$</span>
+                  <input
+                    className="num w-[46px] border-0 bg-transparent p-0 font-sans text-[12px] font-medium text-fg outline-none"
+                    type="number"
+                    min={0.1}
+                    max={500}
+                    step="any"
+                    value={draft.budgetUsd}
+                    aria-label="Budget USD"
+                    onChange={e => setDraft(d => ({ ...d, budgetUsd: Number(e.target.value) }))}
+                  />
+                </label>
+                <label className="inline-flex items-center gap-1 rounded-[5px] bg-panel px-1.5 py-[2px] shadow-hairline" title="Requests per second per origin">
+                  <input
+                    className="num w-[34px] border-0 bg-transparent p-0 font-sans text-[12px] font-medium text-fg outline-none"
+                    type="number"
+                    min={1}
+                    max={rpsMax}
+                    step={1}
+                    value={Math.min(draft.maxRpsPerOrigin, rpsMax)}
+                    aria-label="Requests per second per origin"
+                    onChange={e => setDraft(d => ({ ...d, maxRpsPerOrigin: Math.min(rpsMax, Math.max(1, Number(e.target.value))) }))}
+                  />
+                  <span className="text-fg-subtle">req/s</span>
+                </label>
+                <label className="inline-flex items-center gap-1 rounded-[5px] bg-panel px-1.5 py-[2px] shadow-hairline" title="Request cap (0 = uncapped)">
+                  <input
+                    className="num w-[50px] border-0 bg-transparent p-0 font-sans text-[12px] font-medium text-fg outline-none"
+                    type="number"
+                    min={0}
+                    max={maxBudgetRequests}
+                    step={1}
+                    value={draft.budgetRequests}
+                    aria-label="Request cap (0 = uncapped)"
+                    onChange={e => setDraft(d => ({ ...d, budgetRequests: Number(e.target.value) }))}
+                  />
+                  <span className="text-fg-subtle">reqs</span>
+                </label>
+              </div>
+            : <button
+                type="button"
+                disabled={!canEditConfig}
+                onClick={() => canEditConfig && setEditingBudget(true)}
+                className={cn(
+                  'inline-flex items-center gap-1 border-0 bg-transparent p-0 text-left font-sans text-[12px] font-medium text-fg shadow-none',
+                  canEditConfig && 'cursor-pointer rounded-[4px] hover:bg-transparent hover:underline',
+                )}
+                title={canEditConfig ? 'Click to adjust budget, request cap, and rate limit' : undefined}
+              >
+                <span>{fmtUsd(draft.budgetUsd)}</span>
+                <span className="text-fg-subtle">·</span>
+                <span>{Math.min(draft.maxRpsPerOrigin, rpsMax)} req/s</span>
+                {draft.budgetRequests > 0 && <><span className="text-fg-subtle">·</span><span>{fmtN(draft.budgetRequests)} reqs</span></>}
+              </button>}
+        </div>
+        {canEditConfig && (
+          <button
+            type="button"
+            className={runBtn({ variant: 'ghost', size: 'xs' })}
+            onClick={() => setEditingBudget(b => !b)}
+          >
+            {editingBudget ? 'Done' : 'Adjust'}
+          </button>
+        )}
+      </div>
+    )}
 
     {/* (b) Target Domains & Subdomains */}
     {discoveringSubdomains && (
@@ -659,7 +694,7 @@ function ScopeCard({
     )}
 
     {editing && !discovery
-      ? <div className="grid max-h-[240px] grid-cols-3 overflow-auto p-2 font-mono text-[12px]">
+      ? <div className="grid max-h-[42vh] grid-cols-1 gap-x-1 overflow-y-auto p-2 font-mono text-[12px] sm:grid-cols-2 md:grid-cols-3" data-testid="scope-host-list">
           {filteredHosts.map(h => {
             const on = selected.has(h.id)
             return <label
@@ -677,23 +712,23 @@ function ScopeCard({
                 checked={on}
                 onChange={e => toggleHost(h.id, e.target.checked)}
               />
-              <span className="truncate">{host(h.origin)}</span>
-              {h.thirdParty && <span className="ml-1 text-[10.5px] text-fg-subtle" title={h.externalCname ? `Third-party CNAME (${h.externalCname}) — unchecked by default` : 'Third-party host — unchecked by default'}>
-                {h.externalCname ? `Third-party CNAME (${h.externalCname})` : '3P'}
+              <span className="min-w-0 flex-1 truncate">{host(h.origin)}</span>
+              {h.thirdParty && <span className="flex-none rounded bg-sunk px-1 py-px font-sans text-[10px] font-medium text-fg-subtle" title={h.externalCname ? `Third-party CNAME (${h.externalCname}) — unchecked by default` : 'Third-party host — unchecked by default'}>
+                3P
               </span>}
             </label>
           })}
           {filteredHosts.length === 0 && (
-            <span className="col-span-3 px-2 py-2 font-sans text-[12px] text-fg-subtle">
+            <span className="col-span-full px-2 py-2 font-sans text-[12px] text-fg-subtle">
               No hosts match “{hostQuery}”.
             </span>
           )}
         </div>
-      : <div className="grid max-h-[224px] grid-cols-3 overflow-auto p-2 font-mono text-[12px]">
+      : <div className="grid max-h-[42vh] grid-cols-1 gap-x-1 overflow-y-auto p-2 font-mono text-[12px] sm:grid-cols-2 md:grid-cols-3" data-testid="scope-host-list">
           {shownHosts.map(h => <span key={h.id} className="truncate px-2 py-[3px] text-fg-muted" title={`${h.origin} · ${h.source}`}>{host(h.origin)}</span>)}
           {!shownHosts.length && <span className="px-2 py-[3px] text-fg-subtle">No hosts selected.</span>}
           {!discovery && hosts.length > shownHosts.length && (
-            <span className="col-span-3 px-2 pt-1 font-sans text-[11.5px] text-fg-subtle">
+            <span className="col-span-full px-2 pt-1 font-sans text-[11.5px] text-fg-subtle">
               {plural(hosts.length - shownHosts.length, 'discovered host')} unchecked by default (e.g. third-party or subdomains). Click Edit scope to review all {hosts.length}.
             </span>
           )}
@@ -800,21 +835,45 @@ export function ConsentView() {
   useShortcuts([{ key: 'a', run: () => { if (!canApprove) return false; void approve() } }])
 
   const eyebrow = r.phase === 'review' ? 'Waiting on your scope approval' : 'Waiting on your consent'
-  return <div className="min-h-0 flex-1 overflow-auto px-10 pb-12 pt-11">
-    <div className="mx-auto max-w-[680px]">
-      <span className="inline-flex items-center gap-2 text-[12px] font-medium text-fg-muted">
-        <StatusGlyph status="waiting" />{eyebrow}
-      </span>
-      <div className="mb-2 mt-3 text-[24px] font-semibold leading-[31px] tracking-[-0.02em] text-fg">
-        Nothing has been sent <em className="not-italic text-fg-subtle">yet.</em>
-      </div>
-      <p className="m-0 mb-[22px] max-w-[560px] text-[13.5px] leading-[21px] text-fg-muted">
-        {discovery
-          ? `The coordinator received the goal “${r.goal}” and is holding until you approve discovery below. No request leaves Kovo Hunter before that.`
-          : `Subdomain discovery found ${plural(hosts.length, 'candidate host')} for “${r.goal}”. Confirm the target hosts, mode, and approval policy below before testing begins.`}
-      </p>
-      {nw < 6 && <div className="mb-[18px] flex items-start gap-2.5 rounded-lg bg-warn-soft px-3 py-2.5 text-[12.5px] leading-[19px] text-fg-muted shadow-[inset_0_0_0_1px_var(--warn-line)]">
-        <Icon name="alert" className="mt-[3px] flex-none text-warn" />
+  const customGoal = isCustomRunGoal(r.goal) ? r.goal.trim() : null
+  const stickySummary = consentStickySummary({
+    discovery,
+    hostCount: count,
+    capabilityTier: draft.capabilityTier,
+    approvalPolicy: draft.approvalPolicy,
+  })
+
+  return <div className="relative flex min-h-0 flex-1 flex-col overflow-y-auto" data-testid="consent-scroll-container">
+    <div className="mx-auto w-full max-w-[780px] flex-1 px-6 pb-5 pt-4">
+      <header className="mb-3 flex flex-col gap-1">
+        <span className="inline-flex items-center gap-2 text-[12px] font-medium text-fg-muted">
+          <StatusGlyph status="waiting" />{eyebrow}
+        </span>
+        <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
+          <h1 className="m-0 text-[20px] font-semibold leading-[26px] tracking-[-0.02em] text-fg">
+            {discovery ? 'Approve discovery' : 'Review scope'}
+          </h1>
+          <p className="num m-0 text-[12.5px] leading-[18px] text-fg-muted" data-testid="consent-subtitle">
+            {discovery
+              ? `${plural(hosts.length, 'project seed')} ready · Nothing has been sent yet`
+              : `${plural(hosts.length, 'candidate host')} found · ${count} selected`}
+          </p>
+        </div>
+        {customGoal && (
+          <div className="flex min-w-0 items-center pt-1">
+            <span
+              data-testid="consent-custom-goal-chip"
+              className="inline-flex max-w-full items-center gap-1.5 rounded-control border border-line bg-sunk px-2 py-0.5 text-[11.5px] leading-[16px] text-fg-muted"
+              title={customGoal}
+            >
+              <span className="flex-none font-medium text-fg-subtle">Goal</span>
+              <span className="min-w-0 truncate">{customGoal}</span>
+            </span>
+          </div>
+        )}
+      </header>
+      {customGoal && nw < 6 && <div className="mb-3.5 flex items-start gap-2.5 rounded-lg bg-warn-soft px-3 py-2 text-[12px] leading-[18px] text-fg-muted shadow-[inset_0_0_0_1px_var(--warn-line)]">
+        <Icon name="alert" className="mt-[2px] flex-none text-warn" />
         <div>This goal is {words(nw)} word{nw === 1 ? '' : 's'} long. The coordinator will plan broadly across all {plural(count, 'host')}. Sharpen it in the coordinator chat to focus the {fmtUsd(draft.budgetUsd)} budget.</div>
       </div>}
       <ScopeCard
@@ -822,25 +881,14 @@ export function ConsentView() {
         draft={draft}
         setDraft={setDraft}
         onHostsTouched={() => setUserTouchedHosts(true)}
-        footer={
-          <div className={RW.sheetF}>
-            <span className="mr-auto text-[12px] text-fg-subtle">
-              {footerNote}
-            </span>
-            {!discovery && <button type="button" className={runBtn({ variant: 'ghost' })} onClick={() => { if (editing) { setUserTouchedHosts(false); setDraftState(initialDraft(r, defaults, rpsMax)) } else { setEditing(true) } }}>{editing ? 'Reset' : 'Edit scope'}</button>}
-            <button type="button" className={runBtn({ variant: 'primary' })} disabled={!canApprove} onClick={() => void approve()}>
-              {approving ? 'Starting…' : <>Approve &amp; start<Kbd inverted className="ml-0.5">A</Kbd></>}
-            </button>
-          </div>
-        }
       />
-      <div className="mt-[26px] grid grid-cols-5 border-t border-line">
+      <div className="mt-5 grid grid-cols-5 border-t border-line">
         {STEPS.map((s, i) => {
           const cur = i === 0
           return <div
             key={s[0]}
             className={cn(
-              'relative pr-3 pt-3 text-[12px] leading-[18px] text-fg-subtle before:absolute before:-top-px before:left-0 before:w-7 before:content-[""]',
+              'relative pr-3 pt-2.5 text-[12px] leading-[17px] text-fg-subtle before:absolute before:-top-px before:left-0 before:w-7 before:content-[""]',
               cur ? 'before:h-0.5 before:bg-accent' : 'before:h-px before:bg-fg-subtle',
             )}
           >
@@ -849,7 +897,37 @@ export function ConsentView() {
           </div>
         })}
       </div>
-      <LabPanel className="mt-[26px] border-t border-line" />
+      <LabPanel className="mt-5 border-t border-line" />
+    </div>
+
+    {/* Option 1: Pinned Sticky Bottom Action Bar */}
+    <div
+      data-testid="consent-sticky-bar"
+      className="sticky bottom-0 z-20 mt-auto border-t border-line bg-surface/95 backdrop-blur-sm"
+    >
+      <div className="mx-auto flex w-full max-w-[780px] items-center justify-between gap-3 px-6 py-2.5">
+        <div className="min-w-0 flex-1 truncate text-[12px]" data-testid="consent-bar-summary">
+          {footerNote
+            ? <span className="inline-flex items-center gap-1.5 font-medium text-warn">
+                <Icon name="alert" size={13} className="flex-none" />
+                <span className="truncate">{footerNote}</span>
+              </span>
+            : <span className="num text-fg-muted">{stickySummary}</span>}
+        </div>
+        <div className="flex flex-none items-center gap-2">
+          <Link
+            to="/projects/$projectId"
+            params={{ projectId: detail.project.id }}
+            className={cn(runBtn({ variant: 'ghost' }), 'no-underline')}
+          >
+            Cancel
+          </Link>
+          {!discovery && <button type="button" className={runBtn({ variant: 'ghost' })} onClick={() => { if (editing) { setUserTouchedHosts(false); setDraftState(initialDraft(r, defaults, rpsMax)) } else { setEditing(true) } }}>{editing ? 'Reset' : 'Edit scope'}</button>}
+          <button type="button" className={runBtn({ variant: 'primary' })} disabled={!canApprove} onClick={() => void approve()}>
+            {approving ? 'Starting…' : <>Approve &amp; start<Kbd inverted className="ml-0.5">A</Kbd></>}
+          </button>
+        </div>
+      </div>
     </div>
   </div>
 }
