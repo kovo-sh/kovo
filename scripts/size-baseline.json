@@ -27,7 +27,7 @@
     "src/server/persona-vault.ts": 2409,
     "src/server/phase0-recon.ts": 7766,
     "src/server/program-graph.ts": 4997,
-    "src/server/proof-receipt.ts": 4398,
+    "src/server/proof-receipt.ts": 4397,
     "src/server/provider.ts": 2348,
     "src/server/public-suffix-list.ts": 9049,
     "src/server/request-admission.ts": 2211,

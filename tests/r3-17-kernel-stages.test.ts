@@ -962,3 +962,95 @@ test('R3-17 review guards (B1/B1b/B2): differsOnlyIn parity, fail-closed registr
   runAllRunDisposers('run-dispose-1')
   assert.equal(activeLedger.getRunUsage('run-dispose-1'), 0)
 })
+
+test('R3-17 auth_bypass header/param single-authority guard: middleware/proxy bypass headers confirm TP while sabotaged control and bare-anon 200 reject FP', () => {
+  const authBypassSpec = DEFAULT_ORACLE_SPEC_REGISTRY.get('auth_bypass')!
+  const dupHeaderFiles: string[] = []
+  const dupParamFiles: string[] = []
+  for (const absPath of collectServerTsFiles(SERVER_DIR)) {
+    const rel = relative(REPO_ROOT, absPath).replace(/\\/g, '/')
+    if (rel === 'src/server/proof-kernel/reflection.ts') continue
+    const sf = ts.createSourceFile(absPath, readFileSync(absPath, 'utf8'), ts.ScriptTarget.ESNext, true)
+    const visit = (node: ts.Node) => {
+      if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) {
+        if (node.name.text === 'AUTH_BYPASS_SECURITY_HEADER_RE' || node.name.text === 'BOUNDARY_CREDENTIAL_HEADER_RE') {
+          dupHeaderFiles.push(rel)
+        }
+        if (node.name.text === 'AUTH_BYPASS_PARAM_KEY_RE') {
+          dupParamFiles.push(rel)
+        }
+      }
+      ts.forEachChild(node, visit)
+    }
+    visit(sf)
+  }
+  assert.deepEqual(dupHeaderFiles, [], 'AUTH_OR_BYPASS_HEADER_RE must be the single authoritative auth/bypass header regex')
+  assert.deepEqual(dupParamFiles, [], 'AUTH_BYPASS_PARAM_KEY_RE must be the single authoritative auth/bypass param regex')
+
+  // Legitimate auth-bypass differential with middleware/proxy headers (e.g. CVE-2025-29927):
+  // bare anonymous 401 control vs bypass-header 200 probe must pass assertLegitimateControl + requireAnonymousAblation.
+  for (const [hdrName, hdrVal] of [
+    ['x-middleware-subrequest', 'middleware:middleware:middleware:middleware:middleware'],
+    ['x-middleware-invoke', 'internal-route'],
+    ['forwarded', 'for=127.0.0.1'],
+    ['true-client-ip', '127.0.0.1'],
+    ['x-tenant-id', 'internal-admin'],
+  ] as const) {
+    const bareControl = {
+      id: 'ctl-bare',
+      method: 'GET',
+      route: '/admin',
+      pathAndQuery: '/admin',
+      status: 401,
+      actorHandle: null,
+      actorRole: null,
+      actorAuth: 'unknown',
+      body: '{"error":"unauthorized"}',
+    }
+    const bypassProbe = {
+      id: 'prb-bypass',
+      method: 'GET',
+      route: '/admin',
+      pathAndQuery: '/admin',
+      status: 200,
+      actorHandle: null,
+      actorRole: null,
+      actorAuth: 'unknown',
+      requestHeaders: { [hdrName]: hdrVal },
+      body: '{"panel":"admin_panel_secret_view"}',
+    }
+    const okRes = assertLegitimateControl({
+      spec: authBypassSpec,
+      control: bareControl,
+      probe: bypassProbe,
+      allEntries: [bareControl, bypassProbe],
+      requireAnonymousAblation: true,
+    })
+    assert.equal(okRes.ok, true, `legitimate bypass header ${hdrName} must not be misclassified as bare anonymous ablation: ${okRes.reason}`)
+
+    // Permit-all regression guard: adding a bare anonymous 200 on the same route MUST reject.
+    const bareAnon200 = { ...bareControl, id: 'anon-200', status: 200, body: '{"panel":"public"}' }
+    const permitAllRes = assertLegitimateControl({
+      spec: authBypassSpec,
+      control: bareControl,
+      probe: bypassProbe,
+      allEntries: [bareControl, bypassProbe, bareAnon200],
+      requireAnonymousAblation: true,
+    })
+    assert.equal(permitAllRes.ok, false)
+    assert.equal(permitAllRes.rejectedBy, 'missing_anonymous_ablation')
+
+    // Self-sabotaged control carrying the bypass header (401) vs bare anonymous 200 probe MUST reject.
+    const sabotagedControl = { ...bareControl, id: 'ctl-sabotaged', requestHeaders: { [hdrName]: 'invalid-control-marker' } }
+    const bareProbe = { ...bypassProbe, id: 'prb-bare', requestHeaders: {} }
+    const sabotagedRes = assertLegitimateControl({
+      spec: authBypassSpec,
+      control: sabotagedControl,
+      probe: bareProbe,
+      allEntries: [sabotagedControl, bareProbe],
+      requireAnonymousAblation: true,
+    })
+    assert.equal(sabotagedRes.ok, false)
+    assert.equal(sabotagedRes.rejectedBy, 'self_sabotaged_control')
+  }
+})

@@ -65,6 +65,8 @@ import {
   type BooleanDifferentialRound,
 } from './proof-kernel/boolean-differential.ts'
 import {
+  AUTH_BYPASS_PARAM_KEY_RE,
+  AUTH_OR_BYPASS_HEADER_RE,
   carrierEchoesSignedUrlNeedles,
   carrierReflectsExpressionOutput,
   extractSignedUrlNeedlesFromResponse,
@@ -2128,7 +2130,6 @@ function verifyConservedBalanceReceipt(
 
 const AUTH_BYPASS_BOILERPLATE_KEY_RE = /^(?:ok|status|success|message|msg|error|errors|detail|details|code|timestamp|time|date|version|health|healthy|alive|ping|pong|request_?id|trace_?id|correlation_?id|nonce)$/i
 const AUTH_BYPASS_VOLATILE_HEADER_RE = /^(?:host|content-length|connection|user-agent|accept|accept-encoding|x-request-id|x-correlation-id|x-trace-id|traceparent|tracestate|date)$/i
-const AUTH_BYPASS_SECURITY_HEADER_RE = /^(?:authorization|proxy-authorization|x-forwarded-(?:for|host|proto|user|email|groups|roles|uri|url)|x-original-(?:url|uri|forwarded-for)|x-rewrite-url|x-real-ip|x-client-ip|x-remote-(?:user|addr|ip)|x-custom-ip-authorization|x-user(?:name|-id|-role)?|x-auth(?:[-_].+)?|x-admin(?:[-_].+)?|x-role(?:s)?|x-api-key|x-token(?:[-_].+)?|x-bypass(?:[-_].+)?|x-internal(?:[-_].+)?|x-middleware-(?:subrequest|invoke)|forwarded|client-ip|true-client-ip|cf-connecting-ip|x-impersonate(?:[-_].+)?|x-tenant(?:[-_].+)?)$/i
 const SEALED_OR_VAULT_MARKER_RE = /(?:\[redacted:(?:cap:)?|cap:hop_[A-Za-z0-9._-]+:|\[persona:)/i
 const ANON_HANDLE_RE = /^(?:anon|anonymous|guest|unauthenticated)$/i
 const AUTH_ROLE_RANK: Readonly<Record<string, number>> = { viewer: 1, member: 2, admin: 3, owner: 4 }
@@ -2160,8 +2161,6 @@ function canonicalRequestHeaderMap(headers: Record<string, string> | null | unde
   }
   return out
 }
-
-const AUTH_BYPASS_PARAM_KEY_RE = /^(?:token|access_?token|id_?token|auth|auth_?token|jwt|session|sid|api_?key|apikey|key|sig|signature|bypass|admin|role|impersonate|user|debug|password|passcode|otp|code|assertion|saml|credential|claims)$/i
 
 function parseQueryMap(pathAndQuery: string | undefined): Record<string, string> {
   const out: Record<string, string> = {}
@@ -2224,7 +2223,7 @@ function authBypassRequestDifferential(
   const headerKeys = new Set([...Object.keys(controlHeaders), ...Object.keys(probeHeaders)])
   for (const key of headerKeys) {
     if (key === 'cookie') continue
-    if (!AUTH_BYPASS_SECURITY_HEADER_RE.test(key)) continue
+    if (!AUTH_OR_BYPASS_HEADER_RE.test(key)) continue
     const prbVal = (probeHeaders[key] ?? '').trim()
     const ctlVal = (controlHeaders[key] ?? '').trim()
     if (prbVal.length > 0 && prbVal !== ctlVal) return 'header'

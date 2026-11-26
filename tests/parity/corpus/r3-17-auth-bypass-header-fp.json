@@ -1,0 +1,91 @@
+{
+  "id": "r3-17-auth-bypass-header-fp",
+  "side": "fp",
+  "source": "independent_review",
+  "archetype": "r3-17-sabotaged-middleware-header-control-fp",
+  "description": "R3-17 FP: self-sabotaged control carrying an extra middleware-routing header (401) paired with a bare anonymous probe (200) on a permit-all endpoint must dismiss across all confirmation paths under the unified AUTH_OR_BYPASS_HEADER_RE control-legitimacy and anonymous-ablation stages.",
+  "covers": {
+    "files": [
+      "src/server/proof-kernel/reflection.ts",
+      "src/server/proof-kernel/control-legitimacy.ts",
+      "src/server/proof-receipt.ts"
+    ],
+    "classes": [
+      "auth_bypass"
+    ]
+  },
+  "canonicalLabel": {
+    "cwe": "CWE-287",
+    "category": "auth-bypass",
+    "title": "Self-sabotaged middleware header control paired with bare anonymous 200 must dismiss",
+    "impact": "Endpoint serves public status board anonymously; control only failed due to an extra control-only header.",
+    "claimedImpact": "other",
+    "claimedBoundary": "auth",
+    "vulnClass": "auth_bypass"
+  },
+  "freeTextLabel": {
+    "title": "Control-only middleware header rejected while bare anonymous probe succeeds"
+  },
+  "paths": {
+    "replay": true,
+    "floorReceipt": true,
+    "evaluateClaims": true,
+    "composite": false,
+    "floorInjectionRecipe": false,
+    "proofReceipt": true
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [],
+  "exchanges": [
+    {
+      "id": "ctl_sabotaged_mw",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/public/panel-status",
+      "persona": null,
+      "requestHeaders": {
+        "x-middleware-subrequest": "invalid-control-marker"
+      },
+      "status": 401,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"error\":\"rejected_header\"}"
+    },
+    {
+      "id": "prb_bare_anon",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/public/panel-status",
+      "persona": null,
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"panel\":\"public_status_board\",\"region\":\"us-west\",\"healthy\":true}"
+    }
+  ],
+  "replaySpec": {
+    "assertionsJq": "{ controlPassed: (.steps.ctl_sabotaged_mw.status == 401), confirmed: (.steps.ctl_sabotaged_mw.status == 401 and .steps.prb_bare_anon.status == 200), observed: .steps.prb_bare_anon.json.panel, expected: \"401\" }"
+  },
+  "proofReceipt": {
+    "vulnClass": "auth_bypass",
+    "targetMethod": "GET",
+    "targetPathAndQuery": "/api/public/panel-status",
+    "claimedDelta": "Control carried an extra x-middleware-subrequest header (401) absent from the bare anonymous probe (200); must never confirm as auth_bypass."
+  },
+  "claims": [
+    {
+      "kind": "boundary",
+      "boundaryClass": "auth",
+      "controlExchangeId": "ctl_sabotaged_mw",
+      "probeExchangeId": "prb_bare_anon"
+    }
+  ]
+}

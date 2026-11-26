@@ -18,7 +18,7 @@ import type { OracleControlContract, OracleSpec, V8OracleFamilyId } from '../ora
 import type { WireCredentialProvenance } from '../host-fact-log.ts'
 import type { ImpactStep, RoleName } from '../oracle-invariants.ts'
 import type { HydratableEntry, HydratableTranscriptIndex } from '../v8-oracle-hydrate.ts'
-import { AUTH_OR_BYPASS_HEADER_RE, normalizeRequestCarrier } from './reflection.ts'
+import { AUTH_BYPASS_PARAM_KEY_RE, AUTH_OR_BYPASS_HEADER_RE, normalizeRequestCarrier } from './reflection.ts'
 
 export interface ControlLegitimacyExchange {
   readonly id: string
@@ -62,8 +62,6 @@ export interface ControlLegitimacyResult {
   readonly reason: string
 }
 
-const BOUNDARY_CREDENTIAL_HEADER_RE = /^(?:authorization|proxy-authorization|cookie|x-api-key|x-auth.*)$/i
-const AUTH_BYPASS_PARAM_KEY_RE = /^(?:token|jwt|auth|access_token|id_token|api_key|apikey|key|session|session_id|sid|role|admin|is_admin|user|user_id|uid|bypass|debug|impersonate|as_user|override)$/i
 const TENANT_OR_PRINCIPAL_PARAM_RE = /^(?:tenant|tenant_?id|org|org_?id|account|account_?id|workspace|workspace_?id|user|user_?id|owner|owner_?id|actor|actor_?id|principal)$/i
 const ROLE_PARAM_RE = /^(?:role|roles|scope)$/i
 const SIG_OR_SCOPE_PARAM_RE = /^(?:sig|signature|hmac|mac|x-amz-signature|x-goog-signature|scope|aud|audience|exp|expires|token|jwt)$/i
@@ -618,7 +616,6 @@ function checkControlSelfSabotage(
     boundaryClass === 'mfa'
   if (!enforceStrictUnauthControl || !probe) return null
 
-  const headerRe = boundaryClass && boundaryClass !== 'access' ? BOUNDARY_CREDENTIAL_HEADER_RE : AUTH_OR_BYPASS_HEADER_RE
   for (const [k, v] of Object.entries(ctlHeaders)) {
     if (!v) continue
     if (k === 'cookie') {
@@ -627,7 +624,7 @@ function checkControlSelfSabotage(
       }
       continue
     }
-    if (headerRe.test(k) && !(prbHeaders[k] ?? '').trim()) {
+    if (AUTH_OR_BYPASS_HEADER_RE.test(k) && !(prbHeaders[k] ?? '').trim()) {
       return 'Auth bypass rejected (R4-H-7): control carried an extra auth header absent from the probe (self-sabotaged control is not an authentication bypass).'
     }
   }

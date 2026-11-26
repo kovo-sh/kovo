@@ -102,9 +102,15 @@ export interface SignedUrlResponseInput {
 
 /**
  * Single authoritative regex for authentication, session, bypass, and signature request headers
- * shared by `control-legitimacy.ts` and `publicness.ts` (`R3-17`).
+ * shared across `control-legitimacy.ts`, `publicness.ts`, and `proof-receipt.ts` (`R3-17`).
  */
-export const AUTH_OR_BYPASS_HEADER_RE = /^(?:authorization|proxy-authorization|cookie|x-api-key|api-key|x-auth(?:[-_][a-z0-9-]+)?|x-access-token|x-token|x-session(?:[-_][a-z0-9-]+)?|x-user(?:[-_][a-z0-9-]+)?|x-forwarded-(?:user|for|host|proto)|x-original-url|x-rewrite-url|x-real-ip|x-admin|x-role|x-roles|x-impersonate|x-internal(?:[-_][a-z0-9-]+)?|x-bypass(?:[-_][a-z0-9-]+)?|x-custom-ip-authorization|x-remote-user|x-signature|x-hub-signature(?:[-_][a-z0-9-]+)?)$/i
+export const AUTH_OR_BYPASS_HEADER_RE = /^(?:authorization|proxy-authorization|cookie|x-api-key|api-key|x-auth(?:[-_][a-z0-9_-]+)?|x-access-token|x-token(?:[-_][a-z0-9_-]+)?|x-session(?:[-_][a-z0-9_-]+)?|x-user(?:name|[-_][a-z0-9_-]+)?|x-forwarded-(?:for|host|proto|user|email|groups|roles|uri|url)|x-original-(?:url|uri|forwarded-for)|x-rewrite-url|x-real-ip|x-client-ip|x-remote-(?:user|addr|ip)|x-custom-ip-authorization|x-admin(?:[-_][a-z0-9_-]+)?|x-role(?:s)?|x-impersonate(?:[-_][a-z0-9_-]+)?|x-internal(?:[-_][a-z0-9_-]+)?|x-bypass(?:[-_][a-z0-9_-]+)?|x-middleware-(?:subrequest|invoke)|forwarded|client-ip|true-client-ip|cf-connecting-ip|x-tenant(?:[-_][a-z0-9_-]+)?|x-signature|x-hub-signature(?:[-_][a-z0-9_-]+)?)$/i
+
+/**
+ * Single authoritative regex for authentication and bypass query/body parameter keys
+ * shared across `control-legitimacy.ts` and `proof-receipt.ts` (`R3-17`).
+ */
+export const AUTH_BYPASS_PARAM_KEY_RE = /^(?:token|access_?token|id_?token|auth|auth_?token|jwt|session|session_?id|sid|api_?key|apikey|key|sig|signature|bypass|admin|is_?admin|role|impersonate|as_?user|user|debug|password|passcode|otp|code|assertion|saml|credential|claims)$/i
 
 const TRANSPORT_HEADER_NAME_RE = /^(?:host|content-length|content-type|accept|accept-encoding|accept-language|connection|user-agent|date|cache-control|pragma|upgrade-insecure-requests|sec-fetch-[a-z-]+)$/i
 const SIGNED_URL_SIG_PARAM_RE = /^(?:x-goog-signature|x-amz-signature|signature|sig)$/i
