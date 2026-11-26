@@ -215,7 +215,7 @@ function initialDraft(r: ReturnType<typeof useRun>['detail']['run'], defaults: s
   }
 }
 
-function scopeCommand(
+export function scopeCommand(
   r: ReturnType<typeof useRun>['detail']['run'],
   d: Draft,
   opts: { saveProject?: boolean; scopeOnly?: boolean; expectedScopeRevision?: number } = {},
@@ -228,11 +228,11 @@ function scopeCommand(
     consent: true,
     saveProject,
     capabilityTier: d.capabilityTier,
+    approvalPolicy: d.approvalPolicy,
     approvedPersonaIds: d.capabilityTier >= 2 ? d.approvedPersonaIds : [],
     ...(scopeOnly
       ? {}
       : {
-          approvalPolicy: d.approvalPolicy,
           budgetUsd: d.budgetUsd,
           budgetRequests: d.budgetRequests,
           maxRpsPerOrigin: d.maxRpsPerOrigin,

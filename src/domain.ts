@@ -3,6 +3,7 @@ import type { AccessPolicySnapshot } from './access-policy.ts'
 
 export const id = z.uuid()
 export const shortText = z.string().trim().min(1).max(160)
+export const runLabelText = z.string().trim().max(160).nullable()
 export const goalText = z.string().trim().min(1).max(8000)
 export const maxScopeHosts = 500
 export const maxProjectSeeds = 100
@@ -641,6 +642,15 @@ export const runCommand = z.discriminatedUnion('action', [
   commandBase.extend({ action: z.literal('set_approval_policy'), approvalPolicy: z.enum(approvalPolicies) }),
   commandBase.extend({ action: z.literal('approve_similar_endpoint'), approvalId: id }),
   commandBase.extend({ action: z.literal('approve_all_pending') }),
+  commandBase.extend({ action: z.literal('revoke_approval_lease'), leaseId: id }),
+  commandBase.extend({
+    action: z.literal('remove_approved_pattern'),
+    origin: z.string().trim().min(1).max(253),
+    method: z.string().trim().min(1).max(16),
+    pathPattern: z.string().trim().min(1).max(512),
+    scopeRevision: z.number().int().nonnegative().optional(),
+  }),
+  commandBase.extend({ action: z.literal('rename_run'), label: runLabelText }),
   commandBase.extend({ action: z.literal('cancel_step'), stepId: id }),
   commandBase.extend({
     action: z.literal('raise_budget'),

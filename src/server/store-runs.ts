@@ -134,6 +134,7 @@ export class RunsRepository {
   private readonly session: DbSession
   private readonly projects: ProjectsRepository
   private readonly findings: FindingsRepository
+  private runLabelColumnKnown = false
 
   constructor(session: DbSession, projects: ProjectsRepository, findings: FindingsRepository) {
     this.session = session
@@ -141,8 +142,63 @@ export class RunsRepository {
     this.findings = findings
   }
 
-  run(runId: string): Run {
-    return this.session.requireRun(runId)
+  private hasRunLabelColumn(): boolean {
+    if (this.runLabelColumnKnown) return true
+    const cols = this.session.client.prepare('PRAGMA table_info(runs)').all() as Array<{ name: string }>
+    const present = cols.some(c => c.name === 'label')
+    if (present) this.runLabelColumnKnown = true
+    return present
+  }
+
+  private ensureRunLabelColumn(): void {
+    if (this.hasRunLabelColumn()) return
+    this.session.client.exec('ALTER TABLE runs ADD COLUMN label TEXT;')
+    this.runLabelColumnKnown = true
+  }
+
+  private readRunLabel(runId: string): string | null {
+    if (!this.hasRunLabelColumn()) return null
+    const row = this.session.client.prepare('SELECT label FROM runs WHERE id = ?').get(runId) as
+      | { label?: string | null }
+      | undefined
+    return row?.label ?? null
+  }
+
+  run(runId: string): Run & { label: string | null } {
+    const row = this.session.requireRun(runId)
+    return { ...row, label: this.readRunLabel(runId) }
+  }
+
+  /**
+   * Non-destructive display rename: updates `runs.label` without mutating `goal`,
+   * incrementing `goalRevision`, or canceling active workers.
+   */
+  renameRun(run: Run, label: string | null): Run & { label: string | null } {
+    this.ensureRunLabelColumn()
+    const trimmed = typeof label === 'string' ? label.trim() : ''
+    const nextLabel = trimmed ? redact(trimmed).slice(0, 160) : null
+    this.session.client.prepare('UPDATE runs SET label = ? WHERE id = ? AND workspace_id = ?')
+      .run(nextLabel, run.id, this.session.workspace.id)
+    this.session.event(
+      run.id,
+      'run.renamed',
+      nextLabel ? `Run renamed to "${nextLabel}".` : 'Run label cleared.',
+      { label: nextLabel },
+    )
+    return this.run(run.id)
+  }
+
+  listProjectRunLabels(projectId: string): Record<string, string | null> {
+    this.projects.project(projectId)
+    if (!this.hasRunLabelColumn()) return {}
+    const rows = this.session.client.prepare(
+      'SELECT id, label FROM runs WHERE project_id = ? AND workspace_id = ? AND label IS NOT NULL',
+    ).all(projectId, this.session.workspace.id) as Array<{ id: string; label: string | null }>
+    const out: Record<string, string | null> = {}
+    for (const row of rows) {
+      out[row.id] = row.label
+    }
+    return out
   }
 
   /**
@@ -913,6 +969,14 @@ export class RunsRepository {
         }
       : undefined
 
+    const now = Date.now()
+    const approvalLeases = this.listApprovalLeases(runId, 'active').filter(
+      lease => lease.scopeRevision === run.scopeRevision && (lease.expiresAt === null || lease.expiresAt > now),
+    )
+    const approvedEndpointPatterns = (run.approvedEndpointPatterns ?? []).filter(
+      pattern => pattern.scopeRevision === undefined || pattern.scopeRevision === run.scopeRevision,
+    )
+
     return {
       run,
       project: this.projects.project(run.projectId),
@@ -925,6 +989,8 @@ export class RunsRepository {
       digests,
       assignments,
       approvals,
+      approvalLeases,
+      approvedEndpointPatterns,
       exchangesSummary,
       coverageEntries,
       endpoints,
@@ -1694,6 +1760,50 @@ export class RunsRepository {
         `Batch-approved ${approvedCount} pending Tier 3 ${approvedCount === 1 ? 'probe' : 'probes'}.`)
     }
     return approvedCount
+  }
+
+  removeApprovedPattern(
+    run: Run,
+    input: { origin: string; method: string; pathPattern: string; scopeRevision?: number },
+  ): ApprovedEndpointPattern[] {
+    const normalizedOrigin = normalizeScopeOrigin(input.origin) ?? input.origin.trim()
+    const normalizedMethod = input.method.trim().toUpperCase()
+    const normalizedPattern = input.pathPattern.trim()
+    const current = run.approvedEndpointPatterns ?? []
+    const matchesTarget = (p: ApprovedEndpointPattern) =>
+      (normalizeScopeOrigin(p.origin) ?? p.origin.trim()) === normalizedOrigin &&
+      p.method.trim().toUpperCase() === normalizedMethod &&
+      p.pathPattern.trim() === normalizedPattern &&
+      (input.scopeRevision === undefined || p.scopeRevision === undefined || p.scopeRevision === input.scopeRevision)
+
+    const remaining = current.filter(p => !matchesTarget(p))
+    const removedCount = current.length - remaining.length
+    if (removedCount > 0) {
+      this.updateRun(run.id, { approvedEndpointPatterns: remaining })
+    }
+
+    const matchingLeases = this.listApprovalLeases(run.id, 'active').filter(lease =>
+      (normalizeScopeOrigin(lease.origin) ?? lease.origin.trim()) === normalizedOrigin &&
+      lease.method.trim().toUpperCase() === normalizedMethod &&
+      lease.routePattern.trim() === normalizedPattern &&
+      (input.scopeRevision === undefined || lease.scopeRevision === input.scopeRevision),
+    )
+    for (const lease of matchingLeases) {
+      this.revokeApprovalLease(run, lease.id, 'Approved endpoint pattern removed by operator.')
+    }
+
+    if (removedCount === 0 && matchingLeases.length === 0) {
+      throw new Error('Approved endpoint pattern not found.')
+    }
+    if (removedCount > 0) {
+      this.session.event(
+        run.id,
+        'approval.pattern_removed',
+        `Removed approved endpoint pattern ${normalizedMethod} ${normalizedOrigin}${normalizedPattern}.`,
+        { origin: normalizedOrigin, method: normalizedMethod, pathPattern: normalizedPattern, removedCount },
+      )
+    }
+    return remaining
   }
 
   // --- Budget & Spend Tracking ---
@@ -2632,6 +2742,30 @@ export class RunsRepository {
           break
         case 'approve_all_pending':
           this.approveAllPending(run)
+          break
+        case 'revoke_approval_lease': {
+          const revoked = this.revokeApprovalLease(run, input.leaseId)
+          const remainingPatterns = (run.approvedEndpointPatterns ?? []).filter(p => !(
+            (normalizeScopeOrigin(p.origin) ?? p.origin.trim()) === (normalizeScopeOrigin(revoked.origin) ?? revoked.origin.trim()) &&
+            p.method.trim().toUpperCase() === revoked.method.trim().toUpperCase() &&
+            p.pathPattern.trim() === revoked.routePattern.trim() &&
+            (p.scopeRevision === undefined || p.scopeRevision === revoked.scopeRevision)
+          ))
+          if (remainingPatterns.length !== (run.approvedEndpointPatterns ?? []).length) {
+            this.updateRun(run.id, { approvedEndpointPatterns: remainingPatterns })
+          }
+          break
+        }
+        case 'remove_approved_pattern':
+          this.removeApprovedPattern(run, {
+            origin: input.origin,
+            method: input.method,
+            pathPattern: input.pathPattern,
+            scopeRevision: input.scopeRevision,
+          })
+          break
+        case 'rename_run':
+          this.renameRun(run, input.label)
           break
         case 'cancel_step': {
           const step = this.session.db.select().from(tables.chainSteps).where(and(
