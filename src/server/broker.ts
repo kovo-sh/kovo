@@ -446,6 +446,8 @@ export type BrokerOptions = {
   canaryBroker?: CanaryBroker
   maxJarsPerAssignment?: number
   maxCookiesPerJar?: number
+  /** Per-run fail-closed cap on dynamically registered redaction secrets (defaults to `DEFAULT_MAX_REDACTED_SECRETS_PER_RUN`). */
+  maxRedactedSecretsPerRun?: number
   /** Injectable clock (test-only) used by circuit-breaker accounting. */
   now?: () => number
   /**
@@ -571,6 +573,53 @@ interface SessionJar {
  */
 function sessionJarKey(assignmentKey: string, role: string, persona: string | undefined, session: string | undefined): string {
   return `${assignmentKey}\0${role}\0${persona ? `p:${persona}` : 'p:'}\0${session ? `s:${session}` : 's:'}`
+}
+
+export const DEFAULT_MAX_REDACTED_SECRETS_PER_RUN = 5_000
+export const HARD_MAX_REDACTED_SECRETS_PER_RUN = 50_000
+
+export interface JarKeyScope {
+  runId?: string
+  assignmentId?: string
+  sessionGroupRole?: string
+  persona?: string
+  personaHandle?: string
+  session?: string
+  scopePolicy?: Pick<ScopePolicy, 'runId'>
+}
+
+export interface ResolvedJarKey {
+  runId: string
+  assignmentId: string
+  role: string
+  persona: string | undefined
+  session: string | undefined
+  assignmentKey: string
+  jarKey: string
+}
+
+function normalizeRunKey(runId?: string | null): string {
+  const trimmed = typeof runId === 'string' ? runId.trim() : ''
+  return trimmed || 'default'
+}
+
+/**
+ * Single authoritative jar-key resolver shared by HTTP session jars and `sessionCookiesForBrowser()`.
+ * Always consults both `req.runId` and `grant?.scopePolicy?.runId` (or `req.scopePolicy?.runId`)
+ * so the browser mirror and HTTP transport never disagree.
+ */
+export function resolveJarKey(
+  req: JarKeyScope,
+  grant?: Pick<Grant, 'scopePolicy'>,
+): ResolvedJarKey {
+  const runId = normalizeRunKey(req.runId ?? grant?.scopePolicy?.runId ?? req.scopePolicy?.runId)
+  const assignmentId = req.assignmentId ?? 'default'
+  const role = req.sessionGroupRole ?? 'default'
+  const persona = req.persona ?? req.personaHandle
+  const session = req.session
+  const assignmentKey = `${runId}\0${assignmentId}`
+  const jarKey = sessionJarKey(assignmentKey, role, persona, session)
+  return { runId, assignmentId, role, persona, session, assignmentKey, jarKey }
 }
 
 function normalizeCookiePath(rawPath: string | undefined, requestPathname: string): string {
@@ -852,6 +901,19 @@ export class BrokerApprovalRequired extends Error {
     this.origin = origin
     this.method = method
     this.pathAndQuery = pathAndQuery
+  }
+}
+
+export class RedactionCapacityError extends Error {
+  readonly runId: string
+  readonly cap: number
+  readonly activeCount: number
+  constructor(runId: string, cap: number, activeCount: number) {
+    super(`Redaction registry capacity (${cap}) exceeded for run "${runId}" (${activeCount} active secrets); failing closed instead of evicting live secrets.`)
+    this.name = 'RedactionCapacityError'
+    this.runId = runId
+    this.cap = cap
+    this.activeCount = activeCount
   }
 }
 
@@ -1860,11 +1922,13 @@ export class RequestBroker {
   private readonly origins = new Map<string, OriginHealth>()
   private readonly routeCircuits = new Map<string, RouteHealth>()
   private readonly sessionJars = new Map<string, SessionJar>()
-  private readonly personaScopeMismatches: Array<{ origin: string; expected: string; observed: string; source: string }> = []
-  private readonly personaScopeMismatchKeys = new Set<string>()
-  /** origin\0cookieName\0valueHash → persona that first presented it (session ownership). */
-  private readonly personaSessionOwners = new Map<string, string>()
-  private readonly redactedSecrets = new Map<string, NamedSecret>()
+  /** Per-run persona-scope mismatch diagnostics (cleared cleanly on `disposeRun`). */
+  private readonly personaScopeMismatchesByRun = new Map<string, Array<{ origin: string; expected: string; observed: string; source: string }>>()
+  private readonly personaScopeMismatchKeysByRun = new Map<string, Set<string>>()
+  /** Per-run map: origin\0cookieName\0valueHash → persona that first presented it (session ownership). */
+  private readonly personaSessionOwnersByRun = new Map<string, Map<string, string>>()
+  /** Per-run fail-closed redaction registries (never evict live-run secrets; cleared on `disposeRun`). */
+  private readonly redactedSecretsByRun = new Map<string, Map<string, NamedSecret>>()
   private readonly seenGcbTokens = new Map<string, { probeClass: string; verifyUsed: boolean }>()
   /** Q4: Run-scoped SHA-256 digests of signed/opaque tokens observed in non-privileged in-scope responses (never raw tokens). */
   private readonly ephemeralTokenDigestsByRun = new Map<string, Map<string, { origin: string; observedAt: number }>>()
@@ -1951,8 +2015,18 @@ export class RequestBroker {
     return this.options.storage
   }
 
-  getRegisteredSecrets(): NamedSecret[] {
-    return [...this.redactedSecrets.values()]
+  getRegisteredSecrets(runId?: string): NamedSecret[] {
+    if (runId !== undefined) {
+      const map = this.redactedSecretsByRun.get(normalizeRunKey(runId))
+      return map ? [...map.values()] : []
+    }
+    const merged = new Map<string, NamedSecret>()
+    for (const map of this.redactedSecretsByRun.values()) {
+      for (const [value, secret] of map.entries()) {
+        if (!merged.has(value)) merged.set(value, secret)
+      }
+    }
+    return [...merged.values()]
   }
 
   /**
@@ -1960,8 +2034,13 @@ export class RequestBroker {
    * exchange cannot have been served the declared persona's scope; it is flagged so no proof can
    * cite it.
    */
-  getPersonaScopeMismatches(): Array<{ origin: string; expected: string; observed: string; source: string }> {
-    return [...this.personaScopeMismatches]
+  getPersonaScopeMismatches(runId?: string): Array<{ origin: string; expected: string; observed: string; source: string }> {
+    if (runId !== undefined) {
+      return [...(this.personaScopeMismatchesByRun.get(normalizeRunKey(runId)) ?? [])]
+    }
+    const out: Array<{ origin: string; expected: string; observed: string; source: string }> = []
+    for (const list of this.personaScopeMismatchesByRun.values()) out.push(...list)
+    return out
   }
 
   /**
@@ -1976,17 +2055,23 @@ export class RequestBroker {
     runId?: string
     storage?: SecondOrderStore
   }): boolean {
+    const runKey = normalizeRunKey(input.runId)
+    let owners = this.personaSessionOwnersByRun.get(runKey)
     let shared = false
     for (const [name, value] of input.cookies) {
       if (!sessionCookieNameRegex.test(name) || value.length < 8) continue
+      if (!owners) {
+        owners = new Map<string, string>()
+        this.personaSessionOwnersByRun.set(runKey, owners)
+      }
       const key = `${input.origin}\0${name}\0${createHash('sha256').update(value).digest('hex').slice(0, 16)}`
-      const owner = this.personaSessionOwners.get(key)
+      const owner = owners.get(key)
       if (owner === undefined) {
-        if (this.personaSessionOwners.size >= 4_096) {
-          const oldest = this.personaSessionOwners.keys().next().value
-          if (oldest !== undefined) this.personaSessionOwners.delete(oldest)
+        if (owners.size >= 4_096) {
+          const oldest = owners.keys().next().value
+          if (oldest !== undefined) owners.delete(oldest)
         }
-        this.personaSessionOwners.set(key, input.persona)
+        owners.set(key, input.persona)
         continue
       }
       if (owner === input.persona) continue
@@ -1996,7 +2081,7 @@ export class RequestBroker {
         expected: input.persona,
         observed: owner,
         source: `vault_session:${name}`,
-        ...(input.runId ? { runId: input.runId } : {}),
+        runId: runKey,
         ...(input.storage ? { storage: input.storage } : {}),
       })
     }
@@ -2015,10 +2100,21 @@ export class RequestBroker {
     runId?: string
     storage?: SecondOrderStore
   }): void {
+    const runKey = normalizeRunKey(input.runId)
     const key = `${input.origin}\0${input.expected}\0${input.observed}\0${input.source}`
-    if (this.personaScopeMismatchKeys.has(key)) return
-    this.personaScopeMismatchKeys.add(key)
-    this.personaScopeMismatches.push({
+    let seenKeys = this.personaScopeMismatchKeysByRun.get(runKey)
+    if (!seenKeys) {
+      seenKeys = new Set<string>()
+      this.personaScopeMismatchKeysByRun.set(runKey, seenKeys)
+    }
+    if (seenKeys.has(key)) return
+    seenKeys.add(key)
+    let mismatches = this.personaScopeMismatchesByRun.get(runKey)
+    if (!mismatches) {
+      mismatches = []
+      this.personaScopeMismatchesByRun.set(runKey, mismatches)
+    }
+    mismatches.push({
       origin: input.origin,
       expected: input.expected,
       observed: input.observed,
@@ -2027,7 +2123,7 @@ export class RequestBroker {
     try {
       const storage = input.storage ?? this.options.storage
       storage?.event?.(
-        input.runId ?? null,
+        input.runId && input.runId !== 'default' ? input.runId : null,
         'broker.persona_scope_mismatch',
         `Persona "${input.expected}" presented session state belonging to "${input.observed}"; the exchange is evidence-invalid.`,
         { origin: input.origin, expected: input.expected, observed: input.observed, source: input.source },
@@ -2035,21 +2131,103 @@ export class RequestBroker {
     } catch { /* telemetry is best-effort; the exchange is already flagged */ }
   }
 
-  private registerSecret(label: string, value: string | undefined) {
-    if (!value || value.length < 4) return
-    if (this.redactedSecrets.has(value)) return
-    if (this.redactedSecrets.size >= 5_000) {
-      const oldest = this.redactedSecrets.keys().next().value
-      if (oldest !== undefined) this.redactedSecrets.delete(oldest)
+  private maxRedactedSecretsPerRun(): number {
+    const raw = this.options.maxRedactedSecretsPerRun
+    if (typeof raw === 'number' && Number.isFinite(raw)) {
+      return Math.max(1, Math.min(HARD_MAX_REDACTED_SECRETS_PER_RUN, Math.floor(raw)))
     }
-    this.redactedSecrets.set(value, { placeholder: `[redacted:${label}]`, value })
+    return DEFAULT_MAX_REDACTED_SECRETS_PER_RUN
+  }
+
+  private registerSecret(
+    runId: string,
+    label: string,
+    value: string | undefined,
+    storage?: SecondOrderStore,
+  ): void {
+    if (!value || value.length < 4) return
+    const runKey = normalizeRunKey(runId)
+    let runSecrets = this.redactedSecretsByRun.get(runKey)
+    if (!runSecrets) {
+      runSecrets = new Map<string, NamedSecret>()
+      this.redactedSecretsByRun.set(runKey, runSecrets)
+    }
+    if (runSecrets.has(value)) return
+    const cap = this.maxRedactedSecretsPerRun()
+    if (runSecrets.size >= cap) {
+      try {
+        const store = storage ?? this.options.storage
+        store?.event?.(
+          runKey === 'default' ? null : runKey,
+          'broker.redaction_capacity_exceeded',
+          `Per-run redaction registry cap (${cap}) reached for run "${runKey}"; failing closed instead of evicting live secrets.`,
+          {
+            runId: runKey,
+            cap,
+            activeCount: runSecrets.size,
+            label,
+            degradation: 'redaction_fail_closed',
+          },
+        )
+      } catch { /* telemetry is best-effort; fail-closed error still throws */ }
+      throw new RedactionCapacityError(runKey, cap, runSecrets.size)
+    }
+    runSecrets.set(value, { placeholder: `[redacted:${label}]`, value })
+  }
+
+  resolveJarKey(req: JarKeyScope, grant?: Pick<Grant, 'scopePolicy'>): ResolvedJarKey {
+    return resolveJarKey(req, grant)
   }
 
   private resolveScopeRunKey(
-    req?: Pick<BrokerHttpRequest, 'runId'>,
+    req?: Pick<BrokerHttpRequest, 'runId'> & { scopePolicy?: Pick<ScopePolicy, 'runId'> },
     grant?: Pick<Grant, 'scopePolicy'>,
   ): string {
-    return req?.runId ?? grant?.scopePolicy?.runId ?? 'default'
+    return normalizeRunKey(req?.runId ?? grant?.scopePolicy?.runId ?? req?.scopePolicy?.runId)
+  }
+
+  /**
+   * Release all per-run broker state (session jars, scope revision floor, persona session
+   * ownership/mismatch records, Q4 ephemeral token digests, and per-run redaction secrets).
+   */
+  disposeRun(runId: string): void {
+    const key = normalizeRunKey(runId)
+    this.purgeSessionJars(key)
+    this.latestScopeRevisionByRun.delete(key)
+    this.personaSessionOwnersByRun.delete(key)
+    this.personaScopeMismatchesByRun.delete(key)
+    this.personaScopeMismatchKeysByRun.delete(key)
+    this.ephemeralTokenDigestsByRun.delete(key)
+    this.redactedSecretsByRun.delete(key)
+  }
+
+  /** Alias for `disposeRun(runId)` to purge all per-run broker state cleanly. */
+  purgeRunState(runId: string): void {
+    this.disposeRun(runId)
+  }
+
+  /** Read-only per-run state counts for diagnostics and disposal verification. */
+  getRunStateCounts(runId: string): {
+    sessionJars: number
+    hasScopeRevision: boolean
+    personaSessionOwners: number
+    personaScopeMismatches: number
+    ephemeralTokenDigests: number
+    redactedSecrets: number
+  } {
+    const key = normalizeRunKey(runId)
+    let sessionJars = 0
+    for (const jar of this.sessionJars.values()) {
+      if (jar.runId === key) sessionJars += 1
+    }
+    return {
+      sessionJars,
+      hasScopeRevision: this.latestScopeRevisionByRun.has(key),
+      personaSessionOwners: this.personaSessionOwnersByRun.get(key)?.size ?? 0,
+      personaScopeMismatches: this.personaScopeMismatchesByRun.get(key)?.length ?? 0,
+      ephemeralTokenDigests: this.ephemeralTokenDigestsByRun.get(key)?.size ?? 0,
+      redactedSecrets: this.redactedSecretsByRun.get(key)?.size ?? 0,
+    }
   }
 
   revokeOrigin(origin: string, scopeRevision?: number, runId?: string) {
@@ -2060,7 +2238,7 @@ export class RequestBroker {
       normalized = origin
     }
     if (scopeRevision !== undefined) {
-      const key = runId ?? 'default'
+      const key = normalizeRunKey(runId)
       const prev = this.latestScopeRevisionByRun.get(key) ?? 0
       if (scopeRevision > prev) {
         this.latestScopeRevisionByRun.set(key, scopeRevision)
@@ -2073,7 +2251,7 @@ export class RequestBroker {
   revokeScope(runId: string, scopeRevision: number): void
   revokeScope(runIdOrRevision: string | number, maybeRevision?: number): void {
     if (typeof runIdOrRevision === 'string') {
-      const runId = runIdOrRevision
+      const runId = normalizeRunKey(runIdOrRevision)
       const scopeRevision = maybeRevision ?? 0
       const prev = this.latestScopeRevisionByRun.get(runId) ?? 0
       if (scopeRevision > prev) {
@@ -2101,16 +2279,17 @@ export class RequestBroker {
   }
 
   purgeSessionJars(runId?: string, origin?: string) {
-    if (!runId && !origin) {
+    const normalizedRunId = runId !== undefined ? normalizeRunKey(runId) : undefined
+    if (!normalizedRunId && !origin) {
       this.sessionJars.clear()
       this.ephemeralTokenDigestsByRun.clear()
       return
     }
-    if (!origin && runId) {
-      this.ephemeralTokenDigestsByRun.delete(runId)
+    if (!origin && normalizedRunId) {
+      this.ephemeralTokenDigestsByRun.delete(normalizedRunId)
     } else if (origin) {
       for (const [rKey, tokens] of this.ephemeralTokenDigestsByRun.entries()) {
-        if (runId && rKey !== runId) continue
+        if (normalizedRunId && rKey !== normalizedRunId) continue
         for (const [digest, meta] of tokens.entries()) {
           if (meta.origin === origin) tokens.delete(digest)
         }
@@ -2118,7 +2297,7 @@ export class RequestBroker {
       }
     }
     for (const [key, jar] of this.sessionJars.entries()) {
-      if (runId && jar.runId !== runId) continue
+      if (normalizedRunId && jar.runId !== normalizedRunId) continue
       if (!origin) {
         this.sessionJars.delete(key)
         continue
@@ -2146,15 +2325,11 @@ export class RequestBroker {
   ): SessionJar | undefined {
     // Persona scope is per-request: the jar key carries the persona, so a Set-Cookie rotation is
     // scoped strictly back to the persona that received it.
-    const persona = req.persona ?? req.personaHandle
+    const resolved = resolveJarKey(req, grant)
+    const { runId, assignmentId, role, persona, assignmentKey, jarKey } = resolved
     // A jar exists only for requests that carry or need session state. Creating one eagerly for
     // every persona read would evict the CSRF/setup jars the probe families rely on.
     if (req.session === undefined && (persona === undefined || req.csrfBind === undefined)) return undefined
-    const runId = this.resolveScopeRunKey(req, grant)
-    const assignmentId = req.assignmentId ?? 'default'
-    const role = req.sessionGroupRole ?? 'default'
-    const assignmentKey = `${runId}\0${assignmentId}`
-    const jarKey = sessionJarKey(assignmentKey, role, persona, req.session)
     const latestForRun = this.latestScopeRevisionByRun.get(runId) ?? 0
     const effectiveRevision = Math.max(latestForRun, req.scopeRevision ?? grant.scopeRevision ?? 0)
 
@@ -2184,7 +2359,7 @@ export class RequestBroker {
     // Only `setup` jars may seed `control` or `probe` via deep-clone on first access;
     // `control` and `probe` remain strictly isolated from each other.
     if (role === 'control' || role === 'probe') {
-      const setupKey = sessionJarKey(assignmentKey, 'setup', persona, req.session)
+      const setupKey = resolveJarKey({ ...req, sessionGroupRole: 'setup' }, grant).jarKey
       const setupJar = this.sessionJars.get(setupKey)
       if (setupJar) {
         for (const [k, v] of setupJar.cookies.entries()) cookies.set(k, { ...v })
@@ -2215,6 +2390,7 @@ export class RequestBroker {
     response: RawHttpResponse,
     mediaType: string,
     vaultCookiesAtRequest?: ReadonlyMap<string, string>,
+    storage?: SecondOrderStore,
   ) {
     const maxCookies = Math.max(1, Math.min(this.options.maxCookiesPerJar ?? 32, 64))
     const parsedEntries = parseSetCookieHeaderEntries(response.headers, url)
@@ -2224,6 +2400,8 @@ export class RequestBroker {
         jar.cookies.delete(item.entry.key)
         continue
       }
+      // Register secret BEFORE persisting cookie so a redaction-cap overflow fails closed.
+      this.registerSecret(jar.runId, `jar:${jar.session}:${item.entry.name}`, item.entry.value, storage)
       const existing = jar.cookies.get(item.entry.key)
       item.entry.writeCount = (existing?.writeCount ?? 0) + 1
       item.entry.rotatedFromResponse = true
@@ -2238,7 +2416,6 @@ export class RequestBroker {
         }
       }
       jar.cookies.set(item.entry.key, item.entry)
-      this.registerSecret(`jar:${jar.session}:${item.entry.name}`, item.entry.value)
 
       if (csrfCookieNameRegex.test(item.entry.name) && item.entry.value) {
         jar.csrfTokens.set(`${url.origin}\0${csrfPathPrefix}`, {
@@ -2256,7 +2433,7 @@ export class RequestBroker {
       const value = Array.isArray(raw) ? raw[0] : raw
       if (!value || !value.trim()) continue
       const token = decodeCsrfValue(value.trim())
-      this.registerSecret(`csrf:${jar.session}:${headerName}`, token)
+      this.registerSecret(jar.runId, `csrf:${jar.session}:${headerName}`, token, storage)
       jar.csrfTokens.set(`${url.origin}\0${csrfPathPrefix}`, {
         value: token,
         sourceKind: 'header',
@@ -2268,7 +2445,7 @@ export class RequestBroker {
 
     const bodyCsrf = extractCsrfFromBody(mediaType, response.body ?? '')
     if (bodyCsrf) {
-      this.registerSecret(`csrf:${jar.session}:${bodyCsrf.detectedName ?? 'token'}`, bodyCsrf.value)
+      this.registerSecret(jar.runId, `csrf:${jar.session}:${bodyCsrf.detectedName ?? 'token'}`, bodyCsrf.value, storage)
       jar.csrfTokens.set(`${url.origin}\0${csrfPathPrefix}`, {
         ...bodyCsrf,
         value: decodeCsrfValue(bodyCsrf.value),
@@ -2293,13 +2470,13 @@ export class RequestBroker {
 
   /** Internal helper for ScopedBrowser: non-HttpOnly jar cookies applicable to `origin` (never logged/serialized). */
   sessionCookiesForBrowser(
-    scope: { session?: string; persona?: string; runId?: string; assignmentId?: string; sessionGroupRole?: string },
+    scope: JarKeyScope,
     origin: string,
+    grant?: Pick<Grant, 'scopePolicy'>,
   ): BrowserMirrorCookie[] {
-    if (!scope.session && !scope.persona) return []
-    const assignmentKey = `${scope.runId ?? 'default'}\0${scope.assignmentId ?? 'default'}`
-    const role = scope.sessionGroupRole ?? 'default'
-    const jar = this.sessionJars.get(sessionJarKey(assignmentKey, role, scope.persona, scope.session))
+    const resolved = resolveJarKey(scope, grant)
+    if (!resolved.session && !resolved.persona) return []
+    const jar = this.sessionJars.get(resolved.jarKey)
     if (!jar) return []
     let parsed: URL
     try {
@@ -2726,7 +2903,7 @@ export class RequestBroker {
       }
     }
     for (const s of collectSecrets(req, grant)) addSecret(s.value)
-    for (const s of this.redactedSecrets.values()) addSecret(s.value)
+    for (const s of this.getRegisteredSecrets(this.resolveScopeRunKey(req, grant))) addSecret(s.value)
     return digests
   }
 
@@ -2895,6 +3072,7 @@ export class RequestBroker {
             ...(req.persona ? { persona: req.persona } : {}),
           },
           req.secrets,
+          req.runId,
         )
       }
       throw new BrokerApprovalRequired(decision.normalizedOrigin!, decision.normalizedMethod, req.pathAndQuery)
@@ -2922,6 +3100,7 @@ export class RequestBroker {
           ...(req.persona ? { persona: req.persona } : {}),
         },
         req.secrets,
+        req.runId,
       )
     }
     throw new BrokerDenied(decision.reason)
@@ -2932,12 +3111,14 @@ export class RequestBroker {
     origin: string,
     meta: BrokerAuditMeta,
     extraSecrets?: readonly NamedSecret[],
+    runId?: string,
   ): void {
+    const scopeRunKey = this.resolveScopeRunKey(runId ? { runId } : undefined, grant)
     const effectiveSecrets: NamedSecret[] = [
       ...(extraSecrets ?? []),
       ...(grant.personas ? personaSecrets(grant.personas) : []),
       ...(grant.secrets ?? []),
-      ...this.redactedSecrets.values(),
+      ...this.getRegisteredSecrets(scopeRunKey),
     ]
     const scrub = (value: string | undefined, maxLen: number): string | undefined => {
       if (typeof value !== 'string') return undefined
@@ -3364,9 +3545,11 @@ export class RequestBroker {
       deny('Persona JWT header or payload could not be decoded.')
     }
 
-    this.registerSecret(`jwt:original:${prepared.personaHandle ?? 'persona'}`, originalJwt)
-    this.registerSecret(`jwt:original_hp:${prepared.personaHandle ?? 'persona'}`, `${headerB64}.${payloadB64}`)
-    this.registerSecret(`jwt:original_payload:${prepared.personaHandle ?? 'persona'}`, payloadB64)
+    const authRunKey = this.resolveScopeRunKey(req, grant)
+    const authStorage = this.options.storage ?? grant.storage
+    this.registerSecret(authRunKey, `jwt:original:${prepared.personaHandle ?? 'persona'}`, originalJwt, authStorage)
+    this.registerSecret(authRunKey, `jwt:original_hp:${prepared.personaHandle ?? 'persona'}`, `${headerB64}.${payloadB64}`, authStorage)
+    this.registerSecret(authRunKey, `jwt:original_payload:${prepared.personaHandle ?? 'persona'}`, payloadB64, authStorage)
 
     let mutatedJwt = originalJwt
     if (mutation.kind === 'alg_none') {
@@ -3516,12 +3699,12 @@ export class RequestBroker {
       mutatedJwt = `${headerB64}.${encodeJwtJson(nextPayload)}.${sigB64}`
     }
 
-    this.registerSecret(`jwt:mutated:${mutation.kind}`, mutatedJwt)
+    this.registerSecret(authRunKey, `jwt:mutated:${mutation.kind}`, mutatedJwt, authStorage)
     const mutatedParts = mutatedJwt.split('.')
     if (mutatedParts.length >= 2 && mutatedParts[0] && mutatedParts[1]) {
-      this.registerSecret(`jwt:mutated_hp:${mutation.kind}`, `${mutatedParts[0]}.${mutatedParts[1]}`)
+      this.registerSecret(authRunKey, `jwt:mutated_hp:${mutation.kind}`, `${mutatedParts[0]}.${mutatedParts[1]}`, authStorage)
       if (mutatedParts[1] !== payloadB64) {
-        this.registerSecret(`jwt:mutated_payload:${mutation.kind}`, mutatedParts[1])
+        this.registerSecret(authRunKey, `jwt:mutated_payload:${mutation.kind}`, mutatedParts[1], authStorage)
       }
     }
     if (jwtSource.kind === 'header') {
@@ -3732,7 +3915,7 @@ export class RequestBroker {
           origin: url.origin,
           persona: personaHandle,
           cookies: vaultCookies,
-          ...(req.runId ? { runId: req.runId } : {}),
+          runId: this.resolveScopeRunKey(req, grant),
           ...(this.options.storage ?? grant.storage ? { storage: (this.options.storage ?? grant.storage)! } : {}),
         })) {
         // Fail closed: the request would be answered from another persona's session, so both the
@@ -3806,7 +3989,12 @@ export class RequestBroker {
           }
         }
         if (csrfToken) {
-          this.registerSecret(`csrf:${jar.session}:${csrfToken.detectedName ?? 'token'}`, csrfToken.value)
+          this.registerSecret(
+            jar.runId,
+            `csrf:${jar.session}:${csrfToken.detectedName ?? 'token'}`,
+            csrfToken.value,
+            this.options.storage ?? grant.storage,
+          )
           const headerName = cfg.headerName ?? (
             (csrfToken.sourceKind === 'cookie' || csrfToken.sourceKind === 'vault_cookie') &&
             csrfToken.detectedName?.toLowerCase() === 'xsrf-token'
@@ -3951,7 +4139,7 @@ export class RequestBroker {
       }
 
       if (jar) {
-        this.storeJarCookiesAndCsrf(jar, url, response, obs.mediaType, vaultCookies)
+        this.storeJarCookiesAndCsrf(jar, url, response, obs.mediaType, vaultCookies, this.options.storage ?? grant.storage)
       }
 
       if (followRedirects && [301, 302, 303, 307, 308].includes(response.status)) {
@@ -4005,7 +4193,7 @@ export class RequestBroker {
 
       const effectiveSecrets: NamedSecret[] = [
         ...secrets,
-        ...this.redactedSecrets.values(),
+        ...this.getRegisteredSecrets(this.resolveScopeRunKey(req, grant)),
       ]
       // Structural evidence must be captured from the pre-redaction bytes: redaction is correct
       // for logs/LLMs but erases what a disclosure verifier needs. Only bounded fingerprints leave
@@ -4212,7 +4400,7 @@ export class RequestBroker {
           origin: url.origin,
           persona: personaHandle,
           cookies: vaultCookies,
-          ...(req.runId ? { runId: req.runId } : {}),
+          runId: this.resolveScopeRunKey(req, grant),
           ...(this.options.storage ?? grant.storage ? { storage: (this.options.storage ?? grant.storage)! } : {}),
         })) {
         deny(`Persona scope mismatch: the credential for "${personaHandle}" is the session of another persona; no request was sent. Re-mint this persona's login before scanning.`)
@@ -4362,7 +4550,7 @@ export class RequestBroker {
       }
 
       if (jar) {
-        this.storeJarCookiesAndCsrf(jar, url, response, obs.mediaType, vaultCookies)
+        this.storeJarCookiesAndCsrf(jar, url, response, obs.mediaType, vaultCookies, this.options.storage ?? grant.storage)
       }
 
       const rawBody = response.body ?? ''
@@ -4381,7 +4569,7 @@ export class RequestBroker {
 
       const effectiveSecrets: NamedSecret[] = [
         ...secrets,
-        ...this.redactedSecrets.values(),
+        ...this.getRegisteredSecrets(this.resolveScopeRunKey(req, grant)),
       ]
       const rawResponseHeaders = normalizeHeaders(response.headers)
       this.observeEphemeralResponseTokens({

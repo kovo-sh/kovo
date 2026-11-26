@@ -83,6 +83,9 @@ export function getRunCustodyBudgetUsage(runId: string): { sealTotal: number; co
   const s = runCustodyBudgets.get(runId.trim() || '__default__')
   return s ? { sealTotal: s.sealTotal, compositeVerifyTotal: s.compositeVerifyTotal, sealByEndpoint: Object.fromEntries(s.sealByEndpoint) } : { sealTotal: 0, compositeVerifyTotal: 0, sealByEndpoint: {} }
 }
+export function hasRunCustodyBudget(runId: string): boolean {
+  return runCustodyBudgets.has(runId.trim() || '__default__')
+}
 export function resetRunCustodyBudgets(runId?: string): void {
   if (runId === undefined) runCustodyBudgets.clear(); else runCustodyBudgets.delete(runId.trim() || '__default__')
 }
