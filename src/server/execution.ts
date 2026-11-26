@@ -48,7 +48,7 @@ import {
 } from './broker.ts'
 import { CanaryBroker, scanSecondOrderMarkers, type SecondOrderStore } from './canary-broker.ts'
 import { hasCuratedAdvisory, queryCves, templateIdsForCves } from './cve-broker.ts'
-import { DerivedCapabilityVault } from './derived-custody.ts'
+import { DerivedCapabilityVault, resetRunCustodyBudgets } from './derived-custody.ts'
 import { normalizeEndpointTemplate } from './dedupe.ts'
 import {
   extractCreatedId,
@@ -790,6 +790,8 @@ export class Execution {
     })
     this.budgetTracker.deleteRun(runId)
     this.board.cleanupRun(runId)
+    this.broker.disposeRun(runId)
+    resetRunCustodyBudgets(runId)
     if (!actor || this.actors.get(runId) === actor) this.actors.delete(runId)
   }
 
@@ -899,6 +901,7 @@ export class Execution {
         try { trace.closeTrace() } catch { /* ignore */ }
       }
     })
+    actor.registerResource('broker-custody:dispose', () => { this.broker.disposeRun(runId); resetRunCustodyBudgets(runId) })
     actor.registerResource('run-state:cleanup', () => {
       this.cleanupRunState(runId, actor)
     })
