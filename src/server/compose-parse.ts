@@ -30,6 +30,134 @@ const MAX_SCALAR_LENGTH = 8_192
 const MAX_SERVICE_COUNT = 6
 const MAX_EXPANDED_NODES = 10_000
 const MAX_INTERPOLATION_DEPTH = 16
+const MAX_OCI_IMAGE_LENGTH = 255
+
+const OCI_REPO_COMPONENT_RE = /^[a-z0-9]+(?:(?:\.|_{1,2}|-+)[a-z0-9]+)*$/
+const OCI_TAG_RE = /^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$/
+const OCI_DIGEST_RE = /^(?:sha256:[0-9a-f]{64}|sha384:[0-9a-f]{96}|sha512:[0-9a-f]{128})$/
+const OCI_REGISTRY_LABEL_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/
+
+export type OciImageValidationResult =
+  | { ok: true; image: string }
+  | { ok: false; reason: string }
+
+/**
+ * Validate a container image string against a strict OCI `[registry/]repo[:tag][@digest]` grammar.
+ * Rejects leading `-`, whitespace, control characters, `=`, `..`, and any malformed component so
+ * an image value can never be interpreted as a Docker CLI option or traversal token.
+ */
+export function validateOciImageReference(image: unknown): OciImageValidationResult {
+  if (typeof image !== 'string') {
+    return { ok: false, reason: 'image reference must be a string' }
+  }
+  if (image.length === 0) {
+    return { ok: false, reason: 'image reference must not be empty' }
+  }
+  if (image.length > MAX_OCI_IMAGE_LENGTH) {
+    return { ok: false, reason: `image reference exceeds ${MAX_OCI_IMAGE_LENGTH} characters` }
+  }
+  if (image.startsWith('-')) {
+    return { ok: false, reason: 'image reference must not start with "-"' }
+  }
+  if (/[\x00-\x1f\x7f]/.test(image)) {
+    return { ok: false, reason: 'image reference must not contain control characters' }
+  }
+  if (/\s/.test(image)) {
+    return { ok: false, reason: 'image reference must not contain whitespace' }
+  }
+  if (image.includes('=')) {
+    return { ok: false, reason: 'image reference must not contain "="' }
+  }
+  if (image.includes('..')) {
+    return { ok: false, reason: 'image reference must not contain ".."' }
+  }
+
+  let nameAndTag = image
+  const atIdx = image.indexOf('@')
+  if (atIdx >= 0) {
+    if (image.indexOf('@', atIdx + 1) !== -1) {
+      return { ok: false, reason: 'image reference must not contain multiple "@" digest separators' }
+    }
+    const digest = image.slice(atIdx + 1)
+    if (!OCI_DIGEST_RE.test(digest)) {
+      return { ok: false, reason: 'invalid OCI image digest (expected lowercase sha256/sha384/sha512 hex)' }
+    }
+    nameAndTag = image.slice(0, atIdx)
+    if (nameAndTag.length === 0) {
+      return { ok: false, reason: 'image reference is missing repository before "@digest"' }
+    }
+  }
+
+  const lastSlash = nameAndTag.lastIndexOf('/')
+  const colonIdx = nameAndTag.indexOf(':', lastSlash + 1)
+  let namePart = nameAndTag
+  if (colonIdx >= 0) {
+    if (nameAndTag.indexOf(':', colonIdx + 1) !== -1) {
+      return { ok: false, reason: 'image reference must not contain multiple ":" tag separators' }
+    }
+    const tag = nameAndTag.slice(colonIdx + 1)
+    if (!OCI_TAG_RE.test(tag)) {
+      return { ok: false, reason: `invalid OCI image tag "${tag.slice(0, 64)}"` }
+    }
+    namePart = nameAndTag.slice(0, colonIdx)
+    if (namePart.length === 0) {
+      return { ok: false, reason: 'image reference is missing repository before ":tag"' }
+    }
+  }
+
+  const segments = namePart.split('/')
+  if (segments.some(seg => seg.length === 0)) {
+    return { ok: false, reason: 'image reference contains an empty path segment' }
+  }
+
+  const first = segments[0]
+  const hasRegistry = segments.length > 1 && (first.includes('.') || first.includes(':') || first === 'localhost')
+  let repoSegments: string[]
+  if (hasRegistry) {
+    const portColon = first.indexOf(':')
+    if (portColon >= 0) {
+      if (first.indexOf(':', portColon + 1) !== -1) {
+        return { ok: false, reason: 'invalid OCI registry host:port' }
+      }
+      const portStr = first.slice(portColon + 1)
+      if (!/^\d{1,5}$/.test(portStr)) {
+        return { ok: false, reason: 'invalid OCI registry port' }
+      }
+      const port = Number(portStr)
+      if (!Number.isInteger(port) || port < 1 || port > 65_535) {
+        return { ok: false, reason: 'OCI registry port is out of range' }
+      }
+    }
+    const host = portColon >= 0 ? first.slice(0, portColon) : first
+    if (host.length === 0 || host.length > 253) {
+      return { ok: false, reason: 'invalid OCI registry host' }
+    }
+    if (host !== 'localhost') {
+      const labels = host.split('.')
+      if (labels.some(label => !OCI_REGISTRY_LABEL_RE.test(label))) {
+        return { ok: false, reason: `invalid OCI registry host "${host.slice(0, 64)}"` }
+      }
+    }
+    repoSegments = segments.slice(1)
+  } else {
+    repoSegments = segments
+  }
+
+  if (repoSegments.length === 0 || repoSegments.length > 8) {
+    return { ok: false, reason: 'invalid OCI repository path depth' }
+  }
+  for (const seg of repoSegments) {
+    if (seg.length > 128 || !OCI_REPO_COMPONENT_RE.test(seg)) {
+      return { ok: false, reason: `invalid OCI repository segment "${seg.slice(0, 64)}"` }
+    }
+  }
+
+  return { ok: true, image }
+}
+
+export function isValidOciImageReference(image: unknown): boolean {
+  return validateOciImageReference(image).ok
+}
 
 export class ComposeParseError extends Error {
   readonly lineNumber?: number
@@ -1225,7 +1353,14 @@ function normalizeService(name: string, config: unknown): ComposeServiceSource {
   }
 
   if (config.image !== undefined && config.image !== null) {
-    normalized.image = ensureStringScalar(config.image, `service "${name}" image`)
+    if (typeof config.image !== 'string') {
+      throw new ComposeParseError(`service "${name}" image must be a string`)
+    }
+    const imageCheck = validateOciImageReference(config.image)
+    if (!imageCheck.ok) {
+      throw new ComposeParseError(`service "${name}" has invalid image reference: ${imageCheck.reason}`)
+    }
+    normalized.image = imageCheck.image
   }
   if (config.build !== undefined) normalized.build = normalizeBuild(config.build)
   if (config.command !== undefined) normalized.command = normalizeStringOrArray(config.command, `service "${name}" command`)

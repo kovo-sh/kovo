@@ -52,6 +52,7 @@ import {
   LAB_PATHS,
   LAB_PROXY_IMAGE_DEFAULT,
   LAB_PROXY_IMAGE_ENV,
+  assertSafeLabImageReference,
   buildLabContainerRunArgs,
   buildLabNetworkCreateArgs,
   buildLabProxyRunArgs,
@@ -64,6 +65,7 @@ import {
   labProxySocketMode,
   parseSeededPersonasFromStdout,
   resolveLabContainerUser,
+  resolveLabServiceContainerUser,
   resolveLabStackServices,
   resolveStartCommand,
   rewriteSqliteDatabaseUrl,
@@ -634,7 +636,8 @@ export class LabRunner {
     volumes: string[]
   }> {
     const { runId, networkName, sanitizedRepoDir, service, labConfig, isPrimary, telemetryDir, storage, signal } = params
-    const containerUser = resolveLabContainerUser(this.env)
+    const needsHostWritableMount = Boolean(isPrimary && telemetryDir && labConfig.iastEnabled)
+    const containerUser = resolveLabServiceContainerUser(this.env, { needsHostWritableMount })
     const shortId = createHash('sha256').update(`${runId}:${service.name}:${randomUUID()}`).digest('hex').slice(0, 10)
     const safeSvc = service.name.replace(/[^a-z0-9_-]/g, '').slice(0, 20) || 'svc'
     const containerName = `kovo-lab-${safeSvc}-${shortId}`
@@ -667,13 +670,13 @@ export class LabRunner {
       if (!existsSync(dockerfileFull)) {
         throw new Error(`Lab Dockerfile not found: ${dockerfileRel}`)
       }
-      imageName = `kovo-lab-img-${safeSvc}-${shortId}:local`
+      imageName = assertSafeLabImageReference(`kovo-lab-img-${safeSvc}-${shortId}:local`, `lab build "${service.name}"`)
       const buildSignal = AbortSignal.any([
         AbortSignal.timeout(labConfig.buildTimeoutMs ?? 120_000),
         ...(signal ? [signal] : []),
       ])
       await this.docker(
-        ['build', '--pull=false', '--network', 'none', '-f', dockerfileFull, '-t', imageName, sanitizedRepoDir],
+        ['build', '--pull=false', '--network', 'none', '-f', dockerfileFull, '-t', imageName, '--', sanitizedRepoDir],
         buildSignal,
       )
       builtImage = true
@@ -746,6 +749,8 @@ export class LabRunner {
     const internalPort = service.internalPort
       ?? dbDefaultPort
       ?? (isPrimary ? (labConfig.internalPort ?? 8080) : 8080)
+
+    imageName = assertSafeLabImageReference(imageName, `lab service "${service.name}"`)
 
     const runArgs = buildLabContainerRunArgs({
       containerName,
@@ -911,7 +916,11 @@ export class LabRunner {
       if (primaryLaunched.builtImage) builtImages.push(primaryLaunched.imageName)
 
       writeLabProxyTarget(proxyDir, primaryLaunched.containerName, internalPort)
-      const proxyImage = this.env[LAB_PROXY_IMAGE_ENV]?.trim() || LAB_PROXY_IMAGE_DEFAULT
+      const rawProxyImage = this.env[LAB_PROXY_IMAGE_ENV]
+      const proxyImage = assertSafeLabImageReference(
+        rawProxyImage !== undefined && rawProxyImage !== '' ? rawProxyImage : LAB_PROXY_IMAGE_DEFAULT,
+        'lab proxy',
+      )
       await this.docker(buildLabProxyRunArgs({
         containerName: proxyContainerName,
         networkName,
