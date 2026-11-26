@@ -148,6 +148,13 @@ export interface AssignmentBriefPrunedBranch {
   reason: string
 }
 
+export interface AssignmentBriefWorkflowNotebook {
+  discoveredRoutes?: readonly string[]
+  verifiedHypotheses?: readonly string[]
+  triedRecipes?: readonly string[]
+  openHypotheses?: readonly string[]
+}
+
 export interface AssignmentBriefHopCheckpoint {
   schema?: string
   branchKey: string
@@ -162,6 +169,7 @@ export interface AssignmentBriefHopCheckpoint {
   fuseWithBranchKey?: string
   nextGoal: AssignmentBriefCheckpointNextGoal
   prunedBranches?: readonly AssignmentBriefPrunedBranch[]
+  workflowNotebook?: AssignmentBriefWorkflowNotebook
   /** Always rendered as `true` so specialists continue from parent hops instead of rediscovering Hop 1. */
   doNotRediscover?: true
 }
@@ -179,6 +187,12 @@ export interface RenderedHopCheckpoint {
   fuseWithBranchKey?: string
   nextGoal: AssignmentBriefCheckpointNextGoal
   prunedBranches?: AssignmentBriefPrunedBranch[]
+  workflowNotebook?: {
+    discoveredRoutes?: string[]
+    verifiedHypotheses?: string[]
+    triedRecipes?: string[]
+    openHypotheses?: string[]
+  }
   doNotRediscover: true
 }
 
@@ -545,6 +559,25 @@ export function fitHopCheckpointForBrief(
     return out
   }
 
+  const cleanNbList = (items: readonly string[] | undefined, maxItems: number, maxLen: number): string[] =>
+    [...new Set((items ?? []).map(v => redactBriefText(v, maxLen)).filter(Boolean))].slice(0, maxItems)
+  const rawNb = input.workflowNotebook
+  const notebook: NonNullable<RenderedHopCheckpoint['workflowNotebook']> | undefined = rawNb
+    ? (() => {
+        const discoveredRoutes = cleanNbList(rawNb.discoveredRoutes, 10, 88)
+        const verifiedHypotheses = cleanNbList(rawNb.verifiedHypotheses, 6, 110)
+        const triedRecipes = cleanNbList(rawNb.triedRecipes, 10, 110)
+        const openHypotheses = cleanNbList(rawNb.openHypotheses, 6, 110)
+        if (!discoveredRoutes.length && !verifiedHypotheses.length && !triedRecipes.length && !openHypotheses.length) return undefined
+        return {
+          ...(discoveredRoutes.length ? { discoveredRoutes } : {}),
+          ...(verifiedHypotheses.length ? { verifiedHypotheses } : {}),
+          ...(triedRecipes.length ? { triedRecipes } : {}),
+          ...(openHypotheses.length ? { openHypotheses } : {}),
+        }
+      })()
+    : undefined
+
   const build = (
     hops: AssignmentBriefCheckpointHop[],
     omitted: number,
@@ -553,6 +586,7 @@ export function fitHopCheckpointForBrief(
     goalBytes: number,
     endpointBytes: number,
     includeOptional: boolean,
+    nb?: RenderedHopCheckpoint['workflowNotebook'],
   ): RenderedHopCheckpoint => ({
     schema: HOP_CHECKPOINT_SCHEMA_V1,
     branchKey,
@@ -566,22 +600,35 @@ export function fitHopCheckpointForBrief(
     ...(includeOptional && fuseWithBranchKey ? { fuseWithBranchKey } : {}),
     nextGoal: makeNextGoal(goalBytes, endpointBytes, includeOptional),
     ...(pruned.length ? { prunedBranches: pruned } : {}),
+    ...(nb && Object.keys(nb).length ? { workflowNotebook: nb } : {}),
     doNotRediscover: true,
   })
 
   const measure = (cp: RenderedHopCheckpoint) => Buffer.byteLength(JSON.stringify(cp), 'utf8')
 
-  const full = build(
-    orderedInputHops.map(h => normalizeCheckpointHop(h, false)),
-    baseOmitted,
-    allHandles,
-    prunedBranches,
-    180,
-    96,
-    true,
-  )
+  const fullHops = orderedInputHops.map(h => normalizeCheckpointHop(h, false))
+  const full = build(fullHops, baseOmitted, allHandles, prunedBranches, 180, 96, true, notebook)
   const fullBytes = measure(full)
   if (fullBytes <= cap) return { checkpoint: full, bytes: fullBytes, truncated: false }
+
+  if (notebook) {
+    const trimmedNb: NonNullable<RenderedHopCheckpoint['workflowNotebook']> = {
+      ...(notebook.discoveredRoutes ? { discoveredRoutes: [...notebook.discoveredRoutes] } : {}),
+      ...(notebook.verifiedHypotheses ? { verifiedHypotheses: [...notebook.verifiedHypotheses] } : {}),
+      ...(notebook.triedRecipes ? { triedRecipes: [...notebook.triedRecipes] } : {}),
+      ...(notebook.openHypotheses ? { openHypotheses: [...notebook.openHypotheses] } : {}),
+    }
+    const trimOrder = ['triedRecipes', 'discoveredRoutes', 'openHypotheses', 'verifiedHypotheses'] as const
+    for (const key of trimOrder) {
+      while (trimmedNb[key]?.length) {
+        trimmedNb[key]!.pop()
+        if (!trimmedNb[key]!.length) delete trimmedNb[key]
+        const candidate = build(fullHops, baseOmitted, allHandles, prunedBranches, 180, 96, true, Object.keys(trimmedNb).length ? trimmedNb : undefined)
+        const bytes = measure(candidate)
+        if (bytes <= cap) return { checkpoint: candidate, bytes, truncated: true }
+      }
+    }
+  }
 
   const passes = [
     { compact: false, goalBytes: 180, endpointBytes: 96, opt: true, keepPruned: true },

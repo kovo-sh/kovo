@@ -56,6 +56,7 @@ import {
   type CapabilityKind,
   type CapabilitySurface,
   type HopCheckpointBrief,
+  type HopWorkflowNotebook,
 } from './capability-ledger.ts'
 import { extractCoverageEvidenceMetadata, normalizeOriginForCoverage } from './coverage-category.ts'
 import { extractSpecDedupeFields, normalizeEndpointTemplate } from './dedupe.ts'
@@ -1888,6 +1889,36 @@ export interface HopContinuationExchangeRef {
   method: string
   pathAndQuery: string
   status: number
+  personaHandle?: string | null
+}
+
+/** Rank personas lowest-privilege-first (viewer/guest/readonly < member/user/tenant < manager/editor < admin/owner/superuser). */
+export function personaPrivilegeRank(persona: { handle: string; roleLabel?: string }): number {
+  const norm = `${persona.handle} ${persona.roleLabel ?? ''}`.replace(/([a-z])([A-Z])/g, '$1 $2').toLowerCase()
+  const tokens = new Set(norm.split(/[^a-z0-9]+/).filter(Boolean))
+  const isHighPriv = /\bsuper\s*(?:user|admin)\b/.test(norm)
+    || tokens.has('admin') || tokens.has('administrator') || tokens.has('owner')
+    || tokens.has('superuser') || tokens.has('superadmin') || tokens.has('root') || tokens.has('privileged')
+  const isLowPriv = /\bread\s*only\b/.test(norm)
+    || tokens.has('viewer') || tokens.has('guest') || tokens.has('readonly')
+    || tokens.has('anon') || tokens.has('anonymous') || tokens.has('unauthenticated') || tokens.has('observer')
+  if (isLowPriv && !isHighPriv) return 0
+  if (isHighPriv) return 3
+  if (tokens.has('manager') || tokens.has('editor') || tokens.has('moderator') || tokens.has('approver') || tokens.has('maintainer') || tokens.has('operator')) return 2
+  return 1
+}
+
+export function sortPersonasLowPrivFirst<T extends { handle: string; roleLabel?: string }>(personas: readonly T[]): T[] {
+  return [...personas].sort((a, b) => (personaPrivilegeRank(a) - personaPrivilegeRank(b)) || a.handle.localeCompare(b.handle))
+}
+
+const PERSISTENT_WORKFLOW_STEP_RE = /\b(?:workflow|business[_ -]?logic|state[_ -]?machine|lifecycle|authz|bola|bfla|idor|abac|broken[_ -]?access[_ -]?control|access[_ -]?control)\b/i
+
+export function isPersistentWorkflowContinuationStep(
+  step: Pick<ChainStep, 'title' | 'hypothesis' | 'category' | 'skills'> & { lane?: string | null },
+): boolean {
+  if (step.lane === 'workflow' || step.lane === 'business_logic') return true
+  return PERSISTENT_WORKFLOW_STEP_RE.test(`${step.title} ${step.hypothesis} ${step.category} ${step.skills.join(' ')}`)
 }
 
 export interface EnqueueHopContinuationInput {
@@ -5598,9 +5629,9 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         (codeSlice?.hops.length ?? 0) >= 4
         ? 'full'
         : 'compact'
-      // Exact control/variant actors for the differential: deterministic order by handle, the
-      // variant prefers another tenant (the object/authorization boundary the sink sits behind).
-      const tierAPersonas = [...input.personas].sort((a, b) => a.handle.localeCompare(b.handle))
+      // Exact control/variant actors for the differential: low-privilege-first order so the
+      // default/starting persona is always the lowest-privilege actor when one exists.
+      const tierAPersonas = sortPersonasLowPrivFirst(input.personas)
       const tenantOfPersona = (label: string): string => /\(([^()]+)\)\s*$/.exec(label)?.[1]?.trim() ?? ''
       const controlPersona = tierAPersonas[0]
       const variantPersona = controlPersona
@@ -5613,8 +5644,14 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
             `${hop.artifactKind}:${hop.artifactRef}${hop.stateAfter ? `[${hop.stateBefore ?? '*'}->${hop.stateAfter}]` : ''}`).join('→')
         : ''
       // v8: Resolve canonical <= 2 KB HopCheckpointBrief from SQLite CapabilityLedger (restart-safe)
-      // or persisted host-authored checkpoint metadata, without 480 B truncation or 'artifact' skip.
-      const checkpointFact = input.parentFacts.find(f => isTrustedHostControlFact(f, 'hop_checkpoint'))
+      // or persisted host-authored checkpoint metadata, preferring the deepest/latest round checkpoint.
+      const checkpointFact = input.parentFacts
+        .filter(f => isTrustedHostControlFact(f, 'hop_checkpoint'))
+        .sort((a, b) => {
+          const depthA = parseHopCheckpointJson(a.data?.checkpointBrief ?? a.data?.checkpointJson)?.depth ?? 0
+          const depthB = parseHopCheckpointJson(b.data?.checkpointBrief ?? b.data?.checkpointJson)?.depth ?? 0
+          return (depthB - depthA) || (b.createdAt - a.createdAt)
+        })[0]
       const cachedCheckpoint = this.persistedStepCheckpoints.get(input.step.id)
       const persistedBrief = parseHopCheckpointJson(checkpointFact?.data?.checkpointBrief ?? checkpointFact?.data?.checkpointJson)
         ?? parseHopCheckpointJson(cachedCheckpoint?.checkpointJson)
@@ -5634,6 +5671,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
             ...(persistedBrief?.mode ? { mode: persistedBrief.mode } : {}),
             ...(persistedBrief?.fuseWithBranchKey ? { fuseWithBranchKey: persistedBrief.fuseWithBranchKey } : {}),
             ...(persistedBrief?.nextGoal ? { nextGoal: persistedBrief.nextGoal } : {}),
+            ...(persistedBrief?.workflowNotebook ? { workflowNotebook: persistedBrief.workflowNotebook } : {}),
           })
         }
       }
@@ -6040,7 +6078,13 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     const allowNonChainSealedExit = input.trigger === 'sealed_handle_exit'
       && Boolean(input.allowNonChainWithSealedCap)
       && input.sealedCapHandles.length > 0
-    if (!isMultiHopChainStep(step) && !allowNonChainSealedExit) {
+    const hasWorkflowConcreteProgress = input.sealedCapHandles.length > 0
+      || input.recordedFacts.length > 0
+      || input.recordedExchanges.some(ex => ex.status > 0 && ex.status !== 404)
+    const allowWorkflowRotation = input.trigger === 'wall_clock_rotated'
+      && isPersistentWorkflowContinuationStep(step)
+      && hasWorkflowConcreteProgress
+    if (!isMultiHopChainStep(step) && !allowNonChainSealedExit && !allowWorkflowRotation) {
       return { enqueued: false, reason: 'not_multi_hop_chain' }
     }
     if (input.confirmed) {
@@ -6195,6 +6239,52 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     const nextMethod = lastExchange?.method?.toUpperCase()
     const branchKey = `cont:${step.id.slice(0, 12)}:d${nextDepth}`
 
+    const allLiveFacts = this.pageAll((offset, limit) =>
+      this.storage.listFacts(run.id, { includeTainted: false, limit, offset }))
+    const liveFactById = new Map(allLiveFacts.map(f => [f.id, f]))
+    const liveFactIds = new Set(liveFactById.keys())
+    const parentNotebooks: HopWorkflowNotebook[] = []
+    for (const factId of step.dependsOnFactIds) {
+      const cpFact = liveFactById.get(factId)
+      if (cpFact?.data?.subkind !== 'hop_checkpoint') continue
+      const parentBrief = parseHopCheckpointJson(cpFact.data.checkpointBrief ?? cpFact.data.checkpointJson)
+      if (parentBrief?.workflowNotebook) parentNotebooks.push(parentBrief.workflowNotebook)
+    }
+    if (!parentNotebooks.length) {
+      const cachedParent = parseHopCheckpointJson(this.persistedStepCheckpoints.get(step.id)?.checkpointJson)
+      if (cachedParent?.workflowNotebook) parentNotebooks.push(cachedParent.workflowNotebook)
+    }
+    const newDiscoveredRoutes = input.recordedExchanges
+      .filter(ex => ex.status > 0 && ex.status !== 404)
+      .map(ex => sanitizeCheckpointText(`${ex.method.toUpperCase()} ${ex.pathAndQuery.split('?')[0] || '/'}`, 88))
+    const newTriedRecipes = input.recordedExchanges.map(ex =>
+      sanitizeCheckpointText(`${ex.method.toUpperCase()} ${ex.pathAndQuery.split('?')[0] || '/'} [${ex.personaHandle?.trim() || 'anon'}] -> ${ex.status}`, 110))
+    const verifiedFactRe = /\b(?:verified|confirmed|succeeded|sealed|accepted|leaked|bypassed|granted)\b/i
+    const newVerifiedHypotheses = [
+      ...allSealedHandles.map(h => `Sealed ${h}`),
+      ...input.recordedFacts
+        .filter(f => f.kind === 'object_ref' || f.data?.subkind === 'chain_hop' || f.data?.verified === true || verifiedFactRe.test(f.summary))
+        .map(f => sanitizeCheckpointText(f.summary, 110)),
+    ]
+    const verifiedSet = new Set(newVerifiedHypotheses)
+    const newOpenHypotheses = [
+      ...input.recordedFacts
+        .map(f => sanitizeCheckpointText(f.summary, 110))
+        .filter(s => s && !verifiedSet.has(s)),
+      ...(partialClean && !verifiedSet.has(partialClean) ? [sanitizeCheckpointText(partialClean, 110)] : []),
+    ]
+    const mergeNb = (pick: (nb: HopWorkflowNotebook) => readonly string[] | undefined, extra: readonly string[], limit: number) =>
+      [...new Set([...parentNotebooks.flatMap(nb => pick(nb) ?? []), ...extra].filter(Boolean))].slice(-limit)
+    const mergedNotebook: HopWorkflowNotebook = {
+      discoveredRoutes: mergeNb(nb => nb.discoveredRoutes, newDiscoveredRoutes, 10),
+      verifiedHypotheses: mergeNb(nb => nb.verifiedHypotheses, newVerifiedHypotheses, 6),
+      triedRecipes: mergeNb(nb => nb.triedRecipes, newTriedRecipes, 10),
+      openHypotheses: mergeNb(nb => nb.openHypotheses, newOpenHypotheses, 6),
+    }
+    const workflowNotebook = (mergedNotebook.discoveredRoutes!.length || mergedNotebook.verifiedHypotheses!.length || mergedNotebook.triedRecipes!.length || mergedNotebook.openHypotheses!.length)
+      ? mergedNotebook
+      : undefined
+
     let finalizedBrief: { brief: HopCheckpointBrief; checkpointJson: string; checkpointBytes: number }
     if (primaryCapId && ledgerNodeById.has(primaryCapId)) {
       const ledgerBrief = ledger.buildHopCheckpointBrief(primaryCapId, MAX_CHECKPOINT_BRIEF_BYTES, {
@@ -6208,6 +6298,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
           hypothesisClass: step.category || 'multi_hop_chain',
           goal: HOP_CONTINUATION_DIRECTIVE,
         },
+        ...(workflowNotebook ? { workflowNotebook } : {}),
       })
       const mergedHandles = [...new Set([...ledgerBrief.capabilityHandles, ...allSealedHandles])]
         .map((h, i) => sanitizeCheckpointHandleRef(h, `cap:redacted:${i + 1}`))
@@ -6216,6 +6307,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         depth: Math.max(ledgerBrief.depth, nextDepth),
         targetHop: Math.min(6, Math.max(ledgerBrief.targetHop, nextDepth + 2)),
         capabilityHandles: mergedHandles,
+        ...(workflowNotebook ? { workflowNotebook } : {}),
         doNotRediscover: true,
       }, MAX_CHECKPOINT_BRIEF_BYTES)
     } else {
@@ -6250,6 +6342,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
           hypothesisClass: step.category || 'multi_hop_chain',
           goal: HOP_CONTINUATION_DIRECTIVE,
         },
+        ...(workflowNotebook ? { workflowNotebook } : {}),
         doNotRediscover: true,
       }, MAX_CHECKPOINT_BRIEF_BYTES)
     }
@@ -6278,10 +6371,6 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       `${CHAIN_CONTINUATION_SKILL_PREFIX}${nextDepth}`,
     ])]
 
-    const allLiveFacts = this.pageAll((offset, limit) =>
-      this.storage.listFacts(run.id, { includeTainted: false, limit, offset }))
-    const liveFactById = new Map(allLiveFacts.map(f => [f.id, f]))
-    const liveFactIds = new Set(liveFactById.keys())
     // Lossless hop-continuation fact handoff: retain EVERY inherited capability/checkpoint/hop
     // parent fact first so multi-hop capability context is never truncated by a fixed slice.
     const isPriorityContinuationFact = (factId: string): boolean => {
