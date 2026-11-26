@@ -53,7 +53,7 @@ services:
     depends_on:
       - docker-proxy
     ports:
-      - "${KOVO_PORT:-8000}:8000"
+      - "${KOVO_BIND_HOST:-127.0.0.1}:${KOVO_PORT:-8000}:8000"
     environment:
       PORT: "8000"
       KOVO_PORT: "${KOVO_PORT:-8000}"
