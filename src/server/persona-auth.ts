@@ -1,7 +1,16 @@
+import { and, desc, eq, inArray, notInArray } from 'drizzle-orm'
 import { isLocalLabEnvEnabled } from '../domain.ts'
 import type { PersonaLoginAdapter, PersonaLoginConfig } from '../domain.ts'
 import { createHmac } from 'node:crypto'
-import { refreshBrowserSession } from './browser-session-auth.ts'
+import {
+  BrowserSessionRefreshBlockedError,
+  isVerifyPathModifiedByRun,
+  refreshBrowserSession,
+} from './browser-session-auth.ts'
+import type {
+  BrowserSessionChromiumLaunchOptions,
+  PlaywrightBrowserLike,
+} from './browser-session-auth.ts'
 import {
   EgressDeniedError,
   EgressGateway,
@@ -32,11 +41,14 @@ import type {
   PersonaStorageSnapshot,
   ResolvedPersona,
 } from './persona-vault.ts'
-import { bundleSecrets, frameForSessionOrigin } from './persona-vault.ts'
+import { bundleSecrets, extractScrubbableCookieMapNeedles, frameForSessionOrigin } from './persona-vault.ts'
 import { globalKillSwitch, KillSwitchTrippedError } from './kill-switch.ts'
 import type { GlobalKillSwitch } from './kill-switch.ts'
 import { isCredentialScopeHost, normalizeHostname, registrableDomain } from './public-suffix.ts'
 import { redact } from './redact.ts'
+import { brokerExchanges, projectAssets, runs } from './schema.ts'
+import { normalizeScopeOrigin } from './scope-policy.ts'
+import type { ScopePolicy } from './scope-policy.ts'
 import type { Store } from './store.ts'
 
 export { classifyAddress, createPinnedLookup } from './egress-gateway.ts'
@@ -142,6 +154,8 @@ export interface PersonaAuthManagerOptions {
    */
   fetchImpl?: typeof fetch
   launchBrowser?: (pinnedHosts?: ReadonlyMap<string, readonly string[]>) => Promise<PlaywrightFormBrowserLike>
+  /** Injectable Chromium launcher for universal `browser_session` refresh (deterministic contract tests). */
+  launchBrowserSession?: (opts: BrowserSessionChromiumLaunchOptions) => Promise<PlaywrightBrowserLike>
   timeoutMs?: number
   /** Minimum interval between broker-invoked 401 re-auths per persona (default 60s). */
   reauthMinIntervalMs?: number
@@ -1956,6 +1970,7 @@ export class PersonaAuthManager {
   private readonly fetchImplInjected: boolean
   private readonly resolveHostInjected: boolean
   private readonly launchBrowser: (pinnedHosts?: ReadonlyMap<string, readonly string[]>) => Promise<PlaywrightFormBrowserLike>
+  private readonly launchBrowserSession?: (opts: BrowserSessionChromiumLaunchOptions) => Promise<PlaywrightBrowserLike>
   private readonly timeoutMs: number
   private readonly reauthMinIntervalMs: number
   private readonly resolveHost: (hostname: string) => Promise<string[]>
@@ -1971,6 +1986,7 @@ export class PersonaAuthManager {
     this.resolveHostInjected = Boolean(options.resolveHost)
     this.fetchImpl = options.fetchImpl
     this.launchBrowser = options.launchBrowser ?? launchDefaultChromium
+    this.launchBrowserSession = options.launchBrowserSession
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
     // Legacy pacing for raw registerReauth() handlers only. Session clones (the product path)
     // coordinate through PersonaSessionPool generations + per-entry pacing/circuit breaker.
@@ -2408,6 +2424,7 @@ export class PersonaAuthManager {
     projectId: string,
     personaId: string,
     signal?: AbortSignal,
+    runId?: string,
   ): Promise<AuthenticateResult> {
     const project = storage.project(projectId)
     const tenantId = project.tenantId ?? null
@@ -2450,7 +2467,7 @@ export class PersonaAuthManager {
         return null
       })()
       const browserTargetOrigin = preferredVerifyOrigin ?? defaultTargetOrigin
-      return await this.authenticateBrowserSession(storage, projectId, persona, browserCfg, browserTargetOrigin, signal, tenantId)
+      return await this.authenticateBrowserSession(storage, projectId, persona, browserCfg, browserTargetOrigin, signal, tenantId, runId)
     }
 
     const targetOrigin = defaultTargetOrigin
@@ -2521,6 +2538,128 @@ export class PersonaAuthManager {
   }
 
   /**
+   * R4-H-3: Derive mandatory host-side `ScopePolicy` and run-mutated paths (from `broker_exchanges`
+   * write exchanges) for unattended `refreshBrowserSession` invocations.
+   */
+  private resolveBrowserRefresherHostInputs(
+    storage: Store,
+    projectId: string,
+    persona: ResolvedPersona,
+    approvedIdpOrigins?: readonly string[],
+    explicitRunId?: string,
+  ): { scopePolicy: ScopePolicy; modifiedPaths: string[] } {
+    try {
+      storage.flushNow()
+    } catch {
+      // Best-effort flush before reading broker write exchanges.
+    }
+
+    const project = storage.project(projectId)
+    const terminalRunStatuses = ['complete', 'stopped', 'failed'] as const
+
+    let scopedRunId: string | null = null
+    if (explicitRunId) {
+      const match = storage.db
+        .select({ id: runs.id })
+        .from(runs)
+        .where(and(
+          eq(runs.id, explicitRunId),
+          eq(runs.projectId, project.id),
+          eq(runs.workspaceId, storage.workspace.id),
+        ))
+        .limit(1)
+        .get()
+      if (match) scopedRunId = match.id
+    }
+
+    const activeRunRows = storage.db
+      .select({ id: runs.id })
+      .from(runs)
+      .where(and(
+        eq(runs.projectId, project.id),
+        eq(runs.workspaceId, storage.workspace.id),
+        notInArray(runs.status, [...terminalRunStatuses]),
+      ))
+      .orderBy(desc(runs.createdAt))
+      .all()
+
+    if (!scopedRunId && activeRunRows.length > 0) {
+      scopedRunId = activeRunRows[0]!.id
+    }
+
+    const collectProjectTargetOrigins = (): string[] => {
+      const targetOriginSet = new Set<string>()
+      const addTarget = (raw: string | undefined) => {
+        if (!raw) return
+        const norm = normalizeScopeOrigin(raw)
+        if (norm) targetOriginSet.add(norm)
+      }
+      for (const seed of project.seeds ?? []) addTarget(seed)
+      for (const def of project.defaultScope ?? []) addTarget(def)
+      const assets = storage.db
+        .select({ origin: projectAssets.origin, thirdParty: projectAssets.thirdParty })
+        .from(projectAssets)
+        .where(eq(projectAssets.projectId, project.id))
+        .all()
+      for (const asset of assets) {
+        if (!asset.thirdParty) addTarget(asset.origin)
+      }
+      for (const allowed of persona.originAllowlist) addTarget(allowed)
+      return [...targetOriginSet]
+    }
+
+    let scopePolicy: ScopePolicy
+    if (scopedRunId) {
+      const runPolicy = storage.scopePolicy(scopedRunId)
+      scopePolicy = runPolicy.targetOrigins.length > 0
+        ? runPolicy
+        : { ...runPolicy, targetOrigins: collectProjectTargetOrigins() }
+    } else {
+      scopePolicy = {
+        mode: project.environment === 'local-lab' ? 'ephemeral_lab' : 'prod_readonly',
+        targetOrigins: collectProjectTargetOrigins(),
+        authOrigins: [...(approvedIdpOrigins ?? [])],
+        routeDenylist: [],
+      }
+    }
+
+    const runIdsForWrites = scopedRunId
+      ? [scopedRunId]
+      : activeRunRows.map(r => r.id)
+    const modifiedPathsSet = new Set<string>()
+    if (runIdsForWrites.length > 0) {
+      const readOnlyMethods = ['GET', 'HEAD', 'OPTIONS', 'TRACE', 'get', 'head', 'options', 'trace']
+      const writeRows = storage.db
+        .select({
+          origin: brokerExchanges.origin,
+          finalOrigin: brokerExchanges.finalOrigin,
+          pathAndQuery: brokerExchanges.pathAndQuery,
+        })
+        .from(brokerExchanges)
+        .where(and(
+          inArray(brokerExchanges.runId, runIdsForWrites),
+          notInArray(brokerExchanges.method, readOnlyMethods),
+        ))
+        .all()
+      for (const row of writeRows) {
+        const path = row.pathAndQuery?.trim()
+        if (!path || !path.startsWith('/')) continue
+        const normOrigin = normalizeScopeOrigin(row.origin)
+        if (normOrigin) modifiedPathsSet.add(`${normOrigin}${path}`)
+        const normFinal = normalizeScopeOrigin(row.finalOrigin)
+        if (normFinal && normFinal !== normOrigin) {
+          modifiedPathsSet.add(`${normFinal}${path}`)
+        }
+      }
+    }
+
+    return {
+      scopePolicy,
+      modifiedPaths: [...modifiedPathsSet],
+    }
+  }
+
+  /**
    * Universal, IdP-agnostic browser session authentication & auto-refresh.
    * Loads the persona's persisted Playwright `storageState` bundle into a headless Chromium
    * context routed through `EgressGateway.createLoopbackProxy`, visits `targetOrigin + verifyPath`
@@ -2535,6 +2674,7 @@ export class PersonaAuthManager {
     targetOrigin: string,
     signal?: AbortSignal,
     tenantId?: string | null,
+    runId?: string,
   ): Promise<AuthenticateResult> {
     const project = storage.project(projectId)
     const effectiveTenantId = tenantId !== undefined ? tenantId : (project.tenantId ?? null)
@@ -2571,22 +2711,36 @@ export class PersonaAuthManager {
         const ksBound = this.killSwitch.bindSignal(innerSignal ?? new AbortController().signal, effectiveTenantId)
         try {
           const { bundle } = readBrowserSessionCredentialFile(persona.secretPath!)
+          const { scopePolicy, modifiedPaths } = this.resolveBrowserRefresherHostInputs(
+            storage,
+            projectId,
+            persona,
+            approvedIdpOrigins,
+            runId,
+          )
+          const verifyPathModifiedByRun = isVerifyPathModifiedByRun(verifyPath, targetOrigin, modifiedPaths)
           const refreshed = await refreshBrowserSession({
             storageState: bundle.storageState,
             targetOrigin,
             originAllowlist: persona.originAllowlist,
             ...(approvedIdpOrigins && approvedIdpOrigins.length > 0 ? { idpOrigins: approvedIdpOrigins } : {}),
+            scopePolicy,
+            requireScopePolicy: true,
+            modifiedPaths,
+            verifyPathModifiedByRun,
             verifyPath,
             allowLocalLab,
             priorObservedHeaders: bundle.observedHeaders,
             persistBundlePath: persona.secretPath!,
             signal: ksBound.signal,
+            ...(this.launchBrowserSession ? { launchBrowser: this.launchBrowserSession } : {}),
             resolveHost: this.resolveHost,
           })
           writePersonaSessionFile(persona.sessionPath!, refreshed.session)
           return refreshed
         } catch (err) {
           if (err instanceof KillSwitchTrippedError) throw err
+          if (err instanceof BrowserSessionRefreshBlockedError) throw err
           if (this.killSwitch.isActive(effectiveTenantId)) this.killSwitch.assertAllowed(effectiveTenantId)
           if (err instanceof PersonaAuthError) throw err
           throw new PersonaAuthError(
@@ -3517,11 +3671,11 @@ export class PersonaAuthManager {
       return persistBearer(token, [])
     }
 
-    // 3. Set-Cookie session.
+    // 3. Set-Cookie session (R4-H-17: apply auth-relevant cookie-name quality rule per pair).
     const cookies = extractSetCookies(res.headers)
     if (cookies.size > 0) {
       const cookieHeader = cookiesToHeader(cookies)
-      const scrubTokens = [cookieHeader, ...cookies.values()]
+      const scrubTokens = extractScrubbableCookieMapNeedles(cookies)
       writePersonaSessionFile(persona.sessionPath!, {
         headerType: 'cookie',
         value: cookieHeader,
@@ -4299,7 +4453,7 @@ export class PersonaAuthManager {
         headerType: 'cookie',
         value: cookieHeader,
         adapterUsed: 'form',
-        scrubTokens: [cookieHeader, ...cookieMap.values(), ...harvested],
+        scrubTokens: [...extractScrubbableCookieMapNeedles(cookieMap), ...harvested],
       }
       writePersonaSessionFile(persona.sessionPath!, session)
 
@@ -4377,7 +4531,7 @@ export class PersonaAuthManager {
         if (runController.signal.aborted) {
           throw (runController.signal.reason instanceof Error ? runController.signal.reason : new PersonaAuthError('AUTH_FAILED', 'Run authentication aborted.'))
         }
-        const result = await this.authenticatePersona(storage, projectId, persona.id, runController.signal)
+        const result = await this.authenticatePersona(storage, projectId, persona.id, runController.signal, runId)
         results.push(result)
         const reauthRefresh = result.refresh
         const reloadSession = (): MintedPersonaSession | null => {
@@ -4394,7 +4548,7 @@ export class PersonaAuthManager {
             : runController.signal
           if (effectiveSignal.aborted) return null
           if (reauthRefresh) await reauthRefresh(effectiveSignal)
-          else await this.authenticatePersona(storage, projectId, persona.id, effectiveSignal)
+          else await this.authenticatePersona(storage, projectId, persona.id, effectiveSignal, runId)
           return reloadSession()
         }
         const onRefreshError = (err: unknown) => {
@@ -4553,7 +4707,7 @@ export class PersonaAuthManager {
         throw (controller.signal.reason instanceof Error ? controller.signal.reason : new PersonaAuthError('AUTH_FAILED', 'Ephemeral session bootstrap aborted.'))
       }
       try {
-        const authRes = await this.authenticatePersona(storage, opts.projectId, persona.id, controller.signal)
+        const authRes = await this.authenticatePersona(storage, opts.projectId, persona.id, controller.signal, scopeId)
         const reloadSession = (): MintedPersonaSession | null => {
           try {
             return resolveRunPersonas(storage, opts.projectId, [persona.id]).get(persona.handle)?.session ?? null
@@ -4579,7 +4733,7 @@ export class PersonaAuthManager {
             : controller.signal
           if (effectiveSignal.aborted) return null
           if (reauthRefresh) await reauthRefresh(effectiveSignal)
-          else await this.authenticatePersona(storage, opts.projectId, persona.id, effectiveSignal)
+          else await this.authenticatePersona(storage, opts.projectId, persona.id, effectiveSignal, scopeId)
           return reloadSession()
         }
         this.registerSession(persona.handle, {
