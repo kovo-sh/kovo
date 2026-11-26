@@ -119,40 +119,566 @@ export function redactExactSecrets(value: string, key: string, secrets: SecretSo
 }
 
 /**
- * Copy-on-write recursive exact-secret scrubber over structured JSON payloads (H-8 / H-25).
- * Replaces ONLY exact known secrets (and encoded variants) with ZERO heuristic regexes and ZERO
- * header/key clobbering, returning the original object reference when unchanged.
+ * Null-prototype-safe own data property setter (never mutates prototype on `__proto__` or
+ * crashes on reserved keys such as `constructor` / `toString` / `hasOwnProperty`).
+ */
+function setOwnProperty(target: Record<string, unknown>, key: string, value: unknown): void {
+  Object.defineProperty(target, key, {
+    value,
+    writable: true,
+    enumerable: true,
+    configurable: true,
+  })
+}
+
+function ownValue(record: Fields, key: string): unknown {
+  return Object.prototype.hasOwnProperty.call(record, key) ? record[key] : undefined
+}
+
+function patchRecord(record: Fields, patches: ReadonlyMap<string, unknown>): Fields {
+  if (patches.size === 0) return record
+  const out: Fields = {}
+  for (const key of Object.keys(record)) {
+    setOwnProperty(out, key, patches.has(key) ? patches.get(key) : record[key])
+  }
+  return out
+}
+
+/**
+ * Copy-on-write recursive exact-secret scrubber over arbitrary JSON values that scrubs ONLY
+ * string leaf values and NEVER mutates object keys (R3-H-10). Safe with null-prototype objects
+ * and reserved keys (`__proto__`, `constructor`, `toString`).
+ */
+function scrubStringValuesOnly(node: unknown, scrubString: (value: string) => string): unknown {
+  if (typeof node === 'string') return scrubString(node)
+  if (Array.isArray(node)) {
+    let changed = false
+    const mapped = node.map(item => {
+      const next = scrubStringValuesOnly(item, scrubString)
+      if (next !== item) changed = true
+      return next
+    })
+    return changed ? mapped : node
+  }
+  const rec = fields(node)
+  if (!rec) return node
+  let changed = false
+  const out: Fields = {}
+  for (const key of Object.keys(rec)) {
+    const val = rec[key]
+    const nextVal = scrubStringValuesOnly(val, scrubString)
+    if (nextVal !== val) changed = true
+    setOwnProperty(out, key, nextVal)
+  }
+  return changed ? out : node
+}
+
+/**
+ * Scrubs exact secrets ONLY inside JSON string values of a serialized tool-call `arguments`
+ * payload, never mutating JSON object keys or structure. Preserves exact original string when
+ * unchanged. Falls back to string scrubbing only when `raw` is not valid JSON.
+ */
+function scrubJsonStringValues(raw: string, scrubString: (value: string) => string): string {
+  if (!raw) return raw
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return scrubString(raw)
+  }
+  if (typeof parsed === 'string') {
+    const next = scrubString(parsed)
+    return next === parsed ? raw : JSON.stringify(next)
+  }
+  if (!parsed || typeof parsed !== 'object') return raw
+  const next = scrubStringValuesOnly(parsed, scrubString)
+  return next === parsed ? raw : JSON.stringify(next)
+}
+
+function scrubContentBlock(block: unknown, scrubString: (value: string) => string): unknown {
+  if (typeof block === 'string') return scrubString(block)
+  const rec = fields(block)
+  if (!rec) return block
+  const blockType = ownValue(rec, 'type')
+  const type = typeof blockType === 'string' ? blockType : ''
+
+  // Protocol / opaque / binary blocks: never mutate.
+  if (
+    type === 'redacted_thinking' ||
+    type === 'input_image' ||
+    type === 'image' ||
+    type === 'tool_addition' ||
+    type === 'tool_removal'
+  ) {
+    return block
+  }
+
+  const patches = new Map<string, unknown>()
+  if (type === 'text' || type === 'input_text' || type === 'output_text' || type === 'summary_text') {
+    const text = ownValue(rec, 'text')
+    if (typeof text === 'string') {
+      const next = scrubString(text)
+      if (next !== text) patches.set('text', next)
+    }
+    return patchRecord(rec, patches)
+  }
+
+  if (type === 'refusal') {
+    const refusal = ownValue(rec, 'refusal')
+    if (typeof refusal === 'string') {
+      const next = scrubString(refusal)
+      if (next !== refusal) patches.set('refusal', next)
+    }
+    return patchRecord(rec, patches)
+  }
+
+  if (type === 'thinking') {
+    // Scrub thinking prose only; NEVER touch opaque cryptographic `signature` or `type`.
+    const thinking = ownValue(rec, 'thinking')
+    if (typeof thinking === 'string') {
+      const next = scrubString(thinking)
+      if (next !== thinking) patches.set('thinking', next)
+    }
+    return patchRecord(rec, patches)
+  }
+
+  if (type === 'tool_use') {
+    // Scrub only string values inside `input`; NEVER mutate keys, `type`, `id`, or `name`.
+    const input = ownValue(rec, 'input')
+    if (input !== undefined) {
+      const next = scrubStringValuesOnly(input, scrubString)
+      if (next !== input) patches.set('input', next)
+    }
+    return patchRecord(rec, patches)
+  }
+
+  if (type === 'tool_result') {
+    const content = ownValue(rec, 'content')
+    if (typeof content === 'string') {
+      const next = scrubString(content)
+      if (next !== content) patches.set('content', next)
+    } else if (Array.isArray(content)) {
+      const next = scrubContentBlocks(content, scrubString)
+      if (next !== content) patches.set('content', next)
+    }
+    return patchRecord(rec, patches)
+  }
+
+  if (type === 'document') {
+    for (const fieldName of ['title', 'context'] as const) {
+      const val = ownValue(rec, fieldName)
+      if (typeof val === 'string') {
+        const next = scrubString(val)
+        if (next !== val) patches.set(fieldName, next)
+      }
+    }
+    const source = fields(ownValue(rec, 'source'))
+    if (source && ownValue(source, 'type') === 'text') {
+      const data = ownValue(source, 'data')
+      if (typeof data === 'string') {
+        const nextData = scrubString(data)
+        if (nextData !== data) {
+          patches.set('source', patchRecord(source, new Map([['data', nextData]])))
+        }
+      }
+    }
+    return patchRecord(rec, patches)
+  }
+
+  // Fallback for unknown content blocks: scrub only a `text` string leaf if present; never keys/type.
+  const fallbackText = ownValue(rec, 'text')
+  if (typeof fallbackText === 'string') {
+    const next = scrubString(fallbackText)
+    if (next !== fallbackText) patches.set('text', next)
+  }
+  return patchRecord(rec, patches)
+}
+
+function scrubContentBlocks(blocks: unknown[], scrubString: (value: string) => string): unknown[] {
+  let changed = false
+  const mapped = blocks.map(block => {
+    const next = scrubContentBlock(block, scrubString)
+    if (next !== block) changed = true
+    return next
+  })
+  return changed ? mapped : blocks
+}
+
+function scrubChatToolCalls(toolCalls: unknown[], scrubString: (value: string) => string): unknown[] {
+  let changed = false
+  const mapped = toolCalls.map(entry => {
+    const tc = fields(entry)
+    if (!tc) return entry
+    const fn = fields(ownValue(tc, 'function'))
+    if (!fn) return entry
+    const args = ownValue(fn, 'arguments')
+    if (typeof args !== 'string') return entry
+    const nextArgs = scrubJsonStringValues(args, scrubString)
+    if (nextArgs === args) return entry
+    changed = true
+    return patchRecord(tc, new Map([['function', patchRecord(fn, new Map([['arguments', nextArgs]]))]]))
+  })
+  return changed ? mapped : toolCalls
+}
+
+function scrubOutboundItem(item: unknown, scrubString: (value: string) => string): unknown {
+  if (typeof item === 'string') return scrubString(item)
+  const rec = fields(item)
+  if (!rec) return item
+  const itemType = ownValue(rec, 'type')
+  const type = typeof itemType === 'string' ? itemType : ''
+
+  // Protocol-only items (tool definitions, effort updates, tool search): never touch.
+  if (
+    type === 'additional_tools' ||
+    type === 'configuration_update' ||
+    type === 'tool_search_call' ||
+    type === 'tool_search_output' ||
+    type === 'tool_addition' ||
+    type === 'tool_removal'
+  ) {
+    return item
+  }
+
+  const patches = new Map<string, unknown>()
+
+  if (type === 'function_call') {
+    const args = ownValue(rec, 'arguments')
+    if (typeof args === 'string') {
+      const next = scrubJsonStringValues(args, scrubString)
+      if (next !== args) patches.set('arguments', next)
+    } else if (args && typeof args === 'object') {
+      const next = scrubStringValuesOnly(args, scrubString)
+      if (next !== args) patches.set('arguments', next)
+    }
+    return patchRecord(rec, patches)
+  }
+
+  if (type === 'custom_tool_call') {
+    const input = ownValue(rec, 'input')
+    if (typeof input === 'string') {
+      const next = scrubString(input)
+      if (next !== input) patches.set('input', next)
+    } else if (input && typeof input === 'object') {
+      const next = scrubStringValuesOnly(input, scrubString)
+      if (next !== input) patches.set('input', next)
+    }
+    return patchRecord(rec, patches)
+  }
+
+  if (type === 'function_call_output' || type === 'custom_tool_call_output') {
+    const output = ownValue(rec, 'output')
+    if (typeof output === 'string') {
+      const next = scrubString(output)
+      if (next !== output) patches.set('output', next)
+    } else if (Array.isArray(output)) {
+      const next = scrubContentBlocks(output, scrubString)
+      if (next !== output) patches.set('output', next)
+    }
+    return patchRecord(rec, patches)
+  }
+
+  if (type === 'reasoning') {
+    // Scrub human-readable summary text only; NEVER touch `encrypted_content`, `id`, `status`, `type`.
+    const summary = ownValue(rec, 'summary')
+    if (Array.isArray(summary)) {
+      const next = scrubContentBlocks(summary, scrubString)
+      if (next !== summary) patches.set('summary', next)
+    }
+    return patchRecord(rec, patches)
+  }
+
+  // Message items (OpenAI Responses `type: 'message'` or `role`, Anthropic Messages `role`).
+  const role = ownValue(rec, 'role')
+  if (type === 'message' || typeof role === 'string') {
+    const content = ownValue(rec, 'content')
+    if (typeof content === 'string') {
+      const next = scrubString(content)
+      if (next !== content) patches.set('content', next)
+    } else if (Array.isArray(content)) {
+      const next = scrubContentBlocks(content, scrubString)
+      if (next !== content) patches.set('content', next)
+    }
+    const toolCalls = ownValue(rec, 'tool_calls')
+    if (Array.isArray(toolCalls)) {
+      const next = scrubChatToolCalls(toolCalls, scrubString)
+      if (next !== toolCalls) patches.set('tool_calls', next)
+    }
+    return patchRecord(rec, patches)
+  }
+
+  return item
+}
+
+function isProviderRequestPayload(value: unknown): value is Record<string, unknown> {
+  const rec = fields(value)
+  if (!rec) return false
+  return (
+    typeof ownValue(rec, 'model') === 'string' ||
+    Array.isArray(ownValue(rec, 'input')) ||
+    Array.isArray(ownValue(rec, 'messages')) ||
+    typeof ownValue(rec, 'instructions') === 'string' ||
+    Array.isArray(ownValue(rec, 'tools')) ||
+    ownValue(rec, 'tool_choice') !== undefined ||
+    ownValue(rec, 'reasoning') !== undefined
+  )
+}
+
+/**
+ * Structural copy-on-write exact-secret scrubber for outbound LLM provider requests (R3-H-10 / H-8).
+ *
+ * Walks ONLY content-bearing leaves:
+ *  - top-level `instructions` (string) and `system` (string or content blocks)
+ *  - `input` (string or OpenAI Responses items: message `content`/`text`/`refusal`,
+ *    `function_call.arguments` JSON string values, `custom_tool_call.input`,
+ *    `function_call_output.output`, `custom_tool_call_output.output`, `reasoning.summary[].text`)
+ *  - `messages` (Anthropic Messages / chat items: `content`, `tool_use.input` values,
+ *    `tool_result.content`, `thinking.thinking`, `tool_calls[].function.arguments`)
+ *
+ * NEVER rewrites object keys or protocol/structural metadata (`model`, `role`, `type`,
+ * `tool_choice`, `reasoning.effort`, `reasoning.summary`, `thinking.type`, `tools` definitions
+ * and JSON schemas, `status`, `id`, `call_id`, `tool_use_id`, `signature`, `encrypted_content`).
+ */
+export function scrubOutboundProviderRequest(
+  payload: Record<string, unknown>,
+  key: string,
+  secrets: SecretSource = [],
+): Record<string, unknown> {
+  const rec = fields(payload)
+  if (!rec) return payload
+  const resolved = resolveSecretSource(secrets)
+  const scrubString = (text: string): string => redactSecrets(text, resolved, { providerKey: key })
+  const patches = new Map<string, unknown>()
+
+  const instructions = ownValue(rec, 'instructions')
+  if (typeof instructions === 'string') {
+    const next = scrubString(instructions)
+    if (next !== instructions) patches.set('instructions', next)
+  }
+
+  const system = ownValue(rec, 'system')
+  if (typeof system === 'string') {
+    const next = scrubString(system)
+    if (next !== system) patches.set('system', next)
+  } else if (Array.isArray(system)) {
+    const next = scrubContentBlocks(system, scrubString)
+    if (next !== system) patches.set('system', next)
+  }
+
+  const input = ownValue(rec, 'input')
+  if (typeof input === 'string') {
+    const next = scrubString(input)
+    if (next !== input) patches.set('input', next)
+  } else if (Array.isArray(input)) {
+    let changed = false
+    const mapped = input.map(item => {
+      const next = scrubOutboundItem(item, scrubString)
+      if (next !== item) changed = true
+      return next
+    })
+    if (changed) patches.set('input', mapped)
+  }
+
+  const messages = ownValue(rec, 'messages')
+  if (Array.isArray(messages)) {
+    let changed = false
+    const mapped = messages.map(item => {
+      const next = scrubOutboundItem(item, scrubString)
+      if (next !== item) changed = true
+      return next
+    })
+    if (changed) patches.set('messages', mapped)
+  }
+
+  return patchRecord(rec, patches)
+}
+
+const REDACTION_PLACEHOLDER_RE = /\[persona:[^\]]+\]|\[redacted(?::[^\]]+)?\]/
+
+function valueHasRedactionPlaceholder(value: unknown): boolean {
+  if (typeof value === 'string') return REDACTION_PLACEHOLDER_RE.test(value)
+  if (Array.isArray(value)) return value.some(valueHasRedactionPlaceholder)
+  const rec = fields(value)
+  if (!rec) return false
+  for (const key of Object.keys(rec)) {
+    if (REDACTION_PLACEHOLDER_RE.test(key) || valueHasRedactionPlaceholder(rec[key])) return true
+  }
+  return false
+}
+
+function stableJsonEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true
+  try {
+    return JSON.stringify(a) === JSON.stringify(b)
+  } catch {
+    return false
+  }
+}
+
+const PROTECTED_TOP_LEVEL_FIELDS = [
+  'model',
+  'tool_choice',
+  'reasoning',
+  'thinking',
+  'output_config',
+  'tools',
+  'stream',
+  'store',
+  'include',
+  'betas',
+  'fallbacks',
+  'thread',
+  'service_tier',
+] as const
+
+const PLACEHOLDER_FORBIDDEN_TOP_LEVEL_FIELDS = [
+  'model',
+  'tool_choice',
+  'reasoning',
+  'thinking',
+  'output_config',
+] as const
+
+const PROTECTED_ITEM_FIELDS = [
+  'type',
+  'role',
+  'id',
+  'call_id',
+  'name',
+  'status',
+  'phase',
+  'namespace',
+  'output_config',
+  'encrypted_content',
+] as const
+
+const PROTECTED_BLOCK_FIELDS = [
+  'type',
+  'id',
+  'name',
+  'tool_use_id',
+  'is_error',
+  'cache_control',
+  'signature',
+] as const
+
+function verifyBlocksIntegrity(
+  origBlocks: unknown[],
+  nextBlocks: unknown[],
+  basePath: string,
+): string | null {
+  if (origBlocks.length !== nextBlocks.length) return `${basePath}.length`
+  for (let j = 0; j < origBlocks.length; j++) {
+    const origBlock = fields(origBlocks[j])
+    const nextBlock = fields(nextBlocks[j])
+    if (!origBlock || !nextBlock) continue
+    for (const fieldName of PROTECTED_BLOCK_FIELDS) {
+      const ov = ownValue(origBlock, fieldName)
+      const nv = ownValue(nextBlock, fieldName)
+      if (!stableJsonEqual(ov, nv)) return `${basePath}[${j}].${fieldName}`
+      if (nv !== undefined && valueHasRedactionPlaceholder(nv)) return `${basePath}[${j}].${fieldName}`
+    }
+    if (ownValue(origBlock, 'type') === 'redacted_thinking') {
+      if (!stableJsonEqual(ownValue(origBlock, 'data'), ownValue(nextBlock, 'data'))) {
+        return `${basePath}[${j}].data`
+      }
+    }
+    const origChild = ownValue(origBlock, 'content')
+    const nextChild = ownValue(nextBlock, 'content')
+    if (Array.isArray(origChild) && Array.isArray(nextChild)) {
+      const nested = verifyBlocksIntegrity(origChild, nextChild, `${basePath}[${j}].content`)
+      if (nested) return nested
+    }
+  }
+  return null
+}
+
+/**
+ * Verifies that local outbound scrubbing never mutated protected protocol/structural fields
+ * or introduced redaction placeholders into protocol metadata (R3-H-10).
+ * Returns `null` when intact, or the violated field path when corrupted.
+ */
+export function verifyOutboundProviderRequestIntegrity(
+  original: Record<string, unknown>,
+  scrubbed: Record<string, unknown>,
+): string | null {
+  const origRec = fields(original)
+  const nextRec = fields(scrubbed)
+  if (!origRec || !nextRec) return 'payload'
+
+  const origKeys = Object.keys(origRec)
+  const nextKeys = Object.keys(nextRec)
+  if (origKeys.length !== nextKeys.length || origKeys.some((k, idx) => nextKeys[idx] !== k)) {
+    return 'top-level keys'
+  }
+
+  for (const fieldName of PROTECTED_TOP_LEVEL_FIELDS) {
+    if (!stableJsonEqual(ownValue(origRec, fieldName), ownValue(nextRec, fieldName))) {
+      return fieldName
+    }
+  }
+  for (const fieldName of PLACEHOLDER_FORBIDDEN_TOP_LEVEL_FIELDS) {
+    const val = ownValue(nextRec, fieldName)
+    if (val !== undefined && valueHasRedactionPlaceholder(val)) {
+      return fieldName
+    }
+  }
+
+  const origSystem = ownValue(origRec, 'system')
+  const nextSystem = ownValue(nextRec, 'system')
+  if (Array.isArray(origSystem) && Array.isArray(nextSystem)) {
+    const sysErr = verifyBlocksIntegrity(origSystem, nextSystem, 'system')
+    if (sysErr) return sysErr
+  }
+
+  for (const listKey of ['input', 'messages'] as const) {
+    const origList = ownValue(origRec, listKey)
+    const nextList = ownValue(nextRec, listKey)
+    if (!Array.isArray(origList) || !Array.isArray(nextList)) continue
+    if (origList.length !== nextList.length) return `${listKey}.length`
+    for (let i = 0; i < origList.length; i++) {
+      const origItem = fields(origList[i])
+      const nextItem = fields(nextList[i])
+      if (!origItem || !nextItem) continue
+      for (const fieldName of PROTECTED_ITEM_FIELDS) {
+        const ov = ownValue(origItem, fieldName)
+        const nv = ownValue(nextItem, fieldName)
+        if (!stableJsonEqual(ov, nv)) return `${listKey}[${i}].${fieldName}`
+        if (nv !== undefined && valueHasRedactionPlaceholder(nv)) return `${listKey}[${i}].${fieldName}`
+      }
+      const origContent = ownValue(origItem, 'content')
+      const nextContent = ownValue(nextItem, 'content')
+      if (Array.isArray(origContent) && Array.isArray(nextContent)) {
+        const blockErr = verifyBlocksIntegrity(origContent, nextContent, `${listKey}[${i}].content`)
+        if (blockErr) return blockErr
+      }
+      const origOutput = ownValue(origItem, 'output')
+      const nextOutput = ownValue(nextItem, 'output')
+      if (Array.isArray(origOutput) && Array.isArray(nextOutput)) {
+        const outErr = verifyBlocksIntegrity(origOutput, nextOutput, `${listKey}[${i}].output`)
+        if (outErr) return outErr
+      }
+    }
+  }
+  return null
+}
+
+/**
+ * Copy-on-write exact-secret scrubber over structured JSON payloads (H-8 / H-25 / R3-H-10).
+ * For outbound provider request payloads, scrubs ONLY content-bearing leaves and never mutates
+ * keys or protocol metadata. For generic JSON values, scrubs string values only (never keys)
+ * with null-prototype safety, returning the original object reference when unchanged.
  */
 export function scrubExactSecretsValue(
   value: unknown,
   key: string,
   secrets: SecretSource = [],
 ): unknown {
-  const resolved = resolveSecretSource(secrets)
-  const walk = (node: unknown): unknown => {
-    if (typeof node === 'string') return redactSecrets(node, resolved, { providerKey: key })
-    if (Array.isArray(node)) {
-      let changed = false
-      const mapped = node.map(item => {
-        const next = walk(item)
-        if (next !== item) changed = true
-        return next
-      })
-      return changed ? mapped : node
-    }
-    if (!node || typeof node !== 'object') return node
-    const rec = node as Record<string, unknown>
-    let changed = false
-    const out: Record<string, unknown> = {}
-    for (const [k, v] of Object.entries(rec)) {
-      const nextK = redactSecrets(k, resolved, { providerKey: key })
-      const nextV = walk(v)
-      if (nextK !== k || nextV !== v) changed = true
-      out[nextK] = nextV
-    }
-    return changed ? out : node
+  if (isProviderRequestPayload(value)) {
+    return scrubOutboundProviderRequest(value, key, secrets)
   }
-  return walk(value)
+  const resolved = resolveSecretSource(secrets)
+  return scrubStringValuesOnly(value, text => redactSecrets(text, resolved, { providerKey: key }))
 }
 
 /**
@@ -171,16 +697,17 @@ function sanitizeToolArgumentValue(
 ): unknown {
   if (typeof value === 'string') return redactSecrets(value, secrets, { providerKey: key })
   if (Array.isArray(value)) return value.map(item => sanitizeToolArgumentValue(item, key, secrets, inHeadersMap))
-  if (!value || typeof value !== 'object') return value
+  const rec = fields(value)
+  if (!rec) return value
   const out: Record<string, unknown> = {}
-  for (const [fieldKey, item] of Object.entries(value as Record<string, unknown>)) {
-    const safeKey = redactSecrets(fieldKey, secrets, { providerKey: key })
+  for (const fieldKey of Object.keys(rec)) {
+    const item = rec[fieldKey]
     if (!inHeadersMap && rawCookieField.test(fieldKey) && typeof item === 'string') {
-      out[safeKey] = replacement
+      setOwnProperty(out, fieldKey, replacement)
       continue
     }
     const childInHeaders = inHeadersMap || toolArgHeaderMapKeys.has(fieldKey)
-    out[safeKey] = sanitizeToolArgumentValue(item, key, secrets, childInHeaders)
+    setOwnProperty(out, fieldKey, sanitizeToolArgumentValue(item, key, secrets, childInHeaders))
   }
   return out
 }

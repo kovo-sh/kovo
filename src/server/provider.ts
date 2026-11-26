@@ -14,7 +14,8 @@ import {
   resolveSecretSource,
   sanitizeProviderStream,
   sanitizeProviderValue,
-  scrubExactSecretsValue,
+  scrubOutboundProviderRequest,
+  verifyOutboundProviderRequestIntegrity,
 } from './provider-stream.ts'
 import type { SecretSource } from './provider-stream.ts'
 import { redact } from './redact.ts'
@@ -385,6 +386,56 @@ export class BudgetExceededError extends Error {
   }
 }
 
+export class ProviderRequestMutationError extends Error {
+  readonly status = 400
+  constructor(message: string) {
+    super(message)
+    this.name = 'ProviderRequestMutationError'
+  }
+}
+
+const LOCAL_MUTATION_400_PLACEHOLDER_RE = /\[persona:[^\]]+\]|\[redacted(?::[^\]]+)?\]/
+const LOCAL_MUTATION_400_SCHEMA_RE = /(?:invalid_value|invalid_request_error|invalid enum|expected one of|must be one of|unknown (?:role|type|variant|field)|unrecognized|not valid json|\brole\b|\btool_choice\b|\breasoning(?:\.(?:effort|summary))?\b|\binput_text\b|\boutput_text\b)/i
+
+function extractConciseProviderErrorDetail(errText: string, key: string, secrets: readonly NamedSecret[]): string {
+  let detail = ''
+  if (errText) {
+    try {
+      const parsed = JSON.parse(errText) as { error?: { message?: unknown } | string; message?: unknown }
+      if (parsed && typeof parsed === 'object') {
+        if (parsed.error && typeof parsed.error === 'object' && typeof parsed.error.message === 'string') {
+          detail = parsed.error.message
+        } else if (typeof parsed.error === 'string') {
+          detail = parsed.error
+        } else if (typeof parsed.message === 'string') {
+          detail = parsed.message
+        }
+      }
+    } catch {
+      detail = errText
+    }
+  }
+  const normalized = detail.replace(/\s+/g, ' ').trim()
+  if (!normalized) return ''
+  return redactProviderText(normalized, key, secrets).slice(0, 200)
+}
+
+function diagnoseLocalMutation400(
+  errText: string,
+  locallyMutated: boolean,
+  key: string,
+  secrets: readonly NamedSecret[],
+): string | null {
+  if (!errText) return null
+  const echoesPlaceholder = LOCAL_MUTATION_400_PLACEHOLDER_RE.test(errText)
+  const schemaFailureAfterMutation = locallyMutated && LOCAL_MUTATION_400_SCHEMA_RE.test(errText)
+  if (!echoesPlaceholder && !schemaFailureAfterMutation) return null
+  const detail = extractConciseProviderErrorDetail(errText, key, secrets)
+  return detail
+    ? `Local provider request mutation caused HTTP 400: ${detail}`
+    : 'Local provider request mutation caused HTTP 400 (provider rejected locally modified request payload).'
+}
+
 export function isQuotaBody(body: string): boolean {
   const lower = body.toLowerCase()
   if (
@@ -727,11 +778,19 @@ function makeFetch(
       throw new Error('The model request exceeded Kovo Hunter’s size limit.')
     }
     const payload = JSON.parse(raw) as Record<string, unknown>
-    // H-8: Scrub live registered/rotated secrets from outbound model requests via exact-only
-    // matching (zero heuristics so JSON structure and tool-call code remain byte-intact).
+    // R3-H-10 / H-8: Scrub live registered/rotated secrets EXCLUSIVELY from content-bearing
+    // leaves in outbound model requests (never object keys, roles, types, enums, tool_choice,
+    // reasoning config, or tool definitions/schemas).
     const currentSecrets = getSecrets()
-    const scrubbedPayload = scrubExactSecretsValue(payload, settings.key, currentSecrets) as Record<string, unknown>
-    const outboundRaw = scrubbedPayload === payload ? raw : JSON.stringify(scrubbedPayload)
+    const scrubbedPayload = scrubOutboundProviderRequest(payload, settings.key, currentSecrets)
+    const integrityViolation = verifyOutboundProviderRequestIntegrity(payload, scrubbedPayload)
+    if (integrityViolation) {
+      throw new ProviderRequestMutationError(
+        `Local provider request integrity check failed: protected protocol field "${integrityViolation}" was corrupted before egress.`,
+      )
+    }
+    const locallyMutated = scrubbedPayload !== payload
+    const outboundRaw = locallyMutated ? JSON.stringify(scrubbedPayload) : raw
     if (outboundRaw !== raw && Buffer.byteLength(outboundRaw) > maxRequestBytes) {
       throw new Error('The model request exceeded Kovo Hunter’s size limit.')
     }
@@ -844,6 +903,9 @@ function makeFetch(
             emitTelemetry({ outcome: 'error', costUsd: 0 })
             if (internal.attemptTelemetryState) internal.attemptTelemetryState.recorded = true
           }
+          const localMutationDiagnostic = effectiveStatus === 400
+            ? diagnoseLocalMutation400(errText, locallyMutated, settings.key, currentSecrets)
+            : null
           const message = effectiveStatus === 401 || effectiveStatus === 403
             ? 'The provider rejected the API key.'
             : effectiveStatus === 402
@@ -852,7 +914,7 @@ function makeFetch(
                 ? 'The provider endpoint or model was not found.'
                 : effectiveStatus === 429
                   ? 'The provider rate limit was reached.'
-                  : `The model provider returned HTTP ${effectiveStatus}.`
+                  : localMutationDiagnostic ?? `The model provider returned HTTP ${effectiveStatus}.`
           const error = JSON.stringify({ error: { message } })
           recordResponse?.(error)
           return new Response(error, { status: effectiveStatus, headers: { 'content-type': 'application/json' } })
@@ -1318,7 +1380,7 @@ export function classifyFailoverError(message: string): { failover: boolean; har
   if (/aborted due to timeout/i.test(message)) {
     return { failover: true, hard: false }
   }
-  if (/aborted|cancelled|canceled|budget|exceeded Kovo Hunter’s size limit|Unexpected model endpoint|refused by SSRF policy|never permitted|Plaintext HTTP egress|without local-lab or explicit loopback/i.test(message)) {
+  if (/aborted|cancelled|canceled|budget|exceeded Kovo Hunter’s size limit|Unexpected model endpoint|Local provider request|refused by SSRF policy|never permitted|Plaintext HTTP egress|without local-lab or explicit loopback/i.test(message)) {
     return { failover: false, hard: false }
   }
   if (/rejected the API key|quota|credit balance|401|402|403|404|not found/i.test(message)) {
