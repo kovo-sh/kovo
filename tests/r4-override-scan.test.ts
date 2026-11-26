@@ -1,3 +1,4 @@
+// @kernel @fixes R4-H-14
 /**
  * R4-H-14 regression & stress guard:
  *  - Eliminates the quadratic `[^\r\n]*\bname` multipart regex DoS in `src/server/scope-policy.ts`.

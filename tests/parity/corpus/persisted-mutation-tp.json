@@ -3,6 +3,20 @@
   "side": "tp",
   "archetype": "mass-assignment-persisted-mutation",
   "description": "Mass assignment PATCH returns lightweight ok:true ack followed by substantive GET readback proving persisted protected owner_id change.",
+  "covers": {
+    "files": [
+      "src/server/floor-recipe-engine.ts",
+      "src/server/host-fact-log.ts",
+      "src/server/oracle-invariants.ts",
+      "src/server/proof-receipt.ts",
+      "src/server/replay-verifier.ts",
+      "src/server/verify-claims.ts",
+      "src/server/verify-prove-handlers.ts"
+    ],
+    "classes": [
+      "mass_assignment"
+    ]
+  },
   "canonicalLabel": {
     "cwe": "CWE-915",
     "category": "mass-assignment",
@@ -46,7 +60,9 @@
       "persona": "member_a",
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"id\":\"42\",\"owner_id\":\"u1\",\"status\":\"open\",\"amount\":1500}"
     },
     {
@@ -56,10 +72,14 @@
       "method": "PATCH",
       "pathAndQuery": "/api/invoices/42",
       "persona": "member_a",
-      "requestJson": { "owner_id": "u2" },
+      "requestJson": {
+        "owner_id": "u2"
+      },
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"ok\":true}"
     },
     {
@@ -71,7 +91,9 @@
       "persona": "member_a",
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"id\":\"42\",\"owner_id\":\"u2\",\"status\":\"open\",\"amount\":1500}"
     }
   ],
@@ -79,6 +101,12 @@
     "assertionsJq": "{ controlPassed: (.steps.before.json.owner_id == \"u1\"), confirmed: (.steps.prb.status == 200 and .steps.after.json.owner_id == \"u2\"), observed: .steps.after.json.owner_id, expected: \"u1\" }"
   },
   "claims": [
-    { "kind": "impact", "impactClass": "mass_assignment", "beforeExchangeId": "before", "probeExchangeId": "prb", "afterExchangeId": "after" }
+    {
+      "kind": "impact",
+      "impactClass": "mass_assignment",
+      "beforeExchangeId": "before",
+      "probeExchangeId": "prb",
+      "afterExchangeId": "after"
+    }
   ]
 }

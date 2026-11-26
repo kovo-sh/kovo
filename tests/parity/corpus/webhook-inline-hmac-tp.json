@@ -3,6 +3,18 @@
   "side": "tp",
   "archetype": "webhook-inline-hmac",
   "description": "Webhook receiver rejects a tampered inline signature with 401 while accepting and processing the same delivery signed with an attacker-supplied inline signing key.",
+  "covers": {
+    "files": [
+      "src/server/host-fact-log.ts",
+      "src/server/oracle-invariants.ts",
+      "src/server/proof-receipt.ts",
+      "src/server/verify-claims.ts",
+      "src/server/verify-support.ts"
+    ],
+    "classes": [
+      "webhook_forgery"
+    ]
+  },
   "canonicalLabel": {
     "cwe": "CWE-345",
     "category": "webhook-forgery",
@@ -38,11 +50,17 @@
       "requestJson": {
         "webhook_secret": "parity-inline-key-01",
         "signature": "0000000000000000000000000000000000000000000000000000000000000000",
-        "payload": { "event_id": "evt_parity_901", "type": "invoice.paid", "amount": 1500 }
+        "payload": {
+          "event_id": "evt_parity_901",
+          "type": "invoice.paid",
+          "amount": 1500
+        }
       },
       "status": 401,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"error\":\"invalid_signature\"}"
     },
     {
@@ -55,11 +73,17 @@
       "requestJson": {
         "webhook_secret": "parity-inline-key-01",
         "signature": "7c221e5306a6b1a25510235913b7de402da865263cc558dfae1dd88653b23fd9",
-        "payload": { "event_id": "evt_parity_901", "type": "invoice.paid", "amount": 1500 }
+        "payload": {
+          "event_id": "evt_parity_901",
+          "type": "invoice.paid",
+          "amount": 1500
+        }
       },
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"ok\":true,\"processed\":true,\"event_id\":\"evt_parity_901\",\"invoice_id\":\"inv_901\",\"credited_amount\":1500,\"ledger_note\":\"Settled via billing webhook\"}"
     }
   ],
@@ -70,6 +94,10 @@
     "claimedDelta": "Tampered inline HMAC was rejected with 401 while valid HMAC signed with caller-supplied inline key was accepted and processed."
   },
   "claims": [
-    { "kind": "boundary", "controlExchangeId": "ctl", "probeExchangeId": "prb" }
+    {
+      "kind": "boundary",
+      "controlExchangeId": "ctl",
+      "probeExchangeId": "prb"
+    }
   ]
 }

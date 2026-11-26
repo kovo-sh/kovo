@@ -1,3 +1,4 @@
+// @kernel @fixes R3-C-2, R3-C-4
 /**
  * R3-C-2 & R3-C-4 (kernel-side) regression suite for `src/server/oracle-invariants.ts`:
  *  - R3-C-2: `business_logic` repeated transitions exclude volatile metadata, require a genuine

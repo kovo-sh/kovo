@@ -1,0 +1,307 @@
+{
+  "version": 1,
+  "generator": "scripts/gen-kernel-manifest.ts",
+  "files": [
+    "src/server/agent-script-proof.ts",
+    "src/server/causal-proof-compiler.ts",
+    "src/server/composite-autodag.ts",
+    "src/server/composite-receipt.ts",
+    "src/server/composite-terminal.ts",
+    "src/server/exec-verify.ts",
+    "src/server/floor-recipe-engine.ts",
+    "src/server/floor-recipes.ts",
+    "src/server/host-fact-log.ts",
+    "src/server/oracle-invariants.ts",
+    "src/server/proof-receipt.ts",
+    "src/server/replay-verifier.ts",
+    "src/server/retest-health.ts",
+    "src/server/terminal-oracle-registry.ts",
+    "src/server/v8-oracle-families.ts",
+    "src/server/v8-oracle-hydrate.ts",
+    "src/server/verify-claims.ts",
+    "src/server/verify-prove-handlers.ts",
+    "src/server/verify-rpc.ts",
+    "src/server/verify-support.ts"
+  ],
+  "entries": [
+    {
+      "file": "src/server/agent-script-proof.ts",
+      "reasons": [
+        "confirmation_entrypoint"
+      ],
+      "matchedExports": [
+        "retestPersistedAgentScript",
+        "runAgentScriptProof"
+      ],
+      "reachableFrom": []
+    },
+    {
+      "file": "src/server/causal-proof-compiler.ts",
+      "reasons": [
+        "call_graph_reachable"
+      ],
+      "matchedExports": [],
+      "reachableFrom": [
+        "src/server/terminal-oracle-registry.ts::evaluateTerminalOracle"
+      ]
+    },
+    {
+      "file": "src/server/composite-autodag.ts",
+      "reasons": [
+        "call_graph_reachable"
+      ],
+      "matchedExports": [],
+      "reachableFrom": [
+        "src/server/terminal-oracle-registry.ts::evaluateTerminalOracle"
+      ]
+    },
+    {
+      "file": "src/server/composite-receipt.ts",
+      "reasons": [
+        "call_graph_reachable",
+        "export_signature"
+      ],
+      "matchedExports": [
+        "verifyCompositeReceipt"
+      ],
+      "reachableFrom": [
+        "src/server/terminal-oracle-registry.ts::evaluateTerminalOracle"
+      ]
+    },
+    {
+      "file": "src/server/composite-terminal.ts",
+      "reasons": [
+        "call_graph_reachable"
+      ],
+      "matchedExports": [],
+      "reachableFrom": [
+        "src/server/terminal-oracle-registry.ts::evaluateTerminalOracle"
+      ]
+    },
+    {
+      "file": "src/server/exec-verify.ts",
+      "reasons": [
+        "confirmation_entrypoint"
+      ],
+      "matchedExports": [
+        "inspectCompositeHostOrigin",
+        "resolveCompositeTerminalExchange"
+      ],
+      "reachableFrom": []
+    },
+    {
+      "file": "src/server/floor-recipe-engine.ts",
+      "reasons": [
+        "export_signature"
+      ],
+      "matchedExports": [
+        "assessBflaImpact",
+        "assessHttpChainEndpointBinding",
+        "assessHttpChainProofStrength",
+        "assessRetestHealth"
+      ],
+      "reachableFrom": []
+    },
+    {
+      "file": "src/server/floor-recipes.ts",
+      "reasons": [
+        "confirmation_entrypoint"
+      ],
+      "matchedExports": [
+        "runCut3Recipe",
+        "runFloorRecipe"
+      ],
+      "reachableFrom": []
+    },
+    {
+      "file": "src/server/host-fact-log.ts",
+      "reasons": [
+        "call_graph_reachable"
+      ],
+      "matchedExports": [],
+      "reachableFrom": [
+        "src/server/proof-receipt.ts::verifyReceipt",
+        "src/server/terminal-oracle-registry.ts::evaluateTerminalOracle",
+        "src/server/verify-claims.ts::evaluateClaims",
+        "src/server/verify-prove-handlers.ts::handleProveRace",
+        "src/server/verify-prove-handlers.ts::handleProveSignedUrlMint"
+      ]
+    },
+    {
+      "file": "src/server/oracle-invariants.ts",
+      "reasons": [
+        "call_graph_reachable",
+        "export_signature"
+      ],
+      "matchedExports": [
+        "assessAuthorizationImpact",
+        "assessBooleanDifferential",
+        "assessBoundary",
+        "assessBusinessLogicImpact",
+        "assessCsrfImpact",
+        "assessImpactEvidence",
+        "assessInjectionImpact",
+        "assessMarkupImpact",
+        "assessMassAssignmentImpact",
+        "assessMfaBypass",
+        "assessPublicness",
+        "assessReadDisclosure",
+        "assessStatusOnlyDivergence",
+        "evaluateV8OracleFamily"
+      ],
+      "reachableFrom": [
+        "src/server/proof-receipt.ts::verifyReceipt",
+        "src/server/terminal-oracle-registry.ts::evaluateTerminalOracle",
+        "src/server/v8-oracle-families.ts::evaluateV8OracleFamily",
+        "src/server/verify-claims.ts::evaluateClaims",
+        "src/server/verify-prove-handlers.ts::handleProveDifferential",
+        "src/server/verify-prove-handlers.ts::handleProveRace",
+        "src/server/verify-prove-handlers.ts::handleProveSignedUrlMint"
+      ]
+    },
+    {
+      "file": "src/server/proof-receipt.ts",
+      "reasons": [
+        "call_graph_reachable",
+        "export_signature"
+      ],
+      "matchedExports": [
+        "verifyReceipt"
+      ],
+      "reachableFrom": [
+        "src/server/terminal-oracle-registry.ts::evaluateTerminalOracle",
+        "src/server/verify-claims.ts::evaluateClaims",
+        "src/server/verify-prove-handlers.ts::handleProveDifferential",
+        "src/server/verify-prove-handlers.ts::handleProveInjection",
+        "src/server/verify-prove-handlers.ts::handleProveRace",
+        "src/server/verify-prove-handlers.ts::handleProveSignedUrlMint"
+      ]
+    },
+    {
+      "file": "src/server/replay-verifier.ts",
+      "reasons": [
+        "confirmation_entrypoint",
+        "export_signature"
+      ],
+      "matchedExports": [
+        "assessBflaImpact",
+        "assessHttpChainEndpointBinding",
+        "assessHttpChainProofStrength",
+        "retestReplaySpec",
+        "verifyReplaySpec"
+      ],
+      "reachableFrom": []
+    },
+    {
+      "file": "src/server/retest-health.ts",
+      "reasons": [
+        "export_signature"
+      ],
+      "matchedExports": [
+        "assessDeclarativeRetestHealth",
+        "assessRetestHealth"
+      ],
+      "reachableFrom": []
+    },
+    {
+      "file": "src/server/terminal-oracle-registry.ts",
+      "reasons": [
+        "call_graph_reachable",
+        "export_signature"
+      ],
+      "matchedExports": [
+        "evaluateTerminalOracle"
+      ],
+      "reachableFrom": []
+    },
+    {
+      "file": "src/server/v8-oracle-families.ts",
+      "reasons": [
+        "call_graph_reachable",
+        "export_signature"
+      ],
+      "matchedExports": [
+        "evaluateV8OracleFamily"
+      ],
+      "reachableFrom": [
+        "src/server/proof-receipt.ts::verifyReceipt",
+        "src/server/terminal-oracle-registry.ts::evaluateTerminalOracle",
+        "src/server/verify-prove-handlers.ts::handleProveRace"
+      ]
+    },
+    {
+      "file": "src/server/v8-oracle-hydrate.ts",
+      "reasons": [
+        "call_graph_reachable"
+      ],
+      "matchedExports": [],
+      "reachableFrom": [
+        "src/server/terminal-oracle-registry.ts::evaluateTerminalOracle"
+      ]
+    },
+    {
+      "file": "src/server/verify-claims.ts",
+      "reasons": [
+        "call_graph_reachable",
+        "export_signature"
+      ],
+      "matchedExports": [
+        "evaluateClaims"
+      ],
+      "reachableFrom": [
+        "src/server/terminal-oracle-registry.ts::evaluateTerminalOracle",
+        "src/server/verify-prove-handlers.ts::handleProveAccessBoundary",
+        "src/server/verify-prove-handlers.ts::handleProveDifferential",
+        "src/server/verify-prove-handlers.ts::handleProveInjection",
+        "src/server/verify-prove-handlers.ts::handleProveOob",
+        "src/server/verify-prove-handlers.ts::handleProvePersistedMutation",
+        "src/server/verify-prove-handlers.ts::handleProveRace",
+        "src/server/verify-prove-handlers.ts::handleProveSignedUrlMint"
+      ]
+    },
+    {
+      "file": "src/server/verify-prove-handlers.ts",
+      "reasons": [
+        "call_graph_reachable",
+        "export_signature"
+      ],
+      "matchedExports": [
+        "handleProveAccessBoundary",
+        "handleProveDifferential",
+        "handleProveInjection",
+        "handleProveOob",
+        "handleProvePersistedMutation",
+        "handleProveRace",
+        "handleProveSignedUrlMint"
+      ],
+      "reachableFrom": []
+    },
+    {
+      "file": "src/server/verify-rpc.ts",
+      "reasons": [
+        "confirmation_entrypoint",
+        "export_signature"
+      ],
+      "matchedExports": [
+        "VerifyRpcServer",
+        "evaluateClaims"
+      ],
+      "reachableFrom": []
+    },
+    {
+      "file": "src/server/verify-support.ts",
+      "reasons": [
+        "call_graph_reachable",
+        "export_signature"
+      ],
+      "matchedExports": [
+        "assessSignedUrlMintDifferential"
+      ],
+      "reachableFrom": [
+        "src/server/verify-prove-handlers.ts::handleProveDifferential",
+        "src/server/verify-prove-handlers.ts::handleProveRace",
+        "src/server/verify-prove-handlers.ts::handleProveSignedUrlMint"
+      ]
+    }
+  ]
+}

@@ -3,6 +3,20 @@
   "side": "fp",
   "archetype": "r3-h4-junk-bearer-control",
   "description": "R3-H-4(b) FP: member reads own object and uses a non-auth opaque value sealed as a junk Bearer capability control to elicit a 403/401.",
+  "covers": {
+    "files": [
+      "src/server/composite-receipt.ts",
+      "src/server/host-fact-log.ts",
+      "src/server/terminal-oracle-registry.ts",
+      "src/server/verify-claims.ts",
+      "src/server/verify-rpc.ts"
+    ],
+    "classes": [
+      "bola",
+      "dual_tenant_abac",
+      "authorization"
+    ]
+  },
   "canonicalLabel": {
     "cwe": "CWE-639",
     "category": "bola",
@@ -44,10 +58,14 @@
       "method": "GET",
       "pathAndQuery": "/api/items/item-own-1",
       "persona": "member_a",
-      "emittedCapabilities": ["cap:hop_0:junk_value_from_member"],
+      "emittedCapabilities": [
+        "cap:hop_0:junk_value_from_member"
+      ],
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"id\":\"item-own-1\",\"title\":\"Own private note\",\"opaqueRef\":\"ref_9f8e7d6c5b4a\"}"
     },
     {
@@ -58,10 +76,14 @@
       "pathAndQuery": "/api/items/item-own-1",
       "persona": null,
       "actorRoleLabel": "member (org_a)",
-      "consumedCapabilities": ["cap:hop_0:junk_value_from_member"],
+      "consumedCapabilities": [
+        "cap:hop_0:junk_value_from_member"
+      ],
       "status": 403,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"error\":\"token_rejected\"}"
     }
   ],
@@ -71,9 +93,15 @@
     "oracleFamily": "dual_tenant_abac",
     "singleHop": true,
     "terminalExchangeId": "ex_own",
-    "preChainControlIds": ["ex_ctrl_403"],
-    "attackerPersonas": ["member_a"],
-    "forbiddenShortcutPersonas": ["admin"],
+    "preChainControlIds": [
+      "ex_ctrl_403"
+    ],
+    "attackerPersonas": [
+      "member_a"
+    ],
+    "forbiddenShortcutPersonas": [
+      "admin"
+    ],
     "expectedFailedStage": "terminal_impact",
     "claimedDelta": "Junk-credential Bearer capability control must fail closed and never confirm BOLA on own object."
   }

@@ -3,6 +3,21 @@
   "side": "fp",
   "archetype": "cmdi-cross-family-mismatch",
   "description": "Claim declares OS command injection (cmdi / CWE-78) while probe response carries an unrelated SQLite error fingerprint or echoed shell text.",
+  "covers": {
+    "files": [
+      "src/server/floor-recipe-engine.ts",
+      "src/server/floor-recipes.ts",
+      "src/server/host-fact-log.ts",
+      "src/server/oracle-invariants.ts",
+      "src/server/proof-receipt.ts",
+      "src/server/replay-verifier.ts",
+      "src/server/verify-claims.ts"
+    ],
+    "classes": [
+      "cmdi",
+      "injection"
+    ]
+  },
   "canonicalLabel": {
     "cwe": "CWE-78",
     "category": "cmdi",
@@ -37,7 +52,9 @@
       "persona": null,
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"host\":\"alpha\",\"reachable\":true}"
     },
     {
@@ -49,7 +66,9 @@
       "persona": null,
       "status": 400,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"error\":\"Invalid host value: sh: 1: kovo_missing: not found\"}"
     }
   ],
@@ -63,12 +82,32 @@
     "family": "cmdi"
   },
   "claims": [
-    { "kind": "status", "exchangeId": "ctl", "expected": 200 },
-    { "kind": "status", "exchangeId": "prb", "expected": 400 },
-    { "kind": "body_contains", "exchangeId": "prb", "text": "sh: 1: kovo_missing: not found" }
+    {
+      "kind": "status",
+      "exchangeId": "ctl",
+      "expected": 200
+    },
+    {
+      "kind": "status",
+      "exchangeId": "prb",
+      "expected": 400
+    },
+    {
+      "kind": "body_contains",
+      "exchangeId": "prb",
+      "text": "sh: 1: kovo_missing: not found"
+    }
   ],
   "bareClaims": [
-    { "kind": "status", "exchangeId": "ctl", "expected": 200 },
-    { "kind": "body_contains", "exchangeId": "prb", "text": "sh: 1: kovo_missing: not found" }
+    {
+      "kind": "status",
+      "exchangeId": "ctl",
+      "expected": 200
+    },
+    {
+      "kind": "body_contains",
+      "exchangeId": "prb",
+      "text": "sh: 1: kovo_missing: not found"
+    }
   ]
 }

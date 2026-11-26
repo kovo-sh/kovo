@@ -1,3 +1,4 @@
+// @kernel @fixes R3-H-6
 import assert from 'node:assert/strict'
 import { mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'

@@ -3,6 +3,19 @@
   "side": "tp",
   "archetype": "ssrf-oob-callback",
   "description": "Server-side request forgery on webhook preview endpoint verified by a unique request-side canary URL carrier and host-signed OOB callback.",
+  "covers": {
+    "files": [
+      "src/server/host-fact-log.ts",
+      "src/server/proof-receipt.ts",
+      "src/server/verify-claims.ts",
+      "src/server/verify-prove-handlers.ts",
+      "src/server/verify-rpc.ts"
+    ],
+    "classes": [
+      "ssrf",
+      "oob"
+    ]
+  },
   "canonicalLabel": {
     "cwe": "CWE-918",
     "category": "ssrf",
@@ -40,7 +53,9 @@
       "persona": null,
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"token\":\"kovo-canary-11223344556677889900aabb\"}"
     },
     {
@@ -50,10 +65,14 @@
       "method": "POST",
       "pathAndQuery": "/api/webhooks/preview",
       "persona": null,
-      "requestJson": { "callbackUrl": "https://canary.kovo.invalid/kovo-canary-11223344556677889900aabb" },
+      "requestJson": {
+        "callbackUrl": "https://canary.kovo.invalid/kovo-canary-11223344556677889900aabb"
+      },
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"fetched\":true,\"bytes\":48}"
     }
   ],
@@ -76,6 +95,10 @@
     ]
   },
   "claims": [
-    { "kind": "oob", "exchangeId": "ssrf_mint", "expectHit": true }
+    {
+      "kind": "oob",
+      "exchangeId": "ssrf_mint",
+      "expectHit": true
+    }
   ]
 }

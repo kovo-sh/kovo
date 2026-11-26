@@ -1,3 +1,4 @@
+// @kernel @fixes R3-H-3
 import assert from 'node:assert/strict'
 import { once } from 'node:events'
 import { readFileSync } from 'node:fs'

@@ -3,6 +3,21 @@
   "side": "fp",
   "archetype": "error-status-only-injection",
   "description": "Benign 200 control vs bare 500 error probe without any engine or parser fingerprint.",
+  "covers": {
+    "files": [
+      "src/server/floor-recipe-engine.ts",
+      "src/server/floor-recipes.ts",
+      "src/server/host-fact-log.ts",
+      "src/server/oracle-invariants.ts",
+      "src/server/proof-receipt.ts",
+      "src/server/replay-verifier.ts",
+      "src/server/verify-claims.ts"
+    ],
+    "classes": [
+      "sqli",
+      "injection"
+    ]
+  },
   "canonicalLabel": {
     "cwe": "CWE-89",
     "category": "sqli",
@@ -37,7 +52,9 @@
       "persona": null,
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"items\":[{\"id\":1,\"label\":\"recent\"}]}"
     },
     {
@@ -49,7 +66,9 @@
       "persona": null,
       "status": 500,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"error\":\"Internal Server Error\",\"code\":\"ERR_UNHANDLED\"}"
     }
   ],
@@ -63,12 +82,32 @@
     "family": "sqli"
   },
   "claims": [
-    { "kind": "status", "exchangeId": "ctl", "expected": 200 },
-    { "kind": "status", "exchangeId": "prb", "expected": 500 },
-    { "kind": "body_contains", "exchangeId": "prb", "text": "Internal Server Error" }
+    {
+      "kind": "status",
+      "exchangeId": "ctl",
+      "expected": 200
+    },
+    {
+      "kind": "status",
+      "exchangeId": "prb",
+      "expected": 500
+    },
+    {
+      "kind": "body_contains",
+      "exchangeId": "prb",
+      "text": "Internal Server Error"
+    }
   ],
   "bareClaims": [
-    { "kind": "status", "exchangeId": "ctl", "expected": 200 },
-    { "kind": "status", "exchangeId": "prb", "expected": 500 }
+    {
+      "kind": "status",
+      "exchangeId": "ctl",
+      "expected": 200
+    },
+    {
+      "kind": "status",
+      "exchangeId": "prb",
+      "expected": 500
+    }
   ]
 }

@@ -3,6 +3,20 @@
   "side": "tp",
   "archetype": "cross-tenant-bola",
   "description": "Cross-tenant BOLA read where tenant-b member retrieves tenant-a owner invoice containing victim email and tenant scope.",
+  "covers": {
+    "files": [
+      "src/server/floor-recipe-engine.ts",
+      "src/server/host-fact-log.ts",
+      "src/server/oracle-invariants.ts",
+      "src/server/proof-receipt.ts",
+      "src/server/replay-verifier.ts",
+      "src/server/verify-claims.ts"
+    ],
+    "classes": [
+      "bola",
+      "authorization"
+    ]
+  },
   "canonicalLabel": {
     "cwe": "CWE-639",
     "category": "bola",
@@ -64,7 +78,9 @@
       "persona": "owner_a",
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"id\":\"inv_victim_9\",\"owner_id\":\"owner_a\",\"tenant_id\":\"tenant-a\",\"email\":\"billing@tenant-a.example\",\"amount_cents\":89000}"
     },
     {
@@ -76,7 +92,9 @@
       "persona": "viewer_b",
       "status": 403,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"error\":\"forbidden\"}"
     },
     {
@@ -88,7 +106,9 @@
       "persona": "member_b",
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"id\":\"inv_victim_9\",\"owner_id\":\"owner_a\",\"tenant_id\":\"tenant-a\",\"email\":\"billing@tenant-a.example\",\"amount_cents\":89000}"
     }
   ],
@@ -97,12 +117,37 @@
     "assertionsJq": "{ controlPassed: (.steps.entitled.status == 200 and .steps.denied.status == 403), confirmed: (.steps.prb.status == 200 and .steps.prb.json.email == .steps.entitled.json.email and .steps.prb.json.tenant_id == \"tenant-a\"), observed: .steps.prb.json.email, expected: \"403\" }"
   },
   "claims": [
-    { "kind": "impact", "impactClass": "authorization", "probeExchangeId": "prb", "controlExchangeIds": ["entitled", "denied"], "resourceTenant": "tenant-a" }
+    {
+      "kind": "impact",
+      "impactClass": "authorization",
+      "probeExchangeId": "prb",
+      "controlExchangeIds": [
+        "entitled",
+        "denied"
+      ],
+      "resourceTenant": "tenant-a"
+    }
   ],
   "bareClaims": [
-    { "kind": "status", "exchangeId": "entitled", "expected": 200 },
-    { "kind": "status", "exchangeId": "denied", "expected": 403 },
-    { "kind": "status", "exchangeId": "prb", "expected": 200 },
-    { "kind": "body_contains", "exchangeId": "prb", "text": "billing@tenant-a.example" }
+    {
+      "kind": "status",
+      "exchangeId": "entitled",
+      "expected": 200
+    },
+    {
+      "kind": "status",
+      "exchangeId": "denied",
+      "expected": 403
+    },
+    {
+      "kind": "status",
+      "exchangeId": "prb",
+      "expected": 200
+    },
+    {
+      "kind": "body_contains",
+      "exchangeId": "prb",
+      "text": "billing@tenant-a.example"
+    }
   ]
 }

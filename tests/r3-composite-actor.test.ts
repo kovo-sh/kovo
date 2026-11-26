@@ -1,3 +1,4 @@
+// @kernel @fixes R3-H-4
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {

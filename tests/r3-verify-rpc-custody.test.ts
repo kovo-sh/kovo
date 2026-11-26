@@ -1,3 +1,4 @@
+// @kernel @fixes R3-C-3, R3-C-4, R3-H-2, R3-H-4, R3-H-5
 /**
  * R3 Verification RPC Custody & Kernel Plane Regression Suite
  *

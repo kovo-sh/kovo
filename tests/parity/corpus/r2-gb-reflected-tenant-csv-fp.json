@@ -3,6 +3,21 @@
   "side": "fp",
   "archetype": "r2-gb-reflected-tenant-csv",
   "description": "Move-1 GB FP (PG-D3 class): reflected URL path tenant slug echoed in text/csv claiming cross_tenant_read MUST fail closed without positive non-reflected foreign tenant data.",
+  "covers": {
+    "files": [
+      "src/server/composite-receipt.ts",
+      "src/server/composite-terminal.ts",
+      "src/server/host-fact-log.ts",
+      "src/server/oracle-invariants.ts",
+      "src/server/terminal-oracle-registry.ts",
+      "src/server/verify-claims.ts"
+    ],
+    "classes": [
+      "cross_tenant_read",
+      "bola",
+      "authorization"
+    ]
+  },
   "canonicalLabel": {
     "cwe": "CWE-639",
     "category": "bola",
@@ -44,10 +59,14 @@
       "method": "GET",
       "pathAndQuery": "/api/v1/exports/job_exp_36/url",
       "persona": "member_a",
-      "emittedCapabilities": ["cap:hop_1:export_sig_tok"],
+      "emittedCapabilities": [
+        "cap:hop_1:export_sig_tok"
+      ],
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"signedUrl\":\"/files/export/acme/report-acme.csv?job=job_exp_36&tenant=acme&sig=valid_sig_1\"}"
     },
     {
@@ -59,7 +78,9 @@
       "persona": "member_a",
       "status": 403,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"error\":\"invalid_signature\"}"
     },
     {
@@ -69,10 +90,14 @@
       "method": "GET",
       "pathAndQuery": "/files/export/acme-labs/report-acme.csv?job=job_exp_36&tenant=acme&sig=cap:hop_1:export_sig_tok",
       "persona": "member_a",
-      "consumedCapabilities": ["cap:hop_1:export_sig_tok"],
+      "consumedCapabilities": [
+        "cap:hop_1:export_sig_tok"
+      ],
       "status": 200,
       "mediaType": "text/csv",
-      "responseHeaders": { "content-type": "text/csv; charset=utf-8" },
+      "responseHeaders": {
+        "content-type": "text/csv; charset=utf-8"
+      },
       "body": "field,value\ntenant,acme-labs\nbalance_cents,50000\naccount,acct_own_1\n"
     }
   ],
@@ -82,9 +107,15 @@
     "oracleFamily": "",
     "capabilityToken": "export_sig_tok",
     "terminalExchangeId": "hop2_prb",
-    "preChainControlIds": ["hop2_ctl"],
-    "attackerPersonas": ["member_a"],
-    "forbiddenShortcutPersonas": ["owner_a"],
+    "preChainControlIds": [
+      "hop2_ctl"
+    ],
+    "attackerPersonas": [
+      "member_a"
+    ],
+    "forbiddenShortcutPersonas": [
+      "owner_a"
+    ],
     "expectedFailedStage": "terminal_impact",
     "claimedDelta": "Reflected path segment in text/csv export without positive non-reflected foreign tenant data must fail closed."
   }

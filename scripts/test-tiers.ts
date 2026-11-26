@@ -10,6 +10,12 @@
  *     suites protected under strict kernel/critical quarantine rules.
  */
 
+import { existsSync, readFileSync } from 'node:fs'
+import { isAbsolute, join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const REPO_ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)))
+
 export const KERNEL_TEST_RE =
   /^tests\/.*(?:oracle|receipt|confirm-consistency|floor-recipe|verify-kernel|dispatch-funnel|contract-canary|path-parity|taxonomy-conformance).*\.test\.ts$/
 
@@ -91,4 +97,92 @@ export function isGenericTriageOwner(owner: string): boolean {
   const trimmed = owner.trim()
   if (!trimmed) return true
   return GENERIC_TRIAGE_OWNER_RE.test(trimmed)
+}
+
+// ============================================================================
+// Semantic Test Header Tags (`R3-04`, `plans/claude_quality_3.md` §4)
+// ============================================================================
+
+export interface TestFileTags {
+  kernel: boolean
+  fixes: string[]
+}
+
+const MAX_TAG_HEADER_LINES = 40
+const TAG_KERNEL_RE = /(?:^|[\s*])@kernel(?=$|[\s,;:])/
+const TAG_FIXES_RE = /(?:^|[\s*])@fixes\s+([A-Za-z0-9._-]+(?:\s*,\s*[A-Za-z0-9._-]+)*)/g
+
+function extractTagsFromCommentFragment(
+  fragment: string,
+  onKernel: () => void,
+  fixes: Set<string>,
+): void {
+  if (TAG_KERNEL_RE.test(fragment)) {
+    onKernel()
+  }
+  TAG_FIXES_RE.lastIndex = 0
+  for (const m of fragment.matchAll(TAG_FIXES_RE)) {
+    for (const rawId of m[1]!.split(',')) {
+      const id = rawId.trim()
+      if (id.length > 0) fixes.add(id)
+    }
+  }
+}
+
+/**
+ * Parse semantic `// @kernel` and `// @fixes <ID>` tags from the leading comment header
+ * of a test file (stops at the first non-comment code line or after 40 lines).
+ */
+export function parseTestFileTags(sourceText: string): TestFileTags {
+  let kernel = false
+  const fixes = new Set<string>()
+  const lines = sourceText.split(/\r?\n/)
+  const limit = Math.min(lines.length, MAX_TAG_HEADER_LINES)
+  let inBlockComment = false
+
+  for (let i = 0; i < limit; i += 1) {
+    const trimmed = lines[i]!.trim()
+    if (trimmed === '') continue
+    if (i === 0 && trimmed.startsWith('#!')) continue
+    if (inBlockComment) {
+      const endIdx = trimmed.indexOf('*/')
+      const fragment = endIdx >= 0 ? trimmed.slice(0, endIdx) : trimmed
+      extractTagsFromCommentFragment(fragment, () => { kernel = true }, fixes)
+      if (endIdx >= 0) inBlockComment = false
+      continue
+    }
+    if (trimmed.startsWith('//')) {
+      extractTagsFromCommentFragment(trimmed.slice(2), () => { kernel = true }, fixes)
+      continue
+    }
+    if (trimmed.startsWith('/*')) {
+      const afterOpen = trimmed.slice(2)
+      const endIdx = afterOpen.indexOf('*/')
+      const fragment = endIdx >= 0 ? afterOpen.slice(0, endIdx) : afterOpen
+      extractTagsFromCommentFragment(fragment, () => { kernel = true }, fixes)
+      if (endIdx < 0) inBlockComment = true
+      continue
+    }
+    break
+  }
+
+  return { kernel, fixes: [...fixes] }
+}
+
+/**
+ * Read leading semantic test tags (`@kernel`, `@fixes <ID>`) from a test file on disk.
+ * Returns `{ kernel: false, fixes: [] }` if the file does not exist or cannot be read.
+ */
+export function readTestFileTags(filePath: string, rootDir: string = REPO_ROOT): TestFileTags {
+  const resolved = isAbsolute(filePath) ? filePath : join(rootDir, normalizeTestRelPath(filePath))
+  if (!existsSync(resolved)) return { kernel: false, fixes: [] }
+  try {
+    return parseTestFileTags(readFileSync(resolved, 'utf8'))
+  } catch {
+    return { kernel: false, fixes: [] }
+  }
+}
+
+export function hasProtectedTestTag(tags: TestFileTags): boolean {
+  return tags.kernel || tags.fixes.length > 0
 }

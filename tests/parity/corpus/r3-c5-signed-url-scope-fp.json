@@ -3,6 +3,22 @@
   "side": "fp",
   "archetype": "r3-c5-signed-url-scope-replay",
   "description": "R3-C-5(a) FP: identical signed download URL fetched twice with worker-supplied x-scope header cannot fabricate a cross-scope cryptographic replay.",
+  "covers": {
+    "files": [
+      "src/server/composite-receipt.ts",
+      "src/server/host-fact-log.ts",
+      "src/server/terminal-oracle-registry.ts",
+      "src/server/v8-oracle-families.ts",
+      "src/server/v8-oracle-hydrate.ts",
+      "src/server/verify-claims.ts",
+      "src/server/verify-prove-handlers.ts",
+      "src/server/verify-support.ts"
+    ],
+    "classes": [
+      "cryptographic_scope_replay",
+      "bola"
+    ]
+  },
   "canonicalLabel": {
     "cwe": "CWE-639",
     "category": "bola",
@@ -46,7 +62,9 @@
       "persona": "member_a",
       "status": 403,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"error\":\"invalid_signature\"}"
     },
     {
@@ -58,7 +76,9 @@
       "persona": "member_a",
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"fileId\":\"export-42\",\"rows\":[{\"id\":\"r1\",\"amount\":500}]}"
     },
     {
@@ -68,10 +88,14 @@
       "method": "GET",
       "pathAndQuery": "/api/v1/downloads/export-42?sig=valid-sig-001",
       "persona": "member_a",
-      "requestHeaders": { "x-scope": "org-b:admin" },
+      "requestHeaders": {
+        "x-scope": "org-b:admin"
+      },
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"fileId\":\"export-42\",\"rows\":[{\"id\":\"r1\",\"amount\":500}]}"
     }
   ],
@@ -81,7 +105,9 @@
     "oracleFamily": "cryptographic_scope_replay",
     "singleHop": true,
     "terminalExchangeId": "csr_replay_hdr",
-    "preChainControlIds": ["csr_ctrl"],
+    "preChainControlIds": [
+      "csr_ctrl"
+    ],
     "claimedDelta": "Identical signed URL re-fetched with worker x-scope header must not confirm cryptographic_scope_replay.",
     "v8OracleInput": {
       "family": "cryptographic_scope_replay",

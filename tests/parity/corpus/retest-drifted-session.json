@@ -3,6 +3,20 @@
   "side": "retest",
   "archetype": "retest-drifted-session",
   "description": "Cross-tenant BOLA retest where the authenticated probe persona session expired (HTTP 401) while baseline controls succeeded. All three retest engines MUST return inconclusive with failureReason=session_drifted, NEVER fixed.",
+  "covers": {
+    "files": [
+      "src/server/agent-script-proof.ts",
+      "src/server/exec-verify.ts",
+      "src/server/floor-recipe-engine.ts",
+      "src/server/proof-receipt.ts",
+      "src/server/replay-verifier.ts",
+      "src/server/retest-health.ts"
+    ],
+    "classes": [
+      "bola",
+      "retest"
+    ]
+  },
   "canonicalLabel": {
     "cwe": "CWE-639",
     "category": "bola",
@@ -70,7 +84,9 @@
       "persona": "owner_a",
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"id\":\"inv_victim_9\",\"owner_id\":\"owner_a\",\"tenant_id\":\"tenant-a\",\"email\":\"billing@tenant-a.example\",\"amount_cents\":89000}"
     },
     {
@@ -82,7 +98,9 @@
       "persona": "viewer_b",
       "status": 403,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"error\":\"forbidden\"}"
     },
     {
@@ -94,7 +112,9 @@
       "persona": "member_b",
       "status": 401,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"error\":\"token expired\"}"
     }
   ],
@@ -103,6 +123,15 @@
     "assertionsJq": "{ controlPassed: (.steps.entitled.status == 200 and .steps.denied.status == 403), confirmed: (.steps.prb.status == 200 and .steps.prb.json.email == .steps.entitled.json.email), observed: (.steps.prb.status | tostring), expected: \"403\" }"
   },
   "claims": [
-    { "kind": "impact", "impactClass": "authorization", "probeExchangeId": "prb", "controlExchangeIds": ["entitled", "denied"], "resourceTenant": "tenant-a" }
+    {
+      "kind": "impact",
+      "impactClass": "authorization",
+      "probeExchangeId": "prb",
+      "controlExchangeIds": [
+        "entitled",
+        "denied"
+      ],
+      "resourceTenant": "tenant-a"
+    }
   ]
 }
