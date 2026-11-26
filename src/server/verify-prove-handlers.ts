@@ -5,7 +5,7 @@
  * Depends strictly downward on `verify-claims.ts` and `oracle-invariants.ts`;
  * receives host runtime capabilities via the narrow `ProveHandlerHost` seam.
  */
-import { randomUUID } from 'node:crypto'
+import { randomBytes, randomUUID } from 'node:crypto'
 import type { BoundaryClass, ImpactClass } from './oracle-invariants.ts'
 import { isReservedEvidenceRole } from './host-fact-log.ts'
 import {
@@ -24,6 +24,15 @@ import {
   TranscriptStore,
 } from './verify-claims.ts'
 import type { VerifyCanaryBroker, VerifyClaim } from './verify-claims.ts'
+import {
+  evaluateWorkerStructuralDiff,
+  mintHostBooleanPair,
+  normalizeStructuralTokens,
+  structuralDiffNormalized,
+  verifyBooleanArmBaseParity,
+  type BooleanPairStyle,
+  type HostMintedBooleanPair,
+} from './verify-support.ts'
 
 export type ProveHttpExchangeResult = {
   exchangeId: string
@@ -43,6 +52,7 @@ export interface ProveHandlerHost {
   readonly transcript: TranscriptStore
   readonly defaultOrigin: string | undefined
   readonly canaryBroker: VerifyCanaryBroker | undefined
+  readonly diffDigestKey?: string
   runHttpExchange(args: Record<string, unknown>, nonce: string): Promise<ProveHttpExchangeResult>
   runOob(args: Record<string, unknown>): Promise<unknown>
   runRace(args: Record<string, unknown>, nonce: string): Promise<unknown>
@@ -536,8 +546,42 @@ export async function handleProveDifferential(host: ProveHandlerHost, args: Reco
     : Math.max(2, Math.min(Math.round(Number(args.rounds ?? 3)), 6))
 
   let timingChallenge: HostMintedTimingChallenge | null = null
+  let booleanPair: HostMintedBooleanPair | null = null
+  let baselineTemplate: unknown = args.baseline
   let controlTemplate: unknown = args.control
   let variantTemplate: unknown = args.variant
+  if (mode === 'boolean') {
+    const boolPlaceholders = ['{{boolBase}}', '{{boolTrue}}', '{{boolFalse}}', '{{boolTrueSuffix}}', '{{boolFalseSuffix}}']
+    const rawBoolBase = args.booleanBase ?? args.boolean_base ?? args.baseValue ?? args.base_value
+    const usesHostBoolTemplate = Boolean(
+      typeof rawBoolBase === 'string'
+      || hasAnyPlaceholder(args.control, boolPlaceholders)
+      || hasAnyPlaceholder(args.variant, boolPlaceholders)
+      || (args.baseline !== undefined && hasAnyPlaceholder(args.baseline, boolPlaceholders)),
+    )
+    if (usesHostBoolTemplate) {
+      const baseVal = typeof rawBoolBase === 'string' ? rawBoolBase : '1'
+      const rawStyle = String(args.booleanStyle ?? args.boolean_style ?? '').trim().toLowerCase()
+      const style: BooleanPairStyle = rawStyle === 'single_quote' || rawStyle === 'single'
+        ? 'single_quote'
+        : rawStyle === 'double_quote' || rawStyle === 'double'
+          ? 'double_quote'
+          : 'numeric'
+      booleanPair = mintHostBooleanPair(baseVal, { style })
+      const replacements: Record<string, string> = {
+        '{{boolBase}}': booleanPair.baseValue,
+        '{{boolTrue}}': booleanPair.trueValue,
+        '{{boolFalse}}': booleanPair.falseValue,
+        '{{boolTrueSuffix}}': booleanPair.trueSuffix,
+        '{{boolFalseSuffix}}': booleanPair.falseSuffix,
+      }
+      controlTemplate = renderTemplateStrings(args.control, replacements)
+      variantTemplate = renderTemplateStrings(args.variant, replacements)
+      if (baselineTemplate !== undefined && baselineTemplate !== null) {
+        baselineTemplate = renderTemplateStrings(baselineTemplate, replacements)
+      }
+    }
+  }
   if (mode === 'timing') {
     const rawFamily = String(args.timingFamily ?? args.timing_family ?? args.constructFamily ?? args.construct_family ?? '').trim().toLowerCase()
     const family: TimingConstructFamily = rawFamily === 'nosqli'
@@ -605,6 +649,12 @@ export async function handleProveDifferential(host: ProveHandlerHost, args: Reco
     sessionGroupRole: 'probe',
     session,
   })
+  const baseBaselineArgs = baselineTemplate !== undefined && baselineTemplate !== null
+    ? normalizeArmTarget(host.defaultOrigin, baselineTemplate, {
+        sessionGroupRole: 'setup',
+        session,
+      })
+    : null
   // H-15 / C-7: Enforce strict arm identity parity (origin, method, case-sensitive path,
   // persona, session, capability set, and single differing parameter) BEFORE issuing traffic.
   const parity = checkArmIdentityParity(host.defaultOrigin, baseControlArgs, baseVariantArgs)
@@ -623,10 +673,64 @@ export async function handleProveDifferential(host: ProveHandlerHost, args: Reco
       transcriptSummary: [],
     })
   }
+  if (baseBaselineArgs) {
+    const baseParity = checkArmIdentityParity(host.defaultOrigin, baseBaselineArgs, baseVariantArgs)
+    if (!baseParity.ok || baseParity.differingParam !== parity.differingParam) {
+      const reason = !baseParity.ok
+        ? baseParity.reason
+        : `baseline differing parameter "${baseParity.differingParam}" != "${parity.differingParam}"`
+      return host.scrubRecord({
+        ok: false,
+        confirmed: false,
+        mode,
+        endpoint: String(baseVariantArgs.path ?? ''),
+        controlIds: [],
+        variantIds: [],
+        stats: { reason: `Differential baseline arm identity rejected: ${reason}` },
+        exchanges: { control: [], variant: [] },
+        rejectedBy: mode === 'timing' ? 'timing' : 'boolean_base_mismatch',
+        missingEvidence: ['arm_identity_parity'],
+        transcriptSummary: [],
+      })
+    }
+  }
 
+  // R3-C-4: Enforce base-value equality for boolean differential arms (and optional baseline / host pair).
+  let boolParity: ReturnType<typeof verifyBooleanArmBaseParity> | null = null
+  if (mode === 'boolean') {
+    const ctlParams = paramMapFromArmArgs(baseControlArgs)
+    const varParams = paramMapFromArmArgs(baseVariantArgs)
+    const baseParams = baseBaselineArgs ? paramMapFromArmArgs(baseBaselineArgs) : null
+    boolParity = verifyBooleanArmBaseParity({
+      controlValue: ctlParams[parity.differingParam] ?? '',
+      variantValue: varParams[parity.differingParam] ?? '',
+      ...(baseParams ? { baselineValue: baseParams[parity.differingParam] ?? '' } : {}),
+      ...(booleanPair ? { hostPair: booleanPair } : {}),
+    })
+    if (!boolParity.ok) {
+      return host.scrubRecord({
+        ok: false,
+        confirmed: false,
+        mode: 'boolean',
+        endpoint: String(baseVariantArgs.path ?? ''),
+        controlIds: [],
+        variantIds: [],
+        stats: { reason: `Boolean base-value parity rejected: ${boolParity.reason}`, differingParam: parity.differingParam },
+        exchanges: { control: [], variant: [] },
+        rejectedBy: 'boolean_base_mismatch',
+        missingEvidence: ['boolean_base_value_parity'],
+        transcriptSummary: [],
+      })
+    }
+  }
+
+  const baselineExchanges: Array<ProveHttpExchangeResult> = []
   const controlExchanges: Array<ProveHttpExchangeResult> = []
   const variantExchanges: Array<ProveHttpExchangeResult> = []
   for (let index = 0; index < rounds; index += 1) {
+    if (baseBaselineArgs) {
+      baselineExchanges.push(await host.runHttpExchange({ ...baseBaselineArgs }, nonce))
+    }
     const order: Array<'control' | 'variant'> = index % 2 === 0 ? ['control', 'variant'] : ['variant', 'control']
     for (const which of order) {
       const armArgs = which === 'control' ? { ...baseControlArgs } : { ...baseVariantArgs }
@@ -694,28 +798,59 @@ export async function handleProveDifferential(host: ProveHandlerHost, args: Reco
     maxSimilarity,
     ...(message ? { message } : {}),
   }
+  // R3-H-2: Evaluate structural_diff strictly on worker-visible vault-scrubbed bodies and never
+  // emit raw lowercased plaintext `stableDelta` fragments (emit count + keyed HMAC digests only).
+  const digestKey = host.diffDigestKey ?? randomBytes(32).toString('hex')
+  const workerDiff = evaluateWorkerStructuralDiff(
+    controlExchanges.map(ex => ex.body),
+    variantExchanges.map(ex => ex.body),
+    { minDeltaTokens, maxSimilarity, digestKey },
+  )
+  let baselineOk = true
+  if (baselineExchanges.length > 0 && boolParity?.ok && (boolParity.controlTruth === true || boolParity.variantTruth === true)) {
+    const normBase = baselineExchanges.map(ex => normalizeStructuralTokens(ex.body))
+    const trueBodies = (boolParity.controlTruth === true ? controlExchanges : variantExchanges).map(ex => normalizeStructuralTokens(ex.body))
+    const stableBase = !normBase.some(b => !structuralDiffNormalized(normBase[0]!, b).normalizedEqual)
+    const trueMatchesBase = stableBase && structuralDiffNormalized(normBase[0]!, trueBodies[0]!).normalizedEqual
+    baselineOk = trueMatchesBase
+  }
   const check = evaluateClaim(host.transcript, claim, {})
-  const missingEvidence = check.passed ? [] : describeMissingEvidence(check)
   const obs = check.observed ?? {}
+  const ok = workerDiff.passed && check.passed && baselineOk
+  const missing = new Set<string>(check.passed ? [] : describeMissingEvidence(check))
+  if (!workerDiff.passed) missing.add(workerDiff.stableDeltaCount === 0 ? 'stable_variant_delta' : 'arm_differential')
+  if (!baselineOk) missing.add('boolean_true_matches_baseline')
+  const missingEvidence = ok ? [] : [...missing]
   return host.scrubRecord({
-    ok: check.passed,
-    confirmed: check.passed,
+    ok,
+    confirmed: ok,
     mode: 'boolean',
     endpoint: variantExchanges[0]?.pathAndQuery ?? null,
     controlIds,
     variantIds,
+    ...(baselineExchanges.length > 0 ? { baselineIds: baselineExchanges.map(ex => ex.exchangeId) } : {}),
+    ...(booleanPair ? { hostBooleanPair: booleanPair } : {}),
     claim,
     stats: {
-      stableDelta: obs.stableDelta ?? [],
-      similarity: obs.similarity ?? 1,
+      stableDeltaCount: workerDiff.stableDeltaCount,
+      stableDeltaDigests: workerDiff.stableDeltaDigests,
+      similarity: workerDiff.similarity,
       rounds,
-      stableControl: obs.stableControl ?? false,
-      stableVariant: obs.stableVariant ?? false,
+      stableControl: workerDiff.stableControl,
+      stableVariant: workerDiff.stableVariant,
+      differingParam: parity.differingParam,
+      ...(boolParity?.ok && boolParity.sharedBase !== null ? { sharedBase: boolParity.sharedBase } : {}),
+      ...(baselineExchanges.length > 0 ? { baselineMatchesTrue: baselineOk } : {}),
     },
-    exchanges: { control: controlExchanges, variant: variantExchanges },
-    rejectedBy: check.passed ? null : (typeof obs.rejectedBy === 'string' ? obs.rejectedBy : 'structural_diff'),
+    exchanges: {
+      ...(baselineExchanges.length > 0 ? { baseline: baselineExchanges } : {}),
+      control: controlExchanges,
+      variant: variantExchanges,
+    },
+    rejectedBy: ok ? null : (typeof obs.rejectedBy === 'string' ? obs.rejectedBy : (!baselineOk ? 'boolean_baseline_mismatch' : 'structural_diff')),
     missingEvidence,
     transcriptSummary: [
+      ...baselineExchanges.map(ex => proofEntry('setup', ex, 'boolean_baseline')),
       ...controlExchanges.map(ex => proofEntry('control', ex)),
       ...variantExchanges.map(ex => proofEntry('probe', ex)),
     ],
