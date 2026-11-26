@@ -8,9 +8,19 @@ import { DEFAULT_PROVIDER, isLocalModelEnvEnabled } from '../domain.ts'
 import type { ProviderSettings, RoleAffinity, ThinkingLevel } from '../domain.ts'
 import { EgressDeniedError, EgressGateway } from './egress-gateway.ts'
 import type { ResolvedModelProfile } from './model-settings.ts'
-import { defaultStreamResponseLimit, redactProviderText, sanitizeProviderStream, sanitizeProviderValue } from './provider-stream.ts'
+import {
+  defaultStreamResponseLimit,
+  redactProviderText,
+  resolveSecretSource,
+  sanitizeProviderStream,
+  sanitizeProviderValue,
+  scrubExactSecretsValue,
+} from './provider-stream.ts'
+import type { SecretSource } from './provider-stream.ts'
 import { redact } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
+
+export type { SecretSource }
 
 type Protocol = 'openai-responses' | 'anthropic-messages'
 
@@ -74,7 +84,7 @@ export type ProviderConfig = Pick<ProviderSettings, 'endpoint' | 'model' | 'prot
 export type ProviderOptions = {
   signal?: AbortSignal
   record?: CallRecorder
-  secrets?: readonly NamedSecret[]
+  secrets?: SecretSource
   maxCalls?: number
   maxRequestBytes?: number
   responseLimit?: number
@@ -231,7 +241,7 @@ function makeFetch(
   const idleTimeoutMs = options.idleTimeoutMs ?? defaultIdleTimeoutMs
   const totalTimeoutMs = options.totalTimeoutMs ?? defaultTotalTimeoutMs
   const responseLimit = options.responseLimit ?? defaultStreamResponseLimit
-  const secrets = options.secrets ?? []
+  const getSecrets = (): readonly NamedSecret[] => resolveSecretSource(options.secrets)
 
   const send: typeof fetch = async (input, init) => {
     options.beforeCall?.()
@@ -247,9 +257,16 @@ function makeFetch(
       throw new Error('Offline mode requires a loopback model fixture endpoint.')
     }
     const headers = new Headers(request.headers)
-    if (new URL(endpoint).origin === 'https://openrouter.ai') {
-      headers.delete('x-api-key')
+    // R2-H-2: Explicitly strip any incoming auth headers (e.g. primary pool key injected by SDK
+    // auth resolver or caller opts) and stamp solely from this candidate profile's `settings.key`.
+    headers.delete('authorization')
+    headers.delete('x-api-key')
+    headers.delete('api-key')
+    const endpointOrigin = new URL(endpoint).origin
+    if (endpointOrigin === 'https://openrouter.ai' || settings.protocol === 'responses') {
       headers.set('authorization', 'Bearer ' + settings.key)
+    } else {
+      headers.set('x-api-key', settings.key)
     }
 
     const raw = await request.text()
@@ -257,6 +274,14 @@ function makeFetch(
       throw new Error('The model request exceeded Kovo Hunter’s size limit.')
     }
     const payload = JSON.parse(raw) as Record<string, unknown>
+    // H-8: Scrub live registered/rotated secrets from outbound model requests via exact-only
+    // matching (zero heuristics so JSON structure and tool-call code remain byte-intact).
+    const currentSecrets = getSecrets()
+    const scrubbedPayload = scrubExactSecretsValue(payload, settings.key, currentSecrets) as Record<string, unknown>
+    const outboundRaw = scrubbedPayload === payload ? raw : JSON.stringify(scrubbedPayload)
+    if (outboundRaw !== raw && Buffer.byteLength(outboundRaw) > maxRequestBytes) {
+      throw new Error('The model request exceeded Kovo Hunter’s size limit.')
+    }
     const totalSignal = AbortSignal.any([
       request.signal,
       AbortSignal.timeout(totalTimeoutMs),
@@ -295,7 +320,7 @@ function makeFetch(
         ? await options.fetch(targetUrl, {
             method: 'POST',
             headers,
-            body: raw,
+            body: outboundRaw,
             redirect: 'error',
             signal: fetchSignal,
           })
@@ -304,7 +329,7 @@ function makeFetch(
             {
               method: 'POST',
               headers,
-              body: raw,
+              body: outboundRaw,
               redirect: 'error',
               signal: fetchSignal,
             },
@@ -319,14 +344,17 @@ function makeFetch(
           )
 
       const contentType = response.headers.get('content-type') ?? 'application/json'
-      const recordResponse = options.record && ((body: string) => options.record!({
-        scenario,
-        endpoint: redactProviderText(new URL(endpoint).pathname, settings.key, secrets),
-        request: sanitizeProviderValue(payload, settings.key, undefined, secrets) as Record<string, unknown>,
-        status: response.status,
-        contentType: redactProviderText(contentType, settings.key, secrets),
-        body,
-      }))
+      const recordResponse = options.record && ((body: string) => {
+        const recordSecrets = getSecrets()
+        options.record!({
+          scenario,
+          endpoint: redactProviderText(new URL(endpoint).pathname, settings.key, recordSecrets),
+          request: sanitizeProviderValue(scrubbedPayload, settings.key, undefined, recordSecrets) as Record<string, unknown>,
+          status: response.status,
+          contentType: redactProviderText(contentType, settings.key, recordSecrets),
+          body,
+        })
+      })
 
       if (!response.ok) {
         clearFirstEventTimer()
@@ -354,7 +382,7 @@ function makeFetch(
 
       let resetIdleTimer: () => void = () => undefined
       const sanitized = sanitizeProviderStream(response.body, settings.key, settings.protocol, {
-        secrets,
+        secrets: getSecrets,
         responseLimit,
         onFirstChunk: clearFirstEventTimer,
         onActivity: () => {
@@ -441,6 +469,8 @@ function buildSingleStreamImpl(
     // Total call ceiling for the SDK; per-chunk idle timeouts are enforced inside `makeFetch`
     // and reset in real time on every upstream SSE frame via `sanitizeProviderStream`.
     timeoutMs: options.totalTimeoutMs ?? defaultTotalTimeoutMs,
+    // R2-H-2: Applied LAST in `streamOpts` so primary/caller `sOpts.apiKey` can never overwrite it.
+    apiKey: settings.key,
   }
 
   const implementation: ProviderStreams = api === 'openai-responses' ? {
@@ -583,7 +613,15 @@ export function providerPool(
   const now = Date.now()
   const primary = sorted.find(p => !(p.healthState === 'open' && p.cooldownUntil !== null && p.cooldownUntil > now)) ?? sorted[0]
   const callCounter = { count: 0, maxCalls: options.maxCalls ?? defaultMaxCalls }
-  const primaryBuilt = buildSingleStreamImpl(primary, scenario, options, callCounter, primary.id)
+  const poolKeySecrets: readonly NamedSecret[] = profiles.map(p => ({ value: p.key, placeholder: '[redacted]' }))
+  const poolOptions: ProviderOptions = {
+    ...options,
+    secrets: () => {
+      const base = resolveSecretSource(options.secrets)
+      return base.length ? [...base, ...poolKeySecrets] : poolKeySecrets
+    },
+  }
+  const primaryBuilt = buildSingleStreamImpl(primary, scenario, poolOptions, callCounter, primary.id)
 
   const wrapMethod = (method: 'stream' | 'streamSimple'): ProviderStreams['stream'] => {
     return (_selected, transcript, sOpts) => {
@@ -602,8 +640,9 @@ export function providerPool(
 
           let attempt = 0
           for (;;) {
-            const built = buildSingleStreamImpl(candidate, scenario, options, callCounter, candidate.id)
-            const stream = built.implementation[method](built.model, transcript, sOpts)
+            const built = buildSingleStreamImpl(candidate, scenario, poolOptions, callCounter, candidate.id)
+            const candidateOpts = { ...sOpts, apiKey: candidate.key }
+            const stream = built.implementation[method](built.model, transcript, candidateOpts)
             let emitted = false
             let retrySame = false
             let failedOver = false
@@ -714,7 +753,9 @@ export function providerPool(
   const models = createModels({ identity: { attribution: null } })
   models.setProvider(createProvider<Api>({
     id: providerId,
-    auth: { apiKey: { name: 'Workspace provider pool', resolve: async () => ({ auth: { apiKey: primary.key } }) } },
+    // R2-H-2: Never expose `primary.key` at pool auth scope; each candidate injects its own key in
+    // `wrapMethod`, `buildSingleStreamImpl`, and `makeFetch`.
+    auth: { apiKey: { name: 'Workspace provider pool', resolve: async () => ({ auth: { apiKey: 'kovo-pool-per-candidate-key' } }) } },
     api: implementation,
     models: [primaryBuilt.model],
   }))
