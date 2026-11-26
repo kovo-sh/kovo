@@ -12,6 +12,7 @@ import { after, before, describe, it } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import { stripTypeScriptTypes } from 'node:module'
 import type { Browser, BrowserContext, Page } from '@playwright/test'
+import { HARDENED_NODE_FLAGS } from './app.ts'
 
 const REPO_ROOT = resolve(import.meta.dirname, '..')
 const CONSENT_PATH = join(REPO_ROOT, 'src', 'components', 'run', 'views', 'consent.tsx')
@@ -88,7 +89,7 @@ async function startKovoServer(): Promise<SpawnedKovoServer> {
   const origin = `http://127.0.0.1:${port}`
   let output = ''
 
-  const child: ChildProcess = spawn(process.execPath, ['scripts/serve.ts'], {
+  const child: ChildProcess = spawn(process.execPath, [...HARDENED_NODE_FLAGS, 'scripts/serve.ts'], {
     cwd: REPO_ROOT,
     env: {
       ...process.env,

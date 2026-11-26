@@ -8,6 +8,12 @@ import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import type { Page } from '@playwright/test'
 
+export const HARDENED_NODE_FLAGS = [
+  '--disable-proto=delete',
+  '--enable-experimental-regexp-engine-on-excessive-backtracks',
+  '--regexp-backtracks-before-fallback=10000',
+] as const
+
 async function availablePort() {
   const server = createServer().listen(0, '127.0.0.1')
   await once(server, 'listening')
@@ -31,7 +37,7 @@ export async function createApp(env: NodeJS.ProcessEnv = {}, existingDirectory?:
     async start() {
       output = ''
       bootstrapSecret = ''
-      const child = spawn(process.execPath, ['scripts/serve.ts'], {
+      const child = spawn(process.execPath, [...HARDENED_NODE_FLAGS, 'scripts/serve.ts'], {
         cwd: process.cwd(),
         env: { ...process.env, KOVO_OFFLINE: '1', KOVO_PUBLIC_ORIGIN: '', ...env, PORT: String(port), KOVO_DATA_DIR: directory },
         stdio: ['ignore', 'pipe', 'pipe'],

@@ -17,6 +17,7 @@ import {
   isRound0ThreatModelWorker,
 } from '../src/components/run/format.ts'
 import type { Round0DerivationInput } from '../src/components/run/format.ts'
+import { HARDENED_NODE_FLAGS } from './app.ts'
 
 const REPO_ROOT = resolve(import.meta.dirname, '..')
 
@@ -92,7 +93,7 @@ async function startKovoServer(): Promise<SpawnedKovoServer> {
   const origin = `http://127.0.0.1:${port}`
   let output = ''
 
-  const child: ChildProcess = spawn(process.execPath, ['scripts/serve.ts'], {
+  const child: ChildProcess = spawn(process.execPath, [...HARDENED_NODE_FLAGS, 'scripts/serve.ts'], {
     cwd: REPO_ROOT,
     env: {
       ...process.env,
