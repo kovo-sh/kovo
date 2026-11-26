@@ -114,7 +114,7 @@ test('resolveProfileNoTokenWatchdogMs scales cleanly by profile thinking/model a
   assert.equal(resolveProfileNoTokenWatchdogMs({ model: 'gpt-4o-mini', thinkingLevel: 'off', roleAffinity: 'fast' }, {}), DEFAULT_NO_TOKEN_WATCHDOG_MS)
   assert.equal(resolveProfileNoTokenWatchdogMs({ model: 'gpt-4o-mini', thinkingLevel: 'medium', roleAffinity: 'tactical' }, {}), MEDIUM_THINKING_NO_TOKEN_WATCHDOG_MS)
   assert.equal(resolveProfileNoTokenWatchdogMs({ model: 'gpt-4o-mini', thinkingLevel: 'high', roleAffinity: 'tactical' }, {}), REASONING_NO_TOKEN_WATCHDOG_MS)
-  assert.equal(resolveProfileNoTokenWatchdogMs({ model: 'deepseek/deepseek-v4.1-flash-1017', thinkingLevel: 'medium', roleAffinity: 'tactical' }, {}), REASONING_NO_TOKEN_WATCHDOG_MS)
+  assert.equal(resolveProfileNoTokenWatchdogMs({ model: 'deepseek/deepseek-v4.1-flash-1017', thinkingLevel: 'medium', roleAffinity: 'tactical' }, {}), MEDIUM_THINKING_NO_TOKEN_WATCHDOG_MS)
   assert.equal(resolveProfileNoTokenWatchdogMs({ model: 'custom-model', thinkingLevel: 'low', roleAffinity: 'reasoning' }, {}), REASONING_NO_TOKEN_WATCHDOG_MS)
   assert.equal(resolveProfileNoTokenWatchdogMs({ model: 'deepseek/deepseek-v4.1-flash-1017' }, { KOVO_PROVIDER_NO_TOKEN_MS: '90000' }), 90_000)
   assert.equal(resolveProfileNoTokenWatchdogMs(undefined, { KOVO_PROVIDER_NO_TOKEN_MS: '1000' }), 5_000)

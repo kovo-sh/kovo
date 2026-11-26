@@ -17,8 +17,9 @@ import type {
 } from './finding-fingerprint.ts'
 import { resolveProfilePoolForRole } from './model-settings.ts'
 import type { ResolvedModelProfile } from './model-settings.ts'
+import { providerOptionsFor } from './provider-runtime-policy.ts'
 import { providerPool } from './provider.ts'
-import type { UsageCallback } from './provider.ts'
+import type { TelemetryCallback, UsageCallback } from './provider.ts'
 import { redact } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
 
@@ -998,25 +999,29 @@ export async function evaluateSubmissionDedupe(
 export function createProviderLlmCall(
   profiles: readonly ResolvedModelProfile[],
   options: {
+    runId?: string
     signal?: AbortSignal
     secrets?: readonly NamedSecret[]
     onUsage?: UsageCallback
+    onTelemetry?: TelemetryCallback
     scenario?: string
   } = {},
 ): SemanticDedupeLlmCall {
   return async ({ systemPrompt, userPrompt }) => {
     const routed = resolveProfilePoolForRole('fast', profiles)
-    const { models, model } = providerPool(routed, options.scenario ?? 'dedupe-judge', {
-      signal: options.signal,
-      secrets: options.secrets,
-      onUsage: options.onUsage,
-      maxCalls: 2,
-      thinkingLevel: 'off',
-      roleAffinity: 'fast',
-      firstEventTimeoutMs: 30_000,
-      idleTimeoutMs: 30_000,
-      totalTimeoutMs: 45_000,
-    })
+    const { models, model } = providerPool(
+      routed,
+      options.scenario ?? 'dedupe-judge',
+      providerOptionsFor(options.runId, 'fast', 'dedupe-judge', {
+        profile: routed[0],
+        signal: options.signal,
+        secrets: options.secrets,
+        onUsage: options.onUsage,
+        onTelemetry: options.onTelemetry,
+        maxCalls: 2,
+        thinkingLevel: 'off',
+      }),
+    )
     const stream = models.stream(model, {
       systemPrompt: redact(systemPrompt, options.secrets),
       messages: [{ role: 'user', content: redact(userPrompt, options.secrets), timestamp: Date.now() }],

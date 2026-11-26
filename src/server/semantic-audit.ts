@@ -9,7 +9,8 @@ import {
 } from '../domain.ts'
 import { type CodeAuditSuspectData, type HostTier, classifyHostTier } from './agent-session.ts'
 import { isProfileHealthy, resolveProfilePoolForRole, type ResolvedModelProfile } from './model-settings.ts'
-import { providerPool, type UsageCallback } from './provider.ts'
+import { providerOptionsFor } from './provider-runtime-policy.ts'
+import { providerPool, type TelemetryCallback, type UsageCallback } from './provider.ts'
 import { type NamedSecret, redact } from './redact.ts'
 import {
   diffMiddlewarePolicies,
@@ -632,7 +633,13 @@ export interface RepoContextSummary {
 
 export function createReasoningLlmCall(
   profiles: readonly ResolvedModelProfile[],
-  options: { signal?: AbortSignal; secrets?: readonly NamedSecret[]; onUsage?: UsageCallback } = {},
+  options: {
+    runId?: string
+    signal?: AbortSignal
+    secrets?: readonly NamedSecret[]
+    onUsage?: UsageCallback
+    onTelemetry?: TelemetryCallback
+  } = {},
 ): SemanticAuditLlmCall | undefined {
   const routed = resolveProfilePoolForRole('reasoning', profiles)
   if (routed.length === 0) return undefined
@@ -640,17 +647,19 @@ export function createReasoningLlmCall(
     const now = Date.now()
     const primary = routed.find(p => isProfileHealthy(p, now)) ?? routed[0]
     const effectiveThinking = primary?.thinkingLevel === 'off' ? 'off' : 'high'
-    const { models, model } = providerPool(routed, 'semantic-audit', {
-      signal: options.signal,
-      secrets: options.secrets,
-      onUsage: options.onUsage,
-      maxCalls: 4,
-      thinkingLevel: effectiveThinking,
-      roleAffinity: 'reasoning',
-      firstEventTimeoutMs: 45_000,
-      idleTimeoutMs: 45_000,
-      totalTimeoutMs: 90_000,
-    })
+    const { models, model } = providerPool(
+      routed,
+      'semantic-audit',
+      providerOptionsFor(options.runId, 'reasoning', 'semantic-audit', {
+        profile: primary,
+        signal: options.signal,
+        secrets: options.secrets,
+        onUsage: options.onUsage,
+        onTelemetry: options.onTelemetry,
+        maxCalls: 4,
+        thinkingLevel: effectiveThinking,
+      }),
+    )
     const stream = models.stream(model, {
       systemPrompt: redact(systemPrompt, options.secrets),
       messages: [{ role: 'user', content: redact(userPrompt, options.secrets), timestamp: Date.now() }],
@@ -943,7 +952,7 @@ export async function extractProjectSecuritySpecAndRules(
 
   const llmCall = options.enableLlm !== false
     ? (ctx.llmCall ?? (ctx.modelProfiles?.length
-      ? createReasoningLlmCall(ctx.modelProfiles, { signal: ctx.signal, secrets: ctx.secrets, onUsage: ctx.onUsage })
+      ? createReasoningLlmCall(ctx.modelProfiles, { runId: ctx.run.id, signal: ctx.signal, secrets: ctx.secrets, onUsage: ctx.onUsage })
       : undefined))
     : undefined
 
@@ -2328,7 +2337,7 @@ export async function generateVariantSweepQueries(
 
   // Optional reasoning LLM query synthesis
   const llmCall = ctx.llmCall ?? (ctx.modelProfiles?.length
-    ? createReasoningLlmCall(ctx.modelProfiles, { signal: ctx.signal, secrets: ctx.secrets, onUsage: ctx.onUsage })
+    ? createReasoningLlmCall(ctx.modelProfiles, { runId: ctx.run.id, signal: ctx.signal, secrets: ctx.secrets, onUsage: ctx.onUsage })
     : undefined)
   if (llmCall) {
     try {

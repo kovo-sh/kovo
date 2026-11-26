@@ -701,6 +701,10 @@ export interface LedgerRow {
   unmatchedFalsePositives: number
   validUnplantedCount?: number
   costUsd: number
+  /** Record-only cost efficiency (`costUsd / confirmed` when `confirmed > 0`, else `null`). Never gated. */
+  costPerConfirmed?: number | null
+  /** Record-only wasted provider spend (stalls, retries, aborts, truncated calls). Never gated. */
+  wastedUsd?: number | null
   durationMs?: number
   /** Optional R2-23 / R2-06 preservation & floor-vs-agentic fields. */
   preservationRatio?: number | null
@@ -713,6 +717,16 @@ export interface LedgerRow {
   exposedHeldoutSeeds?: number[]
   siteOutcomes?: Record<string, string>
   notes?: string[]
+}
+
+/**
+ * Compute record-only `costPerConfirmed` (`costUsd / confirmed` when `confirmed > 0`, else `null`).
+ * Record-only — never used as a pass/fail gate.
+ */
+export function computeCostPerConfirmed(costUsd: number, confirmed: number): number | null {
+  if (!Number.isFinite(costUsd) || costUsd < 0) return null
+  if (!Number.isFinite(confirmed) || confirmed <= 0) return null
+  return costUsd / confirmed
 }
 
 export function validateLedgerRow(row: LedgerRow): void {
@@ -729,6 +743,16 @@ export function validateLedgerRow(row: LedgerRow): void {
   if (!row.gitSha || typeof row.gitSha !== 'string') throw new Error('LedgerRow.gitSha is required')
   if (row.status !== 'VALID' && row.status !== 'INVALID') {
     throw new Error(`LedgerRow.status must be 'VALID' or 'INVALID' (got '${String(row.status)}')`)
+  }
+  if (row.costPerConfirmed !== undefined && row.costPerConfirmed !== null) {
+    if (typeof row.costPerConfirmed !== 'number' || !Number.isFinite(row.costPerConfirmed) || row.costPerConfirmed < 0) {
+      throw new Error(`LedgerRow.costPerConfirmed must be a finite non-negative number or null (got '${String(row.costPerConfirmed)}')`)
+    }
+  }
+  if (row.wastedUsd !== undefined && row.wastedUsd !== null) {
+    if (typeof row.wastedUsd !== 'number' || !Number.isFinite(row.wastedUsd) || row.wastedUsd < 0) {
+      throw new Error(`LedgerRow.wastedUsd must be a finite non-negative number or null (got '${String(row.wastedUsd)}')`)
+    }
   }
 }
 
@@ -764,11 +788,18 @@ export function appendLedgerRow(
   ledgerPath: string = DEFAULT_LEDGER_PATH,
   repoRoot: string = REPO_ROOT,
 ): LedgerRow {
-  validateLedgerRow(row)
+  const normalized: LedgerRow = {
+    ...row,
+    costPerConfirmed: row.costPerConfirmed !== undefined
+      ? row.costPerConfirmed
+      : computeCostPerConfirmed(row.costUsd, row.confirmed),
+    wastedUsd: row.wastedUsd !== undefined ? row.wastedUsd : null,
+  }
+  validateLedgerRow(normalized)
   const abs = resolveRepoPath(ledgerPath, repoRoot)
   mkdirSync(dirname(abs), { recursive: true })
-  appendFileSync(abs, `${JSON.stringify(row)}\n`, { encoding: 'utf8', mode: 0o644 })
-  return row
+  appendFileSync(abs, `${JSON.stringify(normalized)}\n`, { encoding: 'utf8', mode: 0o644 })
+  return normalized
 }
 
 export interface PromoteLedgerOptions {
@@ -931,6 +962,10 @@ export interface LedgerComparison {
   strictPrecisionDelta: number | null
   fpDelta: number
   costDeltaUsd: number
+  /** Record-only delta of `costPerConfirmed` (`b - a`), or `null` if unavailable. Never gated. */
+  costPerConfirmedDelta?: number | null
+  /** Record-only delta of `wastedUsd` (`b - a`), or `null` if unavailable. Never gated. */
+  wastedUsdDelta?: number | null
 }
 
 /**
@@ -966,6 +1001,10 @@ export function compareLedgerRows(a: LedgerRow, b: LedgerRow): LedgerComparison 
 
   const aFp = a.decoyFalsePositives + a.unmatchedFalsePositives
   const bFp = b.decoyFalsePositives + b.unmatchedFalsePositives
+  const aCpc = a.costPerConfirmed !== undefined ? a.costPerConfirmed : computeCostPerConfirmed(a.costUsd, a.confirmed)
+  const bCpc = b.costPerConfirmed !== undefined ? b.costPerConfirmed : computeCostPerConfirmed(b.costUsd, b.confirmed)
+  const aWaste = typeof a.wastedUsd === 'number' && Number.isFinite(a.wastedUsd) ? a.wastedUsd : null
+  const bWaste = typeof b.wastedUsd === 'number' && Number.isFinite(b.wastedUsd) ? b.wastedUsd : null
   return {
     suite: a.suite,
     benchmarkVersion: a.benchmarkVersion,
@@ -983,5 +1022,7 @@ export function compareLedgerRows(a: LedgerRow, b: LedgerRow): LedgerComparison 
         : null,
     fpDelta: bFp - aFp,
     costDeltaUsd: b.costUsd - a.costUsd,
+    costPerConfirmedDelta: aCpc !== null && bCpc !== null ? bCpc - aCpc : null,
+    wastedUsdDelta: aWaste !== null && bWaste !== null ? bWaste - aWaste : null,
   }
 }

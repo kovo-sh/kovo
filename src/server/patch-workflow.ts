@@ -25,7 +25,8 @@ import { applyUnifiedDiffToDirectory, type LabRunner } from './lab-runner.ts'
 import { isProfileHealthy, resolveProfilePoolForRole, type ResolvedModelProfile } from './model-settings.ts'
 import { parseRoleLabel } from './oracle-invariants.ts'
 import type { ImpactStep } from './proof-receipt.ts'
-import { providerPool, type UsageCallback } from './provider.ts'
+import { providerOptionsFor } from './provider-runtime-policy.ts'
+import { providerPool, type TelemetryCallback, type UsageCallback } from './provider.ts'
 import { redact, type NamedSecret } from './redact.ts'
 import { retestReplaySpec } from './replay-verifier.ts'
 import { assessRetestHealth, type RetestArmObservation } from './retest-health.ts'
@@ -308,16 +309,31 @@ function extractJsonBlock(raw: string): unknown {
 function makeFreshProviderCall(
   profiles: readonly ResolvedModelProfile[],
   scenario: string,
-  options: { signal?: AbortSignal; secrets?: readonly NamedSecret[]; onUsage?: UsageCallback },
+  options: {
+    runId?: string
+    signal?: AbortSignal
+    secrets?: readonly NamedSecret[]
+    onUsage?: UsageCallback
+    onTelemetry?: TelemetryCallback
+  },
 ): PatchLlmCall {
   return async ({ systemPrompt, userPrompt }) => {
     const routed = resolveProfilePoolForRole('reasoning', profiles)
     const primary = routed.find(p => isProfileHealthy(p, Date.now())) ?? routed[0]
-    const { models, model } = providerPool(routed, scenario, {
-      signal: options.signal, secrets: options.secrets, onUsage: options.onUsage, maxCalls: 2,
-      thinkingLevel: primary?.thinkingLevel === 'off' ? 'off' : 'high', roleAffinity: 'reasoning',
-      firstEventTimeoutMs: 60_000, idleTimeoutMs: 60_000, totalTimeoutMs: 120_000,
-    })
+    const purpose = scenario === 'patch-reviewer' ? 'patch-reviewer' : 'patch-author'
+    const { models, model } = providerPool(
+      routed,
+      scenario,
+      providerOptionsFor(options.runId, 'reasoning', purpose, {
+        profile: primary,
+        signal: options.signal,
+        secrets: options.secrets,
+        onUsage: options.onUsage,
+        onTelemetry: options.onTelemetry,
+        maxCalls: 2,
+        thinkingLevel: primary?.thinkingLevel === 'off' ? 'off' : 'high',
+      }),
+    )
     const stream = models.stream(model, {
       systemPrompt: redact(systemPrompt, options.secrets),
       messages: [{ role: 'user', content: redact(userPrompt, options.secrets), timestamp: Date.now() }],

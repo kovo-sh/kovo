@@ -57,7 +57,6 @@ import {
 } from './dedupe.ts'
 import type { ExecBoardManager } from './exec-board.ts'
 import {
-  PROVIDER_STALL_TURN_MS,
   ProviderNoTokenWatchdog,
   buildBolaTestQueue,
   classifyWorkerErrorToStepStatus,
@@ -101,7 +100,8 @@ import {
 import { resolveProfilePoolForRole, type ResolvedModelProfile } from './model-settings.ts'
 import type { PersonaAuthManager, PersonaSessionClone } from './persona-auth.ts'
 import { crawlStateGraph } from './phase0-recon.ts'
-import { resolveProfileNoTokenWatchdogMs } from './provider-stream.ts'
+import { resolveProviderRuntimePolicy } from './provider-runtime-policy.ts'
+import { createProviderStreamTelemetry, resolveProfileNoTokenWatchdogMs } from './provider-stream.ts'
 import {
   BudgetExceededError,
   ProviderFailureError,
@@ -1324,8 +1324,16 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
       }),
     )
     const primaryProfile = resolveProfilePoolForRole(watchdogSpecialist.roleAffinity, profiles)[0] ?? profiles[0]
-    const noTokenMs = resolveProfileNoTokenWatchdogMs(primaryProfile)
-    const noTokenThresholdMs = () => noTokenMs
+    const runtimePolicy = resolveProviderRuntimePolicy(primaryProfile, {
+      role: watchdogSpecialist.roleAffinity,
+      purpose: 'worker',
+    })
+    const noTokenThresholdMs = () => resolveProfileNoTokenWatchdogMs({
+      model: runtimePolicy.model,
+      thinkingLevel: runtimePolicy.thinkingLevel,
+      roleAffinity: runtimePolicy.roleAffinity,
+    })
+    const streamTelemetry = createProviderStreamTelemetry(runtimePolicy.slowTurnThresholdMs)
     const stallAbortMs = () => providerStallAbortMs(percentile(turnLatencies, 50), turnLatencies.length)
     const stallWatchdog = new ProviderNoTokenWatchdog({
       thresholdMs: noTokenThresholdMs,
@@ -1333,14 +1341,16 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
         if (generationStartedAt === undefined) return
         generationStartedAt = undefined
         job.stallAbort = true
+        streamTelemetry.recordStallAbort()
+        const streamSnap = streamTelemetry.snapshot()
         this.host.providerStallTimeoutsByRun.set(run.id, (this.host.providerStallTimeoutsByRun.get(run.id) ?? 0) + 1)
-        this.host.providerStallTurnsByRun.set(run.id, (this.host.providerStallTurnsByRun.get(run.id) ?? 0) + 1)
         const previousThresholdMs = stallAbortMs()
         const wallSavedMs = Math.max(0, previousThresholdMs - idleMs)
         this.host.providerStallWallSavedByRun.set(run.id, (this.host.providerStallWallSavedByRun.get(run.id) ?? 0) + wallSavedMs)
         this.host.safeEvent(run.id, 'worker.provider_stall', `Provider stream stalled on turn ${turn} (${Math.round(idleMs / 1000)}s without a token); aborting to free the slot.`, {
           assignmentId: job.assignment.id, stepId: step.id, turn, elapsedMs: idleMs, thresholdMs,
           previousThresholdMs, wallSavedMs, stallAbortMs: stallAbortMs(), wallClockMs: budget.wallClockMs,
+          stallAborts: streamSnap.stallAborts, slowTurns: streamSnap.slowTurns,
         })
         job.controller.abort(new Error('Provider stream stalled (no token).'))
       },
@@ -1358,8 +1368,10 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
       generationStartedAt = undefined
       stallWatchdog.clear()
       turnLatencies.push(ms)
-      const stalls = this.host.providerStallTurnsByRun.get(run.id) ?? 0
-      if (ms > PROVIDER_STALL_TURN_MS) this.host.providerStallTurnsByRun.set(run.id, stalls + 1)
+      if (streamTelemetry.recordCompletedTurn(ms, runtimePolicy.slowTurnThresholdMs)) {
+        const slowTurns = this.host.providerStallTurnsByRun.get(run.id) ?? 0
+        this.host.providerStallTurnsByRun.set(run.id, slowTurns + 1)
+      }
     }
 
     const baselineCapIds = new Set(

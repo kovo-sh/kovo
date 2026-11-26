@@ -9,6 +9,13 @@ import type { ProviderSettings, RoleAffinity, ThinkingLevel } from '../domain.ts
 import { EgressDeniedError, EgressGateway } from './egress-gateway.ts'
 import type { ResolvedModelProfile } from './model-settings.ts'
 import {
+  providerOptionsFor,
+  resolveProfilePricing,
+  resolveProviderRuntimePolicy,
+  type ProviderCallPurpose,
+  type ProviderRuntimePolicy,
+} from './provider-runtime-policy.ts'
+import {
   defaultStreamResponseLimit,
   redactProviderText,
   resolveSecretSource,
@@ -17,7 +24,7 @@ import {
   scrubOutboundProviderRequest,
   verifyOutboundProviderRequestIntegrity,
 } from './provider-stream.ts'
-import type { SecretSource } from './provider-stream.ts'
+import type { ProviderStreamTelemetry, SecretSource } from './provider-stream.ts'
 import { redact } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
 import {
@@ -358,12 +365,18 @@ export type ProviderCall = {
 
 export type CallRecorder = (call: ProviderCall) => void
 
+export type UsageCostSource = 'provider_reported' | 'token_rates' | 'abort_delta_estimate'
+
 export type UsageEvent = {
   inputTokens: number
   cachedInputTokens?: number
   outputTokens: number
   reasoningTokens?: number
   costUsd: number
+  /** True when cost/tokens were estimated from streamed deltas on a mid-stream abort/stall/drop. */
+  costEstimated?: boolean
+  /** Provenance of `costUsd` (`provider_reported`, `token_rates`, or `abort_delta_estimate`). */
+  costSource?: UsageCostSource
   profileId?: string
 }
 
@@ -800,6 +813,14 @@ export type ProviderOptions = {
   totalTimeoutMs?: number
   thinkingLevel?: ThinkingLevel
   roleAffinity?: RoleAffinity
+  /** Logical caller purpose used by `resolveProviderRuntimePolicy` across failover candidates. */
+  purpose?: ProviderCallPurpose
+  /** When true (set by `providerOptionsFor`), recompute timeouts per failover candidate from `ProviderRuntimePolicy`. */
+  runtimePolicyManaged?: boolean
+  /** Optional split `stallAborts` vs `slowTurns` stream telemetry tracker. */
+  streamTelemetry?: ProviderStreamTelemetry
+  /** Optional observer invoked whenever `ProviderRuntimePolicy` is resolved for a candidate (including failovers). */
+  onCandidatePolicy?: (policy: ProviderRuntimePolicy, candidate: ProviderConfig) => void
   beforeCall?: () => void
   onUsage?: UsageCallback
   /** Optional run ID for structured per-run token, cost, cache, stall, and truncation telemetry. */
@@ -816,28 +837,38 @@ export type ProviderOptions = {
   resolveHost?: (hostname: string) => Promise<string[]>
 }
 
-function clampContextWindow(value?: number): number {
-  const raw = value ?? DEFAULT_PROVIDER.contextWindow
-  return Math.max(32_000, Math.min(2_000_000, Math.floor(raw)))
-}
-
-function clampMaxTokens(value?: number): number {
-  const raw = value ?? DEFAULT_PROVIDER.maxTokens
-  return Math.max(512, Math.min(393_216, Math.floor(raw)))
-}
-
 export function estimateCostUsd(
   profile: ProviderConfig,
   inputTokens: number,
   outputTokens: number,
   cachedInputTokens = 0,
 ): number {
-  const inRate = profile.inputCostPerMtok ?? DEFAULT_PROVIDER.inputCostPerMtok
-  const cachedRate = profile.cachedInputCostPerMtok ?? DEFAULT_PROVIDER.cachedInputCostPerMtok
-  const outRate = profile.outputCostPerMtok ?? DEFAULT_PROVIDER.outputCostPerMtok
+  const pricing = resolveProfilePricing(profile)
   const cached = Math.max(0, Math.min(inputTokens, cachedInputTokens))
   const uncached = Math.max(0, inputTokens - cached)
-  return (uncached * inRate + cached * cachedRate + outputTokens * outRate) / 1_000_000
+  return (
+    uncached * pricing.inputCostPerMtok +
+    cached * pricing.cachedInputCostPerMtok +
+    outputTokens * pricing.outputCostPerMtok
+  ) / 1_000_000
+}
+
+const STREAM_DELTA_TEXT_EVENT_TYPES = new Set([
+  'response.output_text.delta',
+  'response.refusal.delta',
+  'response.reasoning_text.delta',
+  'response.reasoning_summary_text.delta',
+  'response.function_call_arguments.delta',
+  'response.custom_tool_call_input.delta',
+])
+
+function readFiniteNonNegativeNumber(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value) && value >= 0) return value
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number(value)
+    if (Number.isFinite(parsed) && parsed >= 0) return parsed
+  }
+  return undefined
 }
 
 class SseUsageAccumulator {
@@ -846,13 +877,43 @@ class SseUsageAccumulator {
   private outputTokens = 0
   private anthropicCacheRead = 0
   private reasoningTokens = 0
+  private providerReportedCostUsd: number | undefined
+  private streamedDeltaChars = 0
 
   feedData(data: Record<string, unknown> | '[DONE]' | undefined): void {
     if (!data || data === '[DONE]') return
-    const responseUsage = (data.response as Record<string, unknown> | undefined)?.usage as Record<string, unknown> | undefined
+    const type = typeof data.type === 'string' ? data.type : ''
+    if (STREAM_DELTA_TEXT_EVENT_TYPES.has(type) && typeof data.delta === 'string') {
+      this.streamedDeltaChars += data.delta.length
+    } else if (type === 'content_block_delta') {
+      const delta = data.delta && typeof data.delta === 'object' && !Array.isArray(data.delta)
+        ? data.delta as Record<string, unknown>
+        : undefined
+      if (delta) {
+        if (typeof delta.text === 'string') this.streamedDeltaChars += delta.text.length
+        if (typeof delta.thinking === 'string') this.streamedDeltaChars += delta.thinking.length
+        if (typeof delta.partial_json === 'string') this.streamedDeltaChars += delta.partial_json.length
+      }
+    }
+
+    const responseObj = data.response as Record<string, unknown> | undefined
+    const responseUsage = responseObj?.usage as Record<string, unknown> | undefined
     const topUsage = data.usage as Record<string, unknown> | undefined
     const msgUsage = (data.message as Record<string, unknown> | undefined)?.usage as Record<string, unknown> | undefined
     const usage = responseUsage ?? topUsage ?? msgUsage
+
+    const reportedCost =
+      readFiniteNonNegativeNumber(usage?.cost) ??
+      readFiniteNonNegativeNumber(usage?.total_cost) ??
+      readFiniteNonNegativeNumber(usage?.cost_usd) ??
+      readFiniteNonNegativeNumber(responseObj?.cost) ??
+      readFiniteNonNegativeNumber(data.cost)
+    if (reportedCost !== undefined) {
+      if (this.providerReportedCostUsd === undefined || reportedCost > this.providerReportedCostUsd) {
+        this.providerReportedCostUsd = reportedCost
+      }
+    }
+
     if (!usage) return
     const inp = Number(usage.input_tokens ?? usage.prompt_tokens ?? 0)
     const out = Number(usage.output_tokens ?? usage.completion_tokens ?? 0)
@@ -890,6 +951,14 @@ class SseUsageAccumulator {
 
   reasoningSnapshot(): number {
     return this.reasoningTokens
+  }
+
+  reportedCostSnapshot(): number | undefined {
+    return this.providerReportedCostUsd
+  }
+
+  streamedDeltaCharsSnapshot(): number {
+    return this.streamedDeltaChars
   }
 
   snapshot(protocol: 'responses' | 'messages' = 'responses'): {
@@ -1018,6 +1087,8 @@ interface MakeFetchInternalOptions {
   attemptTelemetryState?: { recorded: boolean }
   /** Optional per-attempt typed failure carrier populated by `makeFetch` for `providerPool` / callers. */
   attemptFailureState?: { error?: ProviderFailureError }
+  /** Resolved per-candidate `ProviderRuntimePolicy` (recomputed per failover candidate). */
+  candidatePolicy?: ProviderRuntimePolicy
 }
 
 const STALL_ERROR_RE = /stall|timed?\s*out|no token/i
@@ -1069,9 +1140,20 @@ function makeFetch(
     64 * 1024,
     Math.min(maxRequestBytesCeiling, options.maxRequestBytes ?? defaultMaxRequestBytes),
   )
-  const firstEventTimeoutMs = options.firstEventTimeoutMs ?? defaultFirstEventTimeoutMs
-  const idleTimeoutMs = options.idleTimeoutMs ?? defaultIdleTimeoutMs
-  const totalTimeoutMs = options.totalTimeoutMs ?? defaultTotalTimeoutMs
+  const candidatePolicy = internal.candidatePolicy ?? resolveProviderRuntimePolicy(settings, {
+    role: options.roleAffinity,
+    purpose: scenario === 'connection' ? 'connection' : options.purpose,
+    thinkingLevel: scenario === 'connection' ? 'off' : options.thinkingLevel,
+  })
+  const firstEventTimeoutMs = options.runtimePolicyManaged
+    ? candidatePolicy.firstEventTimeoutMs
+    : (options.firstEventTimeoutMs ?? defaultFirstEventTimeoutMs)
+  const idleTimeoutMs = options.runtimePolicyManaged
+    ? candidatePolicy.idleTimeoutMs
+    : (options.idleTimeoutMs ?? defaultIdleTimeoutMs)
+  const totalTimeoutMs = options.runtimePolicyManaged
+    ? candidatePolicy.totalTimeoutMs
+    : (options.totalTimeoutMs ?? defaultTotalTimeoutMs)
   const responseLimit = options.responseLimit ?? defaultStreamResponseLimit
   const maxTransportRetries = options.maxTransportRetries !== undefined
     ? Math.max(0, Math.floor(options.maxTransportRetries))
@@ -1131,6 +1213,7 @@ function makeFetch(
     if (outboundRaw !== raw && Buffer.byteLength(outboundRaw) > maxRequestBytes) {
       throw new Error('The model request exceeded Kovo Hunter’s size limit.')
     }
+    const estimatedRequestInputTokens = Math.max(1, Math.ceil(Buffer.byteLength(outboundRaw, 'utf8') / 4))
 
     const targetUrl = beta ? endpoint + '?beta=true' : endpoint
     const allowLocalModel = isLocalModelEnvEnabled()
@@ -1295,6 +1378,7 @@ function makeFetch(
         const usageAccumulator = new SseUsageAccumulator()
         const recordedParts: string[] = []
         const streamDecoder = new TextDecoder()
+        const streamStartMs = Date.now()
         let idleTimer: ReturnType<typeof setTimeout> | undefined
         let finalized = false
         let errored = false
@@ -1317,6 +1401,16 @@ function makeFetch(
           clearFirstEventTimer()
           clearIdleTimer()
           totalSignal.removeEventListener('abort', onTotalAbort)
+          if (options.streamTelemetry) {
+            if (stalled) {
+              options.streamTelemetry.recordStallAbort()
+            } else if (!streamAborted && !errored && !sawErrorFrame) {
+              options.streamTelemetry.recordCompletedTurn(
+                Math.max(0, Date.now() - streamStartMs),
+                candidatePolicy.slowTurnThresholdMs,
+              )
+            }
+          }
           if (options.record) {
             const tail = streamDecoder.decode()
             if (tail) recordedParts.push(tail)
@@ -1327,16 +1421,46 @@ function makeFetch(
           if (options.onUsage || emitTelemetry) {
             const usage = usageAccumulator.snapshot(settings.protocol)
             const reasoningTokens = usageAccumulator.reasoningSnapshot()
-            const hasUsage = usage.inputTokens > 0 || usage.outputTokens > 0
-            const costUsd = hasUsage || reasoningTokens > 0
-              ? estimateCostUsd(settings, usage.inputTokens, usage.outputTokens, usage.cachedInputTokens)
-              : 0
-            if (options.onUsage && hasUsage) {
+            const reportedCostUsd = usageAccumulator.reportedCostSnapshot()
+            const deltaChars = usageAccumulator.streamedDeltaCharsSnapshot()
+            const hasReportedUsage = usage.inputTokens > 0 || usage.outputTokens > 0
+            const isAbortOrErrorPath = stalled || streamAborted || errored || sawErrorFrame
+
+            let effectiveInputTokens = usage.inputTokens
+            let effectiveOutputTokens = usage.outputTokens
+            let costUsd = 0
+            let costEstimated = false
+            let costSource: UsageCostSource = 'token_rates'
+
+            if (reportedCostUsd !== undefined) {
+              costUsd = reportedCostUsd
+              costEstimated = false
+              costSource = 'provider_reported'
+            } else if (hasReportedUsage || reasoningTokens > 0) {
+              costUsd = estimateCostUsd(settings, usage.inputTokens, usage.outputTokens, usage.cachedInputTokens)
+              costEstimated = false
+              costSource = 'token_rates'
+            } else if (deltaChars > 0 || (isAbortOrErrorPath && emittedAnyChunk)) {
+              // Mid-stream abort/stall/drop before terminal usage frame: estimate output tokens
+              // from streamed deltas + outbound request input tokens and label as an estimate.
+              effectiveInputTokens = usage.inputTokens > 0 ? usage.inputTokens : estimatedRequestInputTokens
+              effectiveOutputTokens = deltaChars > 0 ? Math.max(1, Math.ceil(deltaChars / 4)) : 0
+              costUsd = estimateCostUsd(settings, effectiveInputTokens, effectiveOutputTokens, usage.cachedInputTokens)
+              costEstimated = true
+              costSource = 'abort_delta_estimate'
+            }
+
+            const shouldEmitUsage = hasReportedUsage || reportedCostUsd !== undefined || costEstimated
+            if (options.onUsage && shouldEmitUsage) {
               try {
                 options.onUsage({
-                  ...usage,
+                  inputTokens: effectiveInputTokens,
+                  cachedInputTokens: usage.cachedInputTokens,
+                  outputTokens: effectiveOutputTokens,
                   ...(reasoningTokens > 0 ? { reasoningTokens } : {}),
                   costUsd,
+                  ...(costEstimated ? { costEstimated: true } : {}),
+                  costSource,
                   profileId,
                 })
               } catch { /* usage observer must never throw */ }
@@ -1346,7 +1470,7 @@ function makeFetch(
               const isStalled = stalled
               const isAborted = !isStalled && streamAborted
               const isErrored = errored || (sawErrorFrame && retryTransientInFetch)
-              if (hasUsage || reasoningTokens > 0 || isStalled || truncatedToolCalls > 0 || isAborted || isErrored) {
+              if (shouldEmitUsage || reasoningTokens > 0 || isStalled || truncatedToolCalls > 0 || isAborted || isErrored) {
                 const outcome: ProviderUsageTelemetryOutcome = isStalled
                   ? 'stalled'
                   : truncatedToolCalls > 0
@@ -1357,9 +1481,9 @@ function makeFetch(
                         ? 'error'
                         : 'ok'
                 emitTelemetry({
-                  inputTokens: usage.inputTokens,
+                  inputTokens: effectiveInputTokens,
                   cachedInputTokens: usage.cachedInputTokens,
-                  outputTokens: usage.outputTokens,
+                  outputTokens: effectiveOutputTokens,
                   reasoningTokens,
                   costUsd,
                   outcome,
@@ -1542,23 +1666,29 @@ function makeFetch(
             ? firstEventController.signal.reason
             : firstEventTimeoutError()
           if (internal.attemptFailureState) internal.attemptFailureState.error = stallErr
+          options.streamTelemetry?.recordStallAbort()
           if (emitTelemetry) {
             emitTelemetry({ outcome: 'stalled', stalled: true, costUsd: 0 })
             if (internal.attemptTelemetryState) internal.attemptTelemetryState.recorded = true
           }
           throw stallErr
         }
-        if (emitTelemetry) {
+        if (emitTelemetry || options.streamTelemetry) {
           const isStall = isStallAbortReason(totalSignal.aborted ? totalSignal.reason : error)
           if (isStall) {
-            emitTelemetry({ outcome: 'stalled', stalled: true, costUsd: 0 })
-            if (internal.attemptTelemetryState) internal.attemptTelemetryState.recorded = true
-          } else if (totalSignal.aborted) {
-            emitTelemetry({ outcome: 'aborted', costUsd: 0 })
-            if (internal.attemptTelemetryState) internal.attemptTelemetryState.recorded = true
-          } else if (retryTransientInFetch) {
-            emitTelemetry({ outcome: 'error', costUsd: 0 })
-            if (internal.attemptTelemetryState) internal.attemptTelemetryState.recorded = true
+            options.streamTelemetry?.recordStallAbort()
+          }
+          if (emitTelemetry) {
+            if (isStall) {
+              emitTelemetry({ outcome: 'stalled', stalled: true, costUsd: 0 })
+              if (internal.attemptTelemetryState) internal.attemptTelemetryState.recorded = true
+            } else if (totalSignal.aborted) {
+              emitTelemetry({ outcome: 'aborted', costUsd: 0 })
+              if (internal.attemptTelemetryState) internal.attemptTelemetryState.recorded = true
+            } else if (retryTransientInFetch) {
+              emitTelemetry({ outcome: 'error', costUsd: 0 })
+              if (internal.attemptTelemetryState) internal.attemptTelemetryState.recorded = true
+            }
           }
         }
         if (!totalSignal.aborted) {
@@ -1666,12 +1796,18 @@ function buildSingleStreamImpl(
   fetchInternal: MakeFetchInternalOptions = {},
 ) {
   const api: Protocol = settings.protocol === 'responses' ? 'openai-responses' : 'anthropic-messages'
-  const maxTokens = clampMaxTokens(settings.maxTokens)
-  const contextWindow = clampContextWindow(settings.contextWindow)
   const effectiveThinking: ThinkingLevel = scenario === 'connection'
     ? 'off'
     : (options.thinkingLevel ?? settings.thinkingLevel ?? DEFAULT_PROVIDER.thinkingLevel)
-  const thinkingEnabled = effectiveThinking !== 'off'
+  const candidatePolicy = resolveProviderRuntimePolicy(settings, {
+    role: options.roleAffinity,
+    purpose: scenario === 'connection' ? 'connection' : options.purpose,
+    thinkingLevel: effectiveThinking,
+  })
+  const maxTokens = candidatePolicy.maxTokens
+  const contextWindow = candidatePolicy.contextWindow
+  const activeThinking = candidatePolicy.thinkingLevel
+  const thinkingEnabled = activeThinking !== 'off'
   const model: Model<Protocol> = {
     id: settings.model,
     name: settings.model,
@@ -1683,9 +1819,9 @@ function buildSingleStreamImpl(
     contextWindow,
     maxTokens,
     cost: {
-      input: settings.inputCostPerMtok ?? DEFAULT_PROVIDER.inputCostPerMtok,
-      output: settings.outputCostPerMtok ?? DEFAULT_PROVIDER.outputCostPerMtok,
-      cacheRead: settings.cachedInputCostPerMtok ?? DEFAULT_PROVIDER.cachedInputCostPerMtok,
+      input: candidatePolicy.pricing.inputCostPerMtok,
+      output: candidatePolicy.pricing.outputCostPerMtok,
+      cacheRead: candidatePolicy.pricing.cachedInputCostPerMtok,
       cacheWrite: 0,
     },
   }
@@ -1693,11 +1829,16 @@ function buildSingleStreamImpl(
   const chooseEvidenceTool = (transcript: { messages: { role: string }[] }) =>
     (scenario === 'worker-analysis' || scenario === 'response-analysis') && transcript.messages.at(-1)?.role === 'user'
   const redactError = (text: string) => redactProviderText(text, settings.key, options.secrets)
+  const effectiveTotalTimeoutMs = options.runtimePolicyManaged
+    ? candidatePolicy.totalTimeoutMs
+    : (options.totalTimeoutMs ?? defaultTotalTimeoutMs)
   const makeCallContext = () => {
+    options.onCandidatePolicy?.(candidatePolicy, settings)
     const tracker = new SseToolCallArgTracker()
     const send = makeFetch(settings, scenario, options, callCounter, profileId, {
       ...fetchInternal,
       argTracker: tracker,
+      candidatePolicy,
     })
     const streamOpts = {
       fetch: send,
@@ -1705,7 +1846,7 @@ function buildSingleStreamImpl(
       maxRetries: 0,
       // Total call ceiling for the SDK; per-chunk idle timeouts are enforced inside `makeFetch`
       // and reset in real time on every upstream SSE frame via `sanitizeProviderStream`.
-      timeoutMs: options.totalTimeoutMs ?? defaultTotalTimeoutMs,
+      timeoutMs: effectiveTotalTimeoutMs,
       // R2-H-2: Applied LAST in `streamOpts` so primary/caller `sOpts.apiKey` can never overwrite it.
       apiKey: settings.key,
     }
@@ -1753,7 +1894,7 @@ function buildSingleStreamImpl(
           ...sOpts,
           ...streamOpts,
           thinkingEnabled,
-          ...(thinkingEnabled ? { effort: effectiveThinking } : {}),
+          ...(activeThinking !== 'off' ? { effort: activeThinking } : {}),
           ...(connection ? { toolChoice: { type: 'tool' as const, name: 'kovo_connection' } } : {}),
         }),
         tracker,
@@ -1770,7 +1911,7 @@ function buildSingleStreamImpl(
           : simpleMessages(selected as Model<'anthropic-messages'>, transcript, {
             ...sOpts,
             ...streamOpts,
-            ...(thinkingEnabled ? { reasoning: effectiveThinking } : {}),
+            ...(activeThinking !== 'off' ? { reasoning: activeThinking } : {}),
           }),
         tracker,
         redactError,
@@ -2166,15 +2307,17 @@ export async function testProvider(
   record?: CallRecorder,
   extraOptions: Pick<ProviderOptions, 'fetch' | 'resolveHost'> = {},
 ): Promise<{ ok: true }> {
-  const { models, model } = provider(settings, 'connection', {
-    record,
-    maxCalls: 2,
-    maxTransportRetries: 0,
-    firstEventTimeoutMs: 35_000,
-    idleTimeoutMs: 35_000,
-    totalTimeoutMs: 45_000,
-    ...extraOptions,
-  })
+  const { models, model } = provider(
+    settings,
+    'connection',
+    providerOptionsFor(undefined, 'fast', 'connection', {
+      profile: settings,
+      record,
+      maxCalls: 2,
+      maxTransportRetries: 0,
+      ...extraOptions,
+    }),
+  )
   const stream = models.stream(model, {
     systemPrompt: 'Kovo Hunter connection test. Call kovo_connection with status ready. Do not add prose.',
     messages: [{ role: 'user', content: 'Check the Kovo Hunter connection.', timestamp: Date.now() }],
