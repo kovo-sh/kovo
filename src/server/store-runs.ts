@@ -143,6 +143,12 @@ export class RunsRepository {
     this.findings = findings
   }
 
+  private assertTenantRun(runId: string): void {
+    if (this.session.tenantId) {
+      this.session.requireRun(runId)
+    }
+  }
+
   private hasDeclinedOriginsColumn(): boolean {
     if (this.runDeclinedOriginsColumnKnown) return true
     const cols = this.session.client.prepare('PRAGMA table_info(runs)').all() as Array<{ name: string }>
@@ -371,32 +377,32 @@ export class RunsRepository {
     imageName?: string | null
     status?: LabContainerRow['status']
   }): LabContainerRow {
-    const now = Date.now()
-    const existing = this.session.db.select().from(tables.labContainers).where(and(
-      eq(tables.labContainers.runId, input.runId),
-      eq(tables.labContainers.containerName, input.containerName),
-    )).get()
-    if (existing) {
-      return this.session.db.update(tables.labContainers).set({
-        assignmentId: input.assignmentId !== undefined ? input.assignmentId : existing.assignmentId,
-        imageName: input.imageName !== undefined ? input.imageName : existing.imageName,
-        status: input.status ?? existing.status,
+    this.assertTenantRun(input.runId)
+    return this.session.transaction(() => {
+      const now = Date.now()
+      return this.session.db.insert(tables.labContainers).values({
+        id: randomUUID(),
+        runId: input.runId,
+        assignmentId: input.assignmentId ?? null,
+        containerName: input.containerName,
+        imageName: input.imageName ?? null,
+        status: input.status ?? 'running',
+        createdAt: now,
         updatedAt: now,
-      }).where(eq(tables.labContainers.id, existing.id)).returning().get()!
-    }
-    return this.session.db.insert(tables.labContainers).values({
-      id: randomUUID(),
-      runId: input.runId,
-      assignmentId: input.assignmentId ?? null,
-      containerName: input.containerName,
-      imageName: input.imageName ?? null,
-      status: input.status ?? 'running',
-      createdAt: now,
-      updatedAt: now,
-    }).returning().get()
+      }).onConflictDoUpdate({
+        target: [tables.labContainers.runId, tables.labContainers.containerName],
+        set: {
+          ...(input.assignmentId !== undefined ? { assignmentId: input.assignmentId } : {}),
+          ...(input.imageName !== undefined ? { imageName: input.imageName } : {}),
+          ...(input.status !== undefined ? { status: input.status } : {}),
+          updatedAt: now,
+        },
+      }).returning().get()!
+    }, { behavior: 'immediate' })
   }
 
   markLabContainerOrphaned(runId: string, containerName: string) {
+    this.assertTenantRun(runId)
     this.session.db.update(tables.labContainers).set({ status: 'orphaned', updatedAt: Date.now() }).where(and(
       eq(tables.labContainers.runId, runId),
       eq(tables.labContainers.containerName, containerName),
@@ -404,6 +410,7 @@ export class RunsRepository {
   }
 
   listLabContainers(runId: string): LabContainerRow[] {
+    this.assertTenantRun(runId)
     return this.session.db.select().from(tables.labContainers).where(eq(tables.labContainers.runId, runId))
       .orderBy(asc(tables.labContainers.createdAt), asc(tables.labContainers.containerName)).all()
   }
@@ -486,40 +493,44 @@ export class RunsRepository {
    */
   setOriginRole(run: Run, origin: string, role: OriginRole): Run {
     if (!originRoles.includes(role)) throw new Error('Unknown origin role.')
-    const project = this.projects.project(run.projectId)
-    const validated = assetOriginForEnvironment(project.environment).parse(origin)
-    const normalized = normalizeScopeOrigin(validated) ?? validated
-    const candidate = run.candidates.find(item => normalizeScopeOrigin(item.origin) === normalized)
-    const approved = new Set(run.approved)
-    if (role === 'target') {
-      if (!candidate) {
-        throw new Error('Add the host to the run inventory before approving it as a target origin.')
+    return this.session.transaction(() => {
+      const currentRun = this.run(run.id)
+      const project = this.projects.project(currentRun.projectId)
+      const validated = assetOriginForEnvironment(project.environment).parse(origin)
+      const normalized = normalizeScopeOrigin(validated) ?? validated
+      const candidate = currentRun.candidates.find(item => normalizeScopeOrigin(item.origin) === normalized)
+      const approved = new Set(currentRun.approved)
+      if (role === 'target') {
+        if (!candidate) {
+          throw new Error('Add the host to the run inventory before approving it as a target origin.')
+        }
+        approved.add(candidate.id)
+      } else if (candidate) {
+        approved.delete(candidate.id)
       }
-      approved.add(candidate.id)
-    } else if (candidate) {
-      approved.delete(candidate.id)
-    }
-    const without = (list: readonly string[] | undefined) =>
-      [...(list ?? [])].filter(item => normalizeScopeOrigin(item) !== normalized)
-    const updated = this.updateRun(run.id, {
-      approved: [...approved],
-      authOrigins: role === 'auth' ? [...new Set([...without(run.authOrigins), normalized])] : without(run.authOrigins),
-      assetOrigins: role === 'asset' ? [...new Set([...without(run.assetOrigins), normalized])] : without(run.assetOrigins),
-    })
-    const declined = new Set(this.getDeclinedOrigins(run.id))
-    if (role === 'target') {
-      declined.delete(normalized)
-    } else {
-      declined.add(normalized)
-    }
-    this.writeDeclinedOrigins(run.id, declined)
-    this.session.event(run.id, 'scope.origin_role', `Origin ${normalized} assigned the ${role} role.`, {
-      origin: normalized, role,
-    })
-    return updated
+      const without = (list: readonly string[] | undefined) =>
+        [...(list ?? [])].filter(item => normalizeScopeOrigin(item) !== normalized)
+      const updated = this.updateRun(currentRun.id, {
+        approved: [...approved],
+        authOrigins: role === 'auth' ? [...new Set([...without(currentRun.authOrigins), normalized])] : without(currentRun.authOrigins),
+        assetOrigins: role === 'asset' ? [...new Set([...without(currentRun.assetOrigins), normalized])] : without(currentRun.assetOrigins),
+      })
+      const declined = new Set(this.getDeclinedOrigins(currentRun.id))
+      if (role === 'target') {
+        declined.delete(normalized)
+      } else {
+        declined.add(normalized)
+      }
+      this.writeDeclinedOrigins(currentRun.id, declined)
+      this.session.event(currentRun.id, 'scope.origin_role', `Origin ${normalized} assigned the ${role} role.`, {
+        origin: normalized, role,
+      })
+      return updated
+    }, { behavior: 'immediate' })
   }
 
   boardMember(runId: string, handle: string): BoardMemberRow | undefined {
+    this.assertTenantRun(runId)
     const normalized = normalizeBoardHandle(handle)
     if (!normalized) return undefined
     return this.session.db.select().from(tables.boardMembers).where(and(
@@ -528,6 +539,7 @@ export class RunsRepository {
   }
 
   listBoardMembers(runId: string): BoardMemberRow[] {
+    this.assertTenantRun(runId)
     return this.session.db.select().from(tables.boardMembers).where(eq(tables.boardMembers.runId, runId))
       .orderBy(asc(tables.boardMembers.createdAt), asc(tables.boardMembers.handle)).all()
   }
@@ -548,7 +560,6 @@ export class RunsRepository {
     goalRevision?: number
     sourceOrigins?: readonly string[]
   }): BoardMemberRow {
-    const run = typeof runOrId === 'string' ? this.run(runOrId) : runOrId
     const handle = normalizeBoardHandle(input.handle)
     if (!handle || !boardHandlePattern.test(handle)) {
       throw new Error('Board handle must match ^[a-z][a-z0-9_-]{1,23}$.')
@@ -556,31 +567,35 @@ export class RunsRepository {
     if (input.specialistProfile && !specialistProfiles.includes(input.specialistProfile)) {
       throw new Error('Unknown specialist profile.')
     }
-    const now = Date.now()
-    const existing = this.boardMember(run.id, handle)
-    const values = {
-      handle,
-      role: input.role,
-      specialistProfile: input.specialistProfile ?? existing?.specialistProfile ?? null,
-      sessionId: input.sessionId ?? existing?.sessionId ?? randomUUID(),
-      activeAssignmentId: input.activeAssignmentId !== undefined ? input.activeAssignmentId : existing?.activeAssignmentId ?? null,
-      state: input.state ?? existing?.state ?? 'waiting',
-      roleAffinity: input.roleAffinity !== undefined ? input.roleAffinity : existing?.roleAffinity ?? null,
-      lastReadSeq: Math.max(0, Math.round(input.lastReadSeq ?? existing?.lastReadSeq ?? 0)),
-      turnsUsed: Math.max(0, Math.round(input.turnsUsed ?? existing?.turnsUsed ?? 0)),
-      postsCount: Math.max(0, Math.round(input.postsCount ?? existing?.postsCount ?? 0)),
-      peerHopsUsed: Math.max(0, Math.round(input.peerHopsUsed ?? existing?.peerHopsUsed ?? 0)),
-      scopeRevision: Math.max(0, Math.round(input.scopeRevision ?? existing?.scopeRevision ?? run.scopeRevision)),
-      goalRevision: Math.max(0, Math.round(input.goalRevision ?? existing?.goalRevision ?? run.goalRevision)),
-      sourceOrigins: [...new Set(input.sourceOrigins ?? existing?.sourceOrigins ?? [])],
-    }
-    if (existing) {
-      return this.session.db.update(tables.boardMembers).set({ ...values, updatedAt: now })
-        .where(eq(tables.boardMembers.id, existing.id)).returning().get()!
-    }
-    return this.session.db.insert(tables.boardMembers).values({
-      id: randomUUID(), runId: run.id, ...values, createdAt: now, updatedAt: now,
-    }).returning().get()
+    const runId = typeof runOrId === 'string' ? runOrId : runOrId.id
+    return this.session.transaction(() => {
+      const run = typeof runOrId === 'string' ? this.run(runId) : (this.assertTenantRun(runId), runOrId)
+      const now = Date.now()
+      const existing = this.boardMember(run.id, handle)
+      const values = {
+        handle,
+        role: input.role,
+        specialistProfile: input.specialistProfile ?? existing?.specialistProfile ?? null,
+        sessionId: input.sessionId ?? existing?.sessionId ?? randomUUID(),
+        activeAssignmentId: input.activeAssignmentId !== undefined ? input.activeAssignmentId : existing?.activeAssignmentId ?? null,
+        state: input.state ?? existing?.state ?? 'waiting',
+        roleAffinity: input.roleAffinity !== undefined ? input.roleAffinity : existing?.roleAffinity ?? null,
+        lastReadSeq: Math.max(0, Math.round(input.lastReadSeq ?? existing?.lastReadSeq ?? 0)),
+        turnsUsed: Math.max(0, Math.round(input.turnsUsed ?? existing?.turnsUsed ?? 0)),
+        postsCount: Math.max(0, Math.round(input.postsCount ?? existing?.postsCount ?? 0)),
+        peerHopsUsed: Math.max(0, Math.round(input.peerHopsUsed ?? existing?.peerHopsUsed ?? 0)),
+        scopeRevision: Math.max(0, Math.round(input.scopeRevision ?? existing?.scopeRevision ?? run.scopeRevision)),
+        goalRevision: Math.max(0, Math.round(input.goalRevision ?? existing?.goalRevision ?? run.goalRevision)),
+        sourceOrigins: [...new Set(input.sourceOrigins ?? existing?.sourceOrigins ?? [])],
+      }
+      if (existing) {
+        return this.session.db.update(tables.boardMembers).set({ ...values, updatedAt: now })
+          .where(eq(tables.boardMembers.id, existing.id)).returning().get()!
+      }
+      return this.session.db.insert(tables.boardMembers).values({
+        id: randomUUID(), runId: run.id, ...values, createdAt: now, updatedAt: now,
+      }).returning().get()
+    }, { behavior: 'immediate' })
   }
 
   updateBoardMemberState(runId: string, handle: string, patch: {
@@ -596,24 +611,26 @@ export class RunsRepository {
     sourceOrigins?: readonly string[]
     sessionId?: string
   }): BoardMemberRow {
-    const existing = this.boardMember(runId, handle)
-    if (!existing) throw new Error('Board member not found.')
-    return this.upsertBoardMember(runId, {
-      handle: existing.handle,
-      role: existing.role,
-      specialistProfile: existing.specialistProfile,
-      sessionId: patch.sessionId ?? existing.sessionId,
-      activeAssignmentId: patch.activeAssignmentId !== undefined ? patch.activeAssignmentId : existing.activeAssignmentId,
-      state: patch.state ?? existing.state,
-      roleAffinity: patch.roleAffinity !== undefined ? patch.roleAffinity : existing.roleAffinity,
-      lastReadSeq: patch.lastReadSeq ?? existing.lastReadSeq,
-      turnsUsed: patch.turnsUsed ?? existing.turnsUsed,
-      postsCount: patch.postsCount ?? existing.postsCount,
-      peerHopsUsed: patch.peerHopsUsed ?? existing.peerHopsUsed,
-      scopeRevision: patch.scopeRevision ?? existing.scopeRevision,
-      goalRevision: patch.goalRevision ?? existing.goalRevision,
-      sourceOrigins: patch.sourceOrigins ?? existing.sourceOrigins,
-    })
+    return this.session.transaction(() => {
+      const existing = this.boardMember(runId, handle)
+      if (!existing) throw new Error('Board member not found.')
+      return this.upsertBoardMember(runId, {
+        handle: existing.handle,
+        role: existing.role,
+        specialistProfile: existing.specialistProfile,
+        sessionId: patch.sessionId ?? existing.sessionId,
+        activeAssignmentId: patch.activeAssignmentId !== undefined ? patch.activeAssignmentId : existing.activeAssignmentId,
+        state: patch.state ?? existing.state,
+        roleAffinity: patch.roleAffinity !== undefined ? patch.roleAffinity : existing.roleAffinity,
+        lastReadSeq: patch.lastReadSeq ?? existing.lastReadSeq,
+        turnsUsed: patch.turnsUsed ?? existing.turnsUsed,
+        postsCount: patch.postsCount ?? existing.postsCount,
+        peerHopsUsed: patch.peerHopsUsed ?? existing.peerHopsUsed,
+        scopeRevision: patch.scopeRevision ?? existing.scopeRevision,
+        goalRevision: patch.goalRevision ?? existing.goalRevision,
+        sourceOrigins: patch.sourceOrigins ?? existing.sourceOrigins,
+      })
+    }, { behavior: 'immediate' })
   }
 
   retireBoardMember(run: Run | string, handle: string, reason: string): BoardMemberRow {
@@ -718,10 +735,11 @@ export class RunsRepository {
       if (!exists) throw new Error('Cannot reply to a board sequence that does not exist.')
     }
     const message = this.session.transaction(() => {
+      const now = Date.now()
       const maxSeq = this.session.db.select({ value: sql<number>`COALESCE(MAX(${tables.boardMessages.seq}), 0)` })
         .from(tables.boardMessages).where(eq(tables.boardMessages.runId, run.id)).get()
       const seq = Number(maxSeq?.value ?? 0) + 1
-      return this.session.db.insert(tables.boardMessages).values({
+      const inserted = this.session.db.insert(tables.boardMessages).values({
         id: randomUUID(),
         runId: run.id,
         seq,
@@ -740,14 +758,17 @@ export class RunsRepository {
         goalRevision: run.goalRevision,
         sourceOrigins,
         tainted: false,
-        createdAt: Date.now(),
+        createdAt: now,
       }).returning().get()
+      this.session.db.update(tables.boardMembers).set({
+        postsCount: sql`${tables.boardMembers.postsCount} + 1`,
+        updatedAt: now,
+      }).where(and(
+        eq(tables.boardMembers.runId, run.id),
+        eq(tables.boardMembers.handle, authorHandle),
+      )).run()
+      return inserted
     }, { behavior: 'immediate' })
-    const member = this.boardMember(run.id, authorHandle)
-    if (member) {
-      this.session.db.update(tables.boardMembers).set({ postsCount: member.postsCount + 1, updatedAt: Date.now() })
-        .where(eq(tables.boardMembers.id, member.id)).run()
-    }
     this.session.event(run.id, 'board.message', `@${authorHandle} posted a ${input.kind}.`, {
       boardMessageId: message.id, seq: message.seq, authorHandle, authorRole: input.authorRole,
       kind: input.kind, mentions, refApprovalId: message.refApprovalId, tainted: false,
@@ -764,6 +785,7 @@ export class RunsRepository {
     mentionHandle?: string
     approvalId?: string
   } = {}): BoardMessageRow[] {
+    this.assertTenantRun(runId)
     const sinceSeq = Math.max(0, Math.round(opts.sinceSeq ?? 0))
     const limit = Math.min(Math.max(1, opts.limit ?? 200), 500)
     const authorHandle = opts.authorHandle ? normalizeBoardHandle(opts.authorHandle) : null
@@ -788,40 +810,43 @@ export class RunsRepository {
     taintedMessageIds: string[]
     retiredHandles: string[]
   } {
-    // IdP/CDN hops are benign infrastructure: they must never taint a valid target finding.
-    const policy = this.scopePolicy(runId)
-    const allowed = (origin: string) =>
-      approvedOrigins.has(origin) || isProvenanceOriginAllowed(policy, origin)
-    const taintedMessageIds: string[] = []
-    for (const message of this.session.db.select().from(tables.boardMessages).where(and(
-      eq(tables.boardMessages.runId, runId), eq(tables.boardMessages.tainted, false),
-    )).all()) {
-      if (message.sourceOrigins.some(origin => !allowed(origin))) {
-        taintedMessageIds.push(message.id)
+    return this.session.transaction(() => {
+      // IdP/CDN hops are benign infrastructure: they must never taint a valid target finding.
+      const policy = this.scopePolicy(runId)
+      const allowed = (origin: string) =>
+        approvedOrigins.has(origin) || isProvenanceOriginAllowed(policy, origin)
+      const taintedMessageIds: string[] = []
+      for (const message of this.session.db.select().from(tables.boardMessages).where(and(
+        eq(tables.boardMessages.runId, runId), eq(tables.boardMessages.tainted, false),
+      )).all()) {
+        if (message.sourceOrigins.some(origin => !allowed(origin))) {
+          taintedMessageIds.push(message.id)
+        }
       }
-    }
-    if (taintedMessageIds.length) {
-      this.session.db.update(tables.boardMessages).set({ tainted: true }).where(and(
-        eq(tables.boardMessages.runId, runId), inArray(tables.boardMessages.id, taintedMessageIds),
-      )).run()
-    }
-    const retiredHandles: string[] = []
-    for (const member of this.listBoardMembers(runId)) {
-      if (member.state === 'retired') continue
-      if (member.sourceOrigins.some(origin => !allowed(origin))) {
-        this.updateBoardMemberState(runId, member.handle, { state: 'retired', activeAssignmentId: null })
-        retiredHandles.push(member.handle)
+      if (taintedMessageIds.length) {
+        this.session.db.update(tables.boardMessages).set({ tainted: true }).where(and(
+          eq(tables.boardMessages.runId, runId), inArray(tables.boardMessages.id, taintedMessageIds),
+        )).run()
       }
-    }
-    if (taintedMessageIds.length || retiredHandles.length) {
-      this.session.event(runId, 'board.tainted', 'Scope revocation tainted board messages and retired affected members.', {
-        taintedMessageIds, retiredHandles,
-      })
-    }
-    return { taintedMessageIds, retiredHandles }
+      const retiredHandles: string[] = []
+      for (const member of this.listBoardMembers(runId)) {
+        if (member.state === 'retired') continue
+        if (member.sourceOrigins.some(origin => !allowed(origin))) {
+          this.updateBoardMemberState(runId, member.handle, { state: 'retired', activeAssignmentId: null })
+          retiredHandles.push(member.handle)
+        }
+      }
+      if (taintedMessageIds.length || retiredHandles.length) {
+        this.session.event(runId, 'board.tainted', 'Scope revocation tainted board messages and retired affected members.', {
+          taintedMessageIds, retiredHandles,
+        })
+      }
+      return { taintedMessageIds, retiredHandles }
+    }, { behavior: 'immediate' })
   }
 
   eventsAfter(runId: string, after: number, limit = 1000) {
+    this.assertTenantRun(runId)
     return this.session.db.select({
       id: tables.events.id, kind: tables.events.kind, message: tables.events.message,
       detail: tables.events.detail, createdAt: tables.events.createdAt,
@@ -834,16 +859,28 @@ export class RunsRepository {
   runShellSummary(runId: string, limit = 200): RunShellSummary {
     const run = this.run(runId)
     const safeLimit = resolvePageLimit(limit, 200)
-    const runs = this.session.client.prepare(`
-      select r.id as id, r.goal as goal, r.status as status, r.phase as phase,
-        r.created_at as createdAt, r.project_id as projectId, p.name as projectName,
-        (select count(*) from findings f where f.run_id = r.id and f.superseded_by_finding_id is null) as findings
-      from runs r
-      join projects p on p.id = r.project_id
-      where r.workspace_id = ?
-      order by r.created_at desc, r.rowid desc
-      limit ?
-    `).all(run.workspaceId, safeLimit) as unknown as RunShellIndexEntry[]
+    const runs = this.session.tenantId
+      ? (this.session.client.prepare(`
+          select r.id as id, r.goal as goal, r.status as status, r.phase as phase,
+            r.created_at as createdAt, r.project_id as projectId, p.name as projectName,
+            (select count(*) from findings f where f.run_id = r.id and f.superseded_by_finding_id is null) as findings
+          from runs r
+          join projects p on p.id = r.project_id
+          where r.workspace_id = ?
+            and COALESCE(NULLIF(r.tenant_id, 'default'), p.tenant_id, 'default') = ?
+          order by r.created_at desc, r.rowid desc
+          limit ?
+        `).all(run.workspaceId, this.session.tenantId, safeLimit) as unknown as RunShellIndexEntry[])
+      : (this.session.client.prepare(`
+          select r.id as id, r.goal as goal, r.status as status, r.phase as phase,
+            r.created_at as createdAt, r.project_id as projectId, p.name as projectName,
+            (select count(*) from findings f where f.run_id = r.id and f.superseded_by_finding_id is null) as findings
+          from runs r
+          join projects p on p.id = r.project_id
+          where r.workspace_id = ?
+          order by r.created_at desc, r.rowid desc
+          limit ?
+        `).all(run.workspaceId, safeLimit) as unknown as RunShellIndexEntry[])
     const counts = this.session.client.prepare(`
       select
         (select count(*) from broker_exchanges where run_id = ?) as exchanges,
@@ -862,6 +899,12 @@ export class RunsRepository {
       .where(and(eq(tables.runs.id, runId), eq(tables.runs.workspaceId, this.session.workspace.id)))
       .get()
     if (!run) return false
+    if (this.session.tenantId) {
+      const owner = this.session.effectiveRunTenant(runId) ?? 'default'
+      if (owner !== this.session.tenantId) {
+        throw new TenantIsolationError(this.session.tenantId, owner, runId)
+      }
+    }
     if (run.status === 'running') return true
     const activeAssignments = this.session.client.prepare(
       `SELECT count(*) AS c FROM assignments WHERE run_id = ? AND status IN ('running', 'waiting_approval')`,
@@ -875,6 +918,7 @@ export class RunsRepository {
 
   /** Return all run IDs belonging to a project that are currently active. */
   listActiveRunIdsForProject(projectId: string): string[] {
+    if (this.session.tenantId) this.projects.project(projectId)
     const rows = this.session.db.select({ id: tables.runs.id })
       .from(tables.runs)
       .where(and(eq(tables.runs.projectId, projectId), eq(tables.runs.workspaceId, this.session.workspace.id)))
@@ -894,6 +938,12 @@ export class RunsRepository {
         .where(and(eq(tables.runs.id, runId), eq(tables.runs.workspaceId, this.session.workspace.id)))
         .get()
       if (!existing) return null
+      if (this.session.tenantId) {
+        const owner = this.session.effectiveRunTenant(runId) ?? 'default'
+        if (owner !== this.session.tenantId) {
+          throw new TenantIsolationError(this.session.tenantId, owner, runId)
+        }
+      }
       const files = this.session.deleteRunRowsInTx(runId)
       this.session.event(null, 'run.deleted', `Deleted run ${runId}.`, {
         projectId: existing.projectId,
@@ -902,7 +952,7 @@ export class RunsRepository {
       return { projectId: existing.projectId, ...files }
     }, { behavior: 'immediate' })
     if (!committed) return { deleted: false, projectId: '', runId }
-    this.session.cleanupRunFilesOnDisk(runId, committed.sessionIds, committed.flatArtifactIds)
+    this.session.cleanupRunFilesOnDisk(runId, committed.sessionIds, committed.flatArtifactIds, committed.tenantBlobFiles)
     return { deleted: true, projectId: committed.projectId, runId }
   }
 
@@ -1088,14 +1138,17 @@ export class RunsRepository {
   }
 
   workerList(runId: string) {
+    this.assertTenantRun(runId)
     return this.session.db.select().from(tables.assignments).where(eq(tables.assignments.runId, runId))
       .orderBy(asc(tables.assignments.createdAt), asc(tables.assignments.title)).all()
   }
 
   runnable() {
-    return this.session.db.select().from(tables.runs).where(and(
+    const rows = this.session.db.select().from(tables.runs).where(and(
       eq(tables.runs.workspaceId, this.session.workspace.id), eq(tables.runs.status, 'running'),
     )).orderBy(asc(tables.runs.createdAt)).all()
+    if (!this.session.tenantId) return rows
+    return rows.filter(row => (this.session.effectiveRunTenant(row.id) ?? 'default') === this.session.tenantId)
   }
 
   runsWithPendingRetests() {
@@ -1104,9 +1157,11 @@ export class RunsRepository {
     )).all()
     const ids = [...new Set(queuedRetests.map(r => r.runId))]
     if (!ids.length) return []
-    return this.session.db.select().from(tables.runs).where(and(
+    const rows = this.session.db.select().from(tables.runs).where(and(
       eq(tables.runs.workspaceId, this.session.workspace.id), inArray(tables.runs.id, ids),
     )).all()
+    if (!this.session.tenantId) return rows
+    return rows.filter(row => (this.session.effectiveRunTenant(row.id) ?? 'default') === this.session.tenantId)
   }
 
   worker(workerId: string) {
@@ -1119,6 +1174,7 @@ export class RunsRepository {
   // --- Threat Models, Chain Steps, Digests ---
 
   saveThreatModel(run: Run, entries: ThreatModelSummary[], summary: string): ThreatModel {
+    this.assertTenantRun(run.id)
     const row = this.session.db.insert(tables.threatModels).values({
       id: randomUUID(),
       runId: run.id,
@@ -1135,6 +1191,7 @@ export class RunsRepository {
   }
 
   latestThreatModel(runId: string, goalRevision?: number): ThreatModel | null {
+    this.assertTenantRun(runId)
     const where = goalRevision !== undefined
       ? and(eq(tables.threatModels.runId, runId), eq(tables.threatModels.goalRevision, goalRevision))
       : eq(tables.threatModels.runId, runId)
@@ -1143,6 +1200,7 @@ export class RunsRepository {
   }
 
   listChainSteps(runId: string, goalRevision?: number): ChainStep[] {
+    this.assertTenantRun(runId)
     const where = goalRevision !== undefined
       ? and(eq(tables.chainSteps.runId, runId), eq(tables.chainSteps.goalRevision, goalRevision))
       : eq(tables.chainSteps.runId, runId)
@@ -1171,32 +1229,35 @@ export class RunsRepository {
     ) {
       throw new Error(`Invalid specialistProfile "${String(input.specialistProfile)}": expected one of ${specialistProfiles.join(', ')}.`)
     }
-    const existingSteps = this.listChainSteps(run.id)
-    const nextSeq = (existingSteps.at(-1)?.seq ?? 0) + 1
     const depFactIds = [...new Set(input.dependsOnFactIds ?? [])]
     const depStepIds = [...new Set(input.dependsOnStepIds ?? [])]
-    const origins = new Set<string>(input.sourceOrigins ?? [])
-    for (const assetId of input.targetAssetIds) {
-      const asset = run.candidates.find(c => c.id === assetId)
-      if (asset) origins.add(asset.origin)
-    }
-    if (depFactIds.length) {
-      const depFacts = this.session.db.select().from(tables.facts).where(and(
-        eq(tables.facts.runId, run.id), inArray(tables.facts.id, depFactIds),
-      )).all()
-      for (const f of depFacts) {
-        origins.add(f.origin)
-        for (const o of f.sourceOrigins) origins.add(o)
-      }
-    }
-    const allDepStepsComplete = depStepIds.every(sid => existingSteps.find(s => s.id === sid)?.status === 'complete')
-    const now = Date.now()
     const step = this.session.transaction(() => {
+      const currentRun = this.run(run.id)
+      const maxSeqRow = this.session.db.select({ value: sql<number>`COALESCE(MAX(${tables.chainSteps.seq}), 0)` })
+        .from(tables.chainSteps).where(eq(tables.chainSteps.runId, currentRun.id)).get()
+      const nextSeq = Number(maxSeqRow?.value ?? 0) + 1
+      const existingSteps = depStepIds.length ? this.listChainSteps(currentRun.id) : []
+      const origins = new Set<string>(input.sourceOrigins ?? [])
+      for (const assetId of input.targetAssetIds) {
+        const asset = currentRun.candidates.find(c => c.id === assetId)
+        if (asset) origins.add(asset.origin)
+      }
+      if (depFactIds.length) {
+        const depFacts = this.session.db.select().from(tables.facts).where(and(
+          eq(tables.facts.runId, currentRun.id), inArray(tables.facts.id, depFactIds),
+        )).all()
+        for (const f of depFacts) {
+          origins.add(f.origin)
+          for (const o of f.sourceOrigins) origins.add(o)
+        }
+      }
+      const allDepStepsComplete = depStepIds.every(sid => existingSteps.find(s => s.id === sid)?.status === 'complete')
+      const now = Date.now()
       const created = this.session.db.insert(tables.chainSteps).values({
         id: randomUUID(),
-        runId: run.id,
-        goalRevision: run.goalRevision,
-        scopeRevision: run.scopeRevision,
+        runId: currentRun.id,
+        goalRevision: currentRun.goalRevision,
+        scopeRevision: currentRun.scopeRevision,
         seq: nextSeq,
         title: redact(input.title.slice(0, 200)),
         hypothesis: redact(input.hypothesis.slice(0, 1200)),
@@ -1216,72 +1277,79 @@ export class RunsRepository {
         updatedAt: now,
       }).returning().get()
       for (const fId of depFactIds) {
-        this.findings.addGraphEdge(run.id, { fromKind: 'step', fromId: created.id, toKind: 'fact', toId: fId, edgeKind: 'depends_on' })
+        this.findings.addGraphEdge(currentRun.id, { fromKind: 'step', fromId: created.id, toKind: 'fact', toId: fId, edgeKind: 'depends_on' })
       }
       for (const sId of depStepIds) {
-        this.findings.addGraphEdge(run.id, { fromKind: 'step', fromId: created.id, toKind: 'step', toId: sId, edgeKind: 'depends_on' })
+        this.findings.addGraphEdge(currentRun.id, { fromKind: 'step', fromId: created.id, toKind: 'step', toId: sId, edgeKind: 'depends_on' })
       }
+      this.session.event(currentRun.id, 'chain_step.created', `Planned step #${created.seq}: ${created.title}`, {
+        stepId: created.id, seq: created.seq, priority: created.priority, category: created.category,
+      })
       return created
     }, { behavior: 'immediate' })
-    this.session.event(run.id, 'chain_step.created', `Planned step #${step.seq}: ${step.title}`, {
-      stepId: step.id, seq: step.seq, priority: step.priority, category: step.category,
-    })
     return step
   }
 
   updateChainStep(stepId: string, patch: Partial<ChainStep>): ChainStep {
-    const existing = this.session.db.select().from(tables.chainSteps).where(eq(tables.chainSteps.id, stepId)).get()
-    if (!existing) throw new Error('Chain step not found.')
-    // `canceled` is terminal: a sibling trial's worker can finish after early-stop and must not
-    // resurrect its step as complete/running.
-    if (existing.status === 'canceled' && patch.status && patch.status !== 'canceled') {
-      return existing as unknown as ChainStep
-    }
-    const updated = this.session.db.update(tables.chainSteps).set({ ...patch, updatedAt: Date.now() })
-      .where(eq(tables.chainSteps.id, stepId)).returning().get()
-    if (!updated) throw new Error('Chain step not found.')
-    return updated
+    return this.session.transaction(() => {
+      const existing = this.session.db.select().from(tables.chainSteps).where(eq(tables.chainSteps.id, stepId)).get()
+      if (!existing) throw new Error('Chain step not found.')
+      this.session.requireRun(existing.runId)
+      // `canceled` is terminal: a sibling trial's worker can finish after early-stop and must not
+      // resurrect its step as complete/running.
+      if (existing.status === 'canceled' && patch.status && patch.status !== 'canceled') {
+        return existing as unknown as ChainStep
+      }
+      const updated = this.session.db.update(tables.chainSteps).set({ ...patch, updatedAt: Date.now() })
+        .where(eq(tables.chainSteps.id, stepId)).returning().get()
+      if (!updated) throw new Error('Chain step not found.')
+      return updated
+    }, { behavior: 'immediate' })
   }
 
   refreshReadyChainSteps(runId: string, goalRevision: number) {
-    const steps = this.listChainSteps(runId, goalRevision)
-    const stepById = new Map(steps.map(s => [s.id, { ...s }]))
-    const runFacts = new Map(
-      this.session.db.select({ id: tables.facts.id, tainted: tables.facts.tainted }).from(tables.facts)
-        .where(eq(tables.facts.runId, runId)).all().map(f => [f.id, f]),
-    )
-    // Fixed-point propagation so transitive chains (A blocked/canceled/tainted -> B -> C)
-    // resolve in one pass and circuit-open steps (M-12) can never wedge driveInvestigation.
-    let changed = true
-    while (changed) {
-      changed = false
-      for (const step of stepById.values()) {
-        if (step.status !== 'pending') continue
-        const taintedDep = step.dependsOnStepIds.some(sid => {
-          const s = stepById.get(sid)
-          return s && (s.status === 'tainted' || s.status === 'canceled' || s.status === 'blocked')
-        }) || step.dependsOnFactIds.some(fid => runFacts.get(fid)?.tainted)
-        if (taintedDep) {
-          this.updateChainStep(step.id, { status: 'tainted' })
-          step.status = 'tainted'
-          changed = true
-          continue
-        }
-        const ready = step.dependsOnStepIds.every(sid => stepById.get(sid)?.status === 'complete') &&
-          step.dependsOnFactIds.every(fid => {
-            const f = runFacts.get(fid)
-            return f && !f.tainted
-          })
-        if (ready) {
-          this.updateChainStep(step.id, { status: 'ready' })
-          step.status = 'ready'
-          changed = true
+    this.session.transaction(() => {
+      this.assertTenantRun(runId)
+      const steps = this.listChainSteps(runId, goalRevision)
+      const stepById = new Map(steps.map(s => [s.id, { ...s }]))
+      const runFacts = new Map(
+        this.session.db.select({ id: tables.facts.id, tainted: tables.facts.tainted }).from(tables.facts)
+          .where(eq(tables.facts.runId, runId)).all().map(f => [f.id, f]),
+      )
+      // Fixed-point propagation so transitive chains (A blocked/canceled/tainted -> B -> C)
+      // resolve in one pass and circuit-open steps (M-12) can never wedge driveInvestigation.
+      let changed = true
+      while (changed) {
+        changed = false
+        for (const step of stepById.values()) {
+          if (step.status !== 'pending') continue
+          const taintedDep = step.dependsOnStepIds.some(sid => {
+            const s = stepById.get(sid)
+            return s && (s.status === 'tainted' || s.status === 'canceled' || s.status === 'blocked')
+          }) || step.dependsOnFactIds.some(fid => runFacts.get(fid)?.tainted)
+          if (taintedDep) {
+            this.updateChainStep(step.id, { status: 'tainted' })
+            step.status = 'tainted'
+            changed = true
+            continue
+          }
+          const ready = step.dependsOnStepIds.every(sid => stepById.get(sid)?.status === 'complete') &&
+            step.dependsOnFactIds.every(fid => {
+              const f = runFacts.get(fid)
+              return f && !f.tainted
+            })
+          if (ready) {
+            this.updateChainStep(step.id, { status: 'ready' })
+            step.status = 'ready'
+            changed = true
+          }
         }
       }
-    }
+    }, { behavior: 'immediate' })
   }
 
   listDigests(runId: string, activeOnly = true): GraphDigest[] {
+    this.assertTenantRun(runId)
     const where = activeOnly
       ? and(eq(tables.graphDigests.runId, runId), eq(tables.graphDigests.active, true))
       : eq(tables.graphDigests.runId, runId)
@@ -1363,34 +1431,37 @@ export class RunsRepository {
     secrets?: readonly NamedSecret[]
   }): ApprovalRequest {
     const secrets = input.secrets ?? []
-    const now = Date.now()
-    const row = this.session.db.insert(tables.approvalRequests).values({
-      id: randomUUID(),
-      runId: run.id,
-      assignmentId: assignment.id,
-      scopeRevision: run.scopeRevision,
-      origin: input.origin,
-      method: input.method.toUpperCase(),
-      pathAndQuery: redact(input.pathAndQuery, secrets),
-      personaHandle: input.personaHandle ?? null,
-      rationale: redact(input.rationale, secrets),
-      requestPreview: redact(input.requestPreview, secrets),
-      status: 'pending',
-      decidedBy: null,
-      decidedAt: null,
-      policyNote: input.policyNote ? redact(input.policyNote, secrets) : null,
-      riskLevel: input.riskLevel ?? null,
-      expiresAt: now + (input.expiresInMs ?? 15 * 60_000),
-      createdAt: now,
-    }).returning().get()
-    this.updateWorker(assignment.id, { status: 'waiting_approval' })
-    this.session.event(run.id, 'approval.requested', `Tier 3 approval requested for ${row.method} ${row.origin}${row.pathAndQuery.slice(0, 80)}.`, {
-      approvalId: row.id, assignmentId: assignment.id, origin: row.origin, method: row.method,
-      riskLevel: row.riskLevel, policyNote: row.policyNote,
-    })
-    this.session.message(run.id, run.coordinatorId, 'kovo',
-      `Tier 3 approval required: ${row.method} ${row.origin}${row.pathAndQuery}\nRationale: ${row.rationale}`)
-    return row
+    return this.session.transaction(() => {
+      const currentRun = this.run(run.id)
+      const now = Date.now()
+      const row = this.session.db.insert(tables.approvalRequests).values({
+        id: randomUUID(),
+        runId: currentRun.id,
+        assignmentId: assignment.id,
+        scopeRevision: currentRun.scopeRevision,
+        origin: input.origin,
+        method: input.method.toUpperCase(),
+        pathAndQuery: redact(input.pathAndQuery, secrets),
+        personaHandle: input.personaHandle ?? null,
+        rationale: redact(input.rationale, secrets),
+        requestPreview: redact(input.requestPreview, secrets),
+        status: 'pending',
+        decidedBy: null,
+        decidedAt: null,
+        policyNote: input.policyNote ? redact(input.policyNote, secrets) : null,
+        riskLevel: input.riskLevel ?? null,
+        expiresAt: now + (input.expiresInMs ?? 15 * 60_000),
+        createdAt: now,
+      }).returning().get()
+      this.updateWorker(assignment.id, { status: 'waiting_approval' })
+      this.session.event(currentRun.id, 'approval.requested', `Tier 3 approval requested for ${row.method} ${row.origin}${row.pathAndQuery.slice(0, 80)}.`, {
+        approvalId: row.id, assignmentId: assignment.id, origin: row.origin, method: row.method,
+        riskLevel: row.riskLevel, policyNote: row.policyNote,
+      })
+      this.session.message(currentRun.id, currentRun.coordinatorId, 'kovo',
+        `Tier 3 approval required: ${row.method} ${row.origin}${row.pathAndQuery}\nRationale: ${row.rationale}`)
+      return row
+    }, { behavior: 'immediate' })
   }
 
   /**
@@ -1449,14 +1520,17 @@ export class RunsRepository {
   }
 
   getApprovalRequest(runId: string, approvalId: string): ApprovalRequest {
+    this.assertTenantRun(runId)
     const row = this.session.db.select().from(tables.approvalRequests).where(and(
       eq(tables.approvalRequests.runId, runId), eq(tables.approvalRequests.id, approvalId),
     )).get()
     if (!row) throw new Error('Approval request not found.')
+    this.session.requireRun(row.runId)
     return row
   }
 
   listApprovalRequests(runId: string, status?: ApprovalRequest['status']): ApprovalRequest[] {
+    this.assertTenantRun(runId)
     const where = status
       ? and(eq(tables.approvalRequests.runId, runId), eq(tables.approvalRequests.status, status))
       : eq(tables.approvalRequests.runId, runId)
@@ -1520,6 +1594,7 @@ export class RunsRepository {
   }
 
   listApprovalLeases(runId: string, status?: ApprovalLeaseRow['status']): ApprovalLeaseRow[] {
+    this.assertTenantRun(runId)
     const where = status
       ? and(eq(tables.approvalLeases.runId, runId), eq(tables.approvalLeases.status, status))
       : eq(tables.approvalLeases.runId, runId)
@@ -1562,35 +1637,43 @@ export class RunsRepository {
   leaseAuthorizes(runId: string, origin: string, method: string, pathAndQuery: string): boolean {
     const normalized = normalizeScopeOrigin(origin)
     if (!normalized) return false
-    let run: Run
-    try {
-      run = this.run(runId)
-    } catch {
-      return false
-    }
     const normalizedPattern = normalizeApprovalPathPattern(pathAndQuery)
     const legacyRoutePattern = routePatternForPath(pathAndQuery)
     const routePatterns = normalizedPattern === legacyRoutePattern
       ? [normalizedPattern]
       : [normalizedPattern, legacyRoutePattern]
-    const row = this.session.db.select().from(tables.approvalLeases).where(and(
-      eq(tables.approvalLeases.runId, runId),
-      eq(tables.approvalLeases.origin, normalized),
-      eq(tables.approvalLeases.method, method.trim().toUpperCase()),
-      inArray(tables.approvalLeases.routePattern, routePatterns),
-      eq(tables.approvalLeases.status, 'active'),
-      eq(tables.approvalLeases.scopeRevision, run.scopeRevision),
-    )).get()
-    if (!row) return false
-    if (row.expiresAt !== null && row.expiresAt <= Date.now()) {
-      this.session.db.update(tables.approvalLeases).set({ status: 'expired', updatedAt: Date.now() })
-        .where(eq(tables.approvalLeases.id, row.id)).run()
-      return false
-    }
-    this.session.db.update(tables.approvalLeases).set({
-      uses: row.uses + 1, lastUsedAt: Date.now(), updatedAt: Date.now(),
-    }).where(eq(tables.approvalLeases.id, row.id)).run()
-    return true
+    return this.session.transaction(() => {
+      let run: Run
+      try {
+        run = this.run(runId)
+      } catch {
+        return false
+      }
+      const row = this.session.db.select().from(tables.approvalLeases).where(and(
+        eq(tables.approvalLeases.runId, runId),
+        eq(tables.approvalLeases.origin, normalized),
+        eq(tables.approvalLeases.method, method.trim().toUpperCase()),
+        inArray(tables.approvalLeases.routePattern, routePatterns),
+        eq(tables.approvalLeases.status, 'active'),
+        eq(tables.approvalLeases.scopeRevision, run.scopeRevision),
+      )).get()
+      if (!row) return false
+      const now = Date.now()
+      if (row.expiresAt !== null && row.expiresAt <= now) {
+        this.session.db.update(tables.approvalLeases).set({ status: 'expired', updatedAt: now })
+          .where(eq(tables.approvalLeases.id, row.id)).run()
+        return false
+      }
+      this.session.db.update(tables.approvalLeases).set({
+        uses: sql`${tables.approvalLeases.uses} + 1`,
+        lastUsedAt: now,
+        updatedAt: now,
+      }).where(and(
+        eq(tables.approvalLeases.id, row.id),
+        eq(tables.approvalLeases.status, 'active'),
+      )).run()
+      return true
+    }, { behavior: 'immediate' })
   }
 
   /** Ready-to-wire broker grant hook: `approvalLeases: storage.approvalLeaseAuthorizer(runId)`. */
@@ -1647,234 +1730,249 @@ export class RunsRepository {
   }
 
   decideApproval(run: Run, approvalId: string, decision: 'approved' | 'denied'): ApprovalRequest {
-    const existing = this.getApprovalRequest(run.id, approvalId)
-    if (existing.status !== 'pending') throw new Error(`Approval request is already ${existing.status}.`)
-    if (existing.scopeRevision !== run.scopeRevision) {
-      this.session.db.update(tables.approvalRequests).set({ status: 'canceled', decidedAt: Date.now() })
-        .where(eq(tables.approvalRequests.id, approvalId)).run()
-      throw new Error('Scope changed before this approval could be decided.')
-    }
-    const updated = this.session.db.update(tables.approvalRequests).set({
-      status: decision,
-      decidedBy: 'operator',
-      decidedAt: Date.now(),
-    }).where(eq(tables.approvalRequests.id, approvalId)).returning().get()!
-    this.session.event(run.id, 'approval.decided', `Tier 3 request ${decision} for ${updated.method} ${updated.origin}.`, {
-      approvalId: updated.id, assignmentId: updated.assignmentId, decision, decidedBy: 'operator',
-    })
-    if (decision === 'approved') {
-      // Operator opt-in grants a durable route-scoped lease, not a 60 s single-use body-hash token.
-      this.grantApprovalLease(run, {
-        origin: updated.origin,
-        method: updated.method,
-        pathAndQuery: updated.pathAndQuery,
-        personaHandle: updated.personaHandle,
-        sourceApprovalId: updated.id,
-        createdBy: 'operator',
+    return this.session.transaction(() => {
+      const currentRun = this.run(run.id)
+      const existing = this.getApprovalRequest(currentRun.id, approvalId)
+      if (existing.status !== 'pending') throw new Error(`Approval request is already ${existing.status}.`)
+      if (existing.scopeRevision !== currentRun.scopeRevision) {
+        this.session.db.update(tables.approvalRequests).set({ status: 'canceled', decidedAt: Date.now() })
+          .where(eq(tables.approvalRequests.id, approvalId)).run()
+        throw new Error('Scope changed before this approval could be decided.')
+      }
+      const updated = this.session.db.update(tables.approvalRequests).set({
+        status: decision,
+        decidedBy: 'operator',
+        decidedAt: Date.now(),
+      }).where(eq(tables.approvalRequests.id, approvalId)).returning().get()!
+      this.session.event(currentRun.id, 'approval.decided', `Tier 3 request ${decision} for ${updated.method} ${updated.origin}.`, {
+        approvalId: updated.id, assignmentId: updated.assignmentId, decision, decidedBy: 'operator',
       })
-    }
-    this.session.message(run.id, run.coordinatorId, 'kovo',
-      `Tier 3 request ${decision}: ${updated.method} ${updated.origin}${updated.pathAndQuery}`)
-    return updated
+      if (decision === 'approved') {
+        // Operator opt-in grants a durable route-scoped lease, not a 60 s single-use body-hash token.
+        this.grantApprovalLease(currentRun, {
+          origin: updated.origin,
+          method: updated.method,
+          pathAndQuery: updated.pathAndQuery,
+          personaHandle: updated.personaHandle,
+          sourceApprovalId: updated.id,
+          createdBy: 'operator',
+        })
+      }
+      this.session.message(currentRun.id, currentRun.coordinatorId, 'kovo',
+        `Tier 3 request ${decision}: ${updated.method} ${updated.origin}${updated.pathAndQuery}`)
+      return updated
+    }, { behavior: 'immediate' })
   }
 
   setApprovalPolicy(run: Run, approvalPolicy: ApprovalPolicy) {
-    if (['complete', 'stopped', 'failed'].includes(run.status)) {
-      throw new Error('Cannot change approval policy after a run has ended.')
-    }
-    const previous = run.approvalPolicy ?? 'auto_review'
-    const project = this.projects.project(run.projectId)
-    const derivedEnvironmentMode = !this.hasExplicitEnvironmentMode(run.id)
-      ? deriveDefaultEnvironmentMode(project.environment, run.capabilityTier, approvalPolicy)
-      : undefined
-    this.updateRun(run.id, {
-      approvalPolicy,
-      ...(derivedEnvironmentMode !== undefined && derivedEnvironmentMode !== run.environmentMode
-        ? { environmentMode: derivedEnvironmentMode }
-        : {}),
-    })
-    let autoApprovedCount = 0
-    if (approvalPolicy === 'yolo') {
+    this.session.transaction(() => {
+      const currentRun = this.run(run.id)
+      if (['complete', 'stopped', 'failed'].includes(currentRun.status)) {
+        throw new Error('Cannot change approval policy after a run has ended.')
+      }
+      const previous = currentRun.approvalPolicy ?? 'auto_review'
+      const project = this.projects.project(currentRun.projectId)
+      const derivedEnvironmentMode = !this.hasExplicitEnvironmentMode(currentRun.id)
+        ? deriveDefaultEnvironmentMode(project.environment, currentRun.capabilityTier, approvalPolicy)
+        : undefined
+      this.updateRun(currentRun.id, {
+        approvalPolicy,
+        ...(derivedEnvironmentMode !== undefined && derivedEnvironmentMode !== currentRun.environmentMode
+          ? { environmentMode: derivedEnvironmentMode }
+          : {}),
+      })
+      let autoApprovedCount = 0
+      if (approvalPolicy === 'yolo') {
+        const now = Date.now()
+        const pending = this.listApprovalRequests(currentRun.id, 'pending')
+        for (const req of pending) {
+          if (req.scopeRevision !== currentRun.scopeRevision) {
+            this.session.db.update(tables.approvalRequests).set({ status: 'canceled', decidedAt: now })
+              .where(eq(tables.approvalRequests.id, req.id)).run()
+            continue
+          }
+          this.session.db.update(tables.approvalRequests).set({
+            status: 'approved',
+            decidedBy: 'auto-yolo',
+            decidedAt: now,
+            riskLevel: 'low',
+            policyNote: 'Auto-approved when operator switched Tier 3 policy to YOLO autonomous mode.',
+          }).where(eq(tables.approvalRequests.id, req.id)).run()
+          autoApprovedCount += 1
+          this.session.event(currentRun.id, 'approval.auto_approved', `Auto-approved ${req.method} ${req.origin}${req.pathAndQuery.slice(0, 80)} via YOLO policy switch.`, {
+            approvalId: req.id, assignmentId: req.assignmentId, decidedBy: 'auto-yolo',
+          })
+        }
+      }
+      this.session.event(currentRun.id, 'approval.policy_changed', `Tier 3 approval policy switched from ${previous} to ${approvalPolicy}.`, {
+        previous, approvalPolicy, autoApprovedCount,
+      })
+      this.session.message(currentRun.id, currentRun.coordinatorId, 'kovo',
+        `Tier 3 approval policy updated to ${approvalPolicy}${autoApprovedCount > 0 ? ` (${autoApprovedCount} pending ${autoApprovedCount === 1 ? 'request' : 'requests'} auto-approved)` : ''}.`)
+    }, { behavior: 'immediate' })
+  }
+
+  approveSimilarEndpoint(run: Run, approvalId: string) {
+    this.session.transaction(() => {
+      const currentRun = this.run(run.id)
+      const existing = this.getApprovalRequest(currentRun.id, approvalId)
       const now = Date.now()
-      const pending = this.listApprovalRequests(run.id, 'pending')
+      if (existing.status === 'pending') {
+        if (existing.scopeRevision !== currentRun.scopeRevision) {
+          this.session.db.update(tables.approvalRequests).set({ status: 'canceled', decidedAt: now })
+            .where(eq(tables.approvalRequests.id, approvalId)).run()
+          throw new Error('Scope changed before this approval could be decided.')
+        }
+        this.session.db.update(tables.approvalRequests).set({
+          status: 'approved',
+          decidedBy: 'operator',
+          decidedAt: now,
+          policyNote: 'Approved by operator with similar endpoint pattern.',
+        }).where(eq(tables.approvalRequests.id, approvalId)).run()
+      } else if (existing.status !== 'approved') {
+        throw new Error(`Approval request is already ${existing.status}.`)
+      }
+
+      const pathPattern = normalizeApprovalPathPattern(existing.pathAndQuery)
+      const newPattern: ApprovedEndpointPattern = {
+        origin: existing.origin,
+        method: existing.method.toUpperCase(),
+        pathPattern,
+        scopeRevision: currentRun.scopeRevision,
+        createdAt: now,
+      }
+      const currentPatterns = currentRun.approvedEndpointPatterns ?? []
+      const alreadyStored = currentPatterns.some(p =>
+        p.origin === newPattern.origin &&
+        p.method.toUpperCase() === newPattern.method &&
+        p.pathPattern === newPattern.pathPattern &&
+        p.scopeRevision === newPattern.scopeRevision,
+      )
+      const nextPatterns = alreadyStored ? currentPatterns : [...currentPatterns, newPattern]
+      if (!alreadyStored) {
+        this.updateRun(currentRun.id, { approvedEndpointPatterns: nextPatterns })
+      }
+
+      // Also approve any other pending requests matching this exact newly approved pattern
+      let matchedPendingCount = 0
+      for (const req of this.listApprovalRequests(currentRun.id, 'pending')) {
+        if (req.id === approvalId || req.scopeRevision !== currentRun.scopeRevision) continue
+        if (matchesApprovedEndpointPattern({ origin: req.origin, method: req.method, pathAndQuery: req.pathAndQuery }, [newPattern])) {
+          this.session.db.update(tables.approvalRequests).set({
+            status: 'approved',
+            decidedBy: 'auto-review:rule',
+            decidedAt: now,
+            riskLevel: 'low',
+            policyNote: `Auto-approved via operator-approved pattern ${newPattern.method} ${newPattern.pathPattern}.`,
+          }).where(eq(tables.approvalRequests.id, req.id)).run()
+          matchedPendingCount += 1
+        }
+      }
+
+      this.session.event(currentRun.id, 'approval.pattern_approved', `Approved similar probes matching ${newPattern.method} ${newPattern.origin}${newPattern.pathPattern}.`, {
+        approvalId: existing.id,
+        origin: newPattern.origin,
+        method: newPattern.method,
+        pathPattern: newPattern.pathPattern,
+        matchedPendingCount,
+      })
+      this.grantApprovalLease(currentRun, {
+        origin: newPattern.origin,
+        method: newPattern.method,
+        pathAndQuery: newPattern.pathPattern,
+        personaHandle: existing.personaHandle,
+        sourceApprovalId: existing.id,
+        createdBy: 'operator',
+      })
+      this.session.message(currentRun.id, currentRun.coordinatorId, 'kovo',
+        `Approved ${existing.method} ${existing.origin}${existing.pathAndQuery} and future probes matching ${newPattern.method} ${newPattern.pathPattern}.`)
+    }, { behavior: 'immediate' })
+  }
+
+  approveAllPending(run: Run): number {
+    return this.session.transaction(() => {
+      const currentRun = this.run(run.id)
+      const now = Date.now()
+      const pending = this.listApprovalRequests(currentRun.id, 'pending')
+      let approvedCount = 0
       for (const req of pending) {
-        if (req.scopeRevision !== run.scopeRevision) {
+        if (req.scopeRevision !== currentRun.scopeRevision) {
           this.session.db.update(tables.approvalRequests).set({ status: 'canceled', decidedAt: now })
             .where(eq(tables.approvalRequests.id, req.id)).run()
           continue
         }
         this.session.db.update(tables.approvalRequests).set({
           status: 'approved',
-          decidedBy: 'auto-yolo',
+          decidedBy: 'operator',
           decidedAt: now,
-          riskLevel: 'low',
-          policyNote: 'Auto-approved when operator switched Tier 3 policy to YOLO autonomous mode.',
+          policyNote: 'Batch-approved by operator (Approve all pending).',
         }).where(eq(tables.approvalRequests.id, req.id)).run()
-        autoApprovedCount += 1
-        this.session.event(run.id, 'approval.auto_approved', `Auto-approved ${req.method} ${req.origin}${req.pathAndQuery.slice(0, 80)} via YOLO policy switch.`, {
-          approvalId: req.id, assignmentId: req.assignmentId, decidedBy: 'auto-yolo',
+        this.grantApprovalLease(currentRun, {
+          origin: req.origin,
+          method: req.method,
+          pathAndQuery: req.pathAndQuery,
+          personaHandle: req.personaHandle,
+          sourceApprovalId: req.id,
+          createdBy: 'operator',
         })
+        approvedCount += 1
       }
-    }
-    this.session.event(run.id, 'approval.policy_changed', `Tier 3 approval policy switched from ${previous} to ${approvalPolicy}.`, {
-      previous, approvalPolicy, autoApprovedCount,
-    })
-    this.session.message(run.id, run.coordinatorId, 'kovo',
-      `Tier 3 approval policy updated to ${approvalPolicy}${autoApprovedCount > 0 ? ` (${autoApprovedCount} pending ${autoApprovedCount === 1 ? 'request' : 'requests'} auto-approved)` : ''}.`)
-  }
-
-  approveSimilarEndpoint(run: Run, approvalId: string) {
-    const existing = this.getApprovalRequest(run.id, approvalId)
-    const now = Date.now()
-    if (existing.status === 'pending') {
-      if (existing.scopeRevision !== run.scopeRevision) {
-        this.session.db.update(tables.approvalRequests).set({ status: 'canceled', decidedAt: now })
-          .where(eq(tables.approvalRequests.id, approvalId)).run()
-        throw new Error('Scope changed before this approval could be decided.')
-      }
-      this.session.db.update(tables.approvalRequests).set({
-        status: 'approved',
-        decidedBy: 'operator',
-        decidedAt: now,
-        policyNote: 'Approved by operator with similar endpoint pattern.',
-      }).where(eq(tables.approvalRequests.id, approvalId)).run()
-    } else if (existing.status !== 'approved') {
-      throw new Error(`Approval request is already ${existing.status}.`)
-    }
-
-    const pathPattern = normalizeApprovalPathPattern(existing.pathAndQuery)
-    const newPattern: ApprovedEndpointPattern = {
-      origin: existing.origin,
-      method: existing.method.toUpperCase(),
-      pathPattern,
-      scopeRevision: run.scopeRevision,
-      createdAt: now,
-    }
-    const currentPatterns = run.approvedEndpointPatterns ?? []
-    const alreadyStored = currentPatterns.some(p =>
-      p.origin === newPattern.origin &&
-      p.method.toUpperCase() === newPattern.method &&
-      p.pathPattern === newPattern.pathPattern &&
-      p.scopeRevision === newPattern.scopeRevision,
-    )
-    const nextPatterns = alreadyStored ? currentPatterns : [...currentPatterns, newPattern]
-    if (!alreadyStored) {
-      this.updateRun(run.id, { approvedEndpointPatterns: nextPatterns })
-    }
-
-    // Also approve any other pending requests matching this exact newly approved pattern
-    let matchedPendingCount = 0
-    for (const req of this.listApprovalRequests(run.id, 'pending')) {
-      if (req.id === approvalId || req.scopeRevision !== run.scopeRevision) continue
-      if (matchesApprovedEndpointPattern({ origin: req.origin, method: req.method, pathAndQuery: req.pathAndQuery }, [newPattern])) {
-        this.session.db.update(tables.approvalRequests).set({
-          status: 'approved',
-          decidedBy: 'auto-review:rule',
-          decidedAt: now,
-          riskLevel: 'low',
-          policyNote: `Auto-approved via operator-approved pattern ${newPattern.method} ${newPattern.pathPattern}.`,
-        }).where(eq(tables.approvalRequests.id, req.id)).run()
-        matchedPendingCount += 1
-      }
-    }
-
-    this.session.event(run.id, 'approval.pattern_approved', `Approved similar probes matching ${newPattern.method} ${newPattern.origin}${newPattern.pathPattern}.`, {
-      approvalId: existing.id,
-      origin: newPattern.origin,
-      method: newPattern.method,
-      pathPattern: newPattern.pathPattern,
-      matchedPendingCount,
-    })
-    this.grantApprovalLease(run, {
-      origin: newPattern.origin,
-      method: newPattern.method,
-      pathAndQuery: newPattern.pathPattern,
-      personaHandle: existing.personaHandle,
-      sourceApprovalId: existing.id,
-      createdBy: 'operator',
-    })
-    this.session.message(run.id, run.coordinatorId, 'kovo',
-      `Approved ${existing.method} ${existing.origin}${existing.pathAndQuery} and future probes matching ${newPattern.method} ${newPattern.pathPattern}.`)
-  }
-
-  approveAllPending(run: Run): number {
-    const now = Date.now()
-    const pending = this.listApprovalRequests(run.id, 'pending')
-    let approvedCount = 0
-    for (const req of pending) {
-      if (req.scopeRevision !== run.scopeRevision) {
-        this.session.db.update(tables.approvalRequests).set({ status: 'canceled', decidedAt: now })
-          .where(eq(tables.approvalRequests.id, req.id)).run()
-        continue
-      }
-      this.session.db.update(tables.approvalRequests).set({
-        status: 'approved',
-        decidedBy: 'operator',
-        decidedAt: now,
-        policyNote: 'Batch-approved by operator (Approve all pending).',
-      }).where(eq(tables.approvalRequests.id, req.id)).run()
-      this.grantApprovalLease(run, {
-        origin: req.origin,
-        method: req.method,
-        pathAndQuery: req.pathAndQuery,
-        personaHandle: req.personaHandle,
-        sourceApprovalId: req.id,
-        createdBy: 'operator',
+      this.session.event(currentRun.id, 'approval.batch_approved', `Operator batch-approved ${approvedCount} pending Tier 3 ${approvedCount === 1 ? 'request' : 'requests'}.`, {
+        approvedCount,
       })
-      approvedCount += 1
-    }
-    this.session.event(run.id, 'approval.batch_approved', `Operator batch-approved ${approvedCount} pending Tier 3 ${approvedCount === 1 ? 'request' : 'requests'}.`, {
-      approvedCount,
-    })
-    if (approvedCount > 0) {
-      this.session.message(run.id, run.coordinatorId, 'kovo',
-        `Batch-approved ${approvedCount} pending Tier 3 ${approvedCount === 1 ? 'probe' : 'probes'}.`)
-    }
-    return approvedCount
+      if (approvedCount > 0) {
+        this.session.message(currentRun.id, currentRun.coordinatorId, 'kovo',
+          `Batch-approved ${approvedCount} pending Tier 3 ${approvedCount === 1 ? 'probe' : 'probes'}.`)
+      }
+      return approvedCount
+    }, { behavior: 'immediate' })
   }
 
   removeApprovedPattern(
     run: Run,
     input: { origin: string; method: string; pathPattern: string; scopeRevision?: number },
   ): ApprovedEndpointPattern[] {
-    const normalizedOrigin = normalizeScopeOrigin(input.origin) ?? input.origin.trim()
-    const normalizedMethod = input.method.trim().toUpperCase()
-    const normalizedPattern = input.pathPattern.trim()
-    const current = run.approvedEndpointPatterns ?? []
-    const matchesTarget = (p: ApprovedEndpointPattern) =>
-      (normalizeScopeOrigin(p.origin) ?? p.origin.trim()) === normalizedOrigin &&
-      p.method.trim().toUpperCase() === normalizedMethod &&
-      p.pathPattern.trim() === normalizedPattern &&
-      (input.scopeRevision === undefined || p.scopeRevision === undefined || p.scopeRevision === input.scopeRevision)
+    return this.session.transaction(() => {
+      const currentRun = this.run(run.id)
+      const normalizedOrigin = normalizeScopeOrigin(input.origin) ?? input.origin.trim()
+      const normalizedMethod = input.method.trim().toUpperCase()
+      const normalizedPattern = input.pathPattern.trim()
+      const current = currentRun.approvedEndpointPatterns ?? []
+      const matchesTarget = (p: ApprovedEndpointPattern) =>
+        (normalizeScopeOrigin(p.origin) ?? p.origin.trim()) === normalizedOrigin &&
+        p.method.trim().toUpperCase() === normalizedMethod &&
+        p.pathPattern.trim() === normalizedPattern &&
+        (input.scopeRevision === undefined || p.scopeRevision === undefined || p.scopeRevision === input.scopeRevision)
 
-    const remaining = current.filter(p => !matchesTarget(p))
-    const removedCount = current.length - remaining.length
-    if (removedCount > 0) {
-      this.updateRun(run.id, { approvedEndpointPatterns: remaining })
-    }
+      const remaining = current.filter(p => !matchesTarget(p))
+      const removedCount = current.length - remaining.length
+      if (removedCount > 0) {
+        this.updateRun(currentRun.id, { approvedEndpointPatterns: remaining })
+      }
 
-    const matchingLeases = this.listApprovalLeases(run.id, 'active').filter(lease =>
-      (normalizeScopeOrigin(lease.origin) ?? lease.origin.trim()) === normalizedOrigin &&
-      lease.method.trim().toUpperCase() === normalizedMethod &&
-      lease.routePattern.trim() === normalizedPattern &&
-      (input.scopeRevision === undefined || lease.scopeRevision === input.scopeRevision),
-    )
-    for (const lease of matchingLeases) {
-      this.revokeApprovalLease(run, lease.id, 'Approved endpoint pattern removed by operator.')
-    }
-
-    if (removedCount === 0 && matchingLeases.length === 0) {
-      throw new Error('Approved endpoint pattern not found.')
-    }
-    if (removedCount > 0) {
-      this.session.event(
-        run.id,
-        'approval.pattern_removed',
-        `Removed approved endpoint pattern ${normalizedMethod} ${normalizedOrigin}${normalizedPattern}.`,
-        { origin: normalizedOrigin, method: normalizedMethod, pathPattern: normalizedPattern, removedCount },
+      const matchingLeases = this.listApprovalLeases(currentRun.id, 'active').filter(lease =>
+        (normalizeScopeOrigin(lease.origin) ?? lease.origin.trim()) === normalizedOrigin &&
+        lease.method.trim().toUpperCase() === normalizedMethod &&
+        lease.routePattern.trim() === normalizedPattern &&
+        (input.scopeRevision === undefined || lease.scopeRevision === input.scopeRevision),
       )
-    }
-    return remaining
+      for (const lease of matchingLeases) {
+        this.revokeApprovalLease(currentRun, lease.id, 'Approved endpoint pattern removed by operator.')
+      }
+
+      if (removedCount === 0 && matchingLeases.length === 0) {
+        throw new Error('Approved endpoint pattern not found.')
+      }
+      if (removedCount > 0) {
+        this.session.event(
+          currentRun.id,
+          'approval.pattern_removed',
+          `Removed approved endpoint pattern ${normalizedMethod} ${normalizedOrigin}${normalizedPattern}.`,
+          { origin: normalizedOrigin, method: normalizedMethod, pathPattern: normalizedPattern, removedCount },
+        )
+      }
+      return remaining
+    }, { behavior: 'immediate' })
   }
 
   // --- Budget & Spend Tracking ---
@@ -1935,6 +2033,7 @@ export class RunsRepository {
         id: randomUUID(),
         projectId: project.id,
         workspaceId: this.session.workspace.id,
+        tenantId: normalizeTenantId(project.tenantId || 'default'),
         coordinatorId: randomUUID(),
         originalGoal: goal,
         goal,
@@ -1994,22 +2093,25 @@ export class RunsRepository {
   }
 
   suggestCandidateHost(run: Run, origin: string, source: string, thirdParty = false, dnsSource?: DnsSource | null) {
-    if (run.candidates.some(candidate => candidate.origin === origin)) {
-      return { added: false, origin }
-    }
-    const asset = this.projects.saveCandidate(
-      run.projectId,
-      { origin, source: redact(source), thirdParty, ...(dnsSource !== undefined ? { dnsSource } : {}) },
-      false,
-    )
-    const discovery = this.workerList(run.id).find(worker => worker.phase === 'discovery' && worker.assetId === null)
-    const sourceEv = discovery && this.recordInventory(run, discovery, 'Candidate source', [asset])
-    const candidate = sourceEv ? { ...asset, sourceEvidenceId: sourceEv.id } : asset
-    this.updateRun(run.id, { candidates: [...run.candidates, candidate] })
-    this.session.event(run.id, 'asset.candidate', `Worker suggested candidate host ${origin} (unapproved until scope approval).`, {
-      id: asset.id, origin: asset.origin, source: redact(source), thirdParty, sourceEvidenceId: sourceEv?.id,
-    })
-    return { added: true, id: asset.id, origin: asset.origin }
+    return this.session.transaction(() => {
+      const currentRun = this.run(run.id)
+      if (currentRun.candidates.some(candidate => candidate.origin === origin)) {
+        return { added: false, origin }
+      }
+      const asset = this.projects.saveCandidate(
+        currentRun.projectId,
+        { origin, source: redact(source), thirdParty, ...(dnsSource !== undefined ? { dnsSource } : {}) },
+        false,
+      )
+      const discovery = this.workerList(currentRun.id).find(worker => worker.phase === 'discovery' && worker.assetId === null)
+      const sourceEv = discovery && this.recordInventory(currentRun, discovery, 'Candidate source', [asset])
+      const candidate = sourceEv ? { ...asset, sourceEvidenceId: sourceEv.id } : asset
+      this.updateRun(currentRun.id, { candidates: [...currentRun.candidates, candidate] })
+      this.session.event(currentRun.id, 'asset.candidate', `Worker suggested candidate host ${origin} (unapproved until scope approval).`, {
+        id: asset.id, origin: asset.origin, source: redact(source), thirdParty, sourceEvidenceId: sourceEv?.id,
+      })
+      return { added: true, id: asset.id, origin: asset.origin }
+    }, { behavior: 'immediate' })
   }
 
   /**
@@ -2161,12 +2263,19 @@ export class RunsRepository {
   }
 
   updateRun(runId: string, state: Partial<Run>) {
-    const updated = this.session.db.update(tables.runs).set(state).where(eq(tables.runs.id, runId)).returning().get()
+    this.assertTenantRun(runId)
+    const updated = this.session.db.update(tables.runs).set(state).where(and(
+      eq(tables.runs.id, runId), eq(tables.runs.workspaceId, this.session.workspace.id),
+    )).returning().get()
     if (!updated) throw new Error('Run not found.')
     return updated
   }
 
   updateWorker(assignmentId: string, state: Partial<Assignment>) {
+    const existing = this.session.db.select({ id: tables.assignments.id, runId: tables.assignments.runId })
+      .from(tables.assignments).where(eq(tables.assignments.id, assignmentId)).get()
+    if (!existing) return undefined
+    this.session.requireRun(existing.runId)
     return this.session.db.update(tables.assignments).set(state).where(eq(tables.assignments.id, assignmentId)).returning().get()
   }
 
@@ -2773,13 +2882,17 @@ export class RunsRepository {
       gaps,
     }
 
-    const reportId = randomUUID()
-    const version = (snapshot.reports[0]?.version ?? 0) + 1
-    this.session.db.insert(tables.reports).values({ id: reportId, runId: run.id, partial, body, version, createdAt: Date.now() }).run()
-    this.session.event(run.id, partial ? 'report.partial' : 'report.complete',
-      partial ? 'Partial report created.' : 'Complete report created.',
-      { reportId, version, phase: run.phase, status: run.status })
-    return reportId
+    return this.session.transaction(() => {
+      const reportId = randomUUID()
+      const maxVersion = this.session.db.select({ value: sql<number>`COALESCE(MAX(${tables.reports.version}), 0)` })
+        .from(tables.reports).where(eq(tables.reports.runId, run.id)).get()
+      const version = Number(maxVersion?.value ?? 0) + 1
+      this.session.db.insert(tables.reports).values({ id: reportId, runId: run.id, partial, body, version, createdAt: Date.now() }).run()
+      this.session.event(run.id, partial ? 'report.partial' : 'report.complete',
+        partial ? 'Partial report created.' : 'Complete report created.',
+        { reportId, version, phase: run.phase, status: run.status })
+      return reportId
+    }, { behavior: 'immediate' })
   }
 
   command(input: RunCommand, canUseModel = true) {
@@ -3047,28 +3160,48 @@ export class RunsRepository {
 
   // --- v7 M4: Per-tenant isolation and append-only audit log ---
 
-  /** Assign a specific run to a tenant namespace. */
+  /** Assign a specific run to a tenant namespace atomically. */
   setRunTenant(runId: string, tenantId: string): void {
     const normalized = normalizeTenantId(tenantId)
-    this.run(runId)
-    this.session.client.prepare('UPDATE runs SET tenant_id = ? WHERE id = ?').run(normalized, runId)
+    if (this.session.tenantId && normalized !== this.session.tenantId) {
+      throw new TenantIsolationError(this.session.tenantId, normalized, runId)
+    }
+    this.session.transaction(() => {
+      this.run(runId)
+      this.session.client.prepare(
+        'UPDATE runs SET tenant_id = ? WHERE id = ? AND workspace_id = ?',
+      ).run(normalized, runId, this.session.workspace.id)
+    }, { behavior: 'immediate' })
   }
 
   /** Resolve a run's effective tenant (inheriting its parent project tenant if unset). */
   getRunTenant(runId: string): string {
     const row = this.session.client.prepare(
-      'SELECT r.tenant_id AS run_tenant, p.tenant_id AS project_tenant FROM runs r LEFT JOIN projects p ON p.id = r.project_id WHERE r.id = ?',
-    ).get(runId) as { run_tenant: string | null; project_tenant: string | null } | undefined
+      `SELECT r.tenant_id AS run_tenant, p.tenant_id AS project_tenant
+       FROM runs r
+       LEFT JOIN projects p ON p.id = r.project_id
+       WHERE r.id = ? AND r.workspace_id = ?`,
+    ).get(runId, this.session.workspace.id) as { run_tenant: string | null; project_tenant: string | null } | undefined
     if (!row) throw new Error(`Unknown run ${runId}`)
-    if (row.run_tenant && row.run_tenant !== 'default') return row.run_tenant
-    if (row.project_tenant && row.project_tenant !== 'default') return row.project_tenant
-    return row.run_tenant || 'default'
+    const owner = (row.run_tenant && row.run_tenant !== 'default')
+      ? row.run_tenant
+      : (row.project_tenant && row.project_tenant !== 'default')
+        ? row.project_tenant
+        : (row.run_tenant || 'default')
+    if (this.session.tenantId && owner !== this.session.tenantId) {
+      throw new TenantIsolationError(this.session.tenantId, owner, runId)
+    }
+    return owner
   }
 
   /** Fail closed if `tenantId` does not own `runId`, recording a denied audit entry. */
   assertRunTenantAccess(runId: string, tenantId: string, actor = 'operator'): void {
     const requested = normalizeTenantId(tenantId)
-    const owner = this.getRunTenant(runId)
+    if (this.session.tenantId && requested !== this.session.tenantId) {
+      throw new TenantIsolationError(this.session.tenantId, requested, runId)
+    }
+    const owner = this.session.effectiveRunTenant(runId)
+    if (owner === null) throw new Error(`Unknown run ${runId}`)
     if (owner !== requested) {
       this.appendTenantAuditLog({
         tenantId: requested,
@@ -3087,19 +3220,25 @@ export class RunsRepository {
   /** List runs strictly belonging to `tenantId` (zero cross-tenant visibility). */
   listRunsForTenant(tenantId: string): Run[] {
     const normalized = normalizeTenantId(tenantId)
+    if (this.session.tenantId && normalized !== this.session.tenantId) {
+      throw new TenantIsolationError(this.session.tenantId, normalized, 'runs')
+    }
     const rows = this.session.client.prepare(
       `SELECT r.id FROM runs r
        LEFT JOIN projects p ON p.id = r.project_id
-       WHERE r.tenant_id = ?
-          OR (r.tenant_id = 'default' AND p.tenant_id = ?)
+       WHERE r.workspace_id = ?
+         AND COALESCE(NULLIF(r.tenant_id, 'default'), p.tenant_id, 'default') = ?
        ORDER BY r.created_at DESC`,
-    ).all(normalized, normalized) as Array<{ id: string }>
+    ).all(this.session.workspace.id, normalized) as Array<{ id: string }>
     return rows.map(r => this.run(r.id))
   }
 
   /** Append a hash-chained, PII/secret-scrubbed entry to the immutable `tenant_audit_log`. */
   appendTenantAuditLog(input: AppendTenantAuditLogInput): TenantAuditLogEntry {
     const tenantId = normalizeTenantId(input.tenantId)
+    if (this.session.tenantId && tenantId !== this.session.tenantId) {
+      throw new TenantIsolationError(this.session.tenantId, tenantId, 'tenant_audit_log')
+    }
     const now = input.now ?? Date.now()
     const id = randomUUID()
     const actor = (input.actor || 'system').trim().slice(0, 128)
@@ -3110,44 +3249,55 @@ export class RunsRepository {
     const scrubbedDetail = redactZdrJsonValue(input.detail ?? {}) as Record<string, unknown>
     const detailJson = JSON.stringify(scrubbedDetail)
 
-    const prevRow = this.session.client.prepare(
-      'SELECT entry_hash FROM tenant_audit_log WHERE tenant_id = ? ORDER BY seq DESC LIMIT 1',
-    ).get(tenantId) as { entry_hash: string } | undefined
-    const prevHash = prevRow?.entry_hash ?? 'GENESIS'
-    const entryHash = computeTenantAuditHash({
-      id,
-      tenantId,
-      runId,
-      actor,
-      action,
-      resourceKind,
-      resourceId,
-      outcome: input.outcome,
-      detailJson,
-      prevHash,
-      createdAt: now,
-    })
+    const maxAttempts = 6
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        return this.session.transaction(() => {
+          const prevRow = this.session.client.prepare(
+            'SELECT entry_hash FROM tenant_audit_log WHERE tenant_id = ? ORDER BY seq DESC LIMIT 1',
+          ).get(tenantId) as { entry_hash: string } | undefined
+          const prevHash = prevRow?.entry_hash ?? 'GENESIS'
+          const entryHash = computeTenantAuditHash({
+            id,
+            tenantId,
+            runId,
+            actor,
+            action,
+            resourceKind,
+            resourceId,
+            outcome: input.outcome,
+            detailJson,
+            prevHash,
+            createdAt: now,
+          })
 
-    const inserted = this.session.client.prepare(
-      `INSERT INTO tenant_audit_log
-       (id, tenant_id, run_id, actor, action, resource_kind, resource_id, outcome, detail, prev_hash, entry_hash, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(id, tenantId, runId, actor, action, resourceKind, resourceId, input.outcome, detailJson, prevHash, entryHash, now)
+          const inserted = this.session.client.prepare(
+            `INSERT INTO tenant_audit_log
+             (id, tenant_id, run_id, actor, action, resource_kind, resource_id, outcome, detail, prev_hash, entry_hash, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          ).run(id, tenantId, runId, actor, action, resourceKind, resourceId, input.outcome, detailJson, prevHash, entryHash, now)
 
-    return {
-      seq: Number(inserted.lastInsertRowid),
-      id,
-      tenantId,
-      runId,
-      actor,
-      action,
-      resourceKind,
-      resourceId,
-      outcome: input.outcome,
-      detail: scrubbedDetail,
-      prevHash,
-      entryHash,
-      createdAt: now,
+          return {
+            seq: Number(inserted.lastInsertRowid),
+            id,
+            tenantId,
+            runId,
+            actor,
+            action,
+            resourceKind,
+            resourceId,
+            outcome: input.outcome,
+            detail: scrubbedDetail,
+            prevHash,
+            entryHash,
+            createdAt: now,
+          }
+        }, { behavior: 'immediate' })
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error)
+        const isChainRace = /UNIQUE constraint failed: tenant_audit_log\.tenant_id, tenant_audit_log\.prev_hash/i.test(msg)
+        if (!isChainRace || attempt >= maxAttempts) throw error
+      }
     }
   }
 
@@ -3157,6 +3307,9 @@ export class RunsRepository {
     options: { runId?: string; limit?: number } = {},
   ): TenantAuditLogEntry[] {
     const normalized = normalizeTenantId(tenantId)
+    if (this.session.tenantId && normalized !== this.session.tenantId) {
+      throw new TenantIsolationError(this.session.tenantId, normalized, 'tenant_audit_log')
+    }
     const limit = Math.max(1, Math.min(1000, Math.trunc(options.limit ?? 200)))
     const rows = options.runId
       ? (this.session.client.prepare(
@@ -3185,6 +3338,9 @@ export class RunsRepository {
   /** Verify the cryptographic hash chain of all audit log entries for `tenantId`. */
   verifyTenantAuditLogChain(tenantId: string): { valid: boolean; count: number; brokenAtSeq?: number } {
     const normalized = normalizeTenantId(tenantId)
+    if (this.session.tenantId && normalized !== this.session.tenantId) {
+      throw new TenantIsolationError(this.session.tenantId, normalized, 'tenant_audit_log')
+    }
     const rows = this.session.client.prepare(
       'SELECT seq, id, tenant_id, run_id, actor, action, resource_kind, resource_id, outcome, detail, prev_hash, entry_hash, created_at FROM tenant_audit_log WHERE tenant_id = ? ORDER BY seq ASC',
     ).all(normalized) as unknown as RawTenantAuditRow[]

@@ -26,6 +26,7 @@ import { deletePersonaCredentialFiles } from './persona-vault.ts'
 import { redact } from './redact.ts'
 import * as tables from './schema.ts'
 import {
+  TenantIsolationError,
   isSafePathSegment,
   normalizeTenantId,
   resolvePageLimit,
@@ -51,10 +52,13 @@ export class ProjectsRepository {
   }
 
   listWorkspace() {
+    const where = this.session.tenantId
+      ? and(eq(tables.projects.workspaceId, this.session.workspace.id), eq(tables.projects.tenantId, this.session.tenantId))
+      : eq(tables.projects.workspaceId, this.session.workspace.id)
     return {
       workspace: { id: this.session.workspace.id, name: this.session.workspace.name },
       projects: this.session.db.select().from(tables.projects)
-        .where(eq(tables.projects.workspaceId, this.session.workspace.id))
+        .where(where)
         .orderBy(desc(tables.projects.createdAt)).all(),
     }
   }
@@ -83,39 +87,76 @@ export class ProjectsRepository {
     const workspaceList = this.listWorkspace()
     const workspaceId = workspaceList.workspace.id
     const safeRecentLimit = resolvePageLimit(recentLimit, 15)
+    const tenantId = this.session.tenantId
 
-    const runCountRows = this.session.client.prepare(`
-      select project_id as projectId, count(*) as runCount
-      from runs
-      where workspace_id = ?
-      group by project_id
-    `).all(workspaceId) as { projectId: string; runCount: number }[]
+    const runCountRows = tenantId
+      ? (this.session.client.prepare(`
+          select r.project_id as projectId, count(*) as runCount
+          from runs r
+          join projects p on p.id = r.project_id
+          where r.workspace_id = ?
+            and COALESCE(NULLIF(r.tenant_id, 'default'), p.tenant_id, 'default') = ?
+          group by r.project_id
+        `).all(workspaceId, tenantId) as { projectId: string; runCount: number }[])
+      : (this.session.client.prepare(`
+          select project_id as projectId, count(*) as runCount
+          from runs
+          where workspace_id = ?
+          group by project_id
+        `).all(workspaceId) as { projectId: string; runCount: number }[])
     const runCounts = new Map(runCountRows.map(r => [r.projectId, Number(r.runCount)]))
 
-    const hostCountRows = this.session.client.prepare(`
-      select a.project_id as projectId, count(*) as hostCount
-      from project_assets a
-      join projects p on p.id = a.project_id
-      where p.workspace_id = ?
-      group by a.project_id
-    `).all(workspaceId) as { projectId: string; hostCount: number }[]
+    const hostCountRows = tenantId
+      ? (this.session.client.prepare(`
+          select a.project_id as projectId, count(*) as hostCount
+          from project_assets a
+          join projects p on p.id = a.project_id
+          where p.workspace_id = ? and p.tenant_id = ?
+          group by a.project_id
+        `).all(workspaceId, tenantId) as { projectId: string; hostCount: number }[])
+      : (this.session.client.prepare(`
+          select a.project_id as projectId, count(*) as hostCount
+          from project_assets a
+          join projects p on p.id = a.project_id
+          where p.workspace_id = ?
+          group by a.project_id
+        `).all(workspaceId) as { projectId: string; hostCount: number }[])
     const hostCounts = new Map(hostCountRows.map(r => [r.projectId, Number(r.hostCount)]))
 
-    const latestRunRows = this.session.client.prepare(`
-      select r.id as id, r.project_id as projectId, r.goal as goal, r.status as status, r.phase as phase,
-        r.created_at as startedAt,
-        (select count(*) from findings f where f.run_id = r.id and f.superseded_by_finding_id is null
-          and json_extract(f.finding, '$.status') in ('confirmed', 'verified', 'static_verified')) as confirmedCount,
-        (select count(*) from findings f where f.run_id = r.id and f.superseded_by_finding_id is null) as findingCount
-      from runs r
-      where r.workspace_id = ?
-        and r.id = (
-          select r2.id from runs r2
-          where r2.project_id = r.project_id and r2.workspace_id = r.workspace_id
-          order by r2.created_at desc, r2.rowid desc
-          limit 1
-        )
-    `).all(workspaceId) as unknown as (WorkspaceProjectLatestRun & { projectId: string })[]
+    const latestRunRows = tenantId
+      ? (this.session.client.prepare(`
+          select r.id as id, r.project_id as projectId, r.goal as goal, r.status as status, r.phase as phase,
+            r.created_at as startedAt,
+            (select count(*) from findings f where f.run_id = r.id and f.superseded_by_finding_id is null
+              and json_extract(f.finding, '$.status') in ('confirmed', 'verified', 'static_verified')) as confirmedCount,
+            (select count(*) from findings f where f.run_id = r.id and f.superseded_by_finding_id is null) as findingCount
+          from runs r
+          join projects p on p.id = r.project_id
+          where r.workspace_id = ?
+            and COALESCE(NULLIF(r.tenant_id, 'default'), p.tenant_id, 'default') = ?
+            and r.id = (
+              select r2.id from runs r2
+              where r2.project_id = r.project_id and r2.workspace_id = r.workspace_id
+                and COALESCE(NULLIF(r2.tenant_id, 'default'), p.tenant_id, 'default') = ?
+              order by r2.created_at desc, r2.rowid desc
+              limit 1
+            )
+        `).all(workspaceId, tenantId, tenantId) as unknown as (WorkspaceProjectLatestRun & { projectId: string })[])
+      : (this.session.client.prepare(`
+          select r.id as id, r.project_id as projectId, r.goal as goal, r.status as status, r.phase as phase,
+            r.created_at as startedAt,
+            (select count(*) from findings f where f.run_id = r.id and f.superseded_by_finding_id is null
+              and json_extract(f.finding, '$.status') in ('confirmed', 'verified', 'static_verified')) as confirmedCount,
+            (select count(*) from findings f where f.run_id = r.id and f.superseded_by_finding_id is null) as findingCount
+          from runs r
+          where r.workspace_id = ?
+            and r.id = (
+              select r2.id from runs r2
+              where r2.project_id = r.project_id and r2.workspace_id = r.workspace_id
+              order by r2.created_at desc, r2.rowid desc
+              limit 1
+            )
+        `).all(workspaceId) as unknown as (WorkspaceProjectLatestRun & { projectId: string })[])
     const latestRuns = new Map<string, WorkspaceProjectLatestRun>(latestRunRows.map(r => [r.projectId, {
       id: r.id,
       goal: r.goal,
@@ -126,18 +167,32 @@ export class ProjectsRepository {
       findingCount: Number(r.findingCount),
     }]))
 
-    const recentRunRows = this.session.client.prepare(`
-      select r.id as id, r.project_id as projectId, p.name as projectName, r.goal as goal,
-        r.status as status, r.phase as phase, r.created_at as startedAt,
-        (select count(*) from findings f where f.run_id = r.id and f.superseded_by_finding_id is null
-          and json_extract(f.finding, '$.status') in ('confirmed', 'verified', 'static_verified')) as confirmedCount,
-        (select count(*) from findings f where f.run_id = r.id and f.superseded_by_finding_id is null) as findings
-      from runs r
-      join projects p on p.id = r.project_id
-      where r.workspace_id = ?
-      order by r.created_at desc, r.rowid desc
-      limit ?
-    `).all(workspaceId, safeRecentLimit) as unknown as WorkspaceRecentRunSummary[]
+    const recentRunRows = tenantId
+      ? (this.session.client.prepare(`
+          select r.id as id, r.project_id as projectId, p.name as projectName, r.goal as goal,
+            r.status as status, r.phase as phase, r.created_at as startedAt,
+            (select count(*) from findings f where f.run_id = r.id and f.superseded_by_finding_id is null
+              and json_extract(f.finding, '$.status') in ('confirmed', 'verified', 'static_verified')) as confirmedCount,
+            (select count(*) from findings f where f.run_id = r.id and f.superseded_by_finding_id is null) as findings
+          from runs r
+          join projects p on p.id = r.project_id
+          where r.workspace_id = ?
+            and COALESCE(NULLIF(r.tenant_id, 'default'), p.tenant_id, 'default') = ?
+          order by r.created_at desc, r.rowid desc
+          limit ?
+        `).all(workspaceId, tenantId, safeRecentLimit) as unknown as WorkspaceRecentRunSummary[])
+      : (this.session.client.prepare(`
+          select r.id as id, r.project_id as projectId, p.name as projectName, r.goal as goal,
+            r.status as status, r.phase as phase, r.created_at as startedAt,
+            (select count(*) from findings f where f.run_id = r.id and f.superseded_by_finding_id is null
+              and json_extract(f.finding, '$.status') in ('confirmed', 'verified', 'static_verified')) as confirmedCount,
+            (select count(*) from findings f where f.run_id = r.id and f.superseded_by_finding_id is null) as findings
+          from runs r
+          join projects p on p.id = r.project_id
+          where r.workspace_id = ?
+          order by r.created_at desc, r.rowid desc
+          limit ?
+        `).all(workspaceId, safeRecentLimit) as unknown as WorkspaceRecentRunSummary[])
 
     return {
       workspace: workspaceList.workspace,
@@ -295,11 +350,19 @@ export class ProjectsRepository {
   deleteProject(projectId: string): { deleted: boolean; projectId: string; deletedRuns: number } {
     this.session.flushNow()
     const committed = this.session.transaction(() => {
-      const existing = this.session.db.select({ id: tables.projects.id, name: tables.projects.name })
+      const existing = this.session.db.select({
+        id: tables.projects.id,
+        name: tables.projects.name,
+        tenantId: tables.projects.tenantId,
+      })
         .from(tables.projects)
         .where(and(eq(tables.projects.id, projectId), eq(tables.projects.workspaceId, this.session.workspace.id)))
         .get()
       if (!existing) return null
+      const projectTenant = existing.tenantId || 'default'
+      if (this.session.tenantId && projectTenant !== this.session.tenantId) {
+        throw new TenantIsolationError(this.session.tenantId, projectTenant, projectId)
+      }
       const runRows = this.session.db.select({ id: tables.runs.id })
         .from(tables.runs)
         .where(and(eq(tables.runs.projectId, projectId), eq(tables.runs.workspaceId, this.session.workspace.id)))
@@ -309,14 +372,19 @@ export class ProjectsRepository {
         .where(and(eq(tables.personas.projectId, projectId), eq(tables.personas.workspaceId, this.session.workspace.id)))
         .all()
 
-      let runCleanups: Array<{ runId: string; sessionIds: string[]; flatArtifactIds: string[] }>
+      let runCleanups: Array<{ runId: string; sessionIds: string[]; flatArtifactIds: string[]; tenantBlobFiles: string[] }>
       if (this.session.hasCascadeSchema()) {
-        const pending = runRows.map(row => ({ runId: row.id, ...this.session.collectRunCleanupFiles(row.id) }))
+        const pending = runRows.map(row => ({
+          runId: row.id,
+          runTenant: this.session.effectiveRunTenant(row.id) ?? projectTenant,
+          ...this.session.collectRunCleanupFiles(row.id),
+        }))
         this.session.client.prepare(`DELETE FROM projects WHERE id = ? AND workspace_id = ?`).run(projectId, this.session.workspace.id)
         runCleanups = pending.map(item => ({
           runId: item.runId,
           sessionIds: item.sessionIds,
           flatArtifactIds: this.session.filterUnreferencedFlatArtifacts(item.artifactIds),
+          tenantBlobFiles: this.session.filterUnreferencedTenantBlobs(item.runTenant, item.artifactIds),
         }))
       } else {
         runCleanups = []
@@ -344,7 +412,7 @@ export class ProjectsRepository {
     if (!committed) return { deleted: false, projectId, deletedRuns: 0 }
 
     for (const cleanup of committed.runCleanups) {
-      this.session.cleanupRunFilesOnDisk(cleanup.runId, cleanup.sessionIds, cleanup.flatArtifactIds)
+      this.session.cleanupRunFilesOnDisk(cleanup.runId, cleanup.sessionIds, cleanup.flatArtifactIds, cleanup.tenantBlobFiles)
     }
     deletePersonaCredentialFiles(this.session.directory, committed.credentialIds)
     if (isSafePathSegment(projectId)) {
@@ -372,6 +440,7 @@ export class ProjectsRepository {
       const project = this.session.db.insert(tables.projects).values({
         id: randomUUID(),
         workspaceId: this.session.workspace.id,
+        tenantId: this.session.tenantId ?? 'default',
         name: redact(input.name),
         environment,
         seeds: validatedSeeds,
@@ -767,28 +836,46 @@ export class ProjectsRepository {
     )).get()!
   }
 
-  /** Assign a project (and its existing runs) to a tenant namespace. */
+  /** Assign a project (and its existing runs) to a tenant namespace atomically. */
   setProjectTenant(projectId: string, tenantId: string): void {
     const normalized = normalizeTenantId(tenantId)
-    this.project(projectId)
-    this.session.client.prepare('UPDATE projects SET tenant_id = ? WHERE id = ?').run(normalized, projectId)
-    this.session.client.prepare('UPDATE runs SET tenant_id = ? WHERE project_id = ?').run(normalized, projectId)
+    if (this.session.tenantId && normalized !== this.session.tenantId) {
+      throw new TenantIsolationError(this.session.tenantId, normalized, projectId)
+    }
+    this.session.transaction(() => {
+      this.project(projectId)
+      this.session.client.prepare(
+        'UPDATE projects SET tenant_id = ? WHERE id = ? AND workspace_id = ?',
+      ).run(normalized, projectId, this.session.workspace.id)
+      this.session.client.prepare(
+        'UPDATE runs SET tenant_id = ? WHERE project_id = ? AND workspace_id = ?',
+      ).run(normalized, projectId, this.session.workspace.id)
+    }, { behavior: 'immediate' })
   }
 
   getProjectTenant(projectId: string): string {
-    const row = this.session.client.prepare('SELECT tenant_id FROM projects WHERE id = ?').get(projectId) as
+    const row = this.session.client.prepare(
+      'SELECT tenant_id FROM projects WHERE id = ? AND workspace_id = ?',
+    ).get(projectId, this.session.workspace.id) as
       | { tenant_id: string }
       | undefined
     if (!row) throw new Error(`Unknown project ${projectId}`)
-    return row.tenant_id || 'default'
+    const owner = row.tenant_id || 'default'
+    if (this.session.tenantId && owner !== this.session.tenantId) {
+      throw new TenantIsolationError(this.session.tenantId, owner, projectId)
+    }
+    return owner
   }
 
   /** List projects strictly belonging to `tenantId` (zero cross-tenant visibility). */
   listProjectsForTenant(tenantId: string): Project[] {
     const normalized = normalizeTenantId(tenantId)
+    if (this.session.tenantId && normalized !== this.session.tenantId) {
+      throw new TenantIsolationError(this.session.tenantId, normalized, 'projects')
+    }
     const rows = this.session.client.prepare(
-      'SELECT id FROM projects WHERE tenant_id = ? ORDER BY created_at DESC',
-    ).all(normalized) as Array<{ id: string }>
+      'SELECT id FROM projects WHERE workspace_id = ? AND tenant_id = ? ORDER BY created_at DESC',
+    ).all(this.session.workspace.id, normalized) as Array<{ id: string }>
     return rows.map(r => this.project(r.id))
   }
 }

@@ -8,10 +8,10 @@
 import { createHash, randomUUID } from 'node:crypto'
 import type { EventEmitter } from 'node:events'
 import {
-  existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync, unlinkSync, writeFileSync,
+  chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync, rmdirSync, unlinkSync, writeFileSync,
 } from 'node:fs'
-import { join, resolve } from 'node:path'
-import type { DatabaseSync } from 'node:sqlite'
+import { dirname, join, resolve } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { and, eq } from 'drizzle-orm'
 import type { drizzle } from 'drizzle-orm/node-sqlite'
 import type {
@@ -717,6 +717,10 @@ export function safeJsonParse<T>(raw: string, fallback: T): T {
   }
 }
 
+/** Default SQLite `busy_timeout` (ms) enforced across all Store and auxiliary SQLite connections. */
+export const SQLITE_DEFAULT_BUSY_TIMEOUT_MS = 5_000
+/** Default SQLite `journal_size_limit` (64 MiB) capping WAL file growth after checkpoints. */
+export const SQLITE_JOURNAL_SIZE_LIMIT_BYTES = 64 * 1024 * 1024
 /** Minimum SQLite `busy_timeout` (ms) enforced when high-concurrency Phase-B workers run. */
 export const HIGH_CONCURRENCY_SQLITE_BUSY_TIMEOUT_MS = 15_000
 
@@ -740,6 +744,78 @@ export function withBusyRetry<T>(fn: () => T, maxAttempts = 6, baseBackoffMs = 5
       }
     }
   }
+}
+
+export interface OpenSqliteDatabaseOptions {
+  busyTimeoutMs?: number
+  journalSizeLimitBytes?: number
+  foreignKeys?: boolean
+  readOnly?: boolean
+  createOwnerOnlyFile?: boolean
+}
+
+/**
+ * Unified SQLite connection factory enforcing WAL mode, `synchronous = NORMAL`,
+ * `busy_timeout = 5000`, `journal_size_limit = 64 MiB`, and `foreign_keys = ON`.
+ */
+export function openSqliteDatabase(
+  path: string,
+  options: OpenSqliteDatabaseOptions = {},
+): DatabaseSync {
+  const isMemory = path === ':memory:'
+  const readOnly = Boolean(options.readOnly)
+  const busyTimeoutMs = clampInteger(options.busyTimeoutMs ?? SQLITE_DEFAULT_BUSY_TIMEOUT_MS, 500, 60_000)
+  const journalSizeLimitBytes = Math.max(0, Math.trunc(options.journalSizeLimitBytes ?? SQLITE_JOURNAL_SIZE_LIMIT_BYTES))
+
+  if (!isMemory && !readOnly) {
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
+    if (options.createOwnerOnlyFile !== false && !existsSync(path)) {
+      try {
+        writeFileSync(path, '', { flag: 'wx', mode: 0o600 })
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+      }
+    }
+  }
+
+  const client = new DatabaseSync(path, {
+    timeout: busyTimeoutMs,
+    ...(readOnly ? { readOnly: true } : {}),
+  })
+  try {
+    if (!isMemory && !readOnly && options.createOwnerOnlyFile !== false) {
+      try { chmodSync(path, 0o600) } catch { /* best-effort owner-only permissions */ }
+    }
+    if (readOnly) {
+      withBusyRetry(() => client.exec(`PRAGMA busy_timeout = ${busyTimeoutMs};`))
+    } else {
+      const pragmas: string[] = []
+      if (!isMemory) pragmas.push('PRAGMA journal_mode = WAL;')
+      pragmas.push('PRAGMA synchronous = NORMAL;')
+      pragmas.push(`PRAGMA busy_timeout = ${busyTimeoutMs};`)
+      if (!isMemory) pragmas.push(`PRAGMA journal_size_limit = ${journalSizeLimitBytes};`)
+      if (options.foreignKeys !== false) pragmas.push('PRAGMA foreign_keys = ON;')
+      withBusyRetry(() => client.exec(pragmas.join(' ')))
+    }
+    return client
+  } catch (error) {
+    try { client.close() } catch { /* ignore */ }
+    throw error
+  }
+}
+
+/** Safe single filesystem segment for a tenant's partitioned blob namespace. */
+export function tenantBlobSegment(tenantId: string): string {
+  const normalized = normalizeTenantId(tenantId)
+  if (/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(normalized) && !normalized.includes('..')) {
+    return normalized
+  }
+  return `t_${createHash('sha256').update(normalized, 'utf8').digest('hex').slice(0, 32)}`
+}
+
+/** Partitioned content-addressed blob path: `artifacts/<tenantId>/blobs/<bucket>/<blobId>.txt`. */
+export function tenantBlobFile(directory: string, tenantId: string, blobId: string): string {
+  return join(directory, 'artifacts', tenantBlobSegment(tenantId), 'blobs', artifactBucket(blobId), blobId + '.txt')
 }
 
 /** True when a single path segment contains no traversal or separator characters. */
@@ -878,6 +954,7 @@ export function cleanupRunFilesOnDisk(
   runId: string,
   sessionIds: readonly string[],
   flatArtifactIds: readonly string[],
+  tenantBlobFiles: readonly string[] = [],
 ): void {
   if (isSafePathSegment(runId)) {
     for (const dir of [
@@ -906,6 +983,12 @@ export function cleanupRunFilesOnDisk(
     if (!isSafePathSegment(artifactId)) continue
     try { unlinkSync(join(directory, 'artifacts', `${artifactId}.txt`)) } catch { /* ignore */ }
   }
+  for (const blobPath of tenantBlobFiles) {
+    try {
+      unlinkSync(blobPath)
+      try { rmdirSync(dirname(blobPath)) } catch { /* non-empty */ }
+    } catch { /* missing or already removed */ }
+  }
 }
 
 export type StoreDb = ReturnType<typeof drizzle>
@@ -927,6 +1010,8 @@ export interface DbSession {
   readonly ftsTableExists: boolean
   readonly txDepth: number
   readonly isFlushing: boolean
+  /** Optional tenant boundary enforced on every project/run/blob read and write when set. */
+  readonly tenantId?: string
   transaction<T>(fn: () => T, options?: { behavior?: 'deferred' | 'immediate' | 'exclusive' }): T
   operate<Result extends { id: string }>(input: { requestId: string }, apply: () => Result): Result
   ensureHighConcurrencyPragmas(minBusyTimeoutMs?: number): { journalMode: string; busyTimeoutMs: number }
@@ -935,6 +1020,7 @@ export interface DbSession {
   tableExists(table: string): boolean
   hasCascadeSchema(): boolean
   countRunRows(table: string, runId: string): number
+  effectiveRunTenant(runId: string): string | null
   requireProject(projectId: string): Project
   requireRun(runId: string): Run
   listProjectPersonas(projectId: string): PublicPersona[]
@@ -958,17 +1044,35 @@ export interface DbSession {
   emitWake(): void
   writeArtifactFile(runId: string, id: string, content: string, group?: string, durable?: boolean): void
   readArtifactFile(runId: string, id: string, group?: string): string | null
-  writeBlob(content: string, secrets?: readonly NamedSecret[], runId?: string, durable?: boolean): { id: string; sha256: string }
-  readBlob(blobId: string, runId?: string): string
+  writeBlob(
+    content: string,
+    secrets?: readonly NamedSecret[],
+    runId?: string,
+    durable?: boolean,
+    tenantId?: string,
+  ): { id: string; sha256: string }
+  readBlob(blobId: string, runId?: string, tenantId?: string): string
   collectRunCleanupFiles(runId: string): { sessionIds: string[]; artifactIds: Set<string> }
   filterUnreferencedFlatArtifacts(artifactIds: ReadonlySet<string>): string[]
-  deleteRunRowsInTx(runId: string, cascade?: boolean): { sessionIds: string[]; flatArtifactIds: string[] }
-  cleanupRunFilesOnDisk(runId: string, sessionIds: readonly string[], flatArtifactIds: readonly string[]): void
+  filterUnreferencedTenantBlobs(tenantId: string, artifactIds: ReadonlySet<string>): string[]
+  deleteRunRowsInTx(runId: string, cascade?: boolean): {
+    sessionIds: string[]
+    flatArtifactIds: string[]
+    tenantBlobFiles: string[]
+  }
+  cleanupRunFilesOnDisk(
+    runId: string,
+    sessionIds: readonly string[],
+    flatArtifactIds: readonly string[],
+    tenantBlobFiles?: readonly string[],
+  ): void
 }
 
 export interface StoreSessionConfig {
   db: StoreDb
   client: DatabaseSync
+  /** Optional unwrapped SQLite handle for internal non-exchange lookups that must not flush queued exchanges. */
+  rawClient?: DatabaseSync
   workspace: WorkspaceRow
   directory: string
   emitter: EventEmitter
@@ -984,6 +1088,7 @@ export interface StoreSessionConfig {
 export class StoreSession implements DbSession {
   readonly db: StoreDb
   readonly client: DatabaseSync
+  private readonly rawClient: DatabaseSync
   readonly workspace: WorkspaceRow
   readonly directory: string
   readonly ftsMode: FtsMode
@@ -1010,6 +1115,7 @@ export class StoreSession implements DbSession {
   constructor(config: StoreSessionConfig) {
     this.db = config.db
     this.client = config.client
+    this.rawClient = config.rawClient ?? config.client
     this.workspace = config.workspace
     this.directory = config.directory
     this.emitter = config.emitter
@@ -1081,6 +1187,17 @@ export class StoreSession implements DbSession {
   countRunRows(table: string, runId: string): number {
     const row = this.client.prepare(`SELECT count(*) AS c FROM ${table} WHERE run_id = ?`).get(runId) as { c?: number } | undefined
     return Number(row?.c ?? 0)
+  }
+
+  effectiveRunTenant(runId: string): string | null {
+    const row = this.rawClient.prepare(
+      `SELECT COALESCE(NULLIF(r.tenant_id, 'default'), p.tenant_id, 'default') AS effective_tenant
+       FROM runs r
+       LEFT JOIN projects p ON p.id = r.project_id
+       WHERE r.id = ? AND r.workspace_id = ?`,
+    ).get(runId, this.workspace.id) as { effective_tenant?: string | null } | undefined
+    if (!row) return null
+    return row.effective_tenant || 'default'
   }
 
   requireProject(projectId: string): Project {
@@ -1314,13 +1431,18 @@ export class StoreSession implements DbSession {
     return this.db.insert(tables.events).values(eventRows).returning().all()
   }
 
-  transaction<T>(fn: () => T, _options?: { behavior?: 'deferred' | 'immediate' | 'exclusive' }): T {
+  transaction<T>(fn: () => T, options?: { behavior?: 'deferred' | 'immediate' | 'exclusive' }): T {
     if (this._txDepth === 0) {
       // Preserve write ordering: never open a transaction while exchange writes are pending.
       this.flushNow()
       this._txDepth += 1
+      const beginSql = options?.behavior === 'exclusive'
+        ? 'BEGIN EXCLUSIVE'
+        : options?.behavior === 'deferred'
+          ? 'BEGIN DEFERRED'
+          : 'BEGIN IMMEDIATE'
       try {
-        withBusyRetry(() => this.client.exec('BEGIN IMMEDIATE'))
+        withBusyRetry(() => this.client.exec(beginSql))
       } catch (error) {
         this._txDepth -= 1
         throw error
@@ -1461,42 +1583,94 @@ export class StoreSession implements DbSession {
     secrets: readonly NamedSecret[] = [],
     runId?: string,
     durable = true,
+    tenantId?: string,
   ): { id: string; sha256: string } {
     const clean = redact(content, secrets)
     const sha256 = createHash('sha256').update(clean, 'utf8').digest('hex')
     const id = 'blob-' + sha256
-    if (runId) {
-      this.writeArtifactFile(runId, id, clean, 'blobs', durable)
-    } else {
-      const file = join(this.directory, 'artifacts', id + '.txt')
-      if (!existsSync(file)) {
-        try {
-          writeFileSync(file, clean, { flag: 'wx', mode: 0o600, flush: durable })
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
-        }
+    const resolvedTenant = tenantId !== undefined
+      ? normalizeTenantId(tenantId)
+      : (runId ? (this.effectiveRunTenant(runId) ?? 'default') : 'default')
+
+    if (resolvedTenant !== 'default' || !runId) {
+      const file = tenantBlobFile(this.directory, resolvedTenant, id)
+      mkdirSync(dirname(file), { recursive: true, mode: 0o700 })
+      try {
+        writeFileSync(file, clean, { flag: 'wx', mode: 0o600, flush: durable })
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
       }
+    } else {
+      this.writeArtifactFile(runId, id, clean, 'blobs', durable)
     }
     return { id, sha256 }
   }
 
-  readBlob(blobId: string, runId?: string): string {
+  readBlob(blobId: string, runId?: string, tenantId?: string): string {
     if (!/^blob-[a-f0-9]{64}$/.test(blobId)) throw new Error('Invalid blob ID.')
-    if (runId) {
-      const scoped = this.readArtifactFile(runId, blobId, 'blobs')
-      if (scoped !== null) return scoped
+    let resolvedTenant: string
+    if (tenantId !== undefined) {
+      resolvedTenant = normalizeTenantId(tenantId)
+      if (runId) {
+        const runOwner = this.effectiveRunTenant(runId)
+        if (runOwner !== null && runOwner !== resolvedTenant) {
+          throw new TenantIsolationError(resolvedTenant, runOwner, runId)
+        }
+      }
+    } else if (runId) {
+      resolvedTenant = this.effectiveRunTenant(runId) ?? 'default'
+    } else {
+      resolvedTenant = 'default'
     }
+
+    // 1. Tenant-partitioned content-addressed layout: artifacts/<tenantId>/blobs/<bucket>/<blobId>.txt
+    const partitioned = tenantBlobFile(this.directory, resolvedTenant, blobId)
+    if (existsSync(partitioned)) return readFileSync(partitioned, 'utf8')
+
+    // 2. Run-sharded layout for the authorized run (default tenant or legacy pre-migration run).
+    if (runId && isSafePathSegment(runId)) {
+      const runScoped = artifactShardFile(this.directory, runId, blobId, 'blobs')
+      if (existsSync(runScoped)) return readFileSync(runScoped, 'utf8')
+    }
+
+    // 3. DB-indexed same-tenant run lookup (never scans other tenants' directories via readdirSync).
+    const sameTenantRuns = this.client.prepare(
+      `SELECT DISTINCT e.run_id AS runId
+       FROM broker_exchanges e
+       JOIN runs r ON r.id = e.run_id
+       LEFT JOIN projects p ON p.id = r.project_id
+       WHERE e.body_artifact_id = ?
+         AND r.workspace_id = ?
+         AND COALESCE(NULLIF(r.tenant_id, 'default'), p.tenant_id, 'default') = ?
+       LIMIT 16`,
+    ).all(blobId, this.workspace.id, resolvedTenant) as Array<{ runId: string }>
+    for (const row of sameTenantRuns) {
+      if (!isSafePathSegment(row.runId)) continue
+      const candidate = artifactShardFile(this.directory, row.runId, blobId, 'blobs')
+      if (existsSync(candidate)) return readFileSync(candidate, 'utf8')
+    }
+
+    // 4. Legacy flat path fallback during migration (only when owned by this tenant or unowned in default).
     const flat = join(this.directory, 'artifacts', blobId + '.txt')
-    if (existsSync(flat)) return readFileSync(flat, 'utf8')
-    // Content-addressed blobs may have been first written under another run.
-    let dirs: string[] = []
-    try {
-      dirs = readdirSync(join(this.directory, 'artifacts'), { withFileTypes: true })
-        .filter(entry => entry.isDirectory()).map(entry => entry.name)
-    } catch { /* empty artifacts dir */ }
-    for (const dir of dirs) {
-      const found = this.readArtifactFile(dir, blobId, 'blobs')
-      if (found !== null) return found
+    if (existsSync(flat)) {
+      if (sameTenantRuns.length > 0) {
+        return readFileSync(flat, 'utf8')
+      }
+      if (resolvedTenant === 'default') {
+        const otherTenantRef = this.client.prepare(
+          `SELECT 1 AS hit
+           FROM broker_exchanges e
+           JOIN runs r ON r.id = e.run_id
+           LEFT JOIN projects p ON p.id = r.project_id
+           WHERE e.body_artifact_id = ?
+             AND r.workspace_id = ?
+             AND COALESCE(NULLIF(r.tenant_id, 'default'), p.tenant_id, 'default') <> 'default'
+           LIMIT 1`,
+        ).get(blobId, this.workspace.id) as { hit?: number } | undefined
+        if (!otherTenantRef?.hit) {
+          return readFileSync(flat, 'utf8')
+        }
+      }
     }
     throw new Error('Artifact not found.')
   }
@@ -1546,7 +1720,36 @@ export class StoreSession implements DbSession {
     return flatArtifactIds
   }
 
-  deleteRunRowsInTx(runId: string, cascade = this.hasCascadeSchema()): { sessionIds: string[]; flatArtifactIds: string[] } {
+  /** Return tenant-partitioned blob paths no longer referenced by any surviving run of `tenantId`. */
+  filterUnreferencedTenantBlobs(tenantId: string, artifactIds: ReadonlySet<string>): string[] {
+    if (artifactIds.size === 0) return []
+    const normalized = normalizeTenantId(tenantId)
+    const checkTenantRef = this.client.prepare(
+      `SELECT 1 AS hit
+       FROM broker_exchanges e
+       JOIN runs r ON r.id = e.run_id
+       LEFT JOIN projects p ON p.id = r.project_id
+       WHERE e.body_artifact_id = ?
+         AND r.workspace_id = ?
+         AND COALESCE(NULLIF(r.tenant_id, 'default'), p.tenant_id, 'default') = ?
+       LIMIT 1`,
+    )
+    const out: string[] = []
+    for (const aid of artifactIds) {
+      if (!/^blob-[a-f0-9]{64}$/.test(aid)) continue
+      if (!checkTenantRef.get(aid, this.workspace.id, normalized)) {
+        out.push(tenantBlobFile(this.directory, normalized, aid))
+      }
+    }
+    return out
+  }
+
+  deleteRunRowsInTx(runId: string, cascade = this.hasCascadeSchema()): {
+    sessionIds: string[]
+    flatArtifactIds: string[]
+    tenantBlobFiles: string[]
+  } {
+    const runTenant = this.effectiveRunTenant(runId) ?? 'default'
     const { sessionIds, artifactIds } = this.collectRunCleanupFiles(runId)
 
     // Note: tenant_audit_log is an append-only immutable audit table with a BEFORE DELETE trigger
@@ -1596,14 +1799,169 @@ export class StoreSession implements DbSession {
       }
     }
     this.client.prepare(`DELETE FROM runs WHERE id = ? AND workspace_id = ?`).run(runId, this.workspace.id)
-    return { sessionIds, flatArtifactIds: this.filterUnreferencedFlatArtifacts(artifactIds) }
+    return {
+      sessionIds,
+      flatArtifactIds: this.filterUnreferencedFlatArtifacts(artifactIds),
+      tenantBlobFiles: this.filterUnreferencedTenantBlobs(runTenant, artifactIds),
+    }
   }
 
   cleanupRunFilesOnDisk(
     runId: string,
     sessionIds: readonly string[],
     flatArtifactIds: readonly string[],
+    tenantBlobFiles: readonly string[] = [],
   ): void {
-    cleanupRunFilesOnDisk(this.directory, runId, sessionIds, flatArtifactIds)
+    cleanupRunFilesOnDisk(this.directory, runId, sessionIds, flatArtifactIds, tenantBlobFiles)
+  }
+}
+
+/**
+ * Tenant-scoped `DbSession` wrapper enforcing strict tenant isolation across every
+ * project, run, child-entity, and blob access while delegating transactions, exchange
+ * batching, and events to the backing `StoreSession`.
+ */
+export class TenantScopedSession implements DbSession {
+  private readonly inner: DbSession
+  readonly tenantId: string
+
+  constructor(inner: DbSession, tenantId: string) {
+    this.inner = inner
+    this.tenantId = normalizeTenantId(tenantId)
+  }
+
+  get db() { return this.inner.db }
+  get client() { return this.inner.client }
+  get workspace() { return this.inner.workspace }
+  get directory() { return this.inner.directory }
+  get ftsMode() { return this.inner.ftsMode }
+  get ftsMaxBodyBytes() { return this.inner.ftsMaxBodyBytes }
+  get maxFullFtsDbBytes() { return this.inner.maxFullFtsDbBytes }
+  get ftsAvailable() { return this.inner.ftsAvailable }
+  get ftsTableExists() { return this.inner.ftsTableExists }
+  get txDepth() { return this.inner.txDepth }
+  get isFlushing() { return this.inner.isFlushing }
+
+  transaction<T>(fn: () => T, options?: { behavior?: 'deferred' | 'immediate' | 'exclusive' }): T {
+    return this.inner.transaction(fn, options)
+  }
+  operate<Result extends { id: string }>(input: { requestId: string }, apply: () => Result): Result {
+    return this.inner.operate(input, apply)
+  }
+  ensureHighConcurrencyPragmas(minBusyTimeoutMs?: number) {
+    return this.inner.ensureHighConcurrencyPragmas(minBusyTimeoutMs)
+  }
+  flushNow() { return this.inner.flushNow() }
+  enqueueExchange(item: PendingExchangeWrite) { return this.inner.enqueueExchange(item) }
+  tableExists(table: string) { return this.inner.tableExists(table) }
+  hasCascadeSchema() { return this.inner.hasCascadeSchema() }
+  countRunRows(table: string, runId: string) {
+    this.requireRun(runId)
+    return this.inner.countRunRows(table, runId)
+  }
+
+  effectiveRunTenant(runId: string): string | null {
+    return this.inner.effectiveRunTenant(runId)
+  }
+
+  requireProject(projectId: string): Project {
+    const project = this.inner.requireProject(projectId)
+    const owner = project.tenantId || 'default'
+    if (owner !== this.tenantId) {
+      throw new TenantIsolationError(this.tenantId, owner, projectId)
+    }
+    return project
+  }
+
+  requireRun(runId: string): Run {
+    const run = this.inner.requireRun(runId)
+    const owner = this.inner.effectiveRunTenant(runId) ?? 'default'
+    if (owner !== this.tenantId) {
+      throw new TenantIsolationError(this.tenantId, owner, runId)
+    }
+    return run
+  }
+
+  listProjectPersonas(projectId: string): PublicPersona[] {
+    this.requireProject(projectId)
+    return this.inner.listProjectPersonas(projectId)
+  }
+
+  event(runId: string | null, kind: string, message: string, detail?: Record<string, unknown>) {
+    return this.inner.event(runId, kind, message, detail)
+  }
+
+  message(
+    runId: string,
+    threadId: string,
+    role: typeof tables.messages.$inferSelect.role,
+    content: string,
+    replyTo?: string,
+    evidenceIds?: string[],
+    secrets?: readonly NamedSecret[],
+  ): string {
+    return this.inner.message(runId, threadId, role, content, replyTo, evidenceIds, secrets)
+  }
+
+  onRunEvent(runId: string, fn: (event: RunEventPayload) => void) {
+    this.requireRun(runId)
+    return this.inner.onRunEvent(runId, fn)
+  }
+  onWake(fn: () => void) { return this.inner.onWake(fn) }
+  emitWake() { return this.inner.emitWake() }
+
+  writeArtifactFile(runId: string, id: string, content: string, group?: string, durable?: boolean): void {
+    this.requireRun(runId)
+    this.inner.writeArtifactFile(runId, id, content, group, durable)
+  }
+
+  readArtifactFile(runId: string, id: string, group?: string): string | null {
+    this.requireRun(runId)
+    return this.inner.readArtifactFile(runId, id, group)
+  }
+
+  writeBlob(
+    content: string,
+    secrets: readonly NamedSecret[] = [],
+    runId?: string,
+    durable = true,
+    tenantId?: string,
+  ): { id: string; sha256: string } {
+    if (tenantId !== undefined && normalizeTenantId(tenantId) !== this.tenantId) {
+      throw new TenantIsolationError(this.tenantId, normalizeTenantId(tenantId), 'blob')
+    }
+    if (runId) this.requireRun(runId)
+    return this.inner.writeBlob(content, secrets, runId, durable, this.tenantId)
+  }
+
+  readBlob(blobId: string, runId?: string, tenantId?: string): string {
+    if (tenantId !== undefined && normalizeTenantId(tenantId) !== this.tenantId) {
+      throw new TenantIsolationError(this.tenantId, normalizeTenantId(tenantId), blobId)
+    }
+    if (runId) this.requireRun(runId)
+    return this.inner.readBlob(blobId, runId, this.tenantId)
+  }
+
+  collectRunCleanupFiles(runId: string) {
+    this.requireRun(runId)
+    return this.inner.collectRunCleanupFiles(runId)
+  }
+  filterUnreferencedFlatArtifacts(artifactIds: ReadonlySet<string>) {
+    return this.inner.filterUnreferencedFlatArtifacts(artifactIds)
+  }
+  filterUnreferencedTenantBlobs(tenantId: string, artifactIds: ReadonlySet<string>) {
+    return this.inner.filterUnreferencedTenantBlobs(tenantId, artifactIds)
+  }
+  deleteRunRowsInTx(runId: string, cascade?: boolean) {
+    this.requireRun(runId)
+    return this.inner.deleteRunRowsInTx(runId, cascade)
+  }
+  cleanupRunFilesOnDisk(
+    runId: string,
+    sessionIds: readonly string[],
+    flatArtifactIds: readonly string[],
+    tenantBlobFiles?: readonly string[],
+  ) {
+    this.inner.cleanupRunFilesOnDisk(runId, sessionIds, flatArtifactIds, tenantBlobFiles)
   }
 }
