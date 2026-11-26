@@ -929,13 +929,21 @@ export class RedactionCapacityError extends Error {
 }
 
 /**
- * Probe classes whose payloads legitimately provoke parser/DB/template errors. A 5xx from these
- * is target evidence, so it must not feed the availability circuit breaker.
+ * Probe classes whose payloads legitimately provoke parser/DB/template errors. Only plain
+ * 500/501 responses from these are bounded target evidence; origin-down gateway/edge 5xx
+ * statuses (`ORIGIN_DOWN_5XX_STATUSES`) and transport failures are NEVER exempt.
  */
 const errorInducingProbePattern = /(?:sqli|ssti|xxe|xpath|ldap|nosql|injection|traversal|deserial|template|expression|parser)/i
+const PROBE_INDUCED_EXEMPT_5XX_STATUSES = new Set([500, 501])
+const PROBE_INDUCED_5XX_THRESHOLD_MULTIPLIER = 3
+const MIN_PROBE_INDUCED_5XX_THRESHOLD = 6
 
 function isErrorInducingProbe(probeClass: string | undefined): boolean {
   return Boolean(probeClass && errorInducingProbePattern.test(probeClass))
+}
+
+function resolveProbeInduced5xxThreshold(threshold5xx: number): number {
+  return Math.max(MIN_PROBE_INDUCED_5XX_THRESHOLD, threshold5xx * PROBE_INDUCED_5XX_THRESHOLD_MULTIPLIER)
 }
 
 export function isPublicAddress({ address }: PublicAddress): boolean {
@@ -2975,13 +2983,6 @@ export class RequestBroker {
     state.errors429 = state.errors429.filter(ts => now - ts < windowMs)
     state.probeInduced5xx = state.probeInduced5xx.filter(ts => now - ts < windowMs)
 
-    // A 5xx produced by our own injection/parser payload is *evidence*, not target
-    // unavailability: count it separately so the probe cannot block its own verification.
-    if (status >= 500 && status <= 599 && isErrorInducingProbe(meta?.probeClass)) {
-      state.probeInduced5xx.push(now)
-      return
-    }
-
     if (status === 429) {
       const retryAfter = parseRetryAfterSeconds(meta?.headers)
       if (retryAfter !== undefined && retryAfter > 0) {
@@ -3002,7 +3003,8 @@ export class RequestBroker {
     }
 
     // Global gateway/availability/edge origin-down failures (502–504 and Cloudflare 520–526)
-    // keep origin-wide protection so dead/TLS-broken origins trip cleanly across distinct paths.
+    // ALWAYS keep origin-wide protection regardless of worker-declared `probeClass` so dead or
+    // edge-failing origins trip cleanly even during active injection phases.
     if (ORIGIN_DOWN_5XX_STATUSES.has(status)) {
       state.errors5xx.push(now)
       if (state.errors5xx.length >= threshold5xx) {
@@ -3012,6 +3014,37 @@ export class RequestBroker {
         state.openUntil = now + state.backoffMs
         audit('circuit_open', origin, status)
         throw new BrokerCircuitOpen(origin, state.openReason)
+      }
+      return
+    }
+
+    // Only plain 500/501 responses from error-inducing probes are treated as bounded target
+    // evidence — NEVER origin-down statuses (502–504, 520–526) or transport failures. Enforce a
+    // bounded per-window cap so sustained 500/501 storms still open the route breaker.
+    if (PROBE_INDUCED_EXEMPT_5XX_STATUSES.has(status) && isErrorInducingProbe(meta?.probeClass)) {
+      const routeTemplate = meta?.routeTemplate ?? routeTemplateForPath('/')
+      const key = `${origin}\0${routeTemplate}`
+      const existingRoute = this.routeCircuits.get(key)
+      const probeInducedThreshold = resolveProbeInduced5xxThreshold(threshold5xx)
+      state.probeInduced5xx.push(now)
+      if (existingRoute?.halfOpen || state.probeInduced5xx.length >= probeInducedThreshold) {
+        const route = existingRoute ?? {
+          failures: [],
+          cooldownMs: this.cooldownMs(1),
+          halfOpen: false,
+          consecutiveOpens: 0,
+        }
+        if (!existingRoute) this.routeCircuits.set(key, route)
+        route.consecutiveOpens += 1
+        route.cooldownMs = this.cooldownMs(route.consecutiveOpens)
+        route.openUntil = now + route.cooldownMs
+        route.halfOpen = false
+        route.failures = []
+        audit('circuit_open', origin, status)
+        throw new BrokerCircuitOpen(
+          origin,
+          `Route ${routeTemplate} exceeded probe-induced 5xx budget (${state.probeInduced5xx.length}/${probeInducedThreshold} within ${Math.round(windowMs / 1000)}s); cooling down ${Math.round(route.cooldownMs / 1000)}s (half-open).`,
+        )
       }
       return
     }
