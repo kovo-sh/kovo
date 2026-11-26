@@ -269,28 +269,111 @@ export function setQueryParam(pathAndQuery: string, name: string, value: string)
 
 
 
-export function setJsonPath(target: Record<string, unknown>, dotPath: string, value: unknown) {
+export const FORBIDDEN_PROTO_KEYS = new Set<string>(['__proto__', 'constructor', 'prototype'])
+const MAX_JSON_PATH_DEPTH = 32
+const MAX_PARAM_NAME_LENGTH = 256
+
+export function isForbiddenProtoSegment(segment: string): boolean {
+  return FORBIDDEN_PROTO_KEYS.has(segment) || FORBIDDEN_PROTO_KEYS.has(segment.trim())
+}
+
+/**
+ * Returns true if any dot-separated or bracket-delimited segment of a parameter path targets a
+ * JavaScript prototype accessor (`__proto__`, `constructor`, `prototype`).
+ */
+export function hasForbiddenProtoSegment(paramPath: string): boolean {
+  if (!paramPath) return false
+  for (const dotPart of paramPath.split('.')) {
+    if (isForbiddenProtoSegment(dotPart)) return true
+    if (dotPart.includes('[') || dotPart.includes(']')) {
+      for (const sub of dotPart.split(/[[\]]/)) {
+        if (sub && isForbiddenProtoSegment(sub)) return true
+      }
+    }
+  }
+  return false
+}
+
+export function assertSafeParamName(paramPath: string, contextLabel = 'Parameter'): void {
+  if (typeof paramPath !== 'string' || paramPath.length === 0) {
+    throw new BrokerDenied(`${contextLabel} name must be a non-empty string.`)
+  }
+  if (paramPath.length > MAX_PARAM_NAME_LENGTH || /[\r\n\0]/.test(paramPath)) {
+    throw new BrokerDenied(`${contextLabel} name is too long or contains invalid control characters.`)
+  }
+  if (hasForbiddenProtoSegment(paramPath)) {
+    throw new BrokerDenied(`${contextLabel} "${paramPath}" contains a forbidden prototype property segment.`)
+  }
+}
+
+/**
+ * Deep-clone untrusted JSON values into null-prototype object containers while stripping any
+ * prototype accessor keys (`__proto__`, `constructor`, `prototype`) at every depth.
+ */
+export function toSafeJsonContainer(value: unknown, depth = 0): unknown {
+  if (depth > MAX_JSON_PATH_DEPTH || value === null || typeof value !== 'object') return value
+  if (Array.isArray(value)) {
+    return value.map(item => toSafeJsonContainer(item, depth + 1))
+  }
+  const out = Object.create(null) as Record<string, unknown>
+  for (const key of Object.keys(value as Record<string, unknown>)) {
+    if (isForbiddenProtoSegment(key)) continue
+    Object.defineProperty(out, key, {
+      value: toSafeJsonContainer((value as Record<string, unknown>)[key], depth + 1),
+      writable: true,
+      enumerable: true,
+      configurable: true,
+    })
+  }
+  return out
+}
+
+export function setJsonPath(target: Record<string, unknown>, dotPath: string, value: unknown): void {
+  assertSafeParamName(dotPath, 'JSON path')
   const parts = dotPath.split('.')
+  if (parts.length > MAX_JSON_PATH_DEPTH) {
+    throw new BrokerDenied(`JSON path "${dotPath}" exceeds maximum nesting depth (${MAX_JSON_PATH_DEPTH}).`)
+  }
+  for (const part of parts) {
+    if (!part || isForbiddenProtoSegment(part)) {
+      throw new BrokerDenied(`JSON path "${dotPath}" contains an empty or forbidden segment.`)
+    }
+  }
   let cur: Record<string, unknown> | unknown[] = target
   for (let i = 0; i < parts.length - 1; i += 1) {
-    const part = parts[i]
+    const part = parts[i]!
     const nextIsIndex = /^\d{1,3}$/.test(parts[i + 1] ?? '')
     if (Array.isArray(cur)) {
       const index = /^\d{1,3}$/.test(part) ? Number(part) : 0
-      const existing = cur[index]
-      if (!existing || typeof existing !== 'object') cur[index] = nextIsIndex ? [] : {}
+      const existing = Object.hasOwn(cur, index) ? cur[index] : undefined
+      if (!existing || typeof existing !== 'object') {
+        cur[index] = nextIsIndex ? [] : (Object.create(null) as Record<string, unknown>)
+      }
       cur = cur[index] as Record<string, unknown> | unknown[]
     } else {
-      const existing = cur[part]
-      if (!existing || typeof existing !== 'object') cur[part] = nextIsIndex ? [] : {}
+      const existing = Object.hasOwn(cur, part) ? cur[part] : undefined
+      if (!existing || typeof existing !== 'object') {
+        const nextContainer = nextIsIndex ? [] : (Object.create(null) as Record<string, unknown>)
+        Object.defineProperty(cur, part, {
+          value: nextContainer,
+          writable: true,
+          enumerable: true,
+          configurable: true,
+        })
+      }
       cur = cur[part] as Record<string, unknown> | unknown[]
     }
   }
-  const last = parts[parts.length - 1]
+  const last = parts[parts.length - 1]!
   if (Array.isArray(cur)) {
     cur[/^\d{1,3}$/.test(last) ? Number(last) : 0] = value
   } else {
-    cur[last] = value
+    Object.defineProperty(cur, last, {
+      value,
+      writable: true,
+      enumerable: true,
+      configurable: true,
+    })
   }
 }
 
@@ -342,6 +425,7 @@ export interface UniversalInjectInput {
 
 export function injectUniversalParam(input: UniversalInjectInput): InjectedRequest {
   const param = input.param || 'q'
+  assertSafeParamName(param, 'Parameter')
   const location = input.paramLocation
   const strVal = typeof input.value === 'string'
     ? input.value
@@ -354,7 +438,7 @@ export function injectUniversalParam(input: UniversalInjectInput): InjectedReque
   }
 
   if (location === 'json') {
-    const body: Record<string, unknown> = structuredClone(input.jsonBody ?? {})
+    const body = toSafeJsonContainer(input.jsonBody ?? {}) as Record<string, unknown>
     setJsonPath(body, param, input.value)
     return {
       method: input.method && input.method !== 'GET' ? input.method : 'POST',
@@ -368,10 +452,12 @@ export function injectUniversalParam(input: UniversalInjectInput): InjectedReque
   if (location === 'form') {
     const params = new URLSearchParams()
     if (input.formBody) {
-      for (const [k, v] of Object.entries(input.formBody)) params.set(k, v)
+      for (const [k, v] of Object.entries(input.formBody)) {
+        if (!hasForbiddenProtoSegment(k)) params.set(k, v)
+      }
     } else if (input.jsonBody) {
       for (const [k, v] of Object.entries(input.jsonBody)) {
-        if (v !== undefined && v !== null) {
+        if (!hasForbiddenProtoSegment(k) && v !== undefined && v !== null) {
           params.set(k, typeof v === 'object' ? JSON.stringify(v) : String(v))
         }
       }
@@ -379,8 +465,9 @@ export function injectUniversalParam(input: UniversalInjectInput): InjectedReque
     if (typeof input.value === 'string' || typeof input.value === 'number' || typeof input.value === 'boolean') {
       params.set(param, String(input.value))
     } else {
-      for (const [op, v] of Object.entries(input.value)) {
-        params.set(`${param}[${op}]`, String(v))
+      for (const op of Object.keys(input.value)) {
+        if (hasForbiddenProtoSegment(op)) continue
+        params.set(`${param}[${op}]`, String(input.value[op]))
       }
     }
     return {
@@ -421,10 +508,19 @@ export function injectUniversalParam(input: UniversalInjectInput): InjectedReque
     if (forbiddenParamHeaders.test(param) || /[\r\n\0]/.test(param) || /[\r\n\0]/.test(strVal)) {
       throw new BrokerDenied(`Header parameter "${param}" is forbidden or contains invalid characters.`)
     }
+    const headers: Record<string, string> = {}
+    if (input.headers) {
+      for (const [k, v] of Object.entries(input.headers)) {
+        if (!isForbiddenProtoSegment(k)) {
+          Object.defineProperty(headers, k, { value: v, writable: true, enumerable: true, configurable: true })
+        }
+      }
+    }
+    Object.defineProperty(headers, param, { value: strVal, writable: true, enumerable: true, configurable: true })
     return {
       method: input.method ?? 'GET',
       pathAndQuery: input.pathAndQuery,
-      headers: { ...(input.headers ?? {}), [param]: strVal },
+      headers,
       ...baseExtras,
     }
   }
@@ -456,44 +552,55 @@ export function injectUniversalParam(input: UniversalInjectInput): InjectedReque
   }
 
   if (location === 'graphql_var') {
-    const baseJson = structuredClone(input.jsonBody ?? {})
+    const baseJson = toSafeJsonContainer(input.jsonBody ?? {}) as Record<string, unknown>
+    const rawVars = Object.hasOwn(baseJson, 'variables') ? baseJson.variables : undefined
     const variables = (
-      baseJson.variables && typeof baseJson.variables === 'object' && !Array.isArray(baseJson.variables)
-        ? baseJson.variables
-        : {}
+      rawVars && typeof rawVars === 'object' && !Array.isArray(rawVars)
+        ? rawVars
+        : (Object.create(null) as Record<string, unknown>)
     ) as Record<string, unknown>
     setJsonPath(variables, param, input.value)
     const rootVar = param.split('.')[0].replace(/[^A-Za-z0-9_]/g, '') || 'q'
     const query = input.graphqlQuery ??
-      (typeof baseJson.query === 'string' && baseJson.query.trim()
+      (Object.hasOwn(baseJson, 'query') && typeof baseJson.query === 'string' && baseJson.query.trim()
         ? baseJson.query
         : `query($${rootVar}: String) { __typename }`)
+    const payload = Object.create(null) as Record<string, unknown>
+    for (const k of Object.keys(baseJson)) {
+      if (isForbiddenProtoSegment(k)) continue
+      Object.defineProperty(payload, k, { value: baseJson[k], writable: true, enumerable: true, configurable: true })
+    }
+    Object.defineProperty(payload, 'query', { value: query, writable: true, enumerable: true, configurable: true })
+    Object.defineProperty(payload, 'variables', { value: variables, writable: true, enumerable: true, configurable: true })
     return {
       method: input.method && input.method !== 'GET' ? input.method : 'POST',
       pathAndQuery: input.pathAndQuery,
-      body: JSON.stringify({ ...baseJson, query, variables }),
+      body: JSON.stringify(payload),
       headers: { 'Content-Type': 'application/json', ...(input.headers ?? {}) },
       ...baseExtras,
     }
   }
 
   // Default: query
-  if (typeof input.value !== 'string') {
+  if (typeof input.value === 'object' && input.value !== null) {
     const url = new URL(input.pathAndQuery, 'http://kovo.invalid')
-    for (const [op, v] of Object.entries(input.value)) url.searchParams.set(`${param}[${op}]`, String(v))
+    for (const op of Object.keys(input.value)) {
+      if (hasForbiddenProtoSegment(op)) continue
+      url.searchParams.set(`${param}[${op}]`, String(input.value[op]))
+    }
     return {
       method: input.method ?? 'GET',
       pathAndQuery: url.pathname + url.search,
       headers: input.headers,
-      ...(input.method === 'POST' && input.jsonBody ? { body: JSON.stringify(input.jsonBody) } : {}),
+      ...(input.method === 'POST' && input.jsonBody ? { body: JSON.stringify(toSafeJsonContainer(input.jsonBody)) } : {}),
       ...baseExtras,
     }
   }
   return {
     method: input.method ?? 'GET',
-    pathAndQuery: setQueryParam(input.pathAndQuery, param, input.value),
+    pathAndQuery: setQueryParam(input.pathAndQuery, param, String(input.value)),
     headers: input.headers,
-    ...(input.method === 'POST' && input.jsonBody ? { body: JSON.stringify(input.jsonBody) } : {}),
+    ...(input.method === 'POST' && input.jsonBody ? { body: JSON.stringify(toSafeJsonContainer(input.jsonBody)) } : {}),
     ...baseExtras,
   }
 }
@@ -786,8 +893,10 @@ export const bolaWriteFields = [
 
 export function firstStateField(record: Record<string, unknown> | null, preferred?: string): string | null {
   if (!record) return null
-  if (preferred && preferred in record && typeof record[preferred] !== 'object') return preferred
-  return csrfStateFields.find(f => f in record && typeof record[f] !== 'object') ?? null
+  if (preferred && !hasForbiddenProtoSegment(preferred) && Object.hasOwn(record, preferred) && typeof record[preferred] !== 'object') {
+    return preferred
+  }
+  return csrfStateFields.find(f => Object.hasOwn(record, f) && typeof record[f] !== 'object') ?? null
 }
 
 
@@ -811,9 +920,9 @@ export function stateViewOf(
       ? rows.find(r => Object.values(r).some(v => (typeof v === 'string' || typeof v === 'number') && String(v) === recordId))
       : rows[0]
     if (!match) continue
-    const field = preferred && preferred in match && typeof match[preferred] !== 'object'
+    const field = preferred && !hasForbiddenProtoSegment(preferred) && Object.hasOwn(match, preferred) && typeof match[preferred] !== 'object'
       ? preferred
-      : csrfStateFields.find(f => f in match && typeof match[f] !== 'object')
+      : csrfStateFields.find(f => Object.hasOwn(match, f) && typeof match[f] !== 'object')
     if (field) return { field, value: match[field] }
   }
   return null
