@@ -5,6 +5,7 @@ import {
   updateBrowserSessionPersonaAction,
 } from '../../actions-auth-capture.ts'
 import type { PersonaAuthKind, PersonaLoginAdapter, PublicPersona } from '../../domain.ts'
+import { cn } from '../../lib/cn.ts'
 import { parseCurlOrHeaderInput } from '../../server/curl-parse.ts'
 import { FormError, useAction } from '../common.tsx'
 import { Icon } from '../run/icons.tsx'
@@ -163,6 +164,9 @@ export function PersonaFormModal({
   // Browser Session live-capture (server-side escrow captureToken) & explicit storageState import state
   const [activeCapture, setActiveCapture] = useState<ActiveCaptureSession | null>(null)
   const [captureUrlInput, setCaptureUrlInput] = useState('')
+  const [currentRemoteUrl, setCurrentRemoteUrl] = useState('')
+  const [hasReceivedFrame, setHasReceivedFrame] = useState(false)
+  const [navFlags, setNavFlags] = useState({ canBack: false, canForward: false })
   const [captureBusy, setCaptureBusy] = useState(false)
   const [captureError, setCaptureError] = useState('')
   const [capturedToken, setCapturedToken] = useState('')
@@ -173,9 +177,15 @@ export function PersonaFormModal({
   const [importNote, setImportNote] = useState('')
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
+  const addressInputRef = useRef<HTMLInputElement | null>(null)
   const eventSourceRef = useRef<EventSource | null>(null)
   const lastMoveSentRef = useRef(0)
   const activeCaptureIdRef = useRef<string | null>(null)
+  const isEditingUrlRef = useRef(false)
+  const lastSyncedRemoteUrlRef = useRef('')
+  const navHistoryRef = useRef<string[]>([])
+  const navHistoryIndexRef = useRef(-1)
+  const pendingHistoryIndexRef = useRef<number | null>(null)
   const personaAction = useAction()
 
   const isBrowserSessionMode = authMode === 'browser_session'
@@ -198,6 +208,55 @@ export function PersonaFormModal({
   )
   const secretRequired = !keepingSameAuthKind
 
+  function syncRemoteUrl(
+    remoteUrl: string | undefined,
+    options?: { force?: boolean; recordHistory?: boolean },
+  ) {
+    const trimmed = typeof remoteUrl === 'string' ? remoteUrl.trim() : ''
+    if (!trimmed) return
+    const prevRemote = lastSyncedRemoteUrlRef.current
+    const changed = trimmed !== prevRemote
+    setCurrentRemoteUrl(trimmed)
+
+    if (options?.recordHistory !== false && changed) {
+      if (pendingHistoryIndexRef.current !== null) {
+        navHistoryIndexRef.current = pendingHistoryIndexRef.current
+        pendingHistoryIndexRef.current = null
+      } else {
+        const nextStack = navHistoryRef.current.slice(0, navHistoryIndexRef.current + 1)
+        if (nextStack[nextStack.length - 1] !== trimmed) {
+          nextStack.push(trimmed)
+        }
+        navHistoryRef.current = nextStack
+        navHistoryIndexRef.current = nextStack.length - 1
+      }
+      setNavFlags({
+        canBack: navHistoryIndexRef.current > 0,
+        canForward: navHistoryIndexRef.current < navHistoryRef.current.length - 1,
+      })
+    }
+
+    if (options?.force || (!isEditingUrlRef.current && changed)) {
+      lastSyncedRemoteUrlRef.current = trimmed
+      setCaptureUrlInput(trimmed)
+    } else if (changed) {
+      lastSyncedRemoteUrlRef.current = trimmed
+    }
+  }
+
+  function resolveNavigationTarget(raw: string): string {
+    const trimmed = raw.trim()
+    if (!trimmed) return ''
+    if (/^https?:\/\//i.test(trimmed)) return trimmed
+    if (trimmed.startsWith('/') && activeCapture?.targetOrigin) {
+      return `${activeCapture.targetOrigin.replace(/\/+$/, '')}${trimmed}`
+    }
+    if (/^(localhost|127\.0\.0\.1|\[::1\])(?::\d+)?(?:\/|$)/i.test(trimmed)) {
+      return `http://${trimmed}`
+    }
+    return `https://${trimmed}`
+  }
+
   function closeLiveStream() {
     if (eventSourceRef.current) {
       eventSourceRef.current.close()
@@ -209,6 +268,14 @@ export function PersonaFormModal({
     const idToCancel = captureId ?? activeCaptureIdRef.current
     closeLiveStream()
     activeCaptureIdRef.current = null
+    isEditingUrlRef.current = false
+    lastSyncedRemoteUrlRef.current = ''
+    navHistoryRef.current = []
+    navHistoryIndexRef.current = -1
+    pendingHistoryIndexRef.current = null
+    setNavFlags({ canBack: false, canForward: false })
+    setHasReceivedFrame(false)
+    setCurrentRemoteUrl('')
     setActiveCapture(null)
     if (!idToCancel) return
     try {
@@ -276,11 +343,18 @@ export function PersonaFormModal({
     const es = new EventSource(`/_kovo/auth-capture/${encodeURIComponent(activeCapture.captureId)}/stream`)
     eventSourceRef.current = es
 
+    const handleInit = (ev: MessageEvent) => {
+      try {
+        const payload = JSON.parse(ev.data) as { url?: string }
+        if (payload.url) syncRemoteUrl(payload.url)
+      } catch { /* ignore */ }
+    }
+
     const handleFrame = (ev: MessageEvent) => {
       try {
         const frame = JSON.parse(ev.data) as { data?: string; url?: string }
         setCaptureError('')
-        if (frame.url) setCaptureUrlInput(frame.url)
+        if (frame.url) syncRemoteUrl(frame.url)
         if (!frame.data || !canvasRef.current) return
         const img = new Image()
         img.onload = () => {
@@ -289,6 +363,7 @@ export function PersonaFormModal({
           const ctx = canvas.getContext('2d')
           if (!ctx) return
           ctx.drawImage(img, 0, 0, canvas.width, canvas.height)
+          setHasReceivedFrame(true)
         }
         img.src = `data:image/jpeg;base64,${frame.data}`
       } catch {
@@ -300,7 +375,7 @@ export function PersonaFormModal({
       try {
         const payload = JSON.parse(ev.data) as { url?: string }
         setCaptureError('')
-        if (payload.url) setCaptureUrlInput(payload.url)
+        if (payload.url) syncRemoteUrl(payload.url)
       } catch { /* ignore */ }
     }
 
@@ -310,6 +385,7 @@ export function PersonaFormModal({
         if (payload.state && payload.state !== 'active') {
           closeLiveStream()
           activeCaptureIdRef.current = null
+          isEditingUrlRef.current = false
           setActiveCapture(null)
           if (payload.state === 'expired') {
             setCaptureError(payload.reason || 'Browser sign-in session expired (5 min limit). Start again.')
@@ -319,6 +395,7 @@ export function PersonaFormModal({
     }
 
     let aborted = false
+    es.addEventListener('init', handleInit as EventListener)
     es.addEventListener('frame', handleFrame as EventListener)
     es.addEventListener('url', handleUrl as EventListener)
     es.addEventListener('status', handleStatus as EventListener)
@@ -465,13 +542,22 @@ export function PersonaFormModal({
         throw new Error(payload.error || `Could not launch interactive browser (HTTP ${res.status}).`)
       }
       activeCaptureIdRef.current = payload.captureId
+      const initialUrl = payload.currentUrl || targetOrigin
+      isEditingUrlRef.current = false
+      lastSyncedRemoteUrlRef.current = initialUrl
+      navHistoryRef.current = [initialUrl]
+      navHistoryIndexRef.current = 0
+      pendingHistoryIndexRef.current = null
+      setNavFlags({ canBack: false, canForward: false })
+      setHasReceivedFrame(false)
+      setCurrentRemoteUrl(initialUrl)
+      setCaptureUrlInput(initialUrl)
       setActiveCapture({
         captureId: payload.captureId,
         targetOrigin: payload.targetOrigin || targetOrigin,
         expiresAt: payload.expiresAt || Date.now() + 5 * 60 * 1000,
         viewport: payload.viewport || { width: 1280, height: 800 },
       })
-      setCaptureUrlInput(payload.currentUrl || targetOrigin)
     } catch (err) {
       setCaptureError(err instanceof Error ? err.message : 'Unable to start browser sign-in.')
     } finally {
@@ -502,6 +588,13 @@ export function PersonaFormModal({
       }
       closeLiveStream()
       activeCaptureIdRef.current = null
+      isEditingUrlRef.current = false
+      lastSyncedRemoteUrlRef.current = ''
+      navHistoryRef.current = []
+      navHistoryIndexRef.current = -1
+      pendingHistoryIndexRef.current = null
+      setNavFlags({ canBack: false, canForward: false })
+      setHasReceivedFrame(false)
       setActiveCapture(null)
       setCapturedToken(payload.captureToken)
       setImportedStorageStateJson('')
@@ -514,7 +607,10 @@ export function PersonaFormModal({
     }
   }
 
-  async function sendCaptureInput(body: Record<string, unknown>) {
+  async function sendCaptureInput(
+    body: Record<string, unknown>,
+    options?: { forceUrlSync?: boolean; recordHistory?: boolean },
+  ) {
     const id = activeCaptureIdRef.current
     if (!id) return
     const isHover = body.kind === 'mouse' && body.type === 'mouseMoved'
@@ -527,7 +623,13 @@ export function PersonaFormModal({
       })
       if (res.ok) {
         const data = await res.json().catch(() => ({})) as { url?: string }
-        if (data.url && body.kind === 'navigate') setCaptureUrlInput(data.url)
+        if (data.url && body.kind === 'navigate') {
+          isEditingUrlRef.current = false
+          syncRemoteUrl(data.url, {
+            force: options?.forceUrlSync ?? true,
+            recordHistory: options?.recordHistory,
+          })
+        }
         return
       }
       const errData = await res.json().catch(() => ({})) as { error?: string }
@@ -553,6 +655,35 @@ export function PersonaFormModal({
         setCaptureError('Could not deliver input to the interactive browser — check your connection.')
       }
     }
+  }
+
+  function handleAddressBarNavigate(rawUrl: string) {
+    const resolved = resolveNavigationTarget(rawUrl)
+    if (!resolved) return
+    setCaptureError('')
+    isEditingUrlRef.current = false
+    addressInputRef.current?.blur()
+    setCaptureUrlInput(resolved)
+    void sendCaptureInput({ kind: 'navigate', url: resolved }, { forceUrlSync: true, recordHistory: true })
+  }
+
+  function handleHistoryStep(delta: -1 | 1) {
+    const targetIdx = navHistoryIndexRef.current + delta
+    const targetUrl = navHistoryRef.current[targetIdx]
+    if (!targetUrl) return
+    pendingHistoryIndexRef.current = targetIdx
+    isEditingUrlRef.current = false
+    setCaptureError('')
+    setCaptureUrlInput(targetUrl)
+    void sendCaptureInput({ kind: 'navigate', url: targetUrl }, { forceUrlSync: true, recordHistory: true })
+  }
+
+  function handleBrowserReload() {
+    const targetUrl = lastSyncedRemoteUrlRef.current || activeCapture?.targetOrigin || ''
+    if (!targetUrl) return
+    isEditingUrlRef.current = false
+    setCaptureError('')
+    void sendCaptureInput({ kind: 'navigate', url: targetUrl }, { forceUrlSync: true, recordHistory: false })
   }
 
   function mapCanvasCoords(e: React.MouseEvent<HTMLCanvasElement>): { x: number; y: number } {
@@ -752,6 +883,9 @@ export function PersonaFormModal({
     })
   }
 
+  const captureVp = activeCapture?.viewport ?? { width: 1280, height: 800 }
+  const isSecureRemoteUrl = currentRemoteUrl.startsWith('https://')
+
   return (
     <Dialog
       open={open}
@@ -763,120 +897,353 @@ export function PersonaFormModal({
         }
       }}
     >
-      <DialogContent className={`flex max-h-[calc(100vh-48px)] flex-col overflow-hidden p-0 transition-all ${activeCapture ? 'max-w-[920px]' : 'max-w-[700px]'}`}>
-        <form className="flex min-h-0 flex-1 flex-col" onSubmit={handleSubmit}>
-          <DialogHeader className="flex-row items-center justify-between gap-2.5 border-b border-line bg-raise px-4 py-2.5">
-            <DialogTitle className="text-[13px] font-semibold text-fg">
-              {editingPersona ? 'Edit test account' : 'Add test account'}
-            </DialogTitle>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon"
-              className="size-[26px]"
-              onClick={() => {
-                void cancelActiveCaptureSession()
-                onClose()
-              }}
-              disabled={personaAction.pending}
-              aria-label="Close"
-            >
-              <Icon name="close" size={14} />
-            </Button>
-          </DialogHeader>
-
-          <DialogBody className="flex min-h-0 flex-1 flex-col gap-3.5 overflow-y-auto p-4">
-            <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
-              Account label
-              <Input
-                className="w-full"
-                name="roleLabel"
-                required
-                maxLength={160}
-                placeholder="User A"
-                value={roleLabel}
-                onChange={e => setRoleLabel(e.target.value)}
-              />
-            </label>
-
-            {/* Universal 3-Mode Auth Selector */}
-            <div className="grid gap-1.5" role="radiogroup" aria-label="Authentication mode">
-              <span className="text-[12px] font-medium text-fg-muted">Authentication method</span>
-              <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
-                <button
+      <DialogContent
+        data-capture-active={activeCapture ? 'true' : 'false'}
+        className={cn(
+          'flex flex-col overflow-hidden p-0 transition-[width,height,max-width,max-height,opacity,scale] duration-200 ease-out',
+          activeCapture
+            ? 'h-[92vh] max-h-[92vh] w-[95vw] max-w-[1600px]'
+            : 'max-h-[90vh] w-full max-w-[720px]',
+        )}
+      >
+        {activeCapture ? (
+          <div className="flex min-h-0 flex-1 flex-col bg-panel">
+            {/* Browser Window Title Chrome */}
+            <div className="flex shrink-0 flex-wrap items-center justify-between gap-2.5 border-b border-line bg-raise px-3.5 py-2">
+              <div className="flex min-w-0 items-center gap-2.5">
+                <span className="flex shrink-0 items-center gap-1.5" aria-hidden="true">
+                  <span className="size-2.5 rounded-full bg-danger/70" />
+                  <span className="size-2.5 rounded-full bg-warn/70" />
+                  <span className="size-2.5 rounded-full bg-ok/70" />
+                </span>
+                <div className="flex min-w-0 items-center gap-1.5">
+                  <Icon name="globe" size={13} className="shrink-0 text-fg-subtle" />
+                  <DialogTitle className="truncate text-[12.5px] font-semibold text-fg">
+                    Sign-in browser · {roleLabel.trim() || 'Test account'}
+                  </DialogTitle>
+                </div>
+                <Badge variant="accent" className="hidden sm:inline-flex">
+                  Live session
+                </Badge>
+              </div>
+              <div className="flex shrink-0 items-center gap-2">
+                <Button
                   type="button"
-                  role="radio"
-                  aria-checked={authMode === 'browser_session'}
-                  onClick={() => {
-                    setAuthMode('browser_session')
-                    setCaptureError('')
-                  }}
-                  className={`flex flex-col items-start gap-1 rounded-[7px] border p-2.5 text-left transition-colors ${
-                    authMode === 'browser_session'
-                      ? 'border-accent bg-accent-soft/50 text-fg'
-                      : 'border-line bg-panel text-fg-muted hover:bg-hover'
-                  }`}
+                  variant="default"
+                  className="h-[28px] px-3"
+                  disabled={captureBusy}
+                  onClick={() => void handleCompleteInteractiveCapture()}
                 >
-                  <div className="flex w-full items-center justify-between gap-1.5">
-                    <span className="text-[12.5px] font-semibold text-fg">Browser Session</span>
-                    <Badge variant="accent">Recommended</Badge>
-                  </div>
-                  <span className="text-[11px] leading-snug text-fg-subtle">
-                    Works with SSO, Passkeys, MFA, CAPTCHA, Clerk, Auth0, Supabase &amp; auto-refreshes.
-                  </span>
-                </button>
-
-                <button
+                  <Icon name="check" size={13} />
+                  {captureBusy ? 'Capturing…' : "I'm signed in — capture session"}
+                </Button>
+                <Button
                   type="button"
-                  role="radio"
-                  aria-checked={authMode === 'header_cookie'}
-                  onClick={() => {
-                    void cancelActiveCaptureSession()
-                    setAuthMode('header_cookie')
-                  }}
-                  className={`flex flex-col items-start gap-1 rounded-[7px] border p-2.5 text-left transition-colors ${
-                    authMode === 'header_cookie'
-                      ? 'border-accent bg-accent-soft/50 text-fg'
-                      : 'border-line bg-panel text-fg-muted hover:bg-hover'
-                  }`}
+                  variant="ghost"
+                  className="h-[28px]"
+                  disabled={captureBusy}
+                  onClick={() => void cancelActiveCaptureSession()}
                 >
-                  <span className="text-[12.5px] font-semibold text-fg">Header / Cookie / cURL</span>
-                  <span className="text-[11px] leading-snug text-fg-subtle">
-                    Paste Bearer token, Cookie, custom header, or DevTools Copy as cURL.
-                  </span>
-                </button>
-
-                <button
-                  type="button"
-                  role="radio"
-                  aria-checked={authMode === 'automated_login'}
-                  onClick={() => {
-                    void cancelActiveCaptureSession()
-                    setAuthMode('automated_login')
-                  }}
-                  className={`flex flex-col items-start gap-1 rounded-[7px] border p-2.5 text-left transition-colors ${
-                    authMode === 'automated_login'
-                      ? 'border-accent bg-accent-soft/50 text-fg'
-                      : 'border-line bg-panel text-fg-muted hover:bg-hover'
-                  }`}
-                >
-                  <span className="text-[12.5px] font-semibold text-fg">Automated Login (CI / Staging)</span>
-                  <span className="text-[11px] leading-snug text-fg-subtle">
-                    Email + password form/JSON sign-in for non-MFA local labs &amp; staging CI.
-                  </span>
-                </button>
+                  Cancel
+                </Button>
               </div>
             </div>
 
-            {/* Mode 1: Universal Browser Session (Embedded Live-Login Canvas + storageState.json Fallback) */}
-            {authMode === 'browser_session' && (
-              <div className="grid gap-2.5 rounded-[7px] border border-line bg-sunk/60 p-3">
-                {!activeCapture ? (
+            {/* Browser Navigation + Omnibox Toolbar */}
+            <div className="flex shrink-0 items-center gap-1.5 border-b border-line bg-sunk px-3 py-2">
+              <div className="flex shrink-0 items-center gap-0.5">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  className="size-[28px] rounded-full"
+                  disabled={captureBusy || !navFlags.canBack}
+                  onClick={() => handleHistoryStep(-1)}
+                  aria-label="Back"
+                  title="Back"
+                >
+                  <Icon name="arrowL" size={13} />
+                </Button>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  className="size-[28px] rounded-full"
+                  disabled={captureBusy || !navFlags.canForward}
+                  onClick={() => handleHistoryStep(1)}
+                  aria-label="Forward"
+                  title="Forward"
+                >
+                  <Icon name="arrowR" size={13} />
+                </Button>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  className="size-[28px] rounded-full"
+                  disabled={captureBusy}
+                  onClick={handleBrowserReload}
+                  aria-label="Reload"
+                  title="Reload"
+                >
+                  <svg
+                    className="ico block size-3.5"
+                    viewBox="0 0 16 16"
+                    fill="none"
+                    aria-hidden="true"
+                  >
+                    <path d="M13.25 8a5.25 5.25 0 1 1-1.35-3.5" />
+                    <path d="M13.25 2.75v2.5h-2.5" />
+                  </svg>
+                </Button>
+              </div>
+
+              <div className="flex h-[32px] min-w-0 flex-1 items-center gap-1.5 rounded-full border border-line-2 bg-panel pl-3 pr-1.5 transition-colors focus-within:border-accent-line focus-within:ring-2 focus-within:ring-accent-soft">
+                <Icon
+                  name={isSecureRemoteUrl ? 'lock' : 'globe'}
+                  size={13}
+                  className={cn('shrink-0', isSecureRemoteUrl ? 'text-ok' : 'text-fg-subtle')}
+                />
+                <input
+                  ref={addressInputRef}
+                  type="text"
+                  name="browserAddressBar"
+                  aria-label="Browser address bar"
+                  autoComplete="off"
+                  spellCheck={false}
+                  className="h-full min-w-0 flex-1 border-0 bg-transparent px-1 font-mono text-[12px] text-fg shadow-none focus:shadow-none focus:outline-none"
+                  value={captureUrlInput}
+                  onFocus={() => {
+                    isEditingUrlRef.current = true
+                  }}
+                  onBlur={() => {
+                    isEditingUrlRef.current = false
+                  }}
+                  onChange={e => {
+                    isEditingUrlRef.current = true
+                    setCaptureUrlInput(e.target.value)
+                  }}
+                  onKeyDown={e => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault()
+                      handleAddressBarNavigate(captureUrlInput)
+                      return
+                    }
+                    if (e.key === 'Escape') {
+                      e.preventDefault()
+                      isEditingUrlRef.current = false
+                      setCaptureUrlInput(lastSyncedRemoteUrlRef.current || activeCapture.targetOrigin)
+                      addressInputRef.current?.blur()
+                    }
+                  }}
+                  placeholder="Enter URL (e.g. https://app.example.com/login)"
+                />
+                {captureUrlInput.length > 0 && (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className="size-[22px] shrink-0 rounded-full text-fg-subtle hover:text-fg"
+                    aria-label="Clear address bar"
+                    title="Clear URL"
+                    onMouseDown={e => e.preventDefault()}
+                    onClick={() => {
+                      isEditingUrlRef.current = true
+                      setCaptureUrlInput('')
+                      addressInputRef.current?.focus()
+                    }}
+                  >
+                    <Icon name="close" size={11} />
+                  </Button>
+                )}
+              </div>
+
+              <Button
+                type="button"
+                variant="outline"
+                className="h-[30px] shrink-0 rounded-full px-3"
+                disabled={captureBusy || !captureUrlInput.trim()}
+                onMouseDown={e => e.preventDefault()}
+                onClick={() => handleAddressBarNavigate(captureUrlInput)}
+              >
+                Go
+              </Button>
+            </div>
+
+            {/* Live Browser Viewport Canvas */}
+            <div
+              className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden bg-sunk"
+              style={{ containerType: 'size' }}
+            >
+              <canvas
+                ref={canvasRef}
+                width={captureVp.width}
+                height={captureVp.height}
+                tabIndex={0}
+                aria-label="Interactive sign-in browser"
+                className="block cursor-pointer border-x border-line-2 bg-white shadow-surface outline-none focus-visible:ring-2 focus-visible:ring-accent"
+                style={{
+                  width: `min(100cqw, calc(100cqh * ${captureVp.width} / ${captureVp.height}))`,
+                  height: `min(100cqh, calc(100cqw * ${captureVp.height} / ${captureVp.width}))`,
+                }}
+                onMouseDown={e => handleCanvasMouse('mousePressed', e)}
+                onMouseUp={e => handleCanvasMouse('mouseReleased', e)}
+                onMouseMove={e => handleCanvasMouse('mouseMoved', e)}
+                onWheel={handleCanvasWheel}
+                onKeyDown={handleCanvasKeyDown}
+                onKeyUp={handleCanvasKeyUp}
+                onPaste={handleCanvasPaste}
+                onContextMenu={e => e.preventDefault()}
+              />
+              {!hasReceivedFrame && (
+                <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-1.5 bg-sunk/90 px-4 text-center text-[12.5px] text-fg-muted">
+                  <span className="font-medium text-fg">Connecting to live sign-in browser…</span>
+                  <span className="font-mono text-[11.5px] text-fg-subtle">{activeCapture.targetOrigin}</span>
+                </div>
+              )}
+            </div>
+
+            {/* Slim Browser Status Footer */}
+            <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-t border-line bg-raise px-3.5 py-2 text-[11.5px]">
+              {captureError ? (
+                <p className="m-0 flex min-w-0 flex-1 items-center gap-1.5 text-danger" role="alert">
+                  <Icon name="alert" size={13} className="shrink-0" />
+                  <span className="truncate">{captureError}</span>
+                </p>
+              ) : (
+                <p className="m-0 flex min-w-0 flex-1 items-center gap-2 text-fg-muted">
+                  <span className="size-2 shrink-0 rounded-full bg-ok" aria-hidden="true" />
+                  <span>
+                    Sign in below — Kovo captures cookies &amp; storage automatically when you click{' '}
+                    <strong className="font-semibold text-fg">I&apos;m signed in — capture session</strong>.
+                  </span>
+                </p>
+              )}
+              <span className="shrink-0 font-mono text-[11px] text-fg-subtle">
+                SSO · Passkeys · MFA · CAPTCHA
+              </span>
+            </div>
+          </div>
+        ) : (
+          <form className="flex min-h-0 flex-1 flex-col" onSubmit={handleSubmit}>
+            <DialogHeader className="shrink-0 flex-row items-center justify-between gap-2.5 border-b border-line bg-raise px-4 py-3">
+              <DialogTitle className="text-[13.5px] font-semibold text-fg">
+                {editingPersona ? 'Edit test account' : 'Add test account'}
+              </DialogTitle>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                className="size-[26px]"
+                onClick={() => {
+                  void cancelActiveCaptureSession()
+                  onClose()
+                }}
+                disabled={personaAction.pending}
+                aria-label="Close"
+              >
+                <Icon name="close" size={14} />
+              </Button>
+            </DialogHeader>
+
+            <DialogBody className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto overflow-x-hidden p-4">
+              <label className="grid gap-1.5 text-[12px] font-medium text-fg-muted">
+                Account label
+                <Input
+                  className="w-full"
+                  name="roleLabel"
+                  required
+                  maxLength={160}
+                  placeholder="User A"
+                  value={roleLabel}
+                  onChange={e => setRoleLabel(e.target.value)}
+                />
+              </label>
+
+              {/* Universal 3-Mode Auth Selector */}
+              <div className="grid gap-2" role="radiogroup" aria-label="Authentication mode">
+                <span className="text-[12px] font-medium text-fg-muted">Authentication method</span>
+                <div className="grid grid-cols-1 items-stretch gap-2.5 sm:grid-cols-3">
+                  <button
+                    type="button"
+                    role="radio"
+                    aria-checked={authMode === 'browser_session'}
+                    onClick={() => {
+                      setAuthMode('browser_session')
+                      setCaptureError('')
+                    }}
+                    className={cn(
+                      'flex h-auto w-full min-w-0 cursor-pointer flex-col items-start justify-start gap-1.5 whitespace-normal rounded-[9px] border px-3 py-2.5 text-left font-normal shadow-none transition-colors',
+                      authMode === 'browser_session'
+                        ? 'border-accent-line bg-accent-soft text-fg hover:bg-accent-soft'
+                        : 'border-line-2 bg-panel text-fg hover:border-line-strong hover:bg-hover',
+                    )}
+                  >
+                    <div className="flex w-full flex-wrap items-center justify-between gap-1.5">
+                      <span className="text-[12.5px] font-semibold leading-[17px] text-fg">Browser Session</span>
+                      <Badge variant="accent" className="h-[18px] px-1.5 text-[10.5px]">Recommended</Badge>
+                    </div>
+                    <span className="text-[11.5px] leading-[16px] text-fg-muted">
+                      Works with SSO, Passkeys, MFA, CAPTCHA, Clerk, Auth0, Supabase &amp; auto-refreshes.
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    role="radio"
+                    aria-checked={authMode === 'header_cookie'}
+                    onClick={() => {
+                      void cancelActiveCaptureSession()
+                      setAuthMode('header_cookie')
+                    }}
+                    className={cn(
+                      'flex h-auto w-full min-w-0 cursor-pointer flex-col items-start justify-start gap-1.5 whitespace-normal rounded-[9px] border px-3 py-2.5 text-left font-normal shadow-none transition-colors',
+                      authMode === 'header_cookie'
+                        ? 'border-accent-line bg-accent-soft text-fg hover:bg-accent-soft'
+                        : 'border-line-2 bg-panel text-fg hover:border-line-strong hover:bg-hover',
+                    )}
+                  >
+                    <span className="text-[12.5px] font-semibold leading-[17px] text-fg">Header / Cookie / cURL</span>
+                    <span className="text-[11.5px] leading-[16px] text-fg-muted">
+                      Paste Bearer token, Cookie, custom header, or DevTools Copy as cURL.
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    role="radio"
+                    aria-checked={authMode === 'automated_login'}
+                    onClick={() => {
+                      void cancelActiveCaptureSession()
+                      setAuthMode('automated_login')
+                    }}
+                    className={cn(
+                      'flex h-auto w-full min-w-0 cursor-pointer flex-col items-start justify-start gap-1.5 whitespace-normal rounded-[9px] border px-3 py-2.5 text-left font-normal shadow-none transition-colors',
+                      authMode === 'automated_login'
+                        ? 'border-accent-line bg-accent-soft text-fg hover:bg-accent-soft'
+                        : 'border-line-2 bg-panel text-fg hover:border-line-strong hover:bg-hover',
+                    )}
+                  >
+                    <span className="text-[12.5px] font-semibold leading-[17px] text-fg">Automated Login (CI / Staging)</span>
+                    <span className="text-[11.5px] leading-[16px] text-fg-muted">
+                      Email + password form/JSON sign-in for non-MFA local labs &amp; staging CI.
+                    </span>
+                  </button>
+                </div>
+              </div>
+
+              {/* Mode 1: Universal Browser Session (Embedded Live-Login Browser + storageState.json Fallback) */}
+              {authMode === 'browser_session' && (
+                <div className="grid gap-3 rounded-[9px] border border-line-2 bg-sunk p-3.5">
+                  <p className="m-0 text-[12px] leading-[18px] text-fg-muted">
+                    Open a live sign-in browser to capture session cookies and storage after you log in, or import an existing Playwright <code className="font-mono text-[11.5px] text-fg">storageState.json</code> file.
+                  </p>
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <div className="flex flex-wrap items-center gap-2">
                       <Button
                         type="button"
                         variant="default"
+                        className="h-[28px] px-3"
                         disabled={captureBusy || personaAction.pending}
                         onClick={() => void handleStartInteractiveCapture()}
                       >
@@ -886,6 +1253,7 @@ export function PersonaFormModal({
                       <Button
                         type="button"
                         variant="outline"
+                        className="h-[28px]"
                         disabled={captureBusy || personaAction.pending}
                         onClick={() => setImportOpen(prev => !prev)}
                       >
@@ -905,183 +1273,137 @@ export function PersonaFormModal({
                       </span>
                     )}
                   </div>
-                ) : (
-                  <div className="grid gap-2">
-                    <div className="flex flex-wrap items-center gap-1.5">
+
+                  {importOpen && (
+                    <div className="grid gap-2 border-t border-line pt-3">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="text-[12px] font-medium text-fg-muted">
+                          Import Playwright <code className="font-mono">storageState.json</code>
+                        </span>
+                        <label className="cursor-pointer text-[11.5px] font-medium text-accent hover:underline">
+                          Choose .json file
+                          <input
+                            type="file"
+                            accept=".json,application/json"
+                            className="sr-only"
+                            onChange={e => {
+                              const file = e.target.files?.[0]
+                              if (!file) return
+                              void file.text().then(text => {
+                                setImportJsonText(text)
+                                validateAndStageStorageStateJson(text)
+                              })
+                            }}
+                          />
+                        </label>
+                      </div>
+                      <Textarea
+                        className="w-full font-mono text-[11.5px]"
+                        rows={4}
+                        value={importJsonText}
+                        onChange={e => setImportJsonText(e.target.value)}
+                        placeholder='{"cookies": [...], "origins": [...]}'
+                      />
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="min-w-0 flex-1 text-[11.5px] text-fg-subtle">{importNote}</span>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          disabled={!importJsonText.trim()}
+                          onClick={() => validateAndStageStorageStateJson(importJsonText)}
+                        >
+                          Validate JSON
+                        </Button>
+                      </div>
+                    </div>
+                  )}
+
+                  {captureError && (
+                    <p className="m-0 text-[12px] text-danger" role="alert">
+                      {captureError}
+                    </p>
+                  )}
+                </div>
+              )}
+
+              {/* Mode 2: Header / Cookie / cURL */}
+              {authMode === 'header_cookie' && (
+                <div className="grid gap-3">
+                  <div className="grid gap-1.5">
+                    <span className="text-[12px] font-medium text-fg-muted">Quick paste (optional)</span>
+                    <div className="flex items-center gap-2">
                       <Input
                         className="min-w-0 flex-1 font-mono text-[12px]"
-                        aria-label="Browser address bar"
-                        value={captureUrlInput}
-                        onChange={e => setCaptureUrlInput(e.target.value)}
-                        onKeyDown={e => {
-                          if (e.key === 'Enter') {
+                        aria-label="Paste cURL or auth header"
+                        value={curlPaste}
+                        onChange={e => setCurlPaste(e.target.value)}
+                        onPaste={e => {
+                          const pasted = e.clipboardData.getData('text')
+                          if (pasted) {
                             e.preventDefault()
-                            void sendCaptureInput({ kind: 'navigate', url: captureUrlInput })
+                            applyCurlParse(pasted)
                           }
                         }}
-                        placeholder="https://app.example.com/login"
+                        placeholder="Paste DevTools Copy as cURL, Cookie:, or Authorization: Bearer header…"
                       />
                       <Button
                         type="button"
                         variant="outline"
-                        disabled={captureBusy}
-                        onClick={() => void sendCaptureInput({ kind: 'navigate', url: captureUrlInput })}
+                        className="h-[28px] shrink-0"
+                        onClick={() => applyCurlParse(curlPaste)}
+                        disabled={!curlPaste.trim()}
                       >
-                        Go
-                      </Button>
-                      <Button
-                        type="button"
-                        variant="default"
-                        disabled={captureBusy}
-                        onClick={() => void handleCompleteInteractiveCapture()}
-                      >
-                        <Icon name="check" size={13} />
-                        {captureBusy ? 'Capturing…' : "I'm signed in — capture session"}
-                      </Button>
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        disabled={captureBusy}
-                        onClick={() => void cancelActiveCaptureSession()}
-                      >
-                        Cancel browser
+                        Paste from cURL
                       </Button>
                     </div>
-                    <div className="relative overflow-hidden rounded-[6px] border border-line bg-black">
-                      <canvas
-                        ref={canvasRef}
-                        width={activeCapture.viewport.width}
-                        height={activeCapture.viewport.height}
-                        tabIndex={0}
-                        aria-label="Interactive sign-in browser"
-                        className="block aspect-[16/10] w-full cursor-pointer outline-none focus:ring-2 focus:ring-accent"
-                        onMouseDown={e => handleCanvasMouse('mousePressed', e)}
-                        onMouseUp={e => handleCanvasMouse('mouseReleased', e)}
-                        onMouseMove={e => handleCanvasMouse('mouseMoved', e)}
-                        onWheel={handleCanvasWheel}
-                        onKeyDown={handleCanvasKeyDown}
-                        onKeyUp={handleCanvasKeyUp}
-                        onPaste={handleCanvasPaste}
-                        onContextMenu={e => e.preventDefault()}
-                      />
-                    </div>
-                    <p className="m-0 text-[11.5px] text-fg-subtle">
-                      Click inside the browser to focus and sign in (including SSO, MFA, Passkeys, or CAPTCHA). When you reach your signed-in app view, click <strong>I&apos;m signed in — capture session</strong>.
-                    </p>
+                    {curlNote && <span className="text-[11.5px] text-fg-subtle">{curlNote}</span>}
                   </div>
-                )}
 
-                {importOpen && !activeCapture && (
-                  <div className="grid gap-1.5 border-t border-line pt-2.5">
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      <span className="text-[12px] font-medium text-fg-muted">
-                        Import Playwright <code className="font-mono">storageState.json</code>
-                      </span>
-                      <label className="cursor-pointer text-[11.5px] font-medium text-accent hover:underline">
-                        Choose .json file
-                        <input
-                          type="file"
-                          accept=".json,application/json"
-                          className="sr-only"
-                          onChange={e => {
-                            const file = e.target.files?.[0]
-                            if (!file) return
-                            void file.text().then(text => {
-                              setImportJsonText(text)
-                              validateAndStageStorageStateJson(text)
-                            })
-                          }}
+                  <label className="grid gap-1.5 text-[12px] font-medium text-fg-muted">
+                    Credential type
+                    <NativeSelect
+                      className="w-full"
+                      name="authKind"
+                      value={staticKind}
+                      onChange={e => setStaticKind(e.target.value as StaticCredentialKind)}
+                    >
+                      <option value="cookie">Session cookie (Cookie: …)</option>
+                      <option value="bearer">Bearer token (Authorization: Bearer …)</option>
+                      <option value="header">Custom request header</option>
+                    </NativeSelect>
+                  </label>
+
+                  {staticKind === 'header' ? (
+                    <div className="grid grid-cols-1 items-start gap-3 sm:grid-cols-2">
+                      <label className="grid gap-1.5 text-[12px] font-medium text-fg-muted">
+                        Header name
+                        <Input
+                          className="w-full font-mono text-[12px]"
+                          name="headerName"
+                          required
+                          pattern="[A-Za-z0-9-]{1,64}"
+                          placeholder="X-Api-Key"
+                          value={headerName}
+                          onChange={e => setHeaderName(e.target.value)}
+                        />
+                      </label>
+                      <label className="grid gap-1.5 text-[12px] font-medium text-fg-muted">
+                        Credential secret
+                        <Input
+                          className="w-full"
+                          name="secret"
+                          type="password"
+                          required={secretRequired}
+                          maxLength={4096}
+                          autoComplete="off"
+                          value={secret}
+                          onChange={e => setSecret(e.target.value)}
+                          placeholder={keepingSameAuthKind ? 'Leave blank to keep existing secret' : 'Never displayed back after saving'}
                         />
                       </label>
                     </div>
-                    <Textarea
-                      className="w-full font-mono text-[11.5px]"
-                      rows={4}
-                      value={importJsonText}
-                      onChange={e => setImportJsonText(e.target.value)}
-                      placeholder='{"cookies": [...], "origins": [...]}'
-                    />
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="text-[11.5px] text-fg-subtle">{importNote}</span>
-                      <Button
-                        type="button"
-                        variant="outline"
-                        disabled={!importJsonText.trim()}
-                        onClick={() => validateAndStageStorageStateJson(importJsonText)}
-                      >
-                        Validate JSON
-                      </Button>
-                    </div>
-                  </div>
-                )}
-
-                {captureError && (
-                  <p className="m-0 text-[12px] text-danger" role="alert">
-                    {captureError}
-                  </p>
-                )}
-              </div>
-            )}
-
-            {/* Mode 2: Header / Cookie / cURL */}
-            {authMode === 'header_cookie' && (
-              <div className="grid gap-2.5">
-                <div className="grid gap-1.5">
-                  <div className="flex items-center gap-1.5">
-                    <Input
-                      className="flex-1 font-mono text-[12px]"
-                      value={curlPaste}
-                      onChange={e => setCurlPaste(e.target.value)}
-                      onPaste={e => {
-                        const pasted = e.clipboardData.getData('text')
-                        if (pasted) {
-                          e.preventDefault()
-                          applyCurlParse(pasted)
-                        }
-                      }}
-                      placeholder="Paste DevTools Copy as cURL, Cookie:, or Authorization: Bearer header…"
-                    />
-                    <Button
-                      type="button"
-                      variant="outline"
-                      onClick={() => applyCurlParse(curlPaste)}
-                      disabled={!curlPaste.trim()}
-                    >
-                      Paste from cURL
-                    </Button>
-                  </div>
-                  {curlNote && <span className="text-[11.5px] text-fg-subtle">{curlNote}</span>}
-                </div>
-
-                <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
-                  Credential type
-                  <NativeSelect
-                    className="w-full"
-                    name="authKind"
-                    value={staticKind}
-                    onChange={e => setStaticKind(e.target.value as StaticCredentialKind)}
-                  >
-                    <option value="cookie">Session cookie (Cookie: …)</option>
-                    <option value="bearer">Bearer token (Authorization: Bearer …)</option>
-                    <option value="header">Custom request header</option>
-                  </NativeSelect>
-                </label>
-
-                {staticKind === 'header' ? (
-                  <div className="grid grid-cols-1 items-start gap-2.5 sm:grid-cols-2">
-                    <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
-                      Header name
-                      <Input
-                        className="w-full font-mono text-[12px]"
-                        name="headerName"
-                        required
-                        pattern="[A-Za-z0-9-]{1,64}"
-                        placeholder="X-Api-Key"
-                        value={headerName}
-                        onChange={e => setHeaderName(e.target.value)}
-                      />
-                    </label>
-                    <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
+                  ) : (
+                    <label className="grid gap-1.5 text-[12px] font-medium text-fg-muted">
                       Credential secret
                       <Input
                         className="w-full"
@@ -1095,146 +1417,37 @@ export function PersonaFormModal({
                         placeholder={keepingSameAuthKind ? 'Leave blank to keep existing secret' : 'Never displayed back after saving'}
                       />
                     </label>
-                  </div>
-                ) : (
-                  <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
-                    Credential secret
-                    <Input
-                      className="w-full"
-                      name="secret"
-                      type="password"
-                      required={secretRequired}
-                      maxLength={4096}
-                      autoComplete="off"
-                      value={secret}
-                      onChange={e => setSecret(e.target.value)}
-                      placeholder={keepingSameAuthKind ? 'Leave blank to keep existing secret' : 'Never displayed back after saving'}
-                    />
-                  </label>
-                )}
-              </div>
-            )}
-
-            {/* Mode 3: Automated Login (CI / Staging) */}
-            {authMode === 'automated_login' && (
-              isClerkClient ? (
-                <div className="grid gap-2.5">
-                  <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
-                    Clerk __client cookie (legacy)
-                    <Input
-                      className="w-full font-mono text-[12px]"
-                      name="secret"
-                      type="password"
-                      required={secretRequired}
-                      maxLength={4096}
-                      autoComplete="off"
-                      value={secret}
-                      onChange={e => setSecret(e.target.value)}
-                      placeholder={
-                        keepingSameAuthKind
-                          ? 'Leave blank to keep existing secret'
-                          : 'Paste __client cookie value from DevTools (clerk.yourdomain.com)'
-                      }
-                    />
-                    <small className="text-[11.5px] font-normal text-fg-subtle">
-                      Legacy adapter — prefer <strong>Browser Session</strong> for universal auto-refresh across all identity providers.
-                    </small>
-                  </label>
-                  <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
-                    Clerk Frontend API URL (optional)
-                    <Input
-                      className="w-full"
-                      name="loginUrl"
-                      type="url"
-                      maxLength={500}
-                      autoComplete="off"
-                      value={loginUrl}
-                      onChange={e => setLoginUrl(e.target.value)}
-                      placeholder={LOGIN_URL_PLACEHOLDERS.clerk_client}
-                    />
-                  </label>
+                  )}
                 </div>
-              ) : (
-                <div className="grid grid-cols-1 items-start gap-2.5 sm:grid-cols-2">
-                  <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
-                    Email
-                    <Input
-                      className="w-full"
-                      name="loginEmail"
-                      type="email"
-                      required
-                      maxLength={320}
-                      autoComplete="off"
-                      value={loginEmail}
-                      onChange={e => setLoginEmail(e.target.value)}
-                      placeholder="test-a@example.com"
-                    />
-                  </label>
-                  <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
-                    Password
-                    <Input
-                      className="w-full"
-                      name="secret"
-                      type="password"
-                      required={secretRequired}
-                      maxLength={4096}
-                      autoComplete="off"
-                      value={secret}
-                      onChange={e => setSecret(e.target.value)}
-                      placeholder={keepingSameAuthKind ? 'Leave blank to keep existing secret' : 'Encrypted on your machine'}
-                    />
-                  </label>
-                </div>
-              )
-            )}
+              )}
 
-            <Disclosure
-              open={advancedOpen}
-              onOpenChange={setAdvancedOpen}
-              className="border-t border-line pt-2.5"
-            >
-              <DisclosureTrigger className="h-auto bg-transparent px-0 py-1 text-fg-muted shadow-none hover:bg-transparent hover:text-fg">
-                Advanced configuration
-              </DisclosureTrigger>
-              <DisclosureContent className="grid gap-2.5 pt-2.5">
-                {authMode === 'browser_session' && (
-                  <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
-                    Auto-refresh path (optional)
-                    <Input
-                      className="w-full font-mono text-[12px]"
-                      name="verifyPath"
-                      maxLength={256}
-                      autoComplete="off"
-                      value={verifyPath}
-                      onChange={e => setVerifyPath(e.target.value)}
-                      placeholder="/ (e.g. /dashboard or /app)"
-                    />
-                    <small className="text-[11.5px] font-normal text-fg-subtle">
-                      Visited in a headless browser on refresh so the app&apos;s own JS SDK rotates short-lived tokens automatically.
-                    </small>
-                  </label>
-                )}
-
-                {authMode === 'automated_login' && (
-                  <div className="grid grid-cols-1 items-start gap-2.5 sm:grid-cols-2">
-                    <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
-                      Auth adapter
-                      <NativeSelect
-                        className="w-full"
-                        name="loginAdapter"
-                        value={loginAdapter}
-                        onChange={e => setLoginAdapter(e.target.value as PersonaLoginAdapter)}
-                      >
-                        <option value="auto">Auto-detect</option>
-                        <option value="form">Login Form (Browser)</option>
-                        <option value="json">JSON API / Better Auth</option>
-                        <option value="clerk">Clerk (legacy)</option>
-                        <option value="clerk_client">Clerk __client cookie (auto-refresh)</option>
-                        <option value="supabase">Supabase Auth (legacy)</option>
-                      </NativeSelect>
+              {/* Mode 3: Automated Login (CI / Staging) */}
+              {authMode === 'automated_login' && (
+                isClerkClient ? (
+                  <div className="grid gap-3">
+                    <label className="grid gap-1.5 text-[12px] font-medium text-fg-muted">
+                      Clerk __client cookie (legacy)
+                      <Input
+                        className="w-full font-mono text-[12px]"
+                        name="secret"
+                        type="password"
+                        required={secretRequired}
+                        maxLength={4096}
+                        autoComplete="off"
+                        value={secret}
+                        onChange={e => setSecret(e.target.value)}
+                        placeholder={
+                          keepingSameAuthKind
+                            ? 'Leave blank to keep existing secret'
+                            : 'Paste __client cookie value from DevTools (clerk.yourdomain.com)'
+                        }
+                      />
+                      <small className="text-[11.5px] font-normal text-fg-subtle">
+                        Legacy adapter — prefer <strong>Browser Session</strong> for universal auto-refresh across all identity providers.
+                      </small>
                     </label>
-                    <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
-                      Login URL (optional)
+                    <label className="grid gap-1.5 text-[12px] font-medium text-fg-muted">
+                      Clerk Frontend API URL (optional)
                       <Input
                         className="w-full"
                         name="loginUrl"
@@ -1243,52 +1456,148 @@ export function PersonaFormModal({
                         autoComplete="off"
                         value={loginUrl}
                         onChange={e => setLoginUrl(e.target.value)}
-                        placeholder={LOGIN_URL_PLACEHOLDERS[loginAdapter]}
+                        placeholder={LOGIN_URL_PLACEHOLDERS.clerk_client}
                       />
                     </label>
                   </div>
-                )}
+                ) : (
+                  <div className="grid grid-cols-1 items-start gap-3 sm:grid-cols-2">
+                    <label className="grid gap-1.5 text-[12px] font-medium text-fg-muted">
+                      Email
+                      <Input
+                        className="w-full"
+                        name="loginEmail"
+                        type="email"
+                        required
+                        maxLength={320}
+                        autoComplete="off"
+                        value={loginEmail}
+                        onChange={e => setLoginEmail(e.target.value)}
+                        placeholder="test-a@example.com"
+                      />
+                    </label>
+                    <label className="grid gap-1.5 text-[12px] font-medium text-fg-muted">
+                      Password
+                      <Input
+                        className="w-full"
+                        name="secret"
+                        type="password"
+                        required={secretRequired}
+                        maxLength={4096}
+                        autoComplete="off"
+                        value={secret}
+                        onChange={e => setSecret(e.target.value)}
+                        placeholder={keepingSameAuthKind ? 'Leave blank to keep existing secret' : 'Encrypted on your machine'}
+                      />
+                    </label>
+                  </div>
+                )
+              )}
 
-                <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
-                  Allowed sites (one per line or comma-separated)
-                  <Textarea
-                    className="w-full font-mono text-[12px]"
-                    name="originAllowlist"
-                    rows={2}
-                    value={origins}
-                    onChange={e => setOrigins(e.target.value)}
-                  />
-                </label>
-              </DisclosureContent>
-            </Disclosure>
+              <Disclosure
+                open={advancedOpen}
+                onOpenChange={setAdvancedOpen}
+                className="border-t border-line pt-3"
+              >
+                <DisclosureTrigger className="h-auto bg-transparent px-0 py-1 text-fg-muted shadow-none hover:bg-transparent hover:text-fg">
+                  Advanced configuration
+                </DisclosureTrigger>
+                <DisclosureContent className="grid gap-3 pt-2.5">
+                  {authMode === 'browser_session' && (
+                    <label className="grid gap-1.5 text-[12px] font-medium text-fg-muted">
+                      Auto-refresh path (optional)
+                      <Input
+                        className="w-full font-mono text-[12px]"
+                        name="verifyPath"
+                        maxLength={256}
+                        autoComplete="off"
+                        value={verifyPath}
+                        onChange={e => setVerifyPath(e.target.value)}
+                        placeholder="/ (e.g. /dashboard or /app)"
+                      />
+                      <small className="text-[11.5px] font-normal text-fg-subtle">
+                        Visited in a headless browser on refresh so the app&apos;s own JS SDK rotates short-lived tokens automatically.
+                      </small>
+                    </label>
+                  )}
 
-            <FormError error={personaAction.error} />
-          </DialogBody>
+                  {authMode === 'automated_login' && (
+                    <div className="grid grid-cols-1 items-start gap-3 sm:grid-cols-2">
+                      <label className="grid gap-1.5 text-[12px] font-medium text-fg-muted">
+                        Auth adapter
+                        <NativeSelect
+                          className="w-full"
+                          name="loginAdapter"
+                          value={loginAdapter}
+                          onChange={e => setLoginAdapter(e.target.value as PersonaLoginAdapter)}
+                        >
+                          <option value="auto">Auto-detect</option>
+                          <option value="form">Login Form (Browser)</option>
+                          <option value="json">JSON API / Better Auth</option>
+                          <option value="clerk">Clerk (legacy)</option>
+                          <option value="clerk_client">Clerk __client cookie (auto-refresh)</option>
+                          <option value="supabase">Supabase Auth (legacy)</option>
+                        </NativeSelect>
+                      </label>
+                      <label className="grid gap-1.5 text-[12px] font-medium text-fg-muted">
+                        Login URL (optional)
+                        <Input
+                          className="w-full"
+                          name="loginUrl"
+                          type="url"
+                          maxLength={500}
+                          autoComplete="off"
+                          value={loginUrl}
+                          onChange={e => setLoginUrl(e.target.value)}
+                          placeholder={LOGIN_URL_PLACEHOLDERS[loginAdapter]}
+                        />
+                      </label>
+                    </div>
+                  )}
 
-          <DialogFooter className="flex-wrap">
-            <span className="mr-auto text-[12px] text-fg-subtle">
-              Credentials stay encrypted on your machine and are never sent to AI models.
-            </span>
-            <Button
-              type="button"
-              variant="ghost"
-              disabled={personaAction.pending}
-              onClick={() => {
-                void cancelActiveCaptureSession()
-                onClose()
-              }}
-            >
-              Cancel
-            </Button>
-            <Button
-              type="submit"
-              variant="default"
-              disabled={personaAction.pending || Boolean(activeCapture)}
-            >
-              {personaAction.pending ? 'Saving…' : editingPersona ? 'Save changes' : submitLabel}
-            </Button>
-          </DialogFooter>
-        </form>
+                  <label className="grid gap-1.5 text-[12px] font-medium text-fg-muted">
+                    Allowed sites (one per line or comma-separated)
+                    <Textarea
+                      className="w-full font-mono text-[12px]"
+                      name="originAllowlist"
+                      rows={2}
+                      value={origins}
+                      onChange={e => setOrigins(e.target.value)}
+                    />
+                  </label>
+                </DisclosureContent>
+              </Disclosure>
+
+              <FormError error={personaAction.error} />
+            </DialogBody>
+
+            <DialogFooter className="shrink-0 flex-wrap items-center justify-between gap-2.5 px-4 py-2.5">
+              <span className="min-w-0 text-[12px] text-fg-subtle">
+                Credentials stay encrypted on your machine and are never sent to AI models.
+              </span>
+              <div className="flex shrink-0 items-center gap-2">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  disabled={personaAction.pending}
+                  onClick={() => {
+                    void cancelActiveCaptureSession()
+                    onClose()
+                  }}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  type="submit"
+                  variant="default"
+                  disabled={personaAction.pending}
+                >
+                  {personaAction.pending ? 'Saving…' : editingPersona ? 'Save changes' : submitLabel}
+                </Button>
+              </div>
+            </DialogFooter>
+          </form>
+        )}
       </DialogContent>
     </Dialog>
   )

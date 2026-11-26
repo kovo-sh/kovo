@@ -550,6 +550,162 @@ describe('Pillar 1 — Real Headless Playwright Full-Stack E2E Golden Journeys',
     await dialog.waitFor({ state: 'visible', timeout: 10_000 })
     await dialog.getByRole('heading', { name: 'Add test account' }).waitFor({ state: 'visible', timeout: 5_000 })
 
+    async function assertPersonaFormDialogGeometry(label: string) {
+      interface BoxRect {
+        left: number
+        top: number
+        right: number
+        bottom: number
+        width: number
+        height: number
+      }
+      interface RadioRect extends BoxRect {
+        scrollWidth: number
+        clientWidth: number
+        scrollHeight: number
+        clientHeight: number
+      }
+      const geo = await page!.evaluate(() => {
+        const dlg = document.querySelector('[role="dialog"]') as HTMLElement | null
+        if (!dlg) return null
+        const vp = { width: window.innerWidth, height: window.innerHeight }
+        const rect = dlg.getBoundingClientRect()
+        const body = dlg.querySelector('[data-slot="dialog-body"]') as HTMLElement | null
+        const footer = dlg.querySelector('[data-slot="dialog-footer"]') as HTMLElement | null
+        const radios: RadioRect[] = Array.from(dlg.querySelectorAll('[role="radio"]')).map(el => {
+          const r = el.getBoundingClientRect()
+          return {
+            left: r.left,
+            top: r.top,
+            right: r.right,
+            bottom: r.bottom,
+            width: r.width,
+            height: r.height,
+            scrollWidth: el.scrollWidth,
+            clientWidth: el.clientWidth,
+            scrollHeight: el.scrollHeight,
+            clientHeight: el.clientHeight,
+          }
+        })
+        const cancelBtn = Array.from(dlg.querySelectorAll('button')).find(b => b.textContent?.trim() === 'Cancel')
+        const submitBtn = dlg.querySelector('button[type="submit"]') as HTMLElement | null
+        const toRect = (el: HTMLElement | null): BoxRect | null => {
+          if (!el) return null
+          const r = el.getBoundingClientRect()
+          return { left: r.left, top: r.top, right: r.right, bottom: r.bottom, width: r.width, height: r.height }
+        }
+        return {
+          vp,
+          dialog: {
+            left: rect.left,
+            top: rect.top,
+            right: rect.right,
+            bottom: rect.bottom,
+            width: rect.width,
+            height: rect.height,
+            scrollWidth: dlg.scrollWidth,
+            clientWidth: dlg.clientWidth,
+          },
+          body: body ? {
+            rect: toRect(body)!,
+            scrollWidth: body.scrollWidth,
+            clientWidth: body.clientWidth,
+          } : null,
+          footer: toRect(footer),
+          cancelBtn: toRect(cancelBtn ?? null),
+          submitBtn: toRect(submitBtn),
+          radios,
+        }
+      })
+      assert.ok(geo, `${label}: dialog must exist`)
+      assert.ok(geo.dialog.left >= -1, `${label}: dialog left (${geo.dialog.left}) must be inside viewport`)
+      assert.ok(geo.dialog.top >= -1, `${label}: dialog top (${geo.dialog.top}) must be inside viewport`)
+      assert.ok(geo.dialog.right <= geo.vp.width + 1, `${label}: dialog right (${geo.dialog.right}) exceeds viewport (${geo.vp.width})`)
+      assert.ok(geo.dialog.bottom <= geo.vp.height + 1, `${label}: dialog bottom (${geo.dialog.bottom}) exceeds viewport (${geo.vp.height})`)
+      assert.ok(geo.dialog.width >= 400 && geo.dialog.width <= 900, `${label}: dialog width (${geo.dialog.width}) out of [400, 900]`)
+      assert.ok(geo.dialog.scrollWidth <= geo.dialog.clientWidth + 2, `${label}: dialog has horizontal overflow (${geo.dialog.scrollWidth} > ${geo.dialog.clientWidth})`)
+      assert.ok(geo.body, `${label}: dialog body must exist`)
+      assert.ok(geo.body.scrollWidth <= geo.body.clientWidth + 2, `${label}: dialog body has horizontal overflow (${geo.body.scrollWidth} > ${geo.body.clientWidth})`)
+
+      // Primary submit & Cancel buttons must fit inside viewport and never overlap each other or body content.
+      assert.ok(geo.cancelBtn && geo.submitBtn && geo.footer, `${label}: footer, Cancel, and Submit buttons must exist`)
+      for (const [name, btn] of [['Cancel', geo.cancelBtn], ['Submit', geo.submitBtn]] as const) {
+        assert.ok(btn.width > 0 && btn.height > 0, `${label}: ${name} button must be visible`)
+        assert.ok(btn.left >= 0 && btn.top >= 0 && btn.right <= geo.vp.width && btn.bottom <= geo.vp.height, `${label}: ${name} button must fit inside viewport`)
+        assert.ok(btn.top >= geo.body.rect.bottom - 1, `${label}: ${name} button must not overlap dialog body`)
+      }
+      assert.ok(geo.cancelBtn.right <= geo.submitBtn.left + 1, `${label}: Cancel and Submit buttons must not overlap`)
+
+      // All 3 auth mode radio cards must expand to fit wrapped content with zero clipping or mutual overlap.
+      const radios: RadioRect[] = geo.radios
+      assert.equal(radios.length, 3, `${label}: expected 3 authentication mode cards`)
+      for (let i = 0; i < radios.length; i += 1) {
+        const card = radios[i]!
+        assert.ok(card.height >= 55, `${label}: mode card ${i} height (${card.height}px) must not collapse to single-line button`)
+        assert.ok(card.scrollWidth <= card.clientWidth + 2, `${label}: mode card ${i} horizontal overflow (${card.scrollWidth} > ${card.clientWidth})`)
+        assert.ok(card.scrollHeight <= card.clientHeight + 2, `${label}: mode card ${i} vertical text overflow (${card.scrollHeight} > ${card.clientHeight})`)
+        for (let j = i + 1; j < radios.length; j += 1) {
+          const other = radios[j]!
+          const overlapX = Math.min(card.right, other.right) - Math.max(card.left, other.left)
+          const overlapY = Math.min(card.bottom, other.bottom) - Math.max(card.top, other.top)
+          assert.ok(!(overlapX > 1 && overlapY > 1), `${label}: mode cards ${i} and ${j} overlap by ${overlapX}x${overlapY}px`)
+        }
+      }
+    }
+
+    // 0a. Layout & geometry invariants in Mode 1 (Browser Session) at 1440x900.
+    await assertPersonaFormDialogGeometry('Mode 1 Browser Session (1440x900)')
+
+    // 0b. Live Sign-In Browser expansion & editable address bar regression test.
+    await dialog.getByRole('button', { name: /Sign in with browser/ }).click()
+    const addressBar = dialog.getByRole('textbox', { name: 'Browser address bar' })
+    await addressBar.waitFor({ state: 'visible', timeout: 20_000 })
+    await delay(400) // Allow 200ms expansion transition + initial CDP frames to settle
+
+    const browserGeo = await page.evaluate(() => {
+      const dlg = document.querySelector('[role="dialog"]') as HTMLElement | null
+      const canvas = dlg?.querySelector('canvas') as HTMLElement | null
+      if (!dlg || !canvas) return null
+      const r = dlg.getBoundingClientRect()
+      const cr = canvas.getBoundingClientRect()
+      return {
+        vp: { width: window.innerWidth, height: window.innerHeight },
+        dialog: { left: r.left, top: r.top, right: r.right, bottom: r.bottom, width: r.width, height: r.height, scrollWidth: dlg.scrollWidth, clientWidth: dlg.clientWidth },
+        canvas: { left: cr.left, top: cr.top, right: cr.right, bottom: cr.bottom, width: cr.width, height: cr.height },
+      }
+    })
+    assert.ok(browserGeo, 'Expanded live browser dialog and canvas must render')
+    assert.ok(browserGeo.dialog.width >= browserGeo.vp.width * 0.8, `Sign-in browser width (${browserGeo.dialog.width}) must be >= 80% of viewport (${browserGeo.vp.width})`)
+    assert.ok(browserGeo.dialog.height >= browserGeo.vp.height * 0.75, `Sign-in browser height (${browserGeo.dialog.height}) must be >= 75% of viewport (${browserGeo.vp.height})`)
+    assert.ok(browserGeo.dialog.left >= -1 && browserGeo.dialog.top >= -1 && browserGeo.dialog.right <= browserGeo.vp.width + 1 && browserGeo.dialog.bottom <= browserGeo.vp.height + 1, 'Sign-in browser dialog must fit cleanly within viewport')
+    assert.ok(browserGeo.dialog.scrollWidth <= browserGeo.dialog.clientWidth + 2, 'Sign-in browser dialog must have zero horizontal overflow')
+    assert.ok(browserGeo.canvas.width >= 600 && browserGeo.canvas.height >= 400, `Sign-in browser canvas (${browserGeo.canvas.width}x${browserGeo.canvas.height}) must be large and usable`)
+    await dialog.getByRole('button', { name: 'Back', exact: true }).waitFor({ state: 'visible', timeout: 5_000 })
+    await dialog.getByRole('button', { name: 'Forward', exact: true }).waitFor({ state: 'visible', timeout: 5_000 })
+    await dialog.getByRole('button', { name: 'Reload', exact: true }).waitFor({ state: 'visible', timeout: 5_000 })
+
+    // Address bar must NEVER revert while user deletes or types across SSE frame ticks.
+    await addressBar.click()
+    await page.keyboard.press('Control+A')
+    await page.keyboard.press('Backspace')
+    await delay(700)
+    assert.equal(await addressBar.inputValue(), '', 'Cleared address bar must not revert to original URL across SSE ticks')
+
+    const customTargetUrl = `${targetServer.origin}/signin-step`
+    await addressBar.type(customTargetUrl, { delay: 10 })
+    await delay(500)
+    assert.equal(await addressBar.inputValue(), customTargetUrl, 'Typed URL must not revert while user is editing address bar')
+
+    await page.keyboard.press('Enter')
+    await delay(800)
+    assert.equal(await addressBar.inputValue(), customTargetUrl, 'Address bar should reflect navigated URL after Enter')
+    assert.equal(await dialog.getByRole('button', { name: 'Back', exact: true }).isDisabled(), false, 'Back button should enable after navigating to a second URL')
+
+    // Cancel live browser and confirm dialog returns cleanly to compact Add test account form.
+    await dialog.getByRole('button', { name: 'Cancel', exact: true }).click()
+    await dialog.getByRole('heading', { name: 'Add test account' }).waitFor({ state: 'visible', timeout: 5_000 })
+    await delay(250)
+
     // 1. Account label is auto-populated with "User A".
     const labelInput = dialog.locator('input[name="roleLabel"]')
     assert.equal(await labelInput.inputValue(), 'User A', 'Account label should auto-populate with "User A"')
@@ -573,10 +729,14 @@ describe('Pillar 1 — Real Headless Playwright Full-Stack E2E Golden Journeys',
       'false',
       'Header name must be visible while Advanced configuration Disclosure stays collapsed',
     )
+    await page.setViewportSize({ width: 1280, height: 800 })
+    await assertPersonaFormDialogGeometry('Mode 2 Header/Cookie/cURL (1280x800)')
 
     // 4. Selecting Automated Login -> Clerk __client cookie (auto-refresh) works cleanly end-to-end.
     await dialog.getByRole('radio', { name: /Automated Login/ }).click()
     await advTrigger.click()
+    await assertPersonaFormDialogGeometry('Mode 3 Automated Login + Advanced (1280x800)')
+    await page.setViewportSize({ width: 1440, height: 900 })
     const adapterSelect = dialog.locator('select[name="loginAdapter"]')
     await adapterSelect.waitFor({ state: 'visible', timeout: 5_000 })
     await adapterSelect.selectOption('clerk_client')
