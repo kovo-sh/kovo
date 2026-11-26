@@ -84,6 +84,12 @@ import {
 } from '../src/server/run-safety-budgets.ts'
 import { Store } from '../src/server/store.ts'
 import {
+  HostMintedOracle,
+  buildProofReceipt,
+  verifyHostExpressionProbe,
+  verifyReceipt,
+} from '../src/server/proof-receipt.ts'
+import {
   VERIFY_NONCE_HEADER,
   VERIFY_RPC_HEADER,
   VerifyRpcServer,
@@ -796,4 +802,384 @@ test('Check 4: Messy LLM corpus — kovo_verify rejects metadata-only calls & ca
     assert.equal(JSON.stringify(r).includes(c.expectedRaw), false)
   }
   assert.equal(getRunCustodyBudgetUsage(runId).sealTotal, 4)
+})
+
+// ---------------------------------------------------------------------------
+// Check 5 — R4-H-3 Unwired Security-Primitive Guard
+// ---------------------------------------------------------------------------
+test('Check 5: R4-H-3 — scripts/unwired-baseline.json must never list security-enforcement, refresher, needle, lease, scrubber, oracle, sandbox, or provenance primitives', () => {
+  const baselinePath = join(REPO_ROOT, 'scripts/unwired-baseline.json')
+  const baseline = JSON.parse(readFileSync(baselinePath, 'utf8')) as {
+    baselinedExports?: string[]
+    keepUnwired?: Array<{ key: string }>
+    ticketedAdditions?: Array<{ key: string }>
+  }
+
+  const allUnwiredKeys = [
+    ...(baseline.baselinedExports ?? []),
+    ...(baseline.keepUnwired ?? []).map(entry => entry.key),
+    ...(baseline.ticketedAdditions ?? []).map(entry => entry.key),
+  ]
+
+  // 5a) Explicit denylist of R4 security-enforcement primitives (must never appear unwired).
+  const FORBIDDEN_UNWIRED_SYMBOLS = new Set([
+    'buildPersonaSecretNeedles',
+    'createSecretNeedleBuilder',
+    'extractScrubbableCookieMapNeedles',
+    'assertOriginsWithinProjectScope',
+    'createInteractiveSessionRefresher',
+    'refreshBrowserSession',
+    'evaluateBrowserSessionProxyOrigin',
+    'resolveBrowserSessionEgressPolicy',
+    'leaseAuthorizes',
+    'evaluateLeaseEligibility',
+    'isHighRiskOrExternalMutationPath',
+    'sanitizeProviderStream',
+    'sanitizeProviderStreamLine',
+    'sanitizeProviderValue',
+    'verifyInboundProviderFrameIntegrity',
+    'scrubOutboundProviderRequest',
+    'matchesBoundTerminalControl',
+    'evaluateExchangeTenantPrivilege',
+    'collectCitedReceiptExchanges',
+    'materializeGitTreeBounded',
+    'synthesizeInvariantsInWorker',
+    'searchRepoInWorker',
+    'verifyHostExpressionProbe',
+    'verifyStampedBooleanPairRound',
+    'assessSignedUrlMintDifferential',
+    'verifySignedUrlMintPair',
+    'computeWorkerVisibleBodyDigest',
+    'mintHostBooleanPair',
+    'verifyBooleanArmBaseParity',
+    'normalizeRequestCarrier',
+    'classifyRequestMutation',
+  ])
+
+  // 5b) Structural guard for any future security-fix refresher / oracle / lease / scrubber / provenance / sandbox / quota export.
+  const FORBIDDEN_SECURITY_GUARD_PATTERNS: Array<{ label: string; re: RegExp }> = [
+    { label: 'auth-refresher guard', re: /(?:SessionRefresher|refreshBrowserSession|BrowserSessionProxyOrigin|BrowserSessionEgressPolicy)/i },
+    { label: 'provenance needle-builder guard', re: /(?:SecretNeedle|PersonaSecretNeedles|ScrubbableCookie|OriginsWithinProjectScope)/i },
+    { label: 'provider inbound/outbound scrubber guard', re: /(?:sanitizeProvider(?:Stream|Value)|InboundProviderFrame|OutboundProviderRequest)/i },
+    { label: 'approval-lease predicate guard', re: /(?:leaseAuthorizes|LeaseEligibility|HighRiskOrExternalMutation|ApprovalLease)/i },
+    { label: 'host-minted oracle / proof-kernel guard', re: /(?:HostMinted|HostExpression|HostBooleanPair|HostTimingChallenge|HostRedirectCanary|StampedBooleanPair|SignedUrlMint(?:Pair|Differential)|WorkerVisibleBodyDigest|normalizeRequestCarrier)/i },
+    { label: 'composite binding / tenant provenance guard', re: /(?:BoundTerminalControl|ExchangeTenantPrivilege|CitedReceiptExchanges|OracleInputProvenance)/i },
+    { label: 'worker sandbox / bounded checkout / OOB quota guard', re: /(?:InWorker$|materializeGitTreeBounded|Oob(?:Callback|Token)Quota)/i },
+  ]
+
+  const violations: string[] = []
+  for (const key of allUnwiredKeys) {
+    const symbol = key.includes('::') ? key.slice(key.indexOf('::') + 2) : key
+    if (FORBIDDEN_UNWIRED_SYMBOLS.has(symbol)) {
+      violations.push(`Forbidden security primitive listed as unwired: ${key}`)
+      continue
+    }
+    for (const pat of FORBIDDEN_SECURITY_GUARD_PATTERNS) {
+      if (pat.re.test(symbol)) {
+        violations.push(`Security-fix symbol (${pat.label}) listed as unwired: ${key}`)
+      }
+    }
+  }
+  assert.deepEqual(violations, [], `R4-H-3 unwired-security-primitive violations:\n${violations.join('\n')}`)
+
+  // 5c) Anchor check: live exported security primitives must exist in source (prevents silent rename drift).
+  const REQUIRED_LIVE_EXPORTS: Array<{ file: string; symbol: string }> = [
+    { file: 'src/server/persona-vault.ts', symbol: 'buildPersonaSecretNeedles' },
+    { file: 'src/server/browser-session-auth.ts', symbol: 'refreshBrowserSession' },
+    { file: 'src/server/browser-session-auth.ts', symbol: 'evaluateBrowserSessionProxyOrigin' },
+    { file: 'src/server/approval-pattern.ts', symbol: 'isHighRiskOrExternalMutationPath' },
+    { file: 'src/server/provider-stream.ts', symbol: 'sanitizeProviderStream' },
+    { file: 'src/server/provider-stream.ts', symbol: 'sanitizeProviderValue' },
+    { file: 'src/server/provider-stream.ts', symbol: 'verifyInboundProviderFrameIntegrity' },
+    { file: 'src/server/composite-autodag.ts', symbol: 'matchesBoundTerminalControl' },
+    { file: 'src/server/causal-proof-compiler.ts', symbol: 'evaluateExchangeTenantPrivilege' },
+    { file: 'src/server/causal-proof-compiler.ts', symbol: 'collectCitedReceiptExchanges' },
+    { file: 'src/server/untrusted-compute-pool.ts', symbol: 'synthesizeInvariantsInWorker' },
+    { file: 'src/server/untrusted-compute-pool.ts', symbol: 'searchRepoInWorker' },
+    { file: 'src/server/proof-receipt.ts', symbol: 'verifyHostExpressionProbe' },
+    { file: 'src/server/verify-support.ts', symbol: 'computeWorkerVisibleBodyDigest' },
+    { file: 'src/server/verify-support.ts', symbol: 'assessSignedUrlMintDifferential' },
+  ]
+  for (const { file, symbol } of REQUIRED_LIVE_EXPORTS) {
+    const src = readFileSync(join(REPO_ROOT, file), 'utf8')
+    const exportRe = new RegExp(`export\\s+(?:async\\s+)?(?:function|const|class)\\s+${symbol}\\b|export\\s*\\{[^}]*\\b${symbol}\\b`, 's')
+    assert.ok(exportRe.test(src), `Expected live exported security primitive ${file}::${symbol}`)
+  }
+
+  // 5d) L800 lock-in: verify-rpc.ts getKernelSecrets must use the shared buildPersonaSecretNeedles builder.
+  const verifyRpcSrc = readFileSync(join(REPO_ROOT, 'src/server/verify-rpc.ts'), 'utf8')
+  assert.match(verifyRpcSrc, /\bbuildPersonaSecretNeedles\s*\(/, 'src/server/verify-rpc.ts must call buildPersonaSecretNeedles')
+  assert.doesNotMatch(verifyRpcSrc, /\bpersonaSecrets\s*\(/, 'src/server/verify-rpc.ts must not duplicate personaSecrets alongside buildPersonaSecretNeedles')
+})
+
+// ---------------------------------------------------------------------------
+// Check 6 — R4-C-1 & R4-C-2 Host-Minted Per-Exchange Stamp Guard
+// ---------------------------------------------------------------------------
+test('Check 6: R4-C-1 & R4-C-2 — every host-minted oracle enforces per-exchange host stamps and prove.injection never leaks expectedOutput/operands', () => {
+  const proofReceiptSrc = readFileSync(join(REPO_ROOT, 'src/server/proof-receipt.ts'), 'utf8')
+  const verifyClaimsSrc = readFileSync(join(REPO_ROOT, 'src/server/verify-claims.ts'), 'utf8')
+  const proveHandlersSrc = readFileSync(join(REPO_ROOT, 'src/server/verify-prove-handlers.ts'), 'utf8')
+  const oracleInvariantsSrc = readFileSync(join(REPO_ROOT, 'src/server/oracle-invariants.ts'), 'utf8')
+
+  // 6a) ReceiptTranscriptEntry declares every per-exchange host stamp field.
+  const entryInterfaceMatch = /export interface ReceiptTranscriptEntry\s*\{[\s\S]*?\n\}/.exec(proofReceiptSrc)
+  assert.ok(entryInterfaceMatch, 'ReceiptTranscriptEntry interface must exist in proof-receipt.ts')
+  const entryInterfaceBody = entryInterfaceMatch[0]
+  assert.match(entryInterfaceBody, /\bhostBooleanPair\?:\s*HostStampedBooleanPair\b/)
+  assert.match(entryInterfaceBody, /\bhostExpressionChallenge\?:\s*HostMintedExpressionChallenge\b/)
+  assert.match(entryInterfaceBody, /\bhostTimingChallenge\?:\s*HostMintedTimingChallenge\b/)
+  assert.match(entryInterfaceBody, /\bhostRedirectCanaryHost\?:\s*string\s*\|\s*null\b/)
+
+  // 6b) Kernel verification enforces stamps across all 5 host-minted oracle families:
+  //     (1) boolean & status_differential -> verifyStampedBooleanPairRound + canonicalPredicateSkeleton
+  const booleanRuleIdx = proofReceiptSrc.indexOf("if (rule === 'boolean')")
+  const statusRuleIdx = proofReceiptSrc.indexOf("if (rule === 'status_differential')")
+  const timingRuleIdx = proofReceiptSrc.indexOf("if (rule === 'timing')")
+  const redirectRuleIdx = proofReceiptSrc.indexOf("if (rule === 'redirect')")
+  const oobRuleIdx = proofReceiptSrc.indexOf("if (rule === 'oob')")
+  assert.ok(oobRuleIdx > 0 && booleanRuleIdx > oobRuleIdx && statusRuleIdx > booleanRuleIdx && timingRuleIdx > statusRuleIdx && redirectRuleIdx > timingRuleIdx)
+
+  const oobBlock = proofReceiptSrc.slice(oobRuleIdx, booleanRuleIdx)
+  const booleanBlock = proofReceiptSrc.slice(booleanRuleIdx, statusRuleIdx)
+  const statusBlock = proofReceiptSrc.slice(statusRuleIdx, timingRuleIdx)
+  const timingBlock = proofReceiptSrc.slice(timingRuleIdx, redirectRuleIdx)
+  const redirectBlock = proofReceiptSrc.slice(redirectRuleIdx, redirectRuleIdx + 5000)
+
+  assert.match(booleanBlock, /\bverifyStampedBooleanPairRound\s*\(/, 'boolean rule must enforce verifyStampedBooleanPairRound')
+  assert.match(statusBlock, /\bverifyStampedBooleanPairRound\s*\(/, 'status_differential rule must enforce verifyStampedBooleanPairRound')
+  assert.match(oracleInvariantsSrc, /\bcanonicalPredicateSkeleton\s*\(/, 'oracle-invariants.ts must enforce canonicalPredicateSkeleton')
+
+  //     (2) evaluated-expression -> per-exchange probe.hostExpressionChallenge only (no transcript fallback), shared verifyHostExpressionProbe
+  const evalExprStart = proofReceiptSrc.indexOf('function verifyEvaluatedExpression(')
+  assert.ok(evalExprStart > 0, 'verifyEvaluatedExpression must exist in proof-receipt.ts')
+  const evalExprBlock = proofReceiptSrc.slice(evalExprStart, evalExprStart + 4500)
+  assert.match(evalExprBlock, /if\s*\(\s*!probe\.hostExpressionChallenge\s*\)/, 'verifyEvaluatedExpression must require per-exchange probe.hostExpressionChallenge')
+  assert.doesNotMatch(evalExprBlock, /transcript\.hostExpressionChallenges/, 'verifyEvaluatedExpression must NEVER fall back to transcript.hostExpressionChallenges')
+  assert.match(evalExprBlock, /\bverifyHostExpressionProbe\s*\(/, 'verifyEvaluatedExpression must delegate to verifyHostExpressionProbe')
+
+  const evaluateClaimIdx = verifyClaimsSrc.indexOf('export function evaluateClaim(')
+  assert.ok(evaluateClaimIdx > 0, 'verify-claims.ts must export evaluateClaim')
+  const claimsExprStart = verifyClaimsSrc.indexOf("case 'host_evaluated_expression':", evaluateClaimIdx)
+  assert.ok(claimsExprStart > evaluateClaimIdx, 'evaluateClaim in verify-claims.ts must handle host_evaluated_expression')
+  const claimsExprBlock = verifyClaimsSrc.slice(claimsExprStart, claimsExprStart + 3500)
+  assert.match(claimsExprBlock, /\bverifyHostExpressionProbe\s*\(/, 'verify-claims.ts must delegate host_evaluated_expression to verifyHostExpressionProbe')
+  assert.match(claimsExprBlock, /stampedChallenge:\s*fact\?\.hostExpressionChallenge\s*\?\?\s*prbRec\.hostExpressionChallenge/, 'verify-claims.ts must pass per-exchange hostExpressionChallenge stamp')
+
+  //     (3) timing -> oracle.verifyTimingChallenge + delayToken/controlToken binding
+  assert.match(timingBlock, /\boracle\.verifyTimingChallenge\s*\(/, 'timing rule must enforce HostMintedOracle.verifyTimingChallenge')
+  assert.match(timingBlock, /verifiedChallenge\.delayToken/, 'timing rule must bind host-minted delayToken')
+  assert.match(timingBlock, /verifiedChallenge\.controlToken/, 'timing rule must bind host-minted controlToken')
+
+  //     (4) redirect -> oracle.isMintedRedirectHost + hostRedirectCanaryHost
+  assert.match(redirectBlock, /\bhostRedirectCanaryHost\b/, 'redirect rule must inspect hostRedirectCanaryHost')
+  assert.match(redirectBlock, /\boracle\.isMintedRedirectHost\s*\(/, 'redirect rule must verify host-minted redirect canary host')
+
+  //     (5) OOB -> host callback timestamp + signature verification + unique request-side carrier token
+  assert.match(oobBlock, /\bverifyOobCallbackSignature\s*\(/, 'oob rule must verify host callback signatures')
+  assert.match(oobBlock, /\bentryCarriesTokenInRequest\s*\(/, 'oob rule must require request-side canary carrier')
+
+  // 6c) Prove handlers stamp per-exchange hostBooleanPair & hostExpressionChallenge, and prove.injection
+  //     NEVER returns expectedOutput or operands to workers (verified via AST inspection of handleProveInjection).
+  assert.match(proveHandlersSrc, /stampBooleanPairArm\s*\(\s*booleanPair\s*,\s*'baseline'\s*\)/)
+  assert.match(proveHandlersSrc, /host\.runHttpExchange\s*\(\s*probeArgs1\s*,\s*nonce\s*,\s*\{\s*hostExpressionChallenge:\s*ch1\s*\}\s*\)/)
+  assert.match(proveHandlersSrc, /host\.runHttpExchange\s*\(\s*probeArgs2\s*,\s*nonce\s*,\s*\{\s*hostExpressionChallenge:\s*ch2\s*\}\s*\)/)
+
+  const proveSf = ts.createSourceFile('verify-prove-handlers.ts', proveHandlersSrc, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
+  const SECRET_CHALLENGE_PROPS = new Set(['expectedOutput', 'expected_output', 'operandA', 'operandB', 'expressionSyntax'])
+  let foundHandleProveInjection = false
+  let foundPublicChallenges = false
+  const inspectProveAst = (node: ts.Node): void => {
+    if (ts.isFunctionDeclaration(node) && node.name?.text === 'handleProveInjection') {
+      foundHandleProveInjection = true
+      const walkFn = (inner: ts.Node): void => {
+        // Inspect publicChallenges array literals
+        if (ts.isVariableDeclaration(inner) && ts.isIdentifier(inner.name) && inner.name.text === 'publicChallenges' && inner.initializer) {
+          foundPublicChallenges = true
+          const checkObj = (sub: ts.Node): void => {
+            if (ts.isPropertyAssignment(sub) || ts.isShorthandPropertyAssignment(sub)) {
+              const propName = propertyNameText(sub.name)
+              if (propName && SECRET_CHALLENGE_PROPS.has(propName)) {
+                assert.fail(`handleProveInjection publicChallenges must NEVER expose "${propName}" to workers`)
+              }
+            }
+            if (ts.isSpreadAssignment(sub)) {
+              assert.fail('handleProveInjection publicChallenges must NOT spread raw challenge objects to workers')
+            }
+            ts.forEachChild(sub, checkObj)
+          }
+          checkObj(inner.initializer)
+        }
+        // Inspect every host.scrubRecord({...}) return object in handleProveInjection
+        if (
+          ts.isCallExpression(inner) &&
+          calleeTailName(inner.expression) === 'scrubRecord' &&
+          inner.arguments.length > 0 &&
+          ts.isObjectLiteralExpression(inner.arguments[0]!)
+        ) {
+          for (const prop of inner.arguments[0]!.properties) {
+            if (ts.isPropertyAssignment(prop) || ts.isShorthandPropertyAssignment(prop)) {
+              const propName = propertyNameText(prop.name)
+              if (propName && SECRET_CHALLENGE_PROPS.has(propName)) {
+                assert.fail(`handleProveInjection return payload must NEVER expose "${propName}" to workers`)
+              }
+              if (propName === 'hostMintedChallenges' && ts.isPropertyAssignment(prop) && ts.isArrayLiteralExpression(prop.initializer)) {
+                for (const elem of prop.initializer.elements) {
+                  if (ts.isIdentifier(elem) && (elem.text === 'ch1' || elem.text === 'ch2')) {
+                    assert.fail('handleProveInjection must NOT return raw ch1/ch2 objects in hostMintedChallenges')
+                  }
+                }
+              }
+            }
+          }
+        }
+        ts.forEachChild(inner, walkFn)
+      }
+      walkFn(node)
+    }
+    ts.forEachChild(node, inspectProveAst)
+  }
+  inspectProveAst(proveSf)
+  assert.equal(foundHandleProveInjection, true, 'handleProveInjection function must exist in verify-prove-handlers.ts')
+  assert.equal(foundPublicChallenges, true, 'handleProveInjection must construct sanitized publicChallenges')
+
+  // 6d) Fast runtime fail-closed checks on the verification kernel across all 5 host-minted oracle families.
+  const oracle = new HostMintedOracle()
+  const origin = 'https://canary-stamp-guard.example.invalid'
+  const exprCh = oracle.mintExpressionChallenge('ssti')
+  const noStampExpr = verifyHostExpressionProbe({
+    probeRequest: { pathAndQuery: `/render?q=${encodeURIComponent(exprCh.expressionSyntax)}` },
+    probeBody: `result=${exprCh.expectedOutput}`,
+    probeStatus: 200,
+    controlBodies: ['result=benign'],
+    stampedChallenge: undefined,
+    expectedChallengeId: exprCh.challengeId,
+    vulnClass: 'ssti',
+    oracle,
+  })
+  assert.equal(noStampExpr.ok, false, 'verifyHostExpressionProbe must reject missing per-exchange stamp')
+
+  // Transcript-only expression challenge (missing per-exchange probe.hostExpressionChallenge) must fail closed.
+  const sstiReceipt = buildProofReceipt({
+    vulnClass: 'ssti',
+    target: { origin, method: 'GET', pathAndQuery: '/render?q=benign', param: 'q' },
+    exchangeIds: ['c1', 'p1'],
+    claimedDelta: 'Unstamped probe citing transcript expression challenge must reject.',
+  })
+  const transcriptOnlyExpr = verifyReceipt(sstiReceipt, {
+    hostExpressionChallenges: [exprCh],
+    entries: [
+      {
+        exchangeId: 'c1',
+        origin,
+        step: {
+          id: 'c1', arm: 'control', method: 'GET', route: '/render', pathAndQuery: '/render?q=benign',
+          status: 200, body: 'result=benign', actor: { handle: null, role: null, tenant: null, auth: 'unknown', sameSite: null },
+        },
+      },
+      {
+        exchangeId: 'p1',
+        origin,
+        step: {
+          id: 'p1', arm: 'probe', method: 'GET', route: '/render',
+          pathAndQuery: `/render?q=${encodeURIComponent(exprCh.expressionSyntax)}`,
+          status: 200, body: `result=${exprCh.expectedOutput}`, actor: { handle: null, role: null, tenant: null, auth: 'unknown', sameSite: null },
+        },
+      },
+    ],
+  }, { hostMintedOracle: oracle })
+  assert.equal(transcriptOnlyExpr.confirmed, false, 'ssti receipt without per-exchange hostExpressionChallenge must fail closed')
+
+  // Unstamped boolean differential triangle (missing hostBooleanPair) must fail closed.
+  const boolReceipt = buildProofReceipt({
+    vulnClass: 'boolean_differential',
+    target: { origin, method: 'GET', pathAndQuery: '/items?id=1', param: 'id' },
+    exchangeIds: ['bc1', 'bp1', 'bc2', 'bp2'],
+    claimedDelta: 'Unstamped boolean differential must reject.',
+  })
+  const unstampedBool = verifyReceipt(boolReceipt, {
+    entries: [
+      { exchangeId: 'bc1', origin, step: { id: 'bc1', arm: 'control', method: 'GET', route: '/items', pathAndQuery: '/items?id=1+AND+121%3D121', status: 200, json: { ok: 1 }, actor: { handle: null, role: null, tenant: null, auth: 'unknown', sameSite: null } } },
+      { exchangeId: 'bp1', origin, step: { id: 'bp1', arm: 'probe', method: 'GET', route: '/items', pathAndQuery: '/items?id=1+AND+121%3D211', status: 200, json: { ok: 0 }, actor: { handle: null, role: null, tenant: null, auth: 'unknown', sameSite: null } } },
+      { exchangeId: 'bc2', origin, step: { id: 'bc2', arm: 'control', method: 'GET', route: '/items', pathAndQuery: '/items?id=1+AND+121%3D121', status: 200, json: { ok: 1 }, actor: { handle: null, role: null, tenant: null, auth: 'unknown', sameSite: null } } },
+      { exchangeId: 'bp2', origin, step: { id: 'bp2', arm: 'probe', method: 'GET', route: '/items', pathAndQuery: '/items?id=1+AND+121%3D211', status: 200, json: { ok: 0 }, actor: { handle: null, role: null, tenant: null, auth: 'unknown', sameSite: null } } },
+    ],
+  }, { hostMintedOracle: oracle })
+  assert.equal(unstampedBool.confirmed, false, 'boolean_differential without hostBooleanPair stamp must fail closed')
+
+  // Unstamped timing differential (missing hostTimingChallenge) must fail closed.
+  const timingIds: string[] = []
+  const timingEntries = []
+  for (let i = 0; i < 5; i += 1) {
+    const cid = `tc${i}`
+    const pid = `tp${i}`
+    timingIds.push(cid, pid)
+    timingEntries.push(
+      { exchangeId: cid, origin, seq: i * 2 + 1, durationMs: 25, step: { id: cid, arm: 'control' as const, method: 'GET', route: '/slow', pathAndQuery: '/slow?q=SLEEP(0)', status: 200, durationMs: 25, body: '{}', actor: { handle: null, role: null, tenant: null, auth: 'unknown' as const, sameSite: null } } },
+      { exchangeId: pid, origin, seq: i * 2 + 2, durationMs: 2_500, step: { id: pid, arm: 'probe' as const, method: 'GET', route: '/slow', pathAndQuery: '/slow?q=SLEEP(2)', status: 200, durationMs: 2_500, body: '{}', actor: { handle: null, role: null, tenant: null, auth: 'unknown' as const, sameSite: null } } },
+    )
+  }
+  const timingReceipt = buildProofReceipt({
+    vulnClass: 'sqli_time',
+    target: { origin, method: 'GET', pathAndQuery: '/slow?q=SLEEP(0)', param: 'q' },
+    exchangeIds: timingIds,
+    claimedDelta: 'Unstamped timing differential must reject.',
+  })
+  const unstampedTiming = verifyReceipt(timingReceipt, { entries: timingEntries }, { hostMintedOracle: oracle })
+  assert.equal(unstampedTiming.confirmed, false, 'timing receipt without hostTimingChallenge must fail closed')
+
+  // Unminted redirect destination host must fail closed.
+  const redirReceipt = buildProofReceipt({
+    vulnClass: 'open_redirect',
+    target: { origin, method: 'GET', pathAndQuery: '/go?next=/home', param: 'next' },
+    exchangeIds: ['rc1', 'rp1'],
+    claimedDelta: 'Unminted redirect host must reject.',
+  })
+  const unmintedRedir = verifyReceipt(redirReceipt, {
+    entries: [
+      {
+        exchangeId: 'rc1',
+        origin,
+        step: {
+          id: 'rc1', arm: 'control', method: 'GET', route: '/go', pathAndQuery: '/go?next=%2Fhome',
+          status: 302, responseHeaders: { location: '/home' }, actor: { handle: null, role: null, tenant: null, auth: 'unknown', sameSite: null },
+        },
+      },
+      {
+        exchangeId: 'rp1',
+        origin,
+        step: {
+          id: 'rp1', arm: 'probe', method: 'GET', route: '/go', pathAndQuery: '/go?next=https%3A%2F%2Fevil.example.invalid%2Fx',
+          status: 302, responseHeaders: { location: 'https://evil.example.invalid/x' }, actor: { handle: null, role: null, tenant: null, auth: 'unknown', sameSite: null },
+        },
+      },
+    ],
+  }, { hostMintedOracle: oracle })
+  assert.equal(unmintedRedir.confirmed, false, 'open_redirect with unminted destination host must fail closed')
+
+  // OOB receipt with response-only token (not in request carrier) must fail closed.
+  const oobReceipt = buildProofReceipt({
+    vulnClass: 'ssrf',
+    target: { origin, method: 'POST', pathAndQuery: '/fetch' },
+    exchangeIds: ['ox1'],
+    oobEventIds: ['ev1'],
+    claimedDelta: 'Response-only OOB token must reject.',
+  })
+  const responseOnlyOob = verifyReceipt(oobReceipt, {
+    entries: [
+      {
+        exchangeId: 'ox1',
+        origin,
+        startedAt: 1_000,
+        step: {
+          id: 'ox1', arm: 'probe', method: 'POST', route: '/fetch', pathAndQuery: '/fetch',
+          status: 200, requestBody: '{"url":"https://benign.example"}', body: '{"echo":"canary_tok_9988"}',
+          actor: { handle: null, role: null, tenant: null, auth: 'unknown', sameSite: null },
+        },
+      },
+    ],
+    oobEvents: [
+      { id: 'ev1', token: 'canary_tok_9988', targetOrigin: origin, delivered: true, receivedAtMs: 2_000 },
+    ],
+  }, { hostMintedOracle: oracle })
+  assert.equal(responseOnlyOob.confirmed, false, 'OOB receipt with response-only token must fail closed')
 })

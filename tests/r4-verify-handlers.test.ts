@@ -24,6 +24,7 @@ import type { AddressInfo } from 'node:net'
 import test from 'node:test'
 
 import { RequestBroker, type Grant } from '../src/server/broker.ts'
+import type { ResolvedPersona } from '../src/server/persona-vault.ts'
 import { buildProofReceipt, defaultHostMintedOracle, verifyReceipt } from '../src/server/proof-receipt.ts'
 import {
   VERIFY_NONCE_HEADER,
@@ -651,4 +652,156 @@ test('R4-H-4: no worker-facing request or response digest (transcript.get, prove
   assert.notEqual(suData.control.bodySha256, sha256(JSON.stringify({ reset_token: vaultSecret })), 'prove.signedUrlMint control.bodySha256 must NOT equal raw plaintext digest')
   assert.notEqual(suData.probe.bodySha256, plaintextRespSha, 'prove.signedUrlMint probe.bodySha256 must NOT equal raw plaintext digest')
   assert.equal(suData.probe.bodySha256, sha256(suData.probe.body))
+})
+
+// ============================================================================
+// 5. R4-H-2 / L800: VerifyRpcServer getKernelSecrets uses shared
+//    provenance-tiered buildPersonaSecretNeedles
+// ============================================================================
+
+test('R4-H-2: VerifyRpcServer getKernelSecrets scrubs weak operator primary credentials via shared buildPersonaSecretNeedles without corrupting protocol substrings', async t => {
+  const weakBearer = 'tok42a'
+  const dictPassword = 'password'
+  const genericHexCookie = 'a1b2c3d4e5f6'
+  const protocolCookieVal = 'response.output_text.delta'
+  const benignPrefVal = 'dark_mode_enabled'
+
+  const srv = await startStubServer(() => ({
+    status: 200,
+    body: JSON.stringify({
+      csvLine: `row,1,${weakBearer},${dictPassword},${genericHexCookie}`,
+      streamEvent: protocolCookieVal,
+      uiPref: benignPrefVal,
+    }),
+  }))
+  t.after(() => srv.close())
+
+  const personas = new Map<string, ResolvedPersona>([
+    ['weak_bearer', {
+      id: 'p-weak-bearer',
+      handle: 'weak_bearer',
+      roleLabel: 'member',
+      originAllowlist: [srv.origin],
+      authKind: 'bearer',
+      headerName: null,
+      secret: weakBearer,
+      secretHistory: [weakBearer],
+      canaryMarkers: [],
+    }],
+    ['dict_login', {
+      id: 'p-dict-login',
+      handle: 'dict_login',
+      roleLabel: 'member',
+      originAllowlist: [srv.origin],
+      authKind: 'login',
+      headerName: null,
+      secret: dictPassword,
+      secretHistory: [dictPassword],
+      session: {
+        headerType: 'cookie',
+        value: `prefs=${benignPrefVal}; x_track=${protocolCookieVal}`,
+        adapterUsed: 'json',
+        scrubTokens: [`x_track=${protocolCookieVal}`, protocolCookieVal],
+      },
+      canaryMarkers: [],
+    }],
+    ['hex_cookie', {
+      id: 'p-hex-cookie',
+      handle: 'hex_cookie',
+      roleLabel: 'member',
+      originAllowlist: [srv.origin],
+      authKind: 'cookie',
+      headerName: null,
+      secret: `my_c=${genericHexCookie}`,
+      secretHistory: [`my_c=${genericHexCookie}`],
+      canaryMarkers: [],
+    }],
+  ])
+
+  const grant: Grant = {
+    ...makeGrant(srv.origin),
+    personas,
+  }
+
+  const rpc = new VerifyRpcServer({
+    broker: new RequestBroker({ transportConfig: { http2: false } }),
+    grant,
+    runId: 'run-r4-h2-kernel-secrets',
+    assignmentId: 'asg-r4-h2-kernel-secrets',
+    targetOrigins: [srv.origin],
+  })
+  await rpc.start()
+  t.after(() => rpc.close())
+
+  const sendResp = await rpcCall(rpc, 'http.send', { path: '/api/echo-creds', method: 'GET' })
+  assert.equal(sendResp.ok, true, `http.send failed: ${sendResp.error ?? ''}`)
+  const sendView = sendResp.result as { exchangeId: string; body: string }
+
+  // Weak operator-configured primary credentials MUST be scrubbed across broker + kernel boundaries
+  assert.equal(sendView.body.includes(weakBearer), false, 'weak 6-char primary bearer must be scrubbed')
+  assert.equal(sendView.body.includes(dictPassword), false, 'dictionary primary login password must be scrubbed')
+  assert.equal(sendView.body.includes(genericHexCookie), false, 'non-auth-named 12-hex primary cookie must be scrubbed')
+
+  // Target-derived protocol-substring & benign preference cookies MUST NOT be promoted to exact needles
+  assert.equal(sendView.body.includes(protocolCookieVal), true, 'target-derived protocol substring must NOT be scrubbed')
+  assert.equal(sendView.body.includes(benignPrefVal), true, 'target-derived benign preference cookie must NOT be scrubbed')
+
+  // Verify transcript.get worker view preserves the exact same provenance-tiered redaction
+  const tGet = await rpcCall(rpc, 'transcript', { action: 'get', exchangeId: sendView.exchangeId })
+  assert.equal(tGet.ok, true)
+  const tBody = (tGet.result as { body: string }).body
+  assert.equal(tBody.includes(weakBearer), false)
+  assert.equal(tBody.includes(dictPassword), false)
+  assert.equal(tBody.includes(genericHexCookie), false)
+  assert.equal(tBody.includes(protocolCookieVal), true)
+
+  // Direct VerifyRpcServer kernel-layer check (pass-through broker without broker-side persona redaction)
+  // proves `getKernelSecrets` itself routes through `buildPersonaSecretNeedles` with `[redacted:<handle>]`.
+  const rawBody = JSON.stringify({
+    csvLine: `row,1,${weakBearer},${dictPassword},${genericHexCookie}`,
+    streamEvent: protocolCookieVal,
+    uiPref: benignPrefVal,
+  })
+  const passthroughBroker = {
+    executeHttp: async () => ({
+      origin: srv.origin,
+      finalOrigin: srv.origin,
+      redirectOrigins: [],
+      method: 'GET',
+      pathAndQuery: '/api/echo-creds',
+      personaHandle: null,
+      status: 200,
+      mediaType: 'application/json',
+      reqHeaders: {},
+      respHeaders: { 'content-type': 'application/json' },
+      setCookies: [],
+      bodyPreview: rawBody,
+      body: rawBody,
+      bodyBytes: Buffer.byteLength(rawBody, 'utf8'),
+      bodySha256: sha256(rawBody),
+      bodyTruncated: false,
+      durationMs: 1,
+    }),
+  } as unknown as RequestBroker
+  const kernelRpc = new VerifyRpcServer({
+    broker: passthroughBroker,
+    grant,
+    runId: 'run-r4-h2-kernel-direct',
+    assignmentId: 'asg-r4-h2-kernel-direct',
+    targetOrigins: [srv.origin],
+  })
+  await kernelRpc.start()
+  t.after(() => kernelRpc.close())
+
+  const kernelResp = await rpcCall(kernelRpc, 'http.send', { path: '/api/echo-creds', method: 'GET' })
+  assert.equal(kernelResp.ok, true, `kernel http.send failed: ${kernelResp.error ?? ''}`)
+  const kernelBody = (kernelResp.result as { body: string }).body
+  assert.equal(kernelBody.includes(weakBearer), false, 'kernel sanitizer must scrub weak 6-char primary bearer')
+  assert.equal(kernelBody.includes(dictPassword), false, 'kernel sanitizer must scrub dictionary primary password')
+  assert.equal(kernelBody.includes(genericHexCookie), false, 'kernel sanitizer must scrub non-auth-named 12-hex primary cookie')
+  assert.match(kernelBody, /\[redacted:weak_bearer\]/)
+  assert.match(kernelBody, /\[redacted:dict_login\]/)
+  assert.match(kernelBody, /\[redacted:hex_cookie\]/)
+  assert.equal(kernelBody.includes(protocolCookieVal), true, 'kernel getKernelSecrets must NOT scrub target-derived protocol substring')
+  assert.equal(kernelBody.includes(benignPrefVal), true, 'kernel getKernelSecrets must NOT scrub target-derived benign preference cookie')
 })
