@@ -105,18 +105,56 @@ export interface HostMintedRedirectCanary {
   readonly mintedAtMs: number
 }
 
+export type BooleanPairStyle = 'numeric' | 'single_quote' | 'double_quote'
+export type BooleanPairArm = 'baseline' | 'true' | 'false'
+
+export interface HostMintedBooleanPairChallenge {
+  readonly challengeId: string
+  readonly baseValue: string
+  readonly style: BooleanPairStyle
+  readonly param?: string | null
+  readonly trueSuffix: string
+  readonly falseSuffix: string
+  readonly trueValue: string
+  readonly falseValue: string
+  readonly mintedAtMs: number
+}
+
 /**
- * HostMintedOracle — host-owned randomized oracle state (Move A Part 3a: R2-C-6, H-15, R2-H-13).
+ * R4-C-1: Per-exchange host-stamped boolean-pair binding.
+ * Stamped by the host on baseline/true/false exchanges at send time so `verifyReceipt()`
+ * enforces host-minted equal-length, same-character-multiset predicate pairs and rejects
+ * worker-chosen boolean triangles on both `boolean` and `status_differential` rules.
+ */
+export interface HostStampedBooleanPair {
+  readonly challengeId: string
+  readonly arm: BooleanPairArm
+  readonly mintedValue: string
+  readonly baseValue: string
+  readonly trueValue: string
+  readonly falseValue: string
+  readonly param?: string | null
+  readonly style?: BooleanPairStyle
+}
+
+function sortedCharMultiset(value: string): string {
+  return [...value].sort().join('')
+}
+
+/**
+ * HostMintedOracle — host-owned randomized oracle state (Move A Part 3a: R2-C-6, H-15, R2-H-13;
+ * R4-C-1 host-minted boolean pairs).
  *
- * Mints per-attempt expression operands, timing delay tokens, and redirect canary hosts on the
- * host side so workers can never supply their own expected markers, delay tokens, or external
- * redirect destinations to forge confirmations.
+ * Mints per-attempt expression operands, timing delay tokens, boolean predicate pairs, and
+ * redirect canary hosts on the host side so workers can never supply their own expected markers,
+ * predicate pairs, delay tokens, or external redirect destinations to forge confirmations.
  */
 export class HostMintedOracle {
   private readonly expressionChallenges = new Map<string, HostMintedExpressionChallenge>()
   private readonly recentExpressionOutputs = new Set<string>()
   private readonly timingChallenges = new Map<string, HostMintedTimingChallenge>()
   private readonly redirectCanaries = new Map<string, HostMintedRedirectCanary>()
+  private readonly booleanPairs = new Map<string, HostMintedBooleanPairChallenge>()
 
   mintExpressionChallenge(
     family: ExpressionConstructFamily = 'ssti',
@@ -262,6 +300,123 @@ export class HostMintedOracle {
     if (!host) return false
     return this.redirectCanaries.has(host.trim().toLowerCase())
   }
+
+  /**
+   * R4-C-1: Mint a randomized host-owned boolean predicate pair bound to a non-empty `baseValue`.
+   * Uses a digit-permutation pair `(a, b)` so `trueValue` and `falseValue` have identical byte
+   * length and identical character multiset, preventing input length/charset validator differentials.
+   */
+  mintBooleanPair(
+    baseValue: string,
+    options: { style?: BooleanPairStyle; param?: string | null; deterministicKey?: string } = {},
+  ): HostMintedBooleanPairChallenge {
+    if (typeof baseValue !== 'string' || baseValue.trim().length === 0) {
+      throw new Error('mintBooleanPair requires a non-empty baseValue (empty-base standalone predicates are forbidden).')
+    }
+    const style: BooleanPairStyle = options.style ?? 'numeric'
+    let d1: number
+    let d2: number
+    let d3: number
+    let challengeId: string
+    let mintedAtMs: number
+    if (options.deterministicKey) {
+      const digest = createHmac('sha256', 'kovo-floor-boolean-pair-v1')
+        .update(`${options.deterministicKey}\0${baseValue}\0${style}\0${options.param ?? ''}`, 'utf8')
+        .digest()
+      d1 = (digest[0]! % 9) + 1
+      d2 = ((d1 + (digest[1]! % 8)) % 9) + 1
+      d3 = digest[2]! % 10
+      challengeId = `bool_${digest.subarray(0, 16).toString('hex')}`
+      mintedAtMs = 0
+    } else {
+      d1 = randomInt(1, 10)
+      d2 = ((d1 + randomInt(0, 8)) % 9) + 1
+      d3 = randomInt(0, 10)
+      challengeId = `bool_${randomUUID()}`
+      mintedAtMs = Date.now()
+    }
+    const a = d1 * 100 + d2 * 10 + d3
+    const b = d2 * 100 + d1 * 10 + d3
+    const trueSuffix = style === 'single_quote'
+      ? `' AND '${a}'='${a}'--`
+      : style === 'double_quote'
+        ? `" AND "${a}"="${a}"--`
+        : ` AND ${a}=${a}`
+    const falseSuffix = style === 'single_quote'
+      ? `' AND '${a}'='${b}'--`
+      : style === 'double_quote'
+        ? `" AND "${a}"="${b}"--`
+        : ` AND ${a}=${b}`
+    const pair: HostMintedBooleanPairChallenge = Object.freeze({
+      challengeId,
+      baseValue,
+      style,
+      ...(options.param !== undefined ? { param: options.param } : {}),
+      trueSuffix,
+      falseSuffix,
+      trueValue: `${baseValue}${trueSuffix}`,
+      falseValue: `${baseValue}${falseSuffix}`,
+      mintedAtMs,
+    })
+    this.booleanPairs.set(pair.challengeId, pair)
+    if (this.booleanPairs.size > 512) {
+      const oldest = this.booleanPairs.keys().next().value
+      if (oldest !== undefined) this.booleanPairs.delete(oldest)
+    }
+    return pair
+  }
+
+  stampBooleanPairArm(
+    challenge: HostMintedBooleanPairChallenge,
+    arm: BooleanPairArm,
+  ): HostStampedBooleanPair {
+    const mintedValue = arm === 'baseline'
+      ? challenge.baseValue
+      : arm === 'true'
+        ? challenge.trueValue
+        : challenge.falseValue
+    return Object.freeze({
+      challengeId: challenge.challengeId,
+      arm,
+      mintedValue,
+      baseValue: challenge.baseValue,
+      trueValue: challenge.trueValue,
+      falseValue: challenge.falseValue,
+      ...(challenge.param !== undefined ? { param: challenge.param } : {}),
+      style: challenge.style,
+    })
+  }
+
+  getBooleanPair(challengeId: string): HostMintedBooleanPairChallenge | undefined {
+    return this.booleanPairs.get(challengeId)
+  }
+
+  verifyBooleanPair(stamp: HostStampedBooleanPair | null | undefined): HostMintedBooleanPairChallenge | null {
+    if (!stamp || typeof stamp.challengeId !== 'string') return null
+    const stored = this.booleanPairs.get(stamp.challengeId)
+    if (!stored) return null
+    if (stored.baseValue.trim().length === 0) return null
+    if (stored.trueValue.length !== stored.falseValue.length) return null
+    if (stored.trueValue === stored.falseValue) return null
+    if (!stored.trueValue.startsWith(stored.baseValue) || !stored.falseValue.startsWith(stored.baseValue)) return null
+    if (sortedCharMultiset(stored.trueValue) !== sortedCharMultiset(stored.falseValue)) return null
+    if (
+      stamp.baseValue !== stored.baseValue ||
+      stamp.trueValue !== stored.trueValue ||
+      stamp.falseValue !== stored.falseValue
+    ) {
+      return null
+    }
+    if (stamp.arm !== 'baseline' && stamp.arm !== 'true' && stamp.arm !== 'false') return null
+    const expectedValue = stamp.arm === 'baseline'
+      ? stored.baseValue
+      : stamp.arm === 'true'
+        ? stored.trueValue
+        : stored.falseValue
+    if (stamp.mintedValue !== expectedValue) return null
+    if (stored.param && stamp.param && stored.param !== stamp.param) return null
+    return stored
+  }
 }
 
 export const defaultHostMintedOracle = new HostMintedOracle()
@@ -340,6 +495,8 @@ export interface ReceiptTranscriptEntry {
   hostExpressionChallenge?: HostMintedExpressionChallenge
   /** H-15: Host-minted timing delay challenge bound to this timing experiment. */
   hostTimingChallenge?: HostMintedTimingChallenge
+  /** R4-C-1: Host-minted boolean predicate pair arm bound to this exchange. */
+  hostBooleanPair?: HostStampedBooleanPair
   /** R2-H-13: Host-minted redirect canary host bound to this redirect probe. */
   hostRedirectCanaryHost?: string | null
 }
@@ -724,7 +881,7 @@ export function verifyReceipt(
     }
     const isBaselineEntry = (arm: ReceiptTranscriptEntry): boolean => {
       const role = (arm.evidenceRole ?? '').trim().toLowerCase()
-      return role === 'benign_baseline' || role === 'baseline'
+      return role === 'benign_baseline' || role === 'baseline' || arm.hostBooleanPair?.arm === 'baseline'
     }
     const baselines = arms.filter(isBaselineEntry)
     const controls = arms.filter(arm => arm.step.arm === 'control' && !isBaselineEntry(arm))
@@ -741,6 +898,32 @@ export function verifyReceipt(
         ? entry.step.body
         : entry.step.json !== undefined ? JSON.stringify(entry.step.json) : null
       return parseBodyFromCarrierText(entry.carrierText, entry.step.requestHeaders, response) ?? undefined
+    }
+    const mintedPairIds: string[] = []
+    for (let index = 0; index < controls.length; index += 1) {
+      const baseline = baselines.length > 0 ? (baselines[index] ?? baselines[baselines.length - 1]!) : undefined
+      const control = controls[index]!
+      const probe = probes[index]!
+      const pairCheck = verifyStampedBooleanPairRound({
+        baseline,
+        armA: control,
+        armB: probe,
+        param,
+        requireBaseline: false,
+        oracle,
+      })
+      if (!pairCheck.ok) {
+        return reject(receipt, rule, `Boolean differential round ${index + 1} rejected (R4-C-1): ${pairCheck.reason}`)
+      }
+      mintedPairIds.push(pairCheck.challenge.challengeId)
+      const ctlStatus = control.step.status
+      const prbStatus = probe.step.status
+      if (ctlStatus === null || prbStatus === null || Math.floor(ctlStatus / 100) !== Math.floor(prbStatus / 100)) {
+        return reject(receipt, rule, `Boolean differential round ${index + 1} rejected (R4-C-1): control (${ctlStatus ?? 'null'}) and probe (${prbStatus ?? 'null'}) must stay in the same HTTP status class.`)
+      }
+      if (baseline && (baseline.step.status === null || Math.floor(baseline.step.status / 100) !== Math.floor(prbStatus / 100))) {
+        return reject(receipt, rule, `Boolean differential round ${index + 1} rejected (R4-C-1): false/probe arm status (${prbStatus}) diverged from baseline status class (${baseline.step.status ?? 'null'}).`)
+      }
     }
     const toArm = (entry: ReceiptTranscriptEntry): BooleanDifferentialArm => {
       const requestBody = extractCarrierRequestBody(entry)
@@ -781,7 +964,11 @@ export function verifyReceipt(
       reason: assessment.reason,
       observed: receipt.claimedDelta,
       expected: 'identical responses for equivalent boolean predicates',
-      evidence: assessment.evidence,
+      evidence: {
+        ...assessment.evidence,
+        hostBooleanPairIds: mintedPairIds,
+        hostMinted: true,
+      },
     }
   }
 
@@ -790,6 +977,7 @@ export function verifyReceipt(
     if (citedEntries.some(entry => entryHasVaultScrubbedRequestPlane(entry))) {
       return reject(receipt, rule, 'Kernel request plane contains a vault-scrubbed/redacted placeholder ([redacted...]); status differential fails closed.')
     }
+    const entryByStep = new Map(citedEntries.map(entry => [entry.step, entry]))
     const arms = citedEntries.map(entry => entry.step)
     const triangle = statusDifferentialRounds(arms, receipt.target.param ?? null)
     if (!triangle) {
@@ -798,11 +986,37 @@ export function verifyReceipt(
     if (triangle.rounds.length < 2) {
       return reject(receipt, rule, 'A status differential needs at least two complete benign/tautology/contradiction rounds.')
     }
+    const mintedPairIds: string[] = []
     for (const [index, round] of triangle.rounds.entries()) {
+      const benignEntry = entryByStep.get(round.benign)
+      const tautologyEntry = entryByStep.get(round.tautology)
+      const contradictionEntry = entryByStep.get(round.contradiction)
+      if (!benignEntry || !tautologyEntry || !contradictionEntry) {
+        return reject(receipt, rule, `Status differential round ${index + 1} could not resolve host transcript entries.`)
+      }
+      const roundParam = receipt.target.param
+        ?? deriveDifferingParam(benignEntry, tautologyEntry)
+        ?? deriveDifferingParam(tautologyEntry, contradictionEntry)
+      if (!roundParam) {
+        return reject(receipt, rule, `Status differential round ${index + 1} must name the injected parameter.`)
+      }
+      const pairCheck = verifyStampedBooleanPairRound({
+        baseline: benignEntry,
+        armA: tautologyEntry,
+        armB: contradictionEntry,
+        param: roundParam,
+        requireBaseline: true,
+        requireArmATrue: true,
+        oracle,
+      })
+      if (!pairCheck.ok) {
+        return reject(receipt, rule, `Status differential round ${index + 1} rejected (R4-C-1): ${pairCheck.reason}`)
+      }
+      mintedPairIds.push(pairCheck.challenge.challengeId)
       const assessment = assessInjectionImpact({
         impactClass: 'injection',
         steps: [round.benign, round.tautology, round.contradiction],
-        injection: { family: 'sqli', param: receipt.target.param, statusBoolean: { ...round, param: receipt.target.param ?? null } },
+        injection: { family: 'sqli', param: roundParam, statusBoolean: { ...round, param: roundParam } },
       })
       if (!assessment.satisfied) {
         return {
@@ -827,9 +1041,14 @@ export function verifyReceipt(
       reason: `Paired status-only boolean exception reproduced across ${triangle.rounds.length} rounds: the benign baseline (${triangle.rounds[0]!.benign.status}) and tautology arm (${triangle.rounds[0]!.tautology.status}) are 2xx while the contradiction arm fails (${triangle.rounds[0]!.contradiction.status}) on the same request shape. A single malformed request that turns 200 into 500 is not this shape.`,
       observed: receipt.claimedDelta,
       expected: 'identical status for equivalent boolean predicates',
-      evidence: { rounds: triangle.rounds.length, statuses: triangle.rounds.map(round => ({
-        benign: round.benign.status, tautology: round.tautology.status, contradiction: round.contradiction.status,
-      })) },
+      evidence: {
+        rounds: triangle.rounds.length,
+        hostBooleanPairIds: mintedPairIds,
+        hostMinted: true,
+        statuses: triangle.rounds.map(round => ({
+          benign: round.benign.status, tautology: round.tautology.status, contradiction: round.contradiction.status,
+        })),
+      },
     }
   }
 
@@ -2136,31 +2355,56 @@ function probeCarriedHostCredentialControlLacked(
     }
   }
 
-  // C-4 / H-14: Reject self-sabotaged controls (control carries an extra security header absent from an
-  // authenticated probe carrying a cookie/session/persona/wire credential, e.g., cookie + invalid Bearer vs cookie).
-  const probeHostWireAuth = Boolean(
-    prbWire && (
-      prbWire.sources.some(s => s === 'persona_vault' || s === 'session_jar' || s === 'ephemeral_observed') ||
-      prbWire.session ||
-      prbWire.vaultHeaderNames.length > 0 ||
-      prbWire.vaultCookieNames.length > 0 ||
-      prbWire.jarCookieNames.length > 0
-    ),
+  // R4-H-7: Synthetic invalid credentials are permitted strictly on the probe arm, NEVER as the
+  // negative control (a permit-all endpoint returning 401 on invalid bearer + 200 on anonymous
+  // header must never confirm auth_bypass).
+  const SYNTH_INVALID_CRED_RE = /kovo-synth-invalid-/i
+  const controlHasSyntheticInvalidCred = Boolean(
+    ctlWire?.authMutated ||
+    Object.values(ctlHeaders).some(v => SYNTH_INVALID_CRED_RE.test(v)),
   )
-  const probeAuthenticated = prbHandle !== null || Boolean(prbHeaders.cookie) || Boolean(prbSessionId) || probeHostWireAuth
-  if (probeAuthenticated) {
-    for (const [k, v] of Object.entries(ctlHeaders)) {
-      if (k === 'cookie' || !AUTH_BYPASS_SECURITY_HEADER_RE.test(k)) continue
-      if (v.trim().length > 0 && !(prbHeaders[k] ?? '').trim()) {
-        return 'Auth bypass rejected: control carried an extra auth header absent from the authenticated probe (self-sabotaged control is not an authentication bypass).'
+  if (controlHasSyntheticInvalidCred) {
+    return 'Auth bypass rejected (R4-H-7): synthetic invalid credentials are allowed strictly on the probe arm and never as a negative control (self-sabotaged control is not an authentication bypass).'
+  }
+
+  // C-4 / H-14 / R4-H-7: Reject self-sabotaged controls for BOTH authenticated and anonymous
+  // probes — the control may NEVER carry an auth/security header, cookie, session, or wire
+  // credential that the probe lacks (e.g., invalid Bearer control 401 vs anonymous header probe 200).
+  for (const [k, v] of Object.entries(ctlHeaders)) {
+    if (k === 'cookie') {
+      if (v.trim().length > 0 && !(prbHeaders.cookie ?? '').trim()) {
+        return 'Auth bypass rejected (R4-H-7): control carried a cookie absent from the probe (self-sabotaged control is not an authentication bypass).'
       }
+      continue
     }
-    if (ctlWire) {
-      const prbCallerHeaders = new Set((prbWire?.callerAuthHeaderNames ?? []).map(h => h.toLowerCase()))
-      if (ctlWire.callerAuthHeaderNames.some(h => h.toLowerCase() !== 'cookie' && !prbCallerHeaders.has(h.toLowerCase()))) {
-        return 'Auth bypass rejected: wire credential provenance shows control carried an extra caller auth header absent from the authenticated probe (self-sabotaged control is not an authentication bypass).'
-      }
+    if (!AUTH_BYPASS_SECURITY_HEADER_RE.test(k)) continue
+    if (v.trim().length > 0 && !(prbHeaders[k] ?? '').trim()) {
+      return 'Auth bypass rejected (R4-H-7): control carried an extra auth header absent from the probe (self-sabotaged control is not an authentication bypass).'
     }
+  }
+  if (ctlWire) {
+    const prbCallerHeaders = new Set((prbWire?.callerAuthHeaderNames ?? []).map(h => h.toLowerCase()))
+    const prbAllHeaderKeys = new Set(Object.keys(prbHeaders).filter(k => (prbHeaders[k] ?? '').trim().length > 0))
+    if (ctlWire.callerAuthHeaderNames.some(h => {
+      const lh = h.toLowerCase()
+      return lh !== 'cookie' && !prbCallerHeaders.has(lh) && !prbAllHeaderKeys.has(lh)
+    })) {
+      return 'Auth bypass rejected (R4-H-7): wire credential provenance shows control carried an extra caller auth header absent from the probe (self-sabotaged control is not an authentication bypass).'
+    }
+    const prbVaultHeaders = new Set((prbWire?.vaultHeaderNames ?? []).map(h => h.toLowerCase()))
+    if (ctlWire.vaultHeaderNames.some(h => !prbVaultHeaders.has(h.toLowerCase()))) {
+      return 'Auth bypass rejected (R4-H-7): wire credential provenance shows control carried a vault auth header absent from the probe (self-sabotaged control is not an authentication bypass).'
+    }
+    const prbWireCookies = new Set((prbWire?.cookieNames ?? []).map(c => c.toLowerCase()))
+    if (ctlWire.cookieNames.some(c => !prbWireCookies.has(c.toLowerCase())) && !(prbHeaders.cookie ?? '').trim()) {
+      return 'Auth bypass rejected (R4-H-7): wire credential provenance shows control carried a cookie absent from the probe (self-sabotaged control is not an authentication bypass).'
+    }
+  }
+  if (ctlHandle !== null && prbHandle === null) {
+    return 'Auth bypass rejected (R4-H-7): control carried an authenticated persona that the anonymous probe lacked (self-sabotaged control is not an authentication bypass).'
+  }
+  if (ctlSessionId && !prbSessionId) {
+    return 'Auth bypass rejected (R4-H-7): control carried a session jar that the probe lacked (self-sabotaged control is not an authentication bypass).'
   }
 
   // C-4: Login-issued token check across ALL AUTH_BYPASS_SECURITY_HEADER_RE headers, query params,
@@ -2325,6 +2569,68 @@ function verifyAuthBypassReceipt(
       if (differential !== 'header' && (control.step.status !== 401 || authenticatedControl)) {
         lastRejection = 'Auth bypass rejected: an authenticated/forbidden control changing only a query or body field is an authorization or ordinary request difference, not an authentication bypass.'
         continue
+      }
+      // R4-H-7: Anonymous ablation check.
+      // When the probe does not carry a real host credential (persona/cookie/session jar/vault/ephemeral),
+      // require a denied (401/403) bare anonymous ablation exchange on the exact same method & route
+      // (probe minus the added bypass header/query/body element, with zero auth headers/credentials),
+      // AND reject if any bare anonymous exchange on the same route succeeded with 2xx (permit-all).
+      const probeHeadersMap = canonicalRequestHeaderMap(probe.step.requestHeaders)
+      const probeHasHostBaseAuth = Boolean(
+        normalizedAuthHandle(probe.step.actor.handle) !== null ||
+        probeHeadersMap.cookie ||
+        probe.sessionId ||
+        probe.wireCredentialProvenance?.session ||
+        probe.wireCredentialProvenance?.sources.some(s => s === 'persona_vault' || s === 'session_jar' || s === 'ephemeral_observed') ||
+        (probe.wireCredentialProvenance?.vaultHeaderNames.length ?? 0) > 0 ||
+        (probe.wireCredentialProvenance?.vaultCookieNames.length ?? 0) > 0 ||
+        (probe.wireCredentialProvenance?.jarCookieNames.length ?? 0) > 0,
+      )
+      const isBareAnonymousAblation = (entry: ReceiptTranscriptEntry): boolean => {
+        if (entry.step.method.toUpperCase() !== probeMethod || routeOf(entry.step) !== probeRoute) return false
+        if (normalizedAuthHandle(entry.step.actor.handle) !== null) return false
+        if (entry.sessionId || entry.consumedCapabilityId || (entry.consumedCapabilities && entry.consumedCapabilities.length > 0)) return false
+        const wp = entry.wireCredentialProvenance
+        if (wp && (
+          wp.authenticated ||
+          wp.authMutated ||
+          wp.session ||
+          wp.sources.length > 0 ||
+          wp.headerNames.length > 0 ||
+          wp.callerAuthHeaderNames.length > 0 ||
+          wp.vaultHeaderNames.length > 0 ||
+          wp.cookieNames.length > 0
+        )) {
+          return false
+        }
+        const h = canonicalRequestHeaderMap(entry.step.requestHeaders)
+        if (h.cookie) return false
+        for (const [k, v] of Object.entries(h)) {
+          if (AUTH_BYPASS_SECURITY_HEADER_RE.test(k) && v.trim().length > 0) return false
+        }
+        const q = parseQueryMap(entry.step.pathAndQuery)
+        for (const [k, v] of Object.entries(q)) {
+          if (AUTH_BYPASS_PARAM_KEY_RE.test(k) && v.trim().length > 0) return false
+        }
+        const b = collectBodyEntries(entry.step.requestJson)
+        for (const [k, v] of Object.entries(b)) {
+          const leafKey = k.split('.').pop()?.replace(/\[\d+\]$/, '') ?? ''
+          if (AUTH_BYPASS_PARAM_KEY_RE.test(leafKey) && v.trim().length > 0) return false
+        }
+        return true
+      }
+      if (!probeHasHostBaseAuth) {
+        const bareAnonSucceeded = allEntries.some(e => isBareAnonymousAblation(e) && is2xxStatus(e.step.status))
+        if (bareAnonSucceeded) {
+          lastRejection = 'Auth bypass rejected (R4-H-7): a bare anonymous ablation request on the same route succeeded with 2xx (endpoint is permit-all/public, not an authentication bypass).'
+          continue
+        }
+        const hasDeniedBareAnonAblation = isBareAnonymousAblation(control) ||
+          allEntries.some(e => isBareAnonymousAblation(e) && (e.step.status === 401 || e.step.status === 403))
+        if (!hasDeniedBareAnonAblation) {
+          lastRejection = 'Auth bypass rejected (R4-H-7): missing denied (401/403) bare anonymous ablation arm (the probe minus its bypass element must be denied without credentials).'
+          continue
+        }
       }
       const probeBodyRaw = typeof probe.step.body === 'string'
         ? probe.step.body
@@ -2711,26 +3017,528 @@ function probeCarriesExpressionWithOperands(
   return false
 }
 
+export interface RequestCarrierInput {
+  pathAndQuery?: string | null
+  requestBody?: string | null
+  requestJson?: unknown
+  requestHeaders?: Readonly<Record<string, string>> | null
+}
+
+export interface NormalizedRequestCarrier {
+  /** True when any request component contained a malformed percent-escape or unicode escape (fail closed). */
+  readonly malformedEscape: boolean
+  /** Reason if malformedEscape is true. */
+  readonly malformedReason: string | null
+  /** Decoded user-input carrier components (path segments, query params, body/JSON leaves, non-transport headers). */
+  readonly inputComponents: readonly string[]
+  /** Decoded transport header components (host, user-agent, etc.) checked only for verbatim/cleaned contiguous echoes. */
+  readonly transportHeaderComponents: readonly string[]
+  /** Joined decoded carrier text (safe for operand/traversal checks when !malformedEscape). */
+  readonly combinedDecoded: string
+}
+
+const TRANSPORT_HEADER_NAME_RE = /^(?:host|content-length|content-type|accept|accept-encoding|accept-language|connection|user-agent|date|cache-control|pragma|upgrade-insecure-requests|sec-fetch-[a-z-]+)$/i
+const ZERO_WIDTH_OR_BIDI_RE = /[\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF\u00AD]/g
+
+function decodeHtmlEntitiesBasic(input: string): string {
+  if (!input.includes('&')) return input
+  return input
+    .replace(/&#x([0-9a-fA-F]{1,6});/g, (m, hex: string) => {
+      const cp = parseInt(hex, 16)
+      return cp > 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : m
+    })
+    .replace(/&#(\d{1,7});/g, (m, dec: string) => {
+      const cp = parseInt(dec, 10)
+      return cp > 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : m
+    })
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&amp;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/&apos;|&#0*39;/gi, "'")
+}
+
+function decodeUnicodeAndHexEscapesStrict(raw: string): { ok: true; value: string } | { ok: false; reason: string } {
+  if (!raw.includes('\\')) return { ok: true, value: raw }
+  if (/\\u(?![0-9a-fA-F]{4}|\{[0-9a-fA-F]{1,6}\})/.test(raw)) {
+    return { ok: false, reason: 'malformed_unicode_escape' }
+  }
+  const decoded = raw
+    .replace(/\\u\{([0-9a-fA-F]{1,6})\}/g, (m, hex: string) => {
+      const cp = parseInt(hex, 16)
+      return cp <= 0x10ffff ? String.fromCodePoint(cp) : m
+    })
+    .replace(/\\u([0-9a-fA-F]{4})/g, (_m, hex: string) => String.fromCharCode(parseInt(hex, 16)))
+    .replace(/\\x([0-9a-fA-F]{2})/g, (_m, hex: string) => String.fromCharCode(parseInt(hex, 16)))
+  return { ok: true, value: decoded }
+}
+
+function decodePercentComponentStrict(
+  raw: string,
+  options: { plusAsSpace: boolean; strictBarePercent: boolean },
+): { ok: true; value: string } | { ok: false; reason: string } {
+  let current = options.plusAsSpace ? raw.replace(/\+/g, ' ') : raw
+  for (let round = 0; round < 3; round += 1) {
+    if (!current.includes('%')) break
+    const hasMalformedPercent = /%(?![0-9a-fA-F]{2})/.test(current)
+    const hasValidHexPercent = /%[0-9a-fA-F]{2}/.test(current)
+    if (hasMalformedPercent) {
+      if (round === 0 && (options.strictBarePercent || hasValidHexPercent || /%[g-zG-Z]|%[0-9a-fA-F](?![0-9a-fA-F])/.test(current))) {
+        return { ok: false, reason: 'malformed_percent_escape' }
+      }
+      if (round >= 1 && /%[g-zG-Z]|%[0-9a-fA-F](?![0-9a-fA-F])/.test(current)) {
+        return { ok: false, reason: 'malformed_percent_escape' }
+      }
+      break
+    }
+    try {
+      const next = decodeURIComponent(current)
+      if (next === current) break
+      current = next
+    } catch {
+      if (round === 0 || hasValidHexPercent) {
+        return { ok: false, reason: 'invalid_utf8_percent_escape' }
+      }
+      break
+    }
+  }
+  return { ok: true, value: current }
+}
+
+function stripInertSanitizerChars(value: string): string {
+  return decodeHtmlEntitiesBasic(value)
+    .normalize('NFKC')
+    .replace(/<[^>]*>/g, '')
+    .replace(ZERO_WIDTH_OR_BIDI_RE, '')
+}
+
+function isOrderedSubsequence(needle: string, haystack: string): boolean {
+  if (!needle) return false
+  let j = 0
+  for (let i = 0; i < haystack.length && j < needle.length; i += 1) {
+    if (haystack[i] === needle[j]) j += 1
+  }
+  return j === needle.length
+}
+
+function collectJsonStringLeaves(value: unknown, out: string[], depth = 0): void {
+  if (depth > 8 || out.length >= 256 || value === null || value === undefined) return
+  if (typeof value === 'string') {
+    out.push(value)
+    return
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') {
+    out.push(String(value))
+    return
+  }
+  if (Array.isArray(value)) {
+    for (const item of value.slice(0, 64)) collectJsonStringLeaves(item, out, depth + 1)
+    return
+  }
+  if (typeof value === 'object') {
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      out.push(k)
+      collectJsonStringLeaves(v, out, depth + 1)
+    }
+  }
+}
+
 /**
- * R2-C-6: Fail-closed host-minted evaluated-expression oracle for SSTI / command / SQL expression
- * evaluation (`CWE-1336` / `CWE-78` / `CWE-89`).
+ * R4-C-2 / R4-C-6: Shared per-component fail-closed request carrier normalizer.
+ * Decodes URL path segments, query parameters, form fields, JSON unicode escapes/leaves,
+ * and request headers individually; fails closed on malformed percent-escapes or unicode escapes.
+ */
+export function normalizeRequestCarrier(input: RequestCarrierInput): NormalizedRequestCarrier {
+  const inputComponents: string[] = []
+  const transportHeaderComponents: string[] = []
+  let malformedReason: string | null = null
+
+  const pushInput = (raw: string, opts: { plusAsSpace: boolean; strictBarePercent: boolean }) => {
+    if (!raw) return
+    inputComponents.push(raw)
+    const uni = decodeUnicodeAndHexEscapesStrict(raw)
+    if (!uni.ok) {
+      malformedReason ??= uni.reason
+      return
+    }
+    if (uni.value !== raw) inputComponents.push(uni.value)
+    const pct = decodePercentComponentStrict(uni.value, opts)
+    if (!pct.ok) {
+      malformedReason ??= pct.reason
+      return
+    }
+    if (pct.value !== uni.value) inputComponents.push(pct.value)
+    const html = decodeHtmlEntitiesBasic(pct.value)
+    if (html !== pct.value) inputComponents.push(html)
+  }
+
+  const pq = input.pathAndQuery ?? ''
+  if (pq) {
+    const hashIdx = pq.indexOf('#')
+    const withoutHash = hashIdx >= 0 ? pq.slice(0, hashIdx) : pq
+    const qIdx = withoutHash.indexOf('?')
+    const rawPath = qIdx >= 0 ? withoutHash.slice(0, qIdx) : withoutHash
+    const rawQuery = qIdx >= 0 ? withoutHash.slice(qIdx + 1) : ''
+    for (const seg of rawPath.split('/')) {
+      if (seg) pushInput(seg, { plusAsSpace: false, strictBarePercent: true })
+    }
+    if (rawQuery) {
+      for (const pair of rawQuery.split('&')) {
+        if (!pair) continue
+        const eq = pair.indexOf('=')
+        if (eq < 0) {
+          pushInput(pair, { plusAsSpace: true, strictBarePercent: true })
+        } else {
+          pushInput(pair.slice(0, eq), { plusAsSpace: true, strictBarePercent: true })
+          pushInput(pair.slice(eq + 1), { plusAsSpace: true, strictBarePercent: true })
+        }
+      }
+    }
+  }
+
+  const headers = input.requestHeaders ?? null
+  let contentType = ''
+  if (headers) {
+    for (const [k, v] of Object.entries(headers)) {
+      const lk = k.trim().toLowerCase()
+      if (lk === 'content-type') contentType = String(v).toLowerCase()
+      if (TRANSPORT_HEADER_NAME_RE.test(lk)) {
+        if (v) transportHeaderComponents.push(String(v))
+      } else if (v) {
+        pushInput(String(v), { plusAsSpace: false, strictBarePercent: false })
+      }
+    }
+  }
+
+  const rawBody = typeof input.requestBody === 'string'
+    ? input.requestBody
+    : typeof input.requestJson === 'string'
+      ? input.requestJson
+      : input.requestJson !== undefined
+        ? JSON.stringify(input.requestJson)
+        : ''
+
+  if (rawBody) {
+    const trimmed = rawBody.trim()
+    const isForm = contentType.includes('application/x-www-form-urlencoded')
+      || (!contentType.includes('json') && !trimmed.startsWith('{') && !trimmed.startsWith('[') && trimmed.includes('=') && !trimmed.includes('\n'))
+    const looksJson = contentType.includes('json') || trimmed.startsWith('{') || trimmed.startsWith('[') || trimmed.startsWith('"')
+    if (isForm) {
+      for (const pair of rawBody.split('&')) {
+        if (!pair) continue
+        const eq = pair.indexOf('=')
+        if (eq < 0) {
+          pushInput(pair, { plusAsSpace: true, strictBarePercent: true })
+        } else {
+          pushInput(pair.slice(0, eq), { plusAsSpace: true, strictBarePercent: true })
+          pushInput(pair.slice(eq + 1), { plusAsSpace: true, strictBarePercent: true })
+        }
+      }
+    } else if (looksJson) {
+      const rawUni = decodeUnicodeAndHexEscapesStrict(rawBody)
+      if (!rawUni.ok) {
+        malformedReason ??= rawUni.reason
+      } else if (rawUni.value !== rawBody) {
+        inputComponents.push(rawUni.value)
+      }
+      try {
+        const parsed = JSON.parse(rawBody)
+        const leaves: string[] = []
+        collectJsonStringLeaves(parsed, leaves)
+        for (const leaf of leaves) {
+          pushInput(leaf, { plusAsSpace: false, strictBarePercent: false })
+        }
+      } catch {
+        pushInput(rawBody, { plusAsSpace: false, strictBarePercent: false })
+      }
+    } else {
+      pushInput(rawBody, { plusAsSpace: false, strictBarePercent: false })
+    }
+  } else if (input.requestJson !== undefined && typeof input.requestJson !== 'string') {
+    const leaves: string[] = []
+    collectJsonStringLeaves(input.requestJson, leaves)
+    for (const leaf of leaves) {
+      pushInput(leaf, { plusAsSpace: false, strictBarePercent: false })
+    }
+  }
+
+  return {
+    malformedEscape: malformedReason !== null,
+    malformedReason,
+    inputComponents,
+    transportHeaderComponents,
+    combinedDecoded: inputComponents.join('\n'),
+  }
+}
+
+function maskExpressionOperands(text: string, challenge: HostMintedExpressionChallenge): string {
+  const a = String(challenge.operandA)
+  const b = String(challenge.operandB)
+  const opRe = challenge.operator === '+' ? '\\+' : '\\\\?\\*'
+  return text.replace(new RegExp(`${a}\\s*${opRe}\\s*${b}`, 'g'), ' ')
+}
+
+function carrierReflectsExpressionOutput(
+  carrier: NormalizedRequestCarrier,
+  challenge: HostMintedExpressionChallenge,
+): boolean {
+  if (carrier.malformedEscape) return true
+  const expected = challenge.expectedOutput
+  const expectedDigits = expected.replace(/[^0-9]/g, '')
+  if (!expected || !expectedDigits) return true
+  for (const comp of carrier.inputComponents) {
+    if (comp.includes(expected)) return true
+    const cleaned = stripInertSanitizerChars(comp)
+    if (cleaned.includes(expected)) return true
+    const digitsOnly = cleaned.replace(/[^0-9]/g, '')
+    if (digitsOnly.includes(expectedDigits)) return true
+    const maskedDigits = maskExpressionOperands(cleaned, challenge).replace(/[^0-9]/g, '')
+    if (isOrderedSubsequence(expectedDigits, maskedDigits)) return true
+  }
+  const joinedCleaned = stripInertSanitizerChars(carrier.combinedDecoded)
+  if (joinedCleaned.includes(expected) || joinedCleaned.replace(/[^0-9]/g, '').includes(expectedDigits)) {
+    return true
+  }
+  for (const th of carrier.transportHeaderComponents) {
+    if (th.includes(expected) || stripInertSanitizerChars(th).includes(expected)) return true
+  }
+  return false
+}
+
+export interface EvaluatedExpressionProbeCheck {
+  readonly ok: boolean
+  readonly reason: string
+  readonly challenge: HostMintedExpressionChallenge | null
+}
+
+/**
+ * R4-C-2: Single authoritative kernel primitive for host-minted expression evaluation verification.
+ * Shared by `verifyEvaluatedExpression()` (`proof-receipt.ts`) and `evaluateClaim('host_evaluated_expression')`
+ * (`verify-claims.ts`) so both paths enforce:
+ *  - non-transferable per-exchange `hostExpressionChallenge` stamp verified in `HostMintedOracle`,
+ *  - per-component fail-closed carrier normalization (rejecting malformed percent/unicode escapes),
+ *  - presence of host-minted operands in the decoded probe request,
+ *  - presence of computed output in 2xx probe body, absence from control bodies,
+ *  - deletion-normalized & ordered-digit-subsequence anti-reflection against the probe request.
+ */
+export function verifyHostExpressionProbe(input: {
+  probeRequest: RequestCarrierInput
+  probeBody: string
+  probeStatus: number | null
+  controlBodies: readonly string[]
+  stampedChallenge: HostMintedExpressionChallenge | null | undefined
+  expectedChallengeId?: string
+  vulnClass?: string
+  oracle?: HostMintedOracle
+}): EvaluatedExpressionProbeCheck {
+  const oracle = input.oracle ?? defaultHostMintedOracle
+  if (!input.stampedChallenge) {
+    return {
+      ok: false,
+      reason: 'Probe exchange lacks a host-stamped hostExpressionChallenge (worker-sent probes citing transcript challenges are rejected).',
+      challenge: null,
+    }
+  }
+  const verified = oracle.verifyExpressionChallenge(input.stampedChallenge)
+  if (!verified) {
+    return {
+      ok: false,
+      reason: 'Probe exchange hostExpressionChallenge failed HostMintedOracle verification.',
+      challenge: null,
+    }
+  }
+  if (input.expectedChallengeId && verified.challengeId !== input.expectedChallengeId) {
+    return {
+      ok: false,
+      reason: `Probe exchange hostExpressionChallenge (${verified.challengeId}) does not match claimed challenge (${input.expectedChallengeId}).`,
+      challenge: null,
+    }
+  }
+  if (input.vulnClass && !expressionClassCompatibleWithFamily(input.vulnClass, verified.family)) {
+    return {
+      ok: false,
+      reason: `Challenge family (${verified.family}) is incompatible with vulnerability class (${input.vulnClass}).`,
+      challenge: null,
+    }
+  }
+  if (!is2xxStatus(input.probeStatus)) {
+    return {
+      ok: false,
+      reason: `Probe returned non-2xx status (${input.probeStatus ?? 'null'}).`,
+      challenge: null,
+    }
+  }
+  const carrier = normalizeRequestCarrier(input.probeRequest)
+  if (carrier.malformedEscape) {
+    return {
+      ok: false,
+      reason: `Probe request carrier contained a malformed escape (${carrier.malformedReason}); anti-reflection fails closed.`,
+      challenge: null,
+    }
+  }
+  if (!probeCarriesExpressionWithOperands(carrier.combinedDecoded, verified)) {
+    return {
+      ok: false,
+      reason: 'Decoded probe request does not carry the host-minted expression operands.',
+      challenge: null,
+    }
+  }
+  const marker = verified.expectedOutput
+  if (!input.probeBody.includes(marker)) {
+    return {
+      ok: false,
+      reason: 'Probe response body does not contain the host-computed expected output.',
+      challenge: null,
+    }
+  }
+  if (input.controlBodies.some(cb => cb.includes(marker))) {
+    return {
+      ok: false,
+      reason: 'Control response body already contains the expected output (control leakage).',
+      challenge: null,
+    }
+  }
+  if (carrierReflectsExpressionOutput(carrier, verified)) {
+    return {
+      ok: false,
+      reason: 'Expected output digits appear in the normalized probe request carrier (anti-reflection fail closed).',
+      challenge: null,
+    }
+  }
+  return { ok: true, reason: 'ok', challenge: verified }
+}
+
+function requestBodyOfEntry(entry: ReceiptTranscriptEntry): string | null {
+  if (typeof entry.step.requestJson === 'string') return entry.step.requestJson
+  if (entry.step.requestJson !== undefined) return JSON.stringify(entry.step.requestJson)
+  if (typeof entry.step.requestBody === 'string') return entry.step.requestBody
+  if (entry.carrierText) {
+    const resp = typeof entry.step.body === 'string'
+      ? entry.step.body
+      : entry.step.json !== undefined ? JSON.stringify(entry.step.json) : null
+    return parseBodyFromCarrierText(entry.carrierText, entry.step.requestHeaders, resp)
+  }
+  return null
+}
+
+function extractRequestParamValue(entry: ReceiptTranscriptEntry, param: string): string | null {
+  const pq = entry.step.pathAndQuery ?? ''
+  const qIdx = pq.indexOf('?')
+  if (qIdx >= 0) {
+    const rawQuery = pq.slice(qIdx + 1).split('#')[0] ?? ''
+    const params = new URLSearchParams(rawQuery)
+    if (params.has(param)) return params.get(param)
+  }
+  const rawBody = requestBodyOfEntry(entry)
+  if (rawBody) {
+    const ct = (headerValue(entry.step.requestHeaders, 'content-type') ?? '').toLowerCase()
+    const trimmed = rawBody.trim()
+    if (ct.includes('application/x-www-form-urlencoded') || (!trimmed.startsWith('{') && !trimmed.startsWith('[') && trimmed.includes('='))) {
+      const params = new URLSearchParams(rawBody)
+      if (params.has(param)) return params.get(param)
+    }
+    if (ct.includes('json') || trimmed.startsWith('{') || trimmed.startsWith('[')) {
+      try {
+        const parsed = JSON.parse(rawBody)
+        const found = lookupJsonLeafByKey(parsed, param)
+        if (found !== null) return found
+      } catch { /* ignore */ }
+    }
+  }
+  if (entry.step.requestJson && typeof entry.step.requestJson === 'object') {
+    const found = lookupJsonLeafByKey(entry.step.requestJson, param)
+    if (found !== null) return found
+  }
+  return null
+}
+
+function lookupJsonLeafByKey(value: unknown, key: string, depth = 0): string | null {
+  if (depth > 6 || !value || typeof value !== 'object') return null
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = lookupJsonLeafByKey(item, key, depth + 1)
+      if (found !== null) return found
+    }
+    return null
+  }
+  const rec = value as Record<string, unknown>
+  if (Object.prototype.hasOwnProperty.call(rec, key)) {
+    const v = rec[key]
+    if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') return String(v)
+  }
+  for (const child of Object.values(rec)) {
+    const found = lookupJsonLeafByKey(child, key, depth + 1)
+    if (found !== null) return found
+  }
+  return null
+}
+
+function verifyStampedBooleanPairRound(input: {
+  baseline?: ReceiptTranscriptEntry
+  armA: ReceiptTranscriptEntry
+  armB: ReceiptTranscriptEntry
+  param: string
+  requireBaseline: boolean
+  requireArmATrue?: boolean
+  oracle: HostMintedOracle
+}): { ok: true; challenge: HostMintedBooleanPairChallenge } | { ok: false; reason: string } {
+  const stampA = input.armA.hostBooleanPair
+  const stampB = input.armB.hostBooleanPair
+  if (!stampA || !stampB) {
+    return { ok: false, reason: 'missing host-minted hostBooleanPair stamp on true/false arms; worker-chosen boolean predicate pairs are rejected.' }
+  }
+  const verifiedA = input.oracle.verifyBooleanPair(stampA)
+  const verifiedB = input.oracle.verifyBooleanPair(stampB)
+  if (!verifiedA || !verifiedB) {
+    return { ok: false, reason: 'hostBooleanPair stamp failed HostMintedOracle verification (unminted challengeId, mismatched values, unequal length, or mismatched character multiset).' }
+  }
+  if (verifiedA.challengeId !== verifiedB.challengeId) {
+    return { ok: false, reason: `paired true/false arms cite different hostBooleanPair challengeIds (${verifiedA.challengeId} vs ${verifiedB.challengeId}).` }
+  }
+  if (verifiedA.param && verifiedA.param !== input.param) {
+    return { ok: false, reason: `hostBooleanPair param (${verifiedA.param}) does not match target param (${input.param}).` }
+  }
+  const aIsTrue = stampA.arm === 'true' && stampB.arm === 'false'
+  const aIsFalse = stampA.arm === 'false' && stampB.arm === 'true'
+  if (input.requireArmATrue ? !aIsTrue : (!aIsTrue && !aIsFalse)) {
+    return { ok: false, reason: `paired arms must carry opposing host-minted true/false stamps (got ${stampA.arm} and ${stampB.arm}).` }
+  }
+  if (input.requireBaseline || input.baseline) {
+    if (!input.baseline?.hostBooleanPair) {
+      return { ok: false, reason: 'baseline arm is missing its host-minted hostBooleanPair stamp.' }
+    }
+    const verifiedBase = input.oracle.verifyBooleanPair(input.baseline.hostBooleanPair)
+    if (!verifiedBase || verifiedBase.challengeId !== verifiedA.challengeId || input.baseline.hostBooleanPair.arm !== 'baseline') {
+      return { ok: false, reason: 'baseline arm hostBooleanPair stamp does not match the round challengeId/baseline role.' }
+    }
+    const actualBase = extractRequestParamValue(input.baseline, input.param)
+    if (actualBase !== input.baseline.hostBooleanPair.mintedValue) {
+      return { ok: false, reason: `baseline request param "${input.param}" does not equal host-minted baseValue byte for byte.` }
+    }
+  }
+  const actualA = extractRequestParamValue(input.armA, input.param)
+  if (actualA !== stampA.mintedValue) {
+    return { ok: false, reason: `arm "${input.armA.exchangeId}" param "${input.param}" does not equal host-minted value byte for byte.` }
+  }
+  const actualB = extractRequestParamValue(input.armB, input.param)
+  if (actualB !== stampB.mintedValue) {
+    return { ok: false, reason: `arm "${input.armB.exchangeId}" param "${input.param}" does not equal host-minted value byte for byte.` }
+  }
+  return { ok: true, challenge: verifiedA }
+}
+
+/**
+ * R2-C-6 / R4-C-2: Fail-closed host-minted evaluated-expression oracle for SSTI / command / SQL
+ * expression evaluation (`CWE-1336` / `CWE-78` / `CWE-89`).
  *
- * Requires:
- *  1. Host-minted randomized expression challenge(s) verified in `HostMintedOracle` (rejects ALL
- *     worker-chosen `proofPatterns` / markers),
- *  2. Same normalized origin, HTTP method, route, persona, and request shape apart from the
- *     injected expression parameter between control and probe,
- *  3. Probe request text (clean kernel plane, zero `[redacted:cap:...]` tokens) carries the exact
- *     host-minted operands in a recognized expression syntax,
- *  4. Strict anti-reflection: host-computed `expectedOutput` appears in the 2xx probe body, is
- *     ABSENT from every 2xx control body, and is ABSENT from the probe request text,
- *  5. When multiple probes/attempts are cited, expected outputs MUST vary across attempts and each
- *     probe must return its own host-computed output (never a static page value).
+ * Requires non-transferable per-exchange `entry.hostExpressionChallenge` stamps verified in
+ * `HostMintedOracle` (transcript-wide challenge fallback is deleted) and routes all request
+ * anti-reflection checks through `verifyHostExpressionProbe()` + `normalizeRequestCarrier()`.
  */
 function verifyEvaluatedExpression(
   receipt: ProofReceipt,
   entriesById: ReadonlyMap<string, ReceiptTranscriptEntry>,
-  transcript: ReceiptTranscript,
+  _transcript: ReceiptTranscript,
   oracle: HostMintedOracle,
 ): ReceiptVerification | null {
   const cited = receipt.exchangeIds.map(id => entriesById.get(id)!)
@@ -2739,24 +3547,9 @@ function verifyEvaluatedExpression(
   if (controls.length === 0 || probes.length === 0) return null
   if (cited.some(entry => entryHasVaultScrubbedRequestPlane(entry))) return null
 
-  const transcriptChallenges = (transcript.hostExpressionChallenges ?? [])
-    .map(ch => oracle.verifyExpressionChallenge(ch))
-    .filter((ch): ch is HostMintedExpressionChallenge => ch !== null)
-
   const bodyOf = (step: ImpactStep): string =>
     typeof step.body === 'string' ? step.body : step.json !== undefined ? JSON.stringify(step.json) : ''
-  const requestTextOf = (entry: ReceiptTranscriptEntry): string => {
-    const parts = [
-      entry.step.pathAndQuery ?? '',
-      entry.step.requestJson !== undefined
-        ? (typeof entry.step.requestJson === 'string' ? entry.step.requestJson : JSON.stringify(entry.step.requestJson))
-        : '',
-      entry.step.requestHeaders ? JSON.stringify(entry.step.requestHeaders) : '',
-    ]
-    const raw = parts.join('\n')
-    try { return `${raw}\n${decodeURIComponent(raw)}` } catch { return raw }
-  }
-  const controlBodies = controls.map(c => bodyOf(c.step)).join('\n')
+  const controlBodies = controls.map(c => bodyOf(c.step))
   const targetOrigin = normalizeOrigin(receipt.target.origin)
 
   const verifiedProbes: Array<{
@@ -2769,20 +3562,11 @@ function verifyEvaluatedExpression(
   for (const probe of probes) {
     const probeOrigin = probe.origin ? normalizeOrigin(probe.origin) : targetOrigin
     if (probeOrigin !== targetOrigin) continue
+    // R4-C-2: Per-exchange hostExpressionChallenge stamp is strictly mandatory (no transcript fallback).
+    if (!probe.hostExpressionChallenge) continue
     const probeMethod = probe.step.method.toUpperCase()
     const probeRoute = routeOf(probe.step)
     const probePersona = (probe.step.actor.handle ?? '').trim().toLowerCase()
-    const probeBody = bodyOf(probe.step)
-    const probeReqText = requestTextOf(probe)
-
-    const candidateChallenges: HostMintedExpressionChallenge[] = []
-    if (probe.hostExpressionChallenge) {
-      const verified = oracle.verifyExpressionChallenge(probe.hostExpressionChallenge)
-      if (verified) candidateChallenges.push(verified)
-    } else {
-      candidateChallenges.push(...transcriptChallenges)
-    }
-    if (candidateChallenges.length === 0) continue
 
     const matchingControl = controls.find(control => {
       const ctlOrigin = control.origin ? normalizeOrigin(control.origin) : targetOrigin
@@ -2800,17 +3584,22 @@ function verifyEvaluatedExpression(
     if (!matchingControl) continue
     const differingParam = diffRequestParams(matchingControl, probe).differingKeys[0]!
 
-    for (const challenge of candidateChallenges) {
-      if (!expressionClassCompatibleWithFamily(receipt.vulnClass, challenge.family)) continue
-      if (!probeCarriesExpressionWithOperands(probeReqText, challenge)) continue
-      const marker = challenge.expectedOutput
-      if (!probeBody.includes(marker)) continue
-      if (controlBodies.includes(marker)) continue
-      // Anti-reflection: expected output must not appear verbatim in the probe request.
-      if (probeReqText.includes(marker)) continue
-      verifiedProbes.push({ probe, control: matchingControl, challenge, param: differingParam })
-      break
-    }
+    const check = verifyHostExpressionProbe({
+      probeRequest: {
+        pathAndQuery: probe.step.pathAndQuery,
+        requestBody: requestBodyOfEntry(probe),
+        requestJson: probe.step.requestJson,
+        requestHeaders: probe.step.requestHeaders,
+      },
+      probeBody: bodyOf(probe.step),
+      probeStatus: probe.step.status,
+      controlBodies,
+      stampedChallenge: probe.hostExpressionChallenge,
+      vulnClass: receipt.vulnClass,
+      oracle,
+    })
+    if (!check.ok || !check.challenge) continue
+    verifiedProbes.push({ probe, control: matchingControl, challenge: check.challenge, param: differingParam })
   }
 
   if (verifiedProbes.length === 0) return null
@@ -2997,6 +3786,207 @@ function entryToSignedUrlMintExchange(entry: ReceiptTranscriptEntry, fallbackOri
   }
 }
 
+const SIGNED_URL_SIG_PARAM_RE = /^(?:x-goog-signature|x-amz-signature|signature|sig)$/i
+const SIGNED_URL_INLINE_RE = /https?:\/\/[^\s"'<>\\]+/gi
+
+function extractSignedUrlNeedlesFromResponse(exchange: SignedUrlMintExchange): string[] {
+  const haystacks: string[] = []
+  if (typeof exchange.responseBody === 'string' && exchange.responseBody) haystacks.push(exchange.responseBody)
+  if (exchange.responseJson !== undefined) {
+    try { haystacks.push(JSON.stringify(exchange.responseJson)) } catch { /* ignore */ }
+  }
+  if (exchange.responseHeaders) {
+    for (const v of Object.values(exchange.responseHeaders)) {
+      if (v) haystacks.push(v)
+    }
+  }
+  const needles = new Set<string>()
+  for (const text of haystacks) {
+    SIGNED_URL_INLINE_RE.lastIndex = 0
+    let m: RegExpExecArray | null
+    while ((m = SIGNED_URL_INLINE_RE.exec(text)) !== null) {
+      const rawUrl = m[0].replace(/[),.;]+$/, '')
+      if (rawUrl.length >= 24) needles.add(rawUrl)
+      try {
+        const parsed = new URL(rawUrl)
+        for (const [k, v] of parsed.searchParams.entries()) {
+          if (SIGNED_URL_SIG_PARAM_RE.test(k) && v.length >= 16) {
+            needles.add(v)
+            try {
+              const dec = decodeURIComponent(v)
+              if (dec.length >= 16) needles.add(dec)
+            } catch { /* keep raw */ }
+          }
+        }
+      } catch { /* ignore malformed URL */ }
+    }
+  }
+  return [...needles]
+}
+
+function carrierEchoesSignedUrlNeedle(carrier: NormalizedRequestCarrier, needles: readonly string[]): boolean {
+  if (carrier.malformedEscape) return true
+  if (needles.length === 0) return false
+  const normalizedNeedles = needles.map(n => ({
+    raw: n,
+    cleaned: stripInertSanitizerChars(n),
+  }))
+  const allComponents = [...carrier.inputComponents, ...carrier.transportHeaderComponents, carrier.combinedDecoded]
+  for (const comp of allComponents) {
+    if (!comp) continue
+    const cleaned = stripInertSanitizerChars(comp)
+    for (const needle of normalizedNeedles) {
+      if (comp.includes(needle.raw) || cleaned.includes(needle.cleaned)) return true
+    }
+  }
+  return false
+}
+
+function probeHasTraversalOrSeparatorDifferential(
+  ctlCarrier: NormalizedRequestCarrier,
+  prbCarrier: NormalizedRequestCarrier,
+): boolean {
+  const ctlSet = new Set(ctlCarrier.inputComponents.map(c => c.toLowerCase()))
+  const SEP_OR_TRAV_RE = /(?:\.\.|[\\/])/
+  return prbCarrier.inputComponents.some(comp => !ctlSet.has(comp.toLowerCase()) && SEP_OR_TRAV_RE.test(comp))
+}
+
+/**
+ * R4-C-6: Hardened kernel verification primitive for `signed_url_mint` differential proofs.
+ * Shared by `verifySignedUrlMintReceipt()` (`proof-receipt.ts`) and `evaluateClaim('composite_receipt')`
+ * (`verify-claims.ts`) so both paths enforce:
+ *  - fail-closed per-component carrier normalization on BOTH control & probe (rejecting malformed percent & JSON unicode escapes),
+ *  - fail-closed BOTH-arm echo check against decoded/unescaped carriers,
+ *  - Variant A (`key_traversal`): same persona/session on both arms, non-host/bucket-only escape, and traversal/separator construct in probe input,
+ *  - Variant B (`unauth_write_mint`): strictly 401/403 authentication-denied control (never 400/422 validation error).
+ */
+export function verifySignedUrlMintPair(input: {
+  control: SignedUrlMintExchange
+  probe: SignedUrlMintExchange
+  controlSessionId?: string | null
+  probeSessionId?: string | null
+}): {
+  confirmed: boolean
+  reason: string
+  rejectedBy: string | null
+  missingEvidence: string[]
+  evidence: Record<string, unknown>
+} {
+  const { control, probe } = input
+  const ctlCarrier = normalizeRequestCarrier({
+    pathAndQuery: control.pathAndQuery,
+    requestBody: control.requestBody ?? null,
+    requestJson: control.requestJson,
+    requestHeaders: control.requestHeaders ?? null,
+  })
+  const prbCarrier = normalizeRequestCarrier({
+    pathAndQuery: probe.pathAndQuery,
+    requestBody: probe.requestBody ?? null,
+    requestJson: probe.requestJson,
+    requestHeaders: probe.requestHeaders ?? null,
+  })
+  if (ctlCarrier.malformedEscape || prbCarrier.malformedEscape) {
+    const reason = ctlCarrier.malformedEscape
+      ? `Signed-URL control request contained a malformed escape (${ctlCarrier.malformedReason}); anti-reflection fails closed.`
+      : `Signed-URL probe request contained a malformed escape (${prbCarrier.malformedReason}); anti-reflection fails closed.`
+    return {
+      confirmed: false,
+      reason,
+      rejectedBy: 'signed_url_malformed_request_carrier',
+      missingEvidence: ['clean_request_carrier'],
+      evidence: { controlStatus: control.status, probeStatus: probe.status },
+    }
+  }
+  const probeNeedles = extractSignedUrlNeedlesFromResponse(probe)
+  if (carrierEchoesSignedUrlNeedle(prbCarrier, probeNeedles)) {
+    return {
+      confirmed: false,
+      reason: 'Signed-URL probe signature or URL was echoed from the normalized probe request carrier (including URL/JSON-unicode escapes).',
+      rejectedBy: 'signed_url_echoed',
+      missingEvidence: ['server_generated_signature'],
+      evidence: { controlStatus: control.status, probeStatus: probe.status },
+    }
+  }
+  const ctlNeedles = extractSignedUrlNeedlesFromResponse(control)
+  if (carrierEchoesSignedUrlNeedle(ctlCarrier, ctlNeedles)) {
+    return {
+      confirmed: false,
+      reason: 'Signed-URL control signature or URL was echoed from the normalized control request carrier.',
+      rejectedBy: 'signed_url_control_echoed',
+      missingEvidence: ['server_generated_control_signature'],
+      evidence: { controlStatus: control.status, probeStatus: probe.status },
+    }
+  }
+
+  const assessment = assessSignedUrlMintDifferential({ control, probe })
+  if (!assessment.confirmed) {
+    return {
+      confirmed: false,
+      reason: assessment.reason,
+      rejectedBy: assessment.rejectedBy ?? 'signed_url_mint',
+      missingEvidence: assessment.missingEvidence,
+      evidence: assessment.evidence,
+    }
+  }
+
+  if (assessment.variant === 'key_traversal') {
+    const ctlPersona = normalizedAuthHandle(control.actorHandle ?? control.wireCredentialProvenance?.personaHandle)
+    const prbPersona = normalizedAuthHandle(probe.actorHandle ?? probe.wireCredentialProvenance?.personaHandle)
+    const ctlSess = input.controlSessionId ?? control.wireCredentialProvenance?.session ?? null
+    const prbSess = input.probeSessionId ?? probe.wireCredentialProvenance?.session ?? null
+    const ctlAuthed = Boolean(ctlPersona || ctlSess || control.wireCredentialProvenance?.authenticated)
+    const prbAuthed = Boolean(prbPersona || prbSess || probe.wireCredentialProvenance?.authenticated)
+    if (ctlPersona !== prbPersona || ctlSess !== prbSess || ctlAuthed !== prbAuthed) {
+      return {
+        confirmed: false,
+        reason: `Signed-URL key_traversal rejected (R4-C-6): control (${ctlPersona ?? 'anon'}) and probe (${prbPersona ?? 'anon'}) must execute under the exact same persona/session.`,
+        rejectedBy: 'signed_url_persona_mismatch',
+        missingEvidence: ['same_persona_control_and_probe'],
+        evidence: assessment.evidence,
+      }
+    }
+    const escapeKind = String(assessment.evidence.escapeKind ?? '')
+    if (escapeKind === 'host_escape' || escapeKind === 'bucket_escape') {
+      return {
+        confirmed: false,
+        reason: `Signed-URL key_traversal rejected (R4-C-6): host/bucket differences (${escapeKind}) alone are non-evidence without a bound prefix traversal.`,
+        rejectedBy: 'signed_url_host_or_bucket_non_evidence',
+        missingEvidence: ['bound_prefix_traversal'],
+        evidence: assessment.evidence,
+      }
+    }
+    if (!probeHasTraversalOrSeparatorDifferential(ctlCarrier, prbCarrier)) {
+      return {
+        confirmed: false,
+        reason: 'Signed-URL key_traversal rejected (R4-C-6): probe input contains no differing traversal or path-separator construct (benign multi-folder presign is not CWE-22).',
+        rejectedBy: 'signed_url_no_traversal_input',
+        missingEvidence: ['traversal_or_separator_input'],
+        evidence: assessment.evidence,
+      }
+    }
+  }
+
+  if (assessment.variant === 'unauth_write_mint') {
+    if (control.status !== 401 && control.status !== 403) {
+      return {
+        confirmed: false,
+        reason: `Signed-URL unauth_write_mint rejected (R4-C-6): negative control must be an authentication/authorization denial (401/403), not ${control.status ?? 'null'} (validation errors on public presign endpoints are not CWE-306).`,
+        rejectedBy: 'signed_url_control_not_auth_denied',
+        missingEvidence: ['auth_denied_401_or_403_control'],
+        evidence: assessment.evidence,
+      }
+    }
+  }
+
+  return {
+    confirmed: true,
+    reason: assessment.reason,
+    rejectedBy: null,
+    missingEvidence: [],
+    evidence: assessment.evidence,
+  }
+}
+
 function verifySignedUrlMintReceipt(
   receipt: ProofReceipt,
   entriesById: ReadonlyMap<string, ReceiptTranscriptEntry>,
@@ -3024,9 +4014,11 @@ function verifySignedUrlMintReceipt(
   if (probe.origin && normalizeOrigin(probe.origin) !== targetOrigin) {
     return reject(receipt, rule, 'Signed-URL probe origin does not match the receipt target.')
   }
-  const assessment = assessSignedUrlMintDifferential({
+  const assessment = verifySignedUrlMintPair({
     control: entryToSignedUrlMintExchange(control, receipt.target.origin),
     probe: entryToSignedUrlMintExchange(probe, receipt.target.origin),
+    controlSessionId: control.sessionId ?? null,
+    probeSessionId: probe.sessionId ?? null,
   })
   if (!assessment.confirmed) {
     return {
@@ -3112,6 +4104,8 @@ export interface ScriptProofExchange {
   hostExpressionChallenge?: HostMintedExpressionChallenge
   /** H-15: Host-minted timing delay challenge bound to this exchange. */
   hostTimingChallenge?: HostMintedTimingChallenge
+  /** R4-C-1: Host-minted boolean predicate pair arm bound to this exchange. */
+  hostBooleanPair?: HostStampedBooleanPair
   /** R2-H-13: Host-minted redirect canary host bound to this exchange. */
   hostRedirectCanaryHost?: string | null
   /** Host-recorded OOB or structured artifact (for `op: 'oob'` mint/wait/check records). */

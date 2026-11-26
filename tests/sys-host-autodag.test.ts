@@ -760,9 +760,19 @@ interface HeeStoreFixture {
   probeIds: string[]
 }
 
-function buildHeeStoreFixture(probeBodies: string[], probeStatus = 200): HeeStoreFixture {
+function buildHeeStoreFixture(
+  probeBodies: string[],
+  probeStatus = 200,
+  challenges: Array<ReturnType<typeof defaultHostMintedOracle.mintExpressionChallenge>> = [],
+): HeeStoreFixture {
   const store = new TranscriptStore()
-  const mk = (role: 'control' | 'probe', body: string, status: number, rawRequestBody?: string) => {
+  const mk = (
+    role: 'control' | 'probe',
+    body: string,
+    status: number,
+    rawRequestBody?: string,
+    hostExpressionChallenge?: ReturnType<typeof defaultHostMintedOracle.mintExpressionChallenge>,
+  ) => {
     const request = {
       origin: ORIGIN,
       method: role === 'probe' ? 'POST' : 'GET',
@@ -788,12 +798,14 @@ function buildHeeStoreFixture(probeBodies: string[], probeStatus = 200): HeeStor
       },
       body,
       ...(typeof rawRequestBody === 'string' ? { rawRequestBody } : {}),
+      ...(hostExpressionChallenge ? { hostExpressionChallenge } : {}),
     })
   }
   const control = mk('control', JSON.stringify({ rendered: 'welcome page for the member dashboard template' }), 200)
   const probes = probeBodies.map((body, i) => {
-    const rawRequestBody = JSON.stringify({ template: `{{ member_template_slot_${i} }}`, note: `render request ${i}` })
-    return mk('probe', body, probeStatus, rawRequestBody)
+    const ch = challenges[i]
+    const rawRequestBody = JSON.stringify({ template: ch ? `{{ ${ch.expressionSyntax} }}` : `{{ member_template_slot_${i} }}`, note: `render request ${i}` })
+    return mk('probe', body, probeStatus, rawRequestBody, ch)
   })
   return { store, controlId: control.exchangeId, probeIds: probes.map(p => p.exchangeId) }
 }
@@ -802,7 +814,7 @@ test('host_evaluated_expression: host-minted challenge oracle verifies computed 
   // (a) Single host-minted challenge: probe computes it, control does not leak it, request never echoes it.
   const ch = defaultHostMintedOracle.mintExpressionChallenge('ssti')
   const probeBody = JSON.stringify({ rendered: `rendered marker ${ch.expectedOutput} ok` })
-  const fx = buildHeeStoreFixture([probeBody])
+  const fx = buildHeeStoreFixture([probeBody], 200, [ch])
   const claim = {
     kind: 'host_evaluated_expression' as const,
     controlIds: [fx.controlId],
@@ -824,7 +836,12 @@ test('host_evaluated_expression: host-minted challenge oracle verifies computed 
   // (c) Control leakage: the computed output appears in the control body -> fail closed.
   const leakyControlBody = JSON.stringify({ rendered: `cached banner ${ch.expectedOutput}` })
   const leakStore = new TranscriptStore()
-  const mkLeak = (role: 'control' | 'probe', body: string, rawRequestBody?: string) => {
+  const mkLeak = (
+    role: 'control' | 'probe',
+    body: string,
+    rawRequestBody?: string,
+    hostExpressionChallenge?: ReturnType<typeof defaultHostMintedOracle.mintExpressionChallenge>,
+  ) => {
     const request = {
       origin: ORIGIN, method: role === 'probe' ? 'POST' : 'GET',
       pathAndQuery: role === 'probe' ? '/api/v1/render' : '/api/v1/render?view=control',
@@ -835,10 +852,11 @@ test('host_evaluated_expression: host-minted challenge oracle verifies computed 
       op: 'http' as const, startedAt: 1000, durationMs: 5, request,
       response: { status: 200, headers: {}, bodyBytes: Buffer.byteLength(body), bodySha256: sha256Hex(body), mediaType: 'application/json' },
       body, ...(rawRequestBody !== undefined ? { rawRequestBody } : {}),
+      ...(hostExpressionChallenge ? { hostExpressionChallenge } : {}),
     })
   }
   const leakCtl = mkLeak('control', leakyControlBody)
-  const leakPrb = mkLeak('probe', probeBody, JSON.stringify({ template: '{{ member_template_slot }}' }))
+  const leakPrb = mkLeak('probe', probeBody, JSON.stringify({ template: `{{ ${ch.expressionSyntax} }}` }), ch)
   const leakRes = evaluateClaim(leakStore, {
     kind: 'host_evaluated_expression', controlIds: [leakCtl.exchangeId], probeIds: [leakPrb.exchangeId],
     hostMintedChallengeIds: [ch.challengeId],
@@ -846,7 +864,7 @@ test('host_evaluated_expression: host-minted challenge oracle verifies computed 
   assert.equal(leakRes.passed, false, 'control-arm leakage of the computed output must fail')
 
   // (d) Reflection: the computed output echoed in the probe request -> fail closed.
-  const reflectStore = buildHeeStoreFixture([probeBody])
+  const reflectStore = buildHeeStoreFixture([probeBody], 200, [ch])
   const reflectProbe = reflectStore.store.record({
     op: 'http' as const, startedAt: 1000, durationMs: 5,
     request: {
@@ -855,7 +873,8 @@ test('host_evaluated_expression: host-minted challenge oracle verifies computed 
     },
     response: { status: 200, headers: {}, bodyBytes: Buffer.byteLength(probeBody), bodySha256: sha256Hex(probeBody), mediaType: 'application/json' },
     body: probeBody,
-    rawRequestBody: JSON.stringify({ template: `{{ marker_${ch.expectedOutput} }}` }),
+    rawRequestBody: JSON.stringify({ template: `{{ ${ch.expressionSyntax} }} marker_${ch.expectedOutput}` }),
+    hostExpressionChallenge: ch,
   })
   const reflectRes = evaluateClaim(reflectStore.store, {
     kind: 'host_evaluated_expression', controlIds: [reflectStore.controlId], probeIds: [reflectProbe.exchangeId],
@@ -864,10 +883,10 @@ test('host_evaluated_expression: host-minted challenge oracle verifies computed 
   assert.equal(reflectRes.passed, false, 'reflected (request-echoed) output must fail')
 
   // (e) Non-2xx probe or missing computed output fail closed.
-  const errFx = buildHeeStoreFixture([JSON.stringify({ rendered: 'nothing computed here' })], 500)
+  const errFx = buildHeeStoreFixture([JSON.stringify({ rendered: 'nothing computed here' })], 500, [ch])
   const errRes = evaluateClaim(errFx.store, { ...claim, probeIds: errFx.probeIds }, {})
   assert.equal(errRes.passed, false, 'non-2xx probes must fail')
-  const absentFx = buildHeeStoreFixture([JSON.stringify({ rendered: 'no marker at all' })])
+  const absentFx = buildHeeStoreFixture([JSON.stringify({ rendered: 'no marker at all' })], 200, [ch])
   const absentRes = evaluateClaim(absentFx.store, { ...claim, probeIds: absentFx.probeIds }, {})
   assert.equal(absentRes.passed, false, 'absent computed output must fail')
 })
@@ -879,7 +898,7 @@ test('host_evaluated_expression: varying multi-challenge operands pass, repeated
   const fx = buildHeeStoreFixture([
     JSON.stringify({ rendered: `marker a ${ch1.expectedOutput}` }),
     JSON.stringify({ rendered: `marker b ${ch2.expectedOutput}` }),
-  ])
+  ], 200, [ch1, ch2])
   const claim = {
     kind: 'host_evaluated_expression' as const,
     controlIds: [fx.controlId],

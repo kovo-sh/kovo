@@ -16,7 +16,7 @@ import {
 import type { AmbientAuth, BoundaryClass, ImpactClass, ImpactStep, InjectionFamily, InjectionFamilyScope, ActorIdentity } from './oracle-invariants.ts'
 import { isJobOrHandleStub } from './v8-oracle-families.ts'
 import { deriveRecordAuthMeta, resolveCanonicalArm, stepHasRedactedRequestPlane, type HostFactLog } from './host-fact-log.ts'
-import { defaultHostMintedOracle } from './proof-receipt.ts'
+import { defaultHostMintedOracle, normalizeRequestCarrier, verifyHostExpressionProbe, verifySignedUrlMintPair, type HostMintedExpressionChallenge, type HostStampedBooleanPair } from './proof-receipt.ts'
 import { compileSafeClaimRegex, MAX_CLAIM_REGEX_HAYSTACK } from './safe-regex.ts'
 export { compileSafeClaimRegex } from './safe-regex.ts'
 
@@ -105,6 +105,8 @@ export interface VerifyTranscriptRecord {
   request?: VerifyTranscriptRequest
   response?: VerifyTranscriptResponse
   artifact?: VerifyTranscriptArtifact
+  hostExpressionChallenge?: HostMintedExpressionChallenge
+  hostBooleanPair?: HostStampedBooleanPair
   error?: string
   errorCode?: 'denied' | 'failed' | 'approval_required'
   signature: string
@@ -207,6 +209,8 @@ export class TranscriptStore {
     request?: VerifyTranscriptRequest
     response?: VerifyTranscriptResponse
     artifact?: VerifyTranscriptArtifact
+    hostExpressionChallenge?: HostMintedExpressionChallenge
+    hostBooleanPair?: HostStampedBooleanPair
     error?: string
     errorCode?: 'denied' | 'failed' | 'approval_required'
     body?: string
@@ -223,6 +227,8 @@ export class TranscriptStore {
       ...(input.request ? { request: input.request } : {}),
       ...(input.response ? { response: input.response } : {}),
       ...(input.artifact ? { artifact: input.artifact } : {}),
+      ...(input.hostExpressionChallenge ? { hostExpressionChallenge: input.hostExpressionChallenge } : {}),
+      ...(input.hostBooleanPair ? { hostBooleanPair: input.hostBooleanPair } : {}),
       ...(input.error ? { error: input.error.slice(0, 1024) } : {}),
       ...(input.errorCode ? { errorCode: input.errorCode } : {}),
     }
@@ -1062,6 +1068,11 @@ function evaluateBoundaryClaim(store: TranscriptStore, claim: Extract<VerifyClai
   if (assessment.required && assessment.satisfied) {
     const stub = detectIntermediateStub(store.get(claim.probeExchangeId), store.body(claim.probeExchangeId))
     if (stub.isStub) return stubRejection(claim, stub.state, assessment.evidence)
+    const ctlHdrs = Object.fromEntries(Object.entries(control.requestHeaders ?? {}).map(([k, v]) => [k.toLowerCase(), v.trim()]))
+    const prbHdrs = Object.fromEntries(Object.entries(probe.requestHeaders ?? {}).map(([k, v]) => [k.toLowerCase(), v.trim()]))
+    if (claim.boundaryClass !== 'access' && Object.entries(ctlHdrs).some(([k, v]) => v.length > 0 && (/^(?:authorization|proxy-authorization|cookie|x-api-key|x-auth.*)$/.test(k) && (!prbHdrs[k] || /kovo-synth-invalid-/i.test(v))))) {
+      return { claim, passed: false, detail: 'Auth boundary claim rejected (R4-H-7): control carried an extra or synthetic invalid credential absent from probe (self-sabotaged control).', observed: { ...assessment.evidence, rejectedBy: 'self_sabotaged_control' } }
+    }
     const anonCtrl = !control.actor.handle && control.actor.auth === 'unknown'
     const authProbe = Boolean(probe.actor.handle) || probe.actor.auth !== 'unknown'
     if (anonCtrl && authProbe && (claim.boundaryClass === 'auth' || isMutatingMethod(probe.method) ||
@@ -1566,28 +1577,21 @@ export function evaluateClaim(
         }
       }
       for (const id of hostRec.exchangeIds) {
-        if (!requireRecord(id)) {
-          return {
-            claim,
-            passed: false,
-            detail: `composite_receipt cites exchange ${id} outside this attempt transcript.`,
-            observed: { confirmed: false, rejectedBy: 'composite_transcript_integrity', missingEvidence: ['attempt_transcript_exchange'] },
-          }
+        if (!requireRecord(id)) return { claim, passed: false, detail: `composite_receipt cites exchange ${id} outside this attempt transcript.`, observed: { confirmed: false, rejectedBy: 'composite_transcript_integrity', missingEvidence: ['attempt_transcript_exchange'] } }
+      }
+      if (/^(?:signed_url_mint|presigned_url_mint|signed_url_traversal|storage_signed_url|gcs_signed_url|s3_presigned_url|azure_sas_mint)$/i.test(hostRec.terminalVulnClass)) {
+        const prbId = hostRec.terminalExchangeId ?? hostRec.exchangeIds[hostRec.exchangeIds.length - 1]
+        const ctlId = hostRec.exchangeIds.find(id => id !== prbId)
+        const toEx = (id: string | undefined) => {
+          if (!id) return null
+          const rec = store.get(id), fact = context.factLog?.getExchange(id)
+          return { exchangeId: id, origin: fact?.origin || rec?.request?.origin || '', method: (fact?.method || rec?.request?.method || 'GET').toUpperCase(), pathAndQuery: fact?.pathAndQuery || rec?.request?.pathAndQuery || '/', status: fact?.status ?? recordStatus(rec), actorHandle: fact?.actor ?? rec?.request?.personaHandle ?? null, requestHeaders: fact?.requestHeaders ?? rec?.request?.headers ?? null, requestBody: fact?.rawRequestBody ?? store.requestBody(id) ?? null, responseHeaders: fact?.responseHeaders ?? rec?.response?.headers ?? null, responseBody: fact?.rawResponseBody ?? store.body(id) ?? null, wireCredentialProvenance: fact?.wireCredentialProvenance ?? null }
         }
+        const ctlEx = toEx(ctlId), prbEx = toEx(prbId)
+        const suCheck = ctlEx && prbEx ? verifySignedUrlMintPair({ control: ctlEx, probe: prbEx, controlSessionId: context.factLog?.getExchange(ctlId!)?.sessionId ?? null, probeSessionId: context.factLog?.getExchange(prbId!)?.sessionId ?? null }) : null
+        if (!suCheck || !suCheck.confirmed) return { claim, passed: false, detail: suCheck?.reason ?? 'signed_url_mint composite_receipt missing distinct control and probe exchanges.', observed: { confirmed: false, rejectedBy: suCheck?.rejectedBy ?? 'signed_url_mint', missingEvidence: suCheck?.missingEvidence ?? ['valid_signed_url_pair'] } }
       }
-      return {
-        claim,
-        passed: true,
-        detail: hostRec.reason,
-        observed: {
-          confirmed: true,
-          chainId: hostRec.chainId,
-          terminalVulnClass: hostRec.terminalVulnClass,
-          replayMode: hostRec.replayMode,
-          hopCount: hostRec.hopCount,
-          verifiedEdgeCount: hostRec.verifiedEdgeCount,
-        },
-      }
+      return { claim, passed: true, detail: hostRec.reason, observed: { confirmed: true, chainId: hostRec.chainId, terminalVulnClass: hostRec.terminalVulnClass, replayMode: hostRec.replayMode, hopCount: hostRec.hopCount, verifiedEdgeCount: hostRec.verifiedEdgeCount } }
     }
     case 'host_evaluated_expression': {
       const verifiedChs = claim.hostMintedChallengeIds.map(id => defaultHostMintedOracle.verifyExpressionChallenge(defaultHostMintedOracle.getExpressionChallenge(id)))
@@ -1600,11 +1604,12 @@ export function evaluateClaim(
       const ctlBodies = claim.controlIds.map(id => store.body(id) ?? ''), prbBodies = claim.probeIds.map(id => store.body(id) ?? '')
       const outputs = chs.map(c => c.expectedOutput), varying = outputs.length < 2 || new Set(outputs).size === outputs.length
       const matched = chs.length === prbBodies.length && chs.every((ch, i) => {
-        const pb = prbBodies[i]!, reqText = `${prbRecs[i]?.request?.pathAndQuery ?? ''}\n${store.requestBody(claim.probeIds[i]!) ?? ''}`
-        return pb.includes(ch.expectedOutput) && outputs.every((o, j) => j === i || !pb.includes(o)) && !ctlBodies.some(cb => cb.includes(ch.expectedOutput)) && !reqText.includes(ch.expectedOutput)
+        const pid = claim.probeIds[i]!, fact = context.factLog?.getExchange(pid), prbRec = prbRecs[i]!
+        const check = verifyHostExpressionProbe({ probeRequest: { pathAndQuery: fact?.pathAndQuery ?? prbRec.request?.pathAndQuery, requestBody: fact?.rawRequestBody ?? store.requestBody(pid) ?? null, requestHeaders: fact?.requestHeaders ?? prbRec.request?.headers ?? null }, probeBody: prbBodies[i]!, probeStatus: recordStatus(prbRec), controlBodies: ctlBodies, stampedChallenge: fact?.hostExpressionChallenge ?? prbRec.hostExpressionChallenge, expectedChallengeId: ch.challengeId, vulnClass: claim.vulnClass })
+        return check.ok && outputs.every((o, j) => j === i || !prbBodies[i]!.includes(o))
       })
       const passed = ctlRecs.every(ok2xx) && prbRecs.every(ok2xx) && varying && matched
-      return { claim, passed, detail: passed ? `Host-minted ${chs[0]!.family} expression evaluation verified across ${chs.length} challenge(s).` : 'Host-minted evaluated-expression verification failed (missing 2xx, non-varying operands, control leakage, reflection, or absent computed output).', observed: { passed, family: chs[0]!.family, challengeCount: chs.length, vulnClass: claim.vulnClass ?? null } }
+      return { claim, passed, detail: passed ? `Host-minted ${chs[0]!.family} expression evaluation verified across ${chs.length} challenge(s).` : 'Host-minted evaluated-expression verification failed (missing per-exchange stamp, malformed escape, non-varying operands, control leakage, reflection, or absent computed output).', observed: { passed, family: chs[0]!.family, challengeCount: chs.length, vulnClass: claim.vulnClass ?? null } }
     }
     default:
       return { claim, passed: false, detail: 'Unsupported claim.' }
@@ -1812,10 +1817,8 @@ export function evaluateClaims(store: TranscriptStore, claims: readonly VerifyCl
     const hasActiveMarkupClaim = checks.some(c => c.passed && c.claim.kind === 'body_contains' && !c.claim.absent && ACTIVE_MARKUP_RE.test(c.claim.text))
     const hasSelfEchoClaim = checks.some(c => {
       if (!c.passed || c.claim.kind !== 'body_contains' || c.claim.absent || c.claim.text.length < 4) return false
-      const reqStr = `${store.get(c.claim.exchangeId)?.request?.pathAndQuery ?? ''}\n${store.requestBody(c.claim.exchangeId) ?? ''}`
-      let decoded = reqStr
-      try { decoded = decodeURIComponent(reqStr.replace(/\+/g, ' ')) } catch { /* keep raw */ }
-      return (reqStr.includes(c.claim.text) || decoded.includes(c.claim.text)) && statusSteps.some(s => s.arm === 'control')
+      const norm = normalizeRequestCarrier({ pathAndQuery: store.get(c.claim.exchangeId)?.request?.pathAndQuery, requestBody: store.requestBody(c.claim.exchangeId) ?? null })
+      return (norm.malformedEscape || norm.combinedDecoded.includes(c.claim.text)) && statusSteps.some(s => s.arm === 'control')
     })
     const ctrls = statusSteps.filter(s => s.arm === 'control'), prbs = statusSteps.filter(s => s.arm === 'probe')
     const hasAuthzShape = ctrls.length > 0 && prbs.length > 0 && (

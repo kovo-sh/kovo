@@ -32,6 +32,7 @@ import {
 import {
   buildAgentScriptReceipt,
   buildProofReceipt,
+  defaultHostMintedOracle,
   proofReceiptMode as canonicalProofReceiptMode,
   type ScriptProofExchange,
 } from '../src/server/proof-receipt.ts'
@@ -162,15 +163,15 @@ test('TerminalOracleRegistry: dispatches single-hop ProofReceipt rules (incl. 1-
 
   // 3a. Single-hop form-encoded boolean differential (3-arm baseline/true/false triangle) via HostFactLog + TerminalOracleRegistry
   const formLog = new HostFactLog()
-  const formBase = 'q=1'
-  const formTrue = 'q=1%27+AND+7919%3D7919--+-'
-  const formFalse = 'q=1%27+AND+7919%3D7920--+-'
-  formLog.recordExchange({ seq: 1, exchangeId: 'b1', arm: 'control', evidenceRole: 'benign_baseline', method: 'POST', origin: ORIGIN, pathAndQuery: '/bool-form', status: 200, requestHeaders: { 'content-type': 'application/x-www-form-urlencoded' }, rawRequestBody: formBase, rawResponseBody: '{"rows":["a","b","c"]}' })
-  formLog.recordExchange({ seq: 2, exchangeId: 'c1', arm: 'control', evidenceRole: 'tautology', method: 'POST', origin: ORIGIN, pathAndQuery: '/bool-form', status: 200, requestHeaders: { 'content-type': 'application/x-www-form-urlencoded' }, rawRequestBody: formTrue, rawResponseBody: '{"rows":["a","b","c"]}' })
-  formLog.recordExchange({ seq: 3, exchangeId: 'p1', arm: 'probe', evidenceRole: 'contradiction', method: 'POST', origin: ORIGIN, pathAndQuery: '/bool-form', status: 200, requestHeaders: { 'content-type': 'application/x-www-form-urlencoded' }, rawRequestBody: formFalse, rawResponseBody: '{"rows":[]}' })
-  formLog.recordExchange({ seq: 4, exchangeId: 'b2', arm: 'control', evidenceRole: 'benign_baseline', method: 'POST', origin: ORIGIN, pathAndQuery: '/bool-form', status: 200, requestHeaders: { 'content-type': 'application/x-www-form-urlencoded' }, rawRequestBody: formBase, rawResponseBody: '{"rows":["a","b","c"]}' })
-  formLog.recordExchange({ seq: 5, exchangeId: 'c2', arm: 'control', evidenceRole: 'tautology', method: 'POST', origin: ORIGIN, pathAndQuery: '/bool-form', status: 200, requestHeaders: { 'content-type': 'application/x-www-form-urlencoded' }, rawRequestBody: formTrue, rawResponseBody: '{"rows":["a","b","c"]}' })
-  formLog.recordExchange({ seq: 6, exchangeId: 'p2', arm: 'probe', evidenceRole: 'contradiction', method: 'POST', origin: ORIGIN, pathAndQuery: '/bool-form', status: 200, requestHeaders: { 'content-type': 'application/x-www-form-urlencoded' }, rawRequestBody: formFalse, rawResponseBody: '{"rows":[]}' })
+  const formPair1 = defaultHostMintedOracle.mintBooleanPair('1', { param: 'q', style: 'single_quote' })
+  const formPair2 = defaultHostMintedOracle.mintBooleanPair('1', { param: 'q', style: 'single_quote' })
+  const encodeForm = (v: string) => new URLSearchParams({ q: v }).toString()
+  formLog.recordExchange({ seq: 1, exchangeId: 'b1', arm: 'control', evidenceRole: 'benign_baseline', hostBooleanPair: defaultHostMintedOracle.stampBooleanPairArm(formPair1, 'baseline'), method: 'POST', origin: ORIGIN, pathAndQuery: '/bool-form', status: 200, requestHeaders: { 'content-type': 'application/x-www-form-urlencoded' }, rawRequestBody: encodeForm(formPair1.baseValue), rawResponseBody: '{"rows":["a","b","c"]}' })
+  formLog.recordExchange({ seq: 2, exchangeId: 'c1', arm: 'control', evidenceRole: 'tautology', hostBooleanPair: defaultHostMintedOracle.stampBooleanPairArm(formPair1, 'true'), method: 'POST', origin: ORIGIN, pathAndQuery: '/bool-form', status: 200, requestHeaders: { 'content-type': 'application/x-www-form-urlencoded' }, rawRequestBody: encodeForm(formPair1.trueValue), rawResponseBody: '{"rows":["a","b","c"]}' })
+  formLog.recordExchange({ seq: 3, exchangeId: 'p1', arm: 'probe', evidenceRole: 'contradiction', hostBooleanPair: defaultHostMintedOracle.stampBooleanPairArm(formPair1, 'false'), method: 'POST', origin: ORIGIN, pathAndQuery: '/bool-form', status: 200, requestHeaders: { 'content-type': 'application/x-www-form-urlencoded' }, rawRequestBody: encodeForm(formPair1.falseValue), rawResponseBody: '{"rows":[]}' })
+  formLog.recordExchange({ seq: 4, exchangeId: 'b2', arm: 'control', evidenceRole: 'benign_baseline', hostBooleanPair: defaultHostMintedOracle.stampBooleanPairArm(formPair2, 'baseline'), method: 'POST', origin: ORIGIN, pathAndQuery: '/bool-form', status: 200, requestHeaders: { 'content-type': 'application/x-www-form-urlencoded' }, rawRequestBody: encodeForm(formPair2.baseValue), rawResponseBody: '{"rows":["a","b","c"]}' })
+  formLog.recordExchange({ seq: 5, exchangeId: 'c2', arm: 'control', evidenceRole: 'tautology', hostBooleanPair: defaultHostMintedOracle.stampBooleanPairArm(formPair2, 'true'), method: 'POST', origin: ORIGIN, pathAndQuery: '/bool-form', status: 200, requestHeaders: { 'content-type': 'application/x-www-form-urlencoded' }, rawRequestBody: encodeForm(formPair2.trueValue), rawResponseBody: '{"rows":["a","b","c"]}' })
+  formLog.recordExchange({ seq: 6, exchangeId: 'p2', arm: 'probe', evidenceRole: 'contradiction', hostBooleanPair: defaultHostMintedOracle.stampBooleanPairArm(formPair2, 'false'), method: 'POST', origin: ORIGIN, pathAndQuery: '/bool-form', status: 200, requestHeaders: { 'content-type': 'application/x-www-form-urlencoded' }, rawRequestBody: encodeForm(formPair2.falseValue), rawResponseBody: '{"rows":[]}' })
   const formReceipt = buildProofReceipt({
     vulnClass: 'sqli',
     target: { origin: ORIGIN, method: 'POST', pathAndQuery: '/bool-form', param: 'q' },

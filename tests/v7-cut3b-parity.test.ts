@@ -24,7 +24,7 @@ import {
 } from '../src/server/floor-recipe-engine.ts'
 import { floorRecipe, runFloorRecipe, wiredRecipeForSpecKind } from '../src/server/floor-recipes.ts'
 import type { BooleanOrTimingArgs, AccessBoundaryArgs, PersistedMutationArgs } from '../src/server/floor-recipes.ts'
-import { receiptRuleFor, verifyReceipt } from '../src/server/proof-receipt.ts'
+import { defaultHostMintedOracle, receiptRuleFor, verifyReceipt } from '../src/server/proof-receipt.ts'
 import type { ImpactStep, ReceiptTranscript, ReceiptTranscriptEntry } from '../src/server/proof-receipt.ts'
 import type { EngineHypothesis } from '../src/server/deterministic-specs.ts'
 import type { DifferentialResult } from '../src/server/surface-engine.ts'
@@ -80,36 +80,46 @@ function statusTriangle(options: {
   const entries: ReceiptTranscriptEntry[] = []
   const exchangeIds: string[] = []
   for (let round = 0; round < rounds; round += 1) {
-    const arms: Triplet = {
-      benign: {
-        id: `b${round}`, arm: 'control', method: 'GET', status: options.benignStatus ?? 200,
-        route: '/api/search',
-        pathAndQuery: `/api/search?q=widget&k${round}=${round}`,
-        body: JSON.stringify({ rows: [{ id: 1 }], message: 'ok' }),
-        evidenceRole: 'benign_baseline',
+    const pair = defaultHostMintedOracle.mintBooleanPair('widget', { param: 'q', style: 'single_quote' })
+    const arms: Array<{ spec: Parameters<typeof step>[0]; pairArm: 'baseline' | 'true' | 'false' }> = [
+      {
+        pairArm: 'baseline',
+        spec: {
+          id: `b${round}`, arm: 'control', method: 'GET', status: options.benignStatus ?? 200,
+          route: '/api/search',
+          pathAndQuery: `/api/search?q=${encodeURIComponent(pair.baseValue)}&k${round}=${round}`,
+          body: JSON.stringify({ rows: [{ id: 1 }], message: 'ok' }),
+          evidenceRole: 'benign_baseline',
+        },
       },
-      tautology: {
-        id: `t${round}`, arm: 'probe', method: 'GET', status: options.tautologyStatus ?? 200,
-        route: '/api/search',
-        pathAndQuery: `/api/search?q=${encodeURIComponent(`widget' AND 7919=7919-- -`)}&k${round}=${round}`,
-        body: options.tautologyStatus && options.tautologyStatus >= 400
-          ? '{"error":"invalid query"}'
-          : JSON.stringify({ rows: [{ id: 1 }], message: 'ok' }),
-        evidenceRole: 'tautology',
+      {
+        pairArm: 'true',
+        spec: {
+          id: `t${round}`, arm: 'probe', method: 'GET', status: options.tautologyStatus ?? 200,
+          route: '/api/search',
+          pathAndQuery: `/api/search?q=${encodeURIComponent(pair.trueValue)}&k${round}=${round}`,
+          body: options.tautologyStatus && options.tautologyStatus >= 400
+            ? '{"error":"invalid query"}'
+            : JSON.stringify({ rows: [{ id: 1 }], message: 'ok' }),
+          evidenceRole: 'tautology',
+        },
       },
-      contradiction: {
-        id: `c${round}`, arm: 'probe', method: 'GET', status: options.contradictionStatus ?? 400,
-        route: '/api/search',
-        pathAndQuery: `/api/search?q=${encodeURIComponent(`widget' AND 7919=7920-- -`)}&k${round}=${round}`,
-        body: '{"error":"invalid query"}',
-        evidenceRole: 'contradiction',
+      {
+        pairArm: 'false',
+        spec: {
+          id: `c${round}`, arm: 'probe', method: 'GET', status: options.contradictionStatus ?? 404,
+          route: '/api/search',
+          pathAndQuery: `/api/search?q=${encodeURIComponent(pair.falseValue)}&k${round}=${round}`,
+          body: '{"error":"not_found"}',
+          evidenceRole: 'contradiction',
+        },
       },
-    }
-    for (const arm of [arms.benign, arms.tautology, arms.contradiction]) {
-      if (options.dropBenign && arm.evidenceRole === 'benign_baseline') continue
+    ]
+    for (const { spec, pairArm } of arms) {
+      if (options.dropBenign && spec.evidenceRole === 'benign_baseline') continue
       const id = ids[exchangeIds.length]!
       exchangeIds.push(id)
-      entries.push(entry(id, step(arm)))
+      entries.push(entry(id, step(spec), { hostBooleanPair: defaultHostMintedOracle.stampBooleanPairArm(pair, pairArm) }))
     }
   }
   return { entries, exchangeIds }
@@ -156,7 +166,7 @@ test('status_differential rejects a 5xx contradiction even across rounds', () =>
 
 test('status_differential rejects an unstable tautology/contradiction status pair', () => {
   const first = statusTriangle({ rounds: 1 })
-  const second = statusTriangle({ rounds: 1, contradictionStatus: 422, ids: ['x2', 'x3', 'x4'] })
+  const second = statusTriangle({ rounds: 1, contradictionStatus: 403, ids: ['x2', 'x3', 'x4'] })
   const entries = [...first.entries, ...second.entries]
   const result = verifyReceipt(statusReceipt([...first.exchangeIds, ...second.exchangeIds]), { entries })
   assert.equal(result.confirmed, false)
@@ -686,11 +696,11 @@ test('a wired status differential round-trips through the recipe surface', async
     request: req => {
       const q = new URL(req.pathAndQuery, ORIGIN).searchParams.get('q') ?? ''
       if (!/AND/.test(q)) return { status: 200, body: JSON.stringify({ rows: [{ id: 1 }] }), route: '/api/search' }
-      const match = /AND\s+(\d+)\s*=\s*(\d+)/.exec(q)
+      const match = /AND\s+['"]?(\d+)['"]?\s*=\s*['"]?(\d+)['"]?/.exec(q)
       const equal = match && match[1] === match[2]
       return equal
         ? { status: 200, body: JSON.stringify({ rows: [{ id: 1 }] }), route: '/api/search' }
-        : { status: 400, body: '{"error":"invalid query"}', route: '/api/search' }
+        : { status: 404, body: '{"error":"not_found"}', route: '/api/search' }
     },
     nextExchangeId: seq(),
   })

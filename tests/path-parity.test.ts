@@ -87,6 +87,8 @@ interface ParityExchange {
   role: 'control' | 'probe' | 'setup' | 'cleanup'
   op?: 'http' | 'http2' | 'race' | 'oob' | 'browser'
   evidenceRole?: string
+  booleanPairArm?: 'baseline' | 'true' | 'false'
+  booleanPairRound?: number
   raceBatchId?: string
   durationMs?: number
   startedAtOffsetMs?: number
@@ -182,6 +184,11 @@ interface ParityCase {
       delayMs: number
     }
     mintRedirectCanary?: boolean
+    mintBooleanPair?: {
+      baseValue: string
+      param: string
+      style?: 'numeric' | 'single_quote' | 'double_quote'
+    }
     conservedBalance?: {
       balanceField?: string
       capField?: string
@@ -1317,6 +1324,19 @@ test('path parity [verifyReceipt]: verifies all manifest receipt classes offline
     const hostTimingChallenge = pr.timingChallenge
       ? oracle.mintTimingChallenge(pr.timingChallenge.family, pr.timingChallenge.delayMs)
       : undefined
+    const booleanPairsByRound = new Map<number, ReturnType<HostMintedOracle['mintBooleanPair']>>()
+    const getRoundBooleanPair = (round: number) => {
+      if (!pr.mintBooleanPair) return undefined
+      let pair = booleanPairsByRound.get(round)
+      if (!pair) {
+        pair = oracle.mintBooleanPair(pr.mintBooleanPair.baseValue, {
+          param: pr.mintBooleanPair.param,
+          style: pr.mintBooleanPair.style ?? 'numeric',
+        })
+        booleanPairsByRound.set(round, pair)
+      }
+      return pair
+    }
 
     const personaByHandle = new Map(c.personas.map(p => [p.handle, p]))
     const baseTs = 1_700_000_000_000
@@ -1326,7 +1346,15 @@ test('path parity [verifyReceipt]: verifies all manifest receipt classes offline
       if (ex.op === 'oob') continue
       seq += 1
       const p = ex.persona ? personaByHandle.get(ex.persona) : undefined
-      const pathAndQuery = substituteTemplate(ex.pathAndQuery, templateVars)
+      let pathAndQuery = substituteTemplate(ex.pathAndQuery, templateVars)
+      let hostBooleanPair: ReceiptTranscriptEntry['hostBooleanPair']
+      if (pr.mintBooleanPair && ex.booleanPairArm) {
+        const pair = getRoundBooleanPair(ex.booleanPairRound ?? 1)!
+        hostBooleanPair = oracle.stampBooleanPairArm(pair, ex.booleanPairArm)
+        const parsed = new URL(pathAndQuery, 'http://kovo.invalid')
+        parsed.searchParams.set(pr.mintBooleanPair.param, hostBooleanPair.mintedValue)
+        pathAndQuery = `${parsed.pathname}${parsed.search}`
+      }
       const responseHeaders = substituteHeaders(ex.responseHeaders, templateVars)
       const reqHeaders: Record<string, string> = {
         ...(p ? { [p.headerName]: p.headerValue } : {}),
@@ -1353,6 +1381,7 @@ test('path parity [verifyReceipt]: verifies all manifest receipt classes offline
         ...(ex.evidenceRole ? { evidenceRole: ex.evidenceRole } : {}),
         ...(ex.raceBatchId ? { raceBatchId: ex.raceBatchId } : {}),
         ...(hostTimingChallenge ? { hostTimingChallenge } : {}),
+        ...(hostBooleanPair ? { hostBooleanPair } : {}),
         ...(hostRedirectCanaryHost ? { hostRedirectCanaryHost } : {}),
         step: {
           id: ex.id,

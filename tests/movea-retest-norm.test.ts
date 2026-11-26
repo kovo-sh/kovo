@@ -162,8 +162,9 @@ test('R2-H-15 / H-19: boolean probe 5xx, status tautology 429, HTML readback, an
   const statusBroker429 = new RequestBroker({
     transport: async url => {
       const q = url.searchParams.get('q') ?? ''
-      if (q.includes('1=1')) return { status: 429, headers: {}, body: 'rate limited' }
-      if (q.includes('1=2')) return { status: 404, headers: {}, body: 'not found' }
+      const m = /AND\s+['"]?(\d+)['"]?\s*=\s*['"]?(\d+)['"]?/i.exec(q)
+      if (m && m[1] === m[2]) return { status: 429, headers: {}, body: 'rate limited' }
+      if (m && m[1] !== m[2]) return { status: 404, headers: {}, body: 'not found' }
       return { status: 200, headers: {}, body: 'ok' }
     },
   })

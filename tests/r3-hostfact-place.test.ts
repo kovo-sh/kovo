@@ -670,17 +670,20 @@ test('R3-C-4: integer-coercion boolean triangle fails closed in statusDifferenti
   })
   assert.equal(forgedUntagged.confirmed, false, 'untagged integer-coercion status_differential triangle MUST be rejected')
 
-  // 3) Positive control: byte-identical stripped base value `1` across baseline/true/false confirms
+  // 3) Positive control: host-minted identical-base pair across baseline/true/false confirms (R4-C-1)
+  const statusOracle = new HostMintedOracle()
+  const pair1 = statusOracle.mintBooleanPair('1', { param: 'id', style: 'numeric' })
+  const pair2 = statusOracle.mintBooleanPair('1', { param: 'id', style: 'numeric' })
   const validStatus = verifyReceipt(mkStatusReceipt(['b1', 't1', 'f1', 'b2', 't2', 'f2']), {
     entries: [
-      { exchangeId: 'b1', origin: ORIGIN, evidenceRole: 'benign_baseline', step: mkStep({ id: 'b1', arm: 'control', method: 'GET', route: '/api/items', pathAndQuery: '/api/items?id=1', status: 200, evidenceRole: 'benign_baseline', body: '{"id":1}' }) },
-      { exchangeId: 't1', origin: ORIGIN, evidenceRole: 'tautology', step: mkStep({ id: 't1', arm: 'probe', method: 'GET', route: '/api/items', pathAndQuery: '/api/items?id=1%20AND%201%3D1', status: 200, evidenceRole: 'tautology', body: '{"id":1}' }) },
-      { exchangeId: 'f1', origin: ORIGIN, evidenceRole: 'contradiction', step: mkStep({ id: 'f1', arm: 'probe', method: 'GET', route: '/api/items', pathAndQuery: '/api/items?id=1%20AND%201%3D2', status: 404, evidenceRole: 'contradiction', body: '{"error":"not_found"}' }) },
-      { exchangeId: 'b2', origin: ORIGIN, evidenceRole: 'benign_baseline', step: mkStep({ id: 'b2', arm: 'control', method: 'GET', route: '/api/items', pathAndQuery: '/api/items?id=1', status: 200, evidenceRole: 'benign_baseline', body: '{"id":1}' }) },
-      { exchangeId: 't2', origin: ORIGIN, evidenceRole: 'tautology', step: mkStep({ id: 't2', arm: 'probe', method: 'GET', route: '/api/items', pathAndQuery: '/api/items?id=1%20AND%202%3D2', status: 200, evidenceRole: 'tautology', body: '{"id":1}' }) },
-      { exchangeId: 'f2', origin: ORIGIN, evidenceRole: 'contradiction', step: mkStep({ id: 'f2', arm: 'probe', method: 'GET', route: '/api/items', pathAndQuery: '/api/items?id=1%20AND%202%3D3', status: 404, evidenceRole: 'contradiction', body: '{"error":"not_found"}' }) },
+      { exchangeId: 'b1', origin: ORIGIN, evidenceRole: 'benign_baseline', hostBooleanPair: statusOracle.stampBooleanPairArm(pair1, 'baseline'), step: mkStep({ id: 'b1', arm: 'control', method: 'GET', route: '/api/items', pathAndQuery: `/api/items?id=${encodeURIComponent(pair1.baseValue)}`, status: 200, evidenceRole: 'benign_baseline', body: '{"id":1}' }) },
+      { exchangeId: 't1', origin: ORIGIN, evidenceRole: 'tautology', hostBooleanPair: statusOracle.stampBooleanPairArm(pair1, 'true'), step: mkStep({ id: 't1', arm: 'probe', method: 'GET', route: '/api/items', pathAndQuery: `/api/items?id=${encodeURIComponent(pair1.trueValue)}`, status: 200, evidenceRole: 'tautology', body: '{"id":1}' }) },
+      { exchangeId: 'f1', origin: ORIGIN, evidenceRole: 'contradiction', hostBooleanPair: statusOracle.stampBooleanPairArm(pair1, 'false'), step: mkStep({ id: 'f1', arm: 'probe', method: 'GET', route: '/api/items', pathAndQuery: `/api/items?id=${encodeURIComponent(pair1.falseValue)}`, status: 404, evidenceRole: 'contradiction', body: '{"error":"not_found"}' }) },
+      { exchangeId: 'b2', origin: ORIGIN, evidenceRole: 'benign_baseline', hostBooleanPair: statusOracle.stampBooleanPairArm(pair2, 'baseline'), step: mkStep({ id: 'b2', arm: 'control', method: 'GET', route: '/api/items', pathAndQuery: `/api/items?id=${encodeURIComponent(pair2.baseValue)}`, status: 200, evidenceRole: 'benign_baseline', body: '{"id":1}' }) },
+      { exchangeId: 't2', origin: ORIGIN, evidenceRole: 'tautology', hostBooleanPair: statusOracle.stampBooleanPairArm(pair2, 'true'), step: mkStep({ id: 't2', arm: 'probe', method: 'GET', route: '/api/items', pathAndQuery: `/api/items?id=${encodeURIComponent(pair2.trueValue)}`, status: 200, evidenceRole: 'tautology', body: '{"id":1}' }) },
+      { exchangeId: 'f2', origin: ORIGIN, evidenceRole: 'contradiction', hostBooleanPair: statusOracle.stampBooleanPairArm(pair2, 'false'), step: mkStep({ id: 'f2', arm: 'probe', method: 'GET', route: '/api/items', pathAndQuery: `/api/items?id=${encodeURIComponent(pair2.falseValue)}`, status: 404, evidenceRole: 'contradiction', body: '{"error":"not_found"}' }) },
     ],
-  })
+  }, { hostMintedOracle: statusOracle })
   assert.equal(validStatus.confirmed, true, 'identical-base status_differential triangle must confirm')
 })
 
