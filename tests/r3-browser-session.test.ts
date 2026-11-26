@@ -16,10 +16,10 @@ import {
   filterStorageStateForRefresh,
   formatChromiumSandboxLaunchError,
   isVerifyPathModifiedByRun,
-  refreshBrowserSession,
   resolveBrowserSessionEgressPolicy,
   startInteractiveLoginCapture,
 } from '../src/server/browser-session-auth.ts'
+import { refreshBrowserSessionForTest } from './helpers/browser-session-test-factory.ts'
 import type {
   BrowserSessionChromiumLaunchOptions,
   PlaywrightBrowserLike,
@@ -411,7 +411,7 @@ test('R3-H-3: refreshBrowserSession strips third-party cookies, sets serviceWork
     ],
   }
 
-  const refreshed = await refreshBrowserSession({
+  const refreshed = await refreshBrowserSessionForTest({
     storageState: rawState,
     targetOrigin: 'https://app.northstar.example',
     originAllowlist: ['https://app.northstar.example'],
@@ -483,7 +483,7 @@ test('R3-H-3: refreshBrowserSession refuses automated refresh on run-modified pa
 
   // Flagged via modifiedPaths
   await assert.rejects(
-    () => refreshBrowserSession({
+    () => refreshBrowserSessionForTest({
       storageState: { cookies: [], origins: [] },
       targetOrigin: 'https://app.northstar.example',
       verifyPath: '/dashboard?view=feed',
@@ -497,7 +497,7 @@ test('R3-H-3: refreshBrowserSession refuses automated refresh on run-modified pa
 
   // Flagged via verifyPathModifiedByRun boolean
   await assert.rejects(
-    () => refreshBrowserSession({
+    () => refreshBrowserSessionForTest({
       storageState: { cookies: [], origins: [] },
       targetOrigin: 'https://app.northstar.example',
       verifyPath: '/',
@@ -558,7 +558,7 @@ test('R3-H-6: Chromium launch options explicitly set chromiumSandbox: true by de
     delete process.env.KOVO_INSECURE_NO_SANDBOX
 
     const refreshCapture: Parameters<typeof makeMockBrowser>[0] = {}
-    await refreshBrowserSession({
+    await refreshBrowserSessionForTest({
       storageState: validState,
       targetOrigin: 'https://app.northstar.example',
       settleMs: 200,
@@ -585,7 +585,7 @@ test('R3-H-6: Chromium launch options explicitly set chromiumSandbox: true by de
     // With explicit KOVO_INSECURE_NO_SANDBOX=1
     process.env.KOVO_INSECURE_NO_SANDBOX = '1'
     const optOutCapture: Parameters<typeof makeMockBrowser>[0] = {}
-    await refreshBrowserSession({
+    await refreshBrowserSessionForTest({
       storageState: validState,
       targetOrigin: 'https://app.northstar.example',
       settleMs: 200,

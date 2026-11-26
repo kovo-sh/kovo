@@ -1,6 +1,7 @@
 {
   "version": 2,
-  "maxQuarantinedCases": 189,
+  "maxQuarantinedCases": 180,
+  "maxKernelVerdictQuarantinedCases": 27,
   "entries": [
     {
       "file": "tests/arch-a1-engine.test.ts",
@@ -16,7 +17,8 @@
       "assertionLocation": "tests/arch-c1-verify-kernel.test.ts:42:1",
       "ownerStream": "triage-kernel-arch-c1-verify-kernel",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
+      "expires": "2026-12-03",
+      "triageClass": "environment_or_harness"
     },
     {
       "file": "tests/arch-c1-verify-kernel.test.ts",
@@ -24,7 +26,8 @@
       "assertionLocation": "tests/arch-c1-verify-kernel.test.ts:240:1",
       "ownerStream": "triage-kernel-arch-c1-verify-kernel",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
+      "expires": "2026-12-03",
+      "triageClass": "environment_or_harness"
     },
     {
       "file": "tests/arch-c2-thin-sdk.test.ts",
@@ -99,30 +102,6 @@
       "expires": "2026-12-26"
     },
     {
-      "file": "tests/provider-stream.test.ts",
-      "testName": "keeps split messages API keys and persona secrets out of recorded turns and Pi Durable sessions",
-      "assertionLocation": "tests/provider-stream.test.ts:176:3",
-      "ownerStream": "sys-q1-worker-pool",
-      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
-    },
-    {
-      "file": "tests/provider-stream.test.ts",
-      "testName": "keeps split responses API keys and persona secrets out of recorded turns and Pi Durable sessions",
-      "assertionLocation": "tests/provider-stream.test.ts:176:3",
-      "ownerStream": "sys-q1-worker-pool",
-      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
-    },
-    {
-      "file": "tests/provider-stream.test.ts",
-      "testName": "multi-profile LLM failover pool handles 429->402 quota circuit breaking, context filtering, and safe-window failover",
-      "assertionLocation": "tests/provider-stream.test.ts:275:1",
-      "ownerStream": "sys-q1-worker-pool",
-      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
-    },
-    {
       "file": "tests/specs-recall.test.ts",
       "testName": "credential inventory: the unentitled full secret confirms against the masked control",
       "assertionLocation": "tests/specs-recall.test.ts:407:1",
@@ -137,46 +116,6 @@
       "ownerStream": "cq-4-parity-corpus",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
-    },
-    {
-      "file": "tests/t1-provider-stream.test.ts",
-      "testName": "H-25: End-to-end provider() round-trip delivers unmodified check_canary token and kovo_verify script to pi-ai",
-      "assertionLocation": "tests/t1-provider-stream.test.ts:239:1",
-      "ownerStream": "sys-q1-worker-pool",
-      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
-    },
-    {
-      "file": "tests/t1-provider-stream.test.ts",
-      "testName": "H-26: Active stream that stalls after chunk 1 is still aborted by idleTimeoutMs, and timeout errors classify as transient failover",
-      "assertionLocation": "tests/t1-provider-stream.test.ts:462:1",
-      "ownerStream": "sys-q1-worker-pool",
-      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
-    },
-    {
-      "file": "tests/t1-provider-stream.test.ts",
-      "testName": "H-26: Server hanging before response headers aborts cleanly at firstEventTimeoutMs",
-      "assertionLocation": "tests/t1-provider-stream.test.ts:425:1",
-      "ownerStream": "sys-q1-worker-pool",
-      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
-    },
-    {
-      "file": "tests/t1-provider-stream.test.ts",
-      "testName": "H-26: SSE server sending headers + ZERO bytes past firstEventTimeoutMs aborts cleanly",
-      "assertionLocation": "tests/t1-provider-stream.test.ts:386:1",
-      "ownerStream": "sys-q1-worker-pool",
-      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
-    },
-    {
-      "file": "tests/t1-provider-stream.test.ts",
-      "testName": "H-26: SSE stream sending chunk 1 immediately and chunk 2 AFTER firstEventTimeoutMs completes cleanly",
-      "assertionLocation": "tests/t1-provider-stream.test.ts:305:1",
-      "ownerStream": "sys-q1-worker-pool",
-      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
     },
     {
       "file": "tests/t2-composite-hydrate.test.ts",
@@ -208,7 +147,8 @@
       "assertionLocation": "tests/t2-oracle-invariants.test.ts:70:1",
       "ownerStream": "triage-kernel-t2-oracle-invariants",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
+      "expires": "2026-12-03",
+      "triageClass": "verdict_tp_loss"
     },
     {
       "file": "tests/t2-oracle-invariants.test.ts",
@@ -216,7 +156,8 @@
       "assertionLocation": "tests/t2-oracle-invariants.test.ts:133:1",
       "ownerStream": "triage-kernel-t2-oracle-invariants",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
+      "expires": "2026-12-03",
+      "triageClass": "reason_only"
     },
     {
       "file": "tests/t2-oracle-invariants.test.ts",
@@ -224,7 +165,8 @@
       "assertionLocation": "tests/t2-oracle-invariants.test.ts:125:1",
       "ownerStream": "triage-kernel-t2-oracle-invariants",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
+      "expires": "2026-12-03",
+      "triageClass": "verdict_tp_loss"
     },
     {
       "file": "tests/t2-oracle-invariants.test.ts",
@@ -232,7 +174,8 @@
       "assertionLocation": "tests/t2-oracle-invariants.test.ts:143:1",
       "ownerStream": "triage-kernel-t2-oracle-invariants",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
+      "expires": "2026-12-03",
+      "triageClass": "verdict_tp_loss"
     },
     {
       "file": "tests/t2-receipt-kernel.test.ts",
@@ -240,7 +183,8 @@
       "assertionLocation": "tests/t2-receipt-kernel.test.ts:420:1",
       "ownerStream": "triage-kernel-t2-receipt-kernel",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
+      "expires": "2026-12-03",
+      "triageClass": "verdict_tp_loss"
     },
     {
       "file": "tests/t2-receipt-kernel.test.ts",
@@ -248,7 +192,8 @@
       "assertionLocation": "tests/t2-receipt-kernel.test.ts:228:1",
       "ownerStream": "triage-kernel-t2-receipt-kernel",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
+      "expires": "2026-12-03",
+      "triageClass": "reason_only"
     },
     {
       "file": "tests/ux-session-refresh-a123.test.ts",
@@ -600,7 +545,8 @@
       "assertionLocation": "tests/v7-agentic-lift-oracles.test.ts:378:1",
       "ownerStream": "triage-kernel-v7-agentic-lift-oracles",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
+      "expires": "2026-12-07",
+      "triageClass": "verdict_tp_loss"
     },
     {
       "file": "tests/v7-agentic-lift-oracles.test.ts",
@@ -608,7 +554,8 @@
       "assertionLocation": "tests/v7-agentic-lift-oracles.test.ts:157:1",
       "ownerStream": "triage-kernel-v7-agentic-lift-oracles",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
+      "expires": "2026-12-07",
+      "triageClass": "verdict_tp_loss"
     },
     {
       "file": "tests/v7-agentic-lift-oracles.test.ts",
@@ -616,7 +563,8 @@
       "assertionLocation": "tests/v7-agentic-lift-oracles.test.ts:476:1",
       "ownerStream": "triage-kernel-v7-agentic-lift-oracles",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
+      "expires": "2026-12-07",
+      "triageClass": "verdict_tp_loss"
     },
     {
       "file": "tests/v7-agentic-lift-oracles.test.ts",
@@ -624,7 +572,8 @@
       "assertionLocation": "tests/v7-agentic-lift-oracles.test.ts:613:1",
       "ownerStream": "triage-kernel-v7-agentic-lift-oracles",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
+      "expires": "2026-12-07",
+      "triageClass": "verdict_tp_loss"
     },
     {
       "file": "tests/v7-agentic-lift-oracles.test.ts",
@@ -632,7 +581,8 @@
       "assertionLocation": "tests/v7-agentic-lift-oracles.test.ts:646:1",
       "ownerStream": "triage-kernel-v7-agentic-lift-oracles",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
+      "expires": "2026-12-07",
+      "triageClass": "verdict_tp_loss"
     },
     {
       "file": "tests/v7-conserved-balance-receipt.test.ts",
@@ -640,7 +590,8 @@
       "assertionLocation": "tests/v7-conserved-balance-receipt.test.ts:192:1",
       "ownerStream": "triage-kernel-v7-conserved-balance-receipt",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
+      "expires": "2026-12-05",
+      "triageClass": "verdict_tp_loss"
     },
     {
       "file": "tests/v7-conserved-balance-receipt.test.ts",
@@ -648,7 +599,8 @@
       "assertionLocation": "tests/v7-conserved-balance-receipt.test.ts:100:1",
       "ownerStream": "triage-kernel-v7-conserved-balance-receipt",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
+      "expires": "2026-12-05",
+      "triageClass": "verdict_tp_loss"
     },
     {
       "file": "tests/v7-conserved-balance-receipt.test.ts",
@@ -656,7 +608,8 @@
       "assertionLocation": "tests/v7-conserved-balance-receipt.test.ts:77:1",
       "ownerStream": "triage-kernel-v7-conserved-balance-receipt",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
+      "expires": "2026-12-05",
+      "triageClass": "verdict_tp_loss"
     },
     {
       "file": "tests/v7-conserved-balance-receipt.test.ts",
@@ -664,7 +617,8 @@
       "assertionLocation": "tests/v7-conserved-balance-receipt.test.ts:50:1",
       "ownerStream": "triage-kernel-v7-conserved-balance-receipt",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
+      "expires": "2026-12-05",
+      "triageClass": "verdict_tp_loss"
     },
     {
       "file": "tests/v7-conserved-balance-receipt.test.ts",
@@ -672,7 +626,8 @@
       "assertionLocation": "tests/v7-conserved-balance-receipt.test.ts:122:1",
       "ownerStream": "triage-kernel-v7-conserved-balance-receipt",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
+      "expires": "2026-12-05",
+      "triageClass": "reason_only"
     },
     {
       "file": "tests/v7-cut3a.test.ts",
@@ -792,7 +747,8 @@
       "assertionLocation": "tests/v7-floor-recipes.test.ts:210:1",
       "ownerStream": "triage-kernel-v7-floor-recipes",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
+      "expires": "2026-12-09",
+      "triageClass": "verdict_tp_loss"
     },
     {
       "file": "tests/v7-floor-recipes.test.ts",
@@ -800,7 +756,8 @@
       "assertionLocation": "tests/v7-floor-recipes.test.ts:253:1",
       "ownerStream": "triage-kernel-v7-floor-recipes",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
+      "expires": "2026-12-09",
+      "triageClass": "verdict_tp_loss"
     },
     {
       "file": "tests/v7-floor-recipes.test.ts",
@@ -808,7 +765,8 @@
       "assertionLocation": "tests/v7-floor-recipes.test.ts:313:1",
       "ownerStream": "triage-kernel-v7-floor-recipes",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
+      "expires": "2026-12-09",
+      "triageClass": "reason_only"
     },
     {
       "file": "tests/v7-floor-recipes.test.ts",
@@ -816,7 +774,8 @@
       "assertionLocation": "tests/v7-floor-recipes.test.ts:304:1",
       "ownerStream": "triage-kernel-v7-floor-recipes",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
+      "expires": "2026-12-09",
+      "triageClass": "reason_only"
     },
     {
       "file": "tests/v7-floor-recipes.test.ts",
@@ -824,7 +783,8 @@
       "assertionLocation": "tests/v7-floor-recipes.test.ts:261:1",
       "ownerStream": "triage-kernel-v7-floor-recipes",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
+      "expires": "2026-12-09",
+      "triageClass": "reason_only"
     },
     {
       "file": "tests/v7-floor-recipes.test.ts",
@@ -832,7 +792,8 @@
       "assertionLocation": "tests/v7-floor-recipes.test.ts:418:1",
       "ownerStream": "triage-kernel-v7-floor-recipes",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
+      "expires": "2026-12-09",
+      "triageClass": "verdict_tp_loss"
     },
     {
       "file": "tests/v7-floor-recipes.test.ts",
@@ -840,7 +801,8 @@
       "assertionLocation": "tests/v7-floor-recipes.test.ts:437:1",
       "ownerStream": "triage-kernel-v7-floor-recipes",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
+      "expires": "2026-12-09",
+      "triageClass": "verdict_tp_loss"
     },
     {
       "file": "tests/v7-proofreceipt.test.ts",
@@ -848,7 +810,8 @@
       "assertionLocation": "tests/v7-proofreceipt.test.ts:155:1",
       "ownerStream": "triage-kernel-v7-proofreceipt",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
+      "expires": "2026-12-10",
+      "triageClass": "verdict_tp_loss"
     },
     {
       "file": "tests/v7-proofreceipt.test.ts",
@@ -856,7 +819,8 @@
       "assertionLocation": "tests/v7-proofreceipt.test.ts:233:1",
       "ownerStream": "triage-kernel-v7-proofreceipt",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
+      "expires": "2026-12-10",
+      "triageClass": "verdict_tp_loss"
     },
     {
       "file": "tests/v7-proofreceipt.test.ts",
@@ -864,7 +828,8 @@
       "assertionLocation": "tests/v7-proofreceipt.test.ts:260:1",
       "ownerStream": "triage-kernel-v7-proofreceipt",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
+      "expires": "2026-12-10",
+      "triageClass": "reason_only"
     },
     {
       "file": "tests/v7-proofreceipt.test.ts",
@@ -872,7 +837,8 @@
       "assertionLocation": "tests/v7-proofreceipt.test.ts:331:1",
       "ownerStream": "triage-kernel-v7-proofreceipt",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
+      "expires": "2026-12-10",
+      "triageClass": "environment_or_harness"
     },
     {
       "file": "tests/v7-proofreceipt.test.ts",
@@ -880,7 +846,8 @@
       "assertionLocation": "tests/v7-proofreceipt.test.ts:199:1",
       "ownerStream": "triage-kernel-v7-proofreceipt",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
+      "expires": "2026-12-10",
+      "triageClass": "verdict_tp_loss"
     },
     {
       "file": "tests/v7-proofreceipt.test.ts",
@@ -888,7 +855,8 @@
       "assertionLocation": "tests/v7-proofreceipt.test.ts:508:1",
       "ownerStream": "triage-kernel-v7-proofreceipt",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
+      "expires": "2026-12-10",
+      "triageClass": "verdict_tp_loss"
     },
     {
       "file": "tests/v7-proofreceipt.test.ts",
@@ -896,7 +864,8 @@
       "assertionLocation": "tests/v7-proofreceipt.test.ts:420:1",
       "ownerStream": "triage-kernel-v7-proofreceipt",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
+      "expires": "2026-12-10",
+      "triageClass": "environment_or_harness"
     },
     {
       "file": "tests/v7-publicness-oracle.test.ts",
@@ -904,7 +873,8 @@
       "assertionLocation": "tests/v7-publicness-oracle.test.ts:96:1",
       "ownerStream": "triage-kernel-v7-publicness-oracle",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
+      "expires": "2026-12-05",
+      "triageClass": "verdict_tp_loss"
     },
     {
       "file": "tests/v7-retest-receipts.test.ts",
@@ -912,7 +882,8 @@
       "assertionLocation": "tests/v7-retest-receipts.test.ts:68:1",
       "ownerStream": "triage-kernel-v7-retest-receipts",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
+      "expires": "2026-12-05",
+      "triageClass": "verdict_tp_loss"
     },
     {
       "file": "tests/v7-retest-receipts.test.ts",
@@ -920,7 +891,8 @@
       "assertionLocation": "tests/v7-retest-receipts.test.ts:99:1",
       "ownerStream": "triage-kernel-v7-retest-receipts",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
+      "expires": "2026-12-05",
+      "triageClass": "verdict_tp_loss"
     },
     {
       "file": "tests/v7-shopflow-fp.test.ts",
@@ -1072,7 +1044,8 @@
       "assertionLocation": "tests/v8-oracle-families.test.ts:562:3",
       "ownerStream": "triage-kernel-v8-oracle-families",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
+      "expires": "2026-12-07",
+      "triageClass": "verdict_tp_loss"
     },
     {
       "file": "tests/v8-phasea-fastpath.test.ts",
@@ -1144,7 +1117,8 @@
       "assertionLocation": "tests/v8-q25-oracle-soundness.test.ts:444:1",
       "ownerStream": "triage-kernel-v8-q25-oracle-soundness",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
+      "expires": "2026-12-09",
+      "triageClass": "environment_or_harness"
     },
     {
       "file": "tests/v8-q25-oracle-soundness.test.ts",
@@ -1152,7 +1126,8 @@
       "assertionLocation": "tests/v8-q25-oracle-soundness.test.ts:105:1",
       "ownerStream": "triage-kernel-v8-q25-oracle-soundness",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
+      "expires": "2026-12-09",
+      "triageClass": "reason_only"
     },
     {
       "file": "tests/v8-q25-oracle-soundness.test.ts",
@@ -1160,7 +1135,8 @@
       "assertionLocation": "tests/v8-q25-oracle-soundness.test.ts:282:1",
       "ownerStream": "triage-kernel-v8-q25-oracle-soundness",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
+      "expires": "2026-12-09",
+      "triageClass": "verdict_tp_loss"
     },
     {
       "file": "tests/v8-q25-oracle-soundness.test.ts",
@@ -1168,7 +1144,8 @@
       "assertionLocation": "tests/v8-q25-oracle-soundness.test.ts:397:1",
       "ownerStream": "triage-kernel-v8-q25-oracle-soundness",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
+      "expires": "2026-12-09",
+      "triageClass": "reason_only"
     },
     {
       "file": "tests/v8-q26-multihop-synthesis.test.ts",
@@ -1456,7 +1433,8 @@
       "assertionLocation": "tests/v8-seam3-receipt-fuzz.test.ts:1030:1",
       "ownerStream": "triage-kernel-v8-seam3-receipt-fuzz",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
+      "expires": "2026-12-07",
+      "triageClass": "verdict_tp_loss"
     },
     {
       "file": "tests/v8-seam3-receipt-fuzz.test.ts",
@@ -1464,7 +1442,8 @@
       "assertionLocation": "tests/v8-seam3-receipt-fuzz.test.ts:1475:1",
       "ownerStream": "triage-kernel-v8-seam3-receipt-fuzz",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
+      "expires": "2026-12-07",
+      "triageClass": "reason_only"
     },
     {
       "file": "tests/v8-seam3-receipt-fuzz.test.ts",
@@ -1472,7 +1451,8 @@
       "assertionLocation": "tests/v8-seam3-receipt-fuzz.test.ts:1854:1",
       "ownerStream": "triage-kernel-v8-seam3-receipt-fuzz",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
+      "expires": "2026-12-07",
+      "triageClass": "reason_only"
     },
     {
       "file": "tests/v8-wire-l1.test.ts",

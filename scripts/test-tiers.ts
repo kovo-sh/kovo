@@ -28,6 +28,7 @@ export const CORE_GATE_INVARIANT_TESTS: readonly string[] = Object.freeze([
   'tests/v7-confirm-consistency.test.ts',
   'tests/cq-3-merge-gate.test.ts',
   'tests/r2-02-quarantine.test.ts',
+  'tests/r3-06-quarantine.test.ts',
 ])
 
 export const GATE_TEST_EXACT: ReadonlySet<string> = new Set([
@@ -185,4 +186,170 @@ export function readTestFileTags(filePath: string, rootDir: string = REPO_ROOT):
 
 export function hasProtectedTestTag(tags: TestFileTags): boolean {
   return tags.kernel || tags.fixes.length > 0
+}
+
+// ============================================================================
+// Quarantine Backlog Owner & Verdict-Split Validation (`R3-06`, §6)
+// ============================================================================
+
+export type BacklogRowStatus = 'ready' | 'active' | 'blocked' | 'completed'
+
+export interface BacklogRow {
+  id: string
+  status: BacklogRowStatus
+  lease: string
+  stream: string
+  line: number
+  checked: boolean
+}
+
+export type QuarantineTriageClass =
+  | 'reason_only'
+  | 'verdict_fp_guard'
+  | 'verdict_tp_loss'
+  | 'environment_or_harness'
+  | 'non_kernel'
+
+export type QuarantineAssertionKind = 'prose' | 'verdict' | 'harness'
+
+export const VALID_QUARANTINE_TRIAGE_CLASSES: ReadonlySet<QuarantineTriageClass> = new Set<QuarantineTriageClass>([
+  'reason_only',
+  'verdict_fp_guard',
+  'verdict_tp_loss',
+  'environment_or_harness',
+  'non_kernel',
+])
+
+export const VALID_QUARANTINE_ASSERTION_KINDS: ReadonlySet<QuarantineAssertionKind> = new Set<QuarantineAssertionKind>([
+  'prose',
+  'verdict',
+  'harness',
+])
+
+export const KERNEL_VERDICT_TRIAGE_CLASSES: ReadonlySet<QuarantineTriageClass> = new Set<QuarantineTriageClass>([
+  'verdict_fp_guard',
+  'verdict_tp_loss',
+])
+
+/**
+ * Explicit verdict-scoped test names (`[verdict]`, `verdict:`, `@verdict`) that can NEVER
+ * be quarantined inside a kernel/critical suite.
+ */
+export const EXPLICIT_VERDICT_TEST_NAME_RE = /(?:\[verdict\]|\bverdict\s*:|@verdict\b)/i
+
+export const DEFAULT_STREAM_BACKLOG_REL = 'plans/STREAM-BACKLOG.md'
+
+const BACKLOG_ROW_RE = /^\s*-\s*\[( |x|X)\]\s*`([^`]+)`(.*)$/
+
+function stripBackticks(value: string): string {
+  const trimmed = value.trim()
+  if (trimmed.startsWith('`') && trimmed.endsWith('`') && trimmed.length >= 2) {
+    return trimmed.slice(1, -1).trim()
+  }
+  return trimmed
+}
+
+/**
+ * Parse task rows from `plans/STREAM-BACKLOG.md`.
+ * Format:
+ *   `- [ ] \`<task-id>\` — <desc> | status: ready|active|blocked | lease: <files> | deps: <ids> | stream: <branch or ->`
+ */
+export function parseStreamBacklog(markdown: string): BacklogRow[] {
+  const rows: BacklogRow[] = []
+  const lines = markdown.split(/\r?\n/)
+  for (let i = 0; i < lines.length; i += 1) {
+    const m = BACKLOG_ROW_RE.exec(lines[i]!)
+    if (!m) continue
+    const checked = m[1]!.toLowerCase() === 'x'
+    const id = m[2]!.trim()
+    if (!id) continue
+    const tail = m[3] ?? ''
+    const statusMatch = /\|\s*status:\s*(ready|active|blocked|completed)\b/i.exec(tail)
+    const leaseMatch = /\|\s*lease:\s*([^|]+)/i.exec(tail)
+    const streamMatch = /\|\s*stream:\s*([^|]+)/i.exec(tail)
+    const status: BacklogRowStatus = checked
+      ? 'completed'
+      : ((statusMatch?.[1]?.toLowerCase() as BacklogRowStatus | undefined) ?? 'ready')
+    const lease = leaseMatch ? leaseMatch[1]!.trim() : ''
+    const stream = streamMatch ? stripBackticks(streamMatch[1]!) : ''
+    rows.push({
+      id,
+      status,
+      lease,
+      stream: stream === '-' ? '' : stream,
+      line: i + 1,
+      checked,
+    })
+  }
+  return rows
+}
+
+/**
+ * Read and parse `plans/STREAM-BACKLOG.md` (or an explicit backlog file path).
+ */
+export function readStreamBacklog(
+  backlogPath: string = DEFAULT_STREAM_BACKLOG_REL,
+  rootDir: string = REPO_ROOT,
+): BacklogRow[] {
+  const resolved = isAbsolute(backlogPath) ? backlogPath : join(rootDir, backlogPath)
+  if (!existsSync(resolved)) return []
+  try {
+    return parseStreamBacklog(readFileSync(resolved, 'utf8'))
+  } catch {
+    return []
+  }
+}
+
+/**
+ * Return the set of live (`ready` or `active`, unchecked) owner IDs / stream slugs from `STREAM-BACKLOG.md`.
+ */
+export function getLiveBacklogOwners(rows: readonly BacklogRow[]): Set<string> {
+  const live = new Set<string>()
+  for (const row of rows) {
+    if (row.checked) continue
+    if (row.status !== 'ready' && row.status !== 'active') continue
+    live.add(row.id)
+    if (row.stream && row.stream !== '-') {
+      live.add(row.stream)
+      const shortStream = row.stream.replace(/^(?:agents|swarm)\//, '')
+      if (shortStream) live.add(shortStream)
+    }
+  }
+  return live
+}
+
+/**
+ * Check whether an `ownerStream` resolves to a live (`ready` or `active`) row in `plans/STREAM-BACKLOG.md`.
+ */
+export function isLiveBacklogOwner(owner: string, rows: readonly BacklogRow[]): boolean {
+  const trimmed = owner.trim()
+  if (!trimmed || isGenericTriageOwner(trimmed)) return false
+  return getLiveBacklogOwners(rows).has(trimmed)
+}
+
+/**
+ * Classify whether a test file is kernel/critical by path rules OR leading `@kernel` comment tag.
+ */
+export function isKernelOrCriticalTestFileWithTags(
+  relPath: string,
+  rootDir: string = REPO_ROOT,
+): boolean {
+  if (isKernelOrCriticalTestFile(relPath)) return true
+  return readTestFileTags(relPath, rootDir).kernel
+}
+
+/**
+ * True when a quarantine entry explicitly targets a verdict assertion (unconditionally unquarantinable
+ * in kernel/critical suites).
+ */
+export function isExplicitVerdictQuarantineEntry(entry: {
+  testName?: string
+  assertionKind?: string
+}): boolean {
+  if (entry.assertionKind === 'verdict') return true
+  return typeof entry.testName === 'string' && EXPLICIT_VERDICT_TEST_NAME_RE.test(entry.testName)
+}
+
+export function isKernelVerdictTriageClass(triageClass: string | undefined): boolean {
+  return typeof triageClass === 'string' && KERNEL_VERDICT_TRIAGE_CLASSES.has(triageClass as QuarantineTriageClass)
 }

@@ -10,9 +10,9 @@ import { test } from 'node:test'
 import { createKovoLocalServer } from '../scripts/serve.ts'
 import {
   BrowserCaptureManager,
-  refreshBrowserSession,
   startInteractiveLoginCapture,
 } from '../src/server/browser-session-auth.ts'
+import { refreshBrowserSessionForTest } from './helpers/browser-session-test-factory.ts'
 import type { PlaywrightBrowserLike, PlaywrightStorageState } from '../src/server/browser-session-auth.ts'
 import { parseCurlCommand, parseCurlOrHeaderInput, tokenizeCurlArgs } from '../src/server/curl-parse.ts'
 import { PersonaAuthManager } from '../src/server/persona-auth.ts'
@@ -214,7 +214,7 @@ test('refreshBrowserSession & PersonaAuthManager perform 100% generic zero-IdP-c
   }
 
   // 2a. Direct refreshBrowserSession() call: rotates HttpOnly cookie + observes Authorization Bearer + persists 0600 bundle!
-  const refreshed1 = await refreshBrowserSession({
+  const refreshed1 = await refreshBrowserSessionForTest({
     storageState: initialStorageState,
     targetOrigin: origin,
     verifyPath: '/dashboard',
