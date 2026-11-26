@@ -16,7 +16,8 @@ import {
 import type { AmbientAuth, BoundaryClass, ImpactClass, ImpactStep, InjectionFamily, InjectionFamilyScope, ActorIdentity, RoleName } from './oracle-invariants.ts'
 import { isJobOrHandleStub } from './v8-oracle-families.ts'
 import { deriveRecordAuthMeta, resolveCanonicalArm, stepHasRedactedRequestPlane, type HostFactLog } from './host-fact-log.ts'
-import { defaultHostMintedOracle, diffRequestParams, exactPathnameOf, normalizeRequestCarrier, verifyHostExpressionProbe, verifySignedUrlMintPair, type HostMintedExpressionChallenge, type HostMintedRedirectCanary, type HostMintedTimingChallenge, type HostStampedBooleanPair } from './proof-receipt.ts'
+import { defaultHostMintedOracle, diffRequestParams, exactPathnameOf, verifyHostExpressionProbe, verifySignedUrlMintPair, type HostMintedExpressionChallenge, type HostMintedRedirectCanary, type HostMintedTimingChallenge, type HostStampedBooleanPair } from './proof-receipt.ts'
+import { assertLegitimateControl, impactStepToControlExchange, normalizeRequestCarrier } from './proof-kernel/index.ts'
 import { compileSafeClaimRegex, MAX_CLAIM_REGEX_HAYSTACK } from './safe-regex.ts'
 export { compileSafeClaimRegex } from './safe-regex.ts'
 import { DEFAULT_ORACLE_SPEC_REGISTRY, evaluateRegisteredOracleClaim, isRegisteredImpactClass, isSignedUrlMintLabel, registerOracleClaimEvaluator, sealOracleClaimEvaluators } from './oracle-spec.ts'
@@ -1066,11 +1067,8 @@ function evaluateBoundaryClaim(store: TranscriptStore, claim: Extract<VerifyClai
   if (assessment.required && assessment.satisfied) {
     const stub = detectIntermediateStub(store.get(claim.probeExchangeId), store.body(claim.probeExchangeId))
     if (stub.isStub) return stubRejection(claim, stub.state, assessment.evidence)
-    const ctlHdrs = Object.fromEntries(Object.entries(control.requestHeaders ?? {}).map(([k, v]) => [k.toLowerCase(), v.trim()]))
-    const prbHdrs = Object.fromEntries(Object.entries(probe.requestHeaders ?? {}).map(([k, v]) => [k.toLowerCase(), v.trim()]))
-    if (claim.boundaryClass !== 'access' && Object.entries(ctlHdrs).some(([k, v]) => v.length > 0 && (/^(?:authorization|proxy-authorization|cookie|x-api-key|x-auth.*)$/.test(k) && (!prbHdrs[k] || /kovo-synth-invalid-/i.test(v))))) {
-      return { claim, passed: false, detail: 'Auth boundary claim rejected (R4-H-7): control carried an extra or synthetic invalid credential absent from probe (self-sabotaged control).', observed: { ...assessment.evidence, rejectedBy: 'self_sabotaged_control' } }
-    }
+    const ctlCheck = assertLegitimateControl({ spec: DEFAULT_ORACLE_SPEC_REGISTRY.get(claim.boundaryClass === 'access' ? 'impact:authorization' : 'auth_bypass')!, control: impactStepToControlExchange(control, context.factLog?.getExchange(claim.controlExchangeId)?.wireCredentialProvenance), probe: impactStepToControlExchange(probe, context.factLog?.getExchange(claim.probeExchangeId)?.wireCredentialProvenance), boundaryClass: claim.boundaryClass, requireAnonymousAblation: false })
+    if (!ctlCheck.ok) return { claim, passed: false, detail: ctlCheck.reason, observed: { ...assessment.evidence, rejectedBy: ctlCheck.rejectedBy ?? 'self_sabotaged_control' } }
     const anonCtrl = !control.actor.handle && control.actor.auth === 'unknown'
     const authProbe = Boolean(probe.actor.handle) || probe.actor.auth !== 'unknown'
     if (anonCtrl && authProbe && (claim.boundaryClass === 'auth' || isMutatingMethod(probe.method) ||

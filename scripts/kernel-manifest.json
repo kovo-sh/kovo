@@ -15,6 +15,11 @@
     "src/server/nonce-ledger.ts",
     "src/server/oracle-invariants.ts",
     "src/server/oracle-spec.ts",
+    "src/server/proof-kernel/boolean-differential.ts",
+    "src/server/proof-kernel/control-legitimacy.ts",
+    "src/server/proof-kernel/index.ts",
+    "src/server/proof-kernel/publicness.ts",
+    "src/server/proof-kernel/reflection.ts",
     "src/server/proof-receipt.ts",
     "src/server/replay-verifier.ts",
     "src/server/retest-health.ts",
@@ -184,9 +189,7 @@
         "src/server/terminal-oracle-registry.ts::evaluateTerminalOracle",
         "src/server/v8-oracle-families.ts::evaluateV8OracleFamily",
         "src/server/verify-claims.ts::evaluateClaims",
-        "src/server/verify-prove-handlers.ts::handleProveDifferential",
-        "src/server/verify-prove-handlers.ts::handleProveRace",
-        "src/server/verify-prove-handlers.ts::handleProveSignedUrlMint"
+        "src/server/verify-prove-handlers.ts::handleProveRace"
       ]
     },
     {
@@ -206,6 +209,71 @@
       ]
     },
     {
+      "file": "src/server/proof-kernel/boolean-differential.ts",
+      "reasons": [
+        "call_graph_reachable",
+        "export_signature"
+      ],
+      "matchedExports": [
+        "assessBooleanDifferential"
+      ],
+      "reachableFrom": [
+        "src/server/proof-receipt.ts::verifyReceipt",
+        "src/server/verify-claims.ts::evaluateClaims",
+        "src/server/verify-prove-handlers.ts::handleProveDifferential"
+      ]
+    },
+    {
+      "file": "src/server/proof-kernel/control-legitimacy.ts",
+      "reasons": [
+        "call_graph_reachable"
+      ],
+      "matchedExports": [],
+      "reachableFrom": [
+        "src/server/proof-receipt.ts::verifyReceipt"
+      ]
+    },
+    {
+      "file": "src/server/proof-kernel/index.ts",
+      "reasons": [
+        "call_graph_reachable"
+      ],
+      "matchedExports": [],
+      "reachableFrom": [
+        "src/server/proof-kernel/boolean-differential.ts::re-export",
+        "src/server/proof-kernel/control-legitimacy.ts::re-export",
+        "src/server/proof-kernel/publicness.ts::re-export",
+        "src/server/proof-kernel/reflection.ts::re-export"
+      ]
+    },
+    {
+      "file": "src/server/proof-kernel/publicness.ts",
+      "reasons": [
+        "call_graph_reachable",
+        "export_signature"
+      ],
+      "matchedExports": [
+        "assessPublicness"
+      ],
+      "reachableFrom": [
+        "src/server/proof-receipt.ts::verifyReceipt"
+      ]
+    },
+    {
+      "file": "src/server/proof-kernel/reflection.ts",
+      "reasons": [
+        "call_graph_reachable"
+      ],
+      "matchedExports": [],
+      "reachableFrom": [
+        "src/server/oracle-invariants.ts::assessMfaBypass",
+        "src/server/proof-receipt.ts::verifyReceipt",
+        "src/server/verify-claims.ts::evaluateClaims",
+        "src/server/verify-prove-handlers.ts::handleProveRace",
+        "src/server/verify-prove-handlers.ts::handleProveSignedUrlMint"
+      ]
+    },
+    {
       "file": "src/server/proof-receipt.ts",
       "reasons": [
         "call_graph_reachable",
@@ -216,7 +284,6 @@
       ],
       "reachableFrom": [
         "src/server/terminal-oracle-registry.ts::evaluateTerminalOracle",
-        "src/server/verify-claims.ts::evaluateClaims",
         "src/server/verify-prove-handlers.ts::handleProveDifferential",
         "src/server/verify-prove-handlers.ts::handleProveInjection",
         "src/server/verify-prove-handlers.ts::handleProveRace",

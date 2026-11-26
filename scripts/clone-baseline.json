@@ -212,18 +212,6 @@
       ]
     },
     {
-      "hash": "96d645bf4205ff1b",
-      "lines": 13,
-      "files": [
-        "src/server/oracle-invariants.ts",
-        "src/server/proof-receipt.ts"
-      ],
-      "sampleNames": [
-        "impactStepToBooleanArm",
-        "stepToBooleanArm"
-      ]
-    },
-    {
       "hash": "ab49d438cd3146f1",
       "lines": 7,
       "files": [

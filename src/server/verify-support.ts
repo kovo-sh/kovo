@@ -22,9 +22,16 @@ import type { CanaryBroker } from './canary-broker.ts'
 import { isDerivedCapabilityHandle, type InjectCapabilityTarget } from './derived-custody.ts'
 import type { HostCredentialPlacement } from './host-fact-log.ts'
 import {
-  canonicalPredicateSkeleton,
-  normalizeCarrierForAntiReflection,
-} from './oracle-invariants.ts'
+  stripBooleanPredicateSuffix,
+  verifyBooleanArmBaseParityCore,
+} from './proof-kernel/boolean-differential.ts'
+export { stripBooleanPredicateSuffix }
+import {
+  carrierEchoesSignedUrlNeedles,
+  hasTraversalOrSeparatorDifferential,
+  normalizeRequestCarrier,
+  type NormalizedRequestCarrier,
+} from './proof-kernel/reflection.ts'
 import type { ResolvedPersona } from './persona-vault.ts'
 import type { HostMintedBooleanPairChallenge } from './proof-receipt.ts'
 import { responseSimilarity } from './probes/context.ts'
@@ -557,10 +564,6 @@ export interface HostMintedBooleanPair {
   readonly mintedAtMs: number
 }
 
-function sortedCharMultiset(value: string): string {
-  return [...value].sort().join('')
-}
-
 /**
  * R4-C-1 / R3-C-4: Mint a randomized host-owned boolean predicate pair bound to a non-empty `baseValue`.
  * Routes through `options.oracle.mintBooleanPair` (e.g. `defaultHostMintedOracle`) when provided so
@@ -618,31 +621,10 @@ export function mintHostBooleanPair(
   })
 }
 
-const STANDALONE_EMPTY_BASE_PRED_RE = /^\s*(?:['")]*\s*(?:AND|OR|&&|\|\|)\s*)?(?:NOT\s+)?\(?\s*(?:\d+\s*(?:==|=|!=|<>)\s*\d+(?:\s*[+-]\s*\d+)?|['"][^'"]*['"]\s*(?:==|=|!=|<>)\s*['"][^'"]*['"]?|(?:TRUE|FALSE))\s*\)?\s*(?:--[^\r\n]*|#[^\r\n]*|\/\*[\s\S]*?\*\/)?\s*$/i
-
 /**
- * Strip a trailing explicit boolean predicate expression via the single authoritative
- * `canonicalPredicateSkeleton` parser from `oracle-invariants.ts` (R4-C-1: zero parser drift).
- */
-export function stripBooleanPredicateSuffix(raw: string): {
-  baseValue: string
-  predicateTruth: boolean | null
-  predicateText: string | null
-  skeleton: string | null
-} {
-  const parsed = canonicalPredicateSkeleton(raw)
-  if (!parsed) return { baseValue: raw, predicateTruth: null, predicateText: null, skeleton: null }
-  return {
-    baseValue: parsed.baseValue,
-    predicateTruth: parsed.truth,
-    predicateText: parsed.predicateClause,
-    skeleton: parsed.skeleton,
-  }
-}
-
-/**
- * R4-C-1 / R3-C-4: Enforce byte-identical non-empty base values, identical canonical predicate
- * skeletons, and equal-length/same-character-multiset invariants across boolean differential arms.
+ * R4-C-1 / R3-17: Handler-side defense-in-depth wrapper into `proof-kernel/boolean-differential.ts`
+ * enforcing byte-identical non-empty base values, canonical predicate skeletons, and
+ * equal-length/same-character-multiset invariants before probe dispatch.
  */
 export function verifyBooleanArmBaseParity(input: {
   controlValue: string
@@ -650,87 +632,7 @@ export function verifyBooleanArmBaseParity(input: {
   baselineValue?: string
   hostPair?: HostMintedBooleanPair
 }): { ok: true; sharedBase: string | null; controlTruth: boolean | null; variantTruth: boolean | null } | { ok: false; reason: string } {
-  if (input.hostPair) {
-    const pair = input.hostPair
-    if (pair.baseValue.trim().length === 0) {
-      return { ok: false, reason: 'host-minted boolean pair has an empty base value' }
-    }
-    if (
-      pair.trueValue.length !== pair.falseValue.length
-      || pair.trueValue === pair.falseValue
-      || sortedCharMultiset(pair.trueValue) !== sortedCharMultiset(pair.falseValue)
-    ) {
-      return { ok: false, reason: 'host-minted boolean pair violates equal-length and identical character-multiset invariants' }
-    }
-    if (input.baselineValue !== undefined && input.baselineValue !== pair.baseValue) {
-      return { ok: false, reason: `baseline value "${input.baselineValue}" does not match host-minted base "${pair.baseValue}"` }
-    }
-    const ctlIsTrue = input.controlValue === pair.trueValue && input.variantValue === pair.falseValue
-    const ctlIsFalse = input.controlValue === pair.falseValue && input.variantValue === pair.trueValue
-    if (!ctlIsTrue && !ctlIsFalse) {
-      return { ok: false, reason: 'control and variant arms do not match the host-minted boolean pair' }
-    }
-    return { ok: true, sharedBase: pair.baseValue, controlTruth: ctlIsTrue, variantTruth: ctlIsFalse }
-  }
-
-  const ctl = stripBooleanPredicateSuffix(input.controlValue)
-  const vr = stripBooleanPredicateSuffix(input.variantValue)
-  const base = input.baselineValue !== undefined ? stripBooleanPredicateSuffix(input.baselineValue) : null
-
-  if ((base && base.predicateTruth !== null) || (input.baselineValue !== undefined && STANDALONE_EMPTY_BASE_PRED_RE.test(input.baselineValue))) {
-    return { ok: false, reason: 'baseline arm must carry a benign non-predicate base value' }
-  }
-  if ((ctl.predicateTruth === null && STANDALONE_EMPTY_BASE_PRED_RE.test(input.controlValue)) || (vr.predicateTruth === null && STANDALONE_EMPTY_BASE_PRED_RE.test(input.variantValue))) {
-    return { ok: false, reason: 'empty-base or standalone boolean predicates are forbidden' }
-  }
-  if (ctl.predicateTruth !== null && vr.predicateTruth !== null) {
-    if (ctl.predicateTruth === vr.predicateTruth) {
-      return { ok: false, reason: 'boolean differential arms must carry opposite explicit boolean predicates' }
-    }
-    if (ctl.baseValue !== vr.baseValue) {
-      return {
-        ok: false,
-        reason: `boolean predicate arms have mismatched base values ("${ctl.baseValue}" vs "${vr.baseValue}"); arms must share the identical base value`,
-      }
-    }
-    if (input.baselineValue !== undefined && input.baselineValue !== ctl.baseValue) {
-      return {
-        ok: false,
-        reason: `baseline value "${input.baselineValue}" does not match boolean arm base "${ctl.baseValue}"`,
-      }
-    }
-    if (ctl.skeleton !== vr.skeleton) {
-      return {
-        ok: false,
-        reason: 'boolean predicate arms must share the exact canonical predicate skeleton',
-      }
-    }
-    if (input.controlValue.length !== input.variantValue.length || sortedCharMultiset(input.controlValue) !== sortedCharMultiset(input.variantValue)) {
-      return {
-        ok: false,
-        reason: 'boolean predicate arms must have identical byte length and character multiset',
-      }
-    }
-    return { ok: true, sharedBase: ctl.baseValue, controlTruth: ctl.predicateTruth, variantTruth: vr.predicateTruth }
-  }
-  if (ctl.predicateTruth !== null || vr.predicateTruth !== null) {
-    const predArm = ctl.predicateTruth !== null ? ctl : vr
-    const benignVal = ctl.predicateTruth !== null ? input.variantValue : input.controlValue
-    if (predArm.baseValue !== benignVal) {
-      return {
-        ok: false,
-        reason: `boolean predicate arm base "${predArm.baseValue}" does not match benign arm value "${benignVal}"`,
-      }
-    }
-    if (input.baselineValue !== undefined && input.baselineValue !== benignVal) {
-      return {
-        ok: false,
-        reason: `baseline value "${input.baselineValue}" does not match shared base "${benignVal}"`,
-      }
-    }
-    return { ok: true, sharedBase: benignVal, controlTruth: ctl.predicateTruth, variantTruth: vr.predicateTruth }
-  }
-  return { ok: true, sharedBase: input.baselineValue ?? null, controlTruth: null, variantTruth: null }
+  return verifyBooleanArmBaseParityCore(input)
 }
 
 // ---------------------------------------------------------------------------
@@ -1336,31 +1238,6 @@ function containsRedactedRequestPlane(exchange: SignedUrlMintExchange): boolean 
   return REDACTED_PLACEHOLDER_RE.test(requestCarrierText(exchange))
 }
 
-interface NormalizedSignedUrlCarrier {
-  readonly raw: string
-  readonly malformedEscape: boolean
-  readonly malformedReason: string | null
-  readonly decodedComponents: string[]
-  readonly comparables: string[]
-  readonly alnumCores: string[]
-  readonly params: Record<string, string>
-}
-
-const MALFORMED_JSON_UNICODE_RE = /\\u(?![0-9a-fA-F]{4})/
-const MALFORMED_PERCENT_RE = /%(?![0-9a-fA-F]{2})/
-
-function safeDecodePercentComponent(raw: string): { ok: true; value: string } | { ok: false; reason: string } {
-  const spaced = raw.replace(/\+/g, ' ')
-  if (MALFORMED_PERCENT_RE.test(spaced)) {
-    return { ok: false, reason: 'malformed_percent_escape' }
-  }
-  try {
-    return { ok: true, value: decodeURIComponent(spaced) }
-  } catch {
-    return { ok: false, reason: 'invalid_utf8_percent_escape' }
-  }
-}
-
 function stableCanonicalJson(value: unknown, depth = 0): string {
   if (depth > 8) return 'null'
   if (value === null || typeof value !== 'object') return JSON.stringify(value)
@@ -1386,177 +1263,10 @@ function canonicalExchangeBody(exchange: SignedUrlMintExchange): string {
   return ''
 }
 
-/**
- * R4-C-6: Per-component, fail-closed request carrier normalizer backed by
- * `normalizeCarrierForAntiReflection` (rejects malformed percent & JSON unicode escapes;
- * decodes valid per-component percent and JSON `\uXXXX` escapes).
- */
-function normalizeSignedUrlExchangeCarrier(exchange: SignedUrlMintExchange): NormalizedSignedUrlCarrier {
-  const raw = requestCarrierText(exchange)
-  const decodedComponents: string[] = []
-  const comparables: string[] = []
-  const alnumCores: string[] = []
-  const params: Record<string, string> = {}
-  let malformedEscape = false
-  let malformedReason: string | null = null
-
-  const pushComponent = (text: string, decodePercent: boolean) => {
-    if (!text) return
-    const norm = normalizeCarrierForAntiReflection(text, { decodePercent })
-    if (decodePercent && norm.hadMalformedPercentEscape) {
-      malformedEscape = true
-      malformedReason = malformedReason ?? 'malformed_percent_escape'
-    }
-    decodedComponents.push(text)
-    if (norm.comparable) comparables.push(norm.comparable)
-    if (norm.alnumCore) alnumCores.push(norm.alnumCore)
-  }
-
-  const pq = exchange.pathAndQuery || '/'
-  const qIdx = pq.indexOf('?')
-  const rawPath = qIdx >= 0 ? pq.slice(0, qIdx) : pq
-  for (const seg of rawPath.split('/').filter(Boolean)) {
-    const dec = safeDecodePercentComponent(seg)
-    if (!dec.ok) {
-      malformedEscape = true
-      malformedReason = malformedReason ?? dec.reason
-    } else {
-      pushComponent(dec.value, false)
-    }
-    pushComponent(seg, true)
-  }
-  if (qIdx >= 0) {
-    const rawQuery = pq.slice(qIdx + 1).split('#')[0] ?? ''
-    for (const pair of rawQuery.split('&')) {
-      if (!pair) continue
-      const eq = pair.indexOf('=')
-      const rawKey = eq >= 0 ? pair.slice(0, eq) : pair
-      const rawVal = eq >= 0 ? pair.slice(eq + 1) : ''
-      const decKey = safeDecodePercentComponent(rawKey)
-      const decVal = safeDecodePercentComponent(rawVal)
-      if (!decKey.ok || !decVal.ok) {
-        malformedEscape = true
-        malformedReason = malformedReason ?? (!decKey.ok ? decKey.reason : (!decVal.ok ? decVal.reason : 'malformed_percent_escape'))
-      } else {
-        params[decKey.value] = decVal.value
-        pushComponent(decKey.value, false)
-        pushComponent(decVal.value, false)
-      }
-      pushComponent(rawKey, true)
-      pushComponent(rawVal, true)
-    }
-  }
-
-  const bodyText = typeof exchange.requestBody === 'string'
-    ? exchange.requestBody
-    : exchange.requestJson !== undefined
-      ? (typeof exchange.requestJson === 'string' ? exchange.requestJson : JSON.stringify(exchange.requestJson))
-      : ''
-  if (bodyText) {
-    const trimmed = bodyText.trim()
-    const looksJson = trimmed.startsWith('{') || trimmed.startsWith('[')
-    if (looksJson && MALFORMED_JSON_UNICODE_RE.test(bodyText)) {
-      malformedEscape = true
-      malformedReason = malformedReason ?? 'malformed_json_unicode_escape'
-    }
-    let parsedJson: unknown = exchange.requestJson
-    if (parsedJson === undefined && looksJson) {
-      try { parsedJson = JSON.parse(bodyText) } catch { parsedJson = undefined }
-    } else if (typeof parsedJson === 'string' && (parsedJson.trim().startsWith('{') || parsedJson.trim().startsWith('['))) {
-      try { parsedJson = JSON.parse(parsedJson) } catch { /* keep string */ }
-    }
-    if (parsedJson !== undefined && parsedJson !== null && typeof parsedJson === 'object') {
-      const flatten = (val: unknown, prefix = '', depth = 0): void => {
-        if (depth > 5 || val === null || val === undefined) return
-        if (typeof val === 'string' || typeof val === 'number' || typeof val === 'boolean') {
-          const s = String(val)
-          params[`body:${prefix || '$'}`] = s
-          pushComponent(s, false)
-          return
-        }
-        if (Array.isArray(val)) {
-          val.slice(0, 32).forEach((item, idx) => flatten(item, `${prefix}[${idx}]`, depth + 1))
-          return
-        }
-        for (const [k, child] of Object.entries(val as Record<string, unknown>)) {
-          flatten(child, prefix ? `${prefix}.${k}` : k, depth + 1)
-        }
-      }
-      flatten(parsedJson)
-      pushComponent(bodyText, false)
-    } else if (!looksJson && bodyText.includes('=')) {
-      for (const pair of bodyText.split('&')) {
-        if (!pair) continue
-        const eq = pair.indexOf('=')
-        const rk = eq >= 0 ? pair.slice(0, eq) : pair
-        const rv = eq >= 0 ? pair.slice(eq + 1) : ''
-        const dk = safeDecodePercentComponent(rk)
-        const dv = safeDecodePercentComponent(rv)
-        if (!dk.ok || !dv.ok) {
-          malformedEscape = true
-          malformedReason = malformedReason ?? (!dk.ok ? dk.reason : (!dv.ok ? dv.reason : 'malformed_percent_escape'))
-        } else {
-          params[`body:${dk.value}`] = dv.value
-          pushComponent(dk.value, false)
-          pushComponent(dv.value, false)
-        }
-      }
-    } else {
-      params['body:$'] = bodyText
-      pushComponent(bodyText, false)
-    }
-  }
-
-  for (const [k, v] of Object.entries(exchange.requestHeaders ?? {})) {
-    if (!v) continue
-    pushComponent(`${k}:${v}`, false)
-    pushComponent(v, false)
-  }
-
-  return { raw, malformedEscape, malformedReason, decodedComponents, comparables, alnumCores, params }
-}
-
-function isSignatureOrUrlEchoedFromCarrier(carrier: NormalizedSignedUrlCarrier, signed: ParsedSignedCloudUrl): boolean {
-  if (carrier.malformedEscape) return true
-  const rawNeedles = [signed.signature, signed.rawUrl]
-  const decSig = safeDecodePercentComponent(signed.signature)
-  if (decSig.ok && decSig.value !== signed.signature) rawNeedles.push(decSig.value)
-  for (const needle of rawNeedles) {
-    if (needle.length < 16) continue
-    const normNeedle = normalizeCarrierForAntiReflection(needle, { decodePercent: false })
-    if (carrier.raw.includes(needle)) return true
-    if (carrier.decodedComponents.some(c => c.includes(needle))) return true
-    if (normNeedle.comparable.length >= 16 && carrier.comparables.some(c => c.includes(normNeedle.comparable))) return true
-    if (normNeedle.alnumCore.length >= 16 && carrier.alnumCores.some(c => c.includes(normNeedle.alnumCore))) return true
-  }
-  return false
-}
-
 function normalizedPersonaHandle(value: string | null | undefined): string | null {
   const trimmed = (value ?? '').trim().toLowerCase()
   if (!trimmed || /^(?:anonymous|anon|unauthenticated|none)$/.test(trimmed)) return null
   return trimmed
-}
-
-function hasSingleDifferingTraversalInput(
-  ctlCarrier: NormalizedSignedUrlCarrier,
-  prbCarrier: NormalizedSignedUrlCarrier,
-): boolean {
-  const allKeys = [...new Set([...Object.keys(ctlCarrier.params), ...Object.keys(prbCarrier.params)])]
-  if (allKeys.length === 0) return false
-  const diffKeys = allKeys.filter(k => (ctlCarrier.params[k] ?? '') !== (prbCarrier.params[k] ?? ''))
-  if (diffKeys.length !== 1) return false
-  const soleKey = diffKeys[0]!
-  const ctlVal = ctlCarrier.params[soleKey] ?? ''
-  const prbVal = prbCarrier.params[soleKey] ?? ''
-  const prbNorm = normalizeCarrierForAntiReflection(prbVal, { decodePercent: true }).comparable
-  const hasDotDot = prbVal.includes('..') || prbNorm.includes('..')
-  if (hasDotDot) return true
-  const ctlHasSep = /[\\/]/.test(ctlVal)
-  const prbHasSep = /[\\/]/.test(prbVal) || /[\\/]/.test(prbNorm)
-  if (!ctlHasSep && prbHasSep) return true
-  if (ctlVal.length > 0 && prbVal.startsWith(ctlVal) && /[\\/]/.test(prbVal.slice(ctlVal.length))) return true
-  return false
 }
 
 function isUnauthenticatedExchange(exchange: SignedUrlMintExchange): boolean {
@@ -1585,7 +1295,7 @@ function isUnauthenticatedExchange(exchange: SignedUrlMintExchange): boolean {
 function hasPathInjectionIntoNestedDir(
   control: ParsedSignedCloudUrl,
   probe: ParsedSignedCloudUrl,
-  prbCarrier: NormalizedSignedUrlCarrier,
+  prbCarrier: NormalizedRequestCarrier,
 ): boolean {
   if (prbCarrier.malformedEscape) return false
   if (probe.normalizedParentDir === control.normalizedParentDir) return false
@@ -1593,7 +1303,7 @@ function hasPathInjectionIntoNestedDir(
   const ctlSegs = control.normalizedParentDir.split('/').filter(Boolean)
   const extraSegs = probeSegs.slice(ctlSegs.length).filter(seg => seg !== '<dynamic>' && seg.length >= 2)
   if (extraSegs.length === 0) return false
-  const decodedAll = [...prbCarrier.decodedComponents, ...prbCarrier.comparables].join('\n').toLowerCase()
+  const decodedAll = [...prbCarrier.inputComponents, ...prbCarrier.comparables].join('\n').toLowerCase()
   const hasSep = decodedAll.includes('/') || decodedAll.includes('..') || decodedAll.includes('\\')
   return hasSep && extraSegs.some(seg => decodedAll.includes(seg))
 }
@@ -1650,9 +1360,9 @@ export function assessSignedUrlMintDifferential(input: {
     )
   }
 
-  const ctlCarrier = normalizeSignedUrlExchangeCarrier(control)
-  const prbCarrier = normalizeSignedUrlExchangeCarrier(probe)
-  const ablCarrier = ablation ? normalizeSignedUrlExchangeCarrier(ablation) : null
+  const ctlCarrier = normalizeRequestCarrier(control)
+  const prbCarrier = normalizeRequestCarrier(probe)
+  const ablCarrier = ablation ? normalizeRequestCarrier(ablation) : null
   if (ctlCarrier.malformedEscape || prbCarrier.malformedEscape || ablCarrier?.malformedEscape) {
     const reason = ctlCarrier.malformedEscape
       ? `Signed-URL control request contained a malformed escape (${ctlCarrier.malformedReason}); anti-reflection fails closed.`
@@ -1713,7 +1423,7 @@ export function assessSignedUrlMintDifferential(input: {
     )
   }
 
-  const nonEchoedProbeUrls = probeExtracted.urls.filter(u => !isSignatureOrUrlEchoedFromCarrier(prbCarrier, u))
+  const nonEchoedProbeUrls = probeExtracted.urls.filter(u => !carrierEchoesSignedUrlNeedles(prbCarrier, [u.signature, u.rawUrl]))
   if (nonEchoedProbeUrls.length === 0) {
     return fail(
       'signed_url_echoed',
@@ -1746,7 +1456,7 @@ export function assessSignedUrlMintDifferential(input: {
         'Control returned 2xx but did not contain a valid cloud-storage signed URL for baseline comparison.',
       )
     }
-    const nonEchoedControlUrls = ctlExtracted.urls.filter(u => !isSignatureOrUrlEchoedFromCarrier(ctlCarrier, u))
+    const nonEchoedControlUrls = ctlExtracted.urls.filter(u => !carrierEchoesSignedUrlNeedles(ctlCarrier, [u.signature, u.rawUrl]))
     if (nonEchoedControlUrls.length === 0) {
       return fail(
         'signed_url_control_echoed',
@@ -1762,11 +1472,11 @@ export function assessSignedUrlMintDifferential(input: {
       )
     }
 
-    const hasBoundTraversalInput = hasSingleDifferingTraversalInput(ctlCarrier, prbCarrier)
+    const hasBoundTraversalInput = hasTraversalOrSeparatorDifferential(ctlCarrier, prbCarrier, 'single_param')
     const ablationUrls = (() => {
       if (!ablation || !ablCarrier) return null
       if (ablation.status === null || ablation.status < 200 || ablation.status >= 300) return []
-      return extractSignedCloudUrls(ablation).urls.filter(u => !isSignatureOrUrlEchoedFromCarrier(ablCarrier, u))
+      return extractSignedCloudUrls(ablation).urls.filter(u => !carrierEchoesSignedUrlNeedles(ablCarrier, [u.signature, u.rawUrl]))
     })()
 
     let sawSameSignature = false

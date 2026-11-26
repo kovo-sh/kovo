@@ -1,0 +1,130 @@
+{
+  "id": "r3-17-claude-bypass-review-fp",
+  "side": "fp",
+  "source": "independent_review",
+  "archetype": "r3-17-sabotaged-denied-control-different-path",
+  "description": "Independent-review FP: the denied control targets a different (admin) path with a malformed extra query param while the probe is a legitimate same-tenant read of the member's own record. Under the unified control-legitimacy and must_be_non_public stages this must dismiss (control not differing only in persona/tenant).",
+  "covers": {
+    "files": [
+      "src/server/oracle-invariants.ts",
+      "src/server/oracle-spec.ts",
+      "src/server/proof-kernel/boolean-differential.ts",
+      "src/server/proof-kernel/control-legitimacy.ts",
+      "src/server/proof-kernel/index.ts",
+      "src/server/proof-kernel/publicness.ts",
+      "src/server/proof-kernel/reflection.ts",
+      "src/server/proof-receipt.ts",
+      "src/server/terminal-oracle-registry.ts",
+      "src/server/v8-oracle-hydrate.ts",
+      "src/server/verify-claims.ts",
+      "src/server/verify-support.ts"
+    ],
+    "classes": [
+      "authorization",
+      "bola",
+      "disclosure",
+      "auth_bypass",
+      "signed_url_mint"
+    ]
+  },
+  "canonicalLabel": {
+    "cwe": "CWE-639",
+    "category": "authorization",
+    "title": "Own-tenant read paired with a control on a different path must dismiss",
+    "impact": "Probe reads the caller's own tenant record; no cross-tenant crossing.",
+    "claimedImpact": "authorization",
+    "claimedBoundary": "access",
+    "vulnClass": "bola"
+  },
+  "freeTextLabel": {
+    "title": "Order read denied on sibling admin path"
+  },
+  "paths": {
+    "replay": true,
+    "floorReceipt": true,
+    "evaluateClaims": true,
+    "composite": false,
+    "floorInjectionRecipe": false,
+    "proofReceipt": true
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [
+    {
+      "handle": "member_a",
+      "roleLabel": "member (tenant-a)",
+      "role": "member",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-r317-review-member-a-token"
+    },
+    {
+      "handle": "member_b",
+      "roleLabel": "member (tenant-b)",
+      "role": "member",
+      "tenant": "tenant-b",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-r317-review-member-b-token"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "ctl_wrong_path",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/admin/orders/ord-a-1?filter=%zz",
+      "persona": "member_b",
+      "status": 403,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"error\":\"forbidden\"}"
+    },
+    {
+      "id": "prb_own_record",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/orders/ord-a-1",
+      "persona": "member_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"id\":\"ord-a-1\",\"tenant\":\"tenant-a\",\"status\":\"shipped\"}"
+    }
+  ],
+  "replaySpec": {
+    "assertionsJq": "{ controlPassed: (.steps.ctl_wrong_path.status == 403), confirmed: (.steps.prb_own_record.status == 200), observed: .steps.prb_own_record.json.status, expected: \"403\" }"
+  },
+  "proofReceipt": {
+    "vulnClass": "bola",
+    "targetMethod": "GET",
+    "targetPathAndQuery": "/api/orders/ord-a-1",
+    "claimedDelta": "Denied control on a different admin path with a malformed query param versus a 200 same-tenant read."
+  },
+  "claims": [
+    {
+      "kind": "impact",
+      "impactClass": "authorization",
+      "probeExchangeId": "prb_own_record",
+      "controlExchangeIds": [
+        "ctl_wrong_path"
+      ]
+    }
+  ],
+  "bareClaims": [
+    {
+      "kind": "boundary",
+      "boundaryClass": "access",
+      "controlExchangeId": "ctl_wrong_path",
+      "probeExchangeId": "prb_own_record"
+    }
+  ]
+}

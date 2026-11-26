@@ -130,21 +130,34 @@ function normalizeRelPath(rootDir: string, absPath: string): string {
   return relative(rootDir, absPath).replace(/\\/g, '/')
 }
 
-function isTopLevelServerSource(relPath: string): boolean {
+function isServerSource(relPath: string): boolean {
   if (!relPath.startsWith('src/server/')) return false
-  if (relPath.slice('src/server/'.length).includes('/')) return false
+  // `src/server/probes/**` holds scanner probe generators/context helpers, not confirmation-kernel verifiers.
+  if (relPath.startsWith('src/server/probes/')) return false
   if (!relPath.endsWith('.ts')) return false
   if (TEST_FILE_RE.test(relPath)) return false
   return true
 }
 
-function listTopLevelServerFiles(rootDir: string): string[] {
+function listServerFiles(rootDir: string): string[] {
   const serverDir = join(rootDir, 'src', 'server')
   if (!existsSync(serverDir)) return []
-  return readdirSync(serverDir)
-    .filter(name => name.endsWith('.ts') && !TEST_FILE_RE.test(name))
-    .sort()
-    .map(name => join(serverDir, name))
+  const out: string[] = []
+  const walk = (dir: string): void => {
+    const entries = readdirSync(dir, { withFileTypes: true })
+    entries.sort((a, b) => a.name.localeCompare(b.name))
+    for (const entry of entries) {
+      if (entry.isSymbolicLink()) continue
+      const full = join(dir, entry.name)
+      if (entry.isDirectory()) {
+        walk(full)
+      } else if (entry.isFile() && entry.name.endsWith('.ts') && !TEST_FILE_RE.test(entry.name)) {
+        out.push(full)
+      }
+    }
+  }
+  walk(serverDir)
+  return out
 }
 
 function extractValueExportNames(sf: ts.SourceFile): Map<string, ts.Node> {
@@ -210,7 +223,7 @@ function unwrapCallableDeclaration(decl: ts.Declaration): ts.Node | null {
  */
 export function scanKernelExportFiles(rootDir: string = REPO_ROOT): Map<string, string[]> {
   const absRoot = resolve(rootDir)
-  const files = listTopLevelServerFiles(absRoot)
+  const files = listServerFiles(absRoot)
   const program = ts.createProgram(files, {
     target: ts.ScriptTarget.ESNext,
     module: ts.ModuleKind.NodeNext,
@@ -222,7 +235,7 @@ export function scanKernelExportFiles(rootDir: string = REPO_ROOT): Map<string, 
   const matched = new Map<string, string[]>()
   for (const sf of program.getSourceFiles()) {
     const rel = normalizeRelPath(absRoot, sf.fileName)
-    if (!isTopLevelServerSource(rel)) continue
+    if (!isServerSource(rel)) continue
     const exportsMap = extractValueExportNames(sf)
     const hits = [...exportsMap.keys()].filter(name => KERNEL_EXPORT_RE.test(name)).sort()
     if (hits.length > 0) {
@@ -238,7 +251,7 @@ export function scanKernelExportFiles(rootDir: string = REPO_ROOT): Map<string, 
  */
 export function generateKernelManifest(rootDir: string = REPO_ROOT): KernelManifest {
   const absRoot = resolve(rootDir)
-  const files = listTopLevelServerFiles(absRoot)
+  const files = listServerFiles(absRoot)
   const program = ts.createProgram(files, {
     target: ts.ScriptTarget.ESNext,
     module: ts.ModuleKind.NodeNext,
@@ -253,7 +266,7 @@ export function generateKernelManifest(rootDir: string = REPO_ROOT): KernelManif
   const exportsByRel = new Map<string, Map<string, ts.Node>>()
   for (const sf of program.getSourceFiles()) {
     const rel = normalizeRelPath(absRoot, sf.fileName)
-    if (!isTopLevelServerSource(rel)) continue
+    if (!isServerSource(rel)) continue
     sourceByRel.set(rel, sf)
     exportsByRel.set(rel, extractValueExportNames(sf))
   }
@@ -316,7 +329,7 @@ export function generateKernelManifest(rootDir: string = REPO_ROOT): KernelManif
           for (const decl of sym.declarations) {
             const targetSf = decl.getSourceFile()
             const targetRel = normalizeRelPath(absRoot, targetSf.fileName)
-            if (!isTopLevelServerSource(targetRel)) continue
+            if (!isServerSource(targetRel)) continue
             if (NON_KERNEL_INFRA_BOUNDARY_FILES.has(targetRel)) continue
             ensureFile(targetRel)
             reasonsByFile.get(targetRel)!.add('call_graph_reachable')
@@ -333,6 +346,23 @@ export function generateKernelManifest(rootDir: string = REPO_ROOT): KernelManif
       ts.forEachChild(curr, walk)
     }
     walk(node)
+  }
+
+  // Seed 4: Include pure star-re-export kernel barrels (`export * from './x'`) whose targets
+  // are confirmation-kernel files (e.g. `src/server/proof-kernel/index.ts`).
+  for (const [rel, sf] of sourceByRel) {
+    if (reasonsByFile.has(rel) || NON_KERNEL_INFRA_BOUNDARY_FILES.has(rel)) continue
+    for (const stmt of sf.statements) {
+      if (!ts.isExportDeclaration(stmt) || stmt.isTypeOnly || stmt.exportClause || !stmt.moduleSpecifier || !ts.isStringLiteral(stmt.moduleSpecifier)) continue
+      const specText = stmt.moduleSpecifier.text
+      if (!specText.startsWith('.')) continue
+      const resolved = normalizeRelPath(absRoot, resolve(join(absRoot, rel, '..'), specText))
+      if (reasonsByFile.has(resolved)) {
+        ensureFile(rel)
+        reasonsByFile.get(rel)!.add('call_graph_reachable')
+        reachableFromByFile.get(rel)!.add(`${resolved}::re-export`)
+      }
+    }
   }
 
   const sortedFiles = [...reasonsByFile.keys()].sort()

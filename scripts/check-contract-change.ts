@@ -150,7 +150,7 @@ export interface CheckGitRepoOptions {
 export const EXTENDED_CONTRACT_TEST_RE = /^tests\/(?:r2-|r3-|.*security).*\.test\.ts$/
 
 export const CONFIRMATION_KERNEL_FILE_RE =
-  /^src\/server\/(?:replay-verifier|verify-claims|proof-receipt|floor-recipe[^/]*|composite-receipt|composite-terminal|composite-autodag|oracle-invariants|exec-verify|v8-oracle-[^/]*|verify-support|terminal-oracle-registry|verify-prove-handlers|verify-rpc|agent-script-proof|host-fact-log|causal-proof-compiler|retest-health)\.ts$/
+  /^src\/server\/(?:(?:replay-verifier|verify-claims|proof-receipt|floor-recipe[^/]*|composite-receipt|composite-terminal|composite-autodag|oracle-invariants|exec-verify|v8-oracle-[^/]*|verify-support|terminal-oracle-registry|verify-prove-handlers|verify-rpc|agent-script-proof|host-fact-log|causal-proof-compiler|retest-health)|proof-kernel\/[^/]+)\.ts$/
 
 const SCREAMING_TUNABLE_EXPORT_RE =
   /^\s*export\s+(?:const|let)\s+((?:[A-Z][A-Z0-9_]*_(?:DEFAULT|BUDGET|MS|CAP|IN_FLIGHT|RPS|LIMIT)|(?:[A-Z][A-Z0-9_]*_)?MAX_[A-Z0-9_]+))\b[^=]*=\s*(.+)$/

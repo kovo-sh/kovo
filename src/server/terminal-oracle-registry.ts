@@ -51,6 +51,18 @@ import {
   type EconomicAutoHydrateContext,
   type HydratableTranscriptIndex,
 } from './v8-oracle-hydrate.ts'
+import {
+  assertLegitimateControl,
+  extractV8KernelStageContext,
+  specDeclaresDeniedControl,
+  transcriptEntryToControlExchange,
+} from './proof-kernel/control-legitimacy.ts'
+import {
+  PublicnessReplayBudgetLedger,
+  evaluateMustBeNonPublicStage,
+  specRequiresNonPublic,
+  type PublicnessReplayEnvironmentMode,
+} from './proof-kernel/publicness.ts'
 
 import {
   DEFAULT_ORACLE_SPEC_REGISTRY,
@@ -60,6 +72,7 @@ import {
   getRegisteredClaimEvaluatorSpecs,
   labelToOracle,
   listRegisteredClaimEvaluatorKinds,
+  resolveReceiptRule,
   type LabelToOracleQuery,
   type OracleClaimKind,
   type OracleSpec,
@@ -113,6 +126,21 @@ export interface TerminalOraclePolicyContext {
   runId?: string
   /** Explicitly host-trusted composite verification options. */
   compositeOptions?: Omit<CompositeVerifyOptions, 'signingKey'>
+  /** R3-17: Environment mode enforced by budgeted publicness replay stage (defaults to `'prod_readonly'`). */
+  environmentMode?: PublicnessReplayEnvironmentMode
+  /** R3-17: Optional per-run finite budget ledger for active publicness replay checks. */
+  publicnessReplayBudget?: PublicnessReplayBudgetLedger
+  /** R3-17: Optional active unauthenticated replay probe executor gated by `publicnessReplayBudget`. */
+  publicnessReplayProbe?: (target: { method: string; route: string }) => ImpactStep | null
+  /** R3-17: Fail closed when active publicness replay is denied by budget or `prod_readonly` policy. */
+  failClosedOnPublicnessReplayDenied?: boolean
+  /** R3-17: Optional observer invoked whenever a spec-driven kernel stage executes. */
+  onKernelStageExecuted?: (event: {
+    stage: 'control_legitimacy' | 'must_be_non_public'
+    specId: string
+    ok: boolean
+    reason: string
+  }) => void
 }
 
 export interface TerminalOracleResult {
@@ -293,19 +321,109 @@ function checkHostCustodySignatures(
     ?? check(receipt.browserTraceIds, tracesById, 'browser trace')
 }
 
+function runSingleHopPreOracleStages(
+  spec: OracleSpec | undefined,
+  receipt: ProofReceipt,
+  transcript: HostSignedTranscript,
+  policy: TerminalOraclePolicyContext,
+  rule: SingleHopOracleRule,
+): ReceiptVerification | null {
+  if (!spec) return null
+  const allEntries = transcript.entries ?? []
+  const entriesById = new Map(allEntries.map(e => [e.exchangeId, e]))
+  const cited = receipt.exchangeIds
+    .map(id => entriesById.get(id))
+    .filter((e): e is NonNullable<typeof e> => Boolean(e))
+  const probeEntry = cited.find(e => e.step.arm === 'probe' && typeof e.step.status === 'number' && e.step.status >= 200 && e.step.status < 300)
+    ?? cited.find(e => e.step.arm === 'probe')
+    ?? null
+  const citedControls = cited.filter(e => e.step.arm === 'control')
+
+  if (specDeclaresDeniedControl(spec)) {
+    const allExchanges = allEntries.map(transcriptEntryToControlExchange)
+    const probeEx = probeEntry ? transcriptEntryToControlExchange(probeEntry) : null
+    if (citedControls.length === 0) {
+      const reason = `Control legitimacy rejected (${spec.id}): receipt cites zero negative-control exchanges (fail-closed).`
+      policy.onKernelStageExecuted?.({ stage: 'control_legitimacy', specId: spec.id, ok: false, reason })
+      return {
+        confirmed: false,
+        vulnClass: receipt.vulnClass,
+        rule,
+        reason,
+        observed: receipt.claimedDelta,
+        expected: 'a legitimate negative control satisfying the spec control contract',
+        evidence: { rejectedBy: 'missing_negative_control', specId: spec.id },
+      }
+    }
+    for (const ctl of citedControls) {
+      const res = assertLegitimateControl({
+        spec,
+        control: transcriptEntryToControlExchange(ctl),
+        probe: probeEx,
+        allEntries: allExchanges,
+        requireAnonymousAblation: spec.id === 'auth_bypass',
+      })
+      policy.onKernelStageExecuted?.({ stage: 'control_legitimacy', specId: spec.id, ok: res.ok, reason: res.reason })
+      if (!res.ok) {
+        return {
+          confirmed: false,
+          vulnClass: receipt.vulnClass,
+          rule,
+          reason: res.reason,
+          observed: receipt.claimedDelta,
+          expected: 'a legitimate negative control satisfying the spec control contract',
+          evidence: { rejectedBy: res.rejectedBy ?? 'control_legitimacy', specId: spec.id },
+        }
+      }
+    }
+  }
+
+  if (specRequiresNonPublic(spec)) {
+    const pub = evaluateMustBeNonPublicStage({
+      spec,
+      steps: allEntries.map(e => e.step),
+      probe: probeEntry?.step ?? null,
+      replayBudget: policy.publicnessReplayBudget,
+      runId: policy.runId,
+      environmentMode: policy.environmentMode,
+      replayProbe: policy.publicnessReplayProbe,
+      failClosedOnReplayDenied: policy.failClosedOnPublicnessReplayDenied,
+    })
+    policy.onKernelStageExecuted?.({ stage: 'must_be_non_public', specId: spec.id, ok: pub.passed, reason: pub.reason })
+    if (!pub.passed) {
+      return {
+        confirmed: false,
+        vulnClass: receipt.vulnClass,
+        rule,
+        reason: pub.reason,
+        observed: receipt.claimedDelta,
+        expected: 'a non-public protected resource',
+        evidence: {
+          rejectedBy: 'publicness',
+          specId: spec.id,
+          ...(pub.referenceId ? { publicnessReferenceId: pub.referenceId } : {}),
+          ...(pub.replayTelemetry ? { publicnessReplayTelemetry: pub.replayTelemetry } : {}),
+        },
+      }
+    }
+  }
+  return null
+}
+
 function defaultSingleHopHandler(
   factLog: HostFactLog,
   receipt: ProofReceipt,
   transcript: HostSignedTranscript,
   policy: TerminalOraclePolicyContext,
 ): ReceiptVerification {
-  const { rule } = receiptRuleFor(receipt.vulnClass, receipt)
+  const { rule, spec } = resolveReceiptRule(receipt.vulnClass, receipt)
+  const effectiveRule: ReceiptVerification['rule'] = rule
   const custodyErr = checkHostCustodySignatures(receipt, transcript, policy)
   if (custodyErr) {
     return {
       confirmed: false,
       vulnClass: receipt.vulnClass,
-      rule,
+      rule: effectiveRule,
       reason: custodyErr,
       observed: receipt.claimedDelta,
       expected: 'host-custody verified transcript records',
@@ -315,6 +433,10 @@ function defaultSingleHopHandler(
     ...policy,
     strictHostDerivation: true,
   })
+  if (effectiveRule !== 'none') {
+    const stageRejection = runSingleHopPreOracleStages(spec, canonicalReceipt, transcript, policy, effectiveRule)
+    if (stageRejection) return stageRejection
+  }
   const hostEvidence = constructHostEvidence({
     receipt: canonicalReceipt,
     transcript,
@@ -368,6 +490,78 @@ function defaultV8FamilyHandler(
       reason: 'terminal_impact_unproven_intermediate_stub',
     }
   }
+  const v8Spec = DEFAULT_ORACLE_SPEC_REGISTRY.get(`v8:${family}`)
+  if (!v8Spec) {
+    const reason = `Unregistered v8 oracle spec "v8:${family}" in DEFAULT_ORACLE_SPEC_REGISTRY (fail-closed).`
+    policy.onKernelStageExecuted?.({ stage: 'control_legitimacy', specId: `v8:${family}`, ok: false, reason })
+    return {
+      family,
+      required: true,
+      satisfied: false,
+      reason,
+      evidence: { rejectedBy: 'unregistered_v8_spec', specId: `v8:${family}` },
+    }
+  }
+  const stageCtx = extractV8KernelStageContext(family, hydrated, idx)
+  if (specDeclaresDeniedControl(v8Spec)) {
+    if (stageCtx.controls.length === 0) {
+      const reason = `Control legitimacy rejected (${v8Spec.id}): zero resolvable negative-control exchanges for denied-control spec (fail-closed).`
+      policy.onKernelStageExecuted?.({ stage: 'control_legitimacy', specId: v8Spec.id, ok: false, reason })
+      return {
+        family,
+        required: true,
+        satisfied: false,
+        reason,
+        evidence: { rejectedBy: 'missing_negative_control', specId: v8Spec.id },
+      }
+    }
+    for (const ctl of stageCtx.controls) {
+      const ctlRes = assertLegitimateControl({
+        spec: v8Spec,
+        control: ctl,
+        probe: stageCtx.probe,
+        allEntries: stageCtx.allExchanges,
+        requireAnonymousAblation: false,
+      })
+      policy.onKernelStageExecuted?.({ stage: 'control_legitimacy', specId: v8Spec.id, ok: ctlRes.ok, reason: ctlRes.reason })
+      if (!ctlRes.ok) {
+        return {
+          family,
+          required: true,
+          satisfied: false,
+          reason: ctlRes.reason,
+          evidence: { rejectedBy: ctlRes.rejectedBy ?? 'control_legitimacy', specId: v8Spec.id },
+        }
+      }
+    }
+  }
+  if (specRequiresNonPublic(v8Spec)) {
+    const pubRes = evaluateMustBeNonPublicStage({
+      spec: v8Spec,
+      steps: stageCtx.allSteps,
+      probe: stageCtx.probeStep,
+      replayBudget: policy.publicnessReplayBudget,
+      runId: policy.runId,
+      environmentMode: policy.environmentMode,
+      replayProbe: policy.publicnessReplayProbe,
+      failClosedOnReplayDenied: policy.failClosedOnPublicnessReplayDenied,
+    })
+    policy.onKernelStageExecuted?.({ stage: 'must_be_non_public', specId: v8Spec.id, ok: pubRes.passed, reason: pubRes.reason })
+    if (!pubRes.passed) {
+      return {
+        family,
+        required: true,
+        satisfied: false,
+        reason: pubRes.reason,
+        evidence: {
+          rejectedBy: 'publicness',
+          specId: v8Spec.id,
+          ...(pubRes.referenceId ? { publicnessReferenceId: pubRes.referenceId } : {}),
+          ...(pubRes.replayTelemetry ? { publicnessReplayTelemetry: pubRes.replayTelemetry } : {}),
+        },
+      }
+    }
+  }
   return evaluateV8OracleFamily(family, { ...hydrated, verifySignature } as V8OracleInputMap[typeof family])
 }
 
@@ -381,6 +575,7 @@ export class UnregisteredTerminalOracleError extends Error {
 export class TerminalOracleRegistry {
   private readonly singleHopRules = new Map<SingleHopOracleRule, SingleHopRuleHandler>()
   private readonly v8Families = new Map<V8OracleFamily, V8FamilyHandler>()
+  private readonly defaultPublicnessReplayBudget = new PublicnessReplayBudgetLedger()
 
   constructor(options: { registerDefaults?: boolean } = {}) {
     if (options.registerDefaults !== false) {
@@ -439,12 +634,11 @@ export class TerminalOracleRegistry {
     pointerRef: TerminalOraclePointerRef,
     policyContext: TerminalOraclePolicyContext = {},
   ): TerminalOracleResult {
+    const effectivePolicy: TerminalOraclePolicyContext = policyContext.publicnessReplayBudget || (!policyContext.runId && !policyContext.publicnessReplayProbe) ? policyContext : { ...policyContext, publicnessReplayBudget: this.defaultPublicnessReplayBudget }
     if (pointerRef.kind === 'v8_family') {
       const handler = this.v8Families.get(pointerRef.family)
-      if (!handler) {
-        throw new UnregisteredTerminalOracleError(`Unregistered v8 oracle family "${pointerRef.family}" in TerminalOracleRegistry (fail-closed; no fallback evaluator).`)
-      }
-      const decision = handler(factLog, pointerRef.family, pointerRef.rawInput ?? {}, policyContext, {
+      if (!handler) throw new UnregisteredTerminalOracleError(`Unregistered v8 oracle family "${pointerRef.family}" in TerminalOracleRegistry (fail-closed; no fallback evaluator).`)
+      const decision = handler(factLog, pointerRef.family, pointerRef.rawInput ?? {}, effectivePolicy, {
         ...(pointerRef.econCtx ? { econCtx: pointerRef.econCtx } : {}),
         ...(pointerRef.fallbackSig !== undefined ? { fallbackSig: pointerRef.fallbackSig } : {}),
         ...(pointerRef.verifySignature ? { verifySignature: pointerRef.verifySignature } : {}),
@@ -582,7 +776,7 @@ export class TerminalOracleRegistry {
       }
     }
 
-    const singleHop = handler(factLog, receipt, hostTranscript, policyContext)
+    const singleHop = handler(factLog, receipt, hostTranscript, effectivePolicy)
     return {
       confirmed: singleHop.confirmed,
       kind: 'single_hop',

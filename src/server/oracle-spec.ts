@@ -95,9 +95,42 @@ export interface OracleInputSpec {
   readonly required: boolean
 }
 
+export type OracleControlRole =
+  | 'denied_unauthenticated'
+  | 'denied_unauthorized'
+  | 'denied_tampered'
+  | 'denied_revoked'
+  | 'entitled_owner_or_baseline'
+  | 'benign_control'
+  | 'serial_control'
+
+export type OracleControlDiffDimension =
+  | 'bypass_artifact'
+  | 'persona_or_tenant'
+  | 'role_privilege'
+  | 'request_payload'
+  | 'signature_or_scope'
+  | 'time_after_revocation'
+  | 'concurrency'
+  | 'cache_poison_input'
+
+export type OracleControlOutcome =
+  | 'denied_401_or_403'
+  | 'denied_4xx'
+  | 'clean_baseline_2xx'
+  | 'invariant_preserved'
+
+export interface OracleControlContract {
+  readonly role: OracleControlRole
+  readonly differsOnlyIn: readonly OracleControlDiffDimension[]
+  readonly mustBe: OracleControlOutcome
+}
+
 export interface OracleControlSpec {
   readonly kind: string
   readonly description: string
+  /** R3-17: Declarative negative-control contract enforced by `assertLegitimateControl()`. */
+  readonly contract?: OracleControlContract
 }
 
 export interface OracleArchetypeExemption {
@@ -275,6 +308,9 @@ function validateOracleSpecPolicies(spec: OracleSpec, errors: OracleSpecAdmissio
     for (const ctl of spec.controls) {
       if (!ctl.kind.trim() || !ctl.description.trim()) {
         errors.push({ field: 'controls', message: `Spec "${spec.id}" has an incomplete control declaration.` })
+      }
+      if (ctl.contract && (!ctl.contract.role || !ctl.contract.mustBe || ctl.contract.differsOnlyIn.length === 0)) {
+        errors.push({ field: 'controls', message: `Spec "${spec.id}" control "${ctl.kind}" has an invalid control contract.` })
       }
     }
   }
@@ -753,7 +789,11 @@ const BUILTIN_ORACLE_SPECS: readonly OracleSpec[] = [
       { name: 'exchange_citations', provenance: 'worker_citation', required: true },
     ],
     controls: [
-      { kind: 'owner_or_anon_baseline', description: 'Same-route entitled owner control plus unauthenticated publicness probe.' },
+      {
+        kind: 'owner_or_anon_baseline',
+        description: 'Same-route entitled owner control plus unauthenticated publicness probe.',
+        contract: { role: 'denied_unauthorized', differsOnlyIn: ['persona_or_tenant'], mustBe: 'denied_401_or_403' },
+      },
     ],
     bindingKind: 'persona_tenant',
     reflectionPolicy: 'anti_reflection_required',
@@ -787,7 +827,11 @@ const BUILTIN_ORACLE_SPECS: readonly OracleSpec[] = [
       { name: 'exchange_citations', provenance: 'worker_citation', required: true },
     ],
     controls: [
-      { kind: 'same_tenant_mint_control', description: 'Authorized own-scope signed URL mint paired against foreign-scope mint.' },
+      {
+        kind: 'same_tenant_mint_control',
+        description: 'Authorized own-scope signed URL mint paired against foreign-scope mint.',
+        contract: { role: 'denied_unauthenticated', differsOnlyIn: ['bypass_artifact', 'signature_or_scope'], mustBe: 'denied_401_or_403' },
+      },
     ],
     bindingKind: 'crypto_signature',
     reflectionPolicy: 'anti_reflection_required',
@@ -813,7 +857,11 @@ const BUILTIN_ORACLE_SPECS: readonly OracleSpec[] = [
       { name: 'exchange_citations', provenance: 'worker_citation', required: true },
     ],
     controls: [
-      { kind: 'higher_role_control', description: 'Higher-role control on the same privileged function surface with read/write boundary check.' },
+      {
+        kind: 'higher_role_control',
+        description: 'Higher-role control on the same privileged function surface with read/write boundary check.',
+        contract: { role: 'denied_unauthorized', differsOnlyIn: ['role_privilege', 'persona_or_tenant'], mustBe: 'denied_401_or_403' },
+      },
     ],
     bindingKind: 'persona_tenant',
     reflectionPolicy: 'anti_reflection_required',
@@ -1000,7 +1048,11 @@ const BUILTIN_ORACLE_SPECS: readonly OracleSpec[] = [
       { name: 'exchange_citations', provenance: 'worker_citation', required: true },
     ],
     controls: [
-      { kind: 'entitled_or_public_control', description: 'Control arm proving disclosed record is non-public and unreflected.' },
+      {
+        kind: 'entitled_or_public_control',
+        description: 'Control arm proving disclosed record is non-public and unreflected.',
+        contract: { role: 'denied_unauthorized', differsOnlyIn: ['persona_or_tenant', 'role_privilege'], mustBe: 'denied_401_or_403' },
+      },
     ],
     bindingKind: 'persona_tenant',
     reflectionPolicy: 'anti_reflection_required',
@@ -1291,7 +1343,11 @@ const BUILTIN_ORACLE_SPECS: readonly OracleSpec[] = [
       { name: 'exchange_citations', provenance: 'worker_citation', required: true },
     ],
     controls: [
-      { kind: 'denied_unauthenticated_control', description: 'Denied 401/403 or login-challenge control on the same protected route.' },
+      {
+        kind: 'denied_unauthenticated_control',
+        description: 'Denied 401/403 or login-challenge control on the same protected route.',
+        contract: { role: 'denied_unauthenticated', differsOnlyIn: ['bypass_artifact'], mustBe: 'denied_401_or_403' },
+      },
     ],
     bindingKind: 'persona_tenant',
     reflectionPolicy: 'anti_reflection_required',
@@ -1315,7 +1371,11 @@ const BUILTIN_ORACLE_SPECS: readonly OracleSpec[] = [
       { name: 'exchange_citations', provenance: 'worker_citation', required: true },
     ],
     controls: [
-      { kind: 'invalid_signature_rejected_control', description: 'Bad/missing webhook signature control rejected while forged/replayed delivery succeeds.' },
+      {
+        kind: 'invalid_signature_rejected_control',
+        description: 'Bad/missing webhook signature control rejected while forged/replayed delivery succeeds.',
+        contract: { role: 'denied_tampered', differsOnlyIn: ['signature_or_scope'], mustBe: 'denied_401_or_403' },
+      },
     ],
     bindingKind: 'crypto_signature',
     reflectionPolicy: 'not_applicable',
@@ -1341,7 +1401,11 @@ const BUILTIN_ORACLE_SPECS: readonly OracleSpec[] = [
       { name: 'composite_hop_citations', provenance: 'worker_citation', required: true },
     ],
     controls: [
-      { kind: 'same_tenant_owner_and_anon_controls', description: 'Host-signed entitled owner read and unauthenticated/foreign controls across tenants.' },
+      {
+        kind: 'same_tenant_owner_and_anon_controls',
+        description: 'Host-signed entitled owner read and unauthenticated/foreign controls across tenants.',
+        contract: { role: 'denied_unauthorized', differsOnlyIn: ['persona_or_tenant', 'request_payload'], mustBe: 'denied_401_or_403' },
+      },
     ],
     bindingKind: 'persona_tenant',
     reflectionPolicy: 'anti_reflection_required',
@@ -1366,7 +1430,11 @@ const BUILTIN_ORACLE_SPECS: readonly OracleSpec[] = [
       { name: 'composite_hop_citations', provenance: 'worker_citation', required: true },
     ],
     controls: [
-      { kind: 'pre_revocation_and_revocation_confirmation', description: 'Verified revocation event strictly preceding post-revocation protected access.' },
+      {
+        kind: 'pre_revocation_and_revocation_confirmation',
+        description: 'Verified revocation event strictly preceding post-revocation protected access.',
+        contract: { role: 'denied_revoked', differsOnlyIn: ['time_after_revocation'], mustBe: 'denied_401_or_403' },
+      },
     ],
     bindingKind: 'persona_tenant',
     reflectionPolicy: 'not_applicable',
@@ -1414,7 +1482,11 @@ const BUILTIN_ORACLE_SPECS: readonly OracleSpec[] = [
       { name: 'composite_hop_citations', provenance: 'worker_citation', required: true },
     ],
     controls: [
-      { kind: 'in_scope_issuance_and_denied_control', description: 'Signed token/artifact issued for scope A rejected without artifact and accepted out-of-scope.' },
+      {
+        kind: 'in_scope_issuance_and_denied_control',
+        description: 'Signed token/artifact issued for scope A rejected without artifact and accepted out-of-scope.',
+        contract: { role: 'denied_tampered', differsOnlyIn: ['signature_or_scope'], mustBe: 'denied_401_or_403' },
+      },
     ],
     bindingKind: 'crypto_signature',
     reflectionPolicy: 'not_applicable',
@@ -1463,7 +1535,11 @@ const BUILTIN_ORACLE_SPECS: readonly OracleSpec[] = [
       { name: 'composite_hop_citations', provenance: 'worker_citation', required: true },
     ],
     controls: [
-      { kind: 'terminal_surface_denied_control', description: 'Direct terminal-surface control proving pivot causality across distinct surfaces.' },
+      {
+        kind: 'terminal_surface_denied_control',
+        description: 'Direct terminal-surface control proving pivot causality across distinct surfaces.',
+        contract: { role: 'denied_unauthorized', differsOnlyIn: ['persona_or_tenant', 'bypass_artifact'], mustBe: 'denied_401_or_403' },
+      },
     ],
     bindingKind: 'state_ledger',
     reflectionPolicy: 'anti_reflection_required',

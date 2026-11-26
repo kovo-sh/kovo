@@ -33,6 +33,9 @@ export const RUN_SAFETY_BUDGET_DEFAULTS = {
   investigationLeaseMs: 30 * 60_000,
   patchRetestLeaseMs: 15 * 60_000,
   assignmentReaperGraceMs: 5_000,
+  /** R3-17: Bounded publicness replay request budgets (strictly read-only GET/HEAD; respects prod_readonly). */
+  maxPublicnessReplaysPerRun: 64,
+  maxPublicnessReplaysPerRoute: 2,
 } as const
 
 /** Hard finite OOM ceilings that neither run-scaling nor env/caller overrides may exceed. */
@@ -57,6 +60,8 @@ export const RUN_SAFETY_BUDGET_HARD_CEILINGS = {
   investigationLeaseMs: 120 * 60_000,
   patchRetestLeaseMs: 60 * 60_000,
   assignmentReaperGraceMs: 5 * 60_000,
+  maxPublicnessReplaysPerRun: 512,
+  maxPublicnessReplaysPerRoute: 8,
 } as const
 
 export const RUN_SAFETY_BUDGET_ENV_KEYS = {
@@ -80,6 +85,8 @@ export const RUN_SAFETY_BUDGET_ENV_KEYS = {
   investigationLeaseMs: 'KOVO_INVESTIGATION_LEASE_MS',
   patchRetestLeaseMs: 'KOVO_PATCH_RETEST_LEASE_MS',
   assignmentReaperGraceMs: 'KOVO_ASSIGNMENT_REAPER_GRACE_MS',
+  maxPublicnessReplaysPerRun: 'KOVO_MAX_PUBLICNESS_REPLAYS_PER_RUN',
+  maxPublicnessReplaysPerRoute: 'KOVO_MAX_PUBLICNESS_REPLAYS_PER_ROUTE',
 } as const
 
 export const DEFAULT_MAX_COMPOSITE_VERIFIES_PER_RUN = RUN_SAFETY_BUDGET_DEFAULTS.maxCompositeVerifiesPerRun
@@ -115,6 +122,8 @@ export interface RunSafetyBudgets {
   readonly investigationLeaseMs: number
   readonly patchRetestLeaseMs: number
   readonly assignmentReaperGraceMs: number
+  readonly maxPublicnessReplaysPerRun: number
+  readonly maxPublicnessReplaysPerRoute: number
 }
 
 export interface RunSafetyBudgetOverrides {
@@ -138,6 +147,8 @@ export interface RunSafetyBudgetOverrides {
   investigationLeaseMs?: number
   patchRetestLeaseMs?: number
   assignmentReaperGraceMs?: number
+  maxPublicnessReplaysPerRun?: number
+  maxPublicnessReplaysPerRoute?: number
 }
 
 export interface RunSafetyBudgetOptions {
@@ -189,6 +200,32 @@ export function resolveBoundedBudgetCap(
     return clampBoundedInt(fromEnv, hardMax)
   }
   return clampBoundedInt(fallback, hardMax)
+}
+
+function resolvePublicnessReplayBudgets(
+  overrides: RunSafetyBudgetOverrides,
+  env: Readonly<Record<string, string | undefined>>,
+  scaledAssignments?: number,
+): Pick<RunSafetyBudgets, 'maxPublicnessReplaysPerRun' | 'maxPublicnessReplaysPerRoute'> {
+  const baseRunCap = scaledAssignments !== undefined
+    ? Math.max(RUN_SAFETY_BUDGET_DEFAULTS.maxPublicnessReplaysPerRun, scaledAssignments * 2)
+    : RUN_SAFETY_BUDGET_DEFAULTS.maxPublicnessReplaysPerRun
+  return {
+    maxPublicnessReplaysPerRun: resolveBoundedBudgetCap(
+      overrides.maxPublicnessReplaysPerRun,
+      RUN_SAFETY_BUDGET_ENV_KEYS.maxPublicnessReplaysPerRun,
+      baseRunCap,
+      RUN_SAFETY_BUDGET_HARD_CEILINGS.maxPublicnessReplaysPerRun,
+      env,
+    ),
+    maxPublicnessReplaysPerRoute: resolveBoundedBudgetCap(
+      overrides.maxPublicnessReplaysPerRoute,
+      RUN_SAFETY_BUDGET_ENV_KEYS.maxPublicnessReplaysPerRoute,
+      RUN_SAFETY_BUDGET_DEFAULTS.maxPublicnessReplaysPerRoute,
+      RUN_SAFETY_BUDGET_HARD_CEILINGS.maxPublicnessReplaysPerRoute,
+      env,
+    ),
+  }
 }
 
 function resolveAssignmentLeaseBudgets(
@@ -379,6 +416,7 @@ export function resolveRunSafetyBudgets(options: RunSafetyBudgetOptions = {}): R
       env,
     ),
     ...resolveAssignmentLeaseBudgets(overrides, env),
+    ...resolvePublicnessReplayBudgets(overrides, env, scaledAssignments),
   }
 }
 
