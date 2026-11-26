@@ -32,6 +32,8 @@ interface CaptureSummary {
   capturedAt: number
   cookieCount: number
   originCount: number
+  origins?: string[]
+  headerNames?: string[]
   hasAuthorizationHeader: boolean
 }
 
@@ -158,12 +160,13 @@ export function PersonaFormModal({
   const [curlNote, setCurlNote] = useState('')
   const [advancedOpen, setAdvancedOpen] = useState(false)
 
-  // Browser Session live-capture & storageState import state
+  // Browser Session live-capture (server-side escrow captureToken) & explicit storageState import state
   const [activeCapture, setActiveCapture] = useState<ActiveCaptureSession | null>(null)
   const [captureUrlInput, setCaptureUrlInput] = useState('')
   const [captureBusy, setCaptureBusy] = useState(false)
   const [captureError, setCaptureError] = useState('')
-  const [capturedBundleJson, setCapturedBundleJson] = useState('')
+  const [capturedToken, setCapturedToken] = useState('')
+  const [importedStorageStateJson, setImportedStorageStateJson] = useState('')
   const [capturedSummary, setCapturedSummary] = useState<CaptureSummary | null>(null)
   const [importOpen, setImportOpen] = useState(false)
   const [importJsonText, setImportJsonText] = useState('')
@@ -232,7 +235,8 @@ export function PersonaFormModal({
     setStaticKind(init.staticKind)
     setLoginAdapter(init.adapter)
     setCaptureError('')
-    setCapturedBundleJson('')
+    setCapturedToken('')
+    setImportedStorageStateJson('')
     setCapturedSummary(null)
     setImportOpen(false)
     setImportJsonText('')
@@ -275,6 +279,7 @@ export function PersonaFormModal({
     const handleFrame = (ev: MessageEvent) => {
       try {
         const frame = JSON.parse(ev.data) as { data?: string; url?: string }
+        setCaptureError('')
         if (frame.url) setCaptureUrlInput(frame.url)
         if (!frame.data || !canvasRef.current) return
         const img = new Image()
@@ -294,6 +299,7 @@ export function PersonaFormModal({
     const handleUrl = (ev: MessageEvent) => {
       try {
         const payload = JSON.parse(ev.data) as { url?: string }
+        setCaptureError('')
         if (payload.url) setCaptureUrlInput(payload.url)
       } catch { /* ignore */ }
     }
@@ -312,14 +318,35 @@ export function PersonaFormModal({
       } catch { /* ignore */ }
     }
 
+    let aborted = false
     es.addEventListener('frame', handleFrame as EventListener)
     es.addEventListener('url', handleUrl as EventListener)
     es.addEventListener('status', handleStatus as EventListener)
     es.onerror = () => {
-      // EventSource auto-reconnects unless the session ended.
+      if (aborted) return
+      void fetch('/_kovo/auth/status', { method: 'HEAD', credentials: 'same-origin', cache: 'no-store' })
+        .then(res => {
+          if (aborted) return
+          if (res.status === 401) {
+            closeLiveStream()
+            activeCaptureIdRef.current = null
+            setActiveCapture(null)
+            setCaptureError('Local session expired — open the Kovo Hunter startup bootstrap URL to sign back in.')
+            return
+          }
+          if (es.readyState === EventSource.CLOSED) {
+            setCaptureError('Live browser stream closed. Start sign-in again if the session expired.')
+          } else {
+            setCaptureError('Live browser stream interrupted — reconnecting…')
+          }
+        })
+        .catch(() => {
+          if (!aborted) setCaptureError('Live browser stream interrupted — reconnecting…')
+        })
     }
 
     return () => {
+      aborted = true
       es.close()
       if (eventSourceRef.current === es) eventSourceRef.current = null
     }
@@ -339,7 +366,8 @@ export function PersonaFormModal({
     setSecret('')
     setCurlPaste('')
     setCurlNote('')
-    setCapturedBundleJson('')
+    setCapturedToken('')
+    setImportedStorageStateJson('')
     setCapturedSummary(null)
     setImportOpen(false)
     setImportJsonText('')
@@ -384,7 +412,8 @@ export function PersonaFormModal({
       }
       const allowlist = origins.split(/[\s,]+/).filter(Boolean)
       const firstOrigin = allowlist[0] || project.seeds[0] || ''
-      setCapturedBundleJson(trimmed)
+      setCapturedToken('')
+      setImportedStorageStateJson(trimmed)
       setCapturedSummary({
         targetOrigin: firstOrigin,
         capturedAt: Date.now(),
@@ -464,17 +493,19 @@ export function PersonaFormModal({
       })
       const payload = await res.json().catch(() => ({})) as {
         ok?: boolean
-        bundle?: unknown
+        captureToken?: string
         summary?: CaptureSummary
         error?: string
       }
-      if (!res.ok || !payload.bundle) {
+      if (!res.ok || !payload.captureToken) {
         throw new Error(payload.error || `Could not capture browser session (HTTP ${res.status}).`)
       }
       closeLiveStream()
       activeCaptureIdRef.current = null
       setActiveCapture(null)
-      setCapturedBundleJson(JSON.stringify(payload.bundle))
+      setCapturedToken(payload.captureToken)
+      setImportedStorageStateJson('')
+      setImportJsonText('')
       if (payload.summary) setCapturedSummary(payload.summary)
     } catch (err) {
       setCaptureError(err instanceof Error ? err.message : 'Unable to capture browser session.')
@@ -486,6 +517,7 @@ export function PersonaFormModal({
   async function sendCaptureInput(body: Record<string, unknown>) {
     const id = activeCaptureIdRef.current
     if (!id) return
+    const isHover = body.kind === 'mouse' && body.type === 'mouseMoved'
     try {
       const res = await fetch(`/_kovo/auth-capture/${encodeURIComponent(id)}/input`, {
         method: 'POST',
@@ -496,9 +528,30 @@ export function PersonaFormModal({
       if (res.ok) {
         const data = await res.json().catch(() => ({})) as { url?: string }
         if (data.url && body.kind === 'navigate') setCaptureUrlInput(data.url)
+        return
+      }
+      const errData = await res.json().catch(() => ({})) as { error?: string }
+      if (res.status === 401) {
+        closeLiveStream()
+        activeCaptureIdRef.current = null
+        setActiveCapture(null)
+        setCaptureError('Local session expired — open the Kovo Hunter startup bootstrap URL to sign back in.')
+        return
+      }
+      if (res.status === 404) {
+        closeLiveStream()
+        activeCaptureIdRef.current = null
+        setActiveCapture(null)
+        setCaptureError(errData.error || 'Browser sign-in session ended or expired. Start again.')
+        return
+      }
+      if (!isHover) {
+        setCaptureError(errData.error || `Browser input failed (HTTP ${res.status}).`)
       }
     } catch {
-      // Ignore transient input errors during navigation.
+      if (!isHover) {
+        setCaptureError('Could not deliver input to the interactive browser — check your connection.')
+      }
     }
   }
 
@@ -606,10 +659,11 @@ export function PersonaFormModal({
       setAdvancedOpen(true)
     }
 
-    // Mode 1: Universal Browser Session (interactive live capture or storageState.json import)
+    // Mode 1: Universal Browser Session (server-side escrowed captureToken or explicit storageState.json import)
     if (isBrowserSessionMode) {
-      const storageState = capturedBundleJson.trim() || importJsonText.trim()
-      if (!keepingSameAuthKind && !storageState) {
+      const token = capturedToken.trim()
+      const storageState = token ? '' : (importedStorageStateJson.trim() || importJsonText.trim())
+      if (!keepingSameAuthKind && !token && !storageState) {
         setCaptureError('Sign in with the embedded browser or import a storageState.json file first.')
         return
       }
@@ -621,7 +675,7 @@ export function PersonaFormModal({
           personaId: editingPersona.id,
           roleLabel: cleanLabel,
           originAllowlist: allowlist,
-          ...(storageState ? { storageState } : {}),
+          ...(token ? { captureToken: token } : storageState ? { storageState } : {}),
           ...(cleanVerifyPath ? { verifyPath: cleanVerifyPath } : {}),
         } }), updated => {
           resetForm()
@@ -636,7 +690,7 @@ export function PersonaFormModal({
         handle: generatedHandle,
         roleLabel: cleanLabel,
         originAllowlist: allowlist,
-        storageState,
+        ...(token ? { captureToken: token } : { storageState }),
         ...(cleanVerifyPath ? { verifyPath: cleanVerifyPath } : {}),
         canaryMarkers: [],
       } }), created => {

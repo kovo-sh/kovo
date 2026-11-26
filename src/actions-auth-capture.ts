@@ -1,7 +1,8 @@
 /**
  * Server actions for universal IdP-agnostic Browser Session personas (`adapter: 'browser_session'`).
  * Kept in its own module so `src/actions.ts` and `src/domain.ts` stay untouched while supporting
- * full Playwright `storageState` JSON bundles (up to 2 MiB) and live interactive capture saves.
+ * single-use server-side escrowed `captureToken` redemption and explicit Playwright `storageState`
+ * JSON imports (up to 2 MiB).
  */
 import { createServerFn } from '@tanstack/react-start'
 import { z } from 'zod'
@@ -18,9 +19,23 @@ const optionalVerifyPath = z.string().trim().max(512).transform((raw, ctx) => {
   return raw
 }).optional()
 
+const captureTokenSchema = z.string().trim().regex(
+  /^cap_tok_[a-f0-9]{64}$/,
+  'Invalid captured session token format.',
+)
+
 const storageStatePayloadSchema = z.union([
   z.string().trim().min(2).max(MAX_STORAGE_STATE_JSON_CHARS),
-  z.record(z.string(), z.unknown()),
+  z.record(z.string(), z.unknown()).refine(
+    value => {
+      try {
+        return JSON.stringify(value).length <= MAX_STORAGE_STATE_JSON_CHARS
+      } catch {
+        return false
+      }
+    },
+    { message: 'storageState payload exceeds 2 MiB limit.' },
+  ),
 ])
 
 const observedHeadersSchema = z.record(
@@ -34,11 +49,20 @@ export const createBrowserSessionPersonaSchema = z.object({
   handle: personaHandle,
   roleLabel: shortText,
   originAllowlist: z.array(scopedAssetOrigin).min(1).max(64),
-  storageState: storageStatePayloadSchema,
+  captureToken: captureTokenSchema.optional(),
+  storageState: storageStatePayloadSchema.optional(),
   observedHeaders: observedHeadersSchema,
   verifyPath: optionalVerifyPath,
   refreshIntervalSec: z.number().int().min(15).max(3600).optional(),
   canaryMarkers: z.array(shortText).max(16).default([]),
+}).superRefine((data, ctx) => {
+  if (!data.captureToken && data.storageState === undefined) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['storageState'],
+      message: 'Provide either a captured session token or a storageState.json payload.',
+    })
+  }
 })
 
 export const updateBrowserSessionPersonaSchema = z.object({
@@ -47,6 +71,7 @@ export const updateBrowserSessionPersonaSchema = z.object({
   personaId: id,
   roleLabel: shortText,
   originAllowlist: z.array(scopedAssetOrigin).min(1).max(64),
+  captureToken: captureTokenSchema.optional(),
   storageState: storageStatePayloadSchema.optional(),
   observedHeaders: observedHeadersSchema,
   verifyPath: optionalVerifyPath,
@@ -57,19 +82,19 @@ export const updateBrowserSessionPersonaSchema = z.object({
 export const registerBrowserSessionPersona = createServerFn({ method: 'POST' })
   .validator(createBrowserSessionPersonaSchema)
   .handler(async ({ data }) => {
-    const [{ store }, { createBrowserSessionPersona }] = await Promise.all([
+    const [{ store }, { registerBrowserSessionPersonaFromAction }] = await Promise.all([
       import('./server/store.ts'),
-      import('./server/persona-vault.ts'),
+      import('./server/browser-session-auth.ts'),
     ])
-    return createBrowserSessionPersona(store(), data)
+    return registerBrowserSessionPersonaFromAction(store(), data)
   })
 
 export const updateBrowserSessionPersonaAction = createServerFn({ method: 'POST' })
   .validator(updateBrowserSessionPersonaSchema)
   .handler(async ({ data }) => {
-    const [{ store }, { updateBrowserSessionPersona }] = await Promise.all([
+    const [{ store }, { updateBrowserSessionPersonaFromAction }] = await Promise.all([
       import('./server/store.ts'),
-      import('./server/persona-vault.ts'),
+      import('./server/browser-session-auth.ts'),
     ])
-    return updateBrowserSessionPersona(store(), data)
+    return updateBrowserSessionPersonaFromAction(store(), data)
   })

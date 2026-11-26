@@ -19,6 +19,7 @@ import type { Sel } from './nav.tsx'
 import { OverlaysProvider, useOverlays } from './overlays.tsx'
 import { FallbackInspector } from './pane.tsx'
 import { PaletteProvider, usePalette } from './palette.tsx'
+import { PanelErrorBoundary } from './panel-error-boundary.tsx'
 import { Rail } from './rail.tsx'
 import { useTheme } from './theme.ts'
 import { ToastProvider, useToast } from './toast.tsx'
@@ -141,7 +142,15 @@ function Workspace() {
     <main className="relative flex min-h-0 min-w-0 flex-col bg-panel" aria-label="Run">
       <RunHeader />
       <RunBanners />
-      <div key={nav.view} className="relative flex min-h-0 flex-1 flex-col" id="vh"><View /></div>
+      <div key={nav.view} className="relative flex min-h-0 flex-1 flex-col" id="vh">
+        <PanelErrorBoundary
+          panelName={`${VIEWS.find(v => v.id === nav.view)?.label ?? nav.view} view`}
+          resetKey={`${detail.run.id}:${nav.view}`}
+          entityId={nav.view}
+        >
+          <View />
+        </PanelErrorBoundary>
+      </div>
     </main>
     {!hideBoardBeforeApproval && <aside
       ref={paneRef}
@@ -153,7 +162,9 @@ function Workspace() {
       aria-hidden={nav.paneCollapsed || undefined}
     >
       {!nav.paneCollapsed && <Resizer paneRef={paneRef} onResize={setPaneW} onDraggingChange={setResizing} />}
-      <div id="paneInner" className="flex min-h-0 flex-1 flex-col"><PaneContent /></div>
+      <div id="paneInner" className="flex min-h-0 flex-1 flex-col">
+        <PaneContent />
+      </div>
     </aside>}
     {overlays.scopeOpen && <ScopeOverlay />}
   </div>
@@ -200,13 +211,26 @@ function Resizer({ paneRef, onResize, onDraggingChange }: {
 }
 
 function PaneContent() {
+  const { detail } = useRun()
   const nav = useNav()
   const sel = nav.sel
   const showChat = nav.chat || !sel || (CHAT_FIRST_VIEWS.includes(nav.view) && !sel)
   const key = showChat ? 'chat' : selKey(sel!)
   const Inspector = !showChat ? INSPECTORS[sel!.kind] ?? FallbackInspector : null
+  const handleClose = () => {
+    if (nav.chat) nav.closeChat()
+    else if (nav.sel) nav.close()
+    else nav.togglePane()
+  }
   return <div key={key} className="flex min-h-0 min-w-0 flex-1 flex-col">
-    {showChat ? <BoardPane /> : Inspector && <Inspector sel={sel!} />}
+    <PanelErrorBoundary
+      panelName={showChat ? 'Coordinator board' : 'Inspector panel'}
+      resetKey={`${detail.run.id}:${key}`}
+      entityId={key}
+      onClose={handleClose}
+    >
+      {showChat ? <BoardPane /> : Inspector && <Inspector sel={sel!} />}
+    </PanelErrorBoundary>
   </div>
 }
 
@@ -359,13 +383,51 @@ export function ApprovalBanner({
   </div>
 }
 
-/** Pending approvals, budget-paused, auth-issue, model-missing, reconnecting: crisp one-line banners under the run line. */
+export type LocalAuthProbeResult = 'ok' | 'expired' | 'unreachable'
+
+/**
+ * Lightweight `HEAD /_kovo/auth/status` check invoked when SSE enters `reconnecting` (`onerror`)
+ * so an expired `kovo_local` session surfaces an explicit re-auth notice instead of spinning silently.
+ */
+export async function probeLocalAuthStatus(fetchImpl?: typeof fetch): Promise<LocalAuthProbeResult> {
+  const fetcher = fetchImpl ?? (typeof fetch === 'function' ? fetch : undefined)
+  if (!fetcher) return 'unreachable'
+  try {
+    const res = await fetcher('/_kovo/auth/status', {
+      method: 'HEAD',
+      credentials: 'same-origin',
+      cache: 'no-store',
+    })
+    if (res.status === 401) return 'expired'
+    if (res.ok) return 'ok'
+    return 'unreachable'
+  } catch {
+    return 'unreachable'
+  }
+}
+
+/** Pending approvals, budget-paused, auth-issue, model-missing, session-expired, reconnecting: crisp one-line banners under the run line. */
 function RunBanners() {
   const { detail, model, events, connection, pending } = useRun()
   const nav = useNav()
   const q = useDecisions()
+  const [sessionExpired, setSessionExpired] = useState(false)
   const r = detail.run
   const authIssue = latestAuthIssue(events)
+
+  useEffect(() => {
+    if (connection === 'live') {
+      setSessionExpired(false)
+      return
+    }
+    if (connection !== 'reconnecting') return
+    let cancelled = false
+    void probeLocalAuthStatus().then(status => {
+      if (!cancelled) setSessionExpired(status === 'expired')
+    })
+    return () => { cancelled = true }
+  }, [connection])
+
   const showApprovalBanner = shouldShowApprovalBanner({
     activeApprovalCount: q.activePendingApprovals.length,
     view: nav.view,
@@ -420,7 +482,26 @@ function RunBanners() {
       <span className="min-w-0 flex-1"><b className="font-medium text-fg">Connect a model to continue.</b> No enabled model profile; settings bring you back here.</span>
       <Link className={runBtn()} to="/settings" search={{ runId: r.id }}>Set up model<Icon name="arrowR" /></Link>
     </div>}
-    {connection === 'reconnecting' && <div className="flex min-h-10 flex-none items-center gap-2.5 border-b border-line bg-sunk py-2 pl-[18px] pr-3 text-[12.5px] text-fg-muted" role="status">
+    {sessionExpired && <div
+      className="flex min-h-10 flex-none items-center gap-2.5 border-b border-line bg-warn-soft py-2 pl-[18px] pr-3 text-[12.5px] text-fg-muted shadow-[inset_0_-1px_0_var(--warn-line)]"
+      role="alert"
+      aria-label="Local session expired"
+      data-testid="session-expired-banner"
+    >
+      <Icon name="lock" className="text-warn" />
+      <span className="min-w-0 flex-1">
+        <b className="font-medium text-fg">Local session expired.</b> Open the startup bootstrap URL from your Kovo Hunter terminal (or a device pairing link) to sign back in and resume live updates.
+      </span>
+      <button
+        type="button"
+        className={runBtn({ variant: 'default', size: 'sm' })}
+        data-testid="session-expired-reload"
+        onClick={() => { if (typeof window !== 'undefined') window.location.reload() }}
+      >
+        Reload
+      </button>
+    </div>}
+    {connection === 'reconnecting' && !sessionExpired && <div className="flex min-h-10 flex-none items-center gap-2.5 border-b border-line bg-sunk py-2 pl-[18px] pr-3 text-[12.5px] text-fg-muted" role="status">
       <Icon name="activity" />
       <span className="min-w-0 flex-1">Reconnecting to Kovo Hunter… the view keeps the last data it had.</span>
     </div>}
