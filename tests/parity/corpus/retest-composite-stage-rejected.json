@@ -3,6 +3,21 @@
   "side": "retest",
   "archetype": "retest-composite-stage-rejected",
   "description": "Retest where a multi-hop CompositeProofReceipt fails verification at a composite stage (edge_binding). All three retest engines MUST return inconclusive with failureReason=composite_stage_rejected, NEVER fixed.",
+  "covers": {
+    "files": [
+      "src/server/agent-script-proof.ts",
+      "src/server/composite-receipt.ts",
+      "src/server/exec-verify.ts",
+      "src/server/floor-recipe-engine.ts",
+      "src/server/replay-verifier.ts",
+      "src/server/retest-health.ts"
+    ],
+    "classes": [
+      "bola",
+      "dual_tenant_abac",
+      "retest"
+    ]
+  },
   "canonicalLabel": {
     "cwe": "CWE-639",
     "category": "bola",
@@ -60,10 +75,15 @@
       "method": "POST",
       "pathAndQuery": "/v1/exports/request",
       "persona": "member_a",
-      "requestJson": { "tenant": "tenant-b", "scope": "ledger" },
+      "requestJson": {
+        "tenant": "tenant-b",
+        "scope": "ledger"
+      },
       "status": 201,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"jobId\":\"job_77\",\"downloadToken\":\"tok_exp_9f8e7d6c5b4a\"}"
     },
     {
@@ -75,7 +95,9 @@
       "persona": "viewer_a",
       "status": 403,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"error\":\"forbidden\"}"
     },
     {
@@ -87,7 +109,9 @@
       "persona": "member_a",
       "status": 403,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"error\":\"forbidden\"}"
     }
   ],

@@ -1,3 +1,4 @@
+// @kernel @fixes R4-H-15, R4-H-16
 /**
  * WS-11 (`R4-H-15` & `R4-H-16`) fast class-level stress & static-lint regression guards:
  * 1. R4-H-15: `search_repo` executes off the host event loop inside `UntrustedComputePool` with

@@ -37,9 +37,15 @@ import {
   type V7RegressionFloorInput,
 } from '../scripts/certify-v8.ts'
 
+import { resolveGitState } from '../scripts/bench-ledger.ts'
+
 const REPO_ROOT = join(import.meta.dirname, '..')
 const tempRoot = mkdtempSync(join(tmpdir(), 'kovo-v8-certify-test-'))
 process.on('exit', () => rmSync(tempRoot, { recursive: true, force: true }))
+if (!process.env.KOVO_LEDGER_ROOT) {
+  process.env.KOVO_LEDGER_ROOT = join(tempRoot, 'ledger')
+}
+const TEST_GIT_SHA = resolveGitState().gitSha
 
 // ---------------------------------------------------------------------------
 // Synthetic Fixture Builders
@@ -141,7 +147,7 @@ function makeDevSuiteCells(opts: DevSuiteOptions): MultihopCellInput[] {
       phaseBAssignments: opts.phaseBAssignments ?? 40,
       deadEndReprobeCount: opts.deadEndReprobeCount ?? 1,
       deadEndReprobeWasteRate: opts.deadEndReprobeWasteRate,
-      gitSha: 'abc123def456',
+      gitSha: TEST_GIT_SHA,
     }
   })
 }
@@ -727,7 +733,7 @@ test('M4 PASS: full certification (Dev + Salted Held-Out + Sealed + OSS + Effici
     cells: makePassingM4Cells(),
     oss: makePassingOssInputs(),
     v7Floor: makePassingV7Floor(),
-    options: { gitSha: 'deadbeef1234', generatedAt: '2026-11-25T00:00:00.000Z' },
+    options: { gitSha: TEST_GIT_SHA, generatedAt: '2026-11-25T00:00:00.000Z' },
   })
 
   assert.equal(report.verdict, 'PASS', JSON.stringify(report.failedChecks, null, 2))

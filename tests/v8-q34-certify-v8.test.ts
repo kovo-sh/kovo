@@ -53,8 +53,14 @@ import {
   type V7RegressionFloorInput,
 } from '../scripts/certify-v8.ts'
 
+import { resolveGitState } from '../scripts/bench-ledger.ts'
+
 const tempRoot = mkdtempSync(join(tmpdir(), 'kovo-v8-q34-certify-'))
 process.on('exit', () => rmSync(tempRoot, { recursive: true, force: true }))
+if (!process.env.KOVO_LEDGER_ROOT) {
+  process.env.KOVO_LEDGER_ROOT = join(tempRoot, 'ledger')
+}
+const TEST_GIT_SHA = resolveGitState().gitSha
 
 const DEV_APPS: readonly MultihopAppName[] = ['paygrid', 'shipforge', 'nexusiam']
 
@@ -160,7 +166,7 @@ function makeRealisticCellMeta(opts: BuildCellOptions): MultihopCellMeta {
     origin: 'http://127.0.0.1:41000',
     publicOrigins: ['http://127.0.0.1:41000'],
     loginPath: '/api/auth/login',
-    gitSha: 'deadbeef1234',
+    gitSha: TEST_GIT_SHA,
     model:
       llm === 'agentic'
         ? {
@@ -590,7 +596,7 @@ function makePassingV7Floor(): V7RegressionFloorInput {
 function makeMultihopReportJson(
   cells: MultihopCellMeta[],
   floorCells: MultihopCellMeta[],
-  gitSha = 'deadbeef1234',
+  gitSha = TEST_GIT_SHA,
 ): string {
   const agg = (list: readonly MultihopCellMeta[]) => {
     const chainsTotal = list.reduce((n, c) => n + c.chainsTotal, 0)

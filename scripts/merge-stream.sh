@@ -19,6 +19,7 @@
 #   --set-red-lock [reason]  Create external red-main lock file and exit 0
 #   --gate-cmd <cmd>         Override gate command (default: bash scripts/worker-gate.sh)
 #   --skip-ci-check          Skip querying GitHub Actions verify.yml status via gh
+#   --skip-kernel-review     Skip independent kernel review lane check (unit tests only)
 #   --no-ff                  Create a merge commit even if fast-forward is possible
 #   --json                   Emit machine-readable JSON summary to stdout
 #   -h, --help               Show usage
@@ -27,9 +28,11 @@
 #   KOVO_GATE_STATE_DIR      Directory for main-red.lock (default: $HOME/.config/kovo)
 #   KOVO_MERGE_GATE_CMD      Override default gate command
 #   KOVO_MERGE_SKIP_CI_CHECK Set to 1 to skip GitHub Actions verify.yml check
+#   KOVO_MERGE_SKIP_KERNEL_REVIEW Set to 1 to skip kernel review lane check (unit tests only)
 #   KOVO_GH_BIN              Override gh CLI binary (default: gh)
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_REF="main"
 STREAM_REF=""
 DRY_RUN=0
@@ -37,6 +40,7 @@ CLEAR_RED_LOCK=0
 SET_RED_LOCK=0
 SET_RED_REASON=""
 SKIP_CI_CHECK="${KOVO_MERGE_SKIP_CI_CHECK:-0}"
+SKIP_KERNEL_REVIEW="${KOVO_MERGE_SKIP_KERNEL_REVIEW:-0}"
 NO_FF=0
 JSON_OUT=0
 GATE_CMD="${KOVO_MERGE_GATE_CMD:-bash scripts/worker-gate.sh}"
@@ -74,6 +78,10 @@ while [[ $# -gt 0 ]]; do
       SKIP_CI_CHECK=1
       shift
       ;;
+    --skip-kernel-review)
+      SKIP_KERNEL_REVIEW=1
+      shift
+      ;;
     --no-ff)
       NO_FF=1
       shift
@@ -83,7 +91,7 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     -h|--help)
-      sed -n '2,30p' "$0"
+      sed -n '2,32p' "$0"
       exit 0
       ;;
     -*)
@@ -280,6 +288,42 @@ if [[ -n "$STREAM_REF" && "$STREAM_SHA" != "$BASE_SHA" ]]; then
   fi
 fi
 
+# 3b. Prepare build/ before worker-gate.sh so parallel Playwright suites never race on `npm run build`.
+# Rebuild when the merged diff touches frontend/SSR build inputs or REPO_ROOT/build is missing;
+# otherwise symlink REPO_ROOT/build (matching node_modules reuse above).
+if [[ -f "${WORKTREE_DIR}/package.json" && -e "${WORKTREE_DIR}/node_modules" && ! -e "${WORKTREE_DIR}/build" ]]; then
+  need_build=0
+  if [[ ! -f "${REPO_ROOT}/build/server/server.js" || ! -d "${REPO_ROOT}/build/client" ]]; then
+    need_build=1
+  elif [[ "$MERGED_SHA" != "$BASE_SHA" ]]; then
+    if git -C "$WORKTREE_DIR" diff --name-only "$BASE_SHA..$MERGED_SHA" \
+      | grep -Eq '^src/(components|routes|styles|root\.tsx|app\.css|entry\.|findings-view)|^(vite|react-router|tsconfig)\.config|^package\.json'; then
+      need_build=1
+    fi
+  fi
+  if (( need_build == 1 )); then
+    build_rc=0
+    set +e
+    if (( JSON_OUT == 1 )); then
+      (cd "$WORKTREE_DIR" && npm run build) >&2
+      build_rc=$?
+    else
+      echo "== merge-stream: building client/SSR bundle once in temp worktree"
+      (cd "$WORKTREE_DIR" && npm run build)
+      build_rc=$?
+    fi
+    set -e
+    if (( build_rc != 0 )); then
+      elapsed=$(( $(date +%s) - t0 ))
+      emit_result "GATE_FAILED" "false" "pre-gate npm run build exited ${build_rc}; '${BASE_REF}' left untouched at ${BASE_SHA:0:8}" "$BASE_SHA" "$MERGED_SHA" "$elapsed" "false"
+      exit "$build_rc"
+    fi
+  else
+    build_target="$(readlink -f "${REPO_ROOT}/build" 2>/dev/null || echo "${REPO_ROOT}/build")"
+    ln -s "$build_target" "${WORKTREE_DIR}/build"
+  fi
+fi
+
 # 4. Run the fast gate on the MERGED TREE (never skipped for tests/docs-only branches).
 gate_rc=0
 set +e
@@ -308,6 +352,37 @@ if (( gate_rc != 0 )); then
   elapsed=$(( $(date +%s) - t0 ))
   emit_result "GATE_FAILED" "false" "merged-tree gate exited ${gate_rc}; '${BASE_REF}' left untouched at ${BASE_SHA:0:8}" "$BASE_SHA" "$MERGED_SHA" "$elapsed" "false"
   exit "$gate_rc"
+fi
+
+# 4.5 Independent different-model kernel review lane check (R3-05).
+#     Fast no-op (<50ms) on non-kernel streams; blocks unreviewed confirmation-kernel diffs
+#     unless --skip-kernel-review is explicitly passed (unit tests only).
+if [[ "$SKIP_KERNEL_REVIEW" != "1" && "$MERGED_SHA" != "$BASE_SHA" ]]; then
+  kr_rc=0
+  set +e
+  if [[ -f "${WORKTREE_DIR}/scripts/check-kernel-review.ts" ]]; then
+    if (( JSON_OUT == 1 )); then
+      (cd "$WORKTREE_DIR" && node scripts/check-kernel-review.ts --base "$BASE_SHA") >&2
+      kr_rc=$?
+    else
+      (cd "$WORKTREE_DIR" && node scripts/check-kernel-review.ts --base "$BASE_SHA")
+      kr_rc=$?
+    fi
+  elif [[ -f "${SCRIPT_DIR}/check-kernel-review.ts" ]]; then
+    if (( JSON_OUT == 1 )); then
+      node "${SCRIPT_DIR}/check-kernel-review.ts" --root "$WORKTREE_DIR" --base "$BASE_SHA" >&2
+      kr_rc=$?
+    else
+      node "${SCRIPT_DIR}/check-kernel-review.ts" --root "$WORKTREE_DIR" --base "$BASE_SHA"
+      kr_rc=$?
+    fi
+  fi
+  set -e
+  if (( kr_rc != 0 )); then
+    elapsed=$(( $(date +%s) - t0 ))
+    emit_result "KERNEL_REVIEW_FAILED" "false" "independent kernel review lane check exited ${kr_rc}; '${BASE_REF}' left untouched at ${BASE_SHA:0:8}" "$BASE_SHA" "$MERGED_SHA" "$elapsed" "false"
+    exit "$kr_rc"
+  fi
 fi
 
 # 5. Dry-run returns PASS without advancing BASE_REF or clearing the lock.

@@ -3,6 +3,23 @@
   "side": "fp",
   "archetype": "r4-h5-h6-honest-rbac-sibling-control",
   "description": "R4-H-5/R4-H-6 FP: honest per-object RBAC (member lists own items, reads own object 200, and gets 403 on a sibling foreign object ID) must never confirm broken_access_control/bola/idor.",
+  "covers": {
+    "files": [
+      "src/server/causal-proof-compiler.ts",
+      "src/server/composite-autodag.ts",
+      "src/server/composite-receipt.ts",
+      "src/server/host-fact-log.ts",
+      "src/server/terminal-oracle-registry.ts",
+      "src/server/v8-oracle-families.ts",
+      "src/server/verify-claims.ts"
+    ],
+    "classes": [
+      "broken_access_control",
+      "bola",
+      "dual_tenant_abac",
+      "authorization"
+    ]
+  },
   "canonicalLabel": {
     "cwe": "CWE-639",
     "category": "bola",
@@ -44,10 +61,14 @@
       "method": "GET",
       "pathAndQuery": "/api/v1/items",
       "persona": "member_a",
-      "emittedCapabilities": ["cap:hop_1:own_item_ref"],
+      "emittedCapabilities": [
+        "cap:hop_1:own_item_ref"
+      ],
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"items\":[{\"id\":\"item-8f7e6d5c\",\"tenantId\":\"org_a\",\"owner\":\"member_a\"}]}"
     },
     {
@@ -59,7 +80,9 @@
       "persona": "member_a",
       "status": 403,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"error\":\"forbidden\"}"
     },
     {
@@ -69,10 +92,14 @@
       "method": "GET",
       "pathAndQuery": "/api/v1/items/item-8f7e6d5c",
       "persona": "member_a",
-      "consumedCapabilities": ["cap:hop_1:own_item_ref"],
+      "consumedCapabilities": [
+        "cap:hop_1:own_item_ref"
+      ],
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"id\":\"item-8f7e6d5c\",\"tenantId\":\"org_a\",\"owner\":\"member_a\",\"amount\":4200}"
     }
   ],
@@ -81,7 +108,9 @@
     "terminalVulnClass": "broken_access_control",
     "oracleFamily": "dual_tenant_abac",
     "capabilityToken": "own_item_ref",
-    "attackerPersonas": ["member_a"],
+    "attackerPersonas": [
+      "member_a"
+    ],
     "expectedFailedStage": "terminal_impact",
     "claimedDelta": "Honest per-object RBAC (own object 200 vs foreign sibling object 403) must fail closed at terminal_impact."
   }

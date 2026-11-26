@@ -143,6 +143,7 @@ test('HIGH #1: operator-approved patterns stay segment-aware and reusable, but n
     scopeRevision: 1,
     context: { personaHandle: 'user_a', hasMultipart: false, isRceProof },
     approvedPatterns: patterns,
+    leaseAuthorizes: () => true,
   })
 
   assert.equal(authorize('/api/42').via, 'operator_pattern')
@@ -510,9 +511,13 @@ test('HIGH #1: execution auto-approval is exact and single-use; persisted rows n
   assert.equal(grant.isStateChangeApproved(PUBLIC_ORIGIN, 'POST', '/prefix/child', { ...context, body: '{}' }), false,
     'a persisted approved row must never prefix-match child paths')
 
-  // Operator-approved patterns still work, segment-aware only, and only for ID-shaped segments.
-  storage.updateRun(auto.runId, {
-    approvedEndpointPatterns: [{ origin: PUBLIC_ORIGIN, method: 'POST', pathPattern: '/api/*', scopeRevision: storage.run(auto.runId).scopeRevision }],
+  // Operator-approved durable route leases stay segment-aware only, and only for ID-shaped segments.
+  storage.grantApprovalLease(storage.run(auto.runId), {
+    origin: PUBLIC_ORIGIN,
+    method: 'POST',
+    pathAndQuery: '/api/42',
+    leaseScope: 'route',
+    personaHandle: null,
   })
   assert.equal(grant.isStateChangeApproved(PUBLIC_ORIGIN, 'POST', '/api/42', context), true)
   assert.equal(grant.isStateChangeApproved(PUBLIC_ORIGIN, 'POST', '/api/x', context), false)
@@ -561,7 +566,7 @@ test('HIGH #1: operator approval authorizes the exact request once, then re-esca
     if (!cardId) await delay(20)
   }
   assert.ok(cardId, 'a HITL card must be raised for the unapproved state change')
-  storage.decideApproval(storage.run(runId), cardId, 'approved')
+  storage.decideApproval(storage.run(runId), cardId, 'approved', 'once')
   const decision = await pending
   assert.equal(decision.approved, true)
 

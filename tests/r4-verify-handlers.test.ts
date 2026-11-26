@@ -1,3 +1,4 @@
+// @kernel @fixes R4-C-1, R4-C-2, R4-C-6, R4-H-4
 /**
  * WS-3 class-level guards (`R4-C-1`, `R4-C-2`, `R4-C-6`, `R4-H-4`):
  *  - R4-C-1: Host-minted boolean pair stamping in `prove.differential` & shared canonical skeleton /

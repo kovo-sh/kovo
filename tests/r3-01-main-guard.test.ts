@@ -1,3 +1,4 @@
+// @kernel @fixes R3-01
 /**
  * R3-01 regression & unit tests (`plans/claude_quality_3.md` §1):
  *  1. `.githooks/reference-transaction` + `scripts/install-main-guard.sh`:

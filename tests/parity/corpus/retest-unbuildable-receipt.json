@@ -3,6 +3,20 @@
   "side": "retest",
   "archetype": "retest-unbuildable-receipt",
   "description": "Retest where no host ProofReceipt can be built (mutating boundary claim without before/after readback on agent-script, unclassifiable CWE-0/other spec on declarative, empty/unbuildable receipt on floor). All three retest engines MUST return inconclusive with failureReason=receipt_unbuildable, NEVER fixed.",
+  "covers": {
+    "files": [
+      "src/server/agent-script-proof.ts",
+      "src/server/exec-verify.ts",
+      "src/server/floor-recipe-engine.ts",
+      "src/server/proof-receipt.ts",
+      "src/server/replay-verifier.ts",
+      "src/server/retest-health.ts"
+    ],
+    "classes": [
+      "other",
+      "retest"
+    ]
+  },
   "canonicalLabel": {
     "cwe": "CWE-0",
     "category": "other",
@@ -59,10 +73,14 @@
       "method": "POST",
       "pathAndQuery": "/api/inbox/alert-1/read",
       "persona": "owner_a",
-      "requestJson": { "read": true },
+      "requestJson": {
+        "read": true
+      },
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"id\":\"alert-1\",\"read\":true}"
     },
     {
@@ -72,10 +90,14 @@
       "method": "POST",
       "pathAndQuery": "/api/inbox/alert-1/read",
       "persona": "member_b",
-      "requestJson": { "read": true },
+      "requestJson": {
+        "read": true
+      },
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"id\":\"alert-1\",\"read\":true}"
     }
   ],
@@ -83,6 +105,12 @@
     "assertionsJq": "{ controlPassed: (.steps.ctl.status == 200), confirmed: false, observed: \"no receipt\", expected: \"403\" }"
   },
   "claims": [
-    { "kind": "boundary", "boundaryClass": "access", "controlExchangeId": "ctl", "probeExchangeId": "prb", "resourceTenant": "tenant-a" }
+    {
+      "kind": "boundary",
+      "boundaryClass": "access",
+      "controlExchangeId": "ctl",
+      "probeExchangeId": "prb",
+      "resourceTenant": "tenant-a"
+    }
   ]
 }

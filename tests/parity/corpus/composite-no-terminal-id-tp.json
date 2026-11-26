@@ -3,6 +3,22 @@
   "side": "tp",
   "archetype": "composite-no-terminal-exchange-id",
   "description": "Two-hop composite TP chain intentionally omitting terminalImpact.terminalExchangeId to exercise canonical terminal-exchange resolution in composite-terminal.ts across composite-receipt.ts and exec-verify.ts.",
+  "covers": {
+    "files": [
+      "src/server/composite-receipt.ts",
+      "src/server/composite-terminal.ts",
+      "src/server/exec-verify.ts",
+      "src/server/host-fact-log.ts",
+      "src/server/terminal-oracle-registry.ts",
+      "src/server/v8-oracle-families.ts",
+      "src/server/verify-claims.ts"
+    ],
+    "classes": [
+      "bola",
+      "dual_tenant_abac",
+      "authorization"
+    ]
+  },
   "canonicalLabel": {
     "cwe": "CWE-639",
     "category": "bola",
@@ -53,10 +69,15 @@
       "method": "POST",
       "pathAndQuery": "/v1/exports/request",
       "persona": "member_a",
-      "requestJson": { "tenant": "tenant-b", "scope": "billing" },
+      "requestJson": {
+        "tenant": "tenant-b",
+        "scope": "billing"
+      },
       "status": 201,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"jobId\":\"job_91\",\"downloadToken\":\"tok_notermid_a1b2c3d4\"}"
     },
     {
@@ -68,7 +89,9 @@
       "persona": "viewer_a",
       "status": 403,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"error\":\"forbidden\"}"
     },
     {
@@ -80,7 +103,9 @@
       "persona": "member_a",
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"tenant_id\":\"tenant-b\",\"owner_id\":\"owner_b\",\"email\":\"finance@tenant-b.example\",\"ledger_balance\":612000}"
     }
   ],

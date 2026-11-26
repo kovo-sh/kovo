@@ -1,3 +1,4 @@
+// @kernel @fixes R3-H-17
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'

@@ -3,6 +3,20 @@
   "side": "fp",
   "archetype": "bfla-in-policy-write",
   "description": "Same-tenant admin executes an admin-privileged write; no role escalation differential exists.",
+  "covers": {
+    "files": [
+      "src/server/floor-recipe-engine.ts",
+      "src/server/host-fact-log.ts",
+      "src/server/oracle-invariants.ts",
+      "src/server/proof-receipt.ts",
+      "src/server/replay-verifier.ts",
+      "src/server/verify-claims.ts"
+    ],
+    "classes": [
+      "bfla",
+      "authorization"
+    ]
+  },
   "canonicalLabel": {
     "cwe": "CWE-862",
     "category": "bfla",
@@ -46,7 +60,9 @@
       "persona": "admin_a",
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"theme\":\"light\",\"retention_days\":30}"
     },
     {
@@ -56,10 +72,14 @@
       "method": "PATCH",
       "pathAndQuery": "/api/admin/settings",
       "persona": "admin_a",
-      "requestJson": { "theme": "dark" },
+      "requestJson": {
+        "theme": "dark"
+      },
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"theme\":\"dark\",\"retention_days\":30}"
     },
     {
@@ -71,7 +91,9 @@
       "persona": "admin_a",
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"theme\":\"dark\",\"retention_days\":30}"
     }
   ],
@@ -80,6 +102,17 @@
     "assertionsJq": "{ controlPassed: (.steps.before.json.theme == \"light\"), confirmed: (.steps.prb.status == 200 and .steps.after.json.theme == \"dark\"), observed: .steps.after.json.theme, expected: \"light\" }"
   },
   "claims": [
-    { "kind": "impact", "impactClass": "bfla", "beforeExchangeId": "before", "probeExchangeId": "prb", "afterExchangeId": "after", "controlExchangeIds": ["before", "after"], "requiredRole": "admin" }
+    {
+      "kind": "impact",
+      "impactClass": "bfla",
+      "beforeExchangeId": "before",
+      "probeExchangeId": "prb",
+      "afterExchangeId": "after",
+      "controlExchangeIds": [
+        "before",
+        "after"
+      ],
+      "requiredRole": "admin"
+    }
   ]
 }

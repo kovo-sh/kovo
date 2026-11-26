@@ -1,0 +1,100 @@
+{
+  "id": "r3-12-claude-bypass-review-fp",
+  "side": "fp",
+  "source": "independent_review",
+  "archetype": "r3-12-accumulator-derived-protected-leaf",
+  "description": "R3-12 bypass review FP: honest authorized wallet deposit (POST accumulator action, amount operand) moves balance 100->125 and the server derives loyalty tier silver->gold from the new total. The derived non-numeric protected leaf was NOT supplied by the caller, so it must not confirm business_logic via the direct-field-tamper branch. A reference echoed in the readback provides attribution so the case reaches the tamper gate.",
+  "covers": {
+    "files": [
+      "src/server/oracle-invariants.ts",
+      "src/server/proof-receipt.ts"
+    ],
+    "classes": [
+      "business_logic"
+    ]
+  },
+  "canonicalLabel": {
+    "cwe": "CWE-840",
+    "category": "business-logic",
+    "title": "Honest wallet deposit with server-derived tier promotion",
+    "impact": "Authorized deposit increases balance and the server derives a loyalty tier from it; no refusal control, bound, peer boundary or caller-supplied protected field exists.",
+    "claimedImpact": "business_logic",
+    "claimedBoundary": "other",
+    "vulnClass": "business_logic"
+  },
+  "freeTextLabel": {
+    "title": "Wallet deposit changed protected balance and tier fields"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": false,
+    "evaluateClaims": true,
+    "composite": false,
+    "floorInjectionRecipe": false,
+    "proofReceipt": true
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [
+    {
+      "handle": "owner_a",
+      "roleLabel": "owner (tenant-a)",
+      "role": "owner",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-r312-review-owner-a-token"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "before_bal",
+      "arm": "control",
+      "role": "control",
+      "evidenceRole": "baseline_read",
+      "method": "GET",
+      "pathAndQuery": "/api/wallets/acct_a/balance",
+      "persona": "owner_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"id\":\"acct_a\",\"balance\":100,\"tier\":\"silver\",\"last_reference\":\"none\"}"
+    },
+    {
+      "id": "prb_deposit",
+      "arm": "probe",
+      "role": "probe",
+      "method": "POST",
+      "pathAndQuery": "/api/wallets/acct_a/deposit",
+      "persona": "owner_a",
+      "requestJson": { "amount": 25, "reference": "dep-20260101-0001" },
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"ok\":true,\"reference\":\"dep-20260101-0001\"}"
+    },
+    {
+      "id": "after_bal",
+      "arm": "control",
+      "role": "control",
+      "evidenceRole": "post_mutation_read",
+      "method": "GET",
+      "pathAndQuery": "/api/wallets/acct_a/balance",
+      "persona": "owner_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"id\":\"acct_a\",\"balance\":125,\"tier\":\"gold\",\"last_reference\":\"dep-20260101-0001\"}"
+    }
+  ],
+  "proofReceipt": {
+    "vulnClass": "business_logic",
+    "targetMethod": "POST",
+    "targetPathAndQuery": "/api/wallets/acct_a/deposit",
+    "claimedDelta": "Single honest deposit moved balance 100->125 and server-derived tier silver->gold; no caller-supplied protected field, bound crossing or refusal control."
+  },
+  "claims": [
+    { "kind": "impact", "impactClass": "business_logic", "probeExchangeId": "prb_deposit", "beforeExchangeId": "before_bal", "afterExchangeId": "after_bal", "controlExchangeIds": ["before_bal", "after_bal"] }
+  ]
+}

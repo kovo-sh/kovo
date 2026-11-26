@@ -1,3 +1,4 @@
+// @kernel @fixes R4-C-5, R4-H-5, R4-H-6
 /**
  * WS-5 (R4-C-5 Provenance, R4-H-5 Object-Bound Control & Auto-DAG, R4-H-6 Per-Exchange Tenant Privilege)
  * Fast Class-Level Guard Suite for `scripts/worker-gate.sh`.

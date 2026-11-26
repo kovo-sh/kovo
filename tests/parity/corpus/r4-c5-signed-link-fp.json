@@ -3,6 +3,23 @@
   "side": "fp",
   "archetype": "r4-c5-signed-link-scope-replay",
   "description": "R4-C-5 FP: benign signed-link mint on /share followed by tampered-signature 403 control and valid redemption on /download for the exact same signed resource must reject as same_principal_not_replay.",
+  "covers": {
+    "files": [
+      "src/server/composite-receipt.ts",
+      "src/server/host-fact-log.ts",
+      "src/server/terminal-oracle-registry.ts",
+      "src/server/v8-oracle-families.ts",
+      "src/server/v8-oracle-hydrate.ts",
+      "src/server/verify-claims.ts",
+      "src/server/verify-prove-handlers.ts",
+      "src/server/verify-support.ts"
+    ],
+    "classes": [
+      "cryptographic_scope_replay",
+      "auth_crypto",
+      "authorization"
+    ]
+  },
   "canonicalLabel": {
     "cwe": "CWE-347",
     "category": "auth_crypto",
@@ -46,7 +63,9 @@
       "persona": "member_a",
       "status": 403,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"error\":\"invalid_signature\"}"
     },
     {
@@ -58,7 +77,9 @@
       "persona": "member_a",
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"signedUrl\":\"https://api.example.test/api/v1/downloads/export-42?exp=1700000900&sig=valid-sig-r4c5\"}"
     },
     {
@@ -70,7 +91,9 @@
       "persona": "member_a",
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"fileId\":\"export-42\",\"rows\":[{\"id\":\"r1\",\"amount\":500}]}"
     }
   ],
@@ -80,7 +103,9 @@
     "oracleFamily": "cryptographic_scope_replay",
     "singleHop": true,
     "terminalExchangeId": "r4c5_download",
-    "preChainControlIds": ["r4c5_ctrl"],
+    "preChainControlIds": [
+      "r4c5_ctrl"
+    ],
     "claimedDelta": "Single-persona mint on /share followed by valid download on /download for the same signed resource must not confirm cryptographic_scope_replay.",
     "v8OracleInput": {
       "family": "cryptographic_scope_replay",

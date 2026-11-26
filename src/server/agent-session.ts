@@ -34,6 +34,12 @@ import {
   boardPostBodyLimit,
   specialistBoardPostKinds,
 } from "./board-tools.ts"
+import {
+  RECORD_COVERAGE_BASE_FIELDS,
+  buildRecordCoverageFieldDescriptions,
+  buildRecordCoverageToolDescription,
+  validateRecordCoverageContractInput,
+} from "./coverage-category.ts"
 import type { BoardPostArgs, BoardReadArgs } from "./board-tools.ts"
 import type { BrokerMultipartPart } from "./broker.ts"
 import type { BrowserInteractiveAction, BrowserSessionStep } from "./scoped-browser.ts"
@@ -2900,49 +2906,44 @@ export function buildWorkerTools(
 
   if (handlers.record_coverage) {
     const fn = handlers.record_coverage
+    const allProofGapCodes = [...SPEC_PROOF_GAP_CODES, ...SPEC_PROOF_GAP_ALIASES]
+    const fieldDesc = buildRecordCoverageFieldDescriptions(allProofGapCodes)
     tools.push(defineTool({
       name: 'record_coverage',
-      description: [
-        'Update the per-origin OWASP/API Top 10 3-state closure coverage ledger.',
-        'Strict 3-State Closure Discipline (SPEC-v3 §4.5C):',
-        '- status="reported": link to a confirmed or static_verified finding via linkedFindingId.',
-        '- status="ruled_out": REQUIRES non-empty enforcingControl quoting the exact file:line in /repos or exact negative-control exchangeId proving the control runs on the attacker path (generic claims are rejected).',
-        '- status="needs_follow_up": REQUIRES a non-empty machine-readable proofGapReason (e.g. no_spec_shape, no_authenticated_persona, baseline_empty) explaining the exact blocker so the Coordinator Planner and the held-out autopsy can distinguish an honest gap from a silent skip.',
-        'Proof gaps are route-scoped: a coded gap MUST name the route it applies to via route="METHOD /path" (e.g. route="GET /api/orders/:id"); a gap on one route never discharges another probed route.',
-      ].join(' '),
+      description: buildRecordCoverageToolDescription(),
       parameters: obj({
         origin: str({ maxLength: 256 }),
         category: oneOf(owaspCategories),
         status: oneOf(coverageStatuses),
         summary: str({ maxLength: 600 }),
-        enforcingControl: opt(str({ description: 'REQUIRED when status="ruled_out": exact file:line in /repos or exact negative-control exchangeId.', maxLength: 500 })),
-        proofGapReason: opt(str({ description: `REQUIRED when status="needs_follow_up": machine-readable code plus detail (${[...SPEC_PROOF_GAP_CODES, ...SPEC_PROOF_GAP_ALIASES].join('|')}) explaining the exact blocker.`, maxLength: 600 })),
-        route: opt(str({ description: 'Route this closure applies to, as "METHOD /path" (path parameters may be concrete: "GET /api/orders/1001"). REQUIRED for a coded needs_follow_up gap when more than one route was probed, because the gap discharges only that route.', maxLength: 200 })),
-        linkedFindingId: opt(str({ description: 'Finding ID when status="reported".', maxLength: 64 })),
+        enforcingControl: opt(str({ description: fieldDesc.enforcingControl, maxLength: 500 })),
+        proofGapReason: opt(str({ description: fieldDesc.proofGapReason, maxLength: 600 })),
+        route: opt(str({ description: fieldDesc.route, maxLength: 200 })),
+        linkedFindingId: opt(str({ description: fieldDesc.linkedFindingId, maxLength: 64 })),
         preconditionCapIds: opt(arr(str({ maxLength: 160 }), { maxItems: 16 })),
         branchKey: opt(str({ maxLength: 200 })),
         hypothesisClass: opt(str({ maxLength: 100 })),
-        exchangeIds: opt(arr(str({ maxLength: 120 }), { maxItems: 16 })),
+        exchangeIds: opt(arr(str({ maxLength: 120 }), { description: fieldDesc.exchangeIds, maxItems: 16 })),
       }),
       replay: 'safe',
       outputLimits,
       execute: async (args, _api, ctx) => {
         const signal = combineSignal(ctx.abortSignal)
-        if (args.status === 'ruled_out' && (!args.enforcingControl || args.enforcingControl.trim().length < 3)) {
-          return {
-            isError: true,
-            output: [{
-              type: 'text' as const,
-              text: 'record_coverage validation failed: status="ruled_out" REQUIRES a non-empty enforcingControl quoting the exact file:line in /repos or exact negative-control exchangeId proving the control enforces on the attacker path.',
-            }],
+        for (const baseField of RECORD_COVERAGE_BASE_FIELDS) {
+          if (args[baseField] !== undefined && (typeof args[baseField] !== 'string' || !args[baseField].trim())) {
+            return {
+              isError: true,
+              output: [{ type: 'text' as const, text: `record_coverage validation failed: required base field "${baseField}" must be a non-empty string.` }],
+            }
           }
         }
-        if (args.status === 'needs_follow_up' && (!args.proofGapReason || args.proofGapReason.trim().length < 5)) {
+        const contractCheck = validateRecordCoverageContractInput(args, { proofGapCodes: allProofGapCodes })
+        if (!contractCheck.ok) {
           return {
             isError: true,
             output: [{
               type: 'text' as const,
-              text: `record_coverage validation failed: status="needs_follow_up" REQUIRES a non-empty proofGapReason explaining what is needed to confirm or rule out this lead. Use a machine-readable code so the settlement proof gap is auditable: ${[...SPEC_PROOF_GAP_CODES, ...SPEC_PROOF_GAP_ALIASES].join(', ')}.`,
+              text: `record_coverage validation failed: ${contractCheck.error}`,
             }],
           }
         }

@@ -595,14 +595,6 @@
       "expires": "2026-12-26"
     },
     {
-      "file": "tests/v7-agent-script-proofs.test.ts",
-      "testName": "v7 agent-script-proofs: verifyReceipt fails closed on status-only, missing readback, and anon-401 control",
-      "assertionLocation": "tests/v7-agent-script-proofs.test.ts:594:1",
-      "ownerStream": "v7-triage",
-      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-26"
-    },
-    {
       "file": "tests/v7-agentic-lift-oracles.test.ts",
       "testName": "Seam 1 end-to-end: ctx.prove_access_boundary (TS) confirms forged-JWT auth bypass through verifyScript + ProofReceipt",
       "assertionLocation": "tests/v7-agentic-lift-oracles.test.ts:378:1",

@@ -3,6 +3,21 @@
   "side": "tp",
   "archetype": "boolean-differential",
   "description": "Two paired control/probe rounds with identical stripped base value and arithmetic tautology vs contradiction predicates producing a stable structural JSON differential.",
+  "covers": {
+    "files": [
+      "src/server/host-fact-log.ts",
+      "src/server/oracle-invariants.ts",
+      "src/server/proof-receipt.ts",
+      "src/server/verify-claims.ts",
+      "src/server/verify-prove-handlers.ts",
+      "src/server/verify-support.ts"
+    ],
+    "classes": [
+      "boolean_differential",
+      "sqli",
+      "injection"
+    ]
+  },
   "canonicalLabel": {
     "cwe": "CWE-89",
     "category": "sqli",
@@ -41,7 +56,9 @@
       "persona": null,
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"item\":{\"id\":1,\"sku\":\"BOOK-101\",\"title\":\"Handbook\",\"inStock\":true}}"
     },
     {
@@ -55,7 +72,9 @@
       "persona": null,
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"item\":{\"id\":1,\"sku\":\"BOOK-101\",\"title\":\"Handbook\",\"inStock\":true}}"
     },
     {
@@ -69,7 +88,9 @@
       "persona": null,
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"item\":null,\"matches\":0}"
     },
     {
@@ -84,7 +105,9 @@
       "persona": null,
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"item\":{\"id\":1,\"sku\":\"BOOK-101\",\"title\":\"Handbook\",\"inStock\":true}}"
     },
     {
@@ -98,7 +121,9 @@
       "persona": null,
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"item\":{\"id\":1,\"sku\":\"BOOK-101\",\"title\":\"Handbook\",\"inStock\":true}}"
     },
     {
@@ -112,7 +137,9 @@
       "persona": null,
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"item\":null,\"matches\":0}"
     }
   ],
@@ -121,10 +148,26 @@
     "param": "id",
     "targetMethod": "GET",
     "targetPathAndQuery": "/api/catalog?id=1",
-    "mintBooleanPair": { "baseValue": "1", "param": "id", "style": "numeric" },
+    "mintBooleanPair": {
+      "baseValue": "1",
+      "param": "id",
+      "style": "numeric"
+    },
     "claimedDelta": "Paired boolean tautology and contradiction predicates on identical base value produced a stable structural JSON delta across two rounds."
   },
   "claims": [
-    { "kind": "structural_diff", "controlIds": ["ctl1", "ctl2"], "variantIds": ["prb1", "prb2"], "minRounds": 2, "minDeltaTokens": 1 }
+    {
+      "kind": "structural_diff",
+      "controlIds": [
+        "ctl1",
+        "ctl2"
+      ],
+      "variantIds": [
+        "prb1",
+        "prb2"
+      ],
+      "minRounds": 2,
+      "minDeltaTokens": 1
+    }
   ]
 }

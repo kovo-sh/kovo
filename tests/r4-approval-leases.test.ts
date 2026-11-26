@@ -1,3 +1,4 @@
+// @kernel @fixes R4-H-1
 /**
  * Fast class-level security guard for R4-H-1 (Single Authoritative Lease-Eligibility Predicate):
  *

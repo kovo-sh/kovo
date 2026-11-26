@@ -1,3 +1,4 @@
+// @kernel @fixes R4-H-8, R4-H-11, R4-H-12, R4-H-13, R4-H-16
 /**
  * WS-10 (`R4-H-11`, `R4-H-12`, `R4-H-13`, `R4-H-8`, `R4-H-16`):
  * Fast (<5s) class-level orchestration lifecycle guards.

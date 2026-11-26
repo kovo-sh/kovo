@@ -13,6 +13,7 @@
 #   bash scripts/run-fast-tests.sh
 #   bash scripts/run-fast-tests.sh --quarantine tests/QUARANTINE.json
 #   bash scripts/run-fast-tests.sh --suites-only --quarantine tests/QUARANTINE.json
+#   bash scripts/run-fast-tests.sh --suites-only --quarantine tests/QUARANTINE.json --shard 1/6
 #   bash scripts/run-fast-tests.sh --check-only --quarantine tests/QUARANTINE.json [--now YYYY-MM-DD]
 #   KOVO_FAST_TEST_JOBS=12 bash scripts/run-fast-tests.sh --suites-only --quarantine tests/QUARANTINE.json
 set -uo pipefail
@@ -28,6 +29,7 @@ TESTS_DIR="tests"
 JOBS_OVERRIDE=""
 JSON_OUT=0
 SKIP_GIT_CAP_CHECK=0
+SHARD_SPEC=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -37,12 +39,29 @@ while [[ $# -gt 0 ]]; do
     --now) NOW_DATE="${2:?--now requires YYYY-MM-DD}"; shift 2;;
     --tests-dir) TESTS_DIR="${2:?--tests-dir requires a directory}"; shift 2;;
     --jobs) JOBS_OVERRIDE="${2:?--jobs requires an integer}"; shift 2;;
+    --shard) SHARD_SPEC="${2:?--shard requires <k>/<N>}"; shift 2;;
+    --shard=*) SHARD_SPEC="${1#--shard=}"; shift;;
     --json) JSON_OUT=1; shift;;
     --skip-git-cap-check) SKIP_GIT_CAP_CHECK=1; shift;;
-    -h|--help) sed -n '2,20p' "$0"; exit 0;;
+    -h|--help) sed -n '2,21p' "$0"; exit 0;;
     *) echo "unknown option: $1" >&2; exit 2;;
   esac
 done
+
+SHARD_INDEX=""
+SHARD_TOTAL=""
+if [[ -n "$SHARD_SPEC" ]]; then
+  if [[ ! "$SHARD_SPEC" =~ ^([1-9][0-9]*)/([1-9][0-9]*)$ ]]; then
+    echo "FAIL: invalid --shard value '$SHARD_SPEC' (expected <k>/<N> with integers 1 <= k <= N)" >&2
+    exit 2
+  fi
+  SHARD_INDEX="${BASH_REMATCH[1]}"
+  SHARD_TOTAL="${BASH_REMATCH[2]}"
+  if (( SHARD_INDEX < 1 || SHARD_INDEX > SHARD_TOTAL )); then
+    echo "FAIL: invalid --shard value '$SHARD_SPEC' (require 1 <= k <= N)" >&2
+    exit 2
+  fi
+fi
 
 if [[ "$CHECK_ONLY" -eq 0 && ! -d node_modules ]]; then
   echo "FAIL: node_modules missing — run 'npm ci' (or symlink main checkout's node_modules) first." >&2
@@ -121,10 +140,12 @@ export FAST_TEST_NOW="$NOW_DATE"
 export FAST_TEST_DIR="$TESTS_DIR"
 export FAST_TEST_JSON="$JSON_OUT"
 export FAST_TEST_SKIP_GIT_CAP="$SKIP_GIT_CAP_CHECK"
+export FAST_TEST_SHARD_INDEX="$SHARD_INDEX"
+export FAST_TEST_SHARD_TOTAL="$SHARD_TOTAL"
 
 node --input-type=module <<'EOF'
 import { execFile, execFileSync } from 'node:child_process'
-import { existsSync, readdirSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs'
 import { join, posix, relative, resolve, sep } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
@@ -155,6 +176,18 @@ const quarantinePath = (process.env.FAST_TEST_QUARANTINE || '').trim()
 const todayStr = (process.env.FAST_TEST_NOW || '').trim() || new Date().toISOString().slice(0, 10)
 const jobs = Math.max(1, Number(process.env.FAST_TEST_JOBS) || 8)
 const skipGitCapCheck = process.env.FAST_TEST_SKIP_GIT_CAP === '1' || !isDefaultTestsDir
+const shardIndexRaw = (process.env.FAST_TEST_SHARD_INDEX || '').trim()
+const shardTotalRaw = (process.env.FAST_TEST_SHARD_TOTAL || '').trim()
+const shardActive = Boolean(shardIndexRaw || shardTotalRaw)
+const shardIndex = shardActive ? Number(shardIndexRaw) : 0
+const shardTotal = shardActive ? Number(shardTotalRaw) : 0
+if (
+  shardActive &&
+  (!Number.isInteger(shardIndex) || !Number.isInteger(shardTotal) || shardIndex < 1 || shardIndex > shardTotal)
+) {
+  console.error(`FAIL: invalid --shard '${shardIndexRaw}/${shardTotalRaw}' (expected integers 1 <= k <= N)`)
+  process.exit(2)
+}
 
 const excludedMap = new Map()
 for (const line of (process.env.EXCLUDED_JOINED || '').split(/\r?\n/)) {
@@ -443,6 +476,20 @@ if (errors.length > 0) {
   process.exit(1)
 }
 
+// Deterministically partition fast files across N shards when --shard <k>/<N> is set:
+// sort Playwright/UI suites (tests/ux-*.test.ts, tests/fix-*.test.ts) first, then alphabetical
+// for the rest, and assign round-robin (idx % N === k - 1) so heavy Playwright tests spread evenly.
+const PLAYWRIGHT_UI_RE = /^tests\/(?:ux|fix)-[^/]+\.test\.ts$/
+const selectedRunFiles = shardActive
+  ? [...runFiles]
+      .sort((a, b) => {
+        const pa = PLAYWRIGHT_UI_RE.test(a) ? 0 : 1
+        const pb = PLAYWRIGHT_UI_RE.test(b) ? 0 : 1
+        return pa !== pb ? pa - pb : a.localeCompare(b)
+      })
+      .filter((_, i) => i % shardTotal === shardIndex - 1)
+  : runFiles
+
 if (checkOnly) {
   if (jsonOut) {
     console.log(JSON.stringify({
@@ -450,6 +497,15 @@ if (checkOnly) {
       checkOnly: true,
       discovered: allDiscovered.length,
       fast: runFiles.length,
+      ...(shardActive
+        ? {
+            shard: `${shardIndex}/${shardTotal}`,
+            shardIndex,
+            shardTotal,
+            shardFast: selectedRunFiles.length,
+            shardFiles: selectedRunFiles,
+          }
+        : {}),
       excluded: skippedByExclude.length,
       quarantined: totalQuarantinedCases,
       quarantinedCases: totalQuarantinedCases,
@@ -465,8 +521,9 @@ if (checkOnly) {
     const qNote = quarantinePath
       ? `, ${totalQuarantinedCases}/${maxQuarantinedCases} quarantined cases across ${quarantinedFileCount} files (${kernelQuarantinedCases} kernel/critical, earliest expiry ${earliestExpiry || 'n/a'})`
       : ''
+    const shardNote = shardActive ? `, shard ${shardIndex}/${shardTotal}: ${selectedRunFiles.length} files` : ''
     console.log(
-      `Fast-test inventory PASS: ${allDiscovered.length} discovered (${runFiles.length} fast, ${skippedByExclude.length} excluded${qNote}, 0 orphans)`,
+      `Fast-test inventory PASS: ${allDiscovered.length} discovered (${runFiles.length} fast, ${skippedByExclude.length} excluded${qNote}${shardNote}, 0 orphans)`,
     )
   }
   process.exit(0)
@@ -474,7 +531,7 @@ if (checkOnly) {
 
 // Schedule heavier suites first (LPT heuristic) to eliminate tail stragglers across worker slots.
 const HEAVY_HINT_RE = /(?:v6-auth|v8-concurrency-12|v4-m4-surface-orchestration|ux-inventory-batch|ux-consent-sticky|ux-zero-persona-warn|ux-approval-scopes|ux-round0-stepper|r3-node-hardening|v8-seam2-docs-mock-exec|v8-phasea-overlap|ux-workflow-list|fix-project-tabs|v7-exec-throughput|gb-planner-wiring|realism-mono|product-paging|phase0-paging|contract-canary|oob-engine|crawl-paging|killswitch-nav|universal-browser-auth|bench-cred-dir|proto-pollute|probe-split|egress-admit|static-fp|fixture-timing|realistic-harness)/
-const orderedRunFiles = [...runFiles].sort((a, b) => {
+const orderedRunFiles = [...selectedRunFiles].sort((a, b) => {
   const ha = HEAVY_HINT_RE.test(a) ? 0 : 1
   const hb = HEAVY_HINT_RE.test(b) ? 0 : 1
   return ha !== hb ? ha - hb : a.localeCompare(b)
@@ -483,9 +540,10 @@ const orderedRunFiles = [...runFiles].sort((a, b) => {
 const qBanner = quarantinePath
   ? `, ${totalQuarantinedCases}/${maxQuarantinedCases} quarantined cases in ${quarantinedFileCount} files`
   : ''
+const shardBanner = shardActive ? `shard ${shardIndex}/${shardTotal}: ${selectedRunFiles.length}/` : ''
 if (!jsonOut) {
   console.log(
-    `Discovered ${allDiscovered.length} test files (${runFiles.length} fast zero-LLM, ${skippedByExclude.length} excluded${qBanner}, 0 orphans; concurrency=${jobs})`,
+    `Discovered ${allDiscovered.length} test files (${shardBanner}${runFiles.length} fast zero-LLM, ${skippedByExclude.length} excluded${qBanner}, 0 orphans; concurrency=${jobs})`,
   )
 }
 
@@ -494,6 +552,152 @@ let idx = 0
 const results = []
 const preferredTmpRoot = process.env.TMPDIR || undefined
 
+// Snapshot benchmarks/results (including gitignored runs/) before fast tests execute so
+// any test that leaks ledger/result files into the real checkout fails the gate immediately (R3-02).
+function snapshotBenchResultsState() {
+  const statusLines = []
+  try {
+    const out = execFileSync('git', ['status', '--porcelain', '--ignored', '-uall', '--', 'benchmarks/results'], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    })
+    for (const line of out.split(/\r?\n/)) {
+      const trimmed = line.trimEnd()
+      if (trimmed) statusLines.push(trimmed)
+    }
+    statusLines.sort()
+  } catch {
+    // Non-git directory: fall back to filesystem inventory below.
+  }
+
+  const fileFingerprints = new Map()
+  const resultsRoot = resolve(repoRoot, 'benchmarks/results')
+  function walkResults(dirAbs) {
+    if (!existsSync(dirAbs)) return
+    const entries = readdirSync(dirAbs, { withFileTypes: true })
+    entries.sort((a, b) => a.name.localeCompare(b.name))
+    for (const entry of entries) {
+      const full = join(dirAbs, entry.name)
+      if (entry.isDirectory()) {
+        walkResults(full)
+      } else if (entry.isFile()) {
+        const st = statSync(full)
+        const rel = relative(repoRoot, full).split(sep).join(posix.sep)
+        fileFingerprints.set(rel, `${st.size}:${Math.trunc(st.mtimeMs)}`)
+      }
+    }
+  }
+  walkResults(resultsRoot)
+  return { statusLines, fileFingerprints }
+}
+
+function diffBenchResultsState(before, after) {
+  const drift = []
+  const beforeStatusSet = new Set(before.statusLines)
+  const afterStatusSet = new Set(after.statusLines)
+  for (const line of after.statusLines) {
+    if (!beforeStatusSet.has(line)) drift.push(`status added: ${line}`)
+  }
+  for (const line of before.statusLines) {
+    if (!afterStatusSet.has(line)) drift.push(`status removed: ${line}`)
+  }
+  const seenFiles = new Set([...before.fileFingerprints.keys(), ...after.fileFingerprints.keys()])
+  for (const rel of [...seenFiles].sort()) {
+    const prev = before.fileFingerprints.get(rel)
+    const next = after.fileFingerprints.get(rel)
+    if (prev === next) continue
+    if (prev === undefined) {
+      drift.push(`file created: ${rel}`)
+    } else if (next === undefined) {
+      drift.push(`file removed: ${rel}`)
+    } else {
+      drift.push(`file modified: ${rel}`)
+    }
+  }
+  return drift
+}
+
+const benchResultsBefore = snapshotBenchResultsState()
+
+function formatFailureDiagnostic(rawError) {
+  if (!rawError) return ''
+  const lines = String(rawError)
+    .split(/\r?\n/)
+    .map(l => l.trim())
+    .filter(Boolean)
+    .slice(0, 3)
+  if (lines.length === 0) return ''
+  const joined = lines.join('\n')
+  return joined.length > 300 ? `${joined.slice(0, 297)}...` : joined
+}
+
+function extractMultilineTapErrors(tapText) {
+  const lines = tapText.split(/\r?\n/)
+  const out = []
+  let i = 0
+  while (i < lines.length) {
+    const resM = /^((?:    )*)not ok \d+(?: - (.*))?$/.exec(lines[i])
+    if (!resM) {
+      i += 1
+      continue
+    }
+    let type = 'test'
+    let failureType = ''
+    let errorLines = []
+    if (i + 1 < lines.length && /^(\s+)---$/.test(lines[i + 1])) {
+      const yamlIndent = /^(\s+)---$/.exec(lines[i + 1])[1]
+      const blockPrefix = `${yamlIndent}  `
+      i += 2
+      let inErrorBlock = false
+      while (i < lines.length && lines[i] !== `${yamlIndent}...`) {
+        const yLine = lines[i]
+        if (inErrorBlock) {
+          if (yLine.startsWith(blockPrefix) || yLine.trim() === '') {
+            const txt = yLine.trim()
+            if (txt && errorLines.length < 4) errorLines.push(txt)
+            i += 1
+            continue
+          }
+          inErrorBlock = false
+        }
+        if (yLine.startsWith(yamlIndent)) {
+          const trimmed = yLine.slice(yamlIndent.length)
+          const tm = /^type:\s*'?([^']+)'?$/.exec(trimmed)
+          if (tm) type = tm[1].trim()
+          const fm = /^failureType:\s*'?([^']+)'?$/.exec(trimmed)
+          if (fm) failureType = fm[1].trim()
+          const em = /^error:\s*(.*)$/.exec(trimmed)
+          if (em) {
+            const val = em[1].trim()
+            if (val === '|-' || val === '|' || val === '>-' || val === '>') {
+              inErrorBlock = true
+            } else if (val) {
+              errorLines = [val.replace(/^['"]|['"]$/g, '').trim()]
+            }
+          }
+        }
+        i += 1
+      }
+    }
+    if (failureType !== 'subtestsFailed' && type !== 'suite') {
+      out.push(formatFailureDiagnostic(errorLines.join('\n')))
+    }
+    i += 1
+  }
+  return out
+}
+
+function enrichTapFailureErrors(parsed, tapText) {
+  const failing = parsed.cases.filter(c => c.status === 'fail')
+  if (failing.length === 0 || failing.every(c => c.error && c.error.trim())) return
+  const extracted = extractMultilineTapErrors(tapText)
+  for (let i = 0; i < failing.length; i += 1) {
+    if (!failing[i].error && extracted[i]) {
+      failing[i].error = extracted[i]
+    }
+  }
+}
 function evaluateFileExecution(file, execRes) {
   const qMap = quarantinedByFile.get(file) || new Map()
   const { parsed, err, ms, timedOut, stderrSnippet } = execRes
@@ -546,8 +750,14 @@ function evaluateFileExecution(file, execRes) {
   let reason = ''
   if (unlistedFailures.length > 0) {
     const first = unlistedFailures[0]
-    const errPart = first.error ? ` — ${first.error}` : ''
-    reason = `${first.name}${errPart}`.slice(0, 180)
+    const errInline = first.error ? first.error.replace(/\s+/g, ' ').trim() : ''
+    if (errInline) {
+      const nameCap = Math.min(first.name.length, 90)
+      const shortName = first.name.length > nameCap ? `${first.name.slice(0, nameCap - 1)}…` : first.name
+      reason = `${shortName} — ${errInline}`.slice(0, 260)
+    } else {
+      reason = first.name.slice(0, 180)
+    }
   }
 
   return {
@@ -590,6 +800,7 @@ function runOneRaw(file) {
         const tapText = existsSync(tapPath) ? readFileSync(tapPath, 'utf8') : ''
         rmSync(sandboxDir, { recursive: true, force: true })
         const parsed = parseTapOutput(tapText, repoRoot)
+        enrichTapFailureErrors(parsed, tapText)
         const timedOut = Boolean(err && err.killed)
         const combined = `${stderr || ''}\n${stdout || ''}`
         const errLine = combined
@@ -702,6 +913,9 @@ if (jobs > 1 && initialFailures.length > 0) {
 results.sort((a, b) => a.file.localeCompare(b.file))
 staleEntries.sort((a, b) => `${a.file}\0${a.testName}`.localeCompare(`${b.file}\0${b.testName}`))
 
+const benchResultsAfter = snapshotBenchResultsState()
+const ledgerDrift = diffBenchResultsState(benchResultsBefore, benchResultsAfter)
+
 const wallSec = Number(((Date.now() - tStart) / 1000).toFixed(1))
 const passedFiles = results.filter(r => r.ok)
 const failedFiles = results.filter(r => !r.ok)
@@ -710,7 +924,7 @@ const totalPass = results.reduce((n, r) => n + r.pass, 0)
 const totalUnlistedFail = results.reduce((n, r) => n + r.fail, 0)
 const totalQuarantinedFail = results.reduce((n, r) => n + r.quarantinedFail, 0)
 const totalSkip = results.reduce((n, r) => n + r.skipped, 0)
-const overallOk = failedFiles.length === 0 && staleEntries.length === 0
+const overallOk = failedFiles.length === 0 && staleEntries.length === 0 && ledgerDrift.length === 0
 
 if (jsonOut) {
   console.log(JSON.stringify({
@@ -729,6 +943,7 @@ if (jsonOut) {
       unlistedFailures: r.unlistedFailures.map(f => ({ name: f.name, location: f.location, error: f.error })),
     })),
     staleEntries,
+    ledgerDrift,
     flakyQuarantined,
     recoveredInIsolation,
     excluded: skippedByExclude.length,
@@ -767,6 +982,12 @@ if (jsonOut) {
       console.log(`  FAIL ${r.file} (${r.fail} unlisted / ${r.tests} cases, ${r.ms}ms) — ${r.reason}`)
       for (const f of r.unlistedFailures.slice(0, 5)) {
         console.log(`    - [unlisted] ${f.name}${f.location ? ` (${f.location})` : ''}`)
+        const diag = formatFailureDiagnostic(f.error)
+        if (diag) {
+          for (const diagLine of diag.split('\n')) {
+            console.log(`      ${diagLine}`)
+          }
+        }
       }
     }
   }
@@ -774,6 +995,12 @@ if (jsonOut) {
     console.log(`\nStale quarantine entries (${staleEntries.length} — remove from ${quarantinePath}):`)
     for (const s of staleEntries) {
       console.log(`  STALE ${s.message}`)
+    }
+  }
+  if (ledgerDrift.length > 0) {
+    console.error(`\nFAIL: benchmarks/results/ drift detected during fast-test run (${ledgerDrift.length} change(s)):`)
+    for (const item of ledgerDrift) {
+      console.error(`  - ${item}`)
     }
   }
 }

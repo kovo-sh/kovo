@@ -1,3 +1,4 @@
+// @kernel @fixes R3-H-1
 /**
  * R3-H-1(a) & R3-H-1(b) regression suite:
  *  - R3-H-1(a): Derived (non-explicit) `staging_isolated` under `auto_review` MUST NOT

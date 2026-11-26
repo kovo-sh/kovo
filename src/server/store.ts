@@ -160,6 +160,12 @@ export {
  */
 const ALLOWED_LAZY_RUNTIME_COLUMNS: Readonly<Record<string, ReadonlySet<string>>> = {
   runs: new Set(['declined_origins', 'label']),
+  approval_requests: new Set([
+    'original_judge_decision',
+    'original_risk_level',
+    'host_floor',
+    'fail_safe_reason',
+  ]),
 }
 
 /**
@@ -1892,6 +1898,7 @@ export class Store {
   grantApprovalLease(...args: Parameters<RunsRepository['grantApprovalLease']>) { return this.runsRepo.grantApprovalLease(...args) }
   listApprovalLeases(...args: Parameters<RunsRepository['listApprovalLeases']>) { return this.runsRepo.listApprovalLeases(...args) }
   revokeApprovalLease(...args: Parameters<RunsRepository['revokeApprovalLease']>) { return this.runsRepo.revokeApprovalLease(...args) }
+  extendApprovalLease(...args: Parameters<RunsRepository['extendApprovalLease']>) { return this.runsRepo.extendApprovalLease(...args) }
   revokeApprovalLeasesForOrigin(...args: Parameters<RunsRepository['revokeApprovalLeasesForOrigin']>) { return this.runsRepo.revokeApprovalLeasesForOrigin(...args) }
   leaseAuthorizes(...args: Parameters<RunsRepository['leaseAuthorizes']>) { return this.runsRepo.leaseAuthorizes(...args) }
   approvalLeaseAuthorizer(...args: Parameters<RunsRepository['approvalLeaseAuthorizer']>) { return this.runsRepo.approvalLeaseAuthorizer(...args) }

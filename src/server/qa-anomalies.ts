@@ -83,43 +83,8 @@ const STUCK_ASSIGNMENT_STATUSES: ReadonlySet<string> = new Set(['running', 'queu
  * Keys whose values may hold cookies, auth headers, tokens, secrets, or raw HTTP bodies.
  * Any matching key is omitted completely from sanitized anomaly `detail` payloads.
  */
-const DISALLOWED_DETAIL_KEY_RE = new RegExp(
-  [
-    'cookie',
-    'set[-_]?cookie',
-    'authorization',
-    'proxy[-_]?authorization',
-    'auth[-_]?header',
-    'token',
-    'jwt',
-    'secret',
-    'password',
-    'passwd',
-    'api[-_]?key',
-    'credential',
-    'session[-_]?(?:id|key|cookie|token|state)',
-    'storage[-_]?state',
-    'bootstrap',
-    'private[-_]?key',
-    'csrf',
-    'xsrf',
-    'headers?',
-    'req[-_]?headers?',
-    'resp[-_]?headers?',
-    'request[-_]?headers?',
-    'response[-_]?headers?',
-    'body',
-    'raw[-_]?body',
-    'http[-_]?body',
-    'request[-_]?body',
-    'response[-_]?body',
-    'body[-_]?preview',
-    'html',
-    'raw[-_]?html',
-    'payload',
-  ].join('|'),
-  'i',
-)
+const DISALLOWED_DETAIL_KEY_RE =
+  /cookie|set[-_]?cookie|authorization|proxy[-_]?authorization|auth[-_]?header|token|jwt|secret|password|passwd|api[-_]?key|credential|session[-_]?(?:id|key|cookie|token|state)|storage[-_]?state|bootstrap|private[-_]?key|csrf|xsrf|headers?|req[-_]?headers?|resp[-_]?headers?|request[-_]?headers?|response[-_]?headers?|body|raw[-_]?body|http[-_]?body|request[-_]?body|response[-_]?body|body[-_]?preview|html|raw[-_]?html|payload/i
 
 const INLINE_AUTH_OR_COOKIE_RE = /\b(?:cookie|set-cookie2?|authorization|proxy-authorization|x-api-key|x-auth-token|x-access-token|x-session-token|x-csrf-token|x-xsrf-token)\s*[:=]\s*[^\n\r;,]*/gi
 const QUERY_SECRET_RE = /([?&](?:bootstrap|token|access_token|refresh_token|id_token|code|ticket|session|session_id|key|api_key|apikey|secret|password|auth|sig|signature|jwt)=)[^&#\s]+/gi

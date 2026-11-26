@@ -1,3 +1,4 @@
+// @kernel @fixes R4-H-19
 process.env.KOVO_ALLOW_LOCAL_LAB ??= '1'
 /**
  * WS-9 (`R4-H-19` + shared `RunSafetyBudgets` keys for WS-10, WS-11, WS-14) class-level guards:

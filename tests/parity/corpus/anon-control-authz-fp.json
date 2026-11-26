@@ -3,6 +3,20 @@
   "side": "fp",
   "archetype": "anon-control-authz",
   "description": "Anonymous 401 control paired with authenticated member reading own tenant record; proves login gate, not authz crossing.",
+  "covers": {
+    "files": [
+      "src/server/floor-recipe-engine.ts",
+      "src/server/host-fact-log.ts",
+      "src/server/oracle-invariants.ts",
+      "src/server/proof-receipt.ts",
+      "src/server/replay-verifier.ts",
+      "src/server/verify-claims.ts"
+    ],
+    "classes": [
+      "bola",
+      "authorization"
+    ]
+  },
   "canonicalLabel": {
     "cwe": "CWE-639",
     "category": "bola",
@@ -46,7 +60,9 @@
       "persona": null,
       "status": 401,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"error\":\"unauthorized\"}"
     },
     {
@@ -58,7 +74,9 @@
       "persona": "member_a",
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"id\":\"inv_101\",\"owner_id\":\"member_a\",\"tenant_id\":\"tenant-a\",\"total\":4200}"
     }
   ],
@@ -66,11 +84,29 @@
     "assertionsJq": "{ controlPassed: (.steps.ctl.status == 401), confirmed: (.steps.ctl.status == 401 and .steps.prb.status == 200 and .steps.prb.json.id == \"inv_101\"), observed: \"member_a read invoice\", expected: \"403\" }"
   },
   "claims": [
-    { "kind": "boundary", "boundaryClass": "access", "controlExchangeId": "ctl", "probeExchangeId": "prb", "expectControlDenied": true }
+    {
+      "kind": "boundary",
+      "boundaryClass": "access",
+      "controlExchangeId": "ctl",
+      "probeExchangeId": "prb",
+      "expectControlDenied": true
+    }
   ],
   "bareClaims": [
-    { "kind": "status", "exchangeId": "ctl", "expected": 401 },
-    { "kind": "status", "exchangeId": "prb", "expected": 200 },
-    { "kind": "body_contains", "exchangeId": "prb", "text": "inv_101" }
+    {
+      "kind": "status",
+      "exchangeId": "ctl",
+      "expected": 401
+    },
+    {
+      "kind": "status",
+      "exchangeId": "prb",
+      "expected": 200
+    },
+    {
+      "kind": "body_contains",
+      "exchangeId": "prb",
+      "text": "inv_101"
+    }
   ]
 }

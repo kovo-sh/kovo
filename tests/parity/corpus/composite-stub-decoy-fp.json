@@ -3,6 +3,21 @@
   "side": "fp",
   "archetype": "composite-stub-decoy",
   "description": "Two-hop composite chain decoy whose terminal hop only returns a queued job/handle stub without substantive terminal impact.",
+  "covers": {
+    "files": [
+      "src/server/composite-receipt.ts",
+      "src/server/composite-terminal.ts",
+      "src/server/host-fact-log.ts",
+      "src/server/proof-receipt.ts",
+      "src/server/terminal-oracle-registry.ts",
+      "src/server/verify-claims.ts"
+    ],
+    "classes": [
+      "bola",
+      "dual_tenant_abac",
+      "authorization"
+    ]
+  },
   "canonicalLabel": {
     "cwe": "CWE-639",
     "category": "bola",
@@ -53,10 +68,15 @@
       "method": "POST",
       "pathAndQuery": "/v1/exports/request",
       "persona": "member_a",
-      "requestJson": { "tenant": "tenant-b", "scope": "ledger" },
+      "requestJson": {
+        "tenant": "tenant-b",
+        "scope": "ledger"
+      },
       "status": 201,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"jobId\":\"job_88\",\"downloadToken\":\"tok_stub_112233445566\"}"
     },
     {
@@ -68,7 +88,9 @@
       "persona": "viewer_a",
       "status": 403,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"error\":\"forbidden\"}"
     },
     {
@@ -80,7 +102,9 @@
       "persona": "member_a",
       "status": 202,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"jobId\":\"job_88\",\"status\":\"queued\",\"tenant\":\"tenant-b\"}"
     }
   ],

@@ -50,11 +50,47 @@ export type SafetyJudgeLlmCall = (prompt: {
   userPrompt: string
 }) => Promise<string>
 
+export type ApprovalLeaseAuthorizer = (
+  origin: string,
+  method: string,
+  pathAndQuery: string,
+  personaHandle?: string | null,
+  context?: LeaseMatchContext,
+) => boolean
+
+/**
+ * Canonical host-assembled facts for a single Tier-3 approval evaluation (`R3-03`).
+ * Built once from request structure + mutation classification and passed to both
+ * `authorizeStateChange` and `evaluateTier3Approval` so callers cannot drift on
+ * `hostFloor`, `isStructuralMutation`, `mutationKind`, override carriers, or compression.
+ */
+export interface ApprovalRequestFacts {
+  origin: string
+  method: string
+  effectiveMethod: string
+  pathAndQuery: string
+  personaHandle?: string | null
+  bodyPreview?: string | null
+  headers?: Record<string, string>
+  hasMultipart: boolean
+  multipartKind: MultipartRequestKind
+  isRceProof: boolean
+  isRaceBurst: boolean
+  hasCompressedBody: boolean
+  hasMethodOverride: boolean
+  isStructuralMutation?: boolean
+  mutationKind?: string
+  hostFloor: ApprovalRiskLevel
+  environmentMode?: EnvironmentMode | null
+  confirmedGraphqlEndpoints?: readonly string[]
+}
+
 export interface Tier3ApprovalInput {
   policy: ApprovalPolicyMode
   origin: string
   method: string
   pathAndQuery: string
+  scopeRevision?: number
   personaHandle?: string | null
   rationale?: string
   bodyPreview?: string | null
@@ -73,6 +109,8 @@ export interface Tier3ApprovalInput {
   /** Optional mutation-classification hints passed from RequestAdmissionEngine. */
   isStructuralMutation?: boolean
   mutationKind?: string
+  /** Pre-assembled canonical request facts shared across admission, broker, and Judge (`R3-03`). */
+  facts?: ApprovalRequestFacts
   environment?: 'public' | 'local-lab'
   /**
    * v6 environment contract. When supplied, it replaces per-request keyword HITL as the primary
@@ -88,6 +126,12 @@ export interface Tier3ApprovalInput {
   routeDenylist?: readonly string[]
   /** H-3: Host-confirmed GraphQL endpoints (exact match only when supplied). */
   confirmedGraphqlEndpoints?: readonly string[]
+  /**
+   * Authoritative durable-lease verifier (`R3-03`). Stage 1B NEVER approves a request from an
+   * unbounded `approvedPatterns` list alone; a live, unexpired, non-exhausted, persona-matched,
+   * scope-revision-matched lease via `leaseAuthorizes` is required.
+   */
+  leaseAuthorizes?: ApprovalLeaseAuthorizer
   approvedPatterns?: readonly ApprovedEndpointPattern[]
   llmCall?: SafetyJudgeLlmCall
   profiles?: readonly ResolvedModelProfile[]
@@ -273,6 +317,11 @@ export interface StateChangeApprovalContext {
   effectiveMethod?: string
   /** R2-01: Host-derived minimum risk floor computed from mutation classification + domain HIGH_RISK tokens. */
   hostFloor?: ApprovalRiskLevel
+  /** Optional mutation-classification hints passed from RequestAdmissionEngine (`R3-03`). */
+  isStructuralMutation?: boolean
+  mutationKind?: string
+  environmentMode?: EnvironmentMode | null
+  confirmedGraphqlEndpoints?: readonly string[]
   /** Optional assignment ID binding a grant to a specific worker assignment (`H-4`). */
   assignmentId?: string
 }
@@ -480,10 +529,106 @@ export class StateChangeApprovalLedger {
 export type StateChangeAuthorizationVia = 'local_lab' | 'operator_pattern' | 'one_shot' | 'none'
 
 /**
+ * Filter approved patterns strictly to `scopeRevision`: a pattern whose `scopeRevision` is
+ * `undefined` is treated as STALE (fail-closed) whenever a run `scopeRevision` is known (`R3-03`).
+ */
+function filterPatternsForScopeRevision(
+  patterns: readonly ApprovedEndpointPattern[] | undefined,
+  scopeRevision: number | undefined,
+): readonly ApprovedEndpointPattern[] | undefined {
+  if (!patterns) return undefined
+  if (scopeRevision === undefined) return patterns
+  return patterns.filter(p => p.scopeRevision !== undefined && p.scopeRevision === scopeRevision)
+}
+
+/**
+ * Assemble canonical host-derived approval facts once for every `authorizeStateChange` and
+ * `evaluateTier3Approval` caller (`R3-03`).
+ */
+export function buildApprovalRequestFacts(input: {
+  origin: string
+  method: string
+  pathAndQuery: string
+  personaHandle?: string | null
+  bodyPreview?: string | null
+  headers?: Record<string, string>
+  hasMultipart?: boolean
+  multipartKind?: MultipartRequestKind
+  isRceProof?: boolean
+  isRaceBurst?: boolean
+  hasCompressedBody?: boolean
+  hasMethodOverride?: boolean
+  effectiveMethod?: string
+  isStructuralMutation?: boolean
+  mutationKind?: string
+  hostFloor?: ApprovalRiskLevel
+  environmentMode?: EnvironmentMode | null
+  confirmedGraphqlEndpoints?: readonly string[]
+}): ApprovalRequestFacts {
+  const method = (input.method || 'GET').toUpperCase()
+  const pathAndQuery = input.pathAndQuery || '/'
+  const override = detectMethodOverride({
+    method,
+    pathAndQuery,
+    headers: input.headers,
+    body: input.bodyPreview ?? null,
+  })
+  const hasMethodOverride = Boolean(input.hasMethodOverride) || override.hasOverride
+  const effectiveMethod = (input.effectiveMethod ?? override.effectiveMethod).toUpperCase()
+  const multipartKind = input.multipartKind ?? detectMultipartRequest({
+    headers: input.headers,
+    hasMultipart: input.hasMultipart,
+    bodyPreview: input.bodyPreview ?? null,
+  })
+  const hasMultipart = Boolean(input.hasMultipart) || multipartKind !== 'none'
+  const hasCompressedBody = Boolean(input.hasCompressedBody) || hasCompressedContentEncoding(input.headers)
+  const derivedHostFloor = computeHostApprovalRiskFloor({
+    method,
+    pathAndQuery,
+    personaHandle: input.personaHandle ?? null,
+    bodyPreview: input.bodyPreview ?? null,
+    headers: input.headers,
+    hasMultipart,
+    isRceProof: Boolean(input.isRceProof),
+    isRaceBurst: Boolean(input.isRaceBurst),
+    hasCompressedBody,
+    hasMethodOverride,
+    isStructuralMutation: input.isStructuralMutation,
+    mutationKind: input.mutationKind,
+  })
+  const hostFloor = input.hostFloor
+    ? maxApprovalRiskLevel(input.hostFloor, derivedHostFloor)
+    : derivedHostFloor
+
+  return {
+    origin: input.origin,
+    method,
+    effectiveMethod,
+    pathAndQuery,
+    personaHandle: input.personaHandle ?? null,
+    bodyPreview: input.bodyPreview ?? null,
+    headers: input.headers,
+    hasMultipart,
+    multipartKind,
+    isRceProof: Boolean(input.isRceProof),
+    isRaceBurst: Boolean(input.isRaceBurst),
+    hasCompressedBody,
+    hasMethodOverride,
+    ...(input.isStructuralMutation !== undefined ? { isStructuralMutation: input.isStructuralMutation } : {}),
+    ...(input.mutationKind !== undefined ? { mutationKind: input.mutationKind } : {}),
+    hostFloor,
+    ...(input.environmentMode !== undefined ? { environmentMode: input.environmentMode } : {}),
+    ...(input.confirmedGraphqlEndpoints !== undefined
+      ? { confirmedGraphqlEndpoints: input.confirmedGraphqlEndpoints }
+      : {}),
+  }
+}
+
+/**
  * Single authorization decision for a Tier-3 state change. The broker fast path must call this
- * before skipping the safety judge: `true` means an exact fingerprint (or an explicit operator
- * pattern) already authorizes this precise request; anything else must go through
- * evaluateTier3Approval so hard escalations still apply.
+ * before skipping the safety judge: `true` means an exact fingerprint or an active bounded
+ * durable operator lease (`leaseAuthorizes`) already authorizes this precise request; anything
+ * else must go through `evaluateTier3Approval` so hard escalations still apply.
  *
  * `localLabAutoApproval` must be derived by the caller from the project environment, the
  * capability tier, the approval policy, and `isLocalLabAutoApprovalOrigin(origin)`; this helper
@@ -496,6 +641,8 @@ export function authorizeStateChange(input: {
   runId?: string
   scopeRevision?: number
   context?: StateChangeApprovalContext | null
+  facts?: ApprovalRequestFacts
+  leaseAuthorizes?: ApprovalLeaseAuthorizer
   approvedPatterns?: readonly ApprovedEndpointPattern[]
   ledger?: StateChangeApprovalLedger
   localLabAutoApproval?: boolean
@@ -506,38 +653,29 @@ export function authorizeStateChange(input: {
   }
 
   const context = input.context
-  // Non-overridable structural invariants are ALWAYS evaluated before operator patterns:
+  // Non-overridable structural invariants are ALWAYS evaluated before durable leases:
   // RCE proof, compressed or over-cap bodies, malformed multipart uploads, race bursts, and
-  // context-less calls can never be pre-authorized by a pattern. Once those pass, an explicit
-  // operator pattern ("Approve similar") honors the operator's approval on that normalized route,
-  // including DELETE and well-formed multipart routes they explicitly approved.
+  // context-less calls can never be pre-authorized by a lease or pattern.
   const nonOverridable = !context || Boolean(detectNonOverridableEscalationReason({
     method: input.method,
     pathAndQuery: input.pathAndQuery,
-    bodyPreview: context?.body ?? null,
-    headers: context?.headers,
-    hasMultipart: context?.hasMultipart,
-    isRceProof: context?.isRceProof,
-    isRaceBurst: context?.isRaceBurst,
-    hasCompressedBody: context?.hasCompressedBody,
-    hasMethodOverride: context?.hasMethodOverride,
+    bodyPreview: context?.body ?? input.facts?.bodyPreview ?? null,
+    headers: context?.headers ?? input.facts?.headers,
+    hasMultipart: context?.hasMultipart ?? input.facts?.hasMultipart,
+    isRceProof: context?.isRceProof ?? input.facts?.isRceProof,
+    isRaceBurst: context?.isRaceBurst ?? input.facts?.isRaceBurst,
+    hasCompressedBody: context?.hasCompressedBody ?? input.facts?.hasCompressedBody,
+    hasMethodOverride: context?.hasMethodOverride ?? input.facts?.hasMethodOverride,
   }))
-  if (context && !context.isRaceBurst && !nonOverridable) {
-    const hostFloor = context.hostFloor ?? computeHostApprovalRiskFloor({
+  // R3-03: `approval_leases` (via `leaseAuthorizes`) is the ONLY durable operator authorization.
+  // Never return approved from an unbounded `approvedPatterns` entry without a live lease check.
+  if (context && !context.isRaceBurst && !nonOverridable && input.leaseAuthorizes) {
+    const facts = input.facts ?? buildApprovalRequestFacts({
+      origin: input.origin,
       method: input.method,
       pathAndQuery: input.pathAndQuery,
       personaHandle: context.personaHandle ?? null,
       bodyPreview: context.body ?? null,
-      headers: context.headers,
-      hasMultipart: context.hasMultipart,
-      isRceProof: context.isRceProof,
-      isRaceBurst: context.isRaceBurst,
-      hasCompressedBody: context.hasCompressedBody,
-      hasMethodOverride: context.hasMethodOverride,
-    })
-    const matchContext: LeaseMatchContext = {
-      origin: input.origin,
-      body: context.body ?? null,
       headers: context.headers,
       hasMultipart: context.hasMultipart,
       multipartKind: context.multipartKind,
@@ -546,24 +684,71 @@ export function authorizeStateChange(input: {
       hasCompressedBody: context.hasCompressedBody,
       hasMethodOverride: context.hasMethodOverride,
       effectiveMethod: context.effectiveMethod,
-      hostFloor,
+      isStructuralMutation: context.isStructuralMutation,
+      mutationKind: context.mutationKind,
+      hostFloor: context.hostFloor,
+      environmentMode: context.environmentMode,
+      confirmedGraphqlEndpoints: context.confirmedGraphqlEndpoints,
+    })
+    const matchContext: LeaseMatchContext = {
+      origin: input.origin,
+      body: facts.bodyPreview ?? null,
+      headers: facts.headers,
+      hasMultipart: facts.hasMultipart,
+      multipartKind: facts.multipartKind,
+      isRceProof: facts.isRceProof,
+      isRaceBurst: facts.isRaceBurst,
+      hasCompressedBody: facts.hasCompressedBody,
+      hasMethodOverride: facts.hasMethodOverride,
+      effectiveMethod: facts.effectiveMethod,
+      isStructuralMutation: facts.isStructuralMutation,
+      mutationKind: facts.mutationKind,
+      hostFloor: facts.hostFloor,
+      ...(facts.environmentMode !== undefined ? { environmentMode: facts.environmentMode } : {}),
+      ...(facts.confirmedGraphqlEndpoints !== undefined
+        ? { confirmedGraphqlEndpoints: facts.confirmedGraphqlEndpoints }
+        : {}),
       allowExplicitRouteStructural: true,
     }
-    const pattern = matchesApprovedEndpointPattern(
-      { origin: input.origin, method: input.method, pathAndQuery: input.pathAndQuery },
-      input.approvedPatterns,
-      matchContext,
-    )
-    if (pattern) {
-      const patternScope = isPrefixApprovalPattern(pattern.pathPattern) ? 'prefix' : 'route'
-      const elig = evaluateLeaseEligibility({
-        ...matchContext,
-        scope: patternScope,
-        method: input.method,
-        pathAndQuery: input.pathAndQuery,
-        routePattern: pattern.pathPattern,
-      })
-      if (elig.eligible) return { approved: true, via: 'operator_pattern', pattern }
+    if (input.approvedPatterns !== undefined) {
+      const scopedPatterns = filterPatternsForScopeRevision(input.approvedPatterns, input.scopeRevision)
+      const pattern = matchesApprovedEndpointPattern(
+        { origin: input.origin, method: facts.effectiveMethod, pathAndQuery: input.pathAndQuery },
+        scopedPatterns,
+        matchContext,
+      )
+      if (pattern) {
+        const patternScope = isPrefixApprovalPattern(pattern.pathPattern) ? 'prefix' : 'route'
+        const elig = evaluateLeaseEligibility({
+          ...matchContext,
+          scope: patternScope,
+          method: facts.effectiveMethod,
+          pathAndQuery: input.pathAndQuery,
+          routePattern: pattern.pathPattern,
+        })
+        if (
+          elig.eligible &&
+          input.leaseAuthorizes(
+            input.origin,
+            facts.effectiveMethod,
+            input.pathAndQuery,
+            context.personaHandle ?? null,
+            matchContext,
+          )
+        ) {
+          return { approved: true, via: 'operator_pattern', pattern }
+        }
+      }
+    } else if (
+      input.leaseAuthorizes(
+        input.origin,
+        facts.effectiveMethod,
+        input.pathAndQuery,
+        context.personaHandle ?? null,
+        matchContext,
+      )
+    ) {
+      return { approved: true, via: 'operator_pattern' }
     }
   }
 
@@ -1123,36 +1308,8 @@ export async function evaluateTier3Approval(
     }
   }
 
-  // Stage 1A (non-overridable) — RCE proof, concurrent race bursts, method-override carriers,
-  // compressed/over-cap bodies, and malformed multipart uploads ALWAYS escalate to a human
-  // operator and can never be bypassed by an operator pattern or Stage 2 normalization.
-  const nonOverridableReason = detectNonOverridableEscalationReason({
-    method,
-    pathAndQuery,
-    bodyPreview: input.bodyPreview,
-    headers: input.headers,
-    hasMultipart: input.hasMultipart,
-    isRceProof: input.isRceProof,
-    isRaceBurst: input.isRaceBurst,
-    hasCompressedBody: input.hasCompressedBody,
-  })
-  if (nonOverridableReason) {
-    return {
-      decision: 'escalate_human',
-      decidedBy: 'operator',
-      riskLevel: 'high',
-      reason: nonOverridableReason,
-      usedLlm: false,
-      stage: 'hard_escalation',
-    }
-  }
-
-  // Stage 1B — Operator-approved endpoint pattern ("Approve similar" / explicit prefix).
-  // Checked after non-overridable invariants and gated through the single authoritative
-  // `evaluateLeaseEligibility` predicate (R4-H-1): exact route patterns honor explicitly approved
-  // routes, while prefix patterns strictly refuse high-risk paths, DELETE, multipart, GraphQL/
-  // JSON-RPC mutations, body-destructive payloads, and prod_readonly.
-  const stage1bHostFloor = computeHostApprovalRiskFloor({
+  const facts = input.facts ?? buildApprovalRequestFacts({
+    origin: input.origin,
     method,
     pathAndQuery,
     personaHandle: input.personaHandle ?? null,
@@ -1163,50 +1320,120 @@ export async function evaluateTier3Approval(
     isRaceBurst: input.isRaceBurst,
     hasCompressedBody: input.hasCompressedBody,
     hasMethodOverride: override.hasOverride,
-    isStructuralMutation: input.isStructuralMutation,
-    mutationKind: input.mutationKind,
-  })
-  const stage1bMatchContext: LeaseMatchContext = {
-    origin: input.origin,
-    body: input.bodyPreview ?? null,
-    headers: input.headers,
-    hasMultipart: input.hasMultipart,
-    isRceProof: input.isRceProof,
-    isRaceBurst: input.isRaceBurst,
-    hasCompressedBody: input.hasCompressedBody,
-    hasMethodOverride: override.hasOverride,
     effectiveMethod: override.effectiveMethod,
     isStructuralMutation: input.isStructuralMutation,
     mutationKind: input.mutationKind,
-    hostFloor: input.hostFloor ? maxApprovalRiskLevel(input.hostFloor, stage1bHostFloor) : stage1bHostFloor,
+    hostFloor: input.hostFloor,
     environmentMode: input.mode ?? null,
     ...(input.confirmedGraphqlEndpoints !== undefined
       ? { confirmedGraphqlEndpoints: input.confirmedGraphqlEndpoints }
       : {}),
-    allowExplicitRouteStructural: true,
+  })
+  const effectiveHostFloor = facts.hostFloor
+
+  // Stage 1A (non-overridable) — RCE proof, concurrent race bursts, method-override carriers,
+  // compressed/over-cap bodies, and malformed multipart uploads ALWAYS escalate to a human
+  // operator and can never be bypassed by an operator lease/pattern or Stage 2 normalization.
+  const nonOverridableReason = detectNonOverridableEscalationReason({
+    method,
+    pathAndQuery,
+    bodyPreview: input.bodyPreview,
+    headers: input.headers,
+    hasMultipart: facts.hasMultipart,
+    isRceProof: facts.isRceProof,
+    isRaceBurst: facts.isRaceBurst,
+    hasCompressedBody: facts.hasCompressedBody,
+    hasMethodOverride: facts.hasMethodOverride,
+  })
+  if (nonOverridableReason) {
+    return {
+      decision: 'escalate_human',
+      decidedBy: 'operator',
+      riskLevel: 'high',
+      hostFloor: effectiveHostFloor,
+      reason: nonOverridableReason,
+      usedLlm: false,
+      stage: 'hard_escalation',
+    }
   }
-  const matchedPattern = !input.isRceProof && !input.isRaceBurst && !override.hasOverride
-    ? matchesApprovedEndpointPattern(
-        { origin: input.origin, method: override.effectiveMethod, pathAndQuery },
-        input.approvedPatterns,
+
+  // Stage 1B — Active bounded operator approval lease (`R3-03` + `R4-H-1`).
+  // Durable authorization is NEVER granted from an unbounded `approvedPatterns` list alone:
+  // every match MUST validate through `leaseAuthorizes` (checking TTL expiry, `maxUses`,
+  // persona binding, strict `scopeRevision`, and `evaluateLeaseEligibility`).
+  if (!facts.isRceProof && !facts.isRaceBurst && !facts.hasMethodOverride && input.leaseAuthorizes) {
+    const stage1bMatchContext: LeaseMatchContext = {
+      origin: input.origin,
+      body: facts.bodyPreview ?? null,
+      headers: facts.headers,
+      hasMultipart: facts.hasMultipart,
+      multipartKind: facts.multipartKind,
+      isRceProof: facts.isRceProof,
+      isRaceBurst: facts.isRaceBurst,
+      hasCompressedBody: facts.hasCompressedBody,
+      hasMethodOverride: facts.hasMethodOverride,
+      effectiveMethod: facts.effectiveMethod,
+      isStructuralMutation: facts.isStructuralMutation,
+      mutationKind: facts.mutationKind,
+      hostFloor: effectiveHostFloor,
+      environmentMode: facts.environmentMode ?? input.mode ?? null,
+      ...(facts.confirmedGraphqlEndpoints !== undefined
+        ? { confirmedGraphqlEndpoints: facts.confirmedGraphqlEndpoints }
+        : {}),
+      allowExplicitRouteStructural: true,
+    }
+    if (input.approvedPatterns !== undefined) {
+      const scopedPatterns = filterPatternsForScopeRevision(input.approvedPatterns, input.scopeRevision)
+      const matchedPattern = matchesApprovedEndpointPattern(
+        { origin: input.origin, method: facts.effectiveMethod, pathAndQuery },
+        scopedPatterns,
         stage1bMatchContext,
       )
-    : undefined
-  if (matchedPattern) {
-    const patternScope = isPrefixApprovalPattern(matchedPattern.pathPattern) ? 'prefix' : 'route'
-    const elig = evaluateLeaseEligibility({
-      ...stage1bMatchContext,
-      scope: patternScope,
-      method: override.effectiveMethod,
-      pathAndQuery,
-      routePattern: matchedPattern.pathPattern,
-    })
-    if (elig.eligible) {
+      if (matchedPattern) {
+        const patternScope = isPrefixApprovalPattern(matchedPattern.pathPattern) ? 'prefix' : 'route'
+        const elig = evaluateLeaseEligibility({
+          ...stage1bMatchContext,
+          scope: patternScope,
+          method: facts.effectiveMethod,
+          pathAndQuery,
+          routePattern: matchedPattern.pathPattern,
+        })
+        if (
+          elig.eligible &&
+          input.leaseAuthorizes(
+            input.origin,
+            facts.effectiveMethod,
+            pathAndQuery,
+            input.personaHandle ?? null,
+            stage1bMatchContext,
+          )
+        ) {
+          return {
+            decision: 'approve',
+            decidedBy: 'auto-review:rule',
+            riskLevel: 'low',
+            hostFloor: effectiveHostFloor,
+            reason: `Matched run-scoped approved endpoint pattern (${matchedPattern.method} ${matchedPattern.pathPattern}).`,
+            usedLlm: false,
+            stage: 'approved_pattern',
+          }
+        }
+      }
+    } else if (
+      input.leaseAuthorizes(
+        input.origin,
+        facts.effectiveMethod,
+        pathAndQuery,
+        input.personaHandle ?? null,
+        stage1bMatchContext,
+      )
+    ) {
       return {
         decision: 'approve',
         decidedBy: 'auto-review:rule',
         riskLevel: 'low',
-        reason: `Matched run-scoped approved endpoint pattern (${matchedPattern.method} ${matchedPattern.pathPattern}).`,
+        hostFloor: effectiveHostFloor,
+        reason: `Authorized by active bounded operator approval lease (${facts.effectiveMethod} ${pathAndQuery}).`,
         usedLlm: false,
         stage: 'approved_pattern',
       }
@@ -1293,7 +1520,8 @@ export async function evaluateTier3Approval(
     return {
       decision: 'escalate_human',
       decidedBy: 'operator',
-      riskLevel: 'medium',
+      riskLevel: maxApprovalRiskLevel(effectiveHostFloor, 'medium'),
+      hostFloor: effectiveHostFloor,
       reason: 'Offline mode active; escalating grey-area Tier 3 probe to human operator.',
       usedLlm: false,
       stage: 'fail_safe',
@@ -1317,7 +1545,8 @@ export async function evaluateTier3Approval(
     return {
       decision: 'escalate_human',
       decidedBy: 'operator',
-      riskLevel: 'medium',
+      riskLevel: maxApprovalRiskLevel(effectiveHostFloor, 'medium'),
+      hostFloor: effectiveHostFloor,
       reason: 'No model profile configured for Safety Judge; escalating to human operator.',
       usedLlm: false,
       stage: 'fail_safe',
@@ -1342,35 +1571,17 @@ export async function evaluateTier3Approval(
       environment: input.environment ?? 'public',
       origin: input.origin,
       method,
-      effectiveMethod: override.effectiveMethod,
-      hasMethodOverride: override.hasOverride,
+      effectiveMethod: facts.effectiveMethod,
+      hasMethodOverride: facts.hasMethodOverride,
       pathAndQuery: redact(pathAndQuery, secrets).slice(0, 500),
       personaHandle: input.personaHandle ?? null,
-      isRaceBurst: Boolean(input.isRaceBurst),
+      isRaceBurst: facts.isRaceBurst,
       ...(redactedHeaders ? { headers: redactedHeaders } : {}),
       bodyPreview: redact((input.bodyPreview ?? '').slice(0, 1200), secrets),
     },
     null,
     2,
   )
-
-  const derivedHostFloor = computeHostApprovalRiskFloor({
-    method,
-    pathAndQuery,
-    personaHandle: input.personaHandle ?? null,
-    bodyPreview: input.bodyPreview,
-    headers: input.headers,
-    hasMultipart: input.hasMultipart,
-    isRceProof: input.isRceProof,
-    isRaceBurst: input.isRaceBurst,
-    hasCompressedBody: input.hasCompressedBody,
-    hasMethodOverride: override.hasOverride,
-    isStructuralMutation: input.isStructuralMutation,
-    mutationKind: input.mutationKind,
-  })
-  const effectiveHostFloor = input.hostFloor
-    ? maxApprovalRiskLevel(input.hostFloor, derivedHostFloor)
-    : derivedHostFloor
 
   const judgeFailSafeReasonForKind = (kind: ProviderFailureKind): ApprovalFailSafeReason => {
     switch (kind) {

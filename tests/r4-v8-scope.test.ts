@@ -1,3 +1,4 @@
+// @kernel @fixes R4-C-5
 /**
  * R4-C-5 Class-Level Guard — Signed-Resource Scope & Symmetric Tenant Derivation
  * for `cryptographic_scope_replay`.

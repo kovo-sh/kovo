@@ -3313,7 +3313,7 @@ export function writeV8CertifyLedgerRows(input: {
       llm: c.llm,
       seed: c.seed,
       repeat: Number(c.repeatId ?? 1) || 1,
-      certifying: input.report.verdict === 'PASS' && c.status === 'VALID',
+      certifying: input.report.verdict === 'PASS' && c.status === 'VALID' && !gitState.dirty,
       reportable: c.reportable !== false && c.wordlistOn !== true,
       costUsd: c.costUsd,
       durationMs: c.durationMs,

@@ -8,10 +8,14 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: verify-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  verify:
+  static-and-typecheck:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -37,21 +41,176 @@ jobs:
         run: |
           npm run check -- --extendedDiagnostics | tee /tmp/tsc-extended-diagnostics.txt
           node scripts/check-tsc-budget.ts --from-file /tmp/tsc-extended-diagnostics.txt
+
+  fast-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: npm run worker:install
       - run: npm run build
-      - run: npx playwright install --with-deps chromium
+      - name: Resolve Playwright version for cache key
+        id: pw-version
+        run: |
+          PW_VER="$(node -p "const l = require('./package-lock.json'); l.packages?.['node_modules/playwright-core']?.version || l.packages?.['node_modules/@playwright/test']?.version || 'unknown'")"
+          echo "version=${PW_VER}" >> "$GITHUB_OUTPUT"
+      - name: Cache Playwright Chromium browser
+        id: pw-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}-${{ steps.pw-version.outputs.version }}
+      - name: Install Playwright Chromium system dependencies
+        run: npx playwright install-deps chromium
+      - name: Install Playwright Chromium browser (cache miss)
+        if: steps.pw-cache.outputs.cache-hit != 'true'
+        run: npx playwright install chromium
       - name: Enable unprivileged userns for Chromium sandbox (Ubuntu 24.04)
         run: |
           if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
-      - name: Run fast hermetic unit suites (quarantine & orphan enforced)
-        run: bash scripts/run-fast-tests.sh --suites-only --quarantine tests/QUARANTINE.json --jobs 2
-      - run: npm run worker:build
+      - name: Run fast hermetic unit suites (shard ${{ matrix.shard }}/6, quarantine & orphan enforced)
+        run: bash scripts/run-fast-tests.sh --suites-only --quarantine tests/QUARANTINE.json --jobs 2 --shard ${{ matrix.shard }}/6
+
+  docker-and-boundaries:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: npm run worker:install
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build kovo-worker image (worker:build equivalent with Buildx GHA cache)
+        uses: docker/build-push-action@v6
+        with:
+          context: ./worker
+          file: ./worker/Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: |
+            kovo-worker:v4
+            kovo-worker:local
+          cache-from: type=gha,scope=kovo-worker-amd64
+          cache-to: ${{ (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && 'type=gha,mode=max,scope=kovo-worker-amd64' || '' }}
+          sbom: false
+          provenance: false
       - run: bash scripts/docker-smoke.sh
+      - name: Resolve Playwright version for cache key
+        id: pw-version
+        run: |
+          PW_VER="$(node -p "const l = require('./package-lock.json'); l.packages?.['node_modules/playwright-core']?.version || l.packages?.['node_modules/@playwright/test']?.version || 'unknown'")"
+          echo "version=${PW_VER}" >> "$GITHUB_OUTPUT"
+      - name: Cache Playwright Chromium browser
+        id: pw-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}-${{ steps.pw-version.outputs.version }}
+      - name: Install Playwright Chromium system dependencies
+        run: npx playwright install-deps chromium
+      - name: Install Playwright Chromium browser (cache miss)
+        if: steps.pw-cache.outputs.cache-hit != 'true'
+        run: npx playwright install chromium
+      - name: Enable unprivileged userns for Chromium sandbox (Ubuntu 24.04)
+        run: |
+          if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
       - name: Run npm run test:boundaries
         env:
           KOVO_ALLOW_LOCAL_MODEL: "1"
         run: npm run test:boundaries
+
+  e2e-ui:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - name: Resolve Playwright version for cache key
+        id: pw-version
+        run: |
+          PW_VER="$(node -p "const l = require('./package-lock.json'); l.packages?.['node_modules/playwright-core']?.version || l.packages?.['node_modules/@playwright/test']?.version || 'unknown'")"
+          echo "version=${PW_VER}" >> "$GITHUB_OUTPUT"
+      - name: Cache Playwright Chromium browser
+        id: pw-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}-${{ steps.pw-version.outputs.version }}
+      - name: Install Playwright Chromium system dependencies
+        run: npx playwright install-deps chromium
+      - name: Install Playwright Chromium browser (cache miss)
+        if: steps.pw-cache.outputs.cache-hit != 'true'
+        run: npx playwright install chromium
+      - name: Enable unprivileged userns for Chromium sandbox (Ubuntu 24.04)
+        run: |
+          if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
       - name: Run live Chromium E2E journeys
         timeout-minutes: 12
         run: npm run build && KOVO_ALLOW_LOCAL_MODEL=1 node --test tests/e2e-ui-journeys.test.ts
+
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    needs:
+      - static-and-typecheck
+      - fast-tests
+      - docker-and-boundaries
+      - e2e-ui
+    if: always()
+    steps:
+      - name: Require all verification jobs to succeed
+        env:
+          STATIC_RESULT: ${{ needs.static-and-typecheck.result }}
+          FAST_TESTS_RESULT: ${{ needs.fast-tests.result }}
+          DOCKER_RESULT: ${{ needs.docker-and-boundaries.result }}
+          E2E_UI_RESULT: ${{ needs.e2e-ui.result }}
+        run: |
+          set -euo pipefail
+          echo "static-and-typecheck:  ${STATIC_RESULT}"
+          echo "fast-tests:            ${FAST_TESTS_RESULT}"
+          echo "docker-and-boundaries: ${DOCKER_RESULT}"
+          echo "e2e-ui:                ${E2E_UI_RESULT}"
+          failed=0
+          for pair in \
+            "static-and-typecheck:${STATIC_RESULT}" \
+            "fast-tests:${FAST_TESTS_RESULT}" \
+            "docker-and-boundaries:${DOCKER_RESULT}" \
+            "e2e-ui:${E2E_UI_RESULT}"; do
+            name="${pair%%:*}"
+            res="${pair#*:}"
+            if [ "$res" != "success" ]; then
+              echo "FAIL: required job '${name}' finished with result '${res}'" >&2
+              failed=1
+            fi
+          done
+          exit "$failed"

@@ -1,3 +1,4 @@
+// @kernel @fixes R3-H-16
 /**
  * R3-H-16 — StorageMaintenanceController / ArtifactTTL evidence-retention safety tests:
  *  1. Default `AppRuntime` and `StorageMaintenanceController` ship with exchange & artifact TTL OFF

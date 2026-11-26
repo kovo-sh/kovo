@@ -1,3 +1,4 @@
+// @kernel @fixes R4-H-8, R4-H-9, R4-H-10
 /**
  * R4 WS-12 Class-Level Guards — Gate-6 Composite Retest Truthfulness (R4-H-9),
  * Proposal-Scoped Gate-6 Isolation & Newest-by-createdAt Export (R4-H-10),

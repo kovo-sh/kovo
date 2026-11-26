@@ -535,3 +535,86 @@ test('R2-04: floor retestPersistedRecipe returns inconclusive with session_drift
   assert.equal(fixed.verdict, 'fixed')
   assert.equal((fixed.replay.evidencePayload.retestHealth as RetestHealthAssessment).failureReason, 'claim_not_reproduced')
 })
+
+test('R2-04 / R3-01e: declarative auth_bypass (CWE-287) retest rejects 503, 404, 302, and marker-drifted 200 probes as inconclusive; allows clean 401/403 fix', async (t) => {
+  let probeStatus = 401
+  const server = createServer((req, res) => {
+    req.resume()
+    res.setHeader('content-type', 'application/json')
+    const hasSubreq = Boolean(req.headers['x-middleware-subrequest'])
+    const status = hasSubreq ? probeStatus : 401
+    res.statusCode = status
+    res.end(JSON.stringify({ status, error: status === 200 ? undefined : `status-${status}` }))
+  })
+  server.listen(0, '127.0.0.1')
+  await once(server, 'listening')
+  const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`
+  t.after(async () => {
+    server.closeAllConnections()
+    await new Promise<void>(r => server.close(() => r()))
+  })
+
+  const spec: DeclarativeReplaySpec = {
+    version: 1,
+    kind: 'http_chain',
+    origin,
+    title: 'Middleware auth bypass (CWE-287)',
+    category: 'auth-bypass',
+    cwe: 'CWE-287',
+    severity: 'critical',
+    severityRationale: 'Direct authentication bypass.',
+    impact: 'Bypasses middleware authentication gate.',
+    remediation: 'Strip untrusted internal middleware headers at the edge.',
+    recheckInstructions: 'Replay.',
+    assertionsJq: '{ controlPassed: (.steps.ctl.status == 401), confirmed: (.steps.prb.status == 200 and (.steps.prb.body | contains("admin_secret"))), observed: (.steps.prb.status | tostring), expected: "401" }',
+    steps: [
+      { id: 'ctl', role: 'control', description: 'unauth control', request: { origin, method: 'GET', pathAndQuery: '/api/admin/audit-log', followRedirects: false } },
+      { id: 'prb', role: 'probe', description: 'header-spoofed probe', request: { origin, method: 'GET', pathAndQuery: '/api/admin/audit-log', headers: { 'x-middleware-subrequest': 'middleware:middleware:middleware:middleware:middleware' }, followRedirects: false } },
+    ],
+  } as unknown as DeclarativeReplaySpec
+
+  const broker = new RequestBroker({ rejectUnauthorized: false })
+  const backend = new LocalJqBackend()
+  const grant = makeLabGrant(origin, { tier: 1 })
+
+  // Drifted/unhealthy probes (503, 404, 302) and still-bypassed marker-drifted 200 MUST be inconclusive, NEVER fixed.
+  for (const st of [503, 404, 302, 200] as const) {
+    probeStatus = st
+    const res = await retestReplaySpec({ spec, broker, backend, grant, signal: AbortSignal.timeout(10_000) })
+    assert.equal(res.verdict, 'inconclusive', `CWE-287 auth_bypass probe HTTP ${st} must never be fixed`)
+    const health = res.replay.evidencePayload.retestHealth as RetestHealthAssessment
+    assert.equal(health.healthy, false)
+    assert.notEqual(health.failureReason, 'claim_not_reproduced')
+  }
+
+  // Direct assessDeclarativeRetestHealth check: even when 404 is explicitly expected (bypassing requireControlNonError),
+  // auth_bypass must reject 404 as route drift rather than definitive auth enforcement.
+  const direct404 = assessDeclarativeRetestHealth(
+    spec,
+    {
+      verdict: 'dismissed',
+      outcome: { confirmed: false, controlPassed: true },
+      evidencePayload: {
+        boundaryGate: { required: true, satisfied: false, boundaryClass: 'auth' },
+        steps: {
+          ctl: { id: 'ctl', role: 'control', status: 401 },
+          prb: { id: 'prb', role: 'probe', status: 404 },
+        },
+      },
+    },
+    { receiptBuildable: true },
+  )
+  assert.equal(direct404.healthy, false)
+  assert.equal(direct404.code, 'access_probe_not_denied')
+  assert.equal(direct404.failureReason, 'probe_unhealthy')
+
+  // Clean remediation (401 and 403) MUST return fixed with claim_not_reproduced.
+  for (const st of [401, 403] as const) {
+    probeStatus = st
+    const res = await retestReplaySpec({ spec, broker, backend, grant, signal: AbortSignal.timeout(10_000) })
+    assert.equal(res.verdict, 'fixed', `CWE-287 auth_bypass probe HTTP ${st} must be fixed: ${res.replay.outcome.reason ?? ''}`)
+    const health = res.replay.evidencePayload.retestHealth as RetestHealthAssessment
+    assert.equal(health.healthy, true)
+    assert.equal(health.failureReason, 'claim_not_reproduced')
+  }
+})

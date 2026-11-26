@@ -3,6 +3,23 @@
   "side": "tp",
   "archetype": "composite-multihop-cross-tenant",
   "description": "Two-hop composite chain: Hop 1 mints a cross-tenant export artifact handle and Hop 2 consumes it to download substantive victim tenant billing data.",
+  "covers": {
+    "files": [
+      "src/server/causal-proof-compiler.ts",
+      "src/server/composite-autodag.ts",
+      "src/server/composite-receipt.ts",
+      "src/server/composite-terminal.ts",
+      "src/server/host-fact-log.ts",
+      "src/server/terminal-oracle-registry.ts",
+      "src/server/v8-oracle-families.ts",
+      "src/server/verify-claims.ts"
+    ],
+    "classes": [
+      "bola",
+      "dual_tenant_abac",
+      "authorization"
+    ]
+  },
   "canonicalLabel": {
     "cwe": "CWE-639",
     "category": "bola",
@@ -53,10 +70,15 @@
       "method": "POST",
       "pathAndQuery": "/v1/exports/request",
       "persona": "member_a",
-      "requestJson": { "tenant": "tenant-b", "scope": "ledger" },
+      "requestJson": {
+        "tenant": "tenant-b",
+        "scope": "ledger"
+      },
       "status": 201,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"jobId\":\"job_77\",\"downloadToken\":\"tok_exp_9f8e7d6c5b4a\"}"
     },
     {
@@ -68,7 +90,9 @@
       "persona": "viewer_a",
       "status": 403,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"error\":\"forbidden\"}"
     },
     {
@@ -80,7 +104,9 @@
       "persona": "member_a",
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"tenant_id\":\"tenant-b\",\"owner_id\":\"owner_b\",\"email\":\"payroll@tenant-b.example\",\"ledger_balance\":945000}"
     }
   ],

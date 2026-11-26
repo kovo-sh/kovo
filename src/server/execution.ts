@@ -1396,12 +1396,10 @@ export class Execution {
           fresh.capabilityTier >= 3 &&
           (fresh.approvalPolicy ?? 'auto_review') !== 'strict' &&
           isLocalLabAutoApprovalOrigin(origin)
-        const activePatterns = (fresh.approvedEndpointPatterns ?? []).filter(
-          p => p.scopeRevision === undefined || p.scopeRevision === fresh.scopeRevision,
-        )
-        // Skip the safety judge only for the exact request fingerprint (or an explicit operator
-        // pattern). Automatic decisions are single-use: a consumed grant can never authorize a
-        // later state change on the same origin.
+        // Skip the safety judge only for an active bounded durable lease or an exact single-use
+        // fingerprint (`R3-03`). Durable authorization is owned exclusively by `approval_leases`
+        // (enforcing TTL, maxUses, persona binding, and strict scopeRevision equality — never
+        // unbounded legacy run-level patterns or `scopeRevision === undefined`).
         const verdict = authorizeStateChange({
           runId: run.id,
           origin,
@@ -1409,7 +1407,9 @@ export class Execution {
           pathAndQuery,
           scopeRevision: fresh.scopeRevision,
           context,
-          approvedPatterns: activePatterns,
+          leaseAuthorizes: project.environment === 'local-lab'
+            ? undefined
+            : this.storage.approvalLeaseAuthorizer(run.id),
           ledger: this.stateChangeApprovals,
           localLabAutoApproval,
         })

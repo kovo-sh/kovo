@@ -21,9 +21,15 @@ import {
 } from './active-clock.ts'
 import { defaultCodeAuditMaxTurns, wallClockSettlementMs } from './agent-session.ts'
 import {
+  buildApprovalRequestFacts,
+  computeHostApprovalRiskFloor,
   evaluateTier3Approval,
   StateChangeApprovalLedger,
+  type ApprovalDecidedBy,
+  type ApprovalRequestFacts,
+  type Tier3ApprovalEvaluation,
 } from './approval-judge.ts'
+import { classifyRequestMutation } from './request-admission.ts'
 import {
   BrokerApprovalRequired,
   BrokerDenied,
@@ -1759,6 +1765,90 @@ export interface Tier3ApprovalCoordinatorHost {
   scheduleWake: () => void
 }
 
+/**
+ * Build canonical `ApprovalRequestFacts` once for worker-path Tier-3 approval evaluations (`R3-03`)
+ * using the exact same `classifyRequestMutation` + `computeHostApprovalRiskFloor` primitives as
+ * `RequestAdmissionEngine`.
+ */
+export function buildWorkerApprovalRequestFacts(
+  run: Pick<Run, 'environmentMode'>,
+  input: {
+    origin: string
+    method: string
+    pathAndQuery: string
+    personaHandle?: string | null
+    bodyPreview?: string | null
+    headers?: Record<string, string>
+    hasMultipart?: boolean
+    isRceProof?: boolean
+    isRaceBurst?: boolean
+    hasCompressedBody?: boolean
+    confirmedGraphqlEndpoints?: readonly string[]
+  },
+): ApprovalRequestFacts {
+  const classification = classifyRequestMutation({
+    origin: input.origin,
+    method: input.method,
+    pathAndQuery: input.pathAndQuery,
+    body: input.bodyPreview ?? null,
+    headers: input.headers,
+    ...(input.confirmedGraphqlEndpoints !== undefined
+      ? { confirmedGraphqlEndpoints: input.confirmedGraphqlEndpoints }
+      : {}),
+  })
+  const hasMultipart = Boolean(input.hasMultipart || classification.hasMultipart)
+  const hasCompressedBody = Boolean(input.hasCompressedBody || classification.hasCompressedBody)
+  const hostFloor = computeHostApprovalRiskFloor({
+    method: input.method,
+    pathAndQuery: input.pathAndQuery,
+    personaHandle: input.personaHandle ?? null,
+    bodyPreview: input.bodyPreview ?? null,
+    headers: input.headers,
+    hasMultipart,
+    isRceProof: Boolean(input.isRceProof),
+    isRaceBurst: Boolean(input.isRaceBurst),
+    hasCompressedBody,
+    hasMethodOverride: classification.hasMethodOverride,
+    isStructuralMutation: classification.isStructuralMutation,
+    mutationKind: classification.kind,
+  })
+  return buildApprovalRequestFacts({
+    origin: input.origin,
+    method: input.method,
+    effectiveMethod: classification.effectiveMethod,
+    pathAndQuery: input.pathAndQuery,
+    personaHandle: input.personaHandle ?? null,
+    bodyPreview: input.bodyPreview ?? null,
+    headers: input.headers,
+    hasMultipart,
+    isRceProof: Boolean(input.isRceProof),
+    isRaceBurst: Boolean(input.isRaceBurst),
+    hasCompressedBody,
+    hasMethodOverride: classification.hasMethodOverride,
+    isStructuralMutation: classification.isStructuralMutation,
+    mutationKind: classification.kind,
+    hostFloor,
+    environmentMode: run.environmentMode ?? null,
+    ...(input.confirmedGraphqlEndpoints !== undefined
+      ? { confirmedGraphqlEndpoints: input.confirmedGraphqlEndpoints }
+      : {}),
+  })
+}
+
+/**
+ * Attribute persisted automatic approval decisions honestly (`R3-03`): preserve the Judge /
+ * policy / environment / rule actor instead of hard-coding `'auto-review:judge'` on denials
+ * or overrides.
+ */
+export function resolveAutoApprovalDecidedBy(
+  evaluation: Pick<Tier3ApprovalEvaluation, 'decidedBy' | 'failSafe' | 'hostFloor'>,
+): Exclude<ApprovalDecidedBy, 'operator'> {
+  if (evaluation.decidedBy !== 'operator') return evaluation.decidedBy
+  return evaluation.failSafe || (evaluation.hostFloor && evaluation.hostFloor !== 'low')
+    ? 'auto-review:policy'
+    : 'auto-review:rule'
+}
+
 export class RunTier3ApprovalCoordinator {
   private readonly host: Tier3ApprovalCoordinatorHost
   /** Assignments currently owned by a live in-memory `waitForHumanTier3Card` coroutine. */
@@ -1804,9 +1894,9 @@ export class RunTier3ApprovalCoordinator {
       const distinctTargets = approvalPlan.targets
       const multiTarget = distinctTargets.length > 1
       const project = this.host.storage.project(run.projectId)
-      const activePatterns = (run.approvedEndpointPatterns ?? []).filter(
-        p => p.scopeRevision === undefined || p.scopeRevision === run.scopeRevision,
-      )
+      const leaseAuthorizes = project.environment === 'local-lab'
+        ? undefined
+        : this.host.storage.approvalLeaseAuthorizer(run.id)
       const fastProfiles = resolveProfilePoolForRole('fast', this.host.storage)
       const approvedGrants: Array<Parameters<typeof registerStateChangeGrant>[3]> = []
       const escalatedTargets: Array<{
@@ -1817,21 +1907,38 @@ export class RunTier3ApprovalCoordinator {
 
       for (let idx = 0; idx < distinctTargets.length; idx += 1) {
         const target = distinctTargets[idx]!
+        const facts = buildWorkerApprovalRequestFacts(run, {
+          origin: target.origin,
+          method: target.method,
+          pathAndQuery: target.pathAndQuery,
+          personaHandle: target.personaHandle,
+          bodyPreview: target.bodyPreview,
+          headers: target.headers,
+          hasMultipart: target.hasMultipart,
+          isRaceBurst: options.isRaceBurst,
+          hasCompressedBody: target.hasCompressedBody,
+        })
         const evaluation = await evaluateTier3Approval({
           policy: run.approvalPolicy ?? 'auto_review',
           origin: target.origin,
           method: target.method,
           pathAndQuery: target.pathAndQuery,
+          scopeRevision: run.scopeRevision,
           personaHandle: target.personaHandle,
           rationale: multiTarget
             ? `${options.rationale} (target ${idx + 1}/${distinctTargets.length}: ${target.method.toUpperCase()} ${target.pathAndQuery})`
             : options.rationale,
           bodyPreview: target.bodyPreview,
           headers: target.headers,
-          hasMultipart: target.hasMultipart,
+          hasMultipart: facts.hasMultipart,
           isRaceBurst: options.isRaceBurst,
+          hasCompressedBody: facts.hasCompressedBody,
+          isStructuralMutation: facts.isStructuralMutation,
+          mutationKind: facts.mutationKind,
+          hostFloor: facts.hostFloor,
+          facts,
           environment: project.environment,
-          approvedPatterns: activePatterns,
+          leaseAuthorizes,
           profiles: fastProfiles,
           signal,
           secrets: options.secrets,
@@ -1850,9 +1957,13 @@ export class RunTier3ApprovalCoordinator {
             requestPreview: options.requestPreview,
             riskLevel: evaluation.riskLevel,
             policyNote: evaluation.reason,
+            originalJudgeDecision: evaluation.originalJudgeDecision ?? null,
+            originalRiskLevel: evaluation.originalRiskLevel ?? null,
+            hostFloor: evaluation.hostFloor ?? facts.hostFloor,
+            failSafeReason: evaluation.failSafeReason ?? null,
             secrets: options.secrets,
             decision: approved ? 'approved' : 'denied',
-            decidedBy: approved ? (evaluation.decidedBy === 'operator' ? 'auto-review:rule' : evaluation.decidedBy) : 'auto-review:judge',
+            decidedBy: resolveAutoApprovalDecidedBy(evaluation),
           })
           if (!approved) {
             throw new BrokerDenied(`Tier 3 Safety Judge denied ${options.denyLabel} probe: ${evaluation.reason}`)
@@ -1887,6 +1998,10 @@ export class RunTier3ApprovalCoordinator {
           isRaceBurst: false,
           riskLevel: primary.evaluation.riskLevel,
           policyNote: primary.evaluation.reason,
+          originalJudgeDecision: primary.evaluation.originalJudgeDecision ?? null,
+          originalRiskLevel: primary.evaluation.originalRiskLevel ?? null,
+          hostFloor: primary.evaluation.hostFloor ?? null,
+          failSafeReason: primary.evaluation.failSafeReason ?? null,
           secrets: options.secrets,
         }, signal)
         if (!human.approved) {
@@ -1967,6 +2082,10 @@ export class RunTier3ApprovalCoordinator {
             isRaceBurst: options.isRaceBurst,
             riskLevel: evaluation.riskLevel,
             policyNote: evaluation.reason,
+            originalJudgeDecision: evaluation.originalJudgeDecision ?? null,
+            originalRiskLevel: evaluation.originalRiskLevel ?? null,
+            hostFloor: evaluation.hostFloor ?? null,
+            failSafeReason: evaluation.failSafeReason ?? null,
             secrets: options.secrets,
           }, signal)
           if (!human.approved) {
@@ -2065,23 +2184,40 @@ export class RunTier3ApprovalCoordinator {
       }
     }
 
-    const activePatterns = (run.approvedEndpointPatterns ?? []).filter(
-      p => p.scopeRevision === undefined || p.scopeRevision === run.scopeRevision,
-    )
-    const evaluation = await evaluateTier3Approval({
-      policy: run.approvalPolicy ?? 'auto_review',
+    const facts = buildWorkerApprovalRequestFacts(run, {
       origin: input.origin,
       method: input.method,
       pathAndQuery: input.pathAndQuery,
       personaHandle: input.personaHandle ?? null,
-      rationale: input.rationale,
       bodyPreview: input.bodyPreview ?? null,
       headers: input.headers,
       hasMultipart: input.hasMultipart,
       isRceProof: input.isRceProof,
       isRaceBurst: input.isRaceBurst,
+    })
+    const leaseAuthorizes = project.environment === 'local-lab'
+      ? undefined
+      : this.host.storage.approvalLeaseAuthorizer(run.id)
+    const evaluation = await evaluateTier3Approval({
+      policy: run.approvalPolicy ?? 'auto_review',
+      origin: input.origin,
+      method: input.method,
+      pathAndQuery: input.pathAndQuery,
+      scopeRevision: run.scopeRevision,
+      personaHandle: input.personaHandle ?? null,
+      rationale: input.rationale,
+      bodyPreview: input.bodyPreview ?? null,
+      headers: input.headers,
+      hasMultipart: facts.hasMultipart,
+      isRceProof: input.isRceProof,
+      isRaceBurst: input.isRaceBurst,
+      hasCompressedBody: facts.hasCompressedBody,
+      isStructuralMutation: facts.isStructuralMutation,
+      mutationKind: facts.mutationKind,
+      hostFloor: facts.hostFloor,
+      facts,
       environment: project.environment,
-      approvedPatterns: activePatterns,
+      leaseAuthorizes,
       profiles: resolveProfilePoolForRole('fast', this.host.storage),
       signal,
       secrets: input.secrets,
@@ -2100,7 +2236,7 @@ export class RunTier3ApprovalCoordinator {
       personaHandle: input.personaHandle ?? null,
       bodyHash: input.bodyHash,
       bodyPreview: input.bodyPreview ?? null,
-      hasMultipart: input.hasMultipart,
+      hasMultipart: facts.hasMultipart,
       isRaceBurst: input.isRaceBurst,
       isRceProof: input.isRceProof,
       ...(approvalId ? { approvalId } : {}),
@@ -2113,9 +2249,14 @@ export class RunTier3ApprovalCoordinator {
         origin: input.origin, method: input.method, pathAndQuery: input.pathAndQuery,
         personaHandle: input.personaHandle, rationale: input.rationale,
         requestPreview: input.requestPreview, riskLevel: evaluation.riskLevel,
-        policyNote: evaluation.reason, secrets: input.secrets,
+        policyNote: evaluation.reason,
+        originalJudgeDecision: evaluation.originalJudgeDecision ?? null,
+        originalRiskLevel: evaluation.originalRiskLevel ?? null,
+        hostFloor: evaluation.hostFloor ?? facts.hostFloor,
+        failSafeReason: evaluation.failSafeReason ?? null,
+        secrets: input.secrets,
         decision: approved ? 'approved' : 'denied',
-        decidedBy: approved ? (evaluation.decidedBy === 'operator' ? 'auto-review:rule' : evaluation.decidedBy) : 'auto-review:judge',
+        decidedBy: resolveAutoApprovalDecidedBy(evaluation),
       })
       if (!approved) return { approved: false, deniedReason: evaluation.reason }
       const targetGrant = grantTarget()
@@ -2137,6 +2278,10 @@ export class RunTier3ApprovalCoordinator {
       isRaceBurst: input.isRaceBurst,
       riskLevel: evaluation.riskLevel,
       policyNote: evaluation.reason,
+      originalJudgeDecision: evaluation.originalJudgeDecision ?? null,
+      originalRiskLevel: evaluation.originalRiskLevel ?? null,
+      hostFloor: evaluation.hostFloor ?? facts.hostFloor,
+      failSafeReason: evaluation.failSafeReason ?? null,
       secrets: input.secrets,
     }, signal)
     if (!human.approved) {
@@ -2164,6 +2309,10 @@ export class RunTier3ApprovalCoordinator {
       isRaceBurst?: boolean
       riskLevel: Awaited<ReturnType<typeof evaluateTier3Approval>>['riskLevel']
       policyNote: string
+      originalJudgeDecision?: Tier3ApprovalEvaluation['originalJudgeDecision'] | null
+      originalRiskLevel?: Tier3ApprovalEvaluation['originalRiskLevel']
+      hostFloor?: Tier3ApprovalEvaluation['hostFloor'] | null
+      failSafeReason?: Tier3ApprovalEvaluation['failSafeReason'] | null
       secrets: readonly NamedSecret[]
     },
     signal: AbortSignal,
@@ -2191,7 +2340,12 @@ export class RunTier3ApprovalCoordinator {
           origin: input.origin, method: input.method, pathAndQuery: input.pathAndQuery,
           personaHandle: input.personaHandle ?? undefined, rationale: input.rationale,
           requestPreview: input.requestPreview, riskLevel: input.riskLevel,
-          policyNote: input.policyNote, secrets: input.secrets,
+          policyNote: input.policyNote,
+          originalJudgeDecision: input.originalJudgeDecision ?? null,
+          originalRiskLevel: input.originalRiskLevel ?? null,
+          hostFloor: input.hostFloor ?? null,
+          failSafeReason: input.failSafeReason ?? null,
+          secrets: input.secrets,
         })
         postedApprovalId = req.id
         this.host.postApprovalCard(run, job.assignment.id, {

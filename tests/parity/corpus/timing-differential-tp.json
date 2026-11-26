@@ -3,6 +3,21 @@
   "side": "tp",
   "archetype": "timing-differential",
   "description": "Five interleaved control/probe timing pairs carrying host-minted zero-delay vs 2000ms delay tokens with stable >3x wall-clock separation.",
+  "covers": {
+    "files": [
+      "src/server/host-fact-log.ts",
+      "src/server/oracle-invariants.ts",
+      "src/server/proof-receipt.ts",
+      "src/server/verify-claims.ts",
+      "src/server/verify-prove-handlers.ts",
+      "src/server/verify-support.ts"
+    ],
+    "classes": [
+      "timing",
+      "sqli",
+      "injection"
+    ]
+  },
   "canonicalLabel": {
     "cwe": "CWE-89",
     "category": "sqli",
@@ -39,7 +54,9 @@
       "status": 200,
       "durationMs": 22,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"status\":\"ok\",\"rows\":4}"
     },
     {
@@ -52,7 +69,9 @@
       "status": 200,
       "durationMs": 2045,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"status\":\"ok\",\"rows\":4}"
     },
     {
@@ -65,7 +84,9 @@
       "status": 200,
       "durationMs": 19,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"status\":\"ok\",\"rows\":4}"
     },
     {
@@ -78,7 +99,9 @@
       "status": 200,
       "durationMs": 2060,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"status\":\"ok\",\"rows\":4}"
     },
     {
@@ -91,7 +114,9 @@
       "status": 200,
       "durationMs": 25,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"status\":\"ok\",\"rows\":4}"
     },
     {
@@ -104,7 +129,9 @@
       "status": 200,
       "durationMs": 2080,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"status\":\"ok\",\"rows\":4}"
     },
     {
@@ -117,7 +144,9 @@
       "status": 200,
       "durationMs": 21,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"status\":\"ok\",\"rows\":4}"
     },
     {
@@ -130,7 +159,9 @@
       "status": 200,
       "durationMs": 2030,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"status\":\"ok\",\"rows\":4}"
     },
     {
@@ -143,7 +174,9 @@
       "status": 200,
       "durationMs": 24,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"status\":\"ok\",\"rows\":4}"
     },
     {
@@ -156,7 +189,9 @@
       "status": 200,
       "durationMs": 2095,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"status\":\"ok\",\"rows\":4}"
     }
   ],
@@ -172,6 +207,24 @@
     }
   },
   "claims": [
-    { "kind": "timing", "controlIds": ["tc1", "tc2", "tc3", "tc4", "tc5"], "variantIds": ["tp1", "tp2", "tp3", "tp4", "tp5"], "minPairs": 5, "maxPValue": 0.05 }
+    {
+      "kind": "timing",
+      "controlIds": [
+        "tc1",
+        "tc2",
+        "tc3",
+        "tc4",
+        "tc5"
+      ],
+      "variantIds": [
+        "tp1",
+        "tp2",
+        "tp3",
+        "tp4",
+        "tp5"
+      ],
+      "minPairs": 5,
+      "maxPValue": 0.05
+    }
   ]
 }

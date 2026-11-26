@@ -1,3 +1,4 @@
+// @kernel @fixes R4-C-1, R4-C-3, R4-C-4
 /**
  * R4 WS-1 (R4-C-1, R4-C-3, R4-C-4) fast class-level guard suite for `src/server/oracle-invariants.ts`:
  *  - R4-C-1: Canonical predicate skeleton binding, empty-base standalone rejection, equal-length /

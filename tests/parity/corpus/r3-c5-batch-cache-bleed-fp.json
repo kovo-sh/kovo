@@ -3,6 +3,21 @@
   "side": "fp",
   "archetype": "r3-c5-batch-partial-cache-bleed",
   "description": "R3-C-5(b)/(c) FP: batch endpoint echoing a foreign ID inside a denied error list while worker places target tenantId only in the request body must reject.",
+  "covers": {
+    "files": [
+      "src/server/composite-receipt.ts",
+      "src/server/host-fact-log.ts",
+      "src/server/terminal-oracle-registry.ts",
+      "src/server/v8-oracle-families.ts",
+      "src/server/v8-oracle-hydrate.ts",
+      "src/server/verify-claims.ts"
+    ],
+    "classes": [
+      "batch_partial_authz",
+      "dual_tenant_abac",
+      "bola"
+    ]
+  },
   "canonicalLabel": {
     "cwe": "CWE-639",
     "category": "bola",
@@ -46,7 +61,9 @@
       "persona": "member_a",
       "status": 403,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"error\":\"forbidden\"}"
     },
     {
@@ -56,10 +73,18 @@
       "method": "POST",
       "pathAndQuery": "/api/v1/secrets/batch",
       "persona": "member_a",
-      "requestJson": { "ids": ["sec_own_1", "sec_foreign_2"], "tenantId": "org-victim" },
+      "requestJson": {
+        "ids": [
+          "sec_own_1",
+          "sec_foreign_2"
+        ],
+        "tenantId": "org-victim"
+      },
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"items\":[{\"id\":\"sec_own_1\",\"value\":\"own-secret-val\"}],\"denied\":[{\"id\":\"sec_foreign_2\",\"tenantId\":\"org-victim\",\"reason\":\"forbidden\"}]}"
     }
   ],
@@ -69,7 +94,9 @@
     "oracleFamily": "dual_tenant_abac",
     "singleHop": true,
     "terminalExchangeId": "bpa_denied",
-    "preChainControlIds": ["bpa_ctrl"],
+    "preChainControlIds": [
+      "bpa_ctrl"
+    ],
     "claimedDelta": "Echoed foreign ID in denied array with request-body tenantId must not confirm dual_tenant_abac batch_partial_authz.",
     "v8OracleInput": {
       "family": "dual_tenant_abac",

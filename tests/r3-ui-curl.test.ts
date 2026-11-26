@@ -1,3 +1,4 @@
+// @kernel @fixes R3-H-7
 /**
  * R3-H-7 Regression Tests — Authoritative POSIX single-quote shell escaping
  * for Copy-as-cURL (`formatExchangeAsCurl`) and receipt reproducer (`buildCommandHint`).

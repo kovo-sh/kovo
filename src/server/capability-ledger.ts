@@ -171,9 +171,8 @@ function scrubNotebookItem(raw: string, maxLen: number): string {
   const handles: string[] = []
   let s = raw.replace(DERIVED_HANDLE_GLOBAL_RE, h => { handles.push(h); return `__CAP_H_${handles.length - 1}__` })
   s = redact(s).replace(RAW_BRIEF_SECRET_RE, '[redacted-handle]')
-  for (const { pattern } of EXTRA_SECRET_PATTERNS) {
-    const flags = pattern.flags.includes('g') ? pattern.flags : `${pattern.flags}g`
-    s = s.replace(new RegExp(pattern.source, flags), '[redacted-handle]')
+  for (const { replacePattern } of EXTRA_SECRET_PATTERNS) {
+    s = s.replace(replacePattern, '[redacted-handle]')
   }
   if (scanSecrets(s, { jsonPaths: false, maxMatches: 1 }).length > 0) s = '[redacted-handle]'
   s = s.replace(/__CAP_H_(\d+)__/g, (_, i) => handles[Number(i)] ?? '[cap_handle]')
@@ -251,14 +250,14 @@ export const computeArtifactDigest = (input: string | Uint8Array): string => cre
 export const canonicalPreconditionKey = (capIds: readonly string[]): string =>
   JSON.stringify([...new Set(capIds.map(id => id.trim()).filter(Boolean))].sort())
 
-const EXTRA_SECRET_PATTERNS: ReadonlyArray<{ kind: string; pattern: RegExp }> = [
-  { kind: 'basic_auth', pattern: /\bBasic\s+[A-Za-z0-9+/=]{8,}/i },
-  { kind: 'private_key', pattern: /-----BEGIN\s+[A-Z0-9 ]*(?:PRIVATE|RSA|EC|OPENSSH|PGP|SECRET)\s+KEY-----/i },
-  { kind: 'api_key', pattern: /\b(?:AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,})\b/ },
-  { kind: 'cookie_pair', pattern: /\b(?:session(?:id|_id|_token)?|sid|connect\.sid|jsessionid|auth_token|csrf_?token)\s*=\s*[A-Za-z0-9._~%+/=-]{6,}/i },
-  { kind: 'cookie_attributes', pattern: /\b[A-Za-z0-9_.-]{2,32}=[^;\s]{6,}\s*;\s*(?:HttpOnly|Secure|SameSite|Path=)/i },
-  { kind: 'credential_header', pattern: /\b(?:x-api-key|x-auth-token|x-session-token)\s*:\s*\S{4,}/i },
-  { kind: 'key_value', pattern: /\b(?:signing[_-]?(?:key|salt)|hmac[_-]?(?:key|secret)|access[_-]?token|refresh[_-]?token|id[_-]?token|private[_-]?key|passwd)\s*[:=]\s*(?:"[^"]{4,}"|'[^']{4,}'|[^\s&,;]{4,})/i },
+const EXTRA_SECRET_PATTERNS: ReadonlyArray<{ kind: string; pattern: RegExp; replacePattern: RegExp }> = [
+  { kind: 'basic_auth', pattern: /\bBasic\s+[A-Za-z0-9+/=]{8,}/i, replacePattern: /\bBasic\s+[A-Za-z0-9+/=]{8,}/gi },
+  { kind: 'private_key', pattern: /-----BEGIN\s+[A-Z0-9 ]*(?:PRIVATE|RSA|EC|OPENSSH|PGP|SECRET)\s+KEY-----/i, replacePattern: /-----BEGIN\s+[A-Z0-9 ]*(?:PRIVATE|RSA|EC|OPENSSH|PGP|SECRET)\s+KEY-----/gi },
+  { kind: 'api_key', pattern: /\b(?:AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,})\b/, replacePattern: /\b(?:AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,})\b/g },
+  { kind: 'cookie_pair', pattern: /\b(?:session(?:id|_id|_token)?|sid|connect\.sid|jsessionid|auth_token|csrf_?token)\s*=\s*[A-Za-z0-9._~%+/=-]{6,}/i, replacePattern: /\b(?:session(?:id|_id|_token)?|sid|connect\.sid|jsessionid|auth_token|csrf_?token)\s*=\s*[A-Za-z0-9._~%+/=-]{6,}/gi },
+  { kind: 'cookie_attributes', pattern: /\b[A-Za-z0-9_.-]{2,32}=[^;\s]{6,}\s*;\s*(?:HttpOnly|Secure|SameSite|Path=)/i, replacePattern: /\b[A-Za-z0-9_.-]{2,32}=[^;\s]{6,}\s*;\s*(?:HttpOnly|Secure|SameSite|Path=)/gi },
+  { kind: 'credential_header', pattern: /\b(?:x-api-key|x-auth-token|x-session-token)\s*:\s*\S{4,}/i, replacePattern: /\b(?:x-api-key|x-auth-token|x-session-token)\s*:\s*\S{4,}/gi },
+  { kind: 'key_value', pattern: /\b(?:signing[_-]?(?:key|salt)|hmac[_-]?(?:key|secret)|access[_-]?token|refresh[_-]?token|id[_-]?token|private[_-]?key|passwd)\s*[:=]\s*(?:"[^"]{4,}"|'[^']{4,}'|[^\s&,;]{4,})/i, replacePattern: /\b(?:signing[_-]?(?:key|salt)|hmac[_-]?(?:key|secret)|access[_-]?token|refresh[_-]?token|id[_-]?token|private[_-]?key|passwd)\s*[:=]\s*(?:"[^"]{4,}"|'[^']{4,}'|[^\s&,;]{4,})/gi },
 ]
 
 const SENSITIVE_KEY_RE =

@@ -3,6 +3,20 @@
   "side": "fp",
   "archetype": "public-catalog-bola-fp",
   "description": "Public catalog resource returns identical JSON to anonymous caller and authenticated cross-tenant caller.",
+  "covers": {
+    "files": [
+      "src/server/floor-recipe-engine.ts",
+      "src/server/host-fact-log.ts",
+      "src/server/oracle-invariants.ts",
+      "src/server/proof-receipt.ts",
+      "src/server/replay-verifier.ts",
+      "src/server/verify-claims.ts"
+    ],
+    "classes": [
+      "bola",
+      "authorization"
+    ]
+  },
   "canonicalLabel": {
     "cwe": "CWE-639",
     "category": "bola",
@@ -55,7 +69,9 @@
       "persona": null,
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"id\":\"item_7\",\"name\":\"Standard Plan\",\"price\":25}"
     },
     {
@@ -67,7 +83,9 @@
       "persona": "owner_a",
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"id\":\"item_7\",\"name\":\"Standard Plan\",\"price\":25}"
     },
     {
@@ -79,7 +97,9 @@
       "persona": "member_b",
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"id\":\"item_7\",\"name\":\"Standard Plan\",\"price\":25}"
     }
   ],
@@ -87,11 +107,31 @@
     "assertionsJq": "{ controlPassed: (.steps.owner_read.status == 200), confirmed: (.steps.prb.status == 200 and .steps.prb.json.id == \"item_7\"), observed: .steps.prb.json.name, expected: \"403\" }"
   },
   "claims": [
-    { "kind": "impact", "impactClass": "authorization", "probeExchangeId": "prb", "controlExchangeIds": ["anon", "owner_read"] }
+    {
+      "kind": "impact",
+      "impactClass": "authorization",
+      "probeExchangeId": "prb",
+      "controlExchangeIds": [
+        "anon",
+        "owner_read"
+      ]
+    }
   ],
   "bareClaims": [
-    { "kind": "status", "exchangeId": "anon", "expected": 200 },
-    { "kind": "status", "exchangeId": "prb", "expected": 200 },
-    { "kind": "body_contains", "exchangeId": "prb", "text": "Standard Plan" }
+    {
+      "kind": "status",
+      "exchangeId": "anon",
+      "expected": 200
+    },
+    {
+      "kind": "status",
+      "exchangeId": "prb",
+      "expected": 200
+    },
+    {
+      "kind": "body_contains",
+      "exchangeId": "prb",
+      "text": "Standard Plan"
+    }
   ]
 }

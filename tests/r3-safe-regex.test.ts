@@ -1,3 +1,4 @@
+// @kernel @fixes R3-H-11
 /**
  * R3-H-11 regression suite for `src/server/safe-regex.ts`:
  *  - Class 1: group boundaries & alternations preserve overlapping unbounded chains

@@ -3,6 +3,17 @@
   "side": "tp",
   "archetype": "open-redirect-canary",
   "description": "Same-route control redirects locally while probe carrying a host-minted redirect canary host returns 302 Location to that external canary host.",
+  "covers": {
+    "files": [
+      "src/server/host-fact-log.ts",
+      "src/server/proof-receipt.ts",
+      "src/server/verify-claims.ts",
+      "src/server/verify-support.ts"
+    ],
+    "classes": [
+      "open_redirect"
+    ]
+  },
   "canonicalLabel": {
     "cwe": "CWE-601",
     "category": "open_redirect",
@@ -37,7 +48,9 @@
       "persona": null,
       "status": 302,
       "mediaType": "text/plain",
-      "responseHeaders": { "location": "/dashboard" },
+      "responseHeaders": {
+        "location": "/dashboard"
+      },
       "body": ""
     },
     {
@@ -49,7 +62,9 @@
       "persona": null,
       "status": 302,
       "mediaType": "text/plain",
-      "responseHeaders": { "location": "https://{{MINTED_REDIRECT_HOST}}/landing" },
+      "responseHeaders": {
+        "location": "https://{{MINTED_REDIRECT_HOST}}/landing"
+      },
       "body": ""
     }
   ],
@@ -62,7 +77,16 @@
     "mintRedirectCanary": true
   },
   "claims": [
-    { "kind": "status", "exchangeId": "prb", "expected": 302 },
-    { "kind": "header", "exchangeId": "prb", "name": "location", "matches": "^https://redir-[0-9a-f]+\\.canary\\.kovo\\.invalid/landing$" }
+    {
+      "kind": "status",
+      "exchangeId": "prb",
+      "expected": 302
+    },
+    {
+      "kind": "header",
+      "exchangeId": "prb",
+      "name": "location",
+      "matches": "^https://redir-[0-9a-f]+\\.canary\\.kovo\\.invalid/landing$"
+    }
   ]
 }

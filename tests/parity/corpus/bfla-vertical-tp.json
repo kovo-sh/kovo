@@ -3,6 +3,20 @@
   "side": "tp",
   "archetype": "bfla-vertical",
   "description": "Viewer invokes admin-only role promotion action that denies member control and persists protected role change to admin.",
+  "covers": {
+    "files": [
+      "src/server/floor-recipe-engine.ts",
+      "src/server/host-fact-log.ts",
+      "src/server/oracle-invariants.ts",
+      "src/server/proof-receipt.ts",
+      "src/server/replay-verifier.ts",
+      "src/server/verify-claims.ts"
+    ],
+    "classes": [
+      "bfla",
+      "authorization"
+    ]
+  },
   "canonicalLabel": {
     "cwe": "CWE-862",
     "category": "bfla",
@@ -64,7 +78,9 @@
       "persona": "admin_a",
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"id\":\"u_55\",\"role\":\"member\",\"email\":\"target@tenant-a.example\"}"
     },
     {
@@ -74,10 +90,14 @@
       "method": "POST",
       "pathAndQuery": "/api/admin/users/u_55/role",
       "persona": "member_a",
-      "requestJson": { "role": "admin" },
+      "requestJson": {
+        "role": "admin"
+      },
       "status": 403,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"error\":\"forbidden\"}"
     },
     {
@@ -87,10 +107,14 @@
       "method": "POST",
       "pathAndQuery": "/api/admin/users/u_55/role",
       "persona": "viewer_a",
-      "requestJson": { "role": "admin" },
+      "requestJson": {
+        "role": "admin"
+      },
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"id\":\"u_55\",\"role\":\"admin\",\"email\":\"target@tenant-a.example\"}"
     },
     {
@@ -102,7 +126,9 @@
       "persona": "admin_a",
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"id\":\"u_55\",\"role\":\"admin\",\"email\":\"target@tenant-a.example\"}"
     }
   ],
@@ -111,6 +137,18 @@
     "assertionsJq": "{ controlPassed: (.steps.before.json.role == \"member\" and .steps.denied.status == 403), confirmed: (.steps.prb.status == 200 and .steps.after.json.role == \"admin\"), observed: .steps.after.json.role, expected: \"member\" }"
   },
   "claims": [
-    { "kind": "impact", "impactClass": "bfla", "beforeExchangeId": "before", "probeExchangeId": "prb", "afterExchangeId": "after", "controlExchangeIds": ["before", "denied", "after"], "requiredRole": "admin" }
+    {
+      "kind": "impact",
+      "impactClass": "bfla",
+      "beforeExchangeId": "before",
+      "probeExchangeId": "prb",
+      "afterExchangeId": "after",
+      "controlExchangeIds": [
+        "before",
+        "denied",
+        "after"
+      ],
+      "requiredRole": "admin"
+    }
   ]
 }
