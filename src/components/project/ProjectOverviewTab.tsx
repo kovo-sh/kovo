@@ -400,11 +400,23 @@ export function ProjectOverviewTab({ data, onSelectTab }: Props) {
           <h2 className="m-0 text-[13px] font-semibold text-fg">
             Runs <span className="font-normal tabular-nums text-fg-subtle">({runs.length})</span>
           </h2>
-          {rerunError && <span className="text-[12px] text-danger" role="alert">{rerunError}</span>}
+          <div className="flex items-center gap-3">
+            {rerunError && <span className="text-[12px] text-danger" role="alert">{rerunError}</span>}
+            {runs.length > 0 && (
+              <Link
+                to="/projects/$projectId"
+                params={{ projectId: project.id }}
+                search={{ tab: 'runs' }}
+                className="text-[12px] font-medium text-fg-muted no-underline transition-colors hover:text-fg"
+              >
+                View all runs ({runs.length}) →
+              </Link>
+            )}
+          </div>
         </div>
         {runs.length > 0 ? (
           <div className="border-t border-line">
-            {runs.map(run => {
+            {runs.slice(0, 3).map(run => {
               const runTitle = displayRunLabel(run)
               return (
               <div

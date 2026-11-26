@@ -8,6 +8,7 @@ import { ProjectInventoryTab } from '../components/project/ProjectInventoryTab.t
 import { ProjectNewRunSheet } from '../components/project/ProjectNewRunSheet.tsx'
 import { ProjectOverviewTab } from '../components/project/ProjectOverviewTab.tsx'
 import { ProjectPersonasTab } from '../components/project/ProjectPersonasTab.tsx'
+import { ProjectRunsTab } from '../components/project/ProjectRunsTab.tsx'
 import { ProjectSourcesTab } from '../components/project/ProjectSourcesTab.tsx'
 import type { PersonaTestState, ProjectLoaderData, ProjectTabId } from '../components/project/types.ts'
 import { isProjectTab, PROJECT_TABS, safeHost } from '../components/project/types.ts'
@@ -187,7 +188,7 @@ function ProjectPageContent({ data }: { data: ProjectLoaderData }) {
 
   const allowlistCount = (project.sandboxWriteAllowlist ?? []).length
   const tabCounts: Partial<Record<ProjectTabId, number>> = {
-    overview: runs.length,
+    runs: runs.length,
     inventory: assets.length,
     personas: personas.length,
     sources: specs.length,
@@ -319,6 +320,13 @@ function ProjectPageContent({ data }: { data: ProjectLoaderData }) {
             key={project.id}
             data={data}
             onSelectTab={selectTab}
+          />
+        )}
+        {activeTab === 'runs' && (
+          <ProjectRunsTab
+            key={project.id}
+            data={data}
+            onNewRun={() => setNewRunOpen(true)}
           />
         )}
         {activeTab === 'inventory' && (
