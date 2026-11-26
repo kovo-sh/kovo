@@ -22,6 +22,11 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npx playwright install --with-deps chromium
+      - name: Enable unprivileged userns for Chromium sandbox (Ubuntu 24.04)
+        run: |
+          if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
       - run: npm run check
       - run: npm run worker:build
       - run: bash scripts/docker-smoke.sh
