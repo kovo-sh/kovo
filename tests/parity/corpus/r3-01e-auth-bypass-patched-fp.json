@@ -1,0 +1,78 @@
+{
+  "id": "r3-01e-auth-bypass-patched-fp",
+  "side": "fp",
+  "archetype": "auth-bypass-header-patched",
+  "description": "R3-01e FP: Patched/edge-blocked CWE-287 auth-bypass check where both unauthenticated control and forged middleware-header probe return HTTP 401. Even though buildReplayReceipt builds the auth_bypass receipt when boundaryGate.required is true (so retestReplaySpec can verify a clean fix instead of receipt_unbuildable), every confirmation path must fail closed and never confirm.",
+  "covers": {
+    "files": [
+      "src/server/proof-receipt.ts",
+      "src/server/floor-recipe-engine.ts"
+    ],
+    "classes": [
+      "auth_bypass"
+    ]
+  },
+  "canonicalLabel": {
+    "cwe": "CWE-287",
+    "category": "auth-bypass",
+    "title": "Patched middleware authentication bypass denied with HTTP 401",
+    "impact": "Middleware auth gate rejects both bare and header-spoofed requests with HTTP 401.",
+    "claimedImpact": "other",
+    "claimedBoundary": "auth",
+    "vulnClass": "auth_bypass"
+  },
+  "freeTextLabel": {
+    "title": "Edge-blocked middleware header auth bypass probe returns 401"
+  },
+  "paths": {
+    "replay": true,
+    "floorReceipt": true,
+    "evaluateClaims": true,
+    "composite": false,
+    "floorInjectionRecipe": false,
+    "proofReceipt": true
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [],
+  "exchanges": [
+    {
+      "id": "ctl",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/admin/audit-log",
+      "persona": null,
+      "status": 401,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"error\":\"authentication_required\"}"
+    },
+    {
+      "id": "prb",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/admin/audit-log",
+      "persona": null,
+      "requestHeaders": { "x-middleware-subrequest": "middleware:middleware:middleware:middleware:middleware" },
+      "status": 401,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"error\":\"authentication_required\"}"
+    }
+  ],
+  "replaySpec": {
+    "assertionsJq": "{ controlPassed: (.steps.ctl.status == 401), confirmed: (.steps.ctl.status == 401 and .steps.prb.status == 200), observed: (\"control=\" + (.steps.ctl.status | tostring) + \", probe=\" + (.steps.prb.status | tostring)), expected: \"401\" }"
+  },
+  "proofReceipt": {
+    "vulnClass": "auth_bypass",
+    "targetMethod": "GET",
+    "targetPathAndQuery": "/api/admin/audit-log",
+    "claimedDelta": "Patched middleware gate returned 401 on both control and forged x-middleware-subrequest probe; must never confirm."
+  },
+  "claims": [
+    { "kind": "boundary", "boundaryClass": "auth", "controlExchangeId": "ctl", "probeExchangeId": "prb" }
+  ]
+}

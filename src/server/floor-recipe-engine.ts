@@ -3349,7 +3349,7 @@ export function buildReplayReceipt(input: {
   if (CWE_NUMBER_RE.test(input.spec.cwe ?? '') && specClass === null) return null
   const baseVulnClass = vulnClassForImpactClass(evidenceClass) ?? specClass
   const isBoundaryAuth = (baseVulnClass === null || baseVulnClass === 'auth_bypass') &&
-    boundaryGate?.required === true && boundaryGate.satisfied === true && boundaryGate.boundaryClass === 'auth'
+    boundaryGate?.required === true && boundaryGate.boundaryClass === 'auth'
   const vulnClass = baseVulnClass ?? (isBoundaryAuth ? 'auth_bypass' : null)
   if (!vulnClass) return null
   const canary = input.evidencePayload.canary as {

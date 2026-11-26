@@ -3274,8 +3274,40 @@ export function normalizeRequestCarrier(input: RequestCarrierInput): NormalizedR
 function maskExpressionOperands(text: string, challenge: HostMintedExpressionChallenge): string {
   const a = String(challenge.operandA)
   const b = String(challenge.operandB)
-  const opRe = challenge.operator === '+' ? '\\+' : '\\\\?\\*'
-  return text.replace(new RegExp(`${a}\\s*${opRe}\\s*${b}`, 'g'), ' ')
+  if (!a || !b) return text
+  let out = ''
+  let cursor = 0
+  let searchFrom = 0
+  while (searchFrom <= text.length - a.length) {
+    const pos = text.indexOf(a, searchFrom)
+    if (pos === -1) break
+    let i = pos + a.length
+    while (i < text.length && /\s/.test(text[i]!)) i += 1
+    let opMatched = false
+    if (challenge.operator === '+') {
+      if (text[i] === '+') {
+        i += 1
+        opMatched = true
+      }
+    } else if (text[i] === '\\' && text[i + 1] === '*') {
+      i += 2
+      opMatched = true
+    } else if (text[i] === '*') {
+      i += 1
+      opMatched = true
+    }
+    if (opMatched) {
+      while (i < text.length && /\s/.test(text[i]!)) i += 1
+      if (text.startsWith(b, i)) {
+        out += text.slice(cursor, pos) + ' '
+        cursor = i + b.length
+        searchFrom = cursor
+        continue
+      }
+    }
+    searchFrom = pos + 1
+  }
+  return cursor === 0 ? text : out + text.slice(cursor)
 }
 
 function carrierReflectsExpressionOutput(

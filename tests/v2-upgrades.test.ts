@@ -602,6 +602,8 @@ test('verifyReplaySpec & retestReplaySpec verify race_burst and browser_chain sp
 
   // Cut 3d retired the raw race_burst VM onto the conserved_balance recipe. A bare legacy spec now
   // fails closed at every tier; the broker-level burst above still exercises the transport.
+  // Under R2-04 retest truthfulness, a retired spec that executed no control/probe arms and has no
+  // buildable ProofReceipt MUST return 'inconclusive' (`receipt_unbuildable`), NEVER 'fixed'.
   const tier1Res = await verifyReplaySpec({
     spec: raceSpec, broker, backend, grant: makeGrant({ tier: 1 }), signal: AbortSignal.timeout(15_000),
   })
@@ -613,7 +615,8 @@ test('verifyReplaySpec & retestReplaySpec verify race_burst and browser_chain sp
   const raceRetest = await retestReplaySpec({
     spec: raceSpec, broker, backend, grant: tier2Grant, signal: AbortSignal.timeout(15_000),
   })
-  assert.equal(raceRetest.verdict, 'fixed')
+  assert.equal(raceRetest.verdict, 'inconclusive')
+  assert.equal((raceRetest.replay.evidencePayload.retestHealth as { failureReason?: string } | undefined)?.failureReason, 'receipt_unbuildable')
   raceFixed = true
 
   // --- 3B. DOM-sink browser proof (browser_sink recipe + runBrowserSession) ---
