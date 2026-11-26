@@ -48,7 +48,8 @@ import {
   provider,
   providerPool,
 } from "./provider.ts"
-import type { CallRecorder, ProviderConfig, ProviderOptions, UsageCallback } from "./provider.ts"
+import type { CallRecorder, ProviderConfig, ProviderOptions, SecretSource, UsageCallback } from "./provider.ts"
+import { redactSecrets } from "./egress-sanitizer.ts"
 import { redact } from "./redact.ts"
 import type { NamedSecret } from "./redact.ts"
 import { listSkills, listSkillTags, loadSkill, searchSkills, selectPreInjectionSkills, skillsByTag } from "./skills.ts"
@@ -1275,14 +1276,45 @@ function classifyBrokerDenial(error: unknown): GapDenialKind | null {
   return null
 }
 
+export interface SessionScrubbers {
+  /** Display/logging/LLM-context scrubber: exact live secrets + heuristic credential patterns. */
+  scrubForDisplay: (value: string) => string
+  /** Executable-argument scrubber (H-25): exact live known secrets ONLY (zero heuristic regexes). */
+  scrubExact: (value: string) => string
+}
+
+/**
+ * Builds live display vs exact-only secret scrubbers (H-8 / H-25).
+ * Reads `secrets` on every invocation (never snapshotting at startup), so rotated session tokens
+ * or dynamically registered secrets minted mid-run are immediately scrubbed before reaching the model.
+ */
+export function createSessionScrubbers(
+  secrets?: SecretSource,
+  staticSecrets: readonly NamedSecret[] = [],
+): SessionScrubbers {
+  const resolveLive = (): readonly NamedSecret[] => {
+    const dynamic = typeof secrets === 'function' ? secrets() : (secrets ?? [])
+    if (!dynamic.length) return staticSecrets
+    if (!staticSecrets.length) return dynamic
+    return [...dynamic, ...staticSecrets]
+  }
+  return {
+    scrubForDisplay: (value: string) => redact(value, resolveLive()),
+    scrubExact: (value: string) => redactSecrets(value, resolveLive()),
+  }
+}
+
 export function buildWorkerTools(
   handlers: WorkerToolHandlers,
-  scrub: (value: string) => string,
+  scrub: ((value: string) => string) | SessionScrubbers,
   rootSignal: AbortSignal,
   inlineLimit: number,
   onCompleteIntent: (completion: IntentCompletion) => void,
   specSubmission?: SpecSubmissionToolOptions,
 ): ToolRegistration[] {
+  const scrubForDisplay = typeof scrub === 'function' ? scrub : scrub.scrubForDisplay
+  // H-25: Never run heuristic display scrubbing on executable code/command arguments.
+  const scrubExact = typeof scrub === 'function' ? ((value: string) => value) : scrub.scrubExact
   const tools: ToolRegistration[] = []
   const outputLimits = { maxBytes: inlineLimit }
 
@@ -1304,7 +1336,7 @@ export function buildWorkerTools(
       if (SPEC_SUBMISSION_TOOLS.has(toolName) && !ROUTE_BOUND_SPEC_TOOLS.has(toolName)) specSubmission?.tracker?.noteSpecAttempt()
       if (ROUTE_EVIDENCE_TOOLS.has(toolName)) specSubmission?.tracker?.noteProbe()
       try { observe?.(result) } catch { /* evidence bookkeeping must never break a probe */ }
-      const text = await formatToolOutput(result, toolName, scrub, inlineLimit, handlers.spillOutput, signal)
+      const text = await formatToolOutput(result, toolName, scrubForDisplay, inlineLimit, handlers.spillOutput, signal)
       return {
         output: [{ type: 'text' as const, text }],
         ...(control ? { control } : {}),
@@ -1312,7 +1344,7 @@ export function buildWorkerTools(
     } catch (error) {
       if (rootSignal.aborted) throw error
       try { observeError?.(error) } catch { /* denial bookkeeping must never break the error path */ }
-      const msg = scrub(error instanceof Error ? error.message : String(error)).slice(0, 1600)
+      const msg = scrubForDisplay(error instanceof Error ? error.message : String(error)).slice(0, 1600)
       return {
         isError: true,
         output: [{ type: 'text' as const, text: `Tool ${toolName} error: ${msg}` }],
@@ -1645,7 +1677,7 @@ export function buildWorkerTools(
       outputLimits,
       execute: async (args, _api, ctx) => {
         const signal = combineSignal(ctx.abortSignal)
-        return wrapExec('run_offline_script', () => fn({ ...args, code: scrub(args.code) }, signal), signal)
+        return wrapExec('run_offline_script', () => fn({ ...args, code: scrubExact(args.code) }, signal), signal)
       },
     }))
   }
@@ -1800,7 +1832,7 @@ export function buildWorkerTools(
       outputLimits,
       execute: async (args, _api, ctx) => {
         const signal = combineSignal(ctx.abortSignal)
-        return wrapExec('derive_evidence', () => fn({ ...args, command: scrub(args.command) }, signal), signal)
+        return wrapExec('derive_evidence', () => fn({ ...args, command: scrubExact(args.command) }, signal), signal)
       },
     }))
   }
@@ -2301,9 +2333,9 @@ export function buildWorkerTools(
         gvValidationErrors = 0
         const runtime: KovoVerifyRuntime = 'ts'
         const payload: KovoVerifyArgs = {
-          ...(inlineScript ? { script: inlineScript } : { scriptPath }),
+          ...(inlineScript ? { script: scrubExact(inlineScript) } : { scriptPath }),
           runtime,
-          ...(args.title?.trim() ? { title: args.title.trim() } : {}),
+          ...(args.title?.trim() ? { title: scrubExact(args.title.trim()) } : {}),
           ...(args.timeoutMs !== undefined ? { timeoutMs: args.timeoutMs } : {}),
         }
         return wrapExec(
@@ -2402,9 +2434,9 @@ export function buildWorkerTools(
           replaySpec: parsed.data!,
           chainFactIds: args.chainFactIds ?? [],
           exchangeIds: args.exchangeIds ?? [],
-          counterevidence: scrub(counterevidence),
-          confidenceRationale: scrub(confidenceRationale),
-          severityChangeConditions: args.severityChangeConditions?.trim() ? scrub(args.severityChangeConditions.trim()) : undefined,
+          counterevidence: scrubForDisplay(counterevidence),
+          confidenceRationale: scrubForDisplay(confidenceRationale),
+          severityChangeConditions: args.severityChangeConditions?.trim() ? scrubForDisplay(args.severityChangeConditions.trim()) : undefined,
           codeLocations: args.codeLocations,
           verifyNow: args.verifyNow ?? true,
         }, signal).then(result => {
@@ -2464,12 +2496,12 @@ export function buildWorkerTools(
         }
         return wrapExec('update_proposed_finding', () => fn({
           findingId: args.findingId,
-          title: args.title?.trim() ? scrub(args.title.trim()) : undefined,
+          title: args.title?.trim() ? scrubForDisplay(args.title.trim()) : undefined,
           severity: args.severity,
-          summary: args.summary?.trim() ? scrub(args.summary.trim()) : undefined,
-          counterevidence: args.counterevidence?.trim() ? scrub(args.counterevidence.trim()) : undefined,
-          confidenceRationale: args.confidenceRationale?.trim() ? scrub(args.confidenceRationale.trim()) : undefined,
-          severityChangeConditions: args.severityChangeConditions?.trim() ? scrub(args.severityChangeConditions.trim()) : undefined,
+          summary: args.summary?.trim() ? scrubForDisplay(args.summary.trim()) : undefined,
+          counterevidence: args.counterevidence?.trim() ? scrubForDisplay(args.counterevidence.trim()) : undefined,
+          confidenceRationale: args.confidenceRationale?.trim() ? scrubForDisplay(args.confidenceRationale.trim()) : undefined,
+          severityChangeConditions: args.severityChangeConditions?.trim() ? scrubForDisplay(args.severityChangeConditions.trim()) : undefined,
           replaySpec: parsedSpec,
           codeLocations: args.codeLocations,
           verifyNow: args.verifyNow,
@@ -2664,8 +2696,8 @@ export function buildWorkerTools(
         }
         const completion: IntentCompletion = {
           status: args.status,
-          summary: scrub(args.summary),
-          nextRecommendations: args.nextRecommendations?.map(scrub),
+          summary: scrubForDisplay(args.summary),
+          nextRecommendations: args.nextRecommendations?.map(scrubForDisplay),
         }
         onCompleteIntent(completion)
         return wrapExec('complete_intent', () => fn(completion, signal), signal, { terminate: true })
@@ -2831,7 +2863,8 @@ export interface RunAgentSessionOptions {
   requireCompleteIntent?: boolean
   handlers?: WorkerToolHandlers
   extraTools?: readonly ToolRegistration[]
-  secrets?: readonly NamedSecret[]
+  /** Static array (live-read if mutated) or dynamic getter returning the current secret set (H-8). */
+  secrets?: SecretSource
   record?: CallRecorder
   beforeCall?: () => void
   onUsage?: UsageCallback
@@ -2946,13 +2979,20 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
     if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
   }
 
-  const allSecrets: NamedSecret[] = [
-    ...(options.secrets ?? []),
-    ...(profiles
-      ? profiles.map(p => ({ value: p.key, placeholder: '[redacted]' }))
-      : [{ value: primarySettings.key, placeholder: '[redacted]' }]),
-  ]
-  const scrub = (value: string) => redact(value, allSecrets)
+  // H-8: Read live secret set on every model-boundary scrub (never snapshot at session start)
+  // so rotated session tokens / newly registered secrets minted mid-run are immediately scrubbed.
+  const staticKeySecrets: readonly NamedSecret[] = profiles
+    ? profiles.map(p => ({ value: p.key, placeholder: '[redacted]' }))
+    : [{ value: primarySettings.key, placeholder: '[redacted]' }]
+  const resolveLiveSecrets = (): readonly NamedSecret[] => {
+    const dynamic = typeof options.secrets === 'function'
+      ? options.secrets()
+      : (options.secrets ?? [])
+    if (!dynamic.length) return staticKeySecrets
+    return [...dynamic, ...staticKeySecrets]
+  }
+  const scrubbers = createSessionScrubbers(options.secrets, staticKeySecrets)
+  const { scrubForDisplay } = scrubbers
 
   const sessionStartedAt = Date.now()
   const sessionController = new AbortController()
@@ -2989,7 +3029,7 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
   const providerOpts: ProviderOptions = {
     signal: sessionController.signal,
     record: options.record,
-    secrets: options.secrets,
+    secrets: resolveLiveSecrets,
     maxCalls: Math.max(defaultMaxCalls, maxTurns + 40),
     thinkingLevel: effectiveThinking,
     roleAffinity: effectiveRole,
@@ -3146,7 +3186,7 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
 
   const builtTools = buildWorkerTools(
     handlers,
-    scrub,
+    scrubbers,
     sessionController.signal,
     inlineLimit,
     result => { completion = result },
@@ -3177,7 +3217,7 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
         lastTraceMessageCount = request.messages.length
         const turnStart = options.onTurnStart?.(turnsUsed + 1, maxTurns)
         const extraMessages = (turnStart?.messages ?? []).map(content => ({
-          role: 'user' as const, content, timestamp: Date.now(),
+          role: 'user' as const, content: scrubForDisplay(content), timestamp: Date.now(),
         }))
         const settlingNow = isSettling()
         const wallClockSettlingNow = effectiveWallClockMs !== undefined && wallClockSettlementAt !== undefined
@@ -3452,7 +3492,7 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
       }
     }
 
-    const input = { type: 'input' as const, content: scrub(options.prompt) }
+    const input = { type: 'input' as const, content: scrubForDisplay(options.prompt) }
     const submission = await conversation.submit({ ...input, requestId: options.requestId }, context)
     const initialWait = await waitWithWallClockAbort(submission.wait(context))
     if (initialWait.rotated) return makeWallClockRotatedResult()
@@ -3492,7 +3532,7 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
       const view = await conversation.context(context)
       const lastText = extractLastAssistantText(view.entries)
       return finish({
-        answer: scrub(lastText || `Reached maxTurns (${maxTurns}) without calling complete_intent.`),
+        answer: scrubForDisplay(lastText || `Reached maxTurns (${maxTurns}) without calling complete_intent.`),
         turnsUsed,
         settled,
         nudgesUsed,
@@ -3576,7 +3616,7 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
     }
 
     return finish({
-      answer: scrub(answer),
+      answer: scrubForDisplay(answer),
       turnsUsed,
       settled,
       nudgesUsed,
@@ -3670,7 +3710,7 @@ export interface AgentTurnJob {
   maxTurns?: number
   thinkingLevel?: ThinkingLevel
   roleAffinity?: RoleAffinity
-  secrets?: readonly NamedSecret[]
+  secrets?: SecretSource
   derive?: (command: string, signal: AbortSignal) => Promise<string>
   handlers?: WorkerToolHandlers
   record?: CallRecorder

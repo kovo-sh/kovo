@@ -45,8 +45,14 @@ export function resolveProfileNoTokenWatchdogMs(
   return DEFAULT_NO_TOKEN_WATCHDOG_MS
 }
 
+export type SecretSource = readonly NamedSecret[] | (() => readonly NamedSecret[])
+
+export function resolveSecretSource(source?: SecretSource): readonly NamedSecret[] {
+  return typeof source === 'function' ? source() : (source ?? [])
+}
+
 export interface StreamSanitizeOptions {
-  secrets?: readonly NamedSecret[]
+  secrets?: SecretSource
   responseLimit?: number
   /**
    * Called once as soon as the first non-empty body chunk arrives from upstream, so callers can
@@ -63,6 +69,8 @@ export interface StreamSanitizeOptions {
 
 const replacement = '[redacted]'
 const credentialField = /^(?:authorization|proxy-authorization|cookie|set-cookie|password|api[_-]?key|token|session[_-]?(?:id|key)|client[_-]?secret|service[_-]?role[_-]?key)$/i
+const rawCookieField = /^(?:cookie|set-cookie)$/i
+const toolArgHeaderMapKeys = new Set(['headers', 'reqHeaders', 'requestHeaders', 'upgradeHeaders'])
 type FragmentMode = 'text' | 'json_args' | 'raw_args'
 const terminalEvents = new Set(['response.completed', 'response.incomplete', 'response.failed', 'message_stop', 'error'])
 const messageEvents = new Set([
@@ -87,8 +95,8 @@ function fields(value: unknown): Fields | undefined {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Fields : undefined
 }
 
-export function redactProviderText(value: string, key: string, secrets: readonly NamedSecret[] = []): string {
-  return createEgressSanitizer({ providerKey: key, secrets }).redactText(value, 'llm_context')
+export function redactProviderText(value: string, key: string, secrets: SecretSource = []): string {
+  return createEgressSanitizer({ providerKey: key, secrets: resolveSecretSource(secrets) }).redactText(value, 'llm_context')
 }
 
 function fragment(owner: Fields | undefined, field: string): Fragment | undefined {
@@ -101,16 +109,75 @@ function fragment(owner: Fields | undefined, field: string): Fragment | undefine
  * URL-encoded, base64/base64url, JSON-escaped, and HTML-entity variants) via EgressSanitizer
  * without applying heuristic credential regexes (H-25).
  */
-export function redactExactSecrets(value: string, key: string, secrets: readonly NamedSecret[] = []): string {
-  return redactSecrets(value, secrets, { providerKey: key })
+export function redactExactSecrets(value: string, key: string, secrets: SecretSource = []): string {
+  return redactSecrets(value, resolveSecretSource(secrets), { providerKey: key })
 }
 
+/**
+ * Copy-on-write recursive exact-secret scrubber over structured JSON payloads (H-8 / H-25).
+ * Replaces ONLY exact known secrets (and encoded variants) with ZERO heuristic regexes and ZERO
+ * header/key clobbering, returning the original object reference when unchanged.
+ */
+export function scrubExactSecretsValue(
+  value: unknown,
+  key: string,
+  secrets: SecretSource = [],
+): unknown {
+  const resolved = resolveSecretSource(secrets)
+  const walk = (node: unknown): unknown => {
+    if (typeof node === 'string') return redactSecrets(node, resolved, { providerKey: key })
+    if (Array.isArray(node)) {
+      let changed = false
+      const mapped = node.map(item => {
+        const next = walk(item)
+        if (next !== item) changed = true
+        return next
+      })
+      return changed ? mapped : node
+    }
+    if (!node || typeof node !== 'object') return node
+    const rec = node as Record<string, unknown>
+    let changed = false
+    const out: Record<string, unknown> = {}
+    for (const [k, v] of Object.entries(rec)) {
+      const nextK = redactSecrets(k, resolved, { providerKey: key })
+      const nextV = walk(v)
+      if (nextK !== k || nextV !== v) changed = true
+      out[nextK] = nextV
+    }
+    return changed ? out : node
+  }
+  return walk(value)
+}
+
+/**
+ * Sanitizes model tool-call argument values (`llm_tool_args` channel, H-25):
+ * - Exact-known-secret scrubbing ONLY (zero heuristic keyword regexes on code, scripts, tokens,
+ *   or auth probes).
+ * - Preserves `headers.Cookie` (and `reqHeaders`/`requestHeaders`/`upgradeHeaders`) so HTTP probe
+ *   tool calls can supply explicit probe cookies without clobbering, while still redacting any
+ *   exact registered vault/session/provider secrets inside them.
+ */
 function sanitizeToolArgumentValue(
   value: unknown,
   key: string,
   secrets: readonly NamedSecret[] = [],
+  inHeadersMap = false,
 ): unknown {
-  return createEgressSanitizer({ providerKey: key, secrets }).sanitizeValue(value, 'llm_tool_args')
+  if (typeof value === 'string') return redactSecrets(value, secrets, { providerKey: key })
+  if (Array.isArray(value)) return value.map(item => sanitizeToolArgumentValue(item, key, secrets, inHeadersMap))
+  if (!value || typeof value !== 'object') return value
+  const out: Record<string, unknown> = {}
+  for (const [fieldKey, item] of Object.entries(value as Record<string, unknown>)) {
+    const safeKey = redactSecrets(fieldKey, secrets, { providerKey: key })
+    if (!inHeadersMap && rawCookieField.test(fieldKey) && typeof item === 'string') {
+      out[safeKey] = replacement
+      continue
+    }
+    const childInHeaders = inHeadersMap || toolArgHeaderMapKeys.has(fieldKey)
+    out[safeKey] = sanitizeToolArgumentValue(item, key, secrets, childInHeaders)
+  }
+  return out
 }
 
 function redactArguments(value: string, key: string, secrets: readonly NamedSecret[]): string {
@@ -153,10 +220,11 @@ export function sanitizeProviderValue(
   value: unknown,
   key: string,
   prepared: Prepared = new WeakMap(),
-  secrets: readonly NamedSecret[] = [],
+  secrets: SecretSource = [],
 ): unknown {
-  if (typeof value === 'string') return redactProviderText(value, key, secrets)
-  if (Array.isArray(value)) return value.map(item => sanitizeProviderValue(item, key, prepared, secrets))
+  const resolved = resolveSecretSource(secrets)
+  if (typeof value === 'string') return redactProviderText(value, key, resolved)
+  if (Array.isArray(value)) return value.map(item => sanitizeProviderValue(item, key, prepared, resolved))
   const record = fields(value)
   if (!record) return value
   if (record.type === 'message' && Array.isArray(record.content)) {
@@ -165,28 +233,34 @@ export function sanitizeProviderValue(
       const text = fragment(part, part?.type === 'refusal' ? 'refusal' : 'text')
       return text ? [text] : []
     })
-    prepareFragments(parts, key, prepared, secrets)
+    prepareFragments(parts, key, prepared, resolved)
   }
   return Object.fromEntries(Object.entries(record).map(([name, item]) => {
-    const safeName = redactProviderText(name, key, secrets)
+    const safeName = redactProviderText(name, key, resolved)
     if (prepared.get(record)?.has(name)) return [safeName, item]
     if (credentialField.test(name)) return [safeName, replacement]
     if (
       name === 'arguments' && typeof item === 'string' &&
       (record.type === 'function_call' || record.type === 'response.function_call_arguments.done')
     ) {
-      return [safeName, redactArguments(item, key, secrets)]
+      return [safeName, redactArguments(item, key, resolved)]
     }
     if (
       name === 'input' && typeof item === 'string' &&
       (record.type === 'custom_tool_call' || record.type === 'response.custom_tool_call_input.done')
     ) {
-      return [safeName, redactExactSecrets(item, key, secrets)]
+      return [safeName, redactExactSecrets(item, key, resolved)]
+    }
+    if (
+      name === 'signature' && typeof item === 'string' &&
+      (record.type === 'thinking' || record.type === 'signature_delta')
+    ) {
+      return [safeName, redactExactSecrets(item, key, resolved)]
     }
     if (name === 'input' && record.type === 'tool_use') {
-      return [safeName, sanitizeToolArgumentValue(item, key, secrets)]
+      return [safeName, sanitizeToolArgumentValue(item, key, resolved)]
     }
-    return [safeName, sanitizeProviderValue(item, key, prepared, secrets)]
+    return [safeName, sanitizeProviderValue(item, key, prepared, resolved)]
   }))
 }
 
@@ -199,7 +273,7 @@ function prepareDeltas(frames: Frame[], key: string, secrets: readonly NamedSecr
     if (!group) {
       const mode: FragmentMode = (channel === 'arguments' || channel === 'partial_json')
         ? 'json_args'
-        : channel === 'input'
+        : (channel === 'input' || channel === 'signature')
           ? 'raw_args'
           : 'text'
       group = { mode, parts: [] }
@@ -256,21 +330,23 @@ function readFrame(text: string, protocol: ProviderSettings['protocol']): Frame 
   return { lines, data }
 }
 
-function isSecretList(value: readonly NamedSecret[] | StreamSanitizeOptions): value is readonly NamedSecret[] {
-  return Array.isArray(value)
+function isSecretSource(value: SecretSource | StreamSanitizeOptions): value is SecretSource {
+  return Array.isArray(value) || typeof value === 'function'
 }
 
 export function sanitizeProviderStream(
   body: ReadableStream<Uint8Array>,
   key: string,
   protocol: ProviderSettings['protocol'],
-  secretsOrOptions: readonly NamedSecret[] | StreamSanitizeOptions = [],
+  secretsOrOptions: SecretSource | StreamSanitizeOptions = [],
   responseLimitArg?: number,
 ): ReadableStream<Uint8Array> {
-  const secrets = isSecretList(secretsOrOptions) ? secretsOrOptions : (secretsOrOptions.secrets ?? [])
-  const onFirstChunk = isSecretList(secretsOrOptions) ? undefined : secretsOrOptions.onFirstChunk
-  const onActivity = isSecretList(secretsOrOptions) ? undefined : secretsOrOptions.onActivity
-  const requestedLimit = isSecretList(secretsOrOptions)
+  const secretSource: SecretSource = isSecretSource(secretsOrOptions)
+    ? secretsOrOptions
+    : (secretsOrOptions.secrets ?? [])
+  const onFirstChunk = isSecretSource(secretsOrOptions) ? undefined : secretsOrOptions.onFirstChunk
+  const onActivity = isSecretSource(secretsOrOptions) ? undefined : secretsOrOptions.onActivity
+  const requestedLimit = isSecretSource(secretsOrOptions)
     ? (responseLimitArg ?? defaultStreamResponseLimit)
     : (secretsOrOptions.responseLimit ?? responseLimitArg ?? defaultStreamResponseLimit)
   const responseLimit = Math.max(1024, Math.min(maxStreamResponseLimit, Math.floor(requestedLimit)))
@@ -286,6 +362,7 @@ export function sanitizeProviderStream(
   type Output = TransformStreamDefaultController<Uint8Array>
 
   function emit(controller: Output) {
+    const secrets = resolveSecretSource(secretSource)
     const prepared = prepareDeltas(frames, key, secrets)
     for (const frame of frames.splice(0)) {
       const first = frame.lines.findIndex(isData)
