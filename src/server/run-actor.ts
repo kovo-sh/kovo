@@ -13,6 +13,12 @@
  *  4. Per-run budget/telemetry/code-audit helpers extracted from `execution.ts`.
  */
 import { and, eq } from 'drizzle-orm'
+import {
+  ActiveClock,
+  pauseAssignmentClock,
+  registerRunClock,
+  resumeAssignmentClock,
+} from './active-clock.ts'
 import { defaultCodeAuditMaxTurns, wallClockSettlementMs } from './agent-session.ts'
 import {
   evaluateTier3Approval,
@@ -403,6 +409,9 @@ export class RunActor {
   readonly runId: string
   readonly context: RunContext
   readonly supervisor: TaskSupervisor
+  /** Pause-aware active clock for this run; automatically freezes while in `'paused'` state. */
+  readonly clock: ActiveClock
+  private readonly unregisterRunClock: () => void
   private currentState: RunActorState
   private readonly history: RunActorTransitionRecord[] = []
   private readonly maxHistory: number
@@ -415,6 +424,17 @@ export class RunActor {
     this.supervisor = new TaskSupervisor(options.context)
     this.currentState = options.initialState ?? 'queued'
     this.maxHistory = Math.max(8, options.maxHistory ?? DEFAULT_HISTORY_LIMIT)
+    this.clock = new ActiveClock()
+    if (this.currentState === 'paused') {
+      this.clock.pause('run_paused')
+    } else if (isTerminalRunActorState(this.currentState)) {
+      this.clock.pause('run_terminal')
+    }
+    this.unregisterRunClock = registerRunClock(this.runId, this.clock)
+  }
+
+  activeElapsedMs(): number {
+    return this.clock.activeElapsedMs()
   }
 
   get state(): RunActorState {
@@ -467,6 +487,14 @@ export class RunActor {
     }
     const from = this.currentState
     this.currentState = to
+    if (from !== 'paused' && to === 'paused') {
+      this.clock.pause('run_paused')
+    } else if (from === 'paused' && to !== 'paused') {
+      this.clock.resume('run_paused')
+    }
+    if (isTerminalRunActorState(to)) {
+      this.clock.pause('run_terminal')
+    }
     this.history.push({ from, to, reason, at: Date.now() })
     if (this.history.length > this.maxHistory) {
       this.history.shift()
@@ -586,6 +614,9 @@ export class RunActor {
     if (!this.isTerminal && canTransition(this.currentState, terminalState)) {
       this.transition(terminalState, reason)
     }
+
+    this.unregisterRunClock()
+    this.clock.dispose()
 
     return report
   }
@@ -2112,6 +2143,8 @@ export class RunTier3ApprovalCoordinator {
     }
     this.host.pendingTier3ApprovalKeys.add(approvalKey)
     this.activeWaiters.add(job.assignment.id)
+    // Move O4: pause the worker assignment's active wall-clock budget while parked on human approval.
+    pauseAssignmentClock(job.assignment.id, 'approval_wait')
 
     let decision: 'approved' | 'denied' | 'canceled' | 'expired'
     let postedApprovalId: string | undefined
@@ -2251,6 +2284,7 @@ export class RunTier3ApprovalCoordinator {
       this.terminateApprovalBlockedAssignment(run.id, job.assignment.id, decision)
       return { approved: false }
     } finally {
+      resumeAssignmentClock(job.assignment.id, 'approval_wait')
       this.activeWaiters.delete(job.assignment.id)
     }
   }
