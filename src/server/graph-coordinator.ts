@@ -1254,13 +1254,13 @@ function matchHopForPrimitive(primitive: ChainPrimitive, hops: readonly ChainHop
   }
 }
 
-interface CausalPlanUnit {
+export interface CausalPlanUnit {
   unitId: string
   capId: string
   capKind: CapabilityKind
   primitive: ChainPrimitive
   surface: CapabilitySurface
-  tenantScope: string
+  tenantScope: string | null
   actorPersona: string
   serviceOrigin: string
   hopReceiptId: string
@@ -1311,12 +1311,15 @@ function parseRouteTarget(rawRoute: unknown): { method?: string; endpoint?: stri
   return { endpoint: trimmed }
 }
 
-function ledgerNodeToUnit(node: CapabilityNode, fallbackOrigin: string): CausalPlanUnit {
+function ledgerNodeToUnit(node: CapabilityNode, fallbackOrigin: string | null): CausalPlanUnit | null {
   const meta = node.metadata ?? {}
   const parsedRoute = parseRouteTarget(meta.targetRoute)
   const endpoint = parsedRoute.endpoint ?? (typeof meta.endpoint === 'string' ? meta.endpoint : `/${node.surface}/${node.kind}`)
   const method = parsedRoute.method ?? (typeof meta.method === 'string' ? meta.method.toUpperCase() : 'POST')
   const origin = /^https?:\/\//i.test(node.serviceOrigin) ? node.serviceOrigin : fallbackOrigin
+  if (!origin) return null
+  const rawTenant = node.tenantScope?.trim() || null
+  const tenantScope = rawTenant && rawTenant !== 'unscoped_hypothesis' ? rawTenant : null
   const primitiveKind = capabilityKindToPrimitiveKind(node.kind)
   const hypothesisClass = typeof meta.hypothesisKind === 'string' && meta.hypothesisKind.trim()
     ? meta.hypothesisKind.trim()
@@ -1346,7 +1349,7 @@ function ledgerNodeToUnit(node: CapabilityNode, fallbackOrigin: string): CausalP
       detail,
     },
     surface: node.surface,
-    tenantScope: node.tenantScope,
+    tenantScope,
     actorPersona: node.actorPersona,
     serviceOrigin: node.serviceOrigin,
     hopReceiptId: node.parentHopReceiptIds[0] ?? `hop:${sanitizeUnitToken(node.capId)}`,
@@ -1376,7 +1379,7 @@ function primitiveToUnit(primitive: ChainPrimitive, hops: readonly ChainHop[], o
     capKind,
     primitive,
     surface,
-    tenantScope: 'default_tenant',
+    tenantScope: null,
     actorPersona: primitive.persona ?? 'attacker',
     serviceOrigin: primitive.origin,
     hopReceiptId: matched.hopId,
@@ -1390,14 +1393,18 @@ function primitiveToUnit(primitive: ChainPrimitive, hops: readonly ChainHop[], o
   }
 }
 
-function structuralTransitionFeasibility(
+export function structuralTransitionFeasibility(
   units: readonly CausalPlanUnit[],
   verifiedEdgeCount: number,
 ): { feasibilityProb: number; terminalImpactWeight: number; surfaceNovelty: number } {
   const capKinds = units.map(u => u.capKind)
   const distinctSurfaces = new Set(units.map(u => u.surface)).size
   const distinctOrigins = new Set(units.map(u => u.serviceOrigin)).size
-  const distinctTenants = new Set(units.map(u => u.tenantScope).filter(t => t && t !== 'unscoped_hypothesis')).size
+  const distinctTenants = new Set(
+    units
+      .map(u => u.tenantScope)
+      .filter((t): t is string => Boolean(t && t !== 'unscoped_hypothesis')),
+  ).size
   const hasAuthority = capKinds.some(k => AUTHORITY_CAP_KINDS.has(k))
   const hasPivot = capKinds.some(k => PIVOT_CAP_KINDS.has(k))
   const hasTarget = capKinds.some(k => TARGET_CAP_KINDS.has(k))
@@ -1457,7 +1464,7 @@ function buildCausalBranch(input: {
     kind: unit.capKind,
     surface: unit.surface,
     serviceOrigin: unit.serviceOrigin,
-    tenantScope: unit.tenantScope,
+    tenantScope: unit.tenantScope ?? '',
     actorPersona: unit.actorPersona,
     endpoint: unit.endpoint,
     method: unit.method,
@@ -1617,6 +1624,7 @@ function makeRuntimePlanUnit(input: {
   endpointId?: string
   resourceKey?: string
   persona?: string | null
+  tenantScope?: string | null
   detail: string
   sinkKinds?: readonly string[]
   unitTag: string
@@ -1645,7 +1653,7 @@ function makeRuntimePlanUnit(input: {
     capKind,
     primitive,
     surface,
-    tenantScope: 'default_tenant',
+    tenantScope: input.tenantScope?.trim() || null,
     actorPersona: input.persona ?? 'attacker',
     serviceOrigin: input.origin,
     hopReceiptId: `hop:${sanitizeUnitToken(input.unitTag)}:${input.ordinal}`,
@@ -1666,7 +1674,7 @@ function resolveDependencySide(
   explicitMethod: string | undefined,
   endpointsById: ReadonlyMap<string, CoordinatorEndpoint>,
   endpointsByMethodPath: ReadonlyMap<string, CoordinatorEndpoint>,
-  fallbackOrigin: string,
+  fallbackOrigin: string | null,
 ): { origin: string; method: string; endpoint: string; endpointId?: string; sinkKinds?: readonly string[] } | null {
   if (endpointId) {
     const found = endpointsById.get(endpointId)
@@ -1687,8 +1695,10 @@ function resolveDependencySide(
   const method = (explicitMethod ?? parsed.method ?? 'GET').toUpperCase()
   const matched = endpointsByMethodPath.get(`${method} ${rawEndpoint}`)
     ?? endpointsByMethodPath.get(`* ${rawEndpoint}`)
+  const origin = explicitOrigin ?? matched?.origin ?? fallbackOrigin
+  if (!origin) return null
   return {
-    origin: explicitOrigin ?? matched?.origin ?? fallbackOrigin,
+    origin,
     method,
     endpoint: rawEndpoint,
     ...(matched?.id ? { endpointId: matched.id } : {}),
@@ -1743,13 +1753,14 @@ export function planChainRound(args: PlanChainRoundArgs): ChainHypothesis[] {
       || (a.origin < b.origin ? -1 : a.origin > b.origin ? 1 : 0)
       || (a.value < b.value ? -1 : a.value > b.value ? 1 : 0))
 
-  const fallbackOrigin = args.approvedOrigins?.[0] ?? filteredPrimitives[0]?.origin ?? endpoints[0]?.origin ?? 'https://target.local'
+  const fallbackOrigin = args.approvedOrigins?.[0] ?? filteredPrimitives[0]?.origin ?? endpoints[0]?.origin ?? null
   const primitiveUnits = filteredPrimitives.map((primitive, idx) => primitiveToUnit(primitive, hops, idx))
 
   const ledgerNodes = ledger ? ledger.listCapabilities() : []
   const ledgerUnitsByCapId = new Map<string, CausalPlanUnit>()
   for (const node of ledgerNodes) {
     const unit = ledgerNodeToUnit(node, fallbackOrigin)
+    if (!unit) continue
     if (approved && /^https?:\/\//i.test(node.serviceOrigin) && !approved.has(node.serviceOrigin)) continue
     ledgerUnitsByCapId.set(node.capId, unit)
   }

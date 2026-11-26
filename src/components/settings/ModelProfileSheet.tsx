@@ -227,10 +227,10 @@ export function ModelProfileSheet({
                   </div>
                   <div className="flex flex-col gap-[3px]">
                     <strong className="text-[13px] font-semibold leading-[18px] text-fg">
-                      Default · OpenRouter
+                      Default provider
                     </strong>
                     <span className="text-[11.5px] leading-4 text-fg-muted">
-                      DeepSeek V4.1 Flash via OpenRouter — fast, high-recall default
+                      e.g. Primary Analyst (OpenRouter / Anthropic / OpenAI) — fast, high-recall default
                     </span>
                   </div>
                 </button>
