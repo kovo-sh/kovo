@@ -2535,18 +2535,13 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
         })
       }
       this.storage.upsertChainFinding(run, asset.id, finding, specRow.id, specRow.sourceOrigins)
-    } else if (existing) {
-      this.storage.db.update(findings).set({
-        verificationTier: 'runtime_confirmed',
-        verificationClass: 'runtime_confirmed',
-        finding,
-      }).where(and(eq(findings.runId, run.id), eq(findings.id, findingId))).run()
     } else {
-      this.storage.db.insert(findings).values({
-        id: findingId,
+      this.storage.upsertFindingRecord({
         runId: run.id,
         assetId: asset.id,
         goalRevision: run.goalRevision,
+        findingId,
+        existingId: existing?.id ?? null,
         checkId: 'chain',
         caseId: findingId,
         findingKind: 'multi_step_chain',
@@ -2556,7 +2551,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
         provenance: 'agent_only',
         verificationClass: 'runtime_confirmed',
         finding,
-      }).run()
+      })
     }
     try {
       this.storage.upsertCoverageEntry(run, assignment.id, {
@@ -4156,29 +4151,22 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       provenance: 'agent_only',
       verificationStatus: verificationClass,
     } as typeof record
-    if (existingId) {
-      this.storage.db.update(findings).set({
-        verificationTier: confirmed ? 'baseline_confirmed' : null,
-        verificationClass,
-        finding: persistedRecord,
-      }).where(eq(findings.id, record.id)).run()
-    } else {
-      this.storage.db.insert(findings).values({
-        id: record.id,
-        runId: run.id,
-        assetId: asset.id,
-        goalRevision: run.goalRevision,
-        checkId: rule.id,
-        caseId: coverage.caseId ?? '',
-        findingKind: 'baseline_check',
-        replaySpecId: null,
-        sourceOrigins: [asset.origin],
-        verificationTier: confirmed ? 'baseline_confirmed' : null,
-        provenance: 'agent_only',
-        verificationClass,
-        finding: persistedRecord,
-      }).run()
-    }
+    this.storage.upsertFindingRecord({
+      runId: run.id,
+      assetId: asset.id,
+      goalRevision: run.goalRevision,
+      findingId: record.id,
+      existingId: existingId ?? null,
+      checkId: rule.id,
+      caseId: coverage.caseId ?? '',
+      findingKind: 'baseline_check',
+      replaySpecId: null,
+      sourceOrigins: [asset.origin],
+      verificationTier: confirmed ? 'baseline_confirmed' : null,
+      provenance: 'agent_only',
+      verificationClass,
+      finding: persistedRecord,
+    })
   }
 
 }

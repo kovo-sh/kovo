@@ -7,6 +7,8 @@ import { DatabaseSync } from 'node:sqlite'
 import test from 'node:test'
 import { getTableConfig, type SQLiteTable } from 'drizzle-orm/sqlite-core'
 import { newRun } from '../src/domain.ts'
+import { purgeExpiredArtifacts } from '../src/server/artifact-ttl.ts'
+import { CITING_COLUMNS, validateCitingColumnsAgainstTables } from '../src/server/evidence-citations.ts'
 import { createProjectPersona } from '../src/server/persona-vault.ts'
 import * as schema from '../src/server/schema.ts'
 import { Store } from '../src/server/store.ts'
@@ -523,28 +525,84 @@ function getSchemaTables(): Array<{ exportName: string; config: ReturnType<typeo
   return results
 }
 
-test('schema authority: zero DDL drift across all 41 schema.ts tables, FKs, ON DELETE CASCADE, indexes, and append-only tenant_audit_log', withTempStore(({ store }) => {
+function normalizeDrizzleDefault(col: ReturnType<typeof getTableConfig>['columns'][number]): string | null {
+  if (!col.hasDefault || col.default === undefined) return null
+  if (typeof col.default === 'boolean') return col.default ? '1' : '0'
+  if (typeof col.default === 'object') return JSON.stringify(col.default)
+  return String(col.default)
+}
+
+function normalizeSqliteDefault(raw: string | null): string | null {
+  if (raw === null) return null
+  const trimmed = raw.trim()
+  if (trimmed.length >= 2 && trimmed.startsWith("'") && trimmed.endsWith("'")) {
+    return trimmed.slice(1, -1).replace(/''/g, "'")
+  }
+  return trimmed
+}
+
+test('schema authority: zero DDL drift across all schema.ts tables, columns, defaults, NOT NULL, FKs, ON DELETE CASCADE, indexes, and append-only tenant_audit_log', withTempStore(({ store }) => {
   // PRAGMA foreign_keys = ON must be enabled on every Store DB connection
   const fkPragma = store.client.prepare('PRAGMA foreign_keys').get() as { foreign_keys: number }
   assert.equal(Number(fkPragma.foreign_keys), 1, 'PRAGMA foreign_keys must be ON')
 
   const schemaTables = getSchemaTables()
-  assert.equal(schemaTables.length, 41, 'Expected 40 core/feature tables + tenant_audit_log in schema.ts')
+  assert.ok(schemaTables.length > 0, 'Expected Drizzle schema tables to be exported by schema.ts')
+
+  // Derive expected table set from Drizzle config and confirm exact parity with non-virtual, non-ledger SQLite tables.
+  const drizzleTableNames = schemaTables.map(t => t.config.name).sort()
+  const sqliteManagedTables = (store.client.prepare(
+    `SELECT name FROM sqlite_master
+     WHERE type = 'table'
+       AND name NOT LIKE 'sqlite_%'
+       AND name NOT LIKE 'broker_exchanges_fts%'
+       AND name NOT LIKE 'capability_%'
+     ORDER BY name`,
+  ).all() as Array<{ name: string }>).map(r => r.name)
+  assert.deepEqual(
+    sqliteManagedTables,
+    drizzleTableNames,
+    'Managed SQLite tables must match Drizzle schema.ts exports with zero extra or missing tables',
+  )
 
   const cascadeParents = new Set(['projects', 'runs', 'assignments', 'replay_specs', 'endpoints'])
+  let expectedCascadeFkCount = 0
   let cascadeFkCount = 0
 
   for (const { config } of schemaTables) {
-    // 1. Table exists with exact column parity (zero missing or extra columns)
-    const sqliteCols = (store.client.prepare(`PRAGMA table_info(${config.name})`).all() as Array<{ name: string }>)
-      .map(r => r.name)
-      .sort()
+    // 1. Table exists with exact column name, NOT NULL, and default parity
+    const sqliteInfo = store.client.prepare(`PRAGMA table_info(${config.name})`).all() as Array<{
+      name: string
+      notnull: number
+      dflt_value: string | null
+      pk: number
+    }>
+    const sqliteCols = sqliteInfo.map(r => r.name).sort()
     const drizzleCols = config.columns.map(c => c.name).sort()
     assert.deepEqual(
       sqliteCols,
       drizzleCols,
       `Column drift detected for table "${config.name}"`,
     )
+    const sqliteByName = new Map(sqliteInfo.map(r => [r.name, r]))
+    for (const col of config.columns) {
+      const sq = sqliteByName.get(col.name)
+      assert.ok(sq, `Missing SQLite column "${config.name}.${col.name}"`)
+      const expectedNotNull = Boolean(col.notNull || col.primary)
+      const actualNotNull = Boolean(sq.notnull || sq.pk)
+      assert.equal(
+        actualNotNull,
+        expectedNotNull,
+        `NOT NULL drift on "${config.name}.${col.name}" (expected ${expectedNotNull}, got ${actualNotNull})`,
+      )
+      const expectedDefault = normalizeDrizzleDefault(col)
+      const actualDefault = normalizeSqliteDefault(sq.dflt_value)
+      assert.equal(
+        actualDefault,
+        expectedDefault,
+        `DEFAULT drift on "${config.name}.${col.name}" (expected ${JSON.stringify(expectedDefault)}, got ${JSON.stringify(actualDefault)})`,
+      )
+    }
 
     // 2. Foreign key parity + ON DELETE CASCADE enforcement
     const sqliteFks = (store.client.prepare(`PRAGMA foreign_key_list(${config.name})`).all() as Array<{
@@ -576,6 +634,9 @@ test('schema authority: zero DDL drift across all 41 schema.ts tables, FKs, ON D
       `Foreign key / ON DELETE drift detected for table "${config.name}"`,
     )
 
+    for (const fk of drizzleFks) {
+      if (cascadeParents.has(fk.table)) expectedCascadeFkCount += 1
+    }
     for (const fk of sqliteFks) {
       if (cascadeParents.has(fk.table)) {
         assert.equal(
@@ -615,7 +676,15 @@ test('schema authority: zero DDL drift across all 41 schema.ts tables, FKs, ON D
     }
   }
 
-  assert.equal(cascadeFkCount, 46, 'Expected all 46 child foreign keys to enforce ON DELETE CASCADE')
+  assert.equal(cascadeFkCount, expectedCascadeFkCount, 'Every child FK pointing to a cascade parent must enforce ON DELETE CASCADE')
+  assert.ok(cascadeFkCount > 0)
+
+  // Shared evidence-citations registry must match schema.ts with zero drift.
+  assert.deepEqual(
+    validateCitingColumnsAgainstTables(schemaTables.map(t => t.config)),
+    [],
+    'evidence-citations.ts CITING_COLUMNS must match every citing column in schema.ts',
+  )
 
   // CRITICAL SAFETY INVARIANT: tenant_audit_log has NO FK, NO ON DELETE CASCADE, and append-only triggers
   const auditFks = store.client.prepare('PRAGMA foreign_key_list(tenant_audit_log)').all()
@@ -628,6 +697,10 @@ test('schema authority: zero DDL drift across all 41 schema.ts tables, FKs, ON D
   assert.ok(triggers.has('tenant_audit_log_no_delete'))
   assert.ok(triggers.has('runs_after_delete_capability_ledger'))
   assert.ok(triggers.has('runs_after_delete_fts'))
+  assert.ok(triggers.has('findings_confirmation_evidence_insert'))
+  assert.ok(triggers.has('findings_confirmation_evidence_update'))
+  assert.ok(triggers.has('findings_sync_promoted_insert'))
+  assert.ok(triggers.has('findings_sync_promoted_update'))
 }))
 
 test('raw SQL DELETE FROM runs cascades every child table while preserving sibling runs, workspace events, and tenant_audit_log', withTempStore(({ dir, store }) => {
@@ -1014,3 +1087,279 @@ test('Store.deleteRun and Store.deleteProject stay 100% backward-compatible on l
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+test('R2-12 Store.verifySchema fails closed on injected drift and self-repairs known v10 user-dir drift', () => {
+  // 1. Injected unexpected column causes Store open to fail closed
+  const dirUnexpected = mkdtempSync(join(tmpdir(), 'kovo-r212-drift-extra-'))
+  try {
+    const initial = new Store(dirUnexpected, { ftsMode: 'off' })
+    initial.close()
+    const raw = new DatabaseSync(join(dirUnexpected, 'kovo.sqlite'))
+    raw.exec('ALTER TABLE runs ADD COLUMN rogue_drift_col TEXT;')
+    raw.close()
+    assert.throws(
+      () => new Store(dirUnexpected, { ftsMode: 'off' }),
+      /Schema verification failed.*unexpected column "runs\.rogue_drift_col"/,
+    )
+  } finally {
+    rmSync(dirUnexpected, { recursive: true, force: true })
+  }
+
+  // 2. Dropped non-repairable column causes Store open to fail closed
+  const dirMissing = mkdtempSync(join(tmpdir(), 'kovo-r212-drift-missing-'))
+  try {
+    const initial = new Store(dirMissing, { ftsMode: 'off' })
+    initial.close()
+    const raw = new DatabaseSync(join(dirMissing, 'kovo.sqlite'))
+    raw.exec('ALTER TABLE findings DROP COLUMN counterevidence;')
+    raw.close()
+    assert.throws(
+      () => new Store(dirMissing, { ftsMode: 'off' }),
+      /Schema verification failed.*missing column "findings\.counterevidence"/,
+    )
+  } finally {
+    rmSync(dirMissing, { recursive: true, force: true })
+  }
+
+  // 3. Existing user DB with historical v10 drift (missing operations.created_at) + lazy runs columns self-repairs cleanly
+  const dirRepair = mkdtempSync(join(tmpdir(), 'kovo-r212-drift-repair-'))
+  try {
+    const initial = new Store(dirRepair, { ftsMode: 'off' })
+    initial.close()
+    const raw = new DatabaseSync(join(dirRepair, 'kovo.sqlite'))
+    raw.exec('DROP INDEX IF EXISTS operations_created;')
+    raw.exec('ALTER TABLE operations DROP COLUMN created_at;')
+    raw.exec("ALTER TABLE runs ADD COLUMN declined_origins TEXT NOT NULL DEFAULT '[]';")
+    raw.exec('ALTER TABLE runs ADD COLUMN label TEXT;')
+    raw.close()
+    const repaired = new Store(dirRepair, { ftsMode: 'off' })
+    try {
+      repaired.verifySchema()
+      const opsCols = (repaired.client.prepare('PRAGMA table_info(operations)').all() as Array<{ name: string }>).map(c => c.name)
+      assert.ok(opsCols.includes('created_at'), 'repair migration must restore operations.created_at')
+    } finally {
+      repaired.close()
+    }
+  } finally {
+    rmSync(dirRepair, { recursive: true, force: true })
+  }
+
+  // 4. Schema-walk check catches an unregistered synthetic citing column
+  const syntheticDrift = validateCitingColumnsAgainstTables([
+    ...getSchemaTables().map(t => t.config),
+    { name: 'synthetic_table', columns: [{ name: 'id' }, { name: 'new_artifact_id' }] },
+  ])
+  assert.ok(
+    syntheticDrift.some(v => v.includes('synthetic_table.new_artifact_id')),
+    `Expected unregistered citing column to be flagged, got: ${syntheticDrift.join('; ')}`,
+  )
+  assert.ok(CITING_COLUMNS.some(c => c.table === 'sast_runs' && c.column === 'raw_artifact_id'))
+  assert.ok(CITING_COLUMNS.some(c => c.table === 'messages' && c.column === 'evidence_ids'))
+  assert.ok(CITING_COLUMNS.some(c => c.table === 'lab_telemetry' && c.column === 'artifact_id'))
+})
+
+test('R2-12 fail-closed decoders: corrupt declined_origins throws & blocks admission, and artifact-ttl aborts on protection error while protecting sast_runs/messages/lab_telemetry', withTempStore(({ dir, store }) => {
+  const project = store.createProject({
+    requestId: randomUUID(),
+    name: 'Fail-Closed Safety Target',
+    seeds: ['https://safety.example.com'],
+    environment: 'public',
+    includeSubdomains: true,
+  })
+  const createdRun = store.createRun(newRun.parse({
+    requestId: randomUUID(),
+    projectId: project.id,
+    goal: 'Verify fail-closed decoders and evidence protection',
+    capabilityTier: 2,
+  }))
+  const run = store.run(createdRun.id)
+  const origin = 'https://safety.example.com'
+
+  // 1. Store.hasExplicitEnvironmentMode public hook (R2-01 completion)
+  assert.equal(store.hasExplicitEnvironmentMode(run.id), false)
+  store.setEnvironmentMode(store.run(run.id), 'staging_isolated')
+  assert.equal(store.hasExplicitEnvironmentMode(run.id), true)
+
+  // 2. getDeclinedOrigins / isOriginDeclined / admitDynamicOrigin fail closed on corrupt JSON
+  store.runsRepo.setOriginRole(store.run(run.id), 'https://declined.safety.example.com', 'asset')
+  assert.equal(store.runsRepo.isOriginDeclined(run.id, 'https://declined.safety.example.com'), true)
+
+  store.client.prepare('UPDATE runs SET declined_origins = ? WHERE id = ?').run('{corrupt-json', run.id)
+  assert.throws(
+    () => store.runsRepo.getDeclinedOrigins(run.id),
+    /Corrupt runs\.declined_origins JSON/,
+  )
+  assert.throws(
+    () => store.runsRepo.isOriginDeclined(run.id, 'https://declined.safety.example.com'),
+    /Corrupt runs\.declined_origins JSON/,
+  )
+  assert.throws(
+    () => store.runsRepo.admitDynamicOrigin({
+      runId: run.id,
+      origin: 'https://declined.safety.example.com',
+      source: 'test',
+    }),
+    /Corrupt runs\.declined_origins JSON/,
+  )
+  // Restore valid declined_origins JSON before continuing
+  store.client.prepare('UPDATE runs SET declined_origins = ? WHERE id = ?').run('[]', run.id)
+
+  // 3. artifact-ttl protects sast_runs.raw_artifact_id, messages.evidence_ids, lab_telemetry.artifact_id
+  const oldTs = Date.now() - 10 * 24 * 60 * 60_000
+  const assignmentId = randomUUID()
+  store.db.insert(schema.assignments).values({
+    id: assignmentId,
+    runId: run.id,
+    phase: 'investigation',
+    status: 'complete',
+    scopeRevision: 1,
+    goalRevision: 1,
+    sessionId: `sess-${randomUUID()}`,
+    parentFactIds: [],
+    sourceOrigins: [origin],
+    title: 'TTL check',
+    objective: 'Seed evidence',
+    createdAt: oldTs,
+  }).run()
+
+  const sastEvId = `ev-sast-${randomUUID()}`
+  const msgEvId = `ev-msg-${randomUUID()}`
+  const telEvId = `ev-tel-${randomUUID()}`
+  const orphanEvId = `ev-orphan-${randomUUID()}`
+  for (const id of [sastEvId, msgEvId, telEvId, orphanEvId]) {
+    store.db.insert(schema.evidence).values({
+      id,
+      runId: run.id,
+      assignmentId,
+      scopeRevision: 1,
+      goalRevision: 1,
+      title: `Evidence ${id}`,
+      kind: 'exchange',
+      createdAt: oldTs,
+    }).run()
+  }
+  store.db.insert(schema.sastRuns).values({
+    id: randomUUID(),
+    runId: run.id,
+    assignmentId,
+    repo: 'acme/app',
+    engine: 'semgrep',
+    rawArtifactId: sastEvId,
+    createdAt: oldTs,
+  }).run()
+  const msgId = randomUUID()
+  store.db.insert(schema.messages).values({
+    id: msgId,
+    runId: run.id,
+    threadId: run.id,
+    role: 'coordinator',
+    content: 'Cited evidence',
+    evidenceIds: [msgEvId],
+    createdAt: oldTs,
+  }).run()
+  store.db.insert(schema.labTelemetry).values({
+    id: randomUUID(),
+    runId: run.id,
+    exchangeId: randomUUID(),
+    traceId: `tr-${randomUUID()}`,
+    artifactId: telEvId,
+    createdAt: oldTs,
+  }).run()
+  store.client.prepare("UPDATE runs SET status = 'complete' WHERE id = ?").run(run.id)
+
+  // 4. Corrupt JSON in a citing column MUST abort the entire TTL prune with ZERO deletions!
+  store.client.prepare('UPDATE messages SET evidence_ids = ? WHERE id = ?').run('{not-valid-json', msgId)
+  assert.throws(
+    () => purgeExpiredArtifacts(store, { runId: run.id, artifactTtlMs: 1_000, now: Date.now() }),
+    /Evidence protection aborted: corrupt JSON in messages\.evidence_ids/,
+  )
+  const remainingAfterAbort = (store.client.prepare('SELECT id FROM evidence WHERE run_id = ?').all(run.id) as Array<{ id: string }>)
+    .map(r => r.id)
+    .sort()
+  assert.deepEqual(
+    remainingAfterAbort,
+    [msgEvId, orphanEvId, sastEvId, telEvId].sort(),
+    'Aborted TTL prune must delete ZERO evidence rows',
+  )
+
+  // Fix messages.evidence_ids -> prune deletes ONLY the unreferenced orphan while protecting all 3 cited rows
+  store.client.prepare('UPDATE messages SET evidence_ids = ? WHERE id = ?').run(JSON.stringify([msgEvId]), msgId)
+  const purged = purgeExpiredArtifacts(store, { runId: run.id, artifactTtlMs: 1_000, now: Date.now() })
+  assert.equal(purged.artifactsDeleted, 1)
+  const remainingAfterPurge = (store.client.prepare('SELECT id FROM evidence WHERE run_id = ?').all(run.id) as Array<{ id: string }>)
+    .map(r => r.id)
+    .sort()
+  assert.deepEqual(
+    remainingAfterPurge,
+    [msgEvId, sastEvId, telEvId].sort(),
+    'TTL prune must preserve evidence cited by sast_runs.raw_artifact_id, messages.evidence_ids, and lab_telemetry.artifact_id',
+  )
+
+  // 5. Store.upsertFindingRecord enforces explicit run_id predicate (cross-run UPDATE cannot clobber sibling run)
+  const createdSiblingRun = store.createRun(newRun.parse({
+    requestId: randomUUID(),
+    projectId: project.id,
+    goal: 'Sibling run isolation check',
+    capabilityTier: 1,
+  }))
+  const siblingRun = store.run(createdSiblingRun.id)
+  const baselineId = randomUUID()
+  store.upsertFindingRecord({
+    runId: run.id,
+    assetId: origin,
+    goalRevision: run.goalRevision,
+    findingId: baselineId,
+    checkId: 'hsts',
+    caseId: 'hsts-1',
+    findingKind: 'baseline_check',
+    sourceOrigins: [origin],
+    verificationTier: 'baseline_confirmed',
+    verificationClass: 'runtime_confirmed',
+    finding: {
+      id: baselineId,
+      origin,
+      title: 'Original baseline title',
+      status: 'confirmed',
+      severity: 'low',
+      reason: 'Missing HSTS',
+      remediation: 'Enable HSTS',
+      evidenceIds: [],
+      scopeRevision: run.scopeRevision,
+      findingKind: 'baseline_check',
+      verificationTier: 'baseline_confirmed',
+    },
+  })
+  store.upsertFindingRecord({
+    runId: siblingRun.id,
+    assetId: origin,
+    goalRevision: siblingRun.goalRevision,
+    findingId: baselineId,
+    existingId: baselineId,
+    checkId: 'hsts',
+    caseId: 'hsts-1',
+    findingKind: 'baseline_check',
+    sourceOrigins: [origin],
+    verificationTier: 'baseline_confirmed',
+    verificationClass: 'runtime_confirmed',
+    finding: {
+      id: baselineId,
+      origin,
+      title: 'Cross-run clobber attempt',
+      status: 'confirmed',
+      severity: 'critical',
+      reason: 'Should not modify run 1',
+      remediation: 'None',
+      evidenceIds: [],
+      scopeRevision: siblingRun.scopeRevision,
+      findingKind: 'baseline_check',
+      verificationTier: 'baseline_confirmed',
+    },
+  })
+  const preserved = store.client.prepare('SELECT finding, severity FROM findings WHERE run_id = ? AND id = ?').get(run.id, baselineId) as {
+    finding: string
+    severity: string
+  }
+  assert.equal(JSON.parse(preserved.finding).title, 'Original baseline title')
+  assert.equal(preserved.severity, 'low')
+  void dir
+}))

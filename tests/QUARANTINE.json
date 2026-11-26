@@ -1,6 +1,6 @@
 {
   "version": 2,
-  "maxQuarantinedCases": 198,
+  "maxQuarantinedCases": 197,
   "entries": [
     {
       "file": "tests/arch-a1-engine.test.ts",
@@ -9,14 +9,6 @@
       "ownerStream": "arch-triage",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
-    },
-    {
-      "file": "tests/arch-b3-cascade.test.ts",
-      "testName": "schema authority: zero DDL drift across all 41 schema.ts tables, FKs, ON DELETE CASCADE, indexes, and append-only tenant_audit_log",
-      "assertionLocation": "tests/arch-b3-cascade.test.ts:526:1",
-      "ownerStream": "r2-12-schema-auth",
-      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-10"
     },
     {
       "file": "tests/arch-c1-verify-kernel.test.ts",
