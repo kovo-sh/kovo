@@ -153,7 +153,7 @@ export const QSEC: [QueueSection, string, string][] = [
   ['done', 'Done', 'Server-side decisions and approval audit log'],
 ]
 
-function buildQueue(d: Detail, _findings: readonly FindingRow[], risk: Map<string, ThreatEntry>, _evidenceById: Map<string, Evidence>): QueueBase {
+function buildQueue(d: Detail, _findings: readonly FindingRow[], risk: Map<string, ThreatEntry>, _evidenceById: Map<string, Evidence>, now = Date.now()): QueueBase {
   const run = d.run
   const riskRank = (o: string) => ({ critical: 0, high: 1, medium: 2, low: 3 } as Record<string, number>)[risk.get(o)?.riskTier ?? ''] ?? 4
   const base: QueueBase = { decide: [], review: [], follow: [], done: [] }
@@ -162,7 +162,7 @@ function buildQueue(d: Detail, _findings: readonly FindingRow[], risk: Map<strin
   }
   for (const a of d.approvals.slice().sort((x, y) => x.createdAt - y.createdAt)) {
     const it: QueueItem = { key: 'ap:' + a.id, kind: 'approval', ap: a, title: a.method + ' ' + host(a.origin) + a.pathAndQuery, t: a.createdAt }
-    ;(a.status === 'pending' ? base.decide : base.done).push(it)
+    ;(a.status === 'pending' && !isApprovalExpired(a, now) ? base.decide : base.done).push(it)
   }
   // Follow-ups send a real `inject_hint` command only while the run can still plan.
   const canScheduleFollowUp = run.phase !== 'complete' && !['complete', 'stopped', 'failed'].includes(run.status)
@@ -431,7 +431,7 @@ export function computeRunEnd(d: Detail): number {
   return times.length ? Math.max(...times) : d.run.createdAt
 }
 
-export function buildRunModel(d: Detail): RunModel {
+export function buildRunModel(d: Detail, now = Date.now()): RunModel {
   const allFindings = d.findings
   const findings = allFindings.filter(f => !f.supersededByFindingId)
   const findingById = new Map(allFindings.map(f => [f.id, f]))
@@ -479,7 +479,7 @@ export function buildRunModel(d: Detail): RunModel {
   const scopeFromCandidates = d.run.candidates.filter(c => approved.has(c.id)).map(c => c.origin)
   const scopeOrigins = scopeFromCandidates.length ? scopeFromCandidates : d.project.seeds
 
-  const queue = buildQueue(d, findings, risk, evidenceById)
+  const queue = buildQueue(d, findings, risk, evidenceById, now)
   const queueItem = new Map<string, QueueItem>()
   for (const list of Object.values(queue)) for (const it of list) queueItem.set(it.key, it)
 

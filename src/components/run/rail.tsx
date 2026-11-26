@@ -106,6 +106,32 @@ const railItemOn =
 const sectionHeadingClass =
   'flex items-center justify-between px-2.5 pb-1 pt-2.5 text-[11.5px] font-medium tracking-[0.01em] text-fg-subtle'
 
+export function QueueRailBadge({
+  activeDecideCount,
+  activePendingApprovalsCount = activeDecideCount,
+  pulse = false,
+}: {
+  activeDecideCount: number
+  activePendingApprovalsCount?: number
+  pulse?: boolean
+}) {
+  if (activeDecideCount <= 0) return null
+  const title = activePendingApprovalsCount > 0
+    ? `${activeDecideCount} waiting for approval`
+    : `${activeDecideCount} to decide`
+  return <span
+    className={cn(
+      'num inline-block h-[17px] min-w-[18px] rounded-[9px] px-[5px] text-center text-[11px] font-semibold leading-[17px] transition-transform duration-300',
+      'bg-accent text-accent-fg',
+      pulse && 'scale-115',
+    )}
+    title={title}
+    data-testid="rail-queue-badge"
+  >
+    {activeDecideCount}
+  </span>
+}
+
 export function Rail() {
   const { detail, model, counts, runs } = useRun()
   const nav = useNav()
@@ -114,7 +140,7 @@ export function Rail() {
   const { theme, toggle } = useTheme()
   const [devicesOpen, setDevicesOpen] = useState(false)
   const [telemetryOpen, setTelemetryOpen] = useState(false)
-  const pulse = usePulse(detail.run.id + ':' + q.openCount)
+  const pulse = usePulse(detail.run.id + ':' + q.activeDecideCount)
   const prevViewRef = useRef<ViewId>(nav.view)
 
   const investigationViews = useMemo(() => VIEWS.filter(v => v.group === 'investigation'), [])
@@ -163,20 +189,11 @@ export function Rail() {
       <Icon name={v.icon} className={cn('transition-colors duration-[var(--d1)]', active ? 'text-accent' : 'text-fg-subtle group-hover/ri:text-fg-muted')} />
       <span className="min-w-0 flex-1 truncate">{v.label}</span>
       {v.id === 'queue'
-        ? (q.openCount > 0 && (
-          <span
-            className={cn(
-              'num inline-block h-[17px] min-w-[18px] rounded-[9px] px-[5px] text-center text-[11px] font-semibold leading-[17px] transition-transform duration-300',
-              q.decideCount
-                ? 'bg-warn-soft text-warn shadow-[inset_0_0_0_1px_var(--warn-line)]'
-                : 'bg-press text-fg-muted',
-              pulse && 'scale-115',
-            )}
-            title={`${q.decideCount} to decide · ${q.openCount} open`}
-          >
-            {q.openCount}
-          </span>
-        ))
+        ? <QueueRailBadge
+            activeDecideCount={q.activeDecideCount}
+            activePendingApprovalsCount={q.activePendingApprovals.length}
+            pulse={pulse}
+          />
         : (cnt[v.id] ? <span className="num text-[12px] text-fg-subtle">{cnt[v.id]}</span> : null)}
     </button>
   }
