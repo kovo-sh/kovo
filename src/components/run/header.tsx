@@ -7,7 +7,13 @@ import { Link, useNavigate, useRouter } from '@tanstack/react-router'
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import type { FormEvent, ReactNode, RefObject } from 'react'
 import { downloadReportMarkdown, exportSarifAction, removeRun } from '../../actions.ts'
-import { approvalPolicies, maxBudgetRequests, maxRpsPerOriginCeiling } from '../../domain.ts'
+import {
+  approvalPolicies,
+  isHostNonDestructiveLease,
+  isPrefixApprovalPattern,
+  maxBudgetRequests,
+  maxRpsPerOriginCeiling,
+} from '../../domain.ts'
 import type { ApprovalPolicy } from '../../domain.ts'
 import { approvalPolicyMeta, capabilityTierMeta } from '../run-state.ts'
 import { Dialog, DialogContent, DialogTitle } from '../ui/dialog.tsx'
@@ -96,6 +102,20 @@ function download(content: string, filename: string, type: string) {
   setTimeout(() => URL.revokeObjectURL(url), 1000)
 }
 
+function deriveActiveLeaseGrants(detail: ReturnType<typeof useRun>['detail']) {
+  const r = detail.run
+  const activeLeases = detail.approvalLeases ?? []
+  const activePatterns = (detail.approvedEndpointPatterns ?? r.approvedEndpointPatterns ?? []).filter(
+    p => p.scopeRevision === undefined || p.scopeRevision === r.scopeRevision,
+  )
+  const unmatchedPatterns = activePatterns.filter(
+    p => !activeLeases.some(
+      l => l.origin === p.origin && l.method.toUpperCase() === p.method.toUpperCase() && l.routePattern === p.pathPattern,
+    ),
+  )
+  return { activeLeases, unmatchedPatterns, totalGrants: activeLeases.length + unmatchedPatterns.length }
+}
+
 const rlItemClass =
   'mr-3 inline-flex h-3.5 flex-none items-center gap-1.5 whitespace-nowrap border-r border-line pr-3 last:border-r-0 data-[lastv=true]:border-r-0'
 const rlBtnClass =
@@ -130,16 +150,7 @@ export function RunHeader() {
   const bPct = r.budgetUsd ? r.spentUsd / r.budgetUsd : 0
   const rPct = r.budgetRequests ? r.spentRequests / r.budgetRequests : 0
   const scopeN = model.scopeOrigins.length
-  const activeLeases = detail.approvalLeases ?? []
-  const activePatterns = (detail.approvedEndpointPatterns ?? r.approvedEndpointPatterns ?? []).filter(
-    p => p.scopeRevision === undefined || p.scopeRevision === r.scopeRevision,
-  )
-  const unmatchedPatterns = activePatterns.filter(
-    p => !activeLeases.some(
-      l => l.origin === p.origin && l.method.toUpperCase() === p.method.toUpperCase() && l.routePattern === p.pathPattern,
-    ),
-  )
-  const totalGrants = activeLeases.length + unmatchedPatterns.length
+  const { totalGrants } = deriveActiveLeaseGrants(detail)
   const editable = !['complete', 'stopped', 'failed'].includes(r.status)
   const hasActiveWorkers = r.status === 'running'
     || detail.assignments.some(a => a.status === 'running' || a.status === 'waiting_approval')
@@ -472,112 +483,102 @@ function LeasesList({ onError }: { onError: (msg: string) => void }) {
   const { detail, send, pending } = useRun()
   const toast = useToast()
   const r = detail.run
-  const activeLeases = detail.approvalLeases ?? []
-  const activePatterns = (detail.approvedEndpointPatterns ?? r.approvedEndpointPatterns ?? []).filter(
-    p => p.scopeRevision === undefined || p.scopeRevision === r.scopeRevision,
-  )
-  const unmatchedPatterns = activePatterns.filter(
-    p => !activeLeases.some(
-      l => l.origin === p.origin && l.method.toUpperCase() === p.method.toUpperCase() && l.routePattern === p.pathPattern,
-    ),
-  )
+  const { activeLeases, unmatchedPatterns } = deriveActiveLeaseGrants(detail)
 
   if (!activeLeases.length && !unmatchedPatterns.length) {
-    return <p>No active route approval leases in this scope revision.</p>
+    return <p>No active approval leases in this scope revision.</p>
   }
 
+  const rowCls = 'flex items-center gap-2 rounded-[7px] border border-line bg-sunk px-2.5 py-2'
+  const badgeCls = 'rounded bg-panel px-1 py-0.5 text-[10.5px] font-semibold'
+  const prefixTag = <span className="rounded bg-panel px-1 py-0.5 font-sans text-[10px] font-medium text-fg-subtle">Prefix</span>
+
   return <div className="flex flex-col gap-1.5" data-testid="approval-leases-list">
-    {activeLeases.map(lease => (
-      <div
-        key={lease.id}
-        className="flex items-center gap-2 rounded-[7px] border border-line bg-sunk px-2.5 py-2"
-      >
-        <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-1.5 font-mono text-[11.5px] text-fg">
-            <span className="rounded bg-panel px-1 py-0.5 text-[10.5px] font-semibold">{lease.method}</span>
-            <span className="truncate" title={`${lease.origin}${lease.routePattern}`}>
-              {host(lease.origin)}{lease.routePattern}
-            </span>
+    {activeLeases.map(lease => {
+      const hostLease = isHostNonDestructiveLease(lease)
+      const prefixLease = !hostLease && isPrefixApprovalPattern(lease.routePattern)
+      const meta = [
+        hostLease ? 'Host (POST/PUT/PATCH · no DELETE/high-risk)' : prefixLease ? 'Prefix lease' : null,
+        lease.expiresAt ? `Expires ${fmtTime(lease.expiresAt)}` : 'No expiry',
+        plural(lease.uses, 'use'),
+        lease.personaHandle ? `@${lease.personaHandle}` : null,
+      ].filter(Boolean).join(' · ')
+      return (
+        <div key={lease.id} className={rowCls} data-lease-scope={hostLease ? 'host_nondestructive' : prefixLease ? 'prefix' : 'route'}>
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-1.5 font-mono text-[11.5px] text-fg">
+              {hostLease
+                ? <span className="rounded bg-accent-soft px-1.5 py-0.5 text-[10px] font-semibold text-accent">HOST</span>
+                : <span className={badgeCls}>{lease.method}</span>}
+              {prefixLease && prefixTag}
+              <span className="truncate" title={hostLease ? `${lease.origin} — non-destructive POST/PUT/PATCH only` : `${lease.origin}${lease.routePattern}`}>
+                {hostLease ? host(lease.origin) : `${host(lease.origin)}${lease.routePattern}`}
+              </span>
+            </div>
+            <div className="mt-0.5 text-[11px] text-fg-subtle">{meta}</div>
           </div>
-          <div className="mt-0.5 text-[11px] text-fg-subtle">
-            {lease.expiresAt ? `Expires ${fmtTime(lease.expiresAt)}` : 'No expiry'}
-            {' · '}
-            {plural(lease.uses, 'use')}
-            {lease.personaHandle ? ` · @${lease.personaHandle}` : ''}
-          </div>
+          <button
+            type="button"
+            className={runBtn({ variant: 'ghost', size: 'xs' })}
+            disabled={pending > 0}
+            aria-label={hostLease ? `Revoke host lease for ${host(lease.origin)}` : `Revoke ${lease.method} ${lease.routePattern}`}
+            onClick={() => {
+              onError('')
+              void send({ action: 'revoke_approval_lease', leaseId: lease.id }).then(
+                () => toast.show('Approval lease revoked'),
+                (x: unknown) => onError(x instanceof Error ? x.message : 'Could not revoke the lease'),
+              )
+            }}
+          >
+            Revoke
+          </button>
         </div>
-        <button
-          type="button"
-          className={runBtn({ variant: 'ghost', size: 'xs' })}
-          disabled={pending > 0}
-          aria-label={`Revoke ${lease.method} ${lease.routePattern}`}
-          onClick={() => {
-            onError('')
-            void send({ action: 'revoke_approval_lease', leaseId: lease.id }).then(
-              () => toast.show('Approval lease revoked'),
-              (x: unknown) => onError(x instanceof Error ? x.message : 'Could not revoke the lease'),
-            )
-          }}
-        >
-          Revoke
-        </button>
-      </div>
-    ))}
-    {unmatchedPatterns.map(pattern => (
-      <div
-        key={`${pattern.origin}:${pattern.method}:${pattern.pathPattern}:${pattern.scopeRevision ?? 'any'}`}
-        className="flex items-center gap-2 rounded-[7px] border border-line bg-sunk px-2.5 py-2"
-      >
-        <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-1.5 font-mono text-[11.5px] text-fg">
-            <span className="rounded bg-panel px-1 py-0.5 text-[10.5px] font-semibold">{pattern.method.toUpperCase()}</span>
-            <span className="truncate" title={`${pattern.origin}${pattern.pathPattern}`}>
-              {host(pattern.origin)}{pattern.pathPattern}
-            </span>
+      )
+    })}
+    {unmatchedPatterns.map(pattern => {
+      const prefixRule = isPrefixApprovalPattern(pattern.pathPattern)
+      const m = pattern.method.toUpperCase()
+      return (
+        <div key={`${pattern.origin}:${pattern.method}:${pattern.pathPattern}:${pattern.scopeRevision ?? 'any'}`} className={rowCls}>
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-1.5 font-mono text-[11.5px] text-fg">
+              <span className={badgeCls}>{m}</span>
+              {prefixRule && prefixTag}
+              <span className="truncate" title={`${pattern.origin}${pattern.pathPattern}`}>{host(pattern.origin)}{pattern.pathPattern}</span>
+            </div>
+            <div className="mt-0.5 text-[11px] text-fg-subtle">{prefixRule ? 'Prefix rule' : 'Pattern rule'} · Scope rev {pattern.scopeRevision ?? r.scopeRevision}</div>
           </div>
-          <div className="mt-0.5 text-[11px] text-fg-subtle">
-            Pattern rule · Scope rev {pattern.scopeRevision ?? r.scopeRevision}
-          </div>
+          <button
+            type="button"
+            className={runBtn({ variant: 'ghost', size: 'xs' })}
+            disabled={pending > 0}
+            aria-label={`Revoke ${m} ${pattern.pathPattern}`}
+            onClick={() => {
+              onError('')
+              void send({
+                action: 'remove_approved_pattern',
+                origin: pattern.origin,
+                method: pattern.method,
+                pathPattern: pattern.pathPattern,
+                ...(pattern.scopeRevision !== undefined ? { scopeRevision: pattern.scopeRevision } : {}),
+              }).then(
+                () => toast.show('Approved pattern removed'),
+                (x: unknown) => onError(x instanceof Error ? x.message : 'Could not remove the pattern'),
+              )
+            }}
+          >
+            Revoke
+          </button>
         </div>
-        <button
-          type="button"
-          className={runBtn({ variant: 'ghost', size: 'xs' })}
-          disabled={pending > 0}
-          aria-label={`Revoke ${pattern.method.toUpperCase()} ${pattern.pathPattern}`}
-          onClick={() => {
-            onError('')
-            void send({
-              action: 'remove_approved_pattern',
-              origin: pattern.origin,
-              method: pattern.method,
-              pathPattern: pattern.pathPattern,
-              ...(pattern.scopeRevision !== undefined ? { scopeRevision: pattern.scopeRevision } : {}),
-            }).then(
-              () => toast.show('Approved pattern removed'),
-              (x: unknown) => onError(x instanceof Error ? x.message : 'Could not remove the pattern'),
-            )
-          }}
-        >
-          Revoke
-        </button>
-      </div>
-    ))}
+      )
+    })}
   </div>
 }
 
 function LeasesPopover({ onClose }: { onClose: () => void }) {
   const { detail } = useRun()
   const r = detail.run
-  const activeLeases = detail.approvalLeases ?? []
-  const activePatterns = (detail.approvedEndpointPatterns ?? r.approvedEndpointPatterns ?? []).filter(
-    p => p.scopeRevision === undefined || p.scopeRevision === r.scopeRevision,
-  )
-  const unmatchedPatterns = activePatterns.filter(
-    p => !activeLeases.some(
-      l => l.origin === p.origin && l.method.toUpperCase() === p.method.toUpperCase() && l.routePattern === p.pathPattern,
-    ),
-  )
-  const totalGrants = activeLeases.length + unmatchedPatterns.length
+  const { totalGrants } = deriveActiveLeaseGrants(detail)
   const [err, setErr] = useState('')
 
   return <PopShell
@@ -588,7 +589,7 @@ function LeasesPopover({ onClose }: { onClose: () => void }) {
       <button type="button" className={runBtn({ variant: 'ghost' })} onClick={onClose}>Close</button>
     </>}
   >
-    <p>Route-level write approvals granted in scope revision {r.scopeRevision}. Revoking requires approval again for future writes.</p>
+    <p>Route, prefix, and host-level write approvals granted in scope revision {r.scopeRevision}. Revoking requires approval again for future writes.</p>
     <LeasesList onError={setErr} />
   </PopShell>
 }
@@ -598,16 +599,7 @@ function PolicyPopover({ onClose }: { onClose: () => void }) {
   const r = detail.run
   const current: ApprovalPolicy = r.approvalPolicy ?? 'auto_review'
   const editable = !['complete', 'stopped', 'failed'].includes(r.status)
-  const activeLeases = detail.approvalLeases ?? []
-  const activePatterns = (detail.approvedEndpointPatterns ?? r.approvedEndpointPatterns ?? []).filter(
-    p => p.scopeRevision === undefined || p.scopeRevision === r.scopeRevision,
-  )
-  const unmatchedPatterns = activePatterns.filter(
-    p => !activeLeases.some(
-      l => l.origin === p.origin && l.method.toUpperCase() === p.method.toUpperCase() && l.routePattern === p.pathPattern,
-    ),
-  )
-  const totalGrants = activeLeases.length + unmatchedPatterns.length
+  const { totalGrants } = deriveActiveLeaseGrants(detail)
   const [err, setErr] = useState('')
   return <PopShell title="Approval policy" sub={editable ? 'Switches live' : runStatusLabel(r.status)} footer={err ? <span className="mr-auto text-[12px] text-danger">{err}</span> : undefined}>
     {approvalPolicies.map(p => {

@@ -1649,6 +1649,7 @@ export class RequestAdmissionEngine {
       })
       const checkLease = (): boolean =>
         leaseClassificationEligible &&
+        !classification.hasMultipart &&
         grant.approvalLeases?.(initialOrigin, classification.effectiveMethod, canonical) === true
 
       const sandboxPostAllowed =
@@ -1709,6 +1710,7 @@ export class RequestAdmissionEngine {
           contractApplies &&
           leaseClassificationEligible &&
           scopeDecision.code !== 'out_of_scope' &&
+          scopeDecision.code !== 'staging_denylist' &&
           scopeDecision.code !== 'invalid_path' &&
           scopeDecision.code !== 'auth_origin_active_probe' &&
           scopeDecision.code !== 'asset_origin_active_probe'
