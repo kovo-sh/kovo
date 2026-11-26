@@ -131,7 +131,7 @@ export function settlementNudgeMessage(input: {
 }): string {
   const typed = (input.proofTools ?? []).filter(name => name.trim())
   const proofPath = typed.length
-    ? `submit your proof now via a typed proof tool (${typed.join(', ')}) or the raw-spec fallback propose_chain_finding/update_proposed_finding`
+    ? `submit your proof now via ${typed.join(', ')} (auto-persists confirmed findings; prefer over legacy propose_chain_finding)`
     : 'submit your best proof now via propose_chain_finding/update_proposed_finding'
   return [
     `[KOVO SETTLEMENT NUDGE — Turn ${input.turn}/${input.maxTurns}]`,
@@ -169,7 +169,7 @@ export function settlementBannerMessage(input: {
 }): string {
   const typed = (input.proofTools ?? []).filter(name => name.trim())
   const proofPath = typed.length
-    ? `submit or update any ready candidate findings via ${typed.join('/')} or propose_chain_finding/update_proposed_finding`
+    ? `submit or update any ready candidate findings via ${typed.join('/')} (auto-persists confirmed findings; avoid legacy propose_chain_finding for runtime issues)`
     : 'submit or update any ready candidate findings via propose_chain_finding/update_proposed_finding'
   return [
     `[KOVO SETTLEMENT NOTICE — Turn ${input.turnsUsed}/${input.maxTurns}]`,
@@ -385,7 +385,7 @@ export function earlyExitDirectiveMessage(input: EarlyExitEvent & {
 }): string {
   const typed = (input.proofTools ?? []).filter(name => name.trim())
   const proofPath = typed.length
-    ? `submit the evidence via ${typed.join('/')} or propose_chain_finding/update_proposed_finding`
+    ? `submit the evidence via ${typed.join('/')} (auto-persists confirmed findings)`
     : 'submit the evidence via propose_chain_finding/update_proposed_finding'
   const routeText = input.route ? ` ${input.route.method} ${input.route.path}` : ' the target route'
   const reasonText = input.reason === 'hardened_denial'
@@ -618,7 +618,7 @@ export function kovoVerifyHelperGuidance(): string {
     'Typed helpers (prefer the helper for the class; each records the transcript roles the oracle checks):',
     ...KOVO_VERIFY_HELPERS.map(helper => `- ${helper.name} — ${helper.use}`),
     `Class hints: ${KOVO_VERIFY_CLASS_HINTS.map(([klass, helper]) => `${klass} -> ${helper}`).join('; ')}.`,
-    'Multi-hop chains (N-hop causal chains): prefer ctx.chain({ chainId, terminalVulnClass }) or seal via ctx.seal_capability (minted token: kind:"bearer_token", { capability:{ handle, target:"bearer" } }, OMIT as), inject via ctx.http_send, pivot via ctx.hmac_sign/ctx.jwt_sign/ctx.await_async/ctx.prove_race_burst, and confirm a connected DAG (no orphan hops) via ctx.prove_composite (replayMode="fresh_clean_replay"; economic_conservation: baseline+final readback IDs in oracleInput). Never stop at disclosure/handle; with prerequisite setup hops, ALWAYS use ctx.prove_composite (NEVER standalone prove_race_burst/prove_access_boundary/prove_persisted_mutation) and declare EVERY executed causal hop (Hop 1->terminal) in hops[]+causalEdges[]. Probe hops: ONE low-priv/derived persona — never owner/admin.',
+    'Multi-hop chains (N-hop causal chains): prefer ctx.chain({ chainId, terminalVulnClass }) (auto-wires hops[]/edges) or seal via ctx.seal_capability (structured jsonPath/header/cookie/value only — NEVER regex; minted token: kind:"bearer_token", { capability:{ handle, target:"bearer" } }, OMIT as), inject via ctx.http_send, pivot via ctx.hmac_sign/ctx.jwt_sign/ctx.await_async/ctx.prove_race_burst, and confirm a connected DAG (no orphan hops) via ctx.prove_composite (replayMode="fresh_clean_replay"; economic_conservation: baseline+final readback IDs in oracleInput). Never stop at disclosure/handle; with prerequisite setup hops, ALWAYS use ctx.prove_composite (NEVER standalone prove_race_burst/prove_access_boundary/prove_persisted_mutation) and declare EVERY executed causal hop (Hop 1->terminal) in hops[]+causalEdges[]. Probe hops: ONE low-priv/derived persona — never owner/admin.',
     KOVO_VERIFY_REPAIR_INSTRUCTION,
   ].join('\n')
 }
@@ -722,14 +722,15 @@ const KOVO_VERIFY_TS_EXAMPLE = [
 
 /** Single-source compact multi-hop contract (Move O1 — stated once concisely, reused by tool & active system prompt). */
 export const KOVO_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN = [
-  'N-hop causal chain contract (prefer `ctx.chain({ chainId, terminalVulnClass })` or `ctx.prove_composite` in Mode A `fresh_clean_replay`):',
-  '- Seal & inject: assert 2xx before `ctx.seal_capability` (SSE/non-JSON: `regex`; `kind: "hmac_key"` / `kind: "bearer_token"`); send via `ctx.http_send` (`role`: `"setup"|"control"|"probe"|"cleanup"` only; minted bearer: `{ capability: { handle, target: "bearer" } }` or `{ headers: { Authorization: "Bearer " + handle } }`, OMIT `as`/`persona`); sign/poll via `ctx.hmac_sign`/`ctx.jwt_sign`/`ctx.await_async`/`ctx.prove_race_burst`.',
-  '- Complete connected DAG (`dag_topology`): with ANY prerequisite setup hops, ALWAYS finalize via `ctx.prove_composite` (NEVER standalone `prove_race_burst`/`prove_access_boundary`/`prove_persisted_mutation`), declare EVERY executed causal hop (Hop 1 -> terminal) in `hops[]` + `causalEdges[]` reaching `terminalImpact.terminalHopId` (omitting Hop 1 or intermediate hops yields an incomplete receipt; never include orphan exploratory hops; `state_transition_binding` requires explicit `entityId` + `ablationExchangeIds` from a clean denied control BEFORE Stage 1).',
-  '- Terminal impact & provenance: NEVER stop at or file an intermediate single-hop info-disclosure/handle/job/cache stub; ALL probe-arm hops MUST run as a single starting low-privilege persona (NEVER use a target-tenant persona on the probe arm to mint handles or pre-seeded owner/admin). For `economic_conservation`, read baseline before & final after, passing `baselineReadbackExchangeId`, `finalReadbackExchangeId`, `actionExchangeIds` in `terminalImpact.oracleInput`.',
+  'N-hop causal chain contract (prefer `ctx.chain({ chainId, terminalVulnClass })` over manual `ctx.prove_composite` in Mode A `fresh_clean_replay`):',
+  '- One-shot builder: `const ch = ctx.chain({ chainId, terminalVulnClass }); ch.control(ctl); await ch.hop("hop_1", { claimedDelta }, async () => ...); ch.readback(fin); await ch.prove({ claimedImpact }); return ctx.result({ title })` (auto-wires `hops[]`/edges; `state_transition_binding`: `ch.stateTransition({ fromHopId, toHopId, entityId, ablationExchange })`).',
+  '- Seal & inject: assert 2xx before `ctx.seal_capability` (`jsonPath: "$.field"` | `header` | `cookie` | `value` — NEVER `regex`; `kind: "hmac_key"` / `"bearer_token"`); `ctx.http_send` (`role`: `"setup"|"control"|"probe"|"cleanup"` only; minted bearer: `{ capability: { handle, target: "bearer" } }`, OMIT `as`); `ctx.hmac_sign`/`ctx.jwt_sign`/`ctx.await_async`/`ctx.prove_race_burst`.',
+  '- Connected DAG (`dag_topology`): with ANY prerequisite setup hops, ALWAYS finalize via `ctx.prove_composite` (NEVER standalone `prove_race_burst`/`prove_access_boundary`/`prove_persisted_mutation`), declare EVERY executed causal hop (Hop 1 -> terminal) in `hops[]` + `causalEdges[]` reaching `terminalImpact.terminalHopId` (omitting Hop 1 or intermediate hops yields an incomplete receipt; no orphan hops; `state_transition_binding`: explicit `entityId` + `ablationExchangeIds` from clean pre-Stage-1 control).',
+  '- Terminal & provenance: NEVER stop at disclosure/handle/job/cache stub; ALL probe-arm hops run as one low-priv persona (never target-tenant/owner/admin). `economic_conservation`: pass `baselineReadbackExchangeId`, `finalReadbackExchangeId`, `actionExchangeIds` in `terminalImpact.oracleInput`.',
 ].join('\n')
 
 const KOVO_VERIFY_TOOL_DESCRIPTION_BASE = [
-  'Run an inline TypeScript verification script (`runtime="ts"`; strict camelCase options) through Kovo Hunter’s Layer-1 RPC bridge and independent transcript oracle. Two fresh signed runs confirm; stdout is never evidence. Confirmation BOTH proves AND persists the confirmed finding (`proof_kind="agent_script"` / `CompositeProofReceipt`). Single-hop: `ctx.prove_*` (including `ctx.prove_injection_differential`). Multi-hop: `ctx.chain({ chainId, terminalVulnClass })` or `ctx.prove_composite`.',
+  'REQUIRED: pass `script` inline (TS via `ctx`; `scriptPath` is only for `/repos` files; `runtime="ts"`, `title`, `timeoutMs` are optional — NEVER send `{ runtime, timeoutMs, title }` without `script`). Strict camelCase options; runs through the transcript oracle (two signed runs confirm; stdout is never evidence) and BOTH proves AND persists the confirmed finding (auto-persists `proof_kind="agent_script"` / `CompositeProofReceipt` — prefer over `propose_chain_finding`). Single-hop: `ctx.prove_*` (`prove_injection_differential`). Multi-hop: prefer `ctx.chain({ chainId, terminalVulnClass })`.',
   KOVO_VERIFY_TS_EXAMPLE,
   KOVO_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN,
 ].join('\n\n')
@@ -954,14 +955,14 @@ const PROPOSE_CHAIN_FINDING_LEGACY_SCHEMAS = [
 export function proposeChainFindingDescription(hasKovoVerify: boolean, allowLegacyReplaySpec = false): string {
   if (hasKovoVerify && !allowLegacyReplaySpec) {
     return [
-      "[LEGACY FALLBACK — `kovo_verify` is active in this session. For runtime vulnerabilities, call `kovo_verify(script=\"<inline TS using ctx.prove_*>\", runtime=\"ts\")` instead of proposing runtime replay specs so findings persist a verified ProofReceipt (`proof_kind=\"agent_script\"`). Use `propose_chain_finding` ONLY for `static_ast_proof` or when `kovo_verify` is unavailable.]",
+      "[LEGACY FALLBACK — `kovo_verify` is active in this session and auto-persists confirmed findings without `assertionsJq`. For runtime vulnerabilities, call `kovo_verify(script=\"<inline TS using ctx.prove_* or ctx.chain>\", runtime=\"ts\")` instead of proposing runtime replay specs so findings persist a verified ProofReceipt (`proof_kind=\"agent_script\"`). Use `propose_chain_finding` ONLY for `static_ast_proof` or when `kovo_verify` is unavailable.]",
       "Submit a static-AST source-to-sink finding with mandatory counterevidence, confidenceRationale, and replaySpec.kind=\"static_ast_proof\" (promotes ONLY to status=\"static_verified\", never runtime \"confirmed\").",
       "- static_ast_proof (deterministic offline opengrep/ast-grep re-run over RO /repos -> static_verified tier ONLY): { kind, repo, file, startLine, endLine, engine, ruleOrPattern, sourceToSinkTrace, runtimeProofGap, verificationTier, astVerify, static: { verified, matchCount, matchedLines, controlPassed } }.",
     ].join(" ")
   }
   return [
     ...(hasKovoVerify ? [
-      "[LEGACY FALLBACK — `kovo_verify` is active in this session. For runtime vulnerabilities, call `kovo_verify(script=\"<inline TS using ctx.prove_*>\", runtime=\"ts\")` instead of proposing runtime replay specs so findings persist a verified ProofReceipt (`proof_kind=\"agent_script\"`). Use `propose_chain_finding` ONLY for `static_ast_proof` or when `kovo_verify` is unavailable.]",
+      "[LEGACY FALLBACK — `kovo_verify` is active in this session and auto-persists confirmed findings without `assertionsJq`. For runtime vulnerabilities, call `kovo_verify(script=\"<inline TS using ctx.prove_* or ctx.chain>\", runtime=\"ts\")` instead of proposing runtime replay specs so findings persist a verified ProofReceipt (`proof_kind=\"agent_script\"`). Use `propose_chain_finding` ONLY for `static_ast_proof` or when `kovo_verify` is unavailable.]",
     ] : []),
     ...PROPOSE_CHAIN_FINDING_LEGACY_SCHEMAS,
   ].join(" ")
@@ -1652,7 +1653,7 @@ export function buildAgenticPromptContext(input: AgenticPromptContextInput = {})
       parallelReadOnly: 'Issue independent read-only tool calls (get_exchange, search_facts, search_exchanges, board_read, derive_evidence) together in one turn.',
       assignmentTarget: 'One assignment = one hypothesis cluster (1-3 linked routes) or one det_lead upgrade.',
       turnBudget: '8-10 turns; 6-8 turns for det_lead upgrades and chain step 2.',
-      settlement: 'At turn N-2, submit your proof via a typed prove_* tool (or propose_chain_finding/update_proposed_finding) or call complete_intent; do not start new exploration.',
+      settlement: 'At turn N-2, submit your proof via kovo_verify(script="...") (auto-persists confirmed findings; avoid legacy propose_chain_finding for runtime issues) or call complete_intent; do not start new exploration.',
       // Durable even when the skill catalog is slimmed: the same guidance lives on the tool.
       proofTools: kovoVerifyPromptHint(),
     },
@@ -2153,11 +2154,11 @@ export function workerInvestigationPrompt(input: {
             scopeAnchor: 'Stay strictly anchored to your assigned chain/suspect endpoints and pivot across hops of THAT hypothesis.\nDo not spend turns re-confirming an unrelated endpoint already covered by another finding or step (see alreadyConfirmed).',
             requiredCompositeProof: 'MUST verify the end-to-end causal chain with ctx.seal_capability(...) + ctx.prove_composite(...) (using ctx.hmac_sign / ctx.jwt_sign / ctx.await_async / ctx.prove_race_burst or ctx.chain(...).prove()) — do NOT substitute a standalone single-hop prove_access_boundary / prove_persisted_mutation call as your final proof; with prerequisite setup hops (disclosure, token/session, parser differential, cache prime, state rebind, async job polling), ALWAYS use ctx.prove_composite — NEVER standalone prove_race_burst / prove_access_boundary / prove_persisted_mutation.',
             declareAllExecutedHops: 'Declare EVERY causal hop (Hop 1 -> terminal) in prove_composite.hops[] connected via causalEdges[]; omitting Hop 1 or intermediate hops yields an incomplete receipt.',
-            compositeCallSignature: 'ctx.seal_capability({ exchangeId, slot, jsonPath, kind }) -> ctx.hmac_sign/jwt_sign/await_async -> ctx.prove_composite({ chainId, terminalVulnClass, replayMode: "fresh_clean_replay", hops, causalEdges, terminalImpact })',
+            compositeCallSignature: 'Prefer const ch = ctx.chain({ chainId, terminalVulnClass }); ch.control(ctl); await ch.hop("hop_1", { claimedDelta }, ...); ch.readback(fin); await ch.prove({ claimedImpact }) (auto-wires hops[]/edges; or manual ctx.seal_capability({ exchangeId, slot, jsonPath, kind }) -> ctx.prove_composite)',
             noPrematureSingleHop: 'Never stop at disclosure/handle, job creation, cache prime, or token stubs — seal via ctx.seal_capability and continue in ONE script to ctx.prove_composite.',
             singleOriginProbeArm: 'Run all probe-arm hops as a single starting low-privilege persona (or derived credential); never use a target-tenant persona on the probe arm.',
             cryptoAndAsyncHelpers: 'Use ctx.hmac_sign / ctx.jwt_sign / ctx.await_async / ctx.prove_race_burst inside the same script, then confirm via ctx.prove_composite (replayMode: "fresh_clean_replay").',
-            singleScriptConsolidation: 'Write ONE cohesive N-hop kovo_verify script (prefer ctx.chain) covering Hop 1 -> terminal -> ctx.prove_composite.',
+            singleScriptConsolidation: 'Write ONE cohesive N-hop kovo_verify script using ctx.chain(...) (Hop 1 -> terminal -> ch.prove(...)) so hops[], exchangeIds, and causalEdges[] never mismatch.',
             stateTransitionControlOrder: 'For state_transition_binding, run clean denied control (role: "control") BEFORE Stage 1 (or on a fresh untouched sibling entity) and pass explicit entityId + ablationExchangeIds.',
             economicConservationReadback: 'For terminalVulnClass: "economic_conservation", read baseline BEFORE the chain (preChainControlExchangeIds / oracleInput.baselineReadbackExchangeId), run mutating/race hops, read final AFTER (postChainReadbackExchangeIds / oracleInput.finalReadbackExchangeId), and pass { equation, balancesBefore/paidAmount, baselineReadbackExchangeId, finalReadbackExchangeId, actionExchangeIds } in terminalImpact.oracleInput (host hydrates host-signed records).',
             connectedDagTopology: 'dag_topology: every hop in hops[] must be connected by causalEdges[] reaching terminalImpact.terminalHopId; never include unused or orphan exploratory hops in hops[].',
@@ -2253,7 +2254,7 @@ export function workerSessionInstructions(
 ): string {
   const base = scenarioInstructions[scenario]
   if (scenario === 'worker-investigation' && options?.hasKovoVerify) {
-    return `${base}\nPRIMARY PROOF CONTRACT: \`kovo_verify\` is active — confirm EVERY runtime vulnerability via \`kovo_verify(script="<inline TS using ctx.prove_* or ctx.chain>", runtime="ts")\` (\`proof_kind="agent_script"\`). Do NOT call legacy \`verify_replay_spec\` or \`propose_chain_finding\` with \`http_chain\`.\n${KOVO_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN}`
+    return `${base}\nPRIMARY PROOF CONTRACT: \`kovo_verify\` is active — pass \`script\` inline (auto-persists confirmed findings with \`proof_kind="agent_script"\`; prefer over legacy \`propose_chain_finding\`, which is ONLY for \`static_ast_proof\` and rejects runtime specs/bad \`assertionsJq\`). Do NOT call legacy \`verify_replay_spec\` or \`propose_chain_finding\` with \`http_chain\`.\n${KOVO_VERIFY_MULTIHOP_CRYPTO_ASYNC_PATTERN}`
   }
   return base
 }

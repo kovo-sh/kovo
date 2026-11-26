@@ -22,6 +22,6 @@ Summary: Prove broken object-level authorization (BOLA/IDOR), broken function-le
    - On quota/credit/coupon/redemption endpoints, verify concurrency via `kovo_verify` using `ctx.prove_race_burst({ requests, readRoute, balanceField, unitDebit })` (`2..10` synchronized requests) only when non-destructive or Tier-3 approved.
 
 ## 3. `kovo_verify` Verification Requirements
-- Use `kovo_verify` with `ctx.prove_access_boundary({ controlPersona, probePersona, route, method? })` for direct BOLA/BFLA checks, or `ctx.http` + `ctx.seal_capability` + `ctx.prove_composite` when the target ID must be harvested in a prerequisite setup hop (`replayMode: "fresh_clean_replay"`).
+- Use `kovo_verify` with `ctx.prove_access_boundary({ controlPersona, probePersona, route, method? })` for direct BOLA/BFLA checks, or `ctx.chain(...)` (or `ctx.http_send` + `ctx.seal_capability` + `ctx.prove_composite`) when the target ID must be harvested in a prerequisite setup hop (`replayMode: "fresh_clean_replay"`).
 - Reference personas ONLY via opaque handles (`as` / `controlPersona` / `probePersona`, never raw `Authorization` or `Cookie`).
 - Assert non-SPA content and concrete differential outcomes via `ctx.expect.status` / `ctx.expect.jsonPath` / `ctx.expect.bodyContains` and finish with `return ctx.result({ title })`.

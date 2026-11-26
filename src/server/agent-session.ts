@@ -2292,13 +2292,30 @@ export function buildWorkerTools(
       name: 'kovo_verify',
       description: KOVO_VERIFY_TOOL_DESCRIPTION,
       parameters: obj({
-        script: opt(str({ description: 'Inline TypeScript verification script. Takes precedence over scriptPath.', maxLength: 64 * 1024 })),
-        code: opt(str({ description: 'Alias for `script` (inline verification script).', maxLength: 64 * 1024 })),
-        source: opt(str({ description: 'Alias for `script` (inline verification script).', maxLength: 64 * 1024 })),
-        scriptPath: opt(str({ description: 'Workspace-relative path to a previously written TypeScript verification script.', maxLength: 512 })),
-        runtime: opt(oneOf(['ts'] as const)),
-        title: opt(str({ description: 'Short proof title (echoed by the verdict).', maxLength: 300 })),
-        timeoutMs: opt(int({ minimum: 1_000, maximum: 120_000 })),
+        script: opt(str({
+          description: 'REQUIRED (unless `scriptPath` is provided): complete inline TypeScript verification code using pre-injected `ctx` (e.g. `await ctx.prove_access_boundary({ ... }); return ctx.result({ title: "..." })`). Takes precedence over `scriptPath`; never call `kovo_verify` without `script` or `scriptPath`.',
+          minLength: 1,
+          maxLength: 64 * 1024,
+        })),
+        scriptPath: opt(str({
+          description: 'Optional fallback: workspace-relative path to an existing `.ts` file in `/repos` (omit when passing inline `script`).',
+          minLength: 1,
+          maxLength: 512,
+        })),
+        title: opt(str({
+          description: 'Optional secondary metadata: short proof title echoed by the verdict. Never send `title` without `script`.',
+          maxLength: 300,
+        })),
+        runtime: opt(oneOf(['ts'] as const, {
+          description: 'Optional secondary metadata (TypeScript only; defaults to `"ts"`). Never send `{ runtime, timeoutMs }` without `script`.',
+        })),
+        timeoutMs: opt(int({
+          minimum: 1_000,
+          maximum: 120_000,
+          description: 'Optional secondary metadata: execution timeout in ms (1000..120000, default 60000). Never send `timeoutMs` without `script`.',
+        })),
+        code: opt(str({ description: 'Optional alias for `script` (prefer `script`).', minLength: 1, maxLength: 64 * 1024 })),
+        source: opt(str({ description: 'Optional alias for `script` (prefer `script`).', minLength: 1, maxLength: 64 * 1024 })),
       }),
       replay: 'unsafe',
       outputLimits,
@@ -2326,7 +2343,7 @@ export function buildWorkerTools(
             isError: true,
             output: [{
               type: 'text' as const,
-              text: `kovo_verify validation failed: provide non-empty inline code in \`script\` (or workspace file in \`scriptPath\`). Example call: ${example}.${loopStop}`,
+              text: `kovo_verify validation failed: \`script\` is REQUIRED (do not send metadata-only \`{ runtime, timeoutMs, title }\`); provide non-empty inline code in \`script\` (or workspace file in \`scriptPath\`). Example call: ${example}.${loopStop}`,
             }],
           }
         }
