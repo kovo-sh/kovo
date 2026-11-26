@@ -312,6 +312,8 @@ export class ContainerSupervisor {
   readonly ownerPid: number
   private readonly isPidAliveFn: (pid: number) => boolean
   private readonly active = new Map<string, SupervisedTargetState>()
+  private readonly inFlightBootIds = new Set<string>()
+  private startupRecoveryInFlight: Promise<LabRecoveryResult[]> | null = null
 
   constructor(options: ContainerSupervisorOptions = {}) {
     this.docker = options.docker ?? runDocker
@@ -329,6 +331,19 @@ export class ContainerSupervisor {
     return this.active.has(runId)
   }
 
+  markBooting(runId: string): void {
+    validateLabRunId(runId)
+    this.inFlightBootIds.add(runId)
+  }
+
+  clearBooting(runId: string): void {
+    this.inFlightBootIds.delete(runId)
+  }
+
+  isBooting(runId: string): boolean {
+    return this.inFlightBootIds.has(runId)
+  }
+
   getActiveRun(runId: string): SupervisedTargetState | undefined {
     return this.active.get(runId)
   }
@@ -340,6 +355,7 @@ export class ContainerSupervisor {
   registerActiveRun(runId: string, state: SupervisedTargetState): void {
     installSupervisorSignalHooks()
     ACTIVE_SUPERVISORS.add(this)
+    this.inFlightBootIds.delete(runId)
     this.active.set(runId, state)
     this.persistState(runId)
   }
@@ -571,8 +587,22 @@ export class ContainerSupervisor {
    * Reap every resource for a run: containers/networks/volumes by label, plus every path in the
    * persisted crash record and SQLite registry rows. Idempotent.
    */
-  async recover(runId: string, storage?: LabContainerStore): Promise<LabRecoveryResult> {
+  async recover(
+    runId: string,
+    storage?: LabContainerStore,
+    extraContainerNames: readonly string[] = [],
+  ): Promise<LabRecoveryResult> {
     validateLabRunId(runId)
+    if (this.inFlightBootIds.has(runId)) {
+      return {
+        runId,
+        containersRemoved: 0,
+        networksRemoved: 0,
+        volumesRemoved: 0,
+        tempDirsRemoved: 0,
+        recoveredFromRecord: false,
+      }
+    }
     if (this.active.has(runId)) {
       await this.stopRun(runId)
     }
@@ -590,6 +620,7 @@ export class ContainerSupervisor {
       ...(record?.containerNames ?? []),
       ...(record?.containerIds ?? []),
       ...(record?.proxyContainerName ? [record.proxyContainerName] : []),
+      ...extraContainerNames,
       ...(await this.listByLabel('container', runId)),
     ])
     const processedContainers = new Set<string>()
@@ -638,14 +669,16 @@ export class ContainerSupervisor {
   private collectStoreOrphanRunIds(storage: LabContainerStore | undefined): string[] {
     if (!storage) return []
     const runIds = new Set<string>()
+    const addValid = (raw: unknown) => {
+      if (typeof raw === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(raw)) {
+        runIds.add(raw)
+      }
+    }
     try {
       if (typeof storage.listOrphanedLabContainers === 'function') {
         for (const row of storage.listOrphanedLabContainers()) {
-          if (typeof row.runId === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(row.runId)) {
-            runIds.add(row.runId)
-          }
+          addValid(row.runId)
         }
-        return [...runIds]
       }
       const extended = storage as unknown as {
         rows?: Map<string, { runId: string; status?: string }>
@@ -656,14 +689,12 @@ export class ContainerSupervisor {
           .prepare("SELECT DISTINCT run_id FROM lab_containers WHERE status IN ('orphaned', 'running')")
           .all()
         for (const row of rows) {
-          if (typeof row.run_id === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(row.run_id)) {
-            runIds.add(row.run_id)
-          }
+          addValid(row.run_id)
         }
       } else if (extended.rows instanceof Map) {
         for (const row of extended.rows.values()) {
-          if (typeof row.runId === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(row.runId)) {
-            runIds.add(row.runId)
+          if (!row.status || row.status === 'orphaned' || row.status === 'running') {
+            addValid(row.runId)
           }
         }
       }
@@ -674,15 +705,51 @@ export class ContainerSupervisor {
   }
 
   /**
+   * Idempotent startup recovery hook for server initialization. Coalesces concurrent boot calls
+   * so Docker + SQLite orphan reaping runs cleanly without racing itself or mid-boot runs.
+   */
+  ensureStartupRecovery(
+    storage?: LabContainerStore,
+    options: { includeLiveOwners?: boolean; persistedContainers?: ReadonlyArray<PersistedLabContainerRef> } = {},
+  ): Promise<LabRecoveryResult[]> {
+    if (!this.startupRecoveryInFlight) {
+      this.startupRecoveryInFlight = this.recoverAll(storage, options).finally(() => {
+        this.startupRecoveryInFlight = null
+      })
+    }
+    return this.startupRecoveryInFlight
+  }
+
+  /**
    * Recover every orphaned run found in persisted crash records, Docker `dev.kovo.lab=1` label
-   * scans (skipping containers owned by a different still-alive PID), and optional `LabContainerStore`
-   * orphaned rows.
+   * scans (skipping containers owned by a different still-alive PID or currently booting), and
+   * optional `LabContainerStore` / pre-collected persisted rows.
    */
   async recoverAll(
     storage?: LabContainerStore,
-    options: { includeLiveOwners?: boolean } = {},
+    options: { includeLiveOwners?: boolean; persistedContainers?: ReadonlyArray<PersistedLabContainerRef> } = {},
   ): Promise<LabRecoveryResult[]> {
     const runIds = new Set<string>()
+    const extraContainersByRun = new Map<string, string[]>()
+    const liveOwnerRunIds = new Set<string>()
+    const isProtectedRun = (runId: string) => this.active.has(runId) || this.inFlightBootIds.has(runId)
+
+    // 0. Optional pre-collected persisted rows (e.g., returned by Store.recover() before row wipe)
+    for (const ref of options.persistedContainers ?? []) {
+      if (
+        typeof ref?.runId !== 'string'
+        || typeof ref?.containerName !== 'string'
+        || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(ref.runId)
+        || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(ref.containerName)
+      ) {
+        continue
+      }
+      if (isProtectedRun(ref.runId)) continue
+      runIds.add(ref.runId)
+      const list = extraContainersByRun.get(ref.runId) ?? []
+      list.push(ref.containerName)
+      extraContainersByRun.set(ref.runId, list)
+    }
 
     // 1. Persisted JSON crash-recovery records
     try {
@@ -700,10 +767,11 @@ export class ContainerSupervisor {
             && pid !== this.ownerPid
             && this.isPidAliveFn(pid)
           ) {
+            if (typeof parsed.runId === 'string') liveOwnerRunIds.add(parsed.runId)
             continue
           }
           if (typeof parsed.runId === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(parsed.runId)) {
-            runIds.add(parsed.runId)
+            if (!isProtectedRun(parsed.runId)) runIds.add(parsed.runId)
           }
         } catch {
           // Ignore unreadable/corrupt records; the label scan below still finds live orphans.
@@ -713,9 +781,9 @@ export class ContainerSupervisor {
       // No state dir yet.
     }
 
-    // 2. Store orphaned / stale rows (M-6)
+    // 2. Store orphaned / stale rows (M-6): inspect active/orphaned rows BEFORE deletion
     for (const storeRunId of this.collectStoreOrphanRunIds(storage)) {
-      if (!this.active.has(storeRunId)) {
+      if (!isProtectedRun(storeRunId)) {
         runIds.add(storeRunId)
       }
     }
@@ -748,14 +816,17 @@ export class ContainerSupervisor {
             && ownerPidNum > 0
             && ownerPidNum !== this.ownerPid
             && this.isPidAliveFn(ownerPidNum)
-          if (isOtherLiveOwner) continue
+          if (isOtherLiveOwner) {
+            if (runId && runId !== '<no value>') liveOwnerRunIds.add(runId)
+            continue
+          }
 
           if (
             runId
             && runId !== '<no value>'
             && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(runId)
           ) {
-            if (!this.active.has(runId)) {
+            if (!isProtectedRun(runId)) {
               runIds.add(runId)
             }
           } else if (ids[i] && /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(ids[i])) {
@@ -770,8 +841,8 @@ export class ContainerSupervisor {
 
     const results: LabRecoveryResult[] = []
     for (const runId of [...runIds].slice(0, MAX_RECOVERED_RUNS)) {
-      if (runId === '<no value>') continue
-      results.push(await this.recover(runId, storage))
+      if (runId === '<no value>' || isProtectedRun(runId) || liveOwnerRunIds.has(runId)) continue
+      results.push(await this.recover(runId, storage, extraContainersByRun.get(runId)))
     }
     return results
   }

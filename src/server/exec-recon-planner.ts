@@ -1039,10 +1039,85 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
   private readonly detLeadGateRejected = new Set<string>()
   private readonly cappedLeadReported = new Set<string>()
   private readonly tierAStepKeys = new Set<string>()
+  private readonly stepIdsByRun = new Map<string, Set<string>>()
+  private readonly runLifecycleUnsubs = new Map<string, () => void>()
   private get labRunner() { return this.host.labRunner }
+
+  /**
+   * Evict all per-run in-memory Maps/Sets for `runId` when a run reaches a terminal state
+   * (completed/failed/canceled/stopped) so long-lived servers do not leak unbounded per-run state.
+   */
+  clearRunState(runId: string): void {
+    this.plannerEmptyRounds.delete(runId)
+    this.plannerDryRounds.delete(runId)
+    this.plannerCompletedAtLastRound.delete(runId)
+    this.plannerEvidenceFrontier.delete(runId)
+    this.frontierControllers.delete(runId)
+    this.invariantsSeededRuns.delete(runId)
+    this.wave1InvariantChainsPromoted.delete(runId)
+    this.seededHypothesisIdsByRun.delete(runId)
+    this.runtimeSynthesisWatermark.delete(runId)
+    this.postFloorInvariantsSyncedRuns.delete(runId)
+    this.runtimeCompositeSeededRuns.delete(runId)
+    this.plannerSeenCausalEdges.delete(runId)
+
+    const stepIds = this.stepIdsByRun.get(runId)
+    if (stepIds) {
+      for (const stepId of stepIds) {
+        this.persistedStepCheckpoints.delete(stepId)
+      }
+      this.stepIdsByRun.delete(runId)
+    }
+
+    const colonPrefix = `${runId}:`
+    for (const key of this.emittedSealedHandleSets.keys()) {
+      if (key.startsWith(colonPrefix)) this.emittedSealedHandleSets.delete(key)
+    }
+    const nulPrefix = `${runId}\0`
+    for (const key of this.detLeadStepKeys) {
+      if (key.startsWith(nulPrefix)) this.detLeadStepKeys.delete(key)
+    }
+    for (const key of this.tierAStepKeys) {
+      if (key.startsWith(nulPrefix)) this.tierAStepKeys.delete(key)
+    }
+    for (const key of this.detLeadGateRejected) {
+      if (key.startsWith(nulPrefix)) this.detLeadGateRejected.delete(key)
+    }
+    for (const key of this.cappedLeadReported) {
+      if (key.startsWith(nulPrefix)) this.cappedLeadReported.delete(key)
+    }
+
+    const unsub = this.runLifecycleUnsubs.get(runId)
+    if (unsub) {
+      this.runLifecycleUnsubs.delete(runId)
+      try { unsub() } catch { /* ignore */ }
+    }
+  }
+
+  private trackRunLifecycle(runId: string): void {
+    if (this.runLifecycleUnsubs.has(runId)) return
+    const onRunEventFn = (this.storage as unknown as {
+      onRunEvent?: (runId: string, fn: (event: { kind?: string; detail?: Record<string, unknown> }) => void) => () => void
+    }).onRunEvent
+    if (typeof onRunEventFn !== 'function') return
+    const unsub = onRunEventFn.call(this.storage, runId, event => {
+      const kind = typeof event?.kind === 'string' ? event.kind : ''
+      if (kind !== 'report.complete' && kind !== 'report.partial' && !kind.startsWith('run.')) return
+      try {
+        const current = this.storage.run(runId)
+        if (current.status === 'complete' || current.status === 'failed' || current.status === 'stopped') {
+          this.clearRunState(runId)
+        }
+      } catch {
+        this.clearRunState(runId)
+      }
+    })
+    this.runLifecycleUnsubs.set(runId, unsub)
+  }
 
   /** Return (or initialize) the run-scoped v8 FrontierWaveController bound to Store's CapabilityLedger. */
   frontierControllerFor(runId: string, options: Omit<FrontierWaveControllerOptions, 'ledger'> = {}): FrontierWaveController {
+    this.trackRunLifecycle(runId)
     let controller = this.frontierControllers.get(runId)
     if (!controller) {
       controller = new FrontierWaveController({
@@ -2850,9 +2925,10 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       specialistProfile: routeStepToSpecialist({ title, hypothesis, category: input.category, skills }),
     })
     this.storage.updateChainStep(createdStep.id, { status: 'ready' })
-    this.detLeadStepKeys.add(input.dedupeKey)
+    const runScopedDedupeKey = `${run.id}\0${input.dedupeKey}`
+    this.detLeadStepKeys.add(runScopedDedupeKey)
     if (input.isTierA) {
-      this.tierAStepKeys.add(input.dedupeKey)
+      this.tierAStepKeys.add(runScopedDedupeKey)
       this.host.tierAStepIds.add(createdStep.id)
       this.host.tierAFactIds.add(fact.id)
     }
@@ -2899,7 +2975,8 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       if (!asset) continue
       const category = detLeadCategory(probeClass)
       const dedupeKey = `${method} ${normalizeEndpointTemplate(endpoint)}|${confirmedCategoryFamily(category)}`
-      if (this.tierAStepKeys.has(dedupeKey) || this.detLeadStepKeys.has(dedupeKey)) continue
+      const runScopedDedupeKey = `${run.id}\0${dedupeKey}`
+      if (this.tierAStepKeys.has(runScopedDedupeKey) || this.detLeadStepKeys.has(runScopedDedupeKey)) continue
       const tupleKey = plannerDedupeTupleKey(fact.origin, endpoint, category)
       if (tupleKey && (confirmedTuples.has(tupleKey) || inFlightTuples.has(tupleKey))) continue
       const reason = typeof fact.data.reason === 'string' ? fact.data.reason.slice(0, 200) : 'white-box dataflow slice'
@@ -2940,11 +3017,13 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       const category = detLeadCategory(probeClass)
       const routeKey = `${normalizeConfirmedRouteTemplate(endpoint)}|${confirmedCategoryFamily(category)}`
       const dedupeKey = `${method} ${routeKey}`
-      if (confirmedKeys.has(routeKey) || this.detLeadStepKeys.has(dedupeKey)) continue
+      const runScopedDedupeKey = `${run.id}\0${dedupeKey}`
+      if (confirmedKeys.has(routeKey) || this.detLeadStepKeys.has(runScopedDedupeKey)) continue
       const gate = detLeadEvidenceGate(fact.data)
       if (!gate.admitted) {
-        if (!this.detLeadGateRejected.has(fact.id)) {
-          this.detLeadGateRejected.add(fact.id)
+        const rejectedKey = `${run.id}\0${fact.id}`
+        if (!this.detLeadGateRejected.has(rejectedKey)) {
+          this.detLeadGateRejected.add(rejectedKey)
           try {
             this.storage.event(
               run.id, 'deterministic_lane.lead_deferred',
@@ -2961,8 +3040,9 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       const verdict = this.host.reinvestigationGuardFor(run.id)
         .record(guardKey, detLeadUnlocksReinvestigation(fact.data))
       if (!verdict.allowed) {
-        if (!this.cappedLeadReported.has(fact.id)) {
-          this.cappedLeadReported.add(fact.id)
+        const cappedKey = `${run.id}\0${fact.id}`
+        if (!this.cappedLeadReported.has(cappedKey)) {
+          this.cappedLeadReported.add(cappedKey)
           this.host.noteCappedReinvestigation(run, guardKey, verdict.count)
         }
         continue
@@ -3405,10 +3485,14 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         specialistProfile: routeStepToSpecialist({ title, hypothesis: step.hypothesis, category, skills: step.skills }),
       })
       if (checkpointCapId || checkpointJson) {
+        this.trackRunLifecycle(run.id)
         this.persistedStepCheckpoints.set(createdStep.id, {
           ...(checkpointCapId ? { checkpointCapId } : {}),
           ...(checkpointJson ? { checkpointJson } : {}),
         })
+        const stepIds = this.stepIdsByRun.get(run.id) ?? new Set<string>()
+        stepIds.add(createdStep.id)
+        this.stepIdsByRun.set(run.id, stepIds)
       }
       titles.add(key)
       addStepTuplesToInFlightSet(inFlightTuples, {
@@ -3510,10 +3594,11 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
 
     // Deduplicate identical sealed handle sets on non-rotation exits so a worker that exits via
     // complete_intent / max_turns without sealing any new handle cannot loop infinitely.
+    this.trackRunLifecycle(run.id)
     const stepById = new Map(existingSteps.map(s => [s.id, s]))
     let lineageRootId = step.id
     const visitedLineage = new Set<string>([step.id])
-    for (let hop = 0; hop < 8; hop += 1) {
+    for (let hop = 0; hop < existingSteps.length; hop += 1) {
       const cur = stepById.get(lineageRootId)
       const parentId = cur?.dependsOnStepIds.find(id => stepById.has(id) && !visitedLineage.has(id))
       if (!parentId) break
@@ -3532,12 +3617,22 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       }
       if (currentDepth >= 1) {
         const inheritedHandles = new Set<string>(stepCapId ? [stepCapId] : [])
-        for (const factId of step.dependsOnFactIds) {
-          const cpFact = this.storage.listFacts(run.id, { includeTainted: false, limit: 500 })
-            .find(f => f.id === factId && f.data?.subkind === 'hop_checkpoint')
-          const brief = parseHopCheckpointJson(cpFact?.data?.checkpointBrief ?? cpFact?.data?.checkpointJson)
-          for (const h of brief?.capabilityHandles ?? []) {
-            if (DERIVED_CAPABILITY_HANDLE_RE.test(h)) inheritedHandles.add(h)
+        if (step.dependsOnFactIds.length > 0) {
+          const neededFactIds = new Set(step.dependsOnFactIds)
+          const allRunFacts = this.pageAll((offset, limit) =>
+            this.storage.listFacts(run.id, { includeTainted: false, limit, offset }))
+          const checkpointFactById = new Map<string, (typeof allRunFacts)[number]>()
+          for (const f of allRunFacts) {
+            if (neededFactIds.has(f.id) && f.data?.subkind === 'hop_checkpoint') {
+              checkpointFactById.set(f.id, f)
+            }
+          }
+          for (const factId of step.dependsOnFactIds) {
+            const cpFact = checkpointFactById.get(factId)
+            const brief = parseHopCheckpointJson(cpFact?.data?.checkpointBrief ?? cpFact?.data?.checkpointJson)
+            for (const h of brief?.capabilityHandles ?? []) {
+              if (DERIVED_CAPABILITY_HANDLE_RE.test(h)) inheritedHandles.add(h)
+            }
           }
         }
         const incoming = input.sealedCapHandles.filter(h => DERIVED_CAPABILITY_HANDLE_RE.test(h))
@@ -3994,6 +4089,10 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
 
   async runChainPlanner(run: Run, profiles: readonly ResolvedModelProfile[], task: CoordinatorTask) {
     const fresh = this.storage.run(run.id)
+    if (fresh.status === 'complete' || fresh.status === 'failed' || fresh.status === 'stopped') {
+      this.clearRunState(run.id)
+      return
+    }
     if (fresh.status !== 'running' || fresh.phase !== 'investigation') return
     if (this.storage.checkBudgetExceeded(run.id)) return
 
