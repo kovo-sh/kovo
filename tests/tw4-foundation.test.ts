@@ -86,7 +86,7 @@ test('build output ships Tailwind utilities next to the legacy tokens', async ()
   const assets = await clientCss()
   assert.ok(assets.length > 0, 'no built or compiled CSS found')
 
-  const tailwind = assets.find(({ css }) => css.includes('.bg-panel{'))
+  const tailwind = assets.find(({ css }) => /\.bg-panel(?:,[^{]+)?\{/.test(css))
   assert.ok(tailwind, 'no Tailwind stylesheet in build output')
 
   // Semantic utilities resolve through the legacy token variables (light/dark aware).

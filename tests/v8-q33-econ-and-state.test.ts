@@ -503,7 +503,7 @@ test('state_transition_binding accepts logical state keys ("perm:dual_member", "
   const permTranscript: HostSignedTranscript = {
     entries: [
       signedEntry('gx-ab', { arm: 'control', method: 'GET', pathAndQuery: '/v1/orgs/org_b/secrets', status: 403, timestampMs: 800, actorPersona: 'dual_member', replayAttempt: 'ablation_control', json: { error: 'forbidden' } }),
-      signedEntry('gx-prime', { arm: 'probe', method: 'GET', pathAndQuery: '/v1/permissions', status: 200, timestampMs: 1000, actorPersona: 'dual_member', json: { role: 'admin', cached: true } }),
+      signedEntry('gx-prime', { arm: 'probe', method: 'POST', pathAndQuery: '/v1/permissions/refresh', status: 200, timestampMs: 1000, actorPersona: 'dual_member', json: { role: 'admin', cached: true } }),
       signedEntry('gx-bled', { arm: 'probe', method: 'GET', pathAndQuery: '/v1/orgs/org_b/secrets', status: 200, timestampMs: 1200, actorPersona: 'dual_member', json: { tenantId: 'org_b', records: [{ id: 'sec-1', apiKey: 'k-999' }] } }),
     ],
   }
@@ -511,7 +511,7 @@ test('state_transition_binding accepts logical state keys ("perm:dual_member", "
     chainId: `q33-stb-${entityId.replace(/[^a-z0-9]/gi, '-')}`,
     terminalVulnClass: 'dual_tenant_abac',
     hops: [
-      { hopId: 'hop_1', surface: 'http', target: { origin: ORIGIN, method: 'GET', pathAndQuery: '/v1/permissions' }, exchangeIds: ['gx-prime'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Primed permission cache on own tenant', producedCapabilities: [], consumedCapabilities: [] },
+      { hopId: 'hop_1', surface: 'http', target: { origin: ORIGIN, method: 'POST', pathAndQuery: '/v1/permissions/refresh' }, exchangeIds: ['gx-prime'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Primed permission cache on own tenant', producedCapabilities: [], consumedCapabilities: [] },
       { hopId: 'hop_2', surface: 'http', target: { origin: ORIGIN, method: 'GET', pathAndQuery: '/v1/orgs/org_b/secrets' }, exchangeIds: ['gx-bled'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Accessed org_b secrets using primed permission cache', producedCapabilities: [], consumedCapabilities: [] },
     ],
     causalEdges: [{ kind: 'state_transition_binding', fromHopId: 'hop_1', toHopId: 'hop_2', entityId, ablationExchangeIds: ['gx-ab'] }],
@@ -550,7 +550,7 @@ test('state_transition_binding accepts logical state keys ("perm:dual_member", "
     entries: [
       signedEntry('gx-0', { arm: 'probe', method: 'POST', pathAndQuery: '/v1/session', status: 200, timestampMs: 700, actorPersona: 'dual_member', emittedCapabilities: [cap], json: { session: 's1' } }),
       signedEntry('gx-ab', { arm: 'control', method: 'GET', pathAndQuery: '/v1/orgs/org_b/secrets', status: 403, timestampMs: 800, actorPersona: 'dual_member', replayAttempt: 'ablation_control' }),
-      signedEntry('gx-prime', { arm: 'probe', method: 'GET', pathAndQuery: '/v1/permissions', status: 200, timestampMs: 1000, actorPersona: 'dual_member', consumedCapabilities: [cap], json: { cached: true } }),
+      signedEntry('gx-prime', { arm: 'probe', method: 'POST', pathAndQuery: '/v1/permissions/refresh', status: 200, timestampMs: 1000, actorPersona: 'dual_member', consumedCapabilities: [cap], json: { cached: true } }),
       signedEntry('gx-bled', { arm: 'probe', method: 'GET', pathAndQuery: '/v1/orgs/org_b/secrets', status: 200, timestampMs: 1200, actorPersona: null, consumedCapabilities: [cap], json: { tenantId: 'org_b', records: [{ id: 'sec-1', apiKey: 'k-999' }] } }),
     ],
   }
@@ -559,7 +559,7 @@ test('state_transition_binding accepts logical state keys ("perm:dual_member", "
     terminalVulnClass: 'dual_tenant_abac',
     hops: [
       { hopId: 'hop_0', surface: 'http', target: { origin: ORIGIN, method: 'POST', pathAndQuery: '/v1/session' }, exchangeIds: ['gx-0'], producedCapabilities: [cap], claimedDelta: 'Minted session' },
-      { hopId: 'hop_1', surface: 'http', target: { origin: ORIGIN, method: 'GET', pathAndQuery: '/v1/permissions' }, exchangeIds: ['gx-prime'], consumedCapabilities: [cap], claimedDelta: 'Primed cache' },
+      { hopId: 'hop_1', surface: 'http', target: { origin: ORIGIN, method: 'POST', pathAndQuery: '/v1/permissions/refresh' }, exchangeIds: ['gx-prime'], consumedCapabilities: [cap], claimedDelta: 'Primed cache' },
       { hopId: 'hop_2', surface: 'http', target: { origin: ORIGIN, method: 'GET', pathAndQuery: '/v1/orgs/org_b/secrets' }, exchangeIds: ['gx-bled'], consumedCapabilities: [cap], claimedDelta: 'Read secrets' },
     ],
     causalEdges: [

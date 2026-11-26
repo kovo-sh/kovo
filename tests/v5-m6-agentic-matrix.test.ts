@@ -262,7 +262,7 @@ describe('structured collection and fail-closed classification', () => {
     assert.equal(result.ok, true)
     assert.equal(result.configError, false)
     assert.equal(result.confirmed, 2)
-    assert.equal(result.precision, 0.667)
+    assert.equal(result.precision, 2 / 3)
     assert.equal(result.costUsd, 0.47)
     assert.equal(result.surface, 59)
     assert.equal(result.facts, 65)

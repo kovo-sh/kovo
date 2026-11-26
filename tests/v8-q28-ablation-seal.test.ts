@@ -65,16 +65,22 @@ const fixture = createServer(async (req, res) => {
     const id = parsed.numeric ? String(nextOrderSeq) : `ord-${1000 + nextOrderSeq}`
     const order: OrderState = { id, primed: false, approved: false }
     orders.set(id, order)
-    return jsonRes(res, 201, { id, status: 'draft', order })
+    return jsonRes(res, 201, { id, tenantId: 'org_b', status: 'draft', order })
   }
 
   const patchMatch = /^\/api\/orders\/([^/]+)$/.exec(url.pathname)
+  if (patchMatch && method === 'GET') {
+    const id = decodeURIComponent(patchMatch[1]!)
+    const order = orders.get(id)
+    if (!order) return jsonRes(res, 404, { error: 'not_found' })
+    return jsonRes(res, 200, { id, tenantId: 'org_b', status: order.approved ? 'approved' : order.primed ? 'primed' : 'draft', order })
+  }
   if (patchMatch && method === 'PATCH') {
     const id = decodeURIComponent(patchMatch[1]!)
     const order = orders.get(id)
     if (!order) return jsonRes(res, 404, { error: 'not_found' })
     order.primed = true
-    return jsonRes(res, 200, { id, status: 'primed', primed: true })
+    return jsonRes(res, 200, { id, tenantId: 'org_b', status: 'primed', primed: true })
   }
 
   const approveMatch = /^\/api\/orders\/([^/]+)\/approve$/.exec(url.pathname)
@@ -84,7 +90,7 @@ const fixture = createServer(async (req, res) => {
     if (!order) return jsonRes(res, 404, { error: 'not_found' })
     if (!order.primed) return jsonRes(res, 403, { error: 'maker_checker_denied', id })
     order.approved = true
-    return jsonRes(res, 200, { id, status: 'approved', approved: true, payoutCents: 250000 })
+    return jsonRes(res, 200, { id, tenantId: 'org_b', status: 'approved', approved: true, payoutCents: 250000 })
   }
 
   const invMatch = /^\/api\/invoices\/([^/]+)\/approve$/.exec(url.pathname)

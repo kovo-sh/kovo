@@ -106,7 +106,7 @@ test('Req 1: isPrivilegedActorOrRole allows multi-tenant personas with a low-pri
   assert.equal(isPrivilegedActorOrRole('root_svc', 'viewer', 'viewer (org_a)'), true)
 })
 
-test('Req 1: verifyCompositeReceipt and cross_surface_pivot confirm multi-tenant dual_member when attackerPersonas is omitted', () => {
+test('Req 1: R4-H-6 rejects mixed-role dual_member acting on admin tenant org_a under cross_surface_pivot when attackerPersonas is omitted, while confirming dual_tenant_abac targeting non-admin tenant org_b', () => {
   const dualLabel = 'admin [memberships=admin:org_a,viewer:org_b] (org_a)'
   const cap = 'cap:hop_1:export_sig'
   const ctrl = signedEntry('ex-dm-ctrl', makeStep({
@@ -144,9 +144,42 @@ test('Req 1: verifyCompositeReceipt and cross_surface_pivot confirm multi-tenant
     replayMode: 'fresh_clean_replay',
   }
 
-  // attackerPersonas intentionally omitted -> must CONFIRM for multi-tenant dual_member!
+  // Under R4-H-6, omitted attackerPersonas forbids dual_member acting on its admin tenant (org_a) under cross_surface_pivot.
   const res = verifyCompositeReceipt(receipt, { entries: [ctrl, h1, h2] }, { signingKey: SIGNING_KEY })
-  assert.equal(res.confirmed, true, res.reason)
+  assert.equal(res.confirmed, false, 'R4-H-6 must reject admin-tenant org_a action under cross_surface_pivot when attackerPersonas is omitted')
+  assert.match(res.reason, /pre-seeded persona "dual_member" is forbidden/i)
+
+  // Explicit dual_tenant_abac targeting non-admin tenant org_b confirms with omitted attackerPersonas.
+  const ctrlB = signedEntry('ex-dm-ctrl-b', makeStep({
+    id: 'ex-dm-ctrl-b', arm: 'control', method: 'GET', status: 403, pathAndQuery: '/files/export/org_b/ledger.csv',
+    actor: { handle: 'dual_member', role: 'admin', tenant: 'org_a', auth: 'bearer', sameSite: null },
+    json: { error: 'forbidden' },
+  }), { timestampMs: 900, actorPersona: 'dual_member', actorRoleLabel: dualLabel })
+  const h2B = signedEntry('ex-dm-h2-b', makeStep({
+    id: 'ex-dm-h2-b', arm: 'probe', method: 'GET', status: 200, pathAndQuery: '/files/export/org_b/ledger.csv',
+    actor: { handle: 'dual_member', role: 'admin', tenant: 'org_a', auth: 'bearer', sameSite: null },
+    json: { tenantId: 'org_b', rows: [{ account: 'acct-b', balanceCents: 64000 }] },
+  }), { timestampMs: 1200, actorPersona: 'dual_member', actorRoleLabel: dualLabel, consumedCapabilities: [cap] })
+  const abacReceipt: CompositeProofReceipt = {
+    chainId: 'm2-dual-member-abac-org-b',
+    terminalVulnClass: 'dual_tenant_abac',
+    hops: [
+      { hopId: 'hop_1', surface: 'http', target: { origin: ORIGIN, method: 'POST', pathAndQuery: '/api/exports/sign' }, exchangeIds: ['ex-dm-h1'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Primed export signature from org_a', producedCapabilities: [cap], consumedCapabilities: [] },
+      { hopId: 'hop_2', surface: 'storage', target: { origin: ORIGIN, method: 'GET', pathAndQuery: '/files/export/org_b/ledger.csv' }, exchangeIds: ['ex-dm-h2-b'], oobEventIds: [], browserTraceIds: [], claimedDelta: 'Accessed non-admin tenant org_b ledger', producedCapabilities: [], consumedCapabilities: [cap] },
+    ],
+    causalEdges: [{ kind: 'value_binding', fromHopId: 'hop_1', toHopId: 'hop_2', capabilityHandle: cap }],
+    terminalImpact: {
+      terminalHopId: 'hop_2',
+      claimedImpact: 'Dual-member persona bypassed viewer boundary on non-admin tenant org_b.',
+      summary: 'Dual-member persona bypassed viewer boundary on non-admin tenant org_b.',
+      terminalExchangeId: 'ex-dm-h2-b',
+      preChainControlExchangeIds: ['ex-dm-ctrl-b'],
+      postChainReadbackExchangeIds: [],
+    },
+    replayMode: 'fresh_clean_replay',
+  }
+  const abacRes = verifyCompositeReceipt(abacReceipt, { entries: [ctrlB, h1, h2B] }, { signingKey: SIGNING_KEY })
+  assert.equal(abacRes.confirmed, true, abacRes.reason)
 
   // Same receipt with explicit cross_surface_pivot hydration must set isPrivilegedPreSeeded=false
   const idx: HydratableTranscriptIndex = { entriesById: new Map([[ctrl.exchangeId, ctrl], [h1.exchangeId, h1], [h2.exchangeId, h2]]) }
