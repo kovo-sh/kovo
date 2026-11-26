@@ -151,9 +151,9 @@ describe('CLI parsing', () => {
   })
 
   test('held-out seeds require the salt env and are marked held-out', () => {
-    assert.throws(() => parseMatrixArgs(['--seeds', '1000042'], {}), /KOVO_RB_HELDOUT_SALT/)
-    const args = parseMatrixArgs(['--apps', 'acme-saas', '--seeds', '1,1000042'], SALT_ENV)
-    assert.deepEqual(buildCells(args).map(c => [c.seed, c.seedSet]), [[1, 'dev'], [1000042, 'held-out']])
+    assert.throws(() => parseMatrixArgs(['--seeds', '1000043'], {}), /KOVO_RB_HELDOUT_SALT/)
+    const args = parseMatrixArgs(['--apps', 'acme-saas', '--seeds', '1,1000043'], SALT_ENV)
+    assert.deepEqual(buildCells(args).map(c => [c.seed, c.seedSet]), [[1, 'dev'], [1000043, 'held-out']])
     assert.equal(args.seeds.length, 2)
   })
 
@@ -178,14 +178,14 @@ describe('CLI parsing', () => {
 describe('cell planning', () => {
   test('buildCells orders app -> seed -> mode and labels cells like scorecard artifacts', () => {
     const args = matrixArgs({
-      apps: ['shopflow', 'acme-saas'], seeds: [1, 1000042], modes: ['grey-box', 'white-box'],
+      apps: ['shopflow', 'acme-saas'], seeds: [1, 1000043], modes: ['grey-box', 'white-box'],
     })
     const cells = buildCells(args)
     assert.deepEqual(cells.map(c => c.label), [
       'shopflow-seed1-grey-box', 'shopflow-seed1-white-box',
-      'shopflow-seed1000042-grey-box', 'shopflow-seed1000042-white-box',
+      'shopflow-seed1000043-grey-box', 'shopflow-seed1000043-white-box',
       'acme-saas-seed1-grey-box', 'acme-saas-seed1-white-box',
-      'acme-saas-seed1000042-grey-box', 'acme-saas-seed1000042-white-box',
+      'acme-saas-seed1000043-grey-box', 'acme-saas-seed1000043-white-box',
     ])
     assert.equal(cells[2]!.seedSet, 'held-out')
     assert.equal(cellArtifactPaths('/out', cells[0]!).jsonPath, resolve('/out/shopflow-seed1-grey-box/shopflow-seed1-grey-box.json'))
@@ -199,7 +199,7 @@ describe('cell planning', () => {
     assert.ok(dev.includes('--isolate-data-dir'))
     assert.equal(dev[dev.indexOf('--verifier') + 1], 'docker')
     assert.ok(!dev.includes('--held-out'))
-    const heldout = cellChildArgs(cell({ seed: 1000042, seedSet: 'held-out', label: 'acme-saas-seed1000042-grey-box' }), args)
+    const heldout = cellChildArgs(cell({ seed: 1000043, seedSet: 'held-out', label: 'acme-saas-seed1000043-grey-box' }), args)
     assert.ok(heldout.includes('--held-out'))
     assert.ok(heldout.includes('--budget-usd'))
   })

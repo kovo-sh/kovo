@@ -543,11 +543,12 @@ test('H-4: guardConfirmedFindingMutation blocks severity/identity edits, updateP
   assert.equal(afterUpdate.origin, origin)
   assert.equal(afterUpdate.reason, 'Appended detail')
 
-  // Verify ExecWorkerRunner source wires guardConfirmedFindingMutation + run.id into personaAuth.sessions.generation.
+  // Verify ExecWorkerRunner source wires guardConfirmedFindingMutation + run.id into warm-pool isolation policy.
   const runnerSrc = readFileSync(join(process.cwd(), 'src/server/exec-worker-runner.ts'), 'utf8')
   assert.ok(runnerSrc.includes('guardConfirmedFindingMutation('))
   assert.ok(runnerSrc.includes('stripUntrustedReplayEnvelopes('))
-  assert.ok(runnerSrc.includes('personaAuth.sessions.generation(handle, run.id)'))
+  assert.ok(runnerSrc.includes('buildWarmPoolPolicy('))
+  assert.ok(runnerSrc.includes('runId: run.id'))
 
   // #729 C3 part 2 behavioral proof: rotating a persona in run-B must NOT mutate generation(handle, run-A).
   const pool = new PersonaSessionPool()

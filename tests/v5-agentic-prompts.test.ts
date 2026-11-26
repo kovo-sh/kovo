@@ -259,7 +259,7 @@ test('specialist prompt: contract, read-only confirmed block, hard-surface block
   assert.match(guidance.batching ?? '', /4-8/)
   assert.match(guidance.parallelReadOnly ?? '', /parallel|together/)
   assert.match(guidance.assignmentTarget ?? '', /1-3 linked routes/)
-  assert.match(guidance.turnBudget ?? '', /8-10/)
+  assert.match(guidance.turnBudget ?? '', new RegExp(`^${AGENTIC_SPECIALIST_MAX_TURNS} turns \\(settlement starts at turn ${AGENTIC_SPECIALIST_MAX_TURNS - 2}\\)`))
   assert.match(guidance.settlement ?? '', /N-2/)
 })
 
