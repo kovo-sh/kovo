@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import type { Finding } from '../domain.ts'
+import { cweFamiliesIntersect, isConcreteCwe } from '../vuln-taxonomy.ts'
 import {
   ORIGIN_WIDE_CWE_KEYS,
   computeFindingFingerprint,
@@ -121,6 +122,7 @@ export type SameFindingPredicateReason =
   | 'origin_wide_cwe'
   | 'same_surface'
   | 'origin_mismatch'
+  | 'cwe_family_conflict'
   | 'endpoint_mismatch'
   | 'method_conflict'
   | 'param_conflict'
@@ -628,6 +630,17 @@ function evaluateSameFindingPredicate(
     }
   }
 
+  // R3-11 CWE-family veto: when both findings carry known concrete CWEs whose families do not
+  // intersect (e.g., SQLi CWE-89 vs CMDi CWE-78 or SSTI CWE-1336 sharing `injection-input`, or
+  // BOLA CWE-639 vs Mass Assignment CWE-915), never collapse them on the same surface.
+  if (isConcreteCwe(candCwe) && isConcreteCwe(exCwe) && !cweFamiliesIntersect(candCwe, exCwe)) {
+    return {
+      allowed: false,
+      reason: 'cwe_family_conflict',
+      detail: `CWE family conflict (${candCwe} vs ${exCwe})`,
+    }
+  }
+
   const candEndpoint = normalizeEndpointTemplate(candidate.endpoint)
   const exEndpoint = normalizeEndpointTemplate(existing.endpoint)
   if (candEndpoint !== exEndpoint) {
@@ -832,6 +845,7 @@ export async function judgeSemanticDuplicate(
     '- Mark isDuplicate=true ONLY if fixing one existing finding fixes the candidate (same root cause, same component/middleware/handler).',
     '- Different endpoints with distinct authorization/injection bugs are NOT duplicates, even if they share a CWE.',
     '- Findings that mutate a different parameter, header, GraphQL operation or RPC procedure on the same endpoint are NOT duplicates.',
+    '- Findings with distinct vulnerability classes / CWE families (e.g., SQLi vs command injection vs SSTI vs XXE, or BOLA vs mass assignment) on the same endpoint and parameter are NOT duplicates.',
     '- Findings that resolve to a different verified handler/service path behind a reverse proxy are NOT duplicates.',
     '- Near-identical origin-level misconfigurations (e.g., two CORS reflections on the same host, one Low and one Medium with credentials) ARE duplicates, and shouldUpgrade=true if the candidate proves higher severity/impact.',
     '- If isDuplicate=false, duplicateOfId MUST be null and shouldUpgrade MUST be false.',

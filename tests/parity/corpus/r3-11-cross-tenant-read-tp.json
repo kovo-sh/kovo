@@ -1,0 +1,162 @@
+{
+  "id": "r3-11-cross-tenant-read-tp",
+  "side": "tp",
+  "archetype": "r3-11-cross-tenant-read-identity",
+  "description": "R3-11 TP: cross_tenant_read receipt class confirms cross-tenant authorization boundary violation and binds cleanly to CWE-639 / broken-access-control (never falling through to CWE-200 / misconfig-exposure) across replay, floor receipt, evaluateClaims, and proofReceipt.",
+  "covers": {
+    "files": [
+      "src/server/exec-verify.ts",
+      "src/server/floor-recipe-engine.ts",
+      "src/server/host-fact-log.ts",
+      "src/server/oracle-invariants.ts",
+      "src/server/proof-receipt.ts",
+      "src/server/replay-verifier.ts",
+      "src/server/verify-claims.ts"
+    ],
+    "classes": [
+      "cross_tenant_read",
+      "bola",
+      "authorization"
+    ]
+  },
+  "canonicalLabel": {
+    "cwe": "CWE-639",
+    "category": "broken-access-control",
+    "title": "Cross-tenant read of victim tenant billing record",
+    "impact": "Tenant-B member reads Tenant-A billing record containing victim email and account identifier.",
+    "claimedImpact": "authorization",
+    "claimedBoundary": "access",
+    "vulnClass": "cross_tenant_read"
+  },
+  "freeTextLabel": {
+    "title": "Cross-tenant unauthorized read of another tenant's billing record"
+  },
+  "paths": {
+    "replay": true,
+    "floorReceipt": true,
+    "evaluateClaims": true,
+    "composite": false,
+    "floorInjectionRecipe": false,
+    "proofReceipt": true
+  },
+  "expected": {
+    "confirmed": true
+  },
+  "personas": [
+    {
+      "handle": "owner_a",
+      "roleLabel": "owner (tenant-a)",
+      "role": "owner",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-r311-owner-a"
+    },
+    {
+      "handle": "viewer_b",
+      "roleLabel": "viewer (tenant-b)",
+      "role": "viewer",
+      "tenant": "tenant-b",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-r311-viewer-b"
+    },
+    {
+      "handle": "member_b",
+      "roleLabel": "member (tenant-b)",
+      "role": "member",
+      "tenant": "tenant-b",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-r311-member-b"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "entitled",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/records/rec_tenant_a_42",
+      "persona": "owner_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"id\":\"rec_tenant_a_42\",\"owner_id\":\"owner_a\",\"tenant_id\":\"tenant-a\",\"email\":\"finance@tenant-a.example\",\"balance_cents\":125000}"
+    },
+    {
+      "id": "denied",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/records/rec_tenant_a_42",
+      "persona": "viewer_b",
+      "status": 403,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"error\":\"forbidden\"}"
+    },
+    {
+      "id": "prb",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/records/rec_tenant_a_42",
+      "persona": "member_b",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"id\":\"rec_tenant_a_42\",\"owner_id\":\"owner_a\",\"tenant_id\":\"tenant-a\",\"email\":\"finance@tenant-a.example\",\"balance_cents\":125000}"
+    }
+  ],
+  "replaySpec": {
+    "resourceTenant": "tenant-a",
+    "assertionsJq": "{ controlPassed: (.steps.entitled.status == 200 and .steps.denied.status == 403), confirmed: (.steps.prb.status == 200 and .steps.prb.json.email == .steps.entitled.json.email and .steps.prb.json.tenant_id == \"tenant-a\"), observed: .steps.prb.json.email, expected: \"403\" }"
+  },
+  "proofReceipt": {
+    "vulnClass": "cross_tenant_read",
+    "targetMethod": "GET",
+    "targetPathAndQuery": "/api/records/rec_tenant_a_42",
+    "claimedDelta": "Tenant-B member read Tenant-A confidential billing record under receipt class cross_tenant_read."
+  },
+  "claims": [
+    {
+      "kind": "impact",
+      "impactClass": "authorization",
+      "probeExchangeId": "prb",
+      "controlExchangeIds": [
+        "entitled",
+        "denied"
+      ],
+      "resourceTenant": "tenant-a"
+    }
+  ],
+  "bareClaims": [
+    {
+      "kind": "status",
+      "exchangeId": "entitled",
+      "expected": 200
+    },
+    {
+      "kind": "status",
+      "exchangeId": "denied",
+      "expected": 403
+    },
+    {
+      "kind": "status",
+      "exchangeId": "prb",
+      "expected": 200
+    },
+    {
+      "kind": "body_contains",
+      "exchangeId": "prb",
+      "text": "finance@tenant-a.example"
+    }
+  ]
+}
