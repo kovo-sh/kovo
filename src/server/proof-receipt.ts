@@ -42,6 +42,15 @@ import type { BooleanDifferentialArm, BooleanDifferentialRound, ImpactClass, Imp
 import { isJobOrHandleStub } from './v8-oracle-families.ts'
 import { deriveBooleanRemediationCode, deriveImpactRemediationCode, type OracleFailureCode } from './retry-governor.ts'
 import { assessSignedUrlMintDifferential, type SignedUrlMintExchange } from './verify-support.ts'
+import {
+  canonicalVulnClassForImpact,
+  isAuthBypassLabel,
+  isConservedBalanceLabel,
+  isOobLabel,
+  isSignedUrlMintLabel,
+  resolveImpactClassForLabel,
+  resolveReceiptRule,
+} from './oracle-spec.ts'
 
 export const receiptIdSchema = z.string().trim().min(1).max(128)
 
@@ -561,80 +570,10 @@ export interface ReceiptVerification {
   evidence?: Record<string, unknown>
 }
 
-const OOB_CLASS_RE = /^(?:ssrf|xxe|blind_ssrf|blind_xxe|oob)$/i
-const TIMING_CLASS_RE = /^(?:blind_sqli|sqli_time|sql_time|timing)$/i
-const BOOLEAN_CLASS_RE = /^(?:sqli|sql_boolean|sql_boolean_diff|boolean_sqli|boolean_differential)$/i
-/**
- * The paired status-boolean shape: a benign 2xx baseline, a 2xx tautology arm and a <500
- * contradiction arm on the same request shape. This is deliberately a separate class from `sqli`
- * (which selects the structural differential rule) so a caller can never obtain the weaker status
- * rule by accident.
- */
-const STATUS_DIFF_CLASS_RE = /^(?:sqli_status|sql_status|sql_status_diff|status_sqli|status_boolean)$/i
-const REDIRECT_CLASS_RE = /^(?:open_redirect|redirect|url_redirect|unvalidated_redirect)$/i
-const CONSERVED_BALANCE_CLASS_RE = /^(?:race|race_double_spend|race_condition|race_burst|double_spend|oversell|inventory_oversell|conserved_balance|toctou)$/i
-const AUTH_BYPASS_CLASS_RE = /^(?:auth_bypass|jwt_forgery|broken_auth|auth_protocol|token_forgery|authentication_bypass)$/i
-const SIGNED_URL_MINT_CLASS_RE = /^(?:signed_url_mint|presigned_url_mint|signed_url_traversal|storage_signed_url|gcs_signed_url|s3_presigned_url|azure_sas_mint)$/i
-
-const IMPACT_CLASS_BY_VULN: Readonly<Record<string, ImpactClass>> = {
-  bola: 'authorization',
-  idor: 'authorization',
-  authorization: 'authorization',
-  'broken-access-control': 'authorization',
-  access_control: 'authorization',
-  cross_tenant: 'authorization',
-  cross_tenant_read: 'authorization',
-  cross_tenant_write: 'authorization',
-  bfla: 'bfla',
-  privilege_escalation: 'bfla',
-  mass_assignment: 'mass_assignment',
-  csrf: 'csrf',
-  business_logic: 'business_logic',
-  invariant_violation: 'business_logic',
-  workflow_skip: 'business_logic',
-  xss: 'markup',
-  xss_stored: 'markup',
-  xss_reflected: 'markup',
-  markup: 'markup',
-  html_injection: 'markup',
-  disclosure: 'disclosure',
-  info_disclosure: 'disclosure',
-  secret_disclosed: 'disclosure',
-  // Injection family: the oracle needs an engine fingerprint, a paired boolean/timing arm or OOB
-  // evidence. A bare 2xx -> 4xx/5xx transition is rejected like every other class.
-  injection: 'injection',
-  'injection-input': 'injection',
-  injection_input: 'injection',
-  sqli_error: 'injection',
-  nosqli: 'injection',
-  nosql_injection: 'injection',
-  ssti: 'injection',
-  template_injection: 'injection',
-  command_injection: 'injection',
-  cmdi: 'injection',
-  path_traversal: 'injection',
-  directory_traversal: 'injection',
-}
-
-/** Classify a receipt's vulnerability label into the shared impact model (or a non-impact rule). */
+/** Classify a receipt's vulnerability label via the authoritative `OracleSpec` registry (`R3-13`). */
 export function receiptRuleFor(vulnClass: string, receipt?: Pick<ProofReceipt, 'oobEventIds'>): { rule: ReceiptVerification['rule']; impactClass?: ImpactClass } {
-  if (OOB_CLASS_RE.test(vulnClass)) return { rule: 'oob' }
-  // Webhook forgery has two evidence models: a durable callback remains OOB, while an inline-key
-  // self-signed delivery must prove the signature/control differential over host-recorded requests.
-  if (/^webhook_forgery$/i.test(vulnClass)) {
-    return receipt && receipt.oobEventIds.length === 0 ? { rule: 'webhook' } : { rule: 'oob' }
-  }
-  if (STATUS_DIFF_CLASS_RE.test(vulnClass)) return { rule: 'status_differential' }
-  if (BOOLEAN_CLASS_RE.test(vulnClass)) return { rule: 'boolean' }
-  if (TIMING_CLASS_RE.test(vulnClass)) return { rule: 'timing' }
-  if (CONSERVED_BALANCE_CLASS_RE.test(vulnClass)) return { rule: 'conserved_balance' }
-  if (AUTH_BYPASS_CLASS_RE.test(vulnClass)) return { rule: 'auth_bypass' }
-  if (SIGNED_URL_MINT_CLASS_RE.test(vulnClass)) return { rule: 'impact', impactClass: 'authorization' }
-  if (REDIRECT_CLASS_RE.test(vulnClass)) return { rule: 'redirect' }
-  const impactClass = IMPACT_CLASS_BY_VULN[vulnClass.toLowerCase()]
-  if (impactClass) return { rule: 'impact', impactClass }
-  if (/^browser_|^dom_|^postmessage/i.test(vulnClass)) return { rule: 'browser' }
-  return { rule: 'none' }
+  const { rule, impactClass } = resolveReceiptRule(vulnClass, receipt)
+  return impactClass ? { rule, impactClass } : { rule }
 }
 
 function reject(receipt: ProofReceipt, rule: ReceiptVerification['rule'], reason: string, failureCode: OracleFailureCode = 'oracle_disagreement'): ReceiptVerification {
@@ -783,7 +722,7 @@ export function verifyReceipt(
   const missingTrace = receipt.browserTraceIds.find(id => !tracesById.has(id))
   if (missingTrace) return reject(receipt, rule, `Receipt cites browser trace ${missingTrace}, which is absent from the transcript.`)
 
-  if (SIGNED_URL_MINT_CLASS_RE.test(receipt.vulnClass)) {
+  if (isSignedUrlMintLabel(receipt.vulnClass)) {
     return verifySignedUrlMintReceipt(receipt, entriesById, rule)
   }
 
@@ -4202,17 +4141,6 @@ export interface ScriptProofExchange {
   responseHeaders?: Record<string, string> | null
 }
 
-const IMPACT_CLASS_TO_VULN_CLASS: Readonly<Record<string, string>> = {
-  authorization: 'authorization',
-  bfla: 'bfla',
-  mass_assignment: 'mass_assignment',
-  csrf: 'csrf',
-  business_logic: 'business_logic',
-  markup: 'markup',
-  disclosure: 'disclosure',
-  injection: 'injection',
-}
-
 function recordField(record: Record<string, unknown>, key: string): unknown {
   return record[key]
 }
@@ -4265,7 +4193,7 @@ export function buildAgentScriptReceipt(input: {
       : typeof recordField(claim, 'vulnClass') === 'string'
         ? (recordField(claim, 'vulnClass') as string).trim()
         : ''
-    if (!SIGNED_URL_MINT_CLASS_RE.test(rawTermClass)) continue
+    if (!isSignedUrlMintLabel(rawTermClass)) continue
     if (kind !== 'composite_receipt' && kind !== 'signed_url_mint' && kind !== 'impact') continue
     const explicitControl = typeof recordField(claim, 'controlExchangeId') === 'string'
       ? (recordField(claim, 'controlExchangeId') as string)
@@ -4312,13 +4240,13 @@ export function buildAgentScriptReceipt(input: {
     if (typeof impactClass !== 'string') continue
     const rawVulnClass = recordField(claim, 'vulnClass')
     const explicitVuln = typeof rawVulnClass === 'string' ? rawVulnClass.trim().toLowerCase() : ''
-    const vulnClass = explicitVuln && AUTH_BYPASS_CLASS_RE.test(explicitVuln)
+    const vulnClass = explicitVuln && isAuthBypassLabel(explicitVuln)
       ? explicitVuln
       : impactClass === 'injection' && /^(?:sqli|sql_injection)$/i.test(explicitVuln)
         ? 'sqli_error'
-        : explicitVuln && IMPACT_CLASS_BY_VULN[explicitVuln] === impactClass
+        : explicitVuln && resolveImpactClassForLabel(explicitVuln) === impactClass
           ? explicitVuln
-          : IMPACT_CLASS_TO_VULN_CLASS[impactClass]
+          : canonicalVulnClassForImpact(impactClass)
     if (!vulnClass) continue
     const probeId = recordField(claim, 'probeExchangeId')
     if (typeof probeId !== 'string') continue
@@ -4420,7 +4348,7 @@ export function buildAgentScriptReceipt(input: {
       (headerValue(probe.requestHeaders, 'cookie') && headerValue(probe.requestHeaders, 'cookie') !== headerValue(control.requestHeaders, 'cookie')) ||
       probeWireHasHostCred,
     )
-    const isAuthBypass = AUTH_BYPASS_CLASS_RE.test(rawVuln) ||
+    const isAuthBypass = isAuthBypassLabel(rawVuln) ||
       (boundaryClass === 'auth' && !rawVuln && !normalizedAuthHandle(control.actor) && !probeHasHostCredential)
     const probeMethod = probe.method.toUpperCase()
     // Mutating BOLA/BFLA boundary claims require persisted before/after readbacks (`impact` claim);
@@ -4432,7 +4360,7 @@ export function buildAgentScriptReceipt(input: {
     } else if (probeMethod !== 'GET' && probeMethod !== 'HEAD') {
       continue
     }
-    const vulnClass = rawVuln && (AUTH_BYPASS_CLASS_RE.test(rawVuln) || IMPACT_CLASS_BY_VULN[rawVuln])
+    const vulnClass = rawVuln && (isAuthBypassLabel(rawVuln) || resolveImpactClassForLabel(rawVuln))
       ? rawVuln
       : isAuthBypass
         ? 'auth_bypass'
@@ -4667,7 +4595,7 @@ export function buildAgentScriptReceipt(input: {
         evidenceRoleOverrides,
       })
       const rawClass = recordField(claim, 'vulnClass')
-      const vulnClass = typeof rawClass === 'string' && CONSERVED_BALANCE_CLASS_RE.test(rawClass.trim())
+      const vulnClass = typeof rawClass === 'string' && isConservedBalanceLabel(rawClass.trim())
         ? rawClass.trim()
         : 'race_double_spend'
       const balanceField = typeof recordField(claim, 'balanceField') === 'string' ? (recordField(claim, 'balanceField') as string).trim() : ''
@@ -4797,7 +4725,7 @@ export function buildAgentScriptReceipt(input: {
       ? (recordField(claim, 'vulnClass') as string).trim().toLowerCase()
       : ''
     const msg = `${input.title} ${String(recordField(claim, 'message') ?? '')}`.toLowerCase()
-    const vulnClass = rawVuln && OOB_CLASS_RE.test(rawVuln)
+    const vulnClass = rawVuln && isOobLabel(rawVuln)
       ? rawVuln
       : /\bxxe\b|xml external/.test(msg)
         ? 'xxe'

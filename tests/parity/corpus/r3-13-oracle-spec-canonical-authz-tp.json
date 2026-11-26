@@ -1,0 +1,115 @@
+{
+  "id": "r3-13-oracle-spec-canonical-authz-tp",
+  "side": "tp",
+  "archetype": "r3-13-oracle-spec-cross-tenant-bola-tp",
+  "description": "R3-13 TP: genuine cross-tenant object read (owner_a 200, anon 401, foreign tenant-b owner_b 200 reading tenant-a private invoice) confirms consistently through the OracleSpec-backed confirmation kernel.",
+  "covers": {
+    "files": [
+      "src/server/oracle-spec.ts",
+      "src/server/terminal-oracle-registry.ts",
+      "src/server/proof-receipt.ts",
+      "src/server/v8-oracle-hydrate.ts",
+      "src/server/oracle-invariants.ts",
+      "src/server/verify-claims.ts"
+    ],
+    "classes": [
+      "bola",
+      "idor",
+      "authorization",
+      "cross_tenant_read"
+    ]
+  },
+  "canonicalLabel": {
+    "cwe": "CWE-639",
+    "category": "bola",
+    "title": "Cross-tenant invoice disclosure on /api/invoices/inv_a99 under OracleSpec registry",
+    "impact": "Authenticated tenant-b caller reads private tenant-a invoice containing customer PII and payout totals while anonymous callers receive 401.",
+    "claimedImpact": "authorization",
+    "claimedBoundary": "access",
+    "vulnClass": "bola"
+  },
+  "freeTextLabel": {
+    "title": "Cross-tenant unauthorized access to another workspace's private invoice"
+  },
+  "paths": {
+    "replay": true,
+    "floorReceipt": true,
+    "evaluateClaims": true,
+    "composite": false,
+    "floorInjectionRecipe": false,
+    "proofReceipt": true
+  },
+  "expected": {
+    "confirmed": true
+  },
+  "personas": [
+    {
+      "handle": "owner_a",
+      "roleLabel": "owner (tenant-a)",
+      "role": "owner",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-r313-owner-a-token"
+    },
+    {
+      "handle": "owner_b",
+      "roleLabel": "owner (tenant-b)",
+      "role": "owner",
+      "tenant": "tenant-b",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-r313-owner-b-token"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "ctl_owner_a",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/invoices/inv_a99",
+      "persona": "owner_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"id\":\"inv_a99\",\"tenant_id\":\"tenant-a\",\"owner_email\":\"billing@tenant-a.example\",\"amount_cents\":420000,\"iban\":\"DE89370400440532013000\"}"
+    },
+    {
+      "id": "ctl_anon",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/invoices/inv_a99",
+      "persona": null,
+      "status": 401,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"error\":\"authentication_required\"}"
+    },
+    {
+      "id": "prb_owner_b",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/invoices/inv_a99",
+      "persona": "owner_b",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"id\":\"inv_a99\",\"tenant_id\":\"tenant-a\",\"owner_email\":\"billing@tenant-a.example\",\"amount_cents\":420000,\"iban\":\"DE89370400440532013000\"}"
+    }
+  ],
+  "replaySpec": {
+    "assertionsJq": "{ controlPassed: (.steps.ctl_owner_a.status == 200 and .steps.ctl_anon.status == 401), confirmed: (.steps.prb_owner_b.status == 200 and .steps.prb_owner_b.json.tenant_id == \"tenant-a\"), observed: \"owner_b read tenant-a invoice\", expected: \"403\" }"
+  },
+  "proofReceipt": {
+    "vulnClass": "bola",
+    "targetMethod": "GET",
+    "targetPathAndQuery": "/api/invoices/inv_a99",
+    "claimedDelta": "Foreign tenant-b caller read private tenant-a invoice while unauthenticated requests were denied 401."
+  },
+  "claims": [
+    { "kind": "impact", "impactClass": "authorization", "probeExchangeId": "prb_owner_b", "controlExchangeIds": ["ctl_owner_a", "ctl_anon"] }
+  ]
+}

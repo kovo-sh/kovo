@@ -48,29 +48,23 @@ import {
   type HydratableTranscriptIndex,
 } from './v8-oracle-hydrate.ts'
 
+import {
+  DEFAULT_ORACLE_SPEC_REGISTRY,
+  REGISTERED_SINGLE_HOP_RULES,
+  REGISTERED_V8_FAMILIES,
+  canonicalCweForOracle,
+  labelToOracle,
+  listRegisteredClaimEvaluatorKinds,
+  type LabelToOracleQuery,
+  type OracleClaimKind,
+  type OracleSpec,
+} from './oracle-spec.ts'
+
 export type SingleHopOracleRule = Exclude<ReceiptVerification['rule'], 'none'>
 
-export const SINGLE_HOP_ORACLE_RULES: readonly SingleHopOracleRule[] = [
-  'impact',
-  'oob',
-  'timing',
-  'boolean',
-  'status_differential',
-  'browser',
-  'redirect',
-  'conserved_balance',
-  'auth_bypass',
-  'webhook',
-]
+export const SINGLE_HOP_ORACLE_RULES: readonly SingleHopOracleRule[] = REGISTERED_SINGLE_HOP_RULES
 
-export const REGISTERED_V8_ORACLE_FAMILIES: readonly V8OracleFamily[] = [
-  'dual_tenant_abac',
-  'temporal_revocation',
-  'economic_conservation',
-  'cryptographic_scope_replay',
-  'parser_cache_differential',
-  'cross_surface_pivot',
-]
+export const REGISTERED_V8_ORACLE_FAMILIES: readonly V8OracleFamily[] = REGISTERED_V8_FAMILIES
 
 export type TerminalOraclePointerRef =
   | {
@@ -400,6 +394,22 @@ export class TerminalOracleRegistry {
 
   listRegisteredV8Families(): readonly V8OracleFamily[] {
     return [...this.v8Families.keys()]
+  }
+
+  listOracleSpecs(): readonly OracleSpec[] {
+    return DEFAULT_ORACLE_SPEC_REGISTRY.list()
+  }
+
+  resolveOracleSpec(input: string | LabelToOracleQuery): OracleSpec | null {
+    return labelToOracle(input, DEFAULT_ORACLE_SPEC_REGISTRY)
+  }
+
+  canonicalCweFor(input: string | LabelToOracleQuery): string | null {
+    return canonicalCweForOracle(input, DEFAULT_ORACLE_SPEC_REGISTRY)
+  }
+
+  listRegisteredClaimKinds(): readonly OracleClaimKind[] {
+    return listRegisteredClaimEvaluatorKinds()
   }
 
   /**
