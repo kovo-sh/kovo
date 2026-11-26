@@ -119,7 +119,7 @@ function deriveActiveLeaseGrants(detail: ReturnType<typeof useRun>['detail']) {
 const rlItemClass =
   'mr-3 inline-flex h-3.5 flex-none items-center gap-1.5 whitespace-nowrap border-r border-line pr-3 last:border-r-0 data-[lastv=true]:border-r-0'
 const rlBtnClass =
-  'group/rlb mr-3 inline-flex h-3.5 flex-none cursor-pointer items-center gap-1.5 whitespace-nowrap rounded-none border-0 border-r border-line bg-transparent p-0 pr-3 font-sans text-[12.5px] font-normal text-inherit shadow-none last:border-r-0 data-[lastv=true]:border-r-0 hover:bg-transparent'
+  'group/rlb mr-3 inline-flex h-auto min-h-[22px] flex-none cursor-pointer items-center gap-1.5 whitespace-nowrap rounded-none border-0 border-r border-line bg-transparent py-0.5 pl-0 pr-3 font-sans text-[12.5px] font-normal text-inherit shadow-none last:border-r-0 data-[lastv=true]:border-r-0 hover:bg-transparent'
 
 export function RunHeader() {
   const { detail, send, pending } = useRun()
@@ -181,7 +181,7 @@ export function RunHeader() {
   }
 
   const item = (icon: IconName, label: ReactNode, onClick: () => void, opts: { disabled?: boolean; danger?: boolean; right?: ReactNode } = {}) =>
-    <button type="button" className={runDdItem({ danger: opts.danger })} disabled={opts.disabled} onClick={() => { if (!opts.disabled) onClick() }}>
+    <button type="button" role="menuitem" className={runDdItem({ danger: opts.danger })} disabled={opts.disabled} onClick={() => { if (!opts.disabled) onClick() }}>
       <Icon name={icon} className={opts.danger ? 'text-danger' : 'text-fg-subtle'} />
       <span>{label}</span>
       {opts.right != null && <span className="ml-auto text-[11.5px] text-fg-subtle">{opts.right}</span>}
@@ -204,7 +204,7 @@ export function RunHeader() {
           () => toast.show('Could not copy run ID', { tone: 'error' }),
         )}
       >
-        <span>{fmtAgo(r.createdAt)}</span>
+        <span suppressHydrationWarning>{fmtAgo(r.createdAt)}</span>
         <Icon name="copy" size={11} className="text-fg-subtle opacity-65 transition-[opacity,color] duration-[var(--d1)] group-hover/cc:text-fg-muted group-hover/cc:opacity-100" />
       </button>
       {editingLabel ? (
@@ -398,8 +398,8 @@ export function RunHeader() {
         <span className="group-hover/rlb:text-fg">Leases</span>
         <span className="text-fg-subtle group-hover/rlb:text-fg-muted">· {totalGrants}</span>
       </button>}
-      <span className={rlItemClass} data-rl="" data-p="1" title={`Started ${fmtFullDateTime(r.createdAt)}`} suppressHydrationWarning>
-        <span className="text-fg-subtle">{r.status === 'running' || dur > 60_000 ? fmtDur(dur) : 'Created ' + fmtTime(r.createdAt)}</span>
+      <span className={rlItemClass} data-rl="" data-p="1" title={`Started ${fmtFullDateTime(r.createdAt)}`}>
+        <span className="text-fg-subtle" suppressHydrationWarning>{r.status === 'running' || dur > 60_000 ? fmtDur(dur) : 'Created ' + fmtTime(r.createdAt)}</span>
       </span>
     </div>
   </header>
