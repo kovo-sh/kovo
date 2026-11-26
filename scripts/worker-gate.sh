@@ -66,11 +66,12 @@ if grep -q "invariant.confirmation_evidence" src/server/store.ts \
   fail=1
 fi
 
-# Fast contract invariants: planner/dedupe/orchestration behavior that engine-port broke.
+# Fast contract invariants: planner/dedupe/orchestration + systemic contract canary stress gate.
 run "contract invariants" node --test \
   tests/v4-m7-orch.test.ts \
   tests/v5-m1-wiring-correctness.test.ts \
-  tests/v5-m2-state.test.ts
+  tests/v5-m2-state.test.ts \
+  tests/sys-contract-canary.test.ts
 
 if (( ${#SLICE_ARGS[@]} > 0 )); then
   run "targeted slice" bash scripts/bench-slice.sh "${SLICE_ARGS[@]}"

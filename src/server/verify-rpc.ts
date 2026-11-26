@@ -55,6 +55,7 @@ import {
   isDerivedCapabilityHandle,
   resolveVerifyRpcScratchRoot,
 } from './derived-custody.ts'
+import { resolveRunSafetyBudgets, type RunSafetyBudgets } from './run-safety-budgets.ts'
 import type {
   AsyncPollProfile,
   CapabilityConsumptionAttestation,
@@ -236,8 +237,10 @@ export interface VerifyRpcSessionOptions {
   maxSealsPerRun?: number
   /** Maximum `capability.seal` calls allowed per (origin+path+persona) endpoint per run (default 256). */
   maxSealsPerEndpoint?: number
-  /** Maximum `composite.verify` RPC calls allowed across the entire run (default 1024, R2-C-3 budget). */
+  /** Maximum `composite.verify` RPC calls allowed across the entire run (default from RunSafetyBudgets). */
   maxCompositeVerifiesPerRun?: number
+  /** Optional unified RunSafetyBudgets policy overrides resolved via `resolveRunSafetyBudgets`. */
+  safetyBudgets?: Partial<RunSafetyBudgets>
   /** Canonical request admission engine (defaults to the broker's engine). */
   admissionEngine?: RequestAdmissionEngine
 }
@@ -308,6 +311,7 @@ export class VerifyRpcServer {
   readonly nonce: string
   readonly transcript: TranscriptStore
   readonly capabilityVault: DerivedCapabilityVault
+  readonly safetyBudgets: RunSafetyBudgets
   private readonly options: VerifyRpcSessionOptions
   private readonly admissionEngine: RequestAdmissionEngine
   private readonly compositeSigningKey: string
@@ -345,8 +349,18 @@ export class VerifyRpcServer {
     const safeRunId = /^[A-Za-z0-9._-]{1,128}$/.test(options.runId)
       ? options.runId
       : options.runId.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 128) || 'run'
+    this.safetyBudgets = resolveRunSafetyBudgets({
+      overrides: {
+        ...options.safetyBudgets,
+        ...(options.maxSealsPerRun !== undefined ? { maxSealsPerRun: options.maxSealsPerRun } : {}),
+        ...(options.maxSealsPerEndpoint !== undefined ? { maxSealsPerEndpoint: options.maxSealsPerEndpoint } : {}),
+        ...(options.maxCompositeVerifiesPerRun !== undefined ? { maxCompositeVerifiesPerRun: options.maxCompositeVerifiesPerRun } : {}),
+      },
+    })
     this.capabilityVault = options.capabilityVault ?? new DerivedCapabilityVault({
       runId: safeRunId,
+      maxEntries: this.safetyBudgets.maxVaultEntries,
+      maxSealAttempts: this.safetyBudgets.maxSealAttempts,
       ...(options.capabilityPersistPath ? { persistPath: options.capabilityPersistPath } : {}),
     })
     const getKernelSecrets = (): NamedSecret[] => {
@@ -1603,8 +1617,8 @@ export class VerifyRpcServer {
     const endpointPath = (sourceRecord.request?.pathAndQuery ?? '/').split('?')[0]
     const endpointKey = `${sourceRecord.request?.origin ?? ''}|${endpointPath}|${sourceRecord.request?.personaHandle ?? ''}`
     consumeRunSealBudget(this.options.runId, endpointKey, {
-      maxPerRun: this.options.maxSealsPerRun,
-      maxPerEndpoint: this.options.maxSealsPerEndpoint,
+      maxPerRun: this.options.maxSealsPerRun ?? this.options.safetyBudgets?.maxSealsPerRun,
+      maxPerEndpoint: this.options.maxSealsPerEndpoint ?? this.options.safetyBudgets?.maxSealsPerEndpoint,
     })
     this.totalSealAttempts = checkSealRateLimit(
       this.sealAttemptsByExchange, exchangeId, this.totalSealAttempts,
@@ -1676,7 +1690,7 @@ export class VerifyRpcServer {
     if (alg !== 'sha256' && alg !== 'sha384' && alg !== 'sha512') throw new Error(`Unsupported HMAC alg "${String(alg)}".`)
     if (encoding !== 'hex' && encoding !== 'base64' && encoding !== 'base64url') throw new Error(`Unsupported HMAC encoding "${String(encoding)}".`)
     // R2-C-4: Charge run-scoped seal budget for every HMAC signing request.
-    consumeRunSealBudget(this.options.runId, undefined, { maxPerRun: this.options.maxSealsPerRun })
+    consumeRunSealBudget(this.options.runId, undefined, { maxPerRun: this.options.maxSealsPerRun ?? this.options.safetyBudgets?.maxSealsPerRun })
 
     if (!secretHandle) {
       const lit = computeNonSecretLiteralHmac({ literalKey, payload, alg, encoding, isRedacted: v => this.scrub(v) !== v, vault: this.capabilityVault })
@@ -1768,7 +1782,7 @@ export class VerifyRpcServer {
       : undefined
     const requestedHopId = typeof args.hopReceiptId === 'string' && args.hopReceiptId.trim() ? args.hopReceiptId.trim() : undefined
     const requestedSlot = typeof args.slot === 'string' && args.slot.trim() ? args.slot.trim() : undefined
-    consumeRunSealBudget(this.options.runId, undefined, { maxPerRun: this.options.maxSealsPerRun })
+    consumeRunSealBudget(this.options.runId, undefined, { maxPerRun: this.options.maxSealsPerRun ?? this.options.safetyBudgets?.maxSealsPerRun })
     const sourceMeta = this.capabilityVault.getMeta(secretHandle)
     const effectiveHopId = requestedHopId ?? sourceMeta?.hopReceiptId
     const effectiveSlot = requestedSlot && effectiveHopId
@@ -2176,7 +2190,7 @@ export class VerifyRpcServer {
     if (!rawObj || !Array.isArray(rawObj.hops) || rawObj.hops.length === 0) {
       throw new Error('composite.verify requires a receipt object with a non-empty hops array.')
     }
-    consumeRunCompositeVerifyBudget(this.options.runId, this.options.maxCompositeVerifiesPerRun)
+    consumeRunCompositeVerifyBudget(this.options.runId, this.options.maxCompositeVerifiesPerRun ?? this.options.safetyBudgets?.maxCompositeVerifiesPerRun)
     // Security invariant: RPC callers can never weaken host-configured attackerPersonas, forbiddenShortcutPersonas, benchmarkMode, requireCleanSessionFlag, or signingKey.
     const verdict = this.verifyComposite(rawReceipt)
     const hops = rawObj.hops, ti = asRecord(rawObj.terminalImpact)
