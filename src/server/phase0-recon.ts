@@ -7,7 +7,6 @@ import type { ManifestFile } from '../templates/tech-tags.ts'
 import { BrokerCircuitOpen, BrokerDenied } from './broker.ts'
 import type { BrokerExchangeResult, Grant, RequestBroker } from './broker.ts'
 import type { CanaryBroker } from './canary-broker.ts'
-import { normalizeEndpointTemplate } from './dedupe.ts'
 import { listMountedRepos } from './github-connector.ts'
 import {
   buildCodeDataflowSlice,
@@ -26,6 +25,7 @@ import type {
   RouteSinkPath,
   ServiceOriginMapping,
 } from './program-graph.ts'
+import { normalizeRouteTemplate } from './route-template.ts'
 import { buildSoft404ProbePaths } from './scoped-browser.ts'
 import type { ScopedBrowser } from './scoped-browser.ts'
 import {
@@ -296,36 +296,13 @@ function sanitizePathCandidate(raw: string, baseOrigin: string): string | null {
   return sanitizeSameOriginPath(raw, baseOrigin)
 }
 
-function normalizeRouteTemplate(rawPath: string): string {
-  const bare = rawPath.split('?')[0] || '/'
-  // Convert framework dynamic segments ([id], {id}, <int:id>, <id>) to :id while preserving named placeholders
-  const cleaned = bare
-    .replace(/\/\[\.\.\.([a-zA-Z0-9_-]+)\]/g, '/:$1')
-    .replace(/\/\[([a-zA-Z0-9_-]+)\]/g, '/:$1')
-    .replace(/\/\{([a-zA-Z0-9_-]+)\}/g, '/:$1')
-    .replace(/\/<(?:[a-zA-Z0-9_]+:)?([a-zA-Z0-9_-]+)>/g, '/:$1')
-  // Request paths are case-sensitive: preserve literal segment case (only built-in token shapes
-  // are collapsed to `:id`). Fingerprinting/dedupe opts back into lowercasing separately.
-  const normalized = normalizeEndpointTemplate(cleaned, { preserveCase: true })
-  return normalized.startsWith('/') ? normalized : `/${normalized}`
-}
-
 /**
  * Discovery-facing route normalizer: preserves named parameter identifiers (`:orgId`, `:invoiceId`)
  * and literal segment casing (`/trpc/user.getById`, `/api/getInvoice`), normalizing only framework
  * token forms (`[id]`, `{id}`, `<int:id>`) to `:id`. Aggressive folding stays in `dedupe.ts`.
  */
 export function normalizeDiscoveryTemplate(rawPath: string): string {
-  const bare = (rawPath.split('?')[0] || '/').split('#')[0] || '/'
-  const segments = bare.split('/').map(seg => {
-    if (!seg) return ''
-    if (/^:[A-Za-z_][A-Za-z0-9_-]{0,63}$/.test(seg)) return seg
-    if (/^\[[^\]]{1,64}\]$/.test(seg) || /^\{[^}]{1,64}\}$/.test(seg) || /^<[^>]{1,64}>$/.test(seg)) return ':id'
-    return seg
-  })
-  const joined = segments.join('/').replace(/\/{2,}/g, '/')
-  const trimmed = joined.length > 1 && joined.endsWith('/') ? joined.slice(0, -1) : joined
-  return trimmed.startsWith('/') ? trimmed : `/${trimmed}`
+  return normalizeRouteTemplate(rawPath, { preserveColonParams: true, collapseConcreteIds: false })
 }
 
 /**

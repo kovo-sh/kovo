@@ -302,6 +302,8 @@ export interface ImpactInput {
    * nothing.
    */
   credentialPatterns?: readonly string[] | null
+  /** Runtime-registered canary / secret markers (with optional owning tenant) for this assessment. */
+  canaryMarkers?: ReadonlyArray<string | RegisteredCanaryMarker> | null
   /** Extra injection-arm evidence (boolean rounds, timing, OOB, status-boolean exception). */
   injection?: InjectionEvidence
 }
@@ -413,8 +415,12 @@ function listingLeaves(steps: readonly ImpactStep[]): Set<string> {
  * binds an owner-scoped identity to another principal or carries a tenant/secret canary (a real
  * disclosure that a public surface would not have).
  */
-export function assessPublicness(args: { steps: readonly ImpactStep[]; probe: ImpactStep }): PublicnessAssessment {
-  const { steps, probe } = args
+export function assessPublicness(args: {
+  steps: readonly ImpactStep[]
+  probe: ImpactStep
+  canaryMarkers?: ReadonlyArray<string | RegisteredCanaryMarker> | null
+}): PublicnessAssessment {
+  const { steps, probe, canaryMarkers } = args
   if (!isReadMethod(probe.method) || !isSuccess(probe.status)) return { public: false, reason: '' }
   const probeTenant = probe.actor.tenant ?? null
   const sameRouteReads = steps.filter(step =>
@@ -480,7 +486,7 @@ export function assessPublicness(args: { steps: readonly ImpactStep[]; probe: Im
         // Bound when the same value is served to a *control* actor (the owner reference read).
         if (!controlFlats.some(flat => flat.get(path) === value)) return false
         const leaf = (path.replace(/\[\d+\]/g, '').split('.').pop() ?? '').toLowerCase()
-        return isOwnerBoundIdentity(leaf, value, reference)
+        return isOwnerBoundIdentity(leaf, value, reference, canaryMarkers)
       })
       : false
     if (ownerBound) continue
@@ -597,11 +603,67 @@ const PRINCIPAL_IDENTITY_FIELD_RE = /^(?:[a-z0-9]+[_-])*(?:owner(?:_?id)?|tenant
 const ATTRIBUTION_FIELD_RE = /^(?:[a-z0-9]+[_-])*(?:author|subject)$/i
 const EMAIL_VALUE_RE = /^[^\s@]{1,64}@[^\s@]{1,128}\.[a-z]{2,24}$/i
 const SECRET_FIELD_RE = /^(?:[a-z0-9]+[_-])*(?:secret|api_?key|access_?token|token|password|hash|private_?note|note|internal|ssn)$/i
-/** Tenant/secret canary value shape emitted by the lab canary registry (`rbc_`/`rbs_`). */
-const CANARY_VALUE_RE = /\brb[cs]_[a-z0-9]+_[0-9a-f]{6,}\b/i
+/** Runtime-registered canary / secret marker entry for generic owner/tenant disclosure matching. */
+export interface RegisteredCanaryMarker {
+  value: string
+  tenant?: string | null
+}
 
-function isOwnerBoundIdentity(leaf: string, value: string, reference?: ImpactStep | null): boolean {
-  if (CANARY_VALUE_RE.test(value)) return true
+const runtimeCanaryRegistry = new Map<string, RegisteredCanaryMarker>()
+
+function normalizeCanaryEntry(marker: string | RegisteredCanaryMarker): RegisteredCanaryMarker | null {
+  if (typeof marker === 'string') {
+    const value = marker.trim()
+    return value ? { value, tenant: null } : null
+  }
+  const value = typeof marker.value === 'string' ? marker.value.trim() : ''
+  if (!value) return null
+  const tenant = typeof marker.tenant === 'string' && marker.tenant.trim() ? marker.tenant.trim().toLowerCase() : null
+  return { value, tenant }
+}
+
+/** Register a runtime canary/secret marker so impact validation can detect it without hardcoded prefixes. */
+export function registerCanaryMarker(marker: string | RegisteredCanaryMarker): void {
+  const entry = normalizeCanaryEntry(marker)
+  if (!entry) return
+  runtimeCanaryRegistry.set(entry.value, entry)
+}
+
+/** Register multiple runtime canary/secret markers. */
+export function registerCanaryMarkers(markers: ReadonlyArray<string | RegisteredCanaryMarker>): void {
+  for (const marker of markers) registerCanaryMarker(marker)
+}
+
+/** Clear all runtime-registered canary/secret markers (primarily for isolated test cleanup). */
+export function clearRegisteredCanaryMarkers(): void {
+  runtimeCanaryRegistry.clear()
+}
+
+/** Match a value against runtime-registered canary/secret markers (global registry + per-call extras). */
+export function matchRegisteredCanary(
+  value: string,
+  extraMarkers?: ReadonlyArray<string | RegisteredCanaryMarker> | null,
+): RegisteredCanaryMarker | null {
+  if (!value) return null
+  if (extraMarkers) {
+    for (const raw of extraMarkers) {
+      const entry = normalizeCanaryEntry(raw)
+      if (entry && value.includes(entry.value)) return entry
+    }
+  }
+  for (const entry of runtimeCanaryRegistry.values()) {
+    if (value.includes(entry.value)) return entry
+  }
+  return null
+}
+
+function isOwnerBoundIdentity(
+  leaf: string,
+  value: string,
+  reference?: ImpactStep | null,
+  canaryMarkers?: ReadonlyArray<string | RegisteredCanaryMarker> | null,
+): boolean {
+  if (matchRegisteredCanary(value, canaryMarkers) !== null) return true
   if (reference && reference.actor.handle === null) return false
   if (PRINCIPAL_IDENTITY_FIELD_RE.test(leaf)) return true
   if (ATTRIBUTION_FIELD_RE.test(leaf)) {
@@ -936,6 +998,7 @@ export function hasForeignTenantOrOwnerDisclosure(
   steps: readonly ImpactStep[],
   probe: ImpactStep,
   declaredResourceTenant?: string | null,
+  canaryMarkers?: ReadonlyArray<string | RegisteredCanaryMarker> | null,
 ): boolean {
   if (probe.json === undefined || probe.json === null || typeof probe.json !== 'object') return false
   const flat = flattenJson(probe.json)
@@ -978,8 +1041,8 @@ export function hasForeignTenantOrOwnerDisclosure(
         }
       }
     }
-    const canaryMatch = /\brbc_([a-z0-9-]+)_[0-9a-f]{8,}\b/i.exec(val)
-    if (canaryMatch && probeTenant && canaryMatch[1]!.toLowerCase() !== probeTenant.replace(/[^a-z0-9-]/g, '')) {
+    const matchedCanary = matchRegisteredCanary(rawValue, canaryMarkers) ?? matchRegisteredCanary(val, canaryMarkers)
+    if (matchedCanary?.tenant && probeTenant && matchedCanary.tenant !== probeTenant) {
       return true
     }
   }
@@ -1248,7 +1311,7 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
     // anonymous caller served the *same* payload the owner reference receives is reading the same
     // public object. Catalog/product surfaces (storefront browse, item detail, public store page)
     // are readable by design; a genuine crossing still differs, or binds owner-scoped data.
-    const publicness = assessPublicness({ steps, probe })
+    const publicness = assessPublicness({ steps, probe, canaryMarkers: input.canaryMarkers })
     if (publicness.public && !roleDifferential) {
       return {
         required: true,
@@ -1276,7 +1339,7 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
         ? [...probeFlat.entries()].some(([path, value]) => {
           if (!value || value === 'null') return false
           const leaf = (path.replace(/\[\d+\]/g, '').split('.').pop() ?? '').toLowerCase()
-          return isOwnerBoundIdentity(leaf, value)
+          return isOwnerBoundIdentity(leaf, value, undefined, input.canaryMarkers)
         })
         : false)
       if (!hasPrincipalOrCanary) {
@@ -1320,7 +1383,7 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
     }
   }
   if (!probeIsObjectScoped && !(vertical && probeIsFunctionSurface)) {
-    const foreignCollectionData = hasForeignTenantOrOwnerDisclosure(steps, probe, resourceTenant)
+    const foreignCollectionData = hasForeignTenantOrOwnerDisclosure(steps, probe, resourceTenant, input.canaryMarkers)
     if (!foreignCollectionData) {
       return {
         required: true,
@@ -1335,7 +1398,7 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
   // An anonymous (or non-owner) read that mirrors the owner reference on the same route exposes the
   // same public record — a catalog listing/item — not an owner-scoped disclosure. Genuine private
   // reads differ from the reference or bind an owner-scoped identity, so they are unaffected.
-  const publicness = assessPublicness({ steps, probe })
+  const publicness = assessPublicness({ steps, probe, canaryMarkers: input.canaryMarkers })
   if (publicness.public && !roleDifferential) {
     return {
       required: true,

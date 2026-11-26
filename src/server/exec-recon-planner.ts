@@ -56,6 +56,7 @@ import {
   type HopCheckpointBrief,
 } from './capability-ledger.ts'
 import { extractSpecDedupeFields, normalizeEndpointTemplate } from './dedupe.ts'
+import { normalizeRouteTemplate } from './route-template.ts'
 import { meetsBaseline, type EvidenceReview } from './evidence-checks.ts'
 import {
   CHAIN_CONTINUATION_SKILL_PREFIX,
@@ -344,32 +345,12 @@ export function resolveSafeVariantSweepLocation(
   return resolveSafeVariantSweepFile(canonicalRepoRoot, file, maxBytes)
 }
 
-const SHORT_PREFIXED_DIGIT_ID_RE = /^[a-z]{1,12}[_-][0-9a-z]*\d[0-9a-z_-]*$/i
-const VERSION_OR_PROTOCOL_SEGMENT_RE = /^(?:api[_-]?v\d+|v\d+(?:[_-](?:alpha|beta|rc)\d*)?|oauth[_-]?2|http[_-]?2|2fa|utf[_-]?8|sha[_-]?256|base[_-]?64)$/i
-const PREFIXED_HEX_ID_RE = /^(?:[a-z]{1,10}[_-])?[0-9a-f]{8,}$/i
-const COMPACT_PREFIX_NUM_ID_RE = /^(?!sha256$|base64$|oauth2$|http2$|es20\d\d$)[a-z]{2,8}\d{3,}$/i
-
 /**
- * Normalize concrete resource ID segments (UUIDs, numeric IDs, short prefixed IDs such as
- * `tkt_123`, `tkt-1001`, `ord_42`, `tkt_a1b2c3`, `inv_deadbeef`, and `:param`/`{param}` template
- * placeholders) to `:id` so floor-confirmed routes match template endpoints and sibling concrete IDs.
+ * Normalize concrete resource ID segments (UUIDs, ULIDs, numeric IDs, opaque tokens, prefixed IDs,
+ * and framework param templates) to `:id` via the canonical `normalizeRouteTemplate`.
  */
 export function normalizeConfirmedRouteTemplate(path?: string | null): string {
-  const base = normalizeEndpointTemplate(path)
-  if (!base || base === '/') return base
-  const segments = base.split('/').map((seg, idx) => {
-    if (idx === 0 || !seg || seg === ':id') return seg
-    if (VERSION_OR_PROTOCOL_SEGMENT_RE.test(seg)) return seg
-    if (
-      SHORT_PREFIXED_DIGIT_ID_RE.test(seg) ||
-      PREFIXED_HEX_ID_RE.test(seg) ||
-      COMPACT_PREFIX_NUM_ID_RE.test(seg)
-    ) {
-      return ':id'
-    }
-    return seg
-  })
-  return segments.join('/') || '/'
+  return normalizeRouteTemplate(path, { preserveCase: false })
 }
 
 export interface PlannerConfirmedRef extends AlreadyConfirmedRef {
@@ -1747,7 +1728,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
           kind: hopKindToCapabilityKind(hop.artifactKind),
           promotionStatus: 'capability_only',
           provenance: hop.verified ? 'derived_hop' : 'runtime_discovery',
-          tenantScope: 'default_tenant',
+          tenantScope: 'unscoped_hypothesis',
           actorPersona: hop.persona ?? 'attacker',
           serviceOrigin: hop.origin,
           surface,
@@ -4374,12 +4355,14 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       if (seenEdges.has(edge.edgeId)) continue
       seenEdges.add(edge.edgeId)
       const postNode = edge.postconditionCapId ? ledgerForProgress.getCapability(edge.postconditionCapId) : null
+      const rawTenant = postNode?.tenantScope ?? edge.actorContext.tenantScope ?? ''
+      const normalizedTenant = rawTenant === 'unscoped_hypothesis' ? '' : rawTenant
       newHopEvents.push({
         hopReceiptId: edge.hopReceiptId,
         branchKey: edge.postconditionCapId ?? edge.edgeId,
         depth: Math.max(1, edge.preconditionCapIds.length + 1),
         hostVerified: true,
-        tenantScope: postNode?.tenantScope ?? edge.actorContext.tenantScope ?? 'default_tenant',
+        tenantScope: normalizedTenant,
         ...(edge.actorContext.roleLabel ? { roleLabel: edge.actorContext.roleLabel } : {}),
         serviceOrigin: postNode?.serviceOrigin ?? edge.actorContext.serviceOrigin ?? 'unknown',
         surface: postNode?.surface ?? 'http',

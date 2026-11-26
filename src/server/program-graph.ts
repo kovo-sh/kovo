@@ -11,6 +11,7 @@
  * structural scanner cannot attribute to a handler; those routes are marked
  * with `extraction: 'regex'` and recorded in `warnings`.
  */
+import { normalizeRouteTemplate } from './route-template.ts'
 import type { StaticWorkspaceSnapshot } from './static-workspace-snapshot.ts'
 
 export type ProgramFramework =
@@ -351,17 +352,11 @@ function stringListValue(token: string | undefined): string[] {
   return []
 }
 
-function normalizePathTemplate(path: string): string {
-  return path
-    .replace(/[{<](?:int:|str:|uuid:|slug:|path:)?([A-Za-z_][A-Za-z0-9_]*)[}>]/g, ':$1')
-    .replace(/\{([A-Za-z_][A-Za-z0-9_]*)\}/g, ':$1')
-}
-
 function joinPaths(prefix: string, path: string): string {
-  const raw = `${prefix}/${path}`.replace(/\/{2,}/g, '/')
-  const normalized = normalizePathTemplate(raw)
-  if (!normalized.startsWith('/')) return `/${normalized}`
-  return normalized.length > 1 ? normalized.replace(/\/$/, '') : '/'
+  return normalizeRouteTemplate(`${prefix}/${path}`, {
+    preserveParamNames: true,
+    collapseConcreteIds: false,
+  })
 }
 
 function routeParamNames(path: string): string[] {
@@ -1542,7 +1537,7 @@ function extractRails(file: string, content: string, out: Extraction): boolean {
   const addRoute = (method: string, routePath: string, handler: string, line: number) => {
     const normalized = routePath.startsWith('/') ? routePath : `/${routePath}`
     routeDefinitions.push({
-      framework: 'rails', method, path: normalizePathTemplate(normalized), file, line, handler,
+      framework: 'rails', method, path: normalizeRouteTemplate(normalized, { preserveParamNames: true, collapseConcreteIds: false }), file, line, handler,
       middleware: [], guards: [], input: valueOrFallback(normalized), extraction: 'ast',
     })
   }
