@@ -572,10 +572,126 @@ const FINDING_STATUS_PRIORITY: Readonly<Record<Finding['status'], number>> = {
 }
 
 export interface AgentProofTargetInfo {
+  origin: string | null
   endpoint: string | null
   normalizedEndpoint: string | null
   method: string | null
   terminalOracleFamily: string | null
+}
+
+/** Host-recorded exchange view derived strictly from signed host transcripts / broker exchanges. */
+export interface HostRecordedExchangeView {
+  exchangeId: string
+  origin: string
+  method: string | null
+  pathAndQuery: string
+  status: number | null
+  sessionRole: string | null
+}
+
+export function buildHostRecordedExchangeIndex(
+  proof: Pick<AgentScriptProofResult, 'exchanges'> & { hostTranscript?: AgentScriptProofResult['hostTranscript'] },
+): Map<string, HostRecordedExchangeView> {
+  const byId = new Map<string, HostRecordedExchangeView>()
+  const scriptById = new Map((proof.exchanges ?? []).map(ex => [ex.exchangeId, ex]))
+  for (const entry of proof.hostTranscript?.entries ?? []) {
+    const fallback = scriptById.get(entry.exchangeId)
+    const origin = (entry.origin ?? fallback?.origin ?? '').trim()
+    const method = normalizeMethodToken(entry.step.method) ?? normalizeMethodToken(fallback?.method)
+    const pathAndQuery = (entry.step.pathAndQuery ?? entry.step.route ?? fallback?.pathAndQuery ?? '').trim()
+    const status = typeof entry.step.status === 'number'
+      ? entry.step.status
+      : (typeof fallback?.status === 'number' ? fallback.status : null)
+    const sessionRole: string | null = entry.step.arm === 'probe'
+      ? 'probe'
+      : entry.step.arm === 'control'
+        ? 'control'
+        : (fallback?.sessionRole ?? null)
+    byId.set(entry.exchangeId, {
+      exchangeId: entry.exchangeId,
+      origin,
+      method,
+      pathAndQuery,
+      status,
+      sessionRole,
+    })
+  }
+  for (const ex of proof.exchanges ?? []) {
+    if (byId.has(ex.exchangeId)) continue
+    byId.set(ex.exchangeId, {
+      exchangeId: ex.exchangeId,
+      origin: (ex.origin ?? '').trim(),
+      method: normalizeMethodToken(ex.method),
+      pathAndQuery: (ex.pathAndQuery ?? '').trim(),
+      status: typeof ex.status === 'number' ? ex.status : null,
+      sessionRole: ex.sessionRole ?? null,
+    })
+  }
+  return byId
+}
+
+export function resolveCompositeTerminalExchange(
+  receipt: CompositeProofReceipt,
+  exchangeById: ReadonlyMap<string, HostRecordedExchangeView>,
+): HostRecordedExchangeView | undefined {
+  const termExId = receipt.terminalImpact?.terminalExchangeId
+  if (termExId && exchangeById.has(termExId)) return exchangeById.get(termExId)
+  const terminalHop = receipt.hops.find(h => h.hopId === receipt.terminalImpact?.terminalHopId)
+    ?? receipt.hops[receipt.hops.length - 1]
+  if (!terminalHop) return undefined
+  const hopExchanges = [...terminalHop.exchangeIds]
+    .reverse()
+    .map(id => exchangeById.get(id))
+    .filter((ex): ex is HostRecordedExchangeView => Boolean(ex))
+  return (
+    hopExchanges.find(ex => ex.sessionRole === 'probe' && typeof ex.status === 'number' && ex.status >= 200 && ex.status < 300)
+    ?? hopExchanges.find(ex => ex.sessionRole === 'probe')
+    ?? hopExchanges[0]
+  )
+}
+
+/**
+ * R3-H-15: Derive a composite receipt's authoritative origin strictly from the terminal exchange's
+ * host-signed `origin` in the transcript, rejecting any hop whose declared origin disagrees with
+ * its cited host-signed exchanges.
+ */
+export function inspectCompositeHostOrigin(
+  receipt: CompositeProofReceipt,
+  exchangeById: ReadonlyMap<string, HostRecordedExchangeView>,
+): { ok: true; origin: string; terminalExchange: HostRecordedExchangeView } | { ok: false; reason: string } {
+  const terminalHop = receipt.hops.find(h => h.hopId === receipt.terminalImpact?.terminalHopId)
+    ?? receipt.hops[receipt.hops.length - 1]
+  const terminalExchange = resolveCompositeTerminalExchange(receipt, exchangeById)
+  const signedOrigin = terminalExchange?.origin?.trim() ?? ''
+  const normalizedSigned = signedOrigin ? normalizeOrigin(signedOrigin) : ''
+  if (!terminalExchange || !normalizedSigned) {
+    return {
+      ok: false,
+      reason: 'CompositeProofReceipt is missing a host-signed terminal exchange with a valid origin.',
+    }
+  }
+  const declaredTerminalOrigin = terminalHop?.target?.origin?.trim() ?? ''
+  if (declaredTerminalOrigin && normalizeOrigin(declaredTerminalOrigin) !== normalizedSigned) {
+    return {
+      ok: false,
+      reason: `CompositeProofReceipt terminal hop "${terminalHop?.hopId ?? 'terminal'}" declared origin "${declaredTerminalOrigin}" disagrees with host-signed terminal exchange "${terminalExchange.exchangeId}" origin "${signedOrigin}".`,
+    }
+  }
+  for (const hop of receipt.hops) {
+    if (hop === terminalHop) continue
+    const declaredHopOrigin = hop.target?.origin?.trim() ?? ''
+    if (!declaredHopOrigin || !hop.exchangeIds.length) continue
+    const cited = hop.exchangeIds
+      .map(id => exchangeById.get(id))
+      .filter((ex): ex is HostRecordedExchangeView => Boolean(ex && ex.origin.trim()))
+    if (cited.length > 0 && !cited.some(ex => normalizeOrigin(ex.origin) === normalizeOrigin(declaredHopOrigin))) {
+      return {
+        ok: false,
+        reason: `CompositeProofReceipt hop "${hop.hopId}" declared origin "${declaredHopOrigin}" disagrees with its cited host-signed exchanges.`,
+      }
+    }
+  }
+  return { ok: true, origin: signedOrigin, terminalExchange }
 }
 
 function parseEndpointAndMethodCandidate(raw: unknown): { endpoint: string; method: string | null } | null {
@@ -655,7 +771,7 @@ export function extractAgentProofTarget(input: {
   cleanCompositeBundle: V8CompositeProofBundle | null
   receipt: ProofReceipt | null
   baseSpec: DeclarativeReplaySpec
-  proof: Pick<AgentScriptProofResult, 'exchanges'>
+  proof: Pick<AgentScriptProofResult, 'exchanges'> & { hostTranscript?: AgentScriptProofResult['hostTranscript'] }
   envelope?: AgentScriptProofEnvelope
 }): AgentProofTargetInfo {
   const terminalHop = input.cleanCompositeBundle
@@ -663,24 +779,13 @@ export function extractAgentProofTarget(input: {
         h => h.hopId === input.cleanCompositeBundle!.receipt.terminalImpact.terminalHopId,
       ) ?? input.cleanCompositeBundle.receipt.hops[input.cleanCompositeBundle.receipt.hops.length - 1])
     : undefined
-  const exchangeById = new Map(input.proof.exchanges.map(ex => [ex.exchangeId, ex]))
-  const terminalExchange = (() => {
-    const termExId = input.cleanCompositeBundle?.receipt.terminalImpact.terminalExchangeId
-    if (termExId && exchangeById.has(termExId)) return exchangeById.get(termExId)
-    if (!terminalHop) return undefined
-    const hopExchanges = [...terminalHop.exchangeIds]
-      .reverse()
-      .map(id => exchangeById.get(id))
-      .filter((ex): ex is NonNullable<typeof ex> => Boolean(ex))
-    return (
-      hopExchanges.find(ex => ex.sessionRole === 'probe' && typeof ex.status === 'number' && ex.status >= 200 && ex.status < 300)
-      ?? hopExchanges.find(ex => ex.sessionRole === 'probe')
-      ?? hopExchanges[0]
-    )
-  })()
+  const exchangeById = buildHostRecordedExchangeIndex(input.proof)
+  const terminalExchange = input.cleanCompositeBundle
+    ? resolveCompositeTerminalExchange(input.cleanCompositeBundle.receipt, exchangeById)
+    : undefined
   const receiptExchange = (() => {
     const ids = input.receipt?.exchangeIds ?? []
-    const matched = ids.map(id => exchangeById.get(id)).filter((ex): ex is NonNullable<typeof ex> => Boolean(ex))
+    const matched = ids.map(id => exchangeById.get(id)).filter((ex): ex is HostRecordedExchangeView => Boolean(ex))
     return matched.find(ex => ex.sessionRole === 'probe') ?? matched[0]
   })()
   const baseSpecStep = input.baseSpec.kind === 'http_chain'
@@ -689,13 +794,23 @@ export function extractAgentProofTarget(input: {
   const receiptRecord = input.receipt as (ProofReceipt & { endpoint?: string | null }) | null
   const envelopeRecord = input.envelope as (AgentScriptProofEnvelope & { endpoint?: string; path?: string }) | undefined
 
+  // R3-H-15: For composite proofs, derive origin strictly from the terminal exchange's host-signed
+  // origin — never from worker-declared `hops[terminal].target.origin`.
+  const origin = input.cleanCompositeBundle
+    ? (terminalExchange?.origin?.trim() || null)
+    : (receiptExchange?.origin?.trim()
+        || input.receipt?.target.origin?.trim()
+        || input.proof.exchanges.find(ex => ex.sessionRole === 'probe')?.origin?.trim()
+        || input.proof.exchanges[0]?.origin?.trim()
+        || null)
+
   const endpointCandidates: unknown[] = [
     input.cleanCompositeBundle?.verification.terminalEndpoint,
-    terminalHop?.target.pathAndQuery,
     terminalExchange?.pathAndQuery,
+    ...(input.cleanCompositeBundle ? [] : [terminalHop?.target.pathAndQuery]),
+    receiptExchange?.pathAndQuery,
     receiptRecord?.endpoint,
     input.receipt?.target.pathAndQuery,
-    receiptExchange?.pathAndQuery,
     baseSpecStep?.request.pathAndQuery,
     envelopeRecord?.endpoint,
     envelopeRecord?.path,
@@ -725,10 +840,10 @@ export function extractAgentProofTarget(input: {
     : null
 
   const method = parsedEndpoint?.method
-    ?? normalizeMethodToken(terminalHop?.target.method)
     ?? normalizeMethodToken(terminalExchange?.method)
-    ?? normalizeMethodToken(input.receipt?.target.method)
+    ?? (input.cleanCompositeBundle ? null : normalizeMethodToken(terminalHop?.target.method))
     ?? normalizeMethodToken(receiptExchange?.method)
+    ?? normalizeMethodToken(input.receipt?.target.method)
     ?? matchingExchangeMethod
     ?? baseSpecMethod
     ?? null
@@ -740,7 +855,7 @@ export function extractAgentProofTarget(input: {
     ? rawFamily.trim().toLowerCase()
     : null
 
-  return { endpoint, normalizedEndpoint, method, terminalOracleFamily }
+  return { origin, endpoint, normalizedEndpoint, method, terminalOracleFamily }
 }
 
 function extractExistingFindingTargetMeta(
@@ -797,7 +912,7 @@ function extractExistingFindingTargetMeta(
     ? rawFamily.trim().toLowerCase()
     : null
 
-  return { endpoint, normalizedEndpoint, method, terminalOracleFamily }
+  return { origin: row.finding.origin || null, endpoint, normalizedEndpoint, method, terminalOracleFamily }
 }
 
 function existingRowHasCompositeProof(
@@ -814,12 +929,17 @@ export interface SupersessionEndpointSpec {
   origin: string
   method: string | null
   normalizedEndpoint: string
+  /** Host-signed exchange ID backing this upstream endpoint (when derived from transcript). */
+  exchangeId?: string
+  /** Explicitly declared precondition vulnClass on the upstream hop (e.g. `hop.proofReceipt.vulnClass`). */
+  preconditionVulnClass?: string | null
 }
 
 function parseSupersessionEndpoint(
   origin: unknown,
   rawMethod: unknown,
   rawPath: unknown,
+  extra?: { exchangeId?: string; preconditionVulnClass?: string | null },
 ): SupersessionEndpointSpec | null {
   if (typeof origin !== 'string' || !origin.trim()) return null
   const parsed = parseEndpointAndMethodCandidate(rawPath)
@@ -828,6 +948,8 @@ function parseSupersessionEndpoint(
     origin: origin.trim(),
     method: parsed.method ?? normalizeMethodToken(rawMethod),
     normalizedEndpoint: normalizeEndpointTemplate(parsed.endpoint),
+    ...(extra?.exchangeId ? { exchangeId: extra.exchangeId } : {}),
+    ...(extra?.preconditionVulnClass ? { preconditionVulnClass: extra.preconditionVulnClass } : {}),
   }
 }
 
@@ -835,7 +957,7 @@ function dedupeSupersessionEndpoints(endpoints: readonly SupersessionEndpointSpe
   const out: SupersessionEndpointSpec[] = []
   const seen = new Set<string>()
   for (const ep of endpoints) {
-    const key = `${normalizeOrigin(ep.origin)}|${ep.method ?? '*'}|${ep.normalizedEndpoint}`
+    const key = `${normalizeOrigin(ep.origin)}|${ep.method ?? '*'}|${ep.normalizedEndpoint}|${ep.exchangeId ?? ''}|${ep.preconditionVulnClass ?? ''}`
     if (seen.has(key)) continue
     seen.add(key)
     out.push(ep)
@@ -843,15 +965,37 @@ function dedupeSupersessionEndpoints(endpoints: readonly SupersessionEndpointSpe
   return out
 }
 
-export function extractCompositeUpstreamEndpoints(receipt: CompositeProofReceipt): SupersessionEndpointSpec[] {
+/**
+ * R3-H-13: Derive composite upstream endpoints strictly from non-terminal hops' cited host-signed
+ * transcript exchanges (with exact origin and explicit HTTP method) — NEVER from unbound
+ * worker-declared `hop.target` strings alone.
+ */
+export function extractCompositeUpstreamEndpoints(
+  receipt: CompositeProofReceipt,
+  hostExchanges: ReadonlyMap<string, HostRecordedExchangeView> | readonly HostRecordedExchangeView[] = [],
+): SupersessionEndpointSpec[] {
   if (!Array.isArray(receipt.hops) || receipt.hops.length < 2) return []
+  const exchangeById: ReadonlyMap<string, HostRecordedExchangeView> = hostExchanges instanceof Map
+    ? hostExchanges
+    : new Map((hostExchanges as readonly HostRecordedExchangeView[]).map(ex => [ex.exchangeId, ex]))
+  if (exchangeById.size === 0) return []
   const terminalHop = receipt.hops.find(h => h.hopId === receipt.terminalImpact?.terminalHopId)
     ?? receipt.hops[receipt.hops.length - 1]
   const out: SupersessionEndpointSpec[] = []
   for (const hop of receipt.hops) {
     if (hop === terminalHop) continue
-    const parsed = parseSupersessionEndpoint(hop.target?.origin, hop.target?.method, hop.target?.pathAndQuery)
-    if (parsed) out.push(parsed)
+    const preconditionVulnClass = hop.proofReceipt?.vulnClass?.trim().toLowerCase() || null
+    for (const exId of hop.exchangeIds ?? []) {
+      const ex = exchangeById.get(exId)
+      if (!ex) continue
+      const exMethod = normalizeMethodToken(ex.method)
+      if (!exMethod) continue
+      const parsed = parseSupersessionEndpoint(ex.origin, exMethod, ex.pathAndQuery, {
+        exchangeId: ex.exchangeId,
+        preconditionVulnClass,
+      })
+      if (parsed && parsed.method) out.push(parsed)
+    }
   }
   return dedupeSupersessionEndpoints(out)
 }
@@ -933,6 +1077,28 @@ export function isGenericSharedAuthOrUtilityEndpoint(normalizedEndpoint: string)
   return SHARED_AUTH_UTILITY_ROUTE_RE.test(clean)
 }
 
+function supersessionEndpointsMatchExact(
+  earlier: SupersessionEndpointSpec,
+  upstream: SupersessionEndpointSpec,
+): boolean {
+  const earlierMethod = normalizeMethodToken(earlier.method)
+  const upstreamMethod = normalizeMethodToken(upstream.method)
+  const earlierOrigin = normalizeOrigin(earlier.origin)
+  const upstreamOrigin = normalizeOrigin(upstream.origin)
+  if (!earlierMethod || !upstreamMethod || !earlierOrigin || !upstreamOrigin) return false
+  return (
+    earlier.normalizedEndpoint === upstream.normalizedEndpoint
+    && earlierMethod === upstreamMethod
+    && earlierOrigin === upstreamOrigin
+  )
+}
+
+/**
+ * R3-H-13: Strict subset check for composite supersession:
+ *  - Exact origin match (no loopback cross-port/hostname equivalence)
+ *  - Exact explicit HTTP method match (missing / ANY method never matches)
+ *  - Excludes generic shared auth/utility endpoints from driving supersession
+ */
 export function isEndpointSubsetOfUpstream(
   earlierEndpoints: readonly SupersessionEndpointSpec[],
   upstreamEndpoints: readonly SupersessionEndpointSpec[],
@@ -941,16 +1107,57 @@ export function isEndpointSubsetOfUpstream(
   const nonGenericUpstream = upstreamEndpoints.filter(up => !isGenericSharedAuthOrUtilityEndpoint(up.normalizedEndpoint))
   if (!nonGenericUpstream.length) return false
   const matchesUpstream = (ep: SupersessionEndpointSpec, candidates: readonly SupersessionEndpointSpec[]) =>
-    candidates.some(up =>
-      ep.normalizedEndpoint === up.normalizedEndpoint
-      && methodsCompatibleForAgentProofDedupe(ep.method, up.method)
-      && originsEquivalentForAgentProofDedupe(ep.origin, up.origin, ep.normalizedEndpoint),
-    )
+    candidates.some(up => supersessionEndpointsMatchExact(ep, up))
   const hasNonGenericMatch = earlierEndpoints.some(
     ep => !isGenericSharedAuthOrUtilityEndpoint(ep.normalizedEndpoint) && matchesUpstream(ep, nonGenericUpstream),
   )
   if (!hasNonGenericMatch) return false
   return earlierEndpoints.every(ep => matchesUpstream(ep, upstreamEndpoints))
+}
+
+/**
+ * R3-H-13: Ensure an earlier confirmed finding's vulnerability class or CWE matches the composite
+ * chain's terminal class or an explicitly declared precondition class on the matched upstream hop.
+ * Unrelated classes (e.g. SQLi/XSS on a BOLA setup listing route) must NEVER be superseded.
+ */
+export function isFindingClassSupersessionCompatible(
+  earlier: {
+    cwe?: string | null
+    vulnClass?: string | null
+    terminalOracleFamily?: string | null
+  },
+  composite: {
+    terminalVulnClass: string
+    terminalOracleFamily?: string | null
+    preconditionVulnClasses?: readonly string[]
+  },
+): boolean {
+  const earlierCwe = earlier.cwe ? normalizeCwe(earlier.cwe) : ''
+  const hasConcreteEarlierCwe = /^CWE-\d{1,5}$/.test(earlierCwe)
+  const earlierVulnClass = earlier.vulnClass?.trim().toLowerCase() || ''
+  const earlierFamily = earlier.terminalOracleFamily?.trim().toLowerCase() || ''
+  if (!hasConcreteEarlierCwe && !earlierVulnClass && !earlierFamily) return false
+
+  const allowedClasses = [
+    composite.terminalVulnClass,
+    ...(composite.preconditionVulnClasses ?? []),
+  ]
+    .map(c => c.trim().toLowerCase())
+    .filter(Boolean)
+
+  for (const allowedClass of allowedClasses) {
+    if (earlierVulnClass && earlierVulnClass === allowedClass) return true
+    if (hasConcreteEarlierCwe && isCweConsistentWithReceiptClass(earlierCwe, allowedClass)) return true
+  }
+
+  const compFamily = composite.terminalOracleFamily?.trim().toLowerCase() || ''
+  if (earlierFamily && compFamily) {
+    if (earlierFamily === compFamily) return true
+    const g1 = ORACLE_FAMILY_ALIAS_GROUP[earlierFamily]
+    const g2 = ORACLE_FAMILY_ALIAS_GROUP[compFamily]
+    if (g1 && g2 && g1 === g2) return true
+  }
+  return false
 }
 
 /**
@@ -1313,9 +1520,10 @@ function normalizeLedgerCapHandle(meta: Pick<DerivedCapabilityMeta, 'handle' | '
   return formatDerivedCapabilityHandle(safeHop, safeSlot)
 }
 
-function serializeCompositeProofReceiptRow(
+export function serializeCompositeProofReceiptRow(
   bundle: V8CompositeProofBundle,
   singlePair?: { receipt: ProofReceipt; verification: ReceiptVerification } | null,
+  hostTerminal?: Pick<HostRecordedExchangeView, 'origin' | 'method' | 'pathAndQuery'> | null,
 ): ReplayProofReceiptRow & {
   compositeReceipt: CompositeProofReceipt
   compositeVerification: CompositeReceiptVerification
@@ -1323,15 +1531,33 @@ function serializeCompositeProofReceiptRow(
 } {
   const { receipt: rawComp, verification: rawVer, hopActors } = bundle
   const terminalHop = rawComp.hops.find(h => h.hopId === rawComp.terminalImpact.terminalHopId) ?? rawComp.hops[rawComp.hops.length - 1]!
-  const terminalEndpoint = rawVer.terminalEndpoint ?? terminalHop.target.pathAndQuery ?? null
+  const signedOrigin = hostTerminal?.origin?.trim() || ''
+  if (signedOrigin && terminalHop.target.origin && normalizeOrigin(terminalHop.target.origin) !== normalizeOrigin(signedOrigin)) {
+    throw new InvariantError(
+      'invariant.confirmation_evidence',
+      `CompositeProofReceipt terminal hop "${terminalHop.hopId}" declared origin "${terminalHop.target.origin}" disagrees with host-signed terminal exchange origin "${signedOrigin}".`,
+    )
+  }
+  const resolvedOrigin = signedOrigin || terminalHop.target.origin
+  const terminalEndpoint = rawVer.terminalEndpoint ?? hostTerminal?.pathAndQuery ?? terminalHop.target.pathAndQuery ?? null
+  const terminalMethod = normalizeMethodToken(hostTerminal?.method) ?? normalizeMethodToken(terminalHop.target.method) ?? undefined
   const summaryText = rawComp.terminalImpact.summary && rawComp.terminalImpact.summary.length > 0
     ? rawComp.terminalImpact.summary
     : rawComp.terminalImpact.claimedImpact
   const comp: CompositeProofReceipt = {
     ...rawComp,
-    hops: terminalEndpoint && !terminalHop.target.pathAndQuery
-      ? rawComp.hops.map(h => (h.hopId === terminalHop.hopId ? { ...h, target: { ...h.target, pathAndQuery: terminalEndpoint } } : h))
-      : rawComp.hops,
+    hops: rawComp.hops.map(h => {
+      if (h.hopId !== terminalHop.hopId) return h
+      return {
+        ...h,
+        target: {
+          ...h.target,
+          origin: resolvedOrigin,
+          ...(terminalMethod ? { method: terminalMethod } : {}),
+          ...(terminalEndpoint && !h.target.pathAndQuery ? { pathAndQuery: terminalEndpoint } : {}),
+        },
+      }
+    }),
     terminalImpact: {
       ...rawComp.terminalImpact,
       claimedImpact: rawComp.terminalImpact.claimedImpact || summaryText,
@@ -1366,8 +1592,8 @@ function serializeCompositeProofReceiptRow(
         receipt: {
           vulnClass: comp.terminalVulnClass,
           target: {
-            origin: terminalHop.target.origin,
-            ...(terminalHop.target.method ? { method: terminalHop.target.method } : {}),
+            origin: resolvedOrigin,
+            ...(terminalMethod ? { method: terminalMethod } : {}),
             ...(terminalEndpoint ? { pathAndQuery: terminalEndpoint } : {}),
             ...(terminalHop.target.param ? { param: terminalHop.target.param } : {}),
           },
@@ -2371,7 +2597,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
         reason: STATIC_AST_LIVE_TARGET_REJECT_MESSAGE,
         verification: 'Dismissed: static_ast_proof is disallowed as a standalone finding on live-target runtime verification runs.',
       }
-      this.storage.updateProposedFinding(current, findingRow.id, { verificationTier: null, finding: updatedFinding })
+      this.demoteFindingToNonConfirmed(current, findingRow.id, { verificationTier: null, finding: updatedFinding })
       this.host.completeWorker(
         job.assignment,
         current,
@@ -2403,6 +2629,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
           confidence: 'low',
         }
         this.storage.upsertChainFinding(current, findingRow.assetId, updatedFinding, specRow.id, specRow.sourceOrigins)
+        this.restoreSupersededDependents(current, findingRow.id)
         this.host.completeWorker(job.assignment, current, 'Inconclusive: Tier 3 approval denied.', [], undefined, secrets)
         return
       }
@@ -2467,7 +2694,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
           current, job.assignment, findingRow, specRow.spec, specRow.id, specRow.sourceOrigins, updatedFinding, result, finalStatus,
         )
       } else {
-        this.storage.updateProposedFinding(current, findingRow.id, { verificationTier: null, finding: updatedFinding })
+        this.demoteFindingToNonConfirmed(current, findingRow.id, { verificationTier: null, finding: updatedFinding })
       }
       this.host.completeWorker(
         job.assignment, current, `Replay verdict: ${finalStatus} (${cleanObserved.slice(0, 160)})`, [receipt.id], undefined, secretsList,
@@ -2580,14 +2807,36 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       : null
     const claim = cleanCompositeBundle?.receipt.terminalVulnClass ?? receipt?.vulnClass ?? 'disclosure'
     const attribution = agentProofAttribution(claim)
-    const compositeTerminalOrigin = cleanCompositeBundle
-      ? (cleanCompositeBundle.receipt.hops.find(h => h.hopId === cleanCompositeBundle.receipt.terminalImpact.terminalHopId)?.target.origin
-          ?? cleanCompositeBundle.receipt.hops[cleanCompositeBundle.receipt.hops.length - 1]?.target.origin)
-      : undefined
-    const origin = compositeTerminalOrigin
-      ?? receipt?.target.origin
-      ?? proof.exchanges.find(exchange => exchange.sessionRole === 'probe')?.origin
-      ?? proof.exchanges[0]?.origin
+    // R3-H-15: Derive composite finding origin strictly from the terminal exchange's host-signed
+    // `origin` in the transcript — NEVER from worker-declared `hops[terminal].target.origin`.
+    // Reject/fail closed if the declared hop origin disagrees with its cited host-signed exchange.
+    const hostExchangeById = buildHostRecordedExchangeIndex(proof)
+    let compositeTerminalExchange: HostRecordedExchangeView | null = null
+    let origin: string | undefined
+    if (cleanCompositeBundle) {
+      const originCheck = inspectCompositeHostOrigin(cleanCompositeBundle.receipt, hostExchangeById)
+      if (!originCheck.ok) {
+        throw new InvariantError('invariant.confirmation_evidence', originCheck.reason)
+      }
+      origin = originCheck.origin
+      compositeTerminalExchange = originCheck.terminalExchange
+    } else {
+      const receiptExchange = (() => {
+        const ids = receipt?.exchangeIds ?? []
+        const matched = ids.map(id => hostExchangeById.get(id)).filter((ex): ex is HostRecordedExchangeView => Boolean(ex && ex.origin))
+        return matched.find(ex => ex.sessionRole === 'probe') ?? matched[0]
+      })()
+      if (receiptExchange?.origin && receipt?.target.origin && normalizeOrigin(receipt.target.origin) !== normalizeOrigin(receiptExchange.origin)) {
+        throw new InvariantError(
+          'invariant.confirmation_evidence',
+          `ProofReceipt declared origin "${receipt.target.origin}" disagrees with host-signed exchange "${receiptExchange.exchangeId}" origin "${receiptExchange.origin}".`,
+        )
+      }
+      origin = receiptExchange?.origin
+        ?? receipt?.target.origin
+        ?? proof.exchanges.find(exchange => exchange.sessionRole === 'probe')?.origin
+        ?? proof.exchanges[0]?.origin
+    }
     if (!origin || !this.host.approvedOriginsSet(run).has(origin)) {
       throw new BrokerDenied('The proof exchanges name an origin outside the current approved scope.')
     }
@@ -2737,7 +2986,11 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
           } as unknown as DeclarativeReplaySpec)
         : baseSpec
       const proofReceiptRow: ReplayProofReceiptRow | null = cleanCompositeBundle
-        ? serializeCompositeProofReceiptRow(cleanCompositeBundle, receipt && verification ? { receipt, verification } : null)
+        ? serializeCompositeProofReceiptRow(
+            cleanCompositeBundle,
+            receipt && verification ? { receipt, verification } : null,
+            compositeTerminalExchange,
+          )
         : receipt && verification
           ? serializeProofReceiptRow({ receipt, verification })
           : null
@@ -2820,7 +3073,13 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       : [origin]
     const savedFinding = this.storage.upsertChainFinding(run, upsertAssetId, finding, canonicalSpecId, upsertOrigins)
     if (cleanCompositeBundle) {
-      this.supersedeUpstreamCompositeFindings(run, savedFinding.id, cleanCompositeBundle.receipt)
+      this.supersedeUpstreamCompositeFindings(
+        run,
+        savedFinding.id,
+        cleanCompositeBundle.receipt,
+        hostExchangeById,
+        cleanCompositeBundle.verification,
+      )
     }
     recordReportedFindingCoverage(this.storage, run, assignment.id, origin, attribution.category, `Confirmed via agent script proof: ${cleanTitle}`, findingId, (r, o) => this.host.permitted(r, o))
     this.storage.event(run.id, 'agent.script_proof_confirmed', `Agent script proof confirmed a ${attribution.label} finding on ${origin}.`, {
@@ -2847,13 +3106,54 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
     }
   }
 
+  /**
+   * R3-H-13: Restore any findings previously superseded by `findingId` whenever `findingId`
+   * transitions to a non-confirmed status.
+   */
+  private restoreSupersededDependents(run: Run, findingId: string): string[] {
+    const dependentRows = this.storage.db.select().from(findings).where(and(
+      eq(findings.runId, run.id),
+      eq(findings.supersededByFindingId, findingId),
+    )).all()
+    const restoredIds: string[] = []
+    for (const dep of dependentRows) {
+      this.storage.updateProposedFinding(run, dep.id, {
+        supersededByFindingId: null,
+      })
+      restoredIds.push(dep.id)
+    }
+    return restoredIds
+  }
+
+  /**
+   * R3-H-13: Single authoritative path for transitioning a finding to a non-confirmed status
+   * (`inconclusive` or `dismissed`) and unconditionally restoring any superseded dependents.
+   */
+  private demoteFindingToNonConfirmed(
+    run: Run,
+    findingId: string,
+    patch: Parameters<Store['updateProposedFinding']>[2],
+  ): string[] {
+    this.storage.updateProposedFinding(run, findingId, patch)
+    return this.restoreSupersededDependents(run, findingId)
+  }
+
   private supersedeUpstreamCompositeFindings(
     run: Run,
     newFindingId: string,
     receipt: CompositeProofReceipt,
+    hostExchanges: ReadonlyMap<string, HostRecordedExchangeView>,
+    verification?: CompositeReceiptVerification | null,
   ): string[] {
-    const upstreamEndpoints = extractCompositeUpstreamEndpoints(receipt)
+    const upstreamEndpoints = extractCompositeUpstreamEndpoints(receipt, hostExchanges)
     if (!upstreamEndpoints.length) return []
+
+    const upstreamNonGenericByExchangeId = new Map<string, SupersessionEndpointSpec>()
+    for (const up of upstreamEndpoints) {
+      if (up.exchangeId && !isGenericSharedAuthOrUtilityEndpoint(up.normalizedEndpoint)) {
+        upstreamNonGenericByExchangeId.set(up.exchangeId, up)
+      }
+    }
 
     const rows = this.storage.db.select().from(findings).where(and(
       eq(findings.runId, run.id),
@@ -2868,6 +3168,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       if (!specByFindingId.has(spec.findingId)) specByFindingId.set(spec.findingId, spec)
     }
 
+    const compositeOracleFamily = verification?.terminalOracleFamily ?? receipt.terminalImpact?.oracleFamily ?? null
     const supersededIds: string[] = []
     for (const row of rows) {
       if (row.id === newFindingId) continue
@@ -2878,7 +3179,61 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       const linkedSpec = (row.replaySpecId ? specById.get(row.replaySpecId) : undefined)
         ?? specByFindingId.get(row.id)
       const earlierEndpoints = extractExistingFindingEndpointsForSupersession(row, linkedSpec)
-      if (!isEndpointSubsetOfUpstream(earlierEndpoints, upstreamEndpoints)) continue
+      const earlierExIds = row.finding.exchangeIds ?? []
+      const directMatchedUpstream: SupersessionEndpointSpec[] = []
+      const earlierRowOrigin = normalizeOrigin(row.finding.origin)
+      for (const exId of earlierExIds) {
+        const matched = upstreamNonGenericByExchangeId.get(exId)
+        if (matched && earlierRowOrigin && normalizeOrigin(matched.origin) === earlierRowOrigin) {
+          directMatchedUpstream.push(matched)
+        }
+      }
+
+      // 1) Require verified signed upstream transcript match with exact origin & explicit HTTP method
+      // (or direct signed exchangeId overlap when endpoint metadata is absent).
+      const matchedUpstreamSpecs: SupersessionEndpointSpec[] = []
+      if (earlierEndpoints.length > 0) {
+        if (!isEndpointSubsetOfUpstream(earlierEndpoints, upstreamEndpoints)) continue
+        for (const ep of earlierEndpoints) {
+          if (isGenericSharedAuthOrUtilityEndpoint(ep.normalizedEndpoint)) continue
+          for (const up of upstreamEndpoints) {
+            if (supersessionEndpointsMatchExact(ep, up)) matchedUpstreamSpecs.push(up)
+          }
+        }
+      } else if (directMatchedUpstream.length > 0) {
+        matchedUpstreamSpecs.push(...directMatchedUpstream)
+      } else {
+        continue
+      }
+      if (!matchedUpstreamSpecs.length) continue
+
+      // 2) Require matching vulnClass/CWE (or an explicitly declared precondition class on the matched upstream hop).
+      const findingObj = row.finding as Finding & { evidence?: Record<string, unknown> }
+      const ev = findingObj.evidence && typeof findingObj.evidence === 'object' ? findingObj.evidence : undefined
+      const proofReceiptObj = linkedSpec?.proofReceipt && typeof linkedSpec.proofReceipt === 'object'
+        ? linkedSpec.proofReceipt as unknown as Record<string, unknown>
+        : undefined
+      const earlierCompReceipt = (ev?.compositeReceipt ?? proofReceiptObj?.compositeReceipt) as CompositeProofReceipt | undefined
+      const earlierVulnClass = earlierCompReceipt?.terminalVulnClass
+        ?? linkedSpec?.proofReceipt?.receipt?.vulnClass
+        ?? persistedAgentScriptOf(linkedSpec?.spec)?.envelope.vulnClass
+        ?? null
+      const earlierMeta = extractExistingFindingTargetMeta(row, linkedSpec)
+      const preconditionVulnClasses = matchedUpstreamSpecs
+        .map(up => up.preconditionVulnClass)
+        .filter((cls): cls is string => Boolean(cls))
+      if (!isFindingClassSupersessionCompatible(
+        {
+          cwe: row.finding.cwe,
+          vulnClass: earlierVulnClass,
+          terminalOracleFamily: earlierMeta.terminalOracleFamily,
+        },
+        {
+          terminalVulnClass: receipt.terminalVulnClass,
+          terminalOracleFamily: compositeOracleFamily,
+          preconditionVulnClasses,
+        },
+      )) continue
 
       this.storage.updateProposedFinding(run, row.id, {
         supersededByFindingId: newFindingId,
@@ -3047,7 +3402,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
         createdAt: Date.now(),
       })
       if (findingRow) {
-        this.storage.updateProposedFinding(run, findingRow.id, {
+        this.demoteFindingToNonConfirmed(run, findingRow.id, {
           replaySpecId: updatedSpec.id,
           verificationTier: null,
           finding: {
@@ -3109,7 +3464,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
         createdAt: Date.now(),
       })
       if (findingRow) {
-        this.storage.updateProposedFinding(run, findingRow.id, {
+        this.demoteFindingToNonConfirmed(run, findingRow.id, {
           replaySpecId: updatedSpec.id,
           verificationTier: null,
           finding: {
@@ -3154,6 +3509,15 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
     const receiptOk = result.receipt?.verification.confirmed === true
       || result.compositeReceipt?.verification.confirmed === true
     const rawConfirmed = result.verdict.confirmed && receiptOk
+    const reverifyExchangeById = buildHostRecordedExchangeIndex(result)
+    const reverifyCompositeOrigin = rawConfirmed && result.compositeReceipt?.verification.confirmed
+      ? inspectCompositeHostOrigin(result.compositeReceipt.receipt, reverifyExchangeById)
+      : null
+    const originDriftReason = reverifyCompositeOrigin && !reverifyCompositeOrigin.ok
+      ? reverifyCompositeOrigin.reason
+      : reverifyCompositeOrigin?.ok && findingRow?.finding.origin && normalizeOrigin(reverifyCompositeOrigin.origin) !== normalizeOrigin(findingRow.finding.origin)
+        ? `Re-verification terminal exchange origin "${reverifyCompositeOrigin.origin}" drifted from confirmed finding origin "${findingRow.finding.origin}".`
+        : null
     // H-18 step 6: Reject receipt class drift on reverify when the re-verified receipt class
     // disagrees with the confirmed finding's CWE family.
     const provenVulnClass = result.compositeReceipt?.receipt.terminalVulnClass
@@ -3163,10 +3527,11 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       && !isCweConsistentWithReceiptClass(findingRow.finding.cwe, provenVulnClass)
       ? `Re-verification receipt class "${provenVulnClass}" (${cweFamilyForReceiptClass(provenVulnClass).cwe}) drifted from confirmed finding CWE ${normalizeCwe(findingRow.finding.cwe)}.`
       : null
-    const confirmed = rawConfirmed && !classDriftReason
+    const identityDriftReason = originDriftReason ?? classDriftReason
+    const confirmed = rawConfirmed && !identityDriftReason
     const status: Finding['status'] = confirmed
       ? 'confirmed'
-      : classDriftReason
+      : identityDriftReason
         ? 'inconclusive'
         : result.verdict.reason === 'oracle_failed'
           ? 'dismissed'
@@ -3175,16 +3540,16 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
     const feedback: InlineVerifyFeedback = {
       verdict: status === 'confirmed' ? 'confirmed' : status === 'dismissed' ? 'dismissed' : 'inconclusive',
       ...(verificationTier ? { verificationTier } : {}),
-      controlPassed: !classDriftReason && result.verdict.attempts.every(attempt => attempt.oraclePassed),
+      controlPassed: !identityDriftReason && result.verdict.attempts.every(attempt => attempt.oraclePassed),
       assertionSummary: {
         observed: confirmed
           ? `Agent script ${envelope.runtime} proof reproduced and its receipt re-validated.`
-          : classDriftReason
-            ? classDriftReason
+          : identityDriftReason
+            ? identityDriftReason
             : `Agent script proof did not re-confirm: ${result.verdict.reason}.`,
         expected: 'the persisted script reproduces the confirmation and its receipt re-validates',
-        ...(classDriftReason
-          ? { reason: classDriftReason }
+        ...(identityDriftReason
+          ? { reason: identityDriftReason }
           : result.verdict.detail
             ? { reason: result.verdict.detail }
             : {}),
@@ -3206,7 +3571,11 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
         }
       : null
     const receiptRow = cleanReverifyComposite
-      ? serializeCompositeProofReceiptRow(cleanReverifyComposite, result.receipt)
+      ? serializeCompositeProofReceiptRow(
+          cleanReverifyComposite,
+          result.receipt,
+          reverifyCompositeOrigin?.ok ? reverifyCompositeOrigin.terminalExchange : null,
+        )
       : confirmed && result.receipt
         ? serializeProofReceiptRow(result.receipt)
         : confirmed
@@ -3230,15 +3599,15 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
         verificationTier,
         reason: preservedReason
           ?? cleanReverifyComposite?.verification.reason
-          ?? classDriftReason
+          ?? identityDriftReason
           ?? (result.verdict.detail || result.verdict.reason),
         confidence: confirmed ? 'high' : 'low',
         verification: confirmed
           ? cleanReverifyComposite
             ? `ProofReceipt (Composite) ${cleanReverifyComposite.receipt.chainId} · ${cleanReverifyComposite.verification.hopCount} hops · ${cleanReverifyComposite.receipt.replayMode} · ${cleanReverifyComposite.verification.reason}`
             : `ProofReceipt · ${result.receipt?.verification.rule ?? 'script'} rule · ${result.receipt?.verification.reason ?? result.verdict.reason}`
-          : classDriftReason
-            ? `Agent script proof re-verification returned inconclusive (${classDriftReason}).`
+          : identityDriftReason
+            ? `Agent script proof re-verification returned inconclusive (${identityDriftReason}).`
             : `Agent script proof re-verification returned ${status} (${result.verdict.reason}).`,
         exchangeIds: result.exchanges.map(exchange => exchange.exchangeId),
         replaySpecId: updatedSpec.id,
@@ -3257,10 +3626,16 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
         const assetId = findingRow.assetId
         const savedFinding = this.storage.upsertChainFinding(run, assetId, nextFinding, updatedSpec.id, specRow.sourceOrigins)
         if (cleanReverifyComposite) {
-          this.supersedeUpstreamCompositeFindings(run, savedFinding.id, cleanReverifyComposite.receipt)
+          this.supersedeUpstreamCompositeFindings(
+            run,
+            savedFinding.id,
+            cleanReverifyComposite.receipt,
+            reverifyExchangeById,
+            cleanReverifyComposite.verification,
+          )
         }
       } else {
-        this.storage.updateProposedFinding(run, findingRow.id, {
+        this.demoteFindingToNonConfirmed(run, findingRow.id, {
           replaySpecId: updatedSpec.id,
           verificationTier: null,
           finding: {
@@ -3272,16 +3647,6 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
             exchangeIds: nextFinding.exchangeIds,
           },
         })
-        const dependentRows = this.storage.db.select().from(findings).where(and(
-          eq(findings.runId, run.id),
-          eq(findings.goalRevision, run.goalRevision),
-          eq(findings.supersededByFindingId, findingRow.id),
-        )).all()
-        for (const dep of dependentRows) {
-          this.storage.updateProposedFinding(run, dep.id, {
-            supersededByFindingId: null,
-          })
-        }
       }
     }
     this.host.postVerificationVerdict(run, {
@@ -3454,7 +3819,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
           })
           if (findingRow && !isAlreadyVerified) {
             const latestRun = this.host.check(params.job)
-            this.storage.updateProposedFinding(latestRun, findingRow.id, {
+            this.demoteFindingToNonConfirmed(latestRun, findingRow.id, {
               replaySpecId: updatedSpec.id,
               verificationTier: null,
               finding: { status: 'inconclusive', verificationTier: undefined, reason: deniedReason, confidence: 'low' },
@@ -3542,7 +3907,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
           replay, finalStatus, params.job.assignment.stepId,
         )
       } else {
-        this.storage.updateProposedFinding(latestRun, findingRow.id, {
+        this.demoteFindingToNonConfirmed(latestRun, findingRow.id, {
           replaySpecId: updatedSpec.id, sourceOrigins: mergedOrigins, verificationTier: null, finding: nextFindingPatch,
         })
       }
