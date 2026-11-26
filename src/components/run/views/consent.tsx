@@ -72,6 +72,14 @@ export function consentStickySummary(input: {
   return `${plural(input.hostCount, 'host')} · ${modeLabel} · ${policyLabel}`
 }
 
+/** True when no test accounts exist and active/authenticated checks are enabled. */
+export function shouldShowZeroPersonaWarning(
+  detail: { personas?: readonly unknown[] | null; run?: { capabilityTier?: CapabilityTier } | null },
+  capabilityTier?: CapabilityTier,
+): boolean {
+  return !detail.personas?.length && (capabilityTier ?? detail.run?.capabilityTier ?? 0) >= 2
+}
+
 interface Draft {
   assetIds: string[]
   capabilityTier: CapabilityTier
@@ -85,18 +93,10 @@ interface Draft {
 // Lightweight client fallback for standalone unit tests when server-authoritative PSL
 // ranking (`detail.recommendedScopeAssetIds` / `detail.highSignalScopeAssetIds`) is absent.
 // Authoritative full-PSL ranking runs strictly on the server in `src/actions.ts`.
-const PSL_RULES: ReadonlySet<string> = new Set([
-  'co.uk', 'org.uk', 'gov.uk', 'ac.uk', 'com.au', 'net.au', 'org.au', 'co.jp', 'ne.jp', 'or.jp',
-  'com.br', 'co.nz', 'co.za', 'co.in', 'com.sg', 'com.hk', 'com.mx', 'com.tw', 'co.kr',
-  'vercel.app', 'netlify.app', 'github.io', 'pages.dev', 'fly.dev', 'herokuapp.com',
-  'onrender.com', 'workers.dev', 'web.app', 'firebaseapp.com', 'run.app', 'appspot.com',
-  'azurewebsites.net', 'cloudfront.net', 'amazonaws.com', 'railway.app', 'glitch.me',
-])
-const FALLBACK_MULTI_TENANT_SUFFIXES: ReadonlySet<string> = new Set([
-  'vercel.app', 'netlify.app', 'github.io', 'pages.dev', 'fly.dev', 'herokuapp.com',
-  'onrender.com', 'workers.dev', 'web.app', 'firebaseapp.com', 'run.app', 'appspot.com',
-  'azurewebsites.net', 'cloudfront.net', 'amazonaws.com', 'railway.app', 'glitch.me',
-])
+const PSL_RULES: ReadonlySet<string> = new Set(
+  'co.uk org.uk gov.uk ac.uk com.au net.au org.au co.jp ne.jp or.jp com.br co.nz co.za co.in com.sg com.hk com.mx com.tw co.kr vercel.app netlify.app github.io pages.dev fly.dev herokuapp.com onrender.com workers.dev web.app firebaseapp.com run.app appspot.com azurewebsites.net cloudfront.net amazonaws.com railway.app glitch.me'.split(' '),
+)
+const FALLBACK_MULTI_TENANT_SUFFIXES: ReadonlySet<string> = new Set([...PSL_RULES].slice(19))
 
 function extractFallbackHost(raw: string): string {
   const t = raw.trim()
@@ -205,16 +205,12 @@ export function defaultScopeAssetIds(
       return origin.replace(/^https?:\/\//i, '').replace(/\/.*$/, '').replace(/:\d+$/, '').toLowerCase().replace(/\.$/, '')
     }
   }
-  const fallbackMultiTenant = new Set([
-    'vercel.app', 'netlify.app', 'github.io', 'pages.dev', 'fly.dev', 'herokuapp.com',
-    'onrender.com', 'workers.dev', 'web.app', 'firebaseapp.com', 'run.app', 'appspot.com',
-    'azurewebsites.net', 'cloudfront.net', 'amazonaws.com', 'railway.app', 'glitch.me',
-    'zendesk.com', 'atlassian.net', 'gitbook.io', 'shopify.com', 'myshopify.com', 'statuspage.io',
-  ])
-  const fallbackPublicSuffixes = new Set([
-    'co.uk', 'org.uk', 'gov.uk', 'ac.uk', 'com.au', 'net.au', 'org.au', 'co.jp', 'ne.jp', 'or.jp',
-    'com.br', 'co.nz', 'co.za', 'co.in', 'com.sg', 'com.hk', 'com.mx', 'com.tw', 'co.kr',
-  ])
+  const fallbackMultiTenant = new Set(
+    'vercel.app netlify.app github.io pages.dev fly.dev herokuapp.com onrender.com workers.dev web.app firebaseapp.com run.app appspot.com azurewebsites.net cloudfront.net amazonaws.com railway.app glitch.me zendesk.com atlassian.net gitbook.io shopify.com myshopify.com statuspage.io'.split(' '),
+  )
+  const fallbackPublicSuffixes = new Set(
+    'co.uk org.uk gov.uk ac.uk com.au net.au org.au co.jp ne.jp or.jp com.br co.nz co.za co.in com.sg com.hk com.mx com.tw co.kr'.split(' '),
+  )
   const isMultiTenant = (hostname: string): boolean => {
     if (typeof isMultiTenantPublicSuffix === 'function' && isMultiTenantPublicSuffix(hostname)) return true
     for (const suffix of fallbackMultiTenant) {
@@ -823,6 +819,21 @@ function ScopeCard({
     </div>}
 
     {/* (c) Bind Test Accounts — cleanly separated from Target Domains by a crisp divider */}
+    {!discovery && !scopeOnly && shouldShowZeroPersonaWarning(detail, draft.capabilityTier) && <div
+      data-testid="consent-zero-persona-warning"
+      role="status"
+      className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 border-t border-line bg-warn-soft px-3 py-1.5 text-xs text-fg-muted"
+    >
+      <span className="min-w-0">No test accounts — auth, BOLA/BFLA, and race checks will only test public surfaces.</span>
+      <Link
+        to="/projects/$projectId"
+        params={{ projectId: detail.project.id }}
+        search={{ tab: 'personas' }}
+        className="flex-none font-medium text-warn underline underline-offset-2 hover:text-fg"
+      >
+        Add test accounts →
+      </Link>
+    </div>}
     {canEditConfig && detail.personas.length > 0 && <div className="flex flex-col gap-2 border-t border-line px-4 pb-3 pt-2.5">
       <span className="text-[12px] font-medium text-fg-subtle">
         Bind test accounts
