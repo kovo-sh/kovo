@@ -1,7 +1,7 @@
 import { z } from 'zod'
 import type { Finding } from '../domain.ts'
 import {
-  ORIGIN_WIDE_CWES,
+  ORIGIN_WIDE_CWE_KEYS,
   computeFindingFingerprint,
   normalizeCwe,
   normalizeEndpointTemplate,
@@ -23,6 +23,7 @@ import { redact } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
 
 export {
+  ORIGIN_WIDE_CWE_KEYS,
   computeFindingFingerprint,
   isOriginWideCwe,
   normalizeCwe,
@@ -110,12 +111,39 @@ export type SemanticDedupeLlmCall = (prompt: {
   userPrompt: string
 }) => Promise<string>
 
+export type SameFindingIdentity = Pick<
+  DedupeCandidate,
+  'origin' | 'cwe' | 'category' | 'endpoint' | 'method' | 'param' | 'graphqlField' | 'mutated' | 'handler' | 'verifiedEndpoint'
+>
+
+export type SameFindingPredicateReason =
+  | 'origin_wide_cwe'
+  | 'same_surface'
+  | 'origin_mismatch'
+  | 'endpoint_mismatch'
+  | 'method_conflict'
+  | 'param_conflict'
+  | 'field_conflict'
+  | 'mutation_conflict'
+  | 'input_location_conflict'
+  | 'handler_conflict'
+
+export interface SameFindingPredicateEvaluation {
+  allowed: boolean
+  reason: SameFindingPredicateReason
+  detail: string
+}
+
 export interface SemanticDuplicateResult {
   isDuplicate: boolean
   duplicateOfId: string | null
   shouldUpgrade: boolean
   rationale: string
   usedLlm: boolean
+  /** Populated when the deterministic veto overrode an LLM `isDuplicate: true` verdict against a distinct sibling. */
+  vetoedDuplicateOfId?: string
+  /** Structured reason why `sameFindingPredicate` vetoed the LLM duplicate verdict. */
+  vetoReason?: SameFindingPredicateReason
 }
 
 export interface EvaluateSubmissionDedupeParams {
@@ -136,6 +164,10 @@ export interface SubmissionDedupeDecision {
   normalizedEndpoint: string
   rationale: string
   instruction?: string
+  /** Existing sibling finding ID when a model duplicate verdict was vetoed by `sameFindingPredicate`. */
+  siblingOfId?: string
+  /** Structured deterministic veto reason when `siblingOfId` is recorded. */
+  vetoReason?: SameFindingPredicateReason
 }
 
 const SEVERITY_RANK: Record<Finding['severity'], number> = {
@@ -547,6 +579,162 @@ export function findNearbyFindings(
   return sortExistingByPrecedence(nearby).slice(0, 12)
 }
 
+function normalizeComparableMethod(method?: string | null): string {
+  const normalized = (method ?? '').trim().toUpperCase()
+  return normalized && normalized !== 'ANY' ? normalized : ''
+}
+
+function implicitMutationKind(ref: Pick<SameFindingIdentity, 'param' | 'graphqlField'>): 'param' | 'graphql' | null {
+  if (ref.graphqlField?.trim()) return 'graphql'
+  if (ref.param?.trim()) return 'param'
+  return null
+}
+
+/**
+ * Deterministic surface-identity predicate shared by the offline semantic fallback and the hard
+ * veto on LLM semantic deduplication verdicts.
+ *
+ * Returns `{ allowed: true }` ONLY when two findings share the same origin and either:
+ *  - belong to the same origin-wide CWE (`ORIGIN_WIDE_CWE_KEYS`, e.g. CORS/CSP/HSTS/TLS/cookies), OR
+ *  - target the same normalized route template, compatible HTTP method, compatible input location
+ *    and verified handler, with no conflicting parameter name, GraphQL field, or mutation class.
+ */
+function evaluateSameFindingPredicate(
+  candidate: SameFindingIdentity,
+  existing: SameFindingIdentity,
+): SameFindingPredicateEvaluation {
+  const candOrigin = normalizeOrigin(candidate.origin)
+  const exOrigin = normalizeOrigin(existing.origin)
+  if (!candOrigin || candOrigin !== exOrigin) {
+    return {
+      allowed: false,
+      reason: 'origin_mismatch',
+      detail: `origin mismatch (${candOrigin || 'empty'} vs ${exOrigin || 'empty'})`,
+    }
+  }
+
+  const candCwe = normalizeCwe(candidate.cwe, candidate.category)
+  const exCwe = normalizeCwe(existing.cwe, existing.category)
+  const sameCwe = candCwe !== 'unknown' && candCwe === exCwe
+
+  // Same origin + same origin-wide CWE (e.g., CORS / CSP / HSTS / TLS / cookies):
+  // distinct probe paths or handlers on the same host still collapse into one host-wide finding.
+  if (sameCwe && ORIGIN_WIDE_CWE_KEYS.has(candCwe)) {
+    return {
+      allowed: true,
+      reason: 'origin_wide_cwe',
+      detail: `same origin (${candOrigin}) and origin-wide class ${candCwe}`,
+    }
+  }
+
+  const candEndpoint = normalizeEndpointTemplate(candidate.endpoint)
+  const exEndpoint = normalizeEndpointTemplate(existing.endpoint)
+  if (candEndpoint !== exEndpoint) {
+    return {
+      allowed: false,
+      reason: 'endpoint_mismatch',
+      detail: `normalized endpoint mismatch (${candEndpoint} vs ${exEndpoint})`,
+    }
+  }
+
+  // Two probes that explicitly name different HTTP verbs, parameters, GraphQL fields, mutation
+  // classes/locations, or verified handlers are distinct attack surfaces (GET vs DELETE BOLA,
+  // two parameters, header vs body field, two resolvers, reverse-proxy microservices).
+  const candMethod = normalizeComparableMethod(candidate.method)
+  const exMethod = normalizeComparableMethod(existing.method)
+  if (candMethod && exMethod && candMethod !== exMethod) {
+    return {
+      allowed: false,
+      reason: 'method_conflict',
+      detail: `HTTP method conflict (${candMethod} vs ${exMethod})`,
+    }
+  }
+
+  const candMutated = normalizeMutatedInput(candidate.mutated)
+  const exMutated = normalizeMutatedInput(existing.mutated)
+  if (candMutated && exMutated) {
+    if (candMutated.kind !== exMutated.kind || candMutated.name !== exMutated.name) {
+      return {
+        allowed: false,
+        reason: 'mutation_conflict',
+        detail: `mutated input conflict (${candMutated.kind}:${candMutated.name} vs ${exMutated.kind}:${exMutated.name})`,
+      }
+    }
+    if (candMutated.location && exMutated.location && candMutated.location !== exMutated.location) {
+      return {
+        allowed: false,
+        reason: 'input_location_conflict',
+        detail: `input location conflict (${candMutated.location} vs ${exMutated.location})`,
+      }
+    }
+  } else if (candMutated && !exMutated) {
+    const exImplicit = implicitMutationKind(existing)
+    if (candMutated.kind === 'header' || candMutated.kind === 'rpc' || (exImplicit && candMutated.kind !== exImplicit)) {
+      return {
+        allowed: false,
+        reason: 'mutation_conflict',
+        detail: `mutation class conflict (${candMutated.kind}:${candMutated.name} vs ${exImplicit ?? 'unmutated'})`,
+      }
+    }
+  } else if (!candMutated && exMutated) {
+    const candImplicit = implicitMutationKind(candidate)
+    if (exMutated.kind === 'header' || exMutated.kind === 'rpc' || (candImplicit && exMutated.kind !== candImplicit)) {
+      return {
+        allowed: false,
+        reason: 'mutation_conflict',
+        detail: `mutation class conflict (${candImplicit ?? 'unmutated'} vs ${exMutated.kind}:${exMutated.name})`,
+      }
+    }
+  }
+
+  const candParam = (candidate.param ?? '').trim().toLowerCase() || (candMutated?.kind === 'param' ? candMutated.name : '')
+  const exParam = (existing.param ?? '').trim().toLowerCase() || (exMutated?.kind === 'param' ? exMutated.name : '')
+  if (candParam && exParam && candParam !== exParam) {
+    return {
+      allowed: false,
+      reason: 'param_conflict',
+      detail: `parameter conflict (${candParam} vs ${exParam})`,
+    }
+  }
+
+  const candField = (candidate.graphqlField ?? '').trim().toLowerCase() || (candMutated?.kind === 'graphql' ? candMutated.name : '')
+  const exField = (existing.graphqlField ?? '').trim().toLowerCase() || (exMutated?.kind === 'graphql' ? exMutated.name : '')
+  if (candField && exField && candField !== exField) {
+    return {
+      allowed: false,
+      reason: 'field_conflict',
+      detail: `GraphQL field conflict (${candField} vs ${exField})`,
+    }
+  }
+
+  const candHandler = normalizeHandlerRef(candidate.handler?.trim() ? candidate.handler : candidate.verifiedEndpoint)
+  const exHandler = normalizeHandlerRef(existing.handler?.trim() ? existing.handler : existing.verifiedEndpoint)
+  if (candHandler && exHandler && candHandler !== exHandler) {
+    return {
+      allowed: false,
+      reason: 'handler_conflict',
+      detail: `verified handler conflict (${candHandler} vs ${exHandler})`,
+    }
+  }
+
+  return {
+    allowed: true,
+    reason: 'same_surface',
+    detail: `same origin (${candOrigin}), normalized endpoint (${candEndpoint}), and compatible probe surface`,
+  }
+}
+
+/**
+ * Boolean convenience wrapper around `evaluateSameFindingPredicate`: true iff `candidate` and
+ * `existing` refer to a mergeable attack surface (or the same origin-wide CWE class).
+ */
+export function sameFindingPredicate(
+  candidate: SameFindingIdentity,
+  existing: SameFindingIdentity,
+): boolean {
+  return evaluateSameFindingPredicate(candidate, existing).allowed
+}
+
 function deterministicSemanticFallback(
   candidate: DedupeCandidate,
   nearbyFindings: readonly ExistingFindingRef[],
@@ -556,42 +744,17 @@ function deterministicSemanticFallback(
   const candEndpoint = normalizeEndpointTemplate(candidate.endpoint)
 
   for (const existing of nearbyFindings) {
-    const exOrigin = normalizeOrigin(existing.origin)
     const exCwe = normalizeCwe(existing.cwe, existing.category)
-    const exEndpoint = normalizeEndpointTemplate(existing.endpoint)
-    const sameOrigin = candOrigin === exOrigin
     const sameCwe = candCwe !== 'unknown' && candCwe === exCwe
-    const sameEndpoint = candEndpoint === exEndpoint
-    // Two probes that explicitly name different verbs, different injectable parameters,
-    // GraphQL/RPC operations or verified handlers are distinct attack surfaces (GET vs DELETE
-    // BOLA, two parameters, two resolvers, reverse-proxy handlers).
-    const methodConflict = Boolean(
-      candidate.method && existing.method &&
-      candidate.method.trim().toUpperCase() !== existing.method.trim().toUpperCase(),
-    )
-    const paramConflict = Boolean(
-      candidate.param && existing.param &&
-      candidate.param.trim().toLowerCase() !== existing.param.trim().toLowerCase(),
-    )
-    const fieldConflict = Boolean(
-      candidate.graphqlField && existing.graphqlField &&
-      candidate.graphqlField.trim().toLowerCase() !== existing.graphqlField.trim().toLowerCase(),
-    )
-    const candMutated = normalizeMutatedInput(candidate.mutated)
-    const exMutated = normalizeMutatedInput(existing.mutated)
-    const mutationConflict = Boolean(
-      candMutated && exMutated &&
-      (candMutated.kind !== exMutated.kind || candMutated.name !== exMutated.name),
-    )
-    const candHandler = normalizeHandlerRef(candidate.handler?.trim() ? candidate.handler : candidate.verifiedEndpoint)
-    const exHandler = normalizeHandlerRef(existing.handler?.trim() ? existing.handler : existing.verifiedEndpoint)
-    const handlerConflict = Boolean(candHandler && exHandler && candHandler !== exHandler)
-    const probeConflict = methodConflict || paramConflict || fieldConflict || mutationConflict || handlerConflict
+    if (!sameCwe) continue
+
+    if (!sameFindingPredicate(candidate, existing)) continue
+
     const shouldUpgrade = severityRank(candidate.severity) > severityRank(existing.severity)
 
     // Same origin + origin-wide CWE (e.g., CORS / CSP / HSTS / TLS / cookies):
     // collapse duplicate Low/Medium CORS findings on the same host automatically!
-    if (sameOrigin && sameCwe && ORIGIN_WIDE_CWES.has(candCwe)) {
+    if (ORIGIN_WIDE_CWE_KEYS.has(candCwe)) {
       return {
         isDuplicate: true,
         duplicateOfId: existing.id,
@@ -604,14 +767,12 @@ function deterministicSemanticFallback(
     // Same origin + same CWE + same normalized endpoint template. Cross-endpoint title similarity
     // is deliberately NOT a duplicate signal: two BOLA routes or two resolvers on one host are
     // separate findings even when the prose is near-identical.
-    if (sameOrigin && sameCwe && sameEndpoint && !probeConflict) {
-      return {
-        isDuplicate: true,
-        duplicateOfId: existing.id,
-        shouldUpgrade,
-        rationale: `Deterministic fallback: same origin (${candOrigin}), ${candCwe}, and normalized endpoint (${candEndpoint}) as existing finding ${existing.id}.`,
-        usedLlm: false,
-      }
+    return {
+      isDuplicate: true,
+      duplicateOfId: existing.id,
+      shouldUpgrade,
+      rationale: `Deterministic fallback: same origin (${candOrigin}), ${candCwe}, and normalized endpoint (${candEndpoint}) as existing finding ${existing.id}.`,
+      usedLlm: false,
     }
   }
 
@@ -733,6 +894,21 @@ export async function judgeSemanticDuplicate(
       return deterministicSemanticFallback(candidate, nearbyFindings)
     }
 
+    // Hard deterministic veto: the LLM may ONLY merge a candidate into an existing finding when
+    // `sameFindingPredicate` confirms they target the same attack surface (or origin-wide CWE).
+    if (!sameFindingPredicate(candidate, matched)) {
+      const predicate = evaluateSameFindingPredicate(candidate, matched)
+      return {
+        isDuplicate: false,
+        duplicateOfId: null,
+        shouldUpgrade: false,
+        rationale: `Deterministic veto overrode LLM duplicate verdict against sibling ${matched.id} (${predicate.reason}: ${predicate.detail}); proceeding to verification.`,
+        usedLlm: true,
+        vetoedDuplicateOfId: matched.id,
+        vetoReason: predicate.reason,
+      }
+    }
+
     const higherSeverity = severityRank(candidate.severity) > severityRank(matched.severity)
     return {
       isDuplicate: true,
@@ -771,6 +947,7 @@ export async function evaluateSubmissionDedupe(
   }
 
   const nearby = findNearbyFindings(params.candidate, params.existingFindings, excludeId)
+  let siblingVeto: { vetoedDuplicateOfId: string; vetoReason: SameFindingPredicateReason; rationale: string } | null = null
   if (nearby.length > 0) {
     const semantic = await judgeSemanticDuplicate(params.candidate, nearby, params.llmCall)
     if (semantic.isDuplicate && semantic.duplicateOfId) {
@@ -790,6 +967,13 @@ export async function evaluateSubmissionDedupe(
           : `Same root cause as existing finding ${semantic.duplicateOfId}. Do not create a duplicate row; use update_proposed_finding("${semantic.duplicateOfId}") if adding a stronger proof.`,
       }
     }
+    if (semantic.vetoedDuplicateOfId && semantic.vetoReason) {
+      siblingVeto = {
+        vetoedDuplicateOfId: semantic.vetoedDuplicateOfId,
+        vetoReason: semantic.vetoReason,
+        rationale: semantic.rationale,
+      }
+    }
   }
 
   return {
@@ -801,7 +985,13 @@ export async function evaluateSubmissionDedupe(
     fingerprintKey: structural.fingerprint.key,
     fingerprintHash: structural.fingerprint.hash,
     normalizedEndpoint: structural.fingerprint.normalizedEndpoint,
-    rationale: 'Accepted as a distinct finding.',
+    rationale: siblingVeto ? siblingVeto.rationale : 'Accepted as a distinct finding.',
+    ...(siblingVeto
+      ? {
+          siblingOfId: siblingVeto.vetoedDuplicateOfId,
+          vetoReason: siblingVeto.vetoReason,
+        }
+      : {}),
   }
 }
 

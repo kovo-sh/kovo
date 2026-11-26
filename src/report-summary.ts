@@ -11,6 +11,7 @@ import type {
   SelectedChecks,
   VerificationTier,
 } from './domain.ts'
+import { ORIGIN_WIDE_CWE_KEYS } from './finding-keys.ts'
 
 export const checkLabels: Record<CheckCoverage['status'], string> = {
   met: 'Meets baseline',
@@ -129,12 +130,9 @@ export interface HeaderPostureSummary {
   finding: Finding
 }
 
-// Origin-wide classes where one root cause covers every route on the host. Keep in sync with
-// ORIGIN_WIDE_CWES in src/server/dedupe.ts. Duplicated here so the report layer stays free of
-// server/node imports (it also runs in the browser bundle).
-const ORIGIN_WIDE_CWE_KEYS = new Set([
-  'CWE-942', 'CWE-346', 'CWE-693', 'CWE-1021', 'CWE-319', 'CWE-295', 'CWE-327', 'CWE-614', 'CWE-1004', 'CWE-1275',
-])
+// Re-export the single browser-safe origin-wide CWE Set from `src/finding-keys.ts` so the
+// report layer and server fingerprinting/dedupe layer can never drift.
+export { ORIGIN_WIDE_CWE_KEYS }
 
 export function chainFindingDedupKey(finding: Pick<Finding, 'origin' | 'cwe' | 'category' | 'title' | 'fingerprintHash'>): string {
   const origin = finding.origin.trim().toLowerCase()
