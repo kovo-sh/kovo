@@ -73,12 +73,12 @@ interface RpcEnvelope { ok: boolean; result?: unknown; error?: string }
 export interface HttpExchange {
   exchangeId: string; status: number; method: string; pathAndQuery: string; finalPathAndQuery?: string; redirectOrigins?: string[]
   mediaType: string; headers: Record<string, string>; body: string; text: string; json: unknown; data: unknown; bodyPreview: string
-  bodyBytes: number; bodySha256: string; durationMs: number; personaHandle: string | null; consumedCapabilityId?: string | null; derivedFromCapabilityIds?: string[]; protocol?: 'h2'
+  bodyBytes: number; bodySha256: string; durationMs: number; personaHandle: string | null; consumedCapabilityId?: string | null; consumedCapabilities?: string[]; derivedFromCapabilityIds?: string[]; protocol?: 'h2'
 }
 export interface CapabilityInjectionSpec { handle: string; target?: 'bearer' | 'header' | 'cookie' | 'url'; headerName?: string; cookieName?: string; queryParam?: string }
 export interface SealCapabilityInput {
-  exchangeId?: string; exchange?: { exchangeId: string } | null; hopReceiptId?: string; slot: string
-  jsonPath?: string; header?: string; cookie?: string; regex?: string; value?: string
+  exchangeId?: string | { exchangeId: string }; exchange?: string | { exchangeId: string } | null; hopReceiptId?: string; hopId?: string; slot: string
+  jsonPath?: string; header?: string; cookie?: string; setCookie?: string; locationQuery?: string; queryParam?: string; regex?: string; value?: string
   kind?: 'bearer_token' | 'api_token' | 'cookie' | 'signed_url' | 'oidc_assertion' | 'signing_salt' | 'hmac_key' | 'jwt' | 'header_secret' | 'generic_secret'
   ttlMs?: number | null; defaultHeaderName?: string; defaultCookieName?: string; allowedOrigins?: string[]
 }
@@ -154,38 +154,21 @@ interface RpcTransport { socketPath: string; token: string; nonce: string }
 
 function readContext(): RpcContext {
   const raw = JSON.parse(readFileSync(process.env.KOVO_RPC_CONTEXT_FILE ?? '/kovo-rpc/context.json', 'utf8')) as Record<string, unknown>
-  return {
-    nonce: typeof raw.nonce === 'string' ? raw.nonce : '',
-    runId: typeof raw.runId === 'string' ? raw.runId : 'unknown-run',
-    targetOrigins: Array.isArray(raw.targetOrigins) ? raw.targetOrigins.filter((v): v is string => typeof v === 'string') : [],
-    sdkVersion: typeof raw.sdkVersion === 'string' ? raw.sdkVersion : 'kovo_verify/v8',
-  }
+  return { nonce: typeof raw.nonce === 'string' ? raw.nonce : '', runId: typeof raw.runId === 'string' ? raw.runId : 'unknown-run', targetOrigins: Array.isArray(raw.targetOrigins) ? raw.targetOrigins.filter((v): v is string => typeof v === 'string') : [], sdkVersion: typeof raw.sdkVersion === 'string' ? raw.sdkVersion : 'kovo_verify/v8' }
 }
 
 function sendRpc(transport: RpcTransport, op: string, args: Record<string, unknown>, timeoutMs = 60_000): Promise<unknown> {
   const payload = JSON.stringify({ op, args })
   return new Promise((resolve, reject) => {
-    const req = httpRequest({
-      socketPath: transport.socketPath, path: '/rpc', method: 'POST', timeout: timeoutMs,
-      headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload), 'x-kovo-rpc-token': transport.token, 'x-kovo-verify-nonce': transport.nonce },
-    }, res => {
-      const chunks: Buffer[] = []
-      let size = 0
-      res.on('data', (chunk: Buffer) => {
-        size += chunk.length
-        if (size > 8 * 1024 * 1024) { res.destroy(); reject(new Error('Verification RPC response exceeded the SDK limit.')); return }
-        chunks.push(chunk)
-      })
+    const req = httpRequest({ socketPath: transport.socketPath, path: '/rpc', method: 'POST', timeout: timeoutMs, headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload), 'x-kovo-rpc-token': transport.token, 'x-kovo-verify-nonce': transport.nonce } }, res => {
+      const chunks: Buffer[] = []; let size = 0
+      res.on('data', (chunk: Buffer) => { size += chunk.length; if (size > 8 * 1024 * 1024) { res.destroy(); reject(new Error('Verification RPC response exceeded the SDK limit.')); return } chunks.push(chunk) })
       res.on('end', () => {
-        let body: RpcEnvelope
-        try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as RpcEnvelope } catch { reject(new Error('Verification RPC returned malformed JSON.')); return }
-        if (!body.ok) reject(new Error(body.error ?? 'Verification RPC call failed.'))
-        else resolve(body.result)
+        let body: RpcEnvelope; try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as RpcEnvelope } catch { reject(new Error('Verification RPC returned malformed JSON.')); return }
+        if (!body.ok) reject(new Error(body.error ?? 'Verification RPC call failed.')); else resolve(body.result)
       })
     })
-    req.on('timeout', () => { req.destroy(new Error('Verification RPC call timed out.')) })
-    req.on('error', reject)
-    req.end(payload)
+    req.on('timeout', () => { req.destroy(new Error('Verification RPC call timed out.')) }); req.on('error', reject); req.end(payload)
   })
 }
 
@@ -248,24 +231,17 @@ function extractInlineHttpOptions(input: unknown): HttpOptions {
 
 function parseJsonSafe(body: unknown): unknown {
   if (typeof body !== 'string') return null
-  const cleaned = body.replace(/^\uFEFF/, '').trim()
-  if (!cleaned) return null
+  const cleaned = body.replace(/^\uFEFF/, '').trim(); if (!cleaned) return null
   try { return JSON.parse(cleaned) } catch { return null }
 }
-
 export function hydrateExchange(raw: HttpExchange): HttpExchange {
   if (!raw || typeof raw !== 'object') return raw
-  const body = typeof raw.body === 'string' ? raw.body : ''
-  const parsed = raw.json != null ? raw.json : parseJsonSafe(body)
+  const body = typeof raw.body === 'string' ? raw.body : '', parsed = raw.json != null ? raw.json : parseJsonSafe(body)
   return { ...raw, body, text: body, json: parsed, data: parsed, headers: raw.headers && typeof raw.headers === 'object' ? raw.headers : {} }
 }
-
 function hydrateFields<T extends Record<string, unknown>>(res: T, keys: readonly string[]): T {
   const out: Record<string, unknown> = { ...res }
-  for (const k of keys) {
-    const v = out[k]
-    if (v && typeof v === 'object' && !Array.isArray(v) && 'exchangeId' in (v as Record<string, unknown>)) out[k] = hydrateExchange(v as HttpExchange)
-  }
+  for (const k of keys) { const v = out[k]; if (v && typeof v === 'object' && !Array.isArray(v) && 'exchangeId' in (v as Record<string, unknown>)) out[k] = hydrateExchange(v as HttpExchange) }
   return out as T
 }
 
@@ -295,11 +271,21 @@ function normalizeHopTarget(rawTarget: unknown, hopMethod: unknown, defaultOrigi
   const t = rawTarget as Record<string, unknown>
   const rawOrigin = typeof t.origin === 'string' && t.origin.trim() ? t.origin.trim() : undefined
   const rawMethod = typeof t.method === 'string' && t.method.trim() ? t.method.trim().toUpperCase() : fallbackMethod
-  const rawPath = typeof t.pathAndQuery === 'string' && t.pathAndQuery.trim() ? t.pathAndQuery : undefined
+  const rawPath = typeof t.pathAndQuery === 'string' && t.pathAndQuery.trim() ? t.pathAndQuery : typeof t.path === 'string' && t.path.trim() ? t.path : typeof t.url === 'string' && t.url.trim() ? t.url : undefined
   const split = rawPath !== undefined ? splitTarget(rawPath, rawOrigin ?? defaultOrigin) : undefined
   const origin = rawOrigin ?? split?.origin ?? defaultOrigin
   const param = typeof t.param === 'string' && t.param.trim() ? t.param.trim() : undefined
   return { ...(origin ? { origin } : {}), ...(rawMethod ? { method: rawMethod } : {}), ...(split ? { pathAndQuery: split.path } : {}), ...(param ? { param } : {}) }
+}
+
+const normExRef = (v: unknown): unknown => (v && typeof v === 'object' && !Array.isArray(v) && typeof (v as Record<string, unknown>).exchangeId === 'string') ? (v as Record<string, unknown>).exchangeId : v
+const normExList = (v: unknown): unknown => Array.isArray(v) ? v.map(normExRef) : v
+const normCapRef = (v: unknown): unknown => (v && typeof v === 'object' && !Array.isArray(v)) ? (resolveCapHandle(v) || v) : v
+const normCapList = (v: unknown): unknown => Array.isArray(v) ? v.map(normCapRef) : v
+const mapFields = (obj: Record<string, unknown>, map: Record<string, (v: unknown) => unknown>): Record<string, unknown> => {
+  const out: Record<string, unknown> = { ...obj }
+  for (const [k, fn] of Object.entries(map)) if (out[k] !== undefined) out[k] = fn(out[k])
+  return out
 }
 
 function normalizeCompositeReceipt(receipt: unknown, defaultOrigin: string | undefined): Record<string, unknown> {
@@ -310,9 +296,19 @@ function normalizeCompositeReceipt(receipt: unknown, defaultOrigin: string | und
   const hops = rec.hops.map(h => {
     if (!h || typeof h !== 'object' || Array.isArray(h)) return h
     const { method, target, ...rest } = h as Record<string, unknown>
-    return { ...rest, target: normalizeHopTarget(target, method, defaultOrigin) }
+    return mapFields({ ...rest, target: normalizeHopTarget(target, method, defaultOrigin) }, { exchangeIds: normExList, producedCapabilities: normCapList, consumedCapabilities: normCapList })
   })
-  return { receipt: { ...rec, hops } }
+  const rawEdges = Array.isArray(rec.causalEdges) ? rec.causalEdges : Array.isArray(rec.edges) ? rec.edges : undefined
+  const causalEdges = rawEdges?.map(ed => {
+    if (!ed || typeof ed !== 'object' || Array.isArray(ed)) return ed
+    const e = ed as Record<string, unknown>
+    const ab = e.ablationExchangeIds !== undefined ? normExList(e.ablationExchangeIds) : e.ablationExchange !== undefined ? extractExchangeIds(e.ablationExchange as ExchangeRef | ExchangeRef[]) : undefined
+    return mapFields({ ...e, ...(ab !== undefined ? { ablationExchangeIds: ab } : {}) }, { capabilityHandle: normCapRef, sourceCapabilityId: normCapRef, derivedCapabilityId: normCapRef, sourceExchangeId: normExRef, targetExchangeId: normExRef })
+  })
+  const ti = rec.terminalImpact && typeof rec.terminalImpact === 'object' && !Array.isArray(rec.terminalImpact)
+    ? mapFields(rec.terminalImpact as Record<string, unknown>, { terminalExchangeId: normExRef, modeAFailureExchangeId: normExRef, preChainControlExchangeIds: normExList, postChainReadbackExchangeIds: normExList })
+    : rec.terminalImpact
+  return { receipt: { ...rec, hops, ...(causalEdges !== undefined ? { causalEdges } : {}), ...(ti !== undefined ? { terminalImpact: ti } : {}) } }
 }
 
 interface RecordedHop {
@@ -428,17 +424,24 @@ export class ChainBuilder {
       if (!seenEdges.has(key)) { seenEdges.add(key); edges.push(edge) }
     }
     for (const explicit of this.explicitEdges) addEdge(explicit)
+    const resolveProducer = (cap: string): { hopId: string; exchangeId?: string } | undefined => {
+      const direct = this.capProducer.get(cap); if (direct) return direct
+      const srcEx = this.ctx._capOriginOf(cap), hopId = srcEx ? this.exchangeToHop.get(srcEx) : undefined; if (!hopId) return undefined
+      const prodHop = this.hops.find(h => h.receipt.hopId === hopId)?.receipt
+      if (prodHop) { prodHop.producedCapabilities ??= []; pushUnique(prodHop.producedCapabilities, cap) }
+      const resolved = { hopId, ...(srcEx ? { exchangeId: srcEx } : {}) }; this.capProducer.set(cap, resolved); return resolved
+    }
     for (const hop of this.hops) {
       const toHopId = hop.receipt.hopId, cryptoBound = new Set<string>()
       for (const c of hop.cryptoConsumptions) {
-        const prod = this.capProducer.get(c.sourceCapabilityId)
+        const prod = resolveProducer(c.sourceCapabilityId)
         if (!prod || prod.hopId === toHopId) continue
         cryptoBound.add(c.sourceCapabilityId)
         addEdge({ kind: 'derived_crypto_binding', fromHopId: prod.hopId, toHopId, sourceCapabilityId: c.sourceCapabilityId, ...(c.derivedCapabilityId && /^cap:/.test(c.derivedCapabilityId) ? { derivedCapabilityId: c.derivedCapabilityId } : {}), ...(c.alg ? { alg: c.alg } : {}) })
       }
       for (const cap of hop.receipt.consumedCapabilities ?? []) {
         if (cryptoBound.has(cap) && !hop.capConsumeExchange.has(cap)) continue
-        const prod = this.capProducer.get(cap)
+        const prod = resolveProducer(cap)
         if (!prod || prod.hopId === toHopId) continue
         const targetExchangeId = hop.capConsumeExchange.get(cap)
         addEdge({ kind: 'value_binding', fromHopId: prod.hopId, toHopId, capabilityHandle: cap, ...(prod.exchangeId ? { sourceExchangeId: prod.exchangeId } : {}), ...(targetExchangeId ? { targetExchangeId } : {}) })
@@ -477,7 +480,7 @@ export class VerifyContext {
   readonly claims: VerifyClaim[] = []; readonly expect: Expectations; readonly assert: Expectations
   private readonly defaultOrigin: string | undefined; private readonly transport: RpcTransport
   private _lastRpcOp: string | null = null; private _lastFailedCompositeClaim: CompositeReceiptClaim | null = null
-  private readonly _hopStack: HopRecorder[] = []
+  private readonly _hopStack: HopRecorder[] = []; private readonly _capOrigins = new Map<string, string>()
 
   constructor() {
     const context = readContext()
@@ -501,8 +504,13 @@ export class VerifyContext {
 
   get lastRpcOp(): string | null { return this._lastRpcOp }
   /** @internal */ _pushHopRecorder(rec: HopRecorder): void { this._hopStack.push(rec) }
-  /** @internal */ _popHopRecorder(rec: HopRecorder): void { const idx = this._hopStack.lastIndexOf(rec); if (idx >= 0) this._hopStack.splice(idx, 1) }
+  /** @internal */ _popHopRecorder(rec: HopRecorder): void { const i = this._hopStack.lastIndexOf(rec); if (i >= 0) this._hopStack.splice(i, 1) }
+  /** @internal */ _capOriginOf(cap: string): string | undefined { return this._capOrigins.get(cap) }
   private activeHop(): HopRecorder | undefined { return this._hopStack[this._hopStack.length - 1] }
+  private recordExCaps(hop: HopRecorder, ex: HttpExchange, explicitCap?: unknown): void {
+    for (const c of [resolveCapHandle(explicitCap), ex.consumedCapabilityId, ...(ex.consumedCapabilities ?? [])]) if (typeof c === 'string' && c.trim()) { pushUnique(hop.consumedCapabilities, c); hop.capConsumeExchange.set(c, ex.exchangeId) }
+    for (const src of ex.derivedFromCapabilityIds ?? []) if (src && !hop.cryptoConsumptions.some(c => c.sourceCapabilityId === src)) { pushUnique(hop.consumedCapabilities, src); hop.cryptoConsumptions.push({ sourceCapabilityId: src }) }
+  }
   private callRpc(op: string, args: Record<string, unknown>, timeoutMs = 60_000): Promise<unknown> { this._lastRpcOp = op; return sendRpc(this.transport, op, args, timeoutMs) }
 
   chain(opts: ChainBuilderOptions): ChainBuilder
@@ -536,8 +544,7 @@ export class VerifyContext {
     if (hop) {
       hop.onExchange(ex.exchangeId)
       if (!hop.target) hop.target = { origin: typeof args.origin === 'string' ? args.origin : this.targetOrigin, method: typeof args.method === 'string' ? args.method : ex.method, pathAndQuery: ex.pathAndQuery || (typeof args.path === 'string' ? args.path : '/') }
-      const capHandle = resolveCapHandle(args.capability) || (typeof ex.consumedCapabilityId === 'string' ? ex.consumedCapabilityId : '')
-      if (capHandle) { pushUnique(hop.consumedCapabilities, capHandle); hop.capConsumeExchange.set(capHandle, ex.exchangeId) }
+      this.recordExCaps(hop, ex, args.capability)
       if (!hop.entityId && typeof args.entityId === 'string' && args.entityId.trim()) hop.entityId = args.entityId.trim()
       if (Array.isArray(args.correlationIds)) for (const cid of args.correlationIds) if (typeof cid === 'string') hop.onCorrelation(cid)
     }
@@ -549,16 +556,17 @@ export class VerifyContext {
   request(input: HttpTarget, options: HttpOptions = {}): Promise<HttpExchange> { return this.sendHttp('http.send', input, options) }
 
   async seal_capability(input: SealCapabilityInput): Promise<SealedCapabilityResult> {
-    const exchangeId = input.exchangeId ?? input.exchange?.exchangeId
-    if (!exchangeId) throw new Error('seal_capability requires exchangeId or exchange.')
+    const raw = (input && typeof input === 'object' ? input : {}) as unknown as Record<string, unknown>
+    const exchangeId = extractExchangeIds((raw.exchangeId ?? raw.exchange ?? raw.exchange_id ?? raw.sourceExchangeId ?? raw.response) as ExchangeRef | undefined)[0]
+    if (!exchangeId) throw new Error('seal_capability requires exchangeId (string) or exchange ({ exchangeId }).')
+    const activeHop = this.activeHop(), hopReceiptId = (typeof raw.hopReceiptId === 'string' && raw.hopReceiptId.trim()) ? raw.hopReceiptId.trim() : (typeof raw.hopId === 'string' && raw.hopId.trim()) ? raw.hopId.trim() : activeHop?.hopId
+    const cookieSel = typeof raw.cookie === 'string' && raw.cookie.trim() ? raw.cookie : typeof raw.setCookie === 'string' && raw.setCookie.trim() ? raw.setCookie : undefined
     const res = await this.callRpc('capability.seal', {
-      exchangeId, slot: input.slot,
-      ...pickDefined(input as unknown as Record<string, unknown>, ['hopReceiptId', 'jsonPath', 'header', 'cookie', 'regex', 'kind', 'defaultHeaderName', 'defaultCookieName']),
-      ...(input.value !== undefined ? { value: input.value } : {}),
-      ...(input.ttlMs !== undefined ? { ttlMs: input.ttlMs } : {}),
-      ...(input.allowedOrigins?.length ? { allowedOrigins: input.allowedOrigins } : {}),
+      exchangeId, slot: input.slot, ...(hopReceiptId ? { hopReceiptId } : {}), ...(cookieSel ? { cookie: cookieSel } : {}),
+      ...pickDefined(raw, ['jsonPath', 'header', 'setCookie', 'locationQuery', 'queryParam', 'regex', 'kind', 'defaultHeaderName', 'defaultCookieName']),
+      ...(input.value !== undefined ? { value: input.value } : {}), ...(input.ttlMs !== undefined ? { ttlMs: input.ttlMs } : {}), ...(input.allowedOrigins?.length ? { allowedOrigins: input.allowedOrigins } : {}),
     }, 30_000) as SealedCapabilityResult
-    this.activeHop()?.onProduce(res.handle, res.exchangeId || exchangeId)
+    const srcEx = res.exchangeId || exchangeId; if (res.handle && srcEx) this._capOrigins.set(res.handle, srcEx); activeHop?.onProduce(res.handle, srcEx)
     return res
   }
   sealCapability(input: SealCapabilityInput): Promise<SealedCapabilityResult> { return this.seal_capability(input) }
@@ -595,6 +603,7 @@ export class VerifyContext {
       ...(r.ttlMs !== undefined ? { ttlMs: r.ttlMs } : {}), ...(r.allowedOrigins?.length ? { allowedOrigins: r.allowedOrigins } : {}),
     }, 30_000) as JwtSignResult
     const out = { ...res, handle: res.handle ?? res.derivedHandle, token: res.token ?? res.derivedHandle }
+    if (out.derivedHandle && out.exchangeId) this._capOrigins.set(out.derivedHandle, out.exchangeId)
     this.recordCrypto(secretHandle, out.exchangeId, out.derivedHandle, out.attestation?.alg ?? r.alg)
     return out
   }
@@ -617,6 +626,7 @@ export class VerifyContext {
     const hop = this.activeHop()
     if (hop) {
       if (out.exchangeId) hop.onExchange(out.exchangeId)
+      if (out.exchange) this.recordExCaps(hop, out.exchange, pollRequest.capability)
       if (!hop.target) hop.target = { origin: typeof pollRequest.origin === 'string' ? pollRequest.origin : this.targetOrigin, method: typeof pollRequest.method === 'string' ? pollRequest.method : 'GET', pathAndQuery: out.exchange?.pathAndQuery || (typeof pollRequest.path === 'string' ? pollRequest.path : '/') }
       const cid = r.correlationId ? String(r.correlationId) : (r.correlationIds?.[0] ? String(r.correlationIds[0]) : undefined)
       if (cid) hop.onCorrelation(cid)
@@ -646,16 +656,8 @@ export class VerifyContext {
   }
 
   readonly oob = {
-    mint: async (label: string, origin?: string): Promise<OobHandle> => {
-      const res = await this.callRpc('oob', { action: 'mint', label, ...(origin ? { origin } : {}) }, 30_000) as OobHandle
-      pushUnique(this.activeHop()?.oobEventIds ?? [], res.exchangeId)
-      return res
-    },
-    check: async (handle: OobHandle): Promise<OobCheck> => {
-      const res = { ...handle, ...(await this.callRpc('oob', { action: 'check', token: handle.token, exchangeId: handle.exchangeId }, 30_000) as OobCheck) }
-      pushUnique(this.activeHop()?.oobEventIds ?? [], res.checkExchangeId ?? res.exchangeId)
-      return res
-    },
+    mint: async (label: string, origin?: string): Promise<OobHandle> => { const res = await this.callRpc('oob', { action: 'mint', label, ...(origin ? { origin } : {}) }, 30_000) as OobHandle; pushUnique(this.activeHop()?.oobEventIds ?? [], res.exchangeId); return res },
+    check: async (handle: OobHandle): Promise<OobCheck> => { const res = { ...handle, ...(await this.callRpc('oob', { action: 'check', token: handle.token, exchangeId: handle.exchangeId }, 30_000) as OobCheck) }; pushUnique(this.activeHop()?.oobEventIds ?? [], res.checkExchangeId ?? res.exchangeId); return res },
   }
 
   // -- authoritative host-backed proof helpers (`prove.*`) ----------------
@@ -677,6 +679,8 @@ export class VerifyContext {
     if (!input || typeof input !== 'object') throw new Error('prove_persisted_mutation requires { readRoute, mutation, fieldPath, expectDelta }.')
     const raw = input as Record<string, unknown>, expectFn = typeof raw.expectDelta === 'function' ? raw.expectDelta : null
     const payload: Record<string, unknown> = { ...raw }
+    if (payload.mutation === undefined && payload.write === undefined) { const m = raw.mutate ?? raw.mutationRoute ?? raw.writeRoute ?? raw.mutationTarget; if (m !== undefined) payload.mutation = m }
+    if (payload.readRoute === undefined && payload.read_route === undefined) { const rr = raw.read ?? raw.beforeRoute ?? raw.readTarget ?? (payload.mutation !== undefined || payload.write !== undefined ? raw.route : undefined); if (rr !== undefined) payload.readRoute = rr }
     if (expectFn) { delete payload.expectDelta; payload.hasCustomExpectFn = true }
     const res = hydrateFields(await this.callRpc('prove.persistedMutation', payload, 70_000) as Record<string, unknown>, ['before', 'mutation', 'after']) as unknown as PersistedMutationProof
     if (expectFn && !Boolean(expectFn(res.delta.before, res.delta.after, res.delta))) {
