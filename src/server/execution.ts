@@ -115,11 +115,14 @@ import {
   pauseRunsForKillSwitch,
   recordRunAssignmentMetrics,
   recordRunFloorMetrics,
+  recordVerificationOrRetestFailure,
   resolvePhaseAFloorWallClockMs,
   resolveRunTenantId,
   resolveSourceAuditMaxTurns,
   resolveSourceAuditSettlementMs,
   resolveSourceAuditWallClockMs,
+  rollbackRejectedInvestigationSpawn,
+  rollbackRejectedWorkerSpawn,
   settleCodeAuditSuspects,
   teardownRunStaging,
   trackDetLeadFactForRun,
@@ -145,10 +148,13 @@ export {
   codeAuditSettlementMessage,
   computePlannerBackoffMs,
   promoteSemanticAuditSuspects,
+  recordVerificationOrRetestFailure,
   resolvePhaseAFloorWallClockMs,
   resolveSourceAuditMaxTurns,
   resolveSourceAuditSettlementMs,
   resolveSourceAuditWallClockMs,
+  rollbackRejectedInvestigationSpawn,
+  rollbackRejectedWorkerSpawn,
   settleCodeAuditSuspects,
 } from './run-actor.ts'
 import type { RunDrainReport } from './run-context.ts'
@@ -157,7 +163,7 @@ import { tenantTagForRun } from './scope-policy.ts'
 import { ScopedBrowser } from './scoped-browser.ts'
 import { runThreeStageSemanticAudit, toChainStepInputs, type SemanticAuditSuspect } from './semantic-audit.ts'
 import { cloneWorkerPersona } from './session-isolation.ts'
-import { buildStaticWorkspaceSnapshot } from './static-workspace-snapshot.ts'
+import { buildStaticWorkspaceSnapshotInWorker } from './static-workspace-snapshot.ts'
 import {
   assessmentAssignments,
   dataDirectory,
@@ -563,6 +569,7 @@ export class Execution {
     )
     this.unsubKillSwitch = this.runtime.killSwitch.onChange(state => {
       if (state.active) this.handleKillSwitchTripped(state)
+      else if (!this.stopped) this.scheduleWake()
     })
     this.personaAuth = options.personaAuth ?? new PersonaAuthManager()
     this.broker = options.broker ?? createBroker({ storage, canaryBroker: this.canaryBroker })
@@ -827,12 +834,17 @@ export class Execution {
       (id, kind, msg, detail) => this.safeEvent(id, kind, msg, detail),
       runId => { this.scheduleRunDisposal(runId, 'canceled', 'kill switch tripped') },
     )
+    for (const [runId, actor] of [...this.actors.entries()]) {
+      if (state.tenantId === null || actor.context.tenantId === state.tenantId) {
+        this.scheduleRunDisposal(runId, 'canceled', 'kill switch tripped')
+      }
+    }
   }
 
   /**
    * Ensure a per-run `RunActor` + `RunContext` exists and owns structured resource disposal
    * (staging cleanup, capability vault RAM+disk eviction, OOB unsubscribe, persona refreshers,
-   * lab target teardown, trace close, and timer cancellation).
+   * lab target teardown, warm pool eviction, trace close, and timer cancellation).
    */
   private ensureRunActor(runOrId: Run | string): RunActor {
     const runId = typeof runOrId === 'string' ? runOrId : runOrId.id
@@ -841,9 +853,14 @@ export class Execution {
       if (!existing.isDisposed && !existing.isTerminal && existing.state !== 'stopping' && !existing.signal.aborted) {
         return existing
       }
-      if (existing.isDisposed) {
+      if (existing.context.isDisposed) {
         this.actors.delete(runId)
       } else {
+        if (!this.disposingRuns.has(runId) && !existing.isDraining) {
+          this.trackMaintenance(
+            this.scheduleRunDisposal(runId, 'canceled', 'dispose stale actor').finally(() => this.scheduleWake()),
+          )
+        }
         return existing
       }
     }
@@ -854,7 +871,18 @@ export class Execution {
     }
     const tenantId = run ? this.runTenantId(run) : null
     const initialState = run ? deriveRunActorState(run) : 'queued'
-    const context = this.runtime.getRunContext(runId) ?? this.runtime.createRunContext(runId, { tenantId })
+    const existingCtx = this.runtime.getRunContext(runId)
+    if (existingCtx && (existingCtx.isAborted || existingCtx.isDraining) && !existingCtx.isDisposed) {
+      if (!this.disposingRuns.has(runId)) {
+        this.trackMaintenance(
+          this.scheduleRunDisposal(runId, 'canceled', 'dispose aborted context').finally(() => this.scheduleWake()),
+        )
+      }
+      return new RunActor({ context: existingCtx, initialState })
+    }
+    const context = existingCtx && !existingCtx.isDisposed
+      ? existingCtx
+      : this.runtime.createRunContext(runId, { tenantId })
     const actor = new RunActor({ context, initialState })
 
     actor.registerResource('staging:teardown', () => teardownRunStaging({
@@ -884,6 +912,9 @@ export class Execution {
       this.startedLabRuns.delete(runId)
       this.startedLabHandles.delete(runId)
       await this.labRunner.stopLabTarget(runId).catch(() => undefined)
+    })
+    actor.registerResource('warm-pool:evict', async () => {
+      try { await this.backend.evictRunWarmPool?.(runId) } catch { /* best-effort warm pool eviction */ }
     })
     actor.registerResource('oob:canary-unsubscribe', () => {
       try { this.canaryBroker.unsubscribeRun(runId) } catch { /* ignore */ }
@@ -959,6 +990,9 @@ export class Execution {
         report = await drainTimedOutRunActor(runId, this.timedOutActors, options.timeoutMs)
       } else if (this.runtime.getRunContext(runId)) {
         report = await this.runtime.disposeRunContext(runId, options.timeoutMs)
+      }
+      if (!actor) {
+        try { await this.backend.evictRunWarmPool?.(runId) } catch { /* best-effort warm pool eviction */ }
       }
       this.evictCapabilityVault(runId)
       this.cleanupRunState(runId)
@@ -1744,7 +1778,7 @@ export class Execution {
     this.board.syncTrackedRuns()
 
     // 1. Revoke/abort any active job that lost authorization
-    for (const [id, job] of this.active) {
+    for (const [id, job] of [...this.active.entries()]) {
       if (this.authorize(job)) continue
       job.controller.abort()
       try {
@@ -1756,6 +1790,7 @@ export class Execution {
           })
         }
       } catch { /* ignore */ }
+      this.active.delete(id)
     }
 
     for (const [runId, task] of this.coordinator) {
@@ -1848,14 +1883,21 @@ export class Execution {
         continue
       }
       const existingActor = this.actors.get(run.id)
-      if (existingActor && (existingActor.isTerminal || existingActor.state === 'stopping' || existingActor.signal.aborted)) {
-        if (!existingActor.isDisposed) {
+      if (existingActor && (existingActor.isDisposed || existingActor.isTerminal || existingActor.state === 'stopping' || existingActor.signal.aborted)) {
+        if (!existingActor.context.isDisposed) {
           this.trackMaintenance(
             this.scheduleRunDisposal(run.id, 'canceled', 'reset actor before retest').finally(() => this.scheduleWake()),
           )
           continue
         }
         this.actors.delete(run.id)
+      }
+      const existingCtx = this.runtime.getRunContext(run.id)
+      if (existingCtx && (existingCtx.isAborted || existingCtx.isDraining) && !existingCtx.isDisposed) {
+        this.trackMaintenance(
+          this.scheduleRunDisposal(run.id, 'canceled', 'reset aborted context before retest').finally(() => this.scheduleWake()),
+        )
+        continue
       }
       const retests = this.storage.workerList(run.id).filter(w => w.phase === 'retest' && w.status === 'queued')
       for (const worker of retests) {
@@ -1886,14 +1928,21 @@ export class Execution {
         continue
       }
       const existingActor = this.actors.get(run.id)
-      if (existingActor && (existingActor.isTerminal || existingActor.state === 'stopping' || existingActor.signal.aborted)) {
-        if (!existingActor.isDisposed) {
+      if (existingActor && (existingActor.isDisposed || existingActor.isTerminal || existingActor.state === 'stopping' || existingActor.signal.aborted)) {
+        if (!existingActor.context.isDisposed) {
           this.trackMaintenance(
             this.scheduleRunDisposal(run.id, 'canceled', 'reset actor on resume').finally(() => this.scheduleWake()),
           )
           continue
         }
         this.actors.delete(run.id)
+      }
+      const existingCtx = this.runtime.getRunContext(run.id)
+      if (existingCtx && (existingCtx.isAborted || existingCtx.isDraining) && !existingCtx.isDisposed) {
+        this.trackMaintenance(
+          this.scheduleRunDisposal(run.id, 'canceled', 'reset aborted context on resume').finally(() => this.scheduleWake()),
+        )
+        continue
       }
       const actor = this.ensureRunActor(run)
       const desiredState = deriveRunActorState(run)
@@ -1956,7 +2005,7 @@ export class Execution {
     const controller = new AbortController()
     this.runAuthInFlight.set(run.id, controller)
 
-    this.spawnRunTask(run.id, 'persona-auth', async signal => {
+    const spawned = this.spawnRunTask(run.id, 'persona-auth', async signal => {
       try {
         await this.personaAuth.startRunRefreshers(
           this.storage,
@@ -2008,6 +2057,9 @@ export class Execution {
         this.scheduleWake()
       }
     }, { controller })
+    if (!spawned.started) {
+      this.runAuthInFlight.delete(run.id)
+    }
   }
 
   // --- Phase 1: Round-0 Threat Model & Initial Baseline Checks ---
@@ -2016,7 +2068,7 @@ export class Execution {
     const controller = new AbortController()
     const task: CoordinatorTask = { controller, goalRevision: run.goalRevision, scopeRevision: run.scopeRevision }
     this.threatModeling.set(run.id, task)
-    this.spawnRunTask(run.id, 'threat-model', async () => {
+    const spawned = this.spawnRunTask(run.id, 'threat-model', async () => {
       try {
         await this.reconPlanner.runThreatModel(run, profiles, task)
       } catch (error) {
@@ -2033,6 +2085,9 @@ export class Execution {
         this.scheduleWake()
       }
     }, { controller })
+    if (!spawned.started) {
+      this.threatModeling.delete(run.id)
+    }
   }
 
   /** Correlate dependencies from uploaded/synced specs via the CVE broker (curated + remote). */
@@ -2157,7 +2212,11 @@ export class Execution {
 
     try {
       const stagedSpecs = await this.stageProjectSpecs(run.projectId, session, controller.signal)
-      const staticSnapshot = buildStaticWorkspaceSnapshot(reposDir, { mountedRepos })
+      const staticSnapshot = await buildStaticWorkspaceSnapshotInWorker(reposDir, {
+        mountedRepos,
+        signal: controller.signal,
+        workerTimeoutMs: Math.min(15_000, Math.max(2_000, Math.floor(auditWallMs * 0.25))),
+      })
       const workspaceDigest = buildWorkspaceSourceDigest(staticSnapshot, MAX_WORKSPACE_DIGEST_BYTES)
       const digestStagedPath = await session.stage('workspace-source-digest.md', workspaceDigest, controller.signal).catch(() => null)
       const auditSpecsSummary: Array<{ name: string; kind: string; origin?: string | null; stagedPath?: string; digest?: string }> = [
@@ -2478,7 +2537,7 @@ export class Execution {
     if (locs.length === 0) return
 
     this.variantSweepInFlight.add(findingRow.id)
-    this.spawnRunTask(run.id, `variant-sweep:${findingRow.id}`, async () => {
+    const spawned = this.spawnRunTask(run.id, `variant-sweep:${findingRow.id}`, async () => {
       try {
         await this.reconPlanner.runPostConfirmationVariantSweep(run, findingRow, reposDir, mountedRepos)
       } catch {
@@ -2489,6 +2548,9 @@ export class Execution {
         this.scheduleWake()
       }
     })
+    if (!spawned.started) {
+      this.variantSweepInFlight.delete(findingRow.id)
+    }
   }
 
   private deterministicLaneKey(run: Pick<Run, 'id' | 'goalRevision' | 'scopeRevision'>): string {
@@ -2627,6 +2689,12 @@ export class Execution {
         try { this.scheduleWake() } catch { /* scheduler stopped */ }
       }
     }, { controller })
+    if (!laneTask.started) {
+      this.agenticLaneJobs.delete(run.id)
+      this.laneStartedAt.delete(run.id)
+      this.agenticFloorStartedAt.delete(run.id)
+      return false
+    }
     holder.promise = laneTask.promise.then(() => undefined, () => undefined)
     return true
   }
@@ -3184,7 +3252,7 @@ export class Execution {
   ) {
     if (this.deterministicCompleted.has(key) || this.deterministicInFlight.has(key)) return
     this.deterministicInFlight.add(key)
-    this.spawnRunTask(run.id, `deterministic:${eventPrefix}`, async () => {
+    const spawned = this.spawnRunTask(run.id, `deterministic:${eventPrefix}`, async () => {
       try {
         await execPass()
       } catch (error) {
@@ -3213,6 +3281,9 @@ export class Execution {
         try { this.scheduleWake() } catch { /* scheduler already stopped */ }
       }
     })
+    if (!spawned.started) {
+      this.deterministicInFlight.delete(key)
+    }
   }
 
   private driveDeterministicInvestigation(run: Run) {
@@ -3344,7 +3415,7 @@ export class Execution {
     const controller = new AbortController()
     const task: CoordinatorTask = { controller, goalRevision: run.goalRevision, scopeRevision: run.scopeRevision }
     this.plannerTasks.set(run.id, task)
-    this.spawnRunTask(run.id, 'chain-planner', async () => {
+    const spawned = this.spawnRunTask(run.id, 'chain-planner', async () => {
       try {
         await this.runChainPlanner(run, profiles, task)
         this.plannerErrorState.delete(run.id)
@@ -3395,6 +3466,9 @@ export class Execution {
         this.scheduleWake()
       }
     }, { controller })
+    if (!spawned.started) {
+      this.plannerTasks.delete(run.id)
+    }
   }
 
   private startInvestigationStep(run: Run, step: ChainStep, profiles: readonly ResolvedModelProfile[]) {
@@ -3518,7 +3592,7 @@ export class Execution {
     this.postCoordinatorBrief(run, effectiveStep, boardHandle, targetOrigins)
 
     let workerErrored = false
-    this.spawnRunTask(run.id, `investigation:${assignment.id}`, async () => {
+    const spawned = this.spawnRunTask(run.id, `investigation:${assignment.id}`, async () => {
       try {
         await this.runInvestigationWorker(job, effectiveStep, targetOrigins, profiles, budget)
       } catch (error) {
@@ -3557,6 +3631,13 @@ export class Execution {
         this.scheduleWake()
       }
     }, { controller: job.controller })
+    if (!spawned.started) {
+      this.active.delete(assignment.id)
+      this.boardHandleByAssignment.delete(assignment.id)
+      rollbackRejectedInvestigationSpawn(this.storage, run.id, step.id, assignment)
+      const draining = this.disposingRuns.get(run.id)
+      if (draining) this.trackMaintenance(draining.finally(() => this.scheduleWake()))
+    }
   }
 
   private phaseBControllerFor(run: Run): PhaseBConcurrencyController {
@@ -4174,9 +4255,25 @@ export class Execution {
       }
     }
 
-    const updatedWorkers = this.storage.workerList(run.id).filter(w =>
+    let updatedWorkers = this.storage.workerList(run.id).filter(w =>
       w.phase === 'verification' && w.goalRevision === run.goalRevision &&
       w.sourceOrigins.every(o => approvedOrigins.has(o)))
+
+    // H-27 lease watchdog: reclaim verification workers whose lease expired with no live active job.
+    const now = Date.now()
+    let reclaimedExpired = false
+    for (const w of updatedWorkers) {
+      if (w.status === 'running' && !this.active.has(w.id) && w.leaseExpiresAt !== null && w.leaseExpiresAt <= now) {
+        recordVerificationOrRetestFailure(this.storage, run, w, 'worker', 'Verification lease expired', 'Worker lease expired before completion.')
+        reclaimedExpired = true
+      }
+    }
+    if (reclaimedExpired) {
+      updatedWorkers = this.storage.workerList(run.id).filter(w =>
+        w.phase === 'verification' && w.goalRevision === run.goalRevision &&
+        w.sourceOrigins.every(o => approvedOrigins.has(o)))
+    }
+
     const queued = updatedWorkers.filter(w => w.status === 'queued')
     const activeCount = [...this.active.values()].filter(j => j.assignment.runId === run.id).length
 
@@ -4191,8 +4288,7 @@ export class Execution {
     for (const worker of queued) {
       if (slots <= 0) break
       if (this.active.has(worker.id)) continue
-      this.startVerificationWorker(run, worker)
-      slots -= 1
+      if (this.startVerificationWorker(run, worker)) slots -= 1
     }
   }
 
@@ -4203,7 +4299,7 @@ export class Execution {
     failureLabel: string,
     work: (job: Active) => Promise<void>,
     skipIfUnauthorized: boolean,
-  ): void {
+  ): boolean {
     const claimed = this.storage.transaction(() => {
       const w = this.storage.updateWorker(worker.id, {
         status: 'running', lease: randomUUID(), leaseExpiresAt: Date.now() + 10 * 60_000, outcome: null,
@@ -4211,7 +4307,7 @@ export class Execution {
       this.storage.event(run.id, `${eventPrefix}.started`, worker.title + ' started.', { assignmentId: worker.id })
       return w
     })
-    if (!claimed) return
+    if (!claimed) return false
     const job: Active = { assignment: claimed, origins: new Set(claimed.sourceOrigins), controller: new AbortController() }
     this.active.set(claimed.id, job)
     const runWork = async () => {
@@ -4220,33 +4316,38 @@ export class Execution {
       } catch (error) {
         if (skipIfUnauthorized && (!this.authorize(job) || job.controller.signal.aborted)) return
         const msg = redact(error instanceof Error ? error.message : String(error)).slice(0, 400)
-        this.storage.transaction(() => {
-          this.storage.updateWorker(claimed.id, { status: 'failed', outcome: msg, lease: null, leaseExpiresAt: null })
-          this.storage.event(run.id, `${eventPrefix}.failed`, `${failureLabel}: ${msg}`, { assignmentId: claimed.id })
-        })
+        recordVerificationOrRetestFailure(this.storage, run, claimed, eventPrefix, failureLabel, msg)
       } finally {
         this.active.delete(claimed.id)
         this.scheduleWake()
       }
     }
-    this.spawnRunTask(
+    const task = this.spawnRunTask(
       run.id,
       `${eventPrefix === 'worker' ? 'verification' : 'retest'}:${claimed.id}`,
       runWork,
       { controller: job.controller },
     )
+    if (!task.started) {
+      this.active.delete(claimed.id)
+      rollbackRejectedWorkerSpawn(this.storage, claimed)
+      const draining = this.disposingRuns.get(run.id)
+      if (draining) this.trackMaintenance(draining.finally(() => this.scheduleWake()))
+      return false
+    }
+    return true
   }
 
-  private startVerificationWorker(run: Run, worker: Assignment) {
-    this.claimAndDispatchWorker(
+  private startVerificationWorker(run: Run, worker: Assignment): boolean {
+    return this.claimAndDispatchWorker(
       run, worker, 'worker', 'Verification failed',
       job => (job.assignment.stepId ? this.verifyReplaySpecJob(job, job.assignment.stepId) : this.verifier.verifyBaselineJob(job)),
       true,
     )
   }
 
-  private startRetestWorker(run: Run, worker: Assignment) {
-    this.claimAndDispatchWorker(run, worker, 'retest', 'Verify Fix retest failed', job => this.verifier.runRetestJob(job), false)
+  private startRetestWorker(run: Run, worker: Assignment): boolean {
+    return this.claimAndDispatchWorker(run, worker, 'retest', 'Verify Fix retest failed', job => this.verifier.runRetestJob(job), false)
   }
 
   // --- On-Demand / Opt-In Air-Gapped Verified Patch Workflow (§4.6) ---

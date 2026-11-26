@@ -7,7 +7,9 @@
  * callbacks on every poll, and returns the recorded metrics. It never waits when nothing is
  * pending, so local-lab benchmark runs keep their zero-latency behavior.
  */
-import type { Run } from './store.ts'
+import { eq } from 'drizzle-orm'
+import { reports } from './schema.ts'
+import type { Assignment, Run, Store } from './store.ts'
 
 /** Bounded grace the report waits for late async OOB callbacks (Fixture #2: 15–30 s). */
 export const DEFAULT_OOB_DRAIN_MS = 45_000
@@ -152,6 +154,8 @@ export interface FinalizeStore {
   updateRun(id: string, patch: { phase?: string; status?: string }): Run
   writeReport(run: Run, partial: boolean): string
   message(runId: string, authorId: string, authorRole: string, body: string): unknown
+  workerList?(runId: string): Assignment[]
+  db?: Store['db']
 }
 
 export interface FinalizeHost {
@@ -165,10 +169,27 @@ export interface FinalizeHost {
   drain?: (runId: string, signal?: AbortSignal) => Promise<OobDrainResult>
   /** Optional structured task spawner (e.g. `RunActor.spawn`) to avoid detached `void` async chains. */
   spawn?: (label: string, fn: (signal: AbortSignal) => Promise<void>) => unknown
+  /** Optional callback returning explicit gap lines for failed/exhausted verification workers (`H-27`). */
+  collectFailureGaps?: (run: Run) => string[]
   /** Optional callback fired after `commitFinalReport` completes (sync or async). */
   onFinalized?: (runId: string) => void
   /** Optional observer for unexpected non-deletion storage errors during async finalization. */
   onError?: (error: unknown) => void
+}
+
+/** Build explicit report gap lines for failed verification workers in the current goal revision (`H-27`). */
+export function collectVerificationFailureGaps(
+  workers: readonly Assignment[],
+  goalRevision: number,
+): string[] {
+  const gaps: string[] = []
+  for (const w of workers) {
+    if (w.phase !== 'verification' || w.goalRevision !== goalRevision || w.status !== 'failed') continue
+    const attempts = w.attempt > 0 ? ` after ${w.attempt} attempt${w.attempt === 1 ? '' : 's'}` : ''
+    const detail = (w.outcome ?? '').trim() || 'verification worker failed before completion'
+    gaps.push(`Verification worker failed${attempts} (${w.title}): ${detail}`)
+  }
+  return gaps
 }
 
 /**
@@ -218,7 +239,11 @@ export function scheduleFinalReport(host: FinalizeHost, run: Run): void {
     }
   }
   if (host.spawn) {
-    host.spawn('oob-final-report', signal => runAsyncFinalize(signal))
+    const task = host.spawn('oob-final-report', signal => runAsyncFinalize(signal))
+    if (task && typeof task === 'object' && 'started' in task && (task as { started?: boolean }).started === false) {
+      host.draining.delete(run.id)
+      activeFinalizingRuns.delete(run.id)
+    }
   } else {
     void runAsyncFinalize()
   }
@@ -238,14 +263,36 @@ export function commitFinalReport(host: FinalizeHost, run: Run): void {
         throw error
       }
       if (current.status !== 'running' || current.phase !== 'verification') return
+      const failureGaps = host.collectFailureGaps
+        ? host.collectFailureGaps(current)
+        : collectVerificationFailureGaps(host.storage.workerList?.(current.id) ?? [], current.goalRevision)
+      const partial = failureGaps.length > 0
       const complete = host.storage.updateRun(current.id, { phase: 'complete', status: 'complete' })
-      host.storage.writeReport(complete, false)
+      const reportId = host.storage.writeReport(complete, partial)
+      if (partial && host.storage.db) {
+        try {
+          const row = host.storage.db.select().from(reports).where(eq(reports.id, reportId)).get()
+          if (row && row.body) {
+            const existing = Array.isArray(row.body.gaps) ? row.body.gaps : []
+            const mergedGaps = [...existing]
+            for (const line of failureGaps) {
+              if (!mergedGaps.includes(line)) mergedGaps.push(line)
+            }
+            host.storage.db.update(reports)
+              .set({ body: { ...row.body, gaps: mergedGaps } })
+              .where(eq(reports.id, reportId))
+              .run()
+          }
+        } catch { /* best-effort gap merge */ }
+      }
       const drain = host.lastDrain.get(current.id)
       const drainNote = drain && drain.promotedLate > 0
         ? ` ${drain.promotedLate} late async callback(s) were promoted before finalizing.`
         : ''
-      host.storage.message(current.id, current.coordinatorId, 'kovo',
-        `Verification finished. The complete report is ready.${drainNote}`)
+      const summary = partial
+        ? `Verification finished with ${failureGaps.length} failed verification worker${failureGaps.length === 1 ? '' : 's'}. A partial report is ready.${drainNote}`
+        : `Verification finished. The complete report is ready.${drainNote}`
+      host.storage.message(current.id, current.coordinatorId, 'kovo', summary)
     }, { behavior: 'immediate' })
   } catch (error) {
     if (isDeletedRunRaceError(error)) {
