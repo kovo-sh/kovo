@@ -19,6 +19,7 @@ import type {
   PublicPersona,
   createPersona,
   deletePersona,
+  updatePersona,
 } from '../domain.ts'
 import type { NamedSecret } from './redact.ts'
 import { personas } from './schema.ts'
@@ -802,6 +803,124 @@ export function createProjectPersona(storage: Store, input: z.output<typeof crea
       origins: input.originAllowlist,
     })
     return { id: personaId, handle: input.handle }
+  })
+}
+
+export function updateProjectPersona(storage: Store, input: z.output<typeof updatePersona>): { id: string; handle: string } {
+  return storage.operate(input, () => {
+    storage.project(input.projectId)
+    const existing = storage.db.select().from(personas).where(and(
+      eq(personas.id, input.personaId), eq(personas.projectId, input.projectId), eq(personas.workspaceId, storage.workspace.id),
+    )).get()
+    if (!existing) throw new Error('Persona not found.')
+
+    const dir = join(storage.directory, 'credentials')
+    mkdirSync(dir, { recursive: true, mode: 0o700 })
+    chmodSync(dir, 0o700)
+
+    const existingIsClerkClient = existing.authKind === 'login' && existing.loginConfig?.adapter === 'clerk_client'
+    const nextIsClerkClient = input.authKind === 'login' && input.loginConfig?.adapter === 'clerk_client'
+    const sameAuthKind = existing.authKind === input.authKind && existingIsClerkClient === nextIsClerkClient
+
+    const rawSecret = input.secret ?? ''
+    const hasNewSecret = rawSecret.trim().length > 0
+    if (!sameAuthKind && !hasNewSecret) {
+      throw new Error(
+        nextIsClerkClient
+          ? 'Clerk __client cookie value is required when switching sign-in method.'
+          : 'Credential secret is required when switching sign-in method.',
+      )
+    }
+
+    const canaryMarkers = [...(input.canaryMarkers ?? existing.canaryMarkers)]
+    let storedLoginConfig: PersonaLoginConfig | null = null
+    let newFileBody: string | null = null
+
+    if (input.authKind === 'login') {
+      if (!input.loginConfig || (!nextIsClerkClient && !input.loginConfig.email)) {
+        throw new Error('Email and login configuration are required for Email + Password personas.')
+      }
+      const email = input.loginConfig.email?.trim() ?? ''
+      const { email: _omitEmail, ...restLoginConfig } = input.loginConfig
+      storedLoginConfig = {
+        ...restLoginConfig,
+        ...(email ? { email } : {}),
+      }
+      if (email && !canaryMarkers.some(m => m.toLowerCase() === email.toLowerCase()) && canaryMarkers.length < 16) {
+        canaryMarkers.push(email)
+      }
+      if (hasNewSecret) {
+        let password = rawSecret
+        if (nextIsClerkClient) {
+          const normalized = normalizeClerkClientCookie(rawSecret)
+          if (!normalized) {
+            throw new Error('Paste a valid Clerk __client cookie value (raw token, __client=<value>, or Cookie header containing __client=…).')
+          }
+          password = normalized
+        }
+        const payload: LoginCredentialFilePayload = { v: 1, email, password }
+        newFileBody = JSON.stringify(payload)
+      } else if (!nextIsClerkClient) {
+        // Preserve existing password while keeping stored login email in sync.
+        const oldPath = join(dir, existing.credentialId)
+        try {
+          const parsed = JSON.parse(readFileSync(oldPath, 'utf8')) as Partial<LoginCredentialFilePayload>
+          if (parsed && typeof parsed.password === 'string' && parsed.email !== email) {
+            const payload: LoginCredentialFilePayload = { v: 1, email, password: parsed.password }
+            newFileBody = JSON.stringify(payload)
+          }
+        } catch {
+          throw new Error('Existing credential could not be read; enter a new password.')
+        }
+      }
+    } else if (hasNewSecret) {
+      newFileBody = rawSecret.trim()
+    }
+
+    const oldBasePath = join(dir, existing.credentialId)
+    let nextCredentialId = existing.credentialId
+    let rotatedPath: string | null = null
+
+    if (newFileBody !== null) {
+      nextCredentialId = 'persona-' + randomUUID()
+      rotatedPath = join(dir, nextCredentialId)
+      writeFileSync(rotatedPath, newFileBody, { mode: 0o600, flag: 'wx' })
+      chmodSync(rotatedPath, 0o600)
+    }
+
+    try {
+      storage.db.update(personas).set({
+        roleLabel: input.roleLabel,
+        originAllowlist: [...new Set(input.originAllowlist)],
+        authKind: input.authKind,
+        headerName: input.authKind === 'header' ? (input.headerName ?? 'X-Api-Key') : null,
+        loginConfig: storedLoginConfig,
+        credentialId: nextCredentialId,
+        canaryMarkers,
+      }).where(eq(personas.id, existing.id)).run()
+    } catch (error) {
+      if (rotatedPath) {
+        try { unlinkSync(rotatedPath) } catch { /* ignore */ }
+      }
+      throw error
+    }
+
+    if (rotatedPath) {
+      try { unlinkSync(oldBasePath) } catch { /* ignore */ }
+    }
+    // Invalidate any cached minted session when credentials or login config are updated.
+    try { unlinkSync(oldBasePath + '.session') } catch { /* ignore */ }
+
+    storage.event(null, 'persona.updated', `Updated persona ${existing.handle}.`, {
+      projectId: input.projectId,
+      personaId: existing.id,
+      handle: existing.handle,
+      authKind: input.authKind,
+      adapter: storedLoginConfig?.adapter ?? null,
+      origins: input.originAllowlist,
+      credentialRotated: Boolean(rotatedPath),
+    })
+    return { id: existing.id, handle: existing.handle }
   })
 }
 

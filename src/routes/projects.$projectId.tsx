@@ -337,6 +337,14 @@ function ProjectPageContent({ data }: { data: ProjectLoaderData }) {
             onPersonaCreated={created => {
               setSelectedPersonaIds(prev => prev.includes(created.id) ? prev : [...prev, created.id])
             }}
+            onPersonaUpdated={updated => {
+              setPersonaTests(prev => {
+                if (!(updated.id in prev)) return prev
+                const next = { ...prev }
+                delete next[updated.id]
+                return next
+              })
+            }}
           />
         )}
         {activeTab === 'sources' && <ProjectSourcesTab key={project.id} data={data} />}

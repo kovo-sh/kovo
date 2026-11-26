@@ -151,7 +151,7 @@ function captchaAbortMessage(target: string): string {
 }
 
 function mfaAbortMessage(email: string): string {
-  return `Authentication aborted: Multi-factor authentication (MFA / second factor) is required for ${email}. Kovo Hunter cannot bypass MFA — use a Session Cookie / Bearer persona or a test account without MFA.`
+  return `Authentication aborted: Multi-factor authentication (MFA / second factor) is required for ${email}. Kovo Hunter cannot bypass MFA — use a Clerk __client cookie (auto-refresh), a Session Cookie / Bearer persona, or a test account without MFA.`
 }
 
 function decodeJwtPayload(jwt: string): { exp?: number; iat?: number; sub?: string; sid?: string } | null {
@@ -355,11 +355,14 @@ function sanitizeErrorText(text: string, secrets: readonly string[]): string {
   return redact(text, named).slice(0, 320)
 }
 
+const BENIGN_MFA_SCHEMA_FIELD_RE = /"[a-z0-9_]*(?:second_factor|two_factor|mfa)[a-z0-9_]*"\s*:\s*(?:false|null|\[\s*\])/gi
+
 function checkResponseForCaptchaOrMfa(text: string, target: string, email: string): void {
   if (CAPTCHA_PATTERN.test(text)) {
     throw new PersonaAuthError('CAPTCHA_DETECTED', captchaAbortMessage(target))
   }
-  if (MFA_PATTERN.test(text)) {
+  const mfaScanText = text.replace(BENIGN_MFA_SCHEMA_FIELD_RE, '')
+  if (MFA_PATTERN.test(mfaScanText)) {
     throw new PersonaAuthError('MFA_REQUIRED', mfaAbortMessage(email))
   }
 }
@@ -1988,17 +1991,29 @@ export class PersonaAuthManager {
       )
       const tokText = await tokRes.text()
       rejectUnexpectedRedirect(tokRes, 'Clerk token refresh')
-      checkResponseForCaptchaOrMfa(tokText, params.fapiOrigin, params.email)
+      let tokJson: Record<string, unknown> = {}
+      let tokParsed = false
+      try {
+        tokJson = tokText ? (JSON.parse(tokText) as Record<string, unknown>) : {}
+        tokParsed = true
+      } catch {
+        // Non-JSON response checked below
+      }
+      if (!tokParsed) {
+        checkResponseForCaptchaOrMfa(tokText, params.fapiOrigin, params.email)
+      }
+      const tokErrors = Array.isArray(tokJson.errors) ? (tokJson.errors as Array<Record<string, unknown>>) : []
+      for (const errObj of tokErrors) {
+        const joined = `${String(errObj.code ?? '')} ${String(errObj.message ?? '')} ${String(errObj.long_message ?? '')}`
+        checkResponseForCaptchaOrMfa(joined, params.fapiOrigin, params.email)
+      }
       if (!tokRes.ok) {
         throw new PersonaAuthError(
           'AUTH_FAILED',
           `Clerk token refresh failed (${tokRes.status}): ${sanitizeErrorText(tokText, [...extraSecrets, clientCookie, jwt])}`,
         )
       }
-      let tokJson: Record<string, unknown> = {}
-      try {
-        tokJson = tokText ? (JSON.parse(tokText) as Record<string, unknown>) : {}
-      } catch {
+      if (!tokParsed) {
         throw new PersonaAuthError('AUTH_FAILED', 'Clerk token refresh returned non-JSON response.')
       }
       const rotatedCookies = extractSetCookies(tokRes.headers)
@@ -2079,14 +2094,18 @@ export class PersonaAuthManager {
     const rawText = await res.text()
     rejectUnexpectedRedirect(res, 'Clerk client lookup')
     let body: Record<string, unknown> = {}
+    let parsedJson = false
     try {
       body = rawText ? (JSON.parse(rawText) as Record<string, unknown>) : {}
+      parsedJson = true
     } catch {
       // Non-JSON response handled below
     }
 
     const actorLabel = config.email || persona.handle
-    checkResponseForCaptchaOrMfa(rawText, fapiOrigin, actorLabel)
+    if (!parsedJson) {
+      checkResponseForCaptchaOrMfa(rawText, fapiOrigin, actorLabel)
+    }
     const errors = Array.isArray(body.errors) ? (body.errors as Array<Record<string, unknown>>) : []
     for (const errObj of errors) {
       const joined = `${String(errObj.code ?? '')} ${String(errObj.message ?? '')} ${String(errObj.long_message ?? '')}`
@@ -2195,14 +2214,18 @@ export class PersonaAuthManager {
     const rawText = await res.text()
     rejectUnexpectedRedirect(res, 'Clerk sign-in')
     let body: Record<string, unknown> = {}
+    let parsedJson = false
     try {
       body = rawText ? (JSON.parse(rawText) as Record<string, unknown>) : {}
+      parsedJson = true
     } catch {
       // Non-JSON response checked below
     }
 
     // Strict CAPTCHA / Turnstile / MFA detection
-    checkResponseForCaptchaOrMfa(rawText, fapiOrigin, email)
+    if (!parsedJson) {
+      checkResponseForCaptchaOrMfa(rawText, fapiOrigin, email)
+    }
     const errors = Array.isArray(body.errors) ? (body.errors as Array<Record<string, unknown>>) : []
     for (const errObj of errors) {
       const joined = `${String(errObj.code ?? '')} ${String(errObj.message ?? '')} ${String(errObj.long_message ?? '')}`
