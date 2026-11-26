@@ -21,6 +21,7 @@ import {
 } from '../src/server/persona-auth.ts'
 import {
   browserWebRtcGuardScript,
+  buildChromiumLaunchOptions,
   chromiumLaunchArgs,
   installWebSocketGuard,
 } from '../src/server/scoped-browser.ts'
@@ -424,14 +425,21 @@ test('form login blocks off-scope subresources and DNS-rebound origins before th
 })
 
 test('Chromium sandbox is enabled by default and insecure mode requires an explicit opt-in', () => {
-  const secure = chromiumLaunchArgs()
-  assert.equal(secure.includes('--no-sandbox'), false)
-  assert.ok(secure.some(arg => arg.startsWith('--host-resolver-rules=')))
-  assert.ok(secure.some(arg => arg.includes('disable_non_proxied_udp')))
+  const secure = buildChromiumLaunchOptions({ env: {} })
+  assert.equal(secure.headless, true)
+  assert.equal(secure.chromiumSandbox, true, 'Playwright chromiumSandbox must be explicitly true by default')
+  assert.equal(secure.args.includes('--no-sandbox'), false)
+  assert.ok(secure.args.some(arg => arg.startsWith('--host-resolver-rules=')))
+  assert.ok(secure.args.some(arg => arg.includes('disable_non_proxied_udp')))
+  assert.deepEqual(secure.args, chromiumLaunchArgs())
 
-  const insecure = chromiumLaunchArgs({ insecureNoSandbox: true })
-  assert.ok(insecure.includes('--no-sandbox'))
-  assert.equal(insecure.includes('--no-sandbox'), true)
+  const insecureByOption = buildChromiumLaunchOptions({ insecureNoSandbox: true, env: {} })
+  assert.equal(insecureByOption.chromiumSandbox, false)
+  assert.equal(insecureByOption.args.includes('--no-sandbox'), true)
+
+  const insecureByEnv = buildChromiumLaunchOptions({ env: { KOVO_INSECURE_NO_SANDBOX: '1' } })
+  assert.equal(insecureByEnv.chromiumSandbox, false)
+  assert.equal(insecureByEnv.args.includes('--no-sandbox'), true)
   assert.match(browserWebRtcGuardScript, /RTCPeerConnection/)
 })
 
