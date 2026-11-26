@@ -39,6 +39,7 @@ import {
 } from './oracle-invariants.ts'
 import type { BooleanDifferentialArm, BooleanDifferentialRound, ImpactClass, ImpactInput, ImpactStep, RoleName } from './oracle-invariants.ts'
 import { isJobOrHandleStub } from './v8-oracle-families.ts'
+import { assessSignedUrlMintDifferential, type SignedUrlMintExchange } from './verify-support.ts'
 
 export const receiptIdSchema = z.string().trim().min(1).max(128)
 
@@ -412,6 +413,7 @@ const STATUS_DIFF_CLASS_RE = /^(?:sqli_status|sql_status|sql_status_diff|status_
 const REDIRECT_CLASS_RE = /^(?:open_redirect|redirect|url_redirect|unvalidated_redirect)$/i
 const CONSERVED_BALANCE_CLASS_RE = /^(?:race|race_double_spend|race_condition|race_burst|double_spend|oversell|inventory_oversell|conserved_balance|toctou)$/i
 const AUTH_BYPASS_CLASS_RE = /^(?:auth_bypass|jwt_forgery|broken_auth|auth_protocol|token_forgery|authentication_bypass)$/i
+const SIGNED_URL_MINT_CLASS_RE = /^(?:signed_url_mint|presigned_url_mint|signed_url_traversal|storage_signed_url|gcs_signed_url|s3_presigned_url|azure_sas_mint)$/i
 
 const IMPACT_CLASS_BY_VULN: Readonly<Record<string, ImpactClass>> = {
   bola: 'authorization',
@@ -466,6 +468,7 @@ export function receiptRuleFor(vulnClass: string, receipt?: Pick<ProofReceipt, '
   if (TIMING_CLASS_RE.test(vulnClass)) return { rule: 'timing' }
   if (CONSERVED_BALANCE_CLASS_RE.test(vulnClass)) return { rule: 'conserved_balance' }
   if (AUTH_BYPASS_CLASS_RE.test(vulnClass)) return { rule: 'auth_bypass' }
+  if (SIGNED_URL_MINT_CLASS_RE.test(vulnClass)) return { rule: 'impact', impactClass: 'authorization' }
   if (REDIRECT_CLASS_RE.test(vulnClass)) return { rule: 'redirect' }
   const impactClass = IMPACT_CLASS_BY_VULN[vulnClass.toLowerCase()]
   if (impactClass) return { rule: 'impact', impactClass }
@@ -628,6 +631,10 @@ export function verifyReceipt(
   if (missingOob) return reject(receipt, rule, `Receipt cites OOB event ${missingOob}, which is absent from the transcript.`)
   const missingTrace = receipt.browserTraceIds.find(id => !tracesById.has(id))
   if (missingTrace) return reject(receipt, rule, `Receipt cites browser trace ${missingTrace}, which is absent from the transcript.`)
+
+  if (SIGNED_URL_MINT_CLASS_RE.test(receipt.vulnClass)) {
+    return verifySignedUrlMintReceipt(receipt, entriesById, rule)
+  }
 
   if (rule === 'oob') {
     if (receipt.oobEventIds.length === 0) return reject(receipt, rule, 'An out-of-band class needs at least one durable OOB event.')
@@ -2966,6 +2973,93 @@ function entryCarriesTokenInRequest(entry: ReceiptTranscriptEntry, token: string
 }
 
 /** Typed builder used by the floor/verifier so receipts are always schema-checked before use. */
+function entryToSignedUrlMintExchange(entry: ReceiptTranscriptEntry, fallbackOrigin: string): SignedUrlMintExchange {
+  const step = entry.step
+  const reqBody = typeof step.requestJson === 'string'
+    ? step.requestJson
+    : step.requestJson !== undefined
+      ? JSON.stringify(step.requestJson)
+      : (entry.carrierText ? parseBodyFromCarrierText(entry.carrierText, step.requestHeaders, step.body ?? null) : null)
+  return {
+    exchangeId: entry.exchangeId,
+    origin: entry.origin || fallbackOrigin,
+    method: step.method.toUpperCase(),
+    pathAndQuery: step.pathAndQuery ?? step.route ?? '/',
+    status: step.status,
+    actorHandle: step.actor.handle ?? null,
+    requestHeaders: step.requestHeaders ?? null,
+    requestBody: reqBody,
+    requestJson: step.requestJson,
+    responseHeaders: step.responseHeaders ?? null,
+    responseBody: step.body ?? null,
+    responseJson: step.json,
+    wireCredentialProvenance: entry.wireCredentialProvenance ?? null,
+  }
+}
+
+function verifySignedUrlMintReceipt(
+  receipt: ProofReceipt,
+  entriesById: ReadonlyMap<string, ReceiptTranscriptEntry>,
+  rule: ReceiptVerification['rule'],
+): ReceiptVerification {
+  if (receipt.exchangeIds.length < 2) {
+    return reject(receipt, rule, 'A signed_url_mint receipt requires both a control and a probe exchange.')
+  }
+  const cited = receipt.exchangeIds.map(id => entriesById.get(id)!)
+  if (cited.some(entry => entryHasVaultScrubbedRequestPlane(entry))) {
+    return reject(receipt, rule, 'Signed-URL receipt cites a vault-scrubbed kernel request plane ([redacted:cap:...]).')
+  }
+  const control = cited.find(entry => entry.step.arm === 'control') ?? cited[0]
+  const probe = [...cited].reverse().find(entry => entry.step.arm === 'probe') ?? cited[cited.length - 1]
+  if (!control || !probe || control.exchangeId === probe.exchangeId) {
+    return reject(receipt, rule, 'A signed_url_mint receipt requires distinct control and probe exchanges.')
+  }
+  if (receipt.target.method && receipt.target.method.toUpperCase() !== probe.step.method.toUpperCase()) {
+    return reject(receipt, rule, `Signed-URL probe method (${probe.step.method}) does not match receipt target (${receipt.target.method}).`)
+  }
+  if (receipt.target.pathAndQuery && normalizePath(receipt.target.pathAndQuery) !== routeOf(probe.step)) {
+    return reject(receipt, rule, `Signed-URL probe route (${routeOf(probe.step)}) does not match receipt target (${normalizePath(receipt.target.pathAndQuery)}).`)
+  }
+  const targetOrigin = normalizeOrigin(receipt.target.origin)
+  if (probe.origin && normalizeOrigin(probe.origin) !== targetOrigin) {
+    return reject(receipt, rule, 'Signed-URL probe origin does not match the receipt target.')
+  }
+  const assessment = assessSignedUrlMintDifferential({
+    control: entryToSignedUrlMintExchange(control, receipt.target.origin),
+    probe: entryToSignedUrlMintExchange(probe, receipt.target.origin),
+  })
+  if (!assessment.confirmed) {
+    return {
+      confirmed: false,
+      vulnClass: receipt.vulnClass,
+      rule,
+      reason: assessment.reason,
+      observed: receipt.claimedDelta,
+      expected: 'a host-verified cloud-storage signed-URL key traversal or unauthenticated write-URL minting differential',
+      evidence: {
+        oracle: 'signed_url_mint',
+        rejectedBy: assessment.rejectedBy,
+        missingEvidence: assessment.missingEvidence,
+        ...assessment.evidence,
+      },
+    }
+  }
+  return {
+    confirmed: true,
+    vulnClass: receipt.vulnClass,
+    rule,
+    reason: assessment.reason,
+    observed: receipt.claimedDelta,
+    expected: 'signed cloud-storage URLs remain confined to the expected key prefix and authenticated write scope',
+    evidence: {
+      oracle: 'signed_url_mint',
+      controlExchangeId: control.exchangeId,
+      probeExchangeId: probe.exchangeId,
+      ...assessment.evidence,
+    },
+  }
+}
+
 export function buildProofReceipt(input: z.input<typeof proofReceiptSchema>): ProofReceipt {
   return proofReceiptSchema.parse(input)
 }
@@ -3094,6 +3188,55 @@ export function buildAgentScriptReceipt(input: {
     ...(extra?.evidenceRoleOverrides ? { evidenceRoleOverrides: extra.evidenceRoleOverrides } : {}),
   })
   const cited = (ids: readonly string[]) => ids.filter(hasExchange)
+
+  // P0 #2: First-class `signed_url_mint` host-verified differential receipt branch.
+  for (const claim of input.claims) {
+    const kind = recordField(claim, 'kind')
+    const rawTermClass = typeof recordField(claim, 'terminalVulnClass') === 'string'
+      ? (recordField(claim, 'terminalVulnClass') as string).trim()
+      : typeof recordField(claim, 'vulnClass') === 'string'
+        ? (recordField(claim, 'vulnClass') as string).trim()
+        : ''
+    if (!SIGNED_URL_MINT_CLASS_RE.test(rawTermClass)) continue
+    if (kind !== 'composite_receipt' && kind !== 'signed_url_mint' && kind !== 'impact') continue
+    const explicitControl = typeof recordField(claim, 'controlExchangeId') === 'string'
+      ? (recordField(claim, 'controlExchangeId') as string)
+      : cited(stringArray(recordField(claim, 'controlExchangeIds')))[0]
+    const explicitProbe = typeof recordField(claim, 'probeExchangeId') === 'string'
+      ? (recordField(claim, 'probeExchangeId') as string)
+      : typeof recordField(claim, 'terminalExchangeId') === 'string'
+        ? (recordField(claim, 'terminalExchangeId') as string)
+        : undefined
+    const claimIds = cited(stringArray(recordField(claim, 'exchangeIds')))
+    const probeId = (explicitProbe && hasExchange(explicitProbe) ? explicitProbe : claimIds[claimIds.length - 1]) ?? null
+    const controlId = (explicitControl && hasExchange(explicitControl) ? explicitControl : claimIds.find(id => id !== probeId)) ?? null
+    if (!controlId || !probeId || controlId === probeId) continue
+    const probe = factLog.getExchange(probeId)
+    if (!probe) continue
+    const exchangeIds = sortByHostOrder([controlId, probeId])
+    const armOverrides = new Map<string, ImpactStep['arm']>([
+      [controlId, 'control'],
+      [probeId, 'probe'],
+    ])
+    const transcript = buildTranscript(armOverrides)
+    return {
+      receipt: buildProofReceipt({
+        vulnClass: 'signed_url_mint',
+        target: {
+          origin: probe.origin || input.origin,
+          method: probe.method.toUpperCase(),
+          pathAndQuery: probe.pathAndQuery,
+        },
+        exchangeIds,
+        oobEventIds: [],
+        browserTraceIds: [],
+        claimedDelta: `${input.title} — host-verified cloud-storage signed-URL minting differential over control (${controlId}) and probe (${probeId}).`.slice(0, 1200),
+      }),
+      transcript,
+      factLog,
+      armOverrides,
+    }
+  }
 
   for (const claim of input.claims) {
     if (recordField(claim, 'kind') !== 'impact') continue

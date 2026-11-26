@@ -88,7 +88,9 @@ import {
   consumeRunAsyncPollCallBudget,
   evaluateAsyncMatchPredicate,
   parseCapabilityArg,
+  parseVerifyAuthMutation,
   resolvePersonaAuthKind,
+  resolveScopedBrowserDriverForVerify,
   type HostAuthPlacement,
   type ParsedCapabilityArg,
 } from './verify-support.ts'
@@ -130,6 +132,7 @@ import {
   handleProveOob,
   handleProveRace,
   handleProveInjection,
+  handleProveSignedUrlMint,
 } from './verify-prove-handlers.ts'
 import type { ProveHandlerHost, ProveHttpExchangeResult } from './verify-prove-handlers.ts'
 import { buildLocalAttemptFactory } from './verify-runner.ts'
@@ -569,6 +572,7 @@ export class VerifyRpcServer {
     if (op === 'prove.oob') return handleProveOob(this.proveHost(), args, nonce)
     if (op === 'prove.race') return handleProveRace(this.proveHost(), args, nonce)
     if (op === 'prove.injection') return handleProveInjection(this.proveHost(), args, nonce)
+    if (op === 'prove.signedUrlMint') return handleProveSignedUrlMint(this.proveHost(), args, nonce)
     const safeOp = typeof op === 'string' && SAFE_RPC_OP_RE.test(op) ? op : '<invalid>'
     throw new Error(`Unsupported verification RPC operation: ${safeOp}`)
   }
@@ -661,6 +665,7 @@ export class VerifyRpcServer {
     if (role !== undefined && !['setup', 'control', 'probe', 'cleanup'].includes(role)) {
       throw new Error(`Invalid session group role "${role}"; expected one of: setup|control|probe|cleanup.`)
     }
+    const authMutation = parseVerifyAuthMutation(args.authMutation, persona)
     const brokerRequest: BrokerHttpRequest = {
       origin,
       method: method as BrokerHttpRequest['method'],
@@ -670,6 +675,7 @@ export class VerifyRpcServer {
       ...(persona ? { persona } : {}),
       ...(session ? { session } : {}),
       ...(role ? { sessionGroupRole: role as BrokerHttpRequest['sessionGroupRole'] } : {}),
+      ...(authMutation ? { authMutation: authMutation as BrokerHttpRequest['authMutation'] } : {}),
       ...(typeof args.followRedirects === 'boolean' ? { followRedirects: args.followRedirects } : {}),
       ...(typeof args.probeClass === 'string' ? { probeClass: args.probeClass } : {}),
       runId: this.options.runId,
@@ -1294,6 +1300,10 @@ export class VerifyRpcServer {
     return injected
   }
 
+  get browserDriver(): VerifyBrowserDriver | undefined {
+    return resolveScopedBrowserDriverForVerify({ explicitDriver: this.options.browser, grant: this.options.grant, runId: this.options.runId, assignmentId: this.options.assignmentId })
+  }
+
   private async handleBrowser(args: Record<string, unknown>, nonce: string): Promise<unknown> {
     const requestedOrigin = typeof args.origin === 'string' && args.origin.length > 0 ? args.origin : this.options.targetOrigins?.[0]
     if (!requestedOrigin) throw new Error('No target origin is configured for this verification session.')
@@ -1303,7 +1313,7 @@ export class VerifyRpcServer {
     if (!decision.allowed || !decision.normalizedOrigin || !decision.parsedUrl) throw new Error(decision.reason)
     const origin = decision.normalizedOrigin
     const url = decision.parsedUrl
-    const driver = this.options.browser
+    const driver = this.browserDriver
     if (!driver) throw new Error('Browser verification is not available for this run.')
     const headers: Record<string, string> = personaHandle ? { ...this.resolvePersonaHeaders(this.options.grant, personaHandle, url.origin) } : {}
     const started = Date.now()

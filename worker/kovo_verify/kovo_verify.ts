@@ -57,6 +57,7 @@ export interface DifferentialProof extends ProofFeedback { ok: boolean; confirme
 export interface OobCallbackProof extends ProofFeedback { ok: boolean; confirmed?: boolean; claim: OobClaim; token: string; url: string; dnsHost: string; hit: boolean; stage: 'immediate' | 'late' | 'pending' | 'none'; promoted: boolean; subscriptionId: string | null; exchanges: { mint: string; injection: string | null; wait: string | null } }
 export interface RaceBurstProof extends ProofFeedback { ok: boolean; confirmed?: boolean; claim: RaceClaim; mode: 'h2-single-packet' | 'http1-fallback'; fallbackReason: string | null; summary: Record<string, unknown>; exchanges: Array<{ exchangeId: string; status: number; durationMs: number; bodySha256: string }>; baseline?: HttpExchange | null; post?: HttpExchange | null; serial?: HttpExchange | null; serialPost?: HttpExchange | null }
 export interface InjectionDifferentialProof extends ProofFeedback { ok: boolean; confirmed?: boolean; control: HttpExchange; probe: HttpExchange; claim?: VerifyClaim; claims: VerifyClaim[]; evaluated: boolean }
+export interface SignedUrlMintProof extends ProofFeedback { ok: boolean; confirmed?: boolean; variant: 'key_traversal' | 'unauth_write_mint' | null; provider: 'gcs' | 'aws_s3' | 'azure_blob' | 'cloudflare_r2' | null; endpoint: string; control: HttpExchange; probe: HttpExchange; claim?: VerifyClaim; claims: VerifyClaim[]; evidence: Record<string, unknown>; reason: string }
 
 export interface AccessBoundaryInput { controlPersona?: string | null; probePersona?: string | null; route: HttpTarget; probeRoute?: HttpTarget; expectControlDenied?: boolean; method?: string; controlOptions?: HttpOptions; probeOptions?: HttpOptions; controlSession?: string; probeSession?: string; boundaryClass?: 'auth' | 'access'; vulnClass?: string; actorRoles?: Record<string, string>; actorTenants?: Record<string, string>; message?: string }
 export interface PersistedMutationInput { readRoute: HttpTarget; mutation: HttpTarget | { target: HttpTarget; method?: string; body?: string; headers?: Record<string, string>; as?: string; session?: string }; fieldPath: string; expectDelta: unknown | ((before: unknown, after: unknown, delta: PersistedMutationProof['delta']) => boolean); readPersona?: string; mutatePersona?: string; readMethod?: string; readSession?: string; impactClass?: 'authorization' | 'bfla' | 'mass_assignment' | 'csrf'; requiredRole?: string; resourceTenant?: string; oracleEvents?: string[]; actorRoles?: Record<string, string>; actorTenants?: Record<string, string>; message?: string }
@@ -67,6 +68,7 @@ export interface OobCallbackInput { inject: ((canary: { url: string; token: stri
 export interface RaceRequestInput { target?: HttpTarget; url?: HttpTarget; path?: string; origin?: string; method?: string; headers?: Record<string, string>; body?: string | Record<string, unknown> | unknown[]; as?: string }
 export interface RaceBurstInput { requests: Array<RaceRequestInput | HttpTarget>; barrier?: 'auto' | 'h2' | 'http1'; session?: string; minDistinctOutcomes?: number; expectAllSuccess?: boolean; readRoute?: HttpTarget; readMethod?: string; readPersona?: string; serialRequest?: RaceRequestInput | HttpTarget; balanceField?: string; capField?: string; unitDebit?: number; vulnClass?: string; baselineExchangeId?: string; postExchangeId?: string; serialExchangeIds?: string[]; serialPreExchangeId?: string; serialPostExchangeId?: string; message?: string }
 export interface InjectionDifferentialInput { control?: DifferentialArmInput | HttpTarget; probe?: DifferentialArmInput | HttpTarget; variant?: DifferentialArmInput | HttpTarget; url?: string; path?: string; pathAndQuery?: string; endpoint?: string; route?: string; method?: string; headers?: Record<string, string>; as?: string; controlBody?: string | Record<string, unknown>; probeBody?: string | Record<string, unknown>; expectedOutput?: string; vulnClass?: string; session?: string; message?: string }
+export interface SignedUrlMintInput { control?: DifferentialArmInput | HttpTarget; probe?: DifferentialArmInput | HttpTarget; controlExchangeId?: string; probeExchangeId?: string; variant?: 'auto' | 'key_traversal' | 'unauth_write_mint'; url?: string; path?: string; pathAndQuery?: string; endpoint?: string; route?: string; method?: string; headers?: Record<string, string>; as?: string; controlBody?: string | Record<string, unknown>; probeBody?: string | Record<string, unknown>; session?: string; message?: string }
 
 export interface ProofResult { sdk: 'kovo_verify.ts'; nonce: string; title: string; severity: string; description?: string; claims: VerifyClaim[] }
 export interface RpcContext { nonce: string; runId: string; targetOrigins: string[]; sdkVersion: string }
@@ -121,7 +123,7 @@ export interface HttpOptions {
   method?: string; headers?: Record<string, string>; body?: string | Record<string, unknown> | unknown[]
   followRedirects?: boolean; timeoutMs?: number; capability?: string | CapabilityInjectionSpec
   capabilityTarget?: 'bearer' | 'header' | 'cookie' | 'url'; capabilityHeaderName?: string; capabilityCookieName?: string
-  capabilityQueryParam?: string; entityId?: string; correlationIds?: string[]; evidenceRole?: string
+  capabilityQueryParam?: string; authMutation?: Record<string, unknown>; entityId?: string; correlationIds?: string[]; evidenceRole?: string
   replayAttempt?: 'mode_a' | 'ablation_control' | 'primary'
 }
 export type HttpTarget = string | (HttpOptions & { url?: string; path?: string; pathAndQuery?: string; endpoint?: string; route?: string; target?: HttpTarget; origin?: string })
@@ -218,7 +220,7 @@ function splitTarget(input: HttpTarget, defaultOrigin: string | undefined): { or
   throw new Error('HTTP target requires a path/URL string or an object with { url | path | pathAndQuery | endpoint }.')
 }
 
-const HTTP_OPT_KEYS = ['session', 'role', 'arm', 'followRedirects', 'timeoutMs', 'capability', 'capabilityTarget', 'capabilityHeaderName', 'capabilityCookieName', 'capabilityQueryParam', 'entityId', 'correlationIds', 'evidenceRole', 'replayAttempt'] as const
+const HTTP_OPT_KEYS = ['session', 'role', 'arm', 'followRedirects', 'timeoutMs', 'capability', 'capabilityTarget', 'capabilityHeaderName', 'capabilityCookieName', 'capabilityQueryParam', 'authMutation', 'entityId', 'correlationIds', 'evidenceRole', 'replayAttempt'] as const
 function extractInlineHttpOptions(input: unknown): HttpOptions {
   if (!input || typeof input !== 'object' || Array.isArray(input)) return {}
   const r = input as Record<string, unknown>, out: HttpOptions = pickDefined(r, HTTP_OPT_KEYS) as HttpOptions
@@ -531,7 +533,7 @@ export class VerifyContext {
         ...(target.origin ? { origin: target.origin } : {}), path: target.path, method: (merged.method ?? 'GET').toUpperCase(),
         ...(headers ? { headers } : {}), ...(body !== undefined ? { body } : {}), ...(persona ? { persona } : {}),
         ...(sessionGroupRole ? { sessionGroupRole } : {}),
-        ...pickDefined(merged as Record<string, unknown>, ['session', 'followRedirects', 'capability', 'capabilityTarget', 'capabilityHeaderName', 'capabilityCookieName', 'capabilityQueryParam', 'entityId', 'evidenceRole', 'replayAttempt']),
+        ...pickDefined(merged as Record<string, unknown>, ['session', 'followRedirects', 'capability', 'capabilityTarget', 'capabilityHeaderName', 'capabilityCookieName', 'capabilityQueryParam', 'authMutation', 'entityId', 'evidenceRole', 'replayAttempt']),
         ...(merged.correlationIds?.length ? { correlationIds: merged.correlationIds } : {}),
       },
       timeoutMs: (merged.timeoutMs ?? 60_000) + 10_000,
@@ -732,11 +734,16 @@ export class VerifyContext {
     return this.callProof<InjectionDifferentialProof>('prove.injection', input, 'prove_injection_differential requires { control, probe, expectedOutput?, vulnClass? }.', 70_000, ['control', 'probe'])
   }
 
+  prove_signed_url_mint(input: SignedUrlMintInput | Record<string, unknown>): Promise<SignedUrlMintProof> {
+    return this.callProof<SignedUrlMintProof>('prove.signedUrlMint', input, 'prove_signed_url_mint requires { control, probe } (or route + controlBody/probeBody, or controlExchangeId/probeExchangeId).', 70_000, ['control', 'probe'])
+  }
+
   /** Thin camelCase compatibility delegates for existing v6/v8 callers. */
   proveAccessBoundary(input: AccessBoundaryInput | Record<string, unknown>): Promise<AccessBoundaryProof> { return this.prove_access_boundary(input) }
   provePersistedMutation(input: PersistedMutationInput | Record<string, unknown>): Promise<PersistedMutationProof> { return this.prove_persisted_mutation(input) }
   proveBooleanOrTimingDiff(input: BooleanOrTimingDiffInput | Record<string, unknown>): Promise<DifferentialProof> { return this.prove_boolean_or_timing_diff(input) }
   proveInjectionDifferential(input: InjectionDifferentialInput | Record<string, unknown>): Promise<InjectionDifferentialProof> { return this.prove_injection_differential(input) }
+  proveSignedUrlMint(input: SignedUrlMintInput | Record<string, unknown>): Promise<SignedUrlMintProof> { return this.prove_signed_url_mint(input) }
   proveOobCallback(input: OobCallbackInput | Record<string, unknown>): Promise<OobCallbackProof> { return this.prove_oob_callback(input) }
   proveRaceBurst(input: RaceBurstInput | Record<string, unknown>): Promise<RaceBurstProof> { return this.prove_race_burst(input) }
 

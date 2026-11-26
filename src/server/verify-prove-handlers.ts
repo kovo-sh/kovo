@@ -25,6 +25,7 @@ import {
 } from './verify-claims.ts'
 import type { VerifyCanaryBroker, VerifyClaim } from './verify-claims.ts'
 import {
+  assessSignedUrlMintDifferential,
   evaluateWorkerStructuralDiff,
   mintHostBooleanPair,
   normalizeStructuralTokens,
@@ -32,6 +33,8 @@ import {
   verifyBooleanArmBaseParity,
   type BooleanPairStyle,
   type HostMintedBooleanPair,
+  type SignedUrlMintExchange,
+  type SignedUrlMintVariant,
 } from './verify-support.ts'
 
 export type ProveHttpExchangeResult = {
@@ -142,6 +145,7 @@ function normalizeArmTarget(
     ...(role ? { sessionGroupRole: role } : {}),
     ...(followRedirects !== undefined ? { followRedirects } : {}),
     ...(merged.capability !== undefined ? { capability: merged.capability } : {}),
+    ...(merged.authMutation !== undefined ? { authMutation: merged.authMutation } : {}),
     ...(typeof merged.entityId === 'string' && merged.entityId.trim() ? { entityId: merged.entityId.trim() } : {}),
     ...(typeof merged.correlationId === 'string' && merged.correlationId.trim() ? { correlationId: merged.correlationId.trim() } : {}),
     ...(Array.isArray(merged.correlationIds) ? { correlationIds: merged.correlationIds } : {}),
@@ -1449,5 +1453,177 @@ export async function handleProveInjection(host: ProveHandlerHost, args: Record<
     rejectedBy: check.passed ? null : 'impact',
     missingEvidence,
     transcriptSummary,
+  })
+}
+
+function transcriptRecordToSignedUrlExchange(
+  transcript: TranscriptStore,
+  exchangeId: string,
+  fallbackOrigin: string,
+): SignedUrlMintExchange | null {
+  const rec = transcript.get(exchangeId)
+  if (!rec?.request) return null
+  const rawBody = transcript.body(exchangeId) ?? ''
+  const rawReqBody = transcript.requestBody(exchangeId) ?? null
+  const parsedResp = parseJsonSafe(rawBody)
+  const parsedReq = rawReqBody ? parseJsonSafe(rawReqBody) : undefined
+  const reqExt = rec.request as typeof rec.request & { wireCredentialProvenance?: SignedUrlMintExchange['wireCredentialProvenance'] }
+  return {
+    exchangeId: rec.exchangeId,
+    origin: rec.request.origin || fallbackOrigin,
+    method: rec.request.method.toUpperCase(),
+    pathAndQuery: rec.request.pathAndQuery,
+    status: rec.response?.status ?? null,
+    actorHandle: rec.request.personaHandle ?? null,
+    requestHeaders: rec.request.headers ?? null,
+    requestBody: rawReqBody,
+    requestJson: parsedReq,
+    responseHeaders: rec.response?.headers ?? null,
+    responseBody: rawBody,
+    responseJson: parsedResp,
+    wireCredentialProvenance: reqExt.wireCredentialProvenance ?? null,
+    consumedCapabilityId: rec.request.consumedCapabilityId ?? null,
+  }
+}
+
+function exchangeSummaryFromTranscript(transcript: TranscriptStore, exchangeId: string): ProveHttpExchangeResult | null {
+  const rec = transcript.get(exchangeId)
+  if (!rec?.request) return null
+  const body = transcript.body(exchangeId) ?? ''
+  return {
+    exchangeId: rec.exchangeId,
+    status: rec.response?.status ?? 0,
+    method: rec.request.method,
+    pathAndQuery: rec.request.pathAndQuery,
+    headers: rec.response?.headers ?? {},
+    body,
+    bodyPreview: body.slice(0, 512),
+    bodyBytes: rec.response?.bodyBytes ?? Buffer.byteLength(body),
+    bodySha256: rec.response?.bodySha256 ?? '',
+    durationMs: rec.durationMs,
+    personaHandle: rec.request.personaHandle ?? null,
+  }
+}
+
+export async function handleProveSignedUrlMint(
+  host: ProveHandlerHost,
+  args: Record<string, unknown>,
+  nonce: string,
+): Promise<unknown> {
+  const session = typeof args.session === 'string' && args.session ? args.session : 'signed-url-mint'
+  const rawVariant = String(args.variant ?? 'auto').trim().toLowerCase()
+  const variant: SignedUrlMintVariant | 'auto' = rawVariant === 'key_traversal' || rawVariant === 'unauth_write_mint'
+    ? rawVariant
+    : 'auto'
+  const baseRoute = args.route ?? args.url ?? args.path ?? args.pathAndQuery ?? args.endpoint
+  const baseOpts: Record<string, unknown> = {
+    ...(typeof args.method === 'string' ? { method: args.method } : { method: 'POST' }),
+    ...(asRecord(args.headers) ? { headers: args.headers } : {}),
+    ...(typeof (args.as ?? args.as_persona ?? args.persona) === 'string' ? { persona: args.as ?? args.as_persona ?? args.persona } : {}),
+  }
+
+  const existingControlId = typeof (args.controlExchangeId ?? args.control_exchange_id) === 'string'
+    ? String(args.controlExchangeId ?? args.control_exchange_id).trim()
+    : ''
+  const existingProbeId = typeof (args.probeExchangeId ?? args.probe_exchange_id) === 'string'
+    ? String(args.probeExchangeId ?? args.probe_exchange_id).trim()
+    : ''
+
+  let control: ProveHttpExchangeResult | null = null
+  let probe: ProveHttpExchangeResult | null = null
+
+  if (existingControlId && existingProbeId) {
+    control = exchangeSummaryFromTranscript(host.transcript, existingControlId)
+    probe = exchangeSummaryFromTranscript(host.transcript, existingProbeId)
+    if (!control || !probe) {
+      throw new Error('prove.signedUrlMint references an unknown controlExchangeId or probeExchangeId.')
+    }
+  } else {
+    const controlBodyArg = args.controlBody ?? args.control_body
+    const probeBodyArg = args.probeBody ?? args.probe_body
+    const rawControl = args.control ?? (baseRoute && controlBodyArg !== undefined ? { target: baseRoute, options: { ...baseOpts, body: controlBodyArg } } : undefined)
+    const rawProbe = args.probe ?? args.variantRequest ?? (baseRoute && probeBodyArg !== undefined ? { target: baseRoute, options: { ...baseOpts, body: probeBodyArg } } : undefined)
+    if (!rawControl || !rawProbe) {
+      throw new Error('prove_signed_url_mint requires `control` and `probe` (or `route` with `controlBody` and `probeBody`, or `controlExchangeId` and `probeExchangeId`).')
+    }
+    const controlArgs = normalizeArmTarget(host.defaultOrigin, rawControl, {
+      ...(typeof baseOpts.method === 'string' && !(asRecord(rawControl)?.method || asRecord(asRecord(rawControl)?.options)?.method) ? { method: baseOpts.method } : {}),
+      sessionGroupRole: 'control',
+      session,
+    })
+    const probeArgs = normalizeArmTarget(host.defaultOrigin, rawProbe, {
+      ...(typeof baseOpts.method === 'string' && !(asRecord(rawProbe)?.method || asRecord(asRecord(rawProbe)?.options)?.method) ? { method: baseOpts.method } : {}),
+      sessionGroupRole: 'probe',
+      session,
+    })
+    control = await host.runHttpExchange(controlArgs, nonce)
+    probe = await host.runHttpExchange(probeArgs, nonce)
+  }
+
+  const hostControl = transcriptRecordToSignedUrlExchange(host.transcript, control.exchangeId, host.defaultOrigin ?? '')
+  const hostProbe = transcriptRecordToSignedUrlExchange(host.transcript, probe.exchangeId, host.defaultOrigin ?? '')
+  if (!hostControl || !hostProbe) {
+    throw new Error('prove.signedUrlMint could not read host-signed control/probe records from the transcript.')
+  }
+
+  const assessment = assessSignedUrlMintDifferential({
+    control: hostControl,
+    probe: hostProbe,
+    variant,
+  })
+  const chainId = `signed_url_mint:${assessment.variant ?? (variant === 'auto' ? 'unverified' : variant)}`
+  const cwe = assessment.variant === 'unauth_write_mint' ? 'CWE-306' : 'CWE-22'
+  const exchangeIds = [control.exchangeId, probe.exchangeId]
+  const recorded = host.transcript.recordCompositeVerification({
+    chainId,
+    terminalVulnClass: 'signed_url_mint',
+    replayMode: 'fresh_clean_replay',
+    hopCount: 1,
+    confirmed: assessment.confirmed,
+    verifiedEdgeCount: assessment.confirmed ? 1 : 0,
+    reason: assessment.reason,
+    rejectedBy: assessment.confirmed ? null : (assessment.rejectedBy ?? 'signed_url_mint'),
+    missingEvidence: assessment.missingEvidence,
+    exchangeIds,
+    terminalExchangeId: probe.exchangeId,
+    route: probe.pathAndQuery,
+  })
+  const claim: Extract<VerifyClaim, { kind: 'composite_receipt' }> = {
+    kind: 'composite_receipt',
+    verificationId: recorded.verificationId,
+    chainId,
+    terminalVulnClass: 'signed_url_mint',
+    cwe,
+    route: probe.pathAndQuery,
+    exchangeIds,
+    terminalExchangeId: probe.exchangeId,
+    replayMode: 'fresh_clean_replay',
+    hopCount: 1,
+    ...(typeof args.message === 'string' && args.message ? { message: args.message } : {}),
+    ...(!assessment.confirmed ? {
+      rejectedBy: assessment.rejectedBy ?? 'signed_url_mint',
+      missingEvidence: assessment.missingEvidence,
+      reason: assessment.reason,
+    } : {}),
+  }
+
+  return host.scrubRecord({
+    ok: assessment.confirmed,
+    confirmed: assessment.confirmed,
+    variant: assessment.variant,
+    provider: assessment.provider,
+    endpoint: probe.pathAndQuery,
+    control,
+    probe,
+    claim,
+    claims: [claim],
+    evidence: assessment.evidence,
+    reason: assessment.reason,
+    rejectedBy: assessment.confirmed ? null : (assessment.rejectedBy ?? 'signed_url_mint'),
+    missingEvidence: assessment.missingEvidence,
+    transcriptSummary: [
+      proofEntry('control', control),
+      proofEntry('probe', probe),
+    ],
   })
 }

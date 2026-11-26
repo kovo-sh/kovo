@@ -17,7 +17,7 @@ import { createHmac, randomBytes, randomInt, randomUUID } from 'node:crypto'
 import { once } from 'node:events'
 import { createServer } from 'node:http'
 import type { Server } from 'node:http'
-import type { WireCredentialProvenance } from './broker.ts'
+import type { Grant, WireCredentialProvenance } from './broker.ts'
 import type { CanaryBroker } from './canary-broker.ts'
 import { isDerivedCapabilityHandle, type InjectCapabilityTarget } from './derived-custody.ts'
 import type { HostCredentialPlacement } from './host-fact-log.ts'
@@ -917,5 +917,873 @@ async function sleepAbortable(ms: number, signal: AbortSignal) {
       reject(signal.reason)
     }
     signal.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
+// ---------------------------------------------------------------------------
+// P0 #2: First-class `signed_url_mint` host-verified runtime oracle
+// ---------------------------------------------------------------------------
+
+export type SignedCloudStorageProvider = 'gcs' | 'aws_s3' | 'azure_blob' | 'cloudflare_r2'
+export type SignedUrlMintVariant = 'key_traversal' | 'unauth_write_mint'
+
+export interface ParsedSignedCloudUrl {
+  readonly rawUrl: string
+  readonly provider: SignedCloudStorageProvider
+  readonly host: string
+  readonly bucket: string
+  readonly canonicalPathname: string
+  readonly objectKey: string
+  readonly parentDir: string
+  readonly normalizedParentDir: string
+  readonly signatureParam: string
+  readonly signature: string
+  readonly algorithm: string | null
+  readonly writeCapable: boolean
+  readonly writeReason: string | null
+}
+
+export interface SignedUrlMintExchange {
+  readonly exchangeId?: string
+  readonly origin: string
+  readonly method: string
+  readonly pathAndQuery: string
+  readonly status: number | null
+  readonly actorHandle?: string | null
+  readonly requestHeaders?: Readonly<Record<string, string>> | null
+  readonly requestBody?: string | null
+  readonly requestJson?: unknown
+  readonly responseHeaders?: Readonly<Record<string, string>> | null
+  readonly responseBody?: string | null
+  readonly responseJson?: unknown
+  readonly wireCredentialProvenance?: WireCredentialProvenance | null
+  readonly consumedCapabilityId?: string | null
+  readonly consumedCapabilities?: readonly string[]
+}
+
+export interface SignedUrlMintAssessment {
+  readonly confirmed: boolean
+  readonly variant: SignedUrlMintVariant | null
+  readonly provider: SignedCloudStorageProvider | null
+  readonly reason: string
+  readonly rejectedBy: string | null
+  readonly missingEvidence: string[]
+  readonly evidence: Record<string, unknown>
+}
+
+const GCS_STORAGE_HOST_RE = /^(?:storage\.googleapis\.com|storage\.cloud\.google\.com|[a-z0-9][a-z0-9._-]{1,62}\.storage\.googleapis\.com)$/i
+const AWS_S3_HOST_RE = /^(?:[a-z0-9][a-z0-9.-]*\.)?s3(?:[.-](?:accelerate|dualstack|[a-z0-9-]+))?\.amazonaws\.com$/i
+const AZURE_BLOB_HOST_RE = /^[a-z0-9][a-z0-9-]{1,62}\.blob\.core\.windows\.net$/i
+const CLOUDFLARE_R2_HOST_RE = /^[a-z0-9][a-z0-9.-]*\.r2\.cloudflarestorage\.com$/i
+const SIGNATURE_TOKEN_RE = /^[A-Za-z0-9+/_=-]{32,1024}$/
+const HTTPS_URL_CANDIDATE_RE = /https:\/\/[^\s"'<>\\`]{16,4096}/gi
+const DYNAMIC_PATH_SEG_RE = /^(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{16,}|[0-9]{6,}|[A-Za-z0-9_-]{24,})$/i
+const WRITE_URL_FIELD_RE = /(?:upload|put|write|signed|presigned).*url|url/i
+const WRITE_ROUTE_HINT_RE = /(?:upload|presign|signed[-_]?url|put[-_]?url|create[-_]?upload|generate[-_]?upload)/i
+const REDACTED_PLACEHOLDER_RE = /\[redacted(?::[^\]]{0,160})?\]/i
+
+function shannonEntropy(value: string): number {
+  if (!value) return 0
+  const counts = new Map<string, number>()
+  for (let i = 0; i < value.length; i += 1) {
+    const ch = value[i]!
+    counts.set(ch, (counts.get(ch) ?? 0) + 1)
+  }
+  let entropy = 0
+  for (const count of counts.values()) {
+    const p = count / value.length
+    entropy -= p * Math.log2(p)
+  }
+  return entropy
+}
+
+function isHighEntropySignature(raw: string | null | undefined): boolean {
+  if (!raw) return false
+  let decoded = raw.trim()
+  try { decoded = decodeURIComponent(decoded) } catch { /* keep trimmed */ }
+  if (decoded.length < 32 || !SIGNATURE_TOKEN_RE.test(decoded)) return false
+  const distinct = new Set(decoded).size
+  if (distinct < 8) return false
+  return shannonEntropy(decoded) >= 2.5
+}
+
+function queryParamCI(params: URLSearchParams, name: string): string | null {
+  const lower = name.toLowerCase()
+  for (const [k, v] of params.entries()) {
+    if (k.toLowerCase() === lower && v.trim().length > 0) return v.trim()
+  }
+  return null
+}
+
+function classifyCloudStorageHost(hostname: string): SignedCloudStorageProvider | null {
+  const host = hostname.toLowerCase()
+  if (GCS_STORAGE_HOST_RE.test(host)) return 'gcs'
+  if (AWS_S3_HOST_RE.test(host)) return 'aws_s3'
+  if (AZURE_BLOB_HOST_RE.test(host)) return 'azure_blob'
+  if (CLOUDFLARE_R2_HOST_RE.test(host)) return 'cloudflare_r2'
+  return null
+}
+
+function canonicalizeStoragePathname(rawPathname: string): string {
+  // Decode percent-encoded dot / slash sequences so `%2e%2e` or `%2f` traversal resolves canonically.
+  let decoded = rawPathname
+  try {
+    decoded = rawPathname
+      .replace(/%2e/gi, '.')
+      .replace(/%2f/gi, '/')
+      .replace(/%5c/gi, '/')
+      .replace(/\\/g, '/')
+  } catch { /* keep raw */ }
+  const segments: string[] = []
+  for (const rawSeg of decoded.split('/')) {
+    if (!rawSeg || rawSeg === '.') continue
+    if (rawSeg === '..') {
+      segments.pop()
+      continue
+    }
+    segments.push(rawSeg)
+  }
+  return `/${segments.join('/')}`
+}
+
+function extractBucketAndKey(
+  provider: SignedCloudStorageProvider,
+  host: string,
+  canonicalPathname: string,
+): { bucket: string; objectKey: string; parentDir: string; normalizedParentDir: string } {
+  const parts = canonicalPathname.split('/').filter(Boolean)
+  let bucket = ''
+  let keyParts: string[] = []
+  if (provider === 'gcs') {
+    const virtualMatch = /^([a-z0-9][a-z0-9._-]{1,62})\.storage\.googleapis\.com$/i.exec(host)
+    if (virtualMatch) {
+      bucket = virtualMatch[1]!.toLowerCase()
+      keyParts = parts
+    } else {
+      bucket = (parts[0] ?? '').toLowerCase()
+      keyParts = parts.slice(1)
+    }
+  } else if (provider === 'aws_s3') {
+    const virtualMatch = /^([a-z0-9][a-z0-9.-]*?)\.s3(?:[.-](?:accelerate|dualstack|[a-z0-9-]+))?\.amazonaws\.com$/i.exec(host)
+    if (virtualMatch) {
+      bucket = virtualMatch[1]!.toLowerCase()
+      keyParts = parts
+    } else {
+      bucket = (parts[0] ?? '').toLowerCase()
+      keyParts = parts.slice(1)
+    }
+  } else if (provider === 'azure_blob') {
+    const acct = host.split('.')[0]?.toLowerCase() ?? ''
+    const container = (parts[0] ?? '').toLowerCase()
+    bucket = container ? `${acct}/${container}` : acct
+    keyParts = parts.slice(1)
+  } else {
+    bucket = (parts[0] ?? '').toLowerCase()
+    keyParts = parts.slice(1)
+  }
+
+  const dirParts = parts.length > 1 ? parts.slice(0, -1) : []
+  const parentDir = dirParts.length > 0 ? `/${dirParts.join('/')}/` : '/'
+  const normDirParts = dirParts.map((seg, idx) => {
+    if (idx === 0 && bucket && seg.toLowerCase() === bucket) return seg.toLowerCase()
+    const isDynamic = DYNAMIC_PATH_SEG_RE.test(seg) && (/\d/.test(seg) || seg.length >= 24)
+    return isDynamic ? '<dynamic>' : seg.toLowerCase()
+  })
+  const normalizedParentDir = normDirParts.length > 0 ? `/${normDirParts.join('/')}/` : '/'
+  return {
+    bucket,
+    objectKey: keyParts.join('/'),
+    parentDir,
+    normalizedParentDir,
+  }
+}
+
+function parseSignedCloudUrl(rawUrl: string): ParsedSignedCloudUrl | null {
+  const trimmed = rawUrl.trim().replace(/[),.;]+$/, '')
+  if (!trimmed.toLowerCase().startsWith('https://')) return null
+  let parsed: URL
+  try { parsed = new URL(trimmed) } catch { return null }
+  if (parsed.protocol !== 'https:') return null
+  const host = parsed.hostname.toLowerCase()
+  const provider = classifyCloudStorageHost(host)
+  if (!provider) return null
+
+  const sp = parsed.searchParams
+  let signatureParam = ''
+  let signature = ''
+  let algorithm: string | null = null
+  let writeCapable = false
+  let writeReason: string | null = null
+
+  if (provider === 'gcs') {
+    const v4Sig = queryParamCI(sp, 'X-Goog-Signature')
+    const v4Alg = queryParamCI(sp, 'X-Goog-Algorithm')
+    const v2Sig = queryParamCI(sp, 'Signature')
+    const v2Id = queryParamCI(sp, 'GoogleAccessId')
+    const v2Exp = queryParamCI(sp, 'Expires')
+    if (v4Sig && v4Alg) {
+      signatureParam = 'X-Goog-Signature'
+      signature = v4Sig
+      algorithm = v4Alg
+      const signedHeaders = (queryParamCI(sp, 'X-Goog-SignedHeaders') ?? '').toLowerCase()
+      if (signedHeaders.includes('content-type') || signedHeaders.includes('x-goog-') || queryParamCI(sp, 'uploadType') || queryParamCI(sp, 'x-goog-resumable')) {
+        writeCapable = true
+        writeReason = 'gcs_signed_write_headers'
+      }
+    } else if (v2Sig && v2Id && v2Exp) {
+      signatureParam = 'Signature'
+      signature = v2Sig
+      algorithm = 'GOOG2-RSA-SHA256'
+    } else {
+      return null
+    }
+  } else if (provider === 'aws_s3' || provider === 'cloudflare_r2') {
+    const v4Sig = queryParamCI(sp, 'X-Amz-Signature')
+    const v4Alg = queryParamCI(sp, 'X-Amz-Algorithm')
+    const v2Sig = queryParamCI(sp, 'Signature')
+    const v2Key = queryParamCI(sp, 'AWSAccessKeyId')
+    const v2Exp = queryParamCI(sp, 'Expires')
+    if (v4Sig && v4Alg) {
+      signatureParam = 'X-Amz-Signature'
+      signature = v4Sig
+      algorithm = v4Alg
+      const signedHeaders = (queryParamCI(sp, 'X-Amz-SignedHeaders') ?? '').toLowerCase()
+      if (signedHeaders.includes('content-type') || signedHeaders.includes('x-amz-') || queryParamCI(sp, 'uploadId') || queryParamCI(sp, 'partNumber') || queryParamCI(sp, 'x-amz-acl')) {
+        writeCapable = true
+        writeReason = 's3_signed_write_headers'
+      }
+    } else if (v2Sig && v2Key && v2Exp) {
+      signatureParam = 'Signature'
+      signature = v2Sig
+      algorithm = 'AWS2-HMAC-SHA1'
+    } else {
+      return null
+    }
+  } else {
+    // Azure Blob SAS strictly requires `sig`, `se`, and write/create permission in `sp`.
+    const sig = queryParamCI(sp, 'sig')
+    const se = queryParamCI(sp, 'se')
+    const perms = queryParamCI(sp, 'sp')
+    if (!sig || !se || !perms || !/[wc]/i.test(perms)) return null
+    signatureParam = 'sig'
+    signature = sig
+    algorithm = 'AZURE-SAS'
+    writeCapable = true
+    writeReason = `azure_sas_sp:${perms}`
+  }
+
+  if (!isHighEntropySignature(signature)) return null
+  const canonicalPathname = canonicalizeStoragePathname(parsed.pathname)
+  const { bucket, objectKey, parentDir, normalizedParentDir } = extractBucketAndKey(provider, host, canonicalPathname)
+  if (!bucket || !objectKey) return null
+
+  return {
+    rawUrl: trimmed,
+    provider,
+    host,
+    bucket,
+    canonicalPathname,
+    objectKey,
+    parentDir,
+    normalizedParentDir,
+    signatureParam,
+    signature,
+    algorithm,
+    writeCapable,
+    writeReason,
+  }
+}
+
+function extractSignedCloudUrls(exchange: SignedUrlMintExchange): {
+  urls: ParsedSignedCloudUrl[]
+  hasWriteEnvelopeHint: boolean
+  writeHintReason: string | null
+} {
+  const candidates: string[] = []
+  const seen = new Set<string>()
+  let hasWriteEnvelopeHint = false
+  let writeHintReason: string | null = null
+
+  const pushCandidate = (value: string) => {
+    const trimmed = value.trim()
+    if (!trimmed || seen.has(trimmed) || candidates.length >= 24) return
+    seen.add(trimmed)
+    candidates.push(trimmed)
+  }
+
+  for (const [k, v] of Object.entries(exchange.responseHeaders ?? {})) {
+    if (k.toLowerCase() === 'location' && typeof v === 'string') pushCandidate(v)
+  }
+
+  let parsedJson: unknown = exchange.responseJson
+  if (parsedJson === undefined && typeof exchange.responseBody === 'string' && exchange.responseBody.trim()) {
+    try { parsedJson = JSON.parse(exchange.responseBody) } catch { parsedJson = undefined }
+  }
+  const visitJson = (val: unknown, depth: number): void => {
+    if (depth > 6 || val === null || val === undefined) return
+    if (typeof val === 'string') {
+      if (val.includes('https://')) {
+        for (const match of val.matchAll(HTTPS_URL_CANDIDATE_RE)) pushCandidate(match[0])
+      }
+      return
+    }
+    if (Array.isArray(val)) {
+      for (const item of val.slice(0, 32)) visitJson(item, depth + 1)
+      return
+    }
+    if (typeof val === 'object') {
+      for (const [k, child] of Object.entries(val as Record<string, unknown>)) {
+        const lk = k.toLowerCase()
+        if (typeof child === 'string') {
+          if (/^(?:method|http_?method|verb)$/i.test(lk) && /^(?:PUT|POST)$/i.test(child.trim())) {
+            hasWriteEnvelopeHint = true
+            writeHintReason = `response_method:${child.trim().toUpperCase()}`
+          } else if (/(?:upload|put|write)_?url/i.test(lk) && child.includes('https://')) {
+            hasWriteEnvelopeHint = true
+            writeHintReason = `response_field:${k}`
+          } else if (WRITE_URL_FIELD_RE.test(lk) && child.includes('https://')) {
+            pushCandidate(child)
+          }
+          if (child.includes('https://')) {
+            for (const match of child.matchAll(HTTPS_URL_CANDIDATE_RE)) pushCandidate(match[0])
+          }
+        } else if (lk === 'fields' && child && typeof child === 'object' && !Array.isArray(child)) {
+          // S3 presigned POST policy envelope
+          const fObj = child as Record<string, unknown>
+          if ('Policy' in fObj || 'policy' in fObj || 'X-Amz-Signature' in fObj || 'x-amz-signature' in fObj) {
+            hasWriteEnvelopeHint = true
+            writeHintReason = 's3_presigned_post_fields'
+          }
+          visitJson(child, depth + 1)
+        } else {
+          visitJson(child, depth + 1)
+        }
+      }
+    }
+  }
+  if (parsedJson !== undefined) visitJson(parsedJson, 0)
+  if (typeof exchange.responseBody === 'string' && exchange.responseBody.includes('https://')) {
+    for (const match of exchange.responseBody.matchAll(HTTPS_URL_CANDIDATE_RE)) pushCandidate(match[0])
+  }
+
+  const urls: ParsedSignedCloudUrl[] = []
+  const seenUrls = new Set<string>()
+  for (const raw of candidates) {
+    const parsed = parseSignedCloudUrl(raw)
+    if (parsed && !seenUrls.has(parsed.rawUrl)) {
+      seenUrls.add(parsed.rawUrl)
+      urls.push(parsed)
+    }
+  }
+  return { urls, hasWriteEnvelopeHint, writeHintReason }
+}
+
+function requestCarrierText(exchange: SignedUrlMintExchange): string {
+  const headerVals = Object.entries(exchange.requestHeaders ?? {})
+    .map(([k, v]) => `${k}:${v}`)
+    .join('\n')
+  const bodyText = typeof exchange.requestBody === 'string'
+    ? exchange.requestBody
+    : exchange.requestJson !== undefined
+      ? (typeof exchange.requestJson === 'string' ? exchange.requestJson : JSON.stringify(exchange.requestJson))
+      : ''
+  return `${exchange.pathAndQuery}\n${headerVals}\n${bodyText}`
+}
+
+function normalizeOriginKey(origin: string): string {
+  try { return new URL(origin).origin.toLowerCase() } catch { return origin.trim().toLowerCase().replace(/\/+$/, '') }
+}
+
+function canonicalRoutePath(pathAndQuery: string): string {
+  return pathAndQuery.split('?')[0]!.split('#')[0]!.replace(/\/+$/, '').toLowerCase() || '/'
+}
+
+function containsRedactedRequestPlane(exchange: SignedUrlMintExchange): boolean {
+  return REDACTED_PLACEHOLDER_RE.test(requestCarrierText(exchange))
+}
+
+function isSignatureOrUrlEchoedFromRequest(exchange: SignedUrlMintExchange, signed: ParsedSignedCloudUrl): boolean {
+  const raw = requestCarrierText(exchange)
+  let decoded = raw
+  try { decoded = decodeURIComponent(raw.replace(/\+/g, ' ')) } catch { /* keep raw */ }
+  let decodedSig = signed.signature
+  try { decodedSig = decodeURIComponent(signed.signature) } catch { /* keep raw */ }
+  const needles = [signed.signature, decodedSig, signed.rawUrl]
+  return needles.some(n => n.length >= 16 && (raw.includes(n) || decoded.includes(n)))
+}
+
+function isUnauthenticatedExchange(exchange: SignedUrlMintExchange): boolean {
+  if (exchange.actorHandle && exchange.actorHandle.trim()) return false
+  if (exchange.consumedCapabilityId) return false
+  if (exchange.consumedCapabilities && exchange.consumedCapabilities.length > 0) return false
+  const wp = exchange.wireCredentialProvenance
+  if (wp && (
+    wp.sources.some(s => s === 'persona_vault' || s === 'session_jar' || s === 'ephemeral_observed')
+    || wp.source === 'persona_and_jar'
+    || wp.vaultHeaderNames.length > 0
+    || wp.vaultCookieNames.length > 0
+    || wp.jarCookieNames.length > 0
+  )) {
+    return false
+  }
+  for (const [k, v] of Object.entries(exchange.requestHeaders ?? {})) {
+    const lk = k.toLowerCase()
+    if ((lk === 'authorization' || lk === 'cookie' || lk === 'proxy-authorization') && v.trim().length > 0) {
+      return false
+    }
+  }
+  return true
+}
+
+function hasPathInjectionIntoNestedDir(
+  control: ParsedSignedCloudUrl,
+  probe: ParsedSignedCloudUrl,
+  probeRequestText: string,
+): boolean {
+  if (probe.normalizedParentDir === control.normalizedParentDir) return false
+  const probeSegs = probe.normalizedParentDir.split('/').filter(Boolean)
+  const ctlSegs = control.normalizedParentDir.split('/').filter(Boolean)
+  const extraSegs = probeSegs.slice(ctlSegs.length).filter(seg => seg !== '<dynamic>' && seg.length >= 2)
+  if (extraSegs.length === 0) return false
+  let decodedReq = probeRequestText.toLowerCase()
+  try { decodedReq = decodeURIComponent(decodedReq) } catch { /* keep lower */ }
+  const hasSep = decodedReq.includes('/') || decodedReq.includes('..') || decodedReq.includes('\\')
+  return hasSep && extraSegs.some(seg => decodedReq.includes(seg))
+}
+
+/**
+ * Authoritative, fail-closed host-verified oracle for `signed_url_mint` (P0 #2).
+ *
+ * Evaluates strictly over host-signed transcript exchanges:
+ *   - Variant A (`key_traversal`): 2xx control vs 2xx probe on the same approved origin & route,
+ *     both returning valid high-entropy cloud-storage signed URLs with *differing* non-echoed
+ *     signatures where the probe's canonicalized pathname escapes the control's parent directory
+ *     or bucket (rejecting benign same-prefix filenames and UUID subdirs).
+ *   - Variant B (`unauth_write_mint`): 4xx negative control vs unauthenticated 2xx probe on the
+ *     same origin & route minting a valid high-entropy non-echoed write-capable signed cloud URL.
+ */
+export function assessSignedUrlMintDifferential(input: {
+  control: SignedUrlMintExchange
+  probe: SignedUrlMintExchange
+  variant?: SignedUrlMintVariant | 'auto'
+}): SignedUrlMintAssessment {
+  const { control, probe } = input
+  const requestedVariant = input.variant ?? 'auto'
+  const fail = (
+    rejectedBy: string,
+    missingEvidence: string[],
+    reason: string,
+    extra: Record<string, unknown> = {},
+  ): SignedUrlMintAssessment => ({
+    confirmed: false,
+    variant: null,
+    provider: null,
+    reason,
+    rejectedBy,
+    missingEvidence,
+    evidence: {
+      controlStatus: control.status,
+      probeStatus: probe.status,
+      ...extra,
+    },
+  })
+
+  if (containsRedactedRequestPlane(control) || containsRedactedRequestPlane(probe)) {
+    return fail(
+      'redacted_request_plane',
+      ['clean_request_plane'],
+      'Signed-URL oracle rejected: kernel request plane contains a redacted placeholder.',
+    )
+  }
+
+  const ctlOrigin = normalizeOriginKey(control.origin)
+  const prbOrigin = normalizeOriginKey(probe.origin)
+  if (!ctlOrigin || ctlOrigin !== prbOrigin) {
+    return fail(
+      'signed_url_origin_mismatch',
+      ['same_origin_control_and_probe'],
+      `Control (${ctlOrigin || 'none'}) and probe (${prbOrigin || 'none'}) target different origins.`,
+    )
+  }
+  const ctlMethod = control.method.toUpperCase()
+  const prbMethod = probe.method.toUpperCase()
+  if (ctlMethod !== prbMethod) {
+    return fail(
+      'signed_url_method_mismatch',
+      ['same_method_control_and_probe'],
+      `Control (${ctlMethod}) and probe (${prbMethod}) use different HTTP methods.`,
+    )
+  }
+  const ctlRoute = canonicalRoutePath(control.pathAndQuery)
+  const prbRoute = canonicalRoutePath(probe.pathAndQuery)
+  if (ctlRoute !== prbRoute) {
+    return fail(
+      'signed_url_route_mismatch',
+      ['same_route_control_and_probe'],
+      `Control (${ctlRoute}) and probe (${prbRoute}) target different routes.`,
+    )
+  }
+
+  const ctlStatus = control.status
+  const prbStatus = probe.status
+  const ctlIs2xx = ctlStatus !== null && ctlStatus >= 200 && ctlStatus < 300
+  const ctlIs4xx = ctlStatus !== null && ctlStatus >= 400 && ctlStatus < 500
+  const prbIs2xx = prbStatus !== null && prbStatus >= 200 && prbStatus < 300
+  if (!prbIs2xx) {
+    return fail(
+      'signed_url_probe_not_2xx',
+      ['probe_2xx_signed_url'],
+      `Probe returned status ${prbStatus ?? 'null'}; a 2xx response minting a signed cloud-storage URL is required.`,
+    )
+  }
+
+  const probeExtracted = extractSignedCloudUrls(probe)
+  if (probeExtracted.urls.length === 0) {
+    return fail(
+      'signed_url_missing_or_invalid',
+      ['valid_cloud_signed_url'],
+      'Probe response does not contain a valid cloud-storage signed URL with high-entropy cryptographic signature query parameters.',
+    )
+  }
+
+  const nonEchoedProbeUrls = probeExtracted.urls.filter(u => !isSignatureOrUrlEchoedFromRequest(probe, u))
+  if (nonEchoedProbeUrls.length === 0) {
+    return fail(
+      'signed_url_echoed',
+      ['server_generated_signature'],
+      'Probe signed URL or cryptographic signature was echoed from the request rather than generated by the server.',
+    )
+  }
+
+  // Variant A: Key-traversal / bucket-escape differential (2xx control vs 2xx probe)
+  if (ctlIs2xx && requestedVariant !== 'unauth_write_mint') {
+    const ctlExtracted = extractSignedCloudUrls(control)
+    if (ctlExtracted.urls.length === 0) {
+      return fail(
+        'signed_url_control_missing',
+        ['control_signed_url'],
+        'Control returned 2xx but did not contain a valid cloud-storage signed URL for baseline comparison.',
+      )
+    }
+    const ctlReqText = requestCarrierText(control)
+    const prbReqText = requestCarrierText(probe)
+    if (ctlReqText === prbReqText) {
+      return fail(
+        'signed_url_identical_request',
+        ['differing_probe_input'],
+        'Control and probe requests are identical; a traversal differential requires distinct control vs probe input.',
+      )
+    }
+    let sawSameSignature = false
+    let sawNoEscape = false
+    for (const prbUrl of nonEchoedProbeUrls) {
+      for (const ctlUrl of ctlExtracted.urls) {
+        if (ctlUrl.signature === prbUrl.signature) {
+          sawSameSignature = true
+          continue
+        }
+        const hostEscaped = prbUrl.host !== ctlUrl.host
+        const bucketEscaped = prbUrl.bucket !== ctlUrl.bucket
+        const escapedParentPrefix = !prbUrl.normalizedParentDir.startsWith(ctlUrl.normalizedParentDir)
+        const injectedNestedDir = !escapedParentPrefix && hasPathInjectionIntoNestedDir(ctlUrl, prbUrl, prbReqText)
+        if (hostEscaped || bucketEscaped || escapedParentPrefix || injectedNestedDir) {
+          const escapeKind = hostEscaped
+            ? 'host_escape'
+            : bucketEscaped
+              ? 'bucket_escape'
+              : escapedParentPrefix
+                ? 'parent_prefix_escape'
+                : 'injected_prefix_escape'
+          return {
+            confirmed: true,
+            variant: 'key_traversal',
+            provider: prbUrl.provider,
+            reason: `Server re-signed a canonicalized ${prbUrl.provider} object path (${prbUrl.canonicalPathname}) escaping control prefix (${ctlUrl.parentDir}) via ${escapeKind} with a distinct server-generated cryptographic signature (${prbUrl.signatureParam}).`,
+            rejectedBy: null,
+            missingEvidence: [],
+            evidence: {
+              variant: 'key_traversal',
+              escapeKind,
+              provider: prbUrl.provider,
+              controlStatus: ctlStatus,
+              probeStatus: prbStatus,
+              controlHost: ctlUrl.host,
+              probeHost: prbUrl.host,
+              controlBucket: ctlUrl.bucket,
+              probeBucket: prbUrl.bucket,
+              controlPathname: ctlUrl.canonicalPathname,
+              probePathname: prbUrl.canonicalPathname,
+              controlParentDir: ctlUrl.parentDir,
+              probeParentDir: prbUrl.parentDir,
+              signatureParam: prbUrl.signatureParam,
+              algorithm: prbUrl.algorithm,
+              signatureDistinct: true,
+            },
+          }
+        }
+        sawNoEscape = true
+      }
+    }
+    if (sawSameSignature && !sawNoEscape) {
+      return fail(
+        'signed_url_identical_signature',
+        ['distinct_server_signature'],
+        'Control and probe returned the identical cryptographic signature; the server did not re-sign a traversed object path.',
+      )
+    }
+    return fail(
+      'signed_url_no_prefix_escape',
+      ['canonical_prefix_or_bucket_escape'],
+      'Probe signed URL remained inside the control directory/prefix with no bucket or parent-prefix escape.',
+      {
+        controlPathname: ctlExtracted.urls[0]?.canonicalPathname ?? null,
+        probePathname: nonEchoedProbeUrls[0]?.canonicalPathname ?? null,
+      },
+    )
+  }
+
+  // Variant B: Unauthenticated privileged write-URL minting (4xx negative control vs unauth 2xx probe)
+  if (ctlIs4xx && requestedVariant !== 'key_traversal') {
+    const ctlExtracted = extractSignedCloudUrls(control)
+    if (ctlExtracted.urls.length > 0) {
+      return fail(
+        'signed_url_control_minted',
+        ['negative_4xx_control'],
+        'Control exchange returned a signed cloud URL despite 4xx status; a clean negative control is required.',
+      )
+    }
+    if (!isUnauthenticatedExchange(probe)) {
+      return fail(
+        'signed_url_probe_authenticated',
+        ['unauthenticated_probe'],
+        'Unauthenticated write-URL minting requires an unauthenticated probe (no persona, session cookie, capability, or Authorization header).',
+      )
+    }
+    const isMutatingRoute = (prbMethod === 'POST' || prbMethod === 'PUT' || prbMethod === 'PATCH')
+      && (probeExtracted.hasWriteEnvelopeHint || WRITE_ROUTE_HINT_RE.test(prbRoute))
+    const writeUrl = nonEchoedProbeUrls.find(u => u.writeCapable || isMutatingRoute)
+    if (!writeUrl) {
+      return fail(
+        'signed_url_not_write_capable',
+        ['write_capable_signed_url'],
+        'Minted signed URL lacks verifiable write-capability (no Azure SAS write/create sp, no GCS/S3 write-signed headers/params, and no mutating upload-URL envelope).',
+      )
+    }
+    return {
+      confirmed: true,
+      variant: 'unauth_write_mint',
+      provider: writeUrl.provider,
+      reason: `Unauthenticated ${prbMethod} ${prbRoute} minted a write-capable ${writeUrl.provider} signed URL (${writeUrl.canonicalPathname}, ${writeUrl.signatureParam}) against a ${ctlStatus} negative control.`,
+      rejectedBy: null,
+      missingEvidence: [],
+      evidence: {
+        variant: 'unauth_write_mint',
+        provider: writeUrl.provider,
+        controlStatus: ctlStatus,
+        probeStatus: prbStatus,
+        probeHost: writeUrl.host,
+        probeBucket: writeUrl.bucket,
+        probePathname: writeUrl.canonicalPathname,
+        signatureParam: writeUrl.signatureParam,
+        algorithm: writeUrl.algorithm,
+        writeReason: writeUrl.writeReason ?? probeExtracted.writeHintReason ?? 'mutating_upload_endpoint',
+        unauthenticated: true,
+      },
+    }
+  }
+
+  return fail(
+    'signed_url_control_invalid',
+    ['valid_control_exchange'],
+    `Control returned status ${ctlStatus ?? 'null'}; expected 2xx signed-URL control for key_traversal or 4xx negative control for unauth_write_mint.`,
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Synthetic authMutation passthrough validation (paired with @fix-synth-auth-probe)
+// ---------------------------------------------------------------------------
+
+const SYNTHETIC_AUTH_MUTATION_KINDS = new Set(['synthetic_invalid_bearer', 'synthetic_invalid_api_key'])
+const PERSONA_AUTH_MUTATION_KINDS = new Set([
+  'alg_none',
+  'strip_signature',
+  'expired_replay',
+  'rs256_to_hs256_jwks',
+  'kid_inject',
+  'jku_x5u_canary',
+  'claim_swap',
+])
+const SAFE_API_KEY_HEADER_RE = /^[A-Za-z0-9_-]{1,64}$/
+
+/**
+ * Validate and normalize RPC `authMutation` arguments.
+ * Allows `synthetic_invalid_bearer` and `synthetic_invalid_api_key` without a persona handle,
+ * while keeping persona-mutating kinds strictly fail-closed when `persona` is absent.
+ */
+export function parseVerifyAuthMutation(
+  raw: unknown,
+  persona: string | undefined,
+): Record<string, unknown> | undefined {
+  if (raw === undefined || raw === null) return undefined
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error('authMutation must be an object with a valid `kind`.')
+  }
+  const rec = raw as Record<string, unknown>
+  const kind = typeof rec.kind === 'string' ? rec.kind.trim() : ''
+  if (SYNTHETIC_AUTH_MUTATION_KINDS.has(kind)) {
+    if (kind === 'synthetic_invalid_api_key' && rec.headerName !== undefined) {
+      if (typeof rec.headerName !== 'string' || !SAFE_API_KEY_HEADER_RE.test(rec.headerName.trim())) {
+        throw new Error('authMutation.headerName must be a valid HTTP header token.')
+      }
+      return { kind, headerName: rec.headerName.trim() }
+    }
+    return { kind }
+  }
+  if (!PERSONA_AUTH_MUTATION_KINDS.has(kind)) {
+    throw new Error(`Unsupported authMutation kind "${kind || '<empty>'}".`)
+  }
+  if (!persona) {
+    throw new Error('authMutation requires an approved persona handle.')
+  }
+  return { ...rec, kind }
+}
+
+// ---------------------------------------------------------------------------
+// P1 #6: ScopedBrowser -> VerifyBrowserDriver adapter & run/grant registry
+// ---------------------------------------------------------------------------
+
+export interface ScopedBrowserLike {
+  visitPage(
+    req: {
+      origin: string
+      pathAndQuery: string
+      persona?: string
+      runId?: string
+      assignmentId?: string
+      selector?: string
+      timeoutMs?: number
+      readOnlyMode?: boolean
+    },
+    grant: Grant,
+    signal: AbortSignal,
+  ): Promise<{
+    finalUrl: string
+    title: string
+    status: number | null
+    domSnippet: string
+    canaryCheck?: { token: string | null; triggered: boolean; attested?: boolean }
+    attestedSinks?: string[]
+    attestation?: { verified: boolean; attestedSinks: string[] }
+  }>
+}
+
+export interface VerifyBrowserDriverLike {
+  open(
+    request: {
+      url: string
+      origin: string
+      personaHandle: string | null
+      headers: Record<string, string>
+      waitForSelector?: string
+      timeoutMs: number
+    },
+    signal: AbortSignal,
+  ): Promise<{
+    status: number
+    url: string
+    html: string
+    title?: string
+    executedSentinels?: string[]
+  }>
+}
+
+const grantBrowserRegistry = new WeakMap<Grant, ScopedBrowserLike>()
+const runBrowserRegistry = new Map<string, ScopedBrowserLike>()
+const MAX_REGISTERED_RUN_BROWSERS = 512
+
+/** Bind a run's `ScopedBrowser` to an issued `Grant` (auto-GC'd with the Grant). */
+export function bindScopedBrowserToGrant(grant: Grant, browser: ScopedBrowserLike): void {
+  if ((grant.tier ?? 0) < 1) return
+  grantBrowserRegistry.set(grant, browser)
+}
+
+/** Register a run's `ScopedBrowser` by runId (bounded LRU cap) for Tier >= 1 `kovo_verify` runs. */
+export function registerScopedBrowserForRun(runId: string, browser: ScopedBrowserLike): void {
+  const key = runId.trim()
+  if (!key) return
+  if (runBrowserRegistry.has(key)) runBrowserRegistry.delete(key)
+  runBrowserRegistry.set(key, browser)
+  if (runBrowserRegistry.size > MAX_REGISTERED_RUN_BROWSERS) {
+    const oldest = runBrowserRegistry.keys().next().value
+    if (oldest !== undefined) runBrowserRegistry.delete(oldest)
+  }
+}
+
+export function unregisterScopedBrowserForRun(runId: string): void {
+  runBrowserRegistry.delete(runId.trim())
+}
+
+/** Wrap a `ScopedBrowser` instance as a `VerifyBrowserDriver` for `VerifyRpcServer` (`ctx.browser()`). */
+function createScopedBrowserVerifyDriver(
+  browser: ScopedBrowserLike,
+  ctx: { grant: Grant; runId: string; assignmentId: string },
+): VerifyBrowserDriverLike {
+  return {
+    async open(request, signal) {
+      const parsed = new URL(request.url)
+      const pathAndQuery = `${parsed.pathname}${parsed.search}${parsed.hash}`
+      const visit = await browser.visitPage(
+        {
+          origin: request.origin,
+          pathAndQuery,
+          ...(request.personaHandle ? { persona: request.personaHandle } : {}),
+          runId: ctx.runId,
+          assignmentId: ctx.assignmentId,
+          ...(request.waitForSelector ? { selector: request.waitForSelector } : {}),
+          timeoutMs: request.timeoutMs,
+          readOnlyMode: true,
+        },
+        ctx.grant,
+        signal,
+      )
+      const sentinels = new Set<string>()
+      for (const sink of visit.attestedSinks ?? []) if (sink) sentinels.add(sink)
+      if (visit.attestation?.verified) {
+        for (const sink of visit.attestation.attestedSinks ?? []) if (sink) sentinels.add(sink)
+      }
+      if (visit.canaryCheck?.attested && visit.canaryCheck.token) {
+        sentinels.add(visit.canaryCheck.token)
+      }
+      return {
+        status: visit.status ?? 200,
+        url: visit.finalUrl || request.url,
+        html: visit.domSnippet ?? '',
+        ...(visit.title ? { title: visit.title } : {}),
+        executedSentinels: [...sentinels],
+      }
+    },
+  }
+}
+
+/**
+ * Resolve the effective `VerifyBrowserDriver` for a `VerifyRpcServer` session:
+ *   1. Explicit `options.browser` always wins (tests & custom drivers).
+ *   2. For Tier >= 1 runs, falls back to the `ScopedBrowser` bound to `grant` or `runId`.
+ *   3. Tier 0 runs fail closed (`undefined`).
+ */
+export function resolveScopedBrowserDriverForVerify(options: {
+  explicitDriver?: VerifyBrowserDriverLike
+  grant: Grant
+  runId: string
+  assignmentId: string
+}): VerifyBrowserDriverLike | undefined {
+  if (options.explicitDriver) return options.explicitDriver
+  if ((options.grant.tier ?? 0) < 1) return undefined
+  const scoped = grantBrowserRegistry.get(options.grant) ?? runBrowserRegistry.get(options.runId.trim())
+  if (!scoped) return undefined
+  return createScopedBrowserVerifyDriver(scoped, {
+    grant: options.grant,
+    runId: options.runId,
+    assignmentId: options.assignmentId,
   })
 }
