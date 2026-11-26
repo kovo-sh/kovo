@@ -41,6 +41,38 @@ export type AdmissionScopeHopValidator = (url: URL, redirectHop: boolean) => Adm
 export const FORBIDDEN_CALLER_HEADERS =
   /^(?:authorization|proxy-authorization|cookie|host|content-length|transfer-encoding|x-kovo-trace-id)$/i
 
+export const SYNTHETIC_INVALID_BEARER_PREFIX = 'kovo-invalid-auth-probe-'
+export const SYNTHETIC_INVALID_API_KEY_PREFIX = 'kovo-invalid-api-key-probe-'
+
+const SYNTHETIC_INVALID_BEARER_HEADER_RE =
+  /^Bearer\s+kovo-invalid-auth-probe-[a-f0-9]{12,64}\s*$/i
+
+const SYNTHETIC_API_KEY_HEADER_ALLOWLIST: Readonly<Record<string, string>> = {
+  'x-api-key': 'X-API-Key',
+  'x-auth-token': 'X-Auth-Token',
+  'x-access-token': 'X-Access-Token',
+  'x-session-token': 'X-Session-Token',
+}
+
+export type SyntheticAuthMutation =
+  | { kind: 'synthetic_invalid_bearer' }
+  | { kind: 'synthetic_invalid_api_key'; headerName?: string }
+
+export type BrokerAuthMutation = AuthMutation | SyntheticAuthMutation
+
+export function isSyntheticAuthMutation(
+  mutation: BrokerAuthMutation | undefined,
+): mutation is SyntheticAuthMutation {
+  return mutation?.kind === 'synthetic_invalid_bearer' || mutation?.kind === 'synthetic_invalid_api_key'
+}
+
+export function resolveSyntheticApiKeyHeaderName(headerName?: string): string | null {
+  if (headerName === undefined || headerName.trim() === '') return 'X-API-Key'
+  const trimmed = headerName.trim()
+  if (!isValidHttpToken(trimmed) || FORBIDDEN_CALLER_HEADERS.test(trimmed)) return null
+  return SYNTHETIC_API_KEY_HEADER_ALLOWLIST[trimmed.toLowerCase()] ?? null
+}
+
 export type AdmissionTier = 'offline' | 'passive' | 'supervised' | 'autonomous'
 export type AdmissionOutcome = 'allow' | 'deny' | 'require_approval'
 
@@ -162,7 +194,7 @@ export interface AdmissionRequest {
   body?: string
   multipartParts?: readonly MultipartBodyPart[]
   personaHandle?: string | null
-  authMutation?: AuthMutation
+  authMutation?: BrokerAuthMutation
   scopeHook?: ScopeHook | null
   surface?: ScopeSurface
   redirectHop?: boolean
@@ -382,6 +414,10 @@ export function resolveGrantApprovalContext(grant: Pick<AdmissionGrant, 'approva
   return { effectivePolicy, liveEnvironmentMode, explicitEnvironmentMode }
 }
 
+function isSyntheticInvalidBearerHeader(name: string, value: string): boolean {
+  return /^authorization$/i.test(name) && SYNTHETIC_INVALID_BEARER_HEADER_RE.test(value)
+}
+
 /**
  * Positive-only self-minted unsigned JWT shape (`alg:none` / signature-bypass probe): a three-segment
  * JWT whose signature segment is empty. Every other caller-set Authorization value stays forbidden.
@@ -458,7 +494,10 @@ export function validateCallerHeaders(
       }
     }
     if (FORBIDDEN_CALLER_HEADERS.test(canonicalName)) {
-      const selfMintedOk = allowSelfMinted && isSelfMintedBearer(canonicalName, v)
+      const selfMintedOk = allowSelfMinted && (
+        isSelfMintedBearer(canonicalName, v) ||
+        isSyntheticInvalidBearerHeader(canonicalName, v)
+      )
       let ephemeralOk = false
       if (!selfMintedOk && canonicalName === 'authorization' && options.isAuthorizedEphemeralBearer) {
         const bearer = extractBearerTokenDigest(canonicalName, v)
@@ -1579,7 +1618,16 @@ export class RequestAdmissionEngine {
           'Broker authMutation primitives require Tier 2 or higher.',
           { normalizedOrigin: initialOrigin, normalizedPath, localLab, parsedUrl: url })
       }
-      if (!request.personaHandle) {
+      if (isSyntheticAuthMutation(request.authMutation)) {
+        if (request.authMutation.kind === 'synthetic_invalid_api_key') {
+          const resolvedHeader = resolveSyntheticApiKeyHeaderName(request.authMutation.headerName)
+          if (!resolvedHeader) {
+            return build('deny', 'invalid_header', 'auth_mutation:invalid_synthetic_api_key_header',
+              'synthetic_invalid_api_key headerName must be an allowlisted API-key header (X-API-Key, X-Auth-Token, X-Access-Token, or X-Session-Token).',
+              { normalizedOrigin: initialOrigin, normalizedPath, localLab, parsedUrl: url })
+          }
+        }
+      } else if (!request.personaHandle) {
         return build('deny', 'persona_required', 'auth_mutation:persona_required',
           'authMutation requires an approved persona handle.',
           { normalizedOrigin: initialOrigin, normalizedPath, localLab, parsedUrl: url })

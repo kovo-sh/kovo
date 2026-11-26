@@ -11,7 +11,7 @@ import { EgressDeniedError, EgressGateway, isMetadataOrLinkLocalAddress } from '
 import { isIpLiteralHost, registrableApex } from './public-suffix.ts'
 import type { ApprovalPolicy, ApprovedEndpointPattern, CapabilityTier, HttpMethod, PreparedObservation } from '../domain.ts'
 import { cacheBusterValueRegex, containsWebshellSignature } from '../replay-spec.ts'
-import type { AuthMutation, CsrfBind } from '../replay-spec.ts'
+import type { CsrfBind } from '../replay-spec.ts'
 import { isLocalLabAutoApprovalOrigin } from './approval-judge.ts'
 import type { StateChangeApprovalContext } from './approval-judge.ts'
 import { scanSecondOrderMarkers } from './canary-broker.ts'
@@ -26,11 +26,20 @@ import {
   defaultRequestAdmissionEngine,
   hasDestructiveContent,
   isLocalLabEnabled,
+  isSyntheticAuthMutation,
   isValidWebsocketSubprotocol,
   RequestAdmissionEngine,
+  resolveSyntheticApiKeyHeaderName,
+  SYNTHETIC_INVALID_API_KEY_PREFIX,
+  SYNTHETIC_INVALID_BEARER_PREFIX,
   validateCallerHeaders,
 } from './request-admission.ts'
-import type { AdmissionDecision, AdmissionRequest, ValidateCallerHeadersOptions } from './request-admission.ts'
+import type {
+  AdmissionDecision,
+  AdmissionRequest,
+  BrokerAuthMutation,
+  ValidateCallerHeadersOptions,
+} from './request-admission.ts'
 import { globalKillSwitch, KillSwitchTrippedError } from './kill-switch.ts'
 import type { GlobalKillSwitch } from './kill-switch.ts'
 import {
@@ -93,7 +102,7 @@ export interface BrokerHttpRequest {
   session?: string
   sessionGroupRole?: 'setup' | 'control' | 'probe' | 'cleanup'
   csrfBind?: CsrfBind
-  authMutation?: AuthMutation
+  authMutation?: BrokerAuthMutation
   probeClass?: string
   cacheVerify?: boolean
   traceId?: string
@@ -490,7 +499,7 @@ const sessionHandleRegex = /^[a-z0-9_-]{1,32}$/
 const csrfCookieNameRegex = /^(?:xsrf-token|csrf[_-]?token|_csrf|csrf)$/i
 const csrfInputNameRegex = /^(?:_csrf|csrf[_-]?token|csrfmiddlewaretoken|__RequestVerificationToken|authenticity_token|_token)$/i
 const crossOriginSensitiveHeaders = new Set([
-  'authorization', 'proxy-authorization', 'cookie', 'x-api-key', 'x-auth-token',
+  'authorization', 'proxy-authorization', 'cookie', 'x-api-key', 'x-auth-token', 'x-access-token', 'x-session-token',
 ])
 const postToGetContentHeaders = new Set(['content-type', 'content-encoding', 'content-length'])
 const canaryUrlRegex = /^\/c\/kovo-canary-[a-f0-9]{24}$/i
@@ -3435,6 +3444,7 @@ export class RequestBroker {
     localLab: boolean
     personaHandle: string | undefined
     resolvedPersonaHeaders: Record<string, string> | undefined
+    syntheticAuthHeader?: { name: string; value: string }
     cleanHeaders: Record<string, string>
     ephemeralObservedAuth: boolean
     preparedBody: string | undefined
@@ -3463,13 +3473,14 @@ export class RequestBroker {
     }
 
     const personaHandle = req.persona ?? req.personaHandle
+    const syntheticAuth = isSyntheticAuthMutation(req.authMutation)
     const admissionReq = this.toAdmissionRequest(req, options, grant)
     const auditCtx = { pathAndQuery: req.pathAndQuery, persona: personaHandle, secrets: req.secrets, runId: req.runId }
 
     // Pre-flight static admission when persona or cache-buster checks must fail before consuming
     // single-use Tier-3 approval grants.
     let decision = options.preAdmitted
-    if (!decision && (personaHandle || req.probeClass === 'cache_poison_deception' || req.probeClass === 'cache_differential')) {
+    if (!decision && ((personaHandle && !syntheticAuth) || req.probeClass === 'cache_poison_deception' || req.probeClass === 'cache_differential')) {
       const pre = this.admissionEngine.admit(admissionReq, grant, { evaluateConsumingHooks: false })
       this.enforceAdmission(pre, auditCtx, grant)
       const preOrigin = pre.normalizedOrigin
@@ -3477,7 +3488,7 @@ export class RequestBroker {
       if (req.probeClass === 'cache_poison_deception' || req.probeClass === 'cache_differential') {
         this.validateCacheBuster(req, preUrl, preOrigin, personaHandle, grant)
       }
-      if (personaHandle) {
+      if (personaHandle && !syntheticAuth) {
         this.resolvePersonaHeadersForRequest(req, grant, preOrigin, personaHandle)
       }
     }
@@ -3495,7 +3506,7 @@ export class RequestBroker {
     if (options.preAdmitted && (req.probeClass === 'cache_poison_deception' || req.probeClass === 'cache_differential')) {
       this.validateCacheBuster(req, url, initialOrigin, personaHandle, grant)
     }
-    const resolvedPersonaHeaders = personaHandle
+    const resolvedPersonaHeaders = personaHandle && !syntheticAuth
       ? this.resolvePersonaHeadersForRequest(req, grant, initialOrigin, personaHandle)
       : undefined
 
@@ -3636,9 +3647,8 @@ export class RequestBroker {
     grant: Grant,
     signal: AbortSignal,
   ): Promise<void> {
-    if (!req.authMutation || !prepared.resolvedPersonaHeaders) return
+    if (!req.authMutation) return
     const mutation = req.authMutation
-    const hdrs = prepared.resolvedPersonaHeaders
     const deny: (reason: string) => never = (reason: string): never => {
       this.auditDenied(
         grant,
@@ -3653,6 +3663,37 @@ export class RequestBroker {
       )
       throw new BrokerDenied(reason)
     }
+
+    if (isSyntheticAuthMutation(mutation)) {
+      const authRunKey = this.resolveScopeRunKey(req, grant)
+      const runNonce = createHash('sha256')
+        .update(`kovo-synthetic-invalid-auth-probe:v1:${authRunKey}`)
+        .digest('hex')
+        .slice(0, 16)
+      if (mutation.kind === 'synthetic_invalid_bearer') {
+        prepared.syntheticAuthHeader = {
+          name: 'Authorization',
+          value: `Bearer ${SYNTHETIC_INVALID_BEARER_PREFIX}${runNonce}`,
+        }
+      } else {
+        const headerName = resolveSyntheticApiKeyHeaderName(mutation.headerName)
+        if (!headerName) {
+          deny('synthetic_invalid_api_key headerName must be an allowlisted API-key header (X-API-Key, X-Auth-Token, X-Access-Token, or X-Session-Token).')
+        }
+        prepared.syntheticAuthHeader = {
+          name: headerName,
+          value: `${SYNTHETIC_INVALID_API_KEY_PREFIX}${runNonce}`,
+        }
+      }
+      // Guarantee zero persona credential leakage and accurate `caller_self_minted` wire provenance.
+      prepared.resolvedPersonaHeaders = undefined
+      prepared.personaHandle = undefined
+      prepared.ephemeralObservedAuth = false
+      return
+    }
+
+    if (!prepared.resolvedPersonaHeaders) return
+    const hdrs = prepared.resolvedPersonaHeaders
 
     // Locate JWT in Authorization: Bearer <jwt> or Cookie header value
     let jwtSource: { kind: 'header'; key: string } | { kind: 'cookie'; key: string; cookieName: string } | null = null
@@ -4031,6 +4072,13 @@ export class RequestBroker {
             vaultHeaderNames.push(k.toLowerCase())
           }
         }
+      }
+      if (prepared.syntheticAuthHeader && !stripSensitiveHeaders) {
+        setHeaderCaseInsensitive(
+          outboundHeaders,
+          prepared.syntheticAuthHeader.name,
+          prepared.syntheticAuthHeader.value,
+        )
       }
 
       if (localLab && req.traceId && !/[\r\n\0]/.test(req.traceId)) {
@@ -4537,6 +4585,9 @@ export class RequestBroker {
             vaultHeaderNames.push(k.toLowerCase())
           }
         }
+      }
+      if (prepared.syntheticAuthHeader) {
+        outboundHeaders[prepared.syntheticAuthHeader.name.toLowerCase()] = prepared.syntheticAuthHeader.value
       }
 
       const mergedCookies = new Map<string, string>()
