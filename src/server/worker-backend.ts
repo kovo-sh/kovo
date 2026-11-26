@@ -1227,6 +1227,79 @@ const GIT_CREDENTIAL_FILE_RE = /(?:^|\/)\.git\/(?:config|credentials|fetch_head)
 const GIT_CONFIG_FILE_RE = /(?:^|\/)\.git\/config$/i
 const GIT_CONFIG_SECRET_RE = /^\s*\[credential(?:\s|\])|extraheader|^\s*(?:username|password|token)\s*=|https?:\/\/[^/@\s]+@/im
 
+export const DEFAULT_MAX_STAGE_BYTES = 256 * 1024 * 1024
+export const DEFAULT_MAX_STAGE_FILES = 50_000
+export const DEFAULT_MAX_STAGE_DEPTH = 32
+
+export class RepoStagingQuotaExceededError extends Error {
+  readonly code: 'REPO_STAGING_BYTES_EXCEEDED' | 'REPO_STAGING_FILES_EXCEEDED' | 'REPO_STAGING_DEPTH_EXCEEDED'
+  readonly status = 413
+  readonly limitKind: 'bytes' | 'files' | 'depth'
+  readonly actual: number
+  readonly limit: number
+  readonly offendingPath?: string
+
+  constructor(limitKind: 'bytes' | 'files' | 'depth', actual: number, limit: number, offendingPath?: string) {
+    const code = limitKind === 'bytes'
+      ? 'REPO_STAGING_BYTES_EXCEEDED'
+      : limitKind === 'files'
+        ? 'REPO_STAGING_FILES_EXCEEDED'
+        : 'REPO_STAGING_DEPTH_EXCEEDED'
+    const label = limitKind === 'bytes'
+      ? 'staging byte cap'
+      : limitKind === 'files'
+        ? 'staging file/inode cap'
+        : 'staging directory depth cap'
+    super(
+      `Repository staging exceeded the ${label} (${actual} > ${limit} limit${offendingPath ? ` at "${offendingPath}"` : ''}).`,
+    )
+    this.name = 'RepoStagingQuotaExceededError'
+    this.code = code
+    this.limitKind = limitKind
+    this.actual = actual
+    this.limit = limit
+    this.offendingPath = offendingPath
+  }
+}
+
+export interface StageReposLimits {
+  maxBytes?: number
+  maxFiles?: number
+  maxInodes?: number
+  maxDepth?: number
+}
+
+function parsePositiveStageEnvInt(env: NodeJS.ProcessEnv, name: string): number | undefined {
+  const raw = env[name]?.trim()
+  if (!raw) return undefined
+  const parsed = Number(raw)
+  if (!Number.isFinite(parsed) || parsed <= 0) return undefined
+  return Math.floor(parsed)
+}
+
+function resolveStageLimits(
+  options?: StageReposLimits & { env?: NodeJS.ProcessEnv },
+): { maxBytes: number; maxFiles: number; maxInodes: number; maxDepth: number } {
+  const env = options?.env ?? process.env
+  const maxBytes = Math.max(
+    1,
+    Math.floor(options?.maxBytes ?? parsePositiveStageEnvInt(env, 'KOVO_MAX_STAGE_REPO_BYTES') ?? DEFAULT_MAX_STAGE_BYTES),
+  )
+  const maxFiles = Math.max(
+    1,
+    Math.floor(options?.maxFiles ?? parsePositiveStageEnvInt(env, 'KOVO_MAX_STAGE_REPO_FILES') ?? DEFAULT_MAX_STAGE_FILES),
+  )
+  const maxInodes = Math.max(
+    maxFiles,
+    Math.floor(options?.maxInodes ?? maxFiles * 2),
+  )
+  const maxDepth = Math.max(
+    0,
+    Math.floor(options?.maxDepth ?? parsePositiveStageEnvInt(env, 'KOVO_MAX_STAGE_REPO_DEPTH') ?? DEFAULT_MAX_STAGE_DEPTH),
+  )
+  return { maxBytes, maxFiles, maxInodes, maxDepth }
+}
+
 function isSensitiveRepoEntry(relPosixPath: string, entryName: string, isDir: boolean): boolean {
   const relLower = relPosixPath.toLowerCase()
   const nameLower = entryName.toLowerCase()
@@ -1258,13 +1331,26 @@ function gitConfigHasCredentials(filePath: string): boolean {
   }
 }
 
-function reposTreeNeedsStaging(resolvedRoot: string): boolean {
+function reposTreeNeedsStaging(
+  resolvedRoot: string,
+  limits: { maxDepth: number; maxFiles: number; maxInodes: number },
+): boolean {
   const rootStat = statSync(resolvedRoot)
   // Non-root worker container (UID 10001) needs o+rx on `/repos` and every subdirectory,
   // and o+r on every non-secret file inside it.
-  if ((rootStat.mode & 0o005) !== 0o005) return true
+  let needsStaging = (rootStat.mode & 0o005) !== 0o005
+  let inspectedFiles = 0
+  let inspectedInodes = 0
 
-  const inspect = (dir: string): boolean => {
+  const inspect = (dir: string, depth: number): void => {
+    if (depth > limits.maxDepth) {
+      throw new RepoStagingQuotaExceededError(
+        'depth',
+        depth,
+        limits.maxDepth,
+        relative(resolvedRoot, dir).split(sep).join('/'),
+      )
+    }
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
       const fullPath = join(dir, entry.name)
       const st = lstatSync(fullPath)
@@ -1277,42 +1363,58 @@ function reposTreeNeedsStaging(resolvedRoot: string): boolean {
           const hooksDir = join(fullPath, 'hooks')
           if (existsSync(hooksDir)) {
             try {
-              if ((lstatSync(hooksDir).mode & 0o005) !== 0) return true
+              if ((lstatSync(hooksDir).mode & 0o005) !== 0) needsStaging = true
             } catch { /* ignore */ }
           }
           const configFile = join(fullPath, 'config')
           if (existsSync(configFile)) {
             try {
               const cfgStat = lstatSync(configFile)
-              if ((cfgStat.mode & 0o004) !== 0 && gitConfigHasCredentials(configFile)) return true
+              if ((cfgStat.mode & 0o004) !== 0 && gitConfigHasCredentials(configFile)) needsStaging = true
             } catch {
-              return true
+              needsStaging = true
             }
           }
           continue
         }
         if (isSensitiveRepoEntry(relPosix, entry.name, true)) {
-          if ((st.mode & 0o005) !== 0) return true
+          if ((st.mode & 0o005) !== 0) needsStaging = true
           continue
         }
-        if ((st.mode & 0o005) !== 0o005) return true
-        if (inspect(fullPath)) return true
+        inspectedInodes += 1
+        if (inspectedInodes > limits.maxInodes) {
+          throw new RepoStagingQuotaExceededError('files', inspectedInodes, limits.maxInodes, relPosix)
+        }
+        const nextDepth = depth + 1
+        if (nextDepth > limits.maxDepth) {
+          throw new RepoStagingQuotaExceededError('depth', nextDepth, limits.maxDepth, relPosix)
+        }
+        if ((st.mode & 0o005) !== 0o005) needsStaging = true
+        inspect(fullPath, nextDepth)
       } else if (st.isFile()) {
         if (isSensitiveRepoEntry(relPosix, entry.name, false)) {
           if (GIT_CONFIG_FILE_RE.test(relPosix)) {
-            if ((st.mode & 0o004) !== 0 && gitConfigHasCredentials(fullPath)) return true
+            if ((st.mode & 0o004) !== 0 && gitConfigHasCredentials(fullPath)) needsStaging = true
             continue
           }
-          if ((st.mode & 0o004) !== 0) return true
+          if ((st.mode & 0o004) !== 0) needsStaging = true
           continue
         }
-        if ((st.mode & 0o004) !== 0o004) return true
+        inspectedFiles += 1
+        inspectedInodes += 1
+        if (inspectedFiles > limits.maxFiles) {
+          throw new RepoStagingQuotaExceededError('files', inspectedFiles, limits.maxFiles, relPosix)
+        }
+        if (inspectedInodes > limits.maxInodes) {
+          throw new RepoStagingQuotaExceededError('files', inspectedInodes, limits.maxInodes, relPosix)
+        }
+        if ((st.mode & 0o004) !== 0o004) needsStaging = true
       }
     }
-    return false
   }
 
-  return inspect(resolvedRoot)
+  inspect(resolvedRoot, 0)
+  return needsStaging
 }
 
 function resolveStageReposBaseDir(stageDirMode: number, env: NodeJS.ProcessEnv = process.env): string {
@@ -1333,11 +1435,12 @@ function resolveStageReposBaseDir(stageDirMode: number, env: NodeJS.ProcessEnv =
 export function stageReadableReposTree(
   resolvedRoot: string,
   targetDir?: string,
-  options?: { env?: NodeJS.ProcessEnv; onTargetResolved?: (mountDir: string) => void },
-): { mountDir: string; excludedCount: number } {
+  options?: StageReposLimits & { env?: NodeJS.ProcessEnv; onTargetResolved?: (mountDir: string) => void },
+): { mountDir: string; excludedCount: number; stagedBytes: number; stagedFiles: number } {
   const sameContainerUid = isContainerUid10001()
   const stageDirMode = sameContainerUid ? 0o700 : 0o755
   const stageFileMode = sameContainerUid ? 0o600 : 0o644
+  const { maxBytes, maxFiles, maxInodes, maxDepth } = resolveStageLimits(options)
   let mountDir: string
   let createdTargetDir = false
   if (targetDir) {
@@ -1367,9 +1470,20 @@ export function stageReadableReposTree(
 
   options?.onTargetResolved?.(mountDir)
   let excludedCount = 0
+  let stagedBytes = 0
+  let stagedFiles = 0
+  let stagedInodes = 0
   const createdChildren: string[] = []
 
-  const copyDir = (srcDir: string, dstDir: string) => {
+  const copyDir = (srcDir: string, dstDir: string, depth: number) => {
+    if (depth > maxDepth) {
+      throw new RepoStagingQuotaExceededError(
+        'depth',
+        depth,
+        maxDepth,
+        relative(resolvedRoot, srcDir).split(sep).join('/'),
+      )
+    }
     for (const entry of readdirSync(srcDir, { withFileTypes: true })) {
       const srcChild = join(srcDir, entry.name)
       const st = lstatSync(srcChild)
@@ -1396,26 +1510,50 @@ export function stageReadableReposTree(
           excludedCount += 1
           continue
         }
+        const nextDepth = depth + 1
+        if (nextDepth > maxDepth) {
+          throw new RepoStagingQuotaExceededError('depth', nextDepth, maxDepth, relPosix)
+        }
+        stagedInodes += 1
+        if (stagedInodes > maxInodes) {
+          throw new RepoStagingQuotaExceededError('files', stagedInodes, maxInodes, relPosix)
+        }
         const dstChild = join(dstDir, entry.name)
         mkdirSync(dstChild)
         if (dstDir === mountDir) createdChildren.push(dstChild)
         chmodSync(dstChild, stageDirMode)
-        copyDir(srcChild, dstChild)
+        copyDir(srcChild, dstChild, nextDepth)
       } else if (st.isFile()) {
         if (isSensitiveRepoEntry(relPosix, entry.name, false)) {
           excludedCount += 1
           continue
         }
+        if (stagedFiles + 1 > maxFiles) {
+          throw new RepoStagingQuotaExceededError('files', stagedFiles + 1, maxFiles, relPosix)
+        }
+        if (stagedInodes + 1 > maxInodes) {
+          throw new RepoStagingQuotaExceededError('files', stagedInodes + 1, maxInodes, relPosix)
+        }
+        if (stagedBytes + st.size > maxBytes) {
+          throw new RepoStagingQuotaExceededError('bytes', stagedBytes + st.size, maxBytes, relPosix)
+        }
         const dstChild = join(dstDir, entry.name)
         if (dstDir === mountDir) createdChildren.push(dstChild)
         copyFileSync(srcChild, dstChild)
         chmodSync(dstChild, stageFileMode)
+        const copiedStat = lstatSync(dstChild)
+        stagedFiles += 1
+        stagedInodes += 1
+        stagedBytes += copiedStat.size
+        if (stagedBytes > maxBytes) {
+          throw new RepoStagingQuotaExceededError('bytes', stagedBytes, maxBytes, relPosix)
+        }
       }
     }
   }
 
   try {
-    copyDir(resolvedRoot, mountDir)
+    copyDir(resolvedRoot, mountDir, 0)
   } catch (error) {
     if (createdTargetDir) {
       liveStagedRepoDirs.delete(mountDir)
@@ -1428,7 +1566,7 @@ export function stageReadableReposTree(
     }
     throw error
   }
-  return { mountDir, excludedCount }
+  return { mountDir, excludedCount, stagedBytes, stagedFiles }
 }
 
 function isInsideScratchSubdir(containerScratchDir: string, candidate: string): boolean {
@@ -1450,7 +1588,7 @@ function isInsideScratchSubdir(containerScratchDir: string, candidate: string): 
  */
 export function prepareReposMount(
   reposDir?: string,
-  doodOptions?: { sessionId?: string; env?: NodeJS.ProcessEnv },
+  doodOptions?: StageReposLimits & { sessionId?: string; env?: NodeJS.ProcessEnv },
 ): PreparedReposMount | null {
   if (!reposDir) return null
   if (/[\0,\r\n]/.test(reposDir)) {
@@ -1466,9 +1604,10 @@ export function prepareReposMount(
     throw new Error('Invalid resolved repository mount path.')
   }
   const env = doodOptions?.env ?? process.env
+  const stageLimits = resolveStageLimits({ ...doodOptions, env })
   const dood = resolveDoodScratchConfig(env)
   const needsDoodStage = dood !== null && !isInsideScratchSubdir(dood.containerScratchDir, resolved)
-  if (!needsDoodStage && !reposTreeNeedsStaging(resolved)) {
+  if (!needsDoodStage && !reposTreeNeedsStaging(resolved, stageLimits)) {
     return {
       mountDir: resolved,
       staged: false,
@@ -1485,6 +1624,10 @@ export function prepareReposMount(
   try {
     ({ mountDir, excludedCount } = stageReadableReposTree(resolved, stageTarget, {
       env,
+      maxBytes: stageLimits.maxBytes,
+      maxFiles: stageLimits.maxFiles,
+      maxInodes: stageLimits.maxInodes,
+      maxDepth: stageLimits.maxDepth,
       onTargetResolved: dir => {
         trackedMountDir = dir
         trackLiveStagedRepoDir(dir)

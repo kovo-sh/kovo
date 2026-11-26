@@ -5,6 +5,7 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
+  promises as fsp,
   readdirSync,
   readFileSync,
   readlinkSync,
@@ -87,6 +88,18 @@ export interface GithubSyncOptions {
   maxRepoDiskBytes?: number
   /** Maximum combined on-disk size in bytes allowed across all mounted repos for one project (default 1 GiB). */
   maxProjectDiskBytes?: number
+  /** Maximum file count (inode cap) allowed for a single cloned repository (default 50,000). */
+  maxRepoFiles?: number
+  /** Maximum directory nesting depth allowed inside a repository tree (default 32). */
+  maxRepoDepth?: number
+  /** Optional observability hook invoked after pre-checkout tree quota checks pass and immediately before `git checkout`. */
+  onBeforeCheckout?: (info: {
+    stagingDir: string
+    blobBytes: number
+    fileCount: number
+    inodeCount: number
+    maxDepth: number
+  }) => void
   /** Explicitly allow or disallow `file://` git origins (disabled in production; allowed in test runtime unless false). */
   allowLocalFileProtocol?: boolean
   /** Whether to query GitHub `/repos/<owner>/<repo>` size metadata prior to cloning when using HTTP(S) origins. */
@@ -109,6 +122,9 @@ export interface RepoCommitDiffMining {
 export const DEFAULT_CLONE_DEPTH = 1
 export const DEFAULT_MAX_REPO_DISK_BYTES = 256 * 1024 * 1024
 export const DEFAULT_MAX_PROJECT_DISK_BYTES = 1024 * 1024 * 1024
+export const DEFAULT_MAX_REPO_FILES = 50_000
+export const DEFAULT_MAX_PROJECT_FILES = 200_000
+export const DEFAULT_MAX_REPO_DEPTH = 32
 
 export class RepoWorkspaceBusyError extends Error {
   readonly code: 'REPO_ACTIVE_RUN_LOCKED' | 'REPO_SYNC_IN_PROGRESS'
@@ -145,6 +161,51 @@ export class RepoDiskQuotaExceededError extends Error {
     this.repoFullName = repoFullName
     this.actualBytes = actualBytes
     this.quotaBytes = quotaBytes
+  }
+}
+
+export class RepoDepthLimitExceededError extends Error {
+  readonly code = 'REPO_DEPTH_LIMIT_EXCEEDED'
+  readonly status = 413
+  readonly target: string
+  readonly depth: number
+  readonly maxDepth: number
+  readonly offendingPath?: string
+
+  constructor(target: string, depth: number, maxDepth: number, offendingPath?: string) {
+    super(
+      `Repository "${target}" exceeded the maximum directory depth (${depth} > ${maxDepth} limit${offendingPath ? ` at "${offendingPath}"` : ''}).`,
+    )
+    this.name = 'RepoDepthLimitExceededError'
+    this.target = target
+    this.depth = depth
+    this.maxDepth = maxDepth
+    this.offendingPath = offendingPath
+  }
+}
+
+export class RepoFileLimitExceededError extends Error {
+  readonly code = 'REPO_FILE_LIMIT_EXCEEDED'
+  readonly status = 413
+  readonly scope: 'repo' | 'project' | 'directory'
+  readonly target: string
+  readonly actualFiles: number
+  readonly maxFiles: number
+
+  constructor(
+    scope: 'repo' | 'project' | 'directory',
+    target: string,
+    actualFiles: number,
+    maxFiles: number,
+  ) {
+    super(
+      `Repository "${target}" exceeded the ${scope} file/inode cap (${actualFiles} > ${maxFiles} limit).`,
+    )
+    this.name = 'RepoFileLimitExceededError'
+    this.scope = scope
+    this.target = target
+    this.actualFiles = actualFiles
+    this.maxFiles = maxFiles
   }
 }
 
@@ -359,10 +420,11 @@ export function buildHardenedGitCloneArgs(input: {
   stagingDir: string
   depth?: number
   allowLocalFileProtocol?: boolean
+  noCheckout?: boolean
 }): string[] {
   const depth = Math.max(1, Math.min(Math.floor(input.depth ?? DEFAULT_CLONE_DEPTH), 100))
   const fileProtocolPolicy = input.allowLocalFileProtocol ? 'user' : 'never'
-  return [
+  const args = [
     '-c', 'core.hooksPath=/dev/null',
     '-c', 'core.fsmonitor=false',
     '-c', 'core.symlinks=false',
@@ -375,10 +437,12 @@ export function buildHardenedGitCloneArgs(input: {
     '--single-branch',
     '--no-tags',
     '--no-recurse-submodules',
-    '--',
-    input.repoUrl,
-    input.stagingDir,
   ]
+  if (input.noCheckout !== false) {
+    args.push('--no-checkout')
+  }
+  args.push('--', input.repoUrl, input.stagingDir)
+  return args
 }
 
 const skippedDirNames = new Set([
@@ -468,31 +532,265 @@ export interface UnlinkMountedRepoResult {
   fullName: string
 }
 
-function measureDirectoryBytes(dirPath: string, depth = 0): number {
-  if (depth > 32) return 0
-  let entries
+export interface MeasureDirectoryOptions {
+  /** Maximum allowed directory nesting depth below `dirPath` (default `DEFAULT_MAX_REPO_DEPTH` = 32). */
+  maxDepth?: number
+  /** Maximum allowed regular files (default `DEFAULT_MAX_REPO_FILES` = 50,000). */
+  maxFiles?: number
+  /** Maximum allowed total entries / inodes (files + directories + symlinks; default `maxFiles * 2`). */
+  maxInodes?: number
+  /** Optional early-abort byte ceiling; throws `RepoDiskQuotaExceededError` as soon as exceeded. */
+  maxBytes?: number
+  /** Scope label used in quota errors (default `'repo'`). */
+  scope?: 'repo' | 'project'
+  /** Target label (repo fullName or path) used in thrown errors. */
+  targetLabel?: string
+  /** Bounded async concurrency for filesystem stat operations (default 32). */
+  concurrency?: number
+  /** Optional abort signal. */
+  signal?: AbortSignal
+}
+
+export interface DirectoryMeasurement {
+  bytes: number
+  fileCount: number
+  inodeCount: number
+  maxDepth: number
+}
+
+function resolveMeasureOptions(dirPath: string, options: MeasureDirectoryOptions = {}) {
+  const maxDepth = Math.max(0, Math.floor(options.maxDepth ?? DEFAULT_MAX_REPO_DEPTH))
+  const maxFiles = Math.max(1, Math.floor(options.maxFiles ?? DEFAULT_MAX_REPO_FILES))
+  const maxInodes = Math.max(maxFiles, Math.floor(options.maxInodes ?? maxFiles * 2))
+  const maxBytes = options.maxBytes !== undefined && Number.isFinite(options.maxBytes) && options.maxBytes >= 0
+    ? Math.floor(options.maxBytes)
+    : undefined
+  const scope = options.scope ?? 'repo'
+  const targetLabel = options.targetLabel ?? dirPath
+  const concurrency = Math.max(1, Math.min(Math.floor(options.concurrency ?? 32), 64))
+  return { maxDepth, maxFiles, maxInodes, maxBytes, scope, targetLabel, concurrency }
+}
+
+/**
+ * Asynchronously measure directory disk usage, file/inode count, and nesting depth using
+ * `fs.promises.readdir` / `lstat` with bounded concurrency and event-loop yields.
+ * Always fails closed on over-depth directories (`> maxDepth`, default 32) and file/inode caps.
+ */
+export async function measureDirectoryUsage(
+  dirPath: string,
+  options: MeasureDirectoryOptions = {},
+): Promise<DirectoryMeasurement> {
+  options.signal?.throwIfAborted()
+  const { maxDepth, maxFiles, maxInodes, maxBytes, scope, targetLabel, concurrency } = resolveMeasureOptions(dirPath, options)
+
+  let rootStat
   try {
-    entries = readdirSync(dirPath, { withFileTypes: true })
-  } catch {
-    return 0
+    rootStat = await fsp.lstat(dirPath)
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException | undefined)?.code
+    if (code === 'ENOENT' || code === 'ENOTDIR') {
+      return { bytes: 0, fileCount: 0, inodeCount: 0, maxDepth: 0 }
+    }
+    throw err
   }
-  let total = 0
-  for (const entry of entries) {
-    const fullPath = join(dirPath, entry.name)
-    let st
+  if (rootStat.isSymbolicLink()) {
+    return { bytes: 0, fileCount: 0, inodeCount: 1, maxDepth: 0 }
+  }
+  if (rootStat.isFile()) {
+    if (maxBytes !== undefined && rootStat.size > maxBytes) {
+      throw new RepoDiskQuotaExceededError(scope, targetLabel, rootStat.size, maxBytes)
+    }
+    return { bytes: rootStat.size, fileCount: 1, inodeCount: 1, maxDepth: 0 }
+  }
+  if (!rootStat.isDirectory()) {
+    return { bytes: 0, fileCount: 0, inodeCount: 0, maxDepth: 0 }
+  }
+
+  let bytes = 0
+  let fileCount = 0
+  let inodeCount = 0
+  let observedMaxDepth = 0
+  let opsSinceYield = 0
+  const queue: Array<{ path: string; depth: number }> = [{ path: dirPath, depth: 0 }]
+
+  while (queue.length > 0) {
+    options.signal?.throwIfAborted()
+    const current = queue.shift()!
+    if (current.depth > maxDepth) {
+      throw new RepoDepthLimitExceededError(targetLabel, current.depth, maxDepth, current.path)
+    }
+    if (current.depth > observedMaxDepth) {
+      observedMaxDepth = current.depth
+    }
+
+    let entries
     try {
-      st = lstatSync(fullPath)
-    } catch {
-      continue
+      entries = await fsp.readdir(current.path, { withFileTypes: true })
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException | undefined)?.code
+      if (code === 'ENOENT') continue
+      throw err
     }
-    if (st.isSymbolicLink()) continue
-    if (st.isFile()) {
-      total += st.size
-    } else if (st.isDirectory()) {
-      total += measureDirectoryBytes(fullPath, depth + 1)
+
+    for (let i = 0; i < entries.length; i += concurrency) {
+      options.signal?.throwIfAborted()
+      const batch = entries.slice(i, i + concurrency)
+      const statResults = await Promise.all(
+        batch.map(async entry => {
+          const fullPath = join(current.path, entry.name)
+          try {
+            const st = await fsp.lstat(fullPath)
+            return { fullPath, st }
+          } catch (err) {
+            const code = (err as NodeJS.ErrnoException | undefined)?.code
+            if (code === 'ENOENT') return null
+            throw err
+          }
+        }),
+      )
+
+      for (const item of statResults) {
+        if (!item) continue
+        const { fullPath, st } = item
+        if (st.isSymbolicLink()) {
+          inodeCount += 1
+          if (inodeCount > maxInodes) {
+            throw new RepoFileLimitExceededError(scope, targetLabel, inodeCount, maxInodes)
+          }
+          continue
+        }
+        if (st.isFile()) {
+          fileCount += 1
+          inodeCount += 1
+          bytes += st.size
+          if (fileCount > maxFiles) {
+            throw new RepoFileLimitExceededError(scope, targetLabel, fileCount, maxFiles)
+          }
+          if (inodeCount > maxInodes) {
+            throw new RepoFileLimitExceededError(scope, targetLabel, inodeCount, maxInodes)
+          }
+          if (maxBytes !== undefined && bytes > maxBytes) {
+            throw new RepoDiskQuotaExceededError(scope, targetLabel, bytes, maxBytes)
+          }
+        } else if (st.isDirectory()) {
+          inodeCount += 1
+          if (inodeCount > maxInodes) {
+            throw new RepoFileLimitExceededError(scope, targetLabel, inodeCount, maxInodes)
+          }
+          const nextDepth = current.depth + 1
+          if (nextDepth > maxDepth) {
+            throw new RepoDepthLimitExceededError(targetLabel, nextDepth, maxDepth, fullPath)
+          }
+          queue.push({ path: fullPath, depth: nextDepth })
+        }
+      }
+
+      opsSinceYield += batch.length
+      if (opsSinceYield >= 256) {
+        opsSinceYield = 0
+        await new Promise<void>(resolveImmediate => setImmediate(resolveImmediate))
+      }
     }
   }
-  return total
+
+  return { bytes, fileCount, inodeCount, maxDepth: observedMaxDepth }
+}
+
+/**
+ * Asynchronously measure directory disk usage in bytes, failing closed on over-depth
+ * directories (`> 32` by default) and file/inode caps.
+ */
+export async function measureDirectoryBytes(
+  dirPath: string,
+  options: MeasureDirectoryOptions = {},
+): Promise<number> {
+  const usage = await measureDirectoryUsage(dirPath, options)
+  return usage.bytes
+}
+
+/**
+ * Fail-closed synchronous directory byte counter reserved for legacy synchronous metadata
+ * listing (`listProjectMountedRepos`). Enforces the exact same over-depth and file/inode caps.
+ */
+function measureDirectoryBytesSyncFailClosed(
+  dirPath: string,
+  options: Omit<MeasureDirectoryOptions, 'concurrency' | 'signal'> = {},
+): number {
+  const { maxDepth, maxFiles, maxInodes, maxBytes, scope, targetLabel } = resolveMeasureOptions(dirPath, options)
+  let rootStat
+  try {
+    rootStat = lstatSync(dirPath)
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException | undefined)?.code
+    if (code === 'ENOENT' || code === 'ENOTDIR') return 0
+    throw err
+  }
+  if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+    return rootStat.isFile() ? rootStat.size : 0
+  }
+
+  let bytes = 0
+  let fileCount = 0
+  let inodeCount = 0
+  const stack: Array<{ path: string; depth: number }> = [{ path: dirPath, depth: 0 }]
+
+  while (stack.length > 0) {
+    const current = stack.pop()!
+    if (current.depth > maxDepth) {
+      throw new RepoDepthLimitExceededError(targetLabel, current.depth, maxDepth, current.path)
+    }
+    let entries
+    try {
+      entries = readdirSync(current.path, { withFileTypes: true })
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException | undefined)?.code
+      if (code === 'ENOENT') continue
+      throw err
+    }
+    for (const entry of entries) {
+      const fullPath = join(current.path, entry.name)
+      let st
+      try {
+        st = lstatSync(fullPath)
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException | undefined)?.code
+        if (code === 'ENOENT') continue
+        throw err
+      }
+      if (st.isSymbolicLink()) {
+        inodeCount += 1
+        if (inodeCount > maxInodes) {
+          throw new RepoFileLimitExceededError(scope, targetLabel, inodeCount, maxInodes)
+        }
+        continue
+      }
+      if (st.isFile()) {
+        fileCount += 1
+        inodeCount += 1
+        bytes += st.size
+        if (fileCount > maxFiles) {
+          throw new RepoFileLimitExceededError(scope, targetLabel, fileCount, maxFiles)
+        }
+        if (inodeCount > maxInodes) {
+          throw new RepoFileLimitExceededError(scope, targetLabel, inodeCount, maxInodes)
+        }
+        if (maxBytes !== undefined && bytes > maxBytes) {
+          throw new RepoDiskQuotaExceededError(scope, targetLabel, bytes, maxBytes)
+        }
+      } else if (st.isDirectory()) {
+        inodeCount += 1
+        if (inodeCount > maxInodes) {
+          throw new RepoFileLimitExceededError(scope, targetLabel, inodeCount, maxInodes)
+        }
+        const nextDepth = current.depth + 1
+        if (nextDepth > maxDepth) {
+          throw new RepoDepthLimitExceededError(targetLabel, nextDepth, maxDepth, fullPath)
+        }
+        stack.push({ path: fullPath, depth: nextDepth })
+      }
+    }
+  }
+  return bytes
 }
 
 export interface UnlinkMountedRepoOptions {
@@ -500,20 +798,51 @@ export interface UnlinkMountedRepoOptions {
   assertNoActiveRuns?: () => void
 }
 
-export function measureProjectDiskBytes(
+export async function measureProjectDiskBytes(
   reposDir: string,
-  options: { excludeRepo?: string } = {},
-): number {
+  options: {
+    excludeRepo?: string
+    maxDepth?: number
+    maxFiles?: number
+    maxInodes?: number
+    signal?: AbortSignal
+  } = {},
+): Promise<number> {
+  options.signal?.throwIfAborted()
   const excluded = options.excludeRepo ? parseRepoFullName(options.excludeRepo).fullName.toLowerCase() : null
   const mounted = listMountedRepos(reposDir)
-  let total = 0
+  const maxDepth = options.maxDepth ?? DEFAULT_MAX_REPO_DEPTH
+  const maxFiles = Math.max(1, Math.floor(options.maxFiles ?? DEFAULT_MAX_PROJECT_FILES))
+  const maxInodes = Math.max(maxFiles, Math.floor(options.maxInodes ?? maxFiles * 2))
+  let totalBytes = 0
+  let totalFiles = 0
+  let totalInodes = 0
   for (const mountPath of mounted) {
+    options.signal?.throwIfAborted()
     const fullName = mountPath.slice('/repos/'.length)
     if (excluded && fullName.toLowerCase() === excluded) continue
     const { owner, repo } = parseRepoFullName(fullName)
-    total += measureDirectoryBytes(join(reposDir, owner, repo))
+    const remainingFiles = Math.max(1, maxFiles - totalFiles)
+    const remainingInodes = Math.max(1, maxInodes - totalInodes)
+    const usage = await measureDirectoryUsage(join(reposDir, owner, repo), {
+      maxDepth,
+      maxFiles: remainingFiles,
+      maxInodes: remainingInodes,
+      scope: 'project',
+      targetLabel: fullName,
+      signal: options.signal,
+    })
+    totalBytes += usage.bytes
+    totalFiles += usage.fileCount
+    totalInodes += usage.inodeCount
+    if (totalFiles > maxFiles) {
+      throw new RepoFileLimitExceededError('project', fullName, totalFiles, maxFiles)
+    }
+    if (totalInodes > maxInodes) {
+      throw new RepoFileLimitExceededError('project', fullName, totalInodes, maxInodes)
+    }
   }
-  return total
+  return totalBytes
 }
 
 function readRepoGitHeadInfo(repoDir: string): { branch: string | null; commitSha: string | null } {
@@ -574,7 +903,7 @@ export function listProjectMountedRepos(dataDir: string, projectId: string): Pro
       continue
     }
     const { branch, commitSha } = readRepoGitHeadInfo(repoDir)
-    const sizeBytes = measureDirectoryBytes(repoDir)
+    const sizeBytes = measureDirectoryBytesSyncFailClosed(repoDir, { targetLabel: fullName })
     out.push({
       fullName,
       mountPath,
@@ -1247,7 +1576,9 @@ export function verifyAndStripRepoSymlinks(
   }
 
   const visit = (currentDir: string, depth: number) => {
-    if (depth > 64) return
+    if (depth > 64) {
+      throw new RepoDepthLimitExceededError(rootDir, depth, 64, currentDir)
+    }
     let entries
     try {
       entries = readdirSync(currentDir, { withFileTypes: true })
@@ -1559,6 +1890,194 @@ async function checkGithubPreflightRepoSize(input: {
   }
 }
 
+interface PreCheckoutTreeSummary {
+  blobBytes: number
+  fileCount: number
+  inodeCount: number
+  maxDepth: number
+}
+
+/**
+ * Stream `git ls-tree -r -t -l -z HEAD` on a `--no-checkout` staging repository and abort
+ * immediately if uncompressed blob bytes, file/inode count, or directory depth exceed limits.
+ * No working-tree files exist on disk until this check completes cleanly.
+ */
+function inspectGitTreeBeforeCheckout(input: {
+  stagingDir: string
+  fullName: string
+  gitEnv: NodeJS.ProcessEnv
+  secrets: readonly NamedSecret[]
+  maxRepoDiskBytes: number
+  maxProjectDiskBytes: number
+  existingProjectBytes: number
+  baseGitBytes: number
+  maxRepoFiles: number
+  maxRepoDepth: number
+  signal?: AbortSignal
+  timeoutMs: number
+}): Promise<PreCheckoutTreeSummary> {
+  input.signal?.throwIfAborted()
+  const deadline = input.signal
+    ? AbortSignal.any([input.signal, AbortSignal.timeout(input.timeoutMs)])
+    : AbortSignal.timeout(input.timeoutMs)
+  const maxInodes = Math.max(input.maxRepoFiles, input.maxRepoFiles * 2)
+  const maxSingleRecordBytes = 256 * 1024
+
+  return new Promise((resolvePromise, rejectPromise) => {
+    const args = [
+      '-C', input.stagingDir,
+      '-c', 'safe.directory=*',
+      '-c', 'core.hooksPath=/dev/null',
+      '-c', 'core.fsmonitor=false',
+      '-c', 'core.symlinks=false',
+      '-c', 'protocol.file.allow=never',
+      '-c', 'protocol.ext.allow=never',
+      'ls-tree', '-r', '-t', '-l', '-z', 'HEAD',
+    ]
+    const child = spawn('git', args, {
+      env: input.gitEnv,
+      signal: deadline,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+
+    let blobBytes = 0
+    let fileCount = 0
+    let inodeCount = 0
+    let maxDepth = 0
+    let remainder: Buffer = Buffer.alloc(0)
+    let abortError: Error | null = null
+    const errChunks: Buffer[] = []
+    let errLen = 0
+    const errCap = 64 * 1024
+
+    const failEarly = (err: Error) => {
+      if (abortError) return
+      abortError = err
+      try { child.stdout.destroy() } catch { /* ignore */ }
+      try { child.kill('SIGKILL') } catch { /* ignore */ }
+    }
+
+    const processRecord = (recBuf: Buffer) => {
+      if (abortError || recBuf.length === 0) return
+      const rec = recBuf.toString('utf8')
+      const tabIdx = rec.indexOf('\t')
+      if (tabIdx < 0) {
+        failEarly(new Error(`Malformed git ls-tree record while inspecting "${input.fullName}".`))
+        return
+      }
+      const header = rec.slice(0, tabIdx).trim()
+      const relPath = rec.slice(tabIdx + 1)
+      const parts = header.split(/\s+/)
+      if (parts.length < 4) {
+        failEarly(new Error(`Malformed git ls-tree header while inspecting "${input.fullName}".`))
+        return
+      }
+      const type = parts[1]!
+      const sizeToken = parts[3]!
+      const segments = relPath.split('/').filter(Boolean)
+      const dirDepth = type === 'tree'
+        ? segments.length
+        : Math.max(0, segments.length - 1)
+      if (dirDepth > maxDepth) maxDepth = dirDepth
+      if (dirDepth > input.maxRepoDepth) {
+        failEarly(new RepoDepthLimitExceededError(input.fullName, dirDepth, input.maxRepoDepth, relPath))
+        return
+      }
+
+      inodeCount += 1
+      if (inodeCount > maxInodes) {
+        failEarly(new RepoFileLimitExceededError('repo', input.fullName, inodeCount, maxInodes))
+        return
+      }
+
+      if (type === 'tree') return
+
+      fileCount += 1
+      if (fileCount > input.maxRepoFiles) {
+        failEarly(new RepoFileLimitExceededError('repo', input.fullName, fileCount, input.maxRepoFiles))
+        return
+      }
+
+      if (type === 'blob') {
+        const size = Number(sizeToken)
+        if (!Number.isFinite(size) || size < 0) {
+          failEarly(new Error(`Invalid blob size "${sizeToken}" in git ls-tree for "${input.fullName}".`))
+          return
+        }
+        blobBytes += size
+        const projectedRepoBytes = input.baseGitBytes + blobBytes
+        if (projectedRepoBytes > input.maxRepoDiskBytes) {
+          failEarly(new RepoDiskQuotaExceededError('repo', input.fullName, projectedRepoBytes, input.maxRepoDiskBytes))
+          return
+        }
+        const projectedProjectBytes = input.existingProjectBytes + projectedRepoBytes
+        if (projectedProjectBytes > input.maxProjectDiskBytes) {
+          failEarly(new RepoDiskQuotaExceededError('project', input.fullName, projectedProjectBytes, input.maxProjectDiskBytes))
+          return
+        }
+      }
+    }
+
+    child.stdout.on('data', (chunk: Buffer) => {
+      if (abortError) return
+      const combined = remainder.length > 0 ? Buffer.concat([remainder, chunk]) : chunk
+      let start = 0
+      while (start < combined.length && !abortError) {
+        const nulIdx = combined.indexOf(0, start)
+        if (nulIdx < 0) break
+        processRecord(combined.subarray(start, nulIdx))
+        start = nulIdx + 1
+      }
+      if (abortError) {
+        remainder = Buffer.alloc(0)
+        return
+      }
+      const leftover = combined.subarray(start)
+      if (leftover.length > maxSingleRecordBytes) {
+        failEarly(new Error(`Oversized git ls-tree entry while inspecting "${input.fullName}".`))
+        remainder = Buffer.alloc(0)
+        return
+      }
+      remainder = Buffer.from(leftover)
+    })
+
+    child.stderr.on('data', (chunk: Buffer) => {
+      if (errLen < errCap) {
+        errChunks.push(chunk.subarray(0, errCap - errLen))
+        errLen += chunk.length
+      }
+    })
+
+    child.once('error', err => {
+      if (abortError) {
+        rejectPromise(abortError)
+        return
+      }
+      if (deadline.aborted) {
+        rejectPromise(new Error(`git ls-tree aborted or timed out for "${input.fullName}".`))
+      } else {
+        rejectPromise(new Error(redact(err.message, input.secrets)))
+      }
+    })
+
+    child.once('close', code => {
+      if (!abortError && remainder.length > 0) {
+        processRecord(remainder)
+      }
+      if (abortError) {
+        rejectPromise(abortError)
+        return
+      }
+      if (code === 0) {
+        resolvePromise({ blobBytes, fileCount, inodeCount, maxDepth })
+        return
+      }
+      const stderr = redact(Buffer.concat(errChunks).toString('utf8'), input.secrets).trim().slice(0, 300)
+      rejectPromise(new Error(`git ls-tree failed for "${input.fullName}" (exit ${code}): ${stderr}`))
+    })
+  })
+}
+
 export async function cloneGithubRepos(
   repoFullNames: readonly string[],
   targetRootDir: string,
@@ -1593,6 +2112,15 @@ export async function cloneGithubRepos(
   const maxProjectDiskBytes = Math.max(
     1024,
     Math.floor(options.maxProjectDiskBytes ?? parsePositiveEnvBytes('KOVO_MAX_PROJECT_DISK_BYTES') ?? DEFAULT_MAX_PROJECT_DISK_BYTES),
+  )
+  const maxRepoFiles = Math.max(
+    1,
+    Math.floor(options.maxRepoFiles ?? parsePositiveEnvBytes('KOVO_MAX_REPO_FILES') ?? DEFAULT_MAX_REPO_FILES),
+  )
+  const maxProjectFiles = Math.max(DEFAULT_MAX_PROJECT_FILES, maxRepoFiles)
+  const maxRepoDepth = Math.max(
+    0,
+    Math.floor(options.maxRepoDepth ?? parsePositiveEnvBytes('KOVO_MAX_REPO_DEPTH') ?? DEFAULT_MAX_REPO_DEPTH),
   )
 
   mkdirSync(targetRootDir, { recursive: true, mode: 0o755 })
@@ -1691,16 +2219,19 @@ export async function cloneGithubRepos(
           const warnings: string[] = []
 
           try {
+            // 1. Clone with `--no-checkout` so zero working-tree files hit disk before quota inspection.
             const cloneArgs = buildHardenedGitCloneArgs({
               repoUrl,
               stagingDir,
               depth: historyDepth,
               allowLocalFileProtocol,
+              noCheckout: true,
             })
             await runGit(cloneArgs, gitEnv, secrets, signal, cloneTimeoutMs)
 
             let defaultBranch = 'main'
             let commitSha: string | undefined
+            let hasHead = false
             const revParsePrefix = [
               '-C', stagingDir,
               '-c', 'core.hooksPath=/dev/null',
@@ -1708,6 +2239,7 @@ export async function cloneGithubRepos(
               '-c', 'core.symlinks=false',
               '-c', 'protocol.file.allow=never',
               '-c', 'protocol.ext.allow=never',
+              '-c', 'submodule.recurse=false',
             ]
             try {
               const br = await runGit([...revParsePrefix, 'rev-parse', '--abbrev-ref', 'HEAD'], gitEnv, secrets, signal, 10_000)
@@ -1715,11 +2247,81 @@ export async function cloneGithubRepos(
             } catch { /* fallback to main */ }
             try {
               const sha = await runGit([...revParsePrefix, 'rev-parse', '--short', 'HEAD'], gitEnv, secrets, signal, 10_000)
-              if (sha.stdout.trim()) commitSha = sha.stdout.trim()
-            } catch { /* optional */ }
+              if (sha.stdout.trim()) {
+                commitSha = sha.stdout.trim()
+                hasHead = true
+              }
+            } catch { /* empty repo / unborn HEAD */ }
 
-            // Sanitize retained git metadata (strip credentials, symlinks, executable hooks).
-            sanitizeGitMetadata(join(stagingDir, '.git'))
+            // 2. Sanitize `.git` metadata BEFORE inspecting or checking out anything.
+            const gitDirPath = join(stagingDir, '.git')
+            sanitizeGitMetadata(gitDirPath)
+
+            // 3. Measure existing project disk usage and `.git` store asynchronously before checkout.
+            const existingOtherBytesPre = await measureProjectDiskBytes(resolvedRoot, {
+              excludeRepo: fullName,
+              maxDepth: maxRepoDepth,
+              maxFiles: maxProjectFiles,
+              signal,
+            })
+            const gitDirUsage = await measureDirectoryUsage(gitDirPath, {
+              maxDepth: Math.max(maxRepoDepth, 16),
+              maxFiles: Math.max(maxRepoFiles, 1000),
+              maxBytes: stripGitMetadata ? Math.max(maxRepoDiskBytes, 1024 * 1024) : maxRepoDiskBytes,
+              scope: 'repo',
+              targetLabel: fullName,
+              signal,
+            })
+            const baseGitBytes = stripGitMetadata ? 0 : gitDirUsage.bytes
+            if (baseGitBytes > maxRepoDiskBytes) {
+              throw new RepoDiskQuotaExceededError('repo', fullName, baseGitBytes, maxRepoDiskBytes)
+            }
+            if (existingOtherBytesPre + baseGitBytes > maxProjectDiskBytes) {
+              throw new RepoDiskQuotaExceededError('project', fullName, existingOtherBytesPre + baseGitBytes, maxProjectDiskBytes)
+            }
+
+            // 4. Stream `git ls-tree -r -t -l -z HEAD` to enforce uncompressed blob bytes, file/inode cap,
+            //    and max directory depth BEFORE writing any working-tree file to disk.
+            const treeSummary: PreCheckoutTreeSummary = hasHead
+              ? await inspectGitTreeBeforeCheckout({
+                  stagingDir,
+                  fullName,
+                  gitEnv,
+                  secrets,
+                  maxRepoDiskBytes,
+                  maxProjectDiskBytes,
+                  existingProjectBytes: existingOtherBytesPre,
+                  baseGitBytes,
+                  maxRepoFiles,
+                  maxRepoDepth,
+                  signal,
+                  timeoutMs: cloneTimeoutMs,
+                })
+              : { blobBytes: 0, fileCount: 0, inodeCount: 0, maxDepth: 0 }
+
+            options.onBeforeCheckout?.({
+              stagingDir,
+              blobBytes: treeSummary.blobBytes,
+              fileCount: treeSummary.fileCount,
+              inodeCount: treeSummary.inodeCount,
+              maxDepth: treeSummary.maxDepth,
+            })
+
+            // 5. Only check out working tree after pre-checkout tree quota, file/inode, and depth checks pass.
+            if (hasHead) {
+              await runGit(
+                [
+                  ...revParsePrefix,
+                  '-c', 'filter.lfs.smudge=',
+                  '-c', 'filter.lfs.process=',
+                  'checkout', '-f',
+                ],
+                gitEnv,
+                secrets,
+                signal,
+                cloneTimeoutMs,
+              )
+            }
 
             // Reject any OS or git-tracked symlink escaping the checkout root, and strip all symlinks.
             const symlinkCheck = verifyAndStripRepoSymlinks(stagingDir, { rejectEscaping: true })
@@ -1735,17 +2337,32 @@ export async function cloneGithubRepos(
               ? readRepoCommitDiffs(stagingDir, { maxCommits: maxCommitDiffs })
               : { available: false, commitsScanned: 0, commitDiffs: [] as CommitDiffSignal[] }
             if (stripGitMetadata) {
-              rmSync(join(stagingDir, '.git'), { recursive: true, force: true })
+              rmSync(gitDirPath, { recursive: true, force: true })
             }
 
-            // Enforce per-repo and per-project on-disk quotas before swapping into finalDir.
-            const stagedBytes = measureDirectoryBytes(stagingDir)
-            if (stagedBytes > maxRepoDiskBytes) {
-              throw new RepoDiskQuotaExceededError('repo', fullName, stagedBytes, maxRepoDiskBytes)
+            // Defense-in-depth async post-checkout enforcement (depth, file/inode cap, per-repo & per-project bytes).
+            const postCheckoutMaxFiles = stripGitMetadata
+              ? maxRepoFiles
+              : maxRepoFiles + Math.min(gitDirUsage.fileCount, 1000)
+            const stagedUsage = await measureDirectoryUsage(stagingDir, {
+              maxDepth: maxRepoDepth,
+              maxFiles: postCheckoutMaxFiles,
+              maxBytes: maxRepoDiskBytes,
+              scope: 'repo',
+              targetLabel: fullName,
+              signal,
+            })
+            if (stagedUsage.bytes > maxRepoDiskBytes) {
+              throw new RepoDiskQuotaExceededError('repo', fullName, stagedUsage.bytes, maxRepoDiskBytes)
             }
-            const existingOtherBytes = measureProjectDiskBytes(resolvedRoot, { excludeRepo: fullName })
-            if (existingOtherBytes + stagedBytes > maxProjectDiskBytes) {
-              throw new RepoDiskQuotaExceededError('project', fullName, existingOtherBytes + stagedBytes, maxProjectDiskBytes)
+            const existingOtherBytes = await measureProjectDiskBytes(resolvedRoot, {
+              excludeRepo: fullName,
+              maxDepth: maxRepoDepth,
+              maxFiles: maxProjectFiles,
+              signal,
+            })
+            if (existingOtherBytes + stagedUsage.bytes > maxProjectDiskBytes) {
+              throw new RepoDiskQuotaExceededError('project', fullName, existingOtherBytes + stagedUsage.bytes, maxProjectDiskBytes)
             }
 
             // Re-check active-run guard right before mutating the live bind-mount directory.
@@ -1837,6 +2454,8 @@ export async function cloneGithubRepos(
 export interface RepoWorkspaceManagerOptions {
   maxRepoDiskBytes?: number
   maxProjectDiskBytes?: number
+  maxRepoFiles?: number
+  maxRepoDepth?: number
   shallowDepth?: number
   activeRunChecker?: (projectId: string) => readonly string[] | Promise<readonly string[]>
 }
@@ -1849,12 +2468,16 @@ export interface RepoWorkspaceManagerOptions {
 export class RepoWorkspaceManager {
   readonly maxRepoDiskBytes: number
   readonly maxProjectDiskBytes: number
+  readonly maxRepoFiles: number
+  readonly maxRepoDepth: number
   readonly shallowDepth: number
   private readonly activeRunChecker?: (projectId: string) => readonly string[] | Promise<readonly string[]>
 
   constructor(options: RepoWorkspaceManagerOptions = {}) {
     this.maxRepoDiskBytes = options.maxRepoDiskBytes ?? DEFAULT_MAX_REPO_DISK_BYTES
     this.maxProjectDiskBytes = options.maxProjectDiskBytes ?? DEFAULT_MAX_PROJECT_DISK_BYTES
+    this.maxRepoFiles = options.maxRepoFiles ?? DEFAULT_MAX_REPO_FILES
+    this.maxRepoDepth = options.maxRepoDepth ?? DEFAULT_MAX_REPO_DEPTH
     this.shallowDepth = Math.max(1, Math.min(Math.floor(options.shallowDepth ?? DEFAULT_CLONE_DEPTH), 100))
     this.activeRunChecker = options.activeRunChecker
   }
@@ -1889,8 +2512,11 @@ export class RepoWorkspaceManager {
     return listProjectMountedRepos(dataDir, projectId)
   }
 
-  measureProjectBytes(dataDir: string, projectId: string): number {
-    return measureProjectDiskBytes(projectReposDir(dataDir, projectId))
+  async measureProjectBytes(dataDir: string, projectId: string): Promise<number> {
+    return await measureProjectDiskBytes(projectReposDir(dataDir, projectId), {
+      maxDepth: this.maxRepoDepth,
+      maxFiles: Math.max(DEFAULT_MAX_PROJECT_FILES, this.maxRepoFiles),
+    })
   }
 
   async syncRepos(
@@ -1906,6 +2532,8 @@ export class RepoWorkspaceManager {
       historyDepth: this.shallowDepth,
       maxRepoDiskBytes: this.maxRepoDiskBytes,
       maxProjectDiskBytes: this.maxProjectDiskBytes,
+      maxRepoFiles: this.maxRepoFiles,
+      maxRepoDepth: this.maxRepoDepth,
       ...options,
       assertNoActiveRuns: async repoFullName => {
         await this.assertNoActiveRuns(projectId, 're-sync', repoFullName)
