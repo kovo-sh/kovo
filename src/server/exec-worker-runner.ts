@@ -89,7 +89,12 @@ import {
   type ExecCoreServices,
 } from './exec-exchange.ts'
 import { DETERMINISTIC_PARAM_HINT_RE } from './exec-floor-lane.ts'
-import type { ExecReconPlanner } from './exec-recon-planner.ts'
+import {
+  isPersistentWorkflowContinuationStep,
+  sortPersonasLowPrivFirst,
+  type ExecReconPlanner,
+} from './exec-recon-planner.ts'
+import { FindingsRepository } from './store-findings.ts'
 import {
   STATIC_AST_LIVE_TARGET_REJECT_MESSAGE,
   guardConfirmedFindingMutation,
@@ -686,6 +691,16 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
       offlineScriptLabel: string
       deriveEvidenceTitle: string
       onFactRecorded?: (curRun: Run) => void
+      guardPrematureRuledOut?: (input: {
+        runId: string
+        origins: readonly string[]
+        status: string
+        category?: string
+        hypothesisClass?: string
+        summary?: string
+        enforcingControl?: string
+        exchangeIds?: readonly string[]
+      }) => void
     },
   ) {
     return {
@@ -807,6 +822,16 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
         if (args.status === 'ruled_out' && !ext.enforcingControl?.trim()) {
           throw new Error('record_coverage with status "ruled_out" requires a non-empty enforcingControl (exact file:line or negative-control exchangeId proving the control runs on the attacker path).')
         }
+        options.guardPrematureRuledOut?.({
+          runId: curRun.id,
+          origins: [cleanOrigin],
+          status: args.status,
+          category: args.category,
+          hypothesisClass: ext.hypothesisClass,
+          summary: args.summary,
+          enforcingControl: ext.enforcingControl,
+          exchangeIds: ext.exchangeIds,
+        })
         const entry = this.storage.upsertCoverageEntry(curRun, job.assignment.id, {
           origin: cleanOrigin,
           category: args.category,
@@ -1533,6 +1558,51 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
           },
         })
 
+      const personasPub = sortPersonasLowPrivFirst(publicPersonasFromGrant(grant))
+      const multiPersonaAuthzRe = /\b(?:authz|bola|bfla|idor|abac|broken[_ -]?access[_ -]?control|access[_ -]?control|cross[_ -]?tenant)\b/i
+      const multiStepWorkflowRe = /\b(?:workflow|business[_ -]?logic|lifecycle|chain|race|state[_ -]?machine|multi[_ -]?hop|multihop)\b/i
+      const whiteboxFileLineRe = /(?:\/repos\/[^\s:,)'"`]+|(?:^|[\s(`'"])[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)+\.(?:ts|tsx|js|jsx|mjs|cjs|py|go|rb|java|kt|rs|php|cs|sql|yaml|yml|tf|hcl|rego)):[1-9]\d*/
+      let prematureRuledOutStrikes = 0
+      const guardPrematureRuledOut = (check: {
+        runId: string
+        origins: readonly string[]
+        status: string
+        category?: string
+        hypothesisClass?: string
+        summary?: string
+        enforcingControl?: string
+        exchangeIds?: readonly string[]
+      }) => {
+        if (check.status !== 'ruled_out' && check.status !== 'no_issue_found') return
+        if (prematureRuledOutStrikes >= 1) return
+        const corpus = [check.category, check.hypothesisClass, step.category, step.title, step.hypothesis, step.skills.join(' ')].filter(Boolean).join(' ')
+        const isAuthz = multiPersonaAuthzRe.test(corpus)
+        const isMultiStep = multiStepWorkflowRe.test(corpus) || isMultiHopChainStep(step) || isPersistentWorkflowContinuationStep(step)
+        if (!((isAuthz && personasPub.length >= 2) || (isMultiStep && (personasPub.length >= 2 || isMultiHopChainStep(step) || isPersistentWorkflowContinuationStep(step))))) return
+        const citationText = `${check.enforcingControl ?? ''} ${check.summary ?? ''}`
+        if (whiteboxFileLineRe.test(citationText)) return
+        const extractedIds = [
+          ...(check.exchangeIds ?? []),
+          ...(check.enforcingControl?.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi) ?? []),
+          ...(check.enforcingControl?.match(/\b(?:gx|ex)[_-][A-Za-z0-9._-]{2,80}\b/g) ?? []),
+        ]
+        const ev = FindingsRepository.inspectCoverageExchangeEvidence(
+          this.storage.db,
+          check.runId,
+          check.origins,
+          extractedIds.length > 0 ? extractedIds : undefined,
+          extractedIds.length > 0 ? undefined : job.assignment.id,
+        )
+        const needsMultiPersona = isAuthz && personasPub.length >= 2
+        const hasEnoughPersonas = !needsMultiPersona || ev.distinctPersonas.length >= 2
+        const hasEnoughSteps = ev.distinctExchanges >= 2 && !(ev.allDenial403Or404 && ev.distinctPersonas.length < 2)
+        if (hasEnoughPersonas && hasEnoughSteps) return
+        prematureRuledOutStrikes += 1
+        throw new Error(
+          `Premature "${check.status}" rejected (strike 1/1): multi-persona/multi-step class requires an exact /repos file:line citation or concrete run broker_exchanges evidence (>= 2 distinct exchanges${needsMultiPersona ? ' and >= 2 distinct personas or auth+unauth' : ''}, not a single 403/404 probe; observed ${ev.distinctExchanges} exchange(s), ${ev.distinctPersonas.length} persona(s)). Run the missing cross-persona/multi-step check OR call record_coverage(status="needs_follow_up", proofGapReason="<code>").`,
+        )
+      }
+
       const sharedHandlers = this.buildSharedSessionHandlers(job, session, currentSecrets, {
         offlineScriptLabel: 'Offline {runtime} script',
         deriveEvidenceTitle: 'Derived evidence',
@@ -1540,6 +1610,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
           boardTools.noteEvidence()
           this.host.schedulePlanner(curRun.id)
         },
+        guardPrematureRuledOut,
       })
       const transportHandlers = this.host.buildBrokeredTransportHandlers({
         job,
@@ -2484,10 +2555,16 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
           return this.storage.suggestCandidateHost(curRun, clean, source, Boolean(thirdParty))
         },
 
-        complete_intent: async (completion) => ({ recorded: true, status: completion.status }),
+        complete_intent: async (completion) => {
+          guardPrematureRuledOut({
+            runId: run.id,
+            origins: targetOrigins,
+            status: completion.status,
+            summary: completion.summary,
+          })
+          return { recorded: true, status: completion.status }
+        },
       }
-
-      const personasPub = publicPersonasFromGrant(grant)
 
       const bolaTestQueue = run.capabilityTier >= 2 && personasPub.length >= 2
         ? selectAssignmentBolaQueueItems({
@@ -3023,7 +3100,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
       const isNonConfirmedSealedExit = !confirmedDuringAssignment
         && sessionSealedCapHandles.length > 0
         && (sessionResult.status === 'completed' || sessionResult.status === 'turn_limit' || sessionResult.status === 'nudged_out')
-      if (!confirmedDuringAssignment && ((isWallClockRotated && isMultiHopChainStep(step)) || isNonConfirmedSealedExit)) {
+      if (!confirmedDuringAssignment && ((isWallClockRotated && (isMultiHopChainStep(step) || isPersistentWorkflowContinuationStep(step))) || isNonConfirmedSealedExit)) {
         try {
           const recordedFacts = collectAllPages((offset, limit) =>
             this.storage.listFacts(run.id, { includeTainted: false, limit, offset }))
@@ -3035,6 +3112,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
               method: brokerExchanges.method,
               pathAndQuery: brokerExchanges.pathAndQuery,
               status: brokerExchanges.status,
+              personaHandle: brokerExchanges.personaHandle,
             })
             .from(brokerExchanges)
             .where(and(eq(brokerExchanges.runId, run.id), eq(brokerExchanges.assignmentId, job.assignment.id)))

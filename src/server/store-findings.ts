@@ -1976,6 +1976,72 @@ export class FindingsRepository {
     }, { behavior: 'immediate' })
   }
 
+  static inspectCoverageExchangeEvidence(
+    db: DbSession['db'],
+    runId: string,
+    origins: string | readonly string[],
+    candidateExchangeIds?: readonly string[],
+    assignmentId?: string,
+  ): {
+    verifiedExchangeIds: string[]
+    inferredRouteFromExchange: string | null
+    distinctPersonas: string[]
+    distinctExchanges: number
+    statuses: number[]
+    allDenial403Or404: boolean
+  } {
+    const targetOrigins = new Set((Array.isArray(origins) ? origins : [origins]).map(normalizeOriginForCoverage))
+    const ids = [...new Set((candidateExchangeIds ?? []).map(id => id.trim()).filter(Boolean))]
+    if (!ids.length && !assignmentId) {
+      return { verifiedExchangeIds: [], inferredRouteFromExchange: null, distinctPersonas: [], distinctExchanges: 0, statuses: [], allDenial403Or404: false }
+    }
+    const matchedRows = db.select({
+      id: tables.brokerExchanges.id,
+      origin: tables.brokerExchanges.origin,
+      method: tables.brokerExchanges.method,
+      pathAndQuery: tables.brokerExchanges.pathAndQuery,
+      personaHandle: tables.brokerExchanges.personaHandle,
+      status: tables.brokerExchanges.status,
+    })
+      .from(tables.brokerExchanges)
+      .where(and(
+        eq(tables.brokerExchanges.runId, runId),
+        ids.length > 0
+          ? inArray(tables.brokerExchanges.id, ids)
+          : eq(tables.brokerExchanges.assignmentId, assignmentId!),
+      ))
+      .all()
+    const rowById = new Map(matchedRows.map(r => [r.id, r]))
+    const orderedRows = ids.length > 0
+      ? ids.map(id => rowById.get(id)).filter((r): r is NonNullable<typeof r> => Boolean(r))
+      : matchedRows
+    const verifiedExchangeIds: string[] = []
+    const seenIds = new Set<string>()
+    const personas = new Set<string>()
+    const statuses: number[] = []
+    let inferredRouteFromExchange: string | null = null
+    for (const row of orderedRows) {
+      if (!targetOrigins.has(normalizeOriginForCoverage(row.origin))) continue
+      if (seenIds.has(row.id)) continue
+      seenIds.add(row.id)
+      verifiedExchangeIds.push(row.id)
+      personas.add(row.personaHandle?.trim() || 'unauthenticated')
+      statuses.push(row.status)
+      if (!inferredRouteFromExchange) {
+        const pathOnly = row.pathAndQuery.split('?')[0] || '/'
+        inferredRouteFromExchange = `${row.method.toUpperCase()} ${pathOnly}`
+      }
+    }
+    return {
+      verifiedExchangeIds,
+      inferredRouteFromExchange,
+      distinctPersonas: [...personas],
+      distinctExchanges: verifiedExchangeIds.length,
+      statuses,
+      allDenial403Or404: verifiedExchangeIds.length > 0 && statuses.every(s => s === 403 || s === 404),
+    }
+  }
+
   upsertCoverageEntry(run: Run, assignmentId: string, input: {
     origin: string
     category: OwaspCategory
@@ -2011,34 +2077,11 @@ export class FindingsRepository {
       this.session.flushNow()
     }
 
-    let verifiedExchangeIds: string[] = []
-    let inferredRouteFromExchange: string | null = null
-    if (candidateExchangeIds.length > 0) {
-      const matchedRows = this.session.db.select({
-        id: tables.brokerExchanges.id,
-        origin: tables.brokerExchanges.origin,
-        method: tables.brokerExchanges.method,
-        pathAndQuery: tables.brokerExchanges.pathAndQuery,
-      })
-        .from(tables.brokerExchanges)
-        .where(and(
-          eq(tables.brokerExchanges.runId, run.id),
-          inArray(tables.brokerExchanges.id, candidateExchangeIds),
-        ))
-        .all()
-      const rowById = new Map(matchedRows.map(r => [r.id, r]))
-      for (const id of candidateExchangeIds) {
-        const row = rowById.get(id)
-        if (!row) continue
-        if (normalizeOriginForCoverage(row.origin) !== targetOrigin) continue
-        verifiedExchangeIds.push(row.id)
-        if (!inferredRouteFromExchange) {
-          const pathOnly = row.pathAndQuery.split('?')[0] || '/'
-          inferredRouteFromExchange = `${row.method.toUpperCase()} ${pathOnly}`
-        }
-      }
-      verifiedExchangeIds = [...new Set(verifiedExchangeIds)]
-    }
+    const exchangeEvidence = candidateExchangeIds.length > 0
+      ? FindingsRepository.inspectCoverageExchangeEvidence(this.session.db, run.id, targetOrigin, candidateExchangeIds)
+      : { verifiedExchangeIds: [], inferredRouteFromExchange: null, distinctPersonas: [], distinctExchanges: 0, statuses: [], allDenial403Or404: false }
+    const verifiedExchangeIds = exchangeEvidence.verifiedExchangeIds
+    const inferredRouteFromExchange = exchangeEvidence.inferredRouteFromExchange
 
     if (requiresExchangeEvidence && verifiedExchangeIds.length === 0) {
       const reason = candidateExchangeIds.length === 0

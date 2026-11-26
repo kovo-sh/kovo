@@ -13,7 +13,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { mkdirSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
-import { scanSecrets } from './redact.ts'
+import { redact, scanSecrets } from './redact.ts'
 
 export const CAPABILITY_KINDS = [
   'identity_session', 'scoped_token', 'signing_material', 'signed_artifact_or_url',
@@ -161,6 +161,12 @@ export interface HopCheckpointNextGoal {
   targetSurfaceKey: string; surface: CapabilitySurface; service: string; endpoint: string; method?: string
   hypothesisClass: string; expectedBinding?: CausalEdgeBindingKind; targetTenant?: string; targetRole?: string; goal: string
 }
+export interface HopWorkflowNotebook {
+  discoveredRoutes?: string[]
+  verifiedHypotheses?: string[]
+  triedRecipes?: string[]
+  openHypotheses?: string[]
+}
 export interface HopCheckpointBrief {
   schema: 'v8.hop_checkpoint.v1'; branchKey: string; depth: number; targetHop: number
   mode: 'pivot' | 'fuse' | 'discover' | 'sweep'; evi: number
@@ -168,11 +174,13 @@ export interface HopCheckpointBrief {
   capabilityHandles: string[]; fuseWithBranchKey?: string
   nextGoal: HopCheckpointNextGoal
   prunedBranches?: Array<{ surface: string; hypothesis: string; reason: NegativeEdgeReason }>
+  workflowNotebook?: HopWorkflowNotebook
   truncated?: boolean; doNotRediscover: true
 }
 export interface HopCheckpointBriefOptions {
   branchKey?: string; evi?: number; mode?: 'pivot' | 'fuse' | 'discover' | 'sweep'
   fuseWithBranchKey?: string; nextGoal?: Partial<HopCheckpointNextGoal>
+  workflowNotebook?: HopWorkflowNotebook
 }
 
 const OPAQUE_BRIEF_HANDLE_RE = /^(?:cap|state|ref|hop|handle|secret|artifact|id):[A-Za-z0-9:._/-]{1,96}$/
@@ -196,19 +204,64 @@ export function sanitizeCheckpointHandleRef(raw: string, fallback: string): stri
 }
 export const sanitizeCheckpointText = (text: string, maxLen: number): string => truncateBriefText(text.replace(RAW_BRIEF_SECRET_RE, '[redacted-handle]'), maxLen)
 
+function scrubNotebookItem(raw: string, maxLen: number): string {
+  const handles: string[] = []
+  let s = raw.replace(DERIVED_HANDLE_GLOBAL_RE, h => { handles.push(h); return `__CAP_H_${handles.length - 1}__` })
+  s = redact(s).replace(RAW_BRIEF_SECRET_RE, '[redacted-handle]')
+  for (const { pattern } of EXTRA_SECRET_PATTERNS) {
+    const flags = pattern.flags.includes('g') ? pattern.flags : `${pattern.flags}g`
+    s = s.replace(new RegExp(pattern.source, flags), '[redacted-handle]')
+  }
+  if (scanSecrets(s, { jsonPaths: false, maxMatches: 1 }).length > 0) s = '[redacted-handle]'
+  s = s.replace(/__CAP_H_(\d+)__/g, (_, i) => handles[Number(i)] ?? '[cap_handle]')
+  return truncateBriefText(s, maxLen)
+}
+
+export function sanitizeWorkflowNotebook(nb?: HopWorkflowNotebook): HopWorkflowNotebook | undefined {
+  if (!nb) return undefined
+  const clean = (items: readonly string[] | undefined, maxItems: number, maxLen: number): string[] =>
+    [...new Set((items ?? []).map(v => scrubNotebookItem(String(v ?? ''), maxLen)).filter(Boolean))].slice(0, maxItems)
+  const discoveredRoutes = clean(nb.discoveredRoutes, 10, 88)
+  const verifiedHypotheses = clean(nb.verifiedHypotheses, 6, 110)
+  const triedRecipes = clean(nb.triedRecipes, 10, 110)
+  const openHypotheses = clean(nb.openHypotheses, 6, 110)
+  if (!discoveredRoutes.length && !verifiedHypotheses.length && !triedRecipes.length && !openHypotheses.length) return undefined
+  return {
+    ...(discoveredRoutes.length ? { discoveredRoutes } : {}),
+    ...(verifiedHypotheses.length ? { verifiedHypotheses } : {}),
+    ...(triedRecipes.length ? { triedRecipes } : {}),
+    ...(openHypotheses.length ? { openHypotheses } : {}),
+  }
+}
+
 /** Strictly bound a canonical `v8.hop_checkpoint.v1` brief to `<= maxBytes` UTF-8 (default 2 KB). */
 export function finalizeHopCheckpointBrief(rawBrief: HopCheckpointBrief, maxBytes = DEFAULT_CHECKPOINT_BRIEF_MAX_BYTES): { brief: HopCheckpointBrief; checkpointJson: string; checkpointBytes: number } {
   const cap = Math.max(256, Math.min(DEFAULT_CHECKPOINT_BRIEF_MAX_BYTES, Math.floor(maxBytes)))
+  const workflowNotebook = sanitizeWorkflowNotebook(rawBrief.workflowNotebook)
   const brief: HopCheckpointBrief = {
     ...rawBrief, schema: 'v8.hop_checkpoint.v1', verifiedHops: rawBrief.verifiedHops.map(h => ({ ...h })),
     capabilityHandles: [...rawBrief.capabilityHandles], nextGoal: { ...rawBrief.nextGoal },
-    ...(rawBrief.prunedBranches ? { prunedBranches: rawBrief.prunedBranches.map(p => ({ ...p })) } : {}), doNotRediscover: true,
+    ...(rawBrief.prunedBranches ? { prunedBranches: rawBrief.prunedBranches.map(p => ({ ...p })) } : {}),
+    ...(workflowNotebook ? { workflowNotebook } : {}),
+    doNotRediscover: true,
   }
+  if (!workflowNotebook) delete brief.workflowNotebook
   const measure = () => { const json = JSON.stringify(brief); return { json, bytes: Buffer.byteLength(json, 'utf8') } }
   let m = measure()
   if (m.bytes <= cap) return { brief, checkpointJson: m.json, checkpointBytes: m.bytes }
   brief.truncated = true
   while (m.bytes > cap && brief.prunedBranches?.length) { brief.prunedBranches.pop(); if (!brief.prunedBranches.length) delete brief.prunedBranches; m = measure() }
+  if (brief.workflowNotebook) {
+    const nbKeys: ReadonlyArray<keyof HopWorkflowNotebook> = ['triedRecipes', 'discoveredRoutes', 'openHypotheses', 'verifiedHypotheses']
+    for (const k of nbKeys) {
+      while (m.bytes > cap && brief.workflowNotebook?.[k]?.length) {
+        brief.workflowNotebook[k]!.pop()
+        if (!brief.workflowNotebook[k]!.length) delete brief.workflowNotebook[k]
+        if (brief.workflowNotebook && Object.keys(brief.workflowNotebook).length === 0) delete brief.workflowNotebook
+        m = measure()
+      }
+    }
+  }
   while (m.bytes > cap && brief.verifiedHops.length > 0) { brief.verifiedHops.shift(); brief.omittedEarlierHops = (brief.omittedEarlierHops ?? 0) + 1; m = measure() }
   while (m.bytes > cap && brief.capabilityHandles.length > 1) { brief.capabilityHandles.shift(); m = measure() }
   if (m.bytes > cap) {
@@ -872,6 +925,7 @@ export class CapabilityLedger {
         goal: sanitizeCheckpointText(ng?.goal ?? (targetNode.artifactSummary || `Pivot from ${capId}`), 180),
       },
       ...(prunedRelevant.length > 0 ? { prunedBranches: prunedRelevant.map(n => ({ surface: truncateBriefText(n.targetSurfaceKey, 64), hypothesis: truncateBriefText(n.hypothesisClass, 48), reason: n.reason })) } : {}),
+      ...(options.workflowNotebook ? { workflowNotebook: options.workflowNotebook } : {}),
       truncated: false, doNotRediscover: true,
     }, maxBytes).brief
   }
