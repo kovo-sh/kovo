@@ -48,6 +48,7 @@ import { setupApprovedRun, startHttpFixture, withEnv } from './v4-tier-helpers.t
 
 const repoRoot = resolve(new URL('..', import.meta.url).pathname)
 const executionSource = readFileSync(join(repoRoot, 'src/server/execution.ts'), 'utf8')
+const transportSource = readFileSync(join(repoRoot, 'src/server/exec-brokered-transport.ts'), 'utf8')
 const fakeOrigin = 'https://app.example.invalid'
 
 function makeStore(t: { after: (fn: () => void) => void }): Store {
@@ -535,7 +536,7 @@ test('M1.1: Execution attaches storage to broker, browser and grant, and mints v
 })
 
 test('M1.1: all four brokered tool paths forward session/csrf/authMutation/trace/run/assignment ids', () => {
-  const executeHttpBlock = /const runHttp = \(\) => this\.broker\.executeHttp\(\{[\s\S]{0,900}?\}, grant, signal\)/.exec(executionSource)?.[0] ?? ''
+  const executeHttpBlock = /const runHttp = \(\) => host\.broker\.executeHttp\(\{[\s\S]{0,900}?\}, grant, signal\)/.exec(transportSource)?.[0] ?? ''
   assert.ok(executeHttpBlock, 'executeHttp call not found')
   for (const fragment of [
     'session: args.session',
@@ -549,34 +550,36 @@ test('M1.1: all four brokered tool paths forward session/csrf/authMutation/trace
     assert.ok(executeHttpBlock.includes(fragment), `executeHttp must forward ${fragment}`)
   }
 
-  const raceBlock = /const executeRaceBurstTool = async[\s\S]{0,2600}?this\.broker\.executeRaceBurst/.exec(executionSource)?.[0] ?? ''
+  const raceBlock = /const executeRaceBurstTool = async[\s\S]{0,2600}?host\.broker\.executeRaceBurst/.exec(transportSource)?.[0] ?? ''
   assert.ok(raceBlock)
   for (const fragment of ['session: r.session', 'csrfBind: r.csrfBind', 'authMutation: r.authMutation', 'traceId: r.traceId', 'runId: curRun.id', 'assignmentId: job.assignment.id']) {
     assert.ok(raceBlock.includes(fragment), `executeRaceBurstTool must forward ${fragment}`)
   }
 
-  const batchBlock = /request_http_batch: async[\s\S]{0,1800}?this\.broker\.executeBatch/.exec(executionSource)?.[0] ?? ''
+  const batchBlock = /request_http_batch: async[\s\S]{0,1800}?host\.broker\.executeBatch/.exec(transportSource)?.[0] ?? ''
   assert.ok(batchBlock)
   for (const fragment of ['session: r.session', 'csrfBind: r.csrfBind', 'traceId: r.traceId', 'runId: curRun.id', 'assignmentId: job.assignment.id']) {
     assert.ok(batchBlock.includes(fragment), `request_http_batch must forward ${fragment}`)
   }
 
-  const visitBlock = /browser_visit: async \(args, signal\) => \{[\s\S]{0,1200}?await this\.browser\.visitPage\(\{[\s\S]{0,4000}?\}, grant, signal\)/.exec(executionSource)?.[0] ?? ''
+  const visitBlock = /browser_visit: async \(args, signal\) => \{[\s\S]{0,1200}?await host\.browser\.visitPage\(\{[\s\S]{0,4000}?\}, grant, signal\)/.exec(transportSource)?.[0] ?? ''
   assert.ok(visitBlock)
   for (const fragment of ['session: args.session', 'runId: curRun.id', 'assignmentId: job.assignment.id', 'traceId:']) {
     assert.ok(visitBlock.includes(fragment), `browser_visit must forward ${fragment}`)
   }
 
-  // Broker/browser construction and grant hydration.
+  // Broker/browser construction, transport delegation, and grant hydration.
+  assert.ok(/return buildBrokeredTransportHandlers\(\{[\s\S]{0,500}?broker: this\.broker,[\s\S]{0,200}?browser: this\.browser,/.test(executionSource))
   assert.ok(/new ScopedBrowser\(this\.broker, \{ storage \}\)/.test(executionSource))
   assert.ok(/createBroker\(\{ storage, canaryBroker: this\.canaryBroker \}\)/.test(executionSource))
   assert.ok(/storage: this\.storage,\s*canaryBroker: this\.canaryBroker,/.test(executionSource))
 })
 
 test('M1.2: second-order scanning covers headers, bodies and WebSocket frames', () => {
-  assert.ok(/scanSecondOrderExchange\(curRun, job\.assignment\.id, res, saved\.id\)/.test(executionSource))
-  assert.ok(/scanSecondOrderExchange\(curRun, job\.assignment\.id, ex, saved\.id\)/.test(executionSource))
-  const wsBlock = /const wsScanText = \[[\s\S]{0,600}?mediaType: 'websocket'/.exec(executionSource)?.[0] ?? ''
+  assert.ok(/scanSecondOrderExchange: \(run, aid, res, exId, mt\) => this\.scanSecondOrderExchange\(run, aid, res, exId, mt\)/.test(executionSource))
+  assert.ok(/host\.scanSecondOrderExchange\(curRun, job\.assignment\.id, res, saved\.id\)/.test(transportSource))
+  assert.ok(/host\.scanSecondOrderExchange\(curRun, job\.assignment\.id, ex, saved\.id\)/.test(transportSource))
+  const wsBlock = /const wsScanText = \[[\s\S]{0,600}?mediaType: 'websocket'/.exec(transportSource)?.[0] ?? ''
   assert.ok(wsBlock, 'WebSocket frames + upgrade headers must be scanned for gn2o_ markers')
   assert.ok(/const headerText = Object\.entries\(res\.respHeaders \?\? \{\}\)/.test(executionSource), 'response headers must be scanned')
 })
@@ -999,12 +1002,12 @@ test('M1 worker reliability: docker failures report the real cause and never the
 // ============================================================================
 
 test('M4 wiring: safe templates receive CVE hypotheses and recon-discovered dynamic paths', () => {
-  assert.match(executionSource, /const cveIds = \[\.\.\.new Set\(/)
-  assert.match(executionSource, /kind: 'cve_hypothesis'/)
-  assert.match(executionSource, /templateIdsForCves\(cveIds\)/)
-  assert.match(executionSource, /discoveredPaths: \{ protectedPaths, apiPaths \}/)
-  assert.ok(executionSource.includes('(admin|account|billing|settings|invoice|dashboard)'))
-  assert.ok(executionSource.includes('^\\/(api|graphql|trpc)'))
+  assert.match(transportSource, /const cveIds = \[\.\.\.new Set\(/)
+  assert.match(transportSource, /kind: 'cve_hypothesis'/)
+  assert.match(transportSource, /templateIdsForCves\(cveIds\)/)
+  assert.match(transportSource, /discoveredPaths: \{ protectedPaths, apiPaths \}/)
+  assert.ok(transportSource.includes('(admin|account|billing|settings|invoice|dashboard)'))
+  assert.ok(transportSource.includes('^\\/(api|graphql|trpc)'))
   assert.ok(templateIdsForCves(['CVE-2025-29927']).includes('nextjs-middleware-subrequest-bypass'), 'curated CVE→template mapping must resolve')
 })
 
@@ -1015,10 +1018,10 @@ test('M4 wiring: Stage-1 LLM is enabled by default and receives live endpoints',
 })
 
 test('M4 wiring: dependency correlation iterates all parsed packages with curated-advisory annotation', () => {
-  assert.ok(!executionSource.includes('highSignalPkgs'), 'the JS-only high-signal allowlist must be gone')
+  assert.ok(!executionSource.includes('highSignalPkgs') && !transportSource.includes('highSignalPkgs'), 'the JS-only high-signal allowlist must be gone')
   assert.match(executionSource, /hasCuratedAdvisory\(dep\.ecosystem, dep\.package\)/)
-  assert.match(executionSource, /trivy-fs flagged \$\{cve\}/)
-  assert.match(executionSource, /templateIds: templateIdsForCves\(\[cve\]\)/)
+  assert.match(transportSource, /trivy-fs flagged \$\{cve\}/)
+  assert.match(transportSource, /templateIds: templateIdsForCves\(\[cve\]\)/)
 })
 
 test('M4 wiring: Patch Gate 6 passes labRetest with an authorized baseline caller', () => {

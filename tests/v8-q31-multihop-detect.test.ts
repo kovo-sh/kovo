@@ -224,7 +224,7 @@ test('Q31.2: workerInvestigationPrompt aligns with exec-worker-runner when paren
 })
 
 test('Q31.3: genuine standalone single-route sweeps stay at 120s rotation window and omit multiHopDirectives', () => {
-  const singleRouteCases: Array<{ label: string; step: DispatchLaneStep }> = [
+  const singleRouteCases: Array<{ label: string; step: DispatchLaneStep; expectedWallClockMs?: number }> = [
     {
       label: 'Single-route access sweep',
       step: makeStep({
@@ -251,6 +251,10 @@ test('Q31.3: genuine standalone single-route sweeps stay at 120s rotation window
         skills: ['injection-sqli-nosqli'],
         dependsOnFactIds: ['fact-only-one'],
       }),
+      // Citing 1 upstream fact classifies as multi_step (20 turns, not multi_hop_chain);
+      // R2-19 (2399101) scales multi_step rotation to 20 * ceil(120s / 18) = 133_340ms
+      // to keep seconds-per-turn non-decreasing without escalating to the 270s-300s chain window.
+      expectedWallClockMs: 133_340,
     },
     {
       label: 'Bare HTTP status code arrow (200 -> 403)',
@@ -271,12 +275,12 @@ test('Q31.3: genuine standalone single-route sweeps stay at 120s rotation window
     },
   ]
 
-  for (const { label, step } of singleRouteCases) {
+  for (const { label, step, expectedWallClockMs = 120_000 } of singleRouteCases) {
     assert.equal(matchesMultiHopStepSignal(step), false, `${label}: matchesMultiHopStepSignal must be false`)
     assert.equal(isMultiHopChainStep(step), false, `${label}: isMultiHopChainStep must be false`)
-    assert.equal(resolveWorkerWallClockMs(step, 900_000), 120_000, `${label}: 15m run must stay at 120s`)
-    assert.equal(resolveWorkerWallClockMs(step, 1_800_000), 120_000, `${label}: 30m run must stay at 120s`)
-    assert.equal(resolveWorkerWallClockMs(step, undefined), 120_000, `${label}: default run must stay at 120s`)
+    assert.equal(resolveWorkerWallClockMs(step, 900_000), expectedWallClockMs, `${label}: 15m run must stay at ${expectedWallClockMs}ms`)
+    assert.equal(resolveWorkerWallClockMs(step, 1_800_000), expectedWallClockMs, `${label}: 30m run must stay at ${expectedWallClockMs}ms`)
+    assert.equal(resolveWorkerWallClockMs(step, undefined), expectedWallClockMs, `${label}: default run must stay at ${expectedWallClockMs}ms`)
 
     const parsed = JSON.parse(workerInvestigationPrompt({
       goal: 'Single route verification',

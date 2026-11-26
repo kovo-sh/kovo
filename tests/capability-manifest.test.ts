@@ -132,6 +132,7 @@ function findFirstNode<T extends ts.Node>(root: ts.Node, pred: (n: ts.Node) => n
 function discoverProductionHandlerKeys(): { unconditional: string[]; verifyScriptGated: string[] } {
   const runnerSf = parseSourceFile('src/server/exec-worker-runner.ts')
   const execSf = parseSourceFile('src/server/execution.ts')
+  const transportSf = parseSourceFile('src/server/exec-brokered-transport.ts')
 
   const keys = new Set<string>()
   const verifyScriptGated = new Set<string>()
@@ -176,18 +177,46 @@ function discoverProductionHandlerKeys(): { unconditional: string[]; verifyScrip
   }
   visitRunner(runnerSf)
 
-  // 2. Execution.buildBrokeredTransportHandlers() top-level returned object literal
+  // 2. Execution.buildBrokeredTransportHandlers() delegates to exec-brokered-transport.ts
   const transportMethod = findFirstNode(
     execSf,
     (n): n is ts.MethodDeclaration =>
       ts.isMethodDeclaration(n) && ts.isIdentifier(n.name) && n.name.text === 'buildBrokeredTransportHandlers',
   )
   assert.ok(transportMethod?.body, 'Execution.buildBrokeredTransportHandlers() not found')
-  const returnStmt = transportMethod.body.statements.find(
+  const execDirectReturn = transportMethod.body.statements.find(
     (s): s is ts.ReturnStatement => ts.isReturnStatement(s) && Boolean(s.expression && ts.isObjectLiteralExpression(s.expression)),
   )
-  assert.ok(returnStmt?.expression && ts.isObjectLiteralExpression(returnStmt.expression), 'buildBrokeredTransportHandlers return literal not found')
-  for (const k of extractObjectLiteralKeys(returnStmt.expression)) keys.add(k)
+  let returnExpr: ts.ObjectLiteralExpression | undefined
+  if (execDirectReturn?.expression && ts.isObjectLiteralExpression(execDirectReturn.expression)) {
+    returnExpr = execDirectReturn.expression
+  } else {
+    const execDelegateReturn = transportMethod.body.statements.find(
+      (s): s is ts.ReturnStatement =>
+        ts.isReturnStatement(s)
+        && Boolean(
+          s.expression
+          && ts.isCallExpression(s.expression)
+          && ts.isIdentifier(s.expression.expression)
+          && s.expression.expression.text === 'buildBrokeredTransportHandlers',
+        ),
+    )
+    assert.ok(execDelegateReturn, 'Execution.buildBrokeredTransportHandlers() must return handlers or delegate to buildBrokeredTransportHandlers()')
+    const transportFn = findFirstNode(
+      transportSf,
+      (n): n is ts.FunctionDeclaration =>
+        ts.isFunctionDeclaration(n) && Boolean(n.name && n.name.text === 'buildBrokeredTransportHandlers'),
+    )
+    assert.ok(transportFn?.body, 'exec-brokered-transport.ts buildBrokeredTransportHandlers() not found')
+    const transportReturn = transportFn.body.statements.find(
+      (s): s is ts.ReturnStatement => ts.isReturnStatement(s) && Boolean(s.expression && ts.isObjectLiteralExpression(s.expression)),
+    )
+    if (transportReturn?.expression && ts.isObjectLiteralExpression(transportReturn.expression)) {
+      returnExpr = transportReturn.expression
+    }
+  }
+  assert.ok(returnExpr, 'buildBrokeredTransportHandlers return literal not found')
+  for (const k of extractObjectLiteralKeys(returnExpr)) keys.add(k)
   assert.ok(keys.has('request_http'), 'buildBrokeredTransportHandlers must expose request_http')
 
   for (const gated of verifyScriptGated) keys.delete(gated)
