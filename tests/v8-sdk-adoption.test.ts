@@ -269,6 +269,13 @@ test('multihop-chains.md and Mode-A recipe match live kovo_verify.ts, verify-rpc
 
   const tsSdk = readFileSync(resolve(REPO_ROOT, 'worker/kovo_verify/kovo_verify.ts'), 'utf8')
   const verifyRpc = readFileSync(resolve(REPO_ROOT, 'src/server/verify-rpc.ts'), 'utf8')
+  const verifySupport = readFileSync(resolve(REPO_ROOT, 'src/server/verify-support.ts'), 'utf8')
+  assert.match(
+    verifyRpc,
+    /import\s*\{[\s\S]*?\bparseCapabilityArg\b[\s\S]*?\}\s*from\s*['"]\.\/verify-support\.ts['"]/,
+    'verify-rpc.ts must import parseCapabilityArg from verify-support.ts',
+  )
+  const verifyRpcSurface = `${verifyRpc}\n${verifySupport}`
   const compositeSrc = readFileSync(resolve(REPO_ROOT, 'src/server/composite-receipt.ts'), 'utf8')
 
   // Stale/non-existent field names must NEVER appear in the playbook.
@@ -334,7 +341,7 @@ test('multihop-chains.md and Mode-A recipe match live kovo_verify.ts, verify-rpc
   for (const field of tsSdkFields) {
     assert.ok(playbook.includes(field), `multihop-chains.md missing live field ${field}`)
     assert.ok(tsSdk.includes(field), `kovo_verify.ts missing field ${field}`)
-    assert.ok(verifyRpc.includes(field), `verify-rpc.ts missing field ${field}`)
+    assert.ok(verifyRpcSurface.includes(field), `verify-rpc.ts / verify-support.ts missing field ${field}`)
   }
 
   // Every CompositeProofReceipt field taught in multihop-chains.md must exist in composite-receipt.ts.

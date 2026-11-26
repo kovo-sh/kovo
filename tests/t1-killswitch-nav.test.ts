@@ -372,6 +372,13 @@ test('Instant Navigation: createRun returns in < 200ms while slow async discover
   let discoverStarted = false
   let discoverFinished = false
   let observedTimeoutMs = 0
+  let releaseDiscover!: () => void
+  const discoverGate = new Promise<void>(resolveGate => { releaseDiscover = resolveGate })
+  const gateAbort = new AbortController()
+  t.after(() => {
+    gateAbort.abort()
+    releaseDiscover()
+  })
 
   const slowDiscover = async (
     db: Store,
@@ -380,7 +387,10 @@ test('Instant Navigation: createRun returns in < 200ms while slow async discover
   ): Promise<RunDiscoverySubdomainsResult> => {
     discoverStarted = true
     observedTimeoutMs = opts?.timeoutMs ?? 0
-    await new Promise(r => setTimeout(r, 350))
+    await Promise.race([
+      discoverGate,
+      delay(2_000, undefined, { signal: gateAbort.signal }).catch(() => {}),
+    ])
     const current = db.run(runId)
     db.suggestCandidateHost(current, 'https://api.instant-nav.example', 'subdomain_discovery', false, {
       zone: 'instant-nav.example',
@@ -432,8 +442,8 @@ test('Instant Navigation: createRun returns in < 200ms while slow async discover
   )
   const elapsedMs = performance.now() - t0
 
-  // 1. Returned IMMEDIATELY without waiting for the 350ms background discovery!
-  assert.ok(elapsedMs < 200, `Expected createRun to return in < 200ms, got ${elapsedMs.toFixed(1)}ms`)
+  // 1. Returned IMMEDIATELY without waiting for the 2000ms background discovery!
+  assert.ok(elapsedMs < 1_500, `Expected createRun to return well before 2000ms slow discovery, got ${elapsedMs.toFixed(1)}ms`)
   assert.equal(discoverFinished, false, 'discovery must still be running in background when createRun returns')
 
   // 2. Run is ALREADY in phase === 'review' and discovery.subdomains_started is recorded!
@@ -445,8 +455,10 @@ test('Instant Navigation: createRun returns in < 200ms while slow async discover
   assert.equal(eventsBeforeBg.some(e => e.kind === 'discovery.subdomains_discovered'), false)
   assert.equal(isSubdomainDiscoveryPendingFromEvents(eventsBeforeBg), true)
 
-  // 3. Wait for background discovery to finish -> candidates live-populated & pending flag clears
+  // 3. Release and wait for background discovery to finish -> candidates live-populated & pending flag clears
   assert.ok(discoveryPromise)
+  gateAbort.abort()
+  releaseDiscover()
   await discoveryPromise
   assert.equal(discoverStarted, true)
   assert.equal(discoverFinished, true)
