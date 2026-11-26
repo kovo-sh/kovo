@@ -47,6 +47,7 @@ import {
   classifyProviderFailure,
   evaluateRoleProviderCircuit,
 } from '../src/server/provider.ts'
+import { assessBooleanDifferential } from '../src/server/oracle-invariants.ts'
 import { verifyReceipt } from '../src/server/proof-receipt.ts'
 import { retestPersistedAgentScript, runAgentScriptProof } from '../src/server/replay-verifier.ts'
 import {
@@ -58,6 +59,8 @@ import {
   RetryGovernor,
   computeProviderRetryBackoffMs,
   defaultRetryGovernor,
+  deriveBooleanRemediationCode,
+  deriveImpactRemediationCode,
   isPositiveRemediationOracleCode,
   isRunWallClockExhausted,
   isTypedOracleRemediationCode,
@@ -679,6 +682,155 @@ test('R3-14.4: classifyRetestHealth switches strictly on top-level host OracleFa
   )
   assert.equal(stubVer.confirmed, false)
   assert.equal(stubVer.failureCode, 'oracle_disagreement')
+
+  // R3-05 re-review (#1378) 4 rejecting regression cases:
+  // (a) Probe 404 decoy -> failureCode must NOT be positive; classifier returns inconclusive.
+  const decoy404Ver = verifyReceipt(
+    {
+      vulnClass: 'bola',
+      target: { origin: ORIGIN, method: 'GET', pathAndQuery: '/api/invoices/inv_1' },
+      exchangeIds: ['ctl', 'prb404'],
+      oobEventIds: [],
+      browserTraceIds: [],
+      claimedDelta: '404 decoy probe',
+      resourceTenant: 'tenant-a',
+    },
+    {
+      entries: [
+        { exchangeId: 'ctl', origin: ORIGIN, step: { id: 'ctl', arm: 'control', method: 'GET', route: '/api/invoices/inv_1', pathAndQuery: '/api/invoices/inv_1', status: 200, actor: { handle: 'owner_a', role: 'owner', tenant: 'tenant-a', auth: 'bearer', sameSite: null }, json: { id: 'inv_1' } } },
+        { exchangeId: 'prb404', origin: ORIGIN, step: { id: 'prb404', arm: 'probe', method: 'GET', route: '/api/invoices/inv_1', pathAndQuery: '/api/invoices/inv_1', status: 404, actor: { handle: 'member_b', role: 'member', tenant: 'tenant-b', auth: 'bearer', sameSite: null }, json: { error: 'not_found' } } },
+      ],
+    },
+  )
+  assert.equal(decoy404Ver.confirmed, false)
+  assert.equal(decoy404Ver.failureCode, 'oracle_disagreement')
+  assert.equal(isPositiveRemediationOracleCode(decoy404Ver.failureCode), false)
+  assert.equal(
+    classifyAgentScriptOracleFailure({
+      hasCompositeFailure: false, drifted: false, hasCaptureWithClaims: true, receiptBuilt: true,
+      verdictReason: 'oracle_failed', oracleFailureCode: decoy404Ver.failureCode, rejectedByReceipt: true,
+      attempts: [{ exitCode: 0, signaturesValid: true, nonceMismatch: false, oraclePassed: false }],
+      exchanges: [
+        { exchangeId: 'ctl', origin: ORIGIN, method: 'GET', pathAndQuery: '/api/invoices/inv_1', status: 200, body: '{}', sessionRole: 'control', personaHandle: 'owner_a' },
+        { exchangeId: 'prb404', origin: ORIGIN, method: 'GET', pathAndQuery: '/api/invoices/inv_1', status: 404, body: '{}', sessionRole: 'probe', personaHandle: 'member_b' },
+      ],
+      vulnClass: 'bola',
+    }),
+    'receipt_unbuildable',
+    '404 decoy probe must stay inconclusive, never claim_not_reproduced',
+  )
+
+  // (b) 202 job-stub mutation with identical readbacks -> failureCode must NOT be positive!
+  const jobStub202Ver = verifyReceipt(
+    {
+      vulnClass: 'mass_assignment',
+      target: { origin: ORIGIN, method: 'PATCH', pathAndQuery: '/api/profile' },
+      exchangeIds: ['r1', 'mut202', 'r2'],
+      oobEventIds: [],
+      browserTraceIds: [],
+      claimedDelta: 'Mass assignment job stub',
+    },
+    {
+      entries: [
+        { exchangeId: 'r1', origin: ORIGIN, step: { id: 'r1', arm: 'control', method: 'GET', route: '/api/profile', pathAndQuery: '/api/profile', status: 200, actor: { handle: 'member_a', role: 'member', tenant: 'tenant-a', auth: 'bearer', sameSite: null }, json: { role: 'member' } } },
+        { exchangeId: 'mut202', origin: ORIGIN, step: { id: 'mut202', arm: 'probe', method: 'PATCH', route: '/api/profile', pathAndQuery: '/api/profile', status: 202, requestJson: { role: 'admin' }, actor: { handle: 'member_a', role: 'member', tenant: 'tenant-a', auth: 'bearer', sameSite: null }, json: { jobId: 'job_99', status: 'queued' } } },
+        { exchangeId: 'r2', origin: ORIGIN, step: { id: 'r2', arm: 'control', method: 'GET', route: '/api/profile', pathAndQuery: '/api/profile', status: 200, actor: { handle: 'member_a', role: 'member', tenant: 'tenant-a', auth: 'bearer', sameSite: null }, json: { role: 'member' } } },
+      ],
+    },
+  )
+  assert.equal(jobStub202Ver.confirmed, false)
+  assert.equal(jobStub202Ver.failureCode, 'oracle_disagreement')
+  assert.equal(isPositiveRemediationOracleCode(jobStub202Ver.failureCode), false)
+  assert.equal(
+    classifyAgentScriptOracleFailure({
+      hasCompositeFailure: false, drifted: false, hasCaptureWithClaims: true, receiptBuilt: true,
+      verdictReason: 'oracle_failed', oracleFailureCode: jobStub202Ver.failureCode, rejectedByReceipt: true,
+      attempts: [{ exitCode: 0, signaturesValid: true, nonceMismatch: false, oraclePassed: false }],
+      exchanges: [
+        { exchangeId: 'r1', origin: ORIGIN, method: 'GET', pathAndQuery: '/api/profile', status: 200, body: '{"role":"member"}', sessionRole: 'control', personaHandle: 'member_a' },
+        { exchangeId: 'mut202', origin: ORIGIN, method: 'PATCH', pathAndQuery: '/api/profile', status: 202, body: '{"jobId":"job_99","status":"queued"}', sessionRole: 'probe', personaHandle: 'member_a' },
+        { exchangeId: 'r2', origin: ORIGIN, method: 'GET', pathAndQuery: '/api/profile', status: 200, body: '{"role":"member"}', sessionRole: 'control', personaHandle: 'member_a' },
+      ],
+      vulnClass: 'mass_assignment',
+    }),
+    'receipt_unbuildable',
+    '202 job-stub mutation must stay inconclusive, never claim_not_reproduced',
+  )
+
+  // (c) Echoed-only Boolean differential -> failureCode must NOT be positive!
+  const echoedBool = assessBooleanDifferential({
+    param: 'q',
+    rounds: [
+      {
+        baseline: { status: 200, method: 'GET', origin: ORIGIN, persona: null, pathAndQuery: '/search?q=item', json: { q: 'item', items: [1, 2] } },
+        control: { status: 200, method: 'GET', origin: ORIGIN, persona: null, pathAndQuery: '/search?q=item%20AND%201%3D1', json: { q: 'item AND 1=1', items: [1, 2] } },
+        probe: { status: 200, method: 'GET', origin: ORIGIN, persona: null, pathAndQuery: '/search?q=item%20AND%201%3D2', json: { q: '', items: [1, 2] } },
+      },
+      {
+        baseline: { status: 200, method: 'GET', origin: ORIGIN, persona: null, pathAndQuery: '/search?q=item', json: { q: 'item', items: [1, 2] } },
+        control: { status: 200, method: 'GET', origin: ORIGIN, persona: null, pathAndQuery: '/search?q=item%20AND%202%3D2', json: { q: 'item AND 2=2', items: [1, 2] } },
+        probe: { status: 200, method: 'GET', origin: ORIGIN, persona: null, pathAndQuery: '/search?q=item%20AND%202%3D3', json: { q: '', items: [1, 2] } },
+      },
+    ],
+  })
+  assert.equal(echoedBool.satisfied, false)
+  assert.equal((echoedBool.evidence as { echoedOnly?: boolean }).echoedOnly, true, 'assessBooleanDifferential must mark echoed reflection as echoedOnly=true')
+  const echoedCode = deriveBooleanRemediationCode(echoedBool.evidence as Record<string, unknown>)
+  assert.equal(echoedCode, 'oracle_disagreement', 'echoed-only boolean reflection must never emit positive remediation code')
+  assert.equal(isPositiveRemediationOracleCode(echoedCode), false)
+  assert.equal(
+    classifyAgentScriptOracleFailure({
+      hasCompositeFailure: false, drifted: false, hasCaptureWithClaims: true, receiptBuilt: true,
+      verdictReason: 'oracle_failed', oracleFailureCode: echoedCode, rejectedByReceipt: true,
+      attempts: [{ exitCode: 0, signaturesValid: true, nonceMismatch: false, oraclePassed: false }],
+      exchanges: [
+        { exchangeId: 'c1', origin: ORIGIN, method: 'GET', pathAndQuery: '/search?q=item', status: 200, body: '{}', sessionRole: 'control' },
+        { exchangeId: 'p1', origin: ORIGIN, method: 'GET', pathAndQuery: '/search?q=item', status: 200, body: '{}', sessionRole: 'probe' },
+      ],
+      vulnClass: 'sqli',
+    }),
+    'receipt_unbuildable',
+  )
+  // Contrast: genuine identical-response boolean remediation (no reflection, empty changedPaths) DOES emit positive code.
+  const cleanRemediatedBool = assessBooleanDifferential({
+    param: 'q',
+    rounds: [
+      {
+        baseline: { status: 200, method: 'GET', origin: ORIGIN, persona: null, pathAndQuery: '/search?q=item', json: { items: [1, 2] } },
+        control: { status: 200, method: 'GET', origin: ORIGIN, persona: null, pathAndQuery: '/search?q=item%20AND%201%3D1', json: { items: [1, 2] } },
+        probe: { status: 200, method: 'GET', origin: ORIGIN, persona: null, pathAndQuery: '/search?q=item%20AND%201%3D2', json: { items: [1, 2] } },
+      },
+      {
+        baseline: { status: 200, method: 'GET', origin: ORIGIN, persona: null, pathAndQuery: '/search?q=item', json: { items: [1, 2] } },
+        control: { status: 200, method: 'GET', origin: ORIGIN, persona: null, pathAndQuery: '/search?q=item%20AND%202%3D2', json: { items: [1, 2] } },
+        probe: { status: 200, method: 'GET', origin: ORIGIN, persona: null, pathAndQuery: '/search?q=item%20AND%202%3D3', json: { items: [1, 2] } },
+      },
+    ],
+  })
+  assert.equal(cleanRemediatedBool.satisfied, false)
+  assert.equal(deriveBooleanRemediationCode(cleanRemediatedBool.evidence as Record<string, unknown>), 'remediation_boolean_no_delta')
+
+  // (d) Anonymous control paired with authenticated probe -> failureCode must NOT be positive!
+  const anonControlCode = deriveImpactRemediationCode('authorization', [
+    { arm: 'control', method: 'GET', status: 200, route: '/api/invoices/inv_1', actor: { handle: null, tenant: null } },
+    { arm: 'probe', method: 'GET', status: 403, route: '/api/invoices/inv_1', actor: { handle: 'member_b', tenant: 'tenant-b' } },
+  ])
+  assert.equal(anonControlCode, 'oracle_disagreement', 'anonymous control with authenticated probe must never emit positive remediation code')
+  assert.equal(isPositiveRemediationOracleCode(anonControlCode), false)
+  assert.equal(
+    classifyAgentScriptOracleFailure({
+      hasCompositeFailure: false, drifted: false, hasCaptureWithClaims: true, receiptBuilt: true,
+      verdictReason: 'oracle_failed', oracleFailureCode: anonControlCode, rejectedByReceipt: true,
+      attempts: [{ exitCode: 0, signaturesValid: true, nonceMismatch: false, oraclePassed: false }],
+      exchanges: [
+        { exchangeId: 'ctl', origin: ORIGIN, method: 'GET', pathAndQuery: '/api/invoices/inv_1', status: 200, body: '{}', sessionRole: 'control' },
+        { exchangeId: 'prb', origin: ORIGIN, method: 'GET', pathAndQuery: '/api/invoices/inv_1', status: 403, body: '{}', sessionRole: 'probe', personaHandle: 'member_b' },
+      ],
+      vulnClass: 'bola',
+    }),
+    'receipt_unbuildable',
+    'anonymous control rejection must stay inconclusive, never claim_not_reproduced',
+  )
 })
 
 // ============================================================================

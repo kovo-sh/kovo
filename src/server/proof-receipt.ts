@@ -1508,7 +1508,7 @@ export function verifyReceipt(
     }
     return {
       confirmed: false, vulnClass: receipt.vulnClass, rule,
-      failureCode: deriveImpactRemediationCode(impactClass!, steps),
+      failureCode: deriveImpactRemediationCode(impactClass!, steps, assessment.evidence as Record<string, unknown> | undefined),
       reason: assessment.reason, observed: receipt.claimedDelta,
       expected: 'persisted/observable impact that the recorded exchanges substantiate',
       evidence: assessment.evidence,

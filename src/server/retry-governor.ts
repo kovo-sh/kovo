@@ -111,26 +111,51 @@ export function isTypedOracleRemediationCode(
 /**
  * Derive host-owned `OracleFailureCode` from structured `assessBooleanDifferential` evidence.
  * Returns `'remediation_boolean_no_delta'` ONLY when baseline/control/probe stability and
- * true===baseline equivalence all passed and no structural differential existed.
+ * true===baseline equivalence all passed, the result was NOT echoed-only reflection, and
+ * `changedPaths` is empty. Echoed-only / unstable / incomplete evidence fails closed to
+ * `'oracle_disagreement'`.
  */
 export function deriveBooleanRemediationCode(
   evidence: Record<string, unknown> | undefined,
 ): OracleFailureCode {
   if (!evidence) return 'oracle_disagreement'
+  if (evidence.echoedOnly === true) return 'oracle_disagreement'
+  if (Array.isArray(evidence.echoPaths) && evidence.echoPaths.length > 0) return 'oracle_disagreement'
   const stableTriangle = evidence.baselineStable === true
     && evidence.controlStable === true
     && evidence.probeStable === true
     && evidence.trueMatchesBaseline === true
   if (!stableTriangle) return 'oracle_disagreement'
-  const noDelta = evidence.echoedOnly === true
-    || (Array.isArray(evidence.changedPaths) && evidence.changedPaths.length === 0)
+  const noDelta = Array.isArray(evidence.changedPaths) && evidence.changedPaths.length === 0
   return noDelta ? 'remediation_boolean_no_delta' : 'oracle_disagreement'
+}
+
+const MUTATING_HTTP_METHODS: ReadonlySet<string> = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
+
+function isJobStubBody(json: unknown): boolean {
+  if (!json || typeof json !== 'object' || Array.isArray(json)) return false
+  const rec = json as Record<string, unknown>
+  const hasJobKey = typeof rec.jobId === 'string' || typeof rec.job_id === 'string' || typeof rec.taskId === 'string' || typeof rec.task_id === 'string'
+  const statusStr = typeof rec.status === 'string' ? rec.status.toLowerCase() : ''
+  return hasJobKey || statusStr === 'queued' || statusStr === 'pending' || statusStr === 'accepted'
+}
+
+function normalizedStepRoute(step: { route?: string | null; pathAndQuery?: string | null }): string {
+  const raw = (step.route ?? step.pathAndQuery ?? '').trim()
+  return raw.split(/[?#]/, 1)[0] ?? ''
 }
 
 /**
  * Derive host-owned `OracleFailureCode` from structured impact verification steps when
- * `assessImpactEvidence` did not confirm. Fails closed to `'oracle_disagreement'` unless
- * host-observed arms positively prove denial or idempotent readback.
+ * `assessImpactEvidence` did not confirm. Fails closed to `'oracle_disagreement'` unless:
+ *   - Access/disclosure: a healthy 2xx control arm exists on the same route (authenticated
+ *     when probes are authenticated) AND every probe was strictly denied with 403 (or 401
+ *     for unauthenticated probes). HTTP 404, 5xx, 202, and anonymous-only controls NEVER
+ *     emit a positive remediation code.
+ *   - Persisted mutation (`mass_assignment`/`business_logic`/`csrf`): no stub/decoy/echoed/
+ *     anon-control rejection flag in `evidence`, AND either all probes were strictly denied
+ *     alongside a healthy 2xx control OR an acknowledged non-202, non-stub 2xx mutation is
+ *     chronologically bracketed by same-route 2xx readbacks with identical JSON state.
  */
 export function deriveImpactRemediationCode(
   impactClass: string,
@@ -138,25 +163,68 @@ export function deriveImpactRemediationCode(
     arm: string
     method: string
     status: number | null
-    actor: { handle?: string | null }
+    route?: string | null
+    pathAndQuery?: string | null
+    actor: { handle?: string | null; tenant?: string | null }
     json?: unknown
   }>,
+  evidence?: Record<string, unknown>,
 ): OracleFailureCode {
+  if (
+    evidence
+    && (evidence.stub === true
+      || evidence.decoy === true
+      || evidence.echoed === true
+      || evidence.echoedOnly === true
+      || evidence.anonControlOnly === true)
+  ) {
+    return 'oracle_disagreement'
+  }
   const controls = steps.filter(s => s.arm === 'control')
   const probes = steps.filter(s => s.arm === 'probe')
   if (controls.length === 0 || probes.length === 0) return 'oracle_disagreement'
-  const isDenied = (s: { status: number | null; actor: { handle?: string | null } }) =>
-    s.status === 403 || s.status === 404 || (!s.actor.handle && s.status === 401)
+  const is2xx = (status: number | null): boolean => status !== null && status >= 200 && status < 300
+  const isStrictDenial = (s: { status: number | null; actor: { handle?: string | null } }): boolean =>
+    s.status === 403 || (!s.actor.handle && s.status === 401)
+  const anyAuthProbe = probes.some(p => Boolean(p.actor.handle && p.actor.handle.trim()))
+  const healthyControls = controls.filter(c => is2xx(c.status) && (!anyAuthProbe || Boolean(c.actor.handle && c.actor.handle.trim())))
+  const sharesControlRoute = (targetRoute: string): boolean =>
+    !targetRoute || healthyControls.some(c => {
+      const cr = normalizedStepRoute(c)
+      return !cr || cr === targetRoute
+    })
+
   if (impactClass === 'authorization' || impactClass === 'bfla' || impactClass === 'disclosure') {
-    return probes.every(isDenied) ? 'remediation_access_denied' : 'oracle_disagreement'
+    if (healthyControls.length === 0) return 'oracle_disagreement'
+    const allStrictlyDenied = probes.every(p => isStrictDenial(p) && sharesControlRoute(normalizedStepRoute(p)))
+    return allStrictlyDenied ? 'remediation_access_denied' : 'oracle_disagreement'
   }
   if (impactClass === 'mass_assignment' || impactClass === 'business_logic' || impactClass === 'csrf') {
-    if (probes.every(isDenied)) return 'remediation_mutation_idempotent'
-    const reads = steps.filter(s => (s.method === 'GET' || s.method === 'HEAD') && s.status !== null && s.status >= 200 && s.status < 300 && s.json !== undefined)
-    if (reads.length >= 2) {
-      const first = JSON.stringify(reads[0]!.json)
-      const last = JSON.stringify(reads[reads.length - 1]!.json)
-      if (first === last) return 'remediation_mutation_idempotent'
+    if (healthyControls.length > 0 && probes.every(p => isStrictDenial(p) && sharesControlRoute(normalizedStepRoute(p)))) {
+      return 'remediation_mutation_idempotent'
+    }
+    if (probes.some(p => p.status === null || p.status === 202 || p.status === 404 || p.status >= 500 || p.status === 429 || p.status === 408 || isJobStubBody(p.json))) {
+      return 'oracle_disagreement'
+    }
+    const mutProbeIdx = steps.findIndex(s =>
+      s.arm === 'probe'
+      && MUTATING_HTTP_METHODS.has(s.method.toUpperCase())
+      && is2xx(s.status)
+      && s.status !== 202
+      && !isJobStubBody(s.json),
+    )
+    if (mutProbeIdx < 0) return 'oracle_disagreement'
+    const readBefore = [...steps.slice(0, mutProbeIdx)]
+      .reverse()
+      .find(s => (s.method.toUpperCase() === 'GET' || s.method.toUpperCase() === 'HEAD') && is2xx(s.status) && s.json !== undefined)
+    const readAfter = steps.slice(mutProbeIdx + 1)
+      .find(s => (s.method.toUpperCase() === 'GET' || s.method.toUpperCase() === 'HEAD') && is2xx(s.status) && s.json !== undefined)
+    if (!readBefore || !readAfter) return 'oracle_disagreement'
+    const beforeRoute = normalizedStepRoute(readBefore)
+    const afterRoute = normalizedStepRoute(readAfter)
+    if (beforeRoute && afterRoute && beforeRoute !== afterRoute) return 'oracle_disagreement'
+    if (JSON.stringify(readBefore.json) === JSON.stringify(readAfter.json)) {
+      return 'remediation_mutation_idempotent'
     }
   }
   return 'oracle_disagreement'
