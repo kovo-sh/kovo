@@ -1,0 +1,88 @@
+{
+  "id": "r4-h5-h6-rbac-fp",
+  "side": "fp",
+  "archetype": "r4-h5-h6-honest-rbac-sibling-control",
+  "description": "R4-H-5/R4-H-6 FP: honest per-object RBAC (member lists own items, reads own object 200, and gets 403 on a sibling foreign object ID) must never confirm broken_access_control/bola/idor.",
+  "canonicalLabel": {
+    "cwe": "CWE-639",
+    "category": "bola",
+    "title": "Honest per-object RBAC sibling-ID control mismatch",
+    "impact": "Caller reads its own authorized object after observing 403 on a foreign sibling object ID; no authorization boundary was crossed.",
+    "claimedImpact": "authorization",
+    "claimedBoundary": "access",
+    "vulnClass": "broken_access_control"
+  },
+  "freeTextLabel": {
+    "title": "Per-object authorization check comparing own resource read against foreign resource denial"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": false,
+    "evaluateClaims": true,
+    "composite": true,
+    "floorInjectionRecipe": false
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [
+    {
+      "handle": "member_a",
+      "roleLabel": "member (org_a)",
+      "role": "member",
+      "tenant": "org_a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-r4h5-member-a"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "hop1_ex",
+      "arm": "probe",
+      "role": "setup",
+      "method": "GET",
+      "pathAndQuery": "/api/v1/items",
+      "persona": "member_a",
+      "emittedCapabilities": ["cap:hop_1:own_item_ref"],
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"items\":[{\"id\":\"item-8f7e6d5c\",\"tenantId\":\"org_a\",\"owner\":\"member_a\"}]}"
+    },
+    {
+      "id": "hop2_ctl",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/v1/items/item-1a2b3c4d",
+      "persona": "member_a",
+      "status": 403,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"error\":\"forbidden\"}"
+    },
+    {
+      "id": "hop2_prb",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/v1/items/item-8f7e6d5c",
+      "persona": "member_a",
+      "consumedCapabilities": ["cap:hop_1:own_item_ref"],
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"id\":\"item-8f7e6d5c\",\"tenantId\":\"org_a\",\"owner\":\"member_a\",\"amount\":4200}"
+    }
+  ],
+  "composite": {
+    "chainId": "PARITY-R4-H5-H6-RBAC-FP",
+    "terminalVulnClass": "broken_access_control",
+    "oracleFamily": "dual_tenant_abac",
+    "capabilityToken": "own_item_ref",
+    "attackerPersonas": ["member_a"],
+    "expectedFailedStage": "terminal_impact",
+    "claimedDelta": "Honest per-object RBAC (own object 200 vs foreign sibling object 403) must fail closed at terminal_impact."
+  }
+}

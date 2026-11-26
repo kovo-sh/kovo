@@ -138,6 +138,8 @@ function publicOrigins(lab: StartedLab): Record<string, string> {
 }
 
 function personaLabel(id: string, tenant: string, roles: Record<string, string>): string {
+  const entries = Object.entries(roles)
+  if (entries.length > 1) return entries.map(([t, r]) => `${r} (${t})`).join(', ')
   const role = roles[tenant] ?? Object.values(roles)[0] ?? 'member'
   return `${role} (${tenant})`
 }
@@ -322,8 +324,15 @@ if (!payout) return ctx.result({ title })
 const memberA = await login('member_a')
 if (!memberA) return ctx.result({ title })
 const payoutPath = \`\${cfg.routePrefix}/payouts/\${payout.id}\`
-const control = await send('api', \`\${payoutPath}/approve\`, {
+await send('api', \`\${payoutPath}/approve\`, {
   ...bearer(memberA, 'member_a'),
+  method: 'POST',
+  role: 'control',
+  replayAttempt: 'ablation_control',
+  entityId: payout.id,
+})
+const control = await send('api', \`\${payoutPath}/approve\`, {
+  ...bearer(financeCap, 'member_b'),
   method: 'POST',
   role: 'control',
   replayAttempt: 'ablation_control',
@@ -1123,9 +1132,23 @@ const poll = await ctx.await_async({
 if (!poll.converged || !poll.exchange) return ctx.result({ title })
 const h3 = poll.exchange
 const resultPath = \`\${cfg.routePrefix}/exports/\${jobCap.handle}/result\`
-const controlUser = await login('member_b')
-if (!controlUser) return ctx.result({ title })
-const terminalControl = await send('api', resultPath, { ...bearer(controlUser, 'member_b'), role: 'control', replayAttempt: 'ablation_control', entityId: jobId })
+const ctrlLoginRec = cfg.personas.revoked_or_demoted
+const ctrlLoginEx = await send(cfg.loginService, '/login', {
+  as: 'revoked_or_demoted',
+  role: 'setup',
+  method: 'POST',
+  body: { email: ctrlLoginRec.email, password: ctrlLoginRec.password, tenant: ctrlLoginRec.tenant },
+})
+if (ctrlLoginEx.status !== 200) return ctx.result({ title })
+const controlUser = await ctx.seal_capability({
+  exchange: ctrlLoginEx,
+  hopReceiptId: 'setup',
+  slot: 'revoked_or_demoted_ctrl_session',
+  jsonPath: '$.token',
+  kind: 'bearer_token',
+  allowedOrigins: Object.values(cfg.publicOrigins),
+})
+const terminalControl = await send('api', resultPath, { ...bearer(controlUser, 'revoked_or_demoted'), role: 'control', replayAttempt: 'ablation_control', entityId: jobId })
 const h4 = await send('api', resultPath, {
   capability: { handle: member.handle, target: 'bearer' },
   entityId: jobId,

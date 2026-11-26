@@ -20,12 +20,11 @@ import {
   type CompositeVerifyOptions,
   type HostSignedTranscript,
 } from './composite-receipt.ts'
-import { normalizeCompositeTerminalEndpoint } from './causal-proof-compiler.ts'
+import { normalizeCompositeTerminalEndpoint, parsePersonaPrivilegeProfile } from './causal-proof-compiler.ts'
 import { DerivedCapabilityVault, type DerivedCapabilityMeta } from './derived-custody.ts'
 import { createEgressSanitizer, type EgressSanitizer } from './egress-sanitizer.ts'
 import { HostFactLog } from './host-fact-log.ts'
 import { parseRoleLabel } from './oracle-invariants.ts'
-import { isPrivilegedActorOrRole } from './v8-oracle-hydrate.ts'
 import { buildAgentScriptReceipt } from './proof-receipt.ts'
 import type { ProofReceipt, ReceiptVerification, ScriptProofExchange } from './proof-receipt.ts'
 import { defaultTerminalOracleRegistry } from './terminal-oracle-registry.ts'
@@ -319,11 +318,12 @@ class CapturingVerifyRpcServer extends VerifyRpcServer {
 }
 
 /**
- * H-11: Derive `CompositeVerifyOptions` attacker/forbidden-shortcut persona lists from the run's
- * `Grant` whenever the caller did not supply explicit options. Routes through tenant-aware
- * `isPrivilegedActorOrRole` so multi-tenant personas (`dual_tenant_abac`: admin in tenant A +
- * low-priv in tenant B) are not wrongly blacklisted as `forbiddenShortcutPersonas`, while single-
- * tenant admins, owners, and global superadmins remain strictly forbidden.
+ * H-11 / R4-H-6: Derive `CompositeVerifyOptions` attacker/forbidden-shortcut persona lists from
+ * the run's `Grant` whenever the caller did not supply explicit options. Mixed-role / dual-
+ * membership personas (admin in tenant A, low-priv in tenant B) stay in `forbiddenShortcutPersonas`
+ * by default (never unconditionally in `attackerPersonas`) and are recorded in
+ * `dualTenantAbacPersonas` + `personaRoleLabels` so `verifyAttackerProvenance` permits them ONLY
+ * when acting in a host-bound non-admin tenant under an explicit `dual_tenant_abac` oracle.
  */
 export function buildCompositeVerifyOptionsFromGrant(
   grant: Pick<Grant, 'personas'>,
@@ -331,11 +331,17 @@ export function buildCompositeVerifyOptionsFromGrant(
   if (!grant.personas || grant.personas.size === 0) return undefined
   const attackerPersonas: string[] = []
   const forbiddenShortcutPersonas: string[] = []
+  const dualTenantAbacPersonas: string[] = []
+  const personaRoleLabels: Record<string, string> = {}
   for (const [handle, persona] of grant.personas.entries()) {
+    if (persona.roleLabel?.trim()) personaRoleLabels[handle] = persona.roleLabel
     const parsed = parseRoleLabel(persona.roleLabel)
-    const isPrivileged = isPrivilegedActorOrRole(handle, parsed.role, persona.roleLabel)
-    if (isPrivileged) {
+    const profile = parsePersonaPrivilegeProfile(handle, parsed.role, persona.roleLabel)
+    if (profile.alwaysForbidden) {
       forbiddenShortcutPersonas.push(handle)
+    } else if (profile.isMixedDual) {
+      forbiddenShortcutPersonas.push(handle)
+      dualTenantAbacPersonas.push(handle)
     } else {
       attackerPersonas.push(handle)
     }
@@ -344,6 +350,8 @@ export function buildCompositeVerifyOptionsFromGrant(
   return {
     ...(attackerPersonas.length ? { attackerPersonas } : {}),
     ...(forbiddenShortcutPersonas.length ? { forbiddenShortcutPersonas } : {}),
+    ...(dualTenantAbacPersonas.length ? { dualTenantAbacPersonas } : {}),
+    ...(Object.keys(personaRoleLabels).length ? { personaRoleLabels } : {}),
   }
 }
 
