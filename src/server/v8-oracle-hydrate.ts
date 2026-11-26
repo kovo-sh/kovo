@@ -12,7 +12,7 @@ import { createHash } from 'node:crypto'
 import { parseBodyFromCarrierText } from './host-fact-log.ts'
 import { ROLE_RANK, normalizeRole, parseRoleLabel, parseRoleMemberships, stepReadsState, type RoleName } from './oracle-invariants.ts'
 import type { ProofReceipt } from './proof-receipt.ts'
-import { extractResponseScope, extractTenantMarkers, findNonErrorBatchRecord, isJobOrHandleStub, type HostSignedRecord, type V8OracleFamily } from './v8-oracle-families.ts'
+import { deriveRecordAuthzDimension, extractIssuedSignedUrl, extractTenantMarkers, findNonErrorBatchRecord, isJobOrHandleStub, type HostAuthzDimension, type HostSignedRecord, type V8OracleFamily } from './v8-oracle-families.ts'
 
 export interface HydratableEntry {
   exchangeId: string
@@ -360,8 +360,10 @@ export function toOracleRecord(e: HydratableEntry, fallbackSig: string): HostSig
     status: e.step.status,
     method: e.step.method,
     route: e.step.route ?? e.step.pathAndQuery,
+    pathAndQuery: e.step.pathAndQuery,
     actorId: actorOfEntry(e),
     tenantId: e.step.actor.tenant ?? null,
+    entityId: e.entityId ?? null,
     body: e.step.body,
     json: e.step.json,
     requestHeaders: e.step.requestHeaders ?? null,
@@ -705,14 +707,15 @@ function extractRequestSigDigest(rec: HostSignedRecord | undefined, entry?: Hydr
 
 function extractIssuedSigDigest(entry: HydratableEntry | undefined): string | undefined {
   if (!entry) return undefined
-  const json = entry.step.json
-  if (json && typeof json === 'object') {
-    const sigVal = findStringField(json, ['signature', 'sig', 'hmac', 'mac', 'signedurl', 'signed_url', 'presignedurl', 'presigned_url'])
-    if (sigVal && !sigVal.includes('[redacted')) {
-      const m = /[?&](?:sig|signature|hmac|mac)=([^&]+)/i.exec(sigVal)
-      if (!m?.[1]) return sha256Hex(sigVal)
-      try { return sha256Hex(decodeURIComponent(m[1])) } catch { return sha256Hex(m[1]) }
-    }
+  const issuedUrl = extractIssuedSignedUrl(entry.step.json, entry.step.body)
+  if (issuedUrl && !issuedUrl.includes('[redacted')) {
+    const m = /[?&](?:sig|signature|hmac|mac|token|x-amz-signature)=([^&#]+)/i.exec(issuedUrl)
+    if (m?.[1]) { try { return sha256Hex(decodeURIComponent(m[1])) } catch { return sha256Hex(m[1]) } }
+  }
+  const parsed = entry.step.json !== undefined ? entry.step.json : (typeof entry.step.body === 'string' && /^[\[{]/.test(entry.step.body.trim()) ? (() => { try { return JSON.parse(entry.step.body!) } catch { return undefined } })() : undefined)
+  if (parsed && typeof parsed === 'object') {
+    const sigVal = findStringField(parsed, ['signature', 'sig', 'hmac', 'mac'])
+    if (sigVal && !sigVal.includes('[redacted')) return sha256Hex(sigVal)
   }
   return undefined
 }
@@ -860,6 +863,15 @@ export function hydrateV8OracleInput(
     if (hydrateRoleField(out, rawInput, field, idx, fallbackSig, extraAlias)) explicit.add(field)
   }
 
+  const hostAuthzDim = (e: HydratableEntry | undefined, capIdx?: CapOriginIndex, preferredTenant?: string, stripUrlTokens = false): HostAuthzDimension => {
+    let capT = ''
+    if (e && capIdx) {
+      for (const c of [...(e.actorPersona?.startsWith('cap:') ? [e.actorPersona] : []), ...(e.consumedCapabilities ?? []), ...(e.emittedCapabilities ?? [])]) { const t = capIdx.emitterActorOf(c)?.tenant; if (t) { capT = t; break } }
+    }
+    const personaTenant = (e?.step.actor.tenant ?? parseRoleLabel(e?.actorRoleLabel ?? e?.actorPersona ?? '').tenant ?? capT).trim().toLowerCase()
+    return deriveRecordAuthzDimension(e ? { route: e.step.route, pathAndQuery: e.step.pathAndQuery, json: e.step.json, body: e.step.body, tenantId: personaTenant || null } : undefined, { personaTenant, preferredTenant, stripUrlTokens })
+  }
+
   if (family === 'dual_tenant_abac') {
     for (const [f, a] of [
       ['transferRecord', 'transferExchangeId'], ['postTransferReadback'], ['sourceControlDenied', 'sourceControlExchangeId'],
@@ -882,17 +894,9 @@ export function hydrateV8OracleInput(
       const v = pickStr(rawInput, k, 128)
       if (v && v.length >= MIN_TOKEN_LEN) out[k] = v
     }
-    const tenantOf = (e: HydratableEntry | undefined): string | null =>
-      (e?.step.actor.tenant ?? parseRoleLabel(e?.actorRoleLabel ?? e?.actorPersona ?? '').tenant ?? '').trim().toLowerCase() || null
-    // R3-C-5 + Move-1: derive tenant markers strictly from response-side non-error fields, stripping attacker-supplied URL path/query tokens.
-    const stripUrlToks = (e: HydratableEntry | undefined, ms: Set<string>): Set<string> => {
-      if (!e || ms.size === 0) return ms
-      const [p = '', q = ''] = (e.step.pathAndQuery ?? e.step.route ?? '').split('?', 2), u = new Set<string>()
-      for (const s of p.split('/')) if (s) { u.add(s.toLowerCase()); try { u.add(decodeURIComponent(s).toLowerCase()) } catch {} }
-      if (q) for (const v of new URLSearchParams(q.split('#', 1)[0]!).values()) if (v.trim()) u.add(v.trim().toLowerCase())
-      return new Set([...ms].filter(t => !u.has(t)))
-    }
-    const markersOf = (e: HydratableEntry | undefined): Set<string> => e ? stripUrlToks(e, extractTenantMarkers(e.step.json, e.step.body, true)) : new Set<string>()
+    const tenantOf = (e: HydratableEntry | undefined): string | null => hostAuthzDim(e).personaTenant || null
+    // R3-C-5 + Move-1 + R4-C-5: shared host-attested authz-dimension primitive, stripping attacker-supplied URL path/query tokens.
+    const markersOf = (e: HydratableEntry | undefined): Set<string> => hostAuthzDim(e, undefined, undefined, true).responseTenants
     const hostKnownTenants = new Set<string>()
     for (const e of idx.entriesById.values()) { const t = tenantOf(e); if (t) hostKnownTenants.add(t); if (e.actorRoleLabel) for (const m of parseRoleMemberships(e.actorRoleLabel)) if (m.tenant) hostKnownTenants.add(m.tenant.trim().toLowerCase()) }
     if (mode === 'cross_org_transfer') {
@@ -978,31 +982,24 @@ export function hydrateV8OracleInput(
     const tEntry = tRec ? idx.entriesById.get(tRec.id) : undefined
     const sEntry = sRec ? idx.entriesById.get(sRec.id) : undefined
     const rEntry = rRec ? idx.entriesById.get(rRec.id) : undefined
-    // R3-C-5: derive source/target tenant & scope strictly from host persona/capability metadata and response-side markers.
+    // R4-C-5: shared host-attested authz-dimension primitive; symmetric tenant derivation; signed-resource scope only (no route fallback or caller persona).
     const capIdx = buildCapOriginIndex(idx.entriesById.values(), ANON_HANDLE_RE)
-    const capTenantOf = (e: HydratableEntry | undefined): string => {
-      if (!e) return ''
-      for (const c of [...(e.actorPersona?.startsWith('cap:') ? [e.actorPersona] : []), ...(e.consumedCapabilities ?? []), ...(e.emittedCapabilities ?? [])]) { const t = capIdx.emitterActorOf(c)?.tenant; if (t) return t }
-      return ''
-    }
-    const hostActorOf = (e: HydratableEntry | undefined): string => { const a = e ? actorOfEntry(e)?.trim().toLowerCase() ?? '' : ''; return a && !ANON_HANDLE_RE.test(a) && !a.startsWith('cap:') ? a : '' }
-    const hostPersonaTenantOf = (e: HydratableEntry | undefined): string => (e?.step.actor.tenant ?? parseRoleLabel(e?.actorRoleLabel ?? '').tenant ?? capTenantOf(e) ?? '').trim().toLowerCase()
-    const sRespMarkers = sEntry ? extractTenantMarkers(sEntry.step.json, sEntry.step.body, true) : new Set<string>()
-    const rRespMarkers = rEntry ? extractTenantMarkers(rEntry.step.json, rEntry.step.body, true) : new Set<string>()
-    const hostSrcTenant = (hostPersonaTenantOf(sEntry) || [...sRespMarkers][0] || '').trim().toLowerCase()
-    const rawTarget = pickStr(rawInput, 'targetTenant', 128)?.toLowerCase() ?? ''
-    const hostDstTenant = ((rawTarget && rRespMarkers.has(rawTarget) ? rawTarget : [...rRespMarkers][0]) || hostPersonaTenantOf(rEntry)).trim().toLowerCase()
-    const sActor = hostActorOf(sEntry), rActor = hostActorOf(rEntry), distinctPersonas = Boolean(sActor && rActor && sActor !== rActor)
-    const hostScopeOf = (entry: HydratableEntry | undefined, tenant: string, actor: string): string => {
-      if (!entry) return ''
-      const respScope = extractResponseScope(entry.step.json, entry.step.body)
-      if (respScope) return respScope
-      const rt = (entry.step.route ?? entry.step.pathAndQuery ?? '').split('?', 1)[0]?.replace(/\/+$/, '').toLowerCase() ?? ''
-      if (distinctPersonas && actor && rt) return tenant ? `${tenant}:${actor}:${rt}` : `${actor}:${rt}`
-      return rt && tenant ? `${tenant}:${rt}` : rt
-    }
+    const sDim = hostAuthzDim(sEntry, capIdx, pickStr(rawInput, 'sourceTenant', 128)?.toLowerCase())
+    const rDim = hostAuthzDim(rEntry, capIdx, pickStr(rawInput, 'targetTenant', 128)?.toLowerCase())
+    const sCarriesSig = Boolean(extractRequestSigDigest(sRec, sEntry))
+    const sSignedRes = sDim.issuedSignedResource || (sCarriesSig ? sDim.requestSignedResource : '')
+    const rSignedRes = rDim.requestSignedResource
+    const hostSrcTenant = sDim.tenant
+    const hostDstTenant = rDim.responseTenants.size > 0 ? rDim.tenant : (hostSrcTenant || rDim.tenant)
     if (hostSrcTenant) out.sourceTenant = hostSrcTenant; if (hostDstTenant) out.targetTenant = hostDstTenant
-    const hostSrcScope = hostScopeOf(sEntry, hostSrcTenant, sActor), hostDstScope = hostScopeOf(rEntry, hostDstTenant, rActor)
+    if (sSignedRes) out.sourceSignedResource = sSignedRes; if (rSignedRes) out.targetSignedResource = rSignedRes
+    const [hostSrcScope, hostDstScope] = (sSignedRes && rSignedRes && sSignedRes !== rSignedRes)
+      ? [`resource:${sSignedRes}`, `resource:${rSignedRes}`]
+      : (sDim.responseScope && rDim.responseScope)
+        ? [sDim.responseScope, rDim.responseScope]
+        : (sSignedRes && rSignedRes)
+          ? [`resource:${sSignedRes}`, `resource:${rSignedRes}`]
+          : [hostSrcTenant ? `tenant:${hostSrcTenant}` : '', hostDstTenant ? `tenant:${hostDstTenant}` : '']
     if (hostSrcScope) out.sourceScope = hostSrcScope; if (hostDstScope) out.targetScope = hostDstScope
     // Bind cryptographic digests STRICTLY to cryptoAttestations or request signature/token headers/query —
     // NEVER response-body hashes (`observedResponseDigests` / `rec.artifactDigest`), and NEVER same exchange.
