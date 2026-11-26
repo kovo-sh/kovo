@@ -25,7 +25,6 @@ import {
   runAgentSession,
   selectPreInjectionSkills,
   summarizeKovoVerifyOutcome,
-  wallClockSettlementMs,
   workerInvestigationPrompt,
   type GapValidationEvent,
   type KovoVerifyArgs,
@@ -33,6 +32,11 @@ import {
   type ProofObligationEvent,
   type WorkerToolHandlers,
 } from './agent-session.ts'
+import {
+  detectKovoVerifyScriptAliases,
+  recordKovoVerifyAliasUsage,
+  type KovoVerifyAliasKey,
+} from './verify-runner.ts'
 import type { AgentTrace } from './agent-trace.ts'
 import {
   BrokerDenied,
@@ -162,9 +166,7 @@ export function computeWorkerWallClockPlan(input: {
   const remainingBudgetMs = Math.max(1, wallClockMs - preSessionElapsedMs)
   const isMultiHop = Boolean(input.isMultiHop)
 
-  const baseSettlementMs = isMultiHop
-    ? resolveWorkerSettlementMs(wallClockMs, true)
-    : wallClockSettlementMs(wallClockMs)
+  const baseSettlementMs = resolveWorkerSettlementMs(wallClockMs, isMultiHop)
   const effectiveSettlementMs = input.explicitSettlementMs !== undefined
     ? Math.max(1, Math.floor(input.explicitSettlementMs))
     : wallClockMs >= SETTLEMENT_LEAD_THRESHOLD_MS
@@ -1833,6 +1835,23 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
             if (!script) {
               throw new Error('kovo_verify requires `script` (inline) or `scriptPath` (a file in the mounted workspace).')
             }
+            const aliasHits: KovoVerifyAliasKey[] = [
+              ...(args.aliasUsed === 'code'
+                ? ['tool_arg:code' as const]
+                : args.aliasUsed === 'source'
+                  ? ['tool_arg:source' as const]
+                  : []),
+              ...detectKovoVerifyScriptAliases(script),
+            ]
+            const aliasSnapshot = recordKovoVerifyAliasUsage(curRun.id, aliasHits)
+            if (aliasHits.length > 0) {
+              this.host.safeEvent(
+                curRun.id,
+                'agent.verify_alias_usage',
+                `kovo_verify alias hit(s): ${aliasHits.join(', ')} (run total=${aliasSnapshot.totalAliasHits}/${aliasSnapshot.totalCalls} calls).`,
+                { assignmentId: job.assignment.id, stepId: step.id, aliases: aliasHits, snapshot: aliasSnapshot },
+              )
+            }
             const approved = this.host.approvedOriginsSet(curRun)
             const runVault = this.host.capabilityVaultFor(curRun.id)
             const verifySignal = toolSignal
@@ -1985,13 +2004,15 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
       })
 
       clearPreSessionTimer()
+      const preSessionElapsedMs = assignmentClock.activeElapsedMs()
       const wallPlan = computeWorkerWallClockPlan({
         wallClockMs: budget.wallClockMs,
-        preSessionElapsedMs: assignmentClock.activeElapsedMs(),
+        preSessionElapsedMs,
         explicitSettlementMs: budget.wallClockSettlementMs,
         isMultiHop: isMultiHopStep,
       })
       const effectiveSettlementMs = wallPlan.effectiveSettlementMs
+      const sessionSettlementMs = Math.max(1, effectiveSettlementMs - preSessionElapsedMs)
 
       // Pause-aware verify-grace supervision (backed strictly by `assignmentClock`):
       // - If an active proof call (`kovo_verify` / `verify_replay_spec`) is already in flight
@@ -2101,7 +2122,8 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
             },
             origins: targetOrigins,
             capabilityTier: run.capabilityTier,
-            maxTurns: job.assignment.maxTurns,
+            maxTurns: budget.maxTurns,
+            budget,
             personas: personasPub,
             ...(bolaTestQueue.length ? { bolaTestQueue } : {}),
             parentFacts: parentFacts.map(f => ({
@@ -2116,8 +2138,10 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
             ...(assignmentBrief ? { assignmentBrief } : {}),
           }),
           signal: sessionRotateController.signal,
+          budget,
           maxTurns: budget.maxTurns,
           wallClockMs: sessionWallClockMs,
+          wallClockSettlementMs: sessionSettlementMs,
           wallClockGraceMs: wallPlan.verifyGraceMs,
           activeClock: assignmentClock,
           onWallClockRotate: info => {

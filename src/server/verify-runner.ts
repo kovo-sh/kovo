@@ -43,6 +43,130 @@ export const KOVO_VERIFY_STDERR_PREVIEW_MAX_CHARS = 400
 export const KOVO_VERIFY_USAGE_HINT =
   'Inline TS scripts receive `ctx` directly (no imports required): `await ctx.prove_access_boundary({ controlPersona, probePersona, route }); return ctx.result({ title: "..." })` (or `export default async (ctx) => { ... }`).'
 
+/**
+ * Structured keys for host-observed `kovo_verify` tool-arg and script/SDK alias hits.
+ * Counted host-side before any future alias pruning so telemetry shows which aliases
+ * models actually rely on.
+ */
+export type KovoVerifyAliasKey =
+  | 'tool_arg:code'
+  | 'tool_arg:source'
+  | 'script:code_fence'
+  | 'script:bare_sdk_import'
+  | 'script:define_verification'
+  | 'script:export_default'
+  | 'script:named_verify_fn'
+  | 'sdk_arg:persona'
+  | 'sdk_arg:variant'
+  | 'sdk_arg:edges'
+  | 'sdk_arg:ablationExchange'
+  | 'sdk_arg:endpoint_target'
+
+export interface KovoVerifyAliasUsageSnapshot {
+  totalCalls: number
+  totalAliasHits: number
+  byAlias: Record<string, number>
+}
+
+const CODE_FENCE_RE = /^```[a-zA-Z0-9_-]*[ \t]*\r?\n([\s\S]*?)\r?\n```$/
+const BARE_SDK_IMPORT_RE = /\b(?:from\s*|import\(\s*)(['"])(?:\.\/)?kovo_verify(?:\.(?:mts|js|mjs))?\1/
+const DEFINE_VERIFICATION_RE = /\bdefineVerification\s*\(/
+const EXPORT_DEFAULT_ALIAS_RE = /(^|;[ \t]*|\n[ \t]*)export\s+default\s+/
+const NAMED_VERIFY_ALIAS_RE = /^[ \t]*(?:export\s+)?(?:(?:async\s+)?function\s+verify\s*\(|(?:const|let|var)\s+verify\s*=)/m
+const SDK_PERSONA_ALIAS_RE = /[{,]\s*persona\s*:/
+const SDK_VARIANT_ALIAS_RE = /[{,]\s*variant\s*:/
+const SDK_EDGES_ALIAS_RE = /[{,]\s*edges\s*:/
+const SDK_ABLATION_ALIAS_RE = /[{,]\s*ablationExchange\s*:/
+const SDK_ENDPOINT_TARGET_ALIAS_RE = /[{,]\s*endpoint\s*:/
+
+/** Pure static detector for authoring/SDK aliases inside a raw `kovo_verify` script. */
+export function detectKovoVerifyScriptAliases(rawCode: string): KovoVerifyAliasKey[] {
+  const hits: KovoVerifyAliasKey[] = []
+  const trimmed = (rawCode ?? '').trim()
+  if (!trimmed) return hits
+  if (CODE_FENCE_RE.test(trimmed)) hits.push('script:code_fence')
+  const unfenced = stripCodeFences(rawCode)
+  if (BARE_SDK_IMPORT_RE.test(unfenced)) hits.push('script:bare_sdk_import')
+  if (DEFINE_VERIFICATION_RE.test(unfenced)) hits.push('script:define_verification')
+  if (EXPORT_DEFAULT_ALIAS_RE.test(unfenced)) hits.push('script:export_default')
+  else if (NAMED_VERIFY_ALIAS_RE.test(unfenced)) hits.push('script:named_verify_fn')
+  if (SDK_PERSONA_ALIAS_RE.test(unfenced)) hits.push('sdk_arg:persona')
+  if (SDK_VARIANT_ALIAS_RE.test(unfenced)) hits.push('sdk_arg:variant')
+  if (SDK_EDGES_ALIAS_RE.test(unfenced)) hits.push('sdk_arg:edges')
+  if (SDK_ABLATION_ALIAS_RE.test(unfenced)) hits.push('sdk_arg:ablationExchange')
+  if (SDK_ENDPOINT_TARGET_ALIAS_RE.test(unfenced)) hits.push('sdk_arg:endpoint_target')
+  return hits
+}
+
+/** Mutable counter aggregating `kovo_verify` alias hits for a run or test scope. */
+export class KovoVerifyAliasCounter {
+  private totalCalls = 0
+  private totalAliasHits = 0
+  private readonly counts = new Map<string, number>()
+
+  recordCall(aliases: readonly KovoVerifyAliasKey[] = []): void {
+    this.totalCalls += 1
+    for (const key of aliases) {
+      this.totalAliasHits += 1
+      this.counts.set(key, (this.counts.get(key) ?? 0) + 1)
+    }
+  }
+
+  recordScript(rawCode: string, extraAliases: readonly KovoVerifyAliasKey[] = []): KovoVerifyAliasKey[] {
+    const detected = [...extraAliases, ...detectKovoVerifyScriptAliases(rawCode)]
+    this.recordCall(detected)
+    return detected
+  }
+
+  snapshot(): KovoVerifyAliasUsageSnapshot {
+    const byAlias: Record<string, number> = {}
+    for (const [key, count] of [...this.counts.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
+      byAlias[key] = count
+    }
+    return {
+      totalCalls: this.totalCalls,
+      totalAliasHits: this.totalAliasHits,
+      byAlias,
+    }
+  }
+
+  reset(): void {
+    this.totalCalls = 0
+    this.totalAliasHits = 0
+    this.counts.clear()
+  }
+}
+
+const runAliasCounters = new Map<string, KovoVerifyAliasCounter>()
+
+/** Record one `kovo_verify` invocation's alias hits under a run ID for telemetry reporting. */
+export function recordKovoVerifyAliasUsage(
+  runId: string,
+  aliases: readonly KovoVerifyAliasKey[],
+): KovoVerifyAliasUsageSnapshot {
+  let counter = runAliasCounters.get(runId)
+  if (!counter) {
+    counter = new KovoVerifyAliasCounter()
+    runAliasCounters.set(runId, counter)
+  }
+  counter.recordCall(aliases)
+  return counter.snapshot()
+}
+
+/** Read current host-side `kovo_verify` alias-usage telemetry for a run. */
+export function getKovoVerifyAliasUsage(runId: string): KovoVerifyAliasUsageSnapshot {
+  return runAliasCounters.get(runId)?.snapshot() ?? { totalCalls: 0, totalAliasHits: 0, byAlias: {} }
+}
+
+/** Clear stored `kovo_verify` alias counters for a run (e.g. test cleanup / run disposal). */
+export function resetKovoVerifyAliasUsage(runId?: string): void {
+  if (runId === undefined) {
+    runAliasCounters.clear()
+    return
+  }
+  runAliasCounters.delete(runId)
+}
+
 /** Strip accidental outer markdown code fences (```ts ... ```) from LLM scripts. */
 function stripCodeFences(rawCode: string): string {
   const trimmed = rawCode.trim()
@@ -255,6 +379,8 @@ export interface VerifyVerdict {
   stderrPreview?: string
   /** Actionable 1-line usage hint surfaced on `claims_missing` / execution failure. */
   usageHint?: string
+  /** Structured `kovo_verify` script/SDK alias keys detected on this verification call. */
+  aliasHits?: KovoVerifyAliasKey[]
 }
 
 export interface VerifyScriptOptions {
@@ -548,6 +674,7 @@ async function runAttemptSafe(
  *   5. the nonces differ and each proof document echoes its own attempt nonce.
  */
 export async function verifyScript(options: VerifyScriptOptions): Promise<VerifyVerdict> {
+  const aliasHits = detectKovoVerifyScriptAliases(options.candidate.code)
   const nonces: [string, string] = [randomBytes(16).toString('hex'), randomBytes(16).toString('hex')]
   const first = await runAttemptSafe(options, 1, nonces[0])
   const second = await runAttemptSafe(options, 2, nonces[1])
@@ -573,6 +700,7 @@ export async function verifyScript(options: VerifyScriptOptions): Promise<Verify
       ...(showDiagnostics && typeof failingExit === 'number' ? { exitCode: failingExit } : {}),
       ...(showDiagnostics ? { stderrPreview } : {}),
       ...(includeScriptDiagnostics ? { usageHint: KOVO_VERIFY_USAGE_HINT } : {}),
+      ...(aliasHits.length > 0 ? { aliasHits } : {}),
     }
   }
   const withFeedback = <T extends Omit<VerifyVerdict, 'rejectedBy' | 'missingEvidence' | 'transcriptSummary'>>(

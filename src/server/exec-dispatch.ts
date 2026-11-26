@@ -10,7 +10,7 @@ import {
   type OwaspCategory,
   type ThreatModelSummary,
 } from '../domain.ts'
-import { matchesMultiHopStepSignal } from './agent-prompts.ts'
+import { matchesMultiHopStepSignal, wallClockSettlementMs } from './agent-prompts.ts'
 import {
   classifyHostTier,
   routeStepToSpecialist,
@@ -3001,17 +3001,12 @@ export interface AssignmentBudget {
 }
 
 /**
- * Resolve when the worker settlement nudge fires:
- *  - Multi-hop `chain` steps settle at `max(wallMs - 25s, wallMs * 0.82)` so the worker keeps a
- *    full final turn to emit `ctx.prove_composite(...)`.
- *  - Non-chain steps keep the standard `max(wallMs - 15s, wallMs * 0.80)` schedule.
+ * Resolve when the worker settlement nudge fires — delegates to the single authoritative
+ * `wallClockSettlementMs` formula in `agent-prompts.ts` so dispatch, runner, and session
+ * share one wall-clock settlement schedule.
  */
 export function resolveWorkerSettlementMs(wallClockMs: number, isMultiHop: boolean): number {
-  const wall = Math.max(1, Math.floor(wallClockMs))
-  if (isMultiHop) {
-    return Math.max(1, Math.min(wall, Math.max(wall - MULTI_HOP_CHAIN_SETTLEMENT_BUFFER_MS, Math.floor(wall * MULTI_HOP_CHAIN_SETTLEMENT_SHARE))))
-  }
-  return Math.max(1, Math.min(wall, Math.max(wall - 15_000, Math.floor(wall * 0.8))))
+  return wallClockSettlementMs(wallClockMs, isMultiHop)
 }
 
 /** Classify a step descriptor into its canonical budget tier (`single_step` | `multi_step` | `multi_hop_chain`). */
