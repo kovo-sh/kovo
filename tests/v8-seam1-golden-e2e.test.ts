@@ -584,7 +584,7 @@ return await finish({
   chainId: cfg.chainId,
   terminalVulnClass: cfg.terminalVulnClass,
   hops: [
-    hop('pg-c4-h1', 'api', 'POST', \`\${cfg.routePrefix}/orders\`, h1, 'Duplicate-key cap bypass created an inflated order.', { producedCapabilities: [orderCap.handle], entityId: orderId }),
+    hop('pg-c4-h1', 'edge', 'POST', \`\${cfg.routePrefix}/orders\`, h1, 'Duplicate-key cap bypass created an inflated order.', { producedCapabilities: [orderCap.handle], entityId: orderId }),
     hop('pg-c4-h2', 'api', 'PATCH', \`\${orderPath}/rebind\`, h2, 'Authorized order was rebound to an attacker beneficiary.', { consumedCapabilities: [orderCap.handle], entityId: orderId }),
     hop('pg-c4-h3', 'api', 'POST', \`\${orderPath}/settle-race\`, h3, 'Concurrent captures overcredited the ledger.', { consumedCapabilities: [orderCap.handle], entityId: orderId }),
   ],
@@ -1123,7 +1123,9 @@ const poll = await ctx.await_async({
 if (!poll.converged || !poll.exchange) return ctx.result({ title })
 const h3 = poll.exchange
 const resultPath = \`\${cfg.routePrefix}/exports/\${jobCap.handle}/result\`
-const terminalControl = await send('api', resultPath, { role: 'control', replayAttempt: 'ablation_control', entityId: jobId })
+const controlUser = await login('member_b')
+if (!controlUser) return ctx.result({ title })
+const terminalControl = await send('api', resultPath, { ...bearer(controlUser, 'member_b'), role: 'control', replayAttempt: 'ablation_control', entityId: jobId })
 const h4 = await send('api', resultPath, {
   capability: { handle: member.handle, target: 'bearer' },
   entityId: jobId,
