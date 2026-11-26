@@ -1494,7 +1494,7 @@ export function syncVerifyArtifactsToLedger(input: {
   const hostEntryByExchangeId = new Map<string, HostTranscriptEntry>()
   const metaByPersona = new Map<string, PersonaMeta>()
   const rememberMeta = (handle: string | null | undefined, meta: PersonaMeta): void => {
-    const key = handle?.trim()
+    const key = handle?.trim().toLowerCase()
     if (!key) return
     const prev = metaByPersona.get(key)
     metaByPersona.set(key, {
@@ -1539,7 +1539,7 @@ export function syncVerifyArtifactsToLedger(input: {
         if (candActor && candActor === target) { hostEntry = candHost; matchedRec = candRec; break }
       }
     }
-    const pm = metaByPersona.get(persona.trim())
+    const pm = metaByPersona.get(persona.trim().toLowerCase())
     const tenantRef = matchedRec?.request?.actorTenant ?? hostEntry?.actorTenant ?? hostEntry?.step.actor.tenant ?? pm?.tenantRef ?? null
     const privilege = matchedRec?.request?.actorPrivilege ?? hostEntry?.actorPrivilege ?? hostEntry?.step.actor.role ?? pm?.privilege ?? null
     const roleLabel = matchedRec?.request?.actorRoleLabel ?? hostEntry?.actorRoleLabel ?? pm?.roleLabel ?? null

@@ -971,7 +971,7 @@ test('R3-19c: buildCompositeVerifyOptionsFromGrant and syncVerifyArtifactsToLedg
         reason: 'verified',
         verifiedEdges: [{ edgeIndex: 0, kind: 'value_binding', fromHopId: 'hop_1', toHopId: 'hop_2', verified: true, reason: 'ok' }],
       },
-      hopActors: { hop_1: 'acct_member', hop_2: 'acct_unscoped' },
+      hopActors: { hop_1: 'Acct_Member', hop_2: 'acct_unscoped' },
     },
     vulnClass: 'bola',
     transcriptDigests: [],
