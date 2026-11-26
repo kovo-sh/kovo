@@ -5,7 +5,18 @@
  * Depends strictly downward on `verify-claims.ts` and `oracle-invariants.ts`;
  * receives host runtime capabilities via the narrow `ProveHandlerHost` seam.
  */
+import { randomUUID } from 'node:crypto'
 import type { BoundaryClass, ImpactClass } from './oracle-invariants.ts'
+import { isReservedEvidenceRole } from './host-fact-log.ts'
+import {
+  defaultHostMintedOracle,
+  derivedTimingVulnClassForFamily,
+  exactPathnameOf,
+  type ExpressionConstructFamily,
+  type HostMintedExpressionChallenge,
+  type HostMintedTimingChallenge,
+  type TimingConstructFamily,
+} from './proof-receipt.ts'
 import {
   asRecord,
   describeMissingEvidence,
@@ -124,7 +135,9 @@ function normalizeArmTarget(
     ...(typeof merged.entityId === 'string' && merged.entityId.trim() ? { entityId: merged.entityId.trim() } : {}),
     ...(typeof merged.correlationId === 'string' && merged.correlationId.trim() ? { correlationId: merged.correlationId.trim() } : {}),
     ...(Array.isArray(merged.correlationIds) ? { correlationIds: merged.correlationIds } : {}),
-    ...(typeof merged.evidenceRole === 'string' && merged.evidenceRole.trim() ? { evidenceRole: merged.evidenceRole.trim() } : {}),
+    ...(typeof merged.evidenceRole === 'string' && merged.evidenceRole.trim() && !isReservedEvidenceRole(merged.evidenceRole)
+      ? { evidenceRole: merged.evidenceRole.trim() }
+      : {}),
     ...(typeof merged.replayAttempt === 'string' && merged.replayAttempt.trim() ? { replayAttempt: merged.replayAttempt.trim() } : {}),
   }
 }
@@ -388,6 +401,129 @@ export async function handleProvePersistedMutation(host: ProveHandlerHost, args:
   })
 }
 
+function rawEvidenceRoleOf(spec: unknown): string | null {
+  const rec = asRecord(spec)
+  if (!rec) return null
+  const nested = asRecord(rec.options)
+  const raw = nested?.evidenceRole ?? nested?.evidence_role ?? rec.evidenceRole ?? rec.evidence_role
+  return typeof raw === 'string' && raw.trim() ? raw.trim() : null
+}
+
+function renderTemplateStrings(value: unknown, replacements: Readonly<Record<string, string>>): unknown {
+  const apply = (text: string): string => {
+    let out = text
+    for (const [needle, replacement] of Object.entries(replacements)) {
+      if (out.includes(needle)) out = out.split(needle).join(replacement)
+    }
+    return out
+  }
+  if (typeof value === 'string') return apply(value)
+  if (Array.isArray(value)) return value.map(item => renderTemplateStrings(item, replacements))
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {}
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      out[k] = renderTemplateStrings(v, replacements)
+    }
+    return out
+  }
+  return value
+}
+
+function hasAnyPlaceholder(value: unknown, placeholders: readonly string[]): boolean {
+  const serialized = typeof value === 'string' ? value : JSON.stringify(value ?? '')
+  return placeholders.some(p => serialized.includes(p))
+}
+
+function paramMapFromArmArgs(armArgs: Record<string, unknown>): Record<string, string> {
+  const out: Record<string, string> = {}
+  const pathStr = String(armArgs.path ?? '/')
+  const qIdx = pathStr.indexOf('?')
+  if (qIdx >= 0) {
+    for (const [k, v] of new URLSearchParams(pathStr.slice(qIdx + 1)).entries()) {
+      out[k] = v
+    }
+  }
+  if (typeof armArgs.body === 'string' && armArgs.body.trim()) {
+    const parsed = parseJsonSafe(armArgs.body)
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      const flatten = (val: unknown, prefix = '', depth = 0): void => {
+        if (depth > 4 || val === null || val === undefined) return
+        if (typeof val === 'string' || typeof val === 'number' || typeof val === 'boolean') {
+          out[`body:${prefix || '$'}`] = String(val)
+          return
+        }
+        if (Array.isArray(val)) {
+          val.slice(0, 16).forEach((item, idx) => flatten(item, `${prefix}[${idx}]`, depth + 1))
+          return
+        }
+        if (typeof val === 'object') {
+          for (const [k, child] of Object.entries(val as Record<string, unknown>)) {
+            flatten(child, prefix ? `${prefix}.${k}` : k, depth + 1)
+          }
+        }
+      }
+      flatten(parsed)
+    } else if (armArgs.body.includes('=')) {
+      for (const [k, v] of new URLSearchParams(armArgs.body).entries()) {
+        out[`body:${k}`] = v
+      }
+    } else {
+      out['body:$'] = armArgs.body
+    }
+  }
+  return out
+}
+
+function checkArmIdentityParity(
+  defaultOrigin: string | undefined,
+  controlArgs: Record<string, unknown>,
+  probeArgs: Record<string, unknown>,
+): { ok: true; differingParam: string } | { ok: false; reason: string } {
+  const ctlOrigin = String(controlArgs.origin ?? defaultOrigin ?? '').trim().toLowerCase()
+  const prbOrigin = String(probeArgs.origin ?? defaultOrigin ?? '').trim().toLowerCase()
+  if (ctlOrigin !== prbOrigin) {
+    return { ok: false, reason: `origin mismatch (${ctlOrigin || 'none'} vs ${prbOrigin || 'none'})` }
+  }
+  if (String(controlArgs.method ?? 'GET').toUpperCase() !== String(probeArgs.method ?? 'GET').toUpperCase()) {
+    return { ok: false, reason: `method mismatch (${String(controlArgs.method)} vs ${String(probeArgs.method)})` }
+  }
+  const ctlPath = exactPathnameOf(String(controlArgs.path ?? '/'))
+  const prbPath = exactPathnameOf(String(probeArgs.path ?? '/'))
+  if (ctlPath !== prbPath) {
+    return { ok: false, reason: `path mismatch (${ctlPath} vs ${prbPath})` }
+  }
+  if ((controlArgs.persona ?? null) !== (probeArgs.persona ?? null)) {
+    return { ok: false, reason: `persona mismatch (${String(controlArgs.persona ?? 'anon')} vs ${String(probeArgs.persona ?? 'anon')})` }
+  }
+  if ((controlArgs.session ?? null) !== (probeArgs.session ?? null)) {
+    return { ok: false, reason: `session mismatch (${String(controlArgs.session ?? 'none')} vs ${String(probeArgs.session ?? 'none')})` }
+  }
+  if (JSON.stringify(controlArgs.capability ?? null) !== JSON.stringify(probeArgs.capability ?? null)) {
+    return { ok: false, reason: 'capability set mismatch across control and probe arms' }
+  }
+  const ctlParams = paramMapFromArmArgs(controlArgs)
+  const prbParams = paramMapFromArmArgs(probeArgs)
+  const allKeys = [...new Set([...Object.keys(ctlParams), ...Object.keys(prbParams)])].sort()
+  const diffKeys = allKeys.filter(k => ctlParams[k] !== prbParams[k])
+  if (diffKeys.length !== 1) {
+    return {
+      ok: false,
+      reason: diffKeys.length === 0
+        ? 'control and probe parameters are identical (need exactly 1 differing parameter)'
+        : `control and probe differ in ${diffKeys.length} parameters (${diffKeys.join(', ')}); need exactly 1`,
+    }
+  }
+  const soleKey = diffKeys[0]!
+  // Check remaining query/body key shape parity
+  for (const k of allKeys) {
+    if (k === soleKey) continue
+    if (ctlParams[k] !== prbParams[k]) {
+      return { ok: false, reason: `request shape mismatch on parameter "${k}"` }
+    }
+  }
+  return { ok: true, differingParam: soleKey }
+}
+
 export async function handleProveDifferential(host: ProveHandlerHost, args: Record<string, unknown>, nonce: string): Promise<unknown> {
   if (args.control === undefined || args.control === null || args.variant === undefined || args.variant === null) {
     throw new Error('prove_boolean_or_timing_diff requires `control` and `variant`.')
@@ -395,19 +531,105 @@ export async function handleProveDifferential(host: ProveHandlerHost, args: Reco
   const mode: 'boolean' | 'timing' = args.mode === 'timing' ? 'timing' : 'boolean'
   const session = typeof args.session === 'string' && args.session ? args.session : `diff-${mode}`
   const message = typeof args.message === 'string' && args.message ? args.message : undefined
-  const controlExchanges: Array<ProveHttpExchangeResult> = []
-  const variantExchanges: Array<ProveHttpExchangeResult> = []
   const rounds = mode === 'timing'
     ? Math.max(5, Math.min(Math.round(Number(args.rounds ?? 6)), 7))
     : Math.max(2, Math.min(Math.round(Number(args.rounds ?? 3)), 6))
 
+  let timingChallenge: HostMintedTimingChallenge | null = null
+  let controlTemplate: unknown = args.control
+  let variantTemplate: unknown = args.variant
+  if (mode === 'timing') {
+    const rawFamily = String(args.timingFamily ?? args.timing_family ?? args.constructFamily ?? args.construct_family ?? '').trim().toLowerCase()
+    const family: TimingConstructFamily = rawFamily === 'nosqli'
+      ? 'nosqli'
+      : rawFamily === 'cmdi' || rawFamily === 'command_injection'
+        ? 'cmdi'
+        : rawFamily === 'timing'
+          ? 'timing'
+          : 'sqli'
+    const delayPlaceholders = ['{{delayToken}}', '{{delaySeconds}}', '{{delayMs}}', '{{delay}}']
+    const usesHostDelayTemplate = Boolean(
+      rawFamily ||
+      hasAnyPlaceholder(args.variant, delayPlaceholders) ||
+      hasAnyPlaceholder(args.control, delayPlaceholders),
+    )
+    if (!usesHostDelayTemplate) {
+      const claim: Extract<VerifyClaim, { kind: 'timing' }> = {
+        kind: 'timing',
+        controlIds: [],
+        variantIds: [],
+        minPairs: rounds,
+        maxPValue: Number(args.maxPValue ?? args.max_p_value ?? 0.05),
+        ...(message ? { message } : {}),
+      }
+      return host.scrubRecord({
+        ok: false,
+        confirmed: false,
+        mode: 'timing',
+        endpoint: null,
+        controlIds: [],
+        variantIds: [],
+        claim,
+        stats: { reason: 'Timing differential requires a host-minted delay vs zero-delay control template ({{delayToken}}/{{delaySeconds}}/{{delayMs}} or timingFamily).' },
+        exchanges: { control: [], variant: [] },
+        rejectedBy: 'timing',
+        missingEvidence: ['host_minted_timing_challenge'],
+        transcriptSummary: [],
+      })
+    }
+    const requestedDelayMs = Number(args.delayMs ?? args.delay_ms ?? 2_000)
+    timingChallenge = defaultHostMintedOracle.mintTimingChallenge(
+      family,
+      Number.isFinite(requestedDelayMs) ? requestedDelayMs : 2_000,
+    )
+    const delaySec = String(Math.max(1, Math.round(timingChallenge.delayMs / 1000)))
+    controlTemplate = renderTemplateStrings(args.control, {
+      '{{delayToken}}': timingChallenge.controlToken,
+      '{{delaySeconds}}': '0',
+      '{{delayMs}}': '0',
+      '{{delay}}': timingChallenge.controlToken,
+    })
+    variantTemplate = renderTemplateStrings(args.variant, {
+      '{{delayToken}}': timingChallenge.delayToken,
+      '{{delaySeconds}}': delaySec,
+      '{{delayMs}}': String(timingChallenge.delayMs),
+      '{{delay}}': timingChallenge.delayToken,
+    })
+  }
+
+  const baseControlArgs = normalizeArmTarget(host.defaultOrigin, controlTemplate, {
+    sessionGroupRole: 'control',
+    session,
+  })
+  const baseVariantArgs = normalizeArmTarget(host.defaultOrigin, variantTemplate, {
+    sessionGroupRole: 'probe',
+    session,
+  })
+  // H-15 / C-7: Enforce strict arm identity parity (origin, method, case-sensitive path,
+  // persona, session, capability set, and single differing parameter) BEFORE issuing traffic.
+  const parity = checkArmIdentityParity(host.defaultOrigin, baseControlArgs, baseVariantArgs)
+  if (!parity.ok) {
+    return host.scrubRecord({
+      ok: false,
+      confirmed: false,
+      mode,
+      endpoint: String(baseVariantArgs.path ?? ''),
+      controlIds: [],
+      variantIds: [],
+      stats: { reason: `Differential arm identity rejected: ${parity.reason}` },
+      exchanges: { control: [], variant: [] },
+      rejectedBy: mode === 'timing' ? 'timing' : 'structural_diff',
+      missingEvidence: ['arm_identity_parity'],
+      transcriptSummary: [],
+    })
+  }
+
+  const controlExchanges: Array<ProveHttpExchangeResult> = []
+  const variantExchanges: Array<ProveHttpExchangeResult> = []
   for (let index = 0; index < rounds; index += 1) {
     const order: Array<'control' | 'variant'> = index % 2 === 0 ? ['control', 'variant'] : ['variant', 'control']
     for (const which of order) {
-      const armArgs = normalizeArmTarget(host.defaultOrigin, which === 'control' ? args.control : args.variant, {
-        sessionGroupRole: which === 'control' ? 'control' : 'probe',
-        session,
-      })
+      const armArgs = which === 'control' ? { ...baseControlArgs } : { ...baseVariantArgs }
       const ex = await host.runHttpExchange(armArgs, nonce)
       if (which === 'control') controlExchanges.push(ex)
       else variantExchanges.push(ex)
@@ -418,27 +640,41 @@ export async function handleProveDifferential(host: ProveHandlerHost, args: Reco
 
   if (mode === 'timing') {
     const maxPValue = Number(args.maxPValue ?? args.max_p_value ?? 0.05)
-    const claim: Extract<VerifyClaim, { kind: 'timing' }> = {
+    const statusSet = new Set([...controlExchanges, ...variantExchanges].map(ex => ex.status))
+    const statusParity = statusSet.size === 1
+    const claim: Extract<VerifyClaim, { kind: 'timing' }> & {
+      hostMintedTimingChallengeId?: string
+      vulnClass?: string
+    } = {
       kind: 'timing',
       controlIds,
       variantIds,
       minPairs: rounds,
       maxPValue,
+      ...(timingChallenge ? {
+        hostMintedTimingChallengeId: timingChallenge.challengeId,
+        vulnClass: derivedTimingVulnClassForFamily(timingChallenge.family),
+      } : {}),
       ...(message ? { message } : {}),
     }
     const check = evaluateClaim(host.transcript, claim, {})
-    const missingEvidence = check.passed ? [] : describeMissingEvidence(check)
+    const missing = new Set<string>(check.passed ? [] : describeMissingEvidence(check))
+    if (!statusParity) missing.add('timing_status_parity')
+    if (!timingChallenge) missing.add('host_minted_timing_challenge')
+    const missingEvidence = [...missing]
+    const ok = check.passed && statusParity && Boolean(timingChallenge) && missingEvidence.length === 0
     return host.scrubRecord({
-      ok: check.passed,
-      confirmed: check.passed,
+      ok,
+      confirmed: ok,
       mode: 'timing',
       endpoint: variantExchanges[0]?.pathAndQuery ?? null,
       controlIds,
       variantIds,
       claim,
-      stats: check.observed ?? {},
+      ...(timingChallenge ? { hostTimingChallenge: timingChallenge, derivedVulnClass: derivedTimingVulnClassForFamily(timingChallenge.family) } : {}),
+      stats: { ...(check.observed ?? {}), statusParity, differingParam: parity.differingParam },
       exchanges: { control: controlExchanges, variant: variantExchanges },
-      rejectedBy: check.passed ? null : 'timing',
+      rejectedBy: ok ? null : 'timing',
       missingEvidence,
       transcriptSummary: [
         ...controlExchanges.map(ex => proofEntry('control', ex, `timing ${ex.durationMs}ms`)),
@@ -670,16 +906,48 @@ export async function handleProveRace(host: ProveHandlerHost, args: Record<strin
     }
   }
 
+  // C-5: Reject any worker-supplied reserved evidenceRole on race requests.
+  const badEvidenceRole = rawRequests.map(rawEvidenceRoleOf).find(r => r !== null && isReservedEvidenceRole(r))
+  if (badEvidenceRole) {
+    const claim: Extract<VerifyClaim, { kind: 'race' }> = {
+      kind: 'race',
+      exchangeIds: [],
+      mode: 'http1-fallback',
+      minDistinctOutcomes: minDistinct,
+    }
+    return host.scrubRecord({
+      ok: false,
+      confirmed: false,
+      claim,
+      mode: 'http1-fallback',
+      fallbackReason: `Worker-supplied reserved evidenceRole "${badEvidenceRole}" is rejected; host assigns conservation roles.`,
+      summary: {},
+      exchanges: [],
+      rejectedBy: 'reserved_evidence_role',
+      missingEvidence: ['host_assigned_evidence_role'],
+      transcriptSummary: [],
+    })
+  }
+
+  // C-5: `readRoute` is mandatory to confirm `prove.race`; never fall back to worker-supplied
+  // exchange IDs. When `readRoute` is absent, still execute the host-stamped burst so multi-hop
+  // composite callers can consume burst `exchanges`, while failing closed (`ok: false`) on the
+  // race claim itself.
+  const readRoute = args.readRoute ?? args.read_route
+  const hasReadRoute = readRoute !== undefined && readRoute !== null && (typeof readRoute !== 'string' || readRoute.trim().length > 0)
+
   const sessionBase = typeof args.session === 'string' && args.session ? args.session : undefined
   const topEntityId = typeof args.entityId === 'string' && args.entityId.trim() ? args.entityId.trim() : undefined
   const topCorrelationId = typeof args.correlationId === 'string' && args.correlationId.trim() ? args.correlationId.trim() : undefined
   const topCorrelationIds = Array.isArray(args.correlationIds) ? args.correlationIds : undefined
+  const raceBatchId = `race_${randomUUID()}`
   let firstRequestBody: unknown = undefined
   const normalizedRequests = rawRequests.map((req, index) => {
     const normalized = normalizeArmTarget(host.defaultOrigin, req, {
       sessionGroupRole: 'probe',
       session: sessionBase ?? `race-${index}`,
     })
+    normalized.raceBatchId = raceBatchId
     if (topEntityId && normalized.entityId === undefined) normalized.entityId = topEntityId
     if (topCorrelationId && normalized.correlationId === undefined) normalized.correlationId = topCorrelationId
     if (topCorrelationIds && normalized.correlationIds === undefined) normalized.correlationIds = topCorrelationIds
@@ -689,14 +957,13 @@ export async function handleProveRace(host: ProveHandlerHost, args: Record<strin
     return normalized
   })
   const firstPersona = typeof normalizedRequests[0]?.persona === 'string' ? normalizedRequests[0].persona : undefined
-  const readRoute = args.readRoute ?? args.read_route
   const readPersona = cleanPersona(args.readPersona ?? args.read_persona ?? firstPersona)
   const readMethod = typeof (args.readMethod ?? args.read_method) === 'string'
     ? String(args.readMethod ?? args.read_method).toUpperCase()
     : 'GET'
 
   let baseline: ProveHttpExchangeResult | null = null
-  if (readRoute !== undefined && readRoute !== null) {
+  if (hasReadRoute) {
     baseline = await host.runHttpExchange(normalizeArmTarget(host.defaultOrigin, readRoute, {
       method: readMethod,
       ...(readPersona ? { persona: readPersona } : {}),
@@ -705,62 +972,97 @@ export async function handleProveRace(host: ProveHandlerHost, args: Record<strin
     }), nonce)
   }
 
-  const raceRes = await host.runRace({ requests: normalizedRequests }, nonce) as {
+  const raceRes = await host.runRace({ requests: normalizedRequests, raceBatchId }, nonce) as {
     mode?: 'h2-single-packet' | 'http1-fallback'
     fallbackReason?: string | null
     summary?: Record<string, unknown>
+    raceBatchId?: string
     results?: Array<{
       exchangeId: string; status: number; durationMs: number; bodySha256: string
       consumedCapabilityId?: string; consumedCapabilities?: string[]; derivedFromCapabilityIds?: string[]
     }>
   }
+  const effectiveBatchId = raceRes.raceBatchId ?? raceBatchId
   const mode = raceRes.mode ?? 'http1-fallback'
   const exchanges = (raceRes.results ?? []).map(item => ({
     exchangeId: item.exchangeId,
     status: item.status,
     durationMs: item.durationMs,
     bodySha256: item.bodySha256,
+    raceBatchId: effectiveBatchId,
     ...(item.consumedCapabilityId ? { consumedCapabilityId: item.consumedCapabilityId } : {}),
     ...(item.consumedCapabilities?.length ? { consumedCapabilities: item.consumedCapabilities } : {}),
     ...(item.derivedFromCapabilityIds?.length ? { derivedFromCapabilityIds: item.derivedFromCapabilityIds } : {}),
   }))
 
-  let post: ProveHttpExchangeResult | null = null
-  let serial: ProveHttpExchangeResult | null = null
+  if (!hasReadRoute) {
+    const burstIds = exchanges.map(item => item.exchangeId)
+    const claim: Extract<VerifyClaim, { kind: 'race' }> & { raceBatchId?: string } = {
+      kind: 'race',
+      exchangeIds: burstIds,
+      raceBatchId: effectiveBatchId,
+      mode,
+      minDistinctOutcomes: minDistinct,
+    }
+    return host.scrubRecord({
+      ok: false,
+      confirmed: false,
+      claim,
+      raceBatchId: effectiveBatchId,
+      endpoint: (normalizedRequests[0]?.path as string | undefined) ?? null,
+      mode,
+      fallbackReason: 'prove.race requires `readRoute` for host-executed baseline/post/serial conservation verification (worker exchange ID fallbacks are forbidden).',
+      summary: raceRes.summary ?? {},
+      exchanges,
+      rejectedBy: 'race',
+      missingEvidence: ['read_route'],
+      transcriptSummary: exchanges.map((item, index) => ({
+        exchangeId: item.exchangeId,
+        role: 'race',
+        raceBatchId: effectiveBatchId,
+        personaHandle: (normalizedRequests[index]?.persona as string | undefined) ?? null,
+        method: (normalizedRequests[index]?.method as string | undefined) ?? null,
+        pathAndQuery: (normalizedRequests[index]?.path as string | undefined) ?? null,
+        status: item.status,
+        durationMs: item.durationMs,
+        note: mode,
+      })),
+    })
+  }
+
+  const post = await host.runHttpExchange(normalizeArmTarget(host.defaultOrigin, readRoute, {
+    method: readMethod,
+    ...(readPersona ? { persona: readPersona } : {}),
+    sessionGroupRole: 'control',
+    session: sessionBase ? `${sessionBase}-post` : 'race-post',
+  }), nonce)
+
+  // C-5: Serial control arm MUST be the exact identical request as the concurrent burst arm
+  // (`normalizedRequests[0]`), ignoring any worker `serialRequest` override.
+  const { raceBatchId: _stripBatch, ...burstRequestTemplate } = normalizedRequests[0]!
+  const serialArgs: Record<string, unknown> = {
+    ...burstRequestTemplate,
+    sessionGroupRole: 'control',
+    session: sessionBase ? `${sessionBase}-serial` : 'race-serial',
+  }
+  const serial = await host.runHttpExchange(serialArgs, nonce)
   let serialPost: ProveHttpExchangeResult | null = null
-  if (readRoute !== undefined && readRoute !== null) {
-    post = await host.runHttpExchange(normalizeArmTarget(host.defaultOrigin, readRoute, {
+  if (serial.status >= 200 && serial.status < 300) {
+    serialPost = await host.runHttpExchange(normalizeArmTarget(host.defaultOrigin, readRoute, {
       method: readMethod,
       ...(readPersona ? { persona: readPersona } : {}),
       sessionGroupRole: 'control',
-      session: sessionBase ? `${sessionBase}-post` : 'race-post',
+      session: sessionBase ? `${sessionBase}-serial-post` : 'race-serial-post',
     }), nonce)
-    const serialSpec = args.serialRequest ?? args.serial_request ?? rawRequests[0]
-    const serialArgs = normalizeArmTarget(host.defaultOrigin, serialSpec, {
-      sessionGroupRole: 'control',
-      session: sessionBase ? `${sessionBase}-serial` : 'race-serial',
-    })
-    if (!serialArgs.method && normalizedRequests[0]?.method) serialArgs.method = normalizedRequests[0].method
-    if (!serialArgs.persona && firstPersona) serialArgs.persona = firstPersona
-    serial = await host.runHttpExchange(serialArgs, nonce)
-    if (serial.status >= 200 && serial.status < 300) {
-      serialPost = await host.runHttpExchange(normalizeArmTarget(host.defaultOrigin, readRoute, {
-        method: readMethod,
-        ...(readPersona ? { persona: readPersona } : {}),
-        sessionGroupRole: 'control',
-        session: sessionBase ? `${sessionBase}-serial-post` : 'race-serial-post',
-      }), nonce)
-    }
   }
 
   const ackedCount = exchanges.filter(item => item.status >= 200 && item.status < 300).length
-  const baselineId = baseline?.exchangeId ?? (typeof (args.baselineExchangeId ?? args.baseline_exchange_id) === 'string' ? String(args.baselineExchangeId ?? args.baseline_exchange_id) : undefined)
-  const postId = post?.exchangeId ?? (typeof (args.postExchangeId ?? args.post_exchange_id) === 'string' ? String(args.postExchangeId ?? args.post_exchange_id) : undefined)
-  const rawSerialIds = args.serialExchangeIds ?? args.serial_exchange_ids
-  const serialIds = serial ? [serial.exchangeId] : (Array.isArray(rawSerialIds) && rawSerialIds.length ? rawSerialIds.map(String) : undefined)
-  const serialPreId = typeof (args.serialPreExchangeId ?? args.serial_pre_exchange_id) === 'string' ? String(args.serialPreExchangeId ?? args.serial_pre_exchange_id) : undefined
-  const serialPostId = serialPost?.exchangeId ?? (typeof (args.serialPostExchangeId ?? args.serial_post_exchange_id) === 'string' ? String(args.serialPostExchangeId ?? args.serial_post_exchange_id) : undefined)
-  const hasConservedContext = Boolean((readRoute !== undefined && readRoute !== null) || baselineId || postId || serialIds?.length)
+  // C-5: Host-only exchange IDs (never reading args.baselineExchangeId / postExchangeId / serialExchangeIds).
+  const baselineId = baseline!.exchangeId
+  const postId = post.exchangeId
+  const serialIds = [serial.exchangeId]
+  const serialPostId = serialPost?.exchangeId
+  const hasConservedContext = true
   const explicitExpectAll = args.expectAllSuccess ?? args.expect_all_success
   const expectAllSuccess = explicitExpectAll !== undefined
     ? Boolean(explicitExpectAll)
@@ -768,22 +1070,20 @@ export async function handleProveRace(host: ProveHandlerHost, args: Record<strin
   const burstIds = exchanges.map(item => item.exchangeId)
   const balanceField = args.balanceField ?? args.balance_field
   const capField = args.capField ?? args.cap_field
-  const unitDebit = args.unitDebit ?? args.unit_debit
   const vulnClass = args.vulnClass ?? args.vuln_class
 
-  const claim: Extract<VerifyClaim, { kind: 'race' }> = {
+  const claim: Extract<VerifyClaim, { kind: 'race' }> & { raceBatchId?: string } = {
     kind: 'race',
     exchangeIds: burstIds,
-    ...(hasConservedContext ? { burstExchangeIds: burstIds } : {}),
-    ...(baselineId ? { baselineExchangeId: baselineId } : {}),
-    ...(postId ? { postExchangeId: postId } : {}),
-    ...(serialPreId ? { serialPreExchangeId: serialPreId } : {}),
-    ...(serialIds ? { serialExchangeIds: serialIds } : {}),
+    burstExchangeIds: burstIds,
+    raceBatchId: effectiveBatchId,
+    baselineExchangeId: baselineId,
+    postExchangeId: postId,
+    serialExchangeIds: serialIds,
     ...(serialPostId ? { serialPostExchangeId: serialPostId } : {}),
     ...(typeof balanceField === 'string' && balanceField ? { balanceField } : {}),
     ...(typeof capField === 'string' && capField ? { capField } : {}),
-    ...(unitDebit !== undefined && unitDebit !== null ? { unitDebit: Number(unitDebit) } : {}),
-    ...(typeof vulnClass === 'string' && vulnClass ? { vulnClass } : hasConservedContext ? { vulnClass: 'race_double_spend' } : {}),
+    ...(typeof vulnClass === 'string' && vulnClass ? { vulnClass } : { vulnClass: 'race_double_spend' }),
     ...(firstRequestBody !== undefined ? { requestBody: firstRequestBody } : {}),
     mode,
     minDistinctOutcomes: minDistinct,
@@ -794,7 +1094,7 @@ export async function handleProveRace(host: ProveHandlerHost, args: Record<strin
   const check = evaluateClaim(host.transcript, claim, {})
   const missing = new Set<string>(check.passed ? [] : describeMissingEvidence(check))
   if (args.barrier === 'h2' && mode !== 'h2-single-packet') missing.add('h2_single_packet_barrier')
-  if (hasConservedContext && ackedCount < 2) missing.add('acked_burst_mutations')
+  if (ackedCount < 2) missing.add('acked_burst_mutations')
   const missingEvidence = [...missing]
   const ok = check.passed && missingEvidence.length === 0
 
@@ -802,22 +1102,24 @@ export async function handleProveRace(host: ProveHandlerHost, args: Record<strin
     ok,
     confirmed: ok,
     claim,
+    raceBatchId: effectiveBatchId,
     endpoint: (normalizedRequests[0]?.path as string | undefined) ?? null,
     mode,
     fallbackReason: raceRes.fallbackReason ?? null,
     summary: raceRes.summary ?? {},
     exchanges,
-    ...(baseline ? { baseline } : {}),
-    ...(post ? { post } : {}),
-    ...(serial ? { serial } : {}),
+    baseline: baseline!,
+    post,
+    serial,
     ...(serialPost ? { serialPost } : {}),
     rejectedBy: ok ? null : 'race',
     missingEvidence,
     transcriptSummary: [
-      ...(baseline ? [proofEntry('setup', baseline, 'baseline_read')] : []),
+      proofEntry('setup', baseline!, 'baseline_read'),
       ...exchanges.map((item, index) => ({
         exchangeId: item.exchangeId,
         role: 'race',
+        raceBatchId: effectiveBatchId,
         personaHandle: (normalizedRequests[index]?.persona as string | undefined) ?? null,
         method: (normalizedRequests[index]?.method as string | undefined) ?? null,
         pathAndQuery: (normalizedRequests[index]?.path as string | undefined) ?? null,
@@ -825,8 +1127,8 @@ export async function handleProveRace(host: ProveHandlerHost, args: Record<strin
         durationMs: item.durationMs,
         note: mode,
       })),
-      ...(post ? [proofEntry('control', post, 'post_read')] : []),
-      ...(serial ? [proofEntry('control', serial, 'serial_control')] : []),
+      proofEntry('control', post, 'post_read'),
+      proofEntry('control', serial, 'serial_control'),
       ...(serialPost ? [proofEntry('control', serialPost, 'serial_post_read')] : []),
     ],
   })
@@ -848,83 +1150,146 @@ export async function handleProveInjection(host: ProveHandlerHost, args: Record<
   }
   const session = typeof args.session === 'string' && args.session ? args.session : 'injection-diff'
   const expectedRaw = args.expectedOutput ?? args.expected_output
-  const expected = typeof expectedRaw === 'string' ? expectedRaw.trim() : ''
+  const workerExpected = typeof expectedRaw === 'string' ? expectedRaw.trim() : ''
+  const rawFamily = String(args.expressionFamily ?? args.expression_family ?? '').trim().toLowerCase()
   const vulnRaw = args.vulnClass ?? args.vuln_class
   const vulnClass = typeof vulnRaw === 'string' && vulnRaw.trim() ? vulnRaw.trim() : undefined
   const message = typeof args.message === 'string' && args.message ? args.message : undefined
 
+  const exprPlaceholders = ['{{expr}}', '{{operandA}}', '{{operandB}}']
+  const usesHostMintedExpression = Boolean(
+    rawFamily || hasAnyPlaceholder(rawProbe, exprPlaceholders),
+  )
+
+  // R2-C-6: Host-minted evaluated-expression differential oracle.
+  // Mints two distinct randomized operand challenges per call and verifies each host-computed
+  // output appears only in its own probe response, absent from controls and probe requests.
+  if (usesHostMintedExpression) {
+    const family: ExpressionConstructFamily = rawFamily === 'cmdi' || rawFamily === 'command_injection'
+      ? 'cmdi'
+      : rawFamily === 'sqli' || rawFamily === 'sqli_error'
+        ? 'sqli'
+        : rawFamily === 'expression'
+          ? 'expression'
+          : 'ssti'
+    const ch1: HostMintedExpressionChallenge = defaultHostMintedOracle.mintExpressionChallenge(family)
+    let ch2: HostMintedExpressionChallenge = defaultHostMintedOracle.mintExpressionChallenge(family)
+    if (ch2.expectedOutput === ch1.expectedOutput) {
+      ch2 = defaultHostMintedOracle.mintExpressionChallenge(family)
+    }
+    const renderChallenge = (spec: unknown, ch: HostMintedExpressionChallenge) =>
+      renderTemplateStrings(spec, {
+        '{{expr}}': ch.expressionSyntax,
+        '{{operandA}}': String(ch.operandA),
+        '{{operandB}}': String(ch.operandB),
+      })
+    const controlArgs = normalizeArmTarget(host.defaultOrigin, rawControl, { sessionGroupRole: 'control', session })
+    const probeArgs1 = normalizeArmTarget(host.defaultOrigin, renderChallenge(rawProbe, ch1), { sessionGroupRole: 'probe', session })
+    const probeArgs2 = normalizeArmTarget(host.defaultOrigin, renderChallenge(rawProbe, ch2), { sessionGroupRole: 'probe', session })
+    const parity1 = checkArmIdentityParity(host.defaultOrigin, controlArgs, probeArgs1)
+    const parity2 = checkArmIdentityParity(host.defaultOrigin, controlArgs, probeArgs2)
+    if (!parity1.ok || !parity2.ok) {
+      const reason = !parity1.ok ? parity1.reason : (!parity2.ok ? parity2.reason : 'arm identity mismatch')
+      return host.scrubRecord({
+        ok: false,
+        confirmed: false,
+        endpoint: String(probeArgs1.path ?? ''),
+        evaluated: false,
+        rejectedBy: 'injection_arm_identity',
+        missingEvidence: ['arm_identity_parity'],
+        reason,
+        transcriptSummary: [],
+      })
+    }
+
+    const control = await host.runHttpExchange(controlArgs, nonce)
+    const probe1 = await host.runHttpExchange(probeArgs1, nonce)
+    const probe2 = await host.runHttpExchange(probeArgs2, nonce)
+    const control2 = await host.runHttpExchange(controlArgs, nonce)
+    const transcriptSummary = [
+      proofEntry('control', control),
+      proofEntry('probe', probe1),
+      proofEntry('probe', probe2),
+      proofEntry('control', control2),
+    ]
+    const reqText1 = `${String(probeArgs1.path ?? '')}\n${String(probeArgs1.body ?? '')}`
+    const reqText2 = `${String(probeArgs2.path ?? '')}\n${String(probeArgs2.body ?? '')}`
+    const inProbe1 = probe1.body.includes(ch1.expectedOutput) && !probe1.body.includes(ch2.expectedOutput)
+    const inProbe2 = probe2.body.includes(ch2.expectedOutput) && !probe2.body.includes(ch1.expectedOutput)
+    const inControl = control.body.includes(ch1.expectedOutput) || control.body.includes(ch2.expectedOutput)
+      || control2.body.includes(ch1.expectedOutput) || control2.body.includes(ch2.expectedOutput)
+    const reflected = reqText1.includes(ch1.expectedOutput) || reqText2.includes(ch2.expectedOutput)
+    const varying = ch1.expectedOutput !== ch2.expectedOutput
+    const all2xx = [control, control2, probe1, probe2].every(ex => ex.status >= 200 && ex.status < 300)
+    const missing = new Set<string>()
+    if (!all2xx) missing.add('control_and_probe_2xx')
+    if (!varying) missing.add('varying_host_operands')
+    if (!inProbe1 || !inProbe2) missing.add('host_computed_output_in_probes')
+    if (inControl) missing.add('output_absent_from_controls')
+    if (reflected) missing.add('non_reflected_expression')
+    const missingEvidence = [...missing]
+    const ok = missingEvidence.length === 0
+    const derivedClass = family === 'cmdi' ? 'command_injection' : family === 'sqli' ? 'sqli_error' : family === 'ssti' ? 'ssti' : 'injection'
+    const hostClaim = {
+      kind: 'host_evaluated_expression',
+      vulnClass: derivedClass,
+      controlIds: [control.exchangeId, control2.exchangeId],
+      probeIds: [probe1.exchangeId, probe2.exchangeId],
+      hostMintedChallengeIds: [ch1.challengeId, ch2.challengeId],
+      message: message ?? `Host-minted ${family} evaluated-expression differential verified across 2 randomized challenges`,
+    }
+    return host.scrubRecord({
+      ok,
+      confirmed: ok,
+      endpoint: probe1.pathAndQuery,
+      control,
+      probe: probe1,
+      probe2,
+      control2,
+      hostMintedChallenges: [ch1, ch2],
+      claim: hostClaim,
+      claims: [hostClaim],
+      evaluated: ok,
+      rejectedBy: ok ? null : 'injection_differential',
+      missingEvidence,
+      transcriptSummary,
+    })
+  }
+
+  // R2-C-6: Reject worker-chosen `expectedOutput` markers; downgrade plain `body_contains` pairs
+  // to an unconfirmed lead rather than confirming injection on arbitrary page differences.
+  if (workerExpected.length > 0) {
+    const controlArgs = normalizeArmTarget(host.defaultOrigin, rawControl, { sessionGroupRole: 'control', session })
+    const probeArgs = normalizeArmTarget(host.defaultOrigin, rawProbe, { sessionGroupRole: 'probe', session })
+    const control = await host.runHttpExchange(controlArgs, nonce)
+    const probe = await host.runHttpExchange(probeArgs, nonce)
+    return host.scrubRecord({
+      ok: false,
+      confirmed: false,
+      lead: true,
+      endpoint: probe.pathAndQuery,
+      control,
+      probe,
+      claims: [],
+      evaluated: false,
+      rejectedBy: 'worker_chosen_marker_rejected',
+      missingEvidence: ['host_minted_expression_oracle'],
+      transcriptSummary: [
+        proofEntry('control', control),
+        proofEntry('probe', probe),
+      ],
+    })
+  }
+
   const controlArgs = normalizeArmTarget(host.defaultOrigin, rawControl, { sessionGroupRole: 'control', session })
   const probeArgs = normalizeArmTarget(host.defaultOrigin, rawProbe, { sessionGroupRole: 'probe', session })
-  const controlReqBody = typeof controlArgs.body === 'string' ? (parseJsonSafe(controlArgs.body) ?? controlArgs.body) : undefined
   const probeReqBody = typeof probeArgs.body === 'string' ? (parseJsonSafe(probeArgs.body) ?? probeArgs.body) : undefined
-
   const control = await host.runHttpExchange(controlArgs, nonce)
   const probe = await host.runHttpExchange(probeArgs, nonce)
   const transcriptSummary = [
     proofEntry('control', control),
     proofEntry('probe', probe),
   ]
-
-  if (expected.length >= 4) {
-    const probe2 = await host.runHttpExchange(probeArgs, nonce)
-    const control2 = await host.runHttpExchange(controlArgs, nonce)
-    transcriptSummary.push(proofEntry('probe', probe2), proofEntry('control', control2))
-    const probeReqText = `${String(probeArgs.path ?? '')}\n${String(probeArgs.body ?? '')}`
-    const inProbe = probe.body.includes(expected) && probe2.body.includes(expected)
-    const inControl = control.body.includes(expected) || control2.body.includes(expected)
-    const reflected = probeReqText.includes(expected)
-    const evaluated = inProbe && !inControl && !reflected
-
-    const absentClaim: Extract<VerifyClaim, { kind: 'body_contains' }> = {
-      kind: 'body_contains',
-      exchangeId: control.exchangeId,
-      text: expected,
-      absent: true,
-      ...(controlReqBody !== undefined ? { controlRequestBody: controlReqBody } : {}),
-      message: `${vulnClass ?? 'ssti'} control lacks evaluated marker`,
-    }
-    const presentClaim: Extract<VerifyClaim, { kind: 'body_contains' }> = {
-      kind: 'body_contains',
-      exchangeId: probe.exchangeId,
-      text: expected,
-      absent: false,
-      ...(vulnClass ? { vulnClass } : {}),
-      ...(controlReqBody !== undefined ? { controlRequestBody: controlReqBody } : {}),
-      ...(probeReqBody !== undefined ? { probeRequestBody: probeReqBody } : {}),
-      message: message ?? `${vulnClass ?? 'ssti'} evaluated marker present in probe`,
-    }
-    const diffClaim: Extract<VerifyClaim, { kind: 'structural_diff' }> = {
-      kind: 'structural_diff',
-      controlIds: [control.exchangeId, control2.exchangeId],
-      variantIds: [probe.exchangeId, probe2.exchangeId],
-      minRounds: 2,
-      minDeltaTokens: 1,
-      message: message ?? `${vulnClass ?? 'ssti'} evaluated differential across 2 rounds`,
-    }
-    const claims: VerifyClaim[] = [absentClaim, presentClaim, diffClaim]
-    const checks = claims.map(c => evaluateClaim(host.transcript, c, {}))
-    const missing = new Set<string>()
-    for (const c of checks) for (const item of describeMissingEvidence(c)) missing.add(item)
-    if (!(control.status >= 200 && control.status < 300)) missing.add('control_2xx')
-    if (!inProbe) missing.add('evaluated_marker_in_probe')
-    if (inControl) missing.add('marker_absent_from_control')
-    if (reflected) missing.add('non_reflected_expression')
-    const missingEvidence = [...missing]
-    const ok = checks.every(c => c.passed) && missingEvidence.length === 0
-    return host.scrubRecord({
-      ok,
-      confirmed: ok,
-      endpoint: probe.pathAndQuery,
-      control,
-      probe,
-      claim: presentClaim,
-      claims,
-      evaluated,
-      rejectedBy: ok ? null : 'injection_differential',
-      missingEvidence,
-      transcriptSummary,
-    })
-  }
 
   const impactClaim: Extract<VerifyClaim, { kind: 'impact' }> = {
     kind: 'impact',

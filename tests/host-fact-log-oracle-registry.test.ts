@@ -541,8 +541,8 @@ test('property-based: mutating untrusted worker claim scalars (requiredRole, res
   // Fixture C (Hardened negative — conserved wallet where 2 concurrent debits of 10 properly deduct 20)
   const conservedWalletExchanges: ScriptProofExchange[] = [
     { exchangeId: 'pre', seq: 1, startedAt: 1000, endedAt: 1010, method: 'GET', pathAndQuery: '/api/v1/wallet', origin: ORIGIN, status: 200, body: '{"balance":100}' },
-    { exchangeId: 'b1', seq: 2, startedAt: 1050, endedAt: 1110, durationMs: 60, method: 'POST', pathAndQuery: '/api/v1/wallet/redeem', origin: ORIGIN, status: 200, requestBody: '{"amount":10}', body: '{"ok":true}' },
-    { exchangeId: 'b2', seq: 3, startedAt: 1055, endedAt: 1115, durationMs: 60, method: 'POST', pathAndQuery: '/api/v1/wallet/redeem', origin: ORIGIN, status: 200, requestBody: '{"amount":10}', body: '{"ok":true}' },
+    { exchangeId: 'b1', seq: 2, op: 'race', raceBatchId: 'batch-prop-1', startedAt: 1050, endedAt: 1110, durationMs: 60, method: 'POST', pathAndQuery: '/api/v1/wallet/redeem', origin: ORIGIN, status: 200, requestBody: '{"amount":10}', body: '{"ok":true}' },
+    { exchangeId: 'b2', seq: 3, op: 'race', raceBatchId: 'batch-prop-1', startedAt: 1055, endedAt: 1115, durationMs: 60, method: 'POST', pathAndQuery: '/api/v1/wallet/redeem', origin: ORIGIN, status: 200, requestBody: '{"amount":10}', body: '{"ok":true}' },
     { exchangeId: 'post', seq: 4, startedAt: 1150, endedAt: 1160, method: 'GET', pathAndQuery: '/api/v1/wallet', origin: ORIGIN, status: 200, body: '{"balance":80}' },
     { exchangeId: 's1', seq: 5, startedAt: 1200, endedAt: 1220, durationMs: 20, method: 'POST', pathAndQuery: '/api/v1/wallet/redeem', origin: ORIGIN, status: 200, requestBody: '{"amount":10}', body: '{"ok":true}' },
     { exchangeId: 'spost', seq: 6, startedAt: 1250, endedAt: 1260, method: 'GET', pathAndQuery: '/api/v1/wallet', origin: ORIGIN, status: 200, body: '{"balance":70}' },

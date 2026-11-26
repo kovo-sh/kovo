@@ -25,6 +25,8 @@ import type {
   HostTranscriptEntry,
 } from './composite-receipt.ts'
 import type {
+  HostMintedExpressionChallenge,
+  HostMintedTimingChallenge,
   ReceiptBrowserTrace,
   ReceiptOobEvent,
   ReceiptTranscript,
@@ -32,6 +34,94 @@ import type {
   ScriptProofExchange,
 } from './proof-receipt.ts'
 import type { TranscriptStore, VerifyTranscriptRecord } from './verify-claims.ts'
+
+/** R2-C-9: Vault-scrubbed capability placeholder pattern that MUST NEVER appear in the kernel request plane. */
+export const VAULT_SCRUBBED_TOKEN_RE = /\[redacted:cap:[^\]]*\]/i
+
+export function hasVaultScrubbedToken(value: string | null | undefined): boolean {
+  return typeof value === 'string' && value.length > 0 && VAULT_SCRUBBED_TOKEN_RE.test(value)
+}
+
+export function hasVaultScrubbedRequestPlane(input: {
+  pathAndQuery?: string | null
+  requestHeaders?: Readonly<Record<string, string>> | null
+  rawRequestBody?: string | null
+  carrierText?: string | null
+}): boolean {
+  if (hasVaultScrubbedToken(input.pathAndQuery)) return true
+  if (hasVaultScrubbedToken(input.rawRequestBody)) return true
+  if (hasVaultScrubbedToken(input.carrierText)) return true
+  if (input.requestHeaders) {
+    for (const [k, v] of Object.entries(input.requestHeaders)) {
+      if (hasVaultScrubbedToken(k) || hasVaultScrubbedToken(v)) return true
+    }
+  }
+  return false
+}
+
+export function assertCleanKernelRequestPlane(
+  input: {
+    exchangeId?: string
+    pathAndQuery?: string | null
+    requestHeaders?: Readonly<Record<string, string>> | null
+    rawRequestBody?: string | null
+    carrierText?: string | null
+  },
+  context = 'HostFactLog',
+): void {
+  if (hasVaultScrubbedRequestPlane(input)) {
+    throw new Error(
+      `${context}: kernel request plane${input.exchangeId ? ` for exchange "${input.exchangeId}"` : ''} contains a vault-scrubbed [redacted:cap:...] token; kernel truth must remain pre-redaction.`,
+    )
+  }
+}
+
+/** C-5: Reserved host-owned evidence roles that workers MUST NOT supply directly. */
+export const RESERVED_EVIDENCE_ROLES: ReadonlySet<string> = new Set([
+  'baseline_read',
+  'pre_read',
+  'baseline_balance',
+  'balance_before',
+  'pre_burst_read',
+  'post_read',
+  'post_burst_read',
+  'after_read',
+  'balance_after',
+  'serial_pre_read',
+  'serial_baseline_read',
+  'serial_before_read',
+  'serial_post_read',
+  'serial_after_read',
+  'serial_read',
+  'serial_balance_after',
+  'post_chain_readback',
+  'host_capability_op',
+  'host_crypto_op',
+])
+
+const RESERVED_BURST_OR_SERIAL_ROLE_RE = /^(?:(?:burst|race_burst|concurrent)(?:[_-].*)?|serial(?:_(?:control|mutation|probe|step|request|debit))?(?:_\d+)?)$/i
+
+export function isReservedEvidenceRole(role: string | null | undefined): boolean {
+  if (typeof role !== 'string') return false
+  const normalized = role.trim().toLowerCase()
+  if (!normalized) return false
+  return RESERVED_EVIDENCE_ROLES.has(normalized) || RESERVED_BURST_OR_SERIAL_ROLE_RE.test(normalized)
+}
+
+/**
+ * H-13: Host-only wire credential placement provenance.
+ * Records where the host/broker actually attached credentials on the wire (persona auth kind,
+ * capability injection targets, session jar cookie names, header names, and mixed-auth status)
+ * so ambient auth and SameSite binding are never spoofed by a junk cookie capability on a bearer API.
+ */
+export interface HostCredentialPlacement {
+  readonly personaAuthKind?: 'cookie' | 'bearer' | 'header' | 'none' | null
+  readonly capabilityTargets?: readonly ('cookie' | 'bearer' | 'header' | 'query' | 'body')[]
+  readonly jarCookieNames?: readonly string[]
+  readonly headerNames?: readonly string[]
+  readonly authenticatingCookieName?: string | null
+  readonly mixed?: boolean
+}
 
 export interface HostOobCallbackFact {
   readonly id: string
@@ -48,6 +138,7 @@ export interface HostOobCallbackFact {
   readonly observedValueDigests?: readonly string[]
   readonly correlationIds?: readonly string[]
   readonly hostSignature?: string
+  readonly callbackSignature?: string
 }
 
 export interface HostExchangeFact {
@@ -69,6 +160,13 @@ export interface HostExchangeFact {
   readonly actorTenant: string | null
   readonly ambientAuth: AmbientAuth
   readonly sameSite: string | null
+  readonly credentialPlacement?: HostCredentialPlacement
+  readonly setCookieSameSiteByName?: Readonly<Record<string, string | null>>
+  readonly raceBatchId?: string | null
+  readonly requestPlaneVaultScrubbed?: boolean
+  readonly hostExpressionChallenge?: HostMintedExpressionChallenge
+  readonly hostTimingChallenge?: HostMintedTimingChallenge
+  readonly hostRedirectCanaryHost?: string | null
   readonly oobCallbacks: readonly HostOobCallbackFact[]
   readonly durationMs: number
   readonly startedAt?: number
@@ -113,6 +211,11 @@ export interface HostExchangeFactInput {
   actorTenant?: string | null
   ambientAuth?: AmbientAuth
   sameSite?: string | null
+  credentialPlacement?: HostCredentialPlacement
+  raceBatchId?: string | null
+  hostExpressionChallenge?: HostMintedExpressionChallenge
+  hostTimingChallenge?: HostMintedTimingChallenge
+  hostRedirectCanaryHost?: string | null
   oobCallbacks?: readonly HostOobCallbackFact[]
   durationMs?: number
   startedAt?: number
@@ -159,6 +262,8 @@ export interface WorkerExchangeView {
 
 export interface HostFactLogOptions {
   sanitizer?: EgressSanitizer
+  /** R2-C-9: When true, `recordExchange` throws if the kernel request plane contains `[redacted:cap:...]`. */
+  assertCleanRequestPlane?: boolean
 }
 
 function headerLookup(headers: Readonly<Record<string, string>> | null | undefined, name: string): string | null {
@@ -214,27 +319,188 @@ function normalizeOriginKey(origin: string): string {
   }
 }
 
+const AUTH_COOKIE_NAME_RE = /(?:^|[._-])(?:sid|sess|session|sessionid|auth|token|jwt|access|identity|connect\.sid|jsessionid|phpsessid|asp\.net_sessionid)(?:$|[._-])/i
+const NON_AUTH_COOKIE_NAME_RE = /^(?:theme|locale|lang|tz|timezone|prefs?|ab_?test|ga|_ga|_gid|csrftoken|csrf[_-]?token|xsrf[_-]?token|_csrf)$/i
+
+export function parseCookieHeaderNames(cookieHeader: string | null | undefined): string[] {
+  if (!cookieHeader) return []
+  const names: string[] = []
+  const seen = new Set<string>()
+  for (const part of cookieHeader.split(';')) {
+    const eq = part.indexOf('=')
+    if (eq <= 0) continue
+    const name = part.slice(0, eq).trim()
+    const key = name.toLowerCase()
+    if (!name || seen.has(key)) continue
+    seen.add(key)
+    names.push(name)
+  }
+  return names
+}
+
+function pickAuthenticatingCookieName(
+  cookieNames: readonly string[],
+  explicitName?: string | null,
+): string | null {
+  if (explicitName && explicitName.trim()) return explicitName.trim()
+  if (cookieNames.length === 0) return null
+  const authLike = cookieNames.find(name => AUTH_COOKIE_NAME_RE.test(name))
+  if (authLike) return authLike
+  const nonCosmetic = cookieNames.find(name => !NON_AUTH_COOKIE_NAME_RE.test(name))
+  return nonCosmetic ?? cookieNames[0] ?? null
+}
+
+/**
+ * H-13: Parse every cookie entry from a `Set-Cookie` header into a lowercase cookie-name ->
+ * normalized SameSite (`'Strict' | 'Lax' | 'None' | null`) map without splitting `Expires=` dates.
+ */
+export function parseSetCookieSameSiteMap(
+  headers: Readonly<Record<string, string>> | null | undefined,
+): Record<string, string | null> {
+  const map: Record<string, string | null> = {}
+  if (!headers) return map
+  const rawValues: string[] = []
+  for (const [k, v] of Object.entries(headers)) {
+    if (k.toLowerCase() === 'set-cookie' && typeof v === 'string' && v.trim()) {
+      rawValues.push(v)
+    }
+  }
+  if (rawValues.length === 0) return map
+  // Split multiple Set-Cookie entries joined by `\n` or `, ` (never breaking `Expires=Mon, 01 Jan ...`).
+  const entries: string[] = []
+  for (const raw of rawValues) {
+    for (const line of raw.split(/\r?\n/)) {
+      const parts = line.split(/,\s*(?=[!#$%&'*+\-.^_`|~0-9A-Za-z]+=)/)
+      for (const part of parts) {
+        const trimmed = part.trim()
+        if (trimmed) entries.push(trimmed)
+      }
+    }
+  }
+  for (const entry of entries) {
+    const firstSemi = entry.indexOf(';')
+    const nameVal = firstSemi >= 0 ? entry.slice(0, firstSemi) : entry
+    const eq = nameVal.indexOf('=')
+    if (eq <= 0) continue
+    const cookieName = nameVal.slice(0, eq).trim().toLowerCase()
+    if (!cookieName) continue
+    const attrs = firstSemi >= 0 ? entry.slice(firstSemi + 1) : ''
+    const m = /(?:^|;)\s*samesite\s*=\s*(strict|lax|none)\b/i.exec(attrs)
+    if (!m?.[1]) {
+      map[cookieName] = null
+    } else {
+      const lower = m[1].toLowerCase()
+      map[cookieName] = lower === 'strict' ? 'Strict' : lower === 'lax' ? 'Lax' : 'None'
+    }
+  }
+  return map
+}
+
+export function deriveCredentialPlacement(
+  headers: Readonly<Record<string, string>> | null | undefined,
+  explicit?: HostCredentialPlacement,
+): HostCredentialPlacement {
+  const authHeader = headerLookup(headers, 'authorization')
+  const apiKeyHeader = headerLookup(headers, 'x-api-key')
+  const authTokenHeader = headerLookup(headers, 'x-auth-token')
+  const cookieHeader = headerLookup(headers, 'cookie')
+  const cookieNamesFromHeader = parseCookieHeaderNames(cookieHeader)
+  const jarCookieNames = explicit?.jarCookieNames?.length
+    ? [...explicit.jarCookieNames]
+    : cookieNamesFromHeader
+  const headerNames = explicit?.headerNames?.length
+    ? [...explicit.headerNames]
+    : [
+        ...(authHeader ? ['authorization'] : []),
+        ...(apiKeyHeader ? ['x-api-key'] : []),
+        ...(authTokenHeader ? ['x-auth-token'] : []),
+      ]
+  const capTargets = explicit?.capabilityTargets ? [...explicit.capabilityTargets] : []
+
+  const hasBearer = explicit?.personaAuthKind === 'bearer'
+    || capTargets.includes('bearer')
+    || Boolean(authHeader && /^bearer\s+/i.test(authHeader))
+  const hasHeaderAuth = explicit?.personaAuthKind === 'header'
+    || capTargets.includes('header')
+    || Boolean(apiKeyHeader || authTokenHeader || (authHeader && !/^bearer\s+/i.test(authHeader)))
+  const hasCookie = explicit?.personaAuthKind === 'cookie'
+    || capTargets.includes('cookie')
+    || jarCookieNames.length > 0
+    || Boolean(cookieHeader)
+
+  const mixed = explicit?.mixed === true || ((hasBearer || hasHeaderAuth) && hasCookie)
+  const personaAuthKind: HostCredentialPlacement['personaAuthKind'] = explicit?.personaAuthKind !== undefined
+    ? explicit.personaAuthKind
+    : hasBearer
+      ? 'bearer'
+      : hasHeaderAuth
+        ? 'header'
+        : hasCookie
+          ? 'cookie'
+          : 'none'
+  const authenticatingCookieName = hasCookie && !mixed
+    ? pickAuthenticatingCookieName(jarCookieNames, explicit?.authenticatingCookieName)
+    : (explicit?.authenticatingCookieName ?? null)
+
+  return Object.freeze({
+    personaAuthKind,
+    ...(capTargets.length > 0 ? { capabilityTargets: Object.freeze(capTargets) } : {}),
+    ...(jarCookieNames.length > 0 ? { jarCookieNames: Object.freeze(jarCookieNames) } : {}),
+    ...(headerNames.length > 0 ? { headerNames: Object.freeze(headerNames) } : {}),
+    ...(authenticatingCookieName ? { authenticatingCookieName } : {}),
+    mixed,
+  })
+}
+
 export function deriveAmbientAuthFromHeaders(
   headers: Readonly<Record<string, string>> | null | undefined,
   explicit?: AmbientAuth,
+  placement?: HostCredentialPlacement,
 ): AmbientAuth {
+  if (placement) {
+    // H-13: Mixed auth (e.g. bearer persona + junk cookie capability) MUST NEVER classify as `cookie`.
+    if (placement.mixed) {
+      if (placement.personaAuthKind === 'bearer' || placement.capabilityTargets?.includes('bearer')) return 'bearer'
+      const auth = headerLookup(headers, 'authorization')
+      if (auth && /^bearer\s+/i.test(auth)) return 'bearer'
+      return 'header'
+    }
+    if (placement.personaAuthKind === 'bearer' || placement.capabilityTargets?.includes('bearer')) return 'bearer'
+    if (placement.personaAuthKind === 'header' || placement.capabilityTargets?.includes('header')) return 'header'
+    if (placement.personaAuthKind === 'cookie') return 'cookie'
+  }
+  if (headers) {
+    const auth = headerLookup(headers, 'authorization')
+    const xApiKey = headerLookup(headers, 'x-api-key')
+    const xAuthToken = headerLookup(headers, 'x-auth-token')
+    const cookie = headerLookup(headers, 'cookie')
+    if (auth) return /^bearer\s+/i.test(auth) ? 'bearer' : 'header'
+    if (xApiKey || xAuthToken) return 'header'
+    if (cookie) return 'cookie'
+  }
   if (explicit && explicit !== 'unknown') return explicit
-  if (!headers) return 'unknown'
-  const auth = headerLookup(headers, 'authorization')
-  const cookie = headerLookup(headers, 'cookie')
-  if (cookie && !auth) return 'cookie'
-  if (auth) return /^bearer\s+/i.test(auth) ? 'bearer' : 'header'
-  if (headerLookup(headers, 'x-api-key') || headerLookup(headers, 'x-auth-token')) return 'header'
   return 'unknown'
 }
 
-export function extractSameSiteFromHeaders(headers: Readonly<Record<string, string>> | null | undefined): string | null {
-  const setCookie = headerLookup(headers, 'set-cookie')
-  if (!setCookie) return null
-  const m = /;\s*samesite\s*=\s*(strict|lax|none)\b/i.exec(setCookie)
-  if (!m?.[1]) return null
-  const lower = m[1].toLowerCase()
-  return lower === 'strict' ? 'Strict' : lower === 'lax' ? 'Lax' : 'None'
+export function extractSameSiteFromHeaders(
+  headers: Readonly<Record<string, string>> | null | undefined,
+  authenticatingCookieName?: string | null,
+): string | null {
+  const byName = parseSetCookieSameSiteMap(headers)
+  const keys = Object.keys(byName)
+  if (keys.length === 0) return null
+  if (authenticatingCookieName && authenticatingCookieName.trim()) {
+    const key = authenticatingCookieName.trim().toLowerCase()
+    if (key in byName) {
+      return byName[key] ?? 'Lax'
+    }
+    return null
+  }
+  // Prefer an auth-like cookie if multiple Set-Cookie entries exist; never let a cosmetic cookie win.
+  const authKey = keys.find(k => AUTH_COOKIE_NAME_RE.test(k))
+    ?? keys.find(k => !NON_AUTH_COOKIE_NAME_RE.test(k))
+    ?? keys[0]!
+  return byName[authKey] ?? null
 }
 
 function safeJsonParse(raw: string | null | undefined): unknown {
@@ -307,14 +573,29 @@ export class HostFactLog {
   private readonly browserTraces = new Map<string, HostBrowserTrace>()
   private readonly asyncPolls = new Map<string, HostAsyncPollRecord>()
   private readonly sanitizer: EgressSanitizer
+  private readonly assertCleanRequestPlane: boolean
   private nextSeq = 0
 
   constructor(options: HostFactLogOptions = {}) {
     this.sanitizer = options.sanitizer ?? createEgressSanitizer()
+    this.assertCleanRequestPlane = options.assertCleanRequestPlane === true
   }
 
   get size(): number {
     return this.exchanges.size
+  }
+
+  /** R2-C-9: Assert that recorded kernel request-plane fields never contain vault-scrubbed `[redacted:cap:...]` tokens. */
+  assertKernelRequestPlaneClean(exchangeId?: string): void {
+    if (exchangeId) {
+      const fact = this.exchanges.get(exchangeId)
+      if (!fact) return
+      assertCleanKernelRequestPlane(fact, 'HostFactLog')
+      return
+    }
+    for (const fact of this.exchanges.values()) {
+      assertCleanKernelRequestPlane(fact, 'HostFactLog')
+    }
   }
 
   /** Record one immutable host-observed exchange. Duplicate exchangeIds are rejected (append-only). */
@@ -340,14 +621,32 @@ export class HostFactLog {
     const parsedLabel = parseRoleLabel(roleSource)
     const actorRole: RoleName | null = input.actorRole ?? parsedLabel.role ?? normalizeRole(actor ?? undefined) ?? null
     const actorTenant: string | null = input.actorTenant ?? parsedLabel.tenant ?? parseRoleLabel(actor ?? null).tenant ?? null
-    const ambientAuth = deriveAmbientAuthFromHeaders(requestHeaders, input.ambientAuth)
+    const credentialPlacement = deriveCredentialPlacement(requestHeaders, input.credentialPlacement)
+    const ambientAuth = deriveAmbientAuthFromHeaders(requestHeaders, input.ambientAuth, credentialPlacement)
+    const setCookieMap = parseSetCookieSameSiteMap(responseHeaders)
+    const hasSetCookie = Object.keys(setCookieMap).length > 0
     const sameSite = input.sameSite !== undefined
       ? input.sameSite
-      : extractSameSiteFromHeaders(responseHeaders)
+      : extractSameSiteFromHeaders(responseHeaders, credentialPlacement.authenticatingCookieName)
     const method = (input.method || 'GET').toUpperCase()
     const pathAndQuery = input.pathAndQuery || '/'
     const origin = input.origin || ''
     const url = buildUrlString(origin, pathAndQuery, input.url)
+    const carrierText = input.carrierText !== undefined
+      ? input.carrierText
+      : buildCarrierText(method, pathAndQuery, requestHeaders, rawRequestBody)
+    const requestPlaneVaultScrubbed = hasVaultScrubbedRequestPlane({
+      pathAndQuery,
+      requestHeaders,
+      rawRequestBody,
+      carrierText,
+    })
+    if (this.assertCleanRequestPlane && requestPlaneVaultScrubbed) {
+      assertCleanKernelRequestPlane(
+        { exchangeId: input.exchangeId, pathAndQuery, requestHeaders, rawRequestBody, carrierText },
+        'HostFactLog.recordExchange',
+      )
+    }
     const oobCallbacks = Object.freeze((input.oobCallbacks ?? []).map(freezeOobFact))
 
     for (const cb of oobCallbacks) {
@@ -373,6 +672,13 @@ export class HostFactLog {
       actorTenant,
       ambientAuth,
       sameSite,
+      credentialPlacement,
+      ...(hasSetCookie ? { setCookieSameSiteByName: Object.freeze(setCookieMap) } : {}),
+      ...(input.raceBatchId !== undefined ? { raceBatchId: input.raceBatchId } : {}),
+      ...(requestPlaneVaultScrubbed ? { requestPlaneVaultScrubbed: true } : {}),
+      ...(input.hostExpressionChallenge ? { hostExpressionChallenge: Object.freeze({ ...input.hostExpressionChallenge }) } : {}),
+      ...(input.hostTimingChallenge ? { hostTimingChallenge: Object.freeze({ ...input.hostTimingChallenge }) } : {}),
+      ...(input.hostRedirectCanaryHost !== undefined ? { hostRedirectCanaryHost: input.hostRedirectCanaryHost } : {}),
       oobCallbacks,
       durationMs: Math.max(0, Number.isFinite(input.durationMs ?? 0) ? (input.durationMs ?? 0) : 0),
       ...(input.startedAt !== undefined ? { startedAt: input.startedAt } : {}),
@@ -395,9 +701,7 @@ export class HostFactLog {
       ...(input.cleanSession !== undefined ? { cleanSession: input.cleanSession } : {}),
       ...(input.replayAttempt !== undefined ? { replayAttempt: input.replayAttempt } : {}),
       ...(input.hostSignature !== undefined ? { hostSignature: input.hostSignature } : {}),
-      ...(input.carrierText !== undefined
-        ? { carrierText: input.carrierText }
-        : { carrierText: buildCarrierText(method, pathAndQuery, requestHeaders, rawRequestBody) }),
+      carrierText,
       ...(input.secretMatches ? { secretMatches: freezeStringList(input.secretMatches) } : {}),
       ...(input.artifact !== undefined
         ? { artifact: input.artifact ? Object.freeze({ ...input.artifact }) : null }
@@ -491,10 +795,31 @@ export class HostFactLog {
     return Object.freeze(list)
   }
 
-  /** Derive host-observed SameSite for an exchange (falling back to same-origin/actor Set-Cookie in this log). */
+  /**
+   * H-13: Derive host-observed SameSite strictly bound to the authenticating cookie.
+   * Scans same-origin/actor Set-Cookie headers for that exact cookie name (never letting a
+   * cosmetic cookie overwrite it), and defaults unknown SameSite on cookie auth to `'Lax'`
+   * (never `'None'`).
+   */
   resolveSameSite(exchangeId: string): string | null {
     const fact = this.exchanges.get(exchangeId)
     if (!fact) return null
+    const authCookie = fact.credentialPlacement?.authenticatingCookieName?.trim().toLowerCase() ?? null
+    if (authCookie) {
+      if (fact.setCookieSameSiteByName && authCookie in fact.setCookieSameSiteByName) {
+        return fact.setCookieSameSiteByName[authCookie] ?? 'Lax'
+      }
+      const originKey = normalizeOriginKey(fact.origin)
+      for (const item of this.orderedExchanges()) {
+        if (originKey && item.origin && normalizeOriginKey(item.origin) !== originKey) continue
+        if (fact.actor && item.actor && item.actor !== fact.actor) continue
+        if (item.setCookieSameSiteByName && authCookie in item.setCookieSameSiteByName) {
+          return item.setCookieSameSiteByName[authCookie] ?? 'Lax'
+        }
+      }
+      if (fact.sameSite) return fact.sameSite
+      return fact.ambientAuth === 'cookie' ? 'Lax' : null
+    }
     if (fact.sameSite) return fact.sameSite
     const originKey = normalizeOriginKey(fact.origin)
     for (const item of this.orderedExchanges()) {
@@ -502,7 +827,7 @@ export class HostFactLog {
       if (fact.actor && item.actor && item.actor !== fact.actor) continue
       if (item.sameSite) return item.sameSite
     }
-    return null
+    return fact.ambientAuth === 'cookie' ? 'Lax' : null
   }
 
   /**
@@ -610,6 +935,12 @@ export class HostFactLog {
         ...(fact.sessionId !== undefined ? { sessionId: fact.sessionId } : {}),
         ...(fact.carrierText ? { carrierText: fact.carrierText } : {}),
         ...(evidenceRole ? { evidenceRole } : {}),
+        ...(fact.raceBatchId !== undefined ? { raceBatchId: fact.raceBatchId } : {}),
+        ...(fact.credentialPlacement ? { credentialPlacement: fact.credentialPlacement } : {}),
+        ...(fact.requestPlaneVaultScrubbed ? { requestPlaneVaultScrubbed: true } : {}),
+        ...(fact.hostExpressionChallenge ? { hostExpressionChallenge: fact.hostExpressionChallenge } : {}),
+        ...(fact.hostTimingChallenge ? { hostTimingChallenge: fact.hostTimingChallenge } : {}),
+        ...(fact.hostRedirectCanaryHost !== undefined ? { hostRedirectCanaryHost: fact.hostRedirectCanaryHost } : {}),
       }
     })
     return {
@@ -669,6 +1000,12 @@ export class HostFactLog {
         ...(fact.sessionId !== undefined ? { sessionId: fact.sessionId } : {}),
         ...(fact.carrierText ? { carrierText: fact.carrierText } : {}),
         ...(evidenceRole ? { evidenceRole } : {}),
+        ...(fact.raceBatchId !== undefined ? { raceBatchId: fact.raceBatchId } : {}),
+        ...(fact.credentialPlacement ? { credentialPlacement: fact.credentialPlacement } : {}),
+        ...(fact.requestPlaneVaultScrubbed ? { requestPlaneVaultScrubbed: true } : {}),
+        ...(fact.hostExpressionChallenge ? { hostExpressionChallenge: fact.hostExpressionChallenge } : {}),
+        ...(fact.hostTimingChallenge ? { hostTimingChallenge: fact.hostTimingChallenge } : {}),
+        ...(fact.hostRedirectCanaryHost !== undefined ? { hostRedirectCanaryHost: fact.hostRedirectCanaryHost } : {}),
         timestampMs: ts,
         actorPersona: fact.actor,
         ...(fact.actorRoleLabel !== undefined ? { actorRoleLabel: fact.actorRoleLabel } : {}),
@@ -726,7 +1063,12 @@ export class HostFactLog {
         actorRoleLabel: entry.actorRoleLabel ?? null,
         actorTenant: step.actor.tenant ?? null,
         ambientAuth: step.actor.auth,
-        sameSite: step.actor.sameSite ?? null,
+        ...(step.actor.sameSite !== null && step.actor.sameSite !== undefined ? { sameSite: step.actor.sameSite } : {}),
+        ...(entry.credentialPlacement ? { credentialPlacement: entry.credentialPlacement } : {}),
+        ...(entry.raceBatchId !== undefined ? { raceBatchId: entry.raceBatchId } : {}),
+        ...(entry.hostExpressionChallenge ? { hostExpressionChallenge: entry.hostExpressionChallenge } : {}),
+        ...(entry.hostTimingChallenge ? { hostTimingChallenge: entry.hostTimingChallenge } : {}),
+        ...(entry.hostRedirectCanaryHost !== undefined ? { hostRedirectCanaryHost: entry.hostRedirectCanaryHost } : {}),
         durationMs: entry.durationMs ?? step.durationMs ?? 0,
         ...(entry.startedAt !== undefined ? { startedAt: entry.startedAt } : {}),
         ...(entry.endedAt !== undefined ? { endedAt: entry.endedAt } : {}),
@@ -784,6 +1126,11 @@ export class HostFactLog {
         actorRoleLabel: ex.actorRoleLabel ?? null,
         ambientAuth: ex.ambientAuth,
         ...(ex.sessionSameSite !== undefined ? { sameSite: ex.sessionSameSite } : {}),
+        ...(ex.credentialPlacement ? { credentialPlacement: ex.credentialPlacement } : {}),
+        ...(ex.raceBatchId !== undefined ? { raceBatchId: ex.raceBatchId } : {}),
+        ...(ex.hostExpressionChallenge ? { hostExpressionChallenge: ex.hostExpressionChallenge } : {}),
+        ...(ex.hostTimingChallenge ? { hostTimingChallenge: ex.hostTimingChallenge } : {}),
+        ...(ex.hostRedirectCanaryHost !== undefined ? { hostRedirectCanaryHost: ex.hostRedirectCanaryHost } : {}),
         durationMs: ex.durationMs ?? 0,
         ...(ex.startedAt !== undefined ? { startedAt: ex.startedAt } : {}),
         ...(ex.endedAt !== undefined ? { endedAt: ex.endedAt } : {}),
@@ -825,15 +1172,45 @@ export class HostFactLog {
             ? hostEntry.step.requestJson
             : JSON.stringify(hostEntry.step.requestJson))
           : parseBodyFromCarrierText(hostEntry?.carrierText, hostEntry?.step.requestHeaders, rawResp))
+      const reqExtra = req as (typeof req & {
+        kernelPathAndQuery?: string
+        rawPathAndQuery?: string
+        kernelHeaders?: Record<string, string>
+        rawHeaders?: Record<string, string>
+        raceBatchId?: string | null
+        credentialPlacement?: HostCredentialPlacement
+      }) | undefined
+      const artExtra = record.artifact as (typeof record.artifact & {
+        subscriptionId?: string
+        canaryId?: string
+        callbackId?: string
+        receivedAtMs?: number
+        hostSignature?: string
+        callbackSignature?: string
+      }) | undefined
+      const kernelPathAndQuery = reqExtra?.kernelPathAndQuery
+        ?? reqExtra?.rawPathAndQuery
+        ?? req?.pathAndQuery
+        ?? hostEntry?.step.pathAndQuery
+        ?? hostEntry?.step.route
+        ?? '/'
+      const kernelHeaders = reqExtra?.kernelHeaders
+        ?? reqExtra?.rawHeaders
+        ?? req?.headers
+        ?? hostEntry?.step.requestHeaders
+        ?? null
+      const kernelCarrierText = hostEntry?.carrierText && !hasVaultScrubbedToken(hostEntry.carrierText)
+        ? hostEntry.carrierText
+        : undefined
       log.recordExchange({
         seq: record.seq,
         exchangeId: record.exchangeId,
         op: record.op,
         method: req?.method ?? hostEntry?.step.method ?? (record.op === 'oob' ? 'OOB' : 'GET'),
         origin: req?.origin ?? hostEntry?.origin ?? '',
-        pathAndQuery: req?.pathAndQuery ?? hostEntry?.step.pathAndQuery ?? hostEntry?.step.route ?? '/',
+        pathAndQuery: kernelPathAndQuery,
         status: record.response?.status ?? hostEntry?.step.status ?? null,
-        requestHeaders: req?.headers ?? hostEntry?.step.requestHeaders ?? null,
+        requestHeaders: kernelHeaders,
         rawRequestBody: rawReq,
         responseHeaders: record.response?.headers ?? hostEntry?.step.responseHeaders ?? null,
         rawResponseBody: rawResp,
@@ -842,7 +1219,18 @@ export class HostFactLog {
         actorRoleLabel: req?.actorRoleLabel ?? hostEntry?.actorRoleLabel ?? null,
         actorTenant: hostEntry?.step.actor.tenant ?? null,
         ambientAuth: hostEntry?.step.actor.auth,
-        sameSite: hostEntry?.step.actor.sameSite ?? extractSameSiteFromHeaders(record.response?.headers ?? null),
+        ...(hostEntry?.step.actor.sameSite !== null && hostEntry?.step.actor.sameSite !== undefined
+          ? { sameSite: hostEntry.step.actor.sameSite }
+          : {}),
+        ...(reqExtra?.credentialPlacement ?? hostEntry?.credentialPlacement
+          ? { credentialPlacement: reqExtra?.credentialPlacement ?? hostEntry?.credentialPlacement }
+          : {}),
+        ...(reqExtra?.raceBatchId ?? hostEntry?.raceBatchId !== undefined
+          ? { raceBatchId: reqExtra?.raceBatchId ?? hostEntry?.raceBatchId }
+          : {}),
+        ...(hostEntry?.hostExpressionChallenge ? { hostExpressionChallenge: hostEntry.hostExpressionChallenge } : {}),
+        ...(hostEntry?.hostTimingChallenge ? { hostTimingChallenge: hostEntry.hostTimingChallenge } : {}),
+        ...(hostEntry?.hostRedirectCanaryHost !== undefined ? { hostRedirectCanaryHost: hostEntry.hostRedirectCanaryHost } : {}),
         durationMs: record.durationMs,
         startedAt: record.startedAt,
         endedAt: record.startedAt + Math.max(0, record.durationMs),
@@ -861,7 +1249,7 @@ export class HostFactLog {
         ...(hostEntry?.cleanSession !== undefined ? { cleanSession: hostEntry.cleanSession } : {}),
         ...(hostEntry?.replayAttempt ? { replayAttempt: hostEntry.replayAttempt } : {}),
         ...(hostEntry?.hostSignature ? { hostSignature: hostEntry.hostSignature } : {}),
-        ...(hostEntry?.carrierText ? { carrierText: hostEntry.carrierText } : {}),
+        ...(kernelCarrierText ? { carrierText: kernelCarrierText } : {}),
         ...(record.artifact
           ? {
               artifact: {
@@ -870,6 +1258,12 @@ export class HostFactLog {
                 url: record.artifact.url,
                 dnsHost: record.artifact.dnsHost,
                 hit: record.artifact.hit,
+                ...(artExtra?.subscriptionId ? { subscriptionId: artExtra.subscriptionId } : {}),
+                ...(artExtra?.canaryId ? { canaryId: artExtra.canaryId } : {}),
+                ...(artExtra?.callbackId ? { callbackId: artExtra.callbackId } : {}),
+                ...(artExtra?.receivedAtMs !== undefined ? { receivedAtMs: artExtra.receivedAtMs } : {}),
+                ...(artExtra?.hostSignature ? { hostSignature: artExtra.hostSignature } : {}),
+                ...(artExtra?.callbackSignature ? { callbackSignature: artExtra.callbackSignature } : {}),
               },
             }
           : {}),
