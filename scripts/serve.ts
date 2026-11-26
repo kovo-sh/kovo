@@ -5,7 +5,7 @@ import type { IncomingMessage, Server, ServerResponse } from 'node:http'
 import { join, resolve } from 'node:path'
 import { Readable, Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
-import { isLocalLabEnvEnabled } from '../src/domain.ts'
+import { assetOriginForEnvironment, isLocalLabEnvEnabled } from '../src/domain.ts'
 import { getAppRuntime } from '../src/server/app-runtime.ts'
 import type { AppRuntime } from '../src/server/app-runtime.ts'
 import { BrowserCaptureManager } from '../src/server/browser-session-auth.ts'
@@ -54,6 +54,8 @@ export interface LocalSessionOptions {
   store?: Store
   /** Option 4: optional browser capture manager for `/_kovo/auth-capture/*` interactive login capture. */
   captureManager?: BrowserCaptureManager
+  /** Optional request body byte limit override for proxied app requests (defaults to 8 MiB). */
+  maxBodyBytes?: number
 }
 
 export interface KovoLocalServer {
@@ -172,16 +174,80 @@ function sendJson(res: ServerResponse, status: number, body: unknown, extraHeade
   }).end(JSON.stringify(body))
 }
 
+const TENANT_ID_RE = /^[A-Za-z0-9_.:-]{1,128}$/
+
+class BodyTooLargeError extends Error {
+  constructor() {
+    super('Request body is too large.')
+    this.name = 'BodyTooLargeError'
+  }
+}
+
+function isBodyTooLargeError(err: unknown): boolean {
+  if (err instanceof BodyTooLargeError) return true
+  if (err && typeof err === 'object' && 'cause' in err) {
+    return (err as { cause?: unknown }).cause instanceof BodyTooLargeError
+  }
+  return false
+}
+
+/**
+ * Strict Fetch Metadata (`Sec-Fetch-Site`) control-plane guard:
+ * - Mutating requests (`!readOnly`) only permit `same-origin` (or absent for non-browser callers,
+ *   which are still bound by exact `Origin` equality). Loose `same-site` / `cross-site` / `none`
+ *   are rejected to prevent sibling-subdomain CSRF.
+ * - Read-only requests (`GET` / `HEAD`) permit `same-origin`, `none` (direct address-bar navigation),
+ *   or absent header, and reject both `same-site` and `cross-site`.
+ */
+export function isAllowedSecFetchSite(
+  rawHeader: string | string[] | undefined,
+  readOnly: boolean,
+): boolean {
+  const first = Array.isArray(rawHeader) ? rawHeader[0] : rawHeader
+  if (first === undefined) return true
+  const normalized = first.trim().toLowerCase()
+  if (!normalized) return true
+  if (!readOnly) return normalized === 'same-origin'
+  return normalized === 'same-origin' || normalized === 'none'
+}
+
+function parseOptionalTenantId(raw: unknown): { ok: true; value: string | null } | { ok: false; error: string } {
+  if (raw === undefined || raw === null) return { ok: true, value: null }
+  if (typeof raw !== 'string') return { ok: false, error: 'tenantId must be a string.' }
+  const trimmed = raw.trim()
+  if (!trimmed) return { ok: true, value: null }
+  if (!TENANT_ID_RE.test(trimmed)) {
+    return { ok: false, error: 'Invalid tenantId format.' }
+  }
+  return { ok: true, value: trimmed }
+}
+
+function shouldReturnJsonAuthError(pathname: string): boolean {
+  return (
+    pathname.startsWith('/_kovo/auth/')
+    || pathname.startsWith('/_kovo/auth-capture')
+    || pathname.startsWith('/api/')
+    || pathname.startsWith('/_serverFn/')
+    || receiptExportPathRegex.test(pathname)
+  )
+}
+
 async function readBoundedJsonBody(req: IncomingMessage, limitBytes = maxOpsBody): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = []
   let total = 0
-  for await (const chunk of req) {
-    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
-    total += buf.length
-    if (total > limitBytes) {
-      throw new Error('Request body is too large.')
+  try {
+    for await (const chunk of req) {
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+      total += buf.length
+      if (total > limitBytes) {
+        req.resume()
+        throw new BodyTooLargeError()
+      }
+      chunks.push(buf)
     }
-    chunks.push(buf)
+  } catch (err) {
+    if (err instanceof BodyTooLargeError) throw err
+    throw new Error('Failed to read request body.')
   }
   const raw = Buffer.concat(chunks).toString('utf8').trim()
   if (!raw) return {}
@@ -261,6 +327,7 @@ export function createKovoLocalServer(options: LocalSessionOptions): KovoLocalSe
   const killSwitch = options.killSwitch ?? runtime?.killSwitch ?? getAppRuntime({ dataDir: directory }).killSwitch
   const storeHandle = options.store ?? runtime?.store
   const captureManager = options.captureManager ?? new BrowserCaptureManager()
+  const bodyLimit = Math.max(256, Math.floor(options.maxBodyBytes ?? maxBody))
   let token = readOrCreateSessionToken(directory)
   const secret = readOrCreateBootstrapSecret(directory)
   let bootstrapConsumed = false
@@ -313,7 +380,12 @@ export function createKovoLocalServer(options: LocalSessionOptions): KovoLocalSe
     if (!origin) return reject(res, 421, 'Unexpected host.')
     const path = new URL(req.url ?? '/', origin)
     if (path.origin !== origin) return reject(res, 421, 'Unexpected request URL.')
-    if (!readOnly && req.headers.origin !== origin) return reject(res, 403, 'Unexpected origin.')
+    if (!readOnly) {
+      if (req.headers.origin !== origin) return reject(res, 403, 'Unexpected origin.')
+      if (!isAllowedSecFetchSite(req.headers['sec-fetch-site'], false)) {
+        return reject(res, 403, 'Cross-origin request rejected.')
+      }
+    }
     if (readOnly && path.pathname === '/health') return reject(res, 200, 'ok')
 
     if (readOnly && (path.pathname === '/favicon.svg' || path.pathname === '/favicon-stealth.svg' || /^\/brand\/[A-Za-z0-9._-]+\.svg$/.test(path.pathname))) {
@@ -380,26 +452,41 @@ export function createKovoLocalServer(options: LocalSessionOptions): KovoLocalSe
     }
 
     const session = isSessionAuthorized(req.headers.cookie, token)
+    if (!isAllowedSecFetchSite(req.headers['sec-fetch-site'], readOnly)) {
+      return reject(res, 403, 'Open Kovo Hunter directly.')
+    }
     if (!session) {
-      if (req.headers['sec-fetch-site'] === 'cross-site') return reject(res, 403, 'Open Kovo Hunter directly.')
-      if (
-        path.pathname.startsWith('/_kovo/auth/') ||
-        path.pathname.startsWith('/_kovo/auth-capture') ||
-        path.pathname.startsWith('/api/ops/') ||
-        receiptExportPathRegex.test(path.pathname)
-      ) {
-        return sendJson(res, 401, { error: 'Local session required.' })
+      if (shouldReturnJsonAuthError(path.pathname)) {
+        if (method === 'HEAD') {
+          res.writeHead(401, {
+            'content-type': 'application/json; charset=utf-8',
+            'cache-control': 'no-store',
+            'x-kovo-auth': 'expired',
+          }).end()
+          return
+        }
+        return sendJson(res, 401, { error: 'Local session required.', code: 'SESSION_EXPIRED' }, {
+          'x-kovo-auth': 'expired',
+        })
+      }
+      if (method === 'HEAD') {
+        res.writeHead(401, { 'content-type': 'text/html; charset=utf-8', 'x-kovo-auth': 'expired' }).end()
+        return
       }
       return rejectSession(res)
     }
-    if (req.headers['sec-fetch-site'] === 'cross-site') return reject(res, 403, 'Open Kovo Hunter directly.')
-    if (Number(req.headers['content-length'] ?? 0) > maxBody) return reject(res, 413, 'Request body is too large.')
+    if (Number(req.headers['content-length'] ?? 0) > bodyLimit) return reject(res, 413, 'Request body is too large.')
 
     // v7 M4 Production Ops: global < 2s kill-switch control endpoint.
     if (path.pathname === killSwitchPath) {
       if (method === 'GET' || method === 'HEAD') {
-        const queryTenantId = path.searchParams.get('tenantId')?.trim() || null
-        const state = killSwitch.status(queryTenantId)
+        const tenantCheck = parseOptionalTenantId(path.searchParams.get('tenantId'))
+        if (!tenantCheck.ok) return sendJson(res, 400, { error: tenantCheck.error })
+        const state = killSwitch.status(tenantCheck.value)
+        if (method === 'HEAD') {
+          res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }).end()
+          return
+        }
         return sendJson(res, 200, state)
       }
       if (method !== 'POST') return reject(res, 405, 'Method not allowed.')
@@ -409,13 +496,15 @@ export function createKovoLocalServer(options: LocalSessionOptions): KovoLocalSe
         body = await readBoundedJsonBody(req)
       } catch (err) {
         const msg = err instanceof Error ? err.message : 'Invalid JSON body.'
-        return sendJson(res, msg.includes('too large') ? 413 : 400, { error: msg })
+        return sendJson(res, isBodyTooLargeError(err) || msg.includes('too large') ? 413 : 400, { error: msg })
       }
       const action = typeof body.action === 'string' ? body.action.toLowerCase() : 'trip'
       if (action !== 'trip' && action !== 'reset') {
         return sendJson(res, 400, { error: 'action must be "trip" or "reset".' })
       }
-      const tenantId = typeof body.tenantId === 'string' && body.tenantId.trim() ? body.tenantId.trim() : null
+      const tenantCheck = parseOptionalTenantId(body.tenantId)
+      if (!tenantCheck.ok) return sendJson(res, 400, { error: tenantCheck.error })
+      const tenantId = tenantCheck.value
       const state = action === 'trip'
         ? killSwitch.trip({
             reason: typeof body.reason === 'string' && body.reason.trim()
@@ -458,7 +547,9 @@ export function createKovoLocalServer(options: LocalSessionOptions): KovoLocalSe
         : zdrParam === '0' || zdrParam === 'false'
           ? false
           : undefined
-      const tenantId = path.searchParams.get('tenantId')?.trim() || undefined
+      const tenantCheck = parseOptionalTenantId(path.searchParams.get('tenantId'))
+      if (!tenantCheck.ok) return sendJson(res, 400, { error: tenantCheck.error })
+      const tenantId = tenantCheck.value ?? undefined
       try {
         const bundle = exportRunReceiptBundle(storeHandle, runId, {
           ...(zdr !== undefined ? { zdr } : {}),
@@ -498,10 +589,11 @@ export function createKovoLocalServer(options: LocalSessionOptions): KovoLocalSe
         res.writeHead(200, {
           'content-type': 'application/json; charset=utf-8',
           'cache-control': 'no-store',
+          'x-kovo-auth': 'ok',
         }).end()
         return
       }
-      return sendJson(res, 200, payload)
+      return sendJson(res, 200, payload, { 'x-kovo-auth': 'ok' })
     }
 
     if (path.pathname === pairingLinkPath) {
@@ -549,27 +641,51 @@ export function createKovoLocalServer(options: LocalSessionOptions): KovoLocalSe
         return sendJson(res, 400, { error: 'projectId and targetOrigin are required.' })
       }
       let allowLocalLab = false
-      let allowedOrigins: string[] | undefined = Array.isArray(body.allowedOrigins)
+      let projectEnv: 'public' | 'local-lab' = 'public'
+      let rawAllowedOrigins: string[] | undefined = Array.isArray(body.allowedOrigins)
         ? body.allowedOrigins.filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
         : undefined
       if (storeHandle) {
         try {
           const proj = storeHandle.project(projectId)
+          projectEnv = proj.environment
           allowLocalLab = proj.environment === 'local-lab' && isLocalLabEnvEnabled()
-          if (!allowedOrigins || allowedOrigins.length === 0) {
-            allowedOrigins = [...proj.seeds]
+          if (!rawAllowedOrigins || rawAllowedOrigins.length === 0) {
+            rawAllowedOrigins = [...proj.seeds]
           }
         } catch (err) {
           return sendJson(res, 404, { error: err instanceof Error ? err.message : 'Project not found.' })
         }
       } else if (body.allowLocalLab === true && isLocalLabEnvEnabled()) {
         allowLocalLab = true
+        projectEnv = 'local-lab'
+      }
+      const originPolicy = assetOriginForEnvironment(projectEnv)
+      const parsedTarget = originPolicy.safeParse(targetOrigin)
+      if (!parsedTarget.success) {
+        return sendJson(res, 400, {
+          error: parsedTarget.error.issues[0]?.message ?? `targetOrigin is not allowed for this ${projectEnv} project.`,
+        })
+      }
+      let allowedOrigins: string[] | undefined
+      if (rawAllowedOrigins && rawAllowedOrigins.length > 0) {
+        const validated: string[] = []
+        for (const candidate of rawAllowedOrigins.slice(0, 64)) {
+          const parsedCandidate = originPolicy.safeParse(candidate)
+          if (!parsedCandidate.success) {
+            return sendJson(res, 400, {
+              error: parsedCandidate.error.issues[0]?.message ?? `allowedOrigins entry "${candidate}" is not allowed for this ${projectEnv} project.`,
+            })
+          }
+          validated.push(parsedCandidate.data)
+        }
+        allowedOrigins = validated
       }
       const ttlMs = typeof body.ttlMs === 'number' && Number.isFinite(body.ttlMs) ? body.ttlMs : undefined
       try {
         const capture = await captureManager.startCapture({
           projectId,
-          targetOrigin,
+          targetOrigin: parsedTarget.data,
           allowLocalLab,
           allowedOrigins,
           ...(ttlMs ? { ttlMs } : {}),
@@ -657,17 +773,14 @@ export function createKovoLocalServer(options: LocalSessionOptions): KovoLocalSe
       if (action === 'complete') {
         req.resume()
         try {
-          const bundle = await captureManager.complete(captureId)
+          // Move U2: Keep raw captured BrowserStorageBundle strictly server-side in a single-use
+          // project-bound escrow map and return ONLY { captureToken, expiresAt, summary } to the UI.
+          const escrowed = await captureManager.completeToEscrow(captureId)
           return sendJson(res, 200, {
             ok: true,
-            bundle,
-            summary: {
-              targetOrigin: bundle.targetOrigin,
-              capturedAt: bundle.capturedAt,
-              cookieCount: bundle.storageState.cookies.length,
-              originCount: bundle.storageState.origins.length,
-              hasAuthorizationHeader: Boolean(bundle.observedHeaders?.Authorization),
-            },
+            captureToken: escrowed.captureToken,
+            expiresAt: escrowed.expiresAt,
+            summary: escrowed.summary,
           })
         } catch (err) {
           const message = err instanceof Error ? err.message : 'Unable to complete capture.'
@@ -783,19 +896,55 @@ export function createKovoLocalServer(options: LocalSessionOptions): KovoLocalSe
       abort.abort()
     })
     let received = 0
+    let bodyTooLarge = false
     const limiter = new Transform({
       transform(chunk, _encoding, done) {
         received += chunk.length
-        if (received > maxBody) done(new Error('Request body is too large.'))
-        else done(null, chunk)
+        if (received > bodyLimit) {
+          bodyTooLarge = true
+          req.unpipe(limiter)
+          req.resume()
+          done(new BodyTooLargeError())
+        } else {
+          done(null, chunk)
+        }
       },
     })
-    if (!readOnly) req.pipe(limiter)
+    // Prevent unhandled stream 'error' events if chunked uploads exceed bodyLimit or the socket resets.
+    limiter.on('error', () => {
+      req.unpipe(limiter)
+    })
+    const onReqError = (err: Error) => {
+      req.unpipe(limiter)
+      if (!limiter.destroyed) limiter.destroy(err)
+    }
+    if (!readOnly) {
+      req.on('error', onReqError)
+      req.pipe(limiter)
+    }
+    res.once('close', () => {
+      req.off('error', onReqError)
+      req.unpipe(limiter)
+      if (!limiter.destroyed) limiter.destroy()
+    })
     const body = readOnly ? undefined : Readable.toWeb(limiter) as ReadableStream<Uint8Array>
     const request = new Request(path, {
       method, headers, body, signal: abort.signal, ...(body ? { duplex: 'half' } : {}),
     } as RequestInit)
-    const response = await app.fetch(request)
+    let response: Response
+    try {
+      response = await app.fetch(request)
+    } catch (err) {
+      if (bodyTooLarge || isBodyTooLargeError(err)) {
+        if (!res.headersSent) return reject(res, 413, 'Request body is too large.')
+        return
+      }
+      throw err
+    }
+    if (bodyTooLarge) {
+      if (!res.headersSent) return reject(res, 413, 'Request body is too large.')
+      return
+    }
     for (const [name, value] of response.headers) {
       if (name !== 'set-cookie') res.setHeader(name, value)
     }

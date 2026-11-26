@@ -24,16 +24,20 @@
  *      persists the updated `BrowserStorageBundle` back to disk (`0600`), and returns fresh
  *      `MintedPersonaSession` material.
  */
-import { randomBytes } from 'node:crypto'
+import { randomBytes, timingSafeEqual } from 'node:crypto'
+import { assetOriginForEnvironment } from '../domain.ts'
 import {
+  classifyDetailedAddress,
   EgressGateway,
   isLoopbackLiteral,
 } from './egress-gateway.ts'
 import type { EgressLoopbackProxy } from './egress-gateway.ts'
 import {
   buildSessionFromBrowserBundle,
+  createBrowserSessionPersona,
   normalizeBrowserStorageBundle,
   normalizePlaywrightStorageState,
+  updateBrowserSessionPersona,
   writeBrowserSessionCredentialFile,
 } from './persona-vault.ts'
 import type {
@@ -43,6 +47,7 @@ import type {
   PlaywrightStorageOrigin,
   PlaywrightStorageState,
 } from './persona-vault.ts'
+import type { Store } from './store.ts'
 
 export type {
   BrowserStorageBundle,
@@ -50,7 +55,7 @@ export type {
   PlaywrightStorageOrigin,
   PlaywrightStorageState,
 }
-import { normalizeHostname } from './public-suffix.ts'
+import { isIpLiteralHost, normalizeHostname } from './public-suffix.ts'
 
 // ---------------------------------------------------------------------------
 // Constants & Types
@@ -58,6 +63,10 @@ import { normalizeHostname } from './public-suffix.ts'
 
 export const DEFAULT_CAPTURE_TTL_MS = 5 * 60 * 1000 // 5 minutes
 export const MAX_CAPTURE_TTL_MS = 5 * 60 * 1000
+export const DEFAULT_CAPTURE_ESCROW_TTL_MS = 5 * 60 * 1000 // 5 minutes
+export const MAX_CAPTURE_ESCROW_TTL_MS = 5 * 60 * 1000
+export const MAX_CAPTURE_ESCROW_ENTRIES = 64
+export const CAPTURE_TOKEN_PREFIX = 'cap_tok_'
 export const DEFAULT_CAPTURE_VIEWPORT = { width: 1280, height: 800 } as const
 export const DEFAULT_SCREENCAST_QUALITY = 75
 export const DEFAULT_REFRESH_SETTLE_MS = 2_500
@@ -211,6 +220,36 @@ export interface RefreshedBrowserSession {
 // Helpers: Validation, Proxy Setup & Chromium Launch
 // ---------------------------------------------------------------------------
 
+function assertAllowedBrowserHost(hostname: string, allowLocalLab: boolean, label: string): void {
+  const host = normalizeHostname(hostname)
+  if (!host) {
+    throw new Error(`${label} must include a valid hostname.`)
+  }
+  if (
+    host === 'metadata.google.internal'
+    || host === 'metadata'
+    || (isIpLiteralHost(host) && classifyDetailedAddress(host) === 'metadata_or_link_local')
+  ) {
+    throw new Error(`${label} cannot target cloud metadata or link-local addresses.`)
+  }
+  if (allowLocalLab) return
+  if (
+    isLoopbackLiteral(host)
+    || host === 'localhost'
+    || host.endsWith('.localhost')
+    || host.endsWith('.local')
+    || host.endsWith('.internal')
+  ) {
+    throw new Error(`${label} cannot target loopback or local hosts for public projects.`)
+  }
+  if (isIpLiteralHost(host)) {
+    const cls = classifyDetailedAddress(host)
+    if (cls !== 'public') {
+      throw new Error(`${label} cannot target loopback, private, or non-public IP addresses for public projects.`)
+    }
+  }
+}
+
 function normalizeTargetOrigin(raw: string, allowLocalLab: boolean): URL {
   let parsed: URL
   try {
@@ -224,9 +263,10 @@ function normalizeTargetOrigin(raw: string, allowLocalLab: boolean): URL {
   if (parsed.username || parsed.password) {
     throw new Error('targetOrigin must not contain embedded credentials.')
   }
-  if (parsed.protocol === 'http:' && !allowLocalLab && !isLoopbackLiteral(parsed.hostname)) {
-    throw new Error('Plaintext HTTP targetOrigin requires local-lab mode or a loopback address.')
+  if (parsed.protocol === 'http:' && !allowLocalLab) {
+    throw new Error('Plaintext HTTP targetOrigin is blocked for public projects.')
   }
+  assertAllowedBrowserHost(parsed.hostname, allowLocalLab, 'targetOrigin')
   return parsed
 }
 
@@ -297,9 +337,13 @@ async function createBrowserSessionProxy(params: {
     try {
       const parsed = new URL(raw)
       const norm = normalizeHostname(parsed.hostname)
-      if (norm && isLoopbackLiteral(norm)) loopbackHosts.add(norm)
+      if (allowLocalLab && norm && isLoopbackLiteral(norm)) loopbackHosts.add(norm)
       const port = parsed.port ? Number(parsed.port) : (parsed.protocol === 'https:' ? 443 : 80)
-      if (Number.isInteger(port) && port >= 1 && port <= 65_535) allowedPorts.add(port)
+      if (Number.isInteger(port) && port >= 1 && port <= 65_535) {
+        if (allowLocalLab || (parsed.protocol === 'https:' && port === 443)) {
+          allowedPorts.add(port)
+        }
+      }
     } catch {
       // Ignore malformed origin entries.
     }
@@ -308,20 +352,16 @@ async function createBrowserSessionProxy(params: {
   registerOrigin(targetUrl.origin)
   for (const entry of allowedOrigins ?? []) registerOrigin(entry)
 
-  const allowLoopbackTarget = allowLocalLab || loopbackHosts.size > 0
   return await EgressGateway.createLoopbackProxy({
     allowLocalLab,
     allowHttp: allowLocalLab ? true : undefined,
-    ...(loopbackHosts.size > 0 && !allowLocalLab ? { allowedLoopbackOnlyHosts: [...loopbackHosts] } : {}),
     allowConnectPort: port => allowLocalLab || allowedPorts.has(port),
     allowOrigin: (origin, method, url) => {
-      // Allow public HTTPS (and allowlisted loopback / local-lab HTTP). EgressGateway's
-      // resolveAndValidateHost independently blocks metadata/link-local/private/unlisted-loopback IPs.
+      // Allow public HTTPS (and local-lab HTTP only when allowLocalLab is enabled). EgressGateway's
+      // resolveAndValidateHost independently blocks metadata/link-local/private/loopback IPs.
       if (url.protocol === 'https:') return true
       if (url.protocol === 'http:') {
         if (allowLocalLab) return true
-        const host = normalizeHostname(url.hostname)
-        if (allowLoopbackTarget && loopbackHosts.has(host)) return true
         return { allowed: false, reason: `Browser session proxy refused plaintext HTTP origin "${origin}".` }
       }
       if (method === 'CONNECT') return true
@@ -673,9 +713,10 @@ export async function startInteractiveLoginCapture(
       if (parsed.username || parsed.password) {
         throw new Error('Navigation URL must not contain embedded credentials.')
       }
-      if (parsed.protocol === 'http:' && !allowLocalLab && !isLoopbackLiteral(parsed.hostname)) {
+      if (parsed.protocol === 'http:' && !allowLocalLab) {
         throw new Error('Plaintext HTTP navigation is blocked outside local-lab mode.')
       }
+      assertAllowedBrowserHost(parsed.hostname, allowLocalLab, 'Navigation URL')
       await page!.goto(parsed.toString(), { waitUntil: 'domcontentloaded', timeout: 15_000 })
       lastKnownUrl = page!.url() || parsed.toString()
       emit({ type: 'url', url: lastKnownUrl })
@@ -717,15 +758,301 @@ export async function startInteractiveLoginCapture(
 }
 
 // ---------------------------------------------------------------------------
+// Server-Side Capture Escrow (Single-Use captureToken, Project-Bound, 5m TTL)
+// ---------------------------------------------------------------------------
+
+export interface CaptureSummary {
+  targetOrigin: string
+  capturedAt: number
+  cookieCount: number
+  originCount: number
+  /** Safe non-secret list of origins present in storageState (never localStorage values). */
+  origins: string[]
+  /** Safe non-secret list of observed auth header names (never header values). */
+  headerNames: string[]
+  hasAuthorizationHeader: boolean
+}
+
+export interface EscrowedCapture {
+  readonly captureToken: string
+  readonly projectId: string
+  readonly expiresAt: number
+  readonly summary: CaptureSummary
+}
+
+interface CaptureEscrowRecord {
+  readonly projectId: string
+  readonly bundle: BrowserStorageBundle
+  readonly createdAt: number
+  readonly expiresAt: number
+  readonly timer: ReturnType<typeof setTimeout>
+}
+
+export function summarizeBrowserStorageBundle(bundle: BrowserStorageBundle): CaptureSummary {
+  const originSet = new Set<string>()
+  for (const entry of bundle.storageState.origins) {
+    if (entry.origin) originSet.add(entry.origin)
+  }
+  const headerNames = Object.keys(bundle.observedHeaders ?? {}).sort()
+  return {
+    targetOrigin: bundle.targetOrigin,
+    capturedAt: bundle.capturedAt,
+    cookieCount: bundle.storageState.cookies.length,
+    originCount: bundle.storageState.origins.length,
+    origins: [...originSet].sort(),
+    headerNames,
+    hasAuthorizationHeader: Boolean(bundle.observedHeaders?.Authorization),
+  }
+}
+
+function constantTimeStringEqual(a: string, b: string): boolean {
+  const bufA = Buffer.from(a, 'utf8')
+  const bufB = Buffer.from(b, 'utf8')
+  if (bufA.length !== bufB.length) return false
+  return timingSafeEqual(bufA, bufB)
+}
+
+/**
+ * Process-local server-side escrow holding completed `BrowserStorageBundle` secrets so raw
+ * cookies, localStorage values, and Authorization headers NEVER leave the server during
+ * interactive login capture.
+ */
+export class CaptureEscrowStore {
+  private readonly entries = new Map<string, CaptureEscrowRecord>()
+  private readonly defaultTtlMs: number
+  private readonly maxEntries: number
+  private readonly now: () => number
+
+  constructor(options: { ttlMs?: number; maxEntries?: number; now?: () => number } = {}) {
+    this.defaultTtlMs = Math.max(1_000, Math.min(MAX_CAPTURE_ESCROW_TTL_MS, Math.floor(options.ttlMs ?? DEFAULT_CAPTURE_ESCROW_TTL_MS)))
+    this.maxEntries = Math.max(1, Math.floor(options.maxEntries ?? MAX_CAPTURE_ESCROW_ENTRIES))
+    this.now = options.now ?? Date.now
+  }
+
+  private deleteKey(token: string): void {
+    const existing = this.entries.get(token)
+    if (!existing) return
+    clearTimeout(existing.timer)
+    this.entries.delete(token)
+  }
+
+  pruneExpired(): number {
+    const currentMs = this.now()
+    let removed = 0
+    for (const [token, record] of this.entries) {
+      if (record.expiresAt <= currentMs) {
+        this.deleteKey(token)
+        removed += 1
+      }
+    }
+    return removed
+  }
+
+  get size(): number {
+    this.pruneExpired()
+    return this.entries.size
+  }
+
+  has(captureToken: string): boolean {
+    this.pruneExpired()
+    const entry = this.entries.get(captureToken)
+    return Boolean(entry && entry.expiresAt > this.now())
+  }
+
+  store(params: {
+    projectId: string
+    bundle: BrowserStorageBundle
+    ttlMs?: number
+  }): EscrowedCapture {
+    const projectId = params.projectId.trim()
+    if (!projectId) {
+      throw new Error('projectId is required to escrow a captured browser session.')
+    }
+    this.pruneExpired()
+    while (this.entries.size >= this.maxEntries) {
+      const oldest = this.entries.keys().next().value
+      if (oldest === undefined) break
+      this.deleteKey(oldest)
+    }
+
+    const ttlMs = Math.max(
+      1_000,
+      Math.min(MAX_CAPTURE_ESCROW_TTL_MS, Math.floor(params.ttlMs ?? this.defaultTtlMs)),
+    )
+    const createdAt = this.now()
+    const expiresAt = createdAt + ttlMs
+    const captureToken = `${CAPTURE_TOKEN_PREFIX}${randomBytes(32).toString('hex')}`
+    const timer = setTimeout(() => {
+      this.deleteKey(captureToken)
+    }, ttlMs)
+    timer.unref?.()
+
+    this.entries.set(captureToken, {
+      projectId,
+      bundle: params.bundle,
+      createdAt,
+      expiresAt,
+      timer,
+    })
+
+    return {
+      captureToken,
+      projectId,
+      expiresAt,
+      summary: summarizeBrowserStorageBundle(params.bundle),
+    }
+  }
+
+  redeem(captureToken: string, projectId: string): BrowserStorageBundle {
+    this.pruneExpired()
+    const token = captureToken.trim()
+    const requestedProjectId = projectId.trim()
+    if (!/^cap_tok_[a-f0-9]{64}$/.test(token)) {
+      throw new Error('Captured browser session token is invalid, already used, or expired. Sign in again.')
+    }
+    const entry = this.entries.get(token)
+    if (!entry || entry.expiresAt <= this.now()) {
+      this.deleteKey(token)
+      throw new Error('Captured browser session token is invalid, already used, or expired. Sign in again.')
+    }
+    if (!requestedProjectId || !constantTimeStringEqual(entry.projectId, requestedProjectId)) {
+      throw new Error('Captured browser session token does not belong to this project.')
+    }
+    // Single-use: delete immediately before returning the bundle.
+    this.deleteKey(token)
+    return entry.bundle
+  }
+
+  clear(): void {
+    for (const token of [...this.entries.keys()]) {
+      this.deleteKey(token)
+    }
+  }
+}
+
+const CAPTURE_ESCROW_SYMBOL = Symbol.for('kovo.authCaptureEscrowStore')
+
+/**
+ * Process-wide shared escrow singleton (bridging `scripts/serve.ts` and `build/server/server.js`).
+ */
+export function getCaptureEscrowStore(): CaptureEscrowStore {
+  const g = globalThis as Record<symbol, CaptureEscrowStore | undefined>
+  let store = g[CAPTURE_ESCROW_SYMBOL]
+  if (!store) {
+    store = new CaptureEscrowStore()
+    g[CAPTURE_ESCROW_SYMBOL] = store
+  }
+  return store
+}
+
+export function redeemCapturedBrowserSession(
+  captureToken: string,
+  projectId: string,
+): BrowserStorageBundle {
+  return getCaptureEscrowStore().redeem(captureToken, projectId)
+}
+
+function validateBrowserPersonaOrigins(
+  environment: 'public' | 'local-lab',
+  origins: readonly string[],
+): string[] {
+  const validator = assetOriginForEnvironment(environment)
+  return origins.map(origin => {
+    const parsed = validator.safeParse(origin)
+    if (!parsed.success) {
+      throw new Error(parsed.error.issues[0]?.message ?? `Origin "${origin}" is not allowed for this ${environment} project.`)
+    }
+    return parsed.data
+  })
+}
+
+export function registerBrowserSessionPersonaFromAction(
+  db: Store,
+  data: {
+    requestId: string
+    projectId: string
+    handle: string
+    roleLabel: string
+    originAllowlist: string[]
+    captureToken?: string
+    storageState?: unknown
+    observedHeaders?: Record<string, string>
+    verifyPath?: string
+    refreshIntervalSec?: number
+    canaryMarkers?: string[]
+  },
+  escrow: CaptureEscrowStore = getCaptureEscrowStore(),
+): { id: string; handle: string } {
+  const project = db.project(data.projectId)
+  const originAllowlist = validateBrowserPersonaOrigins(project.environment, data.originAllowlist)
+  const resolvedStorageState = data.captureToken
+    ? escrow.redeem(data.captureToken, data.projectId)
+    : data.storageState
+  if (resolvedStorageState === undefined) {
+    throw new Error('Provide either a captured session token or a storageState.json payload.')
+  }
+  return createBrowserSessionPersona(db, {
+    requestId: data.requestId,
+    projectId: data.projectId,
+    handle: data.handle,
+    roleLabel: data.roleLabel,
+    originAllowlist,
+    storageState: resolvedStorageState,
+    observedHeaders: data.observedHeaders,
+    verifyPath: data.verifyPath,
+    refreshIntervalSec: data.refreshIntervalSec,
+    canaryMarkers: data.canaryMarkers,
+  })
+}
+
+export function updateBrowserSessionPersonaFromAction(
+  db: Store,
+  data: {
+    requestId: string
+    projectId: string
+    personaId: string
+    roleLabel: string
+    originAllowlist: string[]
+    captureToken?: string
+    storageState?: unknown
+    observedHeaders?: Record<string, string>
+    verifyPath?: string
+    refreshIntervalSec?: number
+    canaryMarkers?: string[]
+  },
+  escrow: CaptureEscrowStore = getCaptureEscrowStore(),
+): { id: string; handle: string } {
+  const project = db.project(data.projectId)
+  const originAllowlist = validateBrowserPersonaOrigins(project.environment, data.originAllowlist)
+  const resolvedStorageState = data.captureToken
+    ? escrow.redeem(data.captureToken, data.projectId)
+    : data.storageState
+  return updateBrowserSessionPersona(db, {
+    requestId: data.requestId,
+    projectId: data.projectId,
+    personaId: data.personaId,
+    roleLabel: data.roleLabel,
+    originAllowlist,
+    ...(resolvedStorageState !== undefined ? { storageState: resolvedStorageState } : {}),
+    observedHeaders: data.observedHeaders,
+    verifyPath: data.verifyPath,
+    refreshIntervalSec: data.refreshIntervalSec,
+    canaryMarkers: data.canaryMarkers,
+  })
+}
+
+// ---------------------------------------------------------------------------
 // Capture Registry (Single-Use IDs, Bounded Concurrency, Guaranteed Cleanup)
 // ---------------------------------------------------------------------------
 
 export class BrowserCaptureManager {
   private readonly sessions = new Map<string, InteractiveLoginCaptureSession>()
   private readonly maxConcurrent: number
+  readonly escrow: CaptureEscrowStore
 
-  constructor(options: { maxConcurrent?: number } = {}) {
+  constructor(options: { maxConcurrent?: number; escrow?: CaptureEscrowStore } = {}) {
     this.maxConcurrent = Math.max(1, options.maxConcurrent ?? MAX_CONCURRENT_CAPTURES)
+    this.escrow = options.escrow ?? getCaptureEscrowStore()
   }
 
   get activeCount(): number {
@@ -770,6 +1097,20 @@ export class BrowserCaptureManager {
     // Remove immediately to guarantee single-use semantics even under concurrent calls.
     this.sessions.delete(id)
     return await session.completeCapture()
+  }
+
+  async completeToEscrow(id: string, options?: { ttlMs?: number }): Promise<EscrowedCapture> {
+    const session = this.get(id)
+    if (!session) throw new Error('Capture session not found or already closed.')
+    const projectId = session.projectId
+    // Remove immediately to guarantee single-use semantics even under concurrent calls.
+    this.sessions.delete(id)
+    const bundle = await session.completeCapture()
+    return this.escrow.store({
+      projectId,
+      bundle,
+      ...(options?.ttlMs !== undefined ? { ttlMs: options.ttlMs } : {}),
+    })
   }
 
   async cancel(id: string): Promise<boolean> {
