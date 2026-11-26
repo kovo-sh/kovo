@@ -1,0 +1,166 @@
+{
+  "id": "r3-19c-opaque-typed-agent-script-fp",
+  "side": "fp",
+  "archetype": "r3-19c-opaque-typed-privileged-shortcut",
+  "description": "R3-19c FP: multi-hop composite claim using an opaque-labeled persona ('Account 3') whose typed privilege is 'owner' on 'tenant-a' (derived into forbiddenShortcutPersonas via resolvePersonaIdentity in buildCompositeVerifyOptionsFromGrant) must fail closed on attacker_provenance and never confirm as cross-tenant BOLA on any path.",
+  "covers": {
+    "files": [
+      "src/server/exec-verify.ts",
+      "src/server/agent-script-proof.ts"
+    ],
+    "classes": [
+      "bola",
+      "bfla",
+      "authorization",
+      "dual_tenant_abac"
+    ]
+  },
+  "canonicalLabel": {
+    "cwe": "CWE-639",
+    "category": "bola",
+    "title": "Privileged shortcut under opaque UI persona label on same-tenant document",
+    "impact": "Opaque-labeled owner persona reads same-tenant record via privileged shortcut rather than attacker-origin chain.",
+    "claimedImpact": "authorization",
+    "claimedBoundary": "access",
+    "vulnClass": "bola"
+  },
+  "freeTextLabel": {
+    "title": "Opaque-label owner persona reading own tenant record must fail closed as privileged shortcut"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": true,
+    "evaluateClaims": true,
+    "composite": true,
+    "floorInjectionRecipe": false,
+    "proofReceipt": true
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [
+    {
+      "handle": "acct_owner",
+      "roleLabel": "Account 3",
+      "role": "owner",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-r319c-owner-token"
+    },
+    {
+      "handle": "acct_member",
+      "roleLabel": "Account 1",
+      "role": "member",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-r319c-member-token"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "ctl_member",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/records/rec_a1",
+      "persona": "acct_member",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"id\":\"rec_a1\",\"tenant_id\":\"tenant-a\",\"title\":\"Tenant A Shared Policy\",\"status\":\"active\"}"
+    },
+    {
+      "id": "ctl_anon",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/records/rec_a1",
+      "persona": null,
+      "status": 401,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"error\":\"authentication_required\"}"
+    },
+    {
+      "id": "prb_owner",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/records/rec_a1",
+      "persona": "acct_owner",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"id\":\"rec_a1\",\"tenant_id\":\"tenant-a\",\"title\":\"Tenant A Shared Policy\",\"status\":\"active\"}"
+    }
+  ],
+  "replaySpec": {
+    "assertionsJq": "{ controlPassed: (.steps.ctl_member.status == 200 and .steps.ctl_anon.status == 401), confirmed: (.steps.prb_owner.status == 200 and .steps.prb_owner.json.id == \"rec_a1\"), observed: \"acct_owner read own tenant record\", expected: \"403\" }"
+  },
+  "proofReceipt": {
+    "vulnClass": "bola",
+    "targetMethod": "GET",
+    "targetPathAndQuery": "/api/records/rec_a1",
+    "claimedDelta": "Opaque-labeled owner persona reading own-tenant record must not confirm as BOLA."
+  },
+  "claims": [
+    {
+      "kind": "impact",
+      "impactClass": "authorization",
+      "probeExchangeId": "prb_owner",
+      "controlExchangeIds": [
+        "ctl_member",
+        "ctl_anon"
+      ]
+    }
+  ],
+  "bareClaims": [
+    {
+      "kind": "status",
+      "exchangeId": "ctl_member",
+      "expected": 200
+    },
+    {
+      "kind": "status",
+      "exchangeId": "ctl_anon",
+      "expected": 401
+    },
+    {
+      "kind": "status",
+      "exchangeId": "prb_owner",
+      "expected": 200
+    },
+    {
+      "kind": "body_contains",
+      "exchangeId": "prb_owner",
+      "text": "rec_a1"
+    }
+  ],
+  "composite": {
+    "chainId": "r3-19c-opaque-typed-agent-script-fp",
+    "terminalVulnClass": "bola",
+    "oracleFamily": "dual_tenant_abac",
+    "claimedDelta": "Opaque-labeled owner persona shortcut on own-tenant record must fail closed on attacker_provenance.",
+    "singleHop": true,
+    "attackerPersonas": [
+      "acct_member"
+    ],
+    "forbiddenShortcutPersonas": [
+      "acct_owner"
+    ],
+    "expectedFailedStage": "attacker_provenance",
+    "preChainControlIds": [
+      "ctl_member",
+      "ctl_anon"
+    ],
+    "terminalExchangeId": "prb_owner"
+  }
+}

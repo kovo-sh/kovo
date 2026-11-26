@@ -1,0 +1,159 @@
+{
+  "id": "r3-19c-claude-bypass-review-fp",
+  "side": "fp",
+  "source": "independent_review",
+  "archetype": "r3-19c-unscoped-attacker-vs-typed-victim",
+  "description": "Independent-review FP: attacker persona has an opaque label and no typed tenant/privilege (resolves to unscoped_hypothesis), victim record is typed tenant-a, and the composite hop actor handle differs in case from the transcript persona so the persona-meta lookup can miss. Missing tenant metadata must fail closed and must never be treated as a distinct tenant, so no cross-tenant BOLA may confirm.",
+  "covers": {
+    "files": [
+      "src/server/exec-verify.ts",
+      "src/server/agent-script-proof.ts",
+      "src/server/host-fact-log.ts"
+    ],
+    "classes": [
+      "bola",
+      "authorization",
+      "dual_tenant_abac",
+      "unscoped_tenant_fail_closed",
+      "persona_handle_case_mismatch"
+    ]
+  },
+  "canonicalLabel": {
+    "cwe": "CWE-639",
+    "category": "bola",
+    "title": "Unresolved-tenant attacker reading typed-tenant record must not confirm cross-tenant",
+    "impact": "Absent tenant metadata on the acting persona is not evidence of a tenant boundary crossing.",
+    "claimedImpact": "authorization",
+    "claimedBoundary": "access",
+    "vulnClass": "bola"
+  },
+  "freeTextLabel": {
+    "title": "Opaque attacker with unresolved tenant reads tenant-a record; unscoped must not equal cross-tenant"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": true,
+    "evaluateClaims": true,
+    "composite": true,
+    "floorInjectionRecipe": false,
+    "proofReceipt": true
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [
+    {
+      "handle": "acct_member",
+      "roleLabel": "Account 1",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-r319c-claude-member-token"
+    },
+    {
+      "handle": "acct_owner",
+      "roleLabel": "Account 3",
+      "role": "owner",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-r319c-claude-owner-token"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "ctl_owner",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/records/rec_a1",
+      "persona": "acct_owner",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"id\":\"rec_a1\",\"tenant_id\":\"tenant-a\",\"title\":\"Tenant A Shared Policy\"}"
+    },
+    {
+      "id": "ctl_anon",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/records/rec_a1",
+      "persona": null,
+      "status": 401,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"error\":\"authentication_required\"}"
+    },
+    {
+      "id": "prb_member",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/records/rec_a1",
+      "persona": "acct_member",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"id\":\"rec_a1\",\"tenant_id\":\"tenant-a\",\"title\":\"Tenant A Shared Policy\"}"
+    }
+  ],
+  "replaySpec": {
+    "assertionsJq": "{ controlPassed: (.steps.ctl_owner.status == 200 and .steps.ctl_anon.status == 401), confirmed: (.steps.prb_member.status == 200 and .steps.prb_member.json.id == \"rec_a1\"), observed: \"acct_member (tenant unresolved) read tenant-a record\", expected: \"tenant boundary not established\" }"
+  },
+  "proofReceipt": {
+    "vulnClass": "bola",
+    "targetMethod": "GET",
+    "targetPathAndQuery": "/api/records/rec_a1",
+    "claimedDelta": "Attacker with unresolved tenant reading a tenant-a record must not confirm as cross-tenant BOLA."
+  },
+  "claims": [
+    {
+      "kind": "impact",
+      "impactClass": "authorization",
+      "probeExchangeId": "prb_member",
+      "controlExchangeIds": [
+        "ctl_owner",
+        "ctl_anon"
+      ]
+    }
+  ],
+  "bareClaims": [
+    {
+      "kind": "status",
+      "exchangeId": "ctl_owner",
+      "expected": 200
+    },
+    {
+      "kind": "status",
+      "exchangeId": "ctl_anon",
+      "expected": 401
+    },
+    {
+      "kind": "status",
+      "exchangeId": "prb_member",
+      "expected": 200
+    }
+  ],
+  "composite": {
+    "chainId": "r3-19c-claude-bypass-review-fp",
+    "terminalVulnClass": "bola",
+    "oracleFamily": "dual_tenant_abac",
+    "claimedDelta": "Unscoped attacker (hop actor handle cased Acct_Member) reading typed tenant-a record; absent tenant metadata must fail closed.",
+    "singleHop": true,
+    "attackerPersonas": [
+      "Acct_Member"
+    ],
+    "forbiddenShortcutPersonas": [],
+    "preChainControlIds": [
+      "ctl_owner",
+      "ctl_anon"
+    ],
+    "terminalExchangeId": "prb_member"
+  }
+}

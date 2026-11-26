@@ -18,7 +18,10 @@ import {
   writeRealisticCellLedgerRow,
 } from '../scripts/benchmark-realistic.ts'
 import { loadPersonaFile } from '../scripts/cli.ts'
-import { RequestBroker } from '../src/server/broker.ts'
+import { buildCompositeVerifyOptionsFromGrant, type AgentScriptProofResult } from '../src/server/agent-script-proof.ts'
+import { RequestBroker, type Grant } from '../src/server/broker.ts'
+import { CapabilityLedger } from '../src/server/capability-ledger.ts'
+import { syncVerifyArtifactsToLedger } from '../src/server/exec-verify.ts'
 import {
   signHostRecord,
   verifyCompositeReceipt,
@@ -509,13 +512,8 @@ function sendRpc(server: VerifyRpcServer, op: string, args: Record<string, unkno
   })
 }
 
-test('R3-19: monotone AST ratchet restricts direct parseRoleLabel() calls outside oracle-invariants.ts to deferred sites only', () => {
-  // Strictly non-increasing per-file allowlist of deferred parseRoleLabel() call sites
-  // (remaining 2 files owned by parallel streams r3-11 & r3-14; all R3-19 kernel files = 0).
-  const DEFERRED_ALLOWLIST: Record<string, number> = {
-    'src/server/exec-verify.ts': 3,
-    'src/server/agent-script-proof.ts': 1,
-  }
+test('R3-19: monotone AST ratchet enforces ZERO direct parseRoleLabel() calls outside oracle-invariants.ts', () => {
+  // Strictly zero allowlist: all deferred parseRoleLabel() call sites in src/server/ are closed.
   const serverDir = join(REPO_ROOT, 'src', 'server')
   const actualCounts: Record<string, number> = {}
   let totalOutsideInvariants = 0
@@ -530,17 +528,18 @@ test('R3-19: monotone AST ratchet restricts direct parseRoleLabel() calls outsid
   }
 
   for (const [rel, calls] of Object.entries(actualCounts)) {
-    const cap = DEFERRED_ALLOWLIST[rel] ?? 0
-    assert.ok(
-      calls <= cap,
-      `R3-19 ratchet violated: ${rel} has ${calls} parseRoleLabel() call(s), max allowed is ${cap}`,
+    assert.equal(
+      calls,
+      0,
+      `R3-19 ratchet violated: ${rel} has ${calls} parseRoleLabel() call(s), max allowed is 0`,
     )
   }
-  assert.ok(
-    totalOutsideInvariants <= 4,
-    `R3-19 ratchet violated: total parseRoleLabel() calls outside oracle-invariants.ts = ${totalOutsideInvariants}, max allowed is 4`,
+  assert.equal(
+    totalOutsideInvariants,
+    0,
+    `R3-19 ratchet violated: total parseRoleLabel() calls outside oracle-invariants.ts = ${totalOutsideInvariants}, max allowed is 0`,
   )
-  // Every R3-19 kernel file must have 0 direct parseRoleLabel() calls.
+  // Every R3-19 kernel file (including exec-verify & agent-script-proof) must have 0 direct parseRoleLabel() calls.
   for (const migrated of [
     'src/server/verify-rpc.ts',
     'src/server/verify-claims.ts',
@@ -548,9 +547,12 @@ test('R3-19: monotone AST ratchet restricts direct parseRoleLabel() calls outsid
     'src/server/host-fact-log.ts',
     'src/server/composite-receipt.ts',
     'src/server/floor-recipe-engine.ts',
+    'src/server/exec-verify.ts',
+    'src/server/agent-script-proof.ts',
   ]) {
     assert.equal(actualCounts[migrated] ?? 0, 0, `${migrated} must route through resolvePersonaIdentity (0 direct parseRoleLabel calls)`)
   }
+  assert.equal(readRepo('src/server/exec-verify.ts').includes('default_tenant'), false, 'exec-verify.ts must not collapse unknown tenants into default_tenant')
 })
 
 test('R3-19: VerifyRpcServer stamps host-signed actorTenant & actorPrivilege strictly from ResolvedPersona and confirms opaque-label cross-tenant claims with 0 fallbacks', async t => {
@@ -865,4 +867,208 @@ test('R3-19: benchmark-realistic --opaque-labels flag generates opaque UI labels
   assert.ok(ledgerRes.row)
   assert.equal((ledgerRes.row as unknown as { opaqueLabels?: boolean }).opaqueLabels, true)
   assert.ok(ledgerRes.row.notes?.includes('opaque_labels'))
+})
+
+test('R3-19c: buildCompositeVerifyOptionsFromGrant and syncVerifyArtifactsToLedger honor typed metadata with 0 fallbacks and no default_tenant collapse', t => {
+  // 1. buildCompositeVerifyOptionsFromGrant: opaque UI labels + typed privilege/tenantRef incur 0 label fallbacks.
+  resetPersonaIdentityFallbackCount()
+  const origin = 'https://app.example.test'
+  const typedPersonas: NonNullable<Grant['personas']> = new Map([
+    ['acct_member', { id: 'p1', handle: 'acct_member', roleLabel: 'Account 1', tenantRef: 'acme', privilege: 'member', originAllowlist: [origin], authKind: 'bearer', headerName: 'authorization', secret: 'tok-1', canaryMarkers: [] }],
+    ['acct_viewer', { id: 'p2', handle: 'acct_viewer', roleLabel: 'Account 2', tenantRef: 'globex', privilege: 'viewer', originAllowlist: [origin], authKind: 'bearer', headerName: 'authorization', secret: 'tok-2', canaryMarkers: [] }],
+    ['acct_owner', { id: 'p3', handle: 'acct_owner', roleLabel: 'Account 3', tenantRef: 'acme', privilege: 'owner', originAllowlist: [origin], authKind: 'bearer', headerName: 'authorization', secret: 'tok-3', canaryMarkers: [] }],
+    ['acct_admin', { id: 'p4', handle: 'acct_admin', roleLabel: 'Account 4', tenantRef: 'acme', privilege: 'admin', originAllowlist: [origin], authKind: 'bearer', headerName: 'authorization', secret: 'tok-4', canaryMarkers: [] }],
+    ['acct_contradict', { id: 'p5', handle: 'acct_contradict', roleLabel: 'member (acme)', tenantRef: 'acme', privilege: 'owner', originAllowlist: [origin], authKind: 'bearer', headerName: 'authorization', secret: 'tok-5', canaryMarkers: [] }],
+    ['acct_mystery', { id: 'p6', handle: 'acct_mystery', roleLabel: 'Account Mystery', tenantRef: null, privilege: null, originAllowlist: [origin], authKind: 'bearer', headerName: 'authorization', secret: 'tok-6', canaryMarkers: [] }],
+  ])
+  const derivedTyped = buildCompositeVerifyOptionsFromGrant({ personas: typedPersonas })!
+  assert.deepEqual(new Set(derivedTyped.attackerPersonas), new Set(['acct_member', 'acct_viewer']))
+  assert.deepEqual(
+    new Set(derivedTyped.forbiddenShortcutPersonas),
+    new Set(['acct_owner', 'acct_admin', 'acct_contradict', 'acct_mystery']),
+  )
+  assert.equal(getPersonaIdentityFallbackCount(), 0, 'typed + opaque-untyped grant derivation must incur 0 fallbacks')
+
+  // Legacy untyped label still works via counted fallback inside resolvePersonaIdentity.
+  const legacyPersonas: NonNullable<Grant['personas']> = new Map([
+    ['legacy_m', { id: 'p7', handle: 'legacy_m', roleLabel: 'member (beta)', originAllowlist: [origin], authKind: 'bearer', headerName: 'authorization', secret: 'tok-7', canaryMarkers: [] }],
+  ])
+  const derivedLegacy = buildCompositeVerifyOptionsFromGrant({ personas: legacyPersonas })!
+  assert.deepEqual(derivedLegacy.attackerPersonas, ['legacy_m'])
+  assert.equal(getPersonaIdentityFallbackCount(), 1, 'legacy untyped label must increment fallback counter')
+
+  // 2. syncVerifyArtifactsToLedger: typed host-signed metadata populates exact tenantScope with 0 fallbacks;
+  //    unscoped opaque personas persist 'unscoped_hypothesis' (never 'default_tenant') and omit actorContext.tenantScope.
+  const ledger = new CapabilityLedger(':memory:', { runId: 'r3-19c-ledger-run' })
+  t.after(() => ledger.close())
+
+  resetPersonaIdentityFallbackCount()
+  const signingKey = 'r3-19c-ledger-signing-key-123456'
+  const mkSigned = (partial: Omit<HostTranscriptEntry, 'hostSignature'>): HostTranscriptEntry => ({
+    ...partial,
+    hostSignature: signHostRecord(partial, signingKey),
+  })
+  const h1Entry = mkSigned({
+    exchangeId: 'ex-hop-1', seq: 1, timestampMs: 1000, origin,
+    actorPersona: 'acct_member', actorRoleLabel: 'Account 1', actorTenant: 'acme', actorPrivilege: 'member',
+    emittedCapabilities: ['cap:hop_h1:exp_tok'], cleanSession: true,
+    step: {
+      id: 'ex-hop-1', arm: 'setup', method: 'POST', route: '/v1/exports', pathAndQuery: '/v1/exports', status: 201,
+      actor: { handle: 'acct_member', role: 'member', tenant: 'acme', auth: 'bearer', sameSite: null },
+      json: { ok: true }, body: '{"ok":true}',
+    },
+  })
+  const h2Entry = mkSigned({
+    exchangeId: 'ex-hop-2', seq: 2, timestampMs: 1200, origin,
+    actorPersona: 'acct_unscoped', actorRoleLabel: 'Account Unscoped', actorTenant: null, actorPrivilege: 'member',
+    consumedCapabilities: ['cap:hop_h1:exp_tok'], cleanSession: true,
+    step: {
+      id: 'ex-hop-2', arm: 'probe', method: 'GET', route: '/v1/exports/dl', pathAndQuery: '/v1/exports/dl', status: 200,
+      actor: { handle: 'acct_unscoped', role: 'member', tenant: null, auth: 'bearer', sameSite: null },
+      json: { tenant_id: 'globex' }, body: '{"tenant_id":"globex"}',
+    },
+  })
+  const typedProof: AgentScriptProofResult = {
+    verdict: {
+      confirmed: true, reason: 'confirmed', detail: 'ok', attempts: [],
+      disagreements: [], claimTitle: null, rejectedBy: null, missingEvidence: [], transcriptSummary: [],
+    },
+    exchanges: [],
+    receipt: null,
+    compositeReceipt: {
+      receipt: {
+        chainId: 'chain-r3-19c',
+        terminalVulnClass: 'bola',
+        hops: [
+          {
+            hopId: 'hop_1', surface: 'http',
+            target: { origin, method: 'POST', pathAndQuery: '/v1/exports' },
+            exchangeIds: ['ex-hop-1'], oobEventIds: [], browserTraceIds: [],
+            claimedDelta: 'Mint export cap', producedCapabilities: ['cap:hop_h1:exp_tok'], consumedCapabilities: [],
+          },
+          {
+            hopId: 'hop_2', surface: 'http',
+            target: { origin, method: 'GET', pathAndQuery: '/v1/exports/dl' },
+            exchangeIds: ['ex-hop-2'], oobEventIds: [], browserTraceIds: [],
+            claimedDelta: 'Read foreign tenant export', producedCapabilities: [], consumedCapabilities: ['cap:hop_h1:exp_tok'],
+          },
+        ],
+        causalEdges: [{ kind: 'value_binding', fromHopId: 'hop_1', toHopId: 'hop_2', capabilityHandle: 'cap:hop_h1:exp_tok', sourceExchangeId: 'ex-hop-1', targetExchangeId: 'ex-hop-2' }],
+        terminalImpact: {
+          terminalHopId: 'hop_2', terminalExchangeId: 'ex-hop-2',
+          claimedImpact: 'Cross-tenant disclosure', summary: 'Cross-tenant disclosure',
+          preChainControlExchangeIds: [], postChainReadbackExchangeIds: [],
+        },
+        replayMode: 'fresh_clean_replay',
+      },
+      verification: {
+        confirmed: true,
+        chainId: 'chain-r3-19c',
+        terminalVulnClass: 'bola',
+        replayMode: 'fresh_clean_replay',
+        modeBVerified: false,
+        hopCount: 2,
+        reason: 'verified',
+        verifiedEdges: [{ edgeIndex: 0, kind: 'value_binding', fromHopId: 'hop_1', toHopId: 'hop_2', verified: true, reason: 'ok' }],
+      },
+      hopActors: { hop_1: 'Acct_Member', hop_2: 'acct_unscoped' },
+    },
+    vulnClass: 'bola',
+    transcriptDigests: [],
+    sealedCapabilities: [
+      {
+        handle: 'cap:hop_h1:exp_tok',
+        runId: 'r3-19c-ledger-run',
+        kind: 'bearer_token',
+        hopReceiptId: 'hop_1',
+        slot: 'exp_tok',
+        sha256: 'a'.repeat(64),
+        sha256Prefix: 'aaaaaaaa',
+        createdAtMs: 1000,
+        expiresAtMs: null,
+        allowedOrigins: [origin],
+      },
+      {
+        handle: 'cap:hop_h2:unscoped_tok',
+        runId: 'r3-19c-ledger-run',
+        kind: 'bearer_token',
+        hopReceiptId: 'hop_2',
+        slot: 'unscoped_tok',
+        sha256: 'b'.repeat(64),
+        sha256Prefix: 'bbbbbbbb',
+        createdAtMs: 1200,
+        expiresAtMs: null,
+        allowedOrigins: [origin],
+      },
+    ],
+    transcriptRecords: [
+      {
+        exchangeId: 'ex-hop-1', seq: 1, op: 'http', startedAt: 1000, durationMs: 5, signature: 'sig-1',
+        request: {
+          origin, method: 'POST', pathAndQuery: '/v1/exports', headers: {}, bodyBytes: 0, bodySha256: 'c'.repeat(64),
+          personaHandle: 'acct_member', sessionRole: 'setup',
+          actorRoleLabel: 'Account 1', actorTenant: 'acme', actorPrivilege: 'member', nonce: 'n1',
+        },
+        artifact: { kind: 'capability', capabilityHandle: 'cap:hop_h1:exp_tok' },
+      },
+      {
+        exchangeId: 'ex-hop-2', seq: 2, op: 'http', startedAt: 1200, durationMs: 5, signature: 'sig-2',
+        request: {
+          origin, method: 'GET', pathAndQuery: '/v1/exports/dl', headers: {}, bodyBytes: 0, bodySha256: 'd'.repeat(64),
+          personaHandle: 'acct_unscoped', sessionRole: 'probe',
+          actorRoleLabel: 'Account Unscoped', actorTenant: null, actorPrivilege: 'member', nonce: 'n2',
+        },
+        artifact: { kind: 'capability', capabilityHandle: 'cap:hop_h2:unscoped_tok' },
+      },
+    ],
+    hostTranscript: { entries: [h1Entry, h2Entry], oobEvents: [], browserTraces: [], asyncPollRecords: [] },
+    claimTitle: null,
+    severity: null,
+    description: null,
+  }
+
+  syncVerifyArtifactsToLedger({ ledger, proof: typedProof, defaultOrigin: origin, defaultPersona: 'acct_member' })
+  assert.equal(getPersonaIdentityFallbackCount(), 0, 'typed host-signed ledger sync must incur 0 label fallbacks')
+  assert.equal(ledger.getCapability('cap:hop_h1:exp_tok')?.tenantScope, 'acme')
+  assert.equal(ledger.getCapability('cap:hop_h2:unscoped_tok')?.tenantScope, 'unscoped_hypothesis')
+  for (const node of ledger.listCapabilities()) {
+    assert.notEqual(node.tenantScope, 'default_tenant', `capability ${node.capId} must never collapse to default_tenant`)
+  }
+  const unscopedCapEdge = ledger.listCausalEdges().find(e => e.postconditionCapId === 'cap:hop_h2:unscoped_tok')
+  assert.ok(unscopedCapEdge)
+  assert.equal(unscopedCapEdge.actorContext.tenantScope, undefined, 'unscoped actorContext must omit tenantScope rather than inventing default_tenant')
+  const typedCapEdge = ledger.listCausalEdges().find(e => e.postconditionCapId === 'cap:hop_h1:exp_tok')
+  assert.ok(typedCapEdge)
+  assert.equal(typedCapEdge.actorContext.tenantScope, 'acme')
+
+  // Legacy untyped transcript record still falls back via counted resolver.
+  const legacyProof: AgentScriptProofResult = {
+    ...typedProof,
+    compositeReceipt: null,
+    hostTranscript: null,
+    sealedCapabilities: [{
+      handle: 'cap:hop_h9:legacy_tok',
+      runId: 'r3-19c-ledger-run',
+      kind: 'bearer_token',
+      hopReceiptId: 'hop_9',
+      slot: 'legacy_tok',
+      sha256: 'e'.repeat(64),
+      sha256Prefix: 'eeeeeeee',
+      createdAtMs: 1500,
+      expiresAtMs: null,
+      allowedOrigins: [origin],
+    }],
+    transcriptRecords: [{
+      exchangeId: 'ex-hop-9', seq: 9, op: 'http', startedAt: 1500, durationMs: 5, signature: 'sig-9',
+      request: {
+        origin, method: 'POST', pathAndQuery: '/v1/legacy', headers: {}, bodyBytes: 0, bodySha256: 'f'.repeat(64),
+        personaHandle: 'legacy_u', sessionRole: 'setup',
+        actorRoleLabel: 'member (legacy-org)', nonce: 'n9',
+      },
+      artifact: { kind: 'capability', capabilityHandle: 'cap:hop_h9:legacy_tok' },
+    }],
+  }
+  syncVerifyArtifactsToLedger({ ledger, proof: legacyProof, defaultOrigin: origin, defaultPersona: 'legacy_u' })
+  assert.equal(ledger.getCapability('cap:hop_h9:legacy_tok')?.tenantScope, 'legacy-org')
+  assert.ok(getPersonaIdentityFallbackCount() >= 1, 'legacy untyped ledger sync must increment fallback counter')
 })

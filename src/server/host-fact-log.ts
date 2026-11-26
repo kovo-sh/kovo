@@ -832,11 +832,16 @@ export class HostFactLog {
       privilege: input.actorPrivilege ?? input.actorRole ?? null,
       handle: actor,
     })
-    const actorIdentity = actor && ((primaryIdentity.role === null && !hasExplicitPrivilege) || (primaryIdentity.tenant === null && !hasExplicitTenant))
+    const actorHasLabelSyntax = Boolean(actor && /[@()[\]]/.test(actor))
+    const actorIsBareRole = Boolean(actor && /^(?:owner|admin(?:istrator)?|member|viewer|guest|user|editor)$/i.test(actor.trim()))
+    const actorIdentity = actor && (
+      (primaryIdentity.role === null && !hasExplicitPrivilege && (actorHasLabelSyntax || actorIsBareRole))
+      || (primaryIdentity.tenant === null && !hasExplicitTenant && actorHasLabelSyntax)
+    )
       ? resolvePersonaIdentity({ roleLabel: actor, handle: actor })
       : null
     const actorRole: RoleName | null = primaryIdentity.role ?? (!hasExplicitPrivilege ? actorIdentity?.role ?? null : null)
-    const actorTenant: string | null = primaryIdentity.tenant ?? (!hasExplicitTenant ? actorIdentity?.tenant ?? null : null)
+    const actorTenant: string | null = primaryIdentity.tenant ?? (!hasExplicitTenant && actorHasLabelSyntax ? actorIdentity?.tenant ?? null : null)
     const wireCredentialProvenance = freezeWireCredentialProvenance(input.wireCredentialProvenance)
     const credentialPlacement = deriveCredentialPlacement(requestHeaders, input.credentialPlacement, wireCredentialProvenance)
     const ambientAuth = deriveAmbientAuthFromHeaders(requestHeaders, input.ambientAuth, credentialPlacement)
@@ -1345,9 +1350,9 @@ export class HostFactLog {
         responseHeaders: step.responseHeaders ?? null,
         rawResponseBody: rawResp,
         actor: entry.actorPersona !== undefined ? entry.actorPersona : (step.actor.handle ?? null),
-        ...(entry.actorPrivilege !== undefined ? { actorPrivilege: entry.actorPrivilege } : (step.actor.role ? { actorRole: step.actor.role } : {})),
+        ...(entry.actorPrivilege !== undefined ? { actorPrivilege: entry.actorPrivilege } : (step.actor.role !== undefined ? { actorRole: step.actor.role } : {})),
         actorRoleLabel: entry.actorRoleLabel ?? null,
-        ...(entry.actorTenant !== undefined ? { actorTenant: entry.actorTenant } : (step.actor.tenant ? { actorTenant: step.actor.tenant } : {})),
+        ...(entry.actorTenant !== undefined ? { actorTenant: entry.actorTenant } : (step.actor.tenant !== undefined ? { actorTenant: step.actor.tenant } : {})),
         ambientAuth: step.actor.auth,
         ...(step.actor.sameSite !== null && step.actor.sameSite !== undefined ? { sameSite: step.actor.sameSite } : {}),
         ...(entry.credentialPlacement ? { credentialPlacement: entry.credentialPlacement } : {}),

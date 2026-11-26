@@ -24,7 +24,7 @@ import { normalizeCompositeTerminalEndpoint, parsePersonaPrivilegeProfile } from
 import { DerivedCapabilityVault, type DerivedCapabilityMeta } from './derived-custody.ts'
 import { createEgressSanitizer, type EgressSanitizer } from './egress-sanitizer.ts'
 import { HostFactLog } from './host-fact-log.ts'
-import { parseRoleLabel } from './oracle-invariants.ts'
+import { resolvePersonaIdentity } from './oracle-invariants.ts'
 import { buildAgentScriptReceipt } from './proof-receipt.ts'
 import type { ProofReceipt, ReceiptVerification, ScriptProofExchange } from './proof-receipt.ts'
 import { defaultTerminalOracleRegistry } from './terminal-oracle-registry.ts'
@@ -336,8 +336,13 @@ export function buildCompositeVerifyOptionsFromGrant(
   const personaRoleLabels: Record<string, string> = {}
   for (const [handle, persona] of grant.personas.entries()) {
     if (persona.roleLabel?.trim()) personaRoleLabels[handle] = persona.roleLabel
-    const parsed = parseRoleLabel(persona.roleLabel)
-    const profile = parsePersonaPrivilegeProfile(handle, parsed.role, persona.roleLabel)
+    const resolved = resolvePersonaIdentity({
+      roleLabel: persona.roleLabel,
+      tenantRef: persona.tenantRef,
+      privilege: persona.privilege,
+      handle,
+    })
+    const profile = parsePersonaPrivilegeProfile(handle, resolved.privilege, persona.roleLabel)
     if (profile.alwaysForbidden) {
       forbiddenShortcutPersonas.push(handle)
     } else if (profile.isMixedDual) {

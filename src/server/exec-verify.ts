@@ -43,8 +43,8 @@ import {
   type CausalEdgeBindingKind,
 } from './capability-ledger.ts'
 import type {
-  CompositeProofReceipt,
-  CompositeReceiptVerification,
+  CompositeProofReceipt, CompositeReceiptVerification,
+  HostTranscriptEntry,
 } from './composite-receipt.ts'
 import { resolveCompositeTerminalExchange as resolveCanonicalCompositeTerminalExchange } from './composite-terminal.ts'
 import {
@@ -75,7 +75,7 @@ import {
   normalizeOrigin,
 } from './finding-fingerprint.ts'
 import { CWE_TO_RECEIPT_CLASS, SEVERITY_BY_CLASS } from './floor-recipe-engine.ts'
-import { alignClaimClass, parseRoleLabel } from './oracle-invariants.ts'
+import { alignClaimClass, resolvePersonaIdentity, type RoleName } from './oracle-invariants.ts'
 import {
   buildOobReceipt,
   verifyReceipt,
@@ -1482,17 +1482,69 @@ export function syncVerifyArtifactsToLedger(input: {
   const { ledger, proof } = input
   const defaultOrigin = input.defaultOrigin.trim() || 'unknown'
   const defaultPersona = input.defaultPersona?.trim() || 'attacker'
+  const unscopedTenant = 'unscoped_hypothesis'
   const sealedSummaries: SyncVerifyArtifactsResult['sealedCapabilities'] = []
   const verifiedHops: SyncVerifyArtifactsResult['verifiedHops'] = []
   let newCapabilityCount = 0
   let newEdgeCount = 0
 
+  type PersonaMeta = { roleLabel: string | null; tenantRef: string | null; privilege: RoleName | null }
   const recordByCapHandle = new Map<string, VerifyTranscriptRecord>()
-  const consumedByExchangeId = new Map<string, string>()
+  const recordByExchangeId = new Map<string, VerifyTranscriptRecord>()
+  const hostEntryByExchangeId = new Map<string, HostTranscriptEntry>()
+  const metaByPersona = new Map<string, PersonaMeta>()
+  const rememberMeta = (handle: string | null | undefined, meta: PersonaMeta): void => {
+    const key = handle?.trim().toLowerCase()
+    if (!key) return
+    const prev = metaByPersona.get(key)
+    metaByPersona.set(key, {
+      roleLabel: prev?.roleLabel ?? meta.roleLabel,
+      tenantRef: prev?.tenantRef ?? meta.tenantRef,
+      privilege: prev?.privilege ?? meta.privilege,
+    })
+  }
   for (const rec of proof.transcriptRecords) {
+    recordByExchangeId.set(rec.exchangeId, rec)
     if (rec.artifact?.capabilityHandle) recordByCapHandle.set(rec.artifact.capabilityHandle, rec)
     if (rec.artifact?.derivedCapabilityId) recordByCapHandle.set(rec.artifact.derivedCapabilityId, rec)
-    if (rec.request?.consumedCapabilityId) consumedByExchangeId.set(rec.exchangeId, rec.request.consumedCapabilityId)
+    if (rec.request?.personaHandle) {
+      rememberMeta(rec.request.personaHandle, {
+        roleLabel: rec.request.actorRoleLabel ?? null,
+        tenantRef: rec.request.actorTenant ?? null,
+        privilege: rec.request.actorPrivilege ?? null,
+      })
+    }
+  }
+  for (const entry of proof.hostTranscript?.entries ?? []) {
+    hostEntryByExchangeId.set(entry.exchangeId, entry)
+    rememberMeta(entry.actorPersona ?? entry.step.actor.handle, {
+      roleLabel: entry.actorRoleLabel ?? null,
+      tenantRef: entry.actorTenant ?? entry.step.actor.tenant ?? null,
+      privilege: entry.actorPrivilege ?? entry.step.actor.role ?? null,
+    })
+  }
+  const resolveActorTenant = (
+    persona: string,
+    rec?: VerifyTranscriptRecord,
+    exchangeIds?: readonly string[],
+  ): { tenant: string | null; roleLabel: string | undefined } => {
+    let matchedRec = rec
+    let hostEntry = matchedRec ? hostEntryByExchangeId.get(matchedRec.exchangeId) : undefined
+    if (!matchedRec && !hostEntry && exchangeIds) {
+      const target = persona.trim().toLowerCase()
+      for (const exId of exchangeIds) {
+        const candHost = hostEntryByExchangeId.get(exId)
+        const candRec = recordByExchangeId.get(exId)
+        const candActor = (candRec?.request?.personaHandle ?? candHost?.actorPersona ?? candHost?.step.actor.handle ?? '').trim().toLowerCase()
+        if (candActor && candActor === target) { hostEntry = candHost; matchedRec = candRec; break }
+      }
+    }
+    const pm = metaByPersona.get(persona.trim().toLowerCase())
+    const tenantRef = matchedRec?.request?.actorTenant ?? hostEntry?.actorTenant ?? hostEntry?.step.actor.tenant ?? pm?.tenantRef ?? null
+    const privilege = matchedRec?.request?.actorPrivilege ?? hostEntry?.actorPrivilege ?? hostEntry?.step.actor.role ?? pm?.privilege ?? null
+    const roleLabel = matchedRec?.request?.actorRoleLabel ?? hostEntry?.actorRoleLabel ?? pm?.roleLabel ?? null
+    const resolved = resolvePersonaIdentity({ roleLabel, tenantRef, privilege, handle: persona })
+    return { tenant: resolved.tenant, roleLabel: roleLabel ?? undefined }
   }
 
   const ensureAttackerSeed = (persona: string, tenantScope: string, serviceOrigin: string, createdAtMs: number): string => {
@@ -1500,18 +1552,11 @@ export function syncVerifyArtifactsToLedger(input: {
     const seedCapId = formatDerivedCapabilityHandle(`seed_${safePersona}`, 'session')
     if (!ledger.getCapability(seedCapId)) {
       ledger.addCapability({
-        capId: seedCapId,
-        kind: 'identity_session',
-        promotionStatus: 'capability_only',
-        terminalImpactOracleVerified: false,
-        provenance: 'attacker_seed',
-        tenantScope,
-        actorPersona: persona,
-        serviceOrigin,
-        surface: 'http',
+        capId: seedCapId, kind: 'identity_session', promotionStatus: 'capability_only',
+        terminalImpactOracleVerified: false, provenance: 'attacker_seed', tenantScope,
+        actorPersona: persona, serviceOrigin, surface: 'http',
         artifactDigest: computeArtifactDigest(`seed:${ledger.runId}:${persona}:${serviceOrigin}`),
-        artifactSummary: `Attacker seed session for ${persona}`,
-        createdAtMs: Math.max(0, Math.floor(createdAtMs)),
+        artifactSummary: `Attacker seed session for ${persona}`, createdAtMs: Math.max(0, Math.floor(createdAtMs)),
       })
       newCapabilityCount += 1
     }
@@ -1523,8 +1568,8 @@ export function syncVerifyArtifactsToLedger(input: {
     const capId = normalizeLedgerCapHandle(meta)
     const rec = recordByCapHandle.get(meta.handle)
     const actorPersona = rec?.request?.personaHandle?.trim() || defaultPersona
-    const roleLabel = rec?.request?.actorRoleLabel ?? undefined
-    const tenantScope = parseRoleLabel(roleLabel).tenant || parseRoleLabel(actorPersona).tenant || 'default_tenant'
+    const { tenant: resolvedTenant, roleLabel } = resolveActorTenant(actorPersona, rec)
+    const tenantScope = resolvedTenant ?? unscopedTenant
     const serviceOrigin = rec?.request?.origin?.trim() || meta.allowedOrigins?.[0] || defaultOrigin
     const surface = rec ? mapTranscriptOpToSurface(rec.op) : 'http'
     const capKind = mapDerivedSecretKindToCapabilityKind(meta.kind)
@@ -1532,33 +1577,20 @@ export function syncVerifyArtifactsToLedger(input: {
 
     if (!ledger.getCapability(capId)) {
       ledger.addCapability({
-        capId,
-        kind: capKind,
-        promotionStatus: 'capability_only',
-        terminalImpactOracleVerified: false,
+        capId, kind: capKind, promotionStatus: 'capability_only', terminalImpactOracleVerified: false,
         provenance: meta.derivedFromCapabilityId ? 'derived_hop' : 'runtime_discovery',
-        tenantScope,
-        actorPersona,
-        serviceOrigin,
-        surface,
+        tenantScope, actorPersona, serviceOrigin, surface,
         validityTtlMs: meta.expiresAtMs !== null ? Math.max(0, meta.expiresAtMs - meta.createdAtMs) : null,
-        parentHopReceiptIds: [meta.hopReceiptId],
-        artifactDigest: meta.sha256,
+        parentHopReceiptIds: [meta.hopReceiptId], artifactDigest: meta.sha256,
         artifactSummary: `Sealed ${meta.kind} slot ${meta.slot} (sha256:${meta.sha256Prefix})`,
-        metadata: {
-          slot: meta.slot,
-          secretKind: meta.kind,
-          ...(meta.derivedFromCapabilityId ? { parentHandle: meta.derivedFromCapabilityId } : {}),
-        },
+        metadata: { slot: meta.slot, secretKind: meta.kind, ...(meta.derivedFromCapabilityId ? { parentHandle: meta.derivedFromCapabilityId } : {}) },
         createdAtMs: nowMs,
       })
       newCapabilityCount += 1
     }
 
     sealedSummaries.push({
-      handle: meta.handle,
-      kind: meta.kind,
-      sha256Prefix: meta.sha256Prefix,
+      handle: meta.handle, kind: meta.kind, sha256Prefix: meta.sha256Prefix,
       ...(meta.derivedFromCapabilityId ? { derivedFromCapabilityId: meta.derivedFromCapabilityId } : {}),
     })
 
@@ -1587,36 +1619,25 @@ export function syncVerifyArtifactsToLedger(input: {
     const edgeId = `edge_cap_${createHash('sha256').update(`${ledger.runId}:${preconditionCapIds.join(',')}:${capId}:${bindingKind}`).digest('hex').slice(0, 20)}`
     if (!ledger.getCausalEdge(edgeId)) {
       const { sourceTimestampMs, targetTimestampMs } = nextMonotonicEdgeTimestamps(
-        ledger,
-        preconditionCapIds,
-        rec?.startedAt ?? Math.max(0, nowMs - 1),
-        nowMs,
+        ledger, preconditionCapIds, rec?.startedAt ?? Math.max(0, nowMs - 1), nowMs,
       )
       try {
         const edge = ledger.addCausalEdge({
-          edgeId,
-          preconditionCapIds,
+          edgeId, preconditionCapIds,
           actorContext: {
             persona: actorPersona,
-            tenantScope,
+            ...(resolvedTenant ? { tenantScope: resolvedTenant } : {}),
             ...(roleLabel ? { roleLabel } : {}),
             serviceOrigin,
           },
-          hopReceiptId: meta.hopReceiptId,
-          edgeBindingKind: bindingKind,
-          postconditionCapId: capId,
-          sourceTimestampMs,
-          targetTimestampMs,
-          bindingDigest: meta.sha256,
+          hopReceiptId: meta.hopReceiptId, edgeBindingKind: bindingKind, postconditionCapId: capId,
+          sourceTimestampMs, targetTimestampMs, bindingDigest: meta.sha256,
           metadata: { source: 'kovo_verify', slot: meta.slot },
         })
         newEdgeCount += 1
         verifiedHops.push({
-          hopReceiptId: edge.hopReceiptId,
-          edgeId: edge.edgeId,
-          binding: edge.edgeBindingKind,
-          postconditionCapId: edge.postconditionCapId,
-          terminalImpact: edge.terminalImpact,
+          hopReceiptId: edge.hopReceiptId, edgeId: edge.edgeId, binding: edge.edgeBindingKind,
+          postconditionCapId: edge.postconditionCapId, terminalImpact: edge.terminalImpact,
         })
       } catch {
         // Ignore cycle/duplicate edge races cleanly; capability node stays persisted.
@@ -1634,26 +1655,20 @@ export function syncVerifyArtifactsToLedger(input: {
       const hop = receipt.hops[idx]!
       const persona = hopActors[hop.hopId] || defaultPersona
       const origin = hop.target.origin || defaultOrigin
-      const tenantScope = parseRoleLabel(persona).tenant || 'default_tenant'
+      const { tenant: resolvedTenant } = resolveActorTenant(persona, undefined, hop.exchangeIds)
+      const tenantScope = resolvedTenant ?? unscopedTenant
       const baseTs = Date.now() + idx
 
       for (const rawCap of [...hop.producedCapabilities, ...hop.consumedCapabilities]) {
         if (!DERIVED_CAPABILITY_HANDLE_RE.test(rawCap)) continue
         if (!ledger.getCapability(rawCap)) {
           ledger.addCapability({
-            capId: rawCap,
-            kind: 'scoped_token',
-            promotionStatus: 'capability_only',
-            terminalImpactOracleVerified: false,
-            provenance: 'derived_hop',
-            tenantScope,
-            actorPersona: persona,
-            serviceOrigin: origin,
-            surface: hop.surface,
+            capId: rawCap, kind: 'scoped_token', promotionStatus: 'capability_only',
+            terminalImpactOracleVerified: false, provenance: 'derived_hop', tenantScope,
+            actorPersona: persona, serviceOrigin: origin, surface: hop.surface,
             parentHopReceiptIds: [hop.hopId],
             artifactDigest: computeArtifactDigest(`${receipt.chainId}:${hop.hopId}:${rawCap}`),
-            artifactSummary: `Composite hop ${hop.hopId} capability`,
-            createdAtMs: baseTs,
+            artifactSummary: `Composite hop ${hop.hopId} capability`, createdAtMs: baseTs,
           })
           newCapabilityCount += 1
         }
@@ -1668,19 +1683,12 @@ export function syncVerifyArtifactsToLedger(input: {
         )
         if (!ledger.getCapability(synthetic)) {
           ledger.addCapability({
-            capId: synthetic,
-            kind: 'state_handle',
-            promotionStatus: 'capability_only',
-            terminalImpactOracleVerified: false,
-            provenance: idx === 0 ? 'attacker_seed' : 'derived_hop',
-            tenantScope,
-            actorPersona: persona,
-            serviceOrigin: origin,
-            surface: hop.surface,
+            capId: synthetic, kind: 'state_handle', promotionStatus: 'capability_only',
+            terminalImpactOracleVerified: false, provenance: idx === 0 ? 'attacker_seed' : 'derived_hop',
+            tenantScope, actorPersona: persona, serviceOrigin: origin, surface: hop.surface,
             parentHopReceiptIds: [hop.hopId],
             artifactDigest: computeArtifactDigest(`${receipt.chainId}:${hop.hopId}:${hop.claimedDelta}`),
-            artifactSummary: hop.claimedDelta.slice(0, 160),
-            createdAtMs: baseTs,
+            artifactSummary: hop.claimedDelta.slice(0, 160), createdAtMs: baseTs,
           })
           newCapabilityCount += 1
         }
@@ -1706,31 +1714,28 @@ export function syncVerifyArtifactsToLedger(input: {
       if (ledger.getCausalEdge(edgeId)) continue
 
       const persona = hopActors[edge.toHopId] || hopActors[edge.fromHopId] || defaultPersona
+      const edgeActor = resolveActorTenant(persona, undefined, toHop?.exchangeIds)
       const nowMs = Date.now() + i
       const { sourceTimestampMs, targetTimestampMs } = nextMonotonicEdgeTimestamps(ledger, [fromCap], nowMs, nowMs + 1)
       try {
         const saved = ledger.addCausalEdge({
-          edgeId,
-          preconditionCapIds: [fromCap],
+          edgeId, preconditionCapIds: [fromCap],
           actorContext: {
             persona,
+            ...(edgeActor.tenant ? { tenantScope: edgeActor.tenant } : {}),
+            ...(edgeActor.roleLabel ? { roleLabel: edgeActor.roleLabel } : {}),
             serviceOrigin: toHop?.target.origin || defaultOrigin,
           },
-          hopReceiptId: edge.toHopId,
-          edgeBindingKind: edge.kind,
+          hopReceiptId: edge.toHopId, edgeBindingKind: edge.kind,
           ...(toCap && toCap !== fromCap ? { postconditionCapId: toCap } : {}),
           ...(isTerminal ? { terminalImpact: receipt.terminalImpact.claimedImpact } : {}),
-          sourceTimestampMs,
-          targetTimestampMs,
+          sourceTimestampMs, targetTimestampMs,
           metadata: { chainId: receipt.chainId, terminalVulnClass: receipt.terminalVulnClass },
         })
         newEdgeCount += 1
         verifiedHops.push({
-          hopReceiptId: saved.hopReceiptId,
-          edgeId: saved.edgeId,
-          binding: saved.edgeBindingKind,
-          postconditionCapId: saved.postconditionCapId,
-          terminalImpact: saved.terminalImpact,
+          hopReceiptId: saved.hopReceiptId, edgeId: saved.edgeId, binding: saved.edgeBindingKind,
+          postconditionCapId: saved.postconditionCapId, terminalImpact: saved.terminalImpact,
         })
       } catch {
         // Ignore cycle/duplicate races; verified composite receipt remains authoritative.
@@ -1747,12 +1752,7 @@ export function syncVerifyArtifactsToLedger(input: {
     }
   }
 
-  return {
-    sealedCapabilities: sealedSummaries,
-    verifiedHops,
-    newCapabilityCount,
-    newEdgeCount,
-  }
+  return { sealedCapabilities: sealedSummaries, verifiedHops, newCapabilityCount, newEdgeCount }
 }
 
 /** H-20: Run-scoped request-side carrier recorded for late async OOB callback promotion. */
