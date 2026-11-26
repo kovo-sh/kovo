@@ -119,7 +119,7 @@ export interface MatrixCellResult {
   runtimeMs: number
   confirmed: number
   targets: number
-  precision: number
+  precision: number | null
   decoyFp: number
   decoys: number
   unmatchedFp: number
@@ -147,6 +147,7 @@ export interface MatrixCellResult {
 }
 
 export interface MatrixTotals {
+  status: 'VALID' | 'INVALID'
   cells: number
   ok: number
   failed: number
@@ -155,7 +156,8 @@ export interface MatrixTotals {
   lockErrors: number
   confirmed: number
   targets: number
-  precision: number
+  recall: number | null
+  precision: number | null
   decoyFp: number
   decoys: number
   unmatchedFp: number
@@ -566,6 +568,9 @@ export function collectCellResult(
   else if (noWorkerSessions) error = 'worker sessions unavailable (verifier cannot run agents)'
 
   const ok = outcome.exitCode === 0 && card !== null && !configError
+  const tpPlusFp = confirmed + decoyFp + unmatchedFp
+  const rawPrecision = typeof card?.precision === 'number' && Number.isFinite(card.precision) ? card.precision : null
+  const precision = !ok ? null : (tpPlusFp > 0 ? (rawPrecision ?? confirmed / tpPlusFp) : null)
 
   return {
     app: cell.app,
@@ -578,7 +583,7 @@ export function collectCellResult(
     runtimeMs: outcome.runtimeMs,
     confirmed,
     targets,
-    precision: finite(card?.precision),
+    precision,
     decoyFp,
     decoys,
     unmatchedFp,
@@ -669,16 +674,22 @@ export function summarizeMatrix(results: readonly MatrixCellResult[]): MatrixTot
   const agenticFailed = agentic.reduce((n, r) => n + r.assignments.investigationFailed, 0)
   const costUsd = results.reduce((n, r) => n + r.costUsd, 0)
   const tpPlusFp = confirmed + decoyFp + unmatchedFp
+  const failed = results.filter(r => !r.ok).length
+  const status: 'VALID' | 'INVALID' = failed > 0 ? 'INVALID' : 'VALID'
+  const targets = results.reduce((n, r) => n + r.targets, 0)
+  const recall = failed > 0 ? null : (targets > 0 ? confirmed / targets : 0)
   return {
+    status,
     cells: results.length,
     ok: results.filter(r => r.ok).length,
-    failed: results.filter(r => !r.ok).length,
+    failed,
     inert: results.filter(r => r.inert).length,
     workerSessionFailures: results.filter(r => r.agenticExpected && !r.workerSessions).length,
     lockErrors: results.filter(r => r.lockError).length,
     confirmed,
-    targets: results.reduce((n, r) => n + r.targets, 0),
-    precision: tpPlusFp ? confirmed / tpPlusFp : 1,
+    targets,
+    recall,
+    precision: tpPlusFp > 0 ? confirmed / tpPlusFp : null,
     decoyFp,
     decoys: results.reduce((n, r) => n + r.decoys, 0),
     unmatchedFp,
@@ -703,7 +714,7 @@ export function matrixExitCode(results: readonly MatrixCellResult[]): number {
   return results.some(r => !r.ok) ? 1 : 0
 }
 
-const pct = (n: number): string => `${(n * 100).toFixed(1)}%`
+const pct = (n: number | null): string => (n === null ? 'n/a' : `${(n * 100).toFixed(1)}%`)
 
 export function renderMatrixTable(results: readonly MatrixCellResult[]): string {
   const header = [
@@ -736,13 +747,19 @@ export function renderMatrixTable(results: readonly MatrixCellResult[]): string 
 
 export function renderMatrixSummary(totals: MatrixTotals): string {
   const costPerFinding = totals.costPerFinding === null ? 'n/a' : `$${totals.costPerFinding.toFixed(3)}`
+  const metricsLine = totals.status === 'INVALID'
+    ? `INVALID (${totals.failed}/${totals.cells} cell(s) failed; aggregate recall suppressed) `
+      + `precision=${pct(totals.precision)} decoyFP=${totals.decoyFp}/${totals.decoys} unmatchedFP=${totals.unmatchedFp} `
+      + `cost=$${totals.costUsd.toFixed(3)} cost/finding=${costPerFinding} wall=${Math.round(totals.wallMs / 1000)}s `
+      + `surface=${totals.surface} facts=${totals.facts}`
+    : `confirmed=${totals.confirmed}/${totals.targets} recall=${pct(totals.recall)} precision=${pct(totals.precision)} `
+      + `decoyFP=${totals.decoyFp}/${totals.decoys} unmatchedFP=${totals.unmatchedFp} cost=$${totals.costUsd.toFixed(3)} `
+      + `cost/finding=${costPerFinding} wall=${Math.round(totals.wallMs / 1000)}s surface=${totals.surface} facts=${totals.facts}`
   return [
     '',
     `TOTAL cells=${totals.cells} ok=${totals.ok} failed=${totals.failed} inert=${totals.inert} `
-      + `workerSessionFailures=${totals.workerSessionFailures} lockErrors=${totals.lockErrors}`,
-    `confirmed=${totals.confirmed}/${totals.targets} precision=${pct(totals.precision)} `
-      + `decoyFP=${totals.decoyFp}/${totals.decoys} unmatchedFP=${totals.unmatchedFp} cost=$${totals.costUsd.toFixed(3)} `
-      + `cost/finding=${costPerFinding} wall=${Math.round(totals.wallMs / 1000)}s surface=${totals.surface} facts=${totals.facts}`,
+      + `workerSessionFailures=${totals.workerSessionFailures} lockErrors=${totals.lockErrors} status=${totals.status}`,
+    metricsLine,
     `assignments completed=${totals.assignmentsCompleted} failed=${totals.assignmentsFailed} `
       + `workerFailureRate=${pct(totals.workerFailureRate)}`,
     `funnel=${JSON.stringify(totals.funnel)}`,

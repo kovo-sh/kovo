@@ -62,13 +62,15 @@ export function classCompatible(
   finding: { vulnClass?: string; cwe?: string },
   entry: Pick<GroundTruthEntry, 'vulnClass' | 'cwe'>,
 ): boolean {
-  const hasClass = !!finding.vulnClass || !!finding.cwe
-  if (!hasClass) return true // missing class/CWE => endpoint+param match only
-  if (finding.vulnClass && finding.vulnClass === entry.vulnClass) return true
-  const fc = cweNumber(finding.cwe)
+  const vulnClass = finding.vulnClass?.trim()
+  const cwe = finding.cwe?.trim()
+  if (!vulnClass && !cwe) return false // fail-closed: never wildcard-match a classless finding by endpoint alone
+  if (vulnClass === 'unmatched_classless') return false
+  if (vulnClass && vulnClass === entry.vulnClass) return true
+  const fc = cweNumber(cwe)
   const ec = cweNumber(entry.cwe)
   if (fc != null && ec != null && fc === ec) return true
-  const ff = familiesOf(finding.vulnClass, finding.cwe)
+  const ff = familiesOf(vulnClass, cwe)
   const ef = familiesOf(entry.vulnClass, entry.cwe)
   for (const f of ff) if (ef.has(f)) return true
   return false

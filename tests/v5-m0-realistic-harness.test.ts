@@ -284,7 +284,7 @@ test('translation: confirmed/static/pending map to grader statuses and preserve 
     { method: 'GET', path: '/api/invoices/1001' },
     { method: 'GET', path: '/api/invoices/2002?invoiceId=2002&expand=lines' },
   ])
-  assert.deepEqual(confirmed.params, ['invoiceId'])
+  assert.deepEqual(confirmed.params, ['invoiceId', 'expand'])
   const staticFinding = out.find(f => f.id === 'f-static')!
   assert.equal(staticFinding.status, 'static_verified')
   assert.equal(staticFinding.severity, 'medium')
