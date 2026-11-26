@@ -12,9 +12,13 @@ import {
   defaultHostMintedOracle,
   derivedTimingVulnClassForFamily,
   exactPathnameOf,
+  verifyHostExpressionProbe,
+  verifySignedUrlMintPair,
   type ExpressionConstructFamily,
+  type HostMintedBooleanPairChallenge,
   type HostMintedExpressionChallenge,
   type HostMintedTimingChallenge,
+  type HostStampedBooleanPair,
   type TimingConstructFamily,
 } from './proof-receipt.ts'
 import {
@@ -26,13 +30,13 @@ import {
 import type { VerifyCanaryBroker, VerifyClaim } from './verify-claims.ts'
 import {
   assessSignedUrlMintDifferential,
+  computeWorkerVisibleBodyDigest,
   evaluateWorkerStructuralDiff,
   mintHostBooleanPair,
   normalizeStructuralTokens,
   structuralDiffNormalized,
   verifyBooleanArmBaseParity,
   type BooleanPairStyle,
-  type HostMintedBooleanPair,
   type SignedUrlMintExchange,
   type SignedUrlMintVariant,
 } from './verify-support.ts'
@@ -51,12 +55,18 @@ export type ProveHttpExchangeResult = {
   personaHandle: string | null
 }
 
+export interface ProveHttpExchangeStamps {
+  hostExpressionChallenge?: HostMintedExpressionChallenge
+  hostBooleanPair?: HostStampedBooleanPair
+}
+
 export interface ProveHandlerHost {
   readonly transcript: TranscriptStore
   readonly defaultOrigin: string | undefined
   readonly canaryBroker: VerifyCanaryBroker | undefined
   readonly diffDigestKey?: string
-  runHttpExchange(args: Record<string, unknown>, nonce: string): Promise<ProveHttpExchangeResult>
+  runHttpExchange(args: Record<string, unknown>, nonce: string, stamps?: ProveHttpExchangeStamps): Promise<ProveHttpExchangeResult>
+  exchangeViewFromTranscript?(exchangeId: string): ProveHttpExchangeResult | null
   runOob(args: Record<string, unknown>): Promise<unknown>
   runRace(args: Record<string, unknown>, nonce: string): Promise<unknown>
   scrubRecord<T>(value: T): T
@@ -550,7 +560,7 @@ export async function handleProveDifferential(host: ProveHandlerHost, args: Reco
     : Math.max(2, Math.min(Math.round(Number(args.rounds ?? 3)), 6))
 
   let timingChallenge: HostMintedTimingChallenge | null = null
-  let booleanPair: HostMintedBooleanPair | null = null
+  let booleanPair: HostMintedBooleanPairChallenge | null = null
   let baselineTemplate: unknown = args.baseline
   let controlTemplate: unknown = args.control
   let variantTemplate: unknown = args.variant
@@ -565,13 +575,28 @@ export async function handleProveDifferential(host: ProveHandlerHost, args: Reco
     )
     if (usesHostBoolTemplate) {
       const baseVal = typeof rawBoolBase === 'string' ? rawBoolBase : '1'
+      if (baseVal.trim().length === 0) {
+        return host.scrubRecord({
+          ok: false,
+          confirmed: false,
+          mode: 'boolean',
+          endpoint: null,
+          controlIds: [],
+          variantIds: [],
+          stats: { reason: 'Boolean base value must be non-empty (empty-base standalone predicates are forbidden).' },
+          exchanges: { control: [], variant: [] },
+          rejectedBy: 'boolean_base_mismatch',
+          missingEvidence: ['boolean_base_value_parity'],
+          transcriptSummary: [],
+        })
+      }
       const rawStyle = String(args.booleanStyle ?? args.boolean_style ?? '').trim().toLowerCase()
       const style: BooleanPairStyle = rawStyle === 'single_quote' || rawStyle === 'single'
         ? 'single_quote'
         : rawStyle === 'double_quote' || rawStyle === 'double'
           ? 'double_quote'
           : 'numeric'
-      booleanPair = mintHostBooleanPair(baseVal, { style })
+      booleanPair = mintHostBooleanPair(baseVal, { style, oracle: defaultHostMintedOracle })
       const replacements: Record<string, string> = {
         '{{boolBase}}': booleanPair.baseValue,
         '{{boolTrue}}': booleanPair.trueValue,
@@ -728,17 +753,25 @@ export async function handleProveDifferential(host: ProveHandlerHost, args: Reco
     }
   }
 
+  // R4-C-1: Stamp host-minted boolean pair arms onto every baseline/true/false exchange at send time.
+  const baselineStamp = booleanPair ? { hostBooleanPair: defaultHostMintedOracle.stampBooleanPairArm(booleanPair, 'baseline') } : undefined
+  const controlBoolArm: 'true' | 'false' = boolParity?.ok && boolParity.controlTruth === false ? 'false' : 'true'
+  const variantBoolArm: 'true' | 'false' = controlBoolArm === 'true' ? 'false' : 'true'
+  const controlStamp = booleanPair ? { hostBooleanPair: defaultHostMintedOracle.stampBooleanPairArm(booleanPair, controlBoolArm) } : undefined
+  const variantStamp = booleanPair ? { hostBooleanPair: defaultHostMintedOracle.stampBooleanPairArm(booleanPair, variantBoolArm) } : undefined
+
   const baselineExchanges: Array<ProveHttpExchangeResult> = []
   const controlExchanges: Array<ProveHttpExchangeResult> = []
   const variantExchanges: Array<ProveHttpExchangeResult> = []
   for (let index = 0; index < rounds; index += 1) {
     if (baseBaselineArgs) {
-      baselineExchanges.push(await host.runHttpExchange({ ...baseBaselineArgs }, nonce))
+      baselineExchanges.push(await host.runHttpExchange({ ...baseBaselineArgs }, nonce, baselineStamp))
     }
     const order: Array<'control' | 'variant'> = index % 2 === 0 ? ['control', 'variant'] : ['variant', 'control']
     for (const which of order) {
       const armArgs = which === 'control' ? { ...baseControlArgs } : { ...baseVariantArgs }
-      const ex = await host.runHttpExchange(armArgs, nonce)
+      const armStamp = which === 'control' ? controlStamp : variantStamp
+      const ex = await host.runHttpExchange(armArgs, nonce, armStamp)
       if (which === 'control') controlExchanges.push(ex)
       else variantExchanges.push(ex)
     }
@@ -1341,9 +1374,10 @@ export async function handleProveInjection(host: ProveHandlerHost, args: Record<
       })
     }
 
+    // R4-C-2: Stamp non-transferable per-exchange `hostExpressionChallenge` at send time.
     const control = await host.runHttpExchange(controlArgs, nonce)
-    const probe1 = await host.runHttpExchange(probeArgs1, nonce)
-    const probe2 = await host.runHttpExchange(probeArgs2, nonce)
+    const probe1 = await host.runHttpExchange(probeArgs1, nonce, { hostExpressionChallenge: ch1 })
+    const probe2 = await host.runHttpExchange(probeArgs2, nonce, { hostExpressionChallenge: ch2 })
     const control2 = await host.runHttpExchange(controlArgs, nonce)
     const transcriptSummary = [
       proofEntry('control', control),
@@ -1351,24 +1385,54 @@ export async function handleProveInjection(host: ProveHandlerHost, args: Record<
       proofEntry('probe', probe2),
       proofEntry('control', control2),
     ]
-    const reqText1 = `${String(probeArgs1.path ?? '')}\n${String(probeArgs1.body ?? '')}`
-    const reqText2 = `${String(probeArgs2.path ?? '')}\n${String(probeArgs2.body ?? '')}`
-    const inProbe1 = probe1.body.includes(ch1.expectedOutput) && !probe1.body.includes(ch2.expectedOutput)
-    const inProbe2 = probe2.body.includes(ch2.expectedOutput) && !probe2.body.includes(ch1.expectedOutput)
-    const inControl = control.body.includes(ch1.expectedOutput) || control.body.includes(ch2.expectedOutput)
-      || control2.body.includes(ch1.expectedOutput) || control2.body.includes(ch2.expectedOutput)
-    const reflected = reqText1.includes(ch1.expectedOutput) || reqText2.includes(ch2.expectedOutput)
+    const derivedClass = family === 'cmdi' ? 'command_injection' : family === 'sqli' ? 'sqli_error' : family === 'ssti' ? 'ssti' : 'injection'
+    const rawCtrl1 = host.transcript.body(control.exchangeId) ?? control.body
+    const rawCtrl2 = host.transcript.body(control2.exchangeId) ?? control2.body
+    const rawProbe1 = host.transcript.body(probe1.exchangeId) ?? probe1.body
+    const rawProbe2 = host.transcript.body(probe2.exchangeId) ?? probe2.body
+    const rec1 = host.transcript.get(probe1.exchangeId)
+    const rec2 = host.transcript.get(probe2.exchangeId)
+    const check1 = verifyHostExpressionProbe({
+      probeRequest: {
+        pathAndQuery: rec1?.request?.pathAndQuery ?? String(probeArgs1.path ?? ''),
+        requestBody: host.transcript.requestBody(probe1.exchangeId) ?? (typeof probeArgs1.body === 'string' ? probeArgs1.body : null),
+        requestHeaders: rec1?.request?.headers ?? (asRecord(probeArgs1.headers) as Record<string, string> | null),
+      },
+      probeBody: rawProbe1,
+      probeStatus: probe1.status,
+      controlBodies: [rawCtrl1, rawCtrl2],
+      stampedChallenge: rec1?.hostExpressionChallenge ?? ch1,
+      expectedChallengeId: ch1.challengeId,
+      vulnClass: derivedClass,
+    })
+    const check2 = verifyHostExpressionProbe({
+      probeRequest: {
+        pathAndQuery: rec2?.request?.pathAndQuery ?? String(probeArgs2.path ?? ''),
+        requestBody: host.transcript.requestBody(probe2.exchangeId) ?? (typeof probeArgs2.body === 'string' ? probeArgs2.body : null),
+        requestHeaders: rec2?.request?.headers ?? (asRecord(probeArgs2.headers) as Record<string, string> | null),
+      },
+      probeBody: rawProbe2,
+      probeStatus: probe2.status,
+      controlBodies: [rawCtrl1, rawCtrl2],
+      stampedChallenge: rec2?.hostExpressionChallenge ?? ch2,
+      expectedChallengeId: ch2.challengeId,
+      vulnClass: derivedClass,
+    })
+    const crossIsolated = !rawProbe1.includes(ch2.expectedOutput) && !rawProbe2.includes(ch1.expectedOutput)
     const varying = ch1.expectedOutput !== ch2.expectedOutput
     const all2xx = [control, control2, probe1, probe2].every(ex => ex.status >= 200 && ex.status < 300)
     const missing = new Set<string>()
     if (!all2xx) missing.add('control_and_probe_2xx')
     if (!varying) missing.add('varying_host_operands')
-    if (!inProbe1 || !inProbe2) missing.add('host_computed_output_in_probes')
-    if (inControl) missing.add('output_absent_from_controls')
-    if (reflected) missing.add('non_reflected_expression')
+    if (!check1.ok || !check2.ok || !crossIsolated) {
+      const reasons = `${check1.reason} ${check2.reason}`
+      if (/malformed escape/i.test(reasons)) missing.add('clean_request_carrier')
+      else if (/anti-reflection/i.test(reasons)) missing.add('non_reflected_expression')
+      else if (/control leakage/i.test(reasons)) missing.add('output_absent_from_controls')
+      else missing.add('host_computed_output_in_probes')
+    }
     const missingEvidence = [...missing]
     const ok = missingEvidence.length === 0
-    const derivedClass = family === 'cmdi' ? 'command_injection' : family === 'sqli' ? 'sqli_error' : family === 'ssti' ? 'ssti' : 'injection'
     const hostClaim = {
       kind: 'host_evaluated_expression',
       vulnClass: derivedClass,
@@ -1377,6 +1441,11 @@ export async function handleProveInjection(host: ProveHandlerHost, args: Record<
       hostMintedChallengeIds: [ch1.challengeId, ch2.challengeId],
       message: message ?? `Host-minted ${family} evaluated-expression differential verified across 2 randomized challenges`,
     }
+    // R4-C-2: NEVER return `expectedOutput` (or plaintext operands/expressionSyntax) to the worker.
+    const publicChallenges = [
+      { challengeId: ch1.challengeId, family: ch1.family, mintedAtMs: ch1.mintedAtMs },
+      { challengeId: ch2.challengeId, family: ch2.family, mintedAtMs: ch2.mintedAtMs },
+    ]
     return host.scrubRecord({
       ok,
       confirmed: ok,
@@ -1385,7 +1454,7 @@ export async function handleProveInjection(host: ProveHandlerHost, args: Record<
       probe: probe1,
       probe2,
       control2,
-      hostMintedChallenges: [ch1, ch2],
+      hostMintedChallenges: publicChallenges,
       claim: hostClaim,
       claims: [hostClaim],
       evaluated: ok,
@@ -1486,23 +1555,81 @@ function transcriptRecordToSignedUrlExchange(
   }
 }
 
-function exchangeSummaryFromTranscript(transcript: TranscriptStore, exchangeId: string): ProveHttpExchangeResult | null {
-  const rec = transcript.get(exchangeId)
+function exchangeSummaryFromTranscript(host: ProveHandlerHost, exchangeId: string): ProveHttpExchangeResult | null {
+  if (host.exchangeViewFromTranscript) {
+    return host.exchangeViewFromTranscript(exchangeId)
+  }
+  const rec = host.transcript.get(exchangeId)
   if (!rec?.request) return null
-  const body = transcript.body(exchangeId) ?? ''
+  const rawBody = host.transcript.body(exchangeId) ?? ''
+  // R4-H-4: Compute response digests strictly from the worker-visible scrubbed body (NEVER raw response digests).
+  const { scrubbedBody, bodyBytes, bodySha256 } = computeWorkerVisibleBodyDigest(rawBody, text => host.scrubRecord(text))
   return {
     exchangeId: rec.exchangeId,
     status: rec.response?.status ?? 0,
     method: rec.request.method,
-    pathAndQuery: rec.request.pathAndQuery,
-    headers: rec.response?.headers ?? {},
-    body,
-    bodyPreview: body.slice(0, 512),
-    bodyBytes: rec.response?.bodyBytes ?? Buffer.byteLength(body),
-    bodySha256: rec.response?.bodySha256 ?? '',
+    pathAndQuery: host.scrubRecord(rec.request.pathAndQuery),
+    headers: host.scrubRecord(rec.response?.headers ?? {}),
+    body: scrubbedBody.slice(0, 512 * 1024),
+    bodyPreview: scrubbedBody.slice(0, 512),
+    bodyBytes,
+    bodySha256,
     durationMs: rec.durationMs,
     personaHandle: rec.request.personaHandle ?? null,
   }
+}
+
+function makeInPrefixAblationValue(controlValue: string, nonce: string): string {
+  const tag = nonce.replace(/[^A-Za-z0-9]/g, '').slice(0, 6) || 'abl'
+  const dotIdx = controlValue.lastIndexOf('.')
+  if (dotIdx > 0 && dotIdx < controlValue.length - 1 && !controlValue.slice(dotIdx + 1).includes('/')) {
+    return `${controlValue.slice(0, dotIdx)}_kovo_${tag}${controlValue.slice(dotIdx)}`
+  }
+  return `${controlValue || 'item'}_kovo_${tag}`
+}
+
+function buildSignedUrlAblationArgs(
+  controlArgs: Record<string, unknown>,
+  differingParam: string,
+  nonce: string,
+): Record<string, unknown> | null {
+  const ctlParams = paramMapFromArmArgs(controlArgs)
+  const ctlVal = ctlParams[differingParam]
+  if (ctlVal === undefined) return null
+  const ablVal = makeInPrefixAblationValue(ctlVal, nonce)
+  if (differingParam.startsWith('body:')) {
+    const fieldPath = differingParam.slice(5)
+    const rawBody = typeof controlArgs.body === 'string' ? controlArgs.body : ''
+    const parsed = parseJsonSafe(rawBody)
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      const cloned = JSON.parse(JSON.stringify(parsed)) as Record<string, unknown>
+      const parts = fieldPath.split('.')
+      let cur: Record<string, unknown> = cloned
+      for (let i = 0; i < parts.length - 1; i += 1) {
+        const next = cur[parts[i]!]
+        if (!next || typeof next !== 'object' || Array.isArray(next)) return null
+        cur = next as Record<string, unknown>
+      }
+      const leaf = parts[parts.length - 1]!
+      if (!(leaf in cur)) return null
+      cur[leaf] = ablVal
+      return { ...controlArgs, body: JSON.stringify(cloned), sessionGroupRole: 'control' }
+    }
+    if (rawBody.includes('=')) {
+      const params = new URLSearchParams(rawBody)
+      if (!params.has(fieldPath)) return null
+      params.set(fieldPath, ablVal)
+      return { ...controlArgs, body: params.toString(), sessionGroupRole: 'control' }
+    }
+    return { ...controlArgs, body: ablVal, sessionGroupRole: 'control' }
+  }
+  const pathStr = String(controlArgs.path ?? '/')
+  const qIdx = pathStr.indexOf('?')
+  if (qIdx < 0) return null
+  const params = new URLSearchParams(pathStr.slice(qIdx + 1))
+  if (!params.has(differingParam)) return null
+  params.set(differingParam, ablVal)
+  return { ...controlArgs, path: `${pathStr.slice(0, qIdx)}?${params.toString()}`, sessionGroupRole: 'control' }
 }
 
 export async function handleProveSignedUrlMint(
@@ -1528,23 +1655,40 @@ export async function handleProveSignedUrlMint(
   const existingProbeId = typeof (args.probeExchangeId ?? args.probe_exchange_id) === 'string'
     ? String(args.probeExchangeId ?? args.probe_exchange_id).trim()
     : ''
+  const existingAblationId = typeof (args.ablationExchangeId ?? args.ablation_exchange_id) === 'string'
+    ? String(args.ablationExchangeId ?? args.ablation_exchange_id).trim()
+    : ''
 
   let control: ProveHttpExchangeResult | null = null
   let probe: ProveHttpExchangeResult | null = null
+  let ablation: ProveHttpExchangeResult | null = null
 
   if (existingControlId && existingProbeId) {
-    control = exchangeSummaryFromTranscript(host.transcript, existingControlId)
-    probe = exchangeSummaryFromTranscript(host.transcript, existingProbeId)
+    control = exchangeSummaryFromTranscript(host, existingControlId)
+    probe = exchangeSummaryFromTranscript(host, existingProbeId)
+    if (existingAblationId) {
+      ablation = exchangeSummaryFromTranscript(host, existingAblationId)
+    }
     if (!control || !probe) {
       throw new Error('prove.signedUrlMint references an unknown controlExchangeId or probeExchangeId.')
     }
   } else {
     const controlBodyArg = args.controlBody ?? args.control_body
     const probeBodyArg = args.probeBody ?? args.probe_body
-    const rawControl = args.control ?? (baseRoute && controlBodyArg !== undefined ? { target: baseRoute, options: { ...baseOpts, body: controlBodyArg } } : undefined)
-    const rawProbe = args.probe ?? args.variantRequest ?? (baseRoute && probeBodyArg !== undefined ? { target: baseRoute, options: { ...baseOpts, body: probeBodyArg } } : undefined)
+    const ablationBodyArg = args.ablationBody ?? args.ablation_body
+    const rawControl: unknown = args.control ?? (baseRoute && controlBodyArg !== undefined ? { target: baseRoute, options: { ...baseOpts, body: controlBodyArg } } : undefined)
+    let rawProbe: unknown = args.probe ?? args.variantRequest ?? (baseRoute && probeBodyArg !== undefined ? { target: baseRoute, options: { ...baseOpts, body: probeBodyArg } } : undefined)
+    const rawAblation: unknown = args.ablation ?? (baseRoute && ablationBodyArg !== undefined ? { target: baseRoute, options: { ...baseOpts, body: ablationBodyArg } } : undefined)
     if (!rawControl || !rawProbe) {
       throw new Error('prove_signed_url_mint requires `control` and `probe` (or `route` with `controlBody` and `probeBody`, or `controlExchangeId` and `probeExchangeId`).')
+    }
+    const traversalPlaceholders = ['{{signedUrlTraversal}}', '{{traversalKey}}']
+    if (hasAnyPlaceholder(rawProbe, traversalPlaceholders)) {
+      const mintedTrav = `../kovo-trav-${randomBytes(4).toString('hex')}.json`
+      rawProbe = renderTemplateStrings(rawProbe, {
+        '{{signedUrlTraversal}}': mintedTrav,
+        '{{traversalKey}}': mintedTrav,
+      })
     }
     const controlArgs = normalizeArmTarget(host.defaultOrigin, rawControl, {
       ...(typeof baseOpts.method === 'string' && !(asRecord(rawControl)?.method || asRecord(asRecord(rawControl)?.options)?.method) ? { method: baseOpts.method } : {}),
@@ -1558,32 +1702,75 @@ export async function handleProveSignedUrlMint(
     })
     control = await host.runHttpExchange(controlArgs, nonce)
     probe = await host.runHttpExchange(probeArgs, nonce)
+    if (rawAblation) {
+      const ablationArgs = normalizeArmTarget(host.defaultOrigin, rawAblation, {
+        ...(typeof baseOpts.method === 'string' && !(asRecord(rawAblation)?.method || asRecord(asRecord(rawAblation)?.options)?.method) ? { method: baseOpts.method } : {}),
+        sessionGroupRole: 'control',
+        session,
+      })
+      ablation = await host.runHttpExchange(ablationArgs, nonce)
+    } else if (control.status >= 200 && control.status < 300 && variant !== 'unauth_write_mint') {
+      const armParity = checkArmIdentityParity(host.defaultOrigin, controlArgs, probeArgs)
+      if (armParity.ok) {
+        const autoAblArgs = buildSignedUrlAblationArgs(controlArgs, armParity.differingParam, nonce)
+        if (autoAblArgs) {
+          try { ablation = await host.runHttpExchange(autoAblArgs, nonce) } catch { ablation = null }
+        }
+      }
+    }
   }
 
   const hostControl = transcriptRecordToSignedUrlExchange(host.transcript, control.exchangeId, host.defaultOrigin ?? '')
   const hostProbe = transcriptRecordToSignedUrlExchange(host.transcript, probe.exchangeId, host.defaultOrigin ?? '')
+  const hostAblation = ablation
+    ? transcriptRecordToSignedUrlExchange(host.transcript, ablation.exchangeId, host.defaultOrigin ?? '')
+    : null
   if (!hostControl || !hostProbe) {
     throw new Error('prove.signedUrlMint could not read host-signed control/probe records from the transcript.')
   }
 
-  const assessment = assessSignedUrlMintDifferential({
+  // R4-C-6: Delegate to the shared hardened kernel primitive (`verifySignedUrlMintPair`) and
+  // enforce variant + in-prefix ablation arm checks via `assessSignedUrlMintDifferential`.
+  const kernelCheck = verifySignedUrlMintPair({
     control: hostControl,
     probe: hostProbe,
+  })
+  const detailed = assessSignedUrlMintDifferential({
+    control: hostControl,
+    probe: hostProbe,
+    ...(hostAblation ? { ablation: hostAblation } : {}),
     variant,
   })
-  const chainId = `signed_url_mint:${assessment.variant ?? (variant === 'auto' ? 'unverified' : variant)}`
-  const cwe = assessment.variant === 'unauth_write_mint' ? 'CWE-306' : 'CWE-22'
+  const confirmed = kernelCheck.confirmed && detailed.confirmed
+  const rejectedBy = confirmed
+    ? null
+    : (!kernelCheck.confirmed ? (kernelCheck.rejectedBy ?? 'signed_url_mint') : (detailed.rejectedBy ?? 'signed_url_mint'))
+  const missingEvidence = confirmed
+    ? []
+    : (!kernelCheck.confirmed ? kernelCheck.missingEvidence : detailed.missingEvidence)
+  const reason = confirmed
+    ? detailed.reason
+    : (!kernelCheck.confirmed ? kernelCheck.reason : detailed.reason)
+  const evidence: Record<string, unknown> = {
+    ...(confirmed ? detailed.evidence : (!kernelCheck.confirmed ? kernelCheck.evidence : detailed.evidence)),
+    ...(ablation ? { ablationExchangeId: ablation.exchangeId } : {}),
+  }
+
+  const chainId = `signed_url_mint:${detailed.variant ?? (variant === 'auto' ? 'unverified' : variant)}`
+  const cwe = detailed.variant === 'unauth_write_mint' ? 'CWE-306' : 'CWE-22'
   const exchangeIds = [control.exchangeId, probe.exchangeId]
+  // R4-C-6: NEVER stamp `replayMode: 'fresh_clean_replay'` without an actual fresh clean replay.
+  const replayMode = 'one_shot_transcript' as const
   const recorded = host.transcript.recordCompositeVerification({
     chainId,
     terminalVulnClass: 'signed_url_mint',
-    replayMode: 'fresh_clean_replay',
+    replayMode,
     hopCount: 1,
-    confirmed: assessment.confirmed,
-    verifiedEdgeCount: assessment.confirmed ? 1 : 0,
-    reason: assessment.reason,
-    rejectedBy: assessment.confirmed ? null : (assessment.rejectedBy ?? 'signed_url_mint'),
-    missingEvidence: assessment.missingEvidence,
+    confirmed,
+    verifiedEdgeCount: confirmed ? 1 : 0,
+    reason,
+    rejectedBy,
+    missingEvidence,
     exchangeIds,
     terminalExchangeId: probe.exchangeId,
     route: probe.pathAndQuery,
@@ -1597,33 +1784,35 @@ export async function handleProveSignedUrlMint(
     route: probe.pathAndQuery,
     exchangeIds,
     terminalExchangeId: probe.exchangeId,
-    replayMode: 'fresh_clean_replay',
+    replayMode,
     hopCount: 1,
     ...(typeof args.message === 'string' && args.message ? { message: args.message } : {}),
-    ...(!assessment.confirmed ? {
-      rejectedBy: assessment.rejectedBy ?? 'signed_url_mint',
-      missingEvidence: assessment.missingEvidence,
-      reason: assessment.reason,
+    ...(!confirmed ? {
+      rejectedBy: rejectedBy ?? 'signed_url_mint',
+      missingEvidence,
+      reason,
     } : {}),
   }
 
   return host.scrubRecord({
-    ok: assessment.confirmed,
-    confirmed: assessment.confirmed,
-    variant: assessment.variant,
-    provider: assessment.provider,
+    ok: confirmed,
+    confirmed,
+    variant: confirmed ? detailed.variant : null,
+    provider: confirmed ? detailed.provider : null,
     endpoint: probe.pathAndQuery,
     control,
     probe,
+    ...(ablation ? { ablation } : {}),
     claim,
     claims: [claim],
-    evidence: assessment.evidence,
-    reason: assessment.reason,
-    rejectedBy: assessment.confirmed ? null : (assessment.rejectedBy ?? 'signed_url_mint'),
-    missingEvidence: assessment.missingEvidence,
+    evidence,
+    reason,
+    rejectedBy,
+    missingEvidence,
     transcriptSummary: [
       proofEntry('control', control),
       proofEntry('probe', probe),
+      ...(ablation ? [proofEntry('control', ablation, 'in_prefix_ablation')] : []),
     ],
   })
 }

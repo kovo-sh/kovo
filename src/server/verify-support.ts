@@ -13,7 +13,7 @@
  *
  * This module is stateless and imports only the public relay/broker seam.
  */
-import { createHmac, randomBytes, randomInt, randomUUID } from 'node:crypto'
+import { createHash, createHmac, randomBytes, randomInt, randomUUID } from 'node:crypto'
 import { once } from 'node:events'
 import { createServer } from 'node:http'
 import type { Server } from 'node:http'
@@ -21,7 +21,12 @@ import type { Grant, WireCredentialProvenance } from './broker.ts'
 import type { CanaryBroker } from './canary-broker.ts'
 import { isDerivedCapabilityHandle, type InjectCapabilityTarget } from './derived-custody.ts'
 import type { HostCredentialPlacement } from './host-fact-log.ts'
+import {
+  canonicalPredicateSkeleton,
+  normalizeCarrierForAntiReflection,
+} from './oracle-invariants.ts'
 import type { ResolvedPersona } from './persona-vault.ts'
+import type { HostMintedBooleanPairChallenge } from './proof-receipt.ts'
 import { responseSimilarity } from './probes/context.ts'
 import { registerRunDisposer } from './run-disposers.ts'
 import {
@@ -535,7 +540,7 @@ export function resolvePersonaAuthKind(persona: ResolvedPersona | undefined): 'c
 }
 
 // ---------------------------------------------------------------------------
-// R3-C-4: Host-minted boolean pairs & base-value parity verification
+// R4-C-1 / R3-C-4: Host-minted boolean pairs & canonical predicate parity
 // ---------------------------------------------------------------------------
 
 export type BooleanPairStyle = 'numeric' | 'single_quote' | 'double_quote'
@@ -544,6 +549,7 @@ export interface HostMintedBooleanPair {
   readonly challengeId: string
   readonly baseValue: string
   readonly style: BooleanPairStyle
+  readonly param?: string | null
   readonly trueSuffix: string
   readonly falseSuffix: string
   readonly trueValue: string
@@ -551,18 +557,44 @@ export interface HostMintedBooleanPair {
   readonly mintedAtMs: number
 }
 
+function sortedCharMultiset(value: string): string {
+  return [...value].sort().join('')
+}
+
 /**
- * R3-C-4: Mint a randomized host-owned boolean predicate pair bound to a single exact `baseValue`.
- * Both true and false arms share the exact byte-identical `baseValue` prefix so integer-coercing
- * endpoints cannot fabricate boolean SQLi from differing IDs.
+ * R4-C-1 / R3-C-4: Mint a randomized host-owned boolean predicate pair bound to a non-empty `baseValue`.
+ * Routes through `options.oracle.mintBooleanPair` (e.g. `defaultHostMintedOracle`) when provided so
+ * minted pairs are registered in the kernel oracle, and enforces identical equal-length,
+ * same-character-multiset digit-permutation invariants in all cases.
  */
 export function mintHostBooleanPair(
   baseValue: string,
-  options: { style?: BooleanPairStyle } = {},
+  options: {
+    style?: BooleanPairStyle
+    param?: string | null
+    oracle?: {
+      mintBooleanPair(
+        baseValue: string,
+        opts?: { style?: BooleanPairStyle; param?: string | null },
+      ): HostMintedBooleanPairChallenge
+    }
+  } = {},
 ): HostMintedBooleanPair {
+  if (typeof baseValue !== 'string' || baseValue.trim().length === 0) {
+    throw new Error('mintHostBooleanPair requires a non-empty baseValue (empty-base standalone predicates are forbidden).')
+  }
   const style: BooleanPairStyle = options.style ?? 'numeric'
-  const a = randomInt(100, 900)
-  const b = a + randomInt(1, 90)
+  if (options.oracle) {
+    return options.oracle.mintBooleanPair(baseValue, {
+      style,
+      ...(options.param !== undefined ? { param: options.param } : {}),
+    })
+  }
+  const d1 = randomInt(1, 10)
+  const d2 = ((d1 + randomInt(0, 8)) % 9) + 1
+  const d3 = randomInt(0, 10)
+  const a = d1 * 100 + d2 * 10 + d3
+  const b = d2 * 100 + d1 * 10 + d3
   const trueSuffix = style === 'single_quote'
     ? `' AND '${a}'='${a}'--`
     : style === 'double_quote'
@@ -574,9 +606,10 @@ export function mintHostBooleanPair(
       ? `" AND "${a}"="${b}"--`
       : ` AND ${a}=${b}`
   return Object.freeze({
-    challengeId: `bool-${randomUUID()}`,
+    challengeId: `bool_${randomUUID()}`,
     baseValue,
     style,
+    ...(options.param !== undefined ? { param: options.param } : {}),
     trueSuffix,
     falseSuffix,
     trueValue: `${baseValue}${trueSuffix}`,
@@ -585,42 +618,31 @@ export function mintHostBooleanPair(
   })
 }
 
-const BOOL_SUFFIX_NUMERIC_RE = /(['")]*)\s*\b(?:AND|OR)\s*\(?\s*(\d+)\s*(==|=|!=|<>)\s*(\d+)(?:\s*([+-])\s*(\d+))?\s*\)?\s*(?:--[^\r\n]*|#[^\r\n]*|\/\*[\s\S]*?\*\/)?\s*$/i
-const BOOL_SUFFIX_STRING_RE = /(['")]*)\s*\b(?:AND|OR)\s*\(?\s*(['"])([^'"]*)\2\s*(==|=|!=|<>)\s*(['"])([^'"]*)\5?\s*\)?\s*(?:--[^\r\n]*|#[^\r\n]*|\/\*[\s\S]*?\*\/)?\s*$/i
-const BOOL_SUFFIX_LITERAL_RE = /(['")]*)\s*\b(?:AND|OR)\s*\(?\s*(NOT\s+)?(TRUE|FALSE)\s*\)?\s*(?:--[^\r\n]*|#[^\r\n]*|\/\*[\s\S]*?\*\/)?\s*$/i
+const STANDALONE_EMPTY_BASE_PRED_RE = /^\s*(?:['")]*\s*(?:AND|OR|&&|\|\|)\s*)?(?:NOT\s+)?\(?\s*(?:\d+\s*(?:==|=|!=|<>)\s*\d+(?:\s*[+-]\s*\d+)?|['"][^'"]*['"]\s*(?:==|=|!=|<>)\s*['"][^'"]*['"]?|(?:TRUE|FALSE))\s*\)?\s*(?:--[^\r\n]*|#[^\r\n]*|\/\*[\s\S]*?\*\/)?\s*$/i
 
-/** Strip a trailing explicit boolean predicate expression and return the exact leading base value + truth. */
+/**
+ * Strip a trailing explicit boolean predicate expression via the single authoritative
+ * `canonicalPredicateSkeleton` parser from `oracle-invariants.ts` (R4-C-1: zero parser drift).
+ */
 export function stripBooleanPredicateSuffix(raw: string): {
   baseValue: string
   predicateTruth: boolean | null
   predicateText: string | null
+  skeleton: string | null
 } {
-  const num = BOOL_SUFFIX_NUMERIC_RE.exec(raw)
-  if (num) {
-    const left = Number(num[2])
-    let right = Number(num[4])
-    if (num[5] && num[6]) right += num[5] === '-' ? -Number(num[6]) : Number(num[6])
-    const eq = left === right
-    const truth = num[3] === '!=' || num[3] === '<>' ? !eq : eq
-    return { baseValue: raw.slice(0, num.index), predicateTruth: truth, predicateText: num[0] }
+  const parsed = canonicalPredicateSkeleton(raw)
+  if (!parsed) return { baseValue: raw, predicateTruth: null, predicateText: null, skeleton: null }
+  return {
+    baseValue: parsed.baseValue,
+    predicateTruth: parsed.truth,
+    predicateText: parsed.predicateClause,
+    skeleton: parsed.skeleton,
   }
-  const str = BOOL_SUFFIX_STRING_RE.exec(raw)
-  if (str) {
-    const eq = str[3] === str[6]
-    const truth = str[4] === '!=' || str[4] === '<>' ? !eq : eq
-    return { baseValue: raw.slice(0, str.index), predicateTruth: truth, predicateText: str[0] }
-  }
-  const lit = BOOL_SUFFIX_LITERAL_RE.exec(raw)
-  if (lit) {
-    const baseTruth = lit[3]!.toLowerCase() === 'true'
-    const truth = lit[2] ? !baseTruth : baseTruth
-    return { baseValue: raw.slice(0, lit.index), predicateTruth: truth, predicateText: lit[0] }
-  }
-  return { baseValue: raw, predicateTruth: null, predicateText: null }
 }
 
 /**
- * R3-C-4: Enforce byte-identical stripped base values across baseline, true, and false boolean arms.
+ * R4-C-1 / R3-C-4: Enforce byte-identical non-empty base values, identical canonical predicate
+ * skeletons, and equal-length/same-character-multiset invariants across boolean differential arms.
  */
 export function verifyBooleanArmBaseParity(input: {
   controlValue: string
@@ -630,6 +652,16 @@ export function verifyBooleanArmBaseParity(input: {
 }): { ok: true; sharedBase: string | null; controlTruth: boolean | null; variantTruth: boolean | null } | { ok: false; reason: string } {
   if (input.hostPair) {
     const pair = input.hostPair
+    if (pair.baseValue.trim().length === 0) {
+      return { ok: false, reason: 'host-minted boolean pair has an empty base value' }
+    }
+    if (
+      pair.trueValue.length !== pair.falseValue.length
+      || pair.trueValue === pair.falseValue
+      || sortedCharMultiset(pair.trueValue) !== sortedCharMultiset(pair.falseValue)
+    ) {
+      return { ok: false, reason: 'host-minted boolean pair violates equal-length and identical character-multiset invariants' }
+    }
     if (input.baselineValue !== undefined && input.baselineValue !== pair.baseValue) {
       return { ok: false, reason: `baseline value "${input.baselineValue}" does not match host-minted base "${pair.baseValue}"` }
     }
@@ -645,8 +677,11 @@ export function verifyBooleanArmBaseParity(input: {
   const vr = stripBooleanPredicateSuffix(input.variantValue)
   const base = input.baselineValue !== undefined ? stripBooleanPredicateSuffix(input.baselineValue) : null
 
-  if (base && base.predicateTruth !== null) {
+  if ((base && base.predicateTruth !== null) || (input.baselineValue !== undefined && STANDALONE_EMPTY_BASE_PRED_RE.test(input.baselineValue))) {
     return { ok: false, reason: 'baseline arm must carry a benign non-predicate base value' }
+  }
+  if ((ctl.predicateTruth === null && STANDALONE_EMPTY_BASE_PRED_RE.test(input.controlValue)) || (vr.predicateTruth === null && STANDALONE_EMPTY_BASE_PRED_RE.test(input.variantValue))) {
+    return { ok: false, reason: 'empty-base or standalone boolean predicates are forbidden' }
   }
   if (ctl.predicateTruth !== null && vr.predicateTruth !== null) {
     if (ctl.predicateTruth === vr.predicateTruth) {
@@ -658,10 +693,22 @@ export function verifyBooleanArmBaseParity(input: {
         reason: `boolean predicate arms have mismatched base values ("${ctl.baseValue}" vs "${vr.baseValue}"); arms must share the identical base value`,
       }
     }
-    if (base && input.baselineValue !== ctl.baseValue) {
+    if (input.baselineValue !== undefined && input.baselineValue !== ctl.baseValue) {
       return {
         ok: false,
         reason: `baseline value "${input.baselineValue}" does not match boolean arm base "${ctl.baseValue}"`,
+      }
+    }
+    if (ctl.skeleton !== vr.skeleton) {
+      return {
+        ok: false,
+        reason: 'boolean predicate arms must share the exact canonical predicate skeleton',
+      }
+    }
+    if (input.controlValue.length !== input.variantValue.length || sortedCharMultiset(input.controlValue) !== sortedCharMultiset(input.variantValue)) {
+      return {
+        ok: false,
+        reason: 'boolean predicate arms must have identical byte length and character multiset',
       }
     }
     return { ok: true, sharedBase: ctl.baseValue, controlTruth: ctl.predicateTruth, variantTruth: vr.predicateTruth }
@@ -675,7 +722,7 @@ export function verifyBooleanArmBaseParity(input: {
         reason: `boolean predicate arm base "${predArm.baseValue}" does not match benign arm value "${benignVal}"`,
       }
     }
-    if (base && input.baselineValue !== benignVal) {
+    if (input.baselineValue !== undefined && input.baselineValue !== benignVal) {
       return {
         ok: false,
         reason: `baseline value "${input.baselineValue}" does not match shared base "${benignVal}"`,
@@ -683,7 +730,7 @@ export function verifyBooleanArmBaseParity(input: {
     }
     return { ok: true, sharedBase: benignVal, controlTruth: ctl.predicateTruth, variantTruth: vr.predicateTruth }
   }
-  return { ok: true, sharedBase: base ? input.baselineValue! : null, controlTruth: null, variantTruth: null }
+  return { ok: true, sharedBase: input.baselineValue ?? null, controlTruth: null, variantTruth: null }
 }
 
 // ---------------------------------------------------------------------------
@@ -1289,18 +1336,231 @@ function containsRedactedRequestPlane(exchange: SignedUrlMintExchange): boolean 
   return REDACTED_PLACEHOLDER_RE.test(requestCarrierText(exchange))
 }
 
-function isSignatureOrUrlEchoedFromRequest(exchange: SignedUrlMintExchange, signed: ParsedSignedCloudUrl): boolean {
+interface NormalizedSignedUrlCarrier {
+  readonly raw: string
+  readonly malformedEscape: boolean
+  readonly malformedReason: string | null
+  readonly decodedComponents: string[]
+  readonly comparables: string[]
+  readonly alnumCores: string[]
+  readonly params: Record<string, string>
+}
+
+const MALFORMED_JSON_UNICODE_RE = /\\u(?![0-9a-fA-F]{4})/
+const MALFORMED_PERCENT_RE = /%(?![0-9a-fA-F]{2})/
+
+function safeDecodePercentComponent(raw: string): { ok: true; value: string } | { ok: false; reason: string } {
+  const spaced = raw.replace(/\+/g, ' ')
+  if (MALFORMED_PERCENT_RE.test(spaced)) {
+    return { ok: false, reason: 'malformed_percent_escape' }
+  }
+  try {
+    return { ok: true, value: decodeURIComponent(spaced) }
+  } catch {
+    return { ok: false, reason: 'invalid_utf8_percent_escape' }
+  }
+}
+
+function stableCanonicalJson(value: unknown, depth = 0): string {
+  if (depth > 8) return 'null'
+  if (value === null || typeof value !== 'object') return JSON.stringify(value)
+  if (Array.isArray(value)) return `[${value.map(v => stableCanonicalJson(v, depth + 1)).join(',')}]`
+  const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b))
+  return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${stableCanonicalJson(v, depth + 1)}`).join(',')}}`
+}
+
+function canonicalExchangeBody(exchange: SignedUrlMintExchange): string {
+  if (exchange.requestJson !== undefined) {
+    if (typeof exchange.requestJson === 'string') {
+      const trimmed = exchange.requestJson.trim()
+      if (!trimmed) return ''
+      try { return stableCanonicalJson(JSON.parse(trimmed)) } catch { return trimmed }
+    }
+    return stableCanonicalJson(exchange.requestJson)
+  }
+  if (typeof exchange.requestBody === 'string') {
+    const trimmed = exchange.requestBody.trim()
+    if (!trimmed) return ''
+    try { return stableCanonicalJson(JSON.parse(trimmed)) } catch { return trimmed }
+  }
+  return ''
+}
+
+/**
+ * R4-C-6: Per-component, fail-closed request carrier normalizer backed by
+ * `normalizeCarrierForAntiReflection` (rejects malformed percent & JSON unicode escapes;
+ * decodes valid per-component percent and JSON `\uXXXX` escapes).
+ */
+function normalizeSignedUrlExchangeCarrier(exchange: SignedUrlMintExchange): NormalizedSignedUrlCarrier {
   const raw = requestCarrierText(exchange)
-  let decoded = raw
-  try { decoded = decodeURIComponent(raw.replace(/\+/g, ' ')) } catch { /* keep raw */ }
-  let decodedSig = signed.signature
-  try { decodedSig = decodeURIComponent(signed.signature) } catch { /* keep raw */ }
-  const needles = [signed.signature, decodedSig, signed.rawUrl]
-  return needles.some(n => n.length >= 16 && (raw.includes(n) || decoded.includes(n)))
+  const decodedComponents: string[] = []
+  const comparables: string[] = []
+  const alnumCores: string[] = []
+  const params: Record<string, string> = {}
+  let malformedEscape = false
+  let malformedReason: string | null = null
+
+  const pushComponent = (text: string, decodePercent: boolean) => {
+    if (!text) return
+    const norm = normalizeCarrierForAntiReflection(text, { decodePercent })
+    if (decodePercent && norm.hadMalformedPercentEscape) {
+      malformedEscape = true
+      malformedReason = malformedReason ?? 'malformed_percent_escape'
+    }
+    decodedComponents.push(text)
+    if (norm.comparable) comparables.push(norm.comparable)
+    if (norm.alnumCore) alnumCores.push(norm.alnumCore)
+  }
+
+  const pq = exchange.pathAndQuery || '/'
+  const qIdx = pq.indexOf('?')
+  const rawPath = qIdx >= 0 ? pq.slice(0, qIdx) : pq
+  for (const seg of rawPath.split('/').filter(Boolean)) {
+    const dec = safeDecodePercentComponent(seg)
+    if (!dec.ok) {
+      malformedEscape = true
+      malformedReason = malformedReason ?? dec.reason
+    } else {
+      pushComponent(dec.value, false)
+    }
+    pushComponent(seg, true)
+  }
+  if (qIdx >= 0) {
+    const rawQuery = pq.slice(qIdx + 1).split('#')[0] ?? ''
+    for (const pair of rawQuery.split('&')) {
+      if (!pair) continue
+      const eq = pair.indexOf('=')
+      const rawKey = eq >= 0 ? pair.slice(0, eq) : pair
+      const rawVal = eq >= 0 ? pair.slice(eq + 1) : ''
+      const decKey = safeDecodePercentComponent(rawKey)
+      const decVal = safeDecodePercentComponent(rawVal)
+      if (!decKey.ok || !decVal.ok) {
+        malformedEscape = true
+        malformedReason = malformedReason ?? (!decKey.ok ? decKey.reason : (!decVal.ok ? decVal.reason : 'malformed_percent_escape'))
+      } else {
+        params[decKey.value] = decVal.value
+        pushComponent(decKey.value, false)
+        pushComponent(decVal.value, false)
+      }
+      pushComponent(rawKey, true)
+      pushComponent(rawVal, true)
+    }
+  }
+
+  const bodyText = typeof exchange.requestBody === 'string'
+    ? exchange.requestBody
+    : exchange.requestJson !== undefined
+      ? (typeof exchange.requestJson === 'string' ? exchange.requestJson : JSON.stringify(exchange.requestJson))
+      : ''
+  if (bodyText) {
+    const trimmed = bodyText.trim()
+    const looksJson = trimmed.startsWith('{') || trimmed.startsWith('[')
+    if (looksJson && MALFORMED_JSON_UNICODE_RE.test(bodyText)) {
+      malformedEscape = true
+      malformedReason = malformedReason ?? 'malformed_json_unicode_escape'
+    }
+    let parsedJson: unknown = exchange.requestJson
+    if (parsedJson === undefined && looksJson) {
+      try { parsedJson = JSON.parse(bodyText) } catch { parsedJson = undefined }
+    } else if (typeof parsedJson === 'string' && (parsedJson.trim().startsWith('{') || parsedJson.trim().startsWith('['))) {
+      try { parsedJson = JSON.parse(parsedJson) } catch { /* keep string */ }
+    }
+    if (parsedJson !== undefined && parsedJson !== null && typeof parsedJson === 'object') {
+      const flatten = (val: unknown, prefix = '', depth = 0): void => {
+        if (depth > 5 || val === null || val === undefined) return
+        if (typeof val === 'string' || typeof val === 'number' || typeof val === 'boolean') {
+          const s = String(val)
+          params[`body:${prefix || '$'}`] = s
+          pushComponent(s, false)
+          return
+        }
+        if (Array.isArray(val)) {
+          val.slice(0, 32).forEach((item, idx) => flatten(item, `${prefix}[${idx}]`, depth + 1))
+          return
+        }
+        for (const [k, child] of Object.entries(val as Record<string, unknown>)) {
+          flatten(child, prefix ? `${prefix}.${k}` : k, depth + 1)
+        }
+      }
+      flatten(parsedJson)
+      pushComponent(bodyText, false)
+    } else if (!looksJson && bodyText.includes('=')) {
+      for (const pair of bodyText.split('&')) {
+        if (!pair) continue
+        const eq = pair.indexOf('=')
+        const rk = eq >= 0 ? pair.slice(0, eq) : pair
+        const rv = eq >= 0 ? pair.slice(eq + 1) : ''
+        const dk = safeDecodePercentComponent(rk)
+        const dv = safeDecodePercentComponent(rv)
+        if (!dk.ok || !dv.ok) {
+          malformedEscape = true
+          malformedReason = malformedReason ?? (!dk.ok ? dk.reason : (!dv.ok ? dv.reason : 'malformed_percent_escape'))
+        } else {
+          params[`body:${dk.value}`] = dv.value
+          pushComponent(dk.value, false)
+          pushComponent(dv.value, false)
+        }
+      }
+    } else {
+      params['body:$'] = bodyText
+      pushComponent(bodyText, false)
+    }
+  }
+
+  for (const [k, v] of Object.entries(exchange.requestHeaders ?? {})) {
+    if (!v) continue
+    pushComponent(`${k}:${v}`, false)
+    pushComponent(v, false)
+  }
+
+  return { raw, malformedEscape, malformedReason, decodedComponents, comparables, alnumCores, params }
+}
+
+function isSignatureOrUrlEchoedFromCarrier(carrier: NormalizedSignedUrlCarrier, signed: ParsedSignedCloudUrl): boolean {
+  if (carrier.malformedEscape) return true
+  const rawNeedles = [signed.signature, signed.rawUrl]
+  const decSig = safeDecodePercentComponent(signed.signature)
+  if (decSig.ok && decSig.value !== signed.signature) rawNeedles.push(decSig.value)
+  for (const needle of rawNeedles) {
+    if (needle.length < 16) continue
+    const normNeedle = normalizeCarrierForAntiReflection(needle, { decodePercent: false })
+    if (carrier.raw.includes(needle)) return true
+    if (carrier.decodedComponents.some(c => c.includes(needle))) return true
+    if (normNeedle.comparable.length >= 16 && carrier.comparables.some(c => c.includes(normNeedle.comparable))) return true
+    if (normNeedle.alnumCore.length >= 16 && carrier.alnumCores.some(c => c.includes(normNeedle.alnumCore))) return true
+  }
+  return false
+}
+
+function normalizedPersonaHandle(value: string | null | undefined): string | null {
+  const trimmed = (value ?? '').trim().toLowerCase()
+  if (!trimmed || /^(?:anonymous|anon|unauthenticated|none)$/.test(trimmed)) return null
+  return trimmed
+}
+
+function hasSingleDifferingTraversalInput(
+  ctlCarrier: NormalizedSignedUrlCarrier,
+  prbCarrier: NormalizedSignedUrlCarrier,
+): boolean {
+  const allKeys = [...new Set([...Object.keys(ctlCarrier.params), ...Object.keys(prbCarrier.params)])]
+  if (allKeys.length === 0) return false
+  const diffKeys = allKeys.filter(k => (ctlCarrier.params[k] ?? '') !== (prbCarrier.params[k] ?? ''))
+  if (diffKeys.length !== 1) return false
+  const soleKey = diffKeys[0]!
+  const ctlVal = ctlCarrier.params[soleKey] ?? ''
+  const prbVal = prbCarrier.params[soleKey] ?? ''
+  const prbNorm = normalizeCarrierForAntiReflection(prbVal, { decodePercent: true }).comparable
+  const hasDotDot = prbVal.includes('..') || prbNorm.includes('..')
+  if (hasDotDot) return true
+  const ctlHasSep = /[\\/]/.test(ctlVal)
+  const prbHasSep = /[\\/]/.test(prbVal) || /[\\/]/.test(prbNorm)
+  if (!ctlHasSep && prbHasSep) return true
+  if (ctlVal.length > 0 && prbVal.startsWith(ctlVal) && /[\\/]/.test(prbVal.slice(ctlVal.length))) return true
+  return false
 }
 
 function isUnauthenticatedExchange(exchange: SignedUrlMintExchange): boolean {
-  if (exchange.actorHandle && exchange.actorHandle.trim()) return false
+  if (normalizedPersonaHandle(exchange.actorHandle)) return false
   if (exchange.consumedCapabilityId) return false
   if (exchange.consumedCapabilities && exchange.consumedCapabilities.length > 0) return false
   const wp = exchange.wireCredentialProvenance
@@ -1325,36 +1585,43 @@ function isUnauthenticatedExchange(exchange: SignedUrlMintExchange): boolean {
 function hasPathInjectionIntoNestedDir(
   control: ParsedSignedCloudUrl,
   probe: ParsedSignedCloudUrl,
-  probeRequestText: string,
+  prbCarrier: NormalizedSignedUrlCarrier,
 ): boolean {
+  if (prbCarrier.malformedEscape) return false
   if (probe.normalizedParentDir === control.normalizedParentDir) return false
   const probeSegs = probe.normalizedParentDir.split('/').filter(Boolean)
   const ctlSegs = control.normalizedParentDir.split('/').filter(Boolean)
   const extraSegs = probeSegs.slice(ctlSegs.length).filter(seg => seg !== '<dynamic>' && seg.length >= 2)
   if (extraSegs.length === 0) return false
-  let decodedReq = probeRequestText.toLowerCase()
-  try { decodedReq = decodeURIComponent(decodedReq) } catch { /* keep lower */ }
-  const hasSep = decodedReq.includes('/') || decodedReq.includes('..') || decodedReq.includes('\\')
-  return hasSep && extraSegs.some(seg => decodedReq.includes(seg))
+  const decodedAll = [...prbCarrier.decodedComponents, ...prbCarrier.comparables].join('\n').toLowerCase()
+  const hasSep = decodedAll.includes('/') || decodedAll.includes('..') || decodedAll.includes('\\')
+  return hasSep && extraSegs.some(seg => decodedAll.includes(seg))
 }
 
 /**
- * Authoritative, fail-closed host-verified oracle for `signed_url_mint` (P0 #2).
+ * Authoritative, fail-closed host-verified oracle for `signed_url_mint` (R4-C-6 / P0 #2).
  *
  * Evaluates strictly over host-signed transcript exchanges:
- *   - Variant A (`key_traversal`): 2xx control vs 2xx probe on the same approved origin & route,
- *     both returning valid high-entropy cloud-storage signed URLs with *differing* non-echoed
- *     signatures where the probe's canonicalized pathname escapes the control's parent directory
- *     or bucket (rejecting benign same-prefix filenames and UUID subdirs).
- *   - Variant B (`unauth_write_mint`): 4xx negative control vs unauthenticated 2xx probe on the
- *     same origin & route minting a valid high-entropy non-echoed write-capable signed cloud URL.
+ *   - Fail-closed per-component carrier normalization on BOTH control & probe (rejecting malformed
+ *     percent and JSON unicode escapes) and echo-checking BOTH arms against decoded carriers.
+ *   - Variant A (`key_traversal`): same-persona 2xx control vs 2xx probe on the same approved
+ *     origin & route, with a single differing parameter carrying a traversal/separator construct,
+ *     optional in-prefix ablation arm check, same host & bucket (host/bucket differences are
+ *     non-evidence), and distinct non-echoed signatures where probe escapes the control parent dir.
+ *   - Variant B (`unauth_write_mint`): anonymous 401/403 authentication-denied negative control
+ *     (never 400/422 validation errors) on the same route & canonical body vs unauthenticated 2xx
+ *     probe minting a valid high-entropy non-echoed write-capable signed cloud URL.
  */
 export function assessSignedUrlMintDifferential(input: {
   control: SignedUrlMintExchange
   probe: SignedUrlMintExchange
+  ablation?: SignedUrlMintExchange | null
+  controlSessionId?: string | null
+  probeSessionId?: string | null
+  ablationSessionId?: string | null
   variant?: SignedUrlMintVariant | 'auto'
 }): SignedUrlMintAssessment {
-  const { control, probe } = input
+  const { control, probe, ablation } = input
   const requestedVariant = input.variant ?? 'auto'
   const fail = (
     rejectedBy: string,
@@ -1375,12 +1642,24 @@ export function assessSignedUrlMintDifferential(input: {
     },
   })
 
-  if (containsRedactedRequestPlane(control) || containsRedactedRequestPlane(probe)) {
+  if (containsRedactedRequestPlane(control) || containsRedactedRequestPlane(probe) || (ablation && containsRedactedRequestPlane(ablation))) {
     return fail(
       'redacted_request_plane',
       ['clean_request_plane'],
       'Signed-URL oracle rejected: kernel request plane contains a redacted placeholder.',
     )
+  }
+
+  const ctlCarrier = normalizeSignedUrlExchangeCarrier(control)
+  const prbCarrier = normalizeSignedUrlExchangeCarrier(probe)
+  const ablCarrier = ablation ? normalizeSignedUrlExchangeCarrier(ablation) : null
+  if (ctlCarrier.malformedEscape || prbCarrier.malformedEscape || ablCarrier?.malformedEscape) {
+    const reason = ctlCarrier.malformedEscape
+      ? `Signed-URL control request contained a malformed escape (${ctlCarrier.malformedReason}); anti-reflection fails closed.`
+      : prbCarrier.malformedEscape
+        ? `Signed-URL probe request contained a malformed escape (${prbCarrier.malformedReason}); anti-reflection fails closed.`
+        : `Signed-URL ablation request contained a malformed escape (${ablCarrier?.malformedReason}); anti-reflection fails closed.`
+    return fail('signed_url_malformed_request_carrier', ['clean_request_carrier'], reason)
   }
 
   const ctlOrigin = normalizeOriginKey(control.origin)
@@ -1414,6 +1693,7 @@ export function assessSignedUrlMintDifferential(input: {
   const ctlStatus = control.status
   const prbStatus = probe.status
   const ctlIs2xx = ctlStatus !== null && ctlStatus >= 200 && ctlStatus < 300
+  const ctlIsAuthDenied = ctlStatus === 401 || ctlStatus === 403
   const ctlIs4xx = ctlStatus !== null && ctlStatus >= 400 && ctlStatus < 500
   const prbIs2xx = prbStatus !== null && prbStatus >= 200 && prbStatus < 300
   if (!prbIs2xx) {
@@ -1433,17 +1713,31 @@ export function assessSignedUrlMintDifferential(input: {
     )
   }
 
-  const nonEchoedProbeUrls = probeExtracted.urls.filter(u => !isSignatureOrUrlEchoedFromRequest(probe, u))
+  const nonEchoedProbeUrls = probeExtracted.urls.filter(u => !isSignatureOrUrlEchoedFromCarrier(prbCarrier, u))
   if (nonEchoedProbeUrls.length === 0) {
     return fail(
       'signed_url_echoed',
       ['server_generated_signature'],
-      'Probe signed URL or cryptographic signature was echoed from the request rather than generated by the server.',
+      'Probe signed URL or cryptographic signature was echoed from the normalized request carrier rather than generated by the server.',
     )
   }
 
-  // Variant A: Key-traversal / bucket-escape differential (2xx control vs 2xx probe)
+  // Variant A: Key-traversal differential (same-persona 2xx control vs 2xx probe)
   if (ctlIs2xx && requestedVariant !== 'unauth_write_mint') {
+    const ctlPersona = normalizedPersonaHandle(control.actorHandle ?? control.wireCredentialProvenance?.personaHandle)
+    const prbPersona = normalizedPersonaHandle(probe.actorHandle ?? probe.wireCredentialProvenance?.personaHandle)
+    const ctlSess = (input.controlSessionId ?? control.wireCredentialProvenance?.session ?? null) || null
+    const prbSess = (input.probeSessionId ?? probe.wireCredentialProvenance?.session ?? null) || null
+    const ctlAuthed = Boolean(ctlPersona || ctlSess || control.wireCredentialProvenance?.authenticated)
+    const prbAuthed = Boolean(prbPersona || prbSess || probe.wireCredentialProvenance?.authenticated)
+    if (ctlPersona !== prbPersona || ctlSess !== prbSess || ctlAuthed !== prbAuthed) {
+      return fail(
+        'signed_url_persona_mismatch',
+        ['same_persona_control_and_probe'],
+        `Signed-URL key_traversal rejected (R4-C-6): control (${ctlPersona ?? 'anon'}) and probe (${prbPersona ?? 'anon'}) must execute under the exact same persona/session.`,
+      )
+    }
+
     const ctlExtracted = extractSignedCloudUrls(control)
     if (ctlExtracted.urls.length === 0) {
       return fail(
@@ -1452,35 +1746,63 @@ export function assessSignedUrlMintDifferential(input: {
         'Control returned 2xx but did not contain a valid cloud-storage signed URL for baseline comparison.',
       )
     }
-    const ctlReqText = requestCarrierText(control)
-    const prbReqText = requestCarrierText(probe)
-    if (ctlReqText === prbReqText) {
+    const nonEchoedControlUrls = ctlExtracted.urls.filter(u => !isSignatureOrUrlEchoedFromCarrier(ctlCarrier, u))
+    if (nonEchoedControlUrls.length === 0) {
+      return fail(
+        'signed_url_control_echoed',
+        ['server_generated_control_signature'],
+        'Control signed URL or cryptographic signature was echoed from the normalized control request carrier.',
+      )
+    }
+    if (ctlCarrier.raw === prbCarrier.raw) {
       return fail(
         'signed_url_identical_request',
         ['differing_probe_input'],
         'Control and probe requests are identical; a traversal differential requires distinct control vs probe input.',
       )
     }
+
+    const hasBoundTraversalInput = hasSingleDifferingTraversalInput(ctlCarrier, prbCarrier)
+    const ablationUrls = (() => {
+      if (!ablation || !ablCarrier) return null
+      if (ablation.status === null || ablation.status < 200 || ablation.status >= 300) return []
+      return extractSignedCloudUrls(ablation).urls.filter(u => !isSignatureOrUrlEchoedFromCarrier(ablCarrier, u))
+    })()
+
     let sawSameSignature = false
     let sawNoEscape = false
+    let sawHostOrBucketOnly = false
+    let sawNoTraversalInput = false
+    let sawAblationEscaped = false
     for (const prbUrl of nonEchoedProbeUrls) {
-      for (const ctlUrl of ctlExtracted.urls) {
+      for (const ctlUrl of nonEchoedControlUrls) {
         if (ctlUrl.signature === prbUrl.signature) {
           sawSameSignature = true
           continue
         }
         const hostEscaped = prbUrl.host !== ctlUrl.host
         const bucketEscaped = prbUrl.bucket !== ctlUrl.bucket
+        if (hostEscaped || bucketEscaped) {
+          sawHostOrBucketOnly = true
+          continue
+        }
         const escapedParentPrefix = !prbUrl.normalizedParentDir.startsWith(ctlUrl.normalizedParentDir)
-        const injectedNestedDir = !escapedParentPrefix && hasPathInjectionIntoNestedDir(ctlUrl, prbUrl, prbReqText)
-        if (hostEscaped || bucketEscaped || escapedParentPrefix || injectedNestedDir) {
-          const escapeKind = hostEscaped
-            ? 'host_escape'
-            : bucketEscaped
-              ? 'bucket_escape'
-              : escapedParentPrefix
-                ? 'parent_prefix_escape'
-                : 'injected_prefix_escape'
+        const injectedNestedDir = !escapedParentPrefix && hasPathInjectionIntoNestedDir(ctlUrl, prbUrl, prbCarrier)
+        if (escapedParentPrefix || injectedNestedDir) {
+          if (!hasBoundTraversalInput) {
+            sawNoTraversalInput = true
+            continue
+          }
+          if (ablationUrls && ablationUrls.length > 0) {
+            const ablationStaysInPrefix = ablationUrls.some(
+              au => au.host === ctlUrl.host && au.bucket === ctlUrl.bucket && au.normalizedParentDir.startsWith(ctlUrl.normalizedParentDir),
+            )
+            if (!ablationStaysInPrefix) {
+              sawAblationEscaped = true
+              continue
+            }
+          }
+          const escapeKind = escapedParentPrefix ? 'parent_prefix_escape' : 'injected_prefix_escape'
           return {
             confirmed: true,
             variant: 'key_traversal',
@@ -1505,11 +1827,33 @@ export function assessSignedUrlMintDifferential(input: {
               signatureParam: prbUrl.signatureParam,
               algorithm: prbUrl.algorithm,
               signatureDistinct: true,
+              ...(ablation ? { ablationVerifiedInPrefix: Boolean(ablationUrls && ablationUrls.length > 0) } : {}),
             },
           }
         }
         sawNoEscape = true
       }
+    }
+    if (sawAblationEscaped) {
+      return fail(
+        'signed_url_ablation_escaped',
+        ['in_prefix_ablation_control'],
+        'In-prefix ablation arm also escaped the control directory prefix; prefix change is not bound to the traversal construct.',
+      )
+    }
+    if (sawNoTraversalInput) {
+      return fail(
+        'signed_url_no_traversal_input',
+        ['traversal_or_separator_input'],
+        'Signed-URL key_traversal rejected (R4-C-6): probe must differ in a single parameter carrying a traversal or path-separator construct (benign multi-folder presign is not CWE-22).',
+      )
+    }
+    if (sawHostOrBucketOnly && !sawNoEscape) {
+      return fail(
+        'signed_url_host_or_bucket_non_evidence',
+        ['bound_prefix_traversal'],
+        'Signed-URL key_traversal rejected (R4-C-6): host/bucket differences alone are non-evidence without a bound prefix traversal.',
+      )
     }
     if (sawSameSignature && !sawNoEscape) {
       return fail(
@@ -1521,22 +1865,43 @@ export function assessSignedUrlMintDifferential(input: {
     return fail(
       'signed_url_no_prefix_escape',
       ['canonical_prefix_or_bucket_escape'],
-      'Probe signed URL remained inside the control directory/prefix with no bucket or parent-prefix escape.',
+      'Probe signed URL remained inside the control directory/prefix with no parent-prefix escape.',
       {
-        controlPathname: ctlExtracted.urls[0]?.canonicalPathname ?? null,
+        controlPathname: nonEchoedControlUrls[0]?.canonicalPathname ?? null,
         probePathname: nonEchoedProbeUrls[0]?.canonicalPathname ?? null,
       },
     )
   }
 
-  // Variant B: Unauthenticated privileged write-URL minting (4xx negative control vs unauth 2xx probe)
+  // Variant B: Unauthenticated privileged write-URL minting (anonymous 401/403 control on same route & body vs unauth 2xx probe)
   if (ctlIs4xx && requestedVariant !== 'key_traversal') {
+    if (!ctlIsAuthDenied) {
+      return fail(
+        'signed_url_control_not_auth_denied',
+        ['auth_denied_401_or_403_control'],
+        `Signed-URL unauth_write_mint rejected (R4-C-6): negative control must be an authentication/authorization denial (401/403), not ${ctlStatus ?? 'null'} (validation errors on public presign endpoints are not CWE-306).`,
+      )
+    }
+    if (!isUnauthenticatedExchange(control)) {
+      return fail(
+        'signed_url_control_authenticated',
+        ['anonymous_401_or_403_control'],
+        'Signed-URL unauth_write_mint rejected (R4-C-6): negative 401/403 control must be anonymous.',
+      )
+    }
+    if (canonicalExchangeBody(control) !== canonicalExchangeBody(probe)) {
+      return fail(
+        'signed_url_control_body_mismatch',
+        ['same_body_negative_control'],
+        'Signed-URL unauth_write_mint rejected (R4-C-6): negative 401/403 control must use the same route and request body as the probe.',
+      )
+    }
     const ctlExtracted = extractSignedCloudUrls(control)
     if (ctlExtracted.urls.length > 0) {
       return fail(
         'signed_url_control_minted',
-        ['negative_4xx_control'],
-        'Control exchange returned a signed cloud URL despite 4xx status; a clean negative control is required.',
+        ['negative_401_or_403_control'],
+        'Control exchange returned a signed cloud URL despite 401/403 status; a clean negative control is required.',
       )
     }
     if (!isUnauthenticatedExchange(probe)) {
@@ -1560,7 +1925,7 @@ export function assessSignedUrlMintDifferential(input: {
       confirmed: true,
       variant: 'unauth_write_mint',
       provider: writeUrl.provider,
-      reason: `Unauthenticated ${prbMethod} ${prbRoute} minted a write-capable ${writeUrl.provider} signed URL (${writeUrl.canonicalPathname}, ${writeUrl.signatureParam}) against a ${ctlStatus} negative control.`,
+      reason: `Unauthenticated ${prbMethod} ${prbRoute} minted a write-capable ${writeUrl.provider} signed URL (${writeUrl.canonicalPathname}, ${writeUrl.signatureParam}) against an anonymous ${ctlStatus} negative control.`,
       rejectedBy: null,
       missingEvidence: [],
       evidence: {
@@ -1582,8 +1947,78 @@ export function assessSignedUrlMintDifferential(input: {
   return fail(
     'signed_url_control_invalid',
     ['valid_control_exchange'],
-    `Control returned status ${ctlStatus ?? 'null'}; expected 2xx signed-URL control for key_traversal or 4xx negative control for unauth_write_mint.`,
+    `Control returned status ${ctlStatus ?? 'null'}; expected 2xx signed-URL control for key_traversal or 401/403 negative control for unauth_write_mint.`,
   )
+}
+
+// ---------------------------------------------------------------------------
+// R4-H-4 / R4-C-2: Worker-visible digest & challenge sanitization primitives
+// ---------------------------------------------------------------------------
+
+/**
+ * R4-H-4: Compute worker-facing `bodyBytes` and `bodySha256` strictly over the
+ * worker-visible vault-scrubbed body (NEVER over plaintext injected sealed values).
+ */
+export function computeWorkerVisibleBodyDigest(
+  rawBody: string | null | undefined,
+  scrubFn: (text: string) => string,
+): { scrubbedBody: string; bodyBytes: number; bodySha256: string } {
+  const scrubbedBody = rawBody ? scrubFn(rawBody) : ''
+  return {
+    scrubbedBody,
+    bodyBytes: Buffer.byteLength(scrubbedBody, 'utf8'),
+    bodySha256: createHash('sha256').update(scrubbedBody, 'utf8').digest('hex'),
+  }
+}
+
+const MAX_WORKER_PREVIEW_BODY_LEN = 512 * 1024
+
+/**
+ * R4-H-4 / R4-C-2: Defense-in-depth sanitizer applied inside `scrubRecord`:
+ *  1. Strips `expectedOutput`, `operandA`, `operandB`, `operator`, and `expressionSyntax`
+ *     from any worker-facing host-minted expression challenge object so workers never
+ *     receive challenge answers or operands.
+ *  2. Recomputes `bodySha256`/`bodyBytes` from an already-scrubbed sibling `body` field
+ *     whenever `body` is below the 512 KiB truncation cap, preventing raw digests from
+ *     slipping through any RPC summary.
+ *  3. Replaces any raw `observedValueDigests` hex entries with host-keyed HMAC digests.
+ */
+export function sanitizeWorkerFacingObject<T>(value: T, hmacKey: string): T {
+  const walk = (node: unknown, depth: number): unknown => {
+    if (depth > 16 || node === null || node === undefined || typeof node !== 'object') return node
+    if (Array.isArray(node)) return node.map(item => walk(item, depth + 1))
+    const rec = node as Record<string, unknown>
+    const isExprChallenge = typeof rec.challengeId === 'string'
+      && rec.challengeId.startsWith('expr_')
+      && ('expectedOutput' in rec || 'operandA' in rec || 'operandB' in rec || 'expressionSyntax' in rec)
+    if (isExprChallenge) {
+      return {
+        challengeId: rec.challengeId,
+        ...(typeof rec.family === 'string' ? { family: rec.family } : {}),
+        ...(typeof rec.mintedAtMs === 'number' ? { mintedAtMs: rec.mintedAtMs } : {}),
+      }
+    }
+    const out: Record<string, unknown> = {}
+    for (const [k, v] of Object.entries(rec)) {
+      if (k === 'observedValueDigests' && Array.isArray(v)) {
+        out[k] = v.map(item => (typeof item === 'string'
+          ? createHmac('sha256', hmacKey).update(item, 'utf8').digest('hex')
+          : walk(item, depth + 1)))
+        continue
+      }
+      out[k] = walk(v, depth + 1)
+    }
+    if (
+      typeof out.body === 'string'
+      && out.body.length < MAX_WORKER_PREVIEW_BODY_LEN
+      && ('bodySha256' in out || 'bodyBytes' in out)
+    ) {
+      if ('bodySha256' in out) out.bodySha256 = createHash('sha256').update(out.body, 'utf8').digest('hex')
+      if ('bodyBytes' in out) out.bodyBytes = Buffer.byteLength(out.body, 'utf8')
+    }
+    return out
+  }
+  return walk(value, 0) as T
 }
 
 // ---------------------------------------------------------------------------

@@ -255,15 +255,15 @@ test('P0 #2 Positive TP (Variant B) & Negative FP controls: Azure SAS write mint
   const origin = 'https://upload-app.example.test'
   const sasSig = Buffer.from(randomBytes(32)).toString('base64url')
 
-  // Variant B positive TP: 400 negative control vs unauthenticated 200 Azure SAS write URL
+  // Variant B positive TP (R4-C-6): anonymous 401 auth-denied control on same route & body vs unauthenticated 200 Azure SAS write URL
   const sasWrite = assessSignedUrlMintDifferential({
     control: {
       origin,
       method: 'POST',
       pathAndQuery: '/api/upload-token',
-      status: 400,
-      requestBody: JSON.stringify({}),
-      responseBody: JSON.stringify({ error: 'filename required' }),
+      status: 401,
+      requestBody: JSON.stringify({ filename: 'report.json' }),
+      responseBody: JSON.stringify({ error: 'authentication required' }),
     },
     probe: {
       origin,
@@ -286,9 +286,9 @@ test('P0 #2 Positive TP (Variant B) & Negative FP controls: Azure SAS write mint
       origin,
       method: 'POST',
       pathAndQuery: '/api/upload-token',
-      status: 400,
-      requestBody: '{}',
-      responseBody: '{"error":"missing"}',
+      status: 401,
+      requestBody: '{"filename":"report.json"}',
+      responseBody: '{"error":"authentication required"}',
     },
     probe: {
       origin,

@@ -34,65 +34,34 @@ import { buildPersonaHeader, personaSecrets } from './persona-vault.ts'
 import type { ResolvedPersona } from './persona-vault.ts'
 import { redact, type NamedSecret } from './redact.ts'
 import {
-  EgressSanitizer,
-  checkSealRateLimit,
-  extractRequestEntityIds,
-  normalizeDerivedSecretKind,
-  resolveSealJsonPath,
-  toPublicCapabilityMeta,
-  validateCapabilitySealValue,
+  EgressSanitizer, checkSealRateLimit, extractRequestEntityIds, normalizeDerivedSecretKind,
+  resolveSealJsonPath, toPublicCapabilityMeta, validateCapabilitySealValue,
 } from './egress-sanitizer.ts'
 import { defaultRequestAdmissionEngine, type RequestAdmissionEngine } from './request-admission.ts'
 import {
-  DerivedCapabilityVault,
-  SEAL_FIELD_NOT_FOUND_ERROR,
-  SEAL_REGEX_RETIRED_ERROR,
-  awaitAsyncConvergence,
-  computeNonSecretLiteralHmac,
-  consumeRunCompositeVerifyBudget,
-  consumeRunSealBudget,
-  formatDerivedHandle,
-  isDerivedCapabilityHandle,
-  resolveVerifyRpcScratchRoot,
+  DerivedCapabilityVault, SEAL_FIELD_NOT_FOUND_ERROR, SEAL_REGEX_RETIRED_ERROR, awaitAsyncConvergence,
+  computeNonSecretLiteralHmac, consumeRunCompositeVerifyBudget, consumeRunSealBudget, formatDerivedHandle,
+  isDerivedCapabilityHandle, resolveVerifyRpcScratchRoot,
 } from './derived-custody.ts'
 import { resolveRunSafetyBudgets, type RunSafetyBudgets } from './run-safety-budgets.ts'
 import type {
-  AsyncPollProfile,
-  CapabilityConsumptionAttestation,
-  CapabilitySourceProvenance,
-  HostHmacAlg,
-  HostHmacEncoding,
-  HostJwtAlg,
-  InjectCapabilityTarget,
+  AsyncPollProfile, CapabilityConsumptionAttestation, CapabilitySourceProvenance,
+  HostHmacAlg, HostHmacEncoding, HostJwtAlg, InjectCapabilityTarget,
 } from './derived-custody.ts'
 import { signHostRecord, verifyHostRecordSignature } from './composite-receipt.ts'
 import type {
-  CompositeReceiptVerification,
-  CompositeVerifyOptions,
-  HostAsyncPollRecord,
-  HostBrowserTrace,
-  HostCryptoAttestation,
-  HostOobEvent,
-  HostSignableRecord,
-  HostSignedTranscript,
-  HostTranscriptEntry,
+  CompositeReceiptVerification, CompositeVerifyOptions, HostAsyncPollRecord, HostBrowserTrace,
+  HostCryptoAttestation, HostOobEvent, HostSignableRecord, HostSignedTranscript, HostTranscriptEntry,
 } from './composite-receipt.ts'
 import { HostFactLog, deriveAmbientAuthFromHeaders } from './host-fact-log.ts'
 import { defaultTerminalOracleRegistry } from './terminal-oracle-registry.ts'
 import { isReadMethod, normalizeRole, parseRoleLabel } from './oracle-invariants.ts'
 import type { ImpactStep } from './oracle-invariants.ts'
 import {
-  buildHostAuthPlacement,
-  compileAsyncMatchPredicate,
-  consumeRunAsyncPollAttemptBudget,
-  consumeRunAsyncPollCallBudget,
-  evaluateAsyncMatchPredicate,
-  parseCapabilityArg,
-  parseVerifyAuthMutation,
-  resolvePersonaAuthKind,
-  resolveScopedBrowserDriverForVerify,
-  type HostAuthPlacement,
-  type ParsedCapabilityArg,
+  buildHostAuthPlacement, compileAsyncMatchPredicate, computeWorkerVisibleBodyDigest,
+  consumeRunAsyncPollAttemptBudget, consumeRunAsyncPollCallBudget, evaluateAsyncMatchPredicate,
+  parseCapabilityArg, parseVerifyAuthMutation, resolvePersonaAuthKind, resolveScopedBrowserDriverForVerify,
+  sanitizeWorkerFacingObject, type HostAuthPlacement, type ParsedCapabilityArg,
 } from './verify-support.ts'
 
 declare module './verify-claims.ts' {
@@ -126,15 +95,10 @@ import type {
   VerifyOobPromotionView,
 } from './verify-claims.ts'
 import {
-  handleProveAccessBoundary,
-  handleProvePersistedMutation,
-  handleProveDifferential,
-  handleProveOob,
-  handleProveRace,
-  handleProveInjection,
-  handleProveSignedUrlMint,
+  handleProveAccessBoundary, handleProvePersistedMutation, handleProveDifferential,
+  handleProveOob, handleProveRace, handleProveInjection, handleProveSignedUrlMint,
 } from './verify-prove-handlers.ts'
-import type { ProveHandlerHost, ProveHttpExchangeResult } from './verify-prove-handlers.ts'
+import type { ProveHandlerHost, ProveHttpExchangeResult, ProveHttpExchangeStamps } from './verify-prove-handlers.ts'
 import { buildLocalAttemptFactory } from './verify-runner.ts'
 import type { LocalAttemptFactoryBaseOptions } from './verify-runner.ts'
 
@@ -593,15 +557,19 @@ export class VerifyRpcServer {
       const id = typeof args.exchangeId === 'string' ? args.exchangeId : ''
       const record = this.transcript.get(id)
       if (!record) throw new Error('Unknown exchange id.')
-      const rawBody = this.transcript.body(id)
-      const scrubbedBody = rawBody !== undefined ? redact(this.scrub(rawBody)) : null
-      // R3-H-2: Worker-facing bodySha256/bodyBytes reflect ONLY the worker-visible scrubbed body.
-      const safeRecord = record.response && scrubbedBody !== null
-        ? { ...record, response: { ...record.response, bodySha256: createHash('sha256').update(scrubbedBody, 'utf8').digest('hex'), bodyBytes: Buffer.byteLength(scrubbedBody, 'utf8') } }
-        : record
+      const rawBody = this.rawBodies.get(id) ?? this.transcript.body(id)
+      const respDig = rawBody !== undefined ? this.workerBodyDigest(rawBody) : null
+      const rawReqBody = this.exchangeProvenance.get(id)?.rawRequestBody ?? this.transcript.requestBody(id)
+      const reqDig = rawReqBody !== undefined ? this.workerBodyDigest(rawReqBody) : null
+      // R3-H-2 / R4-H-4: Worker-facing request & response bodySha256/bodyBytes reflect ONLY worker-visible scrubbed bodies.
+      const safeRecord = {
+        ...record,
+        ...(record.request && reqDig ? { request: { ...record.request, bodySha256: reqDig.bodySha256, bodyBytes: reqDig.bodyBytes } } : {}),
+        ...(record.response && respDig ? { response: { ...record.response, bodySha256: respDig.bodySha256, bodyBytes: respDig.bodyBytes } } : {}),
+      }
       return this.scrubRecord({
         record: safeRecord,
-        body: scrubbedBody,
+        body: respDig ? respDig.scrubbedBody : null,
         digest: this.transcript.digest(),
         signaturesValid: this.transcript.verifySignatures(),
       })
@@ -691,6 +659,7 @@ export class VerifyRpcServer {
       runId: this.options.runId,
       assignmentId: this.options.assignmentId,
     }
+    const initialReqDig = this.workerBodyDigest(body)
     return {
       brokerRequest,
       requestMeta: {
@@ -698,8 +667,8 @@ export class VerifyRpcServer {
         method,
         pathAndQuery: rawPath,
         headers,
-        bodyBytes: body ? Buffer.byteLength(body) : 0,
-        bodySha256: createHash('sha256').update(body ?? '').digest('hex'),
+        bodyBytes: initialReqDig.bodyBytes,
+        bodySha256: initialReqDig.bodySha256,
         personaHandle: persona ?? null,
         sessionRole: role ?? null,
         actorRoleLabel: (persona ? this.options.grant.personas?.get(persona)?.roleLabel ?? null : null),
@@ -708,13 +677,9 @@ export class VerifyRpcServer {
     }
   }
 
-  private scrub(text: string): string {
-    return this.egress.redactText(text, 'worker_rpc')
-  }
-
-  private scrubRecord<T>(value: T): T {
-    return this.egress.sanitizeValue(value, 'worker_rpc')
-  }
+  private scrub(text: string): string { return this.egress.redactText(text, 'worker_rpc') }
+  private workerBodyDigest(rawBody: string | null | undefined) { return computeWorkerVisibleBodyDigest(rawBody, text => redact(this.scrub(text))) }
+  private scrubRecord<T>(value: T): T { return sanitizeWorkerFacingObject(this.egress.sanitizeValue(value, 'worker_rpc'), this.compositeSigningKey) }
 
   private scrubKernel(text: string): string {
     // R3-C-3: Kernel request plane uses exact host/persona/grant secret scrubbing ONLY — zero
@@ -1051,16 +1016,15 @@ export class VerifyRpcServer {
       ...(Object.keys(nextHeaders).length > 0 ? { headers: nextHeaders } : { headers: undefined }),
       ...(effectivePersona ? { persona: effectivePersona, personaHandle: undefined } : {}),
     }
+    const nextBodyDig = nextBody !== baseReq.body ? this.workerBodyDigest(nextBody) : null
     const nextMeta: VerifyTranscriptRequest = {
       ...requestMeta,
       origin: nextOrigin,
       pathAndQuery: this.scrubKernel(nextPathAndQuery),
       headers: this.scrubKernelHeaderMap(metaHeaders),
       ...(authCapabilityActor ? { personaHandle: authCapabilityActor.handle, actorRoleLabel: authCapabilityActor.roleLabel } : {}),
-      ...(nextBody !== baseReq.body ? {
-        bodyBytes: nextBody ? Buffer.byteLength(nextBody) : 0,
-        bodySha256: createHash('sha256').update(this.scrubKernel(nextBody ?? '')).digest('hex'),
-      } : {}),
+      // R4-H-4: Compute request bodyBytes/bodySha256 strictly over worker-visible vault-scrubbed body.
+      ...(nextBodyDig ? { bodyBytes: nextBodyDig.bodyBytes, bodySha256: nextBodyDig.bodySha256 } : {}),
       consumedCapabilityId: attestations[0]!.consumedCapabilityId,
     }
     return {
@@ -1177,10 +1141,8 @@ export class VerifyRpcServer {
     derivedFromCapabilityIds?: string[]
     protocol?: 'h2'
   }) {
-    // R2-H-4 / R3-H-2: Always redact FULL raw body before slicing, and hash ONLY the worker-visible scrubbed body.
-    const scrubbedFullBody = redact(this.scrub(result.body))
-    const workerBodySha256 = createHash('sha256').update(scrubbedFullBody, 'utf8').digest('hex')
-    const workerBodyBytes = Buffer.byteLength(scrubbedFullBody, 'utf8')
+    // R2-H-4 / R3-H-2 / R4-H-4: Always redact FULL raw body before slicing, and hash ONLY the worker-visible scrubbed body.
+    const { scrubbedBody: scrubbedFullBody, bodySha256: workerBodySha256, bodyBytes: workerBodyBytes } = this.workerBodyDigest(result.body)
     const previewLimit = Math.min(Math.max(result.bodyPreview.length || 512, 0), 4096)
     return this.scrubRecord({
       exchangeId: record.exchangeId,
@@ -1250,7 +1212,21 @@ export class VerifyRpcServer {
     return { applied, consumedIds, cryptoAttestations, derivedFromCapabilityIds, requestMeta, sessionKey, ...control }
   }
 
-  private async handleHttp(args: Record<string, unknown>, nonce: string, proto: 'http' | 'http2'): Promise<unknown> {
+  private exchangeViewFromTranscript(exchangeId: string): ProveHttpExchangeResult | null {
+    const rec = this.transcript.get(exchangeId)
+    if (!rec?.request) return null
+    const rawBody = this.rawBodies.get(exchangeId) ?? this.transcript.body(exchangeId) ?? ''
+    const { scrubbedBody, bodyBytes, bodySha256 } = this.workerBodyDigest(rawBody)
+    const rawHeaders = this.rawResponseHeaders.get(exchangeId) ?? rec.response?.headers ?? {}
+    return this.scrubRecord({
+      exchangeId: rec.exchangeId, status: rec.response?.status ?? 0, method: rec.request.method,
+      pathAndQuery: this.scrub(rec.request.pathAndQuery), headers: this.egress.sanitizeHttpHeaders(rawHeaders, 'worker_rpc'),
+      body: scrubbedBody.slice(0, 512 * 1024), bodyPreview: scrubbedBody.slice(0, 512),
+      bodyBytes, bodySha256, durationMs: rec.durationMs, personaHandle: rec.request.personaHandle ?? null,
+    })
+  }
+
+  private async handleHttp(args: Record<string, unknown>, nonce: string, proto: 'http' | 'http2', hostStamps?: ProveHttpExchangeStamps): Promise<unknown> {
     const prep = this.prepareCapRequest(args, nonce)
     const started = this.nextHostTimestampMs()
     const signal = AbortSignal.timeout(this.options.callTimeoutMs ?? 30_000)
@@ -1268,6 +1244,8 @@ export class VerifyRpcServer {
       const record = this.transcript.record({
         op: proto, startedAt: started, durationMs: result.durationMs, request: stampedReqMeta, body: result.body,
         ...(prep.applied.brokerRequest.body !== undefined ? { rawRequestBody: this.scrubKernel(prep.applied.brokerRequest.body) } : {}),
+        ...(hostStamps?.hostExpressionChallenge ? { hostExpressionChallenge: hostStamps.hostExpressionChallenge } : {}),
+        ...(hostStamps?.hostBooleanPair ? { hostBooleanPair: hostStamps.hostBooleanPair } : {}),
         response: {
           status: result.status, headers: kernelHeaders, bodyBytes: result.bodyBytes,
           bodySha256: result.bodySha256, mediaType: result.mediaType, redirectOrigins: result.redirectOrigins,
@@ -2185,6 +2163,8 @@ export class VerifyRpcServer {
         ...(prov?.cleanSession !== undefined ? { cleanSession: prov.cleanSession } : {}),
         ...(prov?.replayAttempt ? { replayAttempt: prov.replayAttempt } : {}),
         ...(prov?.raceBatchId ? { raceBatchId: prov.raceBatchId } : {}),
+        ...(record.hostExpressionChallenge ? { hostExpressionChallenge: record.hostExpressionChallenge } : {}),
+        ...(record.hostBooleanPair ? { hostBooleanPair: record.hostBooleanPair } : {}),
       }
       entries.push(sign(entry))
     }
@@ -2274,13 +2254,12 @@ export class VerifyRpcServer {
 
   private proveHost(): ProveHandlerHost {
     return {
-      transcript: this.transcript,
-      defaultOrigin: this.options.targetOrigins?.[0],
+      transcript: this.transcript, defaultOrigin: this.options.targetOrigins?.[0],
       canaryBroker: this.options.canary ?? (this.options.grant as Grant & { canaryBroker?: VerifyCanaryBroker }).canaryBroker,
       diffDigestKey: this.compositeSigningKey,
-      runHttpExchange: async (args, nonce) => await this.handleHttp(args, nonce, 'http') as ProveHttpExchangeResult,
-      runOob: args => this.handleOob(args),
-      runRace: (args, nonce) => this.handleRace(args, nonce),
+      runHttpExchange: async (args, nonce, stamps) => await this.handleHttp(args, nonce, 'http', stamps) as ProveHttpExchangeResult,
+      exchangeViewFromTranscript: id => this.exchangeViewFromTranscript(id),
+      runOob: args => this.handleOob(args), runRace: (args, nonce) => this.handleRace(args, nonce),
       scrubRecord: value => this.scrubRecord(value),
     }
   }
