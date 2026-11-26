@@ -69,9 +69,11 @@ export interface ProgramRoute {
   extraction: ProgramExtractionMode
 }
 
+export type ProgramNodeKind = 'route' | 'function' | 'middleware' | 'sink' | 'service_endpoint' | 'async_channel'
+
 export interface ProgramNode {
   id: string
-  kind: 'route' | 'function' | 'middleware' | 'sink'
+  kind: ProgramNodeKind
   symbol: string
   file: string
   line: number
@@ -83,11 +85,23 @@ export interface ProgramNode {
   calls: string[]
 }
 
+export type ProgramEdgeKind = 'route_handler' | 'call' | 'sink' | 'client_call' | 'async_dispatch'
+
 export interface ProgramEdge {
   fromId: string
   toId: string
   file: string
   line: number
+  /** Structural edge kind (`client_call` and `async_dispatch` connect cross-service/async chains). */
+  kind?: ProgramEdgeKind
+  /** Transport/channel protocol for cross-service and async edges. */
+  protocol?: 'http' | 'rpc' | 'grpc' | 'queue' | 'webhook' | 'job' | 'event'
+  /** Target service hint for cross-service calls (hostname, env var, RPC client). */
+  targetService?: string
+  /** Target route/endpoint path for cross-service calls. */
+  targetPath?: string
+  /** Queue, topic, event, job, or webhook channel name for async dispatches. */
+  channel?: string
 }
 
 export interface ProgramGraph {
@@ -354,8 +368,10 @@ function stringListValue(token: string | undefined): string[] {
 
 const MAX_ROUTER_MOUNT_DEPTH = 12
 const MAX_ROUTER_MOUNT_STEPS = 10_000
+const MAX_MOUNTS_PER_ROUTER = 64
 const MAX_MOUNT_PATH_LENGTH = 2048
 const MAX_MOUNTED_ROUTES = 5000
+const MAX_CROSS_SERVICE_EDGES = 2000
 const MAX_RAW_ROUTES_PER_FILE = 1000
 const MAX_RAW_ROUTE_BYTES_PER_FILE = 512 * 1024
 const MAX_MOUNTS_PER_FILE = 500
@@ -2218,13 +2234,33 @@ function resolveMountedRoutes(extractions: readonly Extraction[]): { routes: Pro
   const mountsByParent = new Map<string, Array<{ mount: MountSpec; child: RouterDef }>>()
   const hasParent = new Set<string>()
   let cycleWarnings = 0
+  let unresolvedWarnings = 0
+  let mountFanoutWarned = false
   let depthWarned = false
   let stepsWarned = false
   let pathWarned = false
 
+  const looksLikeRouterMountTarget = (mount: MountSpec): boolean =>
+    Boolean(mount.childKey)
+    || Boolean(mount.childFile && mount.childFile !== mount.file)
+    || /(?:router|routes|controller|subapp|blueprint|urls|api|v\d+)/i.test(mount.childName)
+
   for (const mount of mounts) {
     const child = resolveChild(mount)
-    if (!child || !mount.parentKey || !routers.has(mount.parentKey)) continue
+    if (!mount.parentKey || !routers.has(mount.parentKey)) {
+      if (unresolvedWarnings < 20) {
+        pushWarn(`Unresolved router mount parent "${mount.parentName}" -> "${mount.childName}" (${mount.prefix || '/'}) at ${mount.file}:${mount.line}`)
+        unresolvedWarnings += 1
+      }
+      continue
+    }
+    if (!child) {
+      if (looksLikeRouterMountTarget(mount) && unresolvedWarnings < 20) {
+        pushWarn(`Unresolved router mount target "${mount.childName}" (${mount.prefix || '/'}) at ${mount.file}:${mount.line}`)
+        unresolvedWarnings += 1
+      }
+      continue
+    }
     if (child.key === mount.parentKey) {
       if (cycleWarnings < 10) {
         pushWarn(`Skipped self-mounting router cycle on ${child.key} at ${mount.file}:${mount.line}`)
@@ -2238,10 +2274,12 @@ function resolveMountedRoutes(extractions: readonly Extraction[]): { routes: Pro
     hasParent.add(child.key)
   }
 
-  const bases = new Map<string, string>()
-  for (const router of routers.values()) bases.set(router.key, router.prefix)
-  const mountChain = new Map<string, MountSpec[]>()
-  const settled = new Set<string>()
+  // Key mount expansion by `(mountPath, childKey)` rather than global `settled.has(childKey)` so a
+  // shared sub-router mounted at multiple prefixes (e.g., `/v1` + `/v2`, `/org` + `/admin`) retains
+  // every mounted prefix & guard chain. Cycles are blocked strictly along `pathVisited`.
+  const mountsByRouter = new Map<string, Array<{ base: string; chain: MountSpec[] }>>()
+  const visitedMounts = new Set<string>()
+  const reachedRouters = new Set<string>()
   let steps = 0
 
   const walk = (
@@ -2258,10 +2296,22 @@ function resolveMountedRoutes(extractions: readonly Extraction[]): { routes: Pro
       }
       return
     }
+    const mountInstanceKey = `${currentBase}\0${routerKey}`
+    if (visitedMounts.has(mountInstanceKey)) return
+    visitedMounts.add(mountInstanceKey)
+    reachedRouters.add(routerKey)
     steps += 1
-    settled.add(routerKey)
-    bases.set(routerKey, currentBase)
-    mountChain.set(routerKey, chain)
+
+    const existingInstances = mountsByRouter.get(routerKey) ?? []
+    if (existingInstances.length >= MAX_MOUNTS_PER_ROUTER) {
+      if (!mountFanoutWarned) {
+        pushWarn(`Router mount fan-out capped at ${MAX_MOUNTS_PER_ROUTER} prefixes for ${routerKey}`)
+        mountFanoutWarned = true
+      }
+      return
+    }
+    existingInstances.push({ base: currentBase, chain })
+    mountsByRouter.set(routerKey, existingInstances)
 
     if (depth >= MAX_ROUTER_MOUNT_DEPTH) {
       if (!depthWarned && (mountsByParent.get(routerKey)?.length ?? 0) > 0) {
@@ -2281,7 +2331,6 @@ function resolveMountedRoutes(extractions: readonly Extraction[]): { routes: Pro
         }
         continue
       }
-      if (settled.has(child.key)) continue
       const stepBase = joinPathsBounded(currentBase, mount.prefix)
       const nextBase = stepBase !== null ? joinPathsBounded(stepBase, child.prefix) : null
       if (nextBase === null) {
@@ -2291,6 +2340,7 @@ function resolveMountedRoutes(extractions: readonly Extraction[]): { routes: Pro
         }
         continue
       }
+      if (visitedMounts.has(`${nextBase}\0${child.key}`)) continue
       pathVisited.add(child.key)
       walk(child.key, nextBase, [...chain, mount], pathVisited, depth + 1)
       pathVisited.delete(child.key)
@@ -2299,23 +2349,23 @@ function resolveMountedRoutes(extractions: readonly Extraction[]): { routes: Pro
 
   // First traverse from zero-in-degree root routers (normal apps & lassos).
   for (const router of routers.values()) {
-    if (hasParent.has(router.key) || settled.has(router.key)) continue
+    if (hasParent.has(router.key) || reachedRouters.has(router.key)) continue
     walk(router.key, router.prefix, [], new Set([router.key]), 0)
   }
   // Then traverse any remaining pure-cycle components without an external root.
   for (const router of routers.values()) {
-    if (settled.has(router.key)) continue
+    if (reachedRouters.has(router.key)) continue
     walk(router.key, router.prefix, [], new Set([router.key]), 0)
   }
 
   // Share precomputed router+mount middleware/guards/mountedFrom arrays by reference across routes
-  // instead of cloning them per route (`R2-H-25`).
+  // within each `(routerKey, mountInstanceIdx)` instead of cloning them per route (`R2-H-25`).
   const routerSharedCache = new Map<string, { middleware: string[]; guards: string[]; mountedFrom: string[] }>()
-  const getRouterShared = (routerKey: string) => {
-    let cached = routerSharedCache.get(routerKey)
+  const getRouterShared = (routerKey: string, instanceIdx: number, chain: MountSpec[]) => {
+    const cacheKey = `${routerKey}\0${instanceIdx}`
+    let cached = routerSharedCache.get(cacheKey)
     if (cached) return cached
     const router = routers.get(routerKey)
-    const chain = mountChain.get(routerKey) ?? []
     const mwSeen = new Set<string>()
     const mw: string[] = []
     const pushMw = (list: readonly string[]) => {
@@ -2340,7 +2390,7 @@ function resolveMountedRoutes(extractions: readonly Extraction[]): { routes: Pro
       guards,
       mountedFrom: mountedFrom.length > 0 ? mountedFrom : EMPTY_STRINGS,
     }
-    routerSharedCache.set(routerKey, cached)
+    routerSharedCache.set(cacheKey, cached)
     return cached
   }
 
@@ -2356,49 +2406,61 @@ function resolveMountedRoutes(extractions: readonly Extraction[]): { routes: Pro
         }
         break
       }
-      const base = raw.routerKey ? bases.get(raw.routerKey) ?? '' : ''
-      const path = raw.routerKey
-        ? joinPathsBounded(base, raw.path)
-        : (raw.path.length <= MAX_MOUNT_PATH_LENGTH ? raw.path : null)
-      if (path === null) {
-        if (!pathWarned) {
-          pushWarn(`Skipped mounted path exceeding ${MAX_MOUNT_PATH_LENGTH} chars at ${raw.file}:${raw.line}`)
-          pathWarned = true
+      const mountInstances = raw.routerKey
+        ? (mountsByRouter.get(raw.routerKey) ?? [{ base: routers.get(raw.routerKey)?.prefix ?? '', chain: [] }])
+        : [{ base: '', chain: [] }]
+      for (let instanceIdx = 0; instanceIdx < mountInstances.length; instanceIdx += 1) {
+        if (routes.length >= MAX_MOUNTED_ROUTES) {
+          if (!routeCapWarned) {
+            pushWarn(`Mounted routes capped at ${MAX_MOUNTED_ROUTES}`)
+            routeCapWarned = true
+          }
+          break
         }
-        continue
+        const instance = mountInstances[instanceIdx]!
+        const path = raw.routerKey
+          ? joinPathsBounded(instance.base, raw.path)
+          : (raw.path.length <= MAX_MOUNT_PATH_LENGTH ? raw.path : null)
+        if (path === null) {
+          if (!pathWarned) {
+            pushWarn(`Skipped mounted path exceeding ${MAX_MOUNT_PATH_LENGTH} chars at ${raw.file}:${raw.line}`)
+            pathWarned = true
+          }
+          continue
+        }
+        const shared = raw.routerKey ? getRouterShared(raw.routerKey, instanceIdx, instance.chain) : undefined
+        const mountedFrom = shared ? shared.mountedFrom : EMPTY_STRINGS
+        const middleware = shared
+          ? mergeBoundedUnique(shared.middleware, raw.middleware, MAX_MIDDLEWARE_PER_ROUTE)
+          : (raw.middleware.length > MAX_MIDDLEWARE_PER_ROUTE ? raw.middleware.slice(0, MAX_MIDDLEWARE_PER_ROUTE) : raw.middleware)
+        const rawGuards = raw.guards.length > 0 ? raw.guards : guardsFromMiddleware(raw.middleware)
+        const guards = shared
+          ? mergeBoundedUnique(shared.guards, rawGuards, MAX_MIDDLEWARE_PER_ROUTE)
+          : (rawGuards.length > MAX_MIDDLEWARE_PER_ROUTE ? rawGuards.slice(0, MAX_MIDDLEWARE_PER_ROUTE) : rawGuards)
+        const id = `route:${raw.method}:${path}:${raw.file}:${raw.line}`
+        if (seen.has(id)) continue
+        seen.add(id)
+        const pathParams = routeParamNames(path)
+        const mergedParams = raw.input.params.length === 0
+          ? pathParams
+          : pathParams.length === 0
+            ? raw.input.params
+            : mergeBoundedUnique(raw.input.params, pathParams, 32)
+        routes.push({
+          id,
+          framework: raw.framework,
+          method: raw.method,
+          path,
+          file: raw.file,
+          line: raw.line,
+          handler: raw.handler,
+          input: mergedParams === raw.input.params ? raw.input : { ...raw.input, params: mergedParams },
+          middleware,
+          guards,
+          mountedFrom,
+          extraction: raw.extraction,
+        })
       }
-      const shared = raw.routerKey ? getRouterShared(raw.routerKey) : undefined
-      const mountedFrom = shared ? shared.mountedFrom : EMPTY_STRINGS
-      const middleware = shared
-        ? mergeBoundedUnique(shared.middleware, raw.middleware, MAX_MIDDLEWARE_PER_ROUTE)
-        : (raw.middleware.length > MAX_MIDDLEWARE_PER_ROUTE ? raw.middleware.slice(0, MAX_MIDDLEWARE_PER_ROUTE) : raw.middleware)
-      const rawGuards = raw.guards.length > 0 ? raw.guards : guardsFromMiddleware(raw.middleware)
-      const guards = shared
-        ? mergeBoundedUnique(shared.guards, rawGuards, MAX_MIDDLEWARE_PER_ROUTE)
-        : (rawGuards.length > MAX_MIDDLEWARE_PER_ROUTE ? rawGuards.slice(0, MAX_MIDDLEWARE_PER_ROUTE) : rawGuards)
-      const id = `route:${raw.method}:${path}:${raw.file}:${raw.line}`
-      if (seen.has(id)) continue
-      seen.add(id)
-      const pathParams = routeParamNames(path)
-      const mergedParams = raw.input.params.length === 0
-        ? pathParams
-        : pathParams.length === 0
-          ? raw.input.params
-          : mergeBoundedUnique(raw.input.params, pathParams, 32)
-      routes.push({
-        id,
-        framework: raw.framework,
-        method: raw.method,
-        path,
-        file: raw.file,
-        line: raw.line,
-        handler: raw.handler,
-        input: mergedParams === raw.input.params ? raw.input : { ...raw.input, params: mergedParams },
-        middleware,
-        guards,
-        mountedFrom,
-        extraction: raw.extraction,
-      })
     }
     if (routes.length >= MAX_MOUNTED_ROUTES) break
   }
@@ -2460,7 +2522,7 @@ function buildGraph(
     }
     nodes.push(node)
     if (handlerFn) {
-      edges.push({ fromId: route.id, toId: fnId(handlerFn), file: route.file, line: route.line })
+      edges.push({ fromId: route.id, toId: fnId(handlerFn), file: route.file, line: route.line, kind: 'route_handler' })
     }
   }
 
@@ -2484,7 +2546,7 @@ function buildGraph(
       }
       sinkNodes.push(sink)
       nodes.push(sink)
-      edges.push({ fromId: fnId(fn), toId: sink.id, file: fn.file, line })
+      edges.push({ fromId: fnId(fn), toId: sink.id, file: fn.file, line, kind: 'sink' })
     }
   }
 
@@ -2572,10 +2634,25 @@ function buildGraph(
         target = fnByName.get(call)![0]
       }
       if (!target || (target.name === fn.name && target.file === fn.file)) continue
-      edges.push({ fromId: fnId(fn), toId: fnId(target), file: fn.file, line: fn.line })
+      edges.push({ fromId: fnId(fn), toId: fnId(target), file: fn.file, line: fn.line, kind: 'call' })
       edgeCount += 1
     }
   }
+
+  // First-class cross-service HTTP/RPC (`client_call`) and async queue/webhook/job (`async_dispatch`) edges.
+  extractCrossServiceAndAsyncEdges({
+    files,
+    functions,
+    routes,
+    nodes,
+    edges,
+    fnByFile,
+    fnByName,
+    fnId,
+    contentByFile,
+    newlineOffsetsByFile,
+    warningsOut,
+  })
 
   const frameworks = [...new Set(routes.map(r => r.framework))]
   if (routes.some(r => r.framework === 'unknown')) warningsOut.push('Some routes were extracted with unknown framework.')
@@ -2592,6 +2669,392 @@ function buildGraph(
     warnings: warningsOut,
     ...(Object.keys(codeHints).length ? { codeHints } : {}),
     ...(staticLeads.length ? { staticLeads } : {}),
+  }
+}
+
+// ============================================================================
+// Cross-service HTTP/RPC (`client_call`) & async (`async_dispatch`) edges
+// ============================================================================
+
+interface CrossServiceExtractContext {
+  files: ReadonlyArray<{ path: string; content: string }>
+  functions: readonly ProgramFunction[]
+  routes: readonly ProgramRoute[]
+  nodes: ProgramNode[]
+  edges: ProgramEdge[]
+  fnByFile: ReadonlyMap<string, ReadonlyMap<string, ProgramFunction>>
+  fnByName: ReadonlyMap<string, readonly ProgramFunction[]>
+  fnId: (fn: ProgramFunction) => string
+  contentByFile: ReadonlyMap<string, string>
+  newlineOffsetsByFile: Map<string, number[]>
+  warningsOut: string[]
+}
+
+const CLIENT_HTTP_URL_RE = /\b(?:fetch|axios(?:\.(?:get|post|put|patch|delete|request))?|got(?:\.(?:get|post|put|patch|delete))?|superagent(?:\.(?:get|post|put|patch|delete))?|http\.(?:get|request|Get|Post|NewRequest)|https\.(?:get|request)|requests\.(?:get|post|put|patch|delete|request)|session\.(?:get|post|put|patch|delete)|RestTemplate\.\w{1,24}|WebClient\.\w{1,24})[ \t]{0,8}\([ \t]{0,8}(['"`])([^'"`\r\n]{1,320})\1/g
+const CLIENT_RPC_CALL_RE = /\b([A-Za-z_$][\w$]{0,63}(?:Client|Stub|Rpc|Service|Proxy))[ \t]{0,4}\.[ \t]{0,4}([A-Za-z_$][\w$]{1,63})[ \t]{0,4}\(/g
+const CLIENT_TRPC_CALL_RE = /\btrpc[ \t]{0,4}\.[ \t]{0,4}([A-Za-z_$][\w$]{0,63})[ \t]{0,4}\.[ \t]{0,4}([A-Za-z_$][\w$]{0,63})[ \t]{0,4}\.[ \t]{0,4}(?:mutate|query)[ \t]{0,4}\(/g
+const ASYNC_PRODUCER_CHANNEL_RE = /\b(?:[A-Za-z_$][\w$]{0,63}\.)?(?:sendToQueue|publish|basic_publish|enqueue|add_task|send_task|convertAndSend|emit|dispatchWebhook|sendWebhook|triggerWebhook|deliverWebhook|NewTask)[ \t]{0,8}\([ \t]{0,8}(['"`])([^'"`\r\n]{1,160})\1/g
+const ASYNC_QUEUE_ADD_RE = /\b([A-Za-z_$][\w$]{0,63}(?:Queue|Bus|Broker|Topic|Producer|Publisher|Events?|Jobs?|Tasks?|Worker|Sqs|Kafka|Rabbit|Nats|Amqp|Redis))[ \t]{0,4}\.[ \t]{0,4}(?:add|send|publish|emit|enqueue|sendMessage|putEvents)[ \t]{0,8}\([ \t]{0,8}(?:(['"`])([^'"`\r\n]{1,160})\2|\{[^{}\r\n]{0,200}\b(?:topic|queue|channel|event|name|QueueUrl)[ \t]{0,4}:[ \t]{0,4}(['"`])([^'"`\r\n]{1,160})\3)/gi
+const ASYNC_CELERY_DELAY_RE = /\b([A-Za-z_][\w]{1,63})\.(?:delay|apply_async|perform_async|perform_later)[ \t]{0,4}\(/g
+const ASYNC_WEBHOOK_CALL_RE = /\b(?:dispatchWebhook|sendWebhook|triggerWebhook|deliverWebhook|postWebhook|fireWebhook)[ \t]{0,8}\(/g
+
+const ASYNC_CONSUMER_CALL_RE = /\b(?:[A-Za-z_$][\w$]{0,63}\.)?(?:process|consume|subscribe|on|handle|registerHandler|registerTask|listen)[ \t]{0,8}\([ \t]{0,8}(?:(['"`])([^'"`\r\n]{1,160})\1|\{[^{}\r\n]{0,160}\b(?:topic|queue|channel|event|name)[ \t]{0,4}:[ \t]{0,4}(['"`])([^'"`\r\n]{1,160})\2)[ \t]{0,8},[ \t]{0,8}([A-Za-z_$][\w$]{0,127})/g
+const ASYNC_DECORATOR_CONSUMER_RE = /@(?:KafkaListener|RabbitListener|SqsListener|EventPattern|MessagePattern|Cron|Task|shared_task|celery\.task)[ \t]{0,8}\(([^)\r\n]{0,200})\)/g
+
+function serviceRootOfFile(filePath: string): string {
+  const parts = filePath.replaceAll('\\', '/').split('/').filter(Boolean)
+  if (parts.length >= 2 && /^(?:services|apps|packages|microservices|workers)$/i.test(parts[0]!)) {
+    return `${parts[0]}/${parts[1]}`.toLowerCase()
+  }
+  return (parts[0] ?? '').toLowerCase()
+}
+
+function parseClientTarget(rawUrl: string): { targetService?: string; targetPath?: string; isWebhook?: boolean } | null {
+  const trimmed = rawUrl.trim()
+  if (!trimmed || trimmed.length > 320) return null
+  let targetService: string | undefined
+  let rawPath = ''
+
+  if (/^https?:\/\//i.test(trimmed)) {
+    // Strip template interpolations inside host/path cleanly without dynamic regex.
+    const cleanForUrl = trimmed.replace(/\$\{[^}]{1,80}\}/g, ':param')
+    try {
+      const parsed = new URL(cleanForUrl)
+      targetService = parsed.hostname.toLowerCase()
+      rawPath = parsed.pathname || '/'
+    } catch {
+      return null
+    }
+  } else if (trimmed.startsWith('${')) {
+    const closeBrace = trimmed.indexOf('}')
+    if (closeBrace < 0) return null
+    const envHint = trimmed.slice(2, closeBrace).trim()
+    const svcHint = envHint
+      .replace(/^process\.env\./, '')
+      .replace(/(?:_URL|_BASE_URL|_ORIGIN|_HOST|_ENDPOINT|_SERVICE)$/i, '')
+      .replace(/[^A-Za-z0-9_-]+/g, '')
+      .toLowerCase()
+    if (svcHint) targetService = svcHint
+    rawPath = trimmed.slice(closeBrace + 1).replace(/\$\{[^}]{1,80}\}/g, ':param')
+  } else if (trimmed.startsWith('/')) {
+    rawPath = trimmed.replace(/\$\{[^}]{1,80}\}/g, ':param')
+  } else {
+    return null
+  }
+
+  const barePath = rawPath.split('?')[0] ?? ''
+  if (!barePath.startsWith('/')) return null
+  const normalizedPath = normalizeRouteTemplate(barePath, { preserveParamNames: true, collapseConcreteIds: false })
+  const isWebhook = /\/webhooks?(?:\/|$)/i.test(normalizedPath) || (targetService ? /webhook|callback/i.test(targetService) : false)
+  return { ...(targetService ? { targetService } : {}), targetPath: normalizedPath, isWebhook }
+}
+
+function routeMatchesTargetPath(routePath: string, targetPath: string): boolean {
+  if (routePath === targetPath) return true
+  const rSegs = routePath.split('/').filter(Boolean)
+  const tSegs = targetPath.split('/').filter(Boolean)
+  if (rSegs.length !== tSegs.length || rSegs.length === 0) return false
+  for (let i = 0; i < rSegs.length; i += 1) {
+    const rs = rSegs[i]!
+    const ts = tSegs[i]!
+    if (rs === ts) continue
+    if (rs.startsWith(':') || ts.startsWith(':')) continue
+    return false
+  }
+  return true
+}
+
+function extractCrossServiceAndAsyncEdges(ctx: CrossServiceExtractContext): void {
+  const {
+    files, functions, routes, nodes, edges,
+    fnByFile, fnByName, fnId, contentByFile, newlineOffsetsByFile, warningsOut,
+  } = ctx
+
+  const syntheticNodes = new Map<string, ProgramNode>()
+  const ensureSyntheticNode = (
+    id: string,
+    kind: 'service_endpoint' | 'async_channel',
+    symbol: string,
+    file: string,
+    line: number,
+  ): ProgramNode => {
+    const existing = syntheticNodes.get(id)
+    if (existing) return existing
+    const node: ProgramNode = { id, kind, symbol, file, line, guards: [], calls: [] }
+    syntheticNodes.set(id, node)
+    nodes.push(node)
+    return node
+  }
+
+  // 1. Index async consumers across files (queue/event/job/listener handlers -> nodeId).
+  const consumersByChannel = new Map<string, string[]>()
+  const addConsumer = (rawChannel: string, targetNodeId: string) => {
+    const key = rawChannel.trim().toLowerCase()
+    if (!key || key.length > 160) return
+    const list = consumersByChannel.get(key) ?? []
+    if (!list.includes(targetNodeId)) list.push(targetNodeId)
+    consumersByChannel.set(key, list)
+  }
+
+  for (const file of files) {
+    const content = file.content.length > 512 * 1024 ? file.content.slice(0, 512 * 1024) : file.content
+    const fileFns = fnByFile.get(file.path)
+    // Match `queue.process('job', handler)` / `eventBus.on('topic', handler)`
+    for (const m of content.matchAll(ASYNC_CONSUMER_CALL_RE)) {
+      const channel = (m[2] ?? m[4] ?? '').trim()
+      const handlerName = (m[5] ?? '').trim()
+      if (!channel || !handlerName) continue
+      const targetFn = fileFns?.get(handlerName) ?? (fnByName.get(handlerName)?.length === 1 ? fnByName.get(handlerName)![0] : undefined)
+      if (targetFn) addConsumer(channel, fnId(targetFn))
+    }
+    // Match `@KafkaListener(topics = "orders")` / `@EventPattern('order.created')` / `@shared_task`
+    for (const m of content.matchAll(ASYNC_DECORATOR_CONSUMER_RE)) {
+      const inner = m[1] ?? ''
+      const lit = /['"]([^'"\r\n]{1,120})['"]/.exec(inner)?.[1]
+      const after = content.slice((m.index ?? 0) + m[0].length, Math.min(content.length, (m.index ?? 0) + m[0].length + 240))
+      const fnMatch = /(?:def|async[ \t]+def|public|private|protected|async|function)[ \t]+(?:[A-Za-z0-9_<>,[\]? \t]{1,64}[ \t]+)?([A-Za-z_$][\w$]{0,127})[ \t]*\(/.exec(after)
+      const handlerName = fnMatch?.[1]
+      const targetFn = handlerName ? fileFns?.get(handlerName) : undefined
+      if (targetFn) {
+        if (lit) addConsumer(lit, fnId(targetFn))
+        addConsumer(targetFn.name, fnId(targetFn))
+      }
+    }
+  }
+  // Index webhook routes as consumers too (e.g. POST /webhooks/stripe).
+  for (const route of routes) {
+    if (/\/webhooks?(?:\/|$)/i.test(route.path)) {
+      addConsumer(route.path, route.id)
+      const tail = route.path.split('/').filter(Boolean).pop()
+      if (tail && !tail.startsWith(':')) addConsumer(`webhook:${tail}`, route.id)
+    }
+  }
+
+  // Helper to resolve a client HTTP call to an extracted ProgramRoute when present in the graph.
+  const findMatchingRoute = (callerFile: string, targetPath: string, targetService?: string): ProgramRoute | undefined => {
+    const callerRoot = serviceRootOfFile(callerFile)
+    const matching = routes.filter(r => routeMatchesTargetPath(r.path, targetPath))
+    if (matching.length === 0) return undefined
+    if (targetService) {
+      const svcClean = targetService.replace(/[^a-z0-9_-]/g, '')
+      const byService = matching.find(r => {
+        const lowerFile = r.file.toLowerCase()
+        return svcClean.length > 0 && (
+          lowerFile.includes(`/${svcClean}/`)
+          || lowerFile.startsWith(`${svcClean}/`)
+          || serviceRootOfFile(r.file).includes(svcClean)
+        )
+      })
+      if (byService) return byService
+    }
+    const crossService = matching.find(r => serviceRootOfFile(r.file) !== callerRoot)
+    return crossService ?? matching[0]
+  }
+
+  const seenEdges = new Set<string>()
+  let crossEdgeCount = 0
+  let capWarned = false
+
+  const pushCrossEdge = (edge: ProgramEdge): boolean => {
+    if (crossEdgeCount >= MAX_CROSS_SERVICE_EDGES) {
+      if (!capWarned && warningsOut.length < MAX_TOTAL_WARNINGS) {
+        warningsOut.push(`Cross-service/async edges capped at ${MAX_CROSS_SERVICE_EDGES}`)
+        capWarned = true
+      }
+      return false
+    }
+    const key = `${edge.fromId}|${edge.toId}|${edge.kind}|${edge.channel ?? edge.targetPath ?? ''}`
+    if (seenEdges.has(key)) return true
+    seenEdges.add(key)
+    edges.push(edge)
+    crossEdgeCount += 1
+    return true
+  }
+
+  const lineFor = (file: string, content: string, absIndex: number): number => {
+    let offsets = newlineOffsetsByFile.get(file)
+    if (!offsets) {
+      offsets = buildNewlineOffsets(content)
+      newlineOffsetsByFile.set(file, offsets)
+    }
+    return lineAtFromOffsets(offsets, absIndex, content.length)
+  }
+
+  for (const fn of functions) {
+    if (crossEdgeCount >= MAX_CROSS_SERVICE_EDGES) break
+    const content = contentByFile.get(fn.file)
+    if (content === undefined) continue
+    const body = content.slice(fn.startIndex, Math.min(fn.endIndex, fn.startIndex + MAX_FUNCTION_BODY_SCAN_BYTES))
+    const sourceId = fnId(fn)
+
+    // 2a. Cross-service HTTP calls (`fetch`, `axios.*`, `requests.*`, `http.Post`, `RestTemplate`, etc.)
+    for (const m of body.matchAll(CLIENT_HTTP_URL_RE)) {
+      const target = parseClientTarget(m[2] ?? '')
+      if (!target || !target.targetPath) continue
+      const line = lineFor(fn.file, content, fn.startIndex + (m.index ?? 0))
+      const matchedRoute = findMatchingRoute(fn.file, target.targetPath, target.targetService)
+      // Avoid creating a self-loop from a handler to its own route in the same file.
+      if (matchedRoute && matchedRoute.file === fn.file && matchedRoute.handler === fn.name) continue
+      const toId = matchedRoute
+        ? matchedRoute.id
+        : ensureSyntheticNode(
+            `svc:${target.targetService ?? 'http'}:${target.targetPath}`,
+            target.isWebhook ? 'async_channel' : 'service_endpoint',
+            target.targetService ? `${target.targetService}${target.targetPath}` : target.targetPath,
+            fn.file,
+            line,
+          ).id
+      if (target.isWebhook) {
+        if (!pushCrossEdge({
+          fromId: sourceId,
+          toId,
+          file: fn.file,
+          line,
+          kind: 'async_dispatch',
+          protocol: 'webhook',
+          ...(target.targetService ? { targetService: target.targetService } : {}),
+          targetPath: target.targetPath,
+          channel: target.targetPath,
+        })) break
+      } else {
+        if (!pushCrossEdge({
+          fromId: sourceId,
+          toId,
+          file: fn.file,
+          line,
+          kind: 'client_call',
+          protocol: 'http',
+          ...(target.targetService ? { targetService: target.targetService } : {}),
+          targetPath: target.targetPath,
+        })) break
+      }
+    }
+
+    // 2b. Cross-service RPC / gRPC client calls (`billingClient.charge(...)`, `trpc.billing.settle.mutate(...)`)
+    for (const m of body.matchAll(CLIENT_RPC_CALL_RE)) {
+      const clientVar = m[1]!
+      const rpcMethod = m[2]!
+      if (/^(?:get|set|on|off|once|close|connect|disconnect|use|then|catch|finally|toString|valueOf)$/i.test(rpcMethod)) continue
+      const line = lineFor(fn.file, content, fn.startIndex + (m.index ?? 0))
+      const svcName = clientVar.replace(/(?:Client|Stub|Rpc|Service|Proxy)$/i, '').toLowerCase() || clientVar.toLowerCase()
+      const candidates = fnByName.get(rpcMethod) ?? []
+      const remoteFn = candidates.find(c => c.file !== fn.file && (serviceRootOfFile(c.file).includes(svcName) || c.file.toLowerCase().includes(svcName)))
+        ?? candidates.find(c => serviceRootOfFile(c.file) !== serviceRootOfFile(fn.file))
+      const toId = remoteFn
+        ? fnId(remoteFn)
+        : ensureSyntheticNode(`rpc:${svcName}:${rpcMethod}`, 'service_endpoint', `${svcName}.${rpcMethod}`, fn.file, line).id
+      if (!pushCrossEdge({
+        fromId: sourceId,
+        toId,
+        file: fn.file,
+        line,
+        kind: 'client_call',
+        protocol: /stub|grpc/i.test(clientVar) ? 'grpc' : 'rpc',
+        targetService: svcName,
+        targetPath: `/${svcName}/${rpcMethod}`,
+      })) break
+    }
+    for (const m of body.matchAll(CLIENT_TRPC_CALL_RE)) {
+      const routerName = m[1]!
+      const procName = m[2]!
+      const line = lineFor(fn.file, content, fn.startIndex + (m.index ?? 0))
+      const trpcPath = `/trpc/${routerName}.${procName}`
+      const matchedRoute = findMatchingRoute(fn.file, trpcPath, routerName)
+      const toId = matchedRoute
+        ? matchedRoute.id
+        : ensureSyntheticNode(`rpc:trpc:${routerName}.${procName}`, 'service_endpoint', `trpc.${routerName}.${procName}`, fn.file, line).id
+      if (!pushCrossEdge({
+        fromId: sourceId,
+        toId,
+        file: fn.file,
+        line,
+        kind: 'client_call',
+        protocol: 'rpc',
+        targetService: routerName.toLowerCase(),
+        targetPath: trpcPath,
+      })) break
+    }
+
+    // 2c. Async queue / event / job / webhook dispatches
+    const recordAsync = (channel: string, protocol: 'queue' | 'webhook' | 'job' | 'event', matchIndex: number): boolean => {
+      const cleanChannel = channel.trim()
+      if (!cleanChannel || cleanChannel.length > 160) return true
+      const line = lineFor(fn.file, content, fn.startIndex + matchIndex)
+      const consumers = consumersByChannel.get(cleanChannel.toLowerCase()) ?? []
+      if (consumers.length > 0) {
+        for (const consumerId of consumers) {
+          if (consumerId === sourceId) continue
+          if (!pushCrossEdge({
+            fromId: sourceId,
+            toId: consumerId,
+            file: fn.file,
+            line,
+            kind: 'async_dispatch',
+            protocol,
+            channel: cleanChannel,
+          })) return false
+        }
+        return true
+      }
+      const chNode = ensureSyntheticNode(`async:${protocol}:${cleanChannel.toLowerCase()}`, 'async_channel', cleanChannel, fn.file, line)
+      return pushCrossEdge({
+        fromId: sourceId,
+        toId: chNode.id,
+        file: fn.file,
+        line,
+        kind: 'async_dispatch',
+        protocol,
+        channel: cleanChannel,
+      })
+    }
+
+    for (const m of body.matchAll(ASYNC_PRODUCER_CHANNEL_RE)) {
+      const raw = m[0]
+      const channel = m[2] ?? ''
+      const protocol: 'queue' | 'webhook' | 'job' | 'event' = /webhook/i.test(raw)
+        ? 'webhook'
+        : /emit/i.test(raw)
+          ? 'event'
+          : /task|enqueue/i.test(raw)
+            ? 'job'
+            : 'queue'
+      if (!recordAsync(channel, protocol, m.index ?? 0)) break
+    }
+    for (const m of body.matchAll(ASYNC_QUEUE_ADD_RE)) {
+      const objName = m[1] ?? ''
+      const channel = (m[3] ?? m[4] ?? '').trim() || objName
+      const protocol: 'queue' | 'job' | 'event' = /event|bus/i.test(objName)
+        ? 'event'
+        : /job|task|worker/i.test(objName)
+          ? 'job'
+          : 'queue'
+      if (!recordAsync(channel, protocol, m.index ?? 0)) break
+    }
+    for (const m of body.matchAll(ASYNC_CELERY_DELAY_RE)) {
+      const taskName = m[1]!
+      const line = lineFor(fn.file, content, fn.startIndex + (m.index ?? 0))
+      const taskFn = fnByFile.get(fn.file)?.get(taskName)
+        ?? (fnByName.get(taskName)?.length === 1 ? fnByName.get(taskName)![0] : undefined)
+      if (taskFn && fnId(taskFn) !== sourceId) {
+        if (!pushCrossEdge({
+          fromId: sourceId,
+          toId: fnId(taskFn),
+          file: fn.file,
+          line,
+          kind: 'async_dispatch',
+          protocol: 'job',
+          channel: taskName,
+        })) break
+      } else {
+        if (!recordAsync(taskName, 'job', m.index ?? 0)) break
+      }
+    }
+    for (const m of body.matchAll(ASYNC_WEBHOOK_CALL_RE)) {
+      // Only emit generic webhook channel if not already matched with a literal channel by ASYNC_PRODUCER_CHANNEL_RE.
+      const after = body.slice((m.index ?? 0) + m[0].length, (m.index ?? 0) + m[0].length + 80).trimStart()
+      if (after.startsWith("'") || after.startsWith('"') || after.startsWith('`')) continue
+      if (!recordAsync('webhook', 'webhook', m.index ?? 0)) break
+    }
   }
 }
 
@@ -2682,21 +3145,36 @@ export function resolveRouteSinkPaths(graph: ProgramGraph, options: ReversePathO
       if (results.length >= maxPaths) return
       if (current.kind === 'route') {
         const route = graph.routes.find(r => r.id === current.id)
-        if (!route) return
-        const ordered = [...chain].reverse()
-        const key = `${route.id}:${sink.id}`
-        if (results.some(existing => `${existing.routeId}:${existing.sinkId}` === key)) return
-        results.push({
-          routeId: route.id,
-          route,
-          sinkId: sink.id,
-          sinkKind: sink.sinkKind ?? 'other',
-          sinkFile: sink.file,
-          sinkLine: sink.line,
-          chain: ordered.map(node => ({ id: node.id, kind: node.kind, symbol: node.symbol, file: node.file, line: node.line })),
-          hops: ordered.length - 1,
-          dominatingGuards: route.guards,
-        })
+        if (route) {
+          const ordered = [...chain].reverse()
+          const key = `${route.id}:${sink.id}`
+          if (!results.some(existing => `${existing.routeId}:${existing.sinkId}` === key)) {
+            results.push({
+              routeId: route.id,
+              route,
+              sinkId: sink.id,
+              sinkKind: sink.sinkKind ?? 'other',
+              sinkFile: sink.file,
+              sinkLine: sink.line,
+              chain: ordered.map(node => ({ id: node.id, kind: node.kind, symbol: node.symbol, file: node.file, line: node.line })),
+              hops: ordered.length - 1,
+              dominatingGuards: route.guards,
+            })
+          }
+        }
+        // Also continue walking backward across cross-service (`client_call`) and async
+        // (`async_dispatch`) edges so upstream entry routes that trigger downstream sinks are visible.
+        if (chain.length > maxDepth + 1) return
+        for (const edge of incoming.get(current.id) ?? []) {
+          if (edge.kind !== 'client_call' && edge.kind !== 'async_dispatch') continue
+          const caller = nodeById.get(edge.fromId)
+          if (!caller || visited.has(caller.id)) continue
+          visited.add(caller.id)
+          chain.push(caller)
+          walk(caller, chain, visited)
+          chain.pop()
+          visited.delete(caller.id)
+        }
         return
       }
       if (chain.length > maxDepth + 1) return
@@ -3849,6 +4327,8 @@ export interface ServiceOriginMapping {
   service: string
   root?: string
   origin?: string
+  /** Optional path prefix (e.g. `/api`, `/billing`) retained from ingress or reverse-proxy rules. */
+  pathPrefix?: string
   confidence: 'exact' | 'host' | 'port' | 'path' | 'fallback' | 'unmapped'
   evidence: string[]
 }
@@ -3857,102 +4337,241 @@ export interface MonorepoOriginInput {
   services: readonly MonorepoService[]
   origins: readonly string[]
   compose?: string
+  /** All discovered compose files with relative paths (replaces single-file drop). */
+  composeFiles?: ReadonlyArray<{ path: string; content: string }>
   ingress?: string
+  /** All discovered ingress YAML files with relative paths (replaces single-file drop). */
+  ingressFiles?: ReadonlyArray<{ path: string; content: string }>
   dockerfiles?: ReadonlyArray<{ path: string; content: string }>
   manifests?: ReadonlyArray<{ path: string; content: string }>
 }
 
-function parseComposeServices(compose: string): Map<string, { hosts: string[]; ports: number[] }> {
-  const services = new Map<string, { hosts: string[]; ports: number[] }>()
-  const lines = compose.split('\n')
-  let inServices = false
-  let servicesIndent = -1
-  let current: string | null = null
-  let serviceIndent = -1
-  let inPorts = false
-  let portsIndent = -1
-  for (const raw of lines) {
-    if (/^\s*services\s*:/.test(raw)) {
-      inServices = true
-      servicesIndent = raw.length - raw.trimStart().length
-      continue
-    }
-    if (!inServices) continue
-    const indent = raw.length - raw.trimStart().length
-    if (raw.trim() && indent <= servicesIndent && !/^\s*services\s*:/.test(raw)) break
-    const serviceMatch = /^(\s+)([A-Za-z0-9_.-]+)\s*:\s*$/.exec(raw)
-    if (serviceMatch && indent <= servicesIndent + 2) {
-      current = serviceMatch[2]
-      serviceIndent = indent
-      inPorts = false
-      services.set(current, { hosts: [], ports: [] })
-      continue
-    }
-    if (!current) continue
-    const entry = services.get(current)!
-    if (raw.trim() && indent <= serviceIndent && !raw.trim().startsWith('#')) {
-      current = null
-      inPorts = false
-      continue
-    }
-    if (/^\s*ports\s*:/.test(raw)) {
-      inPorts = true
-      portsIndent = indent
-      const inline = /ports\s*:\s*\[([^\]]*)\]/.exec(raw)?.[1]
-      if (inline) {
-        for (const port of inline.matchAll(/(?:^|,)\s*['"]?(?:\d+:)?(\d{2,5})(?::\d+)?['"]?/g)) entry.ports.push(Number(port[1]))
-        inPorts = false
-      }
-      continue
-    }
-    if (inPorts && indent <= portsIndent && raw.trim() && !/^\s*-/.test(raw)) {
-      inPorts = false
-    }
-    if (inPorts) {
-      const singlePort = /^\s*-\s*['"]?(?:\d+:)?(\d{2,5})(?::\d+)?['"]?\s*$/.exec(raw)
-      if (singlePort) entry.ports.push(Number(singlePort[1]))
-    }
-    for (const host of raw.matchAll(/Host\s*\(\s*`?([^`')]+)`?\s*\)/g)) entry.hosts.push(host[1])
-    const containerName = /container_name\s*:\s*['"]?([A-Za-z0-9_.-]+)/.exec(raw)?.[1]
-    if (containerName) entry.hosts.push(containerName)
-  }
-  return services
+interface ParsedComposeService {
+  name: string
+  hosts: string[]
+  ports: number[]
+  pathPrefixes: string[]
+  /** Resolved build context / compose directory prefixes for accurate multi-file attribution. */
+  rootHints: string[]
+  sourceFiles: string[]
 }
 
-function parseIngressRules(ingress: string): Array<{ host: string; service: string; path?: string }> {
-  const rules: Array<{ host: string; service: string; path?: string }> = []
-  const lines = ingress.split('\n')
-  let host = ''
-  let path: string | undefined
-  let pendingService = false
-  for (const raw of lines) {
-    const hostMatch = /^\s*-\s*host\s*:\s*['"]?([^'"\s]+)/.exec(raw)
-    if (hostMatch) host = hostMatch[1]
-    const quotedHost = /host\s*:\s*['"]([^'"]+)['"]/.exec(raw)
-    if (quotedHost && !hostMatch) host = quotedHost[1]
-    const pathMatch = /path\s*:\s*['"]?([^'"\s]+)/.exec(raw)
-    if (pathMatch) path = pathMatch[1]
-    if (/service\s*:\s*$/.test(raw)) {
-      pendingService = true
-      continue
+function dirOfRelativePath(filePath: string): string {
+  const norm = filePath.replaceAll('\\', '/').replace(/^\/+|\/+$/g, '')
+  const idx = norm.lastIndexOf('/')
+  return idx >= 0 ? norm.slice(0, idx) : ''
+}
+
+function joinRelativeDir(baseDir: string, rel: string): string {
+  const cleanRel = rel.trim().replace(/^['"]|['"]$/g, '').replaceAll('\\', '/')
+  if (!cleanRel || cleanRel === '.') return baseDir
+  const parts = baseDir ? baseDir.split('/').filter(Boolean) : []
+  for (const seg of cleanRel.split('/')) {
+    if (!seg || seg === '.') continue
+    if (seg === '..') parts.pop()
+    else parts.push(seg)
+  }
+  return parts.join('/')
+}
+
+function parseComposeServicesFromFiles(
+  files: ReadonlyArray<{ path: string; content: string }>,
+): ParsedComposeService[] {
+  const byKey = new Map<string, ParsedComposeService>()
+  for (const file of files) {
+    const dirPrefix = dirOfRelativePath(file.path)
+    const lines = file.content.split('\n')
+    let inServices = false
+    let servicesIndent = -1
+    let current: ParsedComposeService | null = null
+    let serviceIndent = -1
+    let inPorts = false
+    let portsIndent = -1
+    let inBuild = false
+    let buildIndent = -1
+    for (const raw of lines) {
+      if (/^\s*services\s*:/.test(raw)) {
+        inServices = true
+        servicesIndent = raw.length - raw.trimStart().length
+        current = null
+        inPorts = false
+        inBuild = false
+        continue
+      }
+      if (!inServices) continue
+      const indent = raw.length - raw.trimStart().length
+      if (raw.trim() && !raw.trim().startsWith('#') && indent <= servicesIndent && !/^\s*services\s*:/.test(raw)) {
+        inServices = false
+        current = null
+        inPorts = false
+        inBuild = false
+        continue
+      }
+      const serviceMatch = /^(\s+)([A-Za-z0-9_.-]+)\s*:\s*$/.exec(raw)
+      if (serviceMatch && indent <= servicesIndent + 2) {
+        const svcName = serviceMatch[2]
+        const key = `${dirPrefix}\0${svcName.toLowerCase()}`
+        let entry = byKey.get(key)
+        if (!entry) {
+          entry = {
+            name: svcName,
+            hosts: [],
+            ports: [],
+            pathPrefixes: [],
+            rootHints: dirPrefix ? [dirPrefix] : [],
+            sourceFiles: [file.path],
+          }
+          byKey.set(key, entry)
+        } else if (!entry.sourceFiles.includes(file.path)) {
+          entry.sourceFiles.push(file.path)
+        }
+        current = entry
+        serviceIndent = indent
+        inPorts = false
+        inBuild = false
+        continue
+      }
+      if (!current) continue
+      if (raw.trim() && indent <= serviceIndent && !raw.trim().startsWith('#')) {
+        current = null
+        inPorts = false
+        inBuild = false
+        continue
+      }
+      if (/^\s*build\s*:/.test(raw)) {
+        const inlineBuild = /^\s*build\s*:\s*['"]?([^\s'"#]+)['"]?\s*$/.exec(raw)?.[1]
+        if (inlineBuild) {
+          const resolved = joinRelativeDir(dirPrefix, inlineBuild)
+          if (resolved && !current.rootHints.includes(resolved)) current.rootHints.push(resolved)
+          inBuild = false
+        } else {
+          inBuild = true
+          buildIndent = indent
+        }
+        continue
+      }
+      if (inBuild && indent <= buildIndent && raw.trim() && !raw.trim().startsWith('#')) {
+        inBuild = false
+      }
+      if (inBuild) {
+        const ctxMatch = /^\s*context\s*:\s*['"]?([^\s'"#]+)['"]?/.exec(raw)?.[1]
+        if (ctxMatch) {
+          const resolved = joinRelativeDir(dirPrefix, ctxMatch)
+          if (resolved && !current.rootHints.includes(resolved)) current.rootHints.push(resolved)
+        }
+      }
+      if (/^\s*ports\s*:/.test(raw)) {
+        inPorts = true
+        portsIndent = indent
+        const inline = /ports\s*:\s*\[([^\]]*)\]/.exec(raw)?.[1]
+        if (inline) {
+          for (const port of inline.matchAll(/(?:^|,)\s*['"]?(?:[\d.]+:)?(\d{2,5})(?::(\d{2,5}))?(?:\/(?:tcp|udp))?['"]?/g)) {
+            const p1 = Number(port[1])
+            if (p1 > 0 && p1 <= 65535 && !current.ports.includes(p1)) current.ports.push(p1)
+            if (port[2]) {
+              const p2 = Number(port[2])
+              if (p2 > 0 && p2 <= 65535 && !current.ports.includes(p2)) current.ports.push(p2)
+            }
+          }
+          inPorts = false
+        }
+        continue
+      }
+      if (inPorts && indent <= portsIndent && raw.trim() && !/^\s*-/.test(raw)) {
+        inPorts = false
+      }
+      if (inPorts) {
+        const singlePort = /^\s*-\s*['"]?(?:[\d.]+:)?(\d{2,5})(?::(\d{2,5}))?(?:\/(?:tcp|udp))?['"]?\s*$/.exec(raw)
+        if (singlePort) {
+          const p1 = Number(singlePort[1])
+          if (p1 > 0 && p1 <= 65535 && !current.ports.includes(p1)) current.ports.push(p1)
+          if (singlePort[2]) {
+            const p2 = Number(singlePort[2])
+            if (p2 > 0 && p2 <= 65535 && !current.ports.includes(p2)) current.ports.push(p2)
+          }
+        }
+      }
+      for (const host of raw.matchAll(/Host\s*\(\s*`?([^`')]+)`?\s*\)/g)) {
+        if (!current.hosts.includes(host[1])) current.hosts.push(host[1])
+      }
+      for (const prefix of raw.matchAll(/PathPrefix\s*\(\s*`?([^`')]+)`?\s*\)/g)) {
+        if (!current.pathPrefixes.includes(prefix[1])) current.pathPrefixes.push(prefix[1])
+      }
+      const containerName = /container_name\s*:\s*['"]?([A-Za-z0-9_.-]+)/.exec(raw)?.[1]
+      if (containerName && !current.hosts.includes(containerName)) current.hosts.push(containerName)
     }
-    const nameMatch = /^\s*name\s*:\s*['"]?([A-Za-z0-9_.-]+)/.exec(raw)
-    if (pendingService && nameMatch) {
-      rules.push({ host, service: nameMatch[1], ...(path ? { path } : {}) })
-      pendingService = false
+  }
+  return [...byKey.values()]
+}
+
+function parseIngressRulesFromFiles(
+  files: ReadonlyArray<{ path: string; content: string }>,
+): Array<{ host: string; service: string; path?: string; sourceFile: string; dirPrefix: string }> {
+  const rules: Array<{ host: string; service: string; path?: string; sourceFile: string; dirPrefix: string }> = []
+  for (const file of files) {
+    const dirPrefix = dirOfRelativePath(file.path)
+    // Support multi-document YAML separated by `---`.
+    for (const doc of file.content.split(/^\s*---\s*$/m)) {
+      const lines = doc.split('\n')
+      let host = ''
+      let path: string | undefined
+      let pendingService = false
+      for (const raw of lines) {
+        const hostMatch = /^\s*-\s*host\s*:\s*['"]?([^'"\s]+)/.exec(raw)
+        if (hostMatch) {
+          host = hostMatch[1]
+          path = undefined
+        }
+        const quotedHost = /host\s*:\s*['"]([^'"]+)['"]/.exec(raw)
+        if (quotedHost && !hostMatch) {
+          host = quotedHost[1]
+          path = undefined
+        }
+        const pathMatch = /path\s*:\s*['"]?([^'"\s]+)/.exec(raw)
+        if (pathMatch) path = pathMatch[1]
+        if (/service\s*:\s*$/.test(raw)) {
+          pendingService = true
+          continue
+        }
+        const serviceNameInline = /^\s*serviceName\s*:\s*['"]?([A-Za-z0-9_.-]+)/.exec(raw)
+        if (serviceNameInline) {
+          rules.push({ host, service: serviceNameInline[1], ...(path ? { path } : {}), sourceFile: file.path, dirPrefix })
+          pendingService = false
+          continue
+        }
+        const nameMatch = /^\s*name\s*:\s*['"]?([A-Za-z0-9_.-]+)/.exec(raw)
+        if (pendingService && nameMatch) {
+          rules.push({ host, service: nameMatch[1], ...(path ? { path } : {}), sourceFile: file.path, dirPrefix })
+          pendingService = false
+        }
+      }
     }
   }
   return rules
 }
 
 /**
- * Map monorepo services to concrete target origins using compose labels/ports,
- * Dockerfile EXPOSE, k8s ingress host/path backends and manifest names.
- * `origins[0]` is only used as an explicit, low-confidence last resort.
+ * Map monorepo services to concrete target origins using ALL parsed compose files (with build
+ * contexts, ports, labels, and path prefixes), Dockerfile EXPOSE, ALL k8s ingress host/path
+ * backends, and manifest names. Genuinely unmapped services are marked `unmapped` instead of
+ * silently misattributing their routes to `origins[0]`.
  */
 export function mapServicesToOrigins(input: MonorepoOriginInput): ServiceOriginMapping[] {
-  const composeServices = input.compose ? parseComposeServices(input.compose) : new Map<string, { hosts: string[]; ports: number[] }>()
-  const ingressRules = input.ingress ? parseIngressRules(input.ingress) : []
+  const composeFileList: Array<{ path: string; content: string }> = [
+    ...(input.composeFiles ?? []),
+    ...(input.compose && !(input.composeFiles ?? []).some(f => f.content === input.compose)
+      ? [{ path: 'docker-compose.yml', content: input.compose }]
+      : []),
+  ]
+  const ingressFileList: Array<{ path: string; content: string }> = [
+    ...(input.ingressFiles ?? []),
+    ...(input.ingress && !(input.ingressFiles ?? []).some(f => f.content === input.ingress)
+      ? [{ path: 'ingress.yaml', content: input.ingress }]
+      : []),
+  ]
+
+  const composeEntries = parseComposeServicesFromFiles(composeFileList)
+  const ingressRules = parseIngressRulesFromFiles(ingressFileList)
   const dockerPorts = new Map<string, number[]>()
   for (const dockerfile of input.dockerfiles ?? []) {
     const root = dockerfile.path.replace(/(?:\/)?Dockerfile(?:\..*)?$/i, '').replace(/\/$/, '')
@@ -3969,14 +4588,27 @@ export function mapServicesToOrigins(input: MonorepoOriginInput): ServiceOriginM
 
   const results: ServiceOriginMapping[] = []
   for (const service of input.services) {
+    const root = service.root?.replace(/\/$/, '')
     const aliases = new Set<string>([service.name.toLowerCase()])
-    const composeEntry = composeServices.get(service.name)
+    // Match all compose entries belonging to this service (preferring build-context/dir-prefix matches).
+    const matchingCompose = composeEntries.filter(entry => {
+      if (root && entry.rootHints.some(hint => hint === root || root.endsWith(`/${hint}`) || hint.endsWith(`/${root}`))) {
+        return entry.name.toLowerCase() === service.name.toLowerCase() || entry.rootHints.includes(root)
+      }
+      return entry.name.toLowerCase() === service.name.toLowerCase()
+    })
     const evidence: string[] = []
     for (const host of service.hosts ?? []) aliases.add(host.toLowerCase())
-    for (const host of composeEntry?.hosts ?? []) aliases.add(host.toLowerCase())
-    const root = service.root?.replace(/\/$/, '')
+    const composePathPrefixes: string[] = []
+    const ports = new Set<number>([...(service.ports ?? [])])
+    for (const composeEntry of matchingCompose) {
+      for (const host of composeEntry.hosts) aliases.add(host.toLowerCase())
+      for (const port of composeEntry.ports) ports.add(port)
+      for (const prefix of composeEntry.pathPrefixes) {
+        if (!composePathPrefixes.includes(prefix)) composePathPrefixes.push(prefix)
+      }
+    }
     if (root && manifestNames.has(root)) aliases.add(manifestNames.get(root)!.toLowerCase())
-    const ports = new Set<number>([...(service.ports ?? []), ...(composeEntry?.ports ?? [])])
     if (root) for (const port of dockerPorts.get(root) ?? []) ports.add(port)
 
     let best: ServiceOriginMapping | null = null
@@ -3989,31 +4621,67 @@ export function mapServicesToOrigins(input: MonorepoOriginInput): ServiceOriginM
         originPort = Number(url.port || (url.protocol === 'https:' ? 443 : 80))
       } catch { continue }
       const hostMatch = [...aliases].find(alias => host === alias || host.startsWith(`${alias}.`) || host.includes(`-${alias}.`) || host.includes(`.${alias}.`))
-      const ingressMatch = ingressRules.find(rule => rule.service.toLowerCase() === service.name.toLowerCase() && rule.host.toLowerCase() === host)
+      const ingressMatch = ingressRules.find(rule =>
+        (rule.service.toLowerCase() === service.name.toLowerCase() || aliases.has(rule.service.toLowerCase()))
+        && (!rule.host || rule.host.toLowerCase() === host),
+      )
       const portMatch = ports.has(originPort)
+      const retainedPathPrefix = ingressMatch?.path ?? composePathPrefixes[0]
       if (hostMatch) {
-        const candidate: ServiceOriginMapping = { service: service.name, ...(root ? { root } : {}), origin, confidence: 'exact', evidence: [`host ${host} matches alias ${hostMatch}`] }
+        const candidate: ServiceOriginMapping = {
+          service: service.name,
+          ...(root ? { root } : {}),
+          origin,
+          ...(retainedPathPrefix ? { pathPrefix: retainedPathPrefix } : {}),
+          confidence: 'exact',
+          evidence: [
+            `host ${host} matches alias ${hostMatch}`,
+            ...(retainedPathPrefix ? [`path prefix ${retainedPathPrefix}`] : []),
+          ],
+        }
         if (!best || best.confidence !== 'exact') best = candidate
       } else if (ingressMatch) {
         const candidate: ServiceOriginMapping = {
-          service: service.name, ...(root ? { root } : {}), origin,
+          service: service.name,
+          ...(root ? { root } : {}),
+          origin,
+          ...(ingressMatch.path ? { pathPrefix: ingressMatch.path } : {}),
           confidence: ingressMatch.path ? 'path' : 'host',
-          evidence: [`ingress host ${ingressMatch.host}${ingressMatch.path ? ` path ${ingressMatch.path}` : ''} -> service ${service.name}`],
+          evidence: [`ingress ${ingressMatch.sourceFile} host ${ingressMatch.host || host}${ingressMatch.path ? ` path ${ingressMatch.path}` : ''} -> service ${ingressMatch.service}`],
         }
-        if (!best || ['path', 'host'].includes(best.confidence)) best = candidate
+        if (!best || best.confidence === 'port' || (best.confidence === 'host' && candidate.confidence === 'path')) best = candidate
       } else if (portMatch && !best) {
-        best = { service: service.name, ...(root ? { root } : {}), origin, confidence: 'port', evidence: [`port ${originPort} exposed by service`] }
+        best = {
+          service: service.name,
+          ...(root ? { root } : {}),
+          origin,
+          ...(composePathPrefixes[0] ? { pathPrefix: composePathPrefixes[0] } : {}),
+          confidence: 'port',
+          evidence: [`port ${originPort} exposed by service`],
+        }
       }
     }
     if (best) {
       results.push({ ...best, evidence: [...best.evidence, ...evidence] })
-    } else if (input.origins.length) {
+    } else if (input.origins.length === 1 && input.services.length === 1) {
       results.push({
-        service: service.name, ...(root ? { root } : {}), origin: input.origins[0], confidence: 'fallback',
-        evidence: ['no host/port/ingress match; using origins[0] as documented fallback'],
+        service: service.name,
+        ...(root ? { root } : {}),
+        origin: input.origins[0],
+        confidence: 'exact',
+        evidence: ['single service mapped to single approved origin'],
       })
     } else {
-      results.push({ service: service.name, ...(root ? { root } : {}), confidence: 'unmapped', evidence: ['no target origins configured'] })
+      results.push({
+        service: service.name,
+        ...(root ? { root } : {}),
+        confidence: 'unmapped',
+        evidence: [
+          input.origins.length
+            ? 'no host/port/ingress/compose match; service marked unmapped instead of misattributing to origins[0]'
+            : 'no target origins configured',
+        ],
+      })
     }
   }
   return results

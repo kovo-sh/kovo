@@ -23,8 +23,8 @@ export type { GraphqlFieldArg, GraphqlFieldDef, GraphqlParsedSchema } from './pr
 export { redirectHostOf, redirectTargetOf } from './probes/open-redirect.ts'
 
 export const surfaceMaxConcurrency = 2
-export const maxWorkerPaths = 120
-export const maxParamCandidates = 200
+export const maxWorkerPaths = 500
+export const maxParamCandidates = 500
 const probeBodyCap = 128 * 1024
 const calibrationBodyKeep = 32 * 1024
 
@@ -331,6 +331,13 @@ export interface SurfaceAnomaly {
   exchangeId?: string
 }
 
+export interface SurfaceTruncationRecord {
+  category: string
+  cap: number
+  observed: number
+  dropped: number
+}
+
 export interface ProbeSurfaceResult {
   mode: ProbeSurfaceRequest['mode']
   origin: string
@@ -346,6 +353,8 @@ export interface ProbeSurfaceResult {
   stoppedReason: StopReason | null
   exchangeIds: string[]
   notes: string[]
+  /** Structured truncation telemetry whenever a finite discovery cap is reached. */
+  truncations?: SurfaceTruncationRecord[]
   durationMs: number
 }
 
@@ -365,6 +374,12 @@ export async function probeSurface(
   const runner = new ProbeRunner(broker, grant, signal, max, req.persona, req.onExchange)
   const anomalies: SurfaceAnomaly[] = []
   const notes: string[] = []
+  const truncations: SurfaceTruncationRecord[] = []
+  const recordTruncation = (category: string, cap: number, observed: number) => {
+    if (observed > cap) {
+      truncations.push({ category, cap, observed, dropped: observed - cap })
+    }
+  }
   let calibration: SurfaceCalibration | null = null
   let candidates = 0
   let suppressedAsBaseline = 0
@@ -386,14 +401,21 @@ export async function probeSurface(
   try {
     if (req.mode === 'paths') {
       const wordlists = req.wordlists?.length ? req.wordlists : (Object.keys(surfaceWordlists) as SurfaceWordlistName[])
-      const supplied = (req.paths ?? []).slice(0, maxWorkerPaths).filter(safeProbePath)
-      if ((req.paths ?? []).length > maxWorkerPaths) notes.push(`Only the first ${maxWorkerPaths} worker paths were used.`)
+      const rawPaths = req.paths ?? []
+      const supplied = rawPaths.slice(0, maxWorkerPaths).filter(safeProbePath)
+      if (rawPaths.length > maxWorkerPaths) {
+        notes.push(`Only the first ${maxWorkerPaths} worker paths were used.`)
+        recordTruncation('worker_paths', maxWorkerPaths, rawPaths.length)
+      }
       const merged: string[] = [...supplied]
       for (const name of wordlists) {
         const list = surfaceWordlists[name]
         if (list) merged.push(...list)
       }
-      const candidateList = [...new Set(merged)].filter(p => (p.split('?')[0] || '/') !== '/').slice(0, Math.max(0, max - 2))
+      const uniqueCandidates = [...new Set(merged)].filter(p => (p.split('?')[0] || '/') !== '/')
+      const candidateCap = Math.max(0, max - 2)
+      recordTruncation('path_candidates', candidateCap, uniqueCandidates.length)
+      const candidateList = uniqueCandidates.slice(0, candidateCap)
       candidates = candidateList.length
 
       const cal = await calibrateOrigin(runner, origin)
@@ -418,8 +440,10 @@ export async function probeSurface(
       const basePath = req.basePath ?? '/'
       if (!safeProbePath(basePath.split('?')[0].replace(/\{\{[a-zA-Z0-9_]+\}\}/g, 'x'))) throw new BrokerDenied('basePath is invalid.')
       const location: SurfaceParamLocation = req.paramLocation ?? 'query'
-      const names = [...new Set((req.params?.length ? req.params : commonParamWordlist)
-        .filter(n => /^[A-Za-z0-9_.\-[\]]{1,64}$/.test(n) && !hasForbiddenProtoSegment(n)))].slice(0, maxParamCandidates)
+      const validNames = [...new Set((req.params?.length ? req.params : commonParamWordlist)
+        .filter(n => /^[A-Za-z0-9_.\-[\]]{1,64}$/.test(n) && !hasForbiddenProtoSegment(n)))]
+      recordTruncation('param_candidates', maxParamCandidates, validNames.length)
+      const names = validNames.slice(0, maxParamCandidates)
       candidates = names.length
       const batchSize = Math.max(10, Math.min(req.batchSize ?? 25, 25))
       const method: HttpMethod = (location === 'json' || location === 'form' || location === 'xml' || location === 'graphql_var') ? 'POST' : 'GET'
@@ -611,6 +635,7 @@ export async function probeSurface(
     stoppedReason: runner.stopReason,
     exchangeIds: runner.exchangeIds,
     notes,
+    ...(truncations.length > 0 ? { truncations } : {}),
     durationMs: Date.now() - started,
   }
 }
@@ -904,8 +929,8 @@ export async function runSafeTemplates(
   const matches: TemplateMatch[] = []
   const suppressed: RunSafeTemplatesResult['suppressed'] = []
   const skipped = [...selection.skipped]
-  const protectedPaths = (req.discoveredPaths?.protectedPaths ?? []).filter(p => p.startsWith('/')).slice(0, 6)
-  const apiPaths = (req.discoveredPaths?.apiPaths ?? []).filter(p => p.startsWith('/')).slice(0, 6)
+  const protectedPaths = (req.discoveredPaths?.protectedPaths ?? []).filter(p => p.startsWith('/')).slice(0, 24)
+  const apiPaths = (req.discoveredPaths?.apiPaths ?? []).filter(p => p.startsWith('/')).slice(0, 24)
   const dynamicVars: Record<string, string> = {
     ...(protectedPaths[0] ? { discovered_protected_path: protectedPaths[0] } : {}),
     ...(apiPaths[0] ? { discovered_api_path: apiPaths[0] } : {}),
