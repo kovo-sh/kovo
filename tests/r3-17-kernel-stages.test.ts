@@ -38,6 +38,7 @@ import {
 } from '../src/server/proof-kernel/reflection.ts'
 import {
   assertLegitimateControl,
+  isBareAnonymousAblationExchange,
   specDeclaresDeniedControl,
 } from '../src/server/proof-kernel/control-legitimacy.ts'
 import {
@@ -1052,5 +1053,24 @@ test('R3-17 auth_bypass header/param single-authority guard: middleware/proxy by
     })
     assert.equal(sabotagedRes.ok, false)
     assert.equal(sabotagedRes.rejectedBy, 'self_sabotaged_control')
+  }
+
+  // Unified AUTH_BYPASS_PARAM_KEY_RE union guard: uid, user_id, and override are never classified as bare anonymous ablation.
+  for (const param of ['uid=42', 'user_id=42', 'override=true'] as const) {
+    const paramExchange = {
+      id: `ctl-${param}`,
+      method: 'GET',
+      route: '/admin',
+      pathAndQuery: `/admin?${param}`,
+      status: 401,
+      actorHandle: null,
+      actorRole: null,
+      actorAuth: 'unknown',
+    }
+    assert.equal(
+      isBareAnonymousAblationExchange(paramExchange, 'GET', '/admin'),
+      false,
+      `exchange carrying ${param} must not be classified as a bare anonymous ablation`,
+    )
   }
 })

@@ -110,7 +110,7 @@ export const AUTH_OR_BYPASS_HEADER_RE = /^(?:authorization|proxy-authorization|c
  * Single authoritative regex for authentication and bypass query/body parameter keys
  * shared across `control-legitimacy.ts` and `proof-receipt.ts` (`R3-17`).
  */
-export const AUTH_BYPASS_PARAM_KEY_RE = /^(?:token|access_?token|id_?token|auth|auth_?token|jwt|session|session_?id|sid|api_?key|apikey|key|sig|signature|bypass|admin|is_?admin|role|impersonate|as_?user|user|debug|password|passcode|otp|code|assertion|saml|credential|claims)$/i
+export const AUTH_BYPASS_PARAM_KEY_RE = /^(?:token|access_?token|id_?token|auth|auth_?token|jwt|session|session_?id|sid|api_?key|apikey|key|sig|signature|bypass|admin|is_?admin|role|impersonate|as_?user|user|user_id|uid|override|debug|password|passcode|otp|code|assertion|saml|credential|claims)$/i
 
 const TRANSPORT_HEADER_NAME_RE = /^(?:host|content-length|content-type|accept|accept-encoding|accept-language|connection|user-agent|date|cache-control|pragma|upgrade-insecure-requests|sec-fetch-[a-z-]+)$/i
 const SIGNED_URL_SIG_PARAM_RE = /^(?:x-goog-signature|x-amz-signature|signature|sig)$/i

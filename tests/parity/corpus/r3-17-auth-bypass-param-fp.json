@@ -1,0 +1,88 @@
+{
+  "id": "r3-17-auth-bypass-param-fp",
+  "side": "fp",
+  "source": "independent_review",
+  "archetype": "r3-17-sabotaged-auth-param-control-fp",
+  "description": "R3-17 FP: self-sabotaged control carrying extra uid/user_id/override query parameters (401) paired with a bare anonymous probe (200) on a permit-all route must dismiss across all confirmation paths under the unified AUTH_BYPASS_PARAM_KEY_RE control-legitimacy and anonymous-ablation stages.",
+  "covers": {
+    "files": [
+      "src/server/proof-kernel/reflection.ts",
+      "src/server/proof-kernel/control-legitimacy.ts",
+      "src/server/proof-receipt.ts"
+    ],
+    "classes": [
+      "auth_bypass"
+    ]
+  },
+  "canonicalLabel": {
+    "cwe": "CWE-287",
+    "category": "auth-bypass",
+    "title": "Self-sabotaged uid/user_id/override query control paired with bare anonymous 200 must dismiss",
+    "impact": "Endpoint serves public profile metadata anonymously; control only failed due to extraneous uid/user_id/override query parameters.",
+    "claimedImpact": "other",
+    "claimedBoundary": "auth",
+    "vulnClass": "auth_bypass"
+  },
+  "freeTextLabel": {
+    "title": "Control-only uid/user_id/override query parameters rejected while bare anonymous probe succeeds"
+  },
+  "paths": {
+    "replay": true,
+    "floorReceipt": true,
+    "evaluateClaims": true,
+    "composite": false,
+    "floorInjectionRecipe": false,
+    "proofReceipt": true
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [],
+  "exchanges": [
+    {
+      "id": "ctl_sabotaged_param",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/public/account-summary?uid=invalid-ctl&user_id=invalid-ctl&override=false",
+      "persona": null,
+      "status": 401,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"error\":\"rejected_params\"}"
+    },
+    {
+      "id": "prb_bare_anon",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/public/account-summary",
+      "persona": null,
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"account\":\"public_summary\",\"tier\":\"free\",\"region\":\"us-east\"}"
+    }
+  ],
+  "replaySpec": {
+    "assertionsJq": "{ controlPassed: (.steps.ctl_sabotaged_param.status == 401), confirmed: (.steps.ctl_sabotaged_param.status == 401 and .steps.prb_bare_anon.status == 200), observed: .steps.prb_bare_anon.json.account, expected: \"401\" }"
+  },
+  "proofReceipt": {
+    "vulnClass": "auth_bypass",
+    "targetMethod": "GET",
+    "targetPathAndQuery": "/api/public/account-summary",
+    "claimedDelta": "Control carried extra uid/user_id/override query parameters (401) absent from the bare anonymous probe (200); must never confirm as auth_bypass."
+  },
+  "claims": [
+    {
+      "kind": "boundary",
+      "boundaryClass": "auth",
+      "controlExchangeId": "ctl_sabotaged_param",
+      "probeExchangeId": "prb_bare_anon"
+    }
+  ]
+}
