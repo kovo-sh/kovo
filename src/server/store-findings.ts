@@ -1473,8 +1473,9 @@ export class FindingsRepository {
       if (!existing) throw new Error('Finding not found.')
 
       // Floor-confirmed rows are immutable: later agent passes may add evidence elsewhere but can
-      // never overwrite, downgrade or reclassify the floor's own confirmation.
-      if (existing.provenance === 'floor') {
+      // never overwrite, downgrade or reclassify the floor's own runtime confirmation.
+      // Pending or static_verified floor rows remain monotonically upgradable once runtime proof arrives.
+      if (existing.provenance === 'floor' && existing.finding.status === 'confirmed') {
         this.session.event(
           run.id,
           'finding.floor_preserved',
@@ -1488,11 +1489,15 @@ export class FindingsRepository {
         .from(tables.runs).where(eq(tables.runs.id, run.id)).get()
       const currentScopeRevision = Math.max(run.scopeRevision, freshRun?.scopeRevision ?? run.scopeRevision)
 
-      const isExistingVerified = existing.finding.status === 'confirmed' || existing.finding.status === 'static_verified'
+      const isExistingConfirmed = existing.finding.status === 'confirmed'
       const rawIncomingFinding: Partial<Finding> = patch.finding ? { ...patch.finding } : {}
-      const staysVerified = isExistingVerified
-        && (rawIncomingFinding.status === undefined || rawIncomingFinding.status === existing.finding.status)
-      if (isExistingVerified) {
+      if (isExistingConfirmed && rawIncomingFinding.status === 'static_verified') {
+        // Monotonicity: never downgrade a runtime-confirmed finding back to static_verified.
+        delete rawIncomingFinding.status
+      }
+      const staysConfirmed = isExistingConfirmed
+        && (rawIncomingFinding.status === undefined || rawIncomingFinding.status === 'confirmed')
+      if (isExistingConfirmed) {
         // H-4 / H-18: Never allow post-confirmation updates to mutate confirmed finding identity/severity/category.
         delete rawIncomingFinding.cwe
         delete rawIncomingFinding.origin
@@ -1500,11 +1505,11 @@ export class FindingsRepository {
         delete rawIncomingFinding.category
         delete rawIncomingFinding.severity
         delete rawIncomingFinding.fingerprintHash
-        if (staysVerified && existing.replaySpecId) {
+        if (staysConfirmed && existing.replaySpecId) {
           delete rawIncomingFinding.replaySpecId
         }
       }
-      const effectiveReplaySpecId = staysVerified && existing.replaySpecId
+      const effectiveReplaySpecId = staysConfirmed && existing.replaySpecId
         ? existing.replaySpecId
         : (patch.replaySpecId ?? existing.replaySpecId)
       const mergedFinding: Finding = {
@@ -1513,7 +1518,7 @@ export class FindingsRepository {
         id: existing.id,
         ...(effectiveReplaySpecId !== undefined && effectiveReplaySpecId !== null ? { replaySpecId: effectiveReplaySpecId } : {}),
         ...(patch.verificationTier !== undefined ? { verificationTier: patch.verificationTier ?? undefined } : {}),
-        ...(!isExistingVerified && patch.fingerprintHash !== undefined ? { fingerprintHash: patch.fingerprintHash } : {}),
+        ...(!isExistingConfirmed && patch.fingerprintHash !== undefined ? { fingerprintHash: patch.fingerprintHash } : {}),
         ...(patch.supersededByFindingId !== undefined ? { supersededByFindingId: patch.supersededByFindingId } : {}),
         ...(patch.counterevidence !== undefined ? { counterevidence: patch.counterevidence } : {}),
         ...(patch.confidenceRationale !== undefined ? { confidenceRationale: patch.confidenceRationale } : {}),
@@ -1534,8 +1539,13 @@ export class FindingsRepository {
       const parentFindingIds = patch.parentFindingIds !== undefined
         ? (patch.parentFindingIds ? [...new Set(patch.parentFindingIds)] : null)
         : existing.parentFindingIds
-      if (mergedFinding.status === 'confirmed' && mergedFinding.verificationTier === 'static_verified') {
-        mergedFinding.verificationTier = 'runtime_confirmed'
+      if (mergedFinding.status === 'confirmed') {
+        if (mergedFinding.verificationTier === 'static_verified' || mergedFinding.verificationTier === undefined) {
+          mergedFinding.verificationTier = existing.findingKind === 'baseline_check' ? 'baseline_confirmed' : 'runtime_confirmed'
+        }
+        if (existing.finding.status === 'static_verified' && rawIncomingFinding.runtimeProofGap === undefined) {
+          mergedFinding.runtimeProofGap = null
+        }
       }
       const verificationClass = verificationClassForFinding(mergedFinding, patch.verificationClass)
       assertConfirmedVerificationClass(mergedFinding.status, verificationClass)
@@ -1558,10 +1568,12 @@ export class FindingsRepository {
         verificationStatus: verificationClass,
       } as Finding
 
-      const nextVerificationTier = patch.verificationTier !== undefined
-        ? patch.verificationTier
-        : (mergedFinding.verificationTier ?? existing.verificationTier)
-      const nextFingerprintHash = !isExistingVerified && patch.fingerprintHash !== undefined
+      const nextVerificationTier = mergedFinding.status === 'confirmed'
+        ? (mergedFinding.verificationTier ?? 'runtime_confirmed')
+        : (patch.verificationTier !== undefined
+            ? patch.verificationTier
+            : (mergedFinding.verificationTier ?? existing.verificationTier))
+      const nextFingerprintHash = !isExistingConfirmed && patch.fingerprintHash !== undefined
         ? patch.fingerprintHash
         : (mergedFinding.fingerprintHash ?? existing.fingerprintHash)
       const nextSupersededBy = patch.supersededByFindingId !== undefined
@@ -1833,8 +1845,9 @@ export class FindingsRepository {
 
       // Monotonicity: a floor-confirmed row is immutable. An agent re-discovery of the same
       // canonical dedupe key is suppressed as a no-op — never overwritten, never duplicated.
-      const targetIsFloor = targetRow?.provenance === 'floor'
-      if (targetIsFloor && options.provenance !== 'floor') {
+      // Pending or static_verified floor rows remain monotonically upgradable once runtime proof arrives.
+      const targetIsFloorConfirmed = targetRow?.provenance === 'floor' && targetRow.finding.status === 'confirmed'
+      if (targetIsFloorConfirmed && options.provenance !== 'floor') {
         this.session.event(
           run.id,
           'finding.floor_preserved',
@@ -1847,11 +1860,9 @@ export class FindingsRepository {
       const rawStoredFinding: Finding = targetRow
         ? mergeChainFindings(targetRow.finding, incoming)
         : incoming
-      const targetIsVerified = Boolean(
-        targetRow && (targetRow.finding.status === 'confirmed' || targetRow.finding.status === 'static_verified'),
-      )
-      const preservesVerifiedIdentity = targetIsVerified && targetRow!.finding.status === rawStoredFinding.status
-      const storedFinding: Finding = preservesVerifiedIdentity && targetRow
+      const targetIsConfirmed = Boolean(targetRow && targetRow.finding.status === 'confirmed')
+      const preservesConfirmedIdentity = targetIsConfirmed && targetRow!.finding.status === rawStoredFinding.status
+      const storedFinding: Finding = preservesConfirmedIdentity && targetRow
         ? {
             ...rawStoredFinding,
             cwe: targetRow.finding.cwe,
@@ -1862,6 +1873,15 @@ export class FindingsRepository {
             ...(targetRow.finding.fingerprintHash !== undefined ? { fingerprintHash: targetRow.finding.fingerprintHash } : {}),
           }
         : rawStoredFinding
+
+      if (storedFinding.status === 'confirmed') {
+        if (storedFinding.verificationTier === 'static_verified') {
+          storedFinding.verificationTier = 'runtime_confirmed'
+        }
+        if (targetRow?.finding.status === 'static_verified' && !incoming.runtimeProofGap) {
+          storedFinding.runtimeProofGap = null
+        }
+      }
 
       const parentFindingIds = options.parentFindingIds
         ? [...new Set(options.parentFindingIds.filter(id => typeof id === 'string' && id.length > 0))]

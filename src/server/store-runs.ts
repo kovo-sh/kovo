@@ -56,6 +56,7 @@ import {
   buildProvenanceReport,
   collapseBaselineHeaderFindings,
   deduplicateChainFindings,
+  isActiveFinding,
 } from '../report-summary.ts'
 import type {
   FindingProvenanceFields,
@@ -2774,6 +2775,7 @@ export class RunsRepository {
         ...(row.parentFindingIds?.length ? { parentFindingIds: row.parentFindingIds } : {}),
         verificationStatus: row.verificationClass,
       }
+      if (!isActiveFinding(finding)) return []
       const isStaticVerified = finding.status === 'static_verified' || finding.verificationTier === 'static_verified'
       if (!isStaticVerified) {
         if (!run.approved.includes(assetId) || !approvedOrigins.has(finding.origin)) return []

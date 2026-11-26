@@ -9,6 +9,7 @@ import {
   collapseBaselineHeaderFindings,
   deduplicateChainFindings,
   dynamicRetestLabels,
+  filterActiveFindings,
   findingVerificationTier,
   isConsolidatedHeaderPostureFinding,
   owaspCategoryTitles,
@@ -287,12 +288,16 @@ export function exportReportMarkdown(
 
   const attachments = new Map<string, Attachment>()
 
+  const STATIC_ANALYSIS_ORIGIN = 'https://static-analysis.invalid'
+  const staticOriginAllowedKinds = new Set<EvidenceSummary['kind']>(['sast', 'patch', 'replay', 'verification'])
+
   function includeEvidence(origin: string, id: string, sourceOnly = false): Attachment | undefined {
     const key = 'ev:' + origin + ':' + id
     const existing = attachments.get(key)
     if (existing) return sourceOnly && (!existing.kind || !isReportSource(existing.kind)) ? undefined : existing
+    const originAllowed = approved.has(origin) || origin === STATIC_ANALYSIS_ORIGIN
     const record = (() => {
-      if (!approved.has(origin) || !evidenceId.safeParse(id).success) return
+      if (!originAllowed || !evidenceId.safeParse(id).success) return
       try { return storage.artifact(run.id, id) } catch { return }
     })()
     if (sourceOnly && record && !isReportSource(record.kind)) return
@@ -300,6 +305,7 @@ export function exportReportMarkdown(
     const entry: Attachment = { number: attachments.size + 1, origin, kind: record?.kind }
     attachments.set(key, entry)
     if (!record || !evidenceLabels[record.kind]) return entry
+    if (origin === STATIC_ANALYSIS_ORIGIN && !staticOriginAllowedKinds.has(record.kind)) return entry
     const assignment = assignments.get(record.assignmentId)
     if (!assignment ||
         record.goalRevision !== body.goalRevision ||
@@ -374,7 +380,7 @@ export function exportReportMarkdown(
     return links.join(' · ')
   }
 
-  const rawFindings = body.findings.filter(item =>
+  const rawFindings = filterActiveFindings(body.findings).filter(item =>
     approved.has(item.origin) || item.status === 'static_verified' || item.verificationTier === 'static_verified',
   )
   const { findings } = collapseBaselineHeaderFindings(deduplicateChainFindings(rawFindings))
@@ -385,6 +391,10 @@ export function exportReportMarkdown(
   const confirmedFindings = findings.filter(item => item.status === 'confirmed')
   const staticVerifiedFindings = findings.filter(item => item.status === 'static_verified')
   const confirmedProminent = prominentFindings.filter(item => item.status === 'confirmed')
+  const staticAdvisoryProminent = prominentFindings.filter(item => item.status === 'static_verified')
+  const unverifiedProminent = prominentFindings.filter(item => item.status !== 'confirmed' && item.status !== 'static_verified')
+  const confirmedHeaderPosture = headerPostureFindings.filter(item => item.status === 'confirmed')
+  const otherHeaderPosture = headerPostureFindings.filter(item => item.status !== 'confirmed')
   const severityCounts = ['critical', 'high', 'medium', 'low', 'informational'].flatMap(severity => {
     const count = confirmedFindings.filter(item => item.severity === severity).length
     return count ? [`- **${severity[0].toUpperCase() + severity.slice(1)}** ${count}`] : []
@@ -459,12 +469,7 @@ export function exportReportMarkdown(
     lines.push('')
   }
 
-  lines.push('## Findings', '')
-  if (!findings.length) lines.push('No findings recorded.', '')
-  if (findings.length && !prominentFindings.length) {
-    lines.push('No Medium, High, Critical, or non-header findings were recorded. Baseline HTTP security header posture is summarized below.', '')
-  }
-  for (const finding of prominentFindings) {
+  function appendFindingMarkdown(finding: (typeof findings)[number]) {
     const links = evidenceLinks(finding.origin, finding.evidenceIds, finding.exchangeIds ?? [])
     const specRow = finding.replaySpecId ? runSpecs.get(finding.replaySpecId) : undefined
     const retests = retestsByFinding.get(finding.id) ?? []
@@ -545,14 +550,32 @@ export function exportReportMarkdown(
     }
   }
 
-  if (headerPostureFindings.length) {
+  lines.push('## Findings', '')
+  if (!findings.length) {
+    lines.push('No findings recorded.', '')
+  } else if (!confirmedProminent.length && !confirmedHeaderPosture.length) {
+    if (staticAdvisoryProminent.length) {
+      lines.push('No runtime-confirmed findings were recorded. Static-verified advisories are listed separately below.', '')
+    } else if (!otherHeaderPosture.length) {
+      lines.push('No runtime-confirmed findings were recorded. Unverified leads and observations are listed separately below.', '')
+    } else {
+      lines.push('No Medium, High, Critical, or non-header findings were recorded. Baseline HTTP security header posture is summarized below.', '')
+    }
+  } else if (!confirmedProminent.length && confirmedHeaderPosture.length) {
+    lines.push('No Medium, High, Critical, or non-header findings were recorded. Baseline HTTP security header posture is summarized below.', '')
+  }
+  for (const finding of confirmedProminent) {
+    appendFindingMarkdown(finding)
+  }
+
+  const renderHeaderPostureTable = (items: typeof headerPostureFindings) => {
     lines.push(
       '### HTTP Security Header Posture (Baseline Hygiene)', '',
       'Repetitive per-origin missing-header baseline checks (CSP, frame protection, `X-Content-Type-Options`, `Referrer-Policy`, and `Server` disclosure) are consolidated below:', '',
       '| Host | Severity | Status | Summary | Evidence |',
       '| :--- | :--- | :--- | :--- | :--- |',
     )
-    for (const posture of headerPostureFindings) {
+    for (const posture of items) {
       const links = evidenceLinks(posture.origin, posture.evidenceIds, posture.exchangeIds ?? [])
       lines.push(
         `| ${inline(posture.origin, secrets)} | ${inline(posture.severity, secrets)} | ${inline(posture.status, secrets)} | ${inline(posture.reason, secrets)} | ${links || '—'} |`,
@@ -561,8 +584,37 @@ export function exportReportMarkdown(
     lines.push('')
   }
 
+  if (confirmedHeaderPosture.length) {
+    renderHeaderPostureTable(confirmedHeaderPosture)
+  }
+
+  if (staticAdvisoryProminent.length) {
+    lines.push(
+      '## Static-Verified Advisories', '',
+      'The following items were verified deterministically via offline static AST/SAST analysis (`static_verified` tier) and are strictly separated from runtime-confirmed findings.', '',
+    )
+    for (const finding of staticAdvisoryProminent) {
+      appendFindingMarkdown(finding)
+    }
+  }
+
+  if (unverifiedProminent.length || otherHeaderPosture.length) {
+    lines.push(
+      '## Unverified Leads & Other Observations', '',
+      'Pending, inconclusive, or dismissed observations retained for audit completeness (not confirmed findings).', '',
+    )
+    for (const finding of unverifiedProminent) {
+      appendFindingMarkdown(finding)
+    }
+    if (otherHeaderPosture.length) {
+      renderHeaderPostureTable(otherHeaderPosture)
+    }
+  }
+
   const findingsMetaById = new Map(findings.map(f => [f.id, { title: f.title, severity: f.severity, cwe: f.cwe ?? null }]))
+  const activeFindingIds = new Set(findings.map(f => f.id))
   const storeCompositeInputs = extractStoreCompositeReceipts([...runSpecs.values()], runRetests, findingsMetaById)
+    .filter(item => !item.findingId || activeFindingIds.has(item.findingId))
   const compositeByChain = new Map<string, PortableCompositeReceiptRecord>()
   const addCompositeIfInScope = (item: CompositeChainMarkdownInput) => {
     const normalized = normalizeCompositeForMarkdown(item, secrets, options.zdr === true)

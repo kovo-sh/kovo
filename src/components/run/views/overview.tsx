@@ -9,7 +9,7 @@ import { HostLabel } from '../display.tsx'
 import { fmtDate, fmtN, fmtTime, fmtTok, host, plural } from '../format.ts'
 import { CovSwatch, LiveDot, SevGlyph, StatusGlyph } from '../glyphs.tsx'
 import { Icon } from '../icons.tsx'
-import { PHASE_LABEL, SEV, SEV_COL, SEV_LABEL } from '../meta.ts'
+import { normFStatus, PHASE_LABEL, SEV, SEV_COL, SEV_LABEL, stLabel } from '../meta.ts'
 import type { ViewId } from '../meta.ts'
 import { bySeriousness, coverageCounts, trafficHistogram } from '../model.ts'
 import { AnimatedNumber, Meter } from '../motion.tsx'
@@ -68,7 +68,7 @@ export function liveOverviewSummary(input: {
       }
     }
   }
-  return `${PHASE_LABEL[input.phase] ?? input.phase} · Round ${input.roundNo}`
+  return `${PHASE_LABEL[input.phase] ?? (input.phase || 'Running')} · Round ${input.roundNo ?? 0}`
 }
 
 function RunOverview() {
@@ -261,7 +261,7 @@ function RunOverview() {
                 onKeyDown={e => { if (e.key === 'Enter') links.finding(f.id) }}
               >
                 <span className="inline-flex size-3.5 flex-none items-center justify-center"><SevGlyph sev={f.severity} /></span>
-                <span className="inline-flex size-3.5 flex-none items-center justify-center" title={f.status}><StatusGlyph status={f.status === 'static_verified' ? 'confirmed' : f.status} /></span>
+                <span className="inline-flex size-3.5 flex-none items-center justify-center" title={stLabel(normFStatus(f.status))}><StatusGlyph status={normFStatus(f.status)} /></span>
                 <span className="min-w-0 flex-1 truncate text-fg">{f.title}</span>
                 <span className="w-[130px] flex-none truncate text-right font-mono text-[12px] text-fg-subtle max-[1180px]:hidden">
                   <HostLabel host={host(f.origin)} quiet max={22} />

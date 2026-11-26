@@ -4,6 +4,25 @@ import { assessmentCheckIds, assetOrigin, id, preparedObservation, referrerPolic
 import type { EvidenceSummary } from '../domain.ts'
 import { accessPolicyReviews } from './access-policy-checks.ts'
 import { checkCoverage } from './evidence-checks.ts'
+import type { ReplayVerdict, RetestVerdict } from './replay-verifier.ts'
+
+const STATIC_ANALYSIS_ORIGIN = 'https://static-analysis.invalid'
+
+export const REPORT_EVIDENCE_VERDICTS = [
+  'confirmed',
+  'static_verified',
+  'dismissed',
+  'inconclusive',
+  'reproduced',
+  'fixed',
+] as const satisfies readonly (ReplayVerdict | RetestVerdict)[]
+
+type _AssertAllReportVerdictsCovered =
+  Exclude<ReplayVerdict | RetestVerdict, (typeof REPORT_EVIDENCE_VERDICTS)[number]> extends never ? true : never
+const _allReportVerdictsCovered: _AssertAllReportVerdictsCovered = true
+void _allReportVerdictsCovered
+
+export const reportEvidenceVerdictSchema = z.enum(REPORT_EVIDENCE_VERDICTS)
 
 export const responseCapture = z.object({
   observation: preparedObservation.extend({
@@ -55,7 +74,7 @@ const replayReceipt = z.object({
   specSha256: z.string().optional(),
   kind: z.string().optional(),
   origin: assetOrigin.optional(),
-  verdict: z.enum(['confirmed', 'dismissed', 'inconclusive', 'reproduced', 'fixed']).optional(),
+  verdict: reportEvidenceVerdictSchema.optional(),
   outcome: z.object({
     confirmed: z.boolean(),
     controlPassed: z.boolean(),
@@ -110,7 +129,26 @@ export function restrictAccessVerification(content: string, source: { id: string
 }
 
 export function isReportSource(kind: EvidenceSummary['kind']) {
-  return kind === 'observation' || kind === 'access-policy' || kind === 'exchange' || kind === 'dns' || kind === 'tls' || kind === 'browser'
+  return (
+    kind === 'observation'
+    || kind === 'access-policy'
+    || kind === 'exchange'
+    || kind === 'dns'
+    || kind === 'tls'
+    || kind === 'browser'
+    || kind === 'sast'
+    || kind === 'surface'
+    || kind === 'patch'
+    || kind === 'ws'
+  )
+}
+
+function isOriginAllowedForEvidence(
+  candidate: string,
+  approved: ReadonlySet<string>,
+  allowStaticOrigin: boolean,
+): boolean {
+  return approved.has(candidate) || (allowStaticOrigin && candidate === STATIC_ANALYSIS_ORIGIN)
 }
 
 export function projectReportEvidence(
@@ -143,8 +181,9 @@ export function projectReportEvidence(
       }
       const replay = replayReceipt.safeParse(input)
       if (replay.success) {
-        if (replay.data.origin && !approved.has(replay.data.origin)) return
-        if (replay.data.sourceOrigins?.some(o => !approved.has(o))) return
+        const allowStaticOrigin = replay.data.verdict === 'static_verified' || replay.data.kind === 'static_ast_proof'
+        if (replay.data.origin && !isOriginAllowedForEvidence(replay.data.origin, approved, allowStaticOrigin)) return
+        if (replay.data.sourceOrigins?.some(o => !isOriginAllowedForEvidence(o, approved, allowStaticOrigin))) return
         return { data: replay.data }
       }
       return
@@ -152,8 +191,9 @@ export function projectReportEvidence(
     case 'replay': {
       const replay = replayReceipt.safeParse(input)
       if (!replay.success) return
-      if (replay.data.origin && !approved.has(replay.data.origin)) return
-      if (replay.data.sourceOrigins?.some(o => !approved.has(o))) return
+      const allowStaticOrigin = replay.data.verdict === 'static_verified' || replay.data.kind === 'static_ast_proof'
+      if (replay.data.origin && !isOriginAllowedForEvidence(replay.data.origin, approved, allowStaticOrigin)) return
+      if (replay.data.sourceOrigins?.some(o => !isOriginAllowedForEvidence(o, approved, allowStaticOrigin))) return
       return { data: replay.data }
     }
     case 'analysis':
@@ -162,17 +202,31 @@ export function projectReportEvidence(
     case 'tls':
     case 'browser':
     case 'threat-model':
-    case 'digest': {
+    case 'digest':
+    case 'sast':
+    case 'surface':
+    case 'patch':
+    case 'ws': {
       const parsed = genericRecord.safeParse(input)
       if (!parsed.success) return
+      const allowStaticOrigin = kind === 'sast' || kind === 'patch'
       const rawOrigin = typeof parsed.data.origin === 'string' ? parsed.data.origin : undefined
-      if (rawOrigin && !approved.has(rawOrigin)) return
+      if (rawOrigin && !isOriginAllowedForEvidence(rawOrigin, approved, allowStaticOrigin)) return
       const redirectOrigins = Array.isArray(parsed.data.redirectOrigins) ? parsed.data.redirectOrigins : []
       if (redirectOrigins.some(item => typeof item === 'string' && !approved.has(item))) return
       const inputEvidence = Array.isArray(parsed.data.inputEvidence)
         ? parsed.data.inputEvidence.filter((item): item is string => typeof item === 'string' && id.safeParse(item).success)
         : undefined
       return { data: parsed.data, ...(inputEvidence?.length ? { sources: inputEvidence } : {}) }
+    }
+    case 'inventory':
+    case 'handoff': {
+      // Internal run-orchestration records are intentionally excluded from exported report appendices.
+      return undefined
+    }
+    default: {
+      const _exhaustive: never = kind
+      return _exhaustive
     }
   }
 }

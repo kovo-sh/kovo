@@ -27,7 +27,14 @@ import { usePaletteCommands } from '../palette.tsx'
 import type { InspectorMap } from '../pane.tsx'
 import { useToast } from '../toast.tsx'
 import { cn, runBtn, runDdItem, runIconBtn, RW } from '../tw.ts'
-import { canGeneratePatch, canVerifyFix, PatchProposalReview } from './findings-inspector.tsx'
+import {
+  canGeneratePatch,
+  canVerifyFix,
+  CompositeProofDagCard,
+  extractCompositeProofSummary,
+  PatchProposalReview,
+} from './findings-inspector.tsx'
+import type { CompositeDagSummary } from './findings-inspector.tsx'
 
 const H2 = 'm-0 mb-2.5 mt-[30px] text-[12px] font-semibold uppercase tracking-[0.02em] text-fg-subtle'
 const DL = 'm-0 mb-2.5 grid grid-cols-[112px_minmax(0,1fr)] gap-x-3 gap-y-1 text-[12.5px] leading-[19px] [&_dt]:text-fg-subtle [&_dd]:m-0 [&_dd]:break-words [&_dd]:text-fg-muted'
@@ -49,7 +56,7 @@ export function safeReportText(value: unknown, fallback = ''): string {
 export function normalizeReportBody(rawBody: Partial<Rep['body']> | null | undefined) {
   const b = (rawBody && typeof rawBody === 'object' ? rawBody : {}) as Partial<Rep['body']>
   const findings = (Array.isArray(b.findings) ? b.findings : [])
-    .filter((f): f is ReportFinding => Boolean(f && typeof f === 'object'))
+    .filter((f): f is ReportFinding => Boolean(f && typeof f === 'object' && !f.supersededByFindingId))
     .map((f, idx) => ({
       ...f,
       id: safeReportText(f.id, `finding-${idx}`),
@@ -156,6 +163,8 @@ export function ReportDoc({ rep, versions, setVersion }: { rep: Rep; versions: n
   const [open, setOpen] = useViewState<Record<string, boolean>>('report.open', {})
   const [allF, setAllF] = useState(false)
   const [allT, setAllT] = useState(false)
+  const [expandedEvidence, setExpandedEvidence] = useState<Record<string, boolean>>({})
+  const [expandedTags, setExpandedTags] = useState<Record<string, boolean>>({})
   const [patching, setPatching] = useState<string | null>(null)
 
   const fs = useMemo(
@@ -165,6 +174,7 @@ export function ReportDoc({ rep, versions, setVersion }: { rep: Rep; versions: n
   const sevC: Record<string, number> = {}
   fs.forEach(f => { sevC[f.severity] = (sevC[f.severity] ?? 0) + 1 })
   const conf = fs.filter(f => normFStatus(f.status) === 'confirmed').length
+  const staticCount = fs.filter(f => normFStatus(f.status) === 'static_verified').length
   const { coverage: covLine, confirmed: runtimeConf, staticVerified, chainConfirmed, priority } = reportHighlights(b)
   const checks = Array.isArray(b.selectedChecks?.checks) ? b.selectedChecks!.checks : []
   const checkRows = b.coverage.filter(c => Array.isArray(c.checks) && c.checks.length > 0)
@@ -202,6 +212,26 @@ export function ReportDoc({ rep, versions, setVersion }: { rep: Rep; versions: n
     if (!x) continue
     retests.set(x.findingId, [...(retests.get(x.findingId) ?? []), x])
   }
+  const compositeByFinding = useMemo(() => {
+    const map = new Map<string, CompositeDagSummary>()
+    for (const f of fs) {
+      const rs = (f.replaySpecId ? replayById.get(f.replaySpecId) : undefined) ?? replayByFinding.get(f.id)
+      const dag = extractCompositeProofSummary(rs, retests.get(f.id) ?? [])
+      if (dag) map.set(f.id, dag)
+    }
+    return map
+  }, [fs, detail.replaySpecs, detail.retestRuns])
+  const compositeEntries = useMemo(() => {
+    const seen = new Set<string>()
+    const out: Array<{ findingId: string; title: string; summary: CompositeDagSummary }> = []
+    for (const f of fs) {
+      const summary = compositeByFinding.get(f.id)
+      if (!summary || seen.has(summary.chainId)) continue
+      seen.add(summary.chainId)
+      out.push({ findingId: f.id, title: f.title, summary })
+    }
+    return out
+  }, [fs, compositeByFinding])
   const activeRetest = (Array.isArray(detail.assignments) ? detail.assignments : [])
     .filter(a => a && a.phase === 'retest' && (a.status === 'queued' || a.status === 'running'))
     .map(a => safeReportText(a.objective))
@@ -307,9 +337,10 @@ export function ReportDoc({ rep, versions, setVersion }: { rep: Rep; versions: n
     </div>
     <h1 className="m-0 mb-1.5 mt-2 text-[22px] font-semibold leading-[29px] tracking-[-0.02em] text-fg">{hed}</h1>
     <p className="m-0 mb-[22px] line-clamp-3 text-[13px] leading-5 text-fg-muted">{b.goal}</p>
-    <div className="grid grid-cols-5 border-y border-line tabular-nums">
+    <div className={cn('grid border-y border-line tabular-nums', staticCount > 0 ? 'grid-cols-6' : 'grid-cols-5')}>
       <div className="py-2.5"><div className="text-[11.5px] text-fg-subtle">Findings</div><div className="text-[18px] font-[550] leading-[26px] tracking-[-0.02em] text-fg">{fs.length}</div></div>
       <div className="py-2.5"><div className="text-[11.5px] text-fg-subtle">Confirmed by replay</div><div className="text-[18px] font-[550] leading-[26px] tracking-[-0.02em] text-fg">{conf}</div></div>
+      {staticCount > 0 && <div className="py-2.5"><div className="text-[11.5px] text-fg-subtle">Static advisories</div><div className="text-[18px] font-[550] leading-[26px] tracking-[-0.02em] text-fg">{staticCount}</div></div>}
       <div className="py-2.5"><div className="text-[11.5px] text-fg-subtle">Requests</div><div className="text-[18px] font-[550] leading-[26px] tracking-[-0.02em] text-fg">{fmtN(m?.requestsUsed)}</div></div>
       <div className="py-2.5"><div className="text-[11.5px] text-fg-subtle">Verified steps</div><div className="text-[18px] font-[550] leading-[26px] tracking-[-0.02em] text-fg">{fmtN(m?.chainStepsCompleted)}{m && m.chainStepsUntested > 0 && <span className="text-[12px] font-normal tracking-normal text-fg-subtle"> · {m.chainStepsUntested} remaining</span>}</div></div>
       <div className="py-2.5"><div className="text-[11.5px] text-fg-subtle">Spent</div><div className="text-[18px] font-[550] leading-[26px] tracking-[-0.02em] text-fg">{fmtUsd(m?.spentUsd)}</div></div>
@@ -376,7 +407,7 @@ export function ReportDoc({ rep, versions, setVersion }: { rep: Rep; versions: n
             <td colSpan={3} className="border-b border-line pb-3.5 pt-0.5 align-top [overflow-wrap:anywhere]">
               <div className="mb-2.5 mt-0.5 flex flex-wrap gap-[5px]">
                 <Tag><SevGlyph sev={f.severity} />{SEV_LABEL[f.severity] ?? safeReportText(f.severity)}</Tag>
-                <Tag tone={st === 'confirmed' ? 'accent' : undefined}><StatusGlyph status={st} />{stLabel(f.status)}</Tag>
+                <Tag tone={st === 'confirmed' ? 'accent' : st === 'static_verified' ? 'solid' : undefined}><StatusGlyph status={st} />{stLabel(st)}</Tag>
               </div>
               {f.check && <div className={RW.cmp}>
                 <div className="grid grid-cols-[72px_1fr] text-[12px] leading-[18px]">
@@ -392,9 +423,10 @@ export function ReportDoc({ rep, versions, setVersion }: { rep: Rep; versions: n
                 {showReason && <><dt>{st === 'confirmed' ? 'Observation' : 'Reason'}</dt><dd>{f.reason}</dd></>}
                 {f.impact != null && safeReportText(f.impact) && <><dt>Impact</dt><dd>{safeReportText(f.impact)}</dd></>}
                 {codeLocations.length > 0 && <><dt>Code</dt><dd className="font-mono text-[12px]">{codeLocations.map(l => `${safeReportText(l.repo)}/${safeReportText(l.file)}:${l.startLine ?? 0}${(l.endLine ?? 0) > (l.startLine ?? 0) ? '-' + l.endLine : ''}`).join(', ')}</dd></>}
-                {f.remediation && <><dt>{st === 'confirmed' ? 'Remediation' : 'Follow-up'}</dt><dd>{f.remediation}</dd></>}
+                {f.remediation && <><dt>{st === 'confirmed' || st === 'static_verified' ? 'Remediation' : 'Follow-up'}</dt><dd>{f.remediation}</dd></>}
                 {f.recheck != null && safeReportText(f.recheck) && <><dt>Check the fix</dt><dd>{safeReportText(f.recheck)}</dd></>}
               </dl>
+              {compositeByFinding.get(f.id) && <CompositeProofDagCard summary={compositeByFinding.get(f.id)!} compact />}
               {(tier || rk || f.confidence || f.confidenceRationale || f.counterevidence || f.runtimeProofGap || f.verification || (f.chainFactIds?.length ?? 0) > 0) && <Disclosure title="Verification details" right={rk ?? (tier ? verificationTierLabels[tier] : undefined)}>
                 <dl className={cn(DL, 'mb-0')}>
                   {tier && <><dt>Verification</dt><dd>{verificationTierLabels[tier]}</dd></>}
@@ -416,7 +448,16 @@ export function ReportDoc({ rep, versions, setVersion }: { rep: Rep; versions: n
                   <Icon name="replay" />{queued ? 'Verifying fix…' : 'Verify Fix'}</button>}
               </div>}
               <div className="-ml-[9px] flex flex-wrap gap-0.5">
-                {f.evidenceIds.map(id => <button key={id} type="button" className={cn(runBtn({ variant: 'ghost' }), 'max-w-full')} onClick={() => ev(id)}><Icon name="fact" /><span className="truncate">{evidenceTitle(id)}</span></button>)}
+                {(expandedEvidence[f.id] ? f.evidenceIds : f.evidenceIds.slice(0, 8)).map(id => <button key={id} type="button" className={cn(runBtn({ variant: 'ghost' }), 'max-w-full')} onClick={() => ev(id)}><Icon name="fact" /><span className="truncate">{evidenceTitle(id)}</span></button>)}
+                {f.evidenceIds.length > 8 && (
+                  <button
+                    type="button"
+                    className={cn(runBtn({ variant: 'link', size: 'none' }), 'px-2 text-[12px]')}
+                    onClick={() => setExpandedEvidence(prev => ({ ...prev, [f.id]: !prev[f.id] }))}
+                  >
+                    {expandedEvidence[f.id] ? 'Show first 8 items' : `Show all ${f.evidenceIds.length} items`}
+                  </button>
+                )}
                 {rtEvidenceIds.map(id => <button key={'rt' + id} type="button" className={cn(runBtn({ variant: 'ghost' }), 'max-w-full')} onClick={() => ev(id)}><Icon name="replay" />Retest evidence</button>)}
                 {canPatch && <button type="button" className={cn(runBtn({ variant: 'ghost' }), 'max-w-full')} disabled={patching === f.id} onClick={() => void patch(f)}><Icon name="edit" />{patching === f.id ? 'Generating patch…' : 'Generate verified patch'}</button>}
                 {live && <button type="button" className={cn(runBtn({ variant: 'ghost' }), 'max-w-full')} onClick={() => links.finding(f.id)}>Open in Findings<Icon name="arrowR" /></button>}
@@ -427,6 +468,13 @@ export function ReportDoc({ rep, versions, setVersion }: { rep: Rep; versions: n
       })}
     </tbody></table>}
     {fs.length > 40 && <button type="button" className={cn(runBtn({ variant: 'link', size: 'none' }), 'mt-1')} onClick={() => setAllF(v => !v)}>{allF ? 'Show the first 40' : `Show all ${fs.length} findings`}</button>}
+
+    {compositeEntries.length > 0 && <>
+      <h2 className={H2}>Multi-hop causal chains</h2>
+      {compositeEntries.map(entry => (
+        <CompositeProofDagCard key={entry.summary.chainId} summary={entry.summary} title={entry.title} />
+      ))}
+    </>}
 
     {checks.length > 0 && checkRows.length > 0 && <>
       <h2 className={H2}>Baseline checks by origin</h2>
@@ -500,7 +548,22 @@ export function ReportDoc({ rep, versions, setVersion }: { rep: Rep; versions: n
           <td className="border-b border-line py-[7px] align-top">
             <div className="text-fg"><span className="font-mono text-[12px]">{e.origin ? host(e.origin) : 'unknown'}</span> <span className="text-fg-subtle">· {RISKL[e.riskTier as RiskTier] ?? safeReportText(e.riskTier)}</span></div>
             <div className="mt-0.5 text-[12px] leading-[18px] text-fg-subtle">{safeReportText(e.rationale)}</div>
-            {surfaceTags.length > 0 && <div className="mb-0.5 mt-1.5 flex flex-wrap gap-[5px]">{surfaceTags.slice(0, 6).map(t => <Tag key={safeReportText(t)}>{safeReportText(t)}</Tag>)}</div>}
+            {surfaceTags.length > 0 && <div className="mb-0.5 mt-1.5 flex flex-wrap items-center gap-[5px]">
+              {(expandedTags[e.origin ?? String(i)] ? surfaceTags : surfaceTags.slice(0, 6)).map(t => <Tag key={safeReportText(t)}>{safeReportText(t)}</Tag>)}
+              {surfaceTags.length > 6 && (
+                <button
+                  type="button"
+                  className={cn(runBtn({ variant: 'link', size: 'none' }), 'text-[11.5px]')}
+                  onClick={evClick => {
+                    evClick.stopPropagation()
+                    const key = e.origin ?? String(i)
+                    setExpandedTags(prev => ({ ...prev, [key]: !prev[key] }))
+                  }}
+                >
+                  {expandedTags[e.origin ?? String(i)] ? 'Show first 6' : `Show all ${surfaceTags.length} items`}
+                </button>
+              )}
+            </div>}
           </td>
         </tr>
       })}</tbody></table>
