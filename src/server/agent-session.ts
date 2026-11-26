@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto"
-import { mkdirSync, writeFileSync } from "node:fs"
-import { join } from "node:path"
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs"
+import { join, relative, sep } from "node:path"
 import { BACKGROUND_CONTEXT, withAbortSignal } from "@earendil-works/chord/context"
 import {
   createRegistry,
@@ -52,6 +52,7 @@ import type { CallRecorder, ProviderConfig, ProviderOptions, SecretSource, Usage
 import { redactSecrets } from "./egress-sanitizer.ts"
 import { redact } from "./redact.ts"
 import type { NamedSecret } from "./redact.ts"
+import { MAX_CLAIM_REGEX_HAYSTACK, compileSafeClaimRegex } from "./safe-regex.ts"
 import { listSkills, listSkillTags, loadSkill, searchSkills, selectPreInjectionSkills, skillsByTag } from "./skills.ts"
 import {
   EARLY_EXIT_GRACE_TURNS,
@@ -124,11 +125,14 @@ import type {
   ProofObligationEvent,
   ProofObligationStats,
   ProofRouteObligation,
+  ReadEvidenceSliceArgs,
+  ReadRepoFileArgs,
   RejectedProofGap,
   RequestHttpArgs,
   RouteAttemptObservation,
   RouteObservation,
   RouteObservationSnapshot,
+  SearchRepoArgs,
   SpecProofGapCode,
   SpecProofGapEntry,
   SpecRouteEvidence,
@@ -285,6 +289,8 @@ export type {
   ProofToolHandler,
   ProofToolHandlerName,
   ProposeChainFindingArgs,
+  ReadEvidenceSliceArgs,
+  ReadRepoFileArgs,
   RecordCoverageArgs,
   RejectedProofGap,
   RequestHttpArgs,
@@ -295,6 +301,7 @@ export type {
   RunOfflineScriptArgs,
   RunSastScanArgs,
   RunSafeTemplatesToolArgs,
+  SearchRepoArgs,
   SpecProofGapCode,
   SpecProofGapEntry,
   SpecRouteEvidence,
@@ -325,7 +332,7 @@ export {
 
 /** Settlement: probe tools revoked at 85%; read/query tools kept until the final turn; kovo_verify stays available through the final turn as the primary proof submission tool. */
 const SETTLEMENT_REVOKED_TOOLS = new Set(['request_http', 'request_http_batch', 'request_http_race', 'requestHttpRace', 'browser_visit', 'browser_session', 'probe_surface', 'probe_differential', 'run_safe_templates', 'probe_websocket'])
-const SETTLEMENT_WRAPUP_TOOLS = new Set(['verify_replay_spec', 'search_facts', 'search_exchanges', 'get_exchange', 'read_peer_trace', 'expand_digest', 'board_read', 'query_cves', 'load_skill'])
+const SETTLEMENT_WRAPUP_TOOLS = new Set(['verify_replay_spec', 'search_facts', 'search_exchanges', 'get_exchange', 'read_peer_trace', 'expand_digest', 'board_read', 'query_cves', 'load_skill', 'read_repo_file', 'search_repo', 'read_evidence_slice'])
 
 /**
  * Tools that count as route evidence (the worker actually requested a target route) and as spec
@@ -1168,6 +1175,635 @@ function truncateUtf8Tail(text: string, maxBytes: number): string {
   return buf.subarray(start).toString('utf8')
 }
 
+// ---------------------------------------------------------------------------
+// Q2: Host-Executed Read-Only Repo & Evidence Tools + Malformed-Arg Diagnostics
+// ---------------------------------------------------------------------------
+
+const HOST_REPO_SKIP_DIRS = new Set([
+  '.git', 'node_modules', '.ssh', '.gnupg', '.aws', '.kube', '.docker', '.azure', '.gcloud', '.terraform',
+])
+const HOST_REPO_SENSITIVE_FILES = new Set([
+  'id_rsa', 'id_ed25519', 'id_ecdsa', 'id_dsa', '.netrc', '.npmrc', '.pypirc', '.pgpass', '.my.cnf', '.git-credentials',
+])
+const HOST_REPO_SENSITIVE_EXT_RE = /\.(?:pem|key|p12|pfx|jks|keystore|kdbx|ppk)$/i
+const HOST_REPO_SAFE_ENV_TEMPLATE_RE = /^\.env\.(?:example|sample|template|dist|defaults?)$/i
+const HOST_REPO_SOURCE_EXT_RE = /\.(?:[cm]?[jt]sx?|py|go|rs|java|kt|rb|php|cs|c|cpp|h|hpp|swift|scala)$/i
+const SAFE_ARTIFACT_ID_RE = /^[A-Za-z0-9._-]{1,180}$/
+const SAFE_MOUNTED_REPO_RE = /^\/repos\/([A-Za-z0-9._-]+)\/([A-Za-z0-9._-]+)$/
+
+const MAX_REPO_FILE_BYTES = 4 * 1024 * 1024
+const DEFAULT_REPO_READ_LINES = 200
+const MAX_REPO_READ_LINES = 400
+const MAX_REPO_READ_OUTPUT_BYTES = 16 * 1024
+
+const DEFAULT_SEARCH_MATCHES = 50
+const MAX_SEARCH_MATCHES = 200
+const MAX_SEARCH_FILES = 4_000
+const MAX_SEARCH_FILE_BYTES = 512 * 1024
+const MAX_SEARCH_TOTAL_BYTES = 32 * 1024 * 1024
+const MAX_SEARCH_LINE_CHARS = 240
+
+const DEFAULT_EVIDENCE_SLICE_LIMIT = 8_192
+const MAX_EVIDENCE_SLICE_LIMIT = 16_384
+const MAX_HOST_SPILL_ENTRIES = 64
+const MAX_HOST_SPILL_TOTAL_BYTES = 16 * 1024 * 1024
+
+function isSensitiveHostRepoSegment(segment: string, isDir: boolean, parentSegments: readonly string[]): boolean {
+  const lower = segment.toLowerCase()
+  if (HOST_REPO_SKIP_DIRS.has(lower)) return true
+  if (isDir) return false
+  if (HOST_REPO_SENSITIVE_FILES.has(lower)) return true
+  if (HOST_REPO_SENSITIVE_EXT_RE.test(lower)) return true
+  if (lower === '.env' || (lower.startsWith('.env.') && !HOST_REPO_SAFE_ENV_TEMPLATE_RE.test(lower))) return true
+  if (parentSegments.some(p => p.toLowerCase() === 'credentials') && !HOST_REPO_SOURCE_EXT_RE.test(lower)) return true
+  return false
+}
+
+function isSensitiveHostRepoPath(relPosixPath: string): boolean {
+  const segments = relPosixPath.split('/').filter(Boolean)
+  if (segments.length === 0) return false
+  for (let i = 0; i < segments.length; i += 1) {
+    const isDir = i < segments.length - 1
+    if (isSensitiveHostRepoSegment(segments[i]!, isDir, segments.slice(0, i))) return true
+  }
+  return false
+}
+
+function assertCleanRootDir(rootDir: string, label: string): string {
+  if (!rootDir || /[\0\r\n]/.test(rootDir) || !existsSync(rootDir)) {
+    throw new Error(`${label} directory is not available.`)
+  }
+  const st = lstatSync(rootDir)
+  if (!st.isDirectory() || st.isSymbolicLink()) {
+    throw new Error(`${label} root must be a real non-symlink directory.`)
+  }
+  return realpathSync(rootDir)
+}
+
+function resolveJailedHostPath(
+  rootDir: string,
+  rawPath: string,
+  kind: 'repo' | 'evidence',
+  options?: { allowRoot?: boolean },
+): { realRoot: string; realTarget: string; relPosix: string } {
+  const label = kind === 'repo' ? '/repos' : '/evidence'
+  const realRoot = assertCleanRootDir(rootDir, label)
+  const trimmed = rawPath.trim()
+  if (/[\0\r\n]/.test(trimmed) || /^[A-Za-z]:/.test(trimmed)) {
+    throw new Error(`Invalid ${label} path: control characters or drive prefixes are refused.`)
+  }
+  if (trimmed.includes('\\')) {
+    throw new Error(`Invalid ${label} path: backslashes are not permitted.`)
+  }
+  const stripped = kind === 'repo'
+    ? trimmed.replace(/^\/?repos(?:\/|$)/, '')
+    : trimmed.replace(/^\/?evidence(?:\/|$)/, '')
+  const rawSegments = stripped.split('/')
+  const segments: string[] = []
+  for (const seg of rawSegments) {
+    if (!seg) continue
+    if (seg === '.' || seg === '..') {
+      throw new Error(`Path traversal refused: "${rawPath}" escapes ${label}.`)
+    }
+    segments.push(seg)
+  }
+  if (segments.length === 0) {
+    if (options?.allowRoot) {
+      return { realRoot, realTarget: realRoot, relPosix: '' }
+    }
+    throw new Error(`Path must reference a file inside ${label}.`)
+  }
+  const candidateRel = segments.join('/')
+  if (kind === 'repo' && isSensitiveHostRepoPath(candidateRel)) {
+    throw new Error(`Access refused for restricted repository path "${candidateRel}" (.git, node_modules, and credential/secret files are blocked).`)
+  }
+
+  let current = realRoot
+  for (const seg of segments) {
+    current = join(current, seg)
+    let lst
+    try {
+      lst = lstatSync(current)
+    } catch {
+      throw new Error(`Path not found under ${label}: "${candidateRel}".`)
+    }
+    if (lst.isSymbolicLink()) {
+      throw new Error(`Symlink escape refused under ${label}: symbolic links are not permitted ("${candidateRel}").`)
+    }
+  }
+  const realTarget = realpathSync(current)
+  if (realTarget !== realRoot && !realTarget.startsWith(realRoot + sep)) {
+    throw new Error(`Path traversal refused: "${rawPath}" escapes ${label}.`)
+  }
+  const canonicalRel = relative(realRoot, realTarget).split(sep).join('/')
+  if (kind === 'repo' && canonicalRel && isSensitiveHostRepoPath(canonicalRel)) {
+    throw new Error(`Access refused for restricted repository path "${canonicalRel}".`)
+  }
+  return { realRoot, realTarget, relPosix: canonicalRel }
+}
+
+function isBinaryBuffer(buf: Buffer): boolean {
+  const probeLen = Math.min(buf.length, 8_192)
+  for (let i = 0; i < probeLen; i += 1) {
+    if (buf[i] === 0) return true
+  }
+  return false
+}
+
+export interface HostReadRepoFileResult {
+  path: string
+  startLine: number
+  endLine: number
+  totalLines: number
+  truncated: boolean
+  nextStartLine?: number
+  content: string
+}
+
+export function readRepoFileHost(reposDir: string, args: ReadRepoFileArgs): HostReadRepoFileResult {
+  const resolved = resolveJailedHostPath(reposDir, args.path, 'repo', { allowRoot: false })
+  const st = lstatSync(resolved.realTarget)
+  if (!st.isFile()) {
+    throw new Error(`Path "/repos/${resolved.relPosix}" is not a regular file.`)
+  }
+  if (st.size > MAX_REPO_FILE_BYTES) {
+    throw new Error(`File "/repos/${resolved.relPosix}" exceeds the ${Math.floor(MAX_REPO_FILE_BYTES / (1024 * 1024))} MiB read_repo_file limit.`)
+  }
+  const buf = readFileSync(resolved.realTarget)
+  if (isBinaryBuffer(buf)) {
+    throw new Error(`File "/repos/${resolved.relPosix}" appears to be binary and cannot be read as UTF-8 text.`)
+  }
+  const text = buf.toString('utf8')
+  const normalizedText = text.endsWith('\r\n') ? text.slice(0, -2) : (text.endsWith('\n') ? text.slice(0, -1) : text)
+  const lines = normalizedText.length === 0 ? [] : normalizedText.split(/\r?\n/)
+  const totalLines = lines.length
+  const startLine = Math.max(1, Math.trunc(args.startLine ?? 1))
+  if (totalLines === 0 || startLine > totalLines) {
+    return {
+      path: `/repos/${resolved.relPosix}`,
+      startLine,
+      endLine: totalLines,
+      totalLines,
+      truncated: false,
+      content: '',
+    }
+  }
+  const requestedEnd = args.endLine !== undefined
+    ? Math.trunc(args.endLine)
+    : startLine + DEFAULT_REPO_READ_LINES - 1
+  const cappedEnd = Math.min(totalLines, Math.max(startLine, Math.min(requestedEnd, startLine + MAX_REPO_READ_LINES - 1)))
+
+  const outLines: string[] = []
+  let bytesUsed = 0
+  let actualEnd = startLine - 1
+  for (let lineNo = startLine; lineNo <= cappedEnd; lineNo += 1) {
+    const rawLine = lines[lineNo - 1] ?? ''
+    const formatted = `${lineNo}: ${rawLine}`
+    const lineBytes = Buffer.byteLength(formatted, 'utf8') + (outLines.length > 0 ? 1 : 0)
+    if (outLines.length > 0 && bytesUsed + lineBytes > MAX_REPO_READ_OUTPUT_BYTES) {
+      break
+    }
+    if (outLines.length === 0 && lineBytes > MAX_REPO_READ_OUTPUT_BYTES) {
+      outLines.push(truncateUtf8Head(formatted, MAX_REPO_READ_OUTPUT_BYTES))
+      actualEnd = lineNo
+      break
+    }
+    outLines.push(formatted)
+    bytesUsed += lineBytes
+    actualEnd = lineNo
+  }
+
+  const truncated = actualEnd < totalLines
+  return {
+    path: `/repos/${resolved.relPosix}`,
+    startLine,
+    endLine: actualEnd,
+    totalLines,
+    truncated,
+    ...(truncated ? { nextStartLine: actualEnd + 1 } : {}),
+    content: outLines.join('\n'),
+  }
+}
+
+export interface HostSearchRepoResult {
+  query: string
+  mode: 'literal' | 'regex'
+  pathPrefix: string
+  filesScanned: number
+  matchCount: number
+  truncated: boolean
+  matches: Array<{ path: string; line: number; text: string }>
+}
+
+export function searchRepoHost(reposDir: string, args: SearchRepoArgs): HostSearchRepoResult {
+  const query = typeof args.query === 'string' ? args.query : ''
+  if (!query || query.length > 256) {
+    throw new Error('search_repo query must be a non-empty string up to 256 characters.')
+  }
+  const maxMatches = Math.max(1, Math.min(Math.trunc(args.maxMatches ?? DEFAULT_SEARCH_MATCHES), MAX_SEARCH_MATCHES))
+  const useRegex = args.regex === true
+  const caseSensitive = args.caseSensitive === true
+
+  let regexMatcher: RegExp | null = null
+  const literalNeedle = caseSensitive ? query : query.toLowerCase()
+  if (useRegex) {
+    const compiled = compileSafeClaimRegex(query, { flags: caseSensitive ? '' : 'i', maxLength: 256 })
+    if (!compiled.ok) {
+      throw new Error(`Unsafe or invalid search_repo regex rejected: ${compiled.reason} Use literal search (regex: false) or a simpler linear pattern.`)
+    }
+    regexMatcher = compiled.regex
+  }
+
+  const resolved = resolveJailedHostPath(reposDir, args.pathPrefix ?? '', 'repo', { allowRoot: true })
+  const startStat = lstatSync(resolved.realTarget)
+  const matches: Array<{ path: string; line: number; text: string }> = []
+  let filesScanned = 0
+  let totalBytesScanned = 0
+  let truncated = false
+
+  const scanFile = (absPath: string, relPosix: string): void => {
+    if (matches.length >= maxMatches) {
+      truncated = true
+      return
+    }
+    if (filesScanned >= MAX_SEARCH_FILES || totalBytesScanned >= MAX_SEARCH_TOTAL_BYTES) {
+      truncated = true
+      return
+    }
+    let st
+    try {
+      st = lstatSync(absPath)
+    } catch {
+      return
+    }
+    if (!st.isFile() || st.isSymbolicLink() || st.size === 0 || st.size > MAX_SEARCH_FILE_BYTES) return
+    let buf: Buffer
+    try {
+      buf = readFileSync(absPath)
+    } catch {
+      return
+    }
+    if (isBinaryBuffer(buf)) return
+    filesScanned += 1
+    totalBytesScanned += buf.length
+    const lines = buf.toString('utf8').split(/\r?\n/)
+    for (let i = 0; i < lines.length; i += 1) {
+      const line = lines[i]!
+      let matched = false
+      if (regexMatcher) {
+        const haystack = line.length > MAX_CLAIM_REGEX_HAYSTACK ? line.slice(0, MAX_CLAIM_REGEX_HAYSTACK) : line
+        matched = regexMatcher.test(haystack)
+      } else {
+        matched = (caseSensitive ? line : line.toLowerCase()).includes(literalNeedle)
+      }
+      if (!matched) continue
+      if (matches.length >= maxMatches) {
+        truncated = true
+        return
+      }
+      matches.push({
+        path: `/repos/${relPosix}`,
+        line: i + 1,
+        text: line.trimEnd().slice(0, MAX_SEARCH_LINE_CHARS),
+      })
+    }
+  }
+
+  if (startStat.isFile()) {
+    scanFile(resolved.realTarget, resolved.relPosix)
+  } else if (startStat.isDirectory()) {
+    const stack: Array<{ absDir: string; relPrefix: string; parents: string[] }> = [{
+      absDir: resolved.realTarget,
+      relPrefix: resolved.relPosix,
+      parents: resolved.relPosix ? resolved.relPosix.split('/') : [],
+    }]
+    while (stack.length > 0 && !truncated) {
+      const cur = stack.pop()!
+      let entries
+      try {
+        entries = readdirSync(cur.absDir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))
+      } catch {
+        continue
+      }
+      const subdirs: Array<{ absDir: string; relPrefix: string; parents: string[] }> = []
+      for (const entry of entries) {
+        if (entry.isSymbolicLink()) continue
+        const isDir = entry.isDirectory()
+        const isFile = entry.isFile()
+        if (!isDir && !isFile) continue
+        if (isSensitiveHostRepoSegment(entry.name, isDir, cur.parents)) continue
+        const childAbs = join(cur.absDir, entry.name)
+        const childRel = cur.relPrefix ? `${cur.relPrefix}/${entry.name}` : entry.name
+        if (isDir) {
+          subdirs.push({ absDir: childAbs, relPrefix: childRel, parents: [...cur.parents, entry.name] })
+        } else {
+          scanFile(childAbs, childRel)
+          if (matches.length >= maxMatches || filesScanned >= MAX_SEARCH_FILES || totalBytesScanned >= MAX_SEARCH_TOTAL_BYTES) {
+            truncated = true
+            break
+          }
+        }
+      }
+      for (let i = subdirs.length - 1; i >= 0; i -= 1) {
+        stack.push(subdirs[i]!)
+      }
+    }
+  }
+
+  return {
+    query,
+    mode: useRegex ? 'regex' : 'literal',
+    pathPrefix: resolved.relPosix ? `/repos/${resolved.relPosix}` : '/repos',
+    filesScanned,
+    matchCount: matches.length,
+    truncated,
+    matches,
+  }
+}
+
+interface HostSpillRecord {
+  artifactId: string
+  path: string
+  relPath: string
+  content: string
+  bytes: number
+}
+
+export class HostSpillStore {
+  private readonly entries = new Map<string, HostSpillRecord>()
+  private readonly pathIndex = new Map<string, string>()
+  private totalBytes = 0
+
+  put(artifactId: string, spilledPath: string, content: string): void {
+    const cleanPath = spilledPath.startsWith('/evidence/') ? spilledPath : `/evidence/${spilledPath.replace(/^\/+/, '')}`
+    const relPath = cleanPath.replace(/^\/evidence\//, '')
+    const bytes = Buffer.byteLength(content, 'utf8')
+    const existing = this.entries.get(artifactId)
+    if (existing) {
+      this.totalBytes -= existing.bytes
+      this.entries.delete(artifactId)
+    }
+    this.entries.set(artifactId, { artifactId, path: cleanPath, relPath, content, bytes })
+    this.pathIndex.set(cleanPath, artifactId)
+    this.pathIndex.set(relPath, artifactId)
+    this.totalBytes += bytes
+
+    while (this.entries.size > MAX_HOST_SPILL_ENTRIES || this.totalBytes > MAX_HOST_SPILL_TOTAL_BYTES) {
+      const oldestKey = this.entries.keys().next().value
+      if (oldestKey === undefined || oldestKey === artifactId) break
+      const oldest = this.entries.get(oldestKey)!
+      this.entries.delete(oldestKey)
+      this.pathIndex.delete(oldest.path)
+      this.pathIndex.delete(oldest.relPath)
+      this.totalBytes -= oldest.bytes
+    }
+  }
+
+  get(query: { artifactId?: string; path?: string }): HostSpillRecord | undefined {
+    const id = query.artifactId?.trim()
+    if (id) {
+      const byId = this.entries.get(id)
+      if (byId) return byId
+    }
+    const rawPath = query.path?.trim()
+    if (rawPath) {
+      const normRel = rawPath.replace(/^\/?evidence\//, '').replace(/^\/+/, '')
+      const mappedId = this.pathIndex.get(rawPath) ?? this.pathIndex.get(`/evidence/${normRel}`) ?? this.pathIndex.get(normRel)
+      if (mappedId) return this.entries.get(mappedId)
+      const match = /^tool-output\/([^/]+)\.txt$/.exec(normRel)
+      if (match && this.entries.has(match[1]!)) return this.entries.get(match[1]!)
+    }
+    return undefined
+  }
+
+  listIds(limit = 8): string[] {
+    return [...this.entries.keys()].slice(-limit)
+  }
+}
+
+export interface HostReadEvidenceSliceResult {
+  artifactId: string | null
+  path: string
+  offset: number
+  limit: number
+  returnedChars: number
+  totalChars: number
+  hasMore: boolean
+  nextOffset?: number
+  content: string
+}
+
+export function readEvidenceSliceHost(
+  context: { spillStore?: HostSpillStore; evidenceDir?: string },
+  args: ReadEvidenceSliceArgs,
+): HostReadEvidenceSliceResult {
+  const artifactId = args.artifactId?.trim() || undefined
+  const rawPath = args.path?.trim() || undefined
+  if (!artifactId && !rawPath) {
+    throw new Error('read_evidence_slice requires either `artifactId` or `path`.')
+  }
+  const offset = Math.max(0, Math.trunc(args.offset ?? 0))
+  const limit = Math.max(1, Math.min(Math.trunc(args.limit ?? DEFAULT_EVIDENCE_SLICE_LIMIT), MAX_EVIDENCE_SLICE_LIMIT))
+
+  const sliceText = (resolvedId: string | null, resolvedPath: string, fullText: string): HostReadEvidenceSliceResult => {
+    const totalChars = fullText.length
+    const clampedOffset = Math.min(offset, totalChars)
+    const content = fullText.slice(clampedOffset, clampedOffset + limit)
+    const nextOffset = clampedOffset + content.length
+    const hasMore = nextOffset < totalChars
+    return {
+      artifactId: resolvedId,
+      path: resolvedPath,
+      offset: clampedOffset,
+      limit,
+      returnedChars: content.length,
+      totalChars,
+      hasMore,
+      ...(hasMore ? { nextOffset } : {}),
+      content,
+    }
+  }
+
+  const cached = context.spillStore?.get({ artifactId, path: rawPath })
+  if (cached) {
+    return sliceText(cached.artifactId, cached.path, cached.content)
+  }
+
+  if (context.evidenceDir) {
+    let candidatePath: string
+    if (rawPath) {
+      candidatePath = rawPath
+    } else {
+      if (!artifactId || !SAFE_ARTIFACT_ID_RE.test(artifactId) || artifactId === '.' || artifactId === '..') {
+        throw new Error(`Invalid evidence artifactId "${artifactId ?? ''}".`)
+      }
+      const toolOutRel = `tool-output/${artifactId}.txt`
+      candidatePath = existsSync(join(context.evidenceDir, toolOutRel)) ? toolOutRel : artifactId
+    }
+    const resolved = resolveJailedHostPath(context.evidenceDir, candidatePath, 'evidence', { allowRoot: false })
+    const st = lstatSync(resolved.realTarget)
+    if (!st.isFile()) {
+      throw new Error(`Evidence path "/evidence/${resolved.relPosix}" is not a regular file.`)
+    }
+    if (st.size > MAX_REPO_FILE_BYTES) {
+      throw new Error(`Evidence file "/evidence/${resolved.relPosix}" exceeds the host slice read limit.`)
+    }
+    const buf = readFileSync(resolved.realTarget)
+    if (isBinaryBuffer(buf)) {
+      throw new Error(`Evidence file "/evidence/${resolved.relPosix}" is binary and cannot be sliced as UTF-8 text.`)
+    }
+    return sliceText(artifactId ?? null, `/evidence/${resolved.relPosix}`, buf.toString('utf8'))
+  }
+
+  const available = context.spillStore?.listIds() ?? []
+  const hint = available.length > 0 ? ` Available spilled artifactIds: ${available.join(', ')}.` : ''
+  throw new Error(`Evidence artifact/path "${artifactId ?? rawPath}" not found in host spill store.${hint} For exchange bodies use get_exchange; for container-only /evidence files use derive_evidence.`)
+}
+
+/**
+ * Resolve `<dataDir>/repos/<projectId>` when `runAgentSession` is called with a prompt declaring
+ * `mountedRepos` (and no explicit `reposDir`). Fails closed unless exactly one non-symlink project
+ * directory matches all declared `/repos/<owner>/<repo>` entries.
+ */
+export function resolveAutoReposDir(dataDir: string | undefined, prompt: string): string | undefined {
+  if (!dataDir || !prompt || !prompt.includes('"mountedRepos"')) return undefined
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(prompt)
+  } catch {
+    return undefined
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined
+  const rawMounted = (parsed as { mountedRepos?: unknown }).mountedRepos
+  if (!Array.isArray(rawMounted) || rawMounted.length === 0) return undefined
+  const requiredRepos: Array<{ owner: string; repo: string }> = []
+  for (const item of rawMounted) {
+    if (typeof item !== 'string') continue
+    const m = SAFE_MOUNTED_REPO_RE.exec(item.trim())
+    if (!m) return undefined
+    requiredRepos.push({ owner: m[1]!, repo: m[2]! })
+  }
+  if (requiredRepos.length === 0) return undefined
+
+  const reposBase = join(dataDir, 'repos')
+  if (!existsSync(reposBase)) return undefined
+  let baseStat
+  try {
+    baseStat = lstatSync(reposBase)
+  } catch {
+    return undefined
+  }
+  if (!baseStat.isDirectory() || baseStat.isSymbolicLink()) return undefined
+
+  let projects
+  try {
+    projects = readdirSync(reposBase, { withFileTypes: true })
+  } catch {
+    return undefined
+  }
+  const matches: string[] = []
+  for (const proj of projects) {
+    if (proj.name.startsWith('.') || !proj.isDirectory() || proj.isSymbolicLink()) continue
+    const projDir = join(reposBase, proj.name)
+    let allPresent = true
+    for (const { owner, repo } of requiredRepos) {
+      const ownerDir = join(projDir, owner)
+      const repoDir = join(ownerDir, repo)
+      try {
+        const oSt = lstatSync(ownerDir)
+        const rSt = lstatSync(repoDir)
+        if (!oSt.isDirectory() || oSt.isSymbolicLink() || !rSt.isDirectory() || rSt.isSymbolicLink()) {
+          allPresent = false
+          break
+        }
+      } catch {
+        allPresent = false
+        break
+      }
+    }
+    if (allPresent) matches.push(projDir)
+    if (matches.length > 1) return undefined
+  }
+  return matches.length === 1 ? matches[0] : undefined
+}
+
+export const MALFORMED_TOOL_ARGS_KEYS = [
+  '__kovoToolArgsParseError',
+  '__kovo_tool_args_parse_error',
+  '__kovoParseError',
+  '__toolCallParseError',
+  '__toolArgsParseError',
+  '__jsonParseError',
+  '__parseError',
+  '__malformedToolArgs',
+  '__malformedArgs',
+  '__truncatedToolArgs',
+  '_parseError',
+] as const
+
+export interface MalformedToolArgsDiagnostic {
+  markerKey: string
+  reason: string
+  truncated: boolean
+  rawLength?: number
+}
+
+export function detectMalformedToolCallArgs(args: unknown): MalformedToolArgsDiagnostic | null {
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return null
+  const record = args as Record<string, unknown>
+  for (const key of MALFORMED_TOOL_ARGS_KEYS) {
+    if (!(key in record)) continue
+    const raw = record[key]
+    if (raw === false || raw === null || raw === undefined) continue
+    if (typeof raw === 'string') {
+      const reason = raw.trim() || 'Malformed or truncated tool-call JSON.'
+      return {
+        markerKey: key,
+        reason: reason.slice(0, 240),
+        truncated: /truncat|unterminated|unexpected end|eof|max_tokens/i.test(reason) || key.toLowerCase().includes('truncat'),
+        ...(typeof record.__rawLength === 'number' ? { rawLength: record.__rawLength } : {}),
+      }
+    }
+    if (raw === true) {
+      const extraReason = typeof record.__parseErrorMessage === 'string'
+        ? record.__parseErrorMessage
+        : typeof record.__error === 'string'
+          ? record.__error
+          : 'Malformed or truncated tool-call JSON.'
+      return {
+        markerKey: key,
+        reason: extraReason.slice(0, 240),
+        truncated: record.__truncated === true || /truncat|unterminated|unexpected end|eof|max_tokens/i.test(extraReason) || key.toLowerCase().includes('truncat'),
+        ...(typeof record.__rawLength === 'number' ? { rawLength: record.__rawLength } : {}),
+      }
+    }
+    if (typeof raw === 'object' && !Array.isArray(raw)) {
+      const objVal = raw as Record<string, unknown>
+      const reasonRaw = [objVal.message, objVal.error, objVal.reason, objVal.parseError]
+        .find((v): v is string => typeof v === 'string' && v.trim().length > 0)
+        ?? 'Malformed or truncated tool-call JSON.'
+      const rawLength = typeof objVal.rawLength === 'number'
+        ? objVal.rawLength
+        : typeof objVal.length === 'number'
+          ? objVal.length
+          : undefined
+      return {
+        markerKey: key,
+        reason: reasonRaw.trim().slice(0, 240),
+        truncated: objVal.truncated === true || /truncat|unterminated|unexpected end|eof|max_tokens/i.test(reasonRaw),
+        ...(rawLength !== undefined ? { rawLength } : {}),
+      }
+    }
+  }
+  return null
+}
+
+export function formatMalformedToolArgsError(toolName: string, diag: MalformedToolArgsDiagnostic): string {
+  const lenSuffix = diag.rawLength !== undefined ? ` (${diag.rawLength} chars)` : ''
+  const kind = diag.truncated ? 'truncated/malformed JSON' : 'malformed JSON'
+  return `Tool ${toolName} call arguments were ${kind}${lenSuffix}: ${diag.reason} Keep the payload/script concise or split into smaller steps and retry with valid JSON.`
+}
+
 async function formatToolOutput(
   raw: unknown,
   toolName: string,
@@ -1175,6 +1811,7 @@ async function formatToolOutput(
   inlineLimit: number,
   spillOutput: WorkerToolHandlers['spillOutput'],
   signal: AbortSignal,
+  spillStore?: HostSpillStore,
 ): Promise<string> {
   const serialized = typeof raw === 'string' ? raw : JSON.stringify(raw ?? { ok: true }, null, 2)
   const safe = scrub(serialized)
@@ -1182,18 +1819,26 @@ async function formatToolOutput(
   if (byteLen <= inlineLimit) return safe
 
   let spilledPath: string | null = null
-  if (spillOutput) {
-    const spillId = `${toolName}-${randomUUID().slice(0, 8)}`
+  let spillId: string | null = null
+  if (spillOutput || spillStore) {
+    spillId = `${toolName}-${randomUUID().slice(0, 8)}`
     const spillPayload = truncateUtf8Head(safe, maxSpillFileBytes)
-    try {
-      spilledPath = await spillOutput(spillId, spillPayload, signal)
-    } catch {
-      spilledPath = null
+    if (spillOutput) {
+      try {
+        spilledPath = await spillOutput(spillId, spillPayload, signal)
+      } catch {
+        spilledPath = null
+      }
+    }
+    if (spillStore) {
+      const effectivePath = spilledPath ?? `/evidence/tool-output/${spillId}.txt`
+      spillStore.put(spillId, effectivePath, spillPayload)
+      if (!spilledPath) spilledPath = effectivePath
     }
   }
 
-  const notice = spilledPath
-    ? `\n\n... [truncated ${byteLen} bytes; full redacted output spilled to ${spilledPath} — inspect with derive_evidence (rg/jq/head/tail)] ...\n\n`
+  const notice = spilledPath && spillId
+    ? `\n\n... [truncated ${byteLen} bytes; full redacted output spilled to ${spilledPath} (artifactId="${spillId}") — inspect in parallel with read_evidence_slice({ artifactId: "${spillId}", offset: 0, limit: 8192 }) or path="${spilledPath}"; use derive_evidence only for custom jq/pipelines] ...\n\n`
     : `\n\n... [truncated ${byteLen} bytes to ${inlineLimit}-byte inline cap] ...\n\n`
   const available = Math.max(256, inlineLimit - Buffer.byteLength(notice, 'utf8'))
   const headBytes = Math.floor(available * 0.55)
@@ -1212,6 +1857,10 @@ export interface SpecSubmissionToolOptions {
   onRequired?: (info: { status: string; count: number; route?: SpecRouteEvidence }) => void
   /** Explicitly opt in to registering legacy `verify_replay_spec` while `kovo_verify` is active (default false to prevent LLM DSL dilution). */
   allowLegacyReplaySpec?: boolean
+  /** Staged read-only repositories root on host for fast parallel `read_repo_file` / `search_repo`. */
+  reposDir?: string
+  /** Optional host-side evidence/spill directory for fast parallel `read_evidence_slice`. */
+  evidenceDir?: string
 }
 
 /** Read-only structural view of a broker/probe result (never a body): status + shape hash. */
@@ -1317,6 +1966,10 @@ export function buildWorkerTools(
   const scrubExact = typeof scrub === 'function' ? ((value: string) => value) : scrub.scrubExact
   const tools: ToolRegistration[] = []
   const outputLimits = { maxBytes: inlineLimit }
+  const enableHostEvidenceTool = Boolean(
+    handlers.read_evidence_slice || specSubmission?.evidenceDir || handlers.spillOutput || handlers.derive_evidence,
+  )
+  const hostSpillStore = enableHostEvidenceTool ? new HostSpillStore() : undefined
 
   const combineSignal = (ctxSignal?: AbortSignal) =>
     ctxSignal ? AbortSignal.any([rootSignal, ctxSignal]) : rootSignal
@@ -1336,7 +1989,7 @@ export function buildWorkerTools(
       if (SPEC_SUBMISSION_TOOLS.has(toolName) && !ROUTE_BOUND_SPEC_TOOLS.has(toolName)) specSubmission?.tracker?.noteSpecAttempt()
       if (ROUTE_EVIDENCE_TOOLS.has(toolName)) specSubmission?.tracker?.noteProbe()
       try { observe?.(result) } catch { /* evidence bookkeeping must never break a probe */ }
-      const text = await formatToolOutput(result, toolName, scrubForDisplay, inlineLimit, handlers.spillOutput, signal)
+      const text = await formatToolOutput(result, toolName, scrubForDisplay, inlineLimit, handlers.spillOutput, signal, hostSpillStore)
       return {
         output: [{ type: 'text' as const, text }],
         ...(control ? { control } : {}),
@@ -1818,11 +2471,86 @@ export function buildWorkerTools(
     }))
   }
 
+  if (handlers.read_repo_file || specSubmission?.reposDir) {
+    const customFn = handlers.read_repo_file
+    const reposDir = specSubmission?.reposDir
+    tools.push(defineTool({
+      name: 'read_repo_file',
+      description: 'Fast parallel host-executed read-only file reader over staged /repos/<owner>/<repo> (bounded numbered line slices up to 400 lines / 16 KiB; zero shell overhead). Prefer over derive_evidence for reading source files.',
+      parameters: obj({
+        path: str({ description: 'Repo file path (e.g. /repos/owner/repo/src/app.ts or owner/repo/src/app.ts).', minLength: 1, maxLength: 512 }),
+        startLine: opt(int({ description: '1-based start line (default 1).', minimum: 1, maximum: 500000 })),
+        endLine: opt(int({ description: '1-based inclusive end line (default startLine + 199; max 400 lines per call).', minimum: 1, maximum: 500000 })),
+      }),
+      replay: 'safe',
+      outputLimits,
+      execute: async (args, _api, ctx) => {
+        const signal = combineSignal(ctx.abortSignal)
+        return wrapExec(
+          'read_repo_file',
+          async () => customFn ? customFn(args, signal) : readRepoFileHost(reposDir!, args),
+          signal,
+        )
+      },
+    }))
+  }
+
+  if (handlers.search_repo || specSubmission?.reposDir) {
+    const customFn = handlers.search_repo
+    const reposDir = specSubmission?.reposDir
+    tools.push(defineTool({
+      name: 'search_repo',
+      description: 'Fast parallel host-executed read-only code search over staged /repos (literal substring by default; optional ReDoS-safe regex; skips .git and node_modules; zero shell overhead). Prefer over derive_evidence for code search.',
+      parameters: obj({
+        query: str({ description: 'Search pattern (literal by default; set regex=true for ReDoS-safe bounded regex).', minLength: 1, maxLength: 256 }),
+        pathPrefix: opt(str({ description: 'Optional repo or directory prefix (e.g. /repos/owner/repo/src).', maxLength: 512 })),
+        maxMatches: opt(int({ description: 'Max matching lines to return (default 50, max 200).', minimum: 1, maximum: 200 })),
+        regex: opt(bool({ description: 'Evaluate query as a ReDoS-safe regex (default false = fast literal match).' })),
+        caseSensitive: opt(bool({ description: 'Case-sensitive match (default false).' })),
+      }),
+      replay: 'safe',
+      outputLimits,
+      execute: async (args, _api, ctx) => {
+        const signal = combineSignal(ctx.abortSignal)
+        return wrapExec(
+          'search_repo',
+          async () => customFn ? customFn(args, signal) : searchRepoHost(reposDir!, args),
+          signal,
+        )
+      },
+    }))
+  }
+
+  if (enableHostEvidenceTool) {
+    const customFn = handlers.read_evidence_slice
+    const evidenceDir = specSubmission?.evidenceDir
+    tools.push(defineTool({
+      name: 'read_evidence_slice',
+      description: 'Fast parallel host-executed reader for spilled tool outputs and run evidence slices (by artifactId or /evidence/... path, with bounded offset/limit; zero shell overhead). Prefer over derive_evidence for paging spilled outputs.',
+      parameters: obj({
+        artifactId: opt(str({ description: 'Spilled tool-output artifactId from truncation notice (e.g. request_http-a1b2c3d4).', maxLength: 200 })),
+        path: opt(str({ description: 'Evidence/spill path under /evidence (e.g. /evidence/tool-output/request_http-a1b2c3d4.txt).', maxLength: 512 })),
+        offset: opt(int({ description: '0-based character offset to start reading (default 0).', minimum: 0, maximum: 10000000 })),
+        limit: opt(int({ description: 'Max characters to return (default 8192, max 16384).', minimum: 1, maximum: 16384 })),
+      }),
+      replay: 'safe',
+      outputLimits,
+      execute: async (args, _api, ctx) => {
+        const signal = combineSignal(ctx.abortSignal)
+        return wrapExec(
+          'read_evidence_slice',
+          async () => customFn ? customFn(args, signal) : readEvidenceSliceHost({ spillStore: hostSpillStore, evidenceDir }, args),
+          signal,
+        )
+      },
+    }))
+  }
+
   if (handlers.derive_evidence) {
     const fn = handlers.derive_evidence
     tools.push(defineTool({
       name: 'derive_evidence',
-      description: 'Run an offline just-bash command (find, ls, cat, head, tail, grep, rg, jq, diff, sed, awk, wc, base64) inside the air-gapped --network none intent container over read-only /evidence/*, read-only cloned source repos at /repos/<owner>/<repo> (when mounted), and writable /work/*.',
+      description: 'Run an offline just-bash command (jq, diff, sed, awk, wc, base64, find, rg) inside the air-gapped --network none intent container over read-only /evidence/*, read-only /repos/<owner>/<repo>, and writable /work/*. Prefer read_repo_file / search_repo / read_evidence_slice for source reading, search, and spill paging; use derive_evidence for custom jq/pipeline transforms.',
       parameters: obj({
         command: str({ maxLength: 16384 }),
         outputs: opt(arr(str({ maxLength: 64 }), { maxItems: 16 })),
@@ -2321,6 +3049,16 @@ export function buildWorkerTools(
       outputLimits,
       execute: async (args, _api, ctx) => {
         const signal = combineSignal(ctx.abortSignal)
+        const malformed = detectMalformedToolCallArgs(args)
+        if (malformed) {
+          return {
+            isError: true,
+            output: [{
+              type: 'text' as const,
+              text: formatMalformedToolArgsError('kovo_verify', malformed),
+            }],
+          }
+        }
         const inlineScript = (args.script ?? args.code ?? args.source)?.trim()
         const scriptPath = args.scriptPath?.trim()
         const rawRuntime = args.runtime as string | undefined
@@ -2727,7 +3465,12 @@ export function buildWorkerTools(
 }
 
 /** Read-only tools safe to execute concurrently inside a single tool round. */
-export const PARALLEL_READ_ONLY_TOOLS: ReadonlySet<string> = new Set(['search_facts', 'search_exchanges', 'get_exchange', 'read_peer_trace', 'expand_digest', 'query_endpoints', 'query_program_graph', 'query_facts', 'query_findings', 'board_read', 'query_cves', 'load_skill', 'list_second_order_canaries'])
+export const PARALLEL_READ_ONLY_TOOLS: ReadonlySet<string> = new Set([
+  'search_facts', 'search_exchanges', 'get_exchange', 'read_peer_trace', 'expand_digest',
+  'query_endpoints', 'query_program_graph', 'query_facts', 'query_findings',
+  'board_read', 'query_cves', 'load_skill', 'list_second_order_canaries',
+  'read_repo_file', 'search_repo', 'read_evidence_slice', 'derive_evidence',
+])
 
 // ---------------------------------------------------------------------------
 // High-Limit Multi-Turn Pi Durable Runner
@@ -2930,6 +3673,10 @@ export interface RunAgentSessionOptions {
   onProfileFailure?: (profileId: string, err: string, hard: boolean) => void
   /** Explicitly opt in to registering legacy `verify_replay_spec` while `kovo_verify` is active (default false). */
   allowLegacyReplaySpec?: boolean
+  /** Optional staged read-only repositories root on host for fast parallel `read_repo_file` / `search_repo`. */
+  reposDir?: string
+  /** Optional host-side evidence/spill directory for fast parallel `read_evidence_slice`. */
+  evidenceDir?: string
   /** Opt-in agentic trace writer (see createAgentTrace). Nothing is recorded when omitted. */
   trace?: AgentTrace
   /** Identifiers stamped on trace events; defaults to requestId/sessionId/scenario. */
@@ -3207,6 +3954,11 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
     return false
   }
 
+  const resolvedReposDir = options.reposDir
+    ?? ((handlers.derive_evidence || handlers.run_sast_scan || handlers.read_repo_file || handlers.search_repo)
+      ? resolveAutoReposDir(options.directory, options.prompt)
+      : undefined)
+
   const builtTools = buildWorkerTools(
     handlers,
     scrubbers,
@@ -3220,6 +3972,8 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
         options.onSpecSubmissionRequired?.(info)
       },
       ...(options.allowLegacyReplaySpec ? { allowLegacyReplaySpec: true } : {}),
+      ...(resolvedReposDir ? { reposDir: resolvedReposDir } : {}),
+      ...(options.evidenceDir ? { evidenceDir: options.evidenceDir } : {}),
     },
   )
   // Extra tools have unknown semantics: keep them sequential so a round that calls one never races.
@@ -3357,6 +4111,10 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
     hook(ToolTask, {
       beforeTool(call) {
         if (!call.parent) toolStartedAt.set(call.id, Date.now())
+        const malformed = detectMalformedToolCallArgs(call.arguments)
+        if (malformed) {
+          return { block: formatMalformedToolArgsError(call.name, malformed) }
+        }
         const snapshot = specSnapshot()
         const specPending = specSubmissionPending(snapshot)
         const block = settlementToolBlock({
@@ -3372,19 +4130,31 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
       },
       afterTool(call, result) {
         const wasProofCall = activeProofCallIds.delete(call.id)
+        const malformed = detectMalformedToolCallArgs(call.arguments)
+        const effectiveResult = malformed
+          ? (() => {
+              const message = formatMalformedToolArgsError(call.name, malformed)
+              return {
+                ...result,
+                isError: true,
+                output: [{ type: 'text' as const, text: message }],
+                diagnostics: [{ severity: 'error' as const, code: 'malformed_tool_args', message }],
+              }
+            })()
+          : result
         if (trace && !call.parent) {
           const startedAt = toolStartedAt.get(call.id)
           toolStartedAt.delete(call.id)
           try {
-            const summary = toolResultSummary(toolResultText(result.output))
-            const diagnostic = (result.diagnostics ?? []).find(item => item.severity === 'error')
+            const summary = toolResultSummary(toolResultText(effectiveResult.output))
+            const diagnostic = (effectiveResult.diagnostics ?? []).find(item => item.severity === 'error')
             trace.recordToolResult({
               assignmentId: traceAssignmentId,
               turnIdx: Math.max(1, turnsUsed),
               callId: call.id,
               name: call.name,
               durationMs: startedAt === undefined ? null : Date.now() - startedAt,
-              ok: !result.isError,
+              ok: !effectiveResult.isError,
               errorCode: diagnostic?.code ?? null,
               summaryJson: summary,
               exchangeIds: idListFrom(summary, ['exchangeIds', 'exchangeId']),
@@ -3399,7 +4169,7 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
         if (wasProofCall && wallClockExpired && activeProofCallIds.size === 0 && !wallClockRotated) {
           queueMicrotask(() => triggerWallClockRotation())
         }
-        return undefined
+        return malformed ? effectiveResult : undefined
       },
     }),
   ]
