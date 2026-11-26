@@ -1,3 +1,6 @@
+import { httpMethods } from '../domain.ts'
+import type { HttpMethod } from '../domain.ts'
+
 export interface ParsedCurlCredentials {
   origin?: string
   authKind: 'cookie' | 'bearer' | 'header'
@@ -470,24 +473,59 @@ export function parseCurlOrHeader(raw: string): ParsedCurlCredentials | null {
   return null
 }
 
+const ALLOWED_HTTP_METHODS = new Set<string>(httpMethods)
+
 /**
- * Formats a broker exchange as a sanitized, copy-ready cURL command.
+ * Validate and normalize an HTTP method strictly against the authoritative `HttpMethod` enum.
+ * Any unrecognized, empty, or metacharacter-bearing method defaults safely to `'GET'`.
  */
-export function formatExchangeAsCurl(ex: {
+export function normalizeCurlHttpMethod(method: string | undefined | null): HttpMethod {
+  const normalized = typeof method === 'string' ? method.trim().toUpperCase() : ''
+  return ALLOWED_HTTP_METHODS.has(normalized) ? (normalized as HttpMethod) : 'GET'
+}
+
+/**
+ * Authoritative POSIX sh single-quote escaper (browser-safe, zero `node:*` dependencies).
+ *
+ * Strips NUL bytes (which cannot appear in POSIX argv C strings), wraps the value in single
+ * quotes, and replaces embedded single quotes `'` with `'\''`. Inside POSIX single quotes every
+ * other character (`$`, `` ` ``, `"`, `\`, `;`, `|`, `&`, spaces, newlines, globs) is literal
+ * and cannot trigger expansion, substitution, or word splitting.
+ */
+export function quotePosixShellArg(value: string): string {
+  const safe = String(value).replace(/\0/g, '')
+  return `'${safe.replace(/'/g, "'\\''")}'`
+}
+
+export interface FormatCurlExchangeInput {
   method: string
   origin: string
   pathAndQuery: string
   reqHeaders?: Record<string, string>
   personaHandle?: string | null
-}): string {
-  const lines = [`curl -i -X ${ex.method} '${ex.origin}${ex.pathAndQuery}'`]
+  body?: string | null
+}
+
+/**
+ * Formats a broker exchange as a sanitized, copy-ready POSIX cURL command.
+ * Every dynamic argument (validated HTTP method, URL, every `-H` header, persona placeholder,
+ * and optional `--data-raw` body) is quoted with `quotePosixShellArg` (zero double quotes,
+ * zero raw shell interpolation).
+ */
+export function formatExchangeAsCurl(ex: FormatCurlExchangeInput): string {
+  const method = normalizeCurlHttpMethod(ex.method)
+  const url = `${ex.origin}${ex.pathAndQuery}`
+  const lines = [`curl -i -X ${quotePosixShellArg(method)} ${quotePosixShellArg(url)}`]
   const entries = Object.entries(ex.reqHeaders ?? {})
   for (const [key, value] of entries) {
     if (key.toLowerCase() === 'host') continue
-    lines.push(`  -H '${key}: ${String(value).replace(/'/g, "'\\''")}'`)
+    lines.push(`  -H ${quotePosixShellArg(`${key}: ${String(value)}`)}`)
   }
   if (ex.personaHandle && !entries.some(([k]) => /^(cookie|authorization)$/i.test(k))) {
-    lines.push(`  -H 'Cookie: [persona:${ex.personaHandle}:secret]'`)
+    lines.push(`  -H ${quotePosixShellArg(`Cookie: [persona:${ex.personaHandle}:secret]`)}`)
+  }
+  if (typeof ex.body === 'string' && ex.body.length > 0) {
+    lines.push(`  --data-raw ${quotePosixShellArg(ex.body)}`)
   }
   return lines.join(' \\\n')
 }
