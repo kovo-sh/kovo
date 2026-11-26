@@ -521,6 +521,44 @@ export class ExecFloorLane extends ExecServiceModule<ExecFloorLaneHost> {
     } catch { /* run may have been deleted */ }
   }
 
+  private emitPreconditionUnmet(
+    runId: string,
+    input: {
+      origin: string
+      precondition: 'tier' | 'persona_count' | 'browser' | 'canary'
+      vulnClass: string
+      required: string
+      observed: string
+      method?: string
+      route?: string
+      skippedCount?: number
+      source: string
+    },
+  ): void {
+    const method = (input.method ?? 'ANY').toUpperCase()
+    const route = input.route?.trim() || '*'
+    const skippedCount = Math.max(1, Math.floor(input.skippedCount ?? 1))
+    try {
+      this.storage.event(
+        runId,
+        'coverage.precondition_unmet',
+        `Precondition unmet (${input.precondition}: need ${input.required}, got ${input.observed}) skipped ${input.vulnClass} on ${method} ${route}.`,
+        {
+          origin: input.origin,
+          precondition: input.precondition,
+          vulnClass: input.vulnClass,
+          class: input.vulnClass,
+          method,
+          route,
+          required: input.required,
+          observed: input.observed,
+          skippedCount,
+          source: input.source,
+        },
+      )
+    } catch { /* observational telemetry is best-effort */ }
+  }
+
   /**
    * Bounded, tier/scope/budget-aware deterministic hypotheses for discovered endpoints. Used only
    * when the run has no model profile: it probes the highest-value discovered routes, records
@@ -548,6 +586,21 @@ export class ExecFloorLane extends ExecServiceModule<ExecFloorLaneHost> {
     const personaHandles = personas.map(p => p.handle)
     const tier = current.capabilityTier
 
+    if (tier < 2 || personaHandles.length < 2) {
+      for (const origin of approvedOrigins) {
+        this.emitPreconditionUnmet(current.id, {
+          origin,
+          precondition: tier < 2 ? 'tier' : 'persona_count',
+          vulnClass: 'bola',
+          required: tier < 2 ? 'tier>=2' : 'personas>=2',
+          observed: tier < 2 ? `tier=${tier}` : `personas=${personaHandles.length}`,
+          method: 'ANY',
+          route: '*',
+          skippedCount: 1,
+          source: 'floor.deterministic_investigation_bola',
+        })
+      }
+    }
     const resourceQueue = tier >= 2 && personaHandles.length >= 2
       ? buildBolaTestQueue(
           this.storage.listFacts(current.id, { includeTainted: false, limit: 200 }),
@@ -1026,6 +1079,71 @@ export class ExecFloorLane extends ExecServiceModule<ExecFloorLaneHost> {
         },
       )
 
+      // Observational precondition telemetry (never alters engine guard semantics).
+      const engineOrigins = [...new Set(endpoints.map(ep => ep.origin))]
+      const canaryReady = (() => {
+        try {
+          if (!this.canaryBroker) return false
+          const oobStatus = this.canaryBroker.oob.status()
+          return (oobStatus.bindings > 0 || oobStatus.publicEnabled) && oobStatus.problems.length === 0
+        } catch {
+          return false
+        }
+      })()
+      for (const origin of engineOrigins) {
+        if (current.capabilityTier < 2) {
+          this.emitPreconditionUnmet(current.id, {
+            origin,
+            precondition: 'tier',
+            vulnClass: 'bola',
+            required: 'tier>=2',
+            observed: `tier=${current.capabilityTier}`,
+            method: 'ANY',
+            route: '*',
+            skippedCount: 1,
+            source: 'floor.deterministic_engine_tier',
+          })
+        } else if (personas.length < 2) {
+          this.emitPreconditionUnmet(current.id, {
+            origin,
+            precondition: 'persona_count',
+            vulnClass: 'bola',
+            required: 'personas>=2',
+            observed: `personas=${personas.length}`,
+            method: 'ANY',
+            route: '*',
+            skippedCount: 1,
+            source: 'floor.deterministic_engine_personas',
+          })
+        }
+        if (!this.browser) {
+          this.emitPreconditionUnmet(current.id, {
+            origin,
+            precondition: 'browser',
+            vulnClass: 'dom-xss',
+            required: 'browser_available',
+            observed: 'browser=unavailable',
+            method: 'GET',
+            route: '*',
+            skippedCount: 1,
+            source: 'floor.deterministic_engine_browser',
+          })
+        }
+        if (!canaryReady) {
+          this.emitPreconditionUnmet(current.id, {
+            origin,
+            precondition: 'canary',
+            vulnClass: 'oob-ssrf',
+            required: 'canary_listener_ready',
+            observed: 'canary=unavailable',
+            method: 'ANY',
+            route: '*',
+            skippedCount: 1,
+            source: 'floor.deterministic_engine_canary',
+          })
+        }
+      }
+
       const report = await runDeterministicEngine({
         runId: current.id,
         assignmentId: claimed.id,
@@ -1281,7 +1399,20 @@ export class ExecFloorLane extends ExecServiceModule<ExecFloorLaneHost> {
       { provenance: 'floor', verificationClass: 'runtime_confirmed' },
     )
     this.storage.addGraphEdge(run.id, { fromKind: 'fact', fromId: fact.id, toKind: 'finding', toId: saved.id, edgeKind: 'proves' })
-    recordReportedFindingCoverage(this.storage, run, assignment.id, spec.origin, spec.category, `Deterministic verified: ${spec.title}`, saved.id, (r, o) => this.host.permitted(r, o))
+    recordReportedFindingCoverage(
+      this.storage,
+      run,
+      assignment.id,
+      spec.origin,
+      spec.category,
+      `Deterministic verified: ${spec.title}`,
+      saved.id,
+      (r, o) => this.host.permitted(r, o),
+      {
+        route: `${confirmed.hypothesis.method.toUpperCase()} ${confirmed.endpoint}`,
+        exchangeIds: confirmed.exchangeIds,
+      },
+    )
     this.storage.event(
       run.id,
       'deterministic_engine.confirmed',

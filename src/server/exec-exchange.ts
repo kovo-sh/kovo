@@ -1,9 +1,10 @@
 import { and, eq } from 'drizzle-orm'
 import type { AccessPolicySnapshot } from '../access-policy.ts'
-import { owaspCategories, type Finding, type InlineVerifyFeedback, type OwaspCategory } from '../domain.ts'
+import type { Finding, InlineVerifyFeedback } from '../domain.ts'
 import type { DeclarativeReplaySpec } from '../replay-spec.ts'
 import type { BrokerExchangeResult, PublicObservation, RequestBroker } from './broker.ts'
 import type { CanaryBroker } from './canary-broker.ts'
+import { categoryToOwaspCoverageCategory } from './coverage-category.ts'
 import { extractSpecDedupeFields, type ExistingFindingRef } from './dedupe.ts'
 import type { EvidenceReview } from './evidence-checks.ts'
 import { recordProfileFailure, recordProfileSuccess } from './model-settings.ts'
@@ -208,14 +209,23 @@ export function recordReportedFindingCoverage(
   summary: string,
   linkedFindingId: string,
   permitted: (run: Run, origin: string) => boolean,
+  options?: {
+    route?: string | null
+    branchKey?: string | null
+    exchangeIds?: readonly string[]
+  },
 ): void {
-  if (owaspCategories.includes(category as OwaspCategory) && permitted(run, origin)) {
+  const coverageCategory = categoryToOwaspCoverageCategory(category)
+  if (coverageCategory && permitted(run, origin)) {
     storage.upsertCoverageEntry(run, assignmentId, {
       origin,
-      category: category as OwaspCategory,
+      category: coverageCategory,
       status: 'reported',
       summary,
       linkedFindingId,
+      ...(options?.route ? { route: options.route } : {}),
+      ...(options?.branchKey ? { branchKey: options.branchKey } : {}),
+      ...(options?.exchangeIds?.length ? { exchangeIds: options.exchangeIds } : {}),
     })
   }
 }
