@@ -248,13 +248,34 @@ export const HOST_INJECTED_TENANT_HEADERS = new Set([
   'x-kovo-run-id',
 ])
 
+/**
+ * Benign entity-creation body field names automatically prefixed by `tagStagingEntityBody` /
+ * `tagStagingEntityForm`. On derived `staging_isolated` runs, tags appearing only inside these
+ * host-taggable fields MUST NEVER self-satisfy isolation proof (`R3-H-1(a)`).
+ */
+export const HOST_INJECTED_STAGING_BODY_FIELD_RE =
+  /^(?:name|title|label|slug|subject|description|notes?|body|text|company|email|memos?|message|comment|display[_-]?name|first[_-]?name|last[_-]?name|full[_-]?name|username|handle)$/i
+
 const HTTP_METHOD_TOKEN_RE = /^[A-Z][A-Z0-9_-]{0,15}$/
 const METHOD_OVERRIDE_PRIORITY: readonly string[] = ['DELETE', 'PUT', 'PATCH', 'POST']
-const MAX_OVERRIDE_BODY_SCAN_CHARS = 64 * 1024
+/** Deterministic body classification window (64 KiB). Bodies above this fail closed as override-risk (`R3-H-1(b)`). */
+export const MAX_OVERRIDE_BODY_SCAN_CHARS = 64 * 1024
+/** Hard ceiling for full-body method-override parsing to bound memory/CPU; larger bodies fail closed as unscannable. */
+const MAX_OVERRIDE_FULL_SCAN_CHARS = 4 * 1024 * 1024
 
 export interface MethodOverrideDetection {
-  /** True whenever any method-override header, query param, or body field is present. */
+  /** True whenever any method-override header, query param, or body field is present, or a body exceeded the full-scan ceiling. */
   hasOverride: boolean
+  /** R3-H-1(b): True whenever the request body exceeded the 64 KiB deterministic classification window. */
+  bodyExceedsScanWindow: boolean
+  /** R3-H-1(b): True whenever the request body could not be completely parsed/scanned for override carriers. */
+  scanIncomplete: boolean
+  /**
+   * R3-H-1(b): Single authoritative override-risk flag shared across scope policy, admission,
+   * durable leases, and the judge: true if an override carrier was detected, the body exceeded
+   * the 64 KiB scan window, or scanning could not complete cleanly.
+   */
+  hasOverrideRisk: boolean
   /** Effective HTTP verb accounting for override carriers (fails closed toward destructive verbs). */
   effectiveMethod: string
   /** Resolved override verb if an override carrier was present, otherwise `null`. */
@@ -266,6 +287,10 @@ export interface MethodOverrideDetection {
 /**
  * Compute the effective HTTP verb including method-override headers (`X-HTTP-Method-Override`,
  * `X-HTTP-Method`, `X-Method-Override`) and `_method` query/form/JSON/multipart fields (`R2-H-1`).
+ *
+ * R3-H-1(b): NEVER silently truncates `body` at 64 KiB. Bodies up to 4 MiB are scanned in full
+ * for `_method` carriers; bodies exceeding 64 KiB or that cannot be cleanly parsed/scanned are
+ * always flagged fail-closed via `bodyExceedsScanWindow` / `scanIncomplete` / `hasOverrideRisk`.
  */
 export function detectMethodOverride(input: {
   method: string
@@ -276,6 +301,8 @@ export function detectMethodOverride(input: {
   const baseMethod = (input.method || 'GET').trim().toUpperCase() || 'GET'
   const carriers: string[] = []
   const candidates: string[] = []
+  let bodyExceedsScanWindow = false
+  let scanIncomplete = false
 
   const pushVerb = (raw: string | undefined) => {
     if (!raw) return
@@ -305,76 +332,155 @@ export function detectMethodOverride(input: {
     const hIdx = pathAndQuery.indexOf('#', qIdx)
     const rawQuery = hIdx >= 0 ? pathAndQuery.slice(qIdx + 1, hIdx) : pathAndQuery.slice(qIdx + 1)
     if (rawQuery) {
+      let foundQueryOverride = false
       const params = new URLSearchParams(rawQuery)
       for (const [k, v] of params.entries()) {
         if (k.toLowerCase() === '_method' && v.trim().length > 0) {
+          foundQueryOverride = true
           carriers.push('query:_method')
           pushVerb(v)
         }
       }
-    }
-  }
-
-  // 3. `_method` form-urlencoded, JSON, or multipart body field
-  const rawBody = input.body
-  if (typeof rawBody === 'string' && rawBody.length > 0) {
-    const scanBody = rawBody.slice(0, MAX_OVERRIDE_BODY_SCAN_CHARS)
-    const contentType = headerValue(input.headers, 'content-type').toLowerCase()
-
-    // Form-urlencoded body (explicit content-type or form-like key=value syntax)
-    if (
-      contentType.includes('application/x-www-form-urlencoded') ||
-      (!contentType.includes('json') && /(?:^|&|%26)_method=/i.test(scanBody))
-    ) {
-      try {
-        const params = new URLSearchParams(scanBody)
-        for (const [k, v] of params.entries()) {
-          if (k.toLowerCase() === '_method' && v.trim().length > 0) {
-            carriers.push('form:_method')
-            pushVerb(v)
+      if (!foundQueryOverride) {
+        const queryFallbackRe = /(?:^|&|%26)(?:_|%5f)method=([^&#\s]{1,32})/gi
+        let m: RegExpExecArray | null
+        while ((m = queryFallbackRe.exec(rawQuery)) !== null) {
+          let val = m[1]!
+          try { val = decodeURIComponent(val.replaceAll('+', ' ')) } catch { /* keep raw */ }
+          if (val.trim().length > 0) {
+            carriers.push('query:_method')
+            pushVerb(val)
           }
-        }
-      } catch {
-        if (/(?:^|&)_method=/i.test(scanBody)) {
-          carriers.push('form:_method')
         }
       }
     }
+  }
 
-    // JSON object body with top-level `_method` field (including escaped key check)
-    const trimmed = scanBody.trim()
-    if (trimmed.startsWith('{')) {
-      try {
-        const parsed = JSON.parse(trimmed) as unknown
-        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-          for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
-            if (k.toLowerCase() === '_method' && typeof v === 'string' && v.trim().length > 0) {
-              carriers.push('json:_method')
+  // 3. `_method` form-urlencoded, JSON, or multipart body field (full scan, never 64 KiB slice)
+  const rawBody = input.body
+  const contentEncoding = headerValue(input.headers, 'content-encoding').trim()
+  const hasCompressedEncoding = contentEncoding !== '' && !/^identity$/i.test(contentEncoding)
+  if (hasCompressedEncoding) {
+    scanIncomplete = true
+  }
+
+  if (typeof rawBody === 'string' && rawBody.length > 0) {
+    bodyExceedsScanWindow = rawBody.length > MAX_OVERRIDE_BODY_SCAN_CHARS
+
+    if (hasDuplicateHeader(input.headers, 'content-type') || hasDuplicateHeader(input.headers, 'content-encoding')) {
+      scanIncomplete = true
+    }
+
+    if (rawBody.length > MAX_OVERRIDE_FULL_SCAN_CHARS) {
+      scanIncomplete = true
+      carriers.push('body:exceeds_scan_cap')
+    } else if (!hasCompressedEncoding) {
+      const contentType = headerValue(input.headers, 'content-type').toLowerCase()
+      const mediaType = contentType.split(';', 1)[0]!.trim()
+
+      // Form-urlencoded body (explicit content-type or form-like key=value syntax)
+      const looksFormLike =
+        mediaType === 'application/x-www-form-urlencoded' ||
+        contentType.includes('application/x-www-form-urlencoded') ||
+        (!contentType.includes('json') && /(?:^|&|%26)(?:_|%5f)method=/i.test(rawBody))
+      if (looksFormLike) {
+        let foundFormOverride = false
+        try {
+          const params = new URLSearchParams(rawBody)
+          for (const [k, v] of params.entries()) {
+            if (k.toLowerCase() === '_method' && v.trim().length > 0) {
+              foundFormOverride = true
+              carriers.push('form:_method')
               pushVerb(v)
             }
           }
+        } catch {
+          scanIncomplete = true
         }
-      } catch {
-        // Malformed JSON containing a `_method` key hint fails closed as an override carrier.
-        const fallback = /"(?:_method|\\u005fmethod)"\s*:\s*"([A-Za-z_-]{2,16})"/i.exec(trimmed)
-        if (fallback) {
-          carriers.push('json:_method')
-          pushVerb(fallback[1])
+        if (!foundFormOverride) {
+          const formFallbackRe = /(?:^|&|%26)(?:_|%5f)method=([^&#\s]{1,32})/gi
+          let m: RegExpExecArray | null
+          while ((m = formFallbackRe.exec(rawBody)) !== null) {
+            let val = m[1]!
+            try { val = decodeURIComponent(val.replaceAll('+', ' ')) } catch { /* keep raw */ }
+            if (val.trim().length > 0) {
+              carriers.push('form:_method')
+              pushVerb(val)
+            }
+          }
+        }
+      }
+
+      // JSON object body with top-level `_method` field (including escaped & duplicate key checks)
+      const trimmed = rawBody.trim()
+      const isJsonCandidate =
+        trimmed.startsWith('{') ||
+        mediaType === 'application/json' ||
+        /^application\/[a-z0-9.+-]+\+json$/i.test(mediaType)
+      if (isJsonCandidate) {
+        let parsedOk = false
+        if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+          try {
+            const parsed = JSON.parse(trimmed) as unknown
+            parsedOk = true
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+              for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+                if (k.toLowerCase() === '_method' && typeof v === 'string' && v.trim().length > 0) {
+                  carriers.push('json:_method')
+                  pushVerb(v)
+                }
+              }
+            }
+          } catch {
+            scanIncomplete = true
+          }
+        } else {
+          try {
+            JSON.parse(trimmed)
+            parsedOk = true
+          } catch {
+            scanIncomplete = true
+          }
+        }
+        if (!parsedOk || /_method|\\u005f/i.test(trimmed)) {
+          const jsonMethodRe = /"(?:_method|\\u005fmethod)"\s*:\s*"([A-Za-z0-9_-]{1,16})"/gi
+          let m: RegExpExecArray | null
+          while ((m = jsonMethodRe.exec(trimmed)) !== null) {
+            if (m[1]!.trim().length > 0) {
+              carriers.push('json:_method')
+              pushVerb(m[1])
+            }
+          }
+        }
+      }
+
+      // Multipart form-data field named `_method`
+      const isMultipartContentType = /^multipart\//i.test(mediaType)
+      if (isMultipartContentType && !/\bboundary\s*=\s*\S+/i.test(contentType)) {
+        scanIncomplete = true
+      }
+      if (isMultipartContentType || rawBody.toLowerCase().includes('content-disposition')) {
+        if (/content-disposition:\s*form-data;[^\r\n]*\bname\s*=\s*"?_method"?/i.test(rawBody)) {
+          carriers.push('multipart:_method')
+          const mpValueRe = /content-disposition:\s*form-data;[^\r\n]*\bname\s*=\s*"?_method"?[^\r\n]*\r?\n\r?\n\s*([A-Za-z0-9_-]{1,16})/gi
+          let m: RegExpExecArray | null
+          while ((m = mpValueRe.exec(rawBody)) !== null) {
+            if (m[1]) pushVerb(m[1])
+          }
         }
       }
     }
-
-    // Multipart form-data field named `_method`
-    if (/content-disposition:\s*form-data;[^;\r\n]*\bname\s*=\s*"?_method"?/i.test(scanBody)) {
-      carriers.push('multipart:_method')
-      const m = /content-disposition:\s*form-data;[^\r\n]*\bname\s*=\s*"?_method"?[^\r\n]*\r?\n\r?\n\s*([A-Za-z_-]{2,16})/i.exec(scanBody)
-      if (m?.[1]) pushVerb(m[1])
-    }
   }
 
-  if (carriers.length === 0) {
+  const hasOverride = carriers.length > 0
+  const hasOverrideRisk = hasOverride || bodyExceedsScanWindow || scanIncomplete
+
+  if (!hasOverride) {
     return {
       hasOverride: false,
+      bodyExceedsScanWindow,
+      scanIncomplete,
+      hasOverrideRisk,
       effectiveMethod: baseMethod,
       overriddenVerb: null,
       carriers: [],
@@ -392,6 +498,9 @@ export function detectMethodOverride(input: {
 
   return {
     hasOverride: true,
+    bodyExceedsScanWindow,
+    scanIncomplete,
+    hasOverrideRisk,
     effectiveMethod: chosen ?? baseMethod,
     overriddenVerb: chosen,
     carriers: [...new Set(carriers)],
@@ -1051,14 +1160,14 @@ export function isVerifiedReadOnlyGraphqlQuery(
   const trimmed = (body ?? '').trim()
   if (!trimmed || trimmed.length > MAX_GRAPHQL_READONLY_BODY_CHARS) return false
 
-  // H-3: deny method overrides on GraphQL reads (headers, query, or body).
+  // H-3 / R3-H-1(b): deny method overrides or override-risk bodies on GraphQL reads.
   const override = detectMethodOverride({
     method: options?.method ?? 'POST',
     pathAndQuery,
     headers,
     body,
   })
-  if (override.hasOverride) return false
+  if (override.hasOverrideRisk) return false
 
   if (options?.confirmedEndpoints !== undefined) {
     if (!matchesConfirmedGraphqlEndpoint(pathAndQuery, options.confirmedEndpoints, options.origin)) {
@@ -1167,26 +1276,73 @@ export function isRouteDenylisted(policy: ScopePolicy, pathAndQuery: string): bo
   return false
 }
 
+function stripHostInjectedBodyFieldsForTagCheck(
+  body: string | null | undefined,
+  headers?: Record<string, string | string[] | undefined>,
+): string {
+  if (typeof body !== 'string' || body.length === 0) return ''
+  // Fail closed: over-cap bodies cannot safely prove isolation on derived staging.
+  if (body.length > MAX_OVERRIDE_BODY_SCAN_CHARS) return ''
+  const contentType = headerValue(headers, 'content-type').toLowerCase()
+  const trimmed = body.trim()
+  if (trimmed.startsWith('{') || contentType.includes('json')) {
+    try {
+      const parsed = JSON.parse(trimmed) as unknown
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        const filtered: Record<string, unknown> = {}
+        for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+          if (HOST_INJECTED_STAGING_BODY_FIELD_RE.test(k)) continue
+          filtered[k] = v
+        }
+        return JSON.stringify(filtered)
+      }
+      return JSON.stringify(parsed)
+    } catch {
+      return ''
+    }
+  }
+  if (contentType.includes('application/x-www-form-urlencoded') || /(?:^|&)[^=&]+=/.test(trimmed)) {
+    try {
+      const params = new URLSearchParams(body)
+      const kept: string[] = []
+      for (const [k, v] of params.entries()) {
+        if (HOST_INJECTED_STAGING_BODY_FIELD_RE.test(k)) continue
+        kept.push(`${k}=${v}`)
+      }
+      return kept.join('&')
+    } catch {
+      return ''
+    }
+  }
+  return body
+}
+
 /**
  * Does the request carry the run-scoped synthetic tenant tag (path, body, or headers)?
  *
- * R2-H-1: When `ignoreHostInjectedHeaders` is true (always enforced on derived `staging_isolated`
- * runs), host-injected tagging headers (`x-kovo-tenant-tag`, `x-kovo-run-id`) are excluded so a
- * header stamped by the host itself can never serve as standalone isolation proof.
+ * R2-H-1 / R3-H-1(a): When `ignoreHostInjectedHeaders` is true (always enforced on derived
+ * `staging_isolated` runs), host-injected tagging headers (`x-kovo-tenant-tag`, `x-kovo-run-id`)
+ * AND host-taggable entity body fields (`tagStagingEntityBody` / `tagStagingEntityForm`, unless
+ * `ignoreHostInjectedBodyFields: false` is explicitly requested) are excluded so host-stamped tags
+ * can never serve as standalone isolation proof.
  */
 export function requestCarriesTenantTag(
   request: ScopeRequest,
   tenantTag: string | null | undefined,
-  options: { ignoreHostInjectedHeaders?: boolean } = {},
+  options: { ignoreHostInjectedHeaders?: boolean; ignoreHostInjectedBodyFields?: boolean } = {},
 ): boolean {
   const tag = (tenantTag ?? '').trim().toLowerCase()
   if (!tag) return false
-  const ignoreHostInjected = options.ignoreHostInjectedHeaders === true
+  const ignoreHostInjectedHeaders = options.ignoreHostInjectedHeaders === true
+  const ignoreHostInjectedBody = options.ignoreHostInjectedBodyFields ?? ignoreHostInjectedHeaders
+  const bodyForTagCheck = ignoreHostInjectedBody
+    ? stripHostInjectedBodyFieldsForTagCheck(request.body, request.headers)
+    : (request.body ?? '')
   const haystack = [
     request.pathAndQuery,
-    request.body ?? '',
+    bodyForTagCheck,
     ...Object.entries(request.headers ?? {})
-      .filter(([key]) => !ignoreHostInjected || !HOST_INJECTED_TENANT_HEADERS.has(key.toLowerCase()))
+      .filter(([key]) => !ignoreHostInjectedHeaders || !HOST_INJECTED_TENANT_HEADERS.has(key.toLowerCase()))
       .flatMap(([key, value]) => [
         key,
         Array.isArray(value) ? value.join(' ') : (value ?? ''),
@@ -1225,7 +1381,7 @@ export function evaluateScopeRequest(policy: ScopePolicy, request: ScopeRequest)
     body: request.body,
   })
   const effectiveMethod = override.effectiveMethod
-  const readOnly = !override.hasOverride && isReadOnlyHttpMethod(effectiveMethod, request.body)
+  const readOnly = !override.hasOverrideRisk && isReadOnlyHttpMethod(effectiveMethod, request.body)
   const surface: ScopeSurface = request.surface ?? 'broker'
   const origin = normalizeScopeOrigin(request.origin) ?? request.origin
 
@@ -1271,7 +1427,7 @@ export function evaluateScopeRequest(policy: ScopePolicy, request: ScopeRequest)
   const confirmedEndpoints = request.confirmedGraphqlEndpoints ?? policy.confirmedGraphqlEndpoints
   if (
     canonical !== null &&
-    !override.hasOverride &&
+    !override.hasOverrideRisk &&
     effectiveMethod === 'POST' &&
     isVerifiedReadOnlyGraphqlQuery(canonical, request.body, request.headers, {
       ...(confirmedEndpoints !== undefined ? { confirmedEndpoints } : {}),
@@ -1302,10 +1458,17 @@ export function evaluateScopeRequest(policy: ScopePolicy, request: ScopeRequest)
   if (request.hook === 'setup' || request.hook === 'cleanup') {
     return allow('target', `Explicit ${request.hook} hook context.`)
   }
-  const ignoreHostInjectedHeaders = Boolean(request.derivedEnvironmentMode ?? policy.derivedEnvironmentMode)
+  const ignoreHostInjected = Boolean(request.derivedEnvironmentMode ?? policy.derivedEnvironmentMode)
   if (
     canonical !== null &&
-    requestCarriesTenantTag({ ...request, pathAndQuery: canonical }, policy.tenantTag, { ignoreHostInjectedHeaders })
+    requestCarriesTenantTag(
+      { ...request, pathAndQuery: canonical },
+      policy.tenantTag,
+      {
+        ignoreHostInjectedHeaders: ignoreHostInjected,
+        ignoreHostInjectedBodyFields: ignoreHostInjected,
+      },
+    )
   ) {
     return allow('target', 'Mutation targets a run-tagged synthetic test tenant.')
   }
