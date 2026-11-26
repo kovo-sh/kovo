@@ -17,7 +17,7 @@ import type { AddressInfo, Server as TcpServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { basename, isAbsolute, join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
-import { parseComposeDocument } from './compose-parse.ts'
+import { parseComposeDocument, validateOciImageReference } from './compose-parse.ts'
 import type { ComposeHealthcheckSpec, ComposeServiceSource, ParsedComposeDocument } from './compose-parse.ts'
 
 export interface LabServiceHealthcheck {
@@ -142,10 +142,46 @@ const FORBIDDEN_COMPOSE_KEYS = new Set([
 /** Operator override for the lab container uid:gid. Must be a non-root numeric user. */
 export const LAB_CONTAINER_USER_ENV = 'KOVO_LAB_USER'
 
+/** Dedicated unprivileged uid:gid (`nobody:nogroup`) that owns no Kovo host files. */
+export const DEFAULT_UNPRIVILEGED_LAB_USER = '65534:65534'
+
+function assertValidNonRootNumericUser(candidate: string, label: string): string {
+  // Parse numerically: Docker accepts leading zeros (`00:00` is uid 0), so a textual check on the
+  // first character is not enough. Reject any non-numeric form and any uid/gid that resolves to 0.
+  const match = /^(\d{1,10}):(\d{1,10})$/.exec(candidate)
+  if (!match) {
+    throw new Error(`${label} must be numeric uid:gid.`)
+  }
+  const uid = Number(match[1])
+  const gid = Number(match[2])
+  if (!Number.isSafeInteger(uid) || !Number.isSafeInteger(gid) || uid < 0 || gid < 0) {
+    throw new Error(`${label} must be numeric uid:gid.`)
+  }
+  if (uid === 0 || gid === 0) {
+    throw new Error(`Lab containers must run as a non-root user; ${label}=0:* or *:0 is rejected.`)
+  }
+  return `${uid}:${gid}`
+}
+
+/**
+ * Validate a container image reference against the strict OCI `[registry/]repo[:tag][@digest]`
+ * grammar before it enters any service spec or `docker run` / `docker build` argv.
+ */
+export function assertSafeLabImageReference(image: unknown, context = 'lab container'): string {
+  const result = validateOciImageReference(image)
+  if (!result.ok) {
+    const preview = typeof image === 'string'
+      ? image.replace(/[\x00-\x1f\x7f]/g, '?').slice(0, 64)
+      : String(image).slice(0, 64)
+    throw new Error(`Unsafe ${context} image reference "${preview}" rejected: ${result.reason}.`)
+  }
+  return result.image
+}
+
 /**
  * Choose the non-root user lab containers run as. Defaults to the invoking uid:gid so a bind
- * mounted, owner-only IAST telemetry dir stays writable without world permissions; when Kovo Hunter
- * itself runs as root the container falls back to nobody:nogroup.
+ * mounted, owner-only IAST telemetry dir or proxy handshake dir stays writable without world
+ * permissions; when Kovo Hunter itself runs as root the container falls back to nobody:nogroup.
  */
 export function resolveLabContainerUser(env: NodeJS.ProcessEnv = process.env): string {
   const override = env[LAB_CONTAINER_USER_ENV]?.trim()
@@ -153,25 +189,31 @@ export function resolveLabContainerUser(env: NodeJS.ProcessEnv = process.env): s
     ? override
     : (() => {
       const uid = typeof process.getuid === 'function' ? process.getuid() : undefined
-      if (uid === undefined || uid === 0) return '65534:65534'
+      if (uid === undefined || uid === 0) return DEFAULT_UNPRIVILEGED_LAB_USER
       const gid = typeof process.getgid === 'function' ? process.getgid() : uid
       return `${uid}:${gid}`
     })()
-  // Parse numerically: Docker accepts leading zeros (`00:00` is uid 0), so a textual check on the
-  // first character is not enough. Reject any non-numeric form and any uid/gid that resolves to 0.
-  const match = /^(\d{1,10}):(\d{1,10})$/.exec(candidate)
-  if (!match) {
-    throw new Error(`${LAB_CONTAINER_USER_ENV} must be numeric uid:gid.`)
+  return assertValidNonRootNumericUser(candidate, LAB_CONTAINER_USER_ENV)
+}
+
+/**
+ * Resolve the non-root user for untrusted lab service containers (compose / repo workloads).
+ * Runs as the dedicated unprivileged `65534:65534` user (which owns no Kovo host files) by default;
+ * falls back to `resolveLabContainerUser(env)` only when `KOVO_LAB_USER` is explicitly set by the
+ * operator or when the container must write to a host-owned 0700 IAST telemetry mount.
+ */
+export function resolveLabServiceContainerUser(
+  env: NodeJS.ProcessEnv = process.env,
+  options: { needsHostWritableMount?: boolean } = {},
+): string {
+  const override = env[LAB_CONTAINER_USER_ENV]?.trim()
+  if (override && override.length > 0) {
+    return resolveLabContainerUser(env)
   }
-  const uid = Number(match[1])
-  const gid = Number(match[2])
-  if (!Number.isSafeInteger(uid) || !Number.isSafeInteger(gid) || uid < 0 || gid < 0) {
-    throw new Error(`${LAB_CONTAINER_USER_ENV} must be numeric uid:gid.`)
+  if (options.needsHostWritableMount) {
+    return resolveLabContainerUser(env)
   }
-  if (uid === 0 || gid === 0) {
-    throw new Error(`Lab containers must run as a non-root user; ${LAB_CONTAINER_USER_ENV}=0:* or *:0 is rejected.`)
-  }
-  return `${uid}:${gid}`
+  return DEFAULT_UNPRIVILEGED_LAB_USER
 }
 
 // ===========================================================================
@@ -291,9 +333,19 @@ export function validateRawServiceObject(raw: Record<string, unknown>, fallbackN
     ? composeHealthcheckToSpec(rawHealthcheck as ComposeHealthcheckSpec)
     : undefined
 
+  let image: string | undefined
+  if (raw.image !== undefined && raw.image !== null) {
+    if (typeof raw.image !== 'string') {
+      throw new Error(`Unsafe lab service "${name}" image reference rejected: image reference must be a string.`)
+    }
+    if (raw.image.length > 0) {
+      image = assertSafeLabImageReference(raw.image, `lab service "${name}"`)
+    }
+  }
+
   return {
     name,
-    image: typeof raw.image === 'string' && raw.image.trim() ? raw.image.trim() : undefined,
+    image,
     dockerfile,
     startCommand: typeof raw.startCommand === 'string' && raw.startCommand.trim() ? raw.startCommand.trim() : undefined,
     command,
@@ -402,10 +454,21 @@ function validateComposeServiceSource(source: ComposeServiceSource): LabServiceS
 
   if (normalized.user !== undefined) {
     const userValue = normalized.user.trim()
-    const uidPart = userValue.includes(':') ? userValue.split(':')[0] : userValue
-    if (uidPart === '0' || uidPart === 'root') {
+    const [uidPart = '', gidPart] = userValue.split(':')
+    if (
+      /^0+$/.test(uidPart) ||
+      uidPart.toLowerCase() === 'root' ||
+      (gidPart !== undefined && (/^0+$/.test(gidPart) || gidPart.toLowerCase() === 'root'))
+    ) {
       throw new Error(`Forbidden root user "${userValue}" rejected on lab service "${name}"; lab containers must run as non-root.`)
     }
+  }
+
+  let image: string | undefined
+  if (normalized.image !== undefined) {
+    image = assertSafeLabImageReference(normalized.image, `compose service "${name}"`)
+  } else if (config.image !== undefined && config.image !== null) {
+    image = assertSafeLabImageReference(config.image, `compose service "${name}"`)
   }
 
   const env = normalized.environment
@@ -425,7 +488,7 @@ function validateComposeServiceSource(source: ComposeServiceSource): LabServiceS
 
   return {
     name,
-    image: normalized.image,
+    image,
     dockerfile,
     command,
     entrypoint: normalized.entrypoint,
@@ -692,6 +755,8 @@ export interface LabContainerRunArgsInput {
 
 /** Pure builder for the `docker run` argv; exported so security invariants are unit-testable. */
 export function buildLabContainerRunArgs(input: LabContainerRunArgsInput): string[] {
+  const imageName = assertSafeLabImageReference(input.imageName, `lab container "${input.serviceName}"`)
+  const containerUser = assertValidNonRootNumericUser(input.user, LAB_CONTAINER_USER_ENV)
   const aliases = [...new Set([input.serviceName, ...(input.networkAliases ?? [])])]
     .filter(alias => SAFE_SERVICE_NAME.test(alias))
   const labels: string[] = [
@@ -705,12 +770,13 @@ export function buildLabContainerRunArgs(input: LabContainerRunArgsInput): strin
   }
   const args: string[] = [
     'run', '-d',
+    '--pull=never',
     '--name', input.containerName,
     '--network', input.networkName,
   ]
   for (const alias of aliases) args.push('--network-alias', alias)
   args.push(
-    '--user', input.user,
+    '--user', containerUser,
     '--cap-drop', 'ALL',
     '--security-opt', 'no-new-privileges',
   )
@@ -728,7 +794,8 @@ export function buildLabContainerRunArgs(input: LabContainerRunArgsInput): strin
   args.push(
     ...buildSyntheticEnvArgs(input.internalPort, input.env, input.extraEnv),
     ...input.mountArgs,
-    input.imageName,
+    '--',
+    imageName,
     ...input.cmd,
   )
   return args
@@ -817,10 +884,8 @@ export interface LabProxyRunArgsInput {
  * reaping, runs non-root with all capabilities dropped, and publishes zero ports.
  */
 export function buildLabProxyRunArgs(input: LabProxyRunArgsInput): string[] {
-  const image = (input.image ?? LAB_PROXY_IMAGE_DEFAULT).trim()
-  if (!/^[A-Za-z0-9][A-Za-z0-9_./:@-]{0,191}$/.test(image) || image.includes('..')) {
-    throw new Error(`Unsafe lab proxy image reference "${image}" rejected.`)
-  }
+  const image = assertSafeLabImageReference(input.image ?? LAB_PROXY_IMAGE_DEFAULT, 'lab proxy')
+  const containerUser = assertValidNonRootNumericUser(input.user, LAB_CONTAINER_USER_ENV)
   if (!SAFE_SERVICE_NAME.test(input.targetHost) && !/^\d{1,3}(?:\.\d{1,3}){3}$/.test(input.targetHost)) {
     throw new Error(`Unsafe lab proxy target host "${input.targetHost}" rejected.`)
   }
@@ -832,9 +897,10 @@ export function buildLabProxyRunArgs(input: LabProxyRunArgsInput): string[] {
   }
   return [
     'run', '-d',
+    '--pull=never',
     '--name', input.containerName,
     '--network', input.networkName,
-    '--user', input.user,
+    '--user', containerUser,
     '--cap-drop', 'ALL',
     '--security-opt', 'no-new-privileges',
     '--read-only',
@@ -850,6 +916,7 @@ export function buildLabProxyRunArgs(input: LabProxyRunArgsInput): string[] {
     '-e', 'KOVO_PROXY_SOCKET_MODE=' + input.socketMode,
     '-e', 'KOVO_PROXY_TARGET_HOST=' + input.targetHost,
     '-e', 'KOVO_PROXY_TARGET_PORT=' + String(input.targetPort),
+    '--',
     image,
     'node', '-e', LAB_PROXY_SCRIPT,
   ]
@@ -1042,7 +1109,10 @@ export async function waitForContainerPort(
 }
 
 export function resolveStartCommand(sanitizedRepoDir: string, labConfig: LabConfig): { image: string; cmd: string[] } {
-  const image = labConfig.image || 'node:24-bookworm-slim'
+  const configuredImage = labConfig.image !== undefined && labConfig.image !== ''
+    ? assertSafeLabImageReference(labConfig.image, 'labConfig.image')
+    : undefined
+  const image = configuredImage ?? 'node:24-bookworm-slim'
   if (labConfig.startCommand?.trim()) {
     return { image, cmd: ['sh', '-c', labConfig.startCommand.trim()] }
   }
@@ -1062,7 +1132,7 @@ export function resolveStartCommand(sanitizedRepoDir: string, labConfig: LabConf
     return { image, cmd: ['npm', 'start'] }
   }
   if (existsSync(join(sanitizedRepoDir, 'app.py'))) {
-    return { image: labConfig.image || 'kovo-worker:local', cmd: ['python3', '/app/app.py'] }
+    return { image: configuredImage ?? 'kovo-worker:local', cmd: ['python3', '/app/app.py'] }
   }
   throw new Error('Unable to infer lab start command. Specify labConfig.startCommand or labConfig.dockerfile.')
 }
@@ -1159,6 +1229,9 @@ export function resolveLabStackServices(params: {
 }): { services: LabServiceSpec[]; primaryService: LabServiceSpec; sidecarServices: LabServiceSpec[] } {
   const { labConfig, composeYaml, composeDocument, env } = params
   validateEnvMap(labConfig.env, 'labConfig.env')
+  const validatedLabImage = labConfig.image !== undefined && labConfig.image !== ''
+    ? assertSafeLabImageReference(labConfig.image, 'labConfig.image')
+    : undefined
 
   const safeEnv = env && env !== process.env ? env : {}
   const composeServices = composeDocument !== undefined
@@ -1181,7 +1254,7 @@ export function resolveLabStackServices(params: {
     ?? composeServices
     ?? [{
       name: 'app',
-      image: labConfig.image,
+      image: validatedLabImage,
       dockerfile: labConfig.dockerfile,
       startCommand: labConfig.startCommand,
       internalPort: labConfig.internalPort ?? 8080,
