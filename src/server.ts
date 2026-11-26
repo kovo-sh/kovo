@@ -4,7 +4,7 @@ import type { AppRuntime, AppRuntimeOptions } from './server/app-runtime.ts'
 import { execution } from './server/execution.ts'
 
 export function initialize(options?: AppRuntimeOptions): AppRuntime {
-  const runtime = getAppRuntime(options)
+  const runtime = getAppRuntime({ autoRecoverStore: false, ...options })
   // Bind the single shared Store through AppRuntime and run startup crash/lab recovery before
   // starting Execution so Vite SSR and scripts/serve.ts share one recovered runtime.
   void runtime.store

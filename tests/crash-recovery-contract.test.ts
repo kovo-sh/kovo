@@ -283,8 +283,8 @@ describe('R3-20: Crash-Recovery Contract Matrix (all 7 RunStatus values)', () =>
       }
     }
 
-    // 2. Reopen via AppRuntime (Store constructor MUST NOT delete lab_containers before startupRecover!)
-    const runtime = createAppRuntime({ dataDir: dir, maintenance: false, autoStartMaintenance: false })
+    // 2. Reopen via AppRuntime with autoRecoverStore: false (Store constructor MUST NOT delete lab_containers before startupRecover!)
+    const runtime = createAppRuntime({ dataDir: dir, autoRecoverStore: false, maintenance: false, autoStartMaintenance: false })
     t.after(async () => {
       if (!runtime.isDisposed) await runtime.dispose()
     })
@@ -415,24 +415,34 @@ describe('R3-20: Crash-Recovery Contract Matrix (all 7 RunStatus values)', () =>
     assert.deepEqual(calls[0]!.persistedContainers, [{ runId, containerName: 'kovo-lab-stashed-1' }])
   })
 
-  test('Execution.start() triggers AppRuntime.startupRecover() and hands crashed lab containers to LabRunner', async t => {
+  test('Execution.start() hands stashed startup lab containers to LabRunner without re-pausing newly created live runs', async t => {
     const dir = makeTempDir(t, 'kovo-crash-exec-start-')
-    let runId: string
+    let crashedRunId: string
     {
       const seed = new Store(dir, { autoRecover: false })
       const project = seed.createProject(newProject.parse({
         requestId: randomUUID(), name: 'ExecStart', environment: 'local-lab', seeds: [ORIGIN],
       }))
-      runId = seed.createRun(newRun.parse({
+      crashedRunId = seed.createRun(newRun.parse({
         requestId: randomUUID(), projectId: project.id, goal: 'Web startup recovery',
         sourceMode: 'public', capabilityTier: 1, budgetUsd: 5, budgetRequests: 100,
       })).id
-      seed.client.prepare("UPDATE runs SET status = 'running' WHERE id = ?").run(runId)
-      seed.recordLabContainer({ runId, containerName: 'kovo-lab-web-orphan', status: 'running' })
+      seed.client.prepare("UPDATE runs SET status = 'running' WHERE id = ?").run(crashedRunId)
+      seed.recordLabContainer({ runId: crashedRunId, containerName: 'kovo-lab-web-orphan', status: 'running' })
       seed.close()
     }
 
     const runtime = createAppRuntime({ dataDir: dir, maintenance: false, autoStartMaintenance: false })
+    // Store open recovers pre-crash run and stashes kovo-lab-web-orphan; now seed a brand new live run!
+    const liveProject = runtime.store.createProject(newProject.parse({
+      requestId: randomUUID(), name: 'LiveAfterBoot', environment: 'public', seeds: [ORIGIN],
+    }))
+    const liveRunId = runtime.store.createRun(newRun.parse({
+      requestId: randomUUID(), projectId: liveProject.id, goal: 'Fresh live run',
+      sourceMode: 'public', capabilityTier: 1, budgetUsd: 5, budgetRequests: 100,
+    })).id
+    runtime.store.updateRun(liveRunId, { status: 'running', phase: 'investigation' })
+
     const { labRunner, calls } = makeMockLabRunner()
     const exec = new Execution(runtime.store, {
       runtime,
@@ -447,17 +457,17 @@ describe('R3-20: Crash-Recovery Contract Matrix (all 7 RunStatus values)', () =>
     })
 
     exec.start()
-    // Wait briefly for the fire-and-forget startupRecover in Execution.start() to settle
     const deadline = Date.now() + 2_000
     while (calls.length === 0 && Date.now() < deadline) {
       await new Promise(resolve => setTimeout(resolve, 15))
     }
 
-    assert.ok(calls.length >= 1, 'Execution.start() must invoke AppRuntime.startupRecover -> labRunner.ensureStartupRecovery')
+    assert.ok(calls.length >= 1, 'Execution.start() must hand stashed lab containers to labRunner')
     assert.ok(
       calls.some(c => c.persistedContainers.some(p => p.containerName === 'kovo-lab-web-orphan')),
       'crashed lab container must be delivered to labRunner.ensureStartupRecovery on Execution.start()',
     )
-    assert.equal(runtime.store.run(runId).status, 'paused')
+    assert.equal(runtime.store.run(crashedRunId).status, 'paused', 'pre-crash run stays paused')
+    assert.equal(runtime.store.run(liveRunId).status, 'running', 'freshly seeded live run MUST NOT be paused by Execution.start()')
   })
 })

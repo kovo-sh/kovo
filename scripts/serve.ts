@@ -1415,6 +1415,7 @@ async function main() {
   const runtime = getAppRuntime({
     dataDir: directory,
     killSwitchFilePath,
+    autoRecoverStore: false,
   })
   const serverEntry = new URL('../build/server/server.js', import.meta.url).href
   const { default: app, initialize } = await import(serverEntry) as {

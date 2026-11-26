@@ -1025,7 +1025,7 @@ export class Execution {
     this.safetyTimer = setInterval(() => this.wake(), 2_000)
     this.safetyTimer.unref()
     const reclaim = () => {
-      void this.runtime.startupRecover({ labRunner: this.labRunner }).catch(() => undefined)
+      void this.runtime.reapStartupLabContainers({ labRunner: this.labRunner }).catch(() => undefined)
       if (this.backend instanceof LinuxWorkerBackend) {
         void this.backend.reclaimInactive().catch(() => { /* retry on next cycle */ })
       }

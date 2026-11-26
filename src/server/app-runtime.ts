@@ -23,7 +23,12 @@ import {
 import type { KillSwitchOptions, KillSwitchState } from './kill-switch.ts'
 import type { LabRecoveryResult } from './container-supervisor.ts'
 import { getSharedLabRunner, type LabRunner } from './lab-runner.ts'
-import { consumeStoreStartupReclaimedContainers, type ReclaimedLabContainerRef } from './lifecycle.ts'
+import {
+  consumeStoreStartupReclaimedContainers,
+  isStoreStartupRecovered,
+  markStoreStartupRecovered,
+  type ReclaimedLabContainerRef,
+} from './lifecycle.ts'
 import { cancelOobDrainForRun } from './oob-drain.ts'
 import { OobRelay } from './oob-relay.ts'
 import { assertValidRunId, InvalidRunIdError, RunContext } from './run-context.ts'
@@ -57,6 +62,12 @@ export interface AppRuntimeOptions {
   maintenance?: Omit<StorageMaintenanceOptions, 'store' | 'dataDir' | 'getActiveRunIds'> | false
   /** Whether to auto-start `.unref()` maintenance timers once `store` is materialized. Default true. */
   autoStartMaintenance?: boolean
+  /**
+   * When `false`, opening the lazily-owned `Store` defers SQLite recovery until
+   * `AppRuntime.startupRecover()` is invoked explicitly (used by server/CLI boot & crash-DB tests).
+   * Default `true` so standalone/test runtimes recover pre-crash rows at Store open before seeding new runs.
+   */
+  autoRecoverStore?: boolean
 }
 
 export interface AppRuntimeDisposeReport {
@@ -106,9 +117,9 @@ function getAppRuntimeRegistry(): Map<string, AppRuntime> {
   return registry
 }
 
-function getSharedStoreSlot(dir: string): Store {
+function getSharedStoreSlot(dir: string, autoRecover = true): Store {
   const resolvedDir = resolve(dir)
-  if (resolvedDir === resolve(dataDirectory())) {
+  if (resolvedDir === resolve(dataDirectory()) && autoRecover) {
     return legacyStore()
   }
   const g = globalThis as Record<symbol, Map<string, Store> | undefined>
@@ -119,7 +130,7 @@ function getSharedStoreSlot(dir: string): Store {
   }
   let existing = registry.get(resolvedDir)
   if (!existing) {
-    existing = new Store(resolvedDir, { autoRecover: false })
+    existing = new Store(resolvedDir, { autoRecover })
     registry.set(resolvedDir, existing)
   }
   return existing
@@ -135,6 +146,7 @@ export class AppRuntime {
   private readonly defaultDrainTimeoutMs?: number
   private readonly maintenanceEnabled: boolean
   private readonly autoStartMaintenance: boolean
+  private readonly autoRecoverStore: boolean
   private readonly maintenanceOptions: Omit<StorageMaintenanceOptions, 'store' | 'dataDir' | 'getActiveRunIds'>
   private storeInstance: Store | null
   private oobRelayInstance: OobRelay | null
@@ -153,6 +165,7 @@ export class AppRuntime {
     this.defaultDrainTimeoutMs = options.defaultDrainTimeoutMs
     this.maintenanceEnabled = options.maintenance !== false
     this.autoStartMaintenance = options.autoStartMaintenance ?? true
+    this.autoRecoverStore = options.autoRecoverStore ?? true
     this.maintenanceOptions = options.maintenance && typeof options.maintenance === 'object' ? options.maintenance : {}
     this.storeInstance = options.store ?? null
     this.oobRelayInstance = options.oobRelay ?? options.canaryBroker?.oob ?? null
@@ -178,7 +191,7 @@ export class AppRuntime {
   get store(): Store {
     this.assertNotDisposed()
     if (this.useSharedStoreRegistry && !this.storeFactory && !this.storeInstance) {
-      const shared = getSharedStoreSlot(this.dataDir)
+      const shared = getSharedStoreSlot(this.dataDir, this.autoRecoverStore)
       this.storeInstance = shared
       if (this.maintenanceEnabled && this.autoStartMaintenance) {
         this.ensureMaintenanceStarted()
@@ -190,7 +203,7 @@ export class AppRuntime {
       const g = globalThis as Record<symbol, Map<string, Store> | undefined>
       const registry = g[STORE_SINGLETON_SYMBOL]
       if (registry && registry.get(this.dataDir) !== this.storeInstance) {
-        const shared = getSharedStoreSlot(this.dataDir)
+        const shared = getSharedStoreSlot(this.dataDir, this.autoRecoverStore)
         this.storeInstance = shared
         if (this.maintenanceInstance) {
           this.maintenanceInstance.stop()
@@ -204,7 +217,7 @@ export class AppRuntime {
       return this.storeInstance
     }
     if (!this.storeInstance) {
-      this.storeInstance = this.storeFactory ? this.storeFactory(this.dataDir) : new Store(this.dataDir, { autoRecover: false })
+      this.storeInstance = this.storeFactory ? this.storeFactory(this.dataDir) : new Store(this.dataDir, { autoRecover: this.autoRecoverStore })
       if (this.maintenanceEnabled && this.autoStartMaintenance) {
         this.ensureMaintenanceStarted()
       }
@@ -312,7 +325,18 @@ export class AppRuntime {
   ): Promise<AppRuntimeStartupRecoveryReport> {
     const storeInstance = this.store
     const stashed = consumeStoreStartupReclaimedContainers(storeInstance)
-    const storeReport = storeInstance.recover(options.now)
+    const shouldRunSqlRecover = Boolean(options.force) || !isStoreStartupRecovered(storeInstance)
+    const storeReport: RecoveryReport = shouldRunSqlRecover
+      ? storeInstance.recover(options.now)
+      : {
+          pausedRuns: 0,
+          requeuedAssignments: 0,
+          resetBoardMembers: 0,
+          expiredApprovals: 0,
+          reclaimedContainers: [],
+          changed: false,
+        }
+    markStoreStartupRecovered(storeInstance)
     const dedup = new Map<string, ReclaimedLabContainerRef>()
     for (const ref of [...stashed, ...storeReport.reclaimedContainers]) {
       dedup.set(`${ref.runId}\0${ref.containerName}`, ref)
@@ -335,6 +359,27 @@ export class AppRuntime {
       labResults,
       alreadyRecovered: false,
     }
+  }
+
+  /**
+   * Hand off any unconsumed startup-reclaimed `lab_containers` (stashed at `Store` open)
+   * to `labRunner` WITHOUT re-running `store.recover()`, so live runs created after startup
+   * are never paused by `Execution.start()`.
+   */
+  async reapStartupLabContainers(
+    options: Pick<AppRuntimeStartupRecoveryOptions, 'labRunner' | 'includeLiveOwners'> = {},
+  ): Promise<LabRecoveryResult[]> {
+    if (this.disposed || !this.storeInstance) return []
+    const stashed = consumeStoreStartupReclaimedContainers(this.storeInstance)
+    if (stashed.length === 0) return []
+    const labRunner: StartupRecoveryLabRunner = options.labRunner ?? getSharedLabRunner()
+    const labOpts = {
+      persistedContainers: stashed,
+      ...(options.includeLiveOwners !== undefined ? { includeLiveOwners: options.includeLiveOwners } : {}),
+    }
+    if (labRunner.recoverOnStartup) return await labRunner.recoverOnStartup(this.storeInstance, labOpts)
+    if (labRunner.ensureStartupRecovery) return await labRunner.ensureStartupRecovery(this.storeInstance, labOpts)
+    return []
   }
 
   /**

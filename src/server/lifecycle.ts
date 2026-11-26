@@ -43,15 +43,27 @@ export interface ReclaimedLabContainerRef {
 }
 
 const pendingStoreStartupReclaimedContainers = new WeakMap<object, ReclaimedLabContainerRef[]>()
+const recoveredStartupStores = new WeakSet<object>()
+
+/** Record that `storeKey` has completed startup recovery at open (preventing duplicate recovery after live runs start). */
+export function markStoreStartupRecovered(storeKey: object): void {
+  recoveredStartupStores.add(storeKey)
+}
+
+/** True when `storeKey` already executed startup recovery (at `Store` open or `AppRuntime.startupRecover()`). */
+export function isStoreStartupRecovered(storeKey: object): boolean {
+  return recoveredStartupStores.has(storeKey)
+}
 
 /**
  * Stash `lab_containers` rows reclaimed during standalone `Store` startup so a subsequent
- * `AppRuntime.startupRecover()` call still hands them to `LabRunner.ensureStartupRecovery`.
+ * `AppRuntime.startupRecover()` or `Execution.start()` call still hands them to `LabRunner.ensureStartupRecovery`.
  */
 export function recordStoreStartupReclaimedContainers(
   storeKey: object,
   containers: readonly ReclaimedLabContainerRef[],
 ): void {
+  markStoreStartupRecovered(storeKey)
   if (containers.length === 0) return
   const existing = pendingStoreStartupReclaimedContainers.get(storeKey) ?? []
   pendingStoreStartupReclaimedContainers.set(storeKey, [...existing, ...containers])
