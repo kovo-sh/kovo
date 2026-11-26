@@ -19,7 +19,7 @@
  *     stripped on cross-origin hops.
  *  6. Original `Host` header and TLS SNI (`servername`) preserved when dialing pinned IPs.
  */
-import { randomBytes, timingSafeEqual } from 'node:crypto'
+import { randomBytes } from 'node:crypto'
 import { lookup as dnsLookup } from 'node:dns/promises'
 import { createServer as createHttpServer, request as httpRequest } from 'node:http'
 import type { IncomingHttpHeaders, IncomingMessage, Server as HttpServer, ServerResponse } from 'node:http'
@@ -33,6 +33,7 @@ import { pipeline } from 'node:stream'
 import type { Duplex } from 'node:stream'
 import { createBrotliDecompress, createGunzip, createInflate } from 'node:zlib'
 import ipaddr from 'ipaddr.js'
+import { constantTimeStringEqual } from './safety-primitives.ts'
 import { globalKillSwitch, KillSwitchTrippedError } from './kill-switch.ts'
 import type { GlobalKillSwitch } from './kill-switch.ts'
 import { isIpLiteralHost, normalizeHostname } from './public-suffix.ts'
@@ -1736,13 +1737,6 @@ function writeConnectError(
   } catch {
     socket.destroy()
   }
-}
-
-function constantTimeStringEqual(a: string, b: string): boolean {
-  const ab = Buffer.from(a, 'utf8')
-  const bb = Buffer.from(b, 'utf8')
-  if (ab.length !== bb.length) return false
-  return timingSafeEqual(ab, bb)
 }
 
 function mintLoopbackProxyCredentials(): {

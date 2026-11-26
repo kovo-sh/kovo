@@ -24,10 +24,11 @@
  *      persists the updated `BrowserStorageBundle` back to disk (`0600`), and returns fresh
  *      `MintedPersonaSession` material.
  */
-import { randomBytes, timingSafeEqual } from 'node:crypto'
+import { randomBytes } from 'node:crypto'
 import { and, eq } from 'drizzle-orm'
 import { assetOriginForEnvironment } from '../domain.ts'
 import type { PersonaLoginConfig, PersonaPrivilege } from '../domain.ts'
+import { constantTimeStringEqual } from './safety-primitives.ts'
 import {
   buildChromiumLaunchArgs,
   buildPlaywrightChromiumLaunchOptions,
@@ -1852,13 +1853,6 @@ export function summarizeBrowserStorageBundle(
     capturedAppOrigins,
     capturedIdpOrigins,
   }
-}
-
-function constantTimeStringEqual(a: string, b: string): boolean {
-  const bufA = Buffer.from(a, 'utf8')
-  const bufB = Buffer.from(b, 'utf8')
-  if (bufA.length !== bufB.length) return false
-  return timingSafeEqual(bufA, bufB)
 }
 
 /**
