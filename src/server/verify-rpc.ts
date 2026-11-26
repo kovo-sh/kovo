@@ -77,10 +77,30 @@ import type {
   HostSignedTranscript,
   HostTranscriptEntry,
 } from './composite-receipt.ts'
-import { HostFactLog, deriveAmbientAuthFromHeaders, deriveCredentialPlacement } from './host-fact-log.ts'
+import { HostFactLog, deriveAmbientAuthFromHeaders } from './host-fact-log.ts'
 import { defaultTerminalOracleRegistry } from './terminal-oracle-registry.ts'
 import { isReadMethod, normalizeRole, parseRoleLabel } from './oracle-invariants.ts'
 import type { ImpactStep } from './oracle-invariants.ts'
+import {
+  buildHostAuthPlacement,
+  compileAsyncMatchPredicate,
+  consumeRunAsyncPollAttemptBudget,
+  consumeRunAsyncPollCallBudget,
+  evaluateAsyncMatchPredicate,
+  parseCapabilityArg,
+  resolvePersonaAuthKind,
+  type HostAuthPlacement,
+  type ParsedCapabilityArg,
+} from './verify-support.ts'
+
+declare module './verify-claims.ts' {
+  interface VerifyTranscriptRequest {
+    /** R3-H-5: Explicit host-derived wire credential placement stamped from injection + wire provenance. */
+    credentialPlacement?: HostAuthPlacement
+    /** H-14 / R3-H-5: Broker-observed non-secret wire credential provenance. */
+    wireCredentialProvenance?: WireCredentialProvenance
+  }
+}
 import {
   VERIFY_RPC_CONTAINER_DIR,
   VERIFY_RPC_SOCKET_NAME,
@@ -239,6 +259,10 @@ export interface VerifyRpcSessionOptions {
   maxSealsPerEndpoint?: number
   /** Maximum `composite.verify` RPC calls allowed across the entire run (default from RunSafetyBudgets). */
   maxCompositeVerifiesPerRun?: number
+  /** Maximum `async.awaitResult` RPC calls allowed across the entire run (R3-H-2). */
+  maxAsyncPollCallsPerRun?: number
+  /** Maximum `async.awaitResult` individual poll attempts allowed across the entire run (R3-H-2). */
+  maxAsyncPollAttemptsPerRun?: number
   /** Optional unified RunSafetyBudgets policy overrides resolved via `resolveRunSafetyBudgets`. */
   safetyBudgets?: Partial<RunSafetyBudgets>
   /** Canonical request admission engine (defaults to the broker's engine). */
@@ -277,19 +301,12 @@ interface HostExchangeProvenance {
   kernelRequestBody?: string
   authCapabilityActor?: AuthCapabilityActor
   wireCredentialProvenance?: WireCredentialProvenance
+  authPlacement?: HostAuthPlacement
   carrierText?: string
 }
 
-interface ParsedCapabilityArg {
-  handle: string
-  target?: InjectCapabilityTarget
-  headerName?: string
-  cookieName?: string
-  queryParam?: string
-}
-
-const INJECT_CAPABILITY_TARGETS = new Set<InjectCapabilityTarget>(['bearer', 'header', 'cookie', 'url'])
 const BROKER_FORBIDDEN_CALLER_HEADER_RE = /^(?:authorization|proxy-authorization|cookie)$/i
+const AUTH_CAP_HEADER_RE = /^(?:authorization|proxy-authorization|cookie|x-api-key|x-auth-token|x-access-token|x-session-token|api-key|x-token|x-scim-token)$/i
 const INLINE_CAP_RE = /(?<!\[redacted:)(?<![A-Za-z0-9_])cap(?::|%3[aA])hop_[A-Za-z0-9._-]+(?::|%3[aA])[A-Za-z0-9._-]+/g
 const EXACT_BEARER_CAP_RE = /^\s*(?:Bearer\s+)*(cap:hop_[A-Za-z0-9._-]+:[A-Za-z0-9._-]+)\s*$/i
 const EXACT_INLINE_CAP_RE = /^cap:hop_[A-Za-z0-9._-]+:[A-Za-z0-9._-]+$/
@@ -563,9 +580,14 @@ export class VerifyRpcServer {
       const record = this.transcript.get(id)
       if (!record) throw new Error('Unknown exchange id.')
       const rawBody = this.transcript.body(id)
+      const scrubbedBody = rawBody !== undefined ? redact(this.scrub(rawBody)) : null
+      // R3-H-2: Worker-facing bodySha256/bodyBytes reflect ONLY the worker-visible scrubbed body.
+      const safeRecord = record.response && scrubbedBody !== null
+        ? { ...record, response: { ...record.response, bodySha256: createHash('sha256').update(scrubbedBody, 'utf8').digest('hex'), bodyBytes: Buffer.byteLength(scrubbedBody, 'utf8') } }
+        : record
       return this.scrubRecord({
-        record,
-        body: rawBody !== undefined ? this.scrub(rawBody) : null,
+        record: safeRecord,
+        body: scrubbedBody,
         digest: this.transcript.digest(),
         signaturesValid: this.transcript.verifySignatures(),
       })
@@ -679,7 +701,9 @@ export class VerifyRpcServer {
   }
 
   private scrubKernel(text: string): string {
-    return this.kernelSanitizer.redactText(text, 'storage_log')
+    // R3-C-3: Kernel request plane uses exact host/persona/grant secret scrubbing ONLY — zero
+    // heuristic key-name redaction so secret-named query/body echoes cannot bypass anti-reflection.
+    return this.kernelSanitizer.redactSecrets(text)
   }
 
   private scrubKernelHeaderMap(headers: Record<string, string>): Record<string, string> {
@@ -701,40 +725,6 @@ export class VerifyRpcServer {
       candidate = `${requestedSlot.slice(0, 52)}_${suffix}_${attempt++}`
     }
     return candidate
-  }
-
-  private parseCapabilityArg(args: Record<string, unknown>): ParsedCapabilityArg | null {
-    const raw = args.capability
-    if (raw === undefined || raw === null) return null
-    let targetRaw = args.capabilityTarget ?? args.capability_target
-    let headerNameRaw = args.capabilityHeaderName ?? args.capability_header_name
-    let cookieNameRaw = args.capabilityCookieName ?? args.capability_cookie_name
-    let queryParamRaw = args.capabilityQueryParam ?? args.capability_query_param
-    let handle = ''
-    if (typeof raw === 'string') {
-      handle = raw.trim()
-    } else {
-      const obj = asRecord(raw)
-      const rawHandle = obj ? (obj.handle ?? obj.derivedHandle ?? obj.cap_id) : undefined
-      if (!obj || typeof rawHandle !== 'string') throw new Error('capability must be a handle string or { handle, target?, headerName?, cookieName?, queryParam? }.')
-      handle = rawHandle.trim()
-      targetRaw = obj.target ?? targetRaw
-      headerNameRaw = obj.headerName ?? obj.header_name ?? headerNameRaw
-      cookieNameRaw = obj.cookieName ?? obj.cookie_name ?? cookieNameRaw
-      queryParamRaw = obj.queryParam ?? obj.query_param ?? queryParamRaw
-    }
-    if (!isDerivedCapabilityHandle(handle)) throw new Error(`Invalid derived capability handle "${handle}".`)
-    let target: InjectCapabilityTarget | undefined
-    if (targetRaw !== undefined) {
-      if (typeof targetRaw !== 'string' || !INJECT_CAPABILITY_TARGETS.has(targetRaw as InjectCapabilityTarget)) throw new Error(`Unsupported capability target "${String(targetRaw)}".`)
-      target = targetRaw as InjectCapabilityTarget
-    }
-    return {
-      handle, ...(target ? { target } : {}),
-      ...(typeof headerNameRaw === 'string' && headerNameRaw.trim() ? { headerName: headerNameRaw.trim() } : {}),
-      ...(typeof cookieNameRaw === 'string' && cookieNameRaw.trim() ? { cookieName: cookieNameRaw.trim() } : {}),
-      ...(typeof queryParamRaw === 'string' && queryParamRaw.trim() ? { queryParam: queryParamRaw.trim() } : {}),
-    }
   }
 
   private inferCapabilityTarget(cap: ParsedCapabilityArg): InjectCapabilityTarget {
@@ -771,8 +761,17 @@ export class VerifyRpcServer {
     brokerRequest: BrokerHttpRequest; grant: Grant; requestMeta: VerifyTranscriptRequest
     attestation: CapabilityConsumptionAttestation | null; attestations: CapabilityConsumptionAttestation[]
     injectedHeaders: Record<string, string>; authCapabilityActor: AuthCapabilityActor | null
+    injectedAuthHeaders: Record<string, string>; capabilityTargets: Array<'cookie' | 'bearer' | 'header' | 'query' | 'body'>
+    basePersonaAuthKind: 'cookie' | 'bearer' | 'header' | 'none' | null; basePersonaDropped: boolean
   } {
     const baseReq: BrokerHttpRequest = { ...brokerRequest }
+    const basePersonaHandle = baseReq.persona ?? baseReq.personaHandle
+    const basePersonaObj = basePersonaHandle ? this.options.grant.personas?.get(basePersonaHandle) : undefined
+    const basePersonaAuthKind = resolvePersonaAuthKind(basePersonaObj)
+    const basePersonaHeaderLower = basePersonaObj?.headerName?.toLowerCase() ?? null
+    const isCapAuthHeader = (name: string): boolean =>
+      AUTH_CAP_HEADER_RE.test(name) || (basePersonaHeaderLower !== null && name.toLowerCase() === basePersonaHeaderLower)
+    const capTargets = new Set<'cookie' | 'bearer' | 'header' | 'query' | 'body'>()
     const attestationsById = new Map<string, CapabilityConsumptionAttestation>()
     const recordAtt = (att: CapabilityConsumptionAttestation) => { if (!attestationsById.has(att.consumedCapabilityId)) attestationsById.set(att.consumedCapabilityId, att) }
     const decodeCap = (m: string) => (/%3[aA]/.test(m) ? m.replace(/%3[aA]/g, ':') : m)
@@ -828,6 +827,7 @@ export class VerifyRpcServer {
         request: { url: baseUrl, method: baseReq.method, headers: capInputHeaders },
       })
       recordAtt(injected.attestation)
+      if (target === 'url') capTargets.add('query')
       if (injected.request.url !== baseUrl) {
         const parsedUrl = new URL(injected.request.url)
         if (!this.admissionEngine.admitOrigin(parsedUrl.origin, this.options.grant).allowed) throw new Error('Derived capability destination is outside the current assignment scope.')
@@ -835,12 +835,13 @@ export class VerifyRpcServer {
         nextPathAndQuery = parsedUrl.pathname + parsedUrl.search
       }
       for (const [k, v] of Object.entries(injected.request.headers ?? {})) {
-        const isAuthHdr = BROKER_FORBIDDEN_CALLER_HEADER_RE.test(k)
+        const isAuthHdr = isCapAuthHeader(k)
         if (!isAuthHdr && capInputHeaders[k] === v) continue
         const normVal = /^authorization$/i.test(k) ? v.replace(/^\s*(?:Bearer\s+)+/i, 'Bearer ') : v
         injectedHeaders[k] = normVal
         injectedByCapKeys.add(k.toLowerCase())
         if (isAuthHdr) {
+          capTargets.add(/^cookie$/i.test(k) ? 'cookie' : (/^authorization$/i.test(k) && /^bearer\s+/i.test(normVal) ? 'bearer' : 'header'))
           setHeaderCI(authHeaders, k, normVal)
           setHeaderCI(metaHeaders, k, authPlaceholder(k, normVal))
           primaryAuthHandle = primaryAuthHandle ?? cap.handle
@@ -857,6 +858,7 @@ export class VerifyRpcServer {
     if (EXACT_INLINE_CAP_RE.test(trimmedPath)) {
       const urlBase = new URL('/', nextOrigin).href
       const resolved = this.resolveInlineHandle(trimmedPath, urlBase, baseReq.method, 'url')
+      capTargets.add('query')
       if (/^https?:\/\//i.test(resolved.rawValue)) {
         const injected = this.capabilityVault.injectCapabilityIntoRequest({
           handle: trimmedPath, target: 'url', runId: this.capabilityVault.runId, request: { url: urlBase, method: baseReq.method, headers: {} },
@@ -875,12 +877,13 @@ export class VerifyRpcServer {
     } else if (hasInlineCapCandidate(nextPathAndQuery)) {
       const urlBase = new URL(nextPathAndQuery, nextOrigin).href
       nextPathAndQuery = replaceInline(nextPathAndQuery, urlBase, 'url', { rejectCrlf: true })
+      capTargets.add('query')
       if (!nextPathAndQuery.startsWith('/') || nextPathAndQuery.startsWith('//') || nextPathAndQuery.length > MAX_PATH_LENGTH) {
         throw new Error('Request path is invalid or exceeds the 8 KiB limit.')
       }
     }
 
-    // 3) Inline `cap:hop_...` placeholders in headers (routing Authorization/Cookie through auth targets)
+    // 3) Inline `cap:hop_...` placeholders in headers (routing Authorization/Cookie/auth headers through auth targets)
     const targetUrl = new URL(nextPathAndQuery, nextOrigin).href
     const nextHeaders: Record<string, string> = {}
     for (const [k, v] of Object.entries(workingHeaders)) {
@@ -901,11 +904,13 @@ export class VerifyRpcServer {
           setHeaderCI(metaHeaders, k, authPlaceholder(k, resolvedAuth))
           recordAtt(injected.attestation)
           primaryAuthHandle = primaryAuthHandle ?? handle
+          capTargets.add('bearer')
         } else {
           const resolvedAuth = replaceInline(v, targetUrl, 'bearer', { onHandle: h => { primaryAuthHandle = primaryAuthHandle ?? h } }).replace(/^\s*Bearer(?:\s+Bearer)+\s+/i, 'Bearer ')
           setHeaderCI(authHeaders, 'Authorization', resolvedAuth)
           injectedHeaders['Authorization'] = resolvedAuth
           setHeaderCI(metaHeaders, k, authPlaceholder(k, resolvedAuth))
+          capTargets.add(/^bearer\s+/i.test(resolvedAuth) ? 'bearer' : 'header')
         }
       } else if (/^cookie$/i.test(k)) {
         const existingAuthCookie = Object.entries(authHeaders).find(([ak]) => /^cookie$/i.test(ak))?.[1]
@@ -943,14 +948,16 @@ export class VerifyRpcServer {
           injectedHeaders['Cookie'] = cookieHeaders.Cookie
           setHeaderCI(metaHeaders, k, metaSegs.join('; '))
           primaryAuthHandle = primaryAuthHandle ?? firstHandle
+          capTargets.add('cookie')
         } else {
           nextHeaders[k] = v
         }
-      } else if (/^proxy-authorization$/i.test(k)) {
-        const resolvedVal = replaceInline(v, targetUrl, 'bearer', { onHandle: h => { primaryAuthHandle = primaryAuthHandle ?? h } })
+      } else if (/^proxy-authorization$/i.test(k) || isCapAuthHeader(k)) {
+        const resolvedVal = replaceInline(v, targetUrl, /^proxy-authorization$/i.test(k) ? 'bearer' : 'header', { headerName: k, onHandle: h => { primaryAuthHandle = primaryAuthHandle ?? h } })
         setHeaderCI(authHeaders, k, resolvedVal)
         injectedHeaders[k] = resolvedVal
         setHeaderCI(metaHeaders, k, '[injected]')
+        capTargets.add('header')
       } else {
         const resolvedVal = replaceInline(v, targetUrl, 'header', { headerName: k })
         nextHeaders[k] = resolvedVal
@@ -967,6 +974,7 @@ export class VerifyRpcServer {
         try { JSON.parse(nextBody); isJsonBody = true } catch { isJsonBody = false }
       }
       nextBody = replaceInline(nextBody, targetUrl, 'url', { jsonEscape: isJsonBody })
+      capTargets.add('body')
     }
 
     // 4b) Encapsulated vault auto-detection for literal sealed values in path/query, headers, or body
@@ -979,28 +987,27 @@ export class VerifyRpcServer {
 
     const attestations = [...attestationsById.values()]
     if (attestations.length === 0) {
-      return { brokerRequest: baseReq, grant: this.options.grant, requestMeta, attestation: null, attestations: [], injectedHeaders: {}, authCapabilityActor: null }
+      return {
+        brokerRequest: baseReq, grant: this.options.grant, requestMeta, attestation: null, attestations: [],
+        injectedHeaders: {}, authCapabilityActor: null, injectedAuthHeaders: {}, capabilityTargets: [],
+        basePersonaAuthKind, basePersonaDropped: false,
+      }
     }
 
-    // 5) R2-H-8: Package capability-injected Authorization/Cookie headers into an ephemeral persona
-    //    carrying the real source-capability role/tenant provenance (NEVER the base persona label).
+    // 5) R2-H-8 / R3-H-4(a): Package capability-injected auth headers into an ephemeral persona
+    //    carrying ONLY capability credentials (NEVER merging base-persona credential headers!).
     let effectiveGrant: Grant = this.options.grant
     let effectivePersona = baseReq.persona
     let authCapabilityActor: AuthCapabilityActor | null = null
+    let basePersonaDropped = false
     if (Object.keys(authHeaders).length > 0) {
       const mergedBundleHeaders: Record<string, string> = {}
-      const basePersonaHandle = baseReq.persona ?? baseReq.personaHandle
-      const authHasBearer = Object.keys(authHeaders).some(k => /^authorization$/i.test(k))
-      const authHasCookie = Object.keys(authHeaders).some(k => /^cookie$/i.test(k))
       if (basePersonaHandle) {
-        const basePersona = this.options.grant.personas?.get(basePersonaHandle)
-        if (!basePersona) throw new Error(`Persona "${basePersonaHandle}" is not approved for this run.`)
-        const baseInjected = buildPersonaHeader(basePersona, nextOrigin)
-        if (!baseInjected) throw new Error(`Persona "${basePersonaHandle}" does not have an active authenticated session.`)
-        for (const [bk, bv] of Object.entries(baseInjected)) {
-          if (authHasBearer && !authHasCookie && /^cookie$/i.test(bk)) continue
-          mergedBundleHeaders[bk] = bv
-        }
+        if (!basePersonaObj) throw new Error(`Persona "${basePersonaHandle}" is not approved for this run.`)
+        // R3-H-4(a): Drop EVERY base-persona credential header (Authorization, Cookie, X-API-Key,
+        // custom auth headers) whenever a capability supplies any auth credential so a privileged
+        // base persona can NEVER ride along on the wire under a lower-privileged capability label.
+        basePersonaDropped = true
       }
       for (const [k, v] of Object.entries(authHeaders)) setHeaderCI(mergedBundleHeaders, k, v)
       const ephemeralHandle = primaryAuthHandle ?? attestations[0]!.consumedCapabilityId
@@ -1040,7 +1047,11 @@ export class VerifyRpcServer {
       } : {}),
       consumedCapabilityId: attestations[0]!.consumedCapabilityId,
     }
-    return { brokerRequest: nextBrokerReq, grant: effectiveGrant, requestMeta: nextMeta, attestation: attestations[0] ?? null, attestations, injectedHeaders, authCapabilityActor }
+    return {
+      brokerRequest: nextBrokerReq, grant: effectiveGrant, requestMeta: nextMeta,
+      attestation: attestations[0] ?? null, attestations, injectedHeaders, authCapabilityActor,
+      injectedAuthHeaders: authHeaders, capabilityTargets: [...capTargets], basePersonaAuthKind, basePersonaDropped,
+    }
   }
 
   private detectCryptoAttestationsForRequest(
@@ -1087,6 +1098,7 @@ export class VerifyRpcServer {
     cleanSession: boolean,
     authCapabilityActor: AuthCapabilityActor | null = null,
     wireCredentialProvenance?: WireCredentialProvenance,
+    authPlacement?: HostAuthPlacement,
   ): void {
     this.rawBodies.set(exchangeId, result.body)
     this.rawResponseHeaders.set(exchangeId, { ...result.respHeaders })
@@ -1096,7 +1108,7 @@ export class VerifyRpcServer {
     prov.rawRequestBody = brokerRequest.body
     prov.rawRequestOrigin = brokerRequest.origin
     prov.rawRequestParts = [brokerRequest.pathAndQuery, ...Object.values(brokerRequest.headers ?? {}), ...(brokerRequest.body ? [brokerRequest.body] : [])]
-    // R2-C-9: Kernel request plane uses kernel-only sanitization (NEVER vault-scrubbed [redacted:cap:...] tokens).
+    // R2-C-9 / R3-C-3: Kernel request plane uses exact host-secret redaction only (zero heuristics, zero vault placeholders).
     const kernelPath = this.scrubKernel(brokerRequest.pathAndQuery)
     const kernelReqHeaders = this.scrubKernelHeaderMap(requestMeta.headers)
     const kernelReqBody = brokerRequest.body !== undefined ? this.scrubKernel(brokerRequest.body) : undefined
@@ -1105,6 +1117,7 @@ export class VerifyRpcServer {
     prov.kernelRequestBody = kernelReqBody
     if (authCapabilityActor) prov.authCapabilityActor = authCapabilityActor
     if (wireCredentialProvenance) prov.wireCredentialProvenance = wireCredentialProvenance
+    if (authPlacement) prov.authPlacement = authPlacement
     prov.carrierText = this.scrubKernel([kernelPath, ...Object.entries(kernelReqHeaders).map(([k, v]) => `${k}: ${v}`), kernelReqBody ?? ''].join('\n'))
     for (const attestation of attestations) {
       prov.consumedCapabilities.add(attestation.consumedCapabilityId)
@@ -1148,8 +1161,10 @@ export class VerifyRpcServer {
     derivedFromCapabilityIds?: string[]
     protocol?: 'h2'
   }) {
-    // R2-H-4: Always redact the FULL raw body BEFORE slicing/truncating so secrets crossing a slice boundary never leak prefixes.
+    // R2-H-4 / R3-H-2: Always redact FULL raw body before slicing, and hash ONLY the worker-visible scrubbed body.
     const scrubbedFullBody = redact(this.scrub(result.body))
+    const workerBodySha256 = createHash('sha256').update(scrubbedFullBody, 'utf8').digest('hex')
+    const workerBodyBytes = Buffer.byteLength(scrubbedFullBody, 'utf8')
     const previewLimit = Math.min(Math.max(result.bodyPreview.length || 512, 0), 4096)
     return this.scrubRecord({
       exchangeId: record.exchangeId,
@@ -1162,8 +1177,8 @@ export class VerifyRpcServer {
       headers: this.egress.sanitizeHttpHeaders(result.respHeaders, 'worker_rpc'),
       body: scrubbedFullBody.slice(0, 512 * 1024),
       bodyPreview: result.body ? scrubbedFullBody.slice(0, previewLimit) : redact(this.scrub(result.bodyPreview)),
-      bodyBytes: result.bodyBytes,
-      bodySha256: result.bodySha256,
+      bodyBytes: workerBodyBytes,
+      bodySha256: workerBodySha256,
       durationMs: result.durationMs,
       personaHandle: record.request?.personaHandle ?? null,
       ...(extra?.protocol ? { protocol: extra.protocol } : {}),
@@ -1189,9 +1204,21 @@ export class VerifyRpcServer {
     for (const eid of entityIds) this.mutatedSessionEntities.add(`${sessionKey}::${eid}`)
   }
 
+  private stampPlacement(
+    applied: ReturnType<VerifyRpcServer['applyCapabilityInjection']>,
+    requestMeta: VerifyTranscriptRequest,
+    wireProvenance?: WireCredentialProvenance,
+  ): { authPlacement: HostAuthPlacement; stampedReqMeta: VerifyTranscriptRequest } {
+    const authPlacement = buildHostAuthPlacement({
+      wireProvenance, injectedAuthHeaders: applied.injectedAuthHeaders, capabilityTargets: applied.capabilityTargets,
+      basePersonaAuthKind: applied.basePersonaAuthKind, basePersonaDropped: applied.basePersonaDropped, requestHeaders: requestMeta.headers,
+    })
+    return { authPlacement, stampedReqMeta: { ...requestMeta, credentialPlacement: authPlacement, ...(wireProvenance ? { wireCredentialProvenance: wireProvenance } : {}) } }
+  }
+
   private prepareCapRequest(args: Record<string, unknown>, nonce: string) {
     const parsed = this.parseHttpArgs(args)
-    const applied = this.applyCapabilityInjection(parsed.brokerRequest, parsed.requestMeta, this.parseCapabilityArg(args))
+    const applied = this.applyCapabilityInjection(parsed.brokerRequest, parsed.requestMeta, parseCapabilityArg(args))
     const consumedIds = applied.attestations.map(a => a.consumedCapabilityId)
     const cryptoAttestations = this.detectCryptoAttestationsForRequest(applied.brokerRequest, consumedIds, applied.injectedHeaders)
     const derivedFromCapabilityIds = [...new Set(cryptoAttestations.map(a => a.derivedFromCapabilityId))]
@@ -1219,11 +1246,11 @@ export class VerifyRpcServer {
         ? await this.options.broker.executeHttp2Exchange(reqWithRaw, prep.applied.grant, signal)
         : await this.options.broker.executeHttp(reqWithRaw, prep.applied.grant, signal)
       this.recordSessionMutation(prep.sessionKey, prep.applied.brokerRequest.method, prep.entityIds, prep.isControlOrAblation, result.status)
-      // H-9 / R2-C-9: TranscriptStore retains kernel truth (kernel-sanitized only, never capability-rewritten);
-      // worker-facing RPC egress masks sealed capabilities & headers via EgressSanitizer.
+      // H-9 / R2-C-9 / R3-H-5: Stamp authoritative host auth placement from injection + wire provenance.
+      const { authPlacement, stampedReqMeta } = this.stampPlacement(prep.applied, prep.requestMeta, result.wireCredentialProvenance)
       const kernelHeaders = this.kernelSanitizer.sanitizeHttpHeaders(result.respHeaders, 'storage_log')
       const record = this.transcript.record({
-        op: proto, startedAt: started, durationMs: result.durationMs, request: prep.requestMeta, body: result.body,
+        op: proto, startedAt: started, durationMs: result.durationMs, request: stampedReqMeta, body: result.body,
         ...(prep.applied.brokerRequest.body !== undefined ? { rawRequestBody: this.scrubKernel(prep.applied.brokerRequest.body) } : {}),
         response: {
           status: result.status, headers: kernelHeaders, bodyBytes: result.bodyBytes,
@@ -1233,9 +1260,9 @@ export class VerifyRpcServer {
       })
       const rawProv = rawBox.value ? { body: rawBox.value.body, respHeaders: rawBox.value.headers } : { body: result.body, respHeaders: result.respHeaders }
       this.recordRequestProvenance(
-        record.exchangeId, started, args, prep.applied.brokerRequest, prep.requestMeta, rawProv,
+        record.exchangeId, started, args, prep.applied.brokerRequest, stampedReqMeta, rawProv,
         prep.applied.attestations, prep.cryptoAttestations, prep.cleanSession, prep.applied.authCapabilityActor,
-        result.wireCredentialProvenance,
+        result.wireCredentialProvenance, authPlacement,
       )
       return this.exchangeView(record, result, {
         consumedCapabilityId: prep.applied.attestation?.consumedCapabilityId ?? null,
@@ -1346,18 +1373,19 @@ export class VerifyRpcServer {
       const results = burst.results.map((result, index) => {
         const { itemArgs, prep } = items[index]!
         this.recordSessionMutation(prep.sessionKey, prep.applied.brokerRequest.method, prep.entityIds, prep.isControlOrAblation, result.status)
+        const { authPlacement, stampedReqMeta } = this.stampPlacement(prep.applied, prep.requestMeta, result.wireCredentialProvenance)
         const record = this.transcript.record({
           op: mode.mode === 'h2-single-packet' ? 'http2' : 'http',
-          startedAt: started, durationMs: result.durationMs, request: prep.requestMeta, body: result.body,
+          startedAt: started, durationMs: result.durationMs, request: stampedReqMeta, body: result.body,
           ...(prep.applied.brokerRequest.body !== undefined ? { rawRequestBody: this.scrubKernel(prep.applied.brokerRequest.body) } : {}),
           response: { status: result.status, headers: this.kernelSanitizer.sanitizeHttpHeaders(result.respHeaders, 'storage_log'), bodyBytes: result.bodyBytes, bodySha256: result.bodySha256, mediaType: result.mediaType },
         })
         const capRaw = rawCaptures[index]
         this.recordRequestProvenance(
-          record.exchangeId, started, itemArgs, prep.applied.brokerRequest, prep.requestMeta,
+          record.exchangeId, started, itemArgs, prep.applied.brokerRequest, stampedReqMeta,
           capRaw ? { body: capRaw.body, respHeaders: capRaw.headers } : { body: result.body, respHeaders: result.respHeaders },
           prep.applied.attestations, prep.cryptoAttestations, prep.cleanSession, prep.applied.authCapabilityActor,
-          result.wireCredentialProvenance,
+          result.wireCredentialProvenance, authPlacement,
         )
         return this.exchangeView(record, result, {
           consumedCapabilityId: prep.applied.attestation?.consumedCapabilityId ?? null,
@@ -1835,60 +1863,13 @@ export class VerifyRpcServer {
     })
   }
 
-  private matchAsyncPredicate(
-    predicate: Record<string, unknown> | null,
-    pollOutcome: { status: number; body: string; headers: Record<string, string> },
-  ): boolean {
-    if (!predicate || Object.keys(predicate).length === 0) {
-      return pollOutcome.status >= 200 && pollOutcome.status < 300 && pollOutcome.body.trim().length > 0
-    }
-    if (predicate.status !== undefined) {
-      const expected = Array.isArray(predicate.status) ? predicate.status : [predicate.status]
-      if (!expected.includes(pollOutcome.status)) return false
-    }
-    if (typeof predicate.bodyContains === 'string' && !pollOutcome.body.includes(predicate.bodyContains)) {
-      return false
-    }
-    if (typeof predicate.bodyMatches === 'string') {
-      if (predicate.bodyMatches.length > 256) throw new Error('async.awaitResult bodyMatches regex exceeds 256 chars.')
-      let re: RegExp
-      try { re = new RegExp(predicate.bodyMatches) } catch { throw new Error('async.awaitResult bodyMatches regex is invalid.') }
-      if (!re.test(pollOutcome.body)) return false
-    }
-    if (typeof predicate.jsonPath === 'string' && predicate.jsonPath.trim()) {
-      let parsed: unknown
-      try { parsed = JSON.parse(pollOutcome.body) } catch { return false }
-      const evalRes = evaluateJsonPath(parsed, predicate.jsonPath.trim())
-      if (!evalRes.found) return false
-      if (predicate.equals !== undefined && JSON.stringify(evalRes.value) !== JSON.stringify(predicate.equals)) return false
-      if (Array.isArray(predicate.in) && !predicate.in.some(v => JSON.stringify(v) === JSON.stringify(evalRes.value))) return false
-      if (typeof predicate.matches === 'string') {
-        let re: RegExp
-        try { re = new RegExp(predicate.matches) } catch { throw new Error('async.awaitResult jsonPath matches regex is invalid.') }
-        if (!re.test(String(evalRes.value ?? ''))) return false
-      }
-    }
-    const headerPred = asRecord(predicate.header)
-    if (headerPred && typeof headerPred.name === 'string') {
-      const wanted = headerPred.name.toLowerCase()
-      const val = Object.entries(pollOutcome.headers).find(([k]) => k.toLowerCase() === wanted)?.[1]
-      if (val === undefined) return false
-      if (typeof headerPred.equals === 'string' && val !== headerPred.equals) return false
-      if (typeof headerPred.matches === 'string') {
-        let re: RegExp
-        try { re = new RegExp(headerPred.matches) } catch { throw new Error('async.awaitResult header matches regex is invalid.') }
-        if (!re.test(val)) return false
-      }
-    }
-    return true
-  }
-
   private async handleAsyncAwaitResult(args: Record<string, unknown>, nonce: string): Promise<unknown> {
     const pollReqArgs = asRecord(args.pollRequest ?? args.request)
     if (!pollReqArgs) throw new Error('async.awaitResult requires a pollRequest object.')
     const matchPredicate = args.matchPredicate !== undefined ? asRecord(args.matchPredicate)
       : args.match !== undefined ? asRecord(args.match) : null
-
+    // R3-H-2: Validate & compile regex predicates via safe-regex BEFORE consuming budget or issuing traffic.
+    const compiledPredicate = compileAsyncMatchPredicate(matchPredicate)
     const profile: AsyncPollProfile | undefined = args.profile === 'fast_lab' || args.profile === 'wan' ? args.profile : undefined
     const timeoutMs = typeof args.timeoutMs === 'number' ? args.timeoutMs : undefined
     const intervalMs = typeof args.intervalMs === 'number' ? args.intervalMs : undefined
@@ -1907,9 +1888,12 @@ export class VerifyRpcServer {
     }
 
     const parsedPoll = this.parseHttpArgs(pollReqArgs)
-    const capArg = this.parseCapabilityArg(pollReqArgs)
+    const capArg = parseCapabilityArg(pollReqArgs)
+    consumeRunAsyncPollCallBudget(this.options.runId, this.options.maxAsyncPollCallsPerRun)
     type LastPoll = { result: BrokerExchangeResult; rawResp: { body: string; headers: Record<string, string> } | null; startedAt: number; applied: ReturnType<VerifyRpcServer['applyCapabilityInjection']>; cryptoAtts: HostCryptoAttestation[]; cleanSession: boolean }
     let lastBrokerResult: LastPoll | null = null
+    let budgetError: Error | null = null
+    const pollAbort = new AbortController()
 
     const convergence = await awaitAsyncConvergence({
       ...(profile ? { profile } : {}),
@@ -1917,8 +1901,16 @@ export class VerifyRpcServer {
       ...(intervalMs !== undefined ? { intervalMs } : {}),
       ...(maxAttempts !== undefined ? { maxAttempts } : {}),
       ...(tTriggerMs !== undefined ? { tTriggerMs } : {}),
+      signal: pollAbort.signal,
       now: () => this.nextHostTimestampMs(),
       pollFn: async ({ signal }) => {
+        try {
+          consumeRunAsyncPollAttemptBudget(this.options.runId, this.options.maxAsyncPollAttemptsPerRun)
+        } catch (err) {
+          budgetError = err instanceof Error ? err : new Error(String(err))
+          pollAbort.abort(budgetError)
+          throw budgetError
+        }
         const applied = this.applyCapabilityInjection(parsedPoll.brokerRequest, parsedPoll.requestMeta, capArg)
         const cryptoAtts = this.detectCryptoAttestationsForRequest(
           applied.brokerRequest,
@@ -1932,21 +1924,29 @@ export class VerifyRpcServer {
         const result = await this.options.broker.executeHttp({ ...applied.brokerRequest, onRawResponse: raw => { rawResp = raw } }, applied.grant, signal)
         this.recordSessionMutation(sessionKey, applied.brokerRequest.method, entityIds, isControlOrAblation, result.status)
         lastBrokerResult = { result, rawResp, startedAt, applied, cryptoAtts, cleanSession }
-        return { status: result.status, body: result.body, headers: result.respHeaders, observedAtMs: this.nextHostTimestampMs() }
+        // R3-H-2: Evaluate worker predicates strictly on vault-scrubbed worker-visible body & headers.
+        return {
+          status: result.status,
+          body: redact(this.scrub(result.body)),
+          headers: this.egress.sanitizeHttpHeaders(result.respHeaders, 'worker_rpc'),
+          observedAtMs: this.nextHostTimestampMs(),
+        }
       },
-      matchPredicate: (val) => this.matchAsyncPredicate(matchPredicate, val),
+      matchPredicate: (val) => evaluateAsyncMatchPredicate(compiledPredicate, val, evaluateJsonPath),
       extractObservedAtMs: (val) => val.observedAtMs,
     })
+    if (budgetError) throw budgetError
 
     let finalRecord: VerifyTranscriptRecord | null = null
     let finalExchangeView: unknown = null
     if (lastBrokerResult) {
       const last = lastBrokerResult as LastPoll
-      const reqMeta: VerifyTranscriptRequest = {
+      const { authPlacement, stampedReqMeta } = this.stampPlacement(last.applied, {
         ...last.applied.requestMeta,
         ...(last.cryptoAtts.length > 0 ? { derivedFromCapabilityId: last.cryptoAtts[0]!.derivedFromCapabilityId } : {}),
         nonce,
-      }
+      }, last.result.wireCredentialProvenance)
+      const reqMeta = stampedReqMeta
       finalRecord = this.transcript.record({
         op: 'http', startedAt: last.startedAt, durationMs: last.result.durationMs, request: reqMeta, body: last.result.body,
         ...(last.applied.brokerRequest.body !== undefined ? { rawRequestBody: this.scrubKernel(last.applied.brokerRequest.body) } : {}),
@@ -1961,7 +1961,7 @@ export class VerifyRpcServer {
       this.recordRequestProvenance(
         finalRecord.exchangeId, last.startedAt, mergedPollArgs, last.applied.brokerRequest, reqMeta, rawProv,
         last.applied.attestations, last.cryptoAtts, last.cleanSession, last.applied.authCapabilityActor,
-        last.result.wireCredentialProvenance,
+        last.result.wireCredentialProvenance, authPlacement,
       )
       finalExchangeView = this.exchangeView(finalRecord, last.result, {
         consumedCapabilityId: last.applied.attestation?.consumedCapabilityId ?? null,
@@ -2113,13 +2113,16 @@ export class VerifyRpcServer {
         ? Number(record.response.status)
         : (record.op === 'crypto' || record.op === 'capability' ? 200 : null)
 
-      const wireProv = prov?.wireCredentialProvenance
-      const wirePlacement = wireProv ? deriveCredentialPlacement(kernelReqHeaders, undefined, wireProv) : undefined
+      const wireProv = prov?.wireCredentialProvenance ?? record.request?.wireCredentialProvenance
+      const explicitPlacement = prov?.authPlacement
+        ?? record.request?.credentialPlacement
+        ?? (wireProv ? buildHostAuthPlacement({ wireProvenance: wireProv, requestHeaders: kernelReqHeaders }) : undefined)
       const entry: HostTranscriptEntry = {
         exchangeId: record.exchangeId,
         durationMs: record.durationMs,
         ...(prov?.carrierText ? { carrierText: prov.carrierText } : {}),
         ...(prov?.evidenceRole ? { evidenceRole: prov.evidenceRole } : (record.op === 'crypto' || record.op === 'capability' ? { evidenceRole: `host_${record.op}_op` } : {})),
+        ...(explicitPlacement ? { credentialPlacement: explicitPlacement } : {}),
         ...(wireProv ? { wireCredentialProvenance: wireProv } : {}),
         step: {
           id: record.exchangeId,
@@ -2132,7 +2135,7 @@ export class VerifyRpcServer {
             handle,
             role,
             tenant,
-            auth: deriveAmbientAuthFromHeaders(kernelReqHeaders, undefined, wirePlacement),
+            auth: deriveAmbientAuthFromHeaders(kernelReqHeaders, undefined, explicitPlacement),
             sameSite: sameSiteFromRecord(record),
           },
           ...(parsedJson !== undefined ? { json: parsedJson } : {}),
@@ -2244,6 +2247,7 @@ export class VerifyRpcServer {
       transcript: this.transcript,
       defaultOrigin: this.options.targetOrigins?.[0],
       canaryBroker: this.options.canary ?? (this.options.grant as Grant & { canaryBroker?: VerifyCanaryBroker }).canaryBroker,
+      diffDigestKey: this.compositeSigningKey,
       runHttpExchange: async (args, nonce) => await this.handleHttp(args, nonce, 'http') as ProveHttpExchangeResult,
       runOob: args => this.handleOob(args),
       runRace: (args, nonce) => this.handleRace(args, nonce),
