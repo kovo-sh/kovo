@@ -74,6 +74,11 @@ import {
   type SchedulerDecision,
 } from './graph-coordinator.ts'
 import type { LabTargetHandle } from './lab-runner.ts'
+import {
+  classifyRuntimeDependencyEdgeKind,
+  filterGhostSurfaceProbeEndpoints,
+  inferEntityName,
+} from './invariant-runtime-parity.ts'
 import { selectRankedProbeTargets, type Phase0ProbePlanSummary } from './probe-plan.ts'
 import type { ServiceOriginMapping } from './program-graph.ts'
 import { resolveRunSafetyBudgets, type RunSafetyBudgets } from './run-safety-budgets.ts'
@@ -5088,21 +5093,60 @@ export function synthesizeRuntimeCompositeWave1Steps(
     })
   }
 
-  // 1. Collect from runtime API dependencies (highest-signal producer -> consumer links).
+  // 1. Collect from runtime API dependencies (highest-signal producer -> consumer links + typed edge families).
   const depPairs: Array<{ prod: NormalizedRuntimeHopCandidate; cons: NormalizedRuntimeHopCandidate; resourceKey: string }> = []
   const defaultOrigin = [...assetByOrigin.keys()][0]!
-  for (const dep of (options.apiDependencies ?? []).slice(0, 40)) {
+  const factApiDeps: Array<RuntimeCompositeApiDependencyInput & { observedTransitions?: readonly string[] }> = []
+  for (const fact of options.facts ?? []) {
+    if (fact.tainted || !assetByOrigin.has(fact.origin)) continue
+    const data = (fact.data ?? {}) as Record<string, unknown>
+    if (data.subkind === 'runtime_api_dependencies' && Array.isArray(data.apiDependencies)) {
+      for (const raw of data.apiDependencies.slice(0, 24)) {
+        if (!raw || typeof raw !== 'object') continue
+        const d = raw as Partial<RuntimeCompositeApiDependencyInput> & { observedTransitions?: readonly string[] }
+        if (typeof d.producer === 'string' && typeof d.consumer === 'string' && typeof d.resourceKey === 'string') {
+          factApiDeps.push({ producer: d.producer, consumer: d.consumer, resourceKey: d.resourceKey, ...(d.producerOrigin ? { producerOrigin: d.producerOrigin } : {}), ...(d.consumerOrigin ? { consumerOrigin: d.consumerOrigin } : {}), ...(d.personaHandle !== undefined ? { personaHandle: d.personaHandle } : {}), ...(Array.isArray(d.observedTransitions) ? { observedTransitions: d.observedTransitions } : {}) })
+        }
+      }
+    }
+  }
+  const mergedApiDeps: Array<RuntimeCompositeApiDependencyInput & { observedTransitions?: readonly string[] }> = [
+    ...(options.apiDependencies ?? []),
+    ...factApiDeps,
+  ]
+  const seenDepEdge = new Set<string>()
+  const edgePriority = (k: string): number => (k === 'hmac_sign' ? 4 : k === 'await_async' ? 3 : k === 'lifecycle_chain' ? 2 : k === 'signed_url' ? 1 : 0)
+  const prioritizedDeps = [...mergedApiDeps]
+    .filter(d => {
+      const k = `${d.producerOrigin ?? ''}|${d.producer}|${d.consumerOrigin ?? ''}|${d.consumer}|${d.resourceKey}`
+      if (seenDepEdge.has(k)) return false
+      seenDepEdge.add(k)
+      return true
+    })
+    .sort((a, b) => edgePriority(classifyRuntimeDependencyEdgeKind(b)) - edgePriority(classifyRuntimeDependencyEdgeKind(a)))
+  for (const dep of prioritizedDeps.slice(0, 40)) {
     const prodOrigin = dep.producerOrigin && assetByOrigin.has(dep.producerOrigin) ? dep.producerOrigin : defaultOrigin
     const consOrigin = dep.consumerOrigin && assetByOrigin.has(dep.consumerOrigin) ? dep.consumerOrigin : prodOrigin
+    const edgeKind = classifyRuntimeDependencyEdgeKind(dep)
+    const meta = edgeKind === 'hmac_sign'
+      ? { sink: 'webhook', pCue: `Signing producer ${dep.producer} yields "${dep.resourceKey}" (seal signing material)`, cCue: `Webhook consumer ${dep.consumer} validates "${dep.resourceKey}" (forge via ctx.hmac_sign)`, extra: `webhook hmac x-signature signing secret callback ${dep.resourceKey}`, pScore: 88, cScore: 90 }
+      : edgeKind === 'await_async'
+        ? { sink: 'api_route', pCue: `Async producer ${dep.producer} emits "${dep.resourceKey}" (202/async handle; ctx.await_async)`, cCue: `Async poll consumer ${dep.consumer} reads "${dep.resourceKey}" (verify cross-tenant readback)`, extra: `async_worker queue job export poll await_async ${dep.resourceKey}`, pScore: 86, cScore: 88 }
+        : edgeKind === 'lifecycle_chain'
+          ? { sink: 'api_route', pCue: `Lifecycle create/rebind ${dep.producer} yields "${dep.resourceKey}"`, cCue: `Lifecycle rebind/finalize ${dep.consumer} mutates "${dep.resourceKey}" (verify state invariants)`, extra: `state machine lifecycle approve transfer settle export mutation ${dep.resourceKey}`, pScore: 84, cScore: 86 }
+          : edgeKind === 'signed_url'
+            ? { sink: 'upload_storage', pCue: `Signed artifact producer ${dep.producer} yields "${dep.resourceKey}"`, cCue: `Signed URL consumer ${dep.consumer} redeems "${dep.resourceKey}"`, extra: `signed url download export artifact storage ${dep.resourceKey}`, pScore: 82, cScore: 84 }
+            : { sink: undefined, pCue: `Producer ${dep.producer} yields resource "${dep.resourceKey}"`, cCue: `Consumer ${dep.consumer} acts on resource "${dep.resourceKey}"`, extra: `resource ${dep.resourceKey} cross-tenant mutation`, pScore: 76, cScore: 78 }
     const prodBefore = candidates.length
     pushCandidate({
       origin: prodOrigin,
       endpoint: dep.producer,
-      cue: `Producer ${dep.producer} yields resource "${dep.resourceKey}"`,
+      cue: meta.pCue,
+      ...(meta.sink ? { sinkKind: meta.sink } : {}),
       resourceKey: dep.resourceKey,
       isApiDep: true,
-      extraText: `producer resource ${dep.resourceKey}`,
-      baseScore: 76,
+      extraText: `producer ${meta.extra}`,
+      baseScore: meta.pScore,
     })
     const prodCand = candidates.find(c => c.origin === prodOrigin && c.endpoint === dep.producer.trim())
       ?? (candidates.length > prodBefore ? candidates[candidates.length - 1] : undefined)
@@ -5110,11 +5154,12 @@ export function synthesizeRuntimeCompositeWave1Steps(
     pushCandidate({
       origin: consOrigin,
       endpoint: dep.consumer,
-      cue: `Consumer ${dep.consumer} acts on resource "${dep.resourceKey}"`,
+      cue: meta.cCue,
+      ...(meta.sink ? { sinkKind: meta.sink } : {}),
       resourceKey: dep.resourceKey,
       isApiDep: true,
-      extraText: `consumer resource ${dep.resourceKey} cross-tenant mutation`,
-      baseScore: 78,
+      extraText: `consumer ${meta.extra}`,
+      baseScore: meta.cScore,
     })
     const consCand = candidates.find(c => c.origin === consOrigin && c.endpoint === dep.consumer.trim())
       ?? (candidates.length > consBefore ? candidates[candidates.length - 1] : undefined)
@@ -5183,13 +5228,40 @@ export function synthesizeRuntimeCompositeWave1Steps(
     })
   }
 
-  // 3. Collect from persisted endpoints (prioritizing cross-origin diversity and high-risk routes).
-  const endpoints = options.endpoints ?? storage.listEndpoints(run.id, { limit: 200 })
+  // 3. Collect from persisted endpoints (filtering 404/405-only surface_probe ghosts + prioritizing lifecycle chains).
+  const rawEndpoints = options.endpoints ?? storage.listEndpoints(run.id, { limit: 200 })
+  let runExchanges: Array<{ origin: string; method: string; pathAndQuery: string; status: number }> = []
+  try {
+    runExchanges = storage.client.prepare(
+      'SELECT origin, method, path_and_query AS pathAndQuery, status FROM broker_exchanges WHERE run_id = ? ORDER BY created_at DESC LIMIT 400',
+    ).all(run.id) as typeof runExchanges
+  } catch { /* best-effort ghost probe filter */ }
+  const evidencedKeys = new Set<string>()
+  for (const spec of (options.specs ?? []).slice(0, 6)) {
+    if (spec.kind !== 'openapi') continue
+    const so = spec.origin && assetByOrigin.has(spec.origin) ? spec.origin : defaultOrigin
+    try {
+      const p = JSON.parse(spec.content) as { paths?: Record<string, Record<string, unknown>> }
+      for (const pk of Object.keys(p.paths ?? {})) evidencedKeys.add(`${so}|${pk.replace(/\/+$/, '').toLowerCase() || '/'}`)
+    } catch { /* ignore */ }
+  }
+  for (const f of options.facts ?? []) {
+    if (f.tainted) continue
+    const d = (f.data ?? {}) as Record<string, unknown>
+    if (d.subkind === 'runtime_spa_routes' && Array.isArray(d.spaRoutes)) {
+      for (const r of d.spaRoutes as Array<{ serviceOrigin?: string; apiCalls?: Array<{ path?: string; serviceOrigin?: string }> }>) {
+        for (const c of r?.apiCalls ?? []) if (typeof c?.path === 'string') evidencedKeys.add(`${c.serviceOrigin ?? r.serviceOrigin ?? f.origin}|${c.path.split(/[?#]/, 1)[0]!.replace(/\/+$/, '').toLowerCase() || '/'}`)
+      }
+    }
+  }
+  const endpoints = filterGhostSurfaceProbeEndpoints(rawEndpoints, runExchanges, evidencedKeys)
+  const lifeBuckets = new Map<string, { create?: NormalizedRuntimeHopCandidate; rebind?: NormalizedRuntimeHopCandidate; finalize?: NormalizedRuntimeHopCandidate }>()
   for (const ep of endpoints) {
     if (!assetByOrigin.has(ep.origin)) continue
     if (ep.pathTemplate === '/' || /^\/(?:health|healthz|ready|metrics|favicon)/i.test(ep.pathTemplate)) continue
-    const label = `${ep.method.toUpperCase()} ${ep.pathTemplate}`
+    const method = ep.method.toUpperCase(), label = `${method} ${ep.pathTemplate}`
     const authHint = ep.authRequirement ? `auth=${ep.authRequirement}` : 'auth=unspecified'
+    const before = candidates.length
     pushCandidate({
       origin: ep.origin,
       endpoint: label,
@@ -5198,6 +5270,21 @@ export function synthesizeRuntimeCompositeWave1Steps(
       extraText: `${authHint} ${(ep.sinkKinds ?? []).join(' ')}`,
       baseScore: ep.riskScore ?? 55,
     })
+    const cand = candidates.find(c => c.origin === ep.origin && c.endpoint === label) ?? (candidates.length > before ? candidates[candidates.length - 1] : undefined)
+    if (!cand) continue
+    const ent = inferEntityName(ep.pathTemplate)
+    if (ent && ent !== 'resource') {
+      const b = lifeBuckets.get(`${ep.origin}|${ent}`) ?? {}
+      if (!b.create && method === 'POST' && !/\/(?:rebind|update|approve|transfer|finalize|settle|release|export|complete)(?:\/|$)/i.test(ep.pathTemplate)) b.create = cand
+      else if (!b.rebind && (method === 'PATCH' || method === 'PUT' || /\/(?:rebind|update|assign|delegate|transfer|approve)(?:\/|$)/i.test(ep.pathTemplate))) b.rebind = cand
+      if (!b.finalize && /\/(?:finalize|settle|release|complete|commit|publish|capture|export|dispatch|confirm|payout)(?:\/|$)/i.test(ep.pathTemplate) && cand.key !== b.create?.key && cand.key !== b.rebind?.key) b.finalize = cand
+      lifeBuckets.set(`${ep.origin}|${ent}`, b)
+    }
+  }
+  for (const [ek, b] of lifeBuckets) {
+    const rk = `${ek.split('|')[1] ?? 'entity'}Id`
+    if (b.create && b.rebind && !depPairs.some(p => p.prod.key === b.create!.key && p.cons.key === b.rebind!.key)) depPairs.push({ prod: b.create, cons: b.rebind, resourceKey: rk })
+    if (b.rebind && b.finalize && !depPairs.some(p => p.prod.key === b.rebind!.key && p.cons.key === b.finalize!.key)) depPairs.push({ prod: b.rebind, cons: b.finalize, resourceKey: rk })
   }
 
   // 4. Collect from JSON OpenAPI specs when endpoints/facts are sparse.
