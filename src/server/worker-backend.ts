@@ -2,19 +2,8 @@ import { spawn, spawnSync } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import {
-  chmodSync,
-  chownSync,
-  copyFileSync,
-  existsSync,
-  lstatSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  readdirSync,
-  readlinkSync,
-  realpathSync,
-  rmSync,
-  statSync,
+  chmodSync, chownSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync,
+  readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync,
 } from 'node:fs'
 import { basename, dirname, isAbsolute, join, posix, relative, resolve as resolvePath, sep } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -24,14 +13,9 @@ import { z } from 'zod'
 import type { AnalyzerName } from '../../worker/analyzers.ts'
 import { isSensitiveRepoEntry } from './safety-primitives.ts'
 import {
-  VERIFY_RPC_CONTAINER_DIR,
-  VERIFY_RPC_CONTEXT_ENV,
-  VERIFY_RPC_CONTEXT_NAME,
-  VERIFY_RPC_SOCKET_ENV,
-  VERIFY_RPC_SOCKET_NAME,
-  VERIFY_RPC_TOKEN_ENV,
-  VERIFY_RPC_TOKEN_NAME,
-  prepareVerifyScript,
+  VERIFY_RPC_CONTAINER_DIR, VERIFY_RPC_CONTEXT_ENV, VERIFY_RPC_CONTEXT_NAME,
+  VERIFY_RPC_SOCKET_ENV, VERIFY_RPC_SOCKET_NAME, VERIFY_RPC_TOKEN_ENV,
+  VERIFY_RPC_TOKEN_NAME, prepareVerifyScript,
 } from './verify-rpc.ts'
 
 const pathSchema = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}(?:\/[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}){0,3}$/)
@@ -373,16 +357,8 @@ export const astVerifyResultSchema = z.object({
 })
 
 export const callGraphSinkKindSchema = z.enum([
-  'api_route',
-  'server_action',
-  'webhook',
-  'db_query',
-  'outbound_fetch',
-  'redirect',
-  'postmessage_iframe',
-  'upload_storage',
-  'auth_config',
-  'other',
+  'api_route', 'server_action', 'webhook', 'db_query', 'outbound_fetch',
+  'redirect', 'postmessage_iframe', 'upload_storage', 'auth_config', 'other',
 ])
 
 export const callGraphRequestSchema = z.object({
@@ -522,6 +498,10 @@ export interface WorkerBackend {
   verifyStaticAst(assignmentId: string, req: AstVerifyRequest, signal: AbortSignal, options?: WorkerSessionOptions): Promise<AstVerifyResult>
   /** Container image tag used by this backend (container-visible isolation input for warm-pool keying). */
   readonly workerImage?: string
+  /** Immutable Docker image digest/ID (`sha256:...`), or `null` when unavailable. */
+  readonly workerImageId?: string | null
+  /** Build-time `kovo.worker.source_hash` LABEL from the worker image, or `null` when unavailable. */
+  readonly workerSourceHash?: string | null
   /** Container-reuse counters (diagnostic seam; optional for test/fake backends). */
   containerStats?(): WorkerContainerStats | undefined
   /** Size the warm idle pool to the run's worker-slot count (one container per slot). */
@@ -2086,10 +2066,33 @@ export class WarmWorkerPool {
   }
 }
 
+/** Lazy, process-cached `docker image inspect` lookup keyed by image ref (never fabricates a mutable tag). */
+const inspectedWorkerImageCache = new Map<string, { imageId: string | null; sourceHash: string | null }>()
+function inspectWorkerImageIdentitySync(imageRef: string): { imageId: string | null; sourceHash: string | null } {
+  const cached = inspectedWorkerImageCache.get(imageRef)
+  if (cached) return cached
+  let identity: { imageId: string | null; sourceHash: string | null } = { imageId: null, sourceHash: null }
+  try {
+    const res = spawnSync('docker', ['image', 'inspect', '--format', '{{.Id}}\t{{index .Config.Labels "kovo.worker.source_hash"}}', imageRef], { encoding: 'utf8', env: dockerEnv(), timeout: 5_000, stdio: ['ignore', 'pipe', 'ignore'] })
+    if (res.status === 0 && typeof res.stdout === 'string') {
+      const [rawId = '', rawHash = ''] = (res.stdout.trim().split(/\r?\n/)[0] ?? '').split('\t')
+      const cleanId = normalizeDockerLabel(rawId)
+      identity = { imageId: cleanId && cleanId.startsWith('sha256:') ? cleanId : null, sourceHash: normalizeDockerLabel(rawHash) }
+    }
+  } catch { identity = { imageId: null, sourceHash: null } }
+  inspectedWorkerImageCache.set(imageRef, identity)
+  return identity
+}
+
 export class LinuxWorkerBackend implements WorkerBackend {
   private readonly instanceId = randomUUID()
   private readonly image: string
+  private readonly customDockerRunner: boolean
+  private readonly explicitImageId: string | null | undefined
+  private readonly explicitSourceHash: string | null | undefined
   get workerImage(): string { return this.image }
+  get workerImageId(): string | null { return this.explicitImageId !== undefined ? this.explicitImageId : (this.customDockerRunner ? null : inspectWorkerImageIdentitySync(this.image).imageId) }
+  get workerSourceHash(): string | null { return this.explicitSourceHash !== undefined ? this.explicitSourceHash : (this.customDockerRunner ? null : inspectWorkerImageIdentitySync(this.image).sourceHash) }
   private readonly owner?: string
   private readonly runId?: string
   private readonly cell?: string
@@ -2120,6 +2123,10 @@ export class LinuxWorkerBackend implements WorkerBackend {
 
   constructor(input: {
     image?: string
+    /** Immutable image digest/ID (`sha256:...`) when already inspected by the caller. */
+    imageId?: string | null
+    /** Build-time `kovo.worker.source_hash` LABEL when already inspected by the caller. */
+    sourceHash?: string | null
     workspace?: { id: string; directory: string }
     runId?: string
     /** Test seam: replace the docker CLI executor (defaults to the real CLI). */
@@ -2145,20 +2152,13 @@ export class LinuxWorkerBackend implements WorkerBackend {
     maxWarmPools?: number
   } = {}) {
     const {
-      image = 'kovo-worker:v4',
-      workspace,
-      runId,
-      dockerRunner,
-      sessionSpawner,
-      staleCreatedMs,
-      foreignOwnerTtlMs,
-      ownerPidNs,
-      cell,
-      isPidAlive,
-      readPidStartTime,
-      maxWarmPools,
+      image = 'kovo-worker:v4', imageId, sourceHash, workspace, runId, dockerRunner, sessionSpawner,
+      staleCreatedMs, foreignOwnerTtlMs, ownerPidNs, cell, isPidAlive, readPidStartTime, maxWarmPools,
     } = input
     this.image = input.image ?? (process.env.KOVO_WORKER_IMAGE?.trim() || image)
+    this.customDockerRunner = dockerRunner !== undefined
+    this.explicitImageId = imageId !== undefined ? (imageId?.trim() || null) : undefined
+    this.explicitSourceHash = sourceHash !== undefined ? (sourceHash?.trim() || null) : undefined
     this.runId = runId
     this.docker = dockerRunner ?? docker
     this.spawnSession = sessionSpawner ?? (name => spawn('docker', ['container', 'start', '--attach', '--interactive', name], {

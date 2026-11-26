@@ -2600,6 +2600,7 @@ async function waitForTerminal(input: {
   deadlineAt: number
   signal: AbortSignal
   onTick: (status: string, phase: string) => void
+  isEngineStopped?: () => boolean
 }): Promise<{ timedOut: boolean; interrupted: boolean; status: string; phase: string }> {
   const terminal = new Set(['complete', 'failed', 'stopped', 'paused', 'budget_paused'])
   let last = 0
@@ -2611,6 +2612,13 @@ async function waitForTerminal(input: {
     if (input.signal.aborted) {
       try { input.storage.command({ requestId: randomUUID(), runId: input.runId, action: 'stop' }) } catch { /* terminal */ }
       return { timedOut: false, interrupted: true, status: input.storage.run(input.runId).status, phase: input.storage.run(input.runId).phase }
+    }
+    if (input.isEngineStopped?.()) {
+      const latest = input.storage.run(input.runId)
+      if (terminal.has(latest.status)) {
+        return { timedOut: false, interrupted: input.signal.aborted, status: latest.status, phase: latest.phase }
+      }
+      throw new Error(`Execution engine stopped unexpectedly while run ${input.runId} was ${latest.status}/${latest.phase}`)
     }
     if (Date.now() >= input.deadlineAt) {
       try { input.storage.command({ requestId: randomUUID(), runId: input.runId, action: 'stop' }) } catch { /* terminal */ }
@@ -3450,7 +3458,13 @@ export async function runCell(args: RealismArgs, fixtureName: string, signal: Ab
     const selected = await selectVerifierBackend(args.verifier)
     ctx.backendKind = selected.kind
     ctx.backend = selected.kind === 'docker'
-      ? new LinuxWorkerBackend({ workspace: { id: storage.workspace.id, directory: storage.directory }, cell: slug })
+      ? new LinuxWorkerBackend({
+          image: selected.workerImage?.imageRef,
+          imageId: selected.workerImage?.imageId ?? null,
+          sourceHash: selected.workerImage?.sourceHash ?? null,
+          workspace: { id: storage.workspace.id, directory: storage.directory },
+          cell: slug,
+        })
       : selected.backend
     const capability = model.mode === 'agentic'
       ? await detectWorkerSessions(ctx.backend)
@@ -3685,6 +3699,7 @@ export async function runCell(args: RealismArgs, fixtureName: string, signal: Ab
       deadlineAt: startedAt + args.maxDurationMs,
       signal,
       onTick: (status, phase) => log(`[${slug}] ${status}/${phase}`),
+      isEngineStopped: () => engine.isStopped,
     })
     terminalStatus = waited.status
     terminalPhase = waited.phase

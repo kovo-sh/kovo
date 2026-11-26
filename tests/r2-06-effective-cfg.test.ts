@@ -25,6 +25,7 @@ import { describe, test } from 'node:test'
 
 import { conventionalWordlistEnabled } from '../src/server/deterministic-engine.ts'
 import { Execution } from '../src/server/execution.ts'
+import { LinuxWorkerBackend } from '../src/server/worker-backend.ts'
 import { RequestBroker, type Grant } from '../src/server/broker.ts'
 import type { DeclarativeReplaySpec } from '../src/replay-spec.ts'
 import type { Finding } from '../src/domain.ts'
@@ -639,5 +640,93 @@ describe('R2-06: wordlist default OFF, effective_config event, Store guard, cert
     const agenticRc = readFileSync(join(outDir, 'agentic.rc'), 'utf8').trim()
     assert.notEqual(agenticRc, '0')
     assert.match(readFileSync(join(outDir, 'agentic.log'), 'utf8'), /skipped/i)
+  })
+
+  test('8. LinuxWorkerBackend & Execution emit immutable workerImageId/workerSourceHash without mutable-tag fallback and expose isStopped', async t => {
+    const fakeDockerRunner = async () => ''
+    const expectedDigest = 'sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+    const expectedSourceHash = 'abcdef0123456789abcdef0123456789abcdef01'
+
+    // (a) Explicit inspected digest/sourceHash flow cleanly into run.effective_config
+    const backendWithIds = new LinuxWorkerBackend({
+      image: 'kovo-worker:v4',
+      imageId: expectedDigest,
+      sourceHash: expectedSourceHash,
+      dockerRunner: fakeDockerRunner,
+    })
+    assert.equal(backendWithIds.workerImage, 'kovo-worker:v4')
+    assert.equal(backendWithIds.workerImageId, expectedDigest)
+    assert.equal(backendWithIds.workerSourceHash, expectedSourceHash)
+
+    const { storage: storageA } = makeStore(t, 'r2-06-worker-id-explicit-')
+    const { runId: runIdA } = await setupApprovedRun(storageA, { budgetRequests: 400 })
+    const engineA = new Execution(storageA, { deterministicOnly: true, backend: backendWithIds, maxDurationMs: 300_000 })
+    assert.equal(engineA.isStopped, false, 'isStopped must be false before stop()')
+    t.after(async () => { await engineA.stop() })
+    ;(engineA as unknown as { ensureEffectiveConfigRecorded: (r: ReturnType<typeof storageA.run>, p: unknown[]) => void })
+      .ensureEffectiveConfigRecorded(storageA.run(runIdA), [])
+
+    const eventsA = storageA.eventsAfter(runIdA, 0, 200)
+    const obsA = extractObservedEffectiveConfig(eventsA)
+    assert.ok(obsA)
+    assert.equal(obsA.workerImageId, expectedDigest)
+    assert.equal(obsA.workerSourceHash, expectedSourceHash)
+    const cfgA = computeEffectiveConfig({
+      observedEvents: eventsA,
+      deterministicOnly: true,
+      wordlistOn: false,
+      workerImageId: expectedDigest,
+      workerSourceHash: expectedSourceHash,
+      sdkVersion: VERIFY_RPC_SDK_VERSION,
+      env: {},
+    })
+    assert.equal(cfgA.effectiveConfig.workerImageId, expectedDigest)
+    assert.equal(cfgA.effectiveConfig.workerSourceHash, expectedSourceHash)
+
+    // Mismatched digest still fails closed
+    assert.throws(
+      () => computeEffectiveConfig({
+        observedEvents: eventsA,
+        workerImageId: 'sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
+        env: {},
+      }),
+      (err: unknown) => err instanceof EffectiveConfigMismatchError && err.mismatches.some(m => m.field === 'workerImageId'),
+    )
+
+    await engineA.stop()
+    assert.equal(engineA.isStopped, true, 'isStopped must flip to true after stop()')
+
+    // (b) Custom dockerRunner seam without imageId/sourceHash MUST return null (never mutable tag 'kovo-worker:v4')
+    const backendNoIds = new LinuxWorkerBackend({
+      image: 'kovo-worker:v4',
+      dockerRunner: fakeDockerRunner,
+    })
+    assert.equal(backendNoIds.workerImage, 'kovo-worker:v4')
+    assert.equal(backendNoIds.workerImageId, null, 'must never fabricate mutable tag as immutable workerImageId')
+    assert.equal(backendNoIds.workerSourceHash, null)
+
+    const { storage: storageB } = makeStore(t, 'r2-06-worker-id-null-')
+    const { runId: runIdB } = await setupApprovedRun(storageB, { budgetRequests: 400 })
+    const engineB = new Execution(storageB, { deterministicOnly: true, backend: backendNoIds, maxDurationMs: 300_000 })
+    t.after(async () => { await engineB.stop() })
+    ;(engineB as unknown as { ensureEffectiveConfigRecorded: (r: ReturnType<typeof storageB.run>, p: unknown[]) => void })
+      .ensureEffectiveConfigRecorded(storageB.run(runIdB), [])
+
+    const eventsB = storageB.eventsAfter(runIdB, 0, 200)
+    const obsB = extractObservedEffectiveConfig(eventsB)
+    assert.ok(obsB)
+    assert.equal(obsB.workerImageId, null, 'run.effective_config must emit null, never mutable tag kovo-worker:v4')
+    assert.equal(obsB.workerSourceHash, null)
+    // Caller-supplied inspected digest must NOT clash with null observed workerImageId
+    const cfgB = computeEffectiveConfig({
+      observedEvents: eventsB,
+      deterministicOnly: true,
+      wordlistOn: false,
+      workerImageId: expectedDigest,
+      workerSourceHash: expectedSourceHash,
+      sdkVersion: VERIFY_RPC_SDK_VERSION,
+      env: {},
+    })
+    assert.equal(cfgB.effectiveConfig.workerImageId, expectedDigest)
   })
 })

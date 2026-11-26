@@ -84,16 +84,22 @@ import type {
   SnapshotCheckpoint,
   SnapshotCounts,
 } from '../src/server/run-snapshot.ts'
-import { selectVerifierBackend } from './benchmark-backend.ts'
-import type { VerifierBackendKind } from './benchmark-backend.ts'
+import { resolveWorkerImageRef, selectVerifierBackend } from './benchmark-backend.ts'
+import type { VerifierBackendKind, WorkerImageIdentity } from './benchmark-backend.ts'
+import { VERIFY_RPC_SDK_VERSION } from '../src/server/verify-rpc.ts'
 import {
   DEFAULT_LEDGER_PATH,
-  LEDGER_SCHEMA_VERSION,
-  appendLedgerRow,
+  appendPerRunLedgerRow,
   computeBenchmarkVersion,
   computeEffectiveConfig,
+  extractObservedEffectiveConfig,
+  promoteLedgerRows,
   resolveGitState,
+  type EffectiveConfigSnapshot,
+  type LedgerRow,
+  type ObservedEffectiveConfig,
 } from './bench-ledger.ts'
+import { buildLedgerRow } from './score-primitives.ts'
 import type { WorkerBackend } from '../src/server/worker-backend.ts'
 import { LinuxWorkerBackend } from '../src/server/worker-backend.ts'
 
@@ -196,8 +202,10 @@ export interface RealisticArgs {
   snapshotRefresh: boolean
   /** Explicitly allow reusing a salted held-out checkpoint (refused by default). */
   allowHeldoutSnapshot: boolean
-  /** Optional versioned ledger path (`--ledger [path]`). */
+  /** Optional target ledger path to promote validated per-run rows into (`--ledger [path]` / `--promote-ledger [path]`). */
   ledgerPath?: string
+  /** Escape hatch for ad-hoc scratch/dry-runs: disable default per-run ledger emission. */
+  noLedger?: boolean
   help: boolean
 }
 
@@ -279,6 +287,10 @@ Flags:
   --allow-heldout-snapshot
                           explicitly allow reusing a salted held-out checkpoint
                           (refused by default)
+  --ledger [path]         promote validated per-run ledger rows into committed ledger
+                          (default: ${DEFAULT_LEDGER_PATH}; per-run rows are emitted by default)
+  --promote-ledger [path] alias for --ledger [path]
+  --no-ledger             disable default per-run ledger emission (ad-hoc scratch/dry-runs only)
   --help                  show this help
 
 Environment:
@@ -414,13 +426,16 @@ export function parseRealisticArgs(argv: string[], env: NodeJS.ProcessEnv = proc
     'conventional-wordlist', 'no-conventional-wordlist', 'isolate-data-dir', 'keep-data-dirs',
     'allow-inert-workers', 'verifier', 'reuse-recon', 'refresh-recon', 'help',
     'snapshot-after-floor', 'resume-snapshot', 'snapshot-max-age-ms', 'snapshot-refresh',
-    'allow-heldout-snapshot', 'ledger',
+    'allow-heldout-snapshot', 'ledger', 'promote-ledger', 'no-ledger',
   ])
   for (const key of Object.keys(a)) {
     if (!known.has(key)) fail(`unknown flag --${key}`)
   }
   if (a['conventional-wordlist'] === true && a['no-conventional-wordlist'] === true) {
     fail('use either --conventional-wordlist or --no-conventional-wordlist, not both')
+  }
+  if (a['no-ledger'] === true && (a.ledger !== undefined || a['promote-ledger'] !== undefined)) {
+    fail('--no-ledger cannot be combined with --ledger or --promote-ledger')
   }
 
   if (a.help === true) {
@@ -575,11 +590,14 @@ export function parseRealisticArgs(argv: string[], env: NodeJS.ProcessEnv = proc
     snapshotMaxAgeMs,
     snapshotRefresh,
     allowHeldoutSnapshot: a['allow-heldout-snapshot'] === true,
-    ...(a.ledger === true
+    ...(a.ledger === true || a['promote-ledger'] === true
       ? { ledgerPath: DEFAULT_LEDGER_PATH }
-      : typeof a.ledger === 'string'
-        ? { ledgerPath: a.ledger }
-        : {}),
+      : typeof a['promote-ledger'] === 'string'
+        ? { ledgerPath: a['promote-ledger'] }
+        : typeof a.ledger === 'string'
+          ? { ledgerPath: a.ledger }
+          : {}),
+    ...(a['no-ledger'] === true ? { noLedger: true } : {}),
     help: false,
   }
 }
@@ -2928,13 +2946,151 @@ function unlockAndRemove(dir: string): void {
 
 function nowMs(): number { return Date.now() }
 
-async function waitForTerminal(input: {
+/** Sentinel hash stamped on INVALID rows when an Execution-backed run emitted no `run.effective_config` event. */
+export const MISSING_OBSERVED_EFFECTIVE_CONFIG_HASH = createHash('sha256')
+  .update('kovo-effective-config:missing-observed')
+  .digest('hex')
+
+/**
+ * Resolve effective config strictly from an engine-emitted `run.effective_config` event.
+ * Never fabricates `effectiveConfig` from caller flags when `observed` is absent.
+ */
+export function resolveObservedEffectiveConfigForRunner(input: {
+  observed: ObservedEffectiveConfig | null | undefined
+  deterministicOnly: boolean
+  environment?: string
+  approvalPolicy?: string
+  wordlistOn?: boolean
+  verifierBackend: string
+  mode: string
+  workerImageId?: string | null
+  workerSourceHash?: string | null
+  sdkVersion?: string | null
+}): { observed: boolean; effectiveConfigHash: string; effectiveConfig?: EffectiveConfigSnapshot } {
+  if (!input.observed) {
+    return {
+      observed: false,
+      effectiveConfigHash: MISSING_OBSERVED_EFFECTIVE_CONFIG_HASH,
+      effectiveConfig: undefined,
+    }
+  }
+  const { effectiveConfigHash, effectiveConfig } = computeEffectiveConfig({
+    observed: input.observed,
+    deterministicOnly: input.deterministicOnly,
+    environment: input.environment ?? 'local-lab',
+    approvalPolicy: input.approvalPolicy ?? 'auto_review',
+    ...(input.wordlistOn !== undefined ? { wordlistOn: input.wordlistOn } : {}),
+    verifierBackend: input.verifierBackend,
+    mode: input.mode,
+    ...(input.workerImageId ? { workerImageId: input.workerImageId } : {}),
+    ...(input.workerSourceHash ? { workerSourceHash: input.workerSourceHash } : {}),
+    sdkVersion: input.sdkVersion ?? VERIFY_RPC_SDK_VERSION,
+  })
+  return { observed: true, effectiveConfigHash, effectiveConfig }
+}
+
+/**
+ * Emit one realistic-bench cell ledger row to the gitignored per-run ledger by default
+ * (`KOVO_LEDGER_ROOT` / `benchmarks/results/runs/<run-id>.jsonl`), optionally promoting to
+ * `promoteLedgerPath`. Marks the row `INVALID` when observed `effectiveConfig` is missing.
+ */
+export function writeRealisticCellLedgerRow(input: {
+  scorecard: Scorecard
+  app: AppName
+  split: 'dev' | 'held-out' | 'sealed'
+  mode: BenchMode
+  llm: 'agentic' | 'deterministic-no-llm'
+  seed: number
+  recordedAt: string
+  gitSha: string
+  dirty: boolean
+  benchmarkVersion: string
+  effectiveConfigHash: string
+  effectiveConfig?: EffectiveConfigSnapshot
+  observedEffectiveConfig: boolean
+  inert: boolean
+  conventionalWordlist: boolean
+  durationMs: number
+  workerImageId?: string | null
+  workerSourceHash?: string | null
+  sdkVersion?: string | null
+  noLedger?: boolean
+  promoteLedgerPath?: string
+  runId?: string
+  runsDir?: string
+  repoRoot?: string
+}): { perRunPath: string | null; row: LedgerRow | null } {
+  if (input.noLedger) return { perRunPath: null, row: null }
+  const card = input.scorecard
+  const graded = card as typeof card & { validUnplantedCount?: number }
+  const siteOutcomes: Record<string, string> = {}
+  for (const v of card.vulns) siteOutcomes[v.siteId] = v.outcome
+  const missingObserved = !input.observedEffectiveConfig || !input.effectiveConfig
+  const notes: string[] = []
+  if (missingObserved) notes.push('missing_observed_effective_config')
+  const row = buildLedgerRow({
+    cell: card as unknown as Record<string, unknown>,
+    readMeta: {
+      failed: missingObserved,
+      inert: input.inert,
+      app: input.app,
+      seed: input.seed,
+      split: input.split,
+      mode: input.mode,
+      llm: input.llm,
+      durationMs: input.durationMs,
+      ...(missingObserved ? { error: 'missing_observed_effective_config' } : {}),
+    },
+    suite: 'realistic-bench',
+    recordedAt: input.recordedAt,
+    gitSha: input.gitSha,
+    dirty: input.dirty,
+    benchmarkVersion: input.benchmarkVersion,
+    effectiveConfigHash: input.effectiveConfigHash,
+    ...(input.effectiveConfig ? { effectiveConfig: input.effectiveConfig } : {}),
+    app: input.app,
+    split: input.split,
+    mode: input.mode,
+    llm: input.llm,
+    seed: input.seed,
+    repeat: 1,
+    certifying: false,
+    reportable: !input.conventionalWordlist && !input.inert && !missingObserved,
+    validUnplantedCount: graded.validUnplantedCount ?? 0,
+    costUsd: card.totalCostUsd,
+    durationMs: input.durationMs,
+    siteOutcomes,
+    notes,
+  })
+  const stampedRow: LedgerRow = {
+    ...row,
+    workerImageId: input.workerImageId ?? input.effectiveConfig?.workerImageId ?? null,
+    workerSourceHash: input.workerSourceHash ?? input.effectiveConfig?.workerSourceHash ?? null,
+    sdkVersion: input.sdkVersion ?? input.effectiveConfig?.sdkVersion ?? VERIFY_RPC_SDK_VERSION,
+  }
+  const runStem = input.runId ?? `realistic-${input.app}-seed${input.seed}-${input.mode}-${input.recordedAt.replace(/[:.]/g, '-')}-${process.pid}`
+  const appended = appendPerRunLedgerRow(stampedRow, {
+    runId: runStem,
+    runsDir: input.runsDir,
+    repoRoot: input.repoRoot,
+  })
+  if (input.promoteLedgerPath) {
+    promoteLedgerRows(appended.path, {
+      targetLedgerPath: input.promoteLedgerPath,
+      repoRoot: input.repoRoot,
+    })
+  }
+  return { perRunPath: appended.path, row: appended.row }
+}
+
+export async function waitForTerminal(input: {
   storage: Store
   runId: string
   deadlineAt: number
   onTick?: (status: string, phase: string) => void
   /** Fired once, on the first poll that observes the engine's Phase-0 completion marker. */
   onPhase0Complete?: (completedAt: number) => void
+  isEngineStopped?: () => boolean
 }): Promise<{ timedOut: boolean; status: string; phase: string }> {
   const terminal = new Set(['complete', 'failed', 'stopped', 'paused', 'budget_paused'])
   let last = 0
@@ -2948,6 +3104,11 @@ async function waitForTerminal(input: {
       } catch { /* cache capture is best-effort; never block the run */ }
     }
     if (terminal.has(run.status)) return { timedOut: false, status: run.status, phase: run.phase }
+    if (input.isEngineStopped?.()) {
+      const latest = input.storage.run(input.runId)
+      if (terminal.has(latest.status)) return { timedOut: false, status: latest.status, phase: latest.phase }
+      throw new Error(`Execution engine stopped unexpectedly while run ${input.runId} was ${latest.status}/${latest.phase}`)
+    }
     if (nowMs() >= input.deadlineAt) {
       try {
         input.storage.command({ requestId: randomUUID(), runId: input.runId, action: 'stop' })
@@ -3141,10 +3302,16 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
       }
     })()
     backendKind = selected.kind
+    const workerImage: WorkerImageIdentity | null = selected.workerImage
     backend = selected.kind === 'docker'
       // Tag containers with this workspace so a crashed run can be reclaimed, and so the
       // harness leaves zero orphan containers after stop.
-      ? new LinuxWorkerBackend({ workspace: { id: storage.workspace.id, directory: storage.directory } })
+      ? new LinuxWorkerBackend({
+          image: workerImage?.imageRef ?? resolveWorkerImageRef(),
+          imageId: workerImage?.imageId ?? null,
+          sourceHash: workerImage?.sourceHash ?? null,
+          workspace: { id: storage.workspace.id, directory: storage.directory },
+        })
       : selected.backend
 
     const capability = await detectWorkerSessions(backend)
@@ -3543,6 +3710,7 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
       deadlineAt: startedAt + args.maxDurationMs,
       onTick: (status, phase) => log(`[${slug}] ${status}/${phase}`),
       onPhase0Complete: captureRecon,
+      isEngineStopped: () => engine?.isStopped === true,
     })
     notes.push(`personaIdentityFallbacks=${getPersonaIdentityFallbackCount()}`)
     if (recon.requested && !recon.captured && !recon.hit) {
@@ -3770,17 +3938,34 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
     })
 
     const { benchmarkVersion } = computeBenchmarkVersion('realistic-bench')
-    const { effectiveConfigHash, effectiveConfig } = computeEffectiveConfig({
+    const observedEffectiveConfig = extractObservedEffectiveConfig(runEvents)
+    const cfgResolved = resolveObservedEffectiveConfigForRunner({
+      observed: observedEffectiveConfig,
       deterministicOnly: args.noLlm,
       environment: 'local-lab',
       approvalPolicy: 'auto_review',
       wordlistOn: args.conventionalWordlist,
       verifierBackend: backendKind,
       mode: args.mode,
+      workerImageId: workerImage?.imageId ?? null,
+      workerSourceHash: workerImage?.sourceHash ?? null,
+      sdkVersion: VERIFY_RPC_SDK_VERSION,
     })
+    if (!cfgResolved.observed) {
+      notes.push('missing observed run.effective_config event (Execution-backed scorer requires observed config)')
+    }
+    const { effectiveConfigHash, effectiveConfig } = cfgResolved
     const versionStamp = { benchmarkVersion, effectiveConfigHash }
-    ;(meta as unknown as Record<string, unknown>).benchmarkVersion = benchmarkVersion
-    ;(meta as unknown as Record<string, unknown>).effectiveConfigHash = effectiveConfigHash
+    const metaRec = meta as unknown as Record<string, unknown>
+    metaRec.benchmarkVersion = benchmarkVersion
+    metaRec.effectiveConfigHash = effectiveConfigHash
+    metaRec.effectiveConfigObserved = cfgResolved.observed
+    if (effectiveConfig) metaRec.effectiveConfig = effectiveConfig
+    metaRec.workerImageId = workerImage?.imageId ?? effectiveConfig?.workerImageId ?? null
+    metaRec.workerSourceHash = workerImage?.sourceHash ?? effectiveConfig?.workerSourceHash ?? null
+    metaRec.sdkVersion = effectiveConfig?.sdkVersion ?? VERIFY_RPC_SDK_VERSION
+    metaRec.status = meta.inert || !cfgResolved.observed ? 'INVALID' : 'VALID'
+    metaRec.reportable = !args.conventionalWordlist && !meta.inert && cfgResolved.observed
 
     const jsonPath = join(args.outDir, `${slug}.json`)
     const mdPath = join(args.outDir, `${slug}.md`)
@@ -3796,49 +3981,30 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
       versionStamp,
     ), null, 2)}\n`, { mode: 0o600 })
     writeFileSync(mdPath, `${renderScorecard(card, 'md')}\n`, { mode: 0o600 })
-    if (args.ledgerPath) {
+    if (!args.noLedger) {
       const gitState = resolveGitState()
-      const graded = card as typeof card & {
-        rawPrecision?: number | null
-        validUnplantedCount?: number
-      }
-      const siteOutcomes: Record<string, string> = {}
-      for (const v of card.vulns) siteOutcomes[v.siteId] = v.outcome
-      appendLedgerRow({
-        schemaVersion: LEDGER_SCHEMA_VERSION,
-        recordedAt: new Date(endedAt).toISOString(),
-        suite: 'realistic-bench',
-        gitSha: gitState.gitSha,
-        dirty: gitState.dirty,
-        benchmarkVersion,
-        effectiveConfigHash,
-        effectiveConfig,
+      writeRealisticCellLedgerRow({
+        scorecard: card,
         app,
         split: started.plan.seedSet,
         mode: args.mode,
         llm: model.mode === 'agentic' ? 'agentic' : 'deterministic-no-llm',
         seed,
-        repeat: 1,
-        certifying: false,
-        reportable: !args.conventionalWordlist,
-        status: meta.inert ? 'INVALID' : 'VALID',
-        targets: card.targets,
-        confirmed: card.confirmed,
-        recall: meta.inert ? null : card.recall,
-        rawPrecision: graded.rawPrecision ?? (
-          card.confirmed + card.decoyFalsePositives + card.unmatchedFalsePositives > 0
-            ? card.confirmed / (card.confirmed + card.decoyFalsePositives + card.unmatchedFalsePositives)
-            : null
-        ),
-        strictPrecision: card.strictPrecision,
-        precision: card.precision,
-        decoyFalsePositives: card.decoyFalsePositives,
-        unmatchedFalsePositives: card.unmatchedFalsePositives,
-        validUnplantedCount: graded.validUnplantedCount ?? 0,
-        costUsd: card.totalCostUsd,
+        recordedAt: new Date(endedAt).toISOString(),
+        gitSha: gitState.gitSha,
+        dirty: gitState.dirty,
+        benchmarkVersion,
+        effectiveConfigHash,
+        effectiveConfig,
+        observedEffectiveConfig: cfgResolved.observed,
+        inert: meta.inert,
+        conventionalWordlist: args.conventionalWordlist,
         durationMs: endedAt - startedAt,
-        siteOutcomes,
-      }, args.ledgerPath)
+        workerImageId: workerImage?.imageId ?? effectiveConfig?.workerImageId ?? null,
+        workerSourceHash: workerImage?.sourceHash ?? effectiveConfig?.workerSourceHash ?? null,
+        sdkVersion: effectiveConfig?.sdkVersion ?? VERIFY_RPC_SDK_VERSION,
+        promoteLedgerPath: args.ledgerPath,
+      })
     }
 
     return { meta, scorecard: card, jsonPath, mdPath, metaPath }
@@ -3923,7 +4089,7 @@ function writeSummary(outDir: string, results: CellResult[]): void {
     : computeBenchmarkVersion('realistic-bench').benchmarkVersion
   const effectiveConfigHash = typeof firstMeta?.effectiveConfigHash === 'string'
     ? firstMeta.effectiveConfigHash
-    : computeEffectiveConfig({ wordlistOn }).effectiveConfigHash
+    : MISSING_OBSERVED_EFFECTIVE_CONFIG_HASH
   const rendered = renderScorecard(cards, 'json')
   try {
     const parsed = JSON.parse(rendered) as unknown

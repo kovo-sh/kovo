@@ -890,17 +890,23 @@ function unlockAndRemove(dir: string): void {
   rmSync(dir, { recursive: true, force: true })
 }
 
-async function waitForTerminal(input: {
+export async function waitForTerminal(input: {
   storage: Store
   runId: string
   deadlineAt: number
   onTick?: (status: string, phase: string) => void
+  isEngineStopped?: () => boolean
 }): Promise<{ timedOut: boolean; status: string; phase: string }> {
   const terminal = new Set(['complete', 'failed', 'stopped', 'paused', 'budget_paused'])
   let last = 0
   while (true) {
     const run = input.storage.run(input.runId)
     if (terminal.has(run.status)) return { timedOut: false, status: run.status, phase: run.phase }
+    if (input.isEngineStopped?.()) {
+      const latest = input.storage.run(input.runId)
+      if (terminal.has(latest.status)) return { timedOut: false, status: latest.status, phase: latest.phase }
+      throw new Error(`Execution engine stopped unexpectedly while run ${input.runId} was ${latest.status}/${latest.phase}`)
+    }
     if (nowMs() >= input.deadlineAt) {
       try {
         input.storage.command({ requestId: randomUUID(), runId: input.runId, action: 'stop' })
@@ -1079,12 +1085,24 @@ export async function runCell(
   let gitSha = 'unknown'
   let model: ModelInfo = { mode: 'deterministic-no-llm', profiles: [] }
 
-  const unregisterCleanup = cleanup.add(async () => {
-    if (engine) { try { engineBusy = await stopEngine(engine) } catch { engineBusy = -1 } }
-    if (backend instanceof LinuxWorkerBackend) { try { await backend.reclaimInactive() } catch { /* best-effort */ } }
-    try { await canary.stopListener(); canaryStopped = true } catch { canaryStopped = false }
-    if (started) { try { await started.stop(); appStopped = true } catch { appStopped = false } }
-  })
+  let teardownPromise: Promise<void> | null = null
+  const teardownCell = (): Promise<void> => {
+    if (!teardownPromise) {
+      teardownPromise = (async () => {
+        const currentEngine = engine
+        const currentBackend = backend
+        const currentStarted = started
+        engine = undefined
+        started = undefined
+        if (currentEngine) { try { engineBusy = await stopEngine(currentEngine) } catch { engineBusy = -1 } }
+        if (currentBackend instanceof LinuxWorkerBackend) { try { await currentBackend.reclaimInactive() } catch { /* best-effort */ } }
+        try { await canary.stopListener(); canaryStopped = true } catch { canaryStopped = false }
+        if (currentStarted) { try { await currentStarted.stop(); appStopped = true } catch { appStopped = false } }
+      })()
+    }
+    return teardownPromise
+  }
+  const unregisterCleanup = cleanup.add(teardownCell)
 
   try {
     // --- Preflight (before booting the app): model mode + real worker-session capability ---
@@ -1116,7 +1134,12 @@ export async function runCell(
     })()
     backendKind = selected.kind
     backend = selected.kind === 'docker'
-      ? new LinuxWorkerBackend({ workspace: { id: storage.workspace.id, directory: storage.directory } })
+      ? new LinuxWorkerBackend({
+          image: selected.workerImage?.imageRef,
+          imageId: selected.workerImage?.imageId ?? null,
+          sourceHash: selected.workerImage?.sourceHash ?? null,
+          workspace: { id: storage.workspace.id, directory: storage.directory },
+        })
       : selected.backend
 
     const capability = await detectWorkerSessions(backend)
@@ -1362,6 +1385,7 @@ export async function runCell(
       runId,
       deadlineAt: startedAt + args.maxDurationMs,
       onTick: (status, phase) => log(`[${slug}] ${status}/${phase}`),
+      isEngineStopped: () => engine?.isStopped === true,
     })
     if (wait.timedOut) notes.push(`wall-clock cap reached after ${args.maxDurationMs}ms; run stopped`)
     if (wait.status !== 'complete') {
@@ -1539,16 +1563,11 @@ export async function runCell(
     const result: ReasonCellResult = { meta, scorecard: card, jsonPath, mdPath, metaPath }
 
     // Teardown before publishing shutdown state (same ordering contract as the M0 harness).
-    if (engine) { try { engineBusy = await stopEngine(engine) } catch { engineBusy = -1 } }
-    if (backend instanceof LinuxWorkerBackend) { try { await backend.reclaimInactive() } catch { /* best-effort */ } }
-    try { await canary.stopListener(); canaryStopped = true } catch { canaryStopped = false }
-    if (started) { try { await started.stop(); appStopped = true } catch { appStopped = false } }
-    engine = undefined
-    started = undefined
+    await teardownCell()
+    unregisterCleanup()
     if (whiteBoxRoot) { try { unlockAndRemove(whiteBoxRoot) } catch { /* best-effort */ } }
     try { storage.close() } catch { /* already closed */ }
     if (isolated && !args.keepDataDirs) { try { unlockAndRemove(dataDir) } catch { /* best-effort */ } }
-    unregisterCleanup()
 
     meta.shutdown = { engineBusy, appStopped, canaryStopped }
     if (engineBusy > 0) process.stderr.write(`warning: ${engineBusy} execution task(s) still active after stop for ${slug}\n`)
@@ -1556,11 +1575,10 @@ export async function runCell(
     writeOwnerOnly(metaPath, `${JSON.stringify(redactJsonValue(meta, []), null, 2)}\n`)
     return result
   } finally {
-    // Failure path teardown: the registry closure is idempotent and stays registered until the
-    // success path removes it.
-    if (engine || started) {
-      try { await cleanup.runAll() } catch { /* best-effort */ }
-    }
+    // Cell-local teardown ONLY — never invoke process-global cleanup.runAll() from a cell finally,
+    // which would tear down concurrent sibling cells and leave their waitForTerminal loops hanging.
+    try { await teardownCell() } catch { /* best-effort */ }
+    unregisterCleanup()
     if (whiteBoxRoot) { try { unlockAndRemove(whiteBoxRoot) } catch { /* best-effort */ } }
     try { storage.close() } catch { /* already closed */ }
     if (isolated && !args.keepDataDirs) { try { unlockAndRemove(dataDir) } catch { /* best-effort */ } }
