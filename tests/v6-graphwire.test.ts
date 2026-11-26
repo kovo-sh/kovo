@@ -258,7 +258,7 @@ describe('v6 graphwire: monorepo origin mapping', () => {
     assert.equal(mappings.get('acme/product/services/web')?.origin, 'https://shop.test')
   })
 
-  test('single-origin runs attribute without service evidence; fallback is explicit', (t) => {
+  test('single-origin runs attribute without service evidence; multi-origin unmapped is explicit', (t) => {
     const reposDir = makeRepoDir(t, 'graphwire-single-')
     writeTree(reposDir, {
       'acme/app/src/app.ts': [
@@ -273,8 +273,9 @@ describe('v6 graphwire: monorepo origin mapping', () => {
 
     const multi = extractRepoProgramGraph({ reposDir, origins: ['https://a.example.test', 'https://b.example.test'] })
     assert.ok(multi)
-    assert.equal(multi.routes[0]?.originConfidence, 'fallback')
-    assert.ok((multi.routeOrigins['GET /status']?.evidence ?? []).some(evidence => evidence.includes('origins[0]')))
+    assert.equal(multi.routes[0]?.origin, undefined)
+    assert.equal(multi.routes[0]?.originConfidence, 'unmapped')
+    assert.ok((multi.routeOrigins['GET /status']?.evidence ?? []).some(evidence => evidence.includes('unmapped')))
   })
 })
 
