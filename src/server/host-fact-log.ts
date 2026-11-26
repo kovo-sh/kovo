@@ -1041,6 +1041,11 @@ export class HostFactLog {
       : fact.rawResponseBody !== null
         ? [createHash('sha256').update(fact.rawResponseBody, 'utf8').digest('hex')]
         : undefined
+    const consumedCaps = fact.consumedCapabilities?.length
+      ? [...fact.consumedCapabilities]
+      : fact.consumedCapabilityId
+        ? [fact.consumedCapabilityId]
+        : undefined
     return {
       exchangeId: fact.exchangeId,
       step,
@@ -1051,7 +1056,7 @@ export class HostFactLog {
       ...(fact.endedAt !== undefined ? { endedAt: fact.endedAt } : {}),
       ...(fact.origin ? { origin: fact.origin } : {}),
       ...(fact.consumedCapabilityId !== undefined ? { consumedCapabilityId: fact.consumedCapabilityId } : {}),
-      ...(fact.consumedCapabilities ? { consumedCapabilities: [...fact.consumedCapabilities] } : {}),
+      ...(consumedCaps ? { consumedCapabilities: consumedCaps } : {}),
       ...(fact.sessionId !== undefined ? { sessionId: fact.sessionId } : {}),
       ...(fact.carrierText ? { carrierText: fact.carrierText } : {}),
       ...(evidenceRole ? { evidenceRole } : {}),
@@ -1337,8 +1342,16 @@ export class HostFactLog {
         sessionRole: req?.sessionRole ?? null,
         ...(hostEntry?.evidenceRole ? { evidenceRole: hostEntry.evidenceRole } : {}),
         ...(req?.consumedCapabilityId !== undefined ? { consumedCapabilityId: req.consumedCapabilityId } : {}),
-        ...(hostEntry?.consumedCapabilities ? { consumedCapabilities: hostEntry.consumedCapabilities } : {}),
-        ...(hostEntry?.emittedCapabilities ? { emittedCapabilities: hostEntry.emittedCapabilities } : {}),
+        ...(hostEntry?.consumedCapabilities
+          ? { consumedCapabilities: hostEntry.consumedCapabilities }
+          : req?.consumedCapabilityId
+            ? { consumedCapabilities: [req.consumedCapabilityId] }
+            : {}),
+        ...(hostEntry?.emittedCapabilities
+          ? { emittedCapabilities: hostEntry.emittedCapabilities }
+          : record.op === 'capability' && typeof record.artifact?.capabilityHandle === 'string' && record.artifact.capabilityHandle
+            ? { emittedCapabilities: [record.artifact.capabilityHandle] }
+            : {}),
         ...(hostEntry?.observedResponseDigests ? { observedResponseDigests: hostEntry.observedResponseDigests } : {}),
         ...(hostEntry?.injectedRequestDigests ? { injectedRequestDigests: hostEntry.injectedRequestDigests } : {}),
         ...(hostEntry?.cryptoAttestations ? { cryptoAttestations: hostEntry.cryptoAttestations } : {}),
