@@ -3949,6 +3949,40 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     recordTruncationEntry(truncations, category, cap, observed, origin)
   }
 
+  type Phase0StageId =
+    | 'static_ast'
+    | 'host_fingerprint'
+    | 'crawl_state_graph'
+    | 'api_templates'
+    | 'auth_privileged'
+    | 'param_discovery'
+
+  let lastStageName: Phase0StageId | '' = ''
+  let lastStageEmitAt = 0
+  const emitPhase0Stage = (
+    stage: Phase0StageId,
+    label: string,
+    opts?: { origin?: string; hostsDone?: number; hostsTotal?: number; force?: boolean },
+  ) => {
+    const now = Date.now()
+    const stageChanged = stage !== lastStageName
+    if (!opts?.force && !stageChanged && now - lastStageEmitAt < 1000) return
+    lastStageName = stage
+    lastStageEmitAt = now
+    const frameworks = [...frameworksDetected].slice(0, 12)
+    storage.event(runId, 'phase0.stage', label, {
+      stage,
+      label,
+      ...(opts?.origin ? { origin: opts.origin } : {}),
+      ...(opts?.hostsDone !== undefined ? { hostsDone: opts.hostsDone } : {}),
+      ...(opts?.hostsTotal !== undefined ? { hostsTotal: opts.hostsTotal } : {}),
+      endpointsDiscovered,
+      paramsDiscovered,
+      requestsUsed,
+      ...(frameworks.length > 0 ? { frameworks } : {}),
+    })
+  }
+
   // Repo dependency manifests contribute tech tags even when live responses are uninformative
   // (or when Tier 0 sends no requests at all).
   for (const tag of mergeTechTags(techTagsFromManifests(readRepoManifests(params.reposDir ?? '', 200, staticSnapshot)))) {
@@ -3964,6 +3998,11 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
   let codeSlices = emptyCodeSliceSummary(params.maxCodeSlices)
   let probePlan: Phase0ReconResult['probePlan']
   if ((params.reposDir || staticSnapshot) && normalizedOrigins.length > 0) {
+    emitPhase0Stage('static_ast', 'Extracting static routes & workspace program graph.', {
+      hostsDone: 0,
+      hostsTotal: normalizedOrigins.length,
+      force: true,
+    })
     const primaryOrigin = normalizedOrigins[0]!
     const regexExtracted = extractStaticFrameworkRoutes(params.reposDir ?? '', staticSnapshot)
     let graphExtraction: RepoProgramGraphExtraction | null = null
@@ -4228,6 +4267,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       perOriginCap,
       endpointsDiscovered,
       paramsDiscovered,
+      frameworksDetected: [...frameworksDetected],
       ...(truncations.length > 0 ? { truncations } : {}),
     })
     storage.updateRunPhase0Completed(runId, Date.now())
@@ -4264,7 +4304,9 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
   }
 
   // 2. Live Black-Box / Grey-Box Pass (100% through RequestBroker)
-  for (const origin of normalizedOrigins) {
+  const hostsTotal = normalizedOrigins.length
+  for (let originIndex = 0; originIndex < normalizedOrigins.length; originIndex += 1) {
+    const origin = normalizedOrigins[originIndex]!
     if (signal.aborted) {
       stoppedReason = 'aborted'
       break
@@ -4273,6 +4315,17 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       stoppedReason = 'scope_revoked'
       continue
     }
+
+    emitPhase0Stage(
+      'host_fingerprint',
+      `Fingerprinting ${origin} (${originIndex + 1}/${hostsTotal}).`,
+      {
+        origin,
+        hostsDone: originIndex,
+        hostsTotal,
+        force: originIndex === 0 || originIndex === hostsTotal - 1,
+      },
+    )
 
     let originUsed = 0
     const probedPaths = new Set<string>()
@@ -4906,6 +4959,13 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     // 2b. Fetch same-origin JS chunks. The queue is drained breadth-first (imports, manifests,
     // webpack/Vite chunk maps) within a scaled 96-bundle budget; seed probes reserved jsReserve.
     const maxJsChunks = Math.min(MAX_JS_CHUNKS_FETCH, Math.max(0, perOriginCap - originUsed))
+    if (!originHalted && !signal.aborted && jsQueue.length > 0 && maxJsChunks > 0) {
+      emitPhase0Stage(
+        'crawl_state_graph',
+        `Harvesting client bundles & routes on ${origin} (${originIndex + 1}/${hostsTotal}).`,
+        { origin, hostsDone: originIndex, hostsTotal },
+      )
+    }
     let jsFetched = 0
     for (let jsIndex = 0; jsIndex < jsQueue.length && jsFetched < maxJsChunks; jsIndex += 1) {
       const jsPath = jsQueue[jsIndex]
@@ -5147,6 +5207,11 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     // non-empty tag set.
     const remainingForTemplates = perOriginCap - originUsed
     if (!originHalted && !signal.aborted && remainingForTemplates >= 4 && grant.canRead(origin)) {
+      emitPhase0Stage(
+        'api_templates',
+        `Probing API templates & methods on ${origin} (${originIndex + 1}/${hostsTotal}).`,
+        { origin, hostsDone: originIndex, hostsTotal },
+      )
       const templateBudget = Math.min(20, remainingForTemplates)
       const templateApiPaths = new Set<string>()
       const considerApiPath = (rawPath: string): void => {
@@ -5681,6 +5746,11 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     // 2e. Optional browser SPA crawl when caller supplies ScopedBrowser and budget remains
     const remainingForCrawl = perOriginCap - originUsed
     if (params.browser && !originHalted && !signal.aborted && remainingForCrawl >= 2 && grant.canRead(origin)) {
+      emitPhase0Stage(
+        'crawl_state_graph',
+        `Crawling SPA state graph on ${origin} (${originIndex + 1}/${hostsTotal}).`,
+        { origin, hostsDone: originIndex, hostsTotal },
+      )
       let browserExchanges = 0
       const crawlRes = await crawlStateGraph({
         storage,
@@ -5901,6 +5971,11 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
 
     // 2g. Persona-union visibility: persist `visibleToPersonas` on discovered endpoints and surface
     // admin/privileged routes immediately instead of waiting for a later probe pass.
+    emitPhase0Stage(
+      'auth_privileged',
+      `Analyzing auth & privileged surface on ${origin} (${originIndex + 1}/${hostsTotal}).`,
+      { origin, hostsDone: originIndex + 1, hostsTotal },
+    )
     // One paged snapshot instead of a full-store read per visibility key.
     const endpointsByRouteKey = new Map<string, EndpointRow>()
     for (const ep of readPaged('persona_visibility')) {
@@ -5968,6 +6043,13 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
   }
 
   // Per-endpoint param-discovery metrics: one event, deterministic ordering, no raw bodies.
+  if (requestsUsed > 0 || endpointsDiscovered > 0) {
+    emitPhase0Stage(
+      'param_discovery',
+      `Finalizing parameter discovery across ${hostsTotal} host(s).`,
+      { hostsDone: hostsTotal, hostsTotal, force: true },
+    )
+  }
   const paramDiscovery = summarizeParamDiscovery(storage, runId)
   if (paramDiscovery.endpoints.length > 0) {
     const provenance = paramDiscovery.totals.byProvenance
@@ -6093,6 +6175,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     perOriginCap,
     endpointsDiscovered,
     paramsDiscovered,
+    frameworksDetected: [...frameworksDetected],
     routeMapEndpoints,
     jsRouterRoutes,
     navigationRequests,

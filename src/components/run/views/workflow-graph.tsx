@@ -5,13 +5,13 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { CSSProperties, PointerEvent as RPointerEvent } from 'react'
 import { useRun } from '../data.tsx'
-import { clamp, fmtDate, fmtN, fmtRel, firstSentence, host, plural } from '../format.ts'
+import { clamp, deriveRound0PipelineState, fmtDate, fmtN, fmtRel, firstSentence, host, isRound0ThreatModelWorker, plural } from '../format.ts'
 import { LiveDot, SevGlyph, StatusGlyph } from '../glyphs.tsx'
 import { Icon } from '../icons.tsx'
 import { useShortcuts } from '../keyboard.tsx'
 import { PHASE_LABEL, stLabel } from '../meta.ts'
 import { worstSeverity } from '../model.ts'
-import type { FindingRow, RunModel } from '../model.ts'
+import type { FindingRow, RunEvent, RunModel } from '../model.ts'
 import { DUR, EASE_CSS, ease, reducedMotion, T } from '../motion.tsx'
 import { useTheme } from '../theme.ts'
 import { cn, runIconBtn } from '../tw.ts'
@@ -45,6 +45,13 @@ interface NodeInfo {
   reqs: number
   hosts: number
   hist?: string
+  round0?: {
+    stageShort: string
+    mappedHosts: number
+    totalHosts: number
+    reqs: number
+    live: boolean
+  }
 }
 
 const titleOf = (n: WfNode) => n.kind === 'worker' ? n.a!.title : n.kind === 'stack' ? n.g!.title : n.kind === 'queue' ? 'Queued chain steps' : 'Report'
@@ -54,18 +61,35 @@ function aggStatus(list: readonly { status: string }[]) {
   return has('paused') || has('waiting_approval') ? 'paused' : has('running') ? 'running' : has('failed') ? 'failed' : 'complete'
 }
 
-function nodeInfo(m: RunModel, L: WfLayout): Map<string, NodeInfo> {
+function nodeInfo(m: RunModel, L: WfLayout, events: readonly RunEvent[]): Map<string, NodeInfo> {
   const out = new Map<string, NodeInfo>()
   for (const n of L.nodes) {
     if (n.kind === 'worker') {
       const a = n.a!
       const step = a.stepId ? m.stepById.get(a.stepId) : m.stepByWorker.get(a.id)
+      const round0State = isRound0ThreatModelWorker(a)
+        ? deriveRound0PipelineState({ assignment: a, detail: m.detail, events })
+        : null
       out.set(n.id, {
         facts: (m.factsByWorker.get(a.id) ?? []).filter(f => !f.tainted).length,
         findings: m.workerFindings.get(a.id) ?? [],
         idLabel: step ? '#' + step.seq + ' · P' + step.priority : PHASE_LABEL[a.phase] ?? a.phase,
-        host: host(a.sourceOrigins[0] ?? ''),
-        status: a.status, reqs: a.requestsUsed, hosts: 1, hist: L.history.get(a.id),
+        host: round0State && round0State.counts.totalHosts > 1
+          ? plural(round0State.counts.totalHosts, 'host')
+          : host(a.sourceOrigins[0] ?? ''),
+        status: a.status,
+        reqs: round0State ? round0State.counts.requests : a.requestsUsed,
+        hosts: round0State ? round0State.counts.totalHosts : 1,
+        hist: L.history.get(a.id),
+        ...(round0State ? {
+          round0: {
+            stageShort: round0State.stageShort,
+            mappedHosts: round0State.counts.mappedHosts,
+            totalHosts: round0State.counts.totalHosts,
+            reqs: round0State.counts.requests,
+            live: isLive(a),
+          },
+        } : {}),
       })
     } else if (n.kind === 'stack') {
       const ms = n.members!
@@ -251,10 +275,24 @@ const NodeCard = memo(function NodeCard({ n, info, flags, reportSub }: { n: WfNo
       {a.title}
     </div>
     <div className={cn(NODE_BOT, 'text-fg-subtle')}>
-      <span>{a.turnsUsed}/{a.maxTurns} turns</span>
-      <span>{fmtN(a.requestsUsed)} req</span>
+      {i.round0 ? <>
+        <span
+          data-wf-round0-stage=""
+          className={cn(
+            NODE_BADGE,
+            i.round0.live && 'bg-accent-soft text-accent shadow-[inset_0_0_0_1px_var(--accent-line)]',
+          )}
+        >
+          {i.round0.stageShort}
+        </span>
+        {i.round0.totalHosts > 0 && <span>{i.round0.mappedHosts}/{i.round0.totalHosts} hosts</span>}
+        <span>{fmtN(i.round0.reqs)} req</span>
+      </> : <>
+        <span>{a.turnsUsed}/{a.maxTurns} turns</span>
+        <span>{fmtN(a.requestsUsed)} req</span>
+      </>}
       <span className="flex-1" />
-      {i.facts > 0 && <span className={NODE_BADGE}>{plural(i.facts, 'fact')}</span>}
+      {!i.round0 && i.facts > 0 && <span className={NODE_BADGE}>{plural(i.facts, 'fact')}</span>}
       {badge}
     </div>
     {lodBadge}
@@ -298,7 +336,7 @@ export function WorkflowGraph({ L, selId, focusSet, nomatch, onSelect, onExpand,
   const selRef = useRef(selId)
   selRef.current = selId
 
-  const info = useMemo(() => nodeInfo(model, L), [model, L])
+  const info = useMemo(() => nodeInfo(model, L, events), [model, L, events])
 
   // ---- focus: hover is transient, selection persists; digests pass an explicit set
   const focusId = hover ?? selId

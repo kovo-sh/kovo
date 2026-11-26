@@ -5,8 +5,21 @@ import type { ReactNode } from 'react'
 import { readGraphDigest, readWorkerSessionAction } from '../../../actions.ts'
 import type { WorkerSessionData } from '../../../server/worker-session-reader.ts'
 import { useRun, useRunModel } from '../data.tsx'
-import { EmptyState, LinkRow, Props, Section, Tag } from '../display.tsx'
-import { fmtAgo, fmtDate, fmtFullDateTime, fmtN, fmtRel, fmtTimeS, host, plural } from '../format.ts'
+import { Disclosure, EmptyState, HostLabel, LinkRow, Props, Section, Tag } from '../display.tsx'
+import {
+  deriveRound0PipelineState,
+  fmtAgo,
+  fmtDate,
+  fmtFullDateTime,
+  fmtN,
+  fmtRel,
+  fmtTimeS,
+  host,
+  isRound0ThreatModelWorker,
+  plural,
+  sharedApex,
+} from '../format.ts'
+import type { Round0HostSignal, Round0PipelineState, Round0PipelineStep, Round0StageKey, Round0StepStatus } from '../format.ts'
 import { SevGlyph, StatusGlyph } from '../glyphs.tsx'
 import { Icon } from '../icons.tsx'
 import { normFStatus, PHASE_LABEL, prettyCat, stLabel } from '../meta.ts'
@@ -245,18 +258,266 @@ function CancelFooter({ step, label }: { step: ChainStep; label?: ReactNode }) {
   </PaneFooter>
 }
 
+// ---------------------------------------------------------------- Round-0 recon pipeline summary
+
+export { deriveRound0PipelineState, isRound0ThreatModelWorker }
+export type { Round0HostSignal, Round0PipelineState, Round0PipelineStep, Round0StageKey, Round0StepStatus }
+
+const ROUND0_HOST_PREVIEW = 6
+
+function Round0StepIcon({ step }: { step: Round0PipelineStep }) {
+  if (step.status === 'done') {
+    return (
+      <span
+        className="inline-flex size-4 flex-none items-center justify-center rounded-full bg-ok-soft text-ok"
+        aria-label="Done"
+      >
+        <Icon name="check" size={10} />
+      </span>
+    )
+  }
+  if (step.status === 'active') {
+    return (
+      <span
+        className="inline-flex size-4 flex-none items-center justify-center"
+        aria-label="In progress"
+      >
+        <span className="size-3.5 rounded-full border-[1.5px] border-accent/30 border-t-accent animate-spin motion-reduce:animate-none" />
+      </span>
+    )
+  }
+  return (
+    <span
+      className="inline-flex size-4 flex-none items-center justify-center rounded-full border border-line-2 text-[9.5px] font-medium text-fg-faint tabular-nums"
+      aria-label="Pending"
+    >
+      {step.index}
+    </span>
+  )
+}
+
+function Round0PipelineSummary({
+  state,
+  exchanges,
+  requestsUsed,
+}: {
+  state: Round0PipelineState
+  exchanges: readonly { id: string }[]
+  requestsUsed: number
+}) {
+  const [showAllHosts, setShowAllHosts] = useState(false)
+  const [networkOpen, setNetworkOpen] = useState(false)
+  const apex = useMemo(() => sharedApex(state.hosts.map(h => h.host)), [state.hosts])
+  const visibleHosts = showAllHosts ? state.hosts : state.hosts.slice(0, ROUND0_HOST_PREVIEW)
+  const hiddenHostCount = Math.max(0, state.hosts.length - ROUND0_HOST_PREVIEW)
+  const totalRequests = Math.max(requestsUsed, state.counts.requests, exchanges.length)
+
+  return <>
+    <Section
+      title="Recon pipeline"
+      right={<span className="tabular-nums">{state.doneSteps}/5 complete</span>}
+    >
+      <ol
+        className="m-0 mb-2 flex list-none flex-col gap-1 p-0"
+        data-testid="round0-stage-stepper"
+      >
+        {state.steps.map(step => {
+          const active = step.status === 'active'
+          return (
+            <li
+              key={step.id}
+              data-testid={`round0-stage-${step.id}`}
+              data-stage-status={step.status}
+              className={cn(
+                'flex items-center gap-2 rounded-[7px] px-2 py-1.5 text-[12px] leading-[17px]',
+                active
+                  ? 'bg-accent-soft/60 text-fg shadow-[inset_0_0_0_1px_var(--accent-line)]'
+                  : 'bg-transparent text-fg-muted',
+              )}
+            >
+              <Round0StepIcon step={step} />
+              <span
+                className={cn(
+                  'min-w-0 flex-1 truncate',
+                  active ? 'font-medium text-fg' : step.status === 'done' ? 'text-fg-muted' : 'text-fg-subtle',
+                )}
+              >
+                {step.index}. {step.label}
+              </span>
+              {step.metric && (
+                <span
+                  className={cn(
+                    'flex-none font-mono text-[10.5px] tabular-nums whitespace-nowrap',
+                    active ? 'text-accent font-medium' : 'text-fg-subtle',
+                  )}
+                >
+                  {step.metric}
+                </span>
+              )}
+            </li>
+          )
+        })}
+      </ol>
+      {state.activeDetail && (
+        <p className="mb-2! truncate font-mono text-[11px]! text-fg-subtle!" title={state.activeDetail}>
+          {state.activeDetail}
+        </p>
+      )}
+    </Section>
+
+    <Section title="Discovered so far">
+      <div
+        className="mb-2 grid grid-cols-2 gap-1.5 sm:grid-cols-3"
+        data-testid="round0-discovery-counters"
+      >
+        {[
+          { label: 'Endpoints', value: fmtN(state.counts.endpoints) },
+          {
+            label: 'Active hosts',
+            value: state.counts.totalHosts > 0
+              ? `${fmtN(state.counts.mappedHosts)} / ${fmtN(state.counts.totalHosts)}`
+              : fmtN(state.counts.mappedHosts),
+          },
+          { label: 'Auth-gated', value: fmtN(state.counts.authGated), hint: '401/403' },
+          { label: 'Privileged', value: fmtN(state.counts.privileged) },
+          { label: 'Requests', value: fmtN(totalRequests) },
+          { label: 'Parameters', value: fmtN(state.counts.params) },
+        ].map(stat => (
+          <div
+            key={stat.label}
+            className="min-w-0 rounded-[7px] bg-sunk px-2.5 py-1.5 shadow-[inset_0_0_0_1px_var(--line)]"
+          >
+            <div className="truncate text-[11px] leading-4 text-fg-subtle" data-round0-stat-label="">
+              {stat.label}
+            </div>
+            <div className="mt-0.5 flex items-baseline gap-1.5 truncate text-[13.5px] font-semibold leading-[18px] text-fg tabular-nums">
+              <span className="truncate">{stat.value}</span>
+              {stat.hint && <span className="flex-none font-mono text-[10px] font-normal text-fg-faint">{stat.hint}</span>}
+            </div>
+          </div>
+        ))}
+      </div>
+      {state.frameworks.length > 0 && (
+        <div className="mb-2 flex flex-wrap items-center gap-1" data-testid="round0-frameworks">
+          <span className="mr-0.5 text-[11px] text-fg-subtle">Frameworks</span>
+          {state.frameworks.map(fw => <Tag key={fw} tone="solid" mono>{fw}</Tag>)}
+        </div>
+      )}
+    </Section>
+
+    <Section
+      title="Top hosts by signal"
+      right={<span className="tabular-nums">{fmtN(state.hosts.length)}</span>}
+    >
+      {state.hosts.length === 0 ? (
+        <p className={WF_NONE}>Waiting for host probes…</p>
+      ) : (
+        <div className="mb-2" data-testid="round0-top-hosts">
+          <div className="divide-y divide-line overflow-hidden rounded-[7px] border border-line bg-panel">
+            {visibleHosts.map(h => (
+              <div
+                key={h.origin}
+                data-testid="round0-host-row"
+                className="flex min-h-[30px] items-center gap-2 px-2.5 py-1 text-[11.5px]"
+              >
+                <span className="min-w-0 flex-1 font-mono text-[11.5px]">
+                  <HostLabel host={h.host} apex={apex} max={24} />
+                </span>
+                <span className="flex-none font-mono text-[11px] text-fg-muted tabular-nums">
+                  {fmtN(h.endpoints)} ep
+                </span>
+                <span className="flex-none font-mono text-[11px] text-fg-subtle tabular-nums">
+                  {fmtN(h.requests)} req
+                </span>
+                {(h.status401 > 0 || h.status403 > 0 || h.status5xx > 0 || h.privileged > 0) && (
+                  <span className="flex flex-none items-center gap-1">
+                    {h.status401 > 0 && (
+                      <span className="rounded bg-sunk px-1 py-px font-mono text-[10px] text-fg-muted shadow-[inset_0_0_0_1px_var(--line-2)] tabular-nums" title={`${h.status401} HTTP 401 responses`}>
+                        401·{h.status401}
+                      </span>
+                    )}
+                    {h.status403 > 0 && (
+                      <span className="rounded bg-warn-soft px-1 py-px font-mono text-[10px] text-warn shadow-[inset_0_0_0_1px_var(--warn-line)] tabular-nums" title={`${h.status403} HTTP 403 responses`}>
+                        403·{h.status403}
+                      </span>
+                    )}
+                    {h.status5xx > 0 && (
+                      <span className="rounded bg-danger-soft px-1 py-px font-mono text-[10px] text-danger tabular-nums" title={`${h.status5xx} HTTP 5xx responses`}>
+                        5xx·{h.status5xx}
+                      </span>
+                    )}
+                    {h.privileged > 0 && h.status401 === 0 && h.status403 === 0 && (
+                      <span className="rounded bg-accent-soft px-1 py-px font-mono text-[10px] text-accent tabular-nums" title={`${h.privileged} privileged routes`}>
+                        priv·{h.privileged}
+                      </span>
+                    )}
+                  </span>
+                )}
+              </div>
+            ))}
+          </div>
+          {hiddenHostCount > 0 && (
+            <button
+              type="button"
+              data-testid="round0-hosts-toggle"
+              className="mt-1.5 flex h-auto w-full cursor-pointer items-center justify-center gap-1 whitespace-normal rounded-[6px] border-0 bg-sunk px-2.5 py-1.5 text-[11.5px] font-medium text-fg-muted shadow-none transition-colors duration-[var(--d1)] hover:bg-hover hover:text-fg"
+              onClick={() => setShowAllHosts(v => !v)}
+              aria-expanded={showAllHosts}
+            >
+              {showAllHosts ? `Show top ${ROUND0_HOST_PREVIEW} hosts` : `Show all ${fmtN(state.hosts.length)} hosts`}
+              <Icon name={showAllHosts ? 'chevU' : 'chevD'} size={11} />
+            </button>
+          )}
+        </div>
+      )}
+    </Section>
+
+    <div className="mt-1 border-t border-line" data-testid="round0-network-drawer">
+      <button
+        type="button"
+        data-testid="round0-network-log-toggle"
+        className="flex h-auto min-h-[34px] w-full cursor-pointer items-center gap-1.5 whitespace-normal rounded-none border-0 bg-transparent px-0 py-1.5 text-left text-[12px] font-medium text-fg-muted shadow-none transition-colors duration-[var(--d1)] hover:bg-transparent hover:text-fg"
+        onClick={() => setNetworkOpen(o => !o)}
+        aria-expanded={networkOpen}
+      >
+        <Icon
+          name="chev"
+          className={cn('text-fg-subtle transition-transform duration-[var(--d2)] ease-kovo', !networkOpen && '-rotate-90')}
+        />
+        <span>Network log ({plural(totalRequests, 'request')})</span>
+        {exchanges.length > 0 && exchanges.length < totalRequests && (
+          <span className="ml-auto text-[11px] font-normal text-fg-subtle tabular-nums">
+            {fmtN(exchanges.length)} loaded
+          </span>
+        )}
+      </button>
+      {networkOpen && (
+        <div className="pb-2 pt-0.5" data-testid="round0-network-log-panel">
+          {exchanges.length > 0
+            ? <ExchangeRows list={exchanges} />
+            : <p className={WF_NONE}>No HTTP requests recorded in the loaded window yet.</p>}
+        </div>
+      )}
+    </div>
+  </>
+}
+
 // ---------------------------------------------------------------- worker
 
 type ITab = 'summary' | 'transcript' | 'evidence'
 
 export function WorkerInspector({ sel }: InspectorProps) {
-  const { detail } = useRun()
+  const { detail, events } = useRun()
   const model = useRunModel()
   const L = useWorkflowLayout()
   const expanded = useExpanded(detail.run.id)
   const [tab, setTab] = useViewState<ITab>('wf.itab', 'summary')
   const a = model.workerById.get(sel.id)
   const session = useWorkerSession(detail.run.id, a)
+  const round0 = useMemo(
+    () => (a && isRound0ThreatModelWorker(a) ? deriveRound0PipelineState({ assignment: a, detail, events }) : null),
+    [a, detail, events],
+  )
   if (!a) {
     return <><PaneHeader title="Worker" sub={<span title={`Worker ${sel.id}`}>Not found</span>} />
       <PaneBody><EmptyState icon="workers" title="Worker not found">It is not part of this run’s current data.</EmptyState></PaneBody></>
@@ -276,6 +537,7 @@ export function WorkerInspector({ sel }: InspectorProps) {
   const hist = L.history.get(a.id)
   const nTurns = session.data ? session.data.turns.length : a.turnsUsed
   const nArts = session.data?.artifacts.length ?? 0
+  const reqCount = round0 ? round0.counts.requests : a.requestsUsed
   return <>
     <PaneHeader
       title="Worker"
@@ -293,9 +555,21 @@ export function WorkerInspector({ sel }: InspectorProps) {
       </div>
       <h2 className={WF_H2}>{a.title}</h2>
       <Props rows={[
-        ['Turns', <><Meter id="wf.turns" value={pct} warn={isLive(a) && pct > 0.8} />{a.turnsUsed} of {a.maxTurns}</>],
-        ['Requests', <>{fmtN(a.requestsUsed)}{exs.length > 0 && <span className="text-fg-subtle">· {exs.length} in the loaded window</span>}</>],
-        ...(a.sourceOrigins.length ? [['Origins', <span className={WF_ORIGINS} title={a.sourceOrigins.join('\n')}>{a.sourceOrigins.slice(0, 6).map(host).join(', ')}{a.sourceOrigins.length > 6 ? ' +' + (a.sourceOrigins.length - 6) : ''}</span>] as [ReactNode, ReactNode]] : []),
+        round0
+          ? ['Stage', <span className="inline-flex min-w-0 items-center gap-1.5">
+              <Tag tone={isLive(a) ? 'accent' : 'solid'} className="tabular-nums">{round0.stageBadge}</Tag>
+              {round0.counts.totalHosts > 0 && <span className="text-[11.5px] text-fg-subtle tabular-nums">{round0.counts.mappedHosts}/{round0.counts.totalHosts} hosts</span>}
+            </span>]
+          : ['Turns', <><Meter id="wf.turns" value={pct} warn={isLive(a) && pct > 0.8} />{a.turnsUsed} of {a.maxTurns}</>],
+        ['Requests', <>{fmtN(reqCount)}{exs.length > 0 && <span className="text-fg-subtle">· {exs.length} in the loaded window</span>}</>],
+        ...(a.sourceOrigins.length ? [[
+          'Origins',
+          round0 && a.sourceOrigins.length > 1
+            ? <span className="truncate font-mono text-[11.5px]" title={a.sourceOrigins.join('\n')}>
+                {host(a.sourceOrigins[0])} <span className="text-fg-subtle">+{a.sourceOrigins.length - 1} more</span>
+              </span>
+            : <span className={WF_ORIGINS} title={a.sourceOrigins.join('\n')}>{a.sourceOrigins.slice(0, 6).map(host).join(', ')}{a.sourceOrigins.length > 6 ? ' +' + (a.sourceOrigins.length - 6) : ''}</span>,
+        ] as [ReactNode, ReactNode]] : []),
         ['Started', <>{fmtDate(a.createdAt)} <span className="font-mono text-[12px] text-fg-subtle">{fmtRel(a.createdAt, model.base)}</span></>],
         ['Lineage', <>{lin.up.size} upstream · {[...lin.down].filter(x => x !== 'report').length} downstream</>],
       ]} />
@@ -340,6 +614,7 @@ export function WorkerInspector({ sel }: InspectorProps) {
       </div>
 
       {tab === 'summary' && <>
+        {round0 && <Round0PipelineSummary state={round0} exchanges={exs} requestsUsed={a.requestsUsed} />}
         {a.objective && <Section title="Objective"><p>{a.objective}</p></Section>}
         {step?.hypothesis && step.hypothesis !== a.objective && <Section title="Hypothesis"><p>{step.hypothesis}</p>
           {step.skills.length > 0 && <div className="mb-2.5 flex flex-wrap gap-[5px]">{step.skills.map(s => <Tag key={s} mono>{s}</Tag>)}</div>}</Section>}
@@ -348,14 +623,25 @@ export function WorkerInspector({ sel }: InspectorProps) {
         {downs.length > 0 && <Section title="Downstream" right={downs.length}>{downs.slice(0, 8).map(w => <LineageRow key={w} L={L} id={rid} other={w} />)}</Section>}
         {fs.length > 0 && <Section title="Findings" right={fs.length}><FindingRows list={fs} /></Section>}
         {msgs.length > 0 && <Section title="Worker report">{msgs.map(m => <pre key={m.id} className={cn(RW.pre, 'break-words font-sans text-[12.5px] leading-[19px]')}>{m.content}</pre>)}</Section>}
-        {!a.objective && !a.outcome && !ups.length && !downs.length && !fs.length && !msgs.length && <p className={WF_NONE}>Nothing recorded yet.</p>}
+        {!round0 && !a.objective && !a.outcome && !ups.length && !downs.length && !fs.length && !msgs.length && <p className={WF_NONE}>Nothing recorded yet.</p>}
       </>}
       {tab === 'transcript' && <Transcript a={a} s={session} />}
       {tab === 'evidence' && <>
         {facts.length > 0 && <Section title="Facts" right={facts.length}><div className={WF_CTX}>{facts.map(f => <FactItem key={f.id} f={f} />)}</div></Section>}
         <Artifacts s={session} />
-        {exs.length > 0 && <Section title="Exchanges" right={exs.length < a.requestsUsed ? exs.length + ' of ' + fmtN(a.requestsUsed) : exs.length}>
-          <ExchangeRows list={exs} /></Section>}
+        {exs.length > 0 && (
+          round0 && exs.length > 20
+            ? <Disclosure
+                title="Exchanges"
+                right={exs.length < reqCount ? `${fmtN(exs.length)} of ${fmtN(reqCount)}` : fmtN(exs.length)}
+                defaultOpen={false}
+              >
+                <ExchangeRows list={exs} />
+              </Disclosure>
+            : <Section title="Exchanges" right={exs.length < reqCount ? exs.length + ' of ' + fmtN(reqCount) : exs.length}>
+                <ExchangeRows list={exs} />
+              </Section>
+        )}
         {!facts.length && !exs.length && !nArts && <p className={WF_NONE}>{session.loading ? 'Loading…' : 'No facts, artifacts or exchanges recorded by this worker.'}</p>}
       </>}
     </div></PaneBody>

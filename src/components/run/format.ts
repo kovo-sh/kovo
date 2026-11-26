@@ -115,6 +115,19 @@ const EVENT_KIND_LABELS: Record<string, string> = {
   'goal.revised': 'Goal updated',
   'discovery.consented': 'Discovery started',
   'discovery.complete': 'Discovery finished',
+  'phase0.stage': 'Recon stage',
+  'phase0.discovery': 'Recon discovery summary',
+  'phase0.completed': 'Recon completed',
+  'phase0.crawl_paged': 'State-graph crawl read',
+  'phase0.read_paged': 'Surface store read',
+  'phase0.privileged_surface': 'Privileged routes surfaced',
+  'phase0.code_slices': 'Code slices attached',
+  'phase0.program_graph': 'Program graph extracted',
+  'phase0.param_discovery': 'Parameters discovered',
+  'phase0.runtime_catalog': 'Runtime catalog built',
+  'phase0.probe_plan': 'AST probe plan',
+  'phase0.declared_surface': 'Declared API ingested',
+  'phase0.truncation': 'Discovery cap reached',
   'threat_model.saved': 'Threat model saved',
   'threat_model.failed': 'Threat model failed',
   'review.planned': 'Review planned',
@@ -233,4 +246,488 @@ export function prettyBody(body: unknown, mediaType = ''): string {
     try { return JSON.stringify(JSON.parse(t), null, 2) } catch { return body }
   }
   return body
+}
+
+// ---------------------------------------------------------------- Round-0 Recon Pipeline derivation (browser-safe)
+
+export type Round0StageKey = 'fingerprint' | 'crawl' | 'templates' | 'auth' | 'ranking'
+export type Round0StepStatus = 'done' | 'active' | 'pending'
+
+export interface Round0PipelineStep {
+  id: Round0StageKey
+  index: number
+  label: string
+  shortLabel: string
+  status: Round0StepStatus
+  metric: string | null
+}
+
+export interface Round0HostSignal {
+  origin: string
+  host: string
+  endpoints: number
+  requests: number
+  status401: number
+  status403: number
+  status5xx: number
+  privileged: number
+  score: number
+}
+
+export interface Round0PipelineState {
+  steps: Round0PipelineStep[]
+  activeStepIndex: number
+  doneSteps: number
+  isComplete: boolean
+  stageBadge: string
+  stageShort: string
+  currentOrigin: string | null
+  activeDetail: string | null
+  counts: {
+    endpoints: number
+    params: number
+    mappedHosts: number
+    totalHosts: number
+    authGated: number
+    privileged: number
+    requests: number
+    rankedHosts: number
+    seededSteps: number
+  }
+  frameworks: string[]
+  hosts: Round0HostSignal[]
+}
+
+export interface Round0DerivationInput {
+  assignment: {
+    id: string
+    phase: string
+    status: string
+    stepId?: string | null
+    title?: string | null
+    turnsUsed?: number | null
+    requestsUsed?: number | null
+    sourceOrigins?: readonly string[]
+  }
+  detail: {
+    run: {
+      phase: string
+      status: string
+      phase0CompletedAt?: number | null
+      candidates?: readonly { id: string; origin: string }[]
+      approved?: readonly string[]
+    }
+    endpoints?: readonly {
+      origin: string
+      method: string
+      pathTemplate: string
+      source?: string | null
+      framework?: string | null
+      authRequirement?: string | null
+    }[]
+    endpointParams?: readonly { id?: string }[]
+    exchangesSummary?: readonly {
+      id: string
+      assignmentId?: string | null
+      origin: string
+      method: string
+      pathAndQuery: string
+      status: number
+    }[]
+    threatModel?: {
+      entries?: readonly { origin: string; riskTier?: string }[]
+    } | null
+    chainSteps?: readonly { id: string }[]
+    projection?: {
+      totals?: {
+        endpoints?: number
+        endpointParams?: number
+        exchanges?: number
+      }
+    } | null
+  }
+  events?: readonly {
+    kind: string
+    message?: string
+    detail?: Record<string, unknown> | null
+    createdAt?: number
+  }[]
+}
+
+const ROUND0_PRIV_RE = /(?:^|\/)(?:admin|internal|staff|superuser|console|manage|rbac|audit|moderator|ops)(?:\/|$)/i
+const ROUND0_API_RE = /^\/(?:api|rest|graphql|trpc|v\d+)(?:\/|$)/i
+const ROUND0_STEP_DEFS: readonly { id: Round0StageKey; label: string; shortLabel: string }[] = [
+  { id: 'fingerprint', label: 'Reachability & host fingerprint', shortLabel: 'Fingerprint' },
+  { id: 'crawl', label: 'Crawl & state graph', shortLabel: 'Crawl' },
+  { id: 'templates', label: 'API template & method probing', shortLabel: 'API probes' },
+  { id: 'auth', label: 'Auth & privileged surface detection', shortLabel: 'Auth surface' },
+  { id: 'ranking', label: 'Surface ranking & Round-1 worker plan', shortLabel: 'Ranking' },
+]
+
+/** Detect the orchestrator Round-0 Threat Model & Surface Ranking worker cleanly. */
+export function isRound0ThreatModelWorker(a: {
+  phase: string
+  stepId?: string | null
+  title?: string | null
+}): boolean {
+  if (a.phase !== 'threat_model' || a.stepId) return false
+  return /Round-0|Threat Model/i.test(a.title ?? '')
+}
+
+function asNonNegInt(v: unknown): number {
+  return typeof v === 'number' && Number.isFinite(v) && v >= 0 ? Math.floor(v) : 0
+}
+
+/**
+ * Pure browser-safe derivation of the Round-0 5-step recon stepper, discovery counters,
+ * frameworks, and per-host signal table. Works seamlessly for both live runs emitting
+ * `phase0.stage` telemetry AND historical/in-flight runs without `phase0.stage`.
+ */
+export function deriveRound0PipelineState(input: Round0DerivationInput): Round0PipelineState {
+  const { assignment: a, detail, events = [] } = input
+  const endpointsList = detail.endpoints ?? []
+  const endpointParamsList = detail.endpointParams ?? []
+  const allExchanges = detail.exchangesSummary ?? []
+  const workerExchanges = allExchanges.filter(e => e.assignmentId === a.id)
+  const threatEntries = detail.threatModel?.entries ?? []
+  const chainStepsList = detail.chainSteps ?? []
+
+  // Scan phase0.* and threat_model.saved events
+  let latestStage: string | null = null
+  let latestStageLabel: string | null = null
+  let currentOrigin: string | null = null
+  let stageHostsDone = 0
+  let stageHostsTotal = 0
+  let stageEndpoints = 0
+  let stageParams = 0
+  let stageRequests = 0
+  let discoveryEndpoints = 0
+  let discoveryParams = 0
+  let discoveryRequests = 0
+  let hasPhase0Discovery = false
+  let hasPhase0Completed = false
+  let hasCrawlPaged = false
+  let hasTemplateRead = false
+  let hasPrivilegedEvent = false
+  let hasParamDiscoveryEvent = false
+  let hasThreatModelSaved = false
+  const frameworksSet = new Set<string>()
+  const eventMappedOrigins = new Set<string>()
+  const privilegedKeys = new Set<string>()
+  const privilegedByOrigin = new Map<string, Set<string>>()
+
+  const noteFramework = (fw: unknown) => {
+    if (typeof fw !== 'string') return
+    const clean = fw.trim()
+    if (clean) frameworksSet.add(clean)
+  }
+
+  for (const ev of events) {
+    const d = (ev.detail && typeof ev.detail === 'object' ? ev.detail : {}) as Record<string, unknown>
+    if (ev.kind === 'phase0.stage') {
+      if (typeof d.stage === 'string' && d.stage) latestStage = d.stage
+      if (typeof d.label === 'string' && d.label) latestStageLabel = d.label
+      else if (ev.message) latestStageLabel = ev.message
+      if (typeof d.origin === 'string' && d.origin) {
+        currentOrigin = d.origin
+        eventMappedOrigins.add(d.origin)
+      }
+      stageHostsDone = Math.max(stageHostsDone, asNonNegInt(d.hostsDone))
+      stageHostsTotal = Math.max(stageHostsTotal, asNonNegInt(d.hostsTotal))
+      stageEndpoints = Math.max(stageEndpoints, asNonNegInt(d.endpointsDiscovered))
+      stageParams = Math.max(stageParams, asNonNegInt(d.paramsDiscovered))
+      stageRequests = Math.max(stageRequests, asNonNegInt(d.requestsUsed))
+      if (Array.isArray(d.frameworks)) d.frameworks.forEach(noteFramework)
+    } else if (ev.kind === 'phase0.discovery') {
+      hasPhase0Discovery = true
+      discoveryEndpoints = Math.max(discoveryEndpoints, asNonNegInt(d.endpointsDiscovered))
+      discoveryParams = Math.max(discoveryParams, asNonNegInt(d.paramsDiscovered))
+      discoveryRequests = Math.max(discoveryRequests, asNonNegInt(d.requestsUsed))
+      if (Array.isArray(d.frameworksDetected)) d.frameworksDetected.forEach(noteFramework)
+    } else if (ev.kind === 'phase0.completed') {
+      hasPhase0Completed = true
+    } else if (ev.kind === 'phase0.crawl_paged') {
+      hasCrawlPaged = true
+      if (typeof d.origin === 'string' && d.origin) eventMappedOrigins.add(d.origin)
+    } else if (ev.kind === 'phase0.read_paged') {
+      if (typeof d.origin === 'string' && d.origin) eventMappedOrigins.add(d.origin)
+      if (d.phase === 'template_api_paths' || d.phase === 'detail_methods') hasTemplateRead = true
+    } else if (ev.kind === 'phase0.privileged_surface') {
+      hasPrivilegedEvent = true
+      const originVal = typeof d.origin === 'string' ? d.origin : ''
+      if (Array.isArray(d.routes)) {
+        for (const r of d.routes) {
+          if (!r || typeof r !== 'object') continue
+          const rec = r as Record<string, unknown>
+          const m = typeof rec.method === 'string' ? rec.method.toUpperCase() : 'GET'
+          const p = typeof rec.pathTemplate === 'string' ? rec.pathTemplate : ''
+          if (!p) continue
+          const key = `${originVal}|${m} ${p}`
+          privilegedKeys.add(key)
+          if (originVal) {
+            let set = privilegedByOrigin.get(originVal)
+            if (!set) { set = new Set(); privilegedByOrigin.set(originVal, set) }
+            set.add(`${m} ${p}`)
+          }
+        }
+      }
+    } else if (ev.kind === 'phase0.param_discovery') {
+      hasParamDiscoveryEvent = true
+    } else if (ev.kind === 'threat_model.saved') {
+      hasThreatModelSaved = true
+    }
+  }
+
+  // Per-host signal aggregation
+  type HostAcc = {
+    origin: string
+    endpoints: number
+    requests: number
+    status401: number
+    status403: number
+    status5xx: number
+    privSet: Set<string>
+  }
+  const hostMap = new Map<string, HostAcc>()
+  const ensureHost = (origin: string): HostAcc => {
+    let acc = hostMap.get(origin)
+    if (!acc) {
+      acc = { origin, endpoints: 0, requests: 0, status401: 0, status403: 0, status5xx: 0, privSet: new Set() }
+      hostMap.set(origin, acc)
+    }
+    return acc
+  }
+
+  for (const origin of a.sourceOrigins ?? []) if (origin) ensureHost(origin)
+  for (const entry of threatEntries) if (entry.origin) ensureHost(entry.origin)
+  for (const origin of eventMappedOrigins) if (origin) ensureHost(origin)
+
+  let apiEndpoints = 0
+  for (const ep of endpointsList) {
+    if (!ep.origin) continue
+    const acc = ensureHost(ep.origin)
+    acc.endpoints += 1
+    noteFramework(ep.framework)
+    const method = (ep.method || 'GET').toUpperCase()
+    const path = ep.pathTemplate || '/'
+    if (ROUND0_API_RE.test(path) || ep.source === 'openapi' || ep.source === 'graphql' || ep.source === 'surface_probe') {
+      apiEndpoints += 1
+    }
+    const authReq = (ep.authRequirement ?? '').toLowerCase()
+    if (ROUND0_PRIV_RE.test(path) || authReq.includes('admin') || authReq.includes('persona:')) {
+      const k = `${method} ${path}`
+      acc.privSet.add(k)
+      privilegedKeys.add(`${ep.origin}|${k}`)
+    }
+  }
+
+  for (const [origin, set] of privilegedByOrigin) {
+    const acc = ensureHost(origin)
+    for (const k of set) acc.privSet.add(k)
+  }
+
+  let authGated = 0
+  for (const ex of workerExchanges) {
+    if (!ex.origin) continue
+    const acc = ensureHost(ex.origin)
+    acc.requests += 1
+    if (ex.status === 401) { acc.status401 += 1; authGated += 1 }
+    else if (ex.status === 403) { acc.status403 += 1; authGated += 1 }
+    else if (ex.status >= 500 && ex.status < 600) acc.status5xx += 1
+  }
+
+  const hosts: Round0HostSignal[] = [...hostMap.values()]
+    .map(acc => {
+      const privileged = acc.privSet.size
+      const score = acc.endpoints * 3 + privileged * 4 + (acc.status401 + acc.status403) * 2 + acc.status5xx * 2 + acc.requests
+      return {
+        origin: acc.origin,
+        host: host(acc.origin),
+        endpoints: acc.endpoints,
+        requests: acc.requests,
+        status401: acc.status401,
+        status403: acc.status403,
+        status5xx: acc.status5xx,
+        privileged,
+        score,
+      }
+    })
+    .sort((x, y) => y.score - x.score || y.endpoints - x.endpoints || y.requests - x.requests || x.host.localeCompare(y.host))
+
+  const approvedCount = detail.run.approved?.length ?? 0
+  const candidateCount = detail.run.candidates?.length ?? 0
+  const totalHosts = Math.max(
+    a.sourceOrigins?.length ?? 0,
+    stageHostsTotal,
+    approvedCount || candidateCount,
+    hosts.length,
+  )
+
+  const endpoints = Math.max(
+    asNonNegInt(detail.projection?.totals?.endpoints),
+    endpointsList.length,
+    stageEndpoints,
+    discoveryEndpoints,
+  )
+  const params = Math.max(
+    asNonNegInt(detail.projection?.totals?.endpointParams),
+    endpointParamsList.length,
+    stageParams,
+    discoveryParams,
+  )
+  const requests = Math.max(
+    asNonNegInt(a.requestsUsed),
+    workerExchanges.length,
+    stageRequests,
+    discoveryRequests,
+  )
+  const privileged = privilegedKeys.size
+  const rankedHosts = threatEntries.length
+  const seededSteps = chainStepsList.length
+
+  const observedMappedOrigins = new Set<string>(eventMappedOrigins)
+  for (const h of hosts) {
+    if (h.endpoints > 0 || h.requests > 0) observedMappedOrigins.add(h.origin)
+  }
+  let mappedHosts = Math.max(observedMappedOrigins.size, stageHostsDone)
+  if (totalHosts > 0) mappedHosts = Math.min(totalHosts, mappedHosts)
+
+  const workerDone = a.status === 'complete'
+  const workerStopped = a.status === 'failed' || a.status === 'canceled' || a.status === 'stopped'
+  const hasThreatModel = Boolean(detail.threatModel) || hasThreatModelSaved
+  const isComplete = workerDone || (hasThreatModel && a.status !== 'running')
+  const phase0Done = Boolean(detail.run.phase0CompletedAt) || hasPhase0Discovery || hasPhase0Completed || hasThreatModel
+
+  if (isComplete && totalHosts > 0 && mappedHosts === 0 && rankedHosts > 0) {
+    mappedHosts = Math.min(totalHosts, rankedHosts)
+  }
+
+  let activeStepIndex = 0
+  if (isComplete) {
+    activeStepIndex = 4
+  } else if (phase0Done) {
+    activeStepIndex = 4
+  } else if (latestStage) {
+    switch (latestStage) {
+      case 'static_ast':
+        activeStepIndex = 0
+        break
+      case 'host_fingerprint':
+        activeStepIndex = totalHosts > 1 && (mappedHosts > 0 || endpoints > 0 || hasCrawlPaged) ? 1 : 0
+        break
+      case 'crawl_state_graph':
+        activeStepIndex = 1
+        break
+      case 'api_templates':
+        activeStepIndex = 2
+        break
+      case 'auth_privileged':
+      case 'param_discovery':
+        activeStepIndex = 3
+        break
+      default:
+        activeStepIndex = endpoints > 0 || hasCrawlPaged ? 1 : 0
+        break
+    }
+  } else {
+    // Fallback for historical / already-running runs without phase0.stage telemetry
+    if (hasPrivilegedEvent || hasParamDiscoveryEvent) activeStepIndex = 3
+    else if (hasTemplateRead) activeStepIndex = 2
+    else if (hasCrawlPaged || endpoints > 0 || mappedHosts >= 2 || requests >= 5) activeStepIndex = 1
+    else activeStepIndex = 0
+  }
+
+  const frameworks = [...frameworksSet].sort((x, y) => x.localeCompare(y))
+
+  const stepMetric = (id: Round0StageKey, status: Round0StepStatus): string | null => {
+    switch (id) {
+      case 'fingerprint': {
+        if (frameworks.length > 0) {
+          return frameworks.slice(0, 2).join(', ') + (frameworks.length > 2 ? ` +${frameworks.length - 2}` : '')
+        }
+        if (totalHosts > 0) return status === 'done' ? `${totalHosts} ${totalHosts === 1 ? 'host' : 'hosts'}` : `${mappedHosts}/${totalHosts} hosts`
+        return requests > 0 ? `${fmtN(requests)} req` : null
+      }
+      case 'crawl': {
+        const parts: string[] = []
+        if (totalHosts > 0 && (mappedHosts > 0 || status !== 'pending')) parts.push(`${mappedHosts}/${totalHosts} hosts`)
+        if (endpoints > 0 || status !== 'pending') parts.push(`${fmtN(endpoints)} ${endpoints === 1 ? 'endpoint' : 'endpoints'}`)
+        return parts.length ? parts.join(' · ') : null
+      }
+      case 'templates': {
+        if (params > 0) return `${fmtN(params)} ${params === 1 ? 'param' : 'params'}`
+        if (apiEndpoints > 0) return `${fmtN(apiEndpoints)} API ${apiEndpoints === 1 ? 'route' : 'routes'}`
+        return status === 'done' ? 'Checked' : null
+      }
+      case 'auth': {
+        if (privileged > 0 && authGated > 0) return `${fmtN(privileged)} priv · ${fmtN(authGated)} 401/403`
+        if (privileged > 0) return `${fmtN(privileged)} privileged`
+        if (authGated > 0) return `${fmtN(authGated)} 401/403`
+        return status === 'done' ? '0 gated' : null
+      }
+      case 'ranking': {
+        const parts: string[] = []
+        if (rankedHosts > 0) parts.push(`${fmtN(rankedHosts)} ranked`)
+        if (seededSteps > 0) parts.push(`${fmtN(seededSteps)} ${seededSteps === 1 ? 'step' : 'steps'}`)
+        return parts.length ? parts.join(' · ') : null
+      }
+    }
+  }
+
+  const steps: Round0PipelineStep[] = ROUND0_STEP_DEFS.map((def, i) => {
+    const status: Round0StepStatus = isComplete
+      ? 'done'
+      : workerStopped
+        ? (i < activeStepIndex ? 'done' : 'pending')
+        : i < activeStepIndex
+          ? 'done'
+          : i === activeStepIndex
+            ? 'active'
+            : 'pending'
+    return {
+      id: def.id,
+      index: i + 1,
+      label: def.label,
+      shortLabel: def.shortLabel,
+      status,
+      metric: stepMetric(def.id, status),
+    }
+  })
+
+  const doneSteps = steps.filter(s => s.status === 'done').length
+  const activeStep = steps[activeStepIndex] ?? steps[0]!
+  const stageBadge = isComplete
+    ? '5/5 · Ranked'
+    : workerStopped
+      ? `Stopped · ${activeStepIndex + 1}/5`
+      : `Stage ${activeStepIndex + 1}/5 · ${activeStep.shortLabel}`
+  const stageShort = isComplete
+    ? '5/5 Ranked'
+    : workerStopped
+      ? `${activeStepIndex + 1}/5 Stopped`
+      : `${activeStepIndex + 1}/5 ${activeStep.shortLabel}`
+
+  return {
+    steps,
+    activeStepIndex,
+    doneSteps,
+    isComplete,
+    stageBadge,
+    stageShort,
+    currentOrigin,
+    activeDetail: !isComplete && !workerStopped ? latestStageLabel : null,
+    counts: {
+      endpoints,
+      params,
+      mappedHosts,
+      totalHosts,
+      authGated,
+      privileged,
+      requests,
+      rankedHosts,
+      seededSteps,
+    },
+    frameworks,
+    hosts,
+  }
 }
