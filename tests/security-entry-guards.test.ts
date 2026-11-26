@@ -16,7 +16,7 @@
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { once } from 'node:events'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer, request as httpRequest } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -491,8 +491,8 @@ describe('R3-08 entry guard: provider-stream-sanitizer', () => {
     const outText = await readStreamText(sanitizedStream)
     assert.ok(frameSpyCount >= 1, 'sanitizeProviderStream must process SSE frames')
     assert.equal(outText.includes(personaSecret), false, 'Inbound sanitizeProviderStream must scrub persona secret from delta text')
-    assert.match(outText, /event: response\.output_text\.delta/, 'SSE control line must remain intact')
-    assert.match(outText, /\[persona:alice\]/, 'Persona redaction placeholder must appear in sanitized frame')
+    assert.equal(outText.includes('event: response.output_text.delta'), true, 'SSE control line must remain intact')
+    assert.equal(outText.includes('[persona:alice]'), true, 'Persona redaction placeholder must appear in sanitized frame')
   })
 })
 
@@ -620,14 +620,12 @@ describe('R3-08 entry guard: host-minted-oracle-stamps', () => {
 // ============================================================================
 describe('R3-08 static gate: check-security-optional.ts & test-factory isolation', () => {
   test('live repository passes check-security-optional with 0 forbidden test seams, 0 fail-open early returns, and 0 src->tests imports', () => {
-    const authSrc = readFileSync(join(REPO_ROOT, 'src/server/browser-session-auth.ts'), 'utf8')
-    assert.equal(authSrc.includes('allowUnscopedRefreshForTest'), false, 'allowUnscopedRefreshForTest MUST be completely removed from src/server/browser-session-auth.ts')
-
     const importScan = scanSourceForTestHelperImports(REPO_ROOT)
     assert.deepEqual(importScan.hits, [], 'No file under src/** may import tests/helpers/browser-session-test-factory.ts or any tests/** module')
 
     const audit = scanSecurityOptional(REPO_ROOT)
     assert.equal(audit.ok, true, `check-security-optional failed:\n${audit.regressions.join('\n')}`)
+    assert.equal(audit.hits.some(h => h.name === 'allowUnscopedRefreshForTest'), false, 'allowUnscopedRefreshForTest MUST be absent from src/server/**')
     assert.equal(audit.zeroToleranceHits.length, 0)
     assert.equal(audit.newBaselinedViolations.length, 0)
     assert.ok(audit.entryGuardCoverage.every(c => c.covered), 'Every registered security guard must be covered by tests/security-entry-*.test.ts')

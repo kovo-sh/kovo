@@ -49,6 +49,7 @@ run "run-scoped state ratchet" node scripts/check-run-scoped-state.ts
 run "clone & safety-primitive dedup ratchet" node scripts/check-clones.ts
 run "function growth & file size baseline ratchet" node scripts/check-function-growth.ts --baseline
 run "test-shape source-text regex ratchet" node scripts/check-test-shape.ts
+run "security-optional & test-seam boundary ratchet" node scripts/check-security-optional.ts
 CONTRACT_BASE="${KOVO_CONTRACT_BASE:-}"
 if [[ -n "$CONTRACT_BASE" ]]; then
   run "contract-change trailer lint" node scripts/check-contract-change.ts --base "$CONTRACT_BASE"
