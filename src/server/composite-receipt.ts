@@ -91,7 +91,7 @@ export type HostSignableRecord = HostTranscriptEntry | HostOobEvent | HostBrowse
 export interface CompositeOracleEvaluator { evaluate: (factLog: HostFactLog, pointerRef: { kind: 'v8_family'; family: V8OracleFamily; rawInput?: Record<string, unknown>; econCtx?: EconomicAutoHydrateContext } | { kind: 'single_hop'; receipt: ProofReceipt | unknown }, policyContext?: { signingKey?: string; strictHostDerivation?: boolean }) => { confirmed: boolean; reason: string; singleHop?: ReceiptVerification } }
 export interface CompositeVerifyOptions {
   attackerPersonas?: readonly string[]; forbiddenShortcutPersonas?: readonly string[]; benchmarkMode?: boolean; requireCleanSessionFlag?: boolean; signingKey?: string
-  v8OracleInput?: Record<string, unknown>; strictHostDerivation?: boolean; factLog?: HostFactLog; oracleEvaluator?: CompositeOracleEvaluator
+  v8OracleInput?: Record<string, unknown>; strictHostDerivation?: boolean; factLog?: HostFactLog; oracleEvaluator?: CompositeOracleEvaluator; personaRoleLabels?: Readonly<Record<string, string>>
   verifyTerminalImpact?: (receipt: CompositeProofReceipt, transcript: HostSignedTranscript) => { confirmed: boolean; reason: string; family?: string; evidence?: Record<string, unknown> }
 }
 export interface VerifiedEdgeResult { edgeIndex: number; kind: CausalEdgeKind; fromHopId: string; toHopId: string; verified: boolean; reason: string; evidence?: Record<string, unknown> }
@@ -164,6 +164,7 @@ function collectEntryDigests(entry: HostTranscriptEntry, side: 'response' | 'req
     for (const d of entry.injectedRequestDigests ?? []) digests.add(d.toLowerCase())
     collectLeaves(entry.step.requestJson, leaves); collectHeaderTokens(entry.step.requestHeaders, leaves)
     const pq = entry.step.pathAndQuery ?? '', q = pq.indexOf('?')
+    if (pq) { leaves.add(pq); if (entry.origin) leaves.add(`${entry.origin.trim().replace(/\/+$/, '')}${pq}`) }
     for (const seg of (q >= 0 ? pq.slice(0, q) : pq).split('/')) if (seg) { leaves.add(seg); try { const d = decodeURIComponent(seg); if (d !== seg) leaves.add(d) } catch {} }
     if (q >= 0) for (const v of new URLSearchParams(pq.slice(q + 1)).values()) if (v) leaves.add(v)
   }
@@ -562,16 +563,14 @@ function dispatchDefaultV8Oracle(
   const rejectFam = (reason: string, missingEvidence: string[], rejectedBy = `v8_oracle_${family}`) => ({ ok: false as const, reason, rejectedBy, missingEvidence })
   if (ti.oracleFamily && !ti.oracleInput) return rejectFam(`v8_oracle_failed (${family}): missing_v8_oracle_input — terminalImpact.oracleFamily requires terminalImpact.oracleInput.`, ['terminalImpact.oracleInput'])
   if (family === 'dual_tenant_abac' && receipt.hops.length < 2) return rejectFam('v8_oracle_failed (dual_tenant_abac): multi_hop_causal_chain_required', ['upstream_causal_hop_or_oracle_input'])
-  if (family === 'dual_tenant_abac' && !terminalCtrl) return rejectFam('v8_oracle_failed (dual_tenant_abac): missing_denied_control_on_terminal_route', ['clean_denied_control_401_403_404'])
-  const mapFail = (reason: string) => (reason === 'terminal_impact_unproven_intermediate_stub' || reason === 'bled_access_own_tenant_only')
-    ? rejectFam(TERMINAL_IMPACT_UNPROVEN_HINT, [TERMINAL_IMPACT_UNPROVEN_HINT], 'terminal_impact_unproven')
-    : rejectFam(`v8_oracle_failed (${family}): ${reason}`, [reason])
-  const econCtx = { preChainControlExchangeIds: ti.preChainControlExchangeIds, termHopExchangeIds: dag.hopsById.get(ti.terminalHopId)!.exchangeIds, postChainReadbackExchangeIds: ti.postChainReadbackExchangeIds, citedExchangeIds: receipt.hops.flatMap(h => h.exchangeIds) }
-  const explicitInput = ti.oracleInput ?? options.v8OracleInput
-  if (explicitInput) {
-    const res = evalOracle.evaluate(factLog, { kind: 'v8_family', family, rawInput: explicitInput, econCtx }, policy)
-    return res.confirmed ? { ok: true, family, explicit: true } : mapFail(res.reason)
+  if (family === 'dual_tenant_abac' && !terminalCtrl) {
+    const received = ti.preChainControlExchangeIds.slice(0, 3).map(id => { const c = idx.entriesById.get(id); return c ? `${c.step.method} ${normRouteFam(c.step.route ?? c.step.pathAndQuery, c.entityId) || '/'} (${c.step.status ?? 'null'})` : `${id}(missing)` }).join(', ') || 'none'
+    return rejectFam(`v8_oracle_failed (dual_tenant_abac): missing_denied_control_on_terminal_route (expected=${termEx?.step.method ?? 'ANY'} ${ctx.termFam || ctx.termEndpoint || 'unknown'}, received=[${received}])`, ['clean_denied_control_401_403_404'])
   }
+  const mapFail = (reason: string) => (reason === 'terminal_impact_unproven_intermediate_stub' || reason === 'bled_access_own_tenant_only') ? rejectFam(TERMINAL_IMPACT_UNPROVEN_HINT, [TERMINAL_IMPACT_UNPROVEN_HINT], 'terminal_impact_unproven') : rejectFam(`v8_oracle_failed (${family}): ${reason}`, [reason])
+  const econCtx = { preChainControlExchangeIds: ti.preChainControlExchangeIds, termHopExchangeIds: dag.hopsById.get(ti.terminalHopId)!.exchangeIds, postChainReadbackExchangeIds: ti.postChainReadbackExchangeIds, citedExchangeIds: receipt.hops.flatMap(h => h.exchangeIds), ...(options.personaRoleLabels ? { personaRoleLabels: options.personaRoleLabels } : {}) }
+  const explicitInput = ti.oracleInput ?? options.v8OracleInput, freeFormDualFallback = family === 'dual_tenant_abac' && !ti.oracleFamily && !options.v8OracleInput && Boolean(explicitInput && typeof explicitInput.mode !== 'string')
+  if (explicitInput && !freeFormDualFallback) { const res = evalOracle.evaluate(factLog, { kind: 'v8_family', family, rawInput: explicitInput, econCtx }, policy); return res.confirmed ? { ok: true, family, explicit: true } : mapFail(res.reason) }
   if (family === 'cross_surface_pivot') {
     if (receipt.hops.length < 2) return rejectFam('v8_oracle_failed (cross_surface_pivot): invalid_hop_count — requires >= 2 hops across distinct surfaces.', ['cross_surface_pivot_requires_2_plus_hops'])
     const rootHop = dag.hopsById.get(dag.roots[0]!)!, rootEx = rootHop.exchangeIds.map(id => idx.entriesById.get(id)!).find(e => isExecArm(e, rootHop.hopId === ti.terminalHopId)) ?? idx.entriesById.get(rootHop.exchangeIds[0]!)
@@ -694,8 +693,11 @@ function verifyTerminalImpactGate(
 export function verifyCompositeReceipt(rawReceipt: unknown, hostTranscript: HostSignedTranscript, options: CompositeVerifyOptions = {}): CompositeReceiptVerification {
   const parsed = compositeProofReceiptSchema.safeParse(rawReceipt)
   if (!parsed.success) {
-    const issue = parsed.error.issues[0]
-    return { confirmed: false, chainId: 'invalid', terminalVulnClass: 'invalid', replayMode: 'fresh_clean_replay', modeBVerified: false, hopCount: 0, verifiedEdges: [], failedStage: 'schema', reason: `Schema validation failed: ${issue?.path.join('.') || 'receipt'} ${issue?.message ?? ''}`.slice(0, 400) }
+    const issues = parsed.error.issues.slice(0, 2).map(i => `${i.path.join('.') || 'receipt'} ${i.message}`).join('; ')
+    const rawHops = rawReceipt && typeof rawReceipt === 'object' && !Array.isArray(rawReceipt) && Array.isArray((rawReceipt as Record<string, unknown>).hops) ? (rawReceipt as { hops: unknown[] }).hops : []
+    const lastT = (rawHops[rawHops.length - 1] as { target?: { pathAndQuery?: unknown } } | undefined)?.target?.pathAndQuery
+    const rawTerm = typeof lastT === 'string' ? normRouteFam(lastT) : ''
+    return { confirmed: false, chainId: 'invalid', terminalVulnClass: 'invalid', replayMode: 'fresh_clean_replay', modeBVerified: false, hopCount: 0, verifiedEdges: [], failedStage: 'schema', reason: `Schema validation failed: ${issues}${rawTerm ? ` (terminalRoute=${rawTerm})` : ''}`.slice(0, 400) }
   }
   const factLog = options.factLog ?? HostFactLog.fromTranscript(hostTranscript), { receipt, inferredEdges } = augmentCompositeReceiptWithAutoDag(parsed.data, factLog)
   const fail = (failedStage: CompositeFailureStage, reason: string, verifiedEdges: VerifiedEdgeResult[] = [], terminalVerification?: ReceiptVerification, rejectedBy?: string, missingEvidence?: string[]): CompositeReceiptVerification => ({

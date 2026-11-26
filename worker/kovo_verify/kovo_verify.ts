@@ -19,36 +19,13 @@ export interface SentinelsClaim { kind: 'dom_sentinel'; exchangeId: string; sent
 export interface OobClaim { kind: 'oob'; exchangeId: string; expectHit?: boolean; message?: string }
 export interface TimingClaim { kind: 'timing'; controlIds: string[]; variantIds: string[]; minPairs?: number; maxPValue?: number; message?: string }
 export interface StructuralDiffClaim { kind: 'structural_diff'; controlIds: string[]; variantIds: string[]; minRounds?: number; minDeltaTokens?: number; maxSimilarity?: number; message?: string }
-export interface RaceClaim {
-  kind: 'race'; exchangeIds: string[]; burstExchangeIds?: string[]; baselineExchangeId?: string; postExchangeId?: string
-  serialExchangeIds?: string[]; serialPreExchangeId?: string; serialPostExchangeId?: string
-  balanceField?: string; capField?: string; unitDebit?: number; vulnClass?: string; requestBody?: unknown
-  mode?: 'h2-single-packet' | 'http1-fallback'; minDistinctOutcomes?: number; expectAllSuccess?: boolean; message?: string
-}
-export interface ImpactClaim {
-  kind: 'impact'; impactClass: 'authorization' | 'bfla' | 'mass_assignment' | 'csrf' | 'injection'; vulnClass?: string
-  probeExchangeId: string; controlExchangeIds?: string[]; beforeExchangeId?: string; afterExchangeId?: string
-  requiredRole?: string; resourceTenant?: string; expectControlDenied?: boolean; oracleEvents?: string[]; proofPatterns?: string[]
-  actorRoles?: Record<string, string>; actorTenants?: Record<string, string>; requestBody?: unknown
-  ambient?: { kind: 'cookie' | 'bearer' | 'header' | 'unknown'; sameSite?: string }; message?: string
-}
-export interface BoundaryClaim {
-  kind: 'boundary'; boundaryClass: 'auth' | 'mfa' | 'access' | 'other'; vulnClass?: string; controlExchangeId: string; probeExchangeId: string
-  expectControlDenied?: boolean; controlRequestBody?: unknown; probeRequestBody?: unknown
-  actorRoles?: Record<string, string>; actorTenants?: Record<string, string>; message?: string
-}
-export interface CompositeReceiptClaim {
-  kind: 'composite_receipt'; verificationId?: string; chainId: string; terminalVulnClass: string; cwe?: string; route?: string
-  exchangeIds: string[]; terminalExchangeId?: string; replayMode?: 'fresh_clean_replay' | 'one_shot_transcript'; hopCount?: number
-  compositeReceipt?: Record<string, unknown>; rejectedBy?: string | null; missingEvidence?: string[]; reason?: string; message?: string
-}
+export interface RaceClaim { kind: 'race'; exchangeIds: string[]; burstExchangeIds?: string[]; baselineExchangeId?: string; postExchangeId?: string; serialExchangeIds?: string[]; serialPreExchangeId?: string; serialPostExchangeId?: string; balanceField?: string; capField?: string; unitDebit?: number; vulnClass?: string; requestBody?: unknown; mode?: 'h2-single-packet' | 'http1-fallback'; minDistinctOutcomes?: number; expectAllSuccess?: boolean; message?: string }
+export interface ImpactClaim { kind: 'impact'; impactClass: 'authorization' | 'bfla' | 'mass_assignment' | 'csrf' | 'injection'; vulnClass?: string; probeExchangeId: string; controlExchangeIds?: string[]; beforeExchangeId?: string; afterExchangeId?: string; requiredRole?: string; resourceTenant?: string; expectControlDenied?: boolean; oracleEvents?: string[]; proofPatterns?: string[]; actorRoles?: Record<string, string>; actorTenants?: Record<string, string>; requestBody?: unknown; ambient?: { kind: 'cookie' | 'bearer' | 'header' | 'unknown'; sameSite?: string }; message?: string }
+export interface BoundaryClaim { kind: 'boundary'; boundaryClass: 'auth' | 'mfa' | 'access' | 'other'; vulnClass?: string; controlExchangeId: string; probeExchangeId: string; expectControlDenied?: boolean; controlRequestBody?: unknown; probeRequestBody?: unknown; actorRoles?: Record<string, string>; actorTenants?: Record<string, string>; message?: string }
+export interface CompositeReceiptClaim { kind: 'composite_receipt'; verificationId?: string; chainId: string; terminalVulnClass: string; cwe?: string; route?: string; exchangeIds: string[]; terminalExchangeId?: string; replayMode?: 'fresh_clean_replay' | 'one_shot_transcript'; hopCount?: number; compositeReceipt?: Record<string, unknown>; rejectedBy?: string | null; missingEvidence?: string[]; reason?: string; message?: string }
 export interface HostEvaluatedExpressionClaim { kind: 'host_evaluated_expression'; vulnClass?: string; controlIds: string[]; probeIds: string[]; hostMintedChallengeIds: string[]; message?: string }
-export type VerifyClaim =
-  | StatusClaim | HeaderClaim | BodyClaim | JsonPathClaim | CssClaim | SentinelsClaim
-  | OobClaim | TimingClaim | StructuralDiffClaim | RaceClaim | ImpactClaim | BoundaryClaim | CompositeReceiptClaim | HostEvaluatedExpressionClaim
-export type ProofRole =
-  | 'setup' | 'control' | 'probe' | 'cleanup' | 'control_denied' | 'variant_crossed'
-  | 'before_get' | 'mutation' | 'after_get' | 'oob_mint' | 'oob_injection' | 'oob_wait' | 'pending_oob' | 'race'
+export type VerifyClaim = StatusClaim | HeaderClaim | BodyClaim | JsonPathClaim | CssClaim | SentinelsClaim | OobClaim | TimingClaim | StructuralDiffClaim | RaceClaim | ImpactClaim | BoundaryClaim | CompositeReceiptClaim | HostEvaluatedExpressionClaim
+export type ProofRole = 'setup' | 'control' | 'probe' | 'cleanup' | 'control_denied' | 'variant_crossed' | 'before_get' | 'mutation' | 'after_get' | 'oob_mint' | 'oob_injection' | 'oob_wait' | 'pending_oob' | 'race'
 export interface ProofTranscriptEntry { exchangeId: string; role: ProofRole; personaHandle: string | null; method: string | null; pathAndQuery: string | null; status: number | null; durationMs: number; note?: string }
 export interface ProofFeedback { rejectedBy: string | null; missingEvidence: string[]; transcriptSummary: ProofTranscriptEntry[] }
 export interface AccessBoundaryProof extends ProofFeedback { ok: boolean; confirmed?: boolean; claim: BoundaryClaim; control: HttpExchange; probe: HttpExchange; transcript: { control_denied: string; variant_crossed: string }; evidence: { controlStatus: number; variantStatus: number; controlDenied: boolean; crossed: boolean } }
@@ -73,29 +50,17 @@ export interface SignedUrlMintInput { control?: DifferentialArmInput | HttpTarge
 export interface ProofResult { sdk: 'kovo_verify.ts'; nonce: string; title: string; severity: string; description?: string; claims: VerifyClaim[] }
 export interface RpcContext { nonce: string; runId: string; targetOrigins: string[]; sdkVersion: string }
 interface RpcEnvelope { ok: boolean; result?: unknown; error?: string }
-export interface HttpExchange {
-  exchangeId: string; status: number; method: string; pathAndQuery: string; finalPathAndQuery?: string; redirectOrigins?: string[]
-  mediaType: string; headers: Record<string, string>; body: string; text: string; json: unknown; data: unknown; bodyPreview: string
-  bodyBytes: number; bodySha256: string; durationMs: number; personaHandle: string | null; consumedCapabilityId?: string | null; consumedCapabilities?: string[]; derivedFromCapabilityIds?: string[]; protocol?: 'h2'
-}
+export interface HttpExchange { exchangeId: string; status: number; method: string; pathAndQuery: string; finalPathAndQuery?: string; redirectOrigins?: string[]; mediaType: string; headers: Record<string, string>; body: string; text: string; json: unknown; data: unknown; bodyPreview: string; bodyBytes: number; bodySha256: string; durationMs: number; personaHandle: string | null; raceBatchId?: string; consumedCapabilityId?: string | null; consumedCapabilities?: string[]; derivedFromCapabilityIds?: string[]; protocol?: 'h2' }
+export interface RaceBurstHopResult { mode: 'h2-single-packet' | 'http1-fallback'; fallbackReason: string | null; raceBatchId: string; summary: Record<string, unknown>; results: HttpExchange[]; exchanges: HttpExchange[]; baseline?: HttpExchange; post?: HttpExchange }
 export interface CapabilityInjectionSpec { handle: string; target?: 'bearer' | 'header' | 'cookie' | 'url'; headerName?: string; cookieName?: string; queryParam?: string }
-export interface SealCapabilityInput {
-  exchangeId?: string | { exchangeId: string }; exchange?: string | { exchangeId: string } | null; hopReceiptId?: string; hopId?: string; slot: string
-  jsonPath?: string; header?: string; cookie?: string; setCookie?: string; locationQuery?: string; queryParam?: string; regex?: string; value?: string
-  kind?: 'bearer_token' | 'api_token' | 'cookie' | 'signed_url' | 'oidc_assertion' | 'signing_salt' | 'hmac_key' | 'jwt' | 'header_secret' | 'generic_secret'
-  ttlMs?: number | null; defaultHeaderName?: string; defaultCookieName?: string; allowedOrigins?: string[]
-}
+export interface SealCapabilityInput { exchangeId?: string | { exchangeId: string }; exchange?: string | { exchangeId: string } | null; hopReceiptId?: string; hopId?: string; slot: string; jsonPath?: string; header?: string; cookie?: string; setCookie?: string; locationQuery?: string; queryParam?: string; regex?: string; value?: string; kind?: 'bearer_token' | 'api_token' | 'cookie' | 'signed_url' | 'oidc_assertion' | 'signing_salt' | 'hmac_key' | 'jwt' | 'header_secret' | 'generic_secret'; ttlMs?: number | null; defaultHeaderName?: string; defaultCookieName?: string; allowedOrigins?: string[] }
 export interface SealedCapabilityResult { handle: string; meta: Record<string, unknown>; exchangeId: string; sealExchangeId: string; scrubbedPreview: string }
 export interface HmacSignInput { secretHandle: string; payload: string | Record<string, unknown> | unknown[]; alg?: 'sha256' | 'sha384' | 'sha512'; encoding?: 'hex' | 'base64' | 'base64url' }
 export interface HmacSignResult { exchangeId: string; signature: string; handle: string; derivedHandle: string; attestation: { derivedFromCapabilityId: string; alg: string; encoding: string; payloadDigest: string; signatureDigest: string; sourceSecretDigest: string; runId: string; timestampMs: number } }
 export interface JwtSignInput { secretHandle: string; claims: Record<string, unknown>; alg?: 'HS256' | 'HS384' | 'HS512'; header?: Record<string, unknown>; hopReceiptId?: string; slot?: string; ttlMs?: number | null; allowedOrigins?: string[] }
 export interface JwtSignResult { exchangeId: string; derivedHandle: string; handle: string; token: string; attestation: { derivedFromCapabilityId: string; derivedHandle: string; alg: string; claimsDigest: string; tokenDigest: string; sourceSecretDigest: string; runId: string; timestampMs: number } }
 export interface AsyncMatchPredicate { status?: number | number[]; bodyContains?: string; bodyMatches?: string; jsonPath?: string; equals?: unknown; in?: unknown[]; matches?: string; header?: { name: string; equals?: string; matches?: string } }
-export interface AsyncAwaitInput extends HttpOptions {
-  pollRequest?: HttpTarget | (HttpOptions & { path?: string; url?: string; origin?: string }); path?: string; url?: string; pathAndQuery?: string; endpoint?: string; route?: string; target?: HttpTarget; origin?: string
-  matchPredicate?: AsyncMatchPredicate; expectStatus?: number | number[]; profile?: 'fast_lab' | 'wan'; timeoutMs?: number; intervalMs?: number; maxAttempts?: number
-  triggerExchangeId?: string | { exchangeId: string }; tTriggerMs?: number; correlationId?: string; correlationIds?: string[]; entityId?: string
-}
+export interface AsyncAwaitInput extends HttpOptions { pollRequest?: HttpTarget | (HttpOptions & { path?: string; url?: string; origin?: string }); path?: string; url?: string; pathAndQuery?: string; endpoint?: string; route?: string; target?: HttpTarget; origin?: string; matchPredicate?: AsyncMatchPredicate; expectStatus?: number | number[]; profile?: 'fast_lab' | 'wan'; timeoutMs?: number; intervalMs?: number; maxAttempts?: number; triggerExchangeId?: string | { exchangeId: string }; tTriggerMs?: number; correlationId?: string; correlationIds?: string[]; entityId?: string }
 export interface AsyncAwaitResult { pollRecordId: string; converged: boolean; status: 'converged' | 'timeout' | 'aborted' | 'max_attempts' | 'monotonic_violation'; exchangeId: string | null; exchange: HttpExchange | null; evidence: Record<string, unknown> }
 export type HopSurface = 'http' | 'graphql' | 'ws' | 'sse' | 'browser' | 'webhook' | 'async_job' | 'idp' | 'cdn' | 'storage'
 export type ReplayMode = 'fresh_clean_replay' | 'one_shot_transcript'
@@ -116,43 +81,23 @@ export interface BrowserExchange { exchangeId: string; status: number; url: stri
 export interface OobHandle { exchangeId: string; token: string; url: string; dnsHost: string }
 export interface OobCheck extends OobHandle { hit: boolean; checkExchangeId?: string; hits: Array<{ protocol: string; token: string; remoteIp?: string; timestamp?: number }> }
 
-export interface HttpOptions {
-  as?: string; persona?: string; session?: string
-  /** HTTP session group role (`'setup' | 'control' | 'probe' | 'cleanup'`). Distinct from `ProofRole` and persona handles. */
-  role?: 'setup' | 'control' | 'probe' | 'cleanup'; arm?: 'setup' | 'control' | 'probe' | 'cleanup'
-  method?: string; headers?: Record<string, string>; body?: string | Record<string, unknown> | unknown[]
-  followRedirects?: boolean; timeoutMs?: number; capability?: string | CapabilityInjectionSpec
-  capabilityTarget?: 'bearer' | 'header' | 'cookie' | 'url'; capabilityHeaderName?: string; capabilityCookieName?: string
-  capabilityQueryParam?: string; authMutation?: Record<string, unknown>; entityId?: string; correlationIds?: string[]; evidenceRole?: string
-  replayAttempt?: 'mode_a' | 'ablation_control' | 'primary'
-}
+export interface HttpOptions { as?: string; persona?: string; session?: string; role?: 'setup' | 'control' | 'probe' | 'cleanup'; arm?: 'setup' | 'control' | 'probe' | 'cleanup'; method?: string; headers?: Record<string, string>; body?: string | Record<string, unknown> | unknown[]; followRedirects?: boolean; timeoutMs?: number; capability?: string | CapabilityInjectionSpec; capabilityTarget?: 'bearer' | 'header' | 'cookie' | 'url'; capabilityHeaderName?: string; capabilityCookieName?: string; capabilityQueryParam?: string; authMutation?: Record<string, unknown>; entityId?: string; correlationIds?: string[]; evidenceRole?: string; replayAttempt?: 'mode_a' | 'ablation_control' | 'primary' }
 export type HttpTarget = string | (HttpOptions & { url?: string; path?: string; pathAndQuery?: string; endpoint?: string; route?: string; target?: HttpTarget; origin?: string })
 export interface Expectations {
-  status(exchange: { exchangeId: string }, expected: number | number[], message?: string): StatusClaim
-  statusNot(exchange: { exchangeId: string }, unexpected: number, message?: string): StatusClaim
+  status(exchange: { exchangeId: string }, expected: number | number[], message?: string): StatusClaim; statusNot(exchange: { exchangeId: string }, unexpected: number, message?: string): StatusClaim
   header(exchange: { exchangeId: string }, name: string, expected?: string | { equals?: string; matches?: string; absent?: boolean }, message?: string): HeaderClaim
-  bodyContains(exchange: { exchangeId: string }, text: string, message?: string): BodyClaim
-  bodyAbsent(exchange: { exchangeId: string }, text: string, message?: string): BodyClaim
+  bodyContains(exchange: { exchangeId: string }, text: string, message?: string): BodyClaim; bodyAbsent(exchange: { exchangeId: string }, text: string, message?: string): BodyClaim
   jsonPath(exchange: { exchangeId: string }, path: string, expected?: unknown, message?: string): JsonPathClaim
   css(exchange: { exchangeId: string }, selector: string, expected?: { exists?: boolean; count?: number; textEquals?: string; textContains?: string }, message?: string): CssClaim
-  domSentinel(exchange: { exchangeId: string }, sentinel: string, mode?: 'source' | 'executed', message?: string): SentinelsClaim
-  oob(exchange: { exchangeId: string }, expectHit?: boolean, message?: string): OobClaim
+  domSentinel(exchange: { exchangeId: string }, sentinel: string, mode?: 'source' | 'executed', message?: string): SentinelsClaim; oob(exchange: { exchangeId: string }, expectHit?: boolean, message?: string): OobClaim
 }
-
 export type ExchangeRef = string | { exchangeId: string }
 export interface ChainBuilderOptions { chainId: string; terminalVulnClass: string; replayMode?: ReplayMode; benchmarkMode?: boolean }
 export interface ChainHopOptions { surface?: HopSurface; target?: HopTargetInput; method?: string; claimedDelta?: string; entityId?: string; canaryToken?: string; exchangeIds?: string[]; oobEventIds?: string[]; browserTraceIds?: string[]; producedCapabilities?: string[]; consumedCapabilities?: string[]; proofReceipt?: ProofReceiptInput }
+export interface ChainRaceBurstOptions extends ChainHopOptions { requests?: Array<RaceRequestInput | HttpTarget>; request?: RaceRequestInput | HttpTarget; count?: number; barrier?: 'auto' | 'h2' | 'http1'; session?: string; readRoute?: HttpTarget; readMethod?: string; readPersona?: string; baseline?: ExchangeRef; readback?: ExchangeRef; correlationIds?: string[] }
 export interface StateTransitionEdgeInput { fromHopId: string; toHopId: string; entityId: string; ablationExchange?: ExchangeRef | ExchangeRef[]; ablationExchangeIds?: string[]; mutationKind?: string }
 export interface ChainProveOptions { terminalHopId?: string; claimedImpact?: string; summary?: string; terminalExchange?: ExchangeRef; terminalExchangeId?: string; control?: ExchangeRef | ExchangeRef[]; preChainControlExchangeIds?: string[]; readback?: ExchangeRef | ExchangeRef[]; postChainReadbackExchangeIds?: string[]; modeAFailureExchange?: ExchangeRef; modeAFailureExchangeId?: string; oracleFamily?: OracleFamily; oracleInput?: Record<string, unknown>; proofReceipt?: ProofReceiptInput; replayMode?: ReplayMode; benchmarkMode?: boolean }
-
-interface HopRecorder {
-  hopId: string; target?: HopTargetObject; exchangeIds: string[]; oobEventIds: string[]; browserTraceIds: string[]
-  producedCapabilities: string[]; consumedCapabilities: string[]; entityId?: string; correlationIds: string[]
-  capConsumeExchange: Map<string, string>
-  cryptoConsumptions: Array<{ sourceCapabilityId: string; derivedCapabilityId?: string; alg?: string }>
-  asyncPolls: Array<{ pollRecordId: string; correlationId?: string; triggerExchangeId?: string }>
-  onProduce(cap: string, exchangeId?: string): void; onExchange(exchangeId: string): void; onCorrelation(correlationId: string): void
-}
+interface HopRecorder { hopId: string; target?: HopTargetObject; exchangeIds: string[]; oobEventIds: string[]; browserTraceIds: string[]; producedCapabilities: string[]; consumedCapabilities: string[]; entityId?: string; correlationIds: string[]; capConsumeExchange: Map<string, string>; cryptoConsumptions: Array<{ sourceCapabilityId: string; derivedCapabilityId?: string; alg?: string }>; asyncPolls: Array<{ pollRecordId: string; correlationId?: string; triggerExchangeId?: string }>; onProduce(cap: string, exchangeId?: string): void; onExchange(exchangeId: string): void; onCorrelation(correlationId: string): void }
 interface RpcTransport { socketPath: string; token: string; nonce: string }
 
 function readContext(): RpcContext {
@@ -336,7 +281,7 @@ export class ChainBuilder {
   private readonly exchangeToHop = new Map<string, string>()
   private readonly correlationToHop = new Map<string, string>()
   private readonly explicitEdges: CausalEdgeInput[] = []
-  private readonly controlIds: string[] = []; private readonly readbackIds: string[] = []
+  private readonly controlIds: string[] = []; private readonly readbackIds: string[] = []; private readonly raceActionIds: string[] = []
 
   constructor(ctx: VerifyContext, opts: ChainBuilderOptions) {
     if (!opts.chainId?.trim()) throw new Error('ChainBuilder requires a non-empty chainId.')
@@ -418,6 +363,32 @@ export class ChainBuilder {
     return out
   }
 
+  async raceBurst(hopId: string, opts: ChainRaceBurstOptions): Promise<RaceBurstHopResult> {
+    const trimmedId = hopId.trim(); if (!trimmedId) throw new Error('chain.raceBurst requires a non-empty hopId.')
+    const rawReqs = Array.isArray(opts.requests) && opts.requests.length > 0
+      ? opts.requests
+      : opts.request !== undefined ? Array.from({ length: Math.max(2, Math.min(10, Math.floor(opts.count ?? 4))) }, () => opts.request!) : []
+    if (rawReqs.length < 2 || rawReqs.length > 10) throw new Error('chain.raceBurst requires between 2 and 10 requests (or { request, count }).')
+    if (opts.baseline) this.control(opts.baseline)
+    let baseline: HttpExchange | undefined
+    if (!opts.baseline && opts.readRoute) {
+      baseline = await this.ctx.http_send(opts.readRoute, { method: opts.readMethod ?? 'GET', ...(opts.readPersona ? { as: opts.readPersona } : {}), role: 'control', ...(opts.session ? { session: `${opts.session}-base` } : {}) })
+      this.control(baseline)
+    }
+    const { requests: _rq, request: _r, count: _c, barrier, session, readRoute, readMethod, readPersona, baseline: _b, readback: _rb, correlationIds, ...hopMeta } = opts
+    const burst = await this.hop(trimmedId, { ...hopMeta, claimedDelta: hopMeta.claimedDelta ?? `Concurrent race burst (${rawReqs.length} requests) on ${trimmedId}.` }, () =>
+      this.ctx.race_burst(rawReqs, { ...(barrier ? { barrier } : {}), ...(session ? { session } : {}), ...(opts.entityId ? { entityId: opts.entityId } : {}), ...(correlationIds?.length ? { correlationIds } : {}) }),
+    )
+    for (const ex of burst.results) pushUnique(this.raceActionIds, ex.exchangeId)
+    if (opts.readback) this.readback(opts.readback)
+    let post: HttpExchange | undefined
+    if (!opts.readback && readRoute) {
+      post = await this.ctx.http_send(readRoute, { method: readMethod ?? 'GET', ...(readPersona ? { as: readPersona } : {}), role: 'control', ...(session ? { session: `${session}-post` } : {}) })
+      this.readback(post)
+    }
+    return { ...burst, ...(baseline ? { baseline } : {}), ...(post ? { post } : {}) }
+  }
+
   build(opts: ChainProveOptions = {}): CompositeProofReceiptInput {
     if (this.hops.length === 0) throw new Error(`ChainBuilder "${this.chainId}" has no recorded hops.`)
     const edges: CausalEdgeInput[] = [], seenEdges = new Set<string>()
@@ -462,6 +433,13 @@ export class ChainBuilder {
     for (const id of [...this.readbackIds, ...extractExchangeIds(opts.readback), ...(opts.postChainReadbackExchangeIds ?? [])]) pushUnique(postReadback, id)
     const terminalExchangeId = opts.terminalExchangeId ?? extractExchangeIds(opts.terminalExchange)[0]
     const modeAFailureExchangeId = opts.modeAFailureExchangeId ?? extractExchangeIds(opts.modeAFailureExchange)[0]
+    let oracleInput = opts.oracleInput ? { ...opts.oracleInput } : undefined
+    const isEcon = opts.oracleFamily === 'economic_conservation' || this.terminalVulnClass.trim().toLowerCase() === 'economic_conservation'
+    if (isEcon && oracleInput) {
+      if (oracleInput.baselineReadback === undefined && oracleInput.baselineReadbackExchangeId === undefined && oracleInput.baselineExchangeId === undefined && preControl[0]) oracleInput.baselineReadbackExchangeId = preControl[0]
+      if (oracleInput.finalReadback === undefined && oracleInput.finalReadbackExchangeId === undefined && oracleInput.finalExchangeId === undefined && postReadback[0]) oracleInput.finalReadbackExchangeId = postReadback[0]
+      if (oracleInput.actions === undefined && oracleInput.actionExchangeIds === undefined && oracleInput.actionsExchangeIds === undefined && this.raceActionIds.length > 0) oracleInput.actionExchangeIds = [...this.raceActionIds]
+    }
     return {
       chainId: this.chainId, terminalVulnClass: this.terminalVulnClass, replayMode: opts.replayMode ?? this.replayMode,
       ...(opts.benchmarkMode ?? this.benchmarkMode !== undefined ? { benchmarkMode: opts.benchmarkMode ?? this.benchmarkMode } : {}),
@@ -470,7 +448,7 @@ export class ChainBuilder {
         terminalHopId: opts.terminalHopId ?? lastHop.hopId, claimedImpact: opts.claimedImpact ?? opts.summary ?? lastHop.claimedDelta,
         ...(terminalExchangeId ? { terminalExchangeId } : {}), ...(preControl.length ? { preChainControlExchangeIds: preControl } : {}),
         ...(postReadback.length ? { postChainReadbackExchangeIds: postReadback } : {}), ...(modeAFailureExchangeId ? { modeAFailureExchangeId } : {}),
-        ...(opts.oracleFamily ? { oracleFamily: opts.oracleFamily } : {}), ...(opts.oracleInput ? { oracleInput: opts.oracleInput } : {}), ...(opts.proofReceipt ? { proofReceipt: opts.proofReceipt } : {}),
+        ...(opts.oracleFamily ? { oracleFamily: opts.oracleFamily } : {}), ...(oracleInput ? { oracleInput } : {}), ...(opts.proofReceipt ? { proofReceipt: opts.proofReceipt } : {}),
       },
     }
   }
@@ -483,7 +461,7 @@ export class VerifyContext {
   readonly claims: VerifyClaim[] = []; readonly expect: Expectations; readonly assert: Expectations
   private readonly defaultOrigin: string | undefined; private readonly transport: RpcTransport
   private _lastRpcOp: string | null = null; private _lastFailedClaims: VerifyClaim[] = []
-  private readonly _hopStack: HopRecorder[] = []; private readonly _capOrigins = new Map<string, string>()
+  private readonly _hopStack: HopRecorder[] = []; private readonly _capOrigins = new Map<string, string>(); private readonly _exMeta = new Map<string, { status: number; topKeys: string[] }>()
 
   constructor() {
     const context = readContext()
@@ -540,9 +518,27 @@ export class VerifyContext {
     }
   }
 
+  private extractExDiag(raw: { status?: unknown; json?: unknown; body?: unknown }): { status: number; topKeys: string[] } {
+    const status = typeof raw.status === 'number' ? raw.status : 0
+    const parsed = raw.json != null ? raw.json : parseJsonSafe(raw.body)
+    const sanitizeKey = (k: string): string => k.replace(/[^\w.-]/g, '').slice(0, 32)
+    let keys: string[] = []
+    if (parsed && typeof parsed === 'object') {
+      const src = Array.isArray(parsed) ? (parsed[0] && typeof parsed[0] === 'object' && !Array.isArray(parsed[0]) ? Object.keys(parsed[0] as Record<string, unknown>).map(k => `[0].${k}`) : ['<array>']) : Object.keys(parsed as Record<string, unknown>)
+      keys = src.slice(0, 12).map(sanitizeKey).filter(k => Boolean(k) && !/redacted/i.test(k))
+      if (src.length > 12) keys.push('...')
+    }
+    return { status, topKeys: keys }
+  }
+  private rememberEx(ex: HttpExchange | null | undefined): void {
+    if (!ex?.exchangeId) return
+    if (this._exMeta.size >= 256) { const first = this._exMeta.keys().next().value; if (first) this._exMeta.delete(first) }
+    this._exMeta.set(ex.exchangeId, this.extractExDiag(ex))
+  }
   private async sendHttp(op: 'http' | 'http.send', input: HttpTarget, options: HttpOptions = {}): Promise<HttpExchange> {
     const { args, timeoutMs } = this.buildHttpRpcArgs(input, options)
     const ex = hydrateExchange(await this.callRpc(op, args, timeoutMs) as HttpExchange)
+    this.rememberEx(ex)
     const hop = this.activeHop()
     if (hop) {
       hop.onExchange(ex.exchangeId)
@@ -558,17 +554,47 @@ export class VerifyContext {
   http_send(input: HttpTarget, options: HttpOptions = {}): Promise<HttpExchange> { return this.sendHttp('http.send', input, options) }
   request(input: HttpTarget, options: HttpOptions = {}): Promise<HttpExchange> { return this.sendHttp('http.send', input, options) }
 
+  async race_burst(requests: Array<RaceRequestInput | HttpTarget>, opts: { barrier?: 'auto' | 'h2' | 'http1'; session?: string; entityId?: string; correlationIds?: string[] } = {}): Promise<RaceBurstHopResult> {
+    if (!Array.isArray(requests) || requests.length < 2 || requests.length > 10) throw new Error('race_burst requires between 2 and 10 requests.')
+    const built = requests.map((req, i) => {
+      const mergedOpts: HttpOptions = { role: 'probe', session: opts.session ? `${opts.session}-${i}` : `race-${i}`, ...(opts.entityId ? { entityId: opts.entityId } : {}), ...(opts.correlationIds?.length ? { correlationIds: opts.correlationIds } : {}) }
+      return this.buildHttpRpcArgs(req as HttpTarget, mergedOpts)
+    })
+    const raw = await this.callRpc('race.burst', { requests: built.map(b => b.args), ...(opts.barrier ? { barrier: opts.barrier } : {}) }, Math.max(40_000, built[0]!.timeoutMs)) as { mode?: 'h2-single-packet' | 'http1-fallback'; fallbackReason?: string | null; raceBatchId?: string; summary?: Record<string, unknown>; results?: HttpExchange[] }
+    const raceBatchId = raw.raceBatchId ?? ''
+    const results = (raw.results ?? []).map(r => { const ex = hydrateExchange({ ...r, ...(raceBatchId && !r.raceBatchId ? { raceBatchId } : {}) }); this.rememberEx(ex); return ex })
+    const hop = this.activeHop()
+    if (hop) {
+      results.forEach((ex, i) => { hop.onExchange(ex.exchangeId); this.recordExCaps(hop, ex, built[i]?.args.capability) })
+      if (!hop.target && built[0]) hop.target = { origin: typeof built[0].args.origin === 'string' ? built[0].args.origin : this.targetOrigin, method: typeof built[0].args.method === 'string' ? built[0].args.method : 'POST', pathAndQuery: results[0]?.pathAndQuery || (typeof built[0].args.path === 'string' ? built[0].args.path : '/') }
+      if (!hop.entityId && opts.entityId?.trim()) hop.entityId = opts.entityId.trim()
+      if (opts.correlationIds) for (const cid of opts.correlationIds) hop.onCorrelation(cid)
+    }
+    return { mode: raw.mode ?? 'http1-fallback', fallbackReason: raw.fallbackReason ?? null, raceBatchId, summary: raw.summary ?? {}, results, exchanges: results }
+  }
+  raceBurst(requests: Array<RaceRequestInput | HttpTarget>, opts?: { barrier?: 'auto' | 'h2' | 'http1'; session?: string; entityId?: string; correlationIds?: string[] }): Promise<RaceBurstHopResult> { return this.race_burst(requests, opts) }
+
   async seal_capability(input: SealCapabilityInput): Promise<SealedCapabilityResult> {
     const raw = (input && typeof input === 'object' ? input : {}) as unknown as Record<string, unknown>
     const exchangeId = extractExchangeIds((raw.exchangeId ?? raw.exchange ?? raw.exchange_id ?? raw.sourceExchangeId ?? raw.response) as ExchangeRef | undefined)[0]
     if (!exchangeId) throw new Error('seal_capability requires exchangeId (string) or exchange ({ exchangeId }).')
     const activeHop = this.activeHop(), hopReceiptId = (typeof raw.hopReceiptId === 'string' && raw.hopReceiptId.trim()) ? raw.hopReceiptId.trim() : (typeof raw.hopId === 'string' && raw.hopId.trim()) ? raw.hopId.trim() : activeHop?.hopId
     const cookieSel = typeof raw.cookie === 'string' && raw.cookie.trim() ? raw.cookie : typeof raw.setCookie === 'string' && raw.setCookie.trim() ? raw.setCookie : undefined
-    const res = await this.callRpc('capability.seal', {
-      exchangeId, slot: input.slot, ...(hopReceiptId ? { hopReceiptId } : {}), ...(cookieSel ? { cookie: cookieSel } : {}),
-      ...pickDefined(raw, ['jsonPath', 'header', 'setCookie', 'locationQuery', 'queryParam', 'regex', 'kind', 'defaultHeaderName', 'defaultCookieName']),
-      ...(input.value !== undefined ? { value: input.value } : {}), ...(input.ttlMs !== undefined ? { ttlMs: input.ttlMs } : {}), ...(input.allowedOrigins?.length ? { allowedOrigins: input.allowedOrigins } : {}),
-    }, 30_000) as SealedCapabilityResult
+    let res: SealedCapabilityResult
+    try {
+      res = await this.callRpc('capability.seal', {
+        exchangeId, slot: input.slot, ...(hopReceiptId ? { hopReceiptId } : {}), ...(cookieSel ? { cookie: cookieSel } : {}),
+        ...pickDefined(raw, ['jsonPath', 'header', 'setCookie', 'locationQuery', 'queryParam', 'regex', 'kind', 'defaultHeaderName', 'defaultCookieName']),
+        ...(input.value !== undefined ? { value: input.value } : {}), ...(input.ttlMs !== undefined ? { ttlMs: input.ttlMs } : {}), ...(input.allowedOrigins?.length ? { allowedOrigins: input.allowedOrigins } : {}),
+      }, 30_000) as SealedCapabilityResult
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      if (/structured field not found/i.test(msg)) {
+        const diag = this._exMeta.get(exchangeId) ?? (raw.exchange && typeof raw.exchange === 'object' ? this.extractExDiag(raw.exchange as { status?: unknown; json?: unknown; body?: unknown }) : undefined)
+        if (diag) throw new Error(`${msg} [status=${diag.status}, topKeys=[${diag.topKeys.join(', ')}]]`)
+      }
+      throw err
+    }
     const srcEx = res.exchangeId || exchangeId; if (res.handle && srcEx) this._capOrigins.set(res.handle, srcEx); activeHop?.onProduce(res.handle, srcEx)
     return res
   }
@@ -626,6 +652,7 @@ export class VerifyContext {
       ...(r.correlationIds?.length ? { correlationIds: r.correlationIds } : {}), ...(r.entityId ? { entityId: String(r.entityId) } : {}),
     }, Math.max((timeoutMs ?? 30_000) + 10_000, 15_000)) as AsyncAwaitResult
     const out = res && res.exchange ? { ...res, exchange: hydrateExchange(res.exchange) } : res
+    if (out?.exchange) this.rememberEx(out.exchange)
     const hop = this.activeHop()
     if (hop) {
       if (out.exchangeId) hop.onExchange(out.exchangeId)
@@ -676,10 +703,7 @@ export class VerifyContext {
     return res
   }
 
-  prove_access_boundary(input: AccessBoundaryInput | Record<string, unknown>): Promise<AccessBoundaryProof> {
-    return this.callProof<AccessBoundaryProof>('prove.accessBoundary', input, 'prove_access_boundary requires { controlPersona?, probePersona?, route, method?, boundaryClass?, vulnClass?, expectControlDenied? }.', 70_000, ['control', 'probe'])
-  }
-
+  prove_access_boundary(input: AccessBoundaryInput | Record<string, unknown>): Promise<AccessBoundaryProof> { return this.callProof<AccessBoundaryProof>('prove.accessBoundary', input, 'prove_access_boundary requires { controlPersona?, probePersona?, route, method?, boundaryClass?, vulnClass?, expectControlDenied? }.', 70_000, ['control', 'probe']) }
   async prove_persisted_mutation(input: PersistedMutationInput | Record<string, unknown>): Promise<PersistedMutationProof> {
     if (!input || typeof input !== 'object') throw new Error('prove_persisted_mutation requires { readRoute, mutation, fieldPath, expectDelta }.')
     const raw = input as Record<string, unknown>, expectFn = typeof raw.expectDelta === 'function' ? raw.expectDelta : null, payload: Record<string, unknown> = { ...raw }
@@ -694,16 +718,13 @@ export class VerifyContext {
     if (res.claim) this.recordProofClaims(res.ok !== false && res.confirmed !== false, [res.claim])
     return res
   }
-
   async prove_boolean_or_timing_diff(input: BooleanOrTimingDiffInput | Record<string, unknown>): Promise<DifferentialProof> {
     const res = await this.callProof<DifferentialProof>('prove.differential', input, 'prove_boolean_or_timing_diff requires { control, variant, mode: "boolean"|"timing", rounds? }.', 120_000)
     if (res.exchanges) res.exchanges = { control: res.exchanges.control.map(hydrateExchange), variant: res.exchanges.variant.map(hydrateExchange) }
     return res
   }
-
   async prove_oob_callback(input: OobCallbackInput | Record<string, unknown>): Promise<OobCallbackProof> {
-    const raw = input as Record<string, unknown>, timeoutMs = Number(raw.timeoutMs ?? 6_000)
-    let res: OobCallbackProof
+    const raw = input as Record<string, unknown>, timeoutMs = Number(raw.timeoutMs ?? 6_000); let res: OobCallbackProof
     if (typeof raw.inject === 'function') {
       const injectFn = raw.inject as (canary: OobHandle) => Promise<HttpExchange | void> | HttpExchange | void
       const started = await this.callRpc('prove.oob', { phase: 'start', ...(raw.token ? { token: raw.token } : {}), ...(raw.immediateMs !== undefined ? { immediateMs: Number(raw.immediateMs) } : {}), ...(raw.windowMs !== undefined ? { windowMs: Number(raw.windowMs) } : {}) }, 30_000) as { handle: OobHandle; subscription: Record<string, unknown> }
@@ -714,7 +735,6 @@ export class VerifyContext {
     if (res.claim) this.recordProofClaims(res.ok !== false && res.confirmed !== false, [res.claim])
     return res
   }
-
   async prove_race_burst(input: RaceBurstInput | Record<string, unknown>): Promise<RaceBurstProof> {
     const raw = (input && typeof input === 'object' ? input : {}) as Record<string, unknown>, reqCount = Array.isArray(raw.requests) ? raw.requests.length : 0
     const res = hydrateFields(await this.callRpc('prove.race', raw, Math.max(40_000, Math.min(80_000, 25_000 + reqCount * 2_000))) as Record<string, unknown>, ['baseline', 'post', 'serial', 'serialPost']) as unknown as RaceBurstProof
@@ -729,16 +749,8 @@ export class VerifyContext {
     }
     return res
   }
-
-  prove_injection_differential(input: InjectionDifferentialInput | Record<string, unknown>): Promise<InjectionDifferentialProof> {
-    return this.callProof<InjectionDifferentialProof>('prove.injection', input, 'prove_injection_differential requires { control, probe, expectedOutput?, vulnClass? }.', 70_000, ['control', 'probe'])
-  }
-
-  prove_signed_url_mint(input: SignedUrlMintInput | Record<string, unknown>): Promise<SignedUrlMintProof> {
-    return this.callProof<SignedUrlMintProof>('prove.signedUrlMint', input, 'prove_signed_url_mint requires { control, probe } (or route + controlBody/probeBody, or controlExchangeId/probeExchangeId).', 70_000, ['control', 'probe'])
-  }
-
-  /** Thin camelCase compatibility delegates for existing v6/v8 callers. */
+  prove_injection_differential(input: InjectionDifferentialInput | Record<string, unknown>): Promise<InjectionDifferentialProof> { return this.callProof<InjectionDifferentialProof>('prove.injection', input, 'prove_injection_differential requires { control, probe, expectedOutput?, vulnClass? }.', 70_000, ['control', 'probe']) }
+  prove_signed_url_mint(input: SignedUrlMintInput | Record<string, unknown>): Promise<SignedUrlMintProof> { return this.callProof<SignedUrlMintProof>('prove.signedUrlMint', input, 'prove_signed_url_mint requires { control, probe } (or route + controlBody/probeBody, or controlExchangeId/probeExchangeId).', 70_000, ['control', 'probe']) }
   proveAccessBoundary(input: AccessBoundaryInput | Record<string, unknown>): Promise<AccessBoundaryProof> { return this.prove_access_boundary(input) }
   provePersistedMutation(input: PersistedMutationInput | Record<string, unknown>): Promise<PersistedMutationProof> { return this.prove_persisted_mutation(input) }
   proveBooleanOrTimingDiff(input: BooleanOrTimingDiffInput | Record<string, unknown>): Promise<DifferentialProof> { return this.prove_boolean_or_timing_diff(input) }
@@ -746,7 +758,6 @@ export class VerifyContext {
   proveSignedUrlMint(input: SignedUrlMintInput | Record<string, unknown>): Promise<SignedUrlMintProof> { return this.prove_signed_url_mint(input) }
   proveOobCallback(input: OobCallbackInput | Record<string, unknown>): Promise<OobCallbackProof> { return this.prove_oob_callback(input) }
   proveRaceBurst(input: RaceBurstInput | Record<string, unknown>): Promise<RaceBurstProof> { return this.prove_race_burst(input) }
-
   result(input: { title: string; severity?: string; description?: string }): ProofResult {
     if (!input.title || !input.title.trim()) throw new Error('Proof result requires a title.')
     return { sdk: 'kovo_verify.ts', nonce: this.nonce, title: input.title.slice(0, 300), severity: (input.severity ?? 'high').slice(0, 32), ...(input.description ? { description: input.description.slice(0, 4000) } : {}), claims: this.effectiveClaims() }
@@ -756,49 +767,26 @@ export class VerifyContext {
 export interface VerificationScript { setup?(ctx: VerifyContext): Promise<void> | void; verify(ctx: VerifyContext): Promise<ProofResult | unknown> | ProofResult | unknown; cleanup?(ctx: VerifyContext): Promise<void> | void }
 export type VerificationEntrypoint = VerificationScript | ((ctx: VerifyContext) => Promise<ProofResult | unknown> | ProofResult | unknown)
 export function defineVerification(script: VerificationScript): VerificationScript { return script }
-
-function writeResult(value: unknown): void {
-  const path = process.env.KOVO_PROOF_RESULT_FILE ?? join(dirname(process.env.KOVO_RPC_CONTEXT_FILE ?? '/kovo-rpc/context.json'), 'result.json')
-  writeFileSync(path, JSON.stringify(value), { mode: 0o600 })
-}
-
+function writeResult(value: unknown): void { writeFileSync(process.env.KOVO_PROOF_RESULT_FILE ?? join(dirname(process.env.KOVO_RPC_CONTEXT_FILE ?? '/kovo-rpc/context.json'), 'result.json'), JSON.stringify(value), { mode: 0o600 }) }
 function normalizeProofResult(ctx: VerifyContext, returned: unknown, defaultTitle?: string): ProofResult {
-  const fallbackTitle = (defaultTitle && defaultTitle.trim() ? defaultTitle.trim() : 'Verification script proof').slice(0, 300)
-  const fallbackClaims = ctx.effectiveClaims()
-  if (returned && typeof returned === 'object' && !Array.isArray(returned)) {
+  const fallbackTitle = (defaultTitle && defaultTitle.trim() ? defaultTitle.trim() : 'Verification script proof').slice(0, 300), fallbackClaims = ctx.effectiveClaims()
+  if (returned && typeof returned === 'object' && !Array.isArray(returned) && Array.isArray((returned as Record<string, unknown>).claims)) {
     const rec = returned as Record<string, unknown>
-    if (Array.isArray(rec.claims)) {
-      return {
-        sdk: 'kovo_verify.ts', nonce: typeof rec.nonce === 'string' && rec.nonce ? rec.nonce : ctx.nonce,
-        title: typeof rec.title === 'string' && rec.title.trim() ? rec.title.trim().slice(0, 300) : fallbackTitle,
-        severity: typeof rec.severity === 'string' && rec.severity.trim() ? rec.severity.trim().slice(0, 32) : 'high',
-        ...(typeof rec.description === 'string' && rec.description ? { description: rec.description.slice(0, 4000) } : {}),
-        claims: rec.claims.length > 0 ? (rec.claims as VerifyClaim[]) : fallbackClaims,
-      }
-    }
+    return { sdk: 'kovo_verify.ts', nonce: typeof rec.nonce === 'string' && rec.nonce ? rec.nonce : ctx.nonce, title: typeof rec.title === 'string' && rec.title.trim() ? rec.title.trim().slice(0, 300) : fallbackTitle, severity: typeof rec.severity === 'string' && rec.severity.trim() ? rec.severity.trim().slice(0, 32) : 'high', ...(typeof rec.description === 'string' && rec.description ? { description: rec.description.slice(0, 4000) } : {}), claims: (rec.claims as VerifyClaim[]).length > 0 ? (rec.claims as VerifyClaim[]) : fallbackClaims }
   }
   return { sdk: 'kovo_verify.ts', nonce: ctx.nonce, title: fallbackTitle, severity: 'high', claims: fallbackClaims }
 }
-
 function failScript(ctx: VerifyContext, message: string, claims: VerifyClaim[]): void {
   writeResult({ sdk: 'kovo_verify.ts', nonce: ctx.nonce, error: message.slice(0, 2000), ...(ctx.lastRpcOp ? { lastRpcOp: ctx.lastRpcOp } : {}), claims })
-  process.stderr.write(`kovo_verify: ${message}\n`)
-  process.exitCode = 1
+  process.stderr.write(`kovo_verify: ${message}\n`); process.exitCode = 1
 }
-
 export async function runVerification(script: VerificationScript, defaultTitle?: string): Promise<void> {
-  const ctx = new VerifyContext()
-  let result: unknown = null
-  try {
-    await script.setup?.(ctx); result = await script.verify(ctx); await script.cleanup?.(ctx)
-  } catch (error) {
-    failScript(ctx, error instanceof Error ? error.message : 'Verification script failed.', ctx.effectiveClaims()); return
-  }
-  const normalized = normalizeProofResult(ctx, result, defaultTitle)
-  writeResult(normalized)
+  const ctx = new VerifyContext(); let result: unknown = null
+  try { await script.setup?.(ctx); result = await script.verify(ctx); await script.cleanup?.(ctx) }
+  catch (error) { failScript(ctx, error instanceof Error ? error.message : 'Verification script failed.', ctx.effectiveClaims()); return }
+  const normalized = normalizeProofResult(ctx, result, defaultTitle); writeResult(normalized)
   process.stdout.write(`kovo_verify: ${normalized.claims.length} transcript-backed claim(s) recorded\n`)
 }
-
 export async function runEntrypoint(entry: VerificationEntrypoint, defaultTitle?: string): Promise<void> {
   if (typeof entry === 'function') { await runVerification({ verify: entry }, defaultTitle); return }
   if (entry && typeof entry === 'object' && typeof entry.verify === 'function') { await runVerification(entry, defaultTitle); return }

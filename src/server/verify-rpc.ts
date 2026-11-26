@@ -306,6 +306,7 @@ interface HostExchangeProvenance {
   wireCredentialProvenance?: WireCredentialProvenance
   authPlacement?: HostAuthPlacement
   carrierText?: string
+  raceBatchId?: string
 }
 
 const BROKER_FORBIDDEN_CALLER_HEADER_RE = /^(?:authorization|proxy-authorization|cookie)$/i
@@ -560,7 +561,7 @@ export class VerifyRpcServer {
     if (op === 'http2') return this.handleHttp2(args, nonce)
     if (op === 'browser') return this.handleBrowser(args, nonce)
     if (op === 'oob') return this.handleOob(args)
-    if (op === 'race') return this.handleRace(args, nonce)
+    if (op === 'race' || op === 'race.burst') return this.handleRace(args, nonce)
     if (op === 'capability.seal') return this.handleCapabilitySeal(args, nonce)
     if (op === 'crypto.hmacSign') return this.handleCryptoHmacSign(args, nonce)
     if (op === 'crypto.jwtSign') return this.handleCryptoJwtSign(args, nonce)
@@ -1359,7 +1360,7 @@ export class VerifyRpcServer {
     const items = rawRequests.map((item, index) => {
       const record = asRecord(item)
       if (!record) throw new Error(`race request ${index + 1} must be an object.`)
-      const itemArgs = { sessionGroupRole: 'probe', ...record }
+      const itemArgs = { sessionGroupRole: 'probe', ...(typeof record.as === 'string' && !record.persona ? { persona: record.as } : {}), ...record }
       return { itemArgs, prep: this.prepareCapRequest(itemArgs, nonce) }
     })
     let burstGrant: Grant = this.options.grant
@@ -1373,6 +1374,7 @@ export class VerifyRpcServer {
       ? { mode: 'h2-single-packet' as const, fallbackReason: null as string | null }
       : { mode: 'http1-fallback' as const, fallbackReason: summary.proxy ? 'proxy transport disables the HTTP/2 single-packet barrier' : 'HTTP/2 transport is unavailable; the burst runs on the HTTP/1.1 fallback' }
     const started = this.nextHostTimestampMs()
+    const raceBatchId = `race_${randomUUID()}`
     try {
       const rawCaptures: Array<{ body: string; headers: Record<string, string> } | null> = items.map(() => null)
       const burst = await this.options.broker.executeRaceBurst(
@@ -1384,26 +1386,31 @@ export class VerifyRpcServer {
         const { itemArgs, prep } = items[index]!
         this.recordSessionMutation(prep.sessionKey, prep.applied.brokerRequest.method, prep.entityIds, prep.isControlOrAblation, result.status)
         const { authPlacement, stampedReqMeta } = this.stampPlacement(prep.applied, prep.requestMeta, result.wireCredentialProvenance)
+        const batchedReqMeta = { ...stampedReqMeta, raceBatchId } as typeof stampedReqMeta
         const record = this.transcript.record({
           op: mode.mode === 'h2-single-packet' ? 'http2' : 'http',
-          startedAt: started, durationMs: result.durationMs, request: stampedReqMeta, body: result.body,
+          startedAt: started, durationMs: result.durationMs, request: batchedReqMeta, body: result.body,
           ...(prep.applied.brokerRequest.body !== undefined ? { rawRequestBody: this.scrubKernel(prep.applied.brokerRequest.body) } : {}),
           response: { status: result.status, headers: this.kernelSanitizer.sanitizeHttpHeaders(result.respHeaders, 'storage_log'), bodyBytes: result.bodyBytes, bodySha256: result.bodySha256, mediaType: result.mediaType },
         })
         const capRaw = rawCaptures[index]
         this.recordRequestProvenance(
-          record.exchangeId, started, itemArgs, prep.applied.brokerRequest, stampedReqMeta,
+          record.exchangeId, started, itemArgs, prep.applied.brokerRequest, batchedReqMeta,
           capRaw ? { body: capRaw.body, respHeaders: capRaw.headers } : { body: result.body, respHeaders: result.respHeaders },
           prep.applied.attestations, prep.cryptoAttestations, prep.cleanSession, prep.applied.authCapabilityActor,
           result.wireCredentialProvenance, authPlacement,
         )
-        return this.exchangeView(record, result, {
-          consumedCapabilityId: prep.applied.attestation?.consumedCapabilityId ?? null,
-          consumedCapabilities: prep.consumedIds,
-          derivedFromCapabilityIds: prep.derivedFromCapabilityIds,
-        })
+        this.getOrCreateProvenance(record.exchangeId, started).raceBatchId = raceBatchId
+        return {
+          ...this.exchangeView(record, result, {
+            consumedCapabilityId: prep.applied.attestation?.consumedCapabilityId ?? null,
+            consumedCapabilities: prep.consumedIds,
+            derivedFromCapabilityIds: prep.derivedFromCapabilityIds,
+          }),
+          raceBatchId,
+        }
       })
-      return this.scrubRecord({ mode: mode.mode, fallbackReason: mode.fallbackReason, summary: burst.summary, results })
+      return this.scrubRecord({ mode: mode.mode, fallbackReason: mode.fallbackReason, raceBatchId, summary: burst.summary, results })
     } catch (error) {
       const msg = this.scrub(error instanceof Error ? error.message : 'Race burst failed.')
       const record = this.transcript.record({
@@ -2168,6 +2175,7 @@ export class VerifyRpcServer {
         ...(prov && prov.correlationIds.size > 0 ? { correlationIds: [...prov.correlationIds] } : {}),
         ...(prov?.cleanSession !== undefined ? { cleanSession: prov.cleanSession } : {}),
         ...(prov?.replayAttempt ? { replayAttempt: prov.replayAttempt } : {}),
+        ...(prov?.raceBatchId ? { raceBatchId: prov.raceBatchId } : {}),
       }
       entries.push(sign(entry))
     }
@@ -2190,9 +2198,12 @@ export class VerifyRpcServer {
   /** Host-side verification of a CompositeProofReceipt against this session's signed transcript & capability vault. */
   verifyComposite(rawReceipt: unknown, options?: Omit<CompositeVerifyOptions, 'signingKey'>): CompositeReceiptVerification {
     const factLog = HostFactLog.fromTranscript(this.buildHostSignedTranscript())
+    const personaRoleLabels = this.options.grant.personas?.size
+      ? Object.fromEntries([...this.options.grant.personas.entries()].filter(([, p]) => Boolean(p.roleLabel)).map(([h, p]) => [h, p.roleLabel]))
+      : undefined
     const res = defaultTerminalOracleRegistry.evaluate(
       factLog, { kind: 'composite', receipt: rawReceipt },
-      { compositeOptions: { ...this.options.compositeVerifyOptions, ...options }, signingKey: this.compositeSigningKey, strictHostDerivation: true },
+      { compositeOptions: { ...(personaRoleLabels ? { personaRoleLabels } : {}), ...this.options.compositeVerifyOptions, ...options }, signingKey: this.compositeSigningKey, strictHostDerivation: true },
     )
     return res.composite!
   }
