@@ -16,6 +16,15 @@ import {
 import type { CaptureKeyInput, CaptureMouseInput } from '../src/server/browser-session-auth.ts'
 import { configureGlobalKillSwitch } from '../src/server/kill-switch.ts'
 import type { GlobalKillSwitch } from '../src/server/kill-switch.ts'
+import {
+  clearQaAnomalies,
+  isQaAnomaliesEnabled,
+  listQaAnomalies,
+  QA_ANOMALIES_MAX_ENTRIES,
+  qaAnomalyKinds,
+  recordQaAnomaly,
+} from '../src/server/qa-anomalies.ts'
+import type { QaAnomalyKind } from '../src/server/qa-anomalies.ts'
 import { exportRunReceiptBundle } from '../src/server/receipt-export.ts'
 import { store, TenantIsolationError } from '../src/server/store.ts'
 import type { Store } from '../src/server/store.ts'
@@ -31,6 +40,8 @@ const authStatusPath = '/_kovo/auth/status'
 const authCaptureStartPath = '/_kovo/auth-capture/start'
 const authCapturePersonaConfigPath = '/_kovo/auth-capture/persona-config'
 const authCaptureActionRegex = /^\/_kovo\/auth-capture\/([A-Za-z0-9_-]{6,128})\/(stream|input|complete|cancel)$/
+const qaAnomaliesPath = '/_kovo/qa/anomalies'
+const validQaAnomalyKinds: ReadonlySet<string> = new Set(qaAnomalyKinds)
 const killSwitchPath = '/api/ops/kill-switch'
 const receiptExportPathRegex = /^\/api\/runs\/([A-Za-z0-9_-]{1,128})\/receipts\/export$/
 
@@ -231,6 +242,7 @@ function shouldReturnJsonAuthError(pathname: string): boolean {
   return (
     pathname.startsWith('/_kovo/auth/')
     || pathname.startsWith('/_kovo/auth-capture')
+    || pathname.startsWith('/_kovo/qa/')
     || pathname.startsWith('/api/')
     || pathname.startsWith('/_serverFn/')
     || receiptExportPathRegex.test(pathname)
@@ -573,6 +585,18 @@ export function createKovoLocalServer(options: LocalSessionOptions): KovoLocalSe
         if (/unknown run|not found/i.test(message)) {
           return sendJson(res, 404, { error: message })
         }
+        if (isQaAnomaliesEnabled()) {
+          recordQaAnomaly({
+            kind: 'unexpected_ui_rpc_error',
+            routeOrOrigin: path.pathname,
+            summary: `Receipt export failed with HTTP 500: ${message}`,
+            detail: {
+              source: 'serve_receipt_export',
+              method,
+              statusCode: 500,
+            },
+          })
+        }
         return sendJson(res, 500, { error: message })
       }
     }
@@ -717,6 +741,21 @@ export function createKovoLocalServer(options: LocalSessionOptions): KovoLocalSe
           allowedOrigins,
           ...(ttlMs ? { ttlMs } : {}),
         })
+        const initialNavErr = capture.lastError()?.trim()
+        if (initialNavErr && isQaAnomaliesEnabled()) {
+          recordQaAnomaly({
+            kind: /proxy.*denied|disallowed|not allowed|blocked/i.test(initialNavErr)
+              ? 'interactive_proxy_denied'
+              : 'swallowed_nav_error',
+            routeOrOrigin: capture.currentUrl() || capture.targetOrigin,
+            summary: `Interactive auth-capture nav_error: ${initialNavErr}`,
+            detail: {
+              source: 'auth_capture_start',
+              captureId: capture.id,
+              projectId: capture.projectId,
+            },
+          })
+        }
         return sendJson(res, 200, {
           captureId: capture.id,
           projectId: capture.projectId,
@@ -821,7 +860,24 @@ export function createKovoLocalServer(options: LocalSessionOptions): KovoLocalSe
         const unsubscribe = capture.subscribe(ev => {
           if (ev.type === 'frame') sendEvent('frame', ev.frame)
           else if (ev.type === 'url') sendEvent('url', { url: ev.url })
-          else if (ev.type === 'error') sendEvent('nav_error', { message: ev.message, ...(ev.url ? { url: ev.url } : {}) })
+          else if (ev.type === 'error') {
+            const msg = ev.message.trim()
+            if (msg && isQaAnomaliesEnabled()) {
+              recordQaAnomaly({
+                kind: /proxy.*denied|disallowed|not allowed|blocked/i.test(msg)
+                  ? 'interactive_proxy_denied'
+                  : 'swallowed_nav_error',
+                routeOrOrigin: ev.url || capture.currentUrl() || capture.targetOrigin,
+                summary: `Interactive auth-capture nav_error: ${msg}`,
+                detail: {
+                  source: 'auth_capture_stream',
+                  captureId: capture.id,
+                  projectId: capture.projectId,
+                },
+              })
+            }
+            sendEvent('nav_error', { message: ev.message, ...(ev.url ? { url: ev.url } : {}) })
+          }
           else if (ev.type === 'status') {
             sendEvent('status', { state: ev.state, ...(ev.reason ? { reason: ev.reason } : {}) })
             if (ev.state !== 'active' && !res.writableEnded) res.end()
@@ -937,6 +993,66 @@ export function createKovoLocalServer(options: LocalSessionOptions): KovoLocalSe
       return reject(res, 404, 'Not found.')
     }
 
+    // Move 4: Opt-in QA Anomaly Recorder endpoint (strictly 404 unless KOVO_QA_ANOMALIES === '1',
+    // authenticated with the same kovo_local session + Origin + Sec-Fetch-Site guards above).
+    if (path.pathname === qaAnomaliesPath) {
+      if (!isQaAnomaliesEnabled()) {
+        return sendJson(res, 404, { error: 'Not found.' })
+      }
+      if (method === 'GET' || method === 'HEAD') {
+        const rawKind = path.searchParams.get('kind')?.trim()
+        let kind: QaAnomalyKind | undefined
+        if (rawKind) {
+          if (!validQaAnomalyKinds.has(rawKind)) {
+            return sendJson(res, 400, { error: 'Invalid kind filter.' })
+          }
+          kind = rawKind as QaAnomalyKind
+        }
+        const rawLimit = path.searchParams.get('limit')?.trim()
+        let limit: number | undefined
+        if (rawLimit) {
+          if (!/^\d+$/.test(rawLimit)) {
+            return sendJson(res, 400, { error: 'Invalid limit parameter.' })
+          }
+          limit = Number(rawLimit)
+        }
+        const rawSinceTs = path.searchParams.get('sinceTs')?.trim()
+        let sinceTs: number | undefined
+        if (rawSinceTs) {
+          if (!/^\d+$/.test(rawSinceTs)) {
+            return sendJson(res, 400, { error: 'Invalid sinceTs parameter.' })
+          }
+          sinceTs = Number(rawSinceTs)
+        }
+        if (method === 'HEAD') {
+          res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' }).end()
+          return
+        }
+        const anomalies = listQaAnomalies({
+          ...(kind ? { kind } : {}),
+          ...(limit !== undefined ? { limit } : {}),
+          ...(sinceTs !== undefined ? { sinceTs } : {}),
+        })
+        return sendJson(res, 200, {
+          enabled: true,
+          maxEntries: QA_ANOMALIES_MAX_ENTRIES,
+          count: anomalies.length,
+          anomalies,
+        })
+      }
+      if (method === 'DELETE') {
+        if (req.headers.origin !== origin) return reject(res, 403, 'Unexpected origin.')
+        req.resume()
+        clearQaAnomalies()
+        return sendJson(res, 200, { ok: true, cleared: true })
+      }
+      return reject(res, 405, 'Method not allowed.')
+    }
+
+    if (path.pathname.startsWith('/_kovo/qa/')) {
+      return reject(res, 404, 'Not found.')
+    }
+
     const headers = new Headers()
     for (const [name, value] of Object.entries(req.headers)) {
       if (value !== undefined && !name.startsWith('x-forwarded-') && name !== 'forwarded') {
@@ -1026,6 +1142,18 @@ export function createKovoLocalServer(options: LocalSessionOptions): KovoLocalSe
       if (!res.headersSent) return reject(res, 413, 'Request body is too large.')
       return
     }
+    if (response.status >= 500 && isQaAnomaliesEnabled()) {
+      recordQaAnomaly({
+        kind: 'unexpected_ui_rpc_error',
+        routeOrOrigin: path.pathname,
+        summary: `Server responded HTTP ${response.status} for ${method} ${path.pathname}`,
+        detail: {
+          source: 'serve_app_fetch',
+          method,
+          statusCode: response.status,
+        },
+      })
+    }
     for (const [name, value] of response.headers) {
       if (name !== 'set-cookie') res.setHeader(name, value)
     }
@@ -1037,7 +1165,24 @@ export function createKovoLocalServer(options: LocalSessionOptions): KovoLocalSe
   }
 
   const server = createServer((req, res) => {
-    void serve(req, res).catch(() => {
+    void serve(req, res).catch((err: unknown) => {
+      if (isQaAnomaliesEnabled()) {
+        const rawUrl = req.url ?? '/'
+        const pathnameOnly = rawUrl.split(/[?#]/, 1)[0] || '/'
+        const errName = err instanceof Error ? err.name : 'Error'
+        const errMsg = err instanceof Error ? err.message : 'Unhandled server error'
+        recordQaAnomaly({
+          kind: 'unexpected_ui_rpc_error',
+          routeOrOrigin: pathnameOnly,
+          summary: `Unhandled HTTP 500 on ${req.method ?? 'GET'} ${pathnameOnly}: ${errName}: ${errMsg}`,
+          detail: {
+            source: 'serve_unhandled_error',
+            method: req.method ?? 'GET',
+            statusCode: 500,
+            errorName: errName,
+          },
+        })
+      }
       if (res.destroyed) return
       if (!res.headersSent) reject(res, 500, 'Kovo Hunter could not complete the request.')
       else res.end()
