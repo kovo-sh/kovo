@@ -890,7 +890,7 @@ export class HostFactLog {
       rawResponseBody,
       actor,
       actorRole,
-      ...(actorRole !== null || input.actorPrivilege !== undefined ? { actorPrivilege: actorRole } : {}),
+      ...(primaryIdentity.source === 'typed' && actorRole !== null ? { actorPrivilege: actorRole } : {}),
       ...(input.actorRoleLabel !== undefined ? { actorRoleLabel: input.actorRoleLabel } : {}),
       actorTenant,
       ambientAuth,
