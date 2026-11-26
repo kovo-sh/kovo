@@ -28,10 +28,23 @@ export interface OobDrainRelay {
   pending(runId?: string): unknown[]
 }
 
+export interface OobDrainError {
+  phase: 'preflight_pending' | 'promote_late' | 'pending_check' | 'drain'
+  message: string
+  code?: string
+  at: number
+}
+
 export interface OobDrainResult {
   oobDrainMs: number
   promotedLate: number
   remaining: number
+  /** Structured diagnostics for relay/SQLite errors observed during drain (omitted when healthy). */
+  errors?: OobDrainError[]
+  /** True when relay/SQLite failures prevented verifying or promoting pending OOB callbacks. */
+  degraded?: boolean
+  /** Explicit report coverage gap line when `degraded` is true. */
+  coverageGap?: string
 }
 
 export interface OobDrainOptions {
@@ -42,6 +55,33 @@ export interface OobDrainOptions {
   sleep?: (ms: number) => Promise<void>
   /** Optional abort signal to cancel waiting early (e.g. run stopped/deleted). */
   signal?: AbortSignal
+  /** Optional observer invoked whenever a non-deletion relay/storage error occurs during drain. */
+  onError?: (error: unknown) => void
+}
+
+const MAX_RECORDED_DRAIN_ERRORS = 20
+
+function formatDrainError(phase: OobDrainError['phase'], error: unknown, at: number): OobDrainError {
+  const err = error && typeof error === 'object' ? (error as { message?: unknown; code?: unknown }) : null
+  const rawMessage = typeof err?.message === 'string' && err.message.trim()
+    ? err.message.trim()
+    : (typeof error === 'string' && error.trim() ? error.trim() : String(error))
+  const code = typeof err?.code === 'string' && err.code.trim() ? err.code.trim() : undefined
+  return {
+    phase,
+    message: rawMessage.slice(0, 300),
+    ...(code ? { code } : {}),
+    at,
+  }
+}
+
+/** Build an explicit report coverage gap line for relay/SQLite errors during pre-report OOB drain. */
+export function buildOobDrainCoverageGap(errors: readonly OobDrainError[]): string {
+  const phases = [...new Set(errors.map(e => e.phase))].join(', ') || 'drain'
+  const first = errors[0]
+  const codeSuffix = first?.code ? ` [${first.code}]` : ''
+  const detail = first?.message ? `: ${first.message}` : ''
+  return `OOB callback drain degraded (${errors.length} relay/storage error${errors.length === 1 ? '' : 's'} during ${phases}${codeSuffix})${detail}; late async OOB callbacks could not be verified before finalizing.`
 }
 
 const activeDrainControllers = new Map<string, Set<AbortController>>()
@@ -115,32 +155,78 @@ export async function drainPendingOob(
   const pollMs = Math.max(1, options.pollMs ?? OOB_DRAIN_POLL_MS)
   const started = now()
   let promotedLate = 0
-  const promote = () => {
+  let lastKnownRemaining = 0
+  let lastPromoteOk = true
+  let lastPendingOk = true
+  const errors: OobDrainError[] = []
+
+  const recordError = (phase: OobDrainError['phase'], error: unknown): void => {
+    if (errors.length < MAX_RECORDED_DRAIN_ERRORS) {
+      errors.push(formatDrainError(phase, error, now()))
+    }
+    options.onError?.(error)
+  }
+
+  const promote = (): boolean => {
     try {
       promotedLate += relay.promoteLate({ runId, now: now() }).length
-    } catch { /* relay unavailable: there is nothing to promote */ }
+      lastPromoteOk = true
+      return true
+    } catch (error) {
+      if (isDeletedRunRaceError(error)) throw error
+      lastPromoteOk = false
+      recordError('promote_late', error)
+      return false
+    }
   }
-  const pendingCount = (): number => {
-    try { return relay.pending(runId).length } catch { return 0 }
+  const pendingCount = (): { count: number; ok: boolean } => {
+    try {
+      const count = relay.pending(runId).length
+      lastKnownRemaining = count
+      lastPendingOk = true
+      return { count, ok: true }
+    } catch (error) {
+      if (isDeletedRunRaceError(error)) throw error
+      lastPendingOk = false
+      recordError('pending_check', error)
+      return { count: lastKnownRemaining, ok: false }
+    }
+  }
+
+  const buildResult = (oobDrainMs: number, remaining: number): OobDrainResult => {
+    const degraded = !lastPromoteOk || !lastPendingOk || (errors.length > 0 && remaining > 0)
+    if (errors.length === 0) {
+      return { oobDrainMs, promotedLate, remaining }
+    }
+    return {
+      oobDrainMs,
+      promotedLate,
+      remaining,
+      errors,
+      ...(degraded ? { degraded: true, coverageGap: buildOobDrainCoverageGap(errors) } : {}),
+    }
   }
 
   try {
     if (signal.aborted) {
-      return { oobDrainMs: 0, promotedLate: 0, remaining: pendingCount() }
+      const check = pendingCount()
+      return buildResult(0, check.count)
     }
     promote()
-    let remaining = pendingCount()
+    let check = pendingCount()
+    let remaining = check.count
     const maxPolls = Math.ceil(graceMs / pollMs) + 2
     let polls = 0
-    while (!signal.aborted && remaining > 0 && now() - started < graceMs && polls < maxPolls) {
+    while (!signal.aborted && check.ok && remaining > 0 && now() - started < graceMs && polls < maxPolls) {
       polls += 1
       const budget = graceMs - (now() - started)
       await sleep(Math.max(1, Math.min(pollMs, budget)))
       if (signal.aborted) break
       promote()
-      remaining = pendingCount()
+      check = pendingCount()
+      remaining = check.count
     }
-    return { oobDrainMs: Math.max(0, now() - started), promotedLate, remaining }
+    return buildResult(Math.max(0, now() - started), remaining)
   } finally {
     set.delete(controller)
     if (set.size === 0) activeDrainControllers.delete(runId)
@@ -199,7 +285,30 @@ export function collectVerificationFailureGaps(
 export function scheduleFinalReport(host: FinalizeHost, run: Run): void {
   if (host.draining.has(run.id)) return
   let pending = 0
-  try { pending = host.relay.pending(run.id).length } catch { pending = 0 }
+  let preflightError: OobDrainError | null = null
+  try {
+    pending = host.relay.pending(run.id).length
+  } catch (error) {
+    if (isDeletedRunRaceError(error)) {
+      host.lastDrain.delete(run.id)
+      return
+    }
+    preflightError = formatDrainError('preflight_pending', error, Date.now())
+    host.onError?.(error)
+  }
+  if (preflightError) {
+    host.lastDrain.set(run.id, {
+      oobDrainMs: 0,
+      promotedLate: 0,
+      remaining: 0,
+      degraded: true,
+      errors: [preflightError],
+      coverageGap: buildOobDrainCoverageGap([preflightError]),
+    })
+    commitFinalReport(host, run)
+    host.onFinalized?.(run.id)
+    return
+  }
   if (pending === 0) {
     commitFinalReport(host, run)
     host.onFinalized?.(run.id)
@@ -207,7 +316,10 @@ export function scheduleFinalReport(host: FinalizeHost, run: Run): void {
   }
   host.draining.add(run.id)
   activeFinalizingRuns.add(run.id)
-  const drain = host.drain ?? ((runId: string, signal?: AbortSignal) => drainPendingOob(host.relay, runId, { signal }))
+  const drain = host.drain ?? ((runId: string, signal?: AbortSignal) => drainPendingOob(host.relay, runId, {
+    signal,
+    ...(host.onError ? { onError: host.onError } : {}),
+  }))
   const runAsyncFinalize = async (signal?: AbortSignal) => {
     try {
       try {
@@ -218,7 +330,17 @@ export function scheduleFinalReport(host: FinalizeHost, run: Run): void {
           host.lastDrain.delete(run.id)
           return
         }
-        // Transient drain failure must not block report finalization when the run still exists.
+        // Surface unexpected drain failures as an explicit coverage gap rather than silently finalizing clean.
+        const drainErr = formatDrainError('drain', error, Date.now())
+        host.lastDrain.set(run.id, {
+          oobDrainMs: 0,
+          promotedLate: 0,
+          remaining: pending,
+          degraded: true,
+          errors: [drainErr],
+          coverageGap: buildOobDrainCoverageGap([drainErr]),
+        })
+        host.onError?.(error)
       }
       if (signal?.aborted) return
       commitFinalReport(host, run)
@@ -266,7 +388,17 @@ export function commitFinalReport(host: FinalizeHost, run: Run): void {
       const failureGaps = host.collectFailureGaps
         ? host.collectFailureGaps(current)
         : collectVerificationFailureGaps(host.storage.workerList?.(current.id) ?? [], current.goalRevision)
-      const partial = failureGaps.length > 0
+      const drain = host.lastDrain.get(current.id)
+      const drainGaps: string[] = []
+      if (drain?.degraded) {
+        drainGaps.push(drain.coverageGap ?? buildOobDrainCoverageGap(drain.errors ?? [{
+          phase: 'drain',
+          message: 'OOB relay drain reported degraded state',
+          at: Date.now(),
+        }]))
+      }
+      const allGaps = [...failureGaps, ...drainGaps]
+      const partial = allGaps.length > 0
       const complete = host.storage.updateRun(current.id, { phase: 'complete', status: 'complete' })
       const reportId = host.storage.writeReport(complete, partial)
       if (partial && host.storage.db) {
@@ -275,7 +407,7 @@ export function commitFinalReport(host: FinalizeHost, run: Run): void {
           if (row && row.body) {
             const existing = Array.isArray(row.body.gaps) ? row.body.gaps : []
             const mergedGaps = [...existing]
-            for (const line of failureGaps) {
+            for (const line of allGaps) {
               if (!mergedGaps.includes(line)) mergedGaps.push(line)
             }
             host.storage.db.update(reports)
@@ -285,12 +417,16 @@ export function commitFinalReport(host: FinalizeHost, run: Run): void {
           }
         } catch { /* best-effort gap merge */ }
       }
-      const drain = host.lastDrain.get(current.id)
       const drainNote = drain && drain.promotedLate > 0
         ? ` ${drain.promotedLate} late async callback(s) were promoted before finalizing.`
         : ''
+      const degradedNote = drainGaps.length > 0
+        ? ' OOB callback drain encountered relay/storage errors; recorded an explicit coverage gap.'
+        : ''
       const summary = partial
-        ? `Verification finished with ${failureGaps.length} failed verification worker${failureGaps.length === 1 ? '' : 's'}. A partial report is ready.${drainNote}`
+        ? (failureGaps.length > 0
+            ? `Verification finished with ${failureGaps.length} failed verification worker${failureGaps.length === 1 ? '' : 's'}. A partial report is ready.${drainNote}${degradedNote}`
+            : `Verification finished with an OOB drain coverage gap. A partial report is ready.${drainNote}${degradedNote}`)
         : `Verification finished. The complete report is ready.${drainNote}`
       host.storage.message(current.id, current.coordinatorId, 'kovo', summary)
     }, { behavior: 'immediate' })

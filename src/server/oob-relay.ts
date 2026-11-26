@@ -301,7 +301,14 @@ const maxWindowMs = 30 * 60_000
 export const defaultOobWindowMs = 15 * 60_000
 const defaultDnsDomain = 'canary.kovo.invalid'
 const callbackTokenPattern = /^(kovo-canary-[a-f0-9]{24}|gn2o_[a-f0-9]{8,16})$/
-const maxStoredCallbacks = 20_000
+/** Separate bounded retention cap for historical claimed callbacks (`claimed_by IS NOT NULL`). */
+export const MAX_STORED_CLAIMED_OOB_CALLBACKS = 15_000
+/** Separate bounded retention cap for unclaimed callbacks (`claimed_by IS NULL`); active `pending_oob` tokens are never evicted. */
+export const MAX_STORED_UNCLAIMED_OOB_CALLBACKS = 5_000
+/** Default TTL for historical claimed callbacks (7 days). */
+export const DEFAULT_CLAIMED_CALLBACK_TTL_MS = 7 * 24 * 60 * 60_000
+/** Default TTL for orphaned unclaimed callbacks without an active `pending_oob` subscription (24 hours). */
+export const DEFAULT_UNCLAIMED_CALLBACK_TTL_MS = 24 * 60 * 60_000
 /** Bounded ring-cap for `oob_rejections` so external OOB spam cannot fill host disk. */
 export const MAX_STORED_OOB_REJECTIONS = 5_000
 
@@ -618,6 +625,14 @@ export interface OobRelayOptions {
   allowlist?: string[]
   /** Bounded cap for persisted `oob_rejections` rows (defaults to `MAX_STORED_OOB_REJECTIONS = 5000`). */
   maxRejections?: number
+  /** Bounded cap for historical claimed `oob_callbacks` rows (`claimed_by IS NOT NULL`). */
+  maxClaimedCallbacks?: number
+  /** Bounded cap for unclaimed `oob_callbacks` rows (`claimed_by IS NULL`, excluding active `pending_oob` tokens). */
+  maxUnclaimedCallbacks?: number
+  /** Retention TTL (ms) for historical claimed callbacks (0 disables TTL eviction). */
+  claimedCallbackTtlMs?: number
+  /** Retention TTL (ms) for orphaned unclaimed callbacks (0 disables TTL eviction). */
+  unclaimedCallbackTtlMs?: number
   logger?: (rejection: OobRejection) => void
 }
 
@@ -632,6 +647,10 @@ export class OobRelay {
   private readonly defaultWindowMs: number
   private readonly defaultAllowlist: string[]
   private readonly maxStoredRejections: number
+  private readonly maxClaimedCallbacks: number
+  private readonly maxUnclaimedCallbacks: number
+  private readonly claimedCallbackTtlMs: number
+  private readonly unclaimedCallbackTtlMs: number
   private closed = false
 
   constructor(options: OobRelayOptions = {}) {
@@ -643,6 +662,10 @@ export class OobRelay {
     this.defaultWindowMs = Math.min(Math.max(1_000, options.windowMs ?? defaultOobWindowMs), maxWindowMs)
     this.defaultAllowlist = [...(options.allowlist ?? [])]
     this.maxStoredRejections = Math.max(1, Math.trunc(options.maxRejections ?? MAX_STORED_OOB_REJECTIONS))
+    this.maxClaimedCallbacks = Math.max(0, Math.trunc(options.maxClaimedCallbacks ?? MAX_STORED_CLAIMED_OOB_CALLBACKS))
+    this.maxUnclaimedCallbacks = Math.max(1, Math.trunc(options.maxUnclaimedCallbacks ?? MAX_STORED_UNCLAIMED_OOB_CALLBACKS))
+    this.claimedCallbackTtlMs = Math.max(0, Math.trunc(options.claimedCallbackTtlMs ?? DEFAULT_CLAIMED_CALLBACK_TTL_MS))
+    this.unclaimedCallbackTtlMs = Math.max(0, Math.trunc(options.unclaimedCallbackTtlMs ?? DEFAULT_UNCLAIMED_CALLBACK_TTL_MS))
 
     const path = this.directory ? join(this.directory, 'oob-relay.sqlite') : ':memory:'
     this.client = openSqliteDatabase(path, {
@@ -692,6 +715,7 @@ export class OobRelay {
       );
       CREATE INDEX IF NOT EXISTS oob_callbacks_token ON oob_callbacks(token);
       CREATE INDEX IF NOT EXISTS oob_callbacks_claim ON oob_callbacks(token, claimed_by);
+      CREATE INDEX IF NOT EXISTS oob_callbacks_claim_received ON oob_callbacks(claimed_by, received_at);
       CREATE TABLE IF NOT EXISTS oob_bindings (
         token TEXT PRIMARY KEY,
         canary_id TEXT NOT NULL,
@@ -903,7 +927,7 @@ export class OobRelay {
     if (!inserted || Number(inserted.changes ?? 0) === 0) {
       return { accepted: true, duplicate: true, callback }
     }
-    this.pruneCallbacks()
+    this.pruneCallbacks(now, callbackId)
     return { accepted: true, duplicate: false, callback }
   }
 
@@ -1095,6 +1119,7 @@ export class OobRelay {
   }
 
   private claim(subscription: OobSubscription, callback: OobCallback, now: number): OobPromotion {
+    let claimed = false
     withBusyRetry(() => this.client.exec('BEGIN IMMEDIATE'))
     try {
       const subUpdated = this.client.prepare(
@@ -1115,11 +1140,15 @@ export class OobRelay {
             latencyMs: Math.max(0, callback.receivedAt - subscription.createdAt),
           }
         }
+        claimed = true
       }
       withBusyRetry(() => this.client.exec('COMMIT'))
     } catch (err) {
       try { this.client.exec('ROLLBACK') } catch { /* ignore */ }
       throw err
+    }
+    if (claimed) {
+      this.pruneCallbacks(now, callback.callbackId)
     }
     const updated = this.subscription(subscription.id)
     const updatedCb = this.callback(callback.callbackId) ?? callback
@@ -1210,17 +1239,82 @@ export class OobRelay {
     `).run(this.maxStoredRejections)
   }
 
-  private pruneCallbacks(): void {
-    const row = this.client.prepare('SELECT COUNT(*) AS n FROM oob_callbacks')
-      .get() as unknown as { n: number | bigint } | undefined
-    const total = Number(row?.n ?? 0)
-    if (total <= maxStoredCallbacks) return
-    this.client.prepare(`
-      DELETE FROM oob_callbacks
-      WHERE claimed_by IS NULL AND callback_id IN (
-        SELECT callback_id FROM oob_callbacks WHERE claimed_by IS NULL ORDER BY received_at ASC LIMIT ?
-      )
-    `).run(total - maxStoredCallbacks)
+  /**
+   * Enforce independent retention caps and TTLs for historical claimed rows (`claimed_by IS NOT NULL`)
+   * vs. unclaimed rows (`claimed_by IS NULL`).
+   *
+   * Critical invariants:
+   * - Historical claimed rows are pruned ONLY against `maxClaimedCallbacks` / `claimedCallbackTtlMs`
+   *   (oldest first) and can NEVER trigger eviction of unclaimed rows.
+   * - Unclaimed rows matching an active `pending_oob` subscription (`status = 'pending'`) and the
+   *   just-inserted `protectedCallbackId` are NEVER evicted.
+   */
+  private pruneCallbacks(now = this.now(), protectedCallbackId?: string): void {
+    const protectedId = protectedCallbackId ?? null
+    this.inImmediateTx(() => {
+      // 1. Historical claimed rows (`claimed_by IS NOT NULL`): TTL first, then bounded oldest-first cap.
+      if (this.claimedCallbackTtlMs > 0) {
+        const cutoff = now - this.claimedCallbackTtlMs
+        this.client.prepare(`
+          DELETE FROM oob_callbacks
+          WHERE claimed_by IS NOT NULL
+            AND received_at < ?
+            AND (? IS NULL OR callback_id != ?)
+        `).run(cutoff, protectedId, protectedId)
+      }
+      const claimedRow = this.client.prepare(
+        'SELECT COUNT(*) AS n FROM oob_callbacks WHERE claimed_by IS NOT NULL',
+      ).get() as unknown as { n: number | bigint } | undefined
+      const claimedTotal = Number(claimedRow?.n ?? 0)
+      if (claimedTotal > this.maxClaimedCallbacks) {
+        this.client.prepare(`
+          DELETE FROM oob_callbacks
+          WHERE callback_id IN (
+            SELECT callback_id FROM oob_callbacks
+            WHERE claimed_by IS NOT NULL
+              AND (? IS NULL OR callback_id != ?)
+            ORDER BY received_at ASC, rowid ASC
+            LIMIT ?
+          )
+        `).run(protectedId, protectedId, claimedTotal - this.maxClaimedCallbacks)
+      }
+
+      // 2. Unclaimed rows (`claimed_by IS NULL`): only evict orphaned rows with NO active pending_oob
+      // subscription and never evict the just-accepted callback.
+      if (this.unclaimedCallbackTtlMs > 0) {
+        const unclaimedCutoff = now - this.unclaimedCallbackTtlMs
+        this.client.prepare(`
+          DELETE FROM oob_callbacks
+          WHERE claimed_by IS NULL
+            AND received_at < ?
+            AND (? IS NULL OR callback_id != ?)
+            AND NOT EXISTS (
+              SELECT 1 FROM pending_oob p
+              WHERE p.token = oob_callbacks.token AND p.status = 'pending'
+            )
+        `).run(unclaimedCutoff, protectedId, protectedId)
+      }
+      const unclaimedRow = this.client.prepare(
+        'SELECT COUNT(*) AS n FROM oob_callbacks WHERE claimed_by IS NULL',
+      ).get() as unknown as { n: number | bigint } | undefined
+      const unclaimedTotal = Number(unclaimedRow?.n ?? 0)
+      if (unclaimedTotal > this.maxUnclaimedCallbacks) {
+        this.client.prepare(`
+          DELETE FROM oob_callbacks
+          WHERE callback_id IN (
+            SELECT c.callback_id FROM oob_callbacks c
+            WHERE c.claimed_by IS NULL
+              AND (? IS NULL OR c.callback_id != ?)
+              AND NOT EXISTS (
+                SELECT 1 FROM pending_oob p
+                WHERE p.token = c.token AND p.status = 'pending'
+              )
+            ORDER BY c.received_at ASC, c.rowid ASC
+            LIMIT ?
+          )
+        `).run(protectedId, protectedId, unclaimedTotal - this.maxUnclaimedCallbacks)
+      }
+    })
   }
 }
 
