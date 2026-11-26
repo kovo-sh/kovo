@@ -32,15 +32,18 @@ import type { PersonaCredentialSource } from './oracle-invariants.ts'
 import { MAX_REPLAY_REGEX_HAYSTACK_LENGTH, isSafeRegexPattern, proofReceiptMode, safeRegexTest, validateReplayAgentScriptEnvelope, validateReplayRecipeEnvelope } from './proof-receipt.ts'
 import type { ProofReceipt, ProofReceiptMode, ReceiptVerification } from './proof-receipt.ts'
 import { persistedAgentScriptOf, retestPersistedAgentScript } from './agent-script-proof.ts'
+import { assessDeclarativeRetestHealth } from './retest-health.ts'
 import {
   assessBflaImpact,
   assessHttpChainEndpointBinding,
   assessHttpChainProofStrength,
+  buildReplayReceipt,
   defaultRequireControlNonError,
   extractVariables,
   hasDestructiveContent,
   impactStepsFromStepsOut,
   inconclusiveResult,
+  isReceiptExemptHostSpec,
   isSuccessStatus,
   isUnexpectedErrorStatus,
   receiptCheckForResult,
@@ -772,17 +775,11 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
   }
 
   if (!deterministicProofPassed) {
+    const health = assessDeclarativeRetestHealth(spec, { verdict: 'inconclusive', outcome, evidencePayload }, { deterministicProofPassed: false, proofFailureReason, receiptBuildable: true })
     return {
-      verdict: outcome.controlPassed ? 'dismissed' : 'inconclusive',
-      outcome: {
-        ...outcome,
-        confirmed: false,
-        reason: proofFailureReason || 'Cryptographic non-destructive proof-of-execution check did not pass (possible reflection or unexecuted payload).',
-      },
-      exchangeIds,
-      exchanges,
-      evidencePayload,
-      evidenceSha256,
+      verdict: health.healthy && outcome.controlPassed ? 'dismissed' : 'inconclusive',
+      outcome: { ...outcome, confirmed: false, reason: health.reason || proofFailureReason || 'Cryptographic non-destructive proof-of-execution check did not pass (possible reflection or unexecuted payload).' },
+      exchangeIds, exchanges, evidencePayload: { ...evidencePayload, retestHealth: health }, evidenceSha256,
     }
   }
 
@@ -969,8 +966,19 @@ export async function retestReplaySpec(params: VerifyReplaySpecParams): Promise<
     return retestPersistedAgentScript(agentScript.envelope, { ...params, origin: agentScript.origin } as VerifyReplaySpecParams & { origin?: string })
   }
   const replay = await verifyReplaySpec(params)
-  const verdict: RetestVerdict = replay.verdict === 'confirmed' || replay.verdict === 'static_verified' ? 'reproduced' : replay.verdict === 'dismissed' ? 'fixed' : 'inconclusive'
-  return { verdict, replay }
+  if (replay.verdict === 'confirmed' || replay.verdict === 'static_verified') return { verdict: 'reproduced', replay }
+  const parsedSpec = declarativeReplaySpecSchema.safeParse(params.spec)
+  const trust = params.envelopeTrust === 'host_persisted' ? 'host_persisted' : 'untrusted'
+  const receiptBuildable = parsedSpec.success && (
+    isReceiptExemptHostSpec(parsedSpec.data, trust)
+    || Boolean(buildReplayReceipt({ spec: parsedSpec.data, evidencePayload: replay.evidencePayload, exchangeIds: replay.exchangeIds, exchanges: replay.exchanges, ...(params.canaryBroker ? { canaryBroker: params.canaryBroker } : {}), canaryRunId: params.runId ?? 'replay-verifier', ...(params.storage ? { canaryStorage: params.storage } : {}) }))
+  )
+  const health = assessDeclarativeRetestHealth(parsedSpec.success ? parsedSpec.data : params.spec, replay, { receiptBuildable })
+  const fixed = replay.verdict === 'dismissed' && health.healthy && health.failureReason === 'claim_not_reproduced'
+  const evidencePayload = { ...replay.evidencePayload, retestHealth: health }
+  return fixed
+    ? { verdict: 'fixed', replay: { ...replay, evidencePayload } }
+    : { verdict: 'inconclusive', replay: { ...replay, verdict: 'inconclusive', outcome: { ...replay.outcome, confirmed: false, controlPassed: false, reason: health.reason ?? replay.outcome.reason ?? 'Retest health check failed.' }, evidencePayload } }
 }
 
 function persistedRecipeOf(spec: unknown): { envelope: FloorRecipeEnvelope; kind: string; origin: string } | null {

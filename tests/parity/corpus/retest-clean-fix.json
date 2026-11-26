@@ -1,0 +1,108 @@
+{
+  "id": "retest-clean-fix",
+  "side": "retest",
+  "archetype": "retest-clean-fix",
+  "description": "Genuine clean remediation of cross-tenant BOLA: owner_a entitled control returns 200, viewer_b peer denied control returns 403, and member_b probe is now definitively denied with HTTP 403. All three retest engines MUST return fixed with failureReason=claim_not_reproduced.",
+  "canonicalLabel": {
+    "cwe": "CWE-639",
+    "category": "bola",
+    "title": "Cross-tenant BOLA read on victim invoice",
+    "impact": "Tenant-B member reads Tenant-A invoice record and victim email.",
+    "claimedImpact": "authorization",
+    "claimedBoundary": "access",
+    "vulnClass": "bola"
+  },
+  "freeTextLabel": {
+    "title": "Cross-tenant invoice read cleanly fixed with HTTP 403"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": false,
+    "evaluateClaims": false,
+    "composite": false,
+    "floorInjectionRecipe": false,
+    "retest": true
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "retest": {
+    "scenario": "clean_fix",
+    "expectedVerdict": "fixed",
+    "expectedFailureReason": "claim_not_reproduced"
+  },
+  "personas": [
+    {
+      "handle": "owner_a",
+      "roleLabel": "owner (tenant-a)",
+      "role": "owner",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-owner-a-token"
+    },
+    {
+      "handle": "viewer_b",
+      "roleLabel": "viewer (tenant-b)",
+      "role": "viewer",
+      "tenant": "tenant-b",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-viewer-b-token"
+    },
+    {
+      "handle": "member_b",
+      "roleLabel": "member (tenant-b)",
+      "role": "member",
+      "tenant": "tenant-b",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-member-b-token"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "entitled",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/invoices/inv_victim_9",
+      "persona": "owner_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"id\":\"inv_victim_9\",\"owner_id\":\"owner_a\",\"tenant_id\":\"tenant-a\",\"email\":\"billing@tenant-a.example\",\"amount_cents\":89000}"
+    },
+    {
+      "id": "denied",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/invoices/inv_victim_9",
+      "persona": "viewer_b",
+      "status": 403,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"error\":\"forbidden\"}"
+    },
+    {
+      "id": "prb",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/invoices/inv_victim_9",
+      "persona": "member_b",
+      "status": 403,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"error\":\"forbidden\"}"
+    }
+  ],
+  "replaySpec": {
+    "resourceTenant": "tenant-a",
+    "assertionsJq": "{ controlPassed: (.steps.entitled.status == 200 and .steps.denied.status == 403), confirmed: (.steps.prb.status == 200 and .steps.prb.json.email == .steps.entitled.json.email), observed: (.steps.prb.status | tostring), expected: \"403\" }"
+  },
+  "claims": [
+    { "kind": "impact", "impactClass": "authorization", "probeExchangeId": "prb", "controlExchangeIds": ["entitled", "denied"], "resourceTenant": "tenant-a" }
+  ]
+}

@@ -33,9 +33,17 @@ import {
   VerifyRpcServer,
   verifyScript,
   type VerifyAttemptSession,
+  type VerifyReason,
   type VerifyTranscriptRecord,
   type VerifyVerdict,
 } from './verify-rpc.ts'
+import {
+  assessRetestHealth,
+  buildAgentScriptRetestInputs,
+  isFixedEligibleFailureReason,
+  type RetestFailureReason,
+  type RetestHealthAssessment,
+} from './retest-health.ts'
 import {
   prepareSessionScratchDir,
   resolveDoodScratchConfig,
@@ -129,8 +137,14 @@ export interface AgentScriptProofParams {
   compositeVerifyOptions?: Omit<CompositeVerifyOptions, 'signingKey'>
 }
 
+export type AgentScriptVerifyReason = VerifyReason | RetestFailureReason
+
+export interface AgentScriptVerifyVerdict extends Omit<VerifyVerdict, 'reason'> {
+  reason: AgentScriptVerifyReason
+}
+
 export interface AgentScriptProofResult {
-  verdict: VerifyVerdict
+  verdict: AgentScriptVerifyVerdict
   /** Host-recorded exchanges of the last passing attempt (empty when no attempt passed). */
   exchanges: ScriptProofExchange[]
   /** Present only when the claims map onto a single-hop receipt rule AND `verifyReceipt` confirms it. */
@@ -587,6 +601,9 @@ export async function runAgentScriptProof(params: AgentScriptProofParams): Promi
     }
   }
 
+  const hasAuthenticated401 = (list: readonly ScriptProofExchange[]): boolean =>
+    list.some(ex => Boolean(ex.personaHandle && ex.personaHandle.trim()) && ex.status === 401)
+
   const rejectedComposite = a2?.composites.find(c => !c.verification.confirmed)
     ?? a1?.composites.find(c => !c.verification.confirmed)
     ?? null
@@ -597,7 +614,7 @@ export async function runAgentScriptProof(params: AgentScriptProofParams): Promi
       verdict: {
         ...verdict,
         confirmed: false,
-        reason: 'oracle_failed',
+        reason: 'composite_stage_rejected',
         rejectedBy: 'composite_receipt',
         detail: `CompositeProofReceipt rejected at stage '${rejectedComposite.verification.failedStage ?? 'unknown'}': ${rejectedComposite.verification.reason}`,
       },
@@ -622,9 +639,37 @@ export async function runAgentScriptProof(params: AgentScriptProofParams): Promi
         .find(([, captured]) => captured.transcript.size > 0)
     : undefined
   if (!passing) {
+    const exchanges = latestCapture ? factLogToScriptExchanges(latestCapture.factLog, workerSanitizer) : []
+    let typedVerdict: AgentScriptVerifyVerdict = verdict
+    if (!verdict.confirmed && verdict.reason === 'oracle_failed') {
+      const hasCompositeFailure = verdict.attempts.some(att => att.failures.some(f => f.startsWith('composite_receipt:')))
+      const drifted = hasAuthenticated401(exchanges)
+        || verdict.attempts.some(att => att.nonceMismatch || !att.signaturesValid)
+      const fallbackOrigin = exchanges.find(exchange => exchange.sessionRole === 'probe')?.origin
+        ?? exchanges[0]?.origin
+        ?? params.targetOrigins[0]
+        ?? ''
+      const receiptUnbuildable = !hasCompositeFailure && !drifted && Boolean(latestCapture) && !buildAgentScriptReceipt({
+        claims: latestCapture!.claims,
+        exchanges,
+        factLog: latestCapture!.factLog,
+        origin: fallbackOrigin,
+        title: params.title?.trim() || verdict.claimTitle || 'Agent script proof',
+      })
+      typedVerdict = {
+        ...verdict,
+        reason: hasCompositeFailure
+          ? 'composite_stage_rejected'
+          : drifted
+            ? 'session_drifted'
+            : receiptUnbuildable
+              ? 'receipt_unbuildable'
+              : 'claim_not_reproduced',
+      }
+    }
     return {
-      verdict,
-      exchanges: latestCapture ? factLogToScriptExchanges(latestCapture.factLog, workerSanitizer) : [],
+      verdict: typedVerdict,
+      exchanges,
       receipt: null,
       compositeReceipt: null,
       vulnClass: null,
@@ -660,7 +705,7 @@ export async function runAgentScriptProof(params: AgentScriptProofParams): Promi
       verdict: {
         ...verdict,
         confirmed: false,
-        reason: 'oracle_failed',
+        reason: 'receipt_unbuildable',
         rejectedBy: 'receipt',
         missingEvidence: [...new Set([...(verdict.missingEvidence ?? []), 'verified_proof_receipt'])],
         detail: 'ProofReceipt could not be built from the script claims: mutating boundary claims require persisted before/after readbacks via ctx.prove_persisted_mutation; read-only boundaries require GET/HEAD.',
@@ -698,11 +743,13 @@ export async function runAgentScriptProof(params: AgentScriptProofParams): Promi
     expected: 'host-custody verified single-hop receipt',
   }
   if (!verification.confirmed) {
+    const drifted = hasAuthenticated401(exchanges)
+    const structuralFailure = /missing|unbuildable|stub|decoy|echoed|schema|no control|anonymous|unauthenticated/i.test(verification.reason)
     return {
       verdict: {
         ...verdict,
         confirmed: false,
-        reason: 'oracle_failed',
+        reason: drifted ? 'session_drifted' : structuralFailure ? 'receipt_unbuildable' : 'claim_not_reproduced',
         detail: `ProofReceipt verification rejected the script claim (${verification.rule}): ${verification.reason}`,
         rejectedBy: 'receipt',
       },
@@ -857,17 +904,43 @@ export async function retestPersistedAgentScript(
   const hasConfirmedProof = result.receipt?.verification.confirmed === true
     || result.compositeReceipt?.verification.confirmed === true
   const confirmed = result.verdict.confirmed && hasConfirmedProof
+  const healthInputs = buildAgentScriptRetestInputs({
+    confirmed,
+    verdictReason: result.verdict.reason,
+    verdictDetail: result.verdict.detail,
+    attempts: result.verdict.attempts,
+    exchanges: result.exchanges,
+    compositeRejectedStage: result.compositeReceipt && !result.compositeReceipt.verification.confirmed
+      ? (result.compositeReceipt.verification.failedStage ?? 'unknown')
+      : null,
+    vulnClass: envelope.vulnClass ?? result.vulnClass ?? null,
+  })
+  const health: RetestHealthAssessment = assessRetestHealth(
+    healthInputs.baseline,
+    healthInputs.probeArms,
+    healthInputs.session,
+  )
+  const fixedEligible = !confirmed
+    && isFixedEligibleFailureReason(result.verdict.reason)
+    && health.healthy
+    && health.failureReason === 'claim_not_reproduced'
+  const replayVerdict = confirmed ? 'confirmed' : fixedEligible ? 'dismissed' : 'inconclusive'
+  const outcomeReason = confirmed
+    ? result.verdict.detail
+    : fixedEligible
+      ? result.verdict.detail
+      : (health.reason ?? result.verdict.detail)
   const replay: ReplayVerificationResult = {
-    verdict: confirmed ? 'confirmed' : result.verdict.reason === 'oracle_failed' ? 'dismissed' : 'inconclusive',
+    verdict: replayVerdict,
     ...(confirmed ? { verificationTier: 'runtime_confirmed' as const } : {}),
     outcome: {
       confirmed,
-      controlPassed: result.verdict.attempts.every(attempt => attempt.oraclePassed),
+      controlPassed: confirmed || fixedEligible,
       observed: confirmed
         ? `Agent script ${envelope.runtime} proof reproduced (${result.verdict.attempts.length} fresh runs).`
         : `Agent script proof did not reproduce: ${result.verdict.reason}.`,
       expected: 'the persisted proof script reproduces its confirmation',
-      ...(result.verdict.detail ? { reason: result.verdict.detail } : {}),
+      ...(outcomeReason ? { reason: outcomeReason } : {}),
     },
     exchangeIds,
     exchanges,
@@ -876,6 +949,7 @@ export async function retestPersistedAgentScript(
       runtime: envelope.runtime,
       scriptSha256: envelope.scriptSha256,
       transcriptDigests: result.transcriptDigests,
+      retestHealth: health,
       receipt: result.receipt?.verification ?? result.compositeReceipt?.verification ?? null,
       ...(result.compositeReceipt ? {
         compositeReceipt: result.compositeReceipt.receipt,
@@ -886,6 +960,7 @@ export async function retestPersistedAgentScript(
       script: envelope.scriptSha256,
       digests: result.transcriptDigests,
       verdict: result.verdict.reason,
+      health: health.failureReason,
     })).digest('hex'),
     ...(result.receipt
       ? { receipt: { mode: 'strict' as const, receipt: result.receipt.receipt, verification: result.receipt.verification } }
