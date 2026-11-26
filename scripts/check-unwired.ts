@@ -9,10 +9,16 @@
  *   2. Unwired / test-only value export ratchet over `src/server/**`:
  *      - Finds declared value exports in `src/server/**` with zero external non-test callers
  *        (resolving direct imports and transitive re-exports across `src/`, `scripts/`, `worker/`).
+ *      - Drops own-module-only noise (`usedInternallyInModule: true`, i.e. exports called internally
+ *        by a production-consumed module) from the unwired metric so only true cross-module dead
+ *        primitives are counted.
  *      - Allows explicit `keep-unwired` entries with a measured-gate ticket + reason so
- *        precision-sensitive primitives (e.g. signed-scope enforcement, composite patch retest)
- *        are never rushed live.
- *      - Fails on any NEW un-baselined / un-annotated unwired value export.
+ *        precision-sensitive primitives (e.g. signed-scope enforcement) are never rushed live,
+ *        and flags stale `keep-unwired` entries once wired internally/externally or deleted.
+ *      - Fails on any NEW un-baselined / un-annotated unwired value export AND prune-fails on
+ *        `resolvedBaselineExports > 0` until stale baseline entries are pruned.
+ *      - `--write-baseline` is **removal-only** by default (monotone ratchet): refuses to add new
+ *        entries unless `--allow-add-with-ticket` supplies per-entry `{ owner, ticket, expires }`.
  *   3. `ARCHITECTURE.md` stale-symbol gate:
  *      - Fails if `ARCHITECTURE.md` cites a `src/server/**` value export as live when it has
  *        zero external non-test callers (unless the citing paragraph/node explicitly documents
@@ -21,7 +27,8 @@
  * Usage:
  *   node scripts/check-unwired.ts                   # enforce ratchet (exit 0 PASS / exit 1 FAIL)
  *   node scripts/check-unwired.ts --json            # print machine-readable JSON summary
- *   node scripts/check-unwired.ts --write-baseline  # refresh scripts/unwired-baseline.json
+ *   node scripts/check-unwired.ts --write-baseline  # removal-only prune of scripts/unwired-baseline.json
+ *   node scripts/check-unwired.ts --write-baseline --allow-add-with-ticket --owner <o> --ticket <t> --expires <YYYY-MM-DD>
  */
 import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join, posix, relative, resolve, sep } from 'node:path'
@@ -35,11 +42,24 @@ export interface KeepUnwiredEntry {
   reason: string
 }
 
+export interface TicketedBaselineAddition {
+  key: string
+  owner: string
+  ticket: string
+  expires: string
+}
+
+export interface StaleKeepUnwiredEntry {
+  key: string
+  status: 'wired_externally' | 'wired_internally' | 'deleted'
+}
+
 export interface UnwiredBaseline {
   version: 1
   allowedCycles: string[]
   keepUnwired: KeepUnwiredEntry[]
   baselinedExports: string[]
+  ticketedAdditions?: TicketedBaselineAddition[]
 }
 
 export interface UnwiredExportFinding {
@@ -69,10 +89,13 @@ export interface UnwiredCheckResult {
   proofKernelCyclePresent: boolean
   totalServerValueExports: number
   wiredExportCount: number
+  ownModuleOnlyExportCount: number
   unwiredExports: UnwiredExportFinding[]
   newUnwiredExports: UnwiredExportFinding[]
   resolvedBaselineExports: string[]
   invalidKeepUnwired: string[]
+  staleKeepUnwired: StaleKeepUnwiredEntry[]
+  invalidTicketedAdditions: string[]
   staleDocCitations: StaleDocCitation[]
   durationMs: number
 }
@@ -80,6 +103,7 @@ export interface UnwiredCheckResult {
 const EXCLUDED_DIRS = new Set(['node_modules', '.git', 'dist', '.output', '.nitro', '.vinxi', '.tanstack', 'coverage'])
 const TEST_FILE_RE = /(?:^|\/)(?:tests?|__tests__)\/|(?:\.test|\.spec)\.[^./\\]+$/i
 const TS_EXT_RE = /\.(?:ts|tsx|mts|cts)$/i
+const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/
 
 /**
  * Known precision-sensitive / gate-tracked unwired primitives preserved across baseline refreshes.
@@ -97,24 +121,6 @@ export const DEFAULT_KEEP_UNWIRED: readonly KeepUnwiredEntry[] = [
     disposition: 'keep-unwired',
     ticket: 'MEASURED-GATE-SIGNED-SCOPE',
     reason: 'Precision-sensitive signed-scope request enforcement; keep unwired until measured-gate ticket lands.',
-  },
-  {
-    key: 'src/server/patch-workflow.ts::retestCompositeChainPatch',
-    disposition: 'keep-unwired',
-    ticket: 'GATE-6-Q8-COMPOSITE-PATCH-RETEST',
-    reason: 'Multi-hop composite chain patch retest is unit-tested and pending production Gate-6 wiring in Q8.',
-  },
-  {
-    key: 'src/server/patch-workflow.ts::computeCompositeRetestProofDigest',
-    disposition: 'keep-unwired',
-    ticket: 'GATE-6-Q8-COMPOSITE-PATCH-RETEST',
-    reason: 'Proof digest helper for retestCompositeChainPatch; pending production Gate-6 wiring in Q8.',
-  },
-  {
-    key: 'src/server/patch-workflow.ts::verifyCompositeRetestProofDigest',
-    disposition: 'keep-unwired',
-    ticket: 'GATE-6-Q8-COMPOSITE-PATCH-RETEST',
-    reason: 'Digest verifier for retestCompositeChainPatch; pending production Gate-6 wiring in Q8.',
   },
 ]
 
@@ -520,6 +526,7 @@ export function findRuntimeImportCycles(files: Map<string, ParsedFileInfo>): str
 function analyzeUnwiredExports(files: Map<string, ParsedFileInfo>): {
   totalServerValueExports: number
   wiredKeys: Set<string>
+  ownModuleUsedKeys: Set<string>
   liveDocKeys: Set<string>
   unwired: UnwiredExportFinding[]
   declaredBySymbol: Map<string, string[]>
@@ -625,6 +632,7 @@ function analyzeUnwiredExports(files: Map<string, ParsedFileInfo>): {
   }
 
   const wiredKeys = new Set<string>()
+  const ownModuleUsedKeys = new Set<string>()
   const liveDocKeys = new Set<string>()
   const unwired: UnwiredExportFinding[] = []
   const declaredBySymbol = new Map<string, string[]>()
@@ -648,22 +656,26 @@ function analyzeUnwiredExports(files: Map<string, ParsedFileInfo>): {
       if (prodUsed.has(key)) {
         wiredKeys.add(key)
         liveDocKeys.add(key)
+      } else if (usedInternallyInModule) {
+        // Own-module-only noise filter (R2-03): exported symbol is called internally inside a
+        // production-consumed module, so it is live code rather than a cross-module dead primitive.
+        ownModuleUsedKeys.add(key)
+        liveDocKeys.add(key)
       } else {
-        if (usedInternallyInModule) liveDocKeys.add(key)
         const testImporters = [...(testImportersByKey.get(key) ?? [])].sort()
         unwired.push({
           key,
           file: info.relPath,
           symbol: sym,
           kind: testImporters.length > 0 ? 'test_only' : 'unreferenced',
-          usedInternallyInModule,
+          usedInternallyInModule: false,
           testImporters,
         })
       }
     }
   }
 
-  return { totalServerValueExports, wiredKeys, liveDocKeys, unwired, declaredBySymbol }
+  return { totalServerValueExports, wiredKeys, ownModuleUsedKeys, liveDocKeys, unwired, declaredBySymbol }
 }
 
 const PENDING_DOC_QUALIFIER_RE =
@@ -753,16 +765,28 @@ export function loadUnwiredBaseline(baselinePath: string): UnwiredBaseline {
   return JSON.parse(readFileSync(baselinePath, 'utf8')) as UnwiredBaseline
 }
 
+function todayIsoDate(): string {
+  return new Date().toISOString().slice(0, 10)
+}
+
+function isValidIsoDate(s: string): boolean {
+  if (!ISO_DATE_RE.test(s)) return false
+  const ms = Date.parse(`${s}T00:00:00Z`)
+  return Number.isFinite(ms) && new Date(ms).toISOString().slice(0, 10) === s
+}
+
 export function runUnwiredCheck(options: {
   rootDir?: string
   baselinePath?: string
   baseline?: UnwiredBaseline
   docRelPath?: string
+  now?: string
 } = {}): UnwiredCheckResult {
   const started = Date.now()
   const rootDir = resolve(options.rootDir ?? join(dirname(fileURLToPath(import.meta.url)), '..'))
   const baselinePath = options.baselinePath ?? join(rootDir, 'scripts/unwired-baseline.json')
   const baseline = options.baseline ?? loadUnwiredBaseline(baselinePath)
+  const nowDate = options.now ?? todayIsoDate()
 
   const relFiles = collectTsFiles(rootDir, ['src', 'scripts', 'worker', 'tests'])
   const parsedFiles = new Map<string, ParsedFileInfo>()
@@ -779,9 +803,13 @@ export function runUnwiredCheck(options: {
     c => c.includes('src/server/composite-receipt.ts') && c.includes('src/server/terminal-oracle-registry.ts'),
   )
 
-  // 2. Unwired / test-only value exports
-  const { totalServerValueExports, wiredKeys, liveDocKeys, unwired, declaredBySymbol } = analyzeUnwiredExports(parsedFiles)
+  // 2. Unwired / test-only value exports (with own-module noise filtered out)
+  const { totalServerValueExports, wiredKeys, ownModuleUsedKeys, liveDocKeys, unwired, declaredBySymbol } =
+    analyzeUnwiredExports(parsedFiles)
+  const unwiredKeySet = new Set(unwired.map(u => u.key))
+
   const invalidKeepUnwired: string[] = []
+  const staleKeepUnwired: StaleKeepUnwiredEntry[] = []
   const keepSet = new Set<string>()
   for (const entry of baseline.keepUnwired) {
     if (entry.disposition !== 'keep-unwired' || !entry.ticket?.trim() || !entry.reason?.trim()) {
@@ -789,12 +817,31 @@ export function runUnwiredCheck(options: {
     } else {
       keepSet.add(entry.key)
     }
+    if (!unwiredKeySet.has(entry.key)) {
+      const status: StaleKeepUnwiredEntry['status'] = wiredKeys.has(entry.key)
+        ? 'wired_externally'
+        : ownModuleUsedKeys.has(entry.key)
+          ? 'wired_internally'
+          : 'deleted'
+      staleKeepUnwired.push({ key: entry.key, status })
+    }
   }
   const baselinedSet = new Set(baseline.baselinedExports)
-  const unwiredKeySet = new Set(unwired.map(u => u.key))
 
   const newUnwiredExports = unwired.filter(u => !keepSet.has(u.key) && !baselinedSet.has(u.key))
   const resolvedBaselineExports = baseline.baselinedExports.filter(k => !unwiredKeySet.has(k))
+
+  // Validate ticketed additions metadata (if present).
+  const invalidTicketedAdditions: string[] = []
+  for (const ta of baseline.ticketedAdditions ?? []) {
+    if (!ta.key?.trim() || !ta.owner?.trim() || !ta.ticket?.trim() || !isValidIsoDate(ta.expires ?? '')) {
+      invalidTicketedAdditions.push(`${ta.key || '(missing key)'}: requires non-empty owner, ticket, and YYYY-MM-DD expires`)
+    } else if (ta.expires < nowDate) {
+      invalidTicketedAdditions.push(`${ta.key}: expired on ${ta.expires} (owner=${ta.owner}, ticket=${ta.ticket})`)
+    } else if (!baselinedSet.has(ta.key)) {
+      invalidTicketedAdditions.push(`${ta.key}: stale ticketedAddition not present in baselinedExports`)
+    }
+  }
 
   // 3. ARCHITECTURE.md stale citations
   const staleDocCitations = scanArchitectureDocCitations(
@@ -808,7 +855,10 @@ export function runUnwiredCheck(options: {
     !proofKernelCyclePresent
     && newCycles.length === 0
     && newUnwiredExports.length === 0
+    && resolvedBaselineExports.length === 0
     && invalidKeepUnwired.length === 0
+    && staleKeepUnwired.length === 0
+    && invalidTicketedAdditions.length === 0
     && staleDocCitations.length === 0
 
   return {
@@ -821,10 +871,13 @@ export function runUnwiredCheck(options: {
     proofKernelCyclePresent,
     totalServerValueExports,
     wiredExportCount: wiredKeys.size,
+    ownModuleOnlyExportCount: ownModuleUsedKeys.size,
     unwiredExports: unwired,
     newUnwiredExports,
     resolvedBaselineExports,
     invalidKeepUnwired,
+    staleKeepUnwired,
+    invalidTicketedAdditions,
     staleDocCitations,
     durationMs: Date.now() - started,
   }
@@ -833,6 +886,7 @@ export function runUnwiredCheck(options: {
 export function buildBaselineFromResult(
   result: UnwiredCheckResult,
   existingKeepUnwired: readonly KeepUnwiredEntry[] = DEFAULT_KEEP_UNWIRED,
+  existingTicketedAdditions: readonly TicketedBaselineAddition[] = [],
 ): UnwiredBaseline {
   const unwiredKeys = new Set(result.unwiredExports.map(u => u.key))
   const keepUnwired = existingKeepUnwired
@@ -843,34 +897,211 @@ export function buildBaselineFromResult(
     .map(u => u.key)
     .filter(k => !keepSet.has(k))
     .sort()
-  return {
+  const baselinedSet = new Set(baselinedExports)
+  const ticketedAdditions = existingTicketedAdditions
+    .filter(ta => baselinedSet.has(ta.key))
+    .sort((a, b) => a.key.localeCompare(b.key))
+  const out: UnwiredBaseline = {
     version: 1,
     allowedCycles: [...result.cycles].sort(),
     keepUnwired,
     baselinedExports,
   }
+  if (ticketedAdditions.length > 0) out.ticketedAdditions = ticketedAdditions
+  return out
 }
 
-function main(): void {
-  const args = new Set(process.argv.slice(2))
-  const rootDir = resolve(join(dirname(fileURLToPath(import.meta.url)), '..'))
-  const baselinePath = join(rootDir, 'scripts/unwired-baseline.json')
+export interface UpdateBaselineOptions {
+  rootDir: string
+  baselinePath: string
+  allowAddWithTicket?: boolean
+  defaultTicketMeta?: { owner: string; ticket: string; expires: string } | null
+  perEntryTickets?: readonly TicketedBaselineAddition[]
+  now?: string
+}
 
-  if (args.has('--write-baseline')) {
-    const existing = existsSync(baselinePath) ? loadUnwiredBaseline(baselinePath) : null
-    const mergedKeep = existing?.keepUnwired?.length ? existing.keepUnwired : DEFAULT_KEEP_UNWIRED
-    const scan = runUnwiredCheck({ rootDir, baseline: { version: 1, allowedCycles: [], keepUnwired: [...mergedKeep], baselinedExports: [] } })
-    const nextBaseline = buildBaselineFromResult(scan, mergedKeep)
-    writeFileSync(baselinePath, `${JSON.stringify(nextBaseline, null, 2)}\n`, 'utf8')
-    console.log(
-      `wrote ${relative(rootDir, baselinePath)}: cycles=${nextBaseline.allowedCycles.length}, `
-      + `keepUnwired=${nextBaseline.keepUnwired.length}, baselinedExports=${nextBaseline.baselinedExports.length}`,
-    )
-    return
+export interface UpdateBaselineResult {
+  ok: boolean
+  wrote: boolean
+  addedExports: string[]
+  addedCycles: string[]
+  removedExports: string[]
+  removedKeepUnwired: string[]
+  baseline: UnwiredBaseline | null
+  error?: string
+}
+
+/**
+ * Monotone baseline writer (R2-03):
+ * - Default mode is REMOVAL-ONLY: prunes resolved exports, fixed cycles, and stale keepUnwired
+ *   entries, and REFUSES to add any new unwired exports or cycles.
+ * - With `allowAddWithTicket: true`, new unwired exports are allowed ONLY when every added key
+ *   carries valid `{ owner, ticket, expires }` metadata (non-empty owner/ticket, valid future/current
+ *   YYYY-MM-DD expiry). New runtime import cycles are always refused.
+ */
+export function updateBaselineMonotone(opts: UpdateBaselineOptions): UpdateBaselineResult {
+  const nowDate = opts.now ?? todayIsoDate()
+  const existing: UnwiredBaseline = existsSync(opts.baselinePath)
+    ? loadUnwiredBaseline(opts.baselinePath)
+    : { version: 1, allowedCycles: [], keepUnwired: [...DEFAULT_KEEP_UNWIRED], baselinedExports: [] }
+  const mergedKeep = existing.keepUnwired.length > 0 ? existing.keepUnwired : [...DEFAULT_KEEP_UNWIRED]
+  const scan = runUnwiredCheck({
+    rootDir: opts.rootDir,
+    baseline: { version: 1, allowedCycles: [], keepUnwired: [...mergedKeep], baselinedExports: [] },
+    now: nowDate,
+  })
+  const candidate = buildBaselineFromResult(scan, mergedKeep, existing.ticketedAdditions ?? [])
+
+  const existingExports = new Set(existing.baselinedExports)
+  const existingCycles = new Set(existing.allowedCycles)
+  const nextExportsSet = new Set(candidate.baselinedExports)
+  const nextKeepSet = new Set(candidate.keepUnwired.map(k => k.key))
+
+  const addedExports = candidate.baselinedExports.filter(k => !existingExports.has(k))
+  const addedCycles = candidate.allowedCycles.filter(c => !existingCycles.has(c))
+  const removedExports = existing.baselinedExports.filter(k => !nextExportsSet.has(k))
+  const removedKeepUnwired = existing.keepUnwired.map(k => k.key).filter(k => !nextKeepSet.has(k))
+
+  if (addedCycles.length > 0) {
+    return {
+      ok: false,
+      wrote: false,
+      addedExports,
+      addedCycles,
+      removedExports,
+      removedKeepUnwired,
+      baseline: null,
+      error: `Refusing to add ${addedCycles.length} new runtime import cycle(s) to baseline: ${addedCycles.join('; ')}`,
+    }
   }
 
-  const res = runUnwiredCheck({ rootDir, baselinePath })
-  if (args.has('--json')) {
+  if (addedExports.length > 0 && !opts.allowAddWithTicket) {
+    return {
+      ok: false,
+      wrote: false,
+      addedExports,
+      addedCycles: [],
+      removedExports,
+      removedKeepUnwired,
+      baseline: null,
+      error:
+        `--write-baseline is removal-only by default; refusing to add ${addedExports.length} new unwired export(s): `
+        + `${addedExports.slice(0, 8).join(', ')}${addedExports.length > 8 ? ` (+${addedExports.length - 8} more)` : ''}. `
+        + `Wire/delete them or pass --allow-add-with-ticket with explicit { owner, ticket, expires } metadata.`,
+    }
+  }
+
+  if (addedExports.length > 0 && opts.allowAddWithTicket) {
+    const byKey = new Map<string, TicketedBaselineAddition>()
+    for (const existingTa of candidate.ticketedAdditions ?? []) byKey.set(existingTa.key, existingTa)
+    for (const entry of opts.perEntryTickets ?? []) byKey.set(entry.key, entry)
+
+    const missingOrInvalid: string[] = []
+    for (const key of addedExports) {
+      const meta = byKey.get(key) ?? (opts.defaultTicketMeta ? { key, ...opts.defaultTicketMeta } : null)
+      if (!meta || !meta.owner?.trim() || !meta.ticket?.trim() || !isValidIsoDate(meta.expires ?? '')) {
+        missingOrInvalid.push(`${key} (missing valid { owner, ticket, expires })`)
+      } else if (meta.expires < nowDate) {
+        missingOrInvalid.push(`${key} (expires ${meta.expires} is in the past vs ${nowDate})`)
+      } else {
+        byKey.set(key, {
+          key,
+          owner: meta.owner.trim(),
+          ticket: meta.ticket.trim(),
+          expires: meta.expires.trim(),
+        })
+      }
+    }
+    if (missingOrInvalid.length > 0) {
+      return {
+        ok: false,
+        wrote: false,
+        addedExports,
+        addedCycles: [],
+        removedExports,
+        removedKeepUnwired,
+        baseline: null,
+        error: `--allow-add-with-ticket requires valid { owner, ticket, expires } for every added export: ${missingOrInvalid.join('; ')}`,
+      }
+    }
+    candidate.ticketedAdditions = [...byKey.values()]
+      .filter(ta => nextExportsSet.has(ta.key))
+      .sort((a, b) => a.key.localeCompare(b.key))
+  }
+
+  writeFileSync(opts.baselinePath, `${JSON.stringify(candidate, null, 2)}\n`, 'utf8')
+  return {
+    ok: true,
+    wrote: true,
+    addedExports,
+    addedCycles: [],
+    removedExports,
+    removedKeepUnwired,
+    baseline: candidate,
+  }
+}
+
+function main(argv: string[] = process.argv.slice(2)): void {
+  let rootDir = resolve(join(dirname(fileURLToPath(import.meta.url)), '..'))
+  let baselinePath: string | null = null
+  let writeBaseline = false
+  let allowAddWithTicket = false
+  let json = false
+  let nowDate: string | undefined
+  let owner = ''
+  let ticket = ''
+  let expires = ''
+  let addMetaPath = ''
+
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i]!
+    if (arg === '--json') { json = true; continue }
+    if (arg === '--write-baseline') { writeBaseline = true; continue }
+    if (arg === '--allow-add-with-ticket') { allowAddWithTicket = true; continue }
+    if (arg === '--root') { rootDir = resolve(argv[++i] ?? ''); continue }
+    if (arg === '--baseline') { baselinePath = resolve(argv[++i] ?? ''); continue }
+    if (arg === '--now') { nowDate = argv[++i] ?? ''; continue }
+    if (arg === '--owner') { owner = argv[++i] ?? ''; continue }
+    if (arg === '--ticket') { ticket = argv[++i] ?? ''; continue }
+    if (arg === '--expires') { expires = argv[++i] ?? ''; continue }
+    if (arg === '--add-meta') { addMetaPath = resolve(argv[++i] ?? ''); continue }
+    console.error(`check-unwired: unknown argument '${arg}'`)
+    process.exit(2)
+  }
+
+  const resolvedBaselinePath = baselinePath ?? join(rootDir, 'scripts/unwired-baseline.json')
+
+  if (writeBaseline) {
+    let perEntryTickets: TicketedBaselineAddition[] = []
+    if (addMetaPath) {
+      perEntryTickets = JSON.parse(readFileSync(addMetaPath, 'utf8')) as TicketedBaselineAddition[]
+    }
+    const defaultTicketMeta = owner || ticket || expires ? { owner, ticket, expires } : null
+    const upd = updateBaselineMonotone({
+      rootDir,
+      baselinePath: resolvedBaselinePath,
+      allowAddWithTicket,
+      defaultTicketMeta,
+      perEntryTickets,
+      now: nowDate,
+    })
+    if (json) {
+      console.log(JSON.stringify(upd, null, 2))
+    } else if (!upd.ok) {
+      console.error(`check-unwired --write-baseline: FAIL — ${upd.error}`)
+    } else {
+      const b = upd.baseline!
+      console.log(
+        `wrote ${relative(rootDir, resolvedBaselinePath)}: cycles=${b.allowedCycles.length}, `
+        + `keepUnwired=${b.keepUnwired.length}, baselinedExports=${b.baselinedExports.length} `
+        + `(removed=${upd.removedExports.length}, added=${upd.addedExports.length}, prunedKeep=${upd.removedKeepUnwired.length})`,
+      )
+    }
+    process.exit(upd.ok ? 0 : 1)
+  }
+
+  const res = runUnwiredCheck({ rootDir, baselinePath: resolvedBaselinePath, now: nowDate })
+  if (json) {
     console.log(JSON.stringify(res, null, 2))
     process.exit(res.ok ? 0 : 1)
   }
@@ -879,8 +1110,9 @@ function main(): void {
     `check-unwired: ${res.ok ? 'PASS' : 'FAIL'} `
     + `(files=${res.filesScanned}, cycles=${res.cycles.length}, newCycles=${res.newCycles.length}, `
     + `serverExports=${res.totalServerValueExports}, wired=${res.wiredExportCount}, `
-    + `unwired=${res.unwiredExports.length}, newUnwired=${res.newUnwiredExports.length}, `
-    + `staleDocCitations=${res.staleDocCitations.length}, ${res.durationMs}ms)`,
+    + `ownModuleOnly=${res.ownModuleOnlyExportCount}, unwired=${res.unwiredExports.length}, `
+    + `newUnwired=${res.newUnwiredExports.length}, resolvedBaseline=${res.resolvedBaselineExports.length}, `
+    + `staleKeep=${res.staleKeepUnwired.length}, staleDocCitations=${res.staleDocCitations.length}, ${res.durationMs}ms)`,
   )
 
   if (res.proofKernelCyclePresent) {
@@ -892,17 +1124,31 @@ function main(): void {
   for (const inv of res.invalidKeepUnwired) {
     console.error(`FAIL [invalid-keep-unwired]: ${inv} requires disposition="keep-unwired", ticket, and reason`)
   }
+  for (const stale of res.staleKeepUnwired) {
+    console.error(`FAIL [stale-keep-unwired]: ${stale.key} is now ${stale.status} — prune via: node scripts/check-unwired.ts --write-baseline`)
+  }
+  for (const inv of res.invalidTicketedAdditions) {
+    console.error(`FAIL [invalid-ticketed-addition]: ${inv}`)
+  }
   for (const exp of res.newUnwiredExports) {
     console.error(`FAIL [new-unwired-export]: ${exp.key} (${exp.kind}; tests=[${exp.testImporters.slice(0, 3).join(', ')}])`)
+  }
+  if (res.resolvedBaselineExports.length > 0) {
+    console.error(
+      `FAIL [resolved-baseline-export]: ${res.resolvedBaselineExports.length} stale baselined export(s) are now wired/internal/deleted — prune via: node scripts/check-unwired.ts --write-baseline`,
+    )
+    for (const k of res.resolvedBaselineExports.slice(0, 10)) {
+      console.error(`  - ${k}`)
+    }
+    if (res.resolvedBaselineExports.length > 10) {
+      console.error(`  ... (+${res.resolvedBaselineExports.length - 10} more)`)
+    }
   }
   for (const cite of res.staleDocCitations) {
     console.error(`FAIL [stale-architecture-doc]: ${cite.file}:${cite.line} cites unwired symbol "${cite.symbol}" (${cite.declaringFiles.join(', ')})`)
   }
   if (res.fixedCycles.length > 0) {
     console.log(`NOTE: ${res.fixedCycles.length} baselined cycle(s) resolved and can be removed from scripts/unwired-baseline.json.`)
-  }
-  if (res.resolvedBaselineExports.length > 0) {
-    console.log(`NOTE: ${res.resolvedBaselineExports.length} baselined unwired export(s) are now wired/deleted and can be pruned from scripts/unwired-baseline.json.`)
   }
   process.exit(res.ok ? 0 : 1)
 }

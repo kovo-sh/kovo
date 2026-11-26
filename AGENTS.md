@@ -26,11 +26,11 @@
 1. **Split before starting.** Enumerate the files a task touches and carve them into disjoint leases. If there are **two or more independent sets, launch two or more agents in separate worktrees immediately**. Serial execution is allowed only when edits share a file or a hard dependency exists — and the coordinator must state the reason.
 2. **One writer per file.** Use unique branches (`agents/<stream>`). Two streams must never edit the same file; if they must, split the file by section or serialize with an explicit handoff.
 3. **Checkpoint, don't run silent (enforced).** Every stream commits a WIP checkpoint within ~15 minutes or at each milestone. Commit code + typecheck + worker-gate first, then run long evals from committed code, posting a 3-line heartbeat every 15–20 minutes (SHA, step, partial metric). Any stream silent >25–30 minutes with a dirty tree is interrupted to checkpoint or split. A long-running stream with no commit is a process bug, not progress.
-4. **Merge as streams finish.** Do not batch merges behind the slowest stream; integrate each completed stream and re-run the smoke floor.
+4. **Merge as streams finish.** Do not batch merges behind the slowest stream; integrate each completed stream through `scripts/merge-stream.sh <branch>` and re-run the smoke floor.
 5. **Parallelize validation too.** Independent suites and benchmark legs (dev, held-out, agentic) run concurrently with isolated dirs. Use the smoke tier between tweaks; full matrices/gates only at batch boundaries.
 6. **Report the plan.** Before dispatching, state the parallel streams, their file leases, the merge order, and any serialization exception.
 7. **Feed the swarm from the backlog.** Keep `plans/STREAM-BACKLOG.md` current and maintain **≥3 active streams** whenever a `ready` task has a free lease. One stage per stream; split tasks touching >2 files or spanning >1 milestone. The pulse prints **UNDER-PARALLELIZED** when this is violated.
-8. **Merge clean branches within one pulse.** Any `clean + ahead` branch older than ~15 minutes is an **ACTION MERGE NOW**, not a later batch. Docs/tests/bench-only branches merge without waiting for the owner's report; code branches merge after `worker-gate.sh`.
+8. **Merge clean branches within one pulse via the merged-tree fast gate (<60s).** Any `clean + ahead` branch older than ~15 minutes is an **ACTION MERGE NOW**, not a later batch. Every branch — including docs/tests/bench-only branches — merges through `scripts/merge-stream.sh <branch>`, which merges onto a temporary worktree, runs the fast `<60s` `scripts/worker-gate.sh` on the merged tree (typecheck + `check-v8-contamination.ts` + `check-contract-change.ts` + `check-unwired.ts` + hermetic fast suites; never slow Playwright/Docker/dogfood suites), fast-forwards `main` only on PASS, and refuses merges while `${KOVO_GATE_STATE_DIR:-$HOME/.config/kovo}/main-red.lock` exists (clear via `--clear-red-lock` only after verifying green).
 9. **Interrupt dirty streams at 30 minutes.** A dirty tree with no commit for 30 minutes is an **ACTION CHECKPOINT/SPLIT**; park or split it rather than waiting.
 
 Read-only audits, compatibility analysis, docs, and verifier-only changes are usually parallelizable even when the main engine is busy — use them.
@@ -41,7 +41,7 @@ While a multi-stream batch is in flight:
 
 1. Run `scripts/parallel-pulse.sh`. It lists actionable streams (unmerged commits or dirty trees), mergeable (clean + ahead), in-progress, and the files each holds.
 2. Answer its five questions explicitly:
-   - clean + ahead → merge it, run `scripts/worker-gate.sh`, push;
+   - clean + ahead → run `scripts/merge-stream.sh <branch>` (gates the merged tree with fast `<60s` `scripts/worker-gate.sh` and fast-forwards `main` on PASS), then push;
    - P0 item unstarted on a free lease → launch that stream now;
    - P0 blocked only by a lease → park the holder and reclaim the file;
    - acceptance gate unmeasured → start the measurement;
@@ -53,7 +53,7 @@ While a multi-stream batch is in flight:
 
 1. **Freeze harness-only recall work.** `scripts/benchmark-probes.ts` and `scripts/benchmark-specs*.ts` are **maintenance-only** from v5.1 on (bugfixes, scoring, harness parity). New detection/verification capability must land in `src/server/` and be scored through real `Execution`. A PR that only lifts the standalone harness is not acceptance.
 2. **Report both product metrics.** Every capability claim states `Execution --no-llm` (deterministic floor) and `Execution` agentic (increment over that floor), on dev **and** salted held-out. Harness numbers are secondary evidence of engine capability, not the product score.
-3. **Mandatory pre-handoff gate.** A branch cannot be handed off until `scripts/worker-gate.sh` passes (typecheck + fast contract invariants + targeted slice). Discover breakage in minutes, not at release freeze.
+3. **Mandatory pre-handoff & merged-tree fast gate (<60s).** A branch cannot be handed off until `scripts/worker-gate.sh` passes (typecheck + fast contract/unwired/v8 ratchets + hermetic fast suites with quarantine/orphan enforcement; never slow Playwright/Docker/dogfood suites). Landing onto `main` MUST go through `scripts/merge-stream.sh <branch>` so the merged tree itself is gated.
 4. **Use the slice runner.** Iterate one app/class with `scripts/bench-slice.sh --app <app> --class <class>`; no ad-hoc diagnostic scripts once it exists.
 5. **Know which harness you are running.** `scripts/benchmark-realistic.ts` scores the **product** (`Execution`); `benchmarks/realistic-bench/benchmark-realistic.ts` (or `scripts/bench-slice.sh` / `scripts/benchmark-realistic-matrix.ts`) scores the **deterministic capability** harness. A 0/56 from the first is the known v5.0 product gap, not a regression.
 

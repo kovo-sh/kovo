@@ -43,7 +43,11 @@ run() { step "$1"; shift; if "$@"; then :; else echo "FAILED: $1" >&2; fail=1; f
 
 # 1. Fast static lints & structural wiring invariants (<1s total).
 run "v8 anti-contamination lint" node scripts/check-v8-contamination.ts
-run "contract-change trailer lint" node scripts/check-contract-change.ts
+if [[ -n "${KOVO_CONTRACT_BASE:-}" ]]; then
+  run "contract-change trailer lint" node scripts/check-contract-change.ts --base "$KOVO_CONTRACT_BASE"
+else
+  run "contract-change trailer lint" node scripts/check-contract-change.ts
+fi
 
 step "dispatch funnel wiring invariant"
 if grep -q 'evaluateDispatchStop(' src/server/execution.ts \
@@ -64,21 +68,24 @@ else
   fail=1
 fi
 
-# 2. Run typecheck (`npm run check`) in parallel with all non-quarantined fast behavioral suites
-#    (includes v7-dispatch-funnel, v7-confirm-consistency, v4-m7-orch, v5-m1, v5-m2,
-#    sys-contract-canary, cq-3-merge-gate, and all passing precision-kernel suites) plus
-#    QUARANTINE.json cap/expiry validation and recursive orphan-test enforcement.
+# 2. Run typecheck (`npm run check`), unwired-export ratchet (`check-unwired.ts`), and all
+#    non-quarantined fast behavioral suites in parallel (stays <60s; never runs Playwright/Docker/dogfood).
 GATE_LOG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/kovo-worker-gate-XXXXXX")"
 trap 'rm -rf "$GATE_LOG_DIR"' EXIT
 
 npm run check >"$GATE_LOG_DIR/tsc.log" 2>&1 &
 tsc_pid=$!
 
+node scripts/check-unwired.ts >"$GATE_LOG_DIR/unwired.log" 2>&1 &
+unwired_pid=$!
+
 bash scripts/run-fast-tests.sh --suites-only --quarantine tests/QUARANTINE.json >"$GATE_LOG_DIR/fast.log" 2>&1 &
 fast_pid=$!
 
 wait "$tsc_pid"
 tsc_rc=$?
+wait "$unwired_pid"
+unwired_rc=$?
 wait "$fast_pid"
 fast_rc=$?
 
@@ -89,6 +96,13 @@ if (( tsc_rc != 0 )); then
   fail=1
 else
   echo "PASS: typecheck"
+fi
+
+step "unwired-export / cycle / doc-citation ratchet"
+cat "$GATE_LOG_DIR/unwired.log"
+if (( unwired_rc != 0 )); then
+  echo "FAILED: unwired-export ratchet (node scripts/check-unwired.ts)" >&2
+  fail=1
 fi
 
 step "fast behavioral suites + quarantine/orphan gate"
