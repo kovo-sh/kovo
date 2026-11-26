@@ -179,7 +179,7 @@ test('synthesizeInvariants() white-box hypotheses directly seed ready Wave-1 cha
 
   const planner = internals(execution).reconPlanner
   const graph = extractProgramGraph({ files: SYNTH_MULTISERVICE_SOURCE, repo: 'synth-saas' })
-  const res = planner.seedCapabilityLedgerInvariants(run, {
+  const res = await planner.seedCapabilityLedgerInvariants(run, {
     mode: 'white-box',
     graph,
     sourceFiles: SYNTH_MULTISERVICE_SOURCE,
@@ -209,7 +209,7 @@ test('synthesizeInvariants() white-box hypotheses directly seed ready Wave-1 cha
   }
 
   // Idempotency: repeat synthesis does not duplicate ledger nodes or Wave-1 chain steps.
-  const repeat = planner.seedCapabilityLedgerInvariants(run, {
+  const repeat = await planner.seedCapabilityLedgerInvariants(run, {
     mode: 'white-box',
     graph,
     sourceFiles: SYNTH_MULTISERVICE_SOURCE,
@@ -245,7 +245,7 @@ test('synthesizeInvariants() grey-box runtime parity also promotes Wave-1 chain 
   t.after(() => execution.stop())
 
   const planner = internals(execution).reconPlanner
-  const res = planner.seedCapabilityLedgerInvariants(run, {
+  const res = await planner.seedCapabilityLedgerInvariants(run, {
     mode: 'grey-box',
     runtime: {
       personaObservations: [

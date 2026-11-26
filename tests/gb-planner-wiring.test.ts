@@ -357,7 +357,7 @@ test('ExecReconPlanner wires Phase-0 runtime catalogs + OpenAPI security + endpo
   const approvedOrigins = new Set([APP_ORIGIN, API_ORIGIN, IDP_ORIGIN])
 
   // Pre-floor synthesis (sets invariantsSeededRuns + wave1InvariantChainsPromoted)
-  const preFloor = planner.seedCapabilityLedgerInvariants(storage.run(runId), {
+  const preFloor = await planner.seedCapabilityLedgerInvariants(storage.run(runId), {
     approvedOrigins,
     promoteWave1Chains: true,
   })

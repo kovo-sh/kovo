@@ -195,29 +195,42 @@ interface DelimiterIndex {
   braceOpens: number[]
   braceClose: Map<number, number>
   parenClose: Map<number, number>
+  bracketClose: Map<number, number>
 }
 
-/** Single-pass O(n) delimiter matcher for `{}` and `()`, skipping strings and comments. */
-function buildDelimiterIndex(text: string): DelimiterIndex {
+/** Single-pass O(n) delimiter matcher for `{}`, `()`, and `[]`, skipping strings and comments. */
+function buildDelimiterIndex(
+  text: string,
+  options: { hashComments?: boolean; cComments?: boolean } = {},
+): DelimiterIndex {
   const braceOpens: number[] = []
   const braceClose = new Map<number, number>()
   const parenClose = new Map<number, number>()
+  const bracketClose = new Map<number, number>()
   const braceStack: number[] = []
   const parenStack: number[] = []
+  const bracketStack: number[] = []
+  const cComments = options.cComments !== false
+  const hashComments = options.hashComments === true
   for (let i = 0; i < text.length; i += 1) {
     const ch = text[i]
-    if (ch === '"' || ch === "'" || ch === '`') {
+    if (ch === '"' || ch === "'" || (ch === '`' && !hashComments)) {
       i = skipQuoted(text, i) - 1
       continue
     }
-    if (ch === '/' && text[i + 1] === '/') {
+    if (cComments && ch === '/' && text[i + 1] === '/') {
       const nl = text.indexOf('\n', i)
       i = nl < 0 ? text.length : nl
       continue
     }
-    if (ch === '/' && text[i + 1] === '*') {
+    if (cComments && ch === '/' && text[i + 1] === '*') {
       const end = text.indexOf('*/', i + 2)
       i = end < 0 ? text.length : end + 1
+      continue
+    }
+    if (hashComments && ch === '#') {
+      const nl = text.indexOf('\n', i)
+      i = nl < 0 ? text.length : nl
       continue
     }
     if (ch === '{') {
@@ -231,9 +244,14 @@ function buildDelimiterIndex(text: string): DelimiterIndex {
     } else if (ch === ')') {
       const open = parenStack.pop()
       if (open !== undefined) parenClose.set(open, i)
+    } else if (ch === '[') {
+      bracketStack.push(i)
+    } else if (ch === ']') {
+      const open = bracketStack.pop()
+      if (open !== undefined) bracketClose.set(open, i)
     }
   }
-  return { braceOpens, braceClose, parenClose }
+  return { braceOpens, braceClose, parenClose, bracketClose }
 }
 
 /** First `{` index at or after `fromIndex` in O(log n). */
@@ -248,10 +266,11 @@ function nextBraceOpen(braceOpens: readonly number[], fromIndex: number): number
   return lo < braceOpens.length ? braceOpens[lo] : -1
 }
 
-function skipQuoted(text: string, start: number): number {
+function skipQuoted(text: string, start: number, limit = text.length): number {
   const quote = text[start]
+  const end = Math.min(limit, text.length)
   let i = start + 1
-  while (i < text.length) {
+  while (i < end) {
     if (text[i] === '\\') {
       i += 2
       continue
@@ -259,38 +278,57 @@ function skipQuoted(text: string, start: number): number {
     if (text[i] === quote) return i + 1
     i += 1
   }
-  return i
+  return end
 }
 
-/** Find the matching close delimiter, skipping strings and comments. */
+/**
+ * Find the matching close delimiter, skipping strings and comments.
+ * Uses O(1) lookup when a precomputed `DelimiterIndex` is provided, and caps fallback lookahead
+ * at `maxScan` (default `MAX_FIND_MATCHING_SCAN_BYTES` = 4 KiB) so unclosed openers never cause
+ * O(matches × fileSize) EOF scans (`R3-H-12`).
+ */
 function findMatching(
   text: string,
   openIndex: number,
-  options: { open?: string; close?: string; hashComments?: boolean; comments?: boolean } = {},
+  options: {
+    open?: string
+    close?: string
+    hashComments?: boolean
+    comments?: boolean
+    maxScan?: number
+    delimiters?: DelimiterIndex
+  } = {},
 ): number {
   const open = options.open ?? '{'
   const close = options.close ?? '}'
+  if (options.delimiters) {
+    if (open === '(' && close === ')') return options.delimiters.parenClose.get(openIndex) ?? -1
+    if (open === '{' && close === '}') return options.delimiters.braceClose.get(openIndex) ?? -1
+    if (open === '[' && close === ']') return options.delimiters.bracketClose.get(openIndex) ?? -1
+  }
   const comments = options.comments !== false
+  const maxScan = Math.max(1, options.maxScan ?? MAX_FIND_MATCHING_SCAN_BYTES)
+  const scanEnd = Math.min(text.length, openIndex + maxScan)
   let depth = 0
-  for (let i = openIndex; i < text.length; i += 1) {
+  for (let i = openIndex; i < scanEnd; i += 1) {
     const ch = text[i]
     if (ch === '"' || ch === "'" || ch === '`') {
-      i = skipQuoted(text, i) - 1
+      i = skipQuoted(text, i, scanEnd) - 1
       continue
     }
     if (comments && ch === '/' && text[i + 1] === '/') {
       const nl = text.indexOf('\n', i)
-      i = nl < 0 ? text.length : nl
+      i = nl < 0 || nl >= scanEnd ? scanEnd : nl
       continue
     }
     if (comments && ch === '/' && text[i + 1] === '*') {
       const end = text.indexOf('*/', i + 2)
-      i = end < 0 ? text.length : end + 1
+      i = end < 0 || end + 1 >= scanEnd ? scanEnd : end + 1
       continue
     }
     if (options.hashComments && ch === '#') {
       const nl = text.indexOf('\n', i)
-      i = nl < 0 ? text.length : nl
+      i = nl < 0 || nl >= scanEnd ? scanEnd : nl
       continue
     }
     if (ch === open) depth += 1
@@ -302,15 +340,16 @@ function findMatching(
   return -1
 }
 
-/** Split a comma-separated argument list at top-level depth. */
+/** Split a comma-separated argument list at top-level depth (bounded args & quote window). */
 function splitTopLevel(text: string, start: number, end: number, separator = ','): string[] {
   const out: string[] = []
+  const clampedEnd = Math.min(end, text.length)
   let depth = 0
   let last = start
-  for (let i = start; i < end; i += 1) {
+  for (let i = start; i < clampedEnd; i += 1) {
     const ch = text[i]
     if (ch === '"' || ch === "'" || ch === '`') {
-      i = skipQuoted(text, i) - 1
+      i = skipQuoted(text, i, clampedEnd) - 1
       continue
     }
     if (ch === '(' || ch === '[' || ch === '{') depth += 1
@@ -318,16 +357,38 @@ function splitTopLevel(text: string, start: number, end: number, separator = ','
     else if (ch === separator && depth === 0) {
       out.push(text.slice(last, i).trim())
       last = i + 1
+      if (out.length >= MAX_CALL_ARGS) return out
     }
   }
-  const tail = text.slice(last, end).trim()
-  if (tail) out.push(tail)
+  if (out.length < MAX_CALL_ARGS) {
+    const tail = text.slice(last, clampedEnd).trim()
+    if (tail) out.push(tail)
+  }
   return out
 }
 
-function argsAtCall(text: string, openParenIndex: number): { args: string[]; closeIndex: number } {
-  const close = findMatching(text, openParenIndex, { open: '(', close: ')' })
-  if (close < 0) return { args: [], closeIndex: close }
+function argsAtCall(
+  text: string,
+  openParenIndex: number,
+  options: {
+    delimiters?: DelimiterIndex
+    maxSpan?: number
+    consumeScanBytes?: (bytes: number) => boolean
+  } = {},
+): { args: string[]; closeIndex: number } {
+  const maxSpan = Math.max(64, options.maxSpan ?? MAX_CALL_ARGS_SCAN_BYTES)
+  const close = findMatching(text, openParenIndex, {
+    open: '(',
+    close: ')',
+    delimiters: options.delimiters,
+    maxScan: maxSpan,
+  })
+  if (close < 0) return { args: [], closeIndex: -1 }
+  const span = close - openParenIndex
+  if (span > maxSpan) return { args: [], closeIndex: close }
+  if (options.consumeScanBytes && !options.consumeScanBytes(span)) {
+    return { args: [], closeIndex: close }
+  }
   return { args: splitTopLevel(text, openParenIndex + 1, close), closeIndex: close }
 }
 
@@ -373,6 +434,11 @@ const MAX_MOUNT_PATH_LENGTH = 2048
 const MAX_MOUNTED_ROUTES = 5000
 const MAX_CROSS_SERVICE_EDGES = 2000
 const MAX_RAW_ROUTES_PER_FILE = 1000
+const MAX_ROUTE_MATCH_ATTEMPTS_PER_FILE = MAX_RAW_ROUTES_PER_FILE * 4
+const MAX_FIND_MATCHING_SCAN_BYTES = 4096
+const MAX_CALL_ARGS_SCAN_BYTES = 4096
+const MAX_CALL_ARG_SCAN_BYTES_PER_FILE = 256 * 1024
+const MAX_CALL_ARGS = 128
 const MAX_RAW_ROUTE_BYTES_PER_FILE = 512 * 1024
 const MAX_MOUNTS_PER_FILE = 500
 const MAX_FUNCTIONS_PER_FILE = 1000
@@ -382,6 +448,12 @@ const MAX_MIDDLEWARE_PER_ROUTE = 64
 const MAX_MIDDLEWARE_TOKEN_LENGTH = 128
 const MAX_SCAN_LINE_LENGTH = 4096
 const MAX_RAILS_LINES = 20_000
+const MAX_COMPOSE_LINES = 8_000
+const MAX_COMPOSE_SERVICES = 256
+const MAX_COMPOSE_HOSTS_PER_SERVICE = 32
+const MAX_COMPOSE_PREFIXES_PER_SERVICE = 32
+const MAX_COMPOSE_PORTS_PER_SERVICE = 32
+const MAX_INGRESS_RULES = 512
 const MAX_FILE_WARNINGS = 64
 const MAX_TOTAL_WARNINGS = 200
 const EMPTY_STRINGS: string[] = []
@@ -730,11 +802,16 @@ function scanJavaMethodHeaders(
   return matches
 }
 
-function extractJsFunctions(file: string, content: string): ProgramFunction[] {
+function extractJsFunctions(
+  file: string,
+  content: string,
+  sharedDelimiters?: DelimiterIndex,
+  sharedNewlineOffsets?: readonly number[],
+): ProgramFunction[] {
   const out: ProgramFunction[] = []
   const seen = new Set<number>()
-  const newlineOffsets = buildNewlineOffsets(content)
-  const { braceOpens, braceClose, parenClose } = buildDelimiterIndex(content)
+  const newlineOffsets = sharedNewlineOffsets ?? buildNewlineOffsets(content)
+  const { braceOpens, braceClose, parenClose } = sharedDelimiters ?? buildDelimiterIndex(content)
 
   const push = (name: string | undefined, startIndex: number, bodyOpen: number, bodyClose: number) => {
     if (out.length >= MAX_FUNCTIONS_PER_FILE || !name || bodyOpen < 0 || bodyClose < 0 || seen.has(startIndex)) return
@@ -921,10 +998,16 @@ function extractPythonFunctions(file: string, content: string): ProgramFunction[
   return out
 }
 
-function extractBraceFunctions(file: string, content: string, language: 'java' | 'go'): ProgramFunction[] {
+function extractBraceFunctions(
+  file: string,
+  content: string,
+  language: 'java' | 'go',
+  sharedDelimiters?: DelimiterIndex,
+  sharedNewlineOffsets?: readonly number[],
+): ProgramFunction[] {
   const out: ProgramFunction[] = []
-  const newlineOffsets = buildNewlineOffsets(content)
-  const { braceOpens, braceClose, parenClose } = buildDelimiterIndex(content)
+  const newlineOffsets = sharedNewlineOffsets ?? buildNewlineOffsets(content)
+  const { braceOpens, braceClose, parenClose } = sharedDelimiters ?? buildDelimiterIndex(content)
 
   const emit = (name: string, startIndex: number, openParen: number) => {
     if (out.length >= MAX_FUNCTIONS_PER_FILE || !name || CALL_KEYWORDS.has(name)) return
@@ -998,12 +1081,17 @@ function languageOfFile(file: string): 'js' | 'python' | 'java' | 'go' | 'ruby' 
   return 'unknown'
 }
 
-function extractFunctions(file: string, content: string): ProgramFunction[] {
+function extractFunctions(
+  file: string,
+  content: string,
+  sharedDelimiters?: DelimiterIndex,
+  sharedNewlineOffsets?: readonly number[],
+): ProgramFunction[] {
   switch (languageOfFile(file)) {
-    case 'js': return extractJsFunctions(file, content)
+    case 'js': return extractJsFunctions(file, content, sharedDelimiters, sharedNewlineOffsets)
     case 'python': return extractPythonFunctions(file, content)
-    case 'java': return extractBraceFunctions(file, content, 'java')
-    case 'go': return extractBraceFunctions(file, content, 'go')
+    case 'java': return extractBraceFunctions(file, content, 'java', sharedDelimiters, sharedNewlineOffsets)
+    case 'go': return extractBraceFunctions(file, content, 'go', sharedDelimiters, sharedNewlineOffsets)
     case 'ruby': return extractRubyFunctions(file, content)
     default: return []
   }
@@ -1060,11 +1148,18 @@ interface Extraction {
 
 interface FileExtractCtx {
   file: string
+  delimiters: DelimiterIndex
   lineAt: (index: number) => number
   addWarning: (msg: string) => void
   addRoute: (route: RawRoute) => boolean
   addMount: (mount: MountSpec) => boolean
   routesRemaining: () => boolean
+  /** Charge every call-site match attempt (including failed/unclosed openers) against the per-file budget. */
+  consumeMatchAttempt: () => boolean
+  /** O(1)-indexed, scan-budgeted call argument extractor for the current file. */
+  argsAtCall: (openParenIndex: number, maxSpan?: number) => { args: string[]; closeIndex: number }
+  /** O(1) brace-close lookup from the precomputed file delimiter index. */
+  findBraceClose: (openBraceIndex: number) => number
 }
 
 const EXPRESS_METHOD_RE = /(?<![\w$])([A-Za-z_$][\w$]{0,127})[ \t\r\n]{0,16}\.[ \t\r\n]{0,16}(get|post|put|patch|delete|options|head|all|route)[ \t\r\n]{0,16}\(/g
@@ -1113,8 +1208,9 @@ function extractExpressLike(file: string, content: string, out: Extraction, ctx:
   for (const match of content.matchAll(/(?<![\w$])([A-Za-z_$][\w$]{0,127})[ \t\r\n]{0,16}\.[ \t\r\n]{0,16}use[ \t\r\n]{0,16}\(/g)) {
     const parent = routers.get(match[1])
     if (!parent) continue
-    const open = content.indexOf('(', match.index)
-    const { args } = argsAtCall(content, open)
+    if (!ctx.consumeMatchAttempt()) break
+    const open = match.index + match[0].length - 1
+    const { args } = ctx.argsAtCall(open, MAX_CALL_ARGS_SCAN_BYTES)
     if (!args.length) continue
     const childToken = args[args.length - 1]?.trim() ?? ''
     const childName = /^([A-Za-z_$][\w$]{0,127})$/.exec(childToken)?.[1]
@@ -1167,8 +1263,9 @@ function extractExpressLike(file: string, content: string, out: Extraction, ctx:
     if (!ctx.routesRemaining()) break
     const parent = routers.get(match[1])
     if (!parent) continue
-    const open = content.indexOf('{', match.index)
-    const close = findMatching(content, open)
+    if (!ctx.consumeMatchAttempt()) break
+    const open = match.index + match[0].length - 1
+    const close = ctx.findBraceClose(open)
     if (close < 0 || close - open > 16_384) continue
     const object = content.slice(open, close + 1)
     const url = /(?<![\w$])url[ \t]{0,16}:[ \t]{0,16}(['"`])([^'"`\r\n]{1,512})\1/.exec(object)?.[2]
@@ -1203,8 +1300,9 @@ function extractExpressLike(file: string, content: string, out: Extraction, ctx:
     if (!parent) continue
     const method = match[2].toLowerCase()
     if (method === 'route') continue
-    const open = content.indexOf('(', match.index)
-    const { args } = argsAtCall(content, open)
+    if (!ctx.consumeMatchAttempt()) break
+    const open = match.index + match[0].length - 1
+    const { args } = ctx.argsAtCall(open, MAX_FUNCTION_BODY_SCAN_BYTES)
     if (!args.length) continue
     const routePaths = stringListValue(args[0])
     const routeLine = ctx.lineAt(match.index)
@@ -1256,6 +1354,7 @@ function extractExpressLike(file: string, content: string, out: Extraction, ctx:
     if (!ctx.routesRemaining()) break
     const parent = routers.get(match[1])
     if (!parent) continue
+    if (!ctx.consumeMatchAttempt()) break
     const basePath = match[3]
     const routeLine = ctx.lineAt(match.index)
     let pos = match.index + match[0].length
@@ -1267,8 +1366,9 @@ function extractExpressLike(file: string, content: string, out: Extraction, ctx:
       if (!chain) break
       const chainMethod = chain[1].toLowerCase()
       if (!EXPRESS_METHODS.has(chainMethod) && chainMethod !== 'route') break
+      if (!ctx.consumeMatchAttempt()) break
       const chainOpen = pos + chain[0].length - 1
-      const { args, closeIndex } = argsAtCall(content, chainOpen)
+      const { args, closeIndex } = ctx.argsAtCall(chainOpen, MAX_FUNCTION_BODY_SCAN_BYTES)
       if (closeIndex < 0) break
       if (chainMethod !== 'route' && args.length) {
         const middleware = args.length > 1 ? flattenMiddlewareTokens(args.slice(0, -1), MAX_MIDDLEWARE_PER_ROUTE) : EMPTY_STRINGS
@@ -1290,15 +1390,15 @@ function extractExpressLike(file: string, content: string, out: Extraction, ctx:
 }
 
 function extractNest(file: string, content: string, out: Extraction, ctx: FileExtractCtx): boolean {
-  const controllerMatches = [...content.matchAll(/@Controller[ \t]{0,16}\(([^)]{0,512})\)/g)]
-  if (!controllerMatches.length) return false
-  for (const match of controllerMatches) {
-    if (!ctx.routesRemaining()) break
+  let matchedAnyController = false
+  for (const match of content.matchAll(/@Controller[ \t]{0,16}\(([^)]{0,512})\)/g)) {
+    matchedAnyController = true
+    if (!ctx.routesRemaining() || !ctx.consumeMatchAttempt()) break
     const classIndex = content.indexOf('class', match.index + match[0].length)
-    if (classIndex < 0) continue
-    const bodyOpen = content.indexOf('{', classIndex)
-    if (bodyOpen < 0) continue
-    const bodyClose = findMatching(content, bodyOpen)
+    if (classIndex < 0) break
+    const bodyOpen = nextBraceOpen(ctx.delimiters.braceOpens, classIndex)
+    if (bodyOpen < 0) break
+    const bodyClose = ctx.findBraceClose(bodyOpen)
     if (bodyClose < 0) continue
     const classPrefix = stringListValue(splitTopLevel(match[1], 0, match[1].length)[0])[0] ?? ''
     const header = content.slice(match.index, Math.min(classIndex, match.index + 2048))
@@ -1306,7 +1406,7 @@ function extractNest(file: string, content: string, out: Extraction, ctx: FileEx
     const body = content.slice(bodyOpen + 1, bodyClose)
 
     for (const routeMatch of body.matchAll(/@(Get|Post|Put|Patch|Delete|Options|Head|All)[ \t]{0,16}\(([^)]{0,512})\)/g)) {
-      if (!ctx.routesRemaining()) break
+      if (!ctx.routesRemaining() || !ctx.consumeMatchAttempt()) break
       const decoratorStart = bodyOpen + 1 + routeMatch.index
       const routeArgs = splitTopLevel(routeMatch[2], 0, routeMatch[2].length)
       const routePath = stringListValue(routeArgs[0])[0] ?? ''
@@ -1320,7 +1420,7 @@ function extractNest(file: string, content: string, out: Extraction, ctx: FileEx
         if (['if', 'for', 'while', 'switch', 'catch'].includes(hm[1])) continue
         handler = hm[1]
         const signatureOpen = decoratorStart + (hm.index ?? 0) + hm[0].length - 1
-        handlerSignature = argsAtCall(content, signatureOpen).args.join(', ')
+        handlerSignature = ctx.argsAtCall(signatureOpen, MAX_CALL_ARGS_SCAN_BYTES).args.join(', ')
         handlerLine = ctx.lineAt(decoratorStart + (hm.index ?? 0))
         methodDecorators = decoratorRegion.slice(0, hm.index)
         break
@@ -1342,7 +1442,7 @@ function extractNest(file: string, content: string, out: Extraction, ctx: FileEx
       })) break
     }
   }
-  return true
+  return matchedAnyController
 }
 
 const DECORATOR_GUARD_NAMES = new Set([
@@ -1366,7 +1466,7 @@ function decoratorGuards(text: string): string[] {
     let p = nameEnd
     while (p < len && (text.charCodeAt(p) === 32 || text.charCodeAt(p) === 9)) p += 1
     if (p >= len || text.charCodeAt(p) !== 40) continue
-    const close = findMatching(text, p, { open: '(', close: ')' })
+    const close = findMatching(text, p, { open: '(', close: ')', maxScan: 512 })
     if (close < 0 || close - p > 512) {
       pos = p + 1
       continue
@@ -1438,8 +1538,9 @@ function extractPythonRoutes(file: string, content: string, out: Extraction, ctx
 
   if (hasFastApi) {
     for (const match of content.matchAll(/(?<![\w$])([A-Za-z_]\w{0,63})[ \t]{0,16}=[ \t]{0,16}(?:fastapi[ \t]{0,8}\.[ \t]{0,8})?(?:FastAPI|APIRouter)[ \t]{0,16}\(/g)) {
-      const open = content.indexOf('(', match.index)
-      const { args } = argsAtCall(content, open)
+      if (!ctx.consumeMatchAttempt()) break
+      const open = match.index + match[0].length - 1
+      const { args } = ctx.argsAtCall(open, MAX_CALL_ARGS_SCAN_BYTES)
       const prefix = args.map(a => /prefix[ \t]{0,8}=[ \t]{0,8}(['"])([^'"\r\n]{0,256})\1/.exec(a)?.[2]).find(Boolean) ?? ''
       const deps = args.map(a => /dependencies[ \t]{0,8}=[ \t]{0,8}\[([^\]]{0,1024})\]/.exec(a)?.[1]).find(Boolean)
       const middleware = deps ? [...deps.matchAll(/Depends[ \t]{0,8}\([ \t]{0,8}([\w.]{1,64})/g)].map(m => `Depends(${m[1]})`).slice(0, MAX_MIDDLEWARE_PER_ROUTER) : []
@@ -1449,8 +1550,9 @@ function extractPythonRoutes(file: string, content: string, out: Extraction, ctx
       if (!ctx.routesRemaining()) break
       const router = routerVars.get(match[1])
       if (!router) continue
-      const open = content.indexOf('(', match.index)
-      const { args } = argsAtCall(content, open)
+      if (!ctx.consumeMatchAttempt()) break
+      const open = match.index + match[0].length - 1
+      const { args } = ctx.argsAtCall(open, MAX_CALL_ARGS_SCAN_BYTES)
       const routePath = stringListValue(args[0])[0]
       if (routePath === undefined) continue
       const deps = args.map(a => /dependencies[ \t]{0,8}=[ \t]{0,8}\[([^\]]{0,1024})\]/.exec(a)?.[1]).find(Boolean)
@@ -1458,7 +1560,7 @@ function extractPythonRoutes(file: string, content: string, out: Extraction, ctx
       const afterStart = open
       const defMatch = /(?:async[ \t]{1,16})?def[ \t]{1,16}([A-Za-z_]\w{0,63})[ \t]{0,16}\(/.exec(content.slice(afterStart, afterStart + 1200))
       const defOpen = defMatch ? afterStart + (defMatch.index ?? 0) + defMatch[0].length - 1 : -1
-      const signature = defMatch && defOpen >= 0 ? argsAtCall(content, defOpen).args.join(', ') : ''
+      const signature = defMatch && defOpen >= 0 ? ctx.argsAtCall(defOpen, MAX_CALL_ARGS_SCAN_BYTES).args.join(', ') : ''
       if (!ctx.addRoute({
         framework: 'fastapi', method: match[2].toUpperCase(), path: routePath, file,
         line: ctx.lineAt(match.index), handler: defMatch?.[1] ?? 'anonymous',
@@ -1470,8 +1572,9 @@ function extractPythonRoutes(file: string, content: string, out: Extraction, ctx
       })) break
     }
     for (const match of content.matchAll(/(?<![\w$])include_router[ \t]{0,16}\(/g)) {
-      const open = content.indexOf('(', match.index)
-      const { args } = argsAtCall(content, open)
+      if (!ctx.consumeMatchAttempt()) break
+      const open = match.index + match[0].length - 1
+      const { args } = ctx.argsAtCall(open, MAX_CALL_ARGS_SCAN_BYTES)
       const childToken = args[0]?.trim() ?? ''
       const childName = childToken.split('.').pop() ?? childToken
       const prefix = args.map(a => /prefix[ \t]{0,8}=[ \t]{0,8}(['"])([^'"\r\n]{0,256})\1/.exec(a)?.[2]).find(Boolean) ?? ''
@@ -1488,8 +1591,9 @@ function extractPythonRoutes(file: string, content: string, out: Extraction, ctx
 
   if (hasFlask) {
     for (const match of content.matchAll(/(?<![\w$])([A-Za-z_]\w{0,63})[ \t]{0,16}=[ \t]{0,16}(?:flask[ \t]{0,8}\.[ \t]{0,8})?(?:Flask|Blueprint)[ \t]{0,16}\(/g)) {
-      const open = content.indexOf('(', match.index)
-      const { args } = argsAtCall(content, open)
+      if (!ctx.consumeMatchAttempt()) break
+      const open = match.index + match[0].length - 1
+      const { args } = ctx.argsAtCall(open, MAX_CALL_ARGS_SCAN_BYTES)
       const prefix = args.map(a => /url_prefix[ \t]{0,8}=[ \t]{0,8}(['"])([^'"\r\n]{0,256})\1/.exec(a)?.[2]).find(Boolean) ?? ''
       addRouter(match[1], prefix, [], 'flask')
     }
@@ -1497,15 +1601,16 @@ function extractPythonRoutes(file: string, content: string, out: Extraction, ctx
       if (!ctx.routesRemaining()) break
       const router = routerVars.get(match[1])
       if (!router) continue
-      const open = content.indexOf('(', match.index)
-      const { args } = argsAtCall(content, open)
+      if (!ctx.consumeMatchAttempt()) break
+      const open = match.index + match[0].length - 1
+      const { args } = ctx.argsAtCall(open, MAX_CALL_ARGS_SCAN_BYTES)
       const routePath = stringListValue(args[0])[0]
       if (routePath === undefined) continue
       const methodsArg = args.map(a => /methods[ \t]{0,8}=[ \t]{0,8}\[([^\]]{0,256})\]/.exec(a)?.[1]).find(Boolean)
       const methods = methodsArg ? stringListValue(`[${methodsArg}]`).map(m => m.toUpperCase()).slice(0, 12) : [match[2].toUpperCase()]
       const defMatch = /(?:async[ \t]{1,16})?def[ \t]{1,16}([A-Za-z_]\w{0,63})[ \t]{0,16}\(/.exec(content.slice(open, open + 800))
       const defOpen = defMatch ? open + (defMatch.index ?? 0) + defMatch[0].length - 1 : -1
-      const signature = defMatch && defOpen >= 0 ? argsAtCall(content, defOpen).args.join(', ') : ''
+      const signature = defMatch && defOpen >= 0 ? ctx.argsAtCall(defOpen, MAX_CALL_ARGS_SCAN_BYTES).args.join(', ') : ''
       const line = ctx.lineAt(match.index)
       for (const method of methods) {
         if (!ctx.addRoute({
@@ -1519,8 +1624,9 @@ function extractPythonRoutes(file: string, content: string, out: Extraction, ctx
       }
     }
     for (const match of content.matchAll(/(?<![\w$])register_blueprint[ \t]{0,16}\(/g)) {
-      const open = content.indexOf('(', match.index)
-      const { args } = argsAtCall(content, open)
+      if (!ctx.consumeMatchAttempt()) break
+      const open = match.index + match[0].length - 1
+      const { args } = ctx.argsAtCall(open, MAX_CALL_ARGS_SCAN_BYTES)
       const childName = (args[0] ?? '').trim().split('.').pop() ?? ''
       const prefix = args.map(a => /url_prefix[ \t]{0,8}=[ \t]{0,8}(['"])([^'"\r\n]{0,256})\1/.exec(a)?.[2]).find(Boolean) ?? ''
       const parent = [...routerVars.values()].find(r => r.name === 'app')
@@ -1575,9 +1681,9 @@ function extractDjango(file: string, content: string, out: Extraction, ctx: File
   }
 
   for (const match of content.matchAll(/(?<![\w$])(?:path|re_path)[ \t]{0,16}\(/g)) {
-    if (!ctx.routesRemaining()) break
-    const open = content.indexOf('(', match.index)
-    const { args } = argsAtCall(content, open)
+    if (!ctx.routesRemaining() || !ctx.consumeMatchAttempt()) break
+    const open = match.index + match[0].length - 1
+    const { args } = ctx.argsAtCall(open, MAX_CALL_ARGS_SCAN_BYTES)
     const routePath = stringLiteralValue(args[0])
     if (routePath === null) continue
     const viewToken = args[1] ?? ''
@@ -1607,7 +1713,7 @@ function extractDjango(file: string, content: string, out: Extraction, ctx: File
     })) break
   }
   for (const match of content.matchAll(/(?<![\w$])router[ \t]{0,16}\.[ \t]{0,16}register[ \t]{0,16}\([ \t]{0,16}(['"])([^'"\r\n]{1,256})\1/g)) {
-    if (!ctx.routesRemaining()) break
+    if (!ctx.routesRemaining() || !ctx.consumeMatchAttempt()) break
     const base = match[2].startsWith('/') ? match[2] : `/${match[2]}`
     const line = ctx.lineAt(match.index)
     const crud: Array<[string, string, string]> = [
@@ -1628,7 +1734,7 @@ function extractDjango(file: string, content: string, out: Extraction, ctx: File
 
 function extractSpring(file: string, content: string, out: Extraction, ctx: FileExtractCtx): boolean {
   if (!/@(?:RestController|Controller|RequestMapping|GetMapping|PostMapping)\b/.test(content)) return false
-  const { braceOpens, braceClose, parenClose } = buildDelimiterIndex(content)
+  const { braceOpens, braceClose, parenClose } = ctx.delimiters
 
   // Linear O(n) class scanner + bounded lookback for class-level annotations (no nested quantifier regex).
   for (const match of content.matchAll(/(?<![\w$])class[ \t]{1,16}([A-Za-z_]\w{0,63})\b/g)) {
@@ -1651,7 +1757,7 @@ function extractSpring(file: string, content: string, out: Extraction, ctx: File
     if (reqMapIdx >= 0) {
       const openRel = classDecorators.indexOf('(', reqMapIdx + 15)
       if (openRel >= 0 && openRel - (reqMapIdx + 15) <= 16) {
-        const closeRel = findMatching(classDecorators, openRel, { open: '(', close: ')' })
+        const closeRel = findMatching(classDecorators, openRel, { open: '(', close: ')', maxScan: 512 })
         if (closeRel > openRel && closeRel - openRel <= 512) {
           const classBase = classDecorators.slice(openRel + 1, closeRel)
           basePath = stringListValue(splitTopLevel(classBase, 0, classBase.length).find(a => !/method[ \t]{0,8}=/.test(a)) ?? '')[0] ?? ''
@@ -1668,7 +1774,7 @@ function extractSpring(file: string, content: string, out: Extraction, ctx: File
     mappingRe.lastIndex = bodyOpen + 1
     let routeMatch: RegExpExecArray | null
     while ((routeMatch = mappingRe.exec(content)) !== null && routeMatch.index < bodyClose) {
-      if (!ctx.routesRemaining()) break
+      if (!ctx.routesRemaining() || !ctx.consumeMatchAttempt()) break
       const decoratorStart = routeMatch.index
       const openParen = routeMatch.index + routeMatch[0].length - 1
       const closeParen = parenClose.get(openParen)
@@ -1691,7 +1797,7 @@ function extractSpring(file: string, content: string, out: Extraction, ctx: File
         const hm = javaHandlers[0]
         handler = hm.name
         const signatureOpen = decoratorStart + hm.openParen
-        signature = argsAtCall(content, signatureOpen).args.join(', ')
+        signature = ctx.argsAtCall(signatureOpen, MAX_CALL_ARGS_SCAN_BYTES).args.join(', ')
         methodDecorators = region.slice(0, hm.index)
       }
       const methodGuards = decoratorGuards(methodDecorators)
@@ -1728,9 +1834,9 @@ function extractGin(file: string, content: string, out: Extraction, ctx: FileExt
     events.push({ index: match.index, kind: 'group', name: match[1], path: match[4], args: [match[2]] })
   }
   for (const match of content.matchAll(/(?<![\w$])([A-Za-z_]\w{0,63})[ \t]{0,16}\.[ \t]{0,16}(GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD|Any)[ \t]{0,16}\([ \t]{0,16}(['"])([^'"\r\n]{0,512})\3[ \t]{0,16},/g)) {
-    if (events.length >= MAX_GIN_EVENTS) break
+    if (events.length >= MAX_GIN_EVENTS || !ctx.consumeMatchAttempt()) break
     const open = content.indexOf('(', match.index)
-    const { args } = argsAtCall(content, open)
+    const { args } = ctx.argsAtCall(open, MAX_CALL_ARGS_SCAN_BYTES)
     events.push({ index: match.index, kind: 'route', name: match[1], method: match[2], path: match[4], args })
   }
   events.sort((a, b) => a.index - b.index)
@@ -1795,7 +1901,7 @@ function extractGin(file: string, content: string, out: Extraction, ctx: FileExt
 function extractChi(file: string, content: string, out: Extraction, ctx: FileExtractCtx): boolean {
   if (!/chi\.(?:NewRouter|Router)/.test(content)) return false
   const prefixes = new Map<string, string>()
-  const { braceOpens, braceClose } = buildDelimiterIndex(content)
+  const { braceOpens, braceClose } = ctx.delimiters
   const chiEventRe = /(?<![\w$])([A-Za-z_]\w{0,63})[ \t]{0,16}\.[ \t]{0,16}(Route|Mount|Group|With|Get|Post|Put|Patch|Delete|Head|Options|Handle|Any)[ \t]{0,16}\(/g
   const chiWithChainRe = /[ \t\r\n]{0,32}\.[ \t\r\n]{0,16}(Get|Post|Put|Patch|Delete|Head|Options|Handle|Any)[ \t\r\n]{0,16}\(/y
 
@@ -1806,8 +1912,9 @@ function extractChi(file: string, content: string, out: Extraction, ctx: FileExt
       chiEventRe.lastIndex = cursor
       const event = chiEventRe.exec(content)
       if (!event || event.index >= end) break
+      if (!ctx.consumeMatchAttempt()) break
       const callIndex = event.index + event[0].length - 1
-      const { args, closeIndex } = argsAtCall(content, callIndex)
+      const { args, closeIndex } = ctx.argsAtCall(callIndex, MAX_CALL_ARGS_SCAN_BYTES)
       if (closeIndex < 0 || closeIndex > end) break
       const verb = event[2]
       if (verb === 'Route' || verb === 'Mount' || verb === 'Group') {
@@ -1842,8 +1949,9 @@ function extractChi(file: string, content: string, out: Extraction, ctx: FileExt
           chiWithChainRe.lastIndex = pos
           const chain = chiWithChainRe.exec(content)
           if (!chain || chain.index >= end) break
+          if (!ctx.consumeMatchAttempt()) break
           const chainOpen = pos + chain[0].length - 1
-          const chainArgs = argsAtCall(content, chainOpen)
+          const chainArgs = ctx.argsAtCall(chainOpen, MAX_CALL_ARGS_SCAN_BYTES)
           if (chainArgs.closeIndex < 0 || chainArgs.closeIndex > end) break
           const routePath = stringListValue(chainArgs.args[0])[0]
           if (routePath !== undefined) {
@@ -2083,21 +2191,62 @@ function extractFile(file: string, content: string, remainingRouteBudget = MAX_R
   const lang = languageOfFile(file)
   const normalized = file.replaceAll('\\', '/')
   const newlineOffsets = buildNewlineOffsets(content)
+  const delimiters: DelimiterIndex = lang === 'js' || lang === 'python' || lang === 'java' || lang === 'go'
+    ? buildDelimiterIndex(content, { hashComments: lang === 'python', cComments: lang !== 'python' })
+    : { braceOpens: [], braceClose: new Map(), parenClose: new Map(), bracketClose: new Map() }
   const routeLimit = Math.max(0, Math.min(MAX_RAW_ROUTES_PER_FILE, remainingRouteBudget))
   let rawRouteBytes = 0
+  let matchAttempts = 0
+  let argScanBytes = 0
   let routeBudgetExhausted = routeLimit <= 0
+  let matchBudgetWarned = false
+  let argScanBudgetWarned = false
   let routeCapWarned = false
   let byteCapWarned = false
   let pathCapWarned = false
   let mountCapWarned = false
 
+  const consumeArgScanBytes = (bytes: number): boolean => {
+    argScanBytes += Math.max(1, bytes)
+    if (argScanBytes > MAX_CALL_ARG_SCAN_BYTES_PER_FILE) {
+      if (!argScanBudgetWarned) {
+        if (out.warnings.length < MAX_FILE_WARNINGS) {
+          out.warnings.push(`Call argument scan budget (${MAX_CALL_ARG_SCAN_BYTES_PER_FILE} bytes) exceeded in ${file}`)
+        }
+        argScanBudgetWarned = true
+      }
+      return false
+    }
+    return true
+  }
+
   const ctx: FileExtractCtx = {
     file,
+    delimiters,
     lineAt: (index: number) => lineAtFromOffsets(newlineOffsets, index, content.length),
     addWarning: (msg: string) => {
       if (out.warnings.length < MAX_FILE_WARNINGS) out.warnings.push(msg)
     },
     routesRemaining: () => !routeBudgetExhausted,
+    consumeMatchAttempt: () => {
+      matchAttempts += 1
+      if (matchAttempts > MAX_ROUTE_MATCH_ATTEMPTS_PER_FILE) {
+        routeBudgetExhausted = true
+        if (!matchBudgetWarned) {
+          ctx.addWarning(`Route match attempt budget capped at ${MAX_ROUTE_MATCH_ATTEMPTS_PER_FILE} in ${file}`)
+          matchBudgetWarned = true
+        }
+        return false
+      }
+      return true
+    },
+    argsAtCall: (openParenIndex: number, maxSpan = MAX_CALL_ARGS_SCAN_BYTES) =>
+      argsAtCall(content, openParenIndex, {
+        delimiters,
+        maxSpan,
+        consumeScanBytes: consumeArgScanBytes,
+      }),
+    findBraceClose: (openBraceIndex: number) => delimiters.braceClose.get(openBraceIndex) ?? -1,
     addRoute: (route: RawRoute) => {
       if (routeBudgetExhausted) return false
       if (out.routes.length >= routeLimit) {
@@ -2142,7 +2291,7 @@ function extractFile(file: string, content: string, remainingRouteBudget = MAX_R
     },
   }
 
-  out.functions = extractFunctions(file, content)
+  out.functions = extractFunctions(file, content, delimiters, newlineOffsets)
 
   if (lang === 'js') {
     if (extractNext(normalized, content, out, ctx)) return out
@@ -4374,6 +4523,51 @@ function joinRelativeDir(baseDir: string, rel: string): string {
   return parts.join('/')
 }
 
+const TRAEFIK_HOST_OPEN_RE = /\bHost[ \t]{0,8}\(/g
+const TRAEFIK_PATH_PREFIX_OPEN_RE = /\bPathPrefix[ \t]{0,8}\(/g
+const MAX_TRAEFIK_RULE_SPAN = 512
+const MAX_TRAEFIK_MATCHES_PER_LINE = 16
+const MAX_TRAEFIK_HOST_LENGTH = 253
+const MAX_TRAEFIK_PREFIX_LENGTH = 256
+
+/**
+ * Strictly linear, bounded Traefik rule extractor for `Host(...)` and `PathPrefix(...)`.
+ * Avoids backtracking and unbounded captures on adversarial compose labels (`R3-H-12`).
+ */
+function extractTraefikRuleArgs(
+  line: string,
+  openRe: RegExp,
+  mode: 'host' | 'pathPrefix',
+  out: string[],
+  maxOut: number,
+): void {
+  if (out.length >= maxOut) return
+  openRe.lastIndex = 0
+  let match: RegExpExecArray | null
+  let attempts = 0
+  while ((match = openRe.exec(line)) !== null) {
+    if (out.length >= maxOut || attempts >= MAX_TRAEFIK_MATCHES_PER_LINE) break
+    attempts += 1
+    const open = match.index + match[0].length - 1
+    const windowSlice = line.slice(open + 1, Math.min(line.length, open + 1 + MAX_TRAEFIK_RULE_SPAN))
+    const relClose = windowSlice.indexOf(')')
+    if (relClose < 0) continue
+    const inner = windowSlice.slice(0, relClose)
+    for (const part of inner.split(',')) {
+      if (out.length >= maxOut) break
+      const cleaned = part.trim().replace(/^[`'"]+|[`'"]+$/g, '').trim()
+      if (!cleaned) continue
+      if (mode === 'host') {
+        if (cleaned.length > MAX_TRAEFIK_HOST_LENGTH || /[\s`'")(]/.test(cleaned)) continue
+      } else {
+        if (cleaned.length > MAX_TRAEFIK_PREFIX_LENGTH || /[\s`'")(]/.test(cleaned)) continue
+      }
+      if (!out.includes(cleaned)) out.push(cleaned)
+    }
+    openRe.lastIndex = open + 1 + relClose + 1
+  }
+}
+
 function parseComposeServicesFromFiles(
   files: ReadonlyArray<{ path: string; content: string }>,
 ): ParsedComposeService[] {
@@ -4381,6 +4575,7 @@ function parseComposeServicesFromFiles(
   for (const file of files) {
     const dirPrefix = dirOfRelativePath(file.path)
     const lines = file.content.split('\n')
+    const lineCount = Math.min(lines.length, MAX_COMPOSE_LINES)
     let inServices = false
     let servicesIndent = -1
     let current: ParsedComposeService | null = null
@@ -4389,8 +4584,10 @@ function parseComposeServicesFromFiles(
     let portsIndent = -1
     let inBuild = false
     let buildIndent = -1
-    for (const raw of lines) {
-      if (/^\s*services\s*:/.test(raw)) {
+    for (let li = 0; li < lineCount; li += 1) {
+      const rawLine = lines[li]
+      const raw = rawLine.length > MAX_SCAN_LINE_LENGTH ? rawLine.slice(0, MAX_SCAN_LINE_LENGTH) : rawLine
+      if (/^[ \t]{0,64}services[ \t]{0,16}:/.test(raw)) {
         inServices = true
         servicesIndent = raw.length - raw.trimStart().length
         current = null
@@ -4400,19 +4597,23 @@ function parseComposeServicesFromFiles(
       }
       if (!inServices) continue
       const indent = raw.length - raw.trimStart().length
-      if (raw.trim() && !raw.trim().startsWith('#') && indent <= servicesIndent && !/^\s*services\s*:/.test(raw)) {
+      if (raw.trim() && !raw.trim().startsWith('#') && indent <= servicesIndent && !/^[ \t]{0,64}services[ \t]{0,16}:/.test(raw)) {
         inServices = false
         current = null
         inPorts = false
         inBuild = false
         continue
       }
-      const serviceMatch = /^(\s+)([A-Za-z0-9_.-]+)\s*:\s*$/.exec(raw)
+      const serviceMatch = /^([ \t]{1,64})([A-Za-z0-9_.-]{1,128})[ \t]{0,16}:[ \t]{0,16}$/.exec(raw)
       if (serviceMatch && indent <= servicesIndent + 2) {
         const svcName = serviceMatch[2]
         const key = `${dirPrefix}\0${svcName.toLowerCase()}`
         let entry = byKey.get(key)
         if (!entry) {
+          if (byKey.size >= MAX_COMPOSE_SERVICES) {
+            current = null
+            continue
+          }
           entry = {
             name: svcName,
             hosts: [],
@@ -4438,11 +4639,11 @@ function parseComposeServicesFromFiles(
         inBuild = false
         continue
       }
-      if (/^\s*build\s*:/.test(raw)) {
-        const inlineBuild = /^\s*build\s*:\s*['"]?([^\s'"#]+)['"]?\s*$/.exec(raw)?.[1]
+      if (/^[ \t]{0,64}build[ \t]{0,16}:/.test(raw)) {
+        const inlineBuild = /^[ \t]{0,64}build[ \t]{0,16}:[ \t]{0,16}['"]?([^\s'"#]{1,256})['"]?[ \t]{0,16}$/.exec(raw)?.[1]
         if (inlineBuild) {
           const resolved = joinRelativeDir(dirPrefix, inlineBuild)
-          if (resolved && !current.rootHints.includes(resolved)) current.rootHints.push(resolved)
+          if (resolved && !current.rootHints.includes(resolved) && current.rootHints.length < 16) current.rootHints.push(resolved)
           inBuild = false
         } else {
           inBuild = true
@@ -4454,21 +4655,22 @@ function parseComposeServicesFromFiles(
         inBuild = false
       }
       if (inBuild) {
-        const ctxMatch = /^\s*context\s*:\s*['"]?([^\s'"#]+)['"]?/.exec(raw)?.[1]
+        const ctxMatch = /^[ \t]{0,64}context[ \t]{0,16}:[ \t]{0,16}['"]?([^\s'"#]{1,256})['"]?/.exec(raw)?.[1]
         if (ctxMatch) {
           const resolved = joinRelativeDir(dirPrefix, ctxMatch)
-          if (resolved && !current.rootHints.includes(resolved)) current.rootHints.push(resolved)
+          if (resolved && !current.rootHints.includes(resolved) && current.rootHints.length < 16) current.rootHints.push(resolved)
         }
       }
-      if (/^\s*ports\s*:/.test(raw)) {
+      if (/^[ \t]{0,64}ports[ \t]{0,16}:/.test(raw)) {
         inPorts = true
         portsIndent = indent
-        const inline = /ports\s*:\s*\[([^\]]*)\]/.exec(raw)?.[1]
+        const inline = /ports[ \t]{0,16}:[ \t]{0,16}\[([^\]]{0,512})\]/.exec(raw)?.[1]
         if (inline) {
-          for (const port of inline.matchAll(/(?:^|,)\s*['"]?(?:[\d.]+:)?(\d{2,5})(?::(\d{2,5}))?(?:\/(?:tcp|udp))?['"]?/g)) {
+          for (const port of inline.matchAll(/(?:^|,)[ \t]{0,16}['"]?(?:[\d.]{1,32}:)?(\d{2,5})(?::(\d{2,5}))?(?:\/(?:tcp|udp))?['"]?/g)) {
+            if (current.ports.length >= MAX_COMPOSE_PORTS_PER_SERVICE) break
             const p1 = Number(port[1])
             if (p1 > 0 && p1 <= 65535 && !current.ports.includes(p1)) current.ports.push(p1)
-            if (port[2]) {
+            if (port[2] && current.ports.length < MAX_COMPOSE_PORTS_PER_SERVICE) {
               const p2 = Number(port[2])
               if (p2 > 0 && p2 <= 65535 && !current.ports.includes(p2)) current.ports.push(p2)
             }
@@ -4477,28 +4679,30 @@ function parseComposeServicesFromFiles(
         }
         continue
       }
-      if (inPorts && indent <= portsIndent && raw.trim() && !/^\s*-/.test(raw)) {
+      if (inPorts && indent <= portsIndent && raw.trim() && !/^[ \t]{0,64}-/.test(raw)) {
         inPorts = false
       }
-      if (inPorts) {
-        const singlePort = /^\s*-\s*['"]?(?:[\d.]+:)?(\d{2,5})(?::(\d{2,5}))?(?:\/(?:tcp|udp))?['"]?\s*$/.exec(raw)
+      if (inPorts && current.ports.length < MAX_COMPOSE_PORTS_PER_SERVICE) {
+        const singlePort = /^[ \t]{0,64}-[ \t]{0,16}['"]?(?:[\d.]{1,32}:)?(\d{2,5})(?::(\d{2,5}))?(?:\/(?:tcp|udp))?['"]?[ \t]{0,16}$/.exec(raw)
         if (singlePort) {
           const p1 = Number(singlePort[1])
           if (p1 > 0 && p1 <= 65535 && !current.ports.includes(p1)) current.ports.push(p1)
-          if (singlePort[2]) {
+          if (singlePort[2] && current.ports.length < MAX_COMPOSE_PORTS_PER_SERVICE) {
             const p2 = Number(singlePort[2])
             if (p2 > 0 && p2 <= 65535 && !current.ports.includes(p2)) current.ports.push(p2)
           }
         }
       }
-      for (const host of raw.matchAll(/Host\s*\(\s*`?([^`')]+)`?\s*\)/g)) {
-        if (!current.hosts.includes(host[1])) current.hosts.push(host[1])
+      if (raw.includes('Host')) {
+        extractTraefikRuleArgs(raw, TRAEFIK_HOST_OPEN_RE, 'host', current.hosts, MAX_COMPOSE_HOSTS_PER_SERVICE)
       }
-      for (const prefix of raw.matchAll(/PathPrefix\s*\(\s*`?([^`')]+)`?\s*\)/g)) {
-        if (!current.pathPrefixes.includes(prefix[1])) current.pathPrefixes.push(prefix[1])
+      if (raw.includes('PathPrefix')) {
+        extractTraefikRuleArgs(raw, TRAEFIK_PATH_PREFIX_OPEN_RE, 'pathPrefix', current.pathPrefixes, MAX_COMPOSE_PREFIXES_PER_SERVICE)
       }
-      const containerName = /container_name\s*:\s*['"]?([A-Za-z0-9_.-]+)/.exec(raw)?.[1]
-      if (containerName && !current.hosts.includes(containerName)) current.hosts.push(containerName)
+      if (current.hosts.length < MAX_COMPOSE_HOSTS_PER_SERVICE) {
+        const containerName = /container_name[ \t]{0,16}:[ \t]{0,16}['"]?([A-Za-z0-9_.-]{1,128})/.exec(raw)?.[1]
+        if (containerName && !current.hosts.includes(containerName)) current.hosts.push(containerName)
+      }
     }
   }
   return [...byKey.values()]
@@ -4509,37 +4713,44 @@ function parseIngressRulesFromFiles(
 ): Array<{ host: string; service: string; path?: string; sourceFile: string; dirPrefix: string }> {
   const rules: Array<{ host: string; service: string; path?: string; sourceFile: string; dirPrefix: string }> = []
   for (const file of files) {
+    if (rules.length >= MAX_INGRESS_RULES) break
     const dirPrefix = dirOfRelativePath(file.path)
     // Support multi-document YAML separated by `---`.
-    for (const doc of file.content.split(/^\s*---\s*$/m)) {
+    const docs = file.content.split(/^[ \t]{0,64}---[ \t]{0,64}$/m)
+    let totalLinesScanned = 0
+    for (const doc of docs) {
+      if (rules.length >= MAX_INGRESS_RULES || totalLinesScanned >= MAX_COMPOSE_LINES) break
       const lines = doc.split('\n')
       let host = ''
       let path: string | undefined
       let pendingService = false
-      for (const raw of lines) {
-        const hostMatch = /^\s*-\s*host\s*:\s*['"]?([^'"\s]+)/.exec(raw)
+      for (const rawLine of lines) {
+        if (rules.length >= MAX_INGRESS_RULES || totalLinesScanned >= MAX_COMPOSE_LINES) break
+        totalLinesScanned += 1
+        const raw = rawLine.length > MAX_SCAN_LINE_LENGTH ? rawLine.slice(0, MAX_SCAN_LINE_LENGTH) : rawLine
+        const hostMatch = /^[ \t]{0,64}-[ \t]{0,16}host[ \t]{0,16}:[ \t]{0,16}['"]?([^'"\s]{1,253})/.exec(raw)
         if (hostMatch) {
           host = hostMatch[1]
           path = undefined
         }
-        const quotedHost = /host\s*:\s*['"]([^'"]+)['"]/.exec(raw)
+        const quotedHost = /host[ \t]{0,16}:[ \t]{0,16}['"]([^'"]{1,253})['"]/.exec(raw)
         if (quotedHost && !hostMatch) {
           host = quotedHost[1]
           path = undefined
         }
-        const pathMatch = /path\s*:\s*['"]?([^'"\s]+)/.exec(raw)
+        const pathMatch = /path[ \t]{0,16}:[ \t]{0,16}['"]?([^'"\s]{1,256})/.exec(raw)
         if (pathMatch) path = pathMatch[1]
-        if (/service\s*:\s*$/.test(raw)) {
+        if (/service[ \t]{0,16}:[ \t]{0,16}$/.test(raw)) {
           pendingService = true
           continue
         }
-        const serviceNameInline = /^\s*serviceName\s*:\s*['"]?([A-Za-z0-9_.-]+)/.exec(raw)
+        const serviceNameInline = /^[ \t]{0,64}serviceName[ \t]{0,16}:[ \t]{0,16}['"]?([A-Za-z0-9_.-]{1,128})/.exec(raw)
         if (serviceNameInline) {
           rules.push({ host, service: serviceNameInline[1], ...(path ? { path } : {}), sourceFile: file.path, dirPrefix })
           pendingService = false
           continue
         }
-        const nameMatch = /^\s*name\s*:\s*['"]?([A-Za-z0-9_.-]+)/.exec(raw)
+        const nameMatch = /^[ \t]{0,64}name[ \t]{0,16}:[ \t]{0,16}['"]?([A-Za-z0-9_.-]{1,128})/.exec(raw)
         if (pendingService && nameMatch) {
           rules.push({ host, service: nameMatch[1], ...(path ? { path } : {}), sourceFile: file.path, dirPrefix })
           pendingService = false

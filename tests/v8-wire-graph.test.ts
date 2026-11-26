@@ -268,7 +268,7 @@ describe('v8 M0/M2/M3 Graph & Orchestrator Wiring', () => {
 
     // 1. White-box synthesis via ExecReconPlanner seeds quarantined capability_only nodes across all 3 analyzers.
     const graph = extractProgramGraph({ files: SYNTH_MULTISERVICE_SOURCE, repo: 'synth-saas' })
-    const wbSeed = planner.seedCapabilityLedgerInvariants(run, {
+    const wbSeed = await planner.seedCapabilityLedgerInvariants(run, {
       mode: 'white-box',
       graph,
       sourceFiles: SYNTH_MULTISERVICE_SOURCE,
@@ -298,7 +298,7 @@ describe('v8 M0/M2/M3 Graph & Orchestrator Wiring', () => {
     }
 
     // Re-running synthesis is idempotent (0 duplicates).
-    const wbRepeat = planner.seedCapabilityLedgerInvariants(run, {
+    const wbRepeat = await planner.seedCapabilityLedgerInvariants(run, {
       mode: 'white-box',
       graph,
       sourceFiles: SYNTH_MULTISERVICE_SOURCE,
@@ -554,7 +554,7 @@ describe('v8 M0/M2/M3 Graph & Orchestrator Wiring', () => {
     const run = storage.run(setup.runId)
     const planner = makePlanner(storage, { mountedRepos: [] })
 
-    const result = planner.seedCapabilityLedgerInvariants(run, {
+    const result = await planner.seedCapabilityLedgerInvariants(run, {
       mode: 'grey-box',
       runtime: {
         personaObservations: [
