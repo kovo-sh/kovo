@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Mandatory pre-handoff gate for v5.1 hill-climb branches.
-# Fast by default (<~30 s): typecheck + contract invariants + optional targeted slice.
+# Mandatory pre-handoff behavioral merge gate (`cq-3-merge-gate`).
+# Fast (<60s): typecheck + v8 contamination lint + contract-change trailer lint +
+# wiring invariants + quarantine/orphan check + all non-quarantined fast unit suites
+# in parallel + optional targeted slice.
 #
 # Usage:
 #   scripts/worker-gate.sh [--app <app> --class <class> [--seed N] [--split dev|heldout]]
@@ -34,44 +36,67 @@ if [[ -d "$ROOT/.git" && "$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)
   fi
 fi
 
+gate_t0="$(date +%s)"
 fail=0
 step() { printf '\n== %s\n' "$1"; }
 run() { step "$1"; shift; if "$@"; then :; else echo "FAILED: $1" >&2; fail=1; fi; }
 
-run "typecheck" npm run check
-
-# v8 anti-contamination invariant (<1s): zero v8 benchmark literals in src/server/ or src/skills/.
+# 1. Fast static lints & structural wiring invariants (<1s total).
 run "v8 anti-contamination lint" node scripts/check-v8-contamination.ts
+run "contract-change trailer lint" node scripts/check-contract-change.ts
 
-# v7 dispatch-funnel invariant (<=15 lines): the pure helpers must be wired into the engine and the
-# synthetic fixture must prove (a) a dry/coordinator stop never strands dispatchable ready steps and
-# (b) multi-trial fanout only spends surplus worker slots. Catches this coverage class in minutes.
-step "dispatch funnel invariant"
+step "dispatch funnel wiring invariant"
 if grep -q 'evaluateDispatchStop(' src/server/execution.ts \
-   && grep -q 'planMultiTrialExpansion(' src/server/execution.ts \
-   && node --test tests/v7-dispatch-funnel.test.ts >/dev/null 2>&1; then :; else
-  echo "FAILED: dispatch funnel invariant (dry-stop stranding / multi-trial slot starvation)" >&2
+   && grep -q 'planMultiTrialExpansion(' src/server/execution.ts; then
+  echo "PASS: dispatch funnel wiring present in src/server/execution.ts"
+else
+  echo "FAILED: dispatch funnel wiring invariant missing from src/server/execution.ts" >&2
   fail=1
 fi
 
-# Confirmation-consistency invariant (precision integrity): a confirmed finding may only persist
-# while its own persisted evidence confirms. Pins the store gate + DB trigger + demotion path so an
-# inconclusive result can never be persisted as a confirmed claim.
-step "confirmation-consistency invariant"
+step "confirmation-consistency wiring invariant"
 if grep -q "invariant.confirmation_evidence" src/server/store.ts \
    && grep -q 'findings_confirmation_evidence_insert' src/server/store.ts \
-   && grep -q 'enforceConfirmationEvidence(' src/server/store.ts \
-   && node --test tests/v7-confirm-consistency.test.ts >/dev/null 2>&1; then :; else
-  echo "FAILED: confirmation-consistency invariant (confirmed claim without confirming evidence)" >&2
+   && grep -q 'enforceConfirmationEvidence(' src/server/store.ts; then
+  echo "PASS: confirmation-consistency wiring present in src/server/store.ts"
+else
+  echo "FAILED: confirmation-consistency wiring invariant missing from src/server/store.ts" >&2
   fail=1
 fi
 
-# Fast contract invariants: planner/dedupe/orchestration + systemic contract canary stress gate.
-run "contract invariants" node --test \
-  tests/v4-m7-orch.test.ts \
-  tests/v5-m1-wiring-correctness.test.ts \
-  tests/v5-m2-state.test.ts \
-  tests/sys-contract-canary.test.ts
+# 2. Run typecheck (`npm run check`) in parallel with all non-quarantined fast behavioral suites
+#    (includes v7-dispatch-funnel, v7-confirm-consistency, v4-m7-orch, v5-m1, v5-m2,
+#    sys-contract-canary, cq-3-merge-gate, and all passing precision-kernel suites) plus
+#    QUARANTINE.json cap/expiry validation and recursive orphan-test enforcement.
+GATE_LOG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/kovo-worker-gate-XXXXXX")"
+trap 'rm -rf "$GATE_LOG_DIR"' EXIT
+
+npm run check >"$GATE_LOG_DIR/tsc.log" 2>&1 &
+tsc_pid=$!
+
+bash scripts/run-fast-tests.sh --suites-only --quarantine tests/QUARANTINE.json >"$GATE_LOG_DIR/fast.log" 2>&1 &
+fast_pid=$!
+
+wait "$tsc_pid"
+tsc_rc=$?
+wait "$fast_pid"
+fast_rc=$?
+
+step "typecheck"
+cat "$GATE_LOG_DIR/tsc.log"
+if (( tsc_rc != 0 )); then
+  echo "FAILED: typecheck (npm run check)" >&2
+  fail=1
+else
+  echo "PASS: typecheck"
+fi
+
+step "fast behavioral suites + quarantine/orphan gate"
+cat "$GATE_LOG_DIR/fast.log"
+if (( fast_rc != 0 )); then
+  echo "FAILED: fast behavioral suites / quarantine / orphan check" >&2
+  fail=1
+fi
 
 if (( ${#SLICE_ARGS[@]} > 0 )); then
   run "targeted slice" bash scripts/bench-slice.sh "${SLICE_ARGS[@]}"
@@ -88,5 +113,6 @@ if (( FULL == 1 )); then
   fi
 fi
 
-printf '\nworker-gate: %s\n' "$([[ $fail -eq 0 ]] && echo PASS || echo FAIL)"
+gate_elapsed=$(( $(date +%s) - gate_t0 ))
+printf '\nworker-gate: %s (%ss)\n' "$([[ $fail -eq 0 ]] && echo PASS || echo FAIL)" "$gate_elapsed"
 exit "$fail"

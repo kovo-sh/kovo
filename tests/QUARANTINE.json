@@ -1,0 +1,551 @@
+{
+  "maxQuarantined": 91,
+  "entries": [
+    {
+      "file": "tests/arch-a1-engine.test.ts",
+      "owner": "arch-triage",
+      "reason": "Pre-existing failure on main (1/3 failed): A1.3: runV8AgentScriptProof is collapsed into unified runAgentScriptProof (zero monkey-patch) and retestPersistedAgentSc",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/arch-b3-cascade.test.ts",
+      "owner": "arch-triage",
+      "reason": "Pre-existing failure on main (1/7 failed): schema authority: zero DDL drift across all 41 schema.ts tables, FKs, ON DELETE CASCADE, indexes, and append-only tenant",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/arch-c1-verify-kernel.test.ts",
+      "owner": "arch-triage",
+      "reason": "Pre-existing failure on main (1/5 failed): C1.4: runAgentSession omits verify_replay_spec from LLM request tool definitions when kovo_verify is active",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/arch-c2-thin-sdk.test.ts",
+      "owner": "arch-triage",
+      "reason": "Pre-existing failure on main (2/4 failed): every prove_* helper verdict matches the host transcript oracle on vulnerable and hardened fixtures",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/arch-c3-store-repos.test.ts",
+      "owner": "arch-triage",
+      "reason": "Pre-existing failure on main (1/4 failed): arch-c3 store export parity: store.ts preserves 100% of public runtime exports and identity",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/arch-egress-sanitizer.test.ts",
+      "owner": "arch-triage",
+      "reason": "Pre-existing failure on main (1/5 failed): C-3: capability.seal rejects 1-char/short regex & value oracles, enforces per-exchange rate limit, and hides sha256/sha2",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/arch-p1-acyclic-store.test.ts",
+      "owner": "arch-triage",
+      "reason": "Pre-existing failure on main (1/4 failed): arch-p1 leaf module isolation: finding-fingerprint.ts and approval-pattern.ts have zero local runtime deps",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/audit-proof-a.test.ts",
+      "owner": "cq-4-parity-corpus",
+      "reason": "Pre-existing failure on main (2/13 failed): C-2: explicit oracleFamily requires oracleInput and dual_tenant_abac rejects one-hop and bare-401 chains",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/floor-regress.test.ts",
+      "owner": "cq-4-parity-corpus",
+      "reason": "Pre-existing failure on main (1/12 failed): floor: the discriminating baseline confirms on the concatenating twin via wired floor recipe",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/gb-planner-wiring.test.ts",
+      "owner": "cq-6-agent-contract",
+      "reason": "Pre-existing failure on main (1/4 failed): ExecWorkerRunner triggers hop-continuation on non-confirmed complete_intent and max_turns exits with sealed handles, and",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/movea-retest-norm.test.ts",
+      "owner": "cq-4-parity-corpus",
+      "reason": "Pre-existing failure on main (1/8 failed): H-5: verifyReplaySpec and retestReplaySpec default-deny recipe and agentScript envelopes when envelopeTrust is omitted",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/provider-stream.test.ts",
+      "owner": "sys-q1-worker-pool",
+      "reason": "Pre-existing failure on main (3/9 failed): keeps split responses API keys and persona secrets out of recorded turns and Pi Durable sessions",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/specs-recall.test.ts",
+      "owner": "cq-4-parity-corpus",
+      "reason": "Pre-existing failure on main (1/10 failed): credential inventory: the unentitled full secret confirms against the masked control",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/t1-provider-stream.test.ts",
+      "owner": "sys-q1-worker-pool",
+      "reason": "Pre-existing failure on main (5/7 failed): H-25: End-to-end provider() round-trip delivers unmodified check_canary token and kovo_verify script to pi-ai",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/t2-composite-hydrate.test.ts",
+      "owner": "cq-4-parity-corpus",
+      "reason": "Pre-existing failure on main (2/6 failed): C-4: hydrateV8OracleInput strips forged model operands/booleans and cannot spoof any v8 oracle family",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/t2-oracle-invariants.test.ts",
+      "owner": "cq-4-parity-corpus",
+      "reason": "Pre-existing failure on main (3/16 failed): C-6: host-recorded denial or entitled cross-tenant read supplies the boundary",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/t2-receipt-kernel.test.ts",
+      "owner": "cq-4-parity-corpus",
+      "reason": "Pre-existing failure on main (1/8 failed): H-5: replay-verifier rejects untrusted recipe/agentScript envelopes and enforces scope/Tier-0/carrier checks on static_a",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/ux-session-refresh-a123.test.ts",
+      "owner": "ux-triage",
+      "reason": "Pre-existing failure on main (1/5 failed): A3: budgetRequests === 0 (Unlimited requests) does NOT trip tightControlBounds and keeps AIMD active",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/ux-wave-exec-polish.test.ts",
+      "owner": "ux-triage",
+      "reason": "Pre-existing failure on main (1/3 failed): RequestBroker passes diagnostic meta on WebSocket and forbidden-header denials",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/ux-wave-settings-auth.test.ts",
+      "owner": "ux-triage",
+      "reason": "Pre-existing failure on main (1/7 failed): A7: creating a second OpenRouter profile without id never overwrites or unlinks the first profile key, and Test clears o",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v3-protocol-browser.test.ts",
+      "owner": "v4-v5-triage",
+      "reason": "Pre-existing failure on main (3/4 failed): v3 WebSocket: probeWebsocket origin/scope/bounds/redaction & ws_chain replay confirmation/dismissal",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v4-m2-broker-browser-probes.test.ts",
+      "owner": "v4-v5-triage",
+      "reason": "Pre-existing failure on main (2/9 failed): M2.1 session jar isolation: regex BVA, LRU caps, origin/path/secure scoping, setup->probe vs control isolation, vault pr",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v4-m4-surface-orchestration.test.ts",
+      "owner": "v4-v5-triage",
+      "reason": "Pre-existing failure on main (2/10 failed): M4.8 computeMultiTrialFanout BVA and live Execution multi-trial early stopping cancels sibling & emits trial.early_stopp",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v5-agentic-tools.test.ts",
+      "owner": "cq-6-agent-contract",
+      "reason": "Pre-existing failure on main (3/10 failed): trace is off by default and a throwing trace never breaks the run",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v5-board-store.test.ts",
+      "owner": "v4-v5-triage",
+      "reason": "Pre-existing failure on main (1/8 failed): v5 board schema auto-migrates a v4 database without losing rows and re-creates board tables",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v5-m3-specs3.test.ts",
+      "owner": "v4-v5-triage",
+      "reason": "Pre-existing failure on main (4/19 failed): business logic: concurrent out-of-bounds seat allocation confirms via read-back",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v5-m5-board-execution.test.ts",
+      "owner": "v4-v5-triage",
+      "reason": "Pre-existing failure on main (4/9 failed): a dispatched chain step emits a @coordinator brief and keeps the warm member waiting",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v5-tier3-safety.test.ts",
+      "owner": "v4-v5-triage",
+      "reason": "Pre-existing failure on main (1/8 failed): execution Tier-3 gate: local-lab approval is origin-bound, strict-aware, and persisted",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v5-verifier-guards.test.ts",
+      "owner": "v4-v5-triage",
+      "reason": "Pre-existing failure on main (2/9 failed): guards: auth-bypass whose control is a login redirect still confirms via marker differential",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v6-auth.test.ts",
+      "owner": "v6-triage",
+      "reason": "Pre-existing failure on main (0/0 failed): TIMEOUT (>60s)",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v6-fluid.test.ts",
+      "owner": "v6-triage",
+      "reason": "Pre-existing failure on main (2/12 failed): read-only calls in one round run concurrently",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v6-graph.test.ts",
+      "owner": "v6-triage",
+      "reason": "Pre-existing failure on main (1/9 failed): clones with bounded depth, keeps sanitized .git, and mines security-relevant commits",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v6-phaseb-latency.test.ts",
+      "owner": "v6-triage",
+      "reason": "Pre-existing failure on main (1/16 failed): warm pool: a container that is still running is removed, never parked",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v6-sdk-helpers.test.ts",
+      "owner": "v6-triage",
+      "reason": "Pre-existing failure on main (2/7 failed): proveBooleanOrTimingDiff strips rotating tokens and records both arms",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v6-verifier-harden.test.ts",
+      "owner": "v6-triage",
+      "reason": "Pre-existing failure on main (7/41 failed): boundary: a real MFA challenge with a pre/post access differential confirms",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v7-agent-script-proofs.test.ts",
+      "owner": "v7-triage",
+      "reason": "Pre-existing failure on main (5/7 failed): v7 agent-script-proofs: buildAgentScriptReceipt + verifyReceipt pass on impact, boolean, and timing",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v7-agentic-lift-oracles.test.ts",
+      "owner": "v7-triage",
+      "reason": "Pre-existing failure on main (4/9 failed): Seam 1: auth_bypass & jwt_forgery ProofReceipts confirm valid bypasses and fail closed on normal login / status-only / p",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v7-conserved-balance-receipt.test.ts",
+      "owner": "v7-triage",
+      "reason": "Pre-existing failure on main (5/6 failed): conserved_balance confirms under-debit double-spend backed by exact serial debit control",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v7-cut3a.test.ts",
+      "owner": "v7-triage",
+      "reason": "Pre-existing failure on main (2/5 failed): recipe-wired sql_boolean_diff confirms a vulnerable paired differential through the broker",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v7-cut3c-retire.test.ts",
+      "owner": "v7-triage",
+      "reason": "Pre-existing failure on main (2/3 failed): Cut 3c recipe wiring: redirect, browser_sink, and injection_fingerprint persist and retest cleanly through floor-recipe-",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v7-cut3cd-recipes.test.ts",
+      "owner": "v7-triage",
+      "reason": "Pre-existing failure on main (4/31 failed): confirms an off-origin Location that no control reaches",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v7-cut3e-retire.test.ts",
+      "owner": "v7-triage",
+      "reason": "Pre-existing failure on main (2/5 failed): Cut 3e: bare browser_chain is retired while browser_sink recipe envelope confirms via ProofReceipt",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v7-cut3f-retire.test.ts",
+      "owner": "v7-triage",
+      "reason": "Pre-existing failure on main (1/7 failed): the assessment/receipt helpers live in the recipe engine while the VM stays thin",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v7-exec-prep.test.ts",
+      "owner": "v7-triage",
+      "reason": "Pre-existing failure on main (1/3 failed): provider resets idle timeout and forwards onStreamActivity during slow multi-chunk SSE streams",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v7-exec-throughput.test.ts",
+      "owner": "v7-triage",
+      "reason": "Pre-existing failure on main (2/8 failed): Execution wires onProofObligation, onGapValidation, and assignedTargetRoutes into run events and throughput metrics",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v7-floor-recipes.test.ts",
+      "owner": "v7-triage",
+      "reason": "Pre-existing failure on main (8/21 failed): boolean_or_timing confirms a stable >3x timing separation and rejects a noisy one",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v7-proofreceipt.test.ts",
+      "owner": "v7-triage",
+      "reason": "Pre-existing failure on main (5/17 failed): M0 receipt: an OOB callback confirms only when a cited exchange carried the delivered token",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v7-publicness-oracle.test.ts",
+      "owner": "v7-triage",
+      "reason": "Pre-existing failure on main (1/6 failed): positive: genuine private cross-tenant reads still confirm (owner_id, email, canary, principal-bound author)",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v7-retest-receipts.test.ts",
+      "owner": "v7-triage",
+      "reason": "Pre-existing failure on main (2/4 failed): v7 retest receipts: a recipe-confirmed spec persists its recipe envelope",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v7-shopflow-fp.test.ts",
+      "owner": "v7-triage",
+      "reason": "Pre-existing failure on main (1/5 failed): legitimate workflow confirmation survives the tightened taxonomy",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v7-sqli-baseline.test.ts",
+      "owner": "v7-triage",
+      "reason": "Pre-existing failure on main (1/9 failed): sql-baseline: a wired recipe confirms on a catalog lacking the dev literal",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v7-status-diff-guard.test.ts",
+      "owner": "v7-triage",
+      "reason": "Pre-existing failure on main (1/10 failed): status-diff guard: boolean, timing and OOB receipt paths are unchanged",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v7-subdomain-discovery.test.ts",
+      "owner": "v7-triage",
+      "reason": "Pre-existing failure on main (1/6 failed): local-lab, localhost, IP literals, internal suffixes, HTTP, and non-standard ports skip with zero network calls",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v7-tier1-throughput.test.ts",
+      "owner": "v7-triage",
+      "reason": "Pre-existing failure on main (1/6 failed): all 7 specialist focusPrompts steer to kovo_verify and avoid retired legacy VM kinds",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-chain-continuation.test.ts",
+      "owner": "v8-triage",
+      "reason": "Pre-existing failure on main (3/6 failed): Execution emits 270s wall-clock budget for multi-hop chain step vs 120s for single-route step on a 15m run",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-codeaudit-settle.test.ts",
+      "owner": "v8-triage",
+      "reason": "Pre-existing failure on main (1/4 failed): codeAuditPrompt and code-auditor instructions require incremental record_fact",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-composite-fix.test.ts",
+      "owner": "v8-triage",
+      "reason": "Pre-existing failure on main (1/3 failed): composite.verify & v8-oracle-families REJECT benign cache-prime + export-job-creation stubs with terminal_impact_unprove",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-composite-receipt.test.ts",
+      "owner": "v8-triage",
+      "reason": "Pre-existing failure on main (1/12 failed): combined 5-hop signed DAG exercising all 4 edge bindings + custom terminal oracle + disconnected hop check",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-concurrency-12.test.ts",
+      "owner": "v8-triage",
+      "reason": "Pre-existing failure on main (1/11 failed): Live Execution dispatches 12 unique concurrent specialists on Wave 1 with zero duplicates and raises SQLite busy_timeout",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-d3-h3-fix.test.ts",
+      "owner": "v8-triage",
+      "reason": "Pre-existing failure on main (3/5 failed): nested { data: { export: { id, signedUrl, status } } } stub is REJECTED across ALL oracle paths including cross_surface_",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-dag-export.test.ts",
+      "owner": "v8-triage",
+      "reason": "Pre-existing failure on main (1/4 failed): v8 Stream D: formatCompositeChainMarkdown renders 4-hop DAG chain, bindings, Mode-A badge, patchBrokeHopId, and integrat",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-exec-wire.test.ts",
+      "owner": "v8-triage",
+      "reason": "Pre-existing failure on main (2/5 failed): 1. Run-scoped DerivedCapabilityVault persists sealed handles across two VerifyRpcServer worker sessions without raw secr",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-fix-rpc-e2e-bugs.test.ts",
+      "owner": "v8-triage",
+      "reason": "Pre-existing failure on main (1/5 failed): Bug 3: redact(), redactJsonValue(), scanSecrets(), and live broker scrub camelCase secret keys while preserving valid JS",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-oracle-families.test.ts",
+      "owner": "v8-triage",
+      "reason": "Pre-existing failure on main (1/17 failed): confirms 3-arm cross-tenant / cross-scope cryptographic replay",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-patch-retest.test.ts",
+      "owner": "v8-triage",
+      "reason": "Pre-existing failure on main (1/12 failed): 4-hop DAG on unpatched target -> still_vulnerable, executes strictly in topological order & remaps fresh IDs",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-phasea-fastpath.test.ts",
+      "owner": "v8-triage",
+      "reason": "Pre-existing failure on main (1/8 failed): runSourceFirstCodeAudit enforces proportional wall-clock cap (90s), turn cap (8), and semantic sub-timeout (35s)",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-phasea-overlap.test.ts",
+      "owner": "v8-triage",
+      "reason": "Pre-existing failure on main (3/6 failed): Phase A overlap: floor starts during threat_model while code_audit runs, blocks Phase B, and fires post-floor once on se",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-prop-rpc-e2e.test.ts",
+      "owner": "v8-triage",
+      "reason": "Pre-existing failure on main (3/10 failed): E2E Positive 1: dual_tenant_abac + state_transition_binding + value_binding (JSON redaction, Bearer dedup, derived cooki",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-q25-chain-scheduling.test.ts",
+      "owner": "v8-triage",
+      "reason": "Pre-existing failure on main (1/7 failed): runSourceFirstCodeAudit promotes explicit suspects AND cross-cutting defect facts (up to 6) into Wave-1 multi-hop chain ",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-q25-oracle-soundness.test.ts",
+      "owner": "v8-triage",
+      "reason": "Pre-existing failure on main (4/4 failed): cryptographic_scope_replay rejects missing denied control, missing endpoint, wrong-route control, stub, and own-tenant-o",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-q26-multihop-synthesis.test.ts",
+      "owner": "v8-triage",
+      "reason": "Pre-existing failure on main (1/4 failed): Fix C: workerInvestigationPrompt, KOVO_VERIFY guidance, and multihop-chains.md enforce no-premature-filing, single-origi",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-q26-provenance-soundness.test.ts",
+      "owner": "v8-triage",
+      "reason": "Pre-existing failure on main (2/5 failed): verifyAttackerProvenance allows anonymous + single-tenant, DAG-minted credentials, same-tenant peers, and target-tenant ",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-q27-fix-binding.test.ts",
+      "owner": "v8-triage",
+      "reason": "Pre-existing failure on main (1/2 failed): inline cap:... handles resolve across path, query, Authorization, Cookie, custom headers, and JSON body with full attest",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-q27-fix-sdk-ergo.test.ts",
+      "owner": "v8-triage",
+      "reason": "Pre-existing failure on main (1/2 failed): TS SDK hmac_sign, jwt_sign, and await_async support options objects, positional args, flat calls, and result aliases",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-q28-ablation-seal.test.ts",
+      "owner": "v8-triage",
+      "reason": "Pre-existing failure on main (2/5 failed): state_transition_binding STILL rejects mutated-entity ablation, session-wide dirty ablation, and wrong route family",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-q29-vault-autobind.test.ts",
+      "owner": "v8-triage",
+      "reason": "Pre-existing failure on main (2/5 failed): literal sealed order_id auto-binds on http.send, race (every burst exchange) and async.awaitResult; value_binding verifi",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-q30-workflow-push.test.ts",
+      "owner": "cq-6-agent-contract",
+      "reason": "Pre-existing failure on main (1/3 failed): Q30.1: prompts, tool guidance, and multihop-chains.md enforce single-script 3-5 stage workflows and clean-control orderi",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-q31-multihop-detect.test.ts",
+      "owner": "cq-6-agent-contract",
+      "reason": "Pre-existing failure on main (1/5 failed): Q31.4: multiHopDirectives unmistakably mandates ctx.seal_capability + ctx.prove_composite and includes compact signature",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-q32-stub-telemetry.test.ts",
+      "owner": "v8-triage",
+      "reason": "Pre-existing failure on main (3/7 failed): ti.proofReceipt CANNOT bypass isJobOrHandleStub on async export creation + job-status poll",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-q33-auth-and-json.test.ts",
+      "owner": "v8-triage",
+      "reason": "Pre-existing failure on main (2/4 failed): derived session token injects Authorization: Bearer <rawToken> on wire across all 4 call patterns + cookie/override edge",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-q33-dag-and-econ-docs.test.ts",
+      "owner": "v8-triage",
+      "reason": "Pre-existing failure on main (2/4 failed): Q33.2: dag_topology connected-DAG rule forbids unused/orphan exploratory hops in hops[]",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-q33-econ-and-state.test.ts",
+      "owner": "v8-triage",
+      "reason": "Pre-existing failure on main (4/7 failed): economic_conservation hydrates string exchange IDs, {id}/{exchangeId} stubs, and *ExchangeId aliases under signingKey",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-q34-verify-binding.test.ts",
+      "owner": "v8-triage",
+      "reason": "Pre-existing failure on main (1/6 failed): VerifyRpcServer backfills late capability.seal onto subsequent 6-request race burst and verifies hmac_sign value_binding",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-q35-cap-only-gate.test.ts",
+      "owner": "v8-triage",
+      "reason": "Pre-existing failure on main (3/5 failed): rejects standalone parser-differential draft creation via boundary, structural_diff, persisted_mutation, and raw claims",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-q36-soundness-fixes.test.ts",
+      "owner": "v8-triage",
+      "reason": "Pre-existing failure on main (1/5 failed): Bug 1: forged inline oracleInput record with valid hostSignature cannot spoof status/json/fields",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-sdk-strict-camel.test.ts",
+      "owner": "v8-triage",
+      "reason": "Pre-existing failure on main (3/3 failed): kovo_verify.ts drops dead v6/v7 shims and all redundant snake_case option aliases",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-seam2-docs-mock-exec.test.ts",
+      "owner": "v8-triage",
+      "reason": "Pre-existing failure on main (3/6 failed): Part A.1: DerivedSecretKind enum stays in exact 3-way parity across SDK, derived-custody.ts, and verify-rpc.ts",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-seam3-receipt-fuzz.test.ts",
+      "owner": "v8-triage",
+      "reason": "Pre-existing failure on main (4/14 failed): Baselines: all 4 causal edge kinds, all 6 V8_ORACLE_FAMILIES, and single-hop ProofReceipts PASS cleanly",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-slot-rotation.test.ts",
+      "owner": "cq-6-agent-contract",
+      "reason": "Pre-existing failure on main (3/7 failed): runAgentSession hard-aborts a stalled specialist at wallClockMs=150 within < 400ms",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-wire-l1.test.ts",
+      "owner": "v8-triage",
+      "reason": "Pre-existing failure on main (4/5 failed): End-to-end loopback VerifyRpcServer: Hop 1 seal -> Hop 2 hmacSign + jwtSign -> Hop 3 capability inject -> composite.veri",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/xben-readback.test.ts",
+      "owner": "cq-4-parity-corpus",
+      "reason": "Pre-existing failure on main (1/6 failed): parity: the xben-12 self-profile readback confirms the promoted role",
+      "expires": "2026-12-26"
+    }
+  ]
+}

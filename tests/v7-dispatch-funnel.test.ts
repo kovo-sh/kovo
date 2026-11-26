@@ -21,6 +21,8 @@ import { Execution } from '../src/server/execution.ts'
 import { makeStore, setupApprovedRun } from './v4-tier-helpers.ts'
 import {
   DISPATCH_FUNNEL_COUNT_KEYS,
+  FrontierDispatcher,
+  FrontierWaveController,
   addFunnelCounts,
   circuitBreakAction,
   coordinatorSchedulerDecision,
@@ -31,7 +33,6 @@ import {
   normalizeDispatchStopReason,
   permanentlyBlockedStepIds,
   planMultiTrialExpansion,
-  planRoundRobinDispatch,
 } from '../src/server/execution.ts'
 
 interface FakeStep {
@@ -81,7 +82,8 @@ test('7 planned hypotheses and 6 slots: no pairwise/three-way fanout (the measur
   // would then run 2 distinct hypotheses x 3 trials.
   assert.equal(multiTrialSurplusSlots(7, 6), 0)
   assert.deepEqual(planMultiTrialExpansion({ steps, concurrency: 6 }), [])
-  const dispatched = planRoundRobinDispatch(steps, 6).ordered
+  const dispatcher = new FrontierDispatcher({ controller: new FrontierWaveController() })
+  const dispatched = dispatcher.dispatch(steps, 6).ordered
   assert.equal(new Set(dispatched.map(step => step.id)).size, 6, 'six distinct hypotheses must take the six slots')
 })
 
@@ -90,7 +92,8 @@ test('19 planned hypotheses and 6 slots: zero trial expansion, six distinct disp
     priority: index < 4 ? 100 : 90,
   }))
   assert.deepEqual(planMultiTrialExpansion({ steps, concurrency: 6 }), [])
-  const planned = planRoundRobinDispatch(steps, 6).ordered
+  const dispatcher = new FrontierDispatcher({ controller: new FrontierWaveController() })
+  const planned = dispatcher.dispatch(steps, 6).ordered
   assert.equal(planned.length, 6)
   assert.equal(new Set(planned.map(step => step.title)).size, 6)
 })
@@ -293,6 +296,7 @@ function simulateDispatch(input: {
 }) {
   const queued = new Map(input.steps.map(step => [step.id, { ...step }]))
   const dry = input.dryStepIds ?? new Set<string>()
+  const dispatcher = new FrontierDispatcher({ controller: new FrontierWaveController() })
   const dispatched: string[] = []
   let stopReason = 'continue'
   let remainingReady = 0
@@ -306,7 +310,7 @@ function simulateDispatch(input: {
     const ready = [...queued.values()].filter(step => step.status === 'ready')
     remainingReady = ready.length
     const slots = Math.max(0, input.concurrency - [...queued.values()].filter(step => step.status === 'running').length)
-    const plan = planRoundRobinDispatch(ready, slots)
+    const plan = dispatcher.dispatch(ready, slots)
     for (const step of plan.ordered) {
       const liveStep = queued.get(step.id)!
       liveStep.status = 'running'
