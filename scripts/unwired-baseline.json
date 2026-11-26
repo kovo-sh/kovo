@@ -129,19 +129,13 @@
     "src/server/run-actor.ts::evictRunFromExecutionState",
     "src/server/run-snapshot.ts::readSnapshotDatabase",
     "src/server/run-snapshot.ts::snapshotFileModes",
-    "src/server/run-status.ts::ACTIVELY_EXECUTING_RUN_STATUSES",
     "src/server/run-status.ts::CANONICAL_RESUMABLE_NON_TERMINAL_RUN_STATUSES",
-    "src/server/run-status.ts::LEGACY_TERMINAL_RUN_STATUS_ALIASES",
-    "src/server/run-status.ts::RESUMABLE_NON_TERMINAL_RUN_STATUSES",
-    "src/server/run-status.ts::RUN_STATUSES",
     "src/server/run-status.ts::RUN_STATUS_CLASSIFICATION",
-    "src/server/run-status.ts::TERMINAL_RUN_STATUSES",
     "src/server/run-status.ts::classifyRunStatus",
     "src/server/run-status.ts::isActivelyExecutingRunStatus",
     "src/server/run-status.ts::isCanonicalRunStatus",
     "src/server/run-status.ts::isNonTerminalRunStatus",
     "src/server/run-status.ts::isResumableNonTerminalRunStatus",
-    "src/server/run-status.ts::isTerminalRunStatus",
     "src/server/scope-policy.ts::isBenignInfrastructureOrigin",
     "src/server/scope-policy.ts::resolveEffectiveHttpMethod",
     "src/server/scoped-browser.ts::visitPage",
@@ -179,12 +173,6 @@
   ],
   "ticketedAdditions": [
     {
-      "key": "src/server/run-status.ts::ACTIVELY_EXECUTING_RUN_STATUSES",
-      "owner": "r2-03-merge-gate",
-      "ticket": "R2-03-PREEXISTING-RUN-STATUS",
-      "expires": "2026-12-10"
-    },
-    {
       "key": "src/server/run-status.ts::CANONICAL_RESUMABLE_NON_TERMINAL_RUN_STATUSES",
       "owner": "r2-03-merge-gate",
       "ticket": "R2-03-PREEXISTING-RUN-STATUS",
@@ -221,37 +209,7 @@
       "expires": "2026-12-10"
     },
     {
-      "key": "src/server/run-status.ts::isTerminalRunStatus",
-      "owner": "r2-03-merge-gate",
-      "ticket": "R2-03-PREEXISTING-RUN-STATUS",
-      "expires": "2026-12-10"
-    },
-    {
-      "key": "src/server/run-status.ts::LEGACY_TERMINAL_RUN_STATUS_ALIASES",
-      "owner": "r2-03-merge-gate",
-      "ticket": "R2-03-PREEXISTING-RUN-STATUS",
-      "expires": "2026-12-10"
-    },
-    {
-      "key": "src/server/run-status.ts::RESUMABLE_NON_TERMINAL_RUN_STATUSES",
-      "owner": "r2-03-merge-gate",
-      "ticket": "R2-03-PREEXISTING-RUN-STATUS",
-      "expires": "2026-12-10"
-    },
-    {
       "key": "src/server/run-status.ts::RUN_STATUS_CLASSIFICATION",
-      "owner": "r2-03-merge-gate",
-      "ticket": "R2-03-PREEXISTING-RUN-STATUS",
-      "expires": "2026-12-10"
-    },
-    {
-      "key": "src/server/run-status.ts::RUN_STATUSES",
-      "owner": "r2-03-merge-gate",
-      "ticket": "R2-03-PREEXISTING-RUN-STATUS",
-      "expires": "2026-12-10"
-    },
-    {
-      "key": "src/server/run-status.ts::TERMINAL_RUN_STATUSES",
       "owner": "r2-03-merge-gate",
       "ticket": "R2-03-PREEXISTING-RUN-STATUS",
       "expires": "2026-12-10"

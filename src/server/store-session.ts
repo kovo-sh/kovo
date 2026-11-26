@@ -29,6 +29,10 @@ import type {
   FindingVerificationClass,
 } from '../report-summary.ts'
 import { accessPolicyReviews } from './access-policy-checks.ts'
+import {
+  collectDirectArtifactIdsForRun,
+  filterUnreferencedDirectArtifactIds,
+} from './evidence-citations.ts'
 import { isSafeMetadataPath, redact, secretMatchKinds } from './redact.ts'
 import type { NamedSecret, SecretMatch } from './redact.ts'
 import { responseReview } from './response-checks.ts'
@@ -1870,57 +1874,13 @@ export class StoreSession implements DbSession {
         .filter((sid): sid is string => typeof sid === 'string' && sid.length > 0),
     )]
 
-    const artifactIds = new Set<string>()
-    for (const row of this.client.prepare(`SELECT id FROM evidence WHERE run_id = ?`).all(runId) as { id: string }[]) {
-      if (row.id) artifactIds.add(row.id)
-    }
-    for (const row of this.client.prepare(`SELECT body_artifact_id AS aid FROM broker_exchanges WHERE run_id = ? AND body_artifact_id IS NOT NULL`).all(runId) as { aid: string | null }[]) {
-      if (row.aid) artifactIds.add(row.aid)
-    }
-    for (const row of this.client.prepare(`SELECT proof_artifact_id AS aid FROM replay_specs WHERE run_id = ? AND proof_artifact_id IS NOT NULL`).all(runId) as { aid: string | null }[]) {
-      if (row.aid) artifactIds.add(row.aid)
-    }
-    for (const row of this.client.prepare(`SELECT raw_artifact_id AS aid FROM sast_runs WHERE run_id = ? AND raw_artifact_id IS NOT NULL`).all(runId) as { aid: string | null }[]) {
-      if (row.aid) artifactIds.add(row.aid)
-    }
-    for (const row of this.client.prepare(`SELECT artifact_id AS aid FROM lab_telemetry WHERE run_id = ?`).all(runId) as { aid: string | null }[]) {
-      if (row.aid) artifactIds.add(row.aid)
-    }
+    const artifactIds = collectDirectArtifactIdsForRun(this.client, runId)
     return { sessionIds, artifactIds }
   }
 
   /** Keep any legacy flat artifact/blob still referenced by any surviving table across runs. */
   filterUnreferencedFlatArtifacts(artifactIds: ReadonlySet<string>): string[] {
-    if (artifactIds.size === 0) return []
-    const checkExchange = this.client.prepare(
-      `SELECT 1 FROM broker_exchanges WHERE body_artifact_id = ? LIMIT 1`,
-    )
-    const checkEvidence = this.client.prepare(
-      `SELECT 1 FROM evidence WHERE id = ? LIMIT 1`,
-    )
-    const checkProof = this.tableExists('replay_specs')
-      ? this.client.prepare(`SELECT 1 FROM replay_specs WHERE proof_artifact_id = ? LIMIT 1`)
-      : null
-    const checkSast = this.tableExists('sast_runs')
-      ? this.client.prepare(`SELECT 1 FROM sast_runs WHERE raw_artifact_id = ? LIMIT 1`)
-      : null
-    const checkTelemetry = this.tableExists('lab_telemetry')
-      ? this.client.prepare(`SELECT 1 FROM lab_telemetry WHERE artifact_id = ? LIMIT 1`)
-      : null
-    const flatArtifactIds: string[] = []
-    for (const aid of artifactIds) {
-      if (
-        checkExchange.get(aid)
-        || checkEvidence.get(aid)
-        || checkProof?.get(aid)
-        || checkSast?.get(aid)
-        || checkTelemetry?.get(aid)
-      ) {
-        continue
-      }
-      flatArtifactIds.push(aid)
-    }
-    return flatArtifactIds
+    return filterUnreferencedDirectArtifactIds(this.client, artifactIds, table => this.tableExists(table))
   }
 
   /** Return tenant-partitioned blob paths no longer referenced by any surviving run of `tenantId`. */

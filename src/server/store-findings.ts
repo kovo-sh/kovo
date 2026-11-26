@@ -3160,4 +3160,128 @@ export class FindingsRepository {
     return this.session.db.select().from(tables.benchmarkRuns).where(eq(tables.benchmarkRuns.suite, suite))
       .orderBy(desc(tables.benchmarkRuns.createdAt)).limit(1).get() ?? null
   }
+
+  /**
+   * Persist or update a baseline or OOB-confirmed finding through the repository boundary.
+   * Enforces tenant isolation, confirmation-evidence invariants, `FindingCodec` promoted-column
+   * sync, and an explicit `run_id` predicate on every UPDATE.
+   */
+  upsertFindingRecord(input: {
+    runId: string
+    assetId: string
+    goalRevision: number
+    findingId: string
+    existingId?: string | null
+    checkId: string
+    caseId: string
+    findingKind: 'baseline_check' | 'multi_step_chain'
+    replaySpecId?: string | null
+    sourceOrigins: string[]
+    verificationTier: VerificationTier | null
+    provenance?: FindingProvenance
+    verificationClass: FindingVerificationClass
+    finding: Finding
+  }): TriagedFinding {
+    this.assertTenantRun(input.runId)
+    return this.session.transaction(() => {
+      const provenance = input.provenance ?? 'agent_only'
+      const verificationClass = verificationClassForFinding(input.finding, input.verificationClass)
+      assertConfirmedVerificationClass(input.finding.status, verificationClass)
+      if (input.finding.status === 'confirmed') {
+        this.assertConfirmationEvidence(input.runId, {
+          findingId: input.findingId,
+          replaySpecId: input.replaySpecId ?? null,
+          verification: input.finding.verification,
+          findingKind: input.findingKind,
+          verificationTier: input.verificationTier,
+          provenance,
+          status: input.finding.status,
+        })
+      }
+      if (input.existingId) {
+        const encoded = FindingCodec.toUpdateColumns({
+          finding: input.finding,
+          verificationTier: input.verificationTier,
+          verificationClass,
+        })
+        this.session.client.prepare(`
+          UPDATE findings
+          SET verification_tier = ?, verification_class = ?,
+              status = ?, severity = ?, cwe = ?, origin = ?, triage_status = ?,
+              finding = ?
+          WHERE run_id = ? AND id = ?
+        `).run(
+          encoded.verification_tier ?? null,
+          encoded.verification_class,
+          encoded.status,
+          encoded.severity,
+          encoded.cwe,
+          encoded.origin,
+          encoded.triage_status,
+          encoded.finding,
+          input.runId,
+          input.existingId,
+        )
+        return encoded.canonical
+      }
+      const encoded = FindingCodec.toRow({
+        id: input.findingId,
+        runId: input.runId,
+        assetId: input.assetId,
+        goalRevision: input.goalRevision,
+        checkId: input.checkId,
+        caseId: input.caseId,
+        findingKind: input.findingKind,
+        replaySpecId: input.replaySpecId ?? null,
+        provenance,
+        parentFindingIds: null,
+        verificationClass,
+        sourceOrigins: input.sourceOrigins,
+        verificationTier: input.verificationTier,
+        fingerprintHash: null,
+        supersededByFindingId: null,
+        counterevidence: null,
+        confidenceRationale: null,
+        severityChangeConditions: null,
+        codeLocations: null,
+        finding: input.finding,
+      })
+      this.session.client.prepare(`
+        INSERT INTO findings (
+          id, run_id, asset_id, goal_revision, check_id, case_id, finding_kind,
+          replay_spec_id, provenance, parent_finding_ids, verification_class,
+          source_origins, verification_tier, fingerprint_hash, superseded_by_finding_id,
+          counterevidence, confidence_rationale, severity_change_conditions, code_locations,
+          status, severity, cwe, origin, triage_status, finding
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        encoded.id,
+        encoded.run_id,
+        encoded.asset_id,
+        encoded.goal_revision,
+        encoded.check_id,
+        encoded.case_id,
+        encoded.finding_kind,
+        encoded.replay_spec_id,
+        encoded.provenance,
+        encoded.parent_finding_ids,
+        encoded.verification_class,
+        encoded.source_origins,
+        encoded.verification_tier,
+        encoded.fingerprint_hash,
+        encoded.superseded_by_finding_id,
+        encoded.counterevidence,
+        encoded.confidence_rationale,
+        encoded.severity_change_conditions,
+        encoded.code_locations,
+        encoded.status,
+        encoded.severity,
+        encoded.cwe,
+        encoded.origin,
+        encoded.triage_status,
+        encoded.finding,
+      )
+      return encoded.canonical
+    }, { behavior: 'immediate' })
+  }
 }

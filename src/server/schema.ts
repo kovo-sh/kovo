@@ -116,7 +116,7 @@ export const runs = sqliteTable('runs', {
   spentTokens: integer('spent_tokens').default(0).notNull(),
   spentRequests: integer('spent_requests').default(0).notNull(),
   turnsUsed: integer('turns_used').default(0).notNull(),
-  maxRpsPerOrigin: integer('max_rps_per_origin').default(10).notNull(),
+  maxRpsPerOrigin: integer('max_rps_per_origin').default(5).notNull(),
   workerConcurrency: integer('worker_concurrency').default(6).notNull(),
   workerMaxTurns: integer('worker_max_turns').default(150).notNull(),
   dynamicStepBudget: integer('dynamic_step_budget'),
@@ -494,11 +494,20 @@ export const findings = sqliteTable('findings', {
   confidenceRationale: text('confidence_rationale'),
   severityChangeConditions: text('severity_change_conditions'),
   codeLocations: text('code_locations', { mode: 'json' }).$type<CodeLocation[] | null>(),
+  status: text('status').$type<Finding['status']>().default('pending').notNull(),
+  severity: text('severity').$type<Finding['severity']>().default('medium').notNull(),
+  cwe: text('cwe'),
+  origin: text('origin').default('').notNull(),
+  triageStatus: text('triage_status').$type<'open' | 'confirmed_by_operator' | 'accepted_risk' | 'false_positive' | 'fixed'>().default('open').notNull(),
   finding: text('finding', { mode: 'json' }).$type<Finding>().notNull(),
 }, table => [
   index('findings_run').on(table.runId),
   index('findings_fingerprint').on(table.runId, table.fingerprintHash),
   index('findings_provenance').on(table.runId, table.provenance),
+  index('findings_run_verified').on(table.runId, table.verificationClass, table.supersededByFindingId),
+  index('findings_run_status_severity').on(table.runId, table.status, table.severity),
+  index('findings_run_triage').on(table.runId, table.triageStatus),
+  index('findings_run_origin_cwe').on(table.runId, table.origin, table.cwe),
   uniqueIndex('findings_check_case').on(table.runId, table.assetId, table.goalRevision, table.checkId, table.caseId),
 ])
 
@@ -577,7 +586,8 @@ export const operations = sqliteTable('operations', {
   workspaceId: text('workspace_id').notNull().references(() => workspaces.id),
   fingerprint: text('fingerprint').notNull(),
   result: text('result').notNull(),
-})
+  createdAt: integer('created_at').default(0).notNull(),
+}, table => [index('operations_created').on(table.createdAt)])
 
 export const endpoints = sqliteTable('endpoints', {
   id: text('id').primaryKey().notNull(),

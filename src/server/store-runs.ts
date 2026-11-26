@@ -205,33 +205,42 @@ export class RunsRepository {
     return trimmed || null
   }
 
-  /** Origins explicitly declined/excluded by the operator in scope review (`R2-H-5`). */
+  /** Origins explicitly declined/excluded by the operator in scope review (`R2-H-5`). Fail-closed on corrupt state. */
   getDeclinedOrigins(runId: string): string[] {
     this.run(runId)
     if (!this.hasDeclinedOriginsColumn()) return []
     const row = this.session.client.prepare('SELECT declined_origins AS declinedOrigins FROM runs WHERE id = ?').get(runId) as
       | { declinedOrigins?: string | null }
       | undefined
-    if (!row?.declinedOrigins) return []
-    try {
-      const parsed = JSON.parse(row.declinedOrigins) as unknown
-      if (!Array.isArray(parsed)) return []
-      const out = new Set<string>()
-      for (const item of parsed) {
-        if (typeof item !== 'string') continue
-        const norm = this.normalizeDeclinedOrigin(item)
-        if (norm) out.add(norm)
-      }
-      return [...out]
-    } catch {
-      return []
+    if (row?.declinedOrigins == null) {
+      throw new Error(`Corrupt runs.declined_origins for run ${runId}: expected JSON array, got null/undefined.`)
     }
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(row.declinedOrigins) as unknown
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error)
+      throw new Error(`Corrupt runs.declined_origins JSON for run ${runId}: ${detail}`)
+    }
+    if (!Array.isArray(parsed)) {
+      throw new Error(`Corrupt runs.declined_origins for run ${runId}: expected JSON array.`)
+    }
+    const out = new Set<string>()
+    for (const item of parsed) {
+      if (typeof item !== 'string') {
+        throw new Error(`Corrupt runs.declined_origins entry for run ${runId}: expected string.`)
+      }
+      const norm = this.normalizeDeclinedOrigin(item)
+      if (norm) out.add(norm)
+    }
+    return [...out]
   }
 
   isOriginDeclined(runId: string, origin: string): boolean {
+    const declined = this.getDeclinedOrigins(runId)
     const norm = this.normalizeDeclinedOrigin(origin)
     if (!norm) return false
-    return this.getDeclinedOrigins(runId).includes(norm)
+    return declined.includes(norm)
   }
 
   private writeDeclinedOrigins(runId: string, origins: Iterable<string>): string[] {
@@ -458,7 +467,7 @@ export class RunsRepository {
   }
 
   /** True when the operator explicitly locked `environmentMode` via `setEnvironmentMode()`. */
-  private hasExplicitEnvironmentMode(runId: string): boolean {
+  hasExplicitEnvironmentMode(runId: string): boolean {
     const row = this.session.db.select({ id: tables.events.id }).from(tables.events).where(and(
       eq(tables.events.workspaceId, this.session.workspace.id),
       eq(tables.events.runId, runId),

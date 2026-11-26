@@ -4,6 +4,7 @@ import { mkdirSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { drizzle } from 'drizzle-orm/node-sqlite'
+import { getTableConfig, type SQLiteTable } from 'drizzle-orm/sqlite-core'
 import {
   DEFAULT_APPROVAL_LEASE_TTL_MS,
   DEFAULT_HOST_LEASE_MAX_USES,
@@ -18,6 +19,7 @@ import {
   initCapabilityLedgerSchema,
   type CapabilityLedgerOptions,
 } from './capability-ledger.ts'
+import { validateCitingColumnsAgainstTables } from './evidence-citations.ts'
 import { FindingCodec } from './finding-codec.ts'
 import { cancelOobDrainForRun, isDeletedRunRaceError, isOobDrainActive } from './oob-drain.ts'
 import { listProjectPersonas } from './persona-vault.ts'
@@ -151,8 +153,47 @@ export {
   type WorkspaceSummary,
 } from './store-session.ts'
 
-function installConfirmationGuards(ctx: MigrationContext): void {
+/**
+ * Runtime columns added lazily by `RunsRepository` (`ensureDeclinedOriginsColumn`, `ensureRunLabelColumn`).
+ * Allowed by `Store.verifySchema()` on reopened DBs so existing user data dirs remain valid without
+ * relaxing drift detection on any unexpected column.
+ */
+const ALLOWED_LAZY_RUNTIME_COLUMNS: Readonly<Record<string, ReadonlySet<string>>> = {
+  runs: new Set(['declined_origins', 'label']),
+}
+
+/**
+ * Probe SQLite JSON1 (`json_extract` + `json_type`) capability once cleanly instead of catching
+ * and swallowing trigger `syntax error` failures at install time.
+ */
+function hasSqliteJsonSupport(client: DatabaseSync): boolean {
+  try {
+    const row = client.prepare(
+      `SELECT json_extract('{"ok":true}', '$.ok') AS ok, json_type('{"ok":true}', '$.ok') AS kind`,
+    ).get() as { ok?: unknown; kind?: unknown } | undefined
+    return Number(row?.ok) === 1 && row?.kind === 'true'
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error)
+    if (/no such function:\s*json_(?:extract|type)/i.test(msg)) return false
+    throw error
+  }
+}
+
+/**
+ * Install fail-closed confirmation-evidence triggers on `findings`.
+ *
+ * Parity contract with TS `FindingsRepository.assertConfirmationEvidence`:
+ *  - Agrees strictly on baseline checks, confirmed `last_verification_diff.verdict = 'confirmed'`,
+ *    same-run `replay_specs` single (`receipt` object + `verification.confirmed === true`) and
+ *    composite (`compositeReceipt` object + `compositeVerification.confirmed === true`) receipts,
+ *    and uncontradicted `oob.receipt_confirmed` events.
+ *  - Deliberately STRICTER than TS on legacy `floor_artifact` rows (which lack a confirming spec
+ *    diff): raw SQL cannot spoof `provenance = 'floor'` without a confirming spec or OOB receipt.
+ *  - Never swallows `syntax error`; fails closed if trigger DDL is invalid.
+ */
+function installConfirmationGuards(ctx: MigrationContext, jsonSupported = hasSqliteJsonSupport(ctx.client)): void {
   if (!ctx.tableExists('findings') || !ctx.tableExists('replay_specs')) return
+  if (!jsonSupported) return
   const guard = (name: string, event: 'INSERT' | 'UPDATE OF verification_class, replay_spec_id, finding, verification_tier') => `
     DROP TRIGGER IF EXISTS ${name};
     CREATE TRIGGER ${name}
@@ -164,39 +205,50 @@ function installConfirmationGuards(ctx: MigrationContext): void {
       AND NOT EXISTS (
         SELECT 1 FROM replay_specs s
         WHERE s.id = NEW.replay_spec_id
+          AND s.run_id = NEW.run_id
           AND (
             json_extract(s.last_verification_diff, '$.verdict') = 'confirmed'
             OR (
               json_extract(s.last_verification_diff, '$.verdict') IS NULL
               AND (
-                json_extract(s.proof_receipt, '$.verification.confirmed') = 1
-                OR json_extract(s.proof_receipt, '$.compositeVerification.confirmed') = 1
+                (
+                  json_type(s.proof_receipt, '$.receipt') = 'object'
+                  AND json_type(s.proof_receipt, '$.verification.confirmed') = 'true'
+                )
+                OR (
+                  json_type(s.proof_receipt, '$.compositeReceipt') = 'object'
+                  AND json_type(s.proof_receipt, '$.compositeVerification.confirmed') = 'true'
+                )
               )
             )
           )
       )
-      ${ctx.tableExists('events') ? `AND NOT EXISTS (
-        SELECT 1 FROM events e
-        WHERE e.run_id = NEW.run_id
-          AND e.kind = 'oob.receipt_confirmed'
-          AND json_extract(e.detail, '$.findingId') = NEW.id
+      ${ctx.tableExists('events') ? `AND NOT (
+        EXISTS (
+          SELECT 1 FROM events e
+          WHERE e.run_id = NEW.run_id
+            AND e.kind = 'oob.receipt_confirmed'
+            AND json_extract(e.detail, '$.findingId') = NEW.id
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM replay_specs s
+          WHERE s.id = NEW.replay_spec_id
+            AND s.run_id = NEW.run_id
+            AND json_extract(s.last_verification_diff, '$.verdict') IS NOT NULL
+            AND json_extract(s.last_verification_diff, '$.verdict') <> 'confirmed'
+        )
       )` : ''}
     BEGIN
       SELECT RAISE(ABORT, 'invariant.confirmation_evidence');
     END;
   `
-  try {
-    ctx.client.exec(guard('findings_confirmation_evidence_insert', 'INSERT'))
-    ctx.client.exec(guard('findings_confirmation_evidence_update', 'UPDATE OF verification_class, replay_spec_id, finding, verification_tier'))
-  } catch (error) {
-    // Never block startup on an old SQLite build that lacks json_extract; the store-level
-    // InvariantError remains authoritative.
-    if (!/json_extract|syntax error/i.test((error as Error).message)) throw error
-  }
+  ctx.client.exec(guard('findings_confirmation_evidence_insert', 'INSERT'))
+  ctx.client.exec(guard('findings_confirmation_evidence_update', 'UPDATE OF verification_class, replay_spec_id, finding, verification_tier'))
 }
 
-function installPromotedFindingSyncTriggers(ctx: MigrationContext): void {
+function installPromotedFindingSyncTriggers(ctx: MigrationContext, jsonSupported = hasSqliteJsonSupport(ctx.client)): void {
   if (!ctx.tableExists('findings')) return
+  if (!jsonSupported) return
   const statusExpr = `CASE
     WHEN json_extract(NEW.finding, '$.status') IN ('pending', 'confirmed', 'static_verified', 'dismissed', 'inconclusive')
       THEN json_extract(NEW.finding, '$.status')
@@ -233,11 +285,152 @@ function installPromotedFindingSyncTriggers(ctx: MigrationContext): void {
       WHERE id = NEW.id;
     END;
   `
-  try {
-    ctx.client.exec(buildTrigger('findings_sync_promoted_insert', 'INSERT'))
-    ctx.client.exec(buildTrigger('findings_sync_promoted_update', 'UPDATE OF finding'))
-  } catch (error) {
-    if (!/json_extract|syntax error/i.test((error as Error).message)) throw error
+  ctx.client.exec(buildTrigger('findings_sync_promoted_insert', 'INSERT'))
+  ctx.client.exec(buildTrigger('findings_sync_promoted_update', 'UPDATE OF finding'))
+}
+
+function getDrizzleSchemaTables(): Array<ReturnType<typeof getTableConfig>> {
+  const results: Array<ReturnType<typeof getTableConfig>> = []
+  for (const value of Object.values(tables)) {
+    if (!value || typeof value !== 'object') continue
+    try {
+      const config = getTableConfig(value as SQLiteTable)
+      if (config && typeof config.name === 'string' && Array.isArray(config.columns) && config.columns.length > 0) {
+        results.push(config)
+      }
+    } catch {
+      // Non-table exports (constants, types)
+    }
+  }
+  return results
+}
+
+function buildAdHocMigrationContext(client: DatabaseSync): MigrationContext {
+  return {
+    client,
+    tableExists(table: string): boolean {
+      const row = client.prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+      ).get(table) as { name?: string } | undefined
+      return Boolean(row?.name)
+    },
+    existingColumns(table: string): Set<string> {
+      const rows = client.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>
+      return new Set(rows.map(r => r.name))
+    },
+    ensureColumn(table: string, column: string, definition: string): boolean {
+      if (!this.existingColumns(table).has(column)) {
+        client.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition};`)
+        return true
+      }
+      return false
+    },
+  }
+}
+
+/**
+ * Idempotent startup repair for existing user data directories that may have been stamped at
+ * v10/v11 prior to R2-12 (missing historical v10 promoted columns / ops created_at / v11 lease
+ * columns, or pre-R2-12 confirmation triggers). Deliberately scoped to known historical columns
+ * so unexpected / injected schema drift still fails closed in `Store.verifySchema()`.
+ */
+function repairKnownSchemaDrift(client: DatabaseSync, jsonSupported: boolean): void {
+  const ctx = buildAdHocMigrationContext(client)
+  if (ctx.tableExists('operations')) {
+    const addedCreatedAt = ctx.ensureColumn('operations', 'created_at', 'INTEGER NOT NULL DEFAULT 0')
+    if (addedCreatedAt) {
+      client.prepare('UPDATE operations SET created_at = ? WHERE created_at = 0').run(Date.now())
+      client.exec('CREATE INDEX IF NOT EXISTS operations_created ON operations (created_at);')
+    }
+  }
+  if (ctx.tableExists('findings')) {
+    const addedPromoted = [
+      ctx.ensureColumn('findings', 'status', "TEXT NOT NULL DEFAULT 'pending'"),
+      ctx.ensureColumn('findings', 'severity', "TEXT NOT NULL DEFAULT 'medium'"),
+      ctx.ensureColumn('findings', 'cwe', 'TEXT'),
+      ctx.ensureColumn('findings', 'origin', "TEXT NOT NULL DEFAULT ''"),
+      ctx.ensureColumn('findings', 'triage_status', "TEXT NOT NULL DEFAULT 'open'"),
+    ].some(Boolean)
+    if (addedPromoted) {
+      FindingCodec.backfillPromotedColumns(client)
+      client.exec(`
+        CREATE INDEX IF NOT EXISTS findings_run_verified
+          ON findings (run_id, verification_class, superseded_by_finding_id);
+        CREATE INDEX IF NOT EXISTS findings_run_status_severity
+          ON findings (run_id, status, severity);
+        CREATE INDEX IF NOT EXISTS findings_run_triage
+          ON findings (run_id, triage_status);
+        CREATE INDEX IF NOT EXISTS findings_run_origin_cwe
+          ON findings (run_id, origin, cwe);
+      `)
+      installPromotedFindingSyncTriggers(ctx, jsonSupported)
+    }
+  }
+  if (ctx.tableExists('approval_leases')) {
+    ctx.ensureColumn(
+      'approval_leases',
+      'lease_scope',
+      "TEXT NOT NULL DEFAULT 'route' CHECK (lease_scope IN ('route', 'prefix', 'host_nondestructive'))",
+    )
+    ctx.ensureColumn('approval_leases', 'max_uses', 'INTEGER')
+    ctx.ensureColumn('approval_leases', 'cross_persona', 'INTEGER NOT NULL DEFAULT 0')
+  }
+  // Always ensure confirmation triggers match the current strict R2-12 SQL definition.
+  installConfirmationGuards(ctx, jsonSupported)
+}
+
+/**
+ * Fail-closed schema verification comparing live SQLite `PRAGMA table_info(...)` against every
+ * Drizzle table in `src/server/schema.ts` plus the shared `CITING_COLUMNS` registry.
+ */
+function verifyStoreSchema(client: DatabaseSync): void {
+  const schemaTables = getDrizzleSchemaTables()
+  const drift: string[] = []
+
+  for (const config of schemaTables) {
+    const rows = client.prepare(`PRAGMA table_info(${config.name})`).all() as Array<{
+      name: string
+      notnull: number
+      pk: number
+    }>
+    if (rows.length === 0) {
+      drift.push(`missing table "${config.name}"`)
+      continue
+    }
+    const sqliteByName = new Map(rows.map(r => [r.name, r]))
+    const drizzleByName = new Map(config.columns.map(c => [c.name, c]))
+    const allowedLazy = ALLOWED_LAZY_RUNTIME_COLUMNS[config.name]
+
+    for (const [colName, drCol] of drizzleByName) {
+      const sqCol = sqliteByName.get(colName)
+      if (!sqCol) {
+        drift.push(`missing column "${config.name}.${colName}"`)
+        continue
+      }
+      const expectedNotNull = Boolean(drCol.notNull || drCol.primary)
+      const actualNotNull = Boolean(sqCol.notnull || sqCol.pk)
+      if (expectedNotNull !== actualNotNull) {
+        drift.push(
+          `NOT NULL mismatch on "${config.name}.${colName}" (expected ${expectedNotNull ? 'NOT NULL' : 'NULL'}, got ${actualNotNull ? 'NOT NULL' : 'NULL'})`,
+        )
+      }
+    }
+
+    for (const colName of sqliteByName.keys()) {
+      if (!drizzleByName.has(colName) && !allowedLazy?.has(colName)) {
+        drift.push(`unexpected column "${config.name}.${colName}"`)
+      }
+    }
+  }
+
+  for (const violation of validateCitingColumnsAgainstTables(schemaTables)) {
+    drift.push(violation)
+  }
+
+  if (drift.length > 0) {
+    throw new Error(
+      `Schema verification failed (fail-closed on ${drift.length} drift issue${drift.length === 1 ? '' : 's'}): ${drift.join('; ')}`,
+    )
   }
 }
 
@@ -1312,6 +1505,11 @@ export class Store {
     return runSqliteMigrations(client, steps)
   }
 
+  /** Verify live SQLite `PRAGMA table_info(...)` matches `src/server/schema.ts` and fail closed on drift. */
+  static verifySchema(client: DatabaseSync): void {
+    verifyStoreSchema(client)
+  }
+
   readonly db
   readonly client: DatabaseSync
   readonly workspace
@@ -1389,6 +1587,9 @@ export class Store {
       }) as DatabaseSync
       this.db = drizzle({ client: this.client })
       this.migrationReport = runSqliteMigrations(rawClient, STORE_MIGRATIONS)
+      const jsonSupported = hasSqliteJsonSupport(rawClient)
+      repairKnownSchemaDrift(rawClient, jsonSupported)
+      Store.verifySchema(rawClient)
       // v6.2 full-body FTS size guard: refuse to switch on an expensive index over a database that is
       // already large unless the operator explicitly forced it. Release the process lock so a
       // subsequent correctly-configured reopen can proceed.
@@ -1545,6 +1746,7 @@ export class Store {
   }
 
   hasCascadeSchema(): boolean { return this.session.hasCascadeSchema() }
+  verifySchema(): void { Store.verifySchema(this.client) }
   onRunEvent(...args: Parameters<DbSession['onRunEvent']>) { return this.session.onRunEvent(...args) }
   onWake(...args: Parameters<DbSession['onWake']>) { return this.session.onWake(...args) }
   emitWake() { return this.session.emitWake() }
@@ -1634,6 +1836,7 @@ export class Store {
   markLabContainerOrphaned(...args: Parameters<RunsRepository['markLabContainerOrphaned']>) { return this.runsRepo.markLabContainerOrphaned(...args) }
   listLabContainers(...args: Parameters<RunsRepository['listLabContainers']>) { return this.runsRepo.listLabContainers(...args) }
   scopePolicy(...args: Parameters<RunsRepository['scopePolicy']>) { return this.runsRepo.scopePolicy(...args) }
+  hasExplicitEnvironmentMode(...args: Parameters<RunsRepository['hasExplicitEnvironmentMode']>) { return this.runsRepo.hasExplicitEnvironmentMode(...args) }
   setEnvironmentMode(...args: Parameters<RunsRepository['setEnvironmentMode']>) { return this.runsRepo.setEnvironmentMode(...args) }
   setRouteDenylist(...args: Parameters<RunsRepository['setRouteDenylist']>) { return this.runsRepo.setRouteDenylist(...args) }
   setOriginRole(...args: Parameters<RunsRepository['setOriginRole']>) { return this.runsRepo.setOriginRole(...args) }
@@ -1752,6 +1955,7 @@ export class Store {
   listCoverageEntries(...args: Parameters<FindingsRepository['listCoverageEntries']>) { return this.findingsRepo.listCoverageEntries(...args) }
   findDuplicateChainFinding(...args: Parameters<FindingsRepository['findDuplicateChainFinding']>) { return this.findingsRepo.findDuplicateChainFinding(...args) }
   upsertChainFinding(...args: Parameters<FindingsRepository['upsertChainFinding']>) { return this.findingsRepo.upsertChainFinding(...args) }
+  upsertFindingRecord(...args: Parameters<FindingsRepository['upsertFindingRecord']>) { return this.findingsRepo.upsertFindingRecord(...args) }
   upsertEndpoint(...args: Parameters<FindingsRepository['upsertEndpoint']>) { return this.findingsRepo.upsertEndpoint(...args) }
   listEndpoints(...args: Parameters<FindingsRepository['listEndpoints']>) { return this.findingsRepo.listEndpoints(...args) }
   updateEndpointCoverage(...args: Parameters<FindingsRepository['updateEndpointCoverage']>) { return this.findingsRepo.updateEndpointCoverage(...args) }
@@ -1912,6 +2116,7 @@ export class Store {
       writeReport: (...args: Parameters<RunsRepository['writeReport']>) => runsRepo.writeReport(...args),
       eventsAfter: (...args: Parameters<RunsRepository['eventsAfter']>) => runsRepo.eventsAfter(...args),
       isRunActive: (...args: Parameters<RunsRepository['isRunActive']>) => runsRepo.isRunActive(...args),
+      hasExplicitEnvironmentMode: (...args: Parameters<RunsRepository['hasExplicitEnvironmentMode']>) => runsRepo.hasExplicitEnvironmentMode(...args),
       // Findings & Exchanges
       artifact: (...args: Parameters<FindingsRepository['artifact']>) => findingsRepo.artifact(...args),
       addArtifact: (...args: Parameters<FindingsRepository['addArtifact']>) => findingsRepo.addArtifact(...args),
@@ -1926,6 +2131,7 @@ export class Store {
       getReplaySpec: (...args: Parameters<FindingsRepository['getReplaySpec']>) => findingsRepo.getReplaySpec(...args),
       listReplaySpecs: (...args: Parameters<FindingsRepository['listReplaySpecs']>) => findingsRepo.listReplaySpecs(...args),
       upsertChainFinding: (...args: Parameters<FindingsRepository['upsertChainFinding']>) => findingsRepo.upsertChainFinding(...args),
+      upsertFindingRecord: (...args: Parameters<FindingsRepository['upsertFindingRecord']>) => findingsRepo.upsertFindingRecord(...args),
       updateProposedFinding: (...args: Parameters<FindingsRepository['updateProposedFinding']>) => findingsRepo.updateProposedFinding(...args),
       triageFinding: (...args: Parameters<FindingsRepository['triageFinding']>) => findingsRepo.triageFinding(...args),
       queryFindings: (...args: Parameters<FindingsRepository['queryFindings']>) => findingsRepo.queryFindings(...args),
