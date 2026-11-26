@@ -638,7 +638,7 @@ describe('--from-dir ingestion', () => {
       assert.equal(run.confirmedKeys.length, 0)
       assert.equal(run.advisories, 2)
       assert.equal(run.contractLeaks, 0)
-      assert.equal(run.precision, 1)
+      assert.equal(run.precision, null)
     } finally {
       rmSync(root, { recursive: true, force: true })
     }

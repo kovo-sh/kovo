@@ -15,15 +15,20 @@
  *    unburned salted seeds for certification runs.
  */
 import { execFileSync } from 'node:child_process'
-import { createHash } from 'node:crypto'
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync } from 'node:fs'
+import { createHash, randomBytes } from 'node:crypto'
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { listSeeds as realisticListSeeds } from '../benchmarks/realistic-bench/generator/seeds.ts'
+import {
+  listHeldoutSeedsWithIndices,
+  type SeedDomain,
+} from '../benchmarks/realistic-bench/generator/seeds.ts'
 
 export const LEDGER_SCHEMA_VERSION = 1 as const
 export const DEFAULT_LEDGER_PATH = 'benchmarks/results/ledger.jsonl'
+export const DEFAULT_PER_RUN_LEDGER_DIR = 'benchmarks/results/runs'
 export const BURNED_SEEDS_PATH = 'benchmarks/realistic-bench/BURNED_SEEDS'
+export const EXPOSED_SEEDS_PATH = 'benchmarks/realistic-bench/EXPOSED_SEEDS.json'
 export const CERTIFYING_MIN_HELDOUT_SEEDS = 3
 
 export type BenchmarkSuiteName =
@@ -294,30 +299,186 @@ export function assertNoBurnedSeeds(
   )
 }
 
+export interface ExposedSeedRecord {
+  certificateId: string
+  recordedAt: string
+  domain: SeedDomain
+  startIndex: number
+  endIndex: number
+  seeds: number[]
+  gitSha?: string
+}
+
+export interface ExposedSeedState {
+  schemaVersion: 1
+  highestIndex: number
+  exposedSeeds: Set<number>
+  records: ExposedSeedRecord[]
+}
+
+/** Load recorded held-out seed exposure history (`highestIndex = -1` when no record exists yet). */
+export function loadExposedSeedState(
+  exposedPath: string = EXPOSED_SEEDS_PATH,
+  repoRoot: string = REPO_ROOT,
+): ExposedSeedState {
+  const abs = resolveRepoPath(exposedPath, repoRoot)
+  if (!existsSync(abs)) {
+    return { schemaVersion: 1, highestIndex: -1, exposedSeeds: new Set(), records: [] }
+  }
+  const parsed = JSON.parse(readFileSync(abs, 'utf8')) as {
+    schemaVersion?: unknown
+    highestIndex?: unknown
+    records?: unknown
+  }
+  const records: ExposedSeedRecord[] = Array.isArray(parsed.records)
+    ? parsed.records.filter((r): r is ExposedSeedRecord =>
+        typeof r === 'object' && r !== null && Array.isArray((r as ExposedSeedRecord).seeds))
+    : []
+  let highestIndex =
+    typeof parsed.highestIndex === 'number' && Number.isInteger(parsed.highestIndex)
+      ? parsed.highestIndex
+      : -1
+  const exposedSeeds = new Set<number>()
+  for (const rec of records) {
+    if (rec.domain === 'certify' && typeof rec.endIndex === 'number' && Number.isInteger(rec.endIndex)) {
+      if (rec.endIndex > highestIndex) highestIndex = rec.endIndex
+    }
+    if (rec.domain === 'certify') {
+      for (const s of rec.seeds) {
+        if (typeof s === 'number' && Number.isInteger(s)) exposedSeeds.add(s)
+      }
+    }
+  }
+  return { schemaVersion: 1, highestIndex, exposedSeeds, records }
+}
+
+/** Persist exposed held-out seeds and their highest HMAC index per certificate. */
+export function recordExposedHeldoutSeeds(
+  entry: Omit<ExposedSeedRecord, 'recordedAt'> & { recordedAt?: string },
+  exposedPath: string = EXPOSED_SEEDS_PATH,
+  repoRoot: string = REPO_ROOT,
+): ExposedSeedState {
+  const state = loadExposedSeedState(exposedPath, repoRoot)
+  const record: ExposedSeedRecord = {
+    certificateId: entry.certificateId,
+    recordedAt: entry.recordedAt ?? new Date().toISOString(),
+    domain: entry.domain,
+    startIndex: entry.startIndex,
+    endIndex: entry.endIndex,
+    seeds: [...entry.seeds],
+    ...(entry.gitSha ? { gitSha: entry.gitSha } : {}),
+  }
+  state.records.push(record)
+  if (record.domain === 'certify') {
+    if (record.endIndex > state.highestIndex) state.highestIndex = record.endIndex
+    for (const s of record.seeds) state.exposedSeeds.add(s)
+  }
+  const abs = resolveRepoPath(exposedPath, repoRoot)
+  mkdirSync(dirname(abs), { recursive: true })
+  writeFileSync(
+    abs,
+    `${JSON.stringify({
+      schemaVersion: 1,
+      highestIndex: state.highestIndex,
+      records: state.records,
+    }, null, 2)}\n`,
+    { encoding: 'utf8', mode: 0o644 },
+  )
+  return state
+}
+
+export interface DrawHeldoutSeedsOptions {
+  /** HMAC domain (`'certify'` default; `'smoke'` uses a disjoint domain that never consumes certifying indices). */
+  domain?: SeedDomain
+  /** Optional explicit start index (overrides exposure registry when provided). */
+  startIndex?: number
+  /** Exposure registry JSON path (default `benchmarks/realistic-bench/EXPOSED_SEEDS.json`). */
+  exposedPath?: string
+  /** When true on `'certify'` domain, appends an exposure record immediately. */
+  recordExposure?: boolean
+  /** Certificate identifier stored with the exposure record. */
+  certificateId?: string
+  /** Optional git SHA stored with the exposure record. */
+  gitSha?: string
+}
+
+export interface DrawHeldoutSeedsResult {
+  seeds: number[]
+  domain: SeedDomain
+  startIndex: number
+  endIndex: number
+}
+
+/**
+ * Draw `count` fresh unburned salted held-out seeds (`>= 1_000_000`) together with HMAC index bounds.
+ * Certifying draws start strictly after `highestIndex` in the exposure log and skip burned/exposed seeds.
+ * Smoke draws use the separate `'smoke'` HMAC domain so smoke runs never burn certifying seeds.
+ */
+export function drawUnburnedHeldoutSeedsWithMeta(
+  count: number = CERTIFYING_MIN_HELDOUT_SEEDS,
+  salt?: string,
+  burnedPath: string = BURNED_SEEDS_PATH,
+  repoRoot: string = REPO_ROOT,
+  opts: DrawHeldoutSeedsOptions = {},
+): DrawHeldoutSeedsResult {
+  if (!Number.isInteger(count) || count < 1) {
+    throw new Error(`drawUnburnedHeldoutSeeds: count must be a positive integer (got ${count})`)
+  }
+  const domain: SeedDomain = opts.domain ?? 'certify'
+  const burned = loadBurnedSeeds(burnedPath, repoRoot)
+  const exposedState =
+    domain === 'certify'
+      ? loadExposedSeedState(opts.exposedPath ?? EXPOSED_SEEDS_PATH, repoRoot)
+      : { schemaVersion: 1 as const, highestIndex: -1, exposedSeeds: new Set<number>(), records: [] }
+  const startIndex =
+    opts.startIndex !== undefined
+      ? opts.startIndex
+      : (domain === 'certify' ? exposedState.highestIndex + 1 : 0)
+
+  let request = count + burned.size + exposedState.exposedSeeds.size + 4
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const candidates = listHeldoutSeedsWithIndices(request, salt, { startIndex, domain })
+    const fresh = candidates.filter(
+      entry => !burned.has(entry.seed) && (domain !== 'certify' || !exposedState.exposedSeeds.has(entry.seed)),
+    )
+    if (fresh.length >= count) {
+      const selected = fresh.slice(0, count)
+      const seeds = selected.map(s => s.seed)
+      const endIndex = selected[selected.length - 1]!.index
+      if (opts.recordExposure && domain === 'certify') {
+        recordExposedHeldoutSeeds(
+          {
+            certificateId: opts.certificateId ?? `draw-${Date.now()}`,
+            domain,
+            startIndex: selected[0]!.index,
+            endIndex,
+            seeds,
+            ...(opts.gitSha ? { gitSha: opts.gitSha } : {}),
+          },
+          opts.exposedPath ?? EXPOSED_SEEDS_PATH,
+          repoRoot,
+        )
+      }
+      return { seeds, domain, startIndex: selected[0]!.index, endIndex }
+    }
+    request *= 2
+  }
+  throw new Error(`drawUnburnedHeldoutSeeds: unable to draw ${count} unburned held-out seeds`)
+}
+
 /**
  * Draw `count` fresh unburned salted held-out seeds (`>= 1_000_000`) via `listSeeds`,
- * skipping any seed present in `benchmarks/realistic-bench/BURNED_SEEDS`.
+ * skipping any seed present in `benchmarks/realistic-bench/BURNED_SEEDS` or previously exposed
+ * in certifying runs (draws start strictly after the highest recorded exposed index).
  */
 export function drawUnburnedHeldoutSeeds(
   count: number = CERTIFYING_MIN_HELDOUT_SEEDS,
   salt?: string,
   burnedPath: string = BURNED_SEEDS_PATH,
   repoRoot: string = REPO_ROOT,
+  opts: DrawHeldoutSeedsOptions = {},
 ): number[] {
-  if (!Number.isInteger(count) || count < 1) {
-    throw new Error(`drawUnburnedHeldoutSeeds: count must be a positive integer (got ${count})`)
-  }
-  const burned = loadBurnedSeeds(burnedPath, repoRoot)
-  let request = count + burned.size + 4
-  for (let attempt = 0; attempt < 8; attempt += 1) {
-    const candidates = realisticListSeeds('held-out', request, salt)
-    const fresh = candidates.filter(seed => !burned.has(seed))
-    if (fresh.length >= count) {
-      return fresh.slice(0, count)
-    }
-    request *= 2
-  }
-  throw new Error(`drawUnburnedHeldoutSeeds: unable to draw ${count} unburned held-out seeds`)
+  return drawUnburnedHeldoutSeedsWithMeta(count, salt, burnedPath, repoRoot, opts).seeds
 }
 
 // ---------------------------------------------------------------------------
@@ -363,9 +524,11 @@ export interface LedgerRow {
   certifying: boolean
   reportable: boolean
   status: 'VALID' | 'INVALID'
+  cellState?: 'ok_with_claims' | 'ok_no_claims' | 'failed_inert'
   targets: number
   confirmed: number
   recall: number | null
+  headlinePrecision?: number | null
   rawPrecision: number | null
   strictPrecision: number | null
   precision: number | null
@@ -374,6 +537,11 @@ export interface LedgerRow {
   validUnplantedCount?: number
   costUsd: number
   durationMs?: number
+  /** Optional R2-23 / R2-06 preservation & floor-vs-agentic fields. */
+  preservationRatio?: number | null
+  floorConfirmed?: number | null
+  agenticConfirmed?: number | null
+  exposedHeldoutSeeds?: number[]
   siteOutcomes?: Record<string, string>
   notes?: string[]
 }
@@ -395,6 +563,32 @@ export function validateLedgerRow(row: LedgerRow): void {
   }
 }
 
+/** Resolve a gitignored per-run JSONL ledger file path under `benchmarks/results/runs/<run-id>.jsonl`. */
+export function perRunLedgerPath(
+  runId?: string,
+  runsDir: string = DEFAULT_PER_RUN_LEDGER_DIR,
+): string {
+  const sanitized = (runId ?? '')
+    .trim()
+    .replace(/[^a-zA-Z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 80)
+  const stem =
+    sanitized || `${new Date().toISOString().replace(/[:.]/g, '-')}-${process.pid}-${randomBytes(3).toString('hex')}`
+  const filename = stem.endsWith('.jsonl') ? stem : `${stem}.jsonl`
+  return join(runsDir, filename)
+}
+
+/** Append one validated row to a gitignored per-run JSONL file (default `benchmarks/results/runs/<run-id>.jsonl`). */
+export function appendPerRunLedgerRow(
+  row: LedgerRow,
+  opts: { runId?: string; runsDir?: string; repoRoot?: string } = {},
+): { path: string; row: LedgerRow } {
+  const relPath = perRunLedgerPath(opts.runId, opts.runsDir ?? DEFAULT_PER_RUN_LEDGER_DIR)
+  const written = appendLedgerRow(row, relPath, opts.repoRoot ?? REPO_ROOT)
+  return { path: resolveRepoPath(relPath, opts.repoRoot ?? REPO_ROOT), row: written }
+}
+
 /** Append one validated row to the append-only JSONL ledger (default `benchmarks/results/ledger.jsonl`). */
 export function appendLedgerRow(
   row: LedgerRow,
@@ -406,6 +600,115 @@ export function appendLedgerRow(
   mkdirSync(dirname(abs), { recursive: true })
   appendFileSync(abs, `${JSON.stringify(row)}\n`, { encoding: 'utf8', mode: 0o644 })
   return row
+}
+
+export interface PromoteLedgerOptions {
+  targetLedgerPath?: string
+  repoRoot?: string
+  /** Skip INVALID rows during promotion (default true). */
+  requireValid?: boolean
+  /** Require certifying === true during promotion (default false). */
+  requireCertifying?: boolean
+}
+
+export interface PromoteLedgerResult {
+  promoted: number
+  skippedInvalid: number
+  skippedNonCertifying: number
+  skippedDuplicate: number
+  targetPath: string
+  rows: LedgerRow[]
+}
+
+function ledgerRowFingerprint(row: LedgerRow): string {
+  return [
+    row.suite,
+    row.gitSha,
+    row.benchmarkVersion,
+    row.effectiveConfigHash,
+    row.app,
+    row.split,
+    row.mode,
+    row.llm,
+    row.seed,
+    row.repeat,
+    row.recordedAt,
+  ].join('|')
+}
+
+function collectJsonlFiles(sourcePath: string): string[] {
+  if (!existsSync(sourcePath)) return []
+  const st = statSync(sourcePath)
+  if (st.isFile()) return [sourcePath]
+  if (!st.isDirectory()) return []
+  const out: string[] = []
+  for (const entry of readdirSync(sourcePath).sort()) {
+    const full = join(sourcePath, entry)
+    if (statSync(full).isFile() && entry.endsWith('.jsonl')) out.push(full)
+  }
+  return out
+}
+
+/**
+ * Promote validated per-run ledger rows into the committed ledger (`benchmarks/results/ledger.jsonl`).
+ * Idempotent: rows already present in the target ledger (same fingerprint) are skipped.
+ */
+export function promoteLedgerRows(
+  sourcePaths: string | readonly string[],
+  opts: PromoteLedgerOptions = {},
+): PromoteLedgerResult {
+  const repoRoot = opts.repoRoot ?? REPO_ROOT
+  const targetLedgerPath = opts.targetLedgerPath ?? DEFAULT_LEDGER_PATH
+  const targetAbs = resolveRepoPath(targetLedgerPath, repoRoot)
+  const requireValid = opts.requireValid ?? true
+  const requireCertifying = opts.requireCertifying ?? false
+
+  const existingRows = readLedgerRows(targetLedgerPath, repoRoot)
+  const seen = new Set(existingRows.map(ledgerRowFingerprint))
+
+  const sources = Array.isArray(sourcePaths) ? sourcePaths : [sourcePaths]
+  const files: string[] = []
+  for (const src of sources) {
+    files.push(...collectJsonlFiles(resolveRepoPath(src, repoRoot)))
+  }
+
+  let promoted = 0
+  let skippedInvalid = 0
+  let skippedNonCertifying = 0
+  let skippedDuplicate = 0
+  const promotedRows: LedgerRow[] = []
+
+  for (const file of files) {
+    const rows = readLedgerRows(file, repoRoot)
+    for (const row of rows) {
+      if (requireValid && row.status !== 'VALID') {
+        skippedInvalid += 1
+        continue
+      }
+      if (requireCertifying && !row.certifying) {
+        skippedNonCertifying += 1
+        continue
+      }
+      const fp = ledgerRowFingerprint(row)
+      if (seen.has(fp)) {
+        skippedDuplicate += 1
+        continue
+      }
+      seen.add(fp)
+      appendLedgerRow(row, targetLedgerPath, repoRoot)
+      promoted += 1
+      promotedRows.push(row)
+    }
+  }
+
+  return {
+    promoted,
+    skippedInvalid,
+    skippedNonCertifying,
+    skippedDuplicate,
+    targetPath: targetAbs,
+    rows: promotedRows,
+  }
 }
 
 /** Read all rows from a JSONL ledger file (returns `[]` if missing or empty). */

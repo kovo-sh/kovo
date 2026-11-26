@@ -264,10 +264,10 @@ export interface Scorecard {
   recallBySeverity: Record<Severity, { targets: number; confirmed: number; recall: number }>
   recallByClass: Record<string, { targets: number; confirmed: number }>
   staticRecall: number // (confirmed + static_only) / targets — white-box informational metric
-  precision: number // confirmedTP findings / (TP + decoyFP + unmatchedFP), 1 when no findings
+  precision: number | null // confirmedTP / (TP + decoyFP + unmatchedFP), null when no claims (never 1)
   /** Conservative precision that also charges every uncharged misclassification:
-   *  TP / (TP + decoyFP + unmatchedFP + misclassified). Phase-1 gates use this. */
-  strictPrecision: number
+   *  TP / (TP + decoyFP + unmatchedFP + misclassified), null when no claims. Phase-1 gates use this. */
+  strictPrecision: number | null
   /** Findings that hit a planted vulnerable entry's endpoint under an incompatible class, whatever
    *  their status or sibling-pair eligibility. Phase-1 requires 0. */
   incompatibleClassCount: number

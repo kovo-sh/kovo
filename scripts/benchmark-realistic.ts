@@ -3933,7 +3933,7 @@ function writeSummary(outDir: string, results: CellResult[]): void {
 }
 
 function printSummary(results: CellResult[]): void {
-  const pct = (n: number) => `${(n * 100).toFixed(1)}%`
+  const pct = (n: number | null) => (n === null ? 'n/a' : `${(n * 100).toFixed(1)}%`)
   const lines = ['', 'cell                             recall     precision  decoyFP  unmatchedFP  chain   budget', '-'.repeat(100)]
   for (const r of results) {
     const c = r.scorecard
@@ -3965,7 +3965,8 @@ async function main(): Promise<void> {
     process.stdout.write(`[realistic-bench] starting ${app} seed=${seed} ${args.mode}\n`)
     const result = finalizeCellResult(await runCell(args, app, seed, line => process.stdout.write(`${line}\n`)))
     const c = result.scorecard
-    process.stdout.write(`[realistic-bench] finished ${app} seed=${seed}: ${c.confirmed}/${c.targets} confirmed, precision ${(c.precision * 100).toFixed(1)}%, ${result.meta.durationMs}ms${result.meta.inert ? ' [INERT]' : ''}${result.meta.reconCache.requested ? ` recon=${result.meta.reconCache.hit ? 'hit' : 'miss'} saved=${result.meta.reconCache.reconTimeSavedMs}ms` : ''}${result.meta.resumedFrom ? ` resumed=yes skipped=${result.meta.snapshotSkippedMs}ms` : ''}${result.meta.snapshot.capture.requested ? ` snapshot=${result.meta.snapshot.capture.captured ? result.meta.snapshot.capture.checkpoints.join('+') : 'not-captured'}` : ''}\n`)
+    const precText = c.precision === null ? 'n/a' : `${(c.precision * 100).toFixed(1)}%`
+    process.stdout.write(`[realistic-bench] finished ${app} seed=${seed}: ${c.confirmed}/${c.targets} confirmed, precision ${precText}, ${result.meta.durationMs}ms${result.meta.inert ? ' [INERT]' : ''}${result.meta.reconCache.requested ? ` recon=${result.meta.reconCache.hit ? 'hit' : 'miss'} saved=${result.meta.reconCache.reconTimeSavedMs}ms` : ''}${result.meta.resumedFrom ? ` resumed=yes skipped=${result.meta.snapshotSkippedMs}ms` : ''}${result.meta.snapshot.capture.requested ? ` snapshot=${result.meta.snapshot.capture.captured ? result.meta.snapshot.capture.checkpoints.join('+') : 'not-captured'}` : ''}\n`)
     return result
   })
 

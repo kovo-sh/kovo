@@ -98,8 +98,8 @@ function readArgs(argv: string[]): CliArgs {
   }
 }
 
-function pct(n: number): string {
-  return `${(n * 100).toFixed(1)}%`
+function pct(n: number | null): string {
+  return n === null ? 'n/a' : `${(n * 100).toFixed(1)}%`
 }
 
 function writeOut(path: string, content: string): void {

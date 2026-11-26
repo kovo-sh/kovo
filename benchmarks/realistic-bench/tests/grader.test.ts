@@ -125,8 +125,11 @@ test('precision math with TP + decoy + unmatched', () => {
   assert.equal(s.precision, 1 / 3)
 })
 
-test('precision is 1 when no findings', () => {
-  assert.equal(gradeRun(mk({ groundTruth: gt([entry({ siteId: 'v1' })]) })).precision, 1)
+test('precision is null (never 1) when no findings', () => {
+  const empty = gradeRun(mk({ groundTruth: gt([entry({ siteId: 'v1' })]) }))
+  assert.equal(empty.precision, null)
+  assert.equal(empty.strictPrecision, null)
+  assert.equal(empty.rawPrecision, null)
 })
 
 test('static_only counts only in staticRecall', () => {

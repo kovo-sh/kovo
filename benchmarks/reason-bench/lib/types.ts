@@ -380,7 +380,8 @@ export interface Scorecard {
   recallByClass: Record<string, { targets: number; confirmed: number }>
   recallByFamily: Record<string, { targets: number; confirmed: number; recall: number }>
   staticRecall: number // (confirmed + static_only) / targets — white-box informational metric
-  precision: number // confirmedTP findings / (TP + decoyFP + unmatchedFP), 1 when no findings
+  precision: number | null // confirmedTP / (TP + decoyFP + unmatchedFP), null when no claims (never 1)
+  rawPrecision?: number | null // pre-adjudication precision, null when no claims (never 1)
   decoys: number
   decoyFalsePositives: number
   decoyFalsePositiveRate: number // decoyFP / decoys

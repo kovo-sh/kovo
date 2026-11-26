@@ -34,14 +34,23 @@ import { prepareIsolatedDataDir } from './benchmark-realistic.ts'
 import {
   CERTIFYING_MIN_HELDOUT_SEEDS,
   DEFAULT_LEDGER_PATH,
-  LEDGER_SCHEMA_VERSION,
   appendLedgerRow,
+  appendPerRunLedgerRow,
   assertNoBurnedSeeds,
   computeBenchmarkVersion,
   computeEffectiveConfig,
   drawUnburnedHeldoutSeeds,
+  promoteLedgerRows,
   resolveGitState,
+  type EffectiveConfigSnapshot,
+  type LedgerRow,
 } from './bench-ledger.ts'
+import {
+  ScorecardReader,
+  buildLedgerRow,
+  ratioOrNull,
+  type CellReadState,
+} from './score-primitives.ts'
 
 export const MATRIX_KNOWN_APPS = ['acme-saas', 'shopflow', 'opsportal'] as const
 export const MATRIX_KNOWN_MODES = ['black-box', 'grey-box', 'white-box'] as const
@@ -95,8 +104,10 @@ export interface MatrixArgs {
   certifying?: boolean
   /** Reason the matrix is non-certifying (e.g. smoke-tier, burned-dev-seed, dev-only), or null. */
   nonCertifyingReason?: string | null
-  /** Optional ledger JSONL path to append cell rows after completion. */
+  /** Optional ledger JSONL path to append cell rows after completion (in addition to default per-run ledger). */
   ledgerPath?: string | null
+  /** Optional target ledger path to promote validated per-run rows into (`--promote-ledger`). */
+  promoteLedgerPath?: string | null
   help: boolean
 }
 
@@ -139,9 +150,13 @@ export interface MatrixCellResult {
   confirmed: number
   targets: number
   precision: number | null
+  rawPrecision?: number | null
+  strictPrecision?: number | null
+  cellState?: CellReadState
   decoyFp: number
   decoys: number
   unmatchedFp: number
+  misclassifiedCount?: number
   costUsd: number
   wallMs: number
   surface: number
@@ -271,7 +286,7 @@ export function parseMatrixArgs(
     'out-dir', 'data-dir', 'no-llm', 'verifier', 'keep-data-dirs', 'smoke',
     'timeout-ms', 'min-free-gb', 'max-workers', 'no-warm-workers', 'warm-workers',
     'no-model-gate', 'model-gate', 'max-inflight-streams',
-    'held-out', 'certify', 'allow-burned-dev', 'ledger', 'help',
+    'held-out', 'certify', 'allow-burned-dev', 'ledger', 'promote-ledger', 'help',
   ])
   for (const key of Object.keys(flags)) if (!known.has(key)) fail(`unknown flag --${key}`)
 
@@ -283,6 +298,9 @@ export function parseMatrixArgs(
   const ledgerPath = flags.ledger === true
     ? DEFAULT_LEDGER_PATH
     : (typeof flags.ledger === 'string' ? flags.ledger : null)
+  const promoteLedgerPath = flags['promote-ledger'] === true
+    ? DEFAULT_LEDGER_PATH
+    : (typeof flags['promote-ledger'] === 'string' ? flags['promote-ledger'] : null)
 
   const stringFlag = (key: string): string | undefined => (typeof flags[key] === 'string' ? flags[key] as string : undefined)
   const boolFlag = (key: string): boolean => flags[key] === true
@@ -312,7 +330,9 @@ export function parseMatrixArgs(
       fail('held-out seeds (>= 1000000) require KOVO_RB_HELDOUT_SALT (>= 16 chars)')
     }
     const drawCount = smoke ? 1 : CERTIFYING_MIN_HELDOUT_SEEDS
-    seeds = drawUnburnedHeldoutSeeds(drawCount, salt)
+    seeds = drawUnburnedHeldoutSeeds(drawCount, salt, undefined, undefined, {
+      domain: smoke ? 'smoke' : 'certify',
+    })
   } else {
     seeds = [1]
   }
@@ -410,6 +430,7 @@ export function parseMatrixArgs(
     certifying,
     nonCertifyingReason,
     ledgerPath,
+    promoteLedgerPath,
     help,
   }
 }
@@ -642,10 +663,21 @@ export function collectCellResult(
   else if (missingMeta) error = 'cell meta missing (cannot prove worker sessions)'
   else if (noWorkerSessions) error = 'worker sessions unavailable (verifier cannot run agents)'
 
-  const ok = outcome.exitCode === 0 && card !== null && !configError
-  const tpPlusFp = confirmed + decoyFp + unmatchedFp
-  const rawPrecision = typeof card?.precision === 'number' && Number.isFinite(card.precision) ? card.precision : null
-  const precision = !ok ? null : (tpPlusFp > 0 ? (rawPrecision ?? confirmed / tpPlusFp) : null)
+  const normalized = ScorecardReader.read(card, {
+    exitCode: outcome.exitCode,
+    failed: outcome.exitCode !== 0 || card === null,
+    inert,
+    configError,
+    app: cell.app,
+    seed: cell.seed,
+    split: cell.seedSet,
+    mode: cell.mode,
+    llm: modelMode === 'deterministic-no-llm' ? 'deterministic-no-llm' : 'agentic',
+    durationMs: wallMs,
+    error,
+  })
+  const ok = normalized.state !== 'failed_inert'
+  const precision = normalized.headlinePrecision
 
   return {
     app: cell.app,
@@ -656,12 +688,16 @@ export function collectCellResult(
     ok,
     exitCode: outcome.exitCode,
     runtimeMs: outcome.runtimeMs,
-    confirmed,
-    targets,
+    confirmed: normalized.confirmed,
+    targets: normalized.targets,
     precision,
-    decoyFp,
-    decoys,
-    unmatchedFp,
+    rawPrecision: normalized.rawPrecision,
+    strictPrecision: normalized.strictPrecision,
+    cellState: normalized.state,
+    decoyFp: normalized.decoyFalsePositives,
+    decoys: normalized.decoys,
+    unmatchedFp: normalized.unmatchedFalsePositives,
+    misclassifiedCount: normalized.misclassifiedCount,
     costUsd,
     wallMs,
     surface,
@@ -749,14 +785,14 @@ export function summarizeMatrix(results: readonly MatrixCellResult[]): MatrixTot
   const agenticFailed = agentic.reduce((n, r) => n + r.assignments.investigationFailed, 0)
   const costUsd = results.reduce((n, r) => n + r.costUsd, 0)
   const tpPlusFp = confirmed + decoyFp + unmatchedFp
-  const failed = results.filter(r => !r.ok).length
+  const failed = results.filter(r => !r.ok || r.cellState === 'failed_inert').length
   const status: 'VALID' | 'INVALID' = failed > 0 ? 'INVALID' : 'VALID'
   const targets = results.reduce((n, r) => n + r.targets, 0)
-  const recall = failed > 0 ? null : (targets > 0 ? confirmed / targets : 0)
+  const recall = failed > 0 ? null : ratioOrNull(confirmed, targets)
   return {
     status,
     cells: results.length,
-    ok: results.filter(r => r.ok).length,
+    ok: results.length - failed,
     failed,
     inert: results.filter(r => r.inert).length,
     workerSessionFailures: results.filter(r => r.agenticExpected && !r.workerSessions).length,
@@ -764,7 +800,7 @@ export function summarizeMatrix(results: readonly MatrixCellResult[]): MatrixTot
     confirmed,
     targets,
     recall,
-    precision: tpPlusFp > 0 ? confirmed / tpPlusFp : null,
+    precision: ratioOrNull(confirmed, tpPlusFp),
     decoyFp,
     decoys: results.reduce((n, r) => n + r.decoys, 0),
     unmatchedFp,
@@ -915,6 +951,93 @@ export function renderParallelStatus(status: ParallelStatus): string {
   return `parallel ${gate} pauses=${status.pauses.length} [${pauses}] orphans=${status.orphans}`
 }
 
+export function writeAgenticMatrixLedgerRows(input: {
+  results: readonly MatrixCellResult[]
+  recordedAt: string
+  gitSha: string
+  dirty: boolean
+  benchmarkVersion: string
+  effectiveConfigHash: string
+  effectiveConfig?: EffectiveConfigSnapshot
+  certifying: boolean
+  runId?: string
+  runsDir?: string
+  ledgerPath?: string | null
+  promoteLedgerPath?: string | null
+  repoRoot?: string
+}): { perRunPath: string; rows: LedgerRow[] } {
+  const rows: LedgerRow[] = []
+  let perRunPath = ''
+  const runId = input.runId ?? `agentic-matrix-${input.recordedAt.replace(/[:.]/g, '-')}-${process.pid}`
+  for (const cellResult of input.results) {
+    const llm = cellResult.modelMode === 'deterministic-no-llm' ? 'deterministic-no-llm' : 'agentic'
+    const normalized = ScorecardReader.read(
+      {
+        app: cellResult.app,
+        seed: cellResult.seed,
+        seedSet: cellResult.seedSet,
+        mode: cellResult.mode,
+        llm,
+        targets: cellResult.targets,
+        confirmed: cellResult.confirmed,
+        precision: cellResult.precision,
+        rawPrecision: cellResult.rawPrecision,
+        strictPrecision: cellResult.strictPrecision,
+        decoys: cellResult.decoys,
+        decoyFalsePositives: cellResult.decoyFp,
+        unmatchedFalsePositives: cellResult.unmatchedFp,
+        misclassifiedCount: cellResult.misclassifiedCount ?? 0,
+        totalCostUsd: cellResult.costUsd,
+        durationMs: cellResult.wallMs,
+      },
+      {
+        failed: !cellResult.ok || cellResult.cellState === 'failed_inert',
+        inert: cellResult.inert,
+        configError: cellResult.configError,
+        exitCode: cellResult.exitCode,
+        error: cellResult.error,
+      },
+    )
+    const row = buildLedgerRow({
+      cell: normalized,
+      recordedAt: input.recordedAt,
+      suite: 'realistic-bench',
+      gitSha: input.gitSha,
+      dirty: input.dirty,
+      benchmarkVersion: input.benchmarkVersion,
+      effectiveConfigHash: input.effectiveConfigHash,
+      effectiveConfig: input.effectiveConfig,
+      app: cellResult.app,
+      split: cellResult.seedSet,
+      mode: cellResult.mode,
+      llm,
+      seed: cellResult.seed,
+      repeat: 1,
+      certifying: input.certifying && normalized.state !== 'failed_inert',
+      reportable: true,
+      costUsd: cellResult.costUsd,
+      durationMs: cellResult.wallMs,
+    })
+    const appended = appendPerRunLedgerRow(row, {
+      runId,
+      runsDir: input.runsDir,
+      repoRoot: input.repoRoot,
+    })
+    perRunPath = appended.path
+    if (input.ledgerPath) {
+      appendLedgerRow(row, input.ledgerPath, input.repoRoot)
+    }
+    rows.push(row)
+  }
+  if (input.promoteLedgerPath && perRunPath) {
+    promoteLedgerRows(perRunPath, {
+      targetLedgerPath: input.promoteLedgerPath,
+      repoRoot: input.repoRoot,
+    })
+  }
+  return { perRunPath, rows }
+}
+
 export async function main(argv: readonly string[] = process.argv.slice(2)): Promise<number> {
   let args: MatrixArgs
   try {
@@ -1007,39 +1130,20 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
     }
     const outPath = resolve(args.outDir, 'matrix.json')
     writeFileSync(outPath, `${JSON.stringify(matrix, null, 2)}\n`, { mode: 0o600 })
-    if (args.ledgerPath) {
-      for (const cellResult of results) {
-        appendLedgerRow({
-          schemaVersion: LEDGER_SCHEMA_VERSION,
-          recordedAt: matrix.generatedAt,
-          suite: 'realistic-bench',
-          gitSha: gitState.gitSha,
-          dirty: gitState.dirty,
-          benchmarkVersion,
-          effectiveConfigHash,
-          effectiveConfig,
-          app: cellResult.app,
-          split: cellResult.seedSet,
-          mode: cellResult.mode,
-          llm: cellResult.modelMode === 'deterministic-no-llm' ? 'deterministic-no-llm' : 'agentic',
-          seed: cellResult.seed,
-          repeat: 1,
-          certifying: Boolean(args.certifying) && cellResult.ok,
-          reportable: true,
-          status: cellResult.ok ? 'VALID' : 'INVALID',
-          targets: cellResult.targets,
-          confirmed: cellResult.confirmed,
-          recall: cellResult.ok ? (cellResult.targets > 0 ? cellResult.confirmed / cellResult.targets : 0) : null,
-          rawPrecision: cellResult.precision,
-          strictPrecision: cellResult.precision,
-          precision: cellResult.precision,
-          decoyFalsePositives: cellResult.decoyFp,
-          unmatchedFalsePositives: cellResult.unmatchedFp,
-          costUsd: cellResult.costUsd,
-          durationMs: cellResult.wallMs,
-        }, args.ledgerPath)
-      }
-    }
+    // Default per-run ledger writing (gitignored benchmarks/results/runs/<run-id>.jsonl);
+    // explicit promotion to committed ledger via --promote-ledger (or legacy --ledger).
+    writeAgenticMatrixLedgerRows({
+      results,
+      recordedAt: matrix.generatedAt,
+      gitSha: gitState.gitSha,
+      dirty: gitState.dirty,
+      benchmarkVersion,
+      effectiveConfigHash,
+      effectiveConfig,
+      certifying: Boolean(args.certifying),
+      ledgerPath: args.ledgerPath,
+      promoteLedgerPath: args.promoteLedgerPath,
+    })
     process.stdout.write(`[matrix] ${results.length} cell(s) -> ${outPath}\n`)
     process.stdout.write(`${renderMatrixTable(results)}\n${renderMatrixSummary(totals)}\n`)
     process.stdout.write(`${renderParallelStatus({

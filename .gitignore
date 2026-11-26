@@ -16,3 +16,6 @@ __pycache__/
 # landing replay recordings (regenerate with docs/replay/record.mjs)
 docs/replay/*.mp4
 docs/replay/*.webm
+
+# Per-run benchmark ledger files (promoted into benchmarks/results/ledger.jsonl at batch boundaries)
+benchmarks/results/runs/

@@ -57,12 +57,26 @@ import { pathToFileURL } from 'node:url'
 import { MAX_RUN_WORKER_CONCURRENCY } from './benchmark-env.ts'
 import {
   CERTIFYING_MIN_HELDOUT_SEEDS,
+  DEFAULT_LEDGER_PATH,
+  appendLedgerRow,
+  appendPerRunLedgerRow,
   assertNoBurnedSeeds,
   computeBenchmarkVersion,
   computeEffectiveConfig,
   drawUnburnedHeldoutSeeds,
+  drawUnburnedHeldoutSeedsWithMeta,
   loadBurnedSeeds,
+  promoteLedgerRows,
+  recordExposedHeldoutSeeds,
+  resolveGitState,
+  type LedgerRow,
 } from './bench-ledger.ts'
+import {
+  ScorecardReader,
+  buildLedgerRow,
+  ratioOrNull,
+  type CellReadState,
+} from './score-primitives.ts'
 
 // ---------------------------------------------------------------------------------------------
 // Constants and contract types
@@ -122,15 +136,19 @@ export interface ScorecardLike {
   seed: number
   seedSet?: string
   mode?: string
+  status?: 'VALID' | 'INVALID'
+  failed?: boolean
+  inert?: boolean
   targets: number
   confirmed: number
-  recall?: number
-  precision?: number
+  recall?: number | null
+  precision?: number | null
+  rawPrecision?: number | null
   decoys?: number
   decoyFalsePositives?: number
   unmatchedFalsePositives?: number
   /** Conservative precision that also charges uncharged misclassifications (Phase-1 gate). */
-  strictPrecision?: number
+  strictPrecision?: number | null
   /** Class-incompatible claims on planted target endpoints (Phase-1 requires 0). */
   incompatibleClassCount?: number
   misclassifiedFindingIds?: string[]
@@ -192,12 +210,17 @@ export interface RealismRun {
   targets: number
   confirmed: number
   recall: number
-  precision: number
+  precision: number | null
+  rawPrecision?: number | null
+  /** 3-state ScorecardReader classification (`ok_with_claims` | `ok_no_claims` | `failed_inert`). */
+  cellState?: CellReadState
+  failed?: boolean
+  inert?: boolean
   /** Harness cell concurrency (parallel app/seed cells; scheduling only). */
   cellConcurrency: number | null
   /** In-run investigation worker slots handed to Execution for this cell. */
   workerConcurrency: number | null
-  strictPrecision: number
+  strictPrecision: number | null
   /** null = the artifact predates the class-hygiene field (gate treats it as unmeasured). */
   incompatibleClassCount: number | null
   misclassifiedFindingIds: string[]
@@ -225,8 +248,12 @@ export interface ReasonCellLike {
   llm: LlmMode
   targets: number
   confirmed: number
-  recall: number
-  precision: number
+  recall: number | null
+  precision: number | null
+  rawPrecision?: number | null
+  cellState?: CellReadState
+  failed?: boolean
+  inert?: boolean
   decoyFalsePositives: number
   unmatchedFalsePositives: number
   sites: ReasonSiteLike[]
@@ -475,7 +502,10 @@ export interface RunEvidence {
   provenanceSource: string
   advisories: number
   contractLeaks: number
-  precision: number
+  precision: number | null
+  rawPrecision: number | null
+  strictPrecision: number | null
+  cellState: CellReadState
   registeredFindings: number
 }
 
@@ -570,13 +600,11 @@ export function buildRunEvidence(
     : (Array.isArray(card.advisories) ? card.advisories.length + recordArray(card.advisoryFindings).length : null)
   const advisories = advisoryRecords.length > 0 ? advisoryRecords.length : (explicitAdvisories ?? 0)
 
-  let precision = asNumber(card.precision, 1)
-  if (allRecords.length) {
-    // The grader's confirmed target count is the authoritative TP set; contract leaks add FP.
-    const tp = card.confirmed
-    const fp = leakRecords.length + asNumber(card.decoyFalsePositives) + asNumber(card.unmatchedFalsePositives)
-    precision = tp + fp > 0 ? tp / (tp + fp) : 1
-  }
+  const readerCell = ScorecardReader.read(card, {
+    failed: card.failed === true || card.status === 'INVALID' || meta?.failed === true,
+    inert: card.inert === true || meta?.inert === true,
+    contractLeaks: leakRecords.length,
+  })
 
   return {
     provenance,
@@ -584,7 +612,10 @@ export function buildRunEvidence(
     provenanceSource: source,
     advisories,
     contractLeaks: leakRecords.length,
-    precision,
+    precision: readerCell.headlinePrecision,
+    rawPrecision: readerCell.rawPrecision,
+    strictPrecision: readerCell.strictPrecision,
+    cellState: readerCell.state,
     registeredFindings: allRecords.length,
   }
 }
@@ -941,7 +972,7 @@ function isScorecard(value: unknown): value is ScorecardLike {
     && typeof value.seed === 'number'
     && typeof value.targets === 'number'
     && typeof value.confirmed === 'number'
-    && (Array.isArray(value.vulns) || typeof value.precision === 'number')
+    && (Array.isArray(value.vulns) || typeof value.precision === 'number' || value.precision === null)
 }
 
 function isReasonReport(value: unknown): value is { cells: unknown[] } {
@@ -998,9 +1029,13 @@ function realismRunFromCard(
     confirmed: card.confirmed,
     recall,
     precision: evidence.precision,
+    rawPrecision: evidence.rawPrecision,
+    cellState: evidence.cellState,
+    failed: evidence.cellState === 'failed_inert',
+    inert: card.inert === true || meta?.inert === true,
     cellConcurrency: asFiniteNumber(meta?.cellConcurrency),
     workerConcurrency: asFiniteNumber(meta?.workerConcurrency),
-    strictPrecision: asNumber(card.strictPrecision, asNumber(card.precision, 1)),
+    strictPrecision: evidence.strictPrecision,
     incompatibleClassCount: typeof card.incompatibleClassCount === 'number' ? card.incompatibleClassCount : null,
     misclassifiedFindingIds: Array.isArray(card.misclassifiedFindingIds) ? card.misclassifiedFindingIds.map(String) : [],
     decoyFalsePositives: asNumber(card.decoyFalsePositives),
@@ -1022,17 +1057,26 @@ function reasonCellFromScorecard(
   llm: LlmMode,
 ): ReasonCellLike {
   const vulns = Array.isArray(card.vulns) ? card.vulns : []
+  const normalized = ScorecardReader.read(card, {
+    failed: card.failed === true || card.status === 'INVALID' || meta?.failed === true,
+    inert: card.inert === true || meta?.inert === true,
+    llm,
+  })
   return {
     app: card.app,
     seed: card.seed,
     mode: card.mode ?? 'grey-box',
     llm,
-    targets: card.targets,
-    confirmed: card.confirmed,
-    recall: asNumber(card.recall, ratio(card.confirmed, card.targets)),
-    precision: asNumber(card.precision, 1),
-    decoyFalsePositives: asNumber(card.decoyFalsePositives),
-    unmatchedFalsePositives: asNumber(card.unmatchedFalsePositives),
+    targets: normalized.targets,
+    confirmed: normalized.confirmed,
+    recall: normalized.recall,
+    precision: normalized.headlinePrecision,
+    rawPrecision: normalized.rawPrecision,
+    cellState: normalized.state,
+    failed: normalized.failed,
+    inert: normalized.inert,
+    decoyFalsePositives: normalized.decoyFalsePositives,
+    unmatchedFalsePositives: normalized.unmatchedFalsePositives,
     sites: vulns.map(v => ({ siteId: String(v.siteId), confirmed: v.outcome === 'confirmed' })),
   }
 }
@@ -1044,17 +1088,26 @@ function reasonCellsFromReport(report: { cells: unknown[] }): ReasonCellLike[] {
     const llm = llmOf(raw.llm)
     if (!llm) continue
     const sitesRaw = Array.isArray(raw.sites) ? raw.sites : []
-    cells.push({
-      app: typeof raw.app === 'string' ? raw.app : 'unknown',
-      seed: asNumber(raw.seed, 0),
-      mode: typeof raw.mode === 'string' ? raw.mode : 'grey-box',
+    const normalized = ScorecardReader.read(raw, {
+      failed: raw.failed === true || raw.status === 'INVALID',
+      inert: raw.inert === true,
       llm,
-      targets: asNumber(raw.targets),
-      confirmed: asNumber(raw.confirmed),
-      recall: asNumber(raw.recall, ratio(asNumber(raw.confirmed), asNumber(raw.targets))),
-      precision: asNumber(raw.precision, 1),
-      decoyFalsePositives: asNumber(raw.decoyFalsePositives),
-      unmatchedFalsePositives: asNumber(raw.unmatchedFalsePositives),
+    })
+    cells.push({
+      app: normalized.app,
+      seed: normalized.seed,
+      mode: normalized.mode,
+      llm,
+      targets: normalized.targets,
+      confirmed: normalized.confirmed,
+      recall: normalized.recall,
+      precision: normalized.headlinePrecision,
+      rawPrecision: normalized.rawPrecision,
+      cellState: normalized.state,
+      failed: normalized.failed,
+      inert: normalized.inert,
+      decoyFalsePositives: normalized.decoyFalsePositives,
+      unmatchedFalsePositives: normalized.unmatchedFalsePositives,
       sites: sitesRaw.filter(isRecord).map(site => ({
         siteId: String(site.siteId),
         confirmed: site.confirmed === true || site.outcome === 'confirmed',
@@ -1207,6 +1260,8 @@ export interface SplitStats {
 
 export interface Certificate {
   schemaVersion: 1
+  status: 'VALID' | 'INVALID'
+  failedCells: number
   generatedAt: string
   gitSha: string
   benchmarkVersion: string
@@ -1261,7 +1316,7 @@ export interface Certificate {
     keyBased: { dev: number | null; heldout: number | null }
   }
   precision: {
-    worst: number
+    worst: number | null
     worstRun: string | null
     decoyFalsePositives: number
     unmatchedFalsePositives: number
@@ -1272,8 +1327,8 @@ export interface Certificate {
     incompatibleClassCount: number
     /** Runs whose artifact predates the hygiene field (gate fails rather than assuming 0). */
     incompatibleClassUnmeasured: number
-    /** Worst-run strict precision (charges uncharged misclassifications). */
-    worstStrictPrecision: number
+    /** Worst-run strict precision (charges uncharged misclassifications), or null when no claims. */
+    worstStrictPrecision: number | null
     /** Runs that relied on the documented sibling tolerance (should be 0 for Phase-1). */
     misclassifiedRuns: number
     misclassifiedFindingIds: string[]
@@ -1429,15 +1484,28 @@ function provenanceSummary(runs: RealismRun[]): ProvenanceSummary | null {
 }
 
 
-function aggregateReason(cells: ReasonCellLike[]): { confirmed: number; targets: number; recall: number | null; precision: number | null; decoyFP: number; unmatchedFP: number } {
-  if (!cells.length) return { confirmed: 0, targets: 0, recall: null, precision: null, decoyFP: 0, unmatchedFP: 0 }
+function aggregateReason(
+  cells: ReasonCellLike[],
+  expectedTargets?: number,
+): { confirmed: number; targets: number; recall: number | null; precision: number | null; decoyFP: number; unmatchedFP: number; failedCells: number } {
+  if (!cells.length) {
+    return { confirmed: 0, targets: 0, recall: null, precision: null, decoyFP: 0, unmatchedFP: 0, failedCells: 0 }
+  }
   const siteKeys = new Set<string>()
   const confirmedKeys = new Set<string>()
   const maxTargetsByApp = new Map<string, number>()
   const maxConfirmedByApp = new Map<string, number>()
   let decoyFP = 0
   let unmatchedFP = 0
+  let failedCells = 0
+  const measuredPrecisions: number[] = []
+
   for (const cell of cells) {
+    const isFailed = cell.cellState === 'failed_inert' || cell.failed === true || cell.inert === true
+    if (isFailed) {
+      failedCells += 1
+      continue
+    }
     decoyFP += cell.decoyFalsePositives
     unmatchedFP += cell.unmatchedFalsePositives
     maxTargetsByApp.set(cell.app, Math.max(maxTargetsByApp.get(cell.app) ?? 0, cell.targets))
@@ -1447,21 +1515,36 @@ function aggregateReason(cells: ReasonCellLike[]): { confirmed: number; targets:
       siteKeys.add(key)
       if (site.confirmed) confirmedKeys.add(key)
     }
+    const tpPlusFp = cell.confirmed + cell.decoyFalsePositives + cell.unmatchedFalsePositives
+    if (tpPlusFp > 0) {
+      const computed = ratioOrNull(cell.confirmed, tpPlusFp)
+      const cellPrec =
+        typeof cell.precision === 'number' && Number.isFinite(cell.precision) && computed !== null
+          ? Math.min(cell.precision, computed)
+          : computed
+      if (cellPrec !== null) measuredPrecisions.push(cellPrec)
+    }
   }
-  let targets = siteKeys.size
+  let observedTargets = siteKeys.size
   let confirmed = confirmedKeys.size
   if (!siteKeys.size) {
-    targets = sum([...maxTargetsByApp.values()])
+    observedTargets = sum([...maxTargetsByApp.values()])
     confirmed = sum([...maxConfirmedByApp.values()])
   }
-  const worst = Math.min(...cells.map(cell => cell.precision))
+  // Never let a crashed or missing app cell shrink the reason-bench denominator!
+  const targets =
+    expectedTargets !== undefined && expectedTargets > 0
+      ? Math.max(observedTargets, expectedTargets)
+      : observedTargets
+  const worst = measuredPrecisions.length > 0 ? Math.min(...measuredPrecisions) : null
   return {
     confirmed,
     targets,
-    recall: ratio(confirmed, targets),
-    precision: Number.isFinite(worst) ? worst : null,
+    recall: failedCells > 0 ? null : ratioOrNull(confirmed, targets),
+    precision: failedCells > 0 ? null : worst,
     decoyFP,
     unmatchedFP,
+    failedCells,
   }
 }
 
@@ -1542,12 +1625,41 @@ export function evaluateCertification(
   }
 
   // Worst-run precision and false-positive totals across every realism cell.
+  // Normalize each run through ScorecardReader semantics: 0-claim runs report null (never 1),
+  // and any failed/inert run marks the certificate INVALID.
+  const failedRealismRuns = runs.filter(
+    run => run.cellState === 'failed_inert' || run.failed === true || run.inert === true,
+  )
   const precisionRuns = runs
-  const worstRun = precisionRuns.reduce<RealismRun | null>(
-    (worst, run) => (worst === null || run.precision < worst.precision ? run : worst),
+  const measuredPrecisionRuns: Array<{ run: RealismRun; precision: number }> = []
+  const measuredStrictPrecisions: number[] = []
+  for (const run of precisionRuns) {
+    if (run.cellState === 'failed_inert' || run.failed === true || run.inert === true) continue
+    const headlineDenom = run.confirmed + run.decoyFalsePositives + run.unmatchedFalsePositives + run.contractLeaks
+    const strictDenom = headlineDenom + run.misclassifiedFindingIds.length
+    const computedHeadline = ratioOrNull(run.confirmed, headlineDenom)
+    const computedStrict = ratioOrNull(run.confirmed, strictDenom)
+    if (computedHeadline !== null) {
+      const effectivePrec =
+        typeof run.precision === 'number' && Number.isFinite(run.precision)
+          ? Math.min(run.precision, computedHeadline)
+          : computedHeadline
+      measuredPrecisionRuns.push({ run, precision: effectivePrec })
+    }
+    if (computedStrict !== null) {
+      const effectiveStrict =
+        typeof run.strictPrecision === 'number' && Number.isFinite(run.strictPrecision)
+          ? Math.min(run.strictPrecision, computedStrict)
+          : computedStrict
+      measuredStrictPrecisions.push(effectiveStrict)
+    }
+  }
+  const worstEntry = measuredPrecisionRuns.reduce<{ run: RealismRun; precision: number } | null>(
+    (worst, entry) => (worst === null || entry.precision < worst.precision ? entry : worst),
     null,
   )
-  const worstPrecision = precisionRuns.length ? (worstRun?.precision ?? 0) : 0
+  const worstRun = worstEntry?.run ?? null
+  const worstPrecision: number | null = worstEntry ? worstEntry.precision : null
   const decoyFP = sum(runs.map(run => run.decoyFalsePositives))
   const unmatchedFP = sum(runs.map(run => run.unmatchedFalsePositives))
   // Class-label hygiene (reviewer gate): incompatible class claims on planted targets and the
@@ -1556,9 +1668,9 @@ export function evaluateCertification(
   const incompatibleClassCount = sum(runs.map(run => run.incompatibleClassCount ?? 0))
   const misclassifiedRuns = runs.filter(run => run.misclassifiedFindingIds.length > 0).length
   const misclassifiedFindingIds = runs.flatMap(run => run.misclassifiedFindingIds)
-  const worstStrictPrecision = precisionRuns.length
-    ? Math.min(...precisionRuns.map(run => run.strictPrecision))
-    : 0
+  const worstStrictPrecision: number | null = measuredStrictPrecisions.length
+    ? Math.min(...measuredStrictPrecisions)
+    : null
 
   // Leads invariant on unified runs only.
   const leadViolations: Certificate['leads']['violations'] = []
@@ -1577,11 +1689,13 @@ export function evaluateCertification(
     }
   }
 
-  // Reason-bench.
+  // Reason-bench (denominators ALWAYS count expected targets when reason cells are present).
   const reasonFloorCells = reasonRuns.flatMap(run => run.cells.filter(cell => cell.llm === 'deterministic-no-llm'))
   const reasonAgenticCells = reasonRuns.flatMap(run => run.cells.filter(cell => cell.llm === 'agentic'))
-  const reasonFloor = aggregateReason(reasonFloorCells)
-  const reasonAgentic = aggregateReason(reasonAgenticCells)
+  const reasonFloor = aggregateReason(reasonFloorCells, reasonFloorCells.length > 0 ? thresholds.reasonTargets : undefined)
+  const reasonAgentic = aggregateReason(reasonAgenticCells, reasonAgenticCells.length > 0 ? thresholds.reasonTargets : undefined)
+  const failedCells = failedRealismRuns.length + reasonFloor.failedCells + reasonAgentic.failedCells
+  const certStatus: 'VALID' | 'INVALID' = failedCells > 0 ? 'INVALID' : 'VALID'
 
   // Matrix coverage.
   const observed: Certificate['matrix']['observed'] = {}
@@ -1614,9 +1728,13 @@ export function evaluateCertification(
   const monotonicOk = !thresholds.requireMonotonic
     || (monotonicPairs.length >= apps.length * 2 && monotonicFailures.length === 0)
 
-  const reasonFloorOk = reasonFloor.confirmed === thresholds.reasonFloorConfirmed
+  const reasonFloorOk = reasonFloor.failedCells === 0
+    && reasonFloor.confirmed === thresholds.reasonFloorConfirmed
     && reasonFloor.targets === thresholds.reasonTargets
-  const reasonAgenticMeets = reasonAgentic.recall !== null
+    && reasonFloor.decoyFP === 0
+    && reasonFloor.unmatchedFP === 0
+  const reasonAgenticMeets = reasonAgentic.failedCells === 0
+    && reasonAgentic.recall !== null
     && reasonAgentic.recall >= thresholds.reasonAgenticMin
     && reasonAgentic.precision !== null
     && reasonAgentic.precision >= thresholds.worstPrecision
@@ -1717,15 +1835,15 @@ export function evaluateCertification(
       'worst_run_precision',
       'Worst-run precision across every realism cell (decoy + unmatched FP = 0)',
       `== ${thresholds.worstPrecision}`,
-      `${worstPrecision.toFixed(3)} (${worstRun ? `${worstRun.app}@${worstRun.seed}` : 'no runs'})`,
-      precisionRuns.length > 0 && worstPrecision >= thresholds.worstPrecision,
+      `${worstPrecision === null ? 'n/a' : worstPrecision.toFixed(3)} (${worstRun ? `${worstRun.app}@${worstRun.seed}` : precisionRuns.length ? 'no claims' : 'no runs'})`,
+      failedCells === 0 && precisionRuns.length > 0 && decoyFP === 0 && unmatchedFP === 0 && (worstPrecision === null || worstPrecision >= thresholds.worstPrecision),
     ),
     criterion(
       'class_hygiene',
       'Class-label hygiene: incompatible class claims on planted targets must be 0; strict precision charges sibling tolerance',
       'incompatible_class_count == 0 (worst strict precision == 1)',
-      `${incompatibleClassCount} incompatible class claim(s) across ${precisionRuns.length} run(s), ${incompatibleClassUnmeasured} unmeasured; worst strict precision ${worstStrictPrecision.toFixed(3)}; ${misclassifiedFindingIds.length} uncharged misclassification(s) in ${misclassifiedRuns} run(s)`,
-      incompatibleClassCount === 0 && incompatibleClassUnmeasured === 0 && worstStrictPrecision >= thresholds.worstPrecision,
+      `${incompatibleClassCount} incompatible class claim(s) across ${precisionRuns.length} run(s), ${incompatibleClassUnmeasured} unmeasured; worst strict precision ${worstStrictPrecision === null ? 'n/a' : worstStrictPrecision.toFixed(3)}; ${misclassifiedFindingIds.length} uncharged misclassification(s) in ${misclassifiedRuns} run(s)`,
+      failedCells === 0 && incompatibleClassCount === 0 && incompatibleClassUnmeasured === 0 && (worstStrictPrecision === null || worstStrictPrecision >= thresholds.worstPrecision),
     ),
     criterion(
       'agentic_lift_dev',
@@ -1843,9 +1961,21 @@ export function evaluateCertification(
     mode: 'grey-box',
   })
 
-  const verdict = criteria.every(item => item.status === 'PASS') ? 'PASS' : 'FAIL'
+  if (failedCells > 0) {
+    criteria.unshift(criterion(
+      'cell_validity',
+      'All realism and reason cells completed validly (0 failed/inert cells)',
+      '0 failed_inert cells (status VALID)',
+      `INVALID (${failedCells} failed_inert cell(s): realism=${failedRealismRuns.length}, reasonFloor=${reasonFloor.failedCells}, reasonAgentic=${reasonAgentic.failedCells})`,
+      false,
+    ))
+  }
+
+  const verdict = certStatus === 'VALID' && criteria.every(item => item.status === 'PASS') ? 'PASS' : 'FAIL'
   return {
     schemaVersion: 1,
+    status: certStatus,
+    failedCells,
     generatedAt: options.generatedAt ?? new Date().toISOString(),
     gitSha: options.gitSha ?? resolveGitSha(),
     benchmarkVersion,
@@ -1951,7 +2081,7 @@ export function renderCertificateMarkdown(cert: Certificate): string {
   const lines: string[] = []
   lines.push('# Kovo Hunter v6 Phase-1 certification')
   lines.push('')
-  lines.push(`**Verdict: ${cert.verdict}**`)
+  lines.push(`**Verdict: ${cert.verdict}** (status: \`${cert.status}\`, failedCells: ${cert.failedCells})`)
   lines.push('')
   lines.push(`- mode: \`${cert.mode}\``)
   lines.push(`- generated: ${cert.generatedAt}`)
@@ -2041,8 +2171,8 @@ export function renderCertificateMarkdown(cert: Certificate): string {
   lines.push(`- floor preservation (median): ${cert.preservation.median === null ? 'unmeasured' : cert.preservation.median.toFixed(3)}`
     + ` (${cert.preservation.ratios.length} measured, ${cert.preservation.unmeasuredRuns} unmeasured)`)
   lines.push(`- key-based floor retention: dev ${cert.preservation.keyBased.dev === null ? 'n/a' : pct(cert.preservation.keyBased.dev)}, held-out ${cert.preservation.keyBased.heldout === null ? 'n/a' : pct(cert.preservation.keyBased.heldout)}`)
-  lines.push(`- worst-run precision: ${cert.precision.worst.toFixed(3)}; decoy FP ${cert.precision.decoyFalsePositives}; unmatched FP ${cert.precision.unmatchedFalsePositives}`)
-  lines.push(`- class hygiene: ${cert.hygiene.incompatibleClassCount} incompatible class claim(s) (${cert.hygiene.incompatibleClassUnmeasured} unmeasured); worst strict precision ${cert.hygiene.worstStrictPrecision.toFixed(3)}; ${cert.hygiene.misclassifiedFindingIds.length} uncharged misclassification(s) in ${cert.hygiene.misclassifiedRuns} run(s)`)
+  lines.push(`- worst-run precision: ${cert.precision.worst === null ? 'n/a' : cert.precision.worst.toFixed(3)}; decoy FP ${cert.precision.decoyFalsePositives}; unmatched FP ${cert.precision.unmatchedFalsePositives}`)
+  lines.push(`- class hygiene: ${cert.hygiene.incompatibleClassCount} incompatible class claim(s) (${cert.hygiene.incompatibleClassUnmeasured} unmeasured); worst strict precision ${cert.hygiene.worstStrictPrecision === null ? 'n/a' : cert.hygiene.worstStrictPrecision.toFixed(3)}; ${cert.hygiene.misclassifiedFindingIds.length} uncharged misclassification(s) in ${cert.hygiene.misclassifiedRuns} run(s)`)
   lines.push(`- leads invariant: ${cert.leads.violations.length} violation(s), ${cert.leads.unmeasuredRuns} unmeasured, ${cert.leads.checkedRuns} checked`)
   lines.push('')
   lines.push('## Advisories (outside confirmed recall/precision)')
@@ -2402,6 +2532,8 @@ export interface CliOptions {
   skipReason: boolean
   keepDataDirs: boolean
   checkMatrix: boolean
+  ledgerPath?: string | null
+  promoteLedgerPath?: string | null
   help: boolean
 }
 
@@ -2508,7 +2640,7 @@ export function parseCli(argv: string[], env: NodeJS.ProcessEnv = process.env): 
     'heldout-seed', 'heldout-seeds', 'allow-burned-dev',
     'dev-runs', 'floor-heldout-runs', 'heldout-runs', 'concurrency', 'worker-concurrency', 'data-dir', 'verifier',
     'use-newgrp', 'budget-usd', 'max-duration-ms', 'reason-runs', 'skip-reason', 'keep-data-dirs',
-    'no-matrix-check', 'help',
+    'no-matrix-check', 'ledger', 'promote-ledger', 'help',
   ])
   for (const key of Object.keys(a)) if (!known.has(key)) fail(`unknown flag --${key}`)
   if (a.help === true) {
@@ -2608,8 +2740,89 @@ export function parseCli(argv: string[], env: NodeJS.ProcessEnv = process.env): 
     skipReason: a['skip-reason'] === true,
     keepDataDirs: a['keep-data-dirs'] === true,
     checkMatrix: a['no-matrix-check'] !== true,
+    ledgerPath: a.ledger === true ? DEFAULT_LEDGER_PATH : (typeof a.ledger === 'string' ? a.ledger : null),
+    promoteLedgerPath: a['promote-ledger'] === true
+      ? DEFAULT_LEDGER_PATH
+      : (typeof a['promote-ledger'] === 'string' ? a['promote-ledger'] : null),
     help: false,
   }
+}
+
+export function writePhase1CertifyLedgerRows(input: {
+  runs: readonly RealismRun[]
+  certificate: Certificate
+  runId?: string
+  runsDir?: string
+  ledgerPath?: string | null
+  promoteLedgerPath?: string | null
+  repoRoot?: string
+}): { perRunPath: string; rows: LedgerRow[] } {
+  const gitState = resolveGitState(input.repoRoot)
+  const rows: LedgerRow[] = []
+  let perRunPath = ''
+  const runId = input.runId ?? `certify-phase1-${input.certificate.generatedAt.replace(/[:.]/g, '-')}-${process.pid}`
+  for (const run of input.runs) {
+    const readerCell = ScorecardReader.read(
+      {
+        app: run.app,
+        seed: run.seed,
+        seedSet: run.seedSet,
+        mode: run.mode,
+        llm: run.llm,
+        targets: run.targets,
+        confirmed: run.confirmed,
+        precision: run.precision,
+        rawPrecision: run.rawPrecision,
+        strictPrecision: run.strictPrecision,
+        decoyFalsePositives: run.decoyFalsePositives,
+        unmatchedFalsePositives: run.unmatchedFalsePositives,
+        misclassifiedFindingIds: run.misclassifiedFindingIds,
+      },
+      {
+        failed: run.cellState === 'failed_inert' || run.failed === true,
+        inert: run.inert === true,
+        contractLeaks: run.contractLeaks,
+      },
+    )
+    const row = buildLedgerRow({
+      cell: readerCell,
+      recordedAt: input.certificate.generatedAt,
+      suite: 'realistic-bench',
+      gitSha: input.certificate.gitSha,
+      dirty: gitState.dirty,
+      benchmarkVersion: input.certificate.benchmarkVersion,
+      effectiveConfigHash: input.certificate.effectiveConfigHash,
+      app: run.app,
+      split: run.seedSet,
+      mode: run.mode,
+      llm: run.llm,
+      seed: run.seed,
+      repeat: 1,
+      certifying: input.certificate.certifying && input.certificate.verdict === 'PASS' && readerCell.state !== 'failed_inert',
+      reportable: true,
+      preservationRatio: input.certificate.preservation.median,
+      floorConfirmed: run.floor.floorConfirmed,
+      agenticConfirmed: run.provenance ? run.provenance.agentOnly + run.provenance.chainFromFloor : null,
+      ...(run.seedSet === 'held-out' ? { exposedHeldoutSeeds: [run.seed] } : {}),
+    })
+    const appended = appendPerRunLedgerRow(row, {
+      runId,
+      runsDir: input.runsDir,
+      repoRoot: input.repoRoot,
+    })
+    perRunPath = appended.path
+    if (input.ledgerPath) {
+      appendLedgerRow(row, input.ledgerPath, input.repoRoot)
+    }
+    rows.push(row)
+  }
+  if (input.promoteLedgerPath && perRunPath) {
+    promoteLedgerRows(perRunPath, {
+      targetLedgerPath: input.promoteLedgerPath,
+      repoRoot: input.repoRoot,
+    })
+  }
+  return { perRunPath, rows }
 }
 
 function writeOwnerOnly(path: string, text: string): void {
@@ -2643,17 +2856,28 @@ async function main(): Promise<void> {
 
   try {
     let certificate: Certificate
+    let ingestedRuns: RealismRun[] = []
+    let drawnHeldoutMeta: { seeds: number[]; startIndex: number; endIndex: number } | null = null
     const ingestNotes: string[] = []
     if (cli.run) {
       const salt = process.env.KOVO_RB_HELDOUT_SALT ?? ''
       if (!cli.heldoutSeeds && salt.length < 16) {
         fail('--run requires KOVO_RB_HELDOUT_SALT (>= 16 chars) to draw fresh unburned held-out seeds')
       }
+      if (!cli.heldoutSeeds && salt.length >= 16) {
+        const drawCount = Math.max(CERTIFYING_MIN_HELDOUT_SEEDS, cli.heldoutRuns, cli.floorHeldoutRuns)
+        const drawn = drawUnburnedHeldoutSeedsWithMeta(drawCount, salt)
+        drawnHeldoutMeta = { seeds: drawn.seeds, startIndex: drawn.startIndex, endIndex: drawn.endIndex }
+      }
       const plan = buildRunPlan({
         outDir: cli.outDir,
         apps: cli.apps,
         devSeed: cli.devSeed,
-        ...(cli.heldoutSeeds ? { heldoutSeeds: cli.heldoutSeeds } : { heldOutSalt: salt }),
+        ...(cli.heldoutSeeds
+          ? { heldoutSeeds: cli.heldoutSeeds }
+          : drawnHeldoutMeta
+            ? { heldoutSeeds: drawnHeldoutMeta.seeds }
+            : { heldOutSalt: salt }),
         allowBurnedDev: cli.allowBurnedDev,
         devRuns: cli.devRuns,
         floorHeldoutRuns: cli.floorHeldoutRuns,
@@ -2700,6 +2924,7 @@ async function main(): Promise<void> {
         ingestNotes.push(`${expectedGateFailure.length} reason floor cell(s) exited 3 (anti-heuristic gate violation recorded in the certificate)`)
       }
       const ingested = ingestFromDirs([cli.outDir], process.env)
+      ingestedRuns = ingested.runs
       ingestNotes.push(...ingested.notes)
       certificate = evaluateCertification(ingested.runs, ingested.reason, {
         mode: 'run',
@@ -2711,9 +2936,20 @@ async function main(): Promise<void> {
         allowBurnedDev: cli.allowBurnedDev,
         notes: ingestNotes,
       })
+      if (drawnHeldoutMeta && certificate.certifying) {
+        recordExposedHeldoutSeeds({
+          certificateId: `phase1-${certificate.generatedAt}-${certificate.gitSha}`,
+          domain: 'certify',
+          startIndex: drawnHeldoutMeta.startIndex,
+          endIndex: drawnHeldoutMeta.endIndex,
+          seeds: drawnHeldoutMeta.seeds,
+          gitSha: certificate.gitSha,
+        })
+      }
       if (!cli.keepDataDirs) cleanupDataDirs(cli.outDir)
     } else {
       const ingested = ingestFromDirs(cli.fromDirs, process.env)
+      ingestedRuns = ingested.runs
       ingestNotes.push(...ingested.notes)
       ingestNotes.push(`ingested ${ingested.runs.length} realism cell(s) and ${ingested.reason.length} reason report(s) from ${ingested.filesScanned} file(s)`)
       certificate = evaluateCertification(ingested.runs, ingested.reason, {
@@ -2725,6 +2961,15 @@ async function main(): Promise<void> {
         checkMatrix: cli.checkMatrix,
         allowBurnedDev: cli.allowBurnedDev,
         notes: ingestNotes,
+      })
+    }
+
+    if (ingestedRuns.length > 0) {
+      writePhase1CertifyLedgerRows({
+        runs: ingestedRuns,
+        certificate,
+        ledgerPath: cli.ledgerPath,
+        promoteLedgerPath: cli.promoteLedgerPath,
       })
     }
 

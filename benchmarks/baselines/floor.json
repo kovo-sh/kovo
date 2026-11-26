@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "description": "Deterministic regression floor baseline (R2-05). Refresh at batch boundaries via `bash scripts/regression-floor.sh --with-xben --with-heldout-saas --write-baseline` or compare against a promoted ledger row with `--baseline benchmarks/results/ledger.jsonl`.",
+  "updatedAt": "2026-11-26T00:00:00.000Z",
+  "suites": {
+    "xben-25": {
+      "gitSha": null,
+      "targetsTotal": 25,
+      "confirmedCount": 25,
+      "falsePositiveCount": 0,
+      "confirmedIds": []
+    },
+    "held-out-saas": {
+      "gitSha": null,
+      "targetsTotal": 20,
+      "confirmedCount": 20,
+      "falsePositiveCount": 0,
+      "confirmedIds": []
+    }
+  }
+}

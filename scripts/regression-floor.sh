@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
-# Batch-boundary / pre-push deterministic regression floor (`cq-3-merge-gate`).
+# Batch-boundary / pre-push deterministic regression floor (`cq-3-merge-gate`, `R2-05`).
 #
 # Runs (NOT per-merge worker-gate.sh — run at batch boundaries / pre-push / CI):
 #   1. Golden E2E multi-hop chain suite (`tests/v8-seam1-golden-e2e.test.ts`)
 #   2. Boundary contract suites (`npm run test:boundaries`)
 #   3. Optional deterministic floor checks (`--with-xben`, `--with-heldout-saas`, or `--all-suites`),
-#      diffed against a committed baseline JSON (default: `benchmarks/baselines/floor.json`).
-#      Fails closed on any lost TP (confirmedCount drop or previously confirmed target lost)
-#      or any gained FP (falsePositiveCount increase).
+#      diffed against a committed baseline JSON (default: `benchmarks/baselines/floor.json`)
+#      or a JSONL ledger file (`--baseline benchmarks/results/ledger.jsonl`).
+#      Fails closed on any lost TP (confirmedCount drop or previously confirmed target with
+#      `outcome === 'confirmed'` lost) or any gained FP (falsePositiveCount increase).
 #
 # Usage:
 #   bash scripts/regression-floor.sh [--with-xben] [--with-heldout-saas] [--all-suites]
-#                                    [--baseline <path>] [--out-dir <dir>]
+#                                    [--baseline <path>] [--actual-json <path>] [--out-dir <dir>]
 #                                    [--skip-boundaries] [--skip-golden]
 #                                    [--verifier-backend <auto|docker|local-jq>]
 #                                    [--write-baseline]
@@ -26,6 +27,7 @@ SKIP_BOUNDARIES=0
 SKIP_GOLDEN=0
 WRITE_BASELINE=0
 BASELINE_PATH="benchmarks/baselines/floor.json"
+ACTUAL_JSON_PATH=""
 OUT_DIR="${TMPDIR:-/tmp}/kovo-regression-floor-$$"
 VERIFIER_BACKEND="auto"
 
@@ -38,6 +40,7 @@ while [[ $# -gt 0 ]]; do
     --skip-golden) SKIP_GOLDEN=1; shift;;
     --write-baseline) WRITE_BASELINE=1; shift;;
     --baseline) BASELINE_PATH="${2:?--baseline requires a path}"; shift 2;;
+    --actual-json) ACTUAL_JSON_PATH="${2:?--actual-json requires a path}"; shift 2;;
     --out-dir) OUT_DIR="${2:?--out-dir requires a directory}"; shift 2;;
     --verifier-backend) VERIFIER_BACKEND="${2:?--verifier-backend requires a value}"; shift 2;;
     -h|--help) sed -n '2,20p' "$0"; exit 0;;
@@ -80,16 +83,26 @@ if (( ${#SUITES[@]} > 0 )); then
   else
     for suite in "${SUITES[@]}"; do
       step "deterministic floor: $suite"
-      out_json="$OUT_DIR/${suite}.json"
-      if KOVO_ALLOW_LOCAL_LAB=1 node scripts/benchmark-recall.ts \
-           --suite "$suite" \
-           --verifier-backend "$VERIFIER_BACKEND" \
-           --out-json "$out_json"; then
-        echo "Completed $suite -> $out_json"
+      if [[ -n "$ACTUAL_JSON_PATH" ]]; then
+        if [[ ! -f "$ACTUAL_JSON_PATH" ]]; then
+          echo "FAIL: --actual-json file not found at '$ACTUAL_JSON_PATH'" >&2
+          fail=1
+          continue
+        fi
+        out_json="$ACTUAL_JSON_PATH"
+        echo "Using precomputed $suite report -> $out_json"
       else
-        echo "FAIL: benchmark-recall.ts failed for $suite" >&2
-        fail=1
-        continue
+        out_json="$OUT_DIR/${suite}.json"
+        if KOVO_ALLOW_LOCAL_LAB=1 node scripts/benchmark-recall.ts \
+             --suite "$suite" \
+             --verifier-backend "$VERIFIER_BACKEND" \
+             --out-json "$out_json"; then
+          echo "Completed $suite -> $out_json"
+        else
+          echo "FAIL: benchmark-recall.ts failed for $suite" >&2
+          fail=1
+          continue
+        fi
       fi
 
       if (( WRITE_BASELINE == 1 )); then
@@ -104,7 +117,7 @@ const baseline = existsSync(baselinePath)
   : { schemaVersion: 1, suites: {} }
 baseline.suites = baseline.suites || {}
 const confirmedIds = Array.isArray(actual.perTarget)
-  ? actual.perTarget.filter(t => t && t.confirmed).map(t => t.id).sort()
+  ? actual.perTarget.filter(t => t && t.outcome === 'confirmed').map(t => String(t.id)).sort()
   : []
 baseline.updatedAt = new Date().toISOString()
 baseline.suites[suite] = {
@@ -123,9 +136,36 @@ EOF
 import { readFileSync } from 'node:fs'
 
 const [baselinePath, suite, outJsonPath] = process.argv.slice(2)
-const baseline = JSON.parse(readFileSync(baselinePath, 'utf8'))
+const rawBaseline = readFileSync(baselinePath, 'utf8').trim()
 const actual = JSON.parse(readFileSync(outJsonPath, 'utf8'))
-const expected = baseline?.suites?.[suite] ?? baseline?.[suite]
+
+let expected = null
+if (baselinePath.endsWith('.jsonl')) {
+  const rows = rawBaseline
+    .split(/\r?\n/)
+    .map(l => l.trim())
+    .filter(l => l && !l.startsWith('#'))
+    .map(l => JSON.parse(l))
+    .filter(r => r && r.suite === suite && r.status === 'VALID')
+  const latest = rows[rows.length - 1]
+  if (latest) {
+    const confirmedIds = latest.siteOutcomes && typeof latest.siteOutcomes === 'object'
+      ? Object.entries(latest.siteOutcomes)
+          .filter(([, outcome]) => outcome === 'confirmed')
+          .map(([id]) => String(id))
+          .sort()
+      : []
+    expected = {
+      confirmedCount: Number(latest.confirmed ?? 0),
+      falsePositiveCount: Number(latest.decoyFalsePositives ?? 0) + Number(latest.unmatchedFalsePositives ?? 0),
+      confirmedIds,
+    }
+  }
+} else {
+  const baseline = JSON.parse(rawBaseline)
+  expected = baseline?.suites?.[suite] ?? baseline?.[suite] ?? null
+}
+
 if (!expected || typeof expected !== 'object') {
   console.error(`FAIL: baseline ${baselinePath} has no entry for suite "${suite}"`)
   process.exit(1)
@@ -138,7 +178,7 @@ const expectedFp = Number(expected.falsePositiveCount ?? 0)
 
 const actualIds = new Set(
   Array.isArray(actual.perTarget)
-    ? actual.perTarget.filter(t => t && t.confirmed).map(t => String(t.id))
+    ? actual.perTarget.filter(t => t && t.outcome === 'confirmed').map(t => String(t.id))
     : [],
 )
 const expectedIds = Array.isArray(expected.confirmedIds) ? expected.confirmedIds.map(String) : []
