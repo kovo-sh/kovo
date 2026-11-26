@@ -5,8 +5,8 @@
  * Pure leaf of the `verify-*.ts` decomposition: imports no other `verify-*.ts`
  * module except the shared structural-diff helper `verify-support.ts`.
  */
-import { createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
-import { structuralDiff, intersectStructuralDeltas } from './verify-support.ts'
+import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
+import { intersectStructuralDeltas, normalizeStructuralTokens, structuralDiffNormalized } from './verify-support.ts'
 import {
   assessBoundary,
   assessImpactEvidence,
@@ -573,28 +573,63 @@ export interface VerifyCanaryBroker {
 // Assertion primitives (shared semantics with `worker/kovo_verify`).
 // ---------------------------------------------------------------------------
 
-const GX_ID_RE = /\bgx-[0-9a-f-]{8,}\b/gi
-const REDACTED_TOKEN_RE = /\[redacted(?::[^\]]+)?\]/gi
-const CAP_HANDLE_RE = /\bcap:[A-Za-z0-9_.:-]+\b/g
+const GX_ID_RE = /\bgx-[0-9a-f-]{8,64}\b/gi
+const REDACTED_TOKEN_RE = /\[redacted(?::[^\]]{1,128})?\]/gi
+const CAP_HANDLE_RE = /\bcap:[A-Za-z0-9_.:-]{1,128}\b/g
 const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi
-const LONG_HEX_RE = /\b[0-9a-f]{16,}\b/gi
-const ISO_TS_RE = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?/g
-const COMPOUND_ID_RE = /(?<![a-z0-9])(?!(?:cwe|cve|rfc|iso|sha|aes|rsa|hmac|http|https|utf|tls|jwt)[-_])[a-z]{2,12}[_-](?:\d+[a-z0-9]*[_-][a-z0-9]{2,}|[a-z0-9]*\d[a-z0-9]*[_-](?=[a-z0-9]*\d)[a-z0-9]{2,})(?![a-z0-9])/gi
-const PREFIXED_ID_RE = /(?<![a-z0-9])(?!(?:cwe|cve|rfc|iso|sha|aes|rsa|hmac|http|https|utf|tls|jwt)[-_])[a-z]{2,12}[_-](?=[a-z0-9]*\d)[a-z0-9]{3,}(?![a-z0-9])/gi
+const LONG_HEX_RE = /\b[0-9a-f]{16,256}\b/gi
+const ISO_TS_RE = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z?/g
+const STANDARD_ID_PREFIXES = new Set([
+  'cwe', 'cve', 'rfc', 'iso', 'sha', 'aes', 'rsa', 'hmac', 'http', 'https', 'utf', 'tls', 'jwt',
+])
+const IDENTIFIER_RUN_RE = /[A-Za-z0-9_-]+/g
+/** Cap dynamic normalization input to 4 KiB; oversized strings hash their tail deterministically. */
+export const MAX_DYNAMIC_NORMALIZE_LENGTH = 4_096
+/** Hash observed claim values above 2 KiB instead of normalizing multi-hundred-KB strings. */
+const MAX_OBSERVED_STRING_LENGTH = 2_048
+
+const isAlphaPrefix = (s: string) => s.length >= 2 && s.length <= 12 && /^[A-Za-z]+$/.test(s) && !STANDARD_ID_PREFIXES.has(s.toLowerCase())
+const hasDigit = (s: string) => /\d/.test(s)
+
+/** Linear O(N) replacement for quadratic `COMPOUND_ID_RE` + `PREFIXED_ID_RE`. */
+function normalizeDynamicIds(input: string): string {
+  return input.replace(IDENTIFIER_RUN_RE, token => {
+    if (token.length < 6 || !hasDigit(token) || (!token.includes('_') && !token.includes('-'))) return token
+    const parts = token.split(/([_-])/)
+    if (parts.length < 3) return token
+    let out = '', changed = false
+    for (let i = 0; i < parts.length; i += 2) {
+      const seg = parts[i]!
+      if (isAlphaPrefix(seg) && i + 2 < parts.length) {
+        const next = parts[i + 2]!, third = i + 4 < parts.length ? parts[i + 4]! : ''
+        if (i + 4 < parts.length && third.length >= 2 && (/^\d/.test(next) || (hasDigit(next) && hasDigit(third)))) {
+          out += '<id>' + (parts[i + 5] ?? ''); changed = true; i += 4; continue
+        }
+        if (next.length >= 3 && hasDigit(next)) {
+          out += '<id>' + (parts[i + 3] ?? ''); changed = true; i += 2; continue
+        }
+      }
+      out += seg + (parts[i + 1] ?? '')
+    }
+    return changed ? out : token
+  })
+}
+
+const normalizeDynamicBounded = (slice: string): string => normalizeDynamicIds(
+  slice.replace(GX_ID_RE, '<gx>').replace(REDACTED_TOKEN_RE, '<redacted>').replace(CAP_HANDLE_RE, '<cap>')
+    .replace(UUID_RE, '<uuid>').replace(ISO_TS_RE, '<ts>').replace(LONG_HEX_RE, '<hex>'),
+)
 
 /** Remove run-scoped nonces and standard dynamic tokens (for cross-attempt comparison). */
 export function normalizeDynamic(input: string, nonce?: string): string {
-  let out = input
-  if (nonce) out = out.split(nonce).join('<nonce>')
-  return out
-    .replace(GX_ID_RE, '<gx>')
-    .replace(REDACTED_TOKEN_RE, '<redacted>')
-    .replace(CAP_HANDLE_RE, '<cap>')
-    .replace(UUID_RE, '<uuid>')
-    .replace(ISO_TS_RE, '<ts>')
-    .replace(LONG_HEX_RE, '<hex>')
-    .replace(COMPOUND_ID_RE, '<id>')
-    .replace(PREFIXED_ID_RE, '<id>')
+  if (!input) return input
+  let out = nonce ? input.split(nonce).join('<nonce>') : input
+  if (out.length > MAX_DYNAMIC_NORMALIZE_LENGTH) {
+    const prefix = normalizeDynamicBounded(out.slice(0, MAX_DYNAMIC_NORMALIZE_LENGTH))
+    const digest = createHash('sha256').update(out).digest('hex').slice(0, 16)
+    return `${prefix}...<sha256:${digest}:${out.length}>`
+  }
+  return normalizeDynamicBounded(out)
 }
 
 export function asRecord(value: unknown): Record<string, unknown> | null {
@@ -915,7 +950,7 @@ export function sameSiteFromRecord(record: VerifyTranscriptRecord | undefined): 
   return match ? match[1] ?? null : null
 }
 
-/** Normalize a recorded exchange into the shared impact-evidence shape (HostFactLog-first). */
+/** Normalize a recorded exchange into the shared impact-evidence shape (HostFactLog-first, H-13 host-only). */
 function toTranscriptStep(
   store: TranscriptStore,
   id: string,
@@ -923,11 +958,6 @@ function toTranscriptStep(
   opts?: {
     factLog?: HostFactLog
     defaultSameSite?: string | null
-    actorRoles?: Record<string, string>
-    actorTenants?: Record<string, string>
-    requestBody?: unknown
-    ambient?: { kind: AmbientAuth; sameSite?: string }
-    tenantSignedFirst?: boolean
   },
 ): ImpactStep | null {
   const hostFact = opts?.factLog?.getExchange(id)
@@ -940,25 +970,19 @@ function toTranscriptStep(
   const body = store.body(id)
   const json = parseJsonBody(body)
   const handle = record.request?.personaHandle ?? null
-  // Host-signed persona label wins; a script cannot manufacture a role or tenant differential.
+  // H-13: Strictly host-derived role, tenant, auth, SameSite, and request body; drop all script-declared fallbacks.
   const signedLabel = record.request?.actorRoleLabel ?? null
   const role = signedLabel !== null
     ? normalizeRole(signedLabel) ?? normalizeRole(handle) ?? null
-    : normalizeRole(handle) ?? normalizeRole(opts?.actorRoles?.[handle ?? '']) ?? null
+    : normalizeRole(handle) ?? null
   const tenant = signedLabel !== null
-    ? parseRoleLabel(signedLabel).tenant ?? (opts?.tenantSignedFirst ? (opts.actorTenants?.[handle ?? ''] ?? parseRoleLabel(handle).tenant) : parseRoleLabel(handle).tenant) ?? null
-    : (opts?.tenantSignedFirst ? (opts.actorTenants?.[handle ?? ''] ?? parseRoleLabel(handle).tenant) : (parseRoleLabel(handle).tenant ?? opts?.actorTenants?.[handle ?? ''])) ?? null
+    ? parseRoleLabel(signedLabel).tenant ?? parseRoleLabel(handle).tenant ?? null
+    : parseRoleLabel(handle).tenant ?? null
   const hostAuth = deriveAmbientAuthFromHeaders(record.request?.headers)
   const hostSameSite = sameSiteFromRecord(record) ?? opts?.defaultSameSite ?? null
   const hostRawReq = store.requestBody(id)
-  const requestJson = hostRawReq !== undefined ? (parseJsonBody(hostRawReq) ?? hostRawReq) : opts?.requestBody
-  const actor: ActorIdentity = {
-    handle,
-    role,
-    tenant,
-    auth: hostAuth !== 'unknown' ? hostAuth : (opts?.ambient?.kind ?? 'unknown'),
-    sameSite: hostSameSite ?? opts?.ambient?.sameSite ?? null,
-  }
+  const requestJson = hostRawReq !== undefined ? (parseJsonBody(hostRawReq) ?? hostRawReq) : undefined
+  const actor: ActorIdentity = { handle, role, tenant, auth: hostAuth, sameSite: hostSameSite }
   return {
     id,
     arm,
@@ -1039,7 +1063,7 @@ function evaluateBoundaryClaim(store: TranscriptStore, claim: Extract<VerifyClai
   const okId = (id: string) => (!context.allowedExchangeIds || context.allowedExchangeIds.has(id)) && Boolean(store.get(id))
   if (!okId(claim.controlExchangeId)) return { claim, passed: false, detail: `Unknown control exchange ${claim.controlExchangeId} for a boundary claim.` }
   if (!okId(claim.probeExchangeId)) return { claim, passed: false, detail: `Unknown probe exchange ${claim.probeExchangeId} for a boundary claim.` }
-  const stepOpts = { factLog: context.factLog, actorRoles: claim.actorRoles, actorTenants: claim.actorTenants, tenantSignedFirst: true }
+  const stepOpts = { factLog: context.factLog }
   const control = toTranscriptStep(store, claim.controlExchangeId, 'control', stepOpts)
   const probe = toTranscriptStep(store, claim.probeExchangeId, 'probe', stepOpts)
   if (!control || !probe) return { claim, passed: false, detail: 'Boundary claim references an unreadable exchange.' }
@@ -1069,7 +1093,7 @@ function evaluateMfaClaim(
     if (!store.get(id)) return { claim, passed: false, detail: `Unknown MFA exchange ${id}.` }
   }
   const steps: ImpactStep[] = []
-  const stepOpts = { factLog: context.factLog, actorRoles: claim.actorRoles, actorTenants: claim.actorTenants, tenantSignedFirst: true }
+  const stepOpts = { factLog: context.factLog }
   const add = (id: string | undefined, arm: ImpactStep['arm']) => {
     if (!id) return
     const step = toTranscriptStep(store, id, arm, stepOpts)
@@ -1112,14 +1136,7 @@ function evaluateImpactClaim(
   }
   const defaultSameSite = ids.map(id => sameSiteFromRecord(store.get(id))).find(Boolean) ?? null
   const steps: ImpactStep[] = []
-  const stepOpts = {
-    factLog: context.factLog,
-    defaultSameSite,
-    actorRoles: claim.actorRoles,
-    actorTenants: claim.actorTenants,
-    requestBody: claim.requestBody,
-    ambient: claim.ambient,
-  }
+  const stepOpts = { factLog: context.factLog, defaultSameSite }
   const add = (id: string | undefined, arm: ImpactStep['arm']) => {
     if (!id) return
     const step = toTranscriptStep(store, id, arm, stepOpts)
@@ -1134,10 +1151,10 @@ function evaluateImpactClaim(
   const assessment = assessImpactEvidence({
     impactClass: claim.impactClass,
     steps,
-    requiredRole: context.factLog ? null : (claim.requiredRole ?? null),
-    resourceTenant: context.factLog ? null : (claim.resourceTenant ?? null),
+    requiredRole: null,
+    resourceTenant: null,
     expectControlDenied: claim.expectControlDenied,
-    oracleEvents: context.factLog ? [] : claim.oracleEvents,
+    oracleEvents: [],
     targetOrigin: probeRecord?.request?.origin ?? null,
   })
   if (assessment.required && assessment.satisfied && claim.impactClass !== 'injection' && claim.impactClass !== 'markup' && claim.impactClass !== 'csrf') {
@@ -1428,8 +1445,11 @@ export function evaluateClaim(
       if (variantBodies.some(body => body === null)) return { claim, passed: false, detail: 'structural_diff references an unknown or failed variant exchange.' }
       const controls = controlBodies as string[]
       const variants = variantBodies as string[]
-      const unstableControl = controls.some(body => !structuralDiff(controls[0]!, body).normalizedEqual)
-      const unstableVariant = variants.some(body => !structuralDiff(variants[0]!, body).normalizedEqual)
+      // R2-H-29: Normalize each arm body once instead of renormalizing O(rounds) times per claim.
+      const normControls = controls.map(normalizeStructuralTokens)
+      const normVariants = variants.map(normalizeStructuralTokens)
+      const unstableControl = normControls.some(body => !structuralDiffNormalized(normControls[0]!, body).normalizedEqual)
+      const unstableVariant = normVariants.some(body => !structuralDiffNormalized(normVariants[0]!, body).normalizedEqual)
       if (unstableControl || unstableVariant) {
         return {
           claim,
@@ -1438,9 +1458,9 @@ export function evaluateClaim(
           observed: { stableControl: !unstableControl, stableVariant: !unstableVariant },
         }
       }
-      const roundDeltas = controls.map((body, index) => structuralDiff(body, variants[index] ?? variants[0]!).changedTokens)
+      const roundDeltas = normControls.map((body, index) => structuralDiffNormalized(body, normVariants[index] ?? normVariants[0]!).changedTokens)
       const stableDelta = intersectStructuralDeltas(roundDeltas)
-      const cross = structuralDiff(controls[0]!, variants[0]!)
+      const cross = structuralDiffNormalized(normControls[0]!, normVariants[0]!)
       const minDelta = Math.max(1, Math.min(claim.minDeltaTokens ?? 1, 32))
       const maxSimilarity = claim.maxSimilarity ?? 1
       const distinct = !cross.normalizedEqual && stableDelta.length >= minDelta && cross.similarity < maxSimilarity
@@ -1888,7 +1908,14 @@ export function evaluateClaims(
 // ---------------------------------------------------------------------------
 
 function normalizedValue(value: unknown, nonce: string): unknown {
-  if (typeof value === 'string') return normalizeDynamic(value, nonce)
+  if (typeof value === 'string') {
+    if (value.length > MAX_OBSERVED_STRING_LENGTH) {
+      const stripped = nonce ? value.split(nonce).join('<nonce>') : value
+      const digest = createHash('sha256').update(stripped).digest('hex').slice(0, 16)
+      return `<hash:${digest}:${stripped.length}>`
+    }
+    return normalizeDynamic(value, nonce)
+  }
   if (Array.isArray(value)) return value.map(v => normalizedValue(v, nonce))
   if (value && typeof value === 'object') {
     const out: Record<string, unknown> = {}
@@ -1902,6 +1929,7 @@ const STANDARD_PATH_PREFIX_RE = /^(?:cwe|cve|rfc|iso|sha|aes|rsa|hmac|http|https
 const STANDARD_ALGO_TOKEN_RE = /^(?:sha\d+|aes\d+|hs\d+|rs\d+|es\d+|utf\d+|base\d+|http\d+)$/i
 
 function isDynamicPathSegment(decoded: string): boolean {
+  if (decoded.length > 256) return true
   if (
     /^\d+$/.test(decoded) ||
     /^[0-9a-f]{8}-[0-9a-f-]{27,}$/i.test(decoded) ||

@@ -133,6 +133,7 @@ async function verify(spec: Record<string, unknown>, origin: string, personas?: 
   return verifyReplaySpec({
     spec, broker, backend: new LocalJqBackend(), grant: grantFor(origin, personas),
     signal: AbortSignal.timeout(20_000),
+    envelopeTrust: 'host_persisted',
   })
 }
 

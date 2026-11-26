@@ -810,7 +810,7 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
     evidencePayload,
     exchangeIds,
     exchanges,
-    envelopeTrust: params.envelopeTrust,
+    envelopeTrust: params.envelopeTrust === 'host_persisted' ? 'host_persisted' : 'untrusted',
     ...(params.canaryBroker ? { canaryBroker: params.canaryBroker } : {}),
     canaryRunId: params.runId ?? 'replay-verifier',
     ...(params.storage ? { canaryStorage: params.storage } : {}),
@@ -936,17 +936,13 @@ function validatePersistedRecipeEnvelope(
   grant: Grant,
   params: VerifyReplaySpecParams,
 ) {
+  // H-5: Default-deny whenever envelopeTrust is omitted or anything other than 'host_persisted'.
+  const trust = params.envelopeTrust === 'host_persisted' ? 'host_persisted' : 'untrusted'
   return validateReplayRecipeEnvelope({
     specKind: spec.kind, specOrigin: spec.origin, recipeId: persisted.envelope.recipeId,
     recipeArgs: persisted.envelope.args, recipeOrigin: persisted.origin,
-    envelopeTrust: params.envelopeTrust, tier: grant.tier ?? 1,
+    envelopeTrust: trust, tier: grant.tier ?? 1,
     canRead: o => grant.canRead(o), hasDestructive: hasDestructiveContent,
-    ...(params.storage && params.runId ? {
-      hasStoredMatch: () => {
-        const wanted = JSON.stringify(persisted.envelope)
-        return params.storage!.listReplaySpecs(params.runId!).some(r => { const s = persistedRecipeOf(r.spec); return Boolean(s && JSON.stringify(s.envelope) === wanted) })
-      },
-    } : {}),
   })
 }
 
@@ -965,16 +961,11 @@ export async function retestReplaySpec(params: VerifyReplaySpecParams): Promise<
   }
   const agentScript = persistedAgentScriptOf(params.spec)
   if (agentScript) {
+    const trust = params.envelopeTrust === 'host_persisted' ? 'host_persisted' : 'untrusted'
     const scriptCheck = validateReplayAgentScriptEnvelope({
       specKind: params.spec && typeof params.spec === 'object' ? (params.spec as { kind?: unknown }).kind : undefined,
-      origin: agentScript.origin, verdict: agentScript.envelope.verdict, envelopeTrust: params.envelopeTrust,
+      origin: agentScript.origin, verdict: agentScript.envelope.verdict, envelopeTrust: trust,
       tier: params.grant.tier ?? 1, canRead: o => params.grant.canRead(o),
-      ...(params.storage && params.runId ? {
-        hasStoredMatch: () => params.storage!.listReplaySpecs(params.runId!).some(r => {
-          const p = params.storage!.replaySpecProof(params.runId!, r.id)
-          return Boolean(p && p.verdict === 'confirmed' && p.scriptSha256 === agentScript.envelope.scriptSha256)
-        }),
-      } : {}),
     })
     if (!scriptCheck.ok) {
       params.grant.audit('denied', agentScript.origin)

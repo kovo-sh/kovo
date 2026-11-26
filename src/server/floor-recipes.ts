@@ -469,6 +469,14 @@ export interface FloorRecipe {
   run(ctx: FloorRecipeContext): Promise<ProofReceipt>
 }
 
+export type FloorRequireSide = 'control' | 'probe' | 'harness'
+
+export interface FloorRecipeRequireFailure {
+  role: string
+  side: FloorRequireSide
+  message: string
+}
+
 export interface FloorRecipeContext {
   readonly args: FloorRecipeArgs
   /** Exchanges recorded so far (bounded). */
@@ -492,7 +500,7 @@ export interface FloorRecipeContext {
    * Record a preconditions the oracle needs that the receipt gate alone cannot name. Returns the
    * condition so a recipe can continue gathering the rest of the minimum evidence.
    */
-  require(condition: boolean, role: string, message: string): boolean
+  require(condition: boolean, role: string, message: string, side?: FloorRequireSide): boolean
 }
 
 export interface FloorRecipeStepRecord {
@@ -526,6 +534,8 @@ export interface FloorRecipeFailure {
   message: string
   /** Evidence roles the proof lacked, named so a repair can add exactly those. */
   missingRoles: string[]
+  /** Side-tagged failed `ctx.require` preconditions (R2-H-15 / H-19 retest health). */
+  requireFailures?: FloorRecipeRequireFailure[]
 }
 
 export interface FloorRecipeExecution {
@@ -558,7 +568,14 @@ class FloorRecipeAbort extends Error {
 
 interface RecordedMissing {
   roles: string[]
+  side: FloorRequireSide
   message: string
+}
+
+function inferRequireSide(role: string): FloorRequireSide {
+  if (/control|baseline|entitled|reset/i.test(role)) return 'control'
+  if (/probe|tautology|contradiction|burst|sink|callback/i.test(role)) return 'probe'
+  return 'harness'
 }
 
 class RecipeContext implements FloorRecipeContext {
@@ -707,8 +724,8 @@ class RecipeContext implements FloorRecipeContext {
     return result
   }
 
-  require(condition: boolean, role: string, message: string): boolean {
-    if (!condition) this.missing.push({ roles: [role], message })
+  require(condition: boolean, role: string, message: string, side?: FloorRequireSide): boolean {
+    if (!condition) this.missing.push({ roles: [role], side: side ?? inferRequireSide(role), message })
     return condition
   }
 }
@@ -801,6 +818,20 @@ function defineRecipe<A extends FloorRecipeBaseArgs>(
  */
 const accessBoundary = defineRecipe<AccessBoundaryArgs>('access_boundary', async (args, ctx) => {
   const deniedActor = args.denied ?? peerOf(args.probe)
+  const deniedMethod = (args.deniedMethod ?? args.method).toUpperCase()
+  const deniedPath = args.deniedPathAndQuery ?? args.pathAndQuery
+  // H-17: Never allow the denied control arm to be the owner re-reading the exact same method & path.
+  if (
+    deniedActor.handle === args.owner.handle
+    && deniedMethod === args.method.toUpperCase()
+    && deniedPath === args.pathAndQuery
+  ) {
+    throw new FloorRecipeAbort(
+      'recipe_error',
+      'access_boundary denied control actor cannot equal owner on the same method and path.',
+      ['denied_control'],
+    )
+  }
   const entitled = await ctx.send({
     arm: 'control',
     role: 'entitled_read',
@@ -813,7 +844,7 @@ const accessBoundary = defineRecipe<AccessBoundaryArgs>('access_boundary', async
     arm: 'control',
     role: 'denied_control',
     method: args.deniedMethod ?? args.method,
-    pathAndQuery: args.deniedPathAndQuery ?? args.pathAndQuery,
+    pathAndQuery: deniedPath,
     actor: deniedActor,
     ...(args.headers ? { headers: args.headers } : {}),
   })
@@ -826,12 +857,12 @@ const accessBoundary = defineRecipe<AccessBoundaryArgs>('access_boundary', async
     ...(args.headers ? { headers: args.headers } : {}),
   })
 
-  ctx.require(isSuccess(entitled.exchange.status), 'entitled_read', 'The entitled control was not served the resource.')
+  ctx.require(isSuccess(entitled.exchange.status), 'entitled_read', 'The entitled control was not served the resource.', 'control')
   const deniedBody = denied.exchange.body ?? ''
   const distinctControl = isSuccess(denied.exchange.status) && deniedBody.length > 2 && deniedBody !== (entitled.exchange.body ?? '')
   const controlOk = isDenied(denied.exchange.status) || (args.controlEvidence === 'denial_or_distinct' && distinctControl)
-  ctx.require(controlOk, 'denied_control', `The control arm returned ${denied.exchange.status ?? 'no status'} without a denial or a distinct selective body.`)
-  ctx.require(isSuccess(probe.exchange.status), 'probe_request', `The probe actor was not served the resource (${probe.exchange.status ?? 'no status'}).`)
+  ctx.require(controlOk, 'denied_control', `The control arm returned ${denied.exchange.status ?? 'no status'} without a denial or a distinct selective body.`, 'control')
+  ctx.require(isSuccess(probe.exchange.status), 'probe_request', `The probe actor was not served the resource (${probe.exchange.status ?? 'no status'}).`, 'probe')
 
   return buildProofReceipt({
     vulnClass: args.vulnClass,
@@ -872,7 +903,7 @@ const persistedMutation = defineRecipe<PersistedMutationArgs>('persisted_mutatio
       jsonBody: args.reset.body,
       ...(args.headers ? { headers: args.headers } : {}),
     })
-    ctx.require(isSuccess(reset.exchange.status), 'state_reset', `The state reset was not accepted (${reset.exchange.status ?? 'no status'}).`)
+    ctx.require(isSuccess(reset.exchange.status), 'state_reset', `The state reset was not accepted (${reset.exchange.status ?? 'no status'}).`, 'control')
   }
   // A baseline write makes the probe body a genuine delta: the pre-read then holds a known
   // different value, and the persistence oracle can attribute the post-read change to the probe.
@@ -886,7 +917,7 @@ const persistedMutation = defineRecipe<PersistedMutationArgs>('persisted_mutatio
       jsonBody: args.baselineWrite.body,
       ...(args.headers ? { headers: args.headers } : {}),
     })
-    ctx.require(isSuccess(baselineWrite.exchange.status), 'baseline_write', `The baseline write was not accepted (${baselineWrite.exchange.status ?? 'no status'}).`)
+    ctx.require(isSuccess(baselineWrite.exchange.status), 'baseline_write', `The baseline write was not accepted (${baselineWrite.exchange.status ?? 'no status'}).`, 'control')
   }
 
   const baseline = await ctx.send({
@@ -913,13 +944,13 @@ const persistedMutation = defineRecipe<PersistedMutationArgs>('persisted_mutatio
     actor: readbackActor,
   })
 
-  ctx.require(baseline.exchange.json !== undefined, 'baseline_read', 'The pre-mutation baseline read recorded no JSON body.')
-  ctx.require(isSuccess(probe.exchange.status), 'mutation_probe', `The mutating probe was not accepted (${probe.exchange.status ?? 'no status'}).`)
+  ctx.require(baseline.exchange.json !== undefined, 'baseline_read', 'The pre-mutation baseline read recorded no JSON body.', 'control')
+  ctx.require(isSuccess(probe.exchange.status), 'mutation_probe', `The mutating probe was not accepted (${probe.exchange.status ?? 'no status'}).`, 'probe')
   // A DELETE's separate readback proves persistence by reporting the resource gone; a 404/410
   // tombstone need not carry a JSON body (the persistence oracle handles that case).
   const tombstone = args.method.toUpperCase() === 'DELETE' &&
     (after.exchange.status === 404 || after.exchange.status === 410)
-  ctx.require(after.exchange.json !== undefined || tombstone, 'post_mutation_read', 'The separate post-mutation GET recorded no JSON body.')
+  ctx.require(after.exchange.json !== undefined || tombstone, 'post_mutation_read', 'The separate post-mutation GET recorded no JSON body.', 'control')
 
   // An identity-assumption route (impersonate / act-as / tenant switch) pins the acting scope on
   // the caller's *session*. The reset above re-establishes the actor's own baseline before the
@@ -1005,6 +1036,7 @@ const booleanOrTiming = defineRecipe<BooleanOrTimingArgs>('boolean_or_timing', a
       Boolean(param),
       'injected_parameter',
       'A boolean SQL injection proof must name the injected parameter (or vary exactly one query key).',
+      'harness',
     )
     const rounds = Math.max(2, Math.min(4, Math.floor(args.rounds ?? 2)))
     const exchangeIds: string[] = []
@@ -1015,7 +1047,7 @@ const booleanOrTiming = defineRecipe<BooleanOrTimingArgs>('boolean_or_timing', a
       exchangeIds.push(control.exchangeId, probe.exchangeId)
       if ((control.exchange.status ?? 0) >= 500 || (probe.exchange.status ?? 0) >= 500) serverError = true
     }
-    ctx.require(!serverError, 'non_error_arm', 'A boolean differential arm returned a server error (5xx).')
+    ctx.require(!serverError, 'non_error_arm', 'A boolean differential arm returned a server error (5xx).', 'harness')
     return buildProofReceipt({
       vulnClass: args.receiptClass ?? 'sqli',
       target: { ...targetOf(args), ...(param ? { param } : {}) },
@@ -1032,6 +1064,7 @@ const booleanOrTiming = defineRecipe<BooleanOrTimingArgs>('boolean_or_timing', a
       Boolean(param),
       'injected_parameter',
       'A status-only boolean proof must name the injected parameter (or vary exactly one query key).',
+      'harness',
     )
     const rounds = Math.max(2, Math.min(4, Math.floor(args.rounds ?? 2)))
     const contradictionPath = args.contradictionPathAndQuery ?? probePath
@@ -1043,12 +1076,13 @@ const booleanOrTiming = defineRecipe<BooleanOrTimingArgs>('boolean_or_timing', a
       const tautology = await ctx.send(armRequest(args, 'probe', probePath, args.probeJsonBody, actor, 'tautology'))
       const contradiction = await ctx.send(armRequest(args, 'probe', contradictionPath, args.contradictionJsonBody, actor, 'contradiction'))
       exchangeIds.push(benign.exchangeId, tautology.exchangeId, contradiction.exchangeId)
-      ctx.require(isSuccess(benign.exchange.status), 'benign_baseline', `The benign baseline returned ${benign.exchange.status ?? 'no status'} instead of a 2xx.`)
-      ctx.require(isSuccess(tautology.exchange.status), 'tautology', `The tautology arm returned ${tautology.exchange.status ?? 'no status'} instead of a 2xx.`)
+      ctx.require(isSuccess(benign.exchange.status), 'benign_baseline', `The benign baseline returned ${benign.exchange.status ?? 'no status'} instead of a 2xx.`, 'control')
+      ctx.require(isSuccess(tautology.exchange.status), 'tautology', `The tautology arm returned ${tautology.exchange.status ?? 'no status'} instead of a 2xx.`, 'probe')
       ctx.require(
         contradiction.exchange.status !== null && contradiction.exchange.status >= 400 && contradiction.exchange.status < 500,
         'contradiction',
         `The contradiction arm returned ${contradiction.exchange.status ?? 'no status'}; only a 4xx predicate failure is the paired status shape (a 5xx is a malformed request).`,
+        'probe',
       )
     }
     return buildProofReceipt({
@@ -1091,12 +1125,12 @@ const oobCallback = defineRecipe<OobCallbackArgs>('oob_callback', async (args, c
   })
   const event = await ctx.oob({ token: args.token })
 
-  ctx.require(event !== null, 'delivered_callback', 'No durable OOB event was delivered for the injected canary token.')
+  ctx.require(event !== null, 'delivered_callback', 'No durable OOB event was delivered for the injected canary token.', 'probe')
   if (event) {
-    ctx.require(event.delivered, 'delivered_callback', `OOB event ${event.id} was recorded but not delivered.`)
+    ctx.require(event.delivered, 'delivered_callback', `OOB event ${event.id} was recorded but not delivered.`, 'probe')
     const injectedAt = event.injectedAtMs
     if (injectedAt !== undefined) {
-      ctx.require(event.receivedAtMs >= injectedAt, 'callback_causality', `OOB event ${event.id} arrived before the canary was injected.`)
+      ctx.require(event.receivedAtMs >= injectedAt, 'callback_causality', `OOB event ${event.id} arrived before the canary was injected.`, 'harness')
     }
   }
 
@@ -1232,8 +1266,8 @@ const raceBurst = defineRecipe<RaceBurstArgs>('race_burst', async (args, ctx) =>
   const successes = steps.filter(step => isSuccess(step.exchange.status))
   const distinct = new Set(steps.map(outcomeOf)).size
 
-  ctx.require(successes.length >= 2, 'burst_repeat', `Only ${successes.length} of ${count} burst requests were accepted; a race needs the terminal transition accepted twice.`)
-  ctx.require(distinct >= 2, 'burst_divergence', `The burst produced ${distinct} distinct outcome(s); a uniform burst is not race evidence.`)
+  ctx.require(successes.length >= 2, 'burst_repeat', `Only ${successes.length} of ${count} burst requests were accepted; a race needs the terminal transition accepted twice.`, 'probe')
+  ctx.require(distinct >= 2, 'burst_divergence', `The burst produced ${distinct} distinct outcome(s); a uniform burst is not race evidence.`, 'probe')
 
   return buildProofReceipt({
     vulnClass: args.vulnClass,
@@ -1284,10 +1318,10 @@ const disclosure = defineRecipe<DisclosureArgs>('disclosure', async (args, ctx) 
     ...(args.headers ? { headers: args.headers } : {}),
   })
 
-  ctx.require(baseline.exchange.json !== undefined, 'probe_baseline', 'The probe actor\'s own baseline read recorded no JSON body.')
-  ctx.require(isSuccess(entitled.exchange.status), 'entitled_read', 'The entitled control was not served the victim record.')
-  ctx.require(isDenied(denied.exchange.status), 'denied_control', `The peer control returned ${denied.exchange.status ?? 'no status'} instead of a denial.`)
-  ctx.require(isSuccess(probe.exchange.status), 'probe_request', `The probe actor was not served the victim record (${probe.exchange.status ?? 'no status'}).`)
+  ctx.require(baseline.exchange.json !== undefined, 'probe_baseline', 'The probe actor\'s own baseline read recorded no JSON body.', 'control')
+  ctx.require(isSuccess(entitled.exchange.status), 'entitled_read', 'The entitled control was not served the victim record.', 'control')
+  ctx.require(isDenied(denied.exchange.status), 'denied_control', `The peer control returned ${denied.exchange.status ?? 'no status'} instead of a denial.`, 'control')
+  ctx.require(isSuccess(probe.exchange.status), 'probe_request', `The probe actor was not served the victim record (${probe.exchange.status ?? 'no status'}).`, 'probe')
 
   return buildProofReceipt({
     vulnClass: args.vulnClass,
@@ -1353,10 +1387,10 @@ const redirect = defineRecipe<RedirectArgs>('redirect', async (args, ctx) => {
   const controlLocation = headerValue(control.exchange.responseHeaders, 'location')
   const targetHost = hostOfLocation(args.origin, args.origin)
   const probeHost = hostOfLocation(probeLocation, args.origin)
-  ctx.require(isRedirectStatus(probe.exchange.status), 'redirect_probe', `The probe returned ${probe.exchange.status ?? 'no status'} instead of a 3xx redirect.`)
-  ctx.require(Boolean(probeLocation), 'redirect_probe', 'The probe response carried no Location header; a 3xx status alone is not an open redirect.')
-  ctx.require(Boolean(probeHost) && probeHost !== targetHost, 'redirect_probe', `The Location ${probeLocation ?? '(none)'} stays on the target origin.`)
-  ctx.require(controlLocation !== probeLocation, 'same_origin_control', 'The same-origin control redirects to the same destination, so the destination is not attacker-controlled.')
+  ctx.require(isRedirectStatus(probe.exchange.status), 'redirect_probe', `The probe returned ${probe.exchange.status ?? 'no status'} instead of a 3xx redirect.`, 'probe')
+  ctx.require(Boolean(probeLocation), 'redirect_probe', 'The probe response carried no Location header; a 3xx status alone is not an open redirect.', 'probe')
+  ctx.require(Boolean(probeHost) && probeHost !== targetHost, 'redirect_probe', `The Location ${probeLocation ?? '(none)'} stays on the target origin.`, 'probe')
+  ctx.require(controlLocation !== probeLocation, 'same_origin_control', 'The same-origin control redirects to the same destination, so the destination is not attacker-controlled.', 'probe')
   return buildProofReceipt({
     vulnClass: args.vulnClass,
     target: targetOf(args),
@@ -1374,6 +1408,7 @@ const browserSink = defineRecipe<BrowserSinkArgs>('browser_sink', async (args, c
     browserClass,
     'receipt_class',
     `browser_sink needs a browser-class label (dom_*/browser_*/postmessage*/xss*); ${args.vulnClass} maps to a different receipt rule.`,
+    'harness',
   )
   // Verifier-minted canary: deterministic for the same proof inputs, and never a stored literal.
   const canaryToken = args.canaryToken
@@ -1392,14 +1427,15 @@ const browserSink = defineRecipe<BrowserSinkArgs>('browser_sink', async (args, c
     // Single-visit proof (no interaction): the host records one page trace.
     const url = args.url ?? `${args.origin.replace(/\/+$/, '')}${args.pathAndQuery}`
     const trace = await ctx.browser({ origin: args.origin, url, actor: args.actor, ...(args.marker ? { marker: args.marker } : {}) })
-    ctx.require(trace !== null, 'browser_trace', 'No host-recorded browser trace was produced for this origin.')
+    ctx.require(trace !== null, 'browser_trace', 'No host-recorded browser trace was produced for this origin.', 'harness')
     const sinks = trace?.sinks ?? []
-    ctx.require(sinks.length > 0, 'browser_sink', 'The browser trace recorded no sink execution (DOM XSS, postMessage, storage write).')
+    ctx.require(sinks.length > 0, 'browser_sink', 'The browser trace recorded no sink execution (DOM XSS, postMessage, storage write).', 'probe')
     if (args.expectSinks && args.expectSinks.length > 0) {
       ctx.require(
         args.expectSinks.some(sink => sinks.includes(sink)),
         'browser_sink',
         `The trace recorded ${sinks.join(', ') || 'no sinks'}; expected one of ${args.expectSinks.join(', ')}.`,
+        'probe',
       )
     }
     return buildProofReceipt({
@@ -1420,18 +1456,19 @@ const browserSink = defineRecipe<BrowserSinkArgs>('browser_sink', async (args, c
   const probeSteps = normalized.filter(step => step.role !== 'control')
   if (controlSteps.length > 0) {
     const control = await ctx.browserSession({ origin: args.origin, steps: controlSteps, canaryToken, actor: args.actor })
-    ctx.require(control !== null, 'browser_control', 'The control browser session produced no trace.')
-    ctx.require(control?.sinkHit !== true, 'browser_control', 'The control session recorded the canary in an executable sink, so the payload is not the cause.')
+    ctx.require(control !== null, 'browser_control', 'The control browser session produced no trace.', 'control')
+    ctx.require(control?.sinkHit !== true, 'browser_control', 'The control session recorded the canary in an executable sink, so the payload is not the cause.', 'control')
   }
   const result = await ctx.browserSession({ origin: args.origin, steps: probeSteps, canaryToken, actor: args.actor })
-  ctx.require(result !== null, 'browser_trace', 'No host-recorded browser session trace was produced for this origin.')
-  ctx.require(result?.sinkHit === true, 'browser_sink', 'The probe session did not record the canary reaching an executable DOM sink.')
+  ctx.require(result !== null, 'browser_trace', 'No host-recorded browser session trace was produced for this origin.', 'harness')
+  ctx.require(result?.sinkHit === true, 'browser_sink', 'The probe session did not record the canary reaching an executable DOM sink.', 'probe')
   const sinks = [...new Set((result?.traces ?? []).flatMap(trace => trace.sinks ?? []))]
   if (args.expectSinks && args.expectSinks.length > 0) {
     ctx.require(
       args.expectSinks.some(sink => sinks.includes(sink)),
       'browser_sink',
       `The trace recorded ${sinks.join(', ') || 'no sinks'}; expected one of ${args.expectSinks.join(', ')}.`,
+      'probe',
     )
   }
   return buildProofReceipt({
@@ -1555,7 +1592,7 @@ const injectionFingerprint = defineRecipe<InjectionFingerprintArgs>('injection_f
   }
   const controlArm = armFor(controlValue)
   const probeArm = armFor(args.payload)
-  ctx.require(controlArm !== null && probeArm !== null, 'injection_probe', 'The injected parameter could not be moved (a query key or JSON body field is required).')
+  ctx.require(controlArm !== null && probeArm !== null, 'injection_probe', 'The injected parameter could not be moved (a query key or JSON body field is required).', 'harness')
   const control = await ctx.send({
     arm: 'control',
     role: 'benign_control',
@@ -1582,11 +1619,12 @@ const injectionFingerprint = defineRecipe<InjectionFingerprintArgs>('injection_f
     return parts.join('\n')
   }
   const fingerprint = matchInjectionFingerprint(textOf(probe), args.family)
-  ctx.require(fingerprint !== null, 'injection_probe', 'The probe response carried no engine/parser error fingerprint; a status change alone is not injection.')
+  ctx.require(fingerprint !== null, 'injection_probe', 'The probe response carried no engine/parser error fingerprint; a status change alone is not injection.', 'probe')
   ctx.require(
     fingerprint === null || !matchInjectionFingerprint(textOf(control), fingerprint.family),
     'benign_control',
     'The benign control produced the same engine error, so the fingerprint is infrastructure noise, not injection.',
+    'control',
   )
   if (fingerprint === null) {
     return buildProofReceipt({
@@ -1767,12 +1805,18 @@ export async function runFloorRecipe(recipe: FloorRecipe, deps: FloorRecipeDeps)
     ...ctx.missing.flatMap(item => item.roles),
     ...(verification.confirmed ? [] : inferMissingRoles(recipe, receipt, transcript, verification)),
   ])
+  const requireFailures: FloorRecipeRequireFailure[] = ctx.missing.map(item => ({
+    role: item.roles[0] ?? 'unknown',
+    side: item.side,
+    message: item.message,
+  }))
   const failure: FloorRecipeFailure | undefined = abortFailure
     ?? (ctx.missing.length > 0
       ? {
           code: 'precondition_unsatisfied',
           message: ctx.missing.map(item => item.message).join('; '),
           missingRoles: missing,
+          requireFailures,
         }
       : verification.confirmed
         ? undefined

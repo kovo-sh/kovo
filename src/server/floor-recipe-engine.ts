@@ -62,7 +62,7 @@ import { personaSecrets } from './persona-vault.ts'
 import { redact, redactJsonValue } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
 import type { Store } from './store.ts'
-import { openCanarySession, structuralSimilarity } from './verify-support.ts'
+import { normalizeStructuralTokens, openCanarySession, structuralDiffNormalized } from './verify-support.ts'
 import type { EphemeralCanarySession } from './verify-support.ts'
 import type { WorkerBackend } from './worker-backend.ts'
 import { brokerFloorRecipeDeps } from './floor-recipes.ts'
@@ -550,6 +550,45 @@ function authzBodyOf(input: FloorRecipePlanInput): Record<string, unknown> | nul
   return hyp.jsonBody ?? null
 }
 
+const ROLE_PRIVILEGE_RANK: Record<string, number> = {
+  superadmin: 5,
+  owner: 4,
+  admin: 4,
+  manager: 3,
+  editor: 3,
+  moderator: 3,
+  member: 2,
+  user: 2,
+  viewer: 1,
+  readonly: 1,
+  guest: 0,
+  anonymous: 0,
+}
+
+function rolePrivilegeRank(role: RoleName | null | undefined): number | null {
+  if (!role) return null
+  return Object.prototype.hasOwnProperty.call(ROLE_PRIVILEGE_RANK, role) ? ROLE_PRIVILEGE_RANK[role]! : null
+}
+
+function selectLowerRoleDeniedPeer(
+  owner: FloorActor,
+  probe: FloorActor,
+  personas: readonly EnginePersona[],
+): FloorActor | null {
+  const ownerRank = rolePrivilegeRank(owner.role)
+  const candidates = personas
+    .filter(p => p.handle !== owner.handle && p.handle !== probe.handle)
+    .map(p => floorActorFor(p.handle, personas))
+    .filter(actor => {
+      const rank = rolePrivilegeRank(actor.role)
+      if (ownerRank !== null && rank !== null) return rank < ownerRank
+      return actor.role !== owner.role || actor.tenant !== owner.tenant
+    })
+  if (candidates.length === 0) return null
+  candidates.sort((a, b) => (rolePrivilegeRank(a.role) ?? 0) - (rolePrivilegeRank(b.role) ?? 0))
+  return candidates[0]!
+}
+
 function planAuthzRecipe(input: FloorRecipePlanInput): FloorRecipePlan {
   const hyp = input.hypothesis
   const recipeId: FloorRecipeId = hyp.method === 'GET' ? 'access_boundary' : 'persisted_mutation'
@@ -582,10 +621,23 @@ function planAuthzRecipe(input: FloorRecipePlanInput): FloorRecipePlan {
 
   if (hyp.method === 'GET') {
     // The legacy read proof is an entitled read plus a cross-actor read, with an authenticated
-    // bogus-id control where the route only denies nonexistent identifiers. The shared
-    // authorization oracle decides whether the denial is boundary evidence or merely selectivity,
-    // and confirms a cross-tenant disclosure from the entitled/probe pair.
+    // bogus-id control where the route only denies nonexistent identifiers. For same-path / BFLA
+    // reads (H-17), never reuse `owner` as the denied control arm — require a distinct lower-role peer.
     const deniedPath = id && !functionLevel ? fillResourceId(hyp.pathAndQuery, bogusIdFor(id)) : realPath
+    const samePath = deniedPath === realPath
+    let deniedActor: FloorActor
+    if (samePath) {
+      const peer = selectLowerRoleDeniedPeer(owner, probe, input.personas)
+      if (!peer) {
+        return {
+          ...sketch,
+          skipReason: 'function-level authz read requires a distinct lower-role peer persona for the denied control arm',
+        }
+      }
+      deniedActor = peer
+    } else {
+      deniedActor = owner
+    }
     const idInPath = /\/\{\{id\}\}(?:\/|$|\?)/.test(hyp.pathAndQuery) || /\/:\w+(?:\/|$|\?)/.test(hyp.pathAndQuery)
     const args: AccessBoundaryArgs = {
       origin: hyp.endpoint.origin,
@@ -594,9 +646,9 @@ function planAuthzRecipe(input: FloorRecipePlanInput): FloorRecipePlan {
       vulnClass,
       owner,
       probe,
-      denied: owner,
+      denied: deniedActor,
       ...(deniedPath !== realPath ? { deniedPathAndQuery: deniedPath } : {}),
-      ...(!idInPath ? { controlEvidence: 'denial_or_distinct' as const } : {}),
+      ...(!idInPath && !functionLevel ? { controlEvidence: 'denial_or_distinct' as const } : {}),
       ...(Object.keys(headers).length > 0 ? { headers } : {}),
     }
     return { ...sketch, args, paramLocation: 'path' }
@@ -1150,31 +1202,231 @@ export function recipeRetestResult(
   return recipeResult(plan, execution, exchangeIds, execution.result.confirmed)
 }
 
+export type RetestHealthCode =
+  | 'healthy'
+  | 'recipe_error'
+  | 'step_budget'
+  | 'control_require_failed'
+  | 'harness_require_failed'
+  | 'control_status_unhealthy'
+  | 'probe_status_unhealthy'
+  | 'no_healthy_probe'
+  | 'missing_control_arm'
+  | 'access_probe_not_denied'
+  | 'oracle_disagreement'
+
+export interface RetestHealthAssessment {
+  healthy: boolean
+  code: RetestHealthCode
+  reason: string | null
+}
+
+function is2xxStatus(status: number | null): boolean {
+  return status !== null && status >= 200 && status < 300
+}
+
+function isControlStatusAllowed(role: string, status: number | null, deniedRequirePassed: boolean): boolean {
+  if (status === null || status === 0 || status >= 500 || status === 429 || status === 408) return false
+  if (/denied/i.test(role)) {
+    return status === 401 || status === 403 || status === 404 || (deniedRequirePassed && is2xxStatus(status))
+  }
+  if (role === 'same_origin_control') return is2xxStatus(status) || (status >= 300 && status < 400)
+  if (role === 'post_mutation_read') return is2xxStatus(status) || status === 404 || status === 410
+  if (role === 'serial_control_1') return is2xxStatus(status) || status === 400 || status === 409 || status === 422
+  if (role === 'benign_control') return is2xxStatus(status) || status === 400 || status === 404
+  return is2xxStatus(status)
+}
+
 /**
- * A failed control is not evidence of a fix. It means the retest lost the entitled baseline (server
- * failure, expired authentication, transport failure, or no host trace), so the patch gate must
- * report `inconclusive` rather than treating the rejected probe as remediation.
+ * R2-H-15 / H-19: Allowlist-based positive-health retest classifier.
+ *
+ * A non-confirming retest may transition to `fixed` ONLY when:
+ *   1. No `recipe_error`, `step_budget`, control-side `require`, or harness-side `require` failed;
+ *   2. Every HTTP recipe executed at least one healthy control arm matching its expected baseline
+ *      status class (no-control recipes like `race_burst` and `oob_callback` NEVER report `fixed`);
+ *   3. Every probe arm executed cleanly with a definitive status (never null/0, 5xx, 429, 408,
+ *      unexpected 3xx, or authenticated 401);
+ *   4. Access/disclosure recipes observe the entitled baseline served AND the probe definitively
+ *      denied (a 2xx probe is NEVER `fixed`);
+ *   5. No `oracle_disagreement` occurred (all recipe preconditions passed yet the receipt gate
+ *      rejected for a non-remediation reason).
  */
-function retestControlFailureReason(execution: FloorRecipeExecution): string | null {
-  for (const step of execution.result.steps) {
-    if (step.arm !== 'control') continue
+export function classifyRetestHealth(execution: FloorRecipeExecution): RetestHealthAssessment {
+  if (execution.result.confirmed) {
+    return { healthy: true, code: 'healthy', reason: null }
+  }
+  const failure = execution.failure
+  if (failure?.code === 'recipe_error') {
+    return { healthy: false, code: 'recipe_error', reason: failure.message }
+  }
+  if (failure?.code === 'step_budget_exceeded' || (failure?.missingRoles ?? []).includes('step_budget')) {
+    return { healthy: false, code: 'step_budget', reason: failure?.message ?? 'Recipe exceeded the step budget during retest.' }
+  }
+  const reqFailures = failure?.requireFailures ?? []
+  const controlReqFail = reqFailures.find(item => item.side === 'control')
+  if (controlReqFail) {
+    return { healthy: false, code: 'control_require_failed', reason: controlReqFail.message }
+  }
+  const harnessReqFail = reqFailures.find(item => item.side === 'harness')
+  if (harnessReqFail) {
+    return { healthy: false, code: 'harness_require_failed', reason: harnessReqFail.message }
+  }
+  const missingRoles = failure?.missingRoles ?? []
+  if (missingRoles.includes('browser_trace') || missingRoles.includes('browser_control')) {
+    return { healthy: false, code: 'harness_require_failed', reason: failure?.message ?? 'The retest produced no host-recorded browser trace.' }
+  }
+
+  const recipeId = execution.result.recipeId as string
+  if (recipeId === 'browser_sink') {
+    const traces = execution.result.transcript.browserTraces ?? []
+    if (traces.length === 0) {
+      return { healthy: false, code: 'harness_require_failed', reason: 'The browser_sink retest recorded no host browser trace.' }
+    }
+    if (failure?.code === 'receipt_rejected') {
+      return { healthy: false, code: 'oracle_disagreement', reason: `Oracle disagreement on browser_sink retest: ${failure.message}` }
+    }
+    return { healthy: true, code: 'healthy', reason: null }
+  }
+
+  const steps = execution.result.steps
+  const entryById = new Map((execution.result.transcript.entries ?? []).map(entry => [entry.exchangeId, entry]))
+  const isAuthenticatedStep = (exchangeId: string): boolean => Boolean(entryById.get(exchangeId)?.step.actor.handle)
+
+  const setupSteps = steps.filter(step => step.arm === 'setup')
+  for (const step of setupSteps) {
+    if (step.status === null || step.status === 0 || step.status >= 500 || step.status === 429 || step.status === 408) {
+      return {
+        healthy: false,
+        code: 'control_status_unhealthy',
+        reason: `Setup arm "${step.role}" returned unhealthy HTTP ${step.status ?? 'none'}.`,
+      }
+    }
+    if (step.status === 401 && isAuthenticatedStep(step.exchangeId)) {
+      return {
+        healthy: false,
+        code: 'control_status_unhealthy',
+        reason: `Setup arm "${step.role}" returned HTTP 401; test credential was not valid.`,
+      }
+    }
+  }
+
+  const controlSteps = steps.filter(step => step.arm === 'control')
+  const probeSteps = steps.filter(step => step.arm === 'probe')
+  if (controlSteps.length === 0) {
+    return {
+      healthy: false,
+      code: 'missing_control_arm',
+      reason: `Recipe "${recipeId}" executed no control arm to prove baseline health on retest.`,
+    }
+  }
+  if (probeSteps.length === 0) {
+    return {
+      healthy: false,
+      code: 'no_healthy_probe',
+      reason: `Recipe "${recipeId}" executed no probe arm during retest.`,
+    }
+  }
+
+  const deniedRequirePassed = !reqFailures.some(item => item.role === 'denied_control')
+  for (const step of controlSteps) {
+    if (!isControlStatusAllowed(step.role, step.status, deniedRequirePassed)) {
+      return {
+        healthy: false,
+        code: 'control_status_unhealthy',
+        reason: `Control arm "${step.role}" returned unhealthy HTTP ${step.status ?? 'none'}; baseline health was not established.`,
+      }
+    }
+  }
+
+  for (const step of probeSteps) {
     if (step.status === null || step.status === 0) {
-      return `Control arm "${step.role}" recorded no HTTP status (network/transport failure).`
+      return {
+        healthy: false,
+        code: 'probe_status_unhealthy',
+        reason: `Probe arm "${step.role}" recorded no HTTP status (network/transport failure).`,
+      }
     }
     if (step.status >= 500) {
-      return `Control arm "${step.role}" returned HTTP ${step.status}; the entitled baseline was not observed.`
+      return {
+        healthy: false,
+        code: 'probe_status_unhealthy',
+        reason: `Probe arm "${step.role}" returned HTTP ${step.status}; a server error is not evidence of remediation.`,
+      }
     }
-    // A denied-control arm is supposed to observe 401/403. A 401 on any control that must be served
-    // (entitled read, baseline, reset, benign injection control) means the test credential expired.
-    if (step.status === 401 && !/denied/i.test(step.role)) {
-      return `Control arm "${step.role}" returned HTTP 401; authentication for the entitled baseline was not valid.`
+    if (step.status === 429 || step.status === 408) {
+      return {
+        healthy: false,
+        code: 'probe_status_unhealthy',
+        reason: `Probe arm "${step.role}" was throttled/timed out with HTTP ${step.status}; not evidence of remediation.`,
+      }
+    }
+    if (step.status >= 300 && step.status < 400 && recipeId !== 'redirect') {
+      return {
+        healthy: false,
+        code: 'probe_status_unhealthy',
+        reason: `Probe arm "${step.role}" returned unexpected HTTP ${step.status} redirect; not a definitive fix.`,
+      }
+    }
+    if (step.status === 401 && isAuthenticatedStep(step.exchangeId)) {
+      return {
+        healthy: false,
+        code: 'probe_status_unhealthy',
+        reason: `Authenticated probe arm "${step.role}" returned HTTP 401; session expired rather than authorization enforced.`,
+      }
     }
   }
-  const missing = execution.failure?.missingRoles ?? []
-  if (missing.includes('browser_trace') || missing.includes('browser_control')) {
-    return execution.failure?.message ?? 'The retest produced no host-recorded browser control trace.'
+
+  if (recipeId === 'access_boundary' || recipeId === 'disclosure') {
+    const entitled = controlSteps.find(step => step.role === 'entitled_read')
+    if (!entitled || !is2xxStatus(entitled.status)) {
+      return { healthy: false, code: 'control_status_unhealthy', reason: 'Entitled control arm was not served HTTP 2xx.' }
+    }
+    for (const step of probeSteps) {
+      const authed = isAuthenticatedStep(step.exchangeId)
+      const definitivelyDenied = authed
+        ? (step.status === 403 || step.status === 404)
+        : (step.status === 401 || step.status === 403 || step.status === 404)
+      if (!definitivelyDenied) {
+        return {
+          healthy: false,
+          code: 'access_probe_not_denied',
+          reason: `Probe arm "${step.role}" returned HTTP ${step.status ?? 'none'} instead of a definitive denial; cannot mark ${recipeId} fixed.`,
+        }
+      }
+    }
   }
-  return null
+
+  // Oracle-disagreement guard: when every recipe precondition passed yet `verifyReceipt` rejected,
+  // allow `fixed` ONLY for explicit remediation-observed verification reasons (e.g. boolean/timing
+  // differential disappeared, mutation no longer persisted, conservation held).
+  if (failure?.code === 'receipt_rejected') {
+    const reason = execution.result.verification.reason
+    const rule = execution.result.verification.rule
+    if (recipeId === 'boolean_or_timing') {
+      if (rule === 'boolean' && /no structural response change|identical after token stripping|only difference was the injected predicate|rotating nonce/i.test(reason)) {
+        return { healthy: true, code: 'healthy', reason: null }
+      }
+      if (rule === 'timing' && /not distinguishable|stable separation|separation|delay/i.test(reason) && !/wall-clock duration|control and a probe/i.test(reason)) {
+        return { healthy: true, code: 'healthy', reason: null }
+      }
+      return { healthy: false, code: 'oracle_disagreement', reason: `Oracle disagreement on boolean_or_timing retest: ${reason}` }
+    }
+    if (recipeId === 'persisted_mutation') {
+      if (/identical to the baseline|no persisted|state echo|idempotent|not a protected field|not impact/i.test(reason)) {
+        return { healthy: true, code: 'healthy', reason: null }
+      }
+      return { healthy: false, code: 'oracle_disagreement', reason: `Oracle disagreement on persisted_mutation retest: ${reason}` }
+    }
+    if (recipeId === 'conserved_balance') {
+      if (/conserved|conservation|no oversell|within balance|no under-debit/i.test(reason) && !/readback|serial control|concurrent mutation/i.test(reason)) {
+        return { healthy: true, code: 'healthy', reason: null }
+      }
+      return { healthy: false, code: 'oracle_disagreement', reason: `Oracle disagreement on conserved_balance retest: ${reason}` }
+    }
+    return { healthy: false, code: 'oracle_disagreement', reason: `Oracle disagreement on ${recipeId} retest: ${reason}` }
+  }
+
+  return { healthy: true, code: 'healthy', reason: null }
 }
 
 /**
@@ -1186,8 +1438,8 @@ function retestControlFailureReason(execution: FloorRecipeExecution): string | n
  *
  * Verdict mapping keeps the patch gate's semantics:
  *   - the receipt confirms again → `reproduced`
- *   - a healthy control observes the vulnerable precondition disappear → `fixed`
- *   - the control failed, lost auth/trace, or the recipe could not finish → `inconclusive`
+ *   - `classifyRetestHealth` confirms positive baseline + probe health → `fixed`
+ *   - any unhealthy control/probe, missing control, budget overflow, or oracle disagreement → `inconclusive`
  */
 export async function retestPersistedRecipe(input: {
   envelope: FloorRecipeEnvelope
@@ -1235,6 +1487,7 @@ export async function retestPersistedRecipe(input: {
   } catch (error) {
     // A recipe that cannot execute at all is not evidence the vulnerability is gone.
     const reason = `recipe retest could not run: ${error instanceof Error ? error.message.slice(0, 300) : String(error).slice(0, 300)}`
+    const health: RetestHealthAssessment = { healthy: false, code: 'recipe_error', reason }
     return {
       verdict: 'inconclusive',
       execution: null,
@@ -1243,22 +1496,25 @@ export async function retestPersistedRecipe(input: {
         outcome: { confirmed: false, controlPassed: false, observed: reason, expected: 'the persisted recipe re-executes', reason },
         exchangeIds: [],
         exchanges: [],
-        evidencePayload: { kind: plan.specKind, recipe: plan.recipeId, confirmation: 'proof_receipt' },
+        evidencePayload: { kind: plan.specKind, recipe: plan.recipeId, confirmation: 'proof_receipt', retestHealth: health },
         evidenceSha256: createHash('sha256').update(reason).digest('hex'),
       },
     }
   }
   const exchangeIds = [...execution.result.exchangeIds]
-  const replay = recipeRetestResult(plan, execution, exchangeIds)
-  const controlFailure = retestControlFailureReason(execution)
-  const recipeError = execution.failure?.code === 'recipe_error'
-  const verdict: RetestVerdict = controlFailure || recipeError
-    ? 'inconclusive'
-    : execution.result.confirmed
-      ? 'reproduced'
-      : 'fixed'
+  const baseReplay = recipeRetestResult(plan, execution, exchangeIds)
+  const health = classifyRetestHealth(execution)
+  const replay: ReplayVerificationResult = {
+    ...baseReplay,
+    evidencePayload: { ...baseReplay.evidencePayload, retestHealth: health },
+  }
+  const verdict: RetestVerdict = execution.result.confirmed
+    ? 'reproduced'
+    : health.healthy
+      ? 'fixed'
+      : 'inconclusive'
   if (verdict === 'inconclusive') {
-    const reason = controlFailure ?? execution.failure?.message ?? replay.outcome.reason ?? 'The persisted recipe could not complete.'
+    const reason = health.reason ?? execution.failure?.message ?? replay.outcome.reason ?? 'The persisted recipe could not establish retest health.'
     return {
       verdict,
       execution,
@@ -2100,8 +2356,9 @@ export async function runCacheDifferentialRecipe(
       verifyEx.respHeaders['x-proxy-cache'],
       verifyEx.respHeaders['cache-status'],
     ].some(v => typeof v === 'string' && /\bhit\b/i.test(v))
-    const simControlVsVerify = structuralSimilarity(controlEx.body, verifyEx.body)
-    const simProbeVsVerify = structuralSimilarity(probeEx.body, verifyEx.body)
+    const normVerifyBody = normalizeStructuralTokens(verifyEx.body)
+    const simControlVsVerify = structuralDiffNormalized(normalizeStructuralTokens(controlEx.body), normVerifyBody).similarity
+    const simProbeVsVerify = structuralDiffNormalized(normalizeStructuralTokens(probeEx.body), normVerifyBody).similarity
 
     let cacheHitObserved: boolean
     let poisonPersistedToVictim: boolean
@@ -3505,12 +3762,105 @@ export function isUnexpectedErrorStatus(status: number, ...expected: Array<numbe
  * receipt rule keeps a confirmation alive).
  */
 
+const CWE_NUMBER_RE = /\bCWE-(\d{1,5})\b/i
+
+const CWE_TO_RECEIPT_CLASS: Record<number, string> = {
+  918: 'ssrf',
+  611: 'xxe',
+  601: 'open_redirect',
+  345: 'webhook_forgery',
+  287: 'auth_bypass',
+  288: 'auth_bypass',
+  290: 'auth_bypass',
+  306: 'auth_bypass',
+  307: 'auth_bypass',
+  347: 'auth_bypass',
+  384: 'auth_bypass',
+  613: 'auth_bypass',
+  798: 'auth_bypass',
+  352: 'csrf',
+  915: 'mass_assignment',
+  79: 'xss_stored',
+  80: 'xss_stored',
+  83: 'xss_stored',
+  89: 'injection',
+  564: 'injection',
+  943: 'injection',
+  269: 'bfla',
+  285: 'bfla',
+  862: 'bfla',
+  863: 'bfla',
+  284: 'bola',
+  362: 'bola',
+  566: 'bola',
+  639: 'bola',
+  1021: 'bola',
+  1220: 'bola',
+  840: 'business_logic',
+  841: 'business_logic',
+  472: 'business_logic',
+  1284: 'business_logic',
+  200: 'info_disclosure',
+  359: 'info_disclosure',
+  522: 'info_disclosure',
+  532: 'info_disclosure',
+}
+
+const DEDICATED_RECEIPT_CLASSES = new Set(['ssrf', 'xxe', 'open_redirect', 'webhook_forgery'])
+
+const EXPLICIT_KEYWORD_CLASS_MATCHERS: ReadonlyArray<{ receiptClass: string; pattern: RegExp }> = [
+  { receiptClass: 'ssrf', pattern: /\bssrf\b|server[- ]side request/i },
+  { receiptClass: 'xxe', pattern: /\bxxe\b|external entit/i },
+  { receiptClass: 'open_redirect', pattern: /\bopen[-_ ]?redirect\b|unvalidated[- ]redirect/i },
+  { receiptClass: 'webhook_forgery', pattern: /webhook[^.]{0,80}(?:signature|forger|tamper)|(?:signature|forger)[^.]{0,80}webhook/i },
+  { receiptClass: 'csrf', pattern: /\bcsrf\b|cross[- ]site\s+request\s+forgery/i },
+  { receiptClass: 'xss_stored', pattern: /\b(?:xss|cross[- ]site\s+scripting)\b/i },
+  { receiptClass: 'injection', pattern: /\b(?:sqli|sql[-_ ]?injection|nosql[-_ ]?injection)\b/i },
+  { receiptClass: 'mass_assignment', pattern: /\bmass[- ]?assign|over[- ]?post/i },
+  { receiptClass: 'auth_bypass', pattern: /\b(?:auth(?:entication)?[- ]bypass|jwt[- ]forgery|oauth[- ]bypass|mfa[- ]bypass)\b/i },
+]
+
+function explicitKeywordReceiptClasses(labelText: string): string[] {
+  const matched: string[] = []
+  for (const { receiptClass, pattern } of EXPLICIT_KEYWORD_CLASS_MATCHERS) {
+    if (pattern.test(labelText)) matched.push(receiptClass)
+  }
+  return matched
+}
+
+/**
+ * R2-H-14 / H-18: Map a replay spec onto a receipt class strictly CWE-first.
+ *
+ * When `spec.cwe` names a CWE identifier:
+ *   - Unmodelled CWEs (e.g. CWE-22) fail closed (`null`) regardless of keywords in title/impact;
+ *   - Conflicting explicit class keywords in model-authored labels fail closed (`null`).
+ * Only when no CWE identifier is present does classification fall back to label keywords (still
+ * failing closed if two distinct explicit keyword classes conflict).
+ */
 export function receiptVulnClassFor(spec: DeclarativeReplaySpec): string | null {
-  const text = `${spec.cwe} ${spec.category} ${spec.title} ${spec.impact}`
-  if (/CWE-918|\bssrf\b|server[- ]side request/i.test(text)) return 'ssrf'
-  if (/CWE-611|\bxxe\b|external entit/i.test(text)) return 'xxe'
-  if (/CWE-601|\bopen[-_ ]?redirect\b|unvalidated[- ]redirect/i.test(text)) return 'open_redirect'
-  if (/CWE-345/i.test(text) || /webhook[^.]*(?:signature|forger|tamper)|(?:signature|forger)[^.]*webhook/i.test(text)) return 'webhook_forgery'
+  const labelText = `${spec.category ?? ''} ${spec.title ?? ''} ${spec.impact ?? ''}`
+  const keywordClasses = explicitKeywordReceiptClasses(labelText)
+  const cweMatch = CWE_NUMBER_RE.exec(spec.cwe ?? '')
+  if (cweMatch) {
+    const cweNum = Number(cweMatch[1])
+    const cweClass = Object.prototype.hasOwnProperty.call(CWE_TO_RECEIPT_CLASS, cweNum)
+      ? CWE_TO_RECEIPT_CLASS[cweNum]!
+      : null
+    if (!cweClass) return null
+    if (!DEDICATED_RECEIPT_CLASSES.has(cweClass) && spec.kind !== 'http_chain' && spec.kind !== 'auth_protocol_proof') {
+      return null
+    }
+    // Fail closed whenever model-authored label keywords name a different receipt class than the CWE.
+    if (keywordClasses.some(cls => cls !== cweClass)) return null
+    return cweClass
+  }
+
+  // No CWE present: fall back to label keywords, failing closed on multi-class ambiguity.
+  if (keywordClasses.length > 1) return null
+  if (keywordClasses.length === 1) {
+    const only = keywordClasses[0]!
+    if (DEDICATED_RECEIPT_CLASSES.has(only)) return only
+  }
   if (spec.kind !== 'http_chain' && spec.kind !== 'auth_protocol_proof') return null
   if (classifyBoundaryClaim({
     cwe: spec.cwe,
@@ -3565,7 +3915,11 @@ export function buildReplayReceipt(input: {
   const evidenceClass = typeof input.evidencePayload.evidenceClass === 'string'
     ? input.evidencePayload.evidenceClass
     : null
-  const baseVulnClass = vulnClassForImpactClass(evidenceClass) ?? receiptVulnClassFor(input.spec)
+  const specClass = receiptVulnClassFor(input.spec)
+  // R2-H-14: When the spec carries an explicit CWE that failed closed (unmodelled or keyword conflict),
+  // never let evidenceClass override the CWE-first rejection.
+  if (CWE_NUMBER_RE.test(input.spec.cwe ?? '') && specClass === null) return null
+  const baseVulnClass = vulnClassForImpactClass(evidenceClass) ?? specClass
   const isBoundaryAuth = (baseVulnClass === null || baseVulnClass === 'auth_bypass') &&
     boundaryGate?.required === true && boundaryGate.satisfied === true && boundaryGate.boundaryClass === 'auth'
   const vulnClass = baseVulnClass ?? (isBoundaryAuth ? 'auth_bypass' : null)
@@ -3619,9 +3973,9 @@ export function buildReplayReceipt(input: {
   }
 
   if (isOob) {
-    // C-3: A delivered event requires an independently checked host CanaryBroker hit, never a plain evidence flag.
+    // C-3 & R2-H-14: Require canary.triggered === true AND an independently checked host CanaryBroker hit.
     const token = canary?.token
-    if (!token || !replayCanaryTokenRe.test(token) || !canary.callbackId || canary.controlTriggered === true) return null
+    if (canary?.triggered !== true || !token || !replayCanaryTokenRe.test(token) || !canary.callbackId || canary.controlTriggered === true) return null
     const hostCheck = input.canaryBroker?.checkCanary(token, {
       ...(input.canaryStorage ? { storage: input.canaryStorage } : {}),
       ...(input.canaryRunId ? { runId: input.canaryRunId } : {}),
@@ -3768,14 +4122,15 @@ export function receiptCheckForResult(input: {
     }
     return { verdict: input.verdict, outcome: input.outcome }
   }
+  const strictHostDerivation = input.envelopeTrust !== 'host_persisted'
   const oracleRes = defaultTerminalOracleRegistry.evaluate(
     built.factLog,
     { kind: 'single_hop', receipt: built.receipt },
     {
-      // H-6: Preserve host-synthesized persona/tenant boundaries on host_persisted floor specs while
-      // enforcing strictHostDerivation=true on untrusted/inline specs; never trust raw expectedImpactEvents.
-      strictHostDerivation: input.envelopeTrust !== 'host_persisted',
-      ...(built.trustedOracleEvents.length ? { trustedOracleEvents: built.trustedOracleEvents } : {}),
+      // H-6 / R2-H-9: Enforce strictHostDerivation on untrusted/inline specs and NEVER pass
+      // spec-derived trustedOracleEvents under strict host derivation.
+      strictHostDerivation,
+      ...(!strictHostDerivation && built.trustedOracleEvents.length ? { trustedOracleEvents: built.trustedOracleEvents } : {}),
     },
   )
   const verification: ReceiptVerification = oracleRes.singleHop ?? {
