@@ -60,10 +60,44 @@ import type {
   newRun,
 } from '../domain.ts'
 import {
-  stepBlocksDependent,
-  stepKillsDependents,
-  stepSatisfiesDependency,
+  isTerminalStepStatus,
+  type ChainStepStatus,
+  type ChainStepTerminalStatus,
 } from '../step-status.ts'
+
+/**
+ * Compile-time exhaustive parent-step dependency disposition (`R4-H-13`).
+ * Adding any new terminal status to `STEP_STATUS` forces an explicit classification here so
+ * `addChainStep` and `refreshReadyChainSteps` can never strand a pending dependent.
+ */
+type TerminalParentDisposition = 'satisfies' | 'kills' | 'blocks'
+const TERMINAL_PARENT_DISPOSITION: Readonly<Record<ChainStepTerminalStatus, TerminalParentDisposition>> = {
+  complete: 'satisfies',
+  blocked: 'kills',
+  tainted: 'kills',
+  canceled: 'kills',
+  infra_failed: 'kills',
+  model_failure: 'kills',
+  turn_capped: 'blocks',
+  nudged_out: 'blocks',
+  rotated_partial: 'blocks',
+}
+const ORIGIN_QUARANTINE_SKILL_PREFIX_STORE = 'kovo:origin_quarantined:'
+const ORIGIN_QUARANTINE_DEPENDENT_SKILL_TAG = 'kovo:quarantine_dependent_tainted'
+
+function classifyParentStepStatus(status: ChainStepStatus | undefined): 'missing' | 'active' | TerminalParentDisposition {
+  if (!status) return 'missing'
+  if (!isTerminalStepStatus(status)) return 'active'
+  return TERMINAL_PARENT_DISPOSITION[status]
+}
+
+function isOriginQuarantinedBlockedParent(parent: { status: ChainStepStatus; skills: readonly string[] } | undefined): boolean {
+  return Boolean(
+    parent
+    && parent.status === 'blocked'
+    && parent.skills.some(skill => skill.startsWith(ORIGIN_QUARANTINE_SKILL_PREFIX_STORE)),
+  )
+}
 import {
   buildProvenanceReport,
   collapseBaselineHeaderFindings,
@@ -1301,16 +1335,50 @@ export class RunsRepository {
         const asset = currentRun.candidates.find(c => c.id === assetId)
         if (asset) origins.add(asset.origin)
       }
-      if (depFactIds.length) {
-        const depFacts = this.session.db.select().from(tables.facts).where(and(
-          eq(tables.facts.runId, currentRun.id), inArray(tables.facts.id, depFactIds),
-        )).all()
-        for (const f of depFacts) {
-          origins.add(f.origin)
-          for (const o of f.sourceOrigins) origins.add(o)
+      const depFacts = depFactIds.length
+        ? this.session.db.select().from(tables.facts).where(and(
+            eq(tables.facts.runId, currentRun.id), inArray(tables.facts.id, depFactIds),
+          )).all()
+        : []
+      for (const f of depFacts) {
+        origins.add(f.origin)
+        for (const o of f.sourceOrigins) origins.add(o)
+      }
+      const existingById = new Map(existingSteps.map(s => [s.id, s]))
+      const hasTaintedFact = depFacts.some(f => f.tainted)
+      const depParentDispositions = depStepIds.map(sid => {
+        const parent = existingById.get(sid)
+        return {
+          parent,
+          disposition: classifyParentStepStatus(parent?.status),
+        }
+      })
+      const killedByParent = depParentDispositions.some(d => d.disposition === 'kills')
+      const blockedByParent = depParentDispositions.some(d => d.disposition === 'missing' || d.disposition === 'blocks')
+      const allDepStepsSatisfied = depParentDispositions.every(d => d.disposition === 'satisfies')
+      let initialStatus: ChainStepStatus
+      if (killedByParent || hasTaintedFact) {
+        initialStatus = 'tainted'
+      } else if (blockedByParent) {
+        initialStatus = 'blocked'
+      } else if (allDepStepsSatisfied) {
+        initialStatus = 'ready'
+      } else {
+        initialStatus = 'pending'
+      }
+      const skills = [...new Set(input.skills ?? [])]
+      if (
+        initialStatus === 'tainted'
+        && !hasTaintedFact
+        && killedByParent
+        && depParentDispositions
+          .filter(d => d.disposition === 'kills')
+          .every(d => isOriginQuarantinedBlockedParent(d.parent))
+      ) {
+        if (!skills.includes(ORIGIN_QUARANTINE_DEPENDENT_SKILL_TAG)) {
+          skills.push(ORIGIN_QUARANTINE_DEPENDENT_SKILL_TAG)
         }
       }
-      const allDepStepsComplete = depStepIds.every(sid => existingSteps.find(s => s.id === sid)?.status === 'complete')
       const now = Date.now()
       const created = this.session.db.insert(tables.chainSteps).values({
         id: randomUUID(),
@@ -1323,10 +1391,10 @@ export class RunsRepository {
         category: input.category ?? 'misconfig-exposure',
         priority: Math.max(0, Math.min(100, Math.round(input.priority ?? 50))),
         targetAssetIds: [...new Set(input.targetAssetIds)],
-        skills: [...new Set(input.skills ?? [])],
+        skills,
         dependsOnFactIds: depFactIds,
         dependsOnStepIds: depStepIds,
-        status: allDepStepsComplete ? 'ready' : 'pending',
+        status: initialStatus,
         assignedWorkerId: null,
         specialistProfile: input.specialistProfile ?? null,
         trialGroupId: input.trialGroupId ?? null,
@@ -1375,35 +1443,46 @@ export class RunsRepository {
         this.session.db.select({ id: tables.facts.id, tainted: tables.facts.tainted }).from(tables.facts)
           .where(eq(tables.facts.runId, runId)).all().map(f => [f.id, f]),
       )
-      // Fixed-point propagation derived from STEP_STATUS so transitive chains resolve in one pass
-      // and zero pending steps stay stranded on terminal non-satisfying or missing dependencies.
+      // Fixed-point propagation derived from STEP_STATUS (compile-time exhaustive over
+      // ChainStepTerminalStatus) so transitive chains resolve in one pass and zero pending steps
+      // stay stranded on terminal non-satisfying or missing dependencies.
       let changed = true
       while (changed) {
         changed = false
         for (const step of stepById.values()) {
           if (step.status !== 'pending') continue
-          const killedByStep = step.dependsOnStepIds.some(sid => {
-            const s = stepById.get(sid)
-            return Boolean(s && stepKillsDependents(s.status))
+          const parentDispositions = step.dependsOnStepIds.map(sid => {
+            const parent = stepById.get(sid)
+            return { parent, disposition: classifyParentStepStatus(parent?.status) }
           })
+          const killingParents = parentDispositions.filter(d => d.disposition === 'kills')
+          const killedByStep = killingParents.length > 0
           const taintedFact = step.dependsOnFactIds.some(fid => runFacts.get(fid)?.tainted)
           if (killedByStep || taintedFact) {
-            this.updateChainStep(step.id, { status: 'tainted' })
+            const solelyOriginQuarantined =
+              !taintedFact
+              && killedByStep
+              && killingParents.every(d => isOriginQuarantinedBlockedParent(d.parent))
+            const nextSkills = solelyOriginQuarantined && !step.skills.includes(ORIGIN_QUARANTINE_DEPENDENT_SKILL_TAG)
+              ? [...step.skills, ORIGIN_QUARANTINE_DEPENDENT_SKILL_TAG]
+              : step.skills
+            this.updateChainStep(step.id, {
+              status: 'tainted',
+              ...(nextSkills !== step.skills ? { skills: nextSkills } : {}),
+            })
             step.status = 'tainted'
+            step.skills = nextSkills
             changed = true
             continue
           }
-          const blockedByStep = step.dependsOnStepIds.some(sid => {
-            const s = stepById.get(sid)
-            return !s || stepBlocksDependent(s.status)
-          })
+          const blockedByStep = parentDispositions.some(d => d.disposition === 'missing' || d.disposition === 'blocks')
           if (blockedByStep) {
             this.updateChainStep(step.id, { status: 'blocked' })
             step.status = 'blocked'
             changed = true
             continue
           }
-          const ready = step.dependsOnStepIds.every(sid => stepSatisfiesDependency(stepById.get(sid)?.status)) &&
+          const ready = parentDispositions.every(d => d.disposition === 'satisfies') &&
             step.dependsOnFactIds.every(fid => {
               const f = runFacts.get(fid)
               return f && !f.tainted

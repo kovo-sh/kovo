@@ -408,6 +408,30 @@ function parseFileInfo(rootDir: string, relPath: string): ParsedFileInfo {
       }
       if (ts.isTypeNode(node) && !ts.isTypeQueryNode(node)) return
       if (ts.isInterfaceDeclaration(node) || ts.isTypeAliasDeclaration(node)) return
+      // Recognize destructured dynamic imports (`const { foo } = await import('./mod.ts')`) as
+      // wired consumers without adding static module-load cycle edges to `info.runtimeDeps`.
+      if (
+        ts.isVariableDeclaration(node)
+        && ts.isObjectBindingPattern(node.name)
+        && node.initializer
+        && ts.isAwaitExpression(node.initializer)
+        && ts.isCallExpression(node.initializer.expression)
+        && node.initializer.expression.expression.kind === ts.SyntaxKind.ImportKeyword
+        && node.initializer.expression.arguments.length === 1
+        && ts.isStringLiteral(node.initializer.expression.arguments[0]!)
+      ) {
+        const target = resolveLocalSpecifier(rootDir, relPath, node.initializer.expression.arguments[0]!.text)
+        if (target) {
+          for (const el of node.name.elements) {
+            if (!ts.isIdentifier(el.name)) continue
+            const localName = el.name.text
+            const importedName = el.propertyName && ts.isIdentifier(el.propertyName) ? el.propertyName.text : localName
+            if (!info.namedImports.has(localName)) {
+              info.namedImports.set(localName, { from: target, importedName })
+            }
+          }
+        }
+      }
       if (ts.isPropertyAccessExpression(node) && ts.isIdentifier(node.expression) && info.namespaceImports.has(node.expression.text)) {
         const ns = node.expression.text
         let set = info.namespaceProps.get(ns)

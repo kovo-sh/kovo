@@ -106,6 +106,7 @@ import {
   hardChainStepsCeiling,
   hostTierOrder,
   isDetLeadDispatchStep,
+  isLiveNon401HttpStatus,
   isMultiHopChainStep,
   isRetryableChainStepStatus,
   nextPlannerDryRounds,
@@ -115,6 +116,7 @@ import {
   plannerWaveDispatchCap,
   prioritizeMountedSourceInitialSteps,
   readChainHopsFromFacts,
+  reconcileUnavailableOriginSteps,
   reinvestigationKey,
   selectUncoveredHighRiskEndpoints,
   shouldInvokeLlmPlanner,
@@ -130,6 +132,7 @@ import {
   type DispatchFunnelCounts,
   type DispatchStopReason,
   type FrontierWaveControllerOptions,
+  type QuarantineObservedExchange,
   type QuarantinedOriginRecord,
   type ReinvestigationGuard,
   type RuntimeCompositeApiDependencyInput,
@@ -165,7 +168,6 @@ import {
   classifySurface,
   extractRuntimeCatalogFromFacts,
   inferRuntimeInvariantHypotheses,
-  synthesizeInvariants,
   synthesizePostFloorRuntimeInvariants,
   toCapabilityLedgerSeeds,
   type CapabilitySeedRecord,
@@ -213,7 +215,7 @@ import { brokerExchanges, coverageEntries, findings, messages, type ChainStepRet
 import { runVariantSweepForFinding } from './semantic-audit.ts'
 import type { StaticWorkspaceSnapshot } from './static-workspace-snapshot.ts'
 import type { Assignment, ChainStep, Fact, Run, Store } from './store.ts'
-import { extractProgramGraphInWorker } from './untrusted-compute-pool.ts'
+import { extractProgramGraphInWorker, synthesizeInvariantsInWorker } from './untrusted-compute-pool.ts'
 
 type Active = ExecActiveJob
 type Capture = ExecCapture
@@ -2381,9 +2383,102 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
   }
 
   /**
+   * Per-origin SQLite evidence reader (`R4-H-11`):
+   *  1. Lifetime per-origin live-response summary across ALL `broker_exchanges` rows for the run
+   *     (never truncated by a global 240-row window, so busy origin A can never scroll origin B's
+   *     earlier live 2xx response out of visibility).
+   *  2. Per-origin bounded probe sample (up to 64 recent rows PER origin) joined with `assignments`
+   *     so `detectQuarantinedOrigins` can distinguish Phase-0 / host-originated probes from
+   *     arbitrary investigation worker traffic and apply `originQuarantineWindowMs`.
+   */
+  private queryPerOriginQuarantineEvidence(
+    runId: string,
+    originsToSample: readonly string[],
+  ): {
+    everLiveOrigins: Set<string>
+    everReachableOrigins: Set<string>
+    perOriginProbes: QuarantineObservedExchange[]
+  } {
+    const everLiveOrigins = new Set<string>()
+    const everReachableOrigins = new Set<string>()
+    const perOriginProbes: QuarantineObservedExchange[] = []
+    try {
+      const summaryRows = this.storage.client.prepare(`
+        SELECT origin,
+               MAX(CASE WHEN status >= 100 AND status < 600 AND status NOT IN (401, 407) AND (status < 520 OR status > 526) THEN created_at ELSE 0 END) AS lastLiveNon401At,
+               MAX(CASE WHEN status >= 100 AND status < 600 AND (status < 520 OR status > 526) THEN created_at ELSE 0 END) AS lastReachableAt
+        FROM broker_exchanges
+        WHERE run_id = ?
+        GROUP BY origin
+      `).all(runId) as Array<{ origin: string; lastLiveNon401At: number; lastReachableAt: number }>
+      for (const row of summaryRows) {
+        if (!row.origin) continue
+        if (Number(row.lastLiveNon401At) > 0) {
+          everLiveOrigins.add(row.origin)
+          everReachableOrigins.add(row.origin)
+        } else if (Number(row.lastReachableAt) > 0) {
+          everReachableOrigins.add(row.origin)
+        }
+      }
+      if (originsToSample.length > 0) {
+        const sampleStmt = this.storage.client.prepare(`
+          SELECT be.origin,
+                 be.path_and_query AS pathAndQuery,
+                 be.status,
+                 be.persona_handle AS personaHandle,
+                 be.created_at AS createdAt,
+                 a.phase AS assignmentPhase
+          FROM broker_exchanges be
+          LEFT JOIN assignments a ON a.id = be.assignment_id
+          WHERE be.run_id = ? AND be.origin = ?
+          ORDER BY be.created_at DESC
+          LIMIT 64
+        `)
+        for (const origin of originsToSample) {
+          const rows = sampleStmt.all(runId, origin) as Array<{
+            origin: string
+            pathAndQuery: string
+            status: number
+            personaHandle: string | null
+            createdAt: number | null
+            assignmentPhase: string | null
+          }>
+          for (const row of rows) {
+            perOriginProbes.push(row)
+          }
+        }
+      }
+    } catch { /* best-effort DB read */ }
+    return { everLiveOrigins, everReachableOrigins, perOriginProbes }
+  }
+
+  /** Reconcile non-running steps against current quarantined + circuit-open origins (`R4-H-12`). */
+  private reconcileOriginUnavailableStepsForRun(
+    run: Run,
+    quarantinedRecords: ReadonlyMap<string, QuarantinedOriginRecord>,
+    approvedOrigins?: ReadonlySet<string>,
+  ): void {
+    const scope = approvedOrigins ?? this.host.approvedOriginsSet(run)
+    const circuitOpenOrigins = new Set<string>()
+    for (const origin of scope) {
+      if (this.broker.isCircuitOpen(origin)) circuitOpenOrigins.add(origin)
+    }
+    try {
+      reconcileUnavailableOriginSteps({
+        storage: this.storage,
+        run,
+        quarantinedOrigins: quarantinedRecords,
+        circuitOpenOrigins,
+        activeAssignmentIds: new Set(this.host.active.keys()),
+      })
+    } catch { /* step reconciliation is best-effort inside advisory calls */ }
+  }
+
+  /**
    * Record quarantined hosts (`edge_protected` / `unreachable`) on run state, emit a single
    * structured coverage gap per quarantined origin (idempotent via `(runId, goalRevision, origin, category)`),
-   * and emit a telemetry event so planner & dispatch concentrate turn budgets on live origins.
+   * transition non-running steps via `reconcileUnavailableOriginSteps`, and emit telemetry so
+   * planner & dispatch concentrate turn budgets on live origins.
    */
   quarantineOrigins(
     run: Run,
@@ -2395,6 +2490,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     this.quarantinedOriginsByRun.set(run.id, existingMap)
     const gapAssignmentId = assignmentId?.trim() || 'planner:host-quarantine'
     const newlyQuarantined: QuarantinedOriginRecord[] = []
+    const now = Date.now()
 
     for (const rec of records) {
       const origin = rec.origin.trim()
@@ -2402,45 +2498,50 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       const prev = existingMap.get(origin)
       // Preserve an existing `unreachable` diagnosis over a softer `edge_protected` one.
       if (prev && (prev.reason === rec.reason || prev.reason === 'unreachable')) continue
-      existingMap.set(origin, rec)
-      newlyQuarantined.push(rec)
+      const stamped: QuarantinedOriginRecord = { ...rec, origin, quarantinedAt: rec.quarantinedAt ?? now }
+      existingMap.set(origin, stamped)
+      newlyQuarantined.push(stamped)
 
-      const category = rec.reason === 'edge_protected' ? 'auth-identity' : 'misconfig-exposure'
-      const summary = rec.reason === 'edge_protected'
-        ? `Host quarantined (edge_protected): ${rec.detail}. Excluded from unauthenticated investigation steps; supply an authenticated persona for this origin to test behind the edge auth wall.`
-        : `Host quarantined (unreachable): ${rec.detail}. Excluded from investigation queue to concentrate budget on reachable origins.`
+      const category = stamped.reason === 'edge_protected' ? 'auth-identity' : 'misconfig-exposure'
+      const summary = stamped.reason === 'edge_protected'
+        ? `Host quarantined (edge_protected): ${stamped.detail}. Excluded from unauthenticated investigation steps; supply an authenticated persona for this origin to test behind the edge auth wall.`
+        : `Host quarantined (unreachable): ${stamped.detail}. Excluded from investigation queue to concentrate budget on reachable origins.`
       try {
         this.storage.upsertCoverageEntry(run, gapAssignmentId, {
           origin,
           category,
           status: 'needs_follow_up',
           summary,
-          proofGapReason: rec.reason,
+          proofGapReason: stamped.reason,
         })
       } catch (err) {
-        this.noteLifecycleWarning(run.id, 'quarantineOrigins.upsertCoverageEntry', err, { origin, reason: rec.reason })
+        this.noteLifecycleWarning(run.id, 'quarantineOrigins.upsertCoverageEntry', err, { origin, reason: stamped.reason })
       }
       try {
         this.storage.event(
           run.id,
           'planner.origin_quarantined',
-          `Quarantined origin ${origin} (${rec.reason}): ${rec.detail}`,
+          `Quarantined origin ${origin} (${stamped.reason}): ${stamped.detail}`,
           {
             origin,
-            reason: rec.reason,
-            source: rec.source,
-            ...(rec.observedStatuses?.length ? { observedStatuses: rec.observedStatuses } : {}),
-            ...(typeof rec.requestsObserved === 'number' ? { requestsObserved: rec.requestsObserved } : {}),
+            reason: stamped.reason,
+            source: stamped.source,
+            ...(stamped.observedStatuses?.length ? { observedStatuses: stamped.observedStatuses } : {}),
+            ...(typeof stamped.requestsObserved === 'number' ? { requestsObserved: stamped.requestsObserved } : {}),
           },
         )
       } catch { /* telemetry is best-effort */ }
+    }
+    if (newlyQuarantined.length > 0) {
+      this.reconcileOriginUnavailableStepsForRun(run, existingMap)
     }
     return newlyQuarantined
   }
 
   /**
-   * Detect and quarantine edge-protected / dead hosts from Phase-0 output + observed broker exchanges,
-   * recording one structured coverage gap per quarantined origin.
+   * Detect and quarantine edge-protected / dead hosts from Phase-0 output + per-origin broker
+   * probes, automatically releasing any previously quarantined origin that has since returned a
+   * live response, and reconciling queued steps cleanly (`R4-H-11`, `R4-H-12`).
    */
   refreshQuarantinedOriginsFromPhase0(
     run: Run,
@@ -2455,84 +2556,153 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     const approvedOrigins = input.approvedOrigins ?? this.host.approvedOriginsSet(run)
     const personas = [...resolveRunPersonas(this.storage, run.projectId, run.approvedPersonaIds).values()]
       .map(p => ({ handle: p.handle, originAllowlist: p.originAllowlist }))
-    const observedExchanges: Array<NonNullable<DetectQuarantinedOriginsInput['observedExchanges']>[number]> = []
-    try {
-      const rows = this.storage.client.prepare(`
-        SELECT origin, path_and_query AS pathAndQuery, status, persona_handle AS personaHandle
-        FROM broker_exchanges
-        WHERE run_id = ?
-        ORDER BY created_at DESC
-        LIMIT 240
-      `).all(run.id) as Array<{ origin: string; pathAndQuery: string; status: number; personaHandle: string | null }>
-      for (const row of rows) {
-        if (approvedOrigins.size === 0 || approvedOrigins.has(row.origin)) {
-          observedExchanges.push(row)
+    const approvedList = [...approvedOrigins]
+    const evidence = this.queryPerOriginQuarantineEvidence(run.id, approvedList)
+    const extraWithSource: QuarantineObservedExchange[] = (input.extraExchanges ?? []).map(ex => ({
+      ...ex,
+      probeSource: ex.probeSource ?? 'phase0',
+    }))
+    for (const ex of extraWithSource) {
+      const origin = (ex.origin ?? '').trim()
+      if (!origin) continue
+      if (isLiveNon401HttpStatus(ex.status)) {
+        evidence.everLiveOrigins.add(origin)
+        evidence.everReachableOrigins.add(origin)
+      }
+    }
+
+    // Release any previously quarantined origin that has now recorded a live response or persona.
+    const stored = this.quarantinedOriginsByRun.get(run.id)
+    let anyReleased = false
+    if (stored) {
+      for (const [origin, rec] of [...stored.entries()]) {
+        const liveRecovered = evidence.everLiveOrigins.has(origin)
+        const personaRecovered =
+          rec.reason === 'edge_protected' && hasAuthenticatedPersonaForOrigin(origin, personas)
+        if (liveRecovered || personaRecovered) {
+          stored.delete(origin)
+          anyReleased = true
+          try {
+            this.storage.event(
+              run.id,
+              'planner.origin_unquarantined',
+              `Released origin ${origin} from ${rec.reason} quarantine (${liveRecovered ? 'live HTTP response observed' : 'authenticated persona available'}).`,
+              { origin, previousReason: rec.reason, trigger: liveRecovered ? 'live_response' : 'persona_available' },
+            )
+          } catch { /* telemetry is best-effort */ }
         }
       }
-    } catch { /* best-effort DB read */ }
-    const combinedExchanges = [
-      ...observedExchanges,
-      ...(input.extraExchanges ?? []),
+    }
+
+    const combinedExchanges: QuarantineObservedExchange[] = [
+      ...evidence.perOriginProbes,
+      ...extraWithSource,
     ]
     const detected = detectQuarantinedOrigins({
-      approvedOrigins: [...approvedOrigins],
+      approvedOrigins: approvedList,
       edgeProtectedOrigins: input.edgeProtectedOrigins,
       skippedDeadHosts: input.skippedDeadHosts,
       observedExchanges: combinedExchanges,
       personas,
+      everLiveOrigins: evidence.everLiveOrigins,
+      everReachableOrigins: evidence.everReachableOrigins,
     })
     if (detected.records.length > 0) {
       this.quarantineOrigins(run, detected.records, input.assignmentId)
+    } else if (anyReleased && stored) {
+      this.reconcileOriginUnavailableStepsForRun(run, stored, approvedOrigins)
     }
     return detected
   }
 
   /**
-   * Return currently quarantined origins for `run`. Re-checks active authenticated personas so an
-   * `edge_protected` host is automatically released if an authenticated persona for that origin
-   * becomes available (`unreachable` hosts remain quarantined).
+   * Return currently quarantined origin records for `run`. Automatically releases BOTH
+   * `edge_protected` (when an authenticated persona OR live non-401 response arrives) AND
+   * `unreachable` (when a live non-401 response arrives, or a reachable response with an
+   * authenticated persona arrives), and samples unexamined origins strictly per origin (`R4-H-11`).
    */
-  getQuarantinedOriginSet(run: Run, approvedOrigins?: ReadonlySet<string>): Set<string> {
+  getQuarantinedOriginRecords(
+    run: Run,
+    approvedOrigins?: ReadonlySet<string>,
+  ): Map<string, QuarantinedOriginRecord> {
     const scope = approvedOrigins ?? this.host.approvedOriginsSet(run)
     const personas = [...resolveRunPersonas(this.storage, run.projectId, run.approvedPersonaIds).values()]
       .map(p => ({ handle: p.handle, originAllowlist: p.originAllowlist }))
     const stored = this.quarantinedOriginsByRun.get(run.id)
-    const out = new Set<string>()
+    const unexamined = [...scope].filter(origin => !stored?.has(origin))
+    const evidence = this.queryPerOriginQuarantineEvidence(run.id, unexamined)
+
+    const out = new Map<string, QuarantinedOriginRecord>()
+    let anyReleased = false
     if (stored) {
-      for (const [origin, rec] of stored.entries()) {
+      for (const [origin, rec] of [...stored.entries()]) {
         if (scope.size > 0 && !scope.has(origin)) continue
-        if (rec.reason === 'edge_protected' && hasAuthenticatedPersonaForOrigin(origin, personas)) {
+        const hasLive = evidence.everLiveOrigins.has(origin)
+        const hasPersona = hasAuthenticatedPersonaForOrigin(origin, personas)
+        const shouldRelease =
+          hasLive
+          || (rec.reason === 'edge_protected' && hasPersona)
+          || (rec.reason === 'unreachable' && evidence.everReachableOrigins.has(origin) && hasPersona)
+        if (shouldRelease) {
+          stored.delete(origin)
+          anyReleased = true
+          try {
+            this.storage.event(
+              run.id,
+              'planner.origin_unquarantined',
+              `Released origin ${origin} from ${rec.reason} quarantine (${hasLive ? 'live HTTP response observed' : 'authenticated persona available'}).`,
+              { origin, previousReason: rec.reason, trigger: hasLive ? 'live_response' : 'persona_available' },
+            )
+          } catch { /* telemetry is best-effort */ }
           continue
         }
-        out.add(origin)
+        out.set(origin, rec)
       }
     }
-    // Also detect any newly observed uniform 401-wall / 525-only origins from broker_exchanges
+
+    // Detect any newly observed per-origin dead/401-wall hosts from host-originated probes
     // (covers resumed runs or direct planner invocations without a preceding runThreatModel call).
-    const unexamined = [...scope].filter(origin => !stored?.has(origin))
-    if (unexamined.length > 0) {
-      try {
-        const rows = this.storage.client.prepare(`
-          SELECT origin, path_and_query AS pathAndQuery, status, persona_handle AS personaHandle
-          FROM broker_exchanges
-          WHERE run_id = ?
-          ORDER BY created_at DESC
-          LIMIT 240
-        `).all(run.id) as Array<{ origin: string; pathAndQuery: string; status: number; personaHandle: string | null }>
-        if (rows.length > 0) {
-          const detected = detectQuarantinedOrigins({
-            approvedOrigins: unexamined,
-            observedExchanges: rows,
-            personas,
-          })
-          if (detected.records.length > 0) {
-            this.quarantineOrigins(run, detected.records)
-            for (const rec of detected.records) out.add(rec.origin)
-          }
+    const sampleableUnexamined = unexamined.filter(origin => !evidence.everLiveOrigins.has(origin))
+    if (sampleableUnexamined.length > 0 && evidence.perOriginProbes.length > 0) {
+      const detected = detectQuarantinedOrigins({
+        approvedOrigins: sampleableUnexamined,
+        observedExchanges: evidence.perOriginProbes,
+        personas,
+        everLiveOrigins: evidence.everLiveOrigins,
+        everReachableOrigins: evidence.everReachableOrigins,
+      })
+      if (detected.records.length > 0) {
+        this.quarantineOrigins(run, detected.records)
+        const updatedMap = this.quarantinedOriginsByRun.get(run.id)
+        for (const rec of detected.records) {
+          out.set(rec.origin, updatedMap?.get(rec.origin) ?? rec)
         }
-      } catch { /* best-effort */ }
+      }
+    }
+
+    if (anyReleased) {
+      this.reconcileOriginUnavailableStepsForRun(run, out, scope)
     }
     return out
+  }
+
+  /**
+   * Return currently quarantined origin set for `run`. Delegates to
+   * {@link getQuarantinedOriginRecords} so live-response release and per-origin detection stay in
+   * one authoritative path.
+   */
+  getQuarantinedOriginSet(run: Run, approvedOrigins?: ReadonlySet<string>): Set<string> {
+    return new Set(this.getQuarantinedOriginRecords(run, approvedOrigins).keys())
+  }
+
+  /** Union of currently quarantined origins and circuit-open origins for `run` (`R4-H-12`). */
+  unavailableOriginsForRun(run: Run, approvedOrigins?: ReadonlySet<string>): Set<string> {
+    const scope = approvedOrigins ?? this.host.approvedOriginsSet(run)
+    const unavailable = this.getQuarantinedOriginSet(run, scope)
+    for (const origin of scope) {
+      if (this.broker.isCircuitOpen(origin)) unavailable.add(origin)
+    }
+    return unavailable
   }
 
   /** Approved origins minus any currently quarantined (`edge_protected` / `unreachable`) hosts. */
@@ -2601,6 +2771,36 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       )
     }
 
+    const runtimeInput: Omit<RuntimeDiscoveryInput, 'mode'> =
+      options.runtime ?? this.collectRuntimeDiscoveryInput(run, approvedOrigins, specs)
+    const { repoOriginMappings, resolvedServiceOrigins } = this.resolveInvariantOriginMappings(run, {
+      approvedOrigins,
+      mountedRepos,
+      repoDescriptors,
+      graph,
+      serviceOrigins: options.serviceOrigins,
+      compose,
+      ingress,
+    })
+
+    // R4-H-16: White-box post-ProgramGraph invariant synthesis runs off the host event loop inside
+    // `UntrustedComputePool` with a hard wall-clock timeout so hostile repo bytes never stall host.
+    let precomputedSynthesis: SynthesizeInvariantsResult | undefined
+    if (mode === 'white-box' && graph) {
+      precomputedSynthesis = await synthesizeInvariantsInWorker({
+        mode: 'white-box',
+        graph,
+        sourceFiles,
+        services: options.services,
+        serviceOrigins: resolvedServiceOrigins.length ? resolvedServiceOrigins : options.serviceOrigins,
+        compose,
+        ingress,
+        runtime: runtimeInput,
+        totalRunBudgetUsd: run.budgetUsd,
+        maxHypotheses: options.maxHypotheses ?? 64,
+      }, { signal: options.signal })
+    }
+
     return this.finalizeCapabilityLedgerInvariants(run, {
       ...options,
       approvedOrigins,
@@ -2612,33 +2812,28 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       sourceFiles,
       compose,
       ingress,
+      runtime: runtimeInput,
+      precomputedSynthesis,
+      precomputedRepoOriginMappings: repoOriginMappings,
     })
   }
 
-  /**
-   * Pure in-memory / SQLite finalization for `seedCapabilityLedgerInvariants` (zero filesystem
-   * I/O, zero synchronous `ProgramGraph` extraction). Shared by async white-box seeding and the
-   * synchronous grey-box/black-box fast path in `ensureWave1InvariantChainSteps`.
-   */
-  private finalizeCapabilityLedgerInvariants(
+  private resolveInvariantOriginMappings(
     run: Run,
-    input: SeedCapabilityLedgerInvariantsOptions & {
+    input: {
       approvedOrigins: ReadonlySet<string>
+      mountedRepos?: readonly string[]
       repoDescriptors?: readonly RepoAffinityDescriptor[]
-      specs: ReturnType<Store['listProjectSpecsFull']>
-      mode: SynthesizerMode
       graph?: ProgramGraph
-      sourceFiles: readonly SourceFileInput[]
+      serviceOrigins?: readonly ServiceOriginMapping[]
+      compose?: SeedCapabilityLedgerInvariantsOptions['compose']
+      ingress?: SeedCapabilityLedgerInvariantsOptions['ingress']
     },
-  ): SeedCapabilityLedgerInvariantsResult {
-    const { approvedOrigins, specs, mode, graph, sourceFiles } = input
-    // Never silently default unmapped multi-origin seeds to approvedList[0].
-    const defaultOrigin = approvedOrigins.size === 1 ? ([...approvedOrigins][0] ?? 'unknown') : 'unmapped'
-
-    // Build grey-box / black-box runtime parity input from persisted endpoints, specs, and exchanges.
-    const runtimeInput: Omit<RuntimeDiscoveryInput, 'mode'> = input.runtime ?? this.collectRuntimeDiscoveryInput(run, approvedOrigins, specs)
-
-    // Deterministic Repo→Origin affinity resolution across mounted repos + live discovered endpoints.
+  ): {
+    repoOriginMappings: RepoOriginAffinityMapping[]
+    resolvedServiceOrigins: ServiceOriginMapping[]
+  } {
+    const { approvedOrigins, graph } = input
     const mountedRepos = input.mountedRepos ?? this.host.projectReposMount(run.projectId).mountedRepos
     const storedLiveEndpoints = this.storage.listEndpoints(run.id, { limit: 250 })
       .filter(ep => approvedOrigins.has(ep.origin))
@@ -2701,21 +2896,49 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     if (resolvedServiceOrigins.length > 0) {
       this.repoOriginMappingsByRun.set(run.id, resolvedServiceOrigins)
     }
+    return { repoOriginMappings, resolvedServiceOrigins }
+  }
 
-    let synthesis: SynthesizeInvariantsResult
-    if (mode === 'white-box' && graph) {
-      synthesis = synthesizeInvariants({
-        mode: 'white-box',
+  /**
+   * Pure in-memory / SQLite finalization for `seedCapabilityLedgerInvariants` (zero filesystem
+   * I/O, zero synchronous `ProgramGraph` extraction or white-box `synthesizeInvariants`). Shared
+   * by async white-box worker seeding and the synchronous grey-box/black-box fast path in
+   * `ensureWave1InvariantChainSteps`.
+   */
+  private finalizeCapabilityLedgerInvariants(
+    run: Run,
+    input: SeedCapabilityLedgerInvariantsOptions & {
+      approvedOrigins: ReadonlySet<string>
+      repoDescriptors?: readonly RepoAffinityDescriptor[]
+      specs: ReturnType<Store['listProjectSpecsFull']>
+      mode: SynthesizerMode
+      graph?: ProgramGraph
+      sourceFiles: readonly SourceFileInput[]
+      precomputedSynthesis?: SynthesizeInvariantsResult
+      precomputedRepoOriginMappings?: readonly RepoOriginAffinityMapping[]
+    },
+  ): SeedCapabilityLedgerInvariantsResult {
+    const { approvedOrigins, specs, mode, graph } = input
+    // Never silently default unmapped multi-origin seeds to approvedList[0].
+    const defaultOrigin = approvedOrigins.size === 1 ? ([...approvedOrigins][0] ?? 'unknown') : 'unmapped'
+
+    // Build grey-box / black-box runtime parity input from persisted endpoints, specs, and exchanges.
+    const runtimeInput: Omit<RuntimeDiscoveryInput, 'mode'> = input.runtime ?? this.collectRuntimeDiscoveryInput(run, approvedOrigins, specs)
+    const mountedRepos = input.mountedRepos ?? this.host.projectReposMount(run.projectId).mountedRepos
+    const repoOriginMappings = input.precomputedRepoOriginMappings
+      ?? this.resolveInvariantOriginMappings(run, {
+        approvedOrigins,
+        mountedRepos,
+        repoDescriptors: input.repoDescriptors,
         graph,
-        sourceFiles,
-        services: input.services,
-        serviceOrigins: resolvedServiceOrigins.length ? resolvedServiceOrigins : input.serviceOrigins,
+        serviceOrigins: input.serviceOrigins,
         compose: input.compose,
         ingress: input.ingress,
-        runtime: runtimeInput,
-        totalRunBudgetUsd: run.budgetUsd,
-        maxHypotheses: input.maxHypotheses ?? 64,
-      })
+      }).repoOriginMappings
+
+    let synthesis: SynthesizeInvariantsResult
+    if (input.precomputedSynthesis) {
+      synthesis = input.precomputedSynthesis
     } else {
       const parity = inferRuntimeInvariantHypotheses({
         mode: mode === 'black-box' ? 'black-box' : 'grey-box',
@@ -4797,12 +5020,25 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     uninvestigatedFirstPassClasses: string[]
     tierAEndpoints: string[]
   } {
-    const tierAEndpoints = [...new Set(this.tierALeadFacts(run).map(fact => {
-      const method = typeof fact.data?.method === 'string' ? fact.data.method.toUpperCase() : 'GET'
-      const endpoint = typeof fact.data?.endpoint === 'string' ? fact.data.endpoint : ''
-      return `${method} ${endpoint}`
-    }).filter(endpoint => endpoint.length > 0))].sort()
+    let unavailableOrigins = new Set<string>()
+    try {
+      const fullRun = this.storage.run(run.id)
+      unavailableOrigins = this.unavailableOriginsForRun(fullRun)
+    } catch { /* fallback to empty unavailable set if run already removed */ }
+    const tierAEndpoints = [...new Set(
+      this.tierALeadFacts(run)
+        .filter(fact => !fact.origin || !unavailableOrigins.has(fact.origin))
+        .map(fact => {
+          const method = typeof fact.data?.method === 'string' ? fact.data.method.toUpperCase() : 'GET'
+          const endpoint = typeof fact.data?.endpoint === 'string' ? fact.data.endpoint : ''
+          return `${method} ${endpoint}`
+        })
+        .filter(endpoint => endpoint.length > 0),
+    )].sort()
     const coveredAssignments = this.provedOrGapCodedAssignmentIds(run.id)
+    const dispatchableIds = new Set(
+      dispatchableReadySteps(steps, undefined, unavailableOrigins).map(step => step.id),
+    )
     const coverage = passOneCoverage({
       tierAEndpoints,
       steps: steps.map(step => {
@@ -4814,7 +5050,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
           && coveredAssignments.has(step.assignedWorkerId)
         return {
           id: step.id,
-          dispatchable: step.status === 'ready' || step.status === 'pending',
+          dispatchable: dispatchableIds.has(step.id),
           dispatched: step.assignedWorkerId !== null || step.status === 'complete' || step.status === 'running',
           covered: isCovered,
           structuredTargets,
@@ -5760,7 +5996,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         sourceOrigins: effectiveOrigins,
         specialistProfile: routeStepToSpecialist({ title, hypothesis: step.hypothesis, category, skills: step.skills }),
       })
-      if (depStepIds.length > 0 && createdStep.status === 'pending') {
+      if (depStepIds.length > 0 && (createdStep.status === 'pending' || createdStep.status === 'blocked')) {
         const existingById = new Map(existing.map(s => [s.id, s]))
         const allParentsContinuable = depStepIds.every(sid => {
           const parent = existingById.get(sid)
@@ -6296,6 +6532,16 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         targetAssetIds: assetIds, skills: step.skills, dependsOnFactIds: parentFactIds,
         dependsOnStepIds: parentStepIds, sourceOrigins: validOrigins, specialistProfile,
       })
+      if (parentStepIds.length > 0 && (created.status === 'pending' || created.status === 'blocked')) {
+        const existingStepById = new Map(existingSteps.map(s => [s.id, s]))
+        const allParentsContinuable = parentStepIds.every(sid => {
+          const parent = existingStepById.get(sid)
+          return Boolean(parent && isContinuableStepStatus(parent.status))
+        })
+        if (allParentsContinuable) {
+          this.storage.updateChainStep(created.id, { status: 'ready' })
+        }
+      }
       const plannedTargets: StructuredStepTarget[] = (guardRoutes.length ? guardRoutes : ['/'])
         .flatMap(route => validOrigins.map(origin => ({
           origin,
@@ -6654,7 +6900,8 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     // Move O3: Gate redundant 10-turn LLM planner storms when the dispatch queue is already
     // saturated and no high-signal milestone occurred (cheap deterministic synthesis above already ran).
     const stepsPreLlm = getChainSteps()
-    const readyPreLlm = dispatchableReadySteps(stepsPreLlm, factIds).length
+    const unavailablePreLlm = this.unavailableOriginsForRun(updated, approvedOrigins)
+    const readyPreLlm = dispatchableReadySteps(stepsPreLlm, factIds, unavailablePreLlm).length
     const activePreLlm = [...this.host.active.values()].filter(job =>
       job.assignment.runId === run.id && job.assignment.phase === 'investigation').length
     const prevFrontier = this.plannerEvidenceFrontier.get(run.id)
@@ -6966,19 +7213,21 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       this.storage.listFacts(run.id, { includeTainted: true, limit, offset })).map(fact => fact.id))
     const refreshQueueState = () => {
       const steps = this.storage.listChainSteps(run.id, latest.goalRevision)
+      const unavailableOrigins = this.unavailableOriginsForRun(latest)
       return {
         steps,
-        remainingReady: dispatchableReadySteps(steps, finalFactIds).length,
+        unavailableOrigins,
+        remainingReady: dispatchableReadySteps(steps, finalFactIds, unavailableOrigins).length,
         coverage: this.passOneCoverageFor(run, steps),
       }
     }
-    let { steps: finalSteps, remainingReady, coverage } = refreshQueueState()
+    let { steps: finalSteps, unavailableOrigins: stopUnavailableOrigins, remainingReady, coverage } = refreshQueueState()
     let tierASeededAtStop = 0
     if (decision.decision === 'stop' && (coverage.uninvestigatedFirstPassClasses.length || coverage.uncoveredTierAEndpoints.length)) {
       tierASeededAtStop = this.queueTierALeadSteps(
         this.storage.run(run.id), this.host.approvedOriginsSet(run), computeDynamicStepBudget(this.storage, run.id),
       )
-      if (tierASeededAtStop > 0) ({ steps: finalSteps, remainingReady, coverage } = refreshQueueState())
+      if (tierASeededAtStop > 0) ({ steps: finalSteps, unavailableOrigins: stopUnavailableOrigins, remainingReady, coverage } = refreshQueueState())
     }
     const stopBudgetExhausted = this.storage.checkBudgetExceeded(run.id)
     const stopRequestExhausted = latest.budgetRequests > 0 && latest.budgetRequests - latest.spentRequests <= 0
@@ -6992,7 +7241,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         highRiskSeededAtStop = seededHighRisk.seeded
         funnel.planned += seededHighRisk.seeded
         funnel.enqueued += seededHighRisk.seeded
-        ;({ steps: finalSteps, remainingReady, coverage } = refreshQueueState())
+        ;({ steps: finalSteps, unavailableOrigins: stopUnavailableOrigins, remainingReady, coverage } = refreshQueueState())
         try {
           this.storage.event(
             run.id, 'planner.high_risk_coverage_assert',
@@ -7047,7 +7296,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     funnel.remainingReady = remainingReady
     funnel.remainingReadyAtStop = stopEval.decision === 'stop' ? remainingReady : 0
     funnel.stopReason = stopEval.decision === 'stop' ? stopEval.stopReason : 'running'
-    funnel.filteredDep = permanentlyBlockedStepIds(finalSteps, finalFactIds).length
+    funnel.filteredDep = permanentlyBlockedStepIds(finalSteps, finalFactIds, stopUnavailableOrigins).length
     const filteredByReason = {
       alreadyConfirmed: funnel.filteredAlreadyConfirmed,
       cap: funnel.filteredCap,

@@ -207,6 +207,9 @@ import {
   emptyDispatchFunnel,
   permanentlyBlockedStepIds,
   dispatchableReadySteps,
+  hasActiveInvestigationSteps,
+  isStepOriginUnavailable,
+  reconcileUnavailableOriginSteps,
   planMultiTrialExpansion,
   evaluateDispatchStop,
   circuitBreakAction,
@@ -377,6 +380,7 @@ export class Execution {
   private readonly reinvestigationGuards = this.runState.mapView('reinvestigationGuard')
   private readonly recordedPersonaResources = this.runState.mapView('recordedPersonaResources')
   private readonly circuitNotified = this.runState.prefixedSetView('circuitNotified', ':')
+  private readonly strandedBackstopReported = this.runState.prefixedSetView('strandedBackstopReported', ':')
   private readonly runAuthStarted = this.runState.mapView('runAuthStarted')
   private readonly runAuthInFlight = this.runState.mapView('runAuthInFlight')
   private readonly startedLabRuns = this.runState.setView('startedLabRun')
@@ -2258,7 +2262,7 @@ export class Execution {
     }
 
     const { grant, secrets, currentSecrets } = this.buildGrant(job, run, approvedOrigins)
-    const session = await this.backend.openSession(claimed.id, controller.signal, { reposDir })
+    const session = await this.backend.openSession(claimed.id, controller.signal, { reposDir, runId: run.id })
     const startedAt = Date.now()
     let codeAuditSettlementPrompted = false
     let semanticSuspects: SemanticAuditSuspect[] = []
@@ -2458,6 +2462,8 @@ export class Execution {
     if (conc <= 1) return
 
     const steps = this.storage.listChainSteps(run.id, run.goalRevision)
+    const unavailableOrigins = this.reconPlanner.unavailableOriginsForRun(run)
+    const dispatchableStepIds = new Set(dispatchableReadySteps(steps, undefined, unavailableOrigins).map(s => s.id))
     const highSignalFacts = new Set(
       this.reconPlanner.pageAll((offset, limit) =>
         this.storage.listFacts(run.id, { includeTainted: false, limit, offset }))
@@ -2473,8 +2479,8 @@ export class Execution {
     // fill idle capacity; they must never displace a planned hypothesis (the v7 funnel defect).
     const expansions = planMultiTrialExpansion({
       // Tier-A leads are distinct hypotheses with their own Round-1 slot; duplicate trials would
-      // displace other first-pass work.
-      steps: steps.filter(step => !this.tierAStepIds.has(step.id)),
+      // displace other first-pass work. Only expand genuinely dispatchable steps (`R4-H-12`/`R4-H-13`).
+      steps: steps.filter(step => !this.tierAStepIds.has(step.id) && dispatchableStepIds.has(step.id)),
       concurrency: conc,
       multiTrialEnabled: true,
       highSignalFactIds: highSignalFacts,
@@ -2485,7 +2491,7 @@ export class Execution {
       const trialGroupId = randomUUID()
       this.storage.updateChainStep(step.id, { trialGroupId, trialIndex: 0 })
       for (let idx = 1; idx < fanout; idx += 1) {
-        this.storage.addChainStep(run, {
+        const sibling = this.storage.addChainStep(run, {
           title: `${step.title.slice(0, 180)} [trial ${idx + 1}]`,
           hypothesis: step.hypothesis,
           category: step.category,
@@ -2499,6 +2505,12 @@ export class Execution {
           trialGroupId,
           trialIndex: idx,
         })
+        // R4-H-13: If the primary step is already `ready` (e.g. a retry or continuation step
+        // whose lineage `dependsOnStepIds` points at a `turn_capped`/`rotated_partial` parent),
+        // preserve `ready` on its trial sibling so the sibling is never stranded `pending`/`blocked`.
+        if (step.status === 'ready' && sibling.status !== 'ready') {
+          this.storage.updateChainStep(sibling.id, { status: 'ready' })
+        }
       }
       expanded += fanout - 1
     }
@@ -2877,8 +2889,10 @@ export class Execution {
    */
   private highPriorityQueueEmpty(run: Pick<Run, 'id' | 'goalRevision'>): boolean {
     try {
-      return !this.storage.listChainSteps(run.id, run.goalRevision).some(step =>
-        (step.status === 'ready' || step.status === 'pending') &&
+      const fullRun = this.storage.run(run.id)
+      const unavailableOrigins = this.reconPlanner.unavailableOriginsForRun(fullRun)
+      const steps = this.storage.listChainSteps(run.id, run.goalRevision)
+      return !dispatchableReadySteps(steps, undefined, unavailableOrigins).some(step =>
         (isDetLeadDispatchStep(step) ||
           step.skills.some(skill => skill.startsWith('chain:') || skill === 'chain-primitives') ||
           step.priority >= 88))
@@ -2933,17 +2947,19 @@ export class Execution {
   private recordDispatchFunnelSummary(runId: string): void {
     const funnel = this.dispatchFunnels.get(runId)
     if (!funnel) return
-    let status = ''
-    try { status = this.storage.run(runId).status } catch { return }
+    let currentRun: Run
+    try { currentRun = this.storage.run(runId) } catch { return }
+    const status = currentRun.status
     const stopReason: DispatchStopReason = status === 'paused'
       ? 'run_paused'
       : status === 'stopped' ? 'run_stopped' : funnel.stopReason
     const latestSteps = this.storage.listChainSteps(runId)
     const knownFacts = new Set(this.reconPlanner.pageAll((offset, limit) =>
       this.storage.listFacts(runId, { includeTainted: true, limit, offset })).map(fact => fact.id))
-    const remainingReady = dispatchableReadySteps(latestSteps, knownFacts).length
+    const unavailableOrigins = this.reconPlanner.unavailableOriginsForRun(currentRun)
+    const remainingReady = dispatchableReadySteps(latestSteps, knownFacts, unavailableOrigins).length
     const dispatched = latestSteps.filter(step => step.assignedWorkerId !== null).length
-    const blocked = permanentlyBlockedStepIds(latestSteps, knownFacts).length
+    const blocked = permanentlyBlockedStepIds(latestSteps, knownFacts, unavailableOrigins).length
     const evaluation = evaluateDispatchStop({
       decision: STRANDED_READY_STOP_REASONS.includes(stopReason) ? 'stop' : 'continue',
       reason: stopReason,
@@ -3131,23 +3147,31 @@ export class Execution {
       )
     } catch { /* invariant chain promotion is additive */ }
 
+    // R4-H-12: Route BOTH origin quarantine and circuit-open through ONE terminal-transition
+    // primitive so quarantined/circuit-open steps transition to `blocked` (and restore cleanly
+    // on unquarantine) + propagate `refreshReadyChainSteps` instead of stranding in `ready`.
+    const approvedOriginsForDispatch = this.approvedOriginsSet(run)
+    const quarantinedOriginRecords = this.reconPlanner.getQuarantinedOriginRecords(run, approvedOriginsForDispatch)
+    const circuitOpenOrigins = new Set(
+      [...approvedOriginsForDispatch].filter(origin => this.broker.isCircuitOpen(origin)),
+    )
+    const unavailableOrigins = new Set<string>([
+      ...quarantinedOriginRecords.keys(),
+      ...circuitOpenOrigins,
+    ])
+    reconcileUnavailableOriginSteps({
+      storage: this.storage,
+      run,
+      quarantinedOrigins: quarantinedOriginRecords,
+      circuitOpenOrigins,
+      activeAssignmentIds: new Set(this.active.keys()),
+    })
+
     const steps = this.storage.listChainSteps(run.id, run.goalRevision)
-    let anyCircuitBlocked = false
     const readySteps = steps
       .filter(s => s.status === 'ready')
       .filter(s => !(s.assignedWorkerId && this.active.has(s.assignedWorkerId)))
-      .filter(s => {
-        if (s.sourceOrigins.length > 0 && s.sourceOrigins.every(o => this.broker.isCircuitOpen(o))) {
-          this.storage.updateChainStep(s.id, { status: 'blocked' })
-          anyCircuitBlocked = true
-          return false
-        }
-        return true
-      })
-    // M-12: Propagate blocked status to pending dependents immediately so circuit-open steps never wedge driveInvestigation.
-    if (anyCircuitBlocked) {
-      this.storage.refreshReadyChainSteps(run.id, run.goalRevision)
-    }
+      .filter(s => !isStepOriginUnavailable(s, unavailableOrigins))
 
     const configuredConc = Math.max(1, Math.min(maxWorkerConcurrency, run.workerConcurrency || defaultWorkerConcurrency))
     const readyPrimarySteps = readySteps.filter(step => !(typeof step.trialIndex === 'number' && step.trialIndex > 0)).length
@@ -3265,13 +3289,58 @@ export class Execution {
       } catch { /* telemetry is best-effort */ }
     }
 
-    // If nothing is running/ready/pending, check diminishing returns or trigger final planner review.
+    // If nothing is running/ready/pending (via the single quarantine- and terminal-status-aware
+    // predicate), or if the run-level backstop fires (0 dispatchable-ready, 0 running, 0 active
+    // workers, 0 parked workers), check diminishing returns or trigger final planner review.
     // v6: a dry streak is observed, never a global kill switch. Termination is budget/requests/wall
     // exhaustion, per-assignment caps, drained OOB, or explicit coordinator completion.
     const updatedSteps = this.storage.listChainSteps(run.id, run.goalRevision)
-    const anyActive = updatedSteps.some(s => ['pending', 'ready', 'running'].includes(s.status))
+    const pendingNeedsFacts = updatedSteps.some(s => s.status === 'pending' && s.dependsOnFactIds.length > 0)
+    const knownFactIds = pendingNeedsFacts
+      ? new Set(this.reconPlanner.pageAll((offset, limit) =>
+          this.storage.listFacts(run.id, { includeTainted: true, limit, offset })).map(f => f.id))
+      : undefined
+    const dispatchableSteps = dispatchableReadySteps(updatedSteps, knownFactIds, unavailableOrigins)
+    const dispatchableReadyCount = dispatchableSteps.filter(s => s.status === 'ready').length
+    const runningStepsCount = updatedSteps.filter(s => s.status === 'running').length
+    const activeWorkersForRun = [...this.active.values()].filter(
+      j => j.assignment.runId === run.id && j.assignment.phase === 'investigation',
+    ).length
+    const parkedWorkersForRun = this.storage.parkedWorkerCount(run.id)
+    const anyActive = hasActiveInvestigationSteps(updatedSteps, knownFactIds, unavailableOrigins)
+    // R4-H-13 run-level stranded-step backstop: when no step is dispatchable-ready or running and
+    // no worker is active or parked, advance on a stop decision instead of wedging, emitting
+    // structured telemetry for any stranded steps.
+    const runLevelBackstop =
+      dispatchableReadyCount === 0
+      && runningStepsCount === 0
+      && activeWorkersForRun === 0
+      && parkedWorkersForRun === 0
+    if (runLevelBackstop) {
+      const strandedSteps = updatedSteps.filter(s => s.status === 'pending' || s.status === 'ready')
+      if (strandedSteps.length > 0) {
+        const strandedKey = `${run.id}:${run.goalRevision}:${run.roundNo}:${strandedSteps.map(s => s.id).sort().join(',')}`
+        if (!this.strandedBackstopReported.has(strandedKey)) {
+          this.strandedBackstopReported.add(strandedKey)
+          try {
+            this.storage.event(
+              run.id,
+              'scheduler.stranded_steps_backstop',
+              `Run-level backstop triggered with ${strandedSteps.length} stranded non-running step(s) (0 dispatchable-ready, 0 running, 0 active workers).`,
+              {
+                roundNo: run.roundNo,
+                strandedCount: strandedSteps.length,
+                strandedStepIds: strandedSteps.map(s => s.id),
+                strandedStatuses: strandedSteps.map(s => ({ id: s.id, status: s.status })),
+                unavailableOrigins: [...unavailableOrigins],
+              },
+            )
+          } catch { /* telemetry is best-effort */ }
+        }
+      }
+    }
     const plannerErr = this.getPlannerErrorState(run.id, run.goalRevision)
-    if (!anyActive && !this.plannerTasks.has(run.id) && !this.plannerTimers.has(run.id)) {
+    if ((!anyActive || runLevelBackstop) && !this.plannerTasks.has(run.id) && !this.plannerTimers.has(run.id)) {
       if (plannerErr?.breakerTripped) {
         this.advanceToVerification(run)
         return
@@ -3676,8 +3745,11 @@ export class Execution {
           const maxConc = ctrl
             ? ctrl.getEffectiveConcurrency({ remainingBudgetUsd: remainingUsd })
             : Math.max(1, Math.min(maxWorkerConcurrency, latestRun.workerConcurrency || defaultWorkerConcurrency))
-          const readySteps = this.storage.listChainSteps(run.id, latestRun.goalRevision)
-            .filter(s => s.status === 'ready').length
+          const readySteps = dispatchableReadySteps(
+            this.storage.listChainSteps(run.id, latestRun.goalRevision),
+            undefined,
+            this.reconPlanner.unavailableOriginsForRun(latestRun),
+          ).filter(s => s.status === 'ready').length
           const newFact = this.storage.listFacts(run.id, { includeTainted: false, limit: 500 }).length > baselineFacts
           const newFinding = this.storage.db.select().from(findings).where(eq(findings.runId, run.id)).all().length > baselineFindings
           shouldPlan = readySteps < maxConc || newFact || newFinding
