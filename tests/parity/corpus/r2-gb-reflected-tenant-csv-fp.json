@@ -1,0 +1,91 @@
+{
+  "id": "r2-gb-reflected-tenant-csv-fp",
+  "side": "fp",
+  "archetype": "r2-gb-reflected-tenant-csv",
+  "description": "Move-1 GB FP (PG-D3 class): reflected URL path tenant slug echoed in text/csv claiming cross_tenant_read MUST fail closed without positive non-reflected foreign tenant data.",
+  "canonicalLabel": {
+    "cwe": "CWE-639",
+    "category": "bola",
+    "title": "Cross-tenant read forged via reflected path slug in text/csv response",
+    "impact": "The only tenant string in the CSV response was reflected from the attacker-supplied URL path segment on an own-tenant export job.",
+    "claimedImpact": "authorization",
+    "claimedBoundary": "access",
+    "vulnClass": "cross_tenant_read"
+  },
+  "freeTextLabel": {
+    "title": "Cross-tenant CSV export read with reflected tenant path segment"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": false,
+    "evaluateClaims": true,
+    "composite": true,
+    "floorInjectionRecipe": false
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [
+    {
+      "handle": "member_a",
+      "roleLabel": "member (acme)",
+      "role": "member",
+      "tenant": "acme",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-r2gb-member-a"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "hop1_ex",
+      "arm": "probe",
+      "role": "setup",
+      "method": "GET",
+      "pathAndQuery": "/api/v1/exports/job_exp_36/url",
+      "persona": "member_a",
+      "emittedCapabilities": ["cap:hop_1:export_sig_tok"],
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"signedUrl\":\"/files/export/acme/report-acme.csv?job=job_exp_36&tenant=acme&sig=valid_sig_1\"}"
+    },
+    {
+      "id": "hop2_ctl",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/files/export/acme-labs/report-acme.csv?job=job_exp_36&tenant=acme&sig=invalid",
+      "persona": "member_a",
+      "status": 403,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"error\":\"invalid_signature\"}"
+    },
+    {
+      "id": "hop2_prb",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/files/export/acme-labs/report-acme.csv?job=job_exp_36&tenant=acme&sig=cap:hop_1:export_sig_tok",
+      "persona": "member_a",
+      "consumedCapabilities": ["cap:hop_1:export_sig_tok"],
+      "status": 200,
+      "mediaType": "text/csv",
+      "responseHeaders": { "content-type": "text/csv; charset=utf-8" },
+      "body": "field,value\ntenant,acme-labs\nbalance_cents,50000\naccount,acct_own_1\n"
+    }
+  ],
+  "composite": {
+    "chainId": "PARITY-R2-GB-REFLECTED-CSV-FP",
+    "terminalVulnClass": "cross_tenant_read",
+    "oracleFamily": "",
+    "capabilityToken": "export_sig_tok",
+    "terminalExchangeId": "hop2_prb",
+    "preChainControlIds": ["hop2_ctl"],
+    "attackerPersonas": ["member_a"],
+    "forbiddenShortcutPersonas": ["owner_a"],
+    "expectedFailedStage": "terminal_impact",
+    "claimedDelta": "Reflected path segment in text/csv export without positive non-reflected foreign tenant data must fail closed."
+  }
+}

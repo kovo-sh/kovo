@@ -1,0 +1,91 @@
+{
+  "id": "r2-gb-readonly-bfla-fp",
+  "side": "fp",
+  "archetype": "r2-gb-readonly-bfla",
+  "description": "Move-1 GB FP (PG-D1 class): read-only GET member roster/directory listing claiming privilege_escalation without state mutation + readback or v8 oracle MUST reject as terminal_impact_unproven.",
+  "canonicalLabel": {
+    "cwe": "CWE-862",
+    "category": "bfla",
+    "title": "Read-only member roster GET falsely claimed as privilege escalation",
+    "impact": "A read-only directory/member roster listing without state mutation or a verified v8 oracle cannot confirm privilege_escalation or BFLA.",
+    "claimedImpact": "bfla",
+    "claimedBoundary": "access",
+    "vulnClass": "privilege_escalation"
+  },
+  "freeTextLabel": {
+    "title": "Vertical privilege escalation claimed from read-only organization member roster"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": false,
+    "evaluateClaims": true,
+    "composite": true,
+    "floorInjectionRecipe": false
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [
+    {
+      "handle": "member_b",
+      "roleLabel": "member (org_b)",
+      "role": "member",
+      "tenant": "org_b",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-r2gb-member-b"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "hop1_ex",
+      "arm": "probe",
+      "role": "setup",
+      "method": "POST",
+      "pathAndQuery": "/api/v1/invites/resolve",
+      "persona": "member_b",
+      "emittedCapabilities": ["cap:hop_1:invite_roster_tok"],
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"token\":\"resolved-invite-tok-1\",\"org\":\"org_a\"}"
+    },
+    {
+      "id": "hop2_ctl",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/v1/orgs/org_a/members",
+      "persona": "member_b",
+      "status": 403,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"error\":\"not_a_member\"}"
+    },
+    {
+      "id": "hop2_prb",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/v1/orgs/org_a/members",
+      "persona": null,
+      "consumedCapabilities": ["cap:hop_1:invite_roster_tok"],
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"members\":[{\"id\":\"usr_1\",\"email\":\"owner@org-a.example\",\"role\":\"owner\"},{\"id\":\"usr_2\",\"email\":\"member@org-a.example\",\"role\":\"member\"}]}"
+    }
+  ],
+  "composite": {
+    "chainId": "PARITY-R2-GB-READONLY-BFLA-FP",
+    "terminalVulnClass": "privilege_escalation",
+    "oracleFamily": "",
+    "capabilityToken": "invite_roster_tok",
+    "terminalExchangeId": "hop2_prb",
+    "preChainControlIds": ["hop2_ctl"],
+    "attackerPersonas": ["member_b"],
+    "forbiddenShortcutPersonas": ["owner_a"],
+    "expectedFailedStage": "terminal_impact",
+    "claimedDelta": "Read-only GET organization member roster listing without state mutation must fail closed for privilege_escalation."
+  }
+}
