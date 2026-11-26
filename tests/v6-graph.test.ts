@@ -423,8 +423,8 @@ describe('program graph: reverse call graph and hypotheses', () => {
     assert.equal(web?.origin, 'http://localhost:3000')
     assert.equal(web?.confidence, 'port')
     const worker = mappings.find(mapping => mapping.service === 'worker')
-    assert.equal(worker?.origin, 'https://api.shop.test')
-    assert.equal(worker?.confidence, 'fallback', 'origins[0] is an explicit last resort, not the default')
+    assert.equal(worker?.origin, undefined)
+    assert.equal(worker?.confidence, 'unmapped', 'genuinely unmapped multi-origin services must not misattribute to origins[0]')
   })
 })
 
