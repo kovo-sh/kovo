@@ -64,6 +64,15 @@ function readEvents(text: string) {
     .map(line => JSON.parse(line.slice(6)))
 }
 
+function allowLocalModelForTest(t: { after: (fn: () => void) => void }): void {
+  const prev = process.env.KOVO_ALLOW_LOCAL_MODEL
+  process.env.KOVO_ALLOW_LOCAL_MODEL = '1'
+  t.after(() => {
+    if (prev === undefined) delete process.env.KOVO_ALLOW_LOCAL_MODEL
+    else process.env.KOVO_ALLOW_LOCAL_MODEL = prev
+  })
+}
+
 test('sanitizes joined Responses tool arguments with API keys and persona secrets while preserving order', async () => {
   const events = [
     { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', arguments: '{"status":"ready",' } },
@@ -174,6 +183,7 @@ function messagesTurn() {
 
 for (const protocol of ['responses', 'messages'] as const) {
   test(`keeps split ${protocol} API keys and persona secrets out of recorded turns and Pi Durable sessions`, async t => {
+    allowLocalModelForTest(t)
     const directory = await mkdtemp(join(tmpdir(), 'kovo-provider-redaction-'))
     const server = createServer((request, response) => {
       request.resume()
@@ -281,6 +291,7 @@ test('classifies 429 quota exhaustion as 402 hard failure vs transient RPM rate 
 })
 
 test('multi-profile LLM failover pool handles 429->402 quota circuit breaking, context filtering, and safe-window failover', async t => {
+  allowLocalModelForTest(t)
   const directory = await mkdtemp(join(tmpdir(), 'kovo-failover-pool-'))
   t.after(() => rm(directory, { recursive: true, force: true }))
   const storage = new Store(directory)

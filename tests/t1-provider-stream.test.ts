@@ -55,6 +55,15 @@ function readEvents(text: string): Array<Record<string, unknown>> {
     .map(line => JSON.parse(line.slice(6)) as Record<string, unknown>)
 }
 
+function allowLocalModelForTest(t: { after: (fn: () => void) => void }): void {
+  const prev = process.env.KOVO_ALLOW_LOCAL_MODEL
+  process.env.KOVO_ALLOW_LOCAL_MODEL = '1'
+  t.after(() => {
+    if (prev === undefined) delete process.env.KOVO_ALLOW_LOCAL_MODEL
+    else process.env.KOVO_ALLOW_LOCAL_MODEL = prev
+  })
+}
+
 // ============================================================================
 // H-25: Model tool-call arguments bypass heuristic credentialField / regex scrubbing
 // ============================================================================
@@ -237,6 +246,7 @@ test('H-25: Messages tool_use input and input_json_delta preserve tool arguments
 })
 
 test('H-25: End-to-end provider() round-trip delivers unmodified check_canary token and kovo_verify script to pi-ai', async (t) => {
+  allowLocalModelForTest(t)
   const canaryToken = 'gn_canary_e2e_deadbeef'
   const verifyScript = "const csrf_token = 'tok_123';\nconst password = 'probe_pw';\nexport default csrf_token + password;"
   const canaryJson = JSON.stringify({ token: canaryToken })
@@ -303,6 +313,7 @@ test('H-25: End-to-end provider() round-trip delivers unmodified check_canary to
 // ============================================================================
 
 test('H-26: SSE stream sending chunk 1 immediately and chunk 2 AFTER firstEventTimeoutMs completes cleanly', async (t) => {
+  allowLocalModelForTest(t)
   const server = createServer((req, res) => {
     req.resume()
     res.writeHead(200, { 'content-type': 'text/event-stream' })
@@ -384,6 +395,7 @@ test('H-26: SSE stream sending chunk 1 immediately and chunk 2 AFTER firstEventT
 })
 
 test('H-26: SSE server sending headers + ZERO bytes past firstEventTimeoutMs aborts cleanly', async (t) => {
+  allowLocalModelForTest(t)
   const server = createServer((req, res) => {
     req.resume()
     res.writeHead(200, { 'content-type': 'text/event-stream' })
@@ -423,6 +435,7 @@ test('H-26: SSE server sending headers + ZERO bytes past firstEventTimeoutMs abo
 })
 
 test('H-26: Server hanging before response headers aborts cleanly at firstEventTimeoutMs', async (t) => {
+  allowLocalModelForTest(t)
   const server = createServer((req, _res) => {
     req.resume()
     // Intentionally never write headers or close the response.
@@ -460,6 +473,7 @@ test('H-26: Server hanging before response headers aborts cleanly at firstEventT
 })
 
 test('H-26: Active stream that stalls after chunk 1 is still aborted by idleTimeoutMs, and timeout errors classify as transient failover', async (t) => {
+  allowLocalModelForTest(t)
   const server = createServer((req, res) => {
     req.resume()
     res.writeHead(200, { 'content-type': 'text/event-stream' })
