@@ -26,6 +26,7 @@ import {
   selectPreInjectionSkills,
   summarizeKovoVerifyOutcome,
   workerInvestigationPrompt,
+  type AgentSessionHandle,
   type GapValidationEvent,
   type KovoVerifyArgs,
   type KovoVerifyRuntime,
@@ -117,11 +118,72 @@ export const DERIVE_EVIDENCE_PERSIST_THRESHOLD_BYTES = 12 * 1024
 /** Bounded verify-grace bounds applied when an active proof call is running at `wallClockMs`. */
 export const DEFAULT_VERIFY_GRACE_MIN_MS = 20_000
 export const DEFAULT_VERIFY_GRACE_MAX_MS = 45_000
+/** Expanded bounded verify-grace window (+60s) when a worker already entered `kovo_verify` or holds a live sealed capability / active `hop_checkpoint`. */
+export const EXPANDED_VERIFY_GRACE_MS = 60_000
 /** Bounded settlement-stream grace cap when a worker already entered settlement and is mid-generation at `wallClockMs`. */
 export const DEFAULT_SETTLEMENT_VERIFY_GRACE_MAX_MS = 20_000
 const SHORT_WALL_CLOCK_THRESHOLD_MS = 20_000
 const SETTLEMENT_LEAD_THRESHOLD_MS = 45_000
 const PROOF_HANDOFF_GRACE_MS = 400
+
+function clampFiniteNonNegativeMs(value: number | undefined): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return 0
+  return Math.floor(value)
+}
+
+export interface EffectiveWorkerElapsedInput {
+  /** Total wall-clock elapsed time since assignment/session start (ms). */
+  wallElapsedMs: number
+  /** Time spent paused waiting on human approval or run pause (ms). */
+  approvalPausedMs?: number
+  /** Time spent waiting on provider HTTP retries, 429/5xx backoff, and stalled stream timeouts (ms). */
+  providerStallWaitMs?: number
+  /** Finite maximum stall-wait credit deductible from wall-clock elapsed time (ms). Non-finite values clamp to 0. */
+  maxStallCreditMs?: number
+}
+
+export interface EffectiveWorkerElapsedBreakdown {
+  wallElapsedMs: number
+  approvalPausedMs: number
+  providerStallWaitMs: number
+  creditedStallWaitMs: number
+  activeElapsedMs: number
+  effectiveElapsedMs: number
+}
+
+/**
+ * Pure helper computing effective worker elapsed time breakdown for wall-clock rotation decisions.
+ * Deducts both human approval/run pause time AND bounded provider-stall/retry wait time (capped
+ * by finite `maxStallCreditMs`, e.g. `baseWallClockMs`, so total active duration never exceeds
+ * the `2x` hard ceiling).
+ */
+export function computeEffectiveWorkerElapsedBreakdown(
+  input: EffectiveWorkerElapsedInput,
+): EffectiveWorkerElapsedBreakdown {
+  const wallElapsedMs = clampFiniteNonNegativeMs(input.wallElapsedMs)
+  const approvalPausedMs = clampFiniteNonNegativeMs(input.approvalPausedMs)
+  const providerStallWaitMs = clampFiniteNonNegativeMs(input.providerStallWaitMs)
+  const maxStallCreditMs = clampFiniteNonNegativeMs(input.maxStallCreditMs)
+  const activeElapsedMs = Math.max(0, wallElapsedMs - approvalPausedMs)
+  const creditedStallWaitMs = Math.min(providerStallWaitMs, maxStallCreditMs)
+  const effectiveElapsedMs = Math.max(0, activeElapsedMs - creditedStallWaitMs)
+  return {
+    wallElapsedMs,
+    approvalPausedMs,
+    providerStallWaitMs,
+    creditedStallWaitMs,
+    activeElapsedMs,
+    effectiveElapsedMs,
+  }
+}
+
+/**
+ * Pure helper computing effective worker elapsed time (ms) after deducting human approval pauses
+ * and bounded provider-stall/retry wait time (capped at `maxStallCreditMs`).
+ */
+export function computeEffectiveWorkerElapsedMs(input: EffectiveWorkerElapsedInput): number {
+  return computeEffectiveWorkerElapsedBreakdown(input).effectiveElapsedMs
+}
 
 /**
  * Decide whether a `derive_evidence` shell call warrants inserting a SQLite `artifacts` row.
@@ -146,16 +208,46 @@ export interface WorkerWallClockPlan {
   remainingBudgetMs: number
   effectiveSettlementMs: number
   verifyGraceMs: number
+  expandedVerifyGraceMs: number
   settlementStreamGraceMs: number
+  maxStallCreditMs: number
+  hardWallClockCeilingMs: number
+}
+
+export type WorkerVerifyGraceReason =
+  | 'none'
+  | 'active_proof'
+  | 'expanded_verify'
+  | 'settlement_stream'
+
+export interface WorkerVerifyGraceInput {
+  plan: WorkerWallClockPlan
+  sessionActiveElapsedMs: number
+  inFlightProofCall: boolean
+  enteredKovoVerify: boolean
+  hasLiveSealedCapability: boolean
+  hasHopCheckpoint: boolean
+  inSettlementStream: boolean
+  stallAbort?: boolean
+}
+
+export interface WorkerVerifyGraceDecision {
+  graceMs: number
+  reason: WorkerVerifyGraceReason
+  verifyGraceApplied: boolean
+  hardCeilingRemainingMs: number
 }
 
 /**
- * Compute bounded wall-clock settlement and verify-grace windows for an investigation worker.
+ * Compute bounded wall-clock settlement, stall-credit ceiling, and verify-grace windows for an
+ * investigation worker.
  *
- * - Normal production budgets (>= 20s) receive a 20s–45s verify grace for in-flight proof calls
- *   (`kovo_verify` / `verify_replay_spec` / `propose_chain_finding`) plus a bounded 10s–20s
- *   settlement-stream grace if the worker has already entered settlement and is actively generating
- *   its final verification call.
+ * - Normal production budgets (>= 20s) receive a 20s–45s verify grace for in-flight proof calls,
+ *   an expanded +60s bounded verify grace when the worker has already entered `kovo_verify` or
+ *   holds a live sealed capability / active `hop_checkpoint`, plus a bounded 10s–20s
+ *   settlement-stream grace if actively generating its final verification call.
+ * - `maxStallCreditMs` is strictly capped at `remainingBudgetMs` so `hardWallClockCeilingMs`
+ *   never exceeds `2x` base wall-clock budget (zero infinite hangs).
  * - Short test budgets (< 20s) preserve fast proportional scaling with zero settlement-stream
  *   extension so unit/integration rotation tests stay strictly bounded.
  */
@@ -169,6 +261,8 @@ export function computeWorkerWallClockPlan(input: {
   const preSessionElapsedMs = Math.max(0, Math.floor(input.preSessionElapsedMs ?? 0))
   const remainingBudgetMs = Math.max(1, wallClockMs - preSessionElapsedMs)
   const isMultiHop = Boolean(input.isMultiHop)
+  const maxStallCreditMs = remainingBudgetMs
+  const hardWallClockCeilingMs = remainingBudgetMs + maxStallCreditMs
 
   const baseSettlementMs = resolveWorkerSettlementMs(wallClockMs, isMultiHop)
   const effectiveSettlementMs = input.explicitSettlementMs !== undefined
@@ -182,7 +276,10 @@ export function computeWorkerWallClockPlan(input: {
       remainingBudgetMs,
       effectiveSettlementMs,
       verifyGraceMs: Math.min(5_000, Math.max(25, Math.floor(remainingBudgetMs * 0.25))),
+      expandedVerifyGraceMs: Math.min(5_000, Math.max(50, Math.floor(remainingBudgetMs * 0.50))),
       settlementStreamGraceMs: 0,
+      maxStallCreditMs,
+      hardWallClockCeilingMs,
     }
   }
 
@@ -191,6 +288,7 @@ export function computeWorkerWallClockPlan(input: {
     DEFAULT_VERIFY_GRACE_MAX_MS,
     Math.max(DEFAULT_VERIFY_GRACE_MIN_MS, Math.round(remainingBudgetMs * verifyShare)),
   )
+  const expandedVerifyGraceMs = Math.min(EXPANDED_VERIFY_GRACE_MS, maxStallCreditMs)
   const settlementStreamGraceMs = Math.min(
     DEFAULT_SETTLEMENT_VERIFY_GRACE_MAX_MS,
     Math.max(10_000, Math.round(remainingBudgetMs * 0.20)),
@@ -199,8 +297,56 @@ export function computeWorkerWallClockPlan(input: {
     remainingBudgetMs,
     effectiveSettlementMs,
     verifyGraceMs,
+    expandedVerifyGraceMs,
     settlementStreamGraceMs,
+    maxStallCreditMs,
+    hardWallClockCeilingMs,
   }
+}
+
+/**
+ * Decide whether a worker whose soft wall-clock budget has expired qualifies for a bounded
+ * verify-grace extension, strictly clamped by the remaining headroom to `hardWallClockCeilingMs`.
+ */
+export function resolveWorkerVerifyGrace(input: WorkerVerifyGraceInput): WorkerVerifyGraceDecision {
+  const activeElapsed = clampFiniteNonNegativeMs(input.sessionActiveElapsedMs)
+  const hardCeilingRemainingMs = Math.max(0, input.plan.hardWallClockCeilingMs - activeElapsed)
+  if (hardCeilingRemainingMs <= 0) {
+    return { graceMs: 0, reason: 'none', verifyGraceApplied: false, hardCeilingRemainingMs: 0 }
+  }
+  const hasExpandedContext = Boolean(
+    input.enteredKovoVerify
+    || input.hasLiveSealedCapability
+    || input.hasHopCheckpoint,
+  )
+  if (hasExpandedContext) {
+    const graceMs = Math.min(input.plan.expandedVerifyGraceMs, hardCeilingRemainingMs)
+    return {
+      graceMs,
+      reason: graceMs > 0 ? 'expanded_verify' : 'none',
+      verifyGraceApplied: graceMs > 0,
+      hardCeilingRemainingMs,
+    }
+  }
+  if (input.inFlightProofCall) {
+    const graceMs = Math.min(input.plan.verifyGraceMs, hardCeilingRemainingMs)
+    return {
+      graceMs,
+      reason: graceMs > 0 ? 'active_proof' : 'none',
+      verifyGraceApplied: graceMs > 0,
+      hardCeilingRemainingMs,
+    }
+  }
+  if (input.inSettlementStream && !input.stallAbort && input.plan.settlementStreamGraceMs > 0) {
+    const graceMs = Math.min(input.plan.settlementStreamGraceMs, hardCeilingRemainingMs)
+    return {
+      graceMs,
+      reason: graceMs > 0 ? 'settlement_stream' : 'none',
+      verifyGraceApplied: graceMs > 0,
+      hardCeilingRemainingMs,
+    }
+  }
+  return { graceMs: 0, reason: 'none', verifyGraceApplied: false, hardCeilingRemainingMs }
 }
 
 function stripUntrustedReplayEnvelopes(rawSpec: unknown): unknown {
@@ -764,6 +910,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
         this.storage.event(run.id, 'worker.wall_clock_rotated', `${step.title} rotated at wall-clock budget (${budget.wallClockMs}ms); slot released.`, {
           assignmentId: assignment.id, stepId: step.id, stepStatus: 'rotated_partial', specialistProfile: resolvedSpecialistId,
           wallClockMs: budget.wallClockMs, boundedRotation: true, preSession: true,
+          providerStallWaitMs: 0, creditedStallWaitMs: 0, verifyGraceApplied: false, verifyGraceReason: 'none',
         })
       })
       this.emitStepTerminalEvent(run.id, {
@@ -926,6 +1073,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
     const sessionSealedCapHandles: string[] = []
     let confirmedDuringAssignment = false
     let gapCodedDuringAssignment = false
+    let enteredKovoVerify = false
     let inFlightProofCalls = 0
     let onProofCallEnter: (() => void) | undefined
     let onProofCallExit: (() => void) | undefined
@@ -1915,7 +2063,9 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
         }),
 
         ...(this.host.verifier.backendSupportsVerifyScript() ? {
-          kovo_verify: async (args: KovoVerifyArgs, toolSignal?: AbortSignal) => trackProofCall(async () => {
+          kovo_verify: async (args: KovoVerifyArgs, toolSignal?: AbortSignal) => {
+            enteredKovoVerify = true
+            return trackProofCall(async () => {
             const curRun = this.host.check(job)
             const rawRuntime = args.runtime as string | undefined
             if (
@@ -2017,7 +2167,8 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
               detail: `${proof.verdict.detail} Finding ${persisted.findingId} cites ${persisted.receiptId ? `ProofReceipt ${persisted.receiptId}` : 'the persisted script proof'} (replay spec ${persisted.replaySpecId}).`
                 .trim(),
             })
-          }),
+            })
+          },
         } : {}),
 
         suggest_candidate_host: async ({ origin, source, thirdParty }) => {
@@ -2103,6 +2254,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
 
       clearPreSessionTimer()
       const preSessionElapsedMs = assignmentClock.activeElapsedMs()
+      const preSessionPausedMs = assignmentClock.pausedElapsedMs()
       const wallPlan = computeWorkerWallClockPlan({
         wallClockMs: budget.wallClockMs,
         preSessionElapsedMs,
@@ -2112,18 +2264,40 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
       const effectiveSettlementMs = wallPlan.effectiveSettlementMs
       const sessionSettlementMs = Math.max(1, effectiveSettlementMs - preSessionElapsedMs)
 
-      // Pause-aware verify-grace supervision (backed strictly by `assignmentClock`):
-      // - If an active proof call (`kovo_verify` / `verify_replay_spec`) is already in flight
-      //   when `remainingBudgetMs` expires, allow up to `verifyGraceMs` (20–45s) to finish the
-      //   proof and persist its receipt instead of aborting mid-replay.
-      // - If the worker already entered settlement and is actively generating its verification
-      //   turn at `remainingBudgetMs`, allow a bounded `settlementStreamGraceMs` window (10–20s)
-      //   to finish streaming the proof call, followed by `verifyGraceMs` if a proof call starts.
-      // - If neither condition holds (or once the in-flight proof finishes), rotate immediately.
+      // Pause-aware, stall-credit-aware verify-grace supervision (backed strictly by `assignmentClock`):
+      // - Provider HTTP retries, 429/5xx backoff, and stalled stream timeouts are deducted from
+      //   soft wall-clock elapsed time via `computeEffectiveWorkerElapsedMs`, capped at
+      //   `wallPlan.maxStallCreditMs` (`<= baseWallClockMs`) so total active time never exceeds
+      //   `wallPlan.hardWallClockCeilingMs` (`2x` base budget).
+      // - When soft budget expires and the worker has already entered `kovo_verify` OR holds a
+      //   live sealed capability / active `hop_checkpoint`, grant an expanded bounded verify-grace
+      //   window (+60s in production, clamped by remaining headroom to `hardWallClockCeilingMs`).
+      // - Otherwise apply standard active-proof or settlement-stream grace, or rotate immediately.
       const sessionRotateController = new AbortController()
       const onOuterJobAbort = () => sessionRotateController.abort(job.controller.signal.reason)
       job.controller.signal.addEventListener('abort', onOuterJobAbort, { once: true })
       if (job.controller.signal.aborted) sessionRotateController.abort(job.controller.signal.reason)
+
+      let sessionHandle: AgentSessionHandle | undefined
+      const getProviderStallWaitMs = () => sessionHandle?.getProviderStallWaitMs() ?? 0
+      const sessionActiveElapsedMs = () => Math.max(0, assignmentClock.activeElapsedMs() - preSessionElapsedMs)
+      const sessionPausedElapsedMs = () => Math.max(0, assignmentClock.pausedElapsedMs() - preSessionPausedMs)
+      const sessionEffectiveElapsedMs = () => computeEffectiveWorkerElapsedMs({
+        wallElapsedMs: sessionActiveElapsedMs() + sessionPausedElapsedMs(),
+        approvalPausedMs: sessionPausedElapsedMs(),
+        providerStallWaitMs: getProviderStallWaitMs(),
+        maxStallCreditMs: wallPlan.maxStallCreditMs,
+      })
+      const hasLiveSealedCapability = () => {
+        if (sessionSealedCapHandles.length > 0) return true
+        try {
+          return this.storage.capabilityLedger(run.id)
+            .listCapabilities()
+            .some(c => !baselineCapIds.has(c.capId) && DERIVED_CAPABILITY_HANDLE_RE.test(c.capId))
+        } catch {
+          return false
+        }
+      }
 
       let enteredSettlement = false
       let generatingTurn = false
@@ -2132,15 +2306,18 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
       let localWallClockRotated = false
       let localGraceStartedAtMs: number | undefined
       let verifyGraceUsedMs = 0
-      let verifyGraceReason: 'none' | 'active_proof' | 'settlement_stream' = 'none'
+      let verifyGraceReason: WorkerVerifyGraceReason = 'none'
+      const currentVerifyGraceReason = (): WorkerVerifyGraceReason => verifyGraceReason
       let baseDeadlineTimer: DeadlineTimerHandle | undefined
       let verifyGraceTimer: DeadlineTimerHandle | undefined
       let proofHandoffTimer: DeadlineTimerHandle | undefined
+      let hardCeilingTimer: DeadlineTimerHandle | undefined
 
       const clearSupervisionTimers = () => {
         if (baseDeadlineTimer) { baseDeadlineTimer.cancel(); baseDeadlineTimer = undefined }
         if (verifyGraceTimer) { verifyGraceTimer.cancel(); verifyGraceTimer = undefined }
         if (proofHandoffTimer) { proofHandoffTimer.cancel(); proofHandoffTimer = undefined }
+        if (hardCeilingTimer) { hardCeilingTimer.cancel(); hardCeilingTimer = undefined }
       }
 
       const triggerLocalRotation = () => {
@@ -2153,15 +2330,23 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
         sessionRotateController.abort(new Error(`Assignment wall-clock deadline reached (${assignmentClock.activeElapsedMs()}ms / ${budget.wallClockMs}ms).`))
       }
 
-      const armBoundedVerifyGrace = (reason: 'active_proof' | 'settlement_stream', durationMs: number) => {
+      const armBoundedVerifyGrace = (reason: Exclude<WorkerVerifyGraceReason, 'none'>, durationMs: number) => {
         if (verifyGraceTimer) { verifyGraceTimer.cancel(); verifyGraceTimer = undefined }
         if (localGraceStartedAtMs === undefined) localGraceStartedAtMs = assignmentClock.activeElapsedMs()
-        if (verifyGraceReason === 'none' || reason === 'active_proof') verifyGraceReason = reason
-        if (durationMs <= 0) {
+        if (
+          verifyGraceReason === 'none'
+          || reason === 'expanded_verify'
+          || (reason === 'active_proof' && verifyGraceReason === 'settlement_stream')
+        ) {
+          verifyGraceReason = reason
+        }
+        const remainingHardMs = Math.max(0, wallPlan.hardWallClockCeilingMs - sessionActiveElapsedMs())
+        const boundedDurationMs = Math.min(durationMs, remainingHardMs)
+        if (boundedDurationMs <= 0) {
           triggerLocalRotation()
           return
         }
-        verifyGraceTimer = assignmentClock.createDeadlineTimer(durationMs, () => {
+        verifyGraceTimer = assignmentClock.createDeadlineTimer(boundedDurationMs, () => {
           verifyGraceTimer = undefined
           triggerLocalRotation()
         })
@@ -2169,38 +2354,78 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
 
       onProofCallEnter = () => {
         if (proofHandoffTimer) { proofHandoffTimer.cancel(); proofHandoffTimer = undefined }
-        if (baseWallClockExpired && !localWallClockRotated && wallPlan.settlementStreamGraceMs > 0) {
-          armBoundedVerifyGrace('active_proof', wallPlan.verifyGraceMs)
+        if (baseWallClockExpired && !localWallClockRotated) {
+          const decision = resolveWorkerVerifyGrace({
+            plan: wallPlan,
+            sessionActiveElapsedMs: sessionActiveElapsedMs(),
+            inFlightProofCall: inFlightProofCalls > 0,
+            enteredKovoVerify,
+            hasLiveSealedCapability: hasLiveSealedCapability(),
+            hasHopCheckpoint,
+            inSettlementStream: enteredSettlement && generatingTurn,
+            stallAbort: Boolean(job.stallAbort),
+          })
+          if (decision.verifyGraceApplied && decision.reason !== 'none' && decision.graceMs > 0) {
+            armBoundedVerifyGrace(decision.reason, decision.graceMs)
+          }
         }
       }
       onProofCallExit = () => {
-        if (baseWallClockExpired && inFlightProofCalls === 0 && !localWallClockRotated && wallPlan.settlementStreamGraceMs > 0) {
+        if (
+          baseWallClockExpired
+          && inFlightProofCalls === 0
+          && !localWallClockRotated
+          && verifyGraceReason === 'active_proof'
+        ) {
           queueMicrotask(() => {
-            if (inFlightProofCalls === 0 && !localWallClockRotated) triggerLocalRotation()
+            if (inFlightProofCalls === 0 && !localWallClockRotated && verifyGraceReason === 'active_proof') {
+              triggerLocalRotation()
+            }
           })
         }
       }
 
-      if (wallPlan.settlementStreamGraceMs > 0) {
-        baseDeadlineTimer = assignmentClock.createDeadlineTimer(wallPlan.remainingBudgetMs, () => {
+      // Finite hard absolute ceiling (2x base budget) — never bypassed by stall credit or verify grace.
+      hardCeilingTimer = assignmentClock.createDeadlineTimer(wallPlan.hardWallClockCeilingMs, () => {
+        hardCeilingTimer = undefined
+        baseWallClockExpired = true
+        triggerLocalRotation()
+      })
+
+      const armBaseDeadlineTimer = (delayMs: number) => {
+        if (baseDeadlineTimer) { baseDeadlineTimer.cancel(); baseDeadlineTimer = undefined }
+        baseDeadlineTimer = assignmentClock.createDeadlineTimer(Math.max(1, Math.floor(delayMs)), () => {
           baseDeadlineTimer = undefined
-          baseWallClockExpired = true
           if (job.controller.signal.aborted || localWallClockRotated) return
-          if (inFlightProofCalls > 0) {
-            armBoundedVerifyGrace('active_proof', wallPlan.verifyGraceMs)
+          const activeMs = sessionActiveElapsedMs()
+          const effectiveMs = sessionEffectiveElapsedMs()
+          const remainingSoftMs = wallPlan.remainingBudgetMs - effectiveMs
+          const remainingHardMs = wallPlan.hardWallClockCeilingMs - activeMs
+          if (remainingSoftMs > 0 && remainingHardMs > 0) {
+            armBaseDeadlineTimer(Math.min(remainingSoftMs, remainingHardMs))
             return
           }
-          if (enteredSettlement && generatingTurn && !job.stallAbort) {
-            armBoundedVerifyGrace('settlement_stream', wallPlan.settlementStreamGraceMs)
+          baseWallClockExpired = true
+          const decision = resolveWorkerVerifyGrace({
+            plan: wallPlan,
+            sessionActiveElapsedMs: activeMs,
+            inFlightProofCall: inFlightProofCalls > 0,
+            enteredKovoVerify,
+            hasLiveSealedCapability: hasLiveSealedCapability(),
+            hasHopCheckpoint,
+            inSettlementStream: enteredSettlement && generatingTurn,
+            stallAbort: Boolean(job.stallAbort),
+          })
+          if (decision.verifyGraceApplied && decision.reason !== 'none' && decision.graceMs > 0) {
+            armBoundedVerifyGrace(decision.reason, decision.graceMs)
             return
           }
           triggerLocalRotation()
         })
       }
+      armBaseDeadlineTimer(wallPlan.remainingBudgetMs)
 
-      const sessionWallClockMs = wallPlan.settlementStreamGraceMs > 0
-        ? wallPlan.remainingBudgetMs + wallPlan.settlementStreamGraceMs + wallPlan.verifyGraceMs
-        : wallPlan.remainingBudgetMs
+      const sessionWallClockMs = wallPlan.hardWallClockCeilingMs
 
       let sessionResult: Awaited<ReturnType<typeof runAgentSession>>
       try {
@@ -2240,8 +2465,13 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
           maxTurns: budget.maxTurns,
           wallClockMs: sessionWallClockMs,
           wallClockSettlementMs: sessionSettlementMs,
-          wallClockGraceMs: wallPlan.verifyGraceMs,
+          wallClockGraceMs: 0,
+          wallClockMaxStallCreditMs: wallPlan.maxStallCreditMs,
+          wallClockHardCeilingMs: wallPlan.hardWallClockCeilingMs,
           activeClock: assignmentClock,
+          onSessionReady: handle => {
+            sessionHandle = handle
+          },
           onWallClockRotate: info => {
             verifyGraceUsedMs = Math.max(verifyGraceUsedMs, info.graceUsedMs)
             if (info.graceUsedMs > 0 && verifyGraceReason === 'none') {
@@ -2260,7 +2490,13 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
           enableSettlement: true,
           requireCompleteIntent: true,
           shouldSettle: () => {
-            const due = assignmentClock.activeElapsedMs() >= effectiveSettlementMs
+            const effectiveTotalMs = computeEffectiveWorkerElapsedMs({
+              wallElapsedMs: assignmentClock.activeElapsedMs() + assignmentClock.pausedElapsedMs(),
+              approvalPausedMs: assignmentClock.pausedElapsedMs(),
+              providerStallWaitMs: getProviderStallWaitMs(),
+              maxStallCreditMs: wallPlan.maxStallCreditMs,
+            })
+            const due = effectiveTotalMs >= effectiveSettlementMs
             if (due) enteredSettlement = true
             return due
           },
@@ -2285,11 +2521,16 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
             recordTurnLatency()
             this.storage.updateWorker(job.assignment.id, { turnsUsed: turn })
             this.storage.recordLlmSpend(run.id, { turns: 1 })
-            if (baseWallClockExpired && inFlightProofCalls === 0 && !localWallClockRotated && wallPlan.settlementStreamGraceMs > 0) {
+            if (
+              baseWallClockExpired
+              && inFlightProofCalls === 0
+              && !localWallClockRotated
+              && verifyGraceReason === 'settlement_stream'
+            ) {
               if (proofHandoffTimer) proofHandoffTimer.cancel()
               proofHandoffTimer = assignmentClock.createDeadlineTimer(PROOF_HANDOFF_GRACE_MS, () => {
                 proofHandoffTimer = undefined
-                if (inFlightProofCalls === 0 && !localWallClockRotated) {
+                if (inFlightProofCalls === 0 && !localWallClockRotated && verifyGraceReason === 'settlement_stream') {
                   triggerLocalRotation()
                 }
               })
@@ -2355,6 +2596,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
       } catch (err) {
         if (localWallClockRotated && !job.controller.signal.aborted) {
           const elapsedMs = assignmentClock.activeElapsedMs()
+          const providerStallWaitMs = getProviderStallWaitMs()
           sessionResult = {
             answer: `Bounded wall-clock rotation after ${elapsedMs}ms (${turnsCompletedInSession}/${budget.maxTurns} turns); slot released.`,
             turnsUsed: turnsCompletedInSession,
@@ -2363,6 +2605,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
             status: 'wall_clock_rotated',
             wallClockRotated: true,
             elapsedMs,
+            providerStallWaitMs,
           }
         } else {
           throw err
@@ -2383,21 +2626,39 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
       if (sessionResult.status === 'wall_clock_rotated') {
         this.host.wallClockRotationsByRun.set(run.id, (this.host.wallClockRotationsByRun.get(run.id) ?? 0) + 1)
         const elapsedMs = sessionResult.elapsedMs ?? assignmentClock.activeElapsedMs()
+        const providerStallWaitMs = Math.max(
+          sessionResult.providerStallWaitMs ?? 0,
+          getProviderStallWaitMs(),
+        )
+        const elapsedBreakdown = computeEffectiveWorkerElapsedBreakdown({
+          wallElapsedMs: elapsedMs + assignmentClock.pausedElapsedMs(),
+          approvalPausedMs: assignmentClock.pausedElapsedMs(),
+          providerStallWaitMs,
+          maxStallCreditMs: wallPlan.maxStallCreditMs,
+        })
+        const finalVerifyGraceReason = currentVerifyGraceReason()
+        const verifyGraceApplied = finalVerifyGraceReason !== 'none' || verifyGraceUsedMs > 0
         this.host.safeEvent(
           run.id,
           'worker.wall_clock_rotated',
-          `${step.title} rotated cleanly at wall-clock budget (${Math.round(elapsedMs / 1000)}s / ${Math.round(budget.wallClockMs / 1000)}s, ${sessionResult.turnsUsed} turn(s)); slot released.`,
+          `${step.title} rotated cleanly at wall-clock budget (${Math.round(elapsedMs / 1000)}s active / ${Math.round(elapsedBreakdown.effectiveElapsedMs / 1000)}s effective / ${Math.round(budget.wallClockMs / 1000)}s budget, ${sessionResult.turnsUsed} turn(s)); slot released.`,
           {
             assignmentId: job.assignment.id,
             stepId: step.id,
             specialistProfile: specialistProfileId,
             elapsedMs,
+            effectiveElapsedMs: elapsedBreakdown.effectiveElapsedMs,
             wallClockMs: budget.wallClockMs,
+            hardWallClockCeilingMs: wallPlan.hardWallClockCeilingMs,
+            maxStallCreditMs: wallPlan.maxStallCreditMs,
+            providerStallWaitMs,
+            creditedStallWaitMs: elapsedBreakdown.creditedStallWaitMs,
             turnsUsed: sessionResult.turnsUsed,
             boundedRotation: true,
-            verifyGraceMs: wallPlan.verifyGraceMs,
+            verifyGraceMs: finalVerifyGraceReason === 'expanded_verify' ? wallPlan.expandedVerifyGraceMs : wallPlan.verifyGraceMs,
             graceUsedMs: verifyGraceUsedMs,
-            verifyGraceReason,
+            verifyGraceReason: finalVerifyGraceReason,
+            verifyGraceApplied,
           },
         )
       }
