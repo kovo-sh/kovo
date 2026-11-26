@@ -24,30 +24,6 @@ export const updateProjectSpecSchema = z.object({
   content: z.string().min(1).max(maxSpecBytes),
 })
 
-function findActiveProjectRunIds(db: Store, projectId: string): string[] {
-  if (typeof db.listActiveRunIdsForProject === 'function') {
-    return db.listActiveRunIdsForProject(projectId)
-  }
-  const detail = db.projectDetail(projectId)
-  return detail.runs
-    .filter(run => run.isActive || db.isRunActive(run.id))
-    .map(run => run.id)
-}
-
-function assertProjectHasNoActiveRuns(
-  db: Store,
-  projectId: string,
-  action: 're-sync' | 'unlink',
-  repoSlug: string,
-): void {
-  const activeRunIds = findActiveProjectRunIds(db, projectId)
-  if (activeRunIds.length > 0) {
-    throw new Error(
-      `Cannot ${action} repository "${repoSlug}" while project has ${activeRunIds.length} active ${activeRunIds.length === 1 ? 'run' : 'runs'} (${activeRunIds.join(', ')}). Stop active runs first so live worker bind mounts are not corrupted.`,
-    )
-  }
-}
-
 function purgeRepoDerivedSpecs(
   db: Store,
   projectId: string,
@@ -82,7 +58,6 @@ export function unlinkProjectRepoInStore(db: Store, projectId: string, repoSlug:
   const drizzle = req('drizzle-orm') as typeof import('drizzle-orm')
   const tables = req('./server/schema.ts') as typeof import('./server/schema.ts')
   db.project(projectId)
-  assertProjectHasNoActiveRuns(db, projectId, 'unlink', repoSlug)
   const result = unlinkProjectMountedRepo(db.directory, projectId, repoSlug)
   const removedSpecsCount = purgeRepoDerivedSpecs(db, projectId, result.fullName, drizzle, tables)
   if (result.unlinked || removedSpecsCount > 0) {
@@ -108,15 +83,11 @@ export async function resyncProjectRepoInStore(
   const drizzle = req('drizzle-orm') as typeof import('drizzle-orm')
   const tables = req('./server/schema.ts') as typeof import('./server/schema.ts')
   db.project(projectId)
-  assertProjectHasNoActiveRuns(db, projectId, 're-sync', repoSlug)
   const synced = await syncGithubRepos([repoSlug], undefined, {
     dataDir: db.directory,
     cloneDir: projectReposDir(db.directory, projectId),
     historyDepth: 1,
     ...options,
-    assertNoActiveRuns: fullName => {
-      assertProjectHasNoActiveRuns(db, projectId, 're-sync', fullName)
-    },
   })
   const repo = synced[0]
   if (!repo) {
@@ -245,12 +216,7 @@ export const unlinkProjectRepoAction = createServerFn({ method: 'POST' })
     ])
     const db = store()
     db.project(data.projectId)
-    assertProjectHasNoActiveRuns(db, data.projectId, 'unlink', data.repoSlug)
-    const result = await unlinkProjectMountedRepoLocked(db.directory, data.projectId, data.repoSlug, {
-      assertNoActiveRuns: () => {
-        assertProjectHasNoActiveRuns(db, data.projectId, 'unlink', data.repoSlug)
-      },
-    })
+    const result = await unlinkProjectMountedRepoLocked(db.directory, data.projectId, data.repoSlug)
     const removedSpecsCount = purgeRepoDerivedSpecs(db, data.projectId, result.fullName, drizzle, tables)
     if (result.unlinked || removedSpecsCount > 0) {
       db.event(null, 'repo.unlinked', `Unlinked repository ${result.fullName}.`, {
@@ -273,14 +239,10 @@ export const resyncProjectRepoAction = createServerFn({ method: 'POST' })
     ])
     const db = store()
     db.project(data.projectId)
-    assertProjectHasNoActiveRuns(db, data.projectId, 're-sync', data.repoSlug)
     const synced = await syncGithubRepos([data.repoSlug], undefined, {
       dataDir: db.directory,
       cloneDir: projectReposDir(db.directory, data.projectId),
       historyDepth: 1,
-      assertNoActiveRuns: fullName => {
-        assertProjectHasNoActiveRuns(db, data.projectId, 're-sync', fullName)
-      },
     })
     const repo = synced[0]
     if (!repo) {

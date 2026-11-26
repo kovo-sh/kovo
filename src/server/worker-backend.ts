@@ -15,7 +15,7 @@ import {
   rmSync,
   statSync,
 } from 'node:fs'
-import { basename, dirname, isAbsolute, join, posix, relative, sep } from 'node:path'
+import { basename, dirname, isAbsolute, join, posix, relative, resolve as resolvePath, sep } from 'node:path'
 import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import ipaddr from 'ipaddr.js'
@@ -481,6 +481,8 @@ export interface WorkerSession {
 
 export interface WorkerSessionOptions {
   reposDir?: string
+  /** Optional run identifier used to share a single immutable per-run `/repos` snapshot across workers. */
+  runId?: string
   memoryMb?: number
   cpus?: number
   pidsLimit?: number
@@ -1224,10 +1226,9 @@ const SENSITIVE_FILE_EXT_RE = /\.(?:pat|salt|pem|key|p12|pfx|jks|keystore|kdbx|t
 const SAFE_ENV_TEMPLATE_RE = /^\.env\.(?:example|sample|template|dist|schema)$/i
 const SOURCE_CODE_EXT_RE = /\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs|py|go|rs|java|kt|rb|php|cs|c|h|cc|cpp|hpp|swift|scala|sql|graphql|gql|md|html|css|scss|vue|svelte)$/i
 const GIT_CREDENTIAL_FILE_RE = /(?:^|\/)\.git\/(?:config|credentials|fetch_head)$/i
-const GIT_CONFIG_FILE_RE = /(?:^|\/)\.git\/config$/i
-const GIT_CONFIG_SECRET_RE = /^\s*\[credential(?:\s|\])|extraheader|^\s*(?:username|password|token)\s*=|https?:\/\/[^/@\s]+@/im
 
 export const DEFAULT_MAX_STAGE_BYTES = 256 * 1024 * 1024
+const MAX_STAGE_BYTES_ENV_CEILING = 1024 * 1024 * 1024
 export const DEFAULT_MAX_STAGE_FILES = 50_000
 export const DEFAULT_MAX_STAGE_DEPTH = 32
 
@@ -1281,9 +1282,13 @@ function resolveStageLimits(
   options?: StageReposLimits & { env?: NodeJS.ProcessEnv },
 ): { maxBytes: number; maxFiles: number; maxInodes: number; maxDepth: number } {
   const env = options?.env ?? process.env
+  const envMaxBytes = parsePositiveStageEnvInt(env, 'KOVO_MAX_STAGE_REPO_BYTES')
+  const cappedEnvMaxBytes = envMaxBytes !== undefined
+    ? Math.min(envMaxBytes, MAX_STAGE_BYTES_ENV_CEILING)
+    : undefined
   const maxBytes = Math.max(
     1,
-    Math.floor(options?.maxBytes ?? parsePositiveStageEnvInt(env, 'KOVO_MAX_STAGE_REPO_BYTES') ?? DEFAULT_MAX_STAGE_BYTES),
+    Math.floor(options?.maxBytes ?? cappedEnvMaxBytes ?? DEFAULT_MAX_STAGE_BYTES),
   )
   const maxFiles = Math.max(
     1,
@@ -1319,102 +1324,6 @@ function isSensitiveRepoEntry(relPosixPath: string, entryName: string, isDir: bo
     return true
   }
   return false
-}
-
-function gitConfigHasCredentials(filePath: string): boolean {
-  try {
-    const st = lstatSync(filePath)
-    if (!st.isFile() || st.size > 256 * 1024) return true
-    return GIT_CONFIG_SECRET_RE.test(readFileSync(filePath, 'utf8'))
-  } catch {
-    return true
-  }
-}
-
-function reposTreeNeedsStaging(
-  resolvedRoot: string,
-  limits: { maxDepth: number; maxFiles: number; maxInodes: number },
-): boolean {
-  const rootStat = statSync(resolvedRoot)
-  // Non-root worker container (UID 10001) needs o+rx on `/repos` and every subdirectory,
-  // and o+r on every non-secret file inside it.
-  let needsStaging = (rootStat.mode & 0o005) !== 0o005
-  let inspectedFiles = 0
-  let inspectedInodes = 0
-
-  const inspect = (dir: string, depth: number): void => {
-    if (depth > limits.maxDepth) {
-      throw new RepoStagingQuotaExceededError(
-        'depth',
-        depth,
-        limits.maxDepth,
-        relative(resolvedRoot, dir).split(sep).join('/'),
-      )
-    }
-    for (const entry of readdirSync(dir, { withFileTypes: true })) {
-      const fullPath = join(dir, entry.name)
-      const st = lstatSync(fullPath)
-      if (st.isSymbolicLink()) continue
-      const relPosix = relative(resolvedRoot, fullPath).split(sep).join('/')
-      if (st.isDirectory()) {
-        const nameLower = entry.name.toLowerCase()
-        if (nameLower === 'node_modules') continue
-        if (nameLower === '.git') {
-          const hooksDir = join(fullPath, 'hooks')
-          if (existsSync(hooksDir)) {
-            try {
-              if ((lstatSync(hooksDir).mode & 0o005) !== 0) needsStaging = true
-            } catch { /* ignore */ }
-          }
-          const configFile = join(fullPath, 'config')
-          if (existsSync(configFile)) {
-            try {
-              const cfgStat = lstatSync(configFile)
-              if ((cfgStat.mode & 0o004) !== 0 && gitConfigHasCredentials(configFile)) needsStaging = true
-            } catch {
-              needsStaging = true
-            }
-          }
-          continue
-        }
-        if (isSensitiveRepoEntry(relPosix, entry.name, true)) {
-          if ((st.mode & 0o005) !== 0) needsStaging = true
-          continue
-        }
-        inspectedInodes += 1
-        if (inspectedInodes > limits.maxInodes) {
-          throw new RepoStagingQuotaExceededError('files', inspectedInodes, limits.maxInodes, relPosix)
-        }
-        const nextDepth = depth + 1
-        if (nextDepth > limits.maxDepth) {
-          throw new RepoStagingQuotaExceededError('depth', nextDepth, limits.maxDepth, relPosix)
-        }
-        if ((st.mode & 0o005) !== 0o005) needsStaging = true
-        inspect(fullPath, nextDepth)
-      } else if (st.isFile()) {
-        if (isSensitiveRepoEntry(relPosix, entry.name, false)) {
-          if (GIT_CONFIG_FILE_RE.test(relPosix)) {
-            if ((st.mode & 0o004) !== 0 && gitConfigHasCredentials(fullPath)) needsStaging = true
-            continue
-          }
-          if ((st.mode & 0o004) !== 0) needsStaging = true
-          continue
-        }
-        inspectedFiles += 1
-        inspectedInodes += 1
-        if (inspectedFiles > limits.maxFiles) {
-          throw new RepoStagingQuotaExceededError('files', inspectedFiles, limits.maxFiles, relPosix)
-        }
-        if (inspectedInodes > limits.maxInodes) {
-          throw new RepoStagingQuotaExceededError('files', inspectedInodes, limits.maxInodes, relPosix)
-        }
-        if ((st.mode & 0o004) !== 0o004) needsStaging = true
-      }
-    }
-  }
-
-  inspect(resolvedRoot, 0)
-  return needsStaging
 }
 
 function resolveStageReposBaseDir(stageDirMode: number, env: NodeJS.ProcessEnv = process.env): string {
@@ -1569,22 +1478,13 @@ export function stageReadableReposTree(
   return { mountDir, excludedCount, stagedBytes, stagedFiles }
 }
 
-function isInsideScratchSubdir(containerScratchDir: string, candidate: string): boolean {
-  try {
-    relativeScratchSubpath(containerScratchDir, candidate)
-    return true
-  } catch {
-    return false
-  }
-}
-
 /**
  * Validate and prepare a host `reposDir` for a read-only `/repos` bind mount into the non-root
- * Docker worker (`UID 10001`). When the host tree lacks `o+rx` on directories or `o+r` on
- * non-secret files (e.g. created under host `umask 0077` or `0o700`), or when running in DooD
- * sibling-container scratch mode outside `KOVO_CONTAINER_SCRATCH_DIR`, stages a clean read-only
- * copy with explicit `0o755`/`0o644` permissions while excluding credential/token files and
- * leaving original host files (including `0600` secrets) completely unmodified.
+ * Docker worker (`UID 10001`). Always stages an isolated immutable snapshot via
+ * `stageReadableReposTree` — never direct-mounting the live mutable host checkout directory —
+ * with explicit container-readable permissions (`0o755`/`0o644` on host, `0o700`/`0o600` when
+ * running as UID 10001) while stripping `.git`, `node_modules`, symlinks, and sensitive files
+ * (`.env`, keys, tokens) and leaving original host files completely unmodified.
  */
 export function prepareReposMount(
   reposDir?: string,
@@ -1606,15 +1506,6 @@ export function prepareReposMount(
   const env = doodOptions?.env ?? process.env
   const stageLimits = resolveStageLimits({ ...doodOptions, env })
   const dood = resolveDoodScratchConfig(env)
-  const needsDoodStage = dood !== null && !isInsideScratchSubdir(dood.containerScratchDir, resolved)
-  if (!needsDoodStage && !reposTreeNeedsStaging(resolved, stageLimits)) {
-    return {
-      mountDir: resolved,
-      staged: false,
-      excludedCount: 0,
-      cleanup() { /* direct mount: never remove caller's directory */ },
-    }
-  }
   const stageTarget = dood
     ? prepareSessionScratchDir(doodOptions?.sessionId ?? `repos-${randomUUID()}`, 'repos', env)
     : undefined
@@ -1814,7 +1705,7 @@ function normalizeReposDirKey(reposDir?: string): string | undefined {
   try {
     return realpathSync(reposDir)
   } catch {
-    return reposDir
+    return resolvePath(reposDir)
   }
 }
 
@@ -1847,10 +1738,14 @@ export function buildWarmPoolPolicy(input: {
   return `${cleanRunId}:${mountHash}`
 }
 
-interface WarmReposLease {
+interface RunRepoSnapshotLease {
+  key: string
+  runKey: string
   sourceDir: string
   prepared: PreparedReposMount
-  activeSessions: number
+  /** Active borrowers: owning warm-pool slots + open sessions + in-flight run/verifyStaticAst calls. */
+  activeLeases: number
+  /** Marked true once retired by evictRunWarmPool / policy rotation / closeWarmPool; cleaned up when activeLeases hits 0. */
   retired: boolean
 }
 
@@ -1866,7 +1761,7 @@ interface WarmPoolSlot {
   runKey: string
   pool: WarmWorkerPool
   reposSource?: string
-  preparedRepos?: WarmReposLease
+  preparedRepos?: RunRepoSnapshotLease
   warmed: boolean
   /** Concurrent in-flight `openSession` calls + active sessions referencing this slot. */
   activeSessions: number
@@ -1886,12 +1781,14 @@ function sharedWarmPool(input: {
   runLabel: string
   owner?: string
   options?: WorkerSessionOptions
+  reposDirPreStaged?: boolean
   capacity?: number
 }): WarmWorkerPool {
   const sanitizedOptions = input.options ? { ...input.options } : undefined
   if (sanitizedOptions) {
     delete sanitizedOptions.rpcMountDir
     delete sanitizedOptions.warmPoolPolicy
+    delete sanitizedOptions.runId
   }
   // Owner (tenant/workspace) and container options (including read-only reposDir) are part of the
   // key: two tenants or different repo mounts must never share an idle container.
@@ -1923,6 +1820,7 @@ export class WarmWorkerPool {
   private readonly runLabel: string
   private readonly owner?: string
   private readonly options: WorkerSessionOptions
+  private readonly reposDirPreStaged: boolean
   private readonly signature: string
   private readonly registryKey?: string
   private preparedRepos?: PreparedReposMount | null
@@ -1951,6 +1849,7 @@ export class WarmWorkerPool {
     runLabel: string
     owner?: string
     options?: WorkerSessionOptions
+    reposDirPreStaged?: boolean
     capacity?: number
     idleMaxAgeMs?: number
     registryKey?: string
@@ -1961,9 +1860,11 @@ export class WarmWorkerPool {
     this.runLabel = input.runLabel
     this.owner = input.owner
     this.registryKey = input.registryKey
+    this.reposDirPreStaged = Boolean(input.reposDirPreStaged)
     this.options = { ...(input.options ?? {}) }
     delete this.options.rpcMountDir
     delete this.options.warmPoolPolicy
+    delete this.options.runId
     this.signature = workerOptionsSignature(this.options)
     this.capacity = Math.max(1, Math.min(MAX_WARM_POOL_CAPACITY, Math.floor(input.capacity ?? warmPoolCapacity())))
     this.idleMaxAgeMs = Math.max(1_000, input.idleMaxAgeMs ?? Math.floor(DEFAULT_FOREIGN_OWNER_TTL_MS / 2))
@@ -2043,7 +1944,7 @@ export class WarmWorkerPool {
   }
 
   private effectiveCreateOptions(): WorkerSessionOptions {
-    if (!this.options.reposDir) return this.options
+    if (!this.options.reposDir || this.reposDirPreStaged) return this.options
     if (this.preparedRepos === undefined) {
       this.preparedRepos = prepareReposMount(this.options.reposDir, { sessionId: `warm-${this.instanceId}-${randomUUID().slice(0, 8)}` })
     }
@@ -2228,6 +2129,8 @@ export class LinuxWorkerBackend implements WorkerBackend {
   private readonly isPidAlive: (pid: number) => boolean
   private readonly readPidStartTime: (pid: number) => string | null
   private readonly warmPools = new Map<string, WarmPoolSlot>()
+  /** Immutable staged `/repos` snapshots shared across all workers in the same `(runKey, reposDir)`. */
+  private readonly runRepoSnapshots = new Map<string, RunRepoSnapshotLease>()
   /** Most recently installed policy key (used when `openSession` omits `options.warmPoolPolicy`). */
   private activeWarmPoolPolicy?: string
   /** Hard bound on concurrent per-policy warm pools retained in `this.warmPools` (LRU evicted). */
@@ -2307,16 +2210,121 @@ export class LinuxWorkerBackend implements WorkerBackend {
     this.installWarmPool(this.defaultWarmPolicy(), false)
   }
 
-  private retireWarmRepos(lease?: WarmReposLease): void {
-    if (!lease) return
-    lease.retired = true
-    if (lease.activeSessions === 0) lease.prepared.cleanup()
+  private runSnapshotKey(runKey: string, sourceDir: string): string {
+    return `${runKey}\0${sourceDir}`
   }
 
-  private releaseWarmReposLease(lease?: WarmReposLease): void {
+  private resolveRunKeyForOptions(options?: WorkerSessionOptions): string | undefined {
+    const explicitRunId = options?.runId?.trim()
+    if (explicitRunId) return explicitRunId
+    const requestedPolicy = options?.warmPoolPolicy?.trim()
+    if (requestedPolicy) return policyRunKey(requestedPolicy)
+    if (this.activeWarmPoolPolicy) {
+      const activeSlot = this.warmPools.get(this.activeWarmPoolPolicy)
+      if (activeSlot && !activeSlot.retired && activeSlot.policy !== this.defaultWarmPolicy()) {
+        return activeSlot.runKey
+      }
+    }
+    const backendRunId = this.runId?.trim()
+    return backendRunId || undefined
+  }
+
+  private evictExcessIdleRunSnapshots(): void {
+    const maxCached = Math.max(this.maxWarmPools, MAX_ACTIVE_WARM_POOLS)
+    if (this.runRepoSnapshots.size < maxCached) return
+    for (const candidate of [...this.runRepoSnapshots.values()]) {
+      if (this.runRepoSnapshots.size < maxCached) break
+      if (candidate.activeLeases > 0) continue
+      this.retireRunRepoSnapshot(candidate)
+    }
+  }
+
+  private acquireRunRepoSnapshot(
+    runKey: string,
+    reposDir: string,
+    sessionPrefix: string,
+  ): RunRepoSnapshotLease | null {
+    const sourceDir = normalizeReposDirKey(reposDir)
+    if (!sourceDir) return null
+    const key = this.runSnapshotKey(runKey, sourceDir)
+    const existing = this.runRepoSnapshots.get(key)
+    if (existing && !existing.retired && existsSync(existing.prepared.mountDir)) {
+      this.runRepoSnapshots.delete(key)
+      this.runRepoSnapshots.set(key, existing)
+      existing.activeLeases += 1
+      return existing
+    }
+    if (existing) {
+      this.retireRunRepoSnapshot(existing)
+    }
+    this.evictExcessIdleRunSnapshots()
+    const prepared = prepareReposMount(reposDir, {
+      sessionId: `${sessionPrefix}-${this.instanceId.slice(0, 8)}-${randomUUID().slice(0, 8)}`,
+    })
+    if (!prepared) return null
+    const lease: RunRepoSnapshotLease = {
+      key,
+      runKey,
+      sourceDir,
+      prepared,
+      activeLeases: 1,
+      retired: false,
+    }
+    this.runRepoSnapshots.set(key, lease)
+    return lease
+  }
+
+  private retireRunRepoSnapshot(lease?: RunRepoSnapshotLease | null): void {
     if (!lease) return
-    lease.activeSessions = Math.max(0, lease.activeSessions - 1)
-    if (lease.retired && lease.activeSessions === 0) lease.prepared.cleanup()
+    if (this.runRepoSnapshots.get(lease.key) === lease) {
+      this.runRepoSnapshots.delete(lease.key)
+    }
+    lease.retired = true
+    if (lease.activeLeases === 0) {
+      lease.prepared.cleanup()
+    }
+  }
+
+  private releaseRunRepoSnapshotLease(lease?: RunRepoSnapshotLease | null): void {
+    if (!lease) return
+    lease.activeLeases = Math.max(0, lease.activeLeases - 1)
+    if (lease.retired && lease.activeLeases === 0) {
+      lease.prepared.cleanup()
+    } else if (lease.activeLeases === 0) {
+      this.evictExcessIdleRunSnapshots()
+    }
+  }
+
+  private acquireReposForCall(
+    options: WorkerSessionOptions | undefined,
+    fallbackSessionId: string,
+  ): { mountDir: string; release: () => void } | null {
+    if (!options?.reposDir) return null
+    const runKey = this.resolveRunKeyForOptions(options)
+    if (runKey) {
+      const lease = this.acquireRunRepoSnapshot(runKey, options.reposDir, 'runsnap')
+      if (!lease) return null
+      let released = false
+      return {
+        mountDir: lease.prepared.mountDir,
+        release: () => {
+          if (released) return
+          released = true
+          this.releaseRunRepoSnapshotLease(lease)
+        },
+      }
+    }
+    const prepared = prepareReposMount(options.reposDir, { sessionId: fallbackSessionId })
+    if (!prepared) return null
+    let released = false
+    return {
+      mountDir: prepared.mountDir,
+      release: () => {
+        if (released) return
+        released = true
+        prepared.cleanup()
+      },
+    }
   }
 
   /** Pool key: an explicit cell, else the workspace. A bare test backend never prewarms. */
@@ -2379,7 +2387,12 @@ export class LinuxWorkerBackend implements WorkerBackend {
     // Close removes idle containers; a session still holding one releases into a closed pool,
     // which discards instead of reusing. Never carry an old-generation container forward.
     const closing = slot.pool.close().catch(() => undefined)
-    this.retireWarmRepos(slot.preparedRepos)
+    const repoLease = slot.preparedRepos
+    slot.preparedRepos = undefined
+    if (repoLease) {
+      this.retireRunRepoSnapshot(repoLease)
+      this.releaseRunRepoSnapshotLease(repoLease)
+    }
     return awaitClose ? closing : Promise.resolve()
   }
 
@@ -2435,18 +2448,13 @@ export class LinuxWorkerBackend implements WorkerBackend {
       if (!evictCandidate) break
       void this.retireSlot(evictCandidate)
     }
-    let preparedRepos: WarmReposLease | undefined
+    let preparedRepos: RunRepoSnapshotLease | undefined
     let poolOptions: WorkerSessionOptions | undefined
     if (options?.reposDir) {
-      const prepared = prepareReposMount(options.reposDir, { sessionId: `pool-${this.instanceId}-${randomUUID().slice(0, 8)}` })
-      if (prepared) {
-        preparedRepos = {
-          sourceDir: nextReposSource ?? prepared.mountDir,
-          prepared,
-          activeSessions: 0,
-          retired: false,
-        }
-        poolOptions = { reposDir: prepared.mountDir }
+      const lease = this.acquireRunRepoSnapshot(runKey, options.reposDir, 'pool')
+      if (lease) {
+        preparedRepos = lease
+        poolOptions = { reposDir: lease.prepared.mountDir }
       }
     }
     const pool = sharedWarmPool({
@@ -2455,7 +2463,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
       dockerRunner: this.docker,
       runLabel: `${this.defaultWarmPolicy()}#${policy}`,
       ...(this.owner ? { owner: this.owner } : {}),
-      ...(poolOptions ? { options: poolOptions } : {}),
+      ...(poolOptions ? { options: poolOptions, reposDirPreStaged: true } : {}),
       ...(this.desiredWarmCapacity !== undefined ? { capacity: this.desiredWarmCapacity } : {}),
     })
     const slot: WarmPoolSlot = {
@@ -2485,7 +2493,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
     this.installWarmPool(normalized, true, options)
   }
 
-  /** Evict and close all warm-pool containers/leases owned by `runId` on run disposal. */
+  /** Evict and close all warm-pool containers and per-run repo snapshots owned by `runId` on run disposal. */
   async evictRunWarmPool(runId: string): Promise<void> {
     const normalized = runId.trim()
     if (!normalized) return
@@ -2493,13 +2501,26 @@ export class LinuxWorkerBackend implements WorkerBackend {
       slot => slot.runKey === normalized || slot.policy === normalized,
     )
     await Promise.all(targets.map(slot => this.retireSlot(slot, true)))
+    for (const lease of [...this.runRepoSnapshots.values()]) {
+      if (lease.runKey === normalized) {
+        this.retireRunRepoSnapshot(lease)
+      }
+    }
   }
 
-  /** Shutdown seam: remove idle containers across all run pools so teardown leaves none behind. */
+  /** Shutdown seam: remove idle containers and staged per-run repo snapshots across all run pools. */
   async closeWarmPool(): Promise<void> {
     const slots = [...this.warmPools.values()]
     this.activeWarmPoolPolicy = undefined
     await Promise.all(slots.map(slot => this.retireSlot(slot, true)))
+    for (const lease of [...this.runRepoSnapshots.values()]) {
+      this.retireRunRepoSnapshot(lease)
+    }
+  }
+
+  /** Close all warm pools and retire all cached per-run repo snapshots. */
+  async close(): Promise<void> {
+    await this.closeWarmPool()
   }
 
   /** Active warm-pool state (test/diagnostic seam; never contains secrets). */
@@ -2731,14 +2752,14 @@ export class LinuxWorkerBackend implements WorkerBackend {
     // tmpfs (or isolated DooD session subdir) and read the spilled payload directly (size + sha256).
     const scratchSessionId = `run-${randomUUID()}`
     let cleanupDir: string | undefined
-    let preparedRepos: PreparedReposMount | null = null
+    let repoAcquisition: { mountDir: string; release: () => void } | null = null
     this.activeContainers.add(name)
     trackLiveContainer(name)
     try {
       const ipc = makeOneShotIpcDir(scratchSessionId)
       cleanupDir = ipc.cleanupDir
-      preparedRepos = prepareReposMount(options?.reposDir, { sessionId: scratchSessionId })
-      const effectiveOptions = preparedRepos ? { ...options, reposDir: preparedRepos.mountDir } : options
+      repoAcquisition = this.acquireReposForCall(options, scratchSessionId)
+      const effectiveOptions = repoAcquisition ? { ...options, reposDir: repoAcquisition.mountDir } : options
       await this.docker(this.containerCreateArgs(name, job.assignmentId, [], effectiveOptions, ipc.ipcDir), deadline)
       const result = await this.docker(['container', 'start', '--attach', '--interactive', name], deadline, payload)
       const parsed = JSON.parse(result) as Record<string, unknown>
@@ -2749,7 +2770,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
     } finally {
       if (cleanupDir) cleanupSessionSubdir(cleanupDir)
       await this.removeContainer(name)
-      preparedRepos?.cleanup()
+      repoAcquisition?.release()
       this.activeContainers.delete(name)
       liveContainers.delete(name)
     }
@@ -2770,8 +2791,8 @@ export class LinuxWorkerBackend implements WorkerBackend {
     const name = 'kovo-' + randomUUID()
     const timeoutMs = (req.timeoutMs ?? 30_000) + 15_000
     const deadline = AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])
-    const preparedRepos = prepareReposMount(options?.reposDir, { sessionId: `ast-${randomUUID()}` })
-    const effectiveOptions = preparedRepos ? { ...options, reposDir: preparedRepos.mountDir } : options
+    const repoAcquisition = this.acquireReposForCall(options, `ast-${randomUUID()}`)
+    const effectiveOptions = repoAcquisition ? { ...options, reposDir: repoAcquisition.mountDir } : options
     this.activeContainers.add(name)
     trackLiveContainer(name)
     try {
@@ -2780,7 +2801,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
       return astVerifyResultSchema.parse(JSON.parse(result))
     } finally {
       await this.removeContainer(name)
-      preparedRepos?.cleanup()
+      repoAcquisition?.release()
       this.activeContainers.delete(name)
       liveContainers.delete(name)
     }
@@ -2822,20 +2843,20 @@ export class LinuxWorkerBackend implements WorkerBackend {
       && options?.reposDir
       && normalizeReposDirKey(options.reposDir) === warmRepos.sourceDir,
     )
-    let heldWarmRepos: WarmReposLease | undefined
+    let heldWarmRepos: RunRepoSnapshotLease | undefined
     let releasedWarmRepos = false
     const releaseWarmRepos = () => {
       if (releasedWarmRepos) return
       releasedWarmRepos = true
       const lease = heldWarmRepos
       heldWarmRepos = undefined
-      this.releaseWarmReposLease(lease)
+      this.releaseRunRepoSnapshotLease(lease)
     }
     const takeOptions = matchesWarmRepos && warmRepos
       ? { ...options, reposDir: warmRepos.prepared.mountDir }
       : options
     if (matchesWarmRepos && warmRepos) {
-      warmRepos.activeSessions += 1
+      warmRepos.activeLeases += 1
       heldWarmRepos = warmRepos
     }
     let warm: string | null = null
@@ -2857,11 +2878,15 @@ export class LinuxWorkerBackend implements WorkerBackend {
     else this.coldSessionCreates += 1
     this.activeContainers.add(name)
     trackLiveContainer(name)
-    let preparedRepos: PreparedReposMount | null = null
-    const cleanupRepos = () => { preparedRepos?.cleanup() }
+    let repoAcquisition: { mountDir: string; release: () => void } | null = null
+    const cleanupRepos = () => {
+      const current = repoAcquisition
+      repoAcquisition = null
+      current?.release()
+    }
     const createColdSessionContainer = async (targetName: string) => {
-      preparedRepos = prepareReposMount(options?.reposDir, { sessionId: `sess-${randomUUID()}` })
-      const effectiveOptions = preparedRepos ? { ...options, reposDir: preparedRepos.mountDir } : options
+      repoAcquisition = this.acquireReposForCall(options, `sess-${randomUUID()}`)
+      const effectiveOptions = repoAcquisition ? { ...options, reposDir: repoAcquisition.mountDir } : options
       await this.docker(this.containerCreateArgs(targetName, assignmentId, ['--session'], effectiveOptions), AbortSignal.any([signal, AbortSignal.timeout(15_000)]))
     }
     if (!pooled) {

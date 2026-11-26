@@ -194,14 +194,14 @@ test('per-repo locking serializes concurrent operations on the same (projectId, 
   assert.equal(existsSync(repoDir), false)
 })
 
-test('active-run protection blocks destructive unlink/resync and unlinking purges phantom repo-derived specs', async t => {
+test('resync and unlink succeed safely while a project has active runs and unlinking purges phantom repo-derived specs', async t => {
   const dir = makeTempDir(t, 'kovo-p4-store-')
   const store = new Store(dir, { ftsMode: 'preview' })
   t.after(() => store.close())
 
   const project = store.createProject(newProject.parse({
     requestId: randomUUID(),
-    name: 'Active Run Guard Project',
+    name: 'Immutable Snapshot Repo Project',
     seeds: ['https://app.example.test'],
   }))
 
@@ -243,50 +243,13 @@ test('active-run protection blocks destructive unlink/resync and unlinking purge
   const run = store.createRun(newRun.parse({
     requestId: randomUUID(),
     projectId: project.id,
-    goal: 'Verify active run mount protection',
+    goal: 'Verify repo re-sync and unlink succeed with active runs under immutable snapshots',
   }))
   store.db.update(tables.runs).set({ status: 'running' }).where(eq(tables.runs.id, run.id)).run()
   assert.equal(store.isRunActive(run.id), true)
 
-  // Both unlink and resync MUST be refused with a clear operator-facing error while the run is active
-  assert.throws(
-    () => unlinkProjectRepoInStore(store, project.id, 'acme/demo-app'),
-    new RegExp(`Cannot unlink repository "acme/demo-app".*active run.*${run.id}`, 'i'),
-  )
-  await assert.rejects(
-    () => resyncProjectRepoInStore(store, project.id, 'acme/demo-app', {
-      patPath,
-      gitBaseUrl: `file://${originRoot}`,
-      allowLocalFileProtocol: true,
-    }),
-    new RegExp(`Cannot re-sync repository "acme/demo-app".*active run.*${run.id}`, 'i'),
-  )
-
-  // RepoWorkspaceManager activeRunChecker also refuses both sync and unlink
-  const mgr = new RepoWorkspaceManager({
-    activeRunChecker: () => [run.id],
-  })
-  await assert.rejects(
-    () => mgr.syncRepos(dir, project.id, ['acme/demo-app'], undefined, {
-      patPath,
-      gitBaseUrl: `file://${originRoot}`,
-      allowLocalFileProtocol: true,
-    }),
-    err => err instanceof RepoWorkspaceBusyError && err.code === 'REPO_ACTIVE_RUN_LOCKED',
-  )
-  await assert.rejects(
-    () => mgr.unlinkRepo(dir, project.id, 'acme/demo-app'),
-    err => err instanceof RepoWorkspaceBusyError && err.code === 'REPO_ACTIVE_RUN_LOCKED',
-  )
-
-  // Mounted checkout and all specs remain intact after refused mutations
-  assert.deepEqual(listMountedRepos(projectReposDir(dir, project.id)), ['/repos/acme/demo-app'])
-
-  // Stop the active run
-  store.command({ requestId: randomUUID(), runId: run.id, action: 'stop' })
-  assert.equal(store.isRunActive(run.id), false)
-
-  // Resync succeeds now and prunes the stale repo-derived spec while preserving manual-notes.md
+  // Because live workers mount immutable per-run staged snapshots (never the live checkout dir),
+  // re-sync succeeds cleanly while the run is active and prunes stale repo-derived specs.
   await resyncProjectRepoInStore(store, project.id, 'acme/demo-app', {
     patPath,
     gitBaseUrl: `file://${originRoot}`,
@@ -297,12 +260,34 @@ test('active-run protection blocks destructive unlink/resync and unlinking purge
   assert.equal(specsAfterResync.includes('acme/demo-app:inventory'), true)
   assert.equal(specsAfterResync.includes('manual-notes.md'), true)
 
-  // Unlink removes the mounted checkout AND all phantom repo-derived specs, preserving manual specs
+  // RepoWorkspaceManager also permits sync and unlink even when activeRunChecker reports an active run.
+  const mgr = new RepoWorkspaceManager({
+    activeRunChecker: () => [run.id],
+  })
+  const syncedWhileActive = await mgr.syncRepos(dir, project.id, ['acme/demo-app'], undefined, {
+    patPath,
+    gitBaseUrl: `file://${originRoot}`,
+    allowLocalFileProtocol: true,
+  })
+  assert.equal(syncedWhileActive.length, 1)
+  assert.deepEqual(listMountedRepos(projectReposDir(dir, project.id)), ['/repos/acme/demo-app'])
+
+  // Unlink succeeds while the run is active, removes the checkout & phantom specs, and preserves manual specs.
   const unlinked = unlinkProjectRepoInStore(store, project.id, 'acme/demo-app')
   assert.deepEqual(unlinked, { unlinked: true, fullName: 'acme/demo-app' })
   assert.deepEqual(listMountedRepos(projectReposDir(dir, project.id)), [])
   const specsAfterUnlink = store.listProjectSpecs(project.id).map(s => s.name)
   assert.deepEqual(specsAfterUnlink, ['manual-notes.md'])
+
+  // Re-sync and unlink via RepoWorkspaceManager while run is still active also succeed cleanly.
+  await mgr.syncRepos(dir, project.id, ['acme/demo-app'], undefined, {
+    patPath,
+    gitBaseUrl: `file://${originRoot}`,
+    allowLocalFileProtocol: true,
+  })
+  const mgrUnlink = await mgr.unlinkRepo(dir, project.id, 'acme/demo-app')
+  assert.deepEqual(mgrUnlink, { unlinked: true, fullName: 'acme/demo-app' })
+  assert.deepEqual(listMountedRepos(projectReposDir(dir, project.id)), [])
 })
 
 test('orphan .tmp-* and .old-* checkout directories are deterministically cleaned up without touching real repos or symlink targets', async t => {
