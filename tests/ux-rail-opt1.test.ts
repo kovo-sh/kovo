@@ -4,6 +4,7 @@ import { join, resolve } from 'node:path'
 import test from 'node:test'
 import ts from 'typescript'
 import { isProjectTab, PROJECT_TABS } from '../src/components/project/types.ts'
+import { assertNever, isRunInProgress } from '../src/server/run-status.ts'
 
 const REPO_ROOT = resolve(import.meta.dirname, '..')
 
@@ -164,6 +165,8 @@ test('ProjectRunsTab status filter pills, scan mode badge mapping, and search fi
     'src/components/project/ProjectRunsTab.tsx',
     ['RUN_STATUS_FILTERS', 'matchesRunStatusFilter', 'scanModeBadgeInfo', 'filterProjectRuns'],
     {
+      assertNever,
+      isRunInProgress,
       runStatusLabel: (s: string) => s,
       phaseNames: { investigation: 'Investigation', complete: 'Complete', consent: 'Discovery consent' },
     },
