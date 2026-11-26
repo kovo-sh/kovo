@@ -72,7 +72,7 @@ test('classCompatible: exact class, CWE-family, alias, and missing class', () =>
   assert.ok(classCompatible({ vulnClass: 'bola' }, e)) // exact
   assert.ok(classCompatible({ cwe: 'CWE-285' }, e)) // same authz family
   assert.ok(classCompatible({ vulnClass: 'idor' }, e)) // alias -> authz
-  assert.ok(classCompatible({}, e)) // missing class -> endpoint-only
+  assert.ok(!classCompatible({}, e)) // missing class -> fail closed (cq-1)
   assert.ok(!classCompatible({ vulnClass: 'sqli' }, e))
   assert.ok(!classCompatible({ cwe: 'CWE-89' }, e))
 })

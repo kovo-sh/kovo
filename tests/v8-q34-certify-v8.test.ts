@@ -600,7 +600,8 @@ function makeMultihopReportJson(
     const unmatchedFalsePositives = list.reduce((n, c) => n + c.unmatchedFalsePositives, 0)
     const costUsd = list.reduce((n, c) => n + c.costUsd, 0)
     const durationMs = list.reduce((n, c) => n + c.durationMs, 0)
-    const worstRunPrecision = list.length ? Math.min(...list.map((c) => c.precision)) : 1
+    const nonNullPrecs = list.map((c) => c.precision).filter((p): p is number => p !== null)
+    const worstRunPrecision = nonNullPrecs.length ? Math.min(...nonNullPrecs) : null
     const allChains = list.flatMap((c) => c.chains)
     const totalFps = hardenedTwinDecoyFps + unmatchedFalsePositives
     return {
@@ -619,7 +620,7 @@ function makeMultihopReportJson(
       hardenedTwinsTotal,
       hardenedTwinDecoyFps,
       unmatchedFalsePositives,
-      hardenedTwinGatePassed: hardenedTwinDecoyFps === 0 && unmatchedFalsePositives === 0 && worstRunPrecision >= 1,
+      hardenedTwinGatePassed: hardenedTwinDecoyFps === 0 && unmatchedFalsePositives === 0 && (worstRunPrecision === null || worstRunPrecision >= 1),
       costUsd,
       durationMs,
       tpPerDollar: costUsd > 0 ? chainsConfirmed / costUsd : null,
@@ -780,7 +781,7 @@ test('M2 FAIL: decoy FP in hardenedTwins[] or unmatched FP fails worst-run preci
   const decoyReport = evaluateV8Certification({ gate: 'm2', cells: decoyCells })
   assert.equal(decoyReport.verdict, 'FAIL')
   assert.equal(decoyReport.precision.totalHardenedTwinDecoyFps, 1)
-  assert.ok(decoyReport.precision.worstRunPrecision < 1)
+  assert.ok(decoyReport.precision.worstRunPrecision !== null && decoyReport.precision.worstRunPrecision < 1)
   assert.ok(decoyReport.failedChecks.some((c) => c.id === 'precision_worst_run'))
   assert.ok(decoyReport.failedChecks.some((c) => c.id === 'm2_dev_twin_fps'))
 
@@ -801,7 +802,7 @@ test('M2 FAIL: decoy FP in hardenedTwins[] or unmatched FP fails worst-run preci
   const unmatchedReport = evaluateV8Certification({ gate: 'm2', cells: unmatchedCells })
   assert.equal(unmatchedReport.verdict, 'FAIL')
   assert.equal(unmatchedReport.precision.totalUnmatchedFalsePositives, 1)
-  assert.ok(unmatchedReport.precision.worstRunPrecision < 1)
+  assert.ok(unmatchedReport.precision.worstRunPrecision !== null && unmatchedReport.precision.worstRunPrecision < 1)
   assert.ok(unmatchedReport.failedChecks.some((c) => c.id === 'precision_worst_run'))
 })
 

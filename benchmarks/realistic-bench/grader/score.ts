@@ -48,7 +48,58 @@ interface VulnEval {
   confirmingFinding?: SubmittedFinding
 }
 
-export function gradeRun(input: GradeInput): Scorecard {
+export interface ValidUnplantedReplayEvidence {
+  serialReplayVerified: boolean
+  receiptHash: string
+  exchangeCount: number
+  verifiedAt?: string
+}
+
+export interface ValidUnplantedCandidate {
+  findingId: string
+  reason?: string
+  replayEvidence?: ValidUnplantedReplayEvidence | null
+}
+
+export interface ValidUnplantedEntry {
+  findingId: string
+  reason: string
+  replayEvidence: ValidUnplantedReplayEvidence
+}
+
+export interface GradeRunOptions {
+  /** Optional adjudicated unplanted candidates. Only entries backed by valid serial-replay
+   *  evidence enter the `validUnplanted` side column; they NEVER alter headline precision. */
+  validUnplantedCandidates?: readonly ValidUnplantedCandidate[]
+}
+
+export interface GradedScorecard extends Scorecard {
+  /** Headline pre-adjudication precision: TP / (TP + decoyFP + unmatchedFP + misclassified),
+   *  or `null` when the denominator is 0. Never excludes `validUnplanted` entries. */
+  rawPrecision: number | null
+  /** Replay-evidenced unplanted findings (strictly a side column; never feeds headline precision). */
+  validUnplanted: ValidUnplantedEntry[]
+  validUnplantedCount: number
+  validUnplantedRejected: Array<{ findingId: string; reason: string }>
+}
+
+/** Require deterministic serial-replay evidence before admitting any `validUnplanted` side entry. */
+export function validateValidUnplantedEvidence(
+  evidence: unknown,
+): evidence is ValidUnplantedReplayEvidence {
+  if (!evidence || typeof evidence !== 'object') return false
+  const rec = evidence as Record<string, unknown>
+  return (
+    rec.serialReplayVerified === true
+    && typeof rec.receiptHash === 'string'
+    && rec.receiptHash.trim().length >= 8
+    && typeof rec.exchangeCount === 'number'
+    && Number.isInteger(rec.exchangeCount)
+    && rec.exchangeCount >= 1
+  )
+}
+
+export function gradeRun(input: GradeInput, options?: GradeRunOptions): GradedScorecard {
   const { groundTruth: gt, findings, oracleEvents, requestLog, telemetry, mode } = input
   const active = findings.filter((f) => f.status !== 'ruled_out')
 
@@ -218,6 +269,44 @@ export function gradeRun(input: GradeInput): Scorecard {
   // by mislabelling; Phase-1 also requires `incompatibleClassCount === 0`.
   const strictDenom = denom + misclassified.length
   const strictPrecision = findings.length === 0 ? 1 : strictDenom === 0 ? 1 : tp / strictDenom
+  // Headline pre-adjudication precision (Item #2): charges every decoy, unmatched, and
+  // misclassified claim and fails closed to `null` when no findings are graded (denom === 0).
+  // `validUnplanted` is strictly a side column and NEVER reduces `rawPrecision` or `strictPrecision`.
+  const rawPrecision = strictDenom > 0 ? tp / strictDenom : null
+
+  const unmatchedIdSet = new Set(unmatched.map((f) => f.id))
+  const validUnplanted: ValidUnplantedEntry[] = []
+  const validUnplantedRejected: Array<{ findingId: string; reason: string }> = []
+  const seenUnplanted = new Set<string>()
+  for (const cand of options?.validUnplantedCandidates ?? []) {
+    if (!cand || typeof cand.findingId !== 'string' || !cand.findingId.trim()) continue
+    if (seenUnplanted.has(cand.findingId)) continue
+    seenUnplanted.add(cand.findingId)
+    if (!unmatchedIdSet.has(cand.findingId)) {
+      validUnplantedRejected.push({
+        findingId: cand.findingId,
+        reason: 'findingId is not an unmatched finding in this run',
+      })
+      continue
+    }
+    if (!validateValidUnplantedEvidence(cand.replayEvidence)) {
+      validUnplantedRejected.push({
+        findingId: cand.findingId,
+        reason: 'missing required serial-replay evidence (serialReplayVerified, receiptHash, exchangeCount >= 1)',
+      })
+      continue
+    }
+    validUnplanted.push({
+      findingId: cand.findingId,
+      reason: (cand.reason ?? '').trim() || 'replay-verified unplanted issue',
+      replayEvidence: {
+        serialReplayVerified: true,
+        receiptHash: cand.replayEvidence.receiptHash.trim(),
+        exchangeCount: cand.replayEvidence.exchangeCount,
+        ...(cand.replayEvidence.verifiedAt ? { verifiedAt: cand.replayEvidence.verifiedAt } : {}),
+      },
+    })
+  }
 
   const recallBySeverity = {} as Scorecard['recallBySeverity']
   for (const sev of severities) {
@@ -255,7 +344,11 @@ export function gradeRun(input: GradeInput): Scorecard {
     recallByClass,
     staticRecall: targets > 0 ? (confirmed + staticOnly) / targets : 0,
     precision,
+    rawPrecision,
     strictPrecision,
+    validUnplanted,
+    validUnplantedCount: validUnplanted.length,
+    validUnplantedRejected,
     incompatibleClassCount,
     decoys: gt.decoys.length,
     decoyFalsePositives,

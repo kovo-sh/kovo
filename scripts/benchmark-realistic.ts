@@ -81,6 +81,14 @@ import type {
 } from '../src/server/run-snapshot.ts'
 import { selectVerifierBackend } from './benchmark-backend.ts'
 import type { VerifierBackendKind } from './benchmark-backend.ts'
+import {
+  DEFAULT_LEDGER_PATH,
+  LEDGER_SCHEMA_VERSION,
+  appendLedgerRow,
+  computeBenchmarkVersion,
+  computeEffectiveConfig,
+  resolveGitState,
+} from './bench-ledger.ts'
 import type { WorkerBackend } from '../src/server/worker-backend.ts'
 import { LinuxWorkerBackend } from '../src/server/worker-backend.ts'
 
@@ -183,6 +191,8 @@ export interface RealisticArgs {
   snapshotRefresh: boolean
   /** Explicitly allow reusing a salted held-out checkpoint (refused by default). */
   allowHeldoutSnapshot: boolean
+  /** Optional versioned ledger path (`--ledger [path]`). */
+  ledgerPath?: string
   help: boolean
 }
 
@@ -399,7 +409,7 @@ export function parseRealisticArgs(argv: string[], env: NodeJS.ProcessEnv = proc
     'conventional-wordlist', 'no-conventional-wordlist', 'isolate-data-dir', 'keep-data-dirs',
     'allow-inert-workers', 'verifier', 'reuse-recon', 'refresh-recon', 'help',
     'snapshot-after-floor', 'resume-snapshot', 'snapshot-max-age-ms', 'snapshot-refresh',
-    'allow-heldout-snapshot',
+    'allow-heldout-snapshot', 'ledger',
   ])
   for (const key of Object.keys(a)) {
     if (!known.has(key)) fail(`unknown flag --${key}`)
@@ -560,6 +570,11 @@ export function parseRealisticArgs(argv: string[], env: NodeJS.ProcessEnv = proc
     snapshotMaxAgeMs,
     snapshotRefresh,
     allowHeldoutSnapshot: a['allow-heldout-snapshot'] === true,
+    ...(a.ledger === true
+      ? { ledgerPath: DEFAULT_LEDGER_PATH }
+      : typeof a.ledger === 'string'
+        ? { ledgerPath: a.ledger }
+        : {}),
     help: false,
   }
 }
@@ -901,6 +916,18 @@ export function withScorecardReportability<T extends Record<string, unknown>>(
 ): T & { wordlistOn: boolean; reportable: boolean } {
   const wordlistOn = Boolean(conventionalWordlist)
   return { ...artifact, wordlistOn, reportable: !wordlistOn }
+}
+
+/** Stamp benchmarkVersion & effectiveConfigHash onto a scorecard or summary artifact. */
+export function withScorecardVersion<T extends Record<string, unknown>>(
+  artifact: T,
+  stamp: { benchmarkVersion: string; effectiveConfigHash: string },
+): T & { benchmarkVersion: string; effectiveConfigHash: string } {
+  return {
+    ...artifact,
+    benchmarkVersion: stamp.benchmarkVersion,
+    effectiveConfigHash: stamp.effectiveConfigHash,
+  }
 }
 
 interface ExtractedEndpoint { method?: string; path: string }
@@ -3729,17 +3756,77 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
       durationMs: endedAt - startedAt,
     })
 
+    const { benchmarkVersion } = computeBenchmarkVersion('realistic-bench')
+    const { effectiveConfigHash, effectiveConfig } = computeEffectiveConfig({
+      deterministicOnly: args.noLlm,
+      environment: 'local-lab',
+      approvalPolicy: 'auto_review',
+      wordlistOn: args.conventionalWordlist,
+      verifierBackend: backendKind,
+      mode: args.mode,
+    })
+    const versionStamp = { benchmarkVersion, effectiveConfigHash }
+    ;(meta as unknown as Record<string, unknown>).benchmarkVersion = benchmarkVersion
+    ;(meta as unknown as Record<string, unknown>).effectiveConfigHash = effectiveConfigHash
+
     const jsonPath = join(args.outDir, `${slug}.json`)
     const mdPath = join(args.outDir, `${slug}.md`)
     const metaPath = join(args.outDir, `${slug}.meta.json`)
-    writeFileSync(jsonPath, `${JSON.stringify(withScorecardReportability(
-      withFalsePositiveEvidence(
-        card as unknown as Record<string, unknown>,
-        falsePositiveEvidence,
+    writeFileSync(jsonPath, `${JSON.stringify(withScorecardVersion(
+      withScorecardReportability(
+        withFalsePositiveEvidence(
+          card as unknown as Record<string, unknown>,
+          falsePositiveEvidence,
+        ),
+        args.conventionalWordlist,
       ),
-      args.conventionalWordlist,
+      versionStamp,
     ), null, 2)}\n`, { mode: 0o600 })
     writeFileSync(mdPath, `${renderScorecard(card, 'md')}\n`, { mode: 0o600 })
+    if (args.ledgerPath) {
+      const gitState = resolveGitState()
+      const graded = card as typeof card & {
+        rawPrecision?: number | null
+        validUnplantedCount?: number
+      }
+      const siteOutcomes: Record<string, string> = {}
+      for (const v of card.vulns) siteOutcomes[v.siteId] = v.outcome
+      appendLedgerRow({
+        schemaVersion: LEDGER_SCHEMA_VERSION,
+        recordedAt: new Date(endedAt).toISOString(),
+        suite: 'realistic-bench',
+        gitSha: gitState.gitSha,
+        dirty: gitState.dirty,
+        benchmarkVersion,
+        effectiveConfigHash,
+        effectiveConfig,
+        app,
+        split: started.plan.seedSet,
+        mode: args.mode,
+        llm: model.mode === 'agentic' ? 'agentic' : 'deterministic-no-llm',
+        seed,
+        repeat: 1,
+        certifying: false,
+        reportable: !args.conventionalWordlist,
+        status: meta.inert ? 'INVALID' : 'VALID',
+        targets: card.targets,
+        confirmed: card.confirmed,
+        recall: meta.inert ? null : card.recall,
+        rawPrecision: graded.rawPrecision ?? (
+          card.confirmed + card.decoyFalsePositives + card.unmatchedFalsePositives > 0
+            ? card.confirmed / (card.confirmed + card.decoyFalsePositives + card.unmatchedFalsePositives)
+            : null
+        ),
+        strictPrecision: card.strictPrecision,
+        precision: card.precision,
+        decoyFalsePositives: card.decoyFalsePositives,
+        unmatchedFalsePositives: card.unmatchedFalsePositives,
+        validUnplantedCount: graded.validUnplantedCount ?? 0,
+        costUsd: card.totalCostUsd,
+        durationMs: endedAt - startedAt,
+        siteOutcomes,
+      }, args.ledgerPath)
+    }
 
     return { meta, scorecard: card, jsonPath, mdPath, metaPath }
   } finally {
@@ -3817,13 +3904,23 @@ async function runWithConcurrency<T, R>(
 function writeSummary(outDir: string, results: CellResult[]): void {
   const cards = results.map(r => r.scorecard)
   const wordlistOn = results.some(r => r.meta.wordlistOn)
+  const firstMeta = results[0]?.meta as unknown as Record<string, unknown> | undefined
+  const benchmarkVersion = typeof firstMeta?.benchmarkVersion === 'string'
+    ? firstMeta.benchmarkVersion
+    : computeBenchmarkVersion('realistic-bench').benchmarkVersion
+  const effectiveConfigHash = typeof firstMeta?.effectiveConfigHash === 'string'
+    ? firstMeta.effectiveConfigHash
+    : computeEffectiveConfig({ wordlistOn }).effectiveConfigHash
   const rendered = renderScorecard(cards, 'json')
   try {
     const parsed = JSON.parse(rendered) as unknown
     if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
       writeFileSync(
         join(outDir, 'summary.json'),
-        `${JSON.stringify(withScorecardReportability(parsed as Record<string, unknown>, wordlistOn), null, 2)}\n`,
+        `${JSON.stringify(withScorecardVersion(
+          withScorecardReportability(parsed as Record<string, unknown>, wordlistOn),
+          { benchmarkVersion, effectiveConfigHash },
+        ), null, 2)}\n`,
         { mode: 0o600 },
       )
     } else {

@@ -1,0 +1,4 @@
+# Burned realistic-bench held-out seeds (demoted to dev-2 only; refused for certification).
+# See plans/claude_quality.md Item #2 (versioned-results-ledger-heldout-hygiene).
+# Seed 1000042 was autopsied target-by-target and tuned against during v6/v7 development.
+1000042

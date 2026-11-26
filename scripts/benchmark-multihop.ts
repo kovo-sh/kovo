@@ -92,6 +92,14 @@ import type {
   ModelInfo,
   SnapshotRunMeta,
 } from './benchmark-realistic.ts'
+import {
+  DEFAULT_LEDGER_PATH,
+  LEDGER_SCHEMA_VERSION,
+  appendLedgerRow,
+  computeBenchmarkVersion,
+  computeEffectiveConfig,
+  resolveGitState,
+} from './bench-ledger.ts'
 
 // ---------------------------------------------------------------------------------------------
 // Lazy runtime contract with benchmarks/multihop-saas/run.ts
@@ -246,7 +254,7 @@ export interface MultihopScorecard {
   chainsCompositeConfirmed?: number
   chainsConfirmed: number
   recall?: number
-  precision: number
+  precision: number | null
   hardenedTwinsTotal?: number
   hardenedTwinDecoyFps?: number
   decoys?: number
@@ -358,6 +366,7 @@ export interface MultihopArgs {
   curveFrom: string[]
   jsonPath?: string
   mdPath?: string
+  ledgerPath?: string
   listSeeds: boolean
   help: boolean
 }
@@ -529,7 +538,7 @@ export function parseMultihopArgs(argv: string[], env: NodeJS.ProcessEnv = proce
     'data-dir', 'keep-data-dirs',
     'allow-inert-workers', 'snapshot-after-floor', 'resume-snapshot', 'snapshot-max-age-ms',
     'snapshot-refresh', 'allow-heldout-snapshot', 'floor-from', 'curve-from', 'out-dir',
-    'json', 'md', 'list-seeds', 'help',
+    'json', 'md', 'ledger', 'list-seeds', 'help',
   ])
   for (const key of Object.keys(a)) {
     if (!known.has(key)) {
@@ -689,6 +698,11 @@ export function parseMultihopArgs(argv: string[], env: NodeJS.ProcessEnv = proce
     curveFrom: parseDirList(stringFlag(a, 'curve-from')),
     ...(stringFlag(a, 'json') ? { jsonPath: resolve(stringFlag(a, 'json')!) } : {}),
     ...(stringFlag(a, 'md') ? { mdPath: resolve(stringFlag(a, 'md')!) } : {}),
+    ...(a.ledger === true
+      ? { ledgerPath: DEFAULT_LEDGER_PATH }
+      : stringFlag(a, 'ledger')
+        ? { ledgerPath: stringFlag(a, 'ledger')! }
+        : {}),
     listSeeds: a['list-seeds'] === true,
     help: false,
   }
@@ -2476,8 +2490,112 @@ export function aggregateMultihopTelemetry(
 // Cell metadata, artifacts & execution
 // ---------------------------------------------------------------------------------------------
 
+/**
+ * Structured, redacted per-finding summary for unmatched or decoy findings serialized into
+ * v8 `.meta.json` (Gap #3 parity: zero raw HTTP bodies or secrets; enables FP triage without
+ * `--keep-data-dirs`).
+ */
+export interface MultihopUnmatchedFindingSummary {
+  findingId: string
+  status: string
+  findingKind: string | null
+  verificationTier: string | null
+  verificationClass: string | null
+  cwe: string | null
+  route: string | null
+  title: string
+}
+
+function sanitizeRouteSummary(
+  finding: Finding,
+  submittedMatch: SubmittedFinding | undefined,
+  secrets: readonly NamedSecret[],
+): string | null {
+  const ep = submittedMatch?.endpoints?.[0]
+  if (ep?.path) {
+    const cleanPath = ep.path.split('?')[0]!.split('#')[0]!
+    const method = ep.method ? `${ep.method.toUpperCase()} ` : ''
+    return redact(`${method}${cleanPath}`, secrets).slice(0, 160)
+  }
+  const rawRec = finding as unknown as Record<string, unknown>
+  const routeVal = typeof rawRec.route === 'string'
+    ? rawRec.route
+    : typeof rawRec.endpoint === 'string'
+      ? rawRec.endpoint
+      : null
+  if (routeVal) {
+    const cleanPath = routeVal.split('?')[0]!.split('#')[0]!
+    return redact(cleanPath, secrets).slice(0, 160)
+  }
+  return null
+}
+
+/**
+ * Build structured, secret-free summaries of all active findings that did NOT match a two-side
+ * confirmed chain (unmatched FPs or hardened-twin hits) for `.meta.json`.
+ */
+export function buildUnmatchedFindingsDetail(input: {
+  findings: readonly Finding[]
+  submitted: readonly SubmittedFinding[]
+  chains: readonly MultihopChainVerdict[]
+  hardenedTwins?: readonly MultihopTwinVerdict[]
+  secrets?: readonly NamedSecret[]
+}): MultihopUnmatchedFindingSummary[] {
+  const secrets = input.secrets ?? []
+  const confirmedFindingIds = new Set<string>()
+  for (const ch of input.chains) {
+    if (!ch.twoSideConfirmed) continue
+    for (const id of ch.matchedFindingIds ?? []) confirmedFindingIds.add(id)
+  }
+  const submittedById = new Map<string, SubmittedFinding>()
+  for (const sub of input.submitted) submittedById.set(sub.id, sub)
+
+  const out: MultihopUnmatchedFindingSummary[] = []
+  for (const f of input.findings) {
+    const statusStr = String(f.status)
+    if (statusStr === 'dismissed' || statusStr === 'ruled_out') continue
+    if (confirmedFindingIds.has(f.id)) continue
+    const rec = f as unknown as Record<string, unknown>
+    const sub = submittedById.get(f.id)
+    const verificationTier =
+      typeof rec.verificationTier === 'string'
+        ? rec.verificationTier
+        : typeof rec.verificationStatus === 'string'
+          ? rec.verificationStatus
+          : null
+    const verificationClass =
+      typeof rec.verificationClass === 'string'
+        ? rec.verificationClass
+        : typeof sub?.vulnClass === 'string'
+          ? sub.vulnClass
+          : typeof rec.category === 'string'
+            ? rec.category
+            : null
+    const cwe =
+      typeof f.cwe === 'string' && f.cwe.trim()
+        ? f.cwe.trim()
+        : typeof sub?.cwe === 'string' && sub.cwe.trim()
+          ? sub.cwe.trim()
+          : null
+    out.push({
+      findingId: f.id,
+      status: String(f.status),
+      findingKind: typeof rec.findingKind === 'string' ? rec.findingKind : null,
+      verificationTier,
+      verificationClass,
+      cwe,
+      route: sanitizeRouteSummary(f, sub, secrets),
+      title: redact(String(f.title ?? ''), secrets).replace(/\s+/g, ' ').trim().slice(0, 160),
+    })
+  }
+  return out
+}
+
 export interface MultihopCellMeta {
   schemaVersion: 1
+  status?: 'VALID' | 'INVALID'
+  benchmarkVersion?: string
+  effectiveConfigHash?: string
   app: MultihopAppName
   sealed: boolean
   seed: number
@@ -2516,10 +2634,11 @@ export interface MultihopCellMeta {
   shortcutViolations: number
   modeBViolations: number
   recall: number
-  precision: number
+  precision: number | null
   hardenedTwinsTotal: number
   hardenedTwinDecoyFps: number
   unmatchedFalsePositives: number
+  unmatchedFindingsDetail?: MultihopUnmatchedFindingSummary[]
   costUsd: number
   tpPerDollar: number | null
   tpPer10m: number | null
@@ -3208,7 +3327,24 @@ export async function runCell(
     )
     const unmatchedFalsePositives = num(card.unmatchedFalsePositives)
     const totalFps = hardenedTwinDecoyFps + unmatchedFalsePositives
-    const precision = chainsConfirmed + totalFps > 0 ? ratio(chainsConfirmed, chainsConfirmed + totalFps) : 1
+    // Fail closed: empty cells (tp + fp === 0) report precision = null, never 1.
+    const precision: number | null = chainsConfirmed + totalFps > 0 ? ratio(chainsConfirmed, chainsConfirmed + totalFps) : null
+    const unmatchedFindingsDetail = buildUnmatchedFindingsDetail({
+      findings: detail.findings as Finding[],
+      submitted,
+      chains: twoSide.verdicts,
+      hardenedTwins,
+      secrets: cellSecrets,
+    })
+    const { benchmarkVersion } = computeBenchmarkVersion('multihop-saas')
+    const { effectiveConfigHash } = computeEffectiveConfig({
+      deterministicOnly: args.noLlm,
+      environment: 'local-lab',
+      approvalPolicy: 'auto_review',
+      wordlistOn: false,
+      verifierBackend: backendKind,
+      mode: args.mode,
+    })
     const costUsd = num(card.totalCostUsd, finalRun.spentUsd)
     const efficiency = computeEfficiencyMetrics({ confirmedChains: chainsConfirmed, costUsd, durationMs })
 
@@ -3243,6 +3379,9 @@ export async function runCell(
 
     const meta: MultihopCellMeta = {
       schemaVersion: 1,
+      status: inert ? 'INVALID' : 'VALID',
+      benchmarkVersion,
+      effectiveConfigHash,
       app,
       sealed,
       seed,
@@ -3285,6 +3424,7 @@ export async function runCell(
       hardenedTwinsTotal,
       hardenedTwinDecoyFps,
       unmatchedFalsePositives,
+      unmatchedFindingsDetail,
       costUsd,
       tpPerDollar: efficiency.tpPerDollar,
       tpPer10m: efficiency.tpPer10m,
@@ -3390,6 +3530,8 @@ export async function runCell(
 // ---------------------------------------------------------------------------------------------
 
 export interface MultihopAggregate {
+  status?: 'VALID' | 'INVALID'
+  failedCells?: number
   cells: number
   chainsTotal: number
   chainsOracleObserved: number
@@ -3399,9 +3541,9 @@ export interface MultihopAggregate {
   receiptOnlyCount: number
   shortcutViolations: number
   modeBViolations: number
-  recall: number
-  precision: number
-  worstRunPrecision: number
+  recall: number | null
+  precision: number | null
+  worstRunPrecision: number | null
   hardenedTwinsTotal: number
   hardenedTwinDecoyFps: number
   unmatchedFalsePositives: number
@@ -3416,7 +3558,10 @@ export interface MultihopAggregate {
   assignmentsTotal: number
 }
 
-export function aggregateMultihopCells(cells: readonly MultihopCellMeta[]): MultihopAggregate {
+export function aggregateMultihopCells(
+  cells: readonly MultihopCellMeta[],
+  failedCells = 0,
+): MultihopAggregate {
   let chainsTotal = 0
   let chainsOracleObserved = 0
   let chainsCompositeConfirmed = 0
@@ -3432,11 +3577,13 @@ export function aggregateMultihopCells(cells: readonly MultihopCellMeta[]): Mult
   let durationMs = 0
   let assignmentsCompleted = 0
   let assignmentsTotal = 0
-  let worstRunPrecision = 1
+  let worstRunPrecision: number | null = null
+  let invalidCellCount = Math.max(0, failedCells)
   const allChains: MultihopChainVerdict[] = []
   const funnels: HopDepthFunnel[] = []
 
   for (const cell of cells) {
+    if (cell.status === 'INVALID' || cell.inert) invalidCellCount += 1
     chainsTotal += cell.chainsTotal
     chainsOracleObserved += cell.chainsOracleObserved
     chainsCompositeConfirmed += cell.chainsCompositeConfirmed
@@ -3452,15 +3599,27 @@ export function aggregateMultihopCells(cells: readonly MultihopCellMeta[]): Mult
     durationMs += cell.durationMs
     assignmentsCompleted += cell.assignmentsCompleted
     assignmentsTotal += cell.assignmentsTotal
-    worstRunPrecision = Math.min(worstRunPrecision, cell.precision)
+    const cellTotalFps = cell.hardenedTwinDecoyFps + cell.unmatchedFalsePositives
+    const cellPrecision =
+      cell.chainsConfirmed + cellTotalFps > 0
+        ? (typeof cell.precision === 'number' && Number.isFinite(cell.precision)
+            ? Math.min(cell.precision, ratio(cell.chainsConfirmed, cell.chainsConfirmed + cellTotalFps))
+            : ratio(cell.chainsConfirmed, cell.chainsConfirmed + cellTotalFps))
+        : null
+    if (cellPrecision !== null) {
+      worstRunPrecision = worstRunPrecision === null ? cellPrecision : Math.min(worstRunPrecision, cellPrecision)
+    }
     funnels.push(cell.hopFunnel)
     for (const chain of cell.chains) allChains.push(chain)
   }
 
+  const status: 'VALID' | 'INVALID' = invalidCellCount > 0 ? 'INVALID' : 'VALID'
   const totalFps = hardenedTwinDecoyFps + unmatchedFalsePositives
-  const precision = chainsConfirmed + totalFps > 0 ? ratio(chainsConfirmed, chainsConfirmed + totalFps) : 1
+  const precision: number | null = chainsConfirmed + totalFps > 0 ? ratio(chainsConfirmed, chainsConfirmed + totalFps) : null
   const eff = computeEfficiencyMetrics({ confirmedChains: chainsConfirmed, costUsd, durationMs })
   return {
+    status,
+    failedCells: invalidCellCount,
     cells: cells.length,
     chainsTotal,
     chainsOracleObserved,
@@ -3470,13 +3629,17 @@ export function aggregateMultihopCells(cells: readonly MultihopCellMeta[]): Mult
     receiptOnlyCount,
     shortcutViolations,
     modeBViolations,
-    recall: ratio(chainsConfirmed, chainsTotal),
+    recall: status === 'INVALID' ? null : ratio(chainsConfirmed, chainsTotal),
     precision,
-    worstRunPrecision: cells.length ? worstRunPrecision : 1,
+    worstRunPrecision,
     hardenedTwinsTotal,
     hardenedTwinDecoyFps,
     unmatchedFalsePositives,
-    hardenedTwinGatePassed: hardenedTwinDecoyFps === 0 && unmatchedFalsePositives === 0 && worstRunPrecision >= 1,
+    hardenedTwinGatePassed:
+      status === 'VALID'
+      && hardenedTwinDecoyFps === 0
+      && unmatchedFalsePositives === 0
+      && (worstRunPrecision === null || worstRunPrecision >= 1),
     costUsd,
     durationMs,
     tpPerDollar: eff.tpPerDollar,
@@ -3519,10 +3682,10 @@ export function evaluateAntiHeuristicGate(
   })))
   return {
     ceiling,
-    recall: agg.recall,
+    recall: agg.recall ?? 0,
     confirmed: agg.chainsConfirmed,
     targets: agg.chainsTotal,
-    passed: agg.recall <= ceiling,
+    passed: agg.status === 'VALID' && agg.recall !== null && agg.recall <= ceiling,
     chains,
   }
 }
@@ -3543,7 +3706,7 @@ export function floorBaseline(cells: readonly MultihopCellMeta[]): MultihopFloor
 }
 
 export interface MultihopLift {
-  agenticRecall: number
+  agenticRecall: number | null
   floorRecall: number | null
   deltaReasoning: number | null
   costUsd: number
@@ -3559,7 +3722,7 @@ export function computeMultihopLift(
   return {
     agenticRecall: agg.recall,
     floorRecall: floor ? floor.recall : null,
-    deltaReasoning: floor && agentic.length ? agg.recall - floor.recall : null,
+    deltaReasoning: floor && agentic.length && agg.recall !== null ? agg.recall - floor.recall : null,
     costUsd: agg.costUsd,
     tpPerDollar: agg.tpPerDollar,
     tpPer10m: agg.tpPer10m,
@@ -3572,7 +3735,7 @@ export interface MultihopCurveRow {
   cells: number
   chainsTotal: number
   chainsConfirmed: number
-  recall: number
+  recall: number | null
   hardenedTwinDecoyFps: number
   costUsd: number
   tpPerDollar: number | null
@@ -3609,6 +3772,10 @@ export function budgetDurationCurve(cells: readonly MultihopCellMeta[]): Multiho
 
 export interface MultihopReport {
   schemaVersion: 1
+  status?: 'VALID' | 'INVALID'
+  failedCells?: number
+  benchmarkVersion?: string
+  effectiveConfigHash?: string
   generatedAt: string
   gitSha: string
   cells: MultihopCellMeta[]
@@ -3627,17 +3794,22 @@ export function buildMultihopReport(
   cells: MultihopCellMeta[],
   floorCells: MultihopCellMeta[],
   gitSha: string,
+  opts: { failedCells?: number; benchmarkVersion?: string; effectiveConfigHash?: string } = {},
 ): MultihopReport {
+  const failedCells = Math.max(0, opts.failedCells ?? 0)
   const agenticCells = cells.filter(c => c.llm === 'agentic')
   const floorRunCells = cells.filter(c => c.llm === 'deterministic-no-llm')
   const allFloor = floorCells.length ? floorCells : floorRunCells
   const floor = floorBaseline(allFloor)
-  const agentic = aggregateMultihopCells(agenticCells)
-  const floorRun = floorRunCells.length ? aggregateMultihopCells(floorRunCells) : null
-  const allAgg = aggregateMultihopCells(cells)
+  const agentic = aggregateMultihopCells(agenticCells, failedCells)
+  const floorRun = floorRunCells.length ? aggregateMultihopCells(floorRunCells, failedCells) : null
+  const allAgg = aggregateMultihopCells(cells, failedCells)
   const telemetry = aggregateMultihopTelemetry(agenticCells.length ? agenticCells : cells)
 
   const notes: string[] = []
+  if (allAgg.status === 'INVALID') {
+    notes.push(`INVALID report: ${allAgg.failedCells} cell(s) failed or were inert; aggregate recall suppressed`)
+  }
   if (agenticCells.length && !floor) {
     notes.push('no --no-llm floor cells supplied: ΔReasoning is n/a (pass --floor-from <dir> or run --no-llm)')
   }
@@ -3648,8 +3820,15 @@ export function buildMultihopReport(
     notes.push('held-out cells use salted seeds; KOVO_RB_HELDOUT_SALT is never persisted in any artifact')
   }
 
+  const benchmarkVersion = opts.benchmarkVersion ?? cells.find(c => c.benchmarkVersion)?.benchmarkVersion
+  const effectiveConfigHash = opts.effectiveConfigHash ?? cells.find(c => c.effectiveConfigHash)?.effectiveConfigHash
+
   return {
     schemaVersion: 1,
+    status: allAgg.status,
+    failedCells: allAgg.failedCells,
+    ...(benchmarkVersion ? { benchmarkVersion } : {}),
+    ...(effectiveConfigHash ? { effectiveConfigHash } : {}),
     generatedAt: new Date().toISOString(),
     gitSha,
     cells,
@@ -3665,7 +3844,7 @@ export function buildMultihopReport(
   }
 }
 
-const pct = (n: number): string => `${(n * 100).toFixed(1)}%`
+const pct = (n: number | null): string => (n === null ? 'n/a' : `${(n * 100).toFixed(1)}%`)
 const fmtMs = (ms: number | null): string => (ms === null ? 'n/a' : `${(ms / 1000).toFixed(1)}s (${ms}ms)`)
 
 function mdTable(headers: string[], rows: string[][]): string {
@@ -3875,14 +4054,25 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
   const ok = results.filter((r): r is MultihopCellResult => !('error' in r))
   let exitCode = 0
 
-  if (ok.length) {
+  if (ok.length || failures.length) {
     const currentMeta = ok.map(r => r.meta)
     const floorExtra = readMetaArtifacts(args.floorFrom).filter(c => c.llm === 'deterministic-no-llm')
     const curveExtra = readMetaArtifacts(args.curveFrom)
+    const { benchmarkVersion } = computeBenchmarkVersion('multihop-saas')
+    const { effectiveConfigHash, effectiveConfig } = computeEffectiveConfig({
+      deterministicOnly: args.noLlm,
+      environment: 'local-lab',
+      approvalPolicy: 'auto_review',
+      wordlistOn: false,
+      verifierBackend: args.verifier,
+      mode: args.mode,
+    })
+    const gitState = resolveGitState()
     const report = buildMultihopReport(
       currentMeta,
       currentMeta.filter(c => c.llm === 'deterministic-no-llm').concat(floorExtra),
-      resolveGitSha(),
+      gitState.gitSha,
+      { failedCells: failures.length, benchmarkVersion, effectiveConfigHash },
     )
     if (curveExtra.length) report.curve = budgetDurationCurve(currentMeta.concat(curveExtra))
 
@@ -3892,6 +4082,45 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     writeOwnerOnly(mdPath, `${renderMultihopReport(report, 'md')}\n`)
     process.stdout.write(`\nwrote ${jsonPath}\nwrote ${mdPath}\n`)
 
+    if (args.ledgerPath) {
+      for (const cellMeta of currentMeta) {
+        const siteOutcomes: Record<string, string> = {}
+        for (const ch of cellMeta.chains) {
+          siteOutcomes[ch.chainId] = ch.twoSideConfirmed ? 'confirmed' : (ch.dropReason ?? 'missed')
+        }
+        appendLedgerRow({
+          schemaVersion: LEDGER_SCHEMA_VERSION,
+          recordedAt: report.generatedAt,
+          suite: 'multihop-saas',
+          gitSha: gitState.gitSha,
+          dirty: gitState.dirty,
+          benchmarkVersion: cellMeta.benchmarkVersion ?? benchmarkVersion,
+          effectiveConfigHash: cellMeta.effectiveConfigHash ?? effectiveConfigHash,
+          effectiveConfig,
+          app: cellMeta.app,
+          split: cellMeta.sealed ? 'sealed' : cellMeta.seedSet,
+          mode: cellMeta.mode,
+          llm: cellMeta.llm,
+          seed: cellMeta.seed,
+          repeat: 1,
+          certifying: false,
+          reportable: true,
+          status: cellMeta.status ?? (cellMeta.inert ? 'INVALID' : 'VALID'),
+          targets: cellMeta.chainsTotal,
+          confirmed: cellMeta.chainsConfirmed,
+          recall: cellMeta.status === 'INVALID' || cellMeta.inert ? null : cellMeta.recall,
+          rawPrecision: cellMeta.precision,
+          strictPrecision: cellMeta.precision,
+          precision: cellMeta.precision,
+          decoyFalsePositives: cellMeta.hardenedTwinDecoyFps,
+          unmatchedFalsePositives: cellMeta.unmatchedFalsePositives,
+          costUsd: cellMeta.costUsd,
+          durationMs: cellMeta.durationMs,
+          siteOutcomes,
+        }, args.ledgerPath)
+      }
+    }
+
     if (report.antiHeuristicGate && !report.antiHeuristicGate.passed) {
       process.stderr.write(
         `error: Anti-Heuristic Gate FAILED: --no-llm chain recall ${pct(report.antiHeuristicGate.recall)} `
@@ -3900,10 +4129,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       exitCode = Math.max(exitCode, 3)
     }
 
-    if (!report.hardenedTwinGatePassed) {
-      const agg = aggregateMultihopCells(currentMeta)
+    if (ok.length && !report.hardenedTwinGatePassed) {
+      const agg = aggregateMultihopCells(currentMeta, failures.length)
       process.stderr.write(
-        `error: Hardened-Twin / Precision Gate FAILED: hardenedTwinDecoyFps=${agg.hardenedTwinDecoyFps}, `
+        `error: Hardened-Twin / Precision Gate FAILED: status=${agg.status}, hardenedTwinDecoyFps=${agg.hardenedTwinDecoyFps}, `
         + `unmatchedFalsePositives=${agg.unmatchedFalsePositives}, worstRunPrecision=${pct(agg.worstRunPrecision)}\n`,
       )
       exitCode = Math.max(exitCode, 4)

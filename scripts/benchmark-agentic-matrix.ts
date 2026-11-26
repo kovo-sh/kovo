@@ -31,6 +31,17 @@ import {
 } from './benchmark-parallel.ts'
 import type { AimdStats } from './benchmark-parallel.ts'
 import { prepareIsolatedDataDir } from './benchmark-realistic.ts'
+import {
+  CERTIFYING_MIN_HELDOUT_SEEDS,
+  DEFAULT_LEDGER_PATH,
+  LEDGER_SCHEMA_VERSION,
+  appendLedgerRow,
+  assertNoBurnedSeeds,
+  computeBenchmarkVersion,
+  computeEffectiveConfig,
+  drawUnburnedHeldoutSeeds,
+  resolveGitState,
+} from './bench-ledger.ts'
 
 export const MATRIX_KNOWN_APPS = ['acme-saas', 'shopflow', 'opsportal'] as const
 export const MATRIX_KNOWN_MODES = ['black-box', 'grey-box', 'white-box'] as const
@@ -78,6 +89,14 @@ export interface MatrixArgs {
   maxInFlightStreams?: number
   /** Per-cell prepared data-dir override (gate-routed profiles); keyed by cell label. */
   dataDirOverrides?: Record<string, string>
+  /** Explicit dev-2 debugging escape hatch for burned seeds; always stamps non-certifying. */
+  allowBurnedDev?: boolean
+  /** True when the invocation qualifies as a certifying held-out run (n >= 3 fresh unburned seeds, non-smoke). */
+  certifying?: boolean
+  /** Reason the matrix is non-certifying (e.g. smoke-tier, burned-dev-seed, dev-only), or null. */
+  nonCertifyingReason?: string | null
+  /** Optional ledger JSONL path to append cell rows after completion. */
+  ledgerPath?: string | null
   help: boolean
 }
 
@@ -251,12 +270,19 @@ export function parseMatrixArgs(
     'apps', 'seeds', 'modes', 'budget-usd', 'max-duration-ms', 'concurrency',
     'out-dir', 'data-dir', 'no-llm', 'verifier', 'keep-data-dirs', 'smoke',
     'timeout-ms', 'min-free-gb', 'max-workers', 'no-warm-workers', 'warm-workers',
-    'no-model-gate', 'model-gate', 'max-inflight-streams', 'help',
+    'no-model-gate', 'model-gate', 'max-inflight-streams',
+    'held-out', 'certify', 'allow-burned-dev', 'ledger', 'help',
   ])
   for (const key of Object.keys(flags)) if (!known.has(key)) fail(`unknown flag --${key}`)
 
   const smoke = flags.smoke === true
   const help = flags.help === true
+  const heldOutFlag = flags['held-out'] === true
+  const certifyFlag = flags.certify === true
+  const allowBurnedDev = flags['allow-burned-dev'] === true
+  const ledgerPath = flags.ledger === true
+    ? DEFAULT_LEDGER_PATH
+    : (typeof flags.ledger === 'string' ? flags.ledger : null)
 
   const stringFlag = (key: string): string | undefined => (typeof flags[key] === 'string' ? flags[key] as string : undefined)
   const boolFlag = (key: string): boolean => flags[key] === true
@@ -267,12 +293,29 @@ export function parseMatrixArgs(
     ? [...MATRIX_KNOWN_APPS]
     : parseList(appsRaw, '--apps', MATRIX_KNOWN_APPS)
 
-  const seedsRaw = stringFlag('seeds') ?? '1'
-  const seeds = [...new Set(seedsRaw.split(',').map(s => s.trim()).filter(Boolean).map(s => {
-    const n = Number(s)
-    if (!Number.isInteger(n) || n <= 0) fail(`seed '${s}' must be a positive integer`)
-    return n
-  }))]
+  if (certifyFlag && smoke) fail('--smoke is non-certifying and cannot be combined with --certify')
+  if (certifyFlag && allowBurnedDev) {
+    fail('--allow-burned-dev is for dev-2 debugging only (non-certifying) and cannot be combined with --certify')
+  }
+
+  let seeds: number[]
+  const seedsRaw = stringFlag('seeds')
+  if (seedsRaw !== undefined) {
+    seeds = [...new Set(seedsRaw.split(',').map(s => s.trim()).filter(Boolean).map(s => {
+      const n = Number(s)
+      if (!Number.isInteger(n) || n <= 0) fail(`seed '${s}' must be a positive integer`)
+      return n
+    }))]
+  } else if (heldOutFlag || certifyFlag) {
+    const salt = env.KOVO_RB_HELDOUT_SALT ?? ''
+    if (salt.length < 16) {
+      fail('held-out seeds (>= 1000000) require KOVO_RB_HELDOUT_SALT (>= 16 chars)')
+    }
+    const drawCount = smoke ? 1 : CERTIFYING_MIN_HELDOUT_SEEDS
+    seeds = drawUnburnedHeldoutSeeds(drawCount, salt)
+  } else {
+    seeds = [1]
+  }
   if (!seeds.length) fail('at least one seed is required')
 
   const modes = stringFlag('modes') === undefined
@@ -315,6 +358,34 @@ export function parseMatrixArgs(
   if (heldOutSeeds.length && (env.KOVO_RB_HELDOUT_SALT ?? '').length < 16) {
     fail('held-out seeds (>= 1000000) require KOVO_RB_HELDOUT_SALT (>= 16 chars)')
   }
+  const burnedCheck = assertNoBurnedSeeds(seeds, {
+    allowBurnedDev,
+    context: 'benchmark-agentic-matrix',
+  })
+  if (certifyFlag && heldOutSeeds.length < CERTIFYING_MIN_HELDOUT_SEEDS) {
+    fail(
+      `--certify requires >= ${CERTIFYING_MIN_HELDOUT_SEEDS} fresh unburned salted held-out seeds `
+        + `(got ${heldOutSeeds.length})`,
+    )
+  }
+
+  let certifying = false
+  let nonCertifyingReason: string | null = null
+  if (smoke) {
+    certifying = false
+    nonCertifyingReason = 'smoke-tier (n=1, non-certifying)'
+  } else if (allowBurnedDev || burnedCheck.burned.length > 0) {
+    certifying = false
+    nonCertifyingReason = `burned-dev-seed (${burnedCheck.burned.join(',') || 'allow-burned-dev'})`
+  } else if (heldOutSeeds.length >= CERTIFYING_MIN_HELDOUT_SEEDS) {
+    certifying = true
+    nonCertifyingReason = null
+  } else {
+    certifying = false
+    nonCertifyingReason = heldOutSeeds.length > 0
+      ? `insufficient-heldout-seeds (${heldOutSeeds.length} < ${CERTIFYING_MIN_HELDOUT_SEEDS})`
+      : 'dev-only'
+  }
 
   return {
     apps,
@@ -335,6 +406,10 @@ export function parseMatrixArgs(
     warmWorkers,
     modelGate,
     maxInFlightStreams,
+    allowBurnedDev,
+    certifying,
+    nonCertifyingReason,
+    ledgerPath,
     help,
   }
 }
@@ -774,7 +849,11 @@ Usage:
 
 Flags:
   --apps a,b              ${MATRIX_KNOWN_APPS.join(' | ')} (default: all)
-  --seeds 1,1000042       dev (1..9999) and/or held-out (>= 1000000) seeds
+  --seeds 1,...           dev (1..9999) and/or unburned held-out (>= 1000000) seeds
+  --held-out              draw ${CERTIFYING_MIN_HELDOUT_SEEDS} fresh unburned salted seeds (1 in --smoke)
+  --certify               require >= ${CERTIFYING_MIN_HELDOUT_SEEDS} fresh unburned held-out seeds (refuses --smoke/--allow-burned-dev)
+  --allow-burned-dev      dev-2 debugging only: allow seeds in BURNED_SEEDS (stamps certifying=false)
+  --ledger [path]         append cell rows to versioned ledger (default: ${DEFAULT_LEDGER_PATH})
   --modes m,...           ${MATRIX_KNOWN_MODES.join(' | ')} (default: grey-box)
   --budget-usd <n>        per-cell USD budget (default: ${DEFAULT_MATRIX_BUDGET_USD})
   --max-duration-ms <n>   per-cell wall cap (default: ${DEFAULT_MATRIX_MAX_DURATION_MS})
@@ -889,13 +968,30 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
     await new Promise(resolvePromise => setTimeout(resolvePromise, 250))
     orphans = await reaper.orphans()
     const totals = summarizeMatrix(results)
+    const { benchmarkVersion } = computeBenchmarkVersion('realistic-bench')
+    const { effectiveConfigHash, effectiveConfig } = computeEffectiveConfig({
+      deterministicOnly: args.noLlm,
+      environment: 'local-lab',
+      approvalPolicy: 'auto_review',
+      wordlistOn: false,
+      verifierBackend: args.verifier,
+      mode: args.modes.join(','),
+    })
+    const gitState = resolveGitState()
     const matrix = {
       generatedAt: new Date().toISOString(),
+      gitSha: gitState.gitSha,
+      dirty: gitState.dirty,
+      benchmarkVersion,
+      effectiveConfigHash,
+      certifying: Boolean(args.certifying),
+      nonCertifyingReason: args.nonCertifyingReason ?? null,
       wallMs: Date.now() - started,
       args: {
         apps: args.apps, seeds: args.seeds, modes: args.modes, budgetUsd: args.budgetUsd,
         maxDurationMs: args.maxDurationMs, concurrency: args.concurrency, noLlm: args.noLlm,
         verifier: args.verifier, smoke: args.smoke, dataDir: args.dataDir ?? null,
+        allowBurnedDev: Boolean(args.allowBurnedDev),
         warmWorkers: args.warmWorkers !== false,
         maxInFlightStreams: args.maxInFlightStreams ?? 28,
         minFreeMemGb: args.minFreeMemGb ?? DEFAULT_MIN_FREE_MEM_GB,
@@ -911,6 +1007,39 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
     }
     const outPath = resolve(args.outDir, 'matrix.json')
     writeFileSync(outPath, `${JSON.stringify(matrix, null, 2)}\n`, { mode: 0o600 })
+    if (args.ledgerPath) {
+      for (const cellResult of results) {
+        appendLedgerRow({
+          schemaVersion: LEDGER_SCHEMA_VERSION,
+          recordedAt: matrix.generatedAt,
+          suite: 'realistic-bench',
+          gitSha: gitState.gitSha,
+          dirty: gitState.dirty,
+          benchmarkVersion,
+          effectiveConfigHash,
+          effectiveConfig,
+          app: cellResult.app,
+          split: cellResult.seedSet,
+          mode: cellResult.mode,
+          llm: cellResult.modelMode === 'deterministic-no-llm' ? 'deterministic-no-llm' : 'agentic',
+          seed: cellResult.seed,
+          repeat: 1,
+          certifying: Boolean(args.certifying) && cellResult.ok,
+          reportable: true,
+          status: cellResult.ok ? 'VALID' : 'INVALID',
+          targets: cellResult.targets,
+          confirmed: cellResult.confirmed,
+          recall: cellResult.ok ? (cellResult.targets > 0 ? cellResult.confirmed / cellResult.targets : 0) : null,
+          rawPrecision: cellResult.precision,
+          strictPrecision: cellResult.precision,
+          precision: cellResult.precision,
+          decoyFalsePositives: cellResult.decoyFp,
+          unmatchedFalsePositives: cellResult.unmatchedFp,
+          costUsd: cellResult.costUsd,
+          durationMs: cellResult.wallMs,
+        }, args.ledgerPath)
+      }
+    }
     process.stdout.write(`[matrix] ${results.length} cell(s) -> ${outPath}\n`)
     process.stdout.write(`${renderMatrixTable(results)}\n${renderMatrixSummary(totals)}\n`)
     process.stdout.write(`${renderParallelStatus({

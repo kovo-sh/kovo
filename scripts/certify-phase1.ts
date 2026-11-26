@@ -55,6 +55,14 @@ import { basename, dirname, join, relative, resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { pathToFileURL } from 'node:url'
 import { MAX_RUN_WORKER_CONCURRENCY } from './benchmark-env.ts'
+import {
+  CERTIFYING_MIN_HELDOUT_SEEDS,
+  assertNoBurnedSeeds,
+  computeBenchmarkVersion,
+  computeEffectiveConfig,
+  drawUnburnedHeldoutSeeds,
+  loadBurnedSeeds,
+} from './bench-ledger.ts'
 
 // ---------------------------------------------------------------------------------------------
 // Constants and contract types
@@ -63,7 +71,9 @@ import { MAX_RUN_WORKER_CONCURRENCY } from './benchmark-env.ts'
 export const CERTIFY_APPS = ['acme-saas', 'shopflow', 'opsportal'] as const
 export const REASON_APPS = ['ledgerflow', 'forgecloud'] as const
 export const DEV_SEED = 1
+/** Legacy burned seed (demoted to dev-2 only in BURNED_SEEDS; refused for certification). */
 export const HELDOUT_SEED = 1_000_042
+export const DEFAULT_CERTIFY_HELDOUT_SEED_COUNT = CERTIFYING_MIN_HELDOUT_SEEDS
 export const REASON_TARGETS = 28
 
 export const DEFAULT_THRESHOLDS = {
@@ -1199,6 +1209,12 @@ export interface Certificate {
   schemaVersion: 1
   generatedAt: string
   gitSha: string
+  benchmarkVersion: string
+  effectiveConfigHash: string
+  certifying: boolean
+  nonCertifyingReason: string | null
+  heldoutSeeds: number[]
+  burnedSeedsDetected: number[]
   mode: 'from-dir' | 'run'
   verdict: 'PASS' | 'FAIL'
   thresholds: Thresholds
@@ -1282,6 +1298,8 @@ export interface CertifyOptions {
   floorHeldoutRuns?: number
   heldoutRuns?: number
   checkMatrix?: boolean
+  /** Explicit dev-2 debugging escape hatch for burned seeds; always stamps certifying=false. */
+  allowBurnedDev?: boolean
   thresholds?: Thresholds
   generatedAt?: string
   gitSha?: string
@@ -1781,6 +1799,32 @@ export function evaluateCertification(
     ))
   }
 
+  const burnedSet = loadBurnedSeeds()
+  const heldoutSeedsObserved = unique([...floorHeldout, ...unifiedHeldout].map(run => run.seed)).sort((a, b) => a - b)
+  const burnedSeedsDetected = heldoutSeedsObserved.filter(seed => burnedSet.has(seed))
+  const allowBurnedDev = options.allowBurnedDev === true
+  const hasEnoughHeldoutSeeds = heldoutSeedsObserved.length >= CERTIFYING_MIN_HELDOUT_SEEDS
+  const certifying = !allowBurnedDev && burnedSeedsDetected.length === 0 && hasEnoughHeldoutSeeds
+  const nonCertifyingReason = allowBurnedDev
+    ? `allow-burned-dev (${burnedSeedsDetected.join(',') || 'dev-2 override'})`
+    : burnedSeedsDetected.length > 0
+      ? `burned-heldout-seed (${burnedSeedsDetected.join(',')})`
+      : !hasEnoughHeldoutSeeds
+        ? `insufficient-heldout-seeds (${heldoutSeedsObserved.length} < ${CERTIFYING_MIN_HELDOUT_SEEDS})`
+        : null
+
+  if (burnedSeedsDetected.length > 0) {
+    criteria.push(criterion(
+      'heldout_seed_hygiene',
+      'Held-out certification uses only fresh unburned salted seeds (not in BURNED_SEEDS)',
+      '0 burned seeds (n >= 3 fresh salted seeds)',
+      allowBurnedDev
+        ? `dev-2 override (--allow-burned-dev; NON-CERTIFYING): burned seed(s) [${burnedSeedsDetected.join(', ')}]`
+        : `refused burned seed(s) [${burnedSeedsDetected.join(', ')}] in BURNED_SEEDS`,
+      allowBurnedDev,
+    ))
+  }
+
   if (runs.some(run => run.notes.length)) {
     for (const run of runs) {
       for (const note of run.notes) {
@@ -1790,11 +1834,26 @@ export function evaluateCertification(
     }
   }
 
+  const { benchmarkVersion } = computeBenchmarkVersion('realistic-bench')
+  const { effectiveConfigHash } = computeEffectiveConfig({
+    deterministicOnly: false,
+    environment: 'local-lab',
+    approvalPolicy: 'auto_review',
+    wordlistOn: false,
+    mode: 'grey-box',
+  })
+
   const verdict = criteria.every(item => item.status === 'PASS') ? 'PASS' : 'FAIL'
   return {
     schemaVersion: 1,
     generatedAt: options.generatedAt ?? new Date().toISOString(),
     gitSha: options.gitSha ?? resolveGitSha(),
+    benchmarkVersion,
+    effectiveConfigHash,
+    certifying,
+    nonCertifyingReason,
+    heldoutSeeds: heldoutSeedsObserved,
+    burnedSeedsDetected,
     mode: options.mode,
     verdict,
     thresholds,
@@ -2048,7 +2107,14 @@ export interface RunPlanOptions {
   outDir: string
   apps: string[]
   devSeed: number
-  heldoutSeed: number
+  /** Legacy single held-out seed (rejected if in BURNED_SEEDS unless allowBurnedDev=true). */
+  heldoutSeed?: number
+  /** Preferred n >= 3 fresh unburned salted held-out seeds for certification. */
+  heldoutSeeds?: number[]
+  /** Explicit dev-2 debugging override permitting burned seeds (stamps non-certifying). */
+  allowBurnedDev?: boolean
+  /** Optional held-out salt for drawing fresh seeds when heldoutSeeds/heldoutSeed are omitted. */
+  heldOutSalt?: string
   devRuns: number
   floorHeldoutRuns: number
   heldoutRuns: number
@@ -2063,6 +2129,31 @@ export interface RunPlanOptions {
 }
 
 export function buildRunPlan(options: RunPlanOptions): RunPlanCell[] {
+  const allowBurnedDev = options.allowBurnedDev === true
+  let heldoutSeeds: number[]
+  if (options.heldoutSeeds && options.heldoutSeeds.length > 0) {
+    heldoutSeeds = [...new Set(options.heldoutSeeds)]
+  } else if (options.heldoutSeed !== undefined) {
+    heldoutSeeds = [options.heldoutSeed]
+  } else {
+    const drawCount = Math.max(CERTIFYING_MIN_HELDOUT_SEEDS, options.heldoutRuns, options.floorHeldoutRuns)
+    heldoutSeeds = drawUnburnedHeldoutSeeds(drawCount, options.heldOutSalt)
+  }
+
+  for (const seed of heldoutSeeds) {
+    if (seed < 1_000_000) {
+      throw new Error(`certify-phase1: held-out seeds must be >= 1000000 (got ${seed})`)
+    }
+  }
+  assertNoBurnedSeeds(heldoutSeeds, { allowBurnedDev, context: 'certify-phase1' })
+  if (!allowBurnedDev && heldoutSeeds.length < CERTIFYING_MIN_HELDOUT_SEEDS) {
+    throw new Error(
+      `certify-phase1: certifying held-out runs require >= ${CERTIFYING_MIN_HELDOUT_SEEDS} fresh unburned `
+        + `salted seeds (got ${heldoutSeeds.length}: [${heldoutSeeds.join(', ')}]); omit --heldout-seed to draw `
+        + `${CERTIFYING_MIN_HELDOUT_SEEDS} fresh seeds automatically or pass --allow-burned-dev for dev-2 debugging`,
+    )
+  }
+
   const cells: RunPlanCell[] = []
   const base = ['--mode', options.mode, '--verifier', options.verifier, '--keep-data-dirs']
   const workerArgs = options.workerConcurrency
@@ -2080,11 +2171,12 @@ export function buildRunPlan(options: RunPlanOptions): RunPlanCell[] {
       })
     }
     for (let i = 1; i <= options.floorHeldoutRuns; i += 1) {
+      const seed = heldoutSeeds[(i - 1) % heldoutSeeds.length]!
       const outDir = join(options.outDir, 'floor', 'heldout', `${app}-r${i}`)
       cells.push({
         id: `floor-heldout-${app}-r${i}`,
-        kind: 'floor-heldout', app, seed: options.heldoutSeed, heldOut: true, outDir, dataDir: null,
-        args: realistic(['--app', app, '--seed', String(options.heldoutSeed), '--out-dir', outDir, ...base, '--no-llm', '--held-out']),
+        kind: 'floor-heldout', app, seed, heldOut: true, outDir, dataDir: null,
+        args: realistic(['--app', app, '--seed', String(seed), '--out-dir', outDir, ...base, '--no-llm', '--held-out']),
       })
     }
     for (let i = 1; i <= options.devRuns; i += 1) {
@@ -2101,12 +2193,13 @@ export function buildRunPlan(options: RunPlanOptions): RunPlanCell[] {
       })
     }
     for (let i = 1; i <= options.heldoutRuns; i += 1) {
+      const seed = heldoutSeeds[(i - 1) % heldoutSeeds.length]!
       const outDir = join(options.outDir, 'unified', 'heldout', `${app}-r${i}`)
       cells.push({
         id: `unified-heldout-${app}-r${i}`,
-        kind: 'unified-heldout', app, seed: options.heldoutSeed, heldOut: true, outDir, dataDir: options.dataDir,
+        kind: 'unified-heldout', app, seed, heldOut: true, outDir, dataDir: options.dataDir,
         args: realistic([
-          '--app', app, '--seed', String(options.heldoutSeed), '--out-dir', outDir, ...base,
+          '--app', app, '--seed', String(seed), '--out-dir', outDir, ...base,
           '--isolate-data-dir', '--budget-usd', String(options.budgetUsd),
           '--max-duration-ms', String(options.maxDurationMs), '--held-out', ...workerArgs,
           ...(options.dataDir ? ['--data-dir', options.dataDir] : []),
@@ -2282,7 +2375,7 @@ async function executeRunPlan(plan: RunPlanCell[], options: ExecuteOptions): Pro
 // CLI
 // ---------------------------------------------------------------------------------------------
 
-interface CliOptions {
+export interface CliOptions {
   fromDirs: string[]
   run: boolean
   dryRun: boolean
@@ -2291,7 +2384,9 @@ interface CliOptions {
   mdPath: string | null
   apps: string[]
   devSeed: number
-  heldoutSeed: number
+  heldoutSeeds: number[] | null
+  allowBurnedDev: boolean
+  certifying: boolean
   devRuns: number
   floorHeldoutRuns: number
   heldoutRuns: number
@@ -2325,10 +2420,12 @@ Flags:
   --md <path>               certificate Markdown path (default <out-dir>/certificate.md)
   --apps <all|a,b>          apps for the realism matrix (default all three)
   --dev-seed <n>            dev seed (default ${DEV_SEED})
-  --heldout-seed <n>        salted held-out seed (default ${HELDOUT_SEED})
+  --heldout-seeds <a,b,c>   >= ${CERTIFYING_MIN_HELDOUT_SEEDS} fresh unburned salted held-out seeds (default: auto-drawn via listSeeds)
+  --heldout-seed <n>        single held-out seed (requires --allow-burned-dev; non-certifying)
+  --allow-burned-dev        dev-2 debugging only: permit burned seeds in BURNED_SEEDS (stamps certifying=false)
   --dev-runs <n>            floor and unified runs per app on dev (default 3)
-  --floor-heldout-runs <n>  floor runs per app on held-out (default 1)
-  --heldout-runs <n>        unified runs per app on held-out (default 2)
+  --floor-heldout-runs <n>  floor runs per app on held-out (default ${CERTIFYING_MIN_HELDOUT_SEEDS})
+  --heldout-runs <n>        unified runs per app on held-out (default ${CERTIFYING_MIN_HELDOUT_SEEDS})
   --concurrency <n>         concurrent harness processes (default 3) — cell scheduling only
   --worker-concurrency <n>  in-run worker slots per agentic cell (default: harness default:
                             6 agentic / 1 deterministic). Independent of --concurrency.
@@ -2384,7 +2481,7 @@ function parseOptionalWorkerConcurrency(raw: unknown): number | null {
   return value
 }
 
-function parseCli(argv: string[], env: NodeJS.ProcessEnv = process.env): CliOptions {
+export function parseCli(argv: string[], env: NodeJS.ProcessEnv = process.env): CliOptions {
   const a: Record<string, string | boolean | string[]> = {}
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i]!
@@ -2407,7 +2504,8 @@ function parseCli(argv: string[], env: NodeJS.ProcessEnv = process.env): CliOpti
   }
 
   const known = new Set([
-    'run', 'dry-run', 'from-dir', 'out-dir', 'json', 'md', 'apps', 'dev-seed', 'heldout-seed',
+    'run', 'dry-run', 'from-dir', 'out-dir', 'json', 'md', 'apps', 'dev-seed',
+    'heldout-seed', 'heldout-seeds', 'allow-burned-dev',
     'dev-runs', 'floor-heldout-runs', 'heldout-runs', 'concurrency', 'worker-concurrency', 'data-dir', 'verifier',
     'use-newgrp', 'budget-usd', 'max-duration-ms', 'reason-runs', 'skip-reason', 'keep-data-dirs',
     'no-matrix-check', 'help',
@@ -2416,8 +2514,10 @@ function parseCli(argv: string[], env: NodeJS.ProcessEnv = process.env): CliOpti
   if (a.help === true) {
     return {
       fromDirs: [], run: false, dryRun: false, outDir: resolve('.kovo/certify-phase1'),
-      jsonPath: null, mdPath: null, apps: [...CERTIFY_APPS], devSeed: DEV_SEED, heldoutSeed: HELDOUT_SEED,
-      devRuns: 3, floorHeldoutRuns: 1, heldoutRuns: 2, concurrency: 3, workerConcurrency: null, dataDir: null,
+      jsonPath: null, mdPath: null, apps: [...CERTIFY_APPS], devSeed: DEV_SEED,
+      heldoutSeeds: null, allowBurnedDev: false, certifying: true,
+      devRuns: 3, floorHeldoutRuns: CERTIFYING_MIN_HELDOUT_SEEDS, heldoutRuns: CERTIFYING_MIN_HELDOUT_SEEDS,
+      concurrency: 3, workerConcurrency: null, dataDir: null,
       verifier: 'docker', useNewgrp: false, budgetUsd: 5, maxDurationMs: 600_000, reasonRuns: 1,
       skipReason: false, keepDataDirs: false, checkMatrix: true, help: true,
     }
@@ -2428,12 +2528,60 @@ function parseCli(argv: string[], env: NodeJS.ProcessEnv = process.env): CliOpti
   if (!run && !fromDirs.length) fail('use --run or --from-dir <dir>')
   if (run && fromDirs.length) fail('use either --run or --from-dir, not both')
   const dryRun = a['dry-run'] === true
+  const allowBurnedDev = a['allow-burned-dev'] === true
   const appsRaw = typeof a.apps === 'string' ? a.apps : 'all'
   const apps = appsRaw === 'all' ? [...CERTIFY_APPS] : appsRaw.split(',').map(s => s.trim()).filter(Boolean)
   for (const app of apps) if (!CERTIFY_APPS.includes(app as typeof CERTIFY_APPS[number])) fail(`--apps must be ${CERTIFY_APPS.join(', ')} or all (got '${app}')`)
   const verifier = typeof a.verifier === 'string' ? a.verifier : 'docker'
   if (verifier !== 'auto' && verifier !== 'docker' && verifier !== 'local-jq') fail(`--verifier must be auto, docker or local-jq (got '${verifier}')`)
   const dataDir = typeof a['data-dir'] === 'string' ? resolve(a['data-dir']) : (env.KOVO_DATA_DIR ? resolve(env.KOVO_DATA_DIR) : null)
+
+  const floorHeldoutRuns = parsePositiveInt(
+    typeof a['floor-heldout-runs'] === 'string' ? a['floor-heldout-runs'] : String(CERTIFYING_MIN_HELDOUT_SEEDS),
+    '--floor-heldout-runs',
+  )
+  const heldoutRuns = parsePositiveInt(
+    typeof a['heldout-runs'] === 'string' ? a['heldout-runs'] : String(CERTIFYING_MIN_HELDOUT_SEEDS),
+    '--heldout-runs',
+  )
+
+  if (a['heldout-seed'] !== undefined && a['heldout-seeds'] !== undefined) {
+    fail('use either --heldout-seed or --heldout-seeds, not both')
+  }
+  let heldoutSeeds: number[] | null = null
+  if (typeof a['heldout-seeds'] === 'string') {
+    heldoutSeeds = [...new Set(
+      a['heldout-seeds']
+        .split(',')
+        .map(s => s.trim())
+        .filter(Boolean)
+        .map(s => parsePositiveInt(s, '--heldout-seeds')),
+    )]
+    if (!heldoutSeeds.length) fail('--heldout-seeds requires at least one seed')
+  } else if (typeof a['heldout-seed'] === 'string') {
+    heldoutSeeds = [parsePositiveInt(a['heldout-seed'], '--heldout-seed')]
+  } else if (run && (env.KOVO_RB_HELDOUT_SALT ?? '').length >= 16) {
+    heldoutSeeds = drawUnburnedHeldoutSeeds(
+      Math.max(CERTIFYING_MIN_HELDOUT_SEEDS, heldoutRuns, floorHeldoutRuns),
+      env.KOVO_RB_HELDOUT_SALT,
+    )
+  }
+
+  if (heldoutSeeds !== null) {
+    for (const seed of heldoutSeeds) {
+      if (seed < 1_000_000) fail(`--heldout-seeds must be >= 1000000 (salted held-out split; got ${seed})`)
+    }
+    assertNoBurnedSeeds(heldoutSeeds, { allowBurnedDev, context: 'certify-phase1' })
+    if (!allowBurnedDev && heldoutSeeds.length < CERTIFYING_MIN_HELDOUT_SEEDS) {
+      fail(
+        `certify-phase1 requires >= ${CERTIFYING_MIN_HELDOUT_SEEDS} fresh unburned salted held-out seeds `
+          + `(got ${heldoutSeeds.length}); omit --heldout-seed to auto-draw or pass --allow-burned-dev for dev-2 debugging`,
+      )
+    }
+  }
+
+  const certifying = !allowBurnedDev && (heldoutSeeds === null || heldoutSeeds.length >= CERTIFYING_MIN_HELDOUT_SEEDS)
+
   return {
     fromDirs: fromDirs.map(dir => resolve(dir)),
     run,
@@ -2443,10 +2591,12 @@ function parseCli(argv: string[], env: NodeJS.ProcessEnv = process.env): CliOpti
     mdPath: typeof a.md === 'string' ? resolve(a.md) : null,
     apps,
     devSeed: parsePositiveInt(typeof a['dev-seed'] === 'string' ? a['dev-seed'] : String(DEV_SEED), '--dev-seed'),
-    heldoutSeed: parsePositiveInt(typeof a['heldout-seed'] === 'string' ? a['heldout-seed'] : String(HELDOUT_SEED), '--heldout-seed'),
+    heldoutSeeds,
+    allowBurnedDev,
+    certifying,
     devRuns: parsePositiveInt(typeof a['dev-runs'] === 'string' ? a['dev-runs'] : '3', '--dev-runs'),
-    floorHeldoutRuns: parsePositiveInt(typeof a['floor-heldout-runs'] === 'string' ? a['floor-heldout-runs'] : '1', '--floor-heldout-runs'),
-    heldoutRuns: parsePositiveInt(typeof a['heldout-runs'] === 'string' ? a['heldout-runs'] : '2', '--heldout-runs'),
+    floorHeldoutRuns,
+    heldoutRuns,
     concurrency: parsePositiveInt(typeof a.concurrency === 'string' ? a.concurrency : '3', '--concurrency'),
     workerConcurrency: parseOptionalWorkerConcurrency(a['worker-concurrency']),
     dataDir,
@@ -2495,12 +2645,16 @@ async function main(): Promise<void> {
     let certificate: Certificate
     const ingestNotes: string[] = []
     if (cli.run) {
-      if (cli.heldoutSeed < 1_000_000) fail('--heldout-seed must be >= 1000000 (salted held-out split)')
+      const salt = process.env.KOVO_RB_HELDOUT_SALT ?? ''
+      if (!cli.heldoutSeeds && salt.length < 16) {
+        fail('--run requires KOVO_RB_HELDOUT_SALT (>= 16 chars) to draw fresh unburned held-out seeds')
+      }
       const plan = buildRunPlan({
         outDir: cli.outDir,
         apps: cli.apps,
         devSeed: cli.devSeed,
-        heldoutSeed: cli.heldoutSeed,
+        ...(cli.heldoutSeeds ? { heldoutSeeds: cli.heldoutSeeds } : { heldOutSalt: salt }),
+        allowBurnedDev: cli.allowBurnedDev,
         devRuns: cli.devRuns,
         floorHeldoutRuns: cli.floorHeldoutRuns,
         heldoutRuns: cli.heldoutRuns,
@@ -2513,10 +2667,15 @@ async function main(): Promise<void> {
         workerConcurrency: cli.workerConcurrency,
       })
       if (cli.dryRun) {
-        process.stdout.write(`${JSON.stringify({ cells: plan, concurrency: cli.concurrency, workerConcurrency: cli.workerConcurrency }, null, 2)}\n`)
+        process.stdout.write(`${JSON.stringify({
+          certifying: cli.certifying,
+          allowBurnedDev: cli.allowBurnedDev,
+          cells: plan,
+          concurrency: cli.concurrency,
+          workerConcurrency: cli.workerConcurrency,
+        }, null, 2)}\n`)
         return
       }
-      const salt = process.env.KOVO_RB_HELDOUT_SALT ?? ''
       if (salt.length < 16) fail('--run requires KOVO_RB_HELDOUT_SALT (>= 16 chars); the value is never written')
       if (!cli.dataDir) fail('--run agentic cells need --data-dir (or KOVO_DATA_DIR) with an enabled model profile')
       for (const sub of ['floor', 'unified', 'reason']) {
@@ -2549,6 +2708,7 @@ async function main(): Promise<void> {
         floorHeldoutRuns: cli.floorHeldoutRuns,
         heldoutRuns: cli.heldoutRuns,
         checkMatrix: cli.checkMatrix,
+        allowBurnedDev: cli.allowBurnedDev,
         notes: ingestNotes,
       })
       if (!cli.keepDataDirs) cleanupDataDirs(cli.outDir)
@@ -2563,6 +2723,7 @@ async function main(): Promise<void> {
         floorHeldoutRuns: cli.floorHeldoutRuns,
         heldoutRuns: cli.heldoutRuns,
         checkMatrix: cli.checkMatrix,
+        allowBurnedDev: cli.allowBurnedDev,
         notes: ingestNotes,
       })
     }
