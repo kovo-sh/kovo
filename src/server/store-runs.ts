@@ -145,6 +145,15 @@ function deriveDefaultEnvironmentMode(
   return defaultEnvironmentMode(projectEnvironment)
 }
 
+const TERMINAL_RUN_STATUSES = new Set<Run['status']>(['complete', 'stopped', 'failed'])
+const NON_TERMINAL_ASSIGNMENT_STATUSES = ['running', 'queued', 'paused', 'waiting_approval'] as const
+
+function terminalAssignmentOutcome(status: Run['status']): string {
+  if (status === 'complete') return 'Stopped when run completed.'
+  if (status === 'stopped') return 'Stopped when run ended.'
+  return 'Interrupted before run finished.'
+}
+
 export class RunsRepository {
   private readonly session: DbSession
   private readonly projects: ProjectsRepository
@@ -1007,7 +1016,21 @@ export class RunsRepository {
 
     const graphEdges = this.findings.listGraphEdges(runId)
     const digests = this.listDigests(runId, false)
-    const assignments = this.workerList(runId)
+    const runTerminal = TERMINAL_RUN_STATUSES.has(run.status) || run.phase === 'complete'
+    const rawAssignments = this.workerList(runId)
+    const assignments = runTerminal
+      ? rawAssignments.map(a => (
+          a.phase !== 'retest' && (NON_TERMINAL_ASSIGNMENT_STATUSES as readonly string[]).includes(a.status)
+            ? {
+                ...a,
+                status: 'canceled' as const,
+                lease: null,
+                leaseExpiresAt: null,
+                outcome: a.outcome || terminalAssignmentOutcome(run.status),
+              }
+            : a
+        ))
+      : rawAssignments
     const approvals = this.listApprovalRequests(runId)
 
     const exchangeColumns = {
@@ -2559,13 +2582,45 @@ export class RunsRepository {
     }, { behavior: 'immediate' })
   }
 
+  private settleTerminalAssignments(runId: string, terminalStatus: 'complete' | 'stopped' | 'failed'): void {
+    const fallbackOutcome = terminalAssignmentOutcome(terminalStatus)
+    const whereClause = terminalStatus === 'complete'
+      ? and(
+          eq(tables.assignments.runId, runId),
+          inArray(tables.assignments.status, [...NON_TERMINAL_ASSIGNMENT_STATUSES]),
+          sql`${tables.assignments.phase} != 'retest'`,
+        )
+      : and(
+          eq(tables.assignments.runId, runId),
+          inArray(tables.assignments.status, [...NON_TERMINAL_ASSIGNMENT_STATUSES]),
+        )
+    this.session.db.update(tables.assignments).set({
+      status: 'canceled',
+      lease: null,
+      leaseExpiresAt: null,
+      outcome: sql`COALESCE(NULLIF(${tables.assignments.outcome}, ''), ${fallbackOutcome})`,
+    }).where(whereClause).run()
+  }
+
   updateRun(runId: string, state: Partial<Run>) {
     this.assertTenantRun(runId)
-    const updated = this.session.db.update(tables.runs).set(state).where(and(
-      eq(tables.runs.id, runId), eq(tables.runs.workspaceId, this.session.workspace.id),
-    )).returning().get()
-    if (!updated) throw new Error('Run not found.')
-    return updated
+    const terminalStatus: 'complete' | 'stopped' | 'failed' | null =
+      state.status === 'complete' || state.status === 'stopped' || state.status === 'failed'
+        ? state.status
+        : state.phase === 'complete'
+          ? 'complete'
+          : null
+    const apply = () => {
+      const updated = this.session.db.update(tables.runs).set(state).where(and(
+        eq(tables.runs.id, runId), eq(tables.runs.workspaceId, this.session.workspace.id),
+      )).returning().get()
+      if (!updated) throw new Error('Run not found.')
+      if (terminalStatus) {
+        this.settleTerminalAssignments(runId, terminalStatus)
+      }
+      return updated
+    }
+    return terminalStatus ? this.session.transaction(apply, { behavior: 'immediate' }) : apply()
   }
 
   updateWorker(assignmentId: string, state: Partial<Assignment>) {
@@ -2578,7 +2633,7 @@ export class RunsRepository {
 
   setStatus(run: Run, status: Run['status']) {
     this.updateRun(run.id, { status })
-    if (status === 'paused' || status === 'budget_paused' || status === 'stopped' || status === 'failed') {
+    if (status === 'paused' || status === 'budget_paused') {
       this.session.db.update(tables.assignments).set({ status: 'paused', lease: null, leaseExpiresAt: null }).where(and(
         eq(tables.assignments.runId, run.id),
         inArray(tables.assignments.status, ['queued', 'running', 'waiting_approval']),

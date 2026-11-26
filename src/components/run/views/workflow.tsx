@@ -7,7 +7,7 @@ import type { ReactNode } from 'react'
 import { Dropdown, FilterBox, Tabs } from '../controls.tsx'
 import { useRun, useRunModel } from '../data.tsx'
 import { EmptyState, Kbd, KbdGroup, Seg, Tag } from '../display.tsx'
-import { fmtN, host, plural, readRunUrlParam, syncRunUrlParam } from '../format.ts'
+import { deriveRound0PipelineState, fmtN, host, isRound0ThreatModelWorker, plural, readRunUrlParam, syncRunUrlParam } from '../format.ts'
 import { LiveDot, SevGlyph, StatusGlyph } from '../glyphs.tsx'
 import { Icon } from '../icons.tsx'
 import { useShortcuts } from '../keyboard.tsx'
@@ -25,8 +25,13 @@ import { isLive, QUEUE_ID, setExpanded, useWorkflowLayout } from './workflow-lay
 type Filter = 'all' | 'live' | 'complete' | 'findings' | 'failed'
 type Mode = 'graph' | 'list'
 const isWorkflowMode = (v: string | null): v is Mode => v === 'graph' || v === 'list'
+const isTerminalRun = (status: string, phase: string) =>
+  status === 'complete' || status === 'stopped' || status === 'failed' || phase === 'complete'
+const isActiveTask = (a: Assignment) => isLive(a) || (a.status as string) === 'waiting'
 type Group = 'phase' | 'step' | 'status' | 'none'
 const GROUPS: [Group, string][] = [['phase', 'Phase'], ['step', 'Plan step'], ['status', 'Status'], ['none', 'None']]
+const ICON_SLOT = 'inline-flex size-3.5 flex-none items-center justify-center'
+const PILL = 'inline-flex h-[17px] flex-none items-center gap-1 rounded-[9px] px-1.5 text-[11px] font-medium shadow-[inset_0_0_0_1px_var(--line-2)]'
 
 export function WorkflowView() {
   const { detail } = useRun()
@@ -34,24 +39,25 @@ export function WorkflowView() {
   const nav = useNav()
   const L = useWorkflowLayout()
   const runId = detail.run.id
-  const [mode, setModeState] = useViewState<Mode>('wf.mode', 'graph')
+  const terminal = isTerminalRun(detail.run.status, detail.run.phase)
+  const [mode, setModeState] = useViewState<Mode>('wf.mode', 'list')
   const [filter, setFilter] = useViewState<Filter>('wf.filter', 'all')
   const [query, setQuery] = useViewState('wf.q', '')
   const [replay, setReplay] = useState(false)
   const setMode = useCallback((next: Mode) => {
     setModeState(next)
-    syncRunUrlParam('mode', next === 'graph' ? null : next)
+    syncRunUrlParam('mode', next === 'list' ? null : next)
   }, [setModeState])
   useEffect(() => {
     const fromUrl = readRunUrlParam('mode')
     if (isWorkflowMode(fromUrl)) {
       if (fromUrl !== mode) setModeState(fromUrl)
-    } else if (mode !== 'graph') {
+    } else if (mode !== 'list') {
       syncRunUrlParam('mode', mode)
     }
     const onPop = () => {
       const u = readRunUrlParam('mode')
-      setModeState(isWorkflowMode(u) ? u : 'graph')
+      setModeState(isWorkflowMode(u) ? u : 'list')
     }
     window.addEventListener('popstate', onPop)
     return () => window.removeEventListener('popstate', onPop)
@@ -64,18 +70,18 @@ export function WorkflowView() {
   const tabs = useMemo(() => {
     const t: Record<Filter, number> = { all: assignments.length, live: 0, complete: 0, findings: 0, failed: 0 }
     for (const a of assignments) {
-      if (isLive(a)) t.live++
+      if (!terminal && isActiveTask(a)) t.live++
       if (a.status === 'complete') t.complete++
       if (a.status === 'failed') t.failed++
       if ((model.workerFindings.get(a.id) ?? []).length) t.findings++
     }
-    const all: [Filter, string][] = [['all', 'All'], ['live', 'Running · paused'], ['complete', 'Complete'], ['findings', 'With findings'], ['failed', 'Failed']]
+    const all: [Filter, string][] = [['all', 'All'], ['live', 'Active'], ['complete', 'Complete'], ['findings', 'With findings'], ['failed', 'Failed']]
     return all.filter(([k]) => k === 'all' || t[k]).map(([k, l]) => ({ k, l, n: t[k] }))
-  }, [assignments, model])
+  }, [assignments, model, terminal])
   const effFilter: Filter = tabs.some(t => t.k === filter) ? filter : 'all'
   const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean)
   const matches = useCallback((a: Assignment) => {
-    if (effFilter === 'live' && !isLive(a)) return false
+    if (effFilter === 'live' && (terminal || !isActiveTask(a))) return false
     if (effFilter === 'complete' && a.status !== 'complete') return false
     if (effFilter === 'failed' && a.status !== 'failed') return false
     if (effFilter === 'findings' && !(model.workerFindings.get(a.id) ?? []).length) return false
@@ -83,7 +89,7 @@ export function WorkflowView() {
     const hay = (a.title + ' ' + a.objective + ' ' + (a.outcome ?? '') + ' ' + a.sourceOrigins.join(' ') + ' ' + a.phase).toLowerCase()
     return terms.every(t => hay.includes(t))
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [effFilter, model, terms.join(' ')])
+  }, [effFilter, model, terminal, terms.join(' ')])
   const nomatch = useMemo(() => {
     const out = new Set<string>()
     for (const n of L.nodes) {
@@ -188,14 +194,14 @@ export function WorkflowView() {
     </button>
     <div
       className="inline-flex h-[26px] flex-none items-center rounded-control bg-sunk p-0.5 shadow-[inset_0_0_0_1px_var(--line)]"
-      title="Graph or list (L)"
+      title="List or graph (L)"
       role="radiogroup"
     >
-      <button type="button" role="radio" aria-checked={mode === 'graph'} className={modeBtnCls(mode === 'graph')} onClick={() => setMode('graph')}>
-        <Icon name="graph" /><span className="@max-[760px]/wftb:hidden">Graph</span>
-      </button>
-      <button type="button" role="radio" aria-checked={mode === 'list'} className={modeBtnCls(mode === 'list')} onClick={() => { setReplay(false); setMode('list') }}>
+      <button type="button" role="radio" aria-label="List" aria-checked={mode === 'list'} className={modeBtnCls(mode === 'list')} onClick={() => { setReplay(false); setMode('list') }}>
         <Icon name="list" /><span className="@max-[760px]/wftb:hidden">List</span>
+      </button>
+      <button type="button" role="radio" aria-label="Graph" aria-checked={mode === 'graph'} className={modeBtnCls(mode === 'graph')} onClick={() => setMode('graph')}>
+        <Icon name="graph" /><span className="@max-[760px]/wftb:hidden">Graph</span>
       </button>
     </div>
   </div>
@@ -203,7 +209,7 @@ export function WorkflowView() {
   if (!assignments.length) {
     return <>{toolbar}<EmptyState icon="workers" title="No workers dispatched"
       action={detail.run.status === 'waiting' ? <button type="button" className={runBtn()} onClick={() => nav.setView('overview')}>Review scope</button> : undefined}>
-      The coordinator plans chain steps after scope consent, then dispatches sandboxed workers. Their execution graph builds up here.
+      The coordinator plans chain steps after scope consent, then dispatches sandboxed workers.
     </EmptyState></>
   }
   return <>
@@ -211,7 +217,7 @@ export function WorkflowView() {
     {mode === 'graph'
       ? <WorkflowGraph L={L} selId={selId} focusSet={focusSet} nomatch={nomatch} onSelect={select} onExpand={expand}
         onReport={() => nav.setView('report')} replay={replay} onReplayClose={() => setReplay(false)} />
-      : <WorkerList matches={matches} />}
+      : <WorkerList matches={matches} terminal={terminal} />}
   </>
 }
 
@@ -232,7 +238,7 @@ function DigestMenu() {
   const nav = useNav()
   const ds = detail.digests
   const active = ds.filter(d => d.active).length
-  return <Dropdown icon="archive" title="Memory summaries: compacted summaries of older facts" menuClassName="w-[320px] p-1.5"
+  return <Dropdown icon="archive" title="Memory summaries" menuClassName="w-[320px] p-1.5"
     btnClassName={runBtn({ variant: nav.sel?.kind === 'digest' ? 'ghostOn' : 'ghost' })}
     label={<><span className="text-fg-subtle @max-[760px]/wftb:hidden">Summaries</span><span className="tabular-nums">{active || ds.length}</span></>}>
     {close => <>
@@ -244,26 +250,35 @@ function DigestMenu() {
         className={cn(runDdItem({ active: nav.sel?.kind === 'digest' && nav.sel.id === d.id }), 'h-auto min-h-8 py-[5px]')}
         onClick={() => { close(); nav.select({ kind: 'digest', id: d.id }) }}
       >
-        <span className="min-w-0 truncate">Round {d.roundNo} · {d.level} summary{!d.active && <span className="text-fg-subtle"> · superseded</span>}</span>
+        <span className="min-w-0 truncate">Round {d.roundNo} · {d.level}{!d.active && <span className="text-fg-subtle"> · superseded</span>}</span>
         <span className="ml-auto flex-none text-fg-subtle tabular-nums">{plural(d.coveredFactIds.length, 'fact')} · {d.coveredAssignmentIds.length} w</span>
       </button>)}
-      <p className="mx-2 mb-0.5 mt-1.5 text-[11.5px] text-fg-subtle">Selecting a summary highlights the workers it covers.</p>
+      <p className="mx-2 mb-0.5 mt-1.5 text-[11.5px] text-fg-subtle">Highlights covered workers.</p>
     </>}
   </Dropdown>
 }
 
 // ---------------------------------------------------------------- list mode
 
-function WorkerList({ matches }: { matches: (a: Assignment) => boolean }) {
+function WorkerList({ matches, terminal }: { matches: (a: Assignment) => boolean; terminal: boolean }) {
+  const { events } = useRun()
   const model = useRunModel()
   const nav = useNav()
   const [group, setGroup] = useViewState<Group>('wf.group', 'phase')
   const [collapsed, setCollapsed] = useViewState<Record<string, boolean>>('wf.collapsed', {})
   const items = useMemo(() => model.detail.assignments.filter(matches).slice().sort((a, b) => a.createdAt - b.createdAt), [model, matches])
+  const { activeItems, restItems } = useMemo(() => {
+    if (terminal) return { activeItems: [] as Assignment[], restItems: items }
+    const active: Assignment[] = []
+    const rest: Assignment[] = []
+    for (const a of items) (isActiveTask(a) ? active : rest).push(a)
+    active.sort((a, b) => Number(a.status !== 'running') - Number(b.status !== 'running') || a.createdAt - b.createdAt)
+    return { activeItems: active, restItems: rest }
+  }, [items, terminal])
   const groups = useMemo(() => {
     if (group === 'none') return null
     const by = new Map<string, Assignment[]>()
-    for (const a of items) {
+    for (const a of restItems) {
       const k = group === 'phase' ? a.phase : group === 'status' ? a.status : a.stepId ?? '_none'
       by.set(k, [...(by.get(k) ?? []), a])
     }
@@ -272,13 +287,14 @@ function WorkerList({ matches }: { matches: (a: Assignment) => boolean }) {
     keys.sort((a, b) => group === 'phase' ? (PHASE_ORDER[a] ?? 9) - (PHASE_ORDER[b] ?? 9) : group === 'step' ? seq(a) - seq(b) : a.localeCompare(b))
     return keys.map(k => {
       const step = group === 'step' ? model.stepById.get(k) : undefined
-      const label = group === 'phase' ? PHASE_LABEL[k] ?? k : group === 'status' ? stLabel(k) : step ? '#' + step.seq + ' ' + step.title : 'Unplanned (system workers)'
+      const label = group === 'phase' ? PHASE_LABEL[k] ?? k : group === 'status' ? stLabel(k) : step ? '#' + step.seq + ' ' + step.title : 'Unplanned'
       const glyph: ReactNode = group === 'phase' ? <span className="flex text-fg-subtle"><Icon name="workers" /></span> : <StatusGlyph status={group === 'status' ? k : step?.status ?? 'complete'} />
       return { key: k, label, glyph, items: by.get(k)! }
     })
-  }, [items, group, model])
+  }, [restItems, group, model])
   const ck = (k: string) => group + ':' + k
-  const ids = groups ? groups.flatMap(g => (collapsed[ck(g.key)] ? [] : g.items.map(a => a.id))) : items.map(a => a.id)
+  const restIds = groups ? groups.flatMap(g => (collapsed[ck(g.key)] ? [] : g.items.map(a => a.id))) : restItems.map(a => a.id)
+  const ids = [...activeItems.map(a => a.id), ...restIds]
   const { index } = useListNav({ ids, kind: 'worker' })
   useShortcuts([{ key: 'G', run: () => setGroup(GROUPS[(GROUPS.findIndex(g => g[0] === group) + 1) % GROUPS.length][0]) }])
   const listRef = useRef<HTMLDivElement>(null)
@@ -287,29 +303,53 @@ function WorkerList({ matches }: { matches: (a: Assignment) => boolean }) {
     listRef.current?.querySelector(`[data-id="${CSS.escape(ids[index])}"]`)?.scrollIntoView({ block: 'nearest' })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [index])
-  const row = (a: Assignment) => {
+  const row = (a: Assignment, pinned = false) => {
     const fs = model.workerFindings.get(a.id) ?? []
     const nfa = (model.factsByWorker.get(a.id) ?? []).length
     const pct = a.maxTurns ? Math.min(100, a.turnsUsed / a.maxTurns * 100) : 0
     const cur = nav.sel?.kind === 'worker' && nav.sel.id === a.id
-    return <div key={a.id} className={cn(RW.row, cur && RW.rowCur)} data-id={a.id} onClick={() => nav.select({ kind: 'worker', id: a.id })}>
-      <span className="inline-flex size-3.5 flex-none items-center justify-center" title={stLabel(a.status)}>
-        {isLive(a) ? <LiveDot paused={a.status !== 'running'} className="mx-[3px]" /> : <StatusGlyph status={a.status} />}
+    const live = !terminal && isActiveTask(a)
+    const r0 = isRound0ThreatModelWorker(a) ? deriveRound0PipelineState({ assignment: a, detail: model.detail, events }) : null
+    return <div
+      key={a.id}
+      className={cn(RW.row, pinned && 'bg-panel/85 border-l-accent last:border-b-0 hover:bg-panel', cur && RW.rowCur)}
+      data-id={a.id}
+      data-n={a.id}
+      onClick={() => nav.select({ kind: 'worker', id: a.id })}
+    >
+      <span className={ICON_SLOT} title={stLabel(a.status)}>
+        {live ? <LiveDot paused={a.status !== 'running'} className="mx-[3px]" /> : <StatusGlyph status={a.status} />}
       </span>
-      <span className="min-w-0 flex-1 truncate text-fg">{a.title}</span>
-      {fs.length > 0 && <span className="inline-flex h-[17px] flex-none items-center gap-1 rounded-[9px] bg-panel px-1.5 text-[11px] font-medium text-fg shadow-[inset_0_0_0_1px_var(--line-2)]" title="Findings citing this worker's evidence or exchanges"><SevGlyph sev={worstSeverity(fs)} />{fs.length}</span>}
-      {nfa > 0 && <span className="inline-flex h-[17px] flex-none items-center gap-1 rounded-[9px] bg-sunk px-1.5 text-[11px] font-medium text-fg-muted shadow-[inset_0_0_0_1px_var(--line-2)]" title="Facts recorded">{nfa} facts</span>}
-      {group !== 'phase' && <span className="max-w-[170px] flex-none truncate"><Tag>{PHASE_LABEL[a.phase] ?? a.phase}</Tag></span>}
-      <span className="w-[150px] flex-none truncate text-right font-mono text-[12px] text-fg-subtle max-[1320px]:w-[120px] max-[1180px]:hidden">{host(a.sourceOrigins[0] ?? '')}</span>
-      <span className="flex w-[88px] flex-none items-center justify-end gap-[7px] text-fg-subtle tabular-nums" title="Turns used">
-        <span className="relative h-[3px] w-9 overflow-hidden rounded-[3px] bg-line-2"><i className="absolute inset-y-0 left-0 bg-fg-subtle" style={{ width: pct + '%' }} /></span>
-        {a.turnsUsed}/{a.maxTurns}
-      </span>
-      <span className="w-[52px] flex-none text-right text-fg-subtle tabular-nums" title="Requests">{fmtN(a.requestsUsed)} req</span>
+      <span className={cn('min-w-0 flex-1 truncate text-fg', pinned && 'font-medium')}>{a.title}</span>
+      {pinned && <Tag tone={a.status === 'running' ? 'accent' : 'warn'}>{stLabel(a.status)}</Tag>}
+      {fs.length > 0 && <span className={cn(PILL, 'bg-panel text-fg')} title="Findings"><SevGlyph sev={worstSeverity(fs)} />{fs.length}</span>}
+      {!r0 && nfa > 0 && <span className={cn(PILL, 'bg-sunk text-fg-muted')}>{nfa} facts</span>}
+      {r0 ? <>
+        <Tag tone={live ? 'accent' : 'solid'}>{r0.stageShort}</Tag>
+        {r0.counts.totalHosts > 0 && <span className="flex-none text-[12px] text-fg-subtle tabular-nums">{r0.counts.mappedHosts}/{r0.counts.totalHosts} hosts</span>}
+      </> : <>
+        {(pinned || group !== 'phase') && <span className="max-w-[140px] flex-none truncate"><Tag>{PHASE_LABEL[a.phase] ?? a.phase}</Tag></span>}
+        <span className="w-[120px] flex-none truncate text-right font-mono text-[12px] text-fg-subtle max-[1340px]:hidden">{host(a.sourceOrigins[0] ?? '')}</span>
+        <span className="flex w-[84px] flex-none items-center justify-end gap-1.5 text-fg-subtle tabular-nums" title="Turns used">
+          <span className="relative h-[3px] w-8 overflow-hidden rounded bg-line-2"><i className={cn('absolute inset-y-0 left-0', live ? 'bg-accent' : 'bg-fg-subtle')} style={{ width: pct + '%' }} /></span>
+          {a.turnsUsed}/{a.maxTurns}
+        </span>
+      </>}
+      <span className="w-[52px] flex-none text-right text-fg-subtle tabular-nums" title="Requests">{fmtN(r0 ? r0.counts.requests : a.requestsUsed)} req</span>
     </div>
   }
   if (!items.length) return <EmptyState icon="search" title="Nothing matches" style={{ paddingTop: 80 }}>Try a different filter or switch tabs.</EmptyState>
   return <div className={RW.list} ref={listRef} tabIndex={-1} role="region" aria-label="Worker list">
+    {activeItems.length > 0 && (
+      <section data-testid="workflow-active-section" aria-label={`Active now (${activeItems.length})`} className="mx-3 my-2.5 overflow-hidden rounded-lg border border-accent-line bg-accent-soft/45">
+        <div className="flex h-8 items-center gap-2 border-b border-accent-line/60 bg-accent-soft px-3 text-[12px] font-medium text-fg">
+          <LiveDot paused={!activeItems.some(a => a.status === 'running')} />
+          <span>Active now ({activeItems.length})</span>
+          <span className="ml-auto text-[11.5px] font-normal text-fg-muted">{PHASE_LABEL[model.detail.run.phase] ?? model.detail.run.phase}</span>
+        </div>
+        {activeItems.map(a => row(a, true))}
+      </section>
+    )}
     {groups ? groups.map(g => {
       const col = !!collapsed[ck(g.key)]
       const tu = g.items.reduce((s, a) => s + a.turnsUsed, 0), req = g.items.reduce((s, a) => s + a.requestsUsed, 0)
@@ -317,15 +357,15 @@ function WorkerList({ matches }: { matches: (a: Assignment) => boolean }) {
         <div className={RW.ghead} role="button" tabIndex={0} aria-expanded={!col}
           onClick={() => setCollapsed(c => ({ ...c, [ck(g.key)]: !col }))}
           onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setCollapsed(c => ({ ...c, [ck(g.key)]: !col })) } }}>
-          <Icon name="chev" className={cn('text-fg-subtle transition-transform duration-[var(--d2)] ease-kovo', col && '-rotate-90')} />
-          <span className="inline-flex size-3.5 flex-none items-center justify-center">{g.glyph}</span>
+          <Icon name="chev" className={cn('text-fg-subtle transition-transform', col && '-rotate-90')} />
+          <span className={ICON_SLOT}>{g.glyph}</span>
           <span>{g.label}</span>
           <span className="font-normal text-fg-subtle tabular-nums">{g.items.length}</span>
           <span className="ml-auto flex items-center gap-2 font-normal text-fg-subtle tabular-nums">{fmtN(tu)} turns · {fmtN(req)} req</span>
         </div>
-        {!col && g.items.map(row)}
+        {!col && g.items.map(a => row(a))}
       </div>
-    }) : items.map(row)}
+    }) : restItems.map(a => row(a))}
     <div className={cn(RW.listnote, 'gap-1')}><Kbd>L</Kbd> graph · <Kbd>⇧</Kbd><Kbd>G</Kbd> grouping</div>
   </div>
 }
