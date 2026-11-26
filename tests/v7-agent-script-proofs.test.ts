@@ -399,6 +399,8 @@ test('v7 agent-script-proofs: schema v8->v9 additive migration and proof column 
 
   // Simulate an existing v8 database on disk (no proof_* columns, user_version = 8).
   const rawDb = new DatabaseSync(join(dir, 'kovo.sqlite'))
+  rawDb.exec('DROP TRIGGER IF EXISTS findings_confirmation_evidence_insert;')
+  rawDb.exec('DROP TRIGGER IF EXISTS findings_confirmation_evidence_update;')
   rawDb.exec('DROP INDEX IF EXISTS replay_specs_proof;')
   for (const col of ['proof_kind', 'proof_verdict', 'proof_runtime', 'proof_script_sha256', 'proof_artifact_id', 'proof_receipt']) {
     rawDb.exec(`ALTER TABLE replay_specs DROP COLUMN ${col};`)
@@ -413,7 +415,7 @@ test('v7 agent-script-proofs: schema v8->v9 additive migration and proof column 
   t.after(() => migrated.close())
   const version = (migrated.client.prepare('PRAGMA user_version').get() as { user_version: number }).user_version
   assert.equal(version, STORE_SCHEMA_VERSION)
-  assert.equal(STORE_SCHEMA_VERSION, 9)
+  assert.equal(STORE_SCHEMA_VERSION, 10)
   const v9Cols = new Set((migrated.client.prepare('PRAGMA table_info(replay_specs)').all() as Array<{ name: string }>).map(r => r.name))
   for (const col of ['proof_kind', 'proof_verdict', 'proof_runtime', 'proof_script_sha256', 'proof_artifact_id', 'proof_receipt']) {
     assert.equal(v9Cols.has(col), true, `migrated replay_specs must have ${col}`)

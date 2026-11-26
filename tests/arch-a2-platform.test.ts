@@ -261,7 +261,7 @@ test('Store.workspaceSummary and Store.runShellSummary match expected rollups an
   assert.equal(summaryA.latestRun.status, 'complete')
   assert.equal(summaryA.latestRun.phase, 'report')
   assert.equal(summaryA.latestRun.findingCount, 3) // excludes superseded
-  assert.equal(summaryA.latestRun.confirmedCount, 2) // confirmed + static_verified, excludes superseded & open
+  assert.equal(summaryA.latestRun.confirmedCount, 1) // runtime_confirmed + confirmed, excludes static_verified, superseded & open
 
   const summaryB = ws.projects.find(p => p.id === projB.id)!
   assert.equal(summaryB.runCount, 1)
@@ -275,7 +275,7 @@ test('Store.workspaceSummary and Store.runShellSummary match expected rollups an
   const recentA2 = ws.recentRuns.find(r => r.id === runA2.id)!
   assert.equal(recentA2.projectName, 'Alpha App')
   assert.equal(recentA2.findings, 3)
-  assert.equal(recentA2.confirmedCount, 2)
+  assert.equal(recentA2.confirmedCount, 1)
 
   // runShellSummary returns all workspace runs newest first + exact exchange & event counts
   const shell = store.runShellSummary(runA2.id)
