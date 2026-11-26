@@ -17,12 +17,14 @@ import { z } from 'zod'
 import { scopedAssetOrigin } from '../domain.ts'
 import {
   HostFactLog,
+  deriveCredentialPlacement,
   hasVaultScrubbedRequestPlane,
   hasVaultScrubbedToken,
   isReservedEvidenceRole,
   parseBodyFromCarrierText,
   type HostCredentialPlacement,
   type HostExchangeFact,
+  type WireCredentialProvenance,
 } from './host-fact-log.ts'
 import {
   assessBooleanDifferential,
@@ -33,6 +35,7 @@ import {
   isObjectScopedRequest,
   knownOracleEvent,
   stepMutatesState,
+  verifyBooleanTriangleBinding,
 } from './oracle-invariants.ts'
 import type { BooleanDifferentialArm, BooleanDifferentialRound, ImpactClass, ImpactInput, ImpactStep, RoleName } from './oracle-invariants.ts'
 import { isJobOrHandleStub } from './v8-oracle-families.ts'
@@ -328,6 +331,8 @@ export interface ReceiptTranscriptEntry {
   raceBatchId?: string | null
   /** H-13: Host-only wire credential placement provenance. */
   credentialPlacement?: HostCredentialPlacement
+  /** H-14: Broker-observed wire credential provenance (header/cookie names & auth sources). */
+  wireCredentialProvenance?: Readonly<WireCredentialProvenance>
   /** R2-C-9: True if the request plane carried a vault-scrubbed `[redacted:cap:...]` token. */
   requestPlaneVaultScrubbed?: boolean
   /** R2-C-6: Host-minted evaluated-expression challenge bound to this probe exchange. */
@@ -707,6 +712,9 @@ export function verifyReceipt(
       return reject(receipt, rule, 'A boolean differential needs at least two paired control/probe rounds.')
     }
     const arms = receipt.exchangeIds.map(id => entriesById.get(id)!)
+    if (arms.some(entry => entryHasVaultScrubbedRequestPlane(entry))) {
+      return reject(receipt, rule, 'Kernel request plane contains a vault-scrubbed/redacted placeholder ([redacted...]); boolean differential fails closed.')
+    }
     const isBaselineEntry = (arm: ReceiptTranscriptEntry): boolean => {
       const role = (arm.evidenceRole ?? '').trim().toLowerCase()
       return role === 'benign_baseline' || role === 'baseline'
@@ -732,6 +740,8 @@ export function verifyReceipt(
       return {
         status: entry.step.status,
         method: entry.step.method,
+        ...(entry.origin ? { origin: entry.origin } : {}),
+        persona: entry.step.actor.handle ?? null,
         pathAndQuery: entry.step.pathAndQuery,
         ...(entry.step.requestJson !== undefined ? { requestJson: entry.step.requestJson } : {}),
         ...(requestBody !== undefined ? { requestBody } : {}),
@@ -769,10 +779,14 @@ export function verifyReceipt(
   }
 
   if (rule === 'status_differential') {
-    const arms = receipt.exchangeIds.map(id => entriesById.get(id)!.step)
-    const triangle = statusDifferentialRounds(arms)
+    const citedEntries = receipt.exchangeIds.map(id => entriesById.get(id)!)
+    if (citedEntries.some(entry => entryHasVaultScrubbedRequestPlane(entry))) {
+      return reject(receipt, rule, 'Kernel request plane contains a vault-scrubbed/redacted placeholder ([redacted...]); status differential fails closed.')
+    }
+    const arms = citedEntries.map(entry => entry.step)
+    const triangle = statusDifferentialRounds(arms, receipt.target.param ?? null)
     if (!triangle) {
-      return reject(receipt, rule, 'A status differential needs a benign 2xx baseline, a 2xx tautology arm and a <500 contradiction arm on the same request shape, in every round.')
+      return reject(receipt, rule, 'A status differential needs a benign 2xx baseline, a 2xx tautology arm and a <500 contradiction arm on the same request shape and byte-identical stripped base value, in every round.')
     }
     if (triangle.rounds.length < 2) {
       return reject(receipt, rule, 'A status differential needs at least two complete benign/tautology/contradiction rounds.')
@@ -781,7 +795,7 @@ export function verifyReceipt(
       const assessment = assessInjectionImpact({
         impactClass: 'injection',
         steps: [round.benign, round.tautology, round.contradiction],
-        injection: { family: 'sqli', statusBoolean: round },
+        injection: { family: 'sqli', param: receipt.target.param, statusBoolean: { ...round, param: receipt.target.param ?? null } },
       })
       if (!assessment.satisfied) {
         return {
@@ -1207,13 +1221,13 @@ export function verifyReceipt(
   if (receipt.exchangeIds.length === 0) return reject(receipt, rule, 'An impact receipt needs at least one recorded exchange.')
   const citedEntries = receipt.exchangeIds.map(id => entriesById.get(id)!)
   const steps = citedEntries.map(entry => entry.step)
-  // R2-C-9: Kernel request plane must NEVER contain vault-scrubbed `[redacted:cap:...]` tokens
-  // on injection/markup checks (prevents anti-reflection bypass).
+  // R2-C-9 / R3-C-3: Kernel request plane must NEVER contain redacted placeholders (`[redacted...]`
+  // or `[redacted:cap:...]`) on injection/markup checks (prevents anti-reflection bypass).
   if ((impactClass === 'injection' || impactClass === 'markup') && citedEntries.some(entry => entryHasVaultScrubbedRequestPlane(entry))) {
     return reject(
       receipt,
       rule,
-      `Kernel request plane contains a vault-scrubbed [redacted:cap:...] token; anti-reflection for ${impactClass} fails closed.`,
+      `Kernel request plane contains a vault-scrubbed/redacted placeholder ([redacted...]); anti-reflection for ${impactClass} fails closed.`,
     )
   }
   const statusOnly = assessStatusOnlyDivergence(steps)
@@ -2064,18 +2078,80 @@ function probeCarriedHostCredentialControlLacked(
   if (prbHeaders.cookie && prbHeaders.cookie !== ctlHeaders.cookie) {
     return 'Auth bypass rejected: probe carried a session cookie that the control lacked (session-jar authentication is not an authentication bypass).'
   }
-  if (probe.sessionId && probe.sessionId !== control.sessionId) {
+  const ctlSessionId = control.sessionId ?? control.wireCredentialProvenance?.session ?? null
+  const prbSessionId = probe.sessionId ?? probe.wireCredentialProvenance?.session ?? null
+  if (prbSessionId && prbSessionId !== ctlSessionId) {
     return 'Auth bypass rejected: probe used an authenticated session jar that the control lacked.'
   }
 
-  // C-4: Reject self-sabotaged controls (control carries an extra security header absent from an
-  // authenticated probe carrying a cookie/session/persona, e.g., cookie + invalid Bearer vs cookie).
-  const probeAuthenticated = prbHandle !== null || Boolean(prbHeaders.cookie) || Boolean(probe.sessionId)
+  // H-14: Actively enforce signed broker `wireCredentialProvenance` so host-injected vault
+  // credentials, session-jar cookies, or ephemeral observed auth on the wire can never pass as
+  // an unauthenticated auth_bypass (even when scrubbed/omitted from requestHeaders).
+  const ctlWire = control.wireCredentialProvenance
+  const prbWire = probe.wireCredentialProvenance
+  if (prbWire) {
+    const ctlSources = new Set(ctlWire?.sources ?? [])
+    const ctlVaultHeaders = new Set((ctlWire?.vaultHeaderNames ?? []).map(h => h.toLowerCase()))
+    const ctlVaultCookies = new Set((ctlWire?.vaultCookieNames ?? []).map(c => c.toLowerCase()))
+    const ctlJarCookies = new Set((ctlWire?.jarCookieNames ?? []).map(c => c.toLowerCase()))
+    const ctlWireCookies = new Set((ctlWire?.cookieNames ?? []).map(c => c.toLowerCase()))
+    const prbWireHandle = normalizedAuthHandle(prbWire.personaHandle)
+    const ctlWireHandle = normalizedAuthHandle(ctlWire?.personaHandle ?? control.step.actor.handle)
+    if (
+      prbWire.sources.includes('persona_vault') ||
+      prbWire.vaultHeaderNames.length > 0 ||
+      prbWire.vaultCookieNames.length > 0 ||
+      prbWireHandle !== null
+    ) {
+      if (
+        !ctlSources.has('persona_vault') ||
+        (prbWireHandle !== null && prbWireHandle !== ctlWireHandle) ||
+        prbWire.vaultHeaderNames.some(h => !ctlVaultHeaders.has(h.toLowerCase())) ||
+        prbWire.vaultCookieNames.some(c => !ctlVaultCookies.has(c.toLowerCase()))
+      ) {
+        return 'Auth bypass rejected: wire credential provenance shows probe carried host persona-vault credentials that the control lacked (normal authentication is not an authentication bypass).'
+      }
+    }
+    if (prbWire.sources.includes('session_jar') || prbWire.jarCookieNames.length > 0 || prbWire.session) {
+      if (
+        (prbWire.session && prbWire.session !== ctlSessionId) ||
+        prbWire.jarCookieNames.some(c => !ctlJarCookies.has(c.toLowerCase())) ||
+        (prbWire.sources.includes('session_jar') && !ctlSources.has('session_jar'))
+      ) {
+        return 'Auth bypass rejected: wire credential provenance shows probe carried session-jar credentials that the control lacked (session-jar authentication is not an authentication bypass).'
+      }
+    }
+    if (prbWire.sources.includes('ephemeral_observed') && !ctlSources.has('ephemeral_observed')) {
+      return 'Auth bypass rejected: wire credential provenance shows probe replayed host-observed ephemeral credentials that the control lacked.'
+    }
+    if (prbWire.cookieNames.some(c => !ctlWireCookies.has(c.toLowerCase()))) {
+      return 'Auth bypass rejected: wire credential provenance shows probe transmitted cookie(s) on the wire that the control lacked.'
+    }
+  }
+
+  // C-4 / H-14: Reject self-sabotaged controls (control carries an extra security header absent from an
+  // authenticated probe carrying a cookie/session/persona/wire credential, e.g., cookie + invalid Bearer vs cookie).
+  const probeHostWireAuth = Boolean(
+    prbWire && (
+      prbWire.sources.some(s => s === 'persona_vault' || s === 'session_jar' || s === 'ephemeral_observed') ||
+      prbWire.session ||
+      prbWire.vaultHeaderNames.length > 0 ||
+      prbWire.vaultCookieNames.length > 0 ||
+      prbWire.jarCookieNames.length > 0
+    ),
+  )
+  const probeAuthenticated = prbHandle !== null || Boolean(prbHeaders.cookie) || Boolean(prbSessionId) || probeHostWireAuth
   if (probeAuthenticated) {
     for (const [k, v] of Object.entries(ctlHeaders)) {
       if (k === 'cookie' || !AUTH_BYPASS_SECURITY_HEADER_RE.test(k)) continue
       if (v.trim().length > 0 && !(prbHeaders[k] ?? '').trim()) {
         return 'Auth bypass rejected: control carried an extra auth header absent from the authenticated probe (self-sabotaged control is not an authentication bypass).'
+      }
+    }
+    if (ctlWire) {
+      const prbCallerHeaders = new Set((prbWire?.callerAuthHeaderNames ?? []).map(h => h.toLowerCase()))
+      if (ctlWire.callerAuthHeaderNames.some(h => h.toLowerCase() !== 'cookie' && !prbCallerHeaders.has(h.toLowerCase()))) {
+        return 'Auth bypass rejected: wire credential provenance shows control carried an extra caller auth header absent from the authenticated probe (self-sabotaged control is not an authentication bypass).'
       }
     }
   }
@@ -2238,7 +2314,7 @@ function verifyAuthBypassReceipt(
       const controlHeaders = canonicalRequestHeaderMap(control.step.requestHeaders)
       const authenticatedControl = normalizedAuthHandle(control.step.actor.handle) !== null ||
         ['cookie', 'bearer', 'header'].includes(control.step.actor.auth) ||
-        Boolean(controlHeaders.cookie || controlHeaders.authorization || control.sessionId)
+        Boolean(controlHeaders.cookie || controlHeaders.authorization || control.sessionId || control.wireCredentialProvenance?.authenticated || control.wireCredentialProvenance?.session)
       if (differential !== 'header' && (control.step.status !== 401 || authenticatedControl)) {
         lastRejection = 'Auth bypass rejected: an authenticated/forbidden control changing only a query or body field is an authorization or ordinary request difference, not an authentication bypass.'
         continue
@@ -2344,8 +2420,26 @@ export function isCrossSiteSendableCsrfRequest(
   targetOrigin: string,
   entry?: ReceiptTranscriptEntry,
 ): { sendable: boolean; reason?: string } {
-  if (entry?.credentialPlacement?.mixed) {
-    return { sendable: false, reason: 'mixed credential placement (cookie + bearer/header) is not a pure ambient-cookie CSRF' }
+  // R3-H-5: Re-derive authoritative placement from host-stamped placement + signed wire provenance
+  // whenever present so mixed bearer+cookie or worker-named capability cookies NEVER pass as CSRF.
+  if (entry?.credentialPlacement || entry?.wireCredentialProvenance) {
+    const placement = deriveCredentialPlacement(
+      step.requestHeaders,
+      entry.credentialPlacement,
+      entry.wireCredentialProvenance,
+    )
+    if (placement.mixed) {
+      return { sendable: false, reason: 'mixed credential placement (cookie + bearer/header) is not a pure ambient-cookie CSRF' }
+    }
+    if (placement.personaAuthKind && placement.personaAuthKind !== 'cookie') {
+      return { sendable: false, reason: `host wire credential placement is "${placement.personaAuthKind}" rather than a pure ambient cookie` }
+    }
+    if (placement.wireAuthHeaders && placement.wireAuthHeaders.length > 0) {
+      return { sendable: false, reason: `wire credential provenance includes explicit auth header(s) (${placement.wireAuthHeaders.join(', ')}) that a cross-site browser form cannot attach` }
+    }
+    if (placement.capabilityAuthInjected && (placement.jarCookieNames?.length ?? 0) === 0 && (placement.vaultCookieNames?.length ?? 0) === 0) {
+      return { sendable: false, reason: 'worker-chosen capability cookie injection is not an ambient browser session cookie' }
+    }
   }
   const reqHeaders = step.requestHeaders ?? {}
   if (headerValue(reqHeaders, 'authorization') || headerValue(reqHeaders, 'x-api-key') || headerValue(reqHeaders, 'x-auth-token')) {
@@ -2397,14 +2491,12 @@ export function isCrossSiteSendableCsrfRequest(
   return { sendable: true }
 }
 
-/** R2-C-9: Detect vault-scrubbed `[redacted:cap:...]` tokens anywhere in a transcript entry's request plane. */
+/** R2-C-9 / R3-C-3: Detect any `[redacted...]` placeholder anywhere in a transcript entry's request plane. */
 export function entryHasVaultScrubbedRequestPlane(entry: ReceiptTranscriptEntry): boolean {
   if (entry.requestPlaneVaultScrubbed === true) return true
-  const reqBody = entry.step.requestJson === undefined
-    ? null
-    : typeof entry.step.requestJson === 'string'
-      ? entry.step.requestJson
-      : JSON.stringify(entry.step.requestJson)
+  const reqBody = entry.step.requestJson !== undefined
+    ? (typeof entry.step.requestJson === 'string' ? entry.step.requestJson : JSON.stringify(entry.step.requestJson))
+    : (entry.step.requestBody ?? null)
   return hasVaultScrubbedRequestPlane({
     pathAndQuery: entry.step.pathAndQuery ?? entry.step.route ?? null,
     requestHeaders: entry.step.requestHeaders ?? null,
@@ -2744,52 +2836,87 @@ function verifyEvaluatedExpression(
   }
 }
 
+function stepToBooleanArm(step: ImpactStep): BooleanDifferentialArm {
+  return {
+    status: step.status,
+    method: step.method,
+    persona: step.actor.handle ?? null,
+    pathAndQuery: step.pathAndQuery ?? step.route,
+    ...(step.requestJson !== undefined ? { requestJson: step.requestJson } : {}),
+    ...(step.requestBody !== undefined ? { requestBody: step.requestBody } : {}),
+    requestHeaders: step.requestHeaders ?? null,
+    ...(step.json !== undefined ? { json: step.json } : {}),
+    ...(step.body !== undefined ? { body: step.body } : {}),
+  }
+}
+
 /**
- * Reconstruct the benign / tautology / contradiction triangle from the cited arms.
- *
- * The recipe records an `evidenceRole` per exchange, so the normal case is an exact role match.
- * Transcripts built by other producers (async promotion, unit callers) may not carry roles; the
- * fallback infers the triangle from the universal shape — a 2xx baseline without a boolean
- * operator, a 2xx arm with one, and a <500 failing arm with one. A 5xx contradiction is never
- * accepted, so a single malformed request cannot be mistaken for a predicate contrast.
+ * Reconstruct the benign / tautology / contradiction triangle from the cited arms, routing every
+ * candidate round through the shared kernel `verifyBooleanTriangleBinding` (R3-C-4) so identical
+ * stripped base values, named-parameter predicate parsing, and request shape are enforced.
  */
-function statusDifferentialRounds(arms: readonly ImpactStep[]): { rounds: Array<{ benign: ImpactStep; tautology: ImpactStep; contradiction: ImpactStep }> } | null {
+function statusDifferentialRounds(
+  arms: readonly ImpactStep[],
+  param?: string | null,
+): { rounds: Array<{ benign: ImpactStep; tautology: ImpactStep; contradiction: ImpactStep }> } | null {
   const entries = arms as Array<ImpactStep & { evidenceRole?: string }>
   const byRole = (role: string): ImpactStep[] => entries.filter(arm => arm.evidenceRole === role)
   const roleBenign = byRole('benign_baseline')
   const roleTautology = byRole('tautology')
   const roleContradiction = byRole('contradiction')
-  const booleanRequest = (step: ImpactStep): boolean => {
-    const raw = `${step.pathAndQuery ?? ''}${step.requestJson === undefined ? '' : JSON.stringify(step.requestJson)}`
-    let text = raw
-    try { text = decodeURIComponent(raw) } catch { /* keep raw */ }
-    return /\b(?:AND|OR)\b/i.test(text)
-  }
   const success = (status: number | null): boolean => status !== null && status >= 200 && status < 300
   const finishing = (status: number | null): boolean => status !== null && status >= 400 && status < 500
-  const benign = roleBenign.length > 0
-    ? roleBenign
-    : entries.filter(step => step.arm === 'control' && success(step.status) && !booleanRequest(step))
-  const tautology = roleTautology.length > 0
-    ? roleTautology
-    : entries.filter(step => success(step.status) && booleanRequest(step))
-  const contradiction = roleContradiction.length > 0
-    ? roleContradiction
-    : entries.filter(step => finishing(step.status) && booleanRequest(step))
-  if (benign.length === 0 || tautology.length === 0 || contradiction.length === 0) return null
-  const rounds = Math.min(tautology.length, contradiction.length)
-  if (rounds === 0) return null
-  // Every arm of the triangle must be a well-formed member: the baseline is a 2xx without a
-  // predicate, the two predicate arms are one 2xx and one <500 failure. Anything else means the
-  // caller assembled the triangle from unrelated exchanges.
-  if (benign.some(step => !success(step.status) || booleanRequest(step))) return null
-  if (tautology.some(step => !success(step.status))) return null
-  if (contradiction.some(step => !finishing(step.status))) return null
-  return { rounds: Array.from({ length: rounds }, (_, index) => ({
-    benign: benign[index] ?? benign[benign.length - 1]!,
-    tautology: tautology[index]!,
-    contradiction: contradiction[index]!,
-  })) }
+  const verifyRound = (benign: ImpactStep, tautology: ImpactStep, contradiction: ImpactStep): boolean => {
+    if (!success(benign.status) || !success(tautology.status) || !finishing(contradiction.status)) return false
+    const binding = verifyBooleanTriangleBinding({
+      baseline: stepToBooleanArm(benign),
+      armA: stepToBooleanArm(tautology),
+      armB: stepToBooleanArm(contradiction),
+      param: param ?? null,
+      requireNamedParam: false,
+    })
+    return binding.ok && binding.trueArm === 'armA'
+  }
+
+  if (roleBenign.length > 0 || roleTautology.length > 0 || roleContradiction.length > 0) {
+    if (roleBenign.length === 0 || roleTautology.length === 0 || roleContradiction.length === 0) return null
+    const count = Math.min(roleTautology.length, roleContradiction.length)
+    if (count === 0) return null
+    const rounds: Array<{ benign: ImpactStep; tautology: ImpactStep; contradiction: ImpactStep }> = []
+    for (let index = 0; index < count; index += 1) {
+      const benign = roleBenign[index] ?? roleBenign[roleBenign.length - 1]!
+      const tautology = roleTautology[index]!
+      const contradiction = roleContradiction[index]!
+      if (!verifyRound(benign, tautology, contradiction)) return null
+      rounds.push({ benign, tautology, contradiction })
+    }
+    return { rounds }
+  }
+
+  // Fallback when explicit evidenceRole tags are omitted: pair 2xx baseline, 2xx tautology, and
+  // <500 contradiction strictly via `verifyBooleanTriangleBinding` (never raw regex scanning).
+  const okArms = entries.filter(step => success(step.status))
+  const failArms = entries.filter(step => finishing(step.status))
+  if (okArms.length < 2 || failArms.length === 0) return null
+  const usedTautologies = new Set<ImpactStep>()
+  const rounds: Array<{ benign: ImpactStep; tautology: ImpactStep; contradiction: ImpactStep }> = []
+  for (const contradiction of failArms) {
+    let matched: { benign: ImpactStep; tautology: ImpactStep } | null = null
+    for (const benign of okArms) {
+      for (const tautology of okArms) {
+        if (tautology === benign || usedTautologies.has(tautology)) continue
+        if (verifyRound(benign, tautology, contradiction)) {
+          matched = { benign, tautology }
+          break
+        }
+      }
+      if (matched) break
+    }
+    if (!matched) return null
+    usedTautologies.add(matched.tautology)
+    rounds.push({ benign: matched.benign, tautology: matched.tautology, contradiction })
+  }
+  return rounds.length > 0 ? { rounds } : null
 }
 
 function deriveDifferingParam(control: ReceiptTranscriptEntry, probe: ReceiptTranscriptEntry): string | null {
@@ -2885,6 +3012,8 @@ export interface ScriptProofExchange {
   raceBatchId?: string | null
   /** H-13: Host-only wire credential placement provenance. */
   credentialPlacement?: HostCredentialPlacement
+  /** H-14: Broker-observed wire credential provenance (header/cookie names & auth sources). */
+  wireCredentialProvenance?: Readonly<WireCredentialProvenance>
   /** R2-C-6: Host-minted evaluated-expression challenge bound to this exchange. */
   hostExpressionChallenge?: HostMintedExpressionChallenge
   /** H-15: Host-minted timing delay challenge bound to this exchange. */
@@ -3059,14 +3188,26 @@ export function buildAgentScriptReceipt(input: {
     const rawVuln = typeof recordField(claim, 'vulnClass') === 'string'
       ? (recordField(claim, 'vulnClass') as string).trim().toLowerCase()
       : ''
-    // H-14: A probe carrying a persona, sealed capability, session jar, or cookie that the control
-    // lacked cannot auto-classify as an unauthenticated auth_bypass.
+    // H-14: A probe carrying a persona, sealed capability, session jar, cookie, or host wire
+    // credential provenance that the control lacked cannot auto-classify as an unauthenticated auth_bypass.
+    const prbWire = probe.wireCredentialProvenance
+    const ctlWire = control.wireCredentialProvenance
+    const probeWireHasHostCred = Boolean(
+      prbWire && (
+        prbWire.sources.some(s => s === 'persona_vault' || s === 'session_jar' || s === 'ephemeral_observed') ||
+        prbWire.vaultHeaderNames.length > 0 ||
+        prbWire.vaultCookieNames.length > 0 ||
+        prbWire.jarCookieNames.length > 0 ||
+        (prbWire.session && prbWire.session !== (control.sessionId ?? ctlWire?.session ?? null))
+      ),
+    )
     const probeHasHostCredential = Boolean(
       normalizedAuthHandle(probe.actor) ||
       probe.consumedCapabilityId ||
       (probe.consumedCapabilities && probe.consumedCapabilities.length > 0) ||
-      (probe.sessionId && probe.sessionId !== control.sessionId) ||
-      (headerValue(probe.requestHeaders, 'cookie') && headerValue(probe.requestHeaders, 'cookie') !== headerValue(control.requestHeaders, 'cookie')),
+      (probe.sessionId && probe.sessionId !== (control.sessionId ?? ctlWire?.session ?? null)) ||
+      (headerValue(probe.requestHeaders, 'cookie') && headerValue(probe.requestHeaders, 'cookie') !== headerValue(control.requestHeaders, 'cookie')) ||
+      probeWireHasHostCred,
     )
     const isAuthBypass = AUTH_BYPASS_CLASS_RE.test(rawVuln) ||
       (boundaryClass === 'auth' && !rawVuln && !normalizedAuthHandle(control.actor) && !probeHasHostCredential)
