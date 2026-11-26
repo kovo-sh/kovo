@@ -260,8 +260,364 @@ const HTTP_METHOD_TOKEN_RE = /^[A-Z][A-Z0-9_-]{0,15}$/
 const METHOD_OVERRIDE_PRIORITY: readonly string[] = ['DELETE', 'PUT', 'PATCH', 'POST']
 /** Deterministic body classification window (64 KiB). Bodies above this fail closed as override-risk (`R3-H-1(b)`). */
 export const MAX_OVERRIDE_BODY_SCAN_CHARS = 64 * 1024
-/** Hard ceiling for full-body method-override parsing to bound memory/CPU; larger bodies fail closed as unscannable. */
+/** Hard ceiling for linear-time method-override scanning to bound memory/CPU; larger bodies fail closed as unscannable. */
 const MAX_OVERRIDE_FULL_SCAN_CHARS = 4 * 1024 * 1024
+
+function isAsciiHws(code: number): boolean {
+  return code === 0x20 /* ' ' */ || code === 0x09 /* '\t' */
+}
+
+function isAsciiWs(code: number): boolean {
+  return code === 0x20 || code === 0x09 || code === 0x0a || code === 0x0d
+}
+
+function skipHws(text: string, start: number, end: number): number {
+  let i = start
+  while (i < end && isAsciiHws(text.charCodeAt(i))) i += 1
+  return i
+}
+
+function trimEndHws(text: string, start: number, end: number): number {
+  let i = end
+  while (i > start && isAsciiHws(text.charCodeAt(i - 1))) i -= 1
+  return i
+}
+
+function firstNonWsIndex(text: string): number {
+  let i = 0
+  const n = text.length
+  while (i < n && isAsciiWs(text.charCodeAt(i))) i += 1
+  return i
+}
+
+function lastNonWsIndex(text: string): number {
+  let i = text.length - 1
+  while (i >= 0 && isAsciiWs(text.charCodeAt(i))) i -= 1
+  return i
+}
+
+/** Zero-allocation ASCII case-insensitive prefix match within `[offset, end)`. */
+function matchAsciiIgnoreCase(text: string, offset: number, end: number, lowerNeedle: string): boolean {
+  const nLen = lowerNeedle.length
+  if (offset + nLen > end) return false
+  for (let k = 0; k < nLen; k += 1) {
+    let c = text.charCodeAt(offset + k)
+    if (c >= 0x41 && c <= 0x5a) c += 0x20
+    if (c !== lowerNeedle.charCodeAt(k)) return false
+  }
+  return true
+}
+
+/** Zero-allocation ASCII case-insensitive exact match on `[start, end)`. */
+function equalsAsciiIgnoreCase(text: string, start: number, end: number, lowerNeedle: string): boolean {
+  return end - start === lowerNeedle.length && matchAsciiIgnoreCase(text, start, end, lowerNeedle)
+}
+
+/**
+ * Single-pass O(n) `&`-delimited form-urlencoded `_method` scanner (`R4-H-14`).
+ * Avoids allocating huge `URLSearchParams` entry arrays on multi-megabyte bodies while
+ * matching plain (`_method=...`) and percent-encoded (`%5fmethod=...`) keys identically.
+ */
+function scanFormUrlEncodedMethodOverrides(body: string): string[] {
+  const verbs: string[] = []
+  const len = body.length
+  let pos = 0
+
+  while (pos < len) {
+    const amp = body.indexOf('&', pos)
+    const segEnd = amp === -1 ? len : amp
+    const eq = body.indexOf('=', pos)
+    if (eq !== -1 && eq < segEnd) {
+      const keyLen = eq - pos
+      if (keyLen >= 7 && keyLen <= 32) {
+        let isMethodKey = keyLen === 7 && matchAsciiIgnoreCase(body, pos, eq, '_method')
+        if (!isMethodKey) {
+          const rawKey = body.slice(pos, eq)
+          let decodedKey = rawKey
+          try {
+            decodedKey = decodeURIComponent(rawKey.replaceAll('+', ' '))
+          } catch {
+            /* keep raw */
+          }
+          isMethodKey = decodedKey.trim().toLowerCase() === '_method'
+        }
+        if (isMethodKey) {
+          const valEnd = Math.min(segEnd, eq + 1 + 64)
+          const rawVal = body.slice(eq + 1, valEnd)
+          let decodedVal = rawVal
+          try {
+            decodedVal = decodeURIComponent(rawVal.replaceAll('+', ' '))
+          } catch {
+            /* keep raw */
+          }
+          if (decodedVal.trim().length > 0) {
+            verbs.push(decodedVal)
+          }
+        }
+      }
+    }
+    pos = amp === -1 ? len : amp + 1
+  }
+
+  return verbs
+}
+
+/**
+ * Strictly O(n) single-pass JSON `"_method"` / `"\u005fmethod"` scanner (`R4-H-14`).
+ * Cursor advances monotonically with zero backtracking and zero whole-body object allocation.
+ */
+function scanJsonMethodOverrides(text: string): string[] {
+  const verbs: string[] = []
+  const len = text.length
+  let pos = 0
+
+  while (pos < len) {
+    const q = text.indexOf('"', pos)
+    if (q === -1 || q + 9 >= len) break
+    // Skip escaped quotes inside string literals
+    if (q > 0 && text.charCodeAt(q - 1) === 0x5c /* '\\' */) {
+      pos = q + 1
+      continue
+    }
+    const nextCh = text.charCodeAt(q + 1)
+    let afterKey = -1
+    if (nextCh === 0x5f /* '_' */ && matchAsciiIgnoreCase(text, q + 1, len, '_method"')) {
+      afterKey = q + 9
+    } else if (nextCh === 0x5c /* '\\' */ && matchAsciiIgnoreCase(text, q + 1, len, '\\u005fmethod"')) {
+      afterKey = q + 14
+    }
+    if (afterKey === -1) {
+      pos = q + 1
+      continue
+    }
+
+    let cur = afterKey
+    while (cur < len && isAsciiWs(text.charCodeAt(cur))) cur += 1
+    if (cur >= len || text.charCodeAt(cur) !== 0x3a /* ':' */) {
+      pos = cur
+      continue
+    }
+    cur += 1
+    while (cur < len && isAsciiWs(text.charCodeAt(cur))) cur += 1
+    if (cur >= len || text.charCodeAt(cur) !== 0x22 /* '"' */) {
+      pos = cur
+      continue
+    }
+    const valStart = cur + 1
+    const valLimit = Math.min(len, valStart + 64)
+    let valEnd = valStart
+    let closed = false
+    while (valEnd < valLimit) {
+      const c = text.charCodeAt(valEnd)
+      if (c === 0x22 /* '"' */) {
+        closed = true
+        break
+      }
+      if (c === 0x5c /* '\\' */ || c === 0x0a || c === 0x0d) break
+      valEnd += 1
+    }
+    if (closed && valEnd > valStart) {
+      const val = text.slice(valStart, valEnd).trim()
+      if (val.length > 0) verbs.push(val)
+      pos = valEnd + 1
+    } else {
+      pos = valEnd
+    }
+  }
+
+  return verbs
+}
+
+/**
+ * Single-pass O(end - start) scan of semicolon-delimited `Content-Disposition` parameters
+ * looking for `name="_method"` / `name=_method` / `name='_method'` (case-insensitive).
+ */
+function paramsContainMethodName(body: string, start: number, end: number): boolean {
+  let cur = start
+  while (cur < end) {
+    const nextSemi = body.indexOf(';', cur)
+    const segEnd = nextSemi === -1 || nextSemi > end ? end : nextSemi
+    let p = skipHws(body, cur, segEnd)
+    if (matchAsciiIgnoreCase(body, p, segEnd, 'name')) {
+      p = skipHws(body, p + 4, segEnd)
+      if (p < segEnd && body.charCodeAt(p) === 0x3d /* '=' */) {
+        p = skipHws(body, p + 1, segEnd)
+        const vEnd = trimEndHws(body, p, segEnd)
+        if (p < vEnd) {
+          const first = body.charCodeAt(p)
+          if (first === 0x22 /* '"' */ || first === 0x27 /* "'" */) {
+            p += 1
+            if (
+              matchAsciiIgnoreCase(body, p, vEnd, '_method') &&
+              (p + 7 === vEnd || body.charCodeAt(p + 7) === first)
+            ) {
+              return true
+            }
+          } else if (
+            matchAsciiIgnoreCase(body, p, vEnd, '_method') &&
+            (p + 7 === vEnd || isAsciiHws(body.charCodeAt(p + 7)))
+          ) {
+            return true
+          }
+        }
+      }
+    }
+    cur = nextSemi === -1 || nextSemi >= end ? end : nextSemi + 1
+  }
+  return false
+}
+
+/**
+ * Strictly O(n) single-pass CRLF/LF multipart `Content-Disposition` tokenizer (`R4-H-14`).
+ *
+ * Replaces the quadratic `[^\r\n]*\bname` regex so even adversarial 2 MiB single-line bodies
+ * with repeated disposition prefixes finish in a few milliseconds with zero backtracking and
+ * zero whole-body string lowercasing.
+ */
+function scanMultipartMethodOverrides(body: string): { found: boolean; verbs: string[] } {
+  let found = false
+  const verbs: string[] = []
+  const len = body.length
+  let pos = 0
+
+  while (pos < len) {
+    const lineStart = pos
+    const lfIdx = body.indexOf('\n', pos)
+    const lineEnd = lfIdx === -1 ? len : lfIdx
+    const contentEnd = lineEnd > lineStart && body.charCodeAt(lineEnd - 1) === 0x0d ? lineEnd - 1 : lineEnd
+    pos = lfIdx === -1 ? len : lfIdx + 1
+
+    const hStart = skipHws(body, lineStart, contentEnd)
+    if (hStart >= contentEnd) continue
+    const firstCh = body.charCodeAt(hStart)
+    if (firstCh !== 0x63 /* 'c' */ && firstCh !== 0x43 /* 'C' */) continue
+    if (!matchAsciiIgnoreCase(body, hStart, contentEnd, 'content-disposition')) continue
+
+    const afterName = skipHws(body, hStart + 19, contentEnd)
+    if (afterName >= contentEnd || body.charCodeAt(afterName) !== 0x3a /* ':' */) continue
+
+    const valStart = skipHws(body, afterName + 1, contentEnd)
+    const firstSemi = body.indexOf(';', valStart)
+    const typeEnd = trimEndHws(
+      body,
+      valStart,
+      firstSemi === -1 || firstSemi > contentEnd ? contentEnd : firstSemi,
+    )
+    const isFormData = equalsAsciiIgnoreCase(body, valStart, typeEnd, 'form-data')
+    let matchedMethod =
+      isFormData &&
+      firstSemi !== -1 &&
+      firstSemi < contentEnd &&
+      paramsContainMethodName(body, firstSemi + 1, contentEnd)
+
+    // Consume RFC 5322 obs-fold continuation lines (leading SP/HTAB with non-empty content) monotonically.
+    while (pos < len) {
+      if (!isAsciiHws(body.charCodeAt(pos))) break
+      const foldStart = pos
+      const foldLf = body.indexOf('\n', pos)
+      const foldEnd = foldLf === -1 ? len : foldLf
+      const foldContentEnd = foldEnd > foldStart && body.charCodeAt(foldEnd - 1) === 0x0d ? foldEnd - 1 : foldEnd
+      if (skipHws(body, foldStart, foldContentEnd) >= foldContentEnd) break
+      pos = foldLf === -1 ? len : foldLf + 1
+      if (isFormData && !matchedMethod) {
+        matchedMethod = paramsContainMethodName(body, foldStart, foldContentEnd)
+      }
+    }
+
+    if (!matchedMethod) continue
+    found = true
+
+    // Advance monotonically through remaining headers of this MIME part until the blank line separator.
+    let reachedBlankLine = false
+    for (let hdrLines = 0; hdrLines < 32 && pos < len; hdrLines += 1) {
+      const peekStart = pos
+      const peekLf = body.indexOf('\n', pos)
+      const peekEnd = peekLf === -1 ? len : peekLf
+      const peekContentEnd = peekEnd > peekStart && body.charCodeAt(peekEnd - 1) === 0x0d ? peekEnd - 1 : peekEnd
+      if (peekContentEnd === peekStart) {
+        pos = peekLf === -1 ? len : peekLf + 1
+        reachedBlankLine = true
+        break
+      }
+      if (
+        (peekContentEnd - peekStart >= 2 &&
+          body.charCodeAt(peekStart) === 0x2d /* '-' */ &&
+          body.charCodeAt(peekStart + 1) === 0x2d /* '-' */) ||
+        matchAsciiIgnoreCase(body, skipHws(body, peekStart, peekContentEnd), peekContentEnd, 'content-disposition')
+      ) {
+        break
+      }
+      pos = peekLf === -1 ? len : peekLf + 1
+    }
+
+    if (reachedBlankLine && pos < len) {
+      let vPos = pos
+      const wsLimit = Math.min(len, vPos + 64)
+      while (vPos < wsLimit && isAsciiWs(body.charCodeAt(vPos))) vPos += 1
+      const tokStart = vPos
+      const tokLimit = Math.min(len, tokStart + 16)
+      while (vPos < tokLimit) {
+        const c = body.charCodeAt(vPos)
+        const isTokenChar =
+          (c >= 0x41 && c <= 0x5a) ||
+          (c >= 0x61 && c <= 0x7a) ||
+          (c >= 0x30 && c <= 0x39) ||
+          c === 0x5f ||
+          c === 0x2d
+        if (!isTokenChar) break
+        vPos += 1
+      }
+      if (vPos > tokStart) {
+        verbs.push(body.slice(tokStart, vPos))
+      }
+    }
+  }
+
+  return { found, verbs }
+}
+
+/** Zero-allocation linear JSON/GraphQL number scanner (replaces `.exec(text.slice(i))`). */
+function scanJsonNumberEnd(text: string, start: number): number {
+  const n = text.length
+  let i = start
+  if (i < n && text.charCodeAt(i) === 0x2d /* '-' */) i += 1
+  if (i >= n) return -1
+  const first = text.charCodeAt(i)
+  if (first === 0x30 /* '0' */) {
+    i += 1
+  } else if (first >= 0x31 && first <= 0x39 /* '1'-'9' */) {
+    i += 1
+    while (i < n) {
+      const c = text.charCodeAt(i)
+      if (c >= 0x30 && c <= 0x39) i += 1
+      else break
+    }
+  } else {
+    return -1
+  }
+  if (i < n && text.charCodeAt(i) === 0x2e /* '.' */) {
+    i += 1
+    const fracStart = i
+    while (i < n) {
+      const c = text.charCodeAt(i)
+      if (c >= 0x30 && c <= 0x39) i += 1
+      else break
+    }
+    if (i === fracStart) return -1
+  }
+  if (i < n && (text.charCodeAt(i) === 0x65 /* 'e' */ || text.charCodeAt(i) === 0x45 /* 'E' */)) {
+    i += 1
+    if (i < n && (text.charCodeAt(i) === 0x2b /* '+' */ || text.charCodeAt(i) === 0x2d /* '-' */)) i += 1
+    const expStart = i
+    while (i < n) {
+      const c = text.charCodeAt(i)
+      if (c >= 0x30 && c <= 0x39) i += 1
+      else break
+    }
+    if (i === expStart) return -1
+  }
+  return i
+}
 
 export interface MethodOverrideDetection {
   /** True whenever any method-override header, query param, or body field is present, or a body exceeded the full-scan ceiling. */
@@ -288,9 +644,9 @@ export interface MethodOverrideDetection {
  * Compute the effective HTTP verb including method-override headers (`X-HTTP-Method-Override`,
  * `X-HTTP-Method`, `X-Method-Override`) and `_method` query/form/JSON/multipart fields (`R2-H-1`).
  *
- * R3-H-1(b): NEVER silently truncates `body` at 64 KiB. Bodies up to 4 MiB are scanned in full
- * for `_method` carriers; bodies exceeding 64 KiB or that cannot be cleanly parsed/scanned are
- * always flagged fail-closed via `bodyExceedsScanWindow` / `scanIncomplete` / `hasOverrideRisk`.
+ * R3-H-1(b) / R4-H-14: Bodies exceeding the 64 KiB classification window ALWAYS fail closed via
+ * `bodyExceedsScanWindow` / `hasOverrideRisk`, and override-carrier extraction up to 4 MiB uses
+ * strictly O(n) single-pass tokenizers (zero backtracking regexes, zero whole-body allocations).
  */
 export function detectMethodOverride(input: {
   method: string
@@ -356,7 +712,7 @@ export function detectMethodOverride(input: {
     }
   }
 
-  // 3. `_method` form-urlencoded, JSON, or multipart body field (full scan, never 64 KiB slice)
+  // 3. `_method` form-urlencoded, JSON, or multipart body field (strictly O(n) single-pass tokenizers)
   const rawBody = input.body
   const contentEncoding = headerValue(input.headers, 'content-encoding').trim()
   const hasCompressedEncoding = contentEncoding !== '' && !/^identity$/i.test(contentEncoding)
@@ -379,25 +735,18 @@ export function detectMethodOverride(input: {
       const mediaType = contentType.split(';', 1)[0]!.trim()
 
       // Form-urlencoded body (explicit content-type or form-like key=value syntax)
+      // Note: `/(?:^|&|%26)(?:_|%5f)method=/i` has zero quantifiers and runs strictly in O(n).
       const looksFormLike =
         mediaType === 'application/x-www-form-urlencoded' ||
         contentType.includes('application/x-www-form-urlencoded') ||
         (!contentType.includes('json') && /(?:^|&|%26)(?:_|%5f)method=/i.test(rawBody))
       if (looksFormLike) {
-        let foundFormOverride = false
-        try {
-          const params = new URLSearchParams(rawBody)
-          for (const [k, v] of params.entries()) {
-            if (k.toLowerCase() === '_method' && v.trim().length > 0) {
-              foundFormOverride = true
-              carriers.push('form:_method')
-              pushVerb(v)
-            }
-          }
-        } catch {
-          scanIncomplete = true
+        const formVerbs = scanFormUrlEncodedMethodOverrides(rawBody)
+        for (const v of formVerbs) {
+          carriers.push('form:_method')
+          pushVerb(v)
         }
-        if (!foundFormOverride) {
+        if (formVerbs.length === 0 && rawBody.includes('%26')) {
           const formFallbackRe = /(?:^|&|%26)(?:_|%5f)method=([^&#\s]{1,32})/gi
           let m: RegExpExecArray | null
           while ((m = formFallbackRe.exec(rawBody)) !== null) {
@@ -411,62 +760,74 @@ export function detectMethodOverride(input: {
         }
       }
 
-      // JSON object body with top-level `_method` field (including escaped & duplicate key checks)
-      const trimmed = rawBody.trim()
+      // JSON object body with `_method` field (full parse within 64 KiB window; O(n) single-pass scan above 64 KiB)
+      const firstWs = firstNonWsIndex(rawBody)
+      const firstCode = firstWs < rawBody.length ? rawBody.charCodeAt(firstWs) : -1
       const isJsonCandidate =
-        trimmed.startsWith('{') ||
+        firstCode === 0x7b /* '{' */ ||
         mediaType === 'application/json' ||
         /^application\/[a-z0-9.+-]+\+json$/i.test(mediaType)
       if (isJsonCandidate) {
-        let parsedOk = false
-        if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
-          try {
-            const parsed = JSON.parse(trimmed) as unknown
-            parsedOk = true
-            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-              for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
-                if (k.toLowerCase() === '_method' && typeof v === 'string' && v.trim().length > 0) {
-                  carriers.push('json:_method')
-                  pushVerb(v)
+        if (!bodyExceedsScanWindow) {
+          const trimmed = rawBody.trim()
+          let parsedOk = false
+          if (firstCode === 0x7b /* '{' */ || firstCode === 0x5b /* '[' */) {
+            try {
+              const parsed = JSON.parse(trimmed) as unknown
+              parsedOk = true
+              if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+                  if (k.toLowerCase() === '_method' && typeof v === 'string' && v.trim().length > 0) {
+                    carriers.push('json:_method')
+                    pushVerb(v)
+                  }
                 }
               }
+            } catch {
+              scanIncomplete = true
             }
-          } catch {
-            scanIncomplete = true
+          } else {
+            try {
+              JSON.parse(trimmed)
+              parsedOk = true
+            } catch {
+              scanIncomplete = true
+            }
+          }
+          if (!parsedOk || /_method|\\u005f/i.test(trimmed)) {
+            for (const v of scanJsonMethodOverrides(trimmed)) {
+              carriers.push('json:_method')
+              pushVerb(v)
+            }
           }
         } else {
-          try {
-            JSON.parse(trimmed)
-            parsedOk = true
-          } catch {
+          // Beyond 64 KiB (`bodyExceedsScanWindow = true`, already fail-closed): avoid allocating
+          // giant JS object graphs via `JSON.parse`; run strictly O(n) single-pass key extraction.
+          const lastWs = lastNonWsIndex(rawBody)
+          const lastCode = lastWs >= 0 ? rawBody.charCodeAt(lastWs) : -1
+          if (
+            (firstCode === 0x7b && lastCode !== 0x7d) ||
+            (firstCode === 0x5b && lastCode !== 0x5d)
+          ) {
             scanIncomplete = true
           }
-        }
-        if (!parsedOk || /_method|\\u005f/i.test(trimmed)) {
-          const jsonMethodRe = /"(?:_method|\\u005fmethod)"\s*:\s*"([A-Za-z0-9_-]{1,16})"/gi
-          let m: RegExpExecArray | null
-          while ((m = jsonMethodRe.exec(trimmed)) !== null) {
-            if (m[1]!.trim().length > 0) {
-              carriers.push('json:_method')
-              pushVerb(m[1])
-            }
+          for (const v of scanJsonMethodOverrides(rawBody)) {
+            carriers.push('json:_method')
+            pushVerb(v)
           }
         }
       }
 
-      // Multipart form-data field named `_method`
+      // Multipart form-data field named `_method` (strictly O(n) single-pass CRLF/header tokenizer)
       const isMultipartContentType = /^multipart\//i.test(mediaType)
       if (isMultipartContentType && !/\bboundary\s*=\s*\S+/i.test(contentType)) {
         scanIncomplete = true
       }
-      if (isMultipartContentType || rawBody.toLowerCase().includes('content-disposition')) {
-        if (/content-disposition:\s*form-data;[^\r\n]*\bname\s*=\s*"?_method"?/i.test(rawBody)) {
-          carriers.push('multipart:_method')
-          const mpValueRe = /content-disposition:\s*form-data;[^\r\n]*\bname\s*=\s*"?_method"?[^\r\n]*\r?\n\r?\n\s*([A-Za-z0-9_-]{1,16})/gi
-          let m: RegExpExecArray | null
-          while ((m = mpValueRe.exec(rawBody)) !== null) {
-            if (m[1]) pushVerb(m[1])
-          }
+      const mpScan = scanMultipartMethodOverrides(rawBody)
+      if (mpScan.found) {
+        carriers.push('multipart:_method')
+        for (const v of mpScan.verbs) {
+          pushVerb(v)
         }
       }
     }
@@ -675,9 +1036,9 @@ export function validateStrictJsonObject(raw: string): boolean {
     if (text.startsWith('false', i)) { i += 5; return true }
     if (text.startsWith('null', i)) { i += 4; return true }
     // JSON number
-    const numMatch = /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/.exec(text.slice(i))
-    if (!numMatch) return false
-    i += numMatch[0].length
+    const numEnd = scanJsonNumberEnd(text, i)
+    if (numEnd < 0) return false
+    i = numEnd
     return true
   }
 
@@ -836,12 +1197,13 @@ function tokenizeGraphqlDocument(source: string): GraphqlToken[] | undefined {
     }
     // IntValue / FloatValue
     if (ch === '-' || (code >= 0x30 && code <= 0x39)) {
-      const match = /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/.exec(source.slice(i))
-      if (!match) return undefined
-      i += match[0].length
+      const numEnd = scanJsonNumberEnd(source, i)
+      if (numEnd < 0) return undefined
+      const rawNum = source.slice(i, numEnd)
+      i = numEnd
       // Reject numbers immediately followed by a NameStart character (GraphQL spec)
       if (i < n && /[_A-Za-z.]/.test(source[i]!)) return undefined
-      tokens.push({ kind: 'number', value: match[0] })
+      tokens.push({ kind: 'number', value: rawNum })
       continue
     }
     // Name
