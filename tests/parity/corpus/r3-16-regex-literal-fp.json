@@ -1,0 +1,103 @@
+{
+  "id": "r3-16-regex-literal-fp",
+  "side": "fp",
+  "source": "independent_review",
+  "archetype": "r3-16-disclosure-secret-literal-regex-fp",
+  "description": "Benign own-tenant profile readback containing non-secret handle identifiers must dismiss under pre-compiled literal HOST_DISCLOSURE_SECRET_REGEXES with zero worker proofPatterns or role escalation credit.",
+  "covers": {
+    "files": [
+      "src/server/evidence-provenance.ts"
+    ],
+    "classes": [
+      "disclosure",
+      "bola"
+    ]
+  },
+  "canonicalLabel": {
+    "cwe": "CWE-639",
+    "category": "access-control",
+    "title": "Benign own-tenant profile readback with handle-like tokens must dismiss under pre-compiled host secret regexes",
+    "impact": "Authenticated member reads their own tenant profile containing benign non-secret handle tokens; no secret prefix or cross-role boundary is crossed.",
+    "claimedImpact": "authorization",
+    "claimedBoundary": "access",
+    "vulnClass": "bola"
+  },
+  "freeTextLabel": {
+    "title": "Own-tenant profile readback with non-secret handle tokens"
+  },
+  "paths": {
+    "replay": true,
+    "floorReceipt": true,
+    "evaluateClaims": true,
+    "composite": false,
+    "floorInjectionRecipe": false,
+    "proofReceipt": true
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [
+    {
+      "handle": "member_a",
+      "roleLabel": "member (tenant-a)",
+      "role": "member",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-r316-regex-member-a"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "ctl_profile_read",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/v1/profile/me",
+      "persona": "member_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"id\":\"usr_prof_0123456789ab\",\"tenant_id\":\"tenant-a\",\"role\":\"member\",\"display\":\"alice\"}"
+    },
+    {
+      "id": "prb_profile_read",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/v1/profile/me",
+      "persona": "member_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"id\":\"usr_prof_0123456789ab\",\"tenant_id\":\"tenant-a\",\"role\":\"member\",\"display\":\"alice\",\"tag\":\"sk_short_123\"}"
+    }
+  ],
+  "replaySpec": {
+    "assertionsJq": "{ controlPassed: (.steps.ctl_profile_read.status == 200), confirmed: (.steps.prb_profile_read.status == 200), observed: \"own-tenant profile\", expected: \"403\" }"
+  },
+  "proofReceipt": {
+    "vulnClass": "bola",
+    "targetMethod": "GET",
+    "targetPathAndQuery": "/api/v1/profile/me",
+    "claimedDelta": "Own-tenant profile read containing a short non-matching sk_short_123 token and worker proofPatterns must be dismissed by host custody and literal secret regexes."
+  },
+  "claims": [
+    {
+      "kind": "impact",
+      "impactClass": "disclosure",
+      "probeExchangeId": "prb_profile_read",
+      "controlExchangeIds": [
+        "ctl_profile_read"
+      ],
+      "requiredRole": "admin",
+      "proofPatterns": [
+        "sk_short_[0-9]+"
+      ]
+    }
+  ]
+}

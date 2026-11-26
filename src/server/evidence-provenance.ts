@@ -220,14 +220,19 @@ export function isHostEvidence(value: unknown): value is HostEvidence {
   return Boolean(value && typeof value === 'object' && SEALED_HOST_EVIDENCE.has(value))
 }
 
-/** Strict host-owned secret-prefix patterns for disclosure verification (never generic handles, never worker `proofPatterns`). */
-export const HOST_DISCLOSURE_SECRET_PATTERNS: readonly string[] = Object.freeze([
-  '\\bsk_[a-zA-Z0-9]{2,12}_[0-9a-fA-F]{10,}\\b',
-  '\\bpk_[a-zA-Z0-9]{2,12}_[0-9a-fA-F]{10,}\\b',
-  '\\brk_[a-zA-Z0-9]{2,12}_[0-9a-fA-F]{10,}\\b',
-  '\\brbs_[a-zA-Z0-9]{2,12}_[0-9a-fA-F]{10,}\\b',
-  '\\bAKIA[0-9A-Z]{16}\\b',
+/** Strict host-owned pre-compiled secret-prefix regexes for disclosure verification (never generic handles, never worker `proofPatterns`). */
+const HOST_DISCLOSURE_SECRET_REGEXES: readonly RegExp[] = Object.freeze([
+  /\bsk_[a-zA-Z0-9]{2,12}_[0-9a-fA-F]{10,}\b/,
+  /\bpk_[a-zA-Z0-9]{2,12}_[0-9a-fA-F]{10,}\b/,
+  /\brk_[a-zA-Z0-9]{2,12}_[0-9a-fA-F]{10,}\b/,
+  /\brbs_[a-zA-Z0-9]{2,12}_[0-9a-fA-F]{10,}\b/,
+  /\bAKIA[0-9A-Z]{16}\b/,
 ])
+
+/** Strict host-owned secret-prefix patterns for disclosure verification (never generic handles, never worker `proofPatterns`). */
+export const HOST_DISCLOSURE_SECRET_PATTERNS: readonly string[] = Object.freeze(
+  HOST_DISCLOSURE_SECRET_REGEXES.map(re => re.source),
+)
 
 const ADMIN_FUNCTION_SURFACE_RE = /\/(?:admin|manage|staff|internal|system|superuser|operator|roles?|permissions?|grants?|impersonat)\b/i
 const HOST_ROLE_RANK: Readonly<Record<string, number>> = { viewer: 1, member: 2, admin: 3, owner: 4 }
@@ -284,12 +289,11 @@ export function deriveHostObservedRequiredRole(
   if (impactClass === 'disclosure' && !mutatingProbe) {
     const okProbes = steps.filter(s => s.arm === 'probe' && is2xxStep(s.status) && s.actor.handle !== null)
     const controls = steps.filter(s => s.arm === 'control')
-    const secretRes = HOST_DISCLOSURE_SECRET_PATTERNS.map(p => new RegExp(p))
     const textOf = (s: ImpactStep) => typeof s.body === 'string' ? s.body : s.json !== undefined ? JSON.stringify(s.json) : ''
     for (const p of okProbes) {
       const pRank = HOST_ROLE_RANK[(p.actor.role ?? '').toLowerCase()] ?? 0
       if (pRank <= 0) continue
-      const matched = secretRes.filter(re => re.test(textOf(p)))
+      const matched = HOST_DISCLOSURE_SECRET_REGEXES.filter(re => re.test(textOf(p)))
       if (matched.length === 0) continue
       const pRoute = routeOfStep(p)
       const higherSameRouteCtrl = controls.find(c =>
