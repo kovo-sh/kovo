@@ -1044,16 +1044,43 @@ function cleanPathSegment(key: string): string {
   return cleaned.slice(0, 48)
 }
 
+const RESERVED_PROTO_OBJECT_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
+
+function createSafeRedactedObject<T extends Record<string, unknown>>(source: Record<string, unknown>): T {
+  if (Object.getPrototypeOf(source) === null) {
+    return Object.create(null) as T
+  }
+  for (const key of Object.keys(source)) {
+    if (RESERVED_PROTO_OBJECT_KEYS.has(key)) {
+      return Object.create(null) as T
+    }
+  }
+  return {} as T
+}
+
+function defineSafeOwnProperty(target: Record<string, unknown>, key: string, value: unknown): void {
+  Object.defineProperty(target, key, {
+    value,
+    enumerable: true,
+    writable: true,
+    configurable: true,
+  })
+}
+
 export function redactHeaders(
   headers: Record<string, string | string[] | undefined>,
   secrets: readonly NamedSecret[] = [],
 ): Record<string, string> {
   const matcher = secrets.length > 0 ? compileSecretMatcher(secrets, { minLength: 4 }) : undefined
-  const out: Record<string, string> = {}
+  const out = createSafeRedactedObject<Record<string, string>>(headers as Record<string, unknown>)
   for (const [key, rawValue] of Object.entries(headers)) {
     if (rawValue === undefined) continue
     const value = Array.isArray(rawValue) ? rawValue.join(', ') : String(rawValue)
-    out[key] = SENSITIVE_HTTP_HEADER_RE.test(key) ? '[redacted]' : redactWithMatcher(value, matcher)
+    defineSafeOwnProperty(
+      out,
+      key,
+      SENSITIVE_HTTP_HEADER_RE.test(key) ? '[redacted]' : redactWithMatcher(value, matcher),
+    )
   }
   return out
 }
@@ -1062,9 +1089,10 @@ function scrubSensitiveSubtree(value: unknown): unknown {
   if (typeof value === 'string') return '[redacted]'
   if (Array.isArray(value)) return value.map(item => scrubSensitiveSubtree(item))
   if (value && typeof value === 'object') {
-    const out: Record<string, unknown> = {}
-    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      out[k] = scrubSensitiveSubtree(v)
+    const src = value as Record<string, unknown>
+    const out = createSafeRedactedObject<Record<string, unknown>>(src)
+    for (const [k, v] of Object.entries(src)) {
+      defineSafeOwnProperty(out, k, scrubSensitiveSubtree(v))
     }
     return out
   }
@@ -1077,9 +1105,14 @@ function redactJsonNode<T>(value: T, matcher?: SecretMatcher): T {
   if (typeof value === 'string') return redactWithMatcher(value, matcher) as unknown as T
   if (Array.isArray(value)) return value.map(item => redactJsonNode(item, matcher)) as unknown as T
   if (value && typeof value === 'object') {
-    const out: Record<string, unknown> = {}
-    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      out[k] = sensitiveCredentialKeyPattern.test(k) ? scrubSensitiveSubtree(v) : redactJsonNode(v, matcher)
+    const src = value as Record<string, unknown>
+    const out = createSafeRedactedObject<Record<string, unknown>>(src)
+    for (const [k, v] of Object.entries(src)) {
+      defineSafeOwnProperty(
+        out,
+        k,
+        sensitiveCredentialKeyPattern.test(k) ? scrubSensitiveSubtree(v) : redactJsonNode(v, matcher),
+      )
     }
     return out as T
   }
@@ -1194,14 +1227,19 @@ function redactZdrJsonNode<T>(value: T, options: PiiRedactionOptions, matcher?: 
   if (typeof value === 'string') return redactPiiWithMatcher(value, options, matcher) as unknown as T
   if (Array.isArray(value)) return value.map(item => redactZdrJsonNode(item, options, matcher)) as unknown as T
   if (value && typeof value === 'object') {
-    const out: Record<string, unknown> = {}
-    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    const src = value as Record<string, unknown>
+    const out = createSafeRedactedObject<Record<string, unknown>>(src)
+    for (const [k, v] of Object.entries(src)) {
       if (sensitiveCredentialKeyPattern.test(k)) {
-        out[k] = scrubSensitiveSubtree(v)
+        defineSafeOwnProperty(out, k, scrubSensitiveSubtree(v))
       } else if (sensitivePiiKeyPattern.test(k)) {
-        out[k] = typeof v === 'string' || typeof v === 'number' ? '[pii:redacted]' : scrubSensitiveSubtree(v)
+        defineSafeOwnProperty(
+          out,
+          k,
+          typeof v === 'string' || typeof v === 'number' ? '[pii:redacted]' : scrubSensitiveSubtree(v),
+        )
       } else {
-        out[k] = redactZdrJsonNode(v, options, matcher)
+        defineSafeOwnProperty(out, k, redactZdrJsonNode(v, options, matcher))
       }
     }
     return out as T

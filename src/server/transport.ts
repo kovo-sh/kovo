@@ -31,7 +31,12 @@ import type { Duplex } from 'node:stream'
 import { createBrotliDecompress, createGunzip, createInflate } from 'node:zlib'
 import ipaddr from 'ipaddr.js'
 import type { PublicAddress, RawHttpResponse, TlsMetadata, Transport } from './broker.ts'
-import { isMetadataOrLinkLocalAddress } from './egress-gateway.ts'
+import {
+  cloneNullProtoHeaders,
+  isMetadataOrLinkLocalAddress,
+  isReservedProtoHeaderKey,
+  parseRawHeadersNullProto,
+} from './egress-gateway.ts'
 import type { GlobalKillSwitch } from './kill-switch.ts'
 import { isValidHttpToken, isValidWebsocketSubprotocol } from './request-admission.ts'
 
@@ -84,13 +89,13 @@ const forbiddenProfileHeaders = /^(?:host|connection|keep-alive|transfer-encodin
 const crlf = /[\r\n\0]/
 
 function canonicalizeUniqueHeaders(headers: Record<string, string>, source: string): Record<string, string> {
-  const out: Record<string, string> = {}
+  const out = Object.create(null) as Record<string, string>
   for (const [name, value] of Object.entries(headers)) {
     if (!isValidHttpToken(name) || crlf.test(value)) {
       throw new TransportConfigError(`${source} contains an invalid header name or value`)
     }
     const lower = name.toLowerCase()
-    if (Object.prototype.hasOwnProperty.call(out, lower)) {
+    if (Object.hasOwn(out, lower)) {
       throw new TransportConfigError(`${source} contains duplicate case-insensitive header ${lower}`)
     }
     out[lower] = value
@@ -811,19 +816,23 @@ function collectH2Body(
     let truncated = false
     let settled = false
     const finish = () => {
-      if (settled) return
-      settled = true
-      const outHeaders: IncomingHttpHeaders = { ...headers }
-      if (decomp.decompressed) {
-        delete outHeaders['content-encoding']
-        delete outHeaders['content-length']
+      try {
+        if (settled) return
+        settled = true
+        const outHeaders = cloneNullProtoHeaders(headers)
+        if (decomp.decompressed) {
+          delete outHeaders['content-encoding']
+          delete outHeaders['content-length']
+        }
+        resolve({
+          body: Buffer.concat(chunks).toString('utf8'),
+          bodyBytes: total,
+          bodyTruncated: truncated,
+          headers: outHeaders,
+        })
+      } catch (err) {
+        fail(err)
       }
-      resolve({
-        body: Buffer.concat(chunks).toString('utf8'),
-        bodyBytes: total,
-        bodyTruncated: truncated,
-        headers: outHeaders,
-      })
     }
     const fail = (err: unknown) => {
       if (settled) return
@@ -841,19 +850,23 @@ function collectH2Body(
       })
     }
     source.on('data', (chunk: Buffer) => {
-      if (settled) return
-      if (total + chunk.length > cap) {
-        const remaining = cap - total
-        if (remaining > 0) chunks.push(chunk.subarray(0, remaining))
-        total = cap
-        truncated = true
-        try { decomp.stream?.destroy() } catch { /* ignore */ }
-        try { stream.close(8 /* NGHTTP2_CANCEL */) } catch { /* ignore */ }
-        finish()
-        return
+      try {
+        if (settled) return
+        if (total + chunk.length > cap) {
+          const remaining = cap - total
+          if (remaining > 0) chunks.push(chunk.subarray(0, remaining))
+          total = cap
+          truncated = true
+          try { decomp.stream?.destroy() } catch { /* ignore */ }
+          try { stream.close(8 /* NGHTTP2_CANCEL */) } catch { /* ignore */ }
+          finish()
+          return
+        }
+        chunks.push(chunk)
+        total += chunk.length
+      } catch (err) {
+        fail(err)
       }
-      chunks.push(chunk)
-      total += chunk.length
     })
     source.once('end', finish)
     source.once('error', err => {
@@ -1059,30 +1072,36 @@ export function createHttpTransport(config: TransportConfig, fallback: Transport
       signal.addEventListener('abort', onAbort, { once: true })
 
       stream.once('response', rawHeaders => {
-        const status = Number(rawHeaders[':status'] ?? 0)
-        const responseHeaders: IncomingHttpHeaders = {}
-        for (const [k, v] of Object.entries(rawHeaders)) {
-          if (k.startsWith(':')) continue
-          if (k === 'set-cookie') {
-            responseHeaders[k] = Array.isArray(v) ? v.map(String) : [String(v)]
-          } else {
-            responseHeaders[k] = Array.isArray(v) ? v.map(String).join(', ') : String(v)
+        try {
+          const status = Number(rawHeaders[':status'] ?? 0)
+          const responseHeaders = Object.create(null) as IncomingHttpHeaders
+          for (const [k, v] of Object.entries(rawHeaders)) {
+            if (k.startsWith(':')) continue
+            const lower = k.toLowerCase()
+            if (isReservedProtoHeaderKey(lower)) continue
+            if (lower === 'set-cookie') {
+              responseHeaders[lower] = Array.isArray(v) ? v.map(String) : [String(v)]
+            } else {
+              responseHeaders[lower] = Array.isArray(v) ? v.map(String).join(', ') : String(v)
+            }
           }
+          const cap = Math.min(options.maxBodyBytes ?? defaultMaxBodyBytes, hardMaxBodyBytes)
+          if (!(options.readBody ?? false) || methodName === 'HEAD') {
+            settled = true
+            signal.removeEventListener('abort', onAbort)
+            resolve({ status, headers: responseHeaders, body: '', bodyBytes: 0, bodyTruncated: false, tls })
+            try { stream.close(8) } catch { /* ignore */ }
+            return
+          }
+          collectH2Body(stream, responseHeaders, cap).then(result => {
+            if (settled) return
+            settled = true
+            signal.removeEventListener('abort', onAbort)
+            resolve({ status, headers: result.headers, body: result.body, bodyBytes: result.bodyBytes, bodyTruncated: result.bodyTruncated, tls })
+          }).catch(fail)
+        } catch (err) {
+          fail(err instanceof Error ? err : new Error(String(err)))
         }
-        const cap = Math.min(options.maxBodyBytes ?? defaultMaxBodyBytes, hardMaxBodyBytes)
-        if (!(options.readBody ?? false) || methodName === 'HEAD') {
-          settled = true
-          signal.removeEventListener('abort', onAbort)
-          resolve({ status, headers: responseHeaders, body: '', bodyBytes: 0, bodyTruncated: false, tls })
-          try { stream.close(8) } catch { /* ignore */ }
-          return
-        }
-        collectH2Body(stream, responseHeaders, cap).then(result => {
-          if (settled) return
-          settled = true
-          signal.removeEventListener('abort', onAbort)
-          resolve({ status, headers: result.headers, body: result.body, bodyBytes: result.bodyBytes, bodyTruncated: result.bodyTruncated, tls })
-        }).catch(fail)
       })
 
       stream.once('error', err => fail(err))
@@ -1190,82 +1209,95 @@ export function createHttpTransport(config: TransportConfig, fallback: Transport
         reject(err)
       }
       const onResponse = (res: IncomingMessage) => {
-        activeRes = res
-        const tls = res.socket instanceof TLSSocket ? extractTlsMetadata(res.socket, url.hostname) : undefined
-        const cap = Math.min(options.maxBodyBytes ?? defaultMaxBodyBytes, hardMaxBodyBytes)
-        if (!(options.readBody ?? false) || methodName === 'HEAD') {
-          if (!done) {
-            done = true
-            cleanup()
-            resolve({ status: res.statusCode ?? 0, headers: res.headers, body: '', bodyBytes: 0, bodyTruncated: false, tls })
-          }
-          res.destroy()
-          return
-        }
-        const decomp = decompressStream(res.headers)
-        activeDecomp = decomp.stream
-        const source: NodeJS.ReadableStream = decomp.stream ?? res
-        const chunks: Buffer[] = []
-        let total = 0
-        let truncated = false
-        const finish = () => {
-          if (done) return
-          done = true
-          cleanup()
-          const outHeaders: IncomingHttpHeaders = { ...res.headers }
-          if (decomp.decompressed) {
-            delete outHeaders['content-encoding']
-            delete outHeaders['content-length']
-          }
-          resolve({
-            status: res.statusCode ?? 0,
-            headers: outHeaders,
-            body: Buffer.concat(chunks).toString('utf8'),
-            bodyBytes: total,
-            bodyTruncated: truncated,
-            tls,
-          })
-        }
-        if (decomp.stream) {
-          pipeline(res, decomp.stream, err => {
-            if (done) return
-            if (err) {
-              if (truncated) finish()
-              else fail(err)
+        try {
+          activeRes = res
+          const tls = res.socket instanceof TLSSocket ? extractTlsMetadata(res.socket, url.hostname) : undefined
+          const cap = Math.min(options.maxBodyBytes ?? defaultMaxBodyBytes, hardMaxBodyBytes)
+          const parsedHeaders = parseRawHeadersNullProto(res.rawHeaders)
+          if (!(options.readBody ?? false) || methodName === 'HEAD') {
+            if (!done) {
+              done = true
+              cleanup()
+              resolve({ status: res.statusCode ?? 0, headers: parsedHeaders, body: '', bodyBytes: 0, bodyTruncated: false, tls })
             }
-          })
-        }
-        source.on('data', (chunk: Buffer) => {
-          if (done) return
-          if (total + chunk.length > cap) {
-            const remaining = cap - total
-            if (remaining > 0) chunks.push(chunk.subarray(0, remaining))
-            total = cap
-            truncated = true
-            try { decomp.stream?.destroy() } catch { /* ignore */ }
             res.destroy()
-            finish()
             return
           }
-          chunks.push(chunk)
-          total += chunk.length
-        })
-        source.once('end', finish)
-        source.once('error', err => {
-          if (done) return
-          if (truncated) finish()
-          else fail(err)
-        })
-        res.once('aborted', () => {
-          if (done) return
-          if (truncated) finish()
-          else fail(new Error('Proxied HTTP/1.1 response aborted mid-body.'))
-        })
-        res.once('close', () => {
-          if (done) return
-          if (truncated) finish()
-          else if (!res.complete) fail(new Error('Proxied HTTP/1.1 response closed prematurely mid-body.'))
-        })
+          const decomp = decompressStream(parsedHeaders)
+          activeDecomp = decomp.stream
+          const source: NodeJS.ReadableStream = decomp.stream ?? res
+          const chunks: Buffer[] = []
+          let total = 0
+          let truncated = false
+          const finish = () => {
+            try {
+              if (done) return
+              done = true
+              cleanup()
+              const outHeaders = cloneNullProtoHeaders(parsedHeaders)
+              if (decomp.decompressed) {
+                delete outHeaders['content-encoding']
+                delete outHeaders['content-length']
+              }
+              resolve({
+                status: res.statusCode ?? 0,
+                headers: outHeaders,
+                body: Buffer.concat(chunks).toString('utf8'),
+                bodyBytes: total,
+                bodyTruncated: truncated,
+                tls,
+              })
+            } catch (err) {
+              fail(err)
+            }
+          }
+          if (decomp.stream) {
+            pipeline(res, decomp.stream, err => {
+              if (done) return
+              if (err) {
+                if (truncated) finish()
+                else fail(err)
+              }
+            })
+          }
+          source.on('data', (chunk: Buffer) => {
+            try {
+              if (done) return
+              if (total + chunk.length > cap) {
+                const remaining = cap - total
+                if (remaining > 0) chunks.push(chunk.subarray(0, remaining))
+                total = cap
+                truncated = true
+                try { decomp.stream?.destroy() } catch { /* ignore */ }
+                res.destroy()
+                finish()
+                return
+              }
+              chunks.push(chunk)
+              total += chunk.length
+            } catch (err) {
+              fail(err)
+            }
+          })
+          source.once('end', finish)
+          source.once('error', err => {
+            if (done) return
+            if (truncated) finish()
+            else fail(err)
+          })
+          res.once('aborted', () => {
+            if (done) return
+            if (truncated) finish()
+            else fail(new Error('Proxied HTTP/1.1 response aborted mid-body.'))
+          })
+          res.once('close', () => {
+            if (done) return
+            if (truncated) finish()
+            else if (!res.complete) fail(new Error('Proxied HTTP/1.1 response closed prematurely mid-body.'))
+          })
+        } catch (err) {
+          fail(err)
+        }
       }
       const req = useTls
         ? httpsRequest(requestOptions as never, onResponse)

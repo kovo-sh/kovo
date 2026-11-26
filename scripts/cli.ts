@@ -465,6 +465,7 @@ export function assertCliObjectPrototypeIntegrity(): void {
 
 export function hardenCliProcess(options?: {
   requireFlags?: boolean
+  requireLinearRegexp?: boolean
   sealPrototype?: boolean
   quiet?: boolean
 }): CliHardeningStatus {
@@ -495,20 +496,29 @@ export function hardenCliProcess(options?: {
   }
 
   const warnings: string[] = []
+  let linearFailureMessage: string | null = null
   if (!disableProtoDelete) {
     warnings.push(`CLI started without --disable-proto=delete (recommended: node ${CLI_RECOMMENDED_HARDENING_FLAGS} scripts/cli.ts)`)
   }
   if (!linearRegexpFallback) {
-    warnings.push(
-      linearFlagPresent
-        ? `Linear regexp fallback self-check exceeded 50 ms (${regexpSelfCheckMs} ms).`
-        : `CLI started without --enable-experimental-regexp-engine-on-excessive-backtracks (recommended: node ${CLI_RECOMMENDED_HARDENING_FLAGS} scripts/cli.ts)`,
-    )
+    linearFailureMessage = linearFlagPresent
+      ? `Linear regexp fallback self-check exceeded 50 ms (${regexpSelfCheckMs} ms).`
+      : `CLI requires --enable-experimental-regexp-engine-on-excessive-backtracks to prevent regex backtracking stalls. Launch via "npm run scan" or: node ${CLI_RECOMMENDED_HARDENING_FLAGS} scripts/cli.ts`
+    warnings.push(linearFailureMessage)
   }
 
   const requireFlags = options?.requireFlags ?? process.env.KOVO_REQUIRE_HARDENED_NODE === '1'
+  const allowUnhardenedForTest = process.env.KOVO_ALLOW_UNHARDENED_NODE_FOR_TEST === '1'
+  // R3-H-11 backstop: linear-regexp fallback is mandatory at startup unless an explicit test opt-out
+  // (`KOVO_ALLOW_UNHARDENED_NODE_FOR_TEST=1`) or `requireFlags: false` / `requireLinearRegexp: false` is set.
+  const requireLinearRegexp = options?.requireLinearRegexp
+    ?? (requireFlags ? true : (options?.requireFlags === false ? false : !allowUnhardenedForTest))
+
   if (requireFlags && warnings.length > 0) {
     throw new Error(`CLI process hardening check failed: ${warnings.join(' | ')}`)
+  }
+  if (requireLinearRegexp && linearFailureMessage) {
+    throw new Error(`CLI process hardening check failed: ${linearFailureMessage}`)
   }
   if (!options?.quiet) {
     for (const w of warnings) console.warn(`[kovo:hardening] ${w}`)
