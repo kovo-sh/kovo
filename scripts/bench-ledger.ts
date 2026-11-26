@@ -55,6 +55,7 @@ const NON_BEHAVIORAL_KOVO_ENV_KEYS = new Set([
   'KOVO_TMPDIR',
   'KOVO_LOG_DIR',
   'KOVO_CACHE_DIR',
+  'KOVO_LEDGER_ROOT',
   'KOVO_BENCH_DEBUG',
   'KOVO_RB_HELDOUT_SALT',
 ])
@@ -729,7 +730,79 @@ export function computeCostPerConfirmed(costUsd: number, confirmed: number): num
   return costUsd / confirmed
 }
 
-export function validateLedgerRow(row: LedgerRow): void {
+export interface ValidateLedgerRowOptions {
+  /** Git repository root used for commit existence & HEAD ancestry verification (default `REPO_ROOT`). */
+  repoRoot?: string
+  /**
+   * Skip `git cat-file` / `git merge-base` provenance verification.
+   * ONLY for pure unit-test fixtures that do not exercise git provenance — MUST stay `false` in production & promote.
+   */
+  skipGitCheck?: boolean
+}
+
+const GIT_HEX_SHA_RE = /^[0-9a-f]{7,40}$/i
+
+/**
+ * Verify that `gitSha` is a non-null 7..40-char hex commit SHA that resolves to a real commit
+ * (`git cat-file -e <gitSha>^{commit}`) and is an ancestor of `HEAD`
+ * (`git merge-base --is-ancestor <gitSha> HEAD`).
+ */
+export function verifyGitShaProvenance(gitSha: string, repoRoot: string = REPO_ROOT): void {
+  const trimmed = typeof gitSha === 'string' ? gitSha.trim() : ''
+  if (!trimmed || !GIT_HEX_SHA_RE.test(trimmed)) {
+    throw new Error(`LedgerRow.gitSha must be a valid 7-40 hex commit SHA (got '${String(gitSha)}')`)
+  }
+  try {
+    execFileSync('git', ['cat-file', '-e', `${trimmed}^{commit}`], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'ignore', 'pipe'],
+    })
+  } catch {
+    throw new Error(`LedgerRow.gitSha '${trimmed}' does not resolve to a commit in git (git cat-file -e failed)`)
+  }
+  try {
+    execFileSync('git', ['merge-base', '--is-ancestor', trimmed, 'HEAD'], {
+      cwd: repoRoot,
+      stdio: ['ignore', 'ignore', 'pipe'],
+    })
+  } catch {
+    throw new Error(`LedgerRow.gitSha '${trimmed}' is not an ancestor of HEAD (git merge-base --is-ancestor failed)`)
+  }
+}
+
+function resolveRowWorkerSourceHash(row: LedgerRow): { provided: boolean; value: string | null } {
+  const rec = row as unknown as Record<string, unknown>
+  const candidates: unknown[] = [
+    row.workerSourceHash,
+    row.effectiveConfig?.workerSourceHash,
+    rec.workerImageSourceHash,
+  ]
+  let provided = false
+  for (const c of candidates) {
+    if (c === undefined) continue
+    provided = true
+    if (typeof c === 'string') {
+      const trimmed = c.trim()
+      if (trimmed.toLowerCase() === 'unknown' || trimmed.length === 0) {
+        return { provided: true, value: trimmed || '' }
+      }
+      return { provided: true, value: trimmed }
+    }
+  }
+  return { provided, value: null }
+}
+
+function isDockerBackedLedgerRow(row: LedgerRow): boolean {
+  const backend = row.effectiveConfig?.verifierBackend?.trim().toLowerCase()
+  if (backend === 'docker') return true
+  if (typeof row.workerImageId === 'string' && row.workerImageId.trim().length > 0) return true
+  if (typeof row.effectiveConfig?.workerImageId === 'string' && row.effectiveConfig.workerImageId.trim().length > 0) {
+    return true
+  }
+  return false
+}
+
+export function validateLedgerRow(row: LedgerRow, opts: ValidateLedgerRowOptions = {}): void {
   if (row.schemaVersion !== LEDGER_SCHEMA_VERSION) {
     throw new Error(`Unsupported ledger schemaVersion: ${String(row.schemaVersion)}`)
   }
@@ -740,7 +813,29 @@ export function validateLedgerRow(row: LedgerRow): void {
   if (!row.effectiveConfigHash || !/^[0-9a-f]{16,64}$/i.test(row.effectiveConfigHash)) {
     throw new Error(`LedgerRow.effectiveConfigHash must be a hex hash (got '${String(row.effectiveConfigHash)}')`)
   }
-  if (!row.gitSha || typeof row.gitSha !== 'string') throw new Error('LedgerRow.gitSha is required')
+  if (!row.gitSha || typeof row.gitSha !== 'string' || !row.gitSha.trim()) {
+    throw new Error('LedgerRow.gitSha is required')
+  }
+  if (!opts.skipGitCheck) {
+    verifyGitShaProvenance(row.gitSha, opts.repoRoot ?? REPO_ROOT)
+  }
+  if (row.certifying === true && row.dirty === true) {
+    throw new Error(
+      `LedgerRow cannot be certifying=true while dirty=true (suite=${row.suite}, app=${row.app}, gitSha=${row.gitSha})`,
+    )
+  }
+  if (row.certifying === true) {
+    const hashInfo = resolveRowWorkerSourceHash(row)
+    const dockerBacked = isDockerBackedLedgerRow(row)
+    if (
+      (hashInfo.value !== null && (hashInfo.value === '' || hashInfo.value.toLowerCase() === 'unknown'))
+      || (dockerBacked && (!hashInfo.value || hashInfo.value.toLowerCase() === 'unknown'))
+    ) {
+      throw new Error(
+        `Certifying Docker LedgerRow refuses unknown or missing workerSourceHash (got '${String(hashInfo.value)}'; build image via 'npm run worker:build')`,
+      )
+    }
+  }
   if (row.status !== 'VALID' && row.status !== 'INVALID') {
     throw new Error(`LedgerRow.status must be 'VALID' or 'INVALID' (got '${String(row.status)}')`)
   }
@@ -756,11 +851,22 @@ export function validateLedgerRow(row: LedgerRow): void {
   }
 }
 
-/** Resolve a gitignored per-run JSONL ledger file path under `benchmarks/results/runs/<run-id>.jsonl`. */
+/**
+ * Resolve the default per-run ledger directory from `KOVO_LEDGER_ROOT` when set,
+ * falling back to repo-relative `benchmarks/results/runs`.
+ */
+export function resolveDefaultPerRunLedgerDir(env: NodeJS.ProcessEnv = process.env): string {
+  const override = env.KOVO_LEDGER_ROOT?.trim()
+  if (override) return resolve(override)
+  return DEFAULT_PER_RUN_LEDGER_DIR
+}
+
+/** Resolve a gitignored per-run JSONL ledger file path under `KOVO_LEDGER_ROOT` or `benchmarks/results/runs/<run-id>.jsonl`. */
 export function perRunLedgerPath(
   runId?: string,
-  runsDir: string = DEFAULT_PER_RUN_LEDGER_DIR,
+  runsDir?: string,
 ): string {
+  const effectiveRunsDir = runsDir ?? resolveDefaultPerRunLedgerDir()
   const sanitized = (runId ?? '')
     .trim()
     .replace(/[^a-zA-Z0-9._-]+/g, '-')
@@ -769,17 +875,18 @@ export function perRunLedgerPath(
   const stem =
     sanitized || `${new Date().toISOString().replace(/[:.]/g, '-')}-${process.pid}-${randomBytes(3).toString('hex')}`
   const filename = stem.endsWith('.jsonl') ? stem : `${stem}.jsonl`
-  return join(runsDir, filename)
+  return join(effectiveRunsDir, filename)
 }
 
-/** Append one validated row to a gitignored per-run JSONL file (default `benchmarks/results/runs/<run-id>.jsonl`). */
+/** Append one validated row to a gitignored per-run JSONL file (default `KOVO_LEDGER_ROOT` or `benchmarks/results/runs/<run-id>.jsonl`). */
 export function appendPerRunLedgerRow(
   row: LedgerRow,
-  opts: { runId?: string; runsDir?: string; repoRoot?: string } = {},
+  opts: { runId?: string; runsDir?: string; repoRoot?: string; skipGitCheck?: boolean } = {},
 ): { path: string; row: LedgerRow } {
-  const relPath = perRunLedgerPath(opts.runId, opts.runsDir ?? DEFAULT_PER_RUN_LEDGER_DIR)
-  const written = appendLedgerRow(row, relPath, opts.repoRoot ?? REPO_ROOT)
-  return { path: resolveRepoPath(relPath, opts.repoRoot ?? REPO_ROOT), row: written }
+  const repoRoot = opts.repoRoot ?? REPO_ROOT
+  const relPath = perRunLedgerPath(opts.runId, opts.runsDir)
+  const written = appendLedgerRow(row, relPath, repoRoot, { repoRoot, skipGitCheck: opts.skipGitCheck })
+  return { path: resolveRepoPath(relPath, repoRoot), row: written }
 }
 
 /** Append one validated row to the append-only JSONL ledger (default `benchmarks/results/ledger.jsonl`). */
@@ -787,6 +894,7 @@ export function appendLedgerRow(
   row: LedgerRow,
   ledgerPath: string = DEFAULT_LEDGER_PATH,
   repoRoot: string = REPO_ROOT,
+  validateOpts: ValidateLedgerRowOptions = {},
 ): LedgerRow {
   const normalized: LedgerRow = {
     ...row,
@@ -795,7 +903,7 @@ export function appendLedgerRow(
       : computeCostPerConfirmed(row.costUsd, row.confirmed),
     wastedUsd: row.wastedUsd !== undefined ? row.wastedUsd : null,
   }
-  validateLedgerRow(normalized)
+  validateLedgerRow(normalized, { repoRoot, ...validateOpts })
   const abs = resolveRepoPath(ledgerPath, repoRoot)
   mkdirSync(dirname(abs), { recursive: true })
   appendFileSync(abs, `${JSON.stringify(normalized)}\n`, { encoding: 'utf8', mode: 0o644 })
@@ -809,6 +917,10 @@ export interface PromoteLedgerOptions {
   requireValid?: boolean
   /** Require certifying === true during promotion (default false). */
   requireCertifying?: boolean
+  /**
+   * Skip git SHA existence/ancestry checks (unit-test only; default `false` in production promote).
+   */
+  skipGitCheck?: boolean
 }
 
 export interface PromoteLedgerResult {
@@ -862,8 +974,12 @@ export function promoteLedgerRows(
   const targetAbs = resolveRepoPath(targetLedgerPath, repoRoot)
   const requireValid = opts.requireValid ?? true
   const requireCertifying = opts.requireCertifying ?? false
+  const validateOpts: ValidateLedgerRowOptions = {
+    repoRoot,
+    skipGitCheck: opts.skipGitCheck ?? false,
+  }
 
-  const existingRows = readLedgerRows(targetLedgerPath, repoRoot)
+  const existingRows = readLedgerRows(targetLedgerPath, repoRoot, validateOpts)
   const seen = new Set(existingRows.map(ledgerRowFingerprint))
 
   const sources = Array.isArray(sourcePaths) ? sourcePaths : [sourcePaths]
@@ -879,8 +995,9 @@ export function promoteLedgerRows(
   const promotedRows: LedgerRow[] = []
 
   for (const file of files) {
-    const rows = readLedgerRows(file, repoRoot)
+    const rows = readLedgerRows(file, repoRoot, validateOpts)
     for (const row of rows) {
+      validateLedgerRow(row, validateOpts)
       if (requireValid && row.status !== 'VALID') {
         skippedInvalid += 1
         continue
@@ -895,7 +1012,7 @@ export function promoteLedgerRows(
         continue
       }
       seen.add(fp)
-      appendLedgerRow(row, targetLedgerPath, repoRoot)
+      appendLedgerRow(row, targetLedgerPath, repoRoot, validateOpts)
       promoted += 1
       promotedRows.push(row)
     }
@@ -915,6 +1032,7 @@ export function promoteLedgerRows(
 export function readLedgerRows(
   ledgerPath: string = DEFAULT_LEDGER_PATH,
   repoRoot: string = REPO_ROOT,
+  validateOpts: ValidateLedgerRowOptions = {},
 ): LedgerRow[] {
   const abs = resolveRepoPath(ledgerPath, repoRoot)
   if (!existsSync(abs)) return []
@@ -931,7 +1049,7 @@ export function readLedgerRows(
       throw new Error(`Invalid JSON on line ${i + 1} of ${abs}: ${(err as Error).message}`)
     }
     const row = parsed as LedgerRow
-    validateLedgerRow(row)
+    validateLedgerRow(row, { repoRoot, ...validateOpts })
     rows.push(row)
   }
   return rows

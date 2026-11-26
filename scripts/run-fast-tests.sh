@@ -145,7 +145,7 @@ export FAST_TEST_SHARD_TOTAL="$SHARD_TOTAL"
 
 node --input-type=module <<'EOF'
 import { execFile, execFileSync } from 'node:child_process'
-import { existsSync, readdirSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs'
 import { join, posix, relative, resolve, sep } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
@@ -552,6 +552,74 @@ let idx = 0
 const results = []
 const preferredTmpRoot = process.env.TMPDIR || undefined
 
+// Snapshot benchmarks/results (including gitignored runs/) before fast tests execute so
+// any test that leaks ledger/result files into the real checkout fails the gate immediately (R3-02).
+function snapshotBenchResultsState() {
+  const statusLines = []
+  try {
+    const out = execFileSync('git', ['status', '--porcelain', '--ignored', '-uall', '--', 'benchmarks/results'], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    })
+    for (const line of out.split(/\r?\n/)) {
+      const trimmed = line.trimEnd()
+      if (trimmed) statusLines.push(trimmed)
+    }
+    statusLines.sort()
+  } catch {
+    // Non-git directory: fall back to filesystem inventory below.
+  }
+
+  const fileFingerprints = new Map()
+  const resultsRoot = resolve(repoRoot, 'benchmarks/results')
+  function walkResults(dirAbs) {
+    if (!existsSync(dirAbs)) return
+    const entries = readdirSync(dirAbs, { withFileTypes: true })
+    entries.sort((a, b) => a.name.localeCompare(b.name))
+    for (const entry of entries) {
+      const full = join(dirAbs, entry.name)
+      if (entry.isDirectory()) {
+        walkResults(full)
+      } else if (entry.isFile()) {
+        const st = statSync(full)
+        const rel = relative(repoRoot, full).split(sep).join(posix.sep)
+        fileFingerprints.set(rel, `${st.size}:${Math.trunc(st.mtimeMs)}`)
+      }
+    }
+  }
+  walkResults(resultsRoot)
+  return { statusLines, fileFingerprints }
+}
+
+function diffBenchResultsState(before, after) {
+  const drift = []
+  const beforeStatusSet = new Set(before.statusLines)
+  const afterStatusSet = new Set(after.statusLines)
+  for (const line of after.statusLines) {
+    if (!beforeStatusSet.has(line)) drift.push(`status added: ${line}`)
+  }
+  for (const line of before.statusLines) {
+    if (!afterStatusSet.has(line)) drift.push(`status removed: ${line}`)
+  }
+  const seenFiles = new Set([...before.fileFingerprints.keys(), ...after.fileFingerprints.keys()])
+  for (const rel of [...seenFiles].sort()) {
+    const prev = before.fileFingerprints.get(rel)
+    const next = after.fileFingerprints.get(rel)
+    if (prev === next) continue
+    if (prev === undefined) {
+      drift.push(`file created: ${rel}`)
+    } else if (next === undefined) {
+      drift.push(`file removed: ${rel}`)
+    } else {
+      drift.push(`file modified: ${rel}`)
+    }
+  }
+  return drift
+}
+
+const benchResultsBefore = snapshotBenchResultsState()
+
 function formatFailureDiagnostic(rawError) {
   if (!rawError) return ''
   const lines = String(rawError)
@@ -630,7 +698,6 @@ function enrichTapFailureErrors(parsed, tapText) {
     }
   }
 }
-
 function evaluateFileExecution(file, execRes) {
   const qMap = quarantinedByFile.get(file) || new Map()
   const { parsed, err, ms, timedOut, stderrSnippet } = execRes
@@ -846,6 +913,9 @@ if (jobs > 1 && initialFailures.length > 0) {
 results.sort((a, b) => a.file.localeCompare(b.file))
 staleEntries.sort((a, b) => `${a.file}\0${a.testName}`.localeCompare(`${b.file}\0${b.testName}`))
 
+const benchResultsAfter = snapshotBenchResultsState()
+const ledgerDrift = diffBenchResultsState(benchResultsBefore, benchResultsAfter)
+
 const wallSec = Number(((Date.now() - tStart) / 1000).toFixed(1))
 const passedFiles = results.filter(r => r.ok)
 const failedFiles = results.filter(r => !r.ok)
@@ -854,7 +924,7 @@ const totalPass = results.reduce((n, r) => n + r.pass, 0)
 const totalUnlistedFail = results.reduce((n, r) => n + r.fail, 0)
 const totalQuarantinedFail = results.reduce((n, r) => n + r.quarantinedFail, 0)
 const totalSkip = results.reduce((n, r) => n + r.skipped, 0)
-const overallOk = failedFiles.length === 0 && staleEntries.length === 0
+const overallOk = failedFiles.length === 0 && staleEntries.length === 0 && ledgerDrift.length === 0
 
 if (jsonOut) {
   console.log(JSON.stringify({
@@ -873,6 +943,7 @@ if (jsonOut) {
       unlistedFailures: r.unlistedFailures.map(f => ({ name: f.name, location: f.location, error: f.error })),
     })),
     staleEntries,
+    ledgerDrift,
     flakyQuarantined,
     recoveredInIsolation,
     excluded: skippedByExclude.length,
@@ -924,6 +995,12 @@ if (jsonOut) {
     console.log(`\nStale quarantine entries (${staleEntries.length} — remove from ${quarantinePath}):`)
     for (const s of staleEntries) {
       console.log(`  STALE ${s.message}`)
+    }
+  }
+  if (ledgerDrift.length > 0) {
+    console.error(`\nFAIL: benchmarks/results/ drift detected during fast-test run (${ledgerDrift.length} change(s)):`)
+    for (const item of ledgerDrift) {
+      console.error(`  - ${item}`)
     }
   }
 }

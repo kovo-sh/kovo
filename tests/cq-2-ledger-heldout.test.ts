@@ -25,6 +25,7 @@ import {
   drawUnburnedHeldoutSeeds,
   loadBurnedSeeds,
   readLedgerRows,
+  resolveGitState,
   type LedgerRow,
 } from '../scripts/bench-ledger.ts'
 import {
@@ -57,6 +58,7 @@ import {
 } from '../scripts/certify-v8.ts'
 
 const TEST_SALT = '0123456789abcdef0123456789abcdef0123456789abcdef'
+const TEST_GIT_SHA = resolveGitState().gitSha
 
 function makeTmpDir(prefix: string): string {
   return mkdtempSync(join(tmpdir(), prefix))
@@ -67,7 +69,7 @@ function makeLedgerRow(overrides: Partial<LedgerRow> = {}): LedgerRow {
     schemaVersion: LEDGER_SCHEMA_VERSION,
     recordedAt: '2026-11-26T00:00:00.000Z',
     suite: 'realistic-bench',
-    gitSha: 'abc123456789',
+    gitSha: TEST_GIT_SHA,
     dirty: false,
     benchmarkVersion: 'a'.repeat(64),
     effectiveConfigHash: 'b'.repeat(64),
@@ -311,8 +313,8 @@ describe('cq-2 #2: ledger append, cross-version/config comparison refusal & tabl
     t.after(() => rmSync(dir, { recursive: true, force: true }))
     const ledgerPath = join(dir, 'ledger.jsonl')
 
-    const base = makeLedgerRow({ gitSha: 'sha-base', confirmed: 12, recall: 12 / 22, costUsd: 0.5 })
-    const cand = makeLedgerRow({ gitSha: 'sha-cand', confirmed: 15, recall: 15 / 22, costUsd: 0.7 })
+    const base = makeLedgerRow({ gitSha: TEST_GIT_SHA, confirmed: 12, recall: 12 / 22, costUsd: 0.5 })
+    const cand = makeLedgerRow({ gitSha: TEST_GIT_SHA, confirmed: 15, recall: 15 / 22, costUsd: 0.7 })
     appendLedgerRow(base, ledgerPath)
     appendLedgerRow(cand, ledgerPath)
 

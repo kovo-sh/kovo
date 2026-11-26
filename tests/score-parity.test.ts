@@ -32,6 +32,7 @@ import {
   promoteLedgerRows,
   readLedgerRows,
   recordExposedHeldoutSeeds,
+  resolveGitState,
 } from '../scripts/bench-ledger.ts'
 import { listSeeds as realisticListSeeds } from '../benchmarks/realistic-bench/generator/seeds.ts'
 import { gradeRun as gradeRealisticRun } from '../benchmarks/realistic-bench/grader/score.ts'
@@ -72,6 +73,7 @@ import type { GroundTruth as RealisticGT, GroundTruthEntry as RealisticGTEntry }
 import type { GroundTruth as ReasonGT, GroundTruthEntry as ReasonGTEntry } from '../benchmarks/reason-bench/lib/types.ts'
 
 const REPO_ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)))
+const TEST_GIT_SHA = resolveGitState(REPO_ROOT).gitSha
 const TEST_SALT = '0123456789abcdef0123456789abcdef0123456789abcdef'
 const HASH_A = 'a'.repeat(64)
 const HASH_B = 'b'.repeat(64)
@@ -425,7 +427,7 @@ describe('R2-05 #3: matrix aggregators, default per-run ledger writing & promoti
       split: 'dev',
       mode: 'grey-box',
       recordedAt: '2026-11-26T00:00:00.000Z',
-      gitSha: 'deadbeef1234',
+      gitSha: TEST_GIT_SHA,
       dirty: false,
       benchmarkVersion: HASH_A,
       effectiveConfigHash: HASH_B,
@@ -488,7 +490,7 @@ describe('R2-05 #3: matrix aggregators, default per-run ledger writing & promoti
     const aWritten = writeAgenticMatrixLedgerRows({
       results: [collectedEmpty, collectedInert],
       recordedAt: '2026-11-26T00:01:00.000Z',
-      gitSha: 'deadbeef1234',
+      gitSha: TEST_GIT_SHA,
       dirty: false,
       benchmarkVersion: HASH_A,
       effectiveConfigHash: HASH_B,
@@ -547,7 +549,7 @@ describe('R2-05 #4: certify-phase1 & certify-v8 fail closed on empty/failed cell
       mode: 'from-dir',
       checkMatrix: false,
       generatedAt: '2026-11-26T00:00:00.000Z',
-      gitSha: 'deadbeef1234',
+      gitSha: TEST_GIT_SHA,
     })
     assert.equal(certFailedRealism.status, 'INVALID')
     assert.equal(certFailedRealism.failedCells, 1)
@@ -609,7 +611,7 @@ describe('R2-05 #4: certify-phase1 & certify-v8 fail closed on empty/failed cell
       mode: 'from-dir',
       checkMatrix: false,
       generatedAt: '2026-11-26T00:00:00.000Z',
-      gitSha: 'deadbeef1234',
+      gitSha: TEST_GIT_SHA,
     })
     assert.equal(certReasonCrash.status, 'INVALID')
     assert.equal(certReasonCrash.verdict, 'FAIL')
@@ -670,7 +672,7 @@ describe('R2-05 #4: certify-phase1 & certify-v8 fail closed on empty/failed cell
     const report = evaluateV8Certification({
       gate: 'm2',
       cells: [inertV8],
-      options: { gitSha: 'deadbeef1234', generatedAt: '2026-11-26T00:00:00.000Z' },
+      options: { gitSha: TEST_GIT_SHA, generatedAt: '2026-11-26T00:00:00.000Z' },
     })
     assert.equal(report.status, 'INVALID')
     assert.equal(report.verdict, 'FAIL')
@@ -860,7 +862,7 @@ describe('R2-05 #6: regression-floor.sh catches injected lost TP & test:boundari
         app: 'xben-25', seed: 0, targets: 2, confirmed: 2, decoyFalsePositives: 0, unmatchedFalsePositives: 0,
       }),
       suite: 'xben-25',
-      gitSha: 'abc123456789',
+      gitSha: TEST_GIT_SHA,
       dirty: false,
       benchmarkVersion: HASH_A,
       effectiveConfigHash: HASH_B,
