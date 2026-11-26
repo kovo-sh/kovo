@@ -35,6 +35,7 @@ import {
 } from './egress-gateway.ts'
 import type { EgressLoopbackProxy } from './egress-gateway.ts'
 import {
+  assertOriginsWithinProjectScope,
   buildSessionFromBrowserBundle,
   createBrowserSessionPersona,
   normalizeBrowserStorageBundle,
@@ -114,12 +115,15 @@ export interface BrowserSessionChromiumLaunchOptions {
   readonly args: string[]
 }
 
-export class BrowserSessionRefreshBlockedError extends Error {
-  readonly code = 'VERIFY_PATH_MODIFIED' as const
+export type BrowserSessionRefreshBlockedCode = 'VERIFY_PATH_MODIFIED' | 'SCOPE_POLICY_REQUIRED'
 
-  constructor(message: string) {
+export class BrowserSessionRefreshBlockedError extends Error {
+  readonly code: BrowserSessionRefreshBlockedCode
+
+  constructor(message: string, code: BrowserSessionRefreshBlockedCode = 'VERIFY_PATH_MODIFIED') {
     super(message)
     this.name = 'BrowserSessionRefreshBlockedError'
+    this.code = code
   }
 }
 
@@ -262,8 +266,15 @@ export interface RefreshBrowserSessionOptions {
   originAllowlist?: readonly string[]
   /** Explicit, operator-approved IdP origins (from login/IdP config — NEVER "any public HTTPS"). */
   idpOrigins?: readonly string[]
-  /** Optional project ScopePolicy enforced on refresher proxy & browser routes. */
+  /** Host-derived project/run ScopePolicy enforced on refresher proxy & browser routes (mandatory in production). */
   scopePolicy?: ScopePolicy
+  /**
+   * Production callers (`PersonaAuthManager`) set this to fail closed if `scopePolicy` is missing
+   * regardless of environment or stub launcher injection (R4-H-3).
+   */
+  requireScopePolicy?: boolean
+  /** Explicit unit-test opt-in allowing a direct `refreshBrowserSession` call without `scopePolicy`. */
+  allowUnscopedRefreshForTest?: boolean
   /**
    * Opt-in to preserve third-party cookies outside allowed persona + IdP origins when seeding
    * the refresher context (default `false`: third-party cookies are stripped fail-closed).
@@ -623,9 +634,19 @@ export function resolveBrowserSessionEgressPolicy(params: {
 }
 
 /**
- * R3-H-3: Fail-closed origin predicate for the browser-session loopback proxy and browser routes.
+ * Narrow first-party token/session refresh path matcher (R4-H-3).
+ * Unattended browser session refresh blocks non-GET/HEAD mutations to target origins unless
+ * targeting an approved IdP origin or an explicit first-party token-refresh endpoint via POST.
+ */
+const FIRST_PARTY_TOKEN_REFRESH_PATH_RE =
+  /(?:^|\/)(?:(?:oauth2?|oidc|auth|session|jwt|sso|clerk|supabase)\/(?:v\d+\/)?(?:token|refresh|session)|(?:api\/)?(?:v\d+\/)?(?:auth\/)?(?:refresh|token)(?:-?refresh)?)\/?$/i
+
+/**
+ * R3-H-3 / R4-H-3: Fail-closed origin and method predicate for the browser-session loopback proxy
+ * and browser routes.
  * Permits ONLY origins in `policy.allowedOrigins` (persona allowlist + explicit approved IdP origins),
- * enforcing scheme, `allowLocalLab`, and optional `ScopePolicy` constraints.
+ * enforcing scheme, `allowLocalLab`, `ScopePolicy` (`routeDenylist`), and blocking non-GET/HEAD
+ * mutations to target origins unless targeting an approved IdP/token-refresh endpoint.
  */
 export function evaluateBrowserSessionProxyOrigin(
   policy: BrowserSessionEgressPolicy,
@@ -646,6 +667,8 @@ export function evaluateBrowserSessionProxyOrigin(
       reason: `Browser session proxy refused out-of-scope origin "${normalized ?? origin}" (not in persona allowlist or approved IdP origins).`,
     }
   }
+  const upperMethod = (method || 'GET').toUpperCase()
+  const isApprovedIdpOrigin = policy.idpOrigins.has(normalized)
   if (policy.scopePolicy) {
     const role = originRoleFor(policy.scopePolicy, normalized)
     if (!role) {
@@ -654,7 +677,6 @@ export function evaluateBrowserSessionProxyOrigin(
         reason: `Browser session proxy refused origin "${normalized}" outside project ScopePolicy.`,
       }
     }
-    const upperMethod = (method || 'GET').toUpperCase()
     if (upperMethod !== 'CONNECT' && role === 'target') {
       const pathAndQuery = `${url.pathname}${url.search}`
       if (isRouteDenylisted(policy.scopePolicy, pathAndQuery)) {
@@ -662,6 +684,24 @@ export function evaluateBrowserSessionProxyOrigin(
           allowed: false,
           reason: `Browser session proxy refused denylisted route "${pathAndQuery}" on "${normalized}".`,
         }
+      }
+    }
+  }
+  // R4-H-3: Block non-GET/HEAD requests to target origins inside the unattended refresher
+  // unless targeting an approved IdP token endpoint (or narrow first-party token refresh POST).
+  if (
+    upperMethod !== 'GET' &&
+    upperMethod !== 'HEAD' &&
+    upperMethod !== 'OPTIONS' &&
+    upperMethod !== 'CONNECT'
+  ) {
+    const allowedTokenPost =
+      upperMethod === 'POST' &&
+      (isApprovedIdpOrigin || FIRST_PARTY_TOKEN_REFRESH_PATH_RE.test(url.pathname))
+    if (!allowedTokenPost) {
+      return {
+        allowed: false,
+        reason: `Browser session refresher blocked non-GET/HEAD method "${upperMethod}" to "${normalized}${url.pathname}" (only approved IdP token endpoints may accept POST).`,
       }
     }
   }
@@ -706,7 +746,6 @@ export async function createBrowserSessionProxy(params: {
     allowLocalLab,
     allowHttp: allowLocalLab ? true : undefined,
     allowedOrigins: [...egressPolicy.allowedOrigins],
-    ...(egressPolicy.scopePolicy ? { scopePolicy: egressPolicy.scopePolicy } : {}),
     allowConnectPort: (port, hostname) => {
       if (!Number.isInteger(port) || port < 1 || port > 65_535) return false
       const normHost = normalizeHostname(hostname)
@@ -2185,7 +2224,11 @@ export function registerBrowserSessionPersonaFromAction(
   escrow: CaptureEscrowStore = getCaptureEscrowStore(),
 ): { id: string; handle: string } {
   const project = db.project(data.projectId)
-  const originAllowlist = validateBrowserPersonaOrigins(project.environment, data.originAllowlist)
+  const originAllowlist = assertOriginsWithinProjectScope(
+    db,
+    data.projectId,
+    validateBrowserPersonaOrigins(project.environment, data.originAllowlist),
+  )
   const redeemed = data.captureToken
     ? escrow.redeemWithMetadata(data.captureToken, data.projectId)
     : null
@@ -2240,7 +2283,11 @@ export function updateBrowserSessionPersonaFromAction(
   escrow: CaptureEscrowStore = getCaptureEscrowStore(),
 ): { id: string; handle: string } {
   const project = db.project(data.projectId)
-  const originAllowlist = validateBrowserPersonaOrigins(project.environment, data.originAllowlist)
+  const originAllowlist = assertOriginsWithinProjectScope(
+    db,
+    data.projectId,
+    validateBrowserPersonaOrigins(project.environment, data.originAllowlist),
+  )
   const priorMeta = readExistingBrowserSessionMeta(db, data.projectId, data.personaId)
   const redeemed = data.captureToken
     ? escrow.redeemWithMetadata(data.captureToken, data.projectId)
@@ -2404,12 +2451,31 @@ export async function refreshBrowserSession(
     ? [...new Set(options.originAllowlist)]
     : [targetUrl.origin]
 
+  // R4-H-3: Fail closed when host-derived ScopePolicy is missing in production.
+  let effectiveScopePolicy = options.scopePolicy
+  if (!effectiveScopePolicy) {
+    const allowMinimalTestFallback =
+      Boolean(options.allowUnscopedRefreshForTest) ||
+      (!options.requireScopePolicy && (Boolean(options.launchBrowser) || allowLocalLab))
+    if (!allowMinimalTestFallback) {
+      throw new BrowserSessionRefreshBlockedError(
+        'Refusing unattended browser session refresh without a host-derived ScopePolicy.',
+        'SCOPE_POLICY_REQUIRED',
+      )
+    }
+    effectiveScopePolicy = {
+      mode: allowLocalLab ? 'ephemeral_lab' : 'prod_readonly',
+      targetOrigins: [...new Set([targetUrl.origin, ...originAllowlist])],
+      authOrigins: [...(options.idpOrigins ?? [])],
+    }
+  }
+
   const egressPolicy = resolveBrowserSessionEgressPolicy({
     targetUrl,
     allowLocalLab,
     allowedOrigins: originAllowlist,
     idpOrigins: options.idpOrigins,
-    scopePolicy: options.scopePolicy,
+    scopePolicy: effectiveScopePolicy,
   })
   const inputStorageState = normalizePlaywrightStorageState(options.storageState)
   const { storageState: filteredInputStorageState } = filterStorageStateForRefresh(inputStorageState, {

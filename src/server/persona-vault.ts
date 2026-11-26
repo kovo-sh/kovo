@@ -22,7 +22,14 @@ import type {
   updatePersona,
 } from '../domain.ts'
 import type { NamedSecret } from './redact.ts'
-import { personas } from './schema.ts'
+import {
+  isIpLiteralHost,
+  isMultiTenantPublicSuffix,
+  normalizeHostname,
+  registrableApex,
+} from './public-suffix.ts'
+import { personas, projectAssets } from './schema.ts'
+import { normalizeScopeOrigin } from './scope-policy.ts'
 import type { Store } from './store.ts'
 
 export interface LoginCredentialFilePayload {
@@ -578,10 +585,30 @@ export function frameForSessionOrigin(
   }
 }
 
-/** Minimum length for exact-scrub persona secret needles (R3-H-10; raised from 4 to 8). */
+/** Minimum length for exact-scrub heuristic/derived persona secret needles (R3-H-10; raised from 4 to 8). */
 export const MIN_PERSONA_SECRET_NEEDLE_LENGTH = 8
+/** Minimum length for primary operator credentials (R4-H-2: never dropped by heuristic entropy/dictionary gates). */
+export const MIN_PRIMARY_SECRET_NEEDLE_LENGTH = 4
 /** Minimum length for high-entropy values from non-auth-named generic cookies (R3-H-10). */
 export const MIN_GENERIC_COOKIE_NEEDLE_LENGTH = 16
+
+/**
+ * Explicit provenance tier for secret needles (R4-H-2):
+ *  - `'primary_credential'`: operator-supplied credentials (`persona.secret`, static `secretHistory`,
+ *    minted non-cookie session value, every value in an operator-configured `Cookie` header).
+ *    Always registered with only the minimal length floor (`>= 4` chars) so weak/short/dictionary
+ *    test credentials are never leaked in plaintext.
+ *  - `'heuristic_derived'`: target-emitted or harvested tokens (`Set-Cookie`, `scrubTokens`,
+ *    `bundleSecrets`, `extractBrowserBundleSecrets`, login session history). Filtered strictly by
+ *    `isAcceptableSecretNeedle` and auth-relevant cookie-name / entropy checks so target-injected
+ *    protocol substrings or benign preference cookies never pollute exact scrubbing.
+ */
+export type SecretNeedleProvenance = 'primary_credential' | 'heuristic_derived'
+
+const NON_SECRET_SENTINELS = new Set(['browser_session', 'browser-session-state'])
+const PROVIDER_PROTOCOL_EVENT_RE =
+  /^(?:response\.[a-z0-9_.]+|message_(?:start|delta|stop)|content_block_(?:start|delta|stop)|(?:text|thinking|signature|input_json)_delta)$/i
+const PLAIN_LOWERCASE_IDENT_RE = /^[a-z]+(?:[._-][a-z]+)+$/
 
 const PROTOCOL_AND_GENERIC_WORDS = new Set([
   'user', 'auto', 'text', 'true', 'false', 'none', 'null', 'system', 'model', 'input', 'output',
@@ -662,6 +689,7 @@ export function isHighEntropySecretValue(value: string): boolean {
   if (JWT_LIKE_RE.test(trimmed)) return true
   if (trimmed.length < MIN_GENERIC_COOKIE_NEEDLE_LENGTH) return false
   if (PROTOCOL_AND_GENERIC_WORDS.has(trimmed.toLowerCase())) return false
+  if (PROVIDER_PROTOCOL_EVENT_RE.test(trimmed) || PLAIN_LOWERCASE_IDENT_RE.test(trimmed)) return false
   const distinct = distinctCharCount(trimmed)
   if (distinct < 6) return false
   const entropy = shannonEntropyBitsPerChar(trimmed)
@@ -672,9 +700,20 @@ export function isHighEntropySecretValue(value: string): boolean {
 }
 
 /**
- * Quality gate for exact-scrub persona secret needles (R3-H-10):
+ * Minimal floor for primary operator-supplied credentials (R4-H-2):
+ * accepts any non-sentinel secret of >= 4 chars regardless of dictionary class, casing, or entropy.
+ */
+export function isAcceptablePrimarySecretNeedle(value: string): boolean {
+  const trimmed = value.trim()
+  if (trimmed.length < MIN_PRIMARY_SECRET_NEEDLE_LENGTH) return false
+  if (NON_SECRET_SENTINELS.has(trimmed)) return false
+  return true
+}
+
+/**
+ * Quality gate for heuristic/derived exact-scrub secret needles (R3-H-10 / R4-H-2 / R4-H-17):
  *  - length >= 8 characters (blocks short words like `user`, `auto`, `text`, `true`, `none`)
- *  - rejects protocol/generic dictionary tokens and trivial low-entropy strings
+ *  - rejects protocol/generic dictionary tokens, provider SSE event names, and low-entropy strings
  *  - for 8..11 char values, rejects plain lowercase/underscore dictionary words (e.g. `input_text`,
  *    `standard`, `dark_mode`) while retaining real mixed-class tokens, passwords, and session IDs
  */
@@ -683,6 +722,7 @@ export function isAcceptableSecretNeedle(value: string): boolean {
   if (trimmed.length < MIN_PERSONA_SECRET_NEEDLE_LENGTH) return false
   if (JWT_LIKE_RE.test(trimmed)) return true
   if (PROTOCOL_AND_GENERIC_WORDS.has(trimmed.toLowerCase())) return false
+  if (PROVIDER_PROTOCOL_EVENT_RE.test(trimmed)) return false
   if (distinctCharCount(trimmed) < 4) return false
   if (shannonEntropyBitsPerChar(trimmed) < 1.8) return false
   if (trimmed.length < 12 && /^[a-z_]+$/.test(trimmed)) return false
@@ -690,7 +730,7 @@ export function isAcceptableSecretNeedle(value: string): boolean {
 }
 
 /**
- * Decides whether a `(cookieName, cookieValue)` pair qualifies for the exact-scrub needle set:
+ * Decides whether a heuristic/derived `(cookieName, cookieValue)` pair qualifies for exact scrubbing:
  *  - Auth/session-relevant cookie names require >= 8 chars + non-trivial needle quality.
  *  - Arbitrary/preference cookie names require high-entropy tokens >= 16 chars (or JWTs).
  */
@@ -698,32 +738,11 @@ export function isScrubbableCookieNeedle(name: string, value: string): boolean {
   const cleaned = value.trim().replace(/^["']|["']$/g, '')
   if (cleaned.length < MIN_PERSONA_SECRET_NEEDLE_LENGTH) return false
   if (PROTOCOL_AND_GENERIC_WORDS.has(cleaned.toLowerCase())) return false
+  if (PROVIDER_PROTOCOL_EVENT_RE.test(cleaned)) return false
   if (isAuthRelevantCookieName(name)) {
     return isAcceptableSecretNeedle(cleaned)
   }
   return isHighEntropySecretValue(cleaned)
-}
-
-function addCookieHeaderSecrets(cookieHeader: string, out: Set<string>, isSetCookie = false): void {
-  const trimmedHeader = cookieHeader.trim()
-  if (!trimmedHeader) return
-  const pairs = isSetCookie ? [trimmedHeader.split(';')[0] ?? ''] : trimmedHeader.split(';')
-  let matchedAny = false
-  for (const pair of pairs) {
-    const eq = pair.indexOf('=')
-    if (eq <= 0) continue
-    const cookieName = pair.slice(0, eq).trim()
-    const cookieValue = pair.slice(eq + 1).trim().replace(/^["']|["']$/g, '')
-    if (!cookieName || !isScrubbableCookieNeedle(cookieName, cookieValue)) continue
-    out.add(cookieValue)
-    matchedAny = true
-  }
-  if (matchedAny && trimmedHeader.length >= MIN_PERSONA_SECRET_NEEDLE_LENGTH) {
-    // Only register the full Cookie header string when at least one cookie inside it is a genuine
-    // scrubbable secret (prevents benign single-cookie pairs like `summary=concise` from seeding
-    // sub-value extraction in `redact.ts`).
-    out.add(isSetCookie ? pairs[0]!.trim() : trimmedHeader)
-  }
 }
 
 function looksLikeCookieHeaderString(raw: string): boolean {
@@ -736,50 +755,318 @@ function looksLikeCookieHeaderString(raw: string): boolean {
   return parts.every(p => COOKIE_PAIR_SINGLE_RE.test(p))
 }
 
-/** All secret material inside a bundle (auth-relevant cookie values, sensitive headers, token-like storage). */
-export function bundleSecrets(bundle: PersonaCredentialBundle | undefined): string[] {
-  if (!bundle) return []
-  const out = new Set<string>()
-  const addHeaderValue = (name: string, value: string) => {
-    if (!isSensitiveHeaderName(name)) return
-    const lower = name.toLowerCase()
+export interface SecretNeedleBuilder {
+  addRaw(placeholder: string, value: string | undefined, provenance: SecretNeedleProvenance): boolean
+  addCookiePair(placeholder: string, name: string, value: string, provenance: SecretNeedleProvenance): boolean
+  addCookieHeader(
+    placeholder: string,
+    rawCookieHeader: string | undefined,
+    provenance: SecretNeedleProvenance,
+    options?: { isSetCookie?: boolean },
+  ): boolean
+  addHeader(placeholder: string, headerName: string, headerValue: string, provenance: SecretNeedleProvenance): void
+  addBundle(placeholder: string, bundle: PersonaCredentialBundle | undefined, provenance?: SecretNeedleProvenance): void
+  addBrowserBundle(placeholder: string, bundle: BrowserStorageBundle | undefined, provenance?: SecretNeedleProvenance): void
+  addPersona(persona: ResolvedPersona, options?: { placeholder?: string; refreshFromDisk?: boolean }): void
+  build(): NamedSecret[]
+  values(): string[]
+}
+
+/**
+ * Shared provenance-tiered exact-secret needle builder (R4-H-2 / R4-H-17).
+ *
+ * Single authoritative policy shared by `personaSecrets`, `bundleSecrets`,
+ * `extractBrowserBundleSecrets`, `writePersonaSessionFile`, `extractScrubbableCookieMapNeedles`,
+ * and `verify-rpc.ts` (`getKernelSecrets`).
+ */
+export function createSecretNeedleBuilder(): SecretNeedleBuilder {
+  const out: NamedSecret[] = []
+  const seen = new Set<string>()
+
+  const pushVerified = (placeholder: string, value: string): boolean => {
+    if (!value) return false
+    const key = `${placeholder}\0${value}`
+    if (seen.has(key)) return false
+    seen.add(key)
+    out.push({ value, placeholder })
+    return true
+  }
+
+  const addRaw = (
+    placeholder: string,
+    value: string | undefined,
+    provenance: SecretNeedleProvenance,
+  ): boolean => {
+    if (!value) return false
+    if (provenance === 'primary_credential') {
+      if (!isAcceptablePrimarySecretNeedle(value)) return false
+      return pushVerified(placeholder, value)
+    }
+    if (!isAcceptableSecretNeedle(value)) return false
+    return pushVerified(placeholder, value)
+  }
+
+  const addCookiePair = (
+    placeholder: string,
+    name: string,
+    value: string,
+    provenance: SecretNeedleProvenance,
+  ): boolean => {
+    if (!name.trim()) return false
+    const cleaned = value.trim().replace(/^["']|["']$/g, '')
+    if (!cleaned) return false
+    if (provenance === 'primary_credential') {
+      if (!isAcceptablePrimarySecretNeedle(cleaned)) return false
+      pushVerified(placeholder, cleaned)
+      return true
+    }
+    if (!isScrubbableCookieNeedle(name, cleaned)) return false
+    pushVerified(placeholder, cleaned)
+    return true
+  }
+
+  const addCookieHeader = (
+    placeholder: string,
+    rawCookieHeader: string | undefined,
+    provenance: SecretNeedleProvenance,
+    options: { isSetCookie?: boolean } = {},
+  ): boolean => {
+    const trimmedHeader = (rawCookieHeader ?? '').trim()
+    if (!trimmedHeader) return false
+    const isSetCookie = Boolean(options.isSetCookie)
+    const pairs = isSetCookie ? [trimmedHeader.split(';')[0] ?? ''] : trimmedHeader.split(';')
+    let matchedAny = false
+    for (const pair of pairs) {
+      const eq = pair.indexOf('=')
+      if (eq <= 0) continue
+      const cookieName = pair.slice(0, eq).trim()
+      const cookieValue = pair.slice(eq + 1).trim().replace(/^["']|["']$/g, '')
+      if (addCookiePair(placeholder, cookieName, cookieValue, provenance)) {
+        matchedAny = true
+      }
+    }
+    if (!matchedAny && provenance === 'primary_credential' && !trimmedHeader.includes('=')) {
+      return addRaw(placeholder, trimmedHeader, 'primary_credential')
+    }
+    const headerMinLen = provenance === 'primary_credential'
+      ? MIN_PRIMARY_SECRET_NEEDLE_LENGTH
+      : MIN_PERSONA_SECRET_NEEDLE_LENGTH
+    if (matchedAny && trimmedHeader.length >= headerMinLen) {
+      const fullValue = isSetCookie ? pairs[0]!.trim() : trimmedHeader
+      if (fullValue.length >= headerMinLen) {
+        pushVerified(placeholder, fullValue)
+      }
+    }
+    return matchedAny
+  }
+
+  const addHeader = (
+    placeholder: string,
+    headerName: string,
+    headerValue: string,
+    provenance: SecretNeedleProvenance,
+  ): void => {
+    if (provenance === 'heuristic_derived' && !isSensitiveHeaderName(headerName)) return
+    const lower = headerName.toLowerCase()
     if (lower === 'cookie' || lower === 'set-cookie') {
-      addCookieHeaderSecrets(value, out, lower === 'set-cookie')
+      addCookieHeader(placeholder, headerValue, provenance, { isSetCookie: lower === 'set-cookie' })
       return
     }
-    const trimmed = value.replace(/^Bearer\s+/i, '').trim()
-    if (isAcceptableSecretNeedle(trimmed)) out.add(trimmed)
+    const trimmed = headerValue.replace(/^Bearer\s+/i, '').trim()
+    addRaw(placeholder, trimmed, provenance)
   }
-  for (const cookie of bundle.cookies ?? []) {
-    if (isScrubbableCookieNeedle(cookie.name, cookie.value)) {
-      out.add(cookie.value.trim().replace(/^["']|["']$/g, ''))
+
+  const addBundle = (
+    placeholder: string,
+    bundle: PersonaCredentialBundle | undefined,
+    provenance: SecretNeedleProvenance = 'heuristic_derived',
+  ): void => {
+    if (!bundle) return
+    for (const cookie of bundle.cookies ?? []) {
+      addCookiePair(placeholder, cookie.name, cookie.value, provenance)
     }
-  }
-  for (const [name, value] of Object.entries(bundle.headers ?? {})) {
-    addHeaderValue(name, value)
-  }
-  const collectStorageSecrets = (snapshot: PersonaStorageSnapshot | undefined) => {
-    for (const scope of [snapshot?.localStorage, snapshot?.sessionStorage]) {
-      for (const [key, value] of Object.entries(scope ?? {})) {
-        if (
-          isAcceptableSecretNeedle(value) &&
-          (/token|jwt|auth|secret|key|session|credential/i.test(key) || JWT_LIKE_RE.test(value.trim()))
-        ) {
-          out.add(value)
+    for (const [name, value] of Object.entries(bundle.headers ?? {})) {
+      addHeader(placeholder, name, value, provenance)
+    }
+    const collectStorageSecrets = (snapshot: PersonaStorageSnapshot | undefined) => {
+      for (const scope of [snapshot?.localStorage, snapshot?.sessionStorage]) {
+        for (const [key, value] of Object.entries(scope ?? {})) {
+          if (
+            /token|jwt|auth|secret|key|session|credential/i.test(key) ||
+            JWT_LIKE_RE.test(value.trim())
+          ) {
+            addRaw(placeholder, value, provenance)
+          }
         }
       }
     }
-  }
-  collectStorageSecrets(bundle.storage)
-  for (const snapshot of Object.values(bundle.storageByOrigin ?? {})) {
-    collectStorageSecrets(snapshot)
-  }
-  for (const attachment of bundle.attachments ?? []) {
-    for (const [name, value] of Object.entries(attachment.headers ?? {})) {
-      addHeaderValue(name, value)
+    collectStorageSecrets(bundle.storage)
+    for (const snapshot of Object.values(bundle.storageByOrigin ?? {})) {
+      collectStorageSecrets(snapshot)
+    }
+    for (const attachment of bundle.attachments ?? []) {
+      for (const [name, value] of Object.entries(attachment.headers ?? {})) {
+        addHeader(placeholder, name, value, provenance)
+      }
     }
   }
-  return [...out]
+
+  const addBrowserBundle = (
+    placeholder: string,
+    bundle: BrowserStorageBundle | undefined,
+    provenance: SecretNeedleProvenance = 'heuristic_derived',
+  ): void => {
+    if (!bundle) return
+    for (const cookie of bundle.storageState.cookies) {
+      addCookiePair(placeholder, cookie.name, cookie.value, provenance)
+    }
+    for (const origin of bundle.storageState.origins) {
+      for (const item of origin.localStorage) {
+        if (
+          /token|jwt|auth|secret|key|session|credential|refresh|clerk|supabase/i.test(item.name) ||
+          item.value.startsWith('eyJ')
+        ) {
+          addRaw(placeholder, item.value, provenance)
+        }
+      }
+    }
+    const addHeaderMap = (headers: Record<string, string> | undefined) => {
+      for (const [name, value] of Object.entries(headers ?? {})) {
+        addHeader(placeholder, name, value, provenance)
+      }
+    }
+    addHeaderMap(bundle.observedHeaders)
+    for (const originHeaders of Object.values(bundle.observedHeadersByOrigin ?? {})) {
+      addHeaderMap(originHeaders)
+    }
+  }
+
+  const addPersona = (
+    persona: ResolvedPersona,
+    options: { placeholder?: string; refreshFromDisk?: boolean } = {},
+  ): void => {
+    if (options.refreshFromDisk !== false) {
+      try {
+        if (persona.authKind === 'login') {
+          refreshPersonaSession(persona)
+        } else {
+          refreshPersonaSecret(persona)
+        }
+      } catch {
+        /* keep cached history if file permissions changed */
+      }
+    }
+
+    const placeholder = options.placeholder ?? `[persona:${persona.handle}:secret]`
+    const isBrowserSession =
+      persona.authKind === 'login' &&
+      isBrowserSessionConfig(persona.loginConfig as { adapter?: string } | null)
+
+    // 1. Primary static operator credential (always primary_credential except browser_session sentinel/bundle fallback).
+    if (persona.secret) {
+      if (persona.authKind === 'cookie') {
+        addCookieHeader(placeholder, persona.secret, 'primary_credential')
+      } else if (isBrowserSession) {
+        const isPrimaryNonCookieSession =
+          persona.session &&
+          persona.session.headerType !== 'cookie' &&
+          persona.secret === persona.session.value
+        if (isPrimaryNonCookieSession) {
+          addRaw(placeholder, persona.secret, 'primary_credential')
+        } else if (looksLikeCookieHeaderString(persona.secret)) {
+          addCookieHeader(placeholder, persona.secret, 'heuristic_derived')
+        } else {
+          addRaw(placeholder, persona.secret, 'heuristic_derived')
+        }
+      } else {
+        // bearer, header, or login email+password / clerk_client password: ALWAYS primary_credential!
+        addRaw(placeholder, persona.secret, 'primary_credential')
+      }
+    }
+
+    // 2. Active minted session value.
+    if (persona.session?.value) {
+      if (persona.session.headerType === 'cookie') {
+        // Target-emitted Set-Cookie session header: apply cookie-name/entropy heuristic gate (R4-H-17).
+        addCookieHeader(placeholder, persona.session.value, 'heuristic_derived')
+      } else {
+        // Single minted bearer/header credential: always primary_credential (R4-H-2).
+        addRaw(placeholder, persona.session.value, 'primary_credential')
+      }
+    }
+
+    // 3. Historical operator secrets (primary for static personas; heuristic for login mixed history).
+    for (const raw of persona.secretHistory ?? []) {
+      if (!raw) continue
+      if (persona.authKind === 'cookie') {
+        addCookieHeader(placeholder, raw, 'primary_credential')
+      } else if (persona.authKind !== 'login') {
+        addRaw(placeholder, raw, 'primary_credential')
+      } else {
+        // Never misparse a login password containing `=` as a cookie pair.
+        if (!isBrowserSession && raw === persona.secret) {
+          addRaw(placeholder, raw, 'primary_credential')
+        } else if (looksLikeCookieHeaderString(raw)) {
+          addCookieHeader(placeholder, raw, 'heuristic_derived')
+        } else {
+          addRaw(placeholder, raw, 'heuristic_derived')
+        }
+      }
+    }
+
+    // 4. Target-derived session scrubTokens & bundle secrets: always heuristic_derived.
+    for (const tok of persona.session?.scrubTokens ?? []) {
+      if (!tok) continue
+      if (looksLikeCookieHeaderString(tok)) {
+        addCookieHeader(placeholder, tok, 'heuristic_derived')
+      } else {
+        addRaw(placeholder, tok, 'heuristic_derived')
+      }
+    }
+    addBundle(placeholder, persona.session?.bundle, 'heuristic_derived')
+  }
+
+  return {
+    addRaw,
+    addCookiePair,
+    addCookieHeader,
+    addHeader,
+    addBundle,
+    addBrowserBundle,
+    addPersona,
+    build: () => [...out],
+    values: () => [...new Set(out.map(entry => entry.value))],
+  }
+}
+
+/**
+ * Extracts scrubbable exact-needle values from a target-emitted `Set-Cookie` / browser cookie map,
+ * applying the auth-relevant cookie-name + entropy rule per `(name, value)` pair (R4-H-17).
+ */
+export function extractScrubbableCookieMapNeedles(cookies: ReadonlyMap<string, string>): string[] {
+  if (cookies.size === 0) return []
+  const builder = createSecretNeedleBuilder()
+  let matchedAny = false
+  const pairs: string[] = []
+  for (const [name, value] of cookies.entries()) {
+    pairs.push(`${name}=${value}`)
+    if (builder.addCookiePair('[cookie]', name, value, 'heuristic_derived')) {
+      matchedAny = true
+    }
+  }
+  const fullHeader = pairs.join('; ')
+  if (matchedAny && fullHeader.length >= MIN_PERSONA_SECRET_NEEDLE_LENGTH) {
+    builder.addCookieHeader('[cookie]', fullHeader, 'heuristic_derived')
+  }
+  return builder.values()
+}
+
+/** All secret material inside a bundle (auth-relevant cookie values, sensitive headers, token-like storage). */
+export function bundleSecrets(bundle: PersonaCredentialBundle | undefined): string[] {
+  if (!bundle) return []
+  const builder = createSecretNeedleBuilder()
+  builder.addBundle('[bundle]', bundle, 'heuristic_derived')
+  return builder.values()
 }
 
 /** Serialize a storage snapshot into a safe Playwright init script. */
@@ -1063,40 +1350,9 @@ export function normalizeBrowserStorageBundle(
 
 /** Collect sensitive auth/session tokens, cookies, and headers inside a `BrowserStorageBundle` for redaction. */
 export function extractBrowserBundleSecrets(bundle: BrowserStorageBundle): string[] {
-  const out = new Set<string>()
-  for (const cookie of bundle.storageState.cookies) {
-    if (isScrubbableCookieNeedle(cookie.name, cookie.value)) {
-      out.add(cookie.value.trim().replace(/^["']|["']$/g, ''))
-    }
-  }
-  for (const origin of bundle.storageState.origins) {
-    for (const item of origin.localStorage) {
-      if (
-        isAcceptableSecretNeedle(item.value) &&
-        (/token|jwt|auth|secret|key|session|credential|refresh|clerk|supabase/i.test(item.name) ||
-          item.value.startsWith('eyJ'))
-      ) {
-        out.add(item.value)
-      }
-    }
-  }
-  const addHeaderMap = (headers: Record<string, string> | undefined) => {
-    for (const [name, value] of Object.entries(headers ?? {})) {
-      if (!isSensitiveHeaderName(name)) continue
-      const lower = name.toLowerCase()
-      if (lower === 'cookie' || lower === 'set-cookie') {
-        addCookieHeaderSecrets(value, out, lower === 'set-cookie')
-        continue
-      }
-      const trimmed = value.replace(/^Bearer\s+/i, '').trim()
-      if (isAcceptableSecretNeedle(trimmed)) out.add(trimmed)
-    }
-  }
-  addHeaderMap(bundle.observedHeaders)
-  for (const originHeaders of Object.values(bundle.observedHeadersByOrigin ?? {})) {
-    addHeaderMap(originHeaders)
-  }
-  return [...out]
+  const builder = createSecretNeedleBuilder()
+  builder.addBrowserBundle('[browser_bundle]', bundle, 'heuristic_derived')
+  return builder.values()
 }
 
 export function readBrowserSessionCredentialFile(path: string): {
@@ -1326,23 +1582,14 @@ export function writePersonaSessionFile(
 
   // Preserve historical minted session values & extra scrub tokens (e.g. __client, prior JWTs)
   // so personaSecrets() always scrubs every prior & current token after rotation.
-  const mergedScrub: string[] = []
-  const seen = new Set<string>()
-  const pushUnique = (tok: string) => {
-    if (!tok || seen.has(tok)) return
-    seen.add(tok)
-    mergedScrub.push(tok)
-  }
+  const builder = createSecretNeedleBuilder()
   const addToken = (tok: string | undefined, treatAsCookieHeader = false) => {
     if (!tok) return
     if (treatAsCookieHeader || looksLikeCookieHeaderString(tok)) {
-      const extracted = new Set<string>()
-      addCookieHeaderSecrets(tok, extracted)
-      for (const item of extracted) pushUnique(item)
+      builder.addCookieHeader('[session]', tok, 'heuristic_derived')
       return
     }
-    if (!isAcceptableSecretNeedle(tok)) return
-    pushUnique(tok)
+    builder.addRaw('[session]', tok, 'heuristic_derived')
   }
 
   try {
@@ -1358,7 +1605,8 @@ export function writePersonaSessionFile(
   addToken(session.value, session.headerType === 'cookie')
   for (const tok of session.scrubTokens ?? []) addToken(tok)
   const bundle = normalizePersonaBundle(session.bundle)
-  for (const tok of bundleSecrets(bundle)) addToken(tok)
+  builder.addBundle('[session]', bundle, 'heuristic_derived')
+  const mergedScrub = builder.values()
 
   const payload: MintedPersonaSession = {
     headerType: session.headerType,
@@ -1727,11 +1975,95 @@ export interface CreateBrowserSessionPersonaInput {
   canaryMarkers?: string[]
 }
 
+function collectProjectScopeAnchorOrigins(storage: Store, projectId: string): Set<string> {
+  const project = storage.project(projectId)
+  const anchors = new Set<string>()
+  const add = (raw: string | undefined) => {
+    if (!raw) return
+    const norm = normalizeScopeOrigin(raw)
+    if (norm) anchors.add(norm)
+  }
+  for (const seed of project.seeds ?? []) add(seed)
+  for (const origin of project.defaultScope ?? []) add(origin)
+  const assets = storage.db
+    .select({ origin: projectAssets.origin, thirdParty: projectAssets.thirdParty })
+    .from(projectAssets)
+    .where(eq(projectAssets.projectId, project.id))
+    .all()
+  for (const asset of assets) {
+    if (!asset.thirdParty) add(asset.origin)
+  }
+  return anchors
+}
+
+function originMatchesScopeAnchors(candidateOrigin: string, anchors: ReadonlySet<string>): boolean {
+  const normalized = normalizeScopeOrigin(candidateOrigin)
+  if (!normalized) return false
+  if (anchors.size === 0) return true
+  if (anchors.has(normalized)) return true
+  let candidateUrl: URL
+  try {
+    candidateUrl = new URL(normalized)
+  } catch {
+    return false
+  }
+  const candHost = normalizeHostname(candidateUrl.hostname)
+  if (!candHost || candHost === 'localhost' || isIpLiteralHost(candHost) || isMultiTenantPublicSuffix(candHost)) {
+    return false
+  }
+  const candApex = registrableApex(candHost)
+  if (!candApex) return false
+  const candPort = candidateUrl.port || (candidateUrl.protocol === 'https:' ? '443' : '80')
+  for (const anchor of anchors) {
+    try {
+      const anchorUrl = new URL(anchor)
+      if (anchorUrl.protocol !== candidateUrl.protocol) continue
+      const anchorPort = anchorUrl.port || (anchorUrl.protocol === 'https:' ? '443' : '80')
+      if (anchorPort !== candPort) continue
+      const anchorHost = normalizeHostname(anchorUrl.hostname)
+      if (!anchorHost || anchorHost === 'localhost' || isIpLiteralHost(anchorHost) || isMultiTenantPublicSuffix(anchorHost)) {
+        continue
+      }
+      const anchorApex = registrableApex(anchorHost)
+      if (anchorApex && anchorApex === candApex) return true
+    } catch {
+      continue
+    }
+  }
+  return false
+}
+
+/**
+ * R4-H-3: Validates that every `browser_session` persona `originAllowlist` entry falls within
+ * the project's configured scope (seeds, defaultScope, non-third-party project assets, or
+ * first-party same-apex sibling on non-multi-tenant hosts).
+ */
+export function assertOriginsWithinProjectScope(
+  storage: Store,
+  projectId: string,
+  origins: readonly string[],
+): string[] {
+  const anchors = collectProjectScopeAnchorOrigins(storage, projectId)
+  const validated: string[] = []
+  for (const raw of origins) {
+    const normalized = normalizeScopeOrigin(raw)
+    if (!normalized) {
+      throw new Error(`Origin "${raw}" is not a valid HTTP(S) origin.`)
+    }
+    if (!originMatchesScopeAnchors(normalized, anchors)) {
+      throw new Error(`Origin "${normalized}" is outside the project scope.`)
+    }
+    validated.push(normalized)
+  }
+  return validated
+}
+
 export function createBrowserSessionPersona(
   storage: Store,
   input: CreateBrowserSessionPersonaInput,
 ): { id: string; handle: string } {
-  const targetOrigin = input.originAllowlist[0]
+  const scopedAllowlist = assertOriginsWithinProjectScope(storage, input.projectId, input.originAllowlist)
+  const targetOrigin = scopedAllowlist[0]
   const normalizedBundle = normalizeBrowserStorageBundle(
     input.storageState,
     targetOrigin,
@@ -1742,7 +2074,7 @@ export function createBrowserSessionPersona(
     projectId: input.projectId,
     handle: input.handle,
     roleLabel: input.roleLabel,
-    originAllowlist: input.originAllowlist,
+    originAllowlist: scopedAllowlist,
     authKind: 'login',
     loginConfig: {
       adapter: 'browser_session' as unknown as PersonaLoginConfig['adapter'],
@@ -1772,16 +2104,17 @@ export function updateBrowserSessionPersona(
   storage: Store,
   input: UpdateBrowserSessionPersonaInput,
 ): { id: string; handle: string } {
+  const scopedAllowlist = assertOriginsWithinProjectScope(storage, input.projectId, input.originAllowlist)
   const hasReplacement = input.storageState !== undefined && input.storageState !== null && input.storageState !== ''
   const secret = hasReplacement
-    ? JSON.stringify(normalizeBrowserStorageBundle(input.storageState, input.originAllowlist[0], input.observedHeaders))
+    ? JSON.stringify(normalizeBrowserStorageBundle(input.storageState, scopedAllowlist[0], input.observedHeaders))
     : undefined
   return updateProjectPersona(storage, {
     requestId: input.requestId,
     projectId: input.projectId,
     personaId: input.personaId,
     roleLabel: input.roleLabel,
-    originAllowlist: input.originAllowlist,
+    originAllowlist: scopedAllowlist,
     authKind: 'login',
     loginConfig: {
       adapter: 'browser_session' as unknown as PersonaLoginConfig['adapter'],
@@ -1941,72 +2274,29 @@ export function resolveRunPersonas(storage: Store, projectId: string, approvedPe
   return map
 }
 
-export function personaSecrets(resolved: ReadonlyMap<string, ResolvedPersona>): NamedSecret[] {
-  const out: NamedSecret[] = []
-  const seen = new Set<string>()
-  const push = (placeholder: string, value: string, prevalidatedCookieHeader = false) => {
-    if (!value) return
-    if (!prevalidatedCookieHeader && !isAcceptableSecretNeedle(value)) return
-    const key = `${placeholder}\0${value}`
-    if (seen.has(key)) return
-    seen.add(key)
-    out.push({ value, placeholder })
-  }
-  const pushCookieHeader = (placeholder: string, rawCookieHeader: string) => {
-    const extracted = new Set<string>()
-    addCookieHeaderSecrets(rawCookieHeader, extracted)
-    for (const tok of extracted) {
-      push(placeholder, tok, true)
-    }
-  }
+/**
+ * Builds provenance-tiered exact-scrub secret needles for a resolved persona map (R4-H-2).
+ * Shared authoritative entry point for both `personaSecrets` and WS-3 (`getKernelSecrets`).
+ */
+export function buildPersonaSecretNeedles(
+  resolved: ReadonlyMap<string, ResolvedPersona>,
+  options: {
+    placeholderFor?: (persona: ResolvedPersona) => string
+    refreshFromDisk?: boolean
+  } = {},
+): NamedSecret[] {
+  const builder = createSecretNeedleBuilder()
   for (const persona of resolved.values()) {
-    try {
-      if (persona.authKind === 'login') {
-        refreshPersonaSession(persona)
-      } else {
-        refreshPersonaSecret(persona)
-      }
-    } catch {
-      /* keep cached history if file permissions changed */
-    }
-    const placeholder = `[persona:${persona.handle}:secret]`
-
-    // 1. Primary static credential (cookie header for `cookie` personas, password/token for others).
-    if (persona.secret) {
-      if (persona.authKind === 'cookie') {
-        pushCookieHeader(placeholder, persona.secret)
-      } else {
-        push(placeholder, persona.secret)
-      }
-    }
-
-    // 2. Active minted session value.
-    if (persona.session?.value) {
-      if (persona.session.headerType === 'cookie') {
-        pushCookieHeader(placeholder, persona.session.value)
-      } else {
-        push(placeholder, persona.session.value)
-      }
-    }
-
-    // 3. Historical secrets, session scrubTokens, and bundle-derived secrets.
-    const extraValues = new Set<string>([
-      ...(persona.secretHistory ?? []),
-      ...(persona.session?.scrubTokens ?? []),
-      ...bundleSecrets(persona.session?.bundle),
-    ])
-    for (const raw of extraValues) {
-      if (!raw) continue
-      // Never misparse a login password containing `=` as a cookie pair.
-      const isRawPassword = persona.authKind === 'login' && raw === persona.secret
-      if (!isRawPassword && (persona.authKind === 'cookie' || persona.authKind === 'login') && looksLikeCookieHeaderString(raw)) {
-        pushCookieHeader(placeholder, raw)
-      } else {
-        push(placeholder, raw)
-      }
-    }
+    builder.addPersona(persona, {
+      ...(options.placeholderFor ? { placeholder: options.placeholderFor(persona) } : {}),
+      refreshFromDisk: options.refreshFromDisk,
+    })
   }
-  return out
+  return builder.build()
+}
+
+export function personaSecrets(resolved: ReadonlyMap<string, ResolvedPersona>): NamedSecret[] {
+  return buildPersonaSecretNeedles(resolved)
 }
 
 export function buildPersonaHeader(persona: ResolvedPersona, origin: string): Record<string, string> | null {

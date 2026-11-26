@@ -5,7 +5,7 @@ import type { NamedSecret } from './redact.ts'
 type Fields = Record<string, unknown>
 type Fragment = { owner: Fields; field: string; text: string }
 type Frame = { lines: string[]; data: Fields | '[DONE]' | undefined }
-type Prepared = WeakMap<Fields, Set<string>>
+type Prepared = WeakMap<Fields, Map<string, string>>
 
 export const defaultStreamResponseLimit = 16 * 1024 * 1024
 export const maxStreamResponseLimit = 32 * 1024 * 1024
@@ -195,8 +195,28 @@ function scrubJsonStringValues(raw: string, scrubString: (value: string) => stri
   return next === parsed ? raw : JSON.stringify(next)
 }
 
-function scrubContentBlock(block: unknown, scrubString: (value: string) => string): unknown {
-  if (typeof block === 'string') return scrubString(block)
+interface ProviderScrubHooks {
+  scrubText: (value: string) => string
+  scrubExact: (value: string) => string
+  scrubJsonArgs: (raw: string) => string
+  scrubToolInput: (value: unknown) => unknown
+  scrubSignature: boolean
+  joinMessageContent?: boolean
+  prepared?: Prepared
+}
+
+function createOutboundScrubHooks(scrubExact: (value: string) => string): ProviderScrubHooks {
+  return {
+    scrubText: scrubExact,
+    scrubExact,
+    scrubJsonArgs: raw => scrubJsonStringValues(raw, scrubExact),
+    scrubToolInput: value => scrubStringValuesOnly(value, scrubExact),
+    scrubSignature: false,
+  }
+}
+
+function scrubContentBlock(block: unknown, hooks: ProviderScrubHooks): unknown {
+  if (typeof block === 'string') return hooks.scrubText(block)
   const rec = fields(block)
   if (!rec) return block
   const blockType = ownValue(rec, 'type')
@@ -213,11 +233,17 @@ function scrubContentBlock(block: unknown, scrubString: (value: string) => strin
     return block
   }
 
+  const preparedForRec = hooks.prepared?.get(rec)
+  const scrubLeaf = (fieldName: string, raw: string, fn: (v: string) => string): string => {
+    if (preparedForRec?.has(fieldName)) return preparedForRec.get(fieldName)!
+    return fn(raw)
+  }
+
   const patches = new Map<string, unknown>()
   if (type === 'text' || type === 'input_text' || type === 'output_text' || type === 'summary_text') {
     const text = ownValue(rec, 'text')
     if (typeof text === 'string') {
-      const next = scrubString(text)
+      const next = scrubLeaf('text', text, hooks.scrubText)
       if (next !== text) patches.set('text', next)
     }
     return patchRecord(rec, patches)
@@ -226,18 +252,25 @@ function scrubContentBlock(block: unknown, scrubString: (value: string) => strin
   if (type === 'refusal') {
     const refusal = ownValue(rec, 'refusal')
     if (typeof refusal === 'string') {
-      const next = scrubString(refusal)
+      const next = scrubLeaf('refusal', refusal, hooks.scrubText)
       if (next !== refusal) patches.set('refusal', next)
     }
     return patchRecord(rec, patches)
   }
 
   if (type === 'thinking') {
-    // Scrub thinking prose only; NEVER touch opaque cryptographic `signature` or `type`.
+    // Scrub thinking prose; outbound NEVER touches opaque signature, inbound uses exact-only.
     const thinking = ownValue(rec, 'thinking')
     if (typeof thinking === 'string') {
-      const next = scrubString(thinking)
+      const next = scrubLeaf('thinking', thinking, hooks.scrubText)
       if (next !== thinking) patches.set('thinking', next)
+    }
+    if (hooks.scrubSignature) {
+      const signature = ownValue(rec, 'signature')
+      if (typeof signature === 'string') {
+        const next = scrubLeaf('signature', signature, hooks.scrubExact)
+        if (next !== signature) patches.set('signature', next)
+      }
     }
     return patchRecord(rec, patches)
   }
@@ -246,7 +279,7 @@ function scrubContentBlock(block: unknown, scrubString: (value: string) => strin
     // Scrub only string values inside `input`; NEVER mutate keys, `type`, `id`, or `name`.
     const input = ownValue(rec, 'input')
     if (input !== undefined) {
-      const next = scrubStringValuesOnly(input, scrubString)
+      const next = hooks.scrubToolInput(input)
       if (next !== input) patches.set('input', next)
     }
     return patchRecord(rec, patches)
@@ -255,10 +288,10 @@ function scrubContentBlock(block: unknown, scrubString: (value: string) => strin
   if (type === 'tool_result') {
     const content = ownValue(rec, 'content')
     if (typeof content === 'string') {
-      const next = scrubString(content)
+      const next = scrubLeaf('content', content, hooks.scrubText)
       if (next !== content) patches.set('content', next)
     } else if (Array.isArray(content)) {
-      const next = scrubContentBlocks(content, scrubString)
+      const next = scrubContentBlocks(content, hooks)
       if (next !== content) patches.set('content', next)
     }
     return patchRecord(rec, patches)
@@ -268,7 +301,7 @@ function scrubContentBlock(block: unknown, scrubString: (value: string) => strin
     for (const fieldName of ['title', 'context'] as const) {
       const val = ownValue(rec, fieldName)
       if (typeof val === 'string') {
-        const next = scrubString(val)
+        const next = scrubLeaf(fieldName, val, hooks.scrubText)
         if (next !== val) patches.set(fieldName, next)
       }
     }
@@ -276,7 +309,7 @@ function scrubContentBlock(block: unknown, scrubString: (value: string) => strin
     if (source && ownValue(source, 'type') === 'text') {
       const data = ownValue(source, 'data')
       if (typeof data === 'string') {
-        const nextData = scrubString(data)
+        const nextData = hooks.scrubText(data)
         if (nextData !== data) {
           patches.set('source', patchRecord(source, new Map([['data', nextData]])))
         }
@@ -288,23 +321,23 @@ function scrubContentBlock(block: unknown, scrubString: (value: string) => strin
   // Fallback for unknown content blocks: scrub only a `text` string leaf if present; never keys/type.
   const fallbackText = ownValue(rec, 'text')
   if (typeof fallbackText === 'string') {
-    const next = scrubString(fallbackText)
+    const next = scrubLeaf('text', fallbackText, hooks.scrubText)
     if (next !== fallbackText) patches.set('text', next)
   }
   return patchRecord(rec, patches)
 }
 
-function scrubContentBlocks(blocks: unknown[], scrubString: (value: string) => string): unknown[] {
+function scrubContentBlocks(blocks: unknown[], hooks: ProviderScrubHooks): unknown[] {
   let changed = false
   const mapped = blocks.map(block => {
-    const next = scrubContentBlock(block, scrubString)
+    const next = scrubContentBlock(block, hooks)
     if (next !== block) changed = true
     return next
   })
   return changed ? mapped : blocks
 }
 
-function scrubChatToolCalls(toolCalls: unknown[], scrubString: (value: string) => string): unknown[] {
+function scrubChatToolCalls(toolCalls: unknown[], hooks: ProviderScrubHooks): unknown[] {
   let changed = false
   const mapped = toolCalls.map(entry => {
     const tc = fields(entry)
@@ -313,7 +346,7 @@ function scrubChatToolCalls(toolCalls: unknown[], scrubString: (value: string) =
     if (!fn) return entry
     const args = ownValue(fn, 'arguments')
     if (typeof args !== 'string') return entry
-    const nextArgs = scrubJsonStringValues(args, scrubString)
+    const nextArgs = hooks.scrubJsonArgs(args)
     if (nextArgs === args) return entry
     changed = true
     return patchRecord(tc, new Map([['function', patchRecord(fn, new Map([['arguments', nextArgs]]))]]))
@@ -321,8 +354,8 @@ function scrubChatToolCalls(toolCalls: unknown[], scrubString: (value: string) =
   return changed ? mapped : toolCalls
 }
 
-function scrubOutboundItem(item: unknown, scrubString: (value: string) => string): unknown {
-  if (typeof item === 'string') return scrubString(item)
+function scrubStructuredItem(item: unknown, hooks: ProviderScrubHooks): unknown {
+  if (typeof item === 'string') return hooks.scrubText(item)
   const rec = fields(item)
   if (!rec) return item
   const itemType = ownValue(rec, 'type')
@@ -340,15 +373,18 @@ function scrubOutboundItem(item: unknown, scrubString: (value: string) => string
     return item
   }
 
+  const preparedForRec = hooks.prepared?.get(rec)
   const patches = new Map<string, unknown>()
 
   if (type === 'function_call') {
     const args = ownValue(rec, 'arguments')
     if (typeof args === 'string') {
-      const next = scrubJsonStringValues(args, scrubString)
+      const next = preparedForRec?.has('arguments')
+        ? preparedForRec.get('arguments')!
+        : hooks.scrubJsonArgs(args)
       if (next !== args) patches.set('arguments', next)
     } else if (args && typeof args === 'object') {
-      const next = scrubStringValuesOnly(args, scrubString)
+      const next = hooks.scrubToolInput(args)
       if (next !== args) patches.set('arguments', next)
     }
     return patchRecord(rec, patches)
@@ -357,10 +393,12 @@ function scrubOutboundItem(item: unknown, scrubString: (value: string) => string
   if (type === 'custom_tool_call') {
     const input = ownValue(rec, 'input')
     if (typeof input === 'string') {
-      const next = scrubString(input)
+      const next = preparedForRec?.has('input')
+        ? preparedForRec.get('input')!
+        : hooks.scrubExact(input)
       if (next !== input) patches.set('input', next)
     } else if (input && typeof input === 'object') {
-      const next = scrubStringValuesOnly(input, scrubString)
+      const next = hooks.scrubToolInput(input)
       if (next !== input) patches.set('input', next)
     }
     return patchRecord(rec, patches)
@@ -369,10 +407,10 @@ function scrubOutboundItem(item: unknown, scrubString: (value: string) => string
   if (type === 'function_call_output' || type === 'custom_tool_call_output') {
     const output = ownValue(rec, 'output')
     if (typeof output === 'string') {
-      const next = scrubString(output)
+      const next = hooks.scrubText(output)
       if (next !== output) patches.set('output', next)
     } else if (Array.isArray(output)) {
-      const next = scrubContentBlocks(output, scrubString)
+      const next = scrubContentBlocks(output, hooks)
       if (next !== output) patches.set('output', next)
     }
     return patchRecord(rec, patches)
@@ -382,7 +420,7 @@ function scrubOutboundItem(item: unknown, scrubString: (value: string) => string
     // Scrub human-readable summary text only; NEVER touch `encrypted_content`, `id`, `status`, `type`.
     const summary = ownValue(rec, 'summary')
     if (Array.isArray(summary)) {
-      const next = scrubContentBlocks(summary, scrubString)
+      const next = scrubContentBlocks(summary, hooks)
       if (next !== summary) patches.set('summary', next)
     }
     return patchRecord(rec, patches)
@@ -393,15 +431,44 @@ function scrubOutboundItem(item: unknown, scrubString: (value: string) => string
   if (type === 'message' || typeof role === 'string') {
     const content = ownValue(rec, 'content')
     if (typeof content === 'string') {
-      const next = scrubString(content)
+      const next = hooks.scrubText(content)
       if (next !== content) patches.set('content', next)
     } else if (Array.isArray(content)) {
-      const next = scrubContentBlocks(content, scrubString)
-      if (next !== content) patches.set('content', next)
+      if (hooks.joinMessageContent && content.length > 1) {
+        const localPrepared: Prepared = new WeakMap()
+        const parts = content.flatMap(entry => {
+          const part = fields(entry)
+          const text = fragment(part, part?.type === 'refusal' ? 'refusal' : 'text')
+          return text ? [text] : []
+        })
+        if (parts.length > 1) {
+          const joined = parts.map(p => p.text).join('')
+          const safe = hooks.scrubText(joined)
+          let offset = 0
+          for (const [idx, part] of parts.entries()) {
+            const end = idx === parts.length - 1 ? undefined : offset + part.text.length
+            let map = localPrepared.get(part.owner)
+            if (!map) {
+              map = new Map<string, string>()
+              localPrepared.set(part.owner, map)
+            }
+            map.set(part.field, safe.slice(offset, end))
+            offset += part.text.length
+          }
+          const next = scrubContentBlocks(content, { ...hooks, prepared: localPrepared })
+          if (next !== content) patches.set('content', next)
+        } else {
+          const next = scrubContentBlocks(content, hooks)
+          if (next !== content) patches.set('content', next)
+        }
+      } else {
+        const next = scrubContentBlocks(content, hooks)
+        if (next !== content) patches.set('content', next)
+      }
     }
     const toolCalls = ownValue(rec, 'tool_calls')
     if (Array.isArray(toolCalls)) {
-      const next = scrubChatToolCalls(toolCalls, scrubString)
+      const next = scrubChatToolCalls(toolCalls, hooks)
       if (next !== toolCalls) patches.set('tool_calls', next)
     }
     return patchRecord(rec, patches)
@@ -448,6 +515,7 @@ export function scrubOutboundProviderRequest(
   if (!rec) return payload
   const resolved = resolveSecretSource(secrets)
   const scrubString = (text: string): string => redactSecrets(text, resolved, { providerKey: key })
+  const hooks = createOutboundScrubHooks(scrubString)
   const patches = new Map<string, unknown>()
 
   const instructions = ownValue(rec, 'instructions')
@@ -461,7 +529,7 @@ export function scrubOutboundProviderRequest(
     const next = scrubString(system)
     if (next !== system) patches.set('system', next)
   } else if (Array.isArray(system)) {
-    const next = scrubContentBlocks(system, scrubString)
+    const next = scrubContentBlocks(system, hooks)
     if (next !== system) patches.set('system', next)
   }
 
@@ -472,7 +540,7 @@ export function scrubOutboundProviderRequest(
   } else if (Array.isArray(input)) {
     let changed = false
     const mapped = input.map(item => {
-      const next = scrubOutboundItem(item, scrubString)
+      const next = scrubStructuredItem(item, hooks)
       if (next !== item) changed = true
       return next
     })
@@ -483,7 +551,7 @@ export function scrubOutboundProviderRequest(
   if (Array.isArray(messages)) {
     let changed = false
     const mapped = messages.map(item => {
-      const next = scrubOutboundItem(item, scrubString)
+      const next = scrubStructuredItem(item, hooks)
       if (next !== item) changed = true
       return next
     })
@@ -724,6 +792,161 @@ function redactArguments(value: string, key: string, secrets: readonly NamedSecr
   return safe === JSON.stringify(parsed) ? value : safe
 }
 
+const PROTECTED_INBOUND_PROTOCOL_FIELDS = new Set<string>([
+  'type',
+  'event',
+  'id',
+  'item_id',
+  'response_id',
+  'call_id',
+  'tool_use_id',
+  'index',
+  'output_index',
+  'content_index',
+  'summary_index',
+  'sequence_number',
+  'status',
+  'role',
+  'model',
+  'name',
+  'stop_reason',
+  'finish_reason',
+  'stop_sequence',
+  'object',
+  'phase',
+  'namespace',
+  'service_tier',
+  'created',
+  'created_at',
+  'encrypted_content',
+  'obfuscation',
+  'code',
+  'param',
+  'is_error',
+  'cache_control',
+  'tool_choice',
+  'tools',
+  'usage',
+  'incomplete_details',
+  'display',
+  'effort',
+])
+
+const STRUCTURED_ITEM_TYPES = new Set([
+  'message',
+  'function_call',
+  'custom_tool_call',
+  'function_call_output',
+  'custom_tool_call_output',
+  'reasoning',
+  'additional_tools',
+  'configuration_update',
+  'tool_search_call',
+  'tool_search_output',
+  'tool_addition',
+  'tool_removal',
+])
+
+const CONTENT_BLOCK_TYPES = new Set([
+  'text',
+  'input_text',
+  'output_text',
+  'summary_text',
+  'refusal',
+  'thinking',
+  'redacted_thinking',
+  'tool_use',
+  'tool_result',
+  'document',
+  'image',
+  'input_image',
+])
+
+const INBOUND_INTEGRITY_CONTAINER_FIELDS = [
+  'response',
+  'message',
+  'item',
+  'part',
+  'delta',
+  'content_block',
+  'error',
+] as const
+
+const INBOUND_INTEGRITY_LIST_FIELDS = [
+  'output',
+  'content',
+  'summary',
+] as const
+
+function verifyInboundNodeIntegrity(
+  origNode: unknown,
+  nextNode: unknown,
+  path: string,
+): string | null {
+  const origRec = fields(origNode)
+  const nextRec = fields(nextNode)
+  if (!origRec || !nextRec) return null
+
+  const origKeys = Object.keys(origRec)
+  const nextKeys = Object.keys(nextRec)
+  if (origKeys.length !== nextKeys.length || origKeys.some((k, idx) => nextKeys[idx] !== k)) {
+    return `${path}.keys`
+  }
+
+  for (const fieldName of PROTECTED_INBOUND_PROTOCOL_FIELDS) {
+    if (!Object.prototype.hasOwnProperty.call(origRec, fieldName)) continue
+    const ov = ownValue(origRec, fieldName)
+    const nv = ownValue(nextRec, fieldName)
+    if (!stableJsonEqual(ov, nv)) return `${path}.${fieldName}`
+    if (
+      nv !== undefined &&
+      !valueHasRedactionPlaceholder(ov) &&
+      valueHasRedactionPlaceholder(nv)
+    ) {
+      return `${path}.${fieldName}`
+    }
+  }
+
+  for (const containerKey of INBOUND_INTEGRITY_CONTAINER_FIELDS) {
+    const ov = ownValue(origRec, containerKey)
+    const nv = ownValue(nextRec, containerKey)
+    if (fields(ov) && fields(nv)) {
+      const nested = verifyInboundNodeIntegrity(ov, nv, `${path}.${containerKey}`)
+      if (nested) return nested
+    }
+  }
+
+  for (const listKey of INBOUND_INTEGRITY_LIST_FIELDS) {
+    const ov = ownValue(origRec, listKey)
+    const nv = ownValue(nextRec, listKey)
+    if (Array.isArray(ov) && Array.isArray(nv)) {
+      if (ov.length !== nv.length) return `${path}.${listKey}.length`
+      for (let i = 0; i < ov.length; i++) {
+        const nested = verifyInboundNodeIntegrity(ov[i], nv[i], `${path}.${listKey}[${i}]`)
+        if (nested) return nested
+      }
+    }
+  }
+
+  return null
+}
+
+/**
+ * Verifies that local inbound stream scrubbing never rewrote JSON object keys or mutated
+ * protected SSE protocol fields (`type`, `event`, `id`, `index`, `status`, `role`, `stop_reason`,
+ * `finish_reason`, etc.) or introduced redaction placeholders into protocol metadata (R4-H-17).
+ * Returns `null` when intact, or the violated field path when corrupted.
+ */
+export function verifyInboundProviderFrameIntegrity(
+  original: Record<string, unknown>,
+  scrubbed: Record<string, unknown>,
+): string | null {
+  const origRec = fields(original)
+  const nextRec = fields(scrubbed)
+  if (!origRec || !nextRec) return 'frame'
+  return verifyInboundNodeIntegrity(origRec, nextRec, 'frame')
+}
+
 function prepareFragments(
   items: Fragment[],
   key: string,
@@ -741,13 +964,127 @@ function prepareFragments(
   let offset = 0
   for (const [index, item] of items.entries()) {
     const end = index === items.length - 1 ? undefined : offset + item.text.length
-    item.owner[item.field] = safe.slice(offset, end)
+    let ownerMap = prepared.get(item.owner)
+    if (!ownerMap) {
+      ownerMap = new Map<string, string>()
+      prepared.set(item.owner, ownerMap)
+    }
+    ownerMap.set(item.field, safe.slice(offset, end))
     offset += item.text.length
-    if (!prepared.has(item.owner)) prepared.set(item.owner, new Set())
-    prepared.get(item.owner)!.add(item.field)
   }
 }
 
+function createInboundScrubHooks(
+  key: string,
+  resolved: readonly NamedSecret[],
+  prepared: Prepared,
+): ProviderScrubHooks {
+  return {
+    scrubText: text => redactProviderText(text, key, resolved),
+    scrubExact: text => redactExactSecrets(text, key, resolved),
+    scrubJsonArgs: raw => redactArguments(raw, key, resolved),
+    scrubToolInput: value => sanitizeToolArgumentValue(value, key, resolved),
+    scrubSignature: true,
+    joinMessageContent: true,
+    prepared,
+  }
+}
+
+function sanitizeInboundDelta(
+  delta: Fields,
+  hooks: ProviderScrubHooks,
+): Fields {
+  const deltaType = typeof ownValue(delta, 'type') === 'string' ? String(ownValue(delta, 'type')) : ''
+  const preparedForDelta = hooks.prepared?.get(delta)
+  const patches = new Map<string, unknown>()
+
+  if (deltaType === 'text_delta') {
+    const text = ownValue(delta, 'text')
+    if (typeof text === 'string') {
+      const next = preparedForDelta?.has('text') ? preparedForDelta.get('text')! : hooks.scrubText(text)
+      if (next !== text) patches.set('text', next)
+    }
+    return patchRecord(delta, patches)
+  }
+  if (deltaType === 'thinking_delta') {
+    const thinking = ownValue(delta, 'thinking')
+    if (typeof thinking === 'string') {
+      const next = preparedForDelta?.has('thinking') ? preparedForDelta.get('thinking')! : hooks.scrubText(thinking)
+      if (next !== thinking) patches.set('thinking', next)
+    }
+    return patchRecord(delta, patches)
+  }
+  if (deltaType === 'signature_delta') {
+    const sig = ownValue(delta, 'signature')
+    if (typeof sig === 'string') {
+      const next = preparedForDelta?.has('signature') ? preparedForDelta.get('signature')! : hooks.scrubExact(sig)
+      if (next !== sig) patches.set('signature', next)
+    }
+    return patchRecord(delta, patches)
+  }
+  if (deltaType === 'input_json_delta') {
+    const partial = ownValue(delta, 'partial_json')
+    if (typeof partial === 'string') {
+      const next = preparedForDelta?.has('partial_json')
+        ? preparedForDelta.get('partial_json')!
+        : hooks.scrubJsonArgs(partial)
+      if (next !== partial) patches.set('partial_json', next)
+    }
+    return patchRecord(delta, patches)
+  }
+  // e.g. `message_delta.delta` (`{ stop_reason, stop_sequence }`): protocol-only, untouched.
+  return delta
+}
+
+function sanitizeInboundErrorObject(errObj: Fields, hooks: ProviderScrubHooks): Fields {
+  const msg = ownValue(errObj, 'message')
+  if (typeof msg !== 'string') return errObj
+  const next = hooks.scrubText(msg)
+  if (next === msg) return errObj
+  return patchRecord(errObj, new Map([['message', next]]))
+}
+
+function sanitizeInboundResponseObject(respObj: Fields, hooks: ProviderScrubHooks): Fields {
+  const patches = new Map<string, unknown>()
+  const output = ownValue(respObj, 'output')
+  if (Array.isArray(output)) {
+    let changed = false
+    const mapped = output.map(item => {
+      const next = scrubStructuredItem(item, hooks)
+      if (next !== item) changed = true
+      return next
+    })
+    if (changed) patches.set('output', mapped)
+  }
+  const outputText = ownValue(respObj, 'output_text')
+  if (typeof outputText === 'string') {
+    const next = hooks.scrubText(outputText)
+    if (next !== outputText) patches.set('output_text', next)
+  }
+  const instructions = ownValue(respObj, 'instructions')
+  if (typeof instructions === 'string') {
+    const next = hooks.scrubText(instructions)
+    if (next !== instructions) patches.set('instructions', next)
+  }
+  const errObj = fields(ownValue(respObj, 'error'))
+  if (errObj) {
+    const nextErr = sanitizeInboundErrorObject(errObj, hooks)
+    if (nextErr !== errObj) patches.set('error', nextErr)
+  }
+  return patchRecord(respObj, patches)
+}
+
+/**
+ * Structural content-only sanitizer for provider stream frames & recorded payloads (R4-H-17).
+ *
+ * Shares the same structural content-leaf walker as `scrubOutboundProviderRequest`:
+ *  - NEVER rewrites JSON object keys (null-prototype safe).
+ *  - NEVER mutates protocol/structural fields (`type`, `event`, `id`, `index`, `status`,
+ *    `role`, `model`, `name`, `stop_reason`, `finish_reason`, `call_id`, `tool_use_id`,
+ *    `usage`, `tools`, `tool_choice`, `encrypted_content`, etc.).
+ *  - Scrubs ONLY content/text/argument leaves (and non-tool-call credential headers on
+ *    recorded payloads).
+ */
 export function sanitizeProviderValue(
   value: unknown,
   key: string,
@@ -759,41 +1096,175 @@ export function sanitizeProviderValue(
   if (Array.isArray(value)) return value.map(item => sanitizeProviderValue(item, key, prepared, resolved))
   const record = fields(value)
   if (!record) return value
-  if (record.type === 'message' && Array.isArray(record.content)) {
-    const parts = record.content.flatMap(item => {
-      const part = fields(item)
-      const text = fragment(part, part?.type === 'refusal' ? 'refusal' : 'text')
-      return text ? [text] : []
-    })
-    prepareFragments(parts, key, prepared, resolved)
+
+  const hooks = createInboundScrubHooks(key, resolved, prepared)
+  const recordType = typeof ownValue(record, 'type') === 'string' ? String(ownValue(record, 'type')) : ''
+  const preparedForRec = prepared.get(record)
+
+  // 1. Direct content block (e.g. `thinking`, `text`, `output_text`, `tool_use`, `tool_result`, `redacted_thinking`).
+  if (recordType && CONTENT_BLOCK_TYPES.has(recordType)) {
+    return scrubContentBlock(record, hooks)
   }
-  return Object.fromEntries(Object.entries(record).map(([name, item]) => {
-    const safeName = redactProviderText(name, key, resolved)
-    if (prepared.get(record)?.has(name)) return [safeName, item]
-    if (credentialField.test(name)) return [safeName, replacement]
-    if (
-      name === 'arguments' && typeof item === 'string' &&
-      (record.type === 'function_call' || record.type === 'response.function_call_arguments.done')
-    ) {
-      return [safeName, redactArguments(item, key, resolved)]
+
+  // 2. Direct structured item (e.g. `message`, `function_call`, `custom_tool_call`, `reasoning`).
+  if (recordType && STRUCTURED_ITEM_TYPES.has(recordType)) {
+    return scrubStructuredItem(record, hooks)
+  }
+
+  // 3. Inbound SSE event envelopes (OpenAI Responses & Anthropic Messages) and generic/recorded records.
+  const patches = new Map<string, unknown>()
+  for (const name of Object.keys(record)) {
+    const item = record[name]
+
+    // Prepared delta / fragment string takes precedence (already scrubbed across frame boundaries).
+    if (preparedForRec?.has(name)) {
+      const next = preparedForRec.get(name)!
+      if (next !== item) patches.set(name, next)
+      continue
+    }
+
+    // NEVER mutate protected protocol/structural fields (keys are NEVER rewritten either).
+    if (PROTECTED_INBOUND_PROTOCOL_FIELDS.has(name)) {
+      continue
+    }
+
+    // Non-tool-call credential headers/fields on recorded payloads.
+    if (credentialField.test(name)) {
+      if (item !== replacement) patches.set(name, replacement)
+      continue
+    }
+
+    // SSE response / message / item / part / content_block / delta / error containers.
+    if (name === 'response') {
+      const respObj = fields(item)
+      if (respObj) {
+        const next = sanitizeInboundResponseObject(respObj, hooks)
+        if (next !== respObj) patches.set(name, next)
+      }
+      continue
+    }
+    if (name === 'message' && fields(item)) {
+      const next = scrubStructuredItem(item, hooks)
+      if (next !== item) patches.set(name, next)
+      continue
+    }
+    if (name === 'item' && fields(item)) {
+      const next = scrubStructuredItem(item, hooks)
+      if (next !== item) patches.set(name, next)
+      continue
+    }
+    if ((name === 'part' || name === 'content_block') && fields(item)) {
+      const next = scrubContentBlock(item, hooks)
+      if (next !== item) patches.set(name, next)
+      continue
+    }
+    if (name === 'delta') {
+      if (typeof item === 'string') {
+        const next = recordType === 'response.function_call_arguments.delta'
+          ? hooks.scrubJsonArgs(item)
+          : recordType === 'response.custom_tool_call_input.delta'
+            ? hooks.scrubExact(item)
+            : hooks.scrubText(item)
+        if (next !== item) patches.set(name, next)
+      } else {
+        const deltaObj = fields(item)
+        if (deltaObj) {
+          const next = sanitizeInboundDelta(deltaObj, hooks)
+          if (next !== deltaObj) patches.set(name, next)
+        }
+      }
+      continue
+    }
+    if (name === 'error' && fields(item)) {
+      const next = sanitizeInboundErrorObject(item as Fields, hooks)
+      if (next !== item) patches.set(name, next)
+      continue
+    }
+    if (name === 'arguments' && typeof item === 'string') {
+      const next = hooks.scrubJsonArgs(item)
+      if (next !== item) patches.set(name, next)
+      continue
     }
     if (
-      name === 'input' && typeof item === 'string' &&
-      (record.type === 'custom_tool_call' || record.type === 'response.custom_tool_call_input.done')
+      name === 'input' &&
+      typeof item === 'string' &&
+      recordType === 'response.custom_tool_call_input.done'
     ) {
-      return [safeName, redactExactSecrets(item, key, resolved)]
+      const next = hooks.scrubExact(item)
+      if (next !== item) patches.set(name, next)
+      continue
+    }
+    if ((name === 'input' || name === 'messages' || name === 'output') && Array.isArray(item)) {
+      let changed = false
+      const mapped = item.map(entry => {
+        const next = scrubStructuredItem(entry, hooks)
+        if (next !== entry) changed = true
+        return next
+      })
+      if (changed) patches.set(name, mapped)
+      continue
+    }
+    if ((name === 'content' || name === 'system' || name === 'summary') && Array.isArray(item)) {
+      const next = scrubContentBlocks(item, hooks)
+      if (next !== item) patches.set(name, next)
+      continue
     }
     if (
-      name === 'signature' && typeof item === 'string' &&
-      (record.type === 'thinking' || record.type === 'signature_delta')
+      name === 'signature' &&
+      typeof item === 'string' &&
+      (recordType === 'thinking' || recordType === 'signature_delta')
     ) {
-      return [safeName, redactExactSecrets(item, key, resolved)]
+      const next = hooks.scrubExact(item)
+      if (next !== item) patches.set(name, next)
+      continue
     }
-    if (name === 'input' && record.type === 'tool_use') {
-      return [safeName, sanitizeToolArgumentValue(item, key, resolved)]
+    if (name === 'reasoning' || name === 'thinking' || name === 'output_config' || name === 'betas' || name === 'fallbacks' || name === 'include' || name === 'thread') {
+      // Request-level config objects (`reasoning: { effort, summary }`, `thinking: { type, budget_tokens }`):
+      // scrub only string `thinking` prose if this is a prose leaf, never config objects.
+      if (name === 'thinking' && typeof item === 'string') {
+        const next = hooks.scrubText(item)
+        if (next !== item) patches.set(name, next)
+      }
+      continue
     }
-    return [safeName, sanitizeProviderValue(item, key, prepared, resolved)]
-  }))
+    if (name === 'annotation' && fields(item)) {
+      const ann = item as Fields
+      const annPatches = new Map<string, unknown>()
+      for (const annField of ['title', 'url', 'filename', 'text'] as const) {
+        const val = ownValue(ann, annField)
+        if (typeof val === 'string') {
+          const nextVal = hooks.scrubText(val)
+          if (nextVal !== val) annPatches.set(annField, nextVal)
+        }
+      }
+      const nextAnn = patchRecord(ann, annPatches)
+      if (nextAnn !== ann) patches.set(name, nextAnn)
+      continue
+    }
+    // Explicit content-bearing string leaves (`text`, `refusal`, `instructions`, `system`, `message`, `content`, `output`, `input`).
+    if (
+      typeof item === 'string' &&
+      (name === 'text' ||
+        name === 'refusal' ||
+        name === 'instructions' ||
+        name === 'system' ||
+        name === 'message' ||
+        name === 'content' ||
+        name === 'output' ||
+        name === 'input' ||
+        name === 'output_text')
+    ) {
+      const next = hooks.scrubText(item)
+      if (next !== item) patches.set(name, next)
+      continue
+    }
+    // Recurse into non-protocol nested arrays/objects (keys and protected protocol fields stay untouched).
+    if (Array.isArray(item) || fields(item)) {
+      const next = sanitizeProviderValue(item, key, prepared, resolved)
+      if (next !== item) patches.set(name, next)
+    }
+  }
+  return patchRecord(record, patches)
 }
 
 function prepareDeltas(frames: Frame[], key: string, secrets: readonly NamedSecret[]): Prepared {
@@ -894,16 +1365,40 @@ export function sanitizeProviderStream(
   const encoder = new TextEncoder()
   type Output = TransformStreamDefaultController<Uint8Array>
 
+  function sanitizeNonDataSseLine(line: string, secrets: readonly NamedSecret[]): string {
+    // R4-H-17: NEVER scrub SSE protocol control lines (`event:`, `id:`, `retry:`) or empty lines.
+    // Only scrub free-form SSE comment lines (`:...`).
+    if (line.startsWith(':')) {
+      return ':' + redactProviderText(line.slice(1), key, secrets)
+    }
+    return line
+  }
+
   function emit(controller: Output) {
     const secrets = resolveSecretSource(secretSource)
     const prepared = prepareDeltas(frames, key, secrets)
     for (const frame of frames.splice(0)) {
       const first = frame.lines.findIndex(isData)
-      const safe = frame.data === '[DONE]'
-        ? '[DONE]'
-        : JSON.stringify(sanitizeProviderValue(frame.data, key, prepared, secrets))
+      let safe: string
+      if (frame.data === '[DONE]') {
+        safe = '[DONE]'
+      } else if (frame.data) {
+        const sanitized = sanitizeProviderValue(frame.data, key, prepared, secrets)
+        const sanitizedRecord = fields(sanitized)
+        const violation = sanitizedRecord
+          ? verifyInboundProviderFrameIntegrity(frame.data, sanitizedRecord)
+          : 'frame'
+        if (violation) {
+          throw new Error(
+            `Inbound provider stream integrity violation at ${violation}: local sanitizer mutated protocol structure.`,
+          )
+        }
+        safe = JSON.stringify(sanitized)
+      } else {
+        safe = ''
+      }
       const lines = frame.lines.flatMap((line, index) => {
-        if (!isData(line)) return [redactProviderText(line, key, secrets)]
+        if (!isData(line)) return [sanitizeNonDataSseLine(line, secrets)]
         return index === first ? ['data: ' + safe] : []
       })
       controller.enqueue(encoder.encode(lines.join('\n') + '\n\n'))
