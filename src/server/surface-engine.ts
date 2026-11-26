@@ -25,8 +25,14 @@ export { redirectHostOf, redirectTargetOf } from './probes/open-redirect.ts'
 export const surfaceMaxConcurrency = 2
 export const maxWorkerPaths = 500
 export const maxParamCandidates = 500
+export const surfaceProbeTimeoutMs = 10_000
 const probeBodyCap = 128 * 1024
 const calibrationBodyKeep = 32 * 1024
+
+function clampProbeTimeoutMs(raw?: number): number {
+  if (typeof raw !== 'number' || !Number.isFinite(raw) || raw <= 0) return surfaceProbeTimeoutMs
+  return Math.max(500, Math.min(Math.floor(raw), 30_000))
+}
 
 export type SurfaceWordlistName =
   | 'api-routes' | 'nextjs-routes' | 'graphql-endpoints' | 'swagger-openapi'
@@ -117,6 +123,7 @@ class ProbeRunner {
   readonly max: number
   readonly persona?: string
   readonly onExchange?: (exchange: BrokerExchangeResult) => string | void
+  readonly timeoutMs: number
 
   constructor(
     broker: RequestBroker,
@@ -125,6 +132,7 @@ class ProbeRunner {
     max: number,
     persona?: string,
     onExchange?: (exchange: BrokerExchangeResult) => string | void,
+    timeoutMs = surfaceProbeTimeoutMs,
   ) {
     this.broker = broker
     this.grant = grant
@@ -132,6 +140,7 @@ class ProbeRunner {
     this.max = max
     this.persona = persona
     this.onExchange = onExchange
+    this.timeoutMs = clampProbeTimeoutMs(timeoutMs)
   }
 
   stop(reason: StopReason): never {
@@ -154,6 +163,7 @@ class ProbeRunner {
         followRedirects: false,
         maxBodyBytes: probeBodyCap,
         persona: this.persona,
+        timeoutMs: this.timeoutMs,
         ...req,
       }, this.grant, this.signal)
       return { ok: true, ex }
@@ -312,6 +322,7 @@ export interface ProbeSurfaceRequest {
   persona?: string
   session?: string
   maxRequests?: number
+  timeoutMs?: number
   onExchange?: (exchange: BrokerExchangeResult) => string | void
 }
 
@@ -371,7 +382,7 @@ export async function probeSurface(
   const started = Date.now()
   const origin = preflight(req.origin, grant)
   const max = clampMaxRequests(req.maxRequests)
-  const runner = new ProbeRunner(broker, grant, signal, max, req.persona, req.onExchange)
+  const runner = new ProbeRunner(broker, grant, signal, max, req.persona, req.onExchange, clampProbeTimeoutMs(req.timeoutMs))
   const anomalies: SurfaceAnomaly[] = []
   const notes: string[] = []
   const truncations: SurfaceTruncationRecord[] = []
@@ -669,7 +680,7 @@ export async function probeDifferential(
     }
   }
   const max = clampMaxRequests(req.maxRequests ?? 60)
-  const runner = new ProbeRunner(broker, grant, signal, max, req.persona, req.onExchange)
+  const runner = new ProbeRunner(broker, grant, signal, max, req.persona, req.onExchange, surfaceProbeTimeoutMs)
   const notes: string[] = []
   const anomalies: Array<Record<string, unknown>> = []
   let outcome: DiffOutcome = { verdict: 'inconclusive', summary: 'Probe did not run.', details: {} }
@@ -783,6 +794,7 @@ export interface RunSafeTemplatesRequest {
   }
   maxTemplates?: number
   maxRequests?: number
+  timeoutMs?: number
   persona?: string
   runId?: string
   assignmentId?: string
@@ -912,7 +924,7 @@ export async function runSafeTemplates(
   const origin = preflight(req.origin, grant)
   const tier = grant.tier ?? 1
   const max = clampMaxRequests(req.maxRequests)
-  const runner = new ProbeRunner(broker, grant, signal, max, req.persona, req.onExchange)
+  const runner = new ProbeRunner(broker, grant, signal, max, req.persona, req.onExchange, clampProbeTimeoutMs(req.timeoutMs))
   const loaded = loadSafeTemplates({ dir: req.templatesDir })
   const limit = Math.max(1, Math.min(req.maxTemplates ?? defaultTemplateLimit, templateLimitCeiling))
   const cveTemplateIds = req.cveIds?.length
