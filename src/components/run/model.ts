@@ -77,16 +77,23 @@ export function buildVerdict(d: Detail, findings: readonly FindingRow[], interru
     hed = findings.length
       ? capF(words(findings.length)) + ' finding' + (findings.length === 1 ? '' : 's') + ' drafted, none yet verified; ' + state + '.'
       : 'No findings drafted yet; ' + state + '.'
-    dek = (interrupted ? 'The application restarted mid-round. ' : '') + (p
-      ? capF(words(p)) + ' approval-gated write request' + (p > 1 ? 's' : '') + ' waiting on your decision before work can resume.'
-      : r.status === 'running' ? null : 'Resume to continue from saved evidence.')
+    const dekParts: string[] = []
+    if (interrupted) dekParts.push('The application restarted mid-round.')
+    if (p) {
+      dekParts.push(capF(words(p)) + ' approval-gated write request' + (p > 1 ? 's' : '') + ' waiting on your decision before work can resume.')
+    } else if (r.status !== 'running') {
+      dekParts.push('Resume to continue from saved evidence.')
+    }
+    dek = dekParts.length ? dekParts.join(' ') : null
     worst = findings.filter(f => f.status !== 'dismissed').slice().sort(bySev)[0] ?? null
   } else {
     const top = SEV.find(s => confirmed.some(f => f.severity === s))
     if (!top) {
       hed = 'No weakness could be confirmed across ' + hostsW + '.'
-      const k = n.inconclusive
-      dek = k ? capF(words(k)) + ' observation' + (k === 1 ? ' remains' : 's remain') + ' inconclusive.' : null
+      const dekParts: string[] = []
+      if (n.static_verified) dekParts.push(capF(words(n.static_verified)) + ' static ' + (n.static_verified === 1 ? 'advisory' : 'advisories') + ' (not runtime-confirmed).')
+      if (n.inconclusive) dekParts.push(capF(words(n.inconclusive)) + ' observation' + (n.inconclusive === 1 ? ' remains' : 's remain') + ' inconclusive.')
+      dek = dekParts.length ? dekParts.join(' ') : null
     } else {
       const k = confirmed.filter(f => f.severity === top).length
       const i = SEV.indexOf(top)
@@ -107,6 +114,7 @@ export function buildVerdict(d: Detail, findings: readonly FindingRow[], interru
     let word = ratio >= 0.6 ? 'High' : ratio >= 0.3 ? 'Moderate' : 'Limited'
     if (live) word = 'Provisional'
     const parts = [k + ' of ' + standing + ' standing findings confirmed by automated replay']
+    if (n.static_verified) parts.push(n.static_verified + ' static ' + (n.static_verified === 1 ? 'advisory' : 'advisories'))
     if (n.dismissed) parts.push(n.dismissed + ' dismissed on replay')
     if (n.inconclusive) parts.push(n.inconclusive + ' inconclusive')
     if (n.pending) parts.push(n.pending + ' awaiting verification')
@@ -114,7 +122,13 @@ export function buildVerdict(d: Detail, findings: readonly FindingRow[], interru
     if (followups) text += ' ' + capF(words(followups)) + ' coverage area' + (followups > 1 ? 's need' : ' needs') + ' follow-up.'
     conf = {
       word, text,
-      seg: [[k, 'var(--fg-2)', 'Confirmed'], [n.pending, 'var(--med)', 'Awaiting'], [n.inconclusive, 'var(--fg-4)', 'Inconclusive'], [n.dismissed, 'var(--line-strong)', 'Dismissed']],
+      seg: [
+        [k, 'var(--fg-2)', 'Confirmed'],
+        [n.static_verified, 'var(--fg-3)', 'Static advisory'],
+        [n.pending, 'var(--med)', 'Awaiting'],
+        [n.inconclusive, 'var(--fg-4)', 'Inconclusive'],
+        [n.dismissed, 'var(--line-strong)', 'Dismissed'],
+      ],
     }
   }
   return { hed, dek, worst, conf, n, hosts, confirmed: confirmed.length, followups, pendingApprovals }

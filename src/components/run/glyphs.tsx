@@ -36,8 +36,10 @@ function Ring({ stroke, dash, children }: { stroke: string; dash?: boolean; chil
  */
 export function StatusGlyph({ status }: { status: string | null | undefined }) {
   switch (status) {
-    case 'confirmed': case 'verified': case 'static_verified': case 'approved':
+    case 'confirmed': case 'verified': case 'approved':
       return <Ring stroke="var(--fg-3)"><path d="M4.6 7.1 6.3 8.8 9.5 5.4" fill="none" stroke="var(--fg-2)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" /></Ring>
+    case 'static_verified':
+      return <Ring stroke="var(--fg-3)" dash><path d="M5.4 5.2 3.8 7l1.6 1.8M8.6 5.2 10.2 7 8.6 8.8" fill="none" stroke="var(--fg-2)" strokeWidth="1.35" strokeLinecap="round" strokeLinejoin="round" /></Ring>
     case 'reported':
       return <Ring stroke="var(--fg-3)"><path d="M7 4.25 9.75 7 7 9.75 4.25 7Z" fill="var(--fg-2)" /></Ring>
     case 'complete': case 'no_issue_found':
@@ -121,7 +123,7 @@ export function CovSwatch({ status, size, className }: { status: CoverageStatus 
 /** Surface map severity pin: shape = severity, solid = confirmed, outline = unverified, slash = dismissed. */
 export function PinGlyph({ sev, status, size = 10 }: { sev: string; status: string; size?: number }) {
   const col = SEV_COL[sev] || 'var(--fg-4)'
-  const solid = status === 'confirmed' || status === 'verified' || status === 'static_verified'
+  const solid = status === 'confirmed' || status === 'verified'
   const dis = status === 'dismissed'
   const s = size, h = s / 2
   let shape: ReactNode

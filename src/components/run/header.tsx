@@ -19,7 +19,7 @@ import { PhaseTrack, StatusGlyph, TierBars } from './glyphs.tsx'
 import { Icon } from './icons.tsx'
 import type { IconName } from './icons.tsx'
 import { useShortcuts } from './keyboard.tsx'
-import { PHASE_LABEL, runStatusLabel } from './meta.ts'
+import { normFStatus, PHASE_LABEL, runStatusLabel } from './meta.ts'
 import type { RiskTier } from './meta.ts'
 import { Meter } from './motion.tsx'
 import { useNav } from './nav.tsx'
@@ -702,7 +702,7 @@ function DeleteRunDialog({ hasActiveWorkers, hasRunningLab, onClose, onDeleted }
   const [deleting, setDeleting] = useState(false)
   const [err, setErr] = useState('')
   const totalFindings = model.findings.length
-  const confirmedFindings = model.findings.filter(f => ['confirmed', 'verified', 'static_verified'].includes(f.status)).length
+  const confirmedFindings = model.findings.filter(f => normFStatus(f.status) === 'confirmed').length
   const isActive = hasActiveWorkers || hasRunningLab
   const dialogTitle = hasActiveWorkers ? 'Stop & delete run' : hasRunningLab ? 'Stop lab & delete run' : 'Delete run'
   const activeWarning = hasActiveWorkers && hasRunningLab

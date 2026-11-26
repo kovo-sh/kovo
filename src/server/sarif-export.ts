@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import { and, desc, eq } from 'drizzle-orm'
 import type { Finding, OwaspCategory } from '../domain.ts'
-import { deduplicateChainFindings, owaspCategoryTitles } from '../report-summary.ts'
+import { deduplicateChainFindings, filterActiveFindings, owaspCategoryTitles } from '../report-summary.ts'
 import { computeFindingFingerprint } from './dedupe.ts'
 import type { CompositeProofReceipt } from './composite-receipt.ts'
 import { privateModelProfiles } from './model-settings.ts'
@@ -526,14 +526,26 @@ export function buildSarifLog(input: SarifBuildInput): SarifLog {
 
   const results: SarifResult[] = []
 
+  // Enforce canonical non-superseded projection so superseded upstream chain findings are never double-counted.
+  const activeFindings = filterActiveFindings(input.findings)
+  const supersededExcludedCount = input.findings.length - activeFindings.length
+  const STATIC_ANALYSIS_ORIGIN = 'https://static-analysis.invalid'
+
   // Deduplicate chain findings while preserving all distinct findings inside approved scope.
-  const scopedFindings = input.findings.filter(f => approved.has(f.origin))
+  const scopedFindings = activeFindings.filter(f =>
+    approved.has(f.origin)
+    || ((f.status === 'static_verified' || f.verificationTier === 'static_verified') && f.origin === STATIC_ANALYSIS_ORIGIN),
+  )
   const deduped = deduplicateChainFindings(scopedFindings as unknown as Finding[]) as unknown as SarifFindingInput[]
+  let confirmedCount = 0
+  let staticAdvisoryCount = 0
 
   for (const finding of deduped) {
     const isStaticVerified = finding.status === 'static_verified' || finding.verificationTier === 'static_verified'
-    const isConfirmed = finding.status === 'confirmed'
+    const isConfirmed = finding.status === 'confirmed' && !isStaticVerified
     if (!isConfirmed && !isStaticVerified) continue
+    if (isStaticVerified) staticAdvisoryCount += 1
+    else confirmedCount += 1
 
     const ruleMeta = canonicalRuleId(finding)
     const level = severityToSarifLevel(finding.severity)
@@ -618,7 +630,11 @@ export function buildSarifLog(input: SarifBuildInput): SarifLog {
     )
     const replaySpecSha256 = finding.replaySpecId ? input.replaySpecShaById?.get(finding.replaySpecId) : undefined
 
-    const verificationTier = isStaticVerified ? 'static_verified' : 'runtime_confirmed'
+    const verificationTier = isStaticVerified
+      ? 'static_verified'
+      : (finding.verificationTier === 'baseline_confirmed' || finding.findingKind === 'baseline_check'
+          ? 'baseline_confirmed'
+          : 'runtime_confirmed')
     const runtimeProofGap = isStaticVerified
       ? (finding.runtimeProofGap || 'Verified deterministically via air-gapped static AST/SAST re-execution; runtime exploitation was not executed.')
       : undefined
@@ -640,7 +656,7 @@ export function buildSarifLog(input: SarifBuildInput): SarifLog {
     }
 
     const messageText = redact(
-      `[${verificationTier === 'static_verified' ? 'Static Verified' : 'Runtime Confirmed'}] ${finding.title} (${finding.origin}): ${finding.reason}`,
+      `[${verificationTier === 'static_verified' ? 'Static Advisory' : verificationTier === 'baseline_confirmed' ? 'Baseline Confirmed' : 'Runtime Confirmed'}] ${finding.title} (${finding.origin}): ${finding.reason}`,
       secrets,
     )
 
@@ -685,6 +701,8 @@ export function buildSarifLog(input: SarifBuildInput): SarifLog {
           category: finding.category ?? null,
           cwe: ruleMeta.id,
           verificationTier,
+          runtimeConfirmed: !isStaticVerified,
+          tierSection: isStaticVerified ? 'static_advisory' : 'confirmed',
           ...(runtimeProofGap ? { runtimeProofGap } : {}),
           exchangeIds: approvedExchanges,
           ...(replaySpecSha256 ? { replaySpecSha256 } : {}),
@@ -803,6 +821,9 @@ export function buildSarifLog(input: SarifBuildInput): SarifLog {
           scopeRevision: input.scopeRevision,
           goalRevision: input.goalRevision,
           approvedScope: [...approved],
+          confirmedCount,
+          staticAdvisoryCount,
+          supersededExcludedCount,
         },
       },
     ],
@@ -821,6 +842,7 @@ function hydrateFindingsForSarif(storage: Store, runId: string, baseFindings: re
       ...f,
       verificationTier: f.verificationTier ?? row?.verificationTier ?? undefined,
       fingerprintHash: f.fingerprintHash ?? row?.fingerprintHash ?? undefined,
+      supersededByFindingId: f.supersededByFindingId ?? row?.supersededByFindingId ?? undefined,
       counterevidence: f.counterevidence ?? row?.counterevidence ?? undefined,
       confidenceRationale: f.confidenceRationale ?? row?.confidenceRationale ?? undefined,
       severityChangeConditions: f.severityChangeConditions ?? row?.severityChangeConditions ?? undefined,

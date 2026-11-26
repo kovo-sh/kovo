@@ -170,6 +170,18 @@ export function mergeChainFindings(existing: Finding, incoming: Finding): Findin
   const chainFactIds = [...new Set([...(existing.chainFactIds ?? []), ...(incoming.chainFactIds ?? [])])]
   const codeLocations = primary.codeLocations?.length ? primary.codeLocations : secondary.codeLocations
 
+  const mergedTier: VerificationTier | undefined =
+    primary.status === 'confirmed'
+      ? (primary.verificationTier && primary.verificationTier !== 'static_verified'
+          ? primary.verificationTier
+          : (secondary.verificationTier && secondary.verificationTier !== 'static_verified'
+              ? secondary.verificationTier
+              : 'runtime_confirmed'))
+      : (primary.verificationTier ?? secondary.verificationTier)
+  const mergedRuntimeProofGap = primary.status === 'confirmed'
+    ? (primary.runtimeProofGap ?? null)
+    : (primary.runtimeProofGap ?? secondary.runtimeProofGap)
+
   return {
     ...secondary,
     ...primary,
@@ -177,13 +189,13 @@ export function mergeChainFindings(existing: Finding, incoming: Finding): Findin
     severity: bestSeverity,
     findingKind: 'multi_step_chain',
     replaySpecId: primary.replaySpecId ?? secondary.replaySpecId,
-    verificationTier: primary.verificationTier ?? secondary.verificationTier,
+    verificationTier: mergedTier,
     fingerprintHash: primary.fingerprintHash ?? secondary.fingerprintHash,
     supersededByFindingId: primary.supersededByFindingId ?? secondary.supersededByFindingId,
     counterevidence: primary.counterevidence ?? secondary.counterevidence,
     confidenceRationale: primary.confidenceRationale ?? secondary.confidenceRationale,
     severityChangeConditions: primary.severityChangeConditions ?? secondary.severityChangeConditions,
-    runtimeProofGap: primary.runtimeProofGap ?? secondary.runtimeProofGap,
+    runtimeProofGap: mergedRuntimeProofGap,
     ...(codeLocations?.length ? { codeLocations } : {}),
     evidenceIds,
     ...(exchangeIds.length ? { exchangeIds } : {}),
@@ -345,10 +357,28 @@ export interface ReportProvenanceSurface {
   confirmedFindings: Finding[]
 }
 
-/** A finding is runtime-confirmed only when its status *and* verification class agree. */
-export function isRuntimeConfirmedFinding(
-  finding: Pick<Finding, 'status' | 'verificationTier'> & FindingProvenanceFields,
+/**
+ * Canonical non-superseded predicate shared across runtime confirmation, report saves,
+ * Markdown exports, and SARIF exports so superseded upstream findings can never be double-counted.
+ */
+export function isActiveFinding(
+  finding: Pick<Finding, 'supersededByFindingId'>,
 ): boolean {
+  return finding.supersededByFindingId == null || finding.supersededByFindingId === ''
+}
+
+/** Project only non-superseded findings. */
+export function filterActiveFindings<T extends Pick<Finding, 'supersededByFindingId'>>(
+  findings: readonly T[],
+): T[] {
+  return findings.filter(isActiveFinding)
+}
+
+/** A finding is runtime-confirmed only when active (non-superseded) and status *and* verification class agree. */
+export function isRuntimeConfirmedFinding(
+  finding: Pick<Finding, 'status' | 'verificationTier' | 'supersededByFindingId'> & FindingProvenanceFields,
+): boolean {
+  if (!isActiveFinding(finding)) return false
   if (finding.status !== 'confirmed') return false
   const verification = finding.verificationStatus
   if (verification !== undefined && verification !== 'runtime_confirmed') return false
@@ -363,12 +393,12 @@ export function emptyProvenanceCounts(): ProvenanceCounts {
   return { floor: 0, agent_only: 0, chain_from_floor: 0, incremental: 0, agentOnly: 0, chainFromFloor: 0 }
 }
 
-/** Count provenance over the confirmed set and split the rest into a separate advisory bucket. */
+/** Count provenance over the active confirmed set and split the remaining active items into a separate advisory bucket. */
 export function buildProvenanceReport(findings: readonly (Finding & FindingProvenanceFields)[]): ReportProvenanceSurface {
   const counts = emptyProvenanceCounts()
   const advisories: Finding[] = []
   const confirmedFindings: Finding[] = []
-  for (const finding of findings) {
+  for (const finding of filterActiveFindings(findings)) {
     if (!isRuntimeConfirmedFinding(finding)) {
       advisories.push(finding)
       continue
@@ -438,7 +468,7 @@ export function reportHighlights(body: ReportBody) {
   const coverage = coverageParts.join(' · ')
 
   const scopedFindings = collapseBaselineHeaderFindings(
-    deduplicateChainFindings(body.findings.filter(item =>
+    deduplicateChainFindings(filterActiveFindings(body.findings).filter(item =>
       scope.has(item.origin) || item.status === 'static_verified' || item.verificationTier === 'static_verified',
     )),
   ).findings
