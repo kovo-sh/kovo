@@ -800,7 +800,7 @@ export async function runPlannedRecipe(input: RunPlannedRecipeInput): Promise<Fl
 // Persisted record spec + verification result
 // ---------------------------------------------------------------------------------------------
 
-const SEVERITY_BY_CLASS: Readonly<Record<string, Severity>> = {
+export const SEVERITY_BY_CLASS: Readonly<Record<string, Severity>> = {
   bola: 'high',
   idor: 'high',
   bfla: 'high',
@@ -3187,7 +3187,7 @@ export function isUnexpectedErrorStatus(status: number, ...expected: Array<numbe
 
 const CWE_NUMBER_RE = /\bCWE-(\d{1,5})\b/i
 
-const CWE_TO_RECEIPT_CLASS: Record<number, string> = {
+export const CWE_TO_RECEIPT_CLASS: Record<number, string> = {
   918: 'ssrf',
   611: 'xxe',
   601: 'open_redirect',

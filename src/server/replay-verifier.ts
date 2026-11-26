@@ -27,6 +27,7 @@ import {
   assessMfaBypass,
   classifyBoundaryClaim,
   classifyImpactDescriptor,
+  injectionFamilyFromTyped,
 } from './oracle-invariants.ts'
 import type { PersonaCredentialSource } from './oracle-invariants.ts'
 import { MAX_REPLAY_REGEX_HAYSTACK_LENGTH, isSafeRegexPattern, proofReceiptMode, safeRegexTest, validateReplayAgentScriptEnvelope, validateReplayRecipeEnvelope } from './proof-receipt.ts'
@@ -526,6 +527,7 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
           title: spec.title,
           impact: spec.impact,
         })
+        const specInjectionFamily = injectionFamilyFromTyped({ cwe: spec.cwe, category: spec.category })
         const impactSteps = impactStepsFromStepsOut(spec, stepsOut)
         // Evidence-first class: if the probe persisted a protected field from the request body, the
         // proof *is* mass assignment no matter how the model labelled it (the common K=6 case is a
@@ -582,6 +584,7 @@ async function verifyReplaySpecInner(params: VerifyReplaySpecParams): Promise<Re
               oracleEvents,
               targetOrigin: spec.origin,
               credentialPatterns: spec.proofPatterns ?? null,
+              ...(specInjectionFamily ? { injection: { family: specInjectionFamily } } : {}),
             })
         // Universal default-deny boundary gate: auth/bypass claims always need a challenged control
         // (401/403, login redirect, MFA challenge, negative id) plus a crossing variant; access
