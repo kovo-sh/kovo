@@ -35,6 +35,10 @@ const MAX_PIVOT_HOPS = 8
 const FINALIZED_STATES = new Set(['fulfilled', 'completed', 'captured', 'released', 'settled', 'paid', 'shipped', 'delivered', 'disbursed'])
 const ERROR_ONLY_KEYS = new Set(['error', 'errors', 'message', 'detail', 'code', 'status', 'statusCode', 'ok', 'success'])
 const TENANT_MARKER_KEYS = new Set(['tenant', 'tenantid', 'tenant_id', 'org', 'orgid', 'org_id', 'organizationid', 'organization_id', 'workspaceid', 'workspace_id', 'ownertenant', 'ownertenantid', 'owner_tenant_id', 'merchantid', 'merchant_id'])
+const BATCH_DENIAL_KEY_RE = /^(?:error|errors|err|denied|forbidden|unauthorized|unauthorised|rejected|refused|failed|failures|blocked|disallowed|skipped|missing|not_?found|inaccessible|unaccessible|invalid|requested_?ids?|input_?ids?)$/i
+const BATCH_ID_KEY_RE = /^(?:id|record_?id|item_?id|entity_?id|object_?id|secret_?id|resource_?id|doc_?id|document_?id|file_?id|project_?id|key|uid|uuid|slug|ref)$|(?:_id|Id)$/i
+const BATCH_NON_DATA_KEY_RE = /^(?:id|record_?id|item_?id|entity_?id|object_?id|secret_?id|resource_?id|error|errors|err|message|detail|details|reason|code|status|status_?code|http_?status|ok|success|allowed|authorized|permitted|granted|denied|forbidden|unauthorized|unauthorised|rejected|refused|failed|skipped|missing|found|exists|index|idx)$/i
+const BATCH_DENIED_VAL_RE = /^(?:denied|forbidden|unauthorized|unauthorised|rejected|refused|failed|error|not_?found|blocked|disallowed|skipped)$/i
 const SENSITIVE_DATA_KEY_RE = /secret|passw|private|credential|api_?key|ssn|card|iban|balance|amount|salary|price|credit|debit|ledger|cents|vault|payout|settlement/i
 const URL_OR_PATH_VAL_RE = /^(?:https?:\/\/\S+|\/[A-Za-z0-9._~/%?&=:@+-]+|[A-Za-z0-9._-]+\/[A-Za-z0-9._~/%-]*)$/
 const HANDLE_KEY_RE = /^(?:token|code|handle|sig|signature|hmac|mac|nonce|redirect|redirect_?uri|href|link|location|url|uri|cache_?key|etag|checksum|hash|digest|artifact_?key|file_?key|object_?key|storage_?key|prefix|cursor)$|(?:token|handle|url|uri|href|link|path|sig)$/i
@@ -116,19 +120,57 @@ function scanStub(node: unknown, depth: number, acc: StubScan): void {
   }
 }
 
-export function extractTenantMarkers(json: unknown, body?: string): Set<string> {
-  const out = new Set<string>()
-  let val = json
-  if (val === undefined && typeof body === 'string' && /^[\[{]/.test(body.trim())) try { val = JSON.parse(body) } catch { val = undefined }
-  const walk = (v: unknown, d: number): void => {
-    if (d > 4 || out.size > 32 || v == null) return
-    if (Array.isArray(v)) { for (const x of v) walk(x, d + 1); return }
-    if (typeof v === 'object') for (const [k, x] of Object.entries(v as Record<string, unknown>)) {
-      if (typeof x === 'string' && x.trim() && TENANT_MARKER_KEYS.has(k.toLowerCase())) out.add(x.trim().toLowerCase())
-      else if (x && typeof x === 'object') walk(x, d + 1)
+const parseJsonOrBody = (json: unknown, body?: string): unknown => { if (json !== undefined) return json; if (typeof body === 'string' && /^[\[{]/.test(body.trim())) try { return JSON.parse(body) } catch { return undefined }; return undefined }
+function isErrorOrDeniedBatchObj(obj: Record<string, unknown>): boolean {
+  if (obj.ok === false || obj.success === false || obj.allowed === false || obj.authorized === false || obj.permitted === false || obj.granted === false || obj.denied === true || obj.forbidden === true || obj.unauthorized === true || obj.rejected === true || obj.failed === true) return true
+  if (obj.error === true || (typeof obj.error === 'string' && obj.error.trim().length > 0) || (obj.error !== null && typeof obj.error === 'object') || (Array.isArray(obj.errors) && obj.errors.length > 0)) return true
+  return Object.entries(obj).some(([k, v]) => { const lk = k.toLowerCase(); return (typeof v === 'number' && v >= 400 && v <= 599 && /^(?:status|status_?code|http_?status|code)$/.test(lk)) || (typeof v === 'string' && /^(?:status|state|result|outcome|reason|code)$/.test(lk) && BATCH_DENIED_VAL_RE.test(v.trim())) })
+}
+function hasNonErrorDataVal(v: unknown, d: number): boolean {
+  if (d > 3 || v == null || v === '') return false
+  if (typeof v === 'string') return v.trim().length > 0
+  if (typeof v === 'number' || typeof v === 'boolean') return true
+  if (Array.isArray(v)) return v.some(x => hasNonErrorDataVal(x, d + 1))
+  if (typeof v === 'object') { const s = v as Record<string, unknown>; return !isErrorOrDeniedBatchObj(s) && Object.entries(s).some(([k, sv]) => !BATCH_DENIAL_KEY_RE.test(k) && !BATCH_NON_DATA_KEY_RE.test(k) && hasNonErrorDataVal(sv, d + 1)) }
+  return false
+}
+const hasNonErrorDataField = (obj: Record<string, unknown>, idKey?: string): boolean => Object.entries(obj).some(([k, v]) => k !== idKey && !BATCH_DENIAL_KEY_RE.test(k) && !BATCH_NON_DATA_KEY_RE.test(k) && hasNonErrorDataVal(v, 0))
+export function findNonErrorBatchRecord(json: unknown, body: string | undefined, targetId: string): Record<string, unknown> | null {
+  const needle = targetId.trim(), root = parseJsonOrBody(json, body)
+  if (!needle || root == null || typeof root !== 'object') return null
+  const walk = (node: unknown, d: number): Record<string, unknown> | null => {
+    if (d > 5 || node == null || typeof node !== 'object') return null
+    if (Array.isArray(node)) { for (const x of node.slice(0, 64)) { const h = walk(x, d + 1); if (h) return h } return null }
+    const obj = node as Record<string, unknown>; if (isErrorOrDeniedBatchObj(obj)) return null
+    for (const [k, v] of Object.entries(obj)) if ((typeof v === 'string' || typeof v === 'number') && String(v).trim() === needle && BATCH_ID_KEY_RE.test(k) && hasNonErrorDataField(obj, k)) return obj
+    for (const [k, v] of Object.entries(obj)) {
+      if (BATCH_DENIAL_KEY_RE.test(k) || !v || typeof v !== 'object') continue
+      if (k.trim() === needle && !Array.isArray(v) && !isErrorOrDeniedBatchObj(v as Record<string, unknown>) && hasNonErrorDataField(v as Record<string, unknown>)) return v as Record<string, unknown>
+      const h = walk(v, d + 1); if (h) return h
     }
+    return null
+  }
+  return walk(root, 0)
+}
+export function extractTenantMarkers(json: unknown, body?: string, skipDenied = false): Set<string> {
+  const out = new Set<string>(), val = parseJsonOrBody(json, body)
+  const walk = (v: unknown, d: number): void => {
+    if (d > 4 || out.size > 32 || v == null || typeof v !== 'object') return
+    if (Array.isArray(v)) { for (const x of v) walk(x, d + 1); return }
+    const obj = v as Record<string, unknown>; if (skipDenied && isErrorOrDeniedBatchObj(obj)) return
+    for (const [k, x] of Object.entries(obj)) { if (skipDenied && BATCH_DENIAL_KEY_RE.test(k)) continue; if (typeof x === 'string' && x.trim() && TENANT_MARKER_KEYS.has(k.toLowerCase())) out.add(x.trim().toLowerCase()); else if (x && typeof x === 'object') walk(x, d + 1) }
   }
   walk(val, 0); return out
+}
+export function extractResponseScope(json: unknown, body?: string): string {
+  const walk = (v: unknown, d: number): string => {
+    if (d > 4 || v == null || typeof v !== 'object') return ''
+    if (Array.isArray(v)) { for (const x of v.slice(0, 32)) { const h = walk(x, d + 1); if (h) return h } return '' }
+    for (const [k, x] of Object.entries(v as Record<string, unknown>)) if (k.toLowerCase() === 'scope' && typeof x === 'string' && x.trim()) return x.trim().toLowerCase()
+    for (const x of Object.values(v as Record<string, unknown>)) if (x && typeof x === 'object') { const h = walk(x, d + 1); if (h) return h }
+    return ''
+  }
+  return walk(parseJsonOrBody(json, body), 0)
 }
 
 function shapeEqual(a: unknown, b: unknown, depth = 0): boolean {
@@ -310,8 +352,10 @@ export function evaluateDualTenantAbac(input: DualTenantAbacInput): V8OracleDeci
     const cAct = normKey(input.singleForeignControlDenied.actorId), bAct = normKey(input.batchRequest.actorId)
     if (input.singleForeignControlDenied.status === 401 && (!cAct || !bAct || cAct !== bAct)) return deny(f, 'unauthenticated_baseline_control', sub)
 
+    const batchHasJson = parseJsonOrBody(input.batchRequest.json, input.batchRequest.body) !== undefined
     const foreignRead = !stubRec(input.batchRequest) &&
       new Set((input.returnedForeignIds ?? []).map(normStr)).has(foreignId) &&
+      (!batchHasJson || findNonErrorBatchRecord(input.batchRequest.json, input.batchRequest.body, foreignId) !== null) &&
       (input.foreignDataObserved === true || hasSubstantivePayload(input.batchRequest))
     let foreignMut = false
     if (input.postMutationReadback) {
@@ -476,63 +520,39 @@ export function evaluateEconomicConservation(input: EconomicConservationInput): 
 /* ───────────────── 4. Cryptographic Scope Replay Evaluator ───────────────── */
 
 export interface CryptographicScopeReplayInput extends WithVerifier {
-  tamperedSignatureControl: HostSignedRecord
-  sourceValidIssuance: HostSignedRecord
-  replayedAcceptance: HostSignedRecord
-  sourceTenant: string
-  sourceScope: string
-  targetTenant: string
-  targetScope: string
-  tamperedSignatureDigest?: string
-  signatureDigest?: string
-  replayedSignatureDigest?: string
-  persistedImpact?: boolean
+  tamperedSignatureControl: HostSignedRecord; sourceValidIssuance: HostSignedRecord; replayedAcceptance: HostSignedRecord
+  sourceTenant: string; sourceScope: string; targetTenant: string; targetScope: string
+  tamperedSignatureDigest?: string; signatureDigest?: string; replayedSignatureDigest?: string; persistedImpact?: boolean
 }
-
 export function evaluateCryptographicScopeReplay(input: CryptographicScopeReplayInput): V8OracleDecision {
   const f: V8OracleFamily = 'cryptographic_scope_replay'
   if (!input) return deny(f, 'missing_input')
-
-  const recErr = checkRecords([
-    [input.tamperedSignatureControl, 'tampered_signature_control'],
-    [input.sourceValidIssuance, 'source_valid_issuance'],
-    [input.replayedAcceptance, 'replayed_acceptance'],
-  ], input.verifySignature)
+  const recErr = checkRecords([[input.tamperedSignatureControl, 'tampered_signature_control'], [input.sourceValidIssuance, 'source_valid_issuance'], [input.replayedAcceptance, 'replayed_acceptance']], input.verifySignature)
   if (recErr) return deny(f, recErr)
-
-  if (!isDenied(input.tamperedSignatureControl.status)) {
-    return deny(f, 'signature_verification_not_enforced_decoy', undefined, { tamperedStatus: input.tamperedSignatureControl.status })
-  }
+  if (!isDenied(input.tamperedSignatureControl.status)) return deny(f, 'signature_verification_not_enforced_decoy', undefined, { tamperedStatus: input.tamperedSignatureControl.status })
   if (!isOk(input.sourceValidIssuance.status)) return deny(f, 'source_signature_issuance_failed')
   if (!isOk(input.replayedAcceptance.status)) return deny(f, 'replayed_signature_rejected_hardened')
   if (input.sourceValidIssuance.id === input.replayedAcceptance.id) return deny(f, 'issuance_and_replay_same_exchange')
-  if (input.tamperedSignatureControl.id === input.sourceValidIssuance.id || input.tamperedSignatureControl.id === input.replayedAcceptance.id) {
-    return deny(f, 'control_reuses_probe_exchange')
-  }
+  if (input.tamperedSignatureControl.id === input.sourceValidIssuance.id || input.tamperedSignatureControl.id === input.replayedAcceptance.id) return deny(f, 'control_reuses_probe_exchange')
   if (input.replayedAcceptance.timestampMs < input.sourceValidIssuance.timestampMs) return deny(f, 'replay_precedes_signature_issuance')
-
   const tRoute = normRoute(input.tamperedSignatureControl.route), rRoute = normRoute(input.replayedAcceptance.route)
   if (tRoute && rRoute && tRoute !== rRoute) return deny(f, 'tampered_control_and_replay_route_mismatch')
-
   const srcT = normKey(input.sourceTenant), srcS = normKey(input.sourceScope), dstT = normKey(input.targetTenant), dstS = normKey(input.targetScope)
   if (!srcT || !srcS || !dstT || !dstS) return deny(f, 'missing_tenant_or_scope_context')
   if (srcT === dstT && srcS === dstS) return deny(f, 'same_tenant_and_scope_not_replay')
-
-  const tamperedDigest = normStr(input.tamperedSignatureDigest)
-  const validDigest = normStr(input.signatureDigest)
-  const replayedDigest = normStr(input.replayedSignatureDigest)
+  const sRec = input.sourceValidIssuance, rRec = input.replayedAcceptance, sRoute = normRoute(sRec.route)
+  if (sRoute && rRoute && sRoute === rRoute) {
+    const sM = extractTenantMarkers(sRec.json, sRec.body, true), rM = extractTenantMarkers(rRec.json, rRec.body, true)
+    const sameM = sM.size === rM.size && [...sM].every(m => rM.has(m))
+    if (normKey(sRec.actorId) === normKey(rRec.actorId) && normKey(sRec.tenantId) === normKey(rRec.tenantId) && (!normKey(sRec.method) || !normKey(rRec.method) || normKey(sRec.method) === normKey(rRec.method)) && sameM && extractResponseScope(sRec.json, sRec.body) === extractResponseScope(rRec.json, rRec.body)) return deny(f, 'same_tenant_and_scope_not_replay')
+  }
+  const tamperedDigest = normStr(input.tamperedSignatureDigest), validDigest = normStr(input.signatureDigest), replayedDigest = normStr(input.replayedSignatureDigest)
   if (!tamperedDigest || !validDigest || !replayedDigest) return deny(f, 'missing_signature_digest_binding')
   if (tamperedDigest === validDigest) return deny(f, 'tampered_digest_matches_valid_signature')
   if (replayedDigest !== validDigest) return deny(f, 'replayed_signature_digest_mismatch')
-  if (input.persistedImpact !== true && stubRec(input.replayedAcceptance)) {
-    return deny(f, 'terminal_impact_unproven_intermediate_stub')
-  }
+  if (input.persistedImpact !== true && stubRec(input.replayedAcceptance)) return deny(f, 'terminal_impact_unproven_intermediate_stub')
   if (input.persistedImpact !== true && !hasSubstantivePayload(input.replayedAcceptance)) return deny(f, 'replay_acceptance_lacks_substantive_impact')
-
-  return ok(f, srcT !== dstT ? 'cross_tenant_scope_replay' : 'cross_scope_replay', 'valid_signature_replayed_across_scope_boundary', {
-    sourceTenant: srcT, sourceScope: srcS, targetTenant: dstT, targetScope: dstS, signatureDigest: validDigest,
-    tamperedControlId: input.tamperedSignatureControl.id, sourceIssuanceId: input.sourceValidIssuance.id, replayedAcceptanceId: input.replayedAcceptance.id,
-  })
+  return ok(f, srcT !== dstT ? 'cross_tenant_scope_replay' : 'cross_scope_replay', 'valid_signature_replayed_across_scope_boundary', { sourceTenant: srcT, sourceScope: srcS, targetTenant: dstT, targetScope: dstS, signatureDigest: validDigest, tamperedControlId: input.tamperedSignatureControl.id, sourceIssuanceId: input.sourceValidIssuance.id, replayedAcceptanceId: input.replayedAcceptance.id })
 }
 
 /* ───────────────── 5. Parser / Cache Differential Evaluator ──────────────── */
