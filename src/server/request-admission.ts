@@ -181,7 +181,7 @@ export interface AdmissionGrant {
   approvalPolicy?: ApprovalPolicy
   tenantId?: string
   storage?: unknown
-  approvalLeases?: (origin: string, method: string, pathAndQuery: string) => boolean
+  approvalLeases?: (origin: string, method: string, pathAndQuery: string, personaHandle?: string | null) => boolean
   isStateChangeApproved?: (
     origin: string,
     method: string,
@@ -1055,17 +1055,18 @@ export function classifyRequestMutation(input: {
 }
 
 /**
- * Single authoritative durable-route-lease eligibility check (`R3-H-1(b)`).
+ * Single authoritative durable-route-lease eligibility check (`R3-H-1(b)` & `R2-09`).
  *
  * Race bursts, compressed bodies, explicit method-override carriers, over-cap bodies (>64 KiB),
- * and bodies whose override scan was incomplete NEVER satisfy a durable POST/route lease under
- * any approval policy.
+ * bodies whose override scan was incomplete, structural mutations (`DELETE`, multipart, etc.),
+ * destructive/malformed JSON-RPC payloads, and unverified/mutating GraphQL payloads NEVER
+ * satisfy a durable approval lease under any approval policy.
  */
 export function isDurableRouteLeaseEligible(
   classification: Pick<
     RequestMutationClassification,
     'hasCompressedBody' | 'hasMethodOverride' | 'hasOverCapBody' | 'overrideScanIncomplete' | 'hasOverrideRisk'
-  >,
+  > & Partial<Pick<RequestMutationClassification, 'kind' | 'isStructuralMutation' | 'hasMultipart'>>,
   options: { isRaceBurst?: boolean } = {},
 ): boolean {
   if (options.isRaceBurst === true) return false
@@ -1074,6 +1075,17 @@ export function isDurableRouteLeaseEligible(
   if (classification.hasOverCapBody) return false
   if (classification.overrideScanIncomplete) return false
   if (classification.hasOverrideRisk) return false
+  if (classification.hasMultipart) return false
+  if (classification.isStructuralMutation) return false
+  if (
+    classification.kind === 'jsonrpc_destructive' ||
+    classification.kind === 'jsonrpc_malformed' ||
+    classification.kind === 'graphql_mutation_or_unverified' ||
+    classification.kind === 'multipart_upload' ||
+    classification.kind === 'compressed_mutation'
+  ) {
+    return false
+  }
   return true
 }
 
@@ -1738,7 +1750,13 @@ export class RequestAdmissionEngine {
       const checkLease = (): boolean =>
         leaseClassificationEligible &&
         !classification.hasMultipart &&
-        grant.approvalLeases?.(initialOrigin, classification.effectiveMethod, canonical) === true
+        !classification.isStructuralMutation &&
+        grant.approvalLeases?.(
+          initialOrigin,
+          classification.effectiveMethod,
+          canonical,
+          request.personaHandle ?? null,
+        ) === true
 
       const sandboxPostAllowed =
         !classification.hasMultipart &&

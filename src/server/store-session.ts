@@ -36,7 +36,7 @@ import type { ReplayProofReceiptRow } from './schema.ts'
 import * as tables from './schema.ts'
 
 /** Local SQLite schema stamp (`PRAGMA user_version`), independent of Drizzle migrations. */
-export const STORE_SCHEMA_VERSION = 10
+export const STORE_SCHEMA_VERSION = 11
 
 /**
  * Thrown when opening a SQLite database whose `PRAGMA user_version` is newer than the highest

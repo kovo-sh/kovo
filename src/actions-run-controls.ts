@@ -1,7 +1,14 @@
 import { randomUUID } from 'node:crypto'
 import { createServerFn } from '@tanstack/react-start'
 import { z } from 'zod'
-import { approvalScopes, id, runLabelText } from './domain.ts'
+import {
+  approvalScopes,
+  id,
+  MAX_APPROVAL_LEASE_TTL_MS,
+  MAX_APPROVAL_LEASE_USES,
+  MIN_APPROVAL_LEASE_TTL_MS,
+  runLabelText,
+} from './domain.ts'
 import { execution } from './server/execution.ts'
 import { store } from './server/store.ts'
 
@@ -12,6 +19,9 @@ export const decideApprovalAction = createServerFn({ method: 'POST' })
     approvalId: id,
     decision: z.enum(['approved', 'denied']),
     scope: z.enum(approvalScopes).optional(),
+    expiresInMs: z.number().int().min(MIN_APPROVAL_LEASE_TTL_MS).max(MAX_APPROVAL_LEASE_TTL_MS).optional(),
+    maxUses: z.number().int().min(1).max(MAX_APPROVAL_LEASE_USES).optional(),
+    crossPersona: z.boolean().optional(),
   }))
   .handler(({ data }) => {
     const result = store().command({
@@ -21,10 +31,25 @@ export const decideApprovalAction = createServerFn({ method: 'POST' })
       approvalId: data.approvalId,
       decision: data.decision,
       ...(data.scope ? { scope: data.scope } : {}),
+      ...(data.expiresInMs !== undefined ? { expiresInMs: data.expiresInMs } : {}),
+      ...(data.maxUses !== undefined ? { maxUses: data.maxUses } : {}),
+      ...(data.crossPersona !== undefined ? { crossPersona: data.crossPersona } : {}),
     })
     execution().wake()
     return result
   })
+
+export const previewApprovalBlastRadiusAction = createServerFn({ method: 'GET' })
+  .validator(z.object({
+    runId: id,
+    approvalId: id,
+    crossPersona: z.boolean().optional(),
+  }))
+  .handler(({ data }) =>
+    store().runsRepo.previewApprovalBlastRadius(data.runId, data.approvalId, {
+      crossPersona: data.crossPersona,
+    }),
+  )
 
 export const revokeApprovalLeaseAction = createServerFn({ method: 'POST' })
   .validator(z.object({

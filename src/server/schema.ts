@@ -1,7 +1,7 @@
 import { index, integer, real, sqliteTable, text, uniqueIndex } from 'drizzle-orm/sqlite-core'
 import type { AccessPolicySnapshot } from '../access-policy.ts'
 import type {
-  ApprovalPolicy, ApprovedEndpointPattern, AssessmentCheckId, BenchmarkFunnel, BoardAuthorRole, BoardMemberRole, BoardMemberState,
+  ApprovalLeaseScope, ApprovalPolicy, ApprovedEndpointPattern, AssessmentCheckId, BenchmarkFunnel, BoardAuthorRole, BoardMemberRole, BoardMemberState,
   BoardMessageKind, CallerCompatibility, Candidate, CapabilityTier, CheckCoverage,
   CodeLocation, DnsSource, DynamicRetestVerdict, EndpointSource, EvidenceSummary, FailureTaxonomyBucket, Finding, InlineVerifyFeedback, LabConfig,
   OwaspCategory, ParamLocation, PatchProposalStatus, PersonaAuthKind, PersonaLoginConfig, Phase,
@@ -324,7 +324,9 @@ export const approvalLeases = sqliteTable('approval_leases', {
   origin: text('origin').notNull(),
   method: text('method').notNull(),
   routePattern: text('route_pattern').notNull(),
+  leaseScope: text('lease_scope').$type<ApprovalLeaseScope>().default('route').notNull(),
   personaHandle: text('persona_handle'),
+  crossPersona: integer('cross_persona', { mode: 'boolean' }).default(false).notNull(),
   status: text('status').$type<'active' | 'revoked' | 'expired'>().notNull(),
   sourceApprovalId: text('source_approval_id'),
   createdBy: text('created_by').notNull(),
@@ -332,6 +334,7 @@ export const approvalLeases = sqliteTable('approval_leases', {
   updatedAt: integer('updated_at').notNull(),
   expiresAt: integer('expires_at'),
   uses: integer('uses').default(0).notNull(),
+  maxUses: integer('max_uses'),
   lastUsedAt: integer('last_used_at'),
 }, table => [
   index('approval_leases_run').on(table.runId, table.status),

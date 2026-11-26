@@ -1922,7 +1922,7 @@ export class RunTier3ApprovalCoordinator {
             isNonDestructiveMutationMethod(target.method) &&
             !hasApprovalPathGlobMetacharacters(target.pathAndQuery) &&
             !isHighRiskOrExternalMutationPath(target.pathAndQuery) &&
-            this.host.storage.leaseAuthorizes(run.id, target.origin, target.method, target.pathAndQuery)
+            this.host.storage.leaseAuthorizes(run.id, target.origin, target.method, target.pathAndQuery, target.personaHandle)
           if (canReuseDurableLease) {
             this.host.storage.recordAutoApprovalDecision(run, job.assignment, {
               origin: target.origin, method: target.method, pathAndQuery: target.pathAndQuery,
@@ -1931,7 +1931,7 @@ export class RunTier3ApprovalCoordinator {
                 ? `${options.rationale} (target ${idx + 1}/${distinctTargets.length}: ${target.method.toUpperCase()} ${target.pathAndQuery})`
                 : options.rationale,
               requestPreview: options.requestPreview,
-              riskLevel: 'low',
+              riskLevel: evaluation.riskLevel,
               policyNote: 'Authorized by active durable operator approval lease.',
               secrets: options.secrets,
               decision: 'approved',
@@ -2141,12 +2141,12 @@ export class RunTier3ApprovalCoordinator {
       isNonDestructiveMutationMethod(input.method) &&
       !hasApprovalPathGlobMetacharacters(input.pathAndQuery) &&
       !isHighRiskOrExternalMutationPath(input.pathAndQuery) &&
-      this.host.storage.leaseAuthorizes(run.id, input.origin, input.method, input.pathAndQuery)
+      this.host.storage.leaseAuthorizes(run.id, input.origin, input.method, input.pathAndQuery, input.personaHandle)
     if (canReuseDurableLease) {
       this.host.storage.recordAutoApprovalDecision(run, job.assignment, {
         origin: input.origin, method: input.method, pathAndQuery: input.pathAndQuery,
         personaHandle: input.personaHandle, rationale: input.rationale,
-        requestPreview: input.requestPreview, riskLevel: 'low',
+        requestPreview: input.requestPreview, riskLevel: evaluation.riskLevel,
         policyNote: 'Authorized by active durable operator approval lease.',
         secrets: input.secrets,
         decision: 'approved',
