@@ -7,7 +7,7 @@ import { randomUUID } from 'node:crypto'
 import { once } from 'node:events'
 import { createServer } from 'node:http'
 import {
-  existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, rmSync, statSync, writeFileSync,
+  existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -19,10 +19,10 @@ import type {
 } from '../benchmarks/realistic-bench/lib/types.ts'
 import { gradeRun } from '../benchmarks/realistic-bench/run.ts'
 import type { Finding } from '../src/domain.ts'
-import { privateModelProfiles } from '../src/server/model-settings.ts'
+import { CREDENTIALS_DIR_ENV, privateModelProfiles } from '../src/server/model-settings.ts'
 import { Store } from '../src/server/store.ts'
 import {
-  PreflightError, assertAgenticPreflight, briefingToOpenApi, buildTelemetry, cellKeys,
+  PreflightError, acquireCredentialsDirEnv, assertAgenticPreflight, briefingToOpenApi, buildTelemetry, cellKeys,
   describeModelMode, detectWorkerSessions, endpointsFromReplaySpec, isInertAgenticRun, openCellStore,
   parseRealisticArgs, pickLoginPath, planCell, prepareIsolatedDataDir, probeLoginPath,
   shouldIsolateDataDir, stopEngine, summarizeAssignments, translateFindings,
@@ -629,8 +629,12 @@ function walkFilesNoFollow(dir: string): string[] {
   return files
 }
 
-test('isolation: two cell Stores run concurrently, profile visible, credentials symlinked, no key in out-dir', async () => {  const source = makeSourceDataDir()
+test('isolation: two cell Stores run concurrently, profile visible via KOVO_CREDENTIALS_DIR, no symlink or key in out-dir', async () => {
+  const source = makeSourceDataDir()
   const outDir = mkdtempSync(join(tmpdir(), 'kovo-iso-out-'))
+  const prevCredsEnv = process.env[CREDENTIALS_DIR_ENV]
+  delete process.env[CREDENTIALS_DIR_ENV]
+  const releases: Array<() => void> = []
   try {
     const targetA = join(outDir, 'data', 'acme-saas-seed1-grey-box')
     const targetB = join(outDir, 'data', 'shopflow-seed1-grey-box')
@@ -642,7 +646,27 @@ test('isolation: two cell Stores run concurrently, profile visible, credentials 
     assert.deepEqual(b.profileNames, ['Isolated Test Profile'])
     assert.notEqual(a.directory, b.directory)
 
-    // Both Stores open at the same time: no "Another Kovo Hunter server" collision.
+    const hostCredsDir = join(source.dir, 'credentials')
+    for (const iso of [a, b]) {
+      assert.equal(iso.credentialsDir, hostCredsDir)
+      assert.equal(lstatSync(iso.credentialsDir).isSymbolicLink(), false, 'host credentialsDir must not be a symlink')
+      assert.equal(statSync(iso.credentialsDir).isDirectory(), true)
+      assert.equal(statSync(join(iso.credentialsDir, source.credentialId)).mode & 0o777, 0o600)
+
+      const cellCreds = join(iso.directory, 'credentials')
+      const cellStat = lstatSync(cellCreds)
+      assert.equal(cellStat.isSymbolicLink(), false, 'cell credentials/ must NOT be a symlink under M-15')
+      assert.equal(cellStat.isDirectory(), true, 'cell credentials/ must be a real directory')
+      assert.equal(cellStat.mode & 0o777, 0o700, 'cell credentials/ must be mode 0700')
+      assert.equal(existsSync(join(cellCreds, source.credentialId)), false, 'model key must not be copied into cell credentials/')
+    }
+
+    // Bind KOVO_CREDENTIALS_DIR via ref-counted helper and open both Stores concurrently:
+    // no "Another Kovo Hunter server" collision, and profiles resolve from host credentials.
+    releases.push(acquireCredentialsDirEnv(a.credentialsDir))
+    releases.push(acquireCredentialsDirEnv(b.credentialsDir))
+    assert.equal(process.env[CREDENTIALS_DIR_ENV], hostCredsDir)
+
     const storeA = openCellStore(a.directory)
     const storeB = openCellStore(b.directory)
     try {
@@ -652,26 +676,20 @@ test('isolation: two cell Stores run concurrently, profile visible, credentials 
       assert.equal(privateModelProfiles(storeB)[0]?.name, 'Isolated Test Profile')
       assert.equal(storeA.workspace.id, source.workspaceId)
       assert.equal(storeB.workspace.id, source.workspaceId)
-
-      for (const target of [targetA, targetB]) {
-        const link = join(target, 'credentials')
-        assert.ok(lstatSync(link).isSymbolicLink(), 'credentials must be a symlink')
-        const resolved = readlinkSync(link)
-        assert.equal(statSync(resolved).isDirectory(), true)
-        assert.equal(statSync(join(link, source.credentialId)).mode & 0o777, 0o600)
-      }
     } finally {
       storeA.close()
       storeB.close()
     }
 
-    // No key material in regular files under the isolated out-dir (symlinks are skipped).
+    // No key material anywhere under the isolated out-dir.
     const leaked = walkFilesNoFollow(outDir)
       .filter(file => readFileSync(file, 'utf8').includes(KEY_CANARY))
     assert.deepEqual(leaked, [])
-    const credentialLinks = walkFilesNoFollow(outDir)
-    assert.ok(!credentialLinks.includes(join(targetA, 'credentials', source.credentialId)))
+    assert.ok(!walkFilesNoFollow(outDir).includes(join(targetA, 'credentials', source.credentialId)))
   } finally {
+    for (const release of releases) release()
+    if (prevCredsEnv === undefined) delete process.env[CREDENTIALS_DIR_ENV]
+    else process.env[CREDENTIALS_DIR_ENV] = prevCredsEnv
     source.keep()
     rmSync(outDir, { recursive: true, force: true })
   }
