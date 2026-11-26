@@ -1558,14 +1558,25 @@ function writeOneShot(result: unknown) {
   process.stdout.write(JSON.stringify({ resultRef: spillPayload(result as Record<string, unknown>) }))
 }
 
+const DEFAULT_EXEC_TIMEOUT_MS = 60_000
+const MIN_EXEC_TIMEOUT_MS = 1_000
+const MAX_EXEC_TIMEOUT_MS = 120_000
+
+function clampExecTimeoutMs(timeoutMs?: number): number {
+  const numeric = typeof timeoutMs === 'number' && Number.isFinite(timeoutMs)
+    ? Math.trunc(timeoutMs)
+    : DEFAULT_EXEC_TIMEOUT_MS
+  return Math.max(MIN_EXEC_TIMEOUT_MS, Math.min(numeric, MAX_EXEC_TIMEOUT_MS))
+}
+
 async function execCommand(
   shell: Bash,
   scratch: InMemoryFs,
   command: string,
   outputNames: string[],
-  timeoutMs = 60_000,
+  timeoutMs = DEFAULT_EXEC_TIMEOUT_MS,
 ) {
-  const capped = Math.max(1_000, Math.min(timeoutMs, 120_000))
+  const capped = clampExecTimeoutMs(timeoutMs)
   const controller = new AbortController()
   let timedOut = false
   const timer = setTimeout(() => {
@@ -1625,7 +1636,7 @@ async function execCommand(
   }
 }
 
-async function createSandbox() {
+async function createSandbox(maxExecutionTimeMs = MAX_EXEC_TIMEOUT_MS) {
   let inputDirectory: string
   try {
     const lst = lstatSync('/evidence')
@@ -1667,10 +1678,14 @@ async function createSandbox() {
     base: scratch,
     mounts,
   })
+  const boundedExecutionTimeMs = clampExecTimeoutMs(maxExecutionTimeMs)
   const shell = new Bash({
     cwd: '/work',
     fs,
     executionLimitProfile: 'hardened',
+    executionLimits: {
+      maxExecutionTimeMs: boundedExecutionTimeMs,
+    },
     python: false,
     javascript: false,
   })
@@ -1686,16 +1701,17 @@ async function runOneShot() {
     process.stdout.write(JSON.stringify(result))
     return
   }
-  const { inputDirectory, scratch, shell } = await createSandbox()
+  const effectiveTimeoutMs = clampExecTimeoutMs(job.timeoutMs)
+  const { inputDirectory, scratch, shell } = await createSandbox(effectiveTimeoutMs)
   for (const input of job.files) {
     await stageFile(inputDirectory, input.name, input.content)
   }
-  const result = await execCommand(shell, scratch, job.command, job.outputs, job.timeoutMs ?? 60_000)
+  const result = await execCommand(shell, scratch, job.command, job.outputs, effectiveTimeoutMs)
   writeOneShot(result)
 }
 
 async function runSession() {
-  const { inputDirectory, scratch, shell } = await createSandbox()
+  const { inputDirectory, scratch, shell } = await createSandbox(MAX_EXEC_TIMEOUT_MS)
   const stagedContents = new Map<string, string>()
   const rl = createInterface({ input: process.stdin, crlfDelay: Infinity })
   const respond = (payload: Record<string, unknown>) => {
@@ -1721,7 +1737,7 @@ async function runSession() {
         stagedContents.set(msg.name, msg.content)
         respond({ id: msg.id, ok: true, path: '/evidence/' + msg.name })
       } else if (msg.op === 'exec') {
-        const result = await execCommand(shell, scratch, msg.command, msg.outputs, msg.timeoutMs ?? 60_000)
+        const result = await execCommand(shell, scratch, msg.command, msg.outputs, clampExecTimeoutMs(msg.timeoutMs))
         respond({ id: msg.id, ok: true, result })
       } else if (msg.op === 'analyze') {
         if (msg.tool === 'call-graph' && typeof msg.args?.repo === 'string' && !Array.isArray(msg.args?.files)) {
