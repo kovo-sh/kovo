@@ -33,6 +33,53 @@ const H2 = 'm-0 mb-2.5 mt-[30px] text-[12px] font-semibold uppercase tracking-[0
 const DL = 'm-0 mb-2.5 grid grid-cols-[112px_minmax(0,1fr)] gap-x-3 gap-y-1 text-[12.5px] leading-[19px] [&_dt]:text-fg-subtle [&_dd]:m-0 [&_dd]:break-words [&_dd]:text-fg-muted'
 const DOC_P = 'm-0 mb-2.5 text-[12.5px] leading-5 text-fg-muted'
 
+/** Safely coerce potentially null/object/malformed report fields into text so React never throws. */
+export function safeReportText(value: unknown, fallback = ''): string {
+  if (value == null) return fallback
+  if (typeof value === 'string') return value
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value)
+  try {
+    return JSON.stringify(value)
+  } catch {
+    return fallback || String(value)
+  }
+}
+
+/** Normalize optional or malformed report body collections before rendering or exporting. */
+export function normalizeReportBody(rawBody: Partial<Rep['body']> | null | undefined) {
+  const b = (rawBody && typeof rawBody === 'object' ? rawBody : {}) as Partial<Rep['body']>
+  const findings = (Array.isArray(b.findings) ? b.findings : [])
+    .filter((f): f is ReportFinding => Boolean(f && typeof f === 'object'))
+    .map((f, idx) => ({
+      ...f,
+      id: safeReportText(f.id, `finding-${idx}`),
+      title: safeReportText(f.title, 'Untitled finding'),
+      origin: safeReportText(f.origin, ''),
+      severity: f.severity ?? 'informational',
+      status: f.status ?? 'pending',
+      category: safeReportText(f.category, ''),
+      reason: safeReportText(f.reason, ''),
+      remediation: safeReportText(f.remediation, ''),
+      evidenceIds: Array.isArray(f.evidenceIds) ? f.evidenceIds.filter((x): x is string => typeof x === 'string') : [],
+      codeLocations: Array.isArray(f.codeLocations) ? f.codeLocations.filter(Boolean) : undefined,
+      chainFactIds: Array.isArray(f.chainFactIds) ? f.chainFactIds.filter((x): x is string => typeof x === 'string') : undefined,
+    }))
+  const scope = (Array.isArray(b.scope) ? b.scope : []).filter((a): a is Rep['body']['scope'][number] => Boolean(a && typeof a === 'object'))
+  const coverage = (Array.isArray(b.coverage) ? b.coverage : []).filter((c): c is Rep['body']['coverage'][number] => Boolean(c && typeof c === 'object'))
+  const gaps = (Array.isArray(b.gaps) ? b.gaps : []).map(g => safeReportText(g)).filter(Boolean)
+  return {
+    ...b,
+    goal: safeReportText(b.goal, ''),
+    capabilityTier: b.capabilityTier ?? 1,
+    scopeRevision: b.scopeRevision ?? 0,
+    goalRevision: b.goalRevision ?? 0,
+    findings,
+    scope,
+    coverage,
+    gaps,
+  } as Rep['body']
+}
+
 function download(content: string, filename: string, type: string) {
   const url = URL.createObjectURL(new Blob([content], { type }))
   const a = document.createElement('a')
@@ -57,7 +104,7 @@ export function ReportView() {
   const { detail } = useRun()
   const nav = useNav()
   const r = detail.run
-  const reports = detail.reports
+  const reports = Array.isArray(detail.reports) ? detail.reports : []
   const latestVersion = useMemo(() => reports.reduce((max, x) => Math.max(max, x.version), 0), [reports])
   const [version, setVersionState] = useViewState<number | null>('report.version', null)
   const setVersion = useCallback((v: number) => {
@@ -96,13 +143,13 @@ export function ReportView() {
 
 type Rep = ReturnType<typeof useRun>['detail']['reports'][number]
 
-function ReportDoc({ rep, versions, setVersion }: { rep: Rep; versions: number[]; setVersion: (v: number) => void }) {
+export function ReportDoc({ rep, versions, setVersion }: { rep: Rep; versions: number[]; setVersion: (v: number) => void }) {
   const { detail, send, pending, refresh } = useRun()
   const model = useRunModel()
   const verdict = useVerdict()
   const links = useLinks()
   const toast = useToast()
-  const b = rep.body
+  const b = useMemo(() => normalizeReportBody(rep?.body), [rep?.body])
   const m = b.metrics
   const latest = versions[0] === rep.version
   const [exporting, setExporting] = useState(false)
@@ -111,30 +158,53 @@ function ReportDoc({ rep, versions, setVersion }: { rep: Rep; versions: number[]
   const [allT, setAllT] = useState(false)
   const [patching, setPatching] = useState<string | null>(null)
 
-  const fs = useMemo(() => b.findings.slice().sort((x, y) => (SEV_ORDER[x.severity] - SEV_ORDER[y.severity]) || ((FSTAT_ORDER[x.status] ?? 9) - (FSTAT_ORDER[y.status] ?? 9))), [b.findings])
+  const fs = useMemo(
+    () => b.findings.slice().sort((x, y) => ((SEV_ORDER[x.severity] ?? 9) - (SEV_ORDER[y.severity] ?? 9)) || ((FSTAT_ORDER[x.status] ?? 9) - (FSTAT_ORDER[y.status] ?? 9))),
+    [b.findings],
+  )
   const sevC: Record<string, number> = {}
   fs.forEach(f => { sevC[f.severity] = (sevC[f.severity] ?? 0) + 1 })
   const conf = fs.filter(f => normFStatus(f.status) === 'confirmed').length
   const { coverage: covLine, confirmed: runtimeConf, staticVerified, chainConfirmed, priority } = reportHighlights(b)
-  const checks = b.selectedChecks?.checks ?? []
-  const checkRows = b.coverage.filter(c => (c.checks ?? []).length)
-  const threat = b.threatModel?.length ? b.threatModel : (detail.threatModel?.entries ?? [])
-  const owasp = b.owaspCoverage?.length ? b.owaspCoverage : detail.coverageEntries
-  const gapsOpen = b.openProofGaps?.length ? b.openProofGaps
-    : (detail.openProofGaps ?? []).map(g => ({ origin: g.origin, category: g.category, summary: g.summary, proofGapReason: g.proofGapReason || g.summary }))
+  const checks = Array.isArray(b.selectedChecks?.checks) ? b.selectedChecks!.checks : []
+  const checkRows = b.coverage.filter(c => Array.isArray(c.checks) && c.checks.length > 0)
+  const threat = Array.isArray(b.threatModel) && b.threatModel.length
+    ? b.threatModel.filter(Boolean)
+    : (Array.isArray(detail.threatModel?.entries) ? detail.threatModel!.entries.filter(Boolean) : [])
+  const owasp = Array.isArray(b.owaspCoverage) && b.owaspCoverage.length
+    ? b.owaspCoverage.filter(Boolean)
+    : (Array.isArray(detail.coverageEntries) ? detail.coverageEntries.filter(Boolean) : [])
+  const gapsOpen = Array.isArray(b.openProofGaps) && b.openProofGaps.length
+    ? b.openProofGaps.filter(Boolean)
+    : (Array.isArray(detail.openProofGaps) ? detail.openProofGaps.filter(Boolean) : []).map(g => ({
+        origin: safeReportText(g.origin),
+        category: safeReportText(g.category),
+        summary: safeReportText(g.summary),
+        proofGapReason: safeReportText(g.proofGapReason || g.summary),
+      }))
   // Merge live patchProposals with snapshot patches (preferring live records) so newly generated patches appear immediately after refresh().
   const patches = useMemo(() => {
     const byId = new Map<string, (typeof detail.patchProposals)[number]>()
-    for (const p of b.patchProposals ?? []) byId.set(p.id, p as (typeof detail.patchProposals)[number])
-    for (const p of detail.patchProposals ?? []) byId.set(p.id, p)
+    for (const p of Array.isArray(b.patchProposals) ? b.patchProposals : []) {
+      if (p && typeof p === 'object' && p.id) byId.set(p.id, p as (typeof detail.patchProposals)[number])
+    }
+    for (const p of Array.isArray(detail.patchProposals) ? detail.patchProposals : []) {
+      if (p && typeof p === 'object' && p.id) byId.set(p.id, p)
+    }
     return [...byId.values()]
   }, [b.patchProposals, detail.patchProposals])
   const titleById = new Map(b.findings.map(f => [f.id, f.title]))
-  const replayById = new Map(detail.replaySpecs.map(x => [x.id, x]))
-  const replayByFinding = new Map(detail.replaySpecs.map(x => [x.findingId, x]))
+  const replaySpecs = Array.isArray(detail.replaySpecs) ? detail.replaySpecs : []
+  const replayById = new Map(replaySpecs.map(x => [x.id, x]))
+  const replayByFinding = new Map(replaySpecs.map(x => [x.findingId, x]))
   const retests = new Map<string, typeof detail.retestRuns>()
-  detail.retestRuns.forEach(x => retests.set(x.findingId, [...(retests.get(x.findingId) ?? []), x]))
-  const activeRetest = detail.assignments.filter(a => a.phase === 'retest' && (a.status === 'queued' || a.status === 'running')).map(a => a.objective)
+  for (const x of Array.isArray(detail.retestRuns) ? detail.retestRuns : []) {
+    if (!x) continue
+    retests.set(x.findingId, [...(retests.get(x.findingId) ?? []), x])
+  }
+  const activeRetest = (Array.isArray(detail.assignments) ? detail.assignments : [])
+    .filter(a => a && a.phase === 'retest' && (a.status === 'queued' || a.status === 'running'))
+    .map(a => safeReportText(a.objective))
   const evidenceTitle = (id: string) => model.evidenceById.get(id)?.title ?? 'Evidence ' + id.slice(0, 8)
   const ev = (id: string) => { if (model.evidenceById.has(id)) links.evidence(id); else toast.show('This evidence isn’t in the run snapshot', { tone: 'error' }) }
   const modeMeta = capabilityTierMeta[b.capabilityTier as CapabilityTier]
@@ -143,7 +213,11 @@ function ReportDoc({ rep, versions, setVersion }: { rep: Rep; versions: number[]
   // owasp coverage → host × category matrix
   const covHosts = useMemo(() => {
     const map = new Map<string, Map<string, (typeof owasp)[number]>>()
-    owasp.forEach(x => { if (!map.has(x.origin)) map.set(x.origin, new Map()); map.get(x.origin)!.set(x.category, x) })
+    owasp.forEach(x => {
+      if (!x || !x.origin) return
+      if (!map.has(x.origin)) map.set(x.origin, new Map())
+      map.get(x.origin)!.set(x.category, x)
+    })
     return [...map.entries()].sort((a, c) => host(a[0]).localeCompare(host(c[0])))
   }, [owasp])
 
@@ -166,27 +240,27 @@ function ReportDoc({ rep, versions, setVersion }: { rep: Rep; versions: number[]
       reportEvidenceSource(detail.run.sourceMode, b.selectedChecks, b.capabilityTier),
       `Testing mode: ${modeName}`, `Scope revision ${b.scopeRevision} · Goal revision ${b.goalRevision}`,
       ...(reportPlanLabel(b.selectedChecks) ? [reportPlanLabel(b.selectedChecks)!] : []),
-      ...b.scope.map(a => a.origin),
-      ...(threat.length ? ['', 'Threat model', ...threat.map(e => `${e.origin} · ${e.riskTier} · [${e.surfaceTags.join(', ')}] · ${e.rationale}`)] : []),
-      ...(priority ? ['', 'Fix first', priority.label, ...(priority.finding ? [priority.finding.origin, priority.finding.remediation] : [])] : []),
+      ...b.scope.map(a => safeReportText(a.origin)),
+      ...(threat.length ? ['', 'Threat model', ...threat.map(e => `${safeReportText(e.origin)} · ${safeReportText(e.riskTier)} · [${(Array.isArray(e.surfaceTags) ? e.surfaceTags : []).join(', ')}] · ${safeReportText(e.rationale)}`)] : []),
+      ...(priority ? ['', 'Fix first', priority.label, ...(priority.finding ? [safeReportText(priority.finding.origin), safeReportText(priority.finding.remediation)] : [])] : []),
       '', 'Findings',
       ...fs.flatMap(f => {
         const rt = retests.get(f.id)?.[0]
         return [
           `${f.title} · ${f.origin} · ${f.severity} · ${f.status}${f.findingKind === 'multi_step_chain' ? ' · multi-step chain' : ''}`,
-          ...(f.category ? [`Class: ${f.category}${f.cwe ? ` · ${f.cwe}` : ''}`] : []),
-          ...(f.confidence ? [`Confidence: ${f.confidence}`] : []),
-          ...(f.check ? [`Observed: ${f.check.observed ?? 'Unavailable'}`, `Expected: ${f.check.expected}`] : []),
-          f.reason, ...(f.impact ? [`Impact: ${f.impact}`] : []), ...(f.verification ? [`Verification: ${f.verification}`] : []),
-          `Remediation: ${f.remediation}`, ...(f.recheck ? [`Check the fix: ${f.recheck}`] : []),
-          ...(rt ? [`Latest Verify Fix retest: ${retestVerdictLabels[rt.verdict]} — ${rt.summary}`] : []),
+          ...(f.category ? [`Class: ${f.category}${f.cwe ? ` · ${safeReportText(f.cwe)}` : ''}`] : []),
+          ...(f.confidence ? [`Confidence: ${safeReportText(f.confidence)}`] : []),
+          ...(f.check ? [`Observed: ${safeReportText(f.check.observed, 'Unavailable')}`, `Expected: ${safeReportText(f.check.expected)}`] : []),
+          f.reason, ...(f.impact ? [`Impact: ${safeReportText(f.impact)}`] : []), ...(f.verification ? [`Verification: ${safeReportText(f.verification)}`] : []),
+          `Remediation: ${f.remediation}`, ...(f.recheck ? [`Check the fix: ${safeReportText(f.recheck)}`] : []),
+          ...(rt ? [`Latest Verify Fix retest: ${retestVerdictLabels[rt.verdict] ?? rt.verdict} — ${safeReportText(rt.summary)}`] : []),
           `Evidence ${f.evidenceIds.join(', ')}`, '',
         ]
       }),
-      ...(owasp.length ? ['OWASP / API Top 10 coverage', ...owasp.map(x => `${x.origin} · ${owaspCategoryTitles[x.category as keyof typeof owaspCategoryTitles] ?? x.category} · ${owaspStatusLabels[x.status as keyof typeof owaspStatusLabels] ?? x.status} · ${x.summary}`), ''] : []),
+      ...(owasp.length ? ['OWASP / API Top 10 coverage', ...owasp.map(x => `${safeReportText(x.origin)} · ${owaspCategoryTitles[x.category as keyof typeof owaspCategoryTitles] ?? x.category} · ${owaspStatusLabels[x.status as keyof typeof owaspStatusLabels] ?? x.status} · ${safeReportText(x.summary)}`), ''] : []),
       'Coverage',
-      ...b.coverage.flatMap(c => [[c.origin, c.status, c.evidenceId && `Evidence ${c.evidenceId}`].filter(Boolean).join(' · '),
-        ...(c.checks ?? []).flatMap(ch => [`  ${ch.title} · ${checkLabels[ch.status]}`, ...(ch.status === 'untested' ? [] : [`    Observed: ${ch.observed ?? 'Unavailable'}`]), `    Expected: ${ch.expected}`, `    ${ch.reason}`])]),
+      ...b.coverage.flatMap(c => [[safeReportText(c.origin), safeReportText(c.status), c.evidenceId && `Evidence ${c.evidenceId}`].filter(Boolean).join(' · '),
+        ...(Array.isArray(c.checks) ? c.checks : []).flatMap(ch => [`  ${safeReportText(ch.title)} · ${checkLabels[ch.status] ?? ch.status}`, ...(ch.status === 'untested' ? [] : [`    Observed: ${safeReportText(ch.observed, 'Unavailable')}`]), `    Expected: ${safeReportText(ch.expected)}`, `    ${safeReportText(ch.reason)}`])]),
       '', 'Coverage gaps', ...b.gaps,
     ]
     download(lines.join('\n'), `kovo-hunter-report-${rep.version}.txt`, 'text/plain')
@@ -250,7 +324,7 @@ function ReportDoc({ rep, versions, setVersion }: { rep: Rep; versions: number[]
 
     {priority && <div className="mb-3 mt-4 flex items-start gap-2 rounded-[7px] bg-sunk px-2.5 py-2 text-[12px] leading-[19px] text-fg-muted shadow-[inset_0_0_0_1px_var(--line)]">
       <Icon name="flag" className="mt-0.5 flex-none text-fg-muted" />
-      <span className="line-clamp-2 min-w-0 flex-1"><b className="font-medium text-fg">Fix first.</b> {priority.label}{priority.finding && <span className="text-fg-subtle"> · {host(priority.finding.origin)} · {priority.finding.remediation}</span>}</span>
+      <span className="line-clamp-2 min-w-0 flex-1"><b className="font-medium text-fg">Fix first.</b> {priority.label}{priority.finding && <span className="text-fg-subtle"> · {priority.finding.origin ? host(priority.finding.origin) : 'unknown'} · {safeReportText(priority.finding.remediation)}</span>}</span>
       {priority.finding && <button type="button" className={cn(runBtn({ variant: 'ghost' }), '-mt-[3px] ml-auto')} onClick={() => {
         const id = priority.finding!.id
         const i = fs.findIndex(f => f.id === id)
@@ -280,13 +354,18 @@ function ReportDoc({ rep, versions, setVersion }: { rep: Rep; versions: number[]
         const canPatch = canGeneratePatch(f)
         const live = model.findingById.has(f.id)
         const rowBorder = isOpen ? 'border-b border-transparent' : 'border-b border-line'
+        const checkObserved = f.check ? safeReportText(f.check.observed) : ''
+        const checkExpected = f.check ? safeReportText(f.check.expected) : ''
+        const showReason = Boolean(f.reason) && (!f.check || f.status !== 'confirmed' || f.reason.trim() !== checkObserved.trim())
+        const codeLocations = Array.isArray(f.codeLocations) ? f.codeLocations.filter(Boolean) : []
+        const rtEvidenceIds = Array.isArray(rt?.evidenceIds) ? rt.evidenceIds.filter((x): x is string => typeof x === 'string') : []
         return <Fragment key={f.id}>
           <tr className="scroll-mt-4 cursor-pointer hover:bg-hover" data-fid={f.id} onClick={() => setOpen(o => ({ ...o, [f.id]: !isOpen }))} aria-expanded={isOpen}>
             <td className={cn('w-[26px] pb-[7px] pt-2.5 align-top', rowBorder)}><SevGlyph sev={f.severity} /></td>
             <td className={cn('w-[26px] pb-[7px] pt-2.5 align-top', rowBorder)} title={stLabel(f.status)}><StatusGlyph status={st} /></td>
             <td className={cn('py-[7px] align-top [overflow-wrap:anywhere]', rowBorder)}>
               <div className="text-fg">{f.title}</div>
-              <div className="font-mono text-[12px] text-fg-subtle">{host(f.origin)}{f.cwe ? ' · ' + f.cwe : ''} · {prettyCat(f.category)}{f.findingKind === 'multi_step_chain' ? ' · chain' : ''}</div>
+              <div className="font-mono text-[12px] text-fg-subtle">{f.origin ? host(f.origin) : 'unknown'}{f.cwe ? ' · ' + safeReportText(f.cwe) : ''}{f.category ? ' · ' + prettyCat(f.category) : ''}{f.findingKind === 'multi_step_chain' ? ' · chain' : ''}</div>
             </td>
             <td className={cn('w-6 pb-[7px] pt-2.5 text-right align-top text-fg-faint', rowBorder)}>
               <Icon name="chev" className={cn('ml-auto transition-transform duration-[var(--d2)] ease-kovo', isOpen ? 'rotate-0 text-fg-muted' : '-rotate-90')} />
@@ -296,41 +375,41 @@ function ReportDoc({ rep, versions, setVersion }: { rep: Rep; versions: number[]
             <td className="border-b border-line pb-3.5 pt-0.5 align-top" />
             <td colSpan={3} className="border-b border-line pb-3.5 pt-0.5 align-top [overflow-wrap:anywhere]">
               <div className="mb-2.5 mt-0.5 flex flex-wrap gap-[5px]">
-                <Tag><SevGlyph sev={f.severity} />{SEV_LABEL[f.severity] ?? f.severity}</Tag>
+                <Tag><SevGlyph sev={f.severity} />{SEV_LABEL[f.severity] ?? safeReportText(f.severity)}</Tag>
                 <Tag tone={st === 'confirmed' ? 'accent' : undefined}><StatusGlyph status={st} />{stLabel(f.status)}</Tag>
               </div>
               {f.check && <div className={RW.cmp}>
                 <div className="grid grid-cols-[72px_1fr] text-[12px] leading-[18px]">
                   <span className="min-w-0 border-r border-line bg-sunk px-2.5 py-[7px] text-fg-subtle">Expected</span>
-                  <span className="min-w-0 px-2.5 py-[7px] text-fg-muted">{f.check.expected}</span>
+                  <span className="min-w-0 px-2.5 py-[7px] text-fg-muted">{checkExpected || <span className="text-fg-subtle">Unavailable</span>}</span>
                 </div>
                 <div className="grid grid-cols-[72px_1fr] border-t border-line text-[12px] leading-[18px]">
                   <span className="min-w-0 border-r border-line bg-sunk px-2.5 py-[7px] text-fg-subtle">Observed</span>
-                  <span className="min-w-0 break-all px-2.5 py-[7px] font-mono text-[12px] text-fg">{f.check.observed ?? <span className="text-fg-subtle">Unavailable</span>}</span>
+                  <span className="min-w-0 break-all px-2.5 py-[7px] font-mono text-[12px] text-fg">{f.check.observed != null ? checkObserved : <span className="text-fg-subtle">Unavailable</span>}</span>
                 </div>
               </div>}
               <dl className={DL}>
-                {(!f.check || f.status !== 'confirmed') && <><dt>{st === 'confirmed' ? 'Observation' : 'Reason'}</dt><dd>{f.reason}</dd></>}
-                {f.impact && <><dt>Impact</dt><dd>{f.impact}</dd></>}
-                {(f.codeLocations?.length ?? 0) > 0 && <><dt>Code</dt><dd className="font-mono text-[12px]">{f.codeLocations!.map(l => `${l.repo}/${l.file}:${l.startLine}${l.endLine > l.startLine ? '-' + l.endLine : ''}`).join(', ')}</dd></>}
-                <dt>{st === 'confirmed' ? 'Remediation' : 'Follow-up'}</dt><dd>{f.remediation}</dd>
-                {f.recheck && <><dt>Check the fix</dt><dd>{f.recheck}</dd></>}
+                {showReason && <><dt>{st === 'confirmed' ? 'Observation' : 'Reason'}</dt><dd>{f.reason}</dd></>}
+                {f.impact != null && safeReportText(f.impact) && <><dt>Impact</dt><dd>{safeReportText(f.impact)}</dd></>}
+                {codeLocations.length > 0 && <><dt>Code</dt><dd className="font-mono text-[12px]">{codeLocations.map(l => `${safeReportText(l.repo)}/${safeReportText(l.file)}:${l.startLine ?? 0}${(l.endLine ?? 0) > (l.startLine ?? 0) ? '-' + l.endLine : ''}`).join(', ')}</dd></>}
+                {f.remediation && <><dt>{st === 'confirmed' ? 'Remediation' : 'Follow-up'}</dt><dd>{f.remediation}</dd></>}
+                {f.recheck != null && safeReportText(f.recheck) && <><dt>Check the fix</dt><dd>{safeReportText(f.recheck)}</dd></>}
               </dl>
               {(tier || rk || f.confidence || f.confidenceRationale || f.counterevidence || f.runtimeProofGap || f.verification || (f.chainFactIds?.length ?? 0) > 0) && <Disclosure title="Verification details" right={rk ?? (tier ? verificationTierLabels[tier] : undefined)}>
                 <dl className={cn(DL, 'mb-0')}>
                   {tier && <><dt>Verification</dt><dd>{verificationTierLabels[tier]}</dd></>}
                   {rk && <><dt>Method</dt><dd>{rk}</dd></>}
-                  {f.confidence && <><dt>Confidence</dt><dd>{f.confidence}{f.confidenceRationale ? ' — ' + f.confidenceRationale : ''}</dd></>}
-                  {!f.confidence && f.confidenceRationale && <><dt>Confidence</dt><dd>{f.confidenceRationale}</dd></>}
-                  {f.verification && <><dt>Replay notes</dt><dd>{f.verification}</dd></>}
-                  {f.counterevidence && <><dt>Counterevidence</dt><dd>{f.counterevidence}</dd></>}
-                  {f.runtimeProofGap && <><dt>Proof gap</dt><dd>{f.runtimeProofGap}</dd></>}
+                  {f.confidence != null && safeReportText(f.confidence) && <><dt>Confidence</dt><dd>{safeReportText(f.confidence)}{f.confidenceRationale ? ' — ' + safeReportText(f.confidenceRationale) : ''}</dd></>}
+                  {!f.confidence && f.confidenceRationale != null && safeReportText(f.confidenceRationale) && <><dt>Confidence</dt><dd>{safeReportText(f.confidenceRationale)}</dd></>}
+                  {f.verification != null && safeReportText(f.verification) && <><dt>Replay notes</dt><dd>{safeReportText(f.verification)}</dd></>}
+                  {f.counterevidence != null && safeReportText(f.counterevidence) && <><dt>Counterevidence</dt><dd>{safeReportText(f.counterevidence)}</dd></>}
+                  {f.runtimeProofGap != null && safeReportText(f.runtimeProofGap) && <><dt>Proof gap</dt><dd>{safeReportText(f.runtimeProofGap)}</dd></>}
                   {(f.chainFactIds?.length ?? 0) > 0 && <><dt>Linked facts</dt><dd>{plural(f.chainFactIds!.length, 'recorded fact')}</dd></>}
                 </dl>
               </Disclosure>}
               {(rt || canRetest) && <div className="mb-2.5 flex items-center gap-2 rounded-[7px] bg-sunk px-2.5 py-2 text-[12px] leading-[19px] text-fg-muted shadow-[inset_0_0_0_1px_var(--line)]">
                 {rt ? <><StatusGlyph status={rt.verdict === 'fixed' ? 'complete' : rt.verdict === 'reproduced' ? 'failed' : 'inconclusive'} />
-                  <span><b className="font-medium text-fg">{retestVerdictLabels[rt.verdict]}</b> <span className="text-fg-subtle">· {rt.summary} · {fmtDate(rt.createdAt)}</span></span></>
+                  <span><b className="font-medium text-fg">{retestVerdictLabels[rt.verdict] ?? safeReportText(rt.verdict)}</b> <span className="text-fg-subtle">· {safeReportText(rt.summary)} · {fmtDate(rt.createdAt)}</span></span></>
                   : <span className="text-fg-subtle">An automated replay check is ready for fix verification.</span>}
                 {canRetest && <button type="button" className={cn(runBtn(), 'ml-auto')} disabled={pending > 0 || queued}
                   onClick={e => { e.stopPropagation(); void send({ action: 'retest_finding', findingId: f.id }).then(() => toast.show('Verify Fix queued', { icon: 'replay', sub: f.title }), () => {}) }}>
@@ -338,7 +417,7 @@ function ReportDoc({ rep, versions, setVersion }: { rep: Rep; versions: number[]
               </div>}
               <div className="-ml-[9px] flex flex-wrap gap-0.5">
                 {f.evidenceIds.map(id => <button key={id} type="button" className={cn(runBtn({ variant: 'ghost' }), 'max-w-full')} onClick={() => ev(id)}><Icon name="fact" /><span className="truncate">{evidenceTitle(id)}</span></button>)}
-                {rt?.evidenceIds.map(id => <button key={'rt' + id} type="button" className={cn(runBtn({ variant: 'ghost' }), 'max-w-full')} onClick={() => ev(id)}><Icon name="replay" />Retest evidence</button>)}
+                {rtEvidenceIds.map(id => <button key={'rt' + id} type="button" className={cn(runBtn({ variant: 'ghost' }), 'max-w-full')} onClick={() => ev(id)}><Icon name="replay" />Retest evidence</button>)}
                 {canPatch && <button type="button" className={cn(runBtn({ variant: 'ghost' }), 'max-w-full')} disabled={patching === f.id} onClick={() => void patch(f)}><Icon name="edit" />{patching === f.id ? 'Generating patch…' : 'Generate verified patch'}</button>}
                 {live && <button type="button" className={cn(runBtn({ variant: 'ghost' }), 'max-w-full')} onClick={() => links.finding(f.id)}>Open in Findings<Icon name="arrowR" /></button>}
               </div>
@@ -358,13 +437,13 @@ function ReportDoc({ rep, versions, setVersion }: { rep: Rep; versions: number[]
           <th className="whitespace-nowrap border-b border-line px-1 py-1.5 text-right text-[11.5px] font-medium text-fg-subtle">Evidence</th>
         </tr></thead>
         <tbody>{checkRows.map(cv => {
-          const map = new Map((cv.checks ?? []).map(ch => [ch.id as string, ch]))
+          const map = new Map((Array.isArray(cv.checks) ? cv.checks : []).filter(Boolean).map(ch => [ch.id as string, ch]))
           return <tr key={cv.origin}>
-            <td className="max-w-[220px] truncate whitespace-nowrap border-b border-line px-1 py-1 text-left font-mono text-[12px] text-fg-muted">{host(cv.origin)}</td>
+            <td className="max-w-[220px] truncate whitespace-nowrap border-b border-line px-1 py-1 text-left font-mono text-[12px] text-fg-muted">{cv.origin ? host(cv.origin) : 'unknown'}</td>
             {checks.map(id => {
               const ch = map.get(id)
               const st = ch?.status ?? 'not-applicable'
-              return <td key={id} className="whitespace-nowrap border-b border-line px-1 py-1 text-center" title={`${ch?.title ?? id}: ${checkLabels[st as keyof typeof checkLabels] ?? st}${ch?.observed ? ' — observed ' + ch.observed : ''}${ch ? '\nExpected: ' + ch.expected + '\n' + ch.reason : ''}`}>
+              return <td key={id} className="whitespace-nowrap border-b border-line px-1 py-1 text-center" title={`${safeReportText(ch?.title, id)}: ${checkLabels[st as keyof typeof checkLabels] ?? st}${ch?.observed != null ? ' — observed ' + safeReportText(ch.observed) : ''}${ch ? '\nExpected: ' + safeReportText(ch.expected) + '\n' + safeReportText(ch.reason) : ''}`}>
                 <span className="mx-auto inline-flex size-3.5 items-center justify-center"><StatusGlyph status={checkGlyph(st)} /></span>
               </td>
             })}
@@ -396,7 +475,7 @@ function ReportDoc({ rep, versions, setVersion }: { rep: Rep; versions: number[]
           {CATS.map(c => {
             const x = cats.get(c[0])
             const st = x?.status ?? 'untested'
-            return <td key={c[0]} className="whitespace-nowrap border-b border-line px-0.5 py-[3px] text-center" title={`${c[1]}: ${COV_L[st]}${x ? '\n' + x.summary : ''}${x?.enforcingControl ? '\nControl: ' + x.enforcingControl : ''}${x?.proofGapReason ? '\nProof gap: ' + x.proofGapReason : ''}`}>
+            return <td key={c[0]} className="whitespace-nowrap border-b border-line px-0.5 py-[3px] text-center" title={`${c[1]}: ${COV_L[st]}${x ? '\n' + safeReportText(x.summary) : ''}${x?.enforcingControl ? '\nControl: ' + safeReportText(x.enforcingControl) : ''}${x?.proofGapReason ? '\nProof gap: ' + safeReportText(x.proofGapReason) : ''}`}>
               <button
                 type="button"
                 className="inline-grid h-auto cursor-pointer place-items-center rounded-[4px] border-0 bg-transparent p-0.5 shadow-none transition-transform duration-[var(--d1)] ease-kovo hover:-translate-y-px hover:bg-transparent"
@@ -413,43 +492,50 @@ function ReportDoc({ rep, versions, setVersion }: { rep: Rep; versions: number[]
 
     {threat.length > 0 && <>
       <h2 className={H2}>Threat model ranking</h2>
-      <table className="w-full border-collapse"><tbody>{(allT ? threat : threat.slice(0, 8)).map((e, i) => <tr key={e.origin} className="cursor-pointer hover:bg-hover" onClick={() => links.host(e.origin)}>
-        <td className="w-[22px] border-b border-line pb-[7px] pt-[9px] align-top text-[11.5px] tabular-nums text-fg-faint">{i + 1}</td>
-        <td className="w-[26px] border-b border-line pb-[7px] pt-2.5 align-top"><TierBars tier={e.riskTier as RiskTier} /></td>
-        <td className="border-b border-line py-[7px] align-top">
-          <div className="text-fg"><span className="font-mono text-[12px]">{host(e.origin)}</span> <span className="text-fg-subtle">· {RISKL[e.riskTier as RiskTier] ?? e.riskTier}</span></div>
-          <div className="mt-0.5 text-[12px] leading-[18px] text-fg-subtle">{e.rationale}</div>
-          {e.surfaceTags.length > 0 && <div className="mb-0.5 mt-1.5 flex flex-wrap gap-[5px]">{e.surfaceTags.slice(0, 6).map(t => <Tag key={t}>{t}</Tag>)}</div>}
-        </td>
-      </tr>)}</tbody></table>
+      <table className="w-full border-collapse"><tbody>{(allT ? threat : threat.slice(0, 8)).map((e, i) => {
+        const surfaceTags = Array.isArray(e.surfaceTags) ? e.surfaceTags.filter(Boolean) : []
+        return <tr key={e.origin ?? String(i)} className="cursor-pointer hover:bg-hover" onClick={() => e.origin && links.host(e.origin)}>
+          <td className="w-[22px] border-b border-line pb-[7px] pt-[9px] align-top text-[11.5px] tabular-nums text-fg-faint">{i + 1}</td>
+          <td className="w-[26px] border-b border-line pb-[7px] pt-2.5 align-top"><TierBars tier={e.riskTier as RiskTier} /></td>
+          <td className="border-b border-line py-[7px] align-top">
+            <div className="text-fg"><span className="font-mono text-[12px]">{e.origin ? host(e.origin) : 'unknown'}</span> <span className="text-fg-subtle">· {RISKL[e.riskTier as RiskTier] ?? safeReportText(e.riskTier)}</span></div>
+            <div className="mt-0.5 text-[12px] leading-[18px] text-fg-subtle">{safeReportText(e.rationale)}</div>
+            {surfaceTags.length > 0 && <div className="mb-0.5 mt-1.5 flex flex-wrap gap-[5px]">{surfaceTags.slice(0, 6).map(t => <Tag key={safeReportText(t)}>{safeReportText(t)}</Tag>)}</div>}
+          </td>
+        </tr>
+      })}</tbody></table>
       {threat.length > 8 && <button type="button" className={cn(runBtn({ variant: 'link', size: 'none' }), 'mt-1')} onClick={() => setAllT(v => !v)}>{allT ? 'Show the top 8' : `Show all ${threat.length} ranked hosts`}</button>}
     </>}
 
     {gapsOpen.length > 0 && <>
       <h2 className={H2}>Open proof gaps</h2>
-      <table className="w-full border-collapse"><tbody>{gapsOpen.map((g, i) => <tr key={g.origin + g.category + i} className="cursor-pointer hover:bg-hover" onClick={() => links.cell(g.origin, g.category)}>
+      <table className="w-full border-collapse"><tbody>{gapsOpen.map((g, i) => <tr key={safeReportText(g.origin) + safeReportText(g.category) + i} className="cursor-pointer hover:bg-hover" onClick={() => links.cell(g.origin, g.category)}>
         <td className="w-[26px] border-b border-line pb-[7px] pt-2.5 align-top"><StatusGlyph status="needs_follow_up" /></td>
         <td className="border-b border-line py-[7px] align-top">
-          <div className="text-fg">{g.proofGapReason}</div>
-          <div className="text-[12px] text-fg-subtle"><span className="font-mono">{host(g.origin)}</span> · {owaspCategoryTitles[g.category as keyof typeof owaspCategoryTitles] ?? prettyCat(g.category)}{g.summary !== g.proofGapReason ? ' · ' + g.summary : ''}</div>
+          <div className="text-fg">{safeReportText(g.proofGapReason)}</div>
+          <div className="text-[12px] text-fg-subtle"><span className="font-mono">{g.origin ? host(g.origin) : 'unknown'}</span> · {owaspCategoryTitles[g.category as keyof typeof owaspCategoryTitles] ?? prettyCat(g.category)}{g.summary && g.summary !== g.proofGapReason ? ' · ' + safeReportText(g.summary) : ''}</div>
         </td>
       </tr>)}</tbody></table>
     </>}
 
     {patches.length > 0 && <>
       <h2 className={H2}>Verified patch diffs</h2>
-      {patches.map(p => <div key={p.id} className="border-b border-line py-2.5">
-        <div className="mb-1.5 text-[13px] text-fg"><b className="font-medium">{titleById.get(p.findingId) ?? p.findingId}</b><span className="font-mono text-[12px] text-fg-subtle"> · {p.repo}</span></div>
-        <div className="mb-2.5 mt-0.5 flex flex-wrap gap-[5px]">
-          <Tag tone={p.status === 'withheld' || p.status === 'rejected' ? 'warn' : p.status === 'approved' ? 'accent' : undefined}>{patchStatusLabels[p.status]}</Tag>
-          <Tag>{callerCompatibilityLabels[p.callerCompatibility]}</Tag>
-          <Tag>{dynamicRetestLabels[p.dynamicRetestVerdict]}</Tag>
+      {patches.map(p => {
+        const patchLocations = Array.isArray(p.codeLocations) ? p.codeLocations.filter(Boolean) : []
+        const patchDiff = typeof p.diff === 'string' ? p.diff : ''
+        return <div key={p.id} className="border-b border-line py-2.5">
+          <div className="mb-1.5 text-[13px] text-fg"><b className="font-medium">{titleById.get(p.findingId) ?? p.findingId}</b><span className="font-mono text-[12px] text-fg-subtle"> · {safeReportText(p.repo)}</span></div>
+          <div className="mb-2.5 mt-0.5 flex flex-wrap gap-[5px]">
+            <Tag tone={p.status === 'withheld' || p.status === 'rejected' ? 'warn' : p.status === 'approved' ? 'accent' : undefined}>{patchStatusLabels[p.status] ?? safeReportText(p.status)}</Tag>
+            <Tag>{callerCompatibilityLabels[p.callerCompatibility] ?? safeReportText(p.callerCompatibility)}</Tag>
+            <Tag>{dynamicRetestLabels[p.dynamicRetestVerdict] ?? safeReportText(p.dynamicRetestVerdict)}</Tag>
+          </div>
+          {patchLocations.length > 0 && <p className={cn(DOC_P, 'font-mono text-[12px] text-fg-subtle')}>{patchLocations.map(l => `${safeReportText(l.file)}:${l.startLine ?? 0}-${l.endLine ?? 0}`).join(', ')}</p>}
+          {p.status === 'approved' && patchDiff.trim() ? <pre className={RW.pre}>{patchDiff}</pre>
+            : p.status === 'withheld' ? <p className={cn(DOC_P, 'text-fg-subtle')}>Diff withheld automatically because the independent patch reviewer flagged caller compatibility or a gate failure.</p> : null}
+          <PatchProposalReview runId={detail.run.id} proposal={p} onReviewed={refresh} />
         </div>
-        {p.codeLocations.length > 0 && <p className={cn(DOC_P, 'font-mono text-[12px] text-fg-subtle')}>{p.codeLocations.map(l => `${l.file}:${l.startLine}-${l.endLine}`).join(', ')}</p>}
-        {p.status === 'approved' && p.diff.trim() ? <pre className={RW.pre}>{p.diff}</pre>
-          : p.status === 'withheld' ? <p className={cn(DOC_P, 'text-fg-subtle')}>Diff withheld automatically because the independent patch reviewer flagged caller compatibility or a gate failure.</p> : null}
-        <PatchProposalReview runId={detail.run.id} proposal={p} onReviewed={refresh} />
-      </div>)}
+      })}
     </>}
 
     {b.gaps.length > 0 && <>
