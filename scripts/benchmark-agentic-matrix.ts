@@ -100,6 +100,8 @@ export interface MatrixArgs {
   maxInFlightStreams?: number
   /** Per-cell prepared data-dir override (gate-routed profiles); keyed by cell label. */
   dataDirOverrides?: Record<string, string>
+  /** Host read-only credentials directory forwarded via `KOVO_CREDENTIALS_DIR` to child cells. */
+  credentialsDirOverride?: string
   /** Explicit dev-2 debugging escape hatch for burned seeds; always stamps non-certifying. */
   allowBurnedDev?: boolean
   /** True when the invocation qualifies as a certifying held-out run (n >= 3 fresh unburned seeds, non-smoke). */
@@ -574,7 +576,8 @@ function childEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
  */
 export function cellEnv(
   cell: MatrixCell,
-  args: Pick<MatrixArgs, 'dataDir' | 'outDir' | 'warmWorkers' | 'modelGate' | 'dataDirOverrides'>,
+  args: Pick<MatrixArgs, 'dataDir' | 'outDir' | 'warmWorkers' | 'modelGate' | 'dataDirOverrides'>
+    & Partial<Pick<MatrixArgs, 'noLlm' | 'credentialsDirOverride'>>,
   base: NodeJS.ProcessEnv = process.env,
 ): NodeJS.ProcessEnv {
   const id = cellLabel(cell.label)
@@ -585,6 +588,9 @@ export function cellEnv(
   if (!args.modelGate) env.KOVO_MODEL_GATE = '0'
   if (args.dataDir) {
     env.KOVO_DATA_DIR = args.dataDirOverrides?.[cell.label] ?? resolve(args.outDir, 'data', cell.label)
+    if (!args.noLlm && !env.KOVO_CREDENTIALS_DIR?.trim()) {
+      env.KOVO_CREDENTIALS_DIR = args.credentialsDirOverride ?? resolve(args.dataDir, 'credentials')
+    }
   }
   return env
 }
@@ -970,7 +976,8 @@ Exit codes: 0 clean, 2 fail-closed configuration/inert/lock, 1 cell failure.
 
 /**
  * Prepare a gate-routed source data dir per cell. The child still isolates again from this dir;
- * only enabled profile endpoints change (credentials stay symlinked, never copied).
+ * only enabled profile endpoints change (credentials stay in the real host directory and are
+ * referenced read-only via `KOVO_CREDENTIALS_DIR`, never copied or symlinked).
  */
 export function prepareGatedCellDataDirs(args: MatrixArgs, gate: ModelGate): Record<string, string> {
   const overrides: Record<string, string> = {}
@@ -1144,7 +1151,15 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
     if (!args.noLlm && args.modelGate !== false) {
       gate = new ModelGate({ maxInFlightStreams: args.maxInFlightStreams ?? 28 })
       await gate.start()
-      args = { ...args, dataDirOverrides: prepareGatedCellDataDirs(args, gate) }
+      const dataDirOverrides = prepareGatedCellDataDirs(args, gate)
+      const credentialsDirOverride = process.env.KOVO_CREDENTIALS_DIR?.trim()
+        ? resolve(process.env.KOVO_CREDENTIALS_DIR.trim())
+        : (args.dataDir ? resolve(args.dataDir, 'credentials') : undefined)
+      args = {
+        ...args,
+        dataDirOverrides,
+        ...(credentialsDirOverride ? { credentialsDirOverride } : {}),
+      }
       process.stdout.write(`[matrix] model gate 127.0.0.1:${gate.port} maxInFlight=${gate.stats().limit}\n`)
     }
     reaper.install()
