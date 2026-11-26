@@ -25,7 +25,6 @@ import type {
   StaticCodeLead,
 } from './program-graph.ts'
 import {
-  SNAPSHOT_GRAPH_SOURCE_EXTS,
   SNAPSHOT_SEMANTIC_SOURCE_EXTS,
   snapshotSourceFiles,
   type StaticWorkspaceSnapshot,
@@ -167,6 +166,9 @@ export interface CallGraphNode {
   guards: string[]
   sanitizers: string[]
   calls: string[]
+  /** Sink taint qualification when source is available (`false` = constant/parameterized/safe). */
+  taintQualified?: boolean
+  taintReason?: string
 }
 
 export interface CallGraphEdge {
@@ -206,6 +208,9 @@ export interface SinkBackwardPath {
   isInjectionUnsanitized: boolean
   /** Either independent finding above (aggregate, backwards-compatible). */
   isUnguardedPath: boolean
+  /** Source-backed taint qualification (`false` = provably constant/parameterized/safe sink). */
+  taintQualified?: boolean
+  taintReason?: string
 }
 
 export interface SemanticAuditSuspect {
@@ -658,56 +663,45 @@ function detectRepoStackFromSnippets(snippets: ReadonlyArray<{ file: string; exc
   return { frameworks, ormLibraries, authLibraries }
 }
 
-function collectRepoContextFromSnapshot(
-  snapshot: StaticWorkspaceSnapshot,
-  cleanRepo: string,
-): RepoContextSummary {
-  const files = snapshotSourceFiles(snapshot, {
-    extensions: SNAPSHOT_SEMANTIC_SOURCE_EXTS,
-    repoPrefix: cleanRepo,
-  }).slice(0, 400)
+const EXT_TO_LANG: Record<string, string> = {
+  '.ts': 'typescript', '.tsx': 'typescript',
+  '.js': 'javascript', '.jsx': 'javascript', '.mjs': 'javascript', '.cjs': 'javascript',
+  '.py': 'python', '.go': 'go', '.java': 'java', '.php': 'php', '.rb': 'ruby',
+}
 
-  const relevance = (relPath: string): number => {
-    const rel = relPath.toLowerCase()
-    let score = 0
-    if (/(route|router|controller|handler|endpoint|api)/.test(rel)) score += 8
-    if (/(middleware|auth|session|login|jwt|oauth|permission|rbac|acl)/.test(rel)) score += 7
-    if (/(db|database|orm|query|repository|model|schema|migration)/.test(rel)) score += 5
-    if (/(graphql|resolver|trpc)/.test(rel)) score += 6
-    if (/(server|app|main|index)\./.test(rel)) score += 3
-    if (/(test|spec|mock|fixture)/.test(rel)) score -= 7
-    if (/(readme|license|changelog|docs?\/)/.test(rel)) score -= 8
-    return score
-  }
+function fileSecurityRelevance(relPath: string): number {
+  const rel = relPath.toLowerCase()
+  let score = 0
+  if (/(route|router|controller|handler|endpoint|api)/.test(rel)) score += 8
+  if (/(middleware|auth|session|login|jwt|oauth|permission|rbac|acl)/.test(rel)) score += 7
+  if (/(db|database|orm|query|repository|model|schema|migration)/.test(rel)) score += 5
+  if (/(graphql|resolver|trpc)/.test(rel)) score += 6
+  if (/(server|app|main|index)\./.test(rel)) score += 3
+  if (/(test|spec|mock|fixture)/.test(rel)) score -= 7
+  if (/(readme|license|changelog|docs?\/)/.test(rel)) score -= 8
+  return score
+}
 
-  files.sort((a, b) => relevance(b.path) - relevance(a.path) || a.path.localeCompare(b.path))
-
+function collectRepoContextFromSnapshot(snapshot: StaticWorkspaceSnapshot, cleanRepo: string): RepoContextSummary {
+  const files = snapshotSourceFiles(snapshot, { extensions: SNAPSHOT_SEMANTIC_SOURCE_EXTS, repoPrefix: cleanRepo }).slice(0, 400)
+  files.sort((a, b) => fileSecurityRelevance(b.path) - fileSecurityRelevance(a.path) || a.path.localeCompare(b.path))
   const langs = new Set<string>()
   const snippets: Array<{ file: string; excerpt: string }> = []
   let total = 0
   for (const f of files) {
-    const ext = extname(f.path).toLowerCase()
-    if (ext === '.ts' || ext === '.tsx') langs.add('typescript')
-    else if (ext === '.js' || ext === '.jsx' || ext === '.mjs' || ext === '.cjs') langs.add('javascript')
-    else if (ext === '.py') langs.add('python')
-    else if (ext === '.go') langs.add('go')
-    else if (ext === '.java') langs.add('java')
-    else if (ext === '.php') langs.add('php')
-    else if (ext === '.rb') langs.add('ruby')
-
+    const lang = EXT_TO_LANG[extname(f.path).toLowerCase()]
+    if (lang) langs.add(lang)
     if (snippets.length < 40 && total < 44_000 && Buffer.byteLength(f.content, 'utf8') <= 128 * 1024) {
       const txt = f.content.slice(0, 1800)
       snippets.push({ file: f.path, excerpt: txt })
       total += txt.length
     }
   }
-
-  const stack = detectRepoStackFromSnippets(snippets)
   return {
     repo: cleanRepo,
     filesScanned: files.length,
     languages: langs.size ? [...langs] : ['typescript'],
-    ...stack,
+    ...detectRepoStackFromSnippets(snippets),
     snippets,
   }
 }
@@ -719,97 +713,51 @@ export async function collectRepoContextForSpec(
   staticSnapshot?: StaticWorkspaceSnapshot,
 ): Promise<RepoContextSummary> {
   const cleanRepo = normalizeRepoIdentifier(repo)
-  if (staticSnapshot) {
-    return collectRepoContextFromSnapshot(staticSnapshot, cleanRepo)
-  }
+  if (staticSnapshot) return collectRepoContextFromSnapshot(staticSnapshot, cleanRepo)
   const code = `
-import fs from 'node:fs';
-import path from 'node:path';
+import fs from 'node:fs'; import path from 'node:path';
 const repoRoot = path.resolve('/repos', ${JSON.stringify(cleanRepo)});
-const skip = new Set(['node_modules', '.git', 'dist', 'build', '.next', '.venv', 'venv', '__pycache__', 'vendor', 'target']);
-const exts = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.py', '.go', '.java', '.php', '.rb', '.json']);
+const skip = new Set(['node_modules','.git','dist','build','.next','.venv','venv','__pycache__','vendor','target']);
+const langMap = ${JSON.stringify(EXT_TO_LANG)};
 const files = [];
-function walk(d) {
+(function walk(d) {
   if (files.length >= 400) return;
-  let ents = [];
-  try { ents = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+  let ents = []; try { ents = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
   for (const e of ents) {
     if (files.length >= 400) break;
-    if (skip.has(e.name)) continue;
+    if (skip.has(e.name) || e.isSymbolicLink()) continue;
     const full = path.join(d, e.name);
-    if (e.isSymbolicLink()) continue;
     if (e.isDirectory()) walk(full);
-    else if (exts.has(path.extname(e.name).toLowerCase())) files.push(full);
+    else { const ext = path.extname(e.name).toLowerCase(); if (ext in langMap || ext === '.json') files.push(full); }
   }
-}
-walk(repoRoot);
-// Security relevance: routes/controllers/middleware/auth/DB/GraphQL first, docs/config last.
-const relevance = (f) => {
-  const rel = path.relative(repoRoot, f).toLowerCase();
-  let score = 0;
-  if (/(route|router|controller|handler|endpoint|api)/.test(rel)) score += 8;
-  if (/(middleware|auth|session|login|jwt|oauth|permission|rbac|acl)/.test(rel)) score += 7;
-  if (/(db|database|orm|query|repository|model|schema|migration)/.test(rel)) score += 5;
-  if (/(graphql|resolver|trpc)/.test(rel)) score += 6;
-  if (/(server|app|main|index)\\./.test(rel)) score += 3;
-  if (/(test|spec|mock|fixture)/.test(rel)) score -= 7;
-  if (/(readme|license|changelog|docs?\\/)/.test(rel)) score -= 8;
-  return score;
+})(repoRoot);
+const relScore = (f) => {
+  const r = path.relative(repoRoot, f).toLowerCase();
+  return (/(route|router|controller|handler|endpoint|api)/.test(r)?8:0)+(/(middleware|auth|session|login|jwt|oauth|permission|rbac|acl)/.test(r)?7:0)+(/(db|database|orm|query|repository|model|schema|migration)/.test(r)?5:0)+(/(graphql|resolver|trpc)/.test(r)?6:0)+(/(server|app|main|index)\\./.test(r)?3:0)-(/(test|spec|mock|fixture)/.test(r)?7:0)-(/(readme|license|changelog|docs?\\/)/.test(r)?8:0);
 };
-files.sort((a, b) => relevance(b) - relevance(a) || a.localeCompare(b));
-const langs = new Set();
-const snippets = [];
-let total = 0;
+files.sort((a, b) => relScore(b) - relScore(a) || a.localeCompare(b));
+const langs = new Set(), snippets = []; let total = 0;
 for (const f of files) {
-  const rel = path.relative(repoRoot, f);
-  const ext = path.extname(f).toLowerCase();
-  if (['.ts','.tsx'].includes(ext)) langs.add('typescript');
-  else if (['.js','.jsx','.mjs','.cjs'].includes(ext)) langs.add('javascript');
-  else if (ext === '.py') langs.add('python');
-  else if (ext === '.go') langs.add('go');
-  else if (ext === '.java') langs.add('java');
-  else if (ext === '.php') langs.add('php');
-  else if (ext === '.rb') langs.add('ruby');
+  const lang = langMap[path.extname(f).toLowerCase()]; if (lang) langs.add(lang);
   if (snippets.length < 40 && total < 44000) {
-    try {
-      const st = fs.lstatSync(f);
-      if (st.size <= 128 * 1024) {
-        const txt = fs.readFileSync(f, 'utf8').slice(0, 1800);
-        snippets.push({ file: rel, excerpt: txt });
-        total += txt.length;
-      }
-    } catch {}
+    try { if (fs.lstatSync(f).size <= 128*1024) { const txt = fs.readFileSync(f, 'utf8').slice(0, 1800); snippets.push({ file: path.relative(repoRoot, f), excerpt: txt }); total += txt.length; } } catch {}
   }
 }
 process.stdout.write(JSON.stringify({ filesScanned: files.length, languages: [...langs], snippets }));
 `
   try {
     const res = await session.runScript({ runtime: 'node', code, timeoutMs: 20_000 }, signal)
-    const parsed = JSON.parse(res.stdout || '{}') as {
-      filesScanned?: number
-      languages?: string[]
-      snippets?: Array<{ file: string; excerpt: string }>
-    }
+    const parsed = JSON.parse(res.stdout || '{}') as { filesScanned?: number; languages?: string[]; snippets?: Array<{ file: string; excerpt: string }> }
     const snippets = Array.isArray(parsed.snippets) ? parsed.snippets : []
-    const stack = detectRepoStackFromSnippets(snippets)
-
     return {
       repo: cleanRepo,
       filesScanned: Number(parsed.filesScanned ?? snippets.length),
       languages: Array.isArray(parsed.languages) && parsed.languages.length ? parsed.languages : ['typescript'],
-      ...stack,
+      ...detectRepoStackFromSnippets(snippets),
       snippets,
     }
   } catch {
-    return {
-      repo: cleanRepo,
-      filesScanned: 0,
-      languages: ['typescript'],
-      frameworks: [],
-      ormLibraries: [],
-      authLibraries: [],
-      snippets: [],
-    }
+    return { repo: cleanRepo, filesScanned: 0, languages: ['typescript'], frameworks: [], ormLibraries: [], authLibraries: [], snippets: [] }
   }
 }
 
@@ -1023,54 +971,8 @@ export async function runValidatedDynamicRulesInWorker(
     engine: 'opengrep' | 'ast-grep',
     engineRules: ReadonlyArray<ValidatedDynamicRule>,
   ): string => {
-    const items = engineRules.map(r => ({
-      id: r.spec.id,
-      cwe: r.spec.cwe,
-      yaml: r.yaml,
-    }))
-    if (engine === 'opengrep') {
-      return `
-import fs from 'node:fs';
-import path from 'node:path';
-import { execFileSync } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
-const repoRoot = path.resolve('/repos', ${JSON.stringify(cleanRepo)});
-const rules = ${JSON.stringify(items)};
-const findings = [];
-const tmpFiles = [];
-try {
-  fs.mkdirSync('/tmp/.config', { recursive: true });
-  fs.mkdirSync('/tmp/.cache', { recursive: true });
-  for (const rule of rules) {
-    const p = '/tmp/kovo-dyn-og-' + randomUUID() + '.yaml';
-    tmpFiles.push(p);
-    fs.writeFileSync(p, rule.yaml, { mode: 0o600 });
-    try {
-      const out = execFileSync('opengrep', ['scan', '--config', p, '--json', '--no-git-ignore', '--quiet', repoRoot], {
-        encoding: 'utf8', timeout: 45000, maxBuffer: 4 * 1024 * 1024,
-        env: { ...process.env, HOME: '/tmp', XDG_CONFIG_HOME: '/tmp/.config', XDG_CACHE_HOME: '/tmp/.cache', OPENGREP_SEND_METRICS: 'off' }
-      });
-      const parsed = JSON.parse(out || '{}');
-      for (const r of parsed.results || []) {
-        const sevRaw = String(r.extra?.severity || '').toLowerCase();
-        const severity = sevRaw === 'error' ? 'high' : sevRaw === 'warning' ? 'medium' : 'info';
-        findings.push({
-          engine: 'opengrep', ruleId: String(r.check_id || rule.id), severity,
-          file: path.relative(repoRoot, r.path || ''), line: Number(r.start?.line || 1),
-          endLine: r.end?.line ? Number(r.end.line) : undefined,
-          message: String(r.extra?.message || 'Dynamic rule match').slice(0, 400),
-          maskedPreview: String(r.extra?.lines || '').trim().slice(0, 240),
-          cwe: rule.cwe || undefined,
-        });
-      }
-    } catch {}
-  }
-} finally {
-  for (const f of tmpFiles) { try { fs.unlinkSync(f); } catch {} }
-}
-process.stdout.write(JSON.stringify(findings));
-`
-    }
+    const items = engineRules.map(r => ({ id: r.spec.id, cwe: r.spec.cwe, yaml: r.yaml }))
+    const isOg = engine === 'opengrep'
     return `
 import fs from 'node:fs';
 import path from 'node:path';
@@ -1078,27 +980,48 @@ import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 const repoRoot = path.resolve('/repos', ${JSON.stringify(cleanRepo)});
 const rules = ${JSON.stringify(items)};
+const isOg = ${JSON.stringify(isOg)};
 const findings = [];
 const tmpFiles = [];
 try {
+  if (isOg) { fs.mkdirSync('/tmp/.config', { recursive: true }); fs.mkdirSync('/tmp/.cache', { recursive: true }); }
   for (const rule of rules) {
-    const p = '/tmp/kovo-dyn-sg-' + randomUUID() + '.yaml';
+    const p = '/tmp/kovo-dyn-' + (isOg ? 'og-' : 'sg-') + randomUUID() + '.yaml';
     tmpFiles.push(p);
     fs.writeFileSync(p, rule.yaml, { mode: 0o600 });
     try {
-      const out = execFileSync('ast-grep', ['scan', '--rule', p, '--json=compact', repoRoot], {
-        encoding: 'utf8', timeout: 45000, maxBuffer: 4 * 1024 * 1024
-      });
-      const arr = JSON.parse(out || '[]');
-      for (const m of Array.isArray(arr) ? arr : []) {
-        findings.push({
-          engine: 'ast-grep', ruleId: String(m.ruleId || rule.id), severity: 'high',
-          file: path.relative(repoRoot, m.file || ''), line: Number(m.range?.start?.line || 0) + 1,
-          endLine: m.range?.end?.line !== undefined ? Number(m.range.end.line) + 1 : undefined,
-          message: String(m.message || 'Dynamic ast-grep match').slice(0, 400),
-          maskedPreview: String(m.text || '').trim().replace(/\\s+/g, ' ').slice(0, 240),
-          cwe: rule.cwe || undefined,
-        });
+      const args = isOg
+        ? ['scan', '--config', p, '--json', '--no-git-ignore', '--quiet', repoRoot]
+        : ['scan', '--rule', p, '--json=compact', repoRoot];
+      const opts = {
+        encoding: 'utf8', timeout: 45000, maxBuffer: 4 * 1024 * 1024,
+        ...(isOg ? { env: { ...process.env, HOME: '/tmp', XDG_CONFIG_HOME: '/tmp/.config', XDG_CACHE_HOME: '/tmp/.cache', OPENGREP_SEND_METRICS: 'off' } } : {}),
+      };
+      const parsed = JSON.parse(execFileSync(isOg ? 'opengrep' : 'ast-grep', args, opts) || (isOg ? '{}' : '[]'));
+      if (isOg) {
+        for (const r of parsed.results || []) {
+          const sevRaw = String(r.extra?.severity || '').toLowerCase();
+          findings.push({
+            engine: 'opengrep', ruleId: String(r.check_id || rule.id),
+            severity: sevRaw === 'error' ? 'high' : sevRaw === 'warning' ? 'medium' : 'info',
+            file: path.relative(repoRoot, r.path || ''), line: Number(r.start?.line || 1),
+            endLine: r.end?.line ? Number(r.end.line) : undefined,
+            message: String(r.extra?.message || 'Dynamic rule match').slice(0, 400),
+            maskedPreview: String(r.extra?.lines || '').trim().slice(0, 240),
+            cwe: rule.cwe || undefined,
+          });
+        }
+      } else {
+        for (const m of Array.isArray(parsed) ? parsed : []) {
+          findings.push({
+            engine: 'ast-grep', ruleId: String(m.ruleId || rule.id), severity: 'high',
+            file: path.relative(repoRoot, m.file || ''), line: Number(m.range?.start?.line || 0) + 1,
+            endLine: m.range?.end?.line !== undefined ? Number(m.range.end.line) + 1 : undefined,
+            message: String(m.message || 'Dynamic ast-grep match').slice(0, 400),
+            maskedPreview: String(m.text || '').trim().replace(/\\s+/g, ' ').slice(0, 240),
+            cwe: rule.cwe || undefined,
+          });
+        }
       }
     } catch {}
   }
@@ -1134,238 +1057,267 @@ process.stdout.write(JSON.stringify(findings));
 }
 
 // ============================================================================
-// Stage 2: Atlantis/RepoAudit-Style Backward Traversal & Path Dominance
+// Stage 2: ProgramGraph-Backed Call Graph, Taint-Qualified Sinks & Dominance
 // ============================================================================
 
-const SNAPSHOT_CALL_GRAPH_EXTS: ReadonlySet<string> = new Set([
-  ...SNAPSHOT_GRAPH_SOURCE_EXTS,
-  '.php',
-])
+const SINK_CALL_PATTERNS: Partial<Record<AuditSinkKind, RegExp>> = {
+  db_query: /(?:\.[ \t]{0,8}(?:query|execute|raw|exec|prepare|queryRow|executeQuery|executeUpdate)|\$queryRawUnsafe|\$executeRawUnsafe|queryRaw|executeRaw|createQuery|createNativeQuery|findBySql|whereRaw|havingRaw|orderByRaw|unsafeExec|rawExec|execSql|sql\.raw|text|from_statement)[ \t]{0,8}\(/i,
+  outbound_fetch: /\b(?:fetch|axios(?:\.[A-Za-z]{1,16})?|got|superagent|http\.(?:get|request|Get|Post|NewRequest)|https\.(?:get|request)|requests\.(?:get|post|put|delete|request)|urllib\.request\.urlopen|session\.(?:get|post))[ \t]{0,8}\(/,
+  redirect: /\b(?:res\.redirect|NextResponse\.redirect|sendRedirect|Redirect|redirect)[ \t]{0,8}\(/,
+  upload_storage: /\b(?:readFileSync|readFile|writeFileSync|writeFile|createReadStream|createWriteStream|FileInputStream|Files\.(?:read|write|newInputStream)|os\.(?:Open|ReadFile|WriteFile)|open)[ \t]{0,8}\(/,
+  other: /\b(?:execSync|execFile|exec|spawnSync|spawn|os\.system|subprocess\.(?:run|call|Popen|check_output)|render_template_string|render_template|ejs\.render|pug\.render|res\.render|renderTemplate|renderToString|render|sendFile|system)[ \t]{0,8}\(/,
+}
+const SAFE_TAGGED_SQL_RE = /(?:\$queryRaw|\$executeRaw|\bsql)[ \t]*`/
+const UNSAFE_RAW_SQL_RE = /(?:\$queryRawUnsafe|\$executeRawUnsafe|sql\.raw|whereRaw|havingRaw|orderByRaw|unsafeExec|rawExec|execSql)\s*\(/i
+const UNTRUSTED_INPUT_RE = /\b(?:req\.(?:params|query|body|headers|cookies|url|originalUrl|path|file|files)|request\.(?:args|form|json|data|values|headers|cookies|GET|POST|query_params)|ctx\.(?:request|params|query|body)|searchParams\.get|formData\s*\(|c\.(?:Param|Query|PostForm|ShouldBind)|r\.URL\.Query|r\.FormValue|chi\.URLParam|getParameter\s*\(|params\s*\[)|@(?:Param|Query|Body|Headers|PathVariable|RequestParam|RequestBody)\b/
+const SANITIZER_CALL_RE = /\b(parseInt|Number|parseFloat|Boolean|encodeURIComponent|path\.basename|DOMPurify\.sanitize|escapeHtml|int|float|strconv\.Atoi|Integer\.parseInt|UUID\.fromString)\s*\(/g
+const DIRECT_SANITIZER_WRAP_RE = /^(?:parseInt|Number|parseFloat|Boolean|encodeURIComponent|path\.basename|int|float|strconv\.Atoi|Integer\.parseInt|UUID\.fromString)\s*\(/
+const DYNAMIC_STRING_OP_RE = /\$\{|\.format\s*\(|fmt\.Sprintf\s*\(|String\.format\s*\(|#\{|^[rfRF]{1,2}["'][\s\S]*\{/
+const CONSTANT_PATH_JOIN_RE = /^(?:path\.)?(?:join|resolve)\s*\(([\s\S]*)\)$/
+const CONSTANT_DIR_TOKEN_RE = /^(?:__dirname|__filename|import\.meta\.dirname|process\.cwd\(\))$/
 
-function buildRepoCallGraphFromSnapshot(
-  snapshot: StaticWorkspaceSnapshot,
-  cleanRepo: string,
-  customGuardPatterns: readonly string[],
-  customSanitizerPatterns: readonly string[],
-  customSinkPatterns: ReadonlyArray<{ pattern: string; sinkKind: AuditSinkKind }>,
-): CallGraphIndex {
-  const files = snapshotSourceFiles(snapshot, {
-    extensions: SNAPSHOT_CALL_GRAPH_EXTS,
-    repoPrefix: cleanRepo,
-  }).slice(0, 400)
-
-  const nodes: CallGraphNode[] = []
-  const edges: CallGraphEdge[] = []
-  const bySym = new Map<string, CallGraphNode[]>()
-
-  for (const f of files) {
-    const rel = f.path
-    const lines = f.content.split('\n')
-    for (let i = 0; i < lines.length; i += 1) {
-      const l = lines[i]!
-      const fnM = l.match(/(?:export\s+)?(?:async\s+)?function\s+([A-Za-z0-9_]+)\s*\(|def\s+([A-Za-z0-9_]+)\s*\(/)
-      const rtM = l.match(/\.(get|post|put|patch|delete)\s*\(\s*["']([^"']+)["']/)
-      const sym = fnM ? (fnM[1] || fnM[2]) : rtM ? `${rtM[1].toUpperCase()} ${rtM[2]}` : null
-      if (!sym) continue
-      const block = lines.slice(i, Math.min(lines.length, i + 25)).join('\n')
-      const guards = customGuardPatterns.filter(p => block.includes(p))
-      const sanitizers = customSanitizerPatterns.filter(p => block.includes(p))
-      const sinkHit = customSinkPatterns.find(sp => block.includes(sp.pattern))
-      const calls = [...block.matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\s*\(/g)].map(m => m[1]!).filter(c => c !== sym)
-      const node: CallGraphNode = {
-        id: `${rel}:${i + 1}:${sym}`,
-        file: rel,
-        line: i + 1,
-        symbol: sym,
-        kind: rtM ? 'entrypoint' : sinkHit ? 'sink' : 'function',
-        ...(rtM ? { httpMethod: rtM[1].toUpperCase(), routePath: rtM[2] } : {}),
-        ...(sinkHit ? { sinkKind: sinkHit.sinkKind } : {}),
-        guards,
-        sanitizers,
-        calls: [...new Set(calls)].slice(0, 30),
-      }
-      nodes.push(node)
-      const existing = bySym.get(sym)
-      if (existing) existing.push(node)
-      else bySym.set(sym, [node])
+/** Single-pass delimiter-aware scanner supporting balanced parens, top-level arg splitting, and operator checks. */
+function scanOutsideQuotes(text: string, from: number, onChar: (ch: string, idx: number, depth: number) => boolean | void): void {
+  let depth = 0
+  let quote: string | null = null
+  for (let i = from; i < text.length; i += 1) {
+    const ch = text[i]!
+    if (quote) {
+      if (ch === '\\') { i += 1; continue }
+      if (ch === quote) quote = null
+      continue
     }
-  }
-
-  for (const caller of nodes) {
-    for (const c of caller.calls) {
-      for (const callee of (bySym.get(c) ?? []).slice(0, 3)) {
-        if (callee.id !== caller.id) {
-          edges.push({ fromId: caller.id, toId: callee.id, file: caller.file, line: caller.line })
-        }
-      }
-    }
-  }
-
-  return {
-    repo: cleanRepo,
-    filesScanned: files.length,
-    nodes,
-    edges,
-    analyzerSource: 'offline_script_fallback',
+    if (ch === '"' || ch === "'" || ch === '`') { quote = ch; continue }
+    if (ch === '(' || ch === '[' || ch === '{') depth += 1
+    else if (ch === ')' || ch === ']' || ch === '}') depth = Math.max(0, depth - 1)
+    if (onChar(ch, i, depth) === true) return
   }
 }
 
+function extractBalancedParen(text: string, openIndex: number): string | null {
+  let result: string | null = null
+  scanOutsideQuotes(text, openIndex, (ch, i, depth) => {
+    if (ch === ')' && depth === 0) { result = text.slice(openIndex + 1, i); return true }
+  })
+  return result
+}
+
+function splitTopLevelArgs(argList: string): string[] {
+  const args: string[] = []
+  let start = 0
+  scanOutsideQuotes(argList, 0, (ch, i, depth) => {
+    if (ch === ',' && depth === 0) { args.push(argList.slice(start, i).trim()); start = i + 1 }
+  })
+  const tail = argList.slice(start).trim()
+  if (tail) args.push(tail)
+  return args
+}
+
+function hasDynamicConcat(expr: string): boolean {
+  if (DYNAMIC_STRING_OP_RE.test(expr)) return true
+  let found = false
+  scanOutsideQuotes(expr, 0, (ch) => { if (ch === '+' || ch === '%') { found = true; return true } })
+  return found
+}
+
+function isStringLiteral(expr: string): boolean {
+  const s = expr.trim()
+  if (s.length < 2) return false
+  if (s[0] === 'r' && (s[1] === '"' || s[1] === "'")) return isStringLiteral(s.slice(1))
+  const q = s[0]
+  if ((q !== '"' && q !== "'" && q !== '`') || s[s.length - 1] !== q) return false
+  for (let i = 1; i < s.length - 1; i += 1) {
+    if (s[i] === '\\') { i += 1; continue }
+    if (s[i] === q || (q === '`' && s[i] === '$' && s[i + 1] === '{')) return false
+  }
+  return true
+}
+
+function isConstantExpr(expr: string): boolean {
+  const s = expr.trim()
+  if (!s || isStringLiteral(s) || /^(?:true|false|null|undefined|\d+(?:\.\d+)?)$/.test(s)) return true
+  const pathJoin = s.match(CONSTANT_PATH_JOIN_RE)
+  if (!pathJoin) return false
+  const parts = splitTopLevelArgs(pathJoin[1]!)
+  return parts.length > 0 && parts.every(p => isStringLiteral(p) || CONSTANT_DIR_TOKEN_RE.test(p.trim()))
+}
+
+function lookupSource(sourceByPath: ReadonlyMap<string, string> | undefined, file: string, repo?: string): string | undefined {
+  return sourceByPath?.get(file) ?? (repo ? sourceByPath?.get(`${repo}/${file}`) : undefined)
+}
+
+interface SinkQualification {
+  qualified: boolean
+  reason?: string
+  sanitizers: string[]
+  directInput: boolean
+  referencedParam?: string
+}
+
+function qualifySinkCallSite(source: string, line: number, sinkKind: AuditSinkKind): SinkQualification {
+  const lines = source.split('\n')
+  const startIdx = Math.max(0, line - 1)
+  const windowText = lines.slice(startIdx, Math.min(lines.length, startIdx + 6)).join('\n')
+  const lineText = lines[startIdx] ?? ''
+
+  if (sinkKind === 'db_query' && SAFE_TAGGED_SQL_RE.test(windowText) && !UNSAFE_RAW_SQL_RE.test(windowText)) {
+    return { qualified: false, sanitizers: [], directInput: false }
+  }
+
+  const match = SINK_CALL_PATTERNS[sinkKind]?.exec(windowText)
+  if (!match) {
+    const dynamic = hasDynamicConcat(lineText)
+    return { qualified: dynamic, ...(dynamic ? { reason: `dynamic ${sinkKind} expression` } : {}), sanitizers: [], directInput: UNTRUSTED_INPUT_RE.test(lineText) }
+  }
+
+  const argList = extractBalancedParen(windowText, match.index + match[0].length - 1)
+  const args = argList !== null ? splitTopLevelArgs(argList) : []
+  if (args.length === 0) return { qualified: false, sanitizers: [], directInput: false }
+
+  let targetArg = args[0]!
+  const callee = match[0]
+  if (sinkKind === 'outbound_fetch') {
+    if (/(?:NewRequest|requests\.request)\s*\($/.test(callee) && args.length >= 2) targetArg = args[1]!
+    else if (targetArg.startsWith('{')) targetArg = targetArg.match(/\burl\s*:\s*([^,}]+)/)?.[1]?.trim() ?? targetArg
+  } else if (sinkKind === 'redirect' && args.length >= 2 && /^\d{3}$/.test(targetArg)) {
+    targetArg = args[1]!
+  }
+
+  if (isConstantExpr(targetArg)) return { qualified: false, sanitizers: [], directInput: false }
+  if (sinkKind === 'db_query' && (/^[A-Z][A-Za-z0-9_]*$/.test(targetArg) || targetArg.startsWith('{'))) {
+    return { qualified: false, sanitizers: [], directInput: false }
+  }
+
+  const sanitizers = [...new Set([...targetArg.matchAll(SANITIZER_CALL_RE)].map(m => m[1]!))]
+  if (DIRECT_SANITIZER_WRAP_RE.test(targetArg) || (sinkKind === 'upload_storage' && /\bpath\.basename\s*\(/.test(targetArg))) {
+    return { qualified: false, sanitizers, directInput: false }
+  }
+
+  let effectiveExpr = targetArg
+  let referencedParam: string | undefined
+  if (/^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(targetArg)) {
+    let rhs: string | undefined
+    for (let i = Math.min(lines.length - 1, line - 2); i >= Math.max(0, line - 80); i -= 1) {
+      const m = lines[i]!.match(/^\s*(?:(?:export\s+)?(?:const|let|var)|final\s+\w+)?\s*([a-zA-Z_$][a-zA-Z0-9_$]*)\s*(?::[^=\n]+)?=\s*(.+)$/)
+      if (m && m[1] === targetArg && !m[2]!.startsWith('=')) { rhs = m[2]!.replace(/;\s*$/, '').trim(); break }
+    }
+    if (rhs !== undefined) {
+      if (isConstantExpr(rhs)) return { qualified: false, sanitizers, directInput: false }
+      effectiveExpr = rhs
+    } else {
+      referencedParam = targetArg
+    }
+  }
+
+  const directInput = UNTRUSTED_INPUT_RE.test(effectiveExpr) || UNTRUSTED_INPUT_RE.test(targetArg)
+  if (sinkKind === 'db_query') {
+    if (hasDynamicConcat(effectiveExpr) || directInput || UNSAFE_RAW_SQL_RE.test(callee)) {
+      return { qualified: true, reason: 'dynamic SQL query construction', sanitizers, directInput, referencedParam }
+    }
+    return referencedParam
+      ? { qualified: true, reason: 'caller-supplied SQL argument', sanitizers, directInput: false, referencedParam }
+      : { qualified: false, sanitizers, directInput: false }
+  }
+
+  const reason = sinkKind === 'outbound_fetch' ? 'dynamic outbound URL'
+    : sinkKind === 'redirect' ? 'dynamic redirect target'
+      : sinkKind === 'upload_storage' ? 'dynamic file path' : 'dynamic command/template argument'
+  return { qualified: true, reason, sanitizers, directInput, referencedParam }
+}
+
+function chainHasUntrustedInput(chain: readonly CallGraphNode[], sourceByPath: ReadonlyMap<string, string>, repo?: string): boolean {
+  for (const node of chain) {
+    if (node.routePath && routeTemplateParamNames(node.routePath).length > 0) return true
+    const src = lookupSource(sourceByPath, node.file, repo)
+    if (!src) continue
+    const lines = src.split('\n')
+    const start = Math.max(0, node.line - 1)
+    // Bound span strictly to the node's own lines (never spill into adjacent handlers in the same file).
+    const defaultSpan = node.kind === 'sink' || node.kind === 'entrypoint' ? 4 : 25
+    const end = Math.min(lines.length, node.endLine ? Math.max(start + 1, node.endLine) : start + defaultSpan)
+    const slice = lines.slice(start, end).join('\n')
+    if (UNTRUSTED_INPUT_RE.test(slice)) return true
+    if (node.kind === 'function' && /\bdef\s+\w+\s*\(\s*[a-zA-Z_]/.test(lines[start] ?? '') && !/\bdef\s+\w+\s*\(\s*(?:self|cls)?\s*\)/.test(lines[start] ?? '')) {
+      return true
+    }
+  }
+  return false
+}
+
+function callerPassesOnlyConstants(caller: CallGraphNode, calleeSymbol: string, sourceByPath: ReadonlyMap<string, string>, repo?: string): boolean {
+  const src = lookupSource(sourceByPath, caller.file, repo)
+  if (!src) return false
+  const lines = src.split('\n')
+  const start = Math.max(0, caller.line - 1)
+  const end = Math.min(lines.length, caller.endLine ? Math.max(start + 1, caller.endLine) : start + 25)
+  const slice = lines.slice(start, end).join('\n')
+  let idx = slice.indexOf(calleeSymbol)
+  while (idx >= 0) {
+    const prev = idx > 0 ? slice[idx - 1]! : ' '
+    let after = idx + calleeSymbol.length
+    while (after < slice.length && (slice[after] === ' ' || slice[after] === '\t')) after += 1
+    if (!/[A-Za-z0-9_$]/.test(prev) && slice[after] === '(') {
+      const argList = extractBalancedParen(slice, after)
+      if (!argList || hasDynamicConcat(argList) || UNTRUSTED_INPUT_RE.test(argList)) return false
+      return splitTopLevelArgs(argList).some(isStringLiteral)
+    }
+    idx = slice.indexOf(calleeSymbol, idx + 1)
+  }
+  return false
+}
+
 export async function buildRepoCallGraph(
-  session: WorkerSession,
+  session: WorkerSession | undefined,
   repo: string,
   spec: ProjectSecuritySpec,
   signal: AbortSignal,
   staticSnapshot?: StaticWorkspaceSnapshot,
+  programGraph?: ProgramGraph,
 ): Promise<CallGraphIndex> {
   const cleanRepo = normalizeRepoIdentifier(repo)
-  const customGuardPatterns = spec.authTenantGuards.flatMap(g => g.patterns).slice(0, 40)
-  const customSanitizerPatterns = spec.sanitizers.flatMap(s => s.patterns).slice(0, 40)
-  const customSinkPatterns = spec.sinks.flatMap(sk =>
-    sk.patterns.map(p => ({ pattern: p, sinkKind: sk.sinkKind })),
-  ).slice(0, 40)
-
-  if (staticSnapshot) {
-    return buildRepoCallGraphFromSnapshot(
-      staticSnapshot,
-      cleanRepo,
-      customGuardPatterns,
-      customSanitizerPatterns,
-      customSinkPatterns,
-    )
+  const req = {
+    repo: cleanRepo,
+    maxDepth: 6,
+    customGuardPatterns: spec.authTenantGuards.flatMap(g => g.patterns).slice(0, 40),
+    customSanitizerPatterns: spec.sanitizers.flatMap(s => s.patterns).slice(0, 40),
+    customSinkPatterns: spec.sinks.flatMap(sk => sk.patterns.map(p => ({ pattern: p, sinkKind: sk.sinkKind }))).slice(0, 40),
   }
+  const effectivePg = programGraph ?? staticSnapshot?.programGraph
+  const programCallGraph = effectivePg && effectivePg.nodes.length > 0
+    ? callGraphFromProgramGraph(effectivePg, { repo: cleanRepo, sourceByPath: staticSnapshot?.sourceByPath })
+    : undefined
 
-  // Prefer dedicated worker op: 'call_graph' or analyze('call-graph')
-  if (typeof session.callGraph === 'function') {
+  // Never silently bypass AST/worker call-graph analyzers when a worker session provides them.
+  let workerGraph: CallGraphIndex | undefined
+  if (session && typeof session.callGraph === 'function') {
     try {
-      const res: CallGraphResult = await session.callGraph({
-        repo: cleanRepo,
-        maxDepth: 6,
-        customGuardPatterns,
-        customSanitizerPatterns,
-        customSinkPatterns,
-      }, signal)
-      return {
-        repo: cleanRepo,
-        filesScanned: res.filesScanned,
-        nodes: res.nodes as CallGraphNode[],
-        edges: res.edges,
-        analyzerSource: 'worker_analyzer',
+      const res: CallGraphResult = await session.callGraph(req, signal)
+      workerGraph = { repo: cleanRepo, filesScanned: res.filesScanned, nodes: res.nodes as CallGraphNode[], edges: res.edges, analyzerSource: 'worker_analyzer' }
+    } catch { /* fall through to analyze / ProgramGraph */ }
+  }
+  if (!workerGraph && session && typeof session.analyze === 'function') {
+    try {
+      const analyzed = await session.analyze('call-graph', req, signal)
+      if (Array.isArray(analyzed.nodes) && Array.isArray(analyzed.edges)) {
+        workerGraph = {
+          repo: cleanRepo,
+          filesScanned: Number(analyzed.filesScanned ?? 0),
+          nodes: analyzed.nodes as CallGraphNode[],
+          edges: analyzed.edges as CallGraphEdge[],
+          analyzerSource: 'worker_analyzer',
+        }
       }
-    } catch {
-      // fall through to analyze / runScript fallback
-    }
+    } catch { /* fall through to ProgramGraph */ }
   }
 
-  try {
-    const analyzed = await session.analyze('call-graph', {
-      repo: cleanRepo,
-      maxDepth: 6,
-      customGuardPatterns,
-      customSanitizerPatterns,
-      customSinkPatterns,
-    }, signal)
-    if (Array.isArray(analyzed.nodes) && Array.isArray(analyzed.edges)) {
-      return {
-        repo: cleanRepo,
-        filesScanned: Number(analyzed.filesScanned ?? 0),
-        nodes: analyzed.nodes as CallGraphNode[],
-        edges: analyzed.edges as CallGraphEdge[],
-        analyzerSource: 'worker_analyzer',
-      }
-    }
-  } catch {
-    // fall back to embedded script indexer inside --network none container
-  }
-
-  const fallbackCode = `
-import fs from 'node:fs';
-import path from 'node:path';
-const repoRoot = path.resolve('/repos', ${JSON.stringify(cleanRepo)});
-const skip = new Set(['node_modules', '.git', 'dist', 'build', '.next', '.venv']);
-const exts = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.py', '.go', '.java', '.php', '.rb']);
-const files = [];
-function walk(d) {
-  if (files.length >= 400) return;
-  let ents = [];
-  try { ents = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
-  for (const e of ents) {
-    if (skip.has(e.name)) continue;
-    const full = path.join(d, e.name);
-    if (e.isSymbolicLink()) continue;
-    if (e.isDirectory()) walk(full);
-    else if (exts.has(path.extname(e.name).toLowerCase())) files.push(full);
-  }
-}
-walk(repoRoot);
-const guardPats = ${JSON.stringify(customGuardPatterns)};
-const sanPats = ${JSON.stringify(customSanitizerPatterns)};
-const sinkPats = ${JSON.stringify(customSinkPatterns)};
-const nodes = [];
-const edges = [];
-const bySym = new Map();
-for (const f of files) {
-  let txt = '';
-  try { txt = fs.readFileSync(f, 'utf8'); } catch { continue; }
-  const rel = path.relative(repoRoot, f);
-  const lines = txt.split('\\n');
-  for (let i = 0; i < lines.length; i += 1) {
-    const l = lines[i];
-    const fnM = l.match(/(?:export\\s+)?(?:async\\s+)?function\\s+([A-Za-z0-9_]+)\\s*\\(|def\\s+([A-Za-z0-9_]+)\\s*\\(/);
-    const rtM = l.match(/\\.(get|post|put|patch|delete)\\s*\\(\\s*["']([^"']+)["']/);
-    const sym = fnM ? (fnM[1] || fnM[2]) : rtM ? (rtM[1].toUpperCase() + ' ' + rtM[2]) : null;
-    if (!sym) continue;
-    const block = lines.slice(i, Math.min(lines.length, i + 25)).join('\\n');
-    const guards = guardPats.filter(p => block.includes(p));
-    const sanitizers = sanPats.filter(p => block.includes(p));
-    const sinkHit = sinkPats.find(sp => block.includes(sp.pattern));
-    const calls = [...block.matchAll(/\\b([A-Za-z_][A-Za-z0-9_]*)\\s*\\(/g)].map(m => m[1]).filter(c => c !== sym);
-    const node = {
-      id: rel + ':' + (i + 1) + ':' + sym,
-      file: rel, line: i + 1, symbol: sym,
-      kind: rtM ? 'entrypoint' : sinkHit ? 'sink' : 'function',
-      ...(rtM ? { httpMethod: rtM[1].toUpperCase(), routePath: rtM[2] } : {}),
-      ...(sinkHit ? { sinkKind: sinkHit.sinkKind } : {}),
-      guards, sanitizers, calls: [...new Set(calls)].slice(0, 30)
-    };
-    nodes.push(node);
-    if (!bySym.has(sym)) bySym.set(sym, []);
-    bySym.get(sym).push(node);
-  }
-}
-for (const caller of nodes) {
-  for (const c of caller.calls) {
-    for (const callee of (bySym.get(c) || []).slice(0, 3)) {
-      if (callee.id !== caller.id) edges.push({ fromId: caller.id, toId: callee.id, file: caller.file, line: caller.line });
-    }
-  }
-}
-process.stdout.write(JSON.stringify({ filesScanned: files.length, nodes, edges }));
-`
-  try {
-    const res = await session.runScript({ runtime: 'node', code: fallbackCode, timeoutMs: 25_000 }, signal)
-    const parsed = JSON.parse(res.stdout || '{}') as { filesScanned?: number; nodes?: CallGraphNode[]; edges?: CallGraphEdge[] }
-    return {
-      repo: cleanRepo,
-      filesScanned: Number(parsed.filesScanned ?? 0),
-      nodes: Array.isArray(parsed.nodes) ? parsed.nodes : [],
-      edges: Array.isArray(parsed.edges) ? parsed.edges : [],
-      analyzerSource: 'offline_script_fallback',
-    }
-  } catch {
-    return {
-      repo: cleanRepo,
-      filesScanned: 0,
-      nodes: [],
-      edges: [],
-      analyzerSource: 'offline_script_fallback',
-    }
-  }
+  return combineCallGraphs(workerGraph, programCallGraph)
+    ?? { repo: cleanRepo, filesScanned: 0, nodes: [], edges: [], analyzerSource: 'offline_script_fallback' }
 }
 
 export function analyzeSinkBackwardPaths(
   graph: CallGraphIndex,
   spec: ProjectSecuritySpec,
-  options: { maxDepth?: number } = {},
+  options: { maxDepth?: number; sourceByPath?: ReadonlyMap<string, string> } = {},
 ): SinkBackwardPath[] {
   const nodeById = new Map<string, CallGraphNode>(graph.nodes.map(n => [n.id, n]))
   const callersOf = new Map<string, CallGraphNode[]>()
@@ -1377,23 +1329,27 @@ export function analyzeSinkBackwardPaths(
     callersOf.set(edge.toId, list)
   }
 
-  const sinkNodes = graph.nodes.filter(n => {
-    if (n.kind === 'sink' || n.sinkKind !== undefined) return true
-    return spec.sinks.some(s => s.patterns.some(p => n.calls.includes(p) || n.symbol.includes(p)))
-  })
-
-  const rawPaths: Array<{ ep: CallGraphNode; sink: CallGraphNode; chain: CallGraphNode[] }> = []
+  const sinkNodes = graph.nodes.filter(n =>
+    n.kind === 'sink' || n.sinkKind !== undefined
+    || spec.sinks.some(s => s.patterns.some(p => n.calls.includes(p) || n.symbol.includes(p))),
+  )
+  const grouped = new Map<string, Array<{ ep: CallGraphNode; sink: CallGraphNode; chain: CallGraphNode[] }>>()
   const maxDepth = Math.max(1, Math.min(options.maxDepth ?? 7, 16))
+  let totalPaths = 0
   for (const sink of sinkNodes) {
     const dfs = (cur: CallGraphNode, visited: Set<string>, chainRev: CallGraphNode[]) => {
-      if (rawPaths.length >= 400) return
-      const callers = callersOf.get(cur.id) ?? []
-      if (cur.kind === 'entrypoint' || (callers.length === 0 && chainRev.length > 1)) {
-        rawPaths.push({ ep: cur, sink, chain: [...chainRev].reverse() })
-        if (cur.kind === 'entrypoint') return
+      if (totalPaths >= 400) return
+      // Only route/handler entrypoints terminate a valid backward taint path (never unreached utility helpers).
+      if (cur.kind === 'entrypoint') {
+        totalPaths += 1
+        const key = `${cur.id}::${sink.id}`
+        const arr = grouped.get(key) ?? []
+        arr.push({ ep: cur, sink, chain: [...chainRev].reverse() })
+        grouped.set(key, arr)
+        return
       }
       if (chainRev.length >= maxDepth) return
-      for (const caller of callers) {
+      for (const caller of callersOf.get(cur.id) ?? []) {
         if (visited.has(caller.id)) continue
         visited.add(caller.id)
         chainRev.push(caller)
@@ -1402,58 +1358,58 @@ export function analyzeSinkBackwardPaths(
         visited.delete(caller.id)
       }
     }
-    const vis = new Set<string>([sink.id])
-    dfs(sink, vis, [sink])
-  }
-
-  const grouped = new Map<string, Array<{ ep: CallGraphNode; sink: CallGraphNode; chain: CallGraphNode[] }>>()
-  for (const p of rawPaths) {
-    const key = `${p.ep.id}::${p.sink.id}`
-    const arr = grouped.get(key) ?? []
-    arr.push(p)
-    grouped.set(key, arr)
+    dfs(sink, new Set<string>([sink.id]), [sink])
   }
 
   const results: SinkBackwardPath[] = []
   for (const group of grouped.values()) {
     const { ep, sink, chain } = group[0]
+    const sinkKind: AuditSinkKind = sink.sinkKind ?? 'other'
+    let taintQualified: boolean | undefined = sink.taintQualified
+    let taintReason: string | undefined = sink.taintReason
+    const extraSanitizers: string[] = []
+    if (options.sourceByPath) {
+      const sinkSource = lookupSource(options.sourceByPath, sink.file, graph.repo)
+      if (sinkSource !== undefined) {
+        const qual = qualifySinkCallSite(sinkSource, sink.line, sinkKind)
+        extraSanitizers.push(...qual.sanitizers)
+        if (!qual.qualified) {
+          taintQualified = false
+          taintReason = undefined
+        } else {
+          const hasInput = qual.directInput || chainHasUntrustedInput(chain, options.sourceByPath, graph.repo)
+          const enclosingFn = chain.length >= 2 ? chain[chain.length - 2] : undefined
+          const callerOfEnclosing = chain.length >= 3 ? chain[chain.length - 3] : undefined
+          const constantAtCaller = Boolean(
+            !qual.directInput && enclosingFn && callerOfEnclosing
+            && callerPassesOnlyConstants(callerOfEnclosing, enclosingFn.symbol, options.sourceByPath, graph.repo),
+          )
+          taintQualified = hasInput && !constantAtCaller
+          taintReason = taintQualified ? qual.reason : undefined
+        }
+      }
+    }
+
     const guardSets = group.map(g => new Set(g.chain.flatMap(n => n.guards)))
-    const sanSets = group.map(g => new Set(g.chain.flatMap(n => n.sanitizers)))
+    const sanSets = group.map(g => new Set([...g.chain.flatMap(n => n.sanitizers), ...extraSanitizers]))
     const allGuards = [...new Set(guardSets.flatMap(s => [...s]))]
     const dominatingGuards = allGuards.filter(g => guardSets.every(s => s.has(g)))
     const partialGuards = allGuards.filter(g => !dominatingGuards.includes(g))
-    const allSanitizers = [...new Set(sanSets.flatMap(s => [...s]))]
-    const dominatingSanitizers = allSanitizers.filter(sn => sanSets.every(s => s.has(sn)))
+    const dominatingSanitizers = [...new Set(sanSets.flatMap(s => [...s]))].filter(sn => sanSets.every(s => s.has(sn)))
 
-    const sinkKind: AuditSinkKind = sink.sinkKind ?? 'other'
     const authSensitive = ['api_route', 'server_action', 'webhook', 'auth_config', 'db_query'].includes(sinkKind)
     const injectionSink = ['db_query', 'outbound_fetch', 'redirect', 'postmessage_iframe', 'upload_storage', 'other'].includes(sinkKind)
-    const isAuthUnguarded = authSensitive && dominatingGuards.length === 0
-    const isInjectionUnsanitized = injectionSink && dominatingSanitizers.length === 0
-    const isUnguardedPath = isAuthUnguarded || isInjectionUnsanitized
-
+    const isAuthUnguarded = taintQualified === false ? false : (authSensitive && dominatingGuards.length === 0)
+    const isInjectionUnsanitized = taintQualified === false ? false : (injectionSink && dominatingSanitizers.length === 0)
     results.push({
-      entrypointId: ep.id,
-      entrypointSymbol: ep.symbol,
-      entrypointFile: ep.file,
-      entrypointLine: ep.line,
-      routeOrAction: ep.routePath ?? ep.symbol,
-      ...(ep.httpMethod ? { httpMethod: ep.httpMethod } : {}),
-      sinkId: sink.id,
-      sinkSymbol: sink.symbol,
-      sinkFile: sink.file,
-      sinkLine: sink.line,
-      sinkKind,
-      callChain: chain.map(n => n.symbol),
-      dominatingGuards,
-      partialGuards,
-      dominatingSanitizers,
-      isAuthUnguarded,
-      isInjectionUnsanitized,
-      isUnguardedPath,
+      entrypointId: ep.id, entrypointSymbol: ep.symbol, entrypointFile: ep.file, entrypointLine: ep.line,
+      routeOrAction: ep.routePath ?? ep.symbol, ...(ep.httpMethod ? { httpMethod: ep.httpMethod } : {}),
+      sinkId: sink.id, sinkSymbol: sink.symbol, sinkFile: sink.file, sinkLine: sink.line, sinkKind,
+      callChain: chain.map(n => n.symbol), dominatingGuards, partialGuards, dominatingSanitizers,
+      isAuthUnguarded, isInjectionUnsanitized, isUnguardedPath: isAuthUnguarded || isInjectionUnsanitized,
+      ...(taintQualified !== undefined ? { taintQualified } : {}), ...(taintReason ? { taintReason } : {}),
     })
   }
-
   return results
 }
 
@@ -1546,47 +1502,86 @@ const PROGRAM_SINK_KIND_MAP: Record<ProgramSinkKind, AuditSinkKind> = {
   other: 'other',
 }
 
-function programNodeToCallGraphNode(node: ProgramNode, graph: ProgramGraph): CallGraphNode {
+function programNodeToCallGraphNode(
+  node: ProgramNode,
+  routeById: ReadonlyMap<string, ProgramRoute>,
+  stripPrefix: string,
+  sourceByPath?: ReadonlyMap<string, string>,
+  repo?: string,
+): CallGraphNode {
+  const file = stripPrefix && node.file.startsWith(stripPrefix) ? node.file.slice(stripPrefix.length) : node.file
+  const base = {
+    id: node.id,
+    file,
+    line: node.line,
+    ...(node.endLine !== undefined ? { endLine: node.endLine } : {}),
+    guards: [...node.guards],
+    sanitizers: [] as string[],
+    calls: [...node.calls],
+  }
   if (node.kind === 'route') {
-    const route = graph.routes.find(candidate => candidate.id === node.id)
+    const route = routeById.get(node.id)
     return {
-      id: node.id,
-      file: node.file,
-      line: node.line,
-      ...(node.endLine !== undefined ? { endLine: node.endLine } : {}),
+      ...base,
       symbol: route?.handler ?? node.symbol,
       kind: 'entrypoint',
       ...(route?.method ? { httpMethod: route.method } : {}),
       ...(route?.path ? { routePath: route.path } : {}),
-      guards: [...node.guards],
-      sanitizers: [],
-      calls: [...node.calls],
+    }
+  }
+  const sinkKind = node.sinkKind ? (PROGRAM_SINK_KIND_MAP[node.sinkKind] ?? 'other') : undefined
+  let taintQualified: boolean | undefined
+  let taintReason: string | undefined
+  let sanitizers: string[] = []
+  if (node.kind === 'sink' && sinkKind && sourceByPath) {
+    const src = lookupSource(sourceByPath, node.file, repo) ?? lookupSource(sourceByPath, file, repo)
+    if (src !== undefined) {
+      const qual = qualifySinkCallSite(src, node.line, sinkKind)
+      taintQualified = qual.qualified
+      taintReason = qual.reason
+      sanitizers = qual.sanitizers
     }
   }
   return {
-    id: node.id,
-    file: node.file,
-    line: node.line,
-    ...(node.endLine !== undefined ? { endLine: node.endLine } : {}),
+    ...base,
     symbol: node.symbol,
     kind: node.kind,
     ...(node.httpMethod ? { httpMethod: node.httpMethod } : {}),
     ...(node.routePath ? { routePath: node.routePath } : {}),
-    ...(node.sinkKind ? { sinkKind: PROGRAM_SINK_KIND_MAP[node.sinkKind] ?? 'other' } : {}),
-    guards: [...node.guards],
-    sanitizers: [],
-    calls: [...node.calls],
+    ...(sinkKind ? { sinkKind } : {}),
+    sanitizers,
+    ...(taintQualified !== undefined ? { taintQualified } : {}),
+    ...(taintReason ? { taintReason } : {}),
   }
 }
 
 /** Adapt a mounted Program Graph into the Stage-2 call-graph shape (route/sink edges preserved). */
-export function callGraphFromProgramGraph(graph: ProgramGraph, options: { repo?: string } = {}): CallGraphIndex {
-  const nodes = graph.nodes.map(node => programNodeToCallGraphNode(node, graph))
+export function callGraphFromProgramGraph(
+  graph: ProgramGraph,
+  options: { repo?: string; sourceByPath?: ReadonlyMap<string, string> } = {},
+): CallGraphIndex {
+  const repo = options.repo ?? graph.repo ?? 'unknown'
+  const prefix = options.repo ? `${options.repo.replace(/^\/+|\/+$/g, '')}/` : ''
+  const hasPrefixed = Boolean(prefix && graph.nodes.some(n => n.file.startsWith(prefix)))
+  const stripPrefix = hasPrefixed ? prefix : ''
+  const filteredNodes = hasPrefixed ? graph.nodes.filter(n => n.file.startsWith(stripPrefix)) : graph.nodes
+  const keptIds = new Set(filteredNodes.map(n => n.id))
+  const routeById = new Map(graph.routes.map(r => [r.id, r]))
+  const nodes = filteredNodes.map(node => programNodeToCallGraphNode(node, routeById, stripPrefix, options.sourceByPath, options.repo))
+  const edges = graph.edges
+    .filter(edge => !hasPrefixed || (keptIds.has(edge.fromId) && keptIds.has(edge.toId)))
+    .map(edge => ({
+      fromId: edge.fromId,
+      toId: edge.toId,
+      file: stripPrefix && edge.file.startsWith(stripPrefix) ? edge.file.slice(stripPrefix.length) : edge.file,
+      line: edge.line,
+    }))
+  const filesScanned = hasPrefixed ? new Set(nodes.map(n => n.file)).size : graph.filesScanned
   return {
-    repo: options.repo ?? graph.repo ?? 'unknown',
-    filesScanned: graph.filesScanned,
+    repo,
+    filesScanned,
     nodes,
-    edges: graph.edges.map(edge => ({ fromId: edge.fromId, toId: edge.toId, file: edge.file, line: edge.line })),
+    edges,
     analyzerSource: 'offline_script_fallback',
   }
 }
@@ -1608,10 +1603,9 @@ export function combineCallGraphs(primary: CallGraphIndex | undefined, supplemen
   }
 }
 
-/** Cached per-graph sink paths (deterministic, read-only) so repeated suspect binding stays cheap. */
 const PROGRAM_SINK_PATH_CACHE = new WeakMap<ProgramGraph, Map<string, RouteSinkPath[]>>()
+const PROGRAM_SINK_RANK: Record<ProgramSinkKind, number> = { db_query: 3, command: 3, outbound_fetch: 2, template: 2, file: 2, redirect: 1, other: 0 }
 
-/** Cached per-graph sink paths (deterministic, read-only) so repeated suspect binding stays cheap. */
 function sinkPathsByRoute(graph: ProgramGraph): Map<string, RouteSinkPath[]> {
   const cached = PROGRAM_SINK_PATH_CACHE.get(graph)
   if (cached) return cached
@@ -1625,39 +1619,11 @@ function sinkPathsByRoute(graph: ProgramGraph): Map<string, RouteSinkPath[]> {
   return byRoute
 }
 
-function programSinkRank(kind: ProgramSinkKind): number {
-  if (kind === 'db_query' || kind === 'command') return 3
-  if (kind === 'outbound_fetch' || kind === 'template' || kind === 'file') return 2
-  if (kind === 'redirect') return 1
-  return 0
-}
+const dedupeGuards = (values: readonly string[], limit = 8): string[] =>
+  [...new Set(values.map(v => v.trim()).filter(Boolean))].slice(0, limit)
 
-function pickSinkPath(paths: readonly RouteSinkPath[], maxHops: number): RouteSinkPath | undefined {
-  return [...paths]
-    .filter(path => path.hops <= maxHops)
-    .sort((a, b) =>
-      programSinkRank(b.sinkKind) - programSinkRank(a.sinkKind) ||
-      b.hops - a.hops ||
-      a.sinkId.localeCompare(b.sinkId))[0]
-}
-
-function dedupeGuards(values: readonly string[], limit = 8): string[] {
-  const out: string[] = []
-  for (const value of values) {
-    const guard = value.trim()
-    if (!guard || out.includes(guard)) continue
-    out.push(guard)
-    if (out.length >= limit) break
-  }
-  return out
-}
-
-function hopKind(kind: CallGraphNode['kind']): ResolvedEntrypointHop['kind'] {
-  if (kind === 'entrypoint') return 'route'
-  if (kind === 'sink') return 'sink'
-  if (kind === 'middleware' || kind === 'guard') return 'middleware'
-  return 'function'
-}
+const hopKind = (kind: CallGraphNode['kind']): ResolvedEntrypointHop['kind'] =>
+  kind === 'entrypoint' ? 'route' : kind === 'sink' ? 'sink' : kind === 'middleware' || kind === 'guard' ? 'middleware' : 'function'
 
 interface EntrypointEvidence {
   chain: ResolvedEntrypointHop[]
@@ -1666,90 +1632,54 @@ interface EntrypointEvidence {
   sink?: { kind: AuditSinkKind; at: string }
 }
 
-/**
- * Full route -> ... -> sink chain for a Program Graph route, including per-hop guards.
- * Falls back to the route node alone when no call path reaches a sink.
- */
 function evidenceForProgramRoute(graph: ProgramGraph, route: ProgramRoute, maxHops: number): EntrypointEvidence {
-  const sinkPath = pickSinkPath(sinkPathsByRoute(graph).get(route.id) ?? [], maxHops)
+  const sinkPath = [...(sinkPathsByRoute(graph).get(route.id) ?? [])]
+    .filter(p => p.hops <= maxHops)
+    .sort((a, b) => PROGRAM_SINK_RANK[b.sinkKind] - PROGRAM_SINK_RANK[a.sinkKind] || b.hops - a.hops || a.sinkId.localeCompare(b.sinkId))[0]
+  if (!sinkPath) return { chain: [{ symbol: route.handler, file: route.file, line: route.line, kind: 'route' }], guards: dedupeGuards(route.guards), depth: 0 }
   const nodeGuardsById = new Map(graph.nodes.map(node => [node.id, node.guards]))
-  if (sinkPath) {
-    const chain: ResolvedEntrypointHop[] = sinkPath.chain
-      .slice(0, maxHops + 1)
-      .map(hop => ({
-        symbol: hop.symbol,
-        file: hop.file,
-        line: hop.line,
-        kind: hop.kind === 'route' || hop.kind === 'sink' || hop.kind === 'middleware' ? hop.kind : 'function',
-      }))
-    const guards = dedupeGuards([
-      ...route.guards,
-      ...sinkPath.chain.flatMap(hop => nodeGuardsById.get(hop.id) ?? []),
-    ])
-    return {
-      chain,
-      guards,
-      depth: Math.max(0, chain.length - 1),
-      sink: { kind: PROGRAM_SINK_KIND_MAP[sinkPath.sinkKind] ?? 'other', at: `${sinkPath.sinkFile}:${sinkPath.sinkLine}` },
-    }
+  const chain: ResolvedEntrypointHop[] = sinkPath.chain.slice(0, maxHops + 1).map(h => ({
+    symbol: h.symbol, file: h.file, line: h.line,
+    kind: h.kind === 'route' || h.kind === 'sink' || h.kind === 'middleware' ? h.kind : 'function',
+  }))
+  return {
+    chain,
+    guards: dedupeGuards([...route.guards, ...sinkPath.chain.flatMap(h => nodeGuardsById.get(h.id) ?? [])]),
+    depth: Math.max(0, chain.length - 1),
+    sink: { kind: PROGRAM_SINK_KIND_MAP[sinkPath.sinkKind] ?? 'other', at: `${sinkPath.sinkFile}:${sinkPath.sinkLine}` },
   }
-  const chain: ResolvedEntrypointHop[] = [{ symbol: route.handler, file: route.file, line: route.line, kind: 'route' }]
-  return { chain, guards: dedupeGuards(route.guards), depth: 0 }
 }
 
-/** Evidence for call-graph-only binding: entrypoint node plus the hop stack it reached. */
 function evidenceForCallGraphChain(nodes: readonly CallGraphNode[]): EntrypointEvidence {
-  const chain: ResolvedEntrypointHop[] = nodes.map(node => ({
-    symbol: node.symbol,
-    file: node.file,
-    line: node.line,
-    kind: hopKind(node.kind),
-  }))
+  const chain = nodes.map(n => ({ symbol: n.symbol, file: n.file, line: n.line, kind: hopKind(n.kind) }))
   const terminal = nodes[nodes.length - 1]
   return {
     chain,
-    guards: dedupeGuards(nodes.flatMap(node => node.guards)),
+    guards: dedupeGuards(nodes.flatMap(n => n.guards)),
     depth: Math.max(0, chain.length - 1),
-    ...(terminal?.kind === 'sink' && terminal.sinkKind
-      ? { sink: { kind: terminal.sinkKind, at: `${terminal.file}:${terminal.line}` } }
-      : {}),
+    ...(terminal?.kind === 'sink' && terminal.sinkKind ? { sink: { kind: terminal.sinkKind, at: `${terminal.file}:${terminal.line}` } } : {}),
   }
 }
 
-/**
- * Map a `file:line` SAST suspect backwards to its enclosing HTTP entrypoint.
- * Resolution order: containing function span -> nearest preceding entrypoint in
- * the same file -> multi-hop reverse call graph (depth 6-8) -> Program Graph
- * reverse route resolution -> none (caller keeps the raw file target).
- *
- * The result carries the full chain (route -> ... -> sink) and dominating guards so a brief or
- * planner can render code evidence without re-walking the repository.
- */
+/** Map a `file:line` suspect backwards to its enclosing HTTP entrypoint with route->sink chain evidence. */
 export function resolveSuspectEntrypoint(
   graph: CallGraphIndex | undefined,
   target: { file: string; line: number },
   liveEndpoints?: ReadonlyArray<{ method: string; path: string }>,
   options: { maxHops?: number; programGraph?: ProgramGraph } = {},
 ): ResolvedEntrypoint | null {
-  const effectiveGraph = combineCallGraphs(graph, options.programGraph ? callGraphFromProgramGraph(options.programGraph) : undefined)
+  const effectiveGraph = combineCallGraphs(
+    graph,
+    options.programGraph ? callGraphFromProgramGraph(options.programGraph, { ...(graph?.repo ? { repo: graph.repo } : {}) }) : undefined,
+  )
   if (!effectiveGraph) return null
-  // A mounted Program Graph carries resolved mount/controller edges, so the budget opens to 8
-  // hops when it is available (4-hop route -> controller -> service -> repository is common).
   const maxHops = Math.max(1, Math.min(options.maxHops ?? (options.programGraph ? 8 : 7), 16))
-  const entrypoints = effectiveGraph.nodes.filter(n => n.kind === 'entrypoint' && n.routePath)
-  const inFile = entrypoints.filter(n => n.file === target.file)
-  const sorted = [...inFile].sort((a, b) => a.line - b.line)
   let best: { node: CallGraphNode; matchedBy: 'range' | 'nearest' | 'reverse'; chainNodes?: CallGraphNode[] } | null = null
-  for (const node of sorted) {
-    const end = node.endLine ?? node.line
-    if (target.line >= node.line && target.line <= end) {
-      best = { node, matchedBy: 'range' }
-      break
-    }
+  for (const node of effectiveGraph.nodes.filter(n => n.kind === 'entrypoint' && n.routePath && n.file === target.file).sort((a, b) => a.line - b.line)) {
+    if (target.line >= node.line && target.line <= (node.endLine ?? node.line)) { best = { node, matchedBy: 'range' }; break }
     if (node.line <= target.line) best = { node, matchedBy: 'nearest' }
   }
   if (!best) {
-    // Multi-hop reverse call graph: sink/helper -> service -> controller -> route (depth 6-8).
     const nodeById = new Map(effectiveGraph.nodes.map(n => [n.id, n]))
     const incoming = new Map<string, CallGraphEdge[]>()
     for (const edge of effectiveGraph.edges) {
@@ -1757,55 +1687,39 @@ export function resolveSuspectEntrypoint(
       list.push(edge)
       incoming.set(edge.toId, list)
     }
-    const sameFileNodes = effectiveGraph.nodes
+    const sameFile = effectiveGraph.nodes
       .filter(n => n.file === target.file && n.kind !== 'entrypoint')
       .sort((a, b) => (a.kind === 'sink' ? -1 : 1) - (b.kind === 'sink' ? -1 : 1) || b.line - a.line)
-    const start = sameFileNodes.find(n => target.line >= n.line && target.line <= (n.endLine ?? n.line))
-      ?? sameFileNodes.find(n => n.line <= target.line)
+    const start = sameFile.find(n => target.line >= n.line && target.line <= (n.endLine ?? n.line)) ?? sameFile.find(n => n.line <= target.line)
     if (start) {
       let found: { node: CallGraphNode; hops: number; stack: CallGraphNode[] } | null = null
-      const walk = (current: CallGraphNode, hops: number, visited: Set<string>, stack: CallGraphNode[]) => {
+      const walk = (cur: CallGraphNode, hops: number, visited: Set<string>, stack: CallGraphNode[]) => {
         if (found && hops >= found.hops) return
-        if (current.kind === 'entrypoint' && current.routePath) {
-          found = { node: current, hops, stack }
-          return
-        }
+        if (cur.kind === 'entrypoint' && cur.routePath) { found = { node: cur, hops, stack }; return }
         if (hops >= maxHops) return
-        for (const edge of incoming.get(current.id) ?? []) {
+        for (const edge of incoming.get(cur.id) ?? []) {
           const caller = nodeById.get(edge.fromId)
           if (!caller || visited.has(caller.id)) continue
-          visited.add(caller.id)
-          walk(caller, hops + 1, visited, [...stack, caller])
-          visited.delete(caller.id)
+          visited.add(caller.id); walk(caller, hops + 1, visited, [...stack, caller]); visited.delete(caller.id)
         }
       }
       walk(start, 0, new Set([start.id]), [start])
       if (found) {
-        const resolved = found as { node: CallGraphNode; hops: number; stack: CallGraphNode[] }
-        best = { node: resolved.node, matchedBy: 'reverse', chainNodes: [...resolved.stack].reverse() }
+        const res = found as { node: CallGraphNode; hops: number; stack: CallGraphNode[] }
+        best = { node: res.node, matchedBy: 'reverse', chainNodes: [...res.stack].reverse() }
       }
     }
     if (!best && options.programGraph) {
-      // Clean fallback: use the Program Graph's own reverse route resolution (still 1..maxHops),
-      // then the nearest preceding route in the same file.
       const routed = resolveRouteForLocation(options.programGraph, target, { maxDepth: maxHops })
       if (routed) {
-        const routePath = routed.route.path
-        const httpMethod = routed.route.method
-        const evidence = evidenceForProgramRoute(options.programGraph, routed.route, maxHops)
+        const reconciled = reconcileSuspectWithEndpoints(routed.route.method, routed.route.path, liveEndpoints)
         return {
-          routePath,
-          ...(httpMethod ? { httpMethod } : {}),
-          symbol: routed.route.handler,
-          file: routed.route.file,
-          line: routed.route.line,
-          paramNames: routeTemplateParamNames(routePath),
+          routePath: routed.route.path, ...(routed.route.method ? { httpMethod: routed.route.method } : {}),
+          symbol: routed.route.handler, file: routed.route.file, line: routed.route.line,
+          paramNames: routeTemplateParamNames(routed.route.path),
           matchedBy: routed.matchedBy === 'nearest' ? 'nearest' : 'reverse',
-          ...evidence,
-          ...(() => {
-            const reconciled = reconcileSuspectWithEndpoints(httpMethod, routePath, liveEndpoints)
-            return reconciled ? { reconciledEndpoint: reconciled } : {}
-          })(),
+          ...evidenceForProgramRoute(options.programGraph, routed.route, maxHops),
+          ...(reconciled ? { reconciledEndpoint: reconciled } : {}),
         }
       }
     }
@@ -1813,28 +1727,18 @@ export function resolveSuspectEntrypoint(
   }
   const routePath = best.node.routePath ?? best.node.symbol
   const reconciled = reconcileSuspectWithEndpoints(best.node.httpMethod, routePath, liveEndpoints)
-  const programRoute = options.programGraph?.routes.find(route =>
-    route.path === best!.node.routePath &&
-    (!best!.node.httpMethod || route.method.toUpperCase() === best!.node.httpMethod.toUpperCase()))
-  const evidence: EntrypointEvidence = best.chainNodes
+  const programRoute = options.programGraph?.routes.find(r =>
+    r.path === best!.node.routePath && (!best!.node.httpMethod || r.method.toUpperCase() === best!.node.httpMethod.toUpperCase()))
+  const evidence = best.chainNodes
     ? evidenceForCallGraphChain(best.chainNodes)
     : programRoute
       ? evidenceForProgramRoute(options.programGraph!, programRoute, maxHops)
-      : {
-          chain: [{ symbol: best.node.symbol, file: best.node.file, line: best.node.line, kind: 'route' }],
-          guards: dedupeGuards(best.node.guards),
-          depth: 0,
-        }
+      : { chain: [{ symbol: best.node.symbol, file: best.node.file, line: best.node.line, kind: 'route' as const }], guards: dedupeGuards(best.node.guards), depth: 0 }
   return {
-    routePath,
-    ...(best.node.httpMethod ? { httpMethod: best.node.httpMethod } : {}),
-    symbol: best.node.symbol,
-    file: best.node.file,
-    line: best.node.line,
-    paramNames: routeTemplateParamNames(routePath),
-    matchedBy: best.matchedBy,
-    ...evidence,
-    ...(reconciled ? { reconciledEndpoint: reconciled } : {}),
+    routePath, ...(best.node.httpMethod ? { httpMethod: best.node.httpMethod } : {}),
+    symbol: best.node.symbol, file: best.node.file, line: best.node.line,
+    paramNames: routeTemplateParamNames(routePath), matchedBy: best.matchedBy,
+    ...evidence, ...(reconciled ? { reconciledEndpoint: reconciled } : {}),
   }
 }
 
@@ -1907,6 +1811,33 @@ function pickApprovedOrigin(approvedOrigins: readonly string[], hint: string): s
   return match ?? approvedOrigins[0]
 }
 
+function buildSuspect(
+  input: Omit<SemanticAuditSuspect, 'id' | 'fingerprint' | 'data'> & { fingerprintKind?: string },
+): SemanticAuditSuspect {
+  const { fingerprintKind, ...fields } = input
+  const line = Math.max(1, fields.line)
+  const data: CodeAuditSuspectData = {
+    subkind: 'code_audit_suspect',
+    repo: fields.repo,
+    file: fields.file,
+    line,
+    routeOrAction: fields.routeOrAction,
+    authCheck: fields.authCheck,
+    ownershipCheck: fields.ownershipCheck,
+    sinkKind: fields.sinkKind,
+    hypothesis: fields.hypothesis,
+    recommendedTier: fields.recommendedTier,
+  }
+  const optional = Object.fromEntries(Object.entries(fields).filter(([, v]) => v !== undefined))
+  return {
+    ...(optional as Omit<SemanticAuditSuspect, 'id' | 'fingerprint' | 'data'>),
+    id: randomUUID(),
+    fingerprint: makeSuspectFingerprint(fields.origin, fields.repo, fields.file, line, fingerprintKind ?? fields.sinkKind, fields.routeOrAction),
+    line,
+    data,
+  }
+}
+
 export function scoreAndBuildSuspects(params: {
   repo: string
   approvedOrigins: readonly string[]
@@ -1924,135 +1855,60 @@ export function scoreAndBuildSuspects(params: {
   const suspects: SemanticAuditSuspect[] = []
   if (params.approvedOrigins.length === 0) return suspects
 
-  const backwardByFile = new Set(params.backwardPaths.map(bp => `${bp.sinkFile}:${bp.sinkLine}`))
+  const backwardByFile = new Set(
+    params.backwardPaths.filter(bp => bp.taintQualified !== false).map(bp => `${bp.sinkFile}:${bp.sinkLine}`),
+  )
 
   for (const f of params.dynamicFindings) {
     const origin = pickApprovedOrigin(params.approvedOrigins, `${params.repo} ${f.file}`)
     if (!origin) continue
     const sinkKind = inferSinkKindFromFinding(f)
-    const sev: SemanticAuditSuspect['severity'] = f.severity === 'info' ? 'low' : f.severity
-    const corroborated = backwardByFile.has(`${f.file}:${f.line}`)
+    const severity: SemanticAuditSuspect['severity'] = f.severity === 'info' ? 'low' : f.severity
     const resolved = resolveSuspectEntrypoint(params.callGraph, { file: f.file, line: f.line }, params.liveEndpoints, {
       ...(params.programGraph ? { programGraph: params.programGraph } : {}),
     })
-    const priorityScore = computePriorityScore({
-      severity: sev,
-      isUnguarded: true,
-      hasPartialGuards: false,
-      sinkKind,
-      origin,
-      hostTiers: params.hostTiers,
-      corroborated,
-    })
-    const routeOrAction = resolved?.routePath ?? f.file
-    const fingerprint = makeSuspectFingerprint(origin, params.repo, f.file, f.line, sinkKind, routeOrAction)
-    const hypothesis = `${f.message}${f.maskedPreview ? ` (${f.maskedPreview})` : ''}${resolved && resolved.matchedBy !== 'none' ? ` [entrypoint ${resolved.httpMethod ?? 'ANY'} ${resolved.routePath}${resolved.paramNames.length ? ` params: ${resolved.paramNames.join(', ')}` : ''}]` : ''}`
-    const data: CodeAuditSuspectData = {
-      subkind: 'code_audit_suspect',
-      repo: params.repo,
-      file: f.file,
-      line: Math.max(1, f.line),
-      routeOrAction,
-      authCheck: 'unknown',
-      ownershipCheck: 'unknown',
-      sinkKind,
-      hypothesis,
+    suspects.push(buildSuspect({
+      stage: 'stage1_dynamic_rule', origin, repo: params.repo, file: f.file, line: f.line, endLine: f.endLine,
+      routeOrAction: resolved?.routePath ?? f.file, httpMethod: resolved?.httpMethod,
+      paramNames: resolved?.paramNames, entrypointSymbol: resolved?.symbol, reconciledEndpoint: resolved?.reconciledEndpoint,
+      authCheck: 'unknown', ownershipCheck: 'unknown', sinkKind, cwe: f.cwe, severity, ruleId: f.ruleId,
+      priorityScore: computePriorityScore({
+        severity, isUnguarded: true, hasPartialGuards: false, sinkKind, origin,
+        hostTiers: params.hostTiers, corroborated: backwardByFile.has(`${f.file}:${f.line}`),
+      }),
       recommendedTier: sinkKind === 'db_query' || sinkKind === 'outbound_fetch' ? 1 : 2,
-    }
-    suspects.push({
-      id: randomUUID(),
-      fingerprint,
-      stage: 'stage1_dynamic_rule',
-      origin,
-      repo: params.repo,
-      file: f.file,
-      line: Math.max(1, f.line),
-      ...(f.endLine ? { endLine: f.endLine } : {}),
-      routeOrAction,
-      ...(resolved?.httpMethod ? { httpMethod: resolved.httpMethod } : {}),
-      ...(resolved ? { paramNames: resolved.paramNames, entrypointSymbol: resolved.symbol } : {}),
-      ...(resolved?.reconciledEndpoint ? { reconciledEndpoint: resolved.reconciledEndpoint } : {}),
-      authCheck: data.authCheck,
-      ownershipCheck: data.ownershipCheck,
-      sinkKind,
-      ...(f.cwe ? { cwe: f.cwe } : {}),
-      severity: sev,
-      priorityScore,
-      recommendedTier: data.recommendedTier,
       specialistProfile: mapSinkToSpecialist(sinkKind, f.cwe),
-      hypothesis,
-      ruleId: f.ruleId,
-      data,
-    })
+      hypothesis: `${f.message}${f.maskedPreview ? ` (${f.maskedPreview})` : ''}${resolved && resolved.matchedBy !== 'none' ? ` [entrypoint ${resolved.httpMethod ?? 'ANY'} ${resolved.routePath}${resolved.paramNames.length ? ` params: ${resolved.paramNames.join(', ')}` : ''}]` : ''}`,
+    }))
   }
 
   for (const bp of params.backwardPaths) {
-    if (!bp.isUnguardedPath && bp.partialGuards.length === 0) continue
+    // Gate stage2_backward_taint emission on taint-qualified sinks (never bare safe/constant/parameterized sinks).
+    if (bp.taintQualified === false || (!bp.isUnguardedPath && bp.partialGuards.length === 0)) continue
     const origin = pickApprovedOrigin(params.approvedOrigins, `${params.repo} ${bp.routeOrAction}`)
     if (!origin) continue
-    const sev: SemanticAuditSuspect['severity'] = bp.isUnguardedPath
-      ? (bp.sinkKind === 'db_query' || bp.sinkKind === 'other' ? 'critical' : 'high')
-      : 'medium'
-    const priorityScore = computePriorityScore({
-      severity: sev,
-      isUnguarded: bp.isUnguardedPath,
-      hasPartialGuards: bp.partialGuards.length > 0,
-      sinkKind: bp.sinkKind,
-      origin,
-      hostTiers: params.hostTiers,
-    })
+    const severity: SemanticAuditSuspect['severity'] = bp.isUnguardedPath
+      ? (bp.sinkKind === 'db_query' || bp.sinkKind === 'other' ? 'critical' : 'high') : 'medium'
     const authCheck = bp.dominatingGuards.length
       ? `present (${bp.dominatingGuards.join(', ')})`
-      : bp.partialGuards.length
-        ? `partial (${bp.partialGuards.join(', ')})`
-        : 'missing'
-    const ownershipCheck = bp.dominatingGuards.some(g => /org|tenant|owner|member/i.test(g))
-      ? 'present'
-      : 'missing'
+      : bp.partialGuards.length ? `partial (${bp.partialGuards.join(', ')})` : 'missing'
+    const ownershipCheck = bp.dominatingGuards.some(g => /org|tenant|owner|member/i.test(g)) ? 'present' : 'missing'
     const trace = bp.callChain.join(' -> ')
-    const missingControls = [
-      bp.isAuthUnguarded ? 'auth/tenant guard' : null,
-      bp.isInjectionUnsanitized ? 'input sanitizer' : null,
-    ].filter((value): value is string => value !== null)
-    const hypothesis = `Backward taint path ${trace} reaches ${bp.sinkKind} sink without dominating ${missingControls.join(' or ') || 'control'}.`
-    const fingerprint = makeSuspectFingerprint(origin, params.repo, bp.sinkFile, bp.sinkLine, bp.sinkKind, bp.routeOrAction)
-    const reconciled = reconcileSuspectWithEndpoints(bp.httpMethod, bp.routeOrAction, params.liveEndpoints)
-    const data: CodeAuditSuspectData = {
-      subkind: 'code_audit_suspect',
-      repo: params.repo,
-      file: bp.sinkFile,
-      line: Math.max(1, bp.sinkLine),
-      routeOrAction: bp.routeOrAction,
-      authCheck,
-      ownershipCheck,
-      sinkKind: bp.sinkKind,
-      hypothesis,
+    const missingControls = [bp.isAuthUnguarded ? 'auth/tenant guard' : null, bp.isInjectionUnsanitized ? 'input sanitizer' : null]
+      .filter((v): v is string => v !== null)
+    suspects.push(buildSuspect({
+      stage: 'stage2_backward_taint', origin, repo: params.repo, file: bp.sinkFile, line: bp.sinkLine,
+      routeOrAction: bp.routeOrAction, httpMethod: bp.httpMethod, paramNames: routeTemplateParamNames(bp.routeOrAction),
+      entrypointSymbol: bp.entrypointSymbol, reconciledEndpoint: reconcileSuspectWithEndpoints(bp.httpMethod, bp.routeOrAction, params.liveEndpoints),
+      authCheck, ownershipCheck, sinkKind: bp.sinkKind, severity, sourceToSinkTrace: trace,
+      priorityScore: computePriorityScore({
+        severity, isUnguarded: bp.isUnguardedPath, hasPartialGuards: bp.partialGuards.length > 0,
+        sinkKind: bp.sinkKind, origin, hostTiers: params.hostTiers, corroborated: bp.taintQualified === true,
+      }),
       recommendedTier: ownershipCheck === 'missing' ? 2 : 1,
-    }
-    suspects.push({
-      id: randomUUID(),
-      fingerprint,
-      stage: 'stage2_backward_taint',
-      origin,
-      repo: params.repo,
-      file: bp.sinkFile,
-      line: Math.max(1, bp.sinkLine),
-      routeOrAction: bp.routeOrAction,
-      ...(bp.httpMethod ? { httpMethod: bp.httpMethod } : {}),
-      paramNames: routeTemplateParamNames(bp.routeOrAction),
-      entrypointSymbol: bp.entrypointSymbol,
-      ...(reconciled ? { reconciledEndpoint: reconciled } : {}),
-      authCheck,
-      ownershipCheck,
-      sinkKind: bp.sinkKind,
-      severity: sev,
-      priorityScore,
-      recommendedTier: data.recommendedTier,
       specialistProfile: mapSinkToSpecialist(bp.sinkKind),
-      hypothesis,
-      sourceToSinkTrace: trace,
-      data,
-    })
+      hypothesis: `Backward taint path ${trace} reaches ${bp.sinkKind} sink${bp.taintReason ? ` (${bp.taintReason})` : ''} without dominating ${missingControls.join(' or ') || 'control'}.`,
+    }))
   }
 
   // v7 M2: Middleware / RBAC policy diffs from mounted Program Graph.
@@ -2061,113 +1917,40 @@ export function scoreAndBuildSuspects(params: {
       const origin = pickApprovedOrigin(params.approvedOrigins, `${params.repo} ${diff.path}`)
       if (!origin) continue
       const sinkKind: AuditSinkKind = 'api_route'
-      const sev: SemanticAuditSuspect['severity'] = diff.severity
-      const priorityScore = computePriorityScore({
-        severity: sev,
-        isUnguarded: true,
-        hasPartialGuards: false,
-        sinkKind,
-        origin,
-        hostTiers: params.hostTiers,
-        corroborated: diff.guardedSiblings >= 2,
-      })
-      const authCheck = diff.missingFamily === 'tenant'
-        ? 'partial (missing tenant guard)'
-        : `missing (${diff.siblingGuard} on ${diff.guardedSiblings}/${diff.totalSiblings} siblings)`
-      const ownershipCheck = diff.missingFamily === 'tenant'
-        ? `missing (${diff.siblingGuard} on sibling ${diff.siblingRoute})`
-        : 'unknown'
-      const hypothesis = `RBAC/middleware policy diff on ${diff.method} ${diff.path} (${diff.file}:${diff.line}): lacks ${diff.missingFamily} guard "${diff.siblingGuard}" enforced by ${diff.guardedSiblings}/${diff.totalSiblings} sibling route(s) (e.g. ${diff.siblingRoute} @ ${diff.siblingAt}).`
-      const fingerprint = makeSuspectFingerprint(origin, params.repo, diff.file, diff.line, `${sinkKind}:${diff.missingFamily}`, diff.path)
-      const reconciled = reconcileSuspectWithEndpoints(diff.method, diff.path, params.liveEndpoints)
-      const data: CodeAuditSuspectData = {
-        subkind: 'code_audit_suspect',
-        repo: params.repo,
-        file: diff.file,
-        line: Math.max(1, diff.line),
-        routeOrAction: diff.path,
-        authCheck,
-        ownershipCheck,
-        sinkKind,
-        hypothesis,
-        recommendedTier: 2,
-      }
-      suspects.push({
-        id: randomUUID(),
-        fingerprint,
-        stage: 'stage2_backward_taint',
-        origin,
-        repo: params.repo,
-        file: diff.file,
-        line: Math.max(1, diff.line),
-        routeOrAction: diff.path,
-        httpMethod: diff.method,
-        paramNames: routeTemplateParamNames(diff.path),
-        ...(reconciled ? { reconciledEndpoint: reconciled } : {}),
-        authCheck,
-        ownershipCheck,
-        sinkKind,
-        cwe: diff.missingFamily === 'tenant' ? 'CWE-639' : 'CWE-862',
-        severity: sev,
-        priorityScore,
-        recommendedTier: 2,
-        specialistProfile: 'bola-bfla-specialist',
-        hypothesis,
-        data,
-      })
+      suspects.push(buildSuspect({
+        stage: 'stage2_backward_taint', origin, repo: params.repo, file: diff.file, line: diff.line,
+        routeOrAction: diff.path, httpMethod: diff.method, paramNames: routeTemplateParamNames(diff.path),
+        reconciledEndpoint: reconcileSuspectWithEndpoints(diff.method, diff.path, params.liveEndpoints),
+        authCheck: diff.missingFamily === 'tenant'
+          ? 'partial (missing tenant guard)' : `missing (${diff.siblingGuard} on ${diff.guardedSiblings}/${diff.totalSiblings} siblings)`,
+        ownershipCheck: diff.missingFamily === 'tenant' ? `missing (${diff.siblingGuard} on sibling ${diff.siblingRoute})` : 'unknown',
+        sinkKind, fingerprintKind: `${sinkKind}:${diff.missingFamily}`,
+        cwe: diff.missingFamily === 'tenant' ? 'CWE-639' : 'CWE-862', severity: diff.severity,
+        priorityScore: computePriorityScore({
+          severity: diff.severity, isUnguarded: true, hasPartialGuards: false,
+          sinkKind, origin, hostTiers: params.hostTiers, corroborated: diff.guardedSiblings >= 2,
+        }),
+        recommendedTier: 2, specialistProfile: 'bola-bfla-specialist',
+        hypothesis: `RBAC/middleware policy diff on ${diff.method} ${diff.path} (${diff.file}:${diff.line}): lacks ${diff.missingFamily} guard "${diff.siblingGuard}" enforced by ${diff.guardedSiblings}/${diff.totalSiblings} sibling route(s) (e.g. ${diff.siblingRoute} @ ${diff.siblingAt}).`,
+      }))
     }
   }
 
   // v7 M2: Value-free static secrets & IaC leads (never echoing literal credential values).
-  const staticLeads = params.staticLeads ?? params.programGraph?.staticLeads ?? []
-  for (const lead of staticLeads.slice(0, 20)) {
+  for (const lead of (params.staticLeads ?? params.programGraph?.staticLeads ?? []).slice(0, 20)) {
     const origin = pickApprovedOrigin(params.approvedOrigins, `${params.repo} ${lead.file} ${lead.path ?? ''}`)
     if (!origin) continue
     const sinkKind: AuditSinkKind = 'auth_config'
-    const routeOrAction = lead.path ?? lead.file
-    const hypothesis = `Static ${lead.kind} exposure at ${lead.at}: ${lead.note} (value withheld). Verify whether this configuration or credential exposes live authenticated surfaces.`
-    const fingerprint = makeSuspectFingerprint(origin, params.repo, lead.file, lead.line, `static_${lead.kind}`, routeOrAction)
-    const priorityScore = computePriorityScore({
-      severity: lead.severity,
-      isUnguarded: true,
-      hasPartialGuards: false,
-      sinkKind,
-      origin,
-      hostTiers: params.hostTiers,
-    })
-    const data: CodeAuditSuspectData = {
-      subkind: 'code_audit_suspect',
-      repo: params.repo,
-      file: lead.file,
-      line: Math.max(1, lead.line),
-      routeOrAction,
+    suspects.push(buildSuspect({
+      stage: 'stage1_dynamic_rule', origin, repo: params.repo, file: lead.file, line: lead.line,
+      routeOrAction: lead.path ?? lead.file, httpMethod: lead.method,
       authCheck: lead.kind === 'secret' ? 'weak (hardcoded secret indicator)' : 'misconfigured (IaC exposure)',
-      ownershipCheck: 'unknown',
-      sinkKind,
-      hypothesis,
-      recommendedTier: 1,
-    }
-    suspects.push({
-      id: randomUUID(),
-      fingerprint,
-      stage: 'stage1_dynamic_rule',
-      origin,
-      repo: params.repo,
-      file: lead.file,
-      line: Math.max(1, lead.line),
-      routeOrAction,
-      ...(lead.method ? { httpMethod: lead.method } : {}),
-      authCheck: data.authCheck,
-      ownershipCheck: data.ownershipCheck,
-      sinkKind,
-      cwe: lead.kind === 'secret' ? 'CWE-798' : 'CWE-250',
-      severity: lead.severity,
-      priorityScore,
-      recommendedTier: 1,
-      specialistProfile: 'auth-session-oauth-specialist',
-      hypothesis,
-      data,
-    })
+      ownershipCheck: 'unknown', sinkKind, fingerprintKind: `static_${lead.kind}`,
+      cwe: lead.kind === 'secret' ? 'CWE-798' : 'CWE-250', severity: lead.severity,
+      priorityScore: computePriorityScore({ severity: lead.severity, isUnguarded: true, hasPartialGuards: false, sinkKind, origin, hostTiers: params.hostTiers }),
+      recommendedTier: 1, specialistProfile: 'auth-session-oauth-specialist',
+      hypothesis: `Static ${lead.kind} exposure at ${lead.at}: ${lead.note} (value withheld). Verify whether this configuration or credential exposes live authenticated surfaces.`,
+    }))
   }
 
   return suspects
@@ -2334,10 +2117,7 @@ process.stdout.write(JSON.stringify({ available: true, commits }));
       const hypothesis = redactedRemoved.length > 0
         ? `Historical security fix (${c.sha.slice(0, 8)}: "${redact(c.subject, ctx.secrets)}") removed a guard/sanitizer at ${targetFile}:${targetLine} ("${redact(target.snippet, ctx.secrets).slice(0, 120)}"); audit sibling routes/handlers for an incomplete patch or regression.`
         : `Historical security fix (${c.sha.slice(0, 8)}: "${redact(c.subject, ctx.secrets)}") touched ${targetFile}; audit sibling routes/handlers for incomplete patch or regression.`
-      const fp = makeSuspectFingerprint(origin, cleanRepo, targetFile, targetLine, sinkKind, targetFile)
-      suspects.push({
-        id: randomUUID(),
-        fingerprint: fp,
+      suspects.push(buildSuspect({
         stage: 'stage3_git_miner',
         origin,
         repo: cleanRepo,
@@ -2348,30 +2128,11 @@ process.stdout.write(JSON.stringify({ available: true, commits }));
         ownershipCheck: 'unknown',
         sinkKind,
         severity: 'high',
-        priorityScore: computePriorityScore({
-          severity: 'high',
-          isUnguarded: true,
-          hasPartialGuards: false,
-          sinkKind,
-          origin,
-          hostTiers: ctx.hostTiers,
-        }),
+        priorityScore: computePriorityScore({ severity: 'high', isUnguarded: true, hasPartialGuards: false, sinkKind, origin, hostTiers: ctx.hostTiers }),
         recommendedTier: sinkKind === 'api_route' ? 2 : 1,
         specialistProfile: mapSinkToSpecialist(sinkKind),
         hypothesis,
-        data: {
-          subkind: 'code_audit_suspect',
-          repo: cleanRepo,
-          file: targetFile,
-          line: targetLine,
-          routeOrAction: targetFile,
-          authCheck: 'unknown (historical security patch)',
-          ownershipCheck: 'unknown',
-          sinkKind,
-          hypothesis,
-          recommendedTier: sinkKind === 'api_route' ? 2 : 1,
-        },
-      })
+      }))
     }
   }
 
@@ -2553,50 +2314,27 @@ process.stdout.write(lines.slice(s, e).join('\\n').slice(0, 2000));
 
     const newSuspects: SemanticAuditSuspect[] = siblingMatches.map(m => {
       const sinkKind = inferSinkKindFromFinding(m)
-      const sev: SemanticAuditSuspect['severity'] = m.severity === 'info' ? 'low' : m.severity
-      const hypothesis = `Variant sweep sibling of confirmed finding ${finding.id} (${finding.title}) at ${m.file}:${m.line}: ${m.message}`
-      const fp = makeSuspectFingerprint(finding.origin, cleanRepo, m.file, m.line, sinkKind, m.file)
-      return {
-        id: randomUUID(),
-        fingerprint: fp,
+      const severity: SemanticAuditSuspect['severity'] = m.severity === 'info' ? 'low' : m.severity
+      const cwe = m.cwe ?? finding.cwe ?? undefined
+      return buildSuspect({
         stage: 'stage3_variant_sweep',
         origin: finding.origin,
         repo: cleanRepo,
         file: m.file,
-        line: Math.max(1, m.line),
-        ...(m.endLine ? { endLine: m.endLine } : {}),
+        line: m.line,
+        endLine: m.endLine,
         routeOrAction: m.file,
         authCheck: 'unknown (variant sweep sibling)',
         ownershipCheck: 'unknown',
         sinkKind,
-        ...(m.cwe ?? finding.cwe ? { cwe: m.cwe ?? finding.cwe ?? undefined } : {}),
-        severity: sev,
-        priorityScore: computePriorityScore({
-          severity: sev,
-          isUnguarded: true,
-          hasPartialGuards: false,
-          sinkKind,
-          origin: finding.origin,
-          hostTiers: ctx.hostTiers,
-          corroborated: true,
-        }),
+        cwe,
+        severity,
+        priorityScore: computePriorityScore({ severity, isUnguarded: true, hasPartialGuards: false, sinkKind, origin: finding.origin, hostTiers: ctx.hostTiers, corroborated: true }),
         recommendedTier: 1,
-        specialistProfile: mapSinkToSpecialist(sinkKind, m.cwe ?? finding.cwe ?? undefined),
-        hypothesis,
+        specialistProfile: mapSinkToSpecialist(sinkKind, cwe),
+        hypothesis: `Variant sweep sibling of confirmed finding ${finding.id} (${finding.title}) at ${m.file}:${m.line}: ${m.message}`,
         ruleId: m.ruleId,
-        data: {
-          subkind: 'code_audit_suspect',
-          repo: cleanRepo,
-          file: m.file,
-          line: Math.max(1, m.line),
-          routeOrAction: m.file,
-          authCheck: 'unknown (variant sweep sibling)',
-          ownershipCheck: 'unknown',
-          sinkKind,
-          hypothesis,
-          recommendedTier: 1,
-        },
-      }
+      })
     })
 
     if (ctx.storage && ctx.assignment && newSuspects.length > 0) {
@@ -2743,6 +2481,10 @@ export function toChainStepInputs(
     const s = suspects[index]
     const asset = run.candidates.find(c => c.origin === s.origin && run.approved.includes(c.id))
     if (!asset) continue
+    // Stage-2 backward taint suspects must be bound to an HTTP route/entrypoint or corroborated rule before entering chain_steps.
+    if (s.stage === 'stage2_backward_taint' && !s.routeOrAction.startsWith('/') && !s.httpMethod && !s.reconciledEndpoint && !s.ruleId) {
+      continue
+    }
     const locationKey = codeAuditSuspectLocationKey(s)
     if (seenLocations.has(locationKey)) continue
     seenLocations.add(locationKey)
@@ -2822,13 +2564,14 @@ export async function runThreeStageSemanticAudit(
           )
         : []
 
-      // Stage 2: Atlantis/RepoAudit-style Call-Graph Backward Traversal & Path Dominance
+      // Stage 2: ProgramGraph + worker AST call-graph backward traversal & taint-qualified dominance
       const graph = await buildRepoCallGraph(
-        staticSnapshot ? (session as WorkerSession) : await ensureSession(),
+        staticSnapshot ? session : await ensureSession(),
         cleanRepo,
         stage1.spec,
         ctx.signal,
         staticSnapshot,
+        effectiveProgramGraph,
       )
       callGraphsByRepo[cleanRepo] = {
         filesScanned: graph.filesScanned,
@@ -2836,7 +2579,9 @@ export async function runThreeStageSemanticAudit(
         edges: graph.edges.length,
         source: graph.analyzerSource,
       }
-      const backwardPaths = analyzeSinkBackwardPaths(graph, stage1.spec)
+      const backwardPaths = analyzeSinkBackwardPaths(graph, stage1.spec, {
+        ...(staticSnapshot ? { sourceByPath: staticSnapshot.sourceByPath } : {}),
+      })
       backwardPathsEvaluated += backwardPaths.length
 
       allSuspects.push(...scoreAndBuildSuspects({
