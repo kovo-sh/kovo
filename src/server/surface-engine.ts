@@ -8,13 +8,13 @@ import { loadSafeTemplates, selectSafeTemplates, selectTemplateIdsForCves } from
 import type { SafeTemplate, TemplateMatcher } from '../templates/loader.ts'
 import type { Store } from './store.ts'
 // Probe families live in ./probes and are dispatched through the static registry.
-import { clampMaxRequests, escapeXmlText, forbiddenParamHeaders, isPrivateOrLoopbackHost, randToken, responseSimilarity, setQueryParam, sha8 } from './probes/context.ts'
+import { assertSafeParamName, clampMaxRequests, escapeXmlText, forbiddenParamHeaders, hasForbiddenProtoSegment, isPrivateOrLoopbackHost, randToken, responseSimilarity, setQueryParam, sha8 } from './probes/context.ts'
 import type { DiffContext, DiffOutcome, DifferentialResult, InjectedRequest, ProbeDifferentialRequest, StopReason, SurfaceParamLocation } from './probes/context.ts'
 import { probeModuleFor } from './probes/registry.ts'
 import { validateXxeCustomPayload } from './probes/xxe.ts'
 import { resolveGraphqlArgQuery } from './probes/graphql.ts'
 
-export { appendCacheBuster, clampMaxRequests, dbErrorDialect, defaultSurfaceMaxRequests, escapeXmlAttr, escapeXmlText, injectUniversalParam, normalizeEphemeralNoise, responseSimilarity, surfaceMaxRequestsCeiling, surfaceParamLocations } from './probes/context.ts'
+export { FORBIDDEN_PROTO_KEYS, appendCacheBuster, assertSafeParamName, clampMaxRequests, dbErrorDialect, defaultSurfaceMaxRequests, escapeXmlAttr, escapeXmlText, hasForbiddenProtoSegment, injectUniversalParam, isForbiddenProtoSegment, normalizeEphemeralNoise, responseSimilarity, setJsonPath, surfaceMaxRequestsCeiling, surfaceParamLocations, toSafeJsonContainer } from './probes/context.ts'
 export type { DifferentialProbeClass, DifferentialResult, ProbeDifferentialRequest, StopReason, SurfaceParamLocation, UniversalInjectInput } from './probes/context.ts'
 export { analyzeXssReflection } from './probes/xss.ts'
 export type { ReflectionAnalysis, ReflectionContext } from './probes/xss.ts'
@@ -419,7 +419,7 @@ export async function probeSurface(
       if (!safeProbePath(basePath.split('?')[0].replace(/\{\{[a-zA-Z0-9_]+\}\}/g, 'x'))) throw new BrokerDenied('basePath is invalid.')
       const location: SurfaceParamLocation = req.paramLocation ?? 'query'
       const names = [...new Set((req.params?.length ? req.params : commonParamWordlist)
-        .filter(n => /^[A-Za-z0-9_.\-[\]]{1,64}$/.test(n)))].slice(0, maxParamCandidates)
+        .filter(n => /^[A-Za-z0-9_.\-[\]]{1,64}$/.test(n) && !hasForbiddenProtoSegment(n)))].slice(0, maxParamCandidates)
       candidates = names.length
       const batchSize = Math.max(10, Math.min(req.batchSize ?? 25, 25))
       const method: HttpMethod = (location === 'json' || location === 'form' || location === 'xml' || location === 'graphql_var') ? 'POST' : 'GET'
@@ -428,8 +428,10 @@ export async function probeSurface(
       const build = (subset: readonly string[]): BrokerHttpRequest => {
         const sessionExtras = req.session ? { session: req.session } : {}
         if (location === 'json') {
-          const body: Record<string, unknown> = {}
-          for (const n of subset) body[n] = values.get(n)
+          const body = Object.create(null) as Record<string, unknown>
+          for (const n of subset) {
+            Object.defineProperty(body, n, { value: values.get(n), writable: true, enumerable: true, configurable: true })
+          }
           return { origin, method, pathAndQuery: basePath, body: JSON.stringify(body), headers: { 'Content-Type': 'application/json' }, ...sessionExtras }
         }
         if (location === 'form') {
@@ -440,7 +442,9 @@ export async function probeSurface(
         if (location === 'header') {
           const headers: Record<string, string> = {}
           for (const n of subset) {
-            if (!forbiddenParamHeaders.test(n) && !/[\r\n\0]/.test(n)) headers[n] = values.get(n)!
+            if (!forbiddenParamHeaders.test(n) && !/[\r\n\0]/.test(n) && !hasForbiddenProtoSegment(n)) {
+              Object.defineProperty(headers, n, { value: values.get(n)!, writable: true, enumerable: true, configurable: true })
+            }
           }
           return { origin, method, pathAndQuery: basePath, headers, ...sessionExtras }
         }
@@ -452,8 +456,10 @@ export async function probeSurface(
           return { origin, method, pathAndQuery: basePath, body: `<?xml version="1.0" encoding="UTF-8"?><request>${inner}</request>`, headers: { 'Content-Type': 'application/xml' }, ...sessionExtras }
         }
         if (location === 'graphql_var') {
-          const variables: Record<string, unknown> = {}
-          for (const n of subset) variables[n] = values.get(n)
+          const variables = Object.create(null) as Record<string, unknown>
+          for (const n of subset) {
+            Object.defineProperty(variables, n, { value: values.get(n), writable: true, enumerable: true, configurable: true })
+          }
           return { origin, method, pathAndQuery: basePath, body: JSON.stringify({ query: 'query{__typename}', variables }), headers: { 'Content-Type': 'application/json' }, ...sessionExtras }
         }
         if (location === 'path') {
@@ -645,6 +651,22 @@ export async function probeDifferential(
 
   if (!safeProbePath(req.pathAndQuery.split('?')[0].replace(/\{\{[a-zA-Z0-9_]+\}\}/g, 'x'))) {
     throw new BrokerDenied('pathAndQuery is invalid or blocked by the destructive-payload denylist.')
+  }
+  // R2-C-2 ingress guard: reject prototype accessor segments on all parameter/field names before
+  // building any request object or dispatching to probe modules.
+  if (req.param !== undefined) assertSafeParamName(req.param, 'param')
+  if (req.bodyField !== undefined) assertSafeParamName(req.bodyField, 'bodyField')
+  if (req.stateField !== undefined) assertSafeParamName(req.stateField, 'stateField')
+  if (req.quantityField !== undefined) assertSafeParamName(req.quantityField, 'quantityField')
+  if (req.readStateField !== undefined) assertSafeParamName(req.readStateField, 'readStateField')
+  if (req.candidateFields !== undefined) {
+    for (const field of req.candidateFields) assertSafeParamName(field, 'candidateFields entry')
+  }
+  if (req.ssrfParams !== undefined) {
+    for (const p of req.ssrfParams) assertSafeParamName(p, 'ssrfParams entry')
+  }
+  if (req.tokenFields !== undefined) {
+    for (const f of req.tokenFields) assertSafeParamName(f, 'tokenFields entry')
   }
   if (req.probeClass === 'xxe_canary' && req.customPayload !== undefined) {
     validateXxeCustomPayload(req.customPayload)

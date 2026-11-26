@@ -828,7 +828,102 @@ export function createKovoLocalServer(options: LocalSessionOptions): KovoLocalSe
   }
 }
 
+export interface HostHardeningStatus {
+  prototypeClean: boolean
+  prototypeSealed: boolean
+  disableProtoThrow: boolean
+  linearRegexpFallback: boolean
+  regexpSelfCheckMs: number | null
+  warnings: string[]
+}
+
+const RECOMMENDED_HARDENING_FLAGS =
+  '--disable-proto=throw --enable-experimental-regexp-engine-on-excessive-backtracks --regexp-backtracks-before-fallback=10000'
+
+/**
+ * Verify that `Object.prototype` has no unexpected enumerable properties (detects pre-existing
+ * prototype pollution before serving requests).
+ */
+export function assertObjectPrototypeIntegrity(): void {
+  const pollutedKeys = Object.keys(Object.prototype)
+  if (pollutedKeys.length > 0) {
+    throw new Error(`Object.prototype integrity check failed: unexpected own enumerable properties [${pollutedKeys.join(', ')}]`)
+  }
+}
+
+/**
+ * R2-C-2 / H-32 process-level hardening and startup self-check:
+ * 1. Verifies `Object.prototype` has no unexpected enumerable keys.
+ * 2. Seals `Object.prototype` so no new properties can be attached process-wide (while preserving
+ *    compatibility with third-party subclasses such as Playwright's SourceMapGenerator).
+ * 3. Checks whether `--disable-proto=throw` and `--enable-experimental-regexp-engine-on-excessive-backtracks`
+ *    are active and runs a bounded exponential-regex self-check when the linear fallback is enabled.
+ */
+export function hardenHostProcess(options?: {
+  requireFlags?: boolean
+  sealPrototype?: boolean
+  quiet?: boolean
+}): HostHardeningStatus {
+  assertObjectPrototypeIntegrity()
+
+  if (options?.sealPrototype !== false && !Object.isSealed(Object.prototype)) {
+    Object.seal(Object.prototype)
+  }
+
+  let disableProtoThrow = false
+  try {
+    void (Object.prototype as Record<string, unknown>).__proto__
+  } catch (err) {
+    disableProtoThrow = (err as { code?: string })?.code === 'ERR_PROTO_ACCESS' || err instanceof Error
+  }
+
+  const nodeOptionsTokens = (process.env.NODE_OPTIONS ?? '').trim().split(/\s+/).filter(Boolean)
+  const linearFlagPresent =
+    process.execArgv.includes('--enable-experimental-regexp-engine-on-excessive-backtracks')
+    || nodeOptionsTokens.includes('--enable-experimental-regexp-engine-on-excessive-backtracks')
+
+  let regexpSelfCheckMs: number | null = null
+  let linearRegexpFallback = false
+  if (linearFlagPresent) {
+    const probeRe = /(a+)+b/
+    const t0 = performance.now()
+    probeRe.test(`${'a'.repeat(32)}!`)
+    regexpSelfCheckMs = Number((performance.now() - t0).toFixed(2))
+    linearRegexpFallback = regexpSelfCheckMs < 50
+  }
+
+  const warnings: string[] = []
+  if (!disableProtoThrow) {
+    warnings.push(`Node started without --disable-proto=throw (recommended: node ${RECOMMENDED_HARDENING_FLAGS} scripts/serve.ts)`)
+  }
+  if (!linearRegexpFallback) {
+    warnings.push(
+      linearFlagPresent
+        ? `Linear regexp fallback self-check exceeded 50 ms (${regexpSelfCheckMs} ms).`
+        : `Node started without --enable-experimental-regexp-engine-on-excessive-backtracks (recommended: node ${RECOMMENDED_HARDENING_FLAGS} scripts/serve.ts)`,
+    )
+  }
+
+  const requireFlags = options?.requireFlags ?? process.env.KOVO_REQUIRE_HARDENED_NODE === '1'
+  if (requireFlags && warnings.length > 0) {
+    throw new Error(`Host process hardening check failed: ${warnings.join(' | ')}`)
+  }
+  if (!options?.quiet) {
+    for (const w of warnings) console.warn(`[kovo:hardening] ${w}`)
+  }
+
+  return {
+    prototypeClean: true,
+    prototypeSealed: Object.isSealed(Object.prototype),
+    disableProtoThrow,
+    linearRegexpFallback,
+    regexpSelfCheckMs,
+    warnings,
+  }
+}
+
 async function main() {
+  assertObjectPrototypeIntegrity()
   const directory = resolve(process.env.KOVO_DATA_DIR ?? '.kovo')
   const port = Number(process.env.PORT ?? 8000)
   const hostPort = parseOptionalPort(process.env.KOVO_PORT)
@@ -844,6 +939,7 @@ async function main() {
     initialize: (options?: { dataDir?: string; killSwitchFilePath?: string }) => AppRuntime | void
   }
 
+  hardenHostProcess()
   initialize({ dataDir: directory, killSwitchFilePath })
 
   const sharedStore = store()
