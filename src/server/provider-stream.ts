@@ -1,5 +1,11 @@
 import type { ProviderSettings, RoleAffinity, ThinkingLevel } from '../domain.ts'
 import { createEgressSanitizer, redactSecrets } from './egress-sanitizer.ts'
+import {
+  DEFAULT_NO_TOKEN_WATCHDOG_MS,
+  MEDIUM_THINKING_NO_TOKEN_WATCHDOG_MS,
+  REASONING_NO_TOKEN_WATCHDOG_MS,
+  resolveProviderRuntimePolicy,
+} from './provider-runtime-policy.ts'
 import type { NamedSecret } from './redact.ts'
 
 type Fields = Record<string, unknown>
@@ -9,40 +15,68 @@ type Prepared = WeakMap<Fields, Map<string, string>>
 
 export const defaultStreamResponseLimit = 16 * 1024 * 1024
 export const maxStreamResponseLimit = 32 * 1024 * 1024
-/** Default no-token watchdog window for fast/non-reasoning profiles (ms). */
-export const DEFAULT_NO_TOKEN_WATCHDOG_MS = 28_000
-/** Medium-thinking profile no-token watchdog window before first/next SSE frame (ms). */
-export const MEDIUM_THINKING_NO_TOKEN_WATCHDOG_MS = 45_000
-/** High-thinking / reasoning-model no-token watchdog window (ms). */
-export const REASONING_NO_TOKEN_WATCHDOG_MS = 60_000
-const REASONING_MODEL_RE = /(?:reasoner|thinking|(?:^|[-_/])r1\b|(?:^|[-_/])o[134](?:[-_]|$)|deepseek-v4)/i
+export {
+  DEFAULT_NO_TOKEN_WATCHDOG_MS,
+  MEDIUM_THINKING_NO_TOKEN_WATCHDOG_MS,
+  REASONING_NO_TOKEN_WATCHDOG_MS,
+}
 
 /**
- * Profile-aware no-token watchdog window. Reasoning / thinking models routinely pause 25–45 s
- * before emitting their first SSE frame (or between reasoning bursts under concurrent load),
- * whereas a flat 28 s threshold aborts healthy turns. An explicit `KOVO_PROVIDER_NO_TOKEN_MS`
- * override always wins (clamped 5–180 s).
+ * Profile-aware no-token watchdog window backed by `resolveProviderRuntimePolicy` (R2-21).
+ * Computed strictly from the profile's explicit fields (`thinkingLevel`, `roleAffinity`) with
+ * zero model-name regexes. An explicit `KOVO_PROVIDER_NO_TOKEN_MS` override always wins (5–180 s).
  */
 export function resolveProfileNoTokenWatchdogMs(
   profile?: { model?: string; thinkingLevel?: ThinkingLevel; roleAffinity?: RoleAffinity },
   env: NodeJS.ProcessEnv = process.env,
 ): number {
-  const raw = Number(env.KOVO_PROVIDER_NO_TOKEN_MS)
-  if (Number.isFinite(raw) && raw > 0) {
-    return Math.max(5_000, Math.min(180_000, Math.floor(raw)))
+  return resolveProviderRuntimePolicy(profile, { env }).noTokenWatchdogMs
+}
+
+export interface ProviderStreamTelemetrySnapshot {
+  /** Number of turns aborted due to provider stall (first-event, idle, or no-token watchdog). */
+  stallAborts: number
+  /** Number of completed turns whose latency exceeded the slow-turn threshold (never counts stall aborts). */
+  slowTurns: number
+}
+
+export interface ProviderStreamTelemetry {
+  recordStallAbort(): void
+  recordCompletedTurn(durationMs: number, slowTurnThresholdMs?: number): boolean
+  snapshot(): ProviderStreamTelemetrySnapshot
+}
+
+/**
+ * Splits `stallAborts` (hard timeout/stall cancellations) from `slowTurns` (completed turns that
+ * exceeded `slowTurnThresholdMs`) so stream telemetry never conflates the two failure modes.
+ */
+export function createProviderStreamTelemetry(
+  defaultSlowTurnThresholdMs = 20_000,
+): ProviderStreamTelemetry {
+  let stallAborts = 0
+  let slowTurns = 0
+  const fallbackThreshold = Number.isFinite(defaultSlowTurnThresholdMs) && defaultSlowTurnThresholdMs > 0
+    ? defaultSlowTurnThresholdMs
+    : 20_000
+
+  return {
+    recordStallAbort() {
+      stallAborts += 1
+    },
+    recordCompletedTurn(durationMs: number, slowTurnThresholdMs?: number): boolean {
+      const threshold = typeof slowTurnThresholdMs === 'number' && Number.isFinite(slowTurnThresholdMs) && slowTurnThresholdMs > 0
+        ? slowTurnThresholdMs
+        : fallbackThreshold
+      if (Number.isFinite(durationMs) && durationMs > threshold) {
+        slowTurns += 1
+        return true
+      }
+      return false
+    },
+    snapshot(): ProviderStreamTelemetrySnapshot {
+      return { stallAborts, slowTurns }
+    },
   }
-  if (!profile) return DEFAULT_NO_TOKEN_WATCHDOG_MS
-  if (
-    profile.thinkingLevel === 'high' ||
-    profile.roleAffinity === 'reasoning' ||
-    (typeof profile.model === 'string' && REASONING_MODEL_RE.test(profile.model))
-  ) {
-    return REASONING_NO_TOKEN_WATCHDOG_MS
-  }
-  if (profile.thinkingLevel === 'medium') {
-    return MEDIUM_THINKING_NO_TOKEN_WATCHDOG_MS
-  }
-  return DEFAULT_NO_TOKEN_WATCHDOG_MS
 }
 
 export type SecretSource = readonly NamedSecret[] | (() => readonly NamedSecret[])

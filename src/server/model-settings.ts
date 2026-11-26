@@ -6,6 +6,11 @@ import { and, desc, eq } from 'drizzle-orm'
 import type { z } from 'zod'
 import { providerSettings } from '../domain.ts'
 import type { ProviderSettings, PublicModelProfile, RoleAffinity } from '../domain.ts'
+import {
+  CONSERVATIVE_FALLBACK_PRICING,
+  isDefaultFlashModel,
+  resolveProfilePricing,
+} from './provider-runtime-policy.ts'
 import { testProvider } from './provider.ts'
 import { redact } from './redact.ts'
 import { modelProfiles } from './schema.ts'
@@ -494,6 +499,12 @@ export function inspectModelProfileLoad(storage: Store = store()): ModelProfileL
         storage.db.update(modelProfiles).set({ healthState: 'half_open', cooldownUntil: null })
           .where(and(eq(modelProfiles.id, row.id), eq(modelProfiles.workspaceId, storage.workspace.id))).run()
       }
+      const resolvedPricing = resolveProfilePricing({
+        model: row.model,
+        inputCostPerMtok: row.inputCostPerMtok,
+        cachedInputCostPerMtok: row.cachedInputCostPerMtok,
+        outputCostPerMtok: row.outputCostPerMtok,
+      })
       resolved.push({
         id: row.id,
         name: row.name,
@@ -507,9 +518,9 @@ export function inspectModelProfileLoad(storage: Store = store()): ModelProfileL
         maxTokens: row.maxTokens,
         thinkingLevel: row.thinkingLevel,
         roleAffinity: row.roleAffinity ?? 'any',
-        inputCostPerMtok: row.inputCostPerMtok,
-        cachedInputCostPerMtok: row.cachedInputCostPerMtok,
-        outputCostPerMtok: row.outputCostPerMtok,
+        inputCostPerMtok: resolvedPricing.inputCostPerMtok,
+        cachedInputCostPerMtok: resolvedPricing.cachedInputCostPerMtok,
+        outputCostPerMtok: resolvedPricing.outputCostPerMtok,
         healthState,
         cooldownUntil,
         lastError: row.lastError,
@@ -687,12 +698,87 @@ function resolveEffectiveKey(
   return readFileSync(credentialPathInDir(credTarget.dir, existing.credentialId), 'utf8').trim()
 }
 
+function assertNoNullOrNegativePricing(raw: Record<string, unknown>): void {
+  for (const field of ['inputCostPerMtok', 'cachedInputCostPerMtok', 'outputCostPerMtok'] as const) {
+    if (!Object.prototype.hasOwnProperty.call(raw, field)) continue
+    const val = raw[field]
+    if (val === undefined) continue
+    if (val === null || typeof val !== 'number' || !Number.isFinite(val) || val < 0) {
+      throw new Error(
+        `Invalid ${field}: pricing must be a finite non-negative number (null pricing is forbidden because it would disable the hard USD cap).`,
+      )
+    }
+  }
+}
+
+function normalizeModelProfilePricingInput(
+  input: z.input<typeof providerSettings>,
+  opts: {
+    existing?: typeof modelProfiles.$inferSelect
+    requireExplicitPricing?: boolean
+  } = {},
+): z.input<typeof providerSettings> {
+  const raw = input as Record<string, unknown>
+  assertNoNullOrNegativePricing(raw)
+
+  const model = typeof input.model === 'string' ? input.model.trim() : ''
+  if (isDefaultFlashModel(model)) {
+    return input
+  }
+
+  const hasExplicitInput = typeof input.inputCostPerMtok === 'number'
+  const hasExplicitOutput = typeof input.outputCostPerMtok === 'number'
+  const hasExplicitCached = typeof input.cachedInputCostPerMtok === 'number'
+
+  if (hasExplicitInput && hasExplicitOutput) {
+    return {
+      ...input,
+      cachedInputCostPerMtok: hasExplicitCached ? input.cachedInputCostPerMtok : input.inputCostPerMtok,
+    }
+  }
+
+  const sameModelUpdate = Boolean(
+    opts.existing && opts.existing.model.trim().toLowerCase() === model.toLowerCase(),
+  )
+  if (sameModelUpdate && opts.existing) {
+    const preserved = resolveProfilePricing(opts.existing)
+    return {
+      ...input,
+      inputCostPerMtok: hasExplicitInput ? input.inputCostPerMtok : preserved.inputCostPerMtok,
+      cachedInputCostPerMtok: hasExplicitCached ? input.cachedInputCostPerMtok : preserved.cachedInputCostPerMtok,
+      outputCostPerMtok: hasExplicitOutput ? input.outputCostPerMtok : preserved.outputCostPerMtok,
+    }
+  }
+
+  if (opts.requireExplicitPricing) {
+    throw new Error(
+      `Explicit inputCostPerMtok and outputCostPerMtok are required for non-default model profile '${model || 'unknown'}'.`,
+    )
+  }
+
+  // Non-default model without explicit pricing: apply conservatively high fallback pricing
+  // instead of silently inheriting cheap Flash defaults (and never disable the USD cap).
+  const fallbackInput = hasExplicitInput ? input.inputCostPerMtok! : CONSERVATIVE_FALLBACK_PRICING.inputCostPerMtok
+  const fallbackOutput = hasExplicitOutput ? input.outputCostPerMtok! : CONSERVATIVE_FALLBACK_PRICING.outputCostPerMtok
+  const fallbackCached = hasExplicitCached
+    ? input.cachedInputCostPerMtok!
+    : Math.min(fallbackInput, CONSERVATIVE_FALLBACK_PRICING.cachedInputCostPerMtok)
+
+  return {
+    ...input,
+    inputCostPerMtok: fallbackInput,
+    cachedInputCostPerMtok: fallbackCached,
+    outputCostPerMtok: fallbackOutput,
+  }
+}
+
 export async function checkModelConnection(
   input: z.input<typeof providerSettings>,
   storage: Store = store(),
 ): Promise<{ ok: true }> {
-  const parsed = providerSettings.parse(input)
-  const existing = findExistingProfile(storage, parsed)
+  const existing = typeof input.id === 'string' ? findExistingProfile(storage, { id: input.id }) : undefined
+  const normalizedInput = normalizeModelProfilePricingInput(input, { existing })
+  const parsed = providerSettings.parse(normalizedInput)
   const resolvedKey = resolveEffectiveKey(storage, parsed, existing)
   const effective = { ...parsed, key: resolvedKey }
   const digest = hash(effective)
@@ -725,10 +811,15 @@ export async function checkModelConnection(
 export async function saveModelProfile(
   input: z.input<typeof providerSettings>,
   storage: Store = store(),
-  options: { skipConnectionCheck?: boolean } = {},
+  options: { skipConnectionCheck?: boolean; requireExplicitPricing?: boolean } = {},
 ): Promise<{ ok: true; id: string }> {
-  const settings = providerSettings.parse(input)
-  const existing = findExistingProfile(storage, settings)
+  const existingPreParse = typeof input.id === 'string' ? findExistingProfile(storage, { id: input.id }) : undefined
+  const normalizedInput = normalizeModelProfilePricingInput(input, {
+    existing: existingPreParse,
+    requireExplicitPricing: options.requireExplicitPricing,
+  })
+  const settings = providerSettings.parse(normalizedInput)
+  const existing = existingPreParse ?? findExistingProfile(storage, settings)
   const rotatingKey = Boolean(settings.key)
   const resolvedKey = resolveEffectiveKey(storage, settings, existing)
   const effective = { ...settings, key: resolvedKey }

@@ -13,8 +13,9 @@ import {
 import type { LeaseMatchContext } from './approval-pattern.ts'
 import { resolveProfilePoolForRole } from './model-settings.ts'
 import type { ResolvedModelProfile } from './model-settings.ts'
+import { providerOptionsFor } from './provider-runtime-policy.ts'
 import { classifyProviderFailure, providerPool } from './provider.ts'
-import type { ProviderFailureKind, UsageCallback } from './provider.ts'
+import type { ProviderFailureKind, TelemetryCallback, UsageCallback } from './provider.ts'
 import { redact } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
 import {
@@ -778,27 +779,31 @@ function detectRouteStructuralEscalationReason(input: {
 export function createSafetyJudgeLlmCall(
   profiles: readonly ResolvedModelProfile[],
   options: {
+    runId?: string
     signal?: AbortSignal
     secrets?: readonly NamedSecret[]
     onUsage?: UsageCallback
+    onTelemetry?: TelemetryCallback
     fetch?: typeof fetch
   } = {},
 ): SafetyJudgeLlmCall {
   return async ({ systemPrompt, userPrompt }) => {
     const routed = resolveProfilePoolForRole('fast', profiles)
-    const { models, model } = providerPool(routed, 'approval-safety-judge', {
-      signal: options.signal,
-      secrets: options.secrets,
-      onUsage: options.onUsage,
-      ...(options.fetch ? { fetch: options.fetch } : {}),
-      maxCalls: 1,
-      maxTransportRetries: 0,
-      thinkingLevel: 'off',
-      roleAffinity: 'fast',
-      firstEventTimeoutMs: 20_000,
-      idleTimeoutMs: 20_000,
-      totalTimeoutMs: 30_000,
-    })
+    const { models, model } = providerPool(
+      routed,
+      'approval-safety-judge',
+      providerOptionsFor(options.runId, 'fast', 'approval-safety-judge', {
+        profile: routed[0],
+        signal: options.signal,
+        secrets: options.secrets,
+        onUsage: options.onUsage,
+        onTelemetry: options.onTelemetry,
+        ...(options.fetch ? { fetch: options.fetch } : {}),
+        maxCalls: 1,
+        maxTransportRetries: 0,
+        thinkingLevel: 'off',
+      }),
+    )
     const stream = models.stream(model, {
       systemPrompt: redact(systemPrompt, options.secrets),
       messages: [{ role: 'user', content: redact(userPrompt, options.secrets), timestamp: Date.now() }],
