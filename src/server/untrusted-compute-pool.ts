@@ -8,7 +8,9 @@
  *   - Bounded concurrency and bounded queue depth (fail-closed backpressure)
  *   - Idle workers are `unref()`'d so they never pin process shutdown
  */
+import { fork, type ChildProcess } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
+import { fileURLToPath } from 'node:url'
 import { Worker, type ResourceLimits } from 'node:worker_threads'
 import {
   ComposeParseError,
@@ -16,6 +18,8 @@ import {
   type ParsedComposeDocument,
 } from './compose-parse.ts'
 import type { ProgramGraph } from './program-graph.ts'
+
+export type UntrustedComputeIsolation = 'thread' | 'process'
 
 export type UntrustedTaskKind =
   | 'parse_compose'
@@ -109,13 +113,13 @@ export class UntrustedComputeWorkerError extends Error {
 }
 
 export interface UntrustedComputePoolOptions {
-  /** Maximum concurrent worker threads (clamped 1..16). Defaults to 2. */
+  /** Maximum concurrent worker isolates/processes (clamped 1..16). Defaults to 2. */
   maxConcurrency?: number
   /** Maximum pending tasks waiting for a worker slot (clamped 1..1024). Defaults to 64. */
   maxQueueSize?: number
   /** Default wall-clock timeout per task in ms (clamped 10..120000). Defaults to 5000ms. */
   defaultTimeoutMs?: number
-  /** V8 resource limits enforced per worker isolate. */
+  /** V8 resource limits enforced per worker isolate / child process. */
   resourceLimits?: ResourceLimits
   /** Recycle a worker after this many completed tasks (defaults to 100). */
   maxTasksPerWorker?: number
@@ -123,6 +127,12 @@ export interface UntrustedComputePoolOptions {
   maxPayloadBytes?: number
   /** Optional custom worker script URL/path (defaults to `./parser-worker-entry.ts`). */
   workerEntry?: URL | string
+  /**
+   * Isolation backend:
+   * - `'thread'`: bounded `worker_threads` V8 isolate (default for pure JS tasks & custom thread entries)
+   * - `'process'`: pooled disposable `child_process.fork` IPC worker (full crash/SIGSEGV isolation for native parsers)
+   */
+  isolation?: UntrustedComputeIsolation
 }
 
 export interface UntrustedTaskOptions {
@@ -145,7 +155,9 @@ interface PendingTask {
 }
 
 interface PoolWorkerSlot {
-  worker: Worker
+  isolation: UntrustedComputeIsolation
+  worker?: Worker
+  child?: ChildProcess
   busy: boolean
   tasksCompleted: number
   retired: boolean
@@ -229,6 +241,7 @@ export class UntrustedComputePool {
   readonly maxPayloadBytes: number
   readonly resourceLimits: ResourceLimits
   readonly maxTasksPerWorker: number
+  readonly isolation: UntrustedComputeIsolation
   private readonly workerEntry: URL | string
   private readonly slots = new Set<PoolWorkerSlot>()
   private readonly idle: PoolWorkerSlot[] = []
@@ -246,6 +259,7 @@ export class UntrustedComputePool {
       MAX_UNTRUSTED_PAYLOAD_BYTES_CAP,
     )
     this.maxTasksPerWorker = clampInt(options.maxTasksPerWorker, 100, 1, 10_000)
+    this.isolation = options.isolation === 'process' ? 'process' : 'thread'
     this.workerEntry = options.workerEntry ?? new URL('./parser-worker-entry.ts', import.meta.url)
     this.resourceLimits = {
       maxOldGenerationSizeMb: clampInt(
@@ -361,12 +375,45 @@ export class UntrustedComputePool {
     while (this.idle.length > 0) {
       const candidate = this.idle.pop()!
       if (!candidate.retired && this.slots.has(candidate)) {
+        if (candidate.isolation === 'process' && (!candidate.child || !candidate.child.connected || candidate.child.killed)) {
+          this.retireSlot(candidate)
+          continue
+        }
         candidate.busy = true
         return candidate
       }
     }
     if (this.slots.size >= this.maxConcurrency) {
       return null
+    }
+    if (this.isolation === 'process') {
+      const entryPath = this.workerEntry instanceof URL ? fileURLToPath(this.workerEntry) : this.workerEntry
+      const maxOldSpaceMb = Math.max(
+        128,
+        this.resourceLimits.maxOldGenerationSizeMb ?? DEFAULT_WORKER_RESOURCE_LIMITS.maxOldGenerationSizeMb,
+      )
+      const child = fork(entryPath, [], {
+        execArgv: [`--max-old-space-size=${maxOldSpaceMb}`],
+        // Strip host process.env so untrusted child processes never have access to host secrets.
+        env: {},
+        serialization: 'advanced',
+        stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+      })
+      const slot: PoolWorkerSlot = {
+        isolation: 'process',
+        child,
+        busy: true,
+        tasksCompleted: 0,
+        retired: false,
+      }
+      this.slots.add(slot)
+      child.once('exit', () => {
+        slot.retired = true
+        this.slots.delete(slot)
+        const idleIdx = this.idle.indexOf(slot)
+        if (idleIdx >= 0) this.idle.splice(idleIdx, 1)
+      })
+      return slot
     }
     const worker = new Worker(this.workerEntry, {
       resourceLimits: this.resourceLimits,
@@ -375,6 +422,7 @@ export class UntrustedComputePool {
       env: {},
     })
     const slot: PoolWorkerSlot = {
+      isolation: 'thread',
       worker,
       busy: true,
       tasksCompleted: 0,
@@ -390,13 +438,59 @@ export class UntrustedComputePool {
     return slot
   }
 
+  private unrefSlot(slot: PoolWorkerSlot): void {
+    if (slot.worker) {
+      slot.worker.unref()
+    } else if (slot.child) {
+      slot.child.unref()
+      ;(slot.child as unknown as { channel?: { unref?: () => void } }).channel?.unref?.()
+    }
+  }
+
+  private refSlot(slot: PoolWorkerSlot): void {
+    if (slot.worker) {
+      slot.worker.ref()
+    } else if (slot.child) {
+      slot.child.ref()
+      ;(slot.child as unknown as { channel?: { ref?: () => void } }).channel?.ref?.()
+    }
+  }
+
+  private terminateSlot(slot: PoolWorkerSlot): Promise<unknown> {
+    if (slot.worker) {
+      return slot.worker.terminate().catch(() => undefined)
+    }
+    if (slot.child) {
+      const child = slot.child
+      if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve()
+      return new Promise<void>(resolve => {
+        let done = false
+        const finish = () => {
+          if (done) return
+          done = true
+          clearTimeout(fallback)
+          resolve()
+        }
+        child.once('exit', finish)
+        const fallback = setTimeout(finish, 250)
+        fallback.unref?.()
+        try {
+          child.kill('SIGKILL')
+        } catch {
+          finish()
+        }
+      })
+    }
+    return Promise.resolve()
+  }
+
   private retireSlot(slot: PoolWorkerSlot): void {
     slot.retired = true
     slot.busy = false
     this.slots.delete(slot)
     const idleIdx = this.idle.indexOf(slot)
     if (idleIdx >= 0) this.idle.splice(idleIdx, 1)
-    void slot.worker.terminate().catch(() => undefined)
+    void this.terminateSlot(slot)
   }
 
   private releaseOrRetireSlot(slot: PoolWorkerSlot): void {
@@ -406,13 +500,14 @@ export class UntrustedComputePool {
       || slot.retired
       || !this.slots.has(slot)
       || slot.tasksCompleted >= this.maxTasksPerWorker
+      || (slot.isolation === 'process' && (!slot.child || !slot.child.connected || slot.child.killed))
     ) {
       this.retireSlot(slot)
       this.drainQueue()
       return
     }
     slot.busy = false
-    slot.worker.unref()
+    this.unrefSlot(slot)
     this.idle.push(slot)
     this.drainQueue()
   }
@@ -428,7 +523,7 @@ export class UntrustedComputePool {
       }
       if (nextTask.signal?.aborted) {
         slot.busy = false
-        slot.worker.unref()
+        this.unrefSlot(slot)
         this.idle.push(slot)
         nextTask.reject(new UntrustedComputeAbortedError())
         continue
@@ -438,17 +533,8 @@ export class UntrustedComputePool {
   }
 
   private dispatchToSlot(slot: PoolWorkerSlot, task: PendingTask): void {
-    const { worker } = slot
-    worker.ref()
+    this.refSlot(slot)
     let settled = false
-
-    const cleanupListeners = () => {
-      clearTimeout(timer)
-      worker.off('message', onMessage)
-      worker.off('error', onError)
-      worker.off('exit', onExit)
-      if (task.signal) task.signal.removeEventListener('abort', onAbort)
-    }
 
     const onMessage = (raw: unknown) => {
       const msg = raw as WorkerTaskResponse | null | undefined
@@ -472,13 +558,31 @@ export class UntrustedComputePool {
       task.reject(new UntrustedComputeWorkerError(err.message))
     }
 
-    const onExit = (code: number) => {
+    const onThreadExit = (code: number) => {
       if (settled) return
       settled = true
       cleanupListeners()
       this.retireSlot(slot)
       this.drainQueue()
       task.reject(new UntrustedComputeWorkerError(`Worker thread exited unexpectedly with code ${code}.`))
+    }
+
+    const onProcessExit = (code: number | null, sig: NodeJS.Signals | null) => {
+      if (settled) return
+      settled = true
+      cleanupListeners()
+      this.retireSlot(slot)
+      this.drainQueue()
+      task.reject(new UntrustedComputeWorkerError(`Worker process exited unexpectedly (code=${code ?? 'null'}, signal=${sig ?? 'none'}).`))
+    }
+
+    const onProcessDisconnect = () => {
+      if (settled) return
+      settled = true
+      cleanupListeners()
+      this.retireSlot(slot)
+      this.drainQueue()
+      task.reject(new UntrustedComputeWorkerError('Worker process IPC channel disconnected unexpectedly.'))
     }
 
     const onAbort = () => {
@@ -490,20 +594,43 @@ export class UntrustedComputePool {
       task.reject(new UntrustedComputeAbortedError())
     }
 
+    const cleanupListeners = () => {
+      clearTimeout(timer)
+      if (slot.worker) {
+        slot.worker.off('message', onMessage)
+        slot.worker.off('error', onError)
+        slot.worker.off('exit', onThreadExit)
+      }
+      if (slot.child) {
+        slot.child.off('message', onMessage)
+        slot.child.off('error', onError)
+        slot.child.off('exit', onProcessExit)
+        slot.child.off('disconnect', onProcessDisconnect)
+      }
+      if (task.signal) task.signal.removeEventListener('abort', onAbort)
+    }
+
     const timer = setTimeout(() => {
       if (settled) return
       settled = true
       cleanupListeners()
-      // Hard wall-clock termination: destroy the isolate so infinite loops/ReDoS cannot linger.
+      // Hard wall-clock termination: destroy the isolate/process so infinite loops/ReDoS cannot linger.
       this.retireSlot(slot)
       this.drainQueue()
       task.reject(new UntrustedComputeTimeoutError(task.kind, task.timeoutMs))
     }, task.timeoutMs)
     timer.unref?.()
 
-    worker.on('message', onMessage)
-    worker.once('error', onError)
-    worker.once('exit', onExit)
+    if (slot.worker) {
+      slot.worker.on('message', onMessage)
+      slot.worker.once('error', onError)
+      slot.worker.once('exit', onThreadExit)
+    } else if (slot.child) {
+      slot.child.on('message', onMessage)
+      slot.child.once('error', onError)
+      slot.child.once('exit', onProcessExit)
+      slot.child.once('disconnect', onProcessDisconnect)
+    }
     if (task.signal) {
       if (task.signal.aborted) {
         onAbort()
@@ -518,7 +645,19 @@ export class UntrustedComputePool {
       payload: task.payload,
     }
     try {
-      worker.postMessage(request)
+      if (slot.worker) {
+        slot.worker.postMessage(request)
+      } else if (slot.child) {
+        slot.child.send(request, err => {
+          if (err && !settled) {
+            settled = true
+            cleanupListeners()
+            this.retireSlot(slot)
+            this.drainQueue()
+            task.reject(new UntrustedComputeWorkerError(err.message))
+          }
+        })
+      }
     } catch (err) {
       if (!settled) {
         settled = true
@@ -541,30 +680,52 @@ export class UntrustedComputePool {
       pending.reject(new UntrustedComputeWorkerError('UntrustedComputePool closed while task was queued.'))
     }
     this.idle.length = 0
-    const workers = [...this.slots].map(slot => {
-      slot.retired = true
-      return slot.worker
-    })
+    const activeSlots = [...this.slots]
+    for (const slot of activeSlots) slot.retired = true
     this.slots.clear()
-    await Promise.allSettled(workers.map(w => w.terminate()))
+    await Promise.allSettled(activeSlots.map(slot => this.terminateSlot(slot)))
   }
 }
 
 let sharedPool: UntrustedComputePool | undefined
+let sharedProcessPool: UntrustedComputePool | undefined
 
 export function getSharedUntrustedComputePool(): UntrustedComputePool {
-  if (!sharedPool) {
-    sharedPool = new UntrustedComputePool()
+  if (!sharedPool || sharedPool.stats().closed) {
+    sharedPool = new UntrustedComputePool({ isolation: 'thread' })
   }
   return sharedPool
 }
 
-export async function closeSharedUntrustedComputePool(): Promise<void> {
-  const pool = sharedPool
-  sharedPool = undefined
+/**
+ * Shared pooled disposable child-process pool (`child_process.fork` + IPC) used for tasks that may
+ * invoke native parsers (e.g. `@swc/core` in `js_harvest`) so even a native SIGSEGV/OOM is isolated
+ * from the Kovo host process (`R2-H-23`).
+ */
+export function getSharedUntrustedProcessPool(): UntrustedComputePool {
+  if (!sharedProcessPool || sharedProcessPool.stats().closed) {
+    sharedProcessPool = new UntrustedComputePool({ isolation: 'process' })
+  }
+  return sharedProcessPool
+}
+
+export async function closeSharedUntrustedProcessPool(): Promise<void> {
+  const pool = sharedProcessPool
+  sharedProcessPool = undefined
   if (pool) {
     await pool.close()
   }
+}
+
+export async function closeSharedUntrustedComputePool(): Promise<void> {
+  const threadPool = sharedPool
+  const procPool = sharedProcessPool
+  sharedPool = undefined
+  sharedProcessPool = undefined
+  await Promise.allSettled([
+    ...(threadPool ? [threadPool.close()] : []),
+    ...(procPool ? [procPool.close()] : []),
+  ])
 }
 
 export function runUntrustedTask<TResult = unknown>(
@@ -572,6 +733,9 @@ export function runUntrustedTask<TResult = unknown>(
   payload: unknown,
   opts?: UntrustedTaskOptions,
 ): Promise<TResult> {
+  if (kind === 'js_harvest') {
+    return getSharedUntrustedProcessPool().run<TResult>(kind, payload, opts)
+  }
   return getSharedUntrustedComputePool().run<TResult>(kind, payload, opts)
 }
 
@@ -605,40 +769,43 @@ export interface ExtractedHtmlSurface {
   inputs: Array<{ name: string; id: string | null; type: string | null }>
 }
 
+const MAX_HTML_SCAN_BYTES = 512 * 1024
+
 export function extractHtmlLinksAndScripts(html: string, origin: string): ExtractedHtmlSurface {
+  const boundedHtml = html.length > MAX_HTML_SCAN_BYTES ? html.slice(0, MAX_HTML_SCAN_BYTES) : html
   const links = new Set<string>()
   const scripts = new Set<string>()
   const forms: Array<{ action: string; method: string; inputs: string[]; enctype: string }> = []
   const inputs: Array<{ name: string; id: string | null; type: string | null }> = []
   const seenInputs = new Set<string>()
 
-  for (const m of html.matchAll(/<a\b[^>]*\bhref\s*=\s*["']([^"']+)["']/gi)) {
+  for (const m of boundedHtml.matchAll(/<a\b[^>]{0,1024}\bhref[ \t]{0,8}=[ \t]{0,8}["']([^"'\r\n]{1,1024})["']/gi)) {
     const clean = sanitizeSameOriginPath(m[1] ?? '', origin)
     if (clean && !POOL_STATIC_ASSET_RE.test(clean)) links.add(clean)
   }
-  for (const m of html.matchAll(/<script\b[^>]*\bsrc\s*=\s*["']([^"']+)["']/gi)) {
+  for (const m of boundedHtml.matchAll(/<script\b[^>]{0,1024}\bsrc[ \t]{0,8}=[ \t]{0,8}["']([^"'\r\n]{1,1024})["']/gi)) {
     const clean = sanitizeSameOriginPath(m[1] ?? '', origin)
     if (clean) scripts.add(clean)
   }
-  for (const m of html.matchAll(/<form\b([^>]*)>([\s\S]*?)<\/form>/gi)) {
+  for (const m of boundedHtml.matchAll(/<form\b([^>]{0,1024})>([\s\S]{0,65536}?)<\/form>/gi)) {
     const attrs = m[1] ?? ''
     const inner = m[2] ?? ''
-    const actionMatch = /\baction\s*=\s*["']([^"']+)["']/i.exec(attrs)
-    const methodMatch = /\bmethod\s*=\s*["']([a-zA-Z]+)["']/i.exec(attrs)
-    const enctypeMatch = /\benctype\s*=\s*["']([^"']+)["']/i.exec(attrs)
+    const actionMatch = /\baction[ \t]{0,8}=[ \t]{0,8}["']([^"'\r\n]{1,1024})["']/i.exec(attrs)
+    const methodMatch = /\bmethod[ \t]{0,8}=[ \t]{0,8}["']([a-zA-Z]{1,16})["']/i.exec(attrs)
+    const enctypeMatch = /\benctype[ \t]{0,8}=[ \t]{0,8}["']([^"'\r\n]{1,128})["']/i.exec(attrs)
     const action = sanitizeSameOriginPath(actionMatch?.[1] ?? '/', origin) ?? '/'
     const method = (methodMatch?.[1] ?? 'GET').toUpperCase()
     const inputsInForm: string[] = []
-    for (const im of inner.matchAll(/<(?:input|select|textarea)\b[^>]*\bname\s*=\s*["']([^"']+)["']/gi)) {
+    for (const im of inner.matchAll(/<(?:input|select|textarea)\b[^>]{0,512}\bname[ \t]{0,8}=[ \t]{0,8}["']([^"'\r\n]{1,128})["']/gi)) {
       if (im[1]) inputsInForm.push(im[1])
     }
     forms.push({ action, method, inputs: inputsInForm, enctype: (enctypeMatch?.[1] ?? 'application/x-www-form-urlencoded').toLowerCase() })
   }
-  for (const tm of html.matchAll(/<(?:input|select|textarea)\b([^>]*)>/gi)) {
+  for (const tm of boundedHtml.matchAll(/<(?:input|select|textarea)\b([^>]{0,512})>/gi)) {
     const attrs = tm[1] ?? ''
-    const nameMatch = /\bname\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i.exec(attrs)
-    const idMatch = /\bid\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i.exec(attrs)
-    const typeMatch = /\btype\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i.exec(attrs)
+    const nameMatch = /\bname[ \t]{0,8}=[ \t]{0,8}(?:"([^"\r\n]{0,128})"|'([^'\r\n]{0,128})'|([^\s>]{1,128}))/i.exec(attrs)
+    const idMatch = /\bid[ \t]{0,8}=[ \t]{0,8}(?:"([^"\r\n]{0,128})"|'([^'\r\n]{0,128})'|([^\s>]{1,128}))/i.exec(attrs)
+    const typeMatch = /\btype[ \t]{0,8}=[ \t]{0,8}(?:"([^"\r\n]{0,64})"|'([^'\r\n]{0,64})'|([^\s>]{1,64}))/i.exec(attrs)
     const name = (nameMatch?.[1] ?? nameMatch?.[2] ?? nameMatch?.[3] ?? idMatch?.[1] ?? idMatch?.[2] ?? idMatch?.[3] ?? '').trim()
     if (!name) continue
     const id = (idMatch?.[1] ?? idMatch?.[2] ?? idMatch?.[3] ?? null)

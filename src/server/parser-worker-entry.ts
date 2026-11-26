@@ -192,4 +192,25 @@ if (!isMainThread && parentPort) {
       }
     })()
   })
+} else if (isMainThread && typeof process.send === 'function') {
+  // Disposable child_process.fork IPC mode (`R2-H-23`): isolates native crashes (e.g. SIGSEGV)
+  // and OOMs completely from the host Kovo process.
+  process.on('message', (raw: unknown) => {
+    const msg = raw as WorkerTaskRequest | null | undefined
+    if (!msg || typeof msg.id !== 'string' || typeof msg.kind !== 'string') return
+    void (async () => {
+      try {
+        const result = await executeTask(msg.kind, msg.payload)
+        const response: WorkerTaskResponse = { id: msg.id, ok: true, result }
+        if (process.connected) process.send?.(response)
+      } catch (err) {
+        const response: WorkerTaskResponse = {
+          id: msg.id,
+          ok: false,
+          error: serializeWorkerError(err),
+        }
+        if (process.connected) process.send?.(response)
+      }
+    })()
+  })
 }
