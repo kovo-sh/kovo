@@ -343,5 +343,5 @@ test('C4, worker/Dockerfile arm64, and verify.yml hardening contracts hold', () 
 
   assert.match(verifyYml, /timeout-minutes:\s*30/)
   assert.match(verifyYml, /timeout-minutes:\s*12/)
-  assert.match(verifyYml, /npm run test:e2e -- --workers=2 --global-timeout=600000/)
+  assert.match(verifyYml, /npm run build && KOVO_ALLOW_LOCAL_MODEL=1 node --test tests\/e2e-ui-journeys\.test\.ts/)
 })

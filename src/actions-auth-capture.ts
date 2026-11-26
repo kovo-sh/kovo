@@ -6,11 +6,6 @@
 import { createServerFn } from '@tanstack/react-start'
 import { z } from 'zod'
 import { id, personaHandle, scopedAssetOrigin, shortText } from './domain.ts'
-import {
-  createBrowserSessionPersona,
-  updateBrowserSessionPersona,
-} from './server/persona-vault.ts'
-import { store } from './server/store.ts'
 
 const MAX_STORAGE_STATE_JSON_CHARS = 2 * 1024 * 1024
 
@@ -61,8 +56,20 @@ export const updateBrowserSessionPersonaSchema = z.object({
 
 export const registerBrowserSessionPersona = createServerFn({ method: 'POST' })
   .validator(createBrowserSessionPersonaSchema)
-  .handler(({ data }) => createBrowserSessionPersona(store(), data))
+  .handler(async ({ data }) => {
+    const [{ store }, { createBrowserSessionPersona }] = await Promise.all([
+      import('./server/store.ts'),
+      import('./server/persona-vault.ts'),
+    ])
+    return createBrowserSessionPersona(store(), data)
+  })
 
 export const updateBrowserSessionPersonaAction = createServerFn({ method: 'POST' })
   .validator(updateBrowserSessionPersonaSchema)
-  .handler(({ data }) => updateBrowserSessionPersona(store(), data))
+  .handler(async ({ data }) => {
+    const [{ store }, { updateBrowserSessionPersona }] = await Promise.all([
+      import('./server/store.ts'),
+      import('./server/persona-vault.ts'),
+    ])
+    return updateBrowserSessionPersona(store(), data)
+  })

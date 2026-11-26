@@ -17,7 +17,10 @@ import { dirname, join, resolve } from 'node:path'
 import { redact } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
 
-export const DEFAULT_GITHUB_PAT_PATH = join(homedir(), '.config', 'kovo-fixtures', 'github.pat')
+export const DEFAULT_GITHUB_PAT_PATH =
+  typeof process !== 'undefined' && Boolean(process.versions?.node)
+    ? join(homedir(), '.config', 'kovo-fixtures', 'github.pat')
+    : ''
 export const DEFAULT_GITHUB_MAX_AUTO_SELECT = 10
 export const DEFAULT_GITHUB_BASE_URL = 'https://github.com'
 export const DEFAULT_GITHUB_API_BASE_URL = 'https://api.github.com'

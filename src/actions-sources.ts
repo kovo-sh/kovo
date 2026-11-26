@@ -1,16 +1,7 @@
+import { createRequire } from 'node:module'
 import { createServerFn } from '@tanstack/react-start'
-import { and, eq, ne } from 'drizzle-orm'
 import { z } from 'zod'
 import { assetOriginForEnvironment, id, maxSpecBytes, shortText } from './domain.ts'
-import {
-  listProjectMountedRepos,
-  projectReposDir,
-  syncGithubRepos,
-  unlinkProjectMountedRepo,
-} from './server/github-repo-sync.ts'
-import { redact } from './server/redact.ts'
-import * as tables from './server/schema.ts'
-import { store } from './server/store.ts'
 import type { Store } from './server/store.ts'
 
 const repoSlugSchema = z
@@ -34,6 +25,9 @@ export const updateProjectSpecSchema = z.object({
 })
 
 export function unlinkProjectRepoInStore(db: Store, projectId: string, repoSlug: string) {
+  const { unlinkProjectMountedRepo } = createRequire(import.meta.url)(
+    './server/github-repo-sync.ts',
+  ) as typeof import('./server/github-repo-sync.ts')
   db.project(projectId)
   const result = unlinkProjectMountedRepo(db.directory, projectId, repoSlug)
   if (result.unlinked) {
@@ -49,6 +43,10 @@ export function updateProjectSpecInStore(
   db: Store,
   input: z.output<typeof updateProjectSpecSchema>,
 ) {
+  const req = createRequire(import.meta.url)
+  const { and, eq, ne } = req('drizzle-orm') as typeof import('drizzle-orm')
+  const { redact } = req('./server/redact.ts') as typeof import('./server/redact.ts')
+  const tables = req('./server/schema.ts') as typeof import('./server/schema.ts')
   return db.operate(input, () => {
     const project = db.project(input.projectId)
     const existing = db.getProjectSpec(project.id, input.specId)
@@ -113,7 +111,11 @@ export function updateProjectSpecInStore(
 
 export const listProjectReposAction = createServerFn({ method: 'GET' })
   .validator(z.object({ projectId: id }))
-  .handler(({ data }) => {
+  .handler(async ({ data }) => {
+    const [{ store }, { listProjectMountedRepos }] = await Promise.all([
+      import('./server/store.ts'),
+      import('./server/github-repo-sync.ts'),
+    ])
     const db = store()
     db.project(data.projectId)
     return listProjectMountedRepos(db.directory, data.projectId)
@@ -121,11 +123,30 @@ export const listProjectReposAction = createServerFn({ method: 'GET' })
 
 export const unlinkProjectRepoAction = createServerFn({ method: 'POST' })
   .validator(z.object({ projectId: id, repoSlug: repoSlugSchema }))
-  .handler(({ data }) => unlinkProjectRepoInStore(store(), data.projectId, data.repoSlug))
+  .handler(async ({ data }) => {
+    const [{ store }, { unlinkProjectMountedRepo }] = await Promise.all([
+      import('./server/store.ts'),
+      import('./server/github-repo-sync.ts'),
+    ])
+    const db = store()
+    db.project(data.projectId)
+    const result = unlinkProjectMountedRepo(db.directory, data.projectId, data.repoSlug)
+    if (result.unlinked) {
+      db.event(null, 'repo.unlinked', `Unlinked repository ${result.fullName}.`, {
+        projectId: data.projectId,
+        repoSlug: result.fullName,
+      })
+    }
+    return result
+  })
 
 export const resyncProjectRepoAction = createServerFn({ method: 'POST' })
   .validator(z.object({ projectId: id, repoSlug: repoSlugSchema }))
   .handler(async ({ data }) => {
+    const [{ store }, { projectReposDir, syncGithubRepos }] = await Promise.all([
+      import('./server/store.ts'),
+      import('./server/github-repo-sync.ts'),
+    ])
     const db = store()
     db.project(data.projectId)
     const synced = await syncGithubRepos([data.repoSlug], undefined, {
@@ -164,8 +185,79 @@ export const resyncProjectRepoAction = createServerFn({ method: 'POST' })
 
 export const readProjectSpecContentAction = createServerFn({ method: 'GET' })
   .validator(z.object({ projectId: id, specId: id }))
-  .handler(({ data }) => store().getProjectSpec(data.projectId, data.specId))
+  .handler(async ({ data }) => {
+    const { store } = await import('./server/store.ts')
+    return store().getProjectSpec(data.projectId, data.specId)
+  })
 
 export const updateProjectSpecAction = createServerFn({ method: 'POST' })
   .validator(updateProjectSpecSchema)
-  .handler(({ data }) => updateProjectSpecInStore(store(), data))
+  .handler(async ({ data }) => {
+    const [{ store }, { and, eq, ne }, { redact }, tables] = await Promise.all([
+      import('./server/store.ts'),
+      import('drizzle-orm'),
+      import('./server/redact.ts'),
+      import('./server/schema.ts'),
+    ])
+    const db = store()
+    return db.operate(data, () => {
+      const project = db.project(data.projectId)
+      const existing = db.getProjectSpec(project.id, data.specId)
+      const rawOrigin = data.origin?.trim() ?? ''
+      const normalizedOrigin = rawOrigin
+        ? assetOriginForEnvironment(project.environment).parse(rawOrigin)
+        : null
+      const cleanName = redact(data.name.trim())
+      if (!cleanName) {
+        throw new Error('Spec name is required.')
+      }
+      const cleanContent = redact(data.content)
+
+      const collision = db.db
+        .select({ id: tables.projectSpecs.id })
+        .from(tables.projectSpecs)
+        .where(and(
+          eq(tables.projectSpecs.projectId, project.id),
+          eq(tables.projectSpecs.name, cleanName),
+          ne(tables.projectSpecs.id, existing.id),
+        ))
+        .get()
+      if (collision) {
+        throw new Error(`Another spec named "${cleanName}" already exists in this project.`)
+      }
+
+      const updated = db.db
+        .update(tables.projectSpecs)
+        .set({
+          name: cleanName,
+          kind: data.kind,
+          origin: normalizedOrigin,
+          content: cleanContent,
+        })
+        .where(and(
+          eq(tables.projectSpecs.id, existing.id),
+          eq(tables.projectSpecs.projectId, project.id),
+        ))
+        .returning()
+        .get()
+      if (!updated) {
+        throw new Error('Project spec not found.')
+      }
+
+      db.event(null, 'spec.updated', `Updated project spec ${updated.name}.`, {
+        projectId: project.id,
+        specId: updated.id,
+        kind: updated.kind,
+      })
+
+      return {
+        id: updated.id,
+        projectId: updated.projectId,
+        name: updated.name,
+        kind: updated.kind,
+        origin: updated.origin,
+        bytes: Buffer.byteLength(updated.content, 'utf8'),
+        createdAt: updated.createdAt,
+      }
+    })
+  })

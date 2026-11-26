@@ -561,7 +561,8 @@ describe('Pillar 1 — Real Headless Playwright Full-Stack E2E Golden Journeys',
     const dialogTextInitial = await dialog.innerText()
     assert.equal(/canary/i.test(dialogTextInitial), false, 'canaryMarkers copy must not appear in PersonaFormModal')
 
-    // 3. Selecting Custom request header reveals Header name immediately outside Disclosure.
+    // 3. Selecting Header / Cookie / cURL -> Custom request header reveals Header name immediately outside Disclosure.
+    await dialog.getByRole('radio', { name: /Header \/ Cookie \/ cURL/ }).click()
     const signInSelect = dialog.locator('select[name="authKind"]')
     await signInSelect.selectOption('header')
     const headerNameInput = dialog.locator('input[name="headerName"]')
@@ -573,10 +574,14 @@ describe('Pillar 1 — Real Headless Playwright Full-Stack E2E Golden Journeys',
       'Header name must be visible while Advanced configuration Disclosure stays collapsed',
     )
 
-    // 4. Selecting Clerk __client cookie (auto-refresh) works cleanly end-to-end.
-    await signInSelect.selectOption('clerk_client')
+    // 4. Selecting Automated Login -> Clerk __client cookie (auto-refresh) works cleanly end-to-end.
+    await dialog.getByRole('radio', { name: /Automated Login/ }).click()
+    await advTrigger.click()
+    const adapterSelect = dialog.locator('select[name="loginAdapter"]')
+    await adapterSelect.waitFor({ state: 'visible', timeout: 5_000 })
+    await adapterSelect.selectOption('clerk_client')
     const clerkCookieInput = dialog.locator('input[name="secret"]')
-    const clerkFapiInput = dialog.locator('input[name="loginUrl"]')
+    const clerkFapiInput = dialog.getByRole('textbox', { name: /Clerk Frontend API URL/ })
     await clerkCookieInput.waitFor({ state: 'visible', timeout: 5_000 })
     await clerkFapiInput.waitFor({ state: 'visible', timeout: 5_000 })
 
@@ -584,7 +589,6 @@ describe('Pillar 1 — Real Headless Playwright Full-Stack E2E Golden Journeys',
     await clerkFapiInput.fill(clerkServer.origin)
 
     // Add mock Clerk FAPI loopback origin to Allowed sites (keeping target SaaS first as primary target).
-    await advTrigger.click()
     const allowlistTextarea = dialog.locator('textarea[name="originAllowlist"]')
     await allowlistTextarea.waitFor({ state: 'visible', timeout: 5_000 })
     await allowlistTextarea.fill(`${targetServer.origin}\n${clerkServer.origin}`)
@@ -766,8 +770,13 @@ describe('Pillar 1 — Real Headless Playwright Full-Stack E2E Golden Journeys',
 
     // Trigger real browser F5 reload on the run page (never wait for networkidle because SSE stays open).
     await page.reload({ waitUntil: 'domcontentloaded' })
+    const telemetryToggle = page.getByRole('button', { name: /^Telemetry/ })
+    await telemetryToggle.waitFor({ state: 'visible', timeout: 15_000 })
+    if ((await telemetryToggle.getAttribute('aria-expanded')) !== 'true') {
+      await telemetryToggle.click()
+    }
     const telemetryNav = page.getByRole('navigation', { name: 'Telemetry views' })
-    await telemetryNav.waitFor({ state: 'visible', timeout: 15_000 })
+    await telemetryNav.waitFor({ state: 'visible', timeout: 10_000 })
 
     // Open Activity view and assert historical events render cleanly (NOT "Quiet so far").
     await telemetryNav.getByRole('button', { name: /^Activity/ }).click()
@@ -805,8 +814,8 @@ describe('Pillar 1 — Real Headless Playwright Full-Stack E2E Golden Journeys',
     let sheet = page.getByRole('dialog')
     await sheet.waitFor({ state: 'visible', timeout: 10_000 })
 
-    // Verify Default · OpenRouter card is selected by default with OpenRouter badges.
-    const defaultOrRadio = sheet.getByRole('radio', { name: /Default · OpenRouter/ })
+    // Verify Default provider card is selected by default with OpenRouter badges.
+    const defaultOrRadio = sheet.getByRole('radio', { name: /Default provider/ })
     await defaultOrRadio.waitFor({ state: 'visible', timeout: 5_000 })
     assert.equal(await defaultOrRadio.getAttribute('aria-checked'), 'true')
     await sheet.getByText('openrouter.ai/api/v1').waitFor({ state: 'visible', timeout: 5_000 })
