@@ -228,7 +228,7 @@ test('S3: StorageMaintenanceController sweeps TTL, bounds operations retention, 
   store.updateRun(idle.runId, { status: 'complete' })
   store.updateRun(active.runId, { status: 'running' })
 
-  // 1. Seed aged exchange + aged evidence (one protected by confirmed finding, one unprotected) + aged tmp file.
+  // 1. Seed aged unreferenced exchange + aged finding-cited exchange + aged evidence (one protected by confirmed finding, one unprotected).
   const agedEx = store.recordExchange({
     runId: idle.runId,
     assignmentId: idle.worker.id,
@@ -245,8 +245,28 @@ test('S3: StorageMaintenanceController sweeps TTL, bounds operations retention, 
     body: '{"aged":true}',
     durationMs: 2,
   })
+  const protectedEx = store.recordExchange({
+    runId: idle.runId,
+    assignmentId: idle.worker.id,
+    scopeRevision: idle.run.scopeRevision,
+    origin: 'https://idle.example.test',
+    finalOrigin: 'https://idle.example.test',
+    redirectOrigins: [],
+    method: 'GET',
+    pathAndQuery: '/api/confirmed-ex',
+    status: 200,
+    mediaType: 'application/json',
+    reqHeaders: {},
+    respHeaders: {},
+    body: '{"confirmed":true}',
+    durationMs: 2,
+  })
   store.flushNow()
-  store.client.prepare('UPDATE broker_exchanges SET created_at = ? WHERE id = ?').run(now - 20 * DAY_MS, agedEx.id)
+  store.client.prepare('UPDATE broker_exchanges SET created_at = ? WHERE id IN (?, ?)').run(
+    now - 20 * DAY_MS,
+    agedEx.id,
+    protectedEx.id,
+  )
 
   const unprotectedArt = store.addArtifact(idle.run, idle.worker, 'observation', 'Aged observation', 'old-content')
   const protectedArt = store.addArtifact(idle.run, idle.worker, 'verification', 'Confirmed proof', 'keep-this-proof')
@@ -272,6 +292,7 @@ test('S3: StorageMaintenanceController sweeps TTL, bounds operations retention, 
     reason: 'Verified runtime proof',
     remediation: 'Fix access check',
     evidenceIds: [protectedArt.id],
+    exchangeIds: [protectedEx.id],
     scopeRevision: idle.run.scopeRevision,
     verificationTier: 'runtime_confirmed',
   }, spec.id, ['https://idle.example.test'])
@@ -338,22 +359,24 @@ test('S3: StorageMaintenanceController sweeps TTL, bounds operations retention, 
   setOldMtime(staleSessionDb, 2 * HOUR_MS, now)
   setOldMtime(liveSessionDb, 2 * HOUR_MS, now)
 
-  const maint = new StorageMaintenanceController({
+  // Safe default (R3-H-16): without explicit ttlPolicy or KOVO_*_TTL_DAYS, TTL pruning is OFF so
+  // transcripts & evidence are never silently deleted, while operations/orphans/WAL maintenance runs.
+  const defaultMaint = new StorageMaintenanceController({
     store,
     dataDir: dir,
     getActiveRunIds: () => [active.runId],
+    env: {},
     operationsRetentionMs: DEFAULT_OPERATIONS_RETENTION_MS,
     orphanGraceMs: 30 * 60_000,
     now: () => now,
   })
-
-  const report = maint.runMaintenanceCycle({ now })
+  assert.equal(defaultMaint.effectiveTtlPolicy(), false, 'exchange/artifact TTL must be OFF by default')
+  const report = defaultMaint.runMaintenanceCycle({ now })
   assert.deepEqual(report.errors, [])
-
-  // TTL sweep ran automatically: aged exchange & unprotected artifact deleted, confirmed artifact preserved!
-  assert.equal(report.ttl?.exchangesDeleted, 1)
-  assert.equal(report.ttl?.artifactsDeleted, 1)
-  assert.equal(report.ttl?.artifactFilesDeleted, 1)
+  assert.equal(report.ttl, null, 'default maintenance cycle must skip TTL pruning when retention is not configured')
+  assert.equal(store.getExchange(idle.runId, agedEx.id).body, '{"aged":true}')
+  assert.equal(store.getExchange(idle.runId, protectedEx.id).body, '{"confirmed":true}')
+  assert.equal(store.artifact(idle.runId, unprotectedArt.id).content, 'old-content')
   assert.equal(store.artifact(idle.runId, protectedArt.id).content, 'keep-this-proof')
 
   // Operations retention bounded to 7 days.
@@ -382,6 +405,30 @@ test('S3: StorageMaintenanceController sweeps TTL, bounds operations retention, 
   // Because active run was running, checkpoint stayed PASSIVE.
   assert.equal(report.checkpoint.mode, 'passive')
   assert.equal(report.checkpoint.activeRuns, 1)
+
+  // Explicit opt-in TTL policy prunes ONLY unreferenced aged exchanges & unprotected artifacts on
+  // terminal runs while preserving confirmed-finding exchanges (row, FTS, blob) and artifacts!
+  const optInMaint = new StorageMaintenanceController({
+    store,
+    dataDir: dir,
+    getActiveRunIds: () => [active.runId],
+    ttlPolicy: {
+      exchangeTtlMs: 14 * DAY_MS,
+      artifactTtlMs: 14 * DAY_MS,
+      tempFileTtlMs: HOUR_MS,
+      preserveConfirmedEvidence: true,
+    },
+    operationsRetentionMs: DEFAULT_OPERATIONS_RETENTION_MS,
+    orphanGraceMs: 30 * 60_000,
+    now: () => now,
+  })
+  const optInReport = optInMaint.runMaintenanceCycle({ now })
+  assert.deepEqual(optInReport.errors, [])
+  assert.equal(optInReport.ttl?.exchangesDeleted, 1, 'only the unreferenced aged exchange is pruned')
+  assert.equal(optInReport.ttl?.artifactsDeleted, 1, 'only the unreferenced aged artifact is pruned')
+  assert.equal(optInReport.ttl?.artifactFilesDeleted, 1)
+  assert.equal(store.getExchange(idle.runId, protectedEx.id).body, '{"confirmed":true}', 'confirmed-finding exchange & blob MUST survive TTL pruning')
+  assert.equal(store.artifact(idle.runId, protectedArt.id).content, 'keep-this-proof', 'confirmed-finding artifact MUST survive TTL pruning')
 })
 
 test('S3: session.afterCommit runs disk deletions strictly AFTER COMMIT and discards them on ROLLBACK or savepoint rollback', t => {
