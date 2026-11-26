@@ -26,11 +26,13 @@ import { connect as netConnect } from 'node:net'
 import type { Socket as NetSocket } from 'node:net'
 import { connect as tlsConnect, TLSSocket } from 'node:tls'
 import type { DetailedPeerCertificate, ConnectionOptions as TlsConnectionOptions } from 'node:tls'
+import { pipeline } from 'node:stream'
 import type { Duplex } from 'node:stream'
 import { createBrotliDecompress, createGunzip, createInflate } from 'node:zlib'
 import ipaddr from 'ipaddr.js'
 import type { PublicAddress, RawHttpResponse, TlsMetadata, Transport } from './broker.ts'
 import { isMetadataOrLinkLocalAddress } from './egress-gateway.ts'
+import type { GlobalKillSwitch } from './kill-switch.ts'
 import { isValidHttpToken, isValidWebsocketSubprotocol } from './request-admission.ts'
 
 // ---------------------------------------------------------------------------
@@ -795,7 +797,7 @@ function decompressStream(headers: IncomingHttpHeaders): { stream?: Duplex; deco
   return { decompressed: false }
 }
 
-/** Extract the response body from an h2 stream, honoring size caps and content-encoding. */
+/** Extract the response body from an h2 stream, honoring size caps and content-encoding (`R2-H-19`). */
 function collectH2Body(
   stream: ClientHttp2Stream,
   headers: IncomingHttpHeaders,
@@ -803,7 +805,6 @@ function collectH2Body(
 ): Promise<{ body: string; bodyBytes: number; bodyTruncated: boolean; headers: IncomingHttpHeaders }> {
   return new Promise((resolve, reject) => {
     const decomp = decompressStream(headers)
-    if (decomp.stream) stream.pipe(decomp.stream)
     const source: NodeJS.ReadableStream = decomp.stream ?? stream
     const chunks: Buffer[] = []
     let total = 0
@@ -824,6 +825,21 @@ function collectH2Body(
         headers: outHeaders,
       })
     }
+    const fail = (err: unknown) => {
+      if (settled) return
+      settled = true
+      try { decomp.stream?.destroy() } catch { /* ignore */ }
+      reject(err)
+    }
+    if (decomp.stream) {
+      pipeline(stream, decomp.stream, err => {
+        if (settled) return
+        if (err) {
+          if (truncated) finish()
+          else fail(err)
+        }
+      })
+    }
     source.on('data', (chunk: Buffer) => {
       if (settled) return
       if (total + chunk.length > cap) {
@@ -831,6 +847,7 @@ function collectH2Body(
         if (remaining > 0) chunks.push(chunk.subarray(0, remaining))
         total = cap
         truncated = true
+        try { decomp.stream?.destroy() } catch { /* ignore */ }
         try { stream.close(8 /* NGHTTP2_CANCEL */) } catch { /* ignore */ }
         finish()
         return
@@ -840,15 +857,24 @@ function collectH2Body(
     })
     source.once('end', finish)
     source.once('error', err => {
-      if (!settled && !truncated) reject(err)
-      else finish()
+      if (settled) return
+      if (truncated) finish()
+      else fail(err)
     })
     stream.once('error', err => {
-      if (!settled && !truncated) reject(err)
-      else finish()
+      if (settled) return
+      if (truncated) finish()
+      else fail(err)
     })
     stream.once('aborted', () => {
-      if (!settled) reject(new Error('HTTP/2 stream aborted'))
+      if (settled) return
+      if (truncated) finish()
+      else fail(new Error('HTTP/2 stream aborted'))
+    })
+    stream.once('close', () => {
+      if (settled) return
+      if (truncated) finish()
+      else if (!stream.readableEnded) fail(new Error('HTTP/2 stream closed prematurely'))
     })
   })
 }
@@ -863,6 +889,10 @@ export type HttpTransportOptions = {
   raceBarrier?: RaceBarrier
   /** Internal: force the HTTP/1.1 path (used after an h2 downgrade). */
   forceHttp1?: boolean
+  /** H-2: Tenant namespace for per-tenant kill-switch checks. */
+  tenantId?: string | null
+  /** H-2: Optional kill-switch instance. */
+  killSwitch?: GlobalKillSwitch
 }
 
 export type HttpTransport = Transport & {
@@ -1144,24 +1174,44 @@ export function createHttpTransport(config: TransportConfig, fallback: Transport
     }
 
     return new Promise<RawHttpResponse>((resolve, reject) => {
+      let done = false
+      let activeDecomp: Duplex | undefined
+      let activeRes: IncomingMessage | undefined
+      const cleanup = () => {
+        signal.removeEventListener('abort', onAbort)
+      }
+      const fail = (err: unknown) => {
+        if (done) return
+        done = true
+        cleanup()
+        try { activeDecomp?.destroy() } catch { /* ignore */ }
+        try { activeRes?.destroy() } catch { /* ignore */ }
+        try { req.destroy() } catch { /* ignore */ }
+        reject(err)
+      }
       const onResponse = (res: IncomingMessage) => {
+        activeRes = res
         const tls = res.socket instanceof TLSSocket ? extractTlsMetadata(res.socket, url.hostname) : undefined
         const cap = Math.min(options.maxBodyBytes ?? defaultMaxBodyBytes, hardMaxBodyBytes)
         if (!(options.readBody ?? false) || methodName === 'HEAD') {
-          resolve({ status: res.statusCode ?? 0, headers: res.headers, body: '', bodyBytes: 0, bodyTruncated: false, tls })
+          if (!done) {
+            done = true
+            cleanup()
+            resolve({ status: res.statusCode ?? 0, headers: res.headers, body: '', bodyBytes: 0, bodyTruncated: false, tls })
+          }
           res.destroy()
           return
         }
         const decomp = decompressStream(res.headers)
-        if (decomp.stream) res.pipe(decomp.stream)
+        activeDecomp = decomp.stream
         const source: NodeJS.ReadableStream = decomp.stream ?? res
         const chunks: Buffer[] = []
         let total = 0
         let truncated = false
-        let done = false
         const finish = () => {
           if (done) return
           done = true
+          cleanup()
           const outHeaders: IncomingHttpHeaders = { ...res.headers }
           if (decomp.decompressed) {
             delete outHeaders['content-encoding']
@@ -1176,6 +1226,15 @@ export function createHttpTransport(config: TransportConfig, fallback: Transport
             tls,
           })
         }
+        if (decomp.stream) {
+          pipeline(res, decomp.stream, err => {
+            if (done) return
+            if (err) {
+              if (truncated) finish()
+              else fail(err)
+            }
+          })
+        }
         source.on('data', (chunk: Buffer) => {
           if (done) return
           if (total + chunk.length > cap) {
@@ -1183,6 +1242,7 @@ export function createHttpTransport(config: TransportConfig, fallback: Transport
             if (remaining > 0) chunks.push(chunk.subarray(0, remaining))
             total = cap
             truncated = true
+            try { decomp.stream?.destroy() } catch { /* ignore */ }
             res.destroy()
             finish()
             return
@@ -1191,16 +1251,32 @@ export function createHttpTransport(config: TransportConfig, fallback: Transport
           total += chunk.length
         })
         source.once('end', finish)
-        source.once('close', finish)
         source.once('error', err => {
-          if (!done && !truncated) reject(err)
-          else finish()
+          if (done) return
+          if (truncated) finish()
+          else fail(err)
+        })
+        res.once('aborted', () => {
+          if (done) return
+          if (truncated) finish()
+          else fail(new Error('Proxied HTTP/1.1 response aborted mid-body.'))
+        })
+        res.once('close', () => {
+          if (done) return
+          if (truncated) finish()
+          else if (!res.complete) fail(new Error('Proxied HTTP/1.1 response closed prematurely mid-body.'))
         })
       }
       const req = useTls
         ? httpsRequest(requestOptions as never, onResponse)
         : httpRequest(requestOptions as never, onResponse)
-      req.once('error', reject)
+      const onAbort = () => fail(signal.reason ?? new Error('Proxied HTTP/1.1 request aborted.'))
+      if (signal.aborted) {
+        onAbort()
+        return
+      }
+      signal.addEventListener('abort', onAbort, { once: true })
+      req.once('error', err => fail(err))
       if (options.body !== undefined) req.write(options.body)
       req.end()
     })

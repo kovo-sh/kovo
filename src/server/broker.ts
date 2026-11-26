@@ -165,6 +165,45 @@ export interface BrokerWebsocketResult {
   durationMs: number
 }
 
+export type WireCredentialSource =
+  | 'none'
+  | 'persona_vault'
+  | 'session_jar'
+  | 'caller_self_minted'
+  | 'persona_and_jar'
+
+/**
+ * H-14: Non-secret wire credential provenance emitted by `RequestBroker` so proof-kernel
+ * callers can verify true wire authentication (header/cookie names & auth sources only,
+ * NEVER secret values).
+ */
+export interface WireCredentialProvenance {
+  /** Whether any authentication header or cookie was transmitted on the wire. */
+  authenticated: boolean
+  /** Primary auth source summary for the final hop. */
+  source: WireCredentialSource
+  /** Distinct contributing credential sources on the wire. */
+  sources: Array<'persona_vault' | 'session_jar' | 'caller_self_minted' | 'csrf_bind'>
+  /** Declared persona handle if persona credentials were transmitted on the final hop. */
+  personaHandle: string | null
+  /** Session jar label attached to this exchange, if any. */
+  session: string | null
+  /** Lowercased names of auth-bearing headers actually transmitted on the wire (never values). */
+  headerNames: string[]
+  /** Sorted names of cookies actually transmitted on the wire (names only, never values). */
+  cookieNames: string[]
+  /** Sorted names of cookies contributed by the Persona Vault (names only). */
+  vaultCookieNames: string[]
+  /** Sorted names of cookies contributed by the Session Jar (names only). */
+  jarCookieNames: string[]
+  /** Lowercased names of headers contributed by the Persona Vault (names only). */
+  vaultHeaderNames: string[]
+  /** Lowercased names of caller-supplied auth-bearing headers (e.g. self-minted alg:none Bearer). */
+  callerAuthHeaderNames: string[]
+  /** True when broker `authMutation` mutated the transmitted credential. */
+  authMutated: boolean
+}
+
 export interface BrokerExchangeResult {
   origin: string
   finalOrigin: string
@@ -187,6 +226,10 @@ export interface BrokerExchangeResult {
   bodyBytes: number
   bodyTruncated: boolean
   durationMs: number
+  /**
+   * H-14: True wire credential provenance (header/cookie names & auth sources, never secret values).
+   */
+  wireCredentialProvenance?: WireCredentialProvenance
   /**
    * Redacted structural evidence that secret-shaped values were present in the raw response body
    * or headers before scrubbing. Fingerprints only (no raw values); see `SecretMatch` in
@@ -265,6 +308,10 @@ export type Transport = (
     rejectUnauthorized?: boolean
     /** Present only for HTTP/2 race bursts; releases synchronized stream headers. */
     raceBarrier?: RaceBarrier
+    /** H-2: Tenant namespace for per-tenant kill-switch checks. */
+    tenantId?: string | null
+    /** H-2: Optional kill-switch instance. */
+    killSwitch?: GlobalKillSwitch
   },
 ) => Promise<RawHttpResponse>
 
@@ -303,6 +350,8 @@ export type Grant = {
   scopeRevision?: number
   /** Explicit operator-approved non-default target ports (e.g. 8080/8443) for authorized staging origins. */
   allowedPorts?: number[]
+  /** H-3: Host-confirmed GraphQL endpoints for read-only GraphQL exceptions. */
+  confirmedGraphqlEndpoints?: readonly string[]
   storage?: SecondOrderStore
   canaryBroker?: CanaryBroker
   mintCanary?: (purpose: string, origin?: string) => { httpUrl?: string; url?: string } | null
@@ -414,6 +463,8 @@ export type BrokerOptions = {
   killSwitch?: GlobalKillSwitch
   /** Canonical request admission engine (defaults to `defaultRequestAdmissionEngine`). */
   admissionEngine?: RequestAdmissionEngine
+  /** R2-H-19: TTL in ms for per-origin batch/race burst owner locks (defaults to 60_000 ms). */
+  batchLockTtlMs?: number
 }
 
 const maxRedirects = 8
@@ -1294,6 +1345,8 @@ function defaultTransport(
     maxBodyBytes?: number
     readBody?: boolean
     rejectUnauthorized?: boolean
+    tenantId?: string | null
+    killSwitch?: GlobalKillSwitch
   },
 ): Promise<RawHttpResponse> {
   const headers: Record<string, string> = {
@@ -1317,6 +1370,8 @@ function defaultTransport(
     readBody: options?.readBody ?? false,
     rejectUnauthorized: options?.rejectUnauthorized ?? true,
     signal,
+    ...(options?.tenantId !== undefined ? { tenantId: options.tenantId } : {}),
+    ...(options?.killSwitch ? { killSwitch: options.killSwitch } : {}),
     extractTls: extractTlsMetadata,
   })
 }
@@ -1456,6 +1511,119 @@ function stripRedirectHeaders(
   return out
 }
 
+const WIRE_AUTH_HEADER_NAMES = new Set([
+  'authorization',
+  'proxy-authorization',
+  'cookie',
+  'x-api-key',
+  'x-auth-token',
+  'x-access-token',
+  'x-session-token',
+  'x-csrf-token',
+  'x-xsrf-token',
+])
+
+const H2_HOP_BY_HOP_HEADERS = new Set([
+  'connection',
+  'keep-alive',
+  'proxy-authenticate',
+  'proxy-authorization',
+  'proxy-connection',
+  'te',
+  'trailer',
+  'transfer-encoding',
+  'upgrade',
+])
+
+function setHeaderCaseInsensitive(headers: Record<string, string>, key: string, value: string): void {
+  const lower = key.toLowerCase()
+  for (const existing of Object.keys(headers)) {
+    if (existing.toLowerCase() === lower) delete headers[existing]
+  }
+  headers[key] = value
+}
+
+function buildWireCredentialProvenance(input: {
+  outboundHeaders: Record<string, string>
+  vaultHeaderNames: readonly string[]
+  vaultCookieNames: readonly string[]
+  jarCookieNames: readonly string[]
+  mergedCookieNames: readonly string[]
+  injectedCsrfHeaderName?: string
+  personaHandle: string | null
+  session: string | null
+  authMutated: boolean
+}): WireCredentialProvenance {
+  const vaultHeaderSet = new Set(input.vaultHeaderNames.map(h => h.toLowerCase()))
+  const vaultCookies = [...new Set(input.vaultCookieNames)].sort()
+  const jarCookies = [...new Set(input.jarCookieNames)].sort()
+  const cookieNames = [...new Set(input.mergedCookieNames)].sort()
+  const csrfLower = input.injectedCsrfHeaderName?.toLowerCase()
+
+  const headerNamesSet = new Set<string>()
+  const callerAuthSet = new Set<string>()
+
+  for (const key of Object.keys(input.outboundHeaders)) {
+    const lower = key.toLowerCase()
+    if (lower === 'cookie') {
+      if (cookieNames.length > 0) headerNamesSet.add('cookie')
+      continue
+    }
+    if (vaultHeaderSet.has(lower)) {
+      headerNamesSet.add(lower)
+      continue
+    }
+    if (csrfLower && lower === csrfLower) {
+      headerNamesSet.add(lower)
+      continue
+    }
+    if (WIRE_AUTH_HEADER_NAMES.has(lower)) {
+      headerNamesSet.add(lower)
+      callerAuthSet.add(lower)
+    }
+  }
+
+  const vaultHeaders = [...vaultHeaderSet].sort()
+  const callerAuthHeaders = [...callerAuthSet].sort()
+  const headerNames = [...headerNamesSet].sort()
+
+  const hasPersonaVault = vaultHeaders.length > 0 || vaultCookies.length > 0
+  const hasSessionJar = jarCookies.length > 0
+  const hasCallerAuth = callerAuthHeaders.length > 0
+
+  const sources: WireCredentialProvenance['sources'] = []
+  if (hasPersonaVault) sources.push('persona_vault')
+  if (hasSessionJar) sources.push('session_jar')
+  if (hasCallerAuth) sources.push('caller_self_minted')
+  if (csrfLower && headerNamesSet.has(csrfLower)) sources.push('csrf_bind')
+
+  const source: WireCredentialSource =
+    hasPersonaVault && hasSessionJar
+      ? 'persona_and_jar'
+      : hasPersonaVault
+        ? 'persona_vault'
+        : hasSessionJar
+          ? 'session_jar'
+          : hasCallerAuth
+            ? 'caller_self_minted'
+            : 'none'
+
+  return {
+    authenticated: hasPersonaVault || hasSessionJar || hasCallerAuth,
+    source,
+    sources,
+    personaHandle: hasPersonaVault ? input.personaHandle : null,
+    session: input.session,
+    headerNames,
+    cookieNames,
+    vaultCookieNames: vaultCookies,
+    jarCookieNames: jarCookies,
+    vaultHeaderNames: vaultHeaders,
+    callerAuthHeaderNames: callerAuthHeaders,
+    authMutated: input.authMutated,
+  }
+}
+
 function collectSecrets(req: BrokerHttpRequest, grant: Grant): NamedSecret[] {
   const all: NamedSecret[] = []
   if (grant.personas) all.push(...personaSecrets(grant.personas))
@@ -1526,7 +1694,8 @@ type OriginHealth = {
   tokens: number
   lastRefill: number
   inFlight: number
-  batchActive: boolean
+  /** R2-H-19: Owner-scoped batch/race lock with TTL so a stalled burst can never leak permanently. */
+  batchLock?: { owner: string; expiresAt: number }
   /** Adaptive rate cap after 429 pressure; recovers toward the configured cap on healthy responses. */
   adaptiveRps?: number
   retryAfterUntil?: number
@@ -2010,7 +2179,6 @@ export class RequestBroker {
         tokens: capacity,
         lastRefill: this.now(),
         inFlight: 0,
-        batchActive: false,
         consecutiveOpens: 0,
         backoffMs: 0,
         probeInduced5xx: [],
@@ -2018,6 +2186,42 @@ export class RequestBroker {
       this.origins.set(origin, state)
     }
     return state
+  }
+
+  private isBatchLockActive(state: OriginHealth, now = this.now()): boolean {
+    if (!state.batchLock) return false
+    if (state.batchLock.expiresAt <= now) {
+      state.batchLock = undefined
+      return false
+    }
+    return true
+  }
+
+  private acquireBatchLock(origin: string, defaultRps: number, owner: string, ttlMs: number): void {
+    const state = this.health(origin, defaultRps)
+    const now = this.now()
+    if (this.isBatchLockActive(state, now)) {
+      throw new BrokerDenied(`Another synchronized batch is already running for ${origin}.`)
+    }
+    state.batchLock = { owner, expiresAt: now + Math.max(1, ttlMs) }
+  }
+
+  private releaseBatchLock(origin: string, owner: string): void {
+    const state = this.origins.get(origin)
+    if (state?.batchLock?.owner === owner) {
+      state.batchLock = undefined
+    }
+  }
+
+  /** Read-only per-origin in-flight slot count (diagnostics/tests). */
+  getOriginInFlight(origin: string): number {
+    return this.origins.get(origin)?.inFlight ?? 0
+  }
+
+  /** Read-only per-origin batch lock state respecting owner TTL (diagnostics/tests). */
+  isOriginBatchLocked(origin: string): boolean {
+    const state = this.origins.get(origin)
+    return state ? this.isBatchLockActive(state) : false
   }
 
   /** Origin-wide circuit (connection resets/timeouts/global 502–504/429 exhaustion). */
@@ -2225,7 +2429,10 @@ export class RequestBroker {
       if (retryAfterWait <= 0 && concurrencyOk && state.tokens >= 1) {
         state.tokens -= 1
         state.inFlight += 1
+        let released = false
         return () => {
+          if (released) return
+          released = true
           state.inFlight = Math.max(0, state.inFlight - 1)
         }
       }
@@ -2345,9 +2552,14 @@ export class RequestBroker {
     }
   }
 
-  private toAdmissionRequest(req: BrokerHttpRequest, opts: { raceBurst?: boolean } = {}): AdmissionRequest {
+  private toAdmissionRequest(
+    req: BrokerHttpRequest,
+    opts: { raceBurst?: boolean; kind?: 'http' | 'http2' } = {},
+  ): AdmissionRequest {
+    const kind = opts.kind ?? 'http'
+    const stripPseudoHeaders = kind === 'http2'
     return {
-      kind: 'http',
+      kind,
       origin: req.origin,
       method: req.method,
       pathAndQuery: req.pathAndQuery,
@@ -2357,7 +2569,8 @@ export class RequestBroker {
       personaHandle: req.persona ?? req.personaHandle ?? null,
       authMutation: req.authMutation,
       scopeHook: req.scopeHook ?? null,
-      normalizedHeaders: canonicalizeCallerHeaders(req.headers, { allowSelfMintedBearer: true }),
+      stripPseudoHeaders,
+      normalizedHeaders: canonicalizeCallerHeaders(req.headers, { allowSelfMintedBearer: true, stripPseudoHeaders }),
       isRaceBurst: opts.raceBurst === true,
       runId: req.runId,
       assignmentId: req.assignmentId,
@@ -2543,13 +2756,19 @@ export class RequestBroker {
       )
       let response: RawHttpResponse
       try {
-        this.getKillSwitch().assertAllowed(grant.tenantId ?? null)
+        const ks = this.getKillSwitch()
+        ks.assertAllowed(grant.tenantId ?? null)
         deadline.throwIfAborted()
         grant.audit('allowed', url.origin)
-        response = await transport(url, addresses.find(a => a.family === 4) ?? addresses[0], deadline, {
-          readBody: false,
-          rejectUnauthorized: this.options.rejectUnauthorized ?? true,
-        })
+        response = await withAbort(
+          transport(url, addresses.find(a => a.family === 4) ?? addresses[0], deadline, {
+            readBody: false,
+            rejectUnauthorized: this.options.rejectUnauthorized ?? true,
+            tenantId: grant.tenantId ?? null,
+            killSwitch: ks,
+          }),
+          deadline,
+        )
       } finally {
         release()
       }
@@ -2577,7 +2796,7 @@ export class RequestBroker {
   private prepareHttpRequest(
     req: BrokerHttpRequest,
     grant: Grant,
-    options: { raceBurst?: boolean; preAdmitted?: AdmissionDecision } = {},
+    options: { raceBurst?: boolean; preAdmitted?: AdmissionDecision; kind?: 'http' | 'http2' } = {},
   ): {
     initialOrigin: string
     url: URL
@@ -3156,12 +3375,15 @@ export class RequestBroker {
 
       const outboundHeaders = stripRedirectHeaders(activeHeaders, stripSensitiveHeaders, stripEntityHeaders)
       let personaCookieRaw: string | undefined
+      const vaultHeaderNames: string[] = []
       if (includePersona && personaHeaders) {
         for (const [k, v] of Object.entries(personaHeaders)) {
           if (k.toLowerCase() === 'cookie') {
             personaCookieRaw = v
           } else if (!(stripSensitiveHeaders && crossOriginSensitiveHeaders.has(k.toLowerCase()))) {
-            outboundHeaders[k.toLowerCase()] = v
+            // Preserve canonical persona header casing (e.g. `Authorization`) after case-insensitive deduplication.
+            setHeaderCaseInsensitive(outboundHeaders, k, v)
+            vaultHeaderNames.push(k.toLowerCase())
           }
         }
       }
@@ -3206,16 +3428,26 @@ export class RequestBroker {
         // bytes on the wire and any claim drawn from them belong to the wrong actor. Send nothing.
         deny(`Persona scope mismatch: the credential for "${personaHandle}" is the session of another persona; no request was sent. Re-mint this persona's login before scanning.`)
       }
+      const jarCookieNames: string[] = []
+      const vaultCookieNames: string[] = []
       for (const [name, entry] of jarCookieByName) {
-        if (!vaultCookies.has(name) || entry.writeCount > 1) mergedCookies.set(name, entry.value)
+        if (!vaultCookies.has(name) || entry.writeCount > 1) {
+          mergedCookies.set(name, entry.value)
+          jarCookieNames.push(name)
+        }
       }
       for (const [k, v] of vaultCookies) {
         const jarEntry = jarCookieByName.get(k)
         if (jarEntry && jarEntry.writeCount > 1) continue
         mergedCookies.set(k, v)
+        vaultCookieNames.push(k)
       }
       if (mergedCookies.size > 0) {
-        outboundHeaders.cookie = [...mergedCookies.entries()].map(([k, v]) => `${k}=${v}`).join('; ')
+        setHeaderCaseInsensitive(
+          outboundHeaders,
+          'Cookie',
+          [...mergedCookies.entries()].map(([k, v]) => `${k}=${v}`).join('; '),
+        )
       }
 
       // Automatic CSRF token binding (same-origin only)
@@ -3318,6 +3550,18 @@ export class RequestBroker {
         outboundHeaders['content-type'] = hopContentType
       }
 
+      const wireCredentialProvenance = buildWireCredentialProvenance({
+        outboundHeaders,
+        vaultHeaderNames,
+        vaultCookieNames,
+        jarCookieNames,
+        mergedCookieNames: [...mergedCookies.keys()],
+        injectedCsrfHeaderName,
+        personaHandle: includePersona ? (personaHandle ?? null) : null,
+        session: jar ? jar.session : null,
+        authMutated: Boolean(req.authMutation),
+      })
+
       const hopRouteTemplate = routeTemplateForPath(url.pathname)
       const release = await this.acquireSlot(
         url.origin,
@@ -3332,15 +3576,21 @@ export class RequestBroker {
         ks.assertAllowed(grant.tenantId ?? null)
         deadline.throwIfAborted()
         grant.audit('allowed', url.origin)
-        response = await transport(url, addresses.find(a => a.family === 4) ?? addresses[0], deadline, {
-          method: activeMethod,
-          headers: outboundHeaders,
-          body: hopBody,
-          maxBodyBytes: Math.min(req.maxBodyBytes ?? defaultMaxBodyBytes, hardMaxBodyBytes),
-          readBody: true,
-          rejectUnauthorized: this.options.rejectUnauthorized ?? true,
-          ...(options.raceBarrier ? { raceBarrier: options.raceBarrier } : {}),
-        })
+        // R2-H-19: Wrap transport in `withAbort(deadline)` so a hung transport can never leak slots.
+        response = await withAbort(
+          transport(url, addresses.find(a => a.family === 4) ?? addresses[0], deadline, {
+            method: activeMethod,
+            headers: outboundHeaders,
+            body: hopBody,
+            maxBodyBytes: Math.min(req.maxBodyBytes ?? defaultMaxBodyBytes, hardMaxBodyBytes),
+            readBody: true,
+            rejectUnauthorized: this.options.rejectUnauthorized ?? true,
+            tenantId: grant.tenantId ?? null,
+            killSwitch: ks,
+            ...(options.raceBarrier ? { raceBarrier: options.raceBarrier } : {}),
+          }),
+          deadline,
+        )
       } catch (err) {
         if (!deadline.aborted) this.recordTransportFailure(url.origin, grant.audit)
         throw err
@@ -3476,6 +3726,7 @@ export class RequestBroker {
         bodyBytes: response.bodyBytes ?? Buffer.byteLength(rawBody),
         bodyTruncated: Boolean(response.bodyTruncated),
         durationMs: Date.now() - started,
+        wireCredentialProvenance,
         secretMatches,
         ...(response.tls ? { tls: response.tls } : {}),
         observation: obs,
@@ -3499,6 +3750,343 @@ export class RequestBroker {
     return this.executeHttpInternal(req, grant, signal, false)
   }
 
+  /**
+   * C-1: Canonical brokered HTTP/2 exchange enforcing kill-switch, RequestAdmissionEngine,
+   * pinned DNS + SSRF checks, per-origin slot acquisition & concurrency/RPS caps, circuit breaker,
+   * audit logging (`allowed` / `observed`), persona/jar credential binding + `wireCredentialProvenance`
+   * (`H-14`), transport proxy/mTLS/UA header policy, and hop-by-hop header stripping.
+   */
+  async executeHttp2Exchange(
+    req: BrokerHttpRequest,
+    grant: Grant,
+    signal: AbortSignal,
+    internalOptions: { reauthAttempted?: boolean; refreshedPersonaHeaders?: Record<string, string> } = {},
+  ): Promise<BrokerExchangeResult> {
+    this.getKillSwitch().assertAllowed(grant.tenantId ?? null)
+    const prepared = this.prepareHttpRequest(req, grant, { kind: 'http2' })
+    return this.withKillSwitch(signal, grant, async (boundSignal, ks) => {
+      await this.applyAuthMutationIfNeeded(prepared, req, grant, boundSignal)
+      const {
+        initialOrigin,
+        localLab,
+        personaHandle,
+        cleanHeaders,
+        secrets,
+        maxRps,
+        timeoutMs,
+      } = prepared
+      const url = new URL(prepared.url.href)
+      const personaHeaders = internalOptions.refreshedPersonaHeaders ?? prepared.resolvedPersonaHeaders
+      const includePersona = Boolean(personaHeaders && Object.keys(personaHeaders).length > 0)
+      const jar = this.getOrCreateSessionJar(req, grant)
+
+      const started = Date.now()
+      const deadline = AbortSignal.any([boundSignal, AbortSignal.timeout(timeoutMs)])
+      const defaultRps = (grant.tier ?? 1) === 3 ? 3 : 5
+
+      const deny: (message: string) => never = (message: string): never => {
+        this.auditDenied(
+          grant,
+          url.origin,
+          {
+            reason: message,
+            method: req.method,
+            path: `${url.pathname}${url.search}`,
+            ...(includePersona && personaHandle ? { persona: personaHandle } : {}),
+          },
+          req.secrets,
+        )
+        throw new BrokerDenied(message)
+      }
+
+      ks.assertAllowed(grant.tenantId ?? null)
+      deadline.throwIfAborted()
+
+      const addresses = await this.resolveAndCheckAddresses(url.hostname, grant, deadline, url.origin, {
+        method: req.method,
+        path: `${url.pathname}${url.search}`,
+        ...(includePersona && personaHandle ? { persona: personaHandle } : {}),
+        secrets: req.secrets,
+      })
+
+      // Build outbound HTTP/2 headers with transport UA/authorized profile & hop-by-hop stripping.
+      const outboundHeaders: Record<string, string> = {}
+      const connectionListed = new Set<string>()
+      for (const [k, v] of Object.entries(cleanHeaders)) {
+        if (k.toLowerCase() === 'connection') {
+          for (const token of v.split(',')) {
+            const name = token.trim().toLowerCase()
+            if (name) connectionListed.add(name)
+          }
+        }
+      }
+      for (const [k, v] of Object.entries(cleanHeaders)) {
+        if (k.trimStart().startsWith(':')) continue
+        const lower = k.toLowerCase()
+        if (lower === 'host' || H2_HOP_BY_HOP_HEADERS.has(lower) || connectionListed.has(lower)) continue
+        outboundHeaders[lower] = v
+      }
+      if (this.transportConfig.headerProfile?.userAgent && !('user-agent' in outboundHeaders)) {
+        outboundHeaders['user-agent'] = this.transportConfig.headerProfile.userAgent
+      }
+      for (const [k, v] of Object.entries(this.transportConfig.headerProfile?.headers ?? {})) {
+        const lower = k.toLowerCase()
+        if (!(lower in outboundHeaders) && !H2_HOP_BY_HOP_HEADERS.has(lower)) {
+          outboundHeaders[lower] = v
+        }
+      }
+      if (!('user-agent' in outboundHeaders)) {
+        outboundHeaders['user-agent'] = 'KovoHunter/2 defensive evidence review'
+      }
+      if (!('accept' in outboundHeaders)) {
+        outboundHeaders.accept = 'text/html, application/json;q=0.9, */*;q=0.1'
+      }
+      if (!('accept-encoding' in outboundHeaders)) {
+        outboundHeaders['accept-encoding'] = 'gzip, deflate, br'
+      }
+      if (prepared.preparedBody !== undefined && !('content-type' in outboundHeaders)) {
+        outboundHeaders['content-type'] = 'application/json'
+      }
+      if (localLab && req.traceId && !/[\r\n\0]/.test(req.traceId)) {
+        outboundHeaders['x-kovo-trace-id'] = req.traceId.slice(0, 128)
+      }
+
+      let personaCookieRaw: string | undefined
+      const vaultHeaderNames: string[] = []
+      if (includePersona && personaHeaders) {
+        for (const [k, v] of Object.entries(personaHeaders)) {
+          if (k.toLowerCase() === 'cookie') {
+            personaCookieRaw = v
+          } else {
+            setHeaderCaseInsensitive(outboundHeaders, k, v)
+            vaultHeaderNames.push(k.toLowerCase())
+          }
+        }
+      }
+
+      const mergedCookies = new Map<string, string>()
+      const jarCookieByName = new Map<string, JarCookieEntry>()
+      if (jar) {
+        const now = Date.now()
+        for (const entry of jar.cookies.values()) {
+          if (!cookieDomainMatches(entry, url)) continue
+          if (entry.expiresAt !== undefined && entry.expiresAt <= now) continue
+          if (entry.secure && url.protocol !== 'https:') continue
+          if (!cookiePathMatches(url.pathname, entry.path)) continue
+          jarCookieByName.set(entry.name, entry)
+        }
+      }
+      const vaultCookies = personaCookieRaw ? parseCookieHeaderPairs(personaCookieRaw) : new Map<string, string>()
+      if (personaHandle && vaultCookies.size > 0 &&
+        this.notePersonaSessionSharing({
+          origin: url.origin,
+          persona: personaHandle,
+          cookies: vaultCookies,
+          ...(req.runId ? { runId: req.runId } : {}),
+          ...(this.options.storage ?? grant.storage ? { storage: (this.options.storage ?? grant.storage)! } : {}),
+        })) {
+        deny(`Persona scope mismatch: the credential for "${personaHandle}" is the session of another persona; no request was sent. Re-mint this persona's login before scanning.`)
+      }
+      const jarCookieNames: string[] = []
+      const vaultCookieNames: string[] = []
+      for (const [name, entry] of jarCookieByName) {
+        if (!vaultCookies.has(name) || entry.writeCount > 1) {
+          mergedCookies.set(name, entry.value)
+          jarCookieNames.push(name)
+        }
+      }
+      for (const [k, v] of vaultCookies) {
+        const jarEntry = jarCookieByName.get(k)
+        if (jarEntry && jarEntry.writeCount > 1) continue
+        mergedCookies.set(k, v)
+        vaultCookieNames.push(k)
+      }
+      if (mergedCookies.size > 0) {
+        setHeaderCaseInsensitive(
+          outboundHeaders,
+          'Cookie',
+          [...mergedCookies.entries()].map(([k, v]) => `${k}=${v}`).join('; '),
+        )
+      }
+
+      const wireCredentialProvenance = buildWireCredentialProvenance({
+        outboundHeaders,
+        vaultHeaderNames,
+        vaultCookieNames,
+        jarCookieNames,
+        mergedCookieNames: [...mergedCookies.keys()],
+        personaHandle: includePersona ? (personaHandle ?? null) : null,
+        session: jar ? jar.session : null,
+        authMutated: Boolean(req.authMutation),
+      })
+
+      const hopRouteTemplate = routeTemplateForPath(url.pathname)
+      const release = await this.acquireSlot(
+        url.origin,
+        () => resolveGrantMaxRps(grant, maxRps || defaultRps),
+        deadline,
+        false,
+        hopRouteTemplate,
+        localLab,
+      )
+
+      const maxResponseBytes = Math.min(req.maxBodyBytes ?? defaultMaxBodyBytes, hardMaxBodyBytes)
+      let response: RawHttpResponse
+      try {
+        ks.assertAllowed(grant.tenantId ?? null)
+        deadline.throwIfAborted()
+        grant.audit('allowed', url.origin)
+        if (this.transportConfig.proxy || this.transportConfig.mtls) {
+          // Enforce configured egress proxy / mTLS transport instead of dialing directly.
+          response = await withAbort(
+            this.httpTransport(url, addresses.find(a => a.family === 4) ?? addresses[0], deadline, {
+              method: req.method,
+              headers: outboundHeaders,
+              body: prepared.preparedBody,
+              maxBodyBytes: maxResponseBytes,
+              readBody: true,
+              rejectUnauthorized: this.options.rejectUnauthorized ?? true,
+              tenantId: grant.tenantId ?? null,
+              killSwitch: ks,
+            }),
+            deadline,
+          )
+        } else {
+          const h2 = await withAbort(
+            EgressGateway.egressHttp2(
+              url,
+              {
+                method: req.method,
+                headers: outboundHeaders,
+                body: prepared.preparedBody,
+                signal: deadline,
+              },
+              {
+                allowLocalLab: localLab,
+                allowedOrigins: [url.origin],
+                pinnedAddresses: addresses.map(a => a.address),
+                timeoutMs,
+                maxResponseBytes,
+                rejectUnauthorized: this.options.rejectUnauthorized ?? true,
+                tenantId: grant.tenantId ?? null,
+                killSwitch: ks,
+              },
+            ),
+            deadline,
+          )
+          response = {
+            status: h2.status,
+            headers: h2.headers,
+            body: h2.body,
+            bodyBytes: h2.bodyBytes,
+            bodyTruncated: h2.bodyTruncated,
+          }
+        }
+      } catch (err) {
+        if (!deadline.aborted && !(err instanceof KillSwitchTrippedError)) {
+          this.recordTransportFailure(url.origin, grant.audit)
+        }
+        throw err
+      } finally {
+        release()
+      }
+
+      ks.assertAllowed(grant.tenantId ?? null)
+      deadline.throwIfAborted()
+      grant.audit('observed', url.origin, response.status)
+      this.recordStatus(url.origin, response.status, grant.audit, {
+        routeTemplate: hopRouteTemplate,
+        headers: response.headers,
+        configuredRps: resolveGrantMaxRps(grant, maxRps || defaultRps),
+        probeClass: req.probeClass,
+      })
+
+      const requestOriginHeader = cleanHeaders.origin
+      const obs = observed(initialOrigin, url, response, this.options.source ?? 'public response', requestOriginHeader)
+      if (jar) {
+        this.storeJarCookiesAndCsrf(jar, url, response, obs.mediaType)
+      }
+
+      // 401 auto-refresh on HTTP/2: invoke rate-limited persona re-auth once, then retry.
+      if (
+        response.status === 401 &&
+        includePersona &&
+        personaHandle &&
+        !req.authMutation &&
+        !internalOptions.reauthAttempted &&
+        this.reauthHandler &&
+        !deadline.aborted
+      ) {
+        const reauthRunId = req.runId ?? grant.scopePolicy?.runId ?? undefined
+        const refreshed = await this.reauthHandler(personaHandle, reauthRunId, url.origin).catch(() => false)
+        if (refreshed !== false) {
+          const refreshedPersona = grant.personas?.get(personaHandle)
+          const rebuilt = refreshedPersona ? buildPersonaHeader(refreshedPersona, initialOrigin) : null
+          return this.executeHttp2Exchange(req, grant, signal, {
+            reauthAttempted: true,
+            ...(rebuilt ? { refreshedPersonaHeaders: rebuilt } : {}),
+          })
+        }
+      }
+
+      const rawBody = response.body ?? ''
+      const secondOrderStorage = this.options.storage ?? grant.storage
+      if (secondOrderStorage && req.runId && rawBody) {
+        scanSecondOrderMarkers({
+          text: rawBody,
+          runId: req.runId,
+          assignmentId: req.assignmentId,
+          origin: url.origin,
+          endpoint: url.pathname + url.search,
+          persona: personaHandle ?? null,
+          storage: secondOrderStorage,
+        })
+      }
+
+      const effectiveSecrets: NamedSecret[] = [
+        ...secrets,
+        ...this.redactedSecrets.values(),
+      ]
+      const rawResponseHeaders = normalizeHeaders(response.headers)
+      if (req.onRawResponse) {
+        try { req.onRawResponse({ body: rawBody, headers: { ...rawResponseHeaders } }) } catch { /* host hook must never abort exchange */ }
+      }
+      const secretMatches = [
+        ...scanSecrets(rawBody, { secrets: effectiveSecrets }),
+        ...scanSecretHeaders(rawResponseHeaders, { secrets: effectiveSecrets }),
+      ]
+      const safeBody = redact(rawBody, effectiveSecrets)
+      const bodySha256 = createHash('sha256').update(safeBody).digest('hex')
+      const scrubbedReqHeaders = redactHeaders(normalizeHeaders(outboundHeaders), effectiveSecrets)
+
+      return {
+        origin: initialOrigin,
+        finalOrigin: url.origin,
+        redirectOrigins: [url.origin],
+        finalPathAndQuery: redact(`${url.pathname}${url.search}`, effectiveSecrets),
+        redirectPaths: [],
+        method: req.method,
+        pathAndQuery: redact(req.pathAndQuery, effectiveSecrets),
+        personaHandle: personaHandle ?? null,
+        status: response.status,
+        mediaType: obs.mediaType,
+        reqHeaders: scrubbedReqHeaders,
+        respHeaders: redactHeaders(rawResponseHeaders, effectiveSecrets),
+        setCookies: parseSetCookies(response.headers),
+        bodyPreview: safeBody.slice(0, bodyPreviewLimit),
+        body: safeBody,
+        bodySha256,
+        bodyBytes: response.bodyBytes ?? Buffer.byteLength(rawBody),
+        bodyTruncated: Boolean(response.bodyTruncated),
+        durationMs: Date.now() - started,
+        wireCredentialProvenance,
+        secretMatches,
+        ...(response.tls ? { tls: response.tls } : {}),
+        observation: obs,
+      }
+    })
+  }
+
   async executeBatch(reqs: readonly BrokerHttpRequest[], grant: Grant, signal: AbortSignal): Promise<BrokerExchangeResult[]> {
     this.getKillSwitch().assertAllowed(grant.tenantId ?? null)
     signal.throwIfAborted()
@@ -3512,7 +4100,7 @@ export class RequestBroker {
       if (this.isCircuitOpen(origin)) {
         throw new BrokerCircuitOpen(origin, state.openReason ?? 'Origin circuit is open.')
       }
-      if (state.batchActive) throw new BrokerDenied(`Another synchronized batch is already running for ${origin}.`)
+      if (this.isBatchLockActive(state)) throw new BrokerDenied(`Another synchronized batch is already running for ${origin}.`)
       uniqueOrigins.add(origin)
     }
 
@@ -3542,20 +4130,25 @@ export class RequestBroker {
       prepared: this.prepareHttpRequest(req, grant, { preAdmitted: batchDecision.decisions[idx] }),
     }))
 
-    for (const origin of uniqueOrigins) {
-      const state = this.health(origin, resolveGrantMaxRps(grant, 5))
-      state.batchActive = true
-      // Ensure the bucket has enough tokens for a synchronized burst of up to reqs.length
-      state.tokens = Math.max(state.tokens, reqs.length)
-    }
+    const lockOwner = `batch:${randomBytes(8).toString('hex')}`
+    const maxTimeout = Math.max(0, ...preparedList.map(p => p.prepared.timeoutMs))
+    const lockTtlMs = this.options.batchLockTtlMs ?? Math.max(60_000, maxTimeout + 15_000)
+    const lockedOrigins: string[] = []
     try {
+      for (const origin of uniqueOrigins) {
+        const defaultRps = resolveGrantMaxRps(grant, 5)
+        this.acquireBatchLock(origin, defaultRps, lockOwner, lockTtlMs)
+        lockedOrigins.push(origin)
+        const state = this.health(origin, defaultRps)
+        // Ensure the bucket has enough tokens for a synchronized burst of up to reqs.length
+        state.tokens = Math.max(state.tokens, reqs.length)
+      }
       return await Promise.all(
         preparedList.map(({ req, prepared }) => this.executePreparedHttp(prepared, req, grant, signal, { bypassConcurrency: true })),
       )
     } finally {
-      for (const origin of uniqueOrigins) {
-        const state = this.origins.get(origin)
-        if (state) state.batchActive = false
+      for (const origin of lockedOrigins) {
+        this.releaseBatchLock(origin, lockOwner)
       }
     }
   }
@@ -3600,7 +4193,7 @@ export class RequestBroker {
       const origin = prepared.initialOrigin
       const state = this.health(origin, resolveGrantMaxRps(grant, tier === 3 ? 3 : 5))
       if (state.openReason) throw new BrokerCircuitOpen(origin, state.openReason)
-      if (state.batchActive) throw new BrokerDenied(`Another synchronized burst is already running for ${origin}.`)
+      if (this.isBatchLockActive(state)) throw new BrokerDenied(`Another synchronized burst is already running for ${origin}.`)
       countsByOrigin.set(origin, (countsByOrigin.get(origin) ?? 0) + 1)
       if (!hostsToResolve.has(prepared.url.hostname)) {
         hostsToResolve.set(prepared.url.hostname, {
@@ -3629,21 +4222,24 @@ export class RequestBroker {
     )
     signal.throwIfAborted()
 
-    // 3. Re-check all origins atomically before mutating state, then reserve burst tokens and lock.
+    // 3. Re-check all origins atomically before mutating state, then reserve burst tokens and owner-TTL lock.
     const defaultRps = resolveGrantMaxRps(grant, tier === 3 ? 3 : 5)
     for (const origin of countsByOrigin.keys()) {
       const state = this.health(origin, defaultRps)
       if (state.openReason) throw new BrokerCircuitOpen(origin, state.openReason)
-      if (state.batchActive) throw new BrokerDenied(`Another synchronized burst is already running for ${origin}.`)
+      if (this.isBatchLockActive(state)) throw new BrokerDenied(`Another synchronized burst is already running for ${origin}.`)
     }
 
+    const lockOwner = `race:${randomBytes(8).toString('hex')}`
+    const maxTimeout = Math.max(0, ...preparedList.map(p => p.prepared.timeoutMs))
+    const lockTtlMs = this.options.batchLockTtlMs ?? Math.max(60_000, maxTimeout + 15_000)
     const markedOrigins: string[] = []
     let results: BrokerExchangeResult[]
     try {
       for (const [origin, count] of countsByOrigin) {
-        const state = this.health(origin, defaultRps)
-        state.batchActive = true
+        this.acquireBatchLock(origin, defaultRps, lockOwner, lockTtlMs)
         markedOrigins.push(origin)
+        const state = this.health(origin, defaultRps)
         state.tokens = Math.max(state.tokens, count)
       }
       // HTTP/2 bursts share one pooled connection and release every stream header at the same
@@ -3662,8 +4258,7 @@ export class RequestBroker {
       )
     } finally {
       for (const origin of markedOrigins) {
-        const state = this.origins.get(origin)
-        if (state) state.batchActive = false
+        this.releaseBatchLock(origin, lockOwner)
       }
     }
 

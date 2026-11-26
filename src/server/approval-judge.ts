@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import { z } from 'zod'
 import type { ApprovalPolicy, ApprovedEndpointPattern } from '../domain.ts'
 import {
+  computeApprovalHeadersDigest,
   matchesApprovedEndpointPattern,
   normalizeOriginKey,
 } from './approval-pattern.ts'
@@ -12,14 +13,17 @@ import type { UsageCallback } from './provider.ts'
 import { redact } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
 import {
+  detectMethodOverride,
   evaluateScopeRequest,
   isReadOnlyHttpMethod,
   isVerifiedReadOnlyGraphqlQuery,
+  parseStrictJsonObject,
 } from './scope-policy.ts'
 import type { EnvironmentMode, ScopeHook } from './scope-policy.ts'
 
 export type { ApprovalPolicy, ApprovedEndpointPattern }
 export {
+  computeApprovalHeadersDigest,
   matchesApprovedEndpointPattern,
   normalizeApprovalPathPattern,
 } from './approval-pattern.ts'
@@ -65,6 +69,8 @@ export interface Tier3ApprovalInput {
   /** Run-scoped synthetic tenant tag (`kovo-qa-<runId>-`). */
   tenantTag?: string | null
   routeDenylist?: readonly string[]
+  /** H-3: Host-confirmed GraphQL endpoints (exact match only when supplied). */
+  confirmedGraphqlEndpoints?: readonly string[]
   approvedPatterns?: readonly ApprovedEndpointPattern[]
   llmCall?: SafetyJudgeLlmCall
   profiles?: readonly ResolvedModelProfile[]
@@ -187,11 +193,23 @@ export interface StateChangeApprovalContext {
   body?: string | null
   /** SHA-256 body/parts digest as computed by computeStateChangeBodyHash. */
   bodyHash?: string | null
+  /** H-4: Caller headers included in canonical digest & structural checks. */
+  headers?: Record<string, string>
+  /** H-4: Pre-computed canonical headers digest (`computeApprovalHeadersDigest`). */
+  headersDigest?: string | null
   hasMultipart?: boolean
+  /** H-4: Explicit multipart classification (`none` | `multipart` | `malformed_multipart`). */
+  multipartKind?: MultipartRequestKind
   isRaceBurst?: boolean
   isRceProof?: boolean
   /** True when the caller declared a non-identity Content-Encoding (gzip/br/deflate/...). */
   hasCompressedBody?: boolean
+  /** R2-H-1: True when a method-override header or `_method` carrier was detected. */
+  hasMethodOverride?: boolean
+  /** R2-H-1: Effective HTTP verb after accounting for override carriers. */
+  effectiveMethod?: string
+  /** Optional assignment ID binding a grant to a specific worker assignment (`H-4`). */
+  assignmentId?: string
 }
 
 export interface StateChangeFingerprintInput extends StateChangeApprovalContext {
@@ -235,10 +253,31 @@ export function computeStateChangeBodyHash(
   return `body:${sha256Hex(String(body))}`
 }
 
+function hasCompressedContentEncoding(headers: Record<string, string> | undefined): boolean {
+  const ce = (headerLookup(headers, 'content-encoding') ?? '').trim()
+  return ce !== '' && !/^identity$/i.test(ce)
+}
+
 export function buildStateChangeFingerprint(input: StateChangeFingerprintInput): string {
   const bodyHash = input.bodyHash ?? computeStateChangeBodyHash(input.body ?? null)
+  const headersDigest = input.headersDigest !== undefined
+    ? (input.headersDigest ?? '')
+    : (computeApprovalHeadersDigest(input.headers) ?? '')
+  const multipartKind: MultipartRequestKind = input.multipartKind ?? detectMultipartRequest({
+    headers: input.headers,
+    hasMultipart: input.hasMultipart,
+    bodyPreview: input.body ?? null,
+  })
+  const hasCompressed = Boolean(input.hasCompressedBody) || hasCompressedContentEncoding(input.headers)
+  const override = detectMethodOverride({
+    method: input.method,
+    pathAndQuery: input.pathAndQuery,
+    headers: input.headers,
+    body: input.body ?? null,
+  })
+  const hasOverride = Boolean(input.hasMethodOverride) || override.hasOverride
   return JSON.stringify([
-    'state-change-v1',
+    'state-change-v2',
     input.runId ?? '',
     normalizeOriginKey(input.origin),
     input.method.toUpperCase(),
@@ -246,15 +285,24 @@ export function buildStateChangeFingerprint(input: StateChangeFingerprintInput):
     input.personaHandle ?? '',
     bodyHash ?? '',
     input.scopeRevision ?? null,
-    Boolean(input.hasMultipart),
+    Boolean(input.hasMultipart || multipartKind !== 'none'),
     Boolean(input.isRaceBurst),
     Boolean(input.isRceProof),
+    headersDigest,
+    multipartKind,
+    hasCompressed,
+    hasOverride,
+    input.assignmentId ?? '',
   ])
 }
 
 export interface StateChangeApprovalGrant {
   expiresAt: number
   approvalId?: string
+  /** Internal flag: true when the grant explicitly bound headers/headersDigest. */
+  hasHeadersBinding?: boolean
+  /** Internal flag: true when the grant explicitly bound assignmentId. */
+  hasAssignmentBinding?: boolean
 }
 
 /** Grants are valid only long enough for the broker retry that immediately follows the decision. */
@@ -275,17 +323,72 @@ export class StateChangeApprovalLedger {
 
   grant(input: StateChangeFingerprintInput, options: StateChangeApprovalGrant): string {
     const key = buildStateChangeFingerprint(input)
-    this.grants.set(key, options)
+    const hasHeadersBinding = options.hasHeadersBinding ?? (input.headers !== undefined || input.headersDigest !== undefined)
+    const hasAssignmentBinding = options.hasAssignmentBinding ?? Boolean(input.assignmentId)
+    this.grants.set(key, { ...options, hasHeadersBinding, hasAssignmentBinding })
     this.prune(Date.now())
     return key
   }
 
   consume(input: StateChangeFingerprintInput, now = Date.now()): boolean {
     const key = buildStateChangeFingerprint(input)
-    const grant = this.grants.get(key)
-    if (!grant) return false
-    this.grants.delete(key)
-    return grant.expiresAt > now
+    const exact = this.grants.get(key)
+    if (exact) {
+      this.grants.delete(key)
+      return exact.expiresAt > now
+    }
+    // Compatibility bridge for legacy callers that granted without forwarding `headers` or
+    // `assignmentId`: ONLY matches a grant that explicitly lacked those bindings, and NEVER when
+    // the consuming request carries compressed bodies, method overrides, or malformed multipart.
+    const hasInputHeaders = input.headers !== undefined || input.headersDigest !== undefined
+    const hasInputAssignment = Boolean(input.assignmentId)
+    if (hasInputHeaders || hasInputAssignment) {
+      const multipartKind = input.multipartKind ?? detectMultipartRequest({
+        headers: input.headers,
+        hasMultipart: input.hasMultipart,
+        bodyPreview: input.body ?? null,
+      })
+      const hasCompressed = Boolean(input.hasCompressedBody) || hasCompressedContentEncoding(input.headers)
+      const override = detectMethodOverride({
+        method: input.method,
+        pathAndQuery: input.pathAndQuery,
+        headers: input.headers,
+        body: input.body ?? null,
+      })
+      if (!hasCompressed && !override.hasOverride && !input.hasMethodOverride && multipartKind !== 'malformed_multipart') {
+        const candidates: Array<{ key: string; dropHeaders: boolean; dropAssignment: boolean }> = []
+        if (hasInputAssignment) {
+          candidates.push({
+            key: buildStateChangeFingerprint({ ...input, assignmentId: undefined }),
+            dropHeaders: false,
+            dropAssignment: true,
+          })
+        }
+        if (hasInputHeaders) {
+          candidates.push({
+            key: buildStateChangeFingerprint({ ...input, headers: undefined, headersDigest: null }),
+            dropHeaders: true,
+            dropAssignment: false,
+          })
+        }
+        if (hasInputHeaders && hasInputAssignment) {
+          candidates.push({
+            key: buildStateChangeFingerprint({ ...input, headers: undefined, headersDigest: null, assignmentId: undefined }),
+            dropHeaders: true,
+            dropAssignment: true,
+          })
+        }
+        for (const cand of candidates) {
+          const legacy = this.grants.get(cand.key)
+          if (!legacy) continue
+          if (cand.dropHeaders && legacy.hasHeadersBinding !== false) continue
+          if (cand.dropAssignment && legacy.hasAssignmentBinding !== false) continue
+          this.grants.delete(cand.key)
+          return legacy.expiresAt > now
+        }
+      }
+    }
+    return false
   }
 
   get size(): number {
@@ -344,10 +447,14 @@ export function authorizeStateChange(input: {
   // operator pattern ("Approve similar") honors the operator's approval on that normalized route,
   // including DELETE and well-formed multipart routes they explicitly approved.
   const nonOverridable = !context || Boolean(detectNonOverridableEscalationReason({
+    method: input.method,
+    pathAndQuery: input.pathAndQuery,
     bodyPreview: context?.body ?? null,
+    headers: context?.headers,
     hasMultipart: context?.hasMultipart,
     isRceProof: context?.isRceProof,
     hasCompressedBody: context?.hasCompressedBody,
+    hasMethodOverride: context?.hasMethodOverride,
   }))
   if (context && !context.isRaceBurst && !nonOverridable) {
     const pattern = matchesApprovedEndpointPattern(
@@ -367,9 +474,15 @@ export function authorizeStateChange(input: {
       personaHandle: context.personaHandle ?? null,
       bodyHash: context.bodyHash,
       body: context.body,
+      headers: context.headers,
+      headersDigest: context.headersDigest,
       hasMultipart: context.hasMultipart,
+      multipartKind: context.multipartKind,
+      hasCompressedBody: context.hasCompressedBody,
+      hasMethodOverride: context.hasMethodOverride,
       isRaceBurst: context.isRaceBurst,
       isRceProof: context.isRceProof,
+      assignmentId: context.assignmentId,
     }, input.now)
     if (consumed) return { approved: true, via: 'one_shot' }
   }
@@ -430,73 +543,29 @@ export function detectMultipartRequest(input: {
 }
 
 /**
- * Duplicate-aware top-level key scan. `JSON.parse` is last-wins, so a body with two `query` keys
- * (one mutation, one read-only document) could be classified as benign by Kovo Hunter while a target
- * parser executes the other value. Returns `undefined` for malformed JSON.
+ * Strict RFC 8259 JSON object parser shared with `scope-policy.ts` (`H-3`): rejects duplicate
+ * keys at any depth, escaped top-level keys, case-variant top-level duplicates, and malformed JSON.
  */
-function topLevelJsonKeys(raw: string): string[] | undefined {
-  const text = raw.trim()
-  if (!text.startsWith('{')) return undefined
-  const keys: string[] = []
-  let depth = 0
-  let i = 0
-  while (i < text.length) {
-    const ch = text[i]!
-    if (ch === '"') {
-      let j = i + 1
-      let value = ''
-      let closed = false
-      while (j < text.length) {
-        const c = text[j]!
-        if (c === '\\') {
-          value += text.slice(j, j + 2)
-          j += 2
-          continue
-        }
-        if (c === '"') {
-          closed = true
-          j += 1
-          break
-        }
-        value += c
-        j += 1
-      }
-      if (!closed) return undefined
-      if (depth === 1) {
-        let k = j
-        while (k < text.length && /\s/.test(text[k]!)) k += 1
-        if (text[k] === ':') keys.push(value)
-      }
-      i = j
-      continue
-    }
-    if (ch === '{' || ch === '[') depth += 1
-    else if (ch === '}' || ch === ']') {
-      depth -= 1
-      if (depth < 0) return undefined
-    }
-    i += 1
-  }
-  if (depth !== 0) return undefined
-  return keys
-}
-
-function hasDuplicateTopLevelJsonKeys(raw: string): boolean {
-  const keys = topLevelJsonKeys(raw)
-  if (!keys) return false
-  return new Set(keys).size !== keys.length
-}
-
 function parseJsonObjectBody(body: string | null | undefined): Record<string, unknown> | undefined {
-  const trimmed = (body ?? '').trim()
-  if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) return undefined
-  if (hasDuplicateTopLevelJsonKeys(trimmed)) return undefined
-  try {
-    const parsed = JSON.parse(trimmed) as unknown
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined
-    return parsed as Record<string, unknown>
-  } catch {
-    return undefined
+  if (!body) return undefined
+  return parseStrictJsonObject(body)
+}
+
+function collectDecodedJsonStrings(value: unknown, out: string[], depth = 0): void {
+  if (depth > 16 || out.length > 512) return
+  if (typeof value === 'string') {
+    out.push(value)
+    return
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectDecodedJsonStrings(item, out, depth + 1)
+    return
+  }
+  if (value && typeof value === 'object') {
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      out.push(k)
+      collectDecodedJsonStrings(v, out, depth + 1)
+    }
   }
 }
 
@@ -504,35 +573,59 @@ function parseJsonObjectBody(body: string | null | undefined): Record<string, un
  * Compatibility wrapper: read-only GraphQL classification lives in `scope-policy.ts` so the
  * environment contract, broker and browser all agree on what a verified read-only query is.
  */
-function isGraphqlReadOnlyQuery(pathAndQuery: string, body: string | null | undefined): boolean {
-  return isVerifiedReadOnlyGraphqlQuery(pathAndQuery, body)
+function isGraphqlReadOnlyQuery(
+  pathAndQuery: string,
+  body: string | null | undefined,
+  headers?: Record<string, string>,
+  options?: { confirmedEndpoints?: readonly string[]; origin?: string; method?: string },
+): boolean {
+  return isVerifiedReadOnlyGraphqlQuery(pathAndQuery, body, headers, options)
 }
 
 function isReadOnlySearchPost(pathAndQuery: string, body: string | null | undefined): boolean {
   if (!READONLY_SEARCH_PATH_PATTERN.test(pathAndQuery)) return false
   const trimmed = (body ?? '').trim().slice(0, MAX_KEYWORD_SCAN_CHARS)
   if (!trimmed) return true
-  // JSON search bodies must be well-formed and duplicate-key-free, so the exact document the
-  // judge classified is the document the target will parse.
-  if (trimmed.startsWith('{') && !parseJsonObjectBody(trimmed)) return false
-  if (hasDuplicateTopLevelJsonKeys(trimmed)) return false
+  // H-3: reuse strict RFC 8259 JSON parser and scan decoded keys/values so unicode-escaped
+  // mutation hints (e.g. `\u0064elete`) cannot bypass the benign search fast-path check.
+  if (trimmed.startsWith('{')) {
+    const parsed = parseJsonObjectBody(trimmed)
+    if (!parsed) return false
+    const decodedStrings: string[] = []
+    collectDecodedJsonStrings(parsed, decodedStrings)
+    if (decodedStrings.some(s => MUTATION_BODY_HINT.test(s))) return false
+  }
   return !MUTATION_BODY_HINT.test(trimmed)
 }
 
 /**
  * Non-overridable structural safety invariants that ALWAYS require explicit human approval, even
  * when an operator has approved a route pattern ("Approve similar"): RCE proofs, compressed
- * request bodies, over-cap bodies (>64 KiB), and malformed multipart uploads.
+ * request bodies, over-cap bodies (>64 KiB), malformed multipart uploads, and HTTP method-override
+ * carriers (`R2-H-1`).
  */
 function detectNonOverridableEscalationReason(input: {
+  method?: string
+  pathAndQuery?: string
   bodyPreview?: string | null
   headers?: Record<string, string>
   hasMultipart?: boolean
   isRceProof?: boolean
   hasCompressedBody?: boolean
+  hasMethodOverride?: boolean
 }): string | null {
   if (input.isRceProof) {
     return 'RCE proof-of-execution probe always requires explicit human approval.'
+  }
+  const override = detectMethodOverride({
+    method: input.method ?? 'POST',
+    pathAndQuery: input.pathAndQuery,
+    headers: input.headers,
+    body: input.bodyPreview ?? null,
+  })
+  if (input.hasMethodOverride || override.hasOverride) {
+    const detail = override.carriers.length > 0 ? ` (${override.carriers.join(', ')} -> ${override.effectiveMethod})` : ''
+    return `HTTP method-override carriers${detail} always require explicit human approval.`
   }
   const contentEncoding = (headerLookup(input.headers, 'content-encoding') ?? '').trim()
   if (input.hasCompressedBody || (contentEncoding && !/^identity$/i.test(contentEncoding))) {
@@ -555,6 +648,7 @@ function detectNonOverridableEscalationReason(input: {
  */
 function detectRouteStructuralEscalationReason(input: {
   method: string
+  pathAndQuery?: string
   bodyPreview?: string | null
   headers?: Record<string, string>
   hasMultipart?: boolean
@@ -563,7 +657,13 @@ function detectRouteStructuralEscalationReason(input: {
   if (multipartKind === 'multipart') {
     return 'Multipart file upload probe always requires explicit human approval.'
   }
-  if (input.method === 'DELETE') {
+  const effectiveMethod = detectMethodOverride({
+    method: input.method,
+    pathAndQuery: input.pathAndQuery,
+    headers: input.headers,
+    body: input.bodyPreview ?? null,
+  }).effectiveMethod
+  if (input.method === 'DELETE' || effectiveMethod === 'DELETE') {
     return 'HTTP DELETE requests always require explicit human approval.'
   }
   return null
@@ -632,6 +732,12 @@ export async function evaluateTier3Approval(
 ): Promise<Tier3ApprovalEvaluation> {
   const method = input.method.toUpperCase()
   const pathAndQuery = input.pathAndQuery || '/'
+  const override = detectMethodOverride({
+    method,
+    pathAndQuery,
+    headers: input.headers,
+    body: input.bodyPreview ?? null,
+  })
 
   // 0. v6 environment contract — the primary safety decision for non-ephemeral runs.
   //    No keyword scan, no LLM, and no blocking human popup: the environment either permits the
@@ -643,6 +749,9 @@ export async function evaluateTier3Approval(
         mode: input.mode,
         targetOrigins: [input.origin],
         routeDenylist: input.routeDenylist ?? [],
+        ...(input.confirmedGraphqlEndpoints !== undefined
+          ? { confirmedGraphqlEndpoints: input.confirmedGraphqlEndpoints }
+          : {}),
         tenantTag: input.tenantTag ?? null,
       },
       {
@@ -655,7 +764,17 @@ export async function evaluateTier3Approval(
       },
     )
     if (decision.allowed) {
-      const readOnly = isReadOnlyHttpMethod(method, input.bodyPreview ?? null)
+      if (override.hasOverride && input.policy !== 'yolo') {
+        return {
+          decision: 'escalate_human',
+          decidedBy: 'operator',
+          riskLevel: 'high',
+          reason: `HTTP method-override carriers (${override.carriers.join(', ')} -> ${override.effectiveMethod}) always require explicit human approval.`,
+          usedLlm: false,
+          stage: 'hard_escalation',
+        }
+      }
+      const readOnly = !override.hasOverride && isReadOnlyHttpMethod(override.effectiveMethod, input.bodyPreview ?? null)
       return {
         decision: 'approve',
         decidedBy: 'auto-review:environment',
@@ -718,9 +837,12 @@ export async function evaluateTier3Approval(
     }
   }
 
-  // Stage 1A (non-overridable) — RCE proof, compressed/over-cap bodies, and malformed multipart
-  // uploads ALWAYS escalate to a human operator and can never be bypassed by an operator pattern.
+  // Stage 1A (non-overridable) — RCE proof, method-override carriers, compressed/over-cap bodies,
+  // and malformed multipart uploads ALWAYS escalate to a human operator and can never be bypassed
+  // by an operator pattern.
   const nonOverridableReason = detectNonOverridableEscalationReason({
+    method,
+    pathAndQuery,
     bodyPreview: input.bodyPreview,
     headers: input.headers,
     hasMultipart: input.hasMultipart,
@@ -741,9 +863,9 @@ export async function evaluateTier3Approval(
   // Stage 1B — Operator-approved endpoint pattern ("Approve similar").
   // Checked after non-overridable invariants so an operator's explicit "Approve similar" decision
   // on a DELETE or well-formed multipart route suppresses repeat prompts on that exact route.
-  const matchedPattern = !input.isRceProof && !input.isRaceBurst
+  const matchedPattern = !input.isRceProof && !input.isRaceBurst && !override.hasOverride
     ? matchesApprovedEndpointPattern(
-        { origin: input.origin, method, pathAndQuery },
+        { origin: input.origin, method: override.effectiveMethod, pathAndQuery },
         input.approvedPatterns,
       )
     : undefined
@@ -762,6 +884,7 @@ export async function evaluateTier3Approval(
   // until the operator approves that route (or switches to Autonomous / yolo).
   const routeEscalationReason = detectRouteStructuralEscalationReason({
     method,
+    pathAndQuery,
     bodyPreview: input.bodyPreview,
     headers: input.headers,
     hasMultipart: input.hasMultipart,
@@ -778,8 +901,14 @@ export async function evaluateTier3Approval(
   }
 
   // Stage 1C — Deterministic Benign Fast-Path (zero LLM cost)
-  if (method === 'POST' && !input.isRaceBurst) {
-    if (isGraphqlReadOnlyQuery(pathAndQuery, input.bodyPreview)) {
+  if (method === 'POST' && !override.hasOverride && !input.isRaceBurst) {
+    if (isGraphqlReadOnlyQuery(pathAndQuery, input.bodyPreview, input.headers, {
+      ...(input.confirmedGraphqlEndpoints !== undefined
+        ? { confirmedEndpoints: input.confirmedGraphqlEndpoints }
+        : {}),
+      origin: input.origin,
+      method,
+    })) {
       return {
         decision: 'approve',
         decidedBy: 'auto-review:rule',
@@ -860,6 +989,13 @@ export async function evaluateTier3Approval(
   }
 
   const secrets = input.secrets ?? []
+  const redactedHeaders = input.headers
+    ? Object.fromEntries(
+        Object.entries(input.headers)
+          .slice(0, 32)
+          .map(([k, v]) => [k.toLowerCase(), redact(v, secrets).slice(0, 200)]),
+      )
+    : undefined
   // The agent-controlled rationale is intentionally omitted: an untrusted claim of benign intent
   // must never be able to weaken the judge's independent decision.
   const userPrompt = JSON.stringify(
@@ -867,9 +1003,12 @@ export async function evaluateTier3Approval(
       environment: input.environment ?? 'public',
       origin: input.origin,
       method,
+      effectiveMethod: override.effectiveMethod,
+      hasMethodOverride: override.hasOverride,
       pathAndQuery: redact(pathAndQuery, secrets).slice(0, 500),
       personaHandle: input.personaHandle ?? null,
       isRaceBurst: Boolean(input.isRaceBurst),
+      ...(redactedHeaders ? { headers: redactedHeaders } : {}),
       bodyPreview: redact((input.bodyPreview ?? '').slice(0, 1200), secrets),
     },
     null,

@@ -32,9 +32,21 @@ export interface ScopePolicy {
   assetOrigins?: readonly string[]
   /** Optional `staging_isolated` denylist of routes (path prefixes). */
   routeDenylist?: readonly string[]
+  /**
+   * H-3: Host-confirmed GraphQL endpoints (exact canonical pathnames like `/graphql` or
+   * full `origin + pathname` strings). When supplied (even `[]`), ONLY these endpoints qualify
+   * for the read-only GraphQL exception — path-suffix guessing is disabled.
+   */
+  confirmedGraphqlEndpoints?: readonly string[]
   /** Run-scoped synthetic-tenant tag (`kovo-qa-<runId>-`). */
   tenantTag?: string | null
   runId?: string | null
+  /**
+   * R2-H-1: True when `staging_isolated` was derived automatically (not explicitly declared by
+   * the operator). On derived staging runs, host-injected run-tag headers (`x-kovo-tenant-tag`,
+   * `x-kovo-run-id`) are NEVER treated as standalone isolation proof.
+   */
+  derivedEnvironmentMode?: boolean
 }
 
 export type ScopeSurface = 'broker' | 'browser'
@@ -46,6 +58,10 @@ export interface ScopeRequest {
   pathAndQuery: string
   body?: string | null
   headers?: Record<string, string | string[] | undefined>
+  /** Optional per-request confirmed GraphQL endpoints override (defaults to `policy.confirmedGraphqlEndpoints`). */
+  confirmedGraphqlEndpoints?: readonly string[]
+  /** R2-H-1: Per-request override indicating a derived (non-explicit) staging environment mode. */
+  derivedEnvironmentMode?: boolean
   /**
    * The request is a redirect hop rather than an actively-selected probe. IdP redirects and
    * CDN hydration transit are only reachable under this flag.
@@ -210,15 +226,195 @@ export function isReadOnlyHttpMethod(method: string, body?: string | null): bool
   return false
 }
 
+// ---------------------------------------------------------------------------
+// R2-H-1: Effective HTTP verb & method-override carrier detection
+// ---------------------------------------------------------------------------
+
+/** HTTP method-override headers honored by Rails, Laravel, Symfony, Express, Spring, etc. */
+export const METHOD_OVERRIDE_HEADERS = new Set([
+  'x-http-method-override',
+  'x-http-method',
+  'x-method-override',
+])
+
+/** Host-injected tracing/tagging headers that must NEVER serve as standalone isolation proof. */
+export const HOST_INJECTED_TENANT_HEADERS = new Set([
+  'x-kovo-tenant-tag',
+  'x-kovo-run-id',
+])
+
+const HTTP_METHOD_TOKEN_RE = /^[A-Z][A-Z0-9_-]{0,15}$/
+const METHOD_OVERRIDE_PRIORITY: readonly string[] = ['DELETE', 'PUT', 'PATCH', 'POST']
+const MAX_OVERRIDE_BODY_SCAN_CHARS = 64 * 1024
+
+export interface MethodOverrideDetection {
+  /** True whenever any method-override header, query param, or body field is present. */
+  hasOverride: boolean
+  /** Effective HTTP verb accounting for override carriers (fails closed toward destructive verbs). */
+  effectiveMethod: string
+  /** Resolved override verb if an override carrier was present, otherwise `null`. */
+  overriddenVerb: string | null
+  /** Human-readable list of detected override carrier locations (names only, never secret values). */
+  carriers: string[]
+}
+
+/**
+ * Compute the effective HTTP verb including method-override headers (`X-HTTP-Method-Override`,
+ * `X-HTTP-Method`, `X-Method-Override`) and `_method` query/form/JSON/multipart fields (`R2-H-1`).
+ */
+export function detectMethodOverride(input: {
+  method: string
+  pathAndQuery?: string
+  headers?: Record<string, string | string[] | undefined>
+  body?: string | null
+}): MethodOverrideDetection {
+  const baseMethod = (input.method || 'GET').trim().toUpperCase() || 'GET'
+  const carriers: string[] = []
+  const candidates: string[] = []
+
+  const pushVerb = (raw: string | undefined) => {
+    if (!raw) return
+    for (const part of raw.split(',')) {
+      const token = part.trim().toUpperCase()
+      if (token && HTTP_METHOD_TOKEN_RE.test(token)) {
+        candidates.push(token)
+      }
+    }
+  }
+
+  // 1. Method-override headers (case-insensitive)
+  for (const [key, value] of Object.entries(input.headers ?? {})) {
+    const lower = key.toLowerCase()
+    if (!METHOD_OVERRIDE_HEADERS.has(lower)) continue
+    const raw = Array.isArray(value) ? value.join(',') : (value ?? '')
+    if (raw.trim().length > 0) {
+      carriers.push(`header:${lower}`)
+      pushVerb(raw)
+    }
+  }
+
+  // 2. `_method` query parameter
+  const pathAndQuery = input.pathAndQuery ?? ''
+  const qIdx = pathAndQuery.indexOf('?')
+  if (qIdx >= 0) {
+    const hIdx = pathAndQuery.indexOf('#', qIdx)
+    const rawQuery = hIdx >= 0 ? pathAndQuery.slice(qIdx + 1, hIdx) : pathAndQuery.slice(qIdx + 1)
+    if (rawQuery) {
+      const params = new URLSearchParams(rawQuery)
+      for (const [k, v] of params.entries()) {
+        if (k.toLowerCase() === '_method' && v.trim().length > 0) {
+          carriers.push('query:_method')
+          pushVerb(v)
+        }
+      }
+    }
+  }
+
+  // 3. `_method` form-urlencoded, JSON, or multipart body field
+  const rawBody = input.body
+  if (typeof rawBody === 'string' && rawBody.length > 0) {
+    const scanBody = rawBody.slice(0, MAX_OVERRIDE_BODY_SCAN_CHARS)
+    const contentType = headerValue(input.headers, 'content-type').toLowerCase()
+
+    // Form-urlencoded body (explicit content-type or form-like key=value syntax)
+    if (
+      contentType.includes('application/x-www-form-urlencoded') ||
+      (!contentType.includes('json') && /(?:^|&|%26)_method=/i.test(scanBody))
+    ) {
+      try {
+        const params = new URLSearchParams(scanBody)
+        for (const [k, v] of params.entries()) {
+          if (k.toLowerCase() === '_method' && v.trim().length > 0) {
+            carriers.push('form:_method')
+            pushVerb(v)
+          }
+        }
+      } catch {
+        if (/(?:^|&)_method=/i.test(scanBody)) {
+          carriers.push('form:_method')
+        }
+      }
+    }
+
+    // JSON object body with top-level `_method` field (including escaped key check)
+    const trimmed = scanBody.trim()
+    if (trimmed.startsWith('{')) {
+      try {
+        const parsed = JSON.parse(trimmed) as unknown
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+            if (k.toLowerCase() === '_method' && typeof v === 'string' && v.trim().length > 0) {
+              carriers.push('json:_method')
+              pushVerb(v)
+            }
+          }
+        }
+      } catch {
+        // Malformed JSON containing a `_method` key hint fails closed as an override carrier.
+        const fallback = /"(?:_method|\\u005fmethod)"\s*:\s*"([A-Za-z_-]{2,16})"/i.exec(trimmed)
+        if (fallback) {
+          carriers.push('json:_method')
+          pushVerb(fallback[1])
+        }
+      }
+    }
+
+    // Multipart form-data field named `_method`
+    if (/content-disposition:\s*form-data;[^;\r\n]*\bname\s*=\s*"?_method"?/i.test(scanBody)) {
+      carriers.push('multipart:_method')
+      const m = /content-disposition:\s*form-data;[^\r\n]*\bname\s*=\s*"?_method"?[^\r\n]*\r?\n\r?\n\s*([A-Za-z_-]{2,16})/i.exec(scanBody)
+      if (m?.[1]) pushVerb(m[1])
+    }
+  }
+
+  if (carriers.length === 0) {
+    return {
+      hasOverride: false,
+      effectiveMethod: baseMethod,
+      overriddenVerb: null,
+      carriers: [],
+    }
+  }
+
+  let chosen: string | null = null
+  for (const preferred of METHOD_OVERRIDE_PRIORITY) {
+    if (candidates.includes(preferred)) {
+      chosen = preferred
+      break
+    }
+  }
+  chosen ??= candidates[0] ?? null
+
+  return {
+    hasOverride: true,
+    effectiveMethod: chosen ?? baseMethod,
+    overriddenVerb: chosen,
+    carriers: [...new Set(carriers)],
+  }
+}
+
+export function resolveEffectiveHttpMethod(input: {
+  method: string
+  pathAndQuery?: string
+  headers?: Record<string, string | string[] | undefined>
+  body?: string | null
+}): string {
+  return detectMethodOverride(input).effectiveMethod
+}
+
 const MAX_GRAPHQL_READONLY_BODY_CHARS = 64 * 1024
 const MAX_JSON_NESTING_DEPTH = 32
 const MAX_GRAPHQL_NESTING_DEPTH = 24
 const graphqlEnvelopeKeys = new Set(['query', 'operationName', 'variables', 'extensions'])
 
 /**
- * True only when the request pathname (never query string or fragment, and never path traversal)
- * terminates at a GraphQL route segment such as `/graphql` or `/api/v1/graphql`.
+ * Legacy fallback GraphQL mount paths when a caller has not configured `confirmedGraphqlEndpoints`:
+ * ONLY top-level or standard API versioned GraphQL mounts (`/graphql`, `/api/graphql`,
+ * `/v1/graphql`, `/api/v1/graphql`), NEVER arbitrary REST resource routes whose parameter happens
+ * to equal `"graphql"` (e.g. `/api/users/graphql` or `/items/graphql`).
  */
+const CANONICAL_GRAPHQL_MOUNT_RE = /^\/(?:(?:api\/)?(?:v\d+\/)?)?graphql$/i
+
 function isGraphqlEndpointPath(pathAndQuery: string): boolean {
   const canonical = canonicalPathAndQuery(pathAndQuery)
   if (canonical === null) return false
@@ -226,7 +422,47 @@ function isGraphqlEndpointPath(pathAndQuery: string): boolean {
   const segments = pathname.split('/').filter(Boolean)
   if (segments.length === 0) return false
   if (segments.some(seg => seg === '.' || seg === '..')) return false
-  return segments[segments.length - 1]!.toLowerCase() === 'graphql'
+  return CANONICAL_GRAPHQL_MOUNT_RE.test(pathname)
+}
+
+/**
+ * Exact match against host-confirmed GraphQL endpoints (`H-3`).
+ * Entries may be canonical pathnames (`/graphql`, `/api/v2/gql`) or full URLs
+ * (`https://app.example/graphql`, which additionally bind the origin).
+ */
+export function matchesConfirmedGraphqlEndpoint(
+  pathAndQuery: string,
+  confirmedEndpoints: readonly string[],
+  origin?: string,
+): boolean {
+  const canonical = canonicalPathAndQuery(pathAndQuery)
+  if (canonical === null) return false
+  const reqPathname = canonical.split('?', 1)[0]!.toLowerCase().replace(/\/+$/, '') || '/'
+  const reqOrigin = origin ? normalizeScopeOrigin(origin) : null
+
+  for (const rawEntry of confirmedEndpoints) {
+    const entry = (rawEntry ?? '').trim()
+    if (!entry) continue
+    if (ABSOLUTE_URL_RE.test(entry)) {
+      try {
+        const parsed = new URL(entry)
+        const entryOrigin = normalizeScopeOrigin(parsed.origin)
+        const entryCanon = canonicalPathAndQuery(`${parsed.pathname}${parsed.search}`)
+        if (!entryOrigin || entryCanon === null) continue
+        if (reqOrigin && entryOrigin !== reqOrigin) continue
+        const entryPathname = entryCanon.split('?', 1)[0]!.toLowerCase().replace(/\/+$/, '') || '/'
+        if (entryPathname === reqPathname) return true
+      } catch {
+        continue
+      }
+    } else {
+      const entryCanon = canonicalPathAndQuery(entry)
+      if (entryCanon === null) continue
+      const entryPathname = entryCanon.split('?', 1)[0]!.toLowerCase().replace(/\/+$/, '') || '/'
+      if (entryPathname === reqPathname) return true
+    }
+  }
+  return false
 }
 
 /**
@@ -236,7 +472,7 @@ function isGraphqlEndpointPath(pathAndQuery: string): boolean {
  *  - ANY case-insensitive duplicate top-level key (e.g. `"query"` + `"Query"`),
  *  - malformed tokens, excessive nesting, or trailing bytes.
  */
-function validateStrictJsonObject(raw: string): boolean {
+export function validateStrictJsonObject(raw: string): boolean {
   const text = raw.trim()
   if (!text.startsWith('{') || !text.endsWith('}')) return false
   let i = 0
@@ -376,7 +612,7 @@ function validateStrictJsonObject(raw: string): boolean {
   return i === n
 }
 
-function parseJsonObject(raw: string): Record<string, unknown> | undefined {
+export function parseStrictJsonObject(raw: string): Record<string, unknown> | undefined {
   const trimmed = raw.trim()
   if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) return undefined
   if (!validateStrictJsonObject(trimmed)) return undefined
@@ -388,6 +624,8 @@ function parseJsonObject(raw: string): Record<string, unknown> | undefined {
     return undefined
   }
 }
+
+const parseJsonObject = parseStrictJsonObject
 
 type GraphqlTokenKind = 'name' | 'punct' | 'spread' | 'string' | 'number'
 interface GraphqlToken {
@@ -756,33 +994,99 @@ function headerValue(
   return ''
 }
 
+function hasDuplicateHeader(
+  headers: Record<string, string | string[] | undefined> | undefined,
+  name: string,
+): boolean {
+  if (!headers) return false
+  let seen = 0
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.toLowerCase() !== name) continue
+    if (Array.isArray(value)) {
+      if (value.length > 1) return true
+      if (value.length === 1) seen += 1
+    } else if (value !== undefined) {
+      seen += 1
+    }
+    if (seen > 1) return true
+  }
+  return false
+}
+
+export interface VerifiedGraphqlOptions {
+  /**
+   * Host-confirmed GraphQL endpoints (`H-3`). When supplied (including `[]`), ONLY these
+   * exact endpoints qualify — path-suffix inference is disabled.
+   */
+  confirmedEndpoints?: readonly string[]
+  /** When true, require explicit `confirmedEndpoints` (deny if omitted or empty). */
+  requireConfirmedEndpoint?: boolean
+  /** Request origin (used when `confirmedEndpoints` includes full URLs). */
+  origin?: string
+  /** Request HTTP method (defaults to `POST`). */
+  method?: string
+}
+
 /**
- * Verified read-only GraphQL: MUST target a GraphQL route AND carry either a strict, ambiguity-free
- * JSON `query` envelope or a raw GraphQL `query` document whose parsed AST is strictly a single
- * read-only `query` operation (no `mutation`/`subscription`, no multi-operation smuggling, no
- * escaped/duplicate JSON keys, no field aliases, and no persisted-query extensions).
+ * Verified read-only GraphQL (`H-3`):
+ *  - MUST NOT carry any method-override header or `_method` parameter/field.
+ *  - MUST target a host-confirmed GraphQL endpoint (or, when `confirmedEndpoints` is omitted in
+ *    legacy callers, a canonical mount path — never an arbitrary REST route segment).
+ *  - MUST NOT carry duplicate `content-type` / `content-encoding`, non-identity encoding,
+ *    multipart, or loose non-GraphQL/non-JSON media types.
+ *  - MUST carry either a strict, ambiguity-free JSON `query` envelope or a raw GraphQL `query`
+ *    document whose parsed AST is strictly a single read-only `query` operation.
  */
 export function isVerifiedReadOnlyGraphqlQuery(
   pathAndQuery: string,
   body: string | null | undefined,
   headers?: Record<string, string | string[] | undefined>,
+  options?: VerifiedGraphqlOptions,
 ): boolean {
   const trimmed = (body ?? '').trim()
   if (!trimmed || trimmed.length > MAX_GRAPHQL_READONLY_BODY_CHARS) return false
-  if (!isGraphqlEndpointPath(pathAndQuery)) return false
+
+  // H-3: deny method overrides on GraphQL reads (headers, query, or body).
+  const override = detectMethodOverride({
+    method: options?.method ?? 'POST',
+    pathAndQuery,
+    headers,
+    body,
+  })
+  if (override.hasOverride) return false
+
+  if (options?.confirmedEndpoints !== undefined) {
+    if (!matchesConfirmedGraphqlEndpoint(pathAndQuery, options.confirmedEndpoints, options.origin)) {
+      return false
+    }
+  } else if (options?.requireConfirmedEndpoint) {
+    return false
+  } else if (!isGraphqlEndpointPath(pathAndQuery)) {
+    return false
+  }
+
+  // H-3: reject duplicate content-type or content-encoding headers.
+  if (hasDuplicateHeader(headers, 'content-type') || hasDuplicateHeader(headers, 'content-encoding')) {
+    return false
+  }
 
   const contentEncoding = headerValue(headers, 'content-encoding').trim()
   if (contentEncoding && !/^identity$/i.test(contentEncoding)) return false
 
-  const contentType = headerValue(headers, 'content-type').toLowerCase().trim()
-  if (/^multipart\//i.test(contentType)) return false
+  const rawContentType = headerValue(headers, 'content-type').toLowerCase().trim()
+  const mediaType = rawContentType.split(';', 1)[0]!.trim()
+  if (/^multipart\//i.test(mediaType)) return false
 
-  const isRawGraphqlHeader = contentType.includes('application/graphql') && !contentType.includes('json')
+  const isRawGraphqlHeader = mediaType === 'application/graphql'
   if (isRawGraphqlHeader) {
     return isStrictReadOnlyGraphqlDocument(trimmed)
   }
 
-  const isJsonOrUnspecified = !contentType || contentType.includes('json')
+  const isJsonOrUnspecified =
+    !mediaType ||
+    mediaType === 'application/json' ||
+    mediaType === 'application/graphql+json' ||
+    /^application\/[a-z0-9.+-]+\+json$/i.test(mediaType)
   if (!isJsonOrUnspecified) return false
 
   if (trimmed.startsWith('{')) {
@@ -816,7 +1120,7 @@ export function isVerifiedReadOnlyGraphqlQuery(
     return isStrictReadOnlyGraphqlDocument(document, expectedOp)
   }
 
-  if (contentType) return false
+  if (mediaType) return false
   return isStrictReadOnlyGraphqlDocument(trimmed)
 }
 
@@ -858,17 +1162,30 @@ export function isRouteDenylisted(policy: ScopePolicy, pathAndQuery: string): bo
   return false
 }
 
-/** Does the request carry the run-scoped synthetic tenant tag (path, body, or headers)? */
-export function requestCarriesTenantTag(request: ScopeRequest, tenantTag: string | null | undefined): boolean {
+/**
+ * Does the request carry the run-scoped synthetic tenant tag (path, body, or headers)?
+ *
+ * R2-H-1: When `ignoreHostInjectedHeaders` is true (always enforced on derived `staging_isolated`
+ * runs), host-injected tagging headers (`x-kovo-tenant-tag`, `x-kovo-run-id`) are excluded so a
+ * header stamped by the host itself can never serve as standalone isolation proof.
+ */
+export function requestCarriesTenantTag(
+  request: ScopeRequest,
+  tenantTag: string | null | undefined,
+  options: { ignoreHostInjectedHeaders?: boolean } = {},
+): boolean {
   const tag = (tenantTag ?? '').trim().toLowerCase()
   if (!tag) return false
+  const ignoreHostInjected = options.ignoreHostInjectedHeaders === true
   const haystack = [
     request.pathAndQuery,
     request.body ?? '',
-    ...Object.entries(request.headers ?? {}).flatMap(([key, value]) => [
-      key,
-      Array.isArray(value) ? value.join(' ') : (value ?? ''),
-    ]),
+    ...Object.entries(request.headers ?? {})
+      .filter(([key]) => !ignoreHostInjected || !HOST_INJECTED_TENANT_HEADERS.has(key.toLowerCase()))
+      .flatMap(([key, value]) => [
+        key,
+        Array.isArray(value) ? value.join(' ') : (value ?? ''),
+      ]),
   ].join('\n').toLowerCase()
   return haystack.includes(tag)
 }
@@ -896,7 +1213,14 @@ export function evaluateScopeRequest(policy: ScopePolicy, request: ScopeRequest)
   }
   const canonical = canonicalPathAndQuery(request.pathAndQuery)
   const method = (request.method || 'GET').toUpperCase()
-  const readOnly = isReadOnlyHttpMethod(method, request.body)
+  const override = detectMethodOverride({
+    method,
+    pathAndQuery: canonical ?? request.pathAndQuery,
+    headers: request.headers,
+    body: request.body,
+  })
+  const effectiveMethod = override.effectiveMethod
+  const readOnly = !override.hasOverride && isReadOnlyHttpMethod(effectiveMethod, request.body)
   const surface: ScopeSurface = request.surface ?? 'broker'
   const origin = normalizeScopeOrigin(request.origin) ?? request.origin
 
@@ -939,15 +1263,26 @@ export function evaluateScopeRequest(policy: ScopePolicy, request: ScopeRequest)
   if (policy.mode === 'ephemeral_lab') return allow('target')
 
   if (readOnly) return allow('target')
-  if (canonical !== null && method === 'POST' && isVerifiedReadOnlyGraphqlQuery(canonical, request.body, request.headers)) {
+  const confirmedEndpoints = request.confirmedGraphqlEndpoints ?? policy.confirmedGraphqlEndpoints
+  if (
+    canonical !== null &&
+    !override.hasOverride &&
+    effectiveMethod === 'POST' &&
+    isVerifiedReadOnlyGraphqlQuery(canonical, request.body, request.headers, {
+      ...(confirmedEndpoints !== undefined ? { confirmedEndpoints } : {}),
+      origin,
+      method: effectiveMethod,
+    })
+  ) {
     return allow('target', 'Verified read-only GraphQL query.')
   }
 
   if (policy.mode === 'prod_readonly') {
+    const overrideSuffix = override.hasOverride ? ` (method override via ${override.carriers.join(', ')})` : ''
     return deny(
       'readonly_environment',
       'target',
-      `prod_readonly refuses state-changing ${method} ${request.pathAndQuery} without an approval prompt.`,
+      `prod_readonly refuses state-changing ${effectiveMethod} ${request.pathAndQuery}${overrideSuffix} without an approval prompt.`,
     )
   }
 
@@ -962,7 +1297,11 @@ export function evaluateScopeRequest(policy: ScopePolicy, request: ScopeRequest)
   if (request.hook === 'setup' || request.hook === 'cleanup') {
     return allow('target', `Explicit ${request.hook} hook context.`)
   }
-  if (canonical !== null && requestCarriesTenantTag({ ...request, pathAndQuery: canonical }, policy.tenantTag)) {
+  const ignoreHostInjectedHeaders = Boolean(request.derivedEnvironmentMode ?? policy.derivedEnvironmentMode)
+  if (
+    canonical !== null &&
+    requestCarriesTenantTag({ ...request, pathAndQuery: canonical }, policy.tenantTag, { ignoreHostInjectedHeaders })
+  ) {
     return allow('target', 'Mutation targets a run-tagged synthetic test tenant.')
   }
   return deny(
