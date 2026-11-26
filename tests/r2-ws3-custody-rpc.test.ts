@@ -153,11 +153,11 @@ test('C-3: capability.seal kills regex oracle, collapses misses to constant erro
   const grant = makeGrant(origin, [], [{ value: HIDDEN_SECRET, placeholder: '[redacted:target_secret]' }])
   const rpc1 = new VerifyRpcServer({
     broker: new RequestBroker(), grant, runId, assignmentId: 'a1', targetOrigins: [origin],
-    maxSealsPerRun: 14, maxSealsPerEndpoint: 14, maxSealsPerExchange: 20,
+    maxSealsPerRun: 12, maxSealsPerEndpoint: 12, maxSealsPerExchange: 20,
   })
   const rpc2 = new VerifyRpcServer({
     broker: new RequestBroker(), grant, runId, assignmentId: 'a2', targetOrigins: [origin],
-    maxSealsPerRun: 14, maxSealsPerEndpoint: 14, maxSealsPerExchange: 20,
+    maxSealsPerRun: 12, maxSealsPerEndpoint: 12, maxSealsPerExchange: 20,
   })
   await rpc1.start()
   await rpc2.start()
@@ -180,6 +180,7 @@ test('C-3: capability.seal kills regex oracle, collapses misses to constant erro
   assert.equal(regexTrue.ok, false)
   assert.equal(regexFalse.ok, false)
   assert.equal(regexTrue.error, regexFalse.error, 'true and false regex predicates must produce byte-identical errors')
+  assert.match(regexTrue.error ?? '', /regex selector is retired/i)
 
   // 2) All extraction & validation misses collapse to the EXACT same constant-shape error
   const missPath = await rpcCall(rpc1, 'capability.seal', { exchangeId: exJsonId, hopReceiptId: '1', slot: 'm1', jsonPath: '$.doesNotExist' })
@@ -190,8 +191,9 @@ test('C-3: capability.seal kills regex oracle, collapses misses to constant erro
   const missHeader = await rpcCall(rpc1, 'capability.seal', { exchangeId: exJsonId, hopReceiptId: '1', slot: 'm6', header: 'x-missing' })
   const missCookie = await rpcCall(rpc1, 'capability.seal', { exchangeId: exJsonId, hopReceiptId: '1', slot: 'm7', cookie: 'missing_ck' })
   const missHiddenVal = await rpcCall(rpc1, 'capability.seal', { exchangeId: exJsonId, hopReceiptId: '1', slot: 'm8', value: HIDDEN_SECRET })
-  const errors = [regexTrue, regexFalse, missPath, missNonJson, missShort, missRepeat, missObject, missHeader, missCookie, missHiddenVal].map(r => r.error)
-  assert.equal(new Set(errors).size, 1, `all extraction misses must share one constant error, got: ${JSON.stringify([...new Set(errors)])}`)
+  const missErrors = [missPath, missNonJson, missShort, missRepeat, missObject, missHeader, missCookie, missHiddenVal].map(r => r.error)
+  assert.equal(new Set(missErrors).size, 1, `all extraction misses must share one constant error, got: ${JSON.stringify([...new Set(missErrors)])}`)
+  assert.match(missErrors[0] ?? '', /structured field not found/i)
 
   // 3) meta.kind is derived strictly from structural args (NEVER rawValue shape)
   const sealCookieShaped = await rpcCall(rpc1, 'capability.seal', { exchangeId: exJsonId, hopReceiptId: '1', slot: 'k1', jsonPath: '$.cookieShaped' })
@@ -207,7 +209,7 @@ test('C-3: capability.seal kills regex oracle, collapses misses to constant erro
   assert.equal((sealCookieSel.result as { meta: { kind: string } }).meta.kind, 'cookie')
   assert.equal((sealHdrSel.result as { meta: { kind: string } }).meta.kind, 'header_secret')
 
-  // 4) Run-scoped seal budget (14 total already consumed on rpc1!) trips immediately on rpc2 even with a separate vault
+  // 4) Run-scoped seal budget (12 valid-selector attempts already consumed on rpc1; retired-regex arg rejections do not consume budget) trips immediately on rpc2 even with a separate vault
   const exRpc2 = await rpcCall(rpc2, 'http.send', { path: '/api/data', method: 'GET' })
   assert.equal(exRpc2.ok, true)
   const overBudget = await rpcCall(rpc2, 'capability.seal', {

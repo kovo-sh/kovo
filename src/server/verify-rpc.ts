@@ -41,15 +41,17 @@ import {
   resolveSealJsonPath,
   toPublicCapabilityMeta,
   validateCapabilitySealValue,
-  type CapabilitySealSelectorKind,
 } from './egress-sanitizer.ts'
 import { defaultRequestAdmissionEngine, type RequestAdmissionEngine } from './request-admission.ts'
 import {
   DerivedCapabilityVault,
+  SEAL_FIELD_NOT_FOUND_ERROR,
+  SEAL_REGEX_RETIRED_ERROR,
   awaitAsyncConvergence,
   computeNonSecretLiteralHmac,
   consumeRunCompositeVerifyBudget,
   consumeRunSealBudget,
+  formatDerivedHandle,
   isDerivedCapabilityHandle,
   resolveVerifyRpcScratchRoot,
 } from './derived-custody.ts'
@@ -230,11 +232,11 @@ export interface VerifyRpcSessionOptions {
   compositeVerifyOptions?: Omit<CompositeVerifyOptions, 'signingKey'>
   /** Maximum `capability.seal` attempts allowed per exchangeId (default 12, C-3 anti-oracle cap). */
   maxSealsPerExchange?: number
-  /** Maximum `capability.seal` / crypto derivation calls allowed across the entire run (default 256). */
+  /** Maximum `capability.seal` / crypto derivation calls allowed across the entire run (default 4096). */
   maxSealsPerRun?: number
-  /** Maximum `capability.seal` calls allowed per (origin+path+persona) endpoint per run (default 24). */
+  /** Maximum `capability.seal` calls allowed per (origin+path+persona) endpoint per run (default 256). */
   maxSealsPerEndpoint?: number
-  /** Maximum `composite.verify` RPC calls allowed across the entire run (default 32, R2-C-3 budget). */
+  /** Maximum `composite.verify` RPC calls allowed across the entire run (default 1024, R2-C-3 budget). */
   maxCompositeVerifiesPerRun?: number
   /** Canonical request admission engine (defaults to the broker's engine). */
   admissionEngine?: RequestAdmissionEngine
@@ -288,7 +290,6 @@ const BROKER_FORBIDDEN_CALLER_HEADER_RE = /^(?:authorization|proxy-authorization
 const INLINE_CAP_RE = /(?<!\[redacted:)(?<![A-Za-z0-9_])cap(?::|%3[aA])hop_[A-Za-z0-9._-]+(?::|%3[aA])[A-Za-z0-9._-]+/g
 const EXACT_BEARER_CAP_RE = /^\s*(?:Bearer\s+)*(cap:hop_[A-Za-z0-9._-]+:[A-Za-z0-9._-]+)\s*$/i
 const EXACT_INLINE_CAP_RE = /^cap:hop_[A-Za-z0-9._-]+:[A-Za-z0-9._-]+$/
-const SEAL_EXTRACTION_ERROR = 'capability.seal failed: unable to seal requested structured field.'
 const SAFE_RPC_OP_RE = /^[a-z0-9._-]{1,40}$/i
 
 function setHeaderCI(map: Record<string, string>, name: string, value: string): void {
@@ -1524,53 +1525,56 @@ export class VerifyRpcServer {
     throw new Error('Unsupported oob action.')
   }
 
-  private extractSecretFromExchange(exchangeId: string, args: Record<string, unknown>): { rawValue: string; selector: CapabilitySealSelectorKind } {
-    // C-3: Reject raw-byte regex extraction unconditionally BEFORE touching response bytes (kills regex oracle).
-    if (args.regex !== undefined) throw new Error(SEAL_EXTRACTION_ERROR)
-
+  private extractSecretFromExchange(exchangeId: string, args: Record<string, unknown>): { rawValue: string; selector: 'jsonPath' | 'header' | 'cookie' | 'value'; defaultCookieName?: string; isLocationQuery?: boolean } {
+    if (args.regex !== undefined) throw new Error(SEAL_REGEX_RETIRED_ERROR)
     const rawBody = this.rawBodies.get(exchangeId) ?? this.transcript.body(exchangeId) ?? ''
-    const rawHeaders = this.rawResponseHeaders.get(exchangeId) ?? this.transcript.get(exchangeId)?.response?.headers ?? {}
     const record = this.transcript.get(exchangeId)
+    const rawHeaders = this.rawResponseHeaders.get(exchangeId) ?? record?.response?.headers ?? {}
     const artifactText = record?.artifact?.token ?? record?.artifact?.url ?? ''
-
     if (typeof args.jsonPath === 'string' && args.jsonPath.trim()) {
       let parsed: unknown
-      try { parsed = JSON.parse(rawBody) } catch { throw new Error(SEAL_EXTRACTION_ERROR) }
+      try { parsed = JSON.parse(rawBody.replace(/^\uFEFF/, '')) } catch { throw new Error(SEAL_FIELD_NOT_FOUND_ERROR) }
       const evalRes = resolveSealJsonPath(parsed, args.jsonPath.trim(), evaluateJsonPath)
-      if (!evalRes.found || evalRes.value === undefined || evalRes.value === null || typeof evalRes.value === 'object') {
-        throw new Error(SEAL_EXTRACTION_ERROR)
-      }
+      if (!evalRes.found || evalRes.value === undefined || evalRes.value === null || typeof evalRes.value === 'object') throw new Error(SEAL_FIELD_NOT_FOUND_ERROR)
       const extracted = typeof evalRes.value === 'string' ? evalRes.value : String(evalRes.value)
-      if (!extracted) throw new Error(SEAL_EXTRACTION_ERROR)
+      if (!extracted) throw new Error(SEAL_FIELD_NOT_FOUND_ERROR)
       return { rawValue: extracted, selector: 'jsonPath' }
     }
-
+    const locParam = typeof args.locationQuery === 'string' && args.locationQuery.trim() ? args.locationQuery.trim() : (typeof args.queryParam === 'string' && args.queryParam.trim() ? args.queryParam.trim() : '')
+    if (locParam) {
+      const loc = Object.entries(rawHeaders).find(([k]) => k.toLowerCase() === 'location')?.[1]?.trim() ?? ''
+      let parsedUrl: URL | null = null
+      if (loc) { try { parsedUrl = new URL(loc, 'http://kovo-local.invalid') } catch { parsedUrl = null } }
+      const val = parsedUrl?.searchParams.get(locParam) || (parsedUrl && parsedUrl.hash.length > 1 ? new URLSearchParams(parsedUrl.hash.slice(1)).get(locParam) : null)
+      if (!val) throw new Error(SEAL_FIELD_NOT_FOUND_ERROR)
+      return { rawValue: val, selector: 'header', isLocationQuery: true }
+    }
     if (typeof args.header === 'string' && args.header.trim()) {
       const wanted = args.header.trim().toLowerCase()
       const entry = Object.entries(rawHeaders).find(([k]) => k.toLowerCase() === wanted)
-      if (!entry || !entry[1]) throw new Error(SEAL_EXTRACTION_ERROR)
+      if (!entry || !entry[1] || !entry[1].trim()) throw new Error(SEAL_FIELD_NOT_FOUND_ERROR)
       return { rawValue: entry[1], selector: 'header' }
     }
-
-    if (typeof args.cookie === 'string' && args.cookie.trim()) {
-      const cookieName = args.cookie.trim()
+    const cookieName = typeof args.setCookie === 'string' && args.setCookie.trim() ? args.setCookie.trim() : (typeof args.cookie === 'string' && args.cookie.trim() ? args.cookie.trim() : '')
+    if (cookieName) {
       const setCookie = Object.entries(rawHeaders).find(([k]) => k.toLowerCase() === 'set-cookie')?.[1] ?? ''
-      const escaped = cookieName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-      const match = new RegExp(`(?:^|[,;\\s])${escaped}=([^;\\r\\n]+)`).exec(setCookie)
-      if (!match?.[1]) throw new Error(SEAL_EXTRACTION_ERROR)
-      return { rawValue: match[1].trim(), selector: 'cookie' }
+      for (const rawEntry of setCookie.split(/\r?\n/).flatMap(line => line.split(/,\s*(?=[!#$%&'*+\-.^_`|~0-9A-Za-z]+=)/))) {
+        const firstPart = rawEntry.split(';', 1)[0]?.trim() ?? ''
+        const eq = firstPart.indexOf('=')
+        if (eq > 0 && firstPart.slice(0, eq).trim() === cookieName) {
+          const val = firstPart.slice(eq + 1).trim()
+          if (val) return { rawValue: val, selector: 'cookie', defaultCookieName: cookieName }
+        }
+      }
+      throw new Error(SEAL_FIELD_NOT_FOUND_ERROR)
     }
-
     const candidateRaw = typeof args.value === 'string' ? args.value : typeof args.rawValue === 'string' ? args.rawValue : null
     if (candidateRaw !== null && candidateRaw.length > 0) {
-      // C-3: Check value selector ONLY against worker-visible sanitized content (never hidden Set-Cookie/redacted secrets).
       const visibleHeaders = Object.values(this.egress.sanitizeHttpHeaders(rawHeaders, 'worker_rpc'))
-      const haystack = [this.scrub(rawBody), ...visibleHeaders, artifactText].join('\n')
-      if (!haystack.includes(candidateRaw)) throw new Error(SEAL_EXTRACTION_ERROR)
+      if (![this.scrub(rawBody), ...visibleHeaders, artifactText].join('\n').includes(candidateRaw)) throw new Error(SEAL_FIELD_NOT_FOUND_ERROR)
       return { rawValue: candidateRaw, selector: 'value' }
     }
-
-    throw new Error(SEAL_EXTRACTION_ERROR)
+    throw new Error(SEAL_FIELD_NOT_FOUND_ERROR)
   }
 
   private handleCapabilitySeal(args: Record<string, unknown>, nonce: string): unknown {
@@ -1578,6 +1582,24 @@ export class VerifyRpcServer {
     if (!exchangeId) throw new Error('capability.seal requires exchangeId referencing a host-recorded exchange.')
     const sourceRecord = this.transcript.get(exchangeId)
     if (!sourceRecord) throw new Error(`Unknown exchangeId "${exchangeId}" for capability.seal.`)
+
+    // Validate arguments BEFORE consuming run/endpoint/exchange budget so malformed/retired calls never drain budget.
+    const requestedSlot = typeof args.slot === 'string' ? args.slot.trim() : ''
+    if (!requestedSlot) throw new Error('capability.seal requires a non-empty slot name.')
+    const hopReceiptId = typeof args.hopReceiptId === 'string' && args.hopReceiptId.trim() ? args.hopReceiptId.trim() : typeof args.hopId === 'string' && args.hopId.trim() ? args.hopId.trim() : exchangeId
+    const slot = this.resolveImmutableSlot(hopReceiptId, requestedSlot)
+    formatDerivedHandle(hopReceiptId, slot)
+    const kind = normalizeDerivedSecretKind(args.kind)
+    const ttlMs = args.ttlMs === null ? null : typeof args.ttlMs === 'number' ? args.ttlMs : undefined
+    if (ttlMs !== undefined && ttlMs !== null && (!Number.isFinite(ttlMs) || ttlMs < 0)) throw new Error('capability.seal ttlMs must be a non-negative finite number or null.')
+    const allowedOrigins = Array.isArray(args.allowedOrigins) ? args.allowedOrigins.filter((v): v is string => typeof v === 'string' && v.trim().length > 0) : undefined
+    if (args.regex !== undefined) throw new Error(SEAL_REGEX_RETIRED_ERROR)
+    const hasStr = (v: unknown) => typeof v === 'string' && v.trim().length > 0
+    const hasVal = (typeof args.value === 'string' && args.value.length > 0) || (typeof args.rawValue === 'string' && args.rawValue.length > 0)
+    if (!hasStr(args.jsonPath) && !hasStr(args.header) && !hasStr(args.cookie) && !hasStr(args.setCookie) && !hasStr(args.locationQuery) && !hasStr(args.queryParam) && !hasVal) {
+      throw new Error('capability.seal requires a selector: jsonPath, header, setCookie (or cookie), locationQuery (or queryParam), or value.')
+    }
+
     const endpointPath = (sourceRecord.request?.pathAndQuery ?? '/').split('?')[0]
     const endpointKey = `${sourceRecord.request?.origin ?? ''}|${endpointPath}|${sourceRecord.request?.personaHandle ?? ''}`
     consumeRunSealBudget(this.options.runId, endpointKey, {
@@ -1589,19 +1611,12 @@ export class VerifyRpcServer {
       { maxPerExchange: this.options.maxSealsPerExchange },
     )
 
-    const requestedSlot = typeof args.slot === 'string' ? args.slot.trim() : ''
-    if (!requestedSlot) throw new Error('capability.seal requires a non-empty slot name.')
-    const hopReceiptId = typeof args.hopReceiptId === 'string' && args.hopReceiptId.trim() ? args.hopReceiptId.trim() : typeof args.hopId === 'string' && args.hopId.trim() ? args.hopId.trim() : exchangeId
-    const slot = this.resolveImmutableSlot(hopReceiptId, requestedSlot)
-    const kind = normalizeDerivedSecretKind(args.kind)
-    const ttlMs = args.ttlMs === null ? null : typeof args.ttlMs === 'number' ? args.ttlMs : undefined
-    const allowedOrigins = Array.isArray(args.allowedOrigins) ? args.allowedOrigins.filter((v): v is string => typeof v === 'string' && v.trim().length > 0) : undefined
-    const { rawValue, selector } = this.extractSecretFromExchange(exchangeId, args)
-    try { validateCapabilitySealValue(rawValue, selector) } catch { throw new Error(SEAL_EXTRACTION_ERROR) }
+    const { rawValue, selector, defaultCookieName: extractedCookie, isLocationQuery } = this.extractSecretFromExchange(exchangeId, args)
+    try { validateCapabilitySealValue(rawValue, selector) } catch { throw new Error(SEAL_FIELD_NOT_FOUND_ERROR) }
     const defaultHeaderName = typeof args.defaultHeaderName === 'string' && args.defaultHeaderName.trim() ? args.defaultHeaderName.trim() : undefined
-    const defaultCookieName = typeof args.defaultCookieName === 'string' && args.defaultCookieName.trim() ? args.defaultCookieName.trim() : (typeof args.cookie === 'string' && args.cookie.trim() ? args.cookie.trim() : undefined)
+    const defaultCookieName = typeof args.defaultCookieName === 'string' && args.defaultCookieName.trim() ? args.defaultCookieName.trim() : extractedCookie
     // C-3: Derive `kind` strictly from validated structural args — NEVER inspect `rawValue`.
-    const effectiveKind = kind ?? (selector === 'cookie' || defaultCookieName ? 'cookie' : (selector === 'header' || defaultHeaderName ? 'header_secret' : 'generic_secret'))
+    const effectiveKind = kind ?? (selector === 'cookie' || defaultCookieName ? 'cookie' : ((selector === 'header' && !isLocationQuery) || defaultHeaderName ? 'header_secret' : 'generic_secret'))
     const srcRoleLabel = sourceRecord.request?.actorRoleLabel ?? null
     const srcPersona = sourceRecord.request?.personaHandle ?? null
     const srcParsed = parseRoleLabel(srcRoleLabel)
@@ -1658,6 +1673,8 @@ export class VerifyRpcServer {
     if (typeof args.payload !== 'string') throw new Error('crypto.hmacSign requires a string payload.')
     const alg = (typeof args.alg === 'string' ? args.alg.trim().toLowerCase() : 'sha256') as HostHmacAlg
     const encoding = (typeof args.encoding === 'string' ? args.encoding.trim().toLowerCase() : 'hex') as HostHmacEncoding
+    if (alg !== 'sha256' && alg !== 'sha384' && alg !== 'sha512') throw new Error(`Unsupported HMAC alg "${String(alg)}".`)
+    if (encoding !== 'hex' && encoding !== 'base64' && encoding !== 'base64url') throw new Error(`Unsupported HMAC encoding "${String(encoding)}".`)
     // R2-C-4: Charge run-scoped seal budget for every HMAC signing request.
     consumeRunSealBudget(this.options.runId, undefined, { maxPerRun: this.options.maxSealsPerRun })
 
@@ -1743,6 +1760,8 @@ export class VerifyRpcServer {
     const header = args.header !== undefined ? asRecord(args.header) : undefined
     if (args.header !== undefined && !header) throw new Error('crypto.jwtSign header must be a plain object.')
     const alg = (typeof args.alg === 'string' ? args.alg.trim().toUpperCase() : 'HS256') as HostJwtAlg
+    if (alg !== 'HS256' && alg !== 'HS384' && alg !== 'HS512') throw new Error(`Unsupported JWT HMAC alg "${String(alg)}".`)
+    if (header?.alg !== undefined && header.alg !== alg) throw new Error('JWT header.alg must match options.alg.')
     const ttlMs = args.ttlMs === null ? null : typeof args.ttlMs === 'number' ? args.ttlMs : undefined
     const allowedOrigins = Array.isArray(args.allowedOrigins)
       ? args.allowedOrigins.filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
@@ -2152,11 +2171,15 @@ export class VerifyRpcServer {
   }
 
   private handleCompositeVerify(args: Record<string, unknown>): unknown {
-    consumeRunCompositeVerifyBudget(this.options.runId, this.options.maxCompositeVerifiesPerRun)
     const rawReceipt = args.receipt !== undefined ? args.receipt : args
+    const rawObj = asRecord(rawReceipt)
+    if (!rawObj || !Array.isArray(rawObj.hops) || rawObj.hops.length === 0) {
+      throw new Error('composite.verify requires a receipt object with a non-empty hops array.')
+    }
+    consumeRunCompositeVerifyBudget(this.options.runId, this.options.maxCompositeVerifiesPerRun)
     // Security invariant: RPC callers can never weaken host-configured attackerPersonas, forbiddenShortcutPersonas, benchmarkMode, requireCleanSessionFlag, or signingKey.
     const verdict = this.verifyComposite(rawReceipt)
-    const rawObj = asRecord(rawReceipt), hops = Array.isArray(rawObj?.hops) ? rawObj.hops : [], ti = asRecord(rawObj?.terminalImpact)
+    const hops = rawObj.hops, ti = asRecord(rawObj.terminalImpact)
     const terminalHopId = typeof ti?.terminalHopId === 'string' ? ti.terminalHopId : ''
     const termHopObj = asRecord(hops.find(h => asRecord(h)?.hopId === terminalHopId) ?? hops[hops.length - 1])
     const termTarget = asRecord(termHopObj?.target)

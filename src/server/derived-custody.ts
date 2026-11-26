@@ -38,10 +38,16 @@ export interface MatchSealedHandlesInput { runId?: string; targetOrigin?: string
 const SAFE_ID_RE = /^[A-Za-z0-9._-]{1,128}$/, SAFE_SLOT_RE = /^[A-Za-z0-9._-]{1,64}$/
 const HANDLE_RE = /^cap:hop_([A-Za-z0-9._-]{1,128}):([A-Za-z0-9._-]{1,64})$/
 const HEADER_NAME_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]{1,64}$/, COOKIE_NAME_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]{1,256}$/, CRLF_RE = /[\r\n\0]/
-const MAX_SECRET_BYTES = 32_768, DEFAULT_MAX_ENTRIES = 512, DEFAULT_MAX_SEAL_ATTEMPTS = 1_024, DEFAULT_AUTOBIND_MIN_LENGTH = 8, MAX_TRACKED_RUN_BUDGETS = 2_048
-export const DEFAULT_MAX_SEALS_PER_RUN = 256, DEFAULT_MAX_SEALS_PER_ENDPOINT = 24, DEFAULT_MAX_COMPOSITE_VERIFIES_PER_RUN = 32
+const MAX_SECRET_BYTES = 32_768, DEFAULT_MAX_ENTRIES = 4_096, DEFAULT_MAX_SEAL_ATTEMPTS = 8_192, DEFAULT_AUTOBIND_MIN_LENGTH = 8, MAX_TRACKED_RUN_BUDGETS = 2_048
+export const DEFAULT_MAX_SEALS_PER_RUN = 4_096, DEFAULT_MAX_SEALS_PER_ENDPOINT = 256, DEFAULT_MAX_COMPOSITE_VERIFIES_PER_RUN = 1_024
 export const MIN_CRYPTO_KEY_LENGTH = 8, MIN_CRYPTO_KEY_ENTROPY_BITS = 1.5, MIN_SCRUB_LENGTH = 6
-
+export const SEAL_REGEX_RETIRED_ERROR = "capability.seal: regex selector is retired; use jsonPath (e.g. '$.token' or 'token'), header, setCookie, or value."
+export const SEAL_FIELD_NOT_FOUND_ERROR = 'capability.seal: structured field not found (checked jsonPath/header/setCookie/value; verify response status and top-level keys).'
+function resolveBudgetCap(explicit: number | undefined, envKey: string, fallback: number, hardMax: number): number {
+  if (explicit !== undefined && Number.isFinite(explicit)) return Math.max(1, Math.min(hardMax, Math.floor(explicit)))
+  const raw = process.env[envKey]?.trim(); const n = raw && /^\d+$/.test(raw) ? Number(raw) : NaN
+  return Number.isFinite(n) && n >= 1 ? Math.max(1, Math.min(hardMax, Math.floor(n))) : fallback
+}
 interface RunCustodyBudgetState { sealTotal: number; sealByEndpoint: Map<string, number>; compositeVerifyTotal: number }
 const runCustodyBudgets = new Map<string, RunCustodyBudgetState>()
 function getOrCreateRunBudget(runId: string): RunCustodyBudgetState {
@@ -55,8 +61,8 @@ function getOrCreateRunBudget(runId: string): RunCustodyBudgetState {
   return state
 }
 export function consumeRunSealBudget(runId: string, endpointKey?: string, limits: { maxPerRun?: number; maxPerEndpoint?: number } = {}): { runTotal: number; endpointTotal: number } {
-  const maxPerRun = Math.max(1, Math.floor(limits.maxPerRun ?? DEFAULT_MAX_SEALS_PER_RUN))
-  const maxPerEndpoint = Math.max(1, Math.floor(limits.maxPerEndpoint ?? DEFAULT_MAX_SEALS_PER_ENDPOINT))
+  const maxPerRun = resolveBudgetCap(limits.maxPerRun, 'KOVO_MAX_SEALS_PER_RUN', DEFAULT_MAX_SEALS_PER_RUN, 16_384)
+  const maxPerEndpoint = resolveBudgetCap(limits.maxPerEndpoint, 'KOVO_MAX_SEALS_PER_ENDPOINT', DEFAULT_MAX_SEALS_PER_ENDPOINT, 4_096)
   const state = getOrCreateRunBudget(runId)
   assertCustody(state.sealTotal < maxPerRun, 'CAPACITY_EXCEEDED', `Run capability custody budget exceeded (max ${maxPerRun} per run).`)
   let endpointTotal = 0
@@ -68,10 +74,14 @@ export function consumeRunSealBudget(runId: string, endpointKey?: string, limits
   state.sealTotal += 1
   return { runTotal: state.sealTotal, endpointTotal }
 }
-export function consumeRunCompositeVerifyBudget(runId: string, maxPerRun = DEFAULT_MAX_COMPOSITE_VERIFIES_PER_RUN): number {
-  const cap = Math.max(1, Math.floor(maxPerRun)), state = getOrCreateRunBudget(runId)
+export function consumeRunCompositeVerifyBudget(runId: string, maxPerRun?: number): number {
+  const cap = resolveBudgetCap(maxPerRun, 'KOVO_MAX_COMPOSITE_VERIFIES_PER_RUN', DEFAULT_MAX_COMPOSITE_VERIFIES_PER_RUN, 10_000), state = getOrCreateRunBudget(runId)
   assertCustody(state.compositeVerifyTotal < cap, 'CAPACITY_EXCEEDED', `composite.verify run budget exceeded (max ${cap} per run).`)
   return ++state.compositeVerifyTotal
+}
+export function getRunCustodyBudgetUsage(runId: string): { sealTotal: number; compositeVerifyTotal: number; sealByEndpoint: Record<string, number> } {
+  const s = runCustodyBudgets.get(runId.trim() || '__default__')
+  return s ? { sealTotal: s.sealTotal, compositeVerifyTotal: s.compositeVerifyTotal, sealByEndpoint: Object.fromEntries(s.sealByEndpoint) } : { sealTotal: 0, compositeVerifyTotal: 0, sealByEndpoint: {} }
 }
 export function resetRunCustodyBudgets(runId?: string): void {
   if (runId === undefined) runCustodyBudgets.clear(); else runCustodyBudgets.delete(runId.trim() || '__default__')
