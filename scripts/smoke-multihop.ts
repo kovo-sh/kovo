@@ -18,13 +18,14 @@
 
 import { spawn, spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { fileURLToPath } from 'node:url'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = resolve(HERE, '..')
-const DEFAULT_DATA_DIR = process.env.KOVO_DATA_DIR ?? '/home/omarchy/guardian-data'
+const DEFAULT_DATA_DIR = process.env.KOVO_DATA_DIR || join(homedir(), 'guardian-data')
 const DEFAULT_OUT_DIR = join(ROOT, '.kovo/smoke-multihop')
 
 export const SMOKE_MULTIHOP_VERSION = 1

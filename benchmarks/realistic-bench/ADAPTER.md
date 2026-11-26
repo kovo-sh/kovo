@@ -84,7 +84,7 @@ a caller already owns a manifest; the truth-free path above never uses it.
 ## CLI
 
 ```bash
-cd /home/omarchy/kovo-hunter            # repo root
+cd <repo-root>            # repo root
 export KOVO_ALLOW_LOCAL_LAB=1
 
 node benchmarks/realistic-bench/benchmark-realistic.ts \
@@ -116,7 +116,7 @@ by vuln class:
 Dev seed (reproducible, no salt):
 
 ```bash
-cd /home/omarchy/kovo-hunter
+cd <repo-root>
 KOVO_ALLOW_LOCAL_LAB=1 node benchmarks/realistic-bench/benchmark-realistic.ts \
   --app acme-saas --seed 42 --split dev --profile-mode v4-full --mode grey-box \
   --out-json benchmarks/realistic-bench/out/dev-acme-42.score.json \
@@ -126,7 +126,7 @@ KOVO_ALLOW_LOCAL_LAB=1 node benchmarks/realistic-bench/benchmark-realistic.ts \
 Held-out seed (salt never committed; `>= 16` chars):
 
 ```bash
-cd /home/omarchy/kovo-hunter
+cd <repo-root>
 KOVO_ALLOW_LOCAL_LAB=1 KOVO_RB_HELDOUT_SALT="$KOVO_RB_HELDOUT_SALT" \
   node benchmarks/realistic-bench/benchmark-realistic.ts \
   --app acme-saas --seed 1000042 --split heldout --profile-mode v4-full --mode grey-box \

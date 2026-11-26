@@ -228,7 +228,7 @@ test('M-15: legacy profiles without a .pin file keep working and are lazy-pinned
     key: 'sk-or-v1-legacy-profile-key-abcdef',
   }, storage, { skipConnectionCheck: true })
 
-  // Simulate a pre-M-15 workspace (like existing /home/omarchy/guardian-data) by deleting .pin
+  // Simulate a pre-M-15 workspace (like existing ~/guardian-data) by deleting .pin
   const row = storage.db.select().from(modelProfiles).where(eq(modelProfiles.id, saved.id)).get()!
   const pinPath = join(dir, 'credentials', `${row.credentialId}.pin`)
   unlinkSync(pinPath)

@@ -13,6 +13,7 @@
 import { spawn, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { DatabaseSync } from 'node:sqlite'
@@ -31,7 +32,7 @@ import { start as startZeroVulnTrap } from '../benchmarks/realism-suite/traps/ze
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = resolve(HERE, '..')
 const CORPUS_PATH = join(ROOT, 'benchmarks/realism-suite/traps/fp-archetypes.json')
-const DEFAULT_DATA_DIR = process.env.KOVO_DATA_DIR ?? '/home/omarchy/guardian-data'
+const DEFAULT_DATA_DIR = process.env.KOVO_DATA_DIR || join(homedir(), 'guardian-data')
 const DEFAULT_OUT = join(ROOT, '.kovo/smoke-battery')
 const HARDENED_NODE_FLAGS = [
   '--disable-proto=delete',
@@ -244,7 +245,7 @@ Flags:
                             resumable post-recon snapshot exists (default 420)
   --out-dir <path>          artifacts (default .kovo/smoke-battery)
   --data-dir <path>         Kovo Hunter data dir (default $KOVO_DATA_DIR or
-                            /home/omarchy/guardian-data)
+                            $HOME/guardian-data)
   --snapshot-root <path>    post-floor checkpoints (default <out-dir>/snapshots)
   --floor-scorecard <path>  pinned baseline floor scorecard used for net-new/preservation
                             (required with or instead of --lift-baseline; otherwise UNMEASURED)
@@ -1908,7 +1909,7 @@ async function runTierOne(opts: SmokeArgs, report: SmokeReport): Promise<void> {
 export function tierTwoCommand(): string[] {
   return [
     '# Full matrix (all 3 apps, dev seed 1, 15 min/cell, 3 cells in parallel):',
-    'KOVO_ALLOW_LOCAL_LAB=1 KOVO_DATA_DIR=/home/omarchy/guardian-data \\',
+    'KOVO_ALLOW_LOCAL_LAB=1 KOVO_DATA_DIR="$HOME/guardian-data" \\',
     '  newgrp docker -c \'npm run benchmark:realistic -- --app all --seed 1 --mode grey-box \\',
     '    --max-duration-ms 900000 --budget-usd 5 --concurrency 3 --worker-concurrency 6 \\',
     '    --isolate-data-dir --out-dir .kovo/smoke-battery/tier2-dev\'',
@@ -1920,12 +1921,12 @@ export function tierTwoCommand(): string[] {
     '    --isolate-data-dir --out-dir .kovo/smoke-battery/tier2-heldout\'',
     '',
     '# Endurance (45 min, one app, floor+agent split budgets):',
-    'KOVO_ALLOW_LOCAL_LAB=1 KOVO_DATA_DIR=/home/omarchy/guardian-data \\',
+    'KOVO_ALLOW_LOCAL_LAB=1 KOVO_DATA_DIR="$HOME/guardian-data" \\',
     '  newgrp docker -c \'npm run benchmark:realistic -- --app acme-saas --seed 1 \\',
     '    --max-duration-ms 2700000 --budget-usd 10 --out-dir .kovo/smoke-battery/tier2-endurance\'',
     '',
     '# Realism exit gate (all fixtures, wiring + capability):',
-    'KOVO_ALLOW_LOCAL_LAB=1 KOVO_DATA_DIR=/home/omarchy/guardian-data \\',
+    'KOVO_ALLOW_LOCAL_LAB=1 KOVO_DATA_DIR="$HOME/guardian-data" \\',
     '  newgrp docker -c \'npm run benchmark:realism -- --fixture all --verifier docker \\',
     '    --max-duration-ms 600000 --out-dir .kovo/smoke-battery/tier2-realism\'',
   ]

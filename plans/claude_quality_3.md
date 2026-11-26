@@ -179,7 +179,7 @@ Items are ranked by (impact x leverage) / effort (S=1, M=2, L=3), weighted by co
 - scripts/benchmark-realistic.ts:578-582,3799-3841; scripts/benchmark-multihop.ts:706-708,4127 — appendLedgerRow runs only inside `if (args.ledgerPath)` and defaults to the committed ledger. Neither script calls appendPerRunLedgerRow.
 - VERIFICATION-v5.md:66,135; benchmarks/realistic-bench/BURNED_SEEDS — Newest product numbers are Queue #14 @4010d05 (36/59 dev, 29/58 held-out). 784 commits since, merges included. Held-out seed 1000042 is burned and EXPOSED_SEEDS.json is absent.
 - benchmarks/baselines/floor.json (4f0ee88); scripts/regression-floor.sh:184-192 — gitSha null and confirmedIds [] for both suites (worktree-verified), so the lost-TP check is vacuous. held-out-saas is 20/20, but the latest ROADMAP entry (ROADMAP:1038, c3da71f) records 19/20 with hos-07 open. No runner calls regression-floor.sh.
-- /home/omarchy/guardian/benchmarks/results/runs/*.jsonl; tests/v8-q34-certify-v8.test.ts:703; tests/v8-certify.test.ts:986 — 604 rows (coordinator-verified) with gitSha abc123def4… (488) or deadbeef12… (116). All VALID, 360 certifying, 241 certifying and dirty. They are gitignored local files, not committed. Tests call main() without a runs dir.
+- <repo-root>/benchmarks/results/runs/*.jsonl; tests/v8-q34-certify-v8.test.ts:703; tests/v8-certify.test.ts:986 — 604 rows (coordinator-verified) with gitSha abc123def4… (488) or deadbeef12… (116). All VALID, 360 certifying, 241 certifying and dirty. They are gitignored local files, not committed. Tests call main() without a runs dir.
 - scripts/bench-ledger.ts:30,760-772,856-905; scripts/runtime-profile.ts:76-82 — The per-run dir is cwd-relative. promoteLedgerRows checks status, certifying and fingerprint only: no gitSha existence or ancestry check, no dirty check. The hermetic profile isolates data, tmp and xdg dirs only.
 - scripts/bench-ledger.ts:305-332; scripts/benchmark-agentic-matrix.ts:1095-1102; worker/Dockerfile:137-140 — The observed-vs-declared check runs only `if (observed)`, and only multihop passes it. The agentic matrix hardcodes wordlistOn:false. KOVO_WORKER_SOURCE_HASH defaults to 'unknown' and no build path sets it.
 
@@ -945,7 +945,7 @@ Not examined this round: (1) The post-R4 batch 09f9eeb..3a552f1 (45 merges plus 
 ### Parallel workstreams & execution log (updated 2026-11-26 by agy)
 
 #### Binding Rules & Active Overlap Check
-- **Active background work:** `task-9655` (v8 M2 Docker certification at `3fe490d` writing to `/home/omarchy/guardian-bench-tmp/m2-cert-3fe490d/`) — read-only on repo files, zero overlap. Zero other coding workers active.
+- **Active background work:** `task-9655` (v8 M2 Docker certification at `3fe490d` writing to `~/guardian-bench-tmp/m2-cert-3fe490d/`) — read-only on repo files, zero overlap. Zero other coding workers active.
 - **Strict 1-writer-per-file hot-file serialization:**
   - `scripts/merge-stream.sh` & `scripts/parallel-pulse.sh`: `R3-01` → `R3-05` (`merge-stream.sh` hook) / `R3-10` (`parallel-pulse.sh` tripwire)
   - `scripts/worker-gate.sh`: `R3-09` (SOLE OWNER; `R3-05`/`R3-06`/`R3-07`/`R3-08`/`R3-10`/`R3-12` register via R3-09)

@@ -184,7 +184,7 @@ function makeRealisticCellMeta(opts: BuildCellOptions): MultihopCellMeta {
     workerSessions: llm === 'agentic',
     workerSessionsDetail: llm === 'agentic' ? 'docker-worker-ok' : 'no-llm',
     dataDirIsolated: true,
-    dataDirSource: '/home/omarchy/guardian-data',
+    dataDirSource: '/tmp/test-guardian-data',
     isolatedProfileNames: llm === 'agentic' ? ['OpenRouter DeepSeek V4.1 Flash'] : [],
     dataDirKept: false,
     budgetUsd: opts.budgetUsd,

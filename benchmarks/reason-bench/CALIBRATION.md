@@ -28,10 +28,10 @@ export KOVO_ALLOW_LOCAL_LAB=1
 newgrp docker -c 'docker image inspect kovo-worker:v4 >/dev/null && echo worker-ok'
 
 # enabled model profile (OpenRouter DeepSeek V4.1 Flash in the Kovo Hunter data dir)
-export KOVO_DATA_DIR=/home/omarchy/guardian-data
+export KOVO_DATA_DIR="$HOME/guardian-data"
 
 # salted held-out seeds (owner-only file; NEVER print or commit the value)
-export KOVO_RB_HELDOUT_SALT="$(cat /home/omarchy/.config/guardian-bench/heldout.salt)"
+export KOVO_RB_HELDOUT_SALT="$(cat "$HOME/.config/guardian-bench/heldout.salt")"
 ```
 
 Typecheck floor before any calibration run:
@@ -162,8 +162,8 @@ with worker-socket access and the salted seeds:
 ```bash
 newgrp docker          # once per shell (or prefix each command: newgrp docker -c '<command>')
 export KOVO_ALLOW_LOCAL_LAB=1
-export KOVO_DATA_DIR=/home/omarchy/guardian-data
-export KOVO_RB_HELDOUT_SALT="$(cat /home/omarchy/.config/guardian-bench/heldout.salt)"
+export KOVO_DATA_DIR="$HOME/guardian-data"
+export KOVO_RB_HELDOUT_SALT="$(cat "$HOME/.config/guardian-bench/heldout.salt")"
 ```
 
 Run each leg into its own artifact directory so the artifacts carry one `(budget, duration)`

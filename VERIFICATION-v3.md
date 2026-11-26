@@ -8,7 +8,7 @@ Verified on November 21, 2026 against [SPEC-v3.md](SPEC-v3.md) using the real co
 
 Final combined verification command:
 ```bash
-cd /home/exedev/guardian && npm run check && npm run build && npm run test:boundaries && node --test tests/v3-boundaries.test.ts tests/v3-protocol-browser.test.ts && npm run test:e2e
+cd <repo-root> && npm run check && npm run build && npm run test:boundaries && node --test tests/v3-boundaries.test.ts tests/v3-protocol-browser.test.ts && npm run test:e2e
 ```
 
 | Gate | Command | Pass Count | Duration | Result |

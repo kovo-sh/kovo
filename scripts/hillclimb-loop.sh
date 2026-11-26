@@ -10,7 +10,7 @@
 #
 # Env:
 #   HILLCLIMB_OUT              output directory (default /tmp/hillclimb-loop-<timestamp>)
-#   KOVO_DATA_DIR          model data dir (default /home/omarchy/guardian-data)
+#   KOVO_DATA_DIR          model data dir (default $HOME/guardian-data)
 #   HILLCLIMB_SKIP_AGENTIC=1   skip the agentic leg
 #   HILLCLIMB_SKIP_REALISTIC=1 skip the realistic leg
 #
@@ -25,7 +25,7 @@ if [[ "$MODE" != "--smoke" && "$MODE" != "--full" ]]; then
   exit 2
 fi
 OUT="${HILLCLIMB_OUT:-/tmp/hillclimb-loop-$(date +%Y%m%d-%H%M%S)}"
-DATA_DIR="${KOVO_DATA_DIR:-/home/omarchy/guardian-data}"
+DATA_DIR="${KOVO_DATA_DIR:-$HOME/guardian-data}"
 mkdir -p "$OUT"
 
 run() {

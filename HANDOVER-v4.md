@@ -140,7 +140,7 @@ Check exact exported signatures expected by Features 26 & 27 + `T4-13` in `tests
 - **Docker Worker Image:** `guardian-worker:v4` (and `guardian-worker:local` alias) is already built locally (`f926ee3ebbd8`). Rebuild via `npm run worker:build` only if `worker/` changes, and run `docker builder prune -f` afterward.
 - **Worker Host Dependencies:** The `tests/v4-m3-*` AST suites import `worker/analyzers.ts` on the host, which requires `@swc/core`/`acorn` from `worker/node_modules`. Run `npm run worker:install` once after checkout (the root `npm install` does not install them); without it those suites fall back to regex parsing and M3-T5/T8 fail.
 - **Secrets / Safety Rules:**
-  - Never print, log, or commit credentials from `/home/exedev/.config/guardian-git/` or `/home/exedev/.config/guardian-fixtures/`.
+  - Never print, log, or commit credentials from `~/.config/guardian-git/` or `~/.config/guardian-fixtures/`.
   - Never run active automated probing against external internet domains; run all benchmark/hill-climbing work strictly against loopback `local-lab` targets (`127.0.0.1`).
 
 ---
@@ -148,7 +148,7 @@ Check exact exported signatures expected by Features 26 & 27 + `T4-13` in `tests
 ## 5. Quick Resume Commands
 
 ```bash
-cd /home/exedev/guardian
+cd <repo-root>
 
 # 1. Typecheck + build
 NODE_OPTIONS=--max-old-space-size=1536 npm run check && NODE_OPTIONS=--max-old-space-size=1536 npm run build

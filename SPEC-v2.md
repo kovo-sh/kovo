@@ -261,12 +261,12 @@ To preserve Guardian's **100% precision / zero-hallucination** bar across multi-
 
 ## 9. Multi-Profile LLM Failover Pool & Stream Redaction
 
-Long-running multi-hour engagements cannot depend on a single fragile API endpoint. Upgrade [provider.ts](file:///home/exedev/guardian/src/server/provider.ts) with an ARTEX-inspired failover pool while keeping Guardian's stream redaction intact:
+Long-running multi-hour engagements cannot depend on a single fragile API endpoint. Upgrade [provider.ts](src/server/provider.ts) with an ARTEX-inspired failover pool while keeping Guardian's stream redaction intact:
 
 - **Ordered Profile Chain (`model_profiles`):** Profiles sorted by `priority DESC`, with round-robin load-spreading across equal-priority keys and context-window filtering (skip profiles whose `contextWindow` cannot hold the current request).
 - **Safe-Window-Only Failover:** A failed profile (`401`/`402`/`403`/`404`/`429`/`5xx`/transport error) fails over to the next profile **only before any stream event has been committed to Pi Durable**—preventing duplicate or corrupted turns.
 - **Quota-Aware `429 → 402` Classification:** Billing/quota exhaustion opens the profile's circuit breaker immediately; transient RPM rate limits apply exponential backoff before tripping.
-- **End-to-End Redaction Preserved:** Every profile in the pool wraps its HTTP response in `sanitizeProviderStream()` ([provider-stream.ts](file:///home/exedev/guardian/src/server/provider-stream.ts)), scrubbing API keys, persona secrets, cookies, and tokens across SSE chunk boundaries before Pi Durable persistence or fixture recording.
+- **End-to-End Redaction Preserved:** Every profile in the pool wraps its HTTP response in `sanitizeProviderStream()` ([provider-stream.ts](src/server/provider-stream.ts)), scrubbing API keys, persona secrets, cookies, and tokens across SSE chunk boundaries before Pi Durable persistence or fixture recording.
 
 ---
 
@@ -297,7 +297,7 @@ In v1, scope revocation checks `brokerOrigins(assignment)` for a single host's r
 
 ### UI Upgrades
 - **Model Profiles, Persona Vault & Spec/Lockfile Upload:** Multi-profile failover settings page (`priority`, `contextWindow`, `maxTokens`, `thinkingLevel`, cost rates), Project Persona Vault (`handle`, `originAllowlist`, `authKind`, `0600` secret), and OpenAPI/GraphQL/lockfile import.
-- **Chain Lanes in Workflow Trace DAG ([workflow-trace.tsx](file:///home/exedev/guardian/src/components/workflow-trace.tsx)):** Render Threat Model → causal multi-step chain lanes (`Step 1 Fact → Step 2 Chained Intent → Replay Verifier → Report`), collapsible `graph_digests` nodes, live turn/request meters (`42 / 150 turns`), and budget bar (`$1.40 / $25.00`).
+- **Chain Lanes in Workflow Trace DAG ([workflow-trace.tsx](src/components/workflow-trace.tsx)):** Render Threat Model → causal multi-step chain lanes (`Step 1 Fact → Step 2 Chained Intent → Replay Verifier → Report`), collapsible `graph_digests` nodes, live turn/request meters (`42 / 150 turns`), and budget bar (`$1.40 / $25.00`).
 - **Inline Tier 3 / RCE-Proof Approval & Candidate Promotion Cards:** Surface pending `approval_requests` (showing exact benign payload template + CVE/rationale) and worker-suggested candidate hosts directly in the Coordinator pane and Workflow header with one-click **Approve** or **Deny**.
 - **Chain Evidence, OWASP Coverage & One-Click Retest in Reports:** Group confirmed findings with a step-by-step chain timeline (Step 1 → Step 2 → Control → Replay Assertion), OWASP/API Top 10 coverage table, offline SHA-256 redacted exchange appendices, and a **Verify Fix** button.
 

@@ -134,7 +134,7 @@ The fast battery answers one question: **did this change break the funnel, the p
 
 ### V7.7 Queue #14 Unified Agentic Matrix & Tier-1 Warm Smoke (`main` @ `4010d05`) + Post-Queue #14 Batch Merge (`fb93a8a`)
 
-**Queue #14 provenance:** run by `@bench-verifier` on `main` @ `4010d053bb2e`, `--verifier docker`, model `deepseek/deepseek-v4.1-flash-1017`, `GUARDIAN_DATA_DIR=/home/omarchy/guardian-data`. Achieved **100.0% worst-run precision across BOTH full Unified Agentic Matrices**, **21/21 live `agent_script` `ProofReceipt` confirmations** across all 3 legs (`0` stalls, `0` crashes, `0` conflicts), and **Tier-1 warm `throughput` PASS (`12 completed`)** + **`trap-zero` PASS (`0 confirmed`)**.
+**Queue #14 provenance:** run by `@bench-verifier` on `main` @ `4010d053bb2e`, `--verifier docker`, model `deepseek/deepseek-v4.1-flash-1017`, `GUARDIAN_DATA_DIR="$HOME/guardian-data"`. Achieved **100.0% worst-run precision across BOTH full Unified Agentic Matrices**, **21/21 live `agent_script` `ProofReceipt` confirmations** across all 3 legs (`0` stalls, `0` crashes, `0` conflicts), and **Tier-1 warm `throughput` PASS (`12 completed`)** + **`trap-zero` PASS (`0 confirmed`)**.
 
 | Leg | Command / Parameters | Target Gate | Measured (`4010d053bb2e`) | Status |
 | :--- | :--- | :--- | :--- | :--- |
@@ -420,7 +420,7 @@ The 25/59 and 28/59 numbers are **not** in this table because they are not shipp
 newgrp docker -c '
   cd /path/to/guardian &&
   export GUARDIAN_ALLOW_LOCAL_LAB=1 \
-         GUARDIAN_DATA_DIR=/home/omarchy/guardian-data \
+         GUARDIAN_DATA_DIR="$HOME/guardian-data" \
          NODE_OPTIONS=--max-old-space-size=2048 &&
   node scripts/benchmark-realistic.ts \
     --app all --seeds 1 --mode grey-box \
@@ -514,7 +514,7 @@ newgrp docker -c '
 newgrp docker -c '
   cd /path/to/guardian &&
   export GUARDIAN_ALLOW_LOCAL_LAB=1 \
-         GUARDIAN_DATA_DIR=/home/omarchy/guardian-data \
+         GUARDIAN_DATA_DIR="$HOME/guardian-data" \
          NODE_OPTIONS=--max-old-space-size=2048 &&
   node scripts/benchmark-realistic.ts \
     --app all --seeds 1 --mode grey-box \

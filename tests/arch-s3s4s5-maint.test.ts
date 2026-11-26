@@ -23,7 +23,7 @@ import {
   utimesSync,
   writeFileSync,
 } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import test from 'node:test'
@@ -877,8 +877,8 @@ test('S5: downgrade protection refuses newer user_version and failed migration r
   assert.deepEqual(alphaRows.map(r => r.id), [1], 'DML from failed migration step must be rolled back')
 })
 
-test('S5: upgrades a copy of existing pre-v10 user database (/home/omarchy/guardian-user-data/kovo.sqlite) losslessly when present', t => {
-  const sourceDb = '/home/omarchy/guardian-user-data/kovo.sqlite'
+test('S5: upgrades a copy of existing pre-v10 user database (~/guardian-user-data/kovo.sqlite) losslessly when present', t => {
+  const sourceDb = join(homedir(), 'guardian-user-data', 'kovo.sqlite')
   if (!existsSync(sourceDb)) {
     t.skip('host user kovo.sqlite not present')
     return
