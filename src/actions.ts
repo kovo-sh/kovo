@@ -230,6 +230,24 @@ export const updateProjectAssetScope = createServerFn({ method: 'POST' })
   }))
   .handler(({ data }) => store().updateProjectAssetScope(data))
 
+export const bulkUpdateProjectAssetScopeAction = createServerFn({ method: 'POST' })
+  .validator(z.object({
+    requestId: id,
+    projectId: id,
+    assetIds: z.array(id).min(1).max(2000),
+    includeSubdomains: z.boolean().optional(),
+    approveInDefaultScope: z.boolean().optional(),
+  }))
+  .handler(({ data }) => store().projectsRepo.bulkUpdateProjectAssetScope(data))
+
+export const bulkRemoveProjectAssetsAction = createServerFn({ method: 'POST' })
+  .validator(z.object({
+    requestId: id,
+    projectId: id,
+    assetIds: z.array(id).min(1).max(2000),
+  }))
+  .handler(({ data }) => store().projectsRepo.bulkRemoveProjectAssets(data))
+
 export const importProjectDns = createServerFn({ method: 'POST' }).validator(importDnsInventory)
   .handler(({ data }) => store().importProjectDns(data))
 

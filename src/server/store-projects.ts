@@ -8,7 +8,7 @@
 import { randomUUID } from 'node:crypto'
 import { rmSync } from 'node:fs'
 import { join } from 'node:path'
-import { and, desc, eq } from 'drizzle-orm'
+import { and, desc, eq, inArray } from 'drizzle-orm'
 import type { z } from 'zod'
 import type { importAccessPolicy } from '../access-policy.ts'
 import { assetOriginForEnvironment, isLocalLabEnvEnabled, maxProjectSeeds, shortText } from '../domain.ts'
@@ -770,6 +770,194 @@ export class ProjectsRepository {
         origin: asset.origin,
       })
       return { id: asset.id, origin: asset.origin }
+    })
+  }
+
+  bulkUpdateProjectAssetScope(input: {
+    requestId: string
+    projectId: string
+    assetIds: string[]
+    includeSubdomains?: boolean
+    approveInDefaultScope?: boolean
+  }) {
+    return this.session.operate(input, () => {
+      const project = this.project(input.projectId)
+      const uniqueIds = [...new Set(input.assetIds.filter(Boolean))]
+      if (uniqueIds.length === 0) {
+        return {
+          id: project.id,
+          updatedCount: 0,
+          updatedIds: [] as string[],
+          ignoredIds: [] as string[],
+          defaultScope: [...project.defaultScope],
+        }
+      }
+      const matched: (typeof tables.projectAssets.$inferSelect)[] = []
+      for (let offset = 0; offset < uniqueIds.length; offset += 500) {
+        matched.push(
+          ...this.session.db.select().from(tables.projectAssets)
+            .where(and(
+              eq(tables.projectAssets.projectId, project.id),
+              inArray(tables.projectAssets.id, uniqueIds.slice(offset, offset + 500)),
+            ))
+            .all(),
+        )
+      }
+      const matchedIds = new Set(matched.map(a => a.id))
+      const ignoredIds = uniqueIds.filter(assetId => !matchedIds.has(assetId))
+      if (matched.length === 0) {
+        return {
+          id: project.id,
+          updatedCount: 0,
+          updatedIds: [] as string[],
+          ignoredIds,
+          defaultScope: [...project.defaultScope],
+        }
+      }
+
+      if (input.includeSubdomains !== undefined) {
+        const nextFlag = Boolean(input.includeSubdomains)
+        const idsToEnable = nextFlag && project.environment === 'public'
+          ? matched.filter(a => !a.thirdParty).map(a => a.id)
+          : []
+        const idsToDisable = nextFlag
+          ? matched.filter(a => a.thirdParty || project.environment !== 'public').map(a => a.id)
+          : matched.map(a => a.id)
+        for (let offset = 0; offset < idsToEnable.length; offset += 500) {
+          this.session.db.update(tables.projectAssets)
+            .set({ includeSubdomains: true })
+            .where(and(
+              eq(tables.projectAssets.projectId, project.id),
+              inArray(tables.projectAssets.id, idsToEnable.slice(offset, offset + 500)),
+            ))
+            .run()
+        }
+        for (let offset = 0; offset < idsToDisable.length; offset += 500) {
+          this.session.db.update(tables.projectAssets)
+            .set({ includeSubdomains: false })
+            .where(and(
+              eq(tables.projectAssets.projectId, project.id),
+              inArray(tables.projectAssets.id, idsToDisable.slice(offset, offset + 500)),
+            ))
+            .run()
+        }
+      }
+
+      let nextDefaultScope = [...project.defaultScope]
+      if (input.approveInDefaultScope !== undefined) {
+        const matchedOrigins = new Set(matched.map(a => a.origin))
+        if (input.approveInDefaultScope) {
+          const existingSet = new Set(nextDefaultScope)
+          for (const asset of matched) {
+            if (!existingSet.has(asset.origin)) {
+              existingSet.add(asset.origin)
+              nextDefaultScope.push(asset.origin)
+            }
+          }
+        } else {
+          nextDefaultScope = nextDefaultScope.filter(origin => !matchedOrigins.has(origin))
+        }
+        this.session.db.update(tables.projects)
+          .set({ defaultScope: nextDefaultScope })
+          .where(eq(tables.projects.id, project.id))
+          .run()
+      }
+
+      const updatedIds = matched.map(a => a.id)
+      const actionVerb = input.approveInDefaultScope === true
+        ? 'Approved'
+        : input.approveInDefaultScope === false
+          ? 'Unapproved'
+          : 'Updated scope settings for'
+      this.session.event(null, 'inventory.assets_scope_bulk_updated', `${actionVerb} ${updatedIds.length} ${updatedIds.length === 1 ? 'host' : 'hosts'} in project scope.`, {
+        projectId: project.id,
+        updatedCount: updatedIds.length,
+        ignoredCount: ignoredIds.length,
+        ...(input.approveInDefaultScope !== undefined ? { approveInDefaultScope: input.approveInDefaultScope } : {}),
+        ...(input.includeSubdomains !== undefined ? { includeSubdomains: input.includeSubdomains } : {}),
+      })
+      return {
+        id: project.id,
+        updatedCount: updatedIds.length,
+        updatedIds,
+        ignoredIds,
+        defaultScope: nextDefaultScope,
+      }
+    })
+  }
+
+  bulkRemoveProjectAssets(input: {
+    requestId: string
+    projectId: string
+    assetIds: string[]
+  }) {
+    return this.session.operate(input, () => {
+      const project = this.project(input.projectId)
+      const uniqueIds = [...new Set(input.assetIds.filter(Boolean))]
+      if (uniqueIds.length === 0) {
+        return {
+          id: project.id,
+          removedCount: 0,
+          removedIds: [] as string[],
+          ignoredIds: [] as string[],
+          defaultScope: [...project.defaultScope],
+        }
+      }
+      const matched: (typeof tables.projectAssets.$inferSelect)[] = []
+      for (let offset = 0; offset < uniqueIds.length; offset += 500) {
+        matched.push(
+          ...this.session.db.select().from(tables.projectAssets)
+            .where(and(
+              eq(tables.projectAssets.projectId, project.id),
+              inArray(tables.projectAssets.id, uniqueIds.slice(offset, offset + 500)),
+            ))
+            .all(),
+        )
+      }
+      const matchedIds = new Set(matched.map(a => a.id))
+      const ignoredIds = uniqueIds.filter(assetId => !matchedIds.has(assetId))
+      if (matched.length === 0) {
+        return {
+          id: project.id,
+          removedCount: 0,
+          removedIds: [] as string[],
+          ignoredIds,
+          defaultScope: [...project.defaultScope],
+        }
+      }
+
+      const removedIds = matched.map(a => a.id)
+      const removedOrigins = new Set(matched.map(a => a.origin))
+      for (let offset = 0; offset < removedIds.length; offset += 500) {
+        this.session.db.delete(tables.projectAssets)
+          .where(and(
+            eq(tables.projectAssets.projectId, project.id),
+            inArray(tables.projectAssets.id, removedIds.slice(offset, offset + 500)),
+          ))
+          .run()
+      }
+
+      const nextDefaultScope = project.defaultScope.filter(origin => !removedOrigins.has(origin))
+      const nextSeeds = project.seeds.filter(origin => !removedOrigins.has(origin))
+      if (nextDefaultScope.length !== project.defaultScope.length || nextSeeds.length !== project.seeds.length) {
+        this.session.db.update(tables.projects)
+          .set({ defaultScope: nextDefaultScope, seeds: nextSeeds })
+          .where(eq(tables.projects.id, project.id))
+          .run()
+      }
+
+      this.session.event(null, 'inventory.assets_bulk_deleted', `Removed ${removedIds.length} ${removedIds.length === 1 ? 'host' : 'hosts'} from project inventory.`, {
+        projectId: project.id,
+        removedCount: removedIds.length,
+        ignoredCount: ignoredIds.length,
+      })
+      return {
+        id: project.id,
+        removedCount: removedIds.length,
+        removedIds,
+        ignoredIds,
+        defaultScope: nextDefaultScope,
+      }
     })
   }
 

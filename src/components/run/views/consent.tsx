@@ -23,6 +23,9 @@ import { LabPanel } from './lab.tsx'
 const PUBLIC_MAX_RPS_CAP = 20
 const MAX_AUTO_SELECT_HOSTS = 30
 const LARGE_HOST_FILTER_THRESHOLD = 8
+const CHK = 'm-0 size-[13px] accent-[var(--accent)]'
+const NUM_PILL = 'inline-flex items-center gap-1 rounded-[5px] bg-panel px-1.5 py-[2px] shadow-hairline'
+const NUM_IN = 'num border-0 bg-transparent p-0 font-sans text-[12px] font-medium text-fg outline-none'
 
 const DEFAULT_SCAN_MODE_GOALS: ReadonlySet<string> = new Set([
   'Map endpoints, API routes, and client bundles, and verify read-only exposures and cross-account reads without state-changing requests.',
@@ -571,6 +574,12 @@ function ScopeCard({
       ? approvalPolicyMeta[draft.approvalPolicy === 'strict' ? 'strict' : 'auto_review'].summary
       : approvalPolicyMeta.yolo.summary
 
+  const quickBtns = <>
+    <button type="button" className={runBtn({ variant: 'ghost', size: 'xs' })} onClick={selectHighSignal}>High-signal</button>
+    <button type="button" className={runBtn({ variant: 'ghost', size: 'xs' })} onClick={selectAllFirstParty}>All first-party</button>
+    <button type="button" className={runBtn({ variant: 'ghost', size: 'xs' })} onClick={selectNone}>None</button>
+  </>
+
   return <div className={inDialog ? 'overflow-hidden bg-panel' : RW.sheet}>
     {/* Sheet header */}
     <div className={RW.sheetH}>
@@ -584,11 +593,7 @@ function ScopeCard({
           : `${selected.size} of ${plural(hosts.length, 'discovered host')} selected`}
       </span>
       {editing && !discovery && hosts.length <= LARGE_HOST_FILTER_THRESHOLD && (
-        <span className="ml-auto flex gap-1">
-          <button type="button" className={runBtn({ variant: 'ghost', size: 'xs' })} onClick={selectHighSignal}>High-signal</button>
-          <button type="button" className={runBtn({ variant: 'ghost', size: 'xs' })} onClick={selectAllFirstParty}>All first-party</button>
-          <button type="button" className={runBtn({ variant: 'ghost', size: 'xs' })} onClick={selectNone}>None</button>
-        </span>
+        <span className="ml-auto flex gap-1">{quickBtns}</span>
       )}
     </div>
 
@@ -651,10 +656,10 @@ function ScopeCard({
           <span className="text-[11.5px] text-fg-subtle">Budget / RPS</span>
           {canEditConfig && editingBudget
             ? <div className="flex flex-wrap items-center gap-1.5 text-[12px] text-fg-muted">
-                <label className="inline-flex items-center gap-1 rounded-[5px] bg-panel px-1.5 py-[2px] shadow-hairline">
+                <label className={NUM_PILL}>
                   <span className="text-fg-subtle">$</span>
                   <input
-                    className="num w-[46px] border-0 bg-transparent p-0 font-sans text-[12px] font-medium text-fg outline-none"
+                    className={cn(NUM_IN, 'w-[46px]')}
                     type="number"
                     min={0.1}
                     max={500}
@@ -664,9 +669,9 @@ function ScopeCard({
                     onChange={e => setDraft(d => ({ ...d, budgetUsd: Number(e.target.value) }))}
                   />
                 </label>
-                <label className="inline-flex items-center gap-1 rounded-[5px] bg-panel px-1.5 py-[2px] shadow-hairline" title="Requests per second per origin">
+                <label className={NUM_PILL} title="Requests per second per origin">
                   <input
-                    className="num w-[34px] border-0 bg-transparent p-0 font-sans text-[12px] font-medium text-fg outline-none"
+                    className={cn(NUM_IN, 'w-[34px]')}
                     type="number"
                     min={1}
                     max={rpsMax}
@@ -677,9 +682,9 @@ function ScopeCard({
                   />
                   <span className="text-fg-subtle">req/s</span>
                 </label>
-                <label className="inline-flex items-center gap-1 rounded-[5px] bg-panel px-1.5 py-[2px] shadow-hairline" title="Request cap (0 = uncapped)">
+                <label className={NUM_PILL} title="Request cap (0 = uncapped)">
                   <input
-                    className="num w-[50px] border-0 bg-transparent p-0 font-sans text-[12px] font-medium text-fg outline-none"
+                    className={cn(NUM_IN, 'w-[50px]')}
                     type="number"
                     min={0}
                     max={maxBudgetRequests}
@@ -751,11 +756,7 @@ function ScopeCard({
             className="h-[24px] w-full rounded-[5px] border-0 bg-panel pl-7 pr-2 font-sans text-[12px] text-fg shadow-hairline outline-none placeholder:text-fg-faint focus:shadow-[0_0_0_1px_var(--accent-line),0_0_0_3px_var(--accent-soft)]"
           />
         </div>
-        <div className="flex flex-none items-center gap-1">
-          <button type="button" className={runBtn({ variant: 'ghost', size: 'xs' })} onClick={selectHighSignal}>High-signal</button>
-          <button type="button" className={runBtn({ variant: 'ghost', size: 'xs' })} onClick={selectAllFirstParty}>All first-party</button>
-          <button type="button" className={runBtn({ variant: 'ghost', size: 'xs' })} onClick={selectNone}>None</button>
-        </div>
+        <div className="flex flex-none items-center gap-1">{quickBtns}</div>
       </div>
     )}
 
@@ -842,7 +843,7 @@ function ScopeCard({
       <div className="flex flex-wrap gap-x-4 gap-y-1.5">
         {detail.personas.map(p => <label key={p.id} className="flex cursor-pointer select-none items-center gap-2 text-[12.5px] text-fg-muted">
           <input
-            className="m-0 size-[13px] accent-[var(--accent)]"
+            className={CHK}
             type="checkbox"
             disabled={draft.capabilityTier === 0}
             checked={draft.approvedPersonaIds.includes(p.id)}
@@ -876,6 +877,7 @@ export function ConsentView() {
   // Default directly into editable scope review on `phase === 'review'` (no extra click required).
   const [editing, setEditing] = useState(!discovery)
   const [approving, setApproving] = useState(false)
+  const [saveProject, setSaveProject] = useState(false)
   const [userTouchedHosts, setUserTouchedHosts] = useState(false)
   const runSyncKey = `${r.id}:${r.phase}:${r.scopeRevision}`
   const [syncedRunKey, setSyncedRunKey] = useState(runSyncKey)
@@ -889,6 +891,7 @@ export function ConsentView() {
     setSyncedRunKey(runSyncKey)
     setSyncedDefaultsKey(defaultsKey)
     setUserTouchedHosts(false)
+    setSaveProject(false)
     setEditing(!discovery)
     setDraftState(initialDraft(r, defaults, rpsMax))
   } else if (syncedDefaultsKey !== defaultsKey && !userTouchedHosts) {
@@ -910,7 +913,7 @@ export function ConsentView() {
 
   const approve = async () => {
     if (!canApprove) return
-    const command: Command = discovery ? { action: 'discover', consent: true } : scopeCommand(r, draft)
+    const command: Command = discovery ? { action: 'discover', consent: true } : scopeCommand(r, draft, { saveProject })
     const message = discovery
       ? `Discovery approved for ${plural(hosts.length, 'host')}`
       : `Scope approved for ${plural(count, 'host')} (${capabilityTierMeta[draft.capabilityTier].short})`
@@ -1007,6 +1010,10 @@ export function ConsentView() {
             : <span className="num text-fg-muted">{stickySummary}</span>}
         </div>
         <div className="flex flex-none items-center gap-2">
+          {!discovery && <label className="flex cursor-pointer select-none items-center gap-1.5 whitespace-nowrap text-[11.5px] text-fg-muted">
+            <input data-testid="consent-save-default" className={CHK} type="checkbox" disabled={approving} checked={saveProject} onChange={e => setSaveProject(e.target.checked)} />
+            Save as project default
+          </label>}
           <Link
             to="/projects/$projectId"
             params={{ projectId: detail.project.id }}
@@ -1117,7 +1124,7 @@ export function ScopeOverlay() {
               <input className={cn(RW.fieldInput, 'flex-1')} required maxLength={160} placeholder="Source (e.g. service inventory)" value={source} onChange={e => setSource(e.target.value)} aria-label="Source" />
             </div>
             <label className="flex cursor-pointer select-none items-center gap-2 text-[12.5px] text-fg-muted">
-              <input className="m-0 size-[13px] accent-[var(--accent)]" type="checkbox" checked={thirdParty} onChange={e => setThirdParty(e.target.checked)} />
+              <input className={CHK} type="checkbox" checked={thirdParty} onChange={e => setThirdParty(e.target.checked)} />
               Third-party service
             </label>
             {err && <span className="text-[12px] text-danger">{err}</span>}
@@ -1142,7 +1149,7 @@ export function ScopeOverlay() {
           <div className={RW.sheetF}>
             {editable
               ? <label className="mr-auto flex cursor-pointer select-none items-center gap-2 text-[12px] text-fg-subtle">
-                <input className="m-0 size-[13px] accent-[var(--accent)]" type="checkbox" disabled={saving} checked={saveProject} onChange={e => setSaveProject(e.target.checked)} />
+                <input className={CHK} type="checkbox" disabled={saving} checked={saveProject} onChange={e => setSaveProject(e.target.checked)} />
                 Save as the project default
               </label>
               : <span className="mr-auto text-[12px] text-fg-subtle">{discovery ? 'Scope is reviewed after discovery.' : `Scope can’t change while the run is ${runStatusLabel(r.status).toLowerCase()}.`}</span>}
