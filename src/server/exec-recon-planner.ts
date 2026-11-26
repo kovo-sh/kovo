@@ -19,8 +19,8 @@ import {
 import { suppliedResponseLabel } from '../report-summary.ts'
 import { isContinuableStepStatus } from '../step-status.ts'
 import { accessPolicyReviews } from './access-policy-checks.ts'
-import { isSensitiveRepoEntry, isSensitiveRepoRelativePath } from './safety-primitives.ts'
-export { isSensitiveRepoEntry, isSensitiveRepoRelativePath }
+import { isSensitiveRepoEntry, isSensitiveRepoRelativePath } from './safety-primitives.ts'; export { isSensitiveRepoEntry, isSensitiveRepoRelativePath }
+import { settleOrReport, settleOrReportAsync } from './run-disposers.ts'
 import {
   agentTurn,
   classifyHostTier,
@@ -4467,28 +4467,28 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       const sourceMounted = mountedRepos.length > 0
       let codeAuditStepsCreated = 0
       if (sourceMounted && freshRun.capabilityTier > 0 && profiles.length > 0 && this.host.authorize(job)) {
-        try {
-          const auditResult = await this.host.runSourceFirstCodeAudit(
+        const reportSettlement = (id: string, kind: string, msg: string, detail?: Record<string, unknown>) => { this.storage.event(id, kind, msg, detail) }
+        const auditRes = await settleOrReportAsync(
+          freshRun.id,
+          'code_audit.run',
+          () => this.host.runSourceFirstCodeAudit(
             this.storage.run(freshRun.id),
             finalEntries,
             profiles,
             task.controller.signal,
-          )
-          codeAuditStepsCreated = auditResult.stepsCreated.length
-        } catch {
-          // Code audit failure should not block live investigation rounds
-        }
-        try {
-          const tierASeeded = this.queueTierALeadSteps(
-            this.storage.run(freshRun.id),
-            approvedOrigins,
-            computeDynamicStepBudget(this.storage, freshRun.id),
-            { sourceMounted: true },
-          )
-          codeAuditStepsCreated += tierASeeded
-        } catch {
-          // Tier-A white-box seeding is additive
-        }
+          ),
+          reportSettlement,
+        )
+        if (auditRes.ok && auditRes.value) codeAuditStepsCreated = auditRes.value.stepsCreated.length
+        const tierARes = settleOrReport(
+          freshRun.id,
+          'code_audit.tier_a_seed',
+          () => this.queueTierALeadSteps(
+            this.storage.run(freshRun.id), approvedOrigins, computeDynamicStepBudget(this.storage, freshRun.id), { sourceMounted: true },
+          ),
+          reportSettlement,
+        )
+        if (tierARes.ok && tierARes.value) codeAuditStepsCreated += tierARes.value
       }
 
       if (!this.host.authorize(job)) return
