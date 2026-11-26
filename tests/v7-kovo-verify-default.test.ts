@@ -286,6 +286,7 @@ test('kovo_verify ProofReceipt cleanly supports BOLA (CWE-639) boundary claims a
     {
       exchangeId: 'ex-p', method: 'GET', pathAndQuery: `/api/v1/reports/render?tpl=${encodeURIComponent(`{{${sstiChallenge.expressionSyntax}}}`)}`, origin: ORIGIN,
       status: 200, body: `<h1>${sstiChallenge.expectedOutput}</h1>`,
+      hostExpressionChallenge: sstiChallenge,
     },
   ]
   const sstiBuilt = buildAgentScriptReceipt({

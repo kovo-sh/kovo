@@ -54,8 +54,10 @@ import { createHash } from 'node:crypto'
 import { matchStrippedInjectionFingerprint } from './oracle-invariants.ts'
 import type { AmbientAuth, ImpactStep, InjectionFamily, RoleName } from './oracle-invariants.ts'
 import type { BrokerExchangeResult, BrokerHttpRequest, Grant, RequestBroker } from './broker.ts'
-import { buildProofReceipt, verifyReceipt } from './proof-receipt.ts'
+import { buildProofReceipt, defaultHostMintedOracle, verifyReceipt } from './proof-receipt.ts'
 import type {
+  BooleanPairStyle,
+  HostStampedBooleanPair,
   ProofReceipt,
   ReceiptBrowserTrace,
   ReceiptOobEvent,
@@ -126,6 +128,8 @@ export interface FloorRequestSpec {
   session?: string
   /** Bind the route's CSRF token (hidden field + cookie) on this arm. */
   csrfBind?: boolean
+  /** R4-C-1: Host-minted boolean predicate pair arm stamp. */
+  hostBooleanPair?: HostStampedBooleanPair
 }
 
 /** One host-recorded exchange. Ids/timings are the host's, never the recipe's. */
@@ -733,6 +737,7 @@ class RecipeContext implements FloorRecipeContext {
       durationMs: exchange.durationMs ?? measuredDurationMs ?? 0,
       carrierText: exchange.carrierText ?? carrierTextOf(spec),
       evidenceRole: spec.role,
+      ...(spec.hostBooleanPair ? { hostBooleanPair: spec.hostBooleanPair } : {}),
     })
     return recorded
   }
@@ -1333,6 +1338,54 @@ function armRequest(
   }
 }
 
+function extractFloorBooleanBaseAndStyle(
+  param: string,
+  controlPath: string,
+  probePath: string,
+  controlJson: unknown,
+  probeJson: unknown,
+): { baseValue: string; style: BooleanPairStyle; carrier: 'query' | 'json' } | null {
+  let rawControl: string | null = null
+  let rawProbe: string | null = null
+  let carrier: 'query' | 'json' = 'query'
+  try {
+    const ctlUrl = new URL(controlPath, 'http://kovo.invalid')
+    if (ctlUrl.searchParams.has(param)) {
+      rawControl = ctlUrl.searchParams.get(param)
+      rawProbe = new URL(probePath, 'http://kovo.invalid').searchParams.get(param)
+    }
+  } catch { /* ignore */ }
+  if (rawControl === null && controlJson && typeof controlJson === 'object' && !Array.isArray(controlJson)) {
+    const ctlObj = controlJson as Record<string, unknown>
+    if (typeof ctlObj[param] === 'string' || typeof ctlObj[param] === 'number') {
+      rawControl = String(ctlObj[param])
+      const prbObj = probeJson && typeof probeJson === 'object' && !Array.isArray(probeJson) ? probeJson as Record<string, unknown> : null
+      rawProbe = prbObj && (typeof prbObj[param] === 'string' || typeof prbObj[param] === 'number') ? String(prbObj[param]) : null
+      carrier = 'json'
+    }
+  }
+  if (!rawControl || !rawControl.trim()) return null
+  const strippedBase = rawControl.replace(/['"]?\s*\b(?:AND|OR)\b[\s\S]*$/i, '').trim()
+  if (!strippedBase) return null
+  const sample = rawProbe ?? rawControl
+  const style: BooleanPairStyle = sample.includes("'")
+    ? 'single_quote'
+    : sample.includes('"')
+      ? 'double_quote'
+      : 'numeric'
+  return { baseValue: strippedBase, style, carrier }
+}
+
+function withReplacedQueryParam(pathAndQuery: string, param: string, value: string): string {
+  try {
+    const parsed = new URL(pathAndQuery, 'http://kovo.invalid')
+    parsed.searchParams.set(param, value)
+    return `${parsed.pathname}${parsed.search}`
+  } catch {
+    return pathAndQuery
+  }
+}
+
 const booleanOrTiming = defineRecipe<BooleanOrTimingArgs>('boolean_or_timing', async (args, ctx) => {
   const actor = args.actor ?? ANONYMOUS
   const controlPath = args.controlPathAndQuery ?? args.pathAndQuery
@@ -1360,9 +1413,37 @@ const booleanOrTiming = defineRecipe<BooleanOrTimingArgs>('boolean_or_timing', a
     const rounds = Math.max(2, Math.min(4, Math.floor(args.rounds ?? 2)))
     const exchangeIds: string[] = []
     let serverError = false
+    const mintSpec = param
+      ? extractFloorBooleanBaseAndStyle(param, controlPath, probePath, args.controlJsonBody, args.probeJsonBody)
+      : null
     for (let round = 0; round < rounds; round += 1) {
-      const control = await ctx.send(armRequest(args, 'control', controlPath, args.controlJsonBody, actor))
-      const probe = await ctx.send(armRequest(args, 'probe', probePath, args.probeJsonBody, actor))
+      const pair = mintSpec && param
+        ? defaultHostMintedOracle.mintBooleanPair(mintSpec.baseValue, {
+            param,
+            style: mintSpec.style,
+            deterministicKey: `floor:boolean:${args.origin}:${args.method}:${controlPath}:${round}`,
+          })
+        : null
+      const roundCtlPath = pair && param && mintSpec?.carrier === 'query'
+        ? withReplacedQueryParam(controlPath, param, pair.trueValue)
+        : controlPath
+      const roundPrbPath = pair && param && mintSpec?.carrier === 'query'
+        ? withReplacedQueryParam(probePath, param, pair.falseValue)
+        : probePath
+      const roundCtlJson = pair && param && mintSpec?.carrier === 'json' && args.controlJsonBody && typeof args.controlJsonBody === 'object'
+        ? { ...(args.controlJsonBody as Record<string, unknown>), [param]: pair.trueValue }
+        : args.controlJsonBody
+      const roundPrbJson = pair && param && mintSpec?.carrier === 'json' && args.probeJsonBody && typeof args.probeJsonBody === 'object'
+        ? { ...(args.probeJsonBody as Record<string, unknown>), [param]: pair.falseValue }
+        : args.probeJsonBody
+      const ctlReq = armRequest(args, 'control', roundCtlPath, roundCtlJson, actor)
+      const prbReq = armRequest(args, 'probe', roundPrbPath, roundPrbJson, actor)
+      if (pair) {
+        ctlReq.hostBooleanPair = defaultHostMintedOracle.stampBooleanPairArm(pair, 'true')
+        prbReq.hostBooleanPair = defaultHostMintedOracle.stampBooleanPairArm(pair, 'false')
+      }
+      const control = await ctx.send(ctlReq)
+      const probe = await ctx.send(prbReq)
       exchangeIds.push(control.exchangeId, probe.exchangeId)
       if ((control.exchange.status ?? 0) >= 500 || (probe.exchange.status ?? 0) >= 500) serverError = true
     }
@@ -1388,12 +1469,48 @@ const booleanOrTiming = defineRecipe<BooleanOrTimingArgs>('boolean_or_timing', a
     const rounds = Math.max(2, Math.min(4, Math.floor(args.rounds ?? 2)))
     const contradictionPath = args.contradictionPathAndQuery ?? probePath
     const exchangeIds: string[] = []
+    const mintSpec = param
+      ? extractFloorBooleanBaseAndStyle(param, controlPath, probePath, args.controlJsonBody, args.probeJsonBody)
+      : null
     for (let round = 0; round < rounds; round += 1) {
+      const pair = mintSpec && param
+        ? defaultHostMintedOracle.mintBooleanPair(mintSpec.baseValue, {
+            param,
+            style: mintSpec.style,
+            deterministicKey: `floor:status:${args.origin}:${args.method}:${controlPath}:${round}`,
+          })
+        : null
+      const roundBasePath = pair && param && mintSpec?.carrier === 'query'
+        ? withReplacedQueryParam(controlPath, param, pair.baseValue)
+        : controlPath
+      const roundTruePath = pair && param && mintSpec?.carrier === 'query'
+        ? withReplacedQueryParam(probePath, param, pair.trueValue)
+        : probePath
+      const roundFalsePath = pair && param && mintSpec?.carrier === 'query'
+        ? withReplacedQueryParam(contradictionPath, param, pair.falseValue)
+        : contradictionPath
+      const roundBaseJson = pair && param && mintSpec?.carrier === 'json' && args.controlJsonBody && typeof args.controlJsonBody === 'object'
+        ? { ...(args.controlJsonBody as Record<string, unknown>), [param]: pair.baseValue }
+        : args.controlJsonBody
+      const roundTrueJson = pair && param && mintSpec?.carrier === 'json' && args.probeJsonBody && typeof args.probeJsonBody === 'object'
+        ? { ...(args.probeJsonBody as Record<string, unknown>), [param]: pair.trueValue }
+        : args.probeJsonBody
+      const roundFalseJson = pair && param && mintSpec?.carrier === 'json' && args.contradictionJsonBody && typeof args.contradictionJsonBody === 'object'
+        ? { ...(args.contradictionJsonBody as Record<string, unknown>), [param]: pair.falseValue }
+        : args.contradictionJsonBody
+      const benignReq = armRequest(args, 'control', roundBasePath, roundBaseJson, actor, 'benign_baseline')
+      const tautReq = armRequest(args, 'probe', roundTruePath, roundTrueJson, actor, 'tautology')
+      const contraReq = armRequest(args, 'probe', roundFalsePath, roundFalseJson, actor, 'contradiction')
+      if (pair) {
+        benignReq.hostBooleanPair = defaultHostMintedOracle.stampBooleanPairArm(pair, 'baseline')
+        tautReq.hostBooleanPair = defaultHostMintedOracle.stampBooleanPairArm(pair, 'true')
+        contraReq.hostBooleanPair = defaultHostMintedOracle.stampBooleanPairArm(pair, 'false')
+      }
       // The benign baseline is what separates a predicate contrast from a single malformed request:
       // it is the same request without the boolean operator and must answer 2xx.
-      const benign = await ctx.send(armRequest(args, 'control', controlPath, args.controlJsonBody, actor, 'benign_baseline'))
-      const tautology = await ctx.send(armRequest(args, 'probe', probePath, args.probeJsonBody, actor, 'tautology'))
-      const contradiction = await ctx.send(armRequest(args, 'probe', contradictionPath, args.contradictionJsonBody, actor, 'contradiction'))
+      const benign = await ctx.send(benignReq)
+      const tautology = await ctx.send(tautReq)
+      const contradiction = await ctx.send(contraReq)
       exchangeIds.push(benign.exchangeId, tautology.exchangeId, contradiction.exchangeId)
       ctx.require(isSuccess(benign.exchange.status), 'benign_baseline', `The benign baseline returned ${benign.exchange.status ?? 'no status'} instead of a 2xx.`, 'control')
       ctx.require(isSuccess(tautology.exchange.status), 'tautology', `The tautology arm returned ${tautology.exchange.status ?? 'no status'} instead of a 2xx.`, 'probe')

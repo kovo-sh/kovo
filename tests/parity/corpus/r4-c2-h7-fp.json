@@ -1,0 +1,70 @@
+{
+  "id": "r4-c2-h7-fp",
+  "side": "fp",
+  "archetype": "r4-h7-permit-all-invalid-bearer-control",
+  "description": "R4-H-7 FP: permit-all public catalog endpoint rejects an invalid bearer credential on the control arm with 401 while answering an anonymous probe carrying an ignored forwarding header with 200; must fail closed across all entry points because the control self-sabotaged with a credential the probe lacked and no bare anonymous ablation denial exists.",
+  "canonicalLabel": {
+    "cwe": "CWE-287",
+    "category": "auth-bypass",
+    "title": "Self-sabotaged invalid-bearer control on permit-all catalog endpoint",
+    "impact": "Endpoint is intentionally public; 401 came only from a synthetic invalid credential on the control arm while anonymous requests succeed.",
+    "claimedImpact": "other",
+    "claimedBoundary": "auth",
+    "vulnClass": "auth_bypass"
+  },
+  "freeTextLabel": {
+    "title": "Authentication differential caused by invalid bearer on permit-all route"
+  },
+  "paths": {
+    "replay": true,
+    "floorReceipt": true,
+    "evaluateClaims": true,
+    "composite": false,
+    "floorInjectionRecipe": false,
+    "proofReceipt": true
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [],
+  "exchanges": [
+    {
+      "id": "ctl",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/public/catalog",
+      "persona": null,
+      "requestHeaders": { "authorization": "Bearer kovo-synth-invalid-0011223344556677" },
+      "status": 401,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"error\":\"invalid_bearer_token\"}"
+    },
+    {
+      "id": "prb",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/public/catalog",
+      "persona": null,
+      "requestHeaders": { "x-forwarded-user": "synthetic-admin" },
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"catalogEntries\":[{\"id\":\"pub-101\",\"title\":\"Public Handbook\",\"tier\":\"public\"}]}"
+    }
+  ],
+  "replaySpec": {
+    "assertionsJq": "{ controlPassed: (.steps.ctl.status == 401), confirmed: (.steps.ctl.status == 401 and .steps.prb.status == 200 and (.steps.prb.json.catalogEntries | length) > 0), observed: .steps.prb.json.catalogEntries[0].title, expected: \"401\" }"
+  },
+  "proofReceipt": {
+    "vulnClass": "auth_bypass",
+    "targetMethod": "GET",
+    "targetPathAndQuery": "/api/public/catalog",
+    "claimedDelta": "Synthetic invalid bearer control returned 401 while anonymous probe with ignored forwarding header returned 200 on a public route."
+  },
+  "claims": [
+    { "kind": "boundary", "controlExchangeId": "ctl", "probeExchangeId": "prb" }
+  ]
+}

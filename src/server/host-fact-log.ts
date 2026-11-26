@@ -35,6 +35,7 @@ import type {
 import type {
   HostMintedExpressionChallenge,
   HostMintedTimingChallenge,
+  HostStampedBooleanPair,
   ReceiptBrowserTrace,
   ReceiptOobEvent,
   ReceiptTranscript,
@@ -192,6 +193,7 @@ export interface HostExchangeFact {
   readonly requestPlaneVaultScrubbed?: boolean
   readonly hostExpressionChallenge?: HostMintedExpressionChallenge
   readonly hostTimingChallenge?: HostMintedTimingChallenge
+  readonly hostBooleanPair?: HostStampedBooleanPair
   readonly hostRedirectCanaryHost?: string | null
   readonly oobCallbacks: readonly HostOobCallbackFact[]
   readonly durationMs: number
@@ -242,6 +244,7 @@ export interface HostExchangeFactInput {
   raceBatchId?: string | null
   hostExpressionChallenge?: HostMintedExpressionChallenge
   hostTimingChallenge?: HostMintedTimingChallenge
+  hostBooleanPair?: HostStampedBooleanPair
   hostRedirectCanaryHost?: string | null
   oobCallbacks?: readonly HostOobCallbackFact[]
   durationMs?: number
@@ -887,6 +890,7 @@ export class HostFactLog {
       ...(requestPlaneVaultScrubbed ? { requestPlaneVaultScrubbed: true } : {}),
       ...(input.hostExpressionChallenge ? { hostExpressionChallenge: Object.freeze({ ...input.hostExpressionChallenge }) } : {}),
       ...(input.hostTimingChallenge ? { hostTimingChallenge: Object.freeze({ ...input.hostTimingChallenge }) } : {}),
+      ...(input.hostBooleanPair ? { hostBooleanPair: Object.freeze({ ...input.hostBooleanPair }) } : {}),
       ...(input.hostRedirectCanaryHost !== undefined ? { hostRedirectCanaryHost: input.hostRedirectCanaryHost } : {}),
       oobCallbacks,
       durationMs: Math.max(0, Number.isFinite(input.durationMs ?? 0) ? (input.durationMs ?? 0) : 0),
@@ -1184,6 +1188,7 @@ export class HostFactLog {
         ...(fact.requestPlaneVaultScrubbed ? { requestPlaneVaultScrubbed: true } : {}),
         ...(fact.hostExpressionChallenge ? { hostExpressionChallenge: fact.hostExpressionChallenge } : {}),
         ...(fact.hostTimingChallenge ? { hostTimingChallenge: fact.hostTimingChallenge } : {}),
+        ...(fact.hostBooleanPair ? { hostBooleanPair: fact.hostBooleanPair } : {}),
         ...(fact.hostRedirectCanaryHost !== undefined ? { hostRedirectCanaryHost: fact.hostRedirectCanaryHost } : {}),
       }
     })
@@ -1234,6 +1239,7 @@ export class HostFactLog {
       ...(fact.requestPlaneVaultScrubbed ? { requestPlaneVaultScrubbed: true } : {}),
       ...(fact.hostExpressionChallenge ? { hostExpressionChallenge: fact.hostExpressionChallenge } : {}),
       ...(fact.hostTimingChallenge ? { hostTimingChallenge: fact.hostTimingChallenge } : {}),
+      ...(fact.hostBooleanPair ? { hostBooleanPair: fact.hostBooleanPair } : {}),
       ...(fact.hostRedirectCanaryHost !== undefined ? { hostRedirectCanaryHost: fact.hostRedirectCanaryHost } : {}),
       timestampMs: ts,
       actorPersona: fact.actor,
@@ -1335,6 +1341,7 @@ export class HostFactLog {
         ...(entry.raceBatchId !== undefined ? { raceBatchId: entry.raceBatchId } : {}),
         ...(entry.hostExpressionChallenge ? { hostExpressionChallenge: entry.hostExpressionChallenge } : {}),
         ...(entry.hostTimingChallenge ? { hostTimingChallenge: entry.hostTimingChallenge } : {}),
+        ...(entry.hostBooleanPair ? { hostBooleanPair: entry.hostBooleanPair } : {}),
         ...(entry.hostRedirectCanaryHost !== undefined ? { hostRedirectCanaryHost: entry.hostRedirectCanaryHost } : {}),
         durationMs: entry.durationMs ?? step.durationMs ?? 0,
         ...(entry.startedAt !== undefined ? { startedAt: entry.startedAt } : {}),
@@ -1402,6 +1409,7 @@ export class HostFactLog {
         ...(ex.raceBatchId !== undefined ? { raceBatchId: ex.raceBatchId } : {}),
         ...(ex.hostExpressionChallenge ? { hostExpressionChallenge: ex.hostExpressionChallenge } : {}),
         ...(ex.hostTimingChallenge ? { hostTimingChallenge: ex.hostTimingChallenge } : {}),
+        ...(ex.hostBooleanPair ? { hostBooleanPair: ex.hostBooleanPair } : {}),
         ...(ex.hostRedirectCanaryHost !== undefined ? { hostRedirectCanaryHost: ex.hostRedirectCanaryHost } : {}),
         durationMs: ex.durationMs ?? 0,
         ...(ex.startedAt !== undefined ? { startedAt: ex.startedAt } : {}),
@@ -1509,8 +1517,9 @@ export class HostFactLog {
         ...(reqExtra?.raceBatchId ?? hostEntry?.raceBatchId !== undefined
           ? { raceBatchId: reqExtra?.raceBatchId ?? hostEntry?.raceBatchId }
           : {}),
-        ...(hostEntry?.hostExpressionChallenge ? { hostExpressionChallenge: hostEntry.hostExpressionChallenge } : {}),
+        ...(hostEntry?.hostExpressionChallenge ?? record.hostExpressionChallenge ? { hostExpressionChallenge: hostEntry?.hostExpressionChallenge ?? record.hostExpressionChallenge } : {}),
         ...(hostEntry?.hostTimingChallenge ? { hostTimingChallenge: hostEntry.hostTimingChallenge } : {}),
+        ...(hostEntry?.hostBooleanPair ?? record.hostBooleanPair ? { hostBooleanPair: hostEntry?.hostBooleanPair ?? record.hostBooleanPair } : {}),
         ...(hostEntry?.hostRedirectCanaryHost !== undefined ? { hostRedirectCanaryHost: hostEntry.hostRedirectCanaryHost } : {}),
         durationMs: record.durationMs,
         startedAt: record.startedAt,
