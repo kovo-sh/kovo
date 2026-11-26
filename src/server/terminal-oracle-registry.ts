@@ -130,6 +130,10 @@ export interface TerminalOraclePolicyContext {
   environmentMode?: PublicnessReplayEnvironmentMode
   /** R3-17: Optional per-run finite budget ledger for active publicness replay checks. */
   publicnessReplayBudget?: PublicnessReplayBudgetLedger
+  /** R3-17: Optional active unauthenticated replay probe executor gated by `publicnessReplayBudget`. */
+  publicnessReplayProbe?: (target: { method: string; route: string }) => ImpactStep | null
+  /** R3-17: Fail closed when active publicness replay is denied by budget or `prod_readonly` policy. */
+  failClosedOnPublicnessReplayDenied?: boolean
   /** R3-17: Optional observer invoked whenever a spec-driven kernel stage executes. */
   onKernelStageExecuted?: (event: {
     stage: 'control_legitimacy' | 'must_be_non_public'
@@ -333,41 +337,31 @@ function runSingleHopPreOracleStages(
   const probeEntry = cited.find(e => e.step.arm === 'probe' && typeof e.step.status === 'number' && e.step.status >= 200 && e.step.status < 300)
     ?? cited.find(e => e.step.arm === 'probe')
     ?? null
-  const deniedControls = cited.filter(e => e.step.arm === 'control' && (e.step.status === 401 || e.step.status === 403))
+  const citedControls = cited.filter(e => e.step.arm === 'control')
 
   if (specDeclaresDeniedControl(spec)) {
     const allExchanges = allEntries.map(transcriptEntryToControlExchange)
     const probeEx = probeEntry ? transcriptEntryToControlExchange(probeEntry) : null
-    if (deniedControls.length > 0) {
-      for (const ctl of deniedControls) {
-        const res = assertLegitimateControl({
-          spec,
-          control: transcriptEntryToControlExchange(ctl),
-          probe: probeEx,
-          allEntries: allExchanges,
-          requireAnonymousAblation: false,
-        })
-        policy.onKernelStageExecuted?.({ stage: 'control_legitimacy', specId: spec.id, ok: res.ok, reason: res.reason })
-        if (!res.ok) {
-          return {
-            confirmed: false,
-            vulnClass: receipt.vulnClass,
-            rule,
-            reason: res.reason,
-            observed: receipt.claimedDelta,
-            expected: 'a legitimate negative control satisfying the spec control contract',
-            evidence: { rejectedBy: res.rejectedBy ?? 'control_legitimacy', specId: spec.id },
-          }
-        }
+    if (citedControls.length === 0) {
+      const reason = `Control legitimacy rejected (${spec.id}): receipt cites zero negative-control exchanges (fail-closed).`
+      policy.onKernelStageExecuted?.({ stage: 'control_legitimacy', specId: spec.id, ok: false, reason })
+      return {
+        confirmed: false,
+        vulnClass: receipt.vulnClass,
+        rule,
+        reason,
+        observed: receipt.claimedDelta,
+        expected: 'a legitimate negative control satisfying the spec control contract',
+        evidence: { rejectedBy: 'missing_negative_control', specId: spec.id },
       }
-    } else if (cited.length > 0) {
-      const firstCtrl = cited.find(e => e.step.arm === 'control') ?? cited[0]!
+    }
+    for (const ctl of citedControls) {
       const res = assertLegitimateControl({
         spec,
-        control: transcriptEntryToControlExchange(firstCtrl),
+        control: transcriptEntryToControlExchange(ctl),
         probe: probeEx,
         allEntries: allExchanges,
-        requireAnonymousAblation: false,
+        requireAnonymousAblation: spec.id === 'auth_bypass',
       })
       policy.onKernelStageExecuted?.({ stage: 'control_legitimacy', specId: spec.id, ok: res.ok, reason: res.reason })
       if (!res.ok) {
@@ -392,6 +386,8 @@ function runSingleHopPreOracleStages(
       replayBudget: policy.publicnessReplayBudget,
       runId: policy.runId,
       environmentMode: policy.environmentMode,
+      replayProbe: policy.publicnessReplayProbe,
+      failClosedOnReplayDenied: policy.failClosedOnPublicnessReplayDenied,
     })
     policy.onKernelStageExecuted?.({ stage: 'must_be_non_public', specId: spec.id, ok: pub.passed, reason: pub.reason })
     if (!pub.passed) {
@@ -495,52 +491,74 @@ function defaultV8FamilyHandler(
     }
   }
   const v8Spec = DEFAULT_ORACLE_SPEC_REGISTRY.get(`v8:${family}`)
-  if (v8Spec) {
-    const stageCtx = extractV8KernelStageContext(family, hydrated, idx)
-    if (specDeclaresDeniedControl(v8Spec) && stageCtx.controls.length > 0) {
-      for (const ctl of stageCtx.controls) {
-        const ctlRes = assertLegitimateControl({
-          spec: v8Spec,
-          control: ctl,
-          probe: stageCtx.probe,
-          allEntries: stageCtx.allExchanges,
-          requireAnonymousAblation: false,
-        })
-        policy.onKernelStageExecuted?.({ stage: 'control_legitimacy', specId: v8Spec.id, ok: ctlRes.ok, reason: ctlRes.reason })
-        if (!ctlRes.ok) {
-          return {
-            family,
-            required: true,
-            satisfied: false,
-            reason: ctlRes.reason,
-            evidence: { rejectedBy: ctlRes.rejectedBy ?? 'control_legitimacy', specId: v8Spec.id },
-          }
-        }
+  if (!v8Spec) {
+    const reason = `Unregistered v8 oracle spec "v8:${family}" in DEFAULT_ORACLE_SPEC_REGISTRY (fail-closed).`
+    policy.onKernelStageExecuted?.({ stage: 'control_legitimacy', specId: `v8:${family}`, ok: false, reason })
+    return {
+      family,
+      required: true,
+      satisfied: false,
+      reason,
+      evidence: { rejectedBy: 'unregistered_v8_spec', specId: `v8:${family}` },
+    }
+  }
+  const stageCtx = extractV8KernelStageContext(family, hydrated, idx)
+  if (specDeclaresDeniedControl(v8Spec)) {
+    if (stageCtx.controls.length === 0) {
+      const reason = `Control legitimacy rejected (${v8Spec.id}): zero resolvable negative-control exchanges for denied-control spec (fail-closed).`
+      policy.onKernelStageExecuted?.({ stage: 'control_legitimacy', specId: v8Spec.id, ok: false, reason })
+      return {
+        family,
+        required: true,
+        satisfied: false,
+        reason,
+        evidence: { rejectedBy: 'missing_negative_control', specId: v8Spec.id },
       }
     }
-    if (specRequiresNonPublic(v8Spec)) {
-      const pubRes = evaluateMustBeNonPublicStage({
+    for (const ctl of stageCtx.controls) {
+      const ctlRes = assertLegitimateControl({
         spec: v8Spec,
-        steps: stageCtx.allSteps,
-        probe: stageCtx.probeStep,
-        replayBudget: policy.publicnessReplayBudget,
-        runId: policy.runId,
-        environmentMode: policy.environmentMode,
+        control: ctl,
+        probe: stageCtx.probe,
+        allEntries: stageCtx.allExchanges,
+        requireAnonymousAblation: false,
       })
-      policy.onKernelStageExecuted?.({ stage: 'must_be_non_public', specId: v8Spec.id, ok: pubRes.passed, reason: pubRes.reason })
-      if (!pubRes.passed) {
+      policy.onKernelStageExecuted?.({ stage: 'control_legitimacy', specId: v8Spec.id, ok: ctlRes.ok, reason: ctlRes.reason })
+      if (!ctlRes.ok) {
         return {
           family,
           required: true,
           satisfied: false,
-          reason: pubRes.reason,
-          evidence: {
-            rejectedBy: 'publicness',
-            specId: v8Spec.id,
-            ...(pubRes.referenceId ? { publicnessReferenceId: pubRes.referenceId } : {}),
-            ...(pubRes.replayTelemetry ? { publicnessReplayTelemetry: pubRes.replayTelemetry } : {}),
-          },
+          reason: ctlRes.reason,
+          evidence: { rejectedBy: ctlRes.rejectedBy ?? 'control_legitimacy', specId: v8Spec.id },
         }
+      }
+    }
+  }
+  if (specRequiresNonPublic(v8Spec)) {
+    const pubRes = evaluateMustBeNonPublicStage({
+      spec: v8Spec,
+      steps: stageCtx.allSteps,
+      probe: stageCtx.probeStep,
+      replayBudget: policy.publicnessReplayBudget,
+      runId: policy.runId,
+      environmentMode: policy.environmentMode,
+      replayProbe: policy.publicnessReplayProbe,
+      failClosedOnReplayDenied: policy.failClosedOnPublicnessReplayDenied,
+    })
+    policy.onKernelStageExecuted?.({ stage: 'must_be_non_public', specId: v8Spec.id, ok: pubRes.passed, reason: pubRes.reason })
+    if (!pubRes.passed) {
+      return {
+        family,
+        required: true,
+        satisfied: false,
+        reason: pubRes.reason,
+        evidence: {
+          rejectedBy: 'publicness',
+          specId: v8Spec.id,
+          ...(pubRes.referenceId ? { publicnessReferenceId: pubRes.referenceId } : {}),
+          ...(pubRes.replayTelemetry ? { publicnessReplayTelemetry: pubRes.replayTelemetry } : {}),
+        },
       }
     }
   }
@@ -616,7 +634,7 @@ export class TerminalOracleRegistry {
     pointerRef: TerminalOraclePointerRef,
     policyContext: TerminalOraclePolicyContext = {},
   ): TerminalOracleResult {
-    const effectivePolicy: TerminalOraclePolicyContext = policyContext.publicnessReplayBudget ? policyContext : { ...policyContext, publicnessReplayBudget: this.defaultPublicnessReplayBudget }
+    const effectivePolicy: TerminalOraclePolicyContext = policyContext.publicnessReplayBudget || (!policyContext.runId && !policyContext.publicnessReplayProbe) ? policyContext : { ...policyContext, publicnessReplayBudget: this.defaultPublicnessReplayBudget }
     if (pointerRef.kind === 'v8_family') {
       const handler = this.v8Families.get(pointerRef.family)
       if (!handler) throw new UnregisteredTerminalOracleError(`Unregistered v8 oracle family "${pointerRef.family}" in TerminalOracleRegistry (fail-closed; no fallback evaluator).`)

@@ -33,7 +33,10 @@ export interface NormalizeCarrierOptions {
    * - `'reject'`: immediately throws `MalformedCarrierError`.
    */
   malformedMode?: 'flag' | 'reject'
-  /** When true, malformed JSON syntax in a JSON-shaped body also triggers `malformedEscape`. */
+  /**
+   * When true (default), malformed JSON syntax in a JSON-shaped body also triggers `malformedEscape`
+   * so malformed JSON never silently passes as non-echoed (`R3-17` B3). Pass `false` to opt out.
+   */
   strictJson?: boolean
 }
 
@@ -96,6 +99,12 @@ export interface SignedUrlResponseInput {
   responseJson?: unknown
   responseHeaders?: Record<string, string> | null
 }
+
+/**
+ * Single authoritative regex for authentication, session, bypass, and signature request headers
+ * shared by `control-legitimacy.ts` and `publicness.ts` (`R3-17`).
+ */
+export const AUTH_OR_BYPASS_HEADER_RE = /^(?:authorization|proxy-authorization|cookie|x-api-key|api-key|x-auth(?:[-_][a-z0-9-]+)?|x-access-token|x-token|x-session(?:[-_][a-z0-9-]+)?|x-user(?:[-_][a-z0-9-]+)?|x-forwarded-(?:user|for|host|proto)|x-original-url|x-rewrite-url|x-real-ip|x-admin|x-role|x-roles|x-impersonate|x-internal(?:[-_][a-z0-9-]+)?|x-bypass(?:[-_][a-z0-9-]+)?|x-custom-ip-authorization|x-remote-user|x-signature|x-hub-signature(?:[-_][a-z0-9-]+)?)$/i
 
 const TRANSPORT_HEADER_NAME_RE = /^(?:host|content-length|content-type|accept|accept-encoding|accept-language|connection|user-agent|date|cache-control|pragma|upgrade-insecure-requests|sec-fetch-[a-z-]+)$/i
 const SIGNED_URL_SIG_PARAM_RE = /^(?:x-goog-signature|x-amz-signature|signature|sig)$/i
@@ -374,6 +383,100 @@ function extractBodyTextFromInput(input: RequestCarrierInput): string {
   return ''
 }
 
+type CarrierPushFn = (raw: string, opts: { plusAsSpace: boolean; strictBarePercent: boolean; decodePct?: boolean }) => string
+
+function ingestCarrierHeaders(
+  headers: Readonly<Record<string, string>> | null | undefined,
+  decodePercent: boolean,
+  pushInput: CarrierPushFn,
+  out: {
+    headerLines: string[]
+    transportHeaderComponents: string[]
+    comparables: string[]
+    alnumCores: string[]
+    setMalformed: (reason: string) => void
+  },
+): string {
+  let contentType = ''
+  for (const [k, v] of Object.entries(headers ?? {})) {
+    const lk = k.trim().toLowerCase()
+    const sv = String(v ?? '')
+    out.headerLines.push(`${k}:${sv}`)
+    if (lk === 'content-type') contentType = sv.toLowerCase()
+    if (TRANSPORT_HEADER_NAME_RE.test(lk)) {
+      if (sv) {
+        out.transportHeaderComponents.push(sv)
+        const frag = normalizeFragment(sv, { decodePercent, plusAsSpace: false, strictBarePercent: false })
+        if (frag.malformedReason) out.setMalformed(frag.malformedReason)
+        if (frag.decoded !== sv) out.transportHeaderComponents.push(frag.decoded)
+        if (frag.comparable) out.comparables.push(frag.comparable)
+        if (frag.alnumCore) out.alnumCores.push(frag.alnumCore)
+      }
+    } else if (sv) {
+      pushInput(sv, { plusAsSpace: false, strictBarePercent: false })
+    }
+  }
+  return contentType
+}
+
+function ingestCarrierBody(
+  input: RequestCarrierInput,
+  rawBody: string,
+  contentType: string,
+  strictJson: boolean,
+  pushInput: CarrierPushFn,
+  out: {
+    inputComponents: string[]
+    params: Record<string, string>
+    setMalformed: (reason: string) => void
+  },
+): boolean {
+  let malformedJson = false
+  if (rawBody) {
+    const trimmed = rawBody.trim()
+    const isForm = contentType.includes('application/x-www-form-urlencoded')
+      || (!contentType.includes('json') && !trimmed.startsWith('{') && !trimmed.startsWith('[') && !trimmed.startsWith('<') && !trimmed.startsWith('--') && trimmed.includes('=') && !trimmed.includes('\n'))
+    const looksJson = contentType.includes('json') || trimmed.startsWith('{') || trimmed.startsWith('[')
+    if (isForm) {
+      for (const pair of rawBody.split('&')) {
+        if (!pair) continue
+        const eq = pair.indexOf('=')
+        const rk = eq >= 0 ? pair.slice(0, eq) : pair
+        const rv = eq >= 0 ? pair.slice(eq + 1) : ''
+        const dk = pushInput(rk, { plusAsSpace: true, strictBarePercent: true })
+        const dv = eq >= 0 ? pushInput(rv, { plusAsSpace: true, strictBarePercent: true }) : ''
+        if (dk) out.params[`body:${dk}`] = dv
+      }
+    } else if (looksJson) {
+      const rawUni = decodeUnicodeAndBackslashEscapes(rawBody)
+      if (rawUni.malformedReason) {
+        out.setMalformed(rawUni.malformedReason)
+      } else if (rawUni.decoded !== rawBody) {
+        out.inputComponents.push(rawUni.decoded)
+      }
+      try {
+        const parsed = JSON.parse(rawBody)
+        const leaves: string[] = []
+        collectJsonLeavesWithPaths(parsed, leaves, out.params)
+        for (const leaf of leaves) pushInput(leaf, { plusAsSpace: false, strictBarePercent: false })
+        pushInput(rawBody, { plusAsSpace: false, strictBarePercent: false, decodePct: false })
+      } catch {
+        malformedJson = true
+        if (strictJson) out.setMalformed('malformed_json_body')
+        pushInput(rawBody, { plusAsSpace: false, strictBarePercent: false })
+      }
+    } else {
+      out.params['body:$'] = rawBody
+      pushInput(rawBody, { plusAsSpace: false, strictBarePercent: false })
+    }
+  } else if (input.requestJson !== undefined && typeof input.requestJson !== 'string') {
+    const leaves: string[] = []
+    collectJsonLeavesWithPaths(input.requestJson, leaves, out.params)
+    for (const leaf of leaves) pushInput(leaf, { plusAsSpace: false, strictBarePercent: false })
+  }
+  return malformedJson
+}
+
 /**
  * THE single canonical fail-closed request carrier normalizer (`R3-17`, merging `R4-C-2`, `R4-C-3`, `R4-C-6`).
  *
@@ -388,6 +491,7 @@ export function normalizeRequestCarrier(
   options?: NormalizeCarrierOptions,
 ): NormalizedRequestCarrier {
   const decodePercent = options?.decodePercent !== false
+  const strictJson = options?.strictJson !== false
   if (typeof input === 'string') {
     const frag = normalizeFragment(input, { decodePercent, plusAsSpace: false, strictBarePercent: true })
     const malformedEscape = frag.malformedReason !== null
@@ -413,10 +517,11 @@ export function normalizeRequestCarrier(
   const comparables: string[] = []
   const alnumCores: string[] = []
   const params: Record<string, string> = {}
+  const headerLines: string[] = []
   let malformedReason: string | null = null
-  let malformedJson = false
+  const setMalformed = (reason: string) => { malformedReason ??= reason }
 
-  const pushInput = (raw: string, opts: { plusAsSpace: boolean; strictBarePercent: boolean; decodePct?: boolean }): string => {
+  const pushInput: CarrierPushFn = (raw, opts) => {
     if (!raw) return ''
     inputComponents.push(raw)
     const frag = normalizeFragment(raw, {
@@ -424,7 +529,7 @@ export function normalizeRequestCarrier(
       plusAsSpace: opts.plusAsSpace,
       strictBarePercent: opts.strictBarePercent,
     })
-    if (frag.malformedReason) malformedReason ??= frag.malformedReason
+    if (frag.malformedReason) setMalformed(frag.malformedReason)
     if (frag.decoded !== raw) inputComponents.push(frag.decoded)
     if (frag.comparable) comparables.push(frag.comparable)
     if (frag.alnumCore) alnumCores.push(frag.alnumCore)
@@ -454,80 +559,31 @@ export function normalizeRequestCarrier(
     }
   }
 
-  let contentType = ''
-  const headerLines: string[] = []
-  for (const [k, v] of Object.entries(input.requestHeaders ?? {})) {
-    const lk = k.trim().toLowerCase()
-    const sv = String(v ?? '')
-    headerLines.push(`${k}:${sv}`)
-    if (lk === 'content-type') contentType = sv.toLowerCase()
-    if (TRANSPORT_HEADER_NAME_RE.test(lk)) {
-      if (sv) transportHeaderComponents.push(sv)
-    } else if (sv) {
-      pushInput(sv, { plusAsSpace: false, strictBarePercent: false })
-    }
-  }
-
+  const contentType = ingestCarrierHeaders(input.requestHeaders, decodePercent, pushInput, {
+    headerLines,
+    transportHeaderComponents,
+    comparables,
+    alnumCores,
+    setMalformed,
+  })
   const rawBody = extractBodyTextFromInput(input)
-  if (rawBody) {
-    const trimmed = rawBody.trim()
-    const isForm = contentType.includes('application/x-www-form-urlencoded')
-      || (!contentType.includes('json') && !trimmed.startsWith('{') && !trimmed.startsWith('[') && !trimmed.startsWith('<') && !trimmed.startsWith('--') && trimmed.includes('=') && !trimmed.includes('\n'))
-    const looksJson = contentType.includes('json') || trimmed.startsWith('{') || trimmed.startsWith('[') || trimmed.startsWith('"')
-    if (isForm) {
-      for (const pair of rawBody.split('&')) {
-        if (!pair) continue
-        const eq = pair.indexOf('=')
-        const rk = eq >= 0 ? pair.slice(0, eq) : pair
-        const rv = eq >= 0 ? pair.slice(eq + 1) : ''
-        const dk = pushInput(rk, { plusAsSpace: true, strictBarePercent: true })
-        const dv = eq >= 0 ? pushInput(rv, { plusAsSpace: true, strictBarePercent: true }) : ''
-        if (dk) params[`body:${dk}`] = dv
-      }
-    } else if (looksJson) {
-      const rawUni = decodeUnicodeAndBackslashEscapes(rawBody)
-      if (rawUni.malformedReason) {
-        malformedReason ??= rawUni.malformedReason
-      } else if (rawUni.decoded !== rawBody) {
-        inputComponents.push(rawUni.decoded)
-      }
-      try {
-        const parsed = JSON.parse(rawBody)
-        const leaves: string[] = []
-        collectJsonLeavesWithPaths(parsed, leaves, params)
-        for (const leaf of leaves) pushInput(leaf, { plusAsSpace: false, strictBarePercent: false })
-        pushInput(rawBody, { plusAsSpace: false, strictBarePercent: false, decodePct: false })
-      } catch {
-        malformedJson = true
-        if (options?.strictJson) malformedReason ??= 'malformed_json_body'
-        pushInput(rawBody, { plusAsSpace: false, strictBarePercent: false })
-      }
-    } else {
-      params['body:$'] = rawBody
-      pushInput(rawBody, { plusAsSpace: false, strictBarePercent: false })
-    }
-  } else if (input.requestJson !== undefined && typeof input.requestJson !== 'string') {
-    const leaves: string[] = []
-    collectJsonLeavesWithPaths(input.requestJson, leaves, params)
-    for (const leaf of leaves) pushInput(leaf, { plusAsSpace: false, strictBarePercent: false })
-  }
-
-  const combinedDecoded = inputComponents.join('\n')
-  const combinedComparable = comparables.join(' ').replace(/\s+/g, ' ').trim()
-  const combinedAlnum = alnumCores.join('')
-  const rawConcat = `${pq}\n${headerLines.join('\n')}\n${rawBody}`.slice(0, 64 * 1024)
+  const malformedJson = ingestCarrierBody(input, rawBody, contentType, strictJson, pushInput, {
+    inputComponents,
+    params,
+    setMalformed,
+  })
 
   return finalizeCarrier({
-    raw: rawConcat,
+    raw: `${pq}\n${headerLines.join('\n')}\n${rawBody}`.slice(0, 64 * 1024),
     malformedEscape: malformedReason !== null,
     hadMalformedPercentEscape: malformedReason !== null,
     malformedReason,
     malformedJson,
     inputComponents,
     transportHeaderComponents,
-    combinedDecoded,
-    comparable: combinedComparable,
-    alnumCore: combinedAlnum,
+    combinedDecoded: inputComponents.join('\n'),
+    comparable: comparables.join(' ').replace(/\s+/g, ' ').trim(),
+    alnumCore: alnumCores.join(''),
     comparables,
     alnumCores,
     params,

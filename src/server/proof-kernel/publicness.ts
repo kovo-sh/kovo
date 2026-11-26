@@ -19,13 +19,19 @@
  */
 
 import type { OracleSpec } from '../oracle-spec.ts'
+import { registerRunDisposer } from '../run-disposers.ts'
 import {
   RUN_SAFETY_BUDGET_DEFAULTS,
   RUN_SAFETY_BUDGET_ENV_KEYS,
   RUN_SAFETY_BUDGET_HARD_CEILINGS,
   resolveBoundedBudgetCap,
 } from '../run-safety-budgets.ts'
-import { flattenJson } from './reflection.ts'
+import {
+  AUTH_OR_BYPASS_HEADER_RE,
+  flattenJson,
+  hasTraversalOrSeparatorDifferential,
+  normalizeRequestCarrier,
+} from './reflection.ts'
 import type { ActorIdentity, ImpactStep, RegisteredCanaryMarker } from '../oracle-invariants.ts'
 
 export type PublicnessReplayEnvironmentMode = 'prod_readonly' | 'staging_isolated' | 'ephemeral_lab'
@@ -43,6 +49,7 @@ export interface PublicnessReplayTelemetry {
     | 'budget_exhausted_route'
     | 'prod_readonly_non_read_method'
     | 'non_read_method'
+    | 'missing_run_id'
     | 'not_applicable'
     | null
   readonly truncated: boolean
@@ -66,6 +73,17 @@ export interface PublicnessStageInput {
   readonly replayBudget?: PublicnessReplayBudgetLedger
   readonly runId?: string
   readonly environmentMode?: PublicnessReplayEnvironmentMode
+  /**
+   * Optional active unauthenticated replay probe executor invoked ONLY when `replayBudget.admit()`
+   * returns `allowed: true` (`R3-17` B2b). Never invoked under `prod_readonly` for non-read methods
+   * or after budget exhaustion.
+   */
+  readonly replayProbe?: (target: { method: string; route: string }) => ImpactStep | null
+  /**
+   * When `true`, denying an active replay via `replayBudget.admit()` (`allowed: false`) fails closed
+   * (`passed: false`) instead of proceeding with transcript-only evidence.
+   */
+  readonly failClosedOnReplayDenied?: boolean
 }
 
 export interface PublicnessStageResult {
@@ -76,6 +94,8 @@ export interface PublicnessStageResult {
   readonly specId: string
   readonly reason: string
   readonly referenceId?: string
+  readonly replayExecuted?: boolean
+  readonly replaySkipped?: boolean
   readonly replayTelemetry?: PublicnessReplayTelemetry
 }
 
@@ -274,11 +294,25 @@ export function assessPublicness(args: {
   return { public: false, reason: '' }
 }
 
+const registeredPublicnessBudgetRefs = new Set<WeakRef<PublicnessReplayBudgetLedger>>()
+
+registerRunDisposer('proof-kernel:publicness-replay-budget', (runId: string) => {
+  for (const ref of [...registeredPublicnessBudgetRefs]) {
+    const ledger = ref.deref()
+    if (!ledger) {
+      registeredPublicnessBudgetRefs.delete(ref)
+    } else {
+      ledger.delete(runId)
+    }
+  }
+})
+
 /**
  * Per-run, per-route finite budget ledger for active publicness replay probes (`R3-17`).
- * Enforces `run-safety-budgets.ts` caps (`maxPublicnessReplaysPerRun`, `maxPublicnessReplaysPerRoute`)
- * and strictly respects `prod_readonly` (zero mutating/non-read publicness probes; bounded GET/HEAD
- * probes with structured truncation telemetry).
+ * Enforces `run-safety-budgets.ts` caps (`maxPublicnessReplaysPerRun`, `maxPublicnessReplaysPerRoute`),
+ * strictly respects `prod_readonly` (zero mutating/non-read publicness probes; bounded GET/HEAD
+ * probes with structured truncation telemetry), and automatically evicts per-run state via
+ * `registerRunDisposer()` in `src/server/run-disposers.ts`.
  */
 export class PublicnessReplayBudgetLedger {
   private readonly runCounts = new Map<string, number>()
@@ -295,6 +329,7 @@ export class PublicnessReplayBudgetLedger {
     this.maxPerRunOverride = options.maxPerRun
     this.maxPerRouteOverride = options.maxPerRoute
     this.env = options.env
+    registeredPublicnessBudgetRefs.add(new WeakRef(this))
   }
 
   private resolveCaps(): { runCap: number; routeCap: number } {
@@ -325,7 +360,19 @@ export class PublicnessReplayBudgetLedger {
   }): PublicnessReplayTelemetry {
     const environmentMode: PublicnessReplayEnvironmentMode = input.environmentMode ?? 'prod_readonly'
     const { runCap, routeCap } = this.resolveCaps()
-    const runKey = input.runId.trim() || 'default'
+    const runKey = input.runId.trim()
+    if (!runKey) {
+      return {
+        allowed: false,
+        skippedReason: 'missing_run_id',
+        truncated: false,
+        runCount: 0,
+        runCap,
+        routeCount: 0,
+        routeCap,
+        environmentMode,
+      }
+    }
     const routeKey = `${runKey}::${input.route.split('?')[0]!.replace(/\/+$/, '').toLowerCase() || '/'}`
     const runCount = this.runCounts.get(runKey) ?? 0
     const routeCount = this.routeCounts.get(routeKey) ?? 0
@@ -382,7 +429,8 @@ export class PublicnessReplayBudgetLedger {
   }
 
   getRunUsage(runId: string): number {
-    return this.runCounts.get(runId.trim() || 'default') ?? 0
+    const key = runId.trim()
+    return key ? (this.runCounts.get(key) ?? 0) : 0
   }
 
   delete(runId?: string): void {
@@ -391,7 +439,8 @@ export class PublicnessReplayBudgetLedger {
       this.routeCounts.clear()
       return
     }
-    const key = runId.trim() || 'default'
+    const key = runId.trim()
+    if (!key) return
     this.runCounts.delete(key)
     for (const rk of [...this.routeCounts.keys()]) {
       if (rk.startsWith(`${key}::`)) this.routeCounts.delete(rk)
@@ -399,7 +448,6 @@ export class PublicnessReplayBudgetLedger {
   }
 }
 
-const AUTH_OR_BYPASS_HEADER_RE = /^(?:authorization|proxy-authorization|cookie|x-api-key|api-key|x-auth(?:[-_][a-z0-9-]+)?|x-access-token|x-token|x-session(?:[-_][a-z0-9-]+)?|x-user(?:[-_][a-z0-9-]+)?|x-forwarded-(?:user|for|host|proto)|x-original-url|x-rewrite-url|x-real-ip|x-admin|x-role|x-roles|x-impersonate|x-internal(?:[-_][a-z0-9-]+)?|x-bypass(?:[-_][a-z0-9-]+)?|x-custom-ip-authorization|x-remote-user|x-signature|x-hub-signature(?:[-_][a-z0-9-]+)?)$/i
 const SIGNED_OR_BYPASS_QUERY_RE = /[?&](?:sig|signature|hmac|mac|token|jwt|auth|access_token|id_token|api_key|apikey|x-amz-signature|x-goog-signature|bypass|impersonate|as_user)=/i
 
 function stepCarriesAuthOrSignatureArtifact(step: ImpactStep): boolean {
@@ -420,12 +468,23 @@ function hasAnonymousSameRoutePublicAccess(
   const probeRoute = normRoute(probe)
   if (!probeRoute || !isSuccessStatus(probe.status)) return { public: false, reason: '' }
   const probeKey = payloadKey(probe)
+  const isUnauthBypassSurface =
+    spec.id === 'impact:signed_url_mint' ||
+    spec.id === 'auth_bypass' ||
+    spec.id === 'v8:cryptographic_scope_replay'
   const isV8OrSignedOrDisclosure =
     spec.kind === 'v8_family' ||
-    spec.id === 'impact:signed_url_mint' ||
-    spec.id === 'impact:disclosure' ||
-    spec.id === 'auth_bypass'
+    isUnauthBypassSurface ||
+    spec.id === 'impact:disclosure'
   if (!isV8OrSignedOrDisclosure) return { public: false, reason: '' }
+
+  const probeCarrier = spec.id === 'impact:signed_url_mint'
+    ? normalizeRequestCarrier({
+        pathAndQuery: probe.pathAndQuery ?? probe.route ?? null,
+        requestJson: probe.requestJson,
+        requestHeaders: probe.requestHeaders ?? null,
+      })
+    : null
 
   for (const step of steps) {
     if (step === probe || step.id === probe.id) continue
@@ -436,17 +495,57 @@ function hasAnonymousSameRoutePublicAccess(
     const sameVerb = step.method.toUpperCase() === probe.method.toUpperCase()
     const readAccess = isReadMethodLocal(step.method)
     if (!sameVerb && !readAccess) continue
+    // On `impact:signed_url_mint` key-traversal proofs, the benign baseline may be an unauthenticated
+    // upload-URL mint when the probe explicitly introduces a path traversal / separator differential
+    // over that baseline. Any non-traversal bare-anonymous 2xx mint still proves publicness (`R3-17` B2c).
+    if (spec.id === 'impact:signed_url_mint' && probeCarrier) {
+      const stepCarrier = normalizeRequestCarrier({
+        pathAndQuery: step.pathAndQuery ?? step.route ?? null,
+        requestJson: step.requestJson,
+        requestHeaders: step.requestHeaders ?? null,
+      })
+      if (hasTraversalOrSeparatorDifferential(stepCarrier, probeCarrier, 'single_param')) continue
+    }
     const anonKey = payloadKey(step)
     const bodyMatches = Boolean(probeKey && anonKey && probeKey === anonKey)
-    if (readAccess || bodyMatches) {
+    // R3-17 B2c: For signed-URL minting, auth_bypass, and cryptographic_scope_replay, any bare-anonymous
+    // same-route same-verb 2xx with a non-empty payload proves public access even when each minted token/URL differs.
+    if (readAccess || bodyMatches || (isUnauthBypassSurface && sameVerb)) {
       return {
         public: true,
         referenceId: step.id,
-        reason: `${spec.id} dismissed (publicness): bare unauthenticated exchange ${step.id} succeeded with ${step.status} on ${probeRoute}, proving the surface is publicly accessible.`,
+        reason: `${spec.id} dismissed (publicness): bare unauthenticated ${step.method.toUpperCase()} exchange ${step.id} succeeded with ${step.status} on ${probeRoute}, proving the surface is publicly accessible.`,
       }
     }
   }
   return { public: false, reason: '' }
+}
+
+function checkRecordedStepsPublicness(
+  input: PublicnessStageInput,
+  steps: readonly ImpactStep[],
+  probe: ImpactStep,
+): { public: boolean; reason: string; referenceId?: string } {
+  const probeMayBeUnauthenticatedBypass =
+    input.spec.id === 'auth_bypass' ||
+    input.spec.id === 'v8:cryptographic_scope_replay' ||
+    input.spec.id === 'impact:signed_url_mint'
+  if (!probeMayBeUnauthenticatedBypass) {
+    const core = assessPublicness({
+      steps,
+      probe,
+      canaryMarkers: input.canaryMarkers,
+      matchCanary: input.matchCanary,
+    })
+    if (core.public) {
+      return {
+        public: true,
+        reason: `${input.spec.id} dismissed (publicness): ${core.reason}.`,
+        ...(core.referenceId ? { referenceId: core.referenceId } : {}),
+      }
+    }
+  }
+  return hasAnonymousSameRoutePublicAccess(input.spec, steps, probe)
 }
 
 /**
@@ -454,6 +553,7 @@ function hasAnonymousSameRoutePublicAccess(
  * Executes for EVERY boundary spec declaring `publicnessPolicy: 'non_public_required'`
  * (`authorization`, `bfla`, `disclosure`, `signed_url_mint`, `auth_bypass`, `v8:dual_tenant_abac`,
  * `v8:temporal_revocation`, `v8:cryptographic_scope_replay`, `v8:cross_surface_pivot`).
+ * Fails closed whenever no 2xx probe can be resolved or when active replay is required and denied.
  */
 export function evaluateMustBeNonPublicStage(input: PublicnessStageInput): PublicnessStageResult {
   if (!specRequiresNonPublic(input.spec)) {
@@ -468,67 +568,68 @@ export function evaluateMustBeNonPublicStage(input: PublicnessStageInput): Publi
   }
 
   const probe = input.probe ?? input.steps.find(s => s.arm === 'probe' && isSuccessStatus(s.status)) ?? null
-  let replayTelemetry: PublicnessReplayTelemetry | undefined
-  if (input.replayBudget && probe) {
-    replayTelemetry = input.replayBudget.admit({
-      runId: input.runId ?? 'default',
-      method: probe.method,
-      route: probe.route ?? probe.pathAndQuery ?? '/',
-      environmentMode: input.environmentMode ?? 'prod_readonly',
-    })
-  }
-
   if (!probe) {
     return {
       required: true,
       executed: true,
-      passed: true,
+      passed: false,
       public: false,
       specId: input.spec.id,
-      reason: 'No 2xx probe step available for recorded publicness check.',
-      ...(replayTelemetry ? { replayTelemetry } : {}),
+      reason: `${input.spec.id} rejected (must_be_non_public): no 2xx probe step available for required non-publicness check (fail-closed).`,
     }
   }
 
-  if (!input.roleDifferential) {
-    // Specs whose probe legitimately runs without a vault persona handle (forged bypass header,
-    // replayed cryptographic token/signature, or unauthenticated signed-URL mint) check sibling
-    // bare-anonymous exchanges rather than flagging the bypassing probe itself as anonymous.
-    const probeMayBeUnauthenticatedBypass =
-      input.spec.id === 'auth_bypass' ||
-      input.spec.id === 'v8:cryptographic_scope_replay' ||
-      input.spec.id === 'impact:signed_url_mint'
-    if (!probeMayBeUnauthenticatedBypass) {
-      const core = assessPublicness({
-        steps: input.steps,
-        probe,
-        canaryMarkers: input.canaryMarkers,
-        matchCanary: input.matchCanary,
-      })
-      if (core.public) {
+  let replayTelemetry: PublicnessReplayTelemetry | undefined
+  let replayExecuted = false
+  let replaySkipped = false
+  let evaluatedSteps: readonly ImpactStep[] = input.steps
+
+  if (input.replayBudget && (input.replayProbe || input.runId)) {
+    replayTelemetry = input.replayBudget.admit({
+      runId: input.runId ?? '',
+      method: probe.method,
+      route: probe.route ?? probe.pathAndQuery ?? '/',
+      environmentMode: input.environmentMode ?? 'prod_readonly',
+    })
+    if (!replayTelemetry.allowed) {
+      replaySkipped = true
+      if (input.failClosedOnReplayDenied) {
         return {
           required: true,
           executed: true,
           passed: false,
-          public: true,
+          public: false,
           specId: input.spec.id,
-          reason: `${input.spec.id} dismissed (publicness): ${core.reason}.`,
-          ...(core.referenceId ? { referenceId: core.referenceId } : {}),
-          ...(replayTelemetry ? { replayTelemetry } : {}),
+          reason: `${input.spec.id} rejected (must_be_non_public): active publicness replay denied (${replayTelemetry.skippedReason ?? 'budget_denied'}).`,
+          replayExecuted: false,
+          replaySkipped: true,
+          replayTelemetry,
         }
       }
+    } else if (input.replayProbe) {
+      const replayedStep = input.replayProbe({
+        method: probe.method,
+        route: probe.route ?? probe.pathAndQuery ?? '/',
+      })
+      replayExecuted = true
+      if (replayedStep) {
+        evaluatedSteps = [...input.steps, replayedStep]
+      }
     }
-    const boundaryAnon = hasAnonymousSameRoutePublicAccess(input.spec, input.steps, probe)
-    if (boundaryAnon.public) {
+  }
+
+  if (!input.roleDifferential) {
+    const verdict = checkRecordedStepsPublicness(input, evaluatedSteps, probe)
+    if (verdict.public) {
       return {
         required: true,
         executed: true,
         passed: false,
         public: true,
         specId: input.spec.id,
-        reason: boundaryAnon.reason,
-        ...(boundaryAnon.referenceId ? { referenceId: boundaryAnon.referenceId } : {}),
-        ...(replayTelemetry ? { replayTelemetry } : {}),
+        reason: verdict.reason,
+        ...(verdict.referenceId ? { referenceId: verdict.referenceId } : {}),
+        ...(replayTelemetry ? { replayExecuted, replaySkipped, replayTelemetry } : {}),
       }
     }
   }
@@ -539,7 +640,9 @@ export function evaluateMustBeNonPublicStage(input: PublicnessStageInput): Publi
     passed: true,
     public: false,
     specId: input.spec.id,
-    reason: 'Non-publicness stage passed.',
-    ...(replayTelemetry ? { replayTelemetry } : {}),
+    reason: replaySkipped
+      ? `Non-publicness stage passed on recorded transcript (active replay skipped: ${replayTelemetry?.skippedReason ?? 'denied'}).`
+      : 'Non-publicness stage passed.',
+    ...(replayTelemetry ? { replayExecuted, replaySkipped, replayTelemetry } : {}),
   }
 }

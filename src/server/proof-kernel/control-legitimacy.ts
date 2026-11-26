@@ -18,6 +18,7 @@ import type { OracleControlContract, OracleSpec, V8OracleFamilyId } from '../ora
 import type { WireCredentialProvenance } from '../host-fact-log.ts'
 import type { ImpactStep, RoleName } from '../oracle-invariants.ts'
 import type { HydratableEntry, HydratableTranscriptIndex } from '../v8-oracle-hydrate.ts'
+import { AUTH_OR_BYPASS_HEADER_RE, normalizeRequestCarrier } from './reflection.ts'
 
 export interface ControlLegitimacyExchange {
   readonly id: string
@@ -61,9 +62,13 @@ export interface ControlLegitimacyResult {
   readonly reason: string
 }
 
-const AUTH_SECURITY_HEADER_RE = /^(?:authorization|proxy-authorization|cookie|x-api-key|api-key|x-auth(?:[-_][a-z0-9-]+)?|x-access-token|x-token|x-session(?:[-_][a-z0-9-]+)?|x-user(?:[-_][a-z0-9-]+)?|x-forwarded-(?:user|for|host|proto)|x-original-url|x-rewrite-url|x-real-ip|x-admin|x-role|x-roles|x-impersonate|x-internal(?:[-_][a-z0-9-]+)?|x-bypass(?:[-_][a-z0-9-]+)?|x-custom-ip-authorization|x-remote-user)$/i
 const BOUNDARY_CREDENTIAL_HEADER_RE = /^(?:authorization|proxy-authorization|cookie|x-api-key|x-auth.*)$/i
 const AUTH_BYPASS_PARAM_KEY_RE = /^(?:token|jwt|auth|access_token|id_token|api_key|apikey|key|session|session_id|sid|role|admin|is_admin|user|user_id|uid|bypass|debug|impersonate|as_user|override)$/i
+const TENANT_OR_PRINCIPAL_PARAM_RE = /^(?:tenant|tenant_?id|org|org_?id|account|account_?id|workspace|workspace_?id|user|user_?id|owner|owner_?id|actor|actor_?id|principal)$/i
+const ROLE_PARAM_RE = /^(?:role|roles|scope)$/i
+const SIG_OR_SCOPE_PARAM_RE = /^(?:sig|signature|hmac|mac|x-amz-signature|x-goog-signature|scope|aud|audience|exp|expires|token|jwt)$/i
+const ROUTE_COLLECTION_SEGMENT_RE = /^(?:tenants|orgs|organizations|users|accounts|workspaces|projects|teams|buckets|repos|customers|clients|members)$/i
+const ROUTE_STATIC_ACTION_RE = /^(?:admin|settings|me|public|health|status|list|search|export|import|batch|create|new|login|logout|auth)$/i
 const SYNTH_INVALID_CRED_RE = /kovo-synth-invalid-/i
 const SEALED_OR_VAULT_MARKER_RE = /\[(?:redacted:cap|persona:[^\]]+:secret)\]/i
 const ROLE_RANK_MAP: Readonly<Record<string, number>> = {
@@ -95,6 +100,66 @@ function canonicalHeaderMap(headers: Readonly<Record<string, string>> | null | u
 
 function normalizeRoutePath(value: string | null | undefined): string {
   return (value ?? '').split('?')[0]!.split('#')[0]!.replace(/\/+$/, '').toLowerCase()
+}
+
+function isDynamicPathSegment(seg: string, prevSeg: string): boolean {
+  if (/^v\d+$/i.test(seg)) return false
+  if (/^\d+$/.test(seg)) return true
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(seg)) return true
+  if (/^[0-9a-f]{16,}$/i.test(seg)) return true
+  if (/^[a-z0-9]+(?:[-_][a-z0-9]+)+$/i.test(seg) && /\d/.test(seg)) return true
+  if (/^[a-z]{1,8}\d+$/i.test(seg)) return true
+  if (ROUTE_COLLECTION_SEGMENT_RE.test(prevSeg) && !ROUTE_STATIC_ACTION_RE.test(seg)) return true
+  return false
+}
+
+function normalizeRouteTemplate(value: string | null | undefined): string {
+  const path = normalizeRoutePath(value)
+  if (!path) return ''
+  const parts = path.split('/').filter(Boolean)
+  const out: string[] = []
+  for (let i = 0; i < parts.length; i += 1) {
+    const seg = parts[i]!
+    const prev = i > 0 ? parts[i - 1]! : ''
+    out.push(isDynamicPathSegment(seg, prev) ? ':id' : seg)
+  }
+  return `/${out.join('/')}`
+}
+
+function extractRawQueryKeys(pathAndQuery: string | null | undefined): Set<string> {
+  const keys = new Set<string>()
+  if (!pathAndQuery) return keys
+  const qIdx = pathAndQuery.indexOf('?')
+  if (qIdx < 0) return keys
+  const raw = pathAndQuery.slice(qIdx + 1).split('#')[0] ?? ''
+  for (const pair of raw.split('&')) {
+    if (!pair) continue
+    const eq = pair.indexOf('=')
+    const rawKey = (eq >= 0 ? pair.slice(0, eq) : pair).trim().toLowerCase()
+    if (rawKey) keys.add(rawKey)
+  }
+  return keys
+}
+
+function extractTopLevelBodyKeys(requestJson: unknown): { hasBody: boolean; keys: Set<string> } {
+  if (requestJson === undefined || requestJson === null || requestJson === '') {
+    return { hasBody: false, keys: new Set() }
+  }
+  let parsed: unknown = requestJson
+  if (typeof requestJson === 'string') {
+    const trimmed = requestJson.trim()
+    if (!trimmed) return { hasBody: false, keys: new Set() }
+    try {
+      parsed = JSON.parse(trimmed)
+    } catch {
+      return { hasBody: true, keys: new Set() }
+    }
+  }
+  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+    const keys = new Set(Object.keys(parsed as Record<string, unknown>).map(k => k.trim().toLowerCase()))
+    return { hasBody: keys.size > 0, keys }
+  }
+  return { hasBody: true, keys: new Set() }
 }
 
 function parseQueryMap(pathAndQuery: string | null | undefined): Record<string, string> {
@@ -259,7 +324,7 @@ export function isBareAnonymousAblationExchange(
   const h = canonicalHeaderMap(entry.requestHeaders)
   if (h.cookie) return false
   for (const [k, v] of Object.entries(h)) {
-    if (AUTH_SECURITY_HEADER_RE.test(k) && v.length > 0) return false
+    if (AUTH_OR_BYPASS_HEADER_RE.test(k) && v.length > 0) return false
   }
   for (const [k, v] of Object.entries(parseQueryMap(entry.pathAndQuery))) {
     if (AUTH_BYPASS_PARAM_KEY_RE.test(k) && v.trim().length > 0) return false
@@ -364,7 +429,7 @@ function checkPriorIssuedLoginToken(
     if (stripped.length >= 12) candidateTokens.add(stripped)
   }
   for (const [k, v] of Object.entries(prbHeaders)) {
-    if (k === 'cookie' || !AUTH_SECURITY_HEADER_RE.test(k)) continue
+    if (k === 'cookie' || !AUTH_OR_BYPASS_HEADER_RE.test(k)) continue
     if (v !== ctlHeaders[k]) addCandidate(v)
   }
   const ctlQuery = parseQueryMap(control.pathAndQuery)
@@ -392,6 +457,109 @@ function checkPriorIssuedLoginToken(
   return null
 }
 
+function isAllowedExtraControlKey(key: string, allowed: ReadonlySet<string>): boolean {
+  if (allowed.has('signature_or_scope') && SIG_OR_SCOPE_PARAM_RE.test(key)) return true
+  if (allowed.has('persona_or_tenant') && TENANT_OR_PRINCIPAL_PARAM_RE.test(key)) return true
+  if (allowed.has('role_privilege') && ROLE_PARAM_RE.test(key)) return true
+  return false
+}
+
+/**
+ * Enforce declarative `contract.differsOnlyIn` request-shape parity between a denied control
+ * and the probe (`R3-17` B1): compares encoding validity, HTTP method, normalized route,
+ * query keys, and body shape, allowing ONLY dimensions declared in `contract.differsOnlyIn`.
+ */
+function checkControlContractParity(
+  control: ControlLegitimacyExchange,
+  probe: ControlLegitimacyExchange | null | undefined,
+  contract: OracleControlContract,
+): string | null {
+  const ctlCarrier = normalizeRequestCarrier({
+    pathAndQuery: control.pathAndQuery ?? control.route ?? null,
+    requestJson: control.requestJson,
+    requestHeaders: control.requestHeaders ?? null,
+  }, { strictJson: true })
+  const prbCarrier = probe ? normalizeRequestCarrier({
+    pathAndQuery: probe.pathAndQuery ?? probe.route ?? null,
+    requestJson: probe.requestJson,
+    requestHeaders: probe.requestHeaders ?? null,
+  }, { strictJson: true }) : null
+  if (ctlCarrier.malformedEscape && !(prbCarrier?.malformedEscape)) {
+    return `Control legitimacy rejected (R3-17): control carries malformed request encoding/JSON (${ctlCarrier.malformedReason ?? 'malformed_carrier'}) absent from the probe (self-sabotaged control).`
+  }
+
+  const isDeniedStatus = typeof control.status === 'number' && control.status >= 400 && control.status < 500
+  if (!probe || !isDeniedStatus) return null
+
+  const allowed = new Set<string>(contract.differsOnlyIn)
+  const allowsArbitraryShape = allowed.has('request_payload') || allowed.has('time_after_revocation')
+
+  // 1. HTTP method parity
+  //    On `denied_unauthorized` mutating write proofs (PATCH/POST/PUT/DELETE), a denied GET/HEAD
+  //    read/publicness probe (401/403/404/405) on the same resource (or parent resource prefix) is
+  //    legitimate pre-write / non-publicness evidence synthesized for mutating endpoints.
+  const ctlMethod = (control.method ?? '').trim().toUpperCase()
+  const prbMethod = (probe.method ?? '').trim().toUpperCase()
+  const isLegitDeniedReadForMutatingProbe =
+    contract.role === 'denied_unauthorized' &&
+    (control.status === 401 || control.status === 403 || control.status === 404 || control.status === 405) &&
+    (ctlMethod === 'GET' || ctlMethod === 'HEAD') &&
+    (prbMethod === 'POST' || prbMethod === 'PUT' || prbMethod === 'PATCH' || prbMethod === 'DELETE')
+  if (!allowsArbitraryShape && ctlMethod && prbMethod && ctlMethod !== prbMethod && !isLegitDeniedReadForMutatingProbe) {
+    return `Control legitimacy rejected (R3-17): denied control method "${ctlMethod}" differs from probe method "${prbMethod}", which is outside contract.differsOnlyIn (${contract.differsOnlyIn.join(', ')}).`
+  }
+
+  // 2. Normalized route parity (exact route for denied_unauthenticated; template parity for denied_unauthorized/denied_tampered)
+  const ctlRouteRaw = control.route ?? control.pathAndQuery
+  const prbRouteRaw = probe.route ?? probe.pathAndQuery
+  if (!allowsArbitraryShape && ctlRouteRaw && prbRouteRaw) {
+    const ctlRoute = contract.role === 'denied_unauthenticated'
+      ? normalizeRoutePath(ctlRouteRaw)
+      : normalizeRouteTemplate(ctlRouteRaw)
+    const prbRoute = contract.role === 'denied_unauthenticated'
+      ? normalizeRoutePath(prbRouteRaw)
+      : normalizeRouteTemplate(prbRouteRaw)
+    const routeMatches = ctlRoute === prbRoute || (
+      isLegitDeniedReadForMutatingProbe &&
+      ctlRoute.length > 1 &&
+      prbRoute.startsWith(`${ctlRoute}/`)
+    )
+    if (ctlRoute && prbRoute && !routeMatches) {
+      return `Control legitimacy rejected (R3-17): denied control route "${ctlRoute}" does not match probe route "${prbRoute}" (outside contract.differsOnlyIn: ${contract.differsOnlyIn.join(', ')}).`
+    }
+  }
+
+  // 3. Query-key parity: reject extraneous query keys added on the denied control absent from the probe
+  if (!allowsArbitraryShape) {
+    const prbQueryKeys = extractRawQueryKeys(probe.pathAndQuery ?? probe.route)
+    const extraQueryKeys = [...extractRawQueryKeys(control.pathAndQuery ?? control.route)].filter(
+      k => !prbQueryKeys.has(k) && !isAllowedExtraControlKey(k, allowed),
+    )
+    if (extraQueryKeys.length > 0) {
+      return `Control legitimacy rejected (R3-17): denied control adds extraneous query parameter(s) [${extraQueryKeys.join(', ')}] absent from the probe (outside contract.differsOnlyIn: ${contract.differsOnlyIn.join(', ')}).`
+    }
+  }
+
+  // 4. Body-shape parity: reject extraneous top-level body keys or control-only bodies absent from the probe
+  if (!allowsArbitraryShape && !allowed.has('signature_or_scope')) {
+    const ctlBody = extractTopLevelBodyKeys(control.requestJson)
+    const prbBody = extractTopLevelBodyKeys(probe.requestJson)
+    if (ctlBody.hasBody && !prbBody.hasBody) {
+      return `Control legitimacy rejected (R3-17): denied control carries a request body absent from the probe (outside contract.differsOnlyIn: ${contract.differsOnlyIn.join(', ')}).`
+    }
+    if (ctlBody.keys.size > 0) {
+      const extraBodyKeys = [...ctlBody.keys].filter(
+        k => !prbBody.keys.has(k) && !isAllowedExtraControlKey(k, allowed),
+      )
+      if (extraBodyKeys.length > 0) {
+        return `Control legitimacy rejected (R3-17): denied control adds extraneous request body field(s) [${extraBodyKeys.join(', ')}] absent from the probe (outside contract.differsOnlyIn: ${contract.differsOnlyIn.join(', ')}).`
+      }
+    }
+  }
+
+  return null
+}
+
 function checkControlSelfSabotage(
   control: ControlLegitimacyExchange,
   probe: ControlLegitimacyExchange | null | undefined,
@@ -410,6 +578,10 @@ function checkControlSelfSabotage(
     return 'Auth bypass rejected (R4-H-7): synthetic invalid credentials are allowed strictly on the probe arm and never as a negative control (self-sabotaged control is not an authentication bypass).'
   }
 
+  // R3-17 B1: Enforce declarative `contract.differsOnlyIn` parity across ALL denied-control specs.
+  const parityErr = checkControlContractParity(control, probe, contract)
+  if (parityErr) return parityErr
+
   // Only `denied_unauthenticated` (and auth/mfa boundary claims) enforce strict zero-extra-auth-on-control;
   // `denied_unauthorized` (BOLA/BFLA/dual-tenant) legitimately has an authenticated denied control,
   // `denied_revoked` (v8:temporal_revocation) legitimately differs in time after revocation, and
@@ -420,7 +592,7 @@ function checkControlSelfSabotage(
     boundaryClass === 'mfa'
   if (!enforceStrictUnauthControl || !probe) return null
 
-  const headerRe = boundaryClass && boundaryClass !== 'access' ? BOUNDARY_CREDENTIAL_HEADER_RE : AUTH_SECURITY_HEADER_RE
+  const headerRe = boundaryClass && boundaryClass !== 'access' ? BOUNDARY_CREDENTIAL_HEADER_RE : AUTH_OR_BYPASS_HEADER_RE
   for (const [k, v] of Object.entries(ctlHeaders)) {
     if (!v) continue
     if (k === 'cookie') {
@@ -526,8 +698,9 @@ export function assertLegitimateControl(input: ControlLegitimacyInput): ControlL
   }
 
   // 2. For `denied_unauthenticated` specs (auth_bypass, signed_url_mint unauth write), reject
-  //    probe host-credential escalations and optionally enforce bare anonymous ablation.
-  if (contract.role === 'denied_unauthenticated' && input.probe && input.boundaryClass !== 'access') {
+  //    probe host-credential escalations on denied controls and optionally enforce bare anonymous ablation.
+  const controlIsDenied = typeof input.control.status !== 'number' || (input.control.status >= 400 && input.control.status < 500)
+  if (contract.role === 'denied_unauthenticated' && input.probe && input.boundaryClass !== 'access' && controlIsDenied) {
     const escalationErr = checkProbeHostCredentialEscalation(
       input.control,
       input.probe,
@@ -659,8 +832,15 @@ export function extractV8KernelStageContext(
         probeEntry = idx.entriesById.get((rec as { id: string }).id)
       }
     }
+    const seenPivotControls = new Set<string>()
+    const preChainCtrl = entryFromField('preChainControlDenied')
+    if (preChainCtrl) {
+      seenPivotControls.add(preChainCtrl.exchangeId)
+      controlEntries.push(preChainCtrl)
+    }
     for (const e of idx.entriesById.values()) {
-      if (e.step.arm === 'control' && (e.step.status === 401 || e.step.status === 403)) {
+      if (e.step.arm === 'control' && !seenPivotControls.has(e.exchangeId)) {
+        seenPivotControls.add(e.exchangeId)
         controlEntries.push(e)
       }
     }

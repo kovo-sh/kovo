@@ -32,6 +32,7 @@ import {
   buildRequestReflectionIndex,
   carrierEchoesSignedUrlNeedles,
   carrierReflectsExpressionOutput,
+  extractSignedUrlNeedlesFromResponse,
   isMatchEchoedFromRequest,
   normalizeRequestCarrier,
 } from '../src/server/proof-kernel/reflection.ts'
@@ -56,6 +57,7 @@ import {
   RUN_SAFETY_BUDGET_HARD_CEILINGS,
   resolveRunSafetyBudgets,
 } from '../src/server/run-safety-budgets.ts'
+import { runAllRunDisposers } from '../src/server/run-disposers.ts'
 import { TerminalOracleRegistry } from '../src/server/terminal-oracle-registry.ts'
 import { verifyBooleanArmBaseParity } from '../src/server/verify-support.ts'
 import { TranscriptStore, evaluateClaim } from '../src/server/verify-claims.ts'
@@ -155,14 +157,32 @@ test('R3-17 reflection: single fail-closed carrier normalizer rejects malformed 
   assert.equal(badUni.malformedEscape, true)
   assert.equal(badUni.malformedReason, 'malformed_unicode_escape')
 
-  // Strict JSON mode rejects broken JSON body
+  // Strict JSON mode is ON by default so malformed JSON bodies fail closed without opting in (R3-17 B3)
   const badJson = normalizeRequestCarrier(
     { pathAndQuery: '/api/items', requestBody: '{"broken":', requestHeaders: { 'content-type': 'application/json' } },
-    { strictJson: true },
   )
   assert.equal(badJson.malformedJson, true)
   assert.equal(badJson.malformedEscape, true)
   assert.equal(badJson.malformedReason, 'malformed_json_body')
+
+  // Worker-controlled transport headers (User-Agent / Accept-Language) remain in comparables so
+  // percent-encoded or case-variant echoes in those headers are caught (R3-17 non-blocking #1)
+  const uaSig = '0123456789ABCDEF0123456789ABCDEF'
+  const uaCarrier = normalizeRequestCarrier({
+    pathAndQuery: '/api/presign',
+    requestHeaders: {
+      'user-agent': `CustomClient/1.0 %30%31%32%33%34%35%36%37%38%39abcdef0123456789abcdef`,
+      'accept-language': 'en-US,en;q=0.9',
+    },
+  })
+  const uaNeedles = extractSignedUrlNeedlesFromResponse({
+    responseBody: `https://storage.example.test/bucket/file?X-Goog-Signature=${uaSig}`,
+  })
+  assert.equal(
+    carrierEchoesSignedUrlNeedles(uaCarrier, uaNeedles),
+    true,
+    'percent-encoded/case-variant signature echoed in User-Agent must be caught',
+  )
 
   // Every echo predicate fails closed (returns true = treated as echoed) on malformed carriers
   assert.equal(
@@ -411,13 +431,32 @@ test('R3-17 publicness stage: executes for 100% of boundary specs and closes dis
   const executedSpecIds = new Set<string>()
   const rejectedSpecIds = new Set<string>()
   for (const spec of boundarySpecs) {
-    const { factLog, controlId, probeId, anonId } = buildFactLogForSpec(spec, { anonymousPublic: true })
     const onKernelStageExecuted = (ev: { stage: string; specId: string; ok: boolean }) => {
       if (ev.stage === 'must_be_non_public') {
         executedSpecIds.add(ev.specId)
         if (!ev.ok) rejectedSpecIds.add(ev.specId)
       }
     }
+    // 1. Clean non-public control pair ensures control_legitimacy passes and must_be_non_public executes for 100% of boundary specs
+    const clean = buildFactLogForSpec(spec, { anonymousPublic: false })
+    if (spec.kind === 'single_hop') {
+      const receipt = buildProofReceipt({
+        vulnClass: spec.canonicalVulnClass,
+        target: { origin: 'https://target.test', method: 'GET', pathAndQuery: '/api/protected/records/42' },
+        exchangeIds: [clean.controlId, clean.probeId],
+        claimedDelta: 'Non-public control pair exercises must_be_non_public stage',
+      })
+      registry.evaluate(clean.factLog, { kind: 'single_hop', receipt }, { onKernelStageExecuted })
+    } else if (spec.v8Family) {
+      registry.evaluate(
+        clean.factLog,
+        { kind: 'v8_family', family: spec.v8Family, rawInput: buildV8RawInputForSpec(spec.v8Family, clean.controlId, clean.probeId) },
+        { onKernelStageExecuted },
+      )
+    }
+
+    // 2. Anonymous 200 public surface MUST reject for 100% of boundary specs
+    const { factLog, controlId, probeId, anonId } = buildFactLogForSpec(spec, { anonymousPublic: true })
     if (spec.kind === 'single_hop') {
       const receipt = buildProofReceipt({
         vulnClass: spec.canonicalVulnClass,
@@ -437,7 +476,7 @@ test('R3-17 publicness stage: executes for 100% of boundary specs and closes dis
     }
   }
 
-  assert.equal(executedSpecIds.size, boundarySpecs.length, 'must_be_non_public must execute for 100% of boundary specs')
+  assert.equal(executedSpecIds.size, boundarySpecs.length, `must_be_non_public must execute for 100% of boundary specs (missing: ${boundarySpecs.filter(s => !executedSpecIds.has(s.id)).map(s => s.id).join(', ')})`)
   for (const closedGapId of ['impact:disclosure', 'impact:signed_url_mint', 'v8:dual_tenant_abac', 'v8:cryptographic_scope_replay']) {
     assert.ok(rejectedSpecIds.has(closedGapId), `must_be_non_public must actively reject anonymous 200 public access on ${closedGapId}`)
   }
@@ -576,4 +615,277 @@ test('R3-17 boolean-differential consolidation: preserves TP/FP parity and handl
   })
   assert.equal(fpEcho.satisfied, false)
   assert.equal(fpEcho.evidence.echoedOnly, true)
+})
+
+test('R3-17 review guards (B1/B1b/B2): differsOnlyIn parity, fail-closed registry stages, non-read signed-URL publicness & run disposer', () => {
+  const authBypassSpec = DEFAULT_ORACLE_SPEC_REGISTRY.get('auth_bypass')!
+  const authzSpec = DEFAULT_ORACLE_SPEC_REGISTRY.get('impact:authorization')!
+  const signedUrlSpec = DEFAULT_ORACLE_SPEC_REGISTRY.get('impact:signed_url_mint')!
+  assert.equal(specDeclaresDeniedControl(authBypassSpec), true, 'auth_bypass must declare a denied-control contract')
+  assert.equal(specDeclaresDeniedControl(authzSpec), true, 'impact:authorization must declare a denied-control contract')
+
+  // B1: Exact r3-17-claude-bypass-review-fp scenario rejects directly in assertLegitimateControl with self_sabotaged_control
+  const reviewFpRes = assertLegitimateControl({
+    spec: authzSpec,
+    control: {
+      id: 'ctl_wrong_path',
+      method: 'GET',
+      route: '/api/admin/orders/ord-a-1',
+      pathAndQuery: '/api/admin/orders/ord-a-1?filter=%zz',
+      status: 403,
+      actorHandle: 'member_b',
+      actorRole: 'member',
+      actorAuth: 'bearer',
+    },
+    probe: {
+      id: 'prb_own_record',
+      method: 'GET',
+      route: '/api/orders/ord-a-1',
+      pathAndQuery: '/api/orders/ord-a-1',
+      status: 200,
+      actorHandle: 'member_a',
+      actorRole: 'member',
+      actorAuth: 'bearer',
+    },
+  })
+  assert.equal(reviewFpRes.ok, false)
+  assert.equal(reviewFpRes.rejectedBy, 'self_sabotaged_control')
+
+  // B1: Even without malformed %zz, sibling admin path, extra query param, method mismatch, or extra body field all reject
+  const wrongPathOnly = assertLegitimateControl({
+    spec: authzSpec,
+    control: { id: 'c1', method: 'GET', pathAndQuery: '/api/admin/orders/ord-a-1', status: 403, actorHandle: 'member_b' },
+    probe: { id: 'p1', method: 'GET', pathAndQuery: '/api/orders/ord-a-1', status: 200, actorHandle: 'member_a' },
+  })
+  assert.equal(wrongPathOnly.ok, false)
+  assert.equal(wrongPathOnly.rejectedBy, 'self_sabotaged_control')
+
+  const extraQueryOnly = assertLegitimateControl({
+    spec: authzSpec,
+    control: { id: 'c2', method: 'GET', pathAndQuery: '/api/orders/ord-a-1?filter=broken', status: 403, actorHandle: 'member_b' },
+    probe: { id: 'p2', method: 'GET', pathAndQuery: '/api/orders/ord-a-1', status: 200, actorHandle: 'member_a' },
+  })
+  assert.equal(extraQueryOnly.ok, false)
+  assert.equal(extraQueryOnly.rejectedBy, 'self_sabotaged_control')
+
+  const wrongMethod = assertLegitimateControl({
+    spec: authzSpec,
+    control: { id: 'c3', method: 'DELETE', pathAndQuery: '/api/orders/ord-a-1', status: 405, actorHandle: 'member_b' },
+    probe: { id: 'p3', method: 'GET', pathAndQuery: '/api/orders/ord-a-1', status: 200, actorHandle: 'member_a' },
+  })
+  assert.equal(wrongMethod.ok, false)
+  assert.equal(wrongMethod.rejectedBy, 'self_sabotaged_control')
+
+  const extraBodyKey = assertLegitimateControl({
+    spec: authzSpec,
+    control: { id: 'c4', method: 'POST', pathAndQuery: '/api/orders/export', status: 403, actorHandle: 'member_b', requestJson: { id: 'ord-1', sabotage: true } },
+    probe: { id: 'p4', method: 'POST', pathAndQuery: '/api/orders/export', status: 200, actorHandle: 'member_a', requestJson: { id: 'ord-1' } },
+  })
+  assert.equal(extraBodyKey.ok, false)
+  assert.equal(extraBodyKey.rejectedBy, 'self_sabotaged_control')
+
+  // B1: Legitimate same-template sibling BOLA control (differs only in persona/tenant + resource ID) PASSES
+  const legitBola = assertLegitimateControl({
+    spec: authzSpec,
+    control: { id: 'c-ok', method: 'GET', pathAndQuery: '/api/orders/ord-a-1', status: 403, actorHandle: 'member_b' },
+    probe: { id: 'p-ok', method: 'GET', pathAndQuery: '/api/orders/ord-b-2', status: 200, actorHandle: 'member_a' },
+  })
+  assert.equal(legitBola.ok, true, legitBola.reason)
+
+  // B1b: Registry rejects single-hop with zero controls, rejects sabotaged 405 alongside clean 403, and rejects v8 with zero controls
+  const registry = new TerminalOracleRegistry()
+  const noCtrlLog = new HostFactLog()
+  const onlyProbe = noCtrlLog.recordExchange({
+    exchangeId: 'ex-only-probe',
+    origin: 'https://target.test',
+    method: 'GET',
+    pathAndQuery: '/api/orders/ord-a-1',
+    status: 200,
+    arm: 'probe',
+    actor: 'member_a',
+    actorRole: 'member',
+    actorTenant: 'tenant-a',
+    ambientAuth: 'bearer',
+    rawResponseBody: JSON.stringify({ id: 'ord-a-1', tenant: 'tenant-a' }),
+    responseHeaders: { 'content-type': 'application/json' },
+    timestampMs: 1_700_000_001_000,
+  })
+  const noCtrlEvents: Array<{ stage: string; ok: boolean }> = []
+  const noCtrlRes = registry.evaluate(
+    noCtrlLog,
+    {
+      kind: 'single_hop',
+      receipt: buildProofReceipt({
+        vulnClass: 'bola',
+        target: { origin: 'https://target.test', method: 'GET', pathAndQuery: '/api/orders/ord-a-1' },
+        exchangeIds: [onlyProbe.exchangeId],
+        claimedDelta: 'Missing control must fail closed',
+      }),
+    },
+    { onKernelStageExecuted: ev => noCtrlEvents.push({ stage: ev.stage, ok: ev.ok }) },
+  )
+  assert.equal(noCtrlRes.confirmed, false)
+  assert.equal((noCtrlRes.evidence as { rejectedBy?: string } | undefined)?.rejectedBy, 'missing_negative_control')
+  assert.ok(noCtrlEvents.some(e => e.stage === 'control_legitimacy' && e.ok === false))
+
+  const v8NoCtrlEvents: Array<{ stage: string; ok: boolean }> = []
+  const v8NoCtrlRes = registry.evaluate(
+    noCtrlLog,
+    { kind: 'v8_family', family: 'dual_tenant_abac', rawInput: { mode: 'dual_org_cache_bleed', bledAccess: onlyProbe.exchangeId } },
+    { onKernelStageExecuted: ev => v8NoCtrlEvents.push({ stage: ev.stage, ok: ev.ok }) },
+  )
+  assert.equal(v8NoCtrlRes.confirmed, false)
+  assert.equal((v8NoCtrlRes.evidence as { rejectedBy?: string } | undefined)?.rejectedBy, 'missing_negative_control')
+  assert.ok(v8NoCtrlEvents.some(e => e.stage === 'control_legitimacy' && e.ok === false))
+
+  // B1b(c): Single-hop with clean 403 + sabotaged 405 control still checks and rejects the 405 control
+  const mixedCtrlLog = new HostFactLog()
+  const clean403 = mixedCtrlLog.recordExchange({
+    exchangeId: 'ex-c-403',
+    origin: 'https://target.test',
+    method: 'GET',
+    pathAndQuery: '/api/orders/ord-a-1',
+    status: 403,
+    arm: 'control',
+    actor: 'member_b',
+    actorRole: 'member',
+    actorTenant: 'tenant-b',
+    ambientAuth: 'bearer',
+    rawResponseBody: '{"error":"forbidden"}',
+    responseHeaders: { 'content-type': 'application/json' },
+    timestampMs: 1_700_000_001_000,
+  })
+  const bad405 = mixedCtrlLog.recordExchange({
+    exchangeId: 'ex-c-405',
+    origin: 'https://target.test',
+    method: 'DELETE',
+    pathAndQuery: '/api/orders/ord-a-1',
+    status: 405,
+    arm: 'control',
+    actor: 'member_b',
+    actorRole: 'member',
+    actorTenant: 'tenant-b',
+    ambientAuth: 'bearer',
+    rawResponseBody: '{"error":"method not allowed"}',
+    responseHeaders: { 'content-type': 'application/json' },
+    timestampMs: 1_700_000_002_000,
+  })
+  const probeOk = mixedCtrlLog.recordExchange({
+    exchangeId: 'ex-p-200',
+    origin: 'https://target.test',
+    method: 'GET',
+    pathAndQuery: '/api/orders/ord-a-1',
+    status: 200,
+    arm: 'probe',
+    actor: 'member_a',
+    actorRole: 'member',
+    actorTenant: 'tenant-a',
+    ambientAuth: 'bearer',
+    rawResponseBody: '{"id":"ord-a-1","tenant":"tenant-a"}',
+    responseHeaders: { 'content-type': 'application/json' },
+    timestampMs: 1_700_000_003_000,
+  })
+  const mixedRes = registry.evaluate(mixedCtrlLog, {
+    kind: 'single_hop',
+    receipt: buildProofReceipt({
+      vulnClass: 'bola',
+      target: { origin: 'https://target.test', method: 'GET', pathAndQuery: '/api/orders/ord-a-1' },
+      exchangeIds: [clean403.exchangeId, bad405.exchangeId, probeOk.exchangeId],
+      claimedDelta: 'Mixed clean 403 and sabotaged 405 control',
+    }),
+  })
+  assert.equal(mixedRes.confirmed, false)
+  assert.equal((mixedRes.evidence as { rejectedBy?: string } | undefined)?.rejectedBy, 'self_sabotaged_control')
+
+  // B2a: evaluateMustBeNonPublicStage with probe: null MUST fail closed
+  const nullProbePub = evaluateMustBeNonPublicStage({ spec: authzSpec, steps: [], probe: null })
+  assert.equal(nullProbePub.passed, false, 'must_be_non_public must fail closed when probe is null')
+
+  // B2c: Bare-anonymous POST mint 2xx with a DISTINCT signed-URL body on impact:signed_url_mint MUST reject as public
+  const mintProbe: ImpactStep = {
+    id: 'mint-prb',
+    arm: 'probe',
+    method: 'POST',
+    route: '/api/storage/presign',
+    pathAndQuery: '/api/storage/presign',
+    status: 200,
+    actor: { handle: 'member_a', role: 'member', tenant: 'tenant-a', auth: 'bearer', sameSite: null },
+    json: { signedUrl: 'https://storage.example.test/bucket/a?X-Goog-Signature=aaaaaaaaaaaaaaaa1111111111111111' },
+  }
+  const bareAnonMint: ImpactStep = {
+    id: 'mint-anon',
+    arm: 'control',
+    method: 'POST',
+    route: '/api/storage/presign',
+    pathAndQuery: '/api/storage/presign',
+    status: 200,
+    actor: { handle: null, role: null, tenant: null, auth: 'unknown', sameSite: null },
+    json: { signedUrl: 'https://storage.example.test/bucket/b?X-Goog-Signature=bbbbbbbbbbbbbbbb2222222222222222' },
+  }
+  const signedMintPub = evaluateMustBeNonPublicStage({
+    spec: signedUrlSpec,
+    steps: [bareAnonMint, mintProbe],
+    probe: mintProbe,
+  })
+  assert.equal(signedMintPub.passed, false, 'bare-anon POST mint 2xx with distinct signed URL must reject as public')
+  assert.equal(signedMintPub.public, true)
+  assert.equal(signedMintPub.referenceId, 'mint-anon')
+
+  // B2b: Active replay gating + failClosedOnReplayDenied + run-disposer eviction + empty runId rejection
+  const activeLedger = new PublicnessReplayBudgetLedger({ maxPerRun: 2, maxPerRoute: 1 })
+  assert.equal(activeLedger.admit({ runId: '   ', method: 'GET', route: '/api/x' }).skippedReason, 'missing_run_id')
+  let replayCalls = 0
+  const deniedPostReplay = evaluateMustBeNonPublicStage({
+    spec: authzSpec,
+    steps: [],
+    probe: mintProbe,
+    replayBudget: activeLedger,
+    runId: 'run-dispose-1',
+    environmentMode: 'prod_readonly',
+    replayProbe: () => { replayCalls += 1; return null },
+    failClosedOnReplayDenied: true,
+  })
+  assert.equal(replayCalls, 0, 'prod_readonly must NEVER invoke replayProbe for POST')
+  assert.equal(deniedPostReplay.passed, false)
+  assert.equal(deniedPostReplay.replaySkipped, true)
+
+  const getProbe: ImpactStep = {
+    id: 'get-prb',
+    arm: 'probe',
+    method: 'GET',
+    route: '/api/records/7',
+    pathAndQuery: '/api/records/7',
+    status: 200,
+    actor: { handle: 'member_a', role: 'member', tenant: 'tenant-a', auth: 'bearer', sameSite: null },
+    json: { id: 7, title: 'Open catalog item' },
+  }
+  const activeGetRes = evaluateMustBeNonPublicStage({
+    spec: authzSpec,
+    steps: [getProbe],
+    probe: getProbe,
+    replayBudget: activeLedger,
+    runId: 'run-dispose-1',
+    environmentMode: 'prod_readonly',
+    replayProbe: () => {
+      replayCalls += 1
+      return {
+        id: 'replayed-anon',
+        arm: 'control',
+        method: 'GET',
+        route: '/api/records/7',
+        status: 200,
+        actor: { handle: null, role: null, tenant: null, auth: 'unknown', sameSite: null },
+        json: { id: 7, title: 'Open catalog item' },
+      }
+    },
+  })
+  assert.equal(replayCalls, 1)
+  assert.equal(activeGetRes.replayExecuted, true)
+  assert.equal(activeGetRes.passed, false)
+  assert.equal(activeGetRes.public, true)
+  assert.equal(activeLedger.getRunUsage('run-dispose-1'), 1)
+
+  // Per-run disposer cleanly evicts ledger state so no cross-run leak remains
+  runAllRunDisposers('run-dispose-1')
+  assert.equal(activeLedger.getRunUsage('run-dispose-1'), 0)
 })
