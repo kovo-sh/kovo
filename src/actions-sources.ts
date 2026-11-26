@@ -24,19 +24,132 @@ export const updateProjectSpecSchema = z.object({
   content: z.string().min(1).max(maxSpecBytes),
 })
 
+function findActiveProjectRunIds(db: Store, projectId: string): string[] {
+  if (typeof db.listActiveRunIdsForProject === 'function') {
+    return db.listActiveRunIdsForProject(projectId)
+  }
+  const detail = db.projectDetail(projectId)
+  return detail.runs
+    .filter(run => run.isActive || db.isRunActive(run.id))
+    .map(run => run.id)
+}
+
+function assertProjectHasNoActiveRuns(
+  db: Store,
+  projectId: string,
+  action: 're-sync' | 'unlink',
+  repoSlug: string,
+): void {
+  const activeRunIds = findActiveProjectRunIds(db, projectId)
+  if (activeRunIds.length > 0) {
+    throw new Error(
+      `Cannot ${action} repository "${repoSlug}" while project has ${activeRunIds.length} active ${activeRunIds.length === 1 ? 'run' : 'runs'} (${activeRunIds.join(', ')}). Stop active runs first so live worker bind mounts are not corrupted.`,
+    )
+  }
+}
+
+function purgeRepoDerivedSpecs(
+  db: Store,
+  projectId: string,
+  fullName: string,
+  drizzle: typeof import('drizzle-orm'),
+  tables: typeof import('./server/schema.ts'),
+  keepNames?: ReadonlySet<string>,
+): number {
+  const prefix = `${fullName}:`
+  const specs = db.listProjectSpecs(projectId)
+  let removed = 0
+  for (const spec of specs) {
+    if (!spec.name.startsWith(prefix)) continue
+    if (keepNames && keepNames.has(spec.name)) continue
+    db.db
+      .delete(tables.projectSpecs)
+      .where(drizzle.and(
+        drizzle.eq(tables.projectSpecs.projectId, projectId),
+        drizzle.eq(tables.projectSpecs.id, spec.id),
+      ))
+      .run()
+    removed += 1
+  }
+  return removed
+}
+
 export function unlinkProjectRepoInStore(db: Store, projectId: string, repoSlug: string) {
-  const { unlinkProjectMountedRepo } = createRequire(import.meta.url)(
+  const req = createRequire(import.meta.url)
+  const { unlinkProjectMountedRepo } = req(
     './server/github-repo-sync.ts',
   ) as typeof import('./server/github-repo-sync.ts')
+  const drizzle = req('drizzle-orm') as typeof import('drizzle-orm')
+  const tables = req('./server/schema.ts') as typeof import('./server/schema.ts')
   db.project(projectId)
+  assertProjectHasNoActiveRuns(db, projectId, 'unlink', repoSlug)
   const result = unlinkProjectMountedRepo(db.directory, projectId, repoSlug)
-  if (result.unlinked) {
+  const removedSpecsCount = purgeRepoDerivedSpecs(db, projectId, result.fullName, drizzle, tables)
+  if (result.unlinked || removedSpecsCount > 0) {
     db.event(null, 'repo.unlinked', `Unlinked repository ${result.fullName}.`, {
       projectId,
       repoSlug: result.fullName,
+      removedSpecsCount,
     })
   }
   return result
+}
+
+export async function resyncProjectRepoInStore(
+  db: Store,
+  projectId: string,
+  repoSlug: string,
+  options: import('./server/github-repo-sync.ts').GithubSyncOptions = {},
+) {
+  const req = createRequire(import.meta.url)
+  const { projectReposDir, syncGithubRepos } = req(
+    './server/github-repo-sync.ts',
+  ) as typeof import('./server/github-repo-sync.ts')
+  const drizzle = req('drizzle-orm') as typeof import('drizzle-orm')
+  const tables = req('./server/schema.ts') as typeof import('./server/schema.ts')
+  db.project(projectId)
+  assertProjectHasNoActiveRuns(db, projectId, 're-sync', repoSlug)
+  const synced = await syncGithubRepos([repoSlug], undefined, {
+    dataDir: db.directory,
+    cloneDir: projectReposDir(db.directory, projectId),
+    historyDepth: 1,
+    ...options,
+    assertNoActiveRuns: fullName => {
+      assertProjectHasNoActiveRuns(db, projectId, 're-sync', fullName)
+    },
+  })
+  const repo = synced[0]
+  if (!repo) {
+    throw new Error(`Repository "${repoSlug}" could not be synced.`)
+  }
+  let specsImported = 0
+  const importedNames = new Set<string>()
+  for (const spec of repo.specs) {
+    db.upsertProjectSpecRaw(projectId, {
+      name: spec.name,
+      kind: spec.kind,
+      content: spec.content,
+    })
+    importedNames.add(spec.name)
+    specsImported += 1
+  }
+  const staleSpecsRemoved = purgeRepoDerivedSpecs(db, projectId, repo.fullName, drizzle, tables, importedNames)
+  db.event(null, 'repo.resynced', `Re-synced repository ${repo.fullName}.`, {
+    projectId,
+    repoSlug: repo.fullName,
+    specsImported,
+    staleSpecsRemoved,
+    dependenciesExtracted: repo.dependencies.length,
+  })
+  return {
+    fullName: repo.fullName,
+    defaultBranch: repo.defaultBranch,
+    commitSha: repo.commitSha ?? null,
+    filesCount: repo.files.length,
+    dependenciesCount: repo.dependencies.length,
+    specsImported,
+    warnings: repo.warnings,
+  }
 }
 
 export function updateProjectSpecInStore(
@@ -124,17 +237,26 @@ export const listProjectReposAction = createServerFn({ method: 'GET' })
 export const unlinkProjectRepoAction = createServerFn({ method: 'POST' })
   .validator(z.object({ projectId: id, repoSlug: repoSlugSchema }))
   .handler(async ({ data }) => {
-    const [{ store }, { unlinkProjectMountedRepo }] = await Promise.all([
+    const [{ store }, { unlinkProjectMountedRepoLocked }, drizzle, tables] = await Promise.all([
       import('./server/store.ts'),
       import('./server/github-repo-sync.ts'),
+      import('drizzle-orm'),
+      import('./server/schema.ts'),
     ])
     const db = store()
     db.project(data.projectId)
-    const result = unlinkProjectMountedRepo(db.directory, data.projectId, data.repoSlug)
-    if (result.unlinked) {
+    assertProjectHasNoActiveRuns(db, data.projectId, 'unlink', data.repoSlug)
+    const result = await unlinkProjectMountedRepoLocked(db.directory, data.projectId, data.repoSlug, {
+      assertNoActiveRuns: () => {
+        assertProjectHasNoActiveRuns(db, data.projectId, 'unlink', data.repoSlug)
+      },
+    })
+    const removedSpecsCount = purgeRepoDerivedSpecs(db, data.projectId, result.fullName, drizzle, tables)
+    if (result.unlinked || removedSpecsCount > 0) {
       db.event(null, 'repo.unlinked', `Unlinked repository ${result.fullName}.`, {
         projectId: data.projectId,
         repoSlug: result.fullName,
+        removedSpecsCount,
       })
     }
     return result
@@ -143,33 +265,44 @@ export const unlinkProjectRepoAction = createServerFn({ method: 'POST' })
 export const resyncProjectRepoAction = createServerFn({ method: 'POST' })
   .validator(z.object({ projectId: id, repoSlug: repoSlugSchema }))
   .handler(async ({ data }) => {
-    const [{ store }, { projectReposDir, syncGithubRepos }] = await Promise.all([
+    const [{ store }, { projectReposDir, syncGithubRepos }, drizzle, tables] = await Promise.all([
       import('./server/store.ts'),
       import('./server/github-repo-sync.ts'),
+      import('drizzle-orm'),
+      import('./server/schema.ts'),
     ])
     const db = store()
     db.project(data.projectId)
+    assertProjectHasNoActiveRuns(db, data.projectId, 're-sync', data.repoSlug)
     const synced = await syncGithubRepos([data.repoSlug], undefined, {
       dataDir: db.directory,
       cloneDir: projectReposDir(db.directory, data.projectId),
+      historyDepth: 1,
+      assertNoActiveRuns: fullName => {
+        assertProjectHasNoActiveRuns(db, data.projectId, 're-sync', fullName)
+      },
     })
     const repo = synced[0]
     if (!repo) {
       throw new Error(`Repository "${data.repoSlug}" could not be synced.`)
     }
     let specsImported = 0
+    const importedNames = new Set<string>()
     for (const spec of repo.specs) {
       db.upsertProjectSpecRaw(data.projectId, {
         name: spec.name,
         kind: spec.kind,
         content: spec.content,
       })
+      importedNames.add(spec.name)
       specsImported += 1
     }
+    const staleSpecsRemoved = purgeRepoDerivedSpecs(db, data.projectId, repo.fullName, drizzle, tables, importedNames)
     db.event(null, 'repo.resynced', `Re-synced repository ${repo.fullName}.`, {
       projectId: data.projectId,
       repoSlug: repo.fullName,
       specsImported,
+      staleSpecsRemoved,
       dependenciesExtracted: repo.dependencies.length,
     })
     return {
