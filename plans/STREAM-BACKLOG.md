@@ -34,6 +34,20 @@ Format:
 - [ ] `triage-kernel-v8-q25-oracle-soundness` — Triage 4 quarantined cases in `tests/v8-q25-oracle-soundness.test.ts` (2 `reason_only`, 1 `environment_or_harness` prompt check, 1 `verdict_tp_loss`) | status: ready | lease: `tests/v8-q25-oracle-soundness.test.ts`, `tests/parity/corpus/`, `tests/QUARANTINE.json` | deps: `R3-05`, `R3-06` | stream: `agents/triage-kernel-v8-q25-oracle-soundness`
 - [ ] `triage-kernel-v8-seam3-receipt-fuzz` — Triage 3 quarantined cases in `tests/v8-seam3-receipt-fuzz.test.ts` (2 `reason_only` M12-M14/M18 codes + 1 `verdict_tp_loss` baseline) | status: ready | lease: `tests/v8-seam3-receipt-fuzz.test.ts`, `tests/parity/corpus/`, `tests/QUARANTINE.json` | deps: `R3-05`, `R3-06` | stream: `agents/triage-kernel-v8-seam3-receipt-fuzz`
 
+## Deletion Debt
+
+Tracked legacy dual paths and compatibility helpers targeted for retirement (`R3-10`; audited by `scripts/parallel-pulse.sh`). Unify/consolidate streams must record any remaining dual path here with an owner and target expiry.
+
+| ID | Legacy Path / Symbol | Replacement | Owner | Target Milestone / Expiry | Status |
+|---|---|---|---|---|---|
+| `DD-01` | `src/server/broker.ts` Stage-2 duplicated `apexBuckets`/`ipBuckets` loops & 4 cap wrapper functions | Unified `aggregateBuckets` pool in `src/server/broker.ts` + direct `src/server/target-load-policy.ts` resolvers | `r3-10b-tripwire` | `R3-10 (2026-11-26)` | `retired` |
+| `DD-02` | `src/server/broker.ts` test-only re-export aliases (`externalApexBucketKey`, `brokerExternalApexRpsCap`, `brokerPerOriginConcurrencyCap`, `brokerPerOriginRpsCap`) | Direct imports from `src/server/target-load-policy.ts` in `tests/perf-broker-rps.test.ts` and `tests/v8-concurrency-12.test.ts` | `r3-10-followup` | `v8-m1 (2026-12-15)` | `open` |
+| `DD-03` | `src/server/replay-verifier.ts` remaining legacy verifier path (`2,657 -> <1K LOC`) | Unified `floor-recipe-engine.ts` + `proof-receipt.ts` + `oracle-invariants.ts` | `v7-m0-cut3f` | `v8-m0 (2026-12-15)` | `open` |
+| `DD-04` | `src/server/exec-verify.ts` local `isSensitiveRepoEntry` copy (baselined in `scripts/clone-baseline.json`) | Shared `isSensitiveRepoEntry` in `src/server/safety-primitives.ts` (under R3-05 kernel review) | `r3-13-oracle-registry` | `R3-13 (2026-12-20)` | `open` |
+| `DD-05` | `src/server/exec-dispatch.ts`, `phase0-recon.ts`, `exec-recon-planner.ts` local lane-concurrency env parsers | `resolveTargetLoadPolicy().lanes` in `src/server/target-load-policy.ts` (R2-16 Stage 2) | `r2-16-stage2` | `v8-m1 (2026-12-20)` | `open` |
+| `DD-06` | `src/server/browser-session-auth.ts`, `scoped-browser.ts`, `persona-auth.ts` duplicated WebSocket/WebRTC egress guards | Shared browser egress guard helper in `src/server/safety-primitives.ts` | `r3-10-followup` | `v8-m1 (2026-12-20)` | `open` |
+| `DD-07` | `src/server/broker.ts` deprecated `Grant.isIdempotentPostAllowed` source-compat field | Exact-fingerprint `Grant.isStateChangeApproved` | `r3-03-followup` | `v8-m1 (2026-12-20)` | `open` |
+
 ## Sequence after Queue #14 (`main` @ `fb93a8a`)
 
 1. Merge `swarm/v7-smoke-fix` (resumed snapshot `conversion` fix + §V7.7 provenance) and `swarm/v7-m1-spa`.
