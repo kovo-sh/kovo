@@ -357,6 +357,7 @@ test('Approve similar suppresses repeat prompts on approved DELETE and multipart
     method: 'DELETE',
     pathAndQuery: '/api/items/999',
     approvedPatterns: deletePattern,
+    leaseAuthorizes: () => true,
     offline: true,
   })
   assert.equal(approvedDel.decision, 'approve')
@@ -368,6 +369,7 @@ test('Approve similar suppresses repeat prompts on approved DELETE and multipart
     pathAndQuery: '/api/items/999',
     context: { personaHandle: 'user_a', hasMultipart: false, isRceProof: false },
     approvedPatterns: deletePattern,
+    leaseAuthorizes: () => true,
   })
   assert.equal(authDel.approved, true)
   assert.equal(authDel.via, 'operator_pattern')
@@ -381,6 +383,7 @@ test('Approve similar suppresses repeat prompts on approved DELETE and multipart
     hasMultipart: true,
     headers: { 'Content-Type': 'multipart/form-data; boundary=testbound' },
     approvedPatterns: uploadPattern,
+    leaseAuthorizes: () => true,
     offline: true,
   })
   assert.equal(approvedUpload.decision, 'approve')
@@ -392,6 +395,7 @@ test('Approve similar suppresses repeat prompts on approved DELETE and multipart
     pathAndQuery: '/api/uploads/20',
     context: { personaHandle: 'user_a', hasMultipart: true, isRceProof: false },
     approvedPatterns: uploadPattern,
+    leaseAuthorizes: () => true,
   })
   assert.equal(authUpload.approved, true)
   assert.equal(authUpload.via, 'operator_pattern')

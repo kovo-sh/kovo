@@ -10,7 +10,7 @@ import { downloadReportMarkdown, exportSarifAction, removeRun } from '../../acti
 import {
   approvalPolicies,
   isHostNonDestructiveLease,
-  isPrefixApprovalPattern,
+  MAX_APPROVAL_LEASE_USES,
   maxBudgetRequests,
   maxRpsPerOriginCeiling,
 } from '../../domain.ts'
@@ -102,18 +102,17 @@ function download(content: string, filename: string, type: string) {
   setTimeout(() => URL.revokeObjectURL(url), 1000)
 }
 
-function deriveActiveLeaseGrants(detail: ReturnType<typeof useRun>['detail']) {
+function deriveActiveLeaseGrants(detail: ReturnType<typeof useRun>['detail'], now = Date.now()) {
   const r = detail.run
-  const activeLeases = detail.approvalLeases ?? []
-  const activePatterns = (detail.approvedEndpointPatterns ?? r.approvedEndpointPatterns ?? []).filter(
-    p => p.scopeRevision === undefined || p.scopeRevision === r.scopeRevision,
+  const activeLeases = (detail.approvalLeases ?? []).filter(
+    lease =>
+      lease.status === 'active' &&
+      lease.scopeRevision === r.scopeRevision &&
+      lease.expiresAt !== null &&
+      lease.expiresAt > now &&
+      (lease.maxUses === null || lease.uses < lease.maxUses),
   )
-  const unmatchedPatterns = activePatterns.filter(
-    p => !activeLeases.some(
-      l => l.origin === p.origin && l.method.toUpperCase() === p.method.toUpperCase() && l.routePattern === p.pathPattern,
-    ),
-  )
-  return { activeLeases, unmatchedPatterns, totalGrants: activeLeases.length + unmatchedPatterns.length }
+  return { activeLeases, totalGrants: activeLeases.length }
 }
 
 const rlItemClass =
@@ -405,8 +404,8 @@ export function RunHeader() {
   </header>
 }
 
-function PopShell({ title, sub, children, footer }: { title: ReactNode; sub?: ReactNode; children: ReactNode; footer?: ReactNode }) {
-  return <div className="absolute right-0 top-8 z-[31] w-[340px] origin-top-right overflow-hidden rounded-card bg-raise shadow-popover" role="dialog" aria-label={typeof title === 'string' ? title : undefined}>
+function PopShell({ title, sub, children, footer, wide = false }: { title: ReactNode; sub?: ReactNode; children: ReactNode; footer?: ReactNode; wide?: boolean }) {
+  return <div className={cn('absolute right-0 top-8 z-[31] max-w-[calc(100vw-24px)] origin-top-right overflow-hidden rounded-card bg-raise shadow-popover', wide ? 'w-[388px]' : 'w-[340px]')} role="dialog" aria-label={typeof title === 'string' ? title : undefined}>
     <div className="flex items-center gap-2 border-b border-line px-3.5 pb-[9px] pt-[11px] font-medium text-fg">
       {title}
       {sub != null && <span className="ml-auto text-[12px] font-normal text-fg-subtle">{sub}</span>}
@@ -480,12 +479,13 @@ function BudgetPopover({ onClose }: { onClose: () => void }) {
 }
 
 function LeasesList({ onError }: { onError: (msg: string) => void }) {
-  const { detail, send, pending } = useRun()
+  const { detail, send, pending, now } = useRun()
   const toast = useToast()
   const r = detail.run
-  const { activeLeases, unmatchedPatterns } = deriveActiveLeaseGrants(detail)
+  const editable = !['complete', 'stopped', 'failed'].includes(r.status)
+  const { activeLeases } = deriveActiveLeaseGrants(detail, now)
 
-  if (!activeLeases.length && !unmatchedPatterns.length) {
+  if (!activeLeases.length) {
     return <p>No active approval leases in this scope revision.</p>
   }
 
@@ -501,12 +501,14 @@ function LeasesList({ onError }: { onError: (msg: string) => void }) {
       const personaLabel = lease.crossPersona
         ? 'Cross-persona'
         : lease.personaHandle ? `@${lease.personaHandle}` : null
+      const atMaxUses = lease.uses >= MAX_APPROVAL_LEASE_USES
       const meta = [
         hostLease ? 'Host (POST/PUT/PATCH · no DELETE/high-risk)' : prefixLease ? 'Prefix lease' : null,
         lease.expiresAt ? `Expires ${fmtTime(lease.expiresAt)}` : 'No expiry',
         useLabel,
         personaLabel,
       ].filter(Boolean).join(' · ')
+      const leaseLabel = hostLease ? `host lease for ${host(lease.origin)}` : `${lease.method} ${lease.routePattern}`
       return (
         <div key={lease.id} className={rowCls} data-lease-scope={lease.leaseScope ?? (hostLease ? 'host_nondestructive' : prefixLease ? 'prefix' : 'route')}>
           <div className="min-w-0 flex-1">
@@ -519,60 +521,43 @@ function LeasesList({ onError }: { onError: (msg: string) => void }) {
                 {hostLease ? host(lease.origin) : `${host(lease.origin)}${lease.routePattern}`}
               </span>
             </div>
-            <div className="mt-0.5 text-[11px] text-fg-subtle">{meta}</div>
+            <div className="mt-0.5 text-[11px] leading-[15px] text-fg-subtle">{meta}</div>
           </div>
-          <button
-            type="button"
-            className={runBtn({ variant: 'ghost', size: 'xs' })}
-            disabled={pending > 0}
-            aria-label={hostLease ? `Revoke host lease for ${host(lease.origin)}` : `Revoke ${lease.method} ${lease.routePattern}`}
-            onClick={() => {
-              onError('')
-              void send({ action: 'revoke_approval_lease', leaseId: lease.id }).then(
-                () => toast.show('Approval lease revoked'),
-                (x: unknown) => onError(x instanceof Error ? x.message : 'Could not revoke the lease'),
-              )
-            }}
-          >
-            Revoke
-          </button>
-        </div>
-      )
-    })}
-    {unmatchedPatterns.map(pattern => {
-      const prefixRule = isPrefixApprovalPattern(pattern.pathPattern)
-      const m = pattern.method.toUpperCase()
-      return (
-        <div key={`${pattern.origin}:${pattern.method}:${pattern.pathPattern}:${pattern.scopeRevision ?? 'any'}`} className={rowCls}>
-          <div className="min-w-0 flex-1">
-            <div className="flex items-center gap-1.5 font-mono text-[11.5px] text-fg">
-              <span className={badgeCls}>{m}</span>
-              {prefixRule && prefixTag}
-              <span className="truncate" title={`${pattern.origin}${pattern.pathPattern}`}>{host(pattern.origin)}{pattern.pathPattern}</span>
-            </div>
-            <div className="mt-0.5 text-[11px] text-fg-subtle">{prefixRule ? 'Prefix rule' : 'Pattern rule'} · Scope rev {pattern.scopeRevision ?? r.scopeRevision}</div>
+          <div className="flex flex-none items-center gap-1">
+            {editable && (
+              <button
+                type="button"
+                className={runBtn({ variant: 'ghost', size: 'xs' })}
+                disabled={pending > 0 || atMaxUses}
+                title={atMaxUses ? `Reached cap (${MAX_APPROVAL_LEASE_USES} uses)` : 'Extend lease by +30m and add uses'}
+                aria-label={`Extend ${leaseLabel}`}
+                onClick={() => {
+                  onError('')
+                  void send({ action: 'extend_approval_lease', leaseId: lease.id }).then(
+                    () => toast.show('Approval lease extended (+30m)'),
+                    (x: unknown) => onError(x instanceof Error ? x.message : 'Could not extend the lease'),
+                  )
+                }}
+              >
+                Extend
+              </button>
+            )}
+            <button
+              type="button"
+              className={runBtn({ variant: 'ghost', size: 'xs' })}
+              disabled={pending > 0}
+              aria-label={`Revoke ${leaseLabel}`}
+              onClick={() => {
+                onError('')
+                void send({ action: 'revoke_approval_lease', leaseId: lease.id }).then(
+                  () => toast.show('Approval lease revoked'),
+                  (x: unknown) => onError(x instanceof Error ? x.message : 'Could not revoke the lease'),
+                )
+              }}
+            >
+              Revoke
+            </button>
           </div>
-          <button
-            type="button"
-            className={runBtn({ variant: 'ghost', size: 'xs' })}
-            disabled={pending > 0}
-            aria-label={`Revoke ${m} ${pattern.pathPattern}`}
-            onClick={() => {
-              onError('')
-              void send({
-                action: 'remove_approved_pattern',
-                origin: pattern.origin,
-                method: pattern.method,
-                pathPattern: pattern.pathPattern,
-                ...(pattern.scopeRevision !== undefined ? { scopeRevision: pattern.scopeRevision } : {}),
-              }).then(
-                () => toast.show('Approved pattern removed'),
-                (x: unknown) => onError(x instanceof Error ? x.message : 'Could not remove the pattern'),
-              )
-            }}
-          >
-            Revoke
-          </button>
         </div>
       )
     })}
@@ -580,32 +565,33 @@ function LeasesList({ onError }: { onError: (msg: string) => void }) {
 }
 
 function LeasesPopover({ onClose }: { onClose: () => void }) {
-  const { detail } = useRun()
+  const { detail, now } = useRun()
   const r = detail.run
-  const { totalGrants } = deriveActiveLeaseGrants(detail)
+  const { totalGrants } = deriveActiveLeaseGrants(detail, now)
   const [err, setErr] = useState('')
 
   return <PopShell
     title="Approval leases"
     sub={totalGrants > 0 ? `${totalGrants} active` : 'None'}
+    wide
     footer={<>
       {err && <span className="mr-auto text-[12px] text-danger">{err}</span>}
       <button type="button" className={runBtn({ variant: 'ghost' })} onClick={onClose}>Close</button>
     </>}
   >
-    <p>Route, prefix, and host-level write approvals granted in scope revision {r.scopeRevision}. Revoking requires approval again for future writes.</p>
+    <p>Bounded route, prefix, and host-level write leases granted in scope revision {r.scopeRevision}. Extend adds +30m and additional uses; revoking requires approval again.</p>
     <LeasesList onError={setErr} />
   </PopShell>
 }
 
 function PolicyPopover({ onClose }: { onClose: () => void }) {
-  const { detail, send, pending } = useRun()
+  const { detail, send, pending, now } = useRun()
   const r = detail.run
   const current: ApprovalPolicy = r.approvalPolicy ?? 'auto_review'
   const editable = !['complete', 'stopped', 'failed'].includes(r.status)
-  const { totalGrants } = deriveActiveLeaseGrants(detail)
+  const { totalGrants } = deriveActiveLeaseGrants(detail, now)
   const [err, setErr] = useState('')
-  return <PopShell title="Approval policy" sub={editable ? 'Switches live' : runStatusLabel(r.status)} footer={err ? <span className="mr-auto text-[12px] text-danger">{err}</span> : undefined}>
+  return <PopShell title="Approval policy" sub={editable ? 'Switches live' : runStatusLabel(r.status)} wide={totalGrants > 0} footer={err ? <span className="mr-auto text-[12px] text-danger">{err}</span> : undefined}>
     {approvalPolicies.map(p => {
       const m = approvalPolicyMeta[p]
       const on = p === current

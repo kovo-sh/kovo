@@ -210,6 +210,7 @@ test('auto_review Stage 1B fast-paths benign unauth POST, read-only GraphQL/sear
     personaHandle: 'user_a',
     bodyPreview: '{"title":"probe"}',
     approvedPatterns: [{ origin: 'https://api.example.com', method: 'PATCH', pathPattern: '/api/v1/notes/*' }],
+    leaseAuthorizes: () => true,
     llmCall,
   })
   assert.equal(patternMatch.decision, 'approve')

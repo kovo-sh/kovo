@@ -296,7 +296,7 @@ test('UI components wire Leases popover, inline RunHeader rename, ProjectOvervie
   assert.match(headerSrc, /function LeasesPopover\(/, 'RunHeader must define LeasesPopover')
   assert.match(headerSrc, /function LeasesList\(/, 'RunHeader must define LeasesList')
   assert.match(headerSrc, /revoke_approval_lease/, 'Leases UI must invoke revoke_approval_lease')
-  assert.match(headerSrc, /remove_approved_pattern/, 'Leases UI must invoke remove_approved_pattern')
+  assert.match(headerSrc, /extend_approval_lease/, 'Leases UI must invoke extend_approval_lease')
   assert.match(headerSrc, /rename_run/, 'RunHeader must invoke rename_run for inline run renaming')
   assert.match(headerSrc, /aria-label="Run label"/, 'RunHeader inline rename input must have accessible label')
   assert.match(headerSrc, /r\.label \|\| r\.goal/, 'RunHeader must render r.label || r.goal')

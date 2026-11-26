@@ -228,8 +228,14 @@ test('v6 delete: opt-in HITL parks, releases the slot, and resumes on a durable 
   assert.equal(storage.worker(job.assignment.id).status, 'running', 'the parked worker resumes on approval')
   assert.ok(storage.worker(job.assignment.id).lease, 'the resumed worker gets a fresh lease')
 
-  // The durable route-scoped lease authorizes sibling ids; the exact ledger stays single-use.
+  // The durable route-scoped lease authorizes sibling ids across both leaseAuthorizes and
+  // isStateChangeApproved; once the durable lease is revoked, the exact ledger stays single-use.
   assert.equal(storage.leaseAuthorizes(runId, appOrigin, 'POST', '/api/notes/8'), true)
+  assert.equal(grant.isStateChangeApproved!(appOrigin, 'POST', '/api/notes/8', context), true)
+  const activeLease = storage.listApprovalLeases(runId, 'active')[0]!
+  assert.ok(activeLease, 'operator approval creates an active durable route lease')
+  storage.revokeApprovalLease(storage.run(runId), activeLease.id)
+  assert.equal(storage.leaseAuthorizes(runId, appOrigin, 'POST', '/api/notes/8'), false)
   assert.equal(grant.isStateChangeApproved!(appOrigin, 'POST', '/api/notes/7', context), true)
   assert.equal(grant.isStateChangeApproved!(appOrigin, 'POST', '/api/notes/7', context), false)
   assert.equal(storage.listApprovalRequests(runId).length, 1, 'one decision, no re-approval storm')
