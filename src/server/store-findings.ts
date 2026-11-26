@@ -37,11 +37,14 @@ import type {
   FindingVerificationClass,
 } from '../report-summary.ts'
 import {
+  RECORD_COVERAGE_CONTRACT,
   appendCoverageEvidenceMetadata,
   categoryToOwaspCoverageCategory,
-  coverageStatusRank,
   extractCoverageEvidenceMetadata,
+  mergeRouteCoverageStatuses,
   normalizeOriginForCoverage,
+  normalizeRouteForCoverage,
+  validateRecordCoverageContractInput,
 } from './coverage-category.ts'
 import {
   FindingCodec,
@@ -2061,17 +2064,14 @@ export class FindingsRepository {
     const cleanSummaryBase = redact(input.summary.slice(0, 600))
     const targetOrigin = normalizeOriginForCoverage(input.origin)
 
-    const candidateExchangeIds = [...new Set([
-      ...(input.exchangeIds ?? []),
-      ...(input.enforcingControl
-        ? [
-            ...(input.enforcingControl.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi) ?? []),
-            ...(input.enforcingControl.match(/\b(?:gx|ex)[_-][A-Za-z0-9._-]{2,80}\b/g) ?? []),
-          ]
-        : []),
-    ].map(id => id.trim()).filter(Boolean))]
+    const contractCheck = validateRecordCoverageContractInput(input, { allowImplicitLinkedFinding: true })
+    if (!contractCheck.ok) {
+      throw new InvariantError(contractCheck.code, contractCheck.error)
+    }
+    const statusRule = RECORD_COVERAGE_CONTRACT[input.status]
+    const candidateExchangeIds = contractCheck.candidateExchangeIds
 
-    const requiresExchangeEvidence = input.status === 'no_issue_found' || input.status === 'ruled_out'
+    const requiresExchangeEvidence = statusRule.requiresVerifiedExchange
     if (requiresExchangeEvidence || candidateExchangeIds.length > 0) {
       // Flush queued broker exchanges so newly recorded run exchanges are visible before verification.
       this.session.flushNow()
@@ -2084,15 +2084,13 @@ export class FindingsRepository {
     const inferredRouteFromExchange = exchangeEvidence.inferredRouteFromExchange
 
     if (requiresExchangeEvidence && verifiedExchangeIds.length === 0) {
-      const reason = candidateExchangeIds.length === 0
-        ? `Coverage status "${input.status}" requires at least one run-owned, origin-matched exchangeId proving the route was probed.`
-        : `Coverage status "${input.status}" rejected: none of the supplied exchangeIds (${candidateExchangeIds.slice(0, 5).join(', ')}) belong to run ${run.id} for origin ${input.origin}.`
+      const reason = `Coverage status "${input.status}" rejected: none of the supplied exchangeIds (${candidateExchangeIds.slice(0, 5).join(', ')}) belong to run ${run.id} for origin ${input.origin}.`
       throw new InvariantError('COVERAGE_EVIDENCE_REQUIRED', reason)
     }
 
     const cleanRoute = input.route?.trim()
-      ? redact(input.route.trim().slice(0, 200))
-      : inferredRouteFromExchange
+      ? normalizeRouteForCoverage(redact(input.route.trim().slice(0, 200)))
+      : (inferredRouteFromExchange ? normalizeRouteForCoverage(inferredRouteFromExchange) : null)
     const cleanBranchKey = input.branchKey?.trim() ? redact(input.branchKey.trim().slice(0, 160)) : null
 
     const isFindingSupersededOrDismissed = (row: {
@@ -2148,10 +2146,10 @@ export class FindingsRepository {
       let effectiveStatus: CoverageEntry['status'] = input.status
       let effectiveLinkedFindingId: string | null = linkedFindingId
       let effectiveSummaryBase = cleanSummaryBase
+      let allowDemotionFromReported = false
+      let blockDemotion = false
 
       if (input.status !== 'reported') {
-        let blockDemotion = false
-        let allowDemotionFromReported = false
         let preservedFindingId: string | null = null
 
         if (existing?.status === 'reported') {
@@ -2191,10 +2189,6 @@ export class FindingsRepository {
           } else if (activeConfirmedForCell) {
             effectiveSummaryBase = redact(`Confirmed finding active: ${activeConfirmedForCell.finding.title}`.slice(0, 600))
           }
-        } else if (!allowDemotionFromReported && existing && coverageStatusRank(input.status) < coverageStatusRank(existing.status)) {
-          effectiveStatus = existing.status
-          effectiveLinkedFindingId = existing.linkedFindingId
-          effectiveSummaryBase = existing.summary
         } else {
           effectiveLinkedFindingId = null
         }
@@ -2202,8 +2196,25 @@ export class FindingsRepository {
         effectiveLinkedFindingId = linkedFindingId ?? existing?.linkedFindingId ?? activeConfirmedForCell?.id ?? null
       }
 
+      const routeMerge = mergeRouteCoverageStatuses({
+        existingStatus: existing?.status ?? null,
+        existingRoutes: existingMeta?.routes ?? [],
+        existingRouteStatuses: existingMeta?.routeStatuses ?? {},
+        incomingRoute: cleanRoute,
+        incomingStatus: input.status,
+        allowDemotionFromReported,
+      })
+
+      if (!blockDemotion && input.status !== 'reported') {
+        effectiveStatus = routeMerge.derivedStatus
+        if (routeMerge.preservedExistingGap && existing) {
+          effectiveSummaryBase = existing.summary
+        }
+      }
+
       const finalSummary = appendCoverageEvidenceMetadata(effectiveSummaryBase, {
         routes: mergedRoutes,
+        routeStatuses: routeMerge.routeStatuses,
         branchKey: mergedBranchKey,
         exchangeIds: mergedExchangeIds,
       })
@@ -2217,10 +2228,12 @@ export class FindingsRepository {
             ? (cleanControl ?? existing.enforcingControl)
             : (effectiveStatus === 'reported' ? existing.enforcingControl : cleanControl),
           proofGapReason: effectiveStatus === 'needs_follow_up'
-            ? (cleanGapReason ?? existing.proofGapReason)
+            ? (routeMerge.preservedExistingGap ? (existing.proofGapReason ?? cleanGapReason) : (cleanGapReason ?? existing.proofGapReason))
             : (effectiveStatus === 'reported' ? existing.proofGapReason : cleanGapReason),
           linkedFindingId: effectiveStatus === 'reported' ? effectiveLinkedFindingId : null,
-          assignmentId: effectiveStatus === 'reported' && input.status !== 'reported' ? existing.assignmentId : assignmentId,
+          assignmentId: (effectiveStatus === 'reported' && input.status !== 'reported') || routeMerge.preservedExistingGap
+            ? existing.assignmentId
+            : assignmentId,
           updatedAt: now,
         }).where(eq(tables.coverageEntries.id, existing.id)).returning().get()!
       }

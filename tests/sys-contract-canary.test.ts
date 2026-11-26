@@ -56,7 +56,21 @@ import {
   type KovoVerifyArgs,
 } from '../src/server/agent-prompts.ts'
 import { buildWorkerTools } from '../src/server/agent-session.ts'
+import {
+  MULTIHOP_HARDENED_TWIN_RULE,
+  RECORD_COVERAGE_BRIEF_GUIDANCE,
+  buildAssignmentBrief,
+  renderSettlementSpecDirective,
+} from '../src/server/assignment-brief.ts'
 import { RequestBroker, type Grant } from '../src/server/broker.ts'
+import {
+  RECORD_COVERAGE_BASE_FIELDS,
+  RECORD_COVERAGE_CONTRACT,
+  buildRecordCoverageBriefGuidance,
+  coverageStatusRank,
+  type RecordCoverageFieldName,
+} from '../src/server/coverage-category.ts'
+import { coverageClosureStatuses } from '../src/domain.ts'
 import {
   DerivedCapabilityVault,
   DerivedCustodyError,
@@ -1182,4 +1196,115 @@ test('Check 6: R4-C-1 & R4-C-2 — every host-minted oracle enforces per-exchang
     ],
   }, { hostMintedOracle: oracle })
   assert.equal(responseOnlyOob.confirmed, false, 'OOB receipt with response-only token must fail closed')
+})
+
+// ---------------------------------------------------------------------------
+// Check 7 — R3-15 Single Authoritative RecordCoverageContract Parity Lock-In
+// ---------------------------------------------------------------------------
+test('Check 7: R3-15 — record_coverage tool schema, store-findings validation, and worker brief share ONE RECORD_COVERAGE_CONTRACT across all 5 statuses', () => {
+  const tools = buildWorkerTools(
+    { record_coverage: async () => ({ ok: true }) },
+    v => v,
+    AbortSignal.timeout(5_000),
+    16_384,
+    () => {},
+  )
+  const recordCoverageTool = tools.find(t => t.name === 'record_coverage')
+  assert.ok(recordCoverageTool, 'record_coverage tool must be registered by buildWorkerTools')
+
+  // 7a) JSON schema base required fields and status enum match RECORD_COVERAGE_CONTRACT verbatim.
+  const schema = recordCoverageTool.parameters as {
+    required?: string[]
+    properties?: Record<string, { enum?: string[]; description?: string }>
+  }
+  assert.deepEqual(
+    [...(schema.required ?? [])].sort(),
+    [...RECORD_COVERAGE_BASE_FIELDS].sort(),
+    'record_coverage JSON schema required base fields must match RECORD_COVERAGE_BASE_FIELDS',
+  )
+  const schemaStatuses = [...(schema.properties?.status?.enum ?? [])].sort()
+  const contractStatuses = [...Object.keys(RECORD_COVERAGE_CONTRACT)].sort()
+  assert.deepEqual(schemaStatuses, [...coverageClosureStatuses].sort(), 'tool status enum must cover all CoverageClosureStatus values')
+  assert.deepEqual(schemaStatuses, contractStatuses, 'tool status enum must match RECORD_COVERAGE_CONTRACT keys')
+
+  // 7b) Tool description & parameter descriptions match RECORD_COVERAGE_CONTRACT for every status.
+  for (const status of coverageClosureStatuses) {
+    const rule = RECORD_COVERAGE_CONTRACT[status]
+    assert.ok(
+      recordCoverageTool.description.includes(rule.ruleSummary),
+      `record_coverage tool description must embed RECORD_COVERAGE_CONTRACT.${status}.ruleSummary`,
+    )
+    assert.equal(rule.acceptsUnverifiedRepoCitation, false, `RECORD_COVERAGE_CONTRACT.${status} must never accept unverified repo prose`)
+    for (const reqField of rule.requiredFields) {
+      const propDesc = schema.properties?.[reqField]?.description ?? ''
+      assert.ok(
+        propDesc.includes(`"${status}"`),
+        `record_coverage schema property "${reqField}" description must document requirement for status="${status}"`,
+      )
+    }
+    if (rule.requiresVerifiedExchange) {
+      assert.ok(
+        rule.requiredFields.includes('exchangeIds'),
+        `status="${status}" requires verified exchange and must list exchangeIds in requiredFields`,
+      )
+    }
+  }
+
+  // Ensure every conditional field listed in the schema only claims statuses that actually require it in RECORD_COVERAGE_CONTRACT.
+  for (const field of ['enforcingControl', 'proofGapReason', 'linkedFindingId', 'exchangeIds'] as const satisfies readonly RecordCoverageFieldName[]) {
+    const propDesc = schema.properties?.[field]?.description ?? ''
+    for (const status of coverageClosureStatuses) {
+      const required = RECORD_COVERAGE_CONTRACT[status].requiredFields.includes(field)
+      if (required) {
+        assert.ok(propDesc.includes(`"${status}"`), `schema field "${field}" must mention required status "${status}"`)
+      } else {
+        assert.ok(
+          !new RegExp(`REQUIRED when status=[^:]*?"${status}"`).test(propDesc),
+          `schema field "${field}" must NOT claim status="${status}" requires it`,
+        )
+      }
+    }
+  }
+
+  // 7c) Zero schema/store/brief drift: verify live wiring in store-findings.ts, agent-session.ts, and assignment-brief.ts.
+  const storeFindingsSrc = readFileSync(join(REPO_ROOT, 'src/server/store-findings.ts'), 'utf8')
+  const agentSessionSrc = readFileSync(join(REPO_ROOT, 'src/server/agent-session.ts'), 'utf8')
+  const briefSrc = readFileSync(join(REPO_ROOT, 'src/server/assignment-brief.ts'), 'utf8')
+
+  assert.match(storeFindingsSrc, /\bRECORD_COVERAGE_CONTRACT\b/, 'store-findings.ts must consume RECORD_COVERAGE_CONTRACT')
+  assert.match(storeFindingsSrc, /\bvalidateRecordCoverageContractInput\s*\(/, 'store-findings.ts must validate via validateRecordCoverageContractInput')
+  assert.match(storeFindingsSrc, /\bmergeRouteCoverageStatuses\s*\(/, 'store-findings.ts must aggregate per-route statuses via mergeRouteCoverageStatuses')
+  assert.doesNotMatch(
+    storeFindingsSrc,
+    /input\.status === 'no_issue_found' \|\| input\.status === 'ruled_out'/,
+    'store-findings.ts must derive exchange requirement from RECORD_COVERAGE_CONTRACT, not a hardcoded status check',
+  )
+
+  assert.match(agentSessionSrc, /\bbuildRecordCoverageToolDescription\s*\(/, 'agent-session.ts must generate tool description from RECORD_COVERAGE_CONTRACT')
+  assert.match(agentSessionSrc, /\bbuildRecordCoverageFieldDescriptions\s*\(/, 'agent-session.ts must generate field descriptions from RECORD_COVERAGE_CONTRACT')
+  assert.match(agentSessionSrc, /\bvalidateRecordCoverageContractInput\s*\(/, 'agent-session.ts must validate via validateRecordCoverageContractInput')
+
+  assert.match(briefSrc, /\bbuildRecordCoverageBriefGuidance\s*\(/, 'assignment-brief.ts must derive coverage guidance from RECORD_COVERAGE_CONTRACT')
+  const expectedGuidance = buildRecordCoverageBriefGuidance()
+  assert.equal(RECORD_COVERAGE_BRIEF_GUIDANCE, expectedGuidance)
+  assert.ok(MULTIHOP_HARDENED_TWIN_RULE.includes('enforcingControl+exchangeIds'))
+  const briefJson = buildAssignmentBrief({
+    missionKind: 'class_scan',
+    origin: 'https://canary-coverage.example.invalid',
+    routes: [{ method: 'GET', path: '/api/items' }],
+  })
+  assert.ok(briefJson.includes(expectedGuidance), 'rendered assignment brief must surface RECORD_COVERAGE_CONTRACT guidance')
+  const directive = renderSettlementSpecDirective(
+    { method: 'GET', path: '/api/items', origin: 'https://canary-coverage.example.invalid' },
+    'kovo_verify({ script })',
+    ['no_spec_shape'],
+  )
+  assert.ok(directive.includes(expectedGuidance), 'settlement directive must surface RECORD_COVERAGE_CONTRACT guidance')
+
+  // 7d) Interim route-safe precedence invariant: reported > needs_follow_up > negative closures > unprobed.
+  assert.ok(coverageStatusRank('reported') > coverageStatusRank('needs_follow_up'))
+  assert.ok(coverageStatusRank('needs_follow_up') > coverageStatusRank('no_issue_found'))
+  assert.ok(coverageStatusRank('needs_follow_up') > coverageStatusRank('ruled_out'))
+  assert.ok(coverageStatusRank('needs_follow_up') > coverageStatusRank('not_applicable'))
+  assert.ok(coverageStatusRank('no_issue_found') > coverageStatusRank('unprobed'))
 })

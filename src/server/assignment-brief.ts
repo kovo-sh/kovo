@@ -21,6 +21,7 @@
  *    state/numeric samples. Secret-shaped keys/values and body-like fields are dropped.
  */
 
+import { buildRecordCoverageBriefGuidance } from './coverage-category.ts'
 import { renderCodeDataflowSlice, type CodeDataflowSlice } from './program-graph.ts'
 import { redact } from './redact.ts'
 
@@ -689,8 +690,10 @@ export const MULTIHOP_ATTACKER_ORIGIN_RULE =
 export const MULTIHOP_CONTINUE_CHAIN_RULE =
   'If Hop 1-2 yields a job/export handle, signing material, or signed URL, seal it (ctx.seal_capability) and continue Hops 3-5 in the SAME script (ctx.await_async / ctx.hmac_sign / ctx.jwt_sign / follow URL) rather than calling ctx.prove_composite prematurely on Hop 2.'
 
+export const RECORD_COVERAGE_BRIEF_GUIDANCE = buildRecordCoverageBriefGuidance()
+
 export const MULTIHOP_HARDENED_TWIN_RULE =
-  'If a terminal guard holds cleanly, do NOT file a standalone finding on benign Hop 1-2; call record_coverage(status="ruled_out", proofGapReason="invariant_enforced_hardened") and complete_intent.'
+  `If a terminal guard holds cleanly, do NOT file a standalone finding on benign Hop 1-2; call record_coverage(status="ruled_out", proofGapReason="invariant_enforced_hardened") with enforcingControl+exchangeIds (or needs_follow_up if no live exchange) and complete_intent.`
 
 export const MULTIHOP_OPTIONAL_HELPERS_NOTE =
   'Crypto/async hops: ctx.hmac_sign({ secretHandle, payload, alg: "sha256", encoding: "hex" }) | ctx.jwt_sign({ secretHandle, claims, alg: "HS256", hopReceiptId, slot }) -> derived_crypto_binding; ctx.await_async({ pollRequest, matchPredicate, triggerExchangeId, correlationId, profile: "fast_lab" }) -> async_pivot_binding; state mutation -> state_transition_binding (entityId, ablationExchangeIds).'
@@ -780,7 +783,7 @@ export function buildMultiHopProofContract(compact = false, input?: AssignmentBr
       continueChainRule: 'Seal Hop 1-2 handle/URL/key (ctx.seal_capability) and continue Hops 3-5 in SAME script (await_async/hmac_sign/jwt_sign); never prove_composite on Hop-2 stub.',
       ...(helperPatterns.length ? { helperPatterns } : {}),
       modeATsRecipe: COMPACT_MULTIHOP_MODE_A_RECIPE,
-      hardenedTwinRule: 'If terminal guard holds, no Hop 1-2 standalone finding; record_coverage(status="ruled_out", proofGapReason="invariant_enforced_hardened") + complete_intent.',
+      hardenedTwinRule: 'If terminal guard holds, no Hop 1-2 standalone finding; record_coverage(status="ruled_out", proofGapReason="invariant_enforced_hardened") with enforcingControl+exchangeIds + complete_intent.',
     }
   }
   return {
@@ -807,6 +810,7 @@ interface WorkingState {
   multiHopProofContract?: AssignmentBriefMultiHopContract
   multiHopContractCompacted: boolean
   proofObligation?: Record<string, unknown>
+  coverageContract?: string
 }
 
 function renderPacket(input: AssignmentBriefInput, state: WorkingState): Record<string, unknown> {
@@ -817,6 +821,7 @@ function renderPacket(input: AssignmentBriefInput, state: WorkingState): Record<
     ...(state.hopCheckpoint ? { hopCheckpoint: state.hopCheckpoint } : {}),
     ...(state.multiHopProofContract ? { multiHopProofContract: state.multiHopProofContract } : {}),
     ...(state.proofObligation ? { proofObligation: state.proofObligation } : {}),
+    ...(state.coverageContract ? { coverageContract: state.coverageContract } : {}),
     routes: state.routes,
     ...(state.code ? { code: state.code } : {}),
     ...(state.linked.length ? { linkedRoutes: state.linked } : {}),
@@ -946,6 +951,7 @@ function buildWorkingState(input: AssignmentBriefInput): WorkingState {
     ...(multiHopProofContract ? { multiHopProofContract } : {}),
     multiHopContractCompacted: false,
     ...(proofObligation ? { proofObligation } : {}),
+    coverageContract: RECORD_COVERAGE_BRIEF_GUIDANCE,
     codeBudget,
     hopCheckpointBudget,
   }
@@ -979,6 +985,11 @@ export function buildAssignmentBriefPacket(
       return { text, bytes, truncated }
     }
     truncated = true
+
+    if (state.coverageContract) {
+      state.coverageContract = undefined
+      continue
+    }
 
     // Compact the Mode-A multi-hop proof contract before dropping linkedRoutes or shrinking
     // secondary material so follow-on hop endpoints and chain lineage coexist inside the 4 KB budget.
@@ -1156,7 +1167,7 @@ export function renderSettlementSpecDirective(
     `[PROOF OBLIGATION — settlement] Your route evidence is ${route}.`,
     'This wrap-up turn is reserved: submit ONE kovo_verify inline script (ctx.prove_*) or replay spec for that route before complete_intent.',
     `Smallest valid spec: ${specShape}`,
-    `If no valid spec can be built, call record_coverage(status="needs_follow_up", proofGapReason="<code>") with a machine-readable code (${codes}) instead of silently skipping.`,
+    `If no valid spec can be built, call record_coverage(status="needs_follow_up", proofGapReason="<code>") with a machine-readable code (${codes}) instead of silently skipping. ${RECORD_COVERAGE_BRIEF_GUIDANCE}`,
   ].join(' ')
 }
 

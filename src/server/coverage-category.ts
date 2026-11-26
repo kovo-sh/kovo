@@ -12,6 +12,7 @@ import { owaspCategories, type CoverageClosureStatus, type OwaspCategory } from 
 export interface CoverageEvidenceMetadata {
   route: string | null
   routes: string[]
+  routeStatuses: Record<string, CoverageClosureStatus>
   branchKey: string | null
   exchangeIds: string[]
 }
@@ -295,17 +296,230 @@ export function categoryToOwaspCoverageCategory(category: string | null | undefi
   return null
 }
 
+export type RecordCoverageFieldName =
+  | 'origin'
+  | 'category'
+  | 'status'
+  | 'summary'
+  | 'enforcingControl'
+  | 'proofGapReason'
+  | 'linkedFindingId'
+  | 'route'
+  | 'exchangeIds'
+
+export interface RecordCoverageStatusRule {
+  readonly status: CoverageClosureStatus
+  /** Status-specific required non-empty fields (in addition to RECORD_COVERAGE_BASE_FIELDS). */
+  readonly requiredFields: readonly RecordCoverageFieldName[]
+  /** Whether the store requires >= 1 host-verified, run-owned, origin-matched broker exchangeId. */
+  readonly requiresVerifiedExchange: boolean
+  /** Minimum trimmed length for enforcingControl when required. */
+  readonly minEnforcingControlLength?: number
+  /** Minimum trimmed length for proofGapReason when required. */
+  readonly minProofGapReasonLength?: number
+  /** Unverified worker prose (e.g. raw /repos file:line without a live exchange) never closes coverage. */
+  readonly acceptsUnverifiedRepoCitation: false
+  /** Authoritative rule summary rendered into the tool schema and worker guidance. */
+  readonly ruleSummary: string
+}
+
+export const RECORD_COVERAGE_BASE_FIELDS = ['origin', 'category', 'status', 'summary'] as const
+
 /**
- * Monotone rank for coverage closure statuses:
- *   reported (confirmed) > ruled_out / no_issue_found / needs_follow_up / not_applicable (probed) > unprobed.
+ * R3-15: Single authoritative `record_coverage` contract shared across:
+ *   - `agent-session.ts` (tool JSON schema descriptions + pre-handler validation),
+ *   - `store-findings.ts` (`upsertCoverageEntry` fail-closed validation), and
+ *   - `assignment-brief.ts` (worker brief & settlement guidance).
+ */
+export const RECORD_COVERAGE_CONTRACT: Readonly<Record<CoverageClosureStatus, RecordCoverageStatusRule>> = {
+  reported: {
+    status: 'reported',
+    requiredFields: ['linkedFindingId'],
+    requiresVerifiedExchange: false,
+    acceptsUnverifiedRepoCitation: false,
+    ruleSummary: 'status="reported": REQUIRES linkedFindingId referencing a confirmed or static_verified finding.',
+  },
+  ruled_out: {
+    status: 'ruled_out',
+    requiredFields: ['enforcingControl', 'exchangeIds'],
+    requiresVerifiedExchange: true,
+    minEnforcingControlLength: 3,
+    acceptsUnverifiedRepoCitation: false,
+    ruleSummary: 'status="ruled_out": REQUIRES non-empty enforcingControl describing the verified guard AND >= 1 run-owned, origin-matched broker exchangeId in exchangeIds (or cited in enforcingControl). Unverified /repos file:line prose alone is rejected; if no live exchange exists, use status="needs_follow_up".',
+  },
+  no_issue_found: {
+    status: 'no_issue_found',
+    requiredFields: ['exchangeIds'],
+    requiresVerifiedExchange: true,
+    acceptsUnverifiedRepoCitation: false,
+    ruleSummary: 'status="no_issue_found": REQUIRES >= 1 run-owned, origin-matched broker exchangeId in exchangeIds proving the route was probed on the live target (use status="needs_follow_up" if no live exchange exists).',
+  },
+  needs_follow_up: {
+    status: 'needs_follow_up',
+    requiredFields: ['proofGapReason'],
+    requiresVerifiedExchange: false,
+    minProofGapReasonLength: 5,
+    acceptsUnverifiedRepoCitation: false,
+    ruleSummary: 'status="needs_follow_up": REQUIRES a non-empty machine-readable proofGapReason (e.g. no_spec_shape, no_authenticated_persona, baseline_empty) explaining the exact blocker; use when no live exchange exists for a closure. Route-scoped: pass route="METHOD /path" so closing another route never hides this gap.',
+  },
+  not_applicable: {
+    status: 'not_applicable',
+    requiredFields: [],
+    requiresVerifiedExchange: false,
+    acceptsUnverifiedRepoCitation: false,
+    ruleSummary: 'status="not_applicable": use only when the OWASP category surface does not exist on the target origin; state why in summary.',
+  },
+} as const
+
+export type RecordCoverageContract = typeof RECORD_COVERAGE_CONTRACT
+
+const COVERAGE_UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi
+const COVERAGE_EXCHANGE_TOKEN_RE = /\b(?:gx|ex)[_-][A-Za-z0-9._-]{2,80}\b/g
+
+/** Extract candidate broker exchange IDs from `exchangeIds` and embedded tokens in `enforcingControl`. */
+export function extractCandidateCoverageExchangeIds(input: {
+  exchangeIds?: readonly string[]
+  enforcingControl?: string | null
+}): string[] {
+  return [...new Set([
+    ...(input.exchangeIds ?? []),
+    ...(input.enforcingControl
+      ? [
+          ...(input.enforcingControl.match(COVERAGE_UUID_RE) ?? []),
+          ...(input.enforcingControl.match(COVERAGE_EXCHANGE_TOKEN_RE) ?? []),
+        ]
+      : []),
+  ].map(id => id.trim()).filter(Boolean))]
+}
+
+/** Validate `record_coverage` arguments against the shared `RECORD_COVERAGE_CONTRACT`. */
+export function validateRecordCoverageContractInput(
+  input: {
+    status: CoverageClosureStatus
+    enforcingControl?: string | null
+    proofGapReason?: string | null
+    linkedFindingId?: string | null
+    exchangeIds?: readonly string[]
+  },
+  options?: {
+    proofGapCodes?: readonly string[]
+    allowImplicitLinkedFinding?: boolean
+  },
+): {
+  ok: true
+  rule: RecordCoverageStatusRule
+  candidateExchangeIds: string[]
+} | {
+  ok: false
+  code: 'INVALID_COVERAGE_ARGS' | 'COVERAGE_EVIDENCE_REQUIRED'
+  error: string
+  rule: RecordCoverageStatusRule
+} {
+  const rule = RECORD_COVERAGE_CONTRACT[input.status]
+  if (rule.requiredFields.includes('enforcingControl')) {
+    const minLen = rule.minEnforcingControlLength ?? 1
+    if (!input.enforcingControl || input.enforcingControl.trim().length < minLen) {
+      return {
+        ok: false,
+        code: 'INVALID_COVERAGE_ARGS',
+        error: rule.ruleSummary,
+        rule,
+      }
+    }
+  }
+  if (rule.requiredFields.includes('proofGapReason')) {
+    const minLen = rule.minProofGapReasonLength ?? 1
+    if (!input.proofGapReason || input.proofGapReason.trim().length < minLen) {
+      const codesSuffix = options?.proofGapCodes?.length
+        ? ` Use a machine-readable code: ${options.proofGapCodes.join(', ')}.`
+        : ''
+      return {
+        ok: false,
+        code: 'INVALID_COVERAGE_ARGS',
+        error: `${rule.ruleSummary}${codesSuffix}`,
+        rule,
+      }
+    }
+  }
+  if (rule.requiredFields.includes('linkedFindingId') && !options?.allowImplicitLinkedFinding) {
+    if (!input.linkedFindingId || !input.linkedFindingId.trim()) {
+      return {
+        ok: false,
+        code: 'INVALID_COVERAGE_ARGS',
+        error: rule.ruleSummary,
+        rule,
+      }
+    }
+  }
+  const candidateExchangeIds = extractCandidateCoverageExchangeIds(input)
+  if (rule.requiresVerifiedExchange && candidateExchangeIds.length === 0) {
+    return {
+      ok: false,
+      code: 'COVERAGE_EVIDENCE_REQUIRED',
+      error: `Coverage status "${input.status}" requires at least one run-owned, origin-matched exchangeId proving the route was probed. ${rule.ruleSummary}`,
+      rule,
+    }
+  }
+  return { ok: true, rule, candidateExchangeIds }
+}
+
+/** Generate the authoritative `record_coverage` tool description from `RECORD_COVERAGE_CONTRACT`. */
+export function buildRecordCoverageToolDescription(): string {
+  return [
+    'Update the per-origin OWASP/API Top 10 closure coverage ledger (governed by RECORD_COVERAGE_CONTRACT):',
+    `- ${RECORD_COVERAGE_CONTRACT.reported.ruleSummary}`,
+    `- ${RECORD_COVERAGE_CONTRACT.ruled_out.ruleSummary}`,
+    `- ${RECORD_COVERAGE_CONTRACT.no_issue_found.ruleSummary}`,
+    `- ${RECORD_COVERAGE_CONTRACT.needs_follow_up.ruleSummary}`,
+    `- ${RECORD_COVERAGE_CONTRACT.not_applicable.ruleSummary}`,
+    'Proof gaps are route-scoped: a coded gap MUST name the route it applies to via route="METHOD /path" (e.g. route="GET /api/orders/:id"); a closure on one route never overwrites an open needs_follow_up gap on another route.',
+  ].join(' ')
+}
+
+/** Generate `record_coverage` parameter descriptions directly from `RECORD_COVERAGE_CONTRACT`. */
+export function buildRecordCoverageFieldDescriptions(proofGapCodes: readonly string[]): {
+  enforcingControl: string
+  proofGapReason: string
+  route: string
+  linkedFindingId: string
+  exchangeIds: string
+} {
+  const requiredStatuses = (field: RecordCoverageFieldName): string =>
+    (Object.values(RECORD_COVERAGE_CONTRACT) as RecordCoverageStatusRule[])
+      .filter(r => r.requiredFields.includes(field))
+      .map(r => `"${r.status}"`)
+      .join(' or ')
+
+  return {
+    enforcingControl: `REQUIRED when status=${requiredStatuses('enforcingControl')}: concrete guard verified on the attacker path (must pair with >= 1 run-owned, origin-matched broker exchangeId in exchangeIds or cited here; unverified /repos file:line prose alone is rejected).`,
+    proofGapReason: `REQUIRED when status=${requiredStatuses('proofGapReason')}: machine-readable code plus detail (${proofGapCodes.join('|')}) explaining the exact blocker; use when no live exchange exists.`,
+    route: 'Route this closure applies to, as "METHOD /path" (path parameters may be concrete: "GET /api/orders/1001"). REQUIRED for a coded needs_follow_up gap when more than one route was probed, because per-route status keeps open gaps isolated from other routes.',
+    linkedFindingId: `REQUIRED when status=${requiredStatuses('linkedFindingId')}: Finding ID linking to a confirmed or static_verified finding.`,
+    exchangeIds: `REQUIRED when status=${requiredStatuses('exchangeIds')}: >= 1 run-owned, origin-matched broker exchangeId proving the route was probed on the live target (use status="needs_follow_up" if no live exchange exists).`,
+  }
+}
+
+/** Compact single-line `record_coverage` contract summary for worker assignment briefs (<= 200 bytes). */
+export function buildRecordCoverageBriefGuidance(): string {
+  const req = (status: CoverageClosureStatus) => RECORD_COVERAGE_CONTRACT[status].requiredFields.join('+')
+  return `record_coverage: reported(${req('reported')}); ruled_out(${req('ruled_out')}); no_issue_found(${req('no_issue_found')}); needs_follow_up(${req('needs_follow_up')}+route if no live exchange); not_applicable(summary).`
+}
+
+/**
+ * Monotone rank for coverage closure statuses (R3-15 interim route-safe precedence):
+ *   reported (4, confirmed)
+ *   > needs_follow_up (3, open proof gap — cannot be silently hidden by a closure on another route)
+ *   > ruled_out / no_issue_found / not_applicable (2, negative closure)
+ *   > unprobed (0).
  */
 export function coverageStatusRank(status: CoverageClosureStatus | 'unprobed'): number {
   switch (status) {
     case 'reported':
+      return 4
+    case 'needs_follow_up':
       return 3
     case 'ruled_out':
     case 'no_issue_found':
-    case 'needs_follow_up':
     case 'not_applicable':
       return 2
     case 'unprobed':
@@ -326,16 +540,51 @@ export function normalizeOriginForCoverage(origin: string): string {
 }
 
 const ROUTE_META_RE = /\[route=([^\]]+)\]/g
+const ROUTE_STATUS_META_RE = /\[route_status=([^\]]+)\]/g
 const BRANCH_META_RE = /\[branch=([^\]]+)\]/g
 const EXCHANGES_META_RE = /\[exchanges=([^\]]+)\]/g
-const ALL_META_TRAILERS_RE = /\s*\[(?:route|branch|exchanges)=[^\]]+\]/g
+const ALL_META_TRAILERS_RE = /\s*\[(?:route|route_status|branch|exchanges)=[^\]]+\]/g
+
+const STATUS_TO_CODE: Readonly<Record<CoverageClosureStatus, string>> = {
+  reported: 'r',
+  needs_follow_up: 'f',
+  no_issue_found: 'n',
+  ruled_out: 'x',
+  not_applicable: 'a',
+}
+
+const CODE_TO_STATUS: Readonly<Record<string, CoverageClosureStatus>> = {
+  r: 'reported',
+  reported: 'reported',
+  f: 'needs_follow_up',
+  needs_follow_up: 'needs_follow_up',
+  n: 'no_issue_found',
+  no_issue_found: 'no_issue_found',
+  x: 'ruled_out',
+  ruled_out: 'ruled_out',
+  a: 'not_applicable',
+  not_applicable: 'not_applicable',
+}
 
 function sanitizeTagValue(value: string): string {
   return value.replace(/[\]\r\n]+/g, '').trim()
 }
 
+/** Normalize a route label (`METHOD /path`) for stable per-route status tracking. */
+export function normalizeRouteForCoverage(route: string): string {
+  const cleaned = sanitizeTagValue(route).replace(/,/g, '').replace(/\s+/g, ' ').trim()
+  if (!cleaned) return ''
+  const spaceIdx = cleaned.indexOf(' ')
+  if (spaceIdx > 0) {
+    const method = cleaned.slice(0, spaceIdx).toUpperCase()
+    const path = cleaned.slice(spaceIdx + 1).trim().split(/[?#]/, 1)[0] || '/'
+    return `${method} ${path}`
+  }
+  return cleaned.split(/[?#]/, 1)[0] || cleaned
+}
+
 /**
- * Parse structured route, branchKey, and exchangeIds metadata preserved in
+ * Parse structured route, per-route status, branchKey, and exchangeIds metadata preserved in
  * `coverage_entries` text fields (`summary`, `proofGapReason`, `enforcingControl`).
  */
 export function extractCoverageEvidenceMetadata(row: {
@@ -345,13 +594,19 @@ export function extractCoverageEvidenceMetadata(row: {
 }): CoverageEvidenceMetadata {
   const routes: string[] = []
   const routeSeen = new Set<string>()
-  const addRoute = (raw: string) => {
+  const routeStatuses: Record<string, CoverageClosureStatus> = {}
+  const addRoute = (raw: string): string[] => {
+    const parsed: string[] = []
     for (const part of raw.split(',')) {
-      const cleaned = sanitizeTagValue(part)
-      if (!cleaned || routeSeen.has(cleaned)) continue
-      routeSeen.add(cleaned)
-      routes.push(cleaned)
+      const cleaned = normalizeRouteForCoverage(part)
+      if (!cleaned) continue
+      parsed.push(cleaned)
+      if (!routeSeen.has(cleaned)) {
+        routeSeen.add(cleaned)
+        routes.push(cleaned)
+      }
     }
+    return parsed
   }
 
   let branchKey: string | null = null
@@ -368,8 +623,26 @@ export function extractCoverageEvidenceMetadata(row: {
 
   for (const field of [row.summary, row.proofGapReason, row.enforcingControl]) {
     if (!field) continue
+    const fieldRoutes: string[] = []
     for (const match of field.matchAll(ROUTE_META_RE)) {
-      if (match[1]) addRoute(match[1])
+      if (match[1]) fieldRoutes.push(...addRoute(match[1]))
+    }
+    for (const match of field.matchAll(ROUTE_STATUS_META_RE)) {
+      if (!match[1]) continue
+      const tokens = match[1].split(',').map(sanitizeTagValue).filter(Boolean)
+      for (let i = 0; i < tokens.length; i += 1) {
+        const tok = tokens[i]!
+        const eqIdx = tok.lastIndexOf('=')
+        if (eqIdx > 0) {
+          const r = normalizeRouteForCoverage(tok.slice(0, eqIdx))
+          const st = CODE_TO_STATUS[tok.slice(eqIdx + 1).trim()]
+          if (r && st) routeStatuses[r] = st
+        } else {
+          const st = CODE_TO_STATUS[tok]
+          const r = fieldRoutes[i]
+          if (r && st) routeStatuses[r] = st
+        }
+      }
     }
     for (const match of field.matchAll(BRANCH_META_RE)) {
       if (match[1]) {
@@ -385,35 +658,136 @@ export function extractCoverageEvidenceMetadata(row: {
   return {
     route: routes[0] ?? null,
     routes,
+    routeStatuses,
     branchKey,
     exchangeIds,
   }
 }
 
 /**
- * Attach canonical `[route=...]`, `[branch=...]`, and `[exchanges=...]` metadata
- * to a coverage entry summary while clamping total length to 600 chars so metadata
- * is never silently truncated.
+ * R3-15 route-safe per-category status aggregation:
+ *   - Tracks each route's closure status individually inside `routeStatuses`.
+ *   - Closing route A (`no_issue_found`/`ruled_out`) NEVER overwrites an open `needs_follow_up` gap on route B.
+ *   - Later closing route B itself (same route) cleanly replaces route B's `needs_follow_up`, allowing the
+ *     category cell to advance once no open `needs_follow_up` routes remain.
+ */
+export function mergeRouteCoverageStatuses(input: {
+  existingStatus?: CoverageClosureStatus | null
+  existingRoutes?: readonly string[]
+  existingRouteStatuses?: Readonly<Record<string, CoverageClosureStatus>>
+  incomingRoute?: string | null
+  incomingStatus: CoverageClosureStatus
+  allowDemotionFromReported?: boolean
+}): {
+  routeStatuses: Record<string, CoverageClosureStatus>
+  derivedStatus: CoverageClosureStatus
+  preservedExistingGap: boolean
+} {
+  const routeStatuses: Record<string, CoverageClosureStatus> = {}
+  for (const [rawRoute, st] of Object.entries(input.existingRouteStatuses ?? {})) {
+    const key = normalizeRouteForCoverage(rawRoute)
+    if (key) routeStatuses[key] = st
+  }
+  if (input.existingStatus) {
+    for (const rawRoute of input.existingRoutes ?? []) {
+      const key = normalizeRouteForCoverage(rawRoute)
+      if (key && !(key in routeStatuses)) {
+        routeStatuses[key] = input.existingStatus
+      }
+    }
+  }
+
+  const incomingKey = input.incomingRoute ? normalizeRouteForCoverage(input.incomingRoute) : ''
+  if (input.allowDemotionFromReported) {
+    for (const [k, st] of Object.entries(routeStatuses)) {
+      if (st === 'reported') delete routeStatuses[k]
+    }
+  }
+  if (incomingKey) {
+    const prevForRoute = routeStatuses[incomingKey]
+    if (prevForRoute !== 'reported' || input.allowDemotionFromReported) {
+      routeStatuses[incomingKey] = input.incomingStatus
+    }
+  }
+
+  const trackedValues = Object.values(routeStatuses)
+  const existingHadNoRoutes = (input.existingRoutes?.length ?? 0) === 0
+    && Object.keys(input.existingRouteStatuses ?? {}).length === 0
+
+  let derivedStatus: CoverageClosureStatus = input.incomingStatus
+  if (!input.allowDemotionFromReported && trackedValues.includes('reported')) {
+    derivedStatus = 'reported'
+  } else if (trackedValues.includes('needs_follow_up')) {
+    derivedStatus = 'needs_follow_up'
+  } else if (
+    input.existingStatus === 'needs_follow_up'
+    && existingHadNoRoutes
+    && coverageStatusRank(input.incomingStatus) < coverageStatusRank('needs_follow_up')
+  ) {
+    // An unscoped category-level gap (e.g. host quarantine) cannot be cleared by a single-route closure.
+    derivedStatus = 'needs_follow_up'
+  } else if (
+    !input.allowDemotionFromReported
+    && input.existingStatus
+    && trackedValues.length === 0
+    && coverageStatusRank(input.incomingStatus) < coverageStatusRank(input.existingStatus)
+  ) {
+    derivedStatus = input.existingStatus
+  }
+
+  return {
+    routeStatuses,
+    derivedStatus,
+    preservedExistingGap: derivedStatus === 'needs_follow_up' && input.incomingStatus !== 'needs_follow_up',
+  }
+}
+
+/**
+ * Attach canonical `[route=...]`, `[route_status=...]`, `[branch=...]`, and `[exchanges=...]`
+ * metadata to a coverage entry summary while clamping total length to 600 chars so metadata
+ * is never silently truncated. When > 6 routes exist, higher-rank (`reported` / `needs_follow_up`)
+ * routes are always retained first so open gaps are never evicted.
  */
 export function appendCoverageEvidenceMetadata(
   summary: string,
   meta: {
     routes?: readonly string[]
     route?: string | null
+    routeStatuses?: Readonly<Record<string, CoverageClosureStatus>>
     branchKey?: string | null
     exchangeIds?: readonly string[]
   },
 ): string {
   const base = summary.replace(ALL_META_TRAILERS_RE, '').trim()
-  const routes = [...new Set([
+  const normStatuses: Record<string, CoverageClosureStatus> = {}
+  for (const [k, v] of Object.entries(meta.routeStatuses ?? {})) {
+    const nk = normalizeRouteForCoverage(k)
+    if (nk) normStatuses[nk] = v
+  }
+  const allRoutes = [...new Set([
     ...(meta.routes ?? []),
     ...(meta.route ? [meta.route] : []),
-  ].map(sanitizeTagValue).filter(Boolean))].slice(0, 6)
+    ...Object.keys(normStatuses),
+  ].map(normalizeRouteForCoverage).filter(Boolean))]
+  const routes = allRoutes.length <= 6
+    ? allRoutes
+    : [...allRoutes]
+        .sort((a, b) => coverageStatusRank(normStatuses[b] ?? 'unprobed') - coverageStatusRank(normStatuses[a] ?? 'unprobed'))
+        .slice(0, 6)
   const branch = meta.branchKey ? sanitizeTagValue(meta.branchKey).slice(0, 120) : ''
   const exchanges = [...new Set((meta.exchangeIds ?? []).map(sanitizeTagValue).filter(Boolean))].slice(0, 8)
 
   const parts: string[] = []
-  if (routes.length > 0) parts.push(`[route=${routes.join(',')}]`)
+  if (routes.length > 0) {
+    parts.push(`[route=${routes.join(',')}]`)
+    const hasAnyStatus = routes.some(r => r in normStatuses)
+    if (hasAnyStatus) {
+      const codes = routes.map(r => (normStatuses[r] ? STATUS_TO_CODE[normStatuses[r]!] : '')).join(',')
+      if (codes.replace(/,/g, '').length > 0) {
+        parts.push(`[route_status=${codes}]`)
+      }
+    }
+  }
   if (branch) parts.push(`[branch=${branch}]`)
   if (exchanges.length > 0) parts.push(`[exchanges=${exchanges.join(',')}]`)
   if (parts.length === 0) return base.slice(0, 600)
