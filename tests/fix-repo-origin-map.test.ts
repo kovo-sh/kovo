@@ -306,7 +306,10 @@ describe('P1 #4a: Edge-Protected & Dead Host Quarantine', () => {
         { origin: 'https://live-app.example', status: 401, pathAndQuery: '/api/admin' },
         { origin: 'https://telemetry-401.example', status: 401, pathAndQuery: '/' },
         { origin: 'https://telemetry-401.example', status: 401, pathAndQuery: '/api/health' },
+        { origin: 'https://telemetry-401.example', status: 401, pathAndQuery: '/api/status' },
         { origin: 'https://telemetry-525.example', status: 525, pathAndQuery: '/' },
+        { origin: 'https://telemetry-525.example', status: 525, pathAndQuery: '/health' },
+        { origin: 'https://telemetry-525.example', status: 525, pathAndQuery: '/api' },
       ],
       personas: [],
     })

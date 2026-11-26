@@ -76,6 +76,7 @@ import {
 import type { LabTargetHandle } from './lab-runner.ts'
 import { selectRankedProbeTargets, type Phase0ProbePlanSummary } from './probe-plan.ts'
 import type { ServiceOriginMapping } from './program-graph.ts'
+import { resolveRunSafetyBudgets, type RunSafetyBudgets } from './run-safety-budgets.ts'
 import {
   chainStepRetryableStatuses,
   chainStepTerminalStatuses,
@@ -1208,28 +1209,66 @@ export interface DispatchFunnelStep {
   status: string
   dependsOnFactIds?: readonly string[]
   dependsOnStepIds?: readonly string[]
+  sourceOrigins?: readonly string[]
+}
+
+const ORIGIN_QUARANTINE_SKILL_PREFIX = 'kovo:origin_quarantined:'
+const ORIGIN_QUARANTINE_DEPENDENT_SKILL_TAG = 'kovo:quarantine_dependent_tainted'
+const CIRCUIT_OPEN_SKILL_TAG = 'kovo:circuit_open'
+
+/**
+ * Single authoritative predicate (`R4-H-12`): true when every declared origin of `step` is
+ * unavailable (origin-quarantined and/or circuit-open). Shared across `dispatchFrontierWave`,
+ * `applyCrownJewelStepBudget`, `permanentlyBlockedStepIds`, `dispatchableReadySteps`,
+ * `hasActiveInvestigationSteps`, `passOneCoverageFor`, and `reconcileUnavailableOriginSteps`.
+ */
+export function isStepOriginUnavailable(
+  step: { sourceOrigins?: readonly string[]; origins?: readonly string[] },
+  unavailableOrigins?: ReadonlySet<string>,
+): boolean {
+  if (!unavailableOrigins || unavailableOrigins.size === 0) return false
+  const raw = Array.isArray(step.sourceOrigins)
+    ? step.sourceOrigins
+    : Array.isArray(step.origins)
+      ? step.origins
+      : []
+  const origins = raw.map(o => o.trim()).filter(Boolean)
+  return origins.length > 0 && origins.every(origin => unavailableOrigins.has(origin))
 }
 
 /**
  * Pending steps whose declared dependencies can never resolve: a step dependency that is missing,
- * has a terminal non-satisfying status per `STEP_STATUS` (or transitively depends on one), or
- * (when the fact set is supplied) a fact id that does not exist. These are permanently stranded —
- * `refreshReadyChainSteps` can never promote them — so the funnel reports them as `filteredDep`
- * and `dispatchableReadySteps` excludes them from the O3 planner deferral gate.
+ * has a terminal non-satisfying status per `STEP_STATUS` (or transitively depends on one), targets
+ * exclusively unavailable (quarantined / circuit-open) origins, forms a dependency cycle with no
+ * resolvable root, or (when the fact set is supplied) cites a fact id that does not exist.
  */
 export function permanentlyBlockedStepIds(
   steps: readonly DispatchFunnelStep[],
   knownFactIds?: ReadonlySet<string>,
+  unavailableOrigins?: ReadonlySet<string>,
 ): string[] {
   const byId = new Map(steps.map(step => [step.id, step]))
+  const unavailableStepIds = new Set<string>()
+  if (unavailableOrigins && unavailableOrigins.size > 0) {
+    for (const step of steps) {
+      if (step.status !== 'running' && !isTerminalStepStatus(step.status) && isStepOriginUnavailable(step, unavailableOrigins)) {
+        unavailableStepIds.add(step.id)
+      }
+    }
+  }
   const blockedSet = new Set<string>()
   let changed = true
   while (changed) {
     changed = false
     for (const step of steps) {
       if (step.status !== 'pending' || blockedSet.has(step.id)) continue
+      if (unavailableStepIds.has(step.id)) {
+        blockedSet.add(step.id)
+        changed = true
+        continue
+      }
       const deadStepDep = (step.dependsOnStepIds ?? []).some(id => {
-        if (blockedSet.has(id)) return true
+        if (blockedSet.has(id) || unavailableStepIds.has(id)) return true
         const dep = byId.get(id)
         return !dep || stepBlocksDependent(dep.status)
       })
@@ -1242,21 +1281,243 @@ export function permanentlyBlockedStepIds(
       }
     }
   }
+  // Detect genuine dependency cycles among remaining pending steps (e.g. A -> B -> A with no
+  // resolvable root). Acyclic chains rooted at a `pending` (deps=[]), `ready`, `running`, or
+  // `complete` step remain resolvable and are NOT marked blocked.
+  const resolvable = new Set<string>()
+  for (const step of steps) {
+    if (blockedSet.has(step.id) || unavailableStepIds.has(step.id)) continue
+    if (step.status === 'ready' || step.status === 'running' || step.status === 'complete') {
+      resolvable.add(step.id)
+    } else if (step.status === 'pending' && (step.dependsOnStepIds ?? []).length === 0) {
+      resolvable.add(step.id)
+    }
+  }
+  let resolvedMore = true
+  while (resolvedMore) {
+    resolvedMore = false
+    for (const step of steps) {
+      if (step.status !== 'pending' || blockedSet.has(step.id) || resolvable.has(step.id)) continue
+      const deps = step.dependsOnStepIds ?? []
+      if (deps.length > 0 && deps.every(id => resolvable.has(id))) {
+        resolvable.add(step.id)
+        resolvedMore = true
+      }
+    }
+  }
+  for (const step of steps) {
+    if (step.status === 'pending' && !blockedSet.has(step.id) && !resolvable.has(step.id)) {
+      blockedSet.add(step.id)
+    }
+  }
   return steps.filter(step => blockedSet.has(step.id)).map(step => step.id)
 }
 
 /** Steps the scheduler could still dispatch: `ready`, plus `pending` with satisfiable deps.
- *  All terminal statuses (derived from `STEP_STATUS`) and any pending step whose dependency is
- *  terminal non-satisfying (directly or transitively) are excluded. */
+ *  All terminal statuses (derived from `STEP_STATUS`), any step whose origins are all unavailable
+ *  (quarantined / circuit-open), and any pending step whose dependency is terminal non-satisfying
+ *  (directly or transitively) are excluded. */
 export function dispatchableReadySteps<T extends DispatchFunnelStep>(
   steps: readonly T[],
   knownFactIds?: ReadonlySet<string>,
+  unavailableOrigins?: ReadonlySet<string>,
 ): T[] {
-  const blocked = new Set(permanentlyBlockedStepIds(steps, knownFactIds))
+  const blocked = new Set(permanentlyBlockedStepIds(steps, knownFactIds, unavailableOrigins))
   return steps.filter(step =>
     !isTerminalStepStatus(step.status)
+    && !isStepOriginUnavailable(step, unavailableOrigins)
     && (step.status === 'ready' || (step.status === 'pending' && !blocked.has(step.id))),
   )
+}
+
+/**
+ * Single quarantine- and terminal-status-aware activity predicate (`R4-H-12` / `R4-H-13`).
+ * True iff at least one step is actively `running` or dispatchable per {@link dispatchableReadySteps}.
+ */
+export function hasActiveInvestigationSteps(
+  steps: readonly DispatchFunnelStep[],
+  knownFactIds?: ReadonlySet<string>,
+  unavailableOrigins?: ReadonlySet<string>,
+): boolean {
+  if (steps.some(step => step.status === 'running')) return true
+  return dispatchableReadySteps(steps, knownFactIds, unavailableOrigins).length > 0
+}
+
+export interface ReconcileUnavailableOriginStepsInput {
+  storage: Pick<Store, 'listChainSteps' | 'updateChainStep' | 'refreshReadyChainSteps' | 'event' | 'upsertCoverageEntry'>
+  run: Run
+  /** Currently quarantined origins -> quarantine record (`edge_protected` | `unreachable`). */
+  quarantinedOrigins?: ReadonlyMap<string, QuarantinedOriginRecord>
+  /** Origins whose defensive broker circuit breaker is currently open. */
+  circuitOpenOrigins?: ReadonlySet<string>
+  /** In-flight assignment IDs (running steps are never mutated mid-execution). */
+  activeAssignmentIds?: ReadonlySet<string>
+}
+
+export interface ReconcileUnavailableOriginStepsResult {
+  blockedForQuarantineIds: string[]
+  blockedForCircuitIds: string[]
+  restoredStepIds: string[]
+  refreshed: boolean
+}
+
+function isOriginQuarantinedBlockedStep(step: Pick<ChainStep, 'status' | 'skills'>): boolean {
+  return step.status === 'blocked' && step.skills.some(s => s.startsWith(ORIGIN_QUARANTINE_SKILL_PREFIX))
+}
+
+function isOriginQuarantineDependentTaintedStep(step: Pick<ChainStep, 'status' | 'skills'>): boolean {
+  return step.status === 'tainted' && step.skills.includes(ORIGIN_QUARANTINE_DEPENDENT_SKILL_TAG)
+}
+
+/**
+ * Single authoritative terminal-transition & restore primitive for BOTH origin quarantine and
+ * circuit-open steps (`R4-H-12`).
+ *
+ * 1. When a previously quarantined origin is released (e.g. live response or authenticated persona),
+ *    restores `blocked` steps tagged `kovo:origin_quarantined:*` (and any dependents tainted solely
+ *    by them) to `pending` so `refreshReadyChainSteps` promotes them back to `ready`.
+ * 2. Transitions every non-running active (`ready` / `pending`) step whose origins are all
+ *    quarantined or circuit-open to typed `blocked` with a structured gap tag + coverage gap, then
+ *    invokes `refreshReadyChainSteps` so downstream dependents never wedge in `pending`.
+ */
+export function reconcileUnavailableOriginSteps(
+  input: ReconcileUnavailableOriginStepsInput,
+): ReconcileUnavailableOriginStepsResult {
+  const { storage, run, quarantinedOrigins, circuitOpenOrigins, activeAssignmentIds } = input
+  const unavailableOrigins = new Set<string>()
+  if (quarantinedOrigins) {
+    for (const origin of quarantinedOrigins.keys()) unavailableOrigins.add(origin)
+  }
+  if (circuitOpenOrigins) {
+    for (const origin of circuitOpenOrigins) unavailableOrigins.add(origin)
+  }
+
+  const steps = storage.listChainSteps(run.id, run.goalRevision)
+  const restoredStepIds: string[] = []
+  const restoredSet = new Set<string>()
+
+  // 1. Restore steps whose quarantined origin(s) have since become available.
+  for (const step of steps) {
+    if (!isOriginQuarantinedBlockedStep(step)) continue
+    if (isStepOriginUnavailable(step, unavailableOrigins)) continue
+    const cleanedSkills = step.skills.filter(s => !s.startsWith(ORIGIN_QUARANTINE_SKILL_PREFIX))
+    storage.updateChainStep(step.id, { status: 'pending', skills: cleanedSkills })
+    restoredStepIds.push(step.id)
+    restoredSet.add(step.id)
+  }
+  if (restoredSet.size > 0) {
+    // Also restore downstream dependents that were tainted solely by a restored quarantined step.
+    let restoredMore = true
+    while (restoredMore) {
+      restoredMore = false
+      for (const step of steps) {
+        if (restoredSet.has(step.id) || !isOriginQuarantineDependentTaintedStep(step)) continue
+        if (isStepOriginUnavailable(step, unavailableOrigins)) continue
+        if (!step.dependsOnStepIds.some(sid => restoredSet.has(sid))) continue
+        const cleanedSkills = step.skills.filter(s => s !== ORIGIN_QUARANTINE_DEPENDENT_SKILL_TAG)
+        storage.updateChainStep(step.id, { status: 'pending', skills: cleanedSkills })
+        restoredStepIds.push(step.id)
+        restoredSet.add(step.id)
+        restoredMore = true
+      }
+    }
+  }
+
+  // 2. Transition non-running active steps whose origins are all unavailable to `blocked`.
+  const blockedForQuarantineIds: string[] = []
+  const blockedForCircuitIds: string[] = []
+  const recordedGapOrigins = new Set<string>()
+  if (unavailableOrigins.size > 0) {
+    for (const step of steps) {
+      if (step.status === 'running') continue
+      if (step.assignedWorkerId && activeAssignmentIds?.has(step.assignedWorkerId)) continue
+      if (isTerminalStepStatus(step.status)) continue
+      if (!isStepOriginUnavailable(step, unavailableOrigins)) continue
+
+      const stepOrigins = step.sourceOrigins.map(o => o.trim()).filter(Boolean)
+      const allCircuit = Boolean(
+        circuitOpenOrigins && circuitOpenOrigins.size > 0 && stepOrigins.every(o => circuitOpenOrigins.has(o)),
+      )
+      if (allCircuit) {
+        const nextSkills = step.skills.includes(CIRCUIT_OPEN_SKILL_TAG)
+          ? step.skills
+          : [...step.skills, CIRCUIT_OPEN_SKILL_TAG]
+        storage.updateChainStep(step.id, { status: 'blocked', skills: nextSkills })
+        blockedForCircuitIds.push(step.id)
+      } else {
+        let primaryReason: OriginQuarantineReason = 'edge_protected'
+        for (const o of stepOrigins) {
+          if (quarantinedOrigins?.get(o)?.reason === 'unreachable') {
+            primaryReason = 'unreachable'
+            break
+          }
+        }
+        const tag = `${ORIGIN_QUARANTINE_SKILL_PREFIX}${primaryReason}`
+        const nextSkills = [
+          ...step.skills.filter(s => !s.startsWith(ORIGIN_QUARANTINE_SKILL_PREFIX)),
+          tag,
+        ]
+        storage.updateChainStep(step.id, { status: 'blocked', skills: nextSkills })
+        blockedForQuarantineIds.push(step.id)
+
+        for (const origin of stepOrigins) {
+          const rec = quarantinedOrigins?.get(origin)
+          if (!rec) continue
+          const gapKey = `${origin}\0${rec.reason}`
+          if (recordedGapOrigins.has(gapKey)) continue
+          recordedGapOrigins.add(gapKey)
+          const category = rec.reason === 'edge_protected' ? 'auth-identity' : 'misconfig-exposure'
+          const summary = rec.reason === 'edge_protected'
+            ? `Host quarantined (edge_protected): ${rec.detail}. Queued steps transitioned to blocked until an authenticated persona or live response unlocks this origin.`
+            : `Host quarantined (unreachable): ${rec.detail}. Queued steps transitioned to blocked until a live response confirms recovery.`
+          try {
+            storage.upsertCoverageEntry(run, 'planner:host-quarantine', {
+              origin,
+              category,
+              status: 'needs_follow_up',
+              summary,
+              proofGapReason: rec.reason,
+            })
+          } catch { /* coverage gap recording is best-effort */ }
+        }
+      }
+    }
+  }
+
+  const changed = restoredStepIds.length > 0 || blockedForQuarantineIds.length > 0 || blockedForCircuitIds.length > 0
+  if (changed) {
+    storage.refreshReadyChainSteps(run.id, run.goalRevision)
+    try {
+      if (blockedForQuarantineIds.length > 0 || blockedForCircuitIds.length > 0) {
+        storage.event(
+          run.id,
+          'scheduler.steps_blocked_origin_unavailable',
+          `Transitioned ${blockedForQuarantineIds.length} quarantined-origin and ${blockedForCircuitIds.length} circuit-open step(s) to blocked.`,
+          {
+            blockedForQuarantineIds,
+            blockedForCircuitIds,
+            quarantinedOrigins: [...(quarantinedOrigins?.keys() ?? [])],
+            circuitOpenOrigins: [...(circuitOpenOrigins ?? [])],
+          },
+        )
+      }
+      if (restoredStepIds.length > 0) {
+        storage.event(
+          run.id,
+          'scheduler.steps_restored_origin_unquarantined',
+          `Restored ${restoredStepIds.length} previously quarantined step(s) after origin recovery.`,
+          { restoredStepIds },
+        )
+      }
+    } catch { /* telemetry is best-effort */ }
+  }
+
+  return {
+    blockedForQuarantineIds,
+    blockedForCircuitIds,
+    restoredStepIds,
+    refreshed: changed,
+  }
 }
 
 /**
@@ -2068,7 +2329,21 @@ export interface QuarantinedOriginRecord {
   detail: string
   observedStatuses?: number[]
   requestsObserved?: number
+  quarantinedAt?: number
   source: 'phase0_edge_protected' | 'phase0_dead_host' | 'telemetry_401_wall' | 'telemetry_52x_dead'
+}
+
+export interface QuarantineObservedExchange {
+  origin: string
+  status?: number | null
+  error?: string | null
+  personaHandle?: string | null
+  pathAndQuery?: string
+  createdAt?: number | null
+  /** Assignment phase from `assignments.phase` (used to exclude arbitrary worker traffic). */
+  assignmentPhase?: string | null
+  /** Explicit probe provenance (`phase0`/`host` preferred; `worker` never triggers quarantine). */
+  probeSource?: 'phase0' | 'host' | 'worker' | null
 }
 
 export interface DetectQuarantinedOriginsInput {
@@ -2077,16 +2352,21 @@ export interface DetectQuarantinedOriginsInput {
   edgeProtectedOrigins?: ReadonlyArray<string | { origin: string; reason?: string; status?: number; requestsUsed?: number }>
   /** Explicit dead/unreachable origins short-circuited by Phase-0. */
   skippedDeadHosts?: ReadonlyArray<{ origin: string; reason: string; requestsUsed?: number }>
-  /** Observed HTTP exchanges / probe telemetry (from Phase-0, baseline captures, or broker_exchanges). */
-  observedExchanges?: ReadonlyArray<{
-    origin: string
-    status?: number | null
-    error?: string | null
-    personaHandle?: string | null
-    pathAndQuery?: string
-  }>
+  /** Observed HTTP exchanges / probe telemetry (per-origin sampled; host/Phase-0 probes preferred). */
+  observedExchanges?: ReadonlyArray<QuarantineObservedExchange>
   /** Active authenticated personas with optional origin allowlist. */
   personas?: ReadonlyArray<{ handle?: string; originAllowlist?: readonly string[] | null }>
+  /** Origins that have EVER recorded a live non-401/407/52x HTTP response during this run (lifetime immunity). */
+  everLiveOrigins?: ReadonlySet<string>
+  /** Origins that have EVER recorded any non-52x HTTP response during this run (never unreachable). */
+  everReachableOrigins?: ReadonlySet<string>
+  /** Optional overrides for `RunSafetyBudgets` quarantine thresholds (defaults via `resolveRunSafetyBudgets()`). */
+  budgets?: Partial<Pick<
+    RunSafetyBudgets,
+    'originQuarantineMin52xCount' | 'originQuarantineMin401Count' | 'originQuarantineMinDistinctPaths' | 'originQuarantineWindowMs'
+  >>
+  /** Reference clock in epoch ms for `originQuarantineWindowMs` filtering (defaults to latest probe timestamp). */
+  nowMs?: number
 }
 
 export interface DetectQuarantinedOriginsResult {
@@ -2094,6 +2374,42 @@ export interface DetectQuarantinedOriginsResult {
   quarantinedSet: Set<string>
   activeOrigins: string[]
   records: QuarantinedOriginRecord[]
+}
+
+function isDead52xStatus(status: number | null | undefined): boolean {
+  return typeof status === 'number' && status >= 520 && status <= 526
+}
+
+/** True for any live HTTP response from the target that is neither an edge 52x error nor a 401/407 auth wall. */
+export function isLiveNon401HttpStatus(status: number | null | undefined): boolean {
+  return (
+    typeof status === 'number'
+    && status >= 100
+    && status < 600
+    && status !== 401
+    && status !== 407
+    && !isDead52xStatus(status)
+  )
+}
+
+function isReachableHttpStatus(status: number | null | undefined): boolean {
+  return typeof status === 'number' && status >= 100 && status < 600 && !isDead52xStatus(status)
+}
+
+function isHostOriginatedQuarantineProbe(ex: QuarantineObservedExchange): boolean {
+  if (ex.probeSource === 'worker') return false
+  if (ex.probeSource === 'phase0' || ex.probeSource === 'host') return true
+  if (typeof ex.assignmentPhase === 'string' && ex.assignmentPhase.trim()) {
+    const phase = ex.assignmentPhase.trim().toLowerCase()
+    return phase === 'discovery' || phase === 'threat_model'
+  }
+  return true
+}
+
+function normalizeQuarantineProbePath(pathAndQuery: string | undefined): string {
+  const raw = (pathAndQuery ?? '/').trim()
+  const base = raw.split(/[?#]/, 1)[0]?.trim() || '/'
+  return base.startsWith('/') ? base : `/${base}`
 }
 
 /** True when at least one authenticated persona is permitted to access `origin`. */
@@ -2122,20 +2438,59 @@ export function hasAuthenticatedPersonaForOrigin(
 }
 
 /**
- * Detect uniform edge-protected (e.g. Cloudflare Access / Basic 401-wall with no persona) and
- * dead/unreachable (e.g. Phase-0 `skippedDeadHosts` or 520–526 TLS/origin-error-only) hosts so
- * planner and dispatch quarantine them behind a single structured coverage gap instead of burning
- * investigation turns.
+ * Evidence-based per-origin quarantine detector (`R4-H-11`).
+ *
+ * Thresholds come strictly from `resolveRunSafetyBudgets()`:
+ *   - `originQuarantineMin52xCount` (default 3)
+ *   - `originQuarantineMin401Count` (default 3)
+ *   - `originQuarantineMinDistinctPaths` (default 2)
+ *   - `originQuarantineWindowMs` (default 300_000 ms)
+ *
+ * Invariants:
+ *   1. Samples strictly per origin (busy origin A can never scroll origin B's live rows out).
+ *   2. Any live non-401 HTTP response ever recorded for an origin (host OR worker traffic) grants
+ *      quarantine immunity and releases prior `unreachable` / `edge_protected` quarantine.
+ *   3. Telemetry quarantine uses only Phase-0 / host-originated probes (never worker traffic) and
+ *      requires both minimum probe count AND minimum distinct paths within `originQuarantineWindowMs`.
  */
 export function detectQuarantinedOrigins(input: DetectQuarantinedOriginsInput): DetectQuarantinedOriginsResult {
   const approvedList = [...new Set(input.approvedOrigins.map(o => o.trim()).filter(Boolean))]
   const approvedSet = new Set(approvedList)
   const quarantined = new Map<string, QuarantinedOriginRecord>()
 
-  // 1. Explicit Phase-0 dead / unreachable hosts (quarantined regardless of personas).
+  const budgets = resolveRunSafetyBudgets({ overrides: input.budgets })
+  const min52xCount = budgets.originQuarantineMin52xCount
+  const min401Count = budgets.originQuarantineMin401Count
+  const minDistinctPaths = budgets.originQuarantineMinDistinctPaths
+  const windowMs = budgets.originQuarantineWindowMs
+
+  // Collect per-origin lifetime liveness across ALL exchanges (host AND worker) + caller sets.
+  const liveNon401Origins = new Set<string>(input.everLiveOrigins ?? [])
+  const reachableOrigins = new Set<string>(input.everReachableOrigins ?? [])
+  for (const o of liveNon401Origins) reachableOrigins.add(o)
+
+  const hostProbesByOrigin = new Map<string, QuarantineObservedExchange[]>()
+  for (const ex of input.observedExchanges ?? []) {
+    const origin = (ex?.origin ?? '').trim()
+    if (!origin || !approvedSet.has(origin)) continue
+    if (isLiveNon401HttpStatus(ex.status)) {
+      liveNon401Origins.add(origin)
+      reachableOrigins.add(origin)
+    } else if (isReachableHttpStatus(ex.status)) {
+      reachableOrigins.add(origin)
+    }
+    if (isHostOriginatedQuarantineProbe(ex)) {
+      const list = hostProbesByOrigin.get(origin)
+      if (list) list.push(ex)
+      else hostProbesByOrigin.set(origin, [ex])
+    }
+  }
+
+  // 1. Explicit Phase-0 dead / unreachable hosts (superseded if a live/reachable response arrived).
   for (const dead of input.skippedDeadHosts ?? []) {
     const origin = (dead?.origin ?? '').trim()
     if (!origin || !approvedSet.has(origin) || quarantined.has(origin)) continue
+    if (liveNon401Origins.has(origin) || reachableOrigins.has(origin)) continue
     quarantined.set(origin, {
       origin,
       reason: 'unreachable',
@@ -2145,10 +2500,11 @@ export function detectQuarantinedOrigins(input: DetectQuarantinedOriginsInput): 
     })
   }
 
-  // 2. Explicit Phase-0 uniform edge-protected hosts (quarantined unless an authenticated persona exists for the origin).
+  // 2. Explicit Phase-0 uniform edge-protected hosts (superseded by authenticated persona or live non-401 response).
   for (const entry of input.edgeProtectedOrigins ?? []) {
     const origin = (typeof entry === 'string' ? entry : entry?.origin ?? '').trim()
     if (!origin || !approvedSet.has(origin) || quarantined.has(origin)) continue
+    if (liveNon401Origins.has(origin)) continue
     if (hasAuthenticatedPersonaForOrigin(origin, input.personas)) continue
     const detail = typeof entry === 'string'
       ? 'uniform edge authentication wall (no authenticated persona configured)'
@@ -2163,53 +2519,63 @@ export function detectQuarantinedOrigins(input: DetectQuarantinedOriginsInput): 
     })
   }
 
-  // 3. Observed exchange telemetry fallback (uniform 520-526/dead or uniform 401-wall across paths).
-  const byOrigin = new Map<string, Array<{ status?: number | null; error?: string | null; personaHandle?: string | null; pathAndQuery?: string }>>()
-  for (const ex of input.observedExchanges ?? []) {
-    const origin = (ex?.origin ?? '').trim()
-    if (!origin || !approvedSet.has(origin) || quarantined.has(origin)) continue
-    const list = byOrigin.get(origin)
-    if (list) list.push(ex)
-    else byOrigin.set(origin, [ex])
-  }
+  // 3. Per-origin evidence-based telemetry fallback (strictly Phase-0 / host-originated probes).
+  for (const [origin, probes] of hostProbesByOrigin.entries()) {
+    if (!probes.length || quarantined.has(origin)) continue
+    if (liveNon401Origins.has(origin)) continue
 
-  for (const [origin, list] of byOrigin.entries()) {
-    if (!list.length) continue
-    const statuses = list.map(ex => (typeof ex.status === 'number' && ex.status > 0 ? ex.status : 0))
+    const timestamps = probes
+      .map(ex => ex.createdAt)
+      .filter((ts): ts is number => typeof ts === 'number' && Number.isFinite(ts) && ts > 0)
+    const refNow = typeof input.nowMs === 'number' && Number.isFinite(input.nowMs)
+      ? input.nowMs
+      : (timestamps.length > 0 ? Math.max(...timestamps) : Date.now())
+    const windowed = probes.filter(ex =>
+      typeof ex.createdAt !== 'number'
+      || !Number.isFinite(ex.createdAt)
+      || ex.createdAt <= 0
+      || (ex.createdAt <= refNow && refNow - ex.createdAt <= windowMs),
+    )
+    if (!windowed.length) continue
+
+    const statuses = windowed.map(ex => (typeof ex.status === 'number' && ex.status > 0 ? ex.status : 0))
     const uniqueStatuses = [...new Set(statuses.filter(s => s > 0))].sort((a, b) => a - b)
-    const isDeadStatus = (s: number) => s >= 520 && s <= 526
-    const allDeadOrError = list.every((ex, idx) => {
+    const allDeadOrError = windowed.every((ex, idx) => {
       const st = statuses[idx]!
-      return isDeadStatus(st) || (st === 0 && Boolean(ex.error))
+      return isDead52xStatus(st) || (st === 0 && Boolean(ex.error))
     })
-    const hasDead52x = statuses.some(isDeadStatus)
-    if (allDeadOrError && (hasDead52x || list.length >= 2)) {
+    const distinctWindowPaths = new Set(windowed.map(ex => normalizeQuarantineProbePath(ex.pathAndQuery)))
+    const hasDead52x = statuses.some(isDead52xStatus)
+    if (
+      !reachableOrigins.has(origin)
+      && allDeadOrError
+      && windowed.length >= min52xCount
+      && distinctWindowPaths.size >= minDistinctPaths
+    ) {
       quarantined.set(origin, {
         origin,
         reason: 'unreachable',
         detail: hasDead52x
-          ? `host returned only origin/TLS error status(es) [${uniqueStatuses.join(', ')}] across ${list.length} probe(s)`
-          : `host failed all ${list.length} transport probe(s) with no live HTTP response`,
+          ? `host returned only origin/TLS error status(es) [${uniqueStatuses.join(', ')}] across ${windowed.length} host probe(s) (${distinctWindowPaths.size} path(s))`
+          : `host failed all ${windowed.length} transport host probe(s) (${distinctWindowPaths.size} path(s)) with no live HTTP response`,
         ...(uniqueStatuses.length ? { observedStatuses: uniqueStatuses } : {}),
-        requestsObserved: list.length,
+        requestsObserved: windowed.length,
         source: 'telemetry_52x_dead',
       })
       continue
     }
 
     if (hasAuthenticatedPersonaForOrigin(origin, input.personas)) continue
-    const anonList = list.filter(ex => !ex.personaHandle || ex.personaHandle === 'anonymous')
-    if (anonList.length < 2) continue
+    const anonList = windowed.filter(ex => !ex.personaHandle || ex.personaHandle === 'anonymous')
+    if (anonList.length < min401Count) continue
     const all401Wall = anonList.every(ex => ex.status === 401 || ex.status === 407)
     if (!all401Wall) continue
-    const distinctPaths = new Set(
-      anonList.map(ex => (ex.pathAndQuery ?? '/').split(/[?#]/, 1)[0] || '/'),
-    )
-    if (distinctPaths.size >= 2 || anonList.length >= 3) {
+    const distinct401Paths = new Set(anonList.map(ex => normalizeQuarantineProbePath(ex.pathAndQuery)))
+    if (distinct401Paths.size >= minDistinctPaths) {
       quarantined.set(origin, {
         origin,
         reason: 'edge_protected',
-        detail: `uniform edge 401 auth wall across ${anonList.length} probe(s) (${distinctPaths.size} path(s)) with no authenticated persona`,
+        detail: `uniform edge 401 auth wall across ${anonList.length} host probe(s) (${distinct401Paths.size} path(s)) with no authenticated persona`,
         observedStatuses: [...new Set(anonList.map(ex => ex.status!).filter(Boolean))].sort((a, b) => a - b),
         requestsObserved: anonList.length,
         source: 'telemetry_401_wall',
@@ -2730,16 +3096,10 @@ export function dispatchFrontierWave<T extends DispatchLaneStep>(
   let eviRankedCount = 0
 
   const quarantined = options.quarantinedOrigins
-  const isQuarantinedStep = (step: T): boolean => {
-    if (!quarantined || quarantined.size === 0) return false
-    const origins = (step.sourceOrigins ?? []).filter(Boolean)
-    return origins.length > 0 && origins.every(origin => quarantined.has(origin))
-  }
-
   for (const step of steps) {
     if (seenStepIds.has(step.id)) continue
     seenStepIds.add(step.id)
-    if (isQuarantinedStep(step)) continue
+    if (isStepOriginUnavailable(step, quarantined)) continue
     const meta = resolveStepDispatchMeta(step, options, branchEviIndex)
     metaById.set(step.id, meta)
     if (meta.evi > 0) eviRankedCount += 1
@@ -3941,7 +4301,7 @@ export function applyCrownJewelStepBudget<T extends { title: string; priority: n
   const hasCrownOrigin = (origins: readonly string[]) =>
     origins.some(o => (hostTiers[o] ?? classifyHostTier(o)) === 'crown_jewel')
   const isQuarantined = (origins: readonly string[]) =>
-    Boolean(quarantined && quarantined.size > 0 && origins.length > 0 && origins.every(o => quarantined.has(o)))
+    isStepOriginUnavailable({ origins }, quarantined)
 
   const staticStepsByOrigin = new Map<string, number>()
   const existingNonStaticCountsByOrigin = new Map<string, number>()
@@ -5243,6 +5603,7 @@ export interface RunOrchestrationState {
   detLeadGateRejected: Set<string>
   cappedLeadReported: Set<string>
   tierAStepKeys: Set<string>
+  strandedBackstopReported: Set<string>
 }
 
 export function createRunOrchestrationState(runId: string): RunOrchestrationState {
@@ -5267,6 +5628,7 @@ export function createRunOrchestrationState(runId: string): RunOrchestrationStat
     detLeadGateRejected: new Set(),
     cappedLeadReported: new Set(),
     tierAStepKeys: new Set(),
+    strandedBackstopReported: new Set(),
   }
 }
 
