@@ -63,4 +63,6 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD ["node", "-e", "fetch('http://127.0.0.1:' + (process.env.PORT || 8000) + '/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
 
-CMD ["node", "--disable-proto=throw", "--enable-experimental-regexp-engine-on-excessive-backtracks", "--regexp-backtracks-before-fallback=10000", "scripts/serve.ts"]
+# Use --disable-proto=delete (not =throw): playwright-core's colors helper assigns `builder.__proto__ = proto`
+# in formatCallLog (playwright-core/lib/utilsBundle.js:591), which crashes with ERR_PROTO_ACCESS under =throw.
+CMD ["node", "--disable-proto=delete", "--enable-experimental-regexp-engine-on-excessive-backtracks", "--regexp-backtracks-before-fallback=10000", "scripts/serve.ts"]
