@@ -190,6 +190,65 @@ describe('R3-12 FP #1: honest authorized wallet/accumulator deposits never confi
       ],
     })
     assert.equal(priceTamper.satisfied, true, priceTamper.reason)
+
+    // 5. T2: Direct overwrite of credits 0 -> 500 is NOT self-explained as an arithmetic delta
+    const directCreditsOverwrite = assessBusinessLogicImpact({
+      impactClass: 'business_logic',
+      steps: [
+        makeStep({ id: 'r0', seq: 1, arm: 'control', method: 'GET', pathAndQuery: '/api/orgs/org_a', actor: ACTORS.memberA, json: { id: 'org_a', credits: 0 } }),
+        makeStep({ id: 'p1', seq: 2, arm: 'probe', method: 'PATCH', pathAndQuery: '/api/orgs/org_a', actor: ACTORS.memberA, requestJson: { credits: 500 }, json: { ok: true } }),
+        makeStep({ id: 'r1', seq: 3, arm: 'control', method: 'GET', pathAndQuery: '/api/orgs/org_a', actor: ACTORS.memberA, json: { id: 'org_a', credits: 500 } }),
+      ],
+    })
+    assert.equal(directCreditsOverwrite.satisfied, true, directCreditsOverwrite.reason)
+
+    // 6. T4: Reformatted numeric readback ("999.00" vs sent 999) still matches via finite numeric equality
+    const reformattedNumericTamper = assessBusinessLogicImpact({
+      impactClass: 'business_logic',
+      steps: [
+        makeStep({ id: 'r0', seq: 1, arm: 'control', method: 'GET', pathAndQuery: '/api/wallets/acct_a', actor: ACTORS.memberA, json: { id: 'acct_a', balance: '100.00' } }),
+        makeStep({ id: 'p1', seq: 2, arm: 'probe', method: 'PATCH', pathAndQuery: '/api/wallets/acct_a', actor: ACTORS.memberA, requestJson: { balance: 999 }, json: { ok: true } }),
+        makeStep({ id: 'r1', seq: 3, arm: 'control', method: 'GET', pathAndQuery: '/api/wallets/acct_a', actor: ACTORS.memberA, json: { id: 'acct_a', balance: '999.00' } }),
+      ],
+    })
+    assert.equal(reformattedNumericTamper.satisfied, true, reformattedNumericTamper.reason)
+  })
+
+  test('R3-05 review B1/B2 guards: rejects server-derived protected leaf (tier promotion) and unattributed concurrent-writer bound crossings', () => {
+    // B1: Honest deposit with echoed >=8-char reference moves balance 100->125 and server-derived tier silver->gold
+    const derivedTier = assessBusinessLogicImpact({
+      impactClass: 'business_logic',
+      steps: [
+        makeStep({ id: 'before_bal', seq: 1, arm: 'control', method: 'GET', pathAndQuery: '/api/wallets/acct_a/balance', actor: ACTORS.ownerA, json: { id: 'acct_a', balance: 100, tier: 'silver', last_reference: 'none' } }),
+        makeStep({ id: 'prb_deposit', seq: 2, arm: 'probe', method: 'POST', pathAndQuery: '/api/wallets/acct_a/deposit', actor: ACTORS.ownerA, requestJson: { amount: 25, reference: 'dep-20260101-0001' }, json: { ok: true, reference: 'dep-20260101-0001' } }),
+        makeStep({ id: 'after_bal', seq: 3, arm: 'control', method: 'GET', pathAndQuery: '/api/wallets/acct_a/balance', actor: ACTORS.ownerA, json: { id: 'acct_a', balance: 125, tier: 'gold', last_reference: 'dep-20260101-0001' } }),
+      ],
+    })
+    assert.equal(derivedTier.satisfied, false, `server-derived tier promotion must reject, got: ${derivedTier.reason}`)
+
+    // B2: Concurrent/background writer moves balance across floor=0 while probe only sent an unrelated note
+    const unattributedBound = assessBusinessLogicImpact({
+      impactClass: 'business_logic',
+      invariantBounds: [{ field: 'balance', kind: 'floor', min: 0 }],
+      steps: [
+        makeStep({ id: 'r0', seq: 1, arm: 'control', method: 'GET', pathAndQuery: '/api/wallets/acct_a/balance', actor: ACTORS.memberA, json: { accountId: 'acct_a', balance: 100 } }),
+        makeStep({ id: 'p1', seq: 2, arm: 'probe', method: 'POST', pathAndQuery: '/api/wallets/acct_a/note', actor: ACTORS.memberA, requestJson: { note: 'unrelated-probe-note' }, json: { ok: true } }),
+        makeStep({ id: 'r1', seq: 3, arm: 'control', method: 'GET', pathAndQuery: '/api/wallets/acct_a/balance', actor: ACTORS.memberA, json: { accountId: 'acct_a', balance: -50 } }),
+      ],
+    })
+    assert.equal(unattributedBound.satisfied, false, `unattributed concurrent-writer floor crossing must reject, got: ${unattributedBound.reason}`)
+
+    // B2: Unattributed concurrent-writer overdraft even alongside a 409 refusal control
+    const unattributedRefusal = assessBusinessLogicImpact({
+      impactClass: 'business_logic',
+      steps: [
+        makeStep({ id: 'ctl_409', seq: 1, arm: 'control', method: 'POST', pathAndQuery: '/api/wallets/acct_a/withdraw', status: 409, actor: ACTORS.memberA, requestJson: { amount: 25 }, json: { error: 'insufficient_funds' } }),
+        makeStep({ id: 'r0', seq: 2, arm: 'control', method: 'GET', pathAndQuery: '/api/wallets/acct_a/balance', actor: ACTORS.memberA, json: { accountId: 'acct_a', balance: 100 } }),
+        makeStep({ id: 'p1', seq: 3, arm: 'probe', method: 'POST', pathAndQuery: '/api/wallets/acct_a/withdraw', actor: ACTORS.memberA, requestJson: { amount: 25 }, json: { ok: true } }),
+        makeStep({ id: 'r1', seq: 4, arm: 'control', method: 'GET', pathAndQuery: '/api/wallets/acct_a/balance', actor: ACTORS.memberA, json: { accountId: 'acct_a', balance: -37 } }),
+      ],
+    })
+    assert.equal(unattributedRefusal.satisfied, false, `unattributed concurrent-writer overdraft must reject, got: ${unattributedRefusal.reason}`)
   })
 })
 

@@ -1405,6 +1405,7 @@ export interface AuthorizationAssessment extends ImpactAssessment {
     persisted: boolean
     changedFields: string[]
     disclosureFields: string[]
+    credentialPatternMatched?: boolean
   }
 }
 
@@ -1913,7 +1914,7 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
       required: true,
       satisfied: true,
       reason: `Credential-shaped value disclosed: the probe response matches ${patternEvidence.length} declared credential shape(s) absent from every control, under a ${boundaryControlDenied || hasDeniedSameRouteControl ? 'denied sibling control' : 'role differential'}.`,
-      evidence: base,
+      evidence: { ...base, credentialPatternMatched: true },
     }
   }
   if (!probeIsObjectScoped && !(vertical && probeIsFunctionSurface)) {
@@ -2747,20 +2748,83 @@ const ARITHMETIC_DELTA_FIELD_RE =
 const CONSERVED_NONNEGATIVE_FIELD_RE =
   /^(?:[a-z0-9]+[_-])*(?:balance|credits?|stock|inventory|remaining(?:_uses|_count|_balance|_credits|_quota|_stock|_quantity)?|available(?:_qty|_stock|_count)?|funds)$/i
 
+function valuesMatchDirect(reqVal: string, afterVal: string): boolean {
+  if (reqVal === afterVal) return true
+  const nReq = parseFiniteNumber(reqVal)
+  const nAfter = parseFiniteNumber(afterVal)
+  return nReq !== null && nAfter !== null && Math.abs(nReq - nAfter) <= 1e-9 * Math.max(1, Math.abs(nReq))
+}
+
+/**
+ * Verify that a single-step numeric transition (`nBefore -> nAfter`) is attributable to
+ * `mutatingProbe` (preventing concurrent/background writers from satisfying single-step bound or
+ * refusal-backed overdraft paths without probe attribution).
+ */
+function numericBoundTransitionAttributable(args: {
+  mutatingProbe: ImpactStep
+  nBefore: number
+  nAfter: number
+  baseAttributable: boolean
+  oracleDeclared: boolean
+}): boolean {
+  const { mutatingProbe, nBefore, nAfter, baseAttributable, oracleDeclared } = args
+  if (baseAttributable || oracleDeclared) return true
+  if (mutatingProbe.requestJson === undefined) return false
+  const diff = Math.abs(nAfter - nBefore)
+  if (!(diff > 0)) return false
+  const requestFields = flattenJson(mutatingProbe.requestJson)
+  const operands: number[] = []
+  for (const [reqPath, reqVal] of requestFields) {
+    if (!ARITHMETIC_DELTA_FIELD_RE.test(normalizeFieldLeaf(reqPath))) continue
+    const num = parseFiniteNumber(reqVal)
+    if (num !== null && num > 0) operands.push(num)
+  }
+  if (operands.length === 0) return false
+  // Exact single-step arithmetic operand match (e.g. `{ amount: 150 }` moving `100 -> -50`).
+  if (operands.some(op => Math.abs(diff - op) <= 1e-9 * Math.max(1, op))) return true
+  // Race/burst multi-debit match: requires BOTH an integer multiple (`2..32x`) of the probe's
+  // operand AND the probe's own JSON response corroborating `nAfter` on a conserved balance field.
+  if (mutatingProbe.json !== undefined && mutatingProbe.json !== null && typeof mutatingProbe.json === 'object') {
+    const probeRespFields = flattenJson(mutatingProbe.json)
+    let probeEchoesAfter = false
+    for (const [respPath, respVal] of probeRespFields) {
+      if (!CONSERVED_NONNEGATIVE_FIELD_RE.test(normalizeFieldLeaf(respPath))) continue
+      const num = parseFiniteNumber(respVal)
+      if (num !== null && Math.abs(num - nAfter) <= 1e-9 * Math.max(1, Math.abs(nAfter))) {
+        probeEchoesAfter = true
+        break
+      }
+    }
+    if (probeEchoesAfter) {
+      for (const op of operands) {
+        const ratio = diff / op
+        const k = Math.round(ratio)
+        if (k >= 2 && k <= 32 && Math.abs(diff - k * op) <= 1e-9 * Math.max(1, k * op)) {
+          return true
+        }
+      }
+    }
+  }
+  return false
+}
+
 function findSingleStepRefusalBackedOverdraft(args: {
   steps: readonly ImpactStep[]
   mutatingProbe: ImpactStep
   beforeFields: ReadonlyMap<string, string>
   afterFields: ReadonlyMap<string, string>
   changedFields: readonly string[]
+  baseAttributable: boolean
+  oracleDeclared: boolean
 }): { satisfied: boolean; reason: string } {
-  const { steps, mutatingProbe, beforeFields, afterFields, changedFields } = args
+  const { steps, mutatingProbe, beforeFields, afterFields, changedFields, baseAttributable, oracleDeclared } = args
   let negHit: { path: string; before: number; after: number } | null = null
   for (const path of changedFields) {
     if (!CONSERVED_NONNEGATIVE_FIELD_RE.test(normalizeFieldLeaf(path))) continue
     const nBefore = parseFiniteNumber(beforeFields.get(path))
     const nAfter = parseFiniteNumber(afterFields.get(path))
-    if (nBefore !== null && nAfter !== null && nBefore >= 0 && nAfter < 0) {
+    if (nBefore !== null && nAfter !== null && nBefore >= 0 && nAfter < 0 &&
+        numericBoundTransitionAttributable({ mutatingProbe, nBefore, nAfter, baseAttributable, oracleDeclared })) {
       negHit = { path, before: nBefore, after: nAfter }
       break
     }
@@ -2794,12 +2858,15 @@ function findSingleStepRefusalBackedOverdraft(args: {
 }
 
 function checkSingleStepBoundCrossed(args: {
+  mutatingProbe: ImpactStep
   beforeFields: ReadonlyMap<string, string>
   afterFields: ReadonlyMap<string, string>
   changedFields: readonly string[]
   invariantBounds?: readonly BusinessInvariantBound[] | null
+  baseAttributable: boolean
+  oracleDeclared: boolean
 }): { crossed: boolean; reason: string } {
-  const { beforeFields, afterFields, changedFields, invariantBounds } = args
+  const { mutatingProbe, beforeFields, afterFields, changedFields, invariantBounds, baseAttributable, oracleDeclared } = args
   for (const bound of invariantBounds ?? []) {
     if (!bound || !bound.field || !bound.field.trim()) continue
     for (const path of changedFields) {
@@ -2807,6 +2874,9 @@ function checkSingleStepBoundCrossed(args: {
       const nBefore = parseFiniteNumber(beforeFields.get(path))
       const nAfter = parseFiniteNumber(afterFields.get(path))
       if (nBefore === null || nAfter === null) continue
+      if (!numericBoundTransitionAttributable({ mutatingProbe, nBefore, nAfter, baseAttributable, oracleDeclared })) {
+        continue
+      }
       if (bound.kind === 'floor' && typeof bound.min === 'number' && Number.isFinite(bound.min)) {
         if (nBefore >= bound.min && nAfter < bound.min) {
           return {
@@ -2841,34 +2911,43 @@ function isDirectProtectedFieldTamper(args: {
   const method = (mutatingProbe.method ?? '').toUpperCase()
   const route = (mutatingProbe.route ?? mutatingProbe.pathAndQuery ?? '').split('?')[0] ?? ''
   const isAccumulatorAction = method === 'POST' && ACCUMULATOR_ACTION_ROUTE_RE.test(route)
-  const requestDeltaOperands: number[] = []
+  const requestDeltaEntries: Array<{ reqPath: string; reqLeaf: string; num: number }> = []
   for (const [reqPath, reqVal] of requestFields) {
-    if (!ARITHMETIC_DELTA_FIELD_RE.test(normalizeFieldLeaf(reqPath))) continue
+    const reqLeaf = normalizeFieldLeaf(reqPath)
+    if (!ARITHMETIC_DELTA_FIELD_RE.test(reqLeaf)) continue
     const num = parseFiniteNumber(reqVal)
-    if (num !== null) requestDeltaOperands.push(num)
+    if (num !== null) requestDeltaEntries.push({ reqPath, reqLeaf, num })
   }
   for (const path of protectedFields) {
     if (isPriceField(path)) continue
     const leaf = normalizeFieldLeaf(path)
+    const afterVal = afterFields.get(path)
+    if (afterVal === undefined) continue
+    // Require caller-supplied field match for ALL protected leaves (non-accumulator AND
+    // accumulator alike) so server-derived protected fields (e.g. loyalty `tier: "silver" -> "gold"`
+    // derived from an honest deposit) never confirm via the direct-tamper branch.
+    let matchedReqPath: string | null = null
+    for (const [reqPath, reqVal] of requestFields) {
+      if ((reqPath === path || normalizeFieldLeaf(reqPath) === leaf) && valuesMatchDirect(reqVal, afterVal)) {
+        matchedReqPath = reqPath
+        break
+      }
+    }
+    if (matchedReqPath === null) continue
     if (!NUMERIC_ACCUMULATOR_PROTECTED_RE.test(leaf)) {
       return true
     }
     if (isAccumulatorAction) continue
-    const afterVal = afterFields.get(path)
-    if (afterVal === undefined) continue
-    let directValueMatch = false
-    for (const [reqPath, reqVal] of requestFields) {
-      if ((reqPath === path || normalizeFieldLeaf(reqPath) === leaf) && reqVal === afterVal) {
-        directValueMatch = true
-        break
-      }
-    }
-    if (!directValueMatch) continue
+    // Exclude the field's own request path/leaf from delta operands so direct overwrites of
+    // fields like `credits`/`quantity` (e.g. 0 -> N) are never self-explained as arithmetic deltas.
+    const otherDeltaOperands = requestDeltaEntries
+      .filter(entry => entry.reqPath !== matchedReqPath && entry.reqLeaf !== leaf)
+      .map(entry => entry.num)
     const nBefore = parseFiniteNumber(beforeFields.get(path))
     const nAfter = parseFiniteNumber(afterVal)
-    if (nBefore !== null && nAfter !== null && requestDeltaOperands.length > 0) {
+    if (nBefore !== null && nAfter !== null && otherDeltaOperands.length > 0) {
       const diff = nAfter - nBefore
-      const explainedByOperand = requestDeltaOperands.some(op =>
+      const explainedByOperand = otherDeltaOperands.some(op =>
         op > 0 && (Math.abs(diff - op) <= 1e-9 * Math.max(1, Math.abs(op)) ||
           Math.abs(diff + op) <= 1e-9 * Math.max(1, Math.abs(op))))
       if (explainedByOperand) continue
@@ -3199,7 +3278,15 @@ export function assessBusinessLogicImpact(input: ImpactInput): BusinessLogicAsse
   const afterFields = afterRead?.json !== undefined ? flattenJson(afterRead.json) : new Map<string, string>()
   // Raw body substring attribution matches only non-trivial (>=8 char) tokens so short numeric
   // operands (e.g. `amount: 25` or `qty: 1`) never falsely match inside unrelated values like `125`.
-  const attributable = labels.changedFields.some(path => sent.has(afterFields.get(path) ?? '')) ||
+  const attributable = labels.changedFields.some(path => {
+    const afterVal = afterFields.get(path)
+    if (afterVal === undefined) return false
+    if (sent.has(afterVal)) return true
+    for (const sentVal of sent) {
+      if (valuesMatchDirect(sentVal, afterVal)) return true
+    }
+    return false
+  }) ||
     (afterRead !== null && [...sentLongTokens].some(token => String(afterRead.body ?? '').includes(token))) ||
     resourceBound
 
@@ -3311,12 +3398,17 @@ export function assessBusinessLogicImpact(input: ImpactInput): BusinessLogicAsse
 
   // Single-step host-declared bound violation (e.g., single overdraft crossing floor=0 or cap),
   // or refusal-control-backed conservation overdraft driving a conserved balance negative.
+  // Both paths enforce probe attribution (`attributable || oracleDeclared` or exact probe-operand
+  // arithmetic attribution) so an unrelated concurrent/background writer can never satisfy them.
   if (labels.persisted) {
     const singleBound = checkSingleStepBoundCrossed({
+      mutatingProbe,
       beforeFields,
       afterFields,
       changedFields: labels.changedFields,
       invariantBounds: input.invariantBounds,
+      baseAttributable: attributable,
+      oracleDeclared: labels.oracleDeclared,
     })
     if (singleBound.crossed) {
       labels.boundCrossed = true
@@ -3333,6 +3425,8 @@ export function assessBusinessLogicImpact(input: ImpactInput): BusinessLogicAsse
       beforeFields,
       afterFields,
       changedFields: labels.changedFields,
+      baseAttributable: attributable,
+      oracleDeclared: labels.oracleDeclared,
     })
     if (refusalOverdraft.satisfied) {
       labels.refusalControl = true
