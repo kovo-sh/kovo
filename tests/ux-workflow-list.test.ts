@@ -18,6 +18,8 @@ import { Store } from '../src/server/store.ts'
 import { HARDENED_NODE_FLAGS } from './app.ts'
 
 const REPO_ROOT = resolve(import.meta.dirname, '..')
+const CI_TIMEOUT_MULT = process.env.CI ? 2 : 1
+const E2E_HOOK_TIMEOUT_MS = process.env.CI ? 45_000 : 25_000
 
 const SYSTEM_CHROMIUM_CANDIDATES = [
   '/usr/bin/chromium',
@@ -124,10 +126,12 @@ async function startKovoServer(): Promise<SpawnedKovoServer> {
   }
 
   let healthy = false
-  for (let attempt = 0; attempt < 150; attempt += 1) {
+  const healthAttempts = process.env.CI ? 250 : 150
+  const healthReqTimeoutMs = process.env.CI ? 1_000 : 300
+  for (let attempt = 0; attempt < healthAttempts; attempt += 1) {
     if (child.exitCode !== null) break
     try {
-      const res = await fetch(`${origin}/health`, { signal: AbortSignal.timeout(300) })
+      const res = await fetch(`${origin}/health`, { signal: AbortSignal.timeout(healthReqTimeoutMs) })
       if (res.ok) {
         healthy = true
         break
@@ -347,6 +351,8 @@ describe('Workflow UX upgrades & terminal assignment settlement', () => {
       })
       context = await browser.newContext({ viewport: { width: 1280, height: 720 } })
       page = await context.newPage()
+      page.setDefaultTimeout(30_000 * CI_TIMEOUT_MULT)
+      page.setDefaultNavigationTimeout(30_000 * CI_TIMEOUT_MULT)
       page.on('pageerror', err => {
         pageErrors.push(err instanceof Error ? err.message : String(err))
       })
@@ -354,17 +360,17 @@ describe('Workflow UX upgrades & terminal assignment settlement', () => {
       await page.goto(`${kovo.origin}/?bootstrap=${encodeURIComponent(kovo.bootstrapSecret)}`, {
         waitUntil: 'domcontentloaded',
       })
-      await page.getByRole('heading', { name: 'Projects', level: 1 }).waitFor({ state: 'visible', timeout: 15_000 })
+      await page.getByRole('heading', { name: 'Projects', level: 1 }).waitFor({ state: 'visible', timeout: 15_000 * CI_TIMEOUT_MULT })
       await page.getByLabel('Project name').fill('Acme Cloud Workflow QA')
       await page.getByLabel('Sites').fill('https://app.acme-cloud.example\nhttps://api.acme-cloud.example\nhttps://admin.acme-cloud.example')
       await page.getByRole('button', { name: 'Create project', exact: true }).click()
-      await page.waitForURL(/\/projects\/[a-f0-9-]+/, { timeout: 15_000 })
+      await page.waitForURL(/\/projects\/[a-f0-9-]+/, { timeout: 15_000 * CI_TIMEOUT_MULT })
 
       await page.getByRole('button', { name: 'New run', exact: true }).click()
       const dialog = page.getByRole('dialog')
-      await dialog.waitFor({ state: 'visible', timeout: 10_000 })
+      await dialog.waitFor({ state: 'visible', timeout: 10_000 * CI_TIMEOUT_MULT })
       await dialog.getByRole('button', { name: 'Start run', exact: true }).click()
-      await page.waitForURL(/\/runs\/[a-f0-9-]+/, { timeout: 15_000 })
+      await page.waitForURL(/\/runs\/[a-f0-9-]+/, { timeout: 15_000 * CI_TIMEOUT_MULT })
       const runMatch = /\/runs\/([a-f0-9-]+)/.exec(page.url())
       assert.ok(runMatch?.[1], `Expected run URL, got ${page.url()}`)
       runId = runMatch[1]
@@ -469,7 +475,7 @@ describe('Workflow UX upgrades & terminal assignment settlement', () => {
           now - 10_000,
         )
       })
-    })
+    }, { timeout: E2E_HOOK_TIMEOUT_MS })
 
     after(async () => {
       await context?.close()
@@ -477,7 +483,10 @@ describe('Workflow UX upgrades & terminal assignment settlement', () => {
       await kovo?.stop()
     })
 
-    it('elevates Workflow into Investigation, defaults to List view with Active now pinned at top, and keeps geometry clean at 1280x720 & 1440x900', async t => {
+    it(
+      'elevates Workflow into Investigation, defaults to List view with Active now pinned at top, and keeps geometry clean at 1280x720 & 1440x900',
+      { timeout: E2E_HOOK_TIMEOUT_MS },
+      async t => {
       if (skipReason || !page || !kovo) {
         t.skip(skipReason ?? 'Playwright unavailable')
         return
@@ -488,9 +497,9 @@ describe('Workflow UX upgrades & terminal assignment settlement', () => {
 
       // 1. Sidebar: Workflow is inside Investigation (NOT Telemetry)
       const invNav = page.getByRole('navigation', { name: 'Investigation views' })
-      await invNav.waitFor({ state: 'visible', timeout: 15_000 })
+      await invNav.waitFor({ state: 'visible', timeout: 15_000 * CI_TIMEOUT_MULT })
       const invWfBtn = invNav.getByRole('button', { name: /^Workflow/ })
-      await invWfBtn.waitFor({ state: 'visible', timeout: 10_000 })
+      await invWfBtn.waitFor({ state: 'visible', timeout: 10_000 * CI_TIMEOUT_MULT })
       assert.equal(await invWfBtn.getAttribute('aria-current'), 'page')
 
       const telemetryToggle = page.getByRole('button', { name: /^Telemetry/ })
@@ -498,7 +507,7 @@ describe('Workflow UX upgrades & terminal assignment settlement', () => {
         await telemetryToggle.click()
       }
       const telemetryNav = page.getByRole('navigation', { name: 'Telemetry views' })
-      await telemetryNav.waitFor({ state: 'visible', timeout: 5_000 })
+      await telemetryNav.waitFor({ state: 'visible', timeout: 5_000 * CI_TIMEOUT_MULT })
       assert.equal(await telemetryNav.getByRole('button', { name: /^Workflow/ }).count(), 0, 'Workflow must not appear inside Telemetry')
       // Collapse Telemetry back so screenshots show clean default rail
       await telemetryToggle.click()
@@ -508,11 +517,11 @@ describe('Workflow UX upgrades & terminal assignment settlement', () => {
       const graphRadio = page.getByRole('radio', { name: 'Graph' })
       assert.equal(await listRadio.getAttribute('aria-checked'), 'true')
       assert.equal(await graphRadio.getAttribute('aria-checked'), 'false')
-      await page.getByRole('region', { name: 'Worker list' }).waitFor({ state: 'visible', timeout: 10_000 })
+      await page.getByRole('region', { name: 'Worker list' }).waitFor({ state: 'visible', timeout: 10_000 * CI_TIMEOUT_MULT })
 
       // 3. Active now (3) section is pinned at top above completed phase groups
       const activeSection = page.getByTestId('workflow-active-section')
-      await activeSection.waitFor({ state: 'visible', timeout: 10_000 })
+      await activeSection.waitFor({ state: 'visible', timeout: 10_000 * CI_TIMEOUT_MULT })
       const activeText = await activeSection.innerText()
       assert.match(activeText, /Active now \(3\)/)
       assert.match(activeText, /Round-0 Threat Model & Surface Ranking/)
@@ -565,16 +574,16 @@ describe('Workflow UX upgrades & terminal assignment settlement', () => {
       await graphRadio.click()
       assert.equal(await graphRadio.getAttribute('aria-checked'), 'true')
       assert.match(page.url(), /mode=graph/)
-      await page.locator('[data-n="w-inv-live"]').waitFor({ state: 'visible', timeout: 10_000 })
+      await page.locator('[data-n="w-inv-live"]').waitFor({ state: 'visible', timeout: 10_000 * CI_TIMEOUT_MULT })
 
       await listRadio.click()
       assert.equal(await listRadio.getAttribute('aria-checked'), 'true')
       assert.equal(page.url().includes('mode=graph'), false)
-      await activeSection.waitFor({ state: 'visible', timeout: 10_000 })
+      await activeSection.waitFor({ state: 'visible', timeout: 10_000 * CI_TIMEOUT_MULT })
 
       await page.goto(`${kovo.origin}/runs/${runId}?view=workflow&mode=graph`, { waitUntil: 'domcontentloaded' })
-      await page.getByLabel(/Workflow graph/).waitFor({ state: 'visible', timeout: 10_000 })
-      await page.locator('[data-wf-kind="worker"][data-n="w-inv-live"]').waitFor({ state: 'visible', timeout: 10_000 })
+      await page.getByLabel(/Workflow graph/).waitFor({ state: 'visible', timeout: 10_000 * CI_TIMEOUT_MULT })
+      await page.locator('[data-wf-kind="worker"][data-n="w-inv-live"]').waitFor({ state: 'visible', timeout: 10_000 * CI_TIMEOUT_MULT })
       assert.equal(await page.getByRole('radio', { name: 'Graph' }).getAttribute('aria-checked'), 'true')
 
       // 5. Terminal run never displays "Active now" or stale pulsing spinners (even if a legacy row was running in SQLite)
@@ -582,11 +591,12 @@ describe('Workflow UX upgrades & terminal assignment settlement', () => {
         db.prepare(`UPDATE runs SET status = 'complete', phase = 'complete' WHERE id = ?`).run(runId)
       })
       await page.goto(`${kovo.origin}/runs/${runId}?view=workflow`, { waitUntil: 'domcontentloaded' })
-      await page.getByRole('region', { name: 'Worker list' }).waitFor({ state: 'visible', timeout: 10_000 })
+      await page.getByRole('region', { name: 'Worker list' }).waitFor({ state: 'visible', timeout: 10_000 * CI_TIMEOUT_MULT })
       assert.equal(await page.getByTestId('workflow-active-section').count(), 0, 'Completed run must never show Active now section')
       const liveDots = await page.locator('[role="region"][aria-label="Worker list"] .animate-ping').count()
       assert.equal(liveDots, 0, 'Completed run must never show pulsing live spinners')
       assert.deepEqual(pageErrors, [], `Unexpected browser page errors: ${pageErrors.join('; ')}`)
-    })
+      },
+    )
   })
 })

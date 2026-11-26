@@ -45,7 +45,7 @@ jobs:
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
       - name: Run fast hermetic unit suites (quarantine & orphan enforced)
-        run: bash scripts/run-fast-tests.sh --suites-only --quarantine tests/QUARANTINE.json
+        run: bash scripts/run-fast-tests.sh --suites-only --quarantine tests/QUARANTINE.json --jobs 2
       - run: npm run worker:build
       - run: bash scripts/docker-smoke.sh
       - name: Run npm run test:boundaries
