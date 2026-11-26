@@ -29,12 +29,14 @@ import { createHash, randomUUID } from 'node:crypto'
 import { once } from 'node:events'
 import {
   chmodSync,
+  existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
   rmSync,
+  statSync,
   symlinkSync,
   unlinkSync,
   writeFileSync,
@@ -42,7 +44,7 @@ import {
 import { createServer, request as httpRequest } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
-import { dirname, join, resolve } from 'node:path'
+import { dirname, join, posix, relative, resolve, sep } from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import ts from 'typescript'
@@ -119,6 +121,7 @@ import {
   scanSourceTreeForContamination,
   scanTextForContamination,
 } from '../scripts/check-v8-contamination.ts'
+import { SECURITY_GUARD_ENTRY_REGISTRY } from '../scripts/check-security-optional.ts'
 
 process.env.KOVO_ALLOW_LOCAL_LAB = '1'
 
@@ -818,10 +821,303 @@ test('Check 4: Messy LLM corpus — kovo_verify rejects metadata-only calls & ca
   assert.equal(getRunCustodyBudgetUsage(runId).sealTotal, 4)
 })
 
+function toPosixPath(p: string): string {
+  return sep === '/' ? p : p.split(sep).join(posix.sep)
+}
+
+function resolveProductionImport(rootDir: string, fromRel: string, spec: string): string | null {
+  if (!spec.startsWith('.')) return null
+  const baseAbs = resolve(rootDir, dirname(fromRel), spec)
+  const candidates = [
+    baseAbs,
+    `${baseAbs}.ts`,
+    `${baseAbs}.tsx`,
+    `${baseAbs}.mts`,
+    join(baseAbs, 'index.ts'),
+    join(baseAbs, 'index.tsx'),
+  ]
+  if (spec.endsWith('.js') || spec.endsWith('.jsx')) {
+    const stem = baseAbs.slice(0, -3)
+    candidates.unshift(`${stem}.ts`, `${stem}.tsx`)
+  }
+  for (const cand of candidates) {
+    if (existsSync(cand) && statSync(cand).isFile()) {
+      return toPosixPath(relative(rootDir, cand))
+    }
+  }
+  return null
+}
+
+function hasExportModifier(node: ts.Node): boolean {
+  const mods = ts.canHaveModifiers(node) ? ts.getModifiers(node) : undefined
+  return Boolean(mods?.some(m => m.kind === ts.SyntaxKind.ExportKeyword))
+}
+
+interface ModuleReachabilityInfo {
+  relPath: string
+  declaredValueExports: Set<string>
+  runtimeDeps: Set<string>
+  namedImports: Array<{ localName: string; from: string; importedName: string }>
+  namespaceImports: Array<{ localName: string; from: string }>
+  reexports: Map<string, { from: string; importedName: string }>
+  starReexports: Set<string>
+  usedIdentifiers: Set<string>
+  sameFileRefByExport: Map<string, Set<string>>
+  dynamicImportTargets: Set<string>
+}
+
+function parseModuleReachability(rootDir: string, relPath: string): ModuleReachabilityInfo {
+  const abs = join(rootDir, relPath)
+  const src = readFileSync(abs, 'utf8')
+  const sf = ts.createSourceFile(abs, src, ts.ScriptTarget.Latest, true)
+
+  const info: ModuleReachabilityInfo = {
+    relPath,
+    declaredValueExports: new Set(),
+    runtimeDeps: new Set(),
+    namedImports: [],
+    namespaceImports: [],
+    reexports: new Map(),
+    starReexports: new Set(),
+    usedIdentifiers: new Set(),
+    sameFileRefByExport: new Map(),
+    dynamicImportTargets: new Set(),
+  }
+
+  const collectBinding = (name: ts.BindingName, out: Set<string>) => {
+    if (ts.isIdentifier(name)) out.add(name.text)
+    else for (const el of name.elements) if (ts.isBindingElement(el)) collectBinding(el.name, out)
+  }
+
+  for (const stmt of sf.statements) {
+    if (ts.isImportDeclaration(stmt) && ts.isStringLiteral(stmt.moduleSpecifier)) {
+      const clause = stmt.importClause
+      if (clause?.isTypeOnly) continue
+      const target = resolveProductionImport(rootDir, relPath, stmt.moduleSpecifier.text)
+      if (!target) continue
+      let hasValueImport = !clause
+      if (clause?.name) {
+        hasValueImport = true
+        info.namedImports.push({ localName: clause.name.text, from: target, importedName: 'default' })
+      }
+      if (clause?.namedBindings) {
+        if (ts.isNamespaceImport(clause.namedBindings)) {
+          hasValueImport = true
+          info.namespaceImports.push({ localName: clause.namedBindings.name.text, from: target })
+        } else {
+          for (const el of clause.namedBindings.elements) {
+            if (el.isTypeOnly) continue
+            hasValueImport = true
+            info.namedImports.push({
+              localName: el.name.text,
+              from: target,
+              importedName: (el.propertyName ?? el.name).text,
+            })
+          }
+        }
+      }
+      if (hasValueImport) info.runtimeDeps.add(target)
+      continue
+    }
+
+    if (ts.isExportDeclaration(stmt)) {
+      if (stmt.isTypeOnly) continue
+      const target = stmt.moduleSpecifier && ts.isStringLiteral(stmt.moduleSpecifier)
+        ? resolveProductionImport(rootDir, relPath, stmt.moduleSpecifier.text)
+        : null
+      if (target) info.runtimeDeps.add(target)
+      if (!stmt.exportClause && target) {
+        info.starReexports.add(target)
+      } else if (stmt.exportClause && ts.isNamedExports(stmt.exportClause)) {
+        for (const el of stmt.exportClause.elements) {
+          if (el.isTypeOnly) continue
+          const exported = el.name.text
+          const orig = (el.propertyName ?? el.name).text
+          if (target) info.reexports.set(exported, { from: target, importedName: orig })
+          else info.declaredValueExports.add(exported)
+        }
+      }
+      continue
+    }
+
+    const stmtExports = new Set<string>()
+    if (hasExportModifier(stmt)) {
+      if ((ts.isFunctionDeclaration(stmt) || ts.isClassDeclaration(stmt) || ts.isEnumDeclaration(stmt)) && stmt.name) {
+        stmtExports.add(stmt.name.text)
+        info.declaredValueExports.add(stmt.name.text)
+      } else if (ts.isVariableStatement(stmt)) {
+        for (const decl of stmt.declarationList.declarations) {
+          collectBinding(decl.name, stmtExports)
+        }
+        for (const n of stmtExports) info.declaredValueExports.add(n)
+      }
+    }
+
+    const stmtIdents = new Set<string>()
+    const walkExpr = (node: ts.Node) => {
+      if (ts.isTypeNode(node) || ts.isInterfaceDeclaration(node) || ts.isTypeAliasDeclaration(node)) return
+      if (
+        ts.isCallExpression(node)
+        && node.expression.kind === ts.SyntaxKind.ImportKeyword
+        && node.arguments.length > 0
+        && ts.isStringLiteral(node.arguments[0]!)
+      ) {
+        const dynTarget = resolveProductionImport(rootDir, relPath, node.arguments[0]!.text)
+        if (dynTarget) {
+          info.runtimeDeps.add(dynTarget)
+          info.dynamicImportTargets.add(dynTarget)
+        }
+      }
+      if (ts.isIdentifier(node)) {
+        const parent = node.parent
+        if (parent && ts.isPropertyAccessExpression(parent) && parent.name === node) {
+          // Record member name for dynamic-import / namespace member references too
+          info.usedIdentifiers.add(node.text)
+          stmtIdents.add(node.text)
+        } else {
+          info.usedIdentifiers.add(node.text)
+          stmtIdents.add(node.text)
+        }
+      }
+      ts.forEachChild(node, walkExpr)
+    }
+    walkExpr(stmt)
+    for (const exp of stmtExports) {
+      info.sameFileRefByExport.set(exp, stmtIdents)
+    }
+  }
+  return info
+}
+
+/**
+ * R3-08 AST Production-Entry Reachability Walker:
+ * Traces real runtime module & symbol edges from production entrypoints (`src/server.ts`,
+ * `src/actions.ts`, `src/routes/**`, `scripts/serve.ts`, `scripts/benchmark-*.ts`, `worker/**`)
+ * without scanning `tests/**`, returning both reachable modules and reachable `file::symbol` keys.
+ */
+function collectReachableProductionSymbols(rootDir: string): {
+  modules: Map<string, ModuleReachabilityInfo>
+  reachableModules: Set<string>
+  reachableSymbols: Set<string>
+} {
+  const entrySeeds: string[] = []
+  for (const rel of ['src/server.ts', 'src/actions.ts', 'scripts/serve.ts', 'scripts/benchmark-realistic.ts', 'scripts/benchmark-multihop.ts']) {
+    if (existsSync(join(rootDir, rel))) entrySeeds.push(rel)
+  }
+  for (const dir of ['src/routes', 'worker']) {
+    const abs = join(rootDir, dir)
+    if (!existsSync(abs)) continue
+    for (const full of walkRegularFiles(abs)) {
+      if (full.endsWith('.ts') || full.endsWith('.tsx')) {
+        const rel = toPosixPath(relative(rootDir, full))
+        if (!rel.endsWith('.test.ts') && !rel.endsWith('.d.ts')) entrySeeds.push(rel)
+      }
+    }
+  }
+
+  const modules = new Map<string, ModuleReachabilityInfo>()
+  const reachableModules = new Set<string>()
+  const modQueue = [...new Set(entrySeeds)]
+
+  while (modQueue.length > 0) {
+    const rel = modQueue.shift()!
+    if (reachableModules.has(rel)) continue
+    if (rel.startsWith('tests/') || /\.test\.|\.spec\./i.test(rel)) continue
+    if (!existsSync(join(rootDir, rel))) continue
+    reachableModules.add(rel)
+    const info = parseModuleReachability(rootDir, rel)
+    modules.set(rel, info)
+    for (const dep of info.runtimeDeps) {
+      if (!reachableModules.has(dep)) modQueue.push(dep)
+    }
+  }
+
+  const reachableSymbols = new Set<string>()
+  const symQueue: Array<{ file: string; symbol: string }> = []
+  const markSymbol = (file: string, symbol: string) => {
+    const key = `${file}::${symbol}`
+    if (reachableSymbols.has(key)) return
+    reachableSymbols.add(key)
+    symQueue.push({ file, symbol })
+  }
+
+  for (const info of modules.values()) {
+    for (const imp of info.namedImports) {
+      if (info.usedIdentifiers.has(imp.localName)) {
+        markSymbol(imp.from, imp.importedName)
+      }
+    }
+    for (const ns of info.namespaceImports) {
+      const target = modules.get(ns.from)
+      if (!target) continue
+      for (const exp of target.declaredValueExports) {
+        if (info.usedIdentifiers.has(exp) || info.usedIdentifiers.has(ns.localName)) {
+          markSymbol(ns.from, exp)
+        }
+      }
+    }
+    for (const dynTarget of info.dynamicImportTargets) {
+      const target = modules.get(dynTarget)
+      if (!target) continue
+      for (const exp of target.declaredValueExports) {
+        if (info.usedIdentifiers.has(exp)) markSymbol(dynTarget, exp)
+      }
+    }
+  }
+
+  // Propagate through re-exports and same-file call edges from already-reachable exports.
+  while (symQueue.length > 0) {
+    const { file, symbol } = symQueue.shift()!
+    const info = modules.get(file)
+    if (!info) continue
+    const reexp = info.reexports.get(symbol)
+    if (reexp) markSymbol(reexp.from, reexp.importedName)
+    if (!info.declaredValueExports.has(symbol) && !reexp) {
+      for (const starTarget of info.starReexports) markSymbol(starTarget, symbol)
+    }
+    const sameFileRefs = info.sameFileRefByExport.get(symbol)
+    if (sameFileRefs) {
+      for (const ref of sameFileRefs) {
+        if (info.declaredValueExports.has(ref)) markSymbol(file, ref)
+      }
+    }
+  }
+
+  return { modules, reachableModules, reachableSymbols }
+}
+
+function collectAstCallsAndProps(node: ts.Node, sf: ts.SourceFile): {
+  callees: Set<string>
+  qualifiedCalls: Set<string>
+  propAccesses: Set<string>
+  qualifiedProps: Set<string>
+} {
+  const callees = new Set<string>()
+  const qualifiedCalls = new Set<string>()
+  const propAccesses = new Set<string>()
+  const qualifiedProps = new Set<string>()
+  const walk = (n: ts.Node) => {
+    if (ts.isCallExpression(n)) {
+      const tail = calleeTailName(n.expression)
+      if (tail) callees.add(tail)
+      if (ts.isPropertyAccessExpression(n.expression)) {
+        qualifiedCalls.add(`${n.expression.expression.getText(sf)}.${n.expression.name.text}`)
+      }
+    }
+    if (ts.isPropertyAccessExpression(n)) {
+      propAccesses.add(n.name.text)
+      qualifiedProps.add(`${n.expression.getText(sf)}.${n.name.text}`)
+    }
+    ts.forEachChild(n, walk)
+  }
+  walk(node)
+  return { callees, qualifiedCalls, propAccesses, qualifiedProps }
+}
+
 // ---------------------------------------------------------------------------
-// Check 5 — R4-H-3 Unwired Security-Primitive Guard
+// Check 5 — R4-H-3 / R3-08 Security-Primitive Production Reachability Guard
 // ---------------------------------------------------------------------------
-test('Check 5: R4-H-3 — scripts/unwired-baseline.json must never list security-enforcement, refresher, needle, lease, scrubber, oracle, sandbox, or provenance primitives', () => {
+test('Check 5: R4-H-3 / R3-08 — security primitives are never unwired and are AST-reachable from production entrypoints', () => {
   const baselinePath = join(REPO_ROOT, 'scripts/unwired-baseline.json')
   const baseline = JSON.parse(readFileSync(baselinePath, 'utf8')) as {
     baselinedExports?: string[]
@@ -835,74 +1131,24 @@ test('Check 5: R4-H-3 — scripts/unwired-baseline.json must never list security
     ...(baseline.ticketedAdditions ?? []).map(entry => entry.key),
   ]
 
-  // 5a) Explicit denylist of R4 security-enforcement primitives (must never appear unwired).
-  const FORBIDDEN_UNWIRED_SYMBOLS = new Set([
-    'buildPersonaSecretNeedles',
-    'createSecretNeedleBuilder',
-    'extractScrubbableCookieMapNeedles',
-    'assertOriginsWithinProjectScope',
-    'createInteractiveSessionRefresher',
-    'refreshBrowserSession',
-    'evaluateBrowserSessionProxyOrigin',
-    'resolveBrowserSessionEgressPolicy',
-    'leaseAuthorizes',
-    'evaluateLeaseEligibility',
-    'isHighRiskOrExternalMutationPath',
-    'sanitizeProviderStream',
-    'sanitizeProviderStreamLine',
-    'sanitizeProviderValue',
-    'verifyInboundProviderFrameIntegrity',
-    'scrubOutboundProviderRequest',
-    'matchesBoundTerminalControl',
-    'evaluateExchangeTenantPrivilege',
-    'collectCitedReceiptExchanges',
-    'materializeGitTreeBounded',
-    'synthesizeInvariantsInWorker',
-    'searchRepoInWorker',
-    'verifyHostExpressionProbe',
-    'verifyStampedBooleanPairRound',
-    'assessSignedUrlMintDifferential',
-    'verifySignedUrlMintPair',
-    'computeWorkerVisibleBodyDigest',
-    'mintHostBooleanPair',
-    'verifyBooleanArmBaseParity',
-    'normalizeRequestCarrier',
-    'classifyRequestMutation',
-  ])
-
-  // 5b) Structural guard for any future security-fix refresher / oracle / lease / scrubber / provenance / sandbox / quota export.
+  // 5a) Structural guard ensuring scripts/unwired-baseline.json never baselines security primitives.
   const FORBIDDEN_SECURITY_GUARD_PATTERNS: Array<{ label: string; re: RegExp }> = [
     { label: 'auth-refresher guard', re: /(?:SessionRefresher|refreshBrowserSession|BrowserSessionProxyOrigin|BrowserSessionEgressPolicy)/i },
     { label: 'provenance needle-builder guard', re: /(?:SecretNeedle|PersonaSecretNeedles|ScrubbableCookie|OriginsWithinProjectScope)/i },
     { label: 'provider inbound/outbound scrubber guard', re: /(?:sanitizeProvider(?:Stream|Value)|InboundProviderFrame|OutboundProviderRequest)/i },
-    { label: 'approval-lease predicate guard', re: /(?:leaseAuthorizes|LeaseEligibility|HighRiskOrExternalMutation|ApprovalLease)/i },
+    { label: 'approval-lease predicate guard', re: /(?:leaseAuthorizes|LeaseEligibility|HighRiskOrExternalMutation|ApprovalLease|authorizeStateChange)/i },
     { label: 'host-minted oracle / proof-kernel guard', re: /(?:HostMinted|HostExpression|HostBooleanPair|HostTimingChallenge|HostRedirectCanary|StampedBooleanPair|SignedUrlMint(?:Pair|Differential)|WorkerVisibleBodyDigest|normalizeRequestCarrier)/i },
     { label: 'composite binding / tenant provenance guard', re: /(?:BoundTerminalControl|ExchangeTenantPrivilege|CitedReceiptExchanges|OracleInputProvenance)/i },
     { label: 'worker sandbox / bounded checkout / OOB quota guard', re: /(?:InWorker$|materializeGitTreeBounded|Oob(?:Callback|Token)Quota)/i },
   ]
 
-  const violations: string[] = []
-  for (const key of allUnwiredKeys) {
-    const symbol = key.includes('::') ? key.slice(key.indexOf('::') + 2) : key
-    if (FORBIDDEN_UNWIRED_SYMBOLS.has(symbol)) {
-      violations.push(`Forbidden security primitive listed as unwired: ${key}`)
-      continue
-    }
-    for (const pat of FORBIDDEN_SECURITY_GUARD_PATTERNS) {
-      if (pat.re.test(symbol)) {
-        violations.push(`Security-fix symbol (${pat.label}) listed as unwired: ${key}`)
-      }
-    }
-  }
-  assert.deepEqual(violations, [], `R4-H-3 unwired-security-primitive violations:\n${violations.join('\n')}`)
-
-  // 5c) Anchor check: live exported security primitives must exist in source (prevents silent rename drift).
-  const REQUIRED_LIVE_EXPORTS: Array<{ file: string; symbol: string }> = [
-    { file: 'src/server/persona-vault.ts', symbol: 'buildPersonaSecretNeedles' },
-    { file: 'src/server/browser-session-auth.ts', symbol: 'refreshBrowserSession' },
+  // 5b) Authoritative security-guard live reachability set (merges R3-08 registry + R4 security primitives).
+  const REQUIRED_PRODUCTION_REACHABLE: Array<{ file: string; symbol: string }> = [
+    ...SECURITY_GUARD_ENTRY_REGISTRY.map(spec => ({ file: spec.file, symbol: spec.symbol })),
     { file: 'src/server/browser-session-auth.ts', symbol: 'evaluateBrowserSessionProxyOrigin' },
+    { file: 'src/server/browser-session-auth.ts', symbol: 'resolveBrowserSessionEgressPolicy' },
     { file: 'src/server/approval-pattern.ts', symbol: 'isHighRiskOrExternalMutationPath' },
-    { file: 'src/server/provider-stream.ts', symbol: 'sanitizeProviderStream' },
+    { file: 'src/server/provider-stream.ts', symbol: 'scrubOutboundProviderRequest' },
     { file: 'src/server/provider-stream.ts', symbol: 'sanitizeProviderValue' },
     { file: 'src/server/provider-stream.ts', symbol: 'verifyInboundProviderFrameIntegrity' },
     { file: 'src/server/composite-autodag.ts', symbol: 'matchesBoundTerminalControl' },
@@ -914,91 +1160,196 @@ test('Check 5: R4-H-3 — scripts/unwired-baseline.json must never list security
     { file: 'src/server/verify-support.ts', symbol: 'computeWorkerVisibleBodyDigest' },
     { file: 'src/server/verify-support.ts', symbol: 'assessSignedUrlMintDifferential' },
   ]
-  for (const { file, symbol } of REQUIRED_LIVE_EXPORTS) {
-    const src = readFileSync(join(REPO_ROOT, file), 'utf8')
-    const exportRe = new RegExp(`export\\s+(?:async\\s+)?(?:function|const|class)\\s+${symbol}\\b|export\\s*\\{[^}]*\\b${symbol}\\b`, 's')
-    assert.ok(exportRe.test(src), `Expected live exported security primitive ${file}::${symbol}`)
-  }
+  const requiredSymbolNames = new Set(REQUIRED_PRODUCTION_REACHABLE.map(r => r.symbol))
 
-  // 5d) L800 lock-in: verify-rpc.ts getKernelSecrets must use the shared buildPersonaSecretNeedles builder.
-  const verifyRpcSrc = readFileSync(join(REPO_ROOT, 'src/server/verify-rpc.ts'), 'utf8')
-  assert.match(verifyRpcSrc, /\bbuildPersonaSecretNeedles\s*\(/, 'src/server/verify-rpc.ts must call buildPersonaSecretNeedles')
-  assert.doesNotMatch(verifyRpcSrc, /\bpersonaSecrets\s*\(/, 'src/server/verify-rpc.ts must not duplicate personaSecrets alongside buildPersonaSecretNeedles')
+  const violations: string[] = []
+  for (const key of allUnwiredKeys) {
+    const symbol = key.includes('::') ? key.slice(key.indexOf('::') + 2) : key
+    if (requiredSymbolNames.has(symbol)) {
+      violations.push(`Forbidden security primitive listed as unwired: ${key}`)
+      continue
+    }
+    for (const pat of FORBIDDEN_SECURITY_GUARD_PATTERNS) {
+      if (pat.re.test(symbol)) {
+        violations.push(`Security-fix symbol (${pat.label}) listed as unwired: ${key}`)
+      }
+    }
+  }
+  assert.deepEqual(violations, [], `R4-H-3 / R3-08 unwired-security-primitive violations:\n${violations.join('\n')}`)
+
+  // 5c) Real AST production-entry reachability check (replaces regex export scan):
+  //     every registry security symbol must be AST-exported AND reachable via import/call edges
+  //     from a production entrypoint (`src/server.ts`, `src/actions.ts`, `src/routes/**`, `scripts/serve.ts`, etc.).
+  const graph = collectReachableProductionSymbols(REPO_ROOT)
+  const unreachable: string[] = []
+  const seenReq = new Set<string>()
+  for (const { file, symbol } of REQUIRED_PRODUCTION_REACHABLE) {
+    const key = `${file}::${symbol}`
+    if (seenReq.has(key)) continue
+    seenReq.add(key)
+    const mod = graph.modules.get(file)
+    if (!mod || !graph.reachableModules.has(file)) {
+      unreachable.push(`${key} (module "${file}" not reachable from any production entrypoint)`)
+      continue
+    }
+    if (!mod.declaredValueExports.has(symbol) && !mod.reexports.has(symbol)) {
+      unreachable.push(`${key} (symbol "${symbol}" is not exported as a value from "${file}")`)
+      continue
+    }
+    if (!graph.reachableSymbols.has(key)) {
+      unreachable.push(`${key} (exported from "${file}" but no production import/call edge reaches it)`)
+    }
+  }
+  assert.deepEqual(
+    unreachable,
+    [],
+    `R3-08 production-entry reachability failures:\n${unreachable.join('\n')}`,
+  )
+
+  // 5d) AST call lock-in: verify-rpc.ts must call buildPersonaSecretNeedles and must not call duplicate personaSecrets.
+  const verifyRpcPath = join(REPO_ROOT, 'src/server/verify-rpc.ts')
+  const verifyRpcSf = ts.createSourceFile(verifyRpcPath, readFileSync(verifyRpcPath, 'utf8'), ts.ScriptTarget.Latest, true)
+  const verifyRpcAst = collectAstCallsAndProps(verifyRpcSf, verifyRpcSf)
+  assert.ok(verifyRpcAst.callees.has('buildPersonaSecretNeedles'), 'src/server/verify-rpc.ts must call buildPersonaSecretNeedles')
+  assert.equal(verifyRpcAst.callees.has('personaSecrets'), false, 'src/server/verify-rpc.ts must not duplicate personaSecrets alongside buildPersonaSecretNeedles')
 })
 
 // ---------------------------------------------------------------------------
-// Check 6 — R4-C-1 & R4-C-2 Host-Minted Per-Exchange Stamp Guard
+// Check 6 — R4-C-1 & R4-C-2 Host-Minted Per-Exchange Stamp Guard (AST-verified, zero fixed windows)
 // ---------------------------------------------------------------------------
 test('Check 6: R4-C-1 & R4-C-2 — every host-minted oracle enforces per-exchange host stamps and prove.injection never leaks expectedOutput/operands', () => {
-  const proofReceiptSrc = readFileSync(join(REPO_ROOT, 'src/server/proof-receipt.ts'), 'utf8')
-  const verifyClaimsSrc = readFileSync(join(REPO_ROOT, 'src/server/verify-claims.ts'), 'utf8')
-  const proveHandlersSrc = readFileSync(join(REPO_ROOT, 'src/server/verify-prove-handlers.ts'), 'utf8')
-  const oracleInvariantsSrc = readFileSync(join(REPO_ROOT, 'src/server/oracle-invariants.ts'), 'utf8')
+  const proofReceiptPath = join(REPO_ROOT, 'src/server/proof-receipt.ts')
+  const verifyClaimsPath = join(REPO_ROOT, 'src/server/verify-claims.ts')
+  const proveHandlersPath = join(REPO_ROOT, 'src/server/verify-prove-handlers.ts')
+  const oracleInvariantsPath = join(REPO_ROOT, 'src/server/oracle-invariants.ts')
 
-  // 6a) ReceiptTranscriptEntry declares every per-exchange host stamp field.
-  const entryInterfaceMatch = /export interface ReceiptTranscriptEntry\s*\{[\s\S]*?\n\}/.exec(proofReceiptSrc)
-  assert.ok(entryInterfaceMatch, 'ReceiptTranscriptEntry interface must exist in proof-receipt.ts')
-  const entryInterfaceBody = entryInterfaceMatch[0]
-  assert.match(entryInterfaceBody, /\bhostBooleanPair\?:\s*HostStampedBooleanPair\b/)
-  assert.match(entryInterfaceBody, /\bhostExpressionChallenge\?:\s*HostMintedExpressionChallenge\b/)
-  assert.match(entryInterfaceBody, /\bhostTimingChallenge\?:\s*HostMintedTimingChallenge\b/)
-  assert.match(entryInterfaceBody, /\bhostRedirectCanaryHost\?:\s*string\s*\|\s*null\b/)
+  const proofReceiptSf = ts.createSourceFile(proofReceiptPath, readFileSync(proofReceiptPath, 'utf8'), ts.ScriptTarget.Latest, true)
+  const verifyClaimsSf = ts.createSourceFile(verifyClaimsPath, readFileSync(verifyClaimsPath, 'utf8'), ts.ScriptTarget.Latest, true)
+  const proveSf = ts.createSourceFile(proveHandlersPath, readFileSync(proveHandlersPath, 'utf8'), ts.ScriptTarget.Latest, true)
+  const oracleInvariantsSf = ts.createSourceFile(oracleInvariantsPath, readFileSync(oracleInvariantsPath, 'utf8'), ts.ScriptTarget.Latest, true)
 
-  // 6b) Kernel verification enforces stamps across all 5 host-minted oracle families:
+  // 6a) AST inspection: ReceiptTranscriptEntry interface declares every per-exchange host stamp field.
+  let entryInterface: ts.InterfaceDeclaration | undefined
+  let verifyEvalExprFn: ts.FunctionDeclaration | undefined
+  const ruleIfBranches = new Map<string, ts.Statement>()
+  const walkProofReceipt = (node: ts.Node) => {
+    if (ts.isInterfaceDeclaration(node) && node.name.text === 'ReceiptTranscriptEntry') {
+      entryInterface = node
+    } else if (ts.isFunctionDeclaration(node) && node.name?.text === 'verifyEvaluatedExpression') {
+      verifyEvalExprFn = node
+    } else if (
+      ts.isIfStatement(node)
+      && ts.isBinaryExpression(node.expression)
+      && node.expression.operatorToken.kind === ts.SyntaxKind.EqualsEqualsEqualsToken
+      && ts.isIdentifier(node.expression.left)
+      && node.expression.left.text === 'rule'
+      && ts.isStringLiteral(node.expression.right)
+    ) {
+      ruleIfBranches.set(node.expression.right.text, node.thenStatement)
+    }
+    ts.forEachChild(node, walkProofReceipt)
+  }
+  walkProofReceipt(proofReceiptSf)
+
+  assert.ok(entryInterface, 'ReceiptTranscriptEntry interface must exist in proof-receipt.ts')
+  const entryProps = new Map<string, string>()
+  for (const member of entryInterface.members) {
+    if (ts.isPropertySignature(member)) {
+      const key = propertyNameText(member.name)
+      if (key && member.type) entryProps.set(key, member.type.getText(proofReceiptSf).trim())
+    }
+  }
+  assert.equal(entryProps.get('hostBooleanPair'), 'HostStampedBooleanPair')
+  assert.equal(entryProps.get('hostExpressionChallenge'), 'HostMintedExpressionChallenge')
+  assert.equal(entryProps.get('hostTimingChallenge'), 'HostMintedTimingChallenge')
+  assert.equal(entryProps.get('hostRedirectCanaryHost'), 'string | null')
+
+  // 6b) Full-AST branch inspection across all 5 host-minted oracle families (NO fixed char windows!):
+  for (const requiredRule of ['oob', 'boolean', 'status_differential', 'timing', 'redirect']) {
+    assert.ok(ruleIfBranches.has(requiredRule), `proof-receipt.ts must have an explicit AST branch for rule === '${requiredRule}'`)
+  }
+  const oobAst = collectAstCallsAndProps(ruleIfBranches.get('oob')!, proofReceiptSf)
+  const booleanAst = collectAstCallsAndProps(ruleIfBranches.get('boolean')!, proofReceiptSf)
+  const statusAst = collectAstCallsAndProps(ruleIfBranches.get('status_differential')!, proofReceiptSf)
+  const timingAst = collectAstCallsAndProps(ruleIfBranches.get('timing')!, proofReceiptSf)
+  const redirectAst = collectAstCallsAndProps(ruleIfBranches.get('redirect')!, proofReceiptSf)
+  const oracleInvAst = collectAstCallsAndProps(oracleInvariantsSf, oracleInvariantsSf)
+
   //     (1) boolean & status_differential -> verifyStampedBooleanPairRound + canonicalPredicateSkeleton
-  const booleanRuleIdx = proofReceiptSrc.indexOf("if (rule === 'boolean')")
-  const statusRuleIdx = proofReceiptSrc.indexOf("if (rule === 'status_differential')")
-  const timingRuleIdx = proofReceiptSrc.indexOf("if (rule === 'timing')")
-  const redirectRuleIdx = proofReceiptSrc.indexOf("if (rule === 'redirect')")
-  const oobRuleIdx = proofReceiptSrc.indexOf("if (rule === 'oob')")
-  assert.ok(oobRuleIdx > 0 && booleanRuleIdx > oobRuleIdx && statusRuleIdx > booleanRuleIdx && timingRuleIdx > statusRuleIdx && redirectRuleIdx > timingRuleIdx)
+  assert.ok(booleanAst.callees.has('verifyStampedBooleanPairRound'), 'boolean rule AST branch must call verifyStampedBooleanPairRound')
+  assert.ok(statusAst.callees.has('verifyStampedBooleanPairRound'), 'status_differential rule AST branch must call verifyStampedBooleanPairRound')
+  assert.ok(oracleInvAst.callees.has('canonicalPredicateSkeleton'), 'oracle-invariants.ts must call canonicalPredicateSkeleton')
 
-  const oobBlock = proofReceiptSrc.slice(oobRuleIdx, booleanRuleIdx)
-  const booleanBlock = proofReceiptSrc.slice(booleanRuleIdx, statusRuleIdx)
-  const statusBlock = proofReceiptSrc.slice(statusRuleIdx, timingRuleIdx)
-  const timingBlock = proofReceiptSrc.slice(timingRuleIdx, redirectRuleIdx)
-  const redirectBlock = proofReceiptSrc.slice(redirectRuleIdx, redirectRuleIdx + 5000)
+  //     (2) evaluated-expression -> full AST of verifyEvaluatedExpression + evaluateClaim case 'host_evaluated_expression'
+  assert.ok(verifyEvalExprFn, 'verifyEvaluatedExpression function declaration must exist in proof-receipt.ts')
+  const evalExprAst = collectAstCallsAndProps(verifyEvalExprFn, proofReceiptSf)
+  assert.ok(evalExprAst.qualifiedProps.has('probe.hostExpressionChallenge'), 'verifyEvaluatedExpression must require per-exchange probe.hostExpressionChallenge')
+  assert.equal(evalExprAst.qualifiedProps.has('transcript.hostExpressionChallenges'), false, 'verifyEvaluatedExpression must NEVER fall back to transcript.hostExpressionChallenges')
+  assert.ok(evalExprAst.callees.has('verifyHostExpressionProbe'), 'verifyEvaluatedExpression must delegate to verifyHostExpressionProbe')
 
-  assert.match(booleanBlock, /\bverifyStampedBooleanPairRound\s*\(/, 'boolean rule must enforce verifyStampedBooleanPairRound')
-  assert.match(statusBlock, /\bverifyStampedBooleanPairRound\s*\(/, 'status_differential rule must enforce verifyStampedBooleanPairRound')
-  assert.match(oracleInvariantsSrc, /\bcanonicalPredicateSkeleton\s*\(/, 'oracle-invariants.ts must enforce canonicalPredicateSkeleton')
-
-  //     (2) evaluated-expression -> per-exchange probe.hostExpressionChallenge only (no transcript fallback), shared verifyHostExpressionProbe
-  const evalExprStart = proofReceiptSrc.indexOf('function verifyEvaluatedExpression(')
-  assert.ok(evalExprStart > 0, 'verifyEvaluatedExpression must exist in proof-receipt.ts')
-  const evalExprBlock = proofReceiptSrc.slice(evalExprStart, evalExprStart + 4500)
-  assert.match(evalExprBlock, /if\s*\(\s*!probe\.hostExpressionChallenge\s*\)/, 'verifyEvaluatedExpression must require per-exchange probe.hostExpressionChallenge')
-  assert.doesNotMatch(evalExprBlock, /transcript\.hostExpressionChallenges/, 'verifyEvaluatedExpression must NEVER fall back to transcript.hostExpressionChallenges')
-  assert.match(evalExprBlock, /\bverifyHostExpressionProbe\s*\(/, 'verifyEvaluatedExpression must delegate to verifyHostExpressionProbe')
-
-  const evaluateClaimIdx = verifyClaimsSrc.indexOf('export function evaluateClaim(')
-  assert.ok(evaluateClaimIdx > 0, 'verify-claims.ts must export evaluateClaim')
-  const claimsExprStart = verifyClaimsSrc.indexOf("case 'host_evaluated_expression':", evaluateClaimIdx)
-  assert.ok(claimsExprStart > evaluateClaimIdx, 'evaluateClaim in verify-claims.ts must handle host_evaluated_expression')
-  const claimsExprBlock = verifyClaimsSrc.slice(claimsExprStart, claimsExprStart + 3500)
-  assert.match(claimsExprBlock, /\bverifyHostExpressionProbe\s*\(/, 'verify-claims.ts must delegate host_evaluated_expression to verifyHostExpressionProbe')
-  assert.match(claimsExprBlock, /stampedChallenge:\s*fact\?\.hostExpressionChallenge\s*\?\?\s*prbRec\.hostExpressionChallenge/, 'verify-claims.ts must pass per-exchange hostExpressionChallenge stamp')
+  let evaluateClaimFn: ts.FunctionDeclaration | undefined
+  let hostEvalExprCase: ts.CaseClause | undefined
+  const walkVerifyClaims = (node: ts.Node) => {
+    if (ts.isFunctionDeclaration(node) && node.name?.text === 'evaluateClaim') {
+      evaluateClaimFn = node
+      const walkClaimBody = (inner: ts.Node) => {
+        if (ts.isCaseClause(inner) && ts.isStringLiteral(inner.expression) && inner.expression.text === 'host_evaluated_expression') {
+          hostEvalExprCase = inner
+        }
+        ts.forEachChild(inner, walkClaimBody)
+      }
+      walkClaimBody(node)
+    }
+    ts.forEachChild(node, walkVerifyClaims)
+  }
+  walkVerifyClaims(verifyClaimsSf)
+  assert.ok(evaluateClaimFn, 'verify-claims.ts must export evaluateClaim')
+  assert.ok(hostEvalExprCase, 'evaluateClaim in verify-claims.ts must handle case "host_evaluated_expression"')
+  const claimsExprAst = collectAstCallsAndProps(hostEvalExprCase, verifyClaimsSf)
+  assert.ok(claimsExprAst.callees.has('verifyHostExpressionProbe'), 'verify-claims.ts must delegate host_evaluated_expression to verifyHostExpressionProbe')
+  assert.ok(claimsExprAst.propAccesses.has('hostExpressionChallenge'), 'verify-claims.ts must forward per-exchange hostExpressionChallenge stamp')
 
   //     (3) timing -> oracle.verifyTimingChallenge + delayToken/controlToken binding
-  assert.match(timingBlock, /\boracle\.verifyTimingChallenge\s*\(/, 'timing rule must enforce HostMintedOracle.verifyTimingChallenge')
-  assert.match(timingBlock, /verifiedChallenge\.delayToken/, 'timing rule must bind host-minted delayToken')
-  assert.match(timingBlock, /verifiedChallenge\.controlToken/, 'timing rule must bind host-minted controlToken')
+  assert.ok(timingAst.qualifiedCalls.has('oracle.verifyTimingChallenge'), 'timing rule AST branch must call oracle.verifyTimingChallenge')
+  assert.ok(timingAst.propAccesses.has('delayToken'), 'timing rule AST branch must bind host-minted delayToken')
+  assert.ok(timingAst.propAccesses.has('controlToken'), 'timing rule AST branch must bind host-minted controlToken')
 
   //     (4) redirect -> oracle.isMintedRedirectHost + hostRedirectCanaryHost
-  assert.match(redirectBlock, /\bhostRedirectCanaryHost\b/, 'redirect rule must inspect hostRedirectCanaryHost')
-  assert.match(redirectBlock, /\boracle\.isMintedRedirectHost\s*\(/, 'redirect rule must verify host-minted redirect canary host')
+  assert.ok(redirectAst.propAccesses.has('hostRedirectCanaryHost'), 'redirect rule AST branch must inspect hostRedirectCanaryHost')
+  assert.ok(redirectAst.qualifiedCalls.has('oracle.isMintedRedirectHost'), 'redirect rule AST branch must call oracle.isMintedRedirectHost')
 
-  //     (5) OOB -> host callback timestamp + signature verification + unique request-side carrier token
-  assert.match(oobBlock, /\bverifyOobCallbackSignature\s*\(/, 'oob rule must verify host callback signatures')
-  assert.match(oobBlock, /\bentryCarriesTokenInRequest\s*\(/, 'oob rule must require request-side canary carrier')
+  //     (5) OOB -> host callback signature verification + unique request-side carrier token
+  assert.ok(oobAst.callees.has('verifyOobCallbackSignature'), 'oob rule AST branch must call verifyOobCallbackSignature')
+  assert.ok(oobAst.callees.has('entryCarriesTokenInRequest'), 'oob rule AST branch must call entryCarriesTokenInRequest')
 
-  // 6c) Prove handlers stamp per-exchange hostBooleanPair & hostExpressionChallenge, and prove.injection
-  //     NEVER returns expectedOutput or operands to workers (verified via AST inspection of handleProveInjection).
-  assert.match(proveHandlersSrc, /stampBooleanPairArm\s*\(\s*booleanPair\s*,\s*'baseline'\s*\)/)
-  assert.match(proveHandlersSrc, /host\.runHttpExchange\s*\(\s*probeArgs1\s*,\s*nonce\s*,\s*\{\s*hostExpressionChallenge:\s*ch1\s*\}\s*\)/)
-  assert.match(proveHandlersSrc, /host\.runHttpExchange\s*\(\s*probeArgs2\s*,\s*nonce\s*,\s*\{\s*hostExpressionChallenge:\s*ch2\s*\}\s*\)/)
+  // 6c) AST inspection of verify-prove-handlers.ts: stamps per-exchange hostBooleanPair & hostExpressionChallenge,
+  //     and handleProveInjection NEVER returns expectedOutput or operands to workers.
+  let hasBaselineBooleanStamp = false
+  let expressionExchangeStamps = 0
+  const walkProveStamps = (node: ts.Node) => {
+    if (ts.isCallExpression(node)) {
+      const tail = calleeTailName(node.expression)
+      if (tail === 'stampBooleanPairArm' && node.arguments.length >= 2) {
+        const arg1 = node.arguments[1]!
+        if (ts.isStringLiteral(arg1) && arg1.text === 'baseline') hasBaselineBooleanStamp = true
+      }
+      if (tail === 'runHttpExchange' && node.arguments.length >= 3) {
+        const arg2 = node.arguments[2]!
+        if (ts.isObjectLiteralExpression(arg2)) {
+          for (const p of arg2.properties) {
+            if ((ts.isPropertyAssignment(p) || ts.isShorthandPropertyAssignment(p)) && propertyNameText(p.name) === 'hostExpressionChallenge') {
+              expressionExchangeStamps += 1
+            }
+          }
+        }
+      }
+    }
+    ts.forEachChild(node, walkProveStamps)
+  }
+  walkProveStamps(proveSf)
+  assert.equal(hasBaselineBooleanStamp, true, 'verify-prove-handlers.ts must stamp baseline boolean pair arm via stampBooleanPairArm(..., "baseline")')
+  assert.ok(expressionExchangeStamps >= 2, `verify-prove-handlers.ts must stamp >= 2 hostExpressionChallenge exchanges via runHttpExchange, found ${expressionExchangeStamps}`)
 
-  const proveSf = ts.createSourceFile('verify-prove-handlers.ts', proveHandlersSrc, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
   const SECRET_CHALLENGE_PROPS = new Set(['expectedOutput', 'expected_output', 'operandA', 'operandB', 'expressionSyntax'])
   let foundHandleProveInjection = false
   let foundPublicChallenges = false

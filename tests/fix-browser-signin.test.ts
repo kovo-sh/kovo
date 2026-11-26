@@ -18,12 +18,12 @@ import {
   classifyInteractiveCapturedOrigins,
   evaluateBrowserSessionProxyOrigin,
   evaluateInteractiveCaptureOrigin,
-  refreshBrowserSession,
   registerBrowserSessionPersonaFromAction,
   resolveBrowserSessionEgressPolicy,
   startInteractiveLoginCapture,
   wwwSiblingOrigin,
 } from '../src/server/browser-session-auth.ts'
+import { refreshBrowserSessionForTest } from './helpers/browser-session-test-factory.ts'
 import { eq } from 'drizzle-orm'
 import { PersonaAuthManager } from '../src/server/persona-auth.ts'
 import { listProjectPersonas, resolveRunPersonas } from '../src/server/persona-vault.ts'
@@ -460,7 +460,7 @@ test('Live Chromium interactive sign-in handles 308 apex -> www. + cross-origin 
 
   // Step D: Direct refreshBrowserSession against apexOrigin (308 -> wwwOrigin) succeeds WITHOUT ERR_TUNNEL_CONNECTION_FAILED
   // even when ONLY apexOrigin is in originAllowlist (automatic apex <-> www. sibling)!
-  const apexRefresh = await refreshBrowserSession({
+  const apexRefresh = await refreshBrowserSessionForTest({
     storageState: {
       cookies: [{
         name: 'www_landing',

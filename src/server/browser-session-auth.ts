@@ -272,24 +272,19 @@ export interface RefreshBrowserSessionOptions {
   originAllowlist?: readonly string[]
   /** Explicit, operator-approved IdP origins (from login/IdP config — NEVER "any public HTTPS"). */
   idpOrigins?: readonly string[]
-  /** Host-derived project/run ScopePolicy enforced on refresher proxy & browser routes (mandatory in production). */
-  scopePolicy?: ScopePolicy
-  /**
-   * Production callers (`PersonaAuthManager`) set this to fail closed if `scopePolicy` is missing
-   * regardless of environment or stub launcher injection (R4-H-3).
-   */
-  requireScopePolicy?: boolean
-  /** Explicit unit-test opt-in allowing a direct `refreshBrowserSession` call without `scopePolicy`. */
-  allowUnscopedRefreshForTest?: boolean
+  /** Host-derived project/run ScopePolicy enforced on refresher proxy & browser routes (REQUIRED). */
+  scopePolicy: ScopePolicy
+  /** Required attestation (`true`) confirming host-derived `ScopePolicy`; enforced unconditionally (R3-08 / R4-H-3). */
+  requireScopePolicy: true
   /**
    * Opt-in to preserve third-party cookies outside allowed persona + IdP origins when seeding
    * the refresher context (default `false`: third-party cookies are stripped fail-closed).
    */
   allowThirdPartyCookies?: boolean
-  /** Paths or URLs known to have been modified by the active run; refresh refuses if `verifyPath` matches. */
-  modifiedPaths?: readonly string[] | ReadonlySet<string>
-  /** Explicit flag indicating `verifyPath` was modified by the active run; refuses automated refresh. */
-  verifyPathModifiedByRun?: boolean
+  /** Paths or URLs known to have been modified by the active run; refresh refuses if `verifyPath` matches (REQUIRED). */
+  modifiedPaths: readonly string[] | ReadonlySet<string>
+  /** Explicit flag indicating `verifyPath` was modified by the active run; refuses automated refresh (REQUIRED). */
+  verifyPathModifiedByRun: boolean
   /** Optional path on targetOrigin to visit so client JS SDK refreshes tokens (default '/'). */
   verifyPath?: string
   allowLocalLab?: boolean
@@ -1187,9 +1182,14 @@ function normalizePathnameForMatch(pathname: string): string {
 export function isVerifyPathModifiedByRun(
   verifyPath: string,
   targetOrigin: string,
-  modifiedPaths?: readonly string[] | ReadonlySet<string>,
+  modifiedPaths: readonly string[] | ReadonlySet<string>,
 ): boolean {
-  if (!modifiedPaths) return false
+  if (modifiedPaths == null) {
+    throw new BrowserSessionRefreshBlockedError(
+      'Refusing automated browser session refresh: modifiedPaths is required.',
+      'VERIFY_PATH_MODIFIED',
+    )
+  }
   const entries = Array.isArray(modifiedPaths) ? modifiedPaths : [...modifiedPaths]
   if (entries.length === 0) return false
   const canonicalVerify = canonicalPathAndQuery(verifyPath) ?? verifyPath
@@ -2384,6 +2384,25 @@ export async function refreshBrowserSession(
   const allowLocalLab = Boolean(options.allowLocalLab)
   const targetUrl = normalizeTargetOrigin(options.targetOrigin, allowLocalLab)
   const verifyPath = normalizeVerifyPath(options.verifyPath)
+  // R3-08 / R4-H-3: ScopePolicy is ALWAYS required unconditionally (zero test-only bypass flags).
+  const effectiveScopePolicy = options.scopePolicy
+  if (
+    options.requireScopePolicy !== true
+    || !effectiveScopePolicy
+    || typeof effectiveScopePolicy !== 'object'
+  ) {
+    throw new BrowserSessionRefreshBlockedError(
+      'Refusing unattended browser session refresh without a host-derived ScopePolicy.',
+      'SCOPE_POLICY_REQUIRED',
+    )
+  }
+  // R3-08: Fail closed unconditionally when required run-modification guard inputs are absent.
+  if (options.modifiedPaths == null || typeof options.verifyPathModifiedByRun !== 'boolean') {
+    throw new BrowserSessionRefreshBlockedError(
+      'Refusing automated browser session refresh: modifiedPaths and verifyPathModifiedByRun are required.',
+      'VERIFY_PATH_MODIFIED',
+    )
+  }
   if (options.verifyPathModifiedByRun || isVerifyPathModifiedByRun(verifyPath, targetUrl.origin, options.modifiedPaths)) {
     throw new BrowserSessionRefreshBlockedError(
       `Refusing automated browser session refresh on "${verifyPath}": path was modified by the active run.`,
@@ -2396,25 +2415,6 @@ export async function refreshBrowserSession(
   const originAllowlist = options.originAllowlist && options.originAllowlist.length > 0
     ? [...new Set(options.originAllowlist)]
     : [targetUrl.origin]
-
-  // R4-H-3: Fail closed when host-derived ScopePolicy is missing in production.
-  let effectiveScopePolicy = options.scopePolicy
-  if (!effectiveScopePolicy) {
-    const allowMinimalTestFallback =
-      Boolean(options.allowUnscopedRefreshForTest) ||
-      (!options.requireScopePolicy && (Boolean(options.launchBrowser) || allowLocalLab))
-    if (!allowMinimalTestFallback) {
-      throw new BrowserSessionRefreshBlockedError(
-        'Refusing unattended browser session refresh without a host-derived ScopePolicy.',
-        'SCOPE_POLICY_REQUIRED',
-      )
-    }
-    effectiveScopePolicy = {
-      mode: allowLocalLab ? 'ephemeral_lab' : 'prod_readonly',
-      targetOrigins: [...new Set([targetUrl.origin, ...originAllowlist])],
-      authOrigins: [...(options.idpOrigins ?? [])],
-    }
-  }
 
   const egressPolicy = resolveBrowserSessionEgressPolicy({
     targetUrl,

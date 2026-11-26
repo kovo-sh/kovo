@@ -30,6 +30,7 @@ import type {
   PlaywrightBrowserLike,
   PlaywrightRouteLike,
   PlaywrightStorageState,
+  RefreshBrowserSessionOptions,
 } from '../src/server/browser-session-auth.ts'
 import { createEgressSanitizer } from '../src/server/egress-sanitizer.ts'
 import { PersonaAuthManager } from '../src/server/persona-auth.ts'
@@ -471,11 +472,11 @@ describe('R4-H-3: Production refresher forwards host-derived scopePolicy & modif
         storageState: { cookies: [], origins: [] },
         targetOrigin: 'https://app.northstar.example',
         verifyPath: '/dashboard',
-      }),
+      } as unknown as RefreshBrowserSessionOptions),
       err => err instanceof BrowserSessionRefreshBlockedError && err.code === 'SCOPE_POLICY_REQUIRED',
     )
 
-    // Even with a stub launcher, requireScopePolicy: true fails closed
+    // Even with a stub launcher or allowLocalLab, missing scopePolicy fails closed unconditionally
     await assert.rejects(
       () => refreshBrowserSession({
         storageState: { cookies: [], origins: [] },
@@ -483,7 +484,7 @@ describe('R4-H-3: Production refresher forwards host-derived scopePolicy & modif
         verifyPath: '/dashboard',
         requireScopePolicy: true,
         launchBrowser: makeStubBrowserLauncher({ launchCount: 0, visitedUrls: [] }),
-      }),
+      } as unknown as RefreshBrowserSessionOptions),
       err => err instanceof BrowserSessionRefreshBlockedError && err.code === 'SCOPE_POLICY_REQUIRED',
     )
   })
