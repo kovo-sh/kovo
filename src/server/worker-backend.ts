@@ -10,6 +10,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  readlinkSync,
   realpathSync,
   rmSync,
   statSync,
@@ -52,10 +53,49 @@ const cellNamespace = 'dev.kovo.cell'
 const warmNamespace = 'dev.kovo.warm'
 /** Host PID that created/owns the container; stale sweep never reaps live-PID containers. */
 export const WORKER_OWNER_PID_LABEL = 'kovo.owner_pid'
+/** Linux PID namespace inode link (`pid:[...]`) of the owner process. */
+export const WORKER_OWNER_PID_NS_LABEL = 'kovo.owner_pid_ns'
+/** Process start time in clock ticks (`/proc/<pid>/stat` field 22) to defeat PID reuse. */
+export const WORKER_OWNER_START_TIME_LABEL = 'kovo.owner_start_time'
+/** Process session label stamped on every worker container. */
+export const WORKER_SESSION_LABEL = sessionNamespace
 /** Pool or backend instance id stamped on containers for ownership attribution. */
 export const WORKER_POOL_INSTANCE_LABEL = 'kovo.pool_instance'
 /** A container may legitimately sit in `created` only for the create→start instant. */
 const DEFAULT_STALE_CREATED_MS = 120_000
+/** Foreign-namespace containers (e.g. host CLI vs DooD server) cannot use local `kill(pid, 0)`; spare until TTL. */
+export const DEFAULT_FOREIGN_OWNER_TTL_MS = 30 * 60_000
+
+/** Read current process PID namespace (`pid:[...]`), or `null` when `/proc` is unavailable. */
+export function currentPidNamespace(): string | null {
+  try {
+    const link = readlinkSync('/proc/self/ns/pid').trim()
+    return link || null
+  } catch {
+    return null
+  }
+}
+
+/** Read process start ticks (field 22 of `/proc/<pid>/stat`), or `null` when unavailable. */
+export function readProcStartTicks(pid: number | 'self' = 'self'): string | null {
+  try {
+    const raw = readFileSync(`/proc/${pid}/stat`, 'utf8')
+    const closeParen = raw.lastIndexOf(')')
+    if (closeParen < 0) return null
+    const rest = raw.slice(closeParen + 1).trim().split(/\s+/)
+    const startTicks = rest[19]
+    return startTicks && /^\d+$/.test(startTicks) ? startTicks : null
+  } catch {
+    return null
+  }
+}
+
+function normalizeDockerLabel(raw: string | undefined): string | null {
+  if (!raw) return null
+  const trimmed = raw.trim()
+  if (!trimmed || trimmed === '<no value>') return null
+  return trimmed
+}
 
 /**
  * Return `true` if host `pid` is still alive, `false` when definitely dead (`ESRCH`).
@@ -71,6 +111,38 @@ export function isOwnerPidAlive(pid: number): boolean {
     if (code === 'ESRCH') return false
     return true
   }
+}
+
+/**
+ * Namespace-safe owner liveness check (H-31):
+ * - Returns `true` when the owner is provably dead in the **same** PID namespace
+ *   (`ESRCH` or recycled PID whose `/proc/<pid>/stat` start time changed).
+ * - Returns `false` when the owner is alive in the **same** PID namespace.
+ * - Returns `null` when the container belongs to a **foreign** PID namespace (e.g. host CLI vs
+ *   DooD container) so callers fall back to a foreign TTL instead of misreading `ESRCH`.
+ */
+export function isOwnerProvablyDead(
+  owner: { pid: number; pidNs?: string | null; startTime?: string | null },
+  options: {
+    currentPidNs?: string | null
+    isPidAlive?: (pid: number) => boolean
+    readPidStartTime?: (pid: number) => string | null
+  } = {},
+): boolean | null {
+  const pidNs = normalizeDockerLabel(owner.pidNs ?? undefined)
+  const currentNs = options.currentPidNs !== undefined ? options.currentPidNs : currentPidNamespace()
+  if (pidNs !== null && (!currentNs || pidNs !== currentNs)) {
+    return null
+  }
+  const checkAlive = options.isPidAlive ?? isOwnerPidAlive
+  if (!checkAlive(owner.pid)) return true
+  const expectedStart = normalizeDockerLabel(owner.startTime ?? undefined)
+  if (expectedStart !== null) {
+    const readStart = options.readPidStartTime ?? readProcStartTicks
+    const liveStart = readStart(owner.pid)
+    if (liveStart !== null && liveStart !== expectedStart) return true
+  }
+  return false
 }
 
 function parseOwnerPid(raw: string | undefined): number | null {
@@ -1105,6 +1177,9 @@ interface ContainerArgsInput {
   cell?: string
   warm?: boolean
   ownerPid?: number
+  ownerPidNs?: string | null
+  ownerStartTime?: string | null
+  sessionId?: string
   poolInstanceId?: string
   options?: WorkerSessionOptions
   /** One-shot only: host tmpfs (or DooD scratch) dir mounted at /kovo-ipc for large-output pointers. */
@@ -1194,6 +1269,26 @@ function reposTreeNeedsStaging(resolvedRoot: string): boolean {
       if (st.isSymbolicLink()) continue
       const relPosix = relative(resolvedRoot, fullPath).split(sep).join('/')
       if (st.isDirectory()) {
+        const nameLower = entry.name.toLowerCase()
+        if (nameLower === 'node_modules') continue
+        if (nameLower === '.git') {
+          const hooksDir = join(fullPath, 'hooks')
+          if (existsSync(hooksDir)) {
+            try {
+              if ((lstatSync(hooksDir).mode & 0o005) !== 0) return true
+            } catch { /* ignore */ }
+          }
+          const configFile = join(fullPath, 'config')
+          if (existsSync(configFile)) {
+            try {
+              const cfgStat = lstatSync(configFile)
+              if ((cfgStat.mode & 0o004) !== 0 && gitConfigHasCredentials(configFile)) return true
+            } catch {
+              return true
+            }
+          }
+          continue
+        }
         if (isSensitiveRepoEntry(relPosix, entry.name, true)) {
           if ((st.mode & 0o005) !== 0) return true
           continue
@@ -1218,19 +1313,59 @@ function reposTreeNeedsStaging(resolvedRoot: string): boolean {
   return inspect(resolvedRoot)
 }
 
-function stageReadableReposTree(resolvedRoot: string, targetDir?: string): { mountDir: string; excludedCount: number } {
+function resolveStageReposBaseDir(stageDirMode: number, env: NodeJS.ProcessEnv = process.env): string {
+  const containerScratch = env.KOVO_CONTAINER_SCRATCH_DIR?.trim()
+  if (containerScratch && isAbsolute(containerScratch) && !/[\0,\r\n]/.test(containerScratch) && posix.resolve(containerScratch) !== '/') {
+    mkdirSync(containerScratch, { recursive: true, mode: stageDirMode })
+    return containerScratch
+  }
+  const dataDir = env.KOVO_DATA_DIR?.trim()
+  if (dataDir && !/[\0,\r\n]/.test(dataDir)) {
+    const scratchBase = join(dataDir, 'scratch')
+    mkdirSync(scratchBase, { recursive: true, mode: stageDirMode })
+    return scratchBase
+  }
+  return tmpdir()
+}
+
+export function stageReadableReposTree(
+  resolvedRoot: string,
+  targetDir?: string,
+  options?: { env?: NodeJS.ProcessEnv; onTargetResolved?: (mountDir: string) => void },
+): { mountDir: string; excludedCount: number } {
   const sameContainerUid = isContainerUid10001()
   const stageDirMode = sameContainerUid ? 0o700 : 0o755
   const stageFileMode = sameContainerUid ? 0o600 : 0o644
   let mountDir: string
+  let createdTargetDir = false
   if (targetDir) {
-    mountDir = realpathSync(targetDir)
+    if (existsSync(targetDir)) {
+      const targetStat = lstatSync(targetDir)
+      if (targetStat.isSymbolicLink() || !targetStat.isDirectory()) {
+        throw new Error('Staging target path must be a directory.')
+      }
+      if (readdirSync(targetDir).length > 0) {
+        throw new Error('Refusing to stage repository into non-empty target directory.')
+      }
+      mountDir = realpathSync(targetDir)
+      createdTargetDir = false
+    } else {
+      mkdirSync(targetDir, { recursive: false, mode: stageDirMode })
+      chmodSync(targetDir, stageDirMode)
+      mountDir = realpathSync(targetDir)
+      createdTargetDir = true
+    }
   } else {
-    const rawStageDir = mkdtempSync(join(tmpdir(), 'kovo-repos-'))
+    const stageBase = resolveStageReposBaseDir(stageDirMode, options?.env)
+    const rawStageDir = mkdtempSync(join(stageBase, 'kovo-repos-'))
     chmodSync(rawStageDir, stageDirMode)
     mountDir = realpathSync(rawStageDir)
+    createdTargetDir = true
   }
+
+  options?.onTargetResolved?.(mountDir)
   let excludedCount = 0
+  const createdChildren: string[] = []
 
   const copyDir = (srcDir: string, dstDir: string) => {
     for (const entry of readdirSync(srcDir, { withFileTypes: true })) {
@@ -1242,12 +1377,26 @@ function stageReadableReposTree(resolvedRoot: string, targetDir?: string): { mou
       }
       const relPosix = relative(resolvedRoot, srcChild).split(sep).join('/')
       if (st.isDirectory()) {
+        const nameLower = entry.name.toLowerCase()
+        if (nameLower === 'node_modules') {
+          excludedCount += 1
+          continue
+        }
+        if (nameLower === '.git') {
+          // Skip `.git` directories so multi-hundred-MB git object stores never exhaust scratch disk/inodes.
+          let gitSensitiveCount = 0
+          if (existsSync(join(srcChild, 'hooks'))) gitSensitiveCount += 1
+          if (existsSync(join(srcChild, 'config'))) gitSensitiveCount += 1
+          excludedCount += Math.max(1, gitSensitiveCount)
+          continue
+        }
         if (isSensitiveRepoEntry(relPosix, entry.name, true)) {
           excludedCount += 1
           continue
         }
         const dstChild = join(dstDir, entry.name)
         mkdirSync(dstChild)
+        if (dstDir === mountDir) createdChildren.push(dstChild)
         chmodSync(dstChild, stageDirMode)
         copyDir(srcChild, dstChild)
       } else if (st.isFile()) {
@@ -1256,6 +1405,7 @@ function stageReadableReposTree(resolvedRoot: string, targetDir?: string): { mou
           continue
         }
         const dstChild = join(dstDir, entry.name)
+        if (dstDir === mountDir) createdChildren.push(dstChild)
         copyFileSync(srcChild, dstChild)
         chmodSync(dstChild, stageFileMode)
       }
@@ -1265,7 +1415,15 @@ function stageReadableReposTree(resolvedRoot: string, targetDir?: string): { mou
   try {
     copyDir(resolvedRoot, mountDir)
   } catch (error) {
-    try { rmSync(mountDir, { recursive: true, force: true }) } catch { /* ignore */ }
+    if (createdTargetDir) {
+      liveStagedRepoDirs.delete(mountDir)
+      try { rmSync(mountDir, { recursive: true, force: true }) } catch { /* ignore */ }
+    } else {
+      // Never delete a pre-existing directory this call did not create; clean only our partial children.
+      for (const child of createdChildren) {
+        try { rmSync(child, { recursive: true, force: true }) } catch { /* ignore */ }
+      }
+    }
     throw error
   }
   return { mountDir, excludedCount }
@@ -1319,8 +1477,21 @@ export function prepareReposMount(
   const stageTarget = dood
     ? prepareSessionScratchDir(doodOptions?.sessionId ?? `repos-${randomUUID()}`, 'repos', env)
     : undefined
-  const { mountDir, excludedCount } = stageReadableReposTree(resolved, stageTarget)
-  trackLiveStagedRepoDir(mountDir)
+  let trackedMountDir: string | undefined
+  let mountDir: string
+  let excludedCount: number
+  try {
+    ({ mountDir, excludedCount } = stageReadableReposTree(resolved, stageTarget, {
+      env,
+      onTargetResolved: dir => {
+        trackedMountDir = dir
+        trackLiveStagedRepoDir(dir)
+      },
+    }))
+  } catch (error) {
+    if (trackedMountDir) liveStagedRepoDirs.delete(trackedMountDir)
+    throw error
+  }
   let cleaned = false
   return {
     mountDir,
@@ -1432,6 +1603,9 @@ export function workerContainerCreateArgs(input: ContainerArgsInput): string[] {
   const cpus = Number(clamp(options?.cpus, 2.0, 0.5, 4.0).toFixed(2))
   const pidsLimit = Math.round(clamp(options?.pidsLimit, 256, 64, 384))
   const tmpfsMb = Math.round(clamp(options?.tmpfsMb, 128, 64, 512))
+  const ownerPidNs = input.ownerPidNs !== undefined ? input.ownerPidNs : currentPidNamespace()
+  const ownerStartTime = input.ownerStartTime !== undefined ? input.ownerStartTime : readProcStartTicks('self')
+  const sessionId = input.sessionId ?? processSessionId
   return [
     // No `--rm`: Docker's automatic removal races the explicit `rm --force` below and the
     // daemon answers "removal of container ... is already in progress", which previously
@@ -1457,8 +1631,10 @@ export function workerContainerCreateArgs(input: ContainerArgsInput): string[] {
     ...(input.cell ? ['--label', `${cellNamespace}=${input.cell}`] : []),
     ...(input.warm ? ['--label', `${warmNamespace}=1`] : []),
     '--label', `${WORKER_OWNER_PID_LABEL}=${input.ownerPid ?? process.pid}`,
+    ...(ownerPidNs ? ['--label', `${WORKER_OWNER_PID_NS_LABEL}=${ownerPidNs}`] : []),
+    ...(ownerStartTime ? ['--label', `${WORKER_OWNER_START_TIME_LABEL}=${ownerStartTime}`] : []),
     ...(input.poolInstanceId ? ['--label', `${WORKER_POOL_INSTANCE_LABEL}=${input.poolInstanceId}`] : []),
-    '--label', `${sessionNamespace}=${processSessionId}`,
+    '--label', `${sessionNamespace}=${sessionId}`,
     '--label', `${createdAtNamespace}=` + Date.now(),
     input.image,
     ...(input.extraArgs ?? []),
@@ -1573,6 +1749,8 @@ export class WarmWorkerPool {
   private preparedRepos?: PreparedReposMount | null
   private capacity: number
   private readonly idle: string[] = []
+  private readonly createdAtByName = new Map<string, number>()
+  private readonly idleMaxAgeMs: number
   private readonly inflight = new Set<Promise<void>>()
   private readonly used = new Set<string>()
   /** Containers currently held by a session (excluding idle and in-flight creates). */
@@ -1594,6 +1772,7 @@ export class WarmWorkerPool {
     owner?: string
     options?: WorkerSessionOptions
     capacity?: number
+    idleMaxAgeMs?: number
   }) {
     this.cell = input.cell
     this.image = input.image
@@ -1605,6 +1784,7 @@ export class WarmWorkerPool {
     delete this.options.warmPoolPolicy
     this.signature = workerOptionsSignature(this.options)
     this.capacity = Math.max(1, Math.min(MAX_WARM_POOL_CAPACITY, Math.floor(input.capacity ?? warmPoolCapacity())))
+    this.idleMaxAgeMs = Math.max(1_000, input.idleMaxAgeMs ?? Math.floor(DEFAULT_FOREIGN_OWNER_TTL_MS / 2))
   }
 
   get enabled(): boolean { return !this.disabled && !this.closed }
@@ -1674,7 +1854,7 @@ export class WarmWorkerPool {
   private effectiveCreateOptions(): WorkerSessionOptions {
     if (!this.options.reposDir) return this.options
     if (this.preparedRepos === undefined) {
-      this.preparedRepos = prepareReposMount(this.options.reposDir, { sessionId: `warm-${this.instanceId}` })
+      this.preparedRepos = prepareReposMount(this.options.reposDir, { sessionId: `warm-${this.instanceId}-${randomUUID().slice(0, 8)}` })
     }
     return this.preparedRepos ? { ...this.options, reposDir: this.preparedRepos.mountDir } : this.options
   }
@@ -1708,10 +1888,16 @@ export class WarmWorkerPool {
         return
       }
       this.idle.push(name)
+      this.createdAtByName.set(name, Date.now())
       trackLiveContainer(name)
     } catch (error) {
       this.failures += 1
       this.disabled = true
+      if (this.idle.length === 0 && this.outstanding.size === 0) {
+        const staged = this.preparedRepos
+        this.preparedRepos = undefined
+        staged?.cleanup()
+      }
       if (process.env.KOVO_WORKER_DEBUG === '1') {
         console.error('[worker-pool] prewarm failed; falling back to cold create:', error instanceof Error ? error.message.slice(0, 160) : String(error))
       }
@@ -1730,25 +1916,60 @@ export class WarmWorkerPool {
     return this.idle[0] ?? null
   }
 
+  private async inspectIdleContainer(name: string): Promise<boolean> {
+    const createdAt = this.createdAtByName.get(name)
+    if (createdAt !== undefined && Date.now() - createdAt >= this.idleMaxAgeMs) {
+      return false
+    }
+    let raw: string
+    try {
+      raw = await this.docker([
+        'container', 'inspect', '-f',
+        `{{.State.Status}}\t{{index .Config.Labels "${WORKER_POOL_INSTANCE_LABEL}"}}`,
+        name,
+      ], AbortSignal.timeout(5_000))
+    } catch {
+      return false
+    }
+    const trimmed = raw.trim()
+    if (!trimmed) return true
+    const [status = '', instance = ''] = trimmed.split('\t')
+    if (status !== 'created' && status !== 'exited') return false
+    if (instance && instance !== '<no value>' && instance !== this.instanceId) return false
+    return true
+  }
+
   /** Take an idle container when it matches the caller's session shape; null means cold create. */
   async take(signal: AbortSignal, options?: WorkerSessionOptions): Promise<string | null> {
     if (!this.enabled) return null
     if (options?.rpcMountDir) return null
     if (workerOptionsSignature(options) !== this.signature) return null
-    if (!this.idle.length) await this.warm()
+    const startedEmpty = this.idle.length === 0
+    if (startedEmpty) await this.warm()
     signal.throwIfAborted()
-    const name = this.idle.shift()
-    if (!name) return null
-    liveContainers.delete(name)
-    this.outstanding.add(name)
-    if (this.used.has(name)) this.reused += 1
-    else this.used.add(name)
-    return name
+    while (this.idle.length > 0) {
+      const name = this.idle.shift()!
+      liveContainers.delete(name)
+      const healthy = await this.inspectIdleContainer(name)
+      signal.throwIfAborted()
+      if (!healthy) {
+        this.discarded += 1
+        this.used.delete(name)
+        await this.removeIdle(name)
+        continue
+      }
+      this.outstanding.add(name)
+      if (this.used.has(name)) this.reused += 1
+      else this.used.add(name)
+      return name
+    }
+    return null
   }
 
   /** Remove one idle container (pool disabled, oversized, or failed reuse). */
   private async removeIdle(name: string): Promise<void> {
     liveContainers.delete(name)
+    this.createdAtByName.delete(name)
     await this.docker(['container', 'rm', '--force', name], AbortSignal.timeout(5_000)).catch(() => undefined)
     this.removed += 1
   }
@@ -1781,6 +2002,7 @@ export class WarmWorkerPool {
       return false
     }
     this.idle.push(name)
+    this.createdAtByName.set(name, Date.now())
     this.returned += 1
     trackLiveContainer(name)
     return true
@@ -1789,6 +2011,7 @@ export class WarmWorkerPool {
   async close(): Promise<void> {
     this.closed = true
     const idle = this.idle.splice(0)
+    this.createdAtByName.clear()
     await Promise.all(idle.map(name => this.removeIdle(name)))
     const staged = this.preparedRepos
     this.preparedRepos = undefined
@@ -1805,7 +2028,10 @@ export class LinuxWorkerBackend implements WorkerBackend {
   private readonly docker: DockerRunner
   private readonly spawnSession: (name: string) => ChildProcess
   private readonly staleCreatedMs: number
+  private readonly foreignOwnerTtlMs: number
+  private readonly ownerPidNs: string | null
   private readonly isPidAlive: (pid: number) => boolean
+  private readonly readPidStartTime: (pid: number) => string | null
   private readonly warmPools = new Map<string, WarmPoolSlot>()
   /** Most recently installed policy key (used when `openSession` omits `options.warmPoolPolicy`). */
   private activeWarmPoolPolicy?: string
@@ -1832,6 +2058,10 @@ export class LinuxWorkerBackend implements WorkerBackend {
     sessionSpawner?: (name: string) => ChildProcess
     /** Grace before an abandoned `created` container is reclaimed (default 2 min). */
     staleCreatedMs?: number
+    /** TTL before a foreign-namespace container is reclaimed (default 30 min). */
+    foreignOwnerTtlMs?: number
+    /** Test seam: override this process's PID namespace (`pid:[...]`). */
+    ownerPidNs?: string | null
     /**
      * Matrix cell id (default: `KOVO_CELL_ID`). Labels every container `dev.kovo.cell`
      * and enables the best-effort warm session pool unless `KOVO_WARM_WORKERS=0`.
@@ -1839,10 +2069,25 @@ export class LinuxWorkerBackend implements WorkerBackend {
     cell?: string
     /** Test seam: check whether a container owner PID is alive (defaults to `isOwnerPidAlive`). */
     isPidAlive?: (pid: number) => boolean
+    /** Test seam: read `/proc/<pid>/stat` start ticks for PID-reuse detection. */
+    readPidStartTime?: (pid: number) => string | null
     /** Optional max concurrent per-policy warm pools (bounded LRU; defaults to `MAX_ACTIVE_WARM_POOLS`). */
     maxWarmPools?: number
   } = {}) {
-    const { image = 'kovo-worker:v4', workspace, runId, dockerRunner, sessionSpawner, staleCreatedMs, cell, isPidAlive, maxWarmPools } = input
+    const {
+      image = 'kovo-worker:v4',
+      workspace,
+      runId,
+      dockerRunner,
+      sessionSpawner,
+      staleCreatedMs,
+      foreignOwnerTtlMs,
+      ownerPidNs,
+      cell,
+      isPidAlive,
+      readPidStartTime,
+      maxWarmPools,
+    } = input
     this.image = input.image ?? (process.env.KOVO_WORKER_IMAGE?.trim() || image)
     this.runId = runId
     this.docker = dockerRunner ?? docker
@@ -1851,7 +2096,10 @@ export class LinuxWorkerBackend implements WorkerBackend {
       stdio: ['pipe', 'pipe', 'pipe'],
     }))
     this.staleCreatedMs = Math.max(0, staleCreatedMs ?? DEFAULT_STALE_CREATED_MS)
+    this.foreignOwnerTtlMs = Math.max(0, foreignOwnerTtlMs ?? DEFAULT_FOREIGN_OWNER_TTL_MS)
+    this.ownerPidNs = ownerPidNs !== undefined ? ownerPidNs : currentPidNamespace()
     this.isPidAlive = isPidAlive ?? isOwnerPidAlive
+    this.readPidStartTime = readPidStartTime ?? readProcStartTicks
     const envMaxPools = Number(process.env.KOVO_MAX_WARM_POOLS)
     this.maxWarmPools = Math.round(clamp(maxWarmPools ?? (Number.isFinite(envMaxPools) && envMaxPools > 0 ? envMaxPools : undefined), MAX_ACTIVE_WARM_POOLS, 1, 64))
     const cellId = cell ?? process.env.KOVO_CELL_ID
@@ -2119,9 +2367,12 @@ export class LinuxWorkerBackend implements WorkerBackend {
    * (`exited`/`dead`) — e.g. a SIGKILLed test process or a crashed CLI. Running (`Up`)
    * containers are left alone: they may belong to a concurrent stream.
    *
-   * Ownership safety: containers stamped with `kovo.owner_pid` are ONLY swept when that owner PID
-   * is provably dead (`ESRCH`), so parallel processes never reap another live process's idle
-   * warm-pool containers. Legacy unlabelled containers are only swept past `staleCreatedMs`.
+   * Ownership safety (H-31):
+   * - Containers stamped with `kovo.owner_pid` in the **same** PID namespace are ONLY swept when
+   *   that owner PID is provably dead (`ESRCH` or start-time mismatch).
+   * - Containers from a **foreign** PID namespace (e.g. host CLI vs DooD container) are never
+   *   probed against our local PID table and are spared until `foreignOwnerTtlMs` elapses.
+   * - Legacy unlabelled containers are only swept past `staleCreatedMs`.
    */
   private async removeStaleCreated() {
     const signal = AbortSignal.timeout(5_000)
@@ -2131,7 +2382,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
         'container', 'ls', '--all', '--no-trunc',
         '--filter', 'status=created', '--filter', 'status=exited', '--filter', 'status=dead',
         '--format',
-        `{{.ID}}\t{{.Names}}\t{{.Label "${createdAtNamespace}"}}\t{{.CreatedAt}}\t{{.Label "${WORKER_OWNER_PID_LABEL}"}}\t{{.Label "${WORKER_POOL_INSTANCE_LABEL}"}}`,
+        `{{.ID}}\t{{.Names}}\t{{.Label "${createdAtNamespace}"}}\t{{.CreatedAt}}\t{{.Label "${WORKER_OWNER_PID_LABEL}"}}\t{{.Label "${WORKER_POOL_INSTANCE_LABEL}"}}\t{{.Label "${WORKER_OWNER_PID_NS_LABEL}"}}\t{{.Label "${WORKER_OWNER_START_TIME_LABEL}"}}\t{{.Label "${sessionNamespace}"}}`,
       ], signal)
     } catch {
       return
@@ -2140,21 +2391,28 @@ export class LinuxWorkerBackend implements WorkerBackend {
     const stale: string[] = []
     for (const row of rows.trim().split('\n')) {
       if (!row) continue
-      const [id, name, createdLabel, createdAt, ownerPidLabel] = row.split('\t')
+      const [id, name, createdLabel, createdAt, ownerPidLabel, _poolInst, ownerPidNs, ownerStartTime, session] = row.split('\t')
       if (!/^[a-f0-9]{64}$/.test(id) || !workerName.test(name)) continue
       // Never reap a container this process created: pool-parked idle containers sit in `created`
       // or `exited` state between assignments and are removed by the pool, not by the stale sweep.
-      if (this.activeContainers.has(name) || liveContainers.has(name)) continue
+      if (this.activeContainers.has(name) || liveContainers.has(name) || session === processSessionId) continue
+      const stamped = Number(createdLabel)
+      const age = Number.isFinite(stamped) && stamped > 0 ? now - stamped : now - Date.parse(createdAt)
       const ownerPid = parseOwnerPid(ownerPidLabel)
       if (ownerPid !== null) {
-        // Container belongs to a labeled process: NEVER kill another live process's containers.
-        if (this.isPidAlive(ownerPid)) continue
-        stale.push(id)
+        const dead = isOwnerProvablyDead(
+          { pid: ownerPid, pidNs: ownerPidNs, startTime: ownerStartTime },
+          { currentPidNs: this.ownerPidNs, isPidAlive: this.isPidAlive, readPidStartTime: this.readPidStartTime },
+        )
+        if (dead === true) {
+          stale.push(id)
+        } else if (dead === null) {
+          // Foreign PID namespace: fall back to foreign TTL instead of local kill(pid, 0).
+          if (Number.isFinite(age) && age >= this.foreignOwnerTtlMs) stale.push(id)
+        }
         continue
       }
       // Unlabelled legacy container: only sweep after the safe grace threshold.
-      const stamped = Number(createdLabel)
-      const age = Number.isFinite(stamped) && stamped > 0 ? now - stamped : now - Date.parse(createdAt)
       if (!Number.isFinite(age) || age < this.staleCreatedMs) continue
       stale.push(id)
     }
@@ -2173,16 +2431,29 @@ export class LinuxWorkerBackend implements WorkerBackend {
       const rows = await this.docker([
         'container', 'ls', '--all', '--no-trunc', '--filter', `label=${workerNamespace}=${owner}`,
         '--format',
-        `{{.ID}}\t{{.Names}}\t{{.Label "${createdAtNamespace}"}}\t{{.CreatedAt}}\t{{.Label "${sessionNamespace}"}}\t{{.Label "${WORKER_OWNER_PID_LABEL}"}}`,
+        `{{.ID}}\t{{.Names}}\t{{.Label "${createdAtNamespace}"}}\t{{.CreatedAt}}\t{{.Label "${sessionNamespace}"}}\t{{.Label "${WORKER_OWNER_PID_LABEL}"}}\t{{.Label "${WORKER_OWNER_PID_NS_LABEL}"}}\t{{.Label "${WORKER_OWNER_START_TIME_LABEL}"}}`,
       ], signal)
+      const now = Date.now()
       inactive = rows.trim().split('\n').flatMap(row => {
         if (!row) return []
-        const [id, name, _createdLabel, _createdAt, session, ownerPidLabel] = row.split('\t')
+        const [id, name, createdLabel, createdAt, session, ownerPidLabel, ownerPidNs, ownerStartTime] = row.split('\t')
         if (!/^[a-f0-9]{64}$/.test(id) || !workerName.test(name)) return []
         // Never touch this process's own containers or any live sibling process's containers.
         if (this.activeContainers.has(name) || liveContainers.has(name) || session === processSessionId) return []
         const ownerPid = parseOwnerPid(ownerPidLabel)
-        if (ownerPid !== null && this.isPidAlive(ownerPid)) return []
+        if (ownerPid !== null) {
+          const dead = isOwnerProvablyDead(
+            { pid: ownerPid, pidNs: ownerPidNs, startTime: ownerStartTime },
+            { currentPidNs: this.ownerPidNs, isPidAlive: this.isPidAlive, readPidStartTime: this.readPidStartTime },
+          )
+          if (dead === false) return []
+          if (dead === null) {
+            const stamped = Number(createdLabel)
+            const age = Number.isFinite(stamped) && stamped > 0 ? now - stamped : now - Date.parse(createdAt)
+            return Number.isFinite(age) && age >= this.foreignOwnerTtlMs ? [id] : []
+          }
+          return [id]
+        }
         return [id]
       })
     } catch {
@@ -2228,21 +2499,24 @@ export class LinuxWorkerBackend implements WorkerBackend {
     // One-shot containers exit before a pointer can be read via `docker exec`, so mount a host
     // tmpfs (or isolated DooD session subdir) and read the spilled payload directly (size + sha256).
     const scratchSessionId = `run-${randomUUID()}`
-    const { ipcDir, cleanupDir } = makeOneShotIpcDir(scratchSessionId)
-    const preparedRepos = prepareReposMount(options?.reposDir, { sessionId: scratchSessionId })
-    const effectiveOptions = preparedRepos ? { ...options, reposDir: preparedRepos.mountDir } : options
+    let cleanupDir: string | undefined
+    let preparedRepos: PreparedReposMount | null = null
     this.activeContainers.add(name)
     trackLiveContainer(name)
     try {
-      await this.docker(this.containerCreateArgs(name, job.assignmentId, [], effectiveOptions, ipcDir), deadline)
+      const ipc = makeOneShotIpcDir(scratchSessionId)
+      cleanupDir = ipc.cleanupDir
+      preparedRepos = prepareReposMount(options?.reposDir, { sessionId: scratchSessionId })
+      const effectiveOptions = preparedRepos ? { ...options, reposDir: preparedRepos.mountDir } : options
+      await this.docker(this.containerCreateArgs(name, job.assignmentId, [], effectiveOptions, ipc.ipcDir), deadline)
       const result = await this.docker(['container', 'start', '--attach', '--interactive', name], deadline, payload)
       const parsed = JSON.parse(result) as Record<string, unknown>
       if (parsed.resultRef) {
-        return resultSchema.parse(readOneShotRef(ipcDir, parsed.resultRef))
+        return resultSchema.parse(readOneShotRef(ipc.ipcDir, parsed.resultRef))
       }
       return resultSchema.parse(parsed)
     } finally {
-      cleanupSessionSubdir(cleanupDir)
+      if (cleanupDir) cleanupSessionSubdir(cleanupDir)
       await this.removeContainer(name)
       preparedRepos?.cleanup()
       this.activeContainers.delete(name)
@@ -2329,8 +2603,8 @@ export class LinuxWorkerBackend implements WorkerBackend {
       throw error
     }
     if (warm === null) releaseWarmRepos()
-    const pooled = warm !== null
-    const name = warm ?? 'kovo-' + randomUUID()
+    let pooled = warm !== null
+    let name = warm ?? 'kovo-' + randomUUID()
     this.sessionsServed += 1
     if (pooled && activePool) this.pooled.set(name, activePool)
     else this.coldSessionCreates += 1
@@ -2338,11 +2612,14 @@ export class LinuxWorkerBackend implements WorkerBackend {
     trackLiveContainer(name)
     let preparedRepos: PreparedReposMount | null = null
     const cleanupRepos = () => { preparedRepos?.cleanup() }
+    const createColdSessionContainer = async (targetName: string) => {
+      preparedRepos = prepareReposMount(options?.reposDir, { sessionId: `sess-${randomUUID()}` })
+      const effectiveOptions = preparedRepos ? { ...options, reposDir: preparedRepos.mountDir } : options
+      await this.docker(this.containerCreateArgs(targetName, assignmentId, ['--session'], effectiveOptions), AbortSignal.any([signal, AbortSignal.timeout(15_000)]))
+    }
     if (!pooled) {
       try {
-        preparedRepos = prepareReposMount(options?.reposDir, { sessionId: `sess-${randomUUID()}` })
-        const effectiveOptions = preparedRepos ? { ...options, reposDir: preparedRepos.mountDir } : options
-        await this.docker(this.containerCreateArgs(name, assignmentId, ['--session'], effectiveOptions), AbortSignal.any([signal, AbortSignal.timeout(15_000)]))
+        await createColdSessionContainer(name)
       } catch (error) {
         await this.removeContainer(name)
         cleanupRepos()
@@ -2364,7 +2641,23 @@ export class LinuxWorkerBackend implements WorkerBackend {
       releaseWarmRepos()
       this.activeContainers.delete(name)
       liveContainers.delete(name)
-      throw error
+      if (!pooled) throw error
+      // Cold-start fallback on a stale pooled miss.
+      pooled = false
+      name = 'kovo-' + randomUUID()
+      this.coldSessionCreates += 1
+      this.activeContainers.add(name)
+      trackLiveContainer(name)
+      try {
+        await createColdSessionContainer(name)
+        cli = this.spawnSession(name)
+      } catch (coldError) {
+        await this.removeContainer(name)
+        cleanupRepos()
+        this.activeContainers.delete(name)
+        liveContainers.delete(name)
+        throw coldError
+      }
     }
     const sessionStderr: Buffer[] = []
     let sessionStderrBytes = 0
