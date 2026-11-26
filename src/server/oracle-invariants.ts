@@ -1601,24 +1601,27 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
     isReadMethod(step.method) &&
     isSuccess(step.status) &&
     sameRoute(step, probe))
-  // A cross-tenant mutation makes an *unauthenticated* denial meaningless as an authorization
-  // control: a 401 for an anonymous caller proves the route requires authentication, not that the
-  // probe crossed an ownership boundary (the probe already authenticated). This was the
-  // `GET /api/me`-style misattribution where `anonAssign=401` was offered as the control for a
-  // viewer writing another tenant's ticket.
-  const crossTenantMutation = declaredResourceTenant !== null && probeTenants.size > 0 && !probeTenants.has(declaredResourceTenant)
-  const peerDenial = (control: ImpactStep): boolean => {
+  // An unauthenticated 401/403 login wall proves only that the route requires authentication,
+  // never that an authenticated caller (read OR mutation) crossed an authorization/ownership
+  // boundary. Without this check, pairing an anonymous 401 login wall with an authenticated
+  // same-tenant viewer 200 (and owner 200 control) falsely sets `boundaryControlDenied = true`
+  // and bypasses the same-tenant org-shared dismissal guard.
+  const peerDenial = (control: ImpactStep, targetProbe: ImpactStep | undefined = probe): boolean => {
     const controlTenants = actorTenants(control.actor)
     const unauthenticated = control.actor.handle === null && controlTenants.size === 0
-    if (unauthenticated && crossTenantMutation && mutatingProbe !== undefined) return false
-    if (controlTenants.size === 0 || probeTenants.size === 0) return true
-    return (probe !== undefined && actorsShareTenant(control.actor, probe.actor)) ||
-      (mirrorCorroborated && declaredResourceTenant !== null && controlTenants.has(declaredResourceTenant) && !probeTenants.has(declaredResourceTenant))
+    const targetTenants = targetProbe ? actorTenants(targetProbe.actor) : probeTenants
+    const targetAuthenticated = targetProbe !== undefined && (targetProbe.actor.handle !== null || targetTenants.size > 0)
+    if (unauthenticated && targetAuthenticated) return false
+    if (controlTenants.size === 0 || targetTenants.size === 0) return true
+    return (targetProbe !== undefined && actorsShareTenant(control.actor, targetProbe.actor)) ||
+      (mirrorCorroborated && declaredResourceTenant !== null && controlTenants.has(declaredResourceTenant) && !targetTenants.has(declaredResourceTenant))
   }
   const boundaryControlDenied = deniedControls.some(control =>
-    peerDenial(control) &&
     (firstProbeIndex === -1 || steps.indexOf(control) < firstProbeIndex) &&
-    probeSuccesses.some(success => sameRoute(control, success) && !isBogusIdSelectivity404(control, success)))
+    probeSuccesses.some(success =>
+      peerDenial(control, success) &&
+      sameRoute(control, success) &&
+      !isBogusIdSelectivity404(control, success)))
 
   const base = {
     probeRole: probe?.actor.role ?? null,
@@ -1799,7 +1802,11 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
     // needs owner-scoped private data, not merely a cross-tenant 200.
     const publicRoute = steps.some(step => PUBLIC_ROUTE_RE.test(step.route ?? ''))
     if (publicRoute) {
-      const disclosure = assessReadDisclosure({ steps, probe })
+      const disclosure = assessReadDisclosure({
+    steps,
+    probe,
+    allowSameTenantOrgFields: roleDifferential || crossTenant || boundaryControlDenied,
+  })
       base.disclosureFields = disclosure.fields
       if (!disclosure.satisfied) {
         return {
@@ -1890,14 +1897,22 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
   }
   // A credential-bearing response proves disclosure only when the caller was outside the route's
   // entitlement at the same time: a denied sibling arm on the same route, or a role differential.
-  // The pattern is re-tested against the recorded bodies, so a declared-but-absent value (or one a
-  // control also returns, i.e. a public constant) never confirms.
+  // For `disclosure` with an explicit matched credential pattern absent from every control (e.g.
+  // a free-text audit log leaking a credential shape on a login-gated route), an anonymous denial
+  // on the same route also suffices as the non-public boundary. The pattern is re-tested against
+  // the recorded bodies, so a declared-but-absent value (or one a control also returns, i.e. a
+  // public constant) never confirms.
+  const hasDeniedSameRouteControl = deniedControls.some(control =>
+    (firstProbeIndex === -1 || steps.indexOf(control) < firstProbeIndex) &&
+    sameRoute(control, probe) &&
+    !isBogusIdSelectivity404(control, probe))
   const patternEvidence = credentialPatternEvidence(input.credentialPatterns, probe, controls)
-  if (patternEvidence.length > 0 && probe.actor.handle !== null && (boundaryControlDenied || roleDifferential)) {
+  if (patternEvidence.length > 0 && probe.actor.handle !== null &&
+      (boundaryControlDenied || roleDifferential || (input.impactClass === 'disclosure' && hasDeniedSameRouteControl))) {
     return {
       required: true,
       satisfied: true,
-      reason: `Credential-shaped value disclosed: the probe response matches ${patternEvidence.length} declared credential shape(s) absent from every control, under a ${boundaryControlDenied ? 'denied sibling control' : 'role differential'}.`,
+      reason: `Credential-shaped value disclosed: the probe response matches ${patternEvidence.length} declared credential shape(s) absent from every control, under a ${boundaryControlDenied || hasDeniedSameRouteControl ? 'denied sibling control' : 'role differential'}.`,
       evidence: base,
     }
   }
@@ -1912,7 +1927,11 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
       }
     }
   }
-  const disclosure = assessReadDisclosure({ steps, probe })
+  const disclosure = assessReadDisclosure({
+    steps,
+    probe,
+    allowSameTenantOrgFields: roleDifferential || crossTenant || boundaryControlDenied,
+  })
   base.disclosureFields = disclosure.fields
   // An anonymous (or non-owner) read that mirrors the owner reference on the same route exposes the
   // same public record — a catalog listing/item — not an owner-scoped disclosure. Genuine private
@@ -1983,8 +2002,15 @@ function deRedactIdentity(value: string): string {
 export function assessReadDisclosure(args: {
   steps: readonly ImpactStep[]
   probe: ImpactStep
+  /**
+   * When true (e.g. caller already proved a cross-tenant crossing, role differential, or
+   * authenticated peer denial), allow non-secret org-shared fields on same-tenant reads.
+   * Defaults to false so direct callers (such as bare-claim implicit read disclosure) fail closed
+   * on honest same-tenant org-shared reads paired with an anonymous 401 login wall.
+   */
+  allowSameTenantOrgFields?: boolean
 }): ReadDisclosureResult {
-  const { steps, probe } = args
+  const { steps, probe, allowSameTenantOrgFields = false } = args
   if (probe.json === undefined || typeof probe.json !== 'object' || probe.json === null) {
     return { satisfied: false, fields: [], reason: 'The probe response body is not a JSON record, so no object-scoped attribute can be bound to a victim.' }
   }
@@ -2042,6 +2068,43 @@ export function assessReadDisclosure(args: {
       satisfied: false,
       fields: [],
       reason: 'The probe response exposes no owner-scoped, identifier-binding non-public attribute bound to another actor; a differing body without a victim-owned field is not object-level disclosure.',
+    }
+  }
+  if (!allowSameTenantOrgFields) {
+    const sameTenantControlRead = controls.some(control =>
+      stepReadsState(control) &&
+      isSuccess(control.status) &&
+      relatedRoute(control, probe) &&
+      actorsShareTenant(control.actor, probe.actor))
+    const crossTenantControlRead = controls.some(control =>
+      stepReadsState(control) &&
+      isSuccess(control.status) &&
+      relatedRoute(control, probe) &&
+      actorsAreCrossTenant(control.actor, probe.actor))
+    const authPeerDenied = steps.some(control =>
+      control.arm === 'control' &&
+      control.actor.handle !== null &&
+      isDenied(control.status) &&
+      sameRoute(control, probe) &&
+      !isBogusIdSelectivity404(control, probe) &&
+      (actorsShareTenant(control.actor, probe.actor) || (actorTenants(control.actor).size === 0 && actorTenants(probe.actor).size === 0)))
+    const sameTenantOrgRead = (sameTenantControlRead || responseScopedToOwnTenant(probe)) &&
+      !crossTenantControlRead &&
+      !authPeerDenied
+    if (sameTenantOrgRead) {
+      const secretFields = matched.filter(path => SAME_TENANT_SECRET_FIELD_RE.test(path.split('.').pop() ?? ''))
+      if (secretFields.length === 0) {
+        return {
+          satisfied: false,
+          fields: [],
+          reason: `Same-tenant read of org-shared resource (${matched.slice(0, 6).join(', ')}) without a cross-tenant crossing or authenticated peer denial: members of the same tenant legitimately share tenant-scoped records.`,
+        }
+      }
+      return {
+        satisfied: true,
+        fields: secretFields.slice(0, 8),
+        reason: `Owner-scoped secret field(s) disclosed: ${secretFields.slice(0, 6).join(', ')}.`,
+      }
     }
   }
   return {
@@ -2629,6 +2692,192 @@ export function verifyRepeatedTransitionControl(input: {
  * callers MUST pass the result through `verifyRepeatedTransitionControl` so field names alone
  * NEVER confirm business-logic impact (`R4-C-4`).
  */
+const CONCRETE_RESOURCE_SLUG_RE = /^[a-z]{2,8}[_-][a-z0-9]{1,}$/i
+
+function isConcreteResourcePath(step: Pick<ImpactStep, 'route' | 'pathAndQuery'>): boolean {
+  if (isObjectScopedRequest(step)) return true
+  const raw = (step.pathAndQuery ?? step.route ?? '').split('?')[0]?.split('#')[0]?.replace(/\/{2,}/g, '/').replace(/\/+$/, '') ?? ''
+  const segments = raw.split('/').filter(Boolean)
+  for (let i = 1; i < segments.length; i += 1) {
+    const seg = segments[i]!
+    if (NON_OBJECT_SEGMENT_RE.test(seg)) continue
+    if (CONCRETE_RESOURCE_SLUG_RE.test(seg) && !ROUTE_PREFIX_OR_VERSION_RE.test(segments[i - 1]!)) {
+      return true
+    }
+  }
+  return false
+}
+
+/**
+ * Same resource tree for business-logic transitions: equal/ancestor route family (`relatedRoute`),
+ * OR sibling sub-resources under the same concrete object-scoped parent (e.g.
+ * `GET /api/wallets/acct_a/balance` and `POST /api/wallets/acct_a/deposit` both under
+ * `/api/wallets/acct_a`).
+ */
+function relatedBusinessLogicRoute(a: ImpactStep, b: ImpactStep): boolean {
+  if (relatedRoute(a, b)) return true
+  const parentOf = (step: ImpactStep): string | null => {
+    const raw = (step.pathAndQuery ?? step.route ?? '').split('?')[0]?.split('#')[0]?.replace(/\/{2,}/g, '/').replace(/\/+$/, '') ?? ''
+    const parts = raw.split('/').filter(Boolean)
+    if (parts.length < 3) return null
+    const parent = `/${parts.slice(0, -1).join('/')}`
+    return isConcreteResourcePath({ route: parent, pathAndQuery: parent }) ? parent.toLowerCase() : null
+  }
+  const pa = parentOf(a)
+  const pb = parentOf(b)
+  return pa !== null && pb !== null && pa === pb
+}
+
+/**
+ * Numeric accumulator/balance/credit/seat/counter protected fields that legitimately move under
+ * ordinary authorized accounting/accumulation (deposits, topups, cart adds, seat usage updates).
+ * Without a peer/tenant boundary, refusal/bound-backed repeated transition, crossed host-declared
+ * bound, or declared invariant oracle event, a single-step persistence of these fields confirms
+ * ONLY on a direct field-name+value overwrite tamper (not an accumulator action or indirect operand).
+ */
+const NUMERIC_ACCUMULATOR_PROTECTED_RE =
+  /^(?:[a-z0-9]+[_-])*(?:balance|credits?|seats?|seat_?count|seats_?used|seat_?limit|quantity|qty|stock|inventory|points|funds|wallet|remaining|used|usage|quota|count|total|subtotal|discount|refund(?:ed)?)$/i
+
+const ACCUMULATOR_ACTION_ROUTE_RE =
+  /(?:^|\/)(?:deposit|deposits|withdraw|withdrawals?|debit|debits|credit|credits|topup|top[-_]?up|add|increment|decrement|transfer|transfers|items|cart|carts|bag|bags|refund|refunds|pay|payment|charge|charges|redeem|claim|apply)(?:\/|$)/i
+
+const ARITHMETIC_DELTA_FIELD_RE =
+  /^(?:[a-z0-9]+[_-])*(?:amount|delta|qty|quantity|value|units?|deposit|withdraw|debit|credit)$/i
+
+const CONSERVED_NONNEGATIVE_FIELD_RE =
+  /^(?:[a-z0-9]+[_-])*(?:balance|credits?|stock|inventory|remaining(?:_uses|_count|_balance|_credits|_quota|_stock|_quantity)?|available(?:_qty|_stock|_count)?|funds)$/i
+
+function findSingleStepRefusalBackedOverdraft(args: {
+  steps: readonly ImpactStep[]
+  mutatingProbe: ImpactStep
+  beforeFields: ReadonlyMap<string, string>
+  afterFields: ReadonlyMap<string, string>
+  changedFields: readonly string[]
+}): { satisfied: boolean; reason: string } {
+  const { steps, mutatingProbe, beforeFields, afterFields, changedFields } = args
+  let negHit: { path: string; before: number; after: number } | null = null
+  for (const path of changedFields) {
+    if (!CONSERVED_NONNEGATIVE_FIELD_RE.test(normalizeFieldLeaf(path))) continue
+    const nBefore = parseFiniteNumber(beforeFields.get(path))
+    const nAfter = parseFiniteNumber(afterFields.get(path))
+    if (nBefore !== null && nAfter !== null && nBefore >= 0 && nAfter < 0) {
+      negHit = { path, before: nBefore, after: nAfter }
+      break
+    }
+  }
+  if (!negHit) return { satisfied: false, reason: '' }
+  const probeTenants = actorTenants(mutatingProbe.actor)
+  const probeRank = roleRank(mutatingProbe.actor.role)
+  const probeKeys = requestJsonKeySignature(mutatingProbe)
+  const refusalControl = steps.find(control => {
+    if (control.arm !== 'control') return false
+    if (control.status !== 409 && control.status !== 422) return false
+    if (!control.actor.handle) return false
+    if (!sameRoute(control, mutatingProbe)) return false
+    const controlTenants = actorTenants(control.actor)
+    if (controlTenants.size > 0 || probeTenants.size > 0) {
+      if (controlTenants.size === 0 || probeTenants.size === 0 || !actorsShareTenant(control.actor, mutatingProbe.actor)) {
+        return false
+      }
+    }
+    const controlRank = roleRank(control.actor.role)
+    if (controlRank !== null && probeRank !== null && controlRank < probeRank) return false
+    const controlKeys = requestJsonKeySignature(control)
+    if (probeKeys !== null && controlKeys !== null && controlKeys !== probeKeys) return false
+    return true
+  }) ?? null
+  if (!refusalControl) return { satisfied: false, reason: '' }
+  return {
+    satisfied: true,
+    reason: `Host-recorded refusal control (${refusalControl.id}, HTTP ${refusalControl.status}) demonstrated a conservation/limit boundary while the mutating probe drove conserved field "${negHit.path}" negative (${negHit.before} -> ${negHit.after}).`,
+  }
+}
+
+function checkSingleStepBoundCrossed(args: {
+  beforeFields: ReadonlyMap<string, string>
+  afterFields: ReadonlyMap<string, string>
+  changedFields: readonly string[]
+  invariantBounds?: readonly BusinessInvariantBound[] | null
+}): { crossed: boolean; reason: string } {
+  const { beforeFields, afterFields, changedFields, invariantBounds } = args
+  for (const bound of invariantBounds ?? []) {
+    if (!bound || !bound.field || !bound.field.trim()) continue
+    for (const path of changedFields) {
+      if (!boundMatchesFieldPath(bound.field, path)) continue
+      const nBefore = parseFiniteNumber(beforeFields.get(path))
+      const nAfter = parseFiniteNumber(afterFields.get(path))
+      if (nBefore === null || nAfter === null) continue
+      if (bound.kind === 'floor' && typeof bound.min === 'number' && Number.isFinite(bound.min)) {
+        if (nBefore >= bound.min && nAfter < bound.min) {
+          return {
+            crossed: true,
+            reason: `Single transition crossed host-declared floor bound (${bound.min}) on "${path}" (${nBefore} -> ${nAfter}).`,
+          }
+        }
+      } else if (bound.kind === 'cap' && typeof bound.max === 'number' && Number.isFinite(bound.max)) {
+        if (nBefore <= bound.max && nAfter > bound.max) {
+          return {
+            crossed: true,
+            reason: `Single transition crossed host-declared cap bound (${bound.max}) on "${path}" (${nBefore} -> ${nAfter}).`,
+          }
+        }
+      }
+    }
+  }
+  return { crossed: false, reason: '' }
+}
+
+function isDirectProtectedFieldTamper(args: {
+  mutatingProbe: ImpactStep
+  beforeFields: ReadonlyMap<string, string>
+  afterFields: ReadonlyMap<string, string>
+  protectedFields: readonly string[]
+}): boolean {
+  const { mutatingProbe, beforeFields, afterFields, protectedFields } = args
+  if (protectedFields.length === 0) return false
+  const requestFields = mutatingProbe.requestJson !== undefined
+    ? flattenJson(mutatingProbe.requestJson)
+    : new Map<string, string>()
+  const method = (mutatingProbe.method ?? '').toUpperCase()
+  const route = (mutatingProbe.route ?? mutatingProbe.pathAndQuery ?? '').split('?')[0] ?? ''
+  const isAccumulatorAction = method === 'POST' && ACCUMULATOR_ACTION_ROUTE_RE.test(route)
+  const requestDeltaOperands: number[] = []
+  for (const [reqPath, reqVal] of requestFields) {
+    if (!ARITHMETIC_DELTA_FIELD_RE.test(normalizeFieldLeaf(reqPath))) continue
+    const num = parseFiniteNumber(reqVal)
+    if (num !== null) requestDeltaOperands.push(num)
+  }
+  for (const path of protectedFields) {
+    if (isPriceField(path)) continue
+    const leaf = normalizeFieldLeaf(path)
+    if (!NUMERIC_ACCUMULATOR_PROTECTED_RE.test(leaf)) {
+      return true
+    }
+    if (isAccumulatorAction) continue
+    const afterVal = afterFields.get(path)
+    if (afterVal === undefined) continue
+    let directValueMatch = false
+    for (const [reqPath, reqVal] of requestFields) {
+      if ((reqPath === path || normalizeFieldLeaf(reqPath) === leaf) && reqVal === afterVal) {
+        directValueMatch = true
+        break
+      }
+    }
+    if (!directValueMatch) continue
+    const nBefore = parseFiniteNumber(beforeFields.get(path))
+    const nAfter = parseFiniteNumber(afterVal)
+    if (nBefore !== null && nAfter !== null && requestDeltaOperands.length > 0) {
+      const diff = nAfter - nBefore
+      const explainedByOperand = requestDeltaOperands.some(op =>
+        op > 0 && (Math.abs(diff - op) <= 1e-9 * Math.max(1, Math.abs(op)) ||
+          Math.abs(diff + op) <= 1e-9 * Math.max(1, Math.abs(op))))
+      if (explainedByOperand) continue
+    }
+    return true
+  }
+  return false
+}
+
 function findVerifiedRepeatedTransition(
   steps: readonly ImpactStep[],
   hostInvariantFields?: ReadonlySet<string> | null,
@@ -2655,7 +2904,7 @@ function findVerifiedRepeatedTransition(
     const first = steps[i]!
     if (!stepMutatesState(first) || !isSuccess(first.status)) continue
     const firstBodyIds = resourceIdsInJson(first.requestJson)
-    const firstHasExistingResource = isObjectScopedRequest(first) || firstBodyIds.size > 0
+    const firstHasExistingResource = isConcreteResourcePath(first) || firstBodyIds.size > 0
     if (!firstHasExistingResource) continue
 
     const written = collectRequestWrittenFields(first)
@@ -2675,7 +2924,7 @@ function findVerifiedRepeatedTransition(
       for (let m = i + 1; m < j; m += 1) {
         const midRead = steps[m]!
         if (!stepReadsState(midRead) || !isSuccess(midRead.status) ||
-            midRead.json === undefined || midRead.json === null || !relatedRoute(midRead, first)) continue
+            midRead.json === undefined || midRead.json === null || !relatedBusinessLogicRoute(midRead, first)) continue
         const midIds = resourceIdsInJson(midRead.json)
         if (firstBodyIds.size > 0 && midIds.size > 0 && ![...firstBodyIds].some(id => midIds.has(id))) continue
 
@@ -2700,7 +2949,7 @@ function findVerifiedRepeatedTransition(
         // Post-second readback strictly after `second` on the *same read target* as `midRead`.
         for (let n = j + 1; n < steps.length; n += 1) {
           const afterSecond = steps[n]!
-          if (!stepReadsState(afterSecond) || !relatedRoute(afterSecond, second)) continue
+          if (!stepReadsState(afterSecond) || !relatedBusinessLogicRoute(afterSecond, second)) continue
           if (!isSuccess(afterSecond.status) && afterSecond.status !== 404 && afterSecond.status !== 410 && afterSecond.status !== 204) continue
           if (!sameReadTarget(midRead, afterSecond)) continue
           if (isSuccess(afterSecond.status) && afterSecond.status !== 204 &&
@@ -2935,15 +3184,23 @@ export function assessBusinessLogicImpact(input: ImpactInput): BusinessLogicAsse
     pathAddressesResource(mutatingProbe.pathAndQuery, id) && beforeResourceIds.has(id) && afterResourceIds.has(id)))
 
   const sent = new Set<string>()
+  const sentLongTokens = new Set<string>()
   if (mutatingProbe.requestJson !== undefined) {
     for (const value of flattenJson(mutatingProbe.requestJson).values()) {
       sent.add(value)
-      for (const token of value.slice(0, 256).match(/[A-Za-z0-9_-]{8,64}/g) ?? []) sent.add(token)
+      if (value.length >= 8) sentLongTokens.add(value)
+      for (const token of value.slice(0, 256).match(/[A-Za-z0-9_-]{8,64}/g) ?? []) {
+        sent.add(token)
+        sentLongTokens.add(token)
+      }
     }
   }
+  const beforeFields = beforeRead?.json !== undefined ? flattenJson(beforeRead.json) : new Map<string, string>()
   const afterFields = afterRead?.json !== undefined ? flattenJson(afterRead.json) : new Map<string, string>()
+  // Raw body substring attribution matches only non-trivial (>=8 char) tokens so short numeric
+  // operands (e.g. `amount: 25` or `qty: 1`) never falsely match inside unrelated values like `125`.
   const attributable = labels.changedFields.some(path => sent.has(afterFields.get(path) ?? '')) ||
-    (afterRead !== null && [...sent].some(token => String(afterRead.body ?? '').includes(token))) ||
+    (afterRead !== null && [...sentLongTokens].some(token => String(afterRead.body ?? '').includes(token))) ||
     resourceBound
 
   const probeTenants = actorTenants(mutatingProbe.actor)
@@ -3052,6 +3309,43 @@ export function assessBusinessLogicImpact(input: ImpactInput): BusinessLogicAsse
     }
   }
 
+  // Single-step host-declared bound violation (e.g., single overdraft crossing floor=0 or cap),
+  // or refusal-control-backed conservation overdraft driving a conserved balance negative.
+  if (labels.persisted) {
+    const singleBound = checkSingleStepBoundCrossed({
+      beforeFields,
+      afterFields,
+      changedFields: labels.changedFields,
+      invariantBounds: input.invariantBounds,
+    })
+    if (singleBound.crossed) {
+      labels.boundCrossed = true
+      return {
+        required: true,
+        satisfied: true,
+        reason: singleBound.reason,
+        evidence: labels,
+      }
+    }
+    const refusalOverdraft = findSingleStepRefusalBackedOverdraft({
+      steps,
+      mutatingProbe,
+      beforeFields,
+      afterFields,
+      changedFields: labels.changedFields,
+    })
+    if (refusalOverdraft.satisfied) {
+      labels.refusalControl = true
+      labels.boundCrossed = true
+      return {
+        required: true,
+        satisfied: true,
+        reason: refusalOverdraft.reason,
+        evidence: labels,
+      }
+    }
+  }
+
   if (labels.persisted && !attributable && !labels.oracleDeclared) {
     return {
       required: true,
@@ -3072,8 +3366,26 @@ export function assessBusinessLogicImpact(input: ImpactInput): BusinessLogicAsse
       evidence: labels,
     }
   }
+  // R3-12: An authorized single-step persistence of a numeric balance/credit/seat/counter protected
+  // field (e.g. honest wallet deposit, credit topup, cart quantity update) MUST NOT confirm solely
+  // from field classification without a peer boundary, refusal/bound-backed repeated transition,
+  // crossed host-declared bound, declared invariant oracle event, or direct field-name overwrite.
+  const directProtectedTamper = isDirectProtectedFieldTamper({
+    mutatingProbe,
+    beforeFields,
+    afterFields,
+    protectedFields: labels.protectedFields,
+  })
+  if (labels.persisted && labels.protectedFields.length > 0 && !directProtectedTamper && !labels.oracleDeclared) {
+    return {
+      required: true,
+      satisfied: false,
+      reason: `Authorized accumulator/counter update on protected field(s) (${labels.protectedFields.slice(0, 6).join(', ')}) without a refusal/bound control, crossed invariant bound, peer boundary, direct field overwrite tamper, or declared invariant event is normal accounting, not a business-logic violation.`,
+      evidence: labels,
+    }
+  }
   // R2-C-7: `resourceBound` is attribution-only and deliberately excluded from the impact gate.
-  if (labels.persisted && (labels.protectedFields.length > 0 || labels.oracleDeclared)) {
+  if (labels.persisted && (directProtectedTamper || labels.oracleDeclared)) {
     return {
       required: true,
       satisfied: true,
