@@ -1,6 +1,6 @@
 {
   "version": 2,
-  "maxQuarantinedCases": 191,
+  "maxQuarantinedCases": 189,
   "entries": [
     {
       "file": "tests/arch-a1-engine.test.ts",
@@ -1016,21 +1016,6 @@
       "assertionLocation": "tests/v8-composite-fix.test.ts:296:1",
       "ownerStream": "v8-triage",
       "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-26"
-    },
-    {
-      "file": "tests/v8-concurrency-12.test.ts",
-      "testName": "Live Execution dispatches 12 unique concurrent specialists on Wave 1 with zero duplicates and raises SQLite busy_timeout >= 10s",
-      "assertionLocation": "tests/v8-concurrency-12.test.ts:631:1",
-      "ownerStream": "v8-triage",
-      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
-      "expires": "2026-12-26"
-    },
-    {
-      "file": "tests/v8-concurrency-12.test.ts",
-      "testName": "Live Execution strictly caps at 4 when explicit workerConcurrencyOverride or run.workerConcurrency=4 is set, while omitted override ramps via AIMD",
-      "ownerStream": "v8-triage",
-      "reason": "Pre-existing intermittent failure on main (failed in run 2 and isolated verification) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {

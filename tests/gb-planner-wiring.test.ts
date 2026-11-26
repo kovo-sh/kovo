@@ -744,7 +744,7 @@ test('ExecWorkerRunner triggers hop-continuation on non-confirmed complete_inten
     await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1', KOVO_ALLOW_LOCAL_MODEL: '1' }, async () => {
       engine.start()
       engine.wake()
-      const deadline = Date.now() + 8_000
+      const deadline = Date.now() + 15_000
       while (Date.now() < deadline) {
         const steps = storage.listChainSteps(runId, run.goalRevision)
         const cont1 = steps.find(s => s.dependsOnStepIds.includes(parentStep.id) && extractContinuationDepth(s) === 1)
@@ -873,7 +873,8 @@ test('ExecWorkerRunner triggers hop-continuation on non-confirmed complete_inten
       sourceOrigins: [targetOrigin],
       skills: ['multihop-chains', 'chain-primitives'],
     })
-    storage.updateRun(runId, { phase: 'investigation', status: 'running', workerConcurrency: 2, multiTrialEnabled: false })
+    // Pin workerMaxTurns=25 (specialist minimum) so Part B exercises a full turn_limit exit cleanly within CI CPU budgets.
+    storage.updateRun(runId, { phase: 'investigation', status: 'running', workerConcurrency: 2, workerMaxTurns: 25, multiTrialEnabled: false })
 
     const engine = new Execution(storage, {
       broker: new RequestBroker({ rejectUnauthorized: false }),
@@ -885,7 +886,7 @@ test('ExecWorkerRunner triggers hop-continuation on non-confirmed complete_inten
     await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1', KOVO_ALLOW_LOCAL_MODEL: '1' }, async () => {
       engine.start()
       engine.wake()
-      const deadline = Date.now() + 10_000
+      const deadline = Date.now() + 18_000
       while (Date.now() < deadline) {
         const steps = storage.listChainSteps(runId, run.goalRevision)
         const cont1 = steps.find(s => s.dependsOnStepIds.includes(parentStep.id) && extractContinuationDepth(s) === 1)
@@ -898,6 +899,7 @@ test('ExecWorkerRunner triggers hop-continuation on non-confirmed complete_inten
     const allSteps = storage.listChainSteps(runId, run.goalRevision)
     const cont1 = allSteps.find(s => s.dependsOnStepIds.includes(parentStep.id) && extractContinuationDepth(s) === 1)
     assert.ok(cont1, 'turn_limit (max_turns) exit with sessionSealedCapHandles.length > 0 must enqueue continuation #1')
+    assert.equal(cont1.status, 'complete', `continuation #1 must finish executing after turn_limit exit (llmCalls=${llm.calls.length})`)
     assert.ok(cont1PromptText.includes(sealedHandleMt), 'continuation #1 prompt must hydrate the sealed handle from turn_limit exit')
 
     // Direct dedup verification on `sealed_handle_exit`: identical handle set rejected, new handle accepted

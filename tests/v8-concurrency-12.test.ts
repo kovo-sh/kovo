@@ -58,6 +58,7 @@ import type { WorkerBackend, WorkerSession } from '../src/server/worker-backend.
 import { makeStore, setupApprovedRun, stopExecution, withEnv } from './v4-tier-helpers.ts'
 
 process.env.KOVO_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_MODEL = '1'
 
 const GiB = 1024 ** 3
 const ORIGIN = 'https://target.example.invalid'
