@@ -8,7 +8,7 @@ import type { DetailedPeerCertificate, TLSSocket } from 'node:tls'
 import { defaultMaxRpsPerOrigin, referrerPolicies } from '../domain.ts'
 import ipaddr from 'ipaddr.js'
 import { EgressDeniedError, EgressGateway, isMetadataOrLinkLocalAddress } from './egress-gateway.ts'
-import { isIpLiteralHost, registrableApex } from './public-suffix.ts'
+import { isIpLiteralHost } from './public-suffix.ts'
 import type { ApprovalPolicy, ApprovedEndpointPattern, CapabilityTier, HttpMethod, PreparedObservation } from '../domain.ts'
 import { cacheBusterValueRegex, containsWebshellSignature } from '../replay-spec.ts'
 import type { CsrfBind } from '../replay-spec.ts'
@@ -26,6 +26,32 @@ import {
   RUN_SAFETY_BUDGET_DEFAULTS,
   RUN_SAFETY_BUDGET_HARD_CEILINGS,
 } from './run-safety-budgets.ts'
+import {
+  classifyTargetClass,
+  classifyTargetLoadStatus,
+  EXTERNAL_APEX_MAX_RPS_CAP,
+  EXTERNAL_ORIGIN_MAX_IN_FLIGHT,
+  EXTERNAL_ORIGIN_MAX_RPS_CAP,
+  isLoopbackOrigin,
+  LOOPBACK_ORIGIN_MAX_IN_FLIGHT,
+  LOOPBACK_ORIGIN_MAX_RPS_CAP,
+  normalizeIpBucketKey,
+  PROBE_INDUCED_EXEMPT_HTTP_STATUSES,
+  resolveBrokerPerOriginConcurrencyCap,
+  resolveBrokerPerOriginRpsCap,
+  resolveExternalApexBucketKey,
+  resolveExternalApexRpsCap,
+  resolveExternalIpConcurrencyCap,
+  resolveExternalIpRpsCap,
+  resolveTargetLoadPolicy,
+  TARGET_LOAD_POLICY_DEFAULTS,
+} from './target-load-policy.ts'
+import type {
+  AggregateBucketKind,
+  EffectiveTargetLoadPolicy,
+  TargetClass,
+  TargetLoadStatusClass,
+} from './target-load-policy.ts'
 import type { ScopeHook, ScopePolicy } from './scope-policy.ts'
 import {
   defaultRequestAdmissionEngine,
@@ -353,6 +379,32 @@ export interface BrokerAuditMeta {
   persona?: string
 }
 
+export type BrokerLoadEventKind =
+  | 'broker.target_throttled'
+  | 'broker.origin_breaker_open'
+  | 'broker.route_breaker_open'
+  | 'broker.aggregate_cap_wait'
+
+export interface BrokerLoadEvent {
+  kind: BrokerLoadEventKind
+  runId: string | null
+  origin: string
+  targetClass: TargetClass
+  status?: number
+  statusClass?: TargetLoadStatusClass
+  retryAfterSec?: number
+  adaptiveRps?: number
+  configuredRps?: number
+  consecutiveOpens?: number
+  backoffMs?: number
+  routeTemplate?: string
+  bucketKind?: AggregateBucketKind
+  bucketKey?: string
+  waitMs?: number
+  reason: string
+  timestamp: number
+}
+
 export type Grant = {
   origin?: string
   tier?: CapabilityTier
@@ -360,6 +412,12 @@ export type Grant = {
   /** Optional live getter for dynamic mid-run RPS updates (survives `{ ...grant }` spreads). */
   getMaxRpsPerOrigin?: () => number
   allowLocalLab?: boolean
+  /**
+   * R2-16: Optional per-grant `TargetClass` override (`'external' | 'loopback' | 'local_lab'`)
+   * forcing load-policy caps (e.g. external caps on loopback fixtures without toggling env-wide
+   * `KOVO_ALLOW_LOCAL_LAB`). Takes precedence over `BrokerOptions.targetClassOverride`.
+   */
+  targetClassOverride?: TargetClass
   personas?: ReadonlyMap<string, ResolvedPersona>
   secrets?: readonly NamedSecret[]
   sandboxWriteAllowlist?: ApprovedEndpointPattern[]
@@ -487,6 +545,17 @@ export type BrokerOptions = {
   batchLockTtlMs?: number
   /** Optional override for the shared external registrable-apex RPS safety ceiling (defaults to `KOVO_EXTERNAL_APEX_MAX_RPS` or `EXTERNAL_APEX_MAX_RPS_CAP`). */
   externalApexMaxRps?: number
+  /** R2-16: Optional override for the shared external per-IP aggregate RPS ceiling (defaults to `KOVO_EXTERNAL_IP_MAX_RPS` or 45). */
+  externalIpMaxRps?: number
+  /** R2-16: Optional override for the shared external per-IP aggregate concurrent in-flight ceiling (defaults to `KOVO_EXTERNAL_IP_MAX_IN_FLIGHT` or 8). */
+  externalIpMaxInFlight?: number
+  /**
+   * R2-16: Optional `TargetClass` override (`'external' | 'loopback' | 'local_lab'`) forcing
+   * load-policy enforcement (e.g. external caps on loopback fixtures without toggling env-wide flags).
+   */
+  targetClassOverride?: TargetClass
+  /** R2-16: Structured throttle / breaker / aggregate-cap telemetry callback. */
+  onLoadEvent?: (event: BrokerLoadEvent) => void
 }
 
 const maxRedirects = 8
@@ -940,19 +1009,19 @@ export class RedactionCapacityError extends Error {
 /**
  * Probe classes whose payloads legitimately provoke parser/DB/template errors. Only plain
  * 500/501 responses from these are bounded target evidence; origin-down gateway/edge 5xx
- * statuses (`ORIGIN_DOWN_5XX_STATUSES`) and transport failures are NEVER exempt.
+ * statuses (`ORIGIN_DOWN_HTTP_STATUSES`) and transport failures are NEVER exempt.
  */
 const errorInducingProbePattern = /(?:sqli|ssti|xxe|xpath|ldap|nosql|injection|traversal|deserial|template|expression|parser)/i
-const PROBE_INDUCED_EXEMPT_5XX_STATUSES = new Set([500, 501])
-const PROBE_INDUCED_5XX_THRESHOLD_MULTIPLIER = 3
-const MIN_PROBE_INDUCED_5XX_THRESHOLD = 6
 
 function isErrorInducingProbe(probeClass: string | undefined): boolean {
   return Boolean(probeClass && errorInducingProbePattern.test(probeClass))
 }
 
 function resolveProbeInduced5xxThreshold(threshold5xx: number): number {
-  return Math.max(MIN_PROBE_INDUCED_5XX_THRESHOLD, threshold5xx * PROBE_INDUCED_5XX_THRESHOLD_MULTIPLIER)
+  return Math.max(
+    TARGET_LOAD_POLICY_DEFAULTS.minProbeInduced5xxThreshold,
+    threshold5xx * TARGET_LOAD_POLICY_DEFAULTS.probeInduced5xxThresholdMultiplier,
+  )
 }
 
 export function isPublicAddress({ address }: PublicAddress): boolean {
@@ -1077,16 +1146,17 @@ export function routeTemplateForPath(pathname: string): string {
   return templated.join('/') || '/'
 }
 
-function parseRetryAfterSeconds(headers: IncomingHttpHeaders | undefined): number | undefined {
+function parseRetryAfterSeconds(headers: IncomingHttpHeaders | undefined, nowMs: number = Date.now()): number | undefined {
   const raw = headers?.['retry-after']
   const value = Array.isArray(raw) ? raw[0] : raw
   if (!value) return undefined
   const trimmed = value.trim()
   if (!trimmed) return undefined
+  const maxSec = TARGET_LOAD_POLICY_DEFAULTS.maxRetryAfterSeconds
   const asNumber = Number(trimmed)
-  if (Number.isFinite(asNumber) && asNumber >= 0) return Math.min(asNumber, 300)
+  if (Number.isFinite(asNumber) && asNumber >= 0) return Math.min(asNumber, maxSec)
   const asDate = Date.parse(trimmed)
-  if (Number.isFinite(asDate)) return Math.min(Math.max(0, Math.ceil((asDate - Date.now()) / 1000)), 300)
+  if (Number.isFinite(asDate)) return Math.min(Math.max(0, Math.ceil((asDate - nowMs) / 1000)), maxSec)
   return undefined
 }
 
@@ -1868,27 +1938,16 @@ function collectSecrets(req: BrokerHttpRequest, grant: Grant): NamedSecret[] {
   return all
 }
 
-/** Per-origin concurrent in-flight HTTP cap for external/public hosts (polite bound). */
-export const EXTERNAL_ORIGIN_MAX_IN_FLIGHT = 4
-/** Per-origin concurrent in-flight HTTP cap for loopback / authorized local-lab origins (12-worker headroom). */
-export const LOOPBACK_ORIGIN_MAX_IN_FLIGHT = 12
-export const EXTERNAL_ORIGIN_MAX_RPS_CAP = 20
-export const LOOPBACK_ORIGIN_MAX_RPS_CAP = 100
-/** Soft aggregate RPS ceiling shared across all external subdomains of one PSL registrable apex. */
-export const EXTERNAL_APEX_MAX_RPS_CAP = 45
-const EXTERNAL_APEX_MAX_RPS_CEILING = 200
-const MAX_APEX_BUCKETS = 1024
-const APEX_BUCKET_IDLE_TTL_MS = 60_000
+const MAX_APEX_BUCKETS = TARGET_LOAD_POLICY_DEFAULTS.maxAggregateBuckets
+const APEX_BUCKET_IDLE_TTL_MS = TARGET_LOAD_POLICY_DEFAULTS.aggregateBucketIdleTtlMs
 
-/** Gateway / edge origin-unavailable status codes that trip the origin-wide 5xx breaker. */
-const ORIGIN_DOWN_5XX_STATUSES = new Set([502, 503, 504, 520, 521, 522, 523, 524, 525, 526])
-
-/** True strictly for loopback origins (`localhost`, `127.0.0.0/8`, `::1`). */
-export function isLoopbackOrigin(origin: string): boolean {
-  try {
-    return EgressGateway.isLoopbackLiteral(new URL(origin).hostname)
-  } catch { /* invalid origin */ }
-  return false
+export {
+  EXTERNAL_APEX_MAX_RPS_CAP,
+  EXTERNAL_ORIGIN_MAX_IN_FLIGHT,
+  EXTERNAL_ORIGIN_MAX_RPS_CAP,
+  isLoopbackOrigin,
+  LOOPBACK_ORIGIN_MAX_IN_FLIGHT,
+  LOOPBACK_ORIGIN_MAX_RPS_CAP,
 }
 
 /**
@@ -1899,12 +1958,9 @@ export function brokerPerOriginConcurrencyCap(
   origin: string,
   allowLocalLabOrigin = false,
   env: NodeJS.ProcessEnv = process.env,
+  targetClassOverride?: TargetClass,
 ): number {
-  const isLocal = isLoopbackOrigin(origin) || (allowLocalLabOrigin && isLocalLabAutoApprovalOrigin(origin))
-  if (!isLocal) return EXTERNAL_ORIGIN_MAX_IN_FLIGHT
-  const raw = Number(env.KOVO_BROKER_LOOPBACK_IN_FLIGHT)
-  if (Number.isFinite(raw) && raw >= 2) return Math.min(24, Math.floor(raw))
-  return LOOPBACK_ORIGIN_MAX_IN_FLIGHT
+  return resolveBrokerPerOriginConcurrencyCap(origin, allowLocalLabOrigin, env, targetClassOverride)
 }
 
 /** Per-origin RPS ceiling: polite cap (20) on external hosts, higher ceiling (100) on loopback/local-lab. */
@@ -1912,11 +1968,9 @@ export function brokerPerOriginRpsCap(
   origin: string,
   requestedRps: number,
   allowLocalLabOrigin = false,
+  targetClassOverride?: TargetClass,
 ): number {
-  const isLocal = isLoopbackOrigin(origin) || (allowLocalLabOrigin && isLocalLabAutoApprovalOrigin(origin))
-  const ceiling = isLocal ? LOOPBACK_ORIGIN_MAX_RPS_CAP : EXTERNAL_ORIGIN_MAX_RPS_CAP
-  const safeRequested = Number.isFinite(requestedRps) ? requestedRps : defaultMaxRpsPerOrigin
-  return Math.max(1, Math.min(ceiling, safeRequested))
+  return resolveBrokerPerOriginRpsCap(origin, requestedRps, allowLocalLabOrigin, targetClassOverride)
 }
 
 /**
@@ -1927,14 +1981,7 @@ export function brokerExternalApexRpsCap(
   env: NodeJS.ProcessEnv = process.env,
   overrideRps?: number,
 ): number {
-  if (typeof overrideRps === 'number' && Number.isFinite(overrideRps) && overrideRps >= 1) {
-    return Math.max(1, Math.min(EXTERNAL_APEX_MAX_RPS_CEILING, Math.floor(overrideRps)))
-  }
-  const raw = Number(env.KOVO_EXTERNAL_APEX_MAX_RPS)
-  if (Number.isFinite(raw) && raw >= 1) {
-    return Math.max(1, Math.min(EXTERNAL_APEX_MAX_RPS_CEILING, Math.floor(raw)))
-  }
-  return EXTERNAL_APEX_MAX_RPS_CAP
+  return resolveExternalApexRpsCap(env, overrideRps)
 }
 
 /**
@@ -1944,18 +1991,9 @@ export function brokerExternalApexRpsCap(
 export function externalApexBucketKey(
   origin: string,
   allowLocalLabOrigin = false,
+  targetClassOverride?: TargetClass,
 ): string | null {
-  if (allowLocalLabOrigin) return null
-  if (isLoopbackOrigin(origin) || isLocalLabAutoApprovalOrigin(origin)) return null
-  try {
-    const host = new URL(origin).hostname.toLowerCase()
-    if (!host || host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local')) {
-      return null
-    }
-  } catch {
-    return null
-  }
-  return registrableApex(origin)
+  return resolveExternalApexBucketKey(origin, allowLocalLabOrigin, targetClassOverride)
 }
 
 function resolveGrantMaxRps(grant: Grant, fallback: number): number {
@@ -1967,6 +2005,13 @@ type ApexRateBucket = {
   tokens: number
   lastRefill: number
   lastUsed: number
+}
+
+type IpAggregateBucket = {
+  tokens: number
+  lastRefill: number
+  lastUsed: number
+  inFlight: number
 }
 
 type OriginHealth = {
@@ -2003,6 +2048,9 @@ export class RequestBroker {
   private readonly origins = new Map<string, OriginHealth>()
   private readonly apexBuckets = new Map<string, ApexRateBucket>()
   private readonly activeApexesByRun = new Map<string, Set<string>>()
+  private readonly ipBuckets = new Map<string, IpAggregateBucket>()
+  private readonly activeIpsByRun = new Map<string, Set<string>>()
+  private readonly lastAggregateWaitEventAt = new Map<string, number>()
   private readonly routeCircuits = new Map<string, RouteHealth>()
   private readonly sessionJars = new Map<string, SessionJar>()
   /** Per-run persona-scope mismatch diagnostics (cleared cleanly on `disposeRun`). */
@@ -2526,13 +2574,38 @@ export class RequestBroker {
       for (const apex of runApexes) {
         if (!this.isApexReferencedByAnyRun(apex)) {
           this.apexBuckets.delete(apex)
+          this.lastAggregateWaitEventAt.delete(`apex:${apex}`)
         }
       }
     }
-    const now = Date.now()
+    const runIps = this.activeIpsByRun.get(key)
+    this.activeIpsByRun.delete(key)
+    if (runIps) {
+      for (const ipKey of runIps) {
+        if (!this.isIpReferencedByAnyRun(ipKey)) {
+          const bucket = this.ipBuckets.get(ipKey)
+          if (!bucket || bucket.inFlight <= 0) {
+            this.ipBuckets.delete(ipKey)
+            this.lastAggregateWaitEventAt.delete(`ip:${ipKey}`)
+          }
+        }
+      }
+    }
+    const now = this.now()
     for (const [apex, bucket] of this.apexBuckets) {
       if (now - bucket.lastUsed >= APEX_BUCKET_IDLE_TTL_MS && !this.isApexReferencedByAnyRun(apex)) {
         this.apexBuckets.delete(apex)
+        this.lastAggregateWaitEventAt.delete(`apex:${apex}`)
+      }
+    }
+    for (const [ipKey, bucket] of this.ipBuckets) {
+      if (
+        bucket.inFlight <= 0 &&
+        now - bucket.lastUsed >= APEX_BUCKET_IDLE_TTL_MS &&
+        !this.isIpReferencedByAnyRun(ipKey)
+      ) {
+        this.ipBuckets.delete(ipKey)
+        this.lastAggregateWaitEventAt.delete(`ip:${ipKey}`)
       }
     }
   }
@@ -2959,9 +3032,82 @@ export class RequestBroker {
     return state
   }
 
+  private resolveTargetClassOverride(grant?: Pick<Grant, 'targetClassOverride'>): TargetClass | undefined {
+    return grant?.targetClassOverride ?? this.options.targetClassOverride
+  }
+
+  /**
+   * R2-16: Resolve a read-only `EffectiveTargetLoadPolicy` snapshot for this broker and optional
+   * grant/origin list (reflecting injected `targetClassOverride` and effective aggregate caps).
+   */
+  resolveEffectiveLoadPolicy(options: {
+    origins?: readonly string[]
+    grant?: Pick<Grant, 'allowLocalLab' | 'maxRpsPerOrigin' | 'getMaxRpsPerOrigin' | 'targetClassOverride'>
+    env?: Readonly<Record<string, string | undefined>>
+  } = {}): EffectiveTargetLoadPolicy {
+    const grant = options.grant
+    const requestedRps = grant
+      ? (grant.getMaxRpsPerOrigin ? grant.getMaxRpsPerOrigin() : grant.maxRpsPerOrigin)
+      : undefined
+    return resolveTargetLoadPolicy({
+      env: options.env ?? process.env,
+      origins: options.origins,
+      allowLocalLab: grant?.allowLocalLab,
+      targetClassOverride: this.resolveTargetClassOverride(grant),
+      requestedMaxRpsPerOrigin: requestedRps,
+      externalApexMaxRps: this.options.externalApexMaxRps,
+      externalIpMaxRps: this.options.externalIpMaxRps,
+      externalIpMaxInFlight: this.options.externalIpMaxInFlight,
+      circuit5xxThreshold: this.options.circuit5xxThreshold,
+      circuit429Threshold: this.options.circuit429Threshold,
+      circuitWindowMs: this.options.circuitWindowMs,
+      circuitBackoffBaseMs: this.options.circuitBackoffBaseMs,
+      circuitBackoffMaxMs: this.options.circuitBackoffMaxMs,
+    })
+  }
+
+  private emitLoadEvent(
+    event: Omit<BrokerLoadEvent, 'timestamp'>,
+    storage?: SecondOrderStore,
+  ): void {
+    const fullEvent: BrokerLoadEvent = {
+      ...event,
+      timestamp: this.now(),
+    }
+    try {
+      this.options.onLoadEvent?.(fullEvent)
+    } catch { /* telemetry callback is best-effort */ }
+    try {
+      const store = storage ?? this.options.storage
+      const detail: Record<string, unknown> = {
+        origin: fullEvent.origin,
+        targetClass: fullEvent.targetClass,
+        ...(fullEvent.status !== undefined ? { status: fullEvent.status } : {}),
+        ...(fullEvent.statusClass !== undefined ? { statusClass: fullEvent.statusClass } : {}),
+        ...(fullEvent.retryAfterSec !== undefined ? { retryAfterSec: fullEvent.retryAfterSec } : {}),
+        ...(fullEvent.adaptiveRps !== undefined ? { adaptiveRps: fullEvent.adaptiveRps } : {}),
+        ...(fullEvent.configuredRps !== undefined ? { configuredRps: fullEvent.configuredRps } : {}),
+        ...(fullEvent.consecutiveOpens !== undefined ? { consecutiveOpens: fullEvent.consecutiveOpens } : {}),
+        ...(fullEvent.backoffMs !== undefined ? { backoffMs: fullEvent.backoffMs } : {}),
+        ...(fullEvent.routeTemplate !== undefined ? { routeTemplate: fullEvent.routeTemplate } : {}),
+        ...(fullEvent.bucketKind !== undefined ? { bucketKind: fullEvent.bucketKind } : {}),
+        ...(fullEvent.bucketKey !== undefined ? { bucketKey: fullEvent.bucketKey } : {}),
+        ...(fullEvent.waitMs !== undefined ? { waitMs: fullEvent.waitMs } : {}),
+      }
+      store?.event?.(fullEvent.runId, fullEvent.kind, fullEvent.reason, detail)
+    } catch { /* telemetry persistence is best-effort */ }
+  }
+
   private isApexReferencedByAnyRun(apex: string): boolean {
     for (const apexSet of this.activeApexesByRun.values()) {
       if (apexSet.has(apex)) return true
+    }
+    return false
+  }
+
+  private isIpReferencedByAnyRun(ipKey: string): boolean {
+    for (const ipSet of this.activeIpsByRun.values()) {
+      if (ipSet.has(ipKey)) return true
     }
     return false
   }
@@ -2977,6 +3123,30 @@ export class RequestBroker {
       const oldest = this.apexBuckets.keys().next().value
       if (oldest === undefined) break
       this.apexBuckets.delete(oldest)
+    }
+  }
+
+  private evictIpBucketsIfNeeded(now: number): void {
+    if (this.ipBuckets.size < MAX_APEX_BUCKETS) return
+    for (const [ipKey, bucket] of this.ipBuckets) {
+      if (
+        bucket.inFlight <= 0 &&
+        now - bucket.lastUsed >= APEX_BUCKET_IDLE_TTL_MS &&
+        !this.isIpReferencedByAnyRun(ipKey)
+      ) {
+        this.ipBuckets.delete(ipKey)
+      }
+    }
+    while (this.ipBuckets.size >= MAX_APEX_BUCKETS) {
+      let evicted = false
+      for (const [ipKey, bucket] of this.ipBuckets) {
+        if (bucket.inFlight <= 0) {
+          this.ipBuckets.delete(ipKey)
+          evicted = true
+          break
+        }
+      }
+      if (!evicted) break
     }
   }
 
@@ -3006,9 +3176,47 @@ export class RequestBroker {
     return bucket
   }
 
+  private ipBucket(ipKey: string, capacity: number, now: number, runKey?: string): IpAggregateBucket {
+    let bucket = this.ipBuckets.get(ipKey)
+    if (!bucket) {
+      this.evictIpBucketsIfNeeded(now)
+      bucket = {
+        tokens: capacity,
+        lastRefill: now,
+        lastUsed: now,
+        inFlight: 0,
+      }
+      this.ipBuckets.set(ipKey, bucket)
+    } else {
+      this.ipBuckets.delete(ipKey)
+      bucket.lastUsed = now
+      this.ipBuckets.set(ipKey, bucket)
+    }
+    if (runKey) {
+      let runIps = this.activeIpsByRun.get(runKey)
+      if (!runIps) {
+        runIps = new Set<string>()
+        this.activeIpsByRun.set(runKey, runIps)
+      }
+      runIps.add(ipKey)
+    }
+    return bucket
+  }
+
   /** Read-only count of active external registrable-apex rate buckets (diagnostics/tests). */
   getApexBucketCount(): number {
     return this.apexBuckets.size
+  }
+
+  /** Read-only count of active external per-IP aggregate rate/concurrency buckets (diagnostics/tests). */
+  getIpBucketCount(): number {
+    return this.ipBuckets.size
+  }
+
+  /** Read-only aggregate in-flight count for an external IP bucket (diagnostics/tests). */
+  getIpInFlight(ipAddress: string): number {
+    const key = normalizeIpBucketKey(ipAddress)
+    return key ? (this.ipBuckets.get(key)?.inFlight ?? 0) : 0
   }
 
   private isBatchLockActive(state: OriginHealth, now = this.now()): boolean {
@@ -3144,6 +3352,9 @@ export class RequestBroker {
       this.origins.clear()
       this.apexBuckets.clear()
       this.activeApexesByRun.clear()
+      this.ipBuckets.clear()
+      this.activeIpsByRun.clear()
+      this.lastAggregateWaitEventAt.clear()
       this.routeCircuits.clear()
     }
   }
@@ -3154,8 +3365,16 @@ export class RequestBroker {
    * A successful recovery response resets the sequence to zero.
    */
   private cooldownMs(consecutiveOpens: number): number {
-    const base = Math.max(1, this.options.circuitCooldownMs ?? this.options.circuitBackoffBaseMs ?? 1_000)
-    const max = Math.max(base, this.options.circuitBackoffMaxMs ?? 30_000)
+    const base = Math.max(
+      1,
+      this.options.circuitCooldownMs ??
+        this.options.circuitBackoffBaseMs ??
+        TARGET_LOAD_POLICY_DEFAULTS.circuitBackoffBaseMs,
+    )
+    const max = Math.max(
+      base,
+      this.options.circuitBackoffMaxMs ?? TARGET_LOAD_POLICY_DEFAULTS.circuitBackoffMaxMs,
+    )
     const exponent = Math.min(16, Math.max(0, consecutiveOpens - 1))
     return Math.min(max, Math.round(base * 2 ** exponent))
   }
@@ -3168,11 +3387,21 @@ export class RequestBroker {
     )
   }
 
-  private recordRouteStatus(origin: string, routeTemplate: string, status: number, audit: Grant['audit']) {
+  private recordRouteStatus(
+    origin: string,
+    routeTemplate: string,
+    status: number,
+    audit: Grant['audit'],
+    meta?: {
+      runId?: string | null
+      targetClass?: TargetClass
+      storage?: SecondOrderStore
+    },
+  ) {
     const key = `${origin}\0${routeTemplate}`
     const now = this.now()
-    const windowMs = this.options.circuitWindowMs ?? 30_000
-    const threshold = this.options.circuit5xxThreshold ?? 5
+    const windowMs = this.options.circuitWindowMs ?? TARGET_LOAD_POLICY_DEFAULTS.circuitWindowMs
+    const threshold = this.options.circuit5xxThreshold ?? TARGET_LOAD_POLICY_DEFAULTS.circuit5xxThreshold
     let route = this.routeCircuits.get(key)
     if (!route) {
       route = { failures: [], cooldownMs: this.cooldownMs(1), halfOpen: false, consecutiveOpens: 0 }
@@ -3187,11 +3416,24 @@ export class RequestBroker {
         route.openUntil = now + route.cooldownMs
         route.halfOpen = false
         route.failures = []
+        const reason = `Route ${routeTemplate} observed ${threshold}+ HTTP 5xx responses; cooling down ${Math.round(route.cooldownMs / 1000)}s (half-open).`
         audit('circuit_open', origin, status)
-        throw new BrokerCircuitOpen(
-          origin,
-          `Route ${routeTemplate} observed ${threshold}+ HTTP 5xx responses; cooling down ${Math.round(route.cooldownMs / 1000)}s (half-open).`,
+        this.emitLoadEvent(
+          {
+            kind: 'broker.route_breaker_open',
+            runId: meta?.runId ?? null,
+            origin,
+            targetClass: meta?.targetClass ?? classifyTargetClass(origin),
+            status,
+            statusClass: classifyTargetLoadStatus(status),
+            routeTemplate,
+            consecutiveOpens: route.consecutiveOpens,
+            backoffMs: route.cooldownMs,
+            reason,
+          },
+          meta?.storage,
         )
+        throw new BrokerCircuitOpen(origin, reason)
       }
     } else if (status < 500) {
       // Healthy response: close a half-open route and decay the failure window.
@@ -3201,11 +3443,19 @@ export class RequestBroker {
     }
   }
 
-  private recordTransportFailure(origin: string, audit: Grant['audit']) {
+  private recordTransportFailure(
+    origin: string,
+    audit: Grant['audit'],
+    meta?: {
+      runId?: string | null
+      targetClass?: TargetClass
+      storage?: SecondOrderStore
+    },
+  ) {
     const state = this.health(origin)
     const now = this.now()
-    const windowMs = this.options.circuitWindowMs ?? 30_000
-    const threshold = this.options.circuit5xxThreshold ?? 5
+    const windowMs = this.options.circuitWindowMs ?? TARGET_LOAD_POLICY_DEFAULTS.circuitWindowMs
+    const threshold = this.options.circuit5xxThreshold ?? TARGET_LOAD_POLICY_DEFAULTS.circuit5xxThreshold
     state.errors5xx = state.errors5xx.filter(ts => now - ts < windowMs)
     state.errors5xx.push(now)
     if (state.errors5xx.length >= threshold) {
@@ -3214,6 +3464,19 @@ export class RequestBroker {
       state.backoffMs = this.cooldownMs(state.consecutiveOpens)
       state.openUntil = now + state.backoffMs
       audit('circuit_open', origin)
+      this.emitLoadEvent(
+        {
+          kind: 'broker.origin_breaker_open',
+          runId: meta?.runId ?? null,
+          origin,
+          targetClass: meta?.targetClass ?? classifyTargetClass(origin),
+          statusClass: 'origin_down',
+          consecutiveOpens: state.consecutiveOpens,
+          backoffMs: state.backoffMs,
+          reason: state.openReason,
+        },
+        meta?.storage,
+      )
       throw new BrokerCircuitOpen(origin, state.openReason)
     }
   }
@@ -3226,12 +3489,39 @@ export class RequestBroker {
     routeTemplate?: string,
     localLab = false,
     runKey?: string,
+    slotOptions?: {
+      resolvedIp?: string
+      targetClassOverride?: TargetClass
+      storage?: SecondOrderStore
+    },
   ): Promise<() => void> {
-    const inFlightCap = brokerPerOriginConcurrencyCap(origin, localLab)
+    const targetClassOverride = slotOptions?.targetClassOverride ?? this.options.targetClassOverride
+    const targetClass = classifyTargetClass(origin, {
+      allowLocalLab: localLab,
+      targetClassOverride,
+    })
+    const inFlightCap = brokerPerOriginConcurrencyCap(origin, localLab, process.env, targetClassOverride)
     const readConfiguredRps = () =>
-      brokerPerOriginRpsCap(origin, typeof maxRps === 'function' ? maxRps() : maxRps, localLab)
-    const apexKey = externalApexBucketKey(origin, localLab)
+      brokerPerOriginRpsCap(
+        origin,
+        typeof maxRps === 'function' ? maxRps() : maxRps,
+        localLab,
+        targetClassOverride,
+      )
+    const apexKey = externalApexBucketKey(origin, localLab, targetClassOverride)
+    let fallbackHostIp: string | null = null
+    if (!slotOptions?.resolvedIp && targetClass === 'external') {
+      try {
+        fallbackHostIp = new URL(origin).hostname
+      } catch { /* ignore invalid origin */ }
+    }
+    const ipKey = targetClass === 'external'
+      ? normalizeIpBucketKey(slotOptions?.resolvedIp ?? fallbackHostIp)
+      : null
     const readApexRps = () => brokerExternalApexRpsCap(process.env, this.options.externalApexMaxRps)
+    const readIpRps = () => resolveExternalIpRpsCap(process.env, this.options.externalIpMaxRps)
+    const readIpInFlightCap = () => resolveExternalIpConcurrencyCap(process.env, this.options.externalIpMaxInFlight)
+    const telemetryRunId = runKey && runKey !== 'default' ? runKey : null
     const state = this.health(origin, readConfiguredRps())
     if (state.openReason && (!state.openUntil || this.now() < state.openUntil)) {
       throw new BrokerCircuitOpen(origin, state.openReason)
@@ -3262,22 +3552,53 @@ export class RequestBroker {
         apexBucket.lastRefill = now
       }
 
+      let ipBucket: IpAggregateBucket | undefined
+      let ipRps = 0
+      let ipInFlightCap = 0
+      if (ipKey) {
+        ipRps = readIpRps()
+        ipInFlightCap = readIpInFlightCap()
+        ipBucket = this.ipBucket(ipKey, ipRps, now, runKey)
+        const ipElapsedSec = Math.max(0, (now - ipBucket.lastRefill) / 1000)
+        ipBucket.tokens = Math.min(ipRps, ipBucket.tokens + ipElapsedSec * ipRps)
+        ipBucket.lastRefill = now
+      }
+
       const retryAfterWait = state.retryAfterUntil !== undefined ? state.retryAfterUntil - now : 0
       const concurrencyOk = bypassConcurrency || state.inFlight < inFlightCap
       const apexTokensOk = !apexBucket || apexBucket.tokens >= 1
-      if (retryAfterWait <= 0 && concurrencyOk && state.tokens >= 1 && apexTokensOk) {
+      const ipTokensOk = !ipBucket || ipBucket.tokens >= 1
+      const ipConcurrencyOk = bypassConcurrency || !ipBucket || ipBucket.inFlight < ipInFlightCap
+      if (
+        retryAfterWait <= 0 &&
+        concurrencyOk &&
+        state.tokens >= 1 &&
+        apexTokensOk &&
+        ipTokensOk &&
+        ipConcurrencyOk
+      ) {
         state.tokens -= 1
         if (apexBucket) apexBucket.tokens -= 1
+        if (ipBucket) {
+          ipBucket.tokens -= 1
+          ipBucket.inFlight += 1
+        }
         state.inFlight += 1
+        const acquiredIpBucket = ipBucket
         let released = false
         return () => {
           if (released) return
           released = true
           state.inFlight = Math.max(0, state.inFlight - 1)
+          if (acquiredIpBucket) {
+            acquiredIpBucket.inFlight = Math.max(0, acquiredIpBucket.inFlight - 1)
+          }
         }
       }
 
       let waitMs = 40
+      let aggregateWaitKind: AggregateBucketKind | null = null
+      let aggregateWaitKey: string | null = null
       if (retryAfterWait > 0) {
         waitMs = Math.min(1_000, Math.max(50, retryAfterWait))
       } else {
@@ -3287,8 +3608,38 @@ export class RequestBroker {
         const apexTokenWait = apexBucket && apexBucket.tokens < 1
           ? Math.min(250, Math.max(20, Math.ceil(((1 - apexBucket.tokens) / apexRps) * 1000)))
           : 0
-        const tokenWait = Math.max(originTokenWait, apexTokenWait)
+        const ipTokenWait = ipBucket && ipBucket.tokens < 1
+          ? Math.min(250, Math.max(20, Math.ceil(((1 - ipBucket.tokens) / ipRps) * 1000)))
+          : 0
+        const tokenWait = Math.max(originTokenWait, apexTokenWait, ipTokenWait)
         if (tokenWait > 0) waitMs = tokenWait
+        if (ipBucket && (!ipTokensOk || !ipConcurrencyOk)) {
+          aggregateWaitKind = 'ip'
+          aggregateWaitKey = ipKey
+        } else if (apexBucket && !apexTokensOk) {
+          aggregateWaitKind = 'apex'
+          aggregateWaitKey = apexKey
+        }
+      }
+      if (aggregateWaitKind && aggregateWaitKey) {
+        const dedupeKey = `${aggregateWaitKind}:${aggregateWaitKey}`
+        const lastEmitted = this.lastAggregateWaitEventAt.get(dedupeKey) ?? -Infinity
+        if (now - lastEmitted >= 500) {
+          this.lastAggregateWaitEventAt.set(dedupeKey, now)
+          this.emitLoadEvent(
+            {
+              kind: 'broker.aggregate_cap_wait',
+              runId: telemetryRunId,
+              origin,
+              targetClass,
+              bucketKind: aggregateWaitKind,
+              bucketKey: aggregateWaitKey,
+              waitMs,
+              reason: `Pacing request for ${origin} against shared external ${aggregateWaitKind} bucket "${aggregateWaitKey}" (${waitMs}ms).`,
+            },
+            slotOptions?.storage,
+          )
+        }
       }
       await new Promise<void>((resolve, reject) => {
         const timer = setTimeout(() => {
@@ -3314,31 +3665,70 @@ export class RequestBroker {
       configuredRps?: number
       /** Present on active probe traffic; error-inducing classes are excluded from breaker trips. */
       probeClass?: string
+      runId?: string | null
+      targetClass?: TargetClass
+      storage?: SecondOrderStore
     },
   ) {
     const state = this.health(origin, meta?.configuredRps ?? defaultMaxRpsPerOrigin)
     const now = this.now()
-    const windowMs = this.options.circuitWindowMs ?? 30_000
-    const threshold5xx = this.options.circuit5xxThreshold ?? 5
-    const threshold429 = this.options.circuit429Threshold ?? 8
+    const windowMs = this.options.circuitWindowMs ?? TARGET_LOAD_POLICY_DEFAULTS.circuitWindowMs
+    const threshold5xx = this.options.circuit5xxThreshold ?? TARGET_LOAD_POLICY_DEFAULTS.circuit5xxThreshold
+    const threshold429 = this.options.circuit429Threshold ?? TARGET_LOAD_POLICY_DEFAULTS.circuit429Threshold
+    const targetClass = meta?.targetClass ?? classifyTargetClass(origin, {
+      targetClassOverride: this.options.targetClassOverride,
+    })
+    const statusClass = classifyTargetLoadStatus(status)
     state.errors5xx = state.errors5xx.filter(ts => now - ts < windowMs)
     state.errors429 = state.errors429.filter(ts => now - ts < windowMs)
     state.probeInduced5xx = state.probeInduced5xx.filter(ts => now - ts < windowMs)
 
-    if (status === 429) {
-      const retryAfter = parseRetryAfterSeconds(meta?.headers)
+    if (statusClass === 'throttled') {
+      const retryAfter = parseRetryAfterSeconds(meta?.headers, now)
       if (retryAfter !== undefined && retryAfter > 0) {
         state.retryAfterUntil = now + retryAfter * 1000
       }
       const configured = Math.max(1, meta?.configuredRps ?? defaultMaxRpsPerOrigin)
       state.adaptiveRps = Math.max(1, Math.floor((state.adaptiveRps ?? configured) / 2))
       state.errors429.push(now)
+      this.emitLoadEvent(
+        {
+          kind: 'broker.target_throttled',
+          runId: meta?.runId ?? null,
+          origin,
+          targetClass,
+          status,
+          statusClass,
+          ...(retryAfter !== undefined ? { retryAfterSec: retryAfter } : {}),
+          adaptiveRps: state.adaptiveRps,
+          configuredRps: configured,
+          reason: retryAfter !== undefined && retryAfter > 0
+            ? `Target ${origin} returned HTTP ${status} (Retry-After=${retryAfter}s; adaptiveRps=${state.adaptiveRps}/${configured}).`
+            : `Target ${origin} returned HTTP ${status} (adaptiveRps=${state.adaptiveRps}/${configured}).`,
+        },
+        meta?.storage,
+      )
       if (state.errors429.length >= threshold429) {
         state.openReason = `Observed ${state.errors429.length} HTTP 429 rate-limit responses within ${Math.round(windowMs / 1000)}s.`
         state.consecutiveOpens += 1
         state.backoffMs = this.cooldownMs(state.consecutiveOpens)
         state.openUntil = now + state.backoffMs
         audit('circuit_open', origin, status)
+        this.emitLoadEvent(
+          {
+            kind: 'broker.origin_breaker_open',
+            runId: meta?.runId ?? null,
+            origin,
+            targetClass,
+            status,
+            statusClass,
+            ...(retryAfter !== undefined ? { retryAfterSec: retryAfter } : {}),
+            consecutiveOpens: state.consecutiveOpens,
+            backoffMs: state.backoffMs,
+            reason: state.openReason,
+          },
+          meta?.storage,
+        )
         throw new BrokerCircuitOpen(origin, state.openReason)
       }
       return
@@ -3347,7 +3737,7 @@ export class RequestBroker {
     // Global gateway/availability/edge origin-down failures (502–504 and Cloudflare 520–526)
     // ALWAYS keep origin-wide protection regardless of worker-declared `probeClass` so dead or
     // edge-failing origins trip cleanly even during active injection phases.
-    if (ORIGIN_DOWN_5XX_STATUSES.has(status)) {
+    if (statusClass === 'origin_down') {
       state.errors5xx.push(now)
       if (state.errors5xx.length >= threshold5xx) {
         state.openReason = `Observed ${state.errors5xx.length} HTTP ${status} responses within ${Math.round(windowMs / 1000)}s.`
@@ -3355,6 +3745,20 @@ export class RequestBroker {
         state.backoffMs = this.cooldownMs(state.consecutiveOpens)
         state.openUntil = now + state.backoffMs
         audit('circuit_open', origin, status)
+        this.emitLoadEvent(
+          {
+            kind: 'broker.origin_breaker_open',
+            runId: meta?.runId ?? null,
+            origin,
+            targetClass,
+            status,
+            statusClass,
+            consecutiveOpens: state.consecutiveOpens,
+            backoffMs: state.backoffMs,
+            reason: state.openReason,
+          },
+          meta?.storage,
+        )
         throw new BrokerCircuitOpen(origin, state.openReason)
       }
       return
@@ -3363,7 +3767,11 @@ export class RequestBroker {
     // Only plain 500/501 responses from error-inducing probes are treated as bounded target
     // evidence — NEVER origin-down statuses (502–504, 520–526) or transport failures. Enforce a
     // bounded per-window cap so sustained 500/501 storms still open the route breaker.
-    if (PROBE_INDUCED_EXEMPT_5XX_STATUSES.has(status) && isErrorInducingProbe(meta?.probeClass)) {
+    if (
+      statusClass === 'transient' &&
+      PROBE_INDUCED_EXEMPT_HTTP_STATUSES.has(status) &&
+      isErrorInducingProbe(meta?.probeClass)
+    ) {
       const routeTemplate = meta?.routeTemplate ?? routeTemplateForPath('/')
       const key = `${origin}\0${routeTemplate}`
       const existingRoute = this.routeCircuits.get(key)
@@ -3382,23 +3790,40 @@ export class RequestBroker {
         route.openUntil = now + route.cooldownMs
         route.halfOpen = false
         route.failures = []
+        const reason = `Route ${routeTemplate} exceeded probe-induced 5xx budget (${state.probeInduced5xx.length}/${probeInducedThreshold} within ${Math.round(windowMs / 1000)}s); cooling down ${Math.round(route.cooldownMs / 1000)}s (half-open).`
         audit('circuit_open', origin, status)
-        throw new BrokerCircuitOpen(
-          origin,
-          `Route ${routeTemplate} exceeded probe-induced 5xx budget (${state.probeInduced5xx.length}/${probeInducedThreshold} within ${Math.round(windowMs / 1000)}s); cooling down ${Math.round(route.cooldownMs / 1000)}s (half-open).`,
+        this.emitLoadEvent(
+          {
+            kind: 'broker.route_breaker_open',
+            runId: meta?.runId ?? null,
+            origin,
+            targetClass,
+            status,
+            statusClass,
+            routeTemplate,
+            consecutiveOpens: route.consecutiveOpens,
+            backoffMs: route.cooldownMs,
+            reason,
+          },
+          meta?.storage,
         )
+        throw new BrokerCircuitOpen(origin, reason)
       }
       return
     }
 
-    if (status >= 500 && status <= 599) {
+    if (statusClass === 'transient') {
       const routeTemplate = meta?.routeTemplate ?? routeTemplateForPath('/')
-      this.recordRouteStatus(origin, routeTemplate, status, audit)
+      this.recordRouteStatus(origin, routeTemplate, status, audit, {
+        runId: meta?.runId ?? null,
+        targetClass,
+        storage: meta?.storage,
+      })
       return
     }
 
     // Healthy response: recover an adaptive RPS cap toward the configured ceiling.
-    if (status < 400) {
+    if (statusClass === 'healthy') {
       // A real success closes the origin breaker and restarts the backoff sequence.
       state.consecutiveOpens = 0
       state.backoffMs = 0
@@ -3687,8 +4112,9 @@ export class RequestBroker {
     deadline: AbortSignal,
     originForAudit: string,
     auditContext?: { method?: string; path?: string; persona?: string; secrets?: readonly NamedSecret[] },
+    allowLocalLabOverride?: boolean,
   ): Promise<PublicAddress[]> {
-    const localLab = isLocalLabEnabled(grant)
+    const localLab = allowLocalLabOverride !== undefined ? allowLocalLabOverride : isLocalLabEnabled(grant)
     const customResolve = this.options.resolve
     const bare = hostname.replace(/^\[|\]$/g, '')
     const validationUrl = `https://${bare.includes(':') ? `[${bare}]` : bare}/`
@@ -3735,6 +4161,9 @@ export class RequestBroker {
     this.enforceAdmission(initial, { pathAndQuery: '/' }, grant)
 
     const localLab = Boolean(initial.localLab)
+    const targetClassOverride = this.resolveTargetClassOverride(grant)
+    const scopeRunKey = this.resolveScopeRunKey(undefined, grant)
+    const telemetryRunId = scopeRunKey === 'default' ? null : scopeRunKey
     const deadline = AbortSignal.any([signal, AbortSignal.timeout(15_000)])
     const transport = this.httpTransport
     let url = new URL('/', grant.origin)
@@ -3757,11 +4186,23 @@ export class RequestBroker {
     }
     for (redirect = 0; redirect <= 3; redirect += 1) {
       check()
-      const addresses = await this.resolveAndCheckAddresses(url.hostname, grant, deadline, url.origin, {
-        method: 'GET',
-        path: `${url.pathname}${url.search}`,
-      })
+      const addresses = await this.resolveAndCheckAddresses(
+        url.hostname,
+        grant,
+        deadline,
+        url.origin,
+        {
+          method: 'GET',
+          path: `${url.pathname}${url.search}`,
+        },
+        localLab,
+      )
       check()
+      const chosenAddress = addresses.find(a => a.family === 4) ?? addresses[0]
+      const hopTargetClass = classifyTargetClass(url.origin, {
+        allowLocalLab: localLab,
+        targetClassOverride,
+      })
       const release = await this.acquireSlot(
         url.origin,
         () => resolveGrantMaxRps(grant, defaultMaxRpsPerOrigin),
@@ -3769,7 +4210,12 @@ export class RequestBroker {
         false,
         routeTemplateForPath(url.pathname),
         localLab,
-        this.resolveScopeRunKey(undefined, grant),
+        scopeRunKey,
+        {
+          resolvedIp: chosenAddress?.address,
+          targetClassOverride,
+          storage: grant.storage,
+        },
       )
       let response: RawHttpResponse
       try {
@@ -3778,7 +4224,7 @@ export class RequestBroker {
         deadline.throwIfAborted()
         grant.audit('allowed', url.origin)
         response = await withAbort(
-          transport(url, addresses.find(a => a.family === 4) ?? addresses[0], deadline, {
+          transport(url, chosenAddress, deadline, {
             readBody: false,
             rejectUnauthorized: this.options.rejectUnauthorized ?? true,
             tenantId: grant.tenantId ?? null,
@@ -3795,6 +4241,9 @@ export class RequestBroker {
         routeTemplate: routeTemplateForPath(url.pathname),
         headers: response.headers,
         configuredRps: resolveGrantMaxRps(grant, defaultMaxRpsPerOrigin),
+        runId: telemetryRunId,
+        targetClass: hopTargetClass,
+        storage: grant.storage,
       })
       if (![301, 302, 303, 307, 308].includes(response.status)) {
         return observed(grant.origin, url, response, this.options.source ?? 'public response')
@@ -4433,12 +4882,19 @@ export class RequestBroker {
 
       const addresses = redirect === 0 && options.preResolvedAddresses
         ? options.preResolvedAddresses
-        : await this.resolveAndCheckAddresses(url.hostname, grant, deadline, url.origin, {
-          method: activeMethod,
-          path: `${url.pathname}${url.search}`,
-          ...(includePersona && personaHandle ? { persona: personaHandle } : {}),
-          secrets: req.secrets,
-        })
+        : await this.resolveAndCheckAddresses(
+          url.hostname,
+          grant,
+          deadline,
+          url.origin,
+          {
+            method: activeMethod,
+            path: `${url.pathname}${url.search}`,
+            ...(includePersona && personaHandle ? { persona: personaHandle } : {}),
+            secrets: req.secrets,
+          },
+          localLab,
+        )
       check()
 
       const outboundHeaders = stripRedirectHeaders(activeHeaders, stripSensitiveHeaders, stripEntityHeaders)
@@ -4647,6 +5103,14 @@ export class RequestBroker {
       })
 
       const hopRouteTemplate = routeTemplateForPath(url.pathname)
+      const chosenAddress = addresses.find(a => a.family === 4) ?? addresses[0]
+      const targetClassOverride = this.resolveTargetClassOverride(grant)
+      const hopTargetClass = classifyTargetClass(url.origin, {
+        allowLocalLab: localLab,
+        targetClassOverride,
+      })
+      const scopeRunKey = this.resolveScopeRunKey(req, grant)
+      const telemetryRunId = scopeRunKey === 'default' ? null : scopeRunKey
       const release = await this.acquireSlot(
         url.origin,
         () => resolveGrantMaxRps(grant, maxRps || defaultRps),
@@ -4654,7 +5118,12 @@ export class RequestBroker {
         options.bypassConcurrency,
         hopRouteTemplate,
         localLab,
-        this.resolveScopeRunKey(req, grant),
+        scopeRunKey,
+        {
+          resolvedIp: chosenAddress?.address,
+          targetClassOverride,
+          storage: grant.storage,
+        },
       )
       let response: RawHttpResponse
       try {
@@ -4663,7 +5132,7 @@ export class RequestBroker {
         grant.audit('allowed', url.origin)
         // R2-H-19: Wrap transport in `withAbort(deadline)` so a hung transport can never leak slots.
         response = await withAbort(
-          transport(url, addresses.find(a => a.family === 4) ?? addresses[0], deadline, {
+          transport(url, chosenAddress, deadline, {
             method: activeMethod,
             headers: outboundHeaders,
             body: hopBody,
@@ -4681,7 +5150,11 @@ export class RequestBroker {
         // as origin transport failures so unresponsive origins trip the breaker cleanly. Only skip
         // when the run/caller/kill-switch aborted or tripped.
         if (!signal.aborted && !(err instanceof KillSwitchTrippedError)) {
-          this.recordTransportFailure(url.origin, grant.audit)
+          this.recordTransportFailure(url.origin, grant.audit, {
+            runId: telemetryRunId,
+            targetClass: hopTargetClass,
+            storage: grant.storage,
+          })
         }
         throw err
       } finally {
@@ -4694,6 +5167,9 @@ export class RequestBroker {
         headers: response.headers,
         configuredRps: resolveGrantMaxRps(grant, maxRps || defaultRps),
         probeClass: req.probeClass,
+        runId: telemetryRunId,
+        targetClass: hopTargetClass,
+        storage: grant.storage,
       })
 
       const requestOriginHeader = cleanHeaders.origin
@@ -5004,12 +5480,19 @@ export class RequestBroker {
       ks.assertAllowed(grant.tenantId ?? null)
       deadline.throwIfAborted()
 
-      const addresses = await this.resolveAndCheckAddresses(url.hostname, grant, deadline, url.origin, {
-        method: req.method,
-        path: `${url.pathname}${url.search}`,
-        ...(includePersona && personaHandle ? { persona: personaHandle } : {}),
-        secrets: req.secrets,
-      })
+      const addresses = await this.resolveAndCheckAddresses(
+        url.hostname,
+        grant,
+        deadline,
+        url.origin,
+        {
+          method: req.method,
+          path: `${url.pathname}${url.search}`,
+          ...(includePersona && personaHandle ? { persona: personaHandle } : {}),
+          secrets: req.secrets,
+        },
+        localLab,
+      )
 
       // Build outbound HTTP/2 headers with transport UA/authorized profile & hop-by-hop stripping.
       const outboundHeaders: Record<string, string> = {}
@@ -5130,6 +5613,14 @@ export class RequestBroker {
       })
 
       const hopRouteTemplate = routeTemplateForPath(url.pathname)
+      const chosenAddress = addresses.find(a => a.family === 4) ?? addresses[0]
+      const targetClassOverride = this.resolveTargetClassOverride(grant)
+      const hopTargetClass = classifyTargetClass(url.origin, {
+        allowLocalLab: localLab,
+        targetClassOverride,
+      })
+      const scopeRunKey = this.resolveScopeRunKey(req, grant)
+      const telemetryRunId = scopeRunKey === 'default' ? null : scopeRunKey
       const release = await this.acquireSlot(
         url.origin,
         () => resolveGrantMaxRps(grant, maxRps || defaultRps),
@@ -5137,7 +5628,12 @@ export class RequestBroker {
         false,
         hopRouteTemplate,
         localLab,
-        this.resolveScopeRunKey(req, grant),
+        scopeRunKey,
+        {
+          resolvedIp: chosenAddress?.address,
+          targetClassOverride,
+          storage: grant.storage,
+        },
       )
 
       const maxResponseBytes = Math.min(req.maxBodyBytes ?? defaultMaxBodyBytes, hardMaxBodyBytes)
@@ -5149,7 +5645,7 @@ export class RequestBroker {
         if (this.transportConfig.proxy || this.transportConfig.mtls) {
           // Enforce configured egress proxy / mTLS transport instead of dialing directly.
           response = await withAbort(
-            this.httpTransport(url, addresses.find(a => a.family === 4) ?? addresses[0], deadline, {
+            this.httpTransport(url, chosenAddress, deadline, {
               method: req.method,
               headers: outboundHeaders,
               body: prepared.preparedBody,
@@ -5194,7 +5690,11 @@ export class RequestBroker {
         }
       } catch (err) {
         if (!boundSignal.aborted && !(err instanceof KillSwitchTrippedError)) {
-          this.recordTransportFailure(url.origin, grant.audit)
+          this.recordTransportFailure(url.origin, grant.audit, {
+            runId: telemetryRunId,
+            targetClass: hopTargetClass,
+            storage: grant.storage,
+          })
         }
         throw err
       } finally {
@@ -5209,6 +5709,9 @@ export class RequestBroker {
         headers: response.headers,
         configuredRps: resolveGrantMaxRps(grant, maxRps || defaultRps),
         probeClass: req.probeClass,
+        runId: telemetryRunId,
+        targetClass: hopTargetClass,
+        storage: grant.storage,
       })
 
       const requestOriginHeader = cleanHeaders.origin
@@ -5691,13 +6194,27 @@ export class RequestBroker {
     ]
 
     let raw
+    const targetClassOverride = this.resolveTargetClassOverride(grant)
+    const wsTargetClass = classifyTargetClass(initialOrigin, {
+      allowLocalLab: localLab,
+      targetClassOverride,
+    })
+    const wsScopeRunKey = this.resolveScopeRunKey(undefined, grant)
+    const wsTelemetryRunId = wsScopeRunKey === 'default' ? null : wsScopeRunKey
     try {
-      const addresses = await this.resolveAndCheckAddresses(url.hostname, grant, deadline, initialOrigin, {
-        method: 'WS',
-        path: req.pathAndQuery,
-        ...(personaHandle ? { persona: personaHandle } : {}),
-        secrets: req.secrets,
-      })
+      const addresses = await this.resolveAndCheckAddresses(
+        url.hostname,
+        grant,
+        deadline,
+        initialOrigin,
+        {
+          method: 'WS',
+          path: req.pathAndQuery,
+          ...(personaHandle ? { persona: personaHandle } : {}),
+          secrets: req.secrets,
+        },
+        localLab,
+      )
       const chosen = addresses.find(a => a.family === 4) ?? addresses[0]
       const release = await this.acquireSlot(
         initialOrigin,
@@ -5706,7 +6223,12 @@ export class RequestBroker {
         false,
         undefined,
         localLab,
-        this.resolveScopeRunKey(undefined, grant),
+        wsScopeRunKey,
+        {
+          resolvedIp: chosen?.address,
+          targetClassOverride,
+          storage: grant.storage,
+        },
       )
 
       const wsTransport = this.options.wsTransport ?? defaultWsTransport
@@ -5796,7 +6318,11 @@ export class RequestBroker {
 
     grant.audit('observed', initialOrigin, raw.upgradeStatus ?? undefined)
     if (raw.upgradeStatus !== null) {
-      this.recordStatus(initialOrigin, raw.upgradeStatus, grant.audit)
+      this.recordStatus(initialOrigin, raw.upgradeStatus, grant.audit, {
+        runId: wsTelemetryRunId,
+        targetClass: wsTargetClass,
+        storage: grant.storage,
+      })
     }
 
     const safeFrames: BrokerWebsocketFrame[] = raw.frames.slice(0, maxFrames * 2).map(frame => ({

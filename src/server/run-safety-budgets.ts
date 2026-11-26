@@ -479,3 +479,35 @@ export class RunAsyncPollBudgetLedger {
     if (key) this.runs.delete(key)
   }
 }
+
+// ---------------------------------------------------------------------------
+// R2-16: Single host-owned TargetLoadPolicy & unified HTTP status taxonomy
+// ---------------------------------------------------------------------------
+export {
+  classifyTargetClass,
+  classifyTargetLoadStatus,
+  isLoopbackOrigin,
+  normalizeIpBucketKey,
+  ORIGIN_DOWN_HTTP_STATUSES,
+  PROBE_INDUCED_EXEMPT_HTTP_STATUSES,
+  resolveBrokerPerOriginConcurrencyCap,
+  resolveBrokerPerOriginRpsCap,
+  resolveExternalApexBucketKey,
+  resolveExternalApexRpsCap,
+  resolveExternalIpConcurrencyCap,
+  resolveExternalIpRpsCap,
+  resolveTargetLoadPolicy,
+  TARGET_LOAD_POLICY_DEFAULTS,
+  TARGET_LOAD_POLICY_ENV_KEYS,
+  TARGET_LOAD_POLICY_HARD_CEILINGS,
+  THROTTLED_HTTP_STATUSES,
+} from './target-load-policy.ts'
+export type {
+  AggregateBucketKind,
+  EffectiveOriginLoadPolicy,
+  EffectiveTargetLoadPolicy,
+  ResolveTargetClassOptions,
+  ResolveTargetLoadPolicyOptions,
+  TargetClass,
+  TargetLoadStatusClass,
+} from './target-load-policy.ts'
