@@ -5,14 +5,14 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { BoardPane, useBoardSeen } from './coordinator.tsx'
 import { RunDataProvider, useRun } from './data.tsx'
-import { DecisionsProvider } from './decisions.tsx'
-import { fmtN, fmtUsd, RUN_SUBMODE_PARAMS } from './format.ts'
+import { ACTIONS, approvalCommand, DecisionsProvider, useDecisions } from './decisions.tsx'
+import { fmtN, fmtUsd, host, RUN_SUBMODE_PARAMS } from './format.ts'
 import { RunHeader } from './header.tsx'
 import { Icon } from './icons.tsx'
 import { KeyboardProvider, useShortcuts } from './keyboard.tsx'
 import { VIEWS } from './meta.ts'
 import type { ViewId } from './meta.ts'
-import type { Detail, RunEvent } from './model.ts'
+import type { Approval, Detail, RunEvent } from './model.ts'
 import { useReducedMotion } from './motion.tsx'
 import { NavProvider, selKey, useNav } from './nav.tsx'
 import type { Sel } from './nav.tsx'
@@ -248,12 +248,145 @@ function openHeaderBudgetPopover() {
   trigger?.click()
 }
 
-/** Budget-paused, auth-issue, model-missing, reconnecting: crisp one-line banners under the run line. */
+/** Show the pinned top approval banner outside Queue and consent/review screens when active approvals wait. */
+export function shouldShowApprovalBanner(input: {
+  activeApprovalCount: number
+  view: ViewId
+  phase: string
+}): boolean {
+  if (input.activeApprovalCount <= 0) return false
+  if (input.view === 'queue') return false
+  if (isBoardHiddenBeforeApproval(input.phase)) return false
+  return true
+}
+
+export function ApprovalBanner({
+  approvals,
+  submitting,
+  onApprove,
+  onDeny,
+  onInspect,
+  onReviewInQueue,
+  onApproveAll,
+}: {
+  approvals: readonly Approval[]
+  submitting: boolean
+  onApprove: (ap: Approval) => void
+  onDeny: (ap: Approval) => void
+  onInspect: (ap: Approval) => void
+  onReviewInQueue: () => void
+  onApproveAll: () => void
+}) {
+  const count = approvals.length
+  if (count <= 0) return null
+  const first = approvals[0]!
+  const target = `${first.method} ${host(first.origin)}${first.pathAndQuery}`
+  return <div
+    className="flex min-h-10 flex-none items-center gap-2.5 border-b border-accent-line bg-accent-soft py-2 pl-[18px] pr-3 text-[12.5px] text-fg-muted"
+    role="status"
+    aria-label="Pending approvals"
+    data-testid="approval-banner"
+  >
+    <span className="relative inline-flex size-2 flex-none" aria-hidden="true">
+      <span className="absolute inset-0 animate-ping rounded-full bg-accent opacity-50 motion-reduce:animate-none" />
+      <span className="relative inline-block size-2 rounded-full bg-accent" />
+    </span>
+    {count === 1 ? <>
+      <span className="min-w-0 flex-1 truncate" title={`1 approval waiting · ${target}`}>
+        <b className="font-medium text-fg">1 approval waiting</b>
+        {' · '}
+        <span className="font-mono text-[12px] text-fg">
+          <span className="font-semibold text-warn">{first.method}</span>
+          {' '}
+          {host(first.origin)}
+          <span className="text-fg-subtle">{first.pathAndQuery}</span>
+        </span>
+      </span>
+      <button
+        type="button"
+        className={runBtn({ variant: 'primary', size: 'sm' })}
+        data-testid="approval-banner-approve"
+        onClick={() => onApprove(first)}
+      >
+        <Icon name="check" />Approve
+      </button>
+      <button
+        type="button"
+        className={runBtn({ variant: 'ghost', size: 'sm' })}
+        data-testid="approval-banner-deny"
+        onClick={() => onDeny(first)}
+      >
+        Deny
+      </button>
+      <button
+        type="button"
+        className={runBtn({ variant: 'default', size: 'sm' })}
+        data-testid="approval-banner-inspect"
+        onClick={() => onInspect(first)}
+      >
+        Inspect
+      </button>
+    </> : <>
+      <span className="min-w-0 flex-1 truncate" title={`${count} approvals waiting · ${target} (+${count - 1} more)`}>
+        <b className="font-medium text-fg">{count} approvals waiting</b>
+        {' · '}
+        <span className="font-mono text-[12px] text-fg">
+          <span className="font-semibold text-warn">{first.method}</span>
+          {' '}
+          {host(first.origin)}
+          <span className="text-fg-subtle">{first.pathAndQuery}</span>
+        </span>
+        <span className="ml-1.5 text-fg-subtle">(+{count - 1} more)</span>
+      </span>
+      <button
+        type="button"
+        className={runBtn({ variant: 'default', size: 'sm' })}
+        data-testid="approval-banner-review"
+        onClick={onReviewInQueue}
+      >
+        Review in Queue
+      </button>
+      <button
+        type="button"
+        className={runBtn({ variant: 'primary', size: 'sm' })}
+        disabled={submitting}
+        data-testid="approval-banner-approve-all"
+        onClick={onApproveAll}
+      >
+        <Icon name="check" />{submitting ? `Approving ${count}…` : `Approve all (${count})`}
+      </button>
+    </>}
+  </div>
+}
+
+/** Pending approvals, budget-paused, auth-issue, model-missing, reconnecting: crisp one-line banners under the run line. */
 function RunBanners() {
-  const { detail, model, events, connection } = useRun()
+  const { detail, model, events, connection, pending } = useRun()
+  const nav = useNav()
+  const q = useDecisions()
   const r = detail.run
   const authIssue = latestAuthIssue(events)
+  const showApprovalBanner = shouldShowApprovalBanner({
+    activeApprovalCount: q.activePendingApprovals.length,
+    view: nav.view,
+    phase: r.phase,
+  })
+  const decideApproval = (ap: Approval, act: 'approve' | 'deny') => {
+    q.decide('ap:' + ap.id, act, {
+      command: approvalCommand(ap.id, act),
+      message: `${ACTIONS[act].label} ${ap.method} ${host(ap.origin)}${ap.pathAndQuery}`,
+    })
+  }
   return <>
+    {showApprovalBanner && <ApprovalBanner
+      approvals={q.activePendingApprovals}
+      submitting={pending > 0 || q.approvingAll}
+      onApprove={ap => decideApproval(ap, 'approve')}
+      onDeny={ap => decideApproval(ap, 'deny')}
+      onInspect={ap => nav.open('queue', { kind: 'queue', id: 'ap:' + ap.id })}
+      onReviewInQueue={() => nav.setView('queue')}
+      onApproveAll={() => { void q.approveAllPending() }}
+    />}
     {r.status === 'budget_paused' && <div
       className="flex min-h-10 flex-none items-center gap-2.5 border-b border-line bg-warn-soft py-2 pl-[18px] pr-3 text-[12.5px] text-fg-muted shadow-[inset_0_-1px_0_var(--warn-line)]"
       role="status"

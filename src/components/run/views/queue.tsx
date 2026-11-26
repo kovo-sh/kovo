@@ -26,7 +26,6 @@ import type { NavApi } from '../nav.tsx'
 import { PaneBody, PaneHeader } from '../pane.tsx'
 import type { InspectorMap, InspectorProps } from '../pane.tsx'
 import { usePaletteCommands } from '../palette.tsx'
-import { useToast } from '../toast.tsx'
 import { cn, runBtn, runDec, runIconBtn, runStamp, RW } from '../tw.ts'
 import { QGlyph, ReadApproval, ReadConsent, ReadFinding, ReadFollow, VState } from './queue-read.tsx'
 
@@ -174,7 +173,6 @@ export function QueueView() {
   const model = useRunModel()
   const q = useDecisions()
   const nav = useNav()
-  const toast = useToast()
   const m = useMotion()
   const decide = useDecide()
   const ask = useAsk()
@@ -223,7 +221,7 @@ export function QueueView() {
     el?.scrollIntoView({ block: 'nearest' })
   }, [selKey])
 
-  const activePendingApprovals = q.sections.decide.filter(it => it.kind === 'approval' && !isApprovalExpired(it.ap, now))
+  const activePendingApprovals = q.activePendingApprovals
   const initial = q.initialCount
   const handled = q.handledCount
   const pct = initial ? Math.min(1, handled / initial) : 0
@@ -268,24 +266,20 @@ export function QueueView() {
               <button
                 type="button"
                 className={cn(runBtn({ size: 'sm' }), 'ml-auto')}
-                disabled={pending > 0}
+                disabled={pending > 0 || q.approvingAll}
                 data-testid="queue-approve-all"
                 onClick={e => {
                   e.stopPropagation()
-                  const count = activePendingApprovals.length
-                  void send({ action: 'approve_all_pending' }).then(
-                    () => toast.show(`Approved ${plural(count, 'pending request')}`, { icon: 'check' }),
-                    (err: unknown) => toast.show(err instanceof Error ? err.message : 'Could not approve pending requests.', { tone: 'error' }),
-                  )
+                  void q.approveAllPending({ action: 'approve_all_pending' })
                 }}
               >
-                <Icon name="check" />Approve all pending ({activePendingApprovals.length})
+                <Icon name="check" />{q.approvingAll ? 'Approving…' : `Approve all pending (${activePendingApprovals.length})`}
               </button>
             )}
           </div>
           {!col && (!items.length
             ? <div className="border-b border-line pb-3.5 pl-11 pr-[18px] pt-3 text-[12px] text-fg-subtle">{EMPTY[k]}</div>
-            : k === 'done' ? <DoneRows items={items} selKey={selKey} />
+            : k === 'done' ? <DoneRows items={items} selKey={selKey} now={now} />
               : items.map(it => <QRow key={it.key} it={it} sec={k} cur={it.key === selKey} motion={m} now={now}
                 onSelect={() => nav.select({ kind: 'queue', id: it.key })} onAct={act => decide(it.key, act)} onAsk={() => ask(it.key)} />))}
         </div>
@@ -410,7 +404,7 @@ function QRow({ it, sec, cur, motion: m, now, onSelect, onAct, onAsk }: {
   </div>
 }
 
-function DoneRow({ it, cur, entering, onSelect }: { it: QueueItem; cur: boolean; entering: boolean; onSelect: () => void }) {
+function DoneRow({ it, cur, entering, now, onSelect }: { it: QueueItem; cur: boolean; entering: boolean; now: number; onSelect: () => void }) {
   const q = useDecisions()
   const ref = useRef<HTMLDivElement>(null)
   useEnterFlash(ref, entering)
@@ -422,9 +416,13 @@ function DoneRow({ it, cur, entering, onSelect }: { it: QueueItem; cur: boolean;
       <Icon name={A.icon} />{A.label}
     </span>
   } else if (it.kind === 'finding') right = <VState status={it.status} />
-  else if (it.kind === 'approval') right = <span className={cn(runDec(), '[&_svg]:size-[13px]')}>
-    <StatusGlyph status={it.ap.status} />{cap(it.ap.status)}{it.ap.decidedBy ? ' · ' + it.ap.decidedBy : ''}
-  </span>
+  else if (it.kind === 'approval') {
+    const expired = isApprovalExpired(it.ap, now)
+    const status = expired ? 'expired' : it.ap.status
+    right = <span className={cn(runDec(), '[&_svg]:size-[13px]')}>
+      <StatusGlyph status={status} />{cap(status)}{!expired && it.ap.decidedBy ? ' · ' + it.ap.decidedBy : ''}
+    </span>
+  }
   return <div
     ref={ref}
     className={cn(RW.row, 'h-10 cursor-pointer [contain-intrinsic-size:auto_40px]', cur && RW.rowCur)}
@@ -439,7 +437,7 @@ function DoneRow({ it, cur, entering, onSelect }: { it: QueueItem; cur: boolean;
 }
 
 /** Done: your decisions first, then the approval audit log. */
-function DoneRows({ items, selKey }: { items: QueueItem[]; selKey: string | null }) {
+function DoneRows({ items, selKey, now }: { items: QueueItem[]; selKey: string | null; now: number }) {
   const q = useDecisions()
   const nav = useNav()
   const m = useMotion()
@@ -447,7 +445,7 @@ function DoneRows({ items, selKey }: { items: QueueItem[]; selKey: string | null
   const main = items.filter(it => !auto(it))
   const log = items.filter(auto)
   return <>
-    {main.map(it => <DoneRow key={it.key} it={it} cur={it.key === selKey} entering={m.enter === it.key} onSelect={() => nav.select({ kind: 'queue', id: it.key })} />)}
+    {main.map(it => <DoneRow key={it.key} it={it} cur={it.key === selKey} entering={m.enter === it.key} now={now} onSelect={() => nav.select({ kind: 'queue', id: it.key })} />)}
     {log.length > 0 && <>
       <div className="flex h-[30px] items-center gap-2 border-b border-line bg-[color-mix(in_srgb,var(--sunk)_55%,transparent)] pl-11 pr-[18px] text-[12px] font-medium text-fg-muted">
         <Icon name="shield" className="text-fg-subtle" />
@@ -455,7 +453,7 @@ function DoneRows({ items, selKey }: { items: QueueItem[]; selKey: string | null
         <span className="font-normal tabular-nums text-fg-subtle">{log.length}</span>
         <span className="truncate font-normal text-fg-subtle">Audit log of active test requests the policy approved automatically</span>
       </div>
-      {log.map(it => <DoneRow key={it.key} it={it} cur={it.key === selKey} entering={m.enter === it.key} onSelect={() => nav.select({ kind: 'queue', id: it.key })} />)}
+      {log.map(it => <DoneRow key={it.key} it={it} cur={it.key === selKey} entering={m.enter === it.key} now={now} onSelect={() => nav.select({ kind: 'queue', id: it.key })} />)}
     </>}
   </>
 }
