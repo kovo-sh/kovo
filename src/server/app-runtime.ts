@@ -25,6 +25,8 @@ import { cancelOobDrainForRun } from './oob-drain.ts'
 import { OobRelay } from './oob-relay.ts'
 import { assertValidRunId, InvalidRunIdError, RunContext } from './run-context.ts'
 import type { RunContextOptions, RunDrainReport } from './run-context.ts'
+import { StorageMaintenanceController } from './storage-maintenance.ts'
+import type { StorageMaintenanceOptions } from './storage-maintenance.ts'
 import { dataDirectory, Store, store as legacyStore } from './store.ts'
 
 export interface AppRuntimeOptions {
@@ -48,6 +50,10 @@ export interface AppRuntimeOptions {
   useSharedStoreRegistry?: boolean
   /** Default drain timeout (ms) used by `RunContext.drainAndDispose()`. */
   defaultDrainTimeoutMs?: number
+  /** Move S3: StorageMaintenanceController configuration, or `false` to disable automatic background maintenance. */
+  maintenance?: Omit<StorageMaintenanceOptions, 'store' | 'dataDir' | 'getActiveRunIds'> | false
+  /** Whether to auto-start `.unref()` maintenance timers once `store` is materialized. Default true. */
+  autoStartMaintenance?: boolean
 }
 
 export interface AppRuntimeDisposeReport {
@@ -55,6 +61,7 @@ export interface AppRuntimeDisposeReport {
   runsDisposed: number
   runReports: RunDrainReport[]
   oobClosed: boolean
+  maintenanceStopped: boolean
   storeClosed: boolean
   errors: string[]
   alreadyDisposed: boolean
@@ -100,9 +107,13 @@ export class AppRuntime {
   private readonly useSharedStoreRegistry: boolean
   private readonly storeFactory?: (dataDir: string) => Store
   private readonly defaultDrainTimeoutMs?: number
+  private readonly maintenanceEnabled: boolean
+  private readonly autoStartMaintenance: boolean
+  private readonly maintenanceOptions: Omit<StorageMaintenanceOptions, 'store' | 'dataDir' | 'getActiveRunIds'>
   private storeInstance: Store | null
   private oobRelayInstance: OobRelay | null
   private canaryBrokerInstance: CanaryBroker | null
+  private maintenanceInstance: StorageMaintenanceController | null = null
   private readonly disposers = new Map<string, () => void | Promise<void>>()
   private disposed = false
   private disposePromise: Promise<AppRuntimeDisposeReport> | null = null
@@ -112,6 +123,9 @@ export class AppRuntime {
     this.useSharedStoreRegistry = options.useSharedStoreRegistry ?? false
     this.storeFactory = options.storeFactory
     this.defaultDrainTimeoutMs = options.defaultDrainTimeoutMs
+    this.maintenanceEnabled = options.maintenance !== false
+    this.autoStartMaintenance = options.autoStartMaintenance ?? true
+    this.maintenanceOptions = options.maintenance && typeof options.maintenance === 'object' ? options.maintenance : {}
     this.storeInstance = options.store ?? null
     this.oobRelayInstance = options.oobRelay ?? options.canaryBroker?.oob ?? null
     this.canaryBrokerInstance = options.canaryBroker ?? null
@@ -127,6 +141,9 @@ export class AppRuntime {
     } else {
       this.killSwitch = new GlobalKillSwitch(ksOpts)
     }
+    if (this.storeInstance && this.maintenanceEnabled && this.autoStartMaintenance) {
+      this.ensureMaintenanceStarted()
+    }
   }
 
   /** Lazily initialized Store instance owned by this runtime. */
@@ -135,6 +152,9 @@ export class AppRuntime {
     if (this.useSharedStoreRegistry && !this.storeFactory && !this.storeInstance) {
       const shared = getSharedStoreSlot(this.dataDir)
       this.storeInstance = shared
+      if (this.maintenanceEnabled && this.autoStartMaintenance) {
+        this.ensureMaintenanceStarted()
+      }
       return shared
     }
     if (this.useSharedStoreRegistry && !this.storeFactory && this.storeInstance) {
@@ -144,14 +164,72 @@ export class AppRuntime {
       if (registry && registry.get(this.dataDir) !== this.storeInstance) {
         const shared = getSharedStoreSlot(this.dataDir)
         this.storeInstance = shared
+        if (this.maintenanceInstance) {
+          this.maintenanceInstance.stop()
+          this.maintenanceInstance = null
+        }
+        if (this.maintenanceEnabled && this.autoStartMaintenance) {
+          this.ensureMaintenanceStarted()
+        }
         return shared
       }
       return this.storeInstance
     }
     if (!this.storeInstance) {
       this.storeInstance = this.storeFactory ? this.storeFactory(this.dataDir) : new Store(this.dataDir)
+      if (this.maintenanceEnabled && this.autoStartMaintenance) {
+        this.ensureMaintenanceStarted()
+      }
     }
     return this.storeInstance
+  }
+
+  /** Lazily initialized StorageMaintenanceController owned by this runtime. */
+  get maintenance(): StorageMaintenanceController {
+    this.assertNotDisposed()
+    if (!this.maintenanceInstance) {
+      this.maintenanceInstance = new StorageMaintenanceController({
+        ...this.maintenanceOptions,
+        store: this.store,
+        dataDir: this.dataDir,
+        getActiveRunIds: () => this.activeRunIds(),
+      })
+    }
+    return this.maintenanceInstance
+  }
+
+  /** Whether a StorageMaintenanceController has been materialized. */
+  hasMaintenance(): boolean {
+    return this.maintenanceInstance !== null
+  }
+
+  /** Start the runtime-owned StorageMaintenanceController with `.unref()` timers. */
+  startMaintenance(): StorageMaintenanceController | null {
+    this.assertNotDisposed()
+    if (!this.maintenanceEnabled) return null
+    const controller = this.maintenance
+    controller.start()
+    return controller
+  }
+
+  /** Stop the runtime-owned StorageMaintenanceController timers if initialized. */
+  stopMaintenance(): boolean {
+    if (!this.maintenanceInstance) return false
+    this.maintenanceInstance.stop()
+    return true
+  }
+
+  private ensureMaintenanceStarted(): void {
+    if (!this.maintenanceEnabled || this.disposed || !this.storeInstance) return
+    if (!this.maintenanceInstance) {
+      this.maintenanceInstance = new StorageMaintenanceController({
+        ...this.maintenanceOptions,
+        store: this.storeInstance,
+        dataDir: this.dataDir,
+        getActiveRunIds: () => this.activeRunIds(),
+      })
+    }
+    this.maintenanceInstance.start()
   }
 
   /** Whether `store` has been materialized yet (useful for lazy-init assertions). */
@@ -174,6 +252,9 @@ export class AppRuntime {
     this.assertNotDisposed()
     if (!this.storeInstance) {
       this.storeInstance = storeInstance
+      if (this.maintenanceEnabled && this.autoStartMaintenance) {
+        this.ensureMaintenanceStarted()
+      }
     }
   }
 
@@ -373,6 +454,18 @@ export class AppRuntime {
       oobClosed = true
     }
 
+    let maintenanceStopped = false
+    const maint = this.maintenanceInstance
+    this.maintenanceInstance = null
+    if (maint) {
+      try {
+        maint.stop()
+        maintenanceStopped = true
+      } catch (err) {
+        errors.push(`maintenance-stop: ${err instanceof Error ? err.message : String(err)}`)
+      }
+    }
+
     let storeClosed = false
     const st = this.storeInstance
     this.storeInstance = null
@@ -396,6 +489,7 @@ export class AppRuntime {
       runsDisposed: runReports.length,
       runReports,
       oobClosed,
+      maintenanceStopped,
       storeClosed,
       errors,
       alreadyDisposed: false,
@@ -480,6 +574,7 @@ export {
   InvalidRunIdError,
   KillSwitchTrippedError,
   RunContext,
+  StorageMaintenanceController,
   Store,
 }
-export type { KillSwitchOptions, KillSwitchState, RunContextOptions, RunDrainReport }
+export type { KillSwitchOptions, KillSwitchState, RunContextOptions, RunDrainReport, StorageMaintenanceOptions }

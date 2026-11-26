@@ -89,9 +89,16 @@ function candidateArtifactPaths(directory: string, runId: string, evidenceId: st
 
 function collectProtectedEvidenceIds(storage: Store, runId: string): Set<string> {
   const protectedIds = new Set<string>()
-  const findingRows = storage.client.prepare(
-    'SELECT finding FROM findings WHERE run_id = ?',
-  ).all(runId) as Array<{ finding: string }>
+  let findingRows: Array<{ finding: string }> = []
+  try {
+    findingRows = storage.client.prepare(
+      "SELECT finding FROM findings WHERE run_id = ? AND status = 'confirmed' AND verification_class = 'runtime_confirmed'",
+    ).all(runId) as Array<{ finding: string }>
+  } catch {
+    findingRows = storage.client.prepare(
+      'SELECT finding FROM findings WHERE run_id = ?',
+    ).all(runId) as Array<{ finding: string }>
+  }
   for (const row of findingRows) {
     try {
       const parsed = JSON.parse(row.finding) as { status?: string; evidenceIds?: unknown }
@@ -264,7 +271,7 @@ export function purgeExpiredArtifacts(
     }
   }
 
-  // 3. Purge expired evidence artifact rows and their on-disk files.
+  // 3. Purge expired evidence artifact rows and schedule on-disk unlinks strictly post-COMMIT.
   if (policy.artifactTtlMs !== undefined && policy.artifactTtlMs > 0) {
     const cutoff = now - policy.artifactTtlMs
     const selectAged = storage.client.prepare(
@@ -277,27 +284,40 @@ export function purgeExpiredArtifacts(
         ? collectProtectedEvidenceIds(storage, runId)
         : new Set<string>()
       const agedRows = selectAged.all(runId, cutoff) as Array<{ id: string }>
-      for (const row of agedRows) {
-        if (protectedIds.has(row.id)) continue
-        for (const candidatePath of candidateArtifactPaths(storage.directory, runId, row.id)) {
-          const unlink = safeUnlinkRegularFile(candidatePath)
-          if (unlink.skippedSymlink) result.symlinksSkipped += 1
-          if (unlink.deleted) {
-            result.artifactFilesDeleted += 1
-            result.artifactBytesFreed += unlink.bytes
+      const eligibleIds = agedRows.map(row => row.id).filter(id => !protectedIds.has(id))
+      if (eligibleIds.length === 0) continue
+
+      storage.transaction(() => {
+        const deletedIds: string[] = []
+        for (const evidenceId of eligibleIds) {
+          const changes = deleteEvidence.run(evidenceId)
+          const count = Number(changes.changes)
+          if (count > 0) {
+            result.artifactsDeleted += count
+            deletedIds.push(evidenceId)
           }
         }
-        // Best-effort cleanup of empty shard bucket directory.
-        try {
-          rmdirSync(join(storage.directory, 'artifacts', runId, artifactBucket(row.id)))
-        } catch {
-          // Non-empty or absent.
+        if (deletedIds.length > 0) {
+          storage.session.afterCommit(() => {
+            for (const evidenceId of deletedIds) {
+              for (const candidatePath of candidateArtifactPaths(storage.directory, runId, evidenceId)) {
+                const unlink = safeUnlinkRegularFile(candidatePath)
+                if (unlink.skippedSymlink) result.symlinksSkipped += 1
+                if (unlink.deleted) {
+                  result.artifactFilesDeleted += 1
+                  result.artifactBytesFreed += unlink.bytes
+                }
+              }
+              // Best-effort cleanup of empty shard bucket directory.
+              try {
+                rmdirSync(join(storage.directory, 'artifacts', runId, artifactBucket(evidenceId)))
+              } catch {
+                // Non-empty or absent.
+              }
+            }
+          })
         }
-        const changes = deleteEvidence.run(row.id)
-        if (Number(changes.changes) > 0) {
-          result.artifactsDeleted += Number(changes.changes)
-        }
-      }
+      }, { behavior: 'immediate' })
     }
   }
 

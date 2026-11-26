@@ -35,6 +35,18 @@ import type {
   FindingProvenance,
   FindingVerificationClass,
 } from '../report-summary.ts'
+import {
+  FindingCodec,
+  operatorSeverityOverrides,
+  operatorTriageStatuses,
+  type FindingQueryFilter,
+  type OperatorSeverityOverride,
+  type OperatorTriage,
+  type OperatorTriageStatus,
+  type RawFindingRow,
+  type RunFindingRollup,
+  type TriagedFinding,
+} from './finding-codec.ts'
 import { computeFindingFingerprint, isOriginWideCwe, normalizeEndpointTemplate } from './finding-fingerprint.ts'
 import { redact, redactHeaders, redactJsonValue } from './redact.ts'
 import type { NamedSecret, SecretMatch } from './redact.ts'
@@ -97,29 +109,15 @@ import {
   type SurfaceProbe,
 } from './store-session.ts'
 
-export const operatorTriageStatuses = [
-  'open',
-  'confirmed_by_operator',
-  'accepted_risk',
-  'false_positive',
-  'fixed',
-] as const
-export type OperatorTriageStatus = typeof operatorTriageStatuses[number]
-
-export const operatorSeverityOverrides = [
-  'critical',
-  'high',
-  'medium',
-  'low',
-  'info',
-] as const
-export type OperatorSeverityOverride = typeof operatorSeverityOverrides[number]
-
-export interface OperatorTriage {
-  status: OperatorTriageStatus
-  severityOverride: OperatorSeverityOverride | null
-  notes: string
-  updatedAt: number
+export {
+  operatorTriageStatuses,
+  operatorSeverityOverrides,
+  type OperatorTriageStatus,
+  type OperatorSeverityOverride,
+  type OperatorTriage,
+  type TriagedFinding,
+  type FindingQueryFilter,
+  type RunFindingRollup,
 }
 
 export interface TriageFindingInput {
@@ -135,8 +133,6 @@ export interface PatchProposalReviewInput {
   status: PatchProposalReviewStatus
   reviewNotes?: string
 }
-
-export type TriagedFinding = Finding & { operatorTriage?: OperatorTriage | null }
 
 const operatorTriageStatusSet = new Set<string>(operatorTriageStatuses)
 const operatorSeverityOverrideSet = new Set<string>(operatorSeverityOverrides)
@@ -543,12 +539,16 @@ export class FindingsRepository {
       for (const id of batch.blobIds) blobIds.add(id)
       if (batch.rows < batchSize) break
     }
-    for (const blobId of blobIds) {
-      const removed = this.deleteBlobIfUnreferenced(run.id, blobId)
-      if (removed.deleted) {
-        result.blobs += 1
-        result.blobBytes += removed.bytes
-      }
+    if (blobIds.size > 0) {
+      this.session.afterCommit(() => {
+        for (const blobId of blobIds) {
+          const removed = this.deleteBlobIfUnreferenced(run.id, blobId)
+          if (removed.deleted) {
+            result.blobs += 1
+            result.blobBytes += removed.bytes
+          }
+        }
+      })
     }
     return result
   }
@@ -856,6 +856,23 @@ export class FindingsRepository {
     )).orderBy(desc(tables.replaySpecs.createdAt)).all()
   }
 
+  /** Query findings for a run via indexed promoted columns (`status`, `severity`, `cwe`, `origin`, `triage_status`). */
+  queryFindings(runId: string, filter: FindingQueryFilter = {}): TriagedFinding[] {
+    this.assertTenantRun(runId)
+    return FindingCodec.queryFindings(this.session.client, runId, filter)
+  }
+
+  /** Indexed count of runtime-confirmed, non-superseded findings for a single run. */
+  confirmedFindingCount(runId: string): number {
+    this.assertTenantRun(runId)
+    return FindingCodec.countConfirmedForRun(this.session.client, runId)
+  }
+
+  /** Indexed `(findingCount, confirmedCount)` rollups across run IDs (zero `json_extract`). */
+  rollupFindingCountsByRunIds(runIds: readonly string[]): Map<string, RunFindingRollup> {
+    return FindingCodec.rollupCountsByRunIds(this.session.client, runIds)
+  }
+
   /** How many confirmed claims this run demoted after their persisted evidence stopped confirming. */
   confirmationConflictCount(runId: string): number {
     const row = this.session.db.select({ count: sql<number>`count(*)` }).from(tables.events).where(and(
@@ -996,11 +1013,29 @@ export class FindingsRepository {
           + `${row.finding.category ?? 'claimed'} oracle (${evidence.kind}: ${evidence.verdict ?? 'no verdict'}).`
           + (row.finding.reason ? ` Prior: ${row.finding.reason}` : ''),
       }
-      this.session.db.update(tables.findings).set({
+      const encoded = FindingCodec.toUpdateColumns({
+        finding: demoted,
         verificationClass: 'open_proof_gap',
         verificationTier: null,
-        finding: demoted,
-      }).where(and(eq(tables.findings.runId, runId), eq(tables.findings.id, findingId))).run()
+      })
+      this.session.client.prepare(`
+        UPDATE findings
+        SET verification_class = ?, verification_tier = ?,
+            status = ?, severity = ?, cwe = ?, origin = ?, triage_status = ?,
+            finding = ?
+        WHERE run_id = ? AND id = ?
+      `).run(
+        encoded.verification_class,
+        encoded.verification_tier ?? null,
+        encoded.status,
+        encoded.severity,
+        encoded.cwe,
+        encoded.origin,
+        encoded.triage_status,
+        encoded.finding,
+        runId,
+        findingId,
+      )
       this.session.event(
         runId,
         'finding.confirmation_conflict',
@@ -1343,14 +1378,13 @@ export class FindingsRepository {
     return this.session.transaction(() => {
       if (options.runId) this.session.requireRun(options.runId)
 
-      const where = options.runId
-        ? and(eq(tables.findings.runId, options.runId), eq(tables.findings.id, findingId))
-        : eq(tables.findings.id, findingId)
-      const existing = this.session.db.select().from(tables.findings).where(where).get()
-      if (!existing) throw new Error('Finding not found.')
-      this.session.requireRun(existing.runId)
+      const existingRaw = options.runId
+        ? (this.session.client.prepare('SELECT * FROM findings WHERE run_id = ? AND id = ?').get(options.runId, findingId) as RawFindingRow | undefined)
+        : (this.session.client.prepare('SELECT * FROM findings WHERE id = ?').get(findingId) as RawFindingRow | undefined)
+      if (!existingRaw) throw new Error('Finding not found.')
+      this.session.requireRun(existingRaw.run_id)
 
-      const existingFinding = existing.finding as TriagedFinding
+      const existingFinding = FindingCodec.fromRow(existingRaw)
       const prevTriage = existingFinding.operatorTriage ?? null
       const nextTriage: OperatorTriage = {
         status: input.status ?? prevTriage?.status ?? 'open',
@@ -1367,19 +1401,33 @@ export class FindingsRepository {
         ...existingFinding,
         operatorTriage: nextTriage,
       }
-
-      this.session.db.update(tables.findings).set({
+      const encoded = FindingCodec.toUpdateColumns({
         finding: nextFinding,
-      }).where(eq(tables.findings.id, existing.id)).run()
+        verificationClass: existingRaw.verification_class,
+      })
 
-      this.session.event(existing.runId, 'finding.triaged', `Operator triaged "${existing.finding.title}" (${nextTriage.status}).`, {
-        findingId: existing.id,
+      this.session.client.prepare(`
+        UPDATE findings
+        SET status = ?, severity = ?, cwe = ?, origin = ?, triage_status = ?, finding = ?
+        WHERE id = ?
+      `).run(
+        encoded.status,
+        encoded.severity,
+        encoded.cwe,
+        encoded.origin,
+        encoded.triage_status,
+        encoded.finding,
+        existingRaw.id,
+      )
+
+      this.session.event(existingRaw.run_id, 'finding.triaged', `Operator triaged "${existingFinding.title}" (${nextTriage.status}).`, {
+        findingId: existingRaw.id,
         triageStatus: nextTriage.status,
         severityOverride: nextTriage.severityOverride,
         hasNotes: nextTriage.notes.length > 0,
       })
 
-      return nextFinding
+      return encoded.canonical
     }, { behavior: 'immediate' })
   }
 
@@ -1510,31 +1558,81 @@ export class FindingsRepository {
         verificationStatus: verificationClass,
       } as Finding
 
-      this.session.db.update(tables.findings).set({
+      const nextVerificationTier = patch.verificationTier !== undefined
+        ? patch.verificationTier
+        : (mergedFinding.verificationTier ?? existing.verificationTier)
+      const nextFingerprintHash = !isExistingVerified && patch.fingerprintHash !== undefined
+        ? patch.fingerprintHash
+        : (mergedFinding.fingerprintHash ?? existing.fingerprintHash)
+      const nextSupersededBy = patch.supersededByFindingId !== undefined
+        ? patch.supersededByFindingId
+        : (mergedFinding.supersededByFindingId ?? existing.supersededByFindingId)
+      const nextCounterevidence = patch.counterevidence !== undefined
+        ? patch.counterevidence
+        : (mergedFinding.counterevidence ?? existing.counterevidence)
+      const nextConfidenceRationale = patch.confidenceRationale !== undefined
+        ? patch.confidenceRationale
+        : (mergedFinding.confidenceRationale ?? existing.confidenceRationale)
+      const nextSeverityConditions = patch.severityChangeConditions !== undefined
+        ? patch.severityChangeConditions
+        : (mergedFinding.severityChangeConditions ?? existing.severityChangeConditions)
+      const nextCodeLocations = patch.codeLocations !== undefined
+        ? patch.codeLocations
+        : (mergedFinding.codeLocations ?? existing.codeLocations)
+
+      const encoded = FindingCodec.toUpdateColumns({
+        finding: persistedFinding,
         replaySpecId: effectiveReplaySpecId ?? null,
-        sourceOrigins: cleanOrigins,
-        verificationTier: patch.verificationTier !== undefined ? patch.verificationTier : (mergedFinding.verificationTier ?? existing.verificationTier),
-        fingerprintHash: !isExistingVerified && patch.fingerprintHash !== undefined
-          ? patch.fingerprintHash
-          : (mergedFinding.fingerprintHash ?? existing.fingerprintHash),
-        supersededByFindingId: patch.supersededByFindingId !== undefined ? patch.supersededByFindingId : (mergedFinding.supersededByFindingId ?? existing.supersededByFindingId),
-        counterevidence: patch.counterevidence !== undefined ? patch.counterevidence : (mergedFinding.counterevidence ?? existing.counterevidence),
-        confidenceRationale: patch.confidenceRationale !== undefined ? patch.confidenceRationale : (mergedFinding.confidenceRationale ?? existing.confidenceRationale),
-        severityChangeConditions: patch.severityChangeConditions !== undefined ? patch.severityChangeConditions : (mergedFinding.severityChangeConditions ?? existing.severityChangeConditions),
-        codeLocations: patch.codeLocations !== undefined ? patch.codeLocations : (mergedFinding.codeLocations ?? existing.codeLocations),
+        provenance: existing.provenance,
         parentFindingIds: parentFindingIds?.length ? parentFindingIds : null,
         verificationClass,
-        finding: persistedFinding,
-      }).where(eq(tables.findings.id, existing.id)).run()
+        sourceOrigins: cleanOrigins,
+        verificationTier: nextVerificationTier,
+        fingerprintHash: nextFingerprintHash,
+        supersededByFindingId: nextSupersededBy,
+        counterevidence: nextCounterevidence,
+        confidenceRationale: nextConfidenceRationale,
+        severityChangeConditions: nextSeverityConditions,
+        codeLocations: nextCodeLocations,
+      })
+
+      this.session.client.prepare(`
+        UPDATE findings
+        SET replay_spec_id = ?, source_origins = ?, verification_tier = ?, fingerprint_hash = ?,
+            superseded_by_finding_id = ?, counterevidence = ?, confidence_rationale = ?,
+            severity_change_conditions = ?, code_locations = ?, parent_finding_ids = ?,
+            verification_class = ?, status = ?, severity = ?, cwe = ?, origin = ?,
+            triage_status = ?, finding = ?
+        WHERE id = ?
+      `).run(
+        encoded.replay_spec_id ?? null,
+        encoded.source_origins ?? JSON.stringify(cleanOrigins),
+        encoded.verification_tier ?? null,
+        encoded.fingerprint_hash ?? null,
+        encoded.superseded_by_finding_id ?? null,
+        encoded.counterevidence ?? null,
+        encoded.confidence_rationale ?? null,
+        encoded.severity_change_conditions ?? null,
+        encoded.code_locations ?? null,
+        encoded.parent_finding_ids ?? null,
+        encoded.verification_class,
+        encoded.status,
+        encoded.severity,
+        encoded.cwe,
+        encoded.origin,
+        encoded.triage_status,
+        encoded.finding,
+        existing.id,
+      )
 
       this.session.event(run.id, 'finding.updated', `Updated finding "${mergedFinding.title}" (${mergedFinding.status}).`, {
         findingId: mergedFinding.id,
-        status: mergedFinding.status,
-        severity: mergedFinding.severity,
-        verificationTier: mergedFinding.verificationTier ?? null,
-        verificationClass,
+        status: encoded.status,
+        severity: encoded.severity,
+        verificationTier: encoded.verification_tier ?? null,
+        verificationClass: encoded.verification_class,
       })
-      return persistedFinding
+      return encoded.canonical
     }, { behavior: 'immediate' })
   }
 
@@ -1817,8 +1915,10 @@ export class FindingsRepository {
         ...sourceOrigins,
       ])]
 
+      let finalCanonical: TriagedFinding
       if (targetRow) {
-        this.session.db.update(tables.findings).set({
+        const encoded = FindingCodec.toUpdateColumns({
+          finding: persistedFinding,
           replaySpecId: canonicalSpecId,
           sourceOrigins: cleanOrigins,
           verificationTier: storedFinding.verificationTier ?? verificationTier,
@@ -1831,10 +1931,39 @@ export class FindingsRepository {
           provenance,
           parentFindingIds: parentFindingIds?.length ? parentFindingIds : null,
           verificationClass,
-          finding: persistedFinding,
-        }).where(eq(tables.findings.id, targetRow.id)).run()
+        })
+        this.session.client.prepare(`
+          UPDATE findings
+          SET replay_spec_id = ?, source_origins = ?, verification_tier = ?, fingerprint_hash = ?,
+              superseded_by_finding_id = ?, counterevidence = ?, confidence_rationale = ?,
+              severity_change_conditions = ?, code_locations = ?, provenance = ?,
+              parent_finding_ids = ?, verification_class = ?, status = ?, severity = ?,
+              cwe = ?, origin = ?, triage_status = ?, finding = ?
+          WHERE id = ?
+        `).run(
+          encoded.replay_spec_id ?? null,
+          encoded.source_origins ?? JSON.stringify(cleanOrigins),
+          encoded.verification_tier ?? null,
+          encoded.fingerprint_hash ?? null,
+          encoded.superseded_by_finding_id ?? null,
+          encoded.counterevidence ?? null,
+          encoded.confidence_rationale ?? null,
+          encoded.severity_change_conditions ?? null,
+          encoded.code_locations ?? null,
+          encoded.provenance ?? provenance,
+          encoded.parent_finding_ids ?? null,
+          encoded.verification_class,
+          encoded.status,
+          encoded.severity,
+          encoded.cwe,
+          encoded.origin,
+          encoded.triage_status,
+          encoded.finding,
+          targetRow.id,
+        )
+        finalCanonical = encoded.canonical
       } else {
-        this.session.db.insert(tables.findings).values({
+        const encoded = FindingCodec.toRow({
           id: storedFinding.id,
           runId: run.id,
           assetId,
@@ -1855,7 +1984,43 @@ export class FindingsRepository {
           parentFindingIds: parentFindingIds?.length ? parentFindingIds : null,
           verificationClass,
           finding: persistedFinding,
-        }).run()
+        })
+        this.session.client.prepare(`
+          INSERT INTO findings (
+            id, run_id, asset_id, goal_revision, check_id, case_id, finding_kind,
+            replay_spec_id, provenance, parent_finding_ids, verification_class,
+            source_origins, verification_tier, fingerprint_hash, superseded_by_finding_id,
+            counterevidence, confidence_rationale, severity_change_conditions, code_locations,
+            status, severity, cwe, origin, triage_status, finding
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          encoded.id,
+          encoded.run_id,
+          encoded.asset_id,
+          encoded.goal_revision,
+          encoded.check_id,
+          encoded.case_id,
+          encoded.finding_kind,
+          encoded.replay_spec_id,
+          encoded.provenance,
+          encoded.parent_finding_ids,
+          encoded.verification_class,
+          encoded.source_origins,
+          encoded.verification_tier,
+          encoded.fingerprint_hash,
+          encoded.superseded_by_finding_id,
+          encoded.counterevidence,
+          encoded.confidence_rationale,
+          encoded.severity_change_conditions,
+          encoded.code_locations,
+          encoded.status,
+          encoded.severity,
+          encoded.cwe,
+          encoded.origin,
+          encoded.triage_status,
+          encoded.finding,
+        )
+        finalCanonical = encoded.canonical
       }
       if (targetRow) {
         if (finding.id !== targetRow.id) {
@@ -1871,18 +2036,18 @@ export class FindingsRepository {
         this.session.db.delete(tables.findings).where(eq(tables.findings.id, redundantRow.id)).run()
       }
 
-      this.session.event(run.id, storedFinding.status === 'pending' ? 'finding.proposed' : 'finding.verified',
-        `[${storedFinding.status}] ${storedFinding.severity.toUpperCase()} ${storedFinding.title} (${storedFinding.origin})`, {
-          findingId: storedFinding.id,
-          status: storedFinding.status,
-          severity: storedFinding.severity,
-          origin: storedFinding.origin,
+      this.session.event(run.id, finalCanonical.status === 'pending' ? 'finding.proposed' : 'finding.verified',
+        `[${finalCanonical.status}] ${finalCanonical.severity.toUpperCase()} ${finalCanonical.title} (${finalCanonical.origin})`, {
+          findingId: finalCanonical.id,
+          status: finalCanonical.status,
+          severity: finalCanonical.severity,
+          origin: finalCanonical.origin,
           replaySpecId: canonicalSpecId,
           deduplicated: Boolean(dupRow),
           provenance,
           verificationClass,
         })
-      return persistedFinding
+      return finalCanonical
     }, { behavior: 'immediate' })
   }
 

@@ -36,7 +36,123 @@ import type { ReplayProofReceiptRow } from './schema.ts'
 import * as tables from './schema.ts'
 
 /** Local SQLite schema stamp (`PRAGMA user_version`), independent of Drizzle migrations. */
-export const STORE_SCHEMA_VERSION = 9
+export const STORE_SCHEMA_VERSION = 10
+
+/**
+ * Thrown when opening a SQLite database whose `PRAGMA user_version` is newer than the highest
+ * migration supported by this binary. Prevents silent schema corruption on downgrade.
+ */
+export class SchemaDowngradeError extends Error {
+  readonly code = 'SCHEMA_DOWNGRADE_REFUSED'
+  readonly dbVersion: number
+  readonly supportedVersion: number
+
+  constructor(dbVersion: number, supportedVersion: number) {
+    super(
+      `Database schema version ${dbVersion} is newer than supported version ${supportedVersion}. `
+      + 'Refusing to open to prevent downgrade corruption; upgrade Kovo Hunter before opening this data directory.',
+    )
+    this.name = 'SchemaDowngradeError'
+    this.dbVersion = dbVersion
+    this.supportedVersion = supportedVersion
+  }
+}
+
+export interface MigrationContext {
+  readonly client: DatabaseSync
+  tableExists(table: string): boolean
+  existingColumns(table: string): Set<string>
+  ensureColumn(table: string, column: string, definition: string): boolean
+}
+
+export interface MigrationStep {
+  /** Target `PRAGMA user_version` stamped atomically when this step commits. */
+  readonly version: number
+  readonly name: string
+  readonly up: (ctx: MigrationContext) => void
+}
+
+export interface MigrationRunReport {
+  fromVersion: number
+  toVersion: number
+  applied: Array<{ version: number; name: string }>
+}
+
+/**
+ * Execute an ordered list of schema migrations atomically (`v -> v+1`), running each step and
+ * stamping `PRAGMA user_version` inside the same `BEGIN EXCLUSIVE` transaction.
+ * Fails fast with `SchemaDowngradeError` when `dbVersion > maxSupportedVersion`.
+ */
+export function runSqliteMigrations(
+  client: DatabaseSync,
+  steps: readonly MigrationStep[],
+): MigrationRunReport {
+  for (let i = 0; i < steps.length; i += 1) {
+    const step = steps[i]!
+    if (!Number.isInteger(step.version) || step.version <= 0) {
+      throw new Error(`Invalid migration version ${String(step.version)} for step "${step.name}".`)
+    }
+    if (i > 0 && step.version <= steps[i - 1]!.version) {
+      throw new Error(
+        `Migrations must be strictly ordered by version (got ${step.version} after ${steps[i - 1]!.version}).`,
+      )
+    }
+  }
+  const targetVersion = steps.length > 0 ? steps[steps.length - 1]!.version : 0
+  const currentVersion = Number(
+    (client.prepare('PRAGMA user_version').get() as { user_version?: number } | undefined)?.user_version ?? 0,
+  )
+  if (currentVersion > targetVersion) {
+    throw new SchemaDowngradeError(currentVersion, targetVersion)
+  }
+
+  const ctx: MigrationContext = {
+    client,
+    tableExists(table: string): boolean {
+      const row = client.prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+      ).get(table) as { name?: string } | undefined
+      return Boolean(row?.name)
+    },
+    existingColumns(table: string): Set<string> {
+      const rows = client.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>
+      return new Set(rows.map(r => r.name))
+    },
+    ensureColumn(table: string, column: string, definition: string): boolean {
+      if (!this.existingColumns(table).has(column)) {
+        client.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition};`)
+        return true
+      }
+      return false
+    },
+  }
+
+  const applied: Array<{ version: number; name: string }> = []
+  let activeVersion = currentVersion
+  for (const step of steps) {
+    if (step.version <= activeVersion) continue
+    withBusyRetry(() => client.exec('BEGIN EXCLUSIVE'))
+    try {
+      step.up(ctx)
+      client.exec(`PRAGMA user_version = ${step.version};`)
+      withBusyRetry(() => client.exec('COMMIT'))
+      activeVersion = step.version
+      applied.push({ version: step.version, name: step.name })
+    } catch (error) {
+      try { client.exec('ROLLBACK') } catch { /* ignore rollback error */ }
+      const detail = error instanceof Error ? error.message : String(error)
+      const wrapped = new Error(`Migration v${step.version} (${step.name}) failed: ${detail}`)
+      ;(wrapped as Error & { cause?: unknown }).cause = error
+      throw wrapped
+    }
+  }
+
+  return {
+    fromVersion: currentVersion,
+    toVersion: activeVersion,
+    applied,
+  }
+}
 
 const PENDING_OOB_RE = /pending[_\s-]?oob|awaiting[_\s-]?(?:oob|callback)/i
 
@@ -790,7 +906,15 @@ export function openSqliteDatabase(
       withBusyRetry(() => client.exec(`PRAGMA busy_timeout = ${busyTimeoutMs};`))
     } else {
       const pragmas: string[] = []
-      if (!isMemory) pragmas.push('PRAGMA journal_mode = WAL;')
+      if (!isMemory) {
+        // Enable incremental auto_vacuum on brand-new databases before the first page is allocated
+        // so idle `PRAGMA incremental_vacuum` can reclaim freed pages without a blocking VACUUM.
+        const pageRow = withBusyRetry(() => client.prepare('PRAGMA page_count').get()) as { page_count?: number } | undefined
+        if (Number(pageRow?.page_count ?? 0) === 0) {
+          pragmas.push('PRAGMA auto_vacuum = INCREMENTAL;')
+        }
+        pragmas.push('PRAGMA journal_mode = WAL;')
+      }
       pragmas.push('PRAGMA synchronous = NORMAL;')
       pragmas.push(`PRAGMA busy_timeout = ${busyTimeoutMs};`)
       if (!isMemory) pragmas.push(`PRAGMA journal_size_limit = ${journalSizeLimitBytes};`)
@@ -1013,6 +1137,12 @@ export interface DbSession {
   /** Optional tenant boundary enforced on every project/run/blob read and write when set. */
   readonly tenantId?: string
   transaction<T>(fn: () => T, options?: { behavior?: 'deferred' | 'immediate' | 'exclusive' }): T
+  /**
+   * Register a post-commit side-effect (such as disk file deletion) that runs strictly AFTER
+   * the outermost SQLite `COMMIT` succeeds. Discarded automatically if the transaction or
+   * enclosing savepoint rolls back. When called outside a transaction, executes immediately.
+   */
+  afterCommit(fn: () => void): void
   operate<Result extends { id: string }>(input: { requestId: string }, apply: () => Result): Result
   ensureHighConcurrencyPragmas(minBusyTimeoutMs?: number): { journalMode: string; busyTimeoutMs: number }
   flushNow(): void
@@ -1101,6 +1231,9 @@ export class StoreSession implements DbSession {
   private _txDepth = 0
   /** Deferred emitter callbacks per transaction nesting frame (flushed on outermost COMMIT, dropped on ROLLBACK). */
   private deferredEmitStack: Array<Array<() => void>> = []
+  /** Post-commit cleanup callbacks (e.g. disk unlinks) run synchronously after outermost COMMIT, dropped on ROLLBACK. */
+  private afterCommitStack: Array<Array<() => void>> = []
+  private operationsHasCreatedAt: boolean | null = null
   /** Bounded async write queue for broker exchanges (flushed by microtask/size boundary). */
   private pendingExchanges: PendingExchangeWrite[] = []
   private readonly exchangeAttempts = new WeakMap<PendingExchangeWrite, number>()
@@ -1431,6 +1564,25 @@ export class StoreSession implements DbSession {
     return this.db.insert(tables.events).values(eventRows).returning().all()
   }
 
+  afterCommit(fn: () => void): void {
+    if (this._txDepth > 0 && this.afterCommitStack.length > 0) {
+      this.afterCommitStack[this.afterCommitStack.length - 1]!.push(fn)
+      return
+    }
+    fn()
+  }
+
+  private hasOperationsCreatedAt(): boolean {
+    if (this.operationsHasCreatedAt !== null) return this.operationsHasCreatedAt
+    try {
+      const cols = this.rawClient.prepare('PRAGMA table_info(operations)').all() as Array<{ name: string }>
+      this.operationsHasCreatedAt = cols.some(col => col.name === 'created_at')
+    } catch {
+      this.operationsHasCreatedAt = false
+    }
+    return this.operationsHasCreatedAt
+  }
+
   transaction<T>(fn: () => T, options?: { behavior?: 'deferred' | 'immediate' | 'exclusive' }): T {
     if (this._txDepth === 0) {
       // Preserve write ordering: never open a transaction while exchange writes are pending.
@@ -1448,7 +1600,9 @@ export class StoreSession implements DbSession {
         throw error
       }
       const frame: Array<() => void> = []
+      const postCommitFrame: Array<() => void> = []
       this.deferredEmitStack.push(frame)
+      this.afterCommitStack.push(postCommitFrame)
       let committed = false
       try {
         const result = fn()
@@ -1460,18 +1614,26 @@ export class StoreSession implements DbSession {
         throw error
       } finally {
         this.deferredEmitStack.pop()
+        this.afterCommitStack.pop()
         this._txDepth -= 1
-        if (committed && frame.length > 0) {
-          queueMicrotask(() => {
-            for (const cb of frame) cb()
-          })
+        if (committed) {
+          for (const cb of postCommitFrame) {
+            try { cb() } catch { /* post-commit cleanup is best-effort and must not hide committed state */ }
+          }
+          if (frame.length > 0) {
+            queueMicrotask(() => {
+              for (const cb of frame) cb()
+            })
+          }
         }
       }
     }
     const sp = `sp_${++this._txDepth}`
     this.client.exec(`SAVEPOINT ${sp}`)
     const childFrame: Array<() => void> = []
+    const childPostCommitFrame: Array<() => void> = []
     this.deferredEmitStack.push(childFrame)
+    this.afterCommitStack.push(childPostCommitFrame)
     let released = false
     try {
       const result = fn()
@@ -1486,15 +1648,28 @@ export class StoreSession implements DbSession {
       throw error
     } finally {
       this.deferredEmitStack.pop()
+      this.afterCommitStack.pop()
       this._txDepth -= 1
-      if (released && childFrame.length > 0) {
-        const parent = this.deferredEmitStack[this.deferredEmitStack.length - 1]
-        if (parent) {
-          parent.push(...childFrame)
-        } else {
-          queueMicrotask(() => {
-            for (const cb of childFrame) cb()
-          })
+      if (released) {
+        if (childPostCommitFrame.length > 0) {
+          const parentPost = this.afterCommitStack[this.afterCommitStack.length - 1]
+          if (parentPost) {
+            parentPost.push(...childPostCommitFrame)
+          } else {
+            for (const cb of childPostCommitFrame) {
+              try { cb() } catch { /* post-commit cleanup is best-effort */ }
+            }
+          }
+        }
+        if (childFrame.length > 0) {
+          const parent = this.deferredEmitStack[this.deferredEmitStack.length - 1]
+          if (parent) {
+            parent.push(...childFrame)
+          } else {
+            queueMicrotask(() => {
+              for (const cb of childFrame) cb()
+            })
+          }
         }
       }
     }
@@ -1511,9 +1686,16 @@ export class StoreSession implements DbSession {
         return JSON.parse(existing.result) as Result
       }
       const result = apply()
-      this.db.insert(tables.operations).values({
-        id: input.requestId, workspaceId: this.workspace.id, fingerprint, result: JSON.stringify(result),
-      }).run()
+      const serialized = JSON.stringify(result)
+      if (this.hasOperationsCreatedAt()) {
+        this.client.prepare(
+          'INSERT INTO operations (id, workspace_id, fingerprint, result, created_at) VALUES (?, ?, ?, ?, ?)',
+        ).run(input.requestId, this.workspace.id, fingerprint, serialized, Date.now())
+      } else {
+        this.db.insert(tables.operations).values({
+          id: input.requestId, workspaceId: this.workspace.id, fingerprint, result: serialized,
+        }).run()
+      }
       return result
     }, { behavior: 'immediate' })
   }
@@ -1707,15 +1889,36 @@ export class StoreSession implements DbSession {
     return { sessionIds, artifactIds }
   }
 
-  /** Keep any legacy flat content-addressed blob still referenced by another surviving run. */
+  /** Keep any legacy flat artifact/blob still referenced by any surviving table across runs. */
   filterUnreferencedFlatArtifacts(artifactIds: ReadonlySet<string>): string[] {
     if (artifactIds.size === 0) return []
-    const checkShared = this.client.prepare(
+    const checkExchange = this.client.prepare(
       `SELECT 1 FROM broker_exchanges WHERE body_artifact_id = ? LIMIT 1`,
     )
+    const checkEvidence = this.client.prepare(
+      `SELECT 1 FROM evidence WHERE id = ? LIMIT 1`,
+    )
+    const checkProof = this.tableExists('replay_specs')
+      ? this.client.prepare(`SELECT 1 FROM replay_specs WHERE proof_artifact_id = ? LIMIT 1`)
+      : null
+    const checkSast = this.tableExists('sast_runs')
+      ? this.client.prepare(`SELECT 1 FROM sast_runs WHERE raw_artifact_id = ? LIMIT 1`)
+      : null
+    const checkTelemetry = this.tableExists('lab_telemetry')
+      ? this.client.prepare(`SELECT 1 FROM lab_telemetry WHERE artifact_id = ? LIMIT 1`)
+      : null
     const flatArtifactIds: string[] = []
     for (const aid of artifactIds) {
-      if (!checkShared.get(aid)) flatArtifactIds.push(aid)
+      if (
+        checkExchange.get(aid)
+        || checkEvidence.get(aid)
+        || checkProof?.get(aid)
+        || checkSast?.get(aid)
+        || checkTelemetry?.get(aid)
+      ) {
+        continue
+      }
+      flatArtifactIds.push(aid)
     }
     return flatArtifactIds
   }
@@ -1844,6 +2047,9 @@ export class TenantScopedSession implements DbSession {
 
   transaction<T>(fn: () => T, options?: { behavior?: 'deferred' | 'immediate' | 'exclusive' }): T {
     return this.inner.transaction(fn, options)
+  }
+  afterCommit(fn: () => void): void {
+    this.inner.afterCommit(fn)
   }
   operate<Result extends { id: string }>(input: { requestId: string }, apply: () => Result): Result {
     return this.inner.operate(input, apply)
