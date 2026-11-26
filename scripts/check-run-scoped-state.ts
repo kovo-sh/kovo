@@ -22,17 +22,19 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import ts from 'typescript'
 
 export interface RunScopedStateFinding {
-  /** Stable identifier `<file>::<name>`. */
+  /** Stable identifier `<file>::<name>` (or `<file>::<Class>.<field>` for class fields). */
   key: string
   /** Repo-relative POSIX path. */
   file: string
   /** 1-based line number. */
   line: number
-  /** Variable name. */
+  /** Variable or `<Class>.<field>` name. */
   name: string
   /** Collection constructor kind. */
   kind: 'Map' | 'Set'
-  /** Whether the variable is registered with `registerRunDisposer(...)` in the same module. */
+  /** Declaration scope: top-level module variable or class instance field. */
+  scope?: 'module' | 'class-field'
+  /** Whether the variable/field is registered with `registerRunDisposer(...)` or disposed in-class. */
   registered: boolean
   /** Trimmed source line excerpt. */
   excerpt: string
@@ -70,8 +72,10 @@ export const BASELINED_UNREGISTERED_RUN_SCOPED_STATE: readonly string[] = [
   'src/server/active-clock.ts::runClocks',
   'src/server/canary-broker.ts::observedSecondOrderByRun',
   'src/server/derived-custody.ts::runCustodyBudgets',
+  'src/server/exec-verify.ts::ExecVerifier.fallbackVaults',
   'src/server/oob-drain.ts::activeFinalizingRuns',
   'src/server/patch-workflow.ts::gate6RunLocks',
+  'src/server/probe-plan.ts::ProbePlanRegistry.plans',
   'src/server/verify-support.ts::runBrowserRegistry',
 ] as const
 
@@ -185,12 +189,79 @@ function isRegisteredWithRunDisposer(
   return false
 }
 
+const CLASS_KEY_ARG_RE =
+  /\b(?:runId|run_id|assignmentId|assignment_id|personaId|persona_id)\b|\b(?:run|assignment|persona)\.id\b/i
+
+function isThisPropAccess(expr: ts.Expression, propName: string): boolean {
+  return (
+    ts.isPropertyAccessExpression(expr)
+    && expr.expression.kind === ts.SyntaxKind.ThisKeyword
+    && expr.name.text === propName
+  )
+}
+
+/**
+ * Inspect a class body for mutations and disposal of `this.<propName>`:
+ *  - `mutatedWithRunKey`: called `.set(arg, ...)` or `.add(arg)` with a run/assignment/persona key arg.
+ *  - `mutatedAny`: called `.set(...)` or `.add(...)` with any arg.
+ *  - `disposed`: calls `this.<propName>.delete(...)` or `.clear(...)`, or delegates the field reference
+ *    as an argument/property value to an external coordinator/cleanup helper.
+ */
+function analyzeClassFieldLifecycle(
+  cls: ts.ClassLikeDeclaration,
+  sf: ts.SourceFile,
+  propName: string,
+): { mutatedWithRunKey: boolean; mutatedAny: boolean; disposed: boolean } {
+  let mutatedWithRunKey = false
+  let mutatedAny = false
+  let disposed = false
+
+  const visit = (node: ts.Node): void => {
+    if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)) {
+      const receiver = node.expression.expression
+      const method = node.expression.name.text
+      if (isThisPropAccess(receiver, propName)) {
+        if (method === 'set' || method === 'add') {
+          mutatedAny = true
+          const firstArg = node.arguments[0]
+          if (firstArg && CLASS_KEY_ARG_RE.test(firstArg.getText(sf))) {
+            mutatedWithRunKey = true
+          }
+        } else if (method === 'delete' || method === 'clear') {
+          disposed = true
+        }
+      }
+    } else if (ts.isPropertyAccessExpression(node) && isThisPropAccess(node, propName)) {
+      const parent = node.parent
+      // Handing the collection reference to a helper/collaborator (e.g. `evictRun({ ... })` or `new Worker({ ... })`)
+      // transfers/shares disposal lifecycle.
+      if (
+        (ts.isCallExpression(parent) && parent.arguments.includes(node))
+        || (ts.isPropertyAssignment(parent) && parent.initializer === node)
+      ) {
+        disposed = true
+      }
+    }
+    ts.forEachChild(node, visit)
+  }
+
+  for (const member of cls.members) {
+    if (ts.isPropertyDeclaration(member) && ts.isIdentifier(member.name) && member.name.text === propName) {
+      continue
+    }
+    visit(member)
+  }
+
+  return { mutatedWithRunKey, mutatedAny, disposed }
+}
+
 export function scanFileForRunScopedState(relFile: string, content: string): RunScopedStateFinding[] {
   if (EXEMPT_FILES.has(relFile)) return []
   const sf = ts.createSourceFile(relFile, content, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
   const disposerRefs = collectDisposerReferencedIdentifiers(sf)
   const findings: RunScopedStateFinding[] = []
 
+  // 1. Top-level module-scoped mutable `new Map()` / `new Set()`
   for (const stmt of sf.statements) {
     if (!ts.isVariableStatement(stmt)) continue
     for (const decl of stmt.declarationList.declarations) {
@@ -219,11 +290,59 @@ export function scanFileForRunScopedState(relFile: string, content: string): Run
         line,
         name: varName,
         kind: ctorName,
+        scope: 'module',
         registered,
         excerpt,
       })
     }
   }
+
+  // 2. Class-field mutable `new Map()` / `new Set()` keyed by runId / assignmentId / persona (R3-09)
+  const visitClasses = (node: ts.Node): void => {
+    if (ts.isClassDeclaration(node) || ts.isClassExpression(node)) {
+      const className = node.name ? node.name.text : '<anonymous>'
+      for (const member of node.members) {
+        if (!ts.isPropertyDeclaration(member) || !member.initializer) continue
+        if (!ts.isIdentifier(member.name) && !ts.isPrivateIdentifier(member.name)) continue
+        if (!ts.isNewExpression(member.initializer)) continue
+        if (!ts.isIdentifier(member.initializer.expression)) continue
+        const ctorName = member.initializer.expression.text
+        if (ctorName !== 'Map' && ctorName !== 'Set') continue
+        if (member.initializer.arguments && member.initializer.arguments.length > 0) continue
+
+        const propName = member.name.text
+        const keyTypeText =
+          member.initializer.typeArguments && member.initializer.typeArguments.length > 0
+            ? member.initializer.typeArguments[0]!.getText(sf)
+            : member.type && ts.isTypeReferenceNode(member.type) && member.type.typeArguments?.[0]
+              ? member.type.typeArguments[0].getText(sf)
+              : ''
+        const keySource = `${propName} ${keyTypeText}`
+        const lifecycle = analyzeClassFieldLifecycle(node, sf, propName)
+        const isRunScopedField =
+          lifecycle.mutatedWithRunKey || (RUN_SCOPED_KEY_RE.test(keySource) && lifecycle.mutatedAny)
+        if (!isRunScopedField) continue
+
+        const line = sf.getLineAndCharacterOfPosition(member.getStart(sf)).line + 1
+        const registered = lifecycle.disposed || isRegisteredWithRunDisposer(sf, disposerRefs, propName)
+        const fieldName = `${className}.${propName}`
+        const excerpt = member.getText(sf).split(/\r?\n/)[0]!.trim().slice(0, 140)
+        findings.push({
+          key: `${relFile}::${fieldName}`,
+          file: relFile,
+          line,
+          name: fieldName,
+          kind: ctorName,
+          scope: 'class-field',
+          registered,
+          excerpt,
+        })
+      }
+    }
+    ts.forEachChild(node, visitClasses)
+  }
+  visitClasses(sf)
+
   return findings
 }
 
@@ -292,7 +411,10 @@ export function formatRunScopedStateReport(result: RunScopedStateScanResult): st
     + `${result.unregisteredCount}/${result.baselineMax} total unregistered in ${result.filesScanned} files):`,
   ]
   for (const v of result.newViolations) {
-    lines.push(`  ${v.file}:${v.line} ${v.key} (${v.kind}) — register via registerRunDisposer() in src/server/run-disposers.ts`)
+    const remediation = v.scope === 'class-field'
+      ? 'back via runState.mapView(...) or delete/clear in run disposal'
+      : 'register via registerRunDisposer() in src/server/run-disposers.ts'
+    lines.push(`  ${v.file}:${v.line} ${v.key} (${v.kind}, ${v.scope ?? 'module'}) — ${remediation}`)
   }
   if (result.newViolations.length === 0 && result.unregisteredCount > result.baselineMax) {
     lines.push(`  unregistered count ${result.unregisteredCount} exceeds baselineMax ${result.baselineMax}`)

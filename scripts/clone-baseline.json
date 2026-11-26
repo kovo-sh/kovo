@@ -1,0 +1,347 @@
+{
+  "version": 1,
+  "dir": "src/server",
+  "minLines": 6,
+  "groups": [
+    {
+      "hash": "100955c7d08a3e5a",
+      "lines": 11,
+      "files": [
+        "src/server/floor-recipe-engine.ts",
+        "src/server/verify-support.ts"
+      ],
+      "sampleNames": [
+        "<anonymous>"
+      ]
+    },
+    {
+      "hash": "1eeeb2e21297fa4d",
+      "lines": 7,
+      "files": [
+        "src/server/receipt-export.ts",
+        "src/server/report-export.ts"
+      ],
+      "sampleNames": [
+        "<anonymous>"
+      ]
+    },
+    {
+      "hash": "1f3194484f001a1f",
+      "lines": 11,
+      "files": [
+        "src/server/artifact-ttl.ts",
+        "src/server/storage-maintenance.ts"
+      ],
+      "sampleNames": [
+        "safeUnlinkFile",
+        "safeUnlinkRegularFile"
+      ]
+    },
+    {
+      "hash": "2585947eeae909a9",
+      "lines": 6,
+      "files": [
+        "src/server/container-supervisor.ts",
+        "src/server/worker-backend.ts"
+      ],
+      "sampleNames": [
+        "normalizeDockerLabel",
+        "normalizeLabelValue"
+      ]
+    },
+    {
+      "hash": "3320698f0224e5d0",
+      "lines": 12,
+      "files": [
+        "src/server/canary-broker.ts",
+        "src/server/oob-relay.ts"
+      ],
+      "sampleNames": [
+        "normalizePublicBaseUrl"
+      ]
+    },
+    {
+      "hash": "3a68cbf432ca8f36",
+      "lines": 7,
+      "files": [
+        "src/server/floor-recipes.ts",
+        "src/server/proof-receipt.ts"
+      ],
+      "sampleNames": [
+        "headerValue"
+      ]
+    },
+    {
+      "hash": "45dbff1a65c87b6e",
+      "lines": 7,
+      "files": [
+        "src/server/broker.ts",
+        "src/server/verify-rpc.ts"
+      ],
+      "sampleNames": [
+        "setHeaderCI",
+        "setHeaderCaseInsensitive"
+      ]
+    },
+    {
+      "hash": "55bdeb6d6c80302c",
+      "lines": 41,
+      "files": [
+        "src/server/request-admission.ts",
+        "src/server/scope-policy.ts"
+      ],
+      "sampleNames": [
+        "parseString"
+      ]
+    },
+    {
+      "hash": "59dcba335d191ea8",
+      "lines": 7,
+      "files": [
+        "src/server/agent-session.ts",
+        "src/server/untrusted-compute-pool.ts"
+      ],
+      "sampleNames": [
+        "isBinaryBuffer",
+        "isWorkerBinaryBuffer"
+      ]
+    },
+    {
+      "hash": "662fdf0b7c39b6f1",
+      "lines": 14,
+      "files": [
+        "src/server/floor-recipe-engine.ts",
+        "src/server/verify-support.ts"
+      ],
+      "sampleNames": [
+        "runnerSleepAbortable",
+        "sleepAbortable"
+      ]
+    },
+    {
+      "hash": "6b8fac33c13cca6b",
+      "lines": 9,
+      "files": [
+        "src/server/phase0-recon.ts",
+        "src/server/static-workspace-snapshot.ts"
+      ],
+      "sampleNames": [
+        "isRealPathUnder"
+      ]
+    },
+    {
+      "hash": "6d3ee105e378fdd6",
+      "lines": 6,
+      "files": [
+        "src/server/store-session.ts",
+        "src/server/store.ts"
+      ],
+      "sampleNames": [
+        "tableExists"
+      ]
+    },
+    {
+      "hash": "70196eb4881e3493",
+      "lines": 8,
+      "files": [
+        "src/server/container-supervisor.ts",
+        "src/server/worker-backend.ts"
+      ],
+      "sampleNames": [
+        "currentPidNamespace",
+        "readSupervisorPidNamespace"
+      ]
+    },
+    {
+      "hash": "72ea5923925d338d",
+      "lines": 7,
+      "files": [
+        "src/server/agent-session.ts",
+        "src/server/worker-session-reader.ts"
+      ],
+      "sampleNames": [
+        "<anonymous>"
+      ]
+    },
+    {
+      "hash": "79f900e861a991bc",
+      "lines": 9,
+      "files": [
+        "src/server/report-export.ts",
+        "src/server/sarif-export.ts"
+      ],
+      "sampleNames": [
+        "normalizeCompositeForMarkdown",
+        "normalizeCompositeForSarif"
+      ]
+    },
+    {
+      "hash": "8758af86b44b3cf1",
+      "lines": 7,
+      "files": [
+        "src/server/approval-pattern.ts",
+        "src/server/subdomain-discovery.ts"
+      ],
+      "sampleNames": [
+        "canonicalOriginKey",
+        "normalizeOriginKey"
+      ]
+    },
+    {
+      "hash": "8b099474ab8acef0",
+      "lines": 11,
+      "files": [
+        "src/server/floor-recipe-engine.ts",
+        "src/server/request-admission.ts",
+        "src/server/scoped-browser.ts"
+      ],
+      "sampleNames": [
+        "hasDestructiveContent",
+        "hasDestructiveInput"
+      ]
+    },
+    {
+      "hash": "8f2dbddb366c03e8",
+      "lines": 6,
+      "files": [
+        "src/server/report-export.ts",
+        "src/server/store-runs.ts"
+      ],
+      "sampleNames": [
+        "<anonymous>"
+      ]
+    },
+    {
+      "hash": "96d645bf4205ff1b",
+      "lines": 13,
+      "files": [
+        "src/server/oracle-invariants.ts",
+        "src/server/proof-receipt.ts"
+      ],
+      "sampleNames": [
+        "impactStepToBooleanArm",
+        "stepToBooleanArm"
+      ]
+    },
+    {
+      "hash": "ab49d438cd3146f1",
+      "lines": 7,
+      "files": [
+        "src/server/broker.ts",
+        "src/server/scoped-browser.ts"
+      ],
+      "sampleNames": [
+        "collectSecrets"
+      ]
+    },
+    {
+      "hash": "ba71bf980880af8c",
+      "lines": 11,
+      "files": [
+        "src/server/derived-custody.ts",
+        "src/server/egress-sanitizer.ts"
+      ],
+      "sampleNames": [
+        "shannonEntropyBitsPerChar",
+        "shannonEntropyPerChar"
+      ]
+    },
+    {
+      "hash": "cb2bf062c99af43a",
+      "lines": 7,
+      "files": [
+        "src/server/dedupe.ts",
+        "src/server/resource-harvest.ts"
+      ],
+      "sampleNames": [
+        "decodePathSegment",
+        "decodeURIComponentSafe"
+      ]
+    },
+    {
+      "hash": "d16efc32b2a50158",
+      "lines": 7,
+      "files": [
+        "src/server/store-session.ts",
+        "src/server/store.ts"
+      ],
+      "sampleNames": [
+        "ensureColumn"
+      ]
+    },
+    {
+      "hash": "d387f9d183d360e7",
+      "lines": 7,
+      "files": [
+        "src/server/request-admission.ts",
+        "src/server/scope-policy.ts"
+      ],
+      "sampleNames": [
+        "skipWs"
+      ]
+    },
+    {
+      "hash": "dcf85f1d1505dfba",
+      "lines": 8,
+      "files": [
+        "src/server/broker.ts",
+        "src/server/finding-fingerprint.ts",
+        "src/server/route-template.ts"
+      ],
+      "sampleNames": [
+        "decodeCsrfValue",
+        "decodeSegmentSafe"
+      ]
+    },
+    {
+      "hash": "e51e1a585e2fee01",
+      "lines": 7,
+      "files": [
+        "src/server/host-fact-log.ts",
+        "src/server/proof-receipt.ts"
+      ],
+      "sampleNames": [
+        "normalizeOrigin",
+        "normalizeOriginKey"
+      ]
+    },
+    {
+      "hash": "f7b5da0f73a7835d",
+      "lines": 7,
+      "files": [
+        "src/server/egress-sanitizer.ts",
+        "src/server/redact.ts"
+      ],
+      "sampleNames": [
+        "sameNamedSecretList",
+        "sameSecretEntries"
+      ]
+    },
+    {
+      "hash": "fb8f8fef78378538",
+      "lines": 12,
+      "files": [
+        "src/server/container-supervisor.ts",
+        "src/server/worker-backend.ts"
+      ],
+      "sampleNames": [
+        "readProcStartTicks",
+        "readSupervisorStartTicks"
+      ]
+    }
+  ],
+  "ticketedSafetyPrimitiveDebt": [
+    {
+      "name": "isSensitiveRepoEntry",
+      "file": "src/server/exec-verify.ts",
+      "ticket": "R3-11",
+      "reason": "Kernel-lane file deferred to R3-11 (R3-05 review lane) to retire final duplicate into safety-primitives.ts."
+    },
+    {
+      "name": "isSensitiveRepoRelativePath",
+      "file": "src/server/exec-verify.ts",
+      "ticket": "R3-11",
+      "reason": "Kernel-lane file deferred to R3-11 (R3-05 review lane) to retire final duplicate into safety-primitives.ts."
+    }
+  ]
+}
