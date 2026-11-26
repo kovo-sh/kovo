@@ -74,7 +74,32 @@ export interface SynthesizeInvariantsInput {
 export interface SynthesizeInvariantsResult { mode: SynthesizerMode; guardMatrix?: GuardAsymmetryMatrixResult; trustBoundaries?: TrustBoundaryGraphResult; lifecycleSlices?: EntityLifecycleSlicesResult; runtimeParity?: RuntimeInvariantParityResult; hypotheses: InvariantHypothesis[]; capabilitySeeds: CapabilitySeedRecord[] }
 
 const WRAPPER_SEG_RE = /^(?:v\d+(?:\.\d+)?|api|rest|rpc|internal|private|public|external|edge|app|portal|admin|batch|bulk|stream|events|sse|ws|socket|graphql|gql|async|jobs|workers|exports|webhooks|callbacks|hooks|files|storage|download|upload|search|facets)$/i
-const PUBLIC_EXEMPT_RE = /\/(?:login|signin|sign-in|register|signup|sign-up|logout|health|healthz|ready|readyz|livez|metrics|status|ping|jwks|\.well-known|openid-configuration|favicon)(?:\/|$)/i
+const PUBLIC_EXEMPT_RE = /\/(?:login|signin|sign-in|register|signup|sign-up|logout|health|healthz|ready|readyz|livez|metrics|status|ping|jwks|\.well-known|openid-configuration|favicon)(?:\/|[?#]|$)/i
+const STATIC_ASSET_EXT_RE = /\.(?:png|svg|jpe?g|webp|gif|ico|css|m?js|map|woff2?|ttf|eot|avif|mp4|webm|pdf|txt|xml)(?:[?#]|$)/i
+const STATIC_ASSET_PREFIX_RE = /^\/(?:_next\/static\/|_next\/image(?:\/|[?#]|$)|static\/|assets\/|images\/|fonts\/|favicon(?:[./?#]|$))/i
+const ANONYMOUS_PERSONA_RE = /^(?:|anonymous|anon|unauthenticated|public)$/i
+const WCD_SENSITIVE_PATH_RE = /\/(?:profile|account|users?|me|settings|billing|orders?|invoices?|secrets?)\//i
+
+/** True when a persona label represents a real authenticated actor rather than anonymous traffic. */
+function isAuthenticatedPersona(persona?: string | null): boolean {
+  return typeof persona === 'string' && !ANONYMOUS_PERSONA_RE.test(persona.trim())
+}
+
+/** True when `path` is a public/health route or static CDN asset path/extension. */
+function isPublicOrStaticAssetPath(path: string): boolean {
+  const normalized = path.trim().replace(/^https?:\/\/[^/?#]+/i, '')
+  return PUBLIC_EXEMPT_RE.test(normalized) || STATIC_ASSET_PREFIX_RE.test(normalized) || STATIC_ASSET_EXT_RE.test(normalized)
+}
+
+/** True when an observation looks like an authenticated multi-tenant Web Cache Deception route rather than a static asset. */
+function isAuthenticatedWcdObservation(obs: PersonaSurfaceObservation): boolean {
+  const normalized = obs.path.trim().replace(/^https?:\/\/[^/?#]+/i, '')
+  return isAuthenticatedPersona(obs.persona)
+    && Boolean(obs.tenantId)
+    && obs.surface === 'cdn'
+    && !STATIC_ASSET_PREFIX_RE.test(normalized)
+    && WCD_SENSITIVE_PATH_RE.test(normalized)
+}
 const AUTH_GUARD_RE = /\b(?:auth(?:enticate|orize|Required|Middleware)?|requireAuth|ensureAuth|verify(?:Jwt|Token|Session|Bearer|Pat|Cookie)|jwtAuth|sessionAuth|passport|loginRequired|isAuthenticated|getSession|currentUser|req\.user|ctx\.user)\b/i
 const TENANT_GUARD_RE = /\b(?:tenant|org(?:anization)?|workspace|account|team|project)(?:Scope|Guard|Check|Isolation|Access|Match|Member|Filter|Context)|require(?:Tenant|Org|Workspace|Account)|enforceTenant|scopeBy(?:Tenant|Org|Workspace)|assert(?:Tenant|Org|Workspace)Access|where.*(?:tenantId|orgId|workspaceId)\b/i
 const ROLE_GUARD_RE = /\b(?:require(?:Admin|Owner|Role|Permission|Scope|Privilege|Approver|Finance)|check(?:Role|Permission|Scope|Rbac|Abac|Policy)|has(?:Role|Permission|Scope)|is(?:Admin|Owner|Staff|Superuser)|authorize(?:Role|Action|Policy)|rbac|abac|allowRoles|guardRole|minRole)\b/i
@@ -275,7 +300,7 @@ export function buildGuardAsymmetryMatrix(
     (a, b) => a.path.localeCompare(b.path) || a.method.localeCompare(b.method) || a.file.localeCompare(b.file) || a.line - b.line,
   )
   for (const route of orderedRoutes) {
-    if (PUBLIC_EXEMPT_RE.test(route.path)) continue
+    if (isPublicOrStaticAssetPath(route.path)) continue
     const handlerFile = route.handlerFile ?? route.file
     const handlerLine = route.handlerLine ?? route.line
     const src = fileMap.get(handlerFile) ?? fileMap.get(route.file)
@@ -603,7 +628,7 @@ export function buildEntityLifecycleSlices(graph: ProgramGraph, options: EntityL
   const clusters = new Map<string, ClusterCandidate>()
   const orderedRoutes = [...graph.routes].sort((a, b) => a.path.localeCompare(b.path) || a.method.localeCompare(b.method) || a.file.localeCompare(b.file) || a.line - b.line)
   for (const route of orderedRoutes) {
-    if (PUBLIC_EXEMPT_RE.test(route.path)) continue
+    if (isPublicOrStaticAssetPath(route.path)) continue
     const handlerFile = route.handlerFile ?? route.file, handlerLine = route.handlerLine ?? route.line
     const src = fileMap.get(handlerFile) ?? fileMap.get(route.file)
     const excerpt = src ? compactCodeExcerpt(src, handlerLine, 10) : `${route.method} ${route.path} -> ${route.handler}`
@@ -713,12 +738,12 @@ export function inferRuntimeInvariantHypotheses(input: RuntimeDiscoveryInput): R
   // 1. Multi-persona cross-surface, revocation & cache-key differentials.
   const obsByEntity = new Map<string, PersonaSurfaceObservation[]>()
   for (const obs of observations) {
-    if (PUBLIC_EXEMPT_RE.test(obs.path)) continue
+    if (isPublicOrStaticAssetPath(obs.path) && !isAuthenticatedWcdObservation(obs)) continue
     const entity = inferEntityName(obs.path, '', (obs.bodyKeys ?? []).join(' '))
     pushMap(obsByEntity, entity, obs)
     const headers = Object.fromEntries(Object.entries(obs.responseHeaders ?? {}).map(([k, v]) => [k.toLowerCase(), v]))
     const cc = headers['cache-control'] ?? '', vary = (headers['vary'] ?? '').toLowerCase()
-    if ((/(?:public|max-age=\d+|s-maxage=\d+)/i.test(cc) || /hit/i.test(headers['x-cache'] ?? '')) && isAllowedStatus(obs.status) && obs.persona && !/(?:authorization|cookie)/.test(vary)) {
+    if ((/(?:public|max-age=\d+|s-maxage=\d+)/i.test(cc) || /hit/i.test(headers['x-cache'] ?? '')) && isAllowedStatus(obs.status) && isAuthenticatedPersona(obs.persona) && !/(?:authorization|cookie)/.test(vary)) {
       hypotheses.push(makeHypothesis({
         id: stableId('hyp_rt_cache', `${obs.method}|${obs.path}|${obs.surface}`), kind: 'trust_boundary_mismatch', capabilityKind: 'parser_or_cache_primitive',
         mode: input.mode, entity, surface: obs.surface === 'http' ? 'cdn' : obs.surface, ...(obs.serviceOrigin ? { serviceOrigin: obs.serviceOrigin } : {}),
@@ -760,7 +785,7 @@ export function inferRuntimeInvariantHypotheses(input: RuntimeDiscoveryInput): R
   const catalogByEntity = new Map<string, CatalogOp[]>(), seenGql = new Set<string>()
   let gqlFieldCount = 0
   for (const op of openApiOps) {
-    if (PUBLIC_EXEMPT_RE.test(op.path)) continue
+    if (isPublicOrStaticAssetPath(op.path)) continue
     pushMap(catalogByEntity, inferEntityName(op.path, op.operationId ?? '', `${(op.requestBodyKeys ?? []).join(' ')} ${(op.parameters ?? []).join(' ')} ${(op.tags ?? []).join(' ')}`), {
       surface: classifySurface(op.path, op.method, op.operationId ?? ''), method: op.method.toUpperCase(), path: op.path,
       hasAuth: hasOpenApiAuth(op), hasRoleGuard: hasOpenApiRoleRestriction(op), isBatch: BATCH_HINT_RE.test(op.path) || BATCH_HINT_RE.test(op.operationId ?? ''),
@@ -859,7 +884,7 @@ export function inferRuntimeInvariantHypotheses(input: RuntimeDiscoveryInput): R
   const parsedDeps: ParsedDep[] = [], depsByProd = new Map<string, ParsedDep[]>()
   for (const dep of apiDependencies) {
     const prod = parseMethodAndPath(dep.producer), cons = parseMethodAndPath(dep.consumer)
-    if (!prod.path.startsWith('/') || !cons.path.startsWith('/') || (PUBLIC_EXEMPT_RE.test(prod.path) && PUBLIC_EXEMPT_RE.test(cons.path))) continue
+    if (!prod.path.startsWith('/') || !cons.path.startsWith('/') || (isPublicOrStaticAssetPath(prod.path) && isPublicOrStaticAssetPath(cons.path))) continue
     const pp = normalizeDepPath(prod.path), cp = normalizeDepPath(cons.path)
     const item: ParsedDep = {
       raw: dep, pm: prod.method, pp, cm: cons.method, cp, entity: inferEntityName(cp, dep.resourceKey, `${pp} ${(dep.observedTransitions ?? []).join(' ')}`),
