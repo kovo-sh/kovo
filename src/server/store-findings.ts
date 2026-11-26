@@ -37,6 +37,13 @@ import type {
   FindingVerificationClass,
 } from '../report-summary.ts'
 import {
+  appendCoverageEvidenceMetadata,
+  categoryToOwaspCoverageCategory,
+  coverageStatusRank,
+  extractCoverageEvidenceMetadata,
+  normalizeOriginForCoverage,
+} from './coverage-category.ts'
+import {
   FindingCodec,
   operatorSeverityOverrides,
   operatorTriageStatuses,
@@ -1909,12 +1916,85 @@ export class FindingsRepository {
     enforcingControl?: string | null
     proofGapReason?: string | null
     linkedFindingId?: string | null
+    route?: string | null
+    branchKey?: string | null
+    exchangeIds?: readonly string[]
   }): CoverageEntry {
     this.assertTenantRun(run.id)
     const cleanControl = input.enforcingControl?.trim() ? redact(input.enforcingControl.trim().slice(0, 600)) : null
     const cleanGapReason = input.proofGapReason?.trim() ? redact(input.proofGapReason.trim().slice(0, 600)) : null
     const linkedFindingId = input.linkedFindingId?.trim() || null
-    const cleanSummary = redact(input.summary.slice(0, 600))
+    const cleanSummaryBase = redact(input.summary.slice(0, 600))
+    const targetOrigin = normalizeOriginForCoverage(input.origin)
+
+    const candidateExchangeIds = [...new Set([
+      ...(input.exchangeIds ?? []),
+      ...(input.enforcingControl
+        ? [
+            ...(input.enforcingControl.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi) ?? []),
+            ...(input.enforcingControl.match(/\b(?:gx|ex)[_-][A-Za-z0-9._-]{2,80}\b/g) ?? []),
+          ]
+        : []),
+    ].map(id => id.trim()).filter(Boolean))]
+
+    const requiresExchangeEvidence = input.status === 'no_issue_found' || input.status === 'ruled_out'
+    if (requiresExchangeEvidence || candidateExchangeIds.length > 0) {
+      // Flush queued broker exchanges so newly recorded run exchanges are visible before verification.
+      this.session.flushNow()
+    }
+
+    let verifiedExchangeIds: string[] = []
+    let inferredRouteFromExchange: string | null = null
+    if (candidateExchangeIds.length > 0) {
+      const matchedRows = this.session.db.select({
+        id: tables.brokerExchanges.id,
+        origin: tables.brokerExchanges.origin,
+        method: tables.brokerExchanges.method,
+        pathAndQuery: tables.brokerExchanges.pathAndQuery,
+      })
+        .from(tables.brokerExchanges)
+        .where(and(
+          eq(tables.brokerExchanges.runId, run.id),
+          inArray(tables.brokerExchanges.id, candidateExchangeIds),
+        ))
+        .all()
+      const rowById = new Map(matchedRows.map(r => [r.id, r]))
+      for (const id of candidateExchangeIds) {
+        const row = rowById.get(id)
+        if (!row) continue
+        if (normalizeOriginForCoverage(row.origin) !== targetOrigin) continue
+        verifiedExchangeIds.push(row.id)
+        if (!inferredRouteFromExchange) {
+          const pathOnly = row.pathAndQuery.split('?')[0] || '/'
+          inferredRouteFromExchange = `${row.method.toUpperCase()} ${pathOnly}`
+        }
+      }
+      verifiedExchangeIds = [...new Set(verifiedExchangeIds)]
+    }
+
+    if (requiresExchangeEvidence && verifiedExchangeIds.length === 0) {
+      const reason = candidateExchangeIds.length === 0
+        ? `Coverage status "${input.status}" requires at least one run-owned, origin-matched exchangeId proving the route was probed.`
+        : `Coverage status "${input.status}" rejected: none of the supplied exchangeIds (${candidateExchangeIds.slice(0, 5).join(', ')}) belong to run ${run.id} for origin ${input.origin}.`
+      throw new InvariantError('COVERAGE_EVIDENCE_REQUIRED', reason)
+    }
+
+    const cleanRoute = input.route?.trim()
+      ? redact(input.route.trim().slice(0, 200))
+      : inferredRouteFromExchange
+    const cleanBranchKey = input.branchKey?.trim() ? redact(input.branchKey.trim().slice(0, 160)) : null
+
+    const isFindingSupersededOrDismissed = (row: {
+      supersededByFindingId: string | null
+      finding: Finding
+    }): boolean => {
+      if (row.supersededByFindingId || row.finding.supersededByFindingId) return true
+      if (row.finding.status === 'dismissed') return true
+      const triageStatus = (row.finding as Finding & { operatorTriage?: { status?: string } }).operatorTriage?.status
+      if (triageStatus === 'false_positive') return true
+      return false
+    }
+
     return this.session.transaction(() => {
       const now = Date.now()
       const existing = this.session.db.select().from(tables.coverageEntries).where(and(
@@ -1923,15 +2003,113 @@ export class FindingsRepository {
         eq(tables.coverageEntries.origin, input.origin),
         eq(tables.coverageEntries.category, input.category),
       )).get()
+
+      const runFindings = this.session.db.select({
+        id: tables.findings.id,
+        supersededByFindingId: tables.findings.supersededByFindingId,
+        finding: tables.findings.finding,
+      })
+        .from(tables.findings)
+        .where(and(
+          eq(tables.findings.runId, run.id),
+          eq(tables.findings.goalRevision, run.goalRevision),
+        ))
+        .all()
+
+      const activeConfirmedForCell = runFindings.find(row =>
+        !isFindingSupersededOrDismissed(row)
+        && row.finding.status === 'confirmed'
+        && normalizeOriginForCoverage(row.finding.origin) === targetOrigin
+        && categoryToOwaspCoverageCategory(row.finding.category) === input.category,
+      )
+
+      const existingMeta = existing ? extractCoverageEvidenceMetadata(existing) : null
+      const mergedRoutes = [...new Set([
+        ...(existingMeta?.routes ?? []),
+        ...(cleanRoute ? [cleanRoute] : []),
+      ])]
+      const mergedExchangeIds = [...new Set([
+        ...(existingMeta?.exchangeIds ?? []),
+        ...verifiedExchangeIds,
+      ])]
+      const mergedBranchKey = cleanBranchKey ?? existingMeta?.branchKey ?? null
+
+      let effectiveStatus: CoverageEntry['status'] = input.status
+      let effectiveLinkedFindingId: string | null = linkedFindingId
+      let effectiveSummaryBase = cleanSummaryBase
+
+      if (input.status !== 'reported') {
+        let blockDemotion = false
+        let allowDemotionFromReported = false
+        let preservedFindingId: string | null = null
+
+        if (existing?.status === 'reported') {
+          if (existing.linkedFindingId) {
+            const linkedRow = runFindings.find(r => r.id === existing.linkedFindingId)
+              ?? this.session.db.select({
+                id: tables.findings.id,
+                supersededByFindingId: tables.findings.supersededByFindingId,
+                finding: tables.findings.finding,
+              })
+                .from(tables.findings)
+                .where(and(eq(tables.findings.runId, run.id), eq(tables.findings.id, existing.linkedFindingId)))
+                .get()
+            const linkedDemotable = linkedRow ? isFindingSupersededOrDismissed(linkedRow) : false
+            if (linkedDemotable) {
+              allowDemotionFromReported = true
+            } else {
+              blockDemotion = true
+              preservedFindingId = existing.linkedFindingId
+            }
+          } else {
+            // A reported cell with no linked finding id cannot prove its finding was superseded/dismissed.
+            blockDemotion = true
+          }
+        }
+
+        if (!blockDemotion && activeConfirmedForCell) {
+          blockDemotion = true
+          preservedFindingId = activeConfirmedForCell.id
+        }
+
+        if (blockDemotion) {
+          effectiveStatus = 'reported'
+          effectiveLinkedFindingId = preservedFindingId ?? existing?.linkedFindingId ?? null
+          if (existing?.status === 'reported') {
+            effectiveSummaryBase = existing.summary
+          } else if (activeConfirmedForCell) {
+            effectiveSummaryBase = redact(`Confirmed finding active: ${activeConfirmedForCell.finding.title}`.slice(0, 600))
+          }
+        } else if (!allowDemotionFromReported && existing && coverageStatusRank(input.status) < coverageStatusRank(existing.status)) {
+          effectiveStatus = existing.status
+          effectiveLinkedFindingId = existing.linkedFindingId
+          effectiveSummaryBase = existing.summary
+        } else {
+          effectiveLinkedFindingId = null
+        }
+      } else {
+        effectiveLinkedFindingId = linkedFindingId ?? existing?.linkedFindingId ?? activeConfirmedForCell?.id ?? null
+      }
+
+      const finalSummary = appendCoverageEvidenceMetadata(effectiveSummaryBase, {
+        routes: mergedRoutes,
+        branchKey: mergedBranchKey,
+        exchangeIds: mergedExchangeIds,
+      })
+
       if (existing) {
         return this.session.db.update(tables.coverageEntries).set({
           scopeRevision: run.scopeRevision,
-          status: input.status,
-          summary: cleanSummary,
-          enforcingControl: cleanControl ?? (input.status === 'ruled_out' ? existing.enforcingControl : null),
-          proofGapReason: cleanGapReason ?? (input.status === 'needs_follow_up' ? existing.proofGapReason : null),
-          linkedFindingId: linkedFindingId ?? (input.status === 'reported' ? existing.linkedFindingId : null),
-          assignmentId,
+          status: effectiveStatus,
+          summary: finalSummary,
+          enforcingControl: effectiveStatus === 'ruled_out'
+            ? (cleanControl ?? existing.enforcingControl)
+            : (effectiveStatus === 'reported' ? existing.enforcingControl : cleanControl),
+          proofGapReason: effectiveStatus === 'needs_follow_up'
+            ? (cleanGapReason ?? existing.proofGapReason)
+            : (effectiveStatus === 'reported' ? existing.proofGapReason : cleanGapReason),
+          linkedFindingId: effectiveStatus === 'reported' ? effectiveLinkedFindingId : null,
+          assignmentId: effectiveStatus === 'reported' && input.status !== 'reported' ? existing.assignmentId : assignmentId,
           updatedAt: now,
         }).where(eq(tables.coverageEntries.id, existing.id)).returning().get()!
       }
@@ -1942,11 +2120,11 @@ export class FindingsRepository {
         goalRevision: run.goalRevision,
         origin: input.origin,
         category: input.category,
-        status: input.status,
-        summary: cleanSummary,
-        enforcingControl: cleanControl,
-        proofGapReason: cleanGapReason,
-        linkedFindingId,
+        status: effectiveStatus,
+        summary: finalSummary,
+        enforcingControl: effectiveStatus === 'ruled_out' ? cleanControl : null,
+        proofGapReason: effectiveStatus === 'needs_follow_up' ? cleanGapReason : (cleanGapReason ?? null),
+        linkedFindingId: effectiveStatus === 'reported' ? effectiveLinkedFindingId : null,
         assignmentId,
         updatedAt: now,
       }).returning().get()

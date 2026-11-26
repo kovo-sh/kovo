@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs'
 import { lstat, readdir, readFile } from 'node:fs/promises'
 import { basename, extname, isAbsolute, join, relative, resolve as resolvePath, sep } from 'node:path'
-import { and, asc, eq } from 'drizzle-orm'
+import { and, asc, eq, inArray } from 'drizzle-orm'
 import {
   defaultWorkerConcurrency,
   isLocalLabEnvEnabled,
@@ -57,6 +57,7 @@ import {
   type CapabilitySurface,
   type HopCheckpointBrief,
 } from './capability-ledger.ts'
+import { extractCoverageEvidenceMetadata, normalizeOriginForCoverage } from './coverage-category.ts'
 import { extractSpecDedupeFields, normalizeEndpointTemplate } from './dedupe.ts'
 import { normalizeRouteTemplate } from './route-template.ts'
 import { meetsBaseline, type EvidenceReview } from './evidence-checks.ts'
@@ -208,7 +209,7 @@ import {
   type SupervisedTask,
 } from './run-actor.ts'
 import { resolveRunSafetyBudgets } from './run-safety-budgets.ts'
-import { coverageEntries, findings, messages, type ChainStepRetryableStatus } from './schema.ts'
+import { brokerExchanges, coverageEntries, findings, messages, type ChainStepRetryableStatus } from './schema.ts'
 import { runVariantSweepForFinding } from './semantic-audit.ts'
 import type { StaticWorkspaceSnapshot } from './static-workspace-snapshot.ts'
 import type { Assignment, ChainStep, Fact, Run, Store } from './store.ts'
@@ -1958,6 +1959,53 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
   private get stepIdsByRun() { return this.runState.mapView('stepIds') }
   private get runLifecycleUnsubs() { return this.runState.mapView('runLifecycleUnsub') }
   private get labRunner() { return this.host.labRunner }
+  private readonly emittedPreconditionUnmetByRun = new Map<string, Set<string>>()
+
+  private emitPreconditionUnmet(
+    runId: string,
+    input: {
+      dedupeKey: string
+      origin: string
+      precondition: 'tier' | 'persona_count' | 'browser' | 'canary'
+      vulnClass: string
+      required: string
+      observed: string
+      method?: string
+      route?: string
+      skippedCount?: number
+      source: string
+    },
+  ): void {
+    let seen = this.emittedPreconditionUnmetByRun.get(runId)
+    if (!seen) {
+      seen = new Set<string>()
+      this.emittedPreconditionUnmetByRun.set(runId, seen)
+    }
+    if (seen.has(input.dedupeKey)) return
+    seen.add(input.dedupeKey)
+    const method = (input.method ?? 'ANY').toUpperCase()
+    const route = input.route?.trim() || '*'
+    const skippedCount = Math.max(1, Math.floor(input.skippedCount ?? 1))
+    try {
+      this.storage.event(
+        runId,
+        'coverage.precondition_unmet',
+        `Precondition unmet (${input.precondition}: need ${input.required}, got ${input.observed}) skipped ${input.vulnClass} on ${method} ${route}.`,
+        {
+          origin: input.origin,
+          precondition: input.precondition,
+          vulnClass: input.vulnClass,
+          class: input.vulnClass,
+          method,
+          route,
+          required: input.required,
+          observed: input.observed,
+          skippedCount,
+          source: input.source,
+        },
+      )
+    } catch { /* observational telemetry is best-effort */ }
+  }
 
   constructor(host: ExecReconPlannerHost) {
     super(host)
@@ -1978,6 +2026,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     }
     this.retryCountsByRun.delete(runId)
     this.invariantsSeedingInFlight.delete(runId)
+    this.emittedPreconditionUnmetByRun.delete(runId)
     if (this.ownRunState) {
       this.ownRunState.disposeRun(runId)
     } else if (state) {
@@ -2804,7 +2853,24 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       maxSteps?: number
     } = {},
   ): string[] {
-    if (run.capabilityTier <= 0) return []
+    if (run.capabilityTier <= 0) {
+      if (synthesis.hypotheses.length > 0) {
+        const origins = [...(options.approvedOrigins ?? this.host.approvedOriginsSet(run))]
+        this.emitPreconditionUnmet(run.id, {
+          dedupeKey: `wave1_invariants:tier:${run.capabilityTier}`,
+          origin: origins[0] ?? 'run',
+          precondition: 'tier',
+          vulnClass: 'chain-invariants',
+          required: 'tier>=1',
+          observed: `tier=${run.capabilityTier}`,
+          method: 'ANY',
+          route: '*',
+          skippedCount: synthesis.hypotheses.length,
+          source: 'planner.promote_wave1_invariants',
+        })
+      }
+      return []
+    }
     const approvedOrigins = options.approvedOrigins ?? this.host.approvedOriginsSet(run)
     if (!approvedOrigins.size) return []
     const quarantinedSet = this.getQuarantinedOriginSet(run, approvedOrigins)
@@ -3982,6 +4048,22 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
           }
         }
         try {
+          const phase0Browser = freshRun.capabilityTier >= 2 ? this.browser : undefined
+          if (!phase0Browser) {
+            const firstOrigin = [...approvedOrigins][0] ?? 'run'
+            this.emitPreconditionUnmet(freshRun.id, {
+              dedupeKey: `phase0:browser:${freshRun.capabilityTier}`,
+              origin: firstOrigin,
+              precondition: freshRun.capabilityTier < 2 ? 'tier' : 'browser',
+              vulnClass: 'dom-xss',
+              required: freshRun.capabilityTier < 2 ? 'tier>=2' : 'browser_available',
+              observed: freshRun.capabilityTier < 2 ? `tier=${freshRun.capabilityTier}` : 'browser=unavailable',
+              method: 'GET',
+              route: '*',
+              skippedCount: Math.max(1, approvedOrigins.size),
+              source: 'planner.phase0_browser_crawl',
+            })
+          }
           const reconResult = await runPhase0Recon({
             storage: this.storage,
             runId: freshRun.id,
@@ -3992,7 +4074,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
             reposDir,
             personas: [...(grant.personas?.keys() ?? [])],
             broker: this.broker,
-            browser: freshRun.capabilityTier >= 2 ? this.browser : undefined,
+            browser: phase0Browser,
             canaryBroker: this.canaryBroker,
             grant,
             signal: task.controller.signal,
@@ -4616,18 +4698,31 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
   /** Assignments in `runId` that achieved a proved finding or a coded proof-gap / settled coverage verdict. */
   private provedOrGapCodedAssignmentIds(runId: string): Set<string> {
     const covered = new Set<string>()
+    const activeConfirmedFindingIds = new Set<string>()
+    const inactiveFindingIds = new Set<string>()
     try {
-      const confirmedFindingIds = new Set(
-        this.storage.db.select({ id: findings.id, finding: findings.finding })
-          .from(findings)
-          .where(eq(findings.runId, runId))
-          .all()
-          .filter(row => row.finding.status === 'confirmed')
-          .map(row => row.id),
-      )
-      if (confirmedFindingIds.size > 0) {
+      const findingRows = this.storage.db.select({
+        id: findings.id,
+        supersededByFindingId: findings.supersededByFindingId,
+        finding: findings.finding,
+      })
+        .from(findings)
+        .where(eq(findings.runId, runId))
+        .all()
+      for (const row of findingRows) {
+        const triageStatus = (row.finding as Finding & { operatorTriage?: { status?: string } }).operatorTriage?.status
+        const isInactive = Boolean(row.supersededByFindingId || row.finding.supersededByFindingId)
+          || row.finding.status === 'dismissed'
+          || triageStatus === 'false_positive'
+        if (isInactive) {
+          inactiveFindingIds.add(row.id)
+        } else if (row.finding.status === 'confirmed') {
+          activeConfirmedFindingIds.add(row.id)
+        }
+      }
+      if (activeConfirmedFindingIds.size > 0) {
         for (const spec of this.storage.listReplaySpecs(runId)) {
-          if (confirmedFindingIds.has(spec.findingId) && spec.assignmentId) {
+          if (activeConfirmedFindingIds.has(spec.findingId) && spec.assignmentId) {
             covered.add(spec.assignmentId)
           }
         }
@@ -4638,20 +4733,55 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     try {
       const rows = this.storage.db.select({
         assignmentId: coverageEntries.assignmentId,
+        origin: coverageEntries.origin,
         status: coverageEntries.status,
+        summary: coverageEntries.summary,
+        enforcingControl: coverageEntries.enforcingControl,
         proofGapReason: coverageEntries.proofGapReason,
+        linkedFindingId: coverageEntries.linkedFindingId,
       })
         .from(coverageEntries)
         .where(eq(coverageEntries.runId, runId))
         .all()
-      for (const row of rows) {
+
+      // Batch-verify all exchangeIds embedded in coverage rows against run-owned broker_exchanges.
+      const candidateExchangeIds = new Set<string>()
+      const metaByRow = rows.map(row => {
+        const meta = extractCoverageEvidenceMetadata(row)
+        for (const id of meta.exchangeIds) candidateExchangeIds.add(id)
+        return meta
+      })
+      const exchangeOriginById = new Map<string, string>()
+      if (candidateExchangeIds.size > 0) {
+        this.storage.flushNow()
+        const exRows = this.storage.db.select({
+          id: brokerExchanges.id,
+          origin: brokerExchanges.origin,
+        })
+          .from(brokerExchanges)
+          .where(and(
+            eq(brokerExchanges.runId, runId),
+            inArray(brokerExchanges.id, [...candidateExchangeIds]),
+          ))
+          .all()
+        for (const ex of exRows) {
+          exchangeOriginById.set(ex.id, normalizeOriginForCoverage(ex.origin))
+        }
+      }
+
+      for (let i = 0; i < rows.length; i += 1) {
+        const row = rows[i]!
+        const meta = metaByRow[i]!
         if (!row.assignmentId) continue
         const hasCodedGap = typeof row.proofGapReason === 'string' && row.proofGapReason.trim().length > 0
-        const settledVerdict = row.status === 'reported'
-          || row.status === 'ruled_out'
-          || row.status === 'not_applicable'
-          || row.status === 'no_issue_found'
-        if (hasCodedGap || settledVerdict) covered.add(row.assignmentId)
+        const isProved = row.status === 'reported'
+          && (!row.linkedFindingId || !inactiveFindingIds.has(row.linkedFindingId))
+        const rowOrigin = normalizeOriginForCoverage(row.origin)
+        const hasVerifiedExchangeEvidence = (row.status === 'ruled_out' || row.status === 'no_issue_found')
+          && meta.exchangeIds.some(id => exchangeOriginById.get(id) === rowOrigin)
+        if (isProved || hasCodedGap || hasVerifiedExchangeEvidence) {
+          covered.add(row.assignmentId)
+        }
       }
     } catch (err) {
       this.noteLifecycleWarning(runId, 'provedOrGapCodedAssignmentIds.coverage', err)
@@ -6431,6 +6561,22 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     )
     const confirmedBolaSets = buildConfirmedRouteSets(confirmedBolaRefs)
     let bolaAutoSteps = 0
+    if (updated.capabilityTier < 2 || personas.length < 2) {
+      for (const origin of activeOrigins) {
+        this.emitPreconditionUnmet(updated.id, {
+          dedupeKey: `planner_bola:${origin}:${updated.capabilityTier < 2 ? 'tier' : 'persona_count'}`,
+          origin,
+          precondition: updated.capabilityTier < 2 ? 'tier' : 'persona_count',
+          vulnClass: 'bola',
+          required: updated.capabilityTier < 2 ? 'tier>=2' : 'personas>=2',
+          observed: updated.capabilityTier < 2 ? `tier=${updated.capabilityTier}` : `personas=${personas.length}`,
+          method: 'ANY',
+          route: '*',
+          skippedCount: 1,
+          source: 'planner.bola_matrix_guard',
+        })
+      }
+    }
     if (updated.capabilityTier >= 2 && personas.length >= 2 && allSteps.length < dynamicStepBudget) {
       const typeGroups = new Map<string, BolaTestQueueItem[]>()
       for (const item of buildBolaTestQueue(allUntaintedFacts, personas, activeOrigins, this.storage.listResourceSamples(run.id))) {

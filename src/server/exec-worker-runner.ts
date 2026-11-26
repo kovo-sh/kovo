@@ -45,6 +45,7 @@ import {
   type Grant,
 } from './broker.ts'
 import { DERIVED_CAPABILITY_HANDLE_RE, type NegativeEdge } from './capability-ledger.ts'
+import { extractCoverageEvidenceMetadata } from './coverage-category.ts'
 import { queryCves } from './cve-broker.ts'
 import { vaultScrubDescriptors, type DerivedCapabilityVault } from './derived-custody.ts'
 import { createEgressSanitizer } from './egress-sanitizer.ts'
@@ -814,18 +815,22 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
           enforcingControl: ext.enforcingControl,
           proofGapReason: args.status === 'needs_follow_up' ? (ext.proofGapReason?.trim() || args.summary) : ext.proofGapReason,
           linkedFindingId: ext.linkedFindingId,
+          route: ext.route,
+          branchKey: ext.branchKey,
+          exchangeIds: ext.exchangeIds,
         })
+        const storedMeta = extractCoverageEvidenceMetadata(entry)
         const neg = this.recordNegativeEdgeCoverage(curRun.id, {
           origin: cleanOrigin,
           category: args.category,
           summary: args.summary,
           proofGapReason: ext.proofGapReason,
-          route: ext.route,
+          route: ext.route ?? storedMeta.route ?? undefined,
           enforcingControl: ext.enforcingControl,
           preconditionCapIds: ext.preconditionCapIds,
-          branchKey: ext.branchKey,
+          branchKey: ext.branchKey ?? storedMeta.branchKey ?? undefined,
           hypothesisClass: ext.hypothesisClass,
-          exchangeIds: ext.exchangeIds,
+          exchangeIds: storedMeta.exchangeIds.length > 0 ? storedMeta.exchangeIds : ext.exchangeIds,
           assignmentId: job.assignment.id,
         })
         return {
@@ -833,6 +838,9 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
           origin: entry.origin,
           category: entry.category,
           status: entry.status,
+          ...(storedMeta.route ? { route: storedMeta.route } : {}),
+          ...(storedMeta.exchangeIds.length > 0 ? { exchangeIds: storedMeta.exchangeIds } : {}),
+          ...(entry.status !== args.status ? { monotonePreserved: true } : {}),
           ...(neg.recorded ? { negativeEdgeRecorded: true, pruned: neg.pruned, attemptCount: neg.attemptCount } : {}),
         }
       },
