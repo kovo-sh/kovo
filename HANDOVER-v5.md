@@ -192,7 +192,7 @@ Use [VERIFICATION-v5.md §10](VERIFICATION-v5.md#10-reproduction).
 
 ```bash
 # Shipped runtime scorecard A
-newgrp docker -c 'cd /path/to/guardian && export GUARDIAN_ALLOW_LOCAL_LAB=1 GUARDIAN_DATA_DIR=/home/omarchy/guardian-data && node scripts/benchmark-realistic.ts --app all --seeds 1 --mode grey-box --verifier docker --isolate-data-dir --concurrency 3 --budget-usd 2 --max-duration-ms 600000 --out-dir /tmp/v5-runtime-agentic'
+newgrp docker -c 'cd /path/to/guardian && export GUARDIAN_ALLOW_LOCAL_LAB=1 GUARDIAN_DATA_DIR="$HOME/guardian-data" && node scripts/benchmark-realistic.ts --app all --seeds 1 --mode grey-box --verifier docker --isolate-data-dir --concurrency 3 --budget-usd 2 --max-duration-ms 600000 --out-dir /tmp/v5-runtime-agentic'
 
 # No-LLM baseline (0/59 on v5.0)
 newgrp docker -c 'cd /path/to/guardian && export GUARDIAN_ALLOW_LOCAL_LAB=1 && node scripts/benchmark-realistic.ts --app all --seeds 1 --mode grey-box --no-llm --verifier docker --isolate-data-dir --concurrency 3 --budget-usd 2 --max-duration-ms 600000 --out-dir /tmp/v5-runtime-no-llm'

@@ -83,7 +83,7 @@ scoped task to **OpenCode** in an isolated git worktree:
    safe even while a verifier is running; prefer a spacious parent directory if
    `/tmp` is small):
    ```bash
-   WT="/home/omarchy/.cache/opencode-wt/<stream>"
+   WT="${XDG_CACHE_HOME:-$HOME/.cache}/opencode-wt/<stream>"
    mkdir -p "$(dirname "$WT")"
    git -C <repo> worktree add -b "opencode/<stream>" "$WT" HEAD
    ```

@@ -43,7 +43,7 @@
  *
  * Usage:
  *   KOVO_ALLOW_LOCAL_LAB=1 npm run certify:phase1 -- --run \
- *     --data-dir /home/omarchy/guardian-data --verifier docker --use-newgrp
+ *     --data-dir "$HOME/guardian-data" --verifier docker --use-newgrp
  *   npm run certify:phase1 -- --from-dir /tmp/v6-floor-post --from-dir /tmp/preserve
  */
 import { execFileSync, spawn } from 'node:child_process'

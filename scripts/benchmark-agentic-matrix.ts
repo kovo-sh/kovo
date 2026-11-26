@@ -14,7 +14,7 @@
  * Usage:
  *   newgrp docker -c 'KOVO_ALLOW_LOCAL_LAB=1 node scripts/benchmark-agentic-matrix.ts \
  *     --apps acme-saas,shopflow,opsportal --seeds 1,1000042 --modes grey-box \
- *     --data-dir /home/omarchy/guardian-data --verifier docker \
+ *     --data-dir "$HOME/guardian-data" --verifier docker \
  *     --budget-usd 5 --max-duration-ms 1200000 --concurrency 3 \
  *     --out-dir /tmp/agentic-matrix'
  *

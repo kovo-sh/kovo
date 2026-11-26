@@ -59,8 +59,8 @@ nonexistent-id path). The floor had rejected the same target at the spec stage
 Commands (salt from the owner-only file, never printed):
 
 ```sh
-KOVO_ALLOW_LOCAL_LAB=1 KOVO_DATA_DIR=/home/omarchy/guardian-data \
-KOVO_RB_HELDOUT_SALT="$(cat /home/omarchy/.config/guardian-bench/heldout.salt)" \
+KOVO_ALLOW_LOCAL_LAB=1 KOVO_DATA_DIR="$HOME/guardian-data" \
+KOVO_RB_HELDOUT_SALT="$(cat "$HOME/.config/guardian-bench/heldout.salt")" \
   newgrp docker -c 'cd <worktree> && node scripts/benchmark-realistic.ts \
     --app acme-saas --seed 1000042 --held-out --mode grey-box --concurrency 1 \
     --worker-concurrency 4 --verifier docker --budget-usd 5 --max-duration-ms 600000 \

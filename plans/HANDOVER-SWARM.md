@@ -160,28 +160,28 @@ Done but unvalidated end-to-end: JWT hypothesis for reporting/integration reads 
 bash scripts/worker-gate.sh
 
 # Dev floor (no model, cheap)
-newgrp docker -c 'cd /home/omarchy/kovo-hunter && KOVO_ALLOW_LOCAL_LAB=1 \
+newgrp docker -c 'cd <repo-root> && KOVO_ALLOW_LOCAL_LAB=1 \
   node scripts/benchmark-realistic.ts --app all --seeds 1 --mode grey-box --no-llm \
   --verifier docker --no-conventional-wordlist --isolate-data-dir --concurrency 1 \
   --budget-usd 2 --max-duration-ms 600000 --out-dir /tmp/floor-x'
 
 # Salted held-out floor (never print the salt)
-newgrp docker -c 'cd /home/omarchy/kovo-hunter && KOVO_ALLOW_LOCAL_LAB=1 \
-  KOVO_RB_HELDOUT_SALT="$(cat /home/omarchy/.config/guardian-bench/heldout.salt)" \
+newgrp docker -c 'cd <repo-root> && KOVO_ALLOW_LOCAL_LAB=1 \
+  KOVO_RB_HELDOUT_SALT="$(cat "$HOME/.config/guardian-bench/heldout.salt")" \
   node scripts/benchmark-realistic.ts --app all --seeds 1000042 --held-out --mode grey-box \
   --no-llm --verifier docker --isolate-data-dir --concurrency 1 --budget-usd 2 \
   --max-duration-ms 600000 --out-dir /tmp/heldout-x'
 
 # Agentic cell (SERIALIZED: --data-dir takes an exclusive lock)
-newgrp docker -c 'cd /home/omarchy/kovo-hunter && KOVO_ALLOW_LOCAL_LAB=1 \
-  KOVO_RB_HELDOUT_SALT="$(cat /home/omarchy/.config/guardian-bench/heldout.salt)" \
+newgrp docker -c 'cd <repo-root> && KOVO_ALLOW_LOCAL_LAB=1 \
+  KOVO_RB_HELDOUT_SALT="$(cat "$HOME/.config/guardian-bench/heldout.salt")" \
   node scripts/benchmark-realistic.ts --app shopflow --seeds 1000042 --held-out --mode grey-box \
   --verifier docker --isolate-data-dir --keep-data-dirs --concurrency 1 --worker-concurrency 6 \
-  --budget-usd 5 --max-duration-ms 600000 --data-dir /home/omarchy/guardian-data \
+  --budget-usd 5 --max-duration-ms 600000 --data-dir "$HOME/guardian-data" \
   --out-dir /tmp/agentic-x'
 
 # Realism suites
-newgrp docker -c 'cd /home/omarchy/kovo-hunter && KOVO_ALLOW_LOCAL_LAB=1 \
+newgrp docker -c 'cd <repo-root> && KOVO_ALLOW_LOCAL_LAB=1 \
   node scripts/benchmark-realism.ts --fixture wan-oob --no-llm --verifier docker --out-dir /tmp/r2'
 node scripts/smoke-agentic.ts --tier 1 --out-dir /tmp/smoke   # ~6 min, ~$1.30, includes the precision trap
 
@@ -194,7 +194,7 @@ node scripts/audit-confirmation-consistency.ts --data-dir /tmp/x/data/<cell>
 - `--data-dir` holds an **exclusive SQLite lock** (model profile) ⇒ **agentic runs are globally serialized**. Floor runs don't need it.
 - 29 GB RAM; concurrent benchmark cells cause SIGTERMs and hung cells. One benchmark at a time.
 - Docker needs `newgrp docker -c '…'`.
-- Model profile: `KOVO_DATA_DIR=/home/omarchy/guardian-data` (OpenRouter DeepSeek V4.1 Flash). Credentials live outside the repo; never print or commit them.
+- Model profile: `KOVO_DATA_DIR="$HOME/guardian-data"` (OpenRouter DeepSeek V4.1 Flash). Credentials live outside the repo; never print or commit them.
 
 ---
 

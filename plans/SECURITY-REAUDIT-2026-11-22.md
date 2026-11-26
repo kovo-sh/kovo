@@ -1,7 +1,7 @@
 # Kovo Hunter security re-audit (adversarial, read-only)
 
 - Date: 2026-11-22
-- Repo: `/home/omarchy/kovo-hunter`
+- Repo: `<repo-root>`
 - HEAD: `3c0a547` (merge of `probe-split` + compat audit)
 - Fix commits in scope (all confirmed ancestors of HEAD): `6350a4f` (Tier-3 approvals), `ad853ab`/`fec9df8` (session/IdP/browser), `dbcc773` (repo/worker/lab).
 - Method: trace real call paths, then try to refute each claim with targeted `node --test` runs and small throw-away probes under `/tmp` (no repo/source edits, no benchmarks, no commits).
