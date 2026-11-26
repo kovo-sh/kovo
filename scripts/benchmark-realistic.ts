@@ -206,6 +206,8 @@ export interface RealisticArgs {
   ledgerPath?: string
   /** Escape hatch for ad-hoc scratch/dry-runs: disable default per-run ledger emission. */
   noLedger?: boolean
+  /** R3-19: Use opaque UI-style role labels ('Account 1', 'Account 2', ...) alongside typed tenantRef & privilege. */
+  opaqueLabels: boolean
   help: boolean
 }
 
@@ -291,6 +293,8 @@ Flags:
                           (default: ${DEFAULT_LEDGER_PATH}; per-run rows are emitted by default)
   --promote-ledger [path] alias for --ledger [path]
   --no-ledger             disable default per-run ledger emission (ad-hoc scratch/dry-runs only)
+  --opaque-labels         use opaque UI-style role labels ('Account 1', 'Account 2', ...) with
+                          typed tenantRef & privilege (R3-19 realism ablation cell)
   --help                  show this help
 
 Environment:
@@ -426,7 +430,7 @@ export function parseRealisticArgs(argv: string[], env: NodeJS.ProcessEnv = proc
     'conventional-wordlist', 'no-conventional-wordlist', 'isolate-data-dir', 'keep-data-dirs',
     'allow-inert-workers', 'verifier', 'reuse-recon', 'refresh-recon', 'help',
     'snapshot-after-floor', 'resume-snapshot', 'snapshot-max-age-ms', 'snapshot-refresh',
-    'allow-heldout-snapshot', 'ledger', 'promote-ledger', 'no-ledger',
+    'allow-heldout-snapshot', 'ledger', 'promote-ledger', 'no-ledger', 'opaque-labels',
   ])
   for (const key of Object.keys(a)) {
     if (!known.has(key)) fail(`unknown flag --${key}`)
@@ -456,6 +460,7 @@ export function parseRealisticArgs(argv: string[], env: NodeJS.ProcessEnv = proc
       verifier: 'auto', refreshRecon: a['refresh-recon'] === true, help: true,
       snapshotMaxAgeMs: DEFAULT_SNAPSHOT_MAX_AGE_MS,
       snapshotRefresh: false, allowHeldoutSnapshot: false,
+      opaqueLabels: a['opaque-labels'] === true,
     }
   }
 
@@ -598,6 +603,7 @@ export function parseRealisticArgs(argv: string[], env: NodeJS.ProcessEnv = proc
           ? { ledgerPath: a.ledger }
           : {}),
     ...(a['no-ledger'] === true ? { noLedger: true } : {}),
+    opaqueLabels: a['opaque-labels'] === true,
     help: false,
   }
 }
@@ -689,21 +695,26 @@ function safeHandle(id: string): string {
 }
 
 /** Mode -> briefing interpretation; this is the only configuration source. */
-export function planCell(briefing: Briefing, loginPath: string | null): CellPlan {
+export function planCell(
+  briefing: Briefing,
+  loginPath: string | null,
+  options?: { opaqueLabels?: boolean },
+): CellPlan {
   if (briefing.mode === 'black-box' && briefing.apiReference) {
     fail('black-box briefings must not include an API reference')
   }
   if (briefing.mode === 'grey-box' && !briefing.apiReference) fail('grey-box briefings require an API reference')
   if (briefing.mode === 'white-box' && !briefing.sourceDir) fail('white-box briefings require a source directory')
 
+  const opaqueLabels = options?.opaqueLabels === true
   const handles = new Set<string>()
-  const personas = briefing.personas.map(p => {
+  const personas = briefing.personas.map((p, index) => {
     let handle = safeHandle(p.id)
     for (let n = 2; handles.has(handle); n += 1) handle = `${safeHandle(p.id)}-${n}`
     handles.add(handle)
     return {
       handle,
-      roleLabel: `${p.role} (${p.tenant})`,
+      roleLabel: opaqueLabels ? `Account ${index + 1}` : `${p.role} (${p.tenant})`,
       tenantRef: p.tenant.trim() || null,
       privilege: normalizeRole(p.role),
       email: p.email,
@@ -2115,6 +2126,7 @@ export function reconVariantHash(input: {
   loginPath: string | null
   apiReference: Briefing['apiReference']
   personaHandles: readonly string[]
+  opaqueLabels?: boolean
 }): string {
   const routes = (input.apiReference ?? [])
     .map(route => `${route.method.toUpperCase()} ${route.path} ${[...route.params].sort().join(',')}`)
@@ -2126,6 +2138,7 @@ export function reconVariantHash(input: {
     loginPath: input.loginPath,
     routes,
     personaHandles: [...input.personaHandles].sort(),
+    ...(input.opaqueLabels ? { opaqueLabels: true } : {}),
   })).digest('hex').slice(0, 16)
 }
 
@@ -2834,6 +2847,8 @@ export interface CellMeta {
   wordlistOn: boolean
   /** False whenever wordlistOn is true (non-reportable). */
   reportable: boolean
+  /** R3-19: True when personas were provisioned with opaque UI-style role labels + typed tenantRef/privilege. */
+  opaqueLabels?: boolean
   origin: string
   loginPath: string | null
   gitSha: string
@@ -2966,6 +2981,7 @@ export function resolveObservedEffectiveConfigForRunner(input: {
   workerImageId?: string | null
   workerSourceHash?: string | null
   sdkVersion?: string | null
+  opaqueLabels?: boolean
 }): { observed: boolean; effectiveConfigHash: string; effectiveConfig?: EffectiveConfigSnapshot } {
   if (!input.observed) {
     return {
@@ -2985,6 +3001,7 @@ export function resolveObservedEffectiveConfigForRunner(input: {
     ...(input.workerImageId ? { workerImageId: input.workerImageId } : {}),
     ...(input.workerSourceHash ? { workerSourceHash: input.workerSourceHash } : {}),
     sdkVersion: input.sdkVersion ?? VERIFY_RPC_SDK_VERSION,
+    ...(input.opaqueLabels ? { extra: { opaqueLabels: true } } : {}),
   })
   return { observed: true, effectiveConfigHash, effectiveConfig }
 }
@@ -3014,6 +3031,7 @@ export function writeRealisticCellLedgerRow(input: {
   workerImageId?: string | null
   workerSourceHash?: string | null
   sdkVersion?: string | null
+  opaqueLabels?: boolean
   noLedger?: boolean
   promoteLedgerPath?: string
   runId?: string
@@ -3028,6 +3046,7 @@ export function writeRealisticCellLedgerRow(input: {
   const missingObserved = !input.observedEffectiveConfig || !input.effectiveConfig
   const notes: string[] = []
   if (missingObserved) notes.push('missing_observed_effective_config')
+  if (input.opaqueLabels) notes.push('opaque_labels')
   const row = buildLedgerRow({
     cell: card as unknown as Record<string, unknown>,
     readMeta: {
@@ -3062,11 +3081,12 @@ export function writeRealisticCellLedgerRow(input: {
     siteOutcomes,
     notes,
   })
-  const stampedRow: LedgerRow = {
+  const stampedRow: LedgerRow & { opaqueLabels?: boolean } = {
     ...row,
     workerImageId: input.workerImageId ?? input.effectiveConfig?.workerImageId ?? null,
     workerSourceHash: input.workerSourceHash ?? input.effectiveConfig?.workerSourceHash ?? null,
     sdkVersion: input.sdkVersion ?? input.effectiveConfig?.sdkVersion ?? VERIFY_RPC_SDK_VERSION,
+    ...(input.opaqueLabels ? { opaqueLabels: true } : {}),
   }
   const runStem = input.runId ?? `realistic-${input.app}-seed${input.seed}-${input.mode}-${input.recordedAt.replace(/[:.]/g, '-')}-${process.pid}`
   const appended = appendPerRunLedgerRow(stampedRow, {
@@ -3349,7 +3369,8 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
       if (loginPath) notes.push(`black-box login route discovered by convention probe: ${loginPath}`)
       else notes.push('black-box login route not discovered; personas are not registered')
     }
-    const plan = planCell(briefing, loginPath)
+    const plan = planCell(briefing, loginPath, { opaqueLabels: args.opaqueLabels })
+    if (args.opaqueLabels) notes.push('--opaque-labels: UI-style opaque role labels with typed tenantRef & privilege')
     const gitSha = resolveGitSha()
     const canaryBaseUrl = listener.localBaseUrl ?? listener.effectiveBaseUrl ?? null
 
@@ -3368,6 +3389,7 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
           loginPath,
           apiReference: briefing.apiReference,
           personaHandles: plan.personas.map(p => p.handle),
+          opaqueLabels: args.opaqueLabels,
         }),
       }
       recon.requested = true
@@ -3843,6 +3865,7 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
       conventionalWordlist: args.conventionalWordlist,
       wordlistOn: args.conventionalWordlist,
       reportable: !args.conventionalWordlist,
+      ...(args.opaqueLabels ? { opaqueLabels: true } : {}),
       model,
       verifierBackend: backendKind,
       ...concurrencyMeta(args),
@@ -3902,6 +3925,7 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
         workerConcurrency: runWorkerConcurrency(args),
         maxRpsPerOrigin: args.maxRps,
         budgetUsd: args.budgetUsd,
+        opaqueLabels: args.opaqueLabels,
         requestBudgets,
         timedOut: wait.timedOut,
         reconCache: recon.requested
@@ -3950,6 +3974,7 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
       workerImageId: workerImage?.imageId ?? null,
       workerSourceHash: workerImage?.sourceHash ?? null,
       sdkVersion: VERIFY_RPC_SDK_VERSION,
+      opaqueLabels: args.opaqueLabels,
     })
     if (!cfgResolved.observed) {
       notes.push('missing observed run.effective_config event (Execution-backed scorer requires observed config)')
@@ -4003,6 +4028,7 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
         workerImageId: workerImage?.imageId ?? effectiveConfig?.workerImageId ?? null,
         workerSourceHash: workerImage?.sourceHash ?? effectiveConfig?.workerSourceHash ?? null,
         sdkVersion: effectiveConfig?.sdkVersion ?? VERIFY_RPC_SDK_VERSION,
+        opaqueLabels: args.opaqueLabels,
         promoteLedgerPath: args.ledgerPath,
       })
     }

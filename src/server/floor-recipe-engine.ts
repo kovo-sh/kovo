@@ -56,7 +56,7 @@ import type {
   PersistedMutationArgs,
   RaceBurstArgs,
 } from './floor-recipes.ts'
-import { actorFromPersona, assessBoundary, assessImpactEvidence, assessMassAssignmentImpact, assessMfaBypass, assessStatusOnlyDivergence, classifyBoundaryClaim, classifyImpactDescriptor, normalizeRole, parseRoleLabel, resolvePersonaIdentity } from './oracle-invariants.ts'
+import { actorFromPersona, assessBoundary, assessImpactEvidence, assessMassAssignmentImpact, assessMfaBypass, assessStatusOnlyDivergence, classifyBoundaryClaim, classifyImpactDescriptor, normalizeRole, resolvePersonaIdentity } from './oracle-invariants.ts'
 import type { ActorIdentity, AmbientAuth, ImpactStep, PersonaCredentialSource, RoleName } from './oracle-invariants.ts'
 import { classifyRetestHealth } from './retest-health.ts'
 import type { RetestHealthAssessment } from './retest-health.ts'
@@ -169,16 +169,16 @@ function personaOf(handle: string | null | undefined, personas: readonly EngineP
 export function floorActorFor(handle: string | null | undefined, personas: readonly EnginePersona[]): FloorActor {
   if (!handle) return { handle: ANONYMOUS_HANDLE, role: null, tenant: null, auth: 'unknown' }
   const persona = personaOf(handle, personas)
-  // Legacy untyped EnginePersona mocks lacked `'owner'` and passed `privilege: 'member'` with
-  // `tenant: undefined` alongside an `owner@...` label; defer to the label only in that case.
-  const effectivePrivilege =
-    persona && !persona.tenant && persona.privilege === 'member' && parseRoleLabel(persona.roleLabel).role === 'owner'
-      ? null
-      : (persona?.privilege ?? null)
+  // R3-19: Typed persona privilege and tenant always take precedence over free-text role labels;
+  // untyped legacy personas fall back to label parsing strictly inside `resolvePersonaIdentity`
+  // where fallbacks are counted. Never allow `roleLabel` to override a typed `privilege`.
+  //
+  // Callers with opaque UI-style labels ('User A', 'Account 1') pass typed `tenant` and
+  // `privilege` directly and incur zero label-fallback increments.
   const identity = resolvePersonaIdentity({
     roleLabel: persona?.roleLabel ?? null,
     tenantRef: persona?.tenant ?? null,
-    privilege: effectivePrivilege,
+    privilege: persona?.privilege ?? null,
     handle,
   })
   return {

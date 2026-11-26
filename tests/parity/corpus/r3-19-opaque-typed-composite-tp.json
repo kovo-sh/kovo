@@ -1,0 +1,122 @@
+{
+  "id": "r3-19-opaque-typed-composite-tp",
+  "side": "tp",
+  "archetype": "r3-19-opaque-typed-composite-cross-tenant",
+  "description": "R3-19 TP: two-hop cross-tenant export chain where personas carry opaque UI-style labels ('Account Alpha', 'Account Gamma') alongside typed host-signed tenant='tenant-a' and role='member'/'viewer' confirms without label grammar.",
+  "covers": {
+    "files": [
+      "src/server/composite-receipt.ts",
+      "src/server/floor-recipe-engine.ts",
+      "src/server/host-fact-log.ts",
+      "src/server/v8-oracle-hydrate.ts",
+      "src/server/verify-claims.ts",
+      "src/server/verify-rpc.ts"
+    ],
+    "classes": [
+      "bola",
+      "dual_tenant_abac",
+      "authorization"
+    ]
+  },
+  "canonicalLabel": {
+    "cwe": "CWE-639",
+    "category": "bola",
+    "title": "Multi-hop cross-tenant export disclosure under opaque persona labels",
+    "impact": "Chained export token grants unauthorized access to foreign tenant-b payroll ledger while attacker personas carry opaque labels.",
+    "claimedImpact": "authorization",
+    "claimedBoundary": "access",
+    "vulnClass": "bola"
+  },
+  "freeTextLabel": {
+    "title": "Two-hop cross-tenant export disclosure under opaque UI persona labels"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": false,
+    "evaluateClaims": true,
+    "composite": true,
+    "floorInjectionRecipe": false
+  },
+  "expected": {
+    "confirmed": true
+  },
+  "personas": [
+    {
+      "handle": "acct_alpha",
+      "roleLabel": "Account Alpha",
+      "role": "member",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-r319-alpha-token"
+    },
+    {
+      "handle": "acct_gamma",
+      "roleLabel": "Account Gamma",
+      "role": "viewer",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-r319-gamma-token"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "hop1_ex",
+      "arm": "setup",
+      "role": "setup",
+      "method": "POST",
+      "pathAndQuery": "/v1/exports/request",
+      "persona": "acct_alpha",
+      "requestJson": {
+        "tenant": "tenant-b",
+        "scope": "ledger"
+      },
+      "status": 201,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"jobId\":\"job_88\",\"downloadToken\":\"tok_r319_9f8e7d6c5b4a\"}"
+    },
+    {
+      "id": "hop2_ctl",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/v1/exports/download?token=invalid_tok",
+      "persona": "acct_gamma",
+      "status": 403,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"error\":\"forbidden\"}"
+    },
+    {
+      "id": "hop2_prb",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/v1/exports/download?token=tok_r319_9f8e7d6c5b4a",
+      "persona": "acct_alpha",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"tenant_id\":\"tenant-b\",\"payroll_email\":\"cfo@tenant-b.example\",\"total_cents\":1850000,\"records\":[{\"emp\":\"b-1\",\"salary\":95000}]}"
+    }
+  ],
+  "composite": {
+    "chainId": "r3-19-opaque-typed-composite-tp",
+    "terminalVulnClass": "bola",
+    "oracleFamily": "dual_tenant_abac",
+    "capabilityToken": "download_tok",
+    "claimedDelta": "Opaque-label member in tenant-a chains export token to disclose tenant-b payroll ledger.",
+    "attackerPersonas": [
+      "acct_alpha",
+      "acct_gamma"
+    ]
+  }
+}

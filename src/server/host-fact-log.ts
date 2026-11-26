@@ -14,7 +14,7 @@
  */
 import { createHash, createHmac } from 'node:crypto'
 import { createEgressSanitizer, EgressSanitizer, type EgressChannel } from './egress-sanitizer.ts'
-import { normalizeRole, parseRoleLabel, type AmbientAuth, type ImpactStep, type RoleName } from './oracle-invariants.ts'
+import { resolvePersonaIdentity, type AmbientAuth, type ImpactStep, type RoleName } from './oracle-invariants.ts'
 import type { BrokerExchangeResult, BrokerHttpRequest, WireCredentialProvenance } from './broker.ts'
 export type { WireCredentialProvenance } from './broker.ts'
 
@@ -181,6 +181,7 @@ export interface HostExchangeFact {
   readonly rawResponseBody: string | null
   readonly actor: string | null
   readonly actorRole: RoleName | null
+  readonly actorPrivilege?: RoleName | null
   readonly actorRoleLabel?: string | null
   readonly actorTenant: string | null
   readonly ambientAuth: AmbientAuth
@@ -235,6 +236,7 @@ export interface HostExchangeFactInput {
   rawResponseBody?: string | null
   actor?: string | null
   actorRole?: RoleName | null
+  actorPrivilege?: RoleName | string | null
   actorRoleLabel?: string | null
   actorTenant?: string | null
   ambientAuth?: AmbientAuth
@@ -822,10 +824,19 @@ export class HostFactLog {
       : null
 
     const actor = input.actor ?? null
-    const roleSource = input.actorRoleLabel ?? actor ?? null
-    const parsedLabel = parseRoleLabel(roleSource)
-    const actorRole: RoleName | null = input.actorRole ?? parsedLabel.role ?? normalizeRole(actor ?? undefined) ?? null
-    const actorTenant: string | null = input.actorTenant ?? parsedLabel.tenant ?? parseRoleLabel(actor ?? null).tenant ?? null
+    const hasExplicitPrivilege = input.actorPrivilege !== undefined || input.actorRole !== undefined
+    const hasExplicitTenant = input.actorTenant !== undefined
+    const primaryIdentity = resolvePersonaIdentity({
+      roleLabel: input.actorRoleLabel ?? null,
+      tenantRef: input.actorTenant ?? null,
+      privilege: input.actorPrivilege ?? input.actorRole ?? null,
+      handle: actor,
+    })
+    const actorIdentity = actor && ((primaryIdentity.role === null && !hasExplicitPrivilege) || (primaryIdentity.tenant === null && !hasExplicitTenant))
+      ? resolvePersonaIdentity({ roleLabel: actor, handle: actor })
+      : null
+    const actorRole: RoleName | null = primaryIdentity.role ?? (!hasExplicitPrivilege ? actorIdentity?.role ?? null : null)
+    const actorTenant: string | null = primaryIdentity.tenant ?? (!hasExplicitTenant ? actorIdentity?.tenant ?? null : null)
     const wireCredentialProvenance = freezeWireCredentialProvenance(input.wireCredentialProvenance)
     const credentialPlacement = deriveCredentialPlacement(requestHeaders, input.credentialPlacement, wireCredentialProvenance)
     const ambientAuth = deriveAmbientAuthFromHeaders(requestHeaders, input.ambientAuth, credentialPlacement)
@@ -879,6 +890,7 @@ export class HostFactLog {
       rawResponseBody,
       actor,
       actorRole,
+      ...(actorRole !== null || input.actorPrivilege !== undefined ? { actorPrivilege: actorRole } : {}),
       ...(input.actorRoleLabel !== undefined ? { actorRoleLabel: input.actorRoleLabel } : {}),
       actorTenant,
       ambientAuth,
@@ -1244,6 +1256,8 @@ export class HostFactLog {
       timestampMs: ts,
       actorPersona: fact.actor,
       ...(fact.actorRoleLabel !== undefined ? { actorRoleLabel: fact.actorRoleLabel } : {}),
+      ...(fact.actorTenant !== null ? { actorTenant: fact.actorTenant } : {}),
+      ...(fact.actorPrivilege !== undefined ? { actorPrivilege: fact.actorPrivilege } : {}),
       ...(fact.emittedCapabilities ? { emittedCapabilities: [...fact.emittedCapabilities] } : {}),
       ...(observedDigests ? { observedResponseDigests: observedDigests } : {}),
       ...(fact.injectedRequestDigests ? { injectedRequestDigests: [...fact.injectedRequestDigests] } : {}),
@@ -1331,9 +1345,9 @@ export class HostFactLog {
         responseHeaders: step.responseHeaders ?? null,
         rawResponseBody: rawResp,
         actor: entry.actorPersona !== undefined ? entry.actorPersona : (step.actor.handle ?? null),
-        actorRole: step.actor.role ?? null,
+        ...(entry.actorPrivilege !== undefined ? { actorPrivilege: entry.actorPrivilege } : (step.actor.role ? { actorRole: step.actor.role } : {})),
         actorRoleLabel: entry.actorRoleLabel ?? null,
-        actorTenant: step.actor.tenant ?? null,
+        ...(entry.actorTenant !== undefined ? { actorTenant: entry.actorTenant } : (step.actor.tenant ? { actorTenant: step.actor.tenant } : {})),
         ambientAuth: step.actor.auth,
         ...(step.actor.sameSite !== null && step.actor.sameSite !== undefined ? { sameSite: step.actor.sameSite } : {}),
         ...(entry.credentialPlacement ? { credentialPlacement: entry.credentialPlacement } : {}),
@@ -1488,22 +1502,19 @@ export class HostFactLog {
       const kernelCarrierText = hostEntry?.carrierText && !hasVaultScrubbedToken(hostEntry.carrierText)
         ? hostEntry.carrierText
         : undefined
+      const rawActorPrivilege = req?.actorPrivilege !== undefined ? req.actorPrivilege : (hostEntry?.actorPrivilege !== undefined ? hostEntry.actorPrivilege : (hostEntry?.step.actor.role ?? undefined))
+      const rawActorTenant = req?.actorTenant !== undefined ? req.actorTenant : (hostEntry?.actorTenant !== undefined ? hostEntry.actorTenant : (hostEntry?.step.actor.tenant ?? undefined))
       log.recordExchange({
-        seq: record.seq,
-        exchangeId: record.exchangeId,
-        op: record.op,
+        seq: record.seq, exchangeId: record.exchangeId, op: record.op,
         method: req?.method ?? hostEntry?.step.method ?? (record.op === 'oob' ? 'OOB' : 'GET'),
-        origin: req?.origin ?? hostEntry?.origin ?? '',
-        pathAndQuery: kernelPathAndQuery,
+        origin: req?.origin ?? hostEntry?.origin ?? '', pathAndQuery: kernelPathAndQuery,
         status: record.response?.status ?? hostEntry?.step.status ?? null,
-        requestHeaders: kernelHeaders,
-        rawRequestBody: rawReq,
-        responseHeaders: record.response?.headers ?? hostEntry?.step.responseHeaders ?? null,
-        rawResponseBody: rawResp,
+        requestHeaders: kernelHeaders, rawRequestBody: rawReq,
+        responseHeaders: record.response?.headers ?? hostEntry?.step.responseHeaders ?? null, rawResponseBody: rawResp,
         actor: req?.personaHandle ?? hostEntry?.actorPersona ?? hostEntry?.step.actor.handle ?? null,
-        actorRole: hostEntry?.step.actor.role ?? null,
+        ...(rawActorPrivilege !== undefined ? { actorPrivilege: rawActorPrivilege } : {}),
         actorRoleLabel: req?.actorRoleLabel ?? hostEntry?.actorRoleLabel ?? null,
-        actorTenant: hostEntry?.step.actor.tenant ?? null,
+        ...(rawActorTenant !== undefined ? { actorTenant: rawActorTenant } : {}),
         ambientAuth: hostEntry?.step.actor.auth,
         ...(hostEntry?.step.actor.sameSite !== null && hostEntry?.step.actor.sameSite !== undefined
           ? { sameSite: hostEntry.step.actor.sameSite }
@@ -1588,6 +1599,7 @@ export class HostFactLog {
       arm?: ImpactStep['arm']
       actorRoleLabel?: string | null
       actorRole?: RoleName | null
+      actorPrivilege?: RoleName | null
       actorTenant?: string | null
       evidenceRole?: string
       startedAt?: number
@@ -1605,9 +1617,10 @@ export class HostFactLog {
       responseHeaders: exchange.respHeaders ?? null,
       rawResponseBody: exchange.body,
       actor: exchange.personaHandle ?? request.persona ?? null,
-      actorRole: meta?.actorRole ?? null,
-      actorRoleLabel: meta?.actorRoleLabel ?? null,
-      actorTenant: meta?.actorTenant ?? null,
+      ...(meta?.actorPrivilege !== undefined ? { actorPrivilege: meta.actorPrivilege } : {}),
+      ...(meta?.actorRole !== undefined ? { actorRole: meta.actorRole } : {}),
+      ...(meta?.actorRoleLabel !== undefined ? { actorRoleLabel: meta.actorRoleLabel } : {}),
+      ...(meta?.actorTenant !== undefined ? { actorTenant: meta.actorTenant } : {}),
       durationMs: exchange.durationMs,
       ...(meta?.startedAt !== undefined ? { startedAt: meta.startedAt, endedAt: meta.startedAt + exchange.durationMs } : {}),
       ...(meta?.arm ? { arm: meta.arm } : {}),

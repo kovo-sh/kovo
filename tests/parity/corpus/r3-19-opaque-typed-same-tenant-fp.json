@@ -1,0 +1,166 @@
+{
+  "id": "r3-19-opaque-typed-same-tenant-fp",
+  "side": "fp",
+  "archetype": "r3-19-opaque-typed-same-tenant-read",
+  "description": "R3-19 FP: same-tenant document read where personas carry opaque UI-style labels ('Account Alpha', 'Account Beta') with typed tenant='tenant-a' (and even an anonymous 401 login wall) must fail closed across replay, floorReceipt, evaluateClaims, proofReceipt, and composite paths.",
+  "covers": {
+    "files": [
+      "src/server/composite-receipt.ts",
+      "src/server/floor-recipe-engine.ts",
+      "src/server/host-fact-log.ts",
+      "src/server/v8-oracle-hydrate.ts",
+      "src/server/verify-claims.ts",
+      "src/server/verify-rpc.ts"
+    ],
+    "classes": [
+      "bola",
+      "idor",
+      "authorization",
+      "dual_tenant_abac"
+    ]
+  },
+  "canonicalLabel": {
+    "cwe": "CWE-639",
+    "category": "bola",
+    "title": "Same-tenant org-shared document read under opaque persona labels with typed tenant metadata",
+    "impact": "Same-tenant viewer with opaque UI label reads shared tenant document while unauthenticated caller receives 401.",
+    "claimedImpact": "authorization",
+    "claimedBoundary": "access",
+    "vulnClass": "bola"
+  },
+  "freeTextLabel": {
+    "title": "Unauthorized cross-tenant access claim with opaque persona labels on same-tenant document"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": true,
+    "evaluateClaims": true,
+    "composite": true,
+    "floorInjectionRecipe": false,
+    "proofReceipt": true
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [
+    {
+      "handle": "acct_alpha",
+      "roleLabel": "Account Alpha",
+      "role": "owner",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-r319-alpha-token"
+    },
+    {
+      "handle": "acct_beta",
+      "roleLabel": "Account Beta",
+      "role": "viewer",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-r319-beta-token"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "ctl_owner",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/docs/doc_a1",
+      "persona": "acct_alpha",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"id\":\"doc_a1\",\"tenant_id\":\"tenant-a\",\"title\":\"Acme Shared Handbook\",\"status\":\"open\"}"
+    },
+    {
+      "id": "ctl_anon",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/docs/doc_a1",
+      "persona": null,
+      "status": 401,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"error\":\"authentication_required\"}"
+    },
+    {
+      "id": "prb_viewer",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/docs/doc_a1",
+      "persona": "acct_beta",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"id\":\"doc_a1\",\"tenant_id\":\"tenant-a\",\"title\":\"Acme Shared Handbook\",\"status\":\"open\"}"
+    }
+  ],
+  "replaySpec": {
+    "assertionsJq": "{ controlPassed: (.steps.ctl_owner.status == 200 and .steps.ctl_anon.status == 401), confirmed: (.steps.prb_viewer.status == 200 and .steps.prb_viewer.json.id == \"doc_a1\"), observed: \"acct_beta read same-tenant doc\", expected: \"403\" }"
+  },
+  "proofReceipt": {
+    "vulnClass": "bola",
+    "targetMethod": "GET",
+    "targetPathAndQuery": "/api/docs/doc_a1",
+    "claimedDelta": "Same-tenant read under opaque persona labels must not confirm as cross-tenant BOLA."
+  },
+  "claims": [
+    {
+      "kind": "impact",
+      "impactClass": "authorization",
+      "probeExchangeId": "prb_viewer",
+      "controlExchangeIds": [
+        "ctl_owner",
+        "ctl_anon"
+      ]
+    }
+  ],
+  "bareClaims": [
+    {
+      "kind": "status",
+      "exchangeId": "ctl_owner",
+      "expected": 200
+    },
+    {
+      "kind": "status",
+      "exchangeId": "ctl_anon",
+      "expected": 401
+    },
+    {
+      "kind": "status",
+      "exchangeId": "prb_viewer",
+      "expected": 200
+    },
+    {
+      "kind": "body_contains",
+      "exchangeId": "prb_viewer",
+      "text": "doc_a1"
+    }
+  ],
+  "composite": {
+    "chainId": "r3-19-opaque-same-tenant-fp",
+    "terminalVulnClass": "bola",
+    "oracleFamily": "dual_tenant_abac",
+    "claimedDelta": "Same-tenant opaque-label viewer read must fail closed in composite verification.",
+    "singleHop": true,
+    "attackerPersonas": [
+      "acct_beta"
+    ],
+    "preChainControlIds": [
+      "ctl_owner",
+      "ctl_anon"
+    ],
+    "terminalExchangeId": "prb_viewer"
+  }
+}
