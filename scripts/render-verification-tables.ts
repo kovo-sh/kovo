@@ -104,7 +104,8 @@ function fmtPct(v: number | null | undefined): string {
   return `${(v * 100).toFixed(1)}%`
 }
 
-function fmtUsd(v: number): string {
+function fmtUsd(v: number | null | undefined): string {
+  if (v === null || v === undefined || !Number.isFinite(v)) return 'n/a'
   return `$${v.toFixed(3)}`
 }
 
@@ -159,6 +160,7 @@ export function renderVerificationTable(
   let totalUnmatchedFp = 0
   let totalValidUnplanted = 0
   let totalCostUsd = 0
+  let hasMissingCost = false
   const recalls: number[] = []
 
   for (const r of sorted) {
@@ -167,7 +169,11 @@ export function renderVerificationTable(
     totalDecoyFp += r.decoyFalsePositives
     totalUnmatchedFp += r.unmatchedFalsePositives
     totalValidUnplanted += r.validUnplantedCount ?? 0
-    totalCostUsd += r.costUsd
+    if (r.costUsd === null || !Number.isFinite(r.costUsd)) {
+      hasMissingCost = true
+    } else {
+      totalCostUsd += r.costUsd
+    }
     if (r.recall !== null && Number.isFinite(r.recall)) recalls.push(r.recall)
 
     const shaLabel = r.dirty ? `${r.gitSha}*` : r.gitSha
@@ -190,7 +196,7 @@ export function renderVerificationTable(
     `| **TOTAL** | ${sorted.length} row(s) | — | — | — | — | — | `
       + `**${totalConfirmed}/${totalTargets}** | **${fmtPct(aggRecall)}**${spread} | `
       + `**${fmtPct(aggRawPrec)}** | — | **${totalDecoyFp}/${totalUnmatchedFp}** | `
-      + `**${totalValidUnplanted}** | **${fmtUsd(totalCostUsd)}** | ${checked.certifyingAll ? 'yes' : 'no'} |`,
+      + `**${totalValidUnplanted}** | **${fmtUsd(hasMissingCost ? null : totalCostUsd)}** | ${checked.certifyingAll ? 'yes' : 'no'} |`,
   )
   return lines.join('\n')
 }
