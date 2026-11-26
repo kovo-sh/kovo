@@ -1,6 +1,7 @@
-import { Link, useRouter } from '@tanstack/react-router'
-import { useState } from 'react'
-import { removeRun } from '../../actions.ts'
+import { Link, useNavigate, useRouter } from '@tanstack/react-router'
+import { useEffect, useState } from 'react'
+import { createRun, removeRun } from '../../actions.ts'
+import { getRunRerunPresetAction, listProjectRunLabelsAction } from '../../actions-run-controls.ts'
 import { cn } from '../../lib/cn.ts'
 import { Icon } from '../run/icons.tsx'
 import { runStatusLabel } from '../run/meta.ts'
@@ -189,11 +190,49 @@ function GithubSetupSvg({ ready }: { ready: boolean }) {
 
 export function ProjectOverviewTab({ data, onSelectTab }: Props) {
   const { project, assets, personas, specs, runs, githubPatStatus } = data
+  const navigate = useNavigate()
   const router = useRouter()
   const now = useNow()
   const [runToDelete, setRunToDelete] = useState<ProjectLoaderData['runs'][number] | null>(null)
   const [deletingRun, setDeletingRun] = useState(false)
   const [deleteError, setDeleteError] = useState('')
+  const [rerunningRunId, setRerunningRunId] = useState<string | null>(null)
+  const [rerunError, setRerunError] = useState('')
+  const [runLabels, setRunLabels] = useState<Record<string, string | null>>({})
+  const runIdsKey = runs.map(r => r.id).join(',')
+
+  useEffect(() => {
+    let active = true
+    void listProjectRunLabelsAction({ data: { projectId: project.id } }).then(
+      labels => {
+        if (active) setRunLabels(labels)
+      },
+      () => {},
+    )
+    return () => { active = false }
+  }, [project.id, runIdsKey])
+
+  const displayRunLabel = (run: ProjectLoaderData['runs'][number]): string =>
+    runLabels[run.id] || (run as { label?: string | null }).label || run.goal
+
+  async function handleRerun(run: ProjectLoaderData['runs'][number]) {
+    if (rerunningRunId) return
+    setRerunningRunId(run.id)
+    setRerunError('')
+    try {
+      const preset = await getRunRerunPresetAction({ data: { runId: run.id } })
+      const created = await createRun({
+        data: {
+          requestId: crypto.randomUUID(),
+          ...preset,
+        },
+      })
+      await navigate({ to: '/runs/$runId', params: { runId: created.id } })
+    } catch (err) {
+      setRerunError(err instanceof Error ? err.message : 'Could not start a re-run.')
+      setRerunningRunId(null)
+    }
+  }
   const latestRun = runs[0]
   const completedRuns = runs.filter(r => r.status === 'complete').length
   const activeRuns = runs.filter(
@@ -361,10 +400,13 @@ export function ProjectOverviewTab({ data, onSelectTab }: Props) {
           <h2 className="m-0 text-[13px] font-semibold text-fg">
             Runs <span className="font-normal tabular-nums text-fg-subtle">({runs.length})</span>
           </h2>
+          {rerunError && <span className="text-[12px] text-danger" role="alert">{rerunError}</span>}
         </div>
         {runs.length > 0 ? (
           <div className="border-t border-line">
-            {runs.map(run => (
+            {runs.map(run => {
+              const runTitle = displayRunLabel(run)
+              return (
               <div
                 key={run.id}
                 className="group flex items-center gap-1 border-b border-line transition-colors hover:bg-hover"
@@ -380,7 +422,7 @@ export function ProjectOverviewTab({ data, onSelectTab }: Props) {
                   />
                   <span className="flex min-w-0 flex-1 flex-col gap-0.5">
                     <span className="flex min-w-0 flex-wrap items-center gap-1.5 font-medium text-fg">
-                      <span className="truncate">{run.goal}</span>
+                      <span className="truncate" title={runTitle !== run.goal ? run.goal : undefined}>{runTitle}</span>
                     </span>
                     <span className="text-[12px] tabular-nums text-fg-subtle">
                       {capabilityTierMeta[run.capabilityTier]?.name ?? 'Standard'} · {phaseNames[run.phase]}
@@ -401,13 +443,26 @@ export function ProjectOverviewTab({ data, onSelectTab }: Props) {
                     </time>
                   </span>
                 </Link>
+                {run.status === 'complete' && (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    className="h-7 flex-none px-2 text-[12px] text-fg-muted hover:text-fg"
+                    disabled={rerunningRunId !== null}
+                    aria-label={`Re-run: ${runTitle}`}
+                    onClick={() => void handleRerun(run)}
+                  >
+                    <Icon name="replay" size={12} />
+                    {rerunningRunId === run.id ? 'Starting…' : 'Re-run'}
+                  </Button>
+                )}
                 <Button
                   type="button"
                   variant="ghost"
                   size="icon"
                   className="mr-1 flex-none text-fg-subtle opacity-55 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100 data-[slot=button]:hover:bg-danger-soft data-[slot=button]:hover:text-danger"
                   title="Delete run"
-                  aria-label={`Delete run: ${run.goal}`}
+                  aria-label={`Delete run: ${runTitle}`}
                   onClick={() => {
                     setDeleteError('')
                     setRunToDelete(run)
@@ -416,7 +471,8 @@ export function ProjectOverviewTab({ data, onSelectTab }: Props) {
                   <Icon name="trash" size={14} />
                 </Button>
               </div>
-            ))}
+              )
+            })}
           </div>
         ) : (
           <div className="mt-3.5 rounded-card border border-line bg-sunk">
@@ -472,7 +528,7 @@ export function ProjectOverviewTab({ data, onSelectTab }: Props) {
                 </DialogDescription>
                 <div className="flex flex-col gap-2 rounded-lg border border-line bg-sunk px-3 py-2.5">
                   <div className="line-clamp-2 text-[13px] font-medium text-fg" title={runToDelete.goal}>
-                    {runToDelete.goal}
+                    {displayRunLabel(runToDelete)}
                   </div>
                   <div className="flex flex-wrap items-center gap-1.5 tabular-nums">
                     <Badge variant="neutral" className="bg-panel capitalize">

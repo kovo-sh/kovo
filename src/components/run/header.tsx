@@ -63,7 +63,7 @@ export function buildBudgetCommand(
   return cmd
 }
 
-type Popover = 'menu' | 'budget' | 'policy' | 'scope' | 'goal' | null
+type Popover = 'menu' | 'budget' | 'policy' | 'leases' | 'scope' | 'goal' | null
 
 /** Hide run-line items by priority (data-p, lowest first) until the line fits. */
 function useFitRunline(ref: RefObject<HTMLDivElement | null>, deps: unknown[]) {
@@ -112,9 +112,14 @@ export function RunHeader() {
   const r = detail.run
   const [pop, setPop] = useState<Popover>(null)
   const [deleteOpen, setDeleteOpen] = useState(false)
+  const [editingLabel, setEditingLabel] = useState(false)
+  const [labelDraft, setLabelDraft] = useState(r.label ?? '')
   const wrap = useRef<HTMLDivElement>(null)
   const rl = useRef<HTMLDivElement>(null)
   const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    if (!editingLabel) setLabelDraft(r.label ?? '')
+  }, [r.id, r.label, editingLabel])
   useEffect(() => {
     if (r.status !== 'running') return
     setNow(Date.now())
@@ -125,11 +130,21 @@ export function RunHeader() {
   const bPct = r.budgetUsd ? r.spentUsd / r.budgetUsd : 0
   const rPct = r.budgetRequests ? r.spentRequests / r.budgetRequests : 0
   const scopeN = model.scopeOrigins.length
+  const activeLeases = detail.approvalLeases ?? []
+  const activePatterns = (detail.approvedEndpointPatterns ?? r.approvedEndpointPatterns ?? []).filter(
+    p => p.scopeRevision === undefined || p.scopeRevision === r.scopeRevision,
+  )
+  const unmatchedPatterns = activePatterns.filter(
+    p => !activeLeases.some(
+      l => l.origin === p.origin && l.method.toUpperCase() === p.method.toUpperCase() && l.routePattern === p.pathPattern,
+    ),
+  )
+  const totalGrants = activeLeases.length + unmatchedPatterns.length
   const editable = !['complete', 'stopped', 'failed'].includes(r.status)
   const hasActiveWorkers = r.status === 'running'
     || detail.assignments.some(a => a.status === 'running' || a.status === 'waiting_approval')
   const hasRunningLab = Boolean(detail.labTarget)
-  useFitRunline(rl, [r.status, r.phase, r.spentUsd, r.spentRequests, scopeN])
+  useFitRunline(rl, [r.status, r.phase, r.spentUsd, r.spentRequests, scopeN, totalGrants])
 
   useEffect(() => {
     if (!pop) return
@@ -181,7 +196,77 @@ export function RunHeader() {
         <span>{fmtAgo(r.createdAt)}</span>
         <Icon name="copy" size={11} className="text-fg-subtle opacity-65 transition-[opacity,color] duration-[var(--d1)] group-hover/cc:text-fg-muted group-hover/cc:opacity-100" />
       </button>
-      <span className="min-w-0 flex-1 cursor-default truncate font-medium text-fg" title={r.goal}>{r.goal}</span>
+      {editingLabel ? (
+        <form
+          className="flex min-w-0 flex-1 items-center gap-1.5"
+          onSubmit={e => {
+            e.preventDefault()
+            const trimmed = labelDraft.trim()
+            const nextLabel = trimmed ? trimmed : null
+            void send({ action: 'rename_run', label: nextLabel }).then(
+              () => {
+                setEditingLabel(false)
+                toast.show(nextLabel ? 'Run renamed' : 'Run label cleared', { icon: 'check' })
+              },
+              (err: unknown) => toast.show(err instanceof Error ? err.message : 'Could not rename the run.', { tone: 'error' }),
+            )
+          }}
+        >
+          <input
+            className={cn(RW.fieldInput, 'h-7 min-w-[160px] max-w-[420px] flex-1')}
+            value={labelDraft}
+            maxLength={160}
+            placeholder={r.goal}
+            aria-label="Run label"
+            autoFocus
+            onChange={e => setLabelDraft(e.target.value)}
+            onKeyDown={e => {
+              if (e.key === 'Escape') {
+                e.preventDefault()
+                setEditingLabel(false)
+                setLabelDraft(r.label ?? '')
+              }
+            }}
+          />
+          <button type="submit" className={runBtn({ variant: 'primary', size: 'xs' })} disabled={pending > 0}>Save</button>
+          <button
+            type="button"
+            className={runBtn({ variant: 'ghost', size: 'xs' })}
+            disabled={pending > 0}
+            onClick={() => {
+              setEditingLabel(false)
+              setLabelDraft(r.label ?? '')
+            }}
+          >
+            Cancel
+          </button>
+        </form>
+      ) : (
+        <div className="flex min-w-0 flex-1 items-center gap-1">
+          <span
+            className="min-w-0 cursor-default truncate font-medium text-fg"
+            title={r.label ? `${r.label} — Goal: ${r.goal}` : r.goal}
+            onDoubleClick={() => {
+              setLabelDraft(r.label ?? '')
+              setEditingLabel(true)
+            }}
+          >
+            {r.label || r.goal}
+          </span>
+          <button
+            type="button"
+            className="inline-flex size-5 flex-none cursor-pointer items-center justify-center rounded-[4px] border-0 bg-transparent p-0 text-fg-subtle opacity-60 transition-[background-color,color,opacity] duration-[var(--d1)] hover:bg-hover hover:text-fg hover:opacity-100"
+            title="Rename run"
+            aria-label="Rename run"
+            onClick={() => {
+              setLabelDraft(r.label ?? '')
+              setEditingLabel(true)
+            }}
+          >
+            <Icon name="edit" size={11} />
+          </button>
+        </div>
+      )}
       <span className="relative flex items-center gap-1.5" ref={wrap}>
         {action}
         <button
@@ -208,7 +293,9 @@ export function RunHeader() {
         {pop === 'menu' && <div className="absolute right-0 top-8 z-30 min-w-[232px] origin-top-right rounded-card bg-raise p-1.5 shadow-popover" role="menu">
           {item('budget', 'Budget and rate limit…', () => setPop('budget'), { right: fmtUsd(r.budgetUsd) })}
           {r.capabilityTier === 3 && item('shield', 'Approval policy…', () => setPop('policy'), { right: approvalPolicyMeta[r.approvalPolicy ?? 'auto_review'].short })}
+          {(totalGrants > 0 || r.capabilityTier === 3) && item('lock', 'Approval leases…', () => setPop('leases'), { right: totalGrants > 0 ? String(totalGrants) : 'None' })}
           {item('globe', 'Scope hosts…', () => setPop('scope'), { right: plural(scopeN, 'host') })}
+          {item('edit', 'Rename run', () => { setPop(null); setLabelDraft(r.label ?? ''); setEditingLabel(true) })}
           {item('edit', 'Revise goal…', () => setPop('goal'), { disabled: !editable })}
           <div className={RW.menuSep} />
           {item('chat', 'Open the board', () => { setPop(null); nav.openChat(null) }, { right: 'C' })}
@@ -235,6 +322,7 @@ export function RunHeader() {
         </div>}
         {pop === 'budget' && <BudgetPopover onClose={() => setPop(null)} />}
         {pop === 'policy' && <PolicyPopover onClose={() => setPop(null)} />}
+        {pop === 'leases' && <LeasesPopover onClose={() => setPop(null)} />}
         {pop === 'scope' && <ScopePopover onClose={() => setPop(null)} onEdit={() => { setPop(null); openScope() }} />}
         {pop === 'goal' && <GoalPopover onClose={() => setPop(null)} />}
       </span>
@@ -286,6 +374,19 @@ export function RunHeader() {
         <span className="group-hover/rlb:text-fg">{capabilityTierMeta[r.capabilityTier].short}</span>
         <span className="text-fg-subtle group-hover/rlb:text-fg-muted">· {plural(scopeN, 'host')}</span>
       </button>
+      {totalGrants > 0 && <button
+        type="button"
+        className={rlBtnClass}
+        data-rl=""
+        data-rl-btn=""
+        data-p="3"
+        title="Active route approval leases — click to inspect or revoke"
+        onClick={() => setPop(pop === 'leases' ? null : 'leases')}
+      >
+        <Icon name="lock" size={12} className="text-fg-subtle group-hover/rlb:text-fg" />
+        <span className="group-hover/rlb:text-fg">Leases</span>
+        <span className="text-fg-subtle group-hover/rlb:text-fg-muted">· {totalGrants}</span>
+      </button>}
       <span className={rlItemClass} data-rl="" data-p="1" title={`Started ${fmtFullDateTime(r.createdAt)}`} suppressHydrationWarning>
         <span className="text-fg-subtle">{r.status === 'running' || dur > 60_000 ? fmtDur(dur) : 'Created ' + fmtTime(r.createdAt)}</span>
       </span>
@@ -367,11 +468,146 @@ function BudgetPopover({ onClose }: { onClose: () => void }) {
   </form>
 }
 
+function LeasesList({ onError }: { onError: (msg: string) => void }) {
+  const { detail, send, pending } = useRun()
+  const toast = useToast()
+  const r = detail.run
+  const activeLeases = detail.approvalLeases ?? []
+  const activePatterns = (detail.approvedEndpointPatterns ?? r.approvedEndpointPatterns ?? []).filter(
+    p => p.scopeRevision === undefined || p.scopeRevision === r.scopeRevision,
+  )
+  const unmatchedPatterns = activePatterns.filter(
+    p => !activeLeases.some(
+      l => l.origin === p.origin && l.method.toUpperCase() === p.method.toUpperCase() && l.routePattern === p.pathPattern,
+    ),
+  )
+
+  if (!activeLeases.length && !unmatchedPatterns.length) {
+    return <p>No active route approval leases in this scope revision.</p>
+  }
+
+  return <div className="flex flex-col gap-1.5" data-testid="approval-leases-list">
+    {activeLeases.map(lease => (
+      <div
+        key={lease.id}
+        className="flex items-center gap-2 rounded-[7px] border border-line bg-sunk px-2.5 py-2"
+      >
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-1.5 font-mono text-[11.5px] text-fg">
+            <span className="rounded bg-panel px-1 py-0.5 text-[10.5px] font-semibold">{lease.method}</span>
+            <span className="truncate" title={`${lease.origin}${lease.routePattern}`}>
+              {host(lease.origin)}{lease.routePattern}
+            </span>
+          </div>
+          <div className="mt-0.5 text-[11px] text-fg-subtle">
+            {lease.expiresAt ? `Expires ${fmtTime(lease.expiresAt)}` : 'No expiry'}
+            {' · '}
+            {plural(lease.uses, 'use')}
+            {lease.personaHandle ? ` · @${lease.personaHandle}` : ''}
+          </div>
+        </div>
+        <button
+          type="button"
+          className={runBtn({ variant: 'ghost', size: 'xs' })}
+          disabled={pending > 0}
+          aria-label={`Revoke ${lease.method} ${lease.routePattern}`}
+          onClick={() => {
+            onError('')
+            void send({ action: 'revoke_approval_lease', leaseId: lease.id }).then(
+              () => toast.show('Approval lease revoked'),
+              (x: unknown) => onError(x instanceof Error ? x.message : 'Could not revoke the lease'),
+            )
+          }}
+        >
+          Revoke
+        </button>
+      </div>
+    ))}
+    {unmatchedPatterns.map(pattern => (
+      <div
+        key={`${pattern.origin}:${pattern.method}:${pattern.pathPattern}:${pattern.scopeRevision ?? 'any'}`}
+        className="flex items-center gap-2 rounded-[7px] border border-line bg-sunk px-2.5 py-2"
+      >
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-1.5 font-mono text-[11.5px] text-fg">
+            <span className="rounded bg-panel px-1 py-0.5 text-[10.5px] font-semibold">{pattern.method.toUpperCase()}</span>
+            <span className="truncate" title={`${pattern.origin}${pattern.pathPattern}`}>
+              {host(pattern.origin)}{pattern.pathPattern}
+            </span>
+          </div>
+          <div className="mt-0.5 text-[11px] text-fg-subtle">
+            Pattern rule · Scope rev {pattern.scopeRevision ?? r.scopeRevision}
+          </div>
+        </div>
+        <button
+          type="button"
+          className={runBtn({ variant: 'ghost', size: 'xs' })}
+          disabled={pending > 0}
+          aria-label={`Revoke ${pattern.method.toUpperCase()} ${pattern.pathPattern}`}
+          onClick={() => {
+            onError('')
+            void send({
+              action: 'remove_approved_pattern',
+              origin: pattern.origin,
+              method: pattern.method,
+              pathPattern: pattern.pathPattern,
+              ...(pattern.scopeRevision !== undefined ? { scopeRevision: pattern.scopeRevision } : {}),
+            }).then(
+              () => toast.show('Approved pattern removed'),
+              (x: unknown) => onError(x instanceof Error ? x.message : 'Could not remove the pattern'),
+            )
+          }}
+        >
+          Revoke
+        </button>
+      </div>
+    ))}
+  </div>
+}
+
+function LeasesPopover({ onClose }: { onClose: () => void }) {
+  const { detail } = useRun()
+  const r = detail.run
+  const activeLeases = detail.approvalLeases ?? []
+  const activePatterns = (detail.approvedEndpointPatterns ?? r.approvedEndpointPatterns ?? []).filter(
+    p => p.scopeRevision === undefined || p.scopeRevision === r.scopeRevision,
+  )
+  const unmatchedPatterns = activePatterns.filter(
+    p => !activeLeases.some(
+      l => l.origin === p.origin && l.method.toUpperCase() === p.method.toUpperCase() && l.routePattern === p.pathPattern,
+    ),
+  )
+  const totalGrants = activeLeases.length + unmatchedPatterns.length
+  const [err, setErr] = useState('')
+
+  return <PopShell
+    title="Approval leases"
+    sub={totalGrants > 0 ? `${totalGrants} active` : 'None'}
+    footer={<>
+      {err && <span className="mr-auto text-[12px] text-danger">{err}</span>}
+      <button type="button" className={runBtn({ variant: 'ghost' })} onClick={onClose}>Close</button>
+    </>}
+  >
+    <p>Route-level write approvals granted in scope revision {r.scopeRevision}. Revoking requires approval again for future writes.</p>
+    <LeasesList onError={setErr} />
+  </PopShell>
+}
+
 function PolicyPopover({ onClose }: { onClose: () => void }) {
   const { detail, send, pending } = useRun()
   const r = detail.run
   const current: ApprovalPolicy = r.approvalPolicy ?? 'auto_review'
   const editable = !['complete', 'stopped', 'failed'].includes(r.status)
+  const activeLeases = detail.approvalLeases ?? []
+  const activePatterns = (detail.approvedEndpointPatterns ?? r.approvedEndpointPatterns ?? []).filter(
+    p => p.scopeRevision === undefined || p.scopeRevision === r.scopeRevision,
+  )
+  const unmatchedPatterns = activePatterns.filter(
+    p => !activeLeases.some(
+      l => l.origin === p.origin && l.method.toUpperCase() === p.method.toUpperCase() && l.routePattern === p.pathPattern,
+    ),
+  )
+  const totalGrants = activeLeases.length + unmatchedPatterns.length
   const [err, setErr] = useState('')
   return <PopShell title="Approval policy" sub={editable ? 'Switches live' : runStatusLabel(r.status)} footer={err ? <span className="mr-auto text-[12px] text-danger">{err}</span> : undefined}>
     {approvalPolicies.map(p => {
@@ -396,6 +632,13 @@ function PolicyPopover({ onClose }: { onClose: () => void }) {
         <small className="text-[11.5px] font-normal leading-4 text-fg-subtle">{m.summary}</small>
       </button>
     })}
+    {totalGrants > 0 && <div className="mt-1 border-t border-line pt-2.5">
+      <div className="mb-1.5 flex items-center justify-between text-[11.5px] font-medium text-fg-muted">
+        <span>Active leases</span>
+        <span className="num text-fg-subtle">{totalGrants}</span>
+      </div>
+      <LeasesList onError={setErr} />
+    </div>}
   </PopShell>
 }
 
@@ -505,7 +748,7 @@ function DeleteRunDialog({ hasActiveWorkers, hasRunningLab, onClose, onDeleted }
           Permanently delete this run and all of its findings, HTTP traffic, reports, and artifacts. This cannot be undone.
         </p>
         <div className="flex flex-col gap-1.5 rounded-lg border border-line bg-sunk px-3 py-2.5">
-          <div className="line-clamp-2 text-[13px] font-medium text-fg" title={r.goal}>{r.goal}</div>
+          <div className="line-clamp-2 text-[13px] font-medium text-fg" title={r.goal}>{r.label || r.goal}</div>
           <div className="num flex flex-wrap items-center gap-1.5 text-[12px] text-fg-subtle">
             <StatusGlyph status={r.status} />
             <span>{runStatusLabel(r.status)}</span>

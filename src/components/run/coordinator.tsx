@@ -206,11 +206,13 @@ function ApprovalsCard({ now }: { now: number }) {
 // ---------------------------------------------------------------- agents dropdown (merged into compact filter bar)
 
 function AgentsDropdown({ members, filter, setFilter }: { members: BoardMember[]; filter: Filter; setFilter: (f: Filter) => void }) {
+  const { send, pending } = useRun()
+  const toast = useToast()
   const links = useLinks()
   const activeAgent = members.find(m => m.handle === filter)
   const workingCount = members.filter(m => m.state === 'working').length
   return <Dropdown
-    menuClassName="top-7 max-h-[280px] w-[236px] overflow-auto p-[5px]"
+    menuClassName="top-7 max-h-[280px] w-[280px] overflow-auto p-[5px]"
     btnClassName={cn(
       'inline-flex h-6 flex-none cursor-pointer items-center gap-[5px] whitespace-nowrap rounded-control border-0 px-2 font-sans text-[12px] font-normal shadow-none transition-[background-color,color] duration-[var(--d1)]',
       activeAgent ? 'bg-press text-fg hover:bg-press' : 'bg-transparent text-fg-subtle hover:bg-hover hover:text-fg',
@@ -229,6 +231,7 @@ function AgentsDropdown({ members, filter, setFilter }: { members: BoardMember[]
         const meta = boardStateMeta[m.state as keyof typeof boardStateMeta] ?? boardStateMeta.waiting
         const on = filter === m.handle
         const profile = m.specialistProfile ?? specialistProfileByHandle[m.handle]
+        const canRetire = m.role !== 'coordinator' && m.role !== 'system' && m.state !== 'retired'
         return <div key={m.id} className={cn('flex items-center gap-0.5', m.state === 'retired' && 'opacity-65')} data-handle={m.handle} data-state={m.state}>
           <button
             type="button"
@@ -249,6 +252,21 @@ function AgentsDropdown({ members, filter, setFilter }: { members: BoardMember[]
             onClick={() => { close(); links.worker(m.activeAssignmentId!) }}
           >
             <Icon name="ext" size={12} />
+          </button>}
+          {canRetire && <button
+            type="button"
+            className={cn(runBtn({ variant: 'ghost', size: 'xs' }), 'h-[24px] flex-none px-1.5 text-[11px] text-fg-subtle hover:text-danger')}
+            aria-label={`Retire @${m.handle}`}
+            title={`Retire @${m.handle} from the board`}
+            disabled={pending > 0}
+            onClick={() => {
+              void send({ action: 'retire_member', handle: m.handle }).then(
+                () => toast.show(`Retired @${m.handle}`),
+                (e: unknown) => toast.show(e instanceof Error ? e.message : `Could not retire @${m.handle}.`, { tone: 'error' }),
+              )
+            }}
+          >
+            Retire
           </button>}
         </div>
       })}
