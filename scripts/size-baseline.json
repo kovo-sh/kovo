@@ -7,7 +7,7 @@
   "files": {
     "src/server/agent-prompts.ts": 2532,
     "src/server/agent-session.ts": 4734,
-    "src/server/broker.ts": 6395,
+    "src/server/broker.ts": 6274,
     "src/server/browser-session-auth.ts": 2535,
     "src/server/deterministic-engine.ts": 5667,
     "src/server/deterministic-specs.ts": 2237,
@@ -56,7 +56,6 @@
     "src/server/board-tools.ts::createBoardTools": 241,
     "src/server/broker.ts::defaultWsTransport": 269,
     "src/server/broker.ts::defaultWsTransport.<anonymous>": 245,
-    "src/server/broker.ts::RequestBroker.acquireSlot": 173,
     "src/server/broker.ts::RequestBroker.applyAuthMutationIfNeeded": 266,
     "src/server/broker.ts::RequestBroker.executeHttp2Exchange": 390,
     "src/server/broker.ts::RequestBroker.executeHttp2Exchange.<anonymous>": 381,
