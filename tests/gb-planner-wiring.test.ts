@@ -671,6 +671,10 @@ test('ExecWorkerRunner triggers hop-continuation on non-confirmed complete_inten
     })
 
     const llm = await startMockLlmServer(t, (body, reqIndex) => {
+      const isWorkerCall = Array.isArray(body.tools) && body.tools.some(
+        tool => tool && typeof tool === 'object' && (tool as { name?: string }).name === 'complete_intent',
+      )
+      if (!isWorkerCall) return { text: 'planner no-op' }
       const inputItems = Array.isArray(body.input) ? body.input : [body.input]
       const firstUserMsg = inputItems.find(item => item && typeof item === 'object' && (item as { role?: string }).role === 'user')
       const ownTaskText = JSON.stringify(firstUserMsg ?? '')
@@ -808,12 +812,16 @@ test('ExecWorkerRunner triggers hop-continuation on non-confirmed complete_inten
 
     let cont1PromptText = ''
     const llm = await startMockLlmServer(t, (body, reqIndex) => {
+      const isWorkerCall = Array.isArray(body.tools) && body.tools.some(
+        tool => tool && typeof tool === 'object' && (tool as { name?: string }).name === 'complete_intent',
+      )
+      if (!isWorkerCall) return { text: 'planner no-op' }
       const inputItems = Array.isArray(body.input) ? body.input : [body.input]
       const firstUserMsg = inputItems.find(item => item && typeof item === 'object' && (item as { role?: string }).role === 'user')
       const ownTaskText = JSON.stringify(firstUserMsg ?? '')
       const fullText = JSON.stringify(body.input ?? '')
       if (ownTaskText.includes('continuation #1')) {
-        cont1PromptText = ownTaskText
+        if (!cont1PromptText) cont1PromptText = ownTaskText
         return {
           toolCall: {
             callId: `c_done_mt_cont1_${reqIndex}`,

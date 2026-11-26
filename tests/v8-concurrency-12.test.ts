@@ -112,6 +112,32 @@ async function startFastMockLlm(
     const chunks: Buffer[] = []
     req.on('data', chunk => chunks.push(chunk as Buffer))
     req.on('end', () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}') as Record<string, unknown>
+      const isWorkerCall = Array.isArray(body.tools) && body.tools.some(
+        tool => tool && typeof tool === 'object' && (tool as { name?: string }).name === 'complete_intent',
+      )
+      if (!isWorkerCall) {
+        // Ignore background debounced planner turns so specialist concurrency measurements reflect only worker slots.
+        res.statusCode = 200
+        res.setHeader('Content-Type', 'text/event-stream')
+        res.setHeader('Cache-Control', 'no-cache')
+        const emit = (event: string, data: Record<string, unknown>) => {
+          res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
+        }
+        emit('response.created', { type: 'response.created', response: { id: 'resp_plan', status: 'in_progress', output: [] } })
+        emit('response.completed', {
+          type: 'response.completed',
+          response: {
+            id: 'resp_plan',
+            status: 'completed',
+            output: [{ id: 'item_plan', type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: 'ok' }] }],
+            usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15, input_tokens_details: { cached_tokens: 0 } },
+          },
+        })
+        res.write('data: [DONE]\n\n')
+        res.end()
+        return
+      }
       active += 1
       total += 1
       if (active > peak) peak = active

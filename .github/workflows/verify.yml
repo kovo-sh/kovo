@@ -54,4 +54,4 @@ jobs:
         run: npm run test:boundaries
       - name: Run live Chromium E2E journeys
         timeout-minutes: 12
-        run: KOVO_ALLOW_LOCAL_MODEL=1 node --test tests/e2e-ui-journeys.test.ts
+        run: npm run build && KOVO_ALLOW_LOCAL_MODEL=1 node --test tests/e2e-ui-journeys.test.ts
