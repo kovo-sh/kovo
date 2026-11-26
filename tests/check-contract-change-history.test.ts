@@ -14,7 +14,7 @@
  */
 import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { copyFileSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { test } from 'node:test'
@@ -30,6 +30,7 @@ import {
   isGateOrKernelTestFile,
   loadKernelManifestFiles,
   loadParityCorpusCases,
+  type ParityGateEvalResult,
 } from '../scripts/check-contract-change.ts'
 import {
   checkKernelManifestFreshness,
@@ -186,30 +187,209 @@ test('R3-04 corpus covers: all 40 corpus files declare valid covers.files/classe
 // 3. History-replay guard on 13337ae, fafeb3c, and 8a94536
 // ============================================================================
 
-test('R3-04 history-replay: commits 13337ae, fafeb3c, and 8a94536 ALL FAIL the upgraded parity gate', () => {
+function hasCommitWithParents(repoDir: string, ref: string): boolean {
+  const commitCheck = spawnSync('git', ['cat-file', '-e', `${ref}^{commit}`], {
+    cwd: repoDir,
+    stdio: 'ignore',
+  })
+  if (commitCheck.status !== 0) return false
+  const parents = spawnSync('git', ['rev-list', '--parents', '-n', '1', ref], {
+    cwd: repoDir,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  if (parents.status !== 0) return false
+  const parentShas = parents.stdout.trim().split(/\s+/).filter(Boolean).slice(1)
+  if (parentShas.length === 0) return false
+  return parentShas.every(
+    parentSha =>
+      spawnSync('git', ['cat-file', '-e', `${parentSha}^{commit}`], {
+        cwd: repoDir,
+        stdio: 'ignore',
+      }).status === 0,
+  )
+}
+
+function buildHermeticHistoryReplayRepo(t: { after: (fn: () => void) => void }): {
+  repo: string
+  sha13337ae: string
+  shaFafeb3c: string
+  sha8a94536: string
+} {
+  const { repo, git } = makeTempGitRepo(t, 'r304-hist-replay-')
+  mkdirSync(join(repo, 'scripts'), { recursive: true })
+  mkdirSync(join(repo, 'src/server'), { recursive: true })
+  mkdirSync(join(repo, 'tests/parity/corpus'), { recursive: true })
+
+  // Use the real kernel manifest and corpus case from REPO_ROOT so the hermetic
+  // replay evaluates the exact same covers.files and manifest rules as live history.
+  copyFileSync(join(REPO_ROOT, 'scripts/kernel-manifest.json'), join(repo, 'scripts/kernel-manifest.json'))
+  copyFileSync(
+    join(REPO_ROOT, 'tests/parity/corpus/r4-h5-h6-rbac-fp.json'),
+    join(repo, 'tests/parity/corpus/r4-h5-h6-rbac-fp.json'),
+  )
+
+  const seedFiles = [
+    'src/server/exec-verify.ts',
+    'src/server/floor-recipe-engine.ts',
+    'src/server/oracle-invariants.ts',
+    'src/server/replay-verifier.ts',
+    'src/server/composite-receipt.ts',
+    'src/server/verify-rpc.ts',
+  ]
+  for (const rel of seedFiles) {
+    writeFileSync(join(repo, rel), `export const seed = '${rel}:v1'\n`)
+  }
+  git('add', '.')
+  git('commit', '-m', 'base')
+
+  // 1) Replay 13337ae: merge commit carrying exec-verify.ts diff with no corpus touch and no Parity-case trailer.
+  git('checkout', '-b', 'swarm-r2-12-schema-auth-c928198c')
+  writeFileSync(join(repo, 'src/server/exec-verify.ts'), "export const seed = 'exec-verify:13337ae'\n")
+  git('add', 'src/server/exec-verify.ts')
+  git('commit', '-m', 'fix(store): enforce single persistence authority and route exec-verify writes (R2-12)')
+  git('checkout', 'main')
+  git('merge', '--no-ff', 'swarm-r2-12-schema-auth-c928198c', '-m', "Merge branch 'swarm-r2-12-schema-auth-c928198c'")
+  const sha13337ae = git('rev-parse', 'HEAD')
+
+  // 2) Replay fafeb3c: merge commit carrying floor-recipe-engine + oracle-invariants + replay-verifier citing unrelated r4-h5-h6-rbac-fp.
+  git('checkout', '-b', 'swarm-r2-17-persona-typed-ce18abda')
+  writeFileSync(join(repo, 'src/server/floor-recipe-engine.ts'), "export const seed = 'floor-recipe-engine:fafeb3c'\n")
+  writeFileSync(join(repo, 'src/server/oracle-invariants.ts'), "export const seed = 'oracle-invariants:fafeb3c'\n")
+  writeFileSync(join(repo, 'src/server/replay-verifier.ts'), "export const seed = 'replay-verifier:fafeb3c'\n")
+  git('add', 'src/server/floor-recipe-engine.ts', 'src/server/oracle-invariants.ts', 'src/server/replay-verifier.ts')
+  git(
+    'commit',
+    '-m',
+    'feat(personas): typed tenant_ref and privilege end to end (R2-17)\n\nParity-case: r4-h5-h6-rbac-fp',
+  )
+  git('checkout', 'main')
+  git('merge', '--no-ff', 'swarm-r2-17-persona-typed-ce18abda', '-m', "Merge branch 'swarm-r2-17-persona-typed-ce18abda'")
+  const shaFafeb3c = git('rev-parse', 'HEAD')
+
+  // 3) Replay 8a94536: non-merge commit carrying composite-receipt + exec-verify + oracle-invariants + verify-rpc citing only r4-h5-h6-rbac-fp.
+  writeFileSync(join(repo, 'src/server/composite-receipt.ts'), "export const seed = 'composite-receipt:8a94536'\n")
+  writeFileSync(join(repo, 'src/server/exec-verify.ts'), "export const seed = 'exec-verify:8a94536'\n")
+  writeFileSync(join(repo, 'src/server/oracle-invariants.ts'), "export const seed = 'oracle-invariants:8a94536'\n")
+  writeFileSync(join(repo, 'src/server/verify-rpc.ts'), "export const seed = 'verify-rpc:8a94536'\n")
+  git(
+    'add',
+    'src/server/composite-receipt.ts',
+    'src/server/exec-verify.ts',
+    'src/server/oracle-invariants.ts',
+    'src/server/verify-rpc.ts',
+  )
+  git(
+    'commit',
+    '-m',
+    'fix(worker-gate): resolve 5 production regressions in verify-rpc, composite-receipt, oracle-invariants, and exec-verify\n\nParity-case: r4-h5-h6-rbac-fp',
+  )
+  const sha8a94536 = git('rev-parse', 'HEAD')
+
+  return { repo, sha13337ae, shaFafeb3c, sha8a94536 }
+}
+
+function assertHistoricalParityGateRejections(
+  label: string,
+  res13337ae: ParityGateEvalResult,
+  resFafeb3c: ParityGateEvalResult,
+  res8a94536: ParityGateEvalResult,
+): void {
   // 1) 13337ae: exec-verify.ts kernel diff with no corpus touch and no Parity-case trailer.
-  const res13337ae = evaluateSingleCommitParityGate(REPO_ROOT, '13337ae')
-  assert.equal(res13337ae.required, true, '13337ae must trigger the confirmation-kernel gate')
-  assert.equal(res13337ae.ok, false, '13337ae MUST FAIL (missing Parity-case for exec-verify.ts)')
-  assert.ok(res13337ae.kernelFilesTouched.includes('src/server/exec-verify.ts'))
-  assert.ok(res13337ae.uncoveredKernelFiles.includes('src/server/exec-verify.ts'))
+  assert.equal(res13337ae.required, true, `${label}: 13337ae must trigger the confirmation-kernel gate`)
+  assert.equal(res13337ae.ok, false, `${label}: 13337ae MUST FAIL (missing Parity-case for exec-verify.ts)`)
+  assert.deepEqual(res13337ae.kernelFilesTouched, ['src/server/exec-verify.ts'])
+  assert.deepEqual(res13337ae.uncoveredKernelFiles, ['src/server/exec-verify.ts'])
+  assert.deepEqual(res13337ae.corpusFilesTouched, [])
+  assert.deepEqual(res13337ae.parityCaseTrailers, [])
+  assert.ok(res13337ae.reason?.includes('src/server/exec-verify.ts'), `${label}: 13337ae reason must name exec-verify.ts`)
 
   // 2) fafeb3c: floor-recipe-engine + oracle-invariants + replay-verifier citing unrelated r4-h5-h6-rbac-fp.
-  const resFafeb3c = evaluateSingleCommitParityGate(REPO_ROOT, 'fafeb3c')
-  assert.equal(resFafeb3c.required, true, 'fafeb3c must trigger the confirmation-kernel gate')
-  assert.equal(resFafeb3c.ok, false, 'fafeb3c MUST FAIL (cited r4-h5-h6-rbac-fp does not cover changed files)')
-  assert.ok(resFafeb3c.uncoveredKernelFiles.includes('src/server/floor-recipe-engine.ts'))
-  assert.ok(resFafeb3c.uncoveredKernelFiles.includes('src/server/oracle-invariants.ts'))
-  assert.ok(resFafeb3c.uncoveredKernelFiles.includes('src/server/replay-verifier.ts'))
+  assert.equal(resFafeb3c.required, true, `${label}: fafeb3c must trigger the confirmation-kernel gate`)
+  assert.equal(resFafeb3c.ok, false, `${label}: fafeb3c MUST FAIL (cited r4-h5-h6-rbac-fp does not cover changed files)`)
+  assert.deepEqual(resFafeb3c.kernelFilesTouched, [
+    'src/server/floor-recipe-engine.ts',
+    'src/server/oracle-invariants.ts',
+    'src/server/replay-verifier.ts',
+  ])
+  assert.deepEqual(resFafeb3c.uncoveredKernelFiles, [
+    'src/server/floor-recipe-engine.ts',
+    'src/server/oracle-invariants.ts',
+    'src/server/replay-verifier.ts',
+  ])
+  assert.deepEqual(resFafeb3c.parityCaseTrailers, ['r4-h5-h6-rbac-fp'])
+  assert.deepEqual(resFafeb3c.validParityCaseIds, ['r4-h5-h6-rbac-fp'])
+  assert.ok(
+    resFafeb3c.reason?.includes('not covered by commit Parity-case/corpus covers.files'),
+    `${label}: fafeb3c reason must report uncovered covers.files`,
+  )
 
   // 3) 8a94536: composite-receipt + exec-verify + oracle-invariants + verify-rpc citing only r4-h5-h6-rbac-fp.
-  const res8a94536 = evaluateSingleCommitParityGate(REPO_ROOT, '8a94536')
-  assert.equal(res8a94536.required, true, '8a94536 must trigger the confirmation-kernel gate')
-  assert.equal(res8a94536.ok, false, '8a94536 MUST FAIL (r4-h5-h6-rbac-fp does not cover exec-verify, oracle-invariants, or verify-rpc)')
-  assert.ok(res8a94536.kernelFilesTouched.includes('src/server/verify-rpc.ts'))
-  assert.ok(res8a94536.uncoveredKernelFiles.includes('src/server/verify-rpc.ts'))
-  assert.ok(res8a94536.uncoveredKernelFiles.includes('src/server/exec-verify.ts'))
-  assert.ok(res8a94536.uncoveredKernelFiles.includes('src/server/oracle-invariants.ts'))
+  assert.equal(res8a94536.required, true, `${label}: 8a94536 must trigger the confirmation-kernel gate`)
+  assert.equal(
+    res8a94536.ok,
+    false,
+    `${label}: 8a94536 MUST FAIL (r4-h5-h6-rbac-fp does not cover exec-verify, oracle-invariants, or verify-rpc)`,
+  )
+  assert.deepEqual(res8a94536.kernelFilesTouched, [
+    'src/server/composite-receipt.ts',
+    'src/server/exec-verify.ts',
+    'src/server/oracle-invariants.ts',
+    'src/server/verify-rpc.ts',
+  ])
+  assert.deepEqual(res8a94536.uncoveredKernelFiles, [
+    'src/server/exec-verify.ts',
+    'src/server/oracle-invariants.ts',
+    'src/server/verify-rpc.ts',
+  ])
+  assert.deepEqual(res8a94536.parityCaseTrailers, ['r4-h5-h6-rbac-fp'])
+  assert.deepEqual(res8a94536.validParityCaseIds, ['r4-h5-h6-rbac-fp'])
+  assert.ok(
+    res8a94536.reason?.includes('not covered by commit Parity-case/corpus covers.files'),
+    `${label}: 8a94536 reason must report uncovered covers.files`,
+  )
+}
+
+test('R3-04 history-replay: commits 13337ae, fafeb3c, and 8a94536 ALL FAIL the upgraded parity gate', (t) => {
+  // Always run the hermetic git-repo replay so shallow/squashed clones (e.g. CI fetch-depth: 1/2)
+  // verify all three historical bypasses against the live kernel manifest and corpus case.
+  const hermetic = buildHermeticHistoryReplayRepo(t)
+  const hermetic13337ae = evaluateSingleCommitParityGate(hermetic.repo, hermetic.sha13337ae)
+  const hermeticFafeb3c = evaluateSingleCommitParityGate(hermetic.repo, hermetic.shaFafeb3c)
+  const hermetic8a94536 = evaluateSingleCommitParityGate(hermetic.repo, hermetic.sha8a94536)
+  assertHistoricalParityGateRejections('hermetic', hermetic13337ae, hermeticFafeb3c, hermetic8a94536)
+
+  // When full git history is present, ALSO run live replay against the real historical commits
+  // and assert exact 1-for-1 parity between live history and the hermetic fixture.
+  const forceShallow = process.env.KOVO_TEST_SHALLOW_HISTORY === '1'
+  const liveShas = ['13337ae', 'fafeb3c', '8a94536'] as const
+  const hasLiveHistory = !forceShallow && liveShas.every(sha => hasCommitWithParents(REPO_ROOT, sha))
+  if (hasLiveHistory) {
+    const live13337ae = evaluateSingleCommitParityGate(REPO_ROOT, '13337ae')
+    const liveFafeb3c = evaluateSingleCommitParityGate(REPO_ROOT, 'fafeb3c')
+    const live8a94536 = evaluateSingleCommitParityGate(REPO_ROOT, '8a94536')
+    assertHistoricalParityGateRejections('live', live13337ae, liveFafeb3c, live8a94536)
+
+    for (const [name, live, synth] of [
+      ['13337ae', live13337ae, hermetic13337ae],
+      ['fafeb3c', liveFafeb3c, hermeticFafeb3c],
+      ['8a94536', live8a94536, hermetic8a94536],
+    ] as const) {
+      assert.deepEqual(synth.kernelFilesTouched, live.kernelFilesTouched, `${name} hermetic kernelFilesTouched drift`)
+      assert.deepEqual(synth.uncoveredKernelFiles, live.uncoveredKernelFiles, `${name} hermetic uncoveredKernelFiles drift`)
+      assert.deepEqual(synth.parityCaseTrailers, live.parityCaseTrailers, `${name} hermetic parityCaseTrailers drift`)
+      assert.equal(synth.reason, live.reason, `${name} hermetic rejection reason drift`)
+    }
+  }
+
+  // Verify shallow-clone detection returns false when historical commits are absent.
+  const shallow = makeTempGitRepo(t, 'r304-shallow-check-')
+  writeFileSync(join(shallow.repo, 'README.md'), 'shallow clone fixture\n')
+  shallow.git('add', 'README.md')
+  shallow.git('commit', '-m', 'shallow head')
+  for (const sha of liveShas) {
+    assert.equal(hasCommitWithParents(shallow.repo, sha), false, `shallow repo must not resolve ${sha}`)
+  }
 })
 
 // ============================================================================
