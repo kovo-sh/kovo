@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { registerPersona, updatePersona } from '../../actions.ts'
 import {
   registerBrowserSessionPersona,
@@ -22,7 +22,7 @@ import {
 import { Disclosure, DisclosureContent, DisclosureTrigger } from '../ui/disclosure.tsx'
 import { Input, NativeSelect, Textarea } from '../ui/input.tsx'
 import type { ProjectLoaderData } from './types.ts'
-import { LOGIN_URL_PLACEHOLDERS } from './types.ts'
+import { LOGIN_URL_PLACEHOLDERS, safeHost } from './types.ts'
 
 export type UniversalAuthMode = 'browser_session' | 'header_cookie' | 'automated_login'
 export type StaticCredentialKind = 'cookie' | 'bearer' | 'header'
@@ -36,6 +36,10 @@ interface CaptureSummary {
   origins?: string[]
   headerNames?: string[]
   hasAuthorizationHeader: boolean
+  verifyOrigin?: string
+  verifyPath?: string
+  capturedAppOrigins?: string[]
+  capturedIdpOrigins?: string[]
 }
 
 interface ActiveCaptureSession {
@@ -45,10 +49,53 @@ interface ActiveCaptureSession {
   viewport: { width: number; height: number }
 }
 
+const EMPTY_ASSETS: readonly ProjectLoaderData['assets'][number][] = []
+
+export function buildProjectDefaultOrigins(
+  project: Pick<ProjectLoaderData['project'], 'seeds' | 'defaultScope'>,
+  assets: readonly Pick<ProjectLoaderData['assets'][number], 'origin' | 'thirdParty'>[] = EMPTY_ASSETS,
+): string[] {
+  const ordered: string[] = []
+  const seen = new Set<string>()
+  const pushOrigin = (raw: string | undefined | null) => {
+    if (typeof raw !== 'string') return
+    const trimmed = raw.trim()
+    if (!trimmed) return
+    let normalized = trimmed
+    try {
+      normalized = new URL(trimmed).origin
+    } catch {
+      // Keep raw string when not a full URL; server validation will check it.
+    }
+    if (seen.has(normalized)) return
+    seen.add(normalized)
+    ordered.push(normalized)
+  }
+  for (const origin of project.defaultScope ?? []) pushOrigin(origin)
+  for (const origin of project.seeds ?? []) pushOrigin(origin)
+  for (const asset of assets ?? []) {
+    if (!asset.thirdParty) pushOrigin(asset.origin)
+  }
+  return ordered
+}
+
+function parseOriginList(raw: string): string[] {
+  const seen = new Set<string>()
+  const result: string[] = []
+  for (const item of raw.split(/[\s,]+/)) {
+    const trimmed = item.trim()
+    if (!trimmed || seen.has(trimmed)) continue
+    seen.add(trimmed)
+    result.push(trimmed)
+  }
+  return result
+}
+
 interface Props {
   open: boolean
   onClose: () => void
   project: ProjectLoaderData['project']
+  assets?: readonly ProjectLoaderData['assets'][number][]
   existingPersonas: readonly Pick<PublicPersona, 'handle' | 'roleLabel'>[]
   editingPersona?: PublicPersona | null
   onCreated: (created: { id: string; handle: string }) => void
@@ -142,20 +189,28 @@ export function PersonaFormModal({
   open,
   onClose,
   project,
+  assets = EMPTY_ASSETS,
   existingPersonas,
   editingPersona = null,
   onCreated,
   submitLabel = 'Save test account',
 }: Props) {
+  const defaultProjectOrigins = useMemo(
+    () => buildProjectDefaultOrigins(project, assets),
+    [project.seeds, project.defaultScope, assets],
+  )
   const [authMode, setAuthMode] = useState<UniversalAuthMode>('browser_session')
   const [staticKind, setStaticKind] = useState<StaticCredentialKind>('cookie')
   const [loginAdapter, setLoginAdapter] = useState<PersonaLoginAdapter>('auto')
   const [loginEmail, setLoginEmail] = useState('')
   const [loginUrl, setLoginUrl] = useState('')
+  const [verifyOrigin, setVerifyOrigin] = useState('')
   const [verifyPath, setVerifyPath] = useState('')
+  const [idpOriginsText, setIdpOriginsText] = useState('')
+  const [selectedStartOrigin, setSelectedStartOrigin] = useState(() => defaultProjectOrigins[0] ?? '')
   const [roleLabel, setRoleLabel] = useState(() => suggestNextAccountLabel(existingPersonas))
   const [headerName, setHeaderName] = useState('')
-  const [origins, setOrigins] = useState(() => project.seeds.join('\n'))
+  const [origins, setOrigins] = useState(() => defaultProjectOrigins.join('\n'))
   const [secret, setSecret] = useState('')
   const [curlPaste, setCurlPaste] = useState('')
   const [curlNote, setCurlNote] = useState('')
@@ -169,6 +224,7 @@ export function PersonaFormModal({
   const [navFlags, setNavFlags] = useState({ canBack: false, canForward: false })
   const [captureBusy, setCaptureBusy] = useState(false)
   const [captureError, setCaptureError] = useState('')
+  const [browserNavError, setBrowserNavError] = useState('')
   const [capturedToken, setCapturedToken] = useState('')
   const [importedStorageStateJson, setImportedStorageStateJson] = useState('')
   const [capturedSummary, setCapturedSummary] = useState<CaptureSummary | null>(null)
@@ -276,6 +332,7 @@ export function PersonaFormModal({
     setNavFlags({ canBack: false, canForward: false })
     setHasReceivedFrame(false)
     setCurrentRemoteUrl('')
+    setBrowserNavError('')
     setActiveCapture(null)
     if (!idToCancel) return
     try {
@@ -302,6 +359,7 @@ export function PersonaFormModal({
     setStaticKind(init.staticKind)
     setLoginAdapter(init.adapter)
     setCaptureError('')
+    setBrowserNavError('')
     setCapturedToken('')
     setImportedStorageStateJson('')
     setCapturedSummary(null)
@@ -312,10 +370,18 @@ export function PersonaFormModal({
       setRoleLabel(editingPersona.roleLabel)
       setLoginEmail(editingPersona.loginConfig?.email ?? '')
       setLoginUrl(editingPersona.loginConfig?.loginUrl ?? '')
-      const cfg = editingPersona.loginConfig as ({ verifyPath?: string } | null | undefined)
+      const cfg = editingPersona.loginConfig
+      const nextVerifyOrigin = typeof cfg?.verifyOrigin === 'string' ? cfg.verifyOrigin : ''
+      setVerifyOrigin(nextVerifyOrigin)
       setVerifyPath(typeof cfg?.verifyPath === 'string' ? cfg.verifyPath : '')
+      setIdpOriginsText(Array.isArray(cfg?.idpOrigins) ? cfg.idpOrigins.join('\n') : '')
       setHeaderName(editingPersona.headerName ?? '')
       setOrigins(editingPersona.originAllowlist.join('\n'))
+      setSelectedStartOrigin(
+        (nextVerifyOrigin && editingPersona.originAllowlist.includes(nextVerifyOrigin))
+          ? nextVerifyOrigin
+          : (editingPersona.originAllowlist[0] ?? defaultProjectOrigins[0] ?? ''),
+      )
       setSecret('')
       setCurlPaste('')
       setCurlNote('')
@@ -326,13 +392,16 @@ export function PersonaFormModal({
     setHeaderName('')
     setLoginEmail('')
     setLoginUrl('')
+    setVerifyOrigin('')
     setVerifyPath('')
-    setOrigins(project.seeds.join('\n'))
+    setIdpOriginsText('')
+    setOrigins(defaultProjectOrigins.join('\n'))
+    setSelectedStartOrigin(defaultProjectOrigins[0] ?? '')
     setSecret('')
     setCurlPaste('')
     setCurlNote('')
     setAdvancedOpen(false)
-  }, [open, project.id, project.seeds, existingPersonas, editingPersona])
+  }, [open, project.id, defaultProjectOrigins, existingPersonas, editingPersona])
 
   // Stream live CDP JPEG frames onto the embedded <canvas> whenever a capture session is active.
   useEffect(() => {
@@ -345,8 +414,11 @@ export function PersonaFormModal({
 
     const handleInit = (ev: MessageEvent) => {
       try {
-        const payload = JSON.parse(ev.data) as { url?: string }
+        const payload = JSON.parse(ev.data) as { url?: string; lastError?: string | null }
         if (payload.url) syncRemoteUrl(payload.url)
+        if (typeof payload.lastError === 'string' && payload.lastError.trim()) {
+          setBrowserNavError(payload.lastError.trim())
+        }
       } catch { /* ignore */ }
     }
 
@@ -379,6 +451,14 @@ export function PersonaFormModal({
       } catch { /* ignore */ }
     }
 
+    const handleNavError = (ev: MessageEvent) => {
+      try {
+        const payload = JSON.parse(ev.data) as { message?: string }
+        const message = typeof payload.message === 'string' ? payload.message.trim() : ''
+        setBrowserNavError(message)
+      } catch { /* ignore */ }
+    }
+
     const handleStatus = (ev: MessageEvent) => {
       try {
         const payload = JSON.parse(ev.data) as { state?: string; reason?: string }
@@ -398,6 +478,7 @@ export function PersonaFormModal({
     es.addEventListener('init', handleInit as EventListener)
     es.addEventListener('frame', handleFrame as EventListener)
     es.addEventListener('url', handleUrl as EventListener)
+    es.addEventListener('nav_error', handleNavError as EventListener)
     es.addEventListener('status', handleStatus as EventListener)
     es.onerror = () => {
       if (aborted) return
@@ -438,8 +519,11 @@ export function PersonaFormModal({
     setLoginAdapter('auto')
     setLoginEmail('')
     setLoginUrl('')
+    setVerifyOrigin('')
     setVerifyPath('')
-    setOrigins(project.seeds.join('\n'))
+    setIdpOriginsText('')
+    setOrigins(defaultProjectOrigins.join('\n'))
+    setSelectedStartOrigin(defaultProjectOrigins[0] ?? '')
     setSecret('')
     setCurlPaste('')
     setCurlNote('')
@@ -450,6 +534,7 @@ export function PersonaFormModal({
     setImportJsonText('')
     setImportNote('')
     setCaptureError('')
+    setBrowserNavError('')
     setAdvancedOpen(false)
   }
 
@@ -508,16 +593,34 @@ export function PersonaFormModal({
     }
   }
 
+  const startingHostOptions = useMemo(() => {
+    const combined = [...parseOriginList(origins), ...defaultProjectOrigins]
+    const seen = new Set<string>()
+    const result: string[] = []
+    for (const item of combined) {
+      if (!item || seen.has(item)) continue
+      seen.add(item)
+      result.push(item)
+    }
+    return result
+  }, [origins, defaultProjectOrigins])
+
+  const effectiveStartOrigin = startingHostOptions.includes(selectedStartOrigin)
+    ? selectedStartOrigin
+    : (startingHostOptions[0] ?? '')
+
   async function handleStartInteractiveCapture() {
-    const allowlist = origins.split(/[\s,]+/).filter(Boolean)
-    const targetOrigin = allowlist[0] || project.seeds[0]
+    const allowlist = parseOriginList(origins)
+    const targetOrigin = effectiveStartOrigin || allowlist[0] || defaultProjectOrigins[0]
     if (!targetOrigin) {
       setCaptureError('Add at least one allowed site origin in Advanced configuration first.')
       setAdvancedOpen(true)
       return
     }
+    const mergedAllowlist = [...new Set([targetOrigin, ...allowlist, ...defaultProjectOrigins])]
     setCaptureBusy(true)
     setCaptureError('')
+    setBrowserNavError('')
     try {
       await cancelActiveCaptureSession()
       const res = await fetch('/_kovo/auth-capture/start', {
@@ -527,13 +630,14 @@ export function PersonaFormModal({
         body: JSON.stringify({
           projectId: project.id,
           targetOrigin,
-          allowedOrigins: allowlist,
+          allowedOrigins: mergedAllowlist,
         }),
       })
       const payload = await res.json().catch(() => ({})) as {
         captureId?: string
         targetOrigin?: string
         currentUrl?: string
+        lastError?: string | null
         expiresAt?: number
         viewport?: { width: number; height: number }
         error?: string
@@ -552,6 +656,7 @@ export function PersonaFormModal({
       setHasReceivedFrame(false)
       setCurrentRemoteUrl(initialUrl)
       setCaptureUrlInput(initialUrl)
+      setBrowserNavError(typeof payload.lastError === 'string' ? payload.lastError : '')
       setActiveCapture({
         captureId: payload.captureId,
         targetOrigin: payload.targetOrigin || targetOrigin,
@@ -580,6 +685,10 @@ export function PersonaFormModal({
       const payload = await res.json().catch(() => ({})) as {
         ok?: boolean
         captureToken?: string
+        verifyOrigin?: string
+        verifyPath?: string
+        capturedAppOrigins?: string[]
+        capturedIdpOrigins?: string[]
         summary?: CaptureSummary
         error?: string
       }
@@ -595,11 +704,48 @@ export function PersonaFormModal({
       pendingHistoryIndexRef.current = null
       setNavFlags({ canBack: false, canForward: false })
       setHasReceivedFrame(false)
+      setBrowserNavError('')
       setActiveCapture(null)
       setCapturedToken(payload.captureToken)
       setImportedStorageStateJson('')
       setImportJsonText('')
-      if (payload.summary) setCapturedSummary(payload.summary)
+
+      const nextVerifyOrigin = payload.verifyOrigin || payload.summary?.verifyOrigin || activeCapture.targetOrigin
+      const nextVerifyPath = payload.verifyPath || payload.summary?.verifyPath || '/'
+      const nextAppOrigins = payload.capturedAppOrigins ?? payload.summary?.capturedAppOrigins ?? (nextVerifyOrigin ? [nextVerifyOrigin] : [])
+      const nextIdpOrigins = payload.capturedIdpOrigins ?? payload.summary?.capturedIdpOrigins ?? []
+
+      const existingOrigins = parseOriginList(origins)
+      const mergedAppOrigins = [
+        ...(nextVerifyOrigin ? [nextVerifyOrigin] : []),
+        ...nextAppOrigins,
+        ...existingOrigins,
+      ].filter((origin, idx, arr) => Boolean(origin) && arr.indexOf(origin) === idx)
+      if (mergedAppOrigins.length > 0) {
+        setOrigins(mergedAppOrigins.join('\n'))
+      }
+      if (nextVerifyOrigin) {
+        setVerifyOrigin(nextVerifyOrigin)
+        setSelectedStartOrigin(nextVerifyOrigin)
+      }
+      setVerifyPath(nextVerifyPath)
+
+      const existingIdpOrigins = parseOriginList(idpOriginsText)
+      const mergedIdpOrigins = [...existingIdpOrigins, ...nextIdpOrigins]
+        .filter((origin, idx, arr) => Boolean(origin) && arr.indexOf(origin) === idx)
+      if (mergedIdpOrigins.length > 0) {
+        setIdpOriginsText(mergedIdpOrigins.join('\n'))
+      }
+
+      if (payload.summary) {
+        setCapturedSummary({
+          ...payload.summary,
+          verifyOrigin: nextVerifyOrigin,
+          verifyPath: nextVerifyPath,
+          capturedAppOrigins: nextAppOrigins,
+          capturedIdpOrigins: nextIdpOrigins,
+        })
+      }
     } catch (err) {
       setCaptureError(err instanceof Error ? err.message : 'Unable to capture browser session.')
     } finally {
@@ -614,6 +760,7 @@ export function PersonaFormModal({
     const id = activeCaptureIdRef.current
     if (!id) return
     const isHover = body.kind === 'mouse' && body.type === 'mouseMoved'
+    const isNavigate = body.kind === 'navigate'
     try {
       const res = await fetch(`/_kovo/auth-capture/${encodeURIComponent(id)}/input`, {
         method: 'POST',
@@ -623,7 +770,10 @@ export function PersonaFormModal({
       })
       if (res.ok) {
         const data = await res.json().catch(() => ({})) as { url?: string }
-        if (data.url && body.kind === 'navigate') {
+        if (isNavigate) {
+          setBrowserNavError('')
+        }
+        if (data.url && isNavigate) {
           isEditingUrlRef.current = false
           syncRemoteUrl(data.url, {
             force: options?.forceUrlSync ?? true,
@@ -647,10 +797,18 @@ export function PersonaFormModal({
         setCaptureError(errData.error || 'Browser sign-in session ended or expired. Start again.')
         return
       }
+      if (isNavigate) {
+        setBrowserNavError(errData.error || `Navigation failed (HTTP ${res.status}).`)
+        return
+      }
       if (!isHover) {
         setCaptureError(errData.error || `Browser input failed (HTTP ${res.status}).`)
       }
     } catch {
+      if (isNavigate) {
+        setBrowserNavError('Could not deliver navigation request to the interactive browser — check your connection.')
+        return
+      }
       if (!isHover) {
         setCaptureError('Could not deliver input to the interactive browser — check your connection.')
       }
@@ -661,6 +819,7 @@ export function PersonaFormModal({
     const resolved = resolveNavigationTarget(rawUrl)
     if (!resolved) return
     setCaptureError('')
+    setBrowserNavError('')
     isEditingUrlRef.current = false
     addressInputRef.current?.blur()
     setCaptureUrlInput(resolved)
@@ -674,6 +833,7 @@ export function PersonaFormModal({
     pendingHistoryIndexRef.current = targetIdx
     isEditingUrlRef.current = false
     setCaptureError('')
+    setBrowserNavError('')
     setCaptureUrlInput(targetUrl)
     void sendCaptureInput({ kind: 'navigate', url: targetUrl }, { forceUrlSync: true, recordHistory: true })
   }
@@ -683,6 +843,7 @@ export function PersonaFormModal({
     if (!targetUrl) return
     isEditingUrlRef.current = false
     setCaptureError('')
+    setBrowserNavError('')
     void sendCaptureInput({ kind: 'navigate', url: targetUrl }, { forceUrlSync: true, recordHistory: false })
   }
 
@@ -798,33 +959,62 @@ export function PersonaFormModal({
         setCaptureError('Sign in with the embedded browser or import a storageState.json file first.')
         return
       }
+      const cleanVerifyOrigin = verifyOrigin.trim()
       const cleanVerifyPath = verifyPath.trim()
+      const parsedIdpOrigins = parseOriginList(idpOriginsText)
+      const saveBrowserMeta = async (personaId: string) => {
+        if (!cleanVerifyOrigin && parsedIdpOrigins.length === 0 && !editingPersona) return
+        const res = await fetch('/_kovo/auth-capture/persona-config', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            projectId: project.id,
+            personaId,
+            verifyOrigin: cleanVerifyOrigin || null,
+            ...(cleanVerifyPath ? { verifyPath: cleanVerifyPath } : {}),
+            idpOrigins: parsedIdpOrigins,
+          }),
+        })
+        if (!res.ok) {
+          const errPayload = await res.json().catch(() => ({})) as { error?: string }
+          throw new Error(errPayload.error || `Could not save browser session verification settings (HTTP ${res.status}).`)
+        }
+      }
       if (editingPersona) {
-        void personaAction.submit(() => updateBrowserSessionPersonaAction({ data: {
-          requestId: crypto.randomUUID(),
-          projectId: project.id,
-          personaId: editingPersona.id,
-          roleLabel: cleanLabel,
-          originAllowlist: allowlist,
-          ...(token ? { captureToken: token } : storageState ? { storageState } : {}),
-          ...(cleanVerifyPath ? { verifyPath: cleanVerifyPath } : {}),
-        } }), updated => {
+        void personaAction.submit(async () => {
+          const updated = await updateBrowserSessionPersonaAction({ data: {
+            requestId: crypto.randomUUID(),
+            projectId: project.id,
+            personaId: editingPersona.id,
+            roleLabel: cleanLabel,
+            originAllowlist: allowlist,
+            ...(token ? { captureToken: token } : storageState ? { storageState } : {}),
+            ...(cleanVerifyPath ? { verifyPath: cleanVerifyPath } : {}),
+          } })
+          await saveBrowserMeta(updated.id)
+          return updated
+        }, updated => {
           resetForm()
           onClose()
           onCreated(updated)
         })
         return
       }
-      void personaAction.submit(() => registerBrowserSessionPersona({ data: {
-        requestId: crypto.randomUUID(),
-        projectId: project.id,
-        handle: generatedHandle,
-        roleLabel: cleanLabel,
-        originAllowlist: allowlist,
-        ...(token ? { captureToken: token } : { storageState }),
-        ...(cleanVerifyPath ? { verifyPath: cleanVerifyPath } : {}),
-        canaryMarkers: [],
-      } }), created => {
+      void personaAction.submit(async () => {
+        const created = await registerBrowserSessionPersona({ data: {
+          requestId: crypto.randomUUID(),
+          projectId: project.id,
+          handle: generatedHandle,
+          roleLabel: cleanLabel,
+          originAllowlist: allowlist,
+          ...(token ? { captureToken: token } : { storageState }),
+          ...(cleanVerifyPath ? { verifyPath: cleanVerifyPath } : {}),
+          canaryMarkers: [],
+        } })
+        await saveBrowserMeta(created.id)
+        return created
+      }, created => {
         resetForm()
         onClose()
         onCreated(created)
@@ -1070,6 +1260,42 @@ export function PersonaFormModal({
               </Button>
             </div>
 
+            {browserNavError && (
+              <div
+                role="alert"
+                data-testid="capture-nav-error"
+                className="flex shrink-0 items-center justify-between gap-2.5 border-b border-danger/35 bg-danger-soft px-3.5 py-2 text-[12px] text-fg"
+              >
+                <div className="flex min-w-0 flex-1 items-center gap-2">
+                  <Icon name="alert" size={14} className="shrink-0 text-danger" />
+                  <span className="min-w-0 flex-1 whitespace-normal break-words leading-snug">
+                    {browserNavError}
+                  </span>
+                </div>
+                <div className="flex shrink-0 items-center gap-1.5">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="h-[24px] px-2 text-[11.5px]"
+                    disabled={captureBusy}
+                    onClick={handleBrowserReload}
+                  >
+                    Retry
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className="size-[24px]"
+                    aria-label="Dismiss navigation error"
+                    onClick={() => setBrowserNavError('')}
+                  >
+                    <Icon name="close" size={12} />
+                  </Button>
+                </div>
+              </div>
+            )}
+
             {/* Live Browser Viewport Canvas */}
             <div
               className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden bg-sunk"
@@ -1095,7 +1321,7 @@ export function PersonaFormModal({
                 onPaste={handleCanvasPaste}
                 onContextMenu={e => e.preventDefault()}
               />
-              {!hasReceivedFrame && (
+              {!hasReceivedFrame && !browserNavError && (
                 <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-1.5 bg-sunk/90 px-4 text-center text-[12.5px] text-fg-muted">
                   <span className="font-medium text-fg">Connecting to live sign-in browser…</span>
                   <span className="font-mono text-[11.5px] text-fg-subtle">{activeCapture.targetOrigin}</span>
@@ -1233,17 +1459,46 @@ export function PersonaFormModal({
               </div>
 
               {/* Mode 1: Universal Browser Session (Embedded Live-Login Browser + storageState.json Fallback) */}
-              {authMode === 'browser_session' && (
+              {authMode === 'browser_session' && (() => {
+                const reviewVerifyOrigin = verifyOrigin.trim() || capturedSummary?.verifyOrigin || capturedSummary?.targetOrigin || ''
+                const reviewVerifyPath = verifyPath.trim() || capturedSummary?.verifyPath || '/'
+                const reviewVerifyUrl = reviewVerifyOrigin
+                  ? `${reviewVerifyOrigin}${reviewVerifyPath.startsWith('/') ? reviewVerifyPath : `/${reviewVerifyPath}`}`
+                  : ''
+                const reviewScopeHosts = [...new Set(parseOriginList(origins).map(safeHost).filter(Boolean))]
+                const reviewIdpHosts = [...new Set(parseOriginList(idpOriginsText).map(safeHost).filter(Boolean))]
+                const reviewPillText = [
+                  reviewVerifyUrl ? `Verify at ${reviewVerifyUrl}` : '',
+                  reviewScopeHosts.length > 0 ? `Scope: ${reviewScopeHosts.join(', ')}` : '',
+                  reviewIdpHosts.length > 0 ? `IdP: ${reviewIdpHosts.join(', ')}` : '',
+                ].filter(Boolean).join(' · ')
+                return (
                 <div className="grid gap-3 rounded-[9px] border border-line-2 bg-sunk p-3.5">
                   <p className="m-0 text-[12px] leading-[18px] text-fg-muted">
                     Open a live sign-in browser to capture session cookies and storage after you log in, or import an existing Playwright <code className="font-mono text-[11.5px] text-fg">storageState.json</code> file.
                   </p>
                   <div className="flex flex-wrap items-center justify-between gap-2">
-                    <div className="flex flex-wrap items-center gap-2">
+                    <div className="flex min-w-0 flex-wrap items-center gap-2">
+                      {startingHostOptions.length > 0 && (
+                        <NativeSelect
+                          aria-label="Starting host"
+                          name="startingHost"
+                          className="h-[28px] w-auto min-w-[160px] max-w-[240px] font-mono text-[11.5px]"
+                          value={effectiveStartOrigin}
+                          disabled={captureBusy || personaAction.pending}
+                          onChange={e => setSelectedStartOrigin(e.target.value)}
+                        >
+                          {startingHostOptions.map(originOption => (
+                            <option key={originOption} value={originOption}>
+                              {safeHost(originOption)}
+                            </option>
+                          ))}
+                        </NativeSelect>
+                      )}
                       <Button
                         type="button"
                         variant="default"
-                        className="h-[28px] px-3"
+                        className="h-[28px] shrink-0 px-3"
                         disabled={captureBusy || personaAction.pending}
                         onClick={() => void handleStartInteractiveCapture()}
                       >
@@ -1253,7 +1508,7 @@ export function PersonaFormModal({
                       <Button
                         type="button"
                         variant="outline"
-                        className="h-[28px]"
+                        className="h-[28px] shrink-0"
                         disabled={captureBusy || personaAction.pending}
                         onClick={() => setImportOpen(prev => !prev)}
                       >
@@ -1273,6 +1528,27 @@ export function PersonaFormModal({
                       </span>
                     )}
                   </div>
+
+                  {capturedSummary && reviewPillText && (
+                    <div
+                      data-testid="captured-session-review"
+                      className="flex min-w-0 items-center justify-between gap-2 rounded-[7px] border border-ok/35 bg-ok-soft px-2.5 py-1.5 text-[11.5px] text-fg"
+                    >
+                      <div className="flex min-w-0 flex-1 items-center gap-1.5">
+                        <Icon name="check" size={13} className="shrink-0 text-ok" />
+                        <span className="min-w-0 flex-1 truncate font-mono text-[11.5px]" title={reviewPillText}>
+                          {reviewPillText}
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        className="h-auto shrink-0 cursor-pointer whitespace-normal border-0 bg-transparent px-1 py-0 text-[11.5px] font-medium text-accent shadow-none hover:underline"
+                        onClick={() => setAdvancedOpen(true)}
+                      >
+                        Edit
+                      </button>
+                    </div>
+                  )}
 
                   {importOpen && (
                     <div className="grid gap-2 border-t border-line pt-3">
@@ -1324,7 +1600,8 @@ export function PersonaFormModal({
                     </p>
                   )}
                 </div>
-              )}
+                )
+              })()}
 
               {/* Mode 2: Header / Cookie / cURL */}
               {authMode === 'header_cookie' && (
@@ -1504,21 +1781,48 @@ export function PersonaFormModal({
                 </DisclosureTrigger>
                 <DisclosureContent className="grid gap-3 pt-2.5">
                   {authMode === 'browser_session' && (
-                    <label className="grid gap-1.5 text-[12px] font-medium text-fg-muted">
-                      Auto-refresh path (optional)
-                      <Input
-                        className="w-full font-mono text-[12px]"
-                        name="verifyPath"
-                        maxLength={256}
-                        autoComplete="off"
-                        value={verifyPath}
-                        onChange={e => setVerifyPath(e.target.value)}
-                        placeholder="/ (e.g. /dashboard or /app)"
-                      />
-                      <small className="text-[11.5px] font-normal text-fg-subtle">
-                        Visited in a headless browser on refresh so the app&apos;s own JS SDK rotates short-lived tokens automatically.
-                      </small>
-                    </label>
+                    <div className="grid gap-3">
+                      <div className="grid grid-cols-1 items-start gap-3 sm:grid-cols-2">
+                        <label className="grid gap-1.5 text-[12px] font-medium text-fg-muted">
+                          Verify origin (optional)
+                          <Input
+                            className="w-full font-mono text-[12px]"
+                            name="verifyOrigin"
+                            maxLength={253}
+                            autoComplete="off"
+                            value={verifyOrigin}
+                            onChange={e => setVerifyOrigin(e.target.value)}
+                            placeholder={effectiveStartOrigin || 'https://app.example.com'}
+                          />
+                        </label>
+                        <label className="grid gap-1.5 text-[12px] font-medium text-fg-muted">
+                          Auto-refresh path (optional)
+                          <Input
+                            className="w-full font-mono text-[12px]"
+                            name="verifyPath"
+                            maxLength={256}
+                            autoComplete="off"
+                            value={verifyPath}
+                            onChange={e => setVerifyPath(e.target.value)}
+                            placeholder="/ (e.g. /dashboard or /app)"
+                          />
+                        </label>
+                      </div>
+                      <label className="grid gap-1.5 text-[12px] font-medium text-fg-muted">
+                        Approved IdP / SSO origins (optional, one per line)
+                        <Textarea
+                          className="w-full font-mono text-[12px]"
+                          name="idpOrigins"
+                          rows={2}
+                          value={idpOriginsText}
+                          onChange={e => setIdpOriginsText(e.target.value)}
+                          placeholder="https://clerk.example.com"
+                        />
+                        <small className="text-[11.5px] font-normal text-fg-subtle">
+                          Auto-captured from your interactive sign-in; permitted during unattended background token refresh.
+                        </small>
+                      </label>
+                    </div>
                   )}
 
                   {authMode === 'automated_login' && (

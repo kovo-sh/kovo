@@ -60,6 +60,7 @@ export function formatPersonaTestStatusLabel(test: PersonaTestState): string {
 
 interface Props {
   data: ProjectLoaderData
+  assets?: ProjectLoaderData['assets']
   personaTests: Record<string, PersonaTestState>
   onTestPersona: (persona: PublicPersona) => void
   onPersonaCreated: (created: { id: string; handle: string }) => void
@@ -207,8 +208,9 @@ function CrossAccountEmptySvg() {
   )
 }
 
-export function ProjectPersonasTab({ data, personaTests, onTestPersona, onPersonaCreated, onPersonaUpdated }: Props) {
+export function ProjectPersonasTab({ data, assets, personaTests, onTestPersona, onPersonaCreated, onPersonaUpdated }: Props) {
   const { project, personas } = data
+  const resolvedAssets = assets ?? data.assets
   const [modalOpen, setModalOpen] = useState(false)
   const [editingPersona, setEditingPersona] = useState<PublicPersona | null>(null)
   const [personaToDelete, setPersonaToDelete] = useState<PublicPersona | null>(null)
@@ -440,6 +442,7 @@ export function ProjectPersonasTab({ data, personaTests, onTestPersona, onPerson
           setEditingPersona(null)
         }}
         project={project}
+        assets={resolvedAssets}
         existingPersonas={personas}
         editingPersona={editingPersona}
         onCreated={result => {

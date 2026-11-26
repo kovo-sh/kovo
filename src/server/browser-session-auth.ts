@@ -25,7 +25,9 @@
  *      `MintedPersonaSession` material.
  */
 import { randomBytes, timingSafeEqual } from 'node:crypto'
+import { and, eq } from 'drizzle-orm'
 import { assetOriginForEnvironment } from '../domain.ts'
+import type { PersonaLoginConfig } from '../domain.ts'
 import {
   classifyDetailedAddress,
   EgressGateway,
@@ -41,12 +43,14 @@ import {
   writeBrowserSessionCredentialFile,
 } from './persona-vault.ts'
 import type {
+  BrowserSessionLoginConfig,
   BrowserStorageBundle,
   MintedPersonaSession,
   PlaywrightStorageCookie,
   PlaywrightStorageOrigin,
   PlaywrightStorageState,
 } from './persona-vault.ts'
+import { personas } from './schema.ts'
 import type { Store } from './store.ts'
 
 export type {
@@ -55,7 +59,14 @@ export type {
   PlaywrightStorageOrigin,
   PlaywrightStorageState,
 }
-import { isIpLiteralHost, isPublicSuffixHost, normalizeHostname } from './public-suffix.ts'
+import {
+  isIpLiteralHost,
+  isMultiTenantPublicSuffix,
+  isPublicSuffixHost,
+  normalizeHostname,
+  registrableApex,
+  registrableDomain,
+} from './public-suffix.ts'
 import {
   canonicalPathAndQuery,
   isRouteDenylisted,
@@ -125,7 +136,15 @@ export interface ScreencastFrame {
 export type CaptureStreamEvent =
   | { type: 'frame'; frame: ScreencastFrame }
   | { type: 'url'; url: string }
+  | { type: 'error'; message: string; url?: string }
   | { type: 'status'; state: CaptureSessionState; reason?: string }
+
+export interface InteractiveCaptureMetadata {
+  verifyOrigin: string
+  verifyPath: string
+  capturedAppOrigins: string[]
+  capturedIdpOrigins: string[]
+}
 
 export type CaptureSessionState = 'active' | 'completed' | 'canceled' | 'expired'
 
@@ -160,6 +179,7 @@ export interface PlaywrightPageLike {
   waitForLoadState?(state: 'load' | 'domcontentloaded' | 'networkidle', options?: { timeout?: number }): Promise<void>
   waitForTimeout(ms: number): Promise<void>
   url(): string
+  mainFrame?(): unknown
   title?(): Promise<string>
   on?(event: string, listener: (...args: unknown[]) => void): void
   evaluate?<T>(fn: () => T | Promise<T>): Promise<T>
@@ -223,7 +243,9 @@ export interface InteractiveLoginCaptureSession {
   readonly viewport: { width: number; height: number }
   readonly state: CaptureSessionState
   currentUrl(): string
+  lastError(): string | null
   latestFrame(): ScreencastFrame | null
+  captureMetadata(): InteractiveCaptureMetadata
   subscribe(listener: (event: CaptureStreamEvent) => void): () => void
   dispatchMouse(input: CaptureMouseInput): Promise<void>
   dispatchKey(input: CaptureKeyInput): Promise<void>
@@ -480,9 +502,50 @@ function validateAndNormalizeOriginEntry(
 }
 
 /**
- * R3-H-3: Resolve the strict egress policy for browser-session capture/refresh.
+ * Return the exact `apex <-> www.` sibling origin for a first-party registrable domain origin
+ * (e.g. `https://dyad.sh` <-> `https://www.dyad.sh`), or `null` for IP literals, localhost,
+ * public suffixes, multi-tenant PaaS suffixes (`vercel.app`, `github.io`, …), or non-apex subdomains.
+ */
+export function wwwSiblingOrigin(rawOrigin: string): string | null {
+  let parsed: URL
+  try {
+    parsed = new URL(rawOrigin.trim())
+  } catch {
+    return null
+  }
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return null
+  const host = normalizeHostname(parsed.hostname)
+  if (
+    !host
+    || host === 'localhost'
+    || host.endsWith('.localhost')
+    || host.endsWith('.local')
+    || host.endsWith('.internal')
+    || isIpLiteralHost(host)
+    || isPublicSuffixHost(host)
+    || isMultiTenantPublicSuffix(host)
+  ) {
+    return null
+  }
+  const apex = registrableDomain(host)
+  if (!apex) return null
+  let siblingHost: string | null = null
+  if (host === apex) {
+    siblingHost = `www.${apex}`
+  } else if (host === `www.${apex}`) {
+    siblingHost = apex
+  }
+  if (!siblingHost) return null
+  const defaultPort = parsed.protocol === 'https:' ? '443' : '80'
+  const port = parsed.port && parsed.port !== defaultPort ? `:${parsed.port}` : ''
+  return `${parsed.protocol}//${siblingHost}${port}`
+}
+
+/**
+ * R3-H-3: Resolve the strict egress policy for unattended browser-session refresh.
  * Egress is strictly scoped to:
- *   1. `persona.originAllowlist` (plus `targetOrigin`, intersected with `scopePolicy` when provided), AND
+ *   1. `persona.originAllowlist` (plus `targetOrigin` and automatic `apex <-> www.` sibling alias,
+ *      intersected with `scopePolicy` when provided), AND
  *   2. Explicit, operator-approved IdP origins (`idpOrigins` + `scopePolicy.authOrigins`).
  * Arbitrary public HTTPS origins are NEVER permitted.
  */
@@ -509,7 +572,7 @@ export function resolveBrowserSessionEgressPolicy(params: {
     if (normalized) approvedIdpSet.add(normalized)
   }
 
-  const effectiveScopePolicy: ScopePolicy | undefined = scopePolicy
+  let effectiveScopePolicy: ScopePolicy | undefined = scopePolicy
     ? {
         ...scopePolicy,
         authOrigins: [...new Set([...(scopePolicy.authOrigins ?? []), ...approvedIdpSet])],
@@ -526,6 +589,26 @@ export function resolveBrowserSessionEgressPolicy(params: {
     if (!normalized) continue
     if (effectiveScopePolicy && originRoleFor(effectiveScopePolicy, normalized) === null) continue
     personaSet.add(normalized)
+  }
+
+  // Automatically permit the exact `apex <-> www.` sibling alias for first-party persona origins
+  // so apex -> www. redirects (e.g. 308 https://dyad.sh/ -> https://www.dyad.sh/) never fail
+  // with ERR_TUNNEL_CONNECTION_FAILED. Never expands arbitrary subdomains or multi-tenant suffixes.
+  const addedWwwSiblings: string[] = []
+  for (const origin of [...personaSet]) {
+    const sibling = wwwSiblingOrigin(origin)
+    if (!sibling || personaSet.has(sibling)) continue
+    const validatedSibling = validateAndNormalizeOriginEntry(sibling, allowLocalLab, 'originAllowlist', false)
+    if (!validatedSibling || personaSet.has(validatedSibling)) continue
+    personaSet.add(validatedSibling)
+    addedWwwSiblings.push(validatedSibling)
+  }
+
+  if (effectiveScopePolicy && addedWwwSiblings.length > 0) {
+    effectiveScopePolicy = {
+      ...effectiveScopePolicy,
+      targetOrigins: [...new Set([...effectiveScopePolicy.targetOrigins, ...addedWwwSiblings])],
+    }
   }
 
   const unionSet = new Set<string>([...personaSet, ...approvedIdpSet])
@@ -635,6 +718,415 @@ export async function createBrowserSessionProxy(params: {
     timeoutMs: timeoutMs ?? DEFAULT_REFRESH_TIMEOUT_MS,
     maxResponseBytes: 8 * 1024 * 1024,
   })
+}
+
+// ---------------------------------------------------------------------------
+// Interactive Human Sign-In Egress (Separate from Strict Unattended Refresher)
+// ---------------------------------------------------------------------------
+
+const AUTH_SUBDOMAIN_LABEL_RE = /^(?:clerk|auth|sso|accounts?|login|signin|sign-in|id|idp|oauth|oauth2|fapi|identity|sts)\./i
+
+const KNOWN_HOSTED_IDP_SUFFIXES: readonly string[] = [
+  'clerk.accounts.dev',
+  'clerk.com',
+  'auth0.com',
+  'okta.com',
+  'oktapreview.com',
+  'accounts.google.com',
+  'login.microsoftonline.com',
+  'login.live.com',
+  'github.com',
+  'appleid.apple.com',
+  'supabase.co',
+  'firebaseapp.com',
+  'identitytoolkit.googleapis.com',
+  'securetoken.googleapis.com',
+  'amazoncognito.com',
+  'stytch.com',
+  'workos.com',
+  'authkit.app',
+  'descope.com',
+  'kinde.com',
+  'frontegg.com',
+  'onelogin.com',
+  'pingidentity.com',
+  'fusionauth.io',
+  'b2clogin.com',
+]
+
+function isKnownHostedIdpHost(hostname: string): boolean {
+  const host = normalizeHostname(hostname)
+  if (!host) return false
+  return KNOWN_HOSTED_IDP_SUFFIXES.some(suffix => host === suffix || host.endsWith(`.${suffix}`))
+}
+
+/**
+ * Egress predicate used ONLY for human-driven `startInteractiveLoginCapture`.
+ * Permits public HTTPS navigation & subresources (SSO providers, Clerk JS, Turnstile, CDNs,
+ * `www.` redirects) while enforcing `EgressGateway` SSRF/private-IP/metadata/loopback protection
+ * (and `allowLocalLab` gating for loopback/plaintext HTTP) plus optional `ScopePolicy` routeDenylist.
+ *
+ * Unattended `refreshBrowserSession` NEVER calls this — it uses strict `evaluateBrowserSessionProxyOrigin`.
+ */
+export function evaluateInteractiveCaptureOrigin(
+  policy: { allowLocalLab: boolean; scopePolicy?: ScopePolicy },
+  origin: string,
+  method: string,
+  url: URL,
+): { allowed: true } | { allowed: false; reason: string } {
+  if (url.protocol !== 'https:' && url.protocol !== 'http:') {
+    return { allowed: false, reason: `Interactive sign-in browser refused unsupported scheme "${url.protocol}" for "${origin}".` }
+  }
+  if (url.protocol === 'http:' && !policy.allowLocalLab) {
+    return { allowed: false, reason: `Interactive sign-in browser refused plaintext HTTP origin "${origin}".` }
+  }
+  try {
+    assertAllowedBrowserHost(url.hostname, policy.allowLocalLab, 'Interactive sign-in browser')
+  } catch (err) {
+    return {
+      allowed: false,
+      reason: err instanceof Error ? err.message : `Interactive sign-in browser refused host "${url.hostname}".`,
+    }
+  }
+  const normalized = normalizeScopeOrigin(origin) ?? normalizeScopeOrigin(url.origin)
+  if (!normalized) {
+    return { allowed: false, reason: `Interactive sign-in browser refused malformed origin "${origin}".` }
+  }
+  if (policy.scopePolicy) {
+    const role = originRoleFor(policy.scopePolicy, normalized)
+    const upperMethod = (method || 'GET').toUpperCase()
+    if (upperMethod !== 'CONNECT' && role === 'target') {
+      const pathAndQuery = `${url.pathname}${url.search}`
+      if (isRouteDenylisted(policy.scopePolicy, pathAndQuery)) {
+        return {
+          allowed: false,
+          reason: `Interactive sign-in browser refused denylisted route "${pathAndQuery}" on "${normalized}".`,
+        }
+      }
+    }
+  }
+  return { allowed: true }
+}
+
+async function createInteractiveCaptureProxy(params: {
+  allowLocalLab: boolean
+  scopePolicy?: ScopePolicy
+  resolveHost?: (hostname: string) => Promise<string[]>
+  timeoutMs?: number
+}): Promise<EgressLoopbackProxy> {
+  const { allowLocalLab, scopePolicy, resolveHost, timeoutMs } = params
+  return await EgressGateway.createLoopbackProxy({
+    allowLocalLab,
+    allowHttp: allowLocalLab ? true : undefined,
+    allowConnectPort: (port, hostname) => {
+      if (!Number.isInteger(port) || port < 1 || port > 65_535) return false
+      try {
+        assertAllowedBrowserHost(hostname, allowLocalLab, 'Interactive sign-in browser')
+      } catch {
+        return false
+      }
+      return allowLocalLab ? true : port === 443
+    },
+    allowOrigin: (origin, method, url) => evaluateInteractiveCaptureOrigin({ allowLocalLab, scopePolicy }, origin, method, url),
+    ...(resolveHost ? { resolveHost } : {}),
+    timeoutMs: timeoutMs ?? DEFAULT_REFRESH_TIMEOUT_MS,
+    maxResponseBytes: 12 * 1024 * 1024,
+  })
+}
+
+async function installInteractiveCaptureContextGuards(
+  context: PlaywrightContextLike,
+  policy: { allowLocalLab: boolean; scopePolicy?: ScopePolicy },
+): Promise<void> {
+  await context.addInitScript?.(WEBRTC_GUARD_SCRIPT)
+  if (typeof context.route === 'function') {
+    await context.route('**/*', async route => {
+      const req = route.request()
+      const rawUrl = req.url()
+      if (rawUrl.startsWith('about:') || rawUrl.startsWith('data:') || rawUrl.startsWith('blob:')) {
+        await route.continue()
+        return
+      }
+      let parsed: URL
+      try {
+        parsed = new URL(rawUrl)
+      } catch {
+        await route.abort('blockedbyclient')
+        return
+      }
+      const verdict = evaluateInteractiveCaptureOrigin(policy, parsed.origin, req.method(), parsed)
+      if (!verdict.allowed) {
+        await route.abort('blockedbyclient')
+        return
+      }
+      await route.continue()
+    })
+  }
+  if (typeof context.routeWebSocket === 'function') {
+    await context.routeWebSocket('**/*', async ws => {
+      let parsed: URL
+      try {
+        parsed = new URL(ws.url())
+      } catch {
+        await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter browser session policy.' })
+        return
+      }
+      if (parsed.protocol !== 'wss:' && !(policy.allowLocalLab && parsed.protocol === 'ws:')) {
+        await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter browser session policy.' })
+        return
+      }
+      const httpEquiv = new URL(parsed.toString().replace(/^wss:/i, 'https:').replace(/^ws:/i, 'http:'))
+      const verdict = evaluateInteractiveCaptureOrigin(policy, httpEquiv.origin, 'GET', httpEquiv)
+      if (!verdict.allowed || typeof ws.connectToServer !== 'function') {
+        await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter browser session policy.' })
+        return
+      }
+      await ws.connectToServer()
+    })
+  } else {
+    await context.addInitScript?.(SOCKET_DENY_SCRIPT)
+  }
+}
+
+export function formatInteractiveNavigationError(err: unknown, attemptedUrl: string): string {
+  const raw = err instanceof Error ? err.message : String(err ?? '')
+  const firstLine = raw.split('\n')[0]?.trim() || 'Navigation failed.'
+  if (/ERR_TUNNEL_CONNECTION_FAILED/i.test(firstLine)) {
+    return `Could not connect to ${attemptedUrl} through the security proxy (ERR_TUNNEL_CONNECTION_FAILED). Check that the hostname resolves to a public address or try another host.`
+  }
+  if (/ERR_NAME_NOT_RESOLVED/i.test(firstLine)) {
+    return `Could not resolve hostname for ${attemptedUrl} (ERR_NAME_NOT_RESOLVED). Check the URL in the address bar.`
+  }
+  if (/ERR_CONNECTION_REFUSED/i.test(firstLine)) {
+    return `Connection refused by ${attemptedUrl} (ERR_CONNECTION_REFUSED). Verify the target server is reachable.`
+  }
+  if (/ERR_CERT_|ERR_SSL_/i.test(firstLine)) {
+    return `TLS/certificate error while loading ${attemptedUrl}.`
+  }
+  if (/Timeout|ERR_TIMED_OUT/i.test(firstLine)) {
+    return `Timed out while loading ${attemptedUrl}. You can retry or enter another URL in the address bar.`
+  }
+  return `Failed to load ${attemptedUrl}: ${firstLine.replace(/^page\.goto:\s*/i, '').slice(0, 220)}`
+}
+
+function createInteractiveRequestObserver(
+  onNavigationOrigin?: (origin: string) => void,
+): {
+  observedRequestOrigins: Set<string>
+  headersByOrigin: Map<string, Record<string, string>>
+  onRequest: (req: unknown) => void
+} {
+  const observedRequestOrigins = new Set<string>()
+  const headersByOrigin = new Map<string, Record<string, string>>()
+
+  const onRequest = (rawReq: unknown) => {
+    if (!rawReq || typeof rawReq !== 'object') return
+    const req = rawReq as {
+      url?: () => string
+      headers?: () => Record<string, string>
+      isNavigationRequest?: () => boolean
+      resourceType?: () => string
+    }
+    if (typeof req.url !== 'function') return
+    let reqUrl: URL
+    try {
+      reqUrl = new URL(req.url())
+    } catch {
+      return
+    }
+    if (reqUrl.protocol !== 'https:' && reqUrl.protocol !== 'http:') return
+    const normOrigin = normalizeScopeOrigin(reqUrl.origin)
+    if (!normOrigin) return
+    observedRequestOrigins.add(normOrigin)
+
+    // Record intermediate 302/308 document redirect hops (e.g. apex -> www. and app -> IdP -> callback)
+    // that Chromium's `framenavigated` event skips because only the final committed document fires it.
+    const isDocNav = (typeof req.isNavigationRequest === 'function' && req.isNavigationRequest())
+      || (typeof req.resourceType === 'function' && req.resourceType() === 'document')
+    if (isDocNav) {
+      onNavigationOrigin?.(normOrigin)
+    }
+
+    if (typeof req.headers !== 'function') return
+    const hdrs = req.headers()
+    for (const [name, value] of Object.entries(hdrs)) {
+      if (!OBSERVABLE_AUTH_HEADER_RE.test(name)) continue
+      const trimmed = typeof value === 'string' ? value.trim() : ''
+      if (!trimmed || /[\r\n\0]/.test(trimmed)) continue
+      const canonical = name.toLowerCase() === 'authorization' ? 'Authorization' : name
+      let bucket = headersByOrigin.get(normOrigin)
+      if (!bucket) {
+        bucket = {}
+        headersByOrigin.set(normOrigin, bucket)
+      }
+      bucket[canonical] = trimmed
+    }
+  }
+
+  return { observedRequestOrigins, headersByOrigin, onRequest }
+}
+
+async function detectInteractiveProxyResponseError(
+  response: unknown,
+  attemptedUrl: string,
+): Promise<string | null> {
+  if (!response || typeof response !== 'object') return null
+  const res = response as {
+    status?: () => number
+    headers?: () => Record<string, string>
+    text?: () => Promise<string>
+  }
+  const status = typeof res.status === 'function' ? res.status() : 0
+  const headers = typeof res.headers === 'function' ? res.headers() : {}
+  const deniedCode = Object.entries(headers).find(([k]) => k.toLowerCase() === 'x-kovo-egress-denied')?.[1]
+  if (!deniedCode) return null
+  const bodyText = typeof res.text === 'function'
+    ? (await res.text().catch(() => '')).trim().slice(0, 220)
+    : ''
+  if (deniedCode === 'upstream_error' || status === 502 || status === 504) {
+    return `Failed to load ${attemptedUrl}: ${bodyText || 'Upstream connection failed (connection refused or unreachable).'} (HTTP ${status || 502})`
+  }
+  return `Blocked while loading ${attemptedUrl}: ${bodyText || deniedCode} (HTTP ${status || 403})`
+}
+
+/**
+ * Classify origins visited/observed during interactive sign-in into:
+ * - `verifyOrigin` + `verifyPath`: exact signed-in origin & path (e.g. `https://academy.dyad.sh` + `/dashboard`)
+ * - `capturedAppOrigins`: visited first-party app origins (same apex or initial allowlist)
+ * - `capturedIdpOrigins`: visited auth/IdP origins approved by the human operator during sign-in
+ */
+export function classifyInteractiveCapturedOrigins(params: {
+  targetOrigin: string
+  initialAllowedOrigins?: readonly string[]
+  finalUrl: string
+  visitedDocOrigins: ReadonlySet<string>
+  observedRequestOrigins?: ReadonlySet<string>
+  storageState?: PlaywrightStorageState
+  allowLocalLab: boolean
+}): InteractiveCaptureMetadata {
+  const {
+    targetOrigin,
+    initialAllowedOrigins = [],
+    finalUrl,
+    visitedDocOrigins,
+    observedRequestOrigins = new Set<string>(),
+    storageState,
+    allowLocalLab,
+  } = params
+
+  const fallbackOrigin = normalizeScopeOrigin(targetOrigin) ?? targetOrigin
+  let verifyOrigin = fallbackOrigin
+  let verifyPath = '/'
+
+  try {
+    const parsedFinal = new URL(finalUrl)
+    if (parsedFinal.protocol === 'https:' || (allowLocalLab && parsedFinal.protocol === 'http:')) {
+      const normalizedFinal = validateAndNormalizeOriginEntry(parsedFinal.origin, allowLocalLab, 'verifyOrigin', false)
+      if (normalizedFinal) {
+        verifyOrigin = normalizedFinal
+        const rawPath = `${parsedFinal.pathname || '/'}${parsedFinal.search || ''}`
+        verifyPath = rawPath.startsWith('/') && !rawPath.startsWith('//')
+          ? rawPath.slice(0, 512)
+          : '/'
+      }
+    }
+  } catch {
+    // Keep fallbackOrigin + '/'
+  }
+
+  const initialAppSet = new Set<string>([fallbackOrigin])
+  for (const raw of initialAllowedOrigins) {
+    const norm = validateAndNormalizeOriginEntry(raw, allowLocalLab, 'originAllowlist', false)
+    if (norm) initialAppSet.add(norm)
+  }
+
+  const appApexes = new Set<string>()
+  const addApex = (origin: string) => {
+    try {
+      const host = normalizeHostname(new URL(origin).hostname)
+      if (!host || isMultiTenantPublicSuffix(host)) return
+      const apex = registrableApex(host)
+      if (apex) appApexes.add(apex)
+    } catch { /* ignore */ }
+  }
+  addApex(verifyOrigin)
+  for (const o of initialAppSet) addApex(o)
+
+  const isAuthSubdomainOfApp = (origin: string): boolean => {
+    try {
+      const host = normalizeHostname(new URL(origin).hostname)
+      const apex = registrableApex(host)
+      if (!apex || !appApexes.has(apex) || host === apex) return false
+      return AUTH_SUBDOMAIN_LABEL_RE.test(host)
+    } catch {
+      return false
+    }
+  }
+
+  const isFirstPartyAppOrigin = (origin: string): boolean => {
+    if (origin === verifyOrigin) return true
+    if (initialAppSet.has(origin)) return true
+    const sib = wwwSiblingOrigin(origin)
+    if (sib && (sib === verifyOrigin || initialAppSet.has(sib))) return true
+    if (isAuthSubdomainOfApp(origin)) return false
+    try {
+      const host = normalizeHostname(new URL(origin).hostname)
+      if (!host || isMultiTenantPublicSuffix(host)) return false
+      const apex = registrableApex(host)
+      if (apex && appApexes.has(apex)) return true
+    } catch { /* ignore */ }
+    return false
+  }
+
+  const appOriginsSet = new Set<string>([verifyOrigin])
+  const idpOriginsSet = new Set<string>()
+
+  const normalizedDocOrigins: string[] = []
+  for (const raw of visitedDocOrigins) {
+    const norm = validateAndNormalizeOriginEntry(raw, allowLocalLab, 'visitedOrigins', false)
+    if (norm) normalizedDocOrigins.push(norm)
+  }
+
+  for (const origin of normalizedDocOrigins) {
+    if (isFirstPartyAppOrigin(origin)) {
+      appOriginsSet.add(origin)
+    } else {
+      idpOriginsSet.add(origin)
+    }
+  }
+
+  // Also detect embedded/XHR auth origins (e.g. Clerk FAPI `clerk.dyad.sh`, `*.clerk.accounts.dev`,
+  // Auth0, Supabase, Firebase, Google/Microsoft OAuth) seen during the login flow.
+  const storageOrigins = new Set<string>()
+  for (const entry of storageState?.origins ?? []) {
+    const norm = validateAndNormalizeOriginEntry(entry.origin, allowLocalLab, 'storageOrigins', false)
+    if (norm) storageOrigins.add(norm)
+  }
+  const candidateAuthOrigins = new Set<string>([...observedRequestOrigins, ...storageOrigins])
+  for (const raw of candidateAuthOrigins) {
+    const norm = validateAndNormalizeOriginEntry(raw, allowLocalLab, 'idpOrigins', false)
+    if (!norm || appOriginsSet.has(norm)) continue
+    let host = ''
+    try {
+      host = normalizeHostname(new URL(norm).hostname)
+    } catch {
+      continue
+    }
+    if (isAuthSubdomainOfApp(norm) || isKnownHostedIdpHost(host)) {
+      idpOriginsSet.add(norm)
+    }
+  }
+
+  // Ensure verifyOrigin is always first in capturedAppOrigins.
+  const capturedAppOrigins = [verifyOrigin, ...[...appOriginsSet].filter(o => o !== verifyOrigin).sort()]
+  const capturedIdpOrigins = [...idpOriginsSet].filter(o => !appOriginsSet.has(o)).sort()
+
+  return {
+    verifyOrigin,
+    verifyPath,
+    capturedAppOrigins,
+    capturedIdpOrigins,
+  }
 }
 
 /**
@@ -892,8 +1384,10 @@ function findJwtInStorage(storageState: PlaywrightStorageState, allowedOrigins: 
 
 /**
  * Start a single-use, TTL-bounded interactive Chromium login capture session.
- * Traffic is routed through `EgressGateway.createLoopbackProxy` so SSRF/scope rules hold
- * even while operators sign in interactively over Tailscale or inside Docker.
+ * Human-driven interactive sign-in allows public HTTPS navigation & subresources (SSO providers,
+ * Clerk JS, Turnstile, CDNs, `www.` redirects) while STILL routing 100% through
+ * `EgressGateway.createLoopbackProxy` to enforce SSRF/private-IP/metadata/loopback protection
+ * (`allowLocalLab` required for loopback) and keeping `chromiumSandbox: true` + `serviceWorkers: 'block'`.
  */
 export async function startInteractiveLoginCapture(
   options: StartInteractiveCaptureOptions,
@@ -910,15 +1404,29 @@ export async function startInteractiveLoginCapture(
   const createdAt = Date.now()
   const expiresAt = createdAt + ttlMs
 
-  const egressPolicy = resolveBrowserSessionEgressPolicy({
-    targetUrl,
+  const interactivePolicy = {
     allowLocalLab,
-    allowedOrigins: options.allowedOrigins,
-    idpOrigins: options.idpOrigins,
-    scopePolicy: options.scopePolicy,
-  })
-  const observedOrigins = new Set<string>(egressPolicy.personaOrigins)
-  const { observedHeaders, onRequest } = createTargetRequestObserver(observedOrigins, targetUrl.origin)
+    ...(options.scopePolicy ? { scopePolicy: options.scopePolicy } : {}),
+  }
+  const initialAllowedOrigins = [
+    targetUrl.origin,
+    ...(options.allowedOrigins ?? []),
+  ]
+  const visitedDocOrigins = new Set<string>()
+  const recordVisitedUrl = (raw: string | undefined) => {
+    if (!raw) return
+    try {
+      const parsed = new URL(raw)
+      if (parsed.protocol !== 'https:' && !(allowLocalLab && parsed.protocol === 'http:')) return
+      const norm = normalizeScopeOrigin(parsed.origin)
+      if (norm) visitedDocOrigins.add(norm)
+    } catch { /* ignore non-HTTP URLs like about:blank / chrome-error:// */ }
+  }
+  recordVisitedUrl(targetUrl.origin)
+
+  const { observedRequestOrigins, headersByOrigin, onRequest } = createInteractiveRequestObserver(
+    origin => visitedDocOrigins.add(origin),
+  )
 
   let proxy: EgressLoopbackProxy | undefined
   let browser: PlaywrightBrowserLike | undefined
@@ -928,10 +1436,9 @@ export async function startInteractiveLoginCapture(
 
   const launch = options.launchBrowser ?? launchDefaultBrowserSessionChromium
   try {
-    proxy = await createBrowserSessionProxy({
-      targetUrl,
+    proxy = await createInteractiveCaptureProxy({
       allowLocalLab,
-      egressPolicy,
+      scopePolicy: options.scopePolicy,
       resolveHost: options.resolveHost,
     })
     browser = await launch(buildBrowserSessionChromiumLaunchOptions())
@@ -943,7 +1450,7 @@ export async function startInteractiveLoginCapture(
       serviceWorkers: 'block',
       proxy: proxy.proxyConfig,
     })
-    await installBrowserSessionContextGuards(context, egressPolicy)
+    await installInteractiveCaptureContextGuards(context, interactivePolicy)
     page = await context.newPage()
     page.on?.('request', onRequest)
   } catch (err) {
@@ -958,6 +1465,8 @@ export async function startInteractiveLoginCapture(
   let latestFrame: ScreencastFrame | null = null
   let lastKnownUrl = targetUrl.toString()
   let lastTitle = ''
+  let lastNavigationError: string | null = null
+  let completedMeta: InteractiveCaptureMetadata | null = null
   const listeners = new Set<(event: CaptureStreamEvent) => void>()
   let disposing: Promise<void> | null = null
 
@@ -991,12 +1500,26 @@ export async function startInteractiveLoginCapture(
   }, ttlMs)
   ttlTimer.unref?.()
 
-  page.on?.('framenavigated', () => {
+  page.on?.('framenavigated', (frame?: unknown) => {
     if (state !== 'active' || !page) return
+    if (frame !== undefined && typeof page.mainFrame === 'function') {
+      try {
+        if (frame !== page.mainFrame()) return
+      } catch { /* ignore */ }
+    }
     const nextUrl = page.url()
-    if (nextUrl && nextUrl !== lastKnownUrl) {
-      lastKnownUrl = nextUrl
-      emit({ type: 'url', url: nextUrl })
+    if (nextUrl) {
+      if (nextUrl.startsWith('http://') || nextUrl.startsWith('https://')) {
+        recordVisitedUrl(nextUrl)
+        if (lastNavigationError) {
+          lastNavigationError = null
+          emit({ type: 'error', message: '' })
+        }
+      }
+      if (nextUrl !== lastKnownUrl) {
+        lastKnownUrl = nextUrl
+        emit({ type: 'url', url: nextUrl })
+      }
     }
   })
 
@@ -1015,9 +1538,12 @@ export async function startInteractiveLoginCapture(
           ? payload.metadata as Record<string, unknown>
           : {})
         const url = page?.url() || lastKnownUrl
-        if (url && url !== lastKnownUrl) {
-          lastKnownUrl = url
-          emit({ type: 'url', url })
+        if (url) {
+          recordVisitedUrl(url)
+          if (url !== lastKnownUrl) {
+            lastKnownUrl = url
+            emit({ type: 'url', url })
+          }
         }
         const frame: ScreencastFrame = {
           data,
@@ -1042,11 +1568,37 @@ export async function startInteractiveLoginCapture(
     }
   }
 
-  // Navigate asynchronously or await initial DOM load (best-effort so slow IdP redirects don't fail start).
-  await page.goto(targetUrl.toString(), { waitUntil: 'domcontentloaded', timeout: 15_000 }).catch(() => undefined)
-  lastKnownUrl = page.url() || targetUrl.toString()
+  // Navigate to initial targetOrigin and surface any navigation/network/proxy error cleanly
+  // instead of silently swallowing it into a blank canvas.
+  try {
+    const initialRes = await page.goto(targetUrl.toString(), { waitUntil: 'domcontentloaded', timeout: 15_000 })
+    lastNavigationError = await detectInteractiveProxyResponseError(initialRes, targetUrl.toString())
+  } catch (err) {
+    lastNavigationError = formatInteractiveNavigationError(err, targetUrl.toString())
+  }
+  const initialPageUrl = page.url()
+  if (initialPageUrl && (initialPageUrl.startsWith('http://') || initialPageUrl.startsWith('https://'))) {
+    lastKnownUrl = initialPageUrl
+    recordVisitedUrl(initialPageUrl)
+  } else {
+    lastKnownUrl = targetUrl.toString()
+  }
   if (typeof page.title === 'function') {
     lastTitle = await page.title().catch(() => '')
+  }
+
+  const computeMetadata = (storageState?: PlaywrightStorageState): InteractiveCaptureMetadata => {
+    const current = state === 'active' && page ? (page.url() || lastKnownUrl) : lastKnownUrl
+    recordVisitedUrl(current)
+    return classifyInteractiveCapturedOrigins({
+      targetOrigin: targetUrl.origin,
+      initialAllowedOrigins,
+      finalUrl: current,
+      visitedDocOrigins,
+      observedRequestOrigins,
+      storageState,
+      allowLocalLab,
+    })
   }
 
   const assertActive = () => {
@@ -1069,13 +1621,22 @@ export async function startInteractiveLoginCapture(
       if (state === 'active' && page) {
         try {
           const u = page.url()
-          if (u) lastKnownUrl = u
+          if (u && (u.startsWith('http://') || u.startsWith('https://'))) {
+            lastKnownUrl = u
+            recordVisitedUrl(u)
+          }
         } catch { /* ignore */ }
       }
       return lastKnownUrl
     },
+    lastError() {
+      return lastNavigationError
+    },
     latestFrame() {
       return latestFrame
+    },
+    captureMetadata() {
+      return completedMeta ?? computeMetadata()
     },
     subscribe(listener) {
       if (state !== 'active') {
@@ -1087,6 +1648,9 @@ export async function startInteractiveLoginCapture(
         listener({ type: 'frame', frame: latestFrame })
       } else {
         listener({ type: 'url', url: lastKnownUrl })
+      }
+      if (lastNavigationError) {
+        listener({ type: 'error', message: lastNavigationError, url: lastKnownUrl })
       }
       return () => {
         listeners.delete(listener)
@@ -1154,12 +1718,33 @@ export async function startInteractiveLoginCapture(
         throw new Error('Plaintext HTTP navigation is blocked outside local-lab mode.')
       }
       assertAllowedBrowserHost(parsed.hostname, allowLocalLab, 'Navigation URL')
-      const verdict = evaluateBrowserSessionProxyOrigin(egressPolicy, parsed.origin, 'GET', parsed)
+      const verdict = evaluateInteractiveCaptureOrigin(interactivePolicy, parsed.origin, 'GET', parsed)
       if (!verdict.allowed) {
         throw new Error(verdict.reason)
       }
-      await page!.goto(parsed.toString(), { waitUntil: 'domcontentloaded', timeout: 15_000 })
-      lastKnownUrl = page!.url() || parsed.toString()
+      try {
+        const navRes = await page!.goto(parsed.toString(), { waitUntil: 'domcontentloaded', timeout: 15_000 })
+        const proxyErr = await detectInteractiveProxyResponseError(navRes, parsed.toString())
+        if (proxyErr) {
+          lastNavigationError = proxyErr
+          emit({ type: 'error', message: proxyErr, url: parsed.toString() })
+          throw new Error(proxyErr)
+        }
+        lastNavigationError = null
+        emit({ type: 'error', message: '' })
+      } catch (err) {
+        const msg = err instanceof Error && (err.message.startsWith('Failed to load ') || err.message.startsWith('Blocked while loading '))
+          ? err.message
+          : formatInteractiveNavigationError(err, parsed.toString())
+        lastNavigationError = msg
+        emit({ type: 'error', message: msg, url: parsed.toString() })
+        throw new Error(msg)
+      }
+      const afterUrl = page!.url()
+      lastKnownUrl = (afterUrl && (afterUrl.startsWith('http://') || afterUrl.startsWith('https://')))
+        ? afterUrl
+        : parsed.toString()
+      recordVisitedUrl(lastKnownUrl)
       emit({ type: 'url', url: lastKnownUrl })
       return { url: lastKnownUrl }
     },
@@ -1169,21 +1754,35 @@ export async function startInteractiveLoginCapture(
       try {
         const rawState = await context!.storageState()
         const storageState = normalizePlaywrightStorageState(rawState)
-        const headers: Record<string, string> = { ...observedHeaders }
+        const meta = computeMetadata(storageState)
+        completedMeta = meta
+
+        // H-8 credential isolation: extract observed auth headers ONLY from first-party app origins
+        // (never from external IdP origins), preferring `verifyOrigin` last so it wins.
+        const appHeaderOrder = [
+          ...meta.capturedAppOrigins.filter(o => o !== meta.verifyOrigin),
+          meta.verifyOrigin,
+        ]
+        const headers: Record<string, string> = {}
+        for (const appOrigin of appHeaderOrder) {
+          const bucket = headersByOrigin.get(appOrigin)
+          if (bucket) Object.assign(headers, bucket)
+        }
+        const appOriginSet = new Set<string>(meta.capturedAppOrigins)
         if (!headers.Authorization) {
-          const storageJwt = findJwtInStorage(storageState, observedOrigins)
+          const storageJwt = findJwtInStorage(storageState, appOriginSet)
           if (storageJwt) headers.Authorization = `Bearer ${storageJwt}`
         }
         return normalizeBrowserStorageBundle(
           {
             v: 1,
             kind: 'browser_session',
-            targetOrigin: targetUrl.origin,
+            targetOrigin: meta.verifyOrigin,
             capturedAt: Date.now(),
             storageState,
             ...(Object.keys(headers).length ? { observedHeaders: headers } : {}),
           },
-          targetUrl.origin,
+          meta.verifyOrigin,
         )
       } finally {
         await cleanupResources('completed')
@@ -1212,6 +1811,14 @@ export interface CaptureSummary {
   /** Safe non-secret list of observed auth header names (never header values). */
   headerNames: string[]
   hasAuthorizationHeader: boolean
+  /** Exact signed-in origin captured when the operator completed login. */
+  verifyOrigin: string
+  /** Exact signed-in pathname (+ query) captured when the operator completed login. */
+  verifyPath: string
+  /** First-party app origins visited during interactive sign-in. */
+  capturedAppOrigins: string[]
+  /** Auth/IdP origins visited or used during interactive sign-in (operator-approved). */
+  capturedIdpOrigins: string[]
 }
 
 export interface EscrowedCapture {
@@ -1224,17 +1831,31 @@ export interface EscrowedCapture {
 interface CaptureEscrowRecord {
   readonly projectId: string
   readonly bundle: BrowserStorageBundle
+  readonly metadata: InteractiveCaptureMetadata
   readonly createdAt: number
   readonly expiresAt: number
   readonly timer: ReturnType<typeof setTimeout>
 }
 
-export function summarizeBrowserStorageBundle(bundle: BrowserStorageBundle): CaptureSummary {
+export function summarizeBrowserStorageBundle(
+  bundle: BrowserStorageBundle,
+  metadata?: Partial<InteractiveCaptureMetadata>,
+): CaptureSummary {
   const originSet = new Set<string>()
   for (const entry of bundle.storageState.origins) {
     if (entry.origin) originSet.add(entry.origin)
   }
   const headerNames = Object.keys(bundle.observedHeaders ?? {}).sort()
+  const verifyOrigin = metadata?.verifyOrigin || bundle.targetOrigin
+  const verifyPath = metadata?.verifyPath && metadata.verifyPath.startsWith('/') && !metadata.verifyPath.startsWith('//')
+    ? metadata.verifyPath
+    : '/'
+  const capturedAppOrigins = metadata?.capturedAppOrigins && metadata.capturedAppOrigins.length > 0
+    ? [...new Set(metadata.capturedAppOrigins)]
+    : [verifyOrigin]
+  const capturedIdpOrigins = metadata?.capturedIdpOrigins
+    ? [...new Set(metadata.capturedIdpOrigins)]
+    : []
   return {
     targetOrigin: bundle.targetOrigin,
     capturedAt: bundle.capturedAt,
@@ -1243,6 +1864,10 @@ export function summarizeBrowserStorageBundle(bundle: BrowserStorageBundle): Cap
     origins: [...originSet].sort(),
     headerNames,
     hasAuthorizationHeader: Boolean(bundle.observedHeaders?.Authorization),
+    verifyOrigin,
+    verifyPath,
+    capturedAppOrigins,
+    capturedIdpOrigins,
   }
 }
 
@@ -1303,6 +1928,7 @@ export class CaptureEscrowStore {
   store(params: {
     projectId: string
     bundle: BrowserStorageBundle
+    metadata?: Partial<InteractiveCaptureMetadata>
     ttlMs?: number
   }): EscrowedCapture {
     const projectId = params.projectId.trim()
@@ -1328,9 +1954,18 @@ export class CaptureEscrowStore {
     }, ttlMs)
     timer.unref?.()
 
+    const summary = summarizeBrowserStorageBundle(params.bundle, params.metadata)
+    const metadata: InteractiveCaptureMetadata = {
+      verifyOrigin: summary.verifyOrigin,
+      verifyPath: summary.verifyPath,
+      capturedAppOrigins: summary.capturedAppOrigins,
+      capturedIdpOrigins: summary.capturedIdpOrigins,
+    }
+
     this.entries.set(captureToken, {
       projectId,
       bundle: params.bundle,
+      metadata,
       createdAt,
       expiresAt,
       timer,
@@ -1340,11 +1975,14 @@ export class CaptureEscrowStore {
       captureToken,
       projectId,
       expiresAt,
-      summary: summarizeBrowserStorageBundle(params.bundle),
+      summary,
     }
   }
 
-  redeem(captureToken: string, projectId: string): BrowserStorageBundle {
+  redeemWithMetadata(
+    captureToken: string,
+    projectId: string,
+  ): { bundle: BrowserStorageBundle; metadata: InteractiveCaptureMetadata } {
     this.pruneExpired()
     const token = captureToken.trim()
     const requestedProjectId = projectId.trim()
@@ -1361,7 +1999,11 @@ export class CaptureEscrowStore {
     }
     // Single-use: delete immediately before returning the bundle.
     this.deleteKey(token)
-    return entry.bundle
+    return { bundle: entry.bundle, metadata: entry.metadata }
+  }
+
+  redeem(captureToken: string, projectId: string): BrowserStorageBundle {
+    return this.redeemWithMetadata(captureToken, projectId).bundle
   }
 
   clear(): void {
@@ -1407,6 +2049,122 @@ function validateBrowserPersonaOrigins(
   })
 }
 
+function readExistingBrowserSessionMeta(
+  db: Store,
+  projectId: string,
+  personaId: string,
+): { verifyOrigin?: string; idpOrigins?: string[] } {
+  const row = db.db.select({ loginConfig: personas.loginConfig })
+    .from(personas)
+    .where(and(
+      eq(personas.id, personaId),
+      eq(personas.projectId, projectId),
+      eq(personas.workspaceId, db.workspace.id),
+    ))
+    .get()
+  const cfg = row?.loginConfig as BrowserSessionLoginConfig | null | undefined
+  if (!cfg || cfg.adapter !== 'browser_session') return {}
+  return {
+    ...(typeof cfg.verifyOrigin === 'string' && cfg.verifyOrigin.trim() ? { verifyOrigin: cfg.verifyOrigin.trim() } : {}),
+    ...(Array.isArray(cfg.idpOrigins) && cfg.idpOrigins.length > 0 ? { idpOrigins: [...cfg.idpOrigins] } : {}),
+  }
+}
+
+function persistBrowserSessionLoginMeta(
+  db: Store,
+  projectId: string,
+  personaId: string,
+  meta: {
+    verifyOrigin?: string | null
+    verifyPath?: string | null
+    idpOrigins?: readonly string[] | null
+  },
+): void {
+  const project = db.project(projectId)
+  const row = db.db.select({
+    id: personas.id,
+    originAllowlist: personas.originAllowlist,
+    loginConfig: personas.loginConfig,
+  })
+    .from(personas)
+    .where(and(
+      eq(personas.id, personaId),
+      eq(personas.projectId, projectId),
+      eq(personas.workspaceId, db.workspace.id),
+    ))
+    .get()
+  if (!row) throw new Error('Persona not found.')
+  const currentCfg = (row.loginConfig ?? {}) as BrowserSessionLoginConfig
+  if (currentCfg.adapter !== 'browser_session') return
+
+  const validator = assetOriginForEnvironment(project.environment)
+  const nextCfg: Record<string, unknown> = {
+    ...currentCfg,
+    adapter: 'browser_session',
+  }
+
+  if (meta.verifyOrigin !== undefined) {
+    if (meta.verifyOrigin === null || !meta.verifyOrigin.trim()) {
+      delete nextCfg.verifyOrigin
+    } else {
+      const parsed = validator.safeParse(meta.verifyOrigin.trim())
+      if (!parsed.success) {
+        throw new Error(parsed.error.issues[0]?.message ?? `verifyOrigin "${meta.verifyOrigin}" is not allowed for this ${project.environment} project.`)
+      }
+      nextCfg.verifyOrigin = parsed.data
+    }
+  }
+
+  if (meta.verifyPath !== undefined) {
+    if (meta.verifyPath === null || !meta.verifyPath.trim()) {
+      delete nextCfg.verifyPath
+    } else {
+      nextCfg.verifyPath = normalizeVerifyPath(meta.verifyPath)
+    }
+  }
+
+  if (meta.idpOrigins !== undefined) {
+    if (meta.idpOrigins === null) {
+      delete nextCfg.idpOrigins
+    } else {
+      const validated = [...new Set(
+        validateBrowserPersonaOrigins(
+          project.environment,
+          meta.idpOrigins.filter(o => typeof o === 'string' && o.trim().length > 0).slice(0, 32),
+        ),
+      )]
+      if (validated.length > 0) {
+        nextCfg.idpOrigins = validated
+      } else {
+        delete nextCfg.idpOrigins
+      }
+    }
+  }
+
+  db.db.update(personas)
+    .set({ loginConfig: nextCfg as unknown as PersonaLoginConfig })
+    .where(and(
+      eq(personas.id, personaId),
+      eq(personas.projectId, projectId),
+      eq(personas.workspaceId, db.workspace.id),
+    ))
+    .run()
+}
+
+export function updateBrowserSessionPersonaMeta(
+  db: Store,
+  input: {
+    projectId: string
+    personaId: string
+    verifyOrigin?: string | null
+    verifyPath?: string | null
+    idpOrigins?: readonly string[] | null
+  },
+): { ok: true } {
+  persistBrowserSessionLoginMeta(db, input.projectId, input.personaId, input)
+  return { ok: true }
+}
+
 export function registerBrowserSessionPersonaFromAction(
   db: Store,
   data: {
@@ -1418,7 +2176,9 @@ export function registerBrowserSessionPersonaFromAction(
     captureToken?: string
     storageState?: unknown
     observedHeaders?: Record<string, string>
+    verifyOrigin?: string
     verifyPath?: string
+    idpOrigins?: string[]
     refreshIntervalSec?: number
     canaryMarkers?: string[]
   },
@@ -1426,13 +2186,15 @@ export function registerBrowserSessionPersonaFromAction(
 ): { id: string; handle: string } {
   const project = db.project(data.projectId)
   const originAllowlist = validateBrowserPersonaOrigins(project.environment, data.originAllowlist)
-  const resolvedStorageState = data.captureToken
-    ? escrow.redeem(data.captureToken, data.projectId)
-    : data.storageState
+  const redeemed = data.captureToken
+    ? escrow.redeemWithMetadata(data.captureToken, data.projectId)
+    : null
+  const resolvedStorageState = redeemed ? redeemed.bundle : data.storageState
   if (resolvedStorageState === undefined) {
     throw new Error('Provide either a captured session token or a storageState.json payload.')
   }
-  return createBrowserSessionPersona(db, {
+  const effectiveVerifyPath = data.verifyPath ?? redeemed?.metadata.verifyPath
+  const created = createBrowserSessionPersona(db, {
     requestId: data.requestId,
     projectId: data.projectId,
     handle: data.handle,
@@ -1440,10 +2202,22 @@ export function registerBrowserSessionPersonaFromAction(
     originAllowlist,
     storageState: resolvedStorageState,
     observedHeaders: data.observedHeaders,
-    verifyPath: data.verifyPath,
+    verifyPath: effectiveVerifyPath,
     refreshIntervalSec: data.refreshIntervalSec,
     canaryMarkers: data.canaryMarkers,
   })
+  const effectiveVerifyOrigin = data.verifyOrigin
+    ?? (redeemed?.metadata.verifyOrigin && originAllowlist.includes(redeemed.metadata.verifyOrigin)
+      ? redeemed.metadata.verifyOrigin
+      : undefined)
+  const effectiveIdpOrigins = data.idpOrigins ?? redeemed?.metadata.capturedIdpOrigins
+  if (effectiveVerifyOrigin || (effectiveIdpOrigins && effectiveIdpOrigins.length > 0)) {
+    persistBrowserSessionLoginMeta(db, data.projectId, created.id, {
+      ...(effectiveVerifyOrigin ? { verifyOrigin: effectiveVerifyOrigin } : {}),
+      ...(effectiveIdpOrigins && effectiveIdpOrigins.length > 0 ? { idpOrigins: effectiveIdpOrigins } : {}),
+    })
+  }
+  return created
 }
 
 export function updateBrowserSessionPersonaFromAction(
@@ -1457,7 +2231,9 @@ export function updateBrowserSessionPersonaFromAction(
     captureToken?: string
     storageState?: unknown
     observedHeaders?: Record<string, string>
+    verifyOrigin?: string | null
     verifyPath?: string
+    idpOrigins?: string[] | null
     refreshIntervalSec?: number
     canaryMarkers?: string[]
   },
@@ -1465,10 +2241,13 @@ export function updateBrowserSessionPersonaFromAction(
 ): { id: string; handle: string } {
   const project = db.project(data.projectId)
   const originAllowlist = validateBrowserPersonaOrigins(project.environment, data.originAllowlist)
-  const resolvedStorageState = data.captureToken
-    ? escrow.redeem(data.captureToken, data.projectId)
-    : data.storageState
-  return updateBrowserSessionPersona(db, {
+  const priorMeta = readExistingBrowserSessionMeta(db, data.projectId, data.personaId)
+  const redeemed = data.captureToken
+    ? escrow.redeemWithMetadata(data.captureToken, data.projectId)
+    : null
+  const resolvedStorageState = redeemed ? redeemed.bundle : data.storageState
+  const effectiveVerifyPath = data.verifyPath ?? redeemed?.metadata.verifyPath
+  const updated = updateBrowserSessionPersona(db, {
     requestId: data.requestId,
     projectId: data.projectId,
     personaId: data.personaId,
@@ -1476,10 +2255,25 @@ export function updateBrowserSessionPersonaFromAction(
     originAllowlist,
     ...(resolvedStorageState !== undefined ? { storageState: resolvedStorageState } : {}),
     observedHeaders: data.observedHeaders,
-    verifyPath: data.verifyPath,
+    verifyPath: effectiveVerifyPath,
     refreshIntervalSec: data.refreshIntervalSec,
     canaryMarkers: data.canaryMarkers,
   })
+  const effectiveVerifyOrigin = data.verifyOrigin !== undefined
+    ? data.verifyOrigin
+    : (redeemed?.metadata.verifyOrigin && originAllowlist.includes(redeemed.metadata.verifyOrigin)
+        ? redeemed.metadata.verifyOrigin
+        : priorMeta.verifyOrigin)
+  const effectiveIdpOrigins = data.idpOrigins !== undefined
+    ? data.idpOrigins
+    : (redeemed ? redeemed.metadata.capturedIdpOrigins : priorMeta.idpOrigins)
+  if (effectiveVerifyOrigin !== undefined || effectiveIdpOrigins !== undefined) {
+    persistBrowserSessionLoginMeta(db, data.projectId, updated.id, {
+      ...(effectiveVerifyOrigin !== undefined ? { verifyOrigin: effectiveVerifyOrigin } : {}),
+      ...(effectiveIdpOrigins !== undefined ? { idpOrigins: effectiveIdpOrigins } : {}),
+    })
+  }
+  return updated
 }
 
 // ---------------------------------------------------------------------------
@@ -1547,9 +2341,11 @@ export class BrowserCaptureManager {
     // Remove immediately to guarantee single-use semantics even under concurrent calls.
     this.sessions.delete(id)
     const bundle = await session.completeCapture()
+    const metadata = session.captureMetadata()
     return this.escrow.store({
       projectId,
       bundle,
+      metadata,
       ...(options?.ttlMs !== undefined ? { ttlMs: options.ttlMs } : {}),
     })
   }

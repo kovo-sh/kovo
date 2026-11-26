@@ -2426,16 +2426,34 @@ export class PersonaAuthManager {
     }
 
     const config = persona.loginConfig
-    const targetOrigin = persona.originAllowlist[0]
-    if (!targetOrigin) {
+    const defaultTargetOrigin = persona.originAllowlist[0]
+    if (!defaultTargetOrigin) {
       throw new PersonaAuthError('AUTH_FAILED', `Persona "${persona.handle}" has no allowlisted origin configured.`)
     }
 
     // Universal IdP-agnostic browser session path (primary): refresh via headless Playwright
     // storageState with zero IdP-specific code.
     if (isBrowserSessionConfig(config as { adapter?: string })) {
-      return await this.authenticateBrowserSession(storage, projectId, persona, config as unknown as BrowserSessionLoginConfig, targetOrigin, signal, tenantId)
+      const browserCfg = config as unknown as BrowserSessionLoginConfig
+      const preferredVerifyOrigin = (() => {
+        if (typeof browserCfg.verifyOrigin !== 'string' || !browserCfg.verifyOrigin.trim()) return null
+        try {
+          const normalizedVerify = new URL(browserCfg.verifyOrigin.trim()).origin
+          for (const allowed of persona.originAllowlist) {
+            try {
+              if (new URL(allowed).origin === normalizedVerify) return normalizedVerify
+            } catch { /* ignore malformed entry */ }
+          }
+        } catch {
+          // Ignore malformed verifyOrigin and fall back to originAllowlist[0].
+        }
+        return null
+      })()
+      const browserTargetOrigin = preferredVerifyOrigin ?? defaultTargetOrigin
+      return await this.authenticateBrowserSession(storage, projectId, persona, browserCfg, browserTargetOrigin, signal, tenantId)
     }
+
+    const targetOrigin = defaultTargetOrigin
 
     const { email, password } = readLoginCredentialFile(persona.secretPath, {
       allowEmptyEmail: config.adapter === 'clerk_client',
@@ -2522,7 +2540,7 @@ export class PersonaAuthManager {
     const effectiveTenantId = tenantId !== undefined ? tenantId : (project.tenantId ?? null)
     const allowLocalLab = project.environment === 'local-lab' && isLocalLabEnvEnabled()
     const verifyPath = (() => {
-      if (typeof config.verifyPath === 'string' && config.verifyPath.startsWith('/')) {
+      if (typeof config.verifyPath === 'string' && config.verifyPath.startsWith('/') && !config.verifyPath.startsWith('//')) {
         return config.verifyPath
       }
       if (config.loginUrl) {
@@ -2537,6 +2555,10 @@ export class PersonaAuthManager {
       }
       return '/'
     })()
+
+    const approvedIdpOrigins = Array.isArray(config.idpOrigins)
+      ? [...new Set(config.idpOrigins.filter((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0))]
+      : undefined
 
     let refreshInFlight: Promise<Awaited<ReturnType<typeof refreshBrowserSession>>> | null = null
     const runRefreshOnce = (innerSignal?: AbortSignal) => {
@@ -2553,6 +2575,7 @@ export class PersonaAuthManager {
             storageState: bundle.storageState,
             targetOrigin,
             originAllowlist: persona.originAllowlist,
+            ...(approvedIdpOrigins && approvedIdpOrigins.length > 0 ? { idpOrigins: approvedIdpOrigins } : {}),
             verifyPath,
             allowLocalLab,
             priorObservedHeaders: bundle.observedHeaders,

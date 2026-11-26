@@ -722,6 +722,13 @@ export const personaLoginConfigSchema = z.object({
   refreshUrl: personaLoginUrl.optional(),
   refreshTokenJsonPath: z.string().trim().min(1).max(160).optional(),
   csrfPrefetchUrl: personaLoginUrl.optional(),
+  // Optional browser_session verification & IdP allowlist hints (origins/paths only — never tokens).
+  verifyOrigin: scopedAssetOrigin.optional(),
+  verifyPath: z.string().trim().max(512).refine(
+    value => !value || (value.startsWith('/') && !value.startsWith('//')),
+    'Verify path must start with "/".',
+  ).optional(),
+  idpOrigins: z.array(scopedAssetOrigin).max(32).optional(),
 }).superRefine((val, ctx) => {
   if (val.adapter !== 'clerk_client' && !val.email) {
     ctx.addIssue({
