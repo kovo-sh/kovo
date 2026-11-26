@@ -214,7 +214,7 @@ test('prepareReposMount stages 0o700/0o600 repos into container-readable 0o755/0
   }
 })
 
-test('prepareReposMount binds directly without copying when tree is already 0o755/0o644 and clean, but stages if .git/config has tokens', () => {
+test('prepareReposMount always stages an immutable snapshot even when tree is already 0o755/0o644 and strips .git', () => {
   const scratch = mkdtempSync(join(tmpdir(), 'kovo-repos-clean-'))
   try {
     const reposDir = join(scratch, 'clean-repos')
@@ -233,15 +233,22 @@ test('prepareReposMount binds directly without copying when tree is already 0o75
     chmodSync(srcFile, 0o644)
     chmodSync(gitConfig, 0o644)
 
-    const direct = prepareReposMount(reposDir)
-    assert.ok(direct)
-    assert.equal(direct.staged, false, 'clean world-readable repo should bind directly')
-    assert.equal(direct.mountDir, realpathSync(reposDir))
-    assert.equal(direct.excludedCount, 0)
-    direct.cleanup()
-    assert.equal(existsSync(reposDir), true, 'direct mount cleanup must never delete caller reposDir')
+    const snapshot = prepareReposMount(reposDir)
+    assert.ok(snapshot)
+    const snapshotDir = snapshot.mountDir
+    try {
+      assert.equal(snapshot.staged, true, 'world-readable repo must still stage an immutable snapshot')
+      assert.notEqual(snapshot.mountDir, realpathSync(reposDir))
+      assert.ok(snapshot.excludedCount >= 1, '.git directory must be excluded from snapshot')
+      assert.equal(existsSync(join(snapshot.mountDir, 'acme', 'demo', '.git')), false)
+      assert.equal(readFileSync(join(snapshot.mountDir, 'acme', 'demo', 'index.ts'), 'utf8'), 'export const v = 1\n')
+    } finally {
+      snapshot.cleanup()
+    }
+    assert.equal(existsSync(snapshotDir), false, 'cleanup must remove staged snapshot directory')
+    assert.equal(existsSync(reposDir), true, 'snapshot cleanup must never delete caller reposDir')
 
-    // Adding an auth header to a world-readable .git/config forces clean staging that strips it.
+    // Adding an auth header to a world-readable .git/config also stages cleanly with .git stripped.
     writeFileSync(gitConfig, '[http "https://github.com/"]\n\textraheader = AUTHORIZATION: basic dGVzdA==\n')
     chmodSync(gitConfig, 0o644)
     const staged = prepareReposMount(reposDir)

@@ -920,19 +920,10 @@ function unlinkProjectMountedRepoUnlocked(
   dataDir: string,
   projectId: string,
   repoSlug: string,
-  options: UnlinkMountedRepoOptions = {},
+  _options: UnlinkMountedRepoOptions = {},
 ): UnlinkMountedRepoResult {
   const reposDir = projectReposDir(dataDir, projectId)
   const { fullName, owner, repo } = parseRepoFullName(repoSlug)
-
-  if (options.activeRunIds && options.activeRunIds.length > 0) {
-    throw new RepoWorkspaceBusyError(
-      'REPO_ACTIVE_RUN_LOCKED',
-      `Cannot unlink repository "${fullName}" while project has ${options.activeRunIds.length} active ${options.activeRunIds.length === 1 ? 'run' : 'runs'} (${options.activeRunIds.join(', ')}). Stop active runs first so live worker bind mounts are not corrupted.`,
-      options.activeRunIds,
-    )
-  }
-  options.assertNoActiveRuns?.()
 
   if (!existsSync(reposDir)) {
     return { unlinked: false, fullName }
@@ -1009,7 +1000,8 @@ function unlinkProjectMountedRepoUnlocked(
 
 /**
  * Unlink (delete) a single mounted repository checkout under `repos/<projectId>/<owner>/<repo>`.
- * Strictly enforces path containment, rejects unlink while a sync holds the repo lock or an active run is bound.
+ * Strictly enforces path containment and rejects unlink while a concurrent sync holds the per-repo lock.
+ * Safe during active runs because worker containers mount immutable per-run snapshots.
  */
 export function unlinkProjectMountedRepo(
   dataDir: string,
@@ -2150,7 +2142,6 @@ export async function cloneGithubRepos(
         fullName,
         async () => {
           signal?.throwIfAborted()
-          await options.assertNoActiveRuns?.(fullName)
 
           // Resolve fresh credentials per repo so long multi-repo batches pick up rotated tokens.
           const cred = await resolveFreshGithubCredential({
@@ -2365,9 +2356,6 @@ export async function cloneGithubRepos(
               throw new RepoDiskQuotaExceededError('project', fullName, existingOtherBytes + stagedUsage.bytes, maxProjectDiskBytes)
             }
 
-            // Re-check active-run guard right before mutating the live bind-mount directory.
-            await options.assertNoActiveRuns?.(fullName)
-
             // Atomically swap staged directory into final destination
             let movedOld = false
             try {
@@ -2457,13 +2445,14 @@ export interface RepoWorkspaceManagerOptions {
   maxRepoFiles?: number
   maxRepoDepth?: number
   shallowDepth?: number
+  /** @deprecated No-op: worker containers mount immutable per-run snapshots, so active runs never block re-sync or unlink. */
   activeRunChecker?: (projectId: string) => readonly string[] | Promise<readonly string[]>
 }
 
 /**
  * Coordinates repository workspace lifecycle under `repos/<projectId>/<owner>/<repo>`:
- * per-repo operation locks, active-run mount protection, orphan `.tmp-*`/`.old-*` GC,
- * shallow hardened clones, and per-repo / per-project disk quotas.
+ * per-repo operation locks, orphan `.tmp-*`/`.old-*` GC, shallow hardened clones,
+ * and per-repo / per-project disk quotas.
  */
 export class RepoWorkspaceManager {
   readonly maxRepoDiskBytes: number
@@ -2471,7 +2460,6 @@ export class RepoWorkspaceManager {
   readonly maxRepoFiles: number
   readonly maxRepoDepth: number
   readonly shallowDepth: number
-  private readonly activeRunChecker?: (projectId: string) => readonly string[] | Promise<readonly string[]>
 
   constructor(options: RepoWorkspaceManagerOptions = {}) {
     this.maxRepoDiskBytes = options.maxRepoDiskBytes ?? DEFAULT_MAX_REPO_DISK_BYTES
@@ -2479,7 +2467,6 @@ export class RepoWorkspaceManager {
     this.maxRepoFiles = options.maxRepoFiles ?? DEFAULT_MAX_REPO_FILES
     this.maxRepoDepth = options.maxRepoDepth ?? DEFAULT_MAX_REPO_DEPTH
     this.shallowDepth = Math.max(1, Math.min(Math.floor(options.shallowDepth ?? DEFAULT_CLONE_DEPTH), 100))
-    this.activeRunChecker = options.activeRunChecker
   }
 
   async withLock<T>(
@@ -2492,16 +2479,12 @@ export class RepoWorkspaceManager {
     return await withRepoOperationLock(projectReposDir(dataDir, projectId), repoSlug, fn, { signal })
   }
 
-  async assertNoActiveRuns(projectId: string, action: 're-sync' | 'unlink', repoSlug: string): Promise<void> {
-    if (!this.activeRunChecker) return
-    const activeRunIds = [...(await this.activeRunChecker(projectId))]
-    if (activeRunIds.length > 0) {
-      throw new RepoWorkspaceBusyError(
-        'REPO_ACTIVE_RUN_LOCKED',
-        `Cannot ${action} repository "${repoSlug}" while project has ${activeRunIds.length} active ${activeRunIds.length === 1 ? 'run' : 'runs'} (${activeRunIds.join(', ')}). Stop active runs first so live worker bind mounts are not corrupted.`,
-        activeRunIds,
-      )
-    }
+  /**
+   * @deprecated No-op: live Docker workers always mount immutable per-run snapshots via
+   * `prepareReposMount`, so re-syncing or unlinking a repo never corrupts live worker mounts.
+   */
+  async assertNoActiveRuns(_projectId: string, _action: 're-sync' | 'unlink', _repoSlug: string): Promise<void> {
+    // Intentionally a no-op: per-run immutable repo snapshots decouple host checkout mutations from live runs.
   }
 
   cleanupOrphans(dataDir: string, projectId: string): OrphanCleanupResult {
@@ -2535,10 +2518,6 @@ export class RepoWorkspaceManager {
       maxRepoFiles: this.maxRepoFiles,
       maxRepoDepth: this.maxRepoDepth,
       ...options,
-      assertNoActiveRuns: async repoFullName => {
-        await this.assertNoActiveRuns(projectId, 're-sync', repoFullName)
-        await options.assertNoActiveRuns?.(repoFullName)
-      },
     })
   }
 
@@ -2553,10 +2532,7 @@ export class RepoWorkspaceManager {
       dataDir,
       projectId,
       fullName,
-      async () => {
-        await this.assertNoActiveRuns(projectId, 'unlink', fullName)
-        return unlinkProjectMountedRepoUnlocked(dataDir, projectId, fullName, options)
-      },
+      () => unlinkProjectMountedRepoUnlocked(dataDir, projectId, fullName, options),
       options.signal,
     )
   }
