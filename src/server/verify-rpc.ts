@@ -55,8 +55,8 @@ import type {
 } from './composite-receipt.ts'
 import { HostFactLog, deriveAmbientAuthFromHeaders } from './host-fact-log.ts'
 import { defaultTerminalOracleRegistry } from './terminal-oracle-registry.ts'
-import { isReadMethod, normalizeRole, parseRoleLabel } from './oracle-invariants.ts'
-import type { ImpactStep } from './oracle-invariants.ts'
+import { isReadMethod, resolvePersonaIdentity } from './oracle-invariants.ts'
+import type { ImpactStep, RoleName } from './oracle-invariants.ts'
 import {
   buildHostAuthPlacement, compileAsyncMatchPredicate, computeWorkerVisibleBodyDigest,
   consumeRunAsyncPollAttemptBudget, consumeRunAsyncPollCallBudget, evaluateAsyncMatchPredicate,
@@ -246,7 +246,7 @@ interface RpcPayload {
 interface AuthCapabilityActor {
   handle: string
   roleLabel: string | null
-  role: string | null
+  role: RoleName | null
   tenant: string | null
 }
 
@@ -665,19 +665,18 @@ export class VerifyRpcServer {
       runId: this.options.runId,
       assignmentId: this.options.assignmentId,
     }
-    const initialReqDig = this.workerBodyDigest(body)
+    const initialReqDig = this.workerBodyDigest(body), personaObj = persona ? this.options.grant.personas?.get(persona) : undefined
     return {
       brokerRequest,
       requestMeta: {
-        origin,
-        method,
-        pathAndQuery: rawPath,
-        headers,
+        origin, method, pathAndQuery: rawPath, headers,
         bodyBytes: initialReqDig.bodyBytes,
         bodySha256: initialReqDig.bodySha256,
         personaHandle: persona ?? null,
         sessionRole: role ?? null,
-        actorRoleLabel: (persona ? this.options.grant.personas?.get(persona)?.roleLabel ?? null : null),
+        actorRoleLabel: personaObj?.roleLabel ?? null,
+        ...(personaObj?.tenantRef !== undefined ? { actorTenant: personaObj.tenantRef } : {}),
+        ...(personaObj?.privilege !== undefined ? { actorPrivilege: personaObj.privilege } : {}),
         nonce: this.nonce,
       },
     }
@@ -1000,11 +999,11 @@ export class VerifyRpcServer {
       const ephemeralHandle = primaryAuthHandle ?? attestations[0]!.consumedCapabilityId
       const srcProv = this.capabilityVault.getSourceProvenance(ephemeralHandle)
       const capRoleLabel = srcProv?.sourceActorRoleLabel ?? null
-      const capRole = srcProv?.sourceActorRole ?? (capRoleLabel ? normalizeRole(capRoleLabel) : null)
-      const capTenant = srcProv?.sourceActorTenant ?? (capRoleLabel ? parseRoleLabel(capRoleLabel).tenant : null)
+      const capId = resolvePersonaIdentity({ roleLabel: capRoleLabel, tenantRef: srcProv?.sourceActorTenant ?? null, privilege: srcProv?.sourceActorRole ?? null })
+      const capRole = capId.role, capTenant = capId.tenant
       authCapabilityActor = { handle: ephemeralHandle, roleLabel: capRoleLabel, role: capRole, tenant: capTenant }
       const ephemeralPersona: ResolvedPersona = {
-        id: ephemeralHandle, handle: ephemeralHandle, roleLabel: capRoleLabel ?? 'derived', originAllowlist: [nextOrigin],
+        id: ephemeralHandle, handle: ephemeralHandle, roleLabel: capRoleLabel ?? 'derived', tenantRef: capTenant, privilege: capRole, originAllowlist: [nextOrigin],
         authKind: 'login', headerName: null, secret: '', canaryMarkers: [],
         session: { headerType: 'header', value: '', adapterUsed: 'derived-capability', bundle: { v: 2, headers: mergedBundleHeaders } },
       }
@@ -1028,7 +1027,7 @@ export class VerifyRpcServer {
       origin: nextOrigin,
       pathAndQuery: this.scrubKernel(nextPathAndQuery),
       headers: this.scrubKernelHeaderMap(metaHeaders),
-      ...(authCapabilityActor ? { personaHandle: authCapabilityActor.handle, actorRoleLabel: authCapabilityActor.roleLabel } : {}),
+      ...(authCapabilityActor ? { personaHandle: authCapabilityActor.handle, actorRoleLabel: authCapabilityActor.roleLabel, actorTenant: authCapabilityActor.tenant, actorPrivilege: authCapabilityActor.role } : {}),
       // R4-H-4: Compute request bodyBytes/bodySha256 strictly over worker-visible vault-scrubbed body.
       ...(nextBodyDig ? { bodyBytes: nextBodyDig.bodyBytes, bodySha256: nextBodyDig.bodySha256 } : {}),
       consumedCapabilityId: attestations[0]!.consumedCapabilityId,
@@ -1669,15 +1668,15 @@ export class VerifyRpcServer {
     const defaultCookieName = typeof args.defaultCookieName === 'string' && args.defaultCookieName.trim() ? args.defaultCookieName.trim() : extractedCookie
     // C-3: Derive `kind` strictly from validated structural args — NEVER inspect `rawValue`.
     const effectiveKind = kind ?? (selector === 'cookie' || defaultCookieName ? 'cookie' : ((selector === 'header' && !isLocationQuery) || defaultHeaderName ? 'header_secret' : 'generic_secret'))
-    const srcRoleLabel = sourceRecord.request?.actorRoleLabel ?? null
-    const srcPersona = sourceRecord.request?.personaHandle ?? null
-    const srcParsed = parseRoleLabel(srcRoleLabel)
+    const srcReq = sourceRecord.request
+    const srcRoleLabel = srcReq?.actorRoleLabel ?? null
+    const srcPersona = srcReq?.personaHandle ?? null
+    const srcId = resolvePersonaIdentity({ roleLabel: srcRoleLabel, tenantRef: srcReq?.actorTenant ?? null, privilege: srcReq?.actorPrivilege ?? null, handle: srcPersona })
+    const srcH = srcPersona && ((srcId.role === null && srcReq?.actorPrivilege === undefined) || (srcId.tenant === null && srcReq?.actorTenant === undefined)) ? resolvePersonaIdentity({ roleLabel: srcPersona, handle: srcPersona }) : null
     const sourceProvenance: CapabilitySourceProvenance = {
-      sourceExchangeId: exchangeId,
-      sourcePersonaHandle: srcPersona,
-      sourceActorRoleLabel: srcRoleLabel,
-      sourceActorRole: srcRoleLabel !== null ? (normalizeRole(srcRoleLabel) ?? normalizeRole(srcPersona) ?? null) : (normalizeRole(srcPersona) ?? null),
-      sourceActorTenant: srcParsed.tenant ?? parseRoleLabel(srcPersona).tenant ?? null,
+      sourceExchangeId: exchangeId, sourcePersonaHandle: srcPersona, sourceActorRoleLabel: srcRoleLabel,
+      sourceActorRole: srcId.role ?? (srcReq?.actorPrivilege === undefined ? srcH?.role ?? null : null),
+      sourceActorTenant: srcId.tenant ?? (srcReq?.actorTenant === undefined ? srcH?.tenant ?? null : null),
     }
     const meta = this.capabilityVault.seal({
       hopReceiptId, slot, rawValue, kind: effectiveKind,
@@ -1705,7 +1704,7 @@ export class VerifyRpcServer {
       request: {
         origin: sourceRecord.request?.origin ?? '', method: 'SEAL', pathAndQuery: `/capability/seal/${encodeURIComponent(slot)}`,
         headers: {}, bodyBytes: 0, bodySha256: opaqueHandleDigest, personaHandle: sourceRecord.request?.personaHandle ?? null,
-        sessionRole: sourceRecord.request?.sessionRole ?? 'probe', actorRoleLabel: sourceRecord.request?.actorRoleLabel ?? null, nonce,
+        sessionRole: sourceRecord.request?.sessionRole ?? 'probe', actorRoleLabel: sourceRecord.request?.actorRoleLabel ?? null, actorTenant: sourceRecord.request?.actorTenant ?? null, actorPrivilege: sourceRecord.request?.actorPrivilege ?? null, nonce,
       },
       artifact: { kind: 'capability', capabilityHandle: meta.handle, artifactDigest: opaqueHandleDigest },
     })
@@ -2020,7 +2019,7 @@ export class VerifyRpcServer {
         bodySha256: createHash('sha256').update(pollRecordId).digest('hex'),
         personaHandle: parsedPoll.requestMeta.personaHandle ?? null,
         sessionRole: parsedPoll.requestMeta.sessionRole ?? 'probe',
-        actorRoleLabel: parsedPoll.requestMeta.actorRoleLabel ?? null,
+        actorRoleLabel: parsedPoll.requestMeta.actorRoleLabel ?? null, actorTenant: parsedPoll.requestMeta.actorTenant ?? null, actorPrivilege: parsedPoll.requestMeta.actorPrivilege ?? null,
         nonce,
       },
       artifact: {
@@ -2102,16 +2101,15 @@ export class VerifyRpcServer {
         try { parsedReqJson = JSON.parse(kernelReqBody) } catch { parsedReqJson = undefined }
       }
       // R2-H-8: Prefer capability-injected actor provenance when Authorization/Cookie was supplied by a capability.
-      const capActor = prov?.authCapabilityActor ?? null
-      const handle = capActor ? capActor.handle : (record.request?.personaHandle ?? null)
-      const signedLabel = capActor ? capActor.roleLabel : (record.request?.actorRoleLabel ?? null)
-      const parsedLabel = parseRoleLabel(signedLabel)
-      const role = capActor
-        ? (normalizeRole(capActor.role ?? signedLabel) ?? null)
-        : (signedLabel !== null ? (normalizeRole(signedLabel) ?? normalizeRole(handle) ?? null) : (normalizeRole(handle) ?? null))
-      const tenant = capActor
-        ? (capActor.tenant ?? parsedLabel.tenant ?? null)
-        : (parsedLabel.tenant ?? parseRoleLabel(handle).tenant ?? null)
+      const capActor = prov?.authCapabilityActor ?? null, req = record.request
+      const handle = capActor ? capActor.handle : (req?.personaHandle ?? null)
+      const signedLabel = capActor ? capActor.roleLabel : (req?.actorRoleLabel ?? null)
+      const typedTenant = capActor ? capActor.tenant : req?.actorTenant
+      const typedPriv = capActor ? capActor.role : req?.actorPrivilege
+      const idn = resolvePersonaIdentity({ roleLabel: signedLabel, tenantRef: typedTenant ?? null, privilege: typedPriv ?? null, handle })
+      const hIdn = !capActor && handle && ((idn.role === null && typedPriv === undefined) || (idn.tenant === null && typedTenant === undefined)) ? resolvePersonaIdentity({ roleLabel: handle, handle }) : null
+      const role = idn.role ?? (!capActor && typedPriv === undefined ? hIdn?.role ?? null : null)
+      const tenant = idn.tenant ?? (!capActor && typedTenant === undefined ? hIdn?.tenant ?? null : null)
       const rawRole = record.request?.sessionRole
       const arm: ImpactStep['arm'] = rawRole === 'control' || rawRole === 'setup' || rawRole === 'cleanup' || rawRole === 'probe'
         ? rawRole
@@ -2159,6 +2157,8 @@ export class VerifyRpcServer {
         timestampMs: ts,
         actorPersona: handle,
         actorRoleLabel: signedLabel,
+        ...(typedTenant !== undefined ? { actorTenant: typedTenant } : {}),
+        ...(typedPriv !== undefined ? { actorPrivilege: typedPriv } : {}),
         ...(prov && prov.emittedCapabilities.size > 0 ? { emittedCapabilities: [...prov.emittedCapabilities] } : {}),
         ...(prov && prov.observedResponseDigests.size > 0 ? { observedResponseDigests: [...prov.observedResponseDigests] } : {}),
         ...(prov && prov.consumedCapabilities.size > 0 ? { consumedCapabilities: [...prov.consumedCapabilities] } : {}),

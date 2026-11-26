@@ -27,7 +27,12 @@ export type ChainStepStatus =
 export interface StepStatusMeta {
   /** Step has finished executing and will not run again. */
   readonly terminal: boolean
-  /** Step is eligible for bounded single-retry requeue (`maybeRequeueRetryableStep`). */
+  /**
+   * Step is eligible for bounded single-retry requeue through the single `RetryGovernor`
+   * (`step_requeue` path). Transient provider failures (`rate_limited`, `server`, `stall`,
+   * `stream_drop`) are evaluated by `RetryGovernor` before settling a step to terminal
+   * `model_failure`, so terminal `model_failure` has already exhausted or been denied retry.
+   */
   readonly retryable: boolean
   /** Step produced partial or complete state an explicit continuation/retry step may build on. */
   readonly continuable: boolean

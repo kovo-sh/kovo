@@ -1938,9 +1938,6 @@ function collectSecrets(req: BrokerHttpRequest, grant: Grant): NamedSecret[] {
   return all
 }
 
-const MAX_APEX_BUCKETS = TARGET_LOAD_POLICY_DEFAULTS.maxAggregateBuckets
-const APEX_BUCKET_IDLE_TTL_MS = TARGET_LOAD_POLICY_DEFAULTS.aggregateBucketIdleTtlMs
-
 export {
   EXTERNAL_APEX_MAX_RPS_CAP,
   EXTERNAL_ORIGIN_MAX_IN_FLIGHT,
@@ -1948,52 +1945,10 @@ export {
   isLoopbackOrigin,
   LOOPBACK_ORIGIN_MAX_IN_FLIGHT,
   LOOPBACK_ORIGIN_MAX_RPS_CAP,
-}
-
-/**
- * Per-origin concurrent in-flight request ceiling. External origins stay bounded at 4 so remote
- * targets are never hammered; loopback / authorized local-lab origins scale smoothly to 12 workers.
- */
-export function brokerPerOriginConcurrencyCap(
-  origin: string,
-  allowLocalLabOrigin = false,
-  env: NodeJS.ProcessEnv = process.env,
-  targetClassOverride?: TargetClass,
-): number {
-  return resolveBrokerPerOriginConcurrencyCap(origin, allowLocalLabOrigin, env, targetClassOverride)
-}
-
-/** Per-origin RPS ceiling: polite cap (20) on external hosts, higher ceiling (100) on loopback/local-lab. */
-export function brokerPerOriginRpsCap(
-  origin: string,
-  requestedRps: number,
-  allowLocalLabOrigin = false,
-  targetClassOverride?: TargetClass,
-): number {
-  return resolveBrokerPerOriginRpsCap(origin, requestedRps, allowLocalLabOrigin, targetClassOverride)
-}
-
-/**
- * Soft aggregate RPS cap shared across all public/external origins under one PSL registrable apex.
- * Configurable via `KOVO_EXTERNAL_APEX_MAX_RPS` (clamped to `[1, 200]`, default `45` req/s).
- */
-export function brokerExternalApexRpsCap(
-  env: NodeJS.ProcessEnv = process.env,
-  overrideRps?: number,
-): number {
-  return resolveExternalApexRpsCap(env, overrideRps)
-}
-
-/**
- * Shared PSL registrable apex key for external origins. Returns null for loopback, authorized
- * local-lab, private-lab, IP-literal, and bare-suffix origins so local targets bypass the external cap.
- */
-export function externalApexBucketKey(
-  origin: string,
-  allowLocalLabOrigin = false,
-  targetClassOverride?: TargetClass,
-): string | null {
-  return resolveExternalApexBucketKey(origin, allowLocalLabOrigin, targetClassOverride)
+  resolveBrokerPerOriginConcurrencyCap as brokerPerOriginConcurrencyCap,
+  resolveBrokerPerOriginRpsCap as brokerPerOriginRpsCap,
+  resolveExternalApexBucketKey as externalApexBucketKey,
+  resolveExternalApexRpsCap as brokerExternalApexRpsCap,
 }
 
 function resolveGrantMaxRps(grant: Grant, fallback: number): number {
@@ -2001,17 +1956,21 @@ function resolveGrantMaxRps(grant: Grant, fallback: number): number {
   return typeof live === 'number' && Number.isFinite(live) && live > 0 ? live : fallback
 }
 
-type ApexRateBucket = {
-  tokens: number
-  lastRefill: number
-  lastUsed: number
-}
-
-type IpAggregateBucket = {
+type AggregateRateBucket = {
   tokens: number
   lastRefill: number
   lastUsed: number
   inFlight: number
+}
+
+function refillTokenBucket(bucket: { tokens: number; lastRefill: number }, rps: number, now: number): void {
+  const elapsedSec = Math.max(0, (now - bucket.lastRefill) / 1000)
+  bucket.tokens = Math.min(rps, bucket.tokens + elapsedSec * rps)
+  bucket.lastRefill = now
+}
+
+function computeTokenWaitMs(tokens: number, rps: number): number {
+  return tokens < 1 ? Math.min(250, Math.max(20, Math.ceil(((1 - tokens) / rps) * 1000))) : 0
 }
 
 type OriginHealth = {
@@ -2046,10 +2005,11 @@ type RouteHealth = {
 export class RequestBroker {
   private readonly options: BrokerOptions
   private readonly origins = new Map<string, OriginHealth>()
-  private readonly apexBuckets = new Map<string, ApexRateBucket>()
-  private readonly activeApexesByRun = new Map<string, Set<string>>()
-  private readonly ipBuckets = new Map<string, IpAggregateBucket>()
-  private readonly activeIpsByRun = new Map<string, Set<string>>()
+  private readonly aggregateBuckets: Record<AggregateBucketKind, Map<string, AggregateRateBucket>> = {
+    apex: new Map(),
+    ip: new Map(),
+  }
+  private readonly activeAggregateKeysByRun = new Map<string, Map<AggregateBucketKind, Set<string>>>()
   private readonly lastAggregateWaitEventAt = new Map<string, number>()
   private readonly routeCircuits = new Map<string, RouteHealth>()
   private readonly sessionJars = new Map<string, SessionJar>()
@@ -2568,46 +2528,7 @@ export class RequestBroker {
     this.redactedSecretRefsByRun.delete(key)
     this.redactionCapacityWarnedByRun.delete(key)
     this.redactionCapacitySaturatedByRun.delete(key)
-    const runApexes = this.activeApexesByRun.get(key)
-    this.activeApexesByRun.delete(key)
-    if (runApexes) {
-      for (const apex of runApexes) {
-        if (!this.isApexReferencedByAnyRun(apex)) {
-          this.apexBuckets.delete(apex)
-          this.lastAggregateWaitEventAt.delete(`apex:${apex}`)
-        }
-      }
-    }
-    const runIps = this.activeIpsByRun.get(key)
-    this.activeIpsByRun.delete(key)
-    if (runIps) {
-      for (const ipKey of runIps) {
-        if (!this.isIpReferencedByAnyRun(ipKey)) {
-          const bucket = this.ipBuckets.get(ipKey)
-          if (!bucket || bucket.inFlight <= 0) {
-            this.ipBuckets.delete(ipKey)
-            this.lastAggregateWaitEventAt.delete(`ip:${ipKey}`)
-          }
-        }
-      }
-    }
-    const now = this.now()
-    for (const [apex, bucket] of this.apexBuckets) {
-      if (now - bucket.lastUsed >= APEX_BUCKET_IDLE_TTL_MS && !this.isApexReferencedByAnyRun(apex)) {
-        this.apexBuckets.delete(apex)
-        this.lastAggregateWaitEventAt.delete(`apex:${apex}`)
-      }
-    }
-    for (const [ipKey, bucket] of this.ipBuckets) {
-      if (
-        bucket.inFlight <= 0 &&
-        now - bucket.lastUsed >= APEX_BUCKET_IDLE_TTL_MS &&
-        !this.isIpReferencedByAnyRun(ipKey)
-      ) {
-        this.ipBuckets.delete(ipKey)
-        this.lastAggregateWaitEventAt.delete(`ip:${ipKey}`)
-      }
-    }
+    this.disposeAggregateBuckets(key, this.now())
   }
 
   /** Alias for `disposeRun(runId)` to purge all per-run broker state cleanly. */
@@ -3098,50 +3019,30 @@ export class RequestBroker {
     } catch { /* telemetry persistence is best-effort */ }
   }
 
-  private isApexReferencedByAnyRun(apex: string): boolean {
-    for (const apexSet of this.activeApexesByRun.values()) {
-      if (apexSet.has(apex)) return true
+  private isAggregateKeyReferenced(kind: AggregateBucketKind, key: string): boolean {
+    for (const runKinds of this.activeAggregateKeysByRun.values()) {
+      if (runKinds.get(kind)?.has(key)) return true
     }
     return false
   }
 
-  private isIpReferencedByAnyRun(ipKey: string): boolean {
-    for (const ipSet of this.activeIpsByRun.values()) {
-      if (ipSet.has(ipKey)) return true
-    }
-    return false
-  }
-
-  private evictApexBucketsIfNeeded(now: number): void {
-    if (this.apexBuckets.size < MAX_APEX_BUCKETS) return
-    for (const [apex, bucket] of this.apexBuckets) {
-      if (now - bucket.lastUsed >= APEX_BUCKET_IDLE_TTL_MS && !this.isApexReferencedByAnyRun(apex)) {
-        this.apexBuckets.delete(apex)
-      }
-    }
-    while (this.apexBuckets.size >= MAX_APEX_BUCKETS) {
-      const oldest = this.apexBuckets.keys().next().value
-      if (oldest === undefined) break
-      this.apexBuckets.delete(oldest)
-    }
-  }
-
-  private evictIpBucketsIfNeeded(now: number): void {
-    if (this.ipBuckets.size < MAX_APEX_BUCKETS) return
-    for (const [ipKey, bucket] of this.ipBuckets) {
+  private evictAggregateBucketsIfNeeded(kind: AggregateBucketKind, now: number): void {
+    const map = this.aggregateBuckets[kind]
+    if (map.size < TARGET_LOAD_POLICY_DEFAULTS.maxAggregateBuckets) return
+    for (const [key, bucket] of map) {
       if (
         bucket.inFlight <= 0 &&
-        now - bucket.lastUsed >= APEX_BUCKET_IDLE_TTL_MS &&
-        !this.isIpReferencedByAnyRun(ipKey)
+        now - bucket.lastUsed >= TARGET_LOAD_POLICY_DEFAULTS.aggregateBucketIdleTtlMs &&
+        !this.isAggregateKeyReferenced(kind, key)
       ) {
-        this.ipBuckets.delete(ipKey)
+        map.delete(key)
       }
     }
-    while (this.ipBuckets.size >= MAX_APEX_BUCKETS) {
+    while (map.size >= TARGET_LOAD_POLICY_DEFAULTS.maxAggregateBuckets) {
       let evicted = false
-      for (const [ipKey, bucket] of this.ipBuckets) {
+      for (const [key, bucket] of map) {
         if (bucket.inFlight <= 0) {
-          this.ipBuckets.delete(ipKey)
+          map.delete(key)
           evicted = true
           break
         }
@@ -3150,73 +3051,85 @@ export class RequestBroker {
     }
   }
 
-  private apexBucket(apex: string, capacity: number, now: number, runKey?: string): ApexRateBucket {
-    let bucket = this.apexBuckets.get(apex)
+  private acquireAggregateBucket(
+    kind: AggregateBucketKind,
+    key: string,
+    rps: number,
+    now: number,
+    runKey?: string,
+  ): AggregateRateBucket {
+    const map = this.aggregateBuckets[kind]
+    let bucket = map.get(key)
     if (!bucket) {
-      this.evictApexBucketsIfNeeded(now)
-      bucket = {
-        tokens: capacity,
-        lastRefill: now,
-        lastUsed: now,
-      }
-      this.apexBuckets.set(apex, bucket)
+      this.evictAggregateBucketsIfNeeded(kind, now)
+      bucket = { tokens: rps, lastRefill: now, lastUsed: now, inFlight: 0 }
+      map.set(key, bucket)
     } else {
-      this.apexBuckets.delete(apex)
+      map.delete(key)
       bucket.lastUsed = now
-      this.apexBuckets.set(apex, bucket)
+      map.set(key, bucket)
+      refillTokenBucket(bucket, rps, now)
     }
     if (runKey) {
-      let runApexes = this.activeApexesByRun.get(runKey)
-      if (!runApexes) {
-        runApexes = new Set<string>()
-        this.activeApexesByRun.set(runKey, runApexes)
+      let runKinds = this.activeAggregateKeysByRun.get(runKey)
+      if (!runKinds) {
+        runKinds = new Map()
+        this.activeAggregateKeysByRun.set(runKey, runKinds)
       }
-      runApexes.add(apex)
+      let keys = runKinds.get(kind)
+      if (!keys) {
+        keys = new Set()
+        runKinds.set(kind, keys)
+      }
+      keys.add(key)
     }
     return bucket
   }
 
-  private ipBucket(ipKey: string, capacity: number, now: number, runKey?: string): IpAggregateBucket {
-    let bucket = this.ipBuckets.get(ipKey)
-    if (!bucket) {
-      this.evictIpBucketsIfNeeded(now)
-      bucket = {
-        tokens: capacity,
-        lastRefill: now,
-        lastUsed: now,
-        inFlight: 0,
+  private disposeAggregateBuckets(runKey: string, now: number): void {
+    const runKinds = this.activeAggregateKeysByRun.get(runKey)
+    this.activeAggregateKeysByRun.delete(runKey)
+    for (const kind of ['apex', 'ip'] as const) {
+      const map = this.aggregateBuckets[kind]
+      const keys = runKinds?.get(kind)
+      if (keys) {
+        for (const key of keys) {
+          if (!this.isAggregateKeyReferenced(kind, key)) {
+            const bucket = map.get(key)
+            if (!bucket || bucket.inFlight <= 0) {
+              map.delete(key)
+              this.lastAggregateWaitEventAt.delete(`${kind}:${key}`)
+            }
+          }
+        }
       }
-      this.ipBuckets.set(ipKey, bucket)
-    } else {
-      this.ipBuckets.delete(ipKey)
-      bucket.lastUsed = now
-      this.ipBuckets.set(ipKey, bucket)
-    }
-    if (runKey) {
-      let runIps = this.activeIpsByRun.get(runKey)
-      if (!runIps) {
-        runIps = new Set<string>()
-        this.activeIpsByRun.set(runKey, runIps)
+      for (const [key, bucket] of map) {
+        if (
+          bucket.inFlight <= 0 &&
+          now - bucket.lastUsed >= TARGET_LOAD_POLICY_DEFAULTS.aggregateBucketIdleTtlMs &&
+          !this.isAggregateKeyReferenced(kind, key)
+        ) {
+          map.delete(key)
+          this.lastAggregateWaitEventAt.delete(`${kind}:${key}`)
+        }
       }
-      runIps.add(ipKey)
     }
-    return bucket
   }
 
   /** Read-only count of active external registrable-apex rate buckets (diagnostics/tests). */
   getApexBucketCount(): number {
-    return this.apexBuckets.size
+    return this.aggregateBuckets.apex.size
   }
 
   /** Read-only count of active external per-IP aggregate rate/concurrency buckets (diagnostics/tests). */
   getIpBucketCount(): number {
-    return this.ipBuckets.size
+    return this.aggregateBuckets.ip.size
   }
 
   /** Read-only aggregate in-flight count for an external IP bucket (diagnostics/tests). */
   getIpInFlight(ipAddress: string): number {
     const key = normalizeIpBucketKey(ipAddress)
-    return key ? (this.ipBuckets.get(key)?.inFlight ?? 0) : 0
+    return key ? (this.aggregateBuckets.ip.get(key)?.inFlight ?? 0) : 0
   }
 
   private isBatchLockActive(state: OriginHealth, now = this.now()): boolean {
@@ -3350,10 +3263,9 @@ export class RequestBroker {
       }
     } else {
       this.origins.clear()
-      this.apexBuckets.clear()
-      this.activeApexesByRun.clear()
-      this.ipBuckets.clear()
-      this.activeIpsByRun.clear()
+      this.aggregateBuckets.apex.clear()
+      this.aggregateBuckets.ip.clear()
+      this.activeAggregateKeysByRun.clear()
       this.lastAggregateWaitEventAt.clear()
       this.routeCircuits.clear()
     }
@@ -3500,15 +3412,15 @@ export class RequestBroker {
       allowLocalLab: localLab,
       targetClassOverride,
     })
-    const inFlightCap = brokerPerOriginConcurrencyCap(origin, localLab, process.env, targetClassOverride)
+    const inFlightCap = resolveBrokerPerOriginConcurrencyCap(origin, localLab, process.env, targetClassOverride)
     const readConfiguredRps = () =>
-      brokerPerOriginRpsCap(
+      resolveBrokerPerOriginRpsCap(
         origin,
         typeof maxRps === 'function' ? maxRps() : maxRps,
         localLab,
         targetClassOverride,
       )
-    const apexKey = externalApexBucketKey(origin, localLab, targetClassOverride)
+    const apexKey = resolveExternalApexBucketKey(origin, localLab, targetClassOverride)
     let fallbackHostIp: string | null = null
     if (!slotOptions?.resolvedIp && targetClass === 'external') {
       try {
@@ -3518,7 +3430,7 @@ export class RequestBroker {
     const ipKey = targetClass === 'external'
       ? normalizeIpBucketKey(slotOptions?.resolvedIp ?? fallbackHostIp)
       : null
-    const readApexRps = () => brokerExternalApexRpsCap(process.env, this.options.externalApexMaxRps)
+    const readApexRps = () => resolveExternalApexRpsCap(process.env, this.options.externalApexMaxRps)
     const readIpRps = () => resolveExternalIpRpsCap(process.env, this.options.externalIpMaxRps)
     const readIpInFlightCap = () => resolveExternalIpConcurrencyCap(process.env, this.options.externalIpMaxInFlight)
     const telemetryRunId = runKey && runKey !== 'default' ? runKey : null
@@ -3538,45 +3450,20 @@ export class RequestBroker {
       const now = this.now()
       const configuredRps = readConfiguredRps()
       const rps = Math.max(1, Math.min(configuredRps, state.adaptiveRps ?? configuredRps))
-      const elapsedSec = Math.max(0, (now - state.lastRefill) / 1000)
-      state.tokens = Math.min(rps, state.tokens + elapsedSec * rps)
-      state.lastRefill = now
+      refillTokenBucket(state, rps, now)
 
-      let apexBucket: ApexRateBucket | undefined
-      let apexRps = 0
-      if (apexKey) {
-        apexRps = readApexRps()
-        apexBucket = this.apexBucket(apexKey, apexRps, now, runKey)
-        const apexElapsedSec = Math.max(0, (now - apexBucket.lastRefill) / 1000)
-        apexBucket.tokens = Math.min(apexRps, apexBucket.tokens + apexElapsedSec * apexRps)
-        apexBucket.lastRefill = now
-      }
-
-      let ipBucket: IpAggregateBucket | undefined
-      let ipRps = 0
-      let ipInFlightCap = 0
-      if (ipKey) {
-        ipRps = readIpRps()
-        ipInFlightCap = readIpInFlightCap()
-        ipBucket = this.ipBucket(ipKey, ipRps, now, runKey)
-        const ipElapsedSec = Math.max(0, (now - ipBucket.lastRefill) / 1000)
-        ipBucket.tokens = Math.min(ipRps, ipBucket.tokens + ipElapsedSec * ipRps)
-        ipBucket.lastRefill = now
-      }
+      const apexRps = apexKey ? readApexRps() : 0
+      const apexBucket = apexKey ? this.acquireAggregateBucket('apex', apexKey, apexRps, now, runKey) : undefined
+      const ipRps = ipKey ? readIpRps() : 0
+      const ipInFlightCap = ipKey ? readIpInFlightCap() : 0
+      const ipBucket = ipKey ? this.acquireAggregateBucket('ip', ipKey, ipRps, now, runKey) : undefined
 
       const retryAfterWait = state.retryAfterUntil !== undefined ? state.retryAfterUntil - now : 0
       const concurrencyOk = bypassConcurrency || state.inFlight < inFlightCap
       const apexTokensOk = !apexBucket || apexBucket.tokens >= 1
       const ipTokensOk = !ipBucket || ipBucket.tokens >= 1
       const ipConcurrencyOk = bypassConcurrency || !ipBucket || ipBucket.inFlight < ipInFlightCap
-      if (
-        retryAfterWait <= 0 &&
-        concurrencyOk &&
-        state.tokens >= 1 &&
-        apexTokensOk &&
-        ipTokensOk &&
-        ipConcurrencyOk
-      ) {
+      if (retryAfterWait <= 0 && concurrencyOk && state.tokens >= 1 && apexTokensOk && ipTokensOk && ipConcurrencyOk) {
         state.tokens -= 1
         if (apexBucket) apexBucket.tokens -= 1
         if (ipBucket) {
@@ -3584,15 +3471,12 @@ export class RequestBroker {
           ipBucket.inFlight += 1
         }
         state.inFlight += 1
-        const acquiredIpBucket = ipBucket
         let released = false
         return () => {
           if (released) return
           released = true
           state.inFlight = Math.max(0, state.inFlight - 1)
-          if (acquiredIpBucket) {
-            acquiredIpBucket.inFlight = Math.max(0, acquiredIpBucket.inFlight - 1)
-          }
+          if (ipBucket) ipBucket.inFlight = Math.max(0, ipBucket.inFlight - 1)
         }
       }
 
@@ -3602,16 +3486,11 @@ export class RequestBroker {
       if (retryAfterWait > 0) {
         waitMs = Math.min(1_000, Math.max(50, retryAfterWait))
       } else {
-        const originTokenWait = state.tokens < 1
-          ? Math.min(250, Math.max(20, Math.ceil(((1 - state.tokens) / rps) * 1000)))
-          : 0
-        const apexTokenWait = apexBucket && apexBucket.tokens < 1
-          ? Math.min(250, Math.max(20, Math.ceil(((1 - apexBucket.tokens) / apexRps) * 1000)))
-          : 0
-        const ipTokenWait = ipBucket && ipBucket.tokens < 1
-          ? Math.min(250, Math.max(20, Math.ceil(((1 - ipBucket.tokens) / ipRps) * 1000)))
-          : 0
-        const tokenWait = Math.max(originTokenWait, apexTokenWait, ipTokenWait)
+        const tokenWait = Math.max(
+          computeTokenWaitMs(state.tokens, rps),
+          apexBucket ? computeTokenWaitMs(apexBucket.tokens, apexRps) : 0,
+          ipBucket ? computeTokenWaitMs(ipBucket.tokens, ipRps) : 0,
+        )
         if (tokenWait > 0) waitMs = tokenWait
         if (ipBucket && (!ipTokensOk || !ipConcurrencyOk)) {
           aggregateWaitKind = 'ip'

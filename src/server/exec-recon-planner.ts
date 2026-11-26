@@ -20,6 +20,7 @@ import { suppliedResponseLabel } from '../report-summary.ts'
 import { isContinuableStepStatus } from '../step-status.ts'
 import { accessPolicyReviews } from './access-policy-checks.ts'
 import { isSensitiveRepoEntry, isSensitiveRepoRelativePath } from './safety-primitives.ts'; export { isSensitiveRepoEntry, isSensitiveRepoRelativePath }
+import { defaultRetryGovernor } from './retry-governor.ts'
 import { settleOrReport, settleOrReportAsync } from './run-disposers.ts'
 import {
   agentTurn,
@@ -1907,7 +1908,6 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
   }
   private readonly persistedStepCheckpoints = new Map<string, { checkpointCapId?: string; checkpointJson?: string }>()
   private readonly structuredStepTargets = new Map<string, StructuredStepTarget[]>()
-  private readonly retryCountsByRun = new Map<string, Map<string, number>>()
   private readonly invariantsSeedingInFlight = new Map<string, Promise<void>>()
   private get plannerEmptyRounds() { return this.runState.mapView('plannerEmptyRounds') }
   private get plannerDryRounds() { return this.runState.mapView('plannerDryRounds') }
@@ -1996,7 +1996,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         this.structuredStepTargets.delete(stepId)
       }
     }
-    this.retryCountsByRun.delete(runId)
+    defaultRetryGovernor.clearRun(runId)
     this.invariantsSeedingInFlight.delete(runId)
     this.emittedPreconditionUnmetByRun.delete(runId)
     if (this.ownRunState) {
@@ -2155,10 +2155,16 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     return derived
   }
 
+  /** Resolve the effective finite run wall-clock duration budget (ms) for `run`. */
+  getRunMaxDurationMs(run?: { maxDurationMs?: number }): number {
+    const runMax = Number(run?.maxDurationMs)
+    return Number.isFinite(runMax) && runMax > 0 ? runMax : this.host.maxDurationMs
+  }
+
   /**
    * Strictly bounded single-retry requeue (max 1 retry per `reinvestigationKey`) for retryable
-   * terminal step statuses (`turn_capped`, `nudged_out`). Strictly charged against
-   * `dynamicStepBudget`, wall-clock, USD/request budget, and `RunSafetyBudgets`.
+   * terminal step statuses (`turn_capped`, `nudged_out`), evaluated through the single
+   * `RetryGovernor` against `dynamicStepBudget`, wall-clock, USD/request budget, and `RunSafetyBudgets`.
    */
   maybeRequeueRetryableStep(input: {
     run: Run
@@ -2168,12 +2174,8 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     targetOrigins: readonly string[]
   }): { requeued: boolean; reason: string; retryStep?: ChainStep; retryKey?: string; repointedDependentIds?: string[] } {
     const { run, step, assignment, terminalStatus } = input
-    if (!isRetryableChainStepStatus(terminalStatus)) {
-      return { requeued: false, reason: 'not_retryable_status' }
-    }
-    if ((step.trialIndex ?? 0) > 0 || step.skills.includes('cq5:retry:1')) {
-      return { requeued: false, reason: 'already_retry_step' }
-    }
+    if (!isRetryableChainStepStatus(terminalStatus)) return { requeued: false, reason: 'not_retryable_status' }
+    if ((step.trialIndex ?? 0) > 0 || step.skills.includes('cq5:retry:1')) return { requeued: false, reason: 'already_retry_step' }
     const structuredTargets = this.getStructuredStepTargets(step)
     const primaryTarget = structuredTargets[0]
     const primaryOrigin = primaryTarget?.origin ?? input.targetOrigins[0] ?? step.sourceOrigins[0] ?? ''
@@ -2181,56 +2183,51 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     const primaryMethod = primaryTarget?.method ?? 'ANY'
     const primaryClass = primaryTarget?.vulnClass ?? step.category ?? 'unknown'
     const retryKey = reinvestigationKey(`${primaryMethod} ${primaryRoute}`, primaryClass)
-
-    let runRetryMap = this.retryCountsByRun.get(run.id)
-    if (!runRetryMap) {
-      runRetryMap = new Map<string, number>()
-      this.retryCountsByRun.set(run.id, runRetryMap)
-    }
-    const priorRetries = runRetryMap.get(retryKey) ?? 0
     const existingSteps = this.storage.listChainSteps(run.id, run.goalRevision)
     const alreadyRetriedPersisted = existingSteps.some(s =>
       s.skills.includes('cq5:retry:1')
       && (s.dependsOnStepIds.includes(step.id)
         || this.getStructuredStepTargets(s).some(t => reinvestigationKey(`${t.method} ${t.route}`, t.vulnClass) === retryKey)),
     )
-    if (priorRetries >= MAX_RETRYABLE_STEP_RETRIES || alreadyRetriedPersisted) {
-      this.storage.event(
-        run.id,
-        'worker.retryable_step_not_requeued',
-        `Retryable step "${step.title}" (${terminalStatus}) not requeued: max 1 retry per key already reached.`,
-        { stepId: step.id, assignmentId: assignment.id, terminalStatus, retryKey, reason: 'retry_cap_reached' },
-      )
-      return { requeued: false, reason: 'retry_cap_reached', retryKey }
-    }
-
     const currentRun = this.storage.run(run.id)
-    if (currentRun.status !== 'running' || currentRun.phase !== 'investigation') {
-      return { requeued: false, reason: 'run_not_investigating', retryKey }
-    }
-    if (this.storage.checkBudgetExceeded(currentRun.id)) {
-      return { requeued: false, reason: 'budget_exhausted', retryKey }
-    }
-    if (currentRun.budgetRequests > 0 && currentRun.budgetRequests - currentRun.spentRequests <= 0) {
-      return { requeued: false, reason: 'request_budget_exhausted', retryKey }
-    }
-    if (this.host.maxDurationMs > 0 && currentRun.createdAt + this.host.maxDurationMs <= Date.now()) {
-      return { requeued: false, reason: 'wall_clock_exhausted', retryKey }
-    }
-    const dynamicBudget = Math.min(
-      hardChainStepsCeiling,
-      currentRun.dynamicStepBudget ?? computeDynamicStepBudget(this.storage, currentRun.id),
-    )
+    const dynamicBudget = Math.min(hardChainStepsCeiling, currentRun.dynamicStepBudget ?? computeDynamicStepBudget(this.storage, currentRun.id))
     const safetyBudgets = resolveRunSafetyBudgets({ maxAssignments: dynamicBudget })
     const effectiveStepCap = Math.min(dynamicBudget, safetyBudgets.maxCompositeVerifiesPerRun)
-    if (existingSteps.length >= effectiveStepCap) {
-      this.storage.event(
-        run.id,
-        'worker.retryable_step_not_requeued',
-        `Retryable step "${step.title}" (${terminalStatus}) not requeued: step budget exhausted (${existingSteps.length}/${effectiveStepCap}).`,
-        { stepId: step.id, assignmentId: assignment.id, terminalStatus, retryKey, reason: 'step_budget_exhausted', existingSteps: existingSteps.length, effectiveStepCap },
-      )
-      return { requeued: false, reason: 'step_budget_exhausted', retryKey }
+    const decision = defaultRetryGovernor.evaluate({
+      runId: currentRun.id,
+      path: 'step_requeue',
+      retryKey,
+      stepStatus: terminalStatus,
+      stepSkills: step.skills,
+      stepTrialIndex: step.trialIndex,
+      alreadyRetriedPersisted,
+      runStatus: currentRun.status,
+      runPhase: currentRun.phase,
+      budgetExhausted: this.storage.checkBudgetExceeded(currentRun.id),
+      requestBudgetExhausted: currentRun.budgetRequests > 0 && currentRun.budgetRequests - currentRun.spentRequests <= 0,
+      runCreatedAt: currentRun.createdAt,
+      maxDurationMs: this.getRunMaxDurationMs(currentRun as { maxDurationMs?: number }),
+      existingStepCount: existingSteps.length,
+      effectiveStepCap,
+      maxRetriesPerKey: MAX_RETRYABLE_STEP_RETRIES,
+    })
+    if (!decision.allowed) {
+      if (decision.reason === 'retry_cap_reached') {
+        this.storage.event(
+          run.id,
+          'worker.retryable_step_not_requeued',
+          `Retryable step "${step.title}" (${terminalStatus}) not requeued: max 1 retry per key already reached.`,
+          { stepId: step.id, assignmentId: assignment.id, terminalStatus, retryKey, reason: 'retry_cap_reached' },
+        )
+      } else if (decision.reason === 'step_budget_exhausted') {
+        this.storage.event(
+          run.id,
+          'worker.retryable_step_not_requeued',
+          `Retryable step "${step.title}" (${terminalStatus}) not requeued: step budget exhausted (${existingSteps.length}/${effectiveStepCap}).`,
+          { stepId: step.id, assignmentId: assignment.id, terminalStatus, retryKey, reason: 'step_budget_exhausted', existingSteps: existingSteps.length, effectiveStepCap },
+        )
+      }
+      return { requeued: false, reason: decision.reason, retryKey }
     }
 
     const approvedOrigins = this.host.approvedOriginsSet(currentRun)
@@ -2281,14 +2278,10 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       }),
     })
     const readyRetry = this.storage.updateChainStep(created.id, { status: 'ready' })
-    // R2-07: Re-point pending downstream dependents of the capped/nudged original step to the
-    // retry step (bounded inside the 1-retry cap and RunSafetyBudgets) so they wait on the retry
-    // instead of stranding on the terminal original.
     const repointedDependentIds: string[] = []
     for (const candidate of existingSteps) {
       if (candidate.id === step.id || candidate.id === readyRetry.id) continue
-      if (candidate.status !== 'pending') continue
-      if (!candidate.dependsOnStepIds.includes(step.id)) continue
+      if (candidate.status !== 'pending' || !candidate.dependsOnStepIds.includes(step.id)) continue
       const nextDeps = [...new Set(candidate.dependsOnStepIds.map(sid => (sid === step.id ? readyRetry.id : sid)))]
       this.storage.updateChainStep(candidate.id, { dependsOnStepIds: nextDeps })
       repointedDependentIds.push(candidate.id)
@@ -2297,7 +2290,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       ? structuredTargets
       : [{ origin: primaryOrigin || validOrigins[0]!, method: primaryMethod, route: primaryRoute, vulnClass: primaryClass }]
     this.registerStepTargets(currentRun.id, created.id, targetsToBind)
-    runRetryMap.set(retryKey, priorRetries + 1)
+    const recorded = defaultRetryGovernor.recordRetry(currentRun.id, retryKey, 'step_requeue')
     this.storage.event(
       currentRun.id,
       'worker.retryable_step_requeued',
@@ -2308,7 +2301,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         assignmentId: assignment.id,
         terminalStatus,
         retryKey,
-        retryCount: priorRetries + 1,
+        retryCount: recorded.keyRetries,
         maxRetries: MAX_RETRYABLE_STEP_RETRIES,
         dynamicBudget,
         effectiveStepCap,

@@ -10,7 +10,7 @@
  */
 import { createHash } from 'node:crypto'
 import { parseBodyFromCarrierText } from './host-fact-log.ts'
-import { ROLE_RANK, normalizeRole, parseRoleLabel, parseRoleMemberships, stepReadsState, type RoleName } from './oracle-invariants.ts'
+import { ROLE_RANK, normalizeRole, parseRoleMemberships, resolvePersonaIdentity, stepReadsState, type RoleName } from './oracle-invariants.ts'
 import type { ProofReceipt } from './proof-receipt.ts'
 import { deriveRecordAuthzDimension, extractIssuedSignedUrl, extractTenantMarkers, findNonErrorBatchRecord, isJobOrHandleStub, type HostAuthzDimension, type HostSignedRecord, type V8OracleFamily } from './v8-oracle-families.ts'
 
@@ -18,8 +18,7 @@ export interface HydratableEntry {
   exchangeId: string
   seq?: number
   timestampMs?: number
-  actorPersona?: string | null
-  actorRoleLabel?: string | null
+  actorPersona?: string | null; actorRoleLabel?: string | null; actorTenant?: string | null; actorPrivilege?: RoleName | null
   emittedCapabilities?: readonly string[]
   observedResponseDigests?: readonly string[]
   consumedCapabilities?: readonly string[]
@@ -87,8 +86,8 @@ const isPosTs = (ts: unknown): ts is number => typeof ts === 'number' && Number.
 const is2xx = (st: number | null | undefined): boolean => typeof st === 'number' && st >= 200 && st < 300
 const actorOfEntry = (e: HydratableEntry): string | null =>
   e.actorPersona !== undefined ? e.actorPersona : (e.step.actor.handle ?? null)
-const roleOfEntry = (e: HydratableEntry): string | null =>
-  e.actorRoleLabel ? parseRoleLabel(e.actorRoleLabel).role : (e.step.actor.role ?? null)
+export const resolveEntryIdentity = (e: HydratableEntry) => resolvePersonaIdentity({ roleLabel: e.actorRoleLabel ?? (e.actorTenant === undefined && !e.step.actor.tenant ? e.actorPersona ?? null : null), tenantRef: e.actorTenant ?? e.step.actor.tenant ?? null, privilege: e.actorPrivilege ?? e.step.actor.role ?? null, handle: e.actorPersona ?? e.step.actor.handle ?? null })
+const roleOfEntry = (e: HydratableEntry): string | null => resolveEntryIdentity(e).role
 
 const PRIV_HANDLE_RE = /^(?:admin|owner|super_?admin|org_?admin|tenant_?admin|root|system|manager|operator|staff|superuser)(?:[_-]|$)|(?:^|[_-])(?:super_?admin|org_?admin|tenant_?admin|owner|root)$/i
 const PRIV_ROLE_WORD_RE = /(?:^|[^a-z])(owner|superadmin|super|admin|administrator|manager|staff|operator|root|superuser)(?:$|[^a-z])/i
@@ -149,7 +148,7 @@ export function isPrivilegedActorOrRole(
   if (labelHead && GLOBAL_PRIV_LABEL_RE.test(labelHead)) return true
   if (labelHead && memberships.length === 0) {
     const labelCls = parseExtendedRole(labelHead)
-    if (labelCls === 'owner' || labelCls === 'admin' || labelCls === 'unknown') return true
+    if (labelCls === 'owner' || labelCls === 'admin' || (labelCls === 'unknown' && rawRoleCls !== 'low')) return true
   }
   const hasAdmin = rawRoleCls === 'admin' || memberships.some(m => m.role === 'admin')
   if (!hasAdmin) return false
@@ -244,7 +243,7 @@ export function buildCapOriginIndex(entries: Iterable<HydratableEntry>, anonActo
   const directTenant = (e: HydratableEntry): string | null => {
     const a = actorOfEntry(e)
     if (!a || anonActorRe.test(a) || a.startsWith('cap:')) return null
-    return (e.step.actor.tenant ?? parseRoleLabel(e.actorRoleLabel ?? e.actorPersona ?? '').tenant ?? '').trim().toLowerCase() || null
+    return resolveEntryIdentity(e).tenant
   }
 
   const loginTenantOf = (cap: string): string | null => {
@@ -757,19 +756,18 @@ function deriveDualActorFromTranscript(
     if (!t || !role || FORBIDDEN_KEYS.has(t)) return
     const prev = rolesByTenant[t]; if (!prev || ROLE_RANK[role] > ROLE_RANK[prev]) rolesByTenant[t] = role
   }
-  const recordLabel = (label: string | null | undefined) => {
+  const recordMemberships = (label: string | null | undefined, allowSingle: boolean) => {
     if (!label) return
     for (const m of parseRoleMemberships(label)) recordRole(m.tenant, m.role)
-    const pl = parseRoleLabel(label); recordRole(pl.tenant, pl.role)
-  }
-  for (const reg of [idx.personaRoleLabels, econCtx?.personaRoleLabels]) {
-    if (reg) for (const [k, label] of Object.entries(reg)) if (k.trim().toLowerCase() === actorLower) recordLabel(label)
+    if (allowSingle) { const idn = resolvePersonaIdentity({ roleLabel: label }); recordRole(idn.tenant, idn.role) }
   }
   for (const e of idx.entriesById.values()) {
     if (resolveEntryActor(e).toLowerCase() !== actorLower) continue
-    recordLabel(e.actorRoleLabel)
-    recordRole(e.step.actor.tenant ?? parseRoleLabel(e.actorPersona ?? '').tenant, normalizeRole(roleOfEntry(e) ?? undefined))
+    const idn = resolveEntryIdentity(e); recordRole(idn.tenant, idn.role)
+    if (e.actorRoleLabel && (e.actorRoleLabel.includes('memberships=') || /[,;]/.test(e.actorRoleLabel))) recordMemberships(e.actorRoleLabel, false)
   }
+  const needReg = Object.keys(rolesByTenant).length === 0
+  for (const reg of [idx.personaRoleLabels, econCtx?.personaRoleLabels]) if (reg) for (const [k, label] of Object.entries(reg)) if (k.trim().toLowerCase() === actorLower) recordMemberships(label, needReg)
   return { actorId, rolesByTenant }
 }
 
@@ -868,7 +866,7 @@ export function hydrateV8OracleInput(
     if (e && capIdx) {
       for (const c of [...(e.actorPersona?.startsWith('cap:') ? [e.actorPersona] : []), ...(e.consumedCapabilities ?? []), ...(e.emittedCapabilities ?? [])]) { const t = capIdx.emitterActorOf(c)?.tenant; if (t) { capT = t; break } }
     }
-    const personaTenant = (e?.step.actor.tenant ?? parseRoleLabel(e?.actorRoleLabel ?? e?.actorPersona ?? '').tenant ?? capT).trim().toLowerCase()
+    const personaTenant = ((e ? resolveEntryIdentity(e).tenant : null) ?? capT).trim().toLowerCase()
     return deriveRecordAuthzDimension(e ? { route: e.step.route, pathAndQuery: e.step.pathAndQuery, json: e.step.json, body: e.step.body, tenantId: personaTenant || null } : undefined, { personaTenant, preferredTenant, stripUrlTokens })
   }
 

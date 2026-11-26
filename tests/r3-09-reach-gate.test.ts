@@ -26,6 +26,7 @@ import { scanRunScopedState } from '../scripts/check-run-scoped-state.ts'
 import { runUnwiredCheck } from '../scripts/check-unwired.ts'
 import { RunOrchestrationStateStore } from '../src/server/exec-dispatch.ts'
 import { ExecWorkerRunner, type ExecWorkerHost } from '../src/server/exec-worker-runner.ts'
+import { defaultRetryGovernor } from '../src/server/retry-governor.ts'
 import { runAllRunDisposers } from '../src/server/run-disposers.ts'
 
 const REPO_ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)))
@@ -103,36 +104,34 @@ describe('R3-09 #1: class-field run-scoped Map detection & ExecWorkerRunner disp
     )
   })
 
-  test('ExecWorkerRunner backs providerRetryCountsByRun & providerRetriesTotalByRun via runState.mapView and disposes cleanly', () => {
-    // Path A: shared RunOrchestrationStateStore passed via host.runState
+  test('ExecWorkerRunner delegates per-run retry state to disposer-registered RetryGovernor and disposes runState cleanly', () => {
+    // Path A: shared RunOrchestrationStateStore passed via host.runState disposes cleanly
     const sharedRunState = new RunOrchestrationStateStore()
     const runnerWithShared = new ExecWorkerRunner({ runState: sharedRunState } as unknown as ExecWorkerHost)
     const internalA = runnerWithShared as unknown as {
-      providerRetryCountsByRun: Map<string, Map<string, number>>
-      providerRetriesTotalByRun: Map<string, number>
+      runState: RunOrchestrationStateStore
+      providerRetryCountsByRun?: unknown
+      providerRetriesTotalByRun?: unknown
     }
-    internalA.providerRetryCountsByRun.set('run-r309-a', new Map([['step-1', 2]]))
-    internalA.providerRetriesTotalByRun.set('run-r309-a', 2)
+    assert.equal(internalA.runState, sharedRunState)
+    assert.equal(internalA.providerRetryCountsByRun, undefined, 'R3-14 retired duplicate worker retry maps in favor of RetryGovernor')
+    assert.equal(internalA.providerRetriesTotalByRun, undefined)
+    sharedRunState.ensure('run-r309-a').providerRetriesTotal = 2
     assert.equal(sharedRunState.get('run-r309-a')?.providerRetriesTotal, 2)
-    assert.equal(sharedRunState.get('run-r309-a')?.providerRetryCounts?.get('step-1'), 2)
-
     sharedRunState.disposeRun('run-r309-a')
-    assert.equal(internalA.providerRetryCountsByRun.has('run-r309-a'), false)
-    assert.equal(internalA.providerRetriesTotalByRun.has('run-r309-a'), false)
+    assert.equal(sharedRunState.get('run-r309-a'), undefined)
 
-    // Path B: host.runState omitted -> fallback own RunOrchestrationStateStore disposed by runAllRunDisposers
+    // Path B: host.runState omitted -> fallback own RunOrchestrationStateStore & defaultRetryGovernor both dispose via runAllRunDisposers
     const runnerFallback = new ExecWorkerRunner({} as unknown as ExecWorkerHost)
-    const internalB = runnerFallback as unknown as {
-      providerRetryCountsByRun: Map<string, Map<string, number>>
-      providerRetriesTotalByRun: Map<string, number>
-    }
-    internalB.providerRetryCountsByRun.set('run-r309-b', new Map([['step-2', 3]]))
-    internalB.providerRetriesTotalByRun.set('run-r309-b', 3)
-    assert.equal(internalB.providerRetriesTotalByRun.get('run-r309-b'), 3)
+    const internalB = runnerFallback as unknown as { runState: RunOrchestrationStateStore }
+    internalB.runState.ensure('run-r309-b').providerRetriesTotal = 3
+    assert.equal(internalB.runState.get('run-r309-b')?.providerRetriesTotal, 3)
+    defaultRetryGovernor.recordRetry('run-r309-b', 'GET /r309::bola', 'provider_transient')
+    assert.ok(defaultRetryGovernor.getRunStats('run-r309-b') !== null)
 
     runAllRunDisposers('run-r309-b')
-    assert.equal(internalB.providerRetryCountsByRun.has('run-r309-b'), false)
-    assert.equal(internalB.providerRetriesTotalByRun.has('run-r309-b'), false)
+    assert.equal(internalB.runState.get('run-r309-b'), undefined)
+    assert.equal(defaultRetryGovernor.getRunStats('run-r309-b'), null)
   })
 })
 

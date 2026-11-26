@@ -5,14 +5,14 @@
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto'
 import { z } from 'zod'
 import { scopedAssetOrigin } from '../domain.ts'
-import { parseRoleLabel, routeFamily, stepReadsState } from './oracle-invariants.ts'
+import { routeFamily, stepReadsState, type RoleName } from './oracle-invariants.ts'
 import { augmentCompositeReceiptWithAutoDag, matchesBoundTerminalControl, matchesNormalizedCtrlPath } from './composite-autodag.ts'
 import { analyzeCrossTenantTerminalEvidence, collectCitedReceiptExchanges, evaluateExchangeTenantPrivilege, inferV8OracleFamilyFromInput, isReadOnlyDirectoryOrMetadataImpact, normalizeCompositeTerminalEndpoint, parsePersonaPrivilegeProfile, verifyReadOnlyStateTransitionGuard } from './causal-proof-compiler.ts'
 import { resolveCompositeTerminalExchange } from './composite-terminal.ts'
 import { HostFactLog } from './host-fact-log.ts'
 import { proofReceiptSchema, receiptIdSchema, verifyReceipt } from './proof-receipt.ts'
 import { evaluateV8OracleFamily, extractTenantMarkers, isJobOrHandleStub, type HostSignedRecord as V8OracleRecord, type V8OracleFamily, type V8OracleInputMap } from './v8-oracle-families.ts'
-import { TERMINAL_CLASS_CONTRACT, buildCapOriginIndex, canonicalNonAuthQuery, cleanExactPath, entryCarriesRequestToken, entryMatchesCorrelation, entryMatchesEntity, hydrateV8OracleInput, isHydratedStub, isPrivilegedActorOrRole, matchesHydratedRecord, resolveTerminalContract, sanitizeEmbeddedProofReceipt, selectStateTransitionPair, type CapOriginIndex, type EconomicAutoHydrateContext, type TerminalContractKind } from './v8-oracle-hydrate.ts'
+import { TERMINAL_CLASS_CONTRACT, buildCapOriginIndex, canonicalNonAuthQuery, cleanExactPath, entryCarriesRequestToken, entryMatchesCorrelation, entryMatchesEntity, hydrateV8OracleInput, isHydratedStub, isPrivilegedActorOrRole, matchesHydratedRecord, resolveEntryIdentity, resolveTerminalContract, sanitizeEmbeddedProofReceipt, selectStateTransitionPair, type CapOriginIndex, type EconomicAutoHydrateContext, type TerminalContractKind } from './v8-oracle-hydrate.ts'
 export { TERMINAL_CLASS_CONTRACT, type TerminalContractKind }
 import type { ProofReceipt, ReceiptBrowserTrace, ReceiptOobEvent, ReceiptTranscript, ReceiptTranscriptEntry, ReceiptVerification } from './proof-receipt.ts'
 
@@ -80,7 +80,7 @@ export type CompositeProofReceipt = z.output<typeof compositeProofReceiptSchema>
 // --- Host-Signed Transcript Types (Superset of ReceiptTranscript) -----------
 export interface HostCryptoAttestation { derivedFromCapabilityId: string; derivedCapabilityId?: string; alg: string; artifactDigest: string; timestampMs: number }
 export interface HostTranscriptEntry extends ReceiptTranscriptEntry {
-  timestampMs?: number; actorPersona?: string | null; actorRoleLabel?: string | null; emittedCapabilities?: readonly string[]
+  timestampMs?: number; actorPersona?: string | null; actorRoleLabel?: string | null; actorTenant?: string | null; actorPrivilege?: RoleName | null; emittedCapabilities?: readonly string[]
   observedResponseDigests?: readonly string[]; consumedCapabilities?: readonly string[]; injectedRequestDigests?: readonly string[]
   cryptoAttestations?: readonly HostCryptoAttestation[]; entityId?: string; correlationIds?: readonly string[]
   cleanSession?: boolean; replayAttempt?: 'mode_a' | 'ablation_control' | 'primary'; hostSignature?: string
@@ -141,8 +141,8 @@ const isLoginCap = (cap: string, capIdx: CapOriginIndex): boolean => Boolean(cap
 const sessionActorOf = (e: HostTranscriptEntry, capIdx: CapOriginIndex): string | null => { const a = actorOf(e); return !a || ANON_ACTOR_RE.test(a) ? null : a.startsWith('cap:') ? (isLoginCap(a, capIdx) ? normAct(capIdx.actorOf(a)) : null) : normAct(a) }
 const probeActorOf = (e: HostTranscriptEntry, capIdx: CapOriginIndex): string | null => { const a = actorOf(e); return !a || ANON_ACTOR_RE.test(a) ? null : a.startsWith('cap:') ? normAct(capIdx.actorOf(a)) : normAct(a) }
 const sameCredIdentity = (a: HostTranscriptEntry, b: HostTranscriptEntry, capIdx: CapOriginIndex): boolean => { const ar = actorOf(a), br = actorOf(b); if (ar && br && ar === br) return true; const sa = sessionActorOf(a, capIdx), sb = sessionActorOf(b, capIdx) ?? probeActorOf(b, capIdx); return Boolean(sa && sb && sa === sb) }
-const roleOf = (e: HostTranscriptEntry): string | null => (e.actorRoleLabel ? parseRoleLabel(e.actorRoleLabel).role : (e.step.actor.role ?? null))
-const probeTenantsOf = (e: HostTranscriptEntry, capIdx?: CapOriginIndex): string[] => { const out: string[] = [], a = actorOf(e), dt = (!a || ANON_ACTOR_RE.test(a) || a.startsWith('cap:')) ? null : ((e.step.actor.tenant ?? parseRoleLabel(e.actorRoleLabel ?? e.actorPersona ?? '').tenant ?? '').trim().toLowerCase() || null); if (dt) out.push(dt); if (capIdx) for (const c of [...(a?.startsWith('cap:') ? [a] : []), ...(e.consumedCapabilities ?? [])]) { const lt = capIdx.loginTenantOf(c); if (lt && !out.includes(lt)) out.push(lt) } return out }
+const roleOf = (e: HostTranscriptEntry): string | null => resolveEntryIdentity(e).role
+const probeTenantsOf = (e: HostTranscriptEntry, capIdx?: CapOriginIndex): string[] => { const out: string[] = [], a = actorOf(e), dt = (!a || ANON_ACTOR_RE.test(a) || a.startsWith('cap:')) ? null : resolveEntryIdentity(e).tenant; if (dt) out.push(dt); if (capIdx) for (const c of [...(a?.startsWith('cap:') ? [a] : []), ...(e.consumedCapabilities ?? [])]) { const lt = capIdx.loginTenantOf(c); if (lt && !out.includes(lt)) out.push(lt) } return out }
 const probeTenantOf = (e: HostTranscriptEntry, capIdx?: CapOriginIndex): string | null => probeTenantsOf(e, capIdx)[0] ?? null
 function collectLeaves(v: unknown, out: Set<string>, d = 0): void {
   if (d > 5 || out.size > 256 || v == null) return
