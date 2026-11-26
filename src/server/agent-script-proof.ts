@@ -20,6 +20,7 @@ import {
   type CompositeVerifyOptions,
   type HostSignedTranscript,
 } from './composite-receipt.ts'
+import { normalizeCompositeTerminalEndpoint } from './causal-proof-compiler.ts'
 import { DerivedCapabilityVault, type DerivedCapabilityMeta } from './derived-custody.ts'
 import { createEgressSanitizer, type EgressSanitizer } from './egress-sanitizer.ts'
 import { HostFactLog } from './host-fact-log.ts'
@@ -500,6 +501,7 @@ export async function runAgentScriptProof(params: AgentScriptProofParams): Promi
     candidate: { name: `agent-proof-${params.runId}.ts`, runtime: 'ts', code },
     openAttempt,
     signal: params.signal,
+    fastFailOnAttempt1: true,
   })
   const transcriptDigests = verdict.attempts.map(attempt => attempt.transcriptDigest).filter(Boolean)
 
@@ -533,8 +535,10 @@ export async function runAgentScriptProof(params: AgentScriptProofParams): Promi
   )
 
   if (sessionsClean && confirmedComp1 && confirmedComp2) {
-    const endpoint1 = (confirmedComp1.verification.terminalEndpoint ?? '').trim()
-    const endpoint2 = (confirmedComp2.verification.terminalEndpoint ?? '').trim()
+    const termEntity1 = confirmedComp1.receipt.hops.find(h => h.hopId === confirmedComp1.receipt.terminalImpact.terminalHopId)?.entityId
+    const termEntity2 = confirmedComp2.receipt.hops.find(h => h.hopId === confirmedComp2.receipt.terminalImpact.terminalHopId)?.entityId
+    const endpoint1 = normalizeCompositeTerminalEndpoint(confirmedComp1.verification.terminalEndpoint, termEntity1)
+    const endpoint2 = normalizeCompositeTerminalEndpoint(confirmedComp2.verification.terminalEndpoint, termEntity2)
     const family1 = (confirmedComp1.verification.terminalOracleFamily ?? confirmedComp1.receipt.terminalImpact.oracleFamily ?? '').trim()
     const family2 = (confirmedComp2.verification.terminalOracleFamily ?? confirmedComp2.receipt.terminalImpact.oracleFamily ?? '').trim()
     const agrees = confirmedComp1.receipt.chainId === confirmedComp2.receipt.chainId

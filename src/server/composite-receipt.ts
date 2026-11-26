@@ -7,6 +7,7 @@ import { z } from 'zod'
 import { scopedAssetOrigin } from '../domain.ts'
 import { parseRoleLabel, routeFamily, stepReadsState } from './oracle-invariants.ts'
 import { augmentCompositeReceiptWithAutoDag, matchesNormalizedCtrlPath } from './composite-autodag.ts'
+import { analyzeCrossTenantTerminalEvidence, inferV8OracleFamilyFromInput, isReadOnlyDirectoryOrMetadataImpact, normalizeCompositeTerminalEndpoint, verifyReadOnlyStateTransitionGuard } from './causal-proof-compiler.ts'
 import { resolveCompositeTerminalExchange } from './composite-terminal.ts'
 import { HostFactLog } from './host-fact-log.ts'
 import { proofReceiptSchema, receiptIdSchema, verifyReceipt } from './proof-receipt.ts'
@@ -107,9 +108,8 @@ export interface CompositeReceiptVerification {
 // --- Cryptographic, Hashing & Transcript Helpers ----------------------------
 const CONSUMED_STATE_RE = /\b(?:already[_\s-]?(?:consumed|redeemed|used|claimed|applied|settled)|token[_\s-]?(?:consumed|used|redeemed|spent)|one[_\s-]?time|nonce[_\s-]?(?:used|replayed|consumed)|invite[_\s-]?(?:redeemed|consumed|used)|state[_\s-]?(?:consumed|exhausted|finalized))\b/i
 const ABLATION_DENIED_STATUSES = new Set([401, 403, 404, 409, 412, 422]), DENIED_CONTROL_STATUSES = new Set([401, 403, 404]), SHA256_RE = /^[0-9a-f]{64}$/
-const CROSS_TENANT_CLASS_RE = /^(?:dual_tenant_abac|parser_cache_differential)$|dual[_-]?tenant|cross[_-]?tenant|tenant[_-]?(?:isolation|bleed|leak|export)|abac|cache[_-]?(?:bleed|poison|deception|diff|bypass)|export[_-]?(?:bypass|leak|disclosure)|presign|cwe[-_]?(?:444|639)|\bidor\b|\bbola\b/i
-const TERMINAL_IMPACT_UNPROVEN_HINT =
-  "terminal_impact_unproven: obtaining a job/export handle, signed URL, or cache ack is an intermediate capability (seal with ctx.seal_capability), NOT terminal impact — fetch the target resource with the derived URL/handle to prove unauthorized foreign-tenant data exposure or privileged state mutation, or settle with record_coverage(status='ruled_out', proofGapReason='invariant_enforced_hardened') if blocked"
+const CROSS_TENANT_CLASS_RE = /^(?:dual_tenant_abac|parser_cache_differential)$|dual[_-]?tenant|cross[_-]?tenant|tenant[_-]?(?:isolation|bleed|leak|export)|abac|cache[_-]?(?:bleed|poison|deception|diff|bypass)|export[_-]?(?:bypass|leak|disclosure)|presign|cwe[-_]?(?:444|639)|\bidor\b|\bbola\b/i, PRIV_ESC_CLASS_RE = /^(?:privilege_escalation|bfla|authz_escalation)$/i
+const TERMINAL_IMPACT_UNPROVEN_HINT = "terminal_impact_unproven: obtaining a job/export handle, signed URL, or cache ack is an intermediate capability (seal with ctx.seal_capability), NOT terminal impact — fetch the target resource with the derived URL/handle to prove unauthorized foreign-tenant data exposure or privileged state mutation, or settle with record_coverage(status='ruled_out', proofGapReason='invariant_enforced_hardened') if blocked"
 const ANON_ACTOR_RE = /^(?:anon(?:ymous)?|unauth(?:enticated)?|guest)$/i
 export const sha256Hex = (value: string): string => createHash('sha256').update(value, 'utf8').digest('hex')
 function canonicalStringify(value: unknown): string {
@@ -134,7 +134,7 @@ const isExecArm = (e: HostTranscriptEntry, isTerm = false): boolean => e.step.ar
 const normOrigin = (o: string | null | undefined): string => (o ?? '').trim().replace(/\/+$/, '').toLowerCase()
 const normHopPath = (p: string | null | undefined): string => { const s = (p ?? '').trim(); return !s ? '' : (cleanExactPath(s) || '/') }
 const matchesHopPath = (a: string, b: string): boolean => { const da = normHopPath(a), db = normHopPath(b); return Boolean(da && db && (da === db || matchesNormalizedCtrlPath(a, b))) }
-const normRouteFam = (p: string | null | undefined, eid?: string): string => !p ? '' : routeFamily(p.split(/[?#]/, 1)[0]!.split('/').map(s => (s && ((eid && s === eid) || /^\d+$/.test(s))) ? ':id' : s).join('/'))
+const normRouteFam = (p: string | null | undefined, eid?: string): string => normalizeCompositeTerminalEndpoint(p, eid)
 const normAct = (a: string | null | undefined): string | null => (!a || ANON_ACTOR_RE.test(a.trim())) ? null : a.trim().toLowerCase()
 const actorOf = (e: HostTranscriptEntry): string | null => (e.actorPersona !== undefined ? e.actorPersona : (e.step.actor.handle ?? null))
 const isLoginCap = (cap: string, capIdx: CapOriginIndex): boolean => Boolean(capIdx.emitterActorOf(cap)?.isLogin)
@@ -393,6 +393,7 @@ function verifyStateTransitionBinding(base: EdgeBase, edge: Extract<CausalEdgeBi
     else diags.push(`${abId}: status=${st ?? 'null'} not a denial (401/403/404/409/412/422)`)
   }
   if (!validAblation) return edgeFail(base, `state_transition_binding on "${edge.entityId}" lacks a passing clean-session ablation control [${diags.join('; ') || 'no ablationExchangeIds cited'}].`)
+  const roErr = verifyReadOnlyStateTransitionGuard(pair, edge.entityId, validAblation, logicalFallback); if (roErr) return edgeFail(base, roErr)
   return edgeOk(base, 'state_transition_binding verified with clean-session ablation control.', { entityId: edge.entityId, fromExchangeId: pair.from.exchangeId, toExchangeId: pair.to.exchangeId, ablationExchangeId: validAblation.exchangeId, ablationStatus: validAblation.step.status, ...(logicalFallback ? { bindingMode: 'logical_key_ablation' } : {}) })
 }
 
@@ -552,9 +553,9 @@ function dispatchDefaultV8Oracle(
   receipt: CompositeProofReceipt, dag: DagTopology, idx: IndexedTranscript, factLog: HostFactLog, termEx: HostTranscriptEntry | undefined, options: CompositeVerifyOptions,
   terminalCtrl: HostTranscriptEntry | undefined, postMutRb: HostTranscriptEntry | undefined, ctx: DefaultV8Ctx,
 ): { ok: true; family: V8OracleFamily; explicit: boolean } | { ok: false; reason: string; rejectedBy: string; missingEvidence: string[] } | null {
-  const ti = receipt.terminalImpact, normCls = receipt.terminalVulnClass.trim().toLowerCase()
-  const family = ti.oracleFamily ?? (V8_ORACLE_FAMILY_SET.has(normCls) ? normCls as V8OracleFamily : null)
-  if (!family) return null
+  const ti = receipt.terminalImpact, normCls = receipt.terminalVulnClass.trim().toLowerCase(), explicitInput = ti.oracleInput ?? options.v8OracleInput, inferredFam = !ti.oracleFamily && !V8_ORACLE_FAMILY_SET.has(normCls) && explicitInput ? inferV8OracleFamilyFromInput(explicitInput) : null
+  if (!ti.oracleFamily && !V8_ORACLE_FAMILY_SET.has(normCls) && explicitInput && !inferredFam) return { ok: false as const, reason: 'v8_oracle_failed (unmapped_oracle_input): terminalImpact.oracleInput supplied without terminalImpact.oracleFamily did not match any v8 oracle family schema — specify terminalImpact.oracleFamily explicitly or remove oracleInput.', rejectedBy: 'v8_oracle_family_missing', missingEvidence: ['terminalImpact.oracleFamily'] }
+  const family = ti.oracleFamily ?? (V8_ORACLE_FAMILY_SET.has(normCls) ? normCls as V8OracleFamily : inferredFam); if (!family) return null
   const policy = { signingKey: options.signingKey, strictHostDerivation: true }, evalOracle = resolveOracleEvaluator(options)
   const rejectFam = (reason: string, missingEvidence: string[], rejectedBy = `v8_oracle_${family}`) => ({ ok: false as const, reason, rejectedBy, missingEvidence })
   if (ti.oracleFamily && !ti.oracleInput) return rejectFam(`v8_oracle_failed (${family}): missing_v8_oracle_input — terminalImpact.oracleFamily requires terminalImpact.oracleInput.`, ['terminalImpact.oracleInput'])
@@ -565,7 +566,7 @@ function dispatchDefaultV8Oracle(
   }
   const mapFail = (reason: string) => (reason === 'terminal_impact_unproven_intermediate_stub' || reason === 'bled_access_own_tenant_only') ? rejectFam(TERMINAL_IMPACT_UNPROVEN_HINT, [TERMINAL_IMPACT_UNPROVEN_HINT], 'terminal_impact_unproven') : rejectFam(`v8_oracle_failed (${family}): ${reason}`, [reason])
   const econCtx = { preChainControlExchangeIds: ti.preChainControlExchangeIds, termHopExchangeIds: dag.hopsById.get(ti.terminalHopId)!.exchangeIds, postChainReadbackExchangeIds: ti.postChainReadbackExchangeIds, citedExchangeIds: receipt.hops.flatMap(h => h.exchangeIds), ...(options.personaRoleLabels ? { personaRoleLabels: options.personaRoleLabels } : {}) }
-  const explicitInput = ti.oracleInput ?? options.v8OracleInput, freeFormDualFallback = family === 'dual_tenant_abac' && !ti.oracleFamily && !options.v8OracleInput && Boolean(explicitInput && typeof explicitInput.mode !== 'string')
+  const freeFormDualFallback = family === 'dual_tenant_abac' && !ti.oracleFamily && !options.v8OracleInput && !inferredFam && Boolean(explicitInput && typeof explicitInput.mode !== 'string')
   if (explicitInput && !freeFormDualFallback) { const res = evalOracle.evaluate(factLog, { kind: 'v8_family', family, rawInput: explicitInput, econCtx }, policy); return res.confirmed ? { ok: true, family, explicit: true } : mapFail(res.reason) }
   if (family === 'cross_surface_pivot') {
     if (receipt.hops.length < 2) return rejectFam('v8_oracle_failed (cross_surface_pivot): invalid_hop_count — requires >= 2 hops across distinct surfaces.', ['cross_surface_pivot_requires_2_plus_hops'])
@@ -664,7 +665,8 @@ function verifyTerminalImpactGate(
     return Boolean((termEx && matchesCtrlTarget(c, termEx)) || (postMutRb && matchesCtrlTarget(c, postMutRb)))
   })
   const hasCleanDeniedCtrl = Boolean(terminalCtrl)
-  const termTenants = termEx ? extractTenantMarkers(termEx.step.json, termEx.step.body) : new Set<string>(), ownTenantOnly = Boolean(termEx && termTenants.size > 0 && attackerTenants.size > 0 && [...termTenants].every(t => attackerTenants.has(t))), hasForeignTenantData = Boolean(termEx && !isStub && hasBody && attackerTenants.size > 0 && [...termTenants].some(t => !attackerTenants.has(t)))
+  const upstreamEntries = receipt.hops.filter(h => h.hopId !== termHop.hopId).flatMap(h => h.exchangeIds).map(id => idx.entriesById.get(id)!).filter(e => Boolean(e && isExecArm(e) && is2xx(e.step.status)))
+  const { ownTenantOnly, hasForeignTenantData, crossTenantSatisfied } = analyzeCrossTenantTerminalEvidence(termEx, attackerTenants, isStub, hasBody, upstreamEntries, hasPostMutation, receipt.hops.length >= 2 && hasVerifiedTermEdge)
   const v8Default = dispatchDefaultV8Oracle(receipt, dag, idx, factLog, termEx, options, terminalCtrl, postMutRb, { termEndpoint, termFam, hasOob: hasBoundOob, hasBrowser: hasBoundBrowser, hasBody, isStub, ownTenantOnly, hasForeignTenantData, hasVerifiedTermEdge })
   if (v8Default && !v8Default.ok) return { ...v8Default, ...(terminalVerification ? { terminalVerification } : {}) }
   const okTerm = (fam?: V8OracleFamily | string) => ({ ok: true as const, ...(terminalVerification ? { terminalVerification } : {}), ...(fam ? { terminalOracleFamily: fam } : {}), ...(termEndpoint ? { terminalEndpoint: termEndpoint } : {}) })
@@ -681,6 +683,8 @@ function verifyTerminalImpactGate(
   if (!singleHopProofOk) {
     if (!hasCleanDeniedCtrl && !hasDerivedTerminalProof) return failUnproven(`Missing clean denied control (401/403/404) bound to terminal target for ${receipt.terminalVulnClass}. ${TERMINAL_IMPACT_UNPROVEN_HINT}`, ['clean_denied_control_401_403_404'])
     if ((!termEx && !hasPostMutation) || !termEndpoint || !termFam) return failUnproven(`Missing concrete terminal exchange or endpoint for ${receipt.terminalVulnClass}. ${TERMINAL_IMPACT_UNPROVEN_HINT}`, ['terminal_exchange_with_endpoint'])
+    if (!v8Default && !hasPostMutation && PRIV_ESC_CLASS_RE.test(receipt.terminalVulnClass) && isReadOnlyDirectoryOrMetadataImpact(termEx)) return failUnproven('terminal_impact_unproven: privilege_escalation/bfla cannot confirm on a read-only directory/roster/metadata GET without a state-mutating terminal action + postChainReadbackExchangeIds or a verified v8 oracle family.')
+    if (!v8Default && isCrossTenantCls && !crossTenantSatisfied) return failUnproven('terminal_impact_unproven: cross-tenant class requires positive non-reflected foreign tenant data (request URL/query tokens stripped) or persisted mutation readback.')
     if (termEx && !hasPostMutation && (!hasBody || isStub || (ownTenantOnly && crossOrReplay))) return failUnproven()
   }
   return okTerm(v8Default?.family)
@@ -695,7 +699,7 @@ export function verifyCompositeReceipt(rawReceipt: unknown, hostTranscript: Host
     const rawTerm = typeof lastT === 'string' ? normRouteFam(lastT) : ''
     return { confirmed: false, chainId: 'invalid', terminalVulnClass: 'invalid', replayMode: 'fresh_clean_replay', modeBVerified: false, hopCount: 0, verifiedEdges: [], failedStage: 'schema', reason: `Schema validation failed: ${issues}${rawTerm ? ` (terminalRoute=${rawTerm})` : ''}`.slice(0, 400) }
   }
-  const factLog = options.factLog ?? HostFactLog.fromTranscript(hostTranscript), { receipt, inferredEdges } = augmentCompositeReceiptWithAutoDag(parsed.data, factLog)
+  const factLog = options.factLog ?? HostFactLog.fromTranscript(hostTranscript), { receipt, inferredEdges, rewiredEdges } = augmentCompositeReceiptWithAutoDag(parsed.data, factLog)
   const fail = (failedStage: CompositeFailureStage, reason: string, verifiedEdges: VerifiedEdgeResult[] = [], terminalVerification?: ReceiptVerification, rejectedBy?: string, missingEvidence?: string[]): CompositeReceiptVerification => ({
     confirmed: false, chainId: receipt.chainId, terminalVulnClass: receipt.terminalVulnClass, replayMode: receipt.replayMode,
     modeBVerified: false, hopCount: receipt.hops.length, verifiedEdges, failedStage, reason,
@@ -725,7 +729,7 @@ export function verifyCompositeReceipt(rawReceipt: unknown, hostTranscript: Host
     modeBVerified: receipt.replayMode === 'one_shot_transcript', hopCount: receipt.hops.length, verifiedEdges,
     reason: `CompositeProofReceipt confirmed (${receipt.hops.length} hop(s), ${verifiedEdges.length} verified causal edge(s), mode=${receipt.replayMode}).`,
     ...termMeta, ...(termRes.terminalVerification ? { terminalVerification: termRes.terminalVerification } : {}),
-    evidence: { topoOrder: dag.topoOrder, roots: dag.roots, derivedCapabilities: provRes.derivedCapabilities, ...(inferredEdges.length ? { autoInferredEdgeCount: inferredEdges.length } : {}), ...termMeta },
+    evidence: { topoOrder: dag.topoOrder, roots: dag.roots, derivedCapabilities: provRes.derivedCapabilities, ...(inferredEdges.length ? { autoInferredEdgeCount: inferredEdges.length } : {}), ...(rewiredEdges.length ? { rewiredEdgeCount: rewiredEdges.length } : {}), ...termMeta },
   }
 }
 

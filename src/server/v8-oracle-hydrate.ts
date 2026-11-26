@@ -884,8 +884,15 @@ export function hydrateV8OracleInput(
     }
     const tenantOf = (e: HydratableEntry | undefined): string | null =>
       (e?.step.actor.tenant ?? parseRoleLabel(e?.actorRoleLabel ?? e?.actorPersona ?? '').tenant ?? '').trim().toLowerCase() || null
-    // R3-C-5: derive tenant markers strictly from response-side non-error fields — NEVER requestJson/body.
-    const markersOf = (e: HydratableEntry | undefined): Set<string> => e ? extractTenantMarkers(e.step.json, e.step.body, true) : new Set<string>()
+    // R3-C-5 + Move-1: derive tenant markers strictly from response-side non-error fields, stripping attacker-supplied URL path/query tokens.
+    const stripUrlToks = (e: HydratableEntry | undefined, ms: Set<string>): Set<string> => {
+      if (!e || ms.size === 0) return ms
+      const [p = '', q = ''] = (e.step.pathAndQuery ?? e.step.route ?? '').split('?', 2), u = new Set<string>()
+      for (const s of p.split('/')) if (s) { u.add(s.toLowerCase()); try { u.add(decodeURIComponent(s).toLowerCase()) } catch {} }
+      if (q) for (const v of new URLSearchParams(q.split('#', 1)[0]!).values()) if (v.trim()) u.add(v.trim().toLowerCase())
+      return new Set([...ms].filter(t => !u.has(t)))
+    }
+    const markersOf = (e: HydratableEntry | undefined): Set<string> => e ? stripUrlToks(e, extractTenantMarkers(e.step.json, e.step.body, true)) : new Set<string>()
     const hostKnownTenants = new Set<string>()
     for (const e of idx.entriesById.values()) { const t = tenantOf(e); if (t) hostKnownTenants.add(t); if (e.actorRoleLabel) for (const m of parseRoleMemberships(e.actorRoleLabel)) if (m.tenant) hostKnownTenants.add(m.tenant.trim().toLowerCase()) }
     if (mode === 'cross_org_transfer') {

@@ -395,6 +395,8 @@ export interface VerifyScriptOptions {
   signal?: AbortSignal
   canary?: VerifyCanaryBroker
   timeoutMs?: number
+  /** Skip Attempt 2 when Attempt 1 already failed with `execution` or `checkpoint` (enabled on live `kovo_verify`). */
+  fastFailOnAttempt1?: boolean
 }
 
 interface CheckpointTranscriptSummary {
@@ -402,16 +404,42 @@ interface CheckpointTranscriptSummary {
   sealedHandles: string[]
   cryptoOpCount: number
   asyncPollCount: number
+  httpShapes: string[]
+}
+
+function summarizeNonSecretHttpShape(transcript: TranscriptStore, record: ReturnType<TranscriptStore['list']>[number]): string | null {
+  if (!record.request || (record.op !== 'http' && record.op !== 'http2' && record.op !== 'race')) return null
+  const method = record.request.method.toUpperCase()
+  const pathOnly = (record.request.pathAndQuery ?? '/').split(/[?#]/, 1)[0] || '/'
+  const status = record.response?.status ?? 'err'
+  let keySuffix = ''
+  const rawBody = typeof transcript.body === 'function' ? transcript.body(record.exchangeId) : undefined
+  if (typeof rawBody === 'string' && rawBody.trim().startsWith('{')) {
+    try {
+      const parsed = JSON.parse(rawBody) as unknown
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        const keys = Object.keys(parsed as Record<string, unknown>)
+          .map(k => k.replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 32))
+          .filter(Boolean)
+          .slice(0, 8)
+        if (keys.length > 0) keySuffix = ` keys=[${keys.join(',')}]`
+      }
+    } catch { /* ignore non-JSON */ }
+  }
+  return `${method} ${pathOnly.slice(0, 80)} -> ${status}${keySuffix}`
 }
 
 function inspectCheckpointTranscript(transcript: TranscriptStore): CheckpointTranscriptSummary {
   const sealedHandles = new Set<string>()
+  const httpShapes: string[] = []
   let hasCheckpointOps = false
   let cryptoOpCount = 0
   let asyncPollCount = 0
 
   for (const record of transcript.list()) {
     if (record.error) continue
+    const shape = summarizeNonSecretHttpShape(transcript, record)
+    if (shape && httpShapes.length < 6) httpShapes.push(shape)
     const artifact = record.artifact
     const ext = record as unknown as Record<string, unknown>
 
@@ -471,20 +499,23 @@ function inspectCheckpointTranscript(transcript: TranscriptStore): CheckpointTra
     sealedHandles: [...sealedHandles],
     cryptoOpCount,
     asyncPollCount,
+    httpShapes,
   }
 }
 
 function formatCheckpointNextStepHint(summary: CheckpointTranscriptSummary): string {
+  const modeAGuidance = 'Mode-A requires Hop 1->N in ONE ctx.chain(...).prove() script (sealed handles do not survive across fresh Mode-A invocations; call ctx.prove_composite(...) in the same script to confirm).'
+  const shapeSuffix = summary.httpShapes.length > 0 ? ` Observed HTTP: ${summary.httpShapes.join('; ')}.` : ''
   if (summary.sealedHandles.length > 0) {
     const preview = summary.sealedHandles.slice(0, 8).join(', ')
     const extra = summary.sealedHandles.length > 8 ? ` (+${summary.sealedHandles.length - 8} more)` : ''
-    return `Checkpoint saved (sealed: ${preview}${extra}). Continue chaining and call ctx.prove_composite(...) to confirm.`
+    return `Checkpoint saved (sealed: ${preview}${extra}). ${modeAGuidance}${shapeSuffix}`
   }
   const parts: string[] = []
   if (summary.cryptoOpCount > 0) parts.push(`${summary.cryptoOpCount} crypto op${summary.cryptoOpCount === 1 ? '' : 's'}`)
   if (summary.asyncPollCount > 0) parts.push(`${summary.asyncPollCount} async poll${summary.asyncPollCount === 1 ? '' : 's'}`)
   const label = parts.length > 0 ? parts.join(', ') : 'host checkpoint operations'
-  return `Checkpoint saved (${label}). Continue chaining and call ctx.prove_composite(...) to confirm.`
+  return `Checkpoint saved (${label}). ${modeAGuidance}${shapeSuffix}`
 }
 
 function describeFingerprint(fingerprint: CausalFingerprint): string {
@@ -682,9 +713,13 @@ export async function verifyScript(options: VerifyScriptOptions): Promise<Verify
   const aliasHits = detectKovoVerifyScriptAliases(options.candidate.code)
   const nonces: [string, string] = [randomBytes(16).toString('hex'), randomBytes(16).toString('hex')]
   const first = await runAttemptSafe(options, 1, nonces[0])
-  const second = await runAttemptSafe(options, 2, nonces[1])
-  const attempts = [first.report, second.report]
-  const detailBase = `first=${first.report.oraclePassed ? 'pass' : 'fail'} second=${second.report.oraclePassed ? 'pass' : 'fail'}`
+  const fastFailFirst = options.fastFailOnAttempt1 === true
+    && (first.report.rejectedBy === 'execution' || first.report.rejectedBy === 'checkpoint')
+  const second = fastFailFirst ? null : await runAttemptSafe(options, 2, nonces[1])
+  const attempts = second ? [first.report, second.report] : [first.report]
+  const detailBase = second
+    ? `first=${first.report.oraclePassed ? 'pass' : 'fail'} second=${second.report.oraclePassed ? 'pass' : 'fail'}`
+    : `first=${first.report.oraclePassed ? 'pass' : 'fail'} second=skipped`
   // The repair contract: name the rejecting validator, the exact missing evidence, and the
   // role-labelled transcript, so the agent can repair in one turn instead of guessing.
   const feedback = (includeScriptDiagnostics = false) => {
@@ -719,13 +754,13 @@ export async function verifyScript(options: VerifyScriptOptions): Promise<Verify
     ...feedback(includeScriptDiagnostics),
   })
 
-  if (first.report.nonce === second.report.nonce) {
+  if (second && first.report.nonce === second.report.nonce) {
     return withFeedback({ confirmed: false, reason: 'nonce_reuse', detail: 'Both attempts used the same nonce; sessions were not fresh.', attempts, disagreements: [], claimTitle: first.report.title })
   }
   if (attempts.some(a => a.nonceMismatch)) {
     return withFeedback({ confirmed: false, reason: 'nonce_mismatch', detail: 'A proof document did not match its fresh attempt nonce.', attempts, disagreements: [], claimTitle: first.report.title })
   }
-  const checkpointSummaries = [first.checkpointOps, second.checkpointOps]
+  const checkpointSummaries = [first.checkpointOps, second?.checkpointOps]
     .filter((summary): summary is CheckpointTranscriptSummary => Boolean(summary?.hasCheckpointOps))
   if (
     checkpointSummaries.length > 0
@@ -736,6 +771,7 @@ export async function verifyScript(options: VerifyScriptOptions): Promise<Verify
       sealedHandles: [...new Set(checkpointSummaries.flatMap(s => s.sealedHandles))],
       cryptoOpCount: checkpointSummaries.reduce((acc, s) => acc + s.cryptoOpCount, 0),
       asyncPollCount: checkpointSummaries.reduce((acc, s) => acc + s.asyncPollCount, 0),
+      httpShapes: [...new Set(checkpointSummaries.flatMap(s => s.httpShapes))].slice(0, 6),
     }
     const checkpointHint = formatCheckpointNextStepHint(merged)
     return {
@@ -745,7 +781,7 @@ export async function verifyScript(options: VerifyScriptOptions): Promise<Verify
         detail: checkpointHint,
         attempts,
         disagreements: [],
-        claimTitle: first.report.title ?? second.report.title,
+        claimTitle: first.report.title ?? second?.report.title ?? null,
         usageHint: checkpointHint,
       }, false),
       rejectedBy: 'checkpoint',
@@ -796,6 +832,16 @@ export async function verifyScript(options: VerifyScriptOptions): Promise<Verify
       disagreements: [],
       claimTitle: first.report.title,
     })
+  }
+  if (!second) {
+    return withFeedback({
+      confirmed: false,
+      reason: 'execution_failed',
+      detail: `Verification run failed on attempt 1 (${detailBase}).`,
+      attempts,
+      disagreements: [],
+      claimTitle: first.report.title,
+    }, true)
   }
   const disagreements: string[] = []
   if (first.fingerprints.length !== second.fingerprints.length) {
