@@ -1,0 +1,356 @@
+{
+  "version": 1,
+  "backends": {
+    "docker": {
+      "backendKind": "docker",
+      "doodMode": "none",
+      "supportsVerifyScript": true,
+      "registeredTools": [
+        "analyze_artifact",
+        "board_post",
+        "board_read",
+        "browser_session",
+        "browser_visit",
+        "check_canary",
+        "complete_intent",
+        "crawl_state_graph",
+        "derive_evidence",
+        "expand_digest",
+        "get_exchange",
+        "inspect_dns",
+        "inspect_tls",
+        "kovo_verify",
+        "list_second_order_canaries",
+        "load_skill",
+        "mint_canary",
+        "mint_second_order_canary",
+        "probe_differential",
+        "probe_surface",
+        "probe_websocket",
+        "propose_chain_finding",
+        "query_cves",
+        "read_peer_trace",
+        "record_coverage",
+        "record_fact",
+        "request_http",
+        "request_http_batch",
+        "request_http_race",
+        "run_offline_script",
+        "run_safe_templates",
+        "run_sast_scan",
+        "search_exchanges",
+        "search_facts",
+        "suggest_candidate_host",
+        "update_proposed_finding"
+      ],
+      "reachableRecipes": {
+        "core": [
+          "access_boundary",
+          "boolean_or_timing",
+          "disclosure",
+          "oob_callback",
+          "persisted_mutation",
+          "race_burst"
+        ],
+        "cut3": [
+          "browser_sink",
+          "conserved_balance",
+          "injection_fingerprint",
+          "redirect"
+        ],
+        "persisted": [
+          "access_boundary",
+          "boolean_or_timing",
+          "browser_sink",
+          "conserved_balance",
+          "disclosure",
+          "injection_fingerprint",
+          "oob_callback",
+          "persisted_mutation",
+          "race_burst",
+          "redirect"
+        ],
+        "wiredSpecKinds": [
+          "browser_chain:browser_sink:[dom_xss,xss,xss_reflected,xss_stored]",
+          "http_chain:access_boundary:[authorization,bfla,bola,cross_tenant_read,cross_tenant_write,idor]",
+          "race_burst:conserved_balance:[race_double_spend]",
+          "sql_boolean_diff:boolean_or_timing:[sqli]",
+          "sql_time_diff:boolean_or_timing:[sqli]"
+        ]
+      },
+      "oracleFamilies": {
+        "singleHopRules": [
+          "auth_bypass",
+          "boolean",
+          "browser",
+          "conserved_balance",
+          "impact",
+          "oob",
+          "redirect",
+          "status_differential",
+          "timing",
+          "webhook"
+        ],
+        "v8Families": [
+          "cross_surface_pivot",
+          "cryptographic_scope_replay",
+          "dual_tenant_abac",
+          "economic_conservation",
+          "parser_cache_differential",
+          "temporal_revocation"
+        ]
+      },
+      "approvalBinders": {
+        "grantBinders": [
+          "approvalLeases",
+          "approvalPolicy",
+          "audit",
+          "canRead",
+          "getMaxRpsPerOrigin",
+          "isStateChangeApproved",
+          "mintCanary",
+          "sandboxWriteAllowlist",
+          "scopePolicy"
+        ],
+        "brokerReauthWired": true,
+        "tier3CoordinatorWired": true,
+        "stateChangeLedgerWired": true,
+        "burstApprovalInstancesWired": true
+      }
+    },
+    "dood": {
+      "backendKind": "dood",
+      "doodMode": "host_bind",
+      "supportsVerifyScript": true,
+      "registeredTools": [
+        "analyze_artifact",
+        "board_post",
+        "board_read",
+        "browser_session",
+        "browser_visit",
+        "check_canary",
+        "complete_intent",
+        "crawl_state_graph",
+        "derive_evidence",
+        "expand_digest",
+        "get_exchange",
+        "inspect_dns",
+        "inspect_tls",
+        "kovo_verify",
+        "list_second_order_canaries",
+        "load_skill",
+        "mint_canary",
+        "mint_second_order_canary",
+        "probe_differential",
+        "probe_surface",
+        "probe_websocket",
+        "propose_chain_finding",
+        "query_cves",
+        "read_peer_trace",
+        "record_coverage",
+        "record_fact",
+        "request_http",
+        "request_http_batch",
+        "request_http_race",
+        "run_offline_script",
+        "run_safe_templates",
+        "run_sast_scan",
+        "search_exchanges",
+        "search_facts",
+        "suggest_candidate_host",
+        "update_proposed_finding"
+      ],
+      "reachableRecipes": {
+        "core": [
+          "access_boundary",
+          "boolean_or_timing",
+          "disclosure",
+          "oob_callback",
+          "persisted_mutation",
+          "race_burst"
+        ],
+        "cut3": [
+          "browser_sink",
+          "conserved_balance",
+          "injection_fingerprint",
+          "redirect"
+        ],
+        "persisted": [
+          "access_boundary",
+          "boolean_or_timing",
+          "browser_sink",
+          "conserved_balance",
+          "disclosure",
+          "injection_fingerprint",
+          "oob_callback",
+          "persisted_mutation",
+          "race_burst",
+          "redirect"
+        ],
+        "wiredSpecKinds": [
+          "browser_chain:browser_sink:[dom_xss,xss,xss_reflected,xss_stored]",
+          "http_chain:access_boundary:[authorization,bfla,bola,cross_tenant_read,cross_tenant_write,idor]",
+          "race_burst:conserved_balance:[race_double_spend]",
+          "sql_boolean_diff:boolean_or_timing:[sqli]",
+          "sql_time_diff:boolean_or_timing:[sqli]"
+        ]
+      },
+      "oracleFamilies": {
+        "singleHopRules": [
+          "auth_bypass",
+          "boolean",
+          "browser",
+          "conserved_balance",
+          "impact",
+          "oob",
+          "redirect",
+          "status_differential",
+          "timing",
+          "webhook"
+        ],
+        "v8Families": [
+          "cross_surface_pivot",
+          "cryptographic_scope_replay",
+          "dual_tenant_abac",
+          "economic_conservation",
+          "parser_cache_differential",
+          "temporal_revocation"
+        ]
+      },
+      "approvalBinders": {
+        "grantBinders": [
+          "approvalLeases",
+          "approvalPolicy",
+          "audit",
+          "canRead",
+          "getMaxRpsPerOrigin",
+          "isStateChangeApproved",
+          "mintCanary",
+          "sandboxWriteAllowlist",
+          "scopePolicy"
+        ],
+        "brokerReauthWired": true,
+        "tier3CoordinatorWired": true,
+        "stateChangeLedgerWired": true,
+        "burstApprovalInstancesWired": true
+      }
+    },
+    "local-jq": {
+      "backendKind": "local-jq",
+      "doodMode": "none",
+      "supportsVerifyScript": false,
+      "registeredTools": [
+        "analyze_artifact",
+        "board_post",
+        "board_read",
+        "browser_session",
+        "browser_visit",
+        "check_canary",
+        "complete_intent",
+        "crawl_state_graph",
+        "derive_evidence",
+        "expand_digest",
+        "get_exchange",
+        "inspect_dns",
+        "inspect_tls",
+        "list_second_order_canaries",
+        "load_skill",
+        "mint_canary",
+        "mint_second_order_canary",
+        "probe_differential",
+        "probe_surface",
+        "probe_websocket",
+        "propose_chain_finding",
+        "query_cves",
+        "read_peer_trace",
+        "record_coverage",
+        "record_fact",
+        "request_http",
+        "request_http_batch",
+        "request_http_race",
+        "run_offline_script",
+        "run_safe_templates",
+        "run_sast_scan",
+        "search_exchanges",
+        "search_facts",
+        "suggest_candidate_host",
+        "update_proposed_finding",
+        "verify_replay_spec"
+      ],
+      "reachableRecipes": {
+        "core": [
+          "access_boundary",
+          "boolean_or_timing",
+          "disclosure",
+          "oob_callback",
+          "persisted_mutation",
+          "race_burst"
+        ],
+        "cut3": [
+          "browser_sink",
+          "conserved_balance",
+          "injection_fingerprint",
+          "redirect"
+        ],
+        "persisted": [
+          "access_boundary",
+          "boolean_or_timing",
+          "browser_sink",
+          "conserved_balance",
+          "disclosure",
+          "injection_fingerprint",
+          "oob_callback",
+          "persisted_mutation",
+          "race_burst",
+          "redirect"
+        ],
+        "wiredSpecKinds": [
+          "browser_chain:browser_sink:[dom_xss,xss,xss_reflected,xss_stored]",
+          "http_chain:access_boundary:[authorization,bfla,bola,cross_tenant_read,cross_tenant_write,idor]",
+          "race_burst:conserved_balance:[race_double_spend]",
+          "sql_boolean_diff:boolean_or_timing:[sqli]",
+          "sql_time_diff:boolean_or_timing:[sqli]"
+        ]
+      },
+      "oracleFamilies": {
+        "singleHopRules": [
+          "auth_bypass",
+          "boolean",
+          "browser",
+          "conserved_balance",
+          "impact",
+          "oob",
+          "redirect",
+          "status_differential",
+          "timing",
+          "webhook"
+        ],
+        "v8Families": [
+          "cross_surface_pivot",
+          "cryptographic_scope_replay",
+          "dual_tenant_abac",
+          "economic_conservation",
+          "parser_cache_differential",
+          "temporal_revocation"
+        ]
+      },
+      "approvalBinders": {
+        "grantBinders": [
+          "approvalLeases",
+          "approvalPolicy",
+          "audit",
+          "canRead",
+          "getMaxRpsPerOrigin",
+          "isStateChangeApproved",
+          "mintCanary",
+          "sandboxWriteAllowlist",
+          "scopePolicy"
+        ],
+        "brokerReauthWired": true,
+        "tier3CoordinatorWired": true,
+        "stateChangeLedgerWired": true,
+        "burstApprovalInstancesWired": true
+      }
+    }
+  }
+}
