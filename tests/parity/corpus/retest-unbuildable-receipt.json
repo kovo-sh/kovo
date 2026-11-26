@@ -1,0 +1,88 @@
+{
+  "id": "retest-unbuildable-receipt",
+  "side": "retest",
+  "archetype": "retest-unbuildable-receipt",
+  "description": "Retest where no host ProofReceipt can be built (mutating boundary claim without before/after readback on agent-script, unclassifiable CWE-0/other spec on declarative, empty/unbuildable receipt on floor). All three retest engines MUST return inconclusive with failureReason=receipt_unbuildable, NEVER fixed.",
+  "canonicalLabel": {
+    "cwe": "CWE-0",
+    "category": "other",
+    "title": "Unclassifiable alert acknowledgement boundary",
+    "impact": "Observed POST status response without persisted readback.",
+    "claimedImpact": "other",
+    "claimedBoundary": "access",
+    "vulnClass": "other"
+  },
+  "freeTextLabel": {
+    "title": "Unbuildable receipt retest"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": false,
+    "evaluateClaims": false,
+    "composite": false,
+    "floorInjectionRecipe": false,
+    "retest": true
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "retest": {
+    "scenario": "unbuildable_receipt",
+    "expectedVerdict": "inconclusive",
+    "expectedFailureReason": "receipt_unbuildable"
+  },
+  "personas": [
+    {
+      "handle": "owner_a",
+      "roleLabel": "owner (tenant-a)",
+      "role": "owner",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-owner-a-token"
+    },
+    {
+      "handle": "member_b",
+      "roleLabel": "member (tenant-b)",
+      "role": "member",
+      "tenant": "tenant-b",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-member-b-token"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "ctl",
+      "arm": "control",
+      "role": "control",
+      "method": "POST",
+      "pathAndQuery": "/api/inbox/alert-1/read",
+      "persona": "owner_a",
+      "requestJson": { "read": true },
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"id\":\"alert-1\",\"read\":true}"
+    },
+    {
+      "id": "prb",
+      "arm": "probe",
+      "role": "probe",
+      "method": "POST",
+      "pathAndQuery": "/api/inbox/alert-1/read",
+      "persona": "member_b",
+      "requestJson": { "read": true },
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"id\":\"alert-1\",\"read\":true}"
+    }
+  ],
+  "replaySpec": {
+    "assertionsJq": "{ controlPassed: (.steps.ctl.status == 200), confirmed: false, observed: \"no receipt\", expected: \"403\" }"
+  },
+  "claims": [
+    { "kind": "boundary", "boundaryClass": "access", "controlExchangeId": "ctl", "probeExchangeId": "prb", "resourceTenant": "tenant-a" }
+  ]
+}

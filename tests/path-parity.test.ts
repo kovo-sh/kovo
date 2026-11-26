@@ -15,7 +15,7 @@ import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { once } from 'node:events'
 import { readdirSync, readFileSync } from 'node:fs'
-import { createServer } from 'node:http'
+import { createServer, request as httpRequest } from 'node:http'
 import { dirname, join, resolve } from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
@@ -24,15 +24,20 @@ import { RequestBroker, type BrokerExchangeResult, type Grant } from '../src/ser
 import { signHostRecord, verifyCompositeReceipt, type CompositeProofReceipt, type HostSignedTranscript, type HostTranscriptEntry } from '../src/server/composite-receipt.ts'
 import {
   RECEIPT_EXEMPT_HOST_SPEC_KINDS,
+  classifyRetestHealth,
   isReceiptExemptHostSpec,
   receiptCheckForResult,
+  retestPersistedRecipe,
 } from '../src/server/floor-recipe-engine.ts'
-import { cut3FloorRecipe, runCut3Recipe } from '../src/server/floor-recipes.ts'
+import { cut3FloorRecipe, runCut3Recipe, type FloorRecipeExecution } from '../src/server/floor-recipes.ts'
 import { HostFactLog } from '../src/server/host-fact-log.ts'
 import { classifyBoundaryClaim, classifyImpactDescriptor, type BoundaryClass, type ImpactClass, type ImpactStep, type InjectionFamily, type RoleName } from '../src/server/oracle-invariants.ts'
 import { isPureJobOrHandleStubChain, proofReceiptMode } from '../src/server/proof-receipt.ts'
-import { verifyReplaySpec } from '../src/server/replay-verifier.ts'
+import { retestPersistedAgentScript, retestReplaySpec, verifyReplaySpec } from '../src/server/replay-verifier.ts'
+import { assessDeclarativeRetestHealth, assessRetestHealth, type RetestFailureReason, type RetestHealthAssessment } from '../src/server/retest-health.ts'
 import { TranscriptStore, evaluateClaims, type VerifyClaim } from '../src/server/verify-claims.ts'
+import { VERIFY_NONCE_HEADER, VERIFY_RPC_CONTEXT_NAME, VERIFY_RPC_HEADER, VERIFY_RPC_SOCKET_NAME, VERIFY_RPC_TOKEN_NAME } from '../src/server/verify-rpc.ts'
+import type { VerifyScriptRequest, VerifyScriptResult, WorkerBackend, WorkerSession, WorkerSessionOptions } from '../src/server/worker-backend.ts'
 import { LocalJqBackend } from '../scripts/benchmark-backend.ts'
 import { makeLabGrant } from './v4-tier-helpers.ts'
 
@@ -81,7 +86,7 @@ interface ParityLabel {
 
 interface ParityCase {
   id: string
-  side: 'tp' | 'fp'
+  side: 'tp' | 'fp' | 'retest'
   archetype: string
   description: string
   canonicalLabel: ParityLabel
@@ -92,8 +97,15 @@ interface ParityCase {
     evaluateClaims: boolean
     composite: boolean
     floorInjectionRecipe: boolean
+    retest?: boolean
   }
   expected: { confirmed: boolean }
+  retest?: {
+    scenario: 'drifted_session' | 'unbuildable_receipt' | 'composite_stage_rejected' | 'clean_fix'
+    expectedVerdict: 'fixed' | 'inconclusive' | 'reproduced'
+    expectedFailureReason: RetestFailureReason
+    failedStage?: string
+  }
   personas: ParityPersona[]
   exchanges: ParityExchange[]
   replaySpec?: {
@@ -866,4 +878,319 @@ test('static hygiene guards: LOC caps, single impactGate veto, unconditional pro
 
   assert.doesNotMatch(verifyClaims, /\bmatchInjectionFingerprint\s*\(/, 'verify-claims.ts must route all fingerprint matches through matchStrippedInjectionFingerprint')
   assert.doesNotMatch(floorRecipes, /\bmatchInjectionFingerprint\s*\(/, 'floor-recipes.ts must route all fingerprint matches through matchStrippedInjectionFingerprint')
+})
+
+// ============================================================================
+// 7. R2-04: Three-Engine Retest Parity Corpus (floor, declarative, agent-script)
+// ============================================================================
+
+async function parityRpcCall(
+  socketPath: string,
+  token: string,
+  nonce: string,
+  op: string,
+  args: Record<string, unknown>,
+): Promise<{ ok: boolean; result?: Record<string, unknown>; error?: string }> {
+  const body = JSON.stringify({ op, args })
+  return await new Promise((resolvePromise, rejectPromise) => {
+    const req = httpRequest(
+      {
+        socketPath,
+        path: '/rpc',
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'content-length': Buffer.byteLength(body),
+          [VERIFY_RPC_HEADER]: token,
+          [VERIFY_NONCE_HEADER]: nonce,
+        },
+      },
+      res => {
+        let data = ''
+        res.setEncoding('utf8')
+        res.on('data', chunk => { data += chunk })
+        res.on('end', () => {
+          try { resolvePromise(JSON.parse(data) as { ok: boolean; result?: Record<string, unknown>; error?: string }) }
+          catch (err) { rejectPromise(err) }
+        })
+      },
+    )
+    req.on('error', rejectPromise)
+    req.end(body)
+  })
+}
+
+function makeRetestScriptBackend(
+  c: ParityCase,
+  origin: string,
+): WorkerBackend {
+  return {
+    async run() { throw new Error('run() unsupported in parity fake backend') },
+    async verifyStaticAst() { throw new Error('verifyStaticAst() unsupported in parity fake backend') },
+    async openSession(_id: string, _signal: AbortSignal, opts?: WorkerSessionOptions): Promise<WorkerSession> {
+      const rpcDir = opts?.rpcMountDir ?? ''
+      return {
+        async stage() { throw new Error('unused') },
+        async exec() { throw new Error('unused') },
+        async analyze() { throw new Error('unused') },
+        async sast() { throw new Error('unused') },
+        async runScript() { throw new Error('unused') },
+        async verifyStaticAst() { throw new Error('unused') },
+        async verifyScript(req: VerifyScriptRequest): Promise<VerifyScriptResult> {
+          const socketPath = join(rpcDir, VERIFY_RPC_SOCKET_NAME)
+          const token = readFileSync(join(rpcDir, VERIFY_RPC_TOKEN_NAME), 'utf8').trim()
+          const context = JSON.parse(readFileSync(join(rpcDir, VERIFY_RPC_CONTEXT_NAME), 'utf8')) as { nonce: string }
+          const rpc = (op: string, args: Record<string, unknown>) => parityRpcCall(socketPath, token, context.nonce, op, args)
+
+          const exIdByStep = new Map<string, string>()
+          for (const ex of c.exchanges) {
+            const resp = await rpc('http', {
+              origin,
+              method: ex.method,
+              path: ex.pathAndQuery,
+              ...(ex.persona ? { persona: ex.persona } : {}),
+              sessionGroupRole: ex.arm,
+              ...(ex.requestJson !== undefined ? { headers: { 'content-type': 'application/json' }, body: JSON.stringify(ex.requestJson) } : {}),
+            })
+            assert.equal(resp.ok, true, `RPC failed for ${c.id}/${ex.id}: ${resp.error ?? 'unknown'}`)
+            exIdByStep.set(ex.id, String(resp.result!.exchangeId))
+          }
+
+          if (c.retest?.scenario === 'composite_stage_rejected' && c.composite) {
+            const hop1Id = exIdByStep.get('hop1_ex')!
+            const hop2CtlId = exIdByStep.get('hop2_ctl')!
+            const hop2PrbId = exIdByStep.get('hop2_prb')!
+            const sealed = await rpc('capability.seal', {
+              exchangeId: hop1Id,
+              hopReceiptId: 'hop_1',
+              slot: 'downloadToken',
+              jsonPath: 'downloadToken',
+              kind: 'token',
+              allowedOrigins: [origin],
+            })
+            const capHandle = String(sealed.result!.handle)
+            // Deliberately fail edge_binding: hop_2 declares consumedCapabilities=[capHandle] while hop2_prb never used it.
+            const compositeReceipt = {
+              chainId: c.composite.chainId,
+              terminalVulnClass: c.composite.terminalVulnClass,
+              replayMode: 'fresh_clean_replay',
+              hops: [
+                { hopId: 'hop_1', surface: 'http', target: { origin, method: 'POST', pathAndQuery: '/v1/exports/request' }, exchangeIds: [hop1Id], producedCapabilities: [capHandle], claimedDelta: 'Minted token.' },
+                { hopId: 'hop_2', surface: 'http', target: { origin, method: 'GET', pathAndQuery: '/v1/exports/download?token=unrelated_tok' }, exchangeIds: [hop2CtlId, hop2PrbId], consumedCapabilities: [capHandle], claimedDelta: c.composite.claimedDelta },
+              ],
+              causalEdges: [
+                { kind: 'value_binding', fromHopId: 'hop_1', toHopId: 'hop_2', capabilityHandle: capHandle, sourceExchangeId: hop1Id, targetExchangeId: hop2PrbId },
+              ],
+              terminalImpact: {
+                terminalHopId: 'hop_2',
+                terminalExchangeId: hop2PrbId,
+                summary: c.composite.claimedDelta,
+                preChainControlExchangeIds: [hop2CtlId],
+              },
+            }
+            const verified = await rpc('composite.verify', { receipt: compositeReceipt })
+            const verObj = verified.result as { confirmed?: boolean; verificationId?: string }
+            return {
+              runtime: req.runtime,
+              exitCode: 0,
+              result: {
+                sdk: 'kovo_verify.ts',
+                nonce: context.nonce,
+                title: c.canonicalLabel.title ?? c.id,
+                claims: verObj.verificationId ? [{ kind: 'composite_receipt', verificationId: verObj.verificationId, chainId: c.composite.chainId, terminalVulnClass: c.composite.terminalVulnClass, exchangeIds: [hop1Id, hop2CtlId, hop2PrbId] }] : [],
+              },
+              stdout: '',
+              stderr: '',
+              durationMs: 10,
+              timedOut: false,
+            }
+          }
+
+          const mappedClaims = remapClaimIds(c.claims ?? [], exIdByStep)
+          return {
+            runtime: req.runtime,
+            exitCode: 0,
+            result: {
+              nonce: context.nonce,
+              title: c.canonicalLabel.title ?? c.id,
+              severity: 'high',
+              description: c.description,
+              claims: mappedClaims,
+            },
+            stdout: '',
+            stderr: '',
+            durationMs: 10,
+            timedOut: false,
+          }
+        },
+        async close() {},
+      }
+    },
+  }
+}
+
+test('R2-04 retest parity [floor + declarative + agent-script]: drifted session, unbuildable receipt, and composite stage rejection ALWAYS return inconclusive; genuine clean fix returns fixed', async (t) => {
+  const retestCases = loadCorpus().filter(c => c.paths.retest && c.retest)
+  assert.ok(retestCases.length >= 4, `expected >= 4 retest corpus cases, found ${retestCases.length}`)
+  const scenarios = new Set(retestCases.map(c => c.retest!.scenario))
+  assert.ok(scenarios.has('drifted_session'), 'missing drifted_session retest corpus case')
+  assert.ok(scenarios.has('unbuildable_receipt'), 'missing unbuildable_receipt retest corpus case')
+  assert.ok(scenarios.has('composite_stage_rejected'), 'missing composite_stage_rejected retest corpus case')
+  assert.ok(scenarios.has('clean_fix'), 'missing clean_fix retest corpus case')
+
+  let activeCase: ParityCase | null = null
+  let stepCursor = 0
+  const server = createServer((req, res) => {
+    req.resume()
+    if (!activeCase) {
+      res.statusCode = 500
+      res.end('{}')
+      return
+    }
+    const ex = activeCase.exchanges[stepCursor % activeCase.exchanges.length]!
+    stepCursor += 1
+    res.statusCode = ex.status
+    for (const [k, v] of Object.entries(ex.responseHeaders)) res.setHeader(k, v)
+    res.end(ex.body)
+  })
+  server.listen(0, '127.0.0.1')
+  await once(server, 'listening')
+  const port = (server.address() as { port: number }).port
+  const origin = `http://127.0.0.1:${port}`
+  t.after(async () => {
+    server.closeAllConnections()
+    await new Promise<void>(resolveClose => server.close(() => resolveClose()))
+  })
+
+  const jqBackend = new LocalJqBackend()
+  const broker = new RequestBroker({ rejectUnauthorized: false })
+
+  for (const c of retestCases) {
+    const rt = c.retest!
+    const grant = buildGrant(origin, c.personas)
+
+    // --- Engine 1: Floor recipe engine (retestPersistedRecipe / classifyRetestHealth) ---
+    if (rt.scenario === 'drifted_session' || rt.scenario === 'clean_fix') {
+      activeCase = c
+      stepCursor = 0
+      const floorRes = await retestPersistedRecipe({
+        envelope: {
+          recipeId: 'access_boundary',
+          args: {
+            origin,
+            method: 'GET',
+            pathAndQuery: '/api/invoices/inv_victim_9',
+            vulnClass: 'bola',
+            owner: { handle: 'owner_a', role: 'owner', tenant: 'tenant-a' },
+            denied: { handle: 'viewer_b', role: 'viewer', tenant: 'tenant-b' },
+            probe: { handle: 'member_b', role: 'member', tenant: 'tenant-b' },
+          },
+        },
+        specKind: 'http_chain',
+        vulnClass: 'bola',
+        endpoint: '/api/invoices/inv_victim_9',
+        origin,
+        broker,
+        grant,
+        signal: AbortSignal.timeout(10_000),
+      })
+      assert.equal(floorRes.verdict, rt.expectedVerdict, `floor verdict mismatch on ${c.id}: ${floorRes.replay.outcome.reason ?? ''}`)
+      const floorHealth = floorRes.replay.evidencePayload.retestHealth as RetestHealthAssessment
+      assert.equal(floorHealth.failureReason, rt.expectedFailureReason, `floor failureReason mismatch on ${c.id}`)
+      assert.equal(floorHealth.healthy, rt.expectedVerdict === 'fixed')
+    } else if (rt.scenario === 'unbuildable_receipt') {
+      const unbuildableExec = {
+        result: {
+          recipeId: 'persisted_mutation',
+          confirmed: false,
+          steps: c.exchanges.map((ex, i) => ({
+            exchangeId: `floor-ex-${i}`,
+            role: ex.role,
+            arm: ex.arm,
+            method: ex.method,
+            pathAndQuery: ex.pathAndQuery,
+            status: ex.status,
+            durationMs: 5,
+          })),
+          exchangeIds: ['floor-ex-0', 'floor-ex-1'],
+          oobEventIds: [],
+          transcript: { entries: [] },
+          verification: { confirmed: false, vulnClass: 'other', rule: 'none', reason: 'ProofReceipt could not be built.', observed: '', expected: '' },
+        },
+        receipt: { vulnClass: 'other', target: { origin, method: 'POST', pathAndQuery: '/api/inbox/alert-1/read' }, exchangeIds: [], oobEventIds: [], browserTraceIds: [], claimedDelta: '' },
+        failure: { code: 'recipe_error', message: 'ProofReceipt could not be built from mutating boundary without readback.', missingRoles: ['verified_proof_receipt'] },
+      } as unknown as FloorRecipeExecution
+      const floorHealth = classifyRetestHealth(unbuildableExec)
+      assert.equal(floorHealth.healthy, false, `floor must mark ${c.id} unhealthy`)
+      assert.equal(floorHealth.failureReason, 'receipt_unbuildable')
+    } else if (rt.scenario === 'composite_stage_rejected') {
+      const compHealth = assessRetestHealth(
+        { controlArms: [{ role: 'hop2_ctl', status: 403, authenticated: true, allowDenied: true }] },
+        { arms: [{ role: 'hop2_prb', status: 403, authenticated: true }] },
+        { compositeRejectedStage: rt.failedStage ?? 'edge_binding', failureDetail: 'Composite edge_binding stage rejected.' },
+      )
+      assert.equal(compHealth.healthy, false, `floor/shared assessor must mark ${c.id} unhealthy`)
+      assert.equal(compHealth.failureReason, 'composite_stage_rejected')
+    }
+
+    // --- Engine 2: Declarative replay engine (retestReplaySpec) ---
+    activeCase = c
+    stepCursor = 0
+    const declSpec = buildReplaySpec(c, origin, c.canonicalLabel)
+    if (rt.scenario === 'composite_stage_rejected') {
+      const declReplay = await verifyReplaySpec({ spec: declSpec, broker, backend: jqBackend, grant, signal: AbortSignal.timeout(10_000) })
+      const declHealth = assessDeclarativeRetestHealth(declSpec, {
+        ...declReplay,
+        evidencePayload: {
+          ...declReplay.evidencePayload,
+          compositeVerification: { confirmed: false, failedStage: rt.failedStage ?? 'edge_binding', reason: 'Edge hop_1 -> hop_2 missing consumed capability attestation.' },
+        },
+      }, { receiptBuildable: true })
+      assert.equal(declHealth.healthy, false, `declarative health must reject ${c.id}`)
+      assert.equal(declHealth.failureReason, 'composite_stage_rejected')
+    } else {
+      const declRetest = await retestReplaySpec({
+        spec: declSpec,
+        broker,
+        backend: jqBackend,
+        grant,
+        signal: AbortSignal.timeout(10_000),
+      })
+      assert.equal(declRetest.verdict, rt.expectedVerdict, `declarative verdict mismatch on ${c.id}: ${declRetest.replay.outcome.reason ?? ''}`)
+      const declHealth = declRetest.replay.evidencePayload.retestHealth as RetestHealthAssessment
+      assert.equal(declHealth.failureReason, rt.expectedFailureReason, `declarative failureReason mismatch on ${c.id}`)
+      assert.equal(declHealth.healthy, rt.expectedVerdict === 'fixed')
+    }
+
+    // --- Engine 3: Agent-script engine (retestPersistedAgentScript) ---
+    activeCase = c
+    stepCursor = 0
+    const scriptText = `// parity retest script for ${c.id}\nexport default async () => ({ ok: true })\n`
+    const envelope = {
+      kind: 'agent_script' as const,
+      runtime: 'ts' as const,
+      script: scriptText,
+      scriptSha256: sha256(scriptText),
+      verdict: 'confirmed' as const,
+      exchangeIds: ['ex-orig'],
+      vulnClass: c.canonicalLabel.vulnClass ?? 'bola',
+      transcriptDigests: [],
+      confirmedAt: Date.now(),
+    }
+    const scriptBackend = makeRetestScriptBackend(c, origin)
+    const agentRetest = await retestPersistedAgentScript(envelope, {
+      spec: { origin, agentScript: envelope },
+      origin,
+      broker,
+      grant,
+      backend: scriptBackend,
+      runId: `parity-${c.id}`,
+      assignmentId: `assign-${c.id}`,
+      signal: AbortSignal.timeout(15_000),
+    })
+    assert.equal(agentRetest.verdict, rt.expectedVerdict, `agent-script verdict mismatch on ${c.id}: ${agentRetest.replay.outcome.reason ?? ''}`)
+    const agentHealth = agentRetest.replay.evidencePayload.retestHealth as RetestHealthAssessment
+    assert.equal(agentHealth.failureReason, rt.expectedFailureReason, `agent-script failureReason mismatch on ${c.id}`)
+    assert.equal(agentHealth.healthy, rt.expectedVerdict === 'fixed')
+  }
 })

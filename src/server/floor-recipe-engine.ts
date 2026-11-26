@@ -58,6 +58,8 @@ import type {
 } from './floor-recipes.ts'
 import { actorFromPersona, assessBoundary, assessImpactEvidence, assessMassAssignmentImpact, assessMfaBypass, assessStatusOnlyDivergence, classifyBoundaryClaim, classifyImpactDescriptor, normalizeRole, parseRoleLabel } from './oracle-invariants.ts'
 import type { ActorIdentity, AmbientAuth, ImpactStep, PersonaCredentialSource, RoleName } from './oracle-invariants.ts'
+import { classifyRetestHealth } from './retest-health.ts'
+import type { RetestHealthAssessment } from './retest-health.ts'
 import { HostFactLog } from './host-fact-log.ts'
 import { isPureJobOrHandleStubChain, proofReceiptMode } from './proof-receipt.ts'
 import type { ProofReceipt, ReceiptTranscript, ReceiptTranscriptEntry, ReceiptVerification } from './proof-receipt.ts'
@@ -1117,232 +1119,8 @@ export function recipeRetestResult(
   return recipeResult(plan, execution, exchangeIds, execution.result.confirmed)
 }
 
-export type RetestHealthCode =
-  | 'healthy'
-  | 'recipe_error'
-  | 'step_budget'
-  | 'control_require_failed'
-  | 'harness_require_failed'
-  | 'control_status_unhealthy'
-  | 'probe_status_unhealthy'
-  | 'no_healthy_probe'
-  | 'missing_control_arm'
-  | 'access_probe_not_denied'
-  | 'oracle_disagreement'
-
-export interface RetestHealthAssessment {
-  healthy: boolean
-  code: RetestHealthCode
-  reason: string | null
-}
-
-function is2xxStatus(status: number | null): boolean {
-  return status !== null && status >= 200 && status < 300
-}
-
-function isControlStatusAllowed(role: string, status: number | null, deniedRequirePassed: boolean): boolean {
-  if (status === null || status === 0 || status >= 500 || status === 429 || status === 408) return false
-  if (/denied/i.test(role)) {
-    return status === 401 || status === 403 || status === 404 || (deniedRequirePassed && is2xxStatus(status))
-  }
-  if (role === 'same_origin_control') return is2xxStatus(status) || (status >= 300 && status < 400)
-  if (role === 'post_mutation_read') return is2xxStatus(status) || status === 404 || status === 410
-  if (role === 'serial_control_1') return is2xxStatus(status) || status === 400 || status === 409 || status === 422
-  if (role === 'benign_control') return is2xxStatus(status) || status === 400 || status === 404
-  return is2xxStatus(status)
-}
-
-/**
- * R2-H-15 / H-19: Allowlist-based positive-health retest classifier.
- *
- * A non-confirming retest may transition to `fixed` ONLY when:
- *   1. No `recipe_error`, `step_budget`, control-side `require`, or harness-side `require` failed;
- *   2. Every HTTP recipe executed at least one healthy control arm matching its expected baseline
- *      status class (no-control recipes like `race_burst` and `oob_callback` NEVER report `fixed`);
- *   3. Every probe arm executed cleanly with a definitive status (never null/0, 5xx, 429, 408,
- *      unexpected 3xx, or authenticated 401);
- *   4. Access/disclosure recipes observe the entitled baseline served AND the probe definitively
- *      denied (a 2xx probe is NEVER `fixed`);
- *   5. No `oracle_disagreement` occurred (all recipe preconditions passed yet the receipt gate
- *      rejected for a non-remediation reason).
- */
-export function classifyRetestHealth(execution: FloorRecipeExecution): RetestHealthAssessment {
-  if (execution.result.confirmed) {
-    return { healthy: true, code: 'healthy', reason: null }
-  }
-  const failure = execution.failure
-  if (failure?.code === 'recipe_error') {
-    return { healthy: false, code: 'recipe_error', reason: failure.message }
-  }
-  if (failure?.code === 'step_budget_exceeded' || (failure?.missingRoles ?? []).includes('step_budget')) {
-    return { healthy: false, code: 'step_budget', reason: failure?.message ?? 'Recipe exceeded the step budget during retest.' }
-  }
-  const reqFailures = failure?.requireFailures ?? []
-  const controlReqFail = reqFailures.find(item => item.side === 'control')
-  if (controlReqFail) {
-    return { healthy: false, code: 'control_require_failed', reason: controlReqFail.message }
-  }
-  const harnessReqFail = reqFailures.find(item => item.side === 'harness')
-  if (harnessReqFail) {
-    return { healthy: false, code: 'harness_require_failed', reason: harnessReqFail.message }
-  }
-  const missingRoles = failure?.missingRoles ?? []
-  if (missingRoles.includes('browser_trace') || missingRoles.includes('browser_control')) {
-    return { healthy: false, code: 'harness_require_failed', reason: failure?.message ?? 'The retest produced no host-recorded browser trace.' }
-  }
-
-  const recipeId = execution.result.recipeId as string
-  if (recipeId === 'browser_sink') {
-    const traces = execution.result.transcript.browserTraces ?? []
-    if (traces.length === 0) {
-      return { healthy: false, code: 'harness_require_failed', reason: 'The browser_sink retest recorded no host browser trace.' }
-    }
-    if (failure?.code === 'receipt_rejected') {
-      return { healthy: false, code: 'oracle_disagreement', reason: `Oracle disagreement on browser_sink retest: ${failure.message}` }
-    }
-    return { healthy: true, code: 'healthy', reason: null }
-  }
-
-  const steps = execution.result.steps
-  const entryById = new Map((execution.result.transcript.entries ?? []).map(entry => [entry.exchangeId, entry]))
-  const isAuthenticatedStep = (exchangeId: string): boolean => Boolean(entryById.get(exchangeId)?.step.actor.handle)
-
-  const setupSteps = steps.filter(step => step.arm === 'setup')
-  for (const step of setupSteps) {
-    if (step.status === null || step.status === 0 || step.status >= 500 || step.status === 429 || step.status === 408) {
-      return {
-        healthy: false,
-        code: 'control_status_unhealthy',
-        reason: `Setup arm "${step.role}" returned unhealthy HTTP ${step.status ?? 'none'}.`,
-      }
-    }
-    if (step.status === 401 && isAuthenticatedStep(step.exchangeId)) {
-      return {
-        healthy: false,
-        code: 'control_status_unhealthy',
-        reason: `Setup arm "${step.role}" returned HTTP 401; test credential was not valid.`,
-      }
-    }
-  }
-
-  const controlSteps = steps.filter(step => step.arm === 'control')
-  const probeSteps = steps.filter(step => step.arm === 'probe')
-  if (controlSteps.length === 0) {
-    return {
-      healthy: false,
-      code: 'missing_control_arm',
-      reason: `Recipe "${recipeId}" executed no control arm to prove baseline health on retest.`,
-    }
-  }
-  if (probeSteps.length === 0) {
-    return {
-      healthy: false,
-      code: 'no_healthy_probe',
-      reason: `Recipe "${recipeId}" executed no probe arm during retest.`,
-    }
-  }
-
-  const deniedRequirePassed = !reqFailures.some(item => item.role === 'denied_control')
-  for (const step of controlSteps) {
-    if (!isControlStatusAllowed(step.role, step.status, deniedRequirePassed)) {
-      return {
-        healthy: false,
-        code: 'control_status_unhealthy',
-        reason: `Control arm "${step.role}" returned unhealthy HTTP ${step.status ?? 'none'}; baseline health was not established.`,
-      }
-    }
-  }
-
-  for (const step of probeSteps) {
-    if (step.status === null || step.status === 0) {
-      return {
-        healthy: false,
-        code: 'probe_status_unhealthy',
-        reason: `Probe arm "${step.role}" recorded no HTTP status (network/transport failure).`,
-      }
-    }
-    if (step.status >= 500) {
-      return {
-        healthy: false,
-        code: 'probe_status_unhealthy',
-        reason: `Probe arm "${step.role}" returned HTTP ${step.status}; a server error is not evidence of remediation.`,
-      }
-    }
-    if (step.status === 429 || step.status === 408) {
-      return {
-        healthy: false,
-        code: 'probe_status_unhealthy',
-        reason: `Probe arm "${step.role}" was throttled/timed out with HTTP ${step.status}; not evidence of remediation.`,
-      }
-    }
-    if (step.status >= 300 && step.status < 400 && recipeId !== 'redirect') {
-      return {
-        healthy: false,
-        code: 'probe_status_unhealthy',
-        reason: `Probe arm "${step.role}" returned unexpected HTTP ${step.status} redirect; not a definitive fix.`,
-      }
-    }
-    if (step.status === 401 && isAuthenticatedStep(step.exchangeId)) {
-      return {
-        healthy: false,
-        code: 'probe_status_unhealthy',
-        reason: `Authenticated probe arm "${step.role}" returned HTTP 401; session expired rather than authorization enforced.`,
-      }
-    }
-  }
-
-  if (recipeId === 'access_boundary' || recipeId === 'disclosure') {
-    const entitled = controlSteps.find(step => step.role === 'entitled_read')
-    if (!entitled || !is2xxStatus(entitled.status)) {
-      return { healthy: false, code: 'control_status_unhealthy', reason: 'Entitled control arm was not served HTTP 2xx.' }
-    }
-    for (const step of probeSteps) {
-      const authed = isAuthenticatedStep(step.exchangeId)
-      const definitivelyDenied = authed
-        ? (step.status === 403 || step.status === 404)
-        : (step.status === 401 || step.status === 403 || step.status === 404)
-      if (!definitivelyDenied) {
-        return {
-          healthy: false,
-          code: 'access_probe_not_denied',
-          reason: `Probe arm "${step.role}" returned HTTP ${step.status ?? 'none'} instead of a definitive denial; cannot mark ${recipeId} fixed.`,
-        }
-      }
-    }
-  }
-
-  // Oracle-disagreement guard: when every recipe precondition passed yet `verifyReceipt` rejected,
-  // allow `fixed` ONLY for explicit remediation-observed verification reasons (e.g. boolean/timing
-  // differential disappeared, mutation no longer persisted, conservation held).
-  if (failure?.code === 'receipt_rejected') {
-    const reason = execution.result.verification.reason
-    const rule = execution.result.verification.rule
-    if (recipeId === 'boolean_or_timing') {
-      if (rule === 'boolean' && /no structural response change|identical after token stripping|only difference was the injected predicate|rotating nonce/i.test(reason)) {
-        return { healthy: true, code: 'healthy', reason: null }
-      }
-      if (rule === 'timing' && /not distinguishable|stable separation|separation|delay/i.test(reason) && !/wall-clock duration|control and a probe/i.test(reason)) {
-        return { healthy: true, code: 'healthy', reason: null }
-      }
-      return { healthy: false, code: 'oracle_disagreement', reason: `Oracle disagreement on boolean_or_timing retest: ${reason}` }
-    }
-    if (recipeId === 'persisted_mutation') {
-      if (/identical to the baseline|no persisted|state echo|idempotent|not a protected field|not impact/i.test(reason)) {
-        return { healthy: true, code: 'healthy', reason: null }
-      }
-      return { healthy: false, code: 'oracle_disagreement', reason: `Oracle disagreement on persisted_mutation retest: ${reason}` }
-    }
-    if (recipeId === 'conserved_balance') {
-      if (/conserved|conservation|no oversell|within balance|no under-debit/i.test(reason) && !/readback|serial control|concurrent mutation/i.test(reason)) {
-        return { healthy: true, code: 'healthy', reason: null }
-      }
-      return { healthy: false, code: 'oracle_disagreement', reason: `Oracle disagreement on conserved_balance retest: ${reason}` }
-    }
-    return { healthy: false, code: 'oracle_disagreement', reason: `Oracle disagreement on ${recipeId} retest: ${reason}` }
-  }
-
-  return { healthy: true, code: 'healthy', reason: null }
-}
+export { assessRetestHealth, classifyRetestHealth } from './retest-health.ts'
+export type { RetestFailureReason, RetestHealthAssessment, RetestHealthCode } from './retest-health.ts'
 
 /**
  * Receipt-based retest of a persisted recipe (Cut 3 retest migration).
@@ -1402,7 +1180,7 @@ export async function retestPersistedRecipe(input: {
   } catch (error) {
     // A recipe that cannot execute at all is not evidence the vulnerability is gone.
     const reason = `recipe retest could not run: ${error instanceof Error ? error.message.slice(0, 300) : String(error).slice(0, 300)}`
-    const health: RetestHealthAssessment = { healthy: false, code: 'recipe_error', reason }
+    const health: RetestHealthAssessment = { healthy: false, code: 'recipe_error', failureReason: 'baseline_unhealthy', reason }
     return {
       verdict: 'inconclusive',
       execution: null,
@@ -1425,7 +1203,7 @@ export async function retestPersistedRecipe(input: {
   }
   const verdict: RetestVerdict = execution.result.confirmed
     ? 'reproduced'
-    : health.healthy
+    : health.healthy && health.failureReason === 'claim_not_reproduced'
       ? 'fixed'
       : 'inconclusive'
   if (verdict === 'inconclusive') {
