@@ -5,7 +5,7 @@ export interface NamedSecret {
   placeholder: string
 }
 
-export const SENSITIVE_HTTP_HEADER_RE = /^(?:authorization|proxy-authorization|cookie|set-cookie|x-api-key|api-key|x-auth-token|x-access-token|x-refresh-token|x-session-token|x-session-id|x-csrf-token|x-xsrf-token|csrf-token|xsrf-token|x-amz-security-token|x-forwarded-authorization)$/i
+export const SENSITIVE_HTTP_HEADER_RE = /^(?:authorization|proxy-authorization|www-authenticate|proxy-authenticate|cookie|set-cookie|set-cookie2|x-forwarded-cookie|x-api-key|api-key|x-auth-token|x-access-token|x-refresh-token|x-session-token|x-session-id|x-csrf-token|x-xsrf-token|csrf-token|xsrf-token|x-amz-security-token|x-forwarded-authorization|private-token|x-vault-token)$/i
 
 const SECRET_KEY_CORE = '(?:[A-Za-z0-9_-]*(?:password|passwd|api[_-]?key|signing[_-]?key|private[_-]?key|encryption[_-]?key|master[_-]?key|hmac[_-]?key|jwt[_-]?key|secret[_-]?key(?:[_-]?base)?|secret[_-]?access[_-]?key|token|secret|session[_-]?(?:id|key|cookie)|service[_-]?role[_-]?key)|authorization|proxy-authorization|cookie|set-cookie|x-api-key|x-auth-token|x-csrf-token|x-xsrf-token)'
 
@@ -30,13 +30,12 @@ function htmlEscapeBasic(value: string): string {
     .replaceAll("'", '&#39;')
 }
 
-/**
- * Generates exact encoded variants of a registered secret for zero-heuristic scrubbing (M-14):
- * raw, URL-encoded (uppercase/lowercase/form), base64 (padded/unpadded/URL-encoded), base64url,
- * JSON-escaped, PHP slash-escaped (`\/`), and HTML-entity-encoded.
- */
-export function buildSecretEncodingVariants(value: string, minEncodedLength = 4): string[] {
-  const forms = new Set<string>([value])
+function jsonUnicodeEscape(value: string): string {
+  return value.replace(/[<>&'"=\\/+]/g, ch => `\\u${ch.charCodeAt(0).toString(16).padStart(4, '0')}`)
+}
+
+function collectEncodingForms(value: string, minEncodedLength: number, forms: Set<string>, allowCookieSubValue: boolean): void {
+  forms.add(value)
   const add = (candidate: string, floor = minEncodedLength) => {
     if (candidate && candidate !== value && candidate.length >= floor) forms.add(candidate)
   }
@@ -49,6 +48,11 @@ export function buildSecretEncodingVariants(value: string, minEncodedLength = 4)
       add(encoded.replaceAll('%20', '+'), Math.max(6, minEncodedLength))
       add(lowerEncoded.replaceAll('%20', '+'), Math.max(6, minEncodedLength))
     }
+    // Double URL-encoding (upper & lower hex) catches double-encoded reflection/redirect channels.
+    const doubleEncoded = encodeURIComponent(encoded)
+    add(doubleEncoded, Math.max(8, minEncodedLength))
+    const lowerDoubleEncoded = doubleEncoded.replace(/%[0-9A-F]{2}/g, m => m.toLowerCase())
+    add(lowerDoubleEncoded, Math.max(8, minEncodedLength))
   }
   const buf = Buffer.from(value, 'utf8')
   const b64 = buf.toString('base64')
@@ -58,8 +62,17 @@ export function buildSecretEncodingVariants(value: string, minEncodedLength = 4)
   if (b64UrlEnc !== b64) add(b64UrlEnc)
   const b64url = buf.toString('base64url')
   add(b64url)
+  // Hex encoding (lower + upper) for secrets >= 6 bytes to avoid colliding with short hex words.
+  if (buf.length >= 6) {
+    const hexLower = buf.toString('hex')
+    add(hexLower, Math.max(12, minEncodedLength * 2))
+    add(hexLower.toUpperCase(), Math.max(12, minEncodedLength * 2))
+  }
   const jsonEscaped = JSON.stringify(value).slice(1, -1)
   add(jsonEscaped)
+  if (/[<>&'"=\\/+]/.test(value)) {
+    add(jsonUnicodeEscape(value), Math.max(6, minEncodedLength))
+  }
   if (value.includes('/')) {
     add(value.replaceAll('/', '\\/'))
     add(jsonEscaped.replaceAll('/', '\\/'))
@@ -69,6 +82,29 @@ export function buildSecretEncodingVariants(value: string, minEncodedLength = 4)
     add(htmlEsc)
     if (value.includes("'")) add(htmlEsc.replaceAll('&#39;', '&#x27;'))
   }
+  // Cookie value-only stripping: if a registered secret is a `name=value` cookie pair,
+  // also scrub the bare value (and its encoded forms) when echoed without the cookie name.
+  if (allowCookieSubValue) {
+    const eqIdx = value.indexOf('=')
+    if (eqIdx > 0 && eqIdx < value.length - 1) {
+      const cookieName = value.slice(0, eqIdx)
+      const cookieVal = value.slice(eqIdx + 1)
+      if (/^[!#$%&'*+\-.^_`|~0-9A-Za-z]{1,64}$/.test(cookieName) && !cookieVal.includes(';') && cookieVal.length >= Math.max(6, minEncodedLength)) {
+        collectEncodingForms(cookieVal, Math.max(6, minEncodedLength), forms, false)
+      }
+    }
+  }
+}
+
+/**
+ * Generates exact encoded variants of a registered secret for zero-heuristic scrubbing (M-14):
+ * raw, URL-encoded (uppercase/lowercase/form + double URL-encoded), base64 (padded/unpadded/URL-encoded),
+ * base64url, hex (lower/upper), JSON-escaped, JSON `\uXXXX` unicode-escaped, PHP slash-escaped (`\/`),
+ * HTML-entity-encoded, and cookie value-only stripped forms.
+ */
+export function buildSecretEncodingVariants(value: string, minEncodedLength = 4): string[] {
+  const forms = new Set<string>()
+  collectEncodingForms(value, minEncodedLength, forms, true)
   return [...forms]
 }
 

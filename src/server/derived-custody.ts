@@ -1,6 +1,6 @@
 /** Layer-1 Derived Capability Custody (`cap:hop_<hopReceiptId>:<slot>`) & Bounded Async Poll-Convergence (v8 M0). */
 import { createHash, createHmac, randomBytes } from 'node:crypto'
-import { accessSync, chmodSync, constants, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { accessSync, chmodSync, constants, lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { buildSecretEncodingVariants, type NamedSecret } from './redact.ts'
 
@@ -27,7 +27,7 @@ export interface DerivedCapabilityMeta {
   allowedOrigins?: readonly string[]
 }
 export interface DerivedCapabilityVaultOptions {
-  runId: string; persistPath?: string; defaultTtlMs?: number | null; maxEntries?: number; now?: () => number
+  runId: string; persistPath?: string; defaultTtlMs?: number | null; maxEntries?: number; maxSealAttempts?: number; now?: () => number
 }
 export interface SealDerivedCapabilityInput {
   hopReceiptId: string; slot: string; rawValue: string; kind?: DerivedSecretKind; ttlMs?: number | null
@@ -45,14 +45,36 @@ const COOKIE_NAME_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]{1,256}$/
 const CRLF_RE = /[\r\n\0]/
 const MAX_SECRET_BYTES = 32_768
 const DEFAULT_MAX_ENTRIES = 512
-const MIN_SCRUB_LENGTH = 8
+const DEFAULT_MAX_SEAL_ATTEMPTS = 1_024
+export const MIN_SCRUB_LENGTH = 6
 const DEFAULT_AUTOBIND_MIN_LENGTH = 8
 const TRIVIAL_AUTOBIND_VALUES = new Set([
   'undefined', 'approved', 'accepted', 'rejected', 'completed', 'complete', 'processing', 'succeeded', 'disabled', 'password',
   'username', 'anonymous', 'localhost', 'application/json', 'text/plain', 'text/html', 'authorization', 'content-type', 'connection',
   'keep-alive', 'transfer-encoding', 'not_found', 'internal_error', 'forbidden', 'unauthorized', 'bad_request', 'placeholder',
   'default_value', 'readonly', 'readwrite',
+  // Common 6-7 char English/JSON/HTTP words safely excluded from exact-value scrubbing.
+  'status', 'active', 'public', 'failed', 'errors', 'result', 'object', 'string', 'number', 'delete',
+  'create', 'update', 'cancel', 'submit', 'search', 'header', 'cookie', 'bearer', 'tokens', 'secret',
+  'health', 'method', 'origin', 'target', 'client', 'server', 'system', 'normal', 'medium', 'simple',
+  'custom', 'strict', 'legacy', 'verify', 'access', 'denied', 'closed', 'opened', 'paused', 'queued',
+  'pending', 'success', 'warning', 'message', 'payload', 'request', 'headers', 'cookies', 'session',
+  'account', 'profile', 'default', 'enabled', 'unknown', 'invalid', 'missing', 'timeout', 'aborted',
+  'allowed', 'blocked', 'content', 'charset', 'options', 'connect', 'upgrade', 'expires', 'max-age',
+  'boolean', 'nullish', 'integer', 'version', 'headers', 'referer', 'refresh',
 ])
+
+export function isScrubbableCapabilityValue(rawValue: string, minLength = MIN_SCRUB_LENGTH): boolean {
+  const floor = Math.max(1, minLength)
+  const trimmed = rawValue.trim()
+  if (!trimmed || rawValue.length < floor || trimmed.length < floor) return false
+  if (/^(.)\1+$/.test(trimmed)) return false
+  if (TRIVIAL_AUTOBIND_VALUES.has(trimmed.toLowerCase())) return false
+  // For short 6-7 char values, require at least 3 distinct characters so trivial low-entropy
+  // patterns (like `ababab`) do not corrupt benign JSON/text while real 6-7 char tokens/OTPs do scrub.
+  if (trimmed.length < 8 && new Set(trimmed).size < 3) return false
+  return true
+}
 const UNSAFE_HEADERS = new Set(['host', 'content-length', 'connection', 'transfer-encoding', 'upgrade', 'keep-alive', 'te', 'trailer', 'proxy-connection'])
 
 function assertCustody(cond: unknown, code: DerivedCustodyErrorCode, msg: string): asserts cond {
@@ -85,7 +107,7 @@ interface ScrubRecord { handle: DerivedCapabilityHandle; rawValue: string }
 interface PersistedVaultPayload { v: 1; runId: string; entries: SealedEntry[]; scrubHistory: ScrubRecord[] }
 interface VaultInternals {
   readonly runId: string; readonly persistPath?: string; readonly defaultTtlMs: number | null
-  readonly maxEntries: number; readonly now: () => number
+  readonly maxEntries: number; readonly maxSealAttempts: number; sealAttempts: number; readonly now: () => number
   readonly entries: Map<DerivedCapabilityHandle, SealedEntry>; readonly scrubHistory: Map<string, ScrubRecord>
   readonly sealedDigests: Map<DerivedCapabilityHandle, string>
 }
@@ -112,11 +134,12 @@ function resolveActiveEntry(vault: DerivedCapabilityVault, handle: string, opts?
 }
 
 function readPersistedVault(path: string, expectedRunId: string): PersistedVaultPayload | null {
-  let stat: ReturnType<typeof statSync>
-  try { stat = statSync(path) } catch (err) {
+  let stat: ReturnType<typeof lstatSync>
+  try { stat = lstatSync(path) } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null
     throw new DerivedCustodyError('PERSISTENCE_ERROR', `Failed to stat custody file: ${(err as Error).message}`)
   }
+  assertCustody(!stat.isSymbolicLink(), 'PERSISTENCE_ERROR', 'Derived custody file must not be a symbolic link.')
   assertCustody((stat.mode & 0o077) === 0, 'PERSISTENCE_ERROR', 'Derived custody file must have owner-only (0600) permissions.')
   assertCustody(stat.isFile(), 'PERSISTENCE_ERROR', 'Derived custody path is not a regular file.')
   accessSync(path, constants.R_OK)
@@ -154,11 +177,13 @@ export class DerivedCapabilityVault {
     assertCustody(SAFE_ID_RE.test(options.runId), 'INVALID_INPUT', `Invalid runId "${options.runId}".`)
     const maxEntries = options.maxEntries ?? DEFAULT_MAX_ENTRIES
     assertCustody(Number.isInteger(maxEntries) && maxEntries >= 1 && maxEntries <= 10_000, 'INVALID_INPUT', 'maxEntries must be 1..10000.')
+    const maxSealAttempts = options.maxSealAttempts ?? DEFAULT_MAX_SEAL_ATTEMPTS
+    assertCustody(Number.isInteger(maxSealAttempts) && maxSealAttempts >= 1 && maxSealAttempts <= 100_000, 'INVALID_INPUT', 'maxSealAttempts must be 1..100000.')
     assertCustody(options.defaultTtlMs === undefined || options.defaultTtlMs === null || (Number.isFinite(options.defaultTtlMs) && options.defaultTtlMs >= 0), 'INVALID_INPUT', 'defaultTtlMs must be a non-negative finite number or null.')
     this.runId = options.runId
     const state: VaultInternals = {
       runId: options.runId, persistPath: options.persistPath, defaultTtlMs: options.defaultTtlMs ?? null,
-      maxEntries, now: options.now ?? Date.now, entries: new Map(), scrubHistory: new Map(), sealedDigests: new Map(),
+      maxEntries, maxSealAttempts, sealAttempts: 0, now: options.now ?? Date.now, entries: new Map(), scrubHistory: new Map(), sealedDigests: new Map(),
     }
     const loaded = options.persistPath ? readPersistedVault(options.persistPath, options.runId) : null
     if (loaded) {
@@ -180,6 +205,8 @@ export class DerivedCapabilityVault {
 
   seal(input: SealDerivedCapabilityInput): DerivedCapabilityMeta {
     const state = getInternals(this)
+    state.sealAttempts += 1
+    assertCustody(state.sealAttempts <= state.maxSealAttempts, 'CAPACITY_EXCEEDED', `Vault seal attempt cap (${state.maxSealAttempts}) exceeded.`)
     assertCustody(typeof input.rawValue === 'string' && input.rawValue.length > 0, 'INVALID_INPUT', 'rawValue must be a non-empty string.')
     assertCustody(Buffer.byteLength(input.rawValue, 'utf8') <= MAX_SECRET_BYTES, 'INVALID_INPUT', `rawValue exceeds ${MAX_SECRET_BYTES} bytes.`)
     const handle = formatDerivedHandle(input.hopReceiptId, input.slot)
@@ -283,16 +310,17 @@ export class DerivedCapabilityVault {
   }
 }
 
-// --- Secret Scrubbing (Raw + URL/Form + Base64 / Unpadded / Base64URL + JSON/HTML Escapes) ---
-export function scrubDerivedSecrets(text: string, vault: DerivedCapabilityVault | readonly DerivedCapabilityVault[]): string {
+// --- Secret Scrubbing (Raw + URL/Form + Base64 / Unpadded / Base64URL + Hex + JSON/HTML Escapes) ---
+export function scrubDerivedSecrets(text: string, vault: DerivedCapabilityVault | readonly DerivedCapabilityVault[], minLength = MIN_SCRUB_LENGTH): string {
   if (!text) return text
+  const floor = Math.max(1, minLength)
   const vaults = Array.isArray(vault) ? vault : [vault]
   const replacements: Array<{ needle: string; placeholder: string }> = []
   for (const v of vaults) {
     for (const rec of getInternals(v).scrubHistory.values()) {
-      if (rec.rawValue.length < MIN_SCRUB_LENGTH || TRIVIAL_AUTOBIND_VALUES.has(rec.rawValue.trim().toLowerCase())) continue
+      if (!isScrubbableCapabilityValue(rec.rawValue, floor)) continue
       const placeholder = `[redacted:${rec.handle}]`
-      for (const needle of buildSecretEncodingVariants(rec.rawValue, MIN_SCRUB_LENGTH)) replacements.push({ needle, placeholder })
+      for (const needle of buildSecretEncodingVariants(rec.rawValue, floor)) replacements.push({ needle, placeholder })
     }
   }
   if (!replacements.length) return text
@@ -302,10 +330,11 @@ export function scrubDerivedSecrets(text: string, vault: DerivedCapabilityVault 
   return out
 }
 
-export function vaultScrubDescriptors(vault: DerivedCapabilityVault): NamedSecret[] {
+export function vaultScrubDescriptors(vault: DerivedCapabilityVault, minLength = MIN_SCRUB_LENGTH): NamedSecret[] {
+  const floor = Math.max(1, minLength)
   const list: NamedSecret[] = []
   for (const rec of getInternals(vault).scrubHistory.values()) {
-    if (rec.rawValue.length >= MIN_SCRUB_LENGTH && !TRIVIAL_AUTOBIND_VALUES.has(rec.rawValue.trim().toLowerCase())) {
+    if (isScrubbableCapabilityValue(rec.rawValue, floor)) {
       list.push({ value: rec.rawValue, placeholder: `[redacted:${rec.handle}]` })
     }
   }

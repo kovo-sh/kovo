@@ -4,12 +4,13 @@ import {
   EgressDeniedError,
   EgressGateway,
   classifyAddress,
+  classifyDetailedAddress,
   createPinnedLookup,
   defaultResolveHost,
   isLoopbackLiteral,
   warnIfEnvProxyEnabled,
 } from './egress-gateway.ts'
-import type { AddressClass } from './egress-gateway.ts'
+import type { AddressClass, EgressLoopbackProxy } from './egress-gateway.ts'
 import {
   normalizeClerkClientCookie,
   normalizePersonaBundle,
@@ -735,7 +736,7 @@ function chromiumResolverTarget(address: string): string {
   return bare.includes(':') ? `[${bare}]` : bare
 }
 
-/** Resolver rules pin validated credential hosts and fail closed for everything else. */
+/** Resolver rules pin validated credential hosts, fail closed for unknown names, and allow the local loopback proxy. */
 export function formChromiumResolverRules(pinnedHosts?: ReadonlyMap<string, readonly string[]>): string {
   const rules: string[] = []
   for (const [host, addresses] of pinnedHosts ?? []) {
@@ -744,6 +745,7 @@ export function formChromiumResolverRules(pinnedHosts?: ReadonlyMap<string, read
     rules.push(`MAP ${host} ${chromiumResolverTarget(address)}`)
   }
   rules.push('MAP * ~NOTFOUND')
+  rules.push('EXCLUDE 127.0.0.1')
   return rules.join(', ')
 }
 
@@ -752,6 +754,8 @@ export function formChromiumLaunchArgs(options: FormChromiumLaunchOptions = {}):
     '--disable-dev-shm-usage',
     '--disable-background-networking',
     `--host-resolver-rules=${formChromiumResolverRules(options.pinnedHosts)}`,
+    // Force even loopback targets through the authenticated host loopback proxy (zero direct bypass).
+    '--proxy-bypass-list=<-loopback>',
     '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
     '--webrtc-ip-handling-policy=disable_non_proxied_udp',
     // WebTransport is HTTP/3 over UDP and bypasses HTTP request interception.
@@ -2747,27 +2751,22 @@ export class PersonaAuthManager {
     }
     const validatedLoginUrl = loginTarget.url.toString()
 
-    const pinnedHosts = new Map<string, string[]>()
-    const pinCandidates = new Set<string>([
-      normalizeHostname(loginTarget.url.hostname),
-      normalizeHostname(new URL(targetOrigin).hostname),
-      ...allowedHostnames(persona.originAllowlist),
-      ...authOrigins.map(origin => {
-        try { return normalizeHostname(new URL(origin).hostname) } catch { return '' }
-      }),
-    ])
-    await Promise.all([...pinCandidates].filter(Boolean).map(async host => {
-      try {
-        const addresses = await this.resolveHost(host)
-        if (addresses.length > 0) pinnedHosts.set(host, addresses)
-      } catch {
-        // Unresolvable hosts get no MAP rule and therefore cannot connect.
-      }
-    }))
+    const pinnedHosts = await this.resolveValidatedFormHosts(
+      [
+        normalizeHostname(loginTarget.url.hostname),
+        normalizeHostname(new URL(targetOrigin).hostname),
+        ...allowedHostnames(persona.originAllowlist),
+        ...authOrigins.map(origin => {
+          try { return normalizeHostname(new URL(origin).hostname) } catch { return '' }
+        }),
+      ],
+      allowedOrigins,
+    )
 
     let browser: PlaywrightFormBrowserLike | undefined
     let context: PlaywrightFormContext | undefined
     let page: PlaywrightFormPage | undefined
+    let loopbackProxy: EgressLoopbackProxy | undefined
     let captchaRouteHit = false
     const interceptedBearer = new Set<string>()
 
@@ -2804,12 +2803,18 @@ export class PersonaAuthManager {
     }
 
     try {
+      loopbackProxy = await this.createFormLoopbackProxy({
+        allowedOrigins,
+        scopeForSubresources,
+        pinnedHosts,
+      })
       browser = await this.launchBrowser(pinnedHosts)
       context = await browser.newContext({
         ignoreHTTPSErrors: false,
         javaScriptEnabled: true,
         bypassCSP: false,
         serviceWorkers: 'block',
+        proxy: loopbackProxy.proxyConfig,
       })
       await context.addInitScript?.(webrtcGuardScript)
       if (typeof context.routeWebSocket === 'function') {
@@ -2819,6 +2824,15 @@ export class PersonaAuthManager {
             const websocketOrigin = `${url.protocol === 'wss:' ? 'https:' : 'http:'}//${url.host}`
             if ((url.protocol !== 'wss:' && url.protocol !== 'ws:') || !allowedOrigins.has(websocketOrigin) ||
               typeof ws.connectToServer !== 'function') {
+              await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter scope.' })
+              return
+            }
+            if (url.protocol === 'ws:' && !isLoopbackLiteral(url.hostname)) {
+              await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter scope.' })
+              return
+            }
+            const safety = await this.browserHostSafety(websocketOrigin, scopeForSubresources)
+            if (!safety.safe) {
               await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter scope.' })
               return
             }
@@ -3003,7 +3017,109 @@ export class PersonaAuthManager {
       await page?.close().catch(() => undefined)
       await context?.close().catch(() => undefined)
       await browser?.close().catch(() => undefined)
+      await loopbackProxy?.close().catch(() => undefined)
     }
+  }
+
+  /**
+   * Resolve form/OIDC browser candidate hosts ONCE and strip any unsafe SSRF/metadata/private/unlisted-loopback
+   * addresses before pinning them into Chromium's `--host-resolver-rules` and loopback proxy.
+   */
+  private async resolveValidatedFormHosts(
+    candidates: Iterable<string>,
+    allowedOrigins: ReadonlySet<string>,
+  ): Promise<Map<string, string[]>> {
+    const allowedLoopbackHosts = new Set<string>()
+    for (const origin of allowedOrigins) {
+      try {
+        const parsed = new URL(origin)
+        const norm = normalizeHostname(parsed.hostname)
+        if (norm && isLoopbackLiteral(norm)) allowedLoopbackHosts.add(norm)
+      } catch {
+        // Ignore malformed origins.
+      }
+    }
+    const pinnedHosts = new Map<string, string[]>()
+    const uniqueCandidates = new Set<string>()
+    for (const c of candidates) {
+      const norm = normalizeHostname(c)
+      if (norm) uniqueCandidates.add(norm)
+    }
+    await Promise.all([...uniqueCandidates].map(async host => {
+      try {
+        const addresses = await this.resolveHost(host)
+        if (!addresses.length) return
+        const allowLoopback = allowedLoopbackHosts.has(host)
+        const safe: string[] = []
+        for (const addr of addresses) {
+          const kind = classifyDetailedAddress(addr)
+          if (kind === 'public') safe.push(addr)
+          else if (kind === 'loopback' && allowLoopback) safe.push(addr)
+          else return // Fail closed on any mixed/rebound private/metadata/loopback resolution!
+        }
+        if (safe.length > 0) pinnedHosts.set(host, safe)
+      } catch {
+        // Unresolvable hosts get no MAP rule and therefore cannot connect.
+      }
+    }))
+    return pinnedHosts
+  }
+
+  /**
+   * Per-login authenticated host-loopback proxy for `persona-auth.ts` Chromium contexts.
+   * Ensures zero unproxied browser egress, enforces SSRF/metadata/CONNECT-port/scope rules,
+   * and dials only validated pinned IP addresses.
+   */
+  private async createFormLoopbackProxy(params: {
+    allowedOrigins: ReadonlySet<string>
+    scopeForSubresources: readonly string[]
+    pinnedHosts: ReadonlyMap<string, readonly string[]>
+  }): Promise<EgressLoopbackProxy> {
+    const { allowedOrigins, scopeForSubresources, pinnedHosts } = params
+    const allowedLoopbackHosts = new Set<string>()
+    const allowedPorts = new Set<number>([443])
+    for (const origin of allowedOrigins) {
+      try {
+        const parsed = new URL(origin)
+        const norm = normalizeHostname(parsed.hostname)
+        if (norm && isLoopbackLiteral(norm)) allowedLoopbackHosts.add(norm)
+        const port = parsed.port ? Number(parsed.port) : (parsed.protocol === 'https:' ? 443 : 80)
+        if (Number.isInteger(port) && port >= 1 && port <= 65_535) allowedPorts.add(port)
+      } catch {
+        // Ignore malformed entries.
+      }
+    }
+    return await EgressGateway.createLoopbackProxy({
+      allowLocalLab: false,
+      allowHttp: false,
+      ...(allowedLoopbackHosts.size > 0 ? { allowedLoopbackOnlyHosts: [...allowedLoopbackHosts] } : {}),
+      allowConnectPort: port => allowedPorts.has(port),
+      allowOrigin: (origin, method, url) => {
+        const exactAllowed = allowedOrigins.has(origin)
+        if (method === 'CONNECT') {
+          if (exactAllowed || isOriginInScope(origin, scopeForSubresources)) return true
+          if (allowedLoopbackHosts.size > 0 && origin.startsWith('https://')) {
+            const httpAlt = origin.replace(/^https:/i, 'http:')
+            if (allowedOrigins.has(httpAlt)) return true
+          }
+          return { allowed: false, reason: `Form-login proxy denied CONNECT origin "${origin}".` }
+        }
+        if (url.protocol === 'http:' && !exactAllowed) {
+          return { allowed: false, reason: `Form-login proxy denied non-allowlisted HTTP origin "${origin}".` }
+        }
+        const isReadOnly = method === 'GET' || method === 'HEAD'
+        if (exactAllowed || (isReadOnly && isOriginInScope(origin, scopeForSubresources))) return true
+        return { allowed: false, reason: `Form-login proxy denied out-of-scope origin "${origin}".` }
+      },
+      resolveHost: async hostname => {
+        const norm = normalizeHostname(hostname)
+        const pinned = pinnedHosts.get(norm)
+        if (pinned && pinned.length > 0) return [...pinned]
+        return await this.resolveHost(hostname)
+      },
+      timeoutMs: this.timeoutMs,
+      maxResponseBytes: MAX_PINNED_RESPONSE_BYTES,
+    })
   }
 
   private async authenticateForm(
@@ -3016,7 +3132,7 @@ export class PersonaAuthManager {
     const loginUrl = config.loginUrl || `${targetOrigin}/login`
     // Form login types the password into this page: validate it exactly like an API credential
     // destination (allowlist + HTTPS, loopback only when explicitly allowlisted). Resolution is
-    // delegated to Chromium's pinned resolver rules below, which fail closed for unknown names.
+    // delegated to Chromium's pinned resolver rules + authenticated loopback proxy below.
     const loginTarget = await this.assertCredentialTarget(
       loginUrl,
       persona.originAllowlist,
@@ -3030,26 +3146,20 @@ export class PersonaAuthManager {
       loginOrigin,
     ])
 
-    // Resolve every host Chromium may contact, once, before launch. The validated answer becomes
-    // a `MAP host ip` rule; all other names resolve to ~NOTFOUND (see formChromiumLaunchArgs).
-    const pinnedHosts = new Map<string, string[]>()
-    const pinCandidates = new Set<string>([
-      normalizeHostname(loginTarget.url.hostname),
-      normalizeHostname(new URL(targetOrigin).hostname),
-      ...allowedHostnames(persona.originAllowlist),
-    ])
-    await Promise.all([...pinCandidates].filter(Boolean).map(async host => {
-      try {
-        const addresses = await this.resolveHost(host)
-        if (addresses.length > 0) pinnedHosts.set(host, addresses)
-      } catch {
-        // Unresolvable hosts get no MAP rule and therefore cannot connect.
-      }
-    }))
+    // Resolve and SSRF-validate every host Chromium may contact, once, before launch.
+    const pinnedHosts = await this.resolveValidatedFormHosts(
+      [
+        normalizeHostname(loginTarget.url.hostname),
+        normalizeHostname(new URL(targetOrigin).hostname),
+        ...allowedHostnames(persona.originAllowlist),
+      ],
+      allowedOrigins,
+    )
 
     let browser: PlaywrightFormBrowserLike | undefined
     let context: PlaywrightFormContext | undefined
     let page: PlaywrightFormPage | undefined
+    let loopbackProxy: EgressLoopbackProxy | undefined
     let captchaRouteHit = false
     const interceptedBearer = new Set<string>()
 
@@ -3094,17 +3204,23 @@ export class PersonaAuthManager {
     }
 
     try {
+      const scopeForSubresources = [...persona.originAllowlist, loginOrigin]
+      loopbackProxy = await this.createFormLoopbackProxy({
+        allowedOrigins,
+        scopeForSubresources,
+        pinnedHosts,
+      })
       browser = await this.launchBrowser(pinnedHosts)
       context = await browser.newContext({
         ignoreHTTPSErrors: false,
         javaScriptEnabled: true,
         bypassCSP: false,
         serviceWorkers: 'block',
+        proxy: loopbackProxy.proxyConfig,
       })
       await context.addInitScript?.(webrtcGuardScript)
-      // WebSocket upgrades are never brokered HTTP. Only exactly allowed origins may open a
-      // socket; everything else is closed before Chromium connects. If the Playwright version
-      // cannot route sockets, the page loses the constructors entirely (fail closed).
+      // WebSocket upgrades are never brokered HTTP. Only exactly allowed origins that pass
+      // SSRF/host safety may open a socket; everything else is closed before Chromium connects.
       if (typeof context.routeWebSocket === 'function') {
         await context.routeWebSocket('**/*', async ws => {
           try {
@@ -3115,6 +3231,15 @@ export class PersonaAuthManager {
             }
             const websocketOrigin = `${url.protocol === 'wss:' ? 'https:' : 'http:'}//${url.host}`
             if (!allowedOrigins.has(websocketOrigin)) {
+              await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter scope.' })
+              return
+            }
+            if (url.protocol === 'ws:' && !isLoopbackLiteral(url.hostname)) {
+              await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter scope.' })
+              return
+            }
+            const safety = await this.browserHostSafety(websocketOrigin, scopeForSubresources)
+            if (!safety.safe) {
               await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter scope.' })
               return
             }
@@ -3131,7 +3256,6 @@ export class PersonaAuthManager {
         if (context.addInitScript) await context.addInitScript(formTransportDenyScript)
         else console.warn('WARNING: routeWebSocket is unavailable; form-login WebSocket egress cannot be intercepted.')
       }
-      const scopeForSubresources = [...persona.originAllowlist, loginOrigin]
       await context.route('**/*', async route => {
         const reqUrl = route.request().url()
         const requestHeaders = route.request().headers?.()
@@ -3328,6 +3452,7 @@ export class PersonaAuthManager {
       await page?.close().catch(() => undefined)
       await context?.close().catch(() => undefined)
       await browser?.close().catch(() => undefined)
+      await loopbackProxy?.close().catch(() => undefined)
     }
   }
 

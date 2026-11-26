@@ -105,10 +105,12 @@ function sendProxyConnect(
   proxyPort: number,
   authority: string,
   payloadAfterConnect?: string,
+  proxyAuthHeader?: string,
 ): Promise<{ statusLine: string; headers: Record<string, string>; body: string }> {
   return new Promise((resolvePromise, reject) => {
     const socket = netConnect({ host: '127.0.0.1', port: proxyPort }, () => {
-      socket.write(`CONNECT ${authority} HTTP/1.1\r\nHost: ${authority}\r\n\r\n`)
+      const authLine = proxyAuthHeader ? `Proxy-Authorization: ${proxyAuthHeader}\r\n` : ''
+      socket.write(`CONNECT ${authority} HTTP/1.1\r\nHost: ${authority}\r\n${authLine}\r\n`)
     })
     let raw = ''
     let headersParsed = false
@@ -496,9 +498,21 @@ describe('EgressGateway: createLoopbackProxy HTTP + CONNECT enforcement', () => 
 
     assert.equal(proxy.host, '127.0.0.1')
     assert.match(proxy.url, /^http:\/\/127\.0\.0\.1:\d+$/)
+    assert.ok(proxy.proxyConfig.username && proxy.proxyConfig.password, 'loopback proxy must mint per-instance credentials')
+
+    // 0) Unauthenticated HTTP and CONNECT requests MUST be rejected with 407 Proxy Authentication Required
+    const unauthHttp = await sendProxyHttpRequest(proxy.port, `http://allowed.local:${httpTarget.port}/hello`)
+    assert.equal(unauthHttp.status, 407)
+    assert.equal(unauthHttp.headers['x-kovo-egress-denied'], 'proxy_auth_required')
+    const unauthConnect = await sendProxyConnect(proxy.port, `tunnel.local:${tcpPort}`)
+    assert.match(unauthConnect.statusLine, /^HTTP\/1\.1 407 /)
+    assert.equal(unauthConnect.headers['x-kovo-egress-denied'], 'proxy_auth_required')
+
+    const authHeaders = { 'proxy-authorization': proxy.authorizationHeader }
 
     // 1) Allowed HTTP request goes through pinned IP with request/response header hooks applied
     const allowedRes = await sendProxyHttpRequest(proxy.port, `http://allowed.local:${httpTarget.port}/hello`, {
+      ...authHeaders,
       cookie: 'client_cookie=0',
     })
     assert.equal(allowedRes.status, 200)
@@ -507,32 +521,32 @@ describe('EgressGateway: createLoopbackProxy HTTP + CONNECT enforcement', () => 
     assert.equal(allowedRes.headers['set-cookie'], undefined, 'transformResponseHeaders hook must strip Set-Cookie')
 
     // 2) Cloud metadata HTTP request refused even when allowOrigin returns true and allowLocalLab is true
-    const metaHttp = await sendProxyHttpRequest(proxy.port, 'http://169.254.169.254/latest/meta-data/')
+    const metaHttp = await sendProxyHttpRequest(proxy.port, 'http://169.254.169.254/latest/meta-data/', authHeaders)
     assert.equal(metaHttp.status, 403)
     assert.equal(metaHttp.headers['x-kovo-egress-denied'], 'metadata_blocked')
 
     // 3) Off-scope HTTP request refused
-    const offScopeHttp = await sendProxyHttpRequest(proxy.port, 'http://offscope.example/secret')
+    const offScopeHttp = await sendProxyHttpRequest(proxy.port, 'http://offscope.example/secret', authHeaders)
     assert.equal(offScopeHttp.status, 403)
     assert.equal(offScopeHttp.headers['x-kovo-egress-denied'], 'scope_denied')
 
     // 4) Allowed CONNECT tunnel establishes 200 and tunnels traffic via pinned IP
-    const okConnect = await sendProxyConnect(proxy.port, `tunnel.local:${tcpPort}`, 'PING_H2')
+    const okConnect = await sendProxyConnect(proxy.port, `tunnel.local:${tcpPort}`, 'PING_H2', proxy.authorizationHeader)
     assert.match(okConnect.statusLine, /^HTTP\/1\.1 200 /)
     assert.equal(okConnect.body, 'TUNNEL_ECHO:PING_H2')
 
     // 5) Cloud metadata CONNECT refused
-    const metaConnect = await sendProxyConnect(proxy.port, '169.254.169.254:443')
+    const metaConnect = await sendProxyConnect(proxy.port, '169.254.169.254:443', undefined, proxy.authorizationHeader)
     assert.match(metaConnect.statusLine, /^HTTP\/1\.1 403 /)
     assert.equal(metaConnect.headers['x-kovo-egress-denied'], 'metadata_blocked')
 
     // 6) IPv6 link-local DNS-rebound CONNECT refused
-    const ipv6LlConnect = await sendProxyConnect(proxy.port, 'rebound.local:443')
+    const ipv6LlConnect = await sendProxyConnect(proxy.port, 'rebound.local:443', undefined, proxy.authorizationHeader)
     assert.match(ipv6LlConnect.statusLine, /^HTTP\/1\.1 403 /)
     assert.equal(ipv6LlConnect.headers['x-kovo-egress-denied'], 'metadata_blocked')
 
     // 7) Off-scope CONNECT refused
-    const offScopeConnect = await sendProxyConnect(proxy.port, 'attacker.example:443')
+    const offScopeConnect = await sendProxyConnect(proxy.port, 'attacker.example:443', undefined, proxy.authorizationHeader)
     assert.match(offScopeConnect.statusLine, /^HTTP\/1\.1 403 /)
     assert.equal(offScopeConnect.headers['x-kovo-egress-denied'], 'scope_denied')
 
@@ -552,11 +566,11 @@ describe('EgressGateway: createLoopbackProxy HTTP + CONNECT enforcement', () => 
     })
     t.after(() => proxy.close())
 
-    const r4 = await sendProxyConnect(proxy.port, 'priv4.example:443')
+    const r4 = await sendProxyConnect(proxy.port, 'priv4.example:443', undefined, proxy.authorizationHeader)
     assert.match(r4.statusLine, /^HTTP\/1\.1 403 /)
     assert.equal(r4.headers['x-kovo-egress-denied'], 'private_ip_blocked')
 
-    const r6 = await sendProxyConnect(proxy.port, 'ula6.example:443')
+    const r6 = await sendProxyConnect(proxy.port, 'ula6.example:443', undefined, proxy.authorizationHeader)
     assert.match(r6.statusLine, /^HTTP\/1\.1 403 /)
     assert.equal(r6.headers['x-kovo-egress-denied'], 'private_ip_blocked')
   })
@@ -589,11 +603,14 @@ describe('ScopedBrowser: EgressGateway loopback proxy & origin-locked storage hy
     const fakeBrowser: PlaywrightBrowserLike = {
       newContext: async (options = {}) => {
         contextOptionsSeen.push(options)
-        const proxyObj = options.proxy as { server?: string } | undefined
+        const proxyObj = options.proxy as { server?: string; username?: string; password?: string } | undefined
         if (proxyObj?.server && liveProxyChecks.length === 0) {
           const proxyPort = Number(new URL(proxyObj.server).port)
-          const meta = await sendProxyConnect(proxyPort, '169.254.169.254:443')
-          const offScope = await sendProxyConnect(proxyPort, 'evil.example:443')
+          const authHdr = proxyObj.username && proxyObj.password
+            ? `Basic ${Buffer.from(`${proxyObj.username}:${proxyObj.password}`, 'utf8').toString('base64')}`
+            : undefined
+          const meta = await sendProxyConnect(proxyPort, '169.254.169.254:443', undefined, authHdr)
+          const offScope = await sendProxyConnect(proxyPort, 'evil.example:443', undefined, authHdr)
           liveProxyChecks.push({ metaStatus: meta.statusLine, offScopeStatus: offScope.statusLine })
         }
         return {
@@ -914,7 +931,6 @@ describe('RequestBroker & VerifyRpcServer: migrated to EgressGateway', () => {
  */
 const WAVE_2B_RAW_DIALER_ALLOWLIST: Readonly<Record<string, string>> = {
   'src/server/transport.ts': 'Wave 2B: RequestBroker Layer-1 HTTP/1.1 + HTTP/2 transport plumbing',
-  'src/server/provider.ts': 'Wave 2B: LLM provider API client',
   'src/server/cve-broker.ts': 'Wave 2B: OSV advisory lookup API client',
   'src/server/github-auth.ts': 'Wave 2B: GitHub OAuth / API client',
   'src/server/github-repo-sync.ts': 'Wave 2B: GitHub repository sync client',
@@ -1062,6 +1078,7 @@ describe('Contract: single canonical EgressGateway dialer across src/server/*.ts
     assert.equal('src/server/scoped-browser.ts' in WAVE_2B_RAW_DIALER_ALLOWLIST, false, 'scoped-browser.ts must NOT be in raw-dialer allowlist')
     assert.equal('src/server/broker.ts' in WAVE_2B_RAW_DIALER_ALLOWLIST, false, 'broker.ts must NOT be in raw-dialer allowlist')
     assert.equal('src/server/verify-rpc.ts' in WAVE_2B_RAW_DIALER_ALLOWLIST, false, 'verify-rpc.ts must NOT be in raw-dialer allowlist')
+    assert.equal('src/server/provider.ts' in WAVE_2B_RAW_DIALER_ALLOWLIST, false, 'provider.ts must NOT be in raw-dialer allowlist')
 
     const serverFiles = collectServerTsFiles(join(repoRoot, 'src/server'))
     assert.ok(serverFiles.length > 40, `Expected src/server/*.ts files to scan, got ${serverFiles.length}`)

@@ -8,11 +8,12 @@ import type { SecondOrderStore } from './canary-broker.ts'
 import { cookieRecordsFromHeader } from './persona-auth.ts'
 import { buildPersonaBrowserAttachment, personaSecrets } from './persona-vault.ts'
 import { EgressGateway } from './egress-gateway.ts'
-import type { EgressLoopbackProxy } from './egress-gateway.ts'
+import type { EgressLoopbackProxy, LoopbackProxyContextBinding } from './egress-gateway.ts'
 import { createEgressSanitizer } from './egress-sanitizer.ts'
+import { isIpLiteralHost } from './public-suffix.ts'
 import { redact } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
-import { evaluateBrowserScopeRequest } from './scope-policy.ts'
+import { evaluateBrowserScopeRequest, isRouteDenylisted } from './scope-policy.ts'
 import type { ScopePolicy } from './scope-policy.ts'
 
 export interface BrowserSameSiteFetchRequest {
@@ -440,16 +441,56 @@ export interface PlaywrightWebSocketRoute {
 }
 
 /**
+ * Determine whether a CONNECT / WebSocket port is allowed for the active grant and scope policy.
+ * Enforces explicit `grant.allowedPorts`, `scopePolicy` origin ports, and fails closed on
+ * non-443 ports outside local-lab unless explicitly allowlisted by `canRead` or `assetScope`.
+ */
+export function isBrowserConnectPortAllowed(params: {
+  port: number
+  hostname: string
+  grant: Pick<Grant, 'canRead' | 'allowedPorts' | 'scopePolicy'>
+  allowLocalLab: boolean
+  assetScope?: AssetOriginScope
+}): boolean {
+  const { port, hostname, grant, allowLocalLab, assetScope } = params
+  if (!Number.isInteger(port) || port < 1 || port > 65_535) return false
+  if (grant.allowedPorts && grant.allowedPorts.length > 0) {
+    return grant.allowedPorts.includes(port)
+  }
+  const bareHost = hostname.trim().toLowerCase().replace(/^\[|\]$/g, '')
+  const formattedHost = bareHost.includes(':') ? `[${bareHost}]` : bareHost
+  const httpsOrigin = port === 443 ? `https://${formattedHost}` : `https://${formattedHost}:${port}`
+  const httpOrigin = port === 80 ? `http://${formattedHost}` : `http://${formattedHost}:${port}`
+  if (grant.scopePolicy) {
+    const checkScope = (o: string): boolean => evaluateBrowserScopeRequest(grant.scopePolicy!, {
+      origin: o,
+      method: 'GET',
+      pathAndQuery: '/',
+      redirectHop: true,
+    }).allowed
+    if (checkScope(httpsOrigin)) return true
+    if (allowLocalLab && checkScope(httpOrigin)) return true
+    return false
+  }
+  if (grant.canRead(httpsOrigin) || isAssetOriginAllowed(httpsOrigin, assetScope)) return true
+  if (allowLocalLab && (grant.canRead(httpOrigin) || isAssetOriginAllowed(httpOrigin, assetScope))) return true
+  return false
+}
+
+/**
  * HTTP interception does not cover WebSocket upgrades. Route every socket through an explicit
- * scope check and only call `connectToServer()` for in-scope wss/ws origins. When the Playwright
- * version has no `routeWebSocket`, the guard fails closed (page-level deny script) instead of
- * silently allowing unchecked upgrades.
+ * scope check (including `allowConnectPort` / `allowedPorts` and `scopePolicy`) and only call
+ * `connectToServer()` for in-scope wss/ws origins. When the Playwright version has no
+ * `routeWebSocket`, the guard fails closed (page-level deny script) instead of allowing upgrades.
  */
 export async function installWebSocketGuard(
   context: Pick<PlaywrightContext, 'routeWebSocket'> & Partial<Pick<PlaywrightContext, 'addInitScript'>>,
   options: {
     canRead: (origin: string) => boolean
     allowLocalLab: boolean | (() => boolean)
+    scopePolicy?: ScopePolicy | (() => ScopePolicy | undefined)
+    allowedPorts?: readonly number[] | (() => readonly number[] | undefined)
+    allowConnectPort?: (port: number, hostname: string) => boolean
     audit?: (decision: 'denied', origin: string) => void
   },
 ): Promise<void> {
@@ -464,19 +505,50 @@ export async function installWebSocketGuard(
   }
   await context.routeWebSocket('**/*', async ws => {
     let origin: string
+    let parsedUrl: URL
+    let port: number
     const allowLocalLab = typeof options.allowLocalLab === 'function' ? options.allowLocalLab() : options.allowLocalLab
     try {
-      const url = new URL(ws.url())
-      const secure = url.protocol === 'wss:'
-      if (!secure && !(allowLocalLab && url.protocol === 'ws:')) {
-        options.audit?.('denied', url.origin)
+      parsedUrl = new URL(ws.url())
+      const secure = parsedUrl.protocol === 'wss:'
+      if (!secure && !(allowLocalLab && parsedUrl.protocol === 'ws:')) {
+        options.audit?.('denied', parsedUrl.origin)
         await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter scope.' })
         return
       }
-      origin = `${secure ? 'https:' : 'http:'}//${url.host}`
+      port = parsedUrl.port ? Number(parsedUrl.port) : (secure ? 443 : 80)
+      origin = `${secure ? 'https:' : 'http:'}//${parsedUrl.host}`
     } catch {
       await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter scope.' })
       return
+    }
+    const allowedPorts = typeof options.allowedPorts === 'function' ? options.allowedPorts() : options.allowedPorts
+    if (allowedPorts && allowedPorts.length > 0 && !allowedPorts.includes(port)) {
+      options.audit?.('denied', origin)
+      await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter scope.' })
+      return
+    }
+    if (options.allowConnectPort && !options.allowConnectPort(port, parsedUrl.hostname)) {
+      options.audit?.('denied', origin)
+      await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter scope.' })
+      return
+    }
+    const scopePolicy = typeof options.scopePolicy === 'function' ? options.scopePolicy() : options.scopePolicy
+    if (scopePolicy) {
+      const wsPath = `${parsedUrl.pathname}${parsedUrl.search}`
+      const decision = evaluateBrowserScopeRequest(scopePolicy, {
+        origin,
+        method: 'GET',
+        pathAndQuery: wsPath,
+        redirectHop: false,
+      })
+      // WebSocket upgrades are bidirectional active channels: permit only `target` origins
+      // and never allow upgrades to `asset`/`auth` origins or denylisted routes.
+      if (!decision.allowed || decision.role !== 'target' || isRouteDenylisted(scopePolicy, wsPath)) {
+        options.audit?.('denied', origin)
+        await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter scope.' })
+        return
+      }
     }
     if (!options.canRead(origin)) {
       options.audit?.('denied', origin)
@@ -1008,8 +1080,10 @@ export interface BrowserPoolStats {
 interface PooledRuntime {
   key: string
   runId: string | undefined
+  origin: string
   context: PlaywrightContext
   page: PlaywrightPage
+  proxyBinding: LoopbackProxyContextBinding
   sockets: Map<string, BrowserWebSocketRecord>
   cdp: PlaywrightCdpSession | null
   active: PooledVisitState | null
@@ -1196,14 +1270,52 @@ function seedStorageInitScript(bundle: BrowserSessionBundle | null, origin: stri
 })();`
 }
 
+/**
+ * Strictly filter bundle cookies to those applicable to `targetOrigin` (H9):
+ * - Host-only cookies (no leading `.`) require exact hostname match.
+ * - Domain cookies (leading `.`) require domain or subdomain match (never IP suffix matches).
+ * - `Secure` cookies are never hydrated onto plaintext `http:` origins.
+ */
+export function filterCookiesForOrigin(
+  cookies: readonly BrowserSeedCookie[],
+  targetOrigin: string,
+): BrowserSeedCookie[] {
+  let parsed: URL
+  try {
+    parsed = new URL(targetOrigin)
+  } catch {
+    return []
+  }
+  const targetHost = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '')
+  const isHttps = parsed.protocol === 'https:'
+  const targetIsIp = isIpLiteralHost(targetHost)
+
+  return cookies.filter(cookie => {
+    if (!cookie.name || !cookie.domain) return false
+    if (cookie.secure && !isHttps) return false
+    const rawDomain = cookie.domain.trim().toLowerCase().replace(/^\[|\]$/g, '')
+    if (!rawDomain) return false
+    if (rawDomain.startsWith('.')) {
+      const base = rawDomain.slice(1)
+      if (!base || targetIsIp || isIpLiteralHost(base)) {
+        return targetHost === base
+      }
+      return targetHost === base || targetHost.endsWith(`.${base}`)
+    }
+    return targetHost === rawDomain
+  })
+}
+
 async function hydrateContextSession(
   context: PlaywrightContext,
   bundle: BrowserSessionBundle | null,
   origin: string,
 ): Promise<void> {
   if (!context.addCookies || !bundle?.cookies?.length) return
+  const scopedCookies = filterCookiesForOrigin(bundle.cookies, origin)
+  if (!scopedCookies.length) return
   try {
-    await context.addCookies(bundle.cookies.map(cookie => ({
+    await context.addCookies(scopedCookies.map(cookie => ({
       name: cookie.name,
       value: cookie.value,
       domain: cookie.domain,
@@ -1216,7 +1328,6 @@ async function hydrateContextSession(
   } catch {
     // Hydration is best-effort: a rejected cookie must never fail a visit.
   }
-  void origin
 }
 
 /** Wait for network-idle plus DOM stability instead of a fixed settle sleep. */
@@ -1511,56 +1622,16 @@ export class ScopedBrowser {
     if (this.poolProxy) return this.poolProxy
     if (!this.poolProxyLaunch) {
       this.poolProxyLaunch = (async () => {
+        // C5: The shared loopback proxy itself fails closed on default credentials; every pooled
+        // BrowserContext registers its own random Proxy-Authorization credential + isolated policy
+        // via `registerContextPolicy` so concurrent contexts NEVER union `allowLocalLab` or origins!
         const proxy = await EgressGateway.createLoopbackProxy({
-          allowLocalLab: () => {
-            for (const entry of this.pooled.values()) {
-              if (entry.active && entry.activeAllowLocalLab) return true
-            }
-            return false
-          },
-          allowOrigin: (origin, method, url) => {
-            let hasActive = false
-            for (const entry of this.pooled.values()) {
-              if (!entry.active || !entry.activeGrant) continue
-              hasActive = true
-              const decision = classifyBrowserHttpRequest({
-                method: method === 'CONNECT' ? 'GET' : method,
-                url: url.href,
-                tier: entry.active.tier,
-                canRead: o => entry.activeGrant!.canRead(o),
-                allowLocalLab: entry.activeAllowLocalLab,
-                assetScope: entry.active.assetScope,
-                scopePolicy: entry.activeGrant.scopePolicy,
-              })
-              if (decision.allowed) return true
-              if (method === 'CONNECT' && entry.activeAllowLocalLab && url.protocol === 'https:') {
-                const httpDecision = classifyBrowserHttpRequest({
-                  method: 'GET',
-                  url: url.href.replace(/^https:/i, 'http:'),
-                  tier: entry.active.tier,
-                  canRead: o => entry.activeGrant!.canRead(o),
-                  allowLocalLab: entry.activeAllowLocalLab,
-                  assetScope: entry.active.assetScope,
-                  scopePolicy: entry.activeGrant.scopePolicy,
-                })
-                if (httpDecision.allowed) return true
-              }
-            }
-            return {
-              allowed: false,
-              reason: hasActive
-                ? `Browser proxy denied out-of-scope origin "${origin}".`
-                : 'Browser proxy denied request without an active visit grant.',
-            }
-          },
+          allowLocalLab: false,
+          allowOrigin: () => ({
+            allowed: false,
+            reason: 'Pooled browser proxy requires per-context Proxy-Authorization credentials.',
+          }),
           ...(this.options.proxyResolveHost ? { resolveHost: this.options.proxyResolveHost } : {}),
-          onDenied: event => {
-            for (const entry of this.pooled.values()) {
-              if (!entry.active || !entry.activeGrant) continue
-              if (event.origin) entry.active.blockedOrigins.add(event.origin)
-              try { entry.activeGrant.audit('denied', event.origin || event.url) } catch { /* ignore */ }
-            }
-          },
         })
         this.poolProxy = proxy
         return proxy
@@ -1579,6 +1650,14 @@ export class ScopedBrowser {
     const { grant, tier, allowLocalLab, assetScope, getBlockedOrigins } = params
     return await EgressGateway.createLoopbackProxy({
       allowLocalLab,
+      ...(grant.scopePolicy ? { scopePolicy: grant.scopePolicy } : {}),
+      allowConnectPort: (port, hostname) => isBrowserConnectPortAllowed({
+        port,
+        hostname,
+        grant,
+        allowLocalLab,
+        assetScope,
+      }),
       allowOrigin: (origin, method, url) => {
         const decision = classifyBrowserHttpRequest({
           method: method === 'CONNECT' ? 'GET' : method,
@@ -1612,7 +1691,7 @@ export class ScopedBrowser {
     })
   }
 
-  private assetScopeFor(req: BrowserVisitRequest): AssetOriginScope | undefined {
+  private assetScopeFor(req: Pick<BrowserVisitRequest, 'assetOrigins'>): AssetOriginScope | undefined {
     const origins = [...(this.options.assetOrigins ?? []), ...(req.assetOrigins ?? [])]
     if (origins.length === 0 && !this.options.assetOriginAllowlist) return undefined
     return {
@@ -1645,7 +1724,8 @@ export class ScopedBrowser {
     initialOrigin: string,
     bundle: BrowserSessionBundle | null,
   ): Promise<PooledRuntime> {
-    const key = `${req.runId ?? 'default'}::${req.persona ? `persona:${req.persona}` : 'anonymous'}`
+    // H9: Include `initialOrigin` in the pool key so cookies, initScripts, and storage never leak across origins.
+    const key = `${req.runId ?? 'default'}::${req.persona ? `persona:${req.persona}` : 'anonymous'}::${initialOrigin}`
     const existing = this.pooled.get(key)
     if (existing) {
       existing.lastUsed = Date.now()
@@ -1664,6 +1744,7 @@ export class ScopedBrowser {
         oldest.active = null
         oldest.activeGrant = null
         oldest.activeAllowLocalLab = false
+        oldest.proxyBinding.unregister()
         await oldest.cdp?.detach?.().catch(() => undefined)
         await oldest.page.close().catch(() => undefined)
         await oldest.context.close().catch(() => undefined)
@@ -1672,21 +1753,13 @@ export class ScopedBrowser {
     }
 
     const poolProxy = await this.ensurePoolProxy()
-    const context = await browser.newContext({
-      ignoreHTTPSErrors: false,
-      javaScriptEnabled: true,
-      bypassCSP: false,
-      serviceWorkers: 'block',
-      proxy: poolProxy.proxyConfig,
-      userAgent: 'KovoHunter/6 pooled scoped inspector',
-    })
-    this.poolStats.contextsCreated += 1
-
     const runtime: PooledRuntime = {
       key,
       runId: req.runId,
-      context,
+      origin: initialOrigin,
+      context: undefined as unknown as PlaywrightContext,
       page: undefined as unknown as PlaywrightPage,
+      proxyBinding: undefined as unknown as LoopbackProxyContextBinding,
       sockets: new Map(),
       cdp: null,
       active: null,
@@ -1695,11 +1768,98 @@ export class ScopedBrowser {
       lastUsed: Date.now(),
     }
 
+    // C5: Register a dedicated per-context Proxy-Authorization credential + policy scoped strictly
+    // to THIS runtime (zero cross-context unioning of `allowLocalLab` or `allowOrigin`).
+    const proxyBinding = poolProxy.registerContextPolicy({
+      allowLocalLab: () => Boolean(runtime.active && runtime.activeAllowLocalLab),
+      scopePolicy: () => runtime.activeGrant?.scopePolicy,
+      allowConnectPort: (port, hostname) => {
+        if (!runtime.active || !runtime.activeGrant) return false
+        return isBrowserConnectPortAllowed({
+          port,
+          hostname,
+          grant: runtime.activeGrant,
+          allowLocalLab: runtime.activeAllowLocalLab,
+          assetScope: runtime.active.assetScope,
+        })
+      },
+      allowOrigin: (origin, method, url) => {
+        if (!runtime.active || !runtime.activeGrant) {
+          return {
+            allowed: false,
+            reason: 'Browser proxy denied request without an active visit grant.',
+          }
+        }
+        const decision = classifyBrowserHttpRequest({
+          method: method === 'CONNECT' ? 'GET' : method,
+          url: url.href,
+          tier: runtime.active.tier,
+          canRead: o => runtime.activeGrant!.canRead(o),
+          allowLocalLab: runtime.activeAllowLocalLab,
+          assetScope: runtime.active.assetScope,
+          scopePolicy: runtime.activeGrant.scopePolicy,
+        })
+        if (decision.allowed) return true
+        if (method === 'CONNECT' && runtime.activeAllowLocalLab && url.protocol === 'https:') {
+          const httpDecision = classifyBrowserHttpRequest({
+            method: 'GET',
+            url: url.href.replace(/^https:/i, 'http:'),
+            tier: runtime.active.tier,
+            canRead: o => runtime.activeGrant!.canRead(o),
+            allowLocalLab: runtime.activeAllowLocalLab,
+            assetScope: runtime.active.assetScope,
+            scopePolicy: runtime.activeGrant.scopePolicy,
+          })
+          if (httpDecision.allowed) return true
+        }
+        return {
+          allowed: false,
+          reason: decision.reason ?? `Browser proxy denied out-of-scope origin "${origin}".`,
+        }
+      },
+      ...(this.options.proxyResolveHost ? { resolveHost: this.options.proxyResolveHost } : {}),
+      onDenied: event => {
+        if (!runtime.active || !runtime.activeGrant) return
+        if (event.origin) runtime.active.blockedOrigins.add(event.origin)
+        try { runtime.activeGrant.audit('denied', event.origin || event.url) } catch { /* ignore */ }
+      },
+    })
+    runtime.proxyBinding = proxyBinding
+
+    let context: PlaywrightContext
+    try {
+      context = await browser.newContext({
+        ignoreHTTPSErrors: false,
+        javaScriptEnabled: true,
+        bypassCSP: false,
+        serviceWorkers: 'block',
+        proxy: proxyBinding.proxyConfig,
+        userAgent: 'KovoHunter/6 pooled scoped inspector',
+      })
+    } catch (err) {
+      proxyBinding.unregister()
+      throw err
+    }
+    runtime.context = context
+    this.poolStats.contextsCreated += 1
+
     await context.addInitScript(postMessageInstrumentationScript)
     await context.addInitScript(browserWebRtcGuardScript)
     await installWebSocketGuard(context, {
       canRead: origin => Boolean(runtime.activeGrant?.canRead(origin)),
       allowLocalLab: () => runtime.activeAllowLocalLab,
+      scopePolicy: () => runtime.activeGrant?.scopePolicy,
+      allowedPorts: () => runtime.activeGrant?.allowedPorts,
+      allowConnectPort: (port, hostname) => {
+        if (!runtime.activeGrant) return false
+        return isBrowserConnectPortAllowed({
+          port,
+          hostname,
+          grant: runtime.activeGrant,
+          allowLocalLab: runtime.activeAllowLocalLab,
+          assetScope: runtime.active?.assetScope,
+        })
+      },
       audit: (decision, origin) => { runtime.activeGrant?.audit(decision, origin) },
     })
     const storageSeed = seedStorageInitScript(bundle, initialOrigin)
@@ -1868,6 +2028,10 @@ export class ScopedBrowser {
     for (const [key, entry] of [...this.pooled.entries()]) {
       if (entry.runId === activeRunId) continue
       this.pooled.delete(key)
+      entry.active = null
+      entry.activeGrant = null
+      entry.activeAllowLocalLab = false
+      entry.proxyBinding.unregister()
       await entry.cdp?.detach?.().catch(() => undefined)
       await entry.page.close().catch(() => undefined)
       await entry.context.close().catch(() => undefined)
@@ -2084,6 +2248,7 @@ export class ScopedBrowser {
       entry.active = null
       entry.activeGrant = null
       entry.activeAllowLocalLab = false
+      entry.proxyBinding.unregister()
       await entry.cdp?.detach?.().catch(() => undefined)
       await entry.page.close().catch(() => undefined)
       await entry.context.close().catch(() => undefined)
@@ -2228,6 +2393,15 @@ export class ScopedBrowser {
       await installWebSocketGuard(context, {
         canRead: origin => grant.canRead(origin),
         allowLocalLab,
+        scopePolicy: grant.scopePolicy,
+        allowedPorts: grant.allowedPorts,
+        allowConnectPort: (port, hostname) => isBrowserConnectPortAllowed({
+          port,
+          hostname,
+          grant,
+          allowLocalLab,
+          assetScope: this.assetScopeFor(req),
+        }),
         audit: (decision, origin) => grant.audit(decision, origin),
       })
       const storageSeed = seedStorageInitScript(bundle, initialOrigin)
@@ -3084,6 +3258,15 @@ export class ScopedBrowser {
           await installWebSocketGuard(context, {
             canRead: origin => grant.canRead(origin),
             allowLocalLab,
+            scopePolicy: grant.scopePolicy,
+            allowedPorts: grant.allowedPorts,
+            allowConnectPort: (port, hostname) => isBrowserConnectPortAllowed({
+              port,
+              hostname,
+              grant,
+              allowLocalLab,
+              assetScope: this.assetScopeFor({}),
+            }),
             audit: (decision, origin) => grant.audit(decision, origin),
           })
           if (groupNeedsSinkHook) {
@@ -3107,22 +3290,22 @@ export class ScopedBrowser {
               return
             }
 
-            const validProtocol = parsedUrl.protocol === 'https:' || (allowLocalLab && parsedUrl.protocol === 'http:')
-            if (!validProtocol || !grant.canRead(parsedUrl.origin)) {
+            const method = request.method().toUpperCase()
+            // H9: Route runBrowserSession requests through the canonical `classifyBrowserHttpRequest`
+            // classifier so `grant.scopePolicy` (`prod_readonly`, `staging_denylist`, origin roles) is enforced.
+            const decision = classifyBrowserHttpRequest({
+              method,
+              url: rawUrl,
+              body: request.postData(),
+              tier,
+              canRead: origin => grant.canRead(origin),
+              allowLocalLab,
+              assetScope: this.assetScopeFor({}),
+              scopePolicy: grant.scopePolicy,
+            })
+            if (!decision.allowed) {
               stepBlockedOrigins.add(parsedUrl.origin)
               grant.audit('denied', parsedUrl.origin)
-              await route.abort('blockedbyclient').catch(() => undefined)
-              return
-            }
-
-            const method = request.method().toUpperCase()
-            if (!allowedMethods.has(method)) {
-              await route.abort('blockedbyclient').catch(() => undefined)
-              return
-            }
-            const isReadOnly = method === 'GET' || method === 'HEAD' || method === 'OPTIONS'
-            const isTier2Post = method === 'POST' && tier >= 2
-            if (!isReadOnly && !isTier2Post && tier < 3) {
               await route.abort('blockedbyclient').catch(() => undefined)
               return
             }
@@ -3136,7 +3319,7 @@ export class ScopedBrowser {
             const cur = activeStep
             const resourceType = request.resourceType()
             let personaForRequest: string | undefined
-            if (cur.step.persona) {
+            if (cur.step.persona && !decision.assetHydration) {
               if (parsedUrl.origin === cur.origin) {
                 personaForRequest = cur.step.persona
               } else if (
@@ -3173,7 +3356,7 @@ export class ScopedBrowser {
                 followRedirects: true,
                 secrets: routeSecrets,
                 timeoutMs: maxBrowserTimeoutMs,
-              }, grant, deadline)
+              }, decision.assetHydration ? assetScopedGrant(grant, parsedUrl.origin) : grant, deadline)
 
               stepExchanges.push(exchange)
               const recordedId = cur.step.onExchange?.(exchange)
