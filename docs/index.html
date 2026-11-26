@@ -44,526 +44,461 @@
 <body>
 <a class="skip" href="#main">Skip to content</a>
 
-<div class="shell">
-  <!-- ================================================================ rail (desktop) -->
-  <aside class="rail" aria-label="Site">
-    <div class="rail-brand">
-      <i class="mk" aria-hidden="true"></i>
-      <a href="#overview" class="rail-name">Kovo Hunter</a>
-      <span class="rail-env">Apache 2.0</span>
+<!-- ================================================================ top bar -->
+<header class="nav" id="nav">
+  <div class="nav-in">
+    <a href="#overview" class="brand" aria-label="Kovo Hunter, back to top"><i class="mk" aria-hidden="true"></i><b>Kovo Hunter</b></a>
+    <nav class="nav-links" aria-label="Sections">
+      <a href="#proof" data-nav="proof">Proof</a>
+      <a href="#architecture" data-nav="architecture">Architecture</a>
+      <a href="#install" data-nav="install">Install</a>
+      <a href="#compare" data-nav="compare">Compare</a>
+      <a href="#faq" data-nav="faq">FAQ</a>
+    </nav>
+    <div class="nav-acts">
+      <button type="button" class="btn ghost icon hide-md" data-act="theme" aria-label="Switch to dark theme"><i class="ico" data-i="moon"></i></button>
+      <a class="btn ghost nav-gh hide-md" href="https://github.com/kovo-sh/kovo-hunter" target="_blank" rel="noopener noreferrer"><i class="ico" data-i="star"></i>GitHub<i class="ico sm dim" data-i="ext"></i></a>
+      <a class="btn primary" href="#install">Get started</a>
+      <button type="button" class="btn ghost icon nav-menu" id="nav-menu" aria-expanded="false" aria-controls="nav-sheet" aria-label="Open menu"><i class="ico" data-i="menu"></i></button>
     </div>
-    <button type="button" class="rail-search" data-act="palette">
-      <i class="ico" data-i="search"></i><span>Search…</span><span class="kgrp"><kbd class="kbd" data-mod>Ctrl</kbd><kbd class="kbd">K</kbd></span>
-    </button>
-    <div class="rail-scroll">
-      <div class="rsec">Product</div>
-      <nav class="rnav" aria-label="Sections">
-        <a class="ri" href="#overview" data-nav="overview" title="Overview (G then O)"><i class="ico" data-i="overview"></i><span class="lbl">Overview</span></a>
-        <a class="ri" href="#proof" data-nav="proof" title="Proof (G then P)"><i class="ico" data-i="replay"></i><span class="lbl">Proof</span><span class="cnt">replay</span></a>
-        <a class="ri" href="#architecture" data-nav="architecture" title="Architecture (G then A)"><i class="ico" data-i="workflow"></i><span class="lbl">Architecture</span><span class="cnt">3</span></a>
-        <a class="ri" href="#install" data-nav="install" title="Install (G then I)"><i class="ico" data-i="download"></i><span class="lbl">Install</span><span class="cnt">3 steps</span></a>
-        <a class="ri" href="#compare" data-nav="compare" title="Compare (G then C)"><i class="ico" data-i="list"></i><span class="lbl">Compare</span><span class="cnt">4</span></a>
-        <a class="ri" href="#faq" data-nav="faq" title="FAQ (G then F)"><i class="ico" data-i="chat"></i><span class="lbl">FAQ</span></a>
-      </nav>
-      <div class="rsec gap">Resources</div>
-      <nav class="rnav" aria-label="Resources">
-        <a class="ri" href="https://github.com/kovo-sh/kovo-hunter" target="_blank" rel="noopener noreferrer"><i class="ico" data-i="globe"></i><span class="lbl">GitHub</span><i class="ico sm tr" data-i="ext"></i></a>
-        <button type="button" class="ri" data-act="report"><i class="ico" data-i="report"></i><span class="lbl">Sample report</span></button>
-        <a class="ri" href="mailto:will@kovo.sh?subject=Kovo%20Hunter%20Enterprise"><i class="ico" data-i="shield"></i><span class="lbl">Enterprise</span><span class="cnt">soon</span></a>
-      </nav>
+  </div>
+  <div class="nav-sheet" id="nav-sheet" hidden>
+    <nav class="sheet-links" aria-label="Sections">
+      <a href="#proof" data-nav="proof">Proof</a>
+      <a href="#architecture" data-nav="architecture">Architecture</a>
+      <a href="#install" data-nav="install">Install</a>
+      <a href="#compare" data-nav="compare">Compare</a>
+      <a href="#faq" data-nav="faq">FAQ</a>
+    </nav>
+    <div class="sheet-acts">
+      <a class="btn" href="https://github.com/kovo-sh/kovo-hunter" target="_blank" rel="noopener noreferrer"><i class="ico" data-i="star"></i>GitHub<i class="ico sm dim" data-i="ext"></i></a>
+      <button type="button" class="btn" data-act="theme"><i class="ico" data-i="moon"></i><span class="theme-lbl">Dark theme</span></button>
     </div>
-    <div class="rail-foot">
-      <button type="button" class="sess" data-copy="docker" title="Copy the Docker command">
-        <i class="ico" data-i="copy"></i><span class="lbl">docker run …</span><small>Copy</small><i class="ico sm" data-i="chevR"></i>
-      </button>
-    </div>
-    <div class="rail-foot2">
-      <button type="button" class="ibtn" data-act="theme" title="Toggle theme (⇧T)"><i class="ico" data-i="moon"></i><span class="theme-lbl">Dark</span></button>
-      <span class="sp"></span>
-      <button type="button" class="ibtn" data-act="help" title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts"><i class="ico" data-i="keyboard"></i></button>
-    </div>
-  </aside>
+  </div>
+</header>
 
-  <!-- ================================================================ main column -->
-  <div class="col">
-    <header class="hdr" id="hdr">
-      <div class="hdr-row">
-        <a href="#overview" class="hdr-brand" aria-label="Kovo Hunter, back to top"><i class="mk" aria-hidden="true"></i><b>Kovo Hunter</b></a>
-        <span class="crumb"><a href="https://github.com/kovo-sh/kovo-hunter" target="_blank" rel="noopener noreferrer">kovo-sh/kovo-hunter</a><span class="slash">/</span><span id="crumb-view">Overview</span></span>
-        <span class="goal">Don’t just trust the AI, verify.</span>
-        <span class="hdr-acts">
-          <button type="button" class="btn ghost icon only-sm" data-act="palette" aria-label="Search and commands"><i class="ico" data-i="search"></i></button>
-          <button type="button" class="btn ghost icon only-sm" data-act="theme" aria-label="Toggle theme"><i class="ico theme-ico" data-i="moon"></i></button>
-          <a class="btn hide-sm" href="https://github.com/kovo-sh/kovo-hunter" target="_blank" rel="noopener noreferrer"><i class="ico" data-i="globe"></i>GitHub</a>
-          <a class="btn primary" href="#install">Get started</a>
-        </span>
+<main id="main" tabindex="-1">
+  <!-- ============================================================ OVERVIEW -->
+  <section class="hero-sec" id="overview" aria-labelledby="hero-h">
+    <div class="wrap hero">
+      <span class="tag accent hero-eyebrow"><span data-glyph="running"></span>Open-source AI security pentester</span>
+      <h1 id="hero-h">Don’t just trust the AI, <span class="acc">verify.</span></h1>
+      <p class="lede">Kovo Hunter catches vulnerabilities before attackers do. It runs on your machine, stays locked to the apps you approve, and confirmed findings carry a deterministic replay you can re-run after you ship the fix.</p>
+      <div class="ctas">
+        <a class="btn primary lg" href="#install">Get started<i class="ico sm" data-i="arrowR"></i></a>
+        <a class="btn lg" href="https://github.com/kovo-sh/kovo-hunter" target="_blank" rel="noopener noreferrer"><i class="ico" data-i="star"></i>GitHub<i class="ico sm dim" data-i="ext"></i></a>
+        <button type="button" class="btn ghost lg" data-act="report" aria-haspopup="dialog"><i class="ico" data-i="report"></i>Sample report</button>
       </div>
-      <div class="runline" id="runline" aria-label="Project facts">
-        <span class="rl" data-p="9"><span data-glyph="complete"></span><b>Apache 2.0</b><span class="s">open source</span></span>
-        <span class="rl" data-p="8"><b>Self-hosted UI</b><span class="s">localhost:8000</span></span>
-        <span class="rl" data-p="7"><span class="s">Inference</span><b>Bring your own model</b></span>
-        <span class="rl" data-p="5"><span class="s">Workers</span><b class="mono">--network=none</b></span>
-        <span class="rl" data-p="3"><span class="s">Locale</span><b>English</b><span class="s">· i18n soon</span></span>
-        <span class="rl" data-p="1"><span class="s">Clean-room · Will Chen (Dyad, 22k+ ★)</span></span>
+      <ul class="badges" aria-label="Project facts">
+        <li class="tag"><span data-glyph="complete"></span>Apache 2.0</li>
+        <li class="tag">Self-hosted UI</li>
+        <li class="tag">Bring your own model</li>
+      </ul>
+
+      <figure class="player" id="player">
+        <div class="player-h">
+          <i class="ico" data-i="replay"></i>
+          <span class="ph-t">Replay</span>
+          <span class="ph-s">Acme staging <span class="slash">/</span> Find cross-tenant data exposure</span>
+          <span class="sp"></span>
+          <span class="tag solid">Simulated data</span>
+          <span class="ph-d num">0:51</span>
+        </div>
+        <div class="player-b">
+          <iframe id="replay" title="Kovo Hunter replay, 51 seconds, simulated data: from scope approval to a fix re-verified by replay" data-src="replay/?embed=1&amp;paused=1" allow="clipboard-write"></iframe>
+          <noscript><p class="noscript">The replay needs JavaScript. <a href="replay/">Open it on its own page.</a></p></noscript>
+        </div>
+        <figcaption class="sr-only">A scripted replay of the Kovo Hunter run workspace: you approve the scope, the broker blocks an out-of-scope host, a confirmed finding shows its control vs. variant replay, and after the fix ships, Verify Fix re-runs the stored replay with no LLM.</figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <!-- ============================================================ WHY -->
+  <section class="view why" aria-labelledby="why-h">
+    <div class="wrap">
+      <p class="eyebrow">Why Kovo Hunter</p>
+      <h2 id="why-h">Self-hosted pentesting, <span class="mute">locked to your own software.</span></h2>
+      <p class="lede sm">Like ARTEX, Kovo Hunter gives you one self-hosted UI to run a pentest end to end. ARTEX is extremely powerful, but easy to misuse when you are protecting your own apps. Kovo Hunter makes it simple to lock testing to your apps and approved domains, so you don’t probe third-party hosts, mutate production data or leak test credentials.</p>
+
+      <ul class="cards" aria-label="Safety guarantees">
+        <li class="card">
+          <span class="fg"><i class="ico" data-i="lock"></i></span>
+          <h3>Air-gapped workers</h3>
+          <p>Workers run under <code>--network=none</code>. All traffic passes through the <b>Host Request Broker</b>, which enforces the scope allowlist, execution Tiers&nbsp;0–3 and RPS circuit breakers.</p>
+          <span class="ft"><span class="tag mono">--network=none</span><span class="tag mono">Tiers 0–3</span></span>
+        </li>
+        <li class="card">
+          <span class="fg"><i class="ico" data-i="shield"></i></span>
+          <h3>Opaque persona vault</h3>
+          <p>Run multi-user authorization tests (<code>bola_idor</code>) without ever exposing cookies or JWTs to the LLM. Personas stay sealed on the host; the model only sees a placeholder.</p>
+          <span class="ft"><span class="tag mono">bola_idor</span><span class="tag">sealed on host</span></span>
+        </li>
+        <li class="card">
+          <span class="fg"><i class="ico" data-i="replay"></i></span>
+          <h3>Grey-box + replay</h3>
+          <p>Read-only <code>/repos</code> mounts give agents code context. Confirmed findings carry a deterministic replay spec, and <b>Verify Fix</b> re-runs it as a retest with no LLM.</p>
+          <span class="ft"><span class="tag mono">/repos:ro</span><span class="tag accent">Verify fix</span></span>
+        </li>
+      </ul>
+      <p class="caption">Enforced by the host, not the prompt.</p>
+    </div>
+  </section>
+
+  <!-- ============================================================ PROOF -->
+  <section class="view" id="proof" aria-labelledby="proof-h">
+    <div class="wrap proof">
+      <div class="proof-copy">
+        <p class="eyebrow">Proof</p>
+        <h2 id="proof-h">Findings come with a <span class="mute">deterministic replay.</span></h2>
+        <p class="lede sm">A confirmed finding stores a replay spec: the recorded request, a control and a variant. In the finding inspector, <b>Verify fix</b> queues a retest that re-sends exactly that spec against your live origin. No model in the loop.</p>
+        <ul class="points">
+          <li><span data-glyph="complete"></span><span><b>Control vs. variant.</b> Same request; only the session differs.</span></li>
+          <li><span data-glyph="complete"></span><span><b>Sessions from the vault.</b> The broker injects them; agents see <code>[redacted:user_b]</code>.</span></li>
+          <li><span data-glyph="complete"></span><span><b>Zero LLM tokens on retest.</b> The verdict comes from the stored assertions.</span></li>
+        </ul>
       </div>
-      <nav class="tabs" aria-label="Sections">
-        <a href="#overview" data-nav="overview">Overview</a>
-        <a href="#proof" data-nav="proof">Proof</a>
-        <a href="#architecture" data-nav="architecture">Architecture</a>
-        <a href="#install" data-nav="install">Install</a>
-        <a href="#compare" data-nav="compare">Compare</a>
-        <a href="#faq" data-nav="faq">FAQ</a>
-      </nav>
-    </header>
 
-    <main id="main" tabindex="-1">
-      <!-- ============================================================ OVERVIEW -->
-      <section class="view" id="overview" aria-labelledby="hero-h">
-        <div class="wrap hero">
-          <div class="hero-tags">
-            <span class="tag accent"><span data-glyph="running"></span>Open-source AI security pentester</span>
-            <span class="tag">Self-hosted</span>
-            <span class="tag">Apache 2.0</span>
-          </div>
-          <div class="hero-top">
-          <h1 id="hero-h">Don’t just trust the AI, <span class="acc">verify.</span></h1>
-          <div class="hero-side">
-          <p class="lede">Kovo Hunter catches vulnerabilities before attackers do. It runs on your machine, stays locked to the apps you approve, and confirmed findings carry a deterministic replay you can re-run after you ship the fix.</p>
-          <div class="ctas">
-            <a class="btn primary lg" href="#install">Get started<i class="ico sm" data-i="arrowR"></i></a>
-            <a class="btn lg" href="https://github.com/kovo-sh/kovo-hunter" target="_blank" rel="noopener noreferrer"><i class="ico" data-i="globe"></i>GitHub<i class="ico sm dim" data-i="ext"></i></a>
-            <button type="button" class="btn ghost lg" data-act="report" aria-haspopup="dialog"><i class="ico" data-i="report"></i>Sample report</button>
-          </div>
-          <p class="hint">Press <span class="kgrp"><kbd class="kbd" data-mod>Ctrl</kbd><kbd class="kbd">K</kbd></span> to jump anywhere or copy the install command.</p>
-          </div>
-          </div>
-
-          <figure class="player" id="player">
-            <div class="player-h">
-              <i class="ico" data-i="replay"></i>
-              <span class="ph-t">Replay</span>
-              <span class="ph-s">Acme staging <span class="slash">/</span> Find cross-tenant data exposure</span>
-              <span class="sp"></span>
-              <span class="tag solid">Simulated data</span>
-              <span class="ph-d num">0:51</span>
-            </div>
-            <div class="player-b">
-              <iframe id="replay" title="Kovo Hunter replay, 51 seconds, simulated data: from scope approval to a fix re-verified by replay" data-src="replay/?embed=1&amp;paused=1" allow="clipboard-write"></iframe>
-              <noscript><p class="noscript">The replay needs JavaScript. <a href="replay/">Open it on its own page.</a></p></noscript>
-            </div>
-            <figcaption class="sr-only">A scripted replay of the Kovo Hunter run workspace: you approve the scope, the broker blocks an out-of-scope host, a confirmed finding shows its control vs. variant replay, and after the fix ships, Verify Fix re-runs the stored replay with no LLM.</figcaption>
-          </figure>
+      <div class="pane-wrap">
+      <div class="pane" aria-label="Sample finding inspector">
+        <div class="pane-h">
+          <span class="pt">Finding <span class="s">High · api.staging.acme.dev</span></span>
+          <span class="ibtn ghosty" aria-hidden="true"><i class="ico" data-i="chat"></i></span>
+          <span class="ibtn ghosty" aria-hidden="true"><i class="ico" data-i="close"></i></span>
         </div>
-
-        <div class="wrap why">
-          <h2>Self-hosted pentesting, <span class="mute">locked to your own software.</span></h2>
-          <p class="lede sm">Like ARTEX, Kovo Hunter gives you one self-hosted UI to run a pentest end to end. ARTEX is extremely powerful, but easy to misuse when you are protecting your own apps. Kovo Hunter makes it simple to lock testing to your apps and approved domains, so you don’t probe third-party hosts, mutate production data or leak test credentials.</p>
-
-          <div class="sheet flist" role="list" aria-label="Safety guarantees">
-            <div class="ghead" aria-hidden="true"><i class="ico sm" data-i="chev"></i><span data-glyph="confirmed"></span><span>Guarantees</span><span class="n">3</span><span class="sp"></span><span class="s">enforced by the host, not the prompt</span></div>
-            <div class="frow" role="listitem">
-              <span class="fg"><i class="ico" data-i="lock"></i></span>
-              <div class="fb">
-                <h3>Air-gapped workers</h3>
-                <p>Workers run under <code>--network=none</code>. All traffic passes through the <b>Host Request Broker</b>, which enforces the scope allowlist, execution Tiers&nbsp;0–3 and RPS circuit breakers.</p>
-              </div>
-              <span class="ft"><span class="tag mono">--network=none</span><span class="tag mono">Tiers 0–3</span></span>
+        <div class="pane-b">
+          <div class="ptags"><span class="tag"><span data-sev="high"></span>High</span><span class="tag accent" id="fi-tag"><span data-glyph="confirmed" id="fi-glyph"></span><span id="fi-st">Confirmed by replay</span></span></div>
+          <h3 class="ftitle">Cross-tenant invoice read via object ID</h3>
+          <dl class="props">
+            <dt>Origin</dt><dd class="mono">api.staging.acme.dev</dd>
+            <dt>Category</dt><dd>Access control</dd>
+            <dt>Weakness</dt><dd class="mono">CWE-639</dd>
+            <dt>Probe class</dt><dd class="mono">bola_idor</dd>
+          </dl>
+          <div class="psec">
+            <h4>What happened</h4>
+            <p><code>user_b</code> (Tenant B) read <code>user_a</code>’s invoice by changing only the object ID.</p>
+            <div class="cmp" role="table" aria-label="Replay steps">
+              <div class="cmp-r cmp-h" role="row"><span role="columnheader">Step</span><span role="columnheader">Session</span><span role="columnheader">Result</span></div>
+              <div class="cmp-r" role="row"><span role="cell">Control</span><span role="cell" class="mono">user_a</span><span role="cell"><span class="code2">200</span> owner’s invoice</span></div>
+              <div class="cmp-r" role="row" id="cmp-var"><span role="cell">Variant</span><span role="cell" class="mono">user_b</span><span role="cell" id="var-res"><span class="code2 bad">200</span> same body <span class="s">· expected 403/404</span></span></div>
             </div>
-            <div class="frow" role="listitem">
-              <span class="fg"><i class="ico" data-i="shield"></i></span>
-              <div class="fb">
-                <h3>Opaque persona vault</h3>
-                <p>Run multi-user authorization tests (<code>bola_idor</code>) without ever exposing cookies or JWTs to the LLM. Personas stay sealed on the host; the model only sees a placeholder.</p>
-              </div>
-              <span class="ft"><span class="tag mono">bola_idor</span><span class="tag">sealed on host</span></span>
+          </div>
+          <div class="psec">
+            <h4>How to fix &amp; verify</h4>
+            <p>Scope the invoice lookup to the caller’s tenant before returning the record.</p>
+            <div class="cloc"><i class="ico sm" data-i="node"></i><span class="f">src/routes/invoices.ts</span><span class="l">L44</span></div>
+            <div class="acts">
+              <button type="button" class="btn" id="verify"><i class="ico" data-i="replay"></i><span id="verify-l">Verify fix</span></button>
+              <button type="button" class="btn ghost" id="verify-reset" hidden>Reset sample</button>
+              <span class="s" id="verify-note">Sample finding · simulated</span>
             </div>
-            <div class="frow" role="listitem">
-              <span class="fg"><i class="ico" data-i="replay"></i></span>
-              <div class="fb">
-                <h3>Grey-box + replay</h3>
-                <p>Read-only <code>/repos</code> mounts give agents code context. Confirmed findings carry a deterministic replay spec, and <b>Verify Fix</b> re-runs it as a retest with no LLM.</p>
-              </div>
-              <span class="ft"><span class="tag mono">/repos:ro</span><span class="tag accent">Verify fix</span></span>
-            </div>
+            <div class="retests" id="retests" aria-live="polite"></div>
           </div>
         </div>
-      </section>
+      </div>
+      <p class="caption">Try <b>Verify fix</b> on the sample finding.</p>
+      </div>
+    </div>
+  </section>
 
-      <!-- ============================================================ PROOF -->
-      <section class="view" id="proof" aria-labelledby="proof-h">
-        <div class="vhead"><div class="wrap"><i class="ico" data-i="replay"></i><span class="vl">Proof</span><span class="sp"></span><span class="vr">Try Verify fix on the sample</span></div></div>
-        <div class="wrap proof">
-          <div class="proof-copy">
-            <h2 id="proof-h">Findings come with a <span class="mute">deterministic replay.</span></h2>
-            <p class="lede sm">A confirmed finding stores a replay spec: the recorded request, a control and a variant. In the finding inspector, <b>Verify fix</b> queues a retest that re-sends exactly that spec against your live origin. No model in the loop.</p>
-            <ul class="points">
-              <li><span data-glyph="complete"></span><span><b>Control vs. variant.</b> Same request; only the session differs.</span></li>
-              <li><span data-glyph="complete"></span><span><b>Sessions from the vault.</b> The broker injects them; agents see <code>[redacted:user_b]</code>.</span></li>
-              <li><span data-glyph="complete"></span><span><b>Zero LLM tokens on retest.</b> The verdict comes from the stored assertions.</span></li>
-            </ul>
+  <!-- ============================================================ ARCHITECTURE -->
+  <section class="view" id="architecture" aria-labelledby="arch-h">
+    <div class="wrap">
+      <p class="eyebrow">Architecture</p>
+      <h2 id="arch-h">Locked to your apps. <span class="mute brk">By design, not by prompt.</span></h2>
+
+      <figure class="strip" id="strip">
+        <figcaption class="sr-only">Three panels. Isolated: the worker container has no network, so a raw socket dies at its wall. Brokered: requests pass through the host broker, which swaps a persona placeholder for a sealed credential and returns a 200. Blocked: a request for a third-party host hits the scope wall and is stamped blocked.</figcaption>
+        <div class="panels">
+          <!-- 1 · ISOLATED -->
+          <div class="panel" tabindex="0" role="button" aria-label="Replay panel 1, Isolated">
+            <div class="panel-num"><b>01</b> worker<span class="again"><i class="ico sm" data-i="replay"></i></span></div>
+            <svg viewBox="0 0 320 200" aria-hidden="true">
+              <rect class="box dr" pathLength="1" x="10" y="30" width="156" height="132" rx="8" style="--d:0s;--dur:.6s" />
+              <text class="t-lbl fi" x="26" y="58" style="--d:.35s">WORKER</text>
+              <g class="fi" style="--d:.45s">
+                <rect class="chipset" x="70" y="80" width="36" height="36" rx="3" />
+                <path class="chipset" d="M79 80v-8M88 80v-8M97 80v-8M79 116v8M88 116v8M97 116v8M70 89h-8M70 98h-8M70 107h-8M106 89h8M106 98h8M106 107h8" />
+              </g>
+              <text class="t-sub fi" x="26" y="150" style="--d:.5s">net: none</text>
+              <path class="wire dr" pathLength="1" d="M166 98 H200" style="--d:.55s;--dur:.3s" />
+              <path class="wire-muted fi" d="M238 98 H254" style="--d:.7s" />
+              <g class="fi" style="--d:.7s">
+                <circle class="globe" cx="282" cy="98" r="24" />
+                <ellipse class="globe-l" cx="282" cy="98" rx="10" ry="24" />
+                <path class="globe-l" d="M258 98h48" />
+              </g>
+              <path class="cut pop tf" d="M206 82 L214 114 M220 82 L228 114" style="--d:.85s" />
+              <circle class="spark tf" cx="118" cy="98" r="7" style="--d:1.05s" />
+              <circle class="burst tf" cx="162" cy="98" r="7" style="--d:1.62s" />
+              <path class="xmark pop tf breathe" d="M152 179 l12 12 M164 179 l-12 12" style="--d:1.7s" />
+              <text class="t-sub t-bad fi" x="172" y="190" style="--d:1.75s">socket dropped</text>
+            </svg>
+            <h3>Isolated.</h3>
+            <p>No network, no sockets, no secrets.</p>
           </div>
 
-          <div class="pane" aria-label="Sample finding inspector">
-            <div class="pane-h">
-              <span class="pt">Finding <span class="s">High · api.staging.acme.dev</span></span>
-              <span class="ibtn ghosty" aria-hidden="true"><i class="ico" data-i="chat"></i></span>
-              <span class="ibtn ghosty" aria-hidden="true"><i class="ico" data-i="close"></i></span>
-            </div>
-            <div class="pane-b">
-              <div class="ptags"><span class="tag"><span data-sev="high"></span>High</span><span class="tag accent" id="fi-tag"><span data-glyph="confirmed" id="fi-glyph"></span><span id="fi-st">Confirmed by replay</span></span></div>
-              <h3 class="ftitle">Cross-tenant invoice read via object ID</h3>
-              <dl class="props">
-                <dt>Origin</dt><dd class="mono">api.staging.acme.dev</dd>
-                <dt>Category</dt><dd>Access control</dd>
-                <dt>Weakness</dt><dd class="mono">CWE-639</dd>
-                <dt>Probe class</dt><dd class="mono">bola_idor</dd>
-              </dl>
-              <div class="psec">
-                <h4>What happened</h4>
-                <p><code>user_b</code> (Tenant B) read <code>user_a</code>’s invoice by changing only the object ID.</p>
-                <div class="cmp" role="table" aria-label="Replay steps">
-                  <div class="cmp-r cmp-h" role="row"><span role="columnheader">Step</span><span role="columnheader">Session</span><span role="columnheader">Result</span></div>
-                  <div class="cmp-r" role="row"><span role="cell">Control</span><span role="cell" class="mono">user_a</span><span role="cell"><span class="code2">200</span> owner’s invoice</span></div>
-                  <div class="cmp-r" role="row" id="cmp-var"><span role="cell">Variant</span><span role="cell" class="mono">user_b</span><span role="cell" id="var-res"><span class="code2 bad">200</span> same body <span class="s">· expected 403/404</span></span></div>
-                </div>
-              </div>
-              <div class="psec">
-                <h4>How to fix &amp; verify</h4>
-                <p>Scope the invoice lookup to the caller’s tenant before returning the record.</p>
-                <div class="cloc"><i class="ico sm" data-i="node"></i><span class="f">src/routes/invoices.ts</span><span class="l">L44</span></div>
-                <div class="acts">
-                  <button type="button" class="btn" id="verify"><i class="ico" data-i="replay"></i><span id="verify-l">Verify fix</span></button>
-                  <button type="button" class="btn ghost" id="verify-reset" hidden>Reset sample</button>
-                  <span class="s" id="verify-note">Sample finding · simulated</span>
-                </div>
-                <div class="retests" id="retests" aria-live="polite"></div>
-              </div>
-            </div>
+          <!-- 2 · BROKERED -->
+          <div class="panel" tabindex="0" role="button" aria-label="Replay panel 2, Brokered">
+            <div class="panel-num"><b>02</b> broker<span class="again"><i class="ico sm" data-i="replay"></i></span></div>
+            <svg viewBox="0 0 320 200" aria-hidden="true">
+              <rect class="box dr" pathLength="1" x="8" y="66" width="68" height="56" rx="7" style="--dur:.4s" />
+              <text class="t-lbl mid fi" x="42" y="99" style="--d:.2s">AI</text>
+              <path class="wire dr" pathLength="1" d="M76 94 H126" style="--d:.2s;--dur:.25s" />
+              <path class="shield flash pop tf" d="M160 48 L196 62 V94 C196 120 181 136 160 146 C139 136 124 120 124 94 V62 Z" style="--d:.25s" />
+              <text class="t-lbl t-inv mid fi" x="160" y="99" style="--d:.4s">GATE</text>
+              <path class="wire dr" pathLength="1" d="M194 94 H244" style="--d:.4s;--dur:.25s" />
+              <rect class="box-ok dr" pathLength="1" x="244" y="66" width="68" height="56" rx="7" style="--d:.45s;--dur:.4s" />
+              <text class="t-lbl t-ok mid fi" x="278" y="99" style="--d:.6s">APP</text>
+              <g class="mv" style="--d:.7s;--dur:.45s;--from:-56px">
+                <rect class="pill-warn" x="46" y="12" width="108" height="28" rx="14" />
+                <text class="t-sub t-warn mid" x="100" y="31" style="font-weight:600">cookie: ??</text>
+              </g>
+              <g class="gh-chip tf" style="--d:1.15s">
+                <rect class="pill-warn" x="46" y="12" width="108" height="28" rx="14" />
+              </g>
+              <g class="mv" style="--d:1.35s;--dur:.45s;--from:-58px">
+                <rect class="pill-ok" x="172" y="12" width="100" height="28" rx="14" />
+                <g class="lock" transform="translate(184 17.5)">
+                  <path d="M3 7 V5 a4 4 0 0 1 8 0 V7" />
+                  <rect class="body" x="0.5" y="7" width="13" height="9" rx="1.5" />
+                </g>
+                <text class="t-sub t-onok" x="206" y="31" style="font-weight:600">sealed</text>
+              </g>
+              <path class="ret dr" pathLength="1" d="M278 122 V168 H42 V130 M34 138 L42 130 L50 138" style="--d:1.75s;--dur:.45s" />
+              <g class="pop tf breathe" style="--d:2.05s">
+                <rect class="pill-ret" x="112" y="154" width="96" height="28" rx="14" />
+                <text class="t-lbl t-ok mid" x="160" y="173.5">✓ 200</text>
+              </g>
+            </svg>
+            <h3 class="ok">Brokered.</h3>
+            <p>Every request checked. Credentials stay sealed.</p>
           </div>
-        </div>
-      </section>
 
-      <!-- ============================================================ ARCHITECTURE -->
-      <section class="view" id="architecture" aria-labelledby="arch-h">
-        <div class="vhead"><div class="wrap"><i class="ico" data-i="workflow"></i><span class="vl">Architecture</span><span class="n">3</span><span class="sp"></span><span class="vr" id="strip-note">Click a panel to replay</span></div></div>
-        <div class="wrap">
-          <h2 id="arch-h">Locked to your apps. <span class="mute brk">By design, not by prompt.</span></h2>
-
-          <figure class="strip" id="strip">
-            <figcaption class="sr-only">Three panels. Isolated: the worker container has no network, so a raw socket dies at its wall. Brokered: requests pass through the host broker, which swaps a persona placeholder for a sealed credential and returns a 200. Blocked: a request for a third-party host hits the scope wall and is stamped blocked.</figcaption>
-            <div class="panels">
-              <!-- 1 · ISOLATED -->
-              <div class="panel" tabindex="0" role="button" aria-label="Replay panel 1, Isolated">
-                <div class="panel-num"><b>01</b> worker<span class="again"><i class="ico sm" data-i="replay"></i></span></div>
-                <svg viewBox="0 0 320 200" aria-hidden="true">
-                  <rect class="box dr" pathLength="1" x="10" y="30" width="156" height="132" rx="8" style="--d:0s;--dur:.6s" />
-                  <text class="t-lbl fi" x="26" y="58" style="--d:.35s">WORKER</text>
-                  <g class="fi" style="--d:.45s">
-                    <rect class="chipset" x="70" y="80" width="36" height="36" rx="3" />
-                    <path class="chipset" d="M79 80v-8M88 80v-8M97 80v-8M79 116v8M88 116v8M97 116v8M70 89h-8M70 98h-8M70 107h-8M106 89h8M106 98h8M106 107h8" />
+          <!-- 3 · BLOCKED -->
+          <div class="panel" tabindex="0" role="button" aria-label="Replay panel 3, Blocked">
+            <div class="panel-num"><b>03</b> scope<span class="again"><i class="ico sm" data-i="replay"></i></span></div>
+            <svg viewBox="0 0 320 200" aria-hidden="true">
+              <path class="shield pop tf" d="M36 54 L62 64 V86 C62 104 51 115 36 122 C21 115 10 104 10 86 V64 Z" />
+              <text class="t-sub mid fi" x="36" y="144" style="--d:.2s">broker</text>
+              <path class="wire dr" pathLength="1" d="M62 88 H186" style="--d:.15s;--dur:.35s" />
+              <g class="fi" style="--d:.3s">
+                <rect class="wall" x="188" y="24" width="16" height="120" rx="2" />
+                <path class="hatch" d="M188 40 l16 -12 M188 60 l16 -12 M188 80 l16 -12 M188 100 l16 -12 M188 120 l16 -12 M188 140 l16 -12" />
+              </g>
+              <path class="wire-muted fi" d="M206 88 H238" style="--d:.4s" />
+              <g class="fi" style="--d:.4s">
+                <circle class="globe" cx="270" cy="88" r="30" />
+                <ellipse class="globe-l" cx="270" cy="88" rx="12" ry="30" />
+                <path class="globe-l" d="M240 88h60M245 73h50M245 103h50" />
+              </g>
+              <text class="t-sub mid fi" x="270" y="138" style="--d:.45s">3rd-party</text>
+              <g class="shake" style="--d:1.15s">
+                <g class="mv" style="--d:.55s;--dur:.6s;--from:-96px">
+                  <rect class="packet" x="160" y="78" width="24" height="20" rx="3" />
+                </g>
+              </g>
+              <g transform="translate(146 166)">
+                <g class="stamp-wrap">
+                  <g class="slam tf breathe" style="--d:1.35s">
+                    <rect class="stamp-box" x="-82" y="-22" width="164" height="44" rx="5" />
+                    <rect class="stamp-in" x="-76" y="-16" width="152" height="32" rx="3" />
+                    <text class="stamp-t mid" x="0" y="8" dx="3">BLOCKED</text>
                   </g>
-                  <text class="t-sub fi" x="26" y="150" style="--d:.5s">net: none</text>
-                  <path class="wire dr" pathLength="1" d="M166 98 H200" style="--d:.55s;--dur:.3s" />
-                  <path class="wire-muted fi" d="M238 98 H254" style="--d:.7s" />
-                  <g class="fi" style="--d:.7s">
-                    <circle class="globe" cx="282" cy="98" r="24" />
-                    <ellipse class="globe-l" cx="282" cy="98" rx="10" ry="24" />
-                    <path class="globe-l" d="M258 98h48" />
-                  </g>
-                  <path class="cut pop tf" d="M206 82 L214 114 M220 82 L228 114" style="--d:.85s" />
-                  <circle class="spark tf" cx="118" cy="98" r="7" style="--d:1.05s" />
-                  <circle class="burst tf" cx="162" cy="98" r="7" style="--d:1.62s" />
-                  <path class="xmark pop tf breathe" d="M152 179 l12 12 M164 179 l-12 12" style="--d:1.7s" />
-                  <text class="t-sub t-bad fi" x="172" y="190" style="--d:1.75s">socket dropped</text>
-                </svg>
-                <h3>Isolated.</h3>
-                <p>No network, no sockets, no secrets.</p>
-              </div>
-
-              <!-- 2 · BROKERED -->
-              <div class="panel" tabindex="0" role="button" aria-label="Replay panel 2, Brokered">
-                <div class="panel-num"><b>02</b> broker<span class="again"><i class="ico sm" data-i="replay"></i></span></div>
-                <svg viewBox="0 0 320 200" aria-hidden="true">
-                  <rect class="box dr" pathLength="1" x="8" y="66" width="68" height="56" rx="7" style="--dur:.4s" />
-                  <text class="t-lbl mid fi" x="42" y="99" style="--d:.2s">AI</text>
-                  <path class="wire dr" pathLength="1" d="M76 94 H126" style="--d:.2s;--dur:.25s" />
-                  <path class="shield flash pop tf" d="M160 48 L196 62 V94 C196 120 181 136 160 146 C139 136 124 120 124 94 V62 Z" style="--d:.25s" />
-                  <text class="t-lbl t-inv mid fi" x="160" y="99" style="--d:.4s">GATE</text>
-                  <path class="wire dr" pathLength="1" d="M194 94 H244" style="--d:.4s;--dur:.25s" />
-                  <rect class="box-ok dr" pathLength="1" x="244" y="66" width="68" height="56" rx="7" style="--d:.45s;--dur:.4s" />
-                  <text class="t-lbl t-ok mid fi" x="278" y="99" style="--d:.6s">APP</text>
-                  <g class="mv" style="--d:.7s;--dur:.45s;--from:-56px">
-                    <rect class="pill-warn" x="46" y="12" width="108" height="28" rx="14" />
-                    <text class="t-sub t-warn mid" x="100" y="31" style="font-weight:600">cookie: ??</text>
-                  </g>
-                  <g class="gh-chip tf" style="--d:1.15s">
-                    <rect class="pill-warn" x="46" y="12" width="108" height="28" rx="14" />
-                  </g>
-                  <g class="mv" style="--d:1.35s;--dur:.45s;--from:-58px">
-                    <rect class="pill-ok" x="172" y="12" width="100" height="28" rx="14" />
-                    <g class="lock" transform="translate(184 17.5)">
-                      <path d="M3 7 V5 a4 4 0 0 1 8 0 V7" />
-                      <rect class="body" x="0.5" y="7" width="13" height="9" rx="1.5" />
-                    </g>
-                    <text class="t-sub t-onok" x="206" y="31" style="font-weight:600">sealed</text>
-                  </g>
-                  <path class="ret dr" pathLength="1" d="M278 122 V168 H42 V130 M34 138 L42 130 L50 138" style="--d:1.75s;--dur:.45s" />
-                  <g class="pop tf breathe" style="--d:2.05s">
-                    <rect class="pill-ret" x="112" y="154" width="96" height="28" rx="14" />
-                    <text class="t-lbl t-ok mid" x="160" y="173.5">✓ 200</text>
-                  </g>
-                </svg>
-                <h3 class="ok">Brokered.</h3>
-                <p>Every request checked. Credentials stay sealed.</p>
-              </div>
-
-              <!-- 3 · BLOCKED -->
-              <div class="panel" tabindex="0" role="button" aria-label="Replay panel 3, Blocked">
-                <div class="panel-num"><b>03</b> scope<span class="again"><i class="ico sm" data-i="replay"></i></span></div>
-                <svg viewBox="0 0 320 200" aria-hidden="true">
-                  <path class="shield pop tf" d="M36 54 L62 64 V86 C62 104 51 115 36 122 C21 115 10 104 10 86 V64 Z" />
-                  <text class="t-sub mid fi" x="36" y="144" style="--d:.2s">broker</text>
-                  <path class="wire dr" pathLength="1" d="M62 88 H186" style="--d:.15s;--dur:.35s" />
-                  <g class="fi" style="--d:.3s">
-                    <rect class="wall" x="188" y="24" width="16" height="120" rx="2" />
-                    <path class="hatch" d="M188 40 l16 -12 M188 60 l16 -12 M188 80 l16 -12 M188 100 l16 -12 M188 120 l16 -12 M188 140 l16 -12" />
-                  </g>
-                  <path class="wire-muted fi" d="M206 88 H238" style="--d:.4s" />
-                  <g class="fi" style="--d:.4s">
-                    <circle class="globe" cx="270" cy="88" r="30" />
-                    <ellipse class="globe-l" cx="270" cy="88" rx="12" ry="30" />
-                    <path class="globe-l" d="M240 88h60M245 73h50M245 103h50" />
-                  </g>
-                  <text class="t-sub mid fi" x="270" y="138" style="--d:.45s">3rd-party</text>
-                  <g class="shake" style="--d:1.15s">
-                    <g class="mv" style="--d:.55s;--dur:.6s;--from:-96px">
-                      <rect class="packet" x="160" y="78" width="24" height="20" rx="3" />
-                    </g>
-                  </g>
-                  <g transform="translate(146 166)">
-                    <g class="stamp-wrap">
-                      <g class="slam tf breathe" style="--d:1.35s">
-                        <rect class="stamp-box" x="-82" y="-22" width="164" height="44" rx="5" />
-                        <rect class="stamp-in" x="-76" y="-16" width="152" height="32" rx="3" />
-                        <text class="stamp-t mid" x="0" y="8" dx="3">BLOCKED</text>
-                      </g>
-                    </g>
-                  </g>
-                </svg>
-                <h3 class="bad">Blocked.</h3>
-                <p>Out-of-scope hosts never get a packet.</p>
-              </div>
-            </div>
-          </figure>
-
-          <div class="facts" aria-label="Enforced at the host">
-            <span class="facts-l">Enforced at the host</span>
-            <span class="tag mono">--network=none</span>
-            <span class="tag">Scope allowlist + RPS</span>
-            <span class="tag">Tiers 0–3 policy gate</span>
-            <span class="tag">Opaque persona vault</span>
-            <span class="tag mono">/repos:ro</span>
+                </g>
+              </g>
+            </svg>
+            <h3 class="bad">Blocked.</h3>
+            <p>Out-of-scope hosts never get a packet.</p>
           </div>
         </div>
-      </section>
+      </figure>
 
-      <!-- ============================================================ INSTALL -->
-      <section class="view" id="install" aria-labelledby="install-h">
-        <div class="vhead"><div class="wrap"><i class="ico" data-i="download"></i><span class="vl">Install</span><span class="n">3</span><span class="sp"></span><span class="vr">About five minutes</span></div></div>
-        <div class="wrap">
-          <h2 id="install-h">Up and running in <span class="mute">three steps.</span></h2>
-          <ol class="steps">
-            <li class="step">
-              <span class="sn" aria-hidden="true">1</span>
-              <div class="sb">
-                <h3>Install</h3>
-                <p>Runs on any laptop or small VM (exe.dev, DigitalOcean, Hetzner, etc.) with one Docker command, or build from source so you can verify you’re running the exact audited code.</p>
-                <div class="seg" role="tablist" aria-label="Installation method">
-                  <button type="button" role="tab" id="tab-docker" aria-selected="true" aria-controls="pane-docker" data-install="docker">Docker</button>
-                  <button type="button" role="tab" id="tab-source" aria-selected="false" aria-controls="pane-source" data-install="source" tabindex="-1">Build from source</button>
-                </div>
-                <div class="ipane" id="pane-docker" role="tabpanel" aria-labelledby="tab-docker">
-                  <div class="code">
-                    <div class="code-h"><span class="dotname">Terminal</span><span class="sp"></span><button type="button" class="btn ghost sm" data-copy="docker" aria-label="Copy Docker install command"><i class="ico" data-i="copy"></i>Copy</button></div>
-                    <pre><span class="pr" aria-hidden="true">$ </span>docker run -p 8000:8000 -v kovo-data:/data ghcr.io/kovo-sh/kovo-hunter</pre>
-                  </div>
-                  <p class="note">Keeps run state in the <code>kovo-data</code> volume and opens the self-hosted UI at <code>http://localhost:8000</code>.</p>
-                </div>
-                <div class="ipane" id="pane-source" role="tabpanel" aria-labelledby="tab-source" hidden>
-                  <div class="code">
-                    <div class="code-h"><span class="dotname">Terminal</span><span class="sp"></span><button type="button" class="btn ghost sm" data-copy="source" aria-label="Copy build from source commands"><i class="ico" data-i="copy"></i>Copy</button></div>
-                    <pre><span class="pr" aria-hidden="true">$ </span>git clone https://github.com/kovo-sh/kovo-hunter.git
+      <p class="caption" id="strip-note">Click a panel to replay it.</p>
+      <div class="facts" aria-label="Enforced at the host">
+        <span class="facts-l">Enforced at the host</span>
+        <span class="tag mono">--network=none</span>
+        <span class="tag">Scope allowlist + RPS</span>
+        <span class="tag">Tiers 0–3 policy gate</span>
+        <span class="tag">Opaque persona vault</span>
+        <span class="tag mono">/repos:ro</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ INSTALL -->
+  <section class="view" id="install" aria-labelledby="install-h">
+    <div class="wrap">
+      <p class="eyebrow">Install</p>
+      <h2 id="install-h">Up and running in <span class="mute">three steps.</span></h2>
+      <p class="caption head-cap">About five minutes, start to first run.</p>
+      <ol class="steps">
+        <li class="step">
+          <span class="sn" aria-hidden="true">1</span>
+          <div class="sb">
+            <h3>Install</h3>
+            <p>Runs on any laptop or small VM (exe.dev, DigitalOcean, Hetzner, etc.) with one Docker command, or build from source so you can verify you’re running the exact audited code.</p>
+            <div class="seg" role="tablist" aria-label="Installation method">
+              <button type="button" role="tab" id="tab-docker" aria-selected="true" aria-controls="pane-docker" data-install="docker">Docker</button>
+              <button type="button" role="tab" id="tab-source" aria-selected="false" aria-controls="pane-source" data-install="source" tabindex="-1">Build from source</button>
+            </div>
+            <div class="ipane" id="pane-docker" role="tabpanel" aria-labelledby="tab-docker">
+              <div class="code">
+                <div class="code-h"><span class="dotname">Terminal</span><span class="sp"></span><button type="button" class="btn ghost sm" data-copy="docker" aria-label="Copy Docker install command"><i class="ico" data-i="copy"></i>Copy</button></div>
+                <pre><span class="pr" aria-hidden="true">$ </span>docker run -p 8000:8000 -v kovo-data:/data ghcr.io/kovo-sh/kovo-hunter</pre>
+              </div>
+              <p class="note">Keeps run state in the <code>kovo-data</code> volume and opens the self-hosted UI at <code>http://localhost:8000</code>.</p>
+            </div>
+            <div class="ipane" id="pane-source" role="tabpanel" aria-labelledby="tab-source" hidden>
+              <div class="code">
+                <div class="code-h"><span class="dotname">Terminal</span><span class="sp"></span><button type="button" class="btn ghost sm" data-copy="source" aria-label="Copy build from source commands"><i class="ico" data-i="copy"></i>Copy</button></div>
+                <pre><span class="pr" aria-hidden="true">$ </span>git clone https://github.com/kovo-sh/kovo-hunter.git
 <span class="pr" aria-hidden="true">$ </span>cd kovo-hunter &amp;&amp; npm ci &amp;&amp; npm run worker:build &amp;&amp; npm run build &amp;&amp; npm start</pre>
-                  </div>
-                  <p class="note">Requires Node.js 24+ and a local Docker daemon for isolated <code>--network=none</code> workers.</p>
-                </div>
               </div>
-            </li>
-            <li class="step">
-              <span class="sn" aria-hidden="true">2</span>
-              <div class="sb">
-                <h3>Set up AI inference</h3>
-                <p>Works with any <b>OpenAI-compatible</b> or <b>Anthropic</b> provider. The simplest and most cost-effective setup is an <b>OpenRouter</b> API key with <b>DeepSeek v4.1 Flash</b>.</p>
-                <div class="mcard">
-                  <div class="mcard-h"><i class="ico" data-i="sliders"></i><span>Model profile</span><span class="sp"></span><span class="tag accent">Recommended</span></div>
-                  <dl class="props">
-                    <dt>Provider</dt><dd>OpenRouter</dd>
-                    <dt>Model</dt><dd>DeepSeek v4.1 Flash <span class="s mono">deepseek/deepseek-v4.1-flash-1017</span></dd>
-                    <dt>Also works</dt><dd>Any OpenAI-compatible or Anthropic endpoint</dd>
-                  </dl>
-                </div>
-              </div>
-            </li>
-            <li class="step">
-              <span class="sn" aria-hidden="true">3</span>
-              <div class="sb">
-                <h3>Launch your first pentest</h3>
-                <p>From your website URL to a re-verified fix.</p>
-                <ol class="track">
-                  <li><span data-glyph="complete"></span><span>Paste your website URL</span></li>
-                  <li><span data-glyph="complete"></span><span>Approve the discovered domains</span></li>
-                  <li><span data-glyph="pending"></span><span>Optionally connect read-only GitHub repos and disposable test accounts</span></li>
-                  <li><span data-glyph="running"></span><span>Launch, then verify fixes</span></li>
-                </ol>
-              </div>
-            </li>
-          </ol>
-        </div>
-      </section>
-
-      <!-- ============================================================ COMPARE -->
-      <section class="view" id="compare" aria-labelledby="compare-h">
-        <div class="vhead"><div class="wrap"><i class="ico" data-i="list"></i><span class="vl">Compare</span><span class="n">4</span><span class="sp"></span><span class="vr">Kept fair on purpose</span></div></div>
-        <div class="wrap">
-          <h2 id="compare-h">How Kovo Hunter <span class="mute">compares.</span></h2>
-          <div class="sheet tbl-wrap">
-            <table class="cmpt">
-              <thead>
-                <tr>
-                  <th scope="col">Dimension</th>
-                  <th scope="col" class="me"><span class="me-h"><i class="mk sm" aria-hidden="true"></i>Kovo Hunter</span></th>
-                  <th scope="col">ARTEX</th>
-                  <th scope="col">Strix</th>
-                  <th scope="col">Classic DAST <span class="s">(ZAP / Nuclei)</span></th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr>
-                  <th scope="row">UI</th>
-                  <td class="me" data-l="Kovo Hunter">Self-hosted end-to-end management UI</td>
-                  <td data-l="ARTEX">Self-hosted web UI</td>
-                  <td data-l="Strix">CLI-first</td>
-                  <td data-l="Classic DAST">Desktop GUI (ZAP) / CLI (Nuclei)</td>
-                </tr>
-                <tr>
-                  <th scope="row">Safety / scoping</th>
-                  <td class="me" data-l="Kovo Hunter">Air-gapped worker, host broker, Tiers 0–3, opaque vault</td>
-                  <td data-l="ARTEX">Powerful red-team engine; easier to misuse on your own apps</td>
-                  <td data-l="Strix">Containerized; operator-managed safety</td>
-                  <td data-l="Classic DAST">Rule/template driven; manual auth and scope tuning</td>
-                </tr>
-                <tr>
-                  <th scope="row">Finding proof</th>
-                  <td class="me" data-l="Kovo Hunter">Zero-LLM replay proof + Verify Fix</td>
-                  <td data-l="ARTEX">Agent-generated PoCs and reports</td>
-                  <td data-l="Strix">Agent exploit scripts and PoCs</td>
-                  <td data-l="Classic DAST">Signature match; manual false-positive triage</td>
-                </tr>
-                <tr>
-                  <th scope="row">Grey-box context</th>
-                  <td class="me" data-l="Kovo Hunter">Full read-only <code>/repos</code> mounts</td>
-                  <td data-l="ARTEX">Primarily external / black-box</td>
-                  <td data-l="Strix">Source + dynamic hybrid</td>
-                  <td data-l="Classic DAST">Black-box HTTP only</td>
-                </tr>
-                <tr>
-                  <th scope="row">License</th>
-                  <td class="me" data-l="Kovo Hunter">Apache 2.0 (clean-room)</td>
-                  <td data-l="ARTEX">Open-source / source-available</td>
-                  <td data-l="Strix">Apache 2.0</td>
-                  <td data-l="Classic DAST">Apache 2.0 / MIT</td>
-                </tr>
-              </tbody>
-            </table>
+              <p class="note">Requires Node.js 24+ and a local Docker daemon for isolated <code>--network=none</code> workers.</p>
+            </div>
           </div>
-        </div>
-      </section>
-
-      <!-- ============================================================ FAQ -->
-      <section class="view" id="faq" aria-labelledby="faq-h">
-        <div class="vhead"><div class="wrap"><i class="ico" data-i="chat"></i><span class="vl">FAQ</span><span class="n">3</span></div></div>
-        <div class="wrap">
-          <h2 id="faq-h">Questions.</h2>
-          <div class="sheet faq">
-            <details open>
-              <summary><i class="ico chev" data-i="chev"></i><span>Is Kovo Hunter free? What are the restrictions?</span></summary>
-              <div class="ans">
-                <p>Free and open source under <b>Apache 2.0</b>: unlimited pentest runs across all your applications, and you pay us nothing.</p>
-              </div>
-            </details>
-            <details>
-              <summary><i class="ico chev" data-i="chev"></i><span>What is the Enterprise Edition?</span><span class="tag warn">In development</span></summary>
-              <div class="ans">
-                <p>For larger teams and organizations: SSO, configurable roles and RBAC, and scheduled routine pentest runs (for example weekly) with automated email and Slack reports. <a href="mailto:will@kovo.sh?subject=Kovo%20Hunter%20Enterprise">Contact us</a>.</p>
-              </div>
-            </details>
-            <details>
-              <summary><i class="ico chev" data-i="chev"></i><span>How does it compare to ARTEX, Strix and traditional scanners?</span></summary>
-              <div class="ans">
-                <p>See <a href="#compare">Compare</a> above. Kovo Hunter pairs ARTEX’s single self-hosted UI with defensive-first boundaries: air-gapped workers, broker-enforced scope tiers, an opaque persona vault, and deterministic zero-LLM replay verification.</p>
-              </div>
-            </details>
+        </li>
+        <li class="step">
+          <span class="sn" aria-hidden="true">2</span>
+          <div class="sb">
+            <h3>Set up AI inference</h3>
+            <p>Works with any <b>OpenAI-compatible</b> or <b>Anthropic</b> provider. The simplest and most cost-effective setup is an <b>OpenRouter</b> API key with <b>DeepSeek v4.1 Flash</b>.</p>
+            <div class="mcard">
+              <div class="mcard-h"><i class="ico" data-i="sliders"></i><span>Model profile</span><span class="sp"></span><span class="tag accent">Recommended</span></div>
+              <dl class="props">
+                <dt>Provider</dt><dd>OpenRouter</dd>
+                <dt>Model</dt><dd>DeepSeek v4.1 Flash <span class="s mono">deepseek/deepseek-v4.1-flash-1017</span></dd>
+                <dt>Also works</dt><dd>Any OpenAI-compatible or Anthropic endpoint</dd>
+              </dl>
+            </div>
           </div>
-
-          <div class="callout">
-            <i class="ico" data-i="flag"></i>
-            <div class="co-b"><b>Enterprise Edition (in development).</b> SSO, configurable roles and RBAC, and scheduled routine pentest runs with automated email and Slack reports.</div>
-            <a class="btn" href="mailto:will@kovo.sh?subject=Kovo%20Hunter%20Enterprise">Contact us</a>
+        </li>
+        <li class="step">
+          <span class="sn" aria-hidden="true">3</span>
+          <div class="sb">
+            <h3>Launch your first pentest</h3>
+            <p>From your website URL to a re-verified fix.</p>
+            <ol class="track">
+              <li><span data-glyph="complete"></span><span>Paste your website URL</span></li>
+              <li><span data-glyph="complete"></span><span>Approve the discovered domains</span></li>
+              <li><span data-glyph="pending"></span><span>Optionally connect read-only GitHub repos and disposable test accounts</span></li>
+              <li><span data-glyph="running"></span><span>Launch, then verify fixes</span></li>
+            </ol>
           </div>
-        </div>
-      </section>
-    </main>
+        </li>
+      </ol>
+    </div>
+  </section>
 
-    <footer class="foot">
-      <div class="wrap">
-        <div class="foot-top">
-          <span class="foot-brand"><i class="mk" aria-hidden="true"></i><b>Kovo Hunter</b></span>
-          <nav aria-label="Footer">
-            <a href="https://github.com/kovo-sh/kovo-hunter" target="_blank" rel="noopener noreferrer">GitHub</a>
-            <a href="https://github.com/kovo-sh/kovo-hunter/blob/main/LICENSE" target="_blank" rel="noopener noreferrer">Apache 2.0 license</a>
-            <a href="mailto:will@kovo.sh?subject=Kovo%20Hunter%20Enterprise">Enterprise contact</a>
-          </nav>
-        </div>
-        <p class="prov"><b>Provenance.</b> Clean-room Apache 2.0 implementation created by Will Chen (creator of Dyad, 22k+ GitHub stars, ex-Google Staff Software Engineer). Full English support today, with more languages coming soon.</p>
+  <!-- ============================================================ COMPARE -->
+  <section class="view" id="compare" aria-labelledby="compare-h">
+    <div class="wrap">
+      <p class="eyebrow">Compare</p>
+      <h2 id="compare-h">How Kovo Hunter <span class="mute">compares.</span></h2>
+      <div class="sheet tbl-wrap">
+        <table class="cmpt">
+          <thead>
+            <tr>
+              <th scope="col">Dimension</th>
+              <th scope="col" class="me"><span class="me-h"><i class="mk sm" aria-hidden="true"></i>Kovo Hunter</span></th>
+              <th scope="col">ARTEX</th>
+              <th scope="col">Strix</th>
+              <th scope="col">Classic DAST <span class="s">(ZAP / Nuclei)</span></th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <th scope="row">UI</th>
+              <td class="me" data-l="Kovo Hunter">Self-hosted end-to-end management UI</td>
+              <td data-l="ARTEX">Self-hosted web UI</td>
+              <td data-l="Strix">CLI-first</td>
+              <td data-l="Classic DAST">Desktop GUI (ZAP) / CLI (Nuclei)</td>
+            </tr>
+            <tr>
+              <th scope="row">Safety / scoping</th>
+              <td class="me" data-l="Kovo Hunter">Air-gapped worker, host broker, Tiers 0–3, opaque vault</td>
+              <td data-l="ARTEX">Powerful red-team engine; easier to misuse on your own apps</td>
+              <td data-l="Strix">Containerized; operator-managed safety</td>
+              <td data-l="Classic DAST">Rule/template driven; manual auth and scope tuning</td>
+            </tr>
+            <tr>
+              <th scope="row">Finding proof</th>
+              <td class="me" data-l="Kovo Hunter">Zero-LLM replay proof + Verify Fix</td>
+              <td data-l="ARTEX">Agent-generated PoCs and reports</td>
+              <td data-l="Strix">Agent exploit scripts and PoCs</td>
+              <td data-l="Classic DAST">Signature match; manual false-positive triage</td>
+            </tr>
+            <tr>
+              <th scope="row">Grey-box context</th>
+              <td class="me" data-l="Kovo Hunter">Full read-only <code>/repos</code> mounts</td>
+              <td data-l="ARTEX">Primarily external / black-box</td>
+              <td data-l="Strix">Source + dynamic hybrid</td>
+              <td data-l="Classic DAST">Black-box HTTP only</td>
+            </tr>
+            <tr>
+              <th scope="row">License</th>
+              <td class="me" data-l="Kovo Hunter">Apache 2.0 (clean-room)</td>
+              <td data-l="ARTEX">Open-source / source-available</td>
+              <td data-l="Strix">Apache 2.0</td>
+              <td data-l="Classic DAST">Apache 2.0 / MIT</td>
+            </tr>
+          </tbody>
+        </table>
       </div>
-    </footer>
-  </div>
-</div>
+      <p class="caption">Kept fair on purpose.</p>
+    </div>
+  </section>
 
-<!-- ================================================================ command palette -->
-<dialog class="dlg pal" id="palette" aria-label="Command palette">
-  <div class="pal-in">
-    <i class="ico" data-i="search"></i>
-    <input id="pal-q" type="text" placeholder="Jump to a section, or copy the install command…" autocomplete="off" spellcheck="false" aria-label="Search commands" aria-controls="pal-list" role="combobox" aria-expanded="true" />
-    <span class="pal-ctx">kovo-sh/kovo-hunter</span>
-  </div>
-  <div class="pal-list" id="pal-list" role="listbox" aria-label="Commands"></div>
-  <div class="pal-foot"><span><kbd class="kbd">↑</kbd><kbd class="kbd">↓</kbd> navigate</span><span><kbd class="kbd">↵</kbd> run</span><span><kbd class="kbd">esc</kbd> close</span></div>
-</dialog>
+  <!-- ============================================================ FAQ -->
+  <section class="view" id="faq" aria-labelledby="faq-h">
+    <div class="wrap">
+      <p class="eyebrow">FAQ</p>
+      <h2 id="faq-h">Questions.</h2>
+      <div class="sheet faq">
+        <details open>
+          <summary><i class="ico chev" data-i="chev"></i><span>Is Kovo Hunter free? What are the restrictions?</span></summary>
+          <div class="ans">
+            <p>Free and open source under <b>Apache 2.0</b>: unlimited pentest runs across all your applications, and you pay us nothing.</p>
+          </div>
+        </details>
+        <details>
+          <summary><i class="ico chev" data-i="chev"></i><span>What is the Enterprise Edition?</span><span class="tag warn">In development</span></summary>
+          <div class="ans">
+            <p>For larger teams and organizations: SSO, configurable roles and RBAC, and scheduled routine pentest runs (for example weekly) with automated email and Slack reports. <a href="mailto:will@kovo.sh?subject=Kovo%20Hunter%20Enterprise">Contact us</a>.</p>
+          </div>
+        </details>
+        <details>
+          <summary><i class="ico chev" data-i="chev"></i><span>How does it compare to ARTEX, Strix and traditional scanners?</span></summary>
+          <div class="ans">
+            <p>See <a href="#compare">Compare</a> above. Kovo Hunter pairs ARTEX’s single self-hosted UI with defensive-first boundaries: air-gapped workers, broker-enforced scope tiers, an opaque persona vault, and deterministic zero-LLM replay verification.</p>
+          </div>
+        </details>
+      </div>
 
-<!-- ================================================================ shortcuts -->
-<dialog class="dlg help" id="help" aria-labelledby="help-h">
-  <div class="help-h"><h2 id="help-h">Keyboard shortcuts</h2><button type="button" class="ibtn" data-close aria-label="Close"><i class="ico" data-i="close"></i></button></div>
-  <div class="help-g">
-    <div class="hr"><span>Command palette</span><span class="kgrp"><kbd class="kbd" data-mod>Ctrl</kbd><kbd class="kbd">K</kbd></span></div>
-    <div class="hr"><span>Command palette</span><span class="kgrp"><kbd class="kbd">/</kbd></span></div>
-    <div class="hr"><span>Go to a section</span><span class="kgrp"><kbd class="kbd">G</kbd><span class="then">then</span><kbd class="kbd">O</kbd><kbd class="kbd">P</kbd><kbd class="kbd">A</kbd><kbd class="kbd">I</kbd><kbd class="kbd">C</kbd><kbd class="kbd">F</kbd></span></div>
-    <div class="hr"><span>Toggle theme</span><span class="kgrp"><kbd class="kbd">⇧</kbd><kbd class="kbd">T</kbd></span></div>
-    <div class="hr"><span>Sample report</span><span class="kgrp"><kbd class="kbd">R</kbd></span></div>
-    <div class="hr"><span>This sheet</span><span class="kgrp"><kbd class="kbd">?</kbd></span></div>
-    <div class="hr"><span>Close overlay</span><span class="kgrp"><kbd class="kbd">Esc</kbd></span></div>
+      <div class="callout">
+        <i class="ico" data-i="flag"></i>
+        <div class="co-b"><b>Enterprise Edition (in development).</b> SSO, configurable roles and RBAC, and scheduled routine pentest runs with automated email and Slack reports.</div>
+        <a class="btn" href="mailto:will@kovo.sh?subject=Kovo%20Hunter%20Enterprise">Contact us</a>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer class="foot">
+  <div class="wrap">
+    <div class="foot-top">
+      <span class="foot-brand"><i class="mk" aria-hidden="true"></i><b>Kovo Hunter</b></span>
+      <nav aria-label="Footer">
+        <a href="https://github.com/kovo-sh/kovo-hunter" target="_blank" rel="noopener noreferrer">GitHub</a>
+        <button type="button" data-act="report" aria-haspopup="dialog">Sample report</button>
+        <a href="https://github.com/kovo-sh/kovo-hunter/blob/main/LICENSE" target="_blank" rel="noopener noreferrer">Apache 2.0 license</a>
+        <a href="mailto:will@kovo.sh?subject=Kovo%20Hunter%20Enterprise">Enterprise contact</a>
+      </nav>
+    </div>
+    <p class="prov"><b>Provenance.</b> Clean-room Apache 2.0 implementation created by Will Chen (creator of Dyad, 22k+ GitHub stars, ex-Google Staff Software Engineer). Full English support today, with more languages coming soon.</p>
   </div>
-</dialog>
+</footer>
 
 <!-- ================================================================ sample report -->
 <dialog class="dlg report" id="report" aria-labelledby="rep-h">

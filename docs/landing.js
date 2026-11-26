@@ -1,30 +1,25 @@
 // Kovo Hunter landing (lab). Plain JS, no deps.
-// Icons, glyphs and behaviours mirror src/components/run/{icons,glyphs,palette,toast,theme,keyboard}.tsx.
+// Icons, glyphs and behaviours mirror src/components/run/{icons,glyphs,toast,theme}.tsx.
 (() => {
   'use strict'
   const $ = (s, r = document) => r.querySelector(s)
   const $$ = (s, r = document) => [...r.querySelectorAll(s)]
   const root = document.documentElement
   const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches
-  const isMac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent)
 
   // ------------------------------------------------------------ icons (icons.tsx, 16px grid, 1.5 stroke)
   const P = {
-    search: '<circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5 14 14"/>',
-    overview: '<path d="M2.75 3.25h10.5M2.75 6.25h10.5M2.75 9.25h6.5M2.75 12.25h4.5"/>',
-    workflow: '<rect x="1.75" y="2.5" width="4" height="3.5" rx="1"/><rect x="10.25" y="2.5" width="4" height="3.5" rx="1"/><rect x="10.25" y="10" width="4" height="3.5" rx="1"/><path d="M5.75 4.25h4.5M5.75 4.25c2.5 0 2 7.5 4.5 7.5"/>',
-    report: '<path d="M4 1.75h5.25L12.25 4.75v9.5H4Z"/><path d="M9 1.75V5h3.25"/><path d="M6.25 8.25h3.5M6.25 10.75h3.5"/>',
+    menu: '<path d="M2.5 4.5h11M2.5 8h11M2.5 11.5h11"/>',
+    star: '<path d="M8 1.9l1.85 3.75 4.15.6-3 2.92.71 4.12L8 11.35 4.29 13.3 5 9.17 2 6.25l4.15-.6Z"/>',
     chat: '<path d="M2.75 3.25h10.5v7.5H7L4.25 13v-2.25h-1.5Z"/>',
+    report: '<path d="M4 1.75h5.25L12.25 4.75v9.5H4Z"/><path d="M9 1.75V5h3.25"/><path d="M6.25 8.25h3.5M6.25 10.75h3.5"/>',
     sun: '<circle cx="8" cy="8" r="2.75"/><path d="M8 1.5v1.5M8 13v1.5M1.5 8H3M13 8h1.5M3.4 3.4l1.06 1.06M11.54 11.54l1.06 1.06M3.4 12.6l1.06-1.06M11.54 4.46l1.06-1.06"/>',
     moon: '<path d="M13.25 9.5A5.5 5.5 0 0 1 6.5 2.75a5.5 5.5 0 1 0 6.75 6.75Z"/>',
-    keyboard: '<rect x="1.75" y="4" width="12.5" height="8" rx="1.5"/><path d="M4.5 6.75h.01M7 6.75h.01M9.5 6.75h.01M12 6.75h.01M5 9.5h6"/>',
     close: '<path d="M4 4l8 8M12 4l-8 8"/>',
     chev: '<path d="M4 6l4 4 4-4"/>',
-    chevR: '<path d="M6 4l4 4-4 4"/>',
     arrowR: '<path d="M3 8h10M9 4l4 4-4 4"/>',
     ext: '<path d="M6 3.5H3.5v9h9V10M9 3.5h3.5V7M12.5 3.5 7 9"/>',
     lock: '<rect x="3.25" y="7" width="9.5" height="6.75" rx="1.25"/><path d="M5.25 7V5a2.75 2.75 0 0 1 5.5 0v2"/>',
-    globe: '<circle cx="8" cy="8" r="6"/><path d="M2 8h12M8 2c1.75 1.75 2.5 3.75 2.5 6S9.75 12.25 8 14C6.25 12.25 5.5 10.25 5.5 8S6.25 3.75 8 2Z"/>',
     sliders: '<path d="M2.5 5h6M11.5 5h2M2.5 11h2M7.5 11h6"/><circle cx="10" cy="5" r="1.5"/><circle cx="6" cy="11" r="1.5"/>',
     check: '<path d="M3.5 8.5 6.5 11.5 12.5 4.5"/>',
     shield: '<path d="M8 1.75 13.25 4v4c0 3-2.25 5.25-5.25 6.25C5 13.25 2.75 11 2.75 8V4Z"/>',
@@ -33,11 +28,7 @@
     node: '<circle cx="8" cy="8" r="2.25"/><path d="M8 1.75v4M8 10.25v4M1.75 8h4M10.25 8h4"/>',
     alert: '<path d="M8 2.25 14.25 13H1.75Z"/><path d="M8 6.5v3M8 11.25v.01"/>',
     replay: '<path d="M2.75 8a5.25 5.25 0 1 0 1.6-3.78"/><path d="M2.5 2.5v3h3"/><path d="M7 6v4l3-2Z" fill="currentColor" stroke="none"/>',
-    list: '<path d="M5.5 4h8M5.5 8h8M5.5 12h8M2.5 4h.01M2.5 8h.01M2.5 12h.01"/>',
-    download: '<path d="M8 2.5v8M4.5 7 8 10.5 11.5 7M3 13.5h10"/>',
     copy: '<rect x="5.25" y="5.25" width="8.5" height="8.5" rx="1.25"/><path d="M3.25 10.75h-.5a1.25 1.25 0 0 1-1.25-1.25v-6.75A1.25 1.25 0 0 1 2.75 1.5h6.75a1.25 1.25 0 0 1 1.25 1.25v.5"/>',
-    play: '<path d="M5 3.25v9.5L12.5 8Z"/>',
-    pause: '<path d="M5.5 3.5v9M10.5 3.5v9"/>',
   }
   const icon = (name, cls = 'ico') => `<svg class="${cls}" viewBox="0 0 16 16" aria-hidden="true">${P[name] || ''}</svg>`
   const hydrateIcons = (scope = document) => $$('i[data-i]', scope).forEach(el => {
@@ -77,7 +68,6 @@
   hydrateIcons()
   hydrateGlyphs()
   $$('.mk').forEach(el => { el.innerHTML = MARK })
-  if (isMac) $$('[data-mod]').forEach(el => { el.textContent = '⌘' })
 
   // ------------------------------------------------------------ toasts (toast.tsx)
   const toastsEl = $('#toasts')
@@ -90,7 +80,7 @@
     const t = document.createElement('div')
     t.className = 'toast enter'
     const ms = opts.ms || (opts.undo ? 6000 : 2200)
-    t.innerHTML = `${opts.icon ? `<span class="ti">${icon(opts.icon)}</span>` : ''}<div class="tb"></div>${opts.undo ? `<button type="button" class="undo">Undo <span class="kbd">Z</span></button><i class="bar"></i>` : ''}`
+    t.innerHTML = `${opts.icon ? `<span class="ti">${icon(opts.icon)}</span>` : ''}<div class="tb"></div>${opts.undo ? `<button type="button" class="undo">Undo</button><i class="bar"></i>` : ''}`
     const tb = $('.tb', t)
     tb.textContent = message
     if (opts.sub) { const s = document.createElement('small'); s.textContent = opts.sub; tb.appendChild(s) }
@@ -143,8 +133,12 @@
   function applyTheme() {
     const th = resolved()
     root.dataset.theme = th
-    $$('.theme-lbl').forEach(el => { el.textContent = th === 'dark' ? 'Light' : 'Dark' })
-    $$('[data-act=theme] svg').forEach(svg => setIcon(svg, th === 'dark' ? 'sun' : 'moon'))
+    const next = th === 'dark' ? 'light' : 'dark'
+    $$('.theme-lbl').forEach(el => { el.textContent = th === 'dark' ? 'Light theme' : 'Dark theme' })
+    $$('[data-act=theme]').forEach(b => {
+      setIcon(b.querySelector('svg'), th === 'dark' ? 'sun' : 'moon')
+      if (!b.querySelector('.theme-lbl')) b.setAttribute('aria-label', 'Switch to ' + next + ' theme')
+    })
     postReplay({ type: 'theme', theme: th })
   }
   function toggleTheme() {
@@ -188,32 +182,14 @@
   }, { threshold: [0, 0.35, 0.6] }).observe(frame)
   document.addEventListener('visibilitychange', () => postReplay({ type: 'visible', on: heroVisible && !document.hidden }))
 
-  // ------------------------------------------------------------ header: scrolled state + run-line fit (header.tsx useFitRunline)
-  const hdr = $('#hdr')
-  const onScroll = () => hdr.classList.toggle('scrolled', window.scrollY > 40)
+  // ------------------------------------------------------------ top bar: solid once scrolled, scroll spy, mobile menu
+  const nav = $('#nav'), menuBtn = $('#nav-menu'), sheet = $('#nav-sheet')
+  const onScroll = () => nav.classList.toggle('scrolled', window.scrollY > 8)
   window.addEventListener('scroll', onScroll, { passive: true })
   onScroll()
-  const rl = $('#runline')
-  function fitRunline() {
-    const items = $$('.rl', rl).sort((a, b) => +a.dataset.p - +b.dataset.p)
-    items.forEach(i => { i.style.display = '' })
-    for (const it of items) { if (rl.scrollWidth <= rl.clientWidth + 1) break; it.style.display = 'none' }
-    const vis = $$('.rl', rl).filter(x => x.style.display !== 'none')
-    $$('.rl', rl).forEach(x => x.classList.toggle('last', x === vis[vis.length - 1]))
-  }
-  new ResizeObserver(fitRunline).observe(rl)
-  const setHdrH = () => root.style.setProperty('--hdr-h', Math.round($('.hdr-row').getBoundingClientRect().height + ($('.tabs').offsetHeight || 0)) + 'px')
-  window.addEventListener('resize', setHdrH)
-  setHdrH()
 
-  // ------------------------------------------------------------ scroll spy: rail + tabs + breadcrumb
-  const SECTIONS = [
-    ['overview', 'Overview', 'O', 'overview'], ['proof', 'Proof', 'P', 'replay'], ['architecture', 'Architecture', 'A', 'workflow'],
-    ['install', 'Install', 'I', 'download'], ['compare', 'Compare', 'C', 'list'], ['faq', 'FAQ', 'F', 'chat'],
-  ]
-  const crumb = $('#crumb-view')
-  const tabs = $('.tabs')
-  let active = ''
+  const SECTIONS = ['overview', 'proof', 'architecture', 'install', 'compare', 'faq']
+  let active = null
   function setActive(id) {
     if (id === active) return
     active = id
@@ -222,17 +198,10 @@
       a.classList.toggle('on', on)
       if (on) a.setAttribute('aria-current', 'location'); else a.removeAttribute('aria-current')
     })
-    const s = SECTIONS.find(x => x[0] === id)
-    if (s) crumb.textContent = s[1]
-    const tab = $(`.tabs [data-nav="${id}"]`)
-    if (tab && tabs.offsetParent !== null) {
-      const left = tab.offsetLeft - (tabs.clientWidth - tab.offsetWidth) / 2
-      tabs.scrollTo({ left: Math.max(0, left), behavior: reduce ? 'auto' : 'smooth' })
-    }
   }
-  const secEls = SECTIONS.map(s => document.getElementById(s[0]))
+  const secEls = SECTIONS.map(id => document.getElementById(id))
   function spy() {
-    const y = (parseFloat(getComputedStyle(root).getPropertyValue('--hdr-h')) || 50) + window.innerHeight * 0.3
+    const y = nav.offsetHeight + window.innerHeight * 0.3
     let cur = secEls[0]
     for (const el of secEls) if (el.getBoundingClientRect().top <= y) cur = el
     if (window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 4) cur = secEls[secEls.length - 1]
@@ -249,6 +218,33 @@
     history.replaceState(null, '', '#' + id)
     setActive(id)
   }
+
+  const menuOpen = () => !sheet.hidden
+  function setMenu(open, restoreFocus) {
+    if (open === menuOpen()) return
+    sheet.hidden = !open
+    nav.classList.toggle('menu-open', open)
+    menuBtn.setAttribute('aria-expanded', String(open))
+    menuBtn.setAttribute('aria-label', open ? 'Close menu' : 'Open menu')
+    setIcon(menuBtn.querySelector('svg'), open ? 'close' : 'menu')
+    if (open) { const first = $('a, button', sheet); if (first) first.focus() }
+    else if (restoreFocus) menuBtn.focus()
+  }
+  menuBtn.addEventListener('click', () => setMenu(!menuOpen()))
+  nav.addEventListener('keydown', e => {
+    if (!menuOpen()) return
+    if (e.key === 'Escape') { e.preventDefault(); setMenu(false, true); return }
+    if (e.key !== 'Tab') return
+    // keep focus inside the menu button + sheet while it is open
+    const f = [menuBtn, ...$$('a, button', sheet)]
+    const i = f.indexOf(document.activeElement)
+    if (e.shiftKey && i <= 0) { e.preventDefault(); f[f.length - 1].focus() }
+    else if (!e.shiftKey && i === f.length - 1) { e.preventDefault(); f[0].focus() }
+  })
+  // composedPath, not contains(): the menu icon is swapped mid-click, detaching the original target
+  document.addEventListener('click', e => { if (menuOpen() && !e.composedPath().includes(nav)) setMenu(false) })
+  $$('a', sheet).forEach(a => a.addEventListener('click', () => setMenu(false)))
+  matchMedia('(min-width: 901px)').addEventListener('change', e => { if (e.matches) setMenu(false) })
 
   // ------------------------------------------------------------ install tabs (Seg)
   const segBtns = $$('.seg [role=tab]')
@@ -272,7 +268,7 @@
   })
 
   // ------------------------------------------------------------ dialogs
-  const pal = $('#palette'), help = $('#help'), report = $('#report')
+  const report = $('#report')
   let lastFocus = null
   function openDlg(d) {
     if (d.open) return
@@ -286,74 +282,10 @@
     $$('[data-close]', d).forEach(b => b.addEventListener('click', () => d.close()))
   })
 
-  // ------------------------------------------------------------ command palette (palette.tsx)
-  const q = $('#pal-q'), list = $('#pal-list')
-  const COMMANDS = [
-    ...SECTIONS.map(([id, label, k, ic]) => ({ id: 'v-' + id, section: 'Sections', label, icon: ic, keys: ['G', k], run: () => go(id) })),
-    { id: 'copy-docker', section: 'Actions', label: 'Copy the Docker command', icon: 'copy', right: 'docker run …', run: () => copyCmd('docker') },
-    { id: 'copy-source', section: 'Actions', label: 'Copy the build-from-source commands', icon: 'copy', right: 'git clone …', run: () => copyCmd('source') },
-    { id: 'replay', section: 'Actions', label: 'Play or pause the replay', icon: 'play', run: () => { go('overview'); setTimeout(() => postReplay({ type: 'toggle' }), reduce ? 0 : 450) } },
-    { id: 'report', section: 'Actions', label: 'Open the sample report', icon: 'report', keys: ['R'], run: () => openDlg(report) },
-    { id: 'verify', section: 'Actions', label: 'Try Verify fix on the sample finding', icon: 'replay', run: () => { go('proof'); setTimeout(() => $('#verify').focus({ preventScroll: true }), reduce ? 0 : 600) } },
-    { id: 'theme', section: 'Actions', label: 'Toggle light / dark theme', icon: 'moon', keys: ['⇧', 'T'], run: toggleTheme },
-    { id: 'help', section: 'Actions', label: 'Keyboard shortcuts', icon: 'keyboard', keys: ['?'], run: () => openDlg(help) },
-    { id: 'gh', section: 'Links', label: 'GitHub · kovo-sh/kovo-hunter', icon: 'globe', right: 'github.com', run: () => window.open('https://github.com/kovo-sh/kovo-hunter', '_blank', 'noopener') },
-    { id: 'license', section: 'Links', label: 'Apache 2.0 license', icon: 'report', run: () => window.open('https://github.com/kovo-sh/kovo-hunter/blob/main/LICENSE', '_blank', 'noopener') },
-    { id: 'ent', section: 'Links', label: 'Contact us about Enterprise Edition', icon: 'shield', right: 'email', run: () => { location.href = 'mailto:will@kovo.sh?subject=Kovo%20Hunter%20Enterprise' } },
-  ]
-  let items = [], cur = 0
-  const esc = s => s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]))
-  const hi = (label, query) => {
-    if (!query) return esc(label)
-    const i = label.toLowerCase().indexOf(query.split(/\s+/)[0])
-    return i < 0 ? esc(label) : esc(label.slice(0, i)) + '<mark>' + esc(label.slice(i, i + query.split(/\s+/)[0].length)) + '</mark>' + esc(label.slice(i + query.split(/\s+/)[0].length))
-  }
-  function renderPal() {
-    const query = q.value.trim().toLowerCase()
-    const toks = query.split(/\s+/).filter(Boolean)
-    items = COMMANDS.filter(c => toks.every(t => (c.label + ' ' + c.section + ' ' + (c.right || '')).toLowerCase().includes(t)))
-    if (query) items.sort((a, b) => (a.label.toLowerCase().startsWith(toks[0]) ? 0 : 1) - (b.label.toLowerCase().startsWith(toks[0]) ? 0 : 1))
-    cur = Math.min(cur, Math.max(0, items.length - 1))
-    if (!items.length) { list.innerHTML = `<div class="pal-empty">No matches for “${esc(q.value)}”</div>`; q.removeAttribute('aria-activedescendant'); return }
-    let last = ''
-    const order = ['Sections', 'Actions', 'Links']
-    if (!query) items.sort((a, b) => order.indexOf(a.section) - order.indexOf(b.section))
-    list.innerHTML = items.map((c, i) => {
-      const head = c.section !== last && !query ? `<div class="pal-sec" role="presentation">${c.section}</div>` : ''
-      last = c.section
-      const right = c.keys ? `<span class="kgrp">${c.keys.map(k => `<kbd class="kbd">${k}</kbd>`).join('')}</span>` : c.right ? `<span class="rt">${esc(c.right)}</span>` : ''
-      return `${head}<div class="pal-it" id="pal-${c.id}" role="option" aria-selected="${i === cur}" data-i="${i}">${icon(c.icon)}<span class="lbl">${hi(c.label, query)}</span>${right}</div>`
-    }).join('')
-    q.setAttribute('aria-activedescendant', 'pal-' + items[cur].id)
-  }
-  function moveSel(d) {
-    if (!items.length) return
-    cur = (cur + d + items.length) % items.length
-    $$('.pal-it', list).forEach((el, i) => el.setAttribute('aria-selected', String(i === cur)))
-    const el = $$('.pal-it', list)[cur]
-    q.setAttribute('aria-activedescendant', el.id)
-    el.scrollIntoView({ block: 'nearest' })
-  }
-  function runSel(i) { const c = items[i]; if (!c) return; pal.close(); c.run() }
-  function openPalette() { q.value = ''; cur = 0; renderPal(); openDlg(pal); q.focus() }
-  q.addEventListener('input', () => { cur = 0; renderPal() })
-  q.addEventListener('keydown', e => {
-    if (e.key === 'ArrowDown' || (e.ctrlKey && e.key === 'n')) { e.preventDefault(); moveSel(1) }
-    else if (e.key === 'ArrowUp' || (e.ctrlKey && e.key === 'p')) { e.preventDefault(); moveSel(-1) }
-    else if (e.key === 'Enter') { e.preventDefault(); runSel(cur) }
-  })
-  list.addEventListener('mousemove', e => {
-    const it = e.target.closest('.pal-it'); if (!it) return
-    const i = +it.dataset.i; if (i !== cur) { cur = i; $$('.pal-it', list).forEach((el, j) => el.setAttribute('aria-selected', String(j === cur))) }
-  })
-  list.addEventListener('click', e => { const it = e.target.closest('.pal-it'); if (it) runSel(+it.dataset.i) })
-
   // ------------------------------------------------------------ action buttons
   $$('[data-act]').forEach(b => b.addEventListener('click', () => {
     const a = b.dataset.act
-    if (a === 'palette') openPalette()
-    else if (a === 'help') openDlg(help)
-    else if (a === 'report') openDlg(report)
+    if (a === 'report') openDlg(report)
     else if (a === 'theme') toggleTheme()
   }))
   $$('a[href^="#"]').forEach(a => a.addEventListener('click', e => {
@@ -363,25 +295,6 @@
     go(id)
     if (id === 'main') document.getElementById('main').focus({ preventScroll: true })
   }))
-
-  // ------------------------------------------------------------ keyboard (keyboard.tsx layering, simplified)
-  let gAt = 0
-  document.addEventListener('keydown', e => {
-    const typing = e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement || e.target.isContentEditable
-    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); pal.open ? pal.close() : openPalette(); return }
-    if (typing || e.metaKey || e.ctrlKey || e.altKey) return
-    if ($('dialog[open]')) return
-    if (e.key === '/') { e.preventDefault(); openPalette() }
-    else if (e.key === '?') { e.preventDefault(); openDlg(help) }
-    else if (e.key === 'T' && e.shiftKey) { e.preventDefault(); toggleTheme() }
-    else if (e.key === 'z' || e.key === 'Z') { if (undoPending()) e.preventDefault() }
-    else if (e.key === 'g' || e.key === 'G') { gAt = Date.now() }
-    else if (Date.now() - gAt < 1200) {
-      const s = SECTIONS.find(x => x[2] === e.key.toUpperCase())
-      gAt = 0
-      if (s) { e.preventDefault(); go(s[0]) }
-    } else if (e.key === 'r' || e.key === 'R') { openDlg(report) }
-  })
 
   // ------------------------------------------------------------ Verify fix demo (findings-inspector.tsx FixVerifyActions)
   const vBtn = $('#verify'), vLbl = $('#verify-l'), vReset = $('#verify-reset'), vNote = $('#verify-note'), retests = $('#retests')
@@ -471,5 +384,4 @@
   })()
 
   applyTheme()
-  fitRunline()
 })()
