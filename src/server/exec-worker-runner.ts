@@ -59,7 +59,6 @@ import {
   percentile,
   providerStallAbortMs,
   resolveWorkerSettlementMs,
-  secretGenerationFingerprint,
   selectAssignmentBolaQueueItems,
   shouldRetryStalledAssignment,
   type AssignmentBudget,
@@ -100,9 +99,103 @@ import type {
   Run,
 } from './store.ts'
 import { probeDifferential, probeSurface } from './surface-engine.ts'
-import type { WorkerBackend } from './worker-backend.ts'
+import { buildWarmPoolPolicy, type WorkerBackend } from './worker-backend.ts'
 
 type Active = ExecActiveJob
+
+/** Output-size threshold above which `derive_evidence` persists a SQLite `artifacts` row (matches 12 KiB spill threshold). */
+export const DERIVE_EVIDENCE_PERSIST_THRESHOLD_BYTES = 12 * 1024
+
+/** Bounded verify-grace bounds applied when an active proof call is running at `wallClockMs`. */
+export const DEFAULT_VERIFY_GRACE_MIN_MS = 20_000
+export const DEFAULT_VERIFY_GRACE_MAX_MS = 45_000
+/** Bounded settlement-stream grace cap when a worker already entered settlement and is mid-generation at `wallClockMs`. */
+export const DEFAULT_SETTLEMENT_VERIFY_GRACE_MAX_MS = 20_000
+const SHORT_WALL_CLOCK_THRESHOLD_MS = 20_000
+const SETTLEMENT_LEAD_THRESHOLD_MS = 45_000
+const PROOF_HANDOFF_GRACE_MS = 400
+
+/**
+ * Decide whether a `derive_evidence` shell call warrants inserting a SQLite `artifacts` row.
+ * Ephemeral shell reads (`ls`, `head`, `rg`, `cat`) with small stdout and no materialized `/work/*`
+ * output files skip SQLite persistence to eliminate thousands of write-amplifying rows per run.
+ */
+export function shouldPersistDeriveEvidenceArtifact(input: {
+  outputs?: Record<string, string>
+  stdout?: string
+  stderr?: string
+  explicitPersist?: boolean
+}): boolean {
+  if (input.explicitPersist) return true
+  if (input.outputs && Object.values(input.outputs).some(v => typeof v === 'string' && v.trim().length > 0)) {
+    return true
+  }
+  const combinedBytes = Buffer.byteLength(input.stdout ?? '', 'utf8') + Buffer.byteLength(input.stderr ?? '', 'utf8')
+  return combinedBytes > DERIVE_EVIDENCE_PERSIST_THRESHOLD_BYTES
+}
+
+export interface WorkerWallClockPlan {
+  remainingBudgetMs: number
+  effectiveSettlementMs: number
+  verifyGraceMs: number
+  settlementStreamGraceMs: number
+}
+
+/**
+ * Compute bounded wall-clock settlement and verify-grace windows for an investigation worker.
+ *
+ * - Normal production budgets (>= 20s) receive a 20s–45s verify grace for in-flight proof calls
+ *   (`kovo_verify` / `verify_replay_spec` / `propose_chain_finding`) plus a bounded 10s–20s
+ *   settlement-stream grace if the worker has already entered settlement and is actively generating
+ *   its final verification call.
+ * - Short test budgets (< 20s) preserve fast proportional scaling with zero settlement-stream
+ *   extension so unit/integration rotation tests stay strictly bounded.
+ */
+export function computeWorkerWallClockPlan(input: {
+  wallClockMs: number
+  preSessionElapsedMs?: number
+  explicitSettlementMs?: number
+  isMultiHop?: boolean
+}): WorkerWallClockPlan {
+  const wallClockMs = Math.max(1, Math.floor(input.wallClockMs))
+  const preSessionElapsedMs = Math.max(0, Math.floor(input.preSessionElapsedMs ?? 0))
+  const remainingBudgetMs = Math.max(1, wallClockMs - preSessionElapsedMs)
+  const isMultiHop = Boolean(input.isMultiHop)
+
+  const baseSettlementMs = isMultiHop
+    ? resolveWorkerSettlementMs(wallClockMs, true)
+    : wallClockSettlementMs(wallClockMs)
+  const effectiveSettlementMs = input.explicitSettlementMs !== undefined
+    ? Math.max(1, Math.floor(input.explicitSettlementMs))
+    : wallClockMs >= SETTLEMENT_LEAD_THRESHOLD_MS
+      ? Math.max(1, Math.min(baseSettlementMs, Math.floor(wallClockMs * 0.75)))
+      : baseSettlementMs
+
+  if (remainingBudgetMs < SHORT_WALL_CLOCK_THRESHOLD_MS) {
+    return {
+      remainingBudgetMs,
+      effectiveSettlementMs,
+      verifyGraceMs: Math.min(5_000, Math.max(25, Math.floor(remainingBudgetMs * 0.25))),
+      settlementStreamGraceMs: 0,
+    }
+  }
+
+  const verifyShare = isMultiHop ? 0.30 : 0.25
+  const verifyGraceMs = Math.min(
+    DEFAULT_VERIFY_GRACE_MAX_MS,
+    Math.max(DEFAULT_VERIFY_GRACE_MIN_MS, Math.round(remainingBudgetMs * verifyShare)),
+  )
+  const settlementStreamGraceMs = Math.min(
+    DEFAULT_SETTLEMENT_VERIFY_GRACE_MAX_MS,
+    Math.max(10_000, Math.round(remainingBudgetMs * 0.20)),
+  )
+  return {
+    remainingBudgetMs,
+    effectiveSettlementMs,
+    verifyGraceMs,
+    settlementStreamGraceMs,
+  }
+}
 
 function stripUntrustedReplayEnvelopes(rawSpec: unknown): unknown {
   if (!rawSpec || typeof rawSpec !== 'object' || Array.isArray(rawSpec)) return rawSpec
@@ -374,6 +467,14 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
       derive_evidence: async ({ command, outputs, timeoutMs }: Parameters<NonNullable<WorkerToolHandlers['derive_evidence']>>[0], sig: AbortSignal) => {
         const curRun = this.host.check(job)
         const res = await session.exec(command, outputs ?? ['result.txt'], sig, timeoutMs ?? 60_000)
+        const shouldPersist = shouldPersistDeriveEvidenceArtifact({
+          outputs: res.outputs,
+          stdout: res.stdout,
+          stderr: res.stderr,
+        })
+        if (!shouldPersist) {
+          return { exitCode: res.exitCode, stdout: res.stdout, stderr: res.stderr, outputs: res.outputs, ephemeral: true }
+        }
         const sec = currentSecrets()
         const ev = this.storage.addArtifact(curRun, job.assignment, 'analysis', options.deriveEvidenceTitle,
           JSON.stringify({
@@ -627,21 +728,26 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
     const permittedAtAdmission = this.host.approvedOriginsSet(run)
     const { grant, secrets, currentSecrets } = this.host.buildGrant(job, run, permittedAtAdmission)
 
-    // Warm-pool policy: run identity + persona credential generation. A rotation (or a new run or
-    // tenant) retires the pool instead of handing an older container to this assignment.
-    const generations = (grant.personas ? [...grant.personas.keys()] : []).sort().map(handle =>
-      `${handle}:${this.host.personaAuth.sessions.generation(handle, run.id)}`)
-    const secretEpoch = secretGenerationFingerprint(generations)
+    // Warm-pool policy: strictly keyed on container-visible isolation state (run identity +
+    // mounted repo tree + worker image). Docker worker containers run `--network none` and never
+    // hold host-side persona credentials, so background persona token refreshes never tear down
+    // idle warm containers or re-stage `/repos`.
+    const { reposDir, mountedRepos } = this.host.projectReposMount(run.projectId)
+    const warmPoolPolicy = buildWarmPoolPolicy({
+      runId: run.id,
+      reposDir,
+      mountedRepos,
+      image: this.backend.workerImage,
+    })
+    const isolationEpoch = warmPoolPolicy.slice(warmPoolPolicy.lastIndexOf(':') + 1)
     const priorEpoch = this.host.warmSecretEpochByRun.get(run.id)
-    if (priorEpoch !== undefined && priorEpoch !== secretEpoch) {
+    if (priorEpoch !== undefined && priorEpoch !== isolationEpoch) {
       this.host.warmPoolPolicyRotationsByRun.set(run.id, (this.host.warmPoolPolicyRotationsByRun.get(run.id) ?? 0) + 1)
-      this.host.safeEvent(run.id, 'worker.warm_pool_rotated', 'Credential generation changed; rebuilding idle warm containers.', {
-        assignmentId: job.assignment.id, stepId: step.id, previous: priorEpoch, next: secretEpoch,
+      this.host.safeEvent(run.id, 'worker.warm_pool_rotated', 'Container isolation policy changed; rebuilding idle warm containers.', {
+        assignmentId: job.assignment.id, stepId: step.id, previous: priorEpoch, next: isolationEpoch,
       })
     }
-    const warmPoolPolicy = `${run.id}:${secretEpoch}`
-    const { reposDir, mountedRepos } = this.host.projectReposMount(run.projectId)
-    this.host.warmSecretEpochByRun.set(run.id, secretEpoch)
+    this.host.warmSecretEpochByRun.set(run.id, isolationEpoch)
     try {
       this.backend.setWarmPoolPolicy?.(
         warmPoolPolicy,
@@ -735,6 +841,19 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
     )
     const sessionSealedCapHandles: string[] = []
     let confirmedDuringAssignment = false
+    let inFlightProofCalls = 0
+    let onProofCallEnter: (() => void) | undefined
+    let onProofCallExit: (() => void) | undefined
+    const trackProofCall = async <T>(fn: () => Promise<T>): Promise<T> => {
+      inFlightProofCalls += 1
+      try { onProofCallEnter?.() } catch { /* advisory */ }
+      try {
+        return await fn()
+      } finally {
+        inFlightProofCalls = Math.max(0, inFlightProofCalls - 1)
+        try { onProofCallExit?.() } catch { /* advisory */ }
+      }
+    }
 
     try {
       const stagedSpecs = await this.host.stageProjectSpecs(run.projectId, session, job.controller.signal)
@@ -851,9 +970,11 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
         replaySpecId?: string,
         deferredCandidate?: InlineDeferredFindingCandidate,
       ) =>
-        this.host.executeInlineVerification({
-          job, grant, currentSecrets, reposDir, spec, findingId, replaySpecId, deferredCandidate, onExchangeObserved: trackPersonaResources,
-        })
+        trackProofCall(() =>
+          this.host.executeInlineVerification({
+            job, grant, currentSecrets, reposDir, spec, findingId, replaySpecId, deferredCandidate, onExchangeObserved: trackPersonaResources,
+          }),
+        )
       const makeTrackedExchangeRecorder = (curRun: Run) =>
         createExchangeRecorder(this.storage, () => curRun, job.assignment.id, currentSecrets, {
           onSaved: (r, e, id) => {
@@ -1677,7 +1798,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
           }
         },
 
-        verify_replay_spec: async (args) => {
+        verify_replay_spec: async (args) => trackProofCall(async () => {
           const spec = args.spec ?? args.replaySpec
           if (!spec) throw new Error('verify_replay_spec requires spec or replaySpec.')
           const inline = await verifyInline(spec, args.findingId, args.replaySpecId)
@@ -1691,10 +1812,10 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
             ...(inline.verificationTier ? { verificationTier: inline.verificationTier } : {}),
             inlineVerifyFeedback: inline.feedback,
           }
-        },
+        }),
 
         ...(this.host.verifier.backendSupportsVerifyScript() ? {
-          kovo_verify: async (args: KovoVerifyArgs) => {
+          kovo_verify: async (args: KovoVerifyArgs, toolSignal?: AbortSignal) => trackProofCall(async () => {
             const curRun = this.host.check(job)
             const rawRuntime = args.runtime as string | undefined
             if (
@@ -1714,6 +1835,9 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
             }
             const approved = this.host.approvedOriginsSet(curRun)
             const runVault = this.host.capabilityVaultFor(curRun.id)
+            const verifySignal = toolSignal
+              ? AbortSignal.any([job.controller.signal, toolSignal])
+              : job.controller.signal
             const proof = await this.host.verifier.runAgentScriptProof({
               script,
               runtime,
@@ -1722,7 +1846,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
               runId: curRun.id,
               assignmentId: job.assignment.id,
               targetOrigins: [...approved].slice(0, 8),
-              signal: job.controller.signal,
+              signal: verifySignal,
               capabilityVault: runVault,
               ...(args.timeoutMs ? { timeoutMs: args.timeoutMs } : {}),
             })
@@ -1776,7 +1900,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
               detail: `${proof.verdict.detail} Finding ${persisted.findingId} cites ${persisted.receiptId ? `ProofReceipt ${persisted.receiptId}` : 'the persisted script proof'} (replay spec ${persisted.replaySpecId}).`
                 .trim(),
             })
-          },
+          }),
         } : {}),
 
         suggest_candidate_host: async ({ origin, source, thirdParty }) => {
@@ -1841,8 +1965,6 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
       })
       const hasHopCheckpoint = Boolean(assignmentBrief && /\b(?:hopCheckpoint|cap:hop_|doNotRediscover)\b/.test(assignmentBrief))
       const isMultiHopStep = hasHopCheckpoint || isMultiHopChainStep(step)
-      const effectiveSettlementMs = budget.wallClockSettlementMs
-        ?? (isMultiHopStep ? resolveWorkerSettlementMs(budget.wallClockMs, true) : wallClockSettlementMs(budget.wallClockMs))
       const preInjectedSkills = selectPreInjectionSkills({
         profileSkills: specialistConfig.skills,
         techTags: [...new Set(techTags)],
@@ -1863,127 +1985,271 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
       })
 
       clearPreSessionTimer()
-      const remainingWallClockMs = Math.max(1, budget.wallClockMs - assignmentClock.activeElapsedMs())
-      const sessionResult = await runAgentSession({
-        directory: this.storage.directory,
-        sessionId: job.assignment.sessionId,
-        requestId: `investigate:${step.id}:attempt-${job.assignment.attempt}`,
-        profiles: resolveProfilePoolForRole(specialistConfig.roleAffinity, profiles),
-        scenario: 'worker-investigation',
-        roleAffinity: specialistConfig.roleAffinity,
-        prompt: workerInvestigationPrompt({
-          goal: run.goal,
-          step: {
-            id: step.id, title: step.title, hypothesis: step.hypothesis,
-            category: step.category, skills: [...new Set([...step.skills, ...specialistConfig.skills])],
-            specialistProfile: specialistProfileId,
-          },
-          origins: targetOrigins,
-          capabilityTier: run.capabilityTier,
-          maxTurns: job.assignment.maxTurns,
-          personas: personasPub,
-          ...(bolaTestQueue.length ? { bolaTestQueue } : {}),
-          parentFacts: parentFacts.map(f => ({
-            id: f.id, kind: f.kind, origin: f.origin, summary: f.summary, data: f.data,
-          })),
-          specsSummary: stagedSpecs,
-          mountedRepos,
-          preInjectedSkills,
-          alreadyConfirmed: confirmedRefs,
-          unconfirmedHardSurface,
-          detLeads,
-          ...(assignmentBrief ? { assignmentBrief } : {}),
-        }),
-        signal: job.controller.signal,
-        maxTurns: budget.maxTurns,
-        wallClockMs: remainingWallClockMs,
-        activeClock: assignmentClock,
-        ...(runTrace ? {
-          trace: runTrace,
-          traceContext: {
-            runId: run.id,
-            assignmentId: job.assignment.id,
-            specialistProfile: specialistProfileId,
-          },
-        } : {}),
-        compaction: true,
-        enableSettlement: true,
-        requireCompleteIntent: true,
-        shouldSettle: () => assignmentClock.activeElapsedMs() >= effectiveSettlementMs,
-        handlers: scopedHandlers,
-        secrets,
-        beforeCall: () => {
-          this.host.check(job)
-          if (this.storage.checkBudgetExceeded(run.id)) {
-            throw new BudgetExceededError('Run spend or request budget exceeded.')
-          }
-        },
-        ...llmRunHooks(this.storage, run.id),
-        onUsage: usage => {
-          const tokens = usage.inputTokens + usage.outputTokens
-          this.storage.recordLlmSpend(run.id, { usd: usage.costUsd, tokens })
-          this.host.board.noteTokens(job.assignment.id, boardHandle, tokens)
-        },
-        onTurn: turn => {
-          recordTurnLatency()
-          this.storage.updateWorker(job.assignment.id, { turnsUsed: turn })
-          this.storage.recordLlmSpend(run.id, { turns: 1 })
-        },
-        onStreamActivity: noteProviderToken,
-        onTurnStart: turn => {
-          armStallTimer(turn)
-          const member = this.storage.boardMember(run.id, boardHandle)
-          const delta = this.host.boardTurnDelta(this.storage.run(run.id), boardHandle, member?.lastReadSeq ?? 0)
-          if (!delta.text) return undefined
-          return {
-            messages: [turn === 1 ? injectBoardTurnInstructions('', delta.text) : delta.text],
-          }
-        },
-        approvedOrigins: [...permittedAtAdmission],
-        ...(assignedTargetRoutes.length ? { assignedTargetRoutes } : {}),
-        onProofObligation: (info: ProofObligationEvent) => {
-          const prev = this.host.proofObligationByRun.get(run.id) ?? {
-            probedRoutes: 0, coveredRoutes: 0, gapRoutes: 0, demandedRoutes: 0, dischargedByGap: 0,
-          }
-          this.host.proofObligationByRun.set(run.id, {
-            probedRoutes: prev.probedRoutes + info.probedRoutes,
-            coveredRoutes: prev.coveredRoutes + info.coveredRoutes,
-            gapRoutes: prev.gapRoutes + info.gapRoutes,
-            demandedRoutes: prev.demandedRoutes + info.demandedRoutes,
-            dischargedByGap: prev.dischargedByGap + info.dischargedByGap,
-          })
-          this.host.safeEvent(
-            run.id, 'agent.proof_obligation',
-            `Proof obligation: ${info.coveredRoutes}/${info.probedRoutes} probed route(s) covered, ${info.gapRoutes} gap(s), ${info.demandedRoutes} demanded.`,
-            { assignmentId: job.assignment.id, stepId: step.id, ...info },
-          )
-        },
-        onGapValidation: (info: GapValidationEvent) => {
-          const prev = this.host.gapValidationByRun.get(run.id) ?? { accepted: 0, rejected: 0, byCode: {} }
-          const byCode: Record<string, { accepted: number; rejected: number }> = { ...prev.byCode }
-          for (const [code, counts] of Object.entries(info.byCode)) {
-            const cur = byCode[code] ?? { accepted: 0, rejected: 0 }
-            byCode[code] = { accepted: cur.accepted + counts.accepted, rejected: cur.rejected + counts.rejected }
-          }
-          this.host.gapValidationByRun.set(run.id, {
-            accepted: prev.accepted + info.accepted, rejected: prev.rejected + info.rejected, byCode,
-          })
-          this.host.safeEvent(
-            run.id, 'agent.gap_validation',
-            `Gap validation: ${info.accepted} accepted, ${info.rejected} rejected.`,
-            { assignmentId: job.assignment.id, stepId: step.id, ...info },
-          )
-        },
-        onEarlyExit: info => {
-          this.host.earlyExitTurnsSavedByRun.set(run.id,
-            (this.host.earlyExitTurnsSavedByRun.get(run.id) ?? 0) + info.turnsSaved)
-          this.storage.event(run.id, 'agent.early_exit',
-            `Early exit (${info.reason}) at turn ${info.turnsUsed}/${info.maxTurns}: `
-            + `${info.evidenceCount} distinct attempt(s), ${info.turnsSaved} turn(s) saved`
-            + (info.route ? ` on ${info.route.method} ${info.route.path}.` : '.'),
-            { ...info })
-        },
+      const wallPlan = computeWorkerWallClockPlan({
+        wallClockMs: budget.wallClockMs,
+        preSessionElapsedMs: assignmentClock.activeElapsedMs(),
+        explicitSettlementMs: budget.wallClockSettlementMs,
+        isMultiHop: isMultiHopStep,
       })
+      const effectiveSettlementMs = wallPlan.effectiveSettlementMs
+
+      // Pause-aware verify-grace supervision (backed strictly by `assignmentClock`):
+      // - If an active proof call (`kovo_verify` / `verify_replay_spec`) is already in flight
+      //   when `remainingBudgetMs` expires, allow up to `verifyGraceMs` (20–45s) to finish the
+      //   proof and persist its receipt instead of aborting mid-replay.
+      // - If the worker already entered settlement and is actively generating its verification
+      //   turn at `remainingBudgetMs`, allow a bounded `settlementStreamGraceMs` window (10–20s)
+      //   to finish streaming the proof call, followed by `verifyGraceMs` if a proof call starts.
+      // - If neither condition holds (or once the in-flight proof finishes), rotate immediately.
+      const sessionRotateController = new AbortController()
+      const onOuterJobAbort = () => sessionRotateController.abort(job.controller.signal.reason)
+      job.controller.signal.addEventListener('abort', onOuterJobAbort, { once: true })
+      if (job.controller.signal.aborted) sessionRotateController.abort(job.controller.signal.reason)
+
+      let enteredSettlement = false
+      let generatingTurn = false
+      let turnsCompletedInSession = 0
+      let baseWallClockExpired = false
+      let localWallClockRotated = false
+      let localGraceStartedAtMs: number | undefined
+      let verifyGraceUsedMs = 0
+      let verifyGraceReason: 'none' | 'active_proof' | 'settlement_stream' = 'none'
+      let baseDeadlineTimer: DeadlineTimerHandle | undefined
+      let verifyGraceTimer: DeadlineTimerHandle | undefined
+      let proofHandoffTimer: DeadlineTimerHandle | undefined
+
+      const clearSupervisionTimers = () => {
+        if (baseDeadlineTimer) { baseDeadlineTimer.cancel(); baseDeadlineTimer = undefined }
+        if (verifyGraceTimer) { verifyGraceTimer.cancel(); verifyGraceTimer = undefined }
+        if (proofHandoffTimer) { proofHandoffTimer.cancel(); proofHandoffTimer = undefined }
+      }
+
+      const triggerLocalRotation = () => {
+        if (localWallClockRotated || job.controller.signal.aborted) return
+        localWallClockRotated = true
+        clearSupervisionTimers()
+        if (localGraceStartedAtMs !== undefined) {
+          verifyGraceUsedMs = Math.max(0, assignmentClock.activeElapsedMs() - localGraceStartedAtMs)
+        }
+        sessionRotateController.abort(new Error(`Assignment wall-clock deadline reached (${assignmentClock.activeElapsedMs()}ms / ${budget.wallClockMs}ms).`))
+      }
+
+      const armBoundedVerifyGrace = (reason: 'active_proof' | 'settlement_stream', durationMs: number) => {
+        if (verifyGraceTimer) { verifyGraceTimer.cancel(); verifyGraceTimer = undefined }
+        if (localGraceStartedAtMs === undefined) localGraceStartedAtMs = assignmentClock.activeElapsedMs()
+        if (verifyGraceReason === 'none' || reason === 'active_proof') verifyGraceReason = reason
+        if (durationMs <= 0) {
+          triggerLocalRotation()
+          return
+        }
+        verifyGraceTimer = assignmentClock.createDeadlineTimer(durationMs, () => {
+          verifyGraceTimer = undefined
+          triggerLocalRotation()
+        })
+      }
+
+      onProofCallEnter = () => {
+        if (proofHandoffTimer) { proofHandoffTimer.cancel(); proofHandoffTimer = undefined }
+        if (baseWallClockExpired && !localWallClockRotated && wallPlan.settlementStreamGraceMs > 0) {
+          armBoundedVerifyGrace('active_proof', wallPlan.verifyGraceMs)
+        }
+      }
+      onProofCallExit = () => {
+        if (baseWallClockExpired && inFlightProofCalls === 0 && !localWallClockRotated && wallPlan.settlementStreamGraceMs > 0) {
+          queueMicrotask(() => {
+            if (inFlightProofCalls === 0 && !localWallClockRotated) triggerLocalRotation()
+          })
+        }
+      }
+
+      if (wallPlan.settlementStreamGraceMs > 0) {
+        baseDeadlineTimer = assignmentClock.createDeadlineTimer(wallPlan.remainingBudgetMs, () => {
+          baseDeadlineTimer = undefined
+          baseWallClockExpired = true
+          if (job.controller.signal.aborted || localWallClockRotated) return
+          if (inFlightProofCalls > 0) {
+            armBoundedVerifyGrace('active_proof', wallPlan.verifyGraceMs)
+            return
+          }
+          if (enteredSettlement && generatingTurn && !job.stallAbort) {
+            armBoundedVerifyGrace('settlement_stream', wallPlan.settlementStreamGraceMs)
+            return
+          }
+          triggerLocalRotation()
+        })
+      }
+
+      const sessionWallClockMs = wallPlan.settlementStreamGraceMs > 0
+        ? wallPlan.remainingBudgetMs + wallPlan.settlementStreamGraceMs + wallPlan.verifyGraceMs
+        : wallPlan.remainingBudgetMs
+
+      let sessionResult: Awaited<ReturnType<typeof runAgentSession>>
+      try {
+        sessionResult = await runAgentSession({
+          directory: this.storage.directory,
+          sessionId: job.assignment.sessionId,
+          requestId: `investigate:${step.id}:attempt-${job.assignment.attempt}`,
+          profiles: resolveProfilePoolForRole(specialistConfig.roleAffinity, profiles),
+          scenario: 'worker-investigation',
+          roleAffinity: specialistConfig.roleAffinity,
+          prompt: workerInvestigationPrompt({
+            goal: run.goal,
+            step: {
+              id: step.id, title: step.title, hypothesis: step.hypothesis,
+              category: step.category, skills: [...new Set([...step.skills, ...specialistConfig.skills])],
+              specialistProfile: specialistProfileId,
+            },
+            origins: targetOrigins,
+            capabilityTier: run.capabilityTier,
+            maxTurns: job.assignment.maxTurns,
+            personas: personasPub,
+            ...(bolaTestQueue.length ? { bolaTestQueue } : {}),
+            parentFacts: parentFacts.map(f => ({
+              id: f.id, kind: f.kind, origin: f.origin, summary: f.summary, data: f.data,
+            })),
+            specsSummary: stagedSpecs,
+            mountedRepos,
+            preInjectedSkills,
+            alreadyConfirmed: confirmedRefs,
+            unconfirmedHardSurface,
+            detLeads,
+            ...(assignmentBrief ? { assignmentBrief } : {}),
+          }),
+          signal: sessionRotateController.signal,
+          maxTurns: budget.maxTurns,
+          wallClockMs: sessionWallClockMs,
+          wallClockGraceMs: wallPlan.verifyGraceMs,
+          activeClock: assignmentClock,
+          onWallClockRotate: info => {
+            verifyGraceUsedMs = Math.max(verifyGraceUsedMs, info.graceUsedMs)
+            if (info.graceUsedMs > 0 && verifyGraceReason === 'none') {
+              verifyGraceReason = 'active_proof'
+            }
+          },
+          ...(runTrace ? {
+            trace: runTrace,
+            traceContext: {
+              runId: run.id,
+              assignmentId: job.assignment.id,
+              specialistProfile: specialistProfileId,
+            },
+          } : {}),
+          compaction: true,
+          enableSettlement: true,
+          requireCompleteIntent: true,
+          shouldSettle: () => {
+            const due = assignmentClock.activeElapsedMs() >= effectiveSettlementMs
+            if (due) enteredSettlement = true
+            return due
+          },
+          handlers: scopedHandlers,
+          secrets,
+          beforeCall: () => {
+            this.host.check(job)
+            if (this.storage.checkBudgetExceeded(run.id)) {
+              throw new BudgetExceededError('Run spend or request budget exceeded.')
+            }
+          },
+          ...llmRunHooks(this.storage, run.id),
+          onUsage: usage => {
+            const tokens = usage.inputTokens + usage.outputTokens
+            this.storage.recordLlmSpend(run.id, { usd: usage.costUsd, tokens })
+            this.host.board.noteTokens(job.assignment.id, boardHandle, tokens)
+          },
+          onTurn: (turn, _maxTurns, settling) => {
+            generatingTurn = false
+            turnsCompletedInSession = turn
+            if (settling) enteredSettlement = true
+            recordTurnLatency()
+            this.storage.updateWorker(job.assignment.id, { turnsUsed: turn })
+            this.storage.recordLlmSpend(run.id, { turns: 1 })
+            if (baseWallClockExpired && inFlightProofCalls === 0 && !localWallClockRotated && wallPlan.settlementStreamGraceMs > 0) {
+              if (proofHandoffTimer) proofHandoffTimer.cancel()
+              proofHandoffTimer = assignmentClock.createDeadlineTimer(PROOF_HANDOFF_GRACE_MS, () => {
+                proofHandoffTimer = undefined
+                if (inFlightProofCalls === 0 && !localWallClockRotated) {
+                  triggerLocalRotation()
+                }
+              })
+            }
+          },
+          onStreamActivity: noteProviderToken,
+          onTurnStart: turn => {
+            generatingTurn = true
+            armStallTimer(turn)
+            const member = this.storage.boardMember(run.id, boardHandle)
+            const delta = this.host.boardTurnDelta(this.storage.run(run.id), boardHandle, member?.lastReadSeq ?? 0)
+            if (!delta.text) return undefined
+            return {
+              messages: [turn === 1 ? injectBoardTurnInstructions('', delta.text) : delta.text],
+            }
+          },
+          approvedOrigins: [...permittedAtAdmission],
+          ...(assignedTargetRoutes.length ? { assignedTargetRoutes } : {}),
+          onProofObligation: (info: ProofObligationEvent) => {
+            const prev = this.host.proofObligationByRun.get(run.id) ?? {
+              probedRoutes: 0, coveredRoutes: 0, gapRoutes: 0, demandedRoutes: 0, dischargedByGap: 0,
+            }
+            this.host.proofObligationByRun.set(run.id, {
+              probedRoutes: prev.probedRoutes + info.probedRoutes,
+              coveredRoutes: prev.coveredRoutes + info.coveredRoutes,
+              gapRoutes: prev.gapRoutes + info.gapRoutes,
+              demandedRoutes: prev.demandedRoutes + info.demandedRoutes,
+              dischargedByGap: prev.dischargedByGap + info.dischargedByGap,
+            })
+            this.host.safeEvent(
+              run.id, 'agent.proof_obligation',
+              `Proof obligation: ${info.coveredRoutes}/${info.probedRoutes} probed route(s) covered, ${info.gapRoutes} gap(s), ${info.demandedRoutes} demanded.`,
+              { assignmentId: job.assignment.id, stepId: step.id, ...info },
+            )
+          },
+          onGapValidation: (info: GapValidationEvent) => {
+            const prev = this.host.gapValidationByRun.get(run.id) ?? { accepted: 0, rejected: 0, byCode: {} }
+            const byCode: Record<string, { accepted: number; rejected: number }> = { ...prev.byCode }
+            for (const [code, counts] of Object.entries(info.byCode)) {
+              const cur = byCode[code] ?? { accepted: 0, rejected: 0 }
+              byCode[code] = { accepted: cur.accepted + counts.accepted, rejected: cur.rejected + counts.rejected }
+            }
+            this.host.gapValidationByRun.set(run.id, {
+              accepted: prev.accepted + info.accepted, rejected: prev.rejected + info.rejected, byCode,
+            })
+            this.host.safeEvent(
+              run.id, 'agent.gap_validation',
+              `Gap validation: ${info.accepted} accepted, ${info.rejected} rejected.`,
+              { assignmentId: job.assignment.id, stepId: step.id, ...info },
+            )
+          },
+          onEarlyExit: info => {
+            this.host.earlyExitTurnsSavedByRun.set(run.id,
+              (this.host.earlyExitTurnsSavedByRun.get(run.id) ?? 0) + info.turnsSaved)
+            this.storage.event(run.id, 'agent.early_exit',
+              `Early exit (${info.reason}) at turn ${info.turnsUsed}/${info.maxTurns}: `
+              + `${info.evidenceCount} distinct attempt(s), ${info.turnsSaved} turn(s) saved`
+              + (info.route ? ` on ${info.route.method} ${info.route.path}.` : '.'),
+              { ...info })
+          },
+        })
+      } catch (err) {
+        if (localWallClockRotated && !job.controller.signal.aborted) {
+          const elapsedMs = assignmentClock.activeElapsedMs()
+          sessionResult = {
+            answer: `Bounded wall-clock rotation after ${elapsedMs}ms (${turnsCompletedInSession}/${budget.maxTurns} turns); slot released.`,
+            turnsUsed: turnsCompletedInSession,
+            nudgesUsed: 0,
+            settled: enteredSettlement,
+            status: 'wall_clock_rotated',
+            wallClockRotated: true,
+            elapsedMs,
+          }
+        } else {
+          throw err
+        }
+      } finally {
+        clearSupervisionTimers()
+        onProofCallEnter = undefined
+        onProofCallExit = undefined
+        job.controller.signal.removeEventListener('abort', onOuterJobAbort)
+      }
 
       const latestRun = this.host.check(job)
       const outcomeText = sessionResult.status === 'wall_clock_rotated'
@@ -2006,6 +2272,9 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
             wallClockMs: budget.wallClockMs,
             turnsUsed: sessionResult.turnsUsed,
             boundedRotation: true,
+            verifyGraceMs: wallPlan.verifyGraceMs,
+            graceUsedMs: verifyGraceUsedMs,
+            verifyGraceReason,
           },
         )
       }
