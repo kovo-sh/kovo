@@ -70,6 +70,7 @@ import {
 } from './graph-coordinator.ts'
 import type { LabTargetHandle } from './lab-runner.ts'
 import { selectRankedProbeTargets, type Phase0ProbePlanSummary } from './probe-plan.ts'
+import type { ServiceOriginMapping } from './program-graph.ts'
 import {
   chainStepRetryableStatuses,
   chainStepTerminalStatuses,
@@ -1976,6 +1977,255 @@ export interface RoundRobinDispatchOptions {
   frontierController?: FrontierWaveController | null
   /** Optional pre-registered typed step metadata keyed by step ID. */
   stepMetaById?: ReadonlyMap<string, Partial<TypedStepDispatchMeta>>
+  /** Optional quarantined origins (edge-protected / dead) excluded from dispatch. */
+  quarantinedOrigins?: ReadonlySet<string>
+  /** Optional soft per-origin concentration cap (default 0.5 when >= 2 live origins have ready steps). */
+  maxOriginShare?: number
+}
+
+export type OriginQuarantineReason = 'edge_protected' | 'unreachable'
+
+export interface QuarantinedOriginRecord {
+  origin: string
+  reason: OriginQuarantineReason
+  detail: string
+  observedStatuses?: number[]
+  requestsObserved?: number
+  source: 'phase0_edge_protected' | 'phase0_dead_host' | 'telemetry_401_wall' | 'telemetry_52x_dead'
+}
+
+export interface DetectQuarantinedOriginsInput {
+  approvedOrigins: readonly string[]
+  /** Explicit uniform edge-protected origins reported by Phase-0 (string or structured entry). */
+  edgeProtectedOrigins?: ReadonlyArray<string | { origin: string; reason?: string; status?: number; requestsUsed?: number }>
+  /** Explicit dead/unreachable origins short-circuited by Phase-0. */
+  skippedDeadHosts?: ReadonlyArray<{ origin: string; reason: string; requestsUsed?: number }>
+  /** Observed HTTP exchanges / probe telemetry (from Phase-0, baseline captures, or broker_exchanges). */
+  observedExchanges?: ReadonlyArray<{
+    origin: string
+    status?: number | null
+    error?: string | null
+    personaHandle?: string | null
+    pathAndQuery?: string
+  }>
+  /** Active authenticated personas with optional origin allowlist. */
+  personas?: ReadonlyArray<{ handle?: string; originAllowlist?: readonly string[] | null }>
+}
+
+export interface DetectQuarantinedOriginsResult {
+  quarantined: Map<string, QuarantinedOriginRecord>
+  quarantinedSet: Set<string>
+  activeOrigins: string[]
+  records: QuarantinedOriginRecord[]
+}
+
+/** True when at least one authenticated persona is permitted to access `origin`. */
+export function hasAuthenticatedPersonaForOrigin(
+  origin: string,
+  personas?: ReadonlyArray<{ handle?: string; originAllowlist?: readonly string[] | null }>,
+): boolean {
+  if (!personas || personas.length === 0) return false
+  let targetHost = ''
+  try { targetHost = new URL(origin).hostname.toLowerCase() } catch { targetHost = origin.toLowerCase() }
+  for (const persona of personas) {
+    const allowlist = persona.originAllowlist
+    if (!allowlist || allowlist.length === 0) return true
+    for (const allowed of allowlist) {
+      const clean = allowed.trim()
+      if (!clean) continue
+      if (clean === origin || clean.toLowerCase() === origin.toLowerCase()) return true
+      try {
+        if (new URL(clean).hostname.toLowerCase() === targetHost) return true
+      } catch {
+        if (clean.toLowerCase() === targetHost) return true
+      }
+    }
+  }
+  return false
+}
+
+/**
+ * Detect uniform edge-protected (e.g. Cloudflare Access / Basic 401-wall with no persona) and
+ * dead/unreachable (e.g. Phase-0 `skippedDeadHosts` or 520–526 TLS/origin-error-only) hosts so
+ * planner and dispatch quarantine them behind a single structured coverage gap instead of burning
+ * investigation turns.
+ */
+export function detectQuarantinedOrigins(input: DetectQuarantinedOriginsInput): DetectQuarantinedOriginsResult {
+  const approvedList = [...new Set(input.approvedOrigins.map(o => o.trim()).filter(Boolean))]
+  const approvedSet = new Set(approvedList)
+  const quarantined = new Map<string, QuarantinedOriginRecord>()
+
+  // 1. Explicit Phase-0 dead / unreachable hosts (quarantined regardless of personas).
+  for (const dead of input.skippedDeadHosts ?? []) {
+    const origin = (dead?.origin ?? '').trim()
+    if (!origin || !approvedSet.has(origin) || quarantined.has(origin)) continue
+    quarantined.set(origin, {
+      origin,
+      reason: 'unreachable',
+      detail: dead.reason?.trim() || 'Phase-0 short-circuited host as unreachable',
+      ...(typeof dead.requestsUsed === 'number' ? { requestsObserved: dead.requestsUsed } : {}),
+      source: 'phase0_dead_host',
+    })
+  }
+
+  // 2. Explicit Phase-0 uniform edge-protected hosts (quarantined unless an authenticated persona exists for the origin).
+  for (const entry of input.edgeProtectedOrigins ?? []) {
+    const origin = (typeof entry === 'string' ? entry : entry?.origin ?? '').trim()
+    if (!origin || !approvedSet.has(origin) || quarantined.has(origin)) continue
+    if (hasAuthenticatedPersonaForOrigin(origin, input.personas)) continue
+    const detail = typeof entry === 'string'
+      ? 'uniform edge authentication wall (no authenticated persona configured)'
+      : (entry.reason?.trim() || `uniform edge auth wall (HTTP ${entry.status ?? 401}) with no authenticated persona`)
+    quarantined.set(origin, {
+      origin,
+      reason: 'edge_protected',
+      detail,
+      ...(typeof entry !== 'string' && typeof entry.status === 'number' ? { observedStatuses: [entry.status] } : { observedStatuses: [401] }),
+      ...(typeof entry !== 'string' && typeof entry.requestsUsed === 'number' ? { requestsObserved: entry.requestsUsed } : {}),
+      source: 'phase0_edge_protected',
+    })
+  }
+
+  // 3. Observed exchange telemetry fallback (uniform 520-526/dead or uniform 401-wall across paths).
+  const byOrigin = new Map<string, Array<{ status?: number | null; error?: string | null; personaHandle?: string | null; pathAndQuery?: string }>>()
+  for (const ex of input.observedExchanges ?? []) {
+    const origin = (ex?.origin ?? '').trim()
+    if (!origin || !approvedSet.has(origin) || quarantined.has(origin)) continue
+    const list = byOrigin.get(origin)
+    if (list) list.push(ex)
+    else byOrigin.set(origin, [ex])
+  }
+
+  for (const [origin, list] of byOrigin.entries()) {
+    if (!list.length) continue
+    const statuses = list.map(ex => (typeof ex.status === 'number' && ex.status > 0 ? ex.status : 0))
+    const uniqueStatuses = [...new Set(statuses.filter(s => s > 0))].sort((a, b) => a - b)
+    const isDeadStatus = (s: number) => s >= 520 && s <= 526
+    const allDeadOrError = list.every((ex, idx) => {
+      const st = statuses[idx]!
+      return isDeadStatus(st) || (st === 0 && Boolean(ex.error))
+    })
+    const hasDead52x = statuses.some(isDeadStatus)
+    if (allDeadOrError && (hasDead52x || list.length >= 2)) {
+      quarantined.set(origin, {
+        origin,
+        reason: 'unreachable',
+        detail: hasDead52x
+          ? `host returned only origin/TLS error status(es) [${uniqueStatuses.join(', ')}] across ${list.length} probe(s)`
+          : `host failed all ${list.length} transport probe(s) with no live HTTP response`,
+        ...(uniqueStatuses.length ? { observedStatuses: uniqueStatuses } : {}),
+        requestsObserved: list.length,
+        source: 'telemetry_52x_dead',
+      })
+      continue
+    }
+
+    if (hasAuthenticatedPersonaForOrigin(origin, input.personas)) continue
+    const anonList = list.filter(ex => !ex.personaHandle || ex.personaHandle === 'anonymous')
+    if (anonList.length < 2) continue
+    const all401Wall = anonList.every(ex => ex.status === 401 || ex.status === 407)
+    if (!all401Wall) continue
+    const distinctPaths = new Set(
+      anonList.map(ex => (ex.pathAndQuery ?? '/').split(/[?#]/, 1)[0] || '/'),
+    )
+    if (distinctPaths.size >= 2 || anonList.length >= 3) {
+      quarantined.set(origin, {
+        origin,
+        reason: 'edge_protected',
+        detail: `uniform edge 401 auth wall across ${anonList.length} probe(s) (${distinctPaths.size} path(s)) with no authenticated persona`,
+        observedStatuses: [...new Set(anonList.map(ex => ex.status!).filter(Boolean))].sort((a, b) => a - b),
+        requestsObserved: anonList.length,
+        source: 'telemetry_401_wall',
+      })
+    }
+  }
+
+  const records = approvedList
+    .map(origin => quarantined.get(origin))
+    .filter((rec): rec is QuarantinedOriginRecord => Boolean(rec))
+  const quarantinedSet = new Set(quarantined.keys())
+  const activeOrigins = approvedList.filter(origin => !quarantinedSet.has(origin))
+  return { quarantined, quarantinedSet, activeOrigins, records }
+}
+
+/** Soft per-origin concentration cap when multiple live origins compete for queued slots. */
+export const DEFAULT_MAX_ORIGIN_SHARE = 0.5
+
+export interface PerOriginFairnessOptions<T> {
+  limit: number
+  maxOriginShare?: number
+  existingCountsByOrigin?: ReadonlyMap<string, number>
+  existingTotal?: number
+  originOf: (item: T) => string | undefined
+  quarantinedOrigins?: ReadonlySet<string>
+}
+
+/**
+ * Apply a soft per-origin fairness / concentration guard over priority-ordered candidates:
+ * - Drops candidates targeting quarantined origins (when `quarantinedOrigins` is supplied).
+ * - When >= 2 distinct origins exist across active + candidate items, caps any single origin at
+ *   `max(1, floor(projectedTotal * maxOriginShare))` (default <= 50%) during Pass 1 so one host
+ *   cannot monopolize the queue while sibling live origins have untested surfaces.
+ * - Soft backfill in Pass 2 fills any remaining slots only after sibling origins are exhausted.
+ */
+export function enforcePerOriginFairness<T>(
+  orderedCandidates: readonly T[],
+  options: PerOriginFairnessOptions<T>,
+): T[] {
+  const limit = Math.max(0, Math.floor(options.limit))
+  if (limit <= 0 || orderedCandidates.length === 0) return []
+  const quarantined = options.quarantinedOrigins
+  const eligible = quarantined && quarantined.size > 0
+    ? orderedCandidates.filter(item => {
+        const origin = options.originOf(item)
+        return !origin || !quarantined.has(origin)
+      })
+    : [...orderedCandidates]
+  if (eligible.length === 0) return []
+
+  const distinctOrigins = new Set<string>()
+  const counts = new Map<string, number>()
+  let existingSum = 0
+  if (options.existingCountsByOrigin) {
+    for (const [origin, count] of options.existingCountsByOrigin.entries()) {
+      if (count <= 0) continue
+      if (quarantined?.has(origin)) continue
+      counts.set(origin, count)
+      distinctOrigins.add(origin)
+      existingSum += count
+    }
+  }
+  for (const item of eligible) {
+    const origin = options.originOf(item)
+    if (origin) distinctOrigins.add(origin)
+  }
+  if (distinctOrigins.size <= 1) {
+    return eligible.slice(0, limit)
+  }
+
+  const share = Math.max(0.1, Math.min(1, options.maxOriginShare ?? DEFAULT_MAX_ORIGIN_SHARE))
+  const existingTotal = Math.max(existingSum, Math.floor(options.existingTotal ?? existingSum))
+  const projectedTotal = existingTotal + Math.min(limit, eligible.length)
+  const perOriginCap = Math.max(1, Math.floor(projectedTotal * share))
+
+  const selected: T[] = []
+  const deferred: T[] = []
+  for (const item of eligible) {
+    if (selected.length >= limit) break
+    const origin = options.originOf(item)
+    if (!origin || (counts.get(origin) ?? 0) < perOriginCap) {
+      selected.push(item)
+      if (origin) counts.set(origin, (counts.get(origin) ?? 0) + 1)
+    } else {
+      deferred.push(item)
+    }
+  }
+  // Soft backfill: never leave slots unused if sibling origins ran out of eligible items.
+  for (const item of deferred) {
+    if (selected.length >= limit) break
+    selected.push(item)
+  }
+  return selected
 }
 
 export type FrontierDispatchOptions = RoundRobinDispatchOptions
@@ -2402,9 +2652,17 @@ export function dispatchFrontierWave<T extends DispatchLaneStep>(
   const seenStepIds = new Set<string>()
   let eviRankedCount = 0
 
+  const quarantined = options.quarantinedOrigins
+  const isQuarantinedStep = (step: T): boolean => {
+    if (!quarantined || quarantined.size === 0) return false
+    const origins = (step.sourceOrigins ?? []).filter(Boolean)
+    return origins.length > 0 && origins.every(origin => quarantined.has(origin))
+  }
+
   for (const step of steps) {
     if (seenStepIds.has(step.id)) continue
     seenStepIds.add(step.id)
+    if (isQuarantinedStep(step)) continue
     const meta = resolveStepDispatchMeta(step, options, branchEviIndex)
     metaById.set(step.id, meta)
     if (meta.evi > 0) eviRankedCount += 1
@@ -2427,6 +2685,56 @@ export function dispatchFrontierWave<T extends DispatchLaneStep>(
     Math.floor(options.leadCap ?? DET_LEAD_CONCURRENT_CAP) - Math.max(0, Math.floor(options.activeLeadCount ?? 0)),
   )
   const ordered: T[] = []
+  const selectedOriginCounts = new Map<string, number>()
+  const primaryOriginOf = (step: T): string | undefined => {
+    const origins = (step.sourceOrigins ?? []).filter(Boolean)
+    return origins.length === 1 ? origins[0] : origins[0]
+  }
+  const allReadyOrigins = new Set<string>()
+  for (const queue of lanes.values()) {
+    for (const s of queue) {
+      const o = primaryOriginOf(s)
+      if (o) allReadyOrigins.add(o)
+    }
+  }
+  const fairnessShare = Math.max(0.1, Math.min(1, options.maxOriginShare ?? DEFAULT_MAX_ORIGIN_SHARE))
+  const fairnessActive = capacity >= 2 && allReadyOrigins.size >= 2
+  const perOriginWaveCap = fairnessActive ? Math.max(1, Math.floor(capacity * fairnessShare)) : Number.POSITIVE_INFINITY
+  const recordSelected = (step: T, lane: DispatchLane) => {
+    ordered.push(step)
+    selectedByLane[lane] += 1
+    const origin = primaryOriginOf(step)
+    if (origin) selectedOriginCounts.set(origin, (selectedOriginCounts.get(origin) ?? 0) + 1)
+  }
+  const hasUnderCapStepIn = (queue: readonly T[], predicate?: (s: T) => boolean): number => {
+    for (let i = 0; i < queue.length; i += 1) {
+      const s = queue[i]!
+      if (predicate && !predicate(s)) continue
+      const o = primaryOriginOf(s)
+      if (!o || (selectedOriginCounts.get(o) ?? 0) < perOriginWaveCap) return i
+    }
+    return -1
+  }
+  const hasAnyOtherUnderCapStep = (excludeQueue?: readonly T[]): boolean => {
+    if (!fairnessActive) return false
+    for (const q of lanes.values()) {
+      if (q === excludeQueue) continue
+      if (hasUnderCapStepIn(q) >= 0) return true
+    }
+    return false
+  }
+  const popFairFromQueue = (queue: T[], predicate?: (s: T) => boolean): T | undefined => {
+    if (!queue.length) return undefined
+    if (fairnessActive) {
+      const fairIdx = hasUnderCapStepIn(queue, predicate)
+      if (fairIdx >= 0) return queue.splice(fairIdx, 1)[0]
+      if (hasAnyOtherUnderCapStep(queue)) return undefined
+    }
+    if (!predicate) return queue.shift()
+    const idx = queue.findIndex(predicate)
+    return idx >= 0 ? queue.splice(idx, 1)[0] : undefined
+  }
+
   const leadQueue = lanes.get('lead')!
   const tierALeadIds = options.tierALeadIds
   const whiteBoxStepIds = options.whiteBoxStepIds
@@ -2471,16 +2779,22 @@ export function dispatchFrontierWave<T extends DispatchLaneStep>(
       : 0
     const whiteBoxSlotCap = Math.max(0, capacity - reserveSlotForRuntimeChain)
 
+    const fairWhiteBox = enforcePerOriginFairness(whiteBoxCandidates, {
+      limit: whiteBoxSlotCap,
+      maxOriginShare: fairnessShare,
+      originOf: entry => primaryOriginOf(entry.step),
+    })
+    const chosenWbIds = new Set(fairWhiteBox.map(entry => entry.step.id))
     const remainingWhiteBox: Array<{ lane: DispatchLane; step: T }> = []
-    for (const entry of whiteBoxCandidates) {
+    for (const entry of fairWhiteBox) {
       if (ordered.length < whiteBoxSlotCap) {
-        ordered.push(entry.step)
-        selectedByLane[entry.lane] += 1
+        recordSelected(entry.step, entry.lane)
         whiteBoxSelected += 1
         if (entry.lane === 'lead') tierASelected += 1
-      } else {
-        remainingWhiteBox.push(entry)
       }
+    }
+    for (const entry of whiteBoxCandidates) {
+      if (!chosenWbIds.has(entry.step.id)) remainingWhiteBox.push(entry)
     }
     for (const entry of remainingWhiteBox.reverse()) {
       lanes.get(entry.lane)!.unshift(entry.step)
@@ -2494,16 +2808,15 @@ export function dispatchFrontierWave<T extends DispatchLaneStep>(
         )
       })
       if (rtIdx >= 0) {
-        ordered.push(chainQueueNow.splice(rtIdx, 1)[0]!)
-        selectedByLane.chain += 1
+        recordSelected(chainQueueNow.splice(rtIdx, 1)[0]!, 'chain')
         runtimeChainReserved += 1
       }
     }
   } else if (tierALeadIds?.size) {
-    for (let idx = 0; idx < leadQueue.length && ordered.length < capacity;) {
-      if (!tierALeadIds.has(leadQueue[idx]!.id)) { idx += 1; continue }
-      ordered.push(leadQueue.splice(idx, 1)[0]!)
-      selectedByLane.lead += 1
+    while (ordered.length < capacity) {
+      const picked = popFairFromQueue(leadQueue, step => tierALeadIds.has(step.id))
+      if (!picked) break
+      recordSelected(picked, 'lead')
       tierASelected += 1
     }
   }
@@ -2528,16 +2841,17 @@ export function dispatchFrontierWave<T extends DispatchLaneStep>(
     maxChainReserve - Math.max(0, Math.floor(options.activeChainCount ?? 0)) - runtimeChainReserved,
   )
   let chainReservedSelected = 0
-  for (let idx = 0; idx < chainQueue.length && ordered.length < capacity && chainReservedSelected < chainReserveRemaining;) {
-    if (!metaById.get(chainQueue[idx]!.id)?.multiHop) { idx += 1; continue }
-    ordered.push(chainQueue.splice(idx, 1)[0]!)
-    selectedByLane.chain += 1
+  while (ordered.length < capacity && chainReservedSelected < chainReserveRemaining) {
+    const picked = popFairFromQueue(chainQueue, step => Boolean(metaById.get(step.id)?.multiHop))
+    if (!picked) break
+    recordSelected(picked, 'chain')
     chainReservedSelected += 1
   }
 
   while (ordered.length < capacity && leadQueue.length > 0 && selectedByLane.lead - tierASelected < leadCap) {
-    ordered.push(leadQueue.shift()!)
-    selectedByLane.lead += 1
+    const picked = popFairFromQueue(leadQueue)
+    if (!picked) break
+    recordSelected(picked, 'lead')
   }
 
   let progressed = true
@@ -2547,24 +2861,36 @@ export function dispatchFrontierWave<T extends DispatchLaneStep>(
       if (ordered.length >= capacity) break
       const queue = lanes.get(lane)!
       if (!queue.length) continue
-      ordered.push(queue.shift()!)
-      selectedByLane[lane] += 1
+      const picked = popFairFromQueue(queue)
+      if (!picked) continue
+      recordSelected(picked, lane)
       progressed = true
+    }
+  }
+
+  // Soft backfill pass across semantic lanes if fairness deferred steps while sibling origins ran out.
+  let backfillProgressed = true
+  while (ordered.length < capacity && backfillProgressed) {
+    backfillProgressed = false
+    for (const lane of DISPATCH_LANE_ORDER) {
+      if (ordered.length >= capacity) break
+      const queue = lanes.get(lane)!
+      if (!queue.length) continue
+      recordSelected(queue.shift()!, lane)
+      backfillProgressed = true
     }
   }
 
   if (options.allowLeadOverflow ?? true) {
     while (ordered.length < capacity && leadQueue.length > 0) {
-      ordered.push(leadQueue.shift()!)
-      selectedByLane.lead += 1
+      recordSelected(leadQueue.shift()!, 'lead')
     }
   }
 
   // Surplus slots only: unstarted trial duplicates never displace a distinct primary hypothesis.
   for (const entry of duplicateTrials) {
     if (ordered.length >= capacity) break
-    ordered.push(entry.step)
-    selectedByLane[entry.lane] += 1
+    recordSelected(entry.step, entry.lane)
   }
 
   return {
@@ -2586,9 +2912,14 @@ export function dispatchFrontierWave<T extends DispatchLaneStep>(
 export class FrontierDispatcher {
   readonly controller: FrontierWaveController | null
   private readonly stepMeta = new Map<string, Partial<TypedStepDispatchMeta>>()
+  private readonly getQuarantinedOrigins?: () => ReadonlySet<string>
 
-  constructor(options: { controller?: FrontierWaveController | null } = {}) {
+  constructor(options: {
+    controller?: FrontierWaveController | null
+    getQuarantinedOrigins?: () => ReadonlySet<string>
+  } = {}) {
     this.controller = options.controller ?? null
+    this.getQuarantinedOrigins = options.getQuarantinedOrigins
   }
 
   registerStepMeta(stepId: string, meta: Partial<TypedStepDispatchMeta>): void {
@@ -2613,10 +2944,12 @@ export class FrontierDispatcher {
     slots: number,
     options: FrontierDispatchOptions = {},
   ): FrontierDispatchPlan<T> {
+    const quarantinedOrigins = options.quarantinedOrigins ?? this.getQuarantinedOrigins?.()
     return dispatchFrontierWave(steps, slots, {
       ...options,
       frontierController: options.frontierController ?? this.controller,
       stepMetaById: options.stepMetaById ?? this.stepMeta,
+      ...(quarantinedOrigins && quarantinedOrigins.size > 0 ? { quarantinedOrigins } : {}),
     })
   }
 }
@@ -2661,6 +2994,10 @@ export function selectUncoveredHighRiskEndpoints<T extends HighRiskEndpointCandi
   limit?: number
   /** When repository source is mounted, prioritize AST/Program-Graph endpoints ahead of crawled routes. */
   sourceMounted?: boolean
+  /** Optional quarantined origins (edge-protected / unreachable) excluded from new high-risk steps. */
+  quarantinedOrigins?: ReadonlySet<string>
+  /** Soft per-origin concentration cap when multiple live origins have untested high-risk routes (default 0.5). */
+  maxOriginShare?: number
 }): T[] {
   const minRisk = input.minRisk ?? 60
   const limit = Math.max(0, Math.floor(input.limit ?? 6))
@@ -2669,6 +3006,7 @@ export function selectUncoveredHighRiskEndpoints<T extends HighRiskEndpointCandi
   const eligible: T[] = []
   for (const ep of input.endpoints) {
     if (!input.approvedOrigins.has(ep.origin)) continue
+    if (input.quarantinedOrigins?.has(ep.origin)) continue
     if (ep.riskScore < minRisk) continue
     const normalizedPath = normalizeEndpointTemplate(ep.pathTemplate)
     if (!normalizedPath || normalizedPath === '/') continue
@@ -2688,7 +3026,12 @@ export function selectUncoveredHighRiskEndpoints<T extends HighRiskEndpointCandi
     (a.coveragePct ?? 0) - (b.coveragePct ?? 0) ||
     a.method.localeCompare(b.method) ||
     a.pathTemplate.localeCompare(b.pathTemplate))
-  return eligible.slice(0, limit)
+  return enforcePerOriginFairness(eligible, {
+    limit,
+    maxOriginShare: input.maxOriginShare ?? DEFAULT_MAX_ORIGIN_SHARE,
+    originOf: ep => ep.origin,
+    quarantinedOrigins: input.quarantinedOrigins,
+  })
 }
 
 /**
@@ -3504,19 +3847,30 @@ export function applyCrownJewelStepBudget<T extends { title: string; priority: n
   hostTiers: Record<string, HostTier>,
   existingSteps: readonly Pick<ChainStep, 'title' | 'sourceOrigins' | 'status'>[],
   maxNewSteps: number,
+  options: {
+    quarantinedOrigins?: ReadonlySet<string>
+    maxOriginShare?: number
+  } = {},
 ): T[] {
   if (maxNewSteps <= 0 || !candidates.length) return []
-  const hasCrownJewel = Object.values(hostTiers).some(t => t === 'crown_jewel')
+  const quarantined = options.quarantinedOrigins
+  const maxOriginShare = options.maxOriginShare ?? DEFAULT_MAX_ORIGIN_SHARE
+  const hasCrownJewel = Object.entries(hostTiers).some(([origin, tier]) =>
+    tier === 'crown_jewel' && !quarantined?.has(origin))
   const existingTitles = new Set(existingSteps.map(s => s.title.trim().toLowerCase()))
 
   const isPureStatic = (origins: readonly string[]) =>
     origins.length > 0 && origins.every(o => (hostTiers[o] ?? classifyHostTier(o)) === 'low_value_static')
   const hasCrownOrigin = (origins: readonly string[]) =>
     origins.some(o => (hostTiers[o] ?? classifyHostTier(o)) === 'crown_jewel')
+  const isQuarantined = (origins: readonly string[]) =>
+    Boolean(quarantined && quarantined.size > 0 && origins.length > 0 && origins.every(o => quarantined.has(o)))
 
   const staticStepsByOrigin = new Map<string, number>()
+  const existingNonStaticCountsByOrigin = new Map<string, number>()
   let existingActiveSteps = 0
   let existingStaticSteps = 0
+  let existingNonStaticTotal = 0
   for (const step of existingSteps) {
     if (step.status === 'canceled' || step.status === 'tainted') continue
     existingActiveSteps += 1
@@ -3525,11 +3879,23 @@ export function applyCrownJewelStepBudget<T extends { title: string; priority: n
       for (const o of step.sourceOrigins) {
         staticStepsByOrigin.set(o, (staticStepsByOrigin.get(o) ?? 0) + 1)
       }
+    } else {
+      existingNonStaticTotal += 1
+      const primary = step.sourceOrigins[0]
+      if (primary && !quarantined?.has(primary)) {
+        existingNonStaticCountsByOrigin.set(primary, (existingNonStaticCountsByOrigin.get(primary) ?? 0) + 1)
+      }
     }
   }
 
   const normalized = candidates
-    .filter(step => step.origins.length > 0 && !existingTitles.has(step.title.trim().toLowerCase()))
+    .map(step => (quarantined && quarantined.size > 0
+      ? { ...step, origins: step.origins.filter(o => !quarantined.has(o)) }
+      : { ...step }))
+    .filter(step =>
+      step.origins.length > 0
+      && !isQuarantined(step.origins)
+      && !existingTitles.has(step.title.trim().toLowerCase()))
     .map(step => {
       if (!hasCrownJewel) return { ...step }
       if (isPureStatic(step.origins)) {
@@ -3548,39 +3914,47 @@ export function applyCrownJewelStepBudget<T extends { title: string; priority: n
     return tierA - tierB || b.priority - a.priority
   })
 
-  if (!hasCrownJewel) {
-    const out: T[] = []
-    const seenTitles = new Set(existingTitles)
-    for (const step of normalized) {
-      if (out.length >= maxNewSteps) break
-      const key = step.title.trim().toLowerCase()
-      if (seenTitles.has(key)) continue
-      seenTitles.add(key)
-      out.push(step)
-    }
-    return out
+  // Dedupe candidate titles before fairness selection so duplicate titles cannot distort per-origin counts.
+  const dedupedNormalized: T[] = []
+  const seenCandidateTitles = new Set(existingTitles)
+  for (const step of normalized) {
+    const key = step.title.trim().toLowerCase()
+    if (seenCandidateTitles.has(key)) continue
+    seenCandidateTitles.add(key)
+    dedupedNormalized.push(step)
   }
 
-  const crownOrStandardPool = normalized.filter(s => !isPureStatic(s.origins))
-  const staticPool = normalized.filter(s => isPureStatic(s.origins))
+  if (!hasCrownJewel) {
+    return enforcePerOriginFairness(dedupedNormalized, {
+      limit: maxNewSteps,
+      maxOriginShare,
+      existingCountsByOrigin: existingNonStaticCountsByOrigin,
+      existingTotal: existingNonStaticTotal,
+      originOf: step => step.origins[0],
+      quarantinedOrigins: quarantined,
+    })
+  }
 
-  const selected: T[] = []
-  const seenTitles = new Set(existingTitles)
+  const crownOrStandardPool = dedupedNormalized.filter(s => !isPureStatic(s.origins))
+  const staticPool = dedupedNormalized.filter(s => isPureStatic(s.origins))
 
-  // Target ~80% crown-jewel/standard allocation when crown-jewel hosts are present
-  const projectedTotal = existingActiveSteps + Math.min(maxNewSteps, normalized.length)
+  // Target ~80% crown-jewel/standard allocation when crown-jewel hosts are present, while enforcing
+  // soft per-origin fairness (<= 50%) among multiple live non-static origins.
+  const projectedTotal = existingActiveSteps + Math.min(maxNewSteps, dedupedNormalized.length)
   const maxTotalStaticSteps = Math.max(1, Math.floor(projectedTotal * 0.2))
   const crownTargetSlots = crownOrStandardPool.length > 0
     ? Math.max(1, Math.ceil(maxNewSteps * 0.8))
     : 0
 
-  for (const step of crownOrStandardPool) {
-    if (selected.length >= maxNewSteps) break
-    const key = step.title.trim().toLowerCase()
-    if (seenTitles.has(key)) continue
-    seenTitles.add(key)
-    selected.push(step)
-  }
+  const selected = enforcePerOriginFairness(crownOrStandardPool, {
+    limit: maxNewSteps,
+    maxOriginShare,
+    existingCountsByOrigin: existingNonStaticCountsByOrigin,
+    existingTotal: existingNonStaticTotal,
+    originOf: step => step.origins[0],
+    quarantinedOrigins: quarantined,
+  })
+  const seenTitles = new Set([...existingTitles, ...selected.map(s => s.title.trim().toLowerCase())])
 
   let staticAdded = 0
   for (const step of staticPool) {
@@ -4738,6 +5112,8 @@ export interface RunOrchestrationState {
   postFloorInvariantsSynced: boolean
   runtimeCompositeSeeded: boolean
   plannerSeenCausalEdges?: Set<string>
+  quarantinedOrigins?: Map<string, QuarantinedOriginRecord>
+  repoOriginMappings?: ServiceOriginMapping[]
   stepIds?: Set<string>
   runLifecycleUnsub?: () => void
   // Auth / lab / floor / vault / trace

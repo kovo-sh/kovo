@@ -62,6 +62,7 @@ import { meetsBaseline, type EvidenceReview } from './evidence-checks.ts'
 import {
   CHAIN_CONTINUATION_SKILL_PREFIX,
   CONTINUABLE_CHAIN_STEP_STATUSES,
+  DEFAULT_MAX_ORIGIN_SHARE,
   DET_LEAD_STEP_PRIORITY,
   DRY_ROUND_LIMIT,
   FrontierDispatcher,
@@ -92,9 +93,12 @@ import {
   detLeadEvidenceGate,
   detLeadSkills,
   detLeadUnlocksReinvestigation,
+  detectQuarantinedOrigins,
   dispatchableReadySteps,
   emptyDispatchFunnel,
+  enforcePerOriginFairness,
   evaluateDispatchStop,
+  hasAuthenticatedPersonaForOrigin,
   isGenericWave1BoundaryChainStep,
   extractContinuationDepth,
   formatHopCheckpointForAssignment,
@@ -120,9 +124,12 @@ import {
   templatesMentionedInText,
   threatModelResponseSchema,
   type BolaTestQueueItem,
+  type DetectQuarantinedOriginsInput,
+  type DetectQuarantinedOriginsResult,
   type DispatchFunnelCounts,
   type DispatchStopReason,
   type FrontierWaveControllerOptions,
+  type QuarantinedOriginRecord,
   type ReinvestigationGuard,
   type RuntimeCompositeApiDependencyInput,
   type StructuredStepTarget,
@@ -900,14 +907,671 @@ function yieldEventLoopTurn(): Promise<void> {
   })
 }
 
+export type RepoOriginAffinityConfidence =
+  | 'exact'
+  | 'config'
+  | 'host'
+  | 'path'
+  | 'port'
+  | 'live_route'
+  | 'hostname_affinity'
+  | 'single_origin'
+  | 'unmapped'
+
+export interface RepoAffinityDescriptor {
+  /** Mounted repo identifier or slug (e.g. `dmail`, `owner/dyad-billingz`, `/repos/dyad-llm-engine`). */
+  repo: string
+  /** Optional relative root prefix inside workspace/source files. */
+  root?: string
+  /** Optional `package.json` `name` field. */
+  packageName?: string
+  /** Optional `package.json` `homepage` URL or hostname. */
+  homepage?: string
+  /** Optional explicit hostnames/URLs extracted from config files (`wrangler.toml`, `vercel.json`, `fly.toml`, `.env`, `CNAME`, etc.). */
+  configHosts?: readonly string[]
+  /** Optional routes declared by this repo in static/AST extraction. */
+  declaredRoutes?: readonly string[]
+}
+
+export interface LiveOriginEndpointObservation {
+  origin: string
+  pathTemplate: string
+  method?: string
+  status?: number | null
+  source?: string | null
+}
+
+export interface RepoOriginAffinityInput {
+  approvedOrigins: readonly string[]
+  repos: readonly (string | RepoAffinityDescriptor)[]
+  /** Optional pre-computed compose/ingress/AST service-to-origin mappings. */
+  serviceOrigins?: readonly ServiceOriginMapping[]
+  /** Optional docker-compose YAML text. */
+  compose?: string
+  /** Optional Kubernetes/Traefik ingress YAML text. */
+  ingress?: string
+  /** Optional discovered live endpoints per origin for route-overlap cross-matching. */
+  liveEndpoints?: readonly LiveOriginEndpointObservation[]
+}
+
+export interface RepoOriginAffinityMapping {
+  repo: string
+  root: string
+  origin?: string
+  pathPrefix?: string
+  confidence: RepoOriginAffinityConfidence
+  score: number
+  evidence: string[]
+}
+
+const AFFINITY_GENERIC_STOPWORDS = new Set([
+  'app', 'web', 'svc', 'service', 'server', 'backend', 'frontend', 'bot', 'repo',
+  'mono', 'monorepo', 'client', 'ui', 'site', 'core', 'main', 'hub', 'platform',
+  'tool', 'tools', 'cli', 'lib', 'pkg', 'sdk', 'www', 'prod', 'production', 'staging',
+])
+
+const LIVE_ROUTE_BOILERPLATE = new Set([
+  '/', '/health', '/healthz', '/ready', '/readyz', '/livez', '/status', '/ping',
+  '/metrics', '/robots.txt', '/favicon.ico', '/sitemap.xml',
+])
+
+const STATIC_ONLY_ENDPOINT_SOURCES = new Set(['repo_ast', 'program_graph', 'static_ast', 'code_audit'])
+
+function normalizeRepoRelPath(raw: string): string {
+  return raw.trim().replace(/^\/repos\//, '').replace(/^\/+|\/+$/g, '')
+}
+
+function repoBasenameSlug(raw: string): string {
+  const clean = normalizeRepoRelPath(raw)
+  const parts = clean.split('/').filter(Boolean)
+  return (parts[parts.length - 1] ?? clean).toLowerCase()
+}
+
+function stemAffinityToken(raw: string): string {
+  const tok = raw.toLowerCase().replace(/[^a-z0-9]/g, '')
+  if (!tok) return ''
+  if (tok === 'uploader' || tok === 'uploaders' || tok === 'uploading' || tok === 'uploads') return 'upload'
+  if (tok === 'downloader' || tok === 'downloaders' || tok === 'downloads') return 'download'
+  if (tok === 'mailer' || tok === 'mailers' || tok === 'mails') return 'mail'
+  if (tok === 'logger' || tok === 'loggers' || tok === 'logging' || tok === 'logs') return 'log'
+  if (tok === 'images' || tok === 'img' || tok === 'imgs') return 'image'
+  if (tok === 'workers' || tok === 'worker') return 'worker'
+  if (tok === 'engines') return 'engine'
+  if (tok === 'chats') return 'chat'
+  if (tok === 'files') return 'file'
+  if (tok === 'docs') return 'doc'
+  if (tok.length > 4 && tok.endsWith('ers')) return tok.slice(0, -3)
+  if (tok.length > 4 && tok.endsWith('er') && /(?:upload|download|mail|log|scan|build|sync|parse|route)er$/.test(tok)) {
+    return tok.slice(0, -2)
+  }
+  if (tok.length > 4 && tok.endsWith('ies')) return `${tok.slice(0, -3)}y`
+  if (tok.length > 3 && tok.endsWith('s') && !/(?:ss|us|is|status|access|billingz)$/.test(tok)) {
+    return tok.slice(0, -1)
+  }
+  return tok
+}
+
+function tokenizeAffinitySlug(raw: string): string[] {
+  return raw
+    .replace(/([a-z0-9])([A-Z])/g, '$1-$2')
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .map(t => t.trim())
+    .filter(Boolean)
+}
+
+function extractHostCandidate(raw: string): string | null {
+  const trimmed = raw.trim().replace(/^['"`]+|['"`]+$/g, '')
+  if (!trimmed) return null
+  if (/^https?:\/\//i.test(trimmed)) {
+    try { return new URL(trimmed).hostname.toLowerCase() } catch { return null }
+  }
+  const hostOnly = trimmed.split(/[/:?#]/, 1)[0]?.toLowerCase() ?? ''
+  if (/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/.test(hostOnly)) {
+    return hostOnly
+  }
+  return null
+}
+
+function extractHostsFromConfigText(text: string): string[] {
+  const hosts = new Set<string>()
+  for (const m of text.matchAll(/https?:\/\/([A-Za-z0-9.-]+)(?::\d+)?/g)) {
+    const h = m[1]?.toLowerCase()
+    if (h && h.includes('.')) hosts.add(h)
+  }
+  for (const m of text.matchAll(/\b(?:host|hostname|domain|route|pattern|custom_domain|cname|app_url|public_url|base_url|site_url)\s*[:=]\s*['"]?([A-Za-z0-9.-]+\.[A-Za-z]{2,})/gi)) {
+    const h = m[1]?.toLowerCase()
+    if (h) hosts.add(h)
+  }
+  return [...hosts]
+}
+
+interface ParsedOriginAffinityInfo {
+  origin: string
+  hostname: string
+  subdomain: string
+  apexBrand: string
+  subTokens: string[]
+  subStems: string[]
+  subStemSet: Set<string>
+}
+
+function parseOriginAffinityInfo(origin: string): ParsedOriginAffinityInfo | null {
+  try {
+    const url = new URL(origin)
+    const hostname = url.hostname.toLowerCase()
+    const labels = hostname.split('.').filter(Boolean)
+    let subdomain = hostname
+    let apexBrand = ''
+    if (labels.length >= 3) {
+      // Handle multi-label public suffixes conservatively (e.g. .co.uk) as well as standard 2-label apex (dyad.sh)
+      const secondLast = labels[labels.length - 2]!
+      const last = labels[labels.length - 1]!
+      const isTwoPartTld = last.length === 2 && /^(?:co|com|org|net|gov|edu|ac)$/.test(secondLast) && labels.length >= 4
+      const apexStart = isTwoPartTld ? labels.length - 3 : labels.length - 2
+      subdomain = labels.slice(0, apexStart).join('.')
+      apexBrand = labels[apexStart] ?? ''
+    } else if (labels.length === 2) {
+      // e.g. `dmail.example` or `upload-logs.example` -> subdomain `dmail` / `upload-logs`, brand `example`
+      subdomain = labels[0]!
+      apexBrand = labels[1]!
+    }
+    const subTokens = tokenizeAffinitySlug(subdomain)
+    const subStems = [...new Set(subTokens.map(stemAffinityToken).filter(Boolean))]
+    return {
+      origin,
+      hostname,
+      subdomain,
+      apexBrand,
+      subTokens,
+      subStems,
+      subStemSet: new Set(subStems),
+    }
+  } catch {
+    return null
+  }
+}
+
+function parseComposeOrIngressHostMatches(
+  text: string | undefined,
+  approvedHostToOrigin: ReadonlyMap<string, string>,
+): Array<{ serviceHint: string; origin: string; source: 'compose' | 'ingress' }> {
+  if (!text || !approvedHostToOrigin.size) return []
+  const results: Array<{ serviceHint: string; origin: string; source: 'compose' | 'ingress' }> = []
+  const lines = text.split(/\r?\n/)
+  let currentService = ''
+  let currentHost = ''
+  for (const rawLine of lines) {
+    const trimmed = rawLine.trim()
+    if (!trimmed || trimmed.startsWith('#')) continue
+    // Compose top-level service key under `services:` (`  my-svc:`)
+    const svcMatch = /^ {2}([A-Za-z0-9_.-]{1,80}):\s*$/.exec(rawLine)
+    if (svcMatch) {
+      currentService = svcMatch[1]!.toLowerCase()
+      currentHost = ''
+    }
+    // Ingress host line (`- host: foo.example` or `host: foo.example`)
+    const hostLine = /^-?\s*host\s*:\s*['"]?([A-Za-z0-9.-]+)['"]?/.exec(trimmed)
+    if (hostLine) {
+      currentHost = hostLine[1]!.toLowerCase()
+    }
+    // Ingress backend service name (`name: my-svc` or `serviceName: my-svc`)
+    const ingressSvc = /^(?:name|serviceName)\s*:\s*['"]?([A-Za-z0-9_.-]{1,80})['"]?/.exec(trimmed)
+    if (ingressSvc && currentHost) {
+      const origin = approvedHostToOrigin.get(currentHost)
+      if (origin) {
+        results.push({ serviceHint: ingressSvc[1]!.toLowerCase(), origin, source: 'ingress' })
+      }
+    }
+    // Any approved hostname mentioned inside a compose service stanza (Traefik Host(`...`), env VIRTUAL_HOST, etc.)
+    if (currentService) {
+      const lower = trimmed.toLowerCase()
+      for (const [host, origin] of approvedHostToOrigin.entries()) {
+        if (lower.includes(host)) {
+          results.push({ serviceHint: currentService, origin, source: 'compose' })
+        }
+      }
+    }
+  }
+  return results
+}
+
+function normalizeDeclaredRouteForOverlap(raw: string): string | null {
+  const cleaned = raw.trim().replace(/^(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|ANY)\s+/i, '').split(/[?#]/, 1)[0] ?? ''
+  if (!cleaned.startsWith('/')) return null
+  const norm = normalizeEndpointTemplate(cleaned)
+  if (!norm || LIVE_ROUTE_BOILERPLATE.has(norm.toLowerCase())) return null
+  return norm.toLowerCase()
+}
+
+/**
+ * Deterministic Repo→Origin affinity resolution:
+ * 1. Explicit `serviceOrigins`, compose/ingress host rules, `package.json` `homepage`, or config host hints.
+ * 2. Live-route overlap cross-matching (live origin returning 2xx/401/403 on routes matching repo's declared routes).
+ * 3. Deterministic repo-slug / package-name ↔ hostname token & stem affinity (bipartite highest-score-first).
+ * 4. Single-origin fallback ONLY when `approvedOrigins.length === 1`. When `approvedOrigins.length > 1`
+ *    and ZERO confident match exists, marks the repo `unmapped` — NEVER dumping onto `approvedOrigins[0]`.
+ */
+export function resolveRepoOriginAffinity(input: RepoOriginAffinityInput): RepoOriginAffinityMapping[] {
+  const uniqueOrigins = [...new Set(input.approvedOrigins.map(o => o.trim()).filter(Boolean))]
+  const parsedOrigins = uniqueOrigins
+    .map(parseOriginAffinityInfo)
+    .filter((info): info is ParsedOriginAffinityInfo => info !== null)
+  const approvedOriginSet = new Set(parsedOrigins.map(o => o.origin))
+  const approvedHostToOrigin = new Map<string, string>()
+  const brandCounts = new Map<string, number>()
+  for (const info of parsedOrigins) {
+    approvedHostToOrigin.set(info.hostname, info.origin)
+    if (info.apexBrand) brandCounts.set(info.apexBrand, (brandCounts.get(info.apexBrand) ?? 0) + 1)
+  }
+  // Brand tokens that appear as the apex brand on approved origins (e.g. `dyad` for `*.dyad.sh`).
+  const brandTokens = new Set<string>(
+    [...brandCounts.entries()].filter(([, count]) => count >= 1).map(([brand]) => brand.toLowerCase()),
+  )
+
+  const normalizedRepos: Array<{
+    descriptor: RepoAffinityDescriptor
+    root: string
+    slug: string
+    pkgSlug: string
+  }> = input.repos.map(entry => {
+    const desc: RepoAffinityDescriptor = typeof entry === 'string' ? { repo: entry } : entry
+    const root = normalizeRepoRelPath(desc.root ?? desc.repo)
+    const slug = repoBasenameSlug(desc.repo)
+    const rawPkg = (desc.packageName ?? '').trim().toLowerCase()
+    const pkgSlug = rawPkg.includes('/') ? (rawPkg.split('/').pop() ?? rawPkg) : rawPkg
+    return { descriptor: desc, root, slug, pkgSlug }
+  })
+
+  const resolved = new Map<number, RepoOriginAffinityMapping>()
+  const claimedOrigins = new Set<string>()
+
+  // Pre-index compose/ingress host rules if supplied.
+  const composeIngressHints = [
+    ...parseComposeOrIngressHostMatches(input.compose, approvedHostToOrigin),
+    ...parseComposeOrIngressHostMatches(input.ingress, approvedHostToOrigin),
+  ]
+
+  // --- Pass 1: Explicit serviceOrigins, homepage, configHosts, compose/ingress ---
+  for (let i = 0; i < normalizedRepos.length; i += 1) {
+    const item = normalizedRepos[i]!
+    const { descriptor, root, slug, pkgSlug } = item
+    const aliases = new Set<string>([slug, root.toLowerCase(), ...(pkgSlug ? [pkgSlug] : [])].filter(Boolean))
+
+    // 1a. Pre-computed ServiceOriginMapping (from Phase-0 / mapServicesToOrigins)
+    const explicitMapping = (input.serviceOrigins ?? []).find(m => {
+      if (!m.origin || m.confidence === 'unmapped' || !approvedOriginSet.has(m.origin)) return false
+      const mSvc = m.service.toLowerCase()
+      const mRoot = m.root ? normalizeRepoRelPath(m.root).toLowerCase() : ''
+      return aliases.has(mSvc) || (Boolean(mRoot) && (aliases.has(mRoot) || mRoot.endsWith(`/${slug}`)))
+    })
+    if (explicitMapping?.origin) {
+      resolved.set(i, {
+        repo: descriptor.repo,
+        root,
+        origin: explicitMapping.origin,
+        ...(explicitMapping.pathPrefix ? { pathPrefix: explicitMapping.pathPrefix } : {}),
+        confidence: explicitMapping.confidence as RepoOriginAffinityConfidence,
+        score: 120,
+        evidence: explicitMapping.evidence.length ? [...explicitMapping.evidence] : [`explicit service mapping -> ${explicitMapping.origin}`],
+      })
+      if (!explicitMapping.pathPrefix) claimedOrigins.add(explicitMapping.origin)
+      continue
+    }
+
+    // 1b. Explicit homepage or configHosts
+    const configCandidates = [
+      ...(descriptor.homepage ? [descriptor.homepage] : []),
+      ...(descriptor.configHosts ?? []),
+    ]
+    let configOrigin: string | undefined
+    let configHostMatched = ''
+    for (const rawHint of configCandidates) {
+      const host = extractHostCandidate(rawHint)
+      if (!host) continue
+      const hit = approvedHostToOrigin.get(host)
+      if (hit) {
+        configOrigin = hit
+        configHostMatched = host
+        break
+      }
+    }
+    if (configOrigin) {
+      resolved.set(i, {
+        repo: descriptor.repo,
+        root,
+        origin: configOrigin,
+        confidence: 'config',
+        score: 115,
+        evidence: [`repo manifest/config host hint "${configHostMatched}" matches ${configOrigin}`],
+      })
+      claimedOrigins.add(configOrigin)
+      continue
+    }
+
+    // 1c. Explicit compose/ingress host rule matching repo alias
+    const ciHit = composeIngressHints.find(h => aliases.has(h.serviceHint) || h.serviceHint === slug || slug.endsWith(`-${h.serviceHint}`))
+    if (ciHit) {
+      resolved.set(i, {
+        repo: descriptor.repo,
+        root,
+        origin: ciHit.origin,
+        confidence: 'host',
+        score: 110,
+        evidence: [`${ciHit.source} service "${ciHit.serviceHint}" mapped to ${ciHit.origin}`],
+      })
+      claimedOrigins.add(ciHit.origin)
+    }
+  }
+
+  // --- Pass 2: Live-route overlap cross-matching ---
+  const liveRoutesByOrigin = new Map<string, Set<string>>()
+  const routeOriginFreq = new Map<string, number>()
+  for (const ep of input.liveEndpoints ?? []) {
+    const origin = ep.origin.trim()
+    if (!approvedOriginSet.has(origin)) continue
+    if (typeof ep.status === 'number') {
+      const isLiveStatus = (ep.status >= 200 && ep.status < 300) || ep.status === 401 || ep.status === 403
+      if (!isLiveStatus) continue
+    } else if (ep.source && STATIC_ONLY_ENDPOINT_SOURCES.has(ep.source.toLowerCase())) {
+      continue
+    }
+    const norm = normalizeDeclaredRouteForOverlap(ep.pathTemplate)
+    if (!norm) continue
+    let set = liveRoutesByOrigin.get(origin)
+    if (!set) {
+      set = new Set<string>()
+      liveRoutesByOrigin.set(origin, set)
+    }
+    if (!set.has(norm)) {
+      set.add(norm)
+      routeOriginFreq.set(norm, (routeOriginFreq.get(norm) ?? 0) + 1)
+    }
+  }
+
+  if (liveRoutesByOrigin.size > 0) {
+    for (let i = 0; i < normalizedRepos.length; i += 1) {
+      if (resolved.has(i)) continue
+      const { descriptor, root } = normalizedRepos[i]!
+      const declared = [...new Set((descriptor.declaredRoutes ?? [])
+        .map(normalizeDeclaredRouteForOverlap)
+        .filter((r): r is string => Boolean(r)))]
+      if (!declared.length) continue
+      const scores: Array<{ origin: string; score: number; matched: string[] }> = []
+      for (const [origin, liveSet] of liveRoutesByOrigin.entries()) {
+        let score = 0
+        const matched: string[] = []
+        for (const route of declared) {
+          if (!liveSet.has(route)) continue
+          matched.push(route)
+          const freq = routeOriginFreq.get(route) ?? 1
+          score += freq === 1 ? 2 : 1
+        }
+        if (score > 0) scores.push({ origin, score, matched })
+      }
+      scores.sort((a, b) => b.score - a.score || b.matched.length - a.matched.length || a.origin.localeCompare(b.origin))
+      const top = scores[0]
+      const second = scores[1]
+      if (top && (!second || top.score > second.score)) {
+        resolved.set(i, {
+          repo: descriptor.repo,
+          root,
+          origin: top.origin,
+          confidence: 'live_route',
+          score: 95 + top.matched.length,
+          evidence: [`live-route overlap (${top.matched.length} route(s): ${top.matched.slice(0, 3).join(', ')}) matches ${top.origin}`],
+        })
+        claimedOrigins.add(top.origin)
+      }
+    }
+  }
+
+  // --- Pass 3: Deterministic repo-slug / package-name <-> hostname affinity (bipartite highest-score-first) ---
+  const scoreRepoVsOrigin = (
+    item: { slug: string; pkgSlug: string },
+    originInfo: ParsedOriginAffinityInfo,
+  ): { score: number; confidence: 'exact' | 'hostname_affinity'; reason: string } => {
+    const candidates = [item.slug, ...(item.pkgSlug && item.pkgSlug !== item.slug ? [item.pkgSlug] : [])]
+    let bestScore = 0
+    let bestConfidence: 'exact' | 'hostname_affinity' = 'hostname_affinity'
+    let bestReason = ''
+
+    for (const rawName of candidates) {
+      const allTokens = tokenizeAffinitySlug(rawName)
+      if (!allTokens.length) continue
+      // Strip leading/trailing apex brand tokens (e.g. `dyad-billingz` -> `billingz`) when non-brand tokens remain.
+      const withoutBrand = allTokens.filter(t => !brandTokens.has(t))
+      const baseTokens = withoutBrand.length > 0 ? withoutBrand : allTokens
+      const distinctiveTokens = baseTokens.filter(t => !AFFINITY_GENERIC_STOPWORDS.has(t))
+      const effectiveTokens = distinctiveTokens.length > 0 ? distinctiveTokens : baseTokens
+
+      const joinedBase = baseTokens.join('-')
+      const joinedEffective = effectiveTokens.join('-')
+      const subClean = originInfo.subdomain.toLowerCase()
+      const subCompact = subClean.replace(/[^a-z0-9]/g, '')
+      const baseCompact = joinedBase.replace(/[^a-z0-9]/g, '')
+      const effCompact = joinedEffective.replace(/[^a-z0-9]/g, '')
+
+      // Exact subdomain match after brand/stopword normalization
+      if (rawName === subClean || joinedBase === subClean || joinedEffective === subClean) {
+        if (100 > bestScore) {
+          bestScore = 100
+          bestConfidence = 'exact'
+          bestReason = `repo slug "${rawName}" matches subdomain "${originInfo.subdomain}"`
+        }
+        continue
+      }
+      if (baseCompact.length >= 3 && (baseCompact === subCompact || effCompact === subCompact)) {
+        if (95 > bestScore) {
+          bestScore = 95
+          bestConfidence = 'hostname_affinity'
+          bestReason = `normalized slug "${joinedEffective}" matches subdomain "${originInfo.subdomain}"`
+        }
+        continue
+      }
+
+      const repoStems = [...new Set(effectiveTokens.map(stemAffinityToken).filter(Boolean))]
+      const repoStemSet = new Set(repoStems)
+      const subStems = originInfo.subStems
+      const subStemSet = originInfo.subStemSet
+      if (!repoStems.length || !subStems.length) continue
+
+      const sharedStems = repoStems.filter(s => subStemSet.has(s))
+      if (!sharedStems.length) continue
+
+      // Identical stem sets (e.g. `image-uploader` -> {image, upload} === `upload-image` -> {upload, image})
+      if (sharedStems.length === repoStemSet.size && sharedStems.length === subStemSet.size) {
+        if (90 > bestScore) {
+          bestScore = 90
+          bestConfidence = 'hostname_affinity'
+          bestReason = `repo stems [${repoStems.join(',')}] match subdomain "${originInfo.subdomain}"`
+        }
+        continue
+      }
+
+      // Every subdomain stem appears in repo stems (e.g. `llm-engine` -> `engine`, `dyad-eve-bot` -> `eve`)
+      if (subStems.every(s => repoStemSet.has(s))) {
+        const extra = Math.max(0, repoStems.length - subStems.length)
+        const s = Math.max(62, 78 + subStems.length * 5 - extra * 3)
+        if (s > bestScore) {
+          bestScore = s
+          bestConfidence = 'hostname_affinity'
+          bestReason = `subdomain stems [${subStems.join(',')}] matched by repo "${rawName}"`
+        }
+        continue
+      }
+
+      // Every effective repo stem appears in subdomain stems (e.g. `dmail` -> `dmail-app`)
+      if (repoStems.every(s => subStemSet.has(s))) {
+        const extra = Math.max(0, subStems.length - repoStems.length)
+        const s = Math.max(58, 72 + repoStems.length * 5 - extra * 3)
+        if (s > bestScore) {
+          bestScore = s
+          bestConfidence = 'hostname_affinity'
+          bestReason = `repo stems [${repoStems.join(',')}] contained in subdomain "${originInfo.subdomain}"`
+        }
+        continue
+      }
+
+      // Partial meaningful stem overlap (e.g. `chat-uploader` sharing `upload` with `upload-logs`)
+      const meaningfulShared = sharedStems.filter(s => s.length >= 4 && !AFFINITY_GENERIC_STOPWORDS.has(s))
+      if (meaningfulShared.length > 0) {
+        const s = 30 + meaningfulShared.length * 15
+        if (s > bestScore) {
+          bestScore = s
+          bestConfidence = 'hostname_affinity'
+          bestReason = `shared stem(s) [${meaningfulShared.join(',')}] between repo "${rawName}" and subdomain "${originInfo.subdomain}"`
+        }
+      }
+    }
+
+    return { score: bestScore, confidence: bestConfidence, reason: bestReason }
+  }
+
+  // Phase 3a: commit strong hostname affinity matches (score >= 60), highest score first
+  const strongEdges: Array<{ repoIdx: number; origin: string; score: number; confidence: 'exact' | 'hostname_affinity'; reason: string }> = []
+  for (let i = 0; i < normalizedRepos.length; i += 1) {
+    if (resolved.has(i)) continue
+    const perOrigin = parsedOrigins
+      .map(info => ({ origin: info.origin, ...scoreRepoVsOrigin(normalizedRepos[i]!, info) }))
+      .filter(e => e.score >= 60)
+      .sort((a, b) => b.score - a.score || a.origin.localeCompare(b.origin))
+    if (perOrigin.length > 0 && (perOrigin.length === 1 || perOrigin[0]!.score > perOrigin[1]!.score)) {
+      strongEdges.push({ repoIdx: i, ...perOrigin[0]! })
+    }
+  }
+  strongEdges.sort((a, b) => b.score - a.score || a.repoIdx - b.repoIdx)
+  for (const edge of strongEdges) {
+    if (resolved.has(edge.repoIdx)) continue
+    const { descriptor, root } = normalizedRepos[edge.repoIdx]!
+    resolved.set(edge.repoIdx, {
+      repo: descriptor.repo,
+      root,
+      origin: edge.origin,
+      confidence: edge.confidence,
+      score: edge.score,
+      evidence: [edge.reason],
+    })
+    claimedOrigins.add(edge.origin)
+  }
+
+  // Phase 3b: commit unique partial stem matches (score >= 30) against UNCLAIMED origins only
+  // (e.g., after `image-uploader` claims `upload-image`, `chat-uploader` uniquely binds to `upload-logs`).
+  const unclaimedOrigins = parsedOrigins.filter(info => !claimedOrigins.has(info.origin))
+  if (unclaimedOrigins.length > 0) {
+    const partialCandidates: Array<{ repoIdx: number; origin: string; score: number; reason: string }> = []
+    for (let i = 0; i < normalizedRepos.length; i += 1) {
+      if (resolved.has(i)) continue
+      const perOrigin = unclaimedOrigins
+        .map(info => ({ origin: info.origin, ...scoreRepoVsOrigin(normalizedRepos[i]!, info) }))
+        .filter(e => e.score >= 30)
+        .sort((a, b) => b.score - a.score || a.origin.localeCompare(b.origin))
+      if (perOrigin.length > 0 && (perOrigin.length === 1 || perOrigin[0]!.score > perOrigin[1]!.score)) {
+        partialCandidates.push({ repoIdx: i, origin: perOrigin[0]!.origin, score: perOrigin[0]!.score, reason: perOrigin[0]!.reason })
+      }
+    }
+    partialCandidates.sort((a, b) => b.score - a.score || a.repoIdx - b.repoIdx)
+    for (const edge of partialCandidates) {
+      if (resolved.has(edge.repoIdx) || claimedOrigins.has(edge.origin)) continue
+      const { descriptor, root } = normalizedRepos[edge.repoIdx]!
+      resolved.set(edge.repoIdx, {
+        repo: descriptor.repo,
+        root,
+        origin: edge.origin,
+        confidence: 'hostname_affinity',
+        score: edge.score,
+        evidence: [edge.reason],
+      })
+      claimedOrigins.add(edge.origin)
+    }
+  }
+
+  // --- Pass 4: Single-origin bind vs explicit `unmapped` on multi-origin runs ---
+  const output: RepoOriginAffinityMapping[] = []
+  for (let i = 0; i < normalizedRepos.length; i += 1) {
+    const existing = resolved.get(i)
+    if (existing) {
+      output.push(existing)
+      continue
+    }
+    const { descriptor, root } = normalizedRepos[i]!
+    if (parsedOrigins.length === 1) {
+      const soleOrigin = parsedOrigins[0]!.origin
+      output.push({
+        repo: descriptor.repo,
+        root,
+        origin: soleOrigin,
+        confidence: 'single_origin',
+        score: 10,
+        evidence: [`single approved origin; bound mounted repo "${descriptor.repo}" to ${soleOrigin}`],
+      })
+    } else {
+      output.push({
+        repo: descriptor.repo,
+        root,
+        confidence: 'unmapped',
+        score: 0,
+        evidence: [
+          parsedOrigins.length > 1
+            ? `no compose/ingress/config, live-route, or hostname affinity match across ${parsedOrigins.length} approved origins; marked unmapped instead of falling back to approvedOrigins[0]`
+            : 'no approved origins configured',
+        ],
+      })
+    }
+  }
+  return output
+}
+
+/** Convert `RepoOriginAffinityMapping[]` into `ServiceOriginMapping[]` for `synthesizeInvariants`. */
+export function repoOriginMappingsToServiceOrigins(
+  mappings: readonly RepoOriginAffinityMapping[],
+): ServiceOriginMapping[] {
+  return mappings.map(m => {
+    const confidence: ServiceOriginMapping['confidence'] =
+      m.confidence === 'unmapped' || !m.origin
+        ? 'unmapped'
+        : m.confidence === 'exact' || m.confidence === 'config' || m.confidence === 'single_origin'
+          ? 'exact'
+          : m.confidence === 'path'
+            ? 'path'
+            : m.confidence === 'port'
+              ? 'port'
+              : 'host'
+    return {
+      service: repoBasenameSlug(m.repo),
+      ...(m.root ? { root: m.root } : {}),
+      ...(m.origin ? { origin: m.origin } : {}),
+      ...(m.pathPrefix ? { pathPrefix: m.pathPrefix } : {}),
+      confidence,
+      evidence: m.evidence,
+    }
+  })
+}
+
+const HOST_HINT_CONFIG_FILES = new Set([
+  'wrangler.toml',
+  'vercel.json',
+  'fly.toml',
+  'cname',
+  '.env.example',
+  '.env.production',
+])
+
 async function collectBoundedRepoSourceFiles(
   reposDir: string,
   mountedRepos: readonly string[],
   maxFiles = 160,
   signal?: AbortSignal,
-): Promise<{ files: SourceFileInput[]; compose?: string }> {
+): Promise<{
+  files: SourceFileInput[]
+  compose?: string
+  ingress?: string
+  repoDescriptors: RepoAffinityDescriptor[]
+}> {
   const files: SourceFileInput[] = []
   let compose: string | undefined
+  let ingress: string | undefined
+  const repoDescriptors: RepoAffinityDescriptor[] = []
   let opsSinceYield = 0
   const maybeYield = async () => {
     opsSinceYield += 1
@@ -916,21 +1580,28 @@ async function collectBoundedRepoSourceFiles(
       await yieldEventLoopTurn()
     }
   }
+  const perRepoCap = mountedRepos.length > 1
+    ? Math.max(16, Math.ceil(maxFiles / mountedRepos.length))
+    : maxFiles
   for (const mountedRepo of mountedRepos) {
-    if (signal?.aborted || files.length >= maxFiles) break
+    if (signal?.aborted) break
     const repoRel = mountedRepo.replace(/^\/repos\//, '').replace(/\/+$/, '')
     const repoRoot = repoRel ? join(reposDir, repoRel) : reposDir
     let rootStat
     try { rootStat = await lstat(repoRoot) } catch { continue }
     if (!rootStat.isDirectory()) continue
+    let packageName: string | undefined
+    let homepage: string | undefined
+    const configHosts = new Set<string>()
+    let repoFilesCount = 0
     const stack = [repoRoot]
-    while (stack.length > 0 && files.length < maxFiles && !signal?.aborted) {
+    while (stack.length > 0 && !signal?.aborted) {
       const dir = stack.pop()!
       let entries: string[]
       try { entries = await readdir(dir) } catch { continue }
       entries.sort()
       for (const entry of entries) {
-        if (signal?.aborted || files.length >= maxFiles) break
+        if (signal?.aborted) break
         if (INVARIANT_SKIP_DIRS.has(entry)) continue
         const full = join(dir, entry)
         let st
@@ -941,19 +1612,67 @@ async function collectBoundedRepoSourceFiles(
         if (st.isDirectory()) { stack.push(full); continue }
         if (!st.isFile() || st.size > 128 * 1024) continue
         const lower = entry.toLowerCase()
-        if (!compose && (lower === 'docker-compose.yml' || lower === 'docker-compose.yaml' || lower === 'compose.yml' || lower === 'compose.yaml')) {
-          try { compose = await readFile(full, 'utf8') } catch { /* ignore */ }
+        if (lower === 'docker-compose.yml' || lower === 'docker-compose.yaml' || lower === 'compose.yml' || lower === 'compose.yaml') {
+          try {
+            const text = await readFile(full, 'utf8')
+            compose = compose ? `${compose}\n${text}` : text
+            for (const h of extractHostsFromConfigText(text)) configHosts.add(h)
+          } catch { /* ignore */ }
           continue
         }
+        if (lower === 'ingress.yml' || lower === 'ingress.yaml') {
+          try {
+            const text = await readFile(full, 'utf8')
+            ingress = ingress ? `${ingress}\n${text}` : text
+            for (const h of extractHostsFromConfigText(text)) configHosts.add(h)
+          } catch { /* ignore */ }
+          continue
+        }
+        if (lower === 'package.json' && dir === repoRoot && st.size <= 32 * 1024) {
+          try {
+            const raw = await readFile(full, 'utf8')
+            const pkg = JSON.parse(raw) as { name?: unknown; homepage?: unknown }
+            if (typeof pkg.name === 'string' && pkg.name.trim()) packageName = pkg.name.trim()
+            if (typeof pkg.homepage === 'string' && pkg.homepage.trim()) homepage = pkg.homepage.trim()
+            for (const h of extractHostsFromConfigText(raw)) configHosts.add(h)
+          } catch { /* ignore */ }
+          continue
+        }
+        if (HOST_HINT_CONFIG_FILES.has(lower) && st.size <= 32 * 1024) {
+          try {
+            const raw = await readFile(full, 'utf8')
+            if (lower === 'cname') {
+              const cnameHost = extractHostCandidate(raw.split(/\r?\n/, 1)[0] ?? '')
+              if (cnameHost) configHosts.add(cnameHost)
+            } else {
+              for (const h of extractHostsFromConfigText(raw)) configHosts.add(h)
+            }
+          } catch { /* ignore */ }
+          continue
+        }
+        if (files.length >= maxFiles || repoFilesCount >= perRepoCap) continue
         if (!INVARIANT_SCAN_EXT.has(extname(lower))) continue
         try {
           const relPath = relative(repoRoot, full).split(sep).join('/')
           files.push({ path: repoRel ? `${repoRel}/${relPath}` : relPath, content: await readFile(full, 'utf8') })
+          repoFilesCount += 1
         } catch { /* ignore */ }
       }
     }
+    repoDescriptors.push({
+      repo: mountedRepo,
+      root: repoRel || mountedRepo,
+      ...(packageName ? { packageName } : {}),
+      ...(homepage ? { homepage } : {}),
+      ...(configHosts.size ? { configHosts: [...configHosts] } : {}),
+    })
   }
-  return { files, ...(compose ? { compose } : {}) }
+  return {
+    files,
+    ...(compose ? { compose } : {}),
+    ...(ingress ? { ingress } : {}),
+    repoDescriptors,
+  }
 }
 
 function hopKindToCapabilityKind(kind: ChainHop['artifactKind']): CapabilityKind {
@@ -1230,6 +1949,8 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
   private get runtimeCompositeSeededRuns() { return this.runState.setView('runtimeCompositeSeeded') }
   private get emittedSealedHandleSets() { return this.runState.prefixedMapView<Set<string>, 'emittedSealedHandleSets'>('emittedSealedHandleSets', ':') }
   private get plannerSeenCausalEdges() { return this.runState.mapView('plannerSeenCausalEdges') }
+  private get quarantinedOriginsByRun() { return this.runState.mapView('quarantinedOrigins') }
+  private get repoOriginMappingsByRun() { return this.runState.mapView('repoOriginMappings') }
   private get detLeadStepKeys() { return this.runState.prefixedSetView('detLeadStepKeys', '\0') }
   private get detLeadGateRejected() { return this.runState.prefixedSetView('detLeadGateRejected', '\0') }
   private get cappedLeadReported() { return this.runState.prefixedSetView('cappedLeadReported', '\0') }
@@ -1279,6 +2000,8 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       state.postFloorInvariantsSynced = false
       state.runtimeCompositeSeeded = false
       state.plannerSeenCausalEdges = undefined
+      state.quarantinedOrigins = undefined
+      state.repoOriginMappings = undefined
       state.stepIds = undefined
       state.emittedSealedHandleSets.clear()
       state.detLeadStepKeys.clear()
@@ -1582,9 +2305,180 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     if (!state.frontierDispatcher) {
       state.frontierDispatcher = new FrontierDispatcher({
         controller: this.frontierControllerFor(runId),
+        getQuarantinedOrigins: () => {
+          try {
+            const currentRun = this.storage.run(runId)
+            return this.getQuarantinedOriginSet(currentRun)
+          } catch {
+            return new Set<string>()
+          }
+        },
       })
     }
     return state.frontierDispatcher
+  }
+
+  /**
+   * Record quarantined hosts (`edge_protected` / `unreachable`) on run state, emit a single
+   * structured coverage gap per quarantined origin (idempotent via `(runId, goalRevision, origin, category)`),
+   * and emit a telemetry event so planner & dispatch concentrate turn budgets on live origins.
+   */
+  quarantineOrigins(
+    run: Run,
+    records: readonly QuarantinedOriginRecord[],
+    assignmentId?: string,
+  ): QuarantinedOriginRecord[] {
+    if (!records.length) return []
+    const existingMap = this.quarantinedOriginsByRun.get(run.id) ?? new Map<string, QuarantinedOriginRecord>()
+    this.quarantinedOriginsByRun.set(run.id, existingMap)
+    const gapAssignmentId = assignmentId?.trim() || 'planner:host-quarantine'
+    const newlyQuarantined: QuarantinedOriginRecord[] = []
+
+    for (const rec of records) {
+      const origin = rec.origin.trim()
+      if (!origin) continue
+      const prev = existingMap.get(origin)
+      // Preserve an existing `unreachable` diagnosis over a softer `edge_protected` one.
+      if (prev && (prev.reason === rec.reason || prev.reason === 'unreachable')) continue
+      existingMap.set(origin, rec)
+      newlyQuarantined.push(rec)
+
+      const category = rec.reason === 'edge_protected' ? 'auth-identity' : 'misconfig-exposure'
+      const summary = rec.reason === 'edge_protected'
+        ? `Host quarantined (edge_protected): ${rec.detail}. Excluded from unauthenticated investigation steps; supply an authenticated persona for this origin to test behind the edge auth wall.`
+        : `Host quarantined (unreachable): ${rec.detail}. Excluded from investigation queue to concentrate budget on reachable origins.`
+      try {
+        this.storage.upsertCoverageEntry(run, gapAssignmentId, {
+          origin,
+          category,
+          status: 'needs_follow_up',
+          summary,
+          proofGapReason: rec.reason,
+        })
+      } catch (err) {
+        this.noteLifecycleWarning(run.id, 'quarantineOrigins.upsertCoverageEntry', err, { origin, reason: rec.reason })
+      }
+      try {
+        this.storage.event(
+          run.id,
+          'planner.origin_quarantined',
+          `Quarantined origin ${origin} (${rec.reason}): ${rec.detail}`,
+          {
+            origin,
+            reason: rec.reason,
+            source: rec.source,
+            ...(rec.observedStatuses?.length ? { observedStatuses: rec.observedStatuses } : {}),
+            ...(typeof rec.requestsObserved === 'number' ? { requestsObserved: rec.requestsObserved } : {}),
+          },
+        )
+      } catch { /* telemetry is best-effort */ }
+    }
+    return newlyQuarantined
+  }
+
+  /**
+   * Detect and quarantine edge-protected / dead hosts from Phase-0 output + observed broker exchanges,
+   * recording one structured coverage gap per quarantined origin.
+   */
+  refreshQuarantinedOriginsFromPhase0(
+    run: Run,
+    input: {
+      approvedOrigins?: ReadonlySet<string>
+      edgeProtectedOrigins?: DetectQuarantinedOriginsInput['edgeProtectedOrigins']
+      skippedDeadHosts?: DetectQuarantinedOriginsInput['skippedDeadHosts']
+      extraExchanges?: DetectQuarantinedOriginsInput['observedExchanges']
+      assignmentId?: string
+    },
+  ): DetectQuarantinedOriginsResult {
+    const approvedOrigins = input.approvedOrigins ?? this.host.approvedOriginsSet(run)
+    const personas = [...resolveRunPersonas(this.storage, run.projectId, run.approvedPersonaIds).values()]
+      .map(p => ({ handle: p.handle, originAllowlist: p.originAllowlist }))
+    const observedExchanges: Array<NonNullable<DetectQuarantinedOriginsInput['observedExchanges']>[number]> = []
+    try {
+      const rows = this.storage.client.prepare(`
+        SELECT origin, path_and_query AS pathAndQuery, status, persona_handle AS personaHandle
+        FROM broker_exchanges
+        WHERE run_id = ?
+        ORDER BY created_at DESC
+        LIMIT 240
+      `).all(run.id) as Array<{ origin: string; pathAndQuery: string; status: number; personaHandle: string | null }>
+      for (const row of rows) {
+        if (approvedOrigins.size === 0 || approvedOrigins.has(row.origin)) {
+          observedExchanges.push(row)
+        }
+      }
+    } catch { /* best-effort DB read */ }
+    const combinedExchanges = [
+      ...observedExchanges,
+      ...(input.extraExchanges ?? []),
+    ]
+    const detected = detectQuarantinedOrigins({
+      approvedOrigins: [...approvedOrigins],
+      edgeProtectedOrigins: input.edgeProtectedOrigins,
+      skippedDeadHosts: input.skippedDeadHosts,
+      observedExchanges: combinedExchanges,
+      personas,
+    })
+    if (detected.records.length > 0) {
+      this.quarantineOrigins(run, detected.records, input.assignmentId)
+    }
+    return detected
+  }
+
+  /**
+   * Return currently quarantined origins for `run`. Re-checks active authenticated personas so an
+   * `edge_protected` host is automatically released if an authenticated persona for that origin
+   * becomes available (`unreachable` hosts remain quarantined).
+   */
+  getQuarantinedOriginSet(run: Run, approvedOrigins?: ReadonlySet<string>): Set<string> {
+    const scope = approvedOrigins ?? this.host.approvedOriginsSet(run)
+    const personas = [...resolveRunPersonas(this.storage, run.projectId, run.approvedPersonaIds).values()]
+      .map(p => ({ handle: p.handle, originAllowlist: p.originAllowlist }))
+    const stored = this.quarantinedOriginsByRun.get(run.id)
+    const out = new Set<string>()
+    if (stored) {
+      for (const [origin, rec] of stored.entries()) {
+        if (scope.size > 0 && !scope.has(origin)) continue
+        if (rec.reason === 'edge_protected' && hasAuthenticatedPersonaForOrigin(origin, personas)) {
+          continue
+        }
+        out.add(origin)
+      }
+    }
+    // Also detect any newly observed uniform 401-wall / 525-only origins from broker_exchanges
+    // (covers resumed runs or direct planner invocations without a preceding runThreatModel call).
+    const unexamined = [...scope].filter(origin => !stored?.has(origin))
+    if (unexamined.length > 0) {
+      try {
+        const rows = this.storage.client.prepare(`
+          SELECT origin, path_and_query AS pathAndQuery, status, persona_handle AS personaHandle
+          FROM broker_exchanges
+          WHERE run_id = ?
+          ORDER BY created_at DESC
+          LIMIT 240
+        `).all(run.id) as Array<{ origin: string; pathAndQuery: string; status: number; personaHandle: string | null }>
+        if (rows.length > 0) {
+          const detected = detectQuarantinedOrigins({
+            approvedOrigins: unexamined,
+            observedExchanges: rows,
+            personas,
+          })
+          if (detected.records.length > 0) {
+            this.quarantineOrigins(run, detected.records)
+            for (const rec of detected.records) out.add(rec.origin)
+          }
+        }
+      } catch { /* best-effort */ }
+    }
+    return out
+  }
+
+  /** Approved origins minus any currently quarantined (`edge_protected` / `unreachable`) hosts. */
+  activeApprovedOrigins(run: Run, approvedOrigins?: ReadonlySet<string>): Set<string> {
+    const scope = approvedOrigins ?? this.host.approvedOriginsSet(run)
+    const quarantined = this.getQuarantinedOriginSet(run, scope)
+    if (!quarantined.size) return new Set(scope)
+    return new Set([...scope].filter(origin => !quarantined.has(origin)))
   }
 
   /**
@@ -1609,8 +2503,9 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     const snap = options.staticSnapshot
     let sourceFiles: readonly SourceFileInput[] = options.sourceFiles ?? []
     let compose = options.compose ?? snap?.compose
-    const ingress = options.ingress ?? snap?.ingress
+    let ingress = options.ingress ?? snap?.ingress
     let graph = options.graph ?? snap?.programGraph
+    let repoDescriptors: RepoAffinityDescriptor[] = []
 
     if (!sourceFiles.length && snap) {
       const fromSnap: SourceFileInput[] = []
@@ -1627,6 +2522,8 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       const collected = await collectBoundedRepoSourceFiles(reposDir, mountedRepos, 160, options.signal)
       sourceFiles = collected.files
       compose = compose ?? collected.compose
+      ingress = ingress ?? collected.ingress
+      repoDescriptors = collected.repoDescriptors
     }
 
     const hasWhiteBoxSource = Boolean(graph || sourceFiles.length > 0)
@@ -1645,6 +2542,8 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     return this.finalizeCapabilityLedgerInvariants(run, {
       ...options,
       approvedOrigins,
+      mountedRepos,
+      repoDescriptors,
       specs,
       mode,
       graph,
@@ -1663,6 +2562,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     run: Run,
     input: SeedCapabilityLedgerInvariantsOptions & {
       approvedOrigins: ReadonlySet<string>
+      repoDescriptors?: readonly RepoAffinityDescriptor[]
       specs: ReturnType<Store['listProjectSpecsFull']>
       mode: SynthesizerMode
       graph?: ProgramGraph
@@ -1670,10 +2570,75 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     },
   ): SeedCapabilityLedgerInvariantsResult {
     const { approvedOrigins, specs, mode, graph, sourceFiles } = input
-    const defaultOrigin = [...approvedOrigins][0] ?? 'unknown'
+    // Never silently default unmapped multi-origin seeds to approvedList[0].
+    const defaultOrigin = approvedOrigins.size === 1 ? ([...approvedOrigins][0] ?? 'unknown') : 'unmapped'
 
     // Build grey-box / black-box runtime parity input from persisted endpoints, specs, and exchanges.
     const runtimeInput: Omit<RuntimeDiscoveryInput, 'mode'> = input.runtime ?? this.collectRuntimeDiscoveryInput(run, approvedOrigins, specs)
+
+    // Deterministic Repo→Origin affinity resolution across mounted repos + live discovered endpoints.
+    const mountedRepos = input.mountedRepos ?? this.host.projectReposMount(run.projectId).mountedRepos
+    const storedLiveEndpoints = this.storage.listEndpoints(run.id, { limit: 250 })
+      .filter(ep => approvedOrigins.has(ep.origin))
+    const descriptorByRoot = new Map<string, RepoAffinityDescriptor>()
+    for (const desc of input.repoDescriptors ?? []) {
+      const root = normalizeRepoRelPath(desc.root ?? desc.repo)
+      descriptorByRoot.set(root, { ...desc, root })
+    }
+    for (const repo of mountedRepos) {
+      const root = normalizeRepoRelPath(repo)
+      if (!descriptorByRoot.has(root)) {
+        descriptorByRoot.set(root, { repo, root })
+      }
+    }
+    if (graph && descriptorByRoot.size > 0) {
+      const routesByRoot = new Map<string, string[]>()
+      for (const route of graph.routes) {
+        const fileNorm = route.file.replace(/^\/+/, '')
+        for (const root of descriptorByRoot.keys()) {
+          if (root && (fileNorm === root || fileNorm.startsWith(`${root}/`))) {
+            const list = routesByRoot.get(root) ?? []
+            list.push(route.path)
+            routesByRoot.set(root, list)
+            break
+          }
+        }
+      }
+      for (const [root, routes] of routesByRoot.entries()) {
+        const desc = descriptorByRoot.get(root)!
+        descriptorByRoot.set(root, {
+          ...desc,
+          declaredRoutes: [...new Set([...(desc.declaredRoutes ?? []), ...routes])],
+        })
+      }
+    }
+    const cachedPhase0Mappings = this.repoOriginMappingsByRun.get(run.id) ?? []
+    const combinedExplicitServiceOrigins = [
+      ...(input.serviceOrigins ?? []),
+      ...cachedPhase0Mappings,
+    ]
+    const repoOriginMappings = descriptorByRoot.size > 0
+      ? resolveRepoOriginAffinity({
+          approvedOrigins: [...approvedOrigins],
+          repos: [...descriptorByRoot.values()],
+          serviceOrigins: combinedExplicitServiceOrigins,
+          compose: input.compose,
+          ingress: input.ingress,
+          liveEndpoints: storedLiveEndpoints.map(ep => ({
+            origin: ep.origin,
+            pathTemplate: ep.pathTemplate,
+            method: ep.method,
+            source: ep.source,
+          })),
+        })
+      : []
+    const resolvedServiceOrigins = [
+      ...combinedExplicitServiceOrigins,
+      ...repoOriginMappingsToServiceOrigins(repoOriginMappings),
+    ]
+    if (resolvedServiceOrigins.length > 0) {
+      this.repoOriginMappingsByRun.set(run.id, resolvedServiceOrigins)
+    }
 
     let synthesis: SynthesizeInvariantsResult
     if (mode === 'white-box' && graph) {
@@ -1682,7 +2647,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         graph,
         sourceFiles,
         services: input.services,
-        serviceOrigins: input.serviceOrigins,
+        serviceOrigins: resolvedServiceOrigins.length ? resolvedServiceOrigins : input.serviceOrigins,
         compose: input.compose,
         ingress: input.ingress,
         runtime: runtimeInput,
@@ -1738,6 +2703,8 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       ? this.promoteInvariantHypothesesToWave1ChainSteps(run, synthesis, {
           approvedOrigins,
           capIdByHypothesisId,
+          repoOriginMappings,
+          mountedRepos,
           maxSteps: input.maxWave1ChainSteps ?? 6,
         })
       : []
@@ -1819,12 +2786,20 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     options: {
       approvedOrigins?: ReadonlySet<string>
       capIdByHypothesisId?: ReadonlyMap<string, string>
+      repoOriginMappings?: readonly RepoOriginAffinityMapping[]
+      mountedRepos?: readonly string[]
       maxSteps?: number
     } = {},
   ): string[] {
     if (run.capabilityTier <= 0) return []
     const approvedOrigins = options.approvedOrigins ?? this.host.approvedOriginsSet(run)
     if (!approvedOrigins.size) return []
+    const quarantinedSet = this.getQuarantinedOriginSet(run, approvedOrigins)
+    const activeOrigins = new Set([...approvedOrigins].filter(o => !quarantinedSet.has(o)))
+    if (!activeOrigins.size) {
+      this.wave1InvariantChainsPromoted.add(run.id)
+      return []
+    }
 
     const eligible = synthesis.hypotheses
       .filter(h => h.score >= 0.55 || h.severity === 'critical' || h.severity === 'high')
@@ -1841,10 +2816,19 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     const existingSteps = this.storage.listChainSteps(run.id, run.goalRevision)
     const existingHypIds = new Set<string>()
     const existingTitles = new Set<string>()
+    const existingActiveOriginCounts = new Map<string, number>()
+    let existingActiveTotal = 0
     for (const step of existingSteps) {
       existingTitles.add(step.title.trim().toLowerCase())
       const m = /\[inv_hyp=([^\]]+)\]/.exec(step.hypothesis)
       if (m?.[1]) existingHypIds.add(m[1])
+      if (step.status !== 'canceled' && step.status !== 'tainted') {
+        existingActiveTotal += 1
+        const primary = step.sourceOrigins[0]
+        if (primary && activeOrigins.has(primary)) {
+          existingActiveOriginCounts.set(primary, (existingActiveOriginCounts.get(primary) ?? 0) + 1)
+        }
+      }
     }
 
     const budget = computeDynamicStepBudget(this.storage, run.id)
@@ -1860,40 +2844,165 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     const personasSummary = personas.length
       ? personas.map(p => `${p.handle} (${p.roleLabel})`).join(', ')
       : 'unauthenticated / active run personas'
-    const storedEndpoints = this.storage.listEndpoints(run.id, { limit: 120 })
+    const storedEndpoints = this.storage.listEndpoints(run.id, { limit: 250 })
       .filter(ep => approvedOrigins.has(ep.origin))
     const approvedList = [...approvedOrigins]
+
+    // Build / reuse deterministic repo -> origin affinity table so mounted repo hypotheses bind
+    // to their true origin and NEVER fall back onto `approvedList[0]` when `approvedOrigins.size > 1`.
+    const mountedRepos = options.mountedRepos ?? this.host.projectReposMount(run.projectId).mountedRepos
+    const repoMappings: readonly RepoOriginAffinityMapping[] = options.repoOriginMappings?.length
+      ? options.repoOriginMappings
+      : mountedRepos.length > 0
+        ? resolveRepoOriginAffinity({
+            approvedOrigins: approvedList,
+            repos: mountedRepos,
+            serviceOrigins: this.repoOriginMappingsByRun.get(run.id),
+            liveEndpoints: storedEndpoints.map(ep => ({
+              origin: ep.origin,
+              pathTemplate: ep.pathTemplate,
+              method: ep.method,
+              source: ep.source,
+            })),
+          })
+        : []
+
+    // Index live non-AST endpoints by normalized path for live-route overlap matching.
+    const liveOriginsByRoute = new Map<string, Set<string>>()
+    for (const ep of storedEndpoints) {
+      if (ep.source && STATIC_ONLY_ENDPOINT_SOURCES.has(ep.source.toLowerCase())) continue
+      const norm = normalizeDeclaredRouteForOverlap(ep.pathTemplate)
+      if (!norm) continue
+      let set = liveOriginsByRoute.get(norm)
+      if (!set) {
+        set = new Set<string>()
+        liveOriginsByRoute.set(norm, set)
+      }
+      set.add(ep.origin)
+    }
+
+    const resolveRepoMappingForFile = (filePath?: string): RepoOriginAffinityMapping | undefined => {
+      if (!filePath || !repoMappings.length) return undefined
+      const cleanFile = filePath.trim().replace(/^\/repos\//, '').replace(/^\/+/, '')
+      for (const mapping of repoMappings) {
+        if (mapping.root && (cleanFile === mapping.root || cleanFile.startsWith(`${mapping.root}/`))) {
+          return mapping
+        }
+        const slug = repoBasenameSlug(mapping.repo)
+        if (slug && (cleanFile === slug || cleanFile.startsWith(`${slug}/`))) {
+          return mapping
+        }
+      }
+      return undefined
+    }
+
     const seenCluster = new Set<string>()
-    const createdIds: string[] = []
+    let unmappedCount = 0
+    let quarantinedSkippedCount = 0
+    const unmappedHypIds: string[] = []
+    interface PreparedWave1Candidate {
+      hyp: InvariantHypothesis
+      targetOrigins: string[]
+      targetAssetIds: string[]
+      capId: string
+      uniqueRoutes: string[]
+      hopDepth: number
+      title: string
+      hypothesis: string
+      category: string
+      skills: string[]
+      clusterKey: string
+    }
+    const preparedCandidates: PreparedWave1Candidate[] = []
 
     for (const hyp of eligible) {
-      if (createdIds.length >= maxToAdd) break
       if (existingHypIds.has(hyp.id)) continue
       const clusterKey = `${hyp.kind}|${hyp.entity.toLowerCase()}|${(hyp.targetRoute ?? hyp.surface).toLowerCase()}`
       if (seenCluster.has(clusterKey)) continue
 
-      const targetOrigins: string[] = []
-      if (hyp.serviceOrigin && approvedOrigins.has(hyp.serviceOrigin)) {
-        targetOrigins.push(hyp.serviceOrigin)
-      }
-      if (hyp.kind === 'trust_boundary_mismatch') {
-        const evidenceText = `${hyp.summary} ${hyp.evidence.join(' ')}`
-        for (const origin of approvedList) {
-          if (targetOrigins.includes(origin)) continue
-          try {
-            const host = new URL(origin).host
-            if (evidenceText.includes(origin) || evidenceText.includes(host)) targetOrigins.push(origin)
-          } catch { /* ignore */ }
-          if (targetOrigins.length >= 2) break
+      const resolvedOrigins: string[] = []
+      const pushOrigin = (o?: string) => {
+        if (o && approvedOrigins.has(o) && !resolvedOrigins.includes(o)) {
+          resolvedOrigins.push(o)
         }
-        if (targetOrigins.length < 2 && approvedList.length >= 2) {
-          for (const origin of approvedList) {
-            if (!targetOrigins.includes(origin)) targetOrigins.push(origin)
-            if (targetOrigins.length >= 2) break
+      }
+
+      // 1. Explicit serviceOrigin on the hypothesis
+      if (hyp.serviceOrigin && approvedOrigins.has(hyp.serviceOrigin)) {
+        pushOrigin(hyp.serviceOrigin)
+      }
+
+      // 2. Deterministic repo->origin affinity from hypothesis source location
+      const fileRepoMapping = resolveRepoMappingForFile(hyp.location?.file)
+      if (fileRepoMapping?.origin && fileRepoMapping.confidence !== 'unmapped') {
+        pushOrigin(fileRepoMapping.origin)
+      }
+
+      // 3. Explicit host/origin mention in evidence or summary (critical for trust_boundary_mismatch)
+      const evidenceText = `${hyp.summary} ${hyp.evidence.join(' ')}`
+      for (const origin of approvedList) {
+        if (resolvedOrigins.includes(origin)) continue
+        try {
+          const host = new URL(origin).host
+          if (evidenceText.includes(origin) || evidenceText.includes(host)) pushOrigin(origin)
+        } catch { /* ignore */ }
+      }
+
+      // 4. Live-route overlap matching (if route(s) match a live endpoint on a unique origin)
+      const candidateRouteRefs = [
+        ...(hyp.targetRoute ? [hyp.targetRoute] : []),
+        ...extractRouteRefsFromText([...hyp.evidence, ...hyp.preconditions, hyp.summary]),
+      ]
+      if (!resolvedOrigins.length && candidateRouteRefs.length > 0) {
+        const originHits = new Map<string, number>()
+        for (const ref of candidateRouteRefs) {
+          const norm = normalizeDeclaredRouteForOverlap(ref)
+          if (!norm) continue
+          const hits = liveOriginsByRoute.get(norm)
+          if (!hits || hits.size === 0) continue
+          const weight = hits.size === 1 ? 2 : 1
+          for (const origin of hits) {
+            originHits.set(origin, (originHits.get(origin) ?? 0) + weight)
+          }
+        }
+        const rankedHits = [...originHits.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+        if (rankedHits.length > 0 && (rankedHits.length === 1 || rankedHits[0]![1] > rankedHits[1]![1])) {
+          pushOrigin(rankedHits[0]![0])
+        }
+      }
+
+      // 5. Repo slug mention inside evidence/summary (when no location.file was attached)
+      if (!resolvedOrigins.length && repoMappings.length > 0) {
+        const lowerEvidence = evidenceText.toLowerCase()
+        for (const mapping of repoMappings) {
+          if (!mapping.origin || mapping.confidence === 'unmapped') continue
+          const slug = repoBasenameSlug(mapping.repo)
+          if (slug.length >= 3 && (lowerEvidence.includes(`${slug}/`) || lowerEvidence.includes(` ${slug} `))) {
+            pushOrigin(mapping.origin)
+            break
           }
         }
       }
-      if (!targetOrigins.length) targetOrigins.push(approvedList[0]!)
+
+      // 6. Single-origin fallback ONLY when approvedOrigins.size === 1.
+      //    When approvedOrigins.size > 1 and ZERO confident match exists, mark `unmapped` —
+      //    NEVER silently dump unmapped routes onto `approvedList[0]`!
+      if (!resolvedOrigins.length) {
+        if (approvedList.length === 1) {
+          pushOrigin(approvedList[0]!)
+        } else {
+          unmappedCount += 1
+          if (unmappedHypIds.length < 16) unmappedHypIds.push(hyp.id)
+          continue
+        }
+      }
+
+      // 7. Quarantine filter: exclude uniform edge-protected / dead origins so they never burn turns.
+      const targetOrigins = resolvedOrigins.filter(origin => activeOrigins.has(origin))
+      if (!targetOrigins.length) {
+        quarantinedSkippedCount += 1
+        continue
+      }
 
       const targetAssetIds = run.candidates
         .filter(c => targetOrigins.includes(c.origin) && run.approved.includes(c.id))
@@ -1905,10 +3014,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
           'synth',
           hyp.id.replace(/[^A-Za-z0-9._-]/g, '_').replace(/^[^A-Za-z0-9]+/, '').slice(0, 60) || 'seed',
         )
-      const routeRefs = [
-        ...(hyp.targetRoute ? [hyp.targetRoute] : []),
-        ...extractRouteRefsFromText([...hyp.evidence, ...hyp.preconditions, hyp.summary]),
-      ]
+      const routeRefs = [...candidateRouteRefs]
       if (routeRefs.length < 2 && hyp.entity && hyp.entity !== 'service' && hyp.entity !== 'boundary') {
         const entityToken = hyp.entity.toLowerCase().replace(/[^a-z0-9]/g, '')
         for (const ep of storedEndpoints) {
@@ -1945,6 +3051,36 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
 
       const category = invariantHypothesisCategory(hyp)
       const skills = invariantHypothesisSkills(hyp)
+      preparedCandidates.push({
+        hyp,
+        targetOrigins,
+        targetAssetIds,
+        capId,
+        uniqueRoutes,
+        hopDepth,
+        title,
+        hypothesis,
+        category,
+        skills,
+        clusterKey,
+      })
+      seenCluster.add(clusterKey)
+      existingTitles.add(title.toLowerCase())
+    }
+
+    // Apply soft per-origin concentration guard (<= 50%) so no single live host monopolizes Wave-1 chains.
+    const fairCandidates = enforcePerOriginFairness(preparedCandidates, {
+      limit: maxToAdd,
+      maxOriginShare: DEFAULT_MAX_ORIGIN_SHARE,
+      existingCountsByOrigin: existingActiveOriginCounts,
+      existingTotal: existingActiveTotal,
+      originOf: item => item.targetOrigins[0],
+      quarantinedOrigins: quarantinedSet,
+    })
+
+    const createdIds: string[] = []
+    for (const item of fairCandidates) {
+      const { hyp, targetOrigins, targetAssetIds, capId, uniqueRoutes, hopDepth, title, hypothesis, category, skills } = item
       const primaryRouteRef = uniqueRoutes[0] ?? '/'
       const primaryRouteParts = primaryRouteRef.trim().split(/\s+/)
       const primaryMethod = primaryRouteParts.length >= 2 ? primaryRouteParts[0]!.toUpperCase() : 'ANY'
@@ -1997,11 +3133,24 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       this.registerStepTargets(run.id, created.id, targetsToRegister)
       createdIds.push(created.id)
       existingHypIds.add(hyp.id)
-      existingTitles.add(title.toLowerCase())
-      seenCluster.add(clusterKey)
     }
 
     this.wave1InvariantChainsPromoted.add(run.id)
+    if (unmappedCount > 0 || quarantinedSkippedCount > 0) {
+      try {
+        this.storage.event(
+          run.id,
+          'invariants.unmapped_origin_skipped',
+          `Skipped ${unmappedCount} unmapped-origin and ${quarantinedSkippedCount} quarantined-origin Wave-1 invariant hypothesis(es) instead of falling back to approvedOrigins[0].`,
+          {
+            unmappedCount,
+            quarantinedSkippedCount,
+            unmappedHypothesisIds: unmappedHypIds,
+            approvedOriginCount: approvedList.length,
+          },
+        )
+      } catch { /* telemetry is best-effort */ }
+    }
     if (createdIds.length > 0) {
       try {
         this.storage.event(
@@ -2012,7 +3161,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
             mode: synthesis.mode,
             count: createdIds.length,
             stepIds: createdIds,
-            hypothesisKinds: [...new Set(eligible.slice(0, createdIds.length).map(h => h.kind))],
+            hypothesisKinds: [...new Set(fairCandidates.slice(0, createdIds.length).map(c => c.hyp.kind))],
           },
         )
       } catch { /* telemetry is best-effort */ }
@@ -2133,23 +3282,27 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     bundle?: ReturnType<ExecReconPlanner['collectRuntimeDiscoveryBundle']>,
   ): number {
     if (run.capabilityTier <= 0) return 0
+    const activeOrigins = this.activeApprovedOrigins(run, approvedOrigins)
+    if (!activeOrigins.size) return 0
     const specs = bundle?.specs ?? this.storage.listProjectSpecsFull(run.projectId)
-    const resolvedBundle = bundle ?? this.collectRuntimeDiscoveryBundle(run, approvedOrigins, specs)
-    const approvedAssets = run.candidates.filter(c => approvedOrigins.has(c.origin) && run.approved.includes(c.id))
-    const hostTiers = computeHostTiers([...approvedOrigins], approvedAssets.map(classifyHostHeuristic))
-    const apiDependencies: RuntimeCompositeApiDependencyInput[] = resolvedBundle.allApiDeps.map(d => ({
-      producer: d.producer,
-      consumer: d.consumer,
-      resourceKey: d.resourceKey,
-      ...(d.producerOrigin ? { producerOrigin: d.producerOrigin } : {}),
-      ...(d.consumerOrigin ? { consumerOrigin: d.consumerOrigin } : {}),
-      ...(d.personaHandle !== undefined ? { personaHandle: d.personaHandle } : {}),
-    }))
+    const resolvedBundle = bundle ?? this.collectRuntimeDiscoveryBundle(run, activeOrigins, specs)
+    const approvedAssets = run.candidates.filter(c => activeOrigins.has(c.origin) && run.approved.includes(c.id))
+    const hostTiers = computeHostTiers([...activeOrigins], approvedAssets.map(classifyHostHeuristic))
+    const apiDependencies: RuntimeCompositeApiDependencyInput[] = resolvedBundle.allApiDeps
+      .filter(d => (!d.producerOrigin || activeOrigins.has(d.producerOrigin)) && (!d.consumerOrigin || activeOrigins.has(d.consumerOrigin)))
+      .map(d => ({
+        producer: d.producer,
+        consumer: d.consumer,
+        resourceKey: d.resourceKey,
+        ...(d.producerOrigin ? { producerOrigin: d.producerOrigin } : {}),
+        ...(d.consumerOrigin ? { consumerOrigin: d.consumerOrigin } : {}),
+        ...(d.personaHandle !== undefined ? { personaHandle: d.personaHandle } : {}),
+      }))
     const frontierController = this.frontierControllerFor(run.id)
     const created = synthesizeRuntimeCompositeWave1Steps(this.storage, run, {
       sourceMounted: false,
-      facts: resolvedBundle.facts,
-      endpoints: resolvedBundle.endpoints,
+      facts: resolvedBundle.facts.filter(f => activeOrigins.has(f.origin)),
+      endpoints: resolvedBundle.endpoints.filter(ep => activeOrigins.has(ep.origin)),
       apiDependencies,
       specs: resolvedBundle.specs,
       hostTiers,
@@ -2216,7 +3369,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       maxHypotheses: 64,
     })
 
-    const defaultOrigin = [...approvedOrigins][0] ?? 'unknown'
+    const defaultOrigin = approvedOrigins.size === 1 ? ([...approvedOrigins][0] ?? 'unknown') : 'unmapped'
     const capIdByHypothesisId = new Map<string, string>()
     let seededCount = 0
     for (const seed of res.capabilitySeeds) {
@@ -2837,11 +3990,27 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
               }
               return recordBrokerExchange(this.storage, freshRun, claimed.id, ex, secrets).id
             },
-          }) as Awaited<ReturnType<typeof runPhase0Recon>> & Phase0GraphwireExtras
+          }) as Awaited<ReturnType<typeof runPhase0Recon>> & Phase0GraphwireExtras & {
+            edgeProtectedOrigins?: DetectQuarantinedOriginsInput['edgeProtectedOrigins']
+          }
           // v6 graphwire: the ranked plan bounds probe breadth without trimming the store, and
           // AST code→runtime hypotheses become prioritized leads for the floor/agentic lane.
           this.host.probePlans.record(this.storage, freshRun.id, reconResult.probePlan)
           this.host.seedCodeToRuntimeLeads(this.storage.run(freshRun.id), claimed, reconResult.codeToRuntimeHypotheses ?? [])
+          if (reconResult.repoStaticExtraction?.originMappings?.length) {
+            this.repoOriginMappingsByRun.set(freshRun.id, reconResult.repoStaticExtraction.originMappings)
+          }
+          this.refreshQuarantinedOriginsFromPhase0(this.storage.run(freshRun.id), {
+            approvedOrigins,
+            edgeProtectedOrigins: reconResult.edgeProtectedOrigins,
+            skippedDeadHosts: reconResult.skippedDeadHosts,
+            extraExchanges: [...phase0RootExchanges.values()].map(ex => ({
+              origin: ex.origin,
+              status: ex.status,
+              pathAndQuery: ex.pathAndQuery,
+            })),
+            assignmentId: claimed.id,
+          })
           this.storage.updateRunDynamicStepBudget(freshRun.id, computeDynamicStepBudget(this.storage, freshRun.id))
         } catch {
           // Phase-0 failure must not block threat model progression
@@ -2887,6 +4056,22 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         signal: task.controller.signal,
         selectedChecks,
       })
+      const baselineTelemetry = observations
+        .map(obs => {
+          const origin = typeof obs.origin === 'string' ? obs.origin : ''
+          if (!origin) return null
+          const status = typeof obs.status === 'number' ? obs.status : null
+          const error = typeof obs.error === 'string' ? obs.error : null
+          return { origin, status, error, pathAndQuery: '/' }
+        })
+        .filter((entry): entry is NonNullable<typeof entry> => entry !== null)
+      this.refreshQuarantinedOriginsFromPhase0(freshRun, {
+        approvedOrigins,
+        extraExchanges: baselineTelemetry,
+        assignmentId: claimed.id,
+      })
+      const quarantinedOrigins = this.getQuarantinedOriginSet(freshRun, approvedOrigins)
+      const activeOrigins = this.activeApprovedOrigins(freshRun, approvedOrigins)
 
       // 3. Build prioritized Threat Model via LLM (with deterministic fallback)
       const heuristicEntries = approvedAssets.map(classifyHostHeuristic)
@@ -3023,8 +4208,10 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       // Ensure at least initial investigation steps exist when Tier >= 1.
       // When source repos are mounted, delete black-box-first overrides: generic fallback recon
       // steps never outrank white-box AST/RBAC/dataflow leads (priority capped <= 65).
-      if (!seededSteps.length && freshRun.capabilityTier > 0 && approvedAssets.length > 0 && (!sourceMounted || codeAuditStepsCreated === 0)) {
-        const topHosts = finalEntries.slice(0, Math.min(8, finalEntries.length))
+      // Never spawn fallback investigation steps onto quarantined (edge-protected/unreachable) hosts.
+      const reachableFinalEntries = finalEntries.filter(entry => activeOrigins.has(entry.origin))
+      if (!seededSteps.length && freshRun.capabilityTier > 0 && reachableFinalEntries.length > 0 && (!sourceMounted || codeAuditStepsCreated === 0)) {
+        const topHosts = reachableFinalEntries.slice(0, Math.min(8, reachableFinalEntries.length))
         seededSteps = topHosts.map((entry, idx) => {
           const tier = finalHostTiers[entry.origin] ?? classifyHostTier(entry.origin, entry.surfaceTags)
           const basePriority = tier === 'low_value_static' ? 30 : Math.max(55, 95 - idx * 6)
@@ -3044,7 +4231,9 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       }
 
       const prioritizedInitialSteps = prioritizeMountedSourceInitialSteps(
-        seededSteps.map(step => ({ ...step, origins: step.origins.filter(o => approvedOrigins.has(o)) })),
+        seededSteps
+          .map(step => ({ ...step, origins: step.origins.filter(o => activeOrigins.has(o)) }))
+          .filter(step => step.origins.length > 0),
         { sourceMounted, hasWhiteBoxSteps: codeAuditStepsCreated > 0, whiteBoxFactIds: this.host.tierAFactIds },
       )
 
@@ -3059,11 +4248,12 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
           finalHostTiers,
           existingSteps,
           remainingInitialSlots,
+          { quarantinedOrigins },
         )
 
         let addedInitial = 0
         for (const step of budgetedSteps) {
-          const validOrigins = step.origins.filter(o => approvedOrigins.has(o))
+          const validOrigins = step.origins.filter(o => activeOrigins.has(o))
           const assetIds = current.candidates.filter(c => validOrigins.includes(c.origin) && current.approved.includes(c.id)).map(c => c.id)
           if (!assetIds.length) continue
           const specialistProfile = routeStepToSpecialist({
@@ -3574,14 +4764,18 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       const anyMethodKey = `${ep.origin}\u0000ANY\u0000${normPath}\u0000${confirmedCategoryFamily(targetCategory)}`
       return !coveredStructuredKeys.has(exactKey) && !coveredRouteMethodKeys.has(anyMethodKey)
     })
+    const quarantinedSet = this.getQuarantinedOriginSet(run, approvedOrigins)
+    const activeOrigins = new Set([...approvedOrigins].filter(o => !quarantinedSet.has(o)))
+    if (!activeOrigins.size) return { seeded: 0, endpoints: [] }
     const candidates = selectUncoveredHighRiskEndpoints({
       endpoints: uncoveredEndpoints,
-      approvedOrigins,
+      approvedOrigins: activeOrigins,
       confirmedPaths: new Set<string>(),
       coveredRoutes: new Set<string>(),
       minRisk: 60,
       limit: cap,
       sourceMounted: this.host.projectReposMount(run.projectId).mountedRepos.length > 0,
+      quarantinedOrigins: quarantinedSet,
     })
     const seededEndpoints: string[] = []
     for (const ep of candidates) {
@@ -3807,6 +5001,8 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
   ): number {
     const facts = this.tierALeadFacts(run)
     if (!facts.length) return 0
+    const activeOrigins = this.activeApprovedOrigins(run, approvedOrigins)
+    if (!activeOrigins.size) return 0
     const existing = this.storage.listChainSteps(run.id, run.goalRevision)
     const boundFactIds = new Set(existing.flatMap(step => step.dependsOnFactIds))
     const confirmedTuples = buildConfirmedTupleKeySets(this.alreadyConfirmedRefs(run, 100)).all
@@ -3818,7 +5014,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     for (const fact of facts) {
       if (slots <= 0) break
       this.host.tierAFactIds.add(fact.id)
-      if (boundFactIds.has(fact.id) || !approvedOrigins.has(fact.origin)) continue
+      if (boundFactIds.has(fact.id) || !activeOrigins.has(fact.origin)) continue
       const endpoint = typeof fact.data?.endpoint === 'string' ? fact.data.endpoint : ''
       const probeClass = typeof fact.data?.probeClass === 'string' ? fact.data.probeClass : ''
       const method = typeof fact.data?.method === 'string' ? fact.data.method.toUpperCase() : 'GET'
@@ -3855,13 +5051,15 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
           `${fact.data?.source === 'program_graph' ? '0' : '1'}\u0000${String(fact.data?.endpoint ?? '')}\u0000${String(fact.data?.method ?? '')}\u0000${String(fact.data?.probeClass ?? '')}\u0000${fact.id}`
         return keyOf(a).localeCompare(keyOf(b))
       })
+    const activeOrigins = this.activeApprovedOrigins(run, approvedOrigins)
+    if (!activeOrigins.size) return 0
     const existing = this.storage.listChainSteps(run.id, run.goalRevision)
     const boundFactIds = new Set(existing.flatMap(step => step.dependsOnFactIds))
     let slots = Math.max(0, budget - existing.length)
     let created = 0
     for (const fact of facts) {
       if (slots <= 0 || created >= 4) break
-      if (!isTrustedHostControlFact(fact, 'det_lead') || !approvedOrigins.has(fact.origin) || boundFactIds.has(fact.id)) continue
+      if (!isTrustedHostControlFact(fact, 'det_lead') || !activeOrigins.has(fact.origin) || boundFactIds.has(fact.id)) continue
       const endpoint = typeof fact.data.endpoint === 'string' ? fact.data.endpoint : ''
       const probeClass = typeof fact.data.probeClass === 'string' ? fact.data.probeClass : ''
       const method = typeof fact.data.method === 'string' ? fact.data.method.toUpperCase() : 'GET'
@@ -4262,12 +5460,17 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     options: { dependsOnStepIds?: readonly string[]; preservePriority?: boolean } = {},
   ): Pick<DispatchFunnelCounts, 'planned' | 'enqueued' | 'filteredDedupe' | 'filteredAlreadyConfirmed' | 'filteredNoAsset'> {
     const existing = this.storage.listChainSteps(run.id, run.goalRevision)
+    const quarantinedSet = this.getQuarantinedOriginSet(run)
     const titles = new Set(existing.map(step => step.title.trim().toLowerCase()))
     const confirmed = this.alreadyConfirmedRefs(run, 100)
     const inFlightTuples = buildInFlightTupleKeys(existing)
     const counts = { planned: plan.plan.length, enqueued: 0, filteredDedupe: 0, filteredAlreadyConfirmed: 0, filteredNoAsset: 0 }
     const depStepIds = [...new Set(options.dependsOnStepIds ?? [])]
     for (const step of plan.plan) {
+      const effectiveOrigins = quarantinedSet.size > 0
+        ? step.origins.filter(o => !quarantinedSet.has(o))
+        : step.origins
+      if (!effectiveOrigins.length) { counts.filteredNoAsset += 1; continue }
       const title = compactChainTitle(step.hypothesis)
       const key = title.toLowerCase()
       if (titles.has(key)) { counts.filteredDedupe += 1; continue }
@@ -4299,7 +5502,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       if (dupReason === 'already_confirmed') { counts.filteredAlreadyConfirmed += 1; continue }
       if (dupReason === 'in_flight') { counts.filteredDedupe += 1; continue }
       const assetIds = run.candidates
-        .filter(candidate => step.origins.includes(candidate.origin) && run.approved.includes(candidate.id))
+        .filter(candidate => effectiveOrigins.includes(candidate.origin) && run.approved.includes(candidate.id))
         .map(candidate => candidate.id)
       if (!assetIds.length) { counts.filteredNoAsset += 1; continue }
       // F2: lead-bound coordinator dispatches obey the same low-priority rule as planner steps.
@@ -4411,7 +5614,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         skills: stepSkills,
         dependsOnFactIds: finalFactIds,
         ...(depStepIds.length ? { dependsOnStepIds: depStepIds } : {}),
-        sourceOrigins: step.origins,
+        sourceOrigins: effectiveOrigins,
         specialistProfile: routeStepToSpecialist({ title, hypothesis: step.hypothesis, category, skills: step.skills }),
       })
       if (depStepIds.length > 0 && createdStep.status === 'pending') {
@@ -4883,16 +6086,19 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       detLeadFactIds,
       funnel,
     } = input
+    const quarantinedSet = this.getQuarantinedOriginSet(currentRun, currentApproved)
+    const activeApproved = new Set([...currentApproved].filter(o => !quarantinedSet.has(o)))
     const confirmedForDispatch = this.alreadyConfirmedRefs(currentRun, 100)
     const inFlightTuples = buildInFlightTupleKeys(existingSteps)
     const remainingSlots = Math.max(0, dynamicStepBudget - existingSteps.length)
     const candidateSteps = newSteps
-      .map(step => ({ ...step, origins: step.origins.filter(origin => currentApproved.has(origin)) }))
+      .map(step => ({ ...step, origins: step.origins.filter(origin => activeApproved.has(origin)) }))
     const budgetedNewSteps = applyCrownJewelStepBudget(
       candidateSteps,
-      computeHostTiers([...currentApproved], this.storage.latestThreatModel(currentRun.id, currentRun.goalRevision)?.entries),
+      computeHostTiers([...activeApproved], this.storage.latestThreatModel(currentRun.id, currentRun.goalRevision)?.entries),
       existingSteps,
       remainingSlots,
+      { quarantinedOrigins: quarantinedSet },
     )
     // Attribute the budget gate precisely: duplicate titles and unusable origins are their own
     // funnel buckets; only the remaining drops are capacity (step-budget/crown-jewel share).
@@ -5090,6 +6296,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     // v7 dispatch funnel: planned → filtered* → enqueued → dispatched, from step objects only.
     const funnel = emptyDispatchFunnel(roundNo)
     const approvedOrigins = this.host.approvedOriginsSet(updated)
+    const activeOrigins = this.activeApprovedOrigins(updated, approvedOrigins)
     const sourceMounted = this.host.projectReposMount(updated.projectId).mountedRepos.length > 0
 
     // Single-snapshot per-round read cache eliminating 6+ redundant full-table DB scans per round.
@@ -5213,7 +6420,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     let bolaAutoSteps = 0
     if (updated.capabilityTier >= 2 && personas.length >= 2 && allSteps.length < dynamicStepBudget) {
       const typeGroups = new Map<string, BolaTestQueueItem[]>()
-      for (const item of buildBolaTestQueue(allUntaintedFacts, personas, approvedOrigins, this.storage.listResourceSamples(run.id))) {
+      for (const item of buildBolaTestQueue(allUntaintedFacts, personas, activeOrigins, this.storage.listResourceSamples(run.id))) {
         const remainingVariants = item.variants.filter(v =>
           (!v.destructive || updated.capabilityTier >= 3) &&
           !isRouteConfirmed({ method: v.method, path: v.endpoint }, confirmedBolaSets),
@@ -5276,7 +6483,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     // skipping routes already confirmed by a host-verified CompositeProofReceipt.
     const secondOrderAutoSteps = this.queueSecondOrderSurfaceSteps(
       updated,
-      approvedOrigins,
+      activeOrigins,
       allUntaintedFacts,
       allSteps,
       confirmedForPlanner,
@@ -5376,7 +6583,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       goal: updated.goal,
       roundNo,
       capabilityTier: updated.capabilityTier,
-      approvedOrigins: [...approvedOrigins],
+      approvedOrigins: [...activeOrigins],
       budgetRemaining: {
         usd: Math.max(0, Number((updated.budgetUsd - updated.spentUsd).toFixed(4))),
         requests: updated.budgetRequests === 0 ? 'unlimited' : Math.max(0, updated.budgetRequests - updated.spentRequests),
