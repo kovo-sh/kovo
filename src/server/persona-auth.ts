@@ -1,5 +1,7 @@
+import { isLocalLabEnvEnabled } from '../domain.ts'
 import type { PersonaLoginAdapter, PersonaLoginConfig } from '../domain.ts'
 import { createHmac } from 'node:crypto'
+import { refreshBrowserSession } from './browser-session-auth.ts'
 import {
   EgressDeniedError,
   EgressGateway,
@@ -12,13 +14,16 @@ import {
 } from './egress-gateway.ts'
 import type { AddressClass, EgressLoopbackProxy } from './egress-gateway.ts'
 import {
+  isBrowserSessionConfig,
   normalizeClerkClientCookie,
   normalizePersonaBundle,
+  readBrowserSessionCredentialFile,
   readLoginCredentialFile,
   resolveRunPersonas,
   writePersonaSessionFile,
 } from './persona-vault.ts'
 import type {
+  BrowserSessionLoginConfig,
   MintedPersonaSession,
   PersonaCookieRecord,
   PersonaCredentialBundle,
@@ -54,7 +59,7 @@ export class PersonaAuthError extends Error {
 export interface AuthenticateResult {
   personaId: string
   handle: string
-  adapterUsed: Exclude<PersonaLoginAdapter, 'auto'> | 'oidc' | 'import'
+  adapterUsed: Exclude<PersonaLoginAdapter, 'auto'> | 'oidc' | 'import' | 'browser_session'
   headerType: 'cookie' | 'bearer' | 'header'
   expiresAt?: number
   refreshIntervalSec?: number
@@ -1815,13 +1820,20 @@ export class PersonaAuthManager {
     }
 
     const config = persona.loginConfig
-    const { email, password } = readLoginCredentialFile(persona.secretPath, {
-      allowEmptyEmail: config.adapter === 'clerk_client',
-    })
     const targetOrigin = persona.originAllowlist[0]
     if (!targetOrigin) {
       throw new PersonaAuthError('AUTH_FAILED', `Persona "${persona.handle}" has no allowlisted origin configured.`)
     }
+
+    // Universal IdP-agnostic browser session path (primary): refresh via headless Playwright
+    // storageState with zero IdP-specific code.
+    if (isBrowserSessionConfig(config as { adapter?: string })) {
+      return await this.authenticateBrowserSession(storage, projectId, persona, config as unknown as BrowserSessionLoginConfig, targetOrigin, signal)
+    }
+
+    const { email, password } = readLoginCredentialFile(persona.secretPath, {
+      allowEmptyEmail: config.adapter === 'clerk_client',
+    })
 
     let adapter: Exclude<PersonaLoginAdapter, 'auto'> | 'oidc'
     let detectedClerkFapiOrigin: string | null = null
@@ -1865,18 +1877,107 @@ export class PersonaAuthManager {
     }
 
     switch (adapter) {
+      /** @deprecated Prefer universal `browser_session` for SSO / OIDC / MFA apps. Kept for backward compatibility. */
       case 'oidc':
         return await this.authenticateOidc(persona, config, email, password, targetOrigin, signal)
+      /** @deprecated Prefer universal `browser_session` for Clerk apps. Kept for backward compatibility. */
       case 'clerk':
         return await this.authenticateClerk(persona, config, email, password, targetOrigin, detectedClerkFapiOrigin, signal)
+      /** @deprecated Prefer universal `browser_session` for Clerk apps. Kept for backward compatibility. */
       case 'clerk_client':
         return await this.authenticateClerkClientCookie(persona, config, password, targetOrigin, signal)
+      /** @deprecated Prefer universal `browser_session` for Supabase apps. Kept for backward compatibility. */
       case 'supabase':
         return await this.authenticateSupabase(persona, config, email, password, targetOrigin, detectedSupabase, signal)
       case 'json':
         return await this.authenticateJson(persona, config, email, password, targetOrigin, signal)
       case 'form':
         return await this.authenticateForm(persona, config, email, password, targetOrigin)
+    }
+  }
+
+  /**
+   * Universal, IdP-agnostic browser session authentication & auto-refresh.
+   * Loads the persona's persisted Playwright `storageState` bundle into a headless Chromium
+   * context routed through `EgressGateway.createLoopbackProxy`, visits `targetOrigin + verifyPath`
+   * so the app's own client JS SDK refreshes short-lived JWTs/cookies, persists the updated
+   * `storageState` back to disk (`0600`), and wires both TTL & on-demand 401 refresh.
+   */
+  private async authenticateBrowserSession(
+    storage: Store,
+    projectId: string,
+    persona: ResolvedPersona,
+    config: BrowserSessionLoginConfig,
+    targetOrigin: string,
+    signal?: AbortSignal,
+  ): Promise<AuthenticateResult> {
+    const project = storage.project(projectId)
+    const allowLocalLab = project.environment === 'local-lab' && isLocalLabEnvEnabled()
+    const verifyPath = (() => {
+      if (typeof config.verifyPath === 'string' && config.verifyPath.startsWith('/')) {
+        return config.verifyPath
+      }
+      if (config.loginUrl) {
+        try {
+          const u = new URL(config.loginUrl)
+          if (u.origin === targetOrigin && u.pathname.startsWith('/')) {
+            return `${u.pathname}${u.search}`
+          }
+        } catch {
+          // Ignore malformed loginUrl.
+        }
+      }
+      return '/'
+    })()
+
+    const runRefreshOnce = async (innerSignal?: AbortSignal) => {
+      const { bundle } = readBrowserSessionCredentialFile(persona.secretPath!)
+      try {
+        const refreshed = await refreshBrowserSession({
+          storageState: bundle.storageState,
+          targetOrigin,
+          originAllowlist: persona.originAllowlist,
+          verifyPath,
+          allowLocalLab,
+          priorObservedHeaders: bundle.observedHeaders,
+          persistBundlePath: persona.secretPath!,
+          signal: innerSignal,
+          resolveHost: this.resolveHost,
+        })
+        writePersonaSessionFile(persona.sessionPath!, refreshed.session)
+        return refreshed
+      } catch (err) {
+        if (err instanceof PersonaAuthError) throw err
+        throw new PersonaAuthError(
+          'AUTH_FAILED',
+          err instanceof Error ? err.message : 'Browser session refresh failed.',
+        )
+      }
+    }
+
+    const initial = await runRefreshOnce(signal)
+
+    // Choose a sensible automatic refresh cadence: respect explicit config, otherwise adapt to
+    // short-lived tokens (e.g., 60s JWT -> ~35s refresh) or default to 240s.
+    let refreshIntervalSec = config.refreshIntervalSec ?? 240
+    if (!config.refreshIntervalSec && initial.expiresAt) {
+      const remainingSec = Math.floor((initial.expiresAt - Date.now()) / 1000)
+      if (remainingSec > 10 && remainingSec < 400) {
+        refreshIntervalSec = Math.max(30, Math.min(240, Math.floor(remainingSec * 0.6)))
+      }
+    }
+
+    return {
+      personaId: persona.id,
+      handle: persona.handle,
+      adapterUsed: 'browser_session',
+      headerType: initial.session.headerType,
+      ...(initial.expiresAt ? { expiresAt: initial.expiresAt } : {}),
+      refreshIntervalSec,
+      refresh: async () => {
+        await runRefreshOnce()
+      },
+      session: initial.session,
     }
   }
 

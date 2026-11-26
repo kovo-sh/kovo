@@ -5,8 +5,11 @@ import type { IncomingMessage, Server, ServerResponse } from 'node:http'
 import { join, resolve } from 'node:path'
 import { Readable, Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
+import { isLocalLabEnvEnabled } from '../src/domain.ts'
 import { getAppRuntime } from '../src/server/app-runtime.ts'
 import type { AppRuntime } from '../src/server/app-runtime.ts'
+import { BrowserCaptureManager } from '../src/server/browser-session-auth.ts'
+import type { CaptureKeyInput, CaptureMouseInput } from '../src/server/browser-session-auth.ts'
 import { configureGlobalKillSwitch } from '../src/server/kill-switch.ts'
 import type { GlobalKillSwitch } from '../src/server/kill-switch.ts'
 import { exportRunReceiptBundle } from '../src/server/receipt-export.ts'
@@ -21,6 +24,8 @@ const maxActivePairingTokens = 10
 const pairingLinkPath = '/_kovo/auth/pairing-link'
 const rotateSessionPath = '/_kovo/auth/rotate-session'
 const authStatusPath = '/_kovo/auth/status'
+const authCaptureStartPath = '/_kovo/auth-capture/start'
+const authCaptureActionRegex = /^\/_kovo\/auth-capture\/([A-Za-z0-9_-]{6,128})\/(stream|input|complete|cancel)$/
 const killSwitchPath = '/api/ops/kill-switch'
 const receiptExportPathRegex = /^\/api\/runs\/([A-Za-z0-9_-]{1,128})\/receipts\/export$/
 
@@ -47,6 +52,8 @@ export interface LocalSessionOptions {
   killSwitch?: GlobalKillSwitch
   /** v7 M4: optional Store handle for `/api/runs/:runId/receipts/export` and ops audit logging. */
   store?: Store
+  /** Option 4: optional browser capture manager for `/_kovo/auth-capture/*` interactive login capture. */
+  captureManager?: BrowserCaptureManager
 }
 
 export interface KovoLocalServer {
@@ -253,6 +260,7 @@ export function createKovoLocalServer(options: LocalSessionOptions): KovoLocalSe
   const runtime = options.runtime
   const killSwitch = options.killSwitch ?? runtime?.killSwitch ?? getAppRuntime({ dataDir: directory }).killSwitch
   const storeHandle = options.store ?? runtime?.store
+  const captureManager = options.captureManager ?? new BrowserCaptureManager()
   let token = readOrCreateSessionToken(directory)
   const secret = readOrCreateBootstrapSecret(directory)
   let bootstrapConsumed = false
@@ -376,6 +384,7 @@ export function createKovoLocalServer(options: LocalSessionOptions): KovoLocalSe
       if (req.headers['sec-fetch-site'] === 'cross-site') return reject(res, 403, 'Open Kovo Hunter directly.')
       if (
         path.pathname.startsWith('/_kovo/auth/') ||
+        path.pathname.startsWith('/_kovo/auth-capture') ||
         path.pathname.startsWith('/api/ops/') ||
         receiptExportPathRegex.test(path.pathname)
       ) {
@@ -523,6 +532,217 @@ export function createKovoLocalServer(options: LocalSessionOptions): KovoLocalSe
       return reject(res, 404, 'Not found.')
     }
 
+    // Option 4: Universal Interactive Browser Login Capture endpoints (gated by kovo_local session).
+    if (path.pathname === authCaptureStartPath) {
+      if (method !== 'POST') return reject(res, 405, 'Method not allowed.')
+      if (req.headers.origin !== origin) return reject(res, 403, 'Unexpected origin.')
+      let body: Record<string, unknown>
+      try {
+        body = await readBoundedJsonBody(req)
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Invalid JSON body.'
+        return sendJson(res, msg.includes('too large') ? 413 : 400, { error: msg })
+      }
+      const projectId = typeof body.projectId === 'string' ? body.projectId.trim() : ''
+      const targetOrigin = typeof body.targetOrigin === 'string' ? body.targetOrigin.trim() : ''
+      if (!projectId || !targetOrigin) {
+        return sendJson(res, 400, { error: 'projectId and targetOrigin are required.' })
+      }
+      let allowLocalLab = false
+      let allowedOrigins: string[] | undefined = Array.isArray(body.allowedOrigins)
+        ? body.allowedOrigins.filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
+        : undefined
+      if (storeHandle) {
+        try {
+          const proj = storeHandle.project(projectId)
+          allowLocalLab = proj.environment === 'local-lab' && isLocalLabEnvEnabled()
+          if (!allowedOrigins || allowedOrigins.length === 0) {
+            allowedOrigins = [...proj.seeds]
+          }
+        } catch (err) {
+          return sendJson(res, 404, { error: err instanceof Error ? err.message : 'Project not found.' })
+        }
+      } else if (body.allowLocalLab === true && isLocalLabEnvEnabled()) {
+        allowLocalLab = true
+      }
+      const ttlMs = typeof body.ttlMs === 'number' && Number.isFinite(body.ttlMs) ? body.ttlMs : undefined
+      try {
+        const capture = await captureManager.startCapture({
+          projectId,
+          targetOrigin,
+          allowLocalLab,
+          allowedOrigins,
+          ...(ttlMs ? { ttlMs } : {}),
+        })
+        return sendJson(res, 200, {
+          captureId: capture.id,
+          projectId: capture.projectId,
+          targetOrigin: capture.targetOrigin,
+          currentUrl: capture.currentUrl(),
+          expiresAt: capture.expiresAt,
+          viewport: capture.viewport,
+        })
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'Unable to start browser login capture.'
+        return sendJson(res, 400, { error: message })
+      }
+    }
+
+    const captureMatch = authCaptureActionRegex.exec(path.pathname)
+    if (captureMatch) {
+      const captureId = captureMatch[1]!
+      const action = captureMatch[2]!
+      if (action === 'stream') {
+        if (method !== 'GET') return reject(res, 405, 'Method not allowed.')
+        const capture = captureManager.get(captureId)
+        if (!capture) {
+          return sendJson(res, 404, { error: 'Capture session not found or expired.' })
+        }
+        const pollMode = path.searchParams.get('mode') === 'poll' ||
+          (req.headers.accept?.includes('application/json') && !req.headers.accept?.includes('text/event-stream'))
+        if (pollMode) {
+          return sendJson(res, 200, {
+            captureId: capture.id,
+            state: capture.state,
+            url: capture.currentUrl(),
+            expiresAt: capture.expiresAt,
+            viewport: capture.viewport,
+            frame: capture.latestFrame(),
+          })
+        }
+        res.writeHead(200, {
+          'content-type': 'text/event-stream; charset=utf-8',
+          'cache-control': 'no-cache, no-store, must-revalidate',
+          connection: 'keep-alive',
+          'x-accel-buffering': 'no',
+        })
+        const sendEvent = (eventName: string, payload: unknown) => {
+          if (res.destroyed || res.writableEnded) return
+          res.write(`event: ${eventName}\ndata: ${JSON.stringify(payload)}\n\n`)
+        }
+        sendEvent('init', {
+          captureId: capture.id,
+          url: capture.currentUrl(),
+          expiresAt: capture.expiresAt,
+          viewport: capture.viewport,
+        })
+        const unsubscribe = capture.subscribe(ev => {
+          if (ev.type === 'frame') sendEvent('frame', ev.frame)
+          else if (ev.type === 'url') sendEvent('url', { url: ev.url })
+          else if (ev.type === 'status') {
+            sendEvent('status', { state: ev.state, ...(ev.reason ? { reason: ev.reason } : {}) })
+            if (ev.state !== 'active' && !res.writableEnded) res.end()
+          }
+        })
+        const keepalive = setInterval(() => {
+          if (!res.destroyed && !res.writableEnded) res.write(': keepalive\n\n')
+        }, 15_000)
+        keepalive.unref?.()
+        res.once('close', () => {
+          clearInterval(keepalive)
+          unsubscribe()
+        })
+        return
+      }
+
+      if (method !== 'POST') return reject(res, 405, 'Method not allowed.')
+      if (req.headers.origin !== origin) return reject(res, 403, 'Unexpected origin.')
+
+      if (action === 'cancel') {
+        req.resume()
+        const canceled = await captureManager.cancel(captureId)
+        return sendJson(res, canceled ? 200 : 404, canceled ? { ok: true, canceled: true } : { error: 'Capture session not found or already closed.' })
+      }
+
+      if (action === 'complete') {
+        req.resume()
+        try {
+          const bundle = await captureManager.complete(captureId)
+          return sendJson(res, 200, {
+            ok: true,
+            bundle,
+            summary: {
+              targetOrigin: bundle.targetOrigin,
+              capturedAt: bundle.capturedAt,
+              cookieCount: bundle.storageState.cookies.length,
+              originCount: bundle.storageState.origins.length,
+              hasAuthorizationHeader: Boolean(bundle.observedHeaders?.Authorization),
+            },
+          })
+        } catch (err) {
+          const message = err instanceof Error ? err.message : 'Unable to complete capture.'
+          return sendJson(res, /not found|already closed|expired/i.test(message) ? 404 : 400, { error: message })
+        }
+      }
+
+      if (action === 'input') {
+        const capture = captureManager.get(captureId)
+        if (!capture) {
+          req.resume()
+          return sendJson(res, 404, { error: 'Capture session not found or expired.' })
+        }
+        let body: Record<string, unknown>
+        try {
+          body = await readBoundedJsonBody(req)
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : 'Invalid JSON body.'
+          return sendJson(res, msg.includes('too large') ? 413 : 400, { error: msg })
+        }
+        const kind = typeof body.kind === 'string' ? body.kind : ''
+        try {
+          if (kind === 'mouse') {
+            const type = body.type
+            if (type !== 'mousePressed' && type !== 'mouseReleased' && type !== 'mouseMoved' && type !== 'mouseWheel') {
+              return sendJson(res, 400, { error: 'Invalid mouse event type.' })
+            }
+            const input: CaptureMouseInput = {
+              type,
+              x: typeof body.x === 'number' ? body.x : 0,
+              y: typeof body.y === 'number' ? body.y : 0,
+              ...(body.button === 'none' || body.button === 'left' || body.button === 'middle' || body.button === 'right'
+                ? { button: body.button }
+                : {}),
+              ...(typeof body.clickCount === 'number' ? { clickCount: body.clickCount } : {}),
+              ...(typeof body.deltaX === 'number' ? { deltaX: body.deltaX } : {}),
+              ...(typeof body.deltaY === 'number' ? { deltaY: body.deltaY } : {}),
+              ...(typeof body.modifiers === 'number' ? { modifiers: body.modifiers } : {}),
+            }
+            await capture.dispatchMouse(input)
+            return sendJson(res, 200, { ok: true, url: capture.currentUrl() })
+          }
+          if (kind === 'key') {
+            const type = body.type
+            if (type !== 'keyDown' && type !== 'keyUp' && type !== 'char' && type !== 'insertText') {
+              return sendJson(res, 400, { error: 'Invalid key event type.' })
+            }
+            const input: CaptureKeyInput = {
+              type,
+              ...(typeof body.key === 'string' ? { key: body.key } : {}),
+              ...(typeof body.code === 'string' ? { code: body.code } : {}),
+              ...(typeof body.text === 'string' ? { text: body.text } : {}),
+              ...(typeof body.windowsVirtualKeyCode === 'number' ? { windowsVirtualKeyCode: body.windowsVirtualKeyCode } : {}),
+              ...(typeof body.modifiers === 'number' ? { modifiers: body.modifiers } : {}),
+            }
+            await capture.dispatchKey(input)
+            return sendJson(res, 200, { ok: true, url: capture.currentUrl() })
+          }
+          if (kind === 'navigate') {
+            const navUrl = typeof body.url === 'string' ? body.url.trim() : ''
+            if (!navUrl) return sendJson(res, 400, { error: 'url is required for navigate input.' })
+            const resNav = await capture.navigate(navUrl)
+            return sendJson(res, 200, { ok: true, url: resNav.url })
+          }
+          return sendJson(res, 400, { error: 'input kind must be "mouse", "key", or "navigate".' })
+        } catch (err) {
+          return sendJson(res, 400, { error: err instanceof Error ? err.message : 'Input dispatch failed.' })
+        }
+      }
+    }
+
+    if (path.pathname.startsWith('/_kovo/auth-capture')) {
+      return reject(res, 404, 'Not found.')
+    }
+
     const headers = new Headers()
     for (const [name, value] of Object.entries(req.headers)) {
       if (value !== undefined && !name.startsWith('x-forwarded-') && name !== 'forwarded') {
@@ -592,6 +812,9 @@ export function createKovoLocalServer(options: LocalSessionOptions): KovoLocalSe
       if (!res.headersSent) reject(res, 500, 'Kovo Hunter could not complete the request.')
       else res.end()
     })
+  })
+  server.once('close', () => {
+    void captureManager.disposeAll()
   })
 
   return {
