@@ -18,14 +18,26 @@
 import { createHash, createHmac, randomBytes, randomInt, randomUUID } from 'node:crypto'
 import { diffResponse } from '../../worker/analyzers.ts'
 import type { StateChangeApprovalContext } from './approval-judge.ts'
-import { baseFields, bogusIdFor } from './deterministic-specs.ts'
+import { baseFields } from './deterministic-specs.ts'
 import type { EngineHypothesis, Severity, SynthesizedEngineSpec } from './deterministic-specs.ts'
+import {
+  POSTURE_CATEGORY_RE,
+  POSTURE_CWES,
+  PRIVILEGED_ACTION_RE,
+  bogusIdFor,
+  fillResourceId,
+  isSafeFieldName,
+  isSafeResourceId,
+  pickBaselineWrite,
+  resolveAuthzReadbackTemplate,
+  rolePrivilegeRank,
+} from './floor-heuristics.ts'
 import { ScopedBrowser } from './scoped-browser.ts'
 import type { BrowserSessionStep } from './scoped-browser.ts'
 import type { EnginePersona } from './deterministic-engine.ts'
 import type { DifferentialResult } from './surface-engine.ts'
 import { injectUniversalParam } from './probes/context.ts'
-import { CUT3_FLOOR_RECIPE_IDS, browserSinkEnvelopeFromSteps, cut3FloorRecipe, floorRecipe, isProtocolBrowserSpec, runCut3Recipe, runFloorRecipe, wiredRecipeForSpecKind } from './floor-recipes.ts'
+import { CUT3_FLOOR_RECIPE_IDS, brokerFloorRecipeDeps, browserSinkEnvelopeFromSteps, cut3FloorRecipe, floorRecipe, isProtocolBrowserSpec, runCut3Recipe, runFloorRecipe, wiredRecipeForSpecKind } from './floor-recipes.ts'
 import type {
   AccessBoundaryArgs,
   BooleanOrTimingArgs,
@@ -65,7 +77,6 @@ import type { Store } from './store.ts'
 import { normalizeStructuralTokens, openCanarySession, structuralDiffNormalized } from './verify-support.ts'
 import type { EphemeralCanarySession } from './verify-support.ts'
 import type { WorkerBackend } from './worker-backend.ts'
-import { brokerFloorRecipeDeps } from './floor-recipes.ts'
 
 export type PersistedFloorRecipeId = FloorRecipeId | Cut3FloorRecipeId
 export type PersistedFloorRecipeArgs = FloorRecipeArgs | Cut3FloorRecipeArgs
@@ -255,6 +266,16 @@ function requestFromInjection(input: {
   }
 }
 
+function armOverrideOf(req: Pick<FloorRequestSpec, 'pathAndQuery' | 'jsonBody' | 'textBody' | 'headers'>) {
+  if (req.textBody === undefined && !req.headers) return undefined
+  return {
+    pathAndQuery: req.pathAndQuery,
+    ...(req.jsonBody !== undefined ? { jsonBody: req.jsonBody } : {}),
+    ...(req.textBody !== undefined ? { textBody: req.textBody } : {}),
+    ...(req.headers ? { headers: req.headers } : {}),
+  }
+}
+
 function planBooleanRecipe(input: FloorRecipePlanInput): FloorRecipePlan {
   const hyp = input.hypothesis
   const sketch: FloorRecipePlan = {
@@ -265,9 +286,33 @@ function planBooleanRecipe(input: FloorRecipePlanInput): FloorRecipePlan {
     args: {} as FloorRecipeArgs,
   }
   if (!hyp.param) return { ...sketch, skipReason: 'sqli hypothesis has no injected parameter' }
-  // Time-based blind SQLi: the engine schedules this probe after a response-identical boolean arm.
-  // The recipe sends a benign control and the conditional-delay probe; the receipt `timing` rule
-  // decides (>3x separation against a <1s control), so a status change is never the signal.
+  const buildArgs = (
+    mode: 'boolean' | 'timing',
+    control: NonNullable<ReturnType<typeof requestFromInjection>>,
+    probe: NonNullable<ReturnType<typeof requestFromInjection>>,
+    extra: Partial<BooleanOrTimingArgs>,
+  ): FloorRecipePlan => {
+    const controlReq = armOverrideOf(control)
+    const probeReq = armOverrideOf(probe)
+    const args: BooleanOrTimingArgs = {
+      mode,
+      origin: hyp.endpoint.origin,
+      method: probe.method,
+      pathAndQuery: probe.pathAndQuery,
+      controlPathAndQuery: control.pathAndQuery,
+      probePathAndQuery: probe.pathAndQuery,
+      param: hyp.param!.name,
+      vulnClass: 'sqli',
+      actor: floorActorFor(hyp.ownerPersona ?? null, input.personas),
+      ...(control.jsonBody !== undefined ? { controlJsonBody: control.jsonBody } : {}),
+      ...(probe.jsonBody !== undefined ? { probeJsonBody: probe.jsonBody } : {}),
+      ...(controlReq ? { controlRequest: controlReq } : {}),
+      ...(probeReq ? { probeRequest: probeReq } : {}),
+      ...(input.headers ?? hyp.headers ? { headers: { ...(hyp.headers ?? {}), ...(input.headers ?? {}) } } : {}),
+      ...extra,
+    }
+    return { ...sketch, args, paramLocation: hyp.location ?? hyp.param!.location }
+  }
   const timingHit = input.probe.anomalies.find(anomaly => anomaly.type === 'sql_time_differential')
   if (timingHit) {
     const baseline = hyp.baselineValue ?? (typeof timingHit.baselineValue === 'string' ? timingHit.baselineValue : '1')
@@ -285,97 +330,24 @@ function planBooleanRecipe(input: FloorRecipePlanInput): FloorRecipePlan {
     const control = requestFromInjection({ hyp, value: baseline })
     const probe = requestFromInjection({ hyp, value: probeValue })
     if (!control || !probe) return { ...sketch, skipReason: 'sqli timing injection point could not be expressed as a recipe request' }
-    const controlReq = (control.textBody !== undefined || control.headers)
-      ? {
-          pathAndQuery: control.pathAndQuery,
-          ...(control.jsonBody !== undefined ? { jsonBody: control.jsonBody } : {}),
-          ...(control.textBody !== undefined ? { textBody: control.textBody } : {}),
-          ...(control.headers ? { headers: control.headers } : {}),
-        }
-      : undefined
-    const probeReq = (probe.textBody !== undefined || probe.headers)
-      ? {
-          pathAndQuery: probe.pathAndQuery,
-          ...(probe.jsonBody !== undefined ? { jsonBody: probe.jsonBody } : {}),
-          ...(probe.textBody !== undefined ? { textBody: probe.textBody } : {}),
-          ...(probe.headers ? { headers: probe.headers } : {}),
-        }
-      : undefined
-    const args: BooleanOrTimingArgs = {
-      mode: 'timing',
-      origin: hyp.endpoint.origin,
-      method: probe.method,
-      pathAndQuery: probe.pathAndQuery,
-      controlPathAndQuery: control.pathAndQuery,
-      probePathAndQuery: probe.pathAndQuery,
-      param: hyp.param.name,
-      vulnClass: 'sqli',
-      receiptClass: 'blind_sqli',
-      actor: floorActorFor(hyp.ownerPersona ?? null, input.personas),
-      baselineValue: baseline,
-      quoteStyle: 'single',
-      ...(control.jsonBody !== undefined ? { controlJsonBody: control.jsonBody } : {}),
-      ...(probe.jsonBody !== undefined ? { probeJsonBody: probe.jsonBody } : {}),
-      ...(controlReq ? { controlRequest: controlReq } : {}),
-      ...(probeReq ? { probeRequest: probeReq } : {}),
-      ...(input.headers ?? hyp.headers ? { headers: { ...(hyp.headers ?? {}), ...(input.headers ?? {}) } } : {}),
-    }
-    return { ...sketch, args, paramLocation: hyp.location ?? hyp.param.location }
+    return buildArgs('timing', control, probe, { receiptClass: 'blind_sqli', baselineValue: baseline, quoteStyle: 'single' })
   }
   const hit = input.probe.anomalies.find(anomaly => anomaly.type === 'boolean_differential')
-  // Prefer the operand the probe actually grounded (a literal from the target's own rows, or the
-  // empty term of the tautology pair). A hypothesis default such as `1` is only the last resort.
-  const grounded = typeof hit?.baselineValue === 'string' ? hit.baselineValue : null
-  const baseline = grounded ?? hyp.baselineValue ?? '1'
+  const baseline = (typeof hit?.baselineValue === 'string' ? hit.baselineValue : null) ?? hyp.baselineValue ?? '1'
   const key = 7_919
   const style = booleanStyleOf(hit?.style)
-  const rawTemplate = typeof hit?.valueTemplate === 'string' && hit.valueTemplate.includes('{{sql_expr}}')
-    ? hit.valueTemplate
-    : null
+  const rawTemplate = typeof hit?.valueTemplate === 'string' && hit.valueTemplate.includes('{{sql_expr}}') ? hit.valueTemplate : null
   const rawQuote = typeof hit?.quoteStyle === 'string' ? hit.quoteStyle : ''
   const quoteStyle: 'single' | 'double' | 'numeric' = rawQuote === 'double' || rawQuote === 'numeric' ? rawQuote : 'single'
-  // The receipt's boolean rule pairs a *true* predicate (control arm) with a *false* predicate
-  // (probe arm): the structural difference between them is the differential. A benign baseline vs a
-  // true predicate is structurally identical by construction, so it can never be the pair.
   const control = requestFromInjection({ hyp, value: booleanArm({ template: rawTemplate, style, baseline, key, arm: 'true' }) })
   const probe = requestFromInjection({ hyp, value: booleanArm({ template: rawTemplate, style, baseline, key, arm: 'false' }) })
   if (!control || !probe) return { ...sketch, skipReason: 'sqli injection point could not be expressed as a recipe request' }
-  const controlReq = (control.textBody !== undefined || control.headers)
-    ? {
-        pathAndQuery: control.pathAndQuery,
-        ...(control.jsonBody !== undefined ? { jsonBody: control.jsonBody } : {}),
-        ...(control.textBody !== undefined ? { textBody: control.textBody } : {}),
-        ...(control.headers ? { headers: control.headers } : {}),
-      }
-    : undefined
-  const probeReq = (probe.textBody !== undefined || probe.headers)
-    ? {
-        pathAndQuery: probe.pathAndQuery,
-        ...(probe.jsonBody !== undefined ? { jsonBody: probe.jsonBody } : {}),
-        ...(probe.textBody !== undefined ? { textBody: probe.textBody } : {}),
-        ...(probe.headers ? { headers: probe.headers } : {}),
-      }
-    : undefined
-  const args: BooleanOrTimingArgs = {
-    mode: 'boolean',
-    origin: hyp.endpoint.origin,
-    method: probe.method,
-    pathAndQuery: probe.pathAndQuery,
-    controlPathAndQuery: control.pathAndQuery,
-    probePathAndQuery: probe.pathAndQuery,
-    param: hyp.param.name,
-    vulnClass: 'sqli',
-    actor: floorActorFor(hyp.ownerPersona ?? null, input.personas),
+  return buildArgs('boolean', control, probe, {
     rounds: 2,
     baselineValue: baseline,
-    ...(rawTemplate ? { valueTemplate: rawTemplate, quoteStyle } : { quoteStyle }),
-    ...(control.jsonBody !== undefined ? { controlJsonBody: control.jsonBody } : {}),
-    ...(probe.jsonBody !== undefined ? { probeJsonBody: probe.jsonBody } : {}),
-    ...(controlReq ? { controlRequest: controlReq } : {}),
-    ...(probeReq ? { probeRequest: probeReq } : {}),
-    ...(input.headers ?? hyp.headers ? { headers: { ...(hyp.headers ?? {}), ...(input.headers ?? {}) } } : {}),
-  }
-  return { ...sketch, args, paramLocation: hyp.location ?? hyp.param.location }
+    quoteStyle,
+    ...(rawTemplate ? { valueTemplate: rawTemplate } : {}),
+  })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -393,13 +365,11 @@ function planRaceRecipe(input: FloorRecipePlanInput): FloorRecipePlan {
     args: {} as ConservedBalanceArgs,
   }
   if (!hit) return { ...sketch, skipReason: 'no race_double_spend evidence on the probe result' }
-  const amountField = typeof hit.amountField === 'string' ? hit.amountField : ''
-  const balanceField = typeof hit.balanceField === 'string' && /^[A-Za-z0-9_.-]{1,64}$/.test(hit.balanceField)
-    ? hit.balanceField
-    : undefined
+  const amountField = isSafeFieldName(hit.amountField) ? hit.amountField : ''
+  const balanceField = isSafeFieldName(hit.balanceField) ? hit.balanceField : undefined
   const amount = Number(hit.amount)
   const burst = Number(hit.burstSize)
-  if (!/^[A-Za-z0-9_.-]{1,64}$/.test(amountField) || !Number.isFinite(amount) || amount <= 0) {
+  if (!amountField || !Number.isFinite(amount) || amount <= 0) {
     return { ...sketch, skipReason: 'race evidence did not name a positive amount field' }
   }
   if (!Number.isFinite(burst) || burst < 2 || burst > 10) {
@@ -446,32 +416,15 @@ function planRaceRecipe(input: FloorRecipePlanInput): FloorRecipePlan {
 // Object-level / function-level authorization
 // ---------------------------------------------------------------------------------------------
 
-const PRIVILEGED_ACTION_RE = /(?:^|\/)(?:admin|administrator|internal|manage|management|staff|superuser|privileged|backoffice|permissions?|roles?|grants?|scopes?|impersonate|feature[-_]?flags?)(?:\/|$)/i
-const BASELINE_STRONG_NUMERIC_FIELD_RE = /(?:^|[_-])(?:amount|total|price|value|cents|balance|qty|quantity|count|seats?|credits?)(?:$|[_-])/i
-const BASELINE_TEXT_FIELD_RE = /^(?:name|title|label|description|note|notes|body|text|summary|message|subject|comment|company|address)$/i
-const BASELINE_STATE_FIELD_RE = /^(?:status|state|stage|phase|visibility|priority|archived?|active)$/i
-const BASELINE_EXCLUDED_FIELD_RE = /(?:^|[_-])(?:id|uuid|owner|tenant|org|team|role|roles|permissions?|email|password|token|secret|key|created|updated)(?:$|[_-])/i
-
-function fillResourceId(pathAndQuery: string, id: string): string {
-  return pathAndQuery.replaceAll('{{id}}', encodeURIComponent(id))
-}
-
 function resourceIdOf(input: FloorRecipePlanInput): string | null {
-  const valid = (value: unknown): value is string => typeof value === 'string' && /^[A-Za-z0-9_.:-]{1,128}$/.test(value)
   const matrix = Array.isArray(input.probe.details.matrix)
     ? input.probe.details.matrix as Array<Record<string, unknown>>
     : null
-  // The differential probe reports one anomaly per (method, object). Prefer the object whose owner
-  // read carried the most data: an empty-but-2xx collection is a legal matrix row, but it can never
-  // satisfy the read differential (the bogus-id control returns the same empty body). Legacy ranked
-  // hits by similarity; body size is the stable tie-breaker that survives an all-1.0 similarity.
   const ownerBytes = (id: string): number => {
     if (!matrix) return 0
     let best = 0
     for (const row of matrix) {
-      if (String(row.resourceId ?? '') !== id) continue
-      if (String(row.actor ?? '') !== 'owner') continue
-      if (row.accessible !== true) continue
+      if (String(row.resourceId ?? '') !== id || String(row.actor ?? '') !== 'owner' || row.accessible !== true) continue
       const status = typeof row.status === 'number' ? row.status : 0
       if (status < 200 || status >= 300) continue
       const bytes = typeof row.bodyBytes === 'number' ? row.bodyBytes : 0
@@ -482,7 +435,7 @@ function resourceIdOf(input: FloorRecipePlanInput): string | null {
   const candidates = input.probe.anomalies
     .filter(anomaly => anomaly.type === 'unauthorized_access' &&
       String(anomaly.method ?? 'GET').toUpperCase() === input.hypothesis.method &&
-      valid(anomaly.resourceId))
+      isSafeResourceId(anomaly.resourceId))
     .map(anomaly => anomaly.resourceId as string)
   if (candidates.length > 0) {
     let best = candidates[0]!
@@ -493,49 +446,14 @@ function resourceIdOf(input: FloorRecipePlanInput): string | null {
     }
     return best
   }
-  return input.hypothesis.resourceIds?.find(valid) ?? null
+  return input.hypothesis.resourceIds?.find(isSafeResourceId) ?? null
 }
 
-/** Readback route for a mutation, mirroring the legacy synthesizer's choice set. */
 function authzReadbackPath(input: FloorRecipePlanInput, id: string | null, functionLevel: boolean): string | null {
-  const hyp = input.hypothesis
-  if (hyp.readbackPath) return id ? fillResourceId(hyp.readbackPath, id) : hyp.readbackPath
-  const bare = hyp.pathAndQuery.split('?')[0]!
-  if (functionLevel) return PRIVILEGED_ACTION_RE.test(bare) ? hyp.pathAndQuery : null
-  if (!id) return null
-  const queryAt = hyp.pathAndQuery.indexOf('?')
-  if (queryAt >= 0 && hyp.pathAndQuery.slice(queryAt).includes('{{id}}')) return hyp.pathAndQuery
-  const segments = bare.split('/')
-  const placeholder = segments.findIndex(segment => segment === '{{id}}' || /^\{[^}]+\}$/.test(segment) || /^:[A-Za-z_][A-Za-z0-9_]*$/.test(segment))
-  if (placeholder <= 0) return null
-  if (placeholder === segments.length - 1) return fillResourceId(hyp.pathAndQuery, id)
-  if (placeholder === segments.length - 2 && PRIVILEGED_ACTION_RE.test(bare)) {
-    return fillResourceId(segments.slice(0, -1).join('/'), id)
-  }
-  return null
-}
-
-/** A fresh baseline value for one mutable field of the probe body, or null when none is writable. */
-function baselineWriteFor(body: unknown): { body: Record<string, unknown>; field: string } | null {
-  if (!body || typeof body !== 'object' || Array.isArray(body)) return null
-  const scalars = Object.entries(body as Record<string, unknown>)
-    .filter(([field, value]) => /^[A-Za-z0-9_.-]{1,64}$/.test(field) &&
-      (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean'))
-  const eligible = scalars.filter(([field]) => !BASELINE_EXCLUDED_FIELD_RE.test(field))
-  const chosen = eligible.find(([field]) => BASELINE_STRONG_NUMERIC_FIELD_RE.test(field))
-    ?? eligible.find(([field]) => BASELINE_TEXT_FIELD_RE.test(field))
-    ?? eligible.find(([, value]) => typeof value === 'boolean')
-    ?? eligible.find(([field]) => BASELINE_STATE_FIELD_RE.test(field))
-    ?? eligible.find(([field]) => !BASELINE_EXCLUDED_FIELD_RE.test(field))
-  if (!chosen) return null
-  const [field, value] = chosen
-  const nonce = randomBytes(4).toString('hex')
-  const baseline = typeof value === 'boolean'
-    ? !value
-    : typeof value === 'number' || /^-?\d+(?:\.\d+)?$/.test(String(value))
-      ? 424_242 + (Number.parseInt(nonce.slice(0, 4), 16) % 1_000)
-      : `kovo-baseline-${nonce}`
-  return { field, body: { ...(body as Record<string, unknown>), [field]: baseline } }
+  const resolved = resolveAuthzReadbackTemplate(input.hypothesis, functionLevel)
+  if (!resolved) return null
+  if (!functionLevel && !id) return null
+  return id ? fillResourceId(resolved.template, id) : resolved.template
 }
 
 function authzBodyOf(input: FloorRecipePlanInput): Record<string, unknown> | null {
@@ -548,26 +466,6 @@ function authzBodyOf(input: FloorRecipePlanInput): Record<string, unknown> | nul
   const hit = hits.find(anomaly => String(anomaly.method ?? 'GET').toUpperCase() === hyp.method) ?? hits[0]
   if (hit?.bodyTemplate) return hit.bodyTemplate as Record<string, unknown>
   return hyp.jsonBody ?? null
-}
-
-const ROLE_PRIVILEGE_RANK: Record<string, number> = {
-  superadmin: 5,
-  owner: 4,
-  admin: 4,
-  manager: 3,
-  editor: 3,
-  moderator: 3,
-  member: 2,
-  user: 2,
-  viewer: 1,
-  readonly: 1,
-  guest: 0,
-  anonymous: 0,
-}
-
-function rolePrivilegeRank(role: RoleName | null | undefined): number | null {
-  if (!role) return null
-  return Object.prototype.hasOwnProperty.call(ROLE_PRIVILEGE_RANK, role) ? ROLE_PRIVILEGE_RANK[role]! : null
 }
 
 function selectLowerRoleDeniedPeer(
@@ -613,7 +511,7 @@ function planAuthzRecipe(input: FloorRecipePlanInput): FloorRecipePlan {
   const reserved = hyp.method === 'DELETE' && !functionLevel && privileged && hyp.reservedVictimId
     ? hyp.reservedVictimId
     : null
-  const resolvedId = reserved && /^[A-Za-z0-9_.:-]{1,128}$/.test(reserved) ? reserved : id
+  const resolvedId = reserved && isSafeResourceId(reserved) ? reserved : id
   const realPath = resolvedId ? fillResourceId(hyp.pathAndQuery, resolvedId) : hyp.pathAndQuery
   const owner = floorActorFor(ownerHandle, input.personas)
   const probe = floorActorFor(probeHandle, input.personas)
@@ -663,7 +561,7 @@ function planAuthzRecipe(input: FloorRecipePlanInput): FloorRecipePlan {
   if (!readbackPath) return { ...sketch, skipReason: 'authz mutation hypothesis has no separate readback route' }
   const readbackActor = floorActorFor(hyp.readbackPersona ?? ownerHandle, input.personas)
   const selfState = Boolean(hyp.functionState?.bindings?.length)
-  const baselineWrite = !functionLevel && !selfState && hyp.method !== 'DELETE' ? baselineWriteFor(body) : null
+  const baselineWrite = !functionLevel && !selfState && hyp.method !== 'DELETE' ? pickBaselineWrite(body) : null
   const resetBody = selfState && hyp.functionState?.reset?.length
     ? { ...body, ...Object.fromEntries(hyp.functionState.reset.map(item => [item.field, item.value])) }
     : null
@@ -679,7 +577,7 @@ function planAuthzRecipe(input: FloorRecipePlanInput): FloorRecipePlan {
     readbackMethod: 'GET',
     readbackPathAndQuery: readbackPath,
     readbackActor,
-    ...(baselineWrite ? { baselineWrite: { body: baselineWrite.body, actor: owner, method: hyp.method } } : {}),
+    ...(baselineWrite ? { baselineWrite: { body: baselineWrite.baselineBody, actor: owner, method: hyp.method } } : {}),
     ...(resetBody ? { reset: { body: resetBody, actor: probe, method: hyp.method } } : {}),
     ...(hyp.authzRequiredRole ? { requiredRole: hyp.authzRequiredRole } : {}),
     ...(functionLevel && privileged && hyp.authzRequiredRole ? { oracleEvents: ['privilege_escalation'] } : {}),
@@ -707,10 +605,27 @@ function planBrowserRecipe(input: FloorRecipePlanInput): FloorRecipePlan {
     args: {} as FloorRecipeArgs,
   }
   const spec = input.candidateSpec
-  const steps = Array.isArray(spec?.steps) ? spec!.steps as Array<Record<string, unknown>> : null
-  if (!steps || steps.length === 0) return { ...sketch, skipReason: 'browser spec carried no steps to replay' }
-  // Protocol browser proofs (postMessage/fetch/builtin) have no recipe model yet and stay on the
-  // framework verifier; only navigate/fill/click DOM proofs migrate.
+  let steps = Array.isArray(spec?.steps) ? spec!.steps as Array<Record<string, unknown>> : null
+  if (!steps || steps.length === 0) {
+    // Direct floor-recipe planning for reflected xss_context without throwaway browser_chain jq synthesis.
+    const hit = input.probe.anomalies.find(a => a.type === 'xss_context')
+    const context = String(hit?.context ?? 'html_body')
+    const chars = Array.isArray(hit?.unencodedChars) ? hit!.unencodedChars.map(String) : []
+    if (!hit || !hyp.param || hyp.location !== 'query' || context !== 'html_body' || !chars.includes('<') || !chars.includes('"')) {
+      return { ...sketch, skipReason: 'browser spec carried no steps to replay' }
+    }
+    const sep = hyp.pathAndQuery.includes('?') ? '&' : '?'
+    const key = encodeURIComponent(hyp.param.name)
+    const controlPath = `${hyp.pathAndQuery}${sep}${key}=kovo`
+    const payload = `<img src=x onerror="document.title='{{canary_token}}'">`
+    const encodedPayload = payload.split('{{canary_token}}').map(encodeURIComponent).join('{{canary_token}}')
+    const probePath = `${hyp.pathAndQuery}${sep}${key}=${encodedPayload}`
+    const persona = hyp.ownerPersona ? { persona: hyp.ownerPersona } : {}
+    steps = [
+      { id: 'c1', role: 'control', origin: hyp.endpoint.origin, ...persona, pathAndQuery: controlPath, action: 'navigate', checkKind: 'dom_xss', enableSinkHook: true, waitAfterLoadMs: 300 },
+      { id: 'p1', role: 'probe', origin: hyp.endpoint.origin, ...persona, pathAndQuery: probePath, action: 'navigate', checkKind: 'dom_xss', enableSinkHook: true, waitAfterLoadMs: 800 },
+    ]
+  }
   if (isProtocolBrowserSpec(steps)) return { ...sketch, skipReason: 'protocol browser proof (postMessage/fetch/builtin) stays on the framework verifier' }
   const origin = typeof steps[0]?.origin === 'string' ? String(steps[0].origin) : hyp.endpoint.origin
   const envelope = browserSinkEnvelopeFromSteps({ origin, vulnClass: 'dom_xss', steps })
@@ -1609,179 +1524,19 @@ function runnerSecrets(grant: Grant, broker: RequestBroker): NamedSecret[] {
   ]
 }
 
-function runnerInconclusive(
-  reason: string,
-  exchanges: BrokerExchangeResult[],
-  exchangeIds: string[],
-  evidencePayload: Record<string, unknown>,
-): ReplayVerificationResult {
-  const payload = { ...evidencePayload, error: reason }
-  const evidenceSha256 = createHash('sha256').update(JSON.stringify(payload)).digest('hex')
-  return {
-    verdict: 'inconclusive',
-    outcome: {
-      confirmed: false,
-      controlPassed: false,
-      observed: reason.slice(0, 1200),
-      expected: 'Clean replay execution passing control and deterministic assertions.',
-      reason: reason.slice(0, 1200),
-    },
-    exchangeIds,
-    exchanges,
-    evidencePayload: payload,
-    evidenceSha256,
-  }
-}
-
-function runnerSummarizeExchange(ex: BrokerExchangeResult) {
-  let json: unknown = null
-  if (ex.mediaType.includes('json')) {
-    try { json = JSON.parse(ex.body) } catch { json = null }
-  }
-  return {
-    origin: ex.origin,
-    finalOrigin: ex.finalOrigin,
-    redirectOrigins: ex.redirectOrigins,
-    method: ex.method,
-    pathAndQuery: ex.pathAndQuery,
-    personaHandle: ex.personaHandle,
-    status: ex.status,
-    mediaType: ex.mediaType,
-    headers: ex.respHeaders,
-    setCookies: ex.setCookies,
-    body: ex.body.slice(0, 64 * 1024),
-    bodyPreview: ex.bodyPreview,
-    bodyBytes: ex.bodyBytes,
-    bodySha256: ex.bodySha256,
-    durationMs: ex.durationMs,
-    ...(ex.secretMatches?.length
-      ? {
-          secretMatches: ex.secretMatches.slice(0, 16).map(m => ({
-            kind: m.kind,
-            sha256Prefix: m.sha256Prefix,
-            ...(m.fieldPath ? { fieldPath: m.fieldPath } : {}),
-            count: m.count,
-          })),
-        }
-      : {}),
-    ...(json !== null ? { json } : {}),
-  }
-}
-
-function runnerInterpolateString(template: string, vars: Record<string, string>): string {
-  return template.replace(/\{\{([a-zA-Z_][a-zA-Z0-9_]*)\}\}/g, (full, name: string) =>
-    Object.prototype.hasOwnProperty.call(vars, name) ? vars[name] : full)
-}
-
-function runnerInterpolateValue(value: unknown, vars: Record<string, string>): unknown {
-  if (typeof value === 'string') return runnerInterpolateString(value, vars)
-  if (Array.isArray(value)) return value.map(v => runnerInterpolateValue(v, vars))
-  if (value && typeof value === 'object') {
-    const out: Record<string, unknown> = {}
-    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      out[k] = runnerInterpolateValue(v, vars)
+function makeRunnerRecorder(ctx: LegacySpecRunnerContext, fallbackPrefix: string) {
+  const exchanges: BrokerExchangeResult[] = []
+  const exchangeIds: string[] = []
+  const recordExchange = (ex: BrokerExchangeResult): string => {
+    exchanges.push(ex)
+    const id = ctx.onExchange?.(ex)
+    if (typeof id === 'string' && id) {
+      exchangeIds.push(id)
+      return id
     }
-    return out
+    return `${fallbackPrefix}-${exchanges.length}`
   }
-  return value
-}
-
-function runnerApplyBodySignature(interpolated: unknown, signable: NonNullable<ReplayStep['request']['bodySignature']>): unknown {
-  const input = interpolated && typeof interpolated === 'object' && !Array.isArray(interpolated)
-    ? { ...(interpolated as Record<string, unknown>) }
-    : {}
-  const key = `kovo_whk_${randomBytes(8).toString('hex')}`
-  const ts = String(Math.floor(Date.now() / 1000))
-  if (signable.timestampField) input[signable.timestampField] = ts
-  input[signable.keyField] = key
-  const withoutSig = { ...input }
-  delete withoutSig[signable.signatureField]
-  const event = signable.eventField
-    ? withoutSig[signable.eventField]
-    : (withoutSig.event ?? withoutSig.payload ?? withoutSig.data ?? withoutSig)
-  const asText = (value: unknown): string => (typeof value === 'string' ? value : JSON.stringify(value))
-  const canonical = signable.canonical === 'ts_event'
-    ? `${ts}.${asText(event)}`
-    : signable.canonical === 'ts_body'
-      ? `${ts}.${JSON.stringify(withoutSig)}`
-      : signable.canonical === 'event'
-        ? asText(event)
-        : JSON.stringify(withoutSig)
-  input[signable.signatureField] = createHmac('sha256', key).update(canonical).digest(signable.encoding)
-  return input
-}
-
-function runnerStepToBrokerRequest(
-  step: ReplayStep,
-  vars: Record<string, string>,
-  opts?: { replayJarPrefix?: string; runId?: string; assignmentId?: string },
-): BrokerHttpRequest {
-  const req = step.request
-  let sessionId: string | undefined
-  if (req.session) {
-    if (opts?.replayJarPrefix) {
-      const candidate = `rv-${opts.replayJarPrefix}-${req.session}`
-      sessionId = candidate.length <= 32
-        ? candidate
-        : `rv-${opts.replayJarPrefix}-${createHash('sha256').update(req.session).digest('hex').slice(0, 12)}`.slice(0, 32)
-    } else {
-      sessionId = req.session
-    }
-  }
-  const pathAndQuery = runnerInterpolateString(req.pathAndQuery, vars)
-  const headers: Record<string, string> = {}
-  for (const [k, v] of Object.entries(req.headers ?? {})) {
-    headers[k] = runnerInterpolateString(v, vars)
-  }
-  let body: string | undefined
-  if (req.textBody !== undefined) {
-    body = runnerInterpolateString(req.textBody, vars)
-  } else if (req.jsonBody !== undefined) {
-    const interpolated = runnerInterpolateValue(req.jsonBody, vars)
-    const signed = req.bodySignature ? runnerApplyBodySignature(interpolated, req.bodySignature) : interpolated
-    body = JSON.stringify(signed)
-    if (!headers['Content-Type'] && !headers['content-type']) {
-      headers['Content-Type'] = 'application/json'
-    }
-  }
-  let authMutation: AuthMutation | undefined = req.authMutation
-  if (authMutation && authMutation.kind === 'jku_x5u_canary') {
-    const rawUrl = authMutation.url ?? authMutation.value
-    const interpUrl = rawUrl !== undefined ? runnerInterpolateString(rawUrl, vars) : undefined
-    authMutation = {
-      ...authMutation,
-      ...(authMutation.url !== undefined && interpUrl !== undefined ? { url: interpUrl } : {}),
-      ...(authMutation.value !== undefined && interpUrl !== undefined ? { value: interpUrl } : {}),
-    }
-  }
-  return {
-    origin: req.origin,
-    method: req.method,
-    pathAndQuery,
-    headers,
-    body,
-    persona: req.persona,
-    ...(sessionId ? { session: sessionId } : {}),
-    sessionGroupRole: step.role,
-    ...(req.csrfBind !== undefined ? { csrfBind: req.csrfBind } : {}),
-    ...(authMutation ? { authMutation } : {}),
-    ...(req.traceId ? { traceId: req.traceId } : {}),
-    ...(opts?.runId ? { runId: opts.runId } : {}),
-    ...(opts?.assignmentId ? { assignmentId: opts.assignmentId } : {}),
-    followRedirects: req.followRedirects,
-  }
-}
-
-function runnerHasDestructiveContent(text: string): boolean {
-  if (containsDestructivePayload(text)) return true
-  try {
-    const decoded = decodeURIComponent(text.replaceAll('+', ' '))
-    if (decoded !== text && containsDestructivePayload(decoded)) return true
-  } catch {
-    const plusDecoded = text.replaceAll('+', ' ')
-    if (plusDecoded !== text && containsDestructivePayload(plusDecoded)) return true
-  }
-  return false
+  return { exchanges, exchangeIds, recordExchange }
 }
 
 function runnerIsPrime(n: number): boolean {
@@ -1828,68 +1583,93 @@ async function runnerSleepAbortable(ms: number, signal: AbortSignal) {
   })
 }
 
-function runnerStatusMatchesExpected(expected: number | number[] | undefined, status: number): boolean {
-  if (expected === undefined) return false
-  return Array.isArray(expected) ? expected.includes(status) : expected === status
-}
-
-function runnerIsUnexpectedErrorStatus(status: number, ...expected: Array<number | number[] | undefined>): boolean {
-  if (status !== 404 && status < 500) return false
-  return !expected.some(e => runnerStatusMatchesExpected(e, status))
-}
-
-const RUNNER_POSTURE_CWES = new Set([
-  'CWE-16', 'CWE-200', 'CWE-209', 'CWE-284', 'CWE-285', 'CWE-287', 'CWE-288', 'CWE-306', 'CWE-319', 'CWE-326',
-  'CWE-346', 'CWE-523', 'CWE-538', 'CWE-540', 'CWE-614', 'CWE-639', 'CWE-693', 'CWE-862', 'CWE-863', 'CWE-942',
-  'CWE-1004', 'CWE-1021',
-])
-const RUNNER_POSTURE_CATEGORY_RE = /access|auth|bypass|cors|header|posture|misconfig|exposure|session|cookie|transport|tls|csp|policy|idor|bola|bfla/i
-
-function runnerDefaultRequireControlNonError(spec: DeclarativeReplaySpec): boolean {
-  if (spec.kind === 'static_ast_proof') return false
-  return RUNNER_POSTURE_CWES.has(spec.cwe) || RUNNER_POSTURE_CATEGORY_RE.test(spec.category)
-}
-
-function runnerReadJsonPath(obj: unknown, path: string): string | null {
-  const clean = path.replace(/^\$\.?/, '')
-  const segments = clean.split('.').filter(Boolean)
-  let cur: unknown = obj
-  for (const seg of segments) {
-    if (cur === null || cur === undefined) return null
-    const arrayMatch = seg.match(/^([a-zA-Z0-9_-]*)\[(\d+)\]$/)
-    if (arrayMatch) {
-      const [, key, idxStr] = arrayMatch
-      if (key) cur = (cur as Record<string, unknown>)[key]
-      if (!Array.isArray(cur)) return null
-      cur = cur[Number(idxStr)]
-    } else if (typeof cur === 'object') {
-      cur = (cur as Record<string, unknown>)[seg]
-    } else {
-      return null
-    }
+function evaluateRunnerOobReceipt(input: {
+  origin: string
+  stepId: string
+  exchange: BrokerExchangeResult
+  exchangeId: string
+  request: BrokerHttpRequest
+  oobEventId: string
+  callbackPrefix: string
+  token: string
+  probeWait: { triggered: boolean; stage?: string; subscriptionId?: string | null }
+  controlTriggered: boolean
+  claimedDelta: string
+  injectedAtMs: number
+  carrierExtra?: string
+}): ReplayReceiptCheck {
+  const receipt: ProofReceipt = {
+    vulnClass: 'oob',
+    target: { origin: input.origin, method: input.exchange.method.toUpperCase(), pathAndQuery: input.exchange.pathAndQuery },
+    exchangeIds: [input.exchangeId],
+    oobEventIds: [input.oobEventId],
+    browserTraceIds: [],
+    claimedDelta: input.claimedDelta,
+    injectedAtMs: input.injectedAtMs,
   }
-  if (cur === null || cur === undefined) return null
-  return typeof cur === 'string' ? cur : JSON.stringify(cur)
+  const carrierBase = `${input.request.pathAndQuery}\n${JSON.stringify(input.request.headers ?? {})}\n${input.request.body ?? ''}`
+  const transcript: ReceiptTranscript = {
+    entries: [{
+      exchangeId: input.exchangeId,
+      step: {
+        id: input.stepId,
+        arm: 'probe',
+        method: input.exchange.method.toUpperCase(),
+        route: input.exchange.pathAndQuery.split('?')[0] || '/',
+        pathAndQuery: input.exchange.pathAndQuery,
+        status: input.exchange.status,
+        actor: { handle: input.exchange.personaHandle, role: null, tenant: null, auth: 'unknown', sameSite: null },
+        json: null,
+        body: input.exchange.body,
+      },
+      carrierText: input.carrierExtra ? `${carrierBase}\n${input.carrierExtra}` : carrierBase,
+    }],
+    oobEvents: [{
+      id: input.oobEventId,
+      callbackId: input.probeWait.subscriptionId ?? `${input.callbackPrefix}:${input.exchangeId}`,
+      token: input.token,
+      targetOrigin: input.origin,
+      delivered: input.probeWait.triggered && !input.controlTriggered,
+      stage: input.probeWait.stage === 'late' ? 'late' : 'immediate',
+      receivedAtMs: Date.now(),
+      injectedAtMs: input.injectedAtMs,
+    }],
+  }
+  const verification = defaultTerminalOracleRegistry.evaluate(
+    HostFactLog.fromTranscript(transcript),
+    { kind: 'single_hop', receipt },
+    { strictHostDerivation: true },
+  ).singleHop!
+  return { receipt, verification, mode: 'strict' }
 }
 
-function runnerExtractVariables(step: ReplayStep, exchange: BrokerExchangeResult, vars: Record<string, string>) {
-  for (const rule of step.extract ?? []) {
-    let extracted: string | null = null
-    if (rule.from === 'status') {
-      extracted = String(exchange.status)
-    } else if (rule.from === 'header') {
-      extracted = exchange.respHeaders[rule.selector.toLowerCase()] ?? null
-    } else if (rule.from === 'json') {
-      try { extracted = runnerReadJsonPath(JSON.parse(exchange.body), rule.selector) } catch { extracted = null }
-    } else if (rule.from === 'regex') {
-      try {
-        const m = exchange.body.match(new RegExp(rule.selector))
-        extracted = m ? (m[1] ?? m[0] ?? null) : null
-      } catch {
-        extracted = null
-      }
-    }
-    if (extracted !== null) vars[rule.varName] = extracted.slice(0, 512)
+async function runRunnerSpaCatchall(input: {
+  origin: string
+  ctx: LegacySpecRunnerContext
+  recordExchange: (ex: BrokerExchangeResult) => string
+  targets: readonly { id: string; exchange: BrokerExchangeResult }[]
+}): Promise<{ summary: Record<string, unknown>; allProbesMatchedCatchall: boolean }> {
+  const catchallPath = `/.kovo-nonexistent-${randomUUID()}`
+  const catchallEx = await input.ctx.broker.executeHttp({
+    origin: input.origin,
+    method: 'GET',
+    pathAndQuery: catchallPath,
+    followRedirects: true,
+  }, input.ctx.grant, input.ctx.signal)
+  input.recordExchange(catchallEx)
+  const comparisons: Record<string, Record<string, unknown>> = {}
+  let allProbesMatchedCatchall = input.targets.length > 0
+  for (const target of input.targets) {
+    const diff = diffResponse(
+      { status: catchallEx.status, body: catchallEx.body, mediaType: catchallEx.mediaType },
+      { status: target.exchange.status, body: target.exchange.body, mediaType: target.exchange.mediaType },
+    )
+    comparisons[target.id] = diff
+    if (!diff.likelySpaCatchall) allProbesMatchedCatchall = false
+  }
+  return {
+    summary: { path: catchallPath, ...summarizeExchange(catchallEx), comparisons, allProbesMatchedCatchall },
+    allProbesMatchedCatchall,
   }
 }
 
@@ -1903,10 +1683,10 @@ function runnerHandleError(
   const secrets = runnerSecrets(ctx.grant, ctx.broker)
   const safePayload = redactJsonValue(evidencePayload, secrets)
   if (err instanceof BrokerDenied || err instanceof BrokerCircuitOpen || err instanceof BrokerApprovalRequired) {
-    return runnerInconclusive(redact(err.message, secrets), exchanges, exchangeIds, safePayload)
+    return inconclusiveResult(redact(err.message, secrets), exchanges, exchangeIds, safePayload)
   }
   const message = redact(err instanceof Error ? err.message : String(err), secrets)
-  return runnerInconclusive(`Replay execution failed: ${message}`, exchanges, exchangeIds, safePayload)
+  return inconclusiveResult(`Replay execution failed: ${message}`, exchanges, exchangeIds, safePayload)
 }
 
 /**
@@ -1918,7 +1698,7 @@ export async function runStaticAstProofRecipe(
   ctx: LegacySpecRunnerContext,
 ): Promise<ReplayVerificationResult> {
   if (!ctx.reposDir) {
-    return runnerInconclusive('static_ast_proof requires the read-only /repos mount (reposDir).', [], [], { kind: spec.kind })
+    return inconclusiveResult('static_ast_proof requires the read-only /repos mount (reposDir).', [], [], { kind: spec.kind })
   }
   const basePayload: Record<string, unknown> = {
     kind: spec.kind,
@@ -1998,24 +1778,14 @@ export async function runRceProofRecipe(
   spec: Extract<DeclarativeReplaySpec, { kind: 'rce_proof' }>,
   ctx: LegacySpecRunnerContext,
 ): Promise<ReplayVerificationResult> {
-  const exchanges: BrokerExchangeResult[] = []
-  const exchangeIds: string[] = []
-  const recordExchange = (ex: BrokerExchangeResult): string => {
-    exchanges.push(ex)
-    const id = ctx.onExchange?.(ex)
-    if (typeof id === 'string' && id) {
-      exchangeIds.push(id)
-      return id
-    }
-    return `rce-${exchanges.length}`
-  }
+  const { exchanges, exchangeIds, recordExchange } = makeRunnerRecorder(ctx, 'rce')
 
   // Hard Tier 3 + HITL approval gate
   const tier = ctx.grant.tier ?? 1
   const gateRequest = spec.probeStep.request
   if (tier < 3) {
     ctx.grant.audit('denied', gateRequest.origin)
-    return runnerInconclusive(`${spec.kind} replay specs are blocked below Tier 3.`, exchanges, exchangeIds, { kind: spec.kind })
+    return inconclusiveResult(`${spec.kind} replay specs are blocked below Tier 3.`, exchanges, exchangeIds, { kind: spec.kind })
   }
   const localLab = Boolean(ctx.grant.allowLocalLab && process.env.KOVO_ALLOW_LOCAL_LAB === '1')
   const approvalContext: StateChangeApprovalContext = {
@@ -2030,7 +1800,7 @@ export async function runRceProofRecipe(
     : localLab
   if (!approved) {
     ctx.grant.audit('denied', gateRequest.origin)
-    return runnerInconclusive(`${spec.kind} requires explicit Tier 3 HITL operator approval.`, exchanges, exchangeIds, { kind: spec.kind })
+    return inconclusiveResult(`${spec.kind} requires explicit Tier 3 HITL operator approval.`, exchanges, exchangeIds, { kind: spec.kind })
   }
 
   const basePayload: Record<string, unknown> = {
@@ -2081,15 +1851,15 @@ export async function runRceProofRecipe(
       proofMeta.probeCanaryToken = probeCanary.token
     }
 
-    const controlReq = runnerStepToBrokerRequest(spec.controlStep, controlVars, { runId: ctx.runId, assignmentId: ctx.assignmentId })
-    const probeReq = runnerStepToBrokerRequest(spec.probeStep, probeVars, { runId: ctx.runId, assignmentId: ctx.assignmentId })
+    const controlReq = stepToBrokerRequest(spec.controlStep, controlVars, { runId: ctx.runId, assignmentId: ctx.assignmentId })
+    const probeReq = stepToBrokerRequest(spec.probeStep, probeVars, { runId: ctx.runId, assignmentId: ctx.assignmentId })
     const serializedProbeReq = JSON.stringify(probeReq)
 
-    if (runnerHasDestructiveContent(JSON.stringify(controlReq)) || runnerHasDestructiveContent(serializedProbeReq)) {
-      return runnerInconclusive('Interpolated rce_proof request matched destructive-payload denylist.', exchanges, exchangeIds, { kind: spec.kind })
+    if (hasDestructiveContent(JSON.stringify(controlReq)) || hasDestructiveContent(serializedProbeReq)) {
+      return inconclusiveResult('Interpolated rce_proof request matched destructive-payload denylist.', exchanges, exchangeIds, { kind: spec.kind })
     }
     if (spec.proofMode === 'split_echo' && expectedSplitAssembled && serializedProbeReq.includes(expectedSplitAssembled)) {
-      return runnerInconclusive('Invalid split_echo template: nonce_part1 and nonce_part2 must be separated by execution concatenation syntax.', exchanges, exchangeIds, { kind: spec.kind })
+      return inconclusiveResult('Invalid split_echo template: nonce_part1 and nonce_part2 must be separated by execution concatenation syntax.', exchanges, exchangeIds, { kind: spec.kind })
     }
 
     const controlEx = await ctx.broker.executeHttp(controlReq, ctx.grant, ctx.signal)
@@ -2105,8 +1875,7 @@ export async function runRceProofRecipe(
     if (spec.proofMode === 'dynamic_math' && expectedNonceProduct) {
       const inProbe = probeEx.body.includes(expectedNonceProduct)
       const inControl = controlEx.body.includes(expectedNonceProduct)
-      const inOutbound = serializedProbeReq.includes(expectedNonceProduct)
-      deterministicProofPassed = inProbe && !inControl && !inOutbound
+      deterministicProofPassed = inProbe && !inControl && !serializedProbeReq.includes(expectedNonceProduct)
       proofMeta.mathVerified = deterministicProofPassed
       proofMeta.productInProbe = inProbe
       proofMeta.productInControl = inControl
@@ -2116,8 +1885,7 @@ export async function runRceProofRecipe(
     } else if (spec.proofMode === 'split_echo' && expectedSplitAssembled) {
       const inProbe = probeEx.body.includes(expectedSplitAssembled)
       const inControl = controlEx.body.includes(expectedSplitAssembled)
-      const inOutbound = serializedProbeReq.includes(expectedSplitAssembled)
-      deterministicProofPassed = inProbe && !inControl && !inOutbound
+      deterministicProofPassed = inProbe && !inControl && !serializedProbeReq.includes(expectedSplitAssembled)
       proofMeta.splitEchoVerified = deterministicProofPassed
       proofMeta.assembledInProbe = inProbe
       proofMeta.assembledInControl = inControl
@@ -2133,49 +1901,21 @@ export async function runRceProofRecipe(
       proofMeta.canaryProbeDetail = probeWait.detail
       proofMeta.canaryControlTriggered = controlCheck.triggered
       proofMeta.canaryControlDetail = controlCheck.detail
-      const receipt: ProofReceipt = {
-        vulnClass: 'oob',
-        target: { origin: spec.origin, method: probeEx.method.toUpperCase(), pathAndQuery: probeEx.pathAndQuery },
-        exchangeIds: [probeExchangeId],
-        oobEventIds: ['rce-oob-canary'],
-        browserTraceIds: [],
+      receiptCheck = evaluateRunnerOobReceipt({
+        origin: spec.origin,
+        stepId: spec.probeStep.id,
+        exchange: probeEx,
+        exchangeId: probeExchangeId,
+        request: probeReq,
+        oobEventId: 'rce-oob-canary',
+        callbackPrefix: 'rce',
+        token: probeCanaryToken,
+        probeWait,
+        controlTriggered: controlCheck.triggered,
         claimedDelta: 'Probe triggered an out-of-band execution callback that control did not.',
         injectedAtMs,
-      }
-      const transcript: ReceiptTranscript = {
-        entries: [{
-          exchangeId: probeExchangeId,
-          step: {
-            id: spec.probeStep.id,
-            arm: 'probe',
-            method: probeEx.method.toUpperCase(),
-            route: probeEx.pathAndQuery.split('?')[0] || '/',
-            pathAndQuery: probeEx.pathAndQuery,
-            status: probeEx.status,
-            actor: { handle: probeEx.personaHandle, role: null, tenant: null, auth: 'unknown', sameSite: null },
-            json: null,
-            body: probeEx.body,
-          },
-          carrierText: `${probeReq.pathAndQuery}\n${JSON.stringify(probeReq.headers ?? {})}\n${probeReq.body ?? ''}`,
-        }],
-        oobEvents: [{
-          id: 'rce-oob-canary',
-          callbackId: probeWait.subscriptionId ?? `rce:${probeExchangeId}`,
-          token: probeCanaryToken,
-          targetOrigin: spec.origin,
-          delivered: probeWait.triggered && !controlCheck.triggered,
-          stage: probeWait.stage === 'late' ? 'late' : 'immediate',
-          receivedAtMs: Date.now(),
-          injectedAtMs,
-        }],
-      }
-      const verification = defaultTerminalOracleRegistry.evaluate(
-        HostFactLog.fromTranscript(transcript),
-        { kind: 'single_hop', receipt },
-        { strictHostDerivation: true },
-      ).singleHop!
-      receiptCheck = { receipt, verification, mode: 'strict' }
-      deterministicProofPassed = probeWait.triggered && !controlCheck.triggered && verification.confirmed
+      })
+      deterministicProofPassed = probeWait.triggered && !controlCheck.triggered && receiptCheck.verification.confirmed
       observed = `probeCanary=${probeWait.triggered}, controlCanary=${controlCheck.triggered}`
     }
 
@@ -2183,13 +1923,13 @@ export async function runRceProofRecipe(
     const evidencePayload = redactJsonValue({
       ...basePayload,
       proofMode: spec.proofMode,
-      control: runnerSummarizeExchange(controlEx),
-      probe: runnerSummarizeExchange(probeEx),
+      control: summarizeExchange(controlEx),
+      probe: summarizeExchange(probeEx),
       proof: proofMeta,
     }, runnerSecrets(ctx.grant, ctx.broker))
     const evidenceSha256 = createHash('sha256').update(JSON.stringify(evidencePayload)).digest('hex')
 
-    const controlPassed = !runnerIsUnexpectedErrorStatus(controlEx.status, spec.controlStep.expectedStatus, spec.expectedStatus) &&
+    const controlPassed = !isUnexpectedErrorStatus(controlEx.status, spec.controlStep.expectedStatus, spec.expectedStatus) &&
       controlEx.status >= 200 && controlEx.status < 500
     if (deterministicProofPassed && controlPassed) {
       return {
@@ -2241,13 +1981,7 @@ export async function runCacheDifferentialRecipe(
   spec: Extract<DeclarativeReplaySpec, { kind: 'cache_differential' }>,
   ctx: LegacySpecRunnerContext,
 ): Promise<ReplayVerificationResult> {
-  const exchanges: BrokerExchangeResult[] = []
-  const exchangeIds: string[] = []
-  const recordExchange = (ex: BrokerExchangeResult) => {
-    exchanges.push(ex)
-    const id = ctx.onExchange?.(ex)
-    if (typeof id === 'string' && id) exchangeIds.push(id)
-  }
+  const { exchanges, exchangeIds, recordExchange } = makeRunnerRecorder(ctx, 'cache')
   const basePayload: Record<string, unknown> = {
     kind: spec.kind,
     origin: spec.origin,
@@ -2273,76 +2007,63 @@ export async function runCacheDifferentialRecipe(
     const actualProbeGcb = extractCacheBusterParam(probePath)
     if (!actualCtrlGcb || !cacheBusterValueRegex.test(actualCtrlGcb) ||
         !actualProbeGcb || !cacheBusterValueRegex.test(actualProbeGcb)) {
-      return runnerInconclusive('cache_differential requires valid ?_gcb=<16-36 hex/uuid> tokens.', exchanges, exchangeIds, { kind: spec.kind })
+      return inconclusiveResult('cache_differential requires valid ?_gcb=<16-36 hex/uuid> tokens.', exchanges, exchangeIds, { kind: spec.kind })
     }
     if (actualCtrlGcb.toLowerCase() === actualProbeGcb.toLowerCase()) {
-      return runnerInconclusive('cache_differential cannot reuse _gcb between control and probe.', exchanges, exchangeIds, { kind: spec.kind })
+      return inconclusiveResult('cache_differential cannot reuse _gcb between control and probe.', exchanges, exchangeIds, { kind: spec.kind })
     }
     if (spec.proofMode === 'body_repeat' && !repeatPath) {
-      return runnerInconclusive('cache_differential body_repeat proof requires a repeatPath.', exchanges, exchangeIds, { kind: spec.kind })
+      return inconclusiveResult('cache_differential body_repeat proof requires a repeatPath.', exchanges, exchangeIds, { kind: spec.kind })
     }
 
-    const controlEx = await ctx.broker.executeHttp({
-      origin: spec.targetOrigin,
-      method: spec.method,
-      pathAndQuery: controlPath,
+    const executeCacheReq = (pathAndQuery: string, extra: Partial<BrokerHttpRequest>) =>
+      ctx.broker.executeHttp({
+        origin: spec.targetOrigin,
+        method: spec.method,
+        pathAndQuery,
+        followRedirects: false,
+        runId: ctx.runId,
+        assignmentId: ctx.assignmentId,
+        ...extra,
+      }, ctx.grant, ctx.signal)
+
+    const controlEx = await executeCacheReq(controlPath, {
       ...(spec.controlPersona ? { persona: spec.controlPersona } : {}),
       probeClass: 'cache_differential',
-      followRedirects: false,
-      runId: ctx.runId,
-      assignmentId: ctx.assignmentId,
-    }, ctx.grant, ctx.signal)
+    })
     recordExchange(controlEx)
 
-    const probeEx = await ctx.broker.executeHttp({
-      origin: spec.targetOrigin,
-      method: spec.method,
-      pathAndQuery: probePath,
+    const probeEx = await executeCacheReq(probePath, {
       headers: spec.poisonHeaders,
       persona: spec.poisonPersona,
       probeClass: 'cache_poison_deception',
-      followRedirects: false,
-      runId: ctx.runId,
-      assignmentId: ctx.assignmentId,
-    }, ctx.grant, ctx.signal)
+    })
     recordExchange(probeEx)
 
-    const verifyEx = await ctx.broker.executeHttp({
-      origin: spec.targetOrigin,
-      method: spec.method,
-      pathAndQuery: verifyPath,
+    const verifyEx = await executeCacheReq(verifyPath, {
       ...(spec.verifyPersona ? { persona: spec.verifyPersona } : {}),
       probeClass: 'cache_differential',
       cacheVerify: true,
-      followRedirects: false,
-      runId: ctx.runId,
-      assignmentId: ctx.assignmentId,
-    }, ctx.grant, ctx.signal)
+    })
     recordExchange(verifyEx)
 
     let repeatEx: BrokerExchangeResult | null = null
     if (spec.proofMode === 'body_repeat' && repeatPath) {
       await runnerSleepAbortable(150, ctx.signal)
-      repeatEx = await ctx.broker.executeHttp({
-        origin: spec.targetOrigin,
-        method: spec.method,
-        pathAndQuery: repeatPath,
+      repeatEx = await executeCacheReq(repeatPath, {
         ...(spec.verifyPersona ? { persona: spec.verifyPersona } : {}),
         probeClass: 'cache_differential',
         cacheVerify: true,
-        followRedirects: false,
-        runId: ctx.runId,
-        assignmentId: ctx.assignmentId,
-      }, ctx.grant, ctx.signal)
+      })
       recordExchange(repeatEx)
     }
 
-    const guardControlErrors = spec.requireControlNonError ?? runnerDefaultRequireControlNonError(spec)
+    const guardControlErrors = spec.requireControlNonError ?? defaultRequireControlNonError(spec)
     let forcedInconclusiveReason: string | null = null
     if (guardControlErrors) {
-      if (runnerIsUnexpectedErrorStatus(controlEx.status, spec.expectedStatus)) {
+      if (isUnexpectedErrorStatus(controlEx.status, spec.expectedStatus)) {
         forcedInconclusiveReason = `Unexpected HTTP ${controlEx.status} on cache_differential control step (requireControlNonError).`
-      } else if (runnerIsUnexpectedErrorStatus(verifyEx.status, spec.expectedStatus)) {
+      } else if (isUnexpectedErrorStatus(verifyEx.status, spec.expectedStatus)) {
         forcedInconclusiveReason = `Unexpected HTTP ${verifyEx.status} on cache_differential verify step (requireControlNonError).`
       }
     }
@@ -2401,33 +2122,22 @@ export async function runCacheDifferentialRecipe(
 
     let spaCatchall: Record<string, unknown> | undefined
     if (spec.spaCatchallControl) {
-      const catchallPath = `/.kovo-nonexistent-${randomUUID()}`
-      const catchallEx = await ctx.broker.executeHttp({
+      const catchall = await runRunnerSpaCatchall({
         origin: spec.targetOrigin,
-        method: 'GET',
-        pathAndQuery: catchallPath,
-        followRedirects: true,
-      }, ctx.grant, ctx.signal)
-      recordExchange(catchallEx)
-      const diff = diffResponse(
-        { status: catchallEx.status, body: catchallEx.body, mediaType: catchallEx.mediaType },
-        { status: verifyEx.status, body: verifyEx.body, mediaType: verifyEx.mediaType },
-      )
-      spaCatchall = {
-        path: catchallPath,
-        ...runnerSummarizeExchange(catchallEx),
-        comparisons: { verify: diff },
-        allProbesMatchedCatchall: diff.likelySpaCatchall,
-      }
-      if (diff.likelySpaCatchall) {
+        ctx,
+        recordExchange,
+        targets: [{ id: 'verify', exchange: verifyEx }],
+      })
+      spaCatchall = catchall.summary
+      if (catchall.allProbesMatchedCatchall) {
         forcedInconclusiveReason = 'cache_differential verify response is structurally indistinguishable from an HTTP 200 SPA catch-all route.'
       }
     }
 
-    const controlSummary = { id: 'control', role: 'control', ...runnerSummarizeExchange(controlEx) }
-    const probeSummary = { id: 'probe', role: 'probe', ...runnerSummarizeExchange(probeEx) }
-    const verifySummary = { id: 'verify', role: 'probe', ...runnerSummarizeExchange(verifyEx) }
-    const repeatSummary = repeatEx ? { id: 'repeat', role: 'probe', ...runnerSummarizeExchange(repeatEx) } : undefined
+    const controlSummary = { id: 'control', role: 'control', ...summarizeExchange(controlEx) }
+    const probeSummary = { id: 'probe', role: 'probe', ...summarizeExchange(probeEx) }
+    const verifySummary = { id: 'verify', role: 'probe', ...summarizeExchange(verifyEx) }
+    const repeatSummary = repeatEx ? { id: 'repeat', role: 'probe', ...summarizeExchange(repeatEx) } : undefined
 
     const evidencePayload = redactJsonValue({
       ...basePayload,
@@ -2522,18 +2232,7 @@ export async function runAuthProtocolProofRecipe(
   spec: Extract<DeclarativeReplaySpec, { kind: 'auth_protocol_proof' }>,
   ctx: LegacySpecRunnerContext,
 ): Promise<ReplayVerificationResult> {
-  const exchanges: BrokerExchangeResult[] = []
-  const exchangeIds: string[] = []
-  const recordExchange = (ex: BrokerExchangeResult): string => {
-    exchanges.push(ex)
-    const id = ctx.onExchange?.(ex)
-    if (typeof id === 'string' && id) {
-      exchangeIds.push(id)
-      return id
-    }
-    return `auth-${exchanges.length}`
-  }
-
+  const { exchanges, exchangeIds, recordExchange } = makeRunnerRecorder(ctx, 'auth')
   const basePayload: Record<string, unknown> = {
     kind: spec.kind,
     origin: spec.origin,
@@ -2562,8 +2261,8 @@ export async function runAuthProtocolProofRecipe(
         }
         return value
       }
-      const headerJson = runnerInterpolateValue(resolveClaims(header), vars) as Record<string, unknown>
-      const payloadJson = runnerInterpolateValue(resolveClaims(mint.payload), vars) as Record<string, unknown>
+      const headerJson = interpolateValue(resolveClaims(header), vars) as Record<string, unknown>
+      const payloadJson = interpolateValue(resolveClaims(mint.payload), vars) as Record<string, unknown>
       vars[mint.name] = `${runnerBase64urlJson(headerJson)}.${runnerBase64urlJson(payloadJson)}.`
       mintedTokens.push({ name: mint.name, alg: String(headerJson.alg ?? 'none') })
     }
@@ -2597,7 +2296,7 @@ export async function runAuthProtocolProofRecipe(
         stepVars.canary_token = activeCanary.token
         stepVars.canary_dns_host = activeCanary.dnsHost
       }
-      const brokerReq = runnerStepToBrokerRequest(step, stepVars, {
+      const brokerReq = stepToBrokerRequest(step, stepVars, {
         replayJarPrefix,
         runId: ctx.runId,
         assignmentId: ctx.assignmentId,
@@ -2607,8 +2306,8 @@ export async function runAuthProtocolProofRecipe(
       }
       const ex = await ctx.broker.executeHttp(brokerReq, ctx.grant, ctx.signal)
       const exId = recordExchange(ex)
-      runnerExtractVariables(step, ex, vars)
-      const stepEntry: Record<string, unknown> = { id: step.id, role: step.role, ...runnerSummarizeExchange(ex) }
+      extractVariables(step, ex, vars)
+      const stepEntry: Record<string, unknown> = { id: step.id, role: step.role, ...summarizeExchange(ex) }
       stepsOut[step.id] = stepEntry
       if (step.role === 'control' && !firstControlStep) firstControlStep = stepEntry
       if (step.role === 'probe') {
@@ -2617,12 +2316,12 @@ export async function runAuthProtocolProofRecipe(
       }
     }
 
-    const guardControlErrors = spec.requireControlNonError ?? runnerDefaultRequireControlNonError(spec)
+    const guardControlErrors = spec.requireControlNonError ?? defaultRequireControlNonError(spec)
     if (guardControlErrors) {
       for (const step of spec.steps) {
         if (step.role !== 'control' && step.role !== 'probe') continue
         const status = (stepsOut[step.id] as { status?: number } | undefined)?.status
-        if (typeof status === 'number' && runnerIsUnexpectedErrorStatus(status, step.expectedStatus, spec.expectedStatus)) {
+        if (typeof status === 'number' && isUnexpectedErrorStatus(status, step.expectedStatus, spec.expectedStatus)) {
           if (step.role === 'probe') {
             const statusAssertedInJq =
               new RegExp(`status\\s*==\\s*${status}\\b|\\b${status}\\s*==\\s*[^;]*status`).test(spec.assertionsJq) ||
@@ -2654,112 +2353,46 @@ export async function runAuthProtocolProofRecipe(
       }
       const primaryProbe = probeStepExchanges[0]
       if (primaryProbe) {
-        const receipt: ProofReceipt = {
-          vulnClass: 'oob',
-          target: { origin: spec.origin, method: primaryProbe.exchange.method.toUpperCase(), pathAndQuery: primaryProbe.exchange.pathAndQuery },
-          exchangeIds: [primaryProbe.exchangeId],
-          oobEventIds: ['auth-oob-canary'],
-          browserTraceIds: [],
-          claimedDelta: 'Auth protocol token header triggered an out-of-band canary fetch on probe only.',
-          injectedAtMs,
-        }
         const carrierExtra = primaryProbe.request.authMutation?.kind === 'jku_x5u_canary'
           ? (primaryProbe.request.authMutation.url ?? primaryProbe.request.authMutation.value ?? '')
           : ''
-        const transcript: ReceiptTranscript = {
-          entries: [{
-            exchangeId: primaryProbe.exchangeId,
-            step: {
-              id: primaryProbe.id,
-              arm: 'probe',
-              method: primaryProbe.exchange.method.toUpperCase(),
-              route: primaryProbe.exchange.pathAndQuery.split('?')[0] || '/',
-              pathAndQuery: primaryProbe.exchange.pathAndQuery,
-              status: primaryProbe.exchange.status,
-              actor: { handle: primaryProbe.exchange.personaHandle, role: null, tenant: null, auth: 'unknown', sameSite: null },
-              json: null,
-              body: primaryProbe.exchange.body,
-            },
-            carrierText: `${primaryProbe.request.pathAndQuery}\n${JSON.stringify(primaryProbe.request.headers ?? {})}\n${primaryProbe.request.body ?? ''}\n${carrierExtra}`,
-          }],
-          oobEvents: [{
-            id: 'auth-oob-canary',
-            callbackId: probeWait.subscriptionId ?? `auth:${primaryProbe.exchangeId}`,
-            token: prbCanary.token,
-            targetOrigin: spec.origin,
-            delivered: probeWait.triggered && !controlCheck.triggered,
-            stage: probeWait.stage === 'late' ? 'late' : 'immediate',
-            receivedAtMs: Date.now(),
-            injectedAtMs,
-          }],
-        }
-        const verification = defaultTerminalOracleRegistry.evaluate(
-          HostFactLog.fromTranscript(transcript),
-          { kind: 'single_hop', receipt },
-          { strictHostDerivation: true },
-        ).singleHop!
-        oobReceiptCheck = { receipt, verification, mode: 'strict' }
-        if (!verification.confirmed) {
+        oobReceiptCheck = evaluateRunnerOobReceipt({
+          origin: spec.origin,
+          stepId: primaryProbe.id,
+          exchange: primaryProbe.exchange,
+          exchangeId: primaryProbe.exchangeId,
+          request: primaryProbe.request,
+          oobEventId: 'auth-oob-canary',
+          callbackPrefix: 'auth',
+          token: prbCanary.token,
+          probeWait,
+          controlTriggered: controlCheck.triggered,
+          claimedDelta: 'Auth protocol token header triggered an out-of-band canary fetch on probe only.',
+          injectedAtMs,
+          carrierExtra,
+        })
+        if (!oobReceiptCheck.verification.confirmed) {
           deterministicProofPassed = false
-          proofFailureReason = verification.reason
+          proofFailureReason = oobReceiptCheck.verification.reason
         }
       }
     }
 
     let spaCatchall: Record<string, unknown> | undefined
     if (spec.spaCatchallControl) {
-      const catchallPath = `/.kovo-nonexistent-${randomUUID()}`
-      const catchallEx = await ctx.broker.executeHttp({
+      const catchall = await runRunnerSpaCatchall({
         origin: spec.origin,
-        method: 'GET',
-        pathAndQuery: catchallPath,
-        followRedirects: true,
-      }, ctx.grant, ctx.signal)
-      recordExchange(catchallEx)
-      const comparisons: Record<string, Record<string, unknown>> = {}
-      let allProbesMatchedCatchall = probeStepExchanges.length > 0
-      for (const probe of probeStepExchanges) {
-        const diff = diffResponse(
-          { status: catchallEx.status, body: catchallEx.body, mediaType: catchallEx.mediaType },
-          { status: probe.exchange.status, body: probe.exchange.body, mediaType: probe.exchange.mediaType },
-        )
-        comparisons[probe.id] = diff
-        if (!diff.likelySpaCatchall) allProbesMatchedCatchall = false
-      }
-      spaCatchall = { path: catchallPath, ...runnerSummarizeExchange(catchallEx), comparisons, allProbesMatchedCatchall }
-      if (allProbesMatchedCatchall) {
+        ctx,
+        recordExchange,
+        targets: probeStepExchanges,
+      })
+      spaCatchall = catchall.summary
+      if (catchall.allProbesMatchedCatchall) {
         forcedInconclusiveReason = 'Probe response is structurally indistinguishable from an HTTP 200 SPA catch-all route.'
       }
     }
 
-    const authSteps: ImpactStep[] = spec.steps.map(step => {
-      const entry = stepsOut[step.id] as Record<string, unknown> | undefined
-      let entryJson = entry?.json ?? null
-      if (entryJson === null && typeof entry?.body === 'string') {
-        try { entryJson = JSON.parse(entry.body) } catch { entryJson = null }
-      }
-      const handle = (typeof entry?.personaHandle === 'string' ? entry.personaHandle : null) ?? step.request.persona ?? null
-      return {
-        id: step.id,
-        arm: step.role,
-        method: step.request.method.toUpperCase(),
-        route: step.request.pathAndQuery.split('?')[0].split('#')[0].replace(/\/{2,}/g, '/').replace(/\/+$/, '').toLowerCase() || '/',
-        pathAndQuery: step.request.pathAndQuery,
-        status: typeof entry?.status === 'number' ? entry.status : null,
-        actor: {
-          handle,
-          role: normalizeRole(step.request.persona),
-          tenant: null,
-          auth: 'unknown' as AmbientAuth,
-          sameSite: null,
-        } satisfies ActorIdentity,
-        json: entryJson,
-        body: typeof entry?.body === 'string' ? entry.body : '',
-        requestJson: step.request.jsonBody,
-        requestHeaders: step.request.headers ?? null,
-        responseHeaders: (entry?.headers as Record<string, string> | undefined) ?? null,
-      }
-    })
+    const authSteps = impactStepsFromStepsOut(spec, stepsOut)
     // Boundary gate applies to HTTP auth/access bypass claims, never to OOB jku_x5u_canary fetches
     // (whose proof is the host-observed out-of-band callback verified by ProofReceipt).
     const authBoundaryClass = canaryProof
@@ -2828,7 +2461,7 @@ export async function runAuthProtocolProofRecipe(
 
     // Non-OOB auth_protocol_proof (JWT mutations, tokenMints, OAuth redirect differentials):
     // evaluate spec assertions via worker jq so every caller differential shape stays exact.
-    const jqCommand = `jq '${spec.assertionsJq.replaceAll("'", "'\\''")}' /evidence/replay-results.json > /work/outcome.json`
+    const jqCommand = `jq '${singleQuoteEscape(spec.assertionsJq)}' /evidence/replay-results.json > /work/outcome.json`
     const workerResult = await ctx.backend.run({
       assignmentId: ctx.assignmentId,
       files: [{ name: 'replay-results.json', content: serializedPayload }],
@@ -2838,11 +2471,11 @@ export async function runAuthProtocolProofRecipe(
     }, ctx.signal)
     const rawOutcome = (workerResult.outputs['outcome.json'] || workerResult.stdout || '').trim()
     if (workerResult.exitCode !== 0 || !rawOutcome) {
-      return runnerInconclusive(`Replay jq assertion failed (exit ${workerResult.exitCode}): ${workerResult.stderr.slice(0, 400)}`, exchanges, exchangeIds, evidencePayload)
+      return inconclusiveResult(`Replay jq assertion failed (exit ${workerResult.exitCode}): ${workerResult.stderr.slice(0, 400)}`, exchanges, exchangeIds, evidencePayload)
     }
     let parsedJson: unknown
     try { parsedJson = JSON.parse(rawOutcome) } catch {
-      return runnerInconclusive('Replay jq assertion did not emit valid JSON.', exchanges, exchangeIds, evidencePayload)
+      return inconclusiveResult('Replay jq assertion did not emit valid JSON.', exchanges, exchangeIds, evidencePayload)
     }
     const coerceText = (v: unknown) => (typeof v === 'string' ? v : (JSON.stringify(v) ?? String(v))).slice(0, 1200)
     if (parsedJson && typeof parsedJson === 'object' && !Array.isArray(parsedJson)) {
@@ -2857,7 +2490,7 @@ export async function runAuthProtocolProofRecipe(
     }
     const validated = replayAssertionOutcomeSchema.safeParse(parsedJson)
     if (!validated.success) {
-      return runnerInconclusive(`Replay assertion output violated schema: ${validated.error.issues[0]?.message ?? 'invalid shape'}`, exchanges, exchangeIds, evidencePayload)
+      return inconclusiveResult(`Replay assertion output violated schema: ${validated.error.issues[0]?.message ?? 'invalid shape'}`, exchanges, exchangeIds, evidencePayload)
     }
     const outcome = validated.data
     if (forcedInconclusiveReason) {
@@ -3733,17 +3366,10 @@ export function stepToBrokerRequest(
   })
 }
 
-const postureCwes = new Set([
-  'CWE-16', 'CWE-200', 'CWE-209', 'CWE-284', 'CWE-285', 'CWE-287', 'CWE-288', 'CWE-306', 'CWE-319', 'CWE-326',
-  'CWE-346', 'CWE-523', 'CWE-538', 'CWE-540', 'CWE-614', 'CWE-639', 'CWE-693', 'CWE-862', 'CWE-863', 'CWE-942',
-  'CWE-1004', 'CWE-1021',
-])
-const postureCategoryPattern = /access|auth|bypass|cors|header|posture|misconfig|exposure|session|cookie|transport|tls|csp|policy|idor|bola|bfla/i
-
 /** requireControlNonError defaults to true for posture / auth-bypass style specs. */
 export function defaultRequireControlNonError(spec: DeclarativeReplaySpec): boolean {
   if (spec.kind === 'static_ast_proof') return false
-  return postureCwes.has(spec.cwe) || postureCategoryPattern.test(spec.category)
+  return POSTURE_CWES.has(spec.cwe) || POSTURE_CATEGORY_RE.test(spec.category)
 }
 
 function statusMatchesExpected(expected: number | number[] | undefined, status: number): boolean {

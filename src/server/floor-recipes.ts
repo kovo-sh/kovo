@@ -1242,24 +1242,31 @@ async function runCleanupSequence(
   }
 }
 
+function buildBurstSpecs(
+  args: { method: string; pathAndQuery: string; actor: FloorActor; body: unknown; headers?: Record<string, string> },
+  count: number,
+  vars: Readonly<Record<string, string>>,
+): FloorRequestSpec[] {
+  const burstPath = interpolateVarString(args.pathAndQuery, vars)
+  const burstBody = interpolateVarValue(args.body, vars)
+  return Array.from({ length: count }, (_, index) => ({
+    arm: 'probe' as const,
+    role: `burst_${index + 1}`,
+    method: args.method,
+    pathAndQuery: burstPath,
+    actor: args.actor,
+    jsonBody: burstBody,
+    ...(args.headers ? { headers: args.headers } : {}),
+  }))
+}
+
 const raceBurst = defineRecipe<RaceBurstArgs>('race_burst', async (args, ctx) => {
   const count = Math.min(MAX_RACE_BURST, Math.max(MIN_RACE_BURST, Math.trunc(args.burst)))
   const vars: Record<string, string> = {}
   await runSetupSequence(ctx, args.setupSteps, args.actor, args.headers, vars)
   let steps: FloorRecipeStep[] = []
   try {
-    const burstPath = interpolateVarString(args.pathAndQuery, vars)
-    const burstBody = interpolateVarValue(args.body, vars)
-    const burstSpecs: FloorRequestSpec[] = Array.from({ length: count }, (_, index) => ({
-      arm: 'probe',
-      role: `burst_${index + 1}`,
-      method: args.method,
-      pathAndQuery: burstPath,
-      actor: args.actor,
-      jsonBody: burstBody,
-      ...(args.headers ? { headers: args.headers } : {}),
-    }))
-    steps = await ctx.sendBurst(burstSpecs)
+    steps = await ctx.sendBurst(buildBurstSpecs(args, count, vars))
   } finally {
     await runCleanupSequence(ctx, args.cleanupSteps, args.actor, args.headers, vars)
   }
@@ -1401,6 +1408,16 @@ const redirect = defineRecipe<RedirectArgs>('redirect', async (args, ctx) => {
   })
 })
 
+function requireExpectedSinks(ctx: FloorRecipeContext, sinks: readonly string[], expectSinks?: readonly string[]): void {
+  if (!expectSinks || expectSinks.length === 0) return
+  ctx.require(
+    expectSinks.some(sink => sinks.includes(sink)),
+    'browser_sink',
+    `The trace recorded ${sinks.join(', ') || 'no sinks'}; expected one of ${expectSinks.join(', ')}.`,
+    'probe',
+  )
+}
+
 /** `browser_chain` / DOM sink → receipt `browser` rule over a host-recorded trace. */
 const browserSink = defineRecipe<BrowserSinkArgs>('browser_sink', async (args, ctx) => {
   const browserClass = /^(?:browser_|dom_|postmessage|xss(?:_(?:reflected|stored))?$)/i.test(args.vulnClass)
@@ -1410,34 +1427,20 @@ const browserSink = defineRecipe<BrowserSinkArgs>('browser_sink', async (args, c
     `browser_sink needs a browser-class label (dom_*/browser_*/postmessage*/xss*); ${args.vulnClass} maps to a different receipt rule.`,
     'harness',
   )
-  // Verifier-minted canary: deterministic for the same proof inputs, and never a stored literal.
   const canaryToken = args.canaryToken
     ?? `kovo-dom-${createHash('sha256').update(`${args.origin}|${args.pathAndQuery}|${args.vulnClass}`).digest('hex').slice(0, 10)}`
   const interpolate = (value: string | undefined): string | undefined => value?.replaceAll('{{canary_token}}', canaryToken)
-
-  // `verifyReceipt` selects the `browser` rule only for browser-class vulnClasses (`dom_xss`, etc.),
-  // whereas `xss`/`xss_reflected`/`xss_stored` route to the HTTP `impact` rule (which requires HTTP
-  // exchangeIds). Normalize XSS aliases to `dom_xss` inside browser-trace receipts so authenticated
-  // reflected/stored XSS proofs verified via browser traces route to the `browser` receipt rule.
   const receiptVulnClass = /^(?:xss|xss_reflected|xss_stored|dom_xss)$/i.test(args.vulnClass)
     ? 'dom_xss'
     : args.vulnClass
 
   if (!args.steps || args.steps.length === 0) {
-    // Single-visit proof (no interaction): the host records one page trace.
     const url = args.url ?? `${args.origin.replace(/\/+$/, '')}${args.pathAndQuery}`
     const trace = await ctx.browser({ origin: args.origin, url, actor: args.actor, ...(args.marker ? { marker: args.marker } : {}) })
     ctx.require(trace !== null, 'browser_trace', 'No host-recorded browser trace was produced for this origin.', 'harness')
     const sinks = trace?.sinks ?? []
     ctx.require(sinks.length > 0, 'browser_sink', 'The browser trace recorded no sink execution (DOM XSS, postMessage, storage write).', 'probe')
-    if (args.expectSinks && args.expectSinks.length > 0) {
-      ctx.require(
-        args.expectSinks.some(sink => sinks.includes(sink)),
-        'browser_sink',
-        `The trace recorded ${sinks.join(', ') || 'no sinks'}; expected one of ${args.expectSinks.join(', ')}.`,
-        'probe',
-      )
-    }
+    requireExpectedSinks(ctx, sinks, args.expectSinks)
     return buildProofReceipt({
       vulnClass: receiptVulnClass,
       target: targetOf(args),
@@ -1463,14 +1466,7 @@ const browserSink = defineRecipe<BrowserSinkArgs>('browser_sink', async (args, c
   ctx.require(result !== null, 'browser_trace', 'No host-recorded browser session trace was produced for this origin.', 'harness')
   ctx.require(result?.sinkHit === true, 'browser_sink', 'The probe session did not record the canary reaching an executable DOM sink.', 'probe')
   const sinks = [...new Set((result?.traces ?? []).flatMap(trace => trace.sinks ?? []))]
-  if (args.expectSinks && args.expectSinks.length > 0) {
-    ctx.require(
-      args.expectSinks.some(sink => sinks.includes(sink)),
-      'browser_sink',
-      `The trace recorded ${sinks.join(', ') || 'no sinks'}; expected one of ${args.expectSinks.join(', ')}.`,
-      'probe',
-    )
-  }
+  requireExpectedSinks(ctx, sinks, args.expectSinks)
   return buildProofReceipt({
     vulnClass: receiptVulnClass,
     target: targetOf(args),
@@ -1669,20 +1665,7 @@ const conservedBalance = defineRecipe<ConservedBalanceArgs>('conserved_balance',
 
   try {
     baseline = await ctx.send(buildStepRequest(args.readback, 'setup', 'baseline_read', args.actor, args.headers, vars))
-
-    const burstPath = interpolateVarString(args.pathAndQuery, vars)
-    const burstBody = interpolateVarValue(args.body, vars)
-    const burstSpecs: FloorRequestSpec[] = Array.from({ length: count }, (_, index) => ({
-      arm: 'probe',
-      role: `burst_${index + 1}`,
-      method: args.method,
-      pathAndQuery: burstPath,
-      actor: args.actor,
-      jsonBody: burstBody,
-      ...(args.headers ? { headers: args.headers } : {}),
-    }))
-    burstSteps = await ctx.sendBurst(burstSpecs)
-
+    burstSteps = await ctx.sendBurst(buildBurstSpecs(args, count, vars))
     postRead = await ctx.send(buildStepRequest(postReadSpec, 'control', 'post_read', args.actor, args.headers, vars))
 
     const serialSpec: ConservedBalanceStepSpec = args.serialControl ?? {
@@ -1865,6 +1848,47 @@ function fallbackReceipt(args: FloorRecipeArgs, exchangeIds: readonly string[], 
  * Name the evidence role a rejected receipt lacked. The receipt gate already says *why*; this maps
  * that reason back to the step role a repair must add, so the migration has one vocabulary.
  */
+const MISSING_ROLE_RULES: Readonly<Record<string, ReadonlyArray<readonly [RegExp, readonly string[]]>>> = {
+  boolean: [
+    [/benign 2xx baseline|benign_baseline|complete benign/, ['benign_baseline']],
+    [/paired control\/probe rounds|equal number/, ['paired_rounds']],
+    [/name the injected parameter/, ['injected_parameter']],
+    [/request shape/, ['request_shape']],
+    [/server error|5xx/, ['non_error_arm']],
+    [/only difference was the injected predicate|rotating nonce|no structural response change/, ['structural_delta']],
+    [/unstable|moving baseline/, ['stable_differential']],
+  ],
+  oob: [
+    [/not delivered|durable OOB event/, ['delivered_callback']],
+    [/carried the delivered canary/, ['injection_exchange']],
+    [/before the canary was injected/, ['callback_causality']],
+    [/different target origin/, ['callback_target']],
+  ],
+  conserved_balance: [
+    [/baseline numeric readback/, ['baseline_read']],
+    [/post-burst numeric readback/, ['post_read']],
+    [/concurrent mutation|no 2xx acknowledged|Only \d+ concurrent/, ['burst_mutation']],
+    [/post-serial numeric readback/, ['serial_post_read']],
+    [/serial control/i, ['serial_control']],
+    [/shared numeric conserved field/, ['conserved_field']],
+  ],
+  impact: [
+    [/pre-mutation readback/, ['baseline_read']],
+    [/separate post-mutation GET/, ['post_mutation_read']],
+    [/identical to the baseline|state echo|not impact|idempotent|removed|no persisted impact/, ['persisted_delta']],
+    [/not a protected field/, ['protected_field']],
+    [/request body/, ['mutation_request_body']],
+    [/owner-scoped|disclosure/, ['disclosed_field']],
+    [/not served|no probe step/, ['probe_request']],
+    [/role|tenant|differential/, ['role_or_tenant_differential']],
+  ],
+}
+
+function matchMissingRole(rules: ReadonlyArray<readonly [RegExp, readonly string[]]>, reason: string): string[] | null {
+  const hit = rules.find(([re]) => re.test(reason))
+  return hit ? [...hit[1]] : null
+}
+
 function inferMissingRoles(
   recipe: FloorRecipe,
   receipt: ProofReceipt,
@@ -1875,18 +1899,9 @@ function inferMissingRoles(
   const cited = (transcript.entries ?? []).filter(entry => receipt.exchangeIds.includes(entry.exchangeId))
 
   if (verification.rule === 'boolean' || verification.rule === 'status_differential') {
-    if (/benign 2xx baseline|benign_baseline|complete benign/.test(reason)) return ['benign_baseline']
-    if (/paired control\/probe rounds|equal number/.test(reason)) return ['paired_rounds']
-    if (/name the injected parameter/.test(reason)) return ['injected_parameter']
-    if (/request shape/.test(reason)) return ['request_shape']
-    if (/server error|5xx/.test(reason)) return ['non_error_arm']
-    if (/only difference was the injected predicate|rotating nonce/.test(reason)) return ['structural_delta']
-    if (/unstable|moving baseline/.test(reason)) return ['stable_differential']
-    if (/no structural response change/.test(reason)) return ['structural_delta']
-    if (verification.rule === 'status_differential') return ['contradiction']
-    return ['boolean_arm']
+    return matchMissingRole(MISSING_ROLE_RULES.boolean!, reason)
+      ?? [verification.rule === 'status_differential' ? 'contradiction' : 'boolean_arm']
   }
-
   if (verification.rule === 'timing') {
     if (/control and a probe/.test(reason)) return ['timing_control', 'timing_probe']
     if (/wall-clock duration/.test(reason)) {
@@ -1895,38 +1910,16 @@ function inferMissingRoles(
       if (cited.some(entry => entry.step.arm === 'probe' && (entry.durationMs ?? 0) <= 0)) roles.push('probe_duration')
       return roles.length > 0 ? roles : ['timing_duration']
     }
-    if (/not distinguishable|stable separation/.test(reason)) return ['probe_delay']
-    return ['timing_arm']
+    return [/not distinguishable|stable separation/.test(reason) ? 'probe_delay' : 'timing_arm']
   }
-
   if (verification.rule === 'oob') {
-    if (/not delivered|durable OOB event/.test(reason)) return ['delivered_callback']
-    if (/carried the delivered canary/.test(reason)) return ['injection_exchange']
-    if (/before the canary was injected/.test(reason)) return ['callback_causality']
-    if (/different target origin/.test(reason)) return ['callback_target']
-    return ['oob_callback']
+    return matchMissingRole(MISSING_ROLE_RULES.oob!, reason) ?? ['oob_callback']
   }
-
   if (verification.rule === 'conserved_balance') {
-    if (/baseline numeric readback/.test(reason)) return ['baseline_read']
-    if (/post-burst numeric readback/.test(reason)) return ['post_read']
-    if (/concurrent mutation|no 2xx acknowledged|Only \d+ concurrent/.test(reason)) return ['burst_mutation']
-    if (/post-serial numeric readback/.test(reason)) return ['serial_post_read']
-    if (/serial control/i.test(reason)) return ['serial_control']
-    if (/shared numeric conserved field/.test(reason)) return ['conserved_field']
-    return ['conservation_violation']
+    return matchMissingRole(MISSING_ROLE_RULES.conserved_balance!, reason) ?? ['conservation_violation']
   }
-
-  if (/pre-mutation readback/.test(reason)) return ['baseline_read']
-  if (/separate post-mutation GET/.test(reason)) return ['post_mutation_read']
-  if (/identical to the baseline|state echo|not impact|idempotent|removed|no persisted impact/.test(reason)) return ['persisted_delta']
-  if (/not a protected field/.test(reason)) return ['protected_field']
-  if (/request body/.test(reason)) return ['mutation_request_body']
-  if (/owner-scoped|disclosure/.test(reason)) return ['disclosed_field']
-  if (/not served|no probe step/.test(reason)) return ['probe_request']
-  if (/role|tenant|differential/.test(reason)) return ['role_or_tenant_differential']
-  if (recipe.id === 'disclosure') return ['disclosed_field']
-  return ['impact_evidence']
+  return matchMissingRole(MISSING_ROLE_RULES.impact!, reason)
+    ?? [recipe.id === 'disclosure' ? 'disclosed_field' : 'impact_evidence']
 }
 
 // ---------------------------------------------------------------------------
