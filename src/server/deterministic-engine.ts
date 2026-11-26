@@ -28,9 +28,49 @@ import type { WorkerBackend } from './worker-backend.ts'
 import { synthesizeEngineSpecs, vulnClassOfSpec } from './deterministic-specs.ts'
 import type { EngineEndpoint, EngineHypothesis, EngineParam, SynthesizedEngineSpec } from './deterministic-specs.ts'
 import { planFloorRecipe, recipeSpecRecord, recipeVerificationResult, runPlannedRecipe } from './floor-recipe-engine.ts'
+import {
+  CONSERVED_AMOUNT_FIELD_RE,
+  CONSERVED_BALANCE_FIELD_RE,
+  CONSERVED_ECHO_FIELD_RE,
+  DYNAMIC_ID_SEGMENT_RE,
+  hasDynamicIdSegment,
+  IDENTITY_ASSUMPTION_ROUTE_RE,
+  isIdentityAssignmentField,
+  isSafeFieldName,
+  isSafeResourceId,
+  pathHasCommandHint,
+  pathHasFileHint,
+  pathHasNounSegment,
+  pathHasPrivilegedHint,
+  pathHasRedirectHint,
+  pathHasSearchHint,
+  pathHasTemplateHint,
+  pathHasUrlHint,
+  pathHasXmlHint,
+  PLACEHOLDER_SEGMENT_RE,
+  rolePrivilegeRank,
+  SAFE_FIELD_NAME_RE,
+  SAFE_RESOURCE_ID_RE,
+  SENSITIVE_READ_ROUTE_RE,
+  withoutIdentityFields,
+} from './floor-heuristics.ts'
 import { parseRoleLabel, parseRoleTenants } from './oracle-invariants.ts'
 
 export type { EngineEndpoint, EngineHypothesis, EngineParam } from './deterministic-specs.ts'
+export {
+  hasDynamicIdSegment,
+  IDENTITY_ASSUMPTION_ROUTE_RE,
+  isIdentityAssignmentField,
+  pathHasCommandHint,
+  pathHasFileHint,
+  pathHasPrivilegedHint,
+  pathHasRedirectHint,
+  pathHasSearchHint,
+  pathHasTemplateHint,
+  pathHasUrlHint,
+  pathHasXmlHint,
+  withoutIdentityFields,
+}
 
 export const defaultEngineMaxRequests = 1800
 export const defaultEngineMaxDurationMs = 240_000
@@ -662,98 +702,6 @@ export function isStaticOrBaselinePath(path: string): boolean {
   return /(?:^|\/)(?:logout|signout)(?:\/|$)/i.test(bare)
 }
 
-const idSegmentRe = /(?:\/:[A-Za-z_][A-Za-z0-9_]*|\/\{\{id\}\}|\/\{[A-Za-z0-9_]+\}|\/\[[^\]]+\])/
-
-export function hasDynamicIdSegment(path: string): boolean {
-  return idSegmentRe.test(path.split('?')[0])
-}
-
-export function pathHasFileHint(path: string): boolean {
-  return /(?:^|[/_.-])(?:download|downloads|file|files|asset|assets|view|serve|log|logs|journal|journals|billing[-_]?docs?|document|documents|attachment|attachments|backup|backups|archive|archives)(?:$|[/_.-])/i.test(path)
-}
-
-export function pathHasUrlHint(path: string): boolean {
-  return /(?:^|[/_.-])(?:avatar|avatars|image|images|photo|photos|logo|logos|media|thumbnail|webhook|webhooks|hook|hooks|callback|callbacks|integration|integrations|connector|connectors|proxy|proxies|fetch|remote|link|links|manifest|manifests)(?:$|[/_.-])/i.test(path)
-}
-
-export function pathHasXmlHint(path: string): boolean {
-  return /(?:^|[/_.-])(?:xml|import|imports|soap|saml|sso|svg|rss|wsdl|manifest|manifests|feed|feeds|upload|uploads|parse|backup|backups|archive|archives)(?:$|[/_.-])/i.test(path)
-}
-
-export function pathHasTemplateHint(path: string): boolean {
-  return /(?:^|[/_.-])(?:render|preview|template|templates|layout|layouts|report|reports|docs?|pages?|email|emails|snippet|snippets)(?:$|[/_.-])/i.test(path)
-}
-
-/**
- * Search-surface vocabulary. Membership is tested against whole path segments and whole tokens
- * within a segment (split on `-`, `_`, `.`), never as a substring of a longer word. `catalog` is a
- * listing noun, not a search surface and deliberately absent: it used to sit in this vocabulary,
- * so derived `catalog*` routes formed search-parameter SQL injection hypotheses and spent the
- * class quota on routes that never read a query. `logs` / `audit-log` are file/audit surfaces;
- * their whole tokens (`log`, `logs`) belong to `pathHasFileHint`, not here.
- */
-const searchHintTokens = new Set([
-  'search', 'searches', 'lookup', 'find', 'filter', 'query', 'queries', 'browse',
-])
-
-/** Lowercased path segments, query string dropped. */
-function pathSegmentsOf(path: string): string[] {
-  return (path.split('?')[0] || '/').split('/').filter(Boolean)
-}
-
-/** Whole tokens of one path segment: `catalog-search` -> `catalog`, `search`. */
-function segmentTokens(segment: string): string[] {
-  return segment.toLowerCase().split(/[-_.]+/).filter(Boolean)
-}
-
-export function pathHasSearchHint(path: string): boolean {
-  return pathSegmentsOf(path).some(segment => segmentTokens(segment).some(token => searchHintTokens.has(token)))
-}
-
-/** A route whose shape says it runs an operator-supplied host/command probe. */
-export function pathHasCommandHint(path: string): boolean {
-  return /(?:^|[/_.-])(?:diag|diagnostics?|exec|execute|command|cmd|shell|ping|nslookup|lookup|resolve|whois|healthcheck|system)(?:$|[/_.-])/i.test(path)
-}
-
-export function pathHasPrivilegedHint(path: string): boolean {
-  return /(?:^|[/_.-])(?:admin|internal|manage|management|staff|superuser|privileged|permission|permissions|role|roles|impersonate|grant|feature[-_]?flag|backoffice)(?:$|[/_.-])/i.test(path)
-}
-
-export function pathHasRedirectHint(path: string): boolean {
-  return /(?:^|[/_.-])(?:redirect|return|callback|continue|resume|sso|oauth|authorize|checkout|download|export|next)(?:$|[/_.-])/i.test(path)
-}
-
-/**
- * Route shapes that hand the caller a new acting identity/scope (impersonation, act-as, tenant
- * switch). Mutating probes on these routes can change the instrument's *own* session, so their
- * bodies are restricted to benign content fields and the mass-assignment recipe (which exists to
- * write scope/privilege fields) is not run there at all. Access control on such a route is still
- * proven by the authz matrix; nothing is exempt from that.
- */
-export const IDENTITY_ASSUMPTION_ROUTE_RE =
-  /(?:^|[/_.-])(?:impersonat\w*|act[-_]?as|sudo|assume[-_]?role|switch[-_]?(?:tenant|org|store|user|account)|sts)(?:$|[/_.-])/i
-
-/** Field names that select or change identity/scope rather than describing record content. */
-export function isIdentityAssignmentField(field: string): boolean {
-  const snake = field.replace(/[A-Z]/g, ch => '_' + ch.toLowerCase()).replace(/[-.]/g, '_')
-  return /^(?:is_?_?admin|admin|role|roles|permission|permissions|privilege|privileges|grant|level|tenant|tenant_id|org|org_id|store|store_id|team|team_id|account|account_id|owner|owner_id|scope|acting|act_as|workspace|workspace_id|user|user_id|actor|subject|email)$/.test(snake)
-}
-
-/** Drop identity/scope selectors from a probe body (shallow and one nested object level). */
-export function withoutIdentityFields(body: Record<string, unknown>): Record<string, unknown> {
-  const out: Record<string, unknown> = {}
-  for (const [field, value] of Object.entries(body)) {
-    if (isIdentityAssignmentField(field)) continue
-    if (value && typeof value === 'object' && !Array.isArray(value)) {
-      const nested = withoutIdentityFields(value as Record<string, unknown>)
-      if (Object.keys(nested).length > 0) out[field] = nested
-      continue
-    }
-    out[field] = value
-  }
-  return out
-}
-
 /** A ranking score for triage priority. Pure and stable; no network access. */
 export function endpointRiskScore(endpoint: EngineEndpoint): number {
   const bare = endpoint.pathTemplate.split('?')[0] || '/'
@@ -846,7 +794,6 @@ export function rankEndpoints(endpoints: readonly EngineEndpoint[]): EngineEndpo
 // Generic parameter inference (route semantics only; every candidate is still probe-verified)
 // ---------------------------------------------------------------------------------------------
 
-const placeholderSeg = /^(:[A-Za-z0-9_]+|\{[^}]+\}|\[[^\]]+\])$/
 const protocolParam = /^(?:client[_-]?id|client[_-]?secret|redirect[_-]?uri|response[_-]?type|grant[_-]?type|scope|state|nonce|code|code[_-]challenge|code[_-]challenge[_-]method|audience|prompt|login[_-]hint|access[_-]token|refresh[_-]token|id[_-]token|assertion|signature|sig|continue|return_to)$/i
 
 export function searchParamNames(path: string): string[] {
@@ -1072,7 +1019,7 @@ export function identifierFormsForRoute(pathTemplate: string, tenants: readonly 
 function collectionPathOf(pathTemplate: string): string | null {
   const bare = pathTemplate.split('?')[0] || '/'
   const segs = bare.split('/').filter(Boolean)
-  const idx = segs.findIndex(seg => placeholderSeg.test(seg))
+  const idx = segs.findIndex(seg => PLACEHOLDER_SEGMENT_RE.test(seg))
   if (idx > 0) return `/${segs.slice(0, idx).join('/')}`
   if (idx < 0 && !hasDynamicIdSegment(bare)) return bare
   return null
@@ -1116,12 +1063,12 @@ function buildReadRouteIndex(endpoints: readonly EngineEndpoint[]): Map<string, 
     const bare = endpoint.pathTemplate.split('?')[0] || '/'
     if (bare === '' || bare === '/') continue
     const raw = bare.split('/').filter(Boolean)
-    const placeholders = raw.filter(segment => placeholderSeg.test(segment))
+    const placeholders = raw.filter(segment => PLACEHOLDER_SEGMENT_RE.test(segment))
     // A readback the synthesizer cannot fill (`fillId` resolves `{{id}}` only) is not a readback.
     if (placeholders.length > 1) continue
     if (raw.length === 0) continue
-    const placeholderIndex = raw.findIndex(segment => placeholderSeg.test(segment))
-    const segments = raw.map(segment => (placeholderSeg.test(segment) ? '{{id}}' : segment))
+    const placeholderIndex = raw.findIndex(segment => PLACEHOLDER_SEGMENT_RE.test(segment))
+    const segments = raw.map(segment => (PLACEHOLDER_SEGMENT_RE.test(segment) ? '{{id}}' : segment))
     const path = `/${segments.join('/')}`
     const list = index.get(endpoint.origin) ?? []
     const paramName = placeholderIndex >= 0 ? readRouteParamName(raw[placeholderIndex]!) : undefined
@@ -1237,10 +1184,10 @@ function inferAuthzReadback(input: {
       route.segments.length === rawSegments.length && route.segments.every((segment, i) => segment === rawSegments[i]))
     if (collection) return { path: `${collection.path}?${encodeURIComponent(input.queryIdParam)}={{id}}` }
   }
-  const placeholderIndex = rawSegments.findIndex(segment => placeholderSeg.test(segment))
+  const placeholderIndex = rawSegments.findIndex(segment => PLACEHOLDER_SEGMENT_RE.test(segment))
   if (placeholderIndex <= 0) return null
   // Normalize the mutation's own placeholder so it compares against the read index (`{{id}}`).
-  const segments = rawSegments.map(segment => (placeholderSeg.test(segment) ? '{{id}}' : segment))
+  const segments = rawSegments.map(segment => (PLACEHOLDER_SEGMENT_RE.test(segment) ? '{{id}}' : segment))
   const mutation = { segments, placeholderIndex }
   const ranked = input.readRoutes
     .map(route => ({ route, score: scoreObjectReadback(mutation, route, input.idParamName) }))
@@ -1284,8 +1231,9 @@ function authzRequiredRoleFor(
   probe?: EnginePersona,
 ): 'viewer' | 'member' | 'admin' | 'owner' | undefined {
   if (!privileged || !control || !probe || control.handle === probe.handle) return undefined
-  const rank: Record<EnginePersona['privilege'], number> = { viewer: 0, member: 1, admin: 2 }
-  if (rank[control.privilege] <= rank[probe.privilege]) return undefined
+  const controlRank = rolePrivilegeRank(control.privilege)
+  const probeRank = rolePrivilegeRank(probe.privilege)
+  if (controlRank === null || probeRank === null || controlRank <= probeRank) return undefined
   return control.privilege
 }
 
@@ -1359,7 +1307,7 @@ export function buildIdentityProfiles(
     if (!harvest) continue
     const bindings: Array<{ field: string; value: string; own?: string }> = []
     for (const [field, values] of Object.entries(harvest.otherValues ?? {})) {
-      if (!/^[A-Za-z0-9_.-]{1,64}$/.test(field)) continue
+      if (!SAFE_FIELD_NAME_RE.test(field)) continue
       if (IDENTITY_CREDENTIAL_FIELD_RE.test(field) || IDENTITY_CALLER_FIELD_RE.test(field)) continue
       const value = values[0]
       if (!value || value.length > 64 || !/^[A-Za-z0-9_.:@-]+$/.test(value)) continue
@@ -1506,7 +1454,7 @@ export function enumerateHypotheses(
     const harvest = harvests.get(endpoint.id)
     const pool = originIdPool.get(endpoint.origin) ?? []
     for (const id of [...(harvest?.ownerIds ?? []), ...(harvest?.otherIds ?? [])]) {
-      if (/^[A-Za-z0-9_.:-]{1,128}$/.test(id) && !pool.includes(id)) pool.push(id)
+      if (SAFE_RESOURCE_ID_RE.test(id) && !pool.includes(id)) pool.push(id)
     }
     originIdPool.set(endpoint.origin, pool.slice(0, 24))
   }
@@ -1515,7 +1463,7 @@ export function enumerateHypotheses(
       ...(harvest?.ownerIds ?? []),
       ...(harvest?.otherIds ?? []),
       ...(originIdPool.get(origin) ?? []),
-    ].filter(id => /^[A-Za-z0-9_.:-]{1,128}$/.test(id))
+    ].filter(isSafeResourceId)
     return [...new Set(ids)].slice(0, 5)
   }
   // Field names observed anywhere on the origin (route maps and config documents publish the real
@@ -1621,14 +1569,14 @@ export function enumerateHypotheses(
         .sort((a, b) => b.score - a.score || a.param.name.localeCompare(b.param.name))
     const pathSegments = bare.split('/').filter(Boolean)
     const lastSegment = pathSegments[pathSegments.length - 1] ?? ''
-    const idIsLast = hasIdPath && placeholderSeg.test(lastSegment)
+    const idIsLast = hasIdPath && PLACEHOLDER_SEGMENT_RE.test(lastSegment)
     const mutating = method === 'POST' || method === 'PUT' || method === 'PATCH'
-    const sensitiveRead = /(?:^|[/_.-])(?:tokens?|keys?|secrets?|audit|auditlog|activity|logs?|config|export|apikeys?)(?:$|[/_.-])/i.test(bare)
+    const sensitiveRead = SENSITIVE_READ_ROUTE_RE.test(bare)
     const activeQuery = new Set(harvest?.activeQueryParams ?? [])
     const ownerId = harvest?.ownerIds[0] ?? harvest?.otherIds[0] ?? '1'
     /** Concrete path for non-authz probes: resolve a dynamic segment with a harvested owner id. */
     const resolvedPath = hasIdPath
-      ? bare.replace(idSegmentRe, `/${encodeURIComponent(ownerId)}`)
+      ? bare.replace(DYNAMIC_ID_SEGMENT_RE, `/${encodeURIComponent(ownerId)}`)
       : bare
 
     // --- Authorization / BOLA / IDOR / BFLA ------------------------------------------------
@@ -1645,7 +1593,7 @@ export function enumerateHypotheses(
       if (method === 'DELETE') ids = ids.filter(id => !reservedDestructiveIds.has(id))
       let reservedVictimId: string | undefined
       if (method === 'DELETE' && privileged && idIsLast) {
-        const placeholderIdx = pathSegments.findIndex(segment => placeholderSeg.test(segment))
+        const placeholderIdx = pathSegments.findIndex(segment => PLACEHOLDER_SEGMENT_RE.test(segment))
         const noun = placeholderIdx > 0 ? pathSegments[placeholderIdx - 1] : undefined
         const family: string[] = []
         if (noun) {
@@ -1658,7 +1606,7 @@ export function enumerateHypotheses(
             const last = (candidateSegments[candidateSegments.length - 1] ?? '').replace(/s$/i, '')
             if (last !== singular) continue
             for (const id of harvests.get(candidate.id)?.ownerIds ?? []) {
-              if (/^[A-Za-z0-9_.:-]{1,128}$/.test(id) && !family.includes(id)) family.push(id)
+              if (SAFE_RESOURCE_ID_RE.test(id) && !family.includes(id)) family.push(id)
             }
           }
         }
@@ -1691,7 +1639,7 @@ export function enumerateHypotheses(
       const runnable = objectRunnable || functionRunnable
       if (runnable && authzOwner && authzOther && authzOwner.handle !== authzOther.handle) {
         let pathAndQuery = endpoint.pathTemplate.split('?')[0]
-        if (hasIdPath) pathAndQuery = bare.replace(idSegmentRe, '/{{id}}')
+        if (hasIdPath) pathAndQuery = bare.replace(DYNAMIC_ID_SEGMENT_RE, '/{{id}}')
         else if (objectIdParam) {
           pathAndQuery = `${bare}?${encodeURIComponent(objectIdParam.name)}={{id}}`
         }
@@ -1810,7 +1758,7 @@ export function enumerateHypotheses(
         const snake = field.replace(/Id$/, '_id')
         const camel = snake.replace(/_([a-z])/g, (_m, ch: string) => ch.toUpperCase())
         const names = [...new Set([field, snake, camel])].slice(0, 2)
-        const fieldValues = (harvest.values[field] ?? []).filter(value => /^[A-Za-z0-9_.:-]{1,128}$/.test(value))
+        const fieldValues = (harvest.values[field] ?? []).filter(value => SAFE_RESOURCE_ID_RE.test(value))
         const resourceIds = [...new Set([...fieldValues, ...globalIds(harvest, endpoint.origin)])].slice(0, 4)
         if (resourceIds.length === 0) continue
         for (const name of names) {
@@ -1957,7 +1905,7 @@ export function enumerateHypotheses(
           jsonBody: siblingBody(harvest?.fields ?? [], harvest?.values ?? {}, param.name, coerceNumericBodies),
           ssrfParams: [param.name],
           ...((trigger || selfTrigger) && method === 'POST'
-            ? { triggerPath: (trigger?.pathTemplate.split('?')[0] || bare).replace(idSegmentRe, '/{{id}}') }
+            ? { triggerPath: (trigger?.pathTemplate.split('?')[0] || bare).replace(DYNAMIC_ID_SEGMENT_RE, '/{{id}}') }
             : {}),
           risk: endpointRiskScore(endpoint) + 12,
         })
@@ -2082,7 +2030,7 @@ export function enumerateHypotheses(
           probeClass: 'workflow_invariant',
           intent: 'workflow',
           method: 'POST',
-          pathAndQuery: bare.replace(idSegmentRe, '/{{id}}'),
+          pathAndQuery: bare.replace(DYNAMIC_ID_SEGMENT_RE, '/{{id}}'),
           ownerPersona: picks.owner?.handle,
           repeatTransition: true,
           ...(list ? { workflowListPath: barePath(list) } : {}),
@@ -2159,7 +2107,7 @@ export function enumerateHypotheses(
         ? endpoints.find(candidate => {
             const candidatePath = candidate.pathTemplate.split('?')[0] || '/'
             if (candidate.method.toUpperCase() !== 'GET' || !hasDynamicIdSegment(candidatePath)) return false
-            return new RegExp(`(?:^|/)${foreignNoun}s?(?:/|$)`, 'i').test(candidatePath)
+            return pathHasNounSegment(candidatePath, foreignNoun)
           })
         : undefined
       const raceRead = foreignRead ?? (raceCollection
@@ -2176,7 +2124,7 @@ export function enumerateHypotheses(
       const collectionHarvest = raceRead ? harvests.get(raceRead.id) : undefined
       const foreignCollection = foreignNoun
         ? endpoints.find(candidate => candidate.method.toUpperCase() === 'GET' &&
-            new RegExp(`(?:^|/)${foreignNoun}s?$`, 'i').test((candidate.pathTemplate.split('?')[0] || '/')))
+            pathHasNounSegment(candidate.pathTemplate.split('?')[0] || '/', foreignNoun, true))
         : undefined
       const foreignHarvest = foreignCollection ? harvests.get(foreignCollection.id) : undefined
       const raceIds = [...(harvest?.otherIds ?? []), ...(collectionHarvest?.otherIds ?? []), ...(foreignHarvest?.otherIds ?? [])]
@@ -2296,7 +2244,7 @@ export function enumerateHypotheses(
           method: 'POST',
           pathAndQuery: resolvedPath,
           readPath: getSibling
-            ? (getSibling.pathTemplate.split('?')[0] || '/').replace(idSegmentRe, `/${encodeURIComponent(ownerId)}`)
+            ? (getSibling.pathTemplate.split('?')[0] || '/').replace(DYNAMIC_ID_SEGMENT_RE, `/${encodeURIComponent(ownerId)}`)
             : resolvedPath,
           stateField: stateField ?? bodyField,
           bodyField,
@@ -2349,7 +2297,7 @@ export function enumerateHypotheses(
       for (const candidate of endpoints) {
         if (candidate.method.toUpperCase() !== 'GET') continue
         const candidatePath = candidate.pathTemplate.split('?')[0] || '/'
-        const segments = candidatePath.split('/').filter(segment => segment && !placeholderSeg.test(segment))
+        const segments = candidatePath.split('/').filter(segment => segment && !PLACEHOLDER_SEGMENT_RE.test(segment))
         const last = segments[segments.length - 1] ?? ''
         if (!/^[a-z][a-z0-9_-]{2,30}s?$/i.test(last)) continue
         if (/^(?:api|v1|v2|me|session|health|config|settings|admin|search|logs?|audit|csrf|login|logout|tokens?|keys?|hooks?|links?|jobs?|docs?)$/i.test(last)) continue
@@ -2469,7 +2417,7 @@ export function enumerateHypotheses(
         ownerPersona: picks.owner?.handle,
         webhookBody: delivery,
         ...(signatureHeader ? { webhookHeader: signatureHeader } : {}),
-        ...(detail ? { readPath: (detail.pathTemplate.split('?')[0] || '/').replace(idSegmentRe, `/${encodeURIComponent(ownerId)}`) } : {}),
+        ...(detail ? { readPath: (detail.pathTemplate.split('?')[0] || '/').replace(DYNAMIC_ID_SEGMENT_RE, `/${encodeURIComponent(ownerId)}`) } : {}),
         ...(stateField ? { stateField } : {}),
         risk: endpointRiskScore(endpoint) + 16 + (/(?:webhook|hooks?|receive|deliver|callback)(?:\/|$)/i.test(bare) ? 34 : 0),
       })
@@ -2502,7 +2450,7 @@ export function enumerateHypotheses(
         ? [...massFields.filter(f => updateSensitive.test(f)), 'role', 'permission', 'tenant_id', 'owner_id', 'plan', 'verified']
         : [...observedPrivilege, ...['role', 'permission', 'tenant_id', 'owner_id', 'plan', 'verified']]
       const candidates = [...new Set(candidateSource)]
-        .filter(f => /^[A-Za-z0-9_.-]{1,64}$/.test(f)).slice(0, 10)
+        .filter(isSafeFieldName).slice(0, 10)
       const eligible = isUpdate
         ? massFields.some(f => updateSensitive.test(f)) || pathHasPrivilegedHint(bare)
         : observedPrivilege.length > 0 || pathHasPrivilegedHint(bare)
@@ -2526,7 +2474,7 @@ export function enumerateHypotheses(
         // The impact monitor evaluates the writer's role after the mutation, so a self-escalation
         // cannot demonstrate an escalation. Choose a colleague from the same collection, skipping
         // the first (owning) record and the viewer's own id.
-        const listIds = (harvest?.ownerIds ?? []).filter(id => /^[A-Za-z0-9_.:-]{1,128}$/.test(id))
+        const listIds = (harvest?.ownerIds ?? []).filter(isSafeResourceId)
         const colleagueTarget = viewerTarget
           ? (listIds.filter(id => id !== viewerTarget && id !== listIds[0])[0]
             ?? listIds.find(id => id !== viewerTarget)
@@ -2539,10 +2487,10 @@ export function enumerateHypotheses(
           if (!persona) return undefined
           const rows = harvest?.rowIds ?? {}
           const direct = rows[persona]
-          if (direct && /^[A-Za-z0-9_.:-]{1,128}$/.test(direct)) return direct
+          if (direct && SAFE_RESOURCE_ID_RE.test(direct)) return direct
           const wanted = persona.toLowerCase()
           for (const [value, id] of Object.entries(rows)) {
-            if (value.toLowerCase() === wanted && /^[A-Za-z0-9_.:-]{1,128}$/.test(id)) return id
+            if (value.toLowerCase() === wanted && SAFE_RESOURCE_ID_RE.test(id)) return id
           }
           return undefined
         }
@@ -2552,7 +2500,7 @@ export function enumerateHypotheses(
         const roleTarget = selfUpdateTarget ?? colleagueTarget ?? viewerTarget
         const writer = (selfUpdateTarget ?? viewerTarget) ? picks.lower!.handle : picks.owner?.handle
         const targetPath = roleTarget && hasIdPath
-          ? bare.replace(idSegmentRe, `/${encodeURIComponent(roleTarget)}`)
+          ? bare.replace(DYNAMIC_ID_SEGMENT_RE, `/${encodeURIComponent(roleTarget)}`)
           : massPath
         add({
           key: `mass_assignment|${endpoint.id}`,
@@ -2729,7 +2677,7 @@ function harvestJson(body: string): JsonHarvest {
       if (!text || text.length > 64) continue
       if (scalars.length < 12) scalars.push(text)
       if (identifier === undefined && /^(?:id|uuid|uid|ext_?id|extid|key|ref)$/i.test(key) &&
-          /^[A-Za-z0-9_.:-]{1,128}$/.test(text)) {
+          SAFE_RESOURCE_ID_RE.test(text)) {
         identifier = text
       }
     }
@@ -2792,7 +2740,7 @@ function harvestJson(body: string): JsonHarvest {
   walk(parsed, 0)
   return {
     status: 200,
-    ids: [...new Set(ids)].filter(id => /^[A-Za-z0-9_.:-]{1,128}$/.test(id)),
+    ids: [...new Set(ids)].filter(isSafeResourceId),
     fields: [...new Set(Object.keys(values))],
     values,
     shapes,
@@ -2986,7 +2934,7 @@ async function harvestSurface(
         const bare = endpoint.pathTemplate.split('?')[0] || '/'
         const segs = bare.split('/').filter(Boolean)
         const last = segs[segs.length - 1] ?? ''
-        return endpoint.source !== 'conventional' && placeholderSeg.test(last)
+        return endpoint.source !== 'conventional' && PLACEHOLDER_SEGMENT_RE.test(last)
       })
       .slice(0, 3)
     let tried = 0
@@ -2998,7 +2946,7 @@ async function harvestSurface(
       const forms = identifierFormsForRoute(bare, tenants)
       for (const candidate of forms) {
         if (budget.requestsUsed + tried >= limit || tried >= 10 || input.signal.aborted) break
-        const detailPath = bare.replace(idSegmentRe, `/${encodeURIComponent(candidate)}`)
+        const detailPath = bare.replace(DYNAMIC_ID_SEGMENT_RE, `/${encodeURIComponent(candidate)}`)
         const probe = await harvester.get(harvestPersonaFor(endpoint), detailPath)
         budget.requestsUsed += 1
         tried += 1
@@ -3079,7 +3027,7 @@ async function harvestSurface(
     // Detail read with a harvested owner id, so field names (body schema) are observable.
     if (hasDynamicIdSegment(bare) && target.fields.length === 0) {
       const detailId = target.ownerIds[0] ?? '1'
-      const detailPath = bare.replace(idSegmentRe, `/${encodeURIComponent(detailId)}`)
+      const detailPath = bare.replace(DYNAMIC_ID_SEGMENT_RE, `/${encodeURIComponent(detailId)}`)
       const detail = await harvester.get(readPersona, detailPath)
       budget.requestsUsed += 1
       mergeHarvest(target, detail)
@@ -3454,7 +3402,7 @@ export function extractCreatedId(body: string): string | null {
     for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
       if ((typeof value === 'string' || typeof value === 'number') &&
           /^(?:id|webhookId|hookId|resourceId|uid|uuid)$/i.test(key)) return String(value)
-      if (typeof value === 'string' && /^[A-Za-z0-9_.:-]{1,128}$/.test(value) && !fallback) fallback = value
+      if (typeof value === 'string' && SAFE_RESOURCE_ID_RE.test(value) && !fallback) fallback = value
       if (value && typeof value === 'object') {
         const found = walk(value, depth + 1)
         if (found) return found
@@ -3957,7 +3905,7 @@ async function probePriceTrust(
     const idPair = entries.find(([field, value]) =>
       /id$/i.test(field) && !/^(?:valid|invalid|paid|void|liquid|solid|bid|grid|mid|kid)$/i.test(field) &&
       (typeof value === 'string' || typeof value === 'number') &&
-      /^[A-Za-z0-9_.:-]{1,128}$/.test(String(value)) && !/^(?:error|message)$/i.test(field))
+      SAFE_RESOURCE_ID_RE.test(String(value)) && !/^(?:error|message)$/i.test(field))
     const prices = numericEntries(record).filter(([field]) => /(?:unit_?)?price|amount|total|cost|cents/i.test(field))
     const pricePair = prices.find(([field]) => /price|unit/i.test(field)) ?? prices[0]
     if (!idPair || !pricePair) return null
@@ -4221,7 +4169,7 @@ export async function probeRaceDoubleSpend(
         const read = await sendGet(origin, candidate.path, candidate.persona)
         if (!read || read.status < 200 || read.status >= 300) continue
         const parsed = readableRecord(read.body)
-        const pair = numericEntries(parsed).find(([field]) => /balance|available|remaining|stock|on_?hand|quantity|credits?|points?/i.test(field))
+        const pair = numericEntries(parsed).find(([field]) => CONSERVED_BALANCE_FIELD_RE.test(field))
         if (!pair) continue
         raceOrigin = origin
         balanceField = pair[0]
@@ -4238,7 +4186,7 @@ export async function probeRaceDoubleSpend(
       // The request field that moves the conserved value: the harvest body first, then the route's
       // declared parameters (an openapi redemption route declares `amount` even when the collection
       // row exposes only `balance`).
-      const amountish = (field: string): boolean => /^(?:item_?|line_?|requested_?|reserved_?|redeem_?)?(?:amount|value|quantity|qty|count|units|seats|credits|points|total|redeem)$/i.test(field)
+      const amountish = (field: string): boolean => CONSERVED_AMOUNT_FIELD_RE.test(field)
       amountField = Object.keys(hyp.jsonBody ?? {}).find(amountish)
         ?? (hyp.endpoint.params ?? []).map(param => param.name).find(name => amountish(name) && name !== balanceField)
         ?? null
@@ -4262,7 +4210,7 @@ export async function probeRaceDoubleSpend(
           const parsed = read ? readableRecord(read.body) : null
           if (!parsed) return null
           return numericEntries(parsed).find(([field]) => field === balanceField)?.[1]
-            ?? numericEntries(parsed).find(([field]) => /balance|remaining|available|stock|on_?hand|quantity|credits?|points?/i.test(field))?.[1]
+            ?? numericEntries(parsed).find(([field]) => CONSERVED_BALANCE_FIELD_RE.test(field))?.[1]
             ?? null
         }
         for (const candidate of discovery.slice(0, 8)) {
@@ -4271,7 +4219,7 @@ export async function probeRaceDoubleSpend(
           if (!attempt || attempt.status < 200 || attempt.status >= 300) continue
           const after = await readConserved()
           const parsed = jsonRecordOf(attempt.body)
-          const echo = numericEntries(parsed).find(([field, value]) => value === 1 && /transfer|debit|charge|amount|count|redeem|used|quantity|qty|reserved/i.test(field))
+          const echo = numericEntries(parsed).find(([field, value]) => value === 1 && CONSERVED_ECHO_FIELD_RE.test(field))
           if (echo || (before !== null && after !== null && before - after === 1)) {
             amountField = candidate
             transferredField = echo?.[0] ?? null
@@ -4296,7 +4244,7 @@ export async function probeRaceDoubleSpend(
       break
     }
     if (!raceOrigin || !record) return { ...base, requestsSent: requests, exchangeIds, durationMs: Date.now() - started }
-    const balancePair = numericEntries(record).find(([field]) => /balance|available|remaining/i.test(field)) ??
+    const balancePair = numericEntries(record).find(([field]) => CONSERVED_BALANCE_FIELD_RE.test(field)) ??
       numericEntries(record).sort((a, b) => b[1] - a[1])[0]
     if (!balancePair) return { ...base, requestsSent: requests, exchangeIds, durationMs: Date.now() - started }
     balanceField = balancePair[0]
@@ -4308,7 +4256,7 @@ export async function probeRaceDoubleSpend(
       const parsed = jsonRecordOf(attempt.body)
       if (!parsed) continue
       const nums = numericEntries(parsed)
-      const echo = nums.find(([field, value]) => value === 1 && /transfer|debit|charge|amount|count|redeem|used|quantity|qty/i.test(field))
+      const echo = nums.find(([field, value]) => value === 1 && CONSERVED_ECHO_FIELD_RE.test(field))
       const observed = nums.find(([field]) => field === balanceField)?.[1]
       const movedByOne = observed !== undefined && baselineBalance - observed === 1
       if (echo || movedByOne) {
@@ -4337,7 +4285,7 @@ export async function probeRaceDoubleSpend(
     // so no extra mutating probe is sent.
     const zero = await send(raceOrigin, { [amountField]: 0 })
     const zeroRecord = zero ? jsonRecordOf(zero.body) : null
-    transferredField = numericEntries(zeroRecord).find(([field]) => /transfer|debit|charge|amount|count|redeem|used|quantity|qty/i.test(field))?.[0] ?? null
+    transferredField = numericEntries(zeroRecord).find(([field]) => CONSERVED_ECHO_FIELD_RE.test(field))?.[0] ?? null
   }
   if (!transferredField) transferredField = amountField
   const readBalance = async (): Promise<number | null> => {
@@ -4352,7 +4300,7 @@ export async function probeRaceDoubleSpend(
         if (exact !== undefined) return exact
         // The readback may name the conserved value differently from the collection row
         // (`remaining` vs `balance`), so fall back to the semantic family.
-        return numericEntries(record).find(([field]) => /balance|remaining|available|stock|on_?hand|quantity|credits?|points?/i.test(field))?.[1]
+        return numericEntries(record).find(([field]) => CONSERVED_BALANCE_FIELD_RE.test(field))?.[1]
       }
       const value = conserved(parsed)
       if (value !== undefined) return value
@@ -4417,7 +4365,7 @@ export async function probeRaceDoubleSpend(
   const burstRecords = burst.results.map(result => jsonRecordOf(result.body))
   const burstObserved = burstRecords
     .map(rec => numericEntries(rec).find(([field]) => field === balanceField)?.[1]
-      ?? numericEntries(rec).find(([field]) => /balance|remaining|available|stock|on_?hand|quantity|credits?|points?/i.test(field))?.[1])
+      ?? numericEntries(rec).find(([field]) => CONSERVED_BALANCE_FIELD_RE.test(field))?.[1])
     .filter((value): value is number => value !== undefined)
   const burstAcks = burst.results.filter(result => result.status >= 200 && result.status < 300).length
   // Acknowledged transfer: prefer an explicit echo of the transferred field; otherwise every 2xx
@@ -4785,7 +4733,7 @@ async function rehomeDeclaredSurface(
     .filter(endpoint => ['POST', 'PUT', 'PATCH', 'DELETE'].includes(endpoint.method.toUpperCase()))
     .filter(endpoint => {
       const segs = (endpoint.pathTemplate.split('?')[0] || '/').split('/').filter(Boolean)
-      return placeholderSeg.test(segs[segs.length - 1] ?? '')
+      return PLACEHOLDER_SEGMENT_RE.test(segs[segs.length - 1] ?? '')
     })
     .slice(0, 2)
   let spent = 0
@@ -4804,7 +4752,7 @@ async function rehomeDeclaredSurface(
           const exchange = await input.broker.executeHttp({
             origin,
             method: 'GET',
-            pathAndQuery: (target.pathTemplate.split('?')[0] || '/').replace(idSegmentRe, `/${encodeURIComponent(candidate)}`),
+            pathAndQuery: (target.pathTemplate.split('?')[0] || '/').replace(DYNAMIC_ID_SEGMENT_RE, `/${encodeURIComponent(candidate)}`),
             persona: owner,
             followRedirects: false,
             timeoutMs: 8_000,
@@ -5555,28 +5503,4 @@ export function intentFamily(intent: string): string {
     case 'auth_protocol': return 'auth'
     default: return intent
   }
-}
-
-export function specClassFamily(cwe: string | undefined, kind: string | undefined): string | null {
-  if (kind === 'static_ast_proof') return null
-  const n = Number(/(\d+)/.exec(cwe ?? '')?.[1] ?? NaN)
-  if (!Number.isFinite(n)) return kind === 'http_chain' ? null : null
-  if ([639, 284, 285, 862, 863, 566].includes(n)) return 'authz'
-  if ([89, 564, 943].includes(n)) return 'sqli'
-  if ([79, 80, 83].includes(n)) return 'xss'
-  if (n === 918) return 'ssrf'
-  if ([611, 776].includes(n)) return 'xxe'
-  if ([22, 23, 35, 73].includes(n)) return 'traversal'
-  if (n === 601) return 'redirect'
-  if (n === 915) return 'mass_assign'
-  if (n === 352) return 'csrf'
-  if ([200, 359, 522, 532].includes(n)) return 'disclosure'
-  if ([524, 525, 444, 349].includes(n)) return 'cache'
-  if ([840, 841].includes(n)) return 'logic'
-  if ([362, 367].includes(n)) return 'race'
-  if ([345, 347, 327, 1270].includes(n)) return 'token'
-  if ([287, 306, 288, 290].includes(n)) return 'auth'
-  if ([77, 78, 88].includes(n)) return 'command'
-  if ([1336, 94, 95].includes(n)) return 'ssti'
-  return null
 }

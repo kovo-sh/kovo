@@ -59,12 +59,14 @@ import type {
 import { actorFromPersona, assessBoundary, assessImpactEvidence, assessMassAssignmentImpact, assessMfaBypass, assessStatusOnlyDivergence, classifyBoundaryClaim, classifyImpactDescriptor, normalizeRole, parseRoleLabel } from './oracle-invariants.ts'
 import type { ActorIdentity, AmbientAuth, ImpactStep, PersonaCredentialSource, RoleName } from './oracle-invariants.ts'
 import { HostFactLog } from './host-fact-log.ts'
-import { proofReceiptMode } from './proof-receipt.ts'
+import { proofReceiptMode as proofReceiptModeOf } from './proof-receipt.ts'
 import type { ProofReceipt, ReceiptTranscript, ReceiptTranscriptEntry, ReceiptVerification } from './proof-receipt.ts'
 import { defaultTerminalOracleRegistry } from './terminal-oracle-registry.ts'
 import type { ProofReceiptMode, ReplayReceiptCheck, ReplayVerdict, ReplayVerificationResult, RetestVerdict } from './replay-verifier.ts'
 
-export { proofReceiptMode }
+export function proofReceiptMode(env: NodeJS.ProcessEnv = process.env): ReturnType<typeof proofReceiptModeOf> {
+  return proofReceiptModeOf(env)
+}
 import { cacheBusterValueRegex, containsDestructivePayload, extractCacheBusterParam, replayAssertionOutcomeSchema } from '../replay-spec.ts'
 import type { AuthMutation, DeclarativeReplaySpec, FloorRecipeEnvelope, ReplayAssertionOutcome, ReplayStep } from '../replay-spec.ts'
 import { BrokerApprovalRequired, BrokerCircuitOpen, BrokerDenied } from './broker.ts'
@@ -511,7 +513,7 @@ function planAuthzRecipe(input: FloorRecipePlanInput): FloorRecipePlan {
   const reserved = hyp.method === 'DELETE' && !functionLevel && privileged && hyp.reservedVictimId
     ? hyp.reservedVictimId
     : null
-  const resolvedId = reserved && /^[A-Za-z0-9_.:-]{1,128}$/.test(reserved) ? reserved : id
+  const resolvedId = reserved && isSafeResourceId(reserved) ? reserved : id
   const realPath = resolvedId ? fillResourceId(hyp.pathAndQuery, resolvedId) : hyp.pathAndQuery
   const owner = floorActorFor(ownerHandle, input.personas)
   const probe = floorActorFor(probeHandle, input.personas)
@@ -1592,7 +1594,7 @@ function evaluateRunnerOobReceipt(input: {
   oobEventId: string
   callbackPrefix: string
   token: string
-  probeWait: { triggered: boolean; stage?: string; subscriptionId?: string }
+  probeWait: { triggered: boolean; stage?: string; subscriptionId?: string | null }
   controlTriggered: boolean
   claimedDelta: string
   injectedAtMs: number

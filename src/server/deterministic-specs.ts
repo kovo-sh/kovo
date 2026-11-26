@@ -11,9 +11,30 @@
  * builder mistake costs a bounded replay and can never persist an unverified finding.
  */
 import { randomBytes } from 'node:crypto'
+import {
+  bogusIdFor,
+  escalatePrivilegeBody,
+  fillResourceId,
+  isAuthzMatrixHitAdmissible,
+  isSafeFieldName,
+  isSafeIdentifier,
+  isSafePersonaHandle,
+  isSafeResourceId,
+  pickBaselineWrite,
+  PRIVILEGED_ACTION_RE,
+  privilegeBaselineFor,
+  resolveAuthzReadbackTemplate,
+  SAFE_FIELD_NAME_RE,
+  SAFE_PERSONA_HANDLE_RE,
+  SAFE_RESOURCE_ID_RE,
+  SENSITIVE_READ_ROUTE_RE,
+} from './floor-heuristics.ts'
+import type { AuthzMatrixRow } from './floor-heuristics.ts'
 import { browserSinkEnvelopeFromSteps } from './floor-recipes.ts'
 import { injectUniversalParam } from './probes/context.ts'
 import type { DifferentialProbeClass, DifferentialResult, SurfaceParamLocation } from './surface-engine.ts'
+
+export { bogusIdFor }
 
 export interface EngineParam {
   name: string
@@ -224,34 +245,6 @@ function appendQuery(pathAndQuery: string, name: string, rawValue: string, encod
   return `${pathAndQuery}${sep}${encodeURIComponent(name)}=${encodedValue}`
 }
 
-function fillId(pathAndQuery: string, id: string): string {
-  return pathAndQuery.replaceAll('{{id}}', encodeURIComponent(id))
-}
-
-/**
- * A syntactically valid identifier that must not resolve to any real object. Used as a negative
- * control so a route that ignores its identifier (and serves the caller's own session object)
- * cannot be mistaken for an object-level authorization failure.
- */
-export function bogusIdFor(id: string): string {
-  if (/^\d{1,12}$/.test(id)) {
-    const n = Number(id)
-    if (Number.isSafeInteger(n)) {
-      const bumped = n + 9_000_001
-      if (String(bumped).length <= 12) return String(bumped)
-    }
-  }
-  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
-    const tail = id.slice(-1) === '0' ? '1' : '0'
-    return `${id.slice(0, -1)}${tail}`
-  }
-  if (/^[A-Za-z]+[-_][A-Za-z0-9]+$/.test(id)) {
-    const sep = id.includes('_') ? '_' : '-'
-    return `${id.split(/[-_]/)[0]}${sep}gx9000001`
-  }
-  return `gx${randomBytes(8).toString('hex')}`
-}
-
 /** Build one request for the hypothesis with `value` placed in its parameter. */
 export function requestParts(hyp: EngineHypothesis, value: string): RequestParts | null {
   const param = hyp.param
@@ -307,16 +300,6 @@ export function requestParts(hyp: EngineHypothesis, value: string): RequestParts
 // Authorization matrix -> http_chain
 // ---------------------------------------------------------------------------------------------
 
-interface MatrixRow {
-  resourceId?: unknown
-  actor?: unknown
-  status?: unknown
-  bodyBytes?: unknown
-  bodySha256?: unknown
-  similarityToOwner?: unknown
-  accessible?: unknown
-}
-
 const NEGATIVE_CONTROL_STATUS = [400, 401, 403, 404, 405, 409, 410, 422]
 /** A readback of a mutation's nonexistent identifier must be absent (never served). */
 const BOGUS_READBACK_ABSENT_STATUS = [404, 410]
@@ -358,152 +341,13 @@ function negativeControlJq(mutating: boolean, bogusReadback = false): string {
   return `(((.steps.c2.status >= 400) and (.steps.c2.status < 500)) or ((${is2xx('c2')}) and (.steps.c2.body != .steps.c1.body) and ((.steps.c2.body | length) > 2)))`
 }
 
-/** A route whose name marks an elevated function (admin console, permission/role grant, ...). */
-const PRIVILEGED_ACTION_RE = /(?:^|[/_.-])(?:admin|administration|internal|manage|management|staff|superuser|privileged|backoffice|permissions?|roles?|grants?|scopes?)(?:$|[/_.-])/i
-
 interface AuthzReadback {
   /** GET path (with the resource id already filled in) used before and after the mutation. */
   path: string
 }
 
-interface AuthzReadbackTemplate {
-  /** Read route with its `{{id}}` placeholder still in place. */
-  template: string
-  /** Actor for the read when it is the mutated actor's own identity route. */
-  persona?: string
-}
-
-/**
- * A mutating authorization proof only becomes observable when a *separate read* shows the change;
- * the mutation's own response is an echo. Pick the read from what the hypothesis already knows:
- * an explicit harvested readback route, the object's REST detail route (dropping a trailing action
- * verb such as `/promote`), or the function's own surface for an elevated action.
- */
-function authzReadbackTemplate(hyp: EngineHypothesis, functionLevel: boolean): AuthzReadbackTemplate | null {
-  if (hyp.readbackPath) return { template: hyp.readbackPath, ...(hyp.readbackPersona ? { persona: hyp.readbackPersona } : {}) }
-  const pathAndQuery = hyp.pathAndQuery
-  const bare = pathAndQuery.split('?')[0]
-  if (functionLevel) {
-    if (!PRIVILEGED_ACTION_RE.test(bare)) return null
-    return { template: pathAndQuery }
-  }
-  // Identifier in the query string: re-read the filtered collection with the same identifier.
-  const queryAt = pathAndQuery.indexOf('?')
-  if (queryAt >= 0 && pathAndQuery.slice(queryAt).includes('{{id}}')) return { template: pathAndQuery }
-  const segs = bare.split('/')
-  const placeholderIdx = segs.findIndex(seg => seg === '{{id}}' || /^\{[^}]+\}$/.test(seg) || /^:[A-Za-z_][A-Za-z0-9_]*$/.test(seg))
-  if (placeholderIdx <= 0) return null
-  // `/api/invoices/{{id}}` — the identifier is the object itself.
-  if (placeholderIdx === segs.length - 1) return { template: pathAndQuery }
-  // `/api/admin/users/{{id}}/promote` — read the object under the elevated action verb.
-  if (placeholderIdx === segs.length - 2 && PRIVILEGED_ACTION_RE.test(bare)) {
-    return { template: segs.slice(0, -1).join('/') }
-  }
-  return null
-}
-
-function authzReadback(hyp: EngineHypothesis, functionLevel: boolean, id: string): AuthzReadback | null {
-  const template = authzReadbackTemplate(hyp, functionLevel)
-  return template ? { path: fillId(template.template, id) } : null
-}
-
-interface BaselineWrite {
-  field: string
-  baselineValue: string | number | boolean
-  probeValue: string | number | boolean
-}
-
-const BASELINE_STRONG_NUMERIC_FIELD_RE = /(?:^|[_-])(?:amount|total|price|value|cents|balance|qty|quantity|count|seats?|credits?)(?:$|[_-])/i
-const BASELINE_TEXT_FIELD_RE = /^(?:name|title|label|description|note|notes|body|text|summary|message|subject|comment|company|address)$/i
-const BASELINE_WEAK_NUMERIC_FIELD_RE = /^(?:number|num|limit|score|rating|page|size|order)$/i
-const BASELINE_EXCLUDED_FIELD_RE = /(?:^|[_-])(?:id|uuid|owner|tenant|org|team|role|roles|permissions?|email|password|token|secret|key|status|state|created|updated)(?:$|[_-])/i
-/** Scope/identity selectors: writing these changes which record is addressed, not its content. */
-const BASELINE_SELECTOR_FIELD_RE = /(?:^|[_-])(?:id|uuid|owner|tenant|org|team|role|roles|permissions?|email|password|token|secret|key|created|updated)(?:$|[_-])/i
-const BASELINE_STATE_FIELD_RE = /^(?:status|state|stage|phase|payment_state|fulfil?lment_state|lifecycle)$/i
-/** Columns a privileged-function mutation grants (role/plan/scope style escalation). */
-const PRIVILEGE_TARGET_FIELD_RE = /^(?:role|role_name|user_role|account_role|account_type|membership|plan|tier|level|scope|is_admin|is_owner|is_staff|admin|privilege|privileges|permissions|permission_level)$/i
-/** Literal values that name an elevated entitlement (never a benign content value). */
-const PRIVILEGE_LITERAL_RE = /^(?:admin|administrator|owner|superuser|root|staff)$/i
-
-/**
- * A privileged-function mutation that *grants* an entitlement has to be replayable after the probe
- * matrix has already applied the grant: re-sending `role:"admin"` reads back the same state and the
- * persistence oracle (correctly) calls it an idempotent no-op. The control arm therefore restores a
- * *non*-privileged baseline for the exact field the probe elevates, so the probe's value is the
- * delta. The demotion is chosen below the function's declared required role and only for a body
- * that carries a recognised elevated literal — a benign content write is never reinterpreted.
- */
-function privilegeBaselineFor(bodyTemplate: unknown, requiredRole?: string | null): BaselineWrite | null {
-  if (!bodyTemplate || typeof bodyTemplate !== 'object' || Array.isArray(bodyTemplate)) return null
-  const entry = Object.entries(bodyTemplate as Record<string, unknown>).find(([field, value]) =>
-    PRIVILEGE_TARGET_FIELD_RE.test(field) && typeof value === 'string' && PRIVILEGE_LITERAL_RE.test(value))
-  if (!entry) return null
-  const [field, value] = entry
-  if (typeof value !== 'string') return null
-  const demotion = requiredRole === 'admin' ? 'member' : 'viewer'
-  if (value.toLowerCase() === demotion) return null
-  return { field, baselineValue: demotion, probeValue: value }
-}
-
-/**
- * A replay re-sends the body the probe matrix already applied, so the post-read equals the
- * pre-read and a persistence oracle correctly calls it an idempotent no-op. A baseline write of a
- * *different* value immediately before the baseline read makes the probe's value a genuine delta.
- * The field is chosen from the body the probe itself carried: numeric/free-text mutable fields
- * first, identity and enum-ish columns excluded.
- */
-/**
- * The probe matrix must not escalate every record it lists, so its write body is the benign one the
- * surface published. The replay of a *privileged function* therefore has to apply the entitlement
- * the function exists to grant: without it the chain re-sends a no-op body and can never show a
- * persisted escalation. Only a field the body already carries is escalated (never an invented name).
- */
-function escalatePrivilegeBody(
-  bodyTemplate: unknown,
-  requiredRole?: string | null,
-): Record<string, unknown> | null {
-  if (!bodyTemplate || typeof bodyTemplate !== 'object' || Array.isArray(bodyTemplate)) return null
-  if (!requiredRole) return null
-  const entries = Object.entries(bodyTemplate as Record<string, unknown>)
-  const field = entries.find(([name, value]) =>
-    PRIVILEGE_TARGET_FIELD_RE.test(name) &&
-    (typeof value === 'string' || value === null || typeof value === 'number' || typeof value === 'boolean'))
-  if (!field) return null
-  const promoted = { ...(bodyTemplate as Record<string, unknown>), [field[0]]: requiredRole }
-  return String(field[1]).toLowerCase() === requiredRole ? null : promoted
-}
-
-function baselineWriteFor(bodyTemplate: unknown): BaselineWrite | null {
-  if (!bodyTemplate || typeof bodyTemplate !== 'object' || Array.isArray(bodyTemplate)) return null
-  const scalarEntries = Object.entries(bodyTemplate as Record<string, unknown>)
-    .filter(([field, value]) =>
-      /^[A-Za-z0-9_.-]{1,64}$/.test(field) &&
-      (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean'))
-  const entries = scalarEntries.filter(([field]) => !BASELINE_EXCLUDED_FIELD_RE.test(field))
-  const pick = entries.find(([field]) => BASELINE_STRONG_NUMERIC_FIELD_RE.test(field)) ??
-    entries.find(([field]) => BASELINE_TEXT_FIELD_RE.test(field)) ??
-    entries.find(([, value]) => typeof value === 'boolean') ??
-    entries.find(([field]) => BASELINE_WEAK_NUMERIC_FIELD_RE.test(field))
-  // Lifecycle/state columns are excluded above because a *content* edit should prefer a data field,
-  // but they are still a legitimate delta target: re-sending the value the record already holds is
-  // an idempotent no-op, so a state transition needs a fresh baseline too. If the target validates
-  // the token as an enum it rejects the baseline write, the control arm fails, and nothing confirms.
-  const chosen = pick ??
-    scalarEntries.find(([field]) => BASELINE_STATE_FIELD_RE.test(field)) ??
-    scalarEntries.find(([field]) => !BASELINE_SELECTOR_FIELD_RE.test(field))
-  if (!chosen) return null
-  const [field, value] = chosen
-  const nonce = randomBytes(4).toString('hex')
-  if (typeof value === 'boolean') return { field, baselineValue: false, probeValue: true }
-  if (typeof value === 'number' || /^-?\d+(?:\.\d+)?$/.test(String(value))) {
-    const base = 424_242 + (Number.parseInt(nonce.slice(0, 4), 16) % 1_000)
-    return { field, baselineValue: base, probeValue: base + 1 }
-  }
-  return { field, baselineValue: `kovo-baseline-${nonce}`, probeValue: `kovo-probe-${nonce}` }
-}
-
 function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): SynthesizedEngineSpec[] {
-  const sensitiveRead = hyp.method === 'GET' && /(?:^|[/_.-])(?:tokens?|keys?|secrets?|audit|auditlog|activity|logs?|config|export|apikeys?|links?|integrations?)(?:$|[/_.-])/i.test(hyp.endpoint.pathTemplate)
+  const sensitiveRead = hyp.method === 'GET' && SENSITIVE_READ_ROUTE_RE.test(hyp.endpoint.pathTemplate)
   // A read of a credential/audit surface is a disclosure claim, not a body-equality claim. Delegate
   // it to the credential-proof shape (masked control or anonymous denial plus a pre-redaction
   // fingerprint / credential-shaped value); a listing read with no such evidence is not reported.
@@ -518,7 +362,7 @@ function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): Synthesi
   const cwe = 'CWE-639'
   const title = 'Cross-actor object or function access'
   let vulnClass = hyp.functionLevel ? 'bfla' : 'bola'
-  const matrix = Array.isArray(result.details.matrix) ? result.details.matrix as MatrixRow[] : null
+  const matrix = Array.isArray(result.details.matrix) ? result.details.matrix as AuthzMatrixRow[] : null
   const hits = result.anomalies
     .filter(a => a.type === 'unauthorized_access')
     .sort((a, b) => {
@@ -555,31 +399,9 @@ function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): Synthesi
     const key = `${method}|${functionLevel ? 'fn' : id}`
     if (seen.has(key)) continue
     seen.add(key)
-    if (!functionLevel && !/^[A-Za-z0-9_.:-]{1,128}$/.test(id)) continue
+    if (!functionLevel && !isSafeResourceId(id)) continue
 
-    const probeActor = hit.actor === 'anonymous' ? 'anonymous' : 'other_persona'
-    let ownerOk = true
-    let probeOk = true
-    if (matrix) {
-      const idRows = functionLevel ? matrix : matrix.filter(r => String(r.resourceId ?? '') === matrixId)
-      const ownerRow = idRows.find(r => r.actor === 'owner')
-      const probeRow = idRows.find(r => r.actor === probeActor)
-      if (!ownerRow || ownerRow.accessible !== true || typeof ownerRow.status !== 'number' || ownerRow.status < 200 || ownerRow.status >= 300) ownerOk = false
-      // A mutating control can legitimately return a compact acknowledgement ({"ok":true}); the
-      // bogus-id negative control, not the body size, is what rules out a no-op route.
-      else if (typeof ownerRow.bodyBytes === 'number' && ownerRow.bodyBytes <= 2) ownerOk = false
-      if (!probeRow || probeRow.accessible !== true) probeOk = false
-      else if (!mutating && Number(probeRow.similarityToOwner ?? hit.similarityToOwner ?? 0) < 0.7) probeOk = false
-      const anonRow = idRows.find(r => r.actor === 'anonymous')
-      // The public-data veto exists to suppress ordinary public catalogs, never credential/audit
-      // reads (those are delegated above).
-      if (!mutating && anonRow?.accessible === true && ownerRow) {
-        const sameBody = typeof anonRow.bodySha256 === 'string' && anonRow.bodySha256 === ownerRow.bodySha256
-        const similar = Number(anonRow.similarityToOwner ?? 0) >= 0.7
-        if (sameBody || similar) ownerOk = false
-      }
-    }
-    if (!ownerOk || !probeOk) continue
+    if (!isAuthzMatrixHitAdmissible(matrix, hit, { mutating, functionLevel })) continue
 
     const observedBody = hyp.functionState?.body
       ?? (hit.bodyTemplate !== undefined && hit.bodyTemplate !== null
@@ -587,7 +409,7 @@ function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): Synthesi
         : (hyp.jsonBody ?? {}))
     const escalatedBody = mutating && privilegedRoute ? escalatePrivilegeBody(observedBody, hyp.authzRequiredRole) : null
     const bodyTemplate = escalatedBody ?? observedBody
-    const realPath = functionLevel ? hyp.pathAndQuery : fillId(hyp.pathAndQuery, id)
+    const realPath = functionLevel ? hyp.pathAndQuery : fillResourceId(hyp.pathAndQuery, id)
     // A staging replay is still a mutation: every write step must carry the run-scoped tenant tag,
     // otherwise the scope contract refuses it and a real finding looks unverifiable.
     const writeHeaders = mutating ? hyp.headers : undefined
@@ -609,7 +431,7 @@ function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): Synthesi
       ? privilegeBaselineFor(bodyTemplate, hyp.authzRequiredRole)
       : null
     const baselineWrite = privilegeBaseline ?? (mutating && !functionLevel && !selfState && method !== 'DELETE'
-      ? baselineWriteFor(bodyTemplate)
+      ? pickBaselineWrite(bodyTemplate)
       : null)
     const withValue = (value: string | number | boolean): unknown => (
       bodyTemplate && typeof bodyTemplate === 'object' && !Array.isArray(bodyTemplate)
@@ -620,8 +442,8 @@ function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): Synthesi
     // mutation's own acknowledgement. Roles: the privileged actor reads before and after, the lower
     // role mutates in between; a function-level proof also lets the lower role re-read the function
     // state so the change is visible to the actor that caused it.
-    const readbackTemplate = mutating ? authzReadbackTemplate(hyp, functionLevel) : null
-    const readback = readbackTemplate ? { path: fillId(readbackTemplate.template, id) } : null
+    const readbackTemplate = mutating ? resolveAuthzReadbackTemplate(hyp, functionLevel) : null
+    const readback = readbackTemplate ? { path: fillResourceId(readbackTemplate.template, id) } : null
     // The bogus-id control is only observable through the same read route; a function-level proof
     // has no object read to bind it to, and a reserved delete victim owns its own control.
     const bogusReadbackTemplate = readbackTemplate && !functionLevel && !useReservedVictim && !selfState
@@ -657,7 +479,7 @@ function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): Synthesi
           `Authorized actor addresses a nonexistent identifier (${negativeId})`,
           {
             method: method as RequestParts['method'],
-            pathAndQuery: fillId(hyp.pathAndQuery, negativeId),
+            pathAndQuery: fillResourceId(hyp.pathAndQuery, negativeId),
             ...(mutating ? { jsonBody: bodyTemplate } : {}),
             ...(writeHeaders ? { headers: writeHeaders } : {}),
           },
@@ -671,7 +493,7 @@ function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): Synthesi
           steps.push(stepOf(
             hyp.endpoint.origin, 'c3', 'control',
             `Authorized actor reads the same nonexistent identifier back (${negativeId})`,
-            { method: 'GET', pathAndQuery: fillId(bogusReadbackTemplate.template, negativeId) },
+            { method: 'GET', pathAndQuery: fillResourceId(bogusReadbackTemplate.template, negativeId) },
             readbackPersona,
             {},
             BOGUS_READBACK_ABSENT_STATUS,
@@ -815,7 +637,7 @@ function synthAuthz(hyp: EngineHypothesis, result: DifferentialResult): Synthesi
         `Authorized actor addresses a nonexistent identifier (${negativeId})`,
         {
           method: method as RequestParts['method'],
-          pathAndQuery: fillId(hyp.pathAndQuery, negativeId),
+          pathAndQuery: fillResourceId(hyp.pathAndQuery, negativeId),
           ...(mutating ? { jsonBody: bodyTemplate } : {}),
         },
         owner, stepExtra, NEGATIVE_CONTROL_STATUS,
@@ -1305,12 +1127,12 @@ function synthMassAssignment(hyp: EngineHypothesis, result: DifferentialResult):
   const hit = result.anomalies.find(a => a.type === 'mass_assignment')
   if (!hit || !hyp.ownerPersona) return []
   const hitField = String(hit.field ?? '')
-  if (!/^[A-Za-z0-9_.-]{1,64}$/.test(hitField)) return []
+  if (!SAFE_FIELD_NAME_RE.test(hitField)) return []
   // The probe reports the first field that persisted; a sibling privileged field (tenant_id vs
   // owner_id) may be the one with a clean read-back. Try the observed field first, then the
   // hypothesis's other candidate fields.
   const fields = [...new Set([hitField, ...(hyp.candidateFields ?? [])])]
-    .filter(field => /^[A-Za-z0-9_.-]{1,64}$/.test(field))
+    .filter(isSafeFieldName)
     .slice(0, 4)
   const method = (hyp.method === 'PUT' ? 'PUT' : hyp.method === 'PATCH' ? 'PATCH' : 'POST') as 'POST' | 'PUT' | 'PATCH'
   const readPath = hyp.pathAndQuery.split('?')[0]
@@ -1396,7 +1218,7 @@ function synthCsrf(hyp: EngineHypothesis, result: DifferentialResult): Synthesiz
   const readPath = String(hit.readPath ?? hyp.readPath ?? '')
   const bodyField = String(hit.bodyField ?? hyp.bodyField ?? '')
   const stateField = String(hit.stateField ?? hyp.stateField ?? bodyField)
-  if (!readPath.startsWith('/') || !/^[A-Za-z0-9_.-]{1,64}$/.test(bodyField) || !/^[A-Za-z0-9_.-]{1,64}$/.test(stateField)) return []
+  if (!readPath.startsWith('/') || !SAFE_FIELD_NAME_RE.test(bodyField) || !SAFE_FIELD_NAME_RE.test(stateField)) return []
   const controlValue = hit.controlValue
   const expectedValue = hit.expectedValue
   if (controlValue === undefined || expectedValue === undefined || controlValue === expectedValue) return []
@@ -1522,7 +1344,7 @@ function synthSensitiveRead(hyp: EngineHypothesis, result: DifferentialResult): 
   const path = typeof hit.path === 'string' && hit.path.startsWith('/') ? hit.path : hyp.pathAndQuery
   if (!path.startsWith('/')) return []
   const safePersona = (value: unknown): string | undefined =>
-    typeof value === 'string' && /^[a-z0-9_-]{1,32}$/.test(value) ? value : undefined
+    isSafePersonaHandle(value) ? value : undefined
   const probePersona = safePersona(hit.persona) ?? safePersona(hyp.viewerPersona) ?? safePersona(hyp.otherPersona)
   if (!probePersona || probePersona === hyp.ownerPersona) return []
   const controlPath = typeof hit.controlPath === 'string' && hit.controlPath.startsWith('/') && hit.controlPath !== path
@@ -1534,7 +1356,7 @@ function synthSensitiveRead(hyp: EngineHypothesis, result: DifferentialResult): 
   const controlStatuses = knownControlStatus && knownControlStatus >= 400 && knownControlStatus < 500
     ? [knownControlStatus]
     : [401, 403]
-  const field = typeof hit.field === 'string' && /^[A-Za-z0-9_.-]{1,64}$/.test(hit.field) ? hit.field : ''
+  const field = isSafeFieldName(hit.field) ? hit.field : ''
   const pattern = typeof hit.secretPattern === 'string' && hit.secretPattern.length > 3 && hit.secretPattern.length < 200
     ? hit.secretPattern
     : GENERIC_CREDENTIAL_PATTERN
@@ -1608,13 +1430,13 @@ function synthSecretDisclosure(hyp: EngineHypothesis, result: DifferentialResult
   // name). A benign page proves the credential is not a site-wide constant while avoiding a 4xx
   // control that the replay verifier would treat as an unstable baseline.
   const controlPath = '/'
-  const secretPersona = typeof hit.persona === 'string' && /^[a-z0-9_-]{1,32}$/.test(hit.persona) ? hit.persona : hyp.ownerPersona
+  const secretPersona = isSafePersonaHandle(hit.persona) ? hit.persona : hyp.ownerPersona
   const field = typeof hit.field === 'string' ? hit.field : ''
   const pattern = typeof hit.pattern === 'string' && hit.pattern.length > 3
     ? hit.pattern
     : typeof hit.secretPattern === 'string' && hit.secretPattern.length > 3 ? hit.secretPattern : ''
   if (!path.startsWith('/')) return []
-  const sensitiveSelector = field && /^[A-Za-z0-9_.-]{1,64}$/.test(field)
+  const sensitiveSelector = field && SAFE_FIELD_NAME_RE.test(field)
     ? `select(.key == ${jqStr(field)})`
     : 'select(.key | test("secret|api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|password|private[_-]?key"; "i"))'
   const rawSelector = `([.steps.%s.json | .. | objects | to_entries[] | ${sensitiveSelector} | select(.value | type == "string") | select((.value | length) > 8) | select((.value | test("^[*…]|\\[redacted\\]"; "i")) | not)] | length)`
@@ -1809,7 +1631,7 @@ function synthCommandInjection(hyp: EngineHypothesis, result: DifferentialResult
 function synthWorkflowStepSkip(hyp: EngineHypothesis, result: DifferentialResult): SynthesizedEngineSpec[] {
   const hit = result.anomalies.find(a => a.type === 'workflow_step_skip')
   if (!hit) return []
-  const safeId = /^[A-Za-z0-9_.:-]{1,128}$/
+  const safeId = SAFE_RESOURCE_ID_RE
   const targetId = typeof hit.targetId === 'string' && safeId.test(hit.targetId) ? hit.targetId : null
   const template = typeof hit.targetTemplate === 'string' && hit.targetTemplate.startsWith('/')
     ? hit.targetTemplate
@@ -1849,7 +1671,7 @@ function finiteNumber(value: unknown): number | null {
 }
 
 function safeFieldName(value: unknown): string | null {
-  return typeof value === 'string' && /^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(value) ? value : null
+  return isSafeIdentifier(value) ? value : null
 }
 
 /**
@@ -1863,7 +1685,7 @@ function synthPriceTrust(hyp: EngineHypothesis, result: DifferentialResult): Syn
   if (!hit) return []
   const path = typeof hit.path === 'string' && hit.path.startsWith('/') ? hit.path.split('?')[0]! : hyp.pathAndQuery.split('?')[0]!
   const idField = safeFieldName(hit.idField)
-  const resourceId = typeof hit.resourceId === 'string' && /^[A-Za-z0-9_.:-]{1,128}$/.test(hit.resourceId) ? hit.resourceId : null
+  const resourceId = typeof hit.resourceId === 'string' && SAFE_RESOURCE_ID_RE.test(hit.resourceId) ? hit.resourceId : null
   const priceField = safeFieldName(hit.priceField)
   const serverPrice = finiteNumber(hit.serverPrice)
   const tamperedPrice = finiteNumber(hit.tamperedPrice)
@@ -2021,7 +1843,7 @@ function synthAuthProtocol(hyp: EngineHypothesis, result: DifferentialResult): S
     if (Object.keys(payload).length === 0) return []
     const declaredAlg = typeof hit.declaredAlg === 'string' && /^[A-Za-z0-9]{2,12}$/.test(hit.declaredAlg) ? hit.declaredAlg : 'HS256'
     const transport = hit.transport === 'body' ? 'body' : 'header'
-    const field = typeof hit.tokenField === 'string' && /^[A-Za-z0-9_.-]{1,64}$/.test(hit.tokenField) ? hit.tokenField : 'token'
+    const field = typeof hit.tokenField === 'string' && SAFE_FIELD_NAME_RE.test(hit.tokenField) ? hit.tokenField : 'token'
     const body = hit.body && typeof hit.body === 'object' && !Array.isArray(hit.body) ? hit.body as Record<string, unknown> : {}
     // Header transport: the verifier mints both tokens from the same claims. The control keeps the
     // server's declared algorithm with an empty (never-issuable) signature; the probe is the unsigned
@@ -2102,7 +1924,7 @@ function synthWebhook(hyp: EngineHypothesis, result: DifferentialResult): Synthe
     ? hit.headerName
     : (hyp.webhookHeader ?? 'x-webhook-signature')
   const proof = typeof hit.proof === 'string' ? hit.proof : 'readback'
-  const stateField = typeof hit.stateField === 'string' && /^[A-Za-z0-9_.-]{1,64}$/.test(hit.stateField)
+  const stateField = typeof hit.stateField === 'string' && SAFE_FIELD_NAME_RE.test(hit.stateField)
     ? hit.stateField : null
   const readPath = typeof hit.readPath === 'string' && hit.readPath.startsWith('/') && !hit.readPath.startsWith('//')
     ? hit.readPath : null

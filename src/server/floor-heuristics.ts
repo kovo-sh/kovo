@@ -8,7 +8,6 @@
  */
 import { randomBytes } from 'node:crypto'
 import type { RoleName } from './oracle-invariants.ts'
-import type { DifferentialResult } from './surface-engine.ts'
 
 // ---------------------------------------------------------------------------------------------
 // Route, action, and identity classification
@@ -29,6 +28,77 @@ export const SENSITIVE_READ_ROUTE_RE =
  */
 export const IDENTITY_ASSUMPTION_ROUTE_RE =
   /(?:^|[/_.-])(?:impersonat\w*|act[-_]?as|sudo|assume[-_]?role|switch[-_]?(?:tenant|org|store|user|account)|sts)(?:$|[/_.-])/i
+
+/** Dynamic path-segment shapes shared by route normalization, readback inference, and replay. */
+export const DYNAMIC_ID_SEGMENT_RE =
+  /(?:\/:[A-Za-z_][A-Za-z0-9_]*|\/\{\{id\}\}|\/\{[A-Za-z0-9_]+\}|\/\[[^\]]+\])/
+export const PLACEHOLDER_SEGMENT_RE = /^(:[A-Za-z0-9_]+|\{[^}]+\}|\[[^\]]+\])$/
+
+export function hasDynamicIdSegment(path: string): boolean {
+  return DYNAMIC_ID_SEGMENT_RE.test(path.split('?')[0])
+}
+
+export function pathHasFileHint(path: string): boolean {
+  return /(?:^|[/_.-])(?:download|downloads|file|files|asset|assets|view|serve|log|logs|journal|journals|billing[-_]?docs?|document|documents|attachment|attachments|backup|backups|archive|archives)(?:$|[/_.-])/i.test(path)
+}
+
+export function pathHasUrlHint(path: string): boolean {
+  return /(?:^|[/_.-])(?:avatar|avatars|image|images|photo|photos|logo|logos|media|thumbnail|webhook|webhooks|hook|hooks|callback|callbacks|integration|integrations|connector|connectors|proxy|proxies|fetch|remote|link|links|manifest|manifests)(?:$|[/_.-])/i.test(path)
+}
+
+export function pathHasXmlHint(path: string): boolean {
+  return /(?:^|[/_.-])(?:xml|import|imports|soap|saml|sso|svg|rss|wsdl|manifest|manifests|feed|feeds|upload|uploads|parse|backup|backups|archive|archives)(?:$|[/_.-])/i.test(path)
+}
+
+export function pathHasTemplateHint(path: string): boolean {
+  return /(?:^|[/_.-])(?:render|preview|template|templates|layout|layouts|report|reports|docs?|pages?|email|emails|snippet|snippets)(?:$|[/_.-])/i.test(path)
+}
+
+/**
+ * Search-surface vocabulary. Membership is tested against whole path segments and whole tokens
+ * within a segment (split on `-`, `_`, `.`), never as a substring of a longer word. `catalog` is a
+ * listing noun, not a search surface and deliberately absent: derived `catalog*` routes must not
+ * spend the SQL-injection quota without evidence that they read a query.
+ */
+const SEARCH_HINT_TOKENS: ReadonlySet<string> = new Set([
+  'search', 'searches', 'lookup', 'find', 'filter', 'query', 'queries', 'browse',
+])
+
+function pathSegmentsOf(path: string): string[] {
+  return (path.split('?')[0] || '/').split('/').filter(Boolean)
+}
+
+/** Match a resource noun or its simple plural against whole path segments, never a substring. */
+export function pathHasNounSegment(path: string, noun: string, lastOnly = false): boolean {
+  const segments = pathSegmentsOf(path)
+  const candidates = lastOnly ? segments.slice(-1) : segments
+  const lower = noun.toLowerCase()
+  return candidates.some(segment => {
+    const value = segment.toLowerCase()
+    return value === lower || value === `${lower}s`
+  })
+}
+
+function segmentTokens(segment: string): string[] {
+  return segment.toLowerCase().split(/[-_.]+/).filter(Boolean)
+}
+
+export function pathHasSearchHint(path: string): boolean {
+  return pathSegmentsOf(path).some(segment => segmentTokens(segment).some(token => SEARCH_HINT_TOKENS.has(token)))
+}
+
+/** A route whose shape says it runs an operator-supplied host/command probe. */
+export function pathHasCommandHint(path: string): boolean {
+  return /(?:^|[/_.-])(?:diag|diagnostics?|exec|execute|command|cmd|shell|ping|nslookup|lookup|resolve|whois|healthcheck|system)(?:$|[/_.-])/i.test(path)
+}
+
+export function pathHasPrivilegedHint(path: string): boolean {
+  return PRIVILEGED_ACTION_RE.test(path)
+}
+
+export function pathHasRedirectHint(path: string): boolean {
+  return /(?:^|[/_.-])(?:redirect|return|callback|continue|resume|sso|oauth|authorize|checkout|download|export|next)(?:$|[/_.-])/i.test(path)
+}
 
 /** Field names that select or change identity/scope rather than describing record content. */
 export function isIdentityAssignmentField(field: string): boolean {
@@ -317,26 +387,4 @@ export function isAuthzMatrixHitAdmissible(
     if (sameBody || similar) return false
   }
   return true
-}
-
-/** True when an `authz_matrix` differential result contains at least one admissible object/function hit. */
-export function hasAdmissibleAuthzHit(
-  hyp: { method: string; functionLevel?: boolean; ownerPersona?: string; otherPersona?: string; reservedVictimId?: string; endpoint: { pathTemplate: string } },
-  result: DifferentialResult,
-): boolean {
-  if (!hyp.ownerPersona || !hyp.otherPersona) return false
-  const matrix = Array.isArray(result.details.matrix) ? result.details.matrix as AuthzMatrixRow[] : null
-  const privilegedRoute = PRIVILEGED_ACTION_RE.test(hyp.endpoint.pathTemplate)
-  for (const hit of result.anomalies) {
-    if (hit.type !== 'unauthorized_access') continue
-    const method = String(hit.method ?? 'GET')
-    if (!['GET', 'POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) continue
-    const mutating = method !== 'GET'
-    const functionLevel = hit.functionLevel === true || hyp.functionLevel === true
-    const useReservedVictim = Boolean(hyp.reservedVictimId) && method === 'DELETE' && privilegedRoute && !functionLevel
-    const id = useReservedVictim ? hyp.reservedVictimId! : String(hit.resourceId ?? '')
-    if (!functionLevel && !SAFE_RESOURCE_ID_RE.test(id)) continue
-    if (isAuthzMatrixHitAdmissible(matrix, hit, { mutating, functionLevel })) return true
-  }
-  return false
 }
