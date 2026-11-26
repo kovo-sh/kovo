@@ -72,6 +72,9 @@ function stripPrefixForRole(raw: string, role: 'old' | 'new'): string {
  * Throws `UnifiedDiffError` with an `Unsafe ... escapes ...` message on traversal or invalid paths.
  */
 export function validateDiffPath(rawPath: string, role: 'old' | 'new'): string {
+  if (/[\x00-\x08\x0a-\x1f\x7f]/.test(rawPath)) {
+    throw new UnifiedDiffError(`Unsafe diff path contains control characters: "${rawPath}"`)
+  }
   const trimmed = rawPath.split('\t')[0]?.trim() ?? ''
   if (!trimmed) {
     throw new UnifiedDiffError(`Unsafe diff path: empty ${role} file header path.`)
@@ -85,6 +88,9 @@ export function validateDiffPath(rawPath: string, role: 'old' | 'new'): string {
   if (/[\x00-\x1f\x7f]/.test(trimmed)) {
     throw new UnifiedDiffError(`Unsafe diff path contains control characters: "${trimmed}"`)
   }
+  if (trimmed.startsWith('-')) {
+    throw new UnifiedDiffError(`Unsafe diff path starts with "-" (option injection rejected): "${trimmed}"`)
+  }
   if (trimmed.includes('\\') || /^[A-Za-z]:/.test(trimmed)) {
     throw new UnifiedDiffError(`Unsafe diff path escapes repository root (non-POSIX separator or drive): "${trimmed}"`)
   }
@@ -92,6 +98,9 @@ export function validateDiffPath(rawPath: string, role: 'old' | 'new'): string {
   const stripped = stripPrefixForRole(trimmed, role)
   if (!stripped || stripped.startsWith('/') || stripped.endsWith('/')) {
     throw new UnifiedDiffError(`Unsafe diff path escapes repository root: "${trimmed}"`)
+  }
+  if (stripped.startsWith('-')) {
+    throw new UnifiedDiffError(`Unsafe diff path starts with "-" (option injection rejected): "${trimmed}"`)
   }
 
   const segments = stripped.split('/')
@@ -115,8 +124,11 @@ function isNextFileOrSectionHeader(line: string | undefined): boolean {
     || line.startsWith('new file mode ')
     || line.startsWith('deleted file mode ')
     || line.startsWith('similarity index ')
+    || line.startsWith('dissimilarity index ')
     || line.startsWith('rename from ')
     || line.startsWith('rename to ')
+    || line.startsWith('copy from ')
+    || line.startsWith('copy to ')
   )
 }
 
@@ -155,16 +167,24 @@ export function parseUnifiedDiff(diffText: string, options: ParseUnifiedDiffOpti
       const role = line.startsWith('rename from ') ? 'old' : 'new'
       const rawRenamePath = line.slice(line.indexOf(' ', 7) + 1)
       validateDiffPath(rawRenamePath, role)
-      i += 1
-      continue
+      throw new UnifiedDiffError(`File renames are unsupported in unified diff patches: "${line}"`)
+    }
+    if (line.startsWith('copy from ') || line.startsWith('copy to ')) {
+      const role = line.startsWith('copy from ') ? 'old' : 'new'
+      const rawCopyPath = line.slice(line.indexOf(' ', 5) + 1)
+      validateDiffPath(rawCopyPath, role)
+      throw new UnifiedDiffError(`File copies are unsupported in unified diff patches: "${line}"`)
     }
     if (line.startsWith('diff --git ')) {
       const m = GIT_DIFF_HEADER_RE.exec(line)
       if (!m) {
         throw new UnifiedDiffError(`Malformed diff --git header: "${line}"`)
       }
-      validateDiffPath(m[1]!, 'old')
-      validateDiffPath(m[2]!, 'new')
+      const oldDiffPath = validateDiffPath(m[1]!, 'old')
+      const newDiffPath = validateDiffPath(m[2]!, 'new')
+      if (oldDiffPath !== newDiffPath) {
+        throw new UnifiedDiffError(`File renames/copies are unsupported in diff --git header: ${oldDiffPath} -> ${newDiffPath}`)
+      }
       i += 1
       continue
     }
@@ -188,7 +208,7 @@ export function parseUnifiedDiff(diffText: string, options: ParseUnifiedDiffOpti
         throw new UnifiedDiffError('Malformed diff: both old and new file paths cannot be /dev/null.')
       }
       if (!isCreate && !isDelete && normOld !== normNew) {
-        // Allow rename diffs only when both sides already passed strict relative path validation.
+        throw new UnifiedDiffError(`File renames/copies across different paths (${normOld} -> ${normNew}) are unsupported in unified diff patches.`)
       }
       const normalizedPath = isDelete ? normOld : normNew
       i += 2
@@ -293,9 +313,8 @@ export function parseUnifiedDiff(diffText: string, options: ParseUnifiedDiffOpti
             contentLine === ''
             && seenOld < oldCount
             && seenNew < newCount
-            && !isNextFileOrSectionHeader(rawLines[i + 1])
           ) {
-            // Blank context line whose trailing space was stripped by an editor.
+            // Blank context line whose trailing space was stripped by an editor (including at EOF or section boundary).
             seenOld += 1
             seenNew += 1
             hunkLines.push(' ')
@@ -374,7 +393,7 @@ export function parseUnifiedDiff(diffText: string, options: ParseUnifiedDiffOpti
       throw new UnifiedDiffError(`Malformed diff: unexpected +++ header without preceding ---: "${line}"`)
     }
 
-    i += 1
+    throw new UnifiedDiffError(`Unexpected line outside diff hunk: "${line.slice(0, 80)}"`)
   }
 
   if (patches.length === 0 && !options.allowEmpty) {

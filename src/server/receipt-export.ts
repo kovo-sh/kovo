@@ -91,7 +91,7 @@ export interface PortableReceiptRecord {
   proofKind: string | null
   proofRuntime: string | null
   proofScriptSha256: string | null
-  receipt: ProofReceipt
+  receipt: ProofReceipt | null
   verification: {
     confirmed: boolean
     vulnClass: string
@@ -347,6 +347,9 @@ function resolveDefaultSigningOptions(storage: Store): ReceiptBundleSignOptions 
   if (fromEnv.length >= 16) {
     if (fromEnv.startsWith('-----BEGIN ')) {
       const privateKey = createPrivateKey(fromEnv)
+      if (privateKey.asymmetricKeyType !== 'ed25519') {
+        throw new Error('KOVO_RECEIPT_SIGNING_KEY PEM must be an Ed25519 private key.')
+      }
       const publicKey = createPublicKey(privateKey)
       return { algorithm: 'ed25519', privateKey, keyId: ed25519KeyId(publicKey) }
     }
@@ -594,7 +597,7 @@ export function buildPortableCompositeReceiptRecord(
     cwe: input.cwe ?? null,
     terminalVulnClass: receipt.terminalVulnClass,
     replayMode: receipt.replayMode,
-    confirmed: input.verification?.confirmed ?? true,
+    confirmed: input.verification?.confirmed ?? false,
     modeBVerified: input.verification?.modeBVerified ?? (receipt.replayMode === 'one_shot_transcript'),
     verificationReason: input.verification?.reason ? scrubText(input.verification.reason, secrets, zdr) : null,
     hopCount: hops.length,
@@ -678,8 +681,15 @@ export function extractStoreCompositeReceipts(
   return extracted
 }
 
-function payloadSigningBytes(payload: ProofReceiptExportPayload, payloadSha256: string): Buffer {
-  return Buffer.from(`kovo.receipt-bundle.v1\n${payloadSha256}\n${canonicalJson(payload)}`, 'utf8')
+function payloadSigningBytes(
+  payload: ProofReceiptExportPayload,
+  payloadSha256: string,
+  envelope: { algorithm: ReceiptBundleAlgorithm; keyId?: string | null },
+): Buffer {
+  return Buffer.from(
+    `kovo.receipt-bundle.v2\n${envelope.algorithm}\n${envelope.keyId ?? ''}\n${payloadSha256}\n${canonicalJson(payload)}`,
+    'utf8',
+  )
 }
 
 /**
@@ -738,7 +748,7 @@ export function exportRunReceiptBundle(
       ? persistedReceipt.receipt.exchangeIds
       : (f.exchangeIds ?? [])
 
-    const receipt: ProofReceipt = persistedReceipt
+    const receipt: ProofReceipt | null = persistedReceipt
       ? {
           vulnClass: persistedReceipt.receipt.vulnClass,
           target: {
@@ -759,14 +769,7 @@ export function exportRunReceiptBundle(
             ? { expectControlDenied: persistedReceipt.receipt.expectControlDenied }
             : {}),
         }
-      : {
-          vulnClass: f.category || 'unknown',
-          target: { origin: f.origin },
-          exchangeIds: [...rawExchangeIds],
-          oobEventIds: [],
-          browserTraceIds: [],
-          claimedDelta: scrubText(f.reason || f.title, secrets, zdr),
-        }
+      : null
 
     const verification = persistedReceipt
       ? {
@@ -778,9 +781,9 @@ export function exportRunReceiptBundle(
           expected: scrubText(persistedReceipt.verification.expected, secrets, zdr),
         }
       : {
-          confirmed: f.status === 'confirmed',
-          vulnClass: receipt.vulnClass,
-          rule: 'replay',
+          confirmed: false,
+          vulnClass: f.category || 'unknown',
+          rule: 'legacy_unreceipted',
           reason: scrubText(f.verification ?? f.reason, secrets, zdr),
           observed: scrubText(f.check?.observed ?? f.reason, secrets, zdr),
           expected: scrubText(f.check?.expected ?? 'denied or safe control behavior', secrets, zdr),
@@ -844,8 +847,8 @@ export function exportRunReceiptBundle(
       verification,
       transcriptSlices,
       reproducer: {
-        vulnClass: receipt.vulnClass,
-        targetOrigin: receipt.target.origin,
+        vulnClass: receipt?.vulnClass ?? (f.category || 'unknown'),
+        targetOrigin: receipt?.target.origin ?? f.origin,
         steps: reproSteps,
         commandHint: buildCommandHint(reproSteps),
       },
@@ -885,7 +888,10 @@ export function exportRunReceiptBundle(
   }
   const payloadSha256 = sha256Hex(canonicalJson(payload))
   const signing: ReceiptBundleSignOptions = options.signing ?? resolveDefaultSigningOptions(storage)
-  const bytes = payloadSigningBytes(payload, payloadSha256)
+  const bytes = payloadSigningBytes(payload, payloadSha256, {
+    algorithm: signing.algorithm,
+    keyId: signing.keyId ?? null,
+  })
   const signature = signing.algorithm === 'hmac-sha256'
     ? createHmac('sha256', signing.secret).update(bytes).digest('base64url')
     : cryptoSign(null, bytes, signing.privateKey).toString('base64url')
@@ -936,9 +942,21 @@ export function verifyProofReceiptBundle(
     !Array.isArray(candidate.payload.records) ||
     typeof candidate.payloadSha256 !== 'string' ||
     typeof candidate.signature !== 'string' ||
+    (candidate.keyId !== undefined && typeof candidate.keyId !== 'string') ||
     (candidate.algorithm !== 'hmac-sha256' && candidate.algorithm !== 'ed25519')
   ) {
     return { valid: false, reason: 'Receipt bundle is malformed.', verifiedRecords: 0 }
+  }
+  if (
+    typeof candidate.payload.receiptCount !== 'number'
+    || !Number.isInteger(candidate.payload.receiptCount)
+    || candidate.payload.receiptCount !== candidate.payload.records.length
+  ) {
+    return {
+      valid: false,
+      reason: `Bundle receiptCount (${String(candidate.payload.receiptCount)}) does not match records.length (${candidate.payload.records.length}).`,
+      verifiedRecords: 0,
+    }
   }
   if (options.algorithm && candidate.algorithm !== options.algorithm) {
     return { valid: false, reason: `Bundle algorithm "${candidate.algorithm}" does not match expected "${options.algorithm}".`, verifiedRecords: 0 }
@@ -983,7 +1001,10 @@ export function verifyProofReceiptBundle(
   if (providedSig.length === 0) {
     return { valid: false, reason: 'Bundle signature is empty.', verifiedRecords: 0 }
   }
-  const bytes = payloadSigningBytes(candidate.payload, candidate.payloadSha256)
+  const bytes = payloadSigningBytes(candidate.payload, candidate.payloadSha256, {
+    algorithm: candidate.algorithm,
+    keyId: candidate.keyId ?? null,
+  })
   if (candidate.algorithm === 'hmac-sha256') {
     if (!options.secret) {
       return { valid: false, reason: 'HMAC secret is required to verify receipt bundle.', verifiedRecords: 0 }

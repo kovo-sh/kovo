@@ -367,6 +367,103 @@ function normalizeRepoRelPath(file: string): string {
   return file.replace(/^\/+/, '').replace(/\\/g, '/').replace(/^[ab]\//, '')
 }
 
+function isFixAfterInChangedHunks(
+  parsedPatches: ReturnType<typeof parseUnifiedDiff>,
+  primaryRelFile: string,
+  normOrig: string,
+  normPatched: string,
+  normFixBefore: string,
+  normFixAfter: string,
+): boolean {
+  const matchingPatches = parsedPatches.filter(
+    fp => normalizeRepoRelPath(fp.normalizedPath) === primaryRelFile,
+  )
+  if (!matchingPatches.length) return false
+  if (normFixAfter.trim() === '') {
+    const removedLines = matchingPatches.flatMap(fp =>
+      fp.hunks.flatMap(h => h.entries.filter(e => e.kind === 'remove').map(e => e.text)),
+    )
+    const beforeNonEmpty = normFixBefore.replace(/\n$/, '').split('\n').filter(l => l.trim() !== '')
+    const removedMatches = beforeNonEmpty.length === 0
+      ? removedLines.length > 0
+      : beforeNonEmpty.every(line => removedLines.some(r => r.includes(line) || line.includes(r)))
+    return removedMatches && !normPatched.includes(normFixBefore)
+  }
+
+  const targetAfter = normFixAfter.replace(/\n$/, '')
+  const targetLines = targetAfter.split('\n').filter(l => l.trim() !== '')
+  const beforeSet = new Set(normFixBefore.replace(/\n$/, '').split('\n'))
+  const changedAfterLines = targetLines.filter(l => !beforeSet.has(l))
+  const requiredAddedLines = changedAfterLines.length > 0 ? changedAfterLines : targetLines
+
+  for (const fp of matchingPatches) {
+    for (const hunk of fp.hunks) {
+      const addedBlock = hunk.entries.filter(e => e.kind === 'add').map(e => e.text).join('\n')
+      if (addedBlock.includes(targetAfter)) return true
+      const hunkNewBlock = hunk.entries
+        .filter(e => e.kind === 'add' || e.kind === 'context')
+        .map(e => e.text)
+        .join('\n')
+      if (!hunkNewBlock.includes(targetAfter)) continue
+      const addedLines = hunk.entries.filter(e => e.kind === 'add').map(e => e.text)
+      if (requiredAddedLines.length > 0 && requiredAddedLines.every(line => addedLines.some(a => a === line || a.includes(line)))) {
+        return true
+      }
+    }
+  }
+  void normOrig
+  return false
+}
+
+const PATCH_SYNTAX_CHECK_SCRIPT = [
+  "import { execFileSync } from 'node:child_process'",
+  "import { copyFileSync, cpSync, mkdirSync, readFileSync, rmSync } from 'node:fs'",
+  "import { dirname, join, resolve } from 'node:path'",
+  "const manifest = JSON.parse(readFileSync('/evidence/patch_syntax_manifest.json', 'utf8'))",
+  "const reposRoot = resolve('/repos')",
+  "const repoSrc = resolve(reposRoot, manifest.repo)",
+  "if (!repoSrc.startsWith(reposRoot + '/')) throw new Error('Invalid repo path')",
+  "const workRepo = resolve('/tmp/work-repo')",
+  "mkdirSync(workRepo, { recursive: true })",
+  "cpSync(repoSrc, workRepo, { recursive: true })",
+  "for (const rel of manifest.deletedFiles ?? []) {",
+  "  const target = resolve(workRepo, rel)",
+  "  if (!target.startsWith(workRepo + '/')) throw new Error('Invalid deleted file path')",
+  "  rmSync(target, { force: true })",
+  "}",
+  "for (const entry of manifest.files ?? []) {",
+  "  const target = resolve(workRepo, entry.origName)",
+  "  if (!target.startsWith(workRepo + '/')) throw new Error('Invalid modified file path')",
+  "  mkdirSync(dirname(target), { recursive: true })",
+  "  copyFileSync(join('/evidence', entry.stagedName), target)",
+  "}",
+  "const runBin = (bin, args, optional = false) => {",
+  "  try {",
+  "    const out = execFileSync(bin, args, { cwd: workRepo, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })",
+  "    if (out) process.stdout.write(out)",
+  "  } catch (err) {",
+  "    if (optional && err && err.code === 'ENOENT') { console.log(`${bin} toolchain unavailable (skipped)`); return }",
+  "    if (err && err.stdout) process.stdout.write(String(err.stdout))",
+  "    if (err && err.stderr) process.stderr.write(String(err.stderr))",
+  "    process.exit(typeof err?.status === 'number' && err.status !== 0 ? err.status : 1)",
+  "  }",
+  "}",
+  "let ranCheck = false",
+  "for (const entry of manifest.files ?? []) {",
+  "  const origName = entry.origName",
+  "  const staged = join('/evidence', entry.stagedName)",
+  "  if (/\\.(?:[cm]?js)$/i.test(origName)) { ranCheck = true; runBin(process.execPath, ['--check', staged]) }",
+  "  else if (/\\.py$/i.test(origName)) { ranCheck = true; runBin('python3', ['-m', 'py_compile', staged]) }",
+  "  else if (/\\.go$/i.test(origName)) { ranCheck = true; runBin('go', ['vet', './' + origName], true) }",
+  "  else if (/\\.(?:java|kt)$/i.test(origName)) { ranCheck = true; mkdirSync('/tmp/kovo-javac', { recursive: true }); runBin('javac', ['-proc:none', '-d', '/tmp/kovo-javac', staged], true) }",
+  "}",
+  "if ((manifest.files ?? []).some(e => /\\.(?:[cm]?ts|tsx)$/i.test(e.origName)) && manifest.hasTsconfig) {",
+  "  ranCheck = true",
+  "  runBin('tsc', ['--noEmit', '--skipLibCheck', '-p', join(workRepo, 'tsconfig.json')], true)",
+  "}",
+  "if (!ranCheck) console.log('syntax-ok')",
+].join('\n') + '\n'
+
 export async function verifyPatchApplicability(params: {
   repoRoot: string
   repo: string
@@ -424,23 +521,38 @@ export async function verifyPatchApplicability(params: {
     copyRepoTreeWithoutSymlinks(repoRoot, workDir)
     const { filesModified } = applyUnifiedDiffToDirectory(workDir, diff)
 
+    const deletedPaths = new Set(
+      parsedPatches.filter(fp => fp.isDelete).map(fp => normalizeRepoRelPath(fp.normalizedPath)),
+    )
+    const survivingFiles = filesModified.filter(f => !deletedPaths.has(normalizeRepoRelPath(f)))
+
     const normalizedModified = new Set(filesModified.map(normalizeRepoRelPath))
     const citedFileModified = primaryRelFile ? normalizedModified.has(primaryRelFile) : filesModified.length > 0
     let fixAppliedToCitedFile = false
     if (primaryRelFile && citedFileModified) {
-      const patchedCitedContent = safeReadRepoFile(workDir, primaryRelFile)
-      if (patchedCitedContent !== null && originalCitedContent !== null) {
-        const normOrig = originalCitedContent.replace(/\r\n/g, '\n')
-        const normPatched = patchedCitedContent.replace(/\r\n/g, '\n')
-        const changed = normPatched !== normOrig
-        if (changed) {
-          if (fixAfter !== undefined) {
-            const normFixAfter = fixAfter.replace(/\r\n/g, '\n')
-            fixAppliedToCitedFile = normFixAfter.trim() === ''
-              ? !normPatched.includes(fixBefore.replace(/\r\n/g, '\n'))
-              : normPatched.includes(normFixAfter)
-          } else {
-            fixAppliedToCitedFile = true
+      if (deletedPaths.has(primaryRelFile)) {
+        fixAppliedToCitedFile = fixAfter !== undefined && fixAfter.trim() === ''
+      } else {
+        const patchedCitedContent = safeReadRepoFile(workDir, primaryRelFile)
+        if (patchedCitedContent !== null && originalCitedContent !== null) {
+          const normOrig = originalCitedContent.replace(/\r\n/g, '\n')
+          const normPatched = patchedCitedContent.replace(/\r\n/g, '\n')
+          const changed = normPatched !== normOrig
+          if (changed) {
+            if (fixAfter !== undefined) {
+              const normFixAfter = fixAfter.replace(/\r\n/g, '\n')
+              const normFixBefore = fixBefore.replace(/\r\n/g, '\n')
+              fixAppliedToCitedFile = isFixAfterInChangedHunks(
+                parsedPatches,
+                primaryRelFile,
+                normOrig,
+                normPatched,
+                normFixBefore,
+                normFixAfter,
+              )
+            } else {
+              fixAppliedToCitedFile = true
+            }
           }
         }
       }
@@ -449,51 +561,57 @@ export async function verifyPatchApplicability(params: {
     }
 
     // Run offline syntax check inside air-gapped --network none worker container if backend provided,
-    // or local Node syntax check on modified JS/TS/MJS/CJS files as fallback.
+    // or local Node syntax check on surviving modified JS/TS/MJS/CJS files as fallback.
     let syntaxCheck: PatchSyntaxCheckResult = { ran: false, passed: true }
 
-    const jsLike = filesModified.filter(f => /\.(?:[cm]?js|[cm]?ts|jsx|tsx)$/i.test(f))
-    const pyLike = filesModified.filter(f => /\.py$/i.test(f))
+    const jsLike = survivingFiles.filter(f => /\.(?:[cm]?js|[cm]?ts|jsx|tsx)$/i.test(f))
+    const pyLike = survivingFiles.filter(f => /\.py$/i.test(f))
 
     if (backend) {
       try {
         const assignmentId = randomUUID()
         const safeRepo = repo.replace(/^\/+|\/+$/g, '')
-        const scriptFiles = filesModified.map(f => ({
-          name: `patched_${filesModified.indexOf(f)}${extname(f) || '.txt'}`,
-          content: readFileSync(join(workDir, f), 'utf8'),
+        if (!safeRepo || safeRepo.startsWith('-') || safeRepo.includes('..') || /[\x00-\x1f\x7f\\]/.test(safeRepo)) {
+          throw new Error(`Unsafe repository name for syntax check: ${repo}`)
+        }
+        const manifestEntries = survivingFiles.map((f, idx) => ({
+          origName: f,
+          stagedName: `patched_${idx}${extname(f) || '.txt'}`,
         }))
-        const checks: string[] = []
-        for (let idx = 0; idx < filesModified.length; idx++) {
-          const origName = filesModified[idx]
-          const staged = `/evidence/patched_${idx}${extname(origName) || '.txt'}`
-          if (/\.(?:[cm]?js)$/i.test(origName)) {
-            checks.push(`node --check "${staged}"`)
-          } else if (/\.py$/i.test(origName)) {
-            checks.push(`python3 -m py_compile "${staged}"`)
-          } else if (/\.go$/i.test(origName)) {
-            checks.push(`if command -v go >/dev/null 2>&1; then go vet "./${origName}" || exit 1; else echo "go toolchain unavailable (skipped)"; fi`)
-          } else if (/\.(?:java|kt)$/i.test(origName)) {
-            checks.push(`if command -v javac >/dev/null 2>&1; then javac -proc:none -d /tmp/kovo-javac "${staged}" || exit 1; else echo "javac unavailable (skipped)"; fi`)
-          }
+        const scriptFiles = [
+          ...survivingFiles.map((f, idx) => ({
+            name: `patched_${idx}${extname(f) || '.txt'}`,
+            content: readFileSync(join(workDir, f), 'utf8'),
+          })),
+          {
+            name: 'patch_syntax_manifest.json',
+            content: JSON.stringify({
+              repo: safeRepo,
+              files: manifestEntries,
+              deletedFiles: [...deletedPaths],
+              hasTsconfig: existsSync(join(workDir, 'tsconfig.json')),
+            }),
+          },
+          {
+            name: 'patch_syntax_check.mjs',
+            content: PATCH_SYNTAX_CHECK_SCRIPT,
+          },
+        ]
+        const checkDescriptions = survivingFiles.flatMap((origName) => {
+          if (/\.(?:[cm]?js)$/i.test(origName)) return [`node --check ${origName}`]
+          if (/\.py$/i.test(origName)) return [`py_compile ${origName}`]
+          if (/\.go$/i.test(origName)) return [`go vet ${origName}`]
+          if (/\.(?:java|kt)$/i.test(origName)) return [`javac ${origName}`]
+          return []
+        })
+        if (survivingFiles.some(f => /\.(?:[cm]?ts|tsx)$/i.test(f)) && existsSync(join(workDir, 'tsconfig.json'))) {
+          checkDescriptions.push('tsc --noEmit')
         }
-        // Language-appropriate project typecheck/build when a toolchain exists in the image.
-        if (filesModified.some(f => /\.(?:[cm]?ts|tsx)$/i.test(f)) && existsSync(join(workDir, 'tsconfig.json'))) {
-          checks.push('if command -v tsc >/dev/null 2>&1; then tsc --noEmit --skipLibCheck -p /tmp/work-repo/tsconfig.json || exit 1; else echo "tsc unavailable (AST syntax check already passed)"; fi')
-        }
-        // Copy /repos/<repo> into container's /tmp/work-repo (read-only /repos invariant preserved!)
-        const copyPatched = filesModified.map((origName, idx) =>
-          `mkdir -p "$(dirname "/tmp/work-repo/${origName}")" && cp "/evidence/patched_${idx}${extname(origName) || '.txt'}" "/tmp/work-repo/${origName}"`)
-        const cmd = [
-          `mkdir -p /tmp/work-repo && cp -R "/repos/${safeRepo}/." /tmp/work-repo/`,
-          ...copyPatched,
-          ...(checks.length ? checks : ['echo "syntax-ok"']),
-        ].join(' && ')
         const res = await backend.run(
           {
             assignmentId,
             files: scriptFiles,
-            command: cmd,
+            command: 'node /evidence/patch_syntax_check.mjs',
             outputs: [],
             timeoutMs: 30_000,
           },
@@ -502,7 +620,7 @@ export async function verifyPatchApplicability(params: {
         )
         syntaxCheck = {
           ran: true,
-          command: checks.length ? checks.join(' && ') : 'air-gapped tmpfs copy check',
+          command: checkDescriptions.length ? checkDescriptions.join(' && ') : 'air-gapped tmpfs copy check',
           passed: res.exitCode === 0,
           output: (res.stdout + '\n' + res.stderr).trim().slice(0, 2000),
         }
@@ -514,7 +632,7 @@ export async function verifyPatchApplicability(params: {
       syntaxCheck = await runLocalOfflineSyntaxCheck(workDir, jsLike, pyLike)
     }
 
-    const staticAst = verifyStaticAstPostPatch(workDir, filesModified)
+    const staticAst = verifyStaticAstPostPatch(workDir, survivingFiles)
     if (!staticAst.ok) {
       syntaxCheck = {
         ...syntaxCheck,
@@ -1362,14 +1480,32 @@ async function withGate6RunLock<T>(runId: string, fn: () => Promise<T>): Promise
   }
 }
 
+function invertUnifiedDiff(diffText: string): string {
+  const patches = parseUnifiedDiff(diffText)
+  const out: string[] = []
+  for (const patch of patches) {
+    const invOldHeader = patch.isDelete ? '/dev/null' : `a/${patch.normalizedPath}`
+    const invNewHeader = patch.isCreate ? '/dev/null' : `b/${patch.normalizedPath}`
+    out.push(`--- ${invOldHeader}`, `+++ ${invNewHeader}`)
+    for (const hunk of patch.hunks) {
+      const ctx = hunk.headerContext ? ` ${hunk.headerContext}` : ''
+      out.push(`@@ -${hunk.newStart},${hunk.newCount} +${hunk.oldStart},${hunk.oldCount} @@${ctx}`)
+      for (const entry of hunk.entries) {
+        if (entry.kind === 'context') out.push(` ${entry.text}`)
+        else if (entry.kind === 'add') out.push(`-${entry.text}`)
+        else out.push(`+${entry.text}`)
+      }
+    }
+  }
+  return out.join('\n') + '\n'
+}
+
 function restoreWorkspaceSnapshot(targetDir: string, backupDir: string): void {
   if (!existsSync(targetDir) || !existsSync(backupDir)) return
   for (const entry of readdirSync(targetDir)) {
     rmSync(join(targetDir, entry), { recursive: true, force: true })
   }
-  for (const entry of readdirSync(backupDir)) {
-    cpSync(join(backupDir, entry), join(targetDir, entry), { recursive: true })
-  }
+  copyRepoTreeWithoutSymlinks(backupDir, targetDir)
 }
 
 export async function generateAndReviewPatch(params: PatchWorkflowParams): Promise<PatchProposalResult> {
@@ -1409,19 +1545,21 @@ export async function generateAndReviewPatch(params: PatchWorkflowParams): Promi
       const sanitizedRepoDir = lr.sanitizedRepoDir ?? activeRunState?.handle?.sanitizedRepoDir
       let scratchDir: string | null = null
       let backupDir: string | null = null
+      let rebuildSucceeded = false
       try {
         if (sanitizedRepoDir && existsSync(sanitizedRepoDir)) {
           // 1. Validate the candidate diff in an isolated temporary copy before touching the live lab dir.
           scratchDir = mkdtempSync(join(tmpdir(), 'kovo-patch-gate6-work-'))
-          cpSync(sanitizedRepoDir, scratchDir, { recursive: true })
+          copyRepoTreeWithoutSymlinks(sanitizedRepoDir, scratchDir)
           applyUnifiedDiffToDirectory(scratchDir, authorOutput.diff)
 
           // 2. Capture a clean pre-retest snapshot for guaranteed rollback in `finally`.
           backupDir = mkdtempSync(join(tmpdir(), 'kovo-patch-gate6-backup-'))
-          cpSync(sanitizedRepoDir, backupDir, { recursive: true })
+          copyRepoTreeWithoutSymlinks(sanitizedRepoDir, backupDir)
         }
 
         await lr.labRunner.rebuildWithPatch(lr.runId, authorOutput.diff, params.signal)
+        rebuildSucceeded = true
         const retest = await retestReplaySpec({
           spec: lr.replaySpec,
           broker: lr.broker,
@@ -1433,6 +1571,7 @@ export async function generateAndReviewPatch(params: PatchWorkflowParams): Promi
           storage: lr.storage,
           runId: lr.runId,
           assignmentId: lr.assignmentId,
+          envelopeTrust: 'host_persisted',
         })
 
         let baselineStatus: number | null = null
@@ -1479,6 +1618,12 @@ export async function generateAndReviewPatch(params: PatchWorkflowParams): Promi
         gates[5] = { gate: 6, name: 'dynamic_retest', passed: false, detail: dynamicRetestSummary }
         finalStatus = 'withheld'
       } finally {
+        if (rebuildSucceeded) {
+          try {
+            const reverseDiff = invertUnifiedDiff(authorOutput.diff)
+            await lr.labRunner.rebuildWithPatch(lr.runId, reverseDiff, AbortSignal.timeout(30_000))
+          } catch { /* rollback rebuild is best-effort; filesystem snapshot restore runs next */ }
+        }
         if (sanitizedRepoDir && backupDir) {
           try {
             restoreWorkspaceSnapshot(sanitizedRepoDir, backupDir)
