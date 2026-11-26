@@ -25,9 +25,13 @@ import {
   REGISTERED_V8_FAMILIES,
   canonicalCweForOracle,
   createOracleSpecRegistry,
+  getRegisteredClaimEvaluatorSpecs,
+  isSignedUrlMintLabel,
   labelToOracle,
   listRegisteredClaimEvaluatorKinds,
   registerOracle,
+  registerOracleClaimEvaluator,
+  resolveBoundaryClassForLabel,
   resolveDescriptorImpactClass,
   validateOracleSpec,
   type OracleClaimKind,
@@ -204,7 +208,64 @@ test('R3-13 admission gate: registerOracle() rejects incomplete, duplicate, unbo
         makeValidSpec({ id: 'test:impact_no_class', singleHopRule: 'impact', impactClass: undefined }),
         reg,
       ),
-    /requires an impactClass/i,
+    /requires a valid impactClass/i,
+  )
+
+  // Empty/whitespace labelPrefixes rejected (Advisory B).
+  assert.throws(
+    () => registerOracle(makeValidSpec({ id: 'test:empty_prefix', labels: ['pref_a'], labelPrefixes: [''] }), reg),
+    /labelPrefix/i,
+  )
+
+  // Bare CWE token as a label rejected (Blocking 1 / Advisory B).
+  assert.throws(
+    () => registerOracle(makeValidSpec({ id: 'test:cwe_label', labels: ['cwe-89'] }), reg),
+    /non-CWE/i,
+  )
+
+  // v8_family with non-v8_* terminalContract rejected (Advisory B).
+  assert.throws(
+    () =>
+      registerOracle(
+        makeValidSpec({
+          id: 'test:v8_bad_contract',
+          kind: 'v8_family',
+          singleHopRule: undefined,
+          v8Family: 'dual_tenant_abac',
+          labels: ['v8_bad_contract'],
+          terminalContract: 'access_control',
+        }),
+        reg,
+      ),
+    /v8_\* terminalContract/i,
+  )
+
+  // Shared label with disagreeing terminalContract rejected (Advisory A).
+  assert.throws(
+    () =>
+      registerOracle(
+        makeValidSpec({
+          id: 'test:shared_label_conflict',
+          labels: ['custom_redirect'],
+          terminalContract: 'oob',
+        }),
+        reg,
+      ),
+    /disagrees on terminalContract/i,
+  )
+
+  // Expired archetype exemption rejected (Advisory B).
+  assert.throws(
+    () =>
+      registerOracle(
+        makeValidSpec({
+          id: 'test:expired_exemption',
+          labels: ['expired_ex_label'],
+          archetypeExemptions: [{ archetype: 'public_endpoint', ticket: 'R3-99', reason: 'expired', expires: '2020-01-01' }],
+        }),
+        reg,
+      ),
+    /expired/i,
   )
 
   // Post-seal registration into DEFAULT_ORACLE_SPEC_REGISTRY or a sealed registry rejected.
@@ -281,30 +342,49 @@ test('R3-13 agreement gate: terminal-oracle-registry, proof-receipt, v8-oracle-h
   assert.equal(resolveTerminalContract('signed_url_mint'), 'access_control')
   assert.deepEqual(drifts, [], `Cross-module oracle table drift detected:\n  - ${drifts.join('\n  - ')}`)
 
-  // 2c. All 10 oracle VerifyClaim kinds in verify-claims.ts are bound to registered OracleSpecs.
-  const expectedClaimKinds: readonly OracleClaimKind[] = [
-    'impact',
-    'boundary',
-    'mfa',
-    'dom_sentinel',
-    'oob',
-    'timing',
-    'structural_diff',
-    'race',
-    'composite_receipt',
-    'host_evaluated_expression',
-  ]
-  const registeredKinds = new Set(listRegisteredClaimEvaluatorKinds())
-  for (const kind of expectedClaimKinds) {
-    assert.ok(registeredKinds.has(kind), `verify-claims.ts missing registered OracleSpec claim evaluator for "${kind}"`)
+  // 2c. Every claimKind declared in ANY registered OracleSpec has exactly one registered evaluator
+  //     whose bound spec list includes every declaring spec, and the evaluator registry is sealed.
+  const declaredClaimKinds = new Set<OracleClaimKind>()
+  for (const spec of DEFAULT_ORACLE_SPEC_REGISTRY.list()) {
+    for (const ck of spec.claimKinds) declaredClaimKinds.add(ck)
   }
+  const registeredKinds = listRegisteredClaimEvaluatorKinds()
+  assert.equal(new Set(registeredKinds).size, registeredKinds.length, 'claim evaluator kinds must be unique')
+  for (const kind of declaredClaimKinds) {
+    assert.ok(registeredKinds.includes(kind), `verify-claims.ts missing registered OracleSpec claim evaluator for "${kind}"`)
+    const declaringIds = DEFAULT_ORACLE_SPEC_REGISTRY.list().filter(s => s.claimKinds.includes(kind)).map(s => s.id)
+    const boundIds = getRegisteredClaimEvaluatorSpecs(kind)
+    assert.deepEqual([...boundIds].sort(), [...declaringIds].sort(), `claim evaluator "${kind}" must bind every declaring OracleSpec`)
+    assert.deepEqual([...defaultTerminalOracleRegistry.claimEvaluatorSpecsFor(kind)], [...boundIds])
+  }
+  // Post-seal overwrite / registration must fail closed (Blocking 2).
+  assert.throws(
+    () => registerOracleClaimEvaluator('oob', 'oob', () => ({ passed: true })),
+    /sealed/i,
+  )
 })
 
 // ============================================================================
-// 3. Strongest / canonical labelToOracle() — NEVER weakest!
+// 3. Strongest / canonical labelToOracle() — NEVER weakest & ZERO CWE hijacking!
 // ============================================================================
 
-test('R3-13 labelToOracle(): always resolves multi-candidate / same-CWE queries to the STRONGEST spec (never weakest)', () => {
+test('R3-13 labelToOracle(): exact-label-only rejects bare CWE tokens, cross-family CWE mismatches fail closed, and same-CWE queries pick the STRONGEST spec', () => {
+  // Blocking 1: bare CWE tokens MUST return null/false/'none' on EVERY label-only resolver.
+  for (const bareCwe of ['CWE-79', 'CWE-639', 'CWE-89', 'cwe-89', 'CWE-287']) {
+    assert.equal(resolveTerminalContract(bareCwe), null, `resolveTerminalContract(${bareCwe}) must be null`)
+    assert.equal(receiptRuleFor(bareCwe).rule, 'none', `receiptRuleFor(${bareCwe}) must be 'none'`)
+    assert.equal(isSignedUrlMintLabel(bareCwe), false, `isSignedUrlMintLabel(${bareCwe}) must be false`)
+    assert.equal(resolveDescriptorImpactClass(bareCwe), null, `resolveDescriptorImpactClass(${bareCwe}) must be null`)
+    assert.equal(resolveBoundaryClassForLabel(bareCwe), null, `resolveBoundaryClassForLabel(${bareCwe}) must be null`)
+    assert.equal(labelToOracle({ label: bareCwe, exactLabelOnly: true }), null, `exactLabelOnly must reject ${bareCwe}`)
+  }
+
+  // Blocking 1(c): cross-family label + CWE mismatch MUST fail closed (never hijack to another CWE family).
+  assert.equal(labelToOracle({ vulnClass: 'sqli_status', cwe: 'CWE-79', scope: 'single_hop' }), null)
+  assert.equal(labelToOracle({ label: 'sqli_status', cwe: 'CWE-79' }), null)
+  assert.equal(canonicalCweForOracle({ label: 'sqli_status', cwe: 'CWE-79' }), null)
+  assert.equal(defaultTerminalOracleRegistry.canonicalCweFor({ label: 'sqli_status', cwe: 'CWE-79' }), null)
+
   // CWE-89 candidates: boolean (95) > timing (80) > impact:injection (75) > status_differential (60).
   const cwe89 = labelToOracle({ cwe: 'CWE-89', scope: 'single_hop' })
   assert.equal(cwe89?.id, 'boolean')
@@ -322,10 +402,12 @@ test('R3-13 labelToOracle(): always resolves multi-candidate / same-CWE queries 
   assert.equal(labelToOracle({ cwe: 'CWE-79', scope: 'single_hop' })?.id, 'browser')
   assert.equal(labelToOracle({ vulnClass: 'xss_reflected', cwe: 'CWE-79', scope: 'single_hop' })?.id, 'browser')
 
-  // CWE-639: v8:dual_tenant_abac (98) > impact:signed_url_mint (90) > impact:authorization (80).
+  // Blocking 1(d): CWE-639 general BOLA stays on `impact:authorization` (single-hop) and is NEVER hijacked by `impact:signed_url_mint` subtype!
   assert.equal(labelToOracle({ cwe: 'CWE-639', scope: 'all' })?.id, 'v8:dual_tenant_abac')
-  assert.equal(labelToOracle({ cwe: 'CWE-639', scope: 'single_hop' })?.id, 'impact:signed_url_mint')
-  assert.equal(labelToOracle({ vulnClass: 'bola', cwe: 'CWE-639', scope: 'single_hop' })?.id, 'impact:signed_url_mint')
+  assert.equal(labelToOracle({ cwe: 'CWE-639', scope: 'single_hop' })?.id, 'impact:authorization')
+  assert.equal(labelToOracle({ vulnClass: 'bola', cwe: 'CWE-639', scope: 'single_hop' })?.id, 'impact:authorization')
+  assert.equal(labelToOracle({ label: 'bola', canonical: true, scope: 'single_hop' })?.id, 'impact:authorization')
+  assert.equal(labelToOracle({ vulnClass: 'signed_url_mint', scope: 'single_hop' })?.id, 'impact:signed_url_mint')
 
   // CWE-840: v8:economic_conservation (98) > conserved_balance (92) > impact:business_logic (80).
   assert.equal(labelToOracle({ cwe: 'CWE-840', scope: 'all' })?.id, 'v8:economic_conservation')

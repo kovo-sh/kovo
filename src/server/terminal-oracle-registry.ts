@@ -53,6 +53,7 @@ import {
   REGISTERED_SINGLE_HOP_RULES,
   REGISTERED_V8_FAMILIES,
   canonicalCweForOracle,
+  getRegisteredClaimEvaluatorSpecs,
   labelToOracle,
   listRegisteredClaimEvaluatorKinds,
   type LabelToOracleQuery,
@@ -410,6 +411,10 @@ export class TerminalOracleRegistry {
 
   listRegisteredClaimKinds(): readonly OracleClaimKind[] {
     return listRegisteredClaimEvaluatorKinds()
+  }
+
+  claimEvaluatorSpecsFor(kind: OracleClaimKind): readonly string[] {
+    return getRegisteredClaimEvaluatorSpecs(kind)
   }
 
   /**

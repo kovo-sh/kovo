@@ -1,0 +1,126 @@
+{
+  "id": "r3-13-claude-bypass-review-fp",
+  "side": "fp",
+  "source": "independent_review",
+  "archetype": "r3-13-cwe-token-as-label-public-read",
+  "description": "R3-13 review FP: worker supplies a bare CWE token as vulnClass/terminalVulnClass for a public catalog read. CWE-token routing must not select a different (signed-url-mint / v8 dual-tenant) contract or confirm; identical public bodies for anon control and cross-tenant viewer must dismiss.",
+  "covers": {
+    "files": [
+      "src/server/oracle-spec.ts",
+      "src/server/terminal-oracle-registry.ts",
+      "src/server/proof-receipt.ts",
+      "src/server/v8-oracle-hydrate.ts",
+      "src/server/oracle-invariants.ts",
+      "src/server/verify-claims.ts"
+    ],
+    "classes": [
+      "bola",
+      "authorization",
+      "signed_url_mint",
+      "dual_tenant_abac",
+      "composite_receipt"
+    ]
+  },
+  "canonicalLabel": {
+    "cwe": "CWE-639",
+    "category": "broken-access-control",
+    "title": "Public catalog item readable by another tenant viewer",
+    "impact": "Item record is a public catalog entry returned identically to anonymous callers.",
+    "claimedImpact": "authorization",
+    "claimedBoundary": "access",
+    "vulnClass": "CWE-639"
+  },
+  "freeTextLabel": {
+    "title": "Public catalog entry returned identically to anonymous and cross-tenant viewer"
+  },
+  "paths": {
+    "replay": true,
+    "floorReceipt": true,
+    "evaluateClaims": true,
+    "composite": true,
+    "floorInjectionRecipe": false,
+    "proofReceipt": true
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [
+    {
+      "handle": "viewer_b",
+      "roleLabel": "viewer (tenant-b)",
+      "role": "viewer",
+      "tenant": "tenant-b",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-r313-claude-viewer-b-token"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "ctl_anon",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/public/catalog/items/42",
+      "persona": null,
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"id\":42,\"sku\":\"SKU-142\",\"name\":\"Desk Lamp\",\"published\":true}"
+    },
+    {
+      "id": "prb_tenant_b",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/public/catalog/items/42",
+      "persona": "viewer_b",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"id\":42,\"sku\":\"SKU-142\",\"name\":\"Desk Lamp\",\"published\":true}"
+    }
+  ],
+  "replaySpec": {
+    "assertionsJq": "{ controlPassed: (.steps.ctl_anon.status == 200), confirmed: (.steps.prb_tenant_b.status == 200), observed: \"identical public body\", expected: \"denied\" }"
+  },
+  "proofReceipt": {
+    "vulnClass": "CWE-639",
+    "targetMethod": "GET",
+    "targetPathAndQuery": "/api/public/catalog/items/42",
+    "claimedDelta": "Anonymous control returns the same published record; no non-public data crosses a tenant boundary under any CWE-639 sibling oracle."
+  },
+  "claims": [
+    {
+      "kind": "impact",
+      "impactClass": "authorization",
+      "probeExchangeId": "prb_tenant_b",
+      "controlExchangeIds": ["ctl_anon"]
+    },
+    {
+      "kind": "composite_receipt",
+      "chainId": "r3-13-claude-chain",
+      "terminalVulnClass": "CWE-639",
+      "verificationId": "absent-host-verification"
+    }
+  ],
+  "bareClaims": [
+    { "kind": "status", "exchangeId": "ctl_anon", "expected": 200 },
+    { "kind": "status", "exchangeId": "prb_tenant_b", "expected": 200 }
+  ],
+  "composite": {
+    "chainId": "r3-13-claude-chain",
+    "terminalVulnClass": "CWE-639",
+    "oracleFamily": "dual_tenant_abac",
+    "claimedDelta": "Bare CWE-639 terminalVulnClass on public catalog read must fail closed as terminal_class_unmapped.",
+    "singleHop": true,
+    "attackerPersonas": ["viewer_b"],
+    "expectedFailedStage": "terminal_impact",
+    "preChainControlIds": ["ctl_anon"],
+    "terminalExchangeId": "prb_tenant_b"
+  }
+}

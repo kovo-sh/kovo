@@ -19,12 +19,7 @@ import { deriveRecordAuthMeta, resolveCanonicalArm, stepHasRedactedRequestPlane,
 import { defaultHostMintedOracle, normalizeRequestCarrier, verifyHostExpressionProbe, verifySignedUrlMintPair, type HostMintedExpressionChallenge, type HostStampedBooleanPair } from './proof-receipt.ts'
 import { compileSafeClaimRegex, MAX_CLAIM_REGEX_HAYSTACK } from './safe-regex.ts'
 export { compileSafeClaimRegex } from './safe-regex.ts'
-import {
-  evaluateRegisteredOracleClaim,
-  isRegisteredImpactClass,
-  isSignedUrlMintLabel,
-  registerOracleClaimEvaluator,
-} from './oracle-spec.ts'
+import { DEFAULT_ORACLE_SPEC_REGISTRY, evaluateRegisteredOracleClaim, isRegisteredImpactClass, isSignedUrlMintLabel, registerOracleClaimEvaluator, sealOracleClaimEvaluators } from './oracle-spec.ts'
 
 // ---------------------------------------------------------------------------
 // Constants shared with the container mount (worker-backend) and both SDKs.
@@ -1433,17 +1428,17 @@ function evaluateCompositeReceiptClaim(
   return { claim, passed: true, detail: hostRec.reason, observed: { confirmed: true, chainId: hostRec.chainId, terminalVulnClass: hostRec.terminalVulnClass, replayMode: hostRec.replayMode, hopCount: hostRec.hopCount, verifiedEdgeCount: hostRec.verifiedEdgeCount } }
 }
 
-// Bind all oracle claim evaluators to their authoritative registered OracleSpec entries (`R3-13`).
-registerOracleClaimEvaluator<TranscriptStore, Extract<VerifyClaim, { kind: 'impact' }>, VerifyClaimContext, VerifyClaimCheck>('impact:authorization', 'impact', (s, c, ctx) => evaluateImpactClaim(s, c, ctx))
-registerOracleClaimEvaluator<TranscriptStore, Extract<VerifyClaim, { kind: 'boundary' }>, VerifyClaimContext, VerifyClaimCheck>('auth_bypass', 'boundary', (s, c, ctx) => evaluateBoundaryClaim(s, c, ctx))
-registerOracleClaimEvaluator<TranscriptStore, Extract<VerifyClaim, { kind: 'mfa' }>, VerifyClaimContext, VerifyClaimCheck>('auth_bypass', 'mfa', (s, c, ctx) => evaluateMfaClaim(s, c, ctx))
-registerOracleClaimEvaluator<TranscriptStore, Extract<VerifyClaim, { kind: 'dom_sentinel' }>, VerifyClaimContext, VerifyClaimCheck>('browser', 'dom_sentinel', (s, c, ctx) => evaluateDomSentinelClaim(s, c, ctx))
-registerOracleClaimEvaluator<TranscriptStore, Extract<VerifyClaim, { kind: 'oob' }>, VerifyClaimContext, VerifyClaimCheck>('oob', 'oob', (s, c, ctx) => evaluateOobClaim(s, c, ctx))
-registerOracleClaimEvaluator<TranscriptStore, Extract<VerifyClaim, { kind: 'timing' }>, VerifyClaimContext, VerifyClaimCheck>('timing', 'timing', (s, c, ctx) => evaluateTimingClaim(s, c, ctx))
-registerOracleClaimEvaluator<TranscriptStore, Extract<VerifyClaim, { kind: 'structural_diff' }>, VerifyClaimContext, VerifyClaimCheck>('boolean', 'structural_diff', (s, c, ctx) => evaluateStructuralDiffClaim(s, c, ctx))
-registerOracleClaimEvaluator<TranscriptStore, Extract<VerifyClaim, { kind: 'race' }>, VerifyClaimContext, VerifyClaimCheck>('conserved_balance', 'race', (s, c, ctx) => evaluateRaceClaim(s, c, ctx))
-registerOracleClaimEvaluator<TranscriptStore, Extract<VerifyClaim, { kind: 'composite_receipt' }>, VerifyClaimContext, VerifyClaimCheck>('v8:dual_tenant_abac', 'composite_receipt', (s, c, ctx) => evaluateCompositeReceiptClaim(s, c, ctx))
-registerOracleClaimEvaluator<TranscriptStore, Extract<VerifyClaim, { kind: 'host_evaluated_expression' }>, VerifyClaimContext, VerifyClaimCheck>('impact:injection', 'host_evaluated_expression', (s, c, ctx) => evaluateClaim(s, c, ctx))
+// Bind all oracle claim evaluators to their exact declaring OracleSpec IDs and seal the registry (`R3-13`).
+const CLAIM_EVALUATOR_BINDINGS = [
+  ['impact', evaluateImpactClaim], ['boundary', evaluateBoundaryClaim], ['mfa', evaluateMfaClaim],
+  ['dom_sentinel', evaluateDomSentinelClaim], ['oob', evaluateOobClaim], ['timing', evaluateTimingClaim],
+  ['structural_diff', evaluateStructuralDiffClaim], ['race', evaluateRaceClaim],
+  ['composite_receipt', evaluateCompositeReceiptClaim], ['host_evaluated_expression', evaluateClaim],
+] as const
+for (const [kind, fn] of CLAIM_EVALUATOR_BINDINGS) {
+  registerOracleClaimEvaluator(DEFAULT_ORACLE_SPEC_REGISTRY.list().filter(s => s.claimKinds.includes(kind)).map(s => s.id), kind, (s, c, ctx) => fn(s as TranscriptStore, c as never, ctx as VerifyClaimContext))
+}
+sealOracleClaimEvaluators()
 
 export function evaluateClaim(
   store: TranscriptStore,

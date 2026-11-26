@@ -39,7 +39,7 @@
     "src/server/store-runs.ts": 4576,
     "src/server/store-session.ts": 2147,
     "src/server/store.ts": 2354,
-    "src/server/verify-claims.ts": 2228,
+    "src/server/verify-claims.ts": 2223,
     "src/server/verify-rpc.ts": 2284,
     "src/server/verify-support.ts": 2212,
     "src/server/worker-backend.ts": 3198

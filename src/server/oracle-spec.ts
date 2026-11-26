@@ -156,6 +156,8 @@ export interface LabelToOracleQuery {
   readonly scope?: 'all' | 'single_hop' | 'v8_family'
   /** Promote exact matches to the canonical strongest spec sharing the matched spec's primary CWE. */
   readonly canonical?: boolean
+  /** Strict label-only lookup: ZERO CWE-token sniffing and ZERO CWE-family expansion. */
+  readonly exactLabelOnly?: boolean
 }
 
 export interface OracleSpecAdmissionError {
@@ -165,6 +167,7 @@ export interface OracleSpecAdmissionError {
 
 const VALID_CWE_RE = /^CWE-[1-9]\d*$/
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/
+const VALID_PREFIX_RE = /^[a-z0-9][a-z0-9_-]*$/
 const VALID_SINGLE_HOP_RULES = new Set<OracleRuleId>([
   'impact',
   'oob',
@@ -184,6 +187,45 @@ const VALID_V8_FAMILIES = new Set<V8OracleFamilyId>([
   'cryptographic_scope_replay',
   'parser_cache_differential',
   'cross_surface_pivot',
+])
+const VALID_IMPACT_CLASSES = new Set<Exclude<OracleImpactClass, 'other'>>([
+  'authorization',
+  'bfla',
+  'mass_assignment',
+  'csrf',
+  'business_logic',
+  'markup',
+  'disclosure',
+  'injection',
+])
+const VALID_DESCRIPTOR_IMPACTS = new Set<OracleImpactClass>([...VALID_IMPACT_CLASSES, 'other'])
+const VALID_BOUNDARY_CLASSES = new Set<OracleBoundaryClass>(['auth', 'access', 'mfa', 'other'])
+const VALID_V8_TERMINAL_CONTRACTS = new Set<OracleTerminalContractKind>([
+  'v8_dual_tenant',
+  'v8_temporal',
+  'v8_economic',
+  'v8_crypto',
+  'v8_parser_cache',
+  'v8_pivot',
+])
+const VALID_SINGLE_HOP_TERMINAL_CONTRACTS = new Set<OracleTerminalContractKind>([
+  'access_control',
+  'auth_or_logic',
+  'oob',
+  'browser',
+  'injection_or_redirect',
+])
+const VALID_CLAIM_KINDS = new Set<OracleClaimKind>([
+  'oob',
+  'timing',
+  'structural_diff',
+  'race',
+  'impact',
+  'boundary',
+  'mfa',
+  'dom_sentinel',
+  'composite_receipt',
+  'host_evaluated_expression',
 ])
 const VALID_PROVENANCE = new Set<OracleInputProvenance>(['host_observed', 'host_minted', 'worker_citation'])
 const VALID_BINDING_KINDS = new Set<OracleBindingKind>([
@@ -209,56 +251,7 @@ export function normalizeOracleCwe(raw: string | null | undefined): string | nul
   return VALID_CWE_RE.test(trimmed) ? trimmed : null
 }
 
-/** Validate an `OracleSpec` against the R3-13 admission contract. Returns all violations. */
-export function validateOracleSpec(spec: OracleSpec): OracleSpecAdmissionError[] {
-  const errors: OracleSpecAdmissionError[] = []
-  if (!spec.id || !/^[a-z0-9][a-z0-9:_-]{1,63}$/.test(spec.id)) {
-    errors.push({ field: 'id', message: `Invalid oracle spec id "${spec.id}".` })
-  }
-  if (spec.kind === 'single_hop') {
-    if (!spec.singleHopRule || !VALID_SINGLE_HOP_RULES.has(spec.singleHopRule)) {
-      errors.push({ field: 'singleHopRule', message: `single_hop spec "${spec.id}" requires a valid singleHopRule.` })
-    }
-    if (spec.v8Family !== undefined) {
-      errors.push({ field: 'v8Family', message: `single_hop spec "${spec.id}" must not declare v8Family.` })
-    }
-    if (spec.singleHopRule === 'impact' && !spec.impactClass) {
-      errors.push({ field: 'impactClass', message: `impact spec "${spec.id}" requires an impactClass.` })
-    }
-  } else if (spec.kind === 'v8_family') {
-    if (!spec.v8Family || !VALID_V8_FAMILIES.has(spec.v8Family)) {
-      errors.push({ field: 'v8Family', message: `v8_family spec "${spec.id}" requires a valid v8Family.` })
-    }
-    if (spec.singleHopRule !== undefined) {
-      errors.push({ field: 'singleHopRule', message: `v8_family spec "${spec.id}" must not declare singleHopRule.` })
-    }
-  } else {
-    errors.push({ field: 'kind', message: `Unsupported oracle spec kind "${String(spec.kind)}".` })
-  }
-  if (!spec.canonicalVulnClass || !spec.canonicalVulnClass.trim()) {
-    errors.push({ field: 'canonicalVulnClass', message: `Spec "${spec.id}" requires a non-empty canonicalVulnClass.` })
-  }
-  if (!Array.isArray(spec.cwes) || spec.cwes.length === 0) {
-    errors.push({ field: 'cwes', message: `Spec "${spec.id}" must declare at least one canonical CWE.` })
-  } else {
-    for (const cwe of spec.cwes) {
-      if (!VALID_CWE_RE.test(cwe)) {
-        errors.push({ field: 'cwes', message: `Spec "${spec.id}" declares invalid CWE "${cwe}".` })
-      }
-    }
-  }
-  if (!Array.isArray(spec.labels) || spec.labels.length === 0) {
-    errors.push({ field: 'labels', message: `Spec "${spec.id}" must declare at least one lowercase label.` })
-  } else {
-    for (const label of spec.labels) {
-      if (!label || label !== label.trim().toLowerCase()) {
-        errors.push({ field: 'labels', message: `Spec "${spec.id}" label "${label}" must be trimmed lowercase.` })
-      }
-    }
-  }
-  if (!Number.isInteger(spec.strictnessRank) || spec.strictnessRank < 1 || spec.strictnessRank > 100) {
-    errors.push({ field: 'strictnessRank', message: `Spec "${spec.id}" strictnessRank must be an integer in 1..100.` })
-  }
+function validateOracleSpecPolicies(spec: OracleSpec, errors: OracleSpecAdmissionError[]): void {
   if (!Array.isArray(spec.inputs) || spec.inputs.length === 0) {
     errors.push({ field: 'inputs', message: `Spec "${spec.id}" must declare input provenance.` })
   } else {
@@ -296,11 +289,98 @@ export function validateOracleSpec(spec: OracleSpec): OracleSpecAdmissionError[]
   if (!VALID_PUBLICNESS.has(spec.publicnessPolicy)) {
     errors.push({ field: 'publicnessPolicy', message: `Spec "${spec.id}" declares invalid publicnessPolicy.` })
   }
+  const todayIso = new Date().toISOString().slice(0, 10)
   for (const ex of spec.archetypeExemptions ?? []) {
     if (!ex.archetype.trim() || !ex.ticket.trim() || !ex.reason.trim() || !ISO_DATE_RE.test(ex.expires)) {
       errors.push({ field: 'archetypeExemptions', message: `Spec "${spec.id}" has an invalid archetype exemption.` })
+    } else if (ex.expires < todayIso) {
+      errors.push({ field: 'archetypeExemptions', message: `Spec "${spec.id}" archetype exemption for "${ex.archetype}" expired on ${ex.expires}.` })
     }
   }
+}
+
+/** Validate an `OracleSpec` against the R3-13 admission contract. Returns all violations. */
+export function validateOracleSpec(spec: OracleSpec): OracleSpecAdmissionError[] {
+  const errors: OracleSpecAdmissionError[] = []
+  if (!spec.id || !/^[a-z0-9][a-z0-9:_-]{1,63}$/.test(spec.id)) {
+    errors.push({ field: 'id', message: `Invalid oracle spec id "${spec.id}".` })
+  }
+  if (spec.kind === 'single_hop') {
+    if (!spec.singleHopRule || !VALID_SINGLE_HOP_RULES.has(spec.singleHopRule)) {
+      errors.push({ field: 'singleHopRule', message: `single_hop spec "${spec.id}" requires a valid singleHopRule.` })
+    }
+    if (spec.v8Family !== undefined) {
+      errors.push({ field: 'v8Family', message: `single_hop spec "${spec.id}" must not declare v8Family.` })
+    }
+    if (spec.singleHopRule === 'impact' && (!spec.impactClass || !VALID_IMPACT_CLASSES.has(spec.impactClass))) {
+      errors.push({ field: 'impactClass', message: `impact spec "${spec.id}" requires a valid impactClass.` })
+    }
+    if (spec.impactClass !== undefined && !VALID_IMPACT_CLASSES.has(spec.impactClass)) {
+      errors.push({ field: 'impactClass', message: `Spec "${spec.id}" declares invalid impactClass "${String(spec.impactClass)}".` })
+    }
+    if (!VALID_SINGLE_HOP_TERMINAL_CONTRACTS.has(spec.terminalContract)) {
+      errors.push({ field: 'terminalContract', message: `single_hop spec "${spec.id}" declares invalid terminalContract "${String(spec.terminalContract)}".` })
+    }
+  } else if (spec.kind === 'v8_family') {
+    if (!spec.v8Family || !VALID_V8_FAMILIES.has(spec.v8Family)) {
+      errors.push({ field: 'v8Family', message: `v8_family spec "${spec.id}" requires a valid v8Family.` })
+    }
+    if (spec.singleHopRule !== undefined) {
+      errors.push({ field: 'singleHopRule', message: `v8_family spec "${spec.id}" must not declare singleHopRule.` })
+    }
+    if (!VALID_V8_TERMINAL_CONTRACTS.has(spec.terminalContract)) {
+      errors.push({ field: 'terminalContract', message: `v8_family spec "${spec.id}" must pair with a v8_* terminalContract (got "${String(spec.terminalContract)}").` })
+    }
+  } else {
+    errors.push({ field: 'kind', message: `Unsupported oracle spec kind "${String(spec.kind)}".` })
+  }
+  if (!VALID_BOUNDARY_CLASSES.has(spec.boundaryClass)) {
+    errors.push({ field: 'boundaryClass', message: `Spec "${spec.id}" declares invalid boundaryClass "${String(spec.boundaryClass)}".` })
+  }
+  if (spec.descriptorImpactClass !== null && !VALID_DESCRIPTOR_IMPACTS.has(spec.descriptorImpactClass)) {
+    errors.push({ field: 'descriptorImpactClass', message: `Spec "${spec.id}" declares invalid descriptorImpactClass "${String(spec.descriptorImpactClass)}".` })
+  }
+  if (!Array.isArray(spec.claimKinds)) {
+    errors.push({ field: 'claimKinds', message: `Spec "${spec.id}" must declare a claimKinds array.` })
+  } else {
+    for (const ck of spec.claimKinds) {
+      if (!VALID_CLAIM_KINDS.has(ck)) {
+        errors.push({ field: 'claimKinds', message: `Spec "${spec.id}" declares invalid claimKind "${String(ck)}".` })
+      }
+    }
+  }
+  if (!spec.canonicalVulnClass || !spec.canonicalVulnClass.trim()) {
+    errors.push({ field: 'canonicalVulnClass', message: `Spec "${spec.id}" requires a non-empty canonicalVulnClass.` })
+  }
+  if (!Array.isArray(spec.cwes) || spec.cwes.length === 0) {
+    errors.push({ field: 'cwes', message: `Spec "${spec.id}" must declare at least one canonical CWE.` })
+  } else {
+    for (const cwe of spec.cwes) {
+      if (!VALID_CWE_RE.test(cwe)) {
+        errors.push({ field: 'cwes', message: `Spec "${spec.id}" declares invalid CWE "${cwe}".` })
+      }
+    }
+  }
+  if (!Array.isArray(spec.labels) || spec.labels.length === 0) {
+    errors.push({ field: 'labels', message: `Spec "${spec.id}" must declare at least one lowercase label.` })
+  } else {
+    for (const label of spec.labels) {
+      if (!label || label !== label.trim().toLowerCase() || VALID_CWE_RE.test(label.toUpperCase())) {
+        errors.push({ field: 'labels', message: `Spec "${spec.id}" label "${label}" must be a non-CWE trimmed lowercase identifier.` })
+      }
+    }
+  }
+  if (spec.labelPrefixes !== undefined) {
+    for (const prefix of spec.labelPrefixes) {
+      if (!prefix || prefix !== prefix.trim().toLowerCase() || !VALID_PREFIX_RE.test(prefix)) {
+        errors.push({ field: 'labelPrefixes', message: `Spec "${spec.id}" labelPrefix "${prefix}" must be a non-empty lowercase prefix token.` })
+      }
+    }
+  }
+  if (!Number.isInteger(spec.strictnessRank) || spec.strictnessRank < 1 || spec.strictnessRank > 100) {
+    errors.push({ field: 'strictnessRank', message: `Spec "${spec.id}" strictnessRank must be an integer in 1..100.` })
+  }
+  validateOracleSpecPolicies(spec, errors)
   return errors
 }
 
@@ -345,6 +425,22 @@ export class OracleSpecRegistry {
     }
     if (this.byId.has(spec.id)) {
       throw new Error(`OracleSpec "${spec.id}" is already registered.`)
+    }
+    // Shared labels across specs must agree on terminalContract, boundaryClass, and descriptorImpactClass.
+    for (const label of spec.labels) {
+      const existing = this.byLabel.get(label)
+      if (!existing) continue
+      for (const peer of existing) {
+        if (
+          peer.terminalContract !== spec.terminalContract ||
+          peer.boundaryClass !== spec.boundaryClass ||
+          peer.descriptorImpactClass !== spec.descriptorImpactClass
+        ) {
+          throw new Error(
+            `OracleSpec "${spec.id}" shares label "${label}" with "${peer.id}" but disagrees on terminalContract/boundaryClass/descriptorImpactClass.`,
+          )
+        }
+      }
     }
     const frozen = freezeSpec(spec)
     this.byId.set(frozen.id, frozen)
@@ -413,9 +509,66 @@ export class OracleSpecRegistry {
     return out
   }
 
+  private pickStrongest(
+    candidates: ReadonlySet<OracleSpec>,
+    exactMatches: ReadonlySet<OracleSpec>,
+    normCwes: readonly string[],
+  ): OracleSpec | null {
+    let best: OracleSpec | null = null
+    for (const cand of candidates) {
+      if (!best) {
+        best = cand
+        continue
+      }
+      if (cand.strictnessRank !== best.strictnessRank) {
+        if (cand.strictnessRank > best.strictnessRank) best = cand
+        continue
+      }
+      const candExact = exactMatches.has(cand) ? 1 : 0
+      const bestExact = exactMatches.has(best) ? 1 : 0
+      if (candExact !== bestExact) {
+        if (candExact > bestExact) best = cand
+        continue
+      }
+      const candPrimaryCwe = cand.cwes[0] && normCwes.includes(cand.cwes[0]) ? 1 : 0
+      const bestPrimaryCwe = best.cwes[0] && normCwes.includes(best.cwes[0]) ? 1 : 0
+      if (candPrimaryCwe !== bestPrimaryCwe) {
+        if (candPrimaryCwe > bestPrimaryCwe) best = cand
+        continue
+      }
+      if (cand.id.localeCompare(best.id) < 0) best = cand
+    }
+    return best
+  }
+
+  /**
+   * Strict label-only lookup (ZERO CWE-token sniffing and ZERO CWE-family expansion).
+   * Used by closed-contract label resolvers (`resolveReceiptRule`, `resolveTerminalContractKind`,
+   * `resolveDescriptorImpactClass`, `resolveBoundaryClassForLabel`, `is*Label`).
+   */
+  resolveByExactLabel(
+    rawLabel: string,
+    opts?: { readonly scope?: 'all' | 'single_hop' | 'v8_family'; readonly oobEventIds?: readonly string[] },
+  ): OracleSpec | null {
+    const norm = rawLabel.trim().toLowerCase()
+    if (!norm) return null
+    const scope = opts?.scope ?? 'all'
+    const inScope = (spec: OracleSpec): boolean =>
+      scope === 'all' || (scope === 'single_hop' ? spec.kind === 'single_hop' : spec.kind === 'v8_family')
+    if (norm === 'webhook_forgery' && opts?.oobEventIds !== undefined && opts.oobEventIds.length === 0) {
+      const wh = this.byId.get('webhook')
+      return wh && inScope(wh) ? wh : null
+    }
+    const matches = new Set(this.specsForLabel(norm).filter(inScope))
+    return this.pickStrongest(matches, matches, [])
+  }
+
   /**
    * Resolve any vulnerability label, CWE, claim kind, or composite terminal to the single
    * canonical **strongest** `OracleSpec` (highest `strictnessRank`, NEVER weakest).
+   *
+   * When both an exact/prefix label AND a CWE are provided, CWEs may ONLY upgrade within
+   * the matched label's CWE family; cross-family label/CWE contradictions fail closed (`null`).
    */
   resolve(input: string | LabelToOracleQuery): OracleSpec | null {
     const query: LabelToOracleQuery = typeof input === 'string' ? { label: input } : input
@@ -426,6 +579,15 @@ export class OracleSpecRegistry {
       ...(query.terminalVulnClass ? [query.terminalVulnClass] : []),
       ...(query.labels ?? []),
     ]
+
+    if (query.exactLabelOnly) {
+      if (rawLabels.length !== 1) return null
+      return this.resolveByExactLabel(rawLabels[0]!, {
+        scope,
+        ...(query.oobEventIds ? { oobEventIds: query.oobEventIds } : {}),
+      })
+    }
+
     const rawCwes = [
       ...(query.cwe ? [query.cwe] : []),
       ...(query.cwes ?? []),
@@ -474,9 +636,26 @@ export class OracleSpecRegistry {
       }
     }
 
-    for (const cwe of normCwes) {
-      for (const spec of this.byCwe.get(cwe) ?? []) {
-        if (inScope(spec)) candidates.add(spec)
+    if (normCwes.length > 0) {
+      if (exactMatches.size > 0) {
+        // CWEs may ONLY upgrade within the CWE family of the matched label(s); fail closed on cross-family mismatch.
+        const exactCweSet = new Set<string>()
+        for (const m of exactMatches) {
+          for (const c of m.cwes) exactCweSet.add(c)
+        }
+        const overlappingCwes = normCwes.filter(c => exactCweSet.has(c))
+        if (overlappingCwes.length === 0) return null
+        for (const cwe of overlappingCwes) {
+          for (const spec of this.byCwe.get(cwe) ?? []) {
+            if (inScope(spec)) candidates.add(spec)
+          }
+        }
+      } else {
+        for (const cwe of normCwes) {
+          for (const spec of this.byCwe.get(cwe) ?? []) {
+            if (inScope(spec)) candidates.add(spec)
+          }
+        }
       }
     }
 
@@ -489,32 +668,7 @@ export class OracleSpecRegistry {
     }
 
     if (candidates.size === 0) return null
-
-    let best: OracleSpec | null = null
-    for (const cand of candidates) {
-      if (!best) {
-        best = cand
-        continue
-      }
-      if (cand.strictnessRank !== best.strictnessRank) {
-        if (cand.strictnessRank > best.strictnessRank) best = cand
-        continue
-      }
-      const candExact = exactMatches.has(cand) ? 1 : 0
-      const bestExact = exactMatches.has(best) ? 1 : 0
-      if (candExact !== bestExact) {
-        if (candExact > bestExact) best = cand
-        continue
-      }
-      const candPrimaryCwe = cand.cwes[0] && normCwes.includes(cand.cwes[0]) ? 1 : 0
-      const bestPrimaryCwe = best.cwes[0] && normCwes.includes(best.cwes[0]) ? 1 : 0
-      if (candPrimaryCwe !== bestPrimaryCwe) {
-        if (candPrimaryCwe > bestPrimaryCwe) best = cand
-        continue
-      }
-      if (cand.id.localeCompare(best.id) < 0) best = cand
-    }
-    return best
+    return this.pickStrongest(candidates, exactMatches, normCwes)
   }
 
   /** Return all sibling labels sharing at least one CWE with the given label or CWE. */
@@ -592,7 +746,7 @@ const BUILTIN_ORACLE_SPECS: readonly OracleSpec[] = [
       cweNumbers: [639],
     },
     claimKinds: ['impact', 'boundary'],
-    strictnessRank: 80,
+    strictnessRank: 85,
     inputs: [
       { name: 'host_exchanges', provenance: 'host_observed', required: true },
       { name: 'persona_identities', provenance: 'host_observed', required: true },
@@ -626,7 +780,7 @@ const BUILTIN_ORACLE_SPECS: readonly OracleSpec[] = [
     boundaryClass: 'access',
     descriptorImpactClass: 'authorization',
     claimKinds: ['impact', 'composite_receipt'],
-    strictnessRank: 90,
+    strictnessRank: 80,
     inputs: [
       { name: 'control_and_probe_exchanges', provenance: 'host_observed', required: true },
       { name: 'wire_credential_provenance', provenance: 'host_observed', required: true },
@@ -1363,17 +1517,16 @@ export function canonicalCweForOracle(
   return labelToOracle(input, registry)?.cwes[0] ?? null
 }
 
-/** Derived single-hop receipt rule resolver (replaces `proof-receipt.ts` regex ladders). */
+/** Derived single-hop receipt rule resolver (strict label-only: zero CWE-token sniffing). */
 export function resolveReceiptRule(
   vulnClass: string,
   receipt?: { readonly oobEventIds: readonly string[] },
 ): { rule: OracleRuleId | 'none'; impactClass?: Exclude<OracleImpactClass, 'other'>; spec?: OracleSpec } {
   const norm = vulnClass.trim().toLowerCase()
   if (!norm) return { rule: 'none' }
-  const spec = DEFAULT_ORACLE_SPEC_REGISTRY.resolve({
-    vulnClass: norm,
-    ...(receipt ? { oobEventIds: receipt.oobEventIds } : {}),
+  const spec = DEFAULT_ORACLE_SPEC_REGISTRY.resolveByExactLabel(norm, {
     scope: 'single_hop',
+    ...(receipt ? { oobEventIds: receipt.oobEventIds } : {}),
   })
   if (!spec || !spec.singleHopRule) return { rule: 'none' }
   return {
@@ -1384,24 +1537,24 @@ export function resolveReceiptRule(
 }
 
 export function isSignedUrlMintLabel(vulnClass: string): boolean {
-  return DEFAULT_ORACLE_SPEC_REGISTRY.resolve({ vulnClass, scope: 'single_hop' })?.id === 'impact:signed_url_mint'
+  return DEFAULT_ORACLE_SPEC_REGISTRY.resolveByExactLabel(vulnClass, { scope: 'single_hop' })?.id === 'impact:signed_url_mint'
 }
 
 export function isAuthBypassLabel(vulnClass: string): boolean {
-  return DEFAULT_ORACLE_SPEC_REGISTRY.resolve({ vulnClass, scope: 'single_hop' })?.id === 'auth_bypass'
+  return DEFAULT_ORACLE_SPEC_REGISTRY.resolveByExactLabel(vulnClass, { scope: 'single_hop' })?.id === 'auth_bypass'
 }
 
 export function isConservedBalanceLabel(vulnClass: string): boolean {
-  return DEFAULT_ORACLE_SPEC_REGISTRY.resolve({ vulnClass, scope: 'single_hop' })?.id === 'conserved_balance'
+  return DEFAULT_ORACLE_SPEC_REGISTRY.resolveByExactLabel(vulnClass, { scope: 'single_hop' })?.id === 'conserved_balance'
 }
 
 export function isOobLabel(vulnClass: string): boolean {
-  const spec = DEFAULT_ORACLE_SPEC_REGISTRY.resolve({ vulnClass, scope: 'single_hop' })
+  const spec = DEFAULT_ORACLE_SPEC_REGISTRY.resolveByExactLabel(vulnClass, { scope: 'single_hop' })
   return spec?.id === 'oob' && vulnClass.trim().toLowerCase() !== 'webhook_forgery'
 }
 
 export function resolveImpactClassForLabel(vulnClass: string): Exclude<OracleImpactClass, 'other'> | undefined {
-  const spec = DEFAULT_ORACLE_SPEC_REGISTRY.resolve({ vulnClass, scope: 'single_hop' })
+  const spec = DEFAULT_ORACLE_SPEC_REGISTRY.resolveByExactLabel(vulnClass, { scope: 'single_hop' })
   return spec?.singleHopRule === 'impact' ? spec.impactClass : undefined
 }
 
@@ -1410,21 +1563,23 @@ export function canonicalVulnClassForImpact(impactClass: string): string | undef
   return impactClass
 }
 
-/** Derived `TERMINAL_CLASS_CONTRACT` map for `v8-oracle-hydrate.ts`. */
+/** Derived `TERMINAL_CLASS_CONTRACT` map for `v8-oracle-hydrate.ts` (single path via `resolveByExactLabel`). */
 export function buildTerminalClassContractMap(): Readonly<Record<string, OracleTerminalContractKind>> {
   const entries: Array<[string, OracleTerminalContractKind]> = []
+  const seen = new Set<string>()
   for (const spec of DEFAULT_ORACLE_SPEC_REGISTRY.list()) {
     for (const label of spec.labels) {
-      entries.push([label, spec.terminalContract])
+      if (seen.has(label)) continue
+      seen.add(label)
+      const resolved = DEFAULT_ORACLE_SPEC_REGISTRY.resolveByExactLabel(label, { scope: 'all' })
+      if (resolved) entries.push([label, resolved.terminalContract])
     }
   }
   return Object.freeze(Object.fromEntries(entries))
 }
 
 export function resolveTerminalContractKind(cls: string): OracleTerminalContractKind | null {
-  const norm = cls.trim().toLowerCase()
-  if (!norm) return null
-  const spec = DEFAULT_ORACLE_SPEC_REGISTRY.resolve({ terminalVulnClass: norm, scope: 'all' })
+  const spec = DEFAULT_ORACLE_SPEC_REGISTRY.resolveByExactLabel(cls, { scope: 'all' })
   return spec ? spec.terminalContract : null
 }
 
@@ -1452,11 +1607,11 @@ export function buildImpactClassCwes(): Record<string, number[]> {
   return out
 }
 
-/** Derived typed-vulnClass descriptor impact resolver for `oracle-invariants.ts`. */
+/** Derived typed-vulnClass descriptor impact resolver for `oracle-invariants.ts` (strict label-only). */
 export function resolveDescriptorImpactClass(vulnClass: string): OracleImpactClass | null {
   const norm = vulnClass.trim().toLowerCase()
   if (!norm) return null
-  const spec = DEFAULT_ORACLE_SPEC_REGISTRY.resolve({ vulnClass: norm, scope: 'all' })
+  const spec = DEFAULT_ORACLE_SPEC_REGISTRY.resolveByExactLabel(norm, { scope: 'all' })
   if (!spec) return null
   if (spec.descriptorImpactLabelOverrides && norm in spec.descriptorImpactLabelOverrides) {
     return spec.descriptorImpactLabelOverrides[norm]!
@@ -1488,12 +1643,12 @@ const ACCESS_BOUNDARY_CWE_SET: ReadonlySet<string> = (() => {
   return set
 })()
 
-/** Derived typed-label boundary classifier for `oracle-invariants.ts`. */
+/** Derived typed-label boundary classifier for `oracle-invariants.ts` (strict label-only). */
 export function resolveBoundaryClassForLabel(vulnClass: string): OracleBoundaryClass | null {
   const norm = vulnClass.trim().toLowerCase()
   if (!norm) return null
   if (MFA_TYPED_LABELS.has(norm)) return 'mfa'
-  const spec = DEFAULT_ORACLE_SPEC_REGISTRY.resolve({ vulnClass: norm, scope: 'all' })
+  const spec = DEFAULT_ORACLE_SPEC_REGISTRY.resolveByExactLabel(norm, { scope: 'all' })
   return spec ? spec.boundaryClass : null
 }
 
@@ -1507,7 +1662,7 @@ export function resolveBoundaryClassForCwe(cwe: string): 'auth' | 'access' | nul
 }
 
 // ---------------------------------------------------------------------------
-// Registered Claim Evaluator Dispatch (verify-claims.ts -> OracleSpec)
+// Registered Claim Evaluator Dispatch (verify-claims.ts -> OracleSpec, fail-closed & sealed)
 // ---------------------------------------------------------------------------
 
 export type OracleClaimEvaluator<TStore = unknown, TClaim = unknown, TContext = unknown, TResult = unknown> = (
@@ -1518,36 +1673,82 @@ export type OracleClaimEvaluator<TStore = unknown, TClaim = unknown, TContext = 
 ) => TResult
 
 interface RegisteredClaimDispatchEntry {
-  readonly specId: string
+  readonly specIds: readonly string[]
   readonly evaluator: OracleClaimEvaluator
 }
 
 const CLAIM_EVALUATOR_REGISTRY = new Map<OracleClaimKind, RegisteredClaimDispatchEntry>()
+let claimEvaluatorsSealed = false
 
 /**
- * Bind a claim-kind evaluator in `verify-claims.ts` to a registered `OracleSpec`.
- * Rejects unknown specs or undeclared claim kinds at registration time.
+ * Bind a claim-kind evaluator in `verify-claims.ts` to its authoritative registered `OracleSpec` ID(s).
+ * Fail-closed: rejects unknown specs, undeclared claim kinds, duplicate kinds, and post-seal calls.
  */
 export function registerOracleClaimEvaluator<TStore, TClaim, TContext, TResult>(
-  specId: string,
+  specIds: string | readonly string[],
   claimKind: OracleClaimKind,
   evaluator: OracleClaimEvaluator<TStore, TClaim, TContext, TResult>,
 ): void {
-  const spec = DEFAULT_ORACLE_SPEC_REGISTRY.get(specId)
-  if (!spec) {
-    throw new Error(`Cannot register claim evaluator for unknown OracleSpec "${specId}".`)
+  if (claimEvaluatorsSealed) {
+    throw new Error(`Oracle claim evaluator registry is sealed; cannot register "${claimKind}".`)
   }
-  if (!spec.claimKinds.includes(claimKind)) {
-    throw new Error(`OracleSpec "${specId}" does not declare claimKind "${claimKind}".`)
+  if (CLAIM_EVALUATOR_REGISTRY.has(claimKind)) {
+    throw new Error(`Oracle claim evaluator for "${claimKind}" is already registered; duplicate overwrite forbidden.`)
+  }
+  const ids = typeof specIds === 'string' ? [specIds] : [...specIds]
+  if (ids.length === 0) {
+    throw new Error(`registerOracleClaimEvaluator("${claimKind}") requires at least one OracleSpec id.`)
+  }
+  for (const specId of ids) {
+    const spec = DEFAULT_ORACLE_SPEC_REGISTRY.get(specId)
+    if (!spec) {
+      throw new Error(`Cannot register claim evaluator for unknown OracleSpec "${specId}".`)
+    }
+    if (!spec.claimKinds.includes(claimKind)) {
+      throw new Error(`OracleSpec "${specId}" does not declare claimKind "${claimKind}".`)
+    }
   }
   CLAIM_EVALUATOR_REGISTRY.set(claimKind, {
-    specId,
+    specIds: Object.freeze(ids),
     evaluator: evaluator as OracleClaimEvaluator,
   })
 }
 
+/** Seal the claim-evaluator registry after built-in evaluators are registered so no module can overwrite them. */
+export function sealOracleClaimEvaluators(): void {
+  claimEvaluatorsSealed = true
+}
+
 export function listRegisteredClaimEvaluatorKinds(): readonly OracleClaimKind[] {
   return [...CLAIM_EVALUATOR_REGISTRY.keys()]
+}
+
+export function getRegisteredClaimEvaluatorSpecs(claimKind: OracleClaimKind): readonly string[] {
+  return CLAIM_EVALUATOR_REGISTRY.get(claimKind)?.specIds ?? []
+}
+
+function resolveSpecForClaimDispatch(
+  claim: { readonly kind: string; readonly impactClass?: unknown; readonly vulnClass?: unknown; readonly terminalVulnClass?: unknown; readonly boundaryClass?: unknown },
+  boundSpecIds: readonly string[],
+): OracleSpec | null {
+  const boundSet = new Set(boundSpecIds)
+  if (typeof claim.vulnClass === 'string') {
+    const exact = DEFAULT_ORACLE_SPEC_REGISTRY.resolveByExactLabel(claim.vulnClass, { scope: 'all' })
+    if (exact && boundSet.has(exact.id)) return exact
+  }
+  if (typeof claim.terminalVulnClass === 'string') {
+    const exact = DEFAULT_ORACLE_SPEC_REGISTRY.resolveByExactLabel(claim.terminalVulnClass, { scope: 'all' })
+    if (exact && boundSet.has(exact.id)) return exact
+  }
+  if (typeof claim.impactClass === 'string') {
+    const byImpact = DEFAULT_ORACLE_SPEC_REGISTRY.get(`impact:${claim.impactClass}`)
+    if (byImpact && boundSet.has(byImpact.id)) return byImpact
+  }
+  if (claim.boundaryClass === 'access') {
+    const authz = DEFAULT_ORACLE_SPEC_REGISTRY.get('impact:authorization')
+    if (authz && boundSet.has(authz.id)) return authz
+  }
+  return DEFAULT_ORACLE_SPEC_REGISTRY.get(boundSpecIds[0]!) ?? null
 }
 
 export function evaluateRegisteredOracleClaim<TStore, TClaim extends { readonly kind: string }, TContext, TResult>(
@@ -1557,7 +1758,7 @@ export function evaluateRegisteredOracleClaim<TStore, TClaim extends { readonly 
 ): TResult | null {
   const entry = CLAIM_EVALUATOR_REGISTRY.get(claim.kind as OracleClaimKind)
   if (!entry) return null
-  const spec = DEFAULT_ORACLE_SPEC_REGISTRY.get(entry.specId)
+  const spec = resolveSpecForClaimDispatch(claim as { readonly kind: string }, entry.specIds)
   if (!spec) return null
   return entry.evaluator(store, claim, context, spec) as TResult
 }
