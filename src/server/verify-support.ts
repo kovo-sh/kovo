@@ -25,20 +25,89 @@ import type { Store } from './store.ts'
 // Structural (noise-tolerant) comparison
 // ---------------------------------------------------------------------------
 
-const STRUCTURAL_KEYED_TOKEN_RE = /(["']?(?:csrf|xsrf|nonce|authenticity[_-]?token|request[_-]?id|trace[_-]?id|correlation[_-]?id|span[_-]?id|session[_-]?id|etag|server[_-]?time|request[_-]?time)["']?\s*[:=]\s*)("(?:[^"\\]|\\.)*"|'[^']*'|[^\s,;&}<]+)/gi
-const STRUCTURAL_TAG_NONCE_RE = /(\b(?:name|id)\s*=\s*["'][^"']*(?:csrf|xsrf|nonce|authenticity|request[_-]?id)[^"']*["'][^>]{0,200}?\b(?:content|value)\s*=\s*)("(?:[^"\\]|\\.)*"|'[^']*')/gi
+const STRUCTURAL_KEYED_TOKEN_RE = /(["']?(?:csrf|xsrf|nonce|authenticity[_-]?token|request[_-]?id|trace[_-]?id|correlation[_-]?id|span[_-]?id|session[_-]?id|etag|server[_-]?time|request[_-]?time)["']?[ \t]{0,8}[:=][ \t]{0,8})("[^"\r\n]{0,256}"|'[^'\r\n]{0,256}'|[^\s,;&}<]{1,256})/gi
 const STRUCTURAL_UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi
 const STRUCTURAL_ISO_TS_RE = /\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:?\d{2})?/g
 const STRUCTURAL_EPOCH_RE = /\b1[5-9]\d{11}\b|\b2\d{12}\b/g
-const STRUCTURAL_LONG_HEX_RE = /\b[0-9a-f]{16,}\b/gi
-const STRUCTURAL_LONG_OPAQUE_RE = /[A-Za-z0-9+/_=-]{24,}/g
+const STRUCTURAL_LONG_HEX_RE = /\b[0-9a-f]{16,256}\b/gi
+const STRUCTURAL_LONG_OPAQUE_RE = /[A-Za-z0-9+/_=-]{24,256}/g
+const TAG_NONCE_KEY_RE = /(?:csrf|xsrf|nonce|authenticity|request[_-]?id)/i
+const MAX_TAG_SCAN_LEN = 512
+/** Cap structural normalization input to 8 KiB (head + tail) so large adversarial bodies stay linear and fast. */
+export const MAX_STRUCTURAL_NORMALIZE_BYTES = 8_192
+
+function readQuotedAttrValue(tag: string, eqPos: number): { start: number; end: number; value: string } | null {
+  let i = eqPos + 1
+  while (i < tag.length && (tag[i] === ' ' || tag[i] === '\t' || tag[i] === '\r' || tag[i] === '\n')) i += 1
+  if (i >= tag.length) return null
+  const quote = tag[i]
+  if (quote !== '"' && quote !== "'") return null
+  const close = tag.indexOf(quote, i + 1)
+  if (close === -1 || close - i > 256) return null
+  return { start: i, end: close + 1, value: tag.slice(i + 1, close) }
+}
+
+/** Linear O(N) tag-scoped scanner replacing the quadratic `STRUCTURAL_TAG_NONCE_RE` regex. */
+function stripTagNonceValues(input: string): string {
+  if (!input.includes('<')) return input
+  let out = ''
+  let pos = 0
+  while (pos < input.length) {
+    const lt = input.indexOf('<', pos)
+    if (lt === -1) {
+      out += input.slice(pos)
+      break
+    }
+    const gt = input.indexOf('>', lt + 1)
+    if (gt === -1) {
+      out += input.slice(pos)
+      break
+    }
+    if (gt - lt > MAX_TAG_SCAN_LEN) {
+      out += input.slice(pos, lt + 1)
+      pos = lt + 1
+      continue
+    }
+    const tag = input.slice(lt, gt + 1)
+    let hasNonceAttr = false
+    let valueSpan: { start: number; end: number } | null = null
+    // Linear attribute scan inside the bounded tag (<= 512 chars).
+    for (let i = 1; i < tag.length - 1; i += 1) {
+      const ch = tag[i]!
+      if (ch === ' ' || ch === '\t' || ch === '\r' || ch === '\n' || ch === '/') continue
+      const nameStart = i
+      while (i < tag.length - 1 && /[A-Za-z0-9_:-]/.test(tag[i]!)) i += 1
+      const attrName = tag.slice(nameStart, i).toLowerCase()
+      while (i < tag.length - 1 && (tag[i] === ' ' || tag[i] === '\t')) i += 1
+      if (tag[i] !== '=') continue
+      const quoted = readQuotedAttrValue(tag, i)
+      if (!quoted) continue
+      i = quoted.end - 1
+      if ((attrName === 'name' || attrName === 'id') && TAG_NONCE_KEY_RE.test(quoted.value)) {
+        hasNonceAttr = true
+      } else if (attrName === 'content' || attrName === 'value') {
+        valueSpan = { start: quoted.start, end: quoted.end }
+      }
+    }
+    out += input.slice(pos, lt)
+    if (hasNonceAttr && valueSpan) {
+      out += `${tag.slice(0, valueSpan.start)}"<dynamic>"${tag.slice(valueSpan.end)}`
+    } else {
+      out += tag
+    }
+    pos = gt + 1
+  }
+  return out
+}
 
 /** Strip run-scoped nonces and other dynamic tokens before structural comparison. */
 export function normalizeStructuralTokens(input: string): string {
   if (!input) return input
-  let out = input
+  const bounded = input.length > MAX_STRUCTURAL_NORMALIZE_BYTES
+    ? `${input.slice(0, 6_144)}\n${input.slice(-2_048)}`
+    : input
+  let out = stripTagNonceValues(bounded)
     .replace(STRUCTURAL_KEYED_TOKEN_RE, '$1"<dynamic>"')
-    .replace(STRUCTURAL_TAG_NONCE_RE, '$1"<dynamic>"')
     .replace(STRUCTURAL_UUID_RE, '<uuid>')
     .replace(STRUCTURAL_ISO_TS_RE, '<timestamp>')
     .replace(STRUCTURAL_EPOCH_RE, '<epoch>')
@@ -60,10 +129,8 @@ function structuralTokenSet(normalized: string): Set<string> {
   return new Set(normalized.toLowerCase().split(/[^a-z0-9]+/).filter(token => token.length >= 2))
 }
 
-/** Structural comparison that ignores dynamic tokens and reports the field-level delta. */
-export function structuralDiff(a: string, b: string, maxTokens = 32): StructuralDiff {
-  const normalizedA = normalizeStructuralTokens(a)
-  const normalizedB = normalizeStructuralTokens(b)
+/** Structural comparison over already-normalized strings (avoids redundant normalization in loops). */
+export function structuralDiffNormalized(normalizedA: string, normalizedB: string, maxTokens = 32): StructuralDiff {
   if (normalizedA === normalizedB) {
     return { similarity: 1, changedTokens: [], normalizedEqual: true }
   }
@@ -77,6 +144,11 @@ export function structuralDiff(a: string, b: string, maxTokens = 32): Structural
     changedTokens: [...changed].sort().slice(0, maxTokens),
     normalizedEqual: false,
   }
+}
+
+/** Structural comparison that ignores dynamic tokens and reports the field-level delta. */
+export function structuralDiff(a: string, b: string, maxTokens = 32): StructuralDiff {
+  return structuralDiffNormalized(normalizeStructuralTokens(a), normalizeStructuralTokens(b), maxTokens)
 }
 
 /** Similarity over noise-normalized tokens (1 = structurally identical). */
