@@ -49,7 +49,7 @@ import { CanaryBroker } from '../src/server/canary-broker.ts'
 import type { CompositeProofReceipt, CompositeReceiptVerification } from '../src/server/composite-receipt.ts'
 import { Execution } from '../src/server/execution.ts'
 import { projectReposDir } from '../src/server/github-connector.ts'
-import { privateModelProfiles } from '../src/server/model-settings.ts'
+import { inspectModelProfileLoad } from '../src/server/model-settings.ts'
 import type { ResolvedModelProfile } from '../src/server/model-settings.ts'
 import { createProjectPersona } from '../src/server/persona-vault.ts'
 import type { NamedSecret } from '../src/server/redact.ts'
@@ -71,6 +71,7 @@ import { selectVerifierBackend } from './benchmark-backend.ts'
 import { resolveOobCallbackPorts } from './benchmark-env.ts'
 import {
   PreflightError,
+  acquireCredentialsDirEnv,
   assertAgenticPreflight,
   buildTelemetry,
   describeModelMode,
@@ -385,7 +386,7 @@ Flags:
   --worker-concurrency <n>  override in-run Execution worker slots (1..${maxWorkerConcurrency}; omitted = dynamic AIMD)
   --data-dir <path>         Kovo Hunter data dir (default: $KOVO_DATA_DIR)
   --isolate-data-dir        per-cell isolated data dir (default ON for --verifier docker;
-                            credentials symlinked, key never copied)
+                            host credentials read via KOVO_CREDENTIALS_DIR, no symlink, key never copied)
   --no-isolate-data-dir     disable default per-cell data-dir isolation for --verifier docker
   --keep-data-dirs          keep isolated per-cell data dirs after grading
   --allow-inert-workers     override fail-fast guard for model profile + local-jq (still exits 2)
@@ -704,13 +705,27 @@ export interface MultihopPreflightInput {
   backendKind: VerifierBackendKind
   workerSessions: boolean
   workerSessionsDetail: string
+  profileLoadError?: string
 }
 
 /**
- * Enforces AGENTS.md fail-fast invariant: agentic runs with a model profile + `local-jq`
- * (or any backend incapable of opening worker sessions) fail immediately with exit code 2.
+ * Enforces AGENTS.md fail-fast invariants:
+ * 1) Agentic runs (`--no-llm` NOT set) MUST NEVER silently fall back to `deterministic-no-llm`
+ *    when 0 usable model profiles are loaded (e.g. missing --data-dir, bad KOVO_CREDENTIALS_DIR,
+ *    symlinked credentials, permission/pin failure).
+ * 2) Agentic runs with a model profile + `local-jq` (or any backend incapable of opening worker
+ *    sessions) fail immediately with exit code 2.
  */
 export function assertMultihopPreflight(input: MultihopPreflightInput): void {
+  if (!input.noLlm && !input.hasProfiles) {
+    const detail = input.profileLoadError ? ` (${input.profileLoadError})` : ''
+    throw new PreflightError(
+      `refusing silent fallback to deterministic-no-llm: agentic mode was requested (--no-llm not set), `
+      + `but 0 enabled model profiles loaded${detail}. `
+      + 'Set --data-dir / KOVO_DATA_DIR (and ensure host credentials are non-symlink owner-only 0700/0600 files), '
+      + 'or pass --no-llm for the deterministic floor.',
+    )
+  }
   if (!input.noLlm && input.hasProfiles && input.backendKind === 'local-jq' && !input.allowInertWorkers) {
     throw new PreflightError(
       'refusing inert agentic run: a model profile is enabled with --verifier local-jq '
@@ -2731,6 +2746,7 @@ export async function runCell(
 
   let dataDir = join(args.outDir, 'data', slug)
   let isolated: IsolatedDataDirResult | undefined
+  let releaseCredentialsDir: (() => void) | undefined
   let loadedSnapshot: ReturnType<typeof readRunSnapshot> | undefined
   if (resumeRequested) {
     const resumeDir = resolveResumeSnapshotDirectory(args.resumeSnapshotDir!, slug)
@@ -2758,13 +2774,17 @@ export async function runCell(
     snapshotMeta.resume.phase0Skipped = Boolean(loadedSnapshot.snapshot.coordinator.phase0CompletedAt)
     dataDir = join(args.outDir, 'data', `${slug}-resume`)
     copySnapshotDatabase({ snapshotDir: resumeDir, targetDir: dataDir })
-    linkSnapshotModelCredentials({
+    const linked = linkSnapshotModelCredentials({
       snapshotDb: join(dataDir, 'kovo.sqlite'),
       ...(sourceDataDir ? { sourceDataDir } : {}),
       targetDataDir: dataDir,
     })
+    if (linked.credentialsDir) {
+      releaseCredentialsDir = acquireCredentialsDirEnv(linked.credentialsDir)
+    }
   } else if (isolate && sourceDataDir) {
     isolated = prepareIsolatedDataDir({ sourceDataDir, targetDir: dataDir })
+    releaseCredentialsDir = acquireCredentialsDirEnv(isolated.credentialsDir)
   } else if (sourceDataDir) {
     dataDir = cellCount === 1 ? sourceDataDir : join(sourceDataDir, slug)
   }
@@ -2775,6 +2795,7 @@ export async function runCell(
     try {
       return openCellStore(dataDir)
     } catch (error) {
+      releaseCredentialsDir?.()
       if (isolated) { try { unlockAndRemove(dataDir) } catch { /* best-effort */ } }
       throw error
     }
@@ -2817,14 +2838,39 @@ export async function runCell(
   })
 
   try {
-    // --- Preflight (before booting any lab service): fail fast on model profile + local-jq ---
+    // --- Preflight (before booting any lab service): fail fast on missing model profile or local-jq ---
     let profiles: ResolvedModelProfile[] = []
-    try {
-      profiles = privateModelProfiles(storage)
-    } catch (error) {
-      notes.push(`model profile lookup failed: ${redact((error as Error).message).slice(0, 160)}`)
+    let profileLoadError: string | undefined
+    if (!args.noLlm) {
+      try {
+        const load = inspectModelProfileLoad(storage)
+        profiles = load.profiles
+        if (load.errors.length) {
+          profileLoadError = redact(load.errors.join('; ')).slice(0, 240)
+          notes.push(`model profile lookup diagnostic: ${profileLoadError}`)
+        } else if (load.profiles.length === 0) {
+          profileLoadError = load.enabledRows === 0
+            ? `no enabled model_profiles rows in ${dataDir}`
+            : `${load.enabledRows} enabled profile row(s) in SQLite failed credential/pin validation`
+        }
+      } catch (error) {
+        profileLoadError = redact((error as Error).message).slice(0, 240)
+        notes.push(`model profile lookup failed: ${profileLoadError}`)
+      }
+      if (profiles.length === 0) {
+        assertMultihopPreflight({
+          hasProfiles: false,
+          noLlm: false,
+          allowInertWorkers: args.allowInertWorkers,
+          backendKind: args.verifier === 'docker' ? 'docker' : 'local-jq',
+          workerSessions: false,
+          workerSessionsDetail: 'skipped after missing model profile',
+          ...(profileLoadError ? { profileLoadError } : {}),
+        })
+      }
+    } else {
+      notes.push('--no-llm: deterministic floor mode (model profiles ignored)')
     }
-    if (args.noLlm) notes.push('--no-llm: deterministic floor mode (model profiles ignored)')
     model = describeModelMode(args.noLlm ? [] : profiles)
 
     const selected = await (async () => {
@@ -3334,6 +3380,7 @@ export async function runCell(
     }
     if (whiteBoxRoot) { try { unlockAndRemove(whiteBoxRoot) } catch { /* best-effort */ } }
     try { storage.close() } catch { /* already closed */ }
+    releaseCredentialsDir?.()
     if (isolated && !args.keepDataDirs) { try { unlockAndRemove(dataDir) } catch { /* best-effort */ } }
   }
 }

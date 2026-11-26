@@ -1,7 +1,7 @@
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { accessSync, chmodSync, constants, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import type { Stats } from 'node:fs'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { and, desc, eq } from 'drizzle-orm'
 import type { z } from 'zod'
 import { providerSettings } from '../domain.ts'
@@ -64,6 +64,12 @@ function pinsEqual(a: string, b: string): boolean {
 const SAFE_CREDENTIAL_ID_RE = /^[A-Za-z0-9._-]{1,128}$/
 const PIN_LEDGER_FILENAME = '.pin-ledger.json'
 const PIN_HMAC_KEY_FILENAME = '.pin-hmac.key'
+export const CREDENTIALS_DIR_ENV = 'KOVO_CREDENTIALS_DIR'
+
+export interface ResolvedCredentialsDir {
+  dir: string
+  isOverride: boolean
+}
 
 function assertSafeCredentialId(credentialId: string): string {
   if (typeof credentialId !== 'string' || !SAFE_CREDENTIAL_ID_RE.test(credentialId) || credentialId === '.' || credentialId === '..') {
@@ -85,6 +91,43 @@ function assertNotSymlinkIfExists(path: string, label: string): Stats | null {
   }
 }
 
+/**
+ * Resolve the active credentials directory for reading model API keys and pins.
+ *
+ * When `KOVO_CREDENTIALS_DIR` is set, it acts as a strictly read-only host-side
+ * credentials directory override (used by isolated benchmark cells so secrets are
+ * neither copied nor symlinked). M-15 anti-symlink and owner-only permission
+ * checks (mode 0700 or read-only 0500) are enforced identically and never weakened.
+ */
+export function resolveCredentialsDir(
+  directory: string,
+  env: NodeJS.ProcessEnv = process.env,
+): ResolvedCredentialsDir {
+  const overrideRaw = env[CREDENTIALS_DIR_ENV]?.trim()
+  if (overrideRaw) {
+    const resolved = resolve(overrideRaw)
+    const st = assertNotSymlinkIfExists(resolved, `${CREDENTIALS_DIR_ENV} credentials directory`)
+    if (!st) {
+      throw new Error(`The ${CREDENTIALS_DIR_ENV} credentials directory does not exist.`)
+    }
+    if (!st.isDirectory()) {
+      throw new Error(`The ${CREDENTIALS_DIR_ENV} credentials path is not a directory.`)
+    }
+    const modeBits = st.mode & 0o7777
+    if (modeBits !== 0o700 && modeBits !== 0o500) {
+      throw new Error(`The ${CREDENTIALS_DIR_ENV} credentials directory must have owner-only permissions (mode 0700 or 0500).`)
+    }
+    accessSync(resolved, constants.R_OK | constants.X_OK)
+    return { dir: resolved, isOverride: true }
+  }
+  const dir = join(directory, 'credentials')
+  const st = assertNotSymlinkIfExists(dir, 'credentials directory')
+  if (st && !st.isDirectory()) {
+    throw new Error('The workspace credentials path is not a directory.')
+  }
+  return { dir, isOverride: false }
+}
+
 function ensureCredentialsDir(directory: string): string {
   const dir = join(directory, 'credentials')
   const existing = assertNotSymlinkIfExists(dir, 'credentials directory')
@@ -100,22 +143,27 @@ function ensureCredentialsDir(directory: string): string {
   return dir
 }
 
+function readPinHmacKeyFromDir(credDir: string): Buffer | null {
+  const keyPath = join(credDir, PIN_HMAC_KEY_FILENAME)
+  const st = assertNotSymlinkIfExists(keyPath, 'credential pin key')
+  if (!st) return null
+  if (!st.isFile() || (st.mode & 0o077) !== 0) {
+    throw new Error('The workspace credential pin key has invalid permissions.')
+  }
+  const raw = readFileSync(keyPath, 'utf8').trim()
+  if (!/^[0-9a-f]{64}$/i.test(raw)) {
+    throw new Error('The workspace credential pin key is malformed.')
+  }
+  return Buffer.from(raw, 'hex')
+}
+
 function loadOrCreatePinHmacKey(directory: string, createIfMissing: boolean): Buffer | null {
   const dir = join(directory, 'credentials')
-  const keyPath = join(dir, PIN_HMAC_KEY_FILENAME)
-  const st = assertNotSymlinkIfExists(keyPath, 'credential pin key')
-  if (st) {
-    if (!st.isFile() || (st.mode & 0o077) !== 0) {
-      throw new Error('The workspace credential pin key has invalid permissions.')
-    }
-    const raw = readFileSync(keyPath, 'utf8').trim()
-    if (!/^[0-9a-f]{64}$/i.test(raw)) {
-      throw new Error('The workspace credential pin key is malformed.')
-    }
-    return Buffer.from(raw, 'hex')
-  }
+  const existing = readPinHmacKeyFromDir(dir)
+  if (existing) return existing
   if (!createIfMissing) return null
   ensureCredentialsDir(directory)
+  const keyPath = join(dir, PIN_HMAC_KEY_FILENAME)
   const secret = randomBytes(32)
   const tmpPath = `${keyPath}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`
   try {
@@ -137,13 +185,12 @@ function computePinLedgerHmac(key: Buffer, pins: Record<string, string>): string
     .digest('hex')
 }
 
-function readPinLedger(directory: string): Map<string, string> {
-  const dir = join(directory, 'credentials')
-  const dirSt = assertNotSymlinkIfExists(dir, 'credentials directory')
+function readPinLedgerFromDir(credDir: string): Map<string, string> {
+  const dirSt = assertNotSymlinkIfExists(credDir, 'credentials directory')
   if (dirSt && !dirSt.isDirectory()) {
     throw new Error('The workspace credentials path is not a directory.')
   }
-  const ledgerPath = join(dir, PIN_LEDGER_FILENAME)
+  const ledgerPath = join(credDir, PIN_LEDGER_FILENAME)
   const st = assertNotSymlinkIfExists(ledgerPath, 'credential pin ledger')
   if (!st) {
     return new Map()
@@ -151,7 +198,7 @@ function readPinLedger(directory: string): Map<string, string> {
   if (!st.isFile() || (st.mode & 0o077) !== 0) {
     throw new Error('The workspace credential pin ledger has invalid permissions.')
   }
-  const key = loadOrCreatePinHmacKey(directory, false)
+  const key = readPinHmacKeyFromDir(credDir)
   if (!key) {
     throw new Error('The workspace credential pin key is missing.')
   }
@@ -189,7 +236,7 @@ function updatePinLedger(
   const dir = ensureCredentialsDir(directory)
   const ledgerPath = join(dir, PIN_LEDGER_FILENAME)
   assertNotSymlinkIfExists(ledgerPath, 'credential pin ledger')
-  const existing = readPinLedger(directory)
+  const existing = readPinLedgerFromDir(dir)
   mutate(existing)
   const key = loadOrCreatePinHmacKey(directory, true)!
   const pinsObj: Record<string, string> = {}
@@ -218,15 +265,16 @@ function credentialPinPath(directory: string, credentialId: string): string {
   return join(directory, 'credentials', `${safeId}.pin`)
 }
 
-function readCredentialPin(
-  directory: string,
+function readCredentialPinFromDir(
+  credDir: string,
   credentialId: string,
 ): { present: false; pinSha256: null } | { present: true; pinSha256: string } {
-  const dirSt = assertNotSymlinkIfExists(join(directory, 'credentials'), 'credentials directory')
+  const dirSt = assertNotSymlinkIfExists(credDir, 'credentials directory')
   if (dirSt && !dirSt.isDirectory()) {
     throw new Error('The workspace credentials path is not a directory.')
   }
-  const path = credentialPinPath(directory, credentialId)
+  const safeId = assertSafeCredentialId(credentialId)
+  const path = join(credDir, `${safeId}.pin`)
   const st = assertNotSymlinkIfExists(path, 'credential pin metadata')
   if (!st) {
     return { present: false, pinSha256: null }
@@ -278,13 +326,13 @@ function writeCredentialPin(
   return path
 }
 
-function credentialPath(directory: string, credentialId: string): string {
+function credentialPathInDir(credDir: string, credentialId: string): string {
   const safeId = assertSafeCredentialId(credentialId)
-  const dirSt = assertNotSymlinkIfExists(join(directory, 'credentials'), 'credentials directory')
+  const dirSt = assertNotSymlinkIfExists(credDir, 'credentials directory')
   if (dirSt && !dirSt.isDirectory()) {
     throw new Error('The workspace credentials path is not a directory.')
   }
-  const path = join(directory, 'credentials', safeId)
+  const path = join(credDir, safeId)
   const file = lstatSync(path)
   if (file.isSymbolicLink()) throw new Error('The workspace credential must not be a symbolic link.')
   if ((file.mode & 0o077) !== 0) throw new Error('The workspace credential must have owner-only permissions.')
@@ -335,49 +383,109 @@ export function publicModelSettings(storage: Store = store()) {
   return head ? { ...head, profiles } : null
 }
 
-export function privateModelProfiles(storage: Store = store()): ResolvedModelProfile[] {
+export interface ModelProfileLoadResult {
+  profiles: ResolvedModelProfile[]
+  enabledRows: number
+  errors: string[]
+}
+
+export function inspectModelProfileLoad(storage: Store = store()): ModelProfileLoadResult {
   const now = Date.now()
   const rows = storage.db.select().from(modelProfiles)
     .where(and(eq(modelProfiles.workspaceId, storage.workspace.id), eq(modelProfiles.enabled, true)))
     .orderBy(desc(modelProfiles.priority), desc(modelProfiles.updatedAt))
     .all()
+  let credTarget: ResolvedCredentialsDir
+  try {
+    credTarget = resolveCredentialsDir(storage.directory)
+  } catch (err) {
+    // Fail closed if credentials dir or KOVO_CREDENTIALS_DIR is a symlink, mispermissioned, or missing.
+    return {
+      profiles: [],
+      enabledRows: rows.length,
+      errors: [err instanceof Error ? err.message : String(err)],
+    }
+  }
   let ledger: Map<string, string>
   try {
-    ledger = readPinLedger(storage.directory)
-  } catch {
+    ledger = readPinLedgerFromDir(credTarget.dir)
+  } catch (err) {
     // Fail closed if the workspace pin ledger is a symlink, mispermissioned, or HMAC-tampered.
-    return []
+    return {
+      profiles: [],
+      enabledRows: rows.length,
+      errors: [err instanceof Error ? err.message : String(err)],
+    }
+  }
+  const localCredDir = resolve(join(storage.directory, 'credentials'))
+  const useLocalFallbackLedger = credTarget.isOverride && localCredDir !== credTarget.dir
+  let localLedger: Map<string, string> | null = null
+  if (useLocalFallbackLedger) {
+    try {
+      localLedger = readPinLedgerFromDir(localCredDir)
+    } catch (err) {
+      return {
+        profiles: [],
+        enabledRows: rows.length,
+        errors: [err instanceof Error ? err.message : String(err)],
+      }
+    }
   }
   const resolved: ResolvedModelProfile[] = []
+  const errors: string[] = []
   for (const row of rows) {
     try {
       const expectedPin = computeCredentialEndpointPin(row.endpoint, row.protocol)
-      const pin = readCredentialPin(storage.directory, row.credentialId)
+      const safeId = assertSafeCredentialId(row.credentialId)
+      const pin = readCredentialPinFromDir(credTarget.dir, safeId)
       if (pin.present) {
         if (!pinsEqual(pin.pinSha256, expectedPin)) {
           // Stored API key is pinned to a different (endpoint, protocol) pair; refuse to load.
+          errors.push(`profile '${row.name}' credential pin mismatch`)
           continue
         }
       } else {
-        const ledgerPin = ledger.get(assertSafeCredentialId(row.credentialId))
+        const ledgerPin = ledger.get(safeId)
         if (ledgerPin !== undefined) {
           if (!pinsEqual(ledgerPin, expectedPin)) {
             // Sidecar .pin was removed and SQLite endpoint/protocol was altered; fail closed.
+            errors.push(`profile '${row.name}' credential pin ledger mismatch`)
             continue
+          }
+        } else if (credTarget.isOverride) {
+          // Read-only host-side KOVO_CREDENTIALS_DIR override: never write to credTarget.dir.
+          // Validate the host credential strictly first, then bind legacy unpinned credentials
+          // into this isolated workspace's own local pin ledger so per-workspace SQLite tampering
+          // still fails closed without mutating or racing on the shared read-only host directory.
+          const credFile = credentialPathInDir(credTarget.dir, safeId)
+          void credFile
+          if (useLocalFallbackLedger && localLedger) {
+            const localPin = localLedger.get(safeId)
+            if (localPin !== undefined) {
+              if (!pinsEqual(localPin, expectedPin)) {
+                errors.push(`profile '${row.name}' local workspace pin ledger mismatch`)
+                continue
+              }
+            } else {
+              updatePinLedger(storage.directory, pins => {
+                if (!pins.has(safeId)) pins.set(safeId, expectedPin)
+              })
+              localLedger.set(safeId, expectedPin)
+            }
           }
         } else {
           // Genuine pre-M-15 legacy profile with neither .pin nor ledger entry: bind its
           // current (endpoint, protocol) into the HMAC-authenticated ledger on first observation
           // so any subsequent tampering fails closed even without a sidecar .pin file.
-          const credFile = credentialPath(storage.directory, row.credentialId)
+          const credFile = credentialPathInDir(credTarget.dir, safeId)
           void credFile
           updatePinLedger(storage.directory, pins => {
-            if (!pins.has(row.credentialId)) pins.set(row.credentialId, expectedPin)
+            if (!pins.has(safeId)) pins.set(safeId, expectedPin)
           })
-          ledger.set(row.credentialId, expectedPin)
+          ledger.set(safeId, expectedPin)
         }
       }
-      const key = readFileSync(credentialPath(storage.directory, row.credentialId), 'utf8').trim()
+      const key = readFileSync(credentialPathInDir(credTarget.dir, safeId), 'utf8').trim()
       let healthState = row.healthState
       let cooldownUntil = row.cooldownUntil
       if (healthState === 'open' && cooldownUntil !== null && cooldownUntil <= now) {
@@ -406,11 +514,16 @@ export function privateModelProfiles(storage: Store = store()): ResolvedModelPro
         cooldownUntil,
         lastError: row.lastError,
       })
-    } catch {
+    } catch (err) {
       // Skip unreadable or improperly permissioned credentials.
+      errors.push(`profile '${row.name}': ${err instanceof Error ? err.message : String(err)}`)
     }
   }
-  return resolved
+  return { profiles: resolved, enabledRows: rows.length, errors }
+}
+
+export function privateModelProfiles(storage: Store = store()): ResolvedModelProfile[] {
+  return inspectModelProfileLoad(storage).profiles
 }
 
 export function privateModelSettings(storage: Store = store()): ResolvedModelProfile | null {
@@ -552,17 +665,26 @@ function resolveEffectiveKey(
   if (!pinsEqual(requestedPin, existingPin)) {
     throw new Error('Changing a model profile endpoint or protocol requires re-entering the API key.')
   }
-  const storedPin = readCredentialPin(storage.directory, existing.credentialId)
+  const credTarget = resolveCredentialsDir(storage.directory)
+  const storedPin = readCredentialPinFromDir(credTarget.dir, existing.credentialId)
   if (storedPin.present && !pinsEqual(storedPin.pinSha256, requestedPin)) {
     throw new Error('Stored API key is pinned to a different endpoint or protocol. Re-enter the API key to continue.')
   }
-  const ledger = readPinLedger(storage.directory)
+  const ledger = readPinLedgerFromDir(credTarget.dir)
   const ledgerPin = ledger.get(assertSafeCredentialId(existing.credentialId))
   if (ledgerPin !== undefined && !pinsEqual(ledgerPin, requestedPin)) {
     throw new Error('Stored API key is pinned to a different endpoint or protocol. Re-enter the API key to continue.')
   }
+  const localCredDir = resolve(join(storage.directory, 'credentials'))
+  if (credTarget.isOverride && localCredDir !== credTarget.dir) {
+    const localLedger = readPinLedgerFromDir(localCredDir)
+    const localPin = localLedger.get(assertSafeCredentialId(existing.credentialId))
+    if (localPin !== undefined && !pinsEqual(localPin, requestedPin)) {
+      throw new Error('Stored API key is pinned to a different endpoint or protocol. Re-enter the API key to continue.')
+    }
+  }
 
-  return readFileSync(credentialPath(storage.directory, existing.credentialId), 'utf8').trim()
+  return readFileSync(credentialPathInDir(credTarget.dir, existing.credentialId), 'utf8').trim()
 }
 
 export async function checkModelConnection(
@@ -582,7 +704,8 @@ export async function checkModelConnection(
     let matchesStoredKey = !parsed.key
     if (!matchesStoredKey) {
       try {
-        matchesStoredKey = resolvedKey === readFileSync(credentialPath(storage.directory, existing.credentialId), 'utf8').trim()
+        const credTarget = resolveCredentialsDir(storage.directory)
+        matchesStoredKey = resolvedKey === readFileSync(credentialPathInDir(credTarget.dir, existing.credentialId), 'utf8').trim()
       } catch {
         matchesStoredKey = false
       }
