@@ -29,7 +29,12 @@ jobs:
           node scripts/check-v8-contamination.ts
           node scripts/check-unwired.ts
           node scripts/check-contract-change.ts --base "$CONTRACT_BASE"
-      - run: npm run check
+      - name: Typecheck and enforce tsc memory/time budget
+        env:
+          NODE_OPTIONS: "--max-old-space-size=6144"
+        run: |
+          npm run check -- --extendedDiagnostics | tee /tmp/tsc-extended-diagnostics.txt
+          node scripts/check-tsc-budget.ts --from-file /tmp/tsc-extended-diagnostics.txt
       - name: Run fast hermetic unit suites (quarantine & orphan enforced)
         run: bash scripts/run-fast-tests.sh --suites-only --quarantine tests/QUARANTINE.json
       - run: npx playwright install --with-deps chromium

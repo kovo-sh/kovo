@@ -18,6 +18,7 @@
 #   --clear-red-lock         Allow running while red-main lock exists; removes lock ONLY on PASS
 #   --set-red-lock [reason]  Create external red-main lock file and exit 0
 #   --gate-cmd <cmd>         Override gate command (default: bash scripts/worker-gate.sh)
+#   --skip-ci-check          Skip querying GitHub Actions verify.yml status via gh
 #   --no-ff                  Create a merge commit even if fast-forward is possible
 #   --json                   Emit machine-readable JSON summary to stdout
 #   -h, --help               Show usage
@@ -25,6 +26,8 @@
 # Environment:
 #   KOVO_GATE_STATE_DIR      Directory for main-red.lock (default: $HOME/.config/kovo)
 #   KOVO_MERGE_GATE_CMD      Override default gate command
+#   KOVO_MERGE_SKIP_CI_CHECK Set to 1 to skip GitHub Actions verify.yml check
+#   KOVO_GH_BIN              Override gh CLI binary (default: gh)
 set -euo pipefail
 
 BASE_REF="main"
@@ -33,9 +36,11 @@ DRY_RUN=0
 CLEAR_RED_LOCK=0
 SET_RED_LOCK=0
 SET_RED_REASON=""
+SKIP_CI_CHECK="${KOVO_MERGE_SKIP_CI_CHECK:-0}"
 NO_FF=0
 JSON_OUT=0
 GATE_CMD="${KOVO_MERGE_GATE_CMD:-bash scripts/worker-gate.sh}"
+GH_BIN="${KOVO_GH_BIN:-gh}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -65,6 +70,10 @@ while [[ $# -gt 0 ]]; do
       GATE_CMD="${2:?--gate-cmd requires a command}"
       shift 2
       ;;
+    --skip-ci-check)
+      SKIP_CI_CHECK=1
+      shift
+      ;;
     --no-ff)
       NO_FF=1
       shift
@@ -74,7 +83,7 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     -h|--help)
-      sed -n '2,27p' "$0"
+      sed -n '2,30p' "$0"
       exit 0
       ;;
     -*)
@@ -177,6 +186,40 @@ else
   STREAM_SHA="$BASE_SHA"
 fi
 
+# 0. Query GitHub Actions verify.yml status on BASE_REF and auto-set main-red.lock on failure.
+if [[ "$CLEAR_RED_LOCK" -eq 0 && "$SKIP_CI_CHECK" != "1" ]]; then
+  if command -v "$GH_BIN" >/dev/null 2>&1 || [[ -x "$GH_BIN" ]]; then
+    set +e
+    ci_raw="$("$GH_BIN" run list --workflow verify.yml --branch "$BASE_REF" --limit 1 --json conclusion,status,databaseId 2>/dev/null)"
+    ci_rc=$?
+    set -e
+    if (( ci_rc == 0 )) && [[ -n "$ci_raw" ]]; then
+      ci_parsed="$(node -e '
+        try {
+          const runs = JSON.parse(process.argv[1]);
+          if (Array.isArray(runs) && runs.length > 0) {
+            const r = runs[0] || {};
+            console.log(`${r.conclusion || ""}|${r.status || ""}|${r.databaseId || ""}`);
+          }
+        } catch {}
+      ' "$ci_raw" 2>/dev/null || true)"
+      if [[ -n "$ci_parsed" ]]; then
+        IFS='|' read -r ci_conclusion ci_status ci_run_id <<< "$ci_parsed"
+        if [[ "$ci_conclusion" == "failure" ]]; then
+          mkdir -p "$STATE_DIR"
+          ci_reason="CI verify.yml run #${ci_run_id:-unknown} concluded failure on ${BASE_REF}"
+          printf 'locked_at=%s\nbase=%s\nsha=%s\nreason=%s\nsource=ci_check\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$BASE_REF" "$BASE_SHA" "$ci_reason" >"$LOCK_FILE"
+        fi
+      fi
+    else
+      echo "merge-stream: notice — skipping CI check (gh unavailable/offline or no GitHub remote for '${BASE_REF}')" >&2
+    fi
+  else
+    echo "merge-stream: notice — skipping CI check ('${GH_BIN}' not found)" >&2
+  fi
+fi
+
 # 1. External red-main lock check (blocks ALL merges until resolved and re-verified with --clear-red-lock).
 if [[ -f "$LOCK_FILE" && "$CLEAR_RED_LOCK" -eq 0 ]]; then
   lock_summary="$(tr '\n' '; ' <"$LOCK_FILE" | sed 's/; $//')"
@@ -202,6 +245,10 @@ git -C "$REPO_ROOT" worktree add --quiet --detach "$WORKTREE_DIR" "$BASE_SHA"
 if [[ -e "${REPO_ROOT}/node_modules" && ! -e "${WORKTREE_DIR}/node_modules" ]]; then
   nm_target="$(readlink -f "${REPO_ROOT}/node_modules" 2>/dev/null || echo "${REPO_ROOT}/node_modules")"
   ln -s "$nm_target" "${WORKTREE_DIR}/node_modules"
+fi
+if [[ -e "${REPO_ROOT}/worker/node_modules" && -d "${WORKTREE_DIR}/worker" && ! -e "${WORKTREE_DIR}/worker/node_modules" ]]; then
+  wnm_target="$(readlink -f "${REPO_ROOT}/worker/node_modules" 2>/dev/null || echo "${REPO_ROOT}/worker/node_modules")"
+  ln -s "$wnm_target" "${WORKTREE_DIR}/worker/node_modules"
 fi
 
 # 3. Merge candidate branch/commit onto BASE_SHA inside the temporary worktree.
@@ -270,6 +317,18 @@ if (( DRY_RUN == 1 )); then
   exit 0
 fi
 
+# 5.5 Stamp refs/notes/merge-gate on MERGED_SHA BEFORE fast-forwarding BASE_REF so
+#     .githooks/reference-transaction verifies the merged tree passed the gate.
+MERGED_TREE_SHA="$(git -C "$REPO_ROOT" rev-parse --verify "${MERGED_SHA}^{tree}")"
+GATE_DIGEST="$(
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s|%s|%s|%s' "$BASE_SHA" "$MERGED_SHA" "$MERGED_TREE_SHA" "$GATE_CMD" | sha256sum | awk '{print $1}'
+  else
+    node -e 'const c=require("node:crypto");console.log(c.createHash("sha256").update(process.argv[1]).digest("hex"))' "${BASE_SHA}|${MERGED_SHA}|${MERGED_TREE_SHA}|${GATE_CMD}"
+  fi
+)"
+git -C "$REPO_ROOT" notes --ref=refs/notes/merge-gate add -f -m "merge-gate: PASS ${GATE_DIGEST} ${MERGED_TREE_SHA}" "$MERGED_SHA" >/dev/null 2>&1
+
 # 6. Fast-forward BASE_REF ONLY on PASS (with CAS check against concurrent base movement).
 if [[ "$MERGED_SHA" != "$BASE_SHA" ]]; then
   current_base_sha="$(git -C "$REPO_ROOT" rev-parse --verify "refs/heads/${BASE_REF}^{commit}" 2>/dev/null || true)"
@@ -319,7 +378,7 @@ if [[ "$MERGED_SHA" != "$BASE_SHA" ]]; then
       }
     fi
   else
-    git -C "$REPO_ROOT" update-ref "refs/heads/${BASE_REF}" "$MERGED_SHA" "$BASE_SHA"
+    git -C "$REPO_ROOT" update-ref -m "merge-stream: Fast-forward ${STREAM_REF:-$BASE_REF}" "refs/heads/${BASE_REF}" "$MERGED_SHA" "$BASE_SHA"
   fi
 fi
 

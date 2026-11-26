@@ -15,49 +15,23 @@ import { dirname, resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { redact, scanSecrets } from './redact.ts'
 
-export const CAPABILITY_KINDS = [
-  'identity_session', 'scoped_token', 'signing_material', 'signed_artifact_or_url',
-  'opaque_object_ref', 'state_handle', 'write_sink_handle', 'internal_reach_handle',
-  'parser_or_cache_primitive', 'policy_asymmetry',
-] as const
+export const CAPABILITY_KINDS = ['identity_session', 'scoped_token', 'signing_material', 'signed_artifact_or_url', 'opaque_object_ref', 'state_handle', 'write_sink_handle', 'internal_reach_handle', 'parser_or_cache_primitive', 'policy_asymmetry'] as const
 export type CapabilityKind = (typeof CAPABILITY_KINDS)[number]
-
-export const CAPABILITY_SURFACES = [
-  'http', 'graphql', 'ws', 'sse', 'browser', 'webhook', 'async_job', 'idp', 'cdn', 'storage',
-] as const
+export const CAPABILITY_SURFACES = ['http', 'graphql', 'ws', 'sse', 'browser', 'webhook', 'async_job', 'idp', 'cdn', 'storage'] as const
 export type CapabilitySurface = (typeof CAPABILITY_SURFACES)[number]
-
-export const CAPABILITY_TEMPORAL_STATES = [
-  'active', 'pending', 'revoked', 'demoted', 'expired', 'primed_cache',
-] as const
+export const CAPABILITY_TEMPORAL_STATES = ['active', 'pending', 'revoked', 'demoted', 'expired', 'primed_cache'] as const
 export type CapabilityTemporalState = (typeof CAPABILITY_TEMPORAL_STATES)[number]
-
 export const PROMOTION_STATUSES = ['capability_only', 'terminal_eligible'] as const
 export type PromotionStatus = (typeof PROMOTION_STATUSES)[number]
-
-export const CAPABILITY_PROVENANCES = [
-  'attacker_seed', 'derived_hop', 'floor_observation', 'static_analysis',
-  'runtime_discovery', 'oob_callback', 'async_poll', 'browser_trace',
-] as const
+export const CAPABILITY_PROVENANCES = ['attacker_seed', 'derived_hop', 'floor_observation', 'static_analysis', 'runtime_discovery', 'oob_callback', 'async_poll', 'browser_trace'] as const
 export type CapabilityProvenance = (typeof CAPABILITY_PROVENANCES)[number]
-
-export const CAUSAL_EDGE_BINDING_KINDS = [
-  'value_binding', 'derived_crypto_binding', 'state_transition_binding', 'async_pivot_binding',
-] as const
+export const CAUSAL_EDGE_BINDING_KINDS = ['value_binding', 'derived_crypto_binding', 'state_transition_binding', 'async_pivot_binding'] as const
 export type CausalEdgeBindingKind = (typeof CAUSAL_EDGE_BINDING_KINDS)[number]
-
-export const NEGATIVE_EDGE_REASONS = [
-  'invariant_enforced_hardened', 'control_blocked_cleanly', 'decoy_guard_verified',
-] as const
+export const NEGATIVE_EDGE_REASONS = ['invariant_enforced_hardened', 'control_blocked_cleanly', 'decoy_guard_verified'] as const
 export type NegativeEdgeReason = (typeof NEGATIVE_EDGE_REASONS)[number]
 
-export const ALWAYS_QUARANTINED_KINDS: ReadonlySet<CapabilityKind> = new Set([
-  'opaque_object_ref', 'policy_asymmetry', 'write_sink_handle',
-])
-const AUTHORITY_GRANTING_KINDS: ReadonlySet<CapabilityKind> = new Set([
-  'identity_session', 'scoped_token', 'signing_material', 'signed_artifact_or_url',
-])
-
+export const ALWAYS_QUARANTINED_KINDS: ReadonlySet<CapabilityKind> = new Set(['opaque_object_ref', 'policy_asymmetry', 'write_sink_handle'])
+const AUTHORITY_GRANTING_KINDS: ReadonlySet<CapabilityKind> = new Set(['identity_session', 'scoped_token', 'signing_material', 'signed_artifact_or_url'])
 const KIND_SET: ReadonlySet<string> = new Set(CAPABILITY_KINDS)
 const SURFACE_SET: ReadonlySet<string> = new Set(CAPABILITY_SURFACES)
 const TEMPORAL_SET: ReadonlySet<string> = new Set(CAPABILITY_TEMPORAL_STATES)
@@ -66,12 +40,9 @@ const PROVENANCE_SET: ReadonlySet<string> = new Set(CAPABILITY_PROVENANCES)
 const BINDING_SET: ReadonlySet<string> = new Set(CAUSAL_EDGE_BINDING_KINDS)
 const NEGATIVE_REASON_SET: ReadonlySet<string> = new Set(NEGATIVE_EDGE_REASONS)
 
-export const DERIVED_CAPABILITY_HANDLE_RE =
-  /^cap:hop_[A-Za-z0-9][A-Za-z0-9._-]{0,63}:[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
-const DERIVED_HANDLE_GLOBAL_RE =
-  /cap:hop_[A-Za-z0-9][A-Za-z0-9._-]{0,63}:[A-Za-z0-9][A-Za-z0-9._-]{0,63}/g
+export const DERIVED_CAPABILITY_HANDLE_RE = /^cap:hop_[A-Za-z0-9][A-Za-z0-9._-]{0,63}:[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
+const DERIVED_HANDLE_GLOBAL_RE = /cap:hop_[A-Za-z0-9][A-Za-z0-9._-]{0,63}:[A-Za-z0-9][A-Za-z0-9._-]{0,63}/g
 const SHA256_HEX_RE = /^[a-f0-9]{64}$/i
-
 export const DEFAULT_PRUNE_STRIKE_THRESHOLD = 2
 export const DEFAULT_CHECKPOINT_BRIEF_MAX_BYTES = 2048
 const MIN_CHECKPOINT_BRIEF_MAX_BYTES = 512
@@ -161,26 +132,18 @@ export interface HopCheckpointNextGoal {
   targetSurfaceKey: string; surface: CapabilitySurface; service: string; endpoint: string; method?: string
   hypothesisClass: string; expectedBinding?: CausalEdgeBindingKind; targetTenant?: string; targetRole?: string; goal: string
 }
-export interface HopWorkflowNotebook {
-  discoveredRoutes?: string[]
-  verifiedHypotheses?: string[]
-  triedRecipes?: string[]
-  openHypotheses?: string[]
-}
+export interface HopWorkflowNotebook { discoveredRoutes?: string[]; verifiedHypotheses?: string[]; triedRecipes?: string[]; openHypotheses?: string[] }
 export interface HopCheckpointBrief {
   schema: 'v8.hop_checkpoint.v1'; branchKey: string; depth: number; targetHop: number
   mode: 'pivot' | 'fuse' | 'discover' | 'sweep'; evi: number
   verifiedHops: CompactCheckpointHop[]; omittedEarlierHops?: number
-  capabilityHandles: string[]; fuseWithBranchKey?: string
-  nextGoal: HopCheckpointNextGoal
+  capabilityHandles: string[]; fuseWithBranchKey?: string; nextGoal: HopCheckpointNextGoal
   prunedBranches?: Array<{ surface: string; hypothesis: string; reason: NegativeEdgeReason }>
-  workflowNotebook?: HopWorkflowNotebook
-  truncated?: boolean; doNotRediscover: true
+  workflowNotebook?: HopWorkflowNotebook; truncated?: boolean; doNotRediscover: true
 }
 export interface HopCheckpointBriefOptions {
   branchKey?: string; evi?: number; mode?: 'pivot' | 'fuse' | 'discover' | 'sweep'
-  fuseWithBranchKey?: string; nextGoal?: Partial<HopCheckpointNextGoal>
-  workflowNotebook?: HopWorkflowNotebook
+  fuseWithBranchKey?: string; nextGoal?: Partial<HopCheckpointNextGoal>; workflowNotebook?: HopWorkflowNotebook
 }
 
 const OPAQUE_BRIEF_HANDLE_RE = /^(?:cap|state|ref|hop|handle|secret|artifact|id):[A-Za-z0-9:._/-]{1,96}$/
@@ -221,17 +184,10 @@ export function sanitizeWorkflowNotebook(nb?: HopWorkflowNotebook): HopWorkflowN
   if (!nb) return undefined
   const clean = (items: readonly string[] | undefined, maxItems: number, maxLen: number): string[] =>
     [...new Set((items ?? []).map(v => scrubNotebookItem(String(v ?? ''), maxLen)).filter(Boolean))].slice(0, maxItems)
-  const discoveredRoutes = clean(nb.discoveredRoutes, 10, 88)
-  const verifiedHypotheses = clean(nb.verifiedHypotheses, 6, 110)
-  const triedRecipes = clean(nb.triedRecipes, 10, 110)
-  const openHypotheses = clean(nb.openHypotheses, 6, 110)
+  const discoveredRoutes = clean(nb.discoveredRoutes, 10, 88), verifiedHypotheses = clean(nb.verifiedHypotheses, 6, 110)
+  const triedRecipes = clean(nb.triedRecipes, 10, 110), openHypotheses = clean(nb.openHypotheses, 6, 110)
   if (!discoveredRoutes.length && !verifiedHypotheses.length && !triedRecipes.length && !openHypotheses.length) return undefined
-  return {
-    ...(discoveredRoutes.length ? { discoveredRoutes } : {}),
-    ...(verifiedHypotheses.length ? { verifiedHypotheses } : {}),
-    ...(triedRecipes.length ? { triedRecipes } : {}),
-    ...(openHypotheses.length ? { openHypotheses } : {}),
-  }
+  return { ...(discoveredRoutes.length ? { discoveredRoutes } : {}), ...(verifiedHypotheses.length ? { verifiedHypotheses } : {}), ...(triedRecipes.length ? { triedRecipes } : {}), ...(openHypotheses.length ? { openHypotheses } : {}) }
 }
 
 /** Strictly bound a canonical `v8.hop_checkpoint.v1` brief to `<= maxBytes` UTF-8 (default 2 KB). */
@@ -279,20 +235,9 @@ export function finalizeHopCheckpointBrief(rawBrief: HopCheckpointBrief, maxByte
   return { brief, checkpointJson: m.json, checkpointBytes: m.bytes }
 }
 
-export interface CapabilityLedgerStats {
-  totalNodes: number; quarantinedNodes: number; terminalEligibleNodes: number
-  positiveEdges: number; negativeEdges: number; prunedBranches: number
-}
-
-export interface CapabilityLedgerOptions {
-  runId?: string
-  pruneStrikeThreshold?: number
-}
-
-function fail(code: CapabilityLedgerErrorCode, message: string): never {
-  throw new CapabilityLedgerError(code, message)
-}
-
+export interface CapabilityLedgerStats { totalNodes: number; quarantinedNodes: number; terminalEligibleNodes: number; positiveEdges: number; negativeEdges: number; prunedBranches: number }
+export interface CapabilityLedgerOptions { runId?: string; pruneStrikeThreshold?: number }
+function fail(code: CapabilityLedgerErrorCode, message: string): never { throw new CapabilityLedgerError(code, message) }
 export const isDerivedCapabilityHandle = (value: string): boolean => DERIVED_CAPABILITY_HANDLE_RE.test(value)
 
 export function formatDerivedCapabilityHandle(hopId: string, slot: string): string {
@@ -360,16 +305,8 @@ const reqEnum = <T extends string>(value: string, allowed: ReadonlySet<string>, 
 const reqTimestamp = (value: number, field: string): number =>
   Number.isInteger(value) && value >= 0 ? value : fail('INVALID_ARGUMENT', `${field} must be a non-negative integer.`)
 
-function dedupeStrings(values: readonly string[] | undefined, field: string): string[] {
-  if (!values) return []
-  const out: string[] = []
-  const seen = new Set<string>()
-  for (const v of values) {
-    const s = reqStr(v, field)
-    if (!seen.has(s)) { seen.add(s); out.push(s) }
-  }
-  return out
-}
+const dedupeStrings = (values: readonly string[] | undefined, field: string): string[] =>
+  values ? [...new Set(values.map(v => reqStr(v, field)))] : []
 
 /** Idempotently initializes the v8 CapabilityLedger SQLite tables and indexes. */
 export function initCapabilityLedgerSchema(db: DatabaseSync): void {
