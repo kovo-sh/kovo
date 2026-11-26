@@ -1368,7 +1368,10 @@ export class ExecFloorLane extends ExecServiceModule<ExecFloorLaneHost> {
       exchangeIds: [...new Set(input.exchangeIds)].slice(0, 6),
       evidenceIds: [artifact.id],
     })
-    const saved = this.storage.upsertChainFinding(input.run, input.asset.id, finding, specRow.id, origins)
+    const saved = this.storage.upsertChainFinding(
+      input.run, input.asset.id, finding, specRow.id, origins,
+      { provenance: 'floor' },
+    )
     this.storage.makeWorker(
       input.run, 'verification', input.asset, `Replay verify · ${spec.title.slice(0, 80)}`,
       `Zero-LLM deterministic replay verification of deterministically proposed spec ${specRow.id}.`,
