@@ -309,7 +309,7 @@ test('MEDIUM #10: agent rationale cannot reach the safety judge or weaken its de
     offline: false,
     llmCall: async ({ systemPrompt, userPrompt }) => {
       promptSeen = `${systemPrompt}\n${userPrompt}`
-      return JSON.stringify({ decision: 'escalate_human', riskLevel: 'medium', reason: 'Judge reached an independent escalation.' })
+      return JSON.stringify({ decision: 'escalate_human', riskLevel: 'high', reason: 'Judge reached an independent escalation.' })
     },
   })
   assert.equal(result.decision, 'escalate_human', 'rationale text must not flip escalate to approve')
