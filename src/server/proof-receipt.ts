@@ -45,7 +45,6 @@ import {
   type WireCredentialProvenance,
 } from './host-fact-log.ts'
 import {
-  assessBooleanDifferential,
   assessImpactEvidence,
   assessInjectionImpact,
   assessStatusOnlyDivergence,
@@ -54,13 +53,38 @@ import {
   knownOracleEvent,
   routeFamily,
   stepMutatesState,
-  verifyBooleanTriangleBinding,
 } from './oracle-invariants.ts'
-import type { BooleanDifferentialArm, BooleanDifferentialRound, ImpactClass, ImpactInput, ImpactStep, RoleName } from './oracle-invariants.ts'
+import type { ImpactClass, ImpactInput, ImpactStep, RoleName } from './oracle-invariants.ts'
+import {
+  assessBooleanDifferential,
+  hasEqualLengthAndCharMultiset,
+  stepToBooleanArm,
+  verifyBooleanTriangleBinding,
+  verifyStampedBooleanPairRound as verifyStampedBooleanPairRoundKernel,
+  type BooleanDifferentialArm,
+  type BooleanDifferentialRound,
+} from './proof-kernel/boolean-differential.ts'
+import {
+  carrierEchoesSignedUrlNeedles,
+  carrierReflectsExpressionOutput,
+  extractSignedUrlNeedlesFromResponse,
+  hasTraversalOrSeparatorDifferential,
+  normalizeRequestCarrier,
+  type NormalizedRequestCarrier,
+  type RequestCarrierInput,
+} from './proof-kernel/reflection.ts'
+import {
+  assertLegitimateControl,
+  transcriptEntryToControlExchange,
+} from './proof-kernel/control-legitimacy.ts'
+import { evaluateMustBeNonPublicStage } from './proof-kernel/publicness.ts'
+export { normalizeRequestCarrier }
+export type { NormalizedRequestCarrier, RequestCarrierInput }
 import { isJobOrHandleStub } from './v8-oracle-families.ts'
 import { deriveBooleanRemediationCode, deriveImpactRemediationCode, type OracleFailureCode } from './retry-governor.ts'
 import { assessSignedUrlMintDifferential, type SignedUrlMintExchange } from './verify-support.ts'
 import {
+  DEFAULT_ORACLE_SPEC_REGISTRY,
   canonicalVulnClassForImpact,
   isAuthBypassLabel,
   isConservedBalanceLabel,
@@ -169,10 +193,6 @@ export interface HostStampedBooleanPair {
   readonly param?: string | null
   readonly style?: BooleanPairStyle
   readonly nonceStamp?: NonceStamp
-}
-
-function sortedCharMultiset(value: string): string {
-  return [...value].sort().join('')
 }
 
 const expressionPayloadDigest = (c: Omit<HostMintedExpressionChallenge, 'nonceStamp'>) =>
@@ -369,8 +389,8 @@ export class HostMintedOracle {
     if (!nonceStamp || !stampMatchesChallengeId(nonceStamp.stampId, stamp.challengeId)) return null
     const payloadDigest = booleanPairPayloadDigest(stored)
     if (!this.ledger.verifyStamp(nonceStamp, { ...expected, runId, oracleId: 'boolean', payloadDigest })) return null
-    if (stored.baseValue.trim().length === 0 || stored.trueValue.length !== stored.falseValue.length || stored.trueValue === stored.falseValue) return null
-    if (!stored.trueValue.startsWith(stored.baseValue) || !stored.falseValue.startsWith(stored.baseValue) || sortedCharMultiset(stored.trueValue) !== sortedCharMultiset(stored.falseValue)) return null
+    if (stored.baseValue.trim().length === 0 || !hasEqualLengthAndCharMultiset(stored.trueValue, stored.falseValue)) return null
+    if (!stored.trueValue.startsWith(stored.baseValue) || !stored.falseValue.startsWith(stored.baseValue)) return null
     if (stamp.baseValue !== stored.baseValue || stamp.trueValue !== stored.trueValue || stamp.falseValue !== stored.falseValue) return null
     if (stamp.arm !== 'baseline' && stamp.arm !== 'true' && stamp.arm !== 'false') return null
     const expectedValue = stamp.arm === 'baseline' ? stored.baseValue : stamp.arm === 'true' ? stored.trueValue : stored.falseValue
@@ -2214,191 +2234,6 @@ function authBypassRequestDifferential(
   return null
 }
 
-function probeCarriedHostCredentialControlLacked(
-  control: ReceiptTranscriptEntry,
-  probe: ReceiptTranscriptEntry,
-  allEntries: readonly ReceiptTranscriptEntry[],
-): string | null {
-  const ctlHandle = normalizedAuthHandle(control.step.actor.handle)
-  const prbHandle = normalizedAuthHandle(probe.step.actor.handle)
-  if (prbHandle !== null && prbHandle !== ctlHandle) {
-    if (ctlHandle === null) {
-      return `Normal authenticated persona "${probe.step.actor.handle}" crossing an unauthenticated 401 is standard login, not an authentication bypass.`
-    }
-    return `Auth bypass rejected: probe used a different authenticated persona ("${probe.step.actor.handle}" vs control "${control.step.actor.handle}"); switching personas is not an authentication bypass.`
-  }
-  if (authRoleRank(probe.step.actor.role) > authRoleRank(control.step.actor.role)) {
-    return `Auth bypass rejected: probe carried higher role privileges ("${probe.step.actor.role}" vs control "${control.step.actor.role ?? 'none'}"); normal RBAC is not an authentication bypass.`
-  }
-
-  // Sealed capability check: reject if probe consumed any host-sealed capability that control lacked.
-  const ctlCaps = new Set<string>([
-    ...(control.consumedCapabilityId ? [control.consumedCapabilityId] : []),
-    ...(control.consumedCapabilities ?? []),
-  ])
-  const prbCaps = [
-    ...(probe.consumedCapabilityId ? [probe.consumedCapabilityId] : []),
-    ...(probe.consumedCapabilities ?? []),
-  ]
-  if (prbCaps.some(cap => !ctlCaps.has(cap))) {
-    return 'Auth bypass rejected: probe carried a host-sealed capability that the control lacked (authenticated session reuse is not an authentication bypass).'
-  }
-  const ctlHeaders = canonicalRequestHeaderMap(control.step.requestHeaders)
-  const prbHeaders = canonicalRequestHeaderMap(probe.step.requestHeaders)
-  for (const [k, v] of Object.entries(prbHeaders)) {
-    if (SEALED_OR_VAULT_MARKER_RE.test(v) && ctlHeaders[k] !== v) {
-      return 'Auth bypass rejected: probe carried a sealed capability or vault credential header that the control lacked.'
-    }
-  }
-
-  // Session jar / cookie check: reject if probe carried a cookie or distinct session jar that control lacked.
-  if (prbHeaders.cookie && prbHeaders.cookie !== ctlHeaders.cookie) {
-    return 'Auth bypass rejected: probe carried a session cookie that the control lacked (session-jar authentication is not an authentication bypass).'
-  }
-  const ctlSessionId = control.sessionId ?? control.wireCredentialProvenance?.session ?? null
-  const prbSessionId = probe.sessionId ?? probe.wireCredentialProvenance?.session ?? null
-  if (prbSessionId && prbSessionId !== ctlSessionId) {
-    return 'Auth bypass rejected: probe used an authenticated session jar that the control lacked.'
-  }
-
-  // H-14: Actively enforce signed broker `wireCredentialProvenance` so host-injected vault
-  // credentials, session-jar cookies, or ephemeral observed auth on the wire can never pass as
-  // an unauthenticated auth_bypass (even when scrubbed/omitted from requestHeaders).
-  const ctlWire = control.wireCredentialProvenance
-  const prbWire = probe.wireCredentialProvenance
-  if (prbWire) {
-    const ctlSources = new Set(ctlWire?.sources ?? [])
-    const ctlVaultHeaders = new Set((ctlWire?.vaultHeaderNames ?? []).map(h => h.toLowerCase()))
-    const ctlVaultCookies = new Set((ctlWire?.vaultCookieNames ?? []).map(c => c.toLowerCase()))
-    const ctlJarCookies = new Set((ctlWire?.jarCookieNames ?? []).map(c => c.toLowerCase()))
-    const ctlWireCookies = new Set((ctlWire?.cookieNames ?? []).map(c => c.toLowerCase()))
-    const prbWireHandle = normalizedAuthHandle(prbWire.personaHandle)
-    const ctlWireHandle = normalizedAuthHandle(ctlWire?.personaHandle ?? control.step.actor.handle)
-    if (
-      prbWire.sources.includes('persona_vault') ||
-      prbWire.vaultHeaderNames.length > 0 ||
-      prbWire.vaultCookieNames.length > 0 ||
-      prbWireHandle !== null
-    ) {
-      if (
-        !ctlSources.has('persona_vault') ||
-        (prbWireHandle !== null && prbWireHandle !== ctlWireHandle) ||
-        prbWire.vaultHeaderNames.some(h => !ctlVaultHeaders.has(h.toLowerCase())) ||
-        prbWire.vaultCookieNames.some(c => !ctlVaultCookies.has(c.toLowerCase()))
-      ) {
-        return 'Auth bypass rejected: wire credential provenance shows probe carried host persona-vault credentials that the control lacked (normal authentication is not an authentication bypass).'
-      }
-    }
-    if (prbWire.sources.includes('session_jar') || prbWire.jarCookieNames.length > 0 || prbWire.session) {
-      if (
-        (prbWire.session && prbWire.session !== ctlSessionId) ||
-        prbWire.jarCookieNames.some(c => !ctlJarCookies.has(c.toLowerCase())) ||
-        (prbWire.sources.includes('session_jar') && !ctlSources.has('session_jar'))
-      ) {
-        return 'Auth bypass rejected: wire credential provenance shows probe carried session-jar credentials that the control lacked (session-jar authentication is not an authentication bypass).'
-      }
-    }
-    if (prbWire.sources.includes('ephemeral_observed') && !ctlSources.has('ephemeral_observed')) {
-      return 'Auth bypass rejected: wire credential provenance shows probe replayed host-observed ephemeral credentials that the control lacked.'
-    }
-    if (prbWire.cookieNames.some(c => !ctlWireCookies.has(c.toLowerCase()))) {
-      return 'Auth bypass rejected: wire credential provenance shows probe transmitted cookie(s) on the wire that the control lacked.'
-    }
-  }
-
-  // R4-H-7: Synthetic invalid credentials are permitted strictly on the probe arm, NEVER as the
-  // negative control (a permit-all endpoint returning 401 on invalid bearer + 200 on anonymous
-  // header must never confirm auth_bypass).
-  const SYNTH_INVALID_CRED_RE = /kovo-synth-invalid-/i
-  const controlHasSyntheticInvalidCred = Boolean(
-    ctlWire?.authMutated ||
-    Object.values(ctlHeaders).some(v => SYNTH_INVALID_CRED_RE.test(v)),
-  )
-  if (controlHasSyntheticInvalidCred) {
-    return 'Auth bypass rejected (R4-H-7): synthetic invalid credentials are allowed strictly on the probe arm and never as a negative control (self-sabotaged control is not an authentication bypass).'
-  }
-
-  // C-4 / H-14 / R4-H-7: Reject self-sabotaged controls for BOTH authenticated and anonymous
-  // probes — the control may NEVER carry an auth/security header, cookie, session, or wire
-  // credential that the probe lacks (e.g., invalid Bearer control 401 vs anonymous header probe 200).
-  for (const [k, v] of Object.entries(ctlHeaders)) {
-    if (k === 'cookie') {
-      if (v.trim().length > 0 && !(prbHeaders.cookie ?? '').trim()) {
-        return 'Auth bypass rejected (R4-H-7): control carried a cookie absent from the probe (self-sabotaged control is not an authentication bypass).'
-      }
-      continue
-    }
-    if (!AUTH_BYPASS_SECURITY_HEADER_RE.test(k)) continue
-    if (v.trim().length > 0 && !(prbHeaders[k] ?? '').trim()) {
-      return 'Auth bypass rejected (R4-H-7): control carried an extra auth header absent from the probe (self-sabotaged control is not an authentication bypass).'
-    }
-  }
-  if (ctlWire) {
-    const prbCallerHeaders = new Set((prbWire?.callerAuthHeaderNames ?? []).map(h => h.toLowerCase()))
-    const prbAllHeaderKeys = new Set(Object.keys(prbHeaders).filter(k => (prbHeaders[k] ?? '').trim().length > 0))
-    if (ctlWire.callerAuthHeaderNames.some(h => {
-      const lh = h.toLowerCase()
-      return lh !== 'cookie' && !prbCallerHeaders.has(lh) && !prbAllHeaderKeys.has(lh)
-    })) {
-      return 'Auth bypass rejected (R4-H-7): wire credential provenance shows control carried an extra caller auth header absent from the probe (self-sabotaged control is not an authentication bypass).'
-    }
-    const prbVaultHeaders = new Set((prbWire?.vaultHeaderNames ?? []).map(h => h.toLowerCase()))
-    if (ctlWire.vaultHeaderNames.some(h => !prbVaultHeaders.has(h.toLowerCase()))) {
-      return 'Auth bypass rejected (R4-H-7): wire credential provenance shows control carried a vault auth header absent from the probe (self-sabotaged control is not an authentication bypass).'
-    }
-    const prbWireCookies = new Set((prbWire?.cookieNames ?? []).map(c => c.toLowerCase()))
-    if (ctlWire.cookieNames.some(c => !prbWireCookies.has(c.toLowerCase())) && !(prbHeaders.cookie ?? '').trim()) {
-      return 'Auth bypass rejected (R4-H-7): wire credential provenance shows control carried a cookie absent from the probe (self-sabotaged control is not an authentication bypass).'
-    }
-  }
-  if (ctlHandle !== null && prbHandle === null) {
-    return 'Auth bypass rejected (R4-H-7): control carried an authenticated persona that the anonymous probe lacked (self-sabotaged control is not an authentication bypass).'
-  }
-  if (ctlSessionId && !prbSessionId) {
-    return 'Auth bypass rejected (R4-H-7): control carried a session jar that the probe lacked (self-sabotaged control is not an authentication bypass).'
-  }
-
-  // C-4: Login-issued token check across ALL AUTH_BYPASS_SECURITY_HEADER_RE headers, query params,
-  // and request body fields: if probe sent a token returned by a prior 2xx exchange, it is a real
-  // login credential, not a forgery.
-  const candidateTokens = new Set<string>()
-  const addCandidate = (raw: string | undefined) => {
-    if (!raw) return
-    const stripped = raw.replace(/^(?:Bearer|Token|Basic|ApiKey)\s+/i, '').trim()
-    if (stripped.length >= 12) candidateTokens.add(stripped)
-  }
-  for (const [k, v] of Object.entries(prbHeaders)) {
-    if (k === 'cookie' || !AUTH_BYPASS_SECURITY_HEADER_RE.test(k)) continue
-    if (v !== ctlHeaders[k]) addCandidate(v)
-  }
-  const ctlQuery = parseQueryMap(control.step.pathAndQuery)
-  const prbQuery = parseQueryMap(probe.step.pathAndQuery)
-  for (const [k, v] of Object.entries(prbQuery)) {
-    if (v !== ctlQuery[k]) addCandidate(v)
-  }
-  const ctlBody = collectBodyEntries(control.step.requestJson)
-  const prbBody = collectBodyEntries(probe.step.requestJson)
-  for (const [k, v] of Object.entries(prbBody)) {
-    if (v !== ctlBody[k]) addCandidate(v)
-  }
-  if (candidateTokens.size > 0) {
-    for (const prior of allEntries) {
-      if (prior.exchangeId === probe.exchangeId || prior.exchangeId === control.exchangeId) continue
-      if (!is2xxStatus(prior.step.status)) continue
-      const priorBody = typeof prior.step.body === 'string'
-        ? prior.step.body
-        : prior.step.json !== undefined ? JSON.stringify(prior.step.json) : ''
-      const priorRespHeaders = Object.values(prior.step.responseHeaders ?? {}).join('\n')
-      for (const rawToken of candidateTokens) {
-        if (priorBody.includes(rawToken) || priorRespHeaders.includes(rawToken)) {
-          return 'Auth bypass rejected: probe used a credential issued by a prior 2xx login/token exchange in the host transcript (normal authentication, not a bypass).'
-        }
-      }
-    }
-  }
-  return null
-}
-
 function collectSubstantiveAuthDataFields(value: unknown, prefix = '', depth = 0, out: string[] = []): string[] {
   if (depth > 4 || out.length >= 16 || value === null || value === undefined) return out
   if (Array.isArray(value)) {
@@ -2501,11 +2336,16 @@ function verifyAuthBypassReceipt(
       continue
     }
     for (const control of sameRouteControls) {
-      // H-14: Reject if probe carried ANY host credential (vault persona, higher role/admin,
-      // sealed capability, session cookie/jar, or login-issued token) that the control lacked.
-      const credRejection = probeCarriedHostCredentialControlLacked(control, probe, allEntries)
-      if (credRejection) {
-        lastRejection = credRejection
+      const authBypassSpec = DEFAULT_ORACLE_SPEC_REGISTRY.get('auth_bypass')!
+      const ctlLegit = assertLegitimateControl({
+        spec: authBypassSpec,
+        control: transcriptEntryToControlExchange(control),
+        probe: transcriptEntryToControlExchange(probe),
+        allEntries: allEntries.map(transcriptEntryToControlExchange),
+        requireAnonymousAblation: true,
+      })
+      if (!ctlLegit.ok) {
+        lastRejection = ctlLegit.reason
         continue
       }
       const differential = authBypassRequestDifferential(control.step, probe.step)
@@ -2520,68 +2360,6 @@ function verifyAuthBypassReceipt(
       if (differential !== 'header' && (control.step.status !== 401 || authenticatedControl)) {
         lastRejection = 'Auth bypass rejected: an authenticated/forbidden control changing only a query or body field is an authorization or ordinary request difference, not an authentication bypass.'
         continue
-      }
-      // R4-H-7: Anonymous ablation check.
-      // When the probe does not carry a real host credential (persona/cookie/session jar/vault/ephemeral),
-      // require a denied (401/403) bare anonymous ablation exchange on the exact same method & route
-      // (probe minus the added bypass header/query/body element, with zero auth headers/credentials),
-      // AND reject if any bare anonymous exchange on the same route succeeded with 2xx (permit-all).
-      const probeHeadersMap = canonicalRequestHeaderMap(probe.step.requestHeaders)
-      const probeHasHostBaseAuth = Boolean(
-        normalizedAuthHandle(probe.step.actor.handle) !== null ||
-        probeHeadersMap.cookie ||
-        probe.sessionId ||
-        probe.wireCredentialProvenance?.session ||
-        probe.wireCredentialProvenance?.sources.some(s => s === 'persona_vault' || s === 'session_jar' || s === 'ephemeral_observed') ||
-        (probe.wireCredentialProvenance?.vaultHeaderNames.length ?? 0) > 0 ||
-        (probe.wireCredentialProvenance?.vaultCookieNames.length ?? 0) > 0 ||
-        (probe.wireCredentialProvenance?.jarCookieNames.length ?? 0) > 0,
-      )
-      const isBareAnonymousAblation = (entry: ReceiptTranscriptEntry): boolean => {
-        if (entry.step.method.toUpperCase() !== probeMethod || routeOf(entry.step) !== probeRoute) return false
-        if (normalizedAuthHandle(entry.step.actor.handle) !== null) return false
-        if (entry.sessionId || entry.consumedCapabilityId || (entry.consumedCapabilities && entry.consumedCapabilities.length > 0)) return false
-        const wp = entry.wireCredentialProvenance
-        if (wp && (
-          wp.authenticated ||
-          wp.authMutated ||
-          wp.session ||
-          wp.sources.length > 0 ||
-          wp.headerNames.length > 0 ||
-          wp.callerAuthHeaderNames.length > 0 ||
-          wp.vaultHeaderNames.length > 0 ||
-          wp.cookieNames.length > 0
-        )) {
-          return false
-        }
-        const h = canonicalRequestHeaderMap(entry.step.requestHeaders)
-        if (h.cookie) return false
-        for (const [k, v] of Object.entries(h)) {
-          if (AUTH_BYPASS_SECURITY_HEADER_RE.test(k) && v.trim().length > 0) return false
-        }
-        const q = parseQueryMap(entry.step.pathAndQuery)
-        for (const [k, v] of Object.entries(q)) {
-          if (AUTH_BYPASS_PARAM_KEY_RE.test(k) && v.trim().length > 0) return false
-        }
-        const b = collectBodyEntries(entry.step.requestJson)
-        for (const [k, v] of Object.entries(b)) {
-          const leafKey = k.split('.').pop()?.replace(/\[\d+\]$/, '') ?? ''
-          if (AUTH_BYPASS_PARAM_KEY_RE.test(leafKey) && v.trim().length > 0) return false
-        }
-        return true
-      }
-      if (!probeHasHostBaseAuth) {
-        const bareAnonSucceeded = allEntries.some(e => isBareAnonymousAblation(e) && is2xxStatus(e.step.status))
-        if (bareAnonSucceeded) {
-          lastRejection = 'Auth bypass rejected (R4-H-7): a bare anonymous ablation request on the same route succeeded with 2xx (endpoint is permit-all/public, not an authentication bypass).'
-          continue
-        }
-        const hasDeniedBareAnonAblation = isBareAnonymousAblation(control) ||
-          allEntries.some(e => isBareAnonymousAblation(e) && (e.step.status === 401 || e.step.status === 403))
-        if (!hasDeniedBareAnonAblation) {
-          lastRejection = 'Auth bypass rejected (R4-H-7): missing denied (401/403) bare anonymous ablation arm (the probe minus its bypass element must be denied without credentials).'
-          continue
-        }
       }
       const probeBodyRaw = typeof probe.step.body === 'string'
         ? probe.step.body
@@ -2968,326 +2746,6 @@ function probeCarriesExpressionWithOperands(
   return false
 }
 
-export interface RequestCarrierInput {
-  pathAndQuery?: string | null
-  requestBody?: string | null
-  requestJson?: unknown
-  requestHeaders?: Readonly<Record<string, string>> | null
-}
-
-export interface NormalizedRequestCarrier {
-  /** True when any request component contained a malformed percent-escape or unicode escape (fail closed). */
-  readonly malformedEscape: boolean
-  /** Reason if malformedEscape is true. */
-  readonly malformedReason: string | null
-  /** Decoded user-input carrier components (path segments, query params, body/JSON leaves, non-transport headers). */
-  readonly inputComponents: readonly string[]
-  /** Decoded transport header components (host, user-agent, etc.) checked only for verbatim/cleaned contiguous echoes. */
-  readonly transportHeaderComponents: readonly string[]
-  /** Joined decoded carrier text (safe for operand/traversal checks when !malformedEscape). */
-  readonly combinedDecoded: string
-}
-
-const TRANSPORT_HEADER_NAME_RE = /^(?:host|content-length|content-type|accept|accept-encoding|accept-language|connection|user-agent|date|cache-control|pragma|upgrade-insecure-requests|sec-fetch-[a-z-]+)$/i
-const ZERO_WIDTH_OR_BIDI_RE = /[\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF\u00AD]/g
-
-function decodeHtmlEntitiesBasic(input: string): string {
-  if (!input.includes('&')) return input
-  return input
-    .replace(/&#x([0-9a-fA-F]{1,6});/g, (m, hex: string) => {
-      const cp = parseInt(hex, 16)
-      return cp > 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : m
-    })
-    .replace(/&#(\d{1,7});/g, (m, dec: string) => {
-      const cp = parseInt(dec, 10)
-      return cp > 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : m
-    })
-    .replace(/&lt;/gi, '<')
-    .replace(/&gt;/gi, '>')
-    .replace(/&amp;/gi, '&')
-    .replace(/&quot;/gi, '"')
-    .replace(/&apos;|&#0*39;/gi, "'")
-}
-
-function decodeUnicodeAndHexEscapesStrict(raw: string): { ok: true; value: string } | { ok: false; reason: string } {
-  if (!raw.includes('\\')) return { ok: true, value: raw }
-  if (/\\u(?![0-9a-fA-F]{4}|\{[0-9a-fA-F]{1,6}\})/.test(raw)) {
-    return { ok: false, reason: 'malformed_unicode_escape' }
-  }
-  const decoded = raw
-    .replace(/\\u\{([0-9a-fA-F]{1,6})\}/g, (m, hex: string) => {
-      const cp = parseInt(hex, 16)
-      return cp <= 0x10ffff ? String.fromCodePoint(cp) : m
-    })
-    .replace(/\\u([0-9a-fA-F]{4})/g, (_m, hex: string) => String.fromCharCode(parseInt(hex, 16)))
-    .replace(/\\x([0-9a-fA-F]{2})/g, (_m, hex: string) => String.fromCharCode(parseInt(hex, 16)))
-  return { ok: true, value: decoded }
-}
-
-function decodePercentComponentStrict(
-  raw: string,
-  options: { plusAsSpace: boolean; strictBarePercent: boolean },
-): { ok: true; value: string } | { ok: false; reason: string } {
-  let current = options.plusAsSpace ? raw.replace(/\+/g, ' ') : raw
-  for (let round = 0; round < 3; round += 1) {
-    if (!current.includes('%')) break
-    const hasMalformedPercent = /%(?![0-9a-fA-F]{2})/.test(current)
-    const hasValidHexPercent = /%[0-9a-fA-F]{2}/.test(current)
-    if (hasMalformedPercent) {
-      if (round === 0 && (options.strictBarePercent || hasValidHexPercent || /%[g-zG-Z]|%[0-9a-fA-F](?![0-9a-fA-F])/.test(current))) {
-        return { ok: false, reason: 'malformed_percent_escape' }
-      }
-      if (round >= 1 && /%[g-zG-Z]|%[0-9a-fA-F](?![0-9a-fA-F])/.test(current)) {
-        return { ok: false, reason: 'malformed_percent_escape' }
-      }
-      break
-    }
-    try {
-      const next = decodeURIComponent(current)
-      if (next === current) break
-      current = next
-    } catch {
-      if (round === 0 || hasValidHexPercent) {
-        return { ok: false, reason: 'invalid_utf8_percent_escape' }
-      }
-      break
-    }
-  }
-  return { ok: true, value: current }
-}
-
-function stripInertSanitizerChars(value: string): string {
-  return decodeHtmlEntitiesBasic(value)
-    .normalize('NFKC')
-    .replace(/<[^>]*>/g, '')
-    .replace(ZERO_WIDTH_OR_BIDI_RE, '')
-}
-
-function isOrderedSubsequence(needle: string, haystack: string): boolean {
-  if (!needle) return false
-  let j = 0
-  for (let i = 0; i < haystack.length && j < needle.length; i += 1) {
-    if (haystack[i] === needle[j]) j += 1
-  }
-  return j === needle.length
-}
-
-function collectJsonStringLeaves(value: unknown, out: string[], depth = 0): void {
-  if (depth > 8 || out.length >= 256 || value === null || value === undefined) return
-  if (typeof value === 'string') {
-    out.push(value)
-    return
-  }
-  if (typeof value === 'number' || typeof value === 'boolean') {
-    out.push(String(value))
-    return
-  }
-  if (Array.isArray(value)) {
-    for (const item of value.slice(0, 64)) collectJsonStringLeaves(item, out, depth + 1)
-    return
-  }
-  if (typeof value === 'object') {
-    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      out.push(k)
-      collectJsonStringLeaves(v, out, depth + 1)
-    }
-  }
-}
-
-/**
- * R4-C-2 / R4-C-6: Shared per-component fail-closed request carrier normalizer.
- * Decodes URL path segments, query parameters, form fields, JSON unicode escapes/leaves,
- * and request headers individually; fails closed on malformed percent-escapes or unicode escapes.
- */
-export function normalizeRequestCarrier(input: RequestCarrierInput): NormalizedRequestCarrier {
-  const inputComponents: string[] = []
-  const transportHeaderComponents: string[] = []
-  let malformedReason: string | null = null
-
-  const pushInput = (raw: string, opts: { plusAsSpace: boolean; strictBarePercent: boolean }) => {
-    if (!raw) return
-    inputComponents.push(raw)
-    const uni = decodeUnicodeAndHexEscapesStrict(raw)
-    if (!uni.ok) {
-      malformedReason ??= uni.reason
-      return
-    }
-    if (uni.value !== raw) inputComponents.push(uni.value)
-    const pct = decodePercentComponentStrict(uni.value, opts)
-    if (!pct.ok) {
-      malformedReason ??= pct.reason
-      return
-    }
-    if (pct.value !== uni.value) inputComponents.push(pct.value)
-    const html = decodeHtmlEntitiesBasic(pct.value)
-    if (html !== pct.value) inputComponents.push(html)
-  }
-
-  const pq = input.pathAndQuery ?? ''
-  if (pq) {
-    const hashIdx = pq.indexOf('#')
-    const withoutHash = hashIdx >= 0 ? pq.slice(0, hashIdx) : pq
-    const qIdx = withoutHash.indexOf('?')
-    const rawPath = qIdx >= 0 ? withoutHash.slice(0, qIdx) : withoutHash
-    const rawQuery = qIdx >= 0 ? withoutHash.slice(qIdx + 1) : ''
-    for (const seg of rawPath.split('/')) {
-      if (seg) pushInput(seg, { plusAsSpace: false, strictBarePercent: true })
-    }
-    if (rawQuery) {
-      for (const pair of rawQuery.split('&')) {
-        if (!pair) continue
-        const eq = pair.indexOf('=')
-        if (eq < 0) {
-          pushInput(pair, { plusAsSpace: true, strictBarePercent: true })
-        } else {
-          pushInput(pair.slice(0, eq), { plusAsSpace: true, strictBarePercent: true })
-          pushInput(pair.slice(eq + 1), { plusAsSpace: true, strictBarePercent: true })
-        }
-      }
-    }
-  }
-
-  const headers = input.requestHeaders ?? null
-  let contentType = ''
-  if (headers) {
-    for (const [k, v] of Object.entries(headers)) {
-      const lk = k.trim().toLowerCase()
-      if (lk === 'content-type') contentType = String(v).toLowerCase()
-      if (TRANSPORT_HEADER_NAME_RE.test(lk)) {
-        if (v) transportHeaderComponents.push(String(v))
-      } else if (v) {
-        pushInput(String(v), { plusAsSpace: false, strictBarePercent: false })
-      }
-    }
-  }
-
-  const rawBody = typeof input.requestBody === 'string'
-    ? input.requestBody
-    : typeof input.requestJson === 'string'
-      ? input.requestJson
-      : input.requestJson !== undefined
-        ? JSON.stringify(input.requestJson)
-        : ''
-
-  if (rawBody) {
-    const trimmed = rawBody.trim()
-    const isForm = contentType.includes('application/x-www-form-urlencoded')
-      || (!contentType.includes('json') && !trimmed.startsWith('{') && !trimmed.startsWith('[') && trimmed.includes('=') && !trimmed.includes('\n'))
-    const looksJson = contentType.includes('json') || trimmed.startsWith('{') || trimmed.startsWith('[') || trimmed.startsWith('"')
-    if (isForm) {
-      for (const pair of rawBody.split('&')) {
-        if (!pair) continue
-        const eq = pair.indexOf('=')
-        if (eq < 0) {
-          pushInput(pair, { plusAsSpace: true, strictBarePercent: true })
-        } else {
-          pushInput(pair.slice(0, eq), { plusAsSpace: true, strictBarePercent: true })
-          pushInput(pair.slice(eq + 1), { plusAsSpace: true, strictBarePercent: true })
-        }
-      }
-    } else if (looksJson) {
-      const rawUni = decodeUnicodeAndHexEscapesStrict(rawBody)
-      if (!rawUni.ok) {
-        malformedReason ??= rawUni.reason
-      } else if (rawUni.value !== rawBody) {
-        inputComponents.push(rawUni.value)
-      }
-      try {
-        const parsed = JSON.parse(rawBody)
-        const leaves: string[] = []
-        collectJsonStringLeaves(parsed, leaves)
-        for (const leaf of leaves) {
-          pushInput(leaf, { plusAsSpace: false, strictBarePercent: false })
-        }
-      } catch {
-        pushInput(rawBody, { plusAsSpace: false, strictBarePercent: false })
-      }
-    } else {
-      pushInput(rawBody, { plusAsSpace: false, strictBarePercent: false })
-    }
-  } else if (input.requestJson !== undefined && typeof input.requestJson !== 'string') {
-    const leaves: string[] = []
-    collectJsonStringLeaves(input.requestJson, leaves)
-    for (const leaf of leaves) {
-      pushInput(leaf, { plusAsSpace: false, strictBarePercent: false })
-    }
-  }
-
-  return {
-    malformedEscape: malformedReason !== null,
-    malformedReason,
-    inputComponents,
-    transportHeaderComponents,
-    combinedDecoded: inputComponents.join('\n'),
-  }
-}
-
-function maskExpressionOperands(text: string, challenge: HostMintedExpressionChallenge): string {
-  const a = String(challenge.operandA)
-  const b = String(challenge.operandB)
-  if (!a || !b) return text
-  let out = ''
-  let cursor = 0
-  let searchFrom = 0
-  while (searchFrom <= text.length - a.length) {
-    const pos = text.indexOf(a, searchFrom)
-    if (pos === -1) break
-    let i = pos + a.length
-    while (i < text.length && /\s/.test(text[i]!)) i += 1
-    let opMatched = false
-    if (challenge.operator === '+') {
-      if (text[i] === '+') {
-        i += 1
-        opMatched = true
-      }
-    } else if (text[i] === '\\' && text[i + 1] === '*') {
-      i += 2
-      opMatched = true
-    } else if (text[i] === '*') {
-      i += 1
-      opMatched = true
-    }
-    if (opMatched) {
-      while (i < text.length && /\s/.test(text[i]!)) i += 1
-      if (text.startsWith(b, i)) {
-        out += text.slice(cursor, pos) + ' '
-        cursor = i + b.length
-        searchFrom = cursor
-        continue
-      }
-    }
-    searchFrom = pos + 1
-  }
-  return cursor === 0 ? text : out + text.slice(cursor)
-}
-
-function carrierReflectsExpressionOutput(
-  carrier: NormalizedRequestCarrier,
-  challenge: HostMintedExpressionChallenge,
-): boolean {
-  if (carrier.malformedEscape) return true
-  const expected = challenge.expectedOutput
-  const expectedDigits = expected.replace(/[^0-9]/g, '')
-  if (!expected || !expectedDigits) return true
-  for (const comp of carrier.inputComponents) {
-    if (comp.includes(expected)) return true
-    const cleaned = stripInertSanitizerChars(comp)
-    if (cleaned.includes(expected)) return true
-    const digitsOnly = cleaned.replace(/[^0-9]/g, '')
-    if (digitsOnly.includes(expectedDigits)) return true
-    const maskedDigits = maskExpressionOperands(cleaned, challenge).replace(/[^0-9]/g, '')
-    if (isOrderedSubsequence(expectedDigits, maskedDigits)) return true
-  }
-  const joinedCleaned = stripInertSanitizerChars(carrier.combinedDecoded)
-  if (joinedCleaned.includes(expected) || joinedCleaned.replace(/[^0-9]/g, '').includes(expectedDigits)) {
-    return true
-  }
-  for (const th of carrier.transportHeaderComponents) {
-    if (th.includes(expected) || stripInertSanitizerChars(th).includes(expected)) return true
-  }
-  return false
-}
-
 export interface EvaluatedExpressionProbeCheck {
   readonly ok: boolean
   readonly reason: string
@@ -3468,61 +2926,12 @@ function verifyStampedBooleanPairRound(input: {
   targetOrigin: string
   runId?: string
 }): { ok: true; challenge: HostMintedBooleanPairChallenge } | { ok: false; reason: string } {
-  if (!input.runId) {
-    return { ok: false, reason: 'hostBooleanPair verification requires a host runId (zero wildcard fallback).' }
-  }
-  const stampA = input.armA.hostBooleanPair
-  const stampB = input.armB.hostBooleanPair
-  if (!stampA || !stampB) {
-    return { ok: false, reason: 'missing host-minted hostBooleanPair stamp on true/false arms; worker-chosen boolean predicate pairs are rejected.' }
-  }
-  const bindFor = (e: ReceiptTranscriptEntry, arm: BooleanPairArm) => ({
-    runId: input.runId!,
-    origin: e.origin ? normalizeOrigin(e.origin) : input.targetOrigin,
-    method: e.step.method,
-    route: exactPathnameOf(e.step.pathAndQuery ?? e.step.route ?? '/'),
-    param: input.param,
-    armRole: arm,
-    exchangeId: e.exchangeId,
+  return verifyStampedBooleanPairRoundKernel({
+    ...input,
+    extractParam: extractRequestParamValue,
+    normalizeOrigin,
+    exactPathnameOf,
   })
-  const verifiedA = input.oracle.verifyBooleanPair(stampA, bindFor(input.armA, stampA.arm))
-  const verifiedB = input.oracle.verifyBooleanPair(stampB, bindFor(input.armB, stampB.arm))
-  if (!verifiedA || !verifiedB) {
-    return { ok: false, reason: 'hostBooleanPair stamp failed HostMintedOracle verification (unminted challengeId, mismatched values, unequal length, or mismatched character multiset).' }
-  }
-  if (verifiedA.challengeId !== verifiedB.challengeId) {
-    return { ok: false, reason: `paired true/false arms cite different hostBooleanPair challengeIds (${verifiedA.challengeId} vs ${verifiedB.challengeId}).` }
-  }
-  if (verifiedA.param && verifiedA.param !== input.param) {
-    return { ok: false, reason: `hostBooleanPair param (${verifiedA.param}) does not match target param (${input.param}).` }
-  }
-  const aIsTrue = stampA.arm === 'true' && stampB.arm === 'false'
-  const aIsFalse = stampA.arm === 'false' && stampB.arm === 'true'
-  if (input.requireArmATrue ? !aIsTrue : (!aIsTrue && !aIsFalse)) {
-    return { ok: false, reason: `paired arms must carry opposing host-minted true/false stamps (got ${stampA.arm} and ${stampB.arm}).` }
-  }
-  if (input.requireBaseline || input.baseline) {
-    if (!input.baseline?.hostBooleanPair) {
-      return { ok: false, reason: 'baseline arm is missing its host-minted hostBooleanPair stamp.' }
-    }
-    const verifiedBase = input.oracle.verifyBooleanPair(input.baseline.hostBooleanPair, bindFor(input.baseline, 'baseline'))
-    if (!verifiedBase || verifiedBase.challengeId !== verifiedA.challengeId || input.baseline.hostBooleanPair.arm !== 'baseline') {
-      return { ok: false, reason: 'baseline arm hostBooleanPair stamp does not match the round challengeId/baseline role.' }
-    }
-    const actualBase = extractRequestParamValue(input.baseline, input.param)
-    if (actualBase !== input.baseline.hostBooleanPair.mintedValue) {
-      return { ok: false, reason: `baseline request param "${input.param}" does not equal host-minted baseValue byte for byte.` }
-    }
-  }
-  const actualA = extractRequestParamValue(input.armA, input.param)
-  if (actualA !== stampA.mintedValue) {
-    return { ok: false, reason: `arm "${input.armA.exchangeId}" param "${input.param}" does not equal host-minted value byte for byte.` }
-  }
-  const actualB = extractRequestParamValue(input.armB, input.param)
-  if (actualB !== stampB.mintedValue) {
-    return { ok: false, reason: `arm "${input.armB.exchangeId}" param "${input.param}" does not equal host-minted value byte for byte.` }
-  }
-  return { ok: true, challenge: verifiedA }
 }
 
 /**
@@ -3632,20 +3041,6 @@ function verifyEvaluatedExpression(
       antiReflectionPassed: true,
       hostMinted: true,
     },
-  }
-}
-
-function stepToBooleanArm(step: ImpactStep): BooleanDifferentialArm {
-  return {
-    status: step.status,
-    method: step.method,
-    persona: step.actor.handle ?? null,
-    pathAndQuery: step.pathAndQuery ?? step.route,
-    ...(step.requestJson !== undefined ? { requestJson: step.requestJson } : {}),
-    ...(step.requestBody !== undefined ? { requestBody: step.requestBody } : {}),
-    requestHeaders: step.requestHeaders ?? null,
-    ...(step.json !== undefined ? { json: step.json } : {}),
-    ...(step.body !== undefined ? { body: step.body } : {}),
   }
 }
 
@@ -3789,71 +3184,6 @@ function entryToSignedUrlMintExchange(entry: ReceiptTranscriptEntry, fallbackOri
   }
 }
 
-const SIGNED_URL_SIG_PARAM_RE = /^(?:x-goog-signature|x-amz-signature|signature|sig)$/i
-const SIGNED_URL_INLINE_RE = /https?:\/\/[^\s"'<>\\]+/gi
-
-function extractSignedUrlNeedlesFromResponse(exchange: SignedUrlMintExchange): string[] {
-  const haystacks: string[] = []
-  if (typeof exchange.responseBody === 'string' && exchange.responseBody) haystacks.push(exchange.responseBody)
-  if (exchange.responseJson !== undefined) {
-    try { haystacks.push(JSON.stringify(exchange.responseJson)) } catch { /* ignore */ }
-  }
-  if (exchange.responseHeaders) {
-    for (const v of Object.values(exchange.responseHeaders)) {
-      if (v) haystacks.push(v)
-    }
-  }
-  const needles = new Set<string>()
-  for (const text of haystacks) {
-    SIGNED_URL_INLINE_RE.lastIndex = 0
-    let m: RegExpExecArray | null
-    while ((m = SIGNED_URL_INLINE_RE.exec(text)) !== null) {
-      const rawUrl = m[0].replace(/[),.;]+$/, '')
-      if (rawUrl.length >= 24) needles.add(rawUrl)
-      try {
-        const parsed = new URL(rawUrl)
-        for (const [k, v] of parsed.searchParams.entries()) {
-          if (SIGNED_URL_SIG_PARAM_RE.test(k) && v.length >= 16) {
-            needles.add(v)
-            try {
-              const dec = decodeURIComponent(v)
-              if (dec.length >= 16) needles.add(dec)
-            } catch { /* keep raw */ }
-          }
-        }
-      } catch { /* ignore malformed URL */ }
-    }
-  }
-  return [...needles]
-}
-
-function carrierEchoesSignedUrlNeedle(carrier: NormalizedRequestCarrier, needles: readonly string[]): boolean {
-  if (carrier.malformedEscape) return true
-  if (needles.length === 0) return false
-  const normalizedNeedles = needles.map(n => ({
-    raw: n,
-    cleaned: stripInertSanitizerChars(n),
-  }))
-  const allComponents = [...carrier.inputComponents, ...carrier.transportHeaderComponents, carrier.combinedDecoded]
-  for (const comp of allComponents) {
-    if (!comp) continue
-    const cleaned = stripInertSanitizerChars(comp)
-    for (const needle of normalizedNeedles) {
-      if (comp.includes(needle.raw) || cleaned.includes(needle.cleaned)) return true
-    }
-  }
-  return false
-}
-
-function probeHasTraversalOrSeparatorDifferential(
-  ctlCarrier: NormalizedRequestCarrier,
-  prbCarrier: NormalizedRequestCarrier,
-): boolean {
-  const ctlSet = new Set(ctlCarrier.inputComponents.map(c => c.toLowerCase()))
-  const SEP_OR_TRAV_RE = /(?:\.\.|[\\/])/
-  return prbCarrier.inputComponents.some(comp => !ctlSet.has(comp.toLowerCase()) && SEP_OR_TRAV_RE.test(comp))
-}
-
 /**
  * R4-C-6: Hardened kernel verification primitive for `signed_url_mint` differential proofs.
  * Shared by `verifySignedUrlMintReceipt()` (`proof-receipt.ts`) and `evaluateClaim('composite_receipt')`
@@ -3901,7 +3231,7 @@ export function verifySignedUrlMintPair(input: {
     }
   }
   const probeNeedles = extractSignedUrlNeedlesFromResponse(probe)
-  if (carrierEchoesSignedUrlNeedle(prbCarrier, probeNeedles)) {
+  if (carrierEchoesSignedUrlNeedles(prbCarrier, probeNeedles)) {
     return {
       confirmed: false,
       reason: 'Signed-URL probe signature or URL was echoed from the normalized probe request carrier (including URL/JSON-unicode escapes).',
@@ -3911,7 +3241,7 @@ export function verifySignedUrlMintPair(input: {
     }
   }
   const ctlNeedles = extractSignedUrlNeedlesFromResponse(control)
-  if (carrierEchoesSignedUrlNeedle(ctlCarrier, ctlNeedles)) {
+  if (carrierEchoesSignedUrlNeedles(ctlCarrier, ctlNeedles)) {
     return {
       confirmed: false,
       reason: 'Signed-URL control signature or URL was echoed from the normalized control request carrier.',
@@ -3958,7 +3288,7 @@ export function verifySignedUrlMintPair(input: {
         evidence: assessment.evidence,
       }
     }
-    if (!probeHasTraversalOrSeparatorDifferential(ctlCarrier, prbCarrier)) {
+    if (!hasTraversalOrSeparatorDifferential(ctlCarrier, prbCarrier, 'any_component')) {
       return {
         confirmed: false,
         reason: 'Signed-URL key_traversal rejected (R4-C-6): probe input contains no differing traversal or path-separator construct (benign multi-folder presign is not CWE-22).',
@@ -4035,6 +3365,27 @@ function verifySignedUrlMintReceipt(
         oracle: 'signed_url_mint',
         rejectedBy: assessment.rejectedBy,
         missingEvidence: assessment.missingEvidence,
+        ...assessment.evidence,
+      },
+    }
+  }
+  const signedUrlPub = evaluateMustBeNonPublicStage({
+    spec: DEFAULT_ORACLE_SPEC_REGISTRY.get('impact:signed_url_mint')!,
+    steps: [...entriesById.values()].map(e => e.step),
+    probe: probe.step,
+  })
+  if (!signedUrlPub.passed) {
+    return {
+      confirmed: false,
+      vulnClass: receipt.vulnClass,
+      rule,
+      reason: signedUrlPub.reason,
+      observed: receipt.claimedDelta,
+      expected: 'a non-public protected signed-URL minting surface',
+      evidence: {
+        oracle: 'signed_url_mint',
+        rejectedBy: 'publicness',
+        ...(signedUrlPub.referenceId ? { publicnessReferenceId: signedUrlPub.referenceId } : {}),
         ...assessment.evidence,
       },
     }

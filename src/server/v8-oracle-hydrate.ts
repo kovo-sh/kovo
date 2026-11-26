@@ -9,7 +9,7 @@
  * and boolean impact predicates exclusively from host-recorded transcript records.
  */
 import { createHash } from 'node:crypto'
-import { parseBodyFromCarrierText } from './host-fact-log.ts'
+import { parseBodyFromCarrierText, type WireCredentialProvenance } from './host-fact-log.ts'
 import { ROLE_RANK, normalizeRole, parseRoleMemberships, resolvePersonaIdentity, stepReadsState, type RoleName } from './oracle-invariants.ts'
 import type { ProofReceipt } from './proof-receipt.ts'
 import { deriveRecordAuthzDimension, extractIssuedSignedUrl, extractTenantMarkers, findNonErrorBatchRecord, isJobOrHandleStub, type HostAuthzDimension, type HostSignedRecord, type V8OracleFamily } from './v8-oracle-families.ts'
@@ -35,6 +35,9 @@ export interface HydratableEntry {
   hostSignature?: string
   evidenceRole?: string
   raceBatchId?: string | null
+  sessionId?: string | null
+  consumedCapabilityId?: string | null
+  wireCredentialProvenance?: Readonly<WireCredentialProvenance> | null
   step: {
     arm: string
     method: string

@@ -1,0 +1,138 @@
+{
+  "id": "r3-17-publicness-and-control-fp",
+  "side": "fp",
+  "archetype": "r3-17-publicness-and-self-sabotaged-control-fp",
+  "description": "R3-17 FP: benign public service metadata read paired with a self-sabotaged synthetic-invalid control (401) and a bare anonymous 200 read on the exact same route must dismiss under the unified proof-kernel control-legitimacy and must_be_non_public stages across all confirmation paths.",
+  "covers": {
+    "files": [
+      "src/server/oracle-invariants.ts",
+      "src/server/oracle-spec.ts",
+      "src/server/proof-kernel/boolean-differential.ts",
+      "src/server/proof-kernel/control-legitimacy.ts",
+      "src/server/proof-kernel/index.ts",
+      "src/server/proof-kernel/publicness.ts",
+      "src/server/proof-kernel/reflection.ts",
+      "src/server/proof-receipt.ts",
+      "src/server/terminal-oracle-registry.ts",
+      "src/server/v8-oracle-hydrate.ts",
+      "src/server/verify-claims.ts",
+      "src/server/verify-support.ts"
+    ],
+    "classes": [
+      "info_disclosure",
+      "disclosure",
+      "auth_bypass",
+      "bola",
+      "signed_url_mint"
+    ]
+  },
+  "canonicalLabel": {
+    "cwe": "CWE-200",
+    "category": "information-disclosure",
+    "title": "Public service status metadata with self-sabotaged control must dismiss under proof-kernel stages",
+    "impact": "Endpoint serves identical benign public status metadata to anonymous and authenticated callers.",
+    "claimedImpact": "disclosure",
+    "claimedBoundary": "access",
+    "vulnClass": "info_disclosure"
+  },
+  "freeTextLabel": {
+    "title": "Public catalog status endpoint with synthetic invalid credential control"
+  },
+  "paths": {
+    "replay": true,
+    "floorReceipt": true,
+    "evaluateClaims": true,
+    "composite": false,
+    "floorInjectionRecipe": false,
+    "proofReceipt": true
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [
+    {
+      "handle": "member_a",
+      "roleLabel": "member (tenant-a)",
+      "role": "member",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-r317-member-a-token"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "ctl_sabotaged",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/catalog/public-status",
+      "persona": null,
+      "requestHeaders": {
+        "authorization": "Bearer kovo-synth-invalid-r317-control"
+      },
+      "status": 401,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"error\":\"invalid_token\"}"
+    },
+    {
+      "id": "ctl_anon_public",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/catalog/public-status",
+      "persona": null,
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"id\":\"pub-101\",\"service\":\"catalog\",\"region\":\"us-east\",\"status\":\"healthy\"}"
+    },
+    {
+      "id": "prb_member",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/catalog/public-status",
+      "persona": "member_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"id\":\"pub-101\",\"service\":\"catalog\",\"region\":\"us-east\",\"status\":\"healthy\"}"
+    }
+  ],
+  "replaySpec": {
+    "assertionsJq": "{ controlPassed: (.steps.ctl_sabotaged.status == 401), confirmed: (.steps.prb_member.status == 200 and .steps.prb_member.json.service == \"catalog\"), observed: .steps.prb_member.json.status, expected: \"401\" }"
+  },
+  "proofReceipt": {
+    "vulnClass": "info_disclosure",
+    "targetMethod": "GET",
+    "targetPathAndQuery": "/api/catalog/public-status",
+    "claimedDelta": "Self-sabotaged synthetic invalid bearer returned 401 while member read public status JSON that is also served 200 anonymously."
+  },
+  "claims": [
+    {
+      "kind": "impact",
+      "impactClass": "disclosure",
+      "probeExchangeId": "prb_member",
+      "controlExchangeIds": [
+        "ctl_sabotaged",
+        "ctl_anon_public"
+      ]
+    }
+  ],
+  "bareClaims": [
+    {
+      "kind": "boundary",
+      "boundaryClass": "auth",
+      "controlExchangeId": "ctl_sabotaged",
+      "probeExchangeId": "prb_member"
+    }
+  ]
+}
