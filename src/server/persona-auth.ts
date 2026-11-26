@@ -12,6 +12,24 @@ import type {
   PlaywrightBrowserLike,
 } from './browser-session-auth.ts'
 import {
+  buildChromiumLaunchArgs,
+  buildPlaywrightChromiumLaunchOptions,
+  formatChromiumSandboxError,
+  isChromiumSandboxFailure,
+  isInsecureNoSandboxEnabled,
+  launchPlaywrightChromium,
+  type ChromiumPlaywrightLauncher,
+  type PlaywrightChromiumLaunchOptions,
+} from './chromium-launch.ts'
+export {
+  formatChromiumSandboxError,
+  isChromiumSandboxFailure,
+  isInsecureNoSandboxEnabled,
+  launchPlaywrightChromium,
+  type ChromiumPlaywrightLauncher,
+  type PlaywrightChromiumLaunchOptions,
+}
+import {
   EgressDeniedError,
   EgressGateway,
   classifyAddress,
@@ -800,103 +818,6 @@ function extractBearerToken(headerValue: string | undefined): string | null {
   return isJwtLike(match[1]) ? match[1] : null
 }
 
-/** Playwright launch options produced by Kovo's authoritative Chromium launch builders. */
-export interface PlaywrightChromiumLaunchOptions {
-  headless: true
-  /**
-   * Explicitly passed to Playwright (`chromiumSandbox: true` by default).
-   * Playwright silently appends `--no-sandbox` whenever `chromiumSandbox !== true`,
-   * so omitting this option disables the Chromium sandbox even when `--no-sandbox`
-   * is absent from `args`.
-   */
-  chromiumSandbox: boolean
-  args: string[]
-}
-
-export interface ChromiumPlaywrightLauncher<TBrowser> {
-  launch: (options: PlaywrightChromiumLaunchOptions) => Promise<TBrowser>
-}
-
-const CHROMIUM_SANDBOX_FAILURE_RE =
-  /no usable sandbox|suid sandbox|setuid sandbox|chromium sandboxing failed|crbug\.com\/(?:638180|357670)|failed to move to new namespace|clone_newuser|unprivileged_userns|running as root without --no-sandbox/i
-
-/** Whether `KOVO_INSECURE_NO_SANDBOX=1` explicitly disables Chromium's sandbox. */
-export function isInsecureNoSandboxEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  return env.KOVO_INSECURE_NO_SANDBOX === '1'
-}
-
-/** Detect Chromium/Playwright launch failures caused by missing kernel/userns sandbox support. */
-export function isChromiumSandboxFailure(error: unknown): boolean {
-  if (!error) return false
-  const parts: string[] = []
-  if (error instanceof Error) {
-    parts.push(error.message)
-    const cause = (error as { cause?: unknown }).cause
-    if (cause instanceof Error) parts.push(cause.message)
-    else if (cause != null) parts.push(String(cause))
-  } else {
-    parts.push(String(error))
-  }
-  return CHROMIUM_SANDBOX_FAILURE_RE.test(parts.join('\n'))
-}
-
-/** Wrap a Chromium sandbox launch failure into a fail-closed, actionable error. */
-export function formatChromiumSandboxError(error: unknown): Error {
-  const detail = error instanceof Error ? error.message : String(error ?? 'unknown error')
-  return new Error(
-    `Chromium sandbox failed to start (refusing to silently retry without sandbox). ` +
-      `Enable unprivileged user namespaces (e.g. sysctl kernel.unprivileged_userns_clone=1 or an AppArmor/seccomp container profile permitting userns), ` +
-      `or for local development only set KOVO_INSECURE_NO_SANDBOX=1. Underlying error: ${detail}`,
-    { cause: error instanceof Error ? error : undefined },
-  )
-}
-
-async function loadPlaywrightChromium<TBrowser>(): Promise<ChromiumPlaywrightLauncher<TBrowser>> {
-  try {
-    const coreName = 'playwright-core'
-    const coreMod = await import(/* @vite-ignore */ coreName) as {
-      chromium?: ChromiumPlaywrightLauncher<TBrowser>
-    }
-    if (coreMod.chromium) return coreMod.chromium
-  } catch (err) {
-    const code = (err as { code?: string } | null)?.code
-    // Only fall back to @playwright/test when playwright-core itself cannot be resolved.
-    if (code !== 'ERR_MODULE_NOT_FOUND' && code !== 'MODULE_NOT_FOUND') {
-      throw err
-    }
-  }
-  const pw = await import('@playwright/test')
-  return pw.chromium as unknown as ChromiumPlaywrightLauncher<TBrowser>
-}
-
-/**
- * Shared Playwright Chromium launcher with fail-closed sandbox enforcement.
- * Never silently retries without the sandbox when `chromiumSandbox: true` fails to start.
- */
-export async function launchPlaywrightChromium<TBrowser>(
-  launchOptions: PlaywrightChromiumLaunchOptions,
-  launcher?: ChromiumPlaywrightLauncher<TBrowser>['launch'],
-): Promise<TBrowser> {
-  if (!launchOptions.chromiumSandbox) {
-    console.warn('WARNING: Chromium sandbox disabled (KOVO_INSECURE_NO_SANDBOX=1). Detection fidelity is reduced.')
-  } else if (launchOptions.args.some(arg => arg === '--no-sandbox' || arg.startsWith('--no-sandbox='))) {
-    throw new Error('Refusing to launch Chromium with --no-sandbox while chromiumSandbox is enabled.')
-  }
-  let launchFn = launcher
-  if (!launchFn) {
-    const chromium = await loadPlaywrightChromium<TBrowser>()
-    launchFn = opts => chromium.launch(opts)
-  }
-  try {
-    return await launchFn(launchOptions)
-  } catch (err) {
-    if (launchOptions.chromiumSandbox && isChromiumSandboxFailure(err)) {
-      throw formatChromiumSandboxError(err)
-    }
-    throw err
-  }
-}
-
 /** Chromium sandboxing defaults. `--no-sandbox` is an explicit, warned-about insecure opt-in. */
 export interface FormChromiumLaunchOptions {
   insecureNoSandbox?: boolean
@@ -907,39 +828,11 @@ export interface FormChromiumLaunchOptions {
   pinnedHosts?: ReadonlyMap<string, readonly string[]>
 }
 
-function chromiumResolverTarget(address: string): string {
-  const bare = address.replace(/^\[|\]$/g, '')
-  return bare.includes(':') ? `[${bare}]` : bare
-}
-
-/** Resolver rules pin validated credential hosts, fail closed for unknown names, and allow the local loopback proxy. */
-export function formChromiumResolverRules(pinnedHosts?: ReadonlyMap<string, readonly string[]>): string {
-  const rules: string[] = []
-  for (const [host, addresses] of pinnedHosts ?? []) {
-    const address = addresses[0]
-    if (!host || !address) continue
-    rules.push(`MAP ${host} ${chromiumResolverTarget(address)}`)
-  }
-  rules.push('MAP * ~NOTFOUND')
-  rules.push('EXCLUDE 127.0.0.1')
-  return rules.join(', ')
-}
-
 export function formChromiumLaunchArgs(options: FormChromiumLaunchOptions = {}): string[] {
-  const args = [
-    '--disable-dev-shm-usage',
-    '--disable-background-networking',
-    `--host-resolver-rules=${formChromiumResolverRules(options.pinnedHosts)}`,
-    // Force even loopback targets through the authenticated host loopback proxy (zero direct bypass).
-    '--proxy-bypass-list=<-loopback>',
-    '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
-    '--webrtc-ip-handling-policy=disable_non_proxied_udp',
-    // WebTransport is HTTP/3 over UDP and bypasses HTTP request interception.
-    '--disable-quic',
-    '--disable-features=WebTransport',
-  ]
-  if (options.insecureNoSandbox) args.push('--no-sandbox')
-  return args
+  return buildChromiumLaunchArgs({
+    insecureNoSandbox: options.insecureNoSandbox,
+    pinnedHosts: options.pinnedHosts,
+  })
 }
 
 /**
@@ -949,11 +842,17 @@ export function formChromiumLaunchArgs(options: FormChromiumLaunchOptions = {}):
 export function buildFormChromiumLaunchOptions(
   options: FormChromiumLaunchOptions & { env?: NodeJS.ProcessEnv } = {},
 ): PlaywrightChromiumLaunchOptions {
-  const insecureNoSandbox = options.insecureNoSandbox ?? isInsecureNoSandboxEnabled(options.env)
+  const base = buildPlaywrightChromiumLaunchOptions({
+    insecureNoSandbox: options.insecureNoSandbox,
+    env: options.env,
+    pinnedHosts: options.pinnedHosts,
+  })
   return {
-    headless: true,
-    chromiumSandbox: !insecureNoSandbox,
-    args: formChromiumLaunchArgs({ insecureNoSandbox, pinnedHosts: options.pinnedHosts }),
+    ...base,
+    args: formChromiumLaunchArgs({
+      insecureNoSandbox: !base.chromiumSandbox,
+      pinnedHosts: options.pinnedHosts,
+    }),
   }
 }
 

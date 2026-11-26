@@ -29,6 +29,15 @@ import { and, eq } from 'drizzle-orm'
 import { assetOriginForEnvironment } from '../domain.ts'
 import type { PersonaLoginConfig } from '../domain.ts'
 import {
+  buildChromiumLaunchArgs,
+  buildPlaywrightChromiumLaunchOptions,
+  formatChromiumSandboxError,
+  isInsecureNoSandboxEnabled,
+  launchPlaywrightChromium,
+  type PlaywrightChromiumLaunchOptions,
+} from './chromium-launch.ts'
+export { formatChromiumSandboxError as formatChromiumSandboxLaunchError }
+import {
   classifyDetailedAddress,
   EgressGateway,
   isLoopbackLiteral,
@@ -109,11 +118,7 @@ const SOCKET_DENY_SCRIPT = `(() => {
   }
 })();`
 
-export interface BrowserSessionChromiumLaunchOptions {
-  readonly headless: true
-  readonly chromiumSandbox: boolean
-  readonly args: string[]
-}
+export type BrowserSessionChromiumLaunchOptions = Readonly<PlaywrightChromiumLaunchOptions>
 
 export type BrowserSessionRefreshBlockedCode = 'VERIFY_PATH_MODIFIED' | 'SCOPE_POLICY_REQUIRED'
 
@@ -372,97 +377,36 @@ function normalizeVerifyPath(raw?: string): string {
   return trimmed.slice(0, 512)
 }
 
-export function isInsecureNoSandboxEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  return env.KOVO_INSECURE_NO_SANDBOX === '1'
-}
-
 export function browserSessionChromiumArgs(
   options: { insecureNoSandbox?: boolean; env?: NodeJS.ProcessEnv } = {},
 ): string[] {
-  const insecureNoSandbox = options.insecureNoSandbox ?? isInsecureNoSandboxEnabled(options.env)
-  const args = [
-    '--disable-dev-shm-usage',
-    '--disable-background-networking',
-    // Force all outbound connections (including loopback targets) through the EgressGateway proxy.
-    '--proxy-bypass-list=<-loopback>',
-    // Fail closed for any non-proxied Chromium DNS lookup; proxy itself runs on 127.0.0.1.
-    '--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1',
-    '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
-    '--webrtc-ip-handling-policy=disable_non_proxied_udp',
-    '--disable-quic',
-    '--disable-features=WebTransport',
-  ]
-  if (insecureNoSandbox) {
-    args.push('--no-sandbox')
-  }
-  return args
+  return buildChromiumLaunchArgs({
+    insecureNoSandbox: options.insecureNoSandbox ?? isInsecureNoSandboxEnabled(options.env),
+  })
 }
 
 /**
  * Build Playwright `chromium.launch(...)` options for browser-session capture and refresh.
- * R3-H-6: Explicitly passes `chromiumSandbox: true` by default (playwright-core otherwise
- * injects `--no-sandbox` whenever `chromiumSandbox !== true`). Only disables the sandbox when
- * `KOVO_INSECURE_NO_SANDBOX === '1'` (or explicit `insecureNoSandbox: true` in tests).
+ * Delegates to the single authoritative Chromium launch builder in `src/server/chromium-launch.ts`.
  */
 export function buildBrowserSessionChromiumLaunchOptions(
   options: { insecureNoSandbox?: boolean; env?: NodeJS.ProcessEnv } = {},
 ): BrowserSessionChromiumLaunchOptions {
-  const insecureNoSandbox = options.insecureNoSandbox ?? isInsecureNoSandboxEnabled(options.env)
+  const base = buildPlaywrightChromiumLaunchOptions(options)
   return {
-    headless: true,
-    chromiumSandbox: !insecureNoSandbox,
-    args: browserSessionChromiumArgs({ insecureNoSandbox }),
-  }
-}
-
-export function formatChromiumSandboxLaunchError(err: unknown): Error {
-  const detail = err instanceof Error ? err.message : String(err)
-  return new Error(
-    `Sandboxed Chromium failed to launch (chromiumSandbox: true). Refusing to fall back to --no-sandbox. `
-    + `Enable unprivileged user namespaces or configure a Chromium seccomp profile on this host/container, `
-    + `or explicitly opt out only in isolated environments with KOVO_INSECURE_NO_SANDBOX=1. `
-    + `Underlying error: ${detail}`,
-  )
-}
-
-async function resolvePlaywrightChromium(): Promise<{
-  launch: (o: BrowserSessionChromiumLaunchOptions) => Promise<PlaywrightBrowserLike>
-}> {
-  try {
-    const coreName = 'playwright-core'
-    const coreMod = await import(/* @vite-ignore */ coreName) as {
-      chromium?: { launch: (o: BrowserSessionChromiumLaunchOptions) => Promise<PlaywrightBrowserLike> }
-    }
-    if (coreMod.chromium) return coreMod.chromium
-  } catch {
-    // Fallback to @playwright/test when playwright-core cannot be imported directly.
-  }
-  const pw = await import('@playwright/test')
-  return pw.chromium as unknown as {
-    launch: (o: BrowserSessionChromiumLaunchOptions) => Promise<PlaywrightBrowserLike>
+    ...base,
+    args: browserSessionChromiumArgs({ insecureNoSandbox: !base.chromiumSandbox }),
   }
 }
 
 async function launchDefaultBrowserSessionChromium(
   opts: BrowserSessionChromiumLaunchOptions,
 ): Promise<PlaywrightBrowserLike> {
-  if (!opts.chromiumSandbox) {
-    console.warn('WARNING: Chromium sandbox disabled (KOVO_INSECURE_NO_SANDBOX=1). Browser session isolation is reduced.')
-  }
-  const chromium = await resolvePlaywrightChromium()
-  const launchOpts: BrowserSessionChromiumLaunchOptions = {
+  return await launchPlaywrightChromium<PlaywrightBrowserLike>({
     headless: true,
     chromiumSandbox: opts.chromiumSandbox,
     args: opts.args,
-  }
-  try {
-    return await chromium.launch(launchOpts)
-  } catch (err) {
-    if (launchOpts.chromiumSandbox) {
-      throw formatChromiumSandboxLaunchError(err)
-    }
-    throw err
-  }
+  })
 }
 
 export interface BrowserSessionEgressPolicy {

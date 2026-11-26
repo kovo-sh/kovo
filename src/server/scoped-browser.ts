@@ -6,14 +6,16 @@ import type { BrokerExchangeResult, Grant } from './broker.ts'
 import { scanSecondOrderMarkers } from './canary-broker.ts'
 import type { SecondOrderStore } from './canary-broker.ts'
 import {
-  cookieRecordsFromHeader,
+  buildChromiumLaunchArgs,
+  buildPlaywrightChromiumLaunchOptions,
   formatChromiumSandboxError,
   isChromiumSandboxFailure,
   isInsecureNoSandboxEnabled,
   launchPlaywrightChromium,
   type ChromiumPlaywrightLauncher,
   type PlaywrightChromiumLaunchOptions,
-} from './persona-auth.ts'
+} from './chromium-launch.ts'
+import { cookieRecordsFromHeader } from './persona-auth.ts'
 export { formatChromiumSandboxError, isChromiumSandboxFailure, isInsecureNoSandboxEnabled }
 export type { PlaywrightChromiumLaunchOptions }
 import { buildPersonaBrowserAttachment, personaSecrets } from './persona-vault.ts'
@@ -462,25 +464,11 @@ export interface ChromiumLaunchOptions {
 }
 
 /**
- * Sandboxing is on by default. Target JavaScript must not be able to reach loopback/LAN/metadata
- * directly: resolver rules fail closed for every non-proxy name (allowing only the host loopback
- * `EgressGateway` proxy on `127.0.0.1`), `--proxy-bypass-list=<-loopback>` prevents Chromium from
- * bypassing the proxy for localhost/127.0.0.1 targets, and WebRTC/QUIC UDP paths are disabled.
+ * Sandboxing is on by default. Delegates to the single authoritative Chromium arg builder
+ * in `src/server/chromium-launch.ts`.
  */
 export function chromiumLaunchArgs(options: ChromiumLaunchOptions = {}): string[] {
-  const args = [
-    '--disable-dev-shm-usage',
-    '--disable-background-networking',
-    '--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1',
-    '--proxy-bypass-list=<-loopback>',
-    '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
-    '--webrtc-ip-handling-policy=disable_non_proxied_udp',
-    // WebTransport is HTTP/3 over UDP: it bypasses HTTP interception and the WebRTC flags.
-    '--disable-quic',
-    '--disable-features=WebTransport',
-  ]
-  if (options.insecureNoSandbox) args.push('--no-sandbox')
-  return args
+  return buildChromiumLaunchArgs({ insecureNoSandbox: options.insecureNoSandbox })
 }
 
 /**
@@ -491,11 +479,13 @@ export function chromiumLaunchArgs(options: ChromiumLaunchOptions = {}): string[
 export function buildChromiumLaunchOptions(
   options: ChromiumLaunchOptions & { env?: NodeJS.ProcessEnv } = {},
 ): PlaywrightChromiumLaunchOptions {
-  const insecureNoSandbox = options.insecureNoSandbox ?? isInsecureNoSandboxEnabled(options.env)
+  const base = buildPlaywrightChromiumLaunchOptions({
+    insecureNoSandbox: options.insecureNoSandbox,
+    env: options.env,
+  })
   return {
-    headless: true,
-    chromiumSandbox: !insecureNoSandbox,
-    args: chromiumLaunchArgs({ insecureNoSandbox }),
+    ...base,
+    args: chromiumLaunchArgs({ insecureNoSandbox: !base.chromiumSandbox }),
   }
 }
 

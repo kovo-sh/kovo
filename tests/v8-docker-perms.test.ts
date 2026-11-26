@@ -151,13 +151,16 @@ test('ensureRpcMountReadable & workerContainerCreateArgs make 0o700/0o600 rpcMou
 
       const resolved = ensureRpcMountReadable(rpcDir)
       assert.equal(resolved, realpathSync(rpcDir))
-      assert.equal(statSync(rpcDir).mode & 0o001, 0o001, 'RPC dir must grant o+x traversal for UID 10001')
-      assert.equal(statSync(rpcDir).mode & 0o004, 0, 'RPC dir should stay non-listable (0o711) when upgraded from 0o700')
-      assert.equal(statSync(tokenPath).mode & 0o004, 0o004, 'RPC token must grant o+r for UID 10001')
-      assert.equal(statSync(contextPath).mode & 0o004, 0o004, 'RPC context.json must grant o+r for UID 10001')
-      assert.equal(lstatSync(socketPath).mode & 0o006, 0o006, 'RPC Unix socket must grant o+rw for UID 10001')
+      assert.equal(statSync(rpcDir).mode & 0o777, 0o750, 'RPC dir must be group-scoped 0o750 (no world bits)')
+      assert.equal(statSync(rpcDir).mode & 0o007, 0, 'RPC dir must have zero world permission bits')
+      assert.equal(statSync(tokenPath).mode & 0o777, 0o640, 'RPC token must be group-scoped 0o640 (no world bits)')
+      assert.equal(statSync(tokenPath).mode & 0o007, 0, 'RPC token must have zero world permission bits')
+      assert.equal(statSync(contextPath).mode & 0o777, 0o640, 'RPC context.json must be group-scoped 0o640 (no world bits)')
+      assert.equal(statSync(contextPath).mode & 0o007, 0, 'RPC context.json must have zero world permission bits')
+      assert.equal(lstatSync(socketPath).mode & 0o777, 0o660, 'RPC Unix socket must be group-scoped 0o660 (no world bits)')
+      assert.equal(lstatSync(socketPath).mode & 0o007, 0, 'RPC Unix socket must have zero world permission bits')
 
-      // Re-restrict and confirm workerContainerCreateArgs enforces the same guarantee automatically.
+      // Re-restrict and confirm workerContainerCreateArgs enforces the same guarantee + --group-add automatically.
       chmodSync(rpcDir, 0o700)
       chmodSync(tokenPath, 0o600)
       chmodSync(contextPath, 0o600)
@@ -171,10 +174,15 @@ test('ensureRpcMountReadable & workerContainerCreateArgs make 0o700/0o600 rpcMou
         options: { rpcMountDir: rpcDir },
       })
       assert.ok(args.includes(`type=bind,source=${realpathSync(rpcDir)},target=/kovo-rpc,readonly`))
-      assert.equal(statSync(rpcDir).mode & 0o001, 0o001)
-      assert.equal(statSync(tokenPath).mode & 0o004, 0o004)
-      assert.equal(statSync(contextPath).mode & 0o004, 0o004)
-      assert.equal(lstatSync(socketPath).mode & 0o006, 0o006)
+      const hostGid = typeof process.getgid === 'function' ? process.getgid() : 0
+      if (hostGid > 0) {
+        const groupAddIdx = args.indexOf('--group-add')
+        assert.ok(groupAddIdx >= 0 && args[groupAddIdx + 1] === String(hostGid), 'must pass --group-add <hostGid> for group-scoped RPC access')
+      }
+      assert.equal(statSync(rpcDir).mode & 0o777, 0o750)
+      assert.equal(statSync(tokenPath).mode & 0o777, 0o640)
+      assert.equal(statSync(contextPath).mode & 0o777, 0o640)
+      assert.equal(lstatSync(socketPath).mode & 0o777, 0o660)
     })
   } finally {
     await new Promise<void>(resolve => server.close(() => resolve()))
