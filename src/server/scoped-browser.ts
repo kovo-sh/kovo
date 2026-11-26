@@ -375,6 +375,9 @@ interface PlaywrightContext {
 export interface PlaywrightBrowserLike {
   newContext(options?: Record<string, unknown>): Promise<PlaywrightContext>
   close(): Promise<void>
+  isConnected?(): boolean
+  on?(event: 'disconnected', listener: () => void): unknown
+  off?(event: 'disconnected', listener: () => void): unknown
 }
 
 export interface ScopedBrowserOptions {
@@ -390,11 +393,20 @@ export interface ScopedBrowserOptions {
   ) => BrowserSessionBundle | null | Promise<BrowserSessionBundle | null>
   /** Capture WebSocket traffic through CDP. Defaults to true. */
   captureWebSockets?: boolean
-  /** Upper bound on simultaneously pooled per-persona contexts. Defaults to 8. */
+  /** Upper bound on simultaneously pooled idle/active contexts before LRU eviction. Defaults to 8. */
   maxPooledContexts?: number
+  /**
+   * Hard upper bound on simultaneous active + creating pooled contexts before backpressure kicks in.
+   * Defaults to a small bounded burst above `maxPooledContexts` (`min(20, max + clamp(floor(max/2), 1, 4))`).
+   */
+  maxActiveContexts?: number
+  /** Maximum time (ms) a caller waits on pool backpressure when all slots are active. Defaults to 15_000. */
+  poolAcquireTimeoutMs?: number
   /** Optional injectable DNS resolver for deterministic EgressGateway loopback proxy tests. */
   proxyResolveHost?: (hostname: string) => Promise<string[]>
 }
+
+const DEFAULT_POOL_ACQUIRE_TIMEOUT_MS = 15_000
 
 const maxBrowserTimeoutMs = 30_000
 const maxDomSnippetChars = 16_384
@@ -1265,6 +1277,107 @@ function resolveBundleAllowedOrigins(
   return [...out]
 }
 
+function isLoopbackHost(hostname: string): boolean {
+  const lower = hostname.toLowerCase()
+  return lower === 'localhost' || lower === '127.0.0.1' || lower === '[::1]' || lower === '::1'
+}
+
+function areSiblingSiteOrigins(originA: string, originB: string): boolean {
+  let urlA: URL
+  let urlB: URL
+  try {
+    urlA = new URL(originA)
+    urlB = new URL(originB)
+  } catch {
+    return false
+  }
+  const hostA = urlA.hostname.toLowerCase()
+  const hostB = urlB.hostname.toLowerCase()
+  if (hostA === hostB) return true
+  if (isLoopbackHost(hostA) && isLoopbackHost(hostB)) return true
+  const labelsA = hostA.split('.').filter(Boolean)
+  const labelsB = hostB.split('.').filter(Boolean)
+  if (labelsA.length >= 2 && labelsB.length >= 2) {
+    const tailA = `${labelsA[labelsA.length - 2]}.${labelsA[labelsA.length - 1]}`
+    const tailB = `${labelsB[labelsB.length - 2]}.${labelsB[labelsB.length - 1]}`
+    if (tailA === tailB) return true
+  }
+  return false
+}
+
+/**
+ * Resolve whether a browser subrequest may attach `persona` credentials.
+ *
+ * Security invariants:
+ * - Never attaches credentials to passive asset hydration (`assetHydration === true`).
+ * - Always attaches for exact same-origin requests (`targetOrigin === pageOrigin`).
+ * - For cross-origin requests (e.g. an SPA on `app.example.com` calling a sibling API on
+ *   `api.example.com`), attaches `persona` ONLY when:
+ *   1. `grant.canRead(targetOrigin)` is true (strictly in-scope target origin), AND
+ *   2. `targetOrigin` is explicitly listed in `grant.personas.get(persona).originAllowlist`
+ *      (strictly refusing out-of-scope or third-party origins — zero credential leakage), AND
+ *   3. Not explicitly excluded by a non-credentialed `validatedFetch` (`credentials !== 'include'`), AND
+ *   4. The request carries credentials, is same-site / sibling API, or is an API/navigation fetch.
+ */
+export function resolvePersonaForBrowserRequest(params: {
+  persona: string | undefined
+  pageOrigin: string
+  targetOrigin: string
+  grant: Pick<Grant, 'canRead' | 'personas'>
+  assetHydration: boolean
+  resourceType: string
+  requestHeaders: Record<string, string>
+  validatedFetch?: { origin: string; credentials: 'include' | 'same-origin' | 'omit' } | null
+}): string | undefined {
+  const { persona, pageOrigin, targetOrigin, grant, assetHydration, resourceType, requestHeaders, validatedFetch } = params
+  if (!persona || assetHydration) return undefined
+  if (targetOrigin === pageOrigin) return persona
+  if (!grant.canRead(targetOrigin)) return undefined
+
+  const resolvedPersona = grant.personas?.get(persona)
+  if (!resolvedPersona || resolvedPersona.originAllowlist.length === 0) return undefined
+  let allowlisted = false
+  for (const entry of resolvedPersona.originAllowlist) {
+    try {
+      const parsed = new URL(entry)
+      if ((parsed.protocol === 'https:' || parsed.protocol === 'http:') && parsed.origin === targetOrigin) {
+        allowlisted = true
+        break
+      }
+    } catch {
+      // Ignore malformed allowlist entries (fail closed).
+    }
+  }
+  if (!allowlisted) return undefined
+
+  if (validatedFetch && validatedFetch.origin === targetOrigin) {
+    return validatedFetch.credentials === 'include' ? persona : undefined
+  }
+
+  let hasCredentialHeader = false
+  let secFetchSite = ''
+  let secFetchMode = ''
+  for (const [key, value] of Object.entries(requestHeaders)) {
+    const lower = key.toLowerCase()
+    if ((lower === 'cookie' || lower === 'authorization') && value.trim().length > 0) {
+      hasCredentialHeader = true
+    } else if (lower === 'sec-fetch-site') {
+      secFetchSite = value.trim().toLowerCase()
+    } else if (lower === 'sec-fetch-mode') {
+      secFetchMode = value.trim().toLowerCase()
+    }
+  }
+
+  if (hasCredentialHeader) return persona
+  if (secFetchSite === 'same-site' || secFetchSite === 'same-origin') return persona
+  if (secFetchMode === 'cors' || secFetchMode === 'navigate') return persona
+  if (resourceType === 'fetch' || resourceType === 'xhr' || resourceType === 'document' || resourceType === 'other') {
+    return persona
+  }
+  if (areSiblingSiteOrigins(pageOrigin, targetOrigin)) return persona
+  return undefined
+}
+
 function collectSecrets(req: BrowserVisitRequest, grant: Grant): NamedSecret[] {
   const out: NamedSecret[] = []
   if (grant.personas) out.push(...personaSecrets(grant.personas))
@@ -1588,6 +1701,23 @@ interface PooledLeaseWaiter {
   reject: (err: unknown) => void
   signal?: AbortSignal
   onAbort?: () => void
+}
+
+interface PoolSlotWaiter {
+  wake: () => void
+  fail: (err: unknown) => void
+}
+
+function isBrowserConnected(browser: PlaywrightBrowserLike | null): boolean {
+  if (!browser) return false
+  if (typeof browser.isConnected === 'function') {
+    try {
+      return browser.isConnected()
+    } catch {
+      return false
+    }
+  }
+  return true
 }
 
 interface PooledRuntime {
@@ -2129,8 +2259,11 @@ export class ScopedBrowser {
   private poolLaunch: Promise<PlaywrightBrowserLike> | null = null
   private poolProxy: EgressLoopbackProxy | null = null
   private poolProxyLaunch: Promise<EgressLoopbackProxy> | null = null
+  private poolBrowserDisconnectCleanup: (() => void) | null = null
   private readonly pooled = new Map<string, PooledRuntime>()
   private readonly pooledPending = new Map<string, Promise<PooledRuntime>>()
+  private pooledCreating = 0
+  private readonly poolSlotWaiters: PoolSlotWaiter[] = []
   private readonly runActiveLeases = new Map<string, number>()
   private readonly poolStats: BrowserPoolStats = {
     launches: 0, contextsCreated: 0, contextsClosed: 0, pagesCreated: 0, activeContexts: 0,
@@ -2151,22 +2284,94 @@ export class ScopedBrowser {
     return this.runActiveLeases.get(runId) ?? 0
   }
 
-  private async ensurePoolBrowser(): Promise<PlaywrightBrowserLike> {
-    if (this.poolBrowser) return this.poolBrowser
+  /** Atomically tear down stale pool state when the underlying Chromium process disconnects/crashes. */
+  private resetPoolOnBrowserDisconnect(disconnectedBrowser: PlaywrightBrowserLike): void {
+    if (this.poolBrowser !== disconnectedBrowser) return
+    this.poolBrowserDisconnectCleanup?.()
+    this.poolBrowserDisconnectCleanup = null
+    this.poolBrowser = null
+    this.poolLaunch = null
+
+    const staleEntries = [...this.pooled.values()]
+    this.pooled.clear()
+    this.pooledPending.clear()
+    this.runActiveLeases.clear()
+
+    for (const entry of staleEntries) {
+      if (entry.closed) continue
+      entry.closed = true
+      entry.active = null
+      entry.activeGrant = null
+      entry.activeAllowLocalLab = false
+      entry.activeAttestor = null
+      entry.leaseOwner = null
+      entry.activeLeases = 0
+      const pendingWaiters = entry.leaseQueue.splice(0)
+      for (const waiter of pendingWaiters) {
+        if (waiter.signal && waiter.onAbort) {
+          waiter.signal.removeEventListener('abort', waiter.onAbort)
+        }
+        waiter.reject(new Error('Pooled browser disconnected unexpectedly before lease acquisition.'))
+      }
+      entry.wireVault.clear()
+      entry.proxyBinding.unregister()
+      void entry.cdp?.detach?.().catch(() => undefined)
+      void entry.page.close().catch(() => undefined)
+      void entry.context.close().catch(() => undefined)
+      this.poolStats.contextsClosed += 1
+    }
+    this.notifyPoolSlotWaiters()
+  }
+
+  private async ensurePoolBrowser(allowRetry = true): Promise<PlaywrightBrowserLike> {
+    if (this.poolBrowser) {
+      if (isBrowserConnected(this.poolBrowser)) {
+        return this.poolBrowser
+      }
+      // Browser process exited or crashed without firing disconnected yet: reset pool atomically.
+      this.resetPoolOnBrowserDisconnect(this.poolBrowser)
+    }
     if (!this.poolLaunch) {
-      this.poolLaunch = (async () => {
+      let launchPromise: Promise<PlaywrightBrowserLike> | null = null
+      launchPromise = (async () => {
         try {
           const browser = await (this.options.launchBrowser ? this.options.launchBrowser() : launchChromium())
+          if (!isBrowserConnected(browser)) {
+            await browser.close().catch(() => undefined)
+            throw new Error('Launched Chromium browser disconnected before pool initialization completed.')
+          }
           this.poolStats.launches += 1
           this.poolBrowser = browser
+          const onDisconnected = () => {
+            this.resetPoolOnBrowserDisconnect(browser)
+          }
+          if (typeof browser.on === 'function') {
+            browser.on('disconnected', onDisconnected)
+            this.poolBrowserDisconnectCleanup = () => {
+              try { browser.off?.('disconnected', onDisconnected) } catch { /* ignore */ }
+            }
+          } else {
+            this.poolBrowserDisconnectCleanup = null
+          }
           return browser
         } catch (err) {
-          this.poolLaunch = null
+          if (this.poolLaunch === launchPromise) {
+            this.poolLaunch = null
+          }
           throw err
         }
       })()
+      this.poolLaunch = launchPromise
     }
-    return await this.poolLaunch
+    const browser = await this.poolLaunch
+    if (!isBrowserConnected(browser)) {
+      this.resetPoolOnBrowserDisconnect(browser)
+      if (allowRetry) {
+        return await this.ensurePoolBrowser(false)
+      }
+      throw new Error('Pooled Chromium browser disconnected immediately after launch.')
+    }
+    return browser
   }
 
   private async ensurePoolProxy(): Promise<EgressLoopbackProxy> {
@@ -2305,6 +2510,83 @@ export class ScopedBrowser {
     await entry.page.close().catch(() => undefined)
     await entry.context.close().catch(() => undefined)
     this.poolStats.contextsClosed += 1
+    this.notifyPoolSlotWaiters()
+  }
+
+  private resolvePoolLimits(): { maxContexts: number; hardCap: number } {
+    const maxContexts = Math.max(1, Math.min(this.options.maxPooledContexts ?? 8, 16))
+    const hardCap = this.options.maxActiveContexts !== undefined
+      ? Math.max(1, Math.min(Math.trunc(this.options.maxActiveContexts), 32))
+      : Math.min(20, maxContexts + Math.max(1, Math.min(4, Math.floor(maxContexts / 2))))
+    return { maxContexts, hardCap }
+  }
+
+  private hasIdlePooledContext(): boolean {
+    for (const entry of this.pooled.values()) {
+      if (!entry.closed && entry.activeLeases === 0 && entry.active === null && entry.leaseQueue.length === 0) {
+        return true
+      }
+    }
+    return false
+  }
+
+  private notifyPoolSlotWaiters(): void {
+    const waiters = this.poolSlotWaiters.splice(0)
+    for (const waiter of waiters) {
+      waiter.wake()
+    }
+  }
+
+  private rejectAllPoolSlotWaiters(err: Error): void {
+    const waiters = this.poolSlotWaiters.splice(0)
+    for (const waiter of waiters) {
+      waiter.fail(err)
+    }
+  }
+
+  private waitForPoolSlotEvent(timeoutMs: number, signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted()
+    return new Promise<void>((resolve, reject) => {
+      let settled = false
+      const cleanup = () => {
+        clearTimeout(timer)
+        if (signal && onAbort) signal.removeEventListener('abort', onAbort)
+        const idx = this.poolSlotWaiters.indexOf(waiter)
+        if (idx >= 0) this.poolSlotWaiters.splice(idx, 1)
+      }
+      const waiter: PoolSlotWaiter = {
+        wake: () => {
+          if (settled) return
+          settled = true
+          cleanup()
+          resolve()
+        },
+        fail: err => {
+          if (settled) return
+          settled = true
+          cleanup()
+          reject(err)
+        },
+      }
+      const onAbort = signal
+        ? () => {
+            if (settled) return
+            settled = true
+            cleanup()
+            reject(signal.reason ?? new Error('Browser pool context wait aborted.'))
+          }
+        : undefined
+      const timer = setTimeout(() => {
+        if (settled) return
+        settled = true
+        cleanup()
+        resolve()
+      }, Math.max(1, timeoutMs))
+      if (signal && onAbort) {
+        signal.addEventListener('abort', onAbort, { once: true })
+      }
+      this.poolSlotWaiters.push(waiter)
+    })
   }
 
   /** Evict strictly idle (`activeLeases === 0`) LRU contexts; never evict an active context. */
@@ -2321,6 +2603,45 @@ export class ScopedBrowser {
       }
       if (!oldestIdle) break
       await this.closePooledRuntime(oldestIdle)
+    }
+  }
+
+  /**
+   * Bounded semaphore backpressure for pooled context creation:
+   * - Evicts idle LRU contexts down below `maxContexts` (never evicting active contexts).
+   * - When all slots up to `hardCap` are actively leased or being created, waits for an active
+   *   context to release (bounded by `poolAcquireTimeoutMs` and `signal`) rather than silently
+   *   leaking unbounded Chromium contexts.
+   * - Reserves one creation slot (`this.pooledCreating += 1`) synchronously upon acquisition.
+   */
+  private async reservePoolCreationSlot(signal?: AbortSignal): Promise<void> {
+    const { maxContexts, hardCap } = this.resolvePoolLimits()
+    const acquireTimeoutMs = Math.max(50, this.options.poolAcquireTimeoutMs ?? DEFAULT_POOL_ACQUIRE_TIMEOUT_MS)
+    const deadlineAt = Date.now() + acquireTimeoutMs
+
+    for (;;) {
+      signal?.throwIfAborted()
+      await this.evictIdleLruIfNeeded(maxContexts)
+      // Synchronously check capacity after eviction and reserve slot before any further await.
+      if (this.pooled.size + this.pooledCreating < hardCap) {
+        this.pooledCreating += 1
+        return
+      }
+      if (this.hasIdlePooledContext()) {
+        // An idle context became available during eviction/yield; loop to reclaim it immediately.
+        await this.evictIdleLruIfNeeded(Math.max(1, hardCap - this.pooledCreating))
+        if (this.pooled.size + this.pooledCreating < hardCap) {
+          this.pooledCreating += 1
+          return
+        }
+      }
+      const remainingMs = deadlineAt - Date.now()
+      if (remainingMs <= 0) {
+        throw new Error(
+          `ScopedBrowser pool capacity exhausted (${this.pooled.size} active/pooled, ${this.pooledCreating} creating, limit ${hardCap}); timed out after ${acquireTimeoutMs} ms waiting for a pooled context slot.`,
+        )
+      }
+      await this.waitForPoolSlotEvent(remainingMs, signal)
     }
   }
 
@@ -2385,6 +2706,14 @@ export class ScopedBrowser {
       next.resolve()
       return
     }
+    if (runtime.activeLeases === 0 && !runtime.closed) {
+      const { maxContexts } = this.resolvePoolLimits()
+      if (this.pooled.size > maxContexts) {
+        await this.closePooledRuntime(runtime)
+        return
+      }
+      this.notifyPoolSlotWaiters()
+    }
   }
 
   private async ensurePooledContext(
@@ -2392,6 +2721,7 @@ export class ScopedBrowser {
     req: BrowserVisitRequest,
     initialOrigin: string,
     bundle: BrowserSessionBundle | null,
+    signal?: AbortSignal,
   ): Promise<PooledRuntime> {
     // H9: Include `initialOrigin` in the pool key so cookies, initScripts, and storage never leak across origins.
     const key = `${req.runId ?? 'default'}::${req.persona ? `persona:${req.persona}` : 'anonymous'}::${initialOrigin}`
@@ -2408,10 +2738,11 @@ export class ScopedBrowser {
     }
 
     const createPromise = (async (): Promise<PooledRuntime> => {
-      const maxContexts = Math.max(1, Math.min(this.options.maxPooledContexts ?? 8, 16))
-      await this.evictIdleLruIfNeeded(maxContexts)
-
-      const poolProxy = await this.ensurePoolProxy()
+      await this.reservePoolCreationSlot(signal)
+      let slotReserved = true
+      try {
+        const activeBrowser = isBrowserConnected(browser) ? browser : await this.ensurePoolBrowser()
+        const poolProxy = await this.ensurePoolProxy()
       const wireVault = new BrowserWirePlaceholderVault()
       const runtime: PooledRuntime = {
         key,
@@ -2501,7 +2832,7 @@ export class ScopedBrowser {
 
       let context: PlaywrightContext
       try {
-        context = await browser.newContext({
+        context = await activeBrowser.newContext({
           ignoreHTTPSErrors: false,
           javaScriptEnabled: true,
           bypassCSP: false,
@@ -2574,25 +2905,23 @@ export class ScopedBrowser {
           await route.abort('blockedbyclient').catch(() => undefined)
           return
         }
+        const rawRequestHeaders = request.headers()
         const forwardedHeaders: Record<string, string> = {}
-        for (const [k, v] of Object.entries(request.headers())) {
+        for (const [k, v] of Object.entries(rawRequestHeaders)) {
           if (forbiddenBrowserForwardHeaders.test(k)) continue
           forwardedHeaders[k] = v
         }
         const resourceType = request.resourceType()
-        let personaForRequest: string | undefined
-        if (state.persona && !decision.assetHydration) {
-          if (parsedUrl.origin === state.origin) {
-            personaForRequest = state.persona
-          } else if (
-            state.validatedFetch &&
-            state.validatedFetch.credentials === 'include' &&
-            parsedUrl.origin === state.validatedFetch.origin &&
-            Boolean(activeGrant.personas?.get(state.persona)?.originAllowlist.includes(parsedUrl.origin))
-          ) {
-            personaForRequest = state.persona
-          }
-        }
+        const personaForRequest = resolvePersonaForBrowserRequest({
+          persona: state.persona,
+          pageOrigin: state.origin,
+          targetOrigin: parsedUrl.origin,
+          grant: activeGrant,
+          assetHydration: Boolean(decision.assetHydration),
+          resourceType,
+          requestHeaders: rawRequestHeaders,
+          validatedFetch: state.validatedFetch,
+        })
         try {
           const exchange = await this.broker.executeHttp({
             origin: parsedUrl.origin,
@@ -2616,7 +2945,7 @@ export class ScopedBrowser {
             const recordedId = state.onExchange?.(exchange)
             if (typeof recordedId === 'string' && recordedId) state.exchangeIds.push(recordedId)
             await mirrorJarCookies(runtime.context, this.broker, {
-              ...(state.persona ? { persona: state.persona } : {}),
+              ...(personaForRequest ? { persona: personaForRequest } : {}),
               ...(state.session ? { session: state.session } : {}),
               ...(state.runId ? { runId: state.runId } : {}),
               ...(state.assignmentId ? { assignmentId: state.assignmentId } : {}),
@@ -2692,7 +3021,15 @@ export class ScopedBrowser {
         runtime.cdp = await attachWebSocketCapture(context, runtime.page, runtime.sockets, [])
       }
       this.pooled.set(key, runtime)
+      slotReserved = false
+      this.pooledCreating = Math.max(0, this.pooledCreating - 1)
       return runtime
+      } finally {
+        if (slotReserved) {
+          this.pooledCreating = Math.max(0, this.pooledCreating - 1)
+          this.notifyPoolSlotWaiters()
+        }
+      }
     })()
 
     this.pooledPending.set(key, createPromise)
@@ -2718,12 +3055,12 @@ export class ScopedBrowser {
     const tier = grant.tier ?? 1
     if (tier === 0) throw new BrokerDenied('Scoped browser inspection is disabled in Tier 0 (offline prepared mode).')
     if (!Array.isArray(requests) || requests.length === 0) return []
-    const browser = await this.ensurePoolBrowser()
     const results: BrowserVisitResult[] = []
     const allowLocalLab = Boolean(grant.allowLocalLab && process.env.KOVO_ALLOW_LOCAL_LAB === '1')
 
     for (const req of requests) {
       signal.throwIfAborted()
+      const browser = await this.ensurePoolBrowser()
       const initialOrigin = new URL(req.origin).origin
       if (!req.pathAndQuery.startsWith('/') || req.pathAndQuery.startsWith('//') || /[\r\n\0]/.test(req.pathAndQuery)) {
         grant.audit('denied', initialOrigin)
@@ -2760,14 +3097,16 @@ export class ScopedBrowser {
       secrets.push(...collectBundleSecrets(bundle))
       const allowedOrigins = resolveBundleAllowedOrigins(grant, req.persona, initialOrigin)
 
-      // Acquire pooled runtime + exclusive per-runtime lease (retrying once if an idle entry closed mid-wait).
-      let runtime = await this.ensurePooledContext(browser, req, initialOrigin, bundle)
+      // Acquire pooled runtime + exclusive per-runtime lease (retrying once if an idle entry closed mid-wait
+      // or the underlying Chromium disconnected and relaunched).
+      let runtime = await this.ensurePooledContext(browser, req, initialOrigin, bundle, deadline)
       let leaseOwner: symbol
       try {
         leaseOwner = await this.acquireRuntimeLease(runtime, deadline)
       } catch (err) {
         if (runtime.closed && !deadline.aborted) {
-          runtime = await this.ensurePooledContext(browser, req, initialOrigin, bundle)
+          const freshBrowser = await this.ensurePoolBrowser()
+          runtime = await this.ensurePooledContext(freshBrowser, req, initialOrigin, bundle, deadline)
           leaseOwner = await this.acquireRuntimeLease(runtime, deadline)
         } else {
           throw err
@@ -2988,21 +3327,26 @@ export class ScopedBrowser {
 
   /** Close every pooled context and the single Chromium process. Idempotent. */
   async close(): Promise<void> {
+    this.rejectAllPoolSlotWaiters(new Error('ScopedBrowser was closed while waiting for a pooled context slot.'))
     for (const entry of [...this.pooled.values()]) {
       await this.closePooledRuntime(entry)
     }
     this.pooled.clear()
     this.pooledPending.clear()
     this.runActiveLeases.clear()
+    this.poolBrowserDisconnectCleanup?.()
+    this.poolBrowserDisconnectCleanup = null
     if (this.poolBrowser) {
-      await this.poolBrowser.close().catch(() => undefined)
+      const browserToClose = this.poolBrowser
       this.poolBrowser = null
       this.poolLaunch = null
+      await browserToClose.close().catch(() => undefined)
     }
     if (this.poolProxy) {
-      await this.poolProxy.close().catch(() => undefined)
+      const proxyToClose = this.poolProxy
       this.poolProxy = null
       this.poolProxyLaunch = null
+      await proxyToClose.close().catch(() => undefined)
     }
   }
 
@@ -3200,26 +3544,24 @@ export class ScopedBrowser {
           return
         }
 
+        const rawRequestHeaders = request.headers()
         const forwardedHeaders: Record<string, string> = {}
-        for (const [k, v] of Object.entries(request.headers())) {
+        for (const [k, v] of Object.entries(rawRequestHeaders)) {
           if (forbiddenBrowserForwardHeaders.test(k)) continue
           forwardedHeaders[k] = v
         }
 
         const resourceType = request.resourceType()
-        let personaForRequest: string | undefined
-        if (req.persona && !decision.assetHydration) {
-          if (parsedUrl.origin === initialOrigin) {
-            personaForRequest = req.persona
-          } else if (
-            validatedFetch &&
-            validatedFetch.credentials === 'include' &&
-            parsedUrl.origin === validatedFetch.origin &&
-            Boolean(grant.personas?.get(req.persona)?.originAllowlist.includes(parsedUrl.origin))
-          ) {
-            personaForRequest = req.persona
-          }
-        }
+        const personaForRequest = resolvePersonaForBrowserRequest({
+          persona: req.persona,
+          pageOrigin: initialOrigin,
+          targetOrigin: parsedUrl.origin,
+          grant,
+          assetHydration: Boolean(decision.assetHydration),
+          resourceType,
+          requestHeaders: rawRequestHeaders,
+          validatedFetch,
+        })
 
         try {
           const exchange = await this.broker.executeHttp({
@@ -3245,7 +3587,7 @@ export class ScopedBrowser {
             const recordedId = req.onExchange?.(exchange)
             if (typeof recordedId === 'string' && recordedId) exchangeIds.push(recordedId)
             await mirrorJarCookies(context, this.broker, {
-              ...(req.persona ? { persona: req.persona } : {}),
+              ...(personaForRequest ? { persona: personaForRequest } : {}),
               session: req.session,
               runId: req.runId,
               assignmentId: req.assignmentId,
@@ -4061,27 +4403,25 @@ export class ScopedBrowser {
               return
             }
 
+            const rawRequestHeaders = request.headers()
             const forwardedHeaders: Record<string, string> = {}
-            for (const [k, v] of Object.entries(request.headers())) {
+            for (const [k, v] of Object.entries(rawRequestHeaders)) {
               if (forbiddenBrowserForwardHeaders.test(k)) continue
               forwardedHeaders[k] = v
             }
 
             const cur = activeStep
             const resourceType = request.resourceType()
-            let personaForRequest: string | undefined
-            if (cur.step.persona && !decision.assetHydration) {
-              if (parsedUrl.origin === cur.origin) {
-                personaForRequest = cur.step.persona
-              } else if (
-                cur.validatedFetch &&
-                cur.validatedFetch.credentials === 'include' &&
-                parsedUrl.origin === cur.validatedFetch.origin &&
-                Boolean(grant.personas?.get(cur.step.persona)?.originAllowlist.includes(parsedUrl.origin))
-              ) {
-                personaForRequest = cur.step.persona
-              }
-            }
+            const personaForRequest = resolvePersonaForBrowserRequest({
+              persona: cur.step.persona,
+              pageOrigin: cur.origin,
+              targetOrigin: parsedUrl.origin,
+              grant,
+              assetHydration: Boolean(decision.assetHydration),
+              resourceType,
+              requestHeaders: rawRequestHeaders,
+              validatedFetch: cur.validatedFetch,
+            })
 
             const routeSecrets = [
               ...(grant.personas ? personaSecrets(grant.personas) : []),
@@ -4113,7 +4453,7 @@ export class ScopedBrowser {
               const recordedId = cur.step.onExchange?.(exchange)
               if (typeof recordedId === 'string' && recordedId) stepExchangeIds.push(recordedId)
               await mirrorJarCookies(context, this.broker, {
-                ...(cur.step.persona ? { persona: cur.step.persona } : {}),
+                ...(personaForRequest ? { persona: personaForRequest } : {}),
                 session: cur.step.session ?? sessionId,
                 runId: cur.step.runId,
                 assignmentId: cur.step.assignmentId,
