@@ -1,10 +1,13 @@
 import { useState } from 'react'
 import {
   addProjectAsset,
+  bulkRemoveProjectAssetsAction,
+  bulkUpdateProjectAssetScopeAction,
   clearProjectAssetAccessPolicyAction,
   updateProjectAssetAction,
   updateProjectAssetScope,
 } from '../../actions.ts'
+import { cn } from '../../lib/cn.ts'
 import { AccessPolicyImport } from '../access-policy-import.tsx'
 import { formatHumanTime, FormError, useAction } from '../common.tsx'
 import { DnsInventoryImport } from '../dns-inventory-import.tsx'
@@ -40,6 +43,8 @@ function safeHostname(raw: string | undefined): string {
   }
 }
 
+type InventoryFilter = 'all' | 'needs_approval' | 'approved' | 'first_party' | 'third_party'
+
 export function ProjectInventoryTab({ data, onDeleteAsset }: Props) {
   const { project, assets } = data
   const [panel, setPanel] = useState<'dns' | 'access'>()
@@ -49,12 +54,15 @@ export function ProjectInventoryTab({ data, onDeleteAsset }: Props) {
   const [editSource, setEditSource] = useState('')
   const [editThirdParty, setEditThirdParty] = useState(false)
   const [assetToDelete, setAssetToDelete] = useState<ProjectLoaderData['assets'][number] | null>(null)
+  const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false)
   const [candidateOrigin, setCandidateOrigin] = useState('')
   const [candidateSource, setCandidateSource] = useState('')
   const [candidateThirdParty, setCandidateThirdParty] = useState(false)
   const [candidateIncludeSubdomains, setCandidateIncludeSubdomains] = useState(false)
   const [notice, setNotice] = useState('')
   const [hostSearch, setHostSearch] = useState('')
+  const [filter, setFilter] = useState<InventoryFilter>('all')
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set())
   const inventoryAction = useAction()
 
   function togglePanel(next: 'dns' | 'access') {
@@ -77,19 +85,137 @@ export function ProjectInventoryTab({ data, onDeleteAsset }: Props) {
     setNotice('')
   }
 
+  const approvedOriginSet = new Set(project.defaultScope)
+  const assetIdSet = new Set(assets.map(a => a.id))
+  const effectiveSelectedIds = new Set([...selectedIds].filter(assetId => assetIdSet.has(assetId)))
+  const selectedCount = effectiveSelectedIds.size
+  const selectedAssets = assets.filter(asset => effectiveSelectedIds.has(asset.id))
+
+  const counts = {
+    all: assets.length,
+    needs_approval: assets.filter(asset => !approvedOriginSet.has(asset.origin)).length,
+    approved: assets.filter(asset => approvedOriginSet.has(asset.origin)).length,
+    first_party: assets.filter(asset => !asset.thirdParty).length,
+    third_party: assets.filter(asset => asset.thirdParty).length,
+  }
+
+  const filterPills: readonly { id: InventoryFilter; label: string; count: number }[] = [
+    { id: 'all', label: 'All', count: counts.all },
+    { id: 'needs_approval', label: 'Needs approval', count: counts.needs_approval },
+    { id: 'approved', label: 'Approved', count: counts.approved },
+    { id: 'first_party', label: 'First-party', count: counts.first_party },
+    { id: 'third_party', label: 'Third-party', count: counts.third_party },
+  ]
+
   const searchTerm = hostSearch.trim().toLowerCase()
+  const filteredAssets = assets.filter(asset => {
+    if (filter === 'needs_approval') return !approvedOriginSet.has(asset.origin)
+    if (filter === 'approved') return approvedOriginSet.has(asset.origin)
+    if (filter === 'first_party') return !asset.thirdParty
+    if (filter === 'third_party') return asset.thirdParty
+    return true
+  })
   const visibleAssets = searchTerm
-    ? assets.filter(asset => {
+    ? filteredAssets.filter(asset => {
       const haystack = `${safeHost(asset.origin)} ${asset.source ?? ''} ${asset.dnsSource?.zone ?? ''}`.toLowerCase()
       return haystack.includes(searchTerm)
     })
-    : assets
-  const approvedAssets = visibleAssets.filter(asset => project.defaultScope.includes(asset.origin))
-  const needsApprovalAssets = visibleAssets.filter(asset => !project.defaultScope.includes(asset.origin))
+    : filteredAssets
+  const approvedAssets = visibleAssets.filter(asset => approvedOriginSet.has(asset.origin))
+  const needsApprovalAssets = visibleAssets.filter(asset => !approvedOriginSet.has(asset.origin))
+  const unapprovedFirstPartyAssets = needsApprovalAssets.filter(asset => !asset.thirdParty)
+
+  const selectedVisibleCount = visibleAssets.filter(asset => effectiveSelectedIds.has(asset.id)).length
+  const allVisibleSelected = visibleAssets.length > 0 && selectedVisibleCount === visibleAssets.length
+  const someVisibleSelected = selectedVisibleCount > 0 && !allVisibleSelected
+
+  function toggleSelectAsset(assetId: string, checked: boolean) {
+    setSelectedIds(prev => {
+      const next = new Set(prev)
+      if (checked) next.add(assetId)
+      else next.delete(assetId)
+      return next
+    })
+  }
+
+  function toggleSelectAllVisible(checked: boolean) {
+    setSelectedIds(prev => {
+      const next = new Set(prev)
+      for (const asset of visibleAssets) {
+        if (checked) next.add(asset.id)
+        else next.delete(asset.id)
+      }
+      return next
+    })
+  }
+
+  function handleApproveAllFirstParty() {
+    const ids = unapprovedFirstPartyAssets.map(asset => asset.id)
+    if (ids.length === 0) return
+    setNotice('')
+    void inventoryAction.submit(
+      () => bulkUpdateProjectAssetScopeAction({
+        data: {
+          requestId: crypto.randomUUID(),
+          projectId: project.id,
+          assetIds: ids,
+          approveInDefaultScope: true,
+        },
+      }),
+      res => {
+        const updatedSet = new Set(res.updatedIds)
+        setSelectedIds(prev => new Set([...prev].filter(id => !updatedSet.has(id))))
+        setNotice(`Approved ${res.updatedCount} first-party ${res.updatedCount === 1 ? 'host' : 'hosts'} in project scope.`)
+      },
+    )
+  }
+
+  function handleBulkApprove(approveInDefaultScope: boolean) {
+    const ids = [...effectiveSelectedIds]
+    if (ids.length === 0) return
+    setNotice('')
+    void inventoryAction.submit(
+      () => bulkUpdateProjectAssetScopeAction({
+        data: {
+          requestId: crypto.randomUUID(),
+          projectId: project.id,
+          assetIds: ids,
+          approveInDefaultScope,
+        },
+      }),
+      res => {
+        setSelectedIds(new Set())
+        setNotice(
+          `${approveInDefaultScope ? 'Approved' : 'Unapproved'} ${res.updatedCount} ${res.updatedCount === 1 ? 'host' : 'hosts'} ${approveInDefaultScope ? 'in' : 'from'} project scope.`,
+        )
+      },
+    )
+  }
+
+  function handleBulkRemove() {
+    const ids = [...effectiveSelectedIds]
+    if (ids.length === 0) return
+    setNotice('')
+    void inventoryAction.submit(
+      () => bulkRemoveProjectAssetsAction({
+        data: {
+          requestId: crypto.randomUUID(),
+          projectId: project.id,
+          assetIds: ids,
+        },
+      }),
+      res => {
+        setSelectedIds(new Set())
+        setBulkDeleteOpen(false)
+        setNotice(`Removed ${res.removedCount} ${res.removedCount === 1 ? 'host' : 'hosts'} from project inventory.`)
+      },
+    )
+  }
 
   function renderAsset(asset: ProjectLoaderData['assets'][number]) {
     const externalCname = asset.dnsSource?.externalAliases?.[0]
-    const isDefaultApproved = project.defaultScope.includes(asset.origin)
+    const isDefaultApproved = approvedOriginSet.has(asset.origin)
+    const isSelected = effectiveSelectedIds.has(asset.id)
     const hostLabel = safeHost(asset.origin)
     const policyRecorded = asset.accessPolicy?.recordedAt
       ? formatHumanTime(asset.accessPolicy.recordedAt)
@@ -97,32 +223,47 @@ export function ProjectInventoryTab({ data, onDeleteAsset }: Props) {
     return (
       <div
         key={asset.id}
-        className="flex min-h-[44px] items-center justify-between gap-3 border-b border-line px-1 py-2 transition-colors hover:bg-hover"
+        data-testid={`inventory-row-${asset.id}`}
+        className={cn(
+          'flex min-h-[44px] items-center justify-between gap-3 border-b border-line px-1.5 py-2 transition-colors hover:bg-hover',
+          isSelected && 'bg-accent-soft/35 hover:bg-accent-soft/50',
+        )}
       >
-        <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-          <div className="flex min-w-0 flex-wrap items-center gap-1.5 font-medium text-fg">
-            <strong className="font-mono text-[12px] font-semibold">{hostLabel}</strong>
-            {asset.includeSubdomains && !asset.thirdParty && (
-              <Badge variant="accent">*.{asset.dnsSource?.zone ?? hostLabel}</Badge>
-            )}
-            {asset.thirdParty && externalCname ? (
-              <Badge variant="warn">Third-party CNAME ({externalCname})</Badge>
-            ) : asset.thirdParty ? (
-              <Badge variant="warn">Third party</Badge>
-            ) : null}
-            {asset.accessPolicy && <Badge variant="neutral" className="bg-sunk">Access policy</Badge>}
-          </div>
-          <div className="text-[12px] text-fg-subtle">
-            {asset.source}
-            {asset.dnsSource ? ` · ${asset.dnsSource.zone}` : ''}
-            {policyRecorded?.label && (
-              <>
-                {' · '}
-                <span className="tabular-nums" title={policyRecorded.full}>
-                  Policy recorded {policyRecorded.label}
-                </span>
-              </>
-            )}
+        <div className="flex min-w-0 flex-1 items-center gap-2.5">
+          <Checkbox
+            data-testid={`select-asset-${asset.id}`}
+            checked={isSelected}
+            disabled={inventoryAction.pending}
+            aria-label={`Select host ${hostLabel}`}
+            onCheckedChange={checked => toggleSelectAsset(asset.id, Boolean(checked))}
+          />
+          <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+            <div className="flex min-w-0 flex-wrap items-center gap-1.5 font-medium text-fg">
+              <strong className="truncate font-mono text-[12px] font-semibold">{hostLabel}</strong>
+              {asset.includeSubdomains && !asset.thirdParty && (
+                <Badge variant="accent">*.{asset.dnsSource?.zone ?? hostLabel}</Badge>
+              )}
+              {asset.thirdParty && externalCname ? (
+                <Badge variant="warn">Third-party CNAME ({externalCname})</Badge>
+              ) : asset.thirdParty ? (
+                <Badge variant="warn">Third party</Badge>
+              ) : null}
+              {asset.accessPolicy && <Badge variant="neutral" className="bg-sunk">Access policy</Badge>}
+            </div>
+            <div className="truncate text-[12px] text-fg-subtle">
+              {[
+                asset.source,
+                asset.dnsSource?.zone,
+              ].filter(Boolean).join(' · ')}
+              {policyRecorded?.label && (
+                <>
+                  {' · '}
+                  <span className="tabular-nums" title={policyRecorded.full}>
+                    Policy recorded {policyRecorded.label}
+                  </span>
+                </>
+              )}
+            </div>
           </div>
         </div>
         <div className="flex flex-none items-center gap-2.5">
@@ -226,16 +367,6 @@ export function ProjectInventoryTab({ data, onDeleteAsset }: Props) {
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-1.5">
-          {assets.length > 6 && (
-            <Input
-              className="h-[26px]! w-[180px]"
-              type="search"
-              value={hostSearch}
-              onChange={e => setHostSearch(e.target.value)}
-              placeholder="Search hosts"
-              aria-label="Search hosts"
-            />
-          )}
           {assets.length > 0 && (
             <Button
               type="button"
@@ -275,7 +406,7 @@ export function ProjectInventoryTab({ data, onDeleteAsset }: Props) {
           {notice}
         </p>
       )}
-      {!addHostOpen && !assetToDelete && !assetToEdit && <FormError error={inventoryAction.error} />}
+      {!addHostOpen && !assetToDelete && !assetToEdit && !bulkDeleteOpen && <FormError error={inventoryAction.error} />}
 
       {panel === 'dns' && (
         <div className="mb-3.5">
@@ -305,6 +436,61 @@ export function ProjectInventoryTab({ data, onDeleteAsset }: Props) {
         </div>
       )}
 
+      {assets.length > 0 && (
+        <div
+          data-testid="inventory-filter-bar"
+          className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-[7px] border border-line bg-sunk/50 px-2.5 py-2"
+        >
+          <div className="flex flex-wrap items-center gap-1.5" role="group" aria-label="Filter hosts">
+            <label
+              className="mr-1 inline-flex cursor-pointer select-none items-center gap-1.5 border-r border-line pr-2.5 text-[12px] font-medium text-fg-muted"
+              title="Select or deselect all currently visible hosts for batch actions"
+            >
+              <Checkbox
+                data-testid="inventory-select-all"
+                checked={allVisibleSelected}
+                indeterminate={someVisibleSelected}
+                disabled={visibleAssets.length === 0 || inventoryAction.pending}
+                aria-label="Select all visible hosts"
+                onCheckedChange={checked => toggleSelectAllVisible(Boolean(checked))}
+              />
+              <span>Select all visible</span>
+            </label>
+            {filterPills.map(pill => {
+              const active = filter === pill.id
+              return (
+                <button
+                  key={pill.id}
+                  type="button"
+                  data-testid={`inventory-filter-${pill.id}`}
+                  aria-pressed={active}
+                  onClick={() => setFilter(pill.id)}
+                  className={cn(
+                    'inline-flex h-auto cursor-pointer items-center gap-1.5 whitespace-normal rounded-full border px-2.5 py-1 text-[12px] font-medium leading-tight shadow-none transition-colors',
+                    active
+                      ? 'border-accent-line bg-accent-soft text-accent hover:bg-accent-soft'
+                      : 'border-line-2 bg-panel text-fg-muted hover:bg-hover hover:text-fg',
+                  )}
+                >
+                  <span>{pill.label}</span>
+                  <span className={cn('text-[11px] font-normal tabular-nums', active ? 'text-accent' : 'text-fg-subtle')}>
+                    {pill.count}
+                  </span>
+                </button>
+              )
+            })}
+          </div>
+          <Input
+            className="h-[26px]! w-[190px] max-w-full"
+            type="search"
+            value={hostSearch}
+            onChange={e => setHostSearch(e.target.value)}
+            placeholder="Search hosts"
+            aria-label="Search hosts"
+          />
+        </div>
+      )}
+
       {assets.length === 0 ? (
         <div className="mt-3.5 rounded-card border border-line bg-sunk">
           <EmptyState
@@ -325,14 +511,30 @@ export function ProjectInventoryTab({ data, onDeleteAsset }: Props) {
           />
         </div>
       ) : visibleAssets.length === 0 ? (
-        <p className="mt-3.5 border-t border-line px-3 py-2.5 text-[12px] leading-[18px] text-fg-subtle">
-          No hosts match “{hostSearch.trim()}”.
-        </p>
+        <div className="mt-3.5 flex flex-wrap items-center justify-between gap-2 border-t border-line px-3 py-2.5 text-[12px] leading-[18px] text-fg-subtle">
+          <span>
+            {hostSearch.trim()
+              ? `No hosts match “${hostSearch.trim()}”.`
+              : 'No hosts match the selected filter.'}
+          </span>
+          {(filter !== 'all' || hostSearch.trim().length > 0) && (
+            <Button
+              type="button"
+              variant="ghost"
+              onClick={() => {
+                setFilter('all')
+                setHostSearch('')
+              }}
+            >
+              Show all hosts
+            </Button>
+          )}
+        </div>
       ) : (
         <>
           {approvedAssets.length > 0 && (
             <div className="border-t border-line">
-              <div className="flex items-baseline justify-between gap-2.5 px-1 pb-[7px] pt-2.5">
+              <div className="flex flex-wrap items-center justify-between gap-2.5 px-1.5 pb-[7px] pt-2.5">
                 <h3 className="m-0 text-[12px] font-semibold text-fg">
                   Approved in scope <span className="font-normal tabular-nums text-fg-subtle">({approvedAssets.length})</span>
                 </h3>
@@ -342,17 +544,81 @@ export function ProjectInventoryTab({ data, onDeleteAsset }: Props) {
             </div>
           )}
           {needsApprovalAssets.length > 0 && (
-            <div className="mt-[18px] border-t border-line">
-              <div className="flex items-baseline justify-between gap-2.5 px-1 pb-[7px] pt-2.5">
-                <h3 className="m-0 text-[12px] font-semibold text-fg">
-                  Needs approval <span className="font-normal tabular-nums text-fg-subtle">({needsApprovalAssets.length})</span>
-                </h3>
-                <span className="text-[11.5px] text-fg-subtle">Approve hosts before they enter scan scope</span>
+            <div className={cn('border-t border-line', approvedAssets.length > 0 && 'mt-[18px]')}>
+              <div className="flex flex-wrap items-center justify-between gap-2.5 px-1.5 pb-[7px] pt-2.5">
+                <div className="flex flex-wrap items-baseline gap-2">
+                  <h3 className="m-0 text-[12px] font-semibold text-fg">
+                    Needs approval <span className="font-normal tabular-nums text-fg-subtle">({needsApprovalAssets.length})</span>
+                  </h3>
+                  <span className="text-[11.5px] text-fg-subtle">Approve hosts before they enter scan scope</span>
+                </div>
+                {unapprovedFirstPartyAssets.length > 0 && (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    data-testid="approve-all-first-party"
+                    disabled={inventoryAction.pending}
+                    onClick={handleApproveAllFirstParty}
+                  >
+                    Approve all first-party ({unapprovedFirstPartyAssets.length})
+                  </Button>
+                )}
               </div>
               {needsApprovalAssets.map(renderAsset)}
             </div>
           )}
         </>
+      )}
+
+      {selectedCount > 0 && (
+        <div
+          data-testid="inventory-batch-bar"
+          className="sticky bottom-0 z-20 mt-4 flex flex-wrap items-center justify-between gap-2.5 border-t border-line bg-surface/95 px-3.5 py-2.5 shadow-card backdrop-blur-sm"
+        >
+          <div className="flex items-center gap-2">
+            <span className="text-[12.5px] font-medium tabular-nums text-fg" data-testid="inventory-batch-count">
+              {selectedCount} selected
+            </span>
+            <Button
+              type="button"
+              variant="ghost"
+              disabled={inventoryAction.pending}
+              onClick={() => setSelectedIds(new Set())}
+            >
+              Clear
+            </Button>
+          </div>
+          <div className="flex flex-wrap items-center gap-1.5">
+            <Button
+              type="button"
+              variant="default"
+              data-testid="batch-approve-selected"
+              disabled={inventoryAction.pending}
+              onClick={() => handleBulkApprove(true)}
+            >
+              {inventoryAction.pending ? 'Updating…' : `Approve selected (${selectedCount})`}
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              data-testid="batch-unapprove-selected"
+              disabled={inventoryAction.pending}
+              onClick={() => handleBulkApprove(false)}
+            >
+              Unapprove selected
+            </Button>
+            <Button
+              type="button"
+              variant="ghost"
+              data-testid="batch-remove-selected"
+              className="data-[slot=button]:text-danger data-[slot=button]:hover:bg-danger-soft data-[slot=button]:hover:text-danger"
+              disabled={inventoryAction.pending}
+              onClick={() => setBulkDeleteOpen(true)}
+            >
+              Remove selected
+            </Button>
+          </div>
+        </div>
       )}
 
       <Dialog
@@ -640,6 +906,71 @@ export function ProjectInventoryTab({ data, onDeleteAsset }: Props) {
               </DialogFooter>
             </>
           )}
+        </DialogContent>
+      </Dialog>
+      <Dialog
+        open={bulkDeleteOpen && selectedCount > 0}
+        closeOnEscape={!inventoryAction.pending}
+        onOpenChange={nextOpen => {
+          if (!nextOpen && !inventoryAction.pending) setBulkDeleteOpen(false)
+        }}
+      >
+        <DialogContent
+          role="alertdialog"
+          className="flex max-h-[calc(100vh-56px)] max-w-[460px] flex-col overflow-hidden p-0"
+        >
+          <DialogHeader className="flex-row items-center justify-between gap-2.5 border-b border-line bg-raise px-4 py-2.5">
+            <DialogTitle className="inline-flex items-center gap-2 text-[13px] font-semibold text-fg">
+              <Icon name="trash" size={15} className="text-danger" />
+              <span>Remove {selectedCount} {selectedCount === 1 ? 'host' : 'hosts'}</span>
+            </DialogTitle>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className="size-[26px]"
+              disabled={inventoryAction.pending}
+              onClick={() => setBulkDeleteOpen(false)}
+              aria-label="Close"
+            >
+              <Icon name="close" size={14} />
+            </Button>
+          </DialogHeader>
+          <DialogBody className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-4">
+            <DialogDescription className="text-[12.5px] leading-5 text-fg-muted">
+              Remove <strong className="font-semibold text-fg">{selectedCount} {selectedCount === 1 ? 'host' : 'hosts'}</strong> from this project&apos;s inventory and default scan scope? Existing runs keep their historical records.
+            </DialogDescription>
+            <ul className="m-0 list-disc space-y-0.5 pl-4 font-mono text-[12px] text-fg-muted">
+              {selectedAssets.slice(0, 5).map(asset => (
+                <li key={asset.id} className="truncate">{safeHost(asset.origin)}</li>
+              ))}
+              {selectedAssets.length > 5 && (
+                <li className="list-none font-sans text-fg-subtle">+{selectedAssets.length - 5} more</li>
+              )}
+            </ul>
+            <FormError error={inventoryAction.error} />
+          </DialogBody>
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="ghost"
+              disabled={inventoryAction.pending}
+              onClick={() => setBulkDeleteOpen(false)}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              variant="default"
+              data-testid="confirm-bulk-remove"
+              className="data-[slot=button]:bg-danger data-[slot=button]:text-white data-[slot=button]:hover:bg-danger hover:brightness-[1.08]"
+              disabled={inventoryAction.pending}
+              onClick={handleBulkRemove}
+            >
+              <Icon name="trash" size={13} />
+              {inventoryAction.pending ? 'Removing…' : `Remove ${selectedCount} ${selectedCount === 1 ? 'host' : 'hosts'}`}
+            </Button>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
     </section>
