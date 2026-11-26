@@ -34,47 +34,86 @@ const DEFAULT_TOL = 1e-6
 const MAX_PIVOT_HOPS = 8
 const FINALIZED_STATES = new Set(['fulfilled', 'completed', 'captured', 'released', 'settled', 'paid', 'shipped', 'delivered', 'disbursed'])
 const ERROR_ONLY_KEYS = new Set(['error', 'errors', 'message', 'detail', 'code', 'status', 'statusCode', 'ok', 'success'])
-const wordSet = (s: string) => new Set(s.split(' '))
-const STUB_META_KEYS = wordSet('ok success error errors message detail code status statuscode state accepted queued pending created updated cached hit miss primed ready completed done enqueued dispatched scheduled minted issued verified revoked active linked stale redeemed redacted id jobid job_id exportid export_id taskid task_id requestid request_id batchid batch_id runid run_id workflowid workflow_id correlationid correlation_id traceid trace_id downloadid download_id artifactid artifact_id fileid file_id objectid object_id sessionid session_id patid pat_id tokenid token_id inviteid invite_id webhookid webhook_id deliveryid delivery_id shareid share_id commentid comment_id handle token exporttoken export_token cachetoken cache_token downloadtoken download_token accesstoken access_token refreshtoken refresh_token idtoken id_token sessiontoken session_token signedtoken signed_token presignedtoken presigned_token scimtoken scim_token apitoken api_token invitetoken invite_token tokentype token_type signedurl signed_url presignedurl presigned_url signeddownloadurl signed_download_url presigneddownloadurl presigned_download_url downloadurl download_url exporturl export_url accessurl access_url uploadurl upload_url presignurl presign_url pollurl poll_url statusurl status_url artifacturl artifact_url fileurl file_url signedpath signed_path downloadpath download_path exportpath export_path signeddownload signed_download url href link self next location redirect redirecturi redirect_uri path filepath file_path filekey file_key objectkey object_key storagekey storage_key key bucket prefix tenantprefix tenant_prefix filename file_name contenttype content_type mimetype mime_type cachekey cache_key cachestatus cache_status cachehit cache_hit etag version region method createdat created_at updatedat updated_at startedat started_at completedat completed_at finishedat finished_at issuedat issued_at expiresat expires_at expiresin expires_in validuntil valid_until expires expiry exp iat nbf jti iss issuer aud audience sub subject ttl eta ts format type kind scope scopes alg algorithm kid keyid key_id tenant tenantid tenant_id org orgid org_id organization organizationid organization_id workspace workspaceid workspace_id ownerid owner_id userid user_id actorid actor_id createdby created_by requestedby requested_by role roles permissions count total size bytes length rowcount row_count recordcount record_count itemcount item_count progress retries attempts priority poll queue queuename queue_name worker checksum sha256 hash digest signature sig hmac mac nonce note hint label description')
-const JOB_CACHE_SIGNAL_KEYS = wordSet('jobid job_id exportid export_id taskid task_id batchid batch_id workflowid workflow_id downloadid download_id artifactid artifact_id fileid file_id sessionid session_id patid pat_id tokenid token_id inviteid invite_id webhookid webhook_id deliveryid delivery_id shareid share_id downloadurl download_url signedurl signed_url presignedurl presigned_url signeddownloadurl signed_download_url presigneddownloadurl presigned_download_url exporturl export_url accessurl access_url uploadurl upload_url presignurl presign_url pollurl poll_url statusurl status_url artifacturl artifact_url fileurl file_url signedpath signed_path downloadpath download_path exportpath export_path signeddownload signed_download url href location redirect redirecturi redirect_uri handle token exporttoken export_token cachetoken cache_token downloadtoken download_token accesstoken access_token refreshtoken refresh_token idtoken id_token sessiontoken session_token signedtoken signed_token presignedtoken presigned_token scimtoken scim_token apitoken api_token invitetoken invite_token tokentype token_type signature sig hmac mac alg algorithm kid keyid key_id filekey file_key objectkey object_key storagekey storage_key filepath file_path tenantprefix tenant_prefix bucket queued pending accepted cached primed minted issued linked cachekey cache_key cachestatus cache_status cachehit cache_hit expiresin expires_in expiresat expires_at validuntil valid_until issuedat issued_at expires expiry exp permissions roles poll queue queuename queue_name job export exports task download presigned cache invite invites delivery deliveries webhook webhooks pat pats session sessions')
-const WRAPPER_KEYS = wordSet('data result job export exports task download artifact file cache meta metadata links _links link presigned signed upload batch workflow run response info headers fields params receipt envelope token_response invite invites delivery deliveries webhook webhooks pat pats session sessions')
-const TENANT_MARKER_KEYS = wordSet('tenant tenantid tenant_id org orgid org_id organizationid organization_id workspaceid workspace_id ownertenant ownertenantid owner_tenant_id merchantid merchant_id')
-const PENDING_STATE_RE = /^(?:queued|pending|processing|accepted|created|scheduled|running|in_progress|started|primed|cached|hit|miss|ok|issued|minted|signed)$/i
-const STUB_URL_VAL_RE = /^(?:https?:\/\/|\/[a-z0-9._~/-]*\/(?:download|export|presign|signed|file|artifact|job|status|poll|token)\b)/i
-const BARE_ACK_BODY_RE = /^(?:ok|queued|accepted|pending|primed|cached|created|done|true|https?:\/\/\S+|\/\S+)$/i
+const TENANT_MARKER_KEYS = new Set(['tenant', 'tenantid', 'tenant_id', 'org', 'orgid', 'org_id', 'organizationid', 'organization_id', 'workspaceid', 'workspace_id', 'ownertenant', 'ownertenantid', 'owner_tenant_id', 'merchantid', 'merchant_id'])
+const SENSITIVE_DATA_KEY_RE = /secret|passw|private|credential|api_?key|ssn|card|iban|balance|amount|salary|price|credit|debit|ledger|cents|vault|payout|settlement/i
+const URL_OR_PATH_VAL_RE = /^(?:https?:\/\/\S+|\/[A-Za-z0-9._~/%?&=:@+-]+|[A-Za-z0-9._-]+\/[A-Za-z0-9._~/%-]*)$/
+const HANDLE_KEY_RE = /^(?:token|code|handle|sig|signature|hmac|mac|nonce|redirect|redirect_?uri|href|link|location|url|uri|cache_?key|etag|checksum|hash|digest|artifact_?key|file_?key|object_?key|storage_?key|prefix|cursor)$|(?:token|handle|url|uri|href|link|path|sig)$/i
+const ID_KEY_RE = /^(?:id|key|ref|trace)$|(?:^|[a-z0-9_])(?:_id|Id)$/
+const SCOPE_KEY_RE = /^(?:tenant|org|organization|workspace|owner|user|actor|merchant|account|role|roles|email|email_?raw|origin|via|mode|source|reason)(?:_?id|Id|_?slug|Slug)?$/i
+const META_KEY_RE = /^(?:ok|success|status|status_?code|state|kind|type|format|scopes?|ts|ttl|eta|exp|iat|nbf|age|retries|attempts|progress|priority|count|size|bytes|length|queued|pending|accepted|created|updated|processed|verified|revoked|linked|cached|primed|active|redeemed|redacted|horodatage|timestamp|expires|expiry)$|(?:At|Ms|Sec|In|Ts|Status|State|Kind|Type|Slug|Key)$|_(?:at|ms|sec|in|ts|en|am|status|state|kind|type|slug|key)$/i
+const HTTP_STATUS_KEY_RE = /^(?:status|status_?code|code|estado|statut)$/i
+const META_NUM_KEY_RE = /^(?:ts|ttl|eta|exp|iat|nbf|age|retries|attempts|progress|priority|count|size|bytes|length|horodatage|timestamp|expires|expiry)$|(?:At|Ms|Sec|In|Ts)$|_(?:at|ms|sec|in|ts|en|am)$/i
 
-// Loose stub-envelope scan (async jobs/exports/renders/reports/tasks, unexercised token/session/invite/webhook/delivery envelopes): tolerates boolean flags and id/timestamp/key-suffixed scalars, never sensitive or record-bearing fields.
-const JOB_ENVELOPE_KEYS = wordSet('job jobs export exports task tasks render renders report reports invite invites delivery deliveries webhook webhooks pat pats session sessions'), JOB_ID_KEY_RE = /^(?:job|export|task|render|report|invite|delivery|webhook|pat|session|token)_?id$/
-const LOOSE_META_KEY_RE = /^(?:trace|via|mode|source|reason|processed|log|logs|ts|linked|verified|revoked|stale|redeemed|redacted)$|[a-z0-9](?:Id|Ids|At|By|Slug|Key|Url|Uri|Path|Status|State|Kind|Type|Ms|Token)$|_(?:id|ids|at|by|slug|key|url|uri|path|status|state|kind|type|ms|token)$/
-const SENSITIVE_KEY_RE = /secret|passw|private|credential|api_?key|ssn|card|iban|balance|amount|salary|email|phone|cents|price|total/i, JOB_ROUTE_RE = /\/(?:(?:exports|jobs|renders|tasks|reports|deliveries|pats|sessions|tokens)(?:\/[^/]+)?|invites(?:\/(?:resolve|redeem))?|webhooks|authorize)\/?$/i
-const INVITE_CTX_KEYS = wordSet('email emailraw email_raw'), DELIVERY_CTX_KEYS = wordSet('log logs output body response ts timestamp')
-type StubScan = { allStub: boolean; hasSignal: boolean; hasState: boolean; hasCreateKey: boolean; hasJob: boolean; count: number }
-function scanStubNode(node: unknown, depth: number, loose = false, ctx: '' | 'inv' | 'dlv' = ''): StubScan {
-  const acc: StubScan = { allStub: true, hasSignal: false, hasState: false, hasCreateKey: false, hasJob: false, count: 0 }
-  const fail: StubScan = { ...acc, allStub: false, count: 1 }
-  const merge = (sub: StubScan): boolean => sub.allStub && Boolean(Object.assign(acc, { hasSignal: acc.hasSignal || sub.hasSignal, hasState: acc.hasState || sub.hasState, hasCreateKey: acc.hasCreateKey || sub.hasCreateKey, hasJob: acc.hasJob || sub.hasJob, count: acc.count + sub.count }))
-  if (depth > 4 || node == null) return acc
+type StubScan = { leaves: number; substantive: boolean; urlOrPath: boolean; tokenOrCode: boolean; handleId: boolean; ts: boolean; bool: boolean; httpSt: boolean; statusLog: boolean; actorBy: boolean; atTs: boolean; tenantScope: boolean; wrapped: boolean; domainShort: number }
+const emptyScan = (): StubScan => ({ leaves: 0, substantive: false, urlOrPath: false, tokenOrCode: false, handleId: false, ts: false, bool: false, httpSt: false, statusLog: false, actorBy: false, atTs: false, tenantScope: false, wrapped: false, domainShort: 0 })
+const isHttpSt = (k: string, v: number): boolean => Number.isInteger(v) && v >= 100 && v <= 599 && HTTP_STATUS_KEY_RE.test(k)
+const isMetaNum = (k: string, v: number): boolean => isHttpSt(k, v) || (v >= 1_000_000_000 && v <= 9_999_999_999_999) || META_NUM_KEY_RE.test(k)
+
+function isStatusLogTuple(obj: Record<string, unknown>): boolean {
+  const entries = Object.entries(obj).filter(([, v]) => v !== null && v !== undefined && v !== '')
+  if (entries.length < 3 || entries.length > 6) return false
+  let hasId = false, hasSt = false, hasTs = false, prose = 0
+  for (const [k, v] of entries) {
+    if (typeof v === 'object' || SENSITIVE_DATA_KEY_RE.test(k)) return false
+    if (typeof v === 'number') { if (isHttpSt(k, v)) hasSt = true; else if (isMetaNum(k, v)) hasTs = true; else return false }
+    else if (typeof v === 'string') { if (ID_KEY_RE.test(k) && !/\s/.test(v.trim())) hasId = true; else if (/\s/.test(v.trim())) prose += 1 }
+  }
+  return hasId && hasSt && hasTs && prose <= 1
+}
+
+function scanStub(node: unknown, depth: number, acc: StubScan): void {
+  if (depth > 4 || node == null || acc.substantive) return
   if (Array.isArray(node)) {
-    if (node.every(x => x === null || typeof x !== 'object')) return { ...acc, count: node.length }
-    for (const item of node) if (!item || typeof item !== 'object' || Array.isArray(item) || !merge(scanStubNode(item, depth + 1, loose, ctx))) return fail
-    return acc
+    for (const item of node.slice(0, 32)) {
+      if (item == null || item === '') continue
+      if (typeof item === 'string' || typeof item === 'number' || typeof item === 'boolean') {
+        acc.leaves += 1
+        if ((typeof item === 'string' && /\s/.test(item.trim())) || (typeof item === 'number' && (item < 1_000_000_000 || item > 9_999_999_999_999))) acc.substantive = true
+      } else if (typeof item === 'object' && !Array.isArray(item)) scanStub(item, depth + 1, acc)
+      else acc.substantive = true
+    }
+    return
   }
-  if (typeof node !== 'object') return fail
-  for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
-    if (v === null || v === undefined || v === '' || (Array.isArray(v) && v.length === 0)) continue
-    const lk = k.toLowerCase(), nextCtx = (lk === 'invite' || lk === 'invites') ? 'inv' : (lk === 'delivery' || lk === 'deliveries') ? 'dlv' : ctx
-    const env = loose && JOB_ENVELOPE_KEYS.has(lk) && typeof v === 'object', ctxOk = (ctx === 'inv' && INVITE_CTX_KEYS.has(lk)) || (ctx === 'dlv' && DELIVERY_CTX_KEYS.has(lk))
-    const looseOk = loose && !SENSITIVE_KEY_RE.test(k) && (typeof v === 'boolean' || ((typeof v === 'string' || typeof v === 'number') && LOOSE_META_KEY_RE.test(k)))
-    if (!STUB_META_KEYS.has(lk) && !WRAPPER_KEYS.has(lk) && !env && !ctxOk && !looseOk) return fail
-    if (JOB_CACHE_SIGNAL_KEYS.has(lk)) acc.hasSignal = true
-    if (env || (loose && JOB_ID_KEY_RE.test(lk))) acc.hasJob = true
-    if (typeof v === 'object') { if (!merge(scanStubNode(v, depth + 1, loose, nextCtx))) return fail; continue }
-    acc.count += 1
-    if ((lk === 'status' || lk === 'state' || lk === 'cachestatus' || lk === 'cache_status') && typeof v === 'string' && PENDING_STATE_RE.test(v.trim())) acc.hasState = true
-    if (typeof v === 'string' && STUB_URL_VAL_RE.test(v.trim())) acc.hasSignal = true
-    if (/^(?:id|status|state|url|location|handle|path|key)$/i.test(lk)) acc.hasCreateKey = true
+  if (typeof node !== 'object') { acc.substantive = true; return }
+  const obj = node as Record<string, unknown>
+  const entries = Object.entries(obj).filter(([, v]) => v !== null && v !== undefined && v !== '' && !(Array.isArray(v) && v.length === 0))
+  if (entries.length === 0) return
+  if (isStatusLogTuple(obj)) { acc.statusLog = acc.handleId = acc.httpSt = acc.ts = true; acc.leaves += entries.length; return }
+  const ownHandle = entries.some(([k, v]) => typeof v === 'string' && (HANDLE_KEY_RE.test(k) || URL_OR_PATH_VAL_RE.test(v.trim())))
+  if (depth === 0 && entries.length === 1 && typeof entries[0]![1] === 'object' && !SENSITIVE_DATA_KEY_RE.test(entries[0]![0])) acc.wrapped = true
+  for (const [k, v] of entries) {
+    if (SENSITIVE_DATA_KEY_RE.test(k)) { acc.substantive = true; return }
+    if (typeof v === 'object') {
+      const isPrimArr = Array.isArray(v) && v.every(x => x == null || typeof x !== 'object')
+      if (!isPrimArr && (depth >= 1 || entries.length > 1)) {
+        const sub = emptyScan(); scanStub(v, depth + 1, sub)
+        if (sub.substantive || (sub.leaves > 0 && !sub.handleId && !sub.urlOrPath && !sub.tokenOrCode && !sub.statusLog)) { acc.substantive = true; return }
+        if (sub.leaves > 0 && !(sub.urlOrPath || sub.tokenOrCode || sub.ts || sub.httpSt || sub.statusLog || sub.bool)) { acc.substantive = true; return }
+        acc.leaves += sub.leaves; acc.urlOrPath ||= sub.urlOrPath; acc.tokenOrCode ||= sub.tokenOrCode; acc.handleId ||= sub.handleId
+        acc.ts ||= sub.ts; acc.bool ||= sub.bool; acc.httpSt ||= sub.httpSt; acc.statusLog ||= sub.statusLog; acc.domainShort += sub.domainShort
+      } else scanStub(v, depth + 1, acc)
+      continue
+    }
+    acc.leaves += 1
+    if (typeof v === 'boolean') { acc.bool = true; if (!META_KEY_RE.test(k)) acc.domainShort += 1; continue }
+    if (typeof v === 'number') {
+      if (isHttpSt(k, v)) { acc.httpSt = true; continue }
+      if (isMetaNum(k, v)) { acc.ts = true; if (/(?:At|_at)$/.test(k)) acc.atTs = true; continue }
+      acc.substantive = true; return
+    }
+    if (typeof v === 'string') {
+      const s = v.trim()
+      if (/\s/.test(s)) { acc.substantive = true; return }
+      if (URL_OR_PATH_VAL_RE.test(s)) acc.urlOrPath = true
+      if (HANDLE_KEY_RE.test(k)) acc.tokenOrCode = true
+      if (TENANT_MARKER_KEYS.has(k.toLowerCase())) acc.tenantScope = true
+      if (/(?:By|_by)$/.test(k)) { acc.actorBy = true; continue }
+      if (ID_KEY_RE.test(k)) { if (!SCOPE_KEY_RE.test(k)) acc.handleId = true; continue }
+      if (HANDLE_KEY_RE.test(k) || URL_OR_PATH_VAL_RE.test(s) || META_KEY_RE.test(k)) continue
+      if (SCOPE_KEY_RE.test(k)) { if (/^(?:email|role|roles|origin)$/i.test(k) && !ownHandle) acc.domainShort += 1; continue }
+      acc.domainShort += 1
+    }
   }
-  return acc
 }
 
 export function extractTenantMarkers(json: unknown, body?: string): Set<string> {
@@ -92,16 +131,32 @@ export function extractTenantMarkers(json: unknown, body?: string): Set<string> 
   walk(val, 0); return out
 }
 
-export function isJobOrHandleStub(json: unknown, body?: string, status?: number | null, method?: string, route?: string | null): boolean {
+function shapeEqual(a: unknown, b: unknown, depth = 0): boolean {
+  if (depth > 4 || a === b) return a === b
+  if (a == null || b == null || typeof a !== 'object' || typeof b !== 'object' || Array.isArray(a) !== Array.isArray(b)) return false
+  if (Array.isArray(a) && Array.isArray(b)) return a.length === b.length && a.every((x, i) => shapeEqual(x, b[i], depth + 1))
+  const ak = Object.keys(a as Record<string, unknown>).sort(), bk = Object.keys(b as Record<string, unknown>).sort()
+  return ak.length === bk.length && ak.every((k, i) => k === bk[i] && shapeEqual((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k], depth + 1))
+}
+
+/** Universal structural & differential stub/ack/enqueue detector (language-agnostic). */
+export function isJobOrHandleStub(json: unknown, body?: string, status?: number | null, method?: string, _route?: string | null, baselineJson?: unknown): boolean {
   let val = json
   const trimmed = typeof body === 'string' ? body.trim() : ''
   if (val === undefined && trimmed && /^[\[{]/.test(trimmed)) try { val = JSON.parse(trimmed) } catch { val = undefined }
-  if (val === undefined || val === null) return Boolean(trimmed && BARE_ACK_BODY_RE.test(trimmed))
-  if (typeof val !== 'object') return typeof val === 'string' && BARE_ACK_BODY_RE.test(val.trim())
-  const scan = scanStubNode(val, 0)
-  if (scan.allStub && (scan.count === 0 || scan.hasSignal || scan.hasState || status === 201 || status === 202 || (Boolean(method) && /^(?:POST|PUT)$/i.test(method!) && scan.hasCreateKey))) return true
-  const loose = scanStubNode(val, 0, true)
-  return loose.allStub && loose.count > 0 && (loose.hasJob || JOB_ROUTE_RE.test(normStr(route).split(/[?#]/)[0] ?? ''))
+  if (val == null) return Boolean(trimmed && !/[\r\n\s,;]/.test(trimmed) && (trimmed.length <= 32 || URL_OR_PATH_VAL_RE.test(trimmed)))
+  if (typeof val !== 'object') return typeof val === 'string' && !/[\r\n\s,;]/.test(val.trim()) && (val.trim().length <= 32 || URL_OR_PATH_VAL_RE.test(val.trim()))
+  if (baselineJson !== undefined && shapeEqual(val, baselineJson)) return true
+  const acc = emptyScan(); scanStub(val, 0, acc)
+  if (acc.substantive) return false
+  if (acc.leaves === 0) return true
+  if (Boolean(method) && /^(?:POST|PUT)$/i.test(method!) && status !== 202 && !acc.wrapped && acc.actorBy && acc.atTs && !acc.urlOrPath && !acc.tokenOrCode && !acc.httpSt) return false
+  if (acc.domainShort > ((status === 202 || acc.urlOrPath || acc.tokenOrCode || acc.statusLog) ? 2 : 1)) return false
+  return status === 202 || acc.urlOrPath || acc.tokenOrCode || acc.statusLog
+    || (status === 201 && (acc.handleId || acc.bool || acc.httpSt || acc.ts))
+    || (acc.wrapped && (acc.handleId || acc.ts || acc.bool || acc.httpSt))
+    || (acc.handleId && (acc.bool || acc.ts || acc.httpSt))
+    || (acc.leaves <= 2 && acc.bool && !acc.tenantScope && acc.domainShort === 0)
 }
 const stubRec = (r: Pick<HostSignedRecord, 'json' | 'body' | 'status' | 'method' | 'route'>): boolean => isJobOrHandleStub(r.json, r.body, r.status, r.method, r.route)
 
@@ -281,42 +336,30 @@ export function evaluateDualTenantAbac(input: DualTenantAbacInput): V8OracleDeci
 }
 
 /* ───────────────────── 2. Temporal Revocation Evaluator ──────────────────── */
-
 export interface TemporalRevocationInput extends WithVerifier {
   credentialKind: 'token' | 'session' | 'role' | 'invite' | 'pat' | 'async_job' | 'webhook_callback'
-  credentialHandle?: string | null
-  actorId?: string | null
-  primarySurface: V8SurfaceKind
-  secondarySurface: V8SurfaceKind
-  preRevocationBaseline?: HostSignedRecord
-  revocationEvent: HostSignedRecord
-  primaryDeniedCheck: HostSignedRecord
-  secondarySuccess: HostSignedRecord
-  elevatedRoleGranted?: boolean
+  credentialHandle?: string | null; actorId?: string | null; primarySurface: V8SurfaceKind; secondarySurface: V8SurfaceKind
+  preRevocationBaseline?: HostSignedRecord; revocationEvent: HostSignedRecord; primaryDeniedCheck: HostSignedRecord; secondarySuccess: HostSignedRecord; elevatedRoleGranted?: boolean
 }
-
 export function evaluateTemporalRevocation(input: TemporalRevocationInput): V8OracleDecision {
   const f: V8OracleFamily = 'temporal_revocation'
   if (!input) return deny(f, 'missing_input')
   const sub = input.credentialKind
-
-  const pairs: [HostSignedRecord | undefined, string][] = [
-    [input.revocationEvent, 'revocation_event'], [input.primaryDeniedCheck, 'primary_denied_check'], [input.secondarySuccess, 'secondary_success'],
-  ]
+  const pairs: [HostSignedRecord | undefined, string][] = [[input.revocationEvent, 'revocation_event'], [input.primaryDeniedCheck, 'primary_denied_check'], [input.secondarySuccess, 'secondary_success']]
   if (input.preRevocationBaseline) pairs.push([input.preRevocationBaseline, 'pre_revocation_baseline'])
   const recErr = checkRecords(pairs, input.verifySignature)
   if (recErr) return deny(f, recErr, sub)
-
   if (input.preRevocationBaseline) {
     if (!isOk(input.preRevocationBaseline.status)) return deny(f, 'baseline_not_active', sub)
     if (input.revocationEvent.timestampMs < input.preRevocationBaseline.timestampMs) return deny(f, 'non_monotonic_revocation_timestamp', sub)
   }
   if (!isOk(input.revocationEvent.status)) return deny(f, 'revocation_event_not_confirmed', sub)
+  if (input.revocationEvent.id === input.primaryDeniedCheck.id || input.revocationEvent.id === input.secondarySuccess.id || input.primaryDeniedCheck.id === input.secondarySuccess.id) return deny(f, 'temporal_reuses_exchange_id', sub)
   if (!isDenied(input.primaryDeniedCheck.status)) return deny(f, 'primary_surface_not_revoked', sub)
+  if (input.revocationEvent.method && /^(?:GET|HEAD|OPTIONS)$/i.test(normStr(input.revocationEvent.method))) return deny(f, 'revocation_event_not_mutating', sub)
   if (!isOk(input.secondarySuccess.status)) return deny(f, 'secondary_surface_properly_revoked', sub)
   if (input.primaryDeniedCheck.timestampMs < input.revocationEvent.timestampMs) return deny(f, 'primary_check_precedes_revocation', sub)
   if (input.secondarySuccess.timestampMs < input.primaryDeniedCheck.timestampMs) return deny(f, 'secondary_access_precedes_verified_revocation', sub)
-
   const handle = normStr(input.credentialHandle), actor = normStr(input.actorId)
   const pHandle = normStr(input.primaryDeniedCheck.capabilityHandle), sHandle = normStr(input.secondarySuccess.capabilityHandle)
   const pActor = normStr(input.primaryDeniedCheck.actorId), sActor = normStr(input.secondarySuccess.actorId)
@@ -324,46 +367,23 @@ export function evaluateTemporalRevocation(input: TemporalRevocationInput): V8Or
   const boundByHandle = Boolean(handle && pHandle === handle && sHandle === handle)
   const boundByActor = Boolean(actor && pActor === actor && sActor === actor && (!pHandle || !sHandle || pHandle === sHandle))
   if (!boundByHandle && !boundByActor) return deny(f, 'unlinked_primary_and_secondary_principal', sub)
-
   const pRoute = normRoute(input.primaryDeniedCheck.route), sRoute = normRoute(input.secondarySuccess.route)
-  if (input.primarySurface === input.secondarySurface && (!pRoute || !sRoute || pRoute === sRoute)) {
-    return deny(f, 'secondary_surface_not_distinct_from_primary', sub)
-  }
-  if (input.elevatedRoleGranted !== true && !hasSubstantivePayload(input.secondarySuccess)) {
-    return deny(f, 'secondary_success_lacks_substantive_impact', sub)
-  }
-
-  return ok(f, sub, 'revoked_credential_accepted_on_secondary_surface', {
-    credentialKind: sub, primarySurface: input.primarySurface, secondarySurface: input.secondarySurface,
-    revocationEventId: input.revocationEvent.id, primaryDeniedId: input.primaryDeniedCheck.id,
-    secondarySuccessId: input.secondarySuccess.id, boundBy: boundByHandle ? 'capability_handle' : 'actor_id',
-  })
+  if (input.primarySurface === input.secondarySurface && (!pRoute || !sRoute || pRoute === sRoute)) return deny(f, 'secondary_surface_not_distinct_from_primary', sub)
+  if (input.elevatedRoleGranted !== true && !hasSubstantivePayload(input.secondarySuccess)) return deny(f, 'secondary_success_lacks_substantive_impact', sub)
+  return ok(f, sub, 'revoked_credential_accepted_on_secondary_surface', { credentialKind: sub, primarySurface: input.primarySurface, secondarySurface: input.secondarySurface, revocationEventId: input.revocationEvent.id, primaryDeniedId: input.primaryDeniedCheck.id, secondarySuccessId: input.secondarySuccess.id, boundBy: boundByHandle ? 'capability_handle' : 'actor_id' })
 }
 
 /* ─────────────────── 3. Economic Conservation Evaluator ──────────────────── */
-
-interface EconomicBase extends WithVerifier {
-  baselineReadback: HostSignedRecord
-  actions: readonly HostSignedRecord[]
-  finalReadback: HostSignedRecord
-  tolerance?: number
-}
-
+interface EconomicBase extends WithVerifier { baselineReadback: HostSignedRecord; actions: readonly HostSignedRecord[]; finalReadback: HostSignedRecord; tolerance?: number }
 export interface OverRefundInput extends EconomicBase { equation: 'over_refund'; paidAmount: number; refundedAmounts: readonly number[]; baselineRefunded?: number }
 export interface BalanceMintingInput extends EconomicBase { equation: 'balance_minting'; balancesBefore: Readonly<Record<string, number>>; balancesAfter: Readonly<Record<string, number>>; authorizedDeposits: number; authorizedWithdrawals?: number }
 export interface UnderpaidFulfillmentInput extends EconomicBase { equation: 'underpaid_fulfillment'; paidAmount: number; fulfilledValue: number; fulfillmentState: string }
 export interface IneligibleDiscountInput extends EconomicBase { equation: 'ineligible_discount'; subtotalAmount: number; requiredThreshold: number; discountApplied: number; finalTotalPaid?: number }
 export type EconomicConservationInput = OverRefundInput | BalanceMintingInput | UnderpaidFulfillmentInput | IneligibleDiscountInput
-
 function sumFiniteMap(map: Readonly<Record<string, number>> | null | undefined): number | null {
   if (!map || typeof map !== 'object') return null
-  const vals = Object.values(map)
-  if (vals.length === 0) return null
-  let total = 0
-  for (const v of vals) {
-    if (!Number.isFinite(v)) return null
-    total += v
-  }
+  const vals = Object.values(map); if (vals.length === 0) return null
+  let total = 0; for (const v of vals) { if (!Number.isFinite(v)) return null; total += v }
   return total
 }
 
@@ -377,6 +397,14 @@ export function evaluateEconomicConservation(input: EconomicConservationInput): 
   if (!Array.isArray(input.actions) || input.actions.length === 0) return deny(f, 'missing_action_records', sub)
   if (!isOk(input.baselineReadback.status)) return deny(f, 'baseline_readback_failed', sub)
   if (!isOk(input.finalReadback.status)) return deny(f, 'final_readback_failed', sub)
+  if (input.baselineReadback.id === input.finalReadback.id) return deny(f, 'baseline_and_final_same_exchange', sub)
+  if (input.baselineReadback.method && !/^(?:GET|HEAD)$/i.test(normStr(input.baselineReadback.method))) return deny(f, 'baseline_readback_not_read', sub)
+  if (input.finalReadback.method && !/^(?:GET|HEAD)$/i.test(normStr(input.finalReadback.method))) return deny(f, 'final_readback_not_read', sub)
+  const bRoute = normRoute(input.baselineReadback.route), fRoute = normRoute(input.finalReadback.route)
+  if (bRoute && fRoute && bRoute !== fRoute) return deny(f, 'baseline_and_final_route_mismatch', sub)
+  const bAct = normKey(input.baselineReadback.actorId), fAct = normKey(input.finalReadback.actorId)
+  if (bAct && fAct && bAct !== fAct) return deny(f, 'baseline_and_final_actor_mismatch', sub)
+  if (input.finalReadback.timestampMs <= input.baselineReadback.timestampMs) return deny(f, 'non_monotonic_baseline_final_timestamp', sub)
 
   let maxActionTs = -Infinity, anyActionOk = false
   const seenActIds = new Set<string>()
@@ -384,6 +412,8 @@ export function evaluateEconomicConservation(input: EconomicConservationInput): 
     const act = input.actions[i]
     const err = checkRecord(act, `action_${i}`, input.verifySignature)
     if (err) return deny(f, err, sub)
+    if (act.id === input.baselineReadback.id || act.id === input.finalReadback.id) return deny(f, 'action_reuses_readback_exchange', sub)
+    if (act.method && /^(?:GET|HEAD|OPTIONS)$/i.test(normStr(act.method))) return deny(f, 'action_not_mutating', sub)
     if (seenActIds.has(act.id)) return deny(f, 'duplicate_action_exchange_id', sub)
     seenActIds.add(act.id)
     if (act.timestampMs < input.baselineReadback.timestampMs) return deny(f, 'action_precedes_baseline_readback', sub)
@@ -475,6 +505,10 @@ export function evaluateCryptographicScopeReplay(input: CryptographicScopeReplay
   }
   if (!isOk(input.sourceValidIssuance.status)) return deny(f, 'source_signature_issuance_failed')
   if (!isOk(input.replayedAcceptance.status)) return deny(f, 'replayed_signature_rejected_hardened')
+  if (input.sourceValidIssuance.id === input.replayedAcceptance.id) return deny(f, 'issuance_and_replay_same_exchange')
+  if (input.tamperedSignatureControl.id === input.sourceValidIssuance.id || input.tamperedSignatureControl.id === input.replayedAcceptance.id) {
+    return deny(f, 'control_reuses_probe_exchange')
+  }
   if (input.replayedAcceptance.timestampMs < input.sourceValidIssuance.timestampMs) return deny(f, 'replay_precedes_signature_issuance')
 
   const tRoute = normRoute(input.tamperedSignatureControl.route), rRoute = normRoute(input.replayedAcceptance.route)
@@ -597,76 +631,44 @@ export function evaluateParserCacheDifferential(input: ParserCacheDifferentialIn
 
 /* ─────────────────── 6. Cross-Surface Pivot Evaluator ────────────────────── */
 
-export type CrossSurfaceHopRole =
-  | 'trigger_write' | 'browser_dom_trace' | 'admin_bot_visit'
-  | 'worker_ssrf_callback' | 'oob_callback' | 'oidc_redirect' | 'token_exchange' | 'terminal_impact'
-
+export type CrossSurfaceHopRole = 'trigger_write' | 'browser_dom_trace' | 'admin_bot_visit' | 'worker_ssrf_callback' | 'oob_callback' | 'oidc_redirect' | 'token_exchange' | 'terminal_impact'
 export interface CrossSurfaceHop {
-  surface: V8SurfaceKind
-  role: CrossSurfaceHopRole
-  record: HostSignedRecord
-  bindingKind?: CausalBindingKind
-  emittedArtifactDigest?: string | null
-  consumedArtifactDigest?: string | null
-  correlationToken?: string | null
-  derivedFromCapabilityId?: string | null
-  ablationControlDenied?: HostSignedRecord
+  surface: V8SurfaceKind; role: CrossSurfaceHopRole; record: HostSignedRecord; bindingKind?: CausalBindingKind
+  emittedArtifactDigest?: string | null; consumedArtifactDigest?: string | null; correlationToken?: string | null
+  derivedFromCapabilityId?: string | null; ablationControlDenied?: HostSignedRecord
 }
-
 export interface CrossSurfacePivotInput extends WithVerifier {
   attackerOriginPersona: { actorId: string; role: RoleName | string; tenantId?: string | null; isPrivilegedPreSeeded?: boolean }
-  preChainControlDenied: HostSignedRecord
-  controlKind?: 'authz_denied' | 'unreachable_internal'
-  hops: readonly CrossSurfaceHop[]
-  terminalImpact: {
-    kind: 'privileged_read' | 'privileged_mutation' | 'credential_capture' | 'internal_secret_exfil' | 'privilege_escalation'
-    verified: boolean
-    impactDigest: string
-    postImpactReadback?: HostSignedRecord
-  }
+  preChainControlDenied: HostSignedRecord; controlKind?: 'authz_denied' | 'unreachable_internal'; hops: readonly CrossSurfaceHop[]
+  terminalImpact: { kind: 'privileged_read' | 'privileged_mutation' | 'credential_capture' | 'internal_secret_exfil' | 'privilege_escalation'; verified: boolean; impactDigest: string; postImpactReadback?: HostSignedRecord }
 }
-
 function hopStatusValid(hop: CrossSurfaceHop): boolean {
   const s = hop.record.status
   if (typeof s === 'number' && s >= 400) return false
   if (hop.role === 'oidc_redirect') return isRedirect(s) || isOk(s)
   if (hop.role === 'terminal_impact') return isOk(s)
-  if (s === undefined || s === null) {
-    return (hop.surface === 'browser' || hop.surface === 'async_job' || hop.surface === 'webhook') &&
-      Boolean(normStr(hop.emittedArtifactDigest ?? hop.record.artifactDigest) || normStr(hop.correlationToken))
-  }
+  if (s == null) return (hop.surface === 'browser' || hop.surface === 'async_job' || hop.surface === 'webhook') && Boolean(normStr(hop.emittedArtifactDigest ?? hop.record.artifactDigest) || normStr(hop.correlationToken))
   return isOk(s) || isRedirect(s)
 }
-
 export function evaluateCrossSurfacePivot(input: CrossSurfacePivotInput): V8OracleDecision {
   const f: V8OracleFamily = 'cross_surface_pivot'
   if (!input?.attackerOriginPersona || !input.terminalImpact) return deny(f, 'missing_pivot_input')
   const sub = input.terminalImpact.kind
-
   if (!normStr(input.attackerOriginPersona.actorId)) return deny(f, 'missing_attacker_origin_persona', sub)
   if (input.attackerOriginPersona.isPrivilegedPreSeeded === true) return deny(f, 'privileged_persona_shortcut_forbidden', sub)
-
   const ctrlErr = checkRecord(input.preChainControlDenied, 'pre_chain_control', input.verifySignature)
   if (ctrlErr) return deny(f, ctrlErr, sub)
   const ctrlStatus = input.preChainControlDenied.status
-  const ctrlValid = input.controlKind === 'unreachable_internal'
-    ? (ctrlStatus === 0 || ctrlStatus === null || ctrlStatus === undefined || isDenied(ctrlStatus))
-    : isDenied(ctrlStatus)
-  if (!ctrlValid) return deny(f, 'pre_chain_control_not_denied', sub)
-
+  if (!(input.controlKind === 'unreachable_internal' ? (ctrlStatus === 0 || ctrlStatus == null || isDenied(ctrlStatus)) : isDenied(ctrlStatus))) return deny(f, 'pre_chain_control_not_denied', sub)
   const hops = input.hops
   if (!Array.isArray(hops) || hops.length < 2 || hops.length > MAX_PIVOT_HOPS) return deny(f, 'invalid_hop_count', sub)
-
-  const surfaces = new Set<V8SurfaceKind>()
-  const emittedValues = new Set<string>(), emittedHandles = new Set<string>(), correlations = new Set<string>()
-
+  const surfaces = new Set<V8SurfaceKind>(), emittedValues = new Set<string>(), emittedHandles = new Set<string>(), correlations = new Set<string>()
   for (let i = 0; i < hops.length; i++) {
     const hop = hops[i]
     if (!hop?.surface) return deny(f, `missing_hop_${i}_surface`, sub)
     const errRec = checkRecord(hop.record, `hop_${i}`, input.verifySignature)
     if (errRec) return deny(f, errRec, sub)
     if (!hopStatusValid(hop)) return deny(f, `hop_${i}_status_failed`, sub)
-
     if (i === 0) {
       const h0Actor = normKey(hop.record.actorId)
       if (h0Actor && h0Actor !== normKey(input.attackerOriginPersona.actorId)) return deny(f, 'hop_0_actor_mismatch', sub)
@@ -674,56 +676,33 @@ export function evaluateCrossSurfacePivot(input: CrossSurfacePivotInput): V8Orac
       if (hop.record.timestampMs < hops[i - 1].record.timestampMs) return deny(f, 'non_monotonic_hop_ordering', sub, { hopIndex: i })
       const kind = hop.bindingKind
       if (!kind) return deny(f, `missing_hop_${i}_causal_binding`, sub)
-      if (kind === 'value_binding') {
-        const consumed = normStr(hop.consumedArtifactDigest)
-        if (!consumed || (!emittedValues.has(consumed) && !emittedHandles.has(consumed))) return deny(f, `broken_value_binding_at_hop_${i}`, sub)
-      } else if (kind === 'derived_crypto_binding') {
-        const derivedFrom = normStr(hop.derivedFromCapabilityId ?? hop.record.derivedFromCapabilityId)
-        if (!derivedFrom || (!emittedHandles.has(derivedFrom) && !emittedValues.has(derivedFrom))) return deny(f, `broken_derived_crypto_binding_at_hop_${i}`, sub)
-      } else if (kind === 'async_pivot_binding') {
-        const tok = normStr(hop.correlationToken)
-        if (!tok || !correlations.has(tok)) return deny(f, `broken_async_pivot_binding_at_hop_${i}`, sub)
-      } else if (kind === 'state_transition_binding') {
-        const tok = normStr(hop.correlationToken)
-        if (!tok || !correlations.has(tok)) return deny(f, `broken_state_transition_binding_at_hop_${i}`, sub)
+      if (kind === 'value_binding') { const c = normStr(hop.consumedArtifactDigest); if (!c || (!emittedValues.has(c) && !emittedHandles.has(c))) return deny(f, `broken_value_binding_at_hop_${i}`, sub) }
+      else if (kind === 'derived_crypto_binding') { const d = normStr(hop.derivedFromCapabilityId ?? hop.record.derivedFromCapabilityId); if (!d || (!emittedHandles.has(d) && !emittedValues.has(d))) return deny(f, `broken_derived_crypto_binding_at_hop_${i}`, sub) }
+      else if (kind === 'async_pivot_binding') { const t = normStr(hop.correlationToken); if (!t || !correlations.has(t)) return deny(f, `broken_async_pivot_binding_at_hop_${i}`, sub) }
+      else if (kind === 'state_transition_binding') {
+        const t = normStr(hop.correlationToken); if (!t || !correlations.has(t)) return deny(f, `broken_state_transition_binding_at_hop_${i}`, sub)
         const ablErr = checkRecord(hop.ablationControlDenied, `hop_${i}_ablation_control`, input.verifySignature)
         if (ablErr) return deny(f, ablErr, sub)
         if (!isDenied(hop.ablationControlDenied!.status)) return deny(f, `hop_${i}_ablation_control_not_denied`, sub)
-      } else {
-        return deny(f, `unknown_binding_kind_at_hop_${i}`, sub)
-      }
+      } else return deny(f, `unknown_binding_kind_at_hop_${i}`, sub)
     }
-
     surfaces.add(hop.surface)
-    const emitted = normStr(hop.emittedArtifactDigest ?? hop.record.artifactDigest)
-    if (emitted) emittedValues.add(emitted)
-    const handle = normStr(hop.record.capabilityHandle)
-    if (handle) emittedHandles.add(handle)
-    const corr = normStr(hop.correlationToken)
-    if (corr) correlations.add(corr)
+    const emitted = normStr(hop.emittedArtifactDigest ?? hop.record.artifactDigest); if (emitted) emittedValues.add(emitted)
+    const handle = normStr(hop.record.capabilityHandle); if (handle) emittedHandles.add(handle)
+    const corr = normStr(hop.correlationToken); if (corr) correlations.add(corr)
   }
-
   if (surfaces.size < 2) return deny(f, 'single_surface_not_cross_surface_pivot', sub)
   const lastHop = hops[hops.length - 1]
   if (input.terminalImpact.verified !== true || !normStr(input.terminalImpact.impactDigest)) return deny(f, 'terminal_impact_unverified', sub)
-  if (!isOk(lastHop.record.status) && lastHop.role !== 'oob_callback' && lastHop.role !== 'worker_ssrf_callback') {
-    return deny(f, 'terminal_hop_did_not_succeed', sub)
-  }
-
+  if (!isOk(lastHop.record.status) && lastHop.role !== 'oob_callback' && lastHop.role !== 'worker_ssrf_callback') return deny(f, 'terminal_hop_did_not_succeed', sub)
   if (input.terminalImpact.kind === 'privileged_mutation' || input.terminalImpact.kind === 'privilege_escalation') {
-    const rb = input.terminalImpact.postImpactReadback
-    const rbErr = checkRecord(rb, 'post_impact_readback', input.verifySignature)
+    const rb = input.terminalImpact.postImpactReadback, rbErr = checkRecord(rb, 'post_impact_readback', input.verifySignature)
     if (rbErr) return deny(f, rbErr, sub)
     if (!isOk(rb!.status)) return deny(f, 'post_impact_readback_failed', sub)
     if (rb!.timestampMs < lastHop.record.timestampMs) return deny(f, 'post_impact_readback_precedes_terminal_hop', sub)
     if (stubRec(rb!)) return deny(f, 'terminal_impact_unproven_intermediate_stub', sub)
-  } else if (stubRec(lastHop.record)) {
-    return deny(f, 'terminal_impact_unproven_intermediate_stub', sub)
-  }
-  return ok(f, sub, 'cross_surface_causal_pivot_confirmed', {
-    attackerActorId: input.attackerOriginPersona.actorId, hopCount: hops.length, surfaces: Array.from(surfaces),
-    impactKind: sub, impactDigest: input.terminalImpact.impactDigest, preChainControlId: input.preChainControlDenied.id, terminalHopId: lastHop.record.id,
-  })
+  } else if (stubRec(lastHop.record)) return deny(f, 'terminal_impact_unproven_intermediate_stub', sub)
+  return ok(f, sub, 'cross_surface_causal_pivot_confirmed', { attackerActorId: input.attackerOriginPersona.actorId, hopCount: hops.length, surfaces: Array.from(surfaces), impactKind: sub, impactDigest: input.terminalImpact.impactDigest, preChainControlId: input.preChainControlDenied.id, terminalHopId: lastHop.record.id })
 }
 
 /* ─────────────────────────── Unified Dispatcher ──────────────────────────── */
