@@ -147,8 +147,12 @@ const NODE_STACK_LAYERS = "before:content-[''] before:absolute before:inset-x-1.
 const NODE_TOP = 'flex h-4 min-w-0 items-center gap-1.5 whitespace-nowrap text-[11.5px] group-data-[lod]/wf:hidden'
 const NODE_TITLE = 'line-clamp-2 min-h-[34px] text-[12.5px] font-medium leading-[17px] group-data-[lod]/wf:min-h-0 group-data-[lod]/wf:text-[21px] group-data-[lod]/wf:leading-[27px]'
 const NODE_BOT = 'mt-auto flex items-center gap-2 whitespace-nowrap text-[11px] tabular-nums group-data-[lod]/wf:hidden'
-const NODE_BADGE = 'inline-flex h-[17px] items-center gap-1 rounded-[9px] bg-sunk px-1.5 text-[11px] font-medium text-fg-muted shadow-[inset_0_0_0_1px_var(--line-2)]'
-const NODE_BADGE_F = 'inline-flex h-[17px] items-center gap-1 rounded-[9px] bg-panel px-1.5 text-[11px] font-medium text-fg shadow-[inset_0_0_0_1px_var(--line-2)]'
+const NODE_BADGE_BASE = 'inline-flex h-[17px] items-center gap-1 rounded-[9px] px-1.5 text-[11px] font-medium shadow-[inset_0_0_0_1px_var(--line-2)]'
+const NODE_BADGE = `${NODE_BADGE_BASE} bg-sunk text-fg-muted`
+const NODE_BADGE_F = `${NODE_BADGE_BASE} bg-panel text-fg`
+const NODE_HOVER = 'hover:shadow-[0_0_0_1px_var(--line-strong),0_4px_12px_-4px_rgba(0,0,0,.14)]'
+const NODE_ICON = 'inline-flex size-3.5 flex-none items-center justify-center'
+const REPORT_MUTE = 'text-[color-mix(in_srgb,var(--panel)_60%,transparent)]'
 
 interface NodeFlags {
   sel: boolean
@@ -166,8 +170,8 @@ const NodeCard = memo(function NodeCard({ n, info, flags, reportSub }: { n: WfNo
   const shadowCls = flags.sel
     ? 'shadow-[0_0_0_1.5px_var(--accent),0_0_0_4px_var(--accent-soft),0_6px_16px_-6px_rgba(0,0,0,.18)]'
     : paused
-      ? 'shadow-[0_0_0_1px_var(--warn-line),var(--shadow-card)] hover:shadow-[0_0_0_1px_var(--line-strong),0_4px_12px_-4px_rgba(0,0,0,.14)]'
-      : 'shadow-surface hover:shadow-[0_0_0_1px_var(--line-strong),0_4px_12px_-4px_rgba(0,0,0,.14)]'
+      ? `shadow-[0_0_0_1px_var(--warn-line),var(--shadow-card)] ${NODE_HOVER}`
+      : `shadow-surface ${NODE_HOVER}`
 
   if (n.kind === 'report') {
     return <div
@@ -178,13 +182,13 @@ const NodeCard = memo(function NodeCard({ n, info, flags, reportSub }: { n: WfNo
       role="button"
       aria-label="Open the report"
     >
-      <div className={cn(NODE_TOP, 'text-[color-mix(in_srgb,var(--panel)_60%,transparent)]')}>
-        <span className="inline-flex size-3.5 flex-none items-center justify-center"><Icon name="report" /></span>
+      <div className={cn(NODE_TOP, REPORT_MUTE)}>
+        <span className={NODE_ICON}><Icon name="report" /></span>
         <span className="flex-none">Report</span>
         <span className="ml-auto min-w-0 truncate text-[11px]">{fmtDate(n.createdAt)}</span>
       </div>
       <div className={cn(NODE_TITLE, 'text-panel')}>{reportSub}</div>
-      <div className={cn(NODE_BOT, 'text-[color-mix(in_srgb,var(--panel)_60%,transparent)]')}>
+      <div className={cn(NODE_BOT, REPORT_MUTE)}>
         <span>Open the report</span><span className="flex-1" /><Icon name="arrowR" />
       </div>
     </div>
@@ -215,7 +219,7 @@ const NodeCard = memo(function NodeCard({ n, info, flags, reportSub }: { n: WfNo
       <div className={cn(NODE_TOP, 'text-fg-subtle')}>
         {n.kind === 'stack'
           ? <Lv status={i.status} />
-          : <span className="inline-flex size-3.5 flex-none items-center justify-center text-fg-subtle"><Icon name="queue" /></span>}
+          : <span className={cn(NODE_ICON, 'text-fg-subtle')}><Icon name="queue" /></span>}
         <span
           className="flex-none tabular-nums"
           data-wf-id=""
@@ -910,6 +914,7 @@ export function WorkflowGraph({ L, selId, focusSet, nomatch, onSelect, onExpand,
   const steps = model.detail.chainSteps
   const stepsDone = steps.filter(s => s.status === 'complete').length
   const svgW = L.W + 200, svgH = L.H + 200
+  const zBtn = cn(runIconBtn({ size: 'sm' }), 'px-1.5')
   return <div
     className="group/wf @container/wf relative flex min-h-0 flex-1 flex-col"
     data-focus={focus ? '' : undefined}
@@ -937,8 +942,7 @@ export function WorkflowGraph({ L, selId, focusSet, nomatch, onSelect, onExpand,
       <div ref={cvRef} className="absolute left-0 top-0 origin-top-left will-change-transform" style={{ '--nw': WF.NW + 'px', '--nh': WF.NH + 'px' } as CSSProperties}>
         <svg className="pointer-events-none absolute left-0 top-0 overflow-visible" width={svgW} height={svgH} aria-hidden="true">
           <defs>
-            <marker id="rw-wf-ah" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 1 7 4 0 7Z" className="fill-[var(--edge)]" /></marker>
-            <marker id="rw-wf-ahh" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 1 7 4 0 7Z" className="fill-accent" /></marker>
+            {(['rw-wf-ah', 'rw-wf-ahh'] as const).map(id => <marker key={id} id={id} viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 1 7 4 0 7Z" className={id === 'rw-wf-ah' ? 'fill-[var(--edge)]' : 'fill-accent'} /></marker>)}
           </defs>
           {L.edges.map(e => <Edge key={e.key} e={e} d={edgePath(L, e)} hot={!!focus?.edges.has(e.key)} />)}
         </svg>
@@ -1016,14 +1020,15 @@ export function WorkflowGraph({ L, selId, focusSet, nomatch, onSelect, onExpand,
 
     <div data-wf-float="" className="absolute bottom-3 left-3 z-[3] flex items-end gap-1.5 group-data-[replaying]/wf:hidden">
       <div className="flex h-[30px] items-center gap-0.5 rounded-lg bg-raise px-[3px] shadow-popover">
-        <button type="button" className={cn(runIconBtn({ size: 'sm' }), 'px-1.5')} title="Zoom out (−)" aria-label="Zoom out" onClick={() => centerZoom(1 / 1.2)}><Icon name="minus" /></button>
+        <button type="button" className={zBtn} title="Zoom out (−)" aria-label="Zoom out" onClick={() => centerZoom(1 / 1.2)}><Icon name="minus" /></button>
         <span className="min-w-11 text-center text-[12px] text-fg-muted tabular-nums" ref={zlRef}>100%</span>
-        <button type="button" className={cn(runIconBtn({ size: 'sm' }), 'px-1.5')} title="Zoom in (+)" aria-label="Zoom in" onClick={() => centerZoom(1.2)}><Icon name="plus" /></button>
-        <button type="button" className={cn(runIconBtn({ size: 'sm' }), 'px-1.5')} title="Fit graph (0)" aria-label="Fit graph" onClick={fit}><Icon name="fit" /></button>
+        <button type="button" className={zBtn} title="Zoom in (+)" aria-label="Zoom in" onClick={() => centerZoom(1.2)}><Icon name="plus" /></button>
+        <button type="button" className={zBtn} title="Fit graph (0)" aria-label="Fit graph" onClick={fit}><Icon name="fit" /></button>
       </div>
       <div className="flex h-[30px] items-center gap-3 whitespace-nowrap rounded-lg bg-raise px-2.5 text-[11.5px] text-fg-subtle shadow-popover @max-[560px]/wf:hidden">
-        <span className="inline-flex items-center gap-1.5"><svg width="22" height="6" aria-hidden="true"><path d="M1 3h20" stroke="var(--fg-3)" strokeWidth="1.4" /></svg>Handoff</span>
-        <span className="inline-flex items-center gap-1.5"><svg width="22" height="6" aria-hidden="true"><path d="M1 3h20" stroke="var(--fg-3)" strokeWidth="1.4" strokeDasharray="4 3" /></svg>Causal · facts</span>
+        {([['Handoff', undefined], ['Causal · facts', '4 3']] as const).map(([lbl, dash]) => (
+          <span key={lbl} className="inline-flex items-center gap-1.5"><svg width="22" height="6" aria-hidden="true"><path d="M1 3h20" stroke="var(--fg-3)" strokeWidth="1.4" strokeDasharray={dash} /></svg>{lbl}</span>
+        ))}
         <span className="text-fg-faint tabular-nums @max-[720px]/wf:hidden">{plural(nLinks, 'link')}{steps.length > 0 && <> · {stepsDone}/{steps.length} steps</>}</span>
       </div>
     </div>

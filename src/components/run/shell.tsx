@@ -305,78 +305,31 @@ export function ApprovalBanner({
   if (count <= 0) return null
   const first = approvals[0]!
   const target = `${first.method} ${host(first.origin)}${first.pathAndQuery}`
-  return <div
-    className="flex min-h-10 flex-none items-center gap-2.5 border-b border-accent-line bg-accent-soft py-2 pl-[18px] pr-3 text-[12.5px] text-fg-muted"
-    role="status"
-    aria-label="Pending approvals"
-    data-testid="approval-banner"
-  >
+  const targetNode = <span className="font-mono text-[12px] text-fg">
+    <span className="font-semibold text-warn">{first.method}</span> {host(first.origin)}
+    <span className="text-fg-subtle">{first.pathAndQuery}</span>
+  </span>
+  return <div className="flex min-h-10 flex-none items-center gap-2.5 border-b border-accent-line bg-accent-soft py-2 pl-[18px] pr-3 text-[12.5px] text-fg-muted" role="status" aria-label="Pending approvals" data-testid="approval-banner">
     <span className="relative inline-flex size-2 flex-none" aria-hidden="true">
       <span className="absolute inset-0 animate-ping rounded-full bg-accent opacity-50 motion-reduce:animate-none" />
       <span className="relative inline-block size-2 rounded-full bg-accent" />
     </span>
     {count === 1 ? <>
       <span className="min-w-0 flex-1 truncate" title={`1 approval waiting · ${target}`}>
-        <b className="font-medium text-fg">1 approval waiting</b>
-        {' · '}
-        <span className="font-mono text-[12px] text-fg">
-          <span className="font-semibold text-warn">{first.method}</span>
-          {' '}
-          {host(first.origin)}
-          <span className="text-fg-subtle">{first.pathAndQuery}</span>
-        </span>
+        <b className="font-medium text-fg">1 approval waiting</b> · {targetNode}
       </span>
-      <button
-        type="button"
-        className={runBtn({ variant: 'primary', size: 'sm' })}
-        data-testid="approval-banner-approve"
-        onClick={() => onApprove(first)}
-      >
+      <button type="button" className={runBtn({ variant: 'primary', size: 'sm' })} data-testid="approval-banner-approve" onClick={() => onApprove(first)}>
         <Icon name="check" />Approve
       </button>
-      <button
-        type="button"
-        className={runBtn({ variant: 'ghost', size: 'sm' })}
-        data-testid="approval-banner-deny"
-        onClick={() => onDeny(first)}
-      >
-        Deny
-      </button>
-      <button
-        type="button"
-        className={runBtn({ variant: 'default', size: 'sm' })}
-        data-testid="approval-banner-inspect"
-        onClick={() => onInspect(first)}
-      >
-        Inspect
-      </button>
+      <button type="button" className={runBtn({ variant: 'ghost', size: 'sm' })} data-testid="approval-banner-deny" onClick={() => onDeny(first)}>Deny</button>
+      <button type="button" className={runBtn({ variant: 'default', size: 'sm' })} data-testid="approval-banner-inspect" onClick={() => onInspect(first)}>Inspect</button>
     </> : <>
       <span className="min-w-0 flex-1 truncate" title={`${count} approvals waiting · ${target} (+${count - 1} more)`}>
-        <b className="font-medium text-fg">{count} approvals waiting</b>
-        {' · '}
-        <span className="font-mono text-[12px] text-fg">
-          <span className="font-semibold text-warn">{first.method}</span>
-          {' '}
-          {host(first.origin)}
-          <span className="text-fg-subtle">{first.pathAndQuery}</span>
-        </span>
+        <b className="font-medium text-fg">{count} approvals waiting</b> · {targetNode}
         <span className="ml-1.5 text-fg-subtle">(+{count - 1} more)</span>
       </span>
-      <button
-        type="button"
-        className={runBtn({ variant: 'default', size: 'sm' })}
-        data-testid="approval-banner-review"
-        onClick={onReviewInQueue}
-      >
-        Review in Queue
-      </button>
-      <button
-        type="button"
-        className={runBtn({ variant: 'primary', size: 'sm' })}
-        disabled={submitting}
-        data-testid="approval-banner-approve-all"
-        onClick={onApproveAll}
-      >
+      <button type="button" className={runBtn({ variant: 'default', size: 'sm' })} data-testid="approval-banner-review" onClick={onReviewInQueue}>Review in Queue</button>
+      <button type="button" className={runBtn({ variant: 'primary', size: 'sm' })} disabled={submitting} data-testid="approval-banner-approve-all" onClick={onApproveAll}>
         <Icon name="check" />{submitting ? `Approving ${count}…` : `Approve all (${count})`}
       </button>
     </>}
@@ -439,6 +392,8 @@ function RunBanners() {
       message: `${ACTIONS[act].label} ${ap.method} ${host(ap.origin)}${ap.pathAndQuery}`,
     })
   }
+  const bCls = 'flex min-h-10 flex-none items-center gap-2.5 border-b border-line py-2 pl-[18px] pr-3 text-[12.5px] text-fg-muted'
+  const wCls = `${bCls} bg-warn-soft shadow-[inset_0_-1px_0_var(--warn-line)]`
   return <>
     {showApprovalBanner && <ApprovalBanner
       approvals={q.activePendingApprovals}
@@ -449,12 +404,7 @@ function RunBanners() {
       onReviewInQueue={() => nav.setView('queue')}
       onApproveAll={() => { void q.approveAllPending() }}
     />}
-    {r.status === 'budget_paused' && <div
-      className="flex min-h-10 flex-none items-center gap-2.5 border-b border-line bg-warn-soft py-2 pl-[18px] pr-3 text-[12.5px] text-fg-muted shadow-[inset_0_-1px_0_var(--warn-line)]"
-      role="status"
-      aria-label="Budget paused"
-      data-testid="budget-paused-banner"
-    >
+    {r.status === 'budget_paused' && <div className={wCls} role="status" aria-label="Budget paused" data-testid="budget-paused-banner">
       <Icon name="budget" className="text-warn" />
       <span className="min-w-0 flex-1 truncate">
         <b className="font-medium text-fg">Paused at the budget ceiling.</b> Spent {fmtUsd(r.spentUsd)} of {fmtUsd(r.budgetUsd)} and {fmtN(r.spentRequests)} of {r.budgetRequests ? fmtN(r.budgetRequests) : 'uncapped'} requests. A partial report is saved.
@@ -463,12 +413,7 @@ function RunBanners() {
         <Icon name="budget" />Raise budget
       </button>
     </div>}
-    {authIssue && <div
-      className="flex min-h-10 flex-none items-center gap-2.5 border-b border-line bg-warn-soft py-2 pl-[18px] pr-3 text-[12.5px] text-fg-muted shadow-[inset_0_-1px_0_var(--warn-line)]"
-      role="status"
-      aria-label="Auth issue"
-      data-testid="auth-issue-banner"
-    >
+    {authIssue && <div className={wCls} role="status" aria-label="Auth issue" data-testid="auth-issue-banner">
       <Icon name="lock" className="text-warn" />
       <span className="min-w-0 flex-1 truncate" title={authIssue.message}>
         <b className="font-medium text-fg">Auth issue.</b> {authIssue.message}
@@ -477,31 +422,21 @@ function RunBanners() {
         Manage test accounts<Icon name="arrowR" />
       </Link>
     </div>}
-    {model.needsModel && <div className="flex min-h-10 flex-none items-center gap-2.5 border-b border-line bg-warn-soft py-2 pl-[18px] pr-3 text-[12.5px] text-fg-muted shadow-[inset_0_-1px_0_var(--warn-line)]" role="status">
+    {model.needsModel && <div className={wCls} role="status">
       <Icon name="alert" className="text-warn" />
       <span className="min-w-0 flex-1"><b className="font-medium text-fg">Connect a model to continue.</b> No enabled model profile; settings bring you back here.</span>
       <Link className={runBtn()} to="/settings" search={{ runId: r.id }}>Set up model<Icon name="arrowR" /></Link>
     </div>}
-    {sessionExpired && <div
-      className="flex min-h-10 flex-none items-center gap-2.5 border-b border-line bg-warn-soft py-2 pl-[18px] pr-3 text-[12.5px] text-fg-muted shadow-[inset_0_-1px_0_var(--warn-line)]"
-      role="alert"
-      aria-label="Local session expired"
-      data-testid="session-expired-banner"
-    >
+    {sessionExpired && <div className={wCls} role="alert" aria-label="Local session expired" data-testid="session-expired-banner">
       <Icon name="lock" className="text-warn" />
       <span className="min-w-0 flex-1">
         <b className="font-medium text-fg">Local session expired.</b> Open the startup bootstrap URL from your Kovo Hunter terminal (or a device pairing link) to sign back in and resume live updates.
       </span>
-      <button
-        type="button"
-        className={runBtn({ variant: 'default', size: 'sm' })}
-        data-testid="session-expired-reload"
-        onClick={() => { if (typeof window !== 'undefined') window.location.reload() }}
-      >
+      <button type="button" className={runBtn({ variant: 'default', size: 'sm' })} data-testid="session-expired-reload" onClick={() => { if (typeof window !== 'undefined') window.location.reload() }}>
         Reload
       </button>
     </div>}
-    {connection === 'reconnecting' && !sessionExpired && <div className="flex min-h-10 flex-none items-center gap-2.5 border-b border-line bg-sunk py-2 pl-[18px] pr-3 text-[12.5px] text-fg-muted" role="status">
+    {connection === 'reconnecting' && !sessionExpired && <div className={`${bCls} bg-sunk`} role="status">
       <Icon name="activity" />
       <span className="min-w-0 flex-1">Reconnecting to Kovo Hunter… the view keeps the last data it had.</span>
     </div>}

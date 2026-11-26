@@ -2,16 +2,16 @@
 // coverage categories and phases. Shared by every view; extend additively.
 import type { IconName } from './icons.tsx'
 
-export const VIEW_IDS = ['overview', 'queue', 'findings', 'report', 'workflow', 'surface', 'exchanges', 'activity'] as const
+export const VIEW_IDS = ['overview', 'workflow', 'queue', 'findings', 'report', 'surface', 'exchanges', 'activity'] as const
 export type ViewId = typeof VIEW_IDS[number]
 export type ViewGroup = 'investigation' | 'telemetry'
 
 export const VIEWS: { id: ViewId; label: string; key: string; icon: IconName; group: ViewGroup }[] = [
   { id: 'overview', label: 'Overview', key: 'o', icon: 'overview', group: 'investigation' },
+  { id: 'workflow', label: 'Workflow', key: 'w', icon: 'workflow', group: 'investigation' },
   { id: 'queue', label: 'Queue', key: 'q', icon: 'queue', group: 'investigation' },
   { id: 'findings', label: 'Findings', key: 'f', icon: 'findings', group: 'investigation' },
   { id: 'report', label: 'Report', key: 'r', icon: 'report', group: 'investigation' },
-  { id: 'workflow', label: 'Workflow', key: 'w', icon: 'workflow', group: 'telemetry' },
   { id: 'surface', label: 'Surface', key: 's', icon: 'surface', group: 'telemetry' },
   { id: 'exchanges', label: 'Exchanges', key: 'e', icon: 'exchanges', group: 'telemetry' },
   { id: 'activity', label: 'Activity', key: 'a', icon: 'activity', group: 'telemetry' },
