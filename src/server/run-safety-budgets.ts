@@ -13,6 +13,21 @@ export const RUN_SAFETY_BUDGET_DEFAULTS = {
   maxSealsPerEndpoint: 256,
   maxVaultEntries: 4_096,
   maxSealAttempts: 8_192,
+  /** R4-H-19: per-run active redaction registry capacity (lifecycle-aware; scales with run workload). */
+  maxRedactedSecretsPerRun: 5_000,
+  /** R4-H-11 (WS-10): per-origin quarantine thresholds replacing the global 240-row hair-trigger. */
+  originQuarantineMin52xCount: 3,
+  originQuarantineMin401Count: 3,
+  originQuarantineMinDistinctPaths: 2,
+  originQuarantineWindowMs: 300_000,
+  /** R4-H-15 (WS-11): per-call host `search_repo` wall-clock deadline and byte budget. */
+  searchRepoDeadlineMs: 2_500,
+  searchRepoMaxBytes: 8 * 1024 * 1024,
+  /** R4-H-20 (WS-14): OOB callback retention & ingest quotas. */
+  oobMaxCallbacksPerToken: 64,
+  oobMaxCallbacksPerRun: 2_048,
+  oobMaxProtectedCallbacks: 1_024,
+  oobMaxCallbacksPerIpWindow: 120,
 } as const
 
 /** Hard finite OOM ceilings that neither run-scaling nor env/caller overrides may exceed. */
@@ -22,6 +37,17 @@ export const RUN_SAFETY_BUDGET_HARD_CEILINGS = {
   maxSealsPerEndpoint: 4_096,
   maxVaultEntries: 10_000,
   maxSealAttempts: 100_000,
+  maxRedactedSecretsPerRun: 50_000,
+  originQuarantineMin52xCount: 32,
+  originQuarantineMin401Count: 32,
+  originQuarantineMinDistinctPaths: 16,
+  originQuarantineWindowMs: 3_600_000,
+  searchRepoDeadlineMs: 15_000,
+  searchRepoMaxBytes: 32 * 1024 * 1024,
+  oobMaxCallbacksPerToken: 512,
+  oobMaxCallbacksPerRun: 16_384,
+  oobMaxProtectedCallbacks: 8_192,
+  oobMaxCallbacksPerIpWindow: 2_048,
 } as const
 
 export const RUN_SAFETY_BUDGET_ENV_KEYS = {
@@ -30,6 +56,17 @@ export const RUN_SAFETY_BUDGET_ENV_KEYS = {
   maxSealsPerEndpoint: 'KOVO_MAX_SEALS_PER_ENDPOINT',
   maxVaultEntries: 'KOVO_MAX_VAULT_ENTRIES',
   maxSealAttempts: 'KOVO_MAX_SEAL_ATTEMPTS',
+  maxRedactedSecretsPerRun: 'KOVO_MAX_REDACTED_SECRETS_PER_RUN',
+  originQuarantineMin52xCount: 'KOVO_ORIGIN_QUARANTINE_MIN_52X_COUNT',
+  originQuarantineMin401Count: 'KOVO_ORIGIN_QUARANTINE_MIN_401_COUNT',
+  originQuarantineMinDistinctPaths: 'KOVO_ORIGIN_QUARANTINE_MIN_DISTINCT_PATHS',
+  originQuarantineWindowMs: 'KOVO_ORIGIN_QUARANTINE_WINDOW_MS',
+  searchRepoDeadlineMs: 'KOVO_SEARCH_REPO_DEADLINE_MS',
+  searchRepoMaxBytes: 'KOVO_SEARCH_REPO_MAX_BYTES',
+  oobMaxCallbacksPerToken: 'KOVO_OOB_MAX_CALLBACKS_PER_TOKEN',
+  oobMaxCallbacksPerRun: 'KOVO_OOB_MAX_CALLBACKS_PER_RUN',
+  oobMaxProtectedCallbacks: 'KOVO_OOB_MAX_PROTECTED_CALLBACKS',
+  oobMaxCallbacksPerIpWindow: 'KOVO_OOB_MAX_CALLBACKS_PER_IP_WINDOW',
 } as const
 
 export const DEFAULT_MAX_COMPOSITE_VERIFIES_PER_RUN = RUN_SAFETY_BUDGET_DEFAULTS.maxCompositeVerifiesPerRun
@@ -50,6 +87,17 @@ export interface RunSafetyBudgets {
   readonly maxSealsPerEndpoint: number
   readonly maxVaultEntries: number
   readonly maxSealAttempts: number
+  readonly maxRedactedSecretsPerRun: number
+  readonly originQuarantineMin52xCount: number
+  readonly originQuarantineMin401Count: number
+  readonly originQuarantineMinDistinctPaths: number
+  readonly originQuarantineWindowMs: number
+  readonly searchRepoDeadlineMs: number
+  readonly searchRepoMaxBytes: number
+  readonly oobMaxCallbacksPerToken: number
+  readonly oobMaxCallbacksPerRun: number
+  readonly oobMaxProtectedCallbacks: number
+  readonly oobMaxCallbacksPerIpWindow: number
 }
 
 export interface RunSafetyBudgetOverrides {
@@ -58,6 +106,17 @@ export interface RunSafetyBudgetOverrides {
   maxSealsPerEndpoint?: number
   maxVaultEntries?: number
   maxSealAttempts?: number
+  maxRedactedSecretsPerRun?: number
+  originQuarantineMin52xCount?: number
+  originQuarantineMin401Count?: number
+  originQuarantineMinDistinctPaths?: number
+  originQuarantineWindowMs?: number
+  searchRepoDeadlineMs?: number
+  searchRepoMaxBytes?: number
+  oobMaxCallbacksPerToken?: number
+  oobMaxCallbacksPerRun?: number
+  oobMaxProtectedCallbacks?: number
+  oobMaxCallbacksPerIpWindow?: number
 }
 
 export interface RunSafetyBudgetOptions {
@@ -139,6 +198,15 @@ export function resolveRunSafetyBudgets(options: RunSafetyBudgetOptions = {}): R
     : DEFAULT_MAX_SEALS_PER_ENDPOINT
   const baseVaultEntries = Math.max(DEFAULT_MAX_VAULT_ENTRIES, baseSealsPerRun)
   const baseSealAttempts = Math.max(DEFAULT_MAX_SEAL_ATTEMPTS, baseSealsPerRun * 2)
+  const baseRedactedSecrets = scaledAssignments !== undefined
+    ? Math.max(RUN_SAFETY_BUDGET_DEFAULTS.maxRedactedSecretsPerRun, scaledAssignments * replayFactor * 32)
+    : RUN_SAFETY_BUDGET_DEFAULTS.maxRedactedSecretsPerRun
+  const baseOobCallbacksPerRun = scaledAssignments !== undefined
+    ? Math.max(RUN_SAFETY_BUDGET_DEFAULTS.oobMaxCallbacksPerRun, scaledAssignments * replayFactor * 8)
+    : RUN_SAFETY_BUDGET_DEFAULTS.oobMaxCallbacksPerRun
+  const baseOobProtectedCallbacks = scaledAssignments !== undefined
+    ? Math.max(RUN_SAFETY_BUDGET_DEFAULTS.oobMaxProtectedCallbacks, scaledAssignments * replayFactor * 4)
+    : RUN_SAFETY_BUDGET_DEFAULTS.oobMaxProtectedCallbacks
 
   return {
     maxCompositeVerifiesPerRun: resolveBoundedBudgetCap(
@@ -174,6 +242,83 @@ export function resolveRunSafetyBudgets(options: RunSafetyBudgetOptions = {}): R
       RUN_SAFETY_BUDGET_ENV_KEYS.maxSealAttempts,
       baseSealAttempts,
       HARD_MAX_SEAL_ATTEMPTS,
+      env,
+    ),
+    maxRedactedSecretsPerRun: resolveBoundedBudgetCap(
+      overrides.maxRedactedSecretsPerRun,
+      RUN_SAFETY_BUDGET_ENV_KEYS.maxRedactedSecretsPerRun,
+      baseRedactedSecrets,
+      RUN_SAFETY_BUDGET_HARD_CEILINGS.maxRedactedSecretsPerRun,
+      env,
+    ),
+    originQuarantineMin52xCount: resolveBoundedBudgetCap(
+      overrides.originQuarantineMin52xCount,
+      RUN_SAFETY_BUDGET_ENV_KEYS.originQuarantineMin52xCount,
+      RUN_SAFETY_BUDGET_DEFAULTS.originQuarantineMin52xCount,
+      RUN_SAFETY_BUDGET_HARD_CEILINGS.originQuarantineMin52xCount,
+      env,
+    ),
+    originQuarantineMin401Count: resolveBoundedBudgetCap(
+      overrides.originQuarantineMin401Count,
+      RUN_SAFETY_BUDGET_ENV_KEYS.originQuarantineMin401Count,
+      RUN_SAFETY_BUDGET_DEFAULTS.originQuarantineMin401Count,
+      RUN_SAFETY_BUDGET_HARD_CEILINGS.originQuarantineMin401Count,
+      env,
+    ),
+    originQuarantineMinDistinctPaths: resolveBoundedBudgetCap(
+      overrides.originQuarantineMinDistinctPaths,
+      RUN_SAFETY_BUDGET_ENV_KEYS.originQuarantineMinDistinctPaths,
+      RUN_SAFETY_BUDGET_DEFAULTS.originQuarantineMinDistinctPaths,
+      RUN_SAFETY_BUDGET_HARD_CEILINGS.originQuarantineMinDistinctPaths,
+      env,
+    ),
+    originQuarantineWindowMs: resolveBoundedBudgetCap(
+      overrides.originQuarantineWindowMs,
+      RUN_SAFETY_BUDGET_ENV_KEYS.originQuarantineWindowMs,
+      RUN_SAFETY_BUDGET_DEFAULTS.originQuarantineWindowMs,
+      RUN_SAFETY_BUDGET_HARD_CEILINGS.originQuarantineWindowMs,
+      env,
+    ),
+    searchRepoDeadlineMs: resolveBoundedBudgetCap(
+      overrides.searchRepoDeadlineMs,
+      RUN_SAFETY_BUDGET_ENV_KEYS.searchRepoDeadlineMs,
+      RUN_SAFETY_BUDGET_DEFAULTS.searchRepoDeadlineMs,
+      RUN_SAFETY_BUDGET_HARD_CEILINGS.searchRepoDeadlineMs,
+      env,
+    ),
+    searchRepoMaxBytes: resolveBoundedBudgetCap(
+      overrides.searchRepoMaxBytes,
+      RUN_SAFETY_BUDGET_ENV_KEYS.searchRepoMaxBytes,
+      RUN_SAFETY_BUDGET_DEFAULTS.searchRepoMaxBytes,
+      RUN_SAFETY_BUDGET_HARD_CEILINGS.searchRepoMaxBytes,
+      env,
+    ),
+    oobMaxCallbacksPerToken: resolveBoundedBudgetCap(
+      overrides.oobMaxCallbacksPerToken,
+      RUN_SAFETY_BUDGET_ENV_KEYS.oobMaxCallbacksPerToken,
+      RUN_SAFETY_BUDGET_DEFAULTS.oobMaxCallbacksPerToken,
+      RUN_SAFETY_BUDGET_HARD_CEILINGS.oobMaxCallbacksPerToken,
+      env,
+    ),
+    oobMaxCallbacksPerRun: resolveBoundedBudgetCap(
+      overrides.oobMaxCallbacksPerRun,
+      RUN_SAFETY_BUDGET_ENV_KEYS.oobMaxCallbacksPerRun,
+      baseOobCallbacksPerRun,
+      RUN_SAFETY_BUDGET_HARD_CEILINGS.oobMaxCallbacksPerRun,
+      env,
+    ),
+    oobMaxProtectedCallbacks: resolveBoundedBudgetCap(
+      overrides.oobMaxProtectedCallbacks,
+      RUN_SAFETY_BUDGET_ENV_KEYS.oobMaxProtectedCallbacks,
+      baseOobProtectedCallbacks,
+      RUN_SAFETY_BUDGET_HARD_CEILINGS.oobMaxProtectedCallbacks,
+      env,
+    ),
+    oobMaxCallbacksPerIpWindow: resolveBoundedBudgetCap(
+      overrides.oobMaxCallbacksPerIpWindow,
+      RUN_SAFETY_BUDGET_ENV_KEYS.oobMaxCallbacksPerIpWindow,
+      RUN_SAFETY_BUDGET_DEFAULTS.oobMaxCallbacksPerIpWindow,
+      RUN_SAFETY_BUDGET_HARD_CEILINGS.oobMaxCallbacksPerIpWindow,
       env,
     ),
   }

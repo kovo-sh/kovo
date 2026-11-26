@@ -77,6 +77,8 @@ import {
   DEFAULT_MAX_SEALS_PER_ENDPOINT,
   DEFAULT_MAX_SEALS_PER_RUN,
   DEFAULT_MAX_VAULT_ENTRIES,
+  RUN_SAFETY_BUDGET_DEFAULTS,
+  RUN_SAFETY_BUDGET_ENV_KEYS,
   RUN_SAFETY_BUDGET_HARD_CEILINGS,
   resolveRunSafetyBudgets,
 } from '../src/server/run-safety-budgets.ts'
@@ -338,13 +340,7 @@ test('Check 1: Prompt & skill fenced snippets obey SDK contract, strict TS types
 test('Check 2: 50x dual-replay 4-hop chains complete with zero starvation under default RunSafetyBudgets and still enforce finite caps', async t => {
   // 2a) Verify RunSafetyBudgets defaults, scaling, env parsing, and strict finite OOM ceilings.
   const defaults = resolveRunSafetyBudgets({ env: {} })
-  assert.deepEqual(defaults, {
-    maxCompositeVerifiesPerRun: DEFAULT_MAX_COMPOSITE_VERIFIES_PER_RUN,
-    maxSealsPerRun: DEFAULT_MAX_SEALS_PER_RUN,
-    maxSealsPerEndpoint: DEFAULT_MAX_SEALS_PER_ENDPOINT,
-    maxVaultEntries: DEFAULT_MAX_VAULT_ENTRIES,
-    maxSealAttempts: DEFAULT_MAX_SEAL_ATTEMPTS,
-  })
+  assert.deepEqual(defaults, RUN_SAFETY_BUDGET_DEFAULTS)
   assert.equal(defaults.maxCompositeVerifiesPerRun, 1024)
   assert.equal(defaults.maxSealsPerRun, 4096)
   assert.equal(defaults.maxSealsPerEndpoint, 256)
@@ -359,14 +355,14 @@ test('Check 2: 50x dual-replay 4-hop chains complete with zero starvation under 
   assert.ok(scaled.maxCompositeVerifiesPerRun <= RUN_SAFETY_BUDGET_HARD_CEILINGS.maxCompositeVerifiesPerRun)
   assert.ok(scaled.maxSealsPerRun <= RUN_SAFETY_BUDGET_HARD_CEILINGS.maxSealsPerRun)
 
+  const clampedEnv: Record<string, string> = {}
+  for (const envKey of Object.values(RUN_SAFETY_BUDGET_ENV_KEYS)) {
+    clampedEnv[envKey] = '99999999'
+  }
   const clamped = resolveRunSafetyBudgets({
     maxAssignments: 1_000_000,
     dualReplay: true,
-    env: {
-      KOVO_MAX_COMPOSITE_VERIFIES_PER_RUN: '99999999',
-      KOVO_MAX_SEALS_PER_RUN: '99999999',
-      KOVO_MAX_SEALS_PER_ENDPOINT: '99999999',
-    },
+    env: clampedEnv,
   })
   assert.deepEqual(clamped, RUN_SAFETY_BUDGET_HARD_CEILINGS)
 
