@@ -1459,9 +1459,12 @@ export class ExecFloorLane extends ExecServiceModule<ExecFloorLaneHost> {
       exchangeIds: [...new Set(input.exchangeIds)].slice(0, 6),
       evidenceIds: [artifact.id],
     })
+    // R3-H-14: Never stamp `provenance: 'floor'` on pending proposals — `floor` is reserved strictly
+    // for host-confirmed deterministic findings (`persistDeterministicConfirmed`). Leaving pending
+    // proposals un-stamped keeps them mutable for replay confirmation/dismissal and agent upgrades,
+    // and prevents unverified rows from receiving `host_persisted` envelopeTrust or `backed: true`.
     const saved = this.storage.upsertChainFinding(
       input.run, input.asset.id, finding, specRow.id, origins,
-      { provenance: 'floor' },
     )
     this.storage.makeWorker(
       input.run, 'verification', input.asset, `Replay verify · ${spec.title.slice(0, 80)}`,

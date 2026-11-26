@@ -10,6 +10,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { lstatSync, rmdirSync, unlinkSync } from 'node:fs'
 import { dirname, join } from 'node:path'
+import type { DatabaseSync } from 'node:sqlite'
 import { and, asc, desc, eq, inArray, or, sql } from 'drizzle-orm'
 import type {
   BenchmarkFunnel,
@@ -137,6 +138,201 @@ export interface PatchProposalReviewInput {
 const operatorTriageStatusSet = new Set<string>(operatorTriageStatuses)
 const operatorSeverityOverrideSet = new Set<string>(operatorSeverityOverrides)
 const patchProposalReviewStatusSet = new Set<string>(patchProposalReviewStatuses)
+
+/**
+ * R3-H-14: Single authoritative predicate for confirmed deterministic-floor rows.
+ * Immutability, `floor_artifact` backing, and `host_persisted` envelope trust apply ONLY to
+ * rows that are both floor-attributed AND already `confirmed` (never pending proposals).
+ */
+export function isConfirmedFloorFinding(
+  row: {
+    provenance?: FindingProvenance | null
+    status?: Finding['status'] | null
+    finding?: Pick<Finding, 'status'> | null
+  } | null | undefined,
+): boolean {
+  if (!row || row.provenance !== 'floor') return false
+  const status = row.finding?.status ?? row.status ?? null
+  return status === 'confirmed'
+}
+
+/** Derive replay/retest envelope trust strictly from confirmed floor rows (never pending proposals). */
+export function floorEnvelopeTrustForFinding(
+  row: {
+    provenance?: FindingProvenance | null
+    status?: Finding['status'] | null
+    finding?: Pick<Finding, 'status'> | null
+  } | null | undefined,
+): 'host_persisted' | 'untrusted' {
+  return isConfirmedFloorFinding(row) ? 'host_persisted' : 'untrusted'
+}
+
+export interface PruneExchangesWithProtectionOptions extends PruneExchangesOptions {
+  /**
+   * When true (default), automatically preserve every exchange cited by findings, replay specs /
+   * proof receipts (single-hop and composite), retest runs, and facts for the run.
+   * Pass `false` explicitly only for hard-wipe / ZDR sweeps that intend to discard cited transcripts.
+   */
+  preserveProtectedExchanges?: boolean
+  /**
+   * Alias aligned with `ArtifactTtlPolicy.preserveConfirmedEvidence` for Stream 15 (`artifact-ttl.ts`).
+   * If either `preserveProtectedExchanges` or `preserveConfirmedEvidence` is `false`, built-in
+   * protection is disabled (explicit `protectedExchangeIds`, if supplied, remain protected).
+   */
+  preserveConfirmedEvidence?: boolean
+  /** Optional caller-supplied exchange IDs that must never be deleted during pruning. */
+  protectedExchangeIds?: ReadonlySet<string>
+}
+
+const EXCHANGE_ID_KEY_RE = /(?:^|_)exchange_?ids?$|ExchangeIds?$/i
+const MAX_EXCHANGE_JSON_WALK_DEPTH = 12
+
+function addNonEmptyString(out: Set<string>, value: unknown): void {
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    if (trimmed.length > 0) out.add(trimmed)
+  }
+}
+
+function addStringArray(out: Set<string>, value: unknown): void {
+  if (!Array.isArray(value)) return
+  for (const item of value) addNonEmptyString(out, item)
+}
+
+function collectExchangeIdsFromJson(value: unknown, out: Set<string>, depth = 0): void {
+  if (depth > MAX_EXCHANGE_JSON_WALK_DEPTH || value == null || typeof value !== 'object') return
+  if (Array.isArray(value)) {
+    for (const item of value) collectExchangeIdsFromJson(item, out, depth + 1)
+    return
+  }
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    if (entry == null) continue
+    if (EXCHANGE_ID_KEY_RE.test(key)) {
+      if (typeof entry === 'string') {
+        addNonEmptyString(out, entry)
+        continue
+      }
+      if (Array.isArray(entry)) {
+        addStringArray(out, entry)
+        continue
+      }
+    }
+    if (typeof entry === 'object') {
+      collectExchangeIdsFromJson(entry, out, depth + 1)
+    }
+  }
+}
+
+function parseJsonAndCollectExchangeIds(raw: unknown, out: Set<string>, topLevelArray = false): void {
+  if (raw == null) return
+  let parsed: unknown = raw
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim()
+    if (!trimmed) return
+    try {
+      parsed = JSON.parse(trimmed)
+    } catch {
+      return
+    }
+  }
+  if (topLevelArray && Array.isArray(parsed)) {
+    addStringArray(out, parsed)
+    return
+  }
+  collectExchangeIdsFromJson(parsed, out)
+}
+
+/**
+ * R3-H-16: Collect every broker exchange ID cited by persisted run artifacts (`findings`,
+ * `replay_specs` / `proof_receipt` / `compositeReceipt`, `retest_runs`, `facts`, and surfaced
+ * `second_order_canaries`) so retention pruning never destroys evidence referenced by findings,
+ * receipts, retests, or facts.
+ */
+export function listProtectedExchangeIdsForRun(
+  client: Pick<DatabaseSync, 'prepare'>,
+  runId: string,
+): Set<string> {
+  const protectedIds = new Set<string>()
+
+  // 1. Findings (confirmed, static_verified, or any finding row's JSON exchangeIds / nested evidence/receipt refs).
+  try {
+    const findingRows = client.prepare(
+      'SELECT finding FROM findings WHERE run_id = ?',
+    ).all(runId) as Array<{ finding: string | null }>
+    for (const row of findingRows) {
+      parseJsonAndCollectExchangeIds(row.finding, protectedIds)
+    }
+  } catch {
+    // Table unavailable on minimal schema.
+  }
+
+  // 2. Replay specs (proof_receipt single-hop + compositeReceipt hops/edges/terminal/control exchanges, spec, diff).
+  try {
+    const specRows = client.prepare(
+      'SELECT spec, proof_receipt, last_verification_diff FROM replay_specs WHERE run_id = ?',
+    ).all(runId) as Array<{
+      spec: string | null
+      proof_receipt: string | null
+      last_verification_diff: string | null
+    }>
+    for (const row of specRows) {
+      parseJsonAndCollectExchangeIds(row.proof_receipt, protectedIds)
+      parseJsonAndCollectExchangeIds(row.spec, protectedIds)
+      parseJsonAndCollectExchangeIds(row.last_verification_diff, protectedIds)
+    }
+  } catch {
+    // Fallback for legacy schemas without proof_receipt / last_verification_diff columns.
+    try {
+      const specRows = client.prepare(
+        'SELECT spec FROM replay_specs WHERE run_id = ?',
+      ).all(runId) as Array<{ spec: string | null }>
+      for (const row of specRows) {
+        parseJsonAndCollectExchangeIds(row.spec, protectedIds)
+      }
+    } catch {
+      // Table unavailable on minimal schema.
+    }
+  }
+
+  // 3. Retest runs (cited exchange_ids).
+  try {
+    const retestRows = client.prepare(
+      'SELECT exchange_ids FROM retest_runs WHERE run_id = ?',
+    ).all(runId) as Array<{ exchange_ids: string | null }>
+    for (const row of retestRows) {
+      parseJsonAndCollectExchangeIds(row.exchange_ids, protectedIds, true)
+    }
+  } catch {
+    // Table unavailable on minimal schema.
+  }
+
+  // 4. Facts (exchange_ids column + nested exchangeId/exchangeIds in fact data JSON).
+  try {
+    const factRows = client.prepare(
+      'SELECT exchange_ids, data FROM facts WHERE run_id = ?',
+    ).all(runId) as Array<{ exchange_ids: string | null; data: string | null }>
+    for (const row of factRows) {
+      parseJsonAndCollectExchangeIds(row.exchange_ids, protectedIds, true)
+      parseJsonAndCollectExchangeIds(row.data, protectedIds)
+    }
+  } catch {
+    // Table unavailable on minimal schema.
+  }
+
+  // 5. Surfaced second-order canaries citing a broker exchange.
+  try {
+    const canaryRows = client.prepare(
+      'SELECT surfaced_exchange_id FROM second_order_canaries WHERE run_id = ? AND surfaced_exchange_id IS NOT NULL',
+    ).all(runId) as Array<{ surfaced_exchange_id: string | null }>
+    for (const row of canaryRows) {
+      addNonEmptyString(protectedIds, row.surfaced_exchange_id)
+    }
+  } catch {
+    // Table unavailable on minimal schema.
+  }
+
+  return protectedIds
+}
 
 export class FindingsRepository {
   private readonly session: DbSession
@@ -376,11 +572,23 @@ export class FindingsRepository {
   // --- Retention GC & storage footprint (v6.2) ---
 
   /**
+   * Collect every exchange ID cited by findings, replay specs / proof receipts, retest runs,
+   * and facts for `runId` so retention pruning never deletes referenced evidence.
+   */
+  listProtectedExchangeIdsForRun(runId: string): Set<string> {
+    this.session.flushNow()
+    this.session.requireRun(runId)
+    return listProtectedExchangeIdsForRun(this.session.client, runId)
+  }
+
+  /**
    * Delete aged exchanges (rows + FTS rows + unreferenced sharded body blobs) for one run in
    * bounded IMMEDIATE batches. `olderThanMs` bounds the age, `keepLatest` always preserves the
-   * newest N exchanges. An unbounded delete (no cutoff and no keepLatest) is a no-op.
+   * newest N exchanges, and exchanges cited by findings/receipts/retests/facts are preserved
+   * automatically unless `preserveProtectedExchanges: false` or `preserveConfirmedEvidence: false`.
+   * An unbounded delete (no cutoff and no keepLatest) is a no-op.
    */
-  pruneExchanges(options: PruneExchangesOptions): PruneExchangesResult {
+  pruneExchanges(options: PruneExchangesWithProtectionOptions): PruneExchangesResult {
     const result = this.pruneExchangeRows(options)
     if (options.emitEvent !== false && result.exchanges > 0) {
       this.session.event(result.runId, 'retention.pruned',
@@ -513,7 +721,7 @@ export class FindingsRepository {
     return row?.r === undefined ? null : Number(row.r)
   }
 
-  private pruneExchangeRows(options: PruneExchangesOptions): PruneExchangesResult {
+  private pruneExchangeRows(options: PruneExchangesWithProtectionOptions): PruneExchangesResult {
     this.session.flushNow()
     const run = this.session.requireRun(options.runId)
     const batchSize = clampInteger(options.batchSize ?? 500, 1, 5000)
@@ -527,17 +735,35 @@ export class FindingsRepository {
     if (cutoff === null && keepLatest === 0) return result
     const keepRowid = keepLatest > 0 ? this.keepBoundaryRowid(run.id, keepLatest) : null
     if (keepLatest > 0 && keepRowid === null) return result
+
+    const protectBuiltIn =
+      options.preserveProtectedExchanges !== false
+      && options.preserveConfirmedEvidence !== false
+    const protectedIds = new Set<string>()
+    if (protectBuiltIn) {
+      for (const id of listProtectedExchangeIdsForRun(this.session.client, run.id)) {
+        protectedIds.add(id)
+      }
+    }
+    if (options.protectedExchangeIds) {
+      for (const id of options.protectedExchangeIds) {
+        addNonEmptyString(protectedIds, id)
+      }
+    }
+
     const blobIds = new Set<string>()
     let cursor = 0
     for (;;) {
-      const batch = this.pruneExchangeBatch(run.id, { cursor, cutoff, keepRowid, batchSize })
+      const batch = this.pruneExchangeBatch(run.id, { cursor, cutoff, keepRowid, batchSize, protectedIds })
       if (!batch) break
-      result.exchanges += batch.rows
-      result.ftsRows += batch.ftsRows
-      result.batches += 1
+      if (batch.rows > 0) {
+        result.exchanges += batch.rows
+        result.ftsRows += batch.ftsRows
+        result.batches += 1
+      }
       cursor = batch.lastRowid
       for (const id of batch.blobIds) blobIds.add(id)
-      if (batch.rows < batchSize) break
+      if (batch.fetched < batchSize) break
     }
     if (blobIds.size > 0) {
       this.session.afterCommit(() => {
@@ -555,8 +781,14 @@ export class FindingsRepository {
 
   private pruneExchangeBatch(
     runId: string,
-    state: { cursor: number; cutoff: number | null; keepRowid: number | null; batchSize: number },
-  ): { rows: number; ftsRows: number; lastRowid: number; blobIds: string[] } | null {
+    state: {
+      cursor: number
+      cutoff: number | null
+      keepRowid: number | null
+      batchSize: number
+      protectedIds: ReadonlySet<string>
+    },
+  ): { fetched: number; rows: number; ftsRows: number; lastRowid: number; blobIds: string[] } | null {
     const conditions = ['run_id = ?']
     const params: Array<string | number> = [runId]
     if (state.cursor > 0) {
@@ -576,7 +808,14 @@ export class FindingsRepository {
        WHERE ${conditions.join(' AND ')} ORDER BY rowid ASC LIMIT ?`,
     ).all(...params, state.batchSize) as Array<{ rowid: number; id: string; body_artifact_id: string | null }>
     if (!rows.length) return null
-    const ids = rows.map(row => row.id)
+    const lastRowid = Number(rows[rows.length - 1]!.rowid)
+    const deletable = state.protectedIds.size > 0
+      ? rows.filter(row => !state.protectedIds.has(row.id))
+      : rows
+    if (!deletable.length) {
+      return { fetched: rows.length, rows: 0, ftsRows: 0, lastRowid, blobIds: [] }
+    }
+    const ids = deletable.map(row => row.id)
     const placeholders = ids.map(() => '?').join(', ')
     let ftsRows = 0
     this.session.transaction(() => {
@@ -591,10 +830,11 @@ export class FindingsRepository {
       ).run(runId, ...ids)
     })
     return {
-      rows: rows.length,
+      fetched: rows.length,
+      rows: deletable.length,
       ftsRows,
-      lastRowid: Number(rows[rows.length - 1]!.rowid),
-      blobIds: rows.map(row => row.body_artifact_id).filter((id): id is string => typeof id === 'string' && id.length > 0),
+      lastRowid,
+      blobIds: deletable.map(row => row.body_artifact_id).filter((id): id is string => typeof id === 'string' && id.length > 0),
     }
   }
 
@@ -895,6 +1135,7 @@ export class FindingsRepository {
     findingKind?: Finding['findingKind']
     verificationTier?: VerificationTier | null
     provenance?: FindingProvenance | null
+    status?: Finding['status'] | null
   }): ConfirmationEvidence {
     const replaySpecId = input.replaySpecId ?? null
     if (input.findingKind === 'baseline_check' || input.verificationTier === 'baseline_confirmed') {
@@ -941,8 +1182,17 @@ export class FindingsRepository {
     // Legacy floor confirmations predate persisted spec diffs: their deterministic-engine event (or
     // the floor's own in-flight confirmation write) is the anchor. An explicit non-confirming diff
     // still wins (it is the later, contradicting write).
-    if (input.provenance === 'floor') {
-      return { backed: true, contradicted: false, kind: 'floor_artifact', verdict: null, replaySpecId }
+    // R3-H-14: Scope `floor_artifact` backing strictly to confirmed floor rows — never pending proposals.
+    if (input.provenance === 'floor' && (input.status === undefined || input.status === null || input.status === 'confirmed')) {
+      const existingRow = this.session.db.select({ finding: tables.findings.finding }).from(tables.findings).where(and(
+        eq(tables.findings.runId, runId), eq(tables.findings.id, input.findingId),
+      )).get()
+      const backedByConfirmedFloor = existingRow
+        ? existingRow.finding.status === 'confirmed'
+        : input.status === 'confirmed'
+      if (backedByConfirmedFloor) {
+        return { backed: true, contradicted: false, kind: 'floor_artifact', verdict: null, replaySpecId }
+      }
     }
     const floorEvent = this.session.db.select({ id: tables.events.id }).from(tables.events).where(and(
       eq(tables.events.runId, runId),
@@ -966,6 +1216,7 @@ export class FindingsRepository {
     findingKind?: Finding['findingKind']
     verificationTier?: VerificationTier | null
     provenance?: FindingProvenance | null
+    status?: Finding['status'] | null
   }): ConfirmationEvidence {
     const evidence = this.confirmationEvidenceFor(runId, input)
     if (!evidence.backed) {
@@ -1001,6 +1252,7 @@ export class FindingsRepository {
         findingKind: row.findingKind,
         verificationTier: row.finding.verificationTier ?? row.verificationTier,
         provenance: row.provenance,
+        status: row.finding.status,
       })
       if (evidence.backed || !evidence.contradicted) return false
       const conflicts = this.confirmationConflictCount(runId) + 1
@@ -1475,7 +1727,7 @@ export class FindingsRepository {
       // Floor-confirmed rows are immutable: later agent passes may add evidence elsewhere but can
       // never overwrite, downgrade or reclassify the floor's own runtime confirmation.
       // Pending or static_verified floor rows remain monotonically upgradable once runtime proof arrives.
-      if (existing.provenance === 'floor' && existing.finding.status === 'confirmed') {
+      if (isConfirmedFloorFinding(existing)) {
         this.session.event(
           run.id,
           'finding.floor_preserved',
@@ -1556,7 +1808,8 @@ export class FindingsRepository {
           verification: mergedFinding.verification,
           findingKind: existing.findingKind,
           verificationTier: mergedFinding.verificationTier ?? existing.verificationTier,
-          provenance: existing.provenance,
+          provenance: isConfirmedFloorFinding(existing) ? 'floor' : null,
+          status: existing.finding.status,
         })
       }
       const existingOperatorTriage = (existing.finding as TriagedFinding).operatorTriage
@@ -1777,7 +2030,7 @@ export class FindingsRepository {
     requested: FindingProvenance | undefined,
     parentFindingIds: readonly string[] | null | undefined,
   ): FindingProvenance {
-    if (targetRow?.provenance === 'floor') return 'floor'
+    if (isConfirmedFloorFinding(targetRow)) return 'floor'
     if (requested === 'floor') return 'floor'
     if (requested === 'chain_from_floor' || (parentFindingIds?.length ?? 0) > 0) {
       return this.chainFromFloorIsValid(runId, finding, parentFindingIds) ? 'chain_from_floor' : 'agent_only'
@@ -1846,8 +2099,8 @@ export class FindingsRepository {
       // Monotonicity: a floor-confirmed row is immutable. An agent re-discovery of the same
       // canonical dedupe key is suppressed as a no-op — never overwritten, never duplicated.
       // Pending or static_verified floor rows remain monotonically upgradable once runtime proof arrives.
-      const targetIsFloorConfirmed = targetRow?.provenance === 'floor' && targetRow.finding.status === 'confirmed'
-      if (targetIsFloorConfirmed && options.provenance !== 'floor') {
+      const targetIsFloorConfirmed = isConfirmedFloorFinding(targetRow)
+      if (targetRow && targetIsFloorConfirmed && options.provenance !== 'floor') {
         this.session.event(
           run.id,
           'finding.floor_preserved',
@@ -1902,7 +2155,12 @@ export class FindingsRepository {
           verification: storedFinding.verification,
           findingKind: storedFinding.findingKind,
           verificationTier: storedFinding.verificationTier,
-          provenance: options.provenance ?? targetRow?.provenance ?? null,
+          provenance: options.provenance === 'floor'
+            ? 'floor'
+            : (targetIsFloorConfirmed ? 'floor' : null),
+          status: options.provenance === 'floor'
+            ? storedFinding.status
+            : (targetRow?.finding.status ?? storedFinding.status),
         })
       }
 
