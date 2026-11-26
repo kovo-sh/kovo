@@ -68,11 +68,17 @@ import {
   type ChainStepStatus,
 } from '../step-status.ts'
 import {
+  canResumeRun,
   deriveRunActivity,
   isTerminalRunStatus,
   summarizeReportChainSteps,
   type RunActivity,
 } from './run-status.ts'
+import {
+  applyRunStatusCoTransitions,
+  reconcilePersistedCrashRecovery,
+  validateLifecycleTransition,
+} from './lifecycle.ts'
 
 type TerminalParentDisposition = 'satisfies' | 'kills' | 'blocks'
 const ORIGIN_QUARANTINE_SKILL_PREFIX_STORE = 'kovo:origin_quarantined:'
@@ -528,100 +534,29 @@ export class RunsRepository {
   }
 
   /**
-   * Crash recovery (idempotent). Resets interrupted runs, stuck board members and stale
-   * assignments, expires pending approval leases, and reclaims persisted LabRunner container rows.
+   * Crash recovery (idempotent). Covers ALL 7 `RunStatus` values via `reconcilePersistedCrashRecovery`,
+   * resets interrupted runs, stuck board members and stale assignments, closes stranded terminal rows,
+   * expires pending approval requests/leases, and reclaims persisted LabRunner container rows.
    * Permanently `failed` assignments are never re-queued.
    */
   recover(now = Date.now()): RecoveryReport {
     if (this.session.txDepth > 0) throw new Error('recover() cannot run inside an open transaction.')
     this.session.flushNow()
-    const report: RecoveryReport = {
-      pausedRuns: 0,
-      requeuedAssignments: 0,
-      resetBoardMembers: 0,
-      expiredApprovals: 0,
-      reclaimedContainers: [],
-      changed: false,
-    }
-    this.session.transaction(() => {
-      const runRows = this.session.db.select({ id: tables.runs.id, status: tables.runs.status }).from(tables.runs)
-        .where(and(
-          eq(tables.runs.workspaceId, this.session.workspace.id),
-          inArray(tables.runs.status, ['running', 'paused', 'budget_paused']),
-        )).all()
-      const runIds = runRows.map(row => row.id)
-      const interrupted = runRows.filter(row => row.status === 'running')
-
-      for (const row of interrupted) {
-        const run = this.run(row.id)
-        this.setStatus(run, 'paused')
-        this.session.db.update(tables.chainSteps).set({ status: 'ready', assignedWorkerId: null, updatedAt: now })
-          .where(and(eq(tables.chainSteps.runId, run.id), eq(tables.chainSteps.status, 'running'))).run()
-        report.pausedRuns += 1
-      }
-
-      if (runIds.length) {
-        const placeholders = runIds.map(() => '?').join(', ')
-        const requeued = this.session.client.prepare(
-          `UPDATE assignments SET status = 'queued', lease = NULL, lease_expires_at = NULL
-           WHERE run_id IN (${placeholders}) AND (
-             status IN ('running', 'paused')
-             OR (status = 'waiting_approval' AND approval_parked_at IS NULL)
-           )`,
-        ).run(...runIds) as { changes?: number }
-        report.requeuedAssignments = Number(requeued.changes ?? 0)
-
-        const resetMembers = this.session.client.prepare(
-          `UPDATE board_members SET state = 'waiting', active_assignment_id = NULL, updated_at = ?
-           WHERE run_id IN (${placeholders}) AND state = 'working'`,
-        ).run(now, ...runIds) as { changes?: number }
-        report.resetBoardMembers = Number(resetMembers.changes ?? 0)
-      }
-
-      const expired = this.session.client.prepare(
-        `UPDATE approval_requests SET status = 'expired', decided_at = ?,
-           policy_note = coalesce(policy_note, 'Expired approval lease cleared during crash recovery.')
-         WHERE status = 'pending' AND expires_at < ?
-           AND run_id IN (SELECT id FROM runs WHERE workspace_id = ?)`,
-      ).run(now, now, this.session.workspace.id) as { changes?: number }
-      report.expiredApprovals = Number(expired.changes ?? 0)
-
-      const orphanedRows = this.session.db.select().from(tables.labContainers)
-        .where(eq(tables.labContainers.status, 'orphaned')).all()
-      const liveRows = runIds.length
-        ? this.session.db.select().from(tables.labContainers).where(and(
-            eq(tables.labContainers.status, 'running'),
-            inArray(tables.labContainers.runId, runIds),
-          )).all()
-        : []
-      const containerRows = [...orphanedRows, ...liveRows]
-      const uniqueContainers = new Map(containerRows.map(row => [row.id, row]))
-      if (uniqueContainers.size) {
-        const ids = [...uniqueContainers.keys()]
-        const deleteStmt = this.session.client.prepare(`DELETE FROM lab_containers WHERE id IN (${ids.map(() => '?').join(', ')})`)
-        deleteStmt.run(...ids)
-        report.reclaimedContainers = [...uniqueContainers.values()]
-          .map(row => ({ runId: row.runId, containerName: row.containerName }))
-      }
-
-      for (const row of interrupted) {
-        this.session.event(row.id, 'interrupted', 'The application restarted. Resume to continue from saved evidence.')
-      }
-
-      report.changed = report.pausedRuns > 0 || report.requeuedAssignments > 0
-        || report.resetBoardMembers > 0 || report.expiredApprovals > 0 || report.reclaimedContainers.length > 0
-
-      if (report.reclaimedContainers.length || report.expiredApprovals) {
-        this.session.event(null, 'recovery.completed', 'Crash recovery reclaimed runtime state.', {
-          pausedRuns: report.pausedRuns,
-          requeuedAssignments: report.requeuedAssignments,
-          resetBoardMembers: report.resetBoardMembers,
-          expiredApprovals: report.expiredApprovals,
-          reclaimedContainers: report.reclaimedContainers.map(row => row.containerName).slice(0, 50),
-        })
+    return this.session.transaction(() => {
+      const full = reconcilePersistedCrashRecovery({
+        client: this.session.client,
+        workspaceId: this.session.workspace.id,
+        event: (runId, kind, message, detail) => this.session.event(runId, kind, message, detail),
+      }, now)
+      return {
+        pausedRuns: full.pausedRuns,
+        requeuedAssignments: full.requeuedAssignments,
+        resetBoardMembers: full.resetBoardMembers,
+        expiredApprovals: full.expiredApprovals,
+        reclaimedContainers: full.reclaimedContainers,
+        changed: full.changed,
       }
     }, { behavior: 'immediate' })
-    return report
   }
 
   // --- LabRunner container registry (v6 crash recovery) ---
@@ -870,6 +805,12 @@ export class RunsRepository {
     return this.session.transaction(() => {
       const existing = this.boardMember(runId, handle)
       if (!existing) throw new Error('Board member not found.')
+      if (patch.state && patch.state !== existing.state) {
+        validateLifecycleTransition('boardMember', existing.state, patch.state, {
+          context: 'updateBoardMemberState', runId, entityId: existing.id,
+          onWarning: w => this.session.event(runId, 'lifecycle.transition_warning', `Illegal boardMember transition ${w.from} -> ${w.to}.`, { entity: w.entity, from: w.from, to: w.to, entityId: existing.id }),
+        })
+      }
       return this.upsertBoardMember(runId, {
         handle: existing.handle,
         role: existing.role,
@@ -1617,6 +1558,12 @@ export class RunsRepository {
       // resurrect its step as complete/running.
       if (existing.status === 'canceled' && patch.status && patch.status !== 'canceled') {
         return existing as unknown as ChainStep
+      }
+      if (patch.status && patch.status !== existing.status) {
+        validateLifecycleTransition('chainStep', existing.status, patch.status, {
+          context: 'updateChainStep', runId: existing.runId, entityId: stepId,
+          onWarning: w => this.session.event(existing.runId, 'lifecycle.transition_warning', `Illegal chainStep transition ${w.from} -> ${w.to}.`, { entity: w.entity, from: w.from, to: w.to, entityId: stepId }),
+        })
       }
       const updated = this.session.db.update(tables.chainSteps).set({ ...patch, updatedAt: Date.now() })
         .where(eq(tables.chainSteps.id, stepId)).returning().get()
@@ -3472,30 +3419,26 @@ export class RunsRepository {
     }, input)
   }
   updateWorker(assignmentId: string, state: Partial<Assignment>) {
-    const existing = this.session.db.select({ id: tables.assignments.id, runId: tables.assignments.runId })
+    const existing = this.session.db.select({ id: tables.assignments.id, runId: tables.assignments.runId, status: tables.assignments.status })
       .from(tables.assignments).where(eq(tables.assignments.id, assignmentId)).get()
     if (!existing) return undefined
     this.session.requireRun(existing.runId)
+    if (state.status && state.status !== existing.status) {
+      validateLifecycleTransition('worker', existing.status, state.status, {
+        context: 'updateWorker', runId: existing.runId, entityId: assignmentId,
+        onWarning: w => this.session.event(existing.runId, 'lifecycle.transition_warning', `Illegal worker transition ${w.from} -> ${w.to}.`, { entity: w.entity, from: w.from, to: w.to, entityId: assignmentId }),
+      })
+    }
     return this.session.db.update(tables.assignments).set(state).where(eq(tables.assignments.id, assignmentId)).returning().get()
   }
 
   setStatus(run: Run, status: Run['status']) {
     this.updateRun(run.id, { status })
-    if (status === 'paused' || status === 'budget_paused') {
-      this.session.db.update(tables.assignments).set({ status: 'paused', lease: null, leaseExpiresAt: null }).where(and(
-        eq(tables.assignments.runId, run.id),
-        inArray(tables.assignments.status, ['queued', 'running', 'waiting_approval']),
-        // Operator opt-in approvals that released their slot survive pause/recovery.
-        sql`NOT (${tables.assignments.status} = 'waiting_approval' AND ${tables.assignments.approvalParkedAt} IS NOT NULL)`,
-      )).run()
-    }
-    if (status === 'running') {
-      this.session.db.update(tables.assignments).set({ status: 'queued', lease: null, leaseExpiresAt: null }).where(and(
-        eq(tables.assignments.runId, run.id),
-        eq(tables.assignments.goalRevision, run.goalRevision),
-        eq(tables.assignments.status, 'paused'),
-      )).run()
-    }
+    applyRunStatusCoTransitions({
+      client: this.session.client,
+      event: (runId, kind, message, detail) => this.session.event(runId, kind, message, detail),
+      refreshReadyChainSteps: (runId, goalRevision) => this.refreshReadyChainSteps(runId, goalRevision),
+    }, run, status)
   }
 
   private discover(run: Run) {
@@ -4325,11 +4268,11 @@ export class RunsRepository {
           this.writeReport(this.run(run.id), true)
           break
         case 'resume':
-          if (run.phase === 'complete') {
+          if (run.phase === 'complete' || run.status === 'complete') {
             throw new Error('Completed runs cannot be resumed.')
           }
-          if (!['paused', 'budget_paused', 'stopped', 'failed'].includes(run.status)) {
-            throw new Error('This run is not paused or stopped.')
+          if (!canResumeRun(run)) {
+            throw new Error(isTerminalRunStatus(run.status) ? 'Stopped or failed runs are terminal and cannot be resumed.' : 'This run is not paused.')
           }
           if (run.status === 'budget_paused' && (run.spentUsd >= run.budgetUsd || (run.budgetRequests > 0 && run.spentRequests >= run.budgetRequests))) {
             throw new Error('Raise the run budget before resuming a budget-paused run.')

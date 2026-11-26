@@ -15,7 +15,7 @@ import {
   maxRpsPerOriginCeiling,
 } from '../../domain.ts'
 import type { ApprovalPolicy } from '../../domain.ts'
-import { isRunDeleteBlocked, isRunEditable } from '../../server/run-status.ts'
+import { canOfferResumeButton, isRunDeleteBlocked, isRunEditable } from '../../server/run-status.ts'
 import type { RunActivity } from '../../server/run-status.ts'
 import { approvalPolicyMeta, capabilityTierMeta } from '../run-state.ts'
 import { Dialog, DialogContent, DialogTitle } from '../ui/dialog.tsx'
@@ -168,7 +168,7 @@ export function RunHeader() {
   const run = (cmd: Parameters<typeof send>[0], done?: string) => send(cmd).then(() => { if (done) toast.show(done) }, () => {})
 
   let action: ReactNode = null
-  if (r.status === 'paused' || r.status === 'stopped' || r.status === 'failed') {
+  if (canOfferResumeButton(r)) {
     action = <button type="button" className={runBtn()} disabled={pending > 0} onClick={() => run({ action: 'resume' }, 'Resuming the run')}><Icon name="play" />Resume</button>
   } else if (r.status === 'budget_paused') {
     action = <button type="button" className={runBtn({ variant: 'primary' })} onClick={() => setPop(pop === 'budget' ? null : 'budget')}><Icon name="budget" />Raise budget</button>

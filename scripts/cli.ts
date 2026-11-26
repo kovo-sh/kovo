@@ -7,6 +7,7 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { pathToFileURL } from 'node:url'
 import { assetOriginForEnvironment, personaHandle } from '../src/domain.ts'
 import type { CapabilityTier, Finding, PersonaPrivilege } from '../src/domain.ts'
+import { AppRuntime } from '../src/server/app-runtime.ts'
 import { Execution } from '../src/server/execution.ts'
 import { projectReposDir } from '../src/server/github-connector.ts'
 import { assertLocalLabAllowed, getSharedLabRunner, LabRunner } from '../src/server/lab-runner.ts'
@@ -610,7 +611,9 @@ export async function runCli(argv: readonly string[]): Promise<0 | 1 | 2> {
   mkdirSync(dataDir, { recursive: true, mode: 0o700 })
 
   const labRunner = getSharedLabRunner()
-  const storage = new Store(dataDir)
+  const storage = new Store(dataDir, { autoRecover: false })
+  const cliRuntime = new AppRuntime({ dataDir, store: storage, maintenance: false, autoStartMaintenance: false })
+  await cliRuntime.startupRecover({ labRunner }).catch(() => undefined)
   if (opts.localLab) {
     await labRunner.recoverAll(storage).catch(() => [])
   }

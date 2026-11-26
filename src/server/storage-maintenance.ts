@@ -13,7 +13,8 @@
  */
 import { lstatSync, readdirSync, rmdirSync, unlinkSync } from 'node:fs'
 import { join, resolve } from 'node:path'
-import { isTerminalRunStatus, purgeExpiredArtifacts } from './artifact-ttl.ts'
+import { isEligibleForArtifactTtlPurge } from './run-status.ts'
+import { purgeExpiredArtifacts } from './artifact-ttl.ts'
 import type { ArtifactTtlPolicy, ArtifactTtlPurgeResult } from './artifact-ttl.ts'
 import { isSafePathSegment, tenantBlobSegment } from './store-session.ts'
 import type { Store } from './store.ts'
@@ -503,7 +504,7 @@ export class StorageMaintenanceController {
     const liveRunIds = new Set<string>(allRunRows.map(r => r.id))
     const protectedRunIds = new Set<string>(activeRuns)
     for (const row of allRunRows) {
-      if (row.id && !isTerminalRunStatus(row.status)) {
+      if (row.id && !isEligibleForArtifactTtlPurge(row.status)) {
         protectedRunIds.add(row.id)
       }
     }

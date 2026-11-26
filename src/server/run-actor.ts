@@ -58,7 +58,7 @@ import { KillSwitchTrippedError } from './kill-switch.ts'
 import { resolveProfilePoolForRole } from './model-settings.ts'
 import { BudgetExceededError } from './provider.ts'
 import type { NamedSecret } from './redact.ts'
-import { RunContext, type RunDrainReport } from './run-context.ts'
+import { RunContext, type RunDrainReport, type RunResourceRegistration } from './run-context.ts'
 import { approvalRequests, findings } from './schema.ts'
 import { codeAuditSuspectLocationKey, type SemanticAuditSuspect } from './semantic-audit.ts'
 import type { Assignment, Fact, Run, Store } from './store.ts'
@@ -497,8 +497,10 @@ export class RunActor {
     this.currentState = to
     if (from !== 'paused' && to === 'paused') {
       this.clock.pause('run_paused')
+      void this.context.reconcileResourcesForState('paused')
     } else if (from === 'paused' && to !== 'paused') {
       this.clock.resume('run_paused')
+      if (!isTerminalRunActorState(to)) void this.context.reconcileResourcesForState('running')
     }
     if (isTerminalRunActorState(to)) {
       this.clock.pause('run_terminal')
@@ -573,9 +575,9 @@ export class RunActor {
     return this.supervisor.scheduleTimer(label, delayMs, fn)
   }
 
-  /** Register a disposable run resource on the underlying `RunContext`. */
-  registerResource(name: string, disposeFn: () => void | Promise<void>): () => void {
-    return this.context.registerResource(name, disposeFn)
+  /** Register a disposable or pause-aware run resource on the underlying `RunContext`. */
+  registerResource(name: string, disposeOrDescriptor: RunResourceRegistration): () => void {
+    return this.context.registerResource(name, disposeOrDescriptor)
   }
 
   /** Register a raw Node timer on the underlying `RunContext`. */
@@ -629,7 +631,6 @@ export class RunActor {
     return report
   }
 }
-
 // ============================================================================
 // 4. Idempotent `unhandledRejection` Safety-Net Helper
 // ============================================================================
@@ -2631,12 +2632,11 @@ export class RunTier3ApprovalCoordinator {
         const assigned = workerById.get(step.assignedWorkerId)
         if (!assigned) continue
         let reconciledStatus: ChainStepTerminalStatus | null = null
-        if (assigned.status === 'complete') {
-          reconciledStatus = 'complete'
-        } else if (assigned.status === 'failed') {
-          reconciledStatus = classifyWorkerErrorToStepStatus(assigned.outcome)
-        } else if (assigned.status === 'canceled') {
-          reconciledStatus = 'canceled'
+        if (assigned.status === 'complete') reconciledStatus = 'complete'
+        else if (assigned.status === 'failed') reconciledStatus = classifyWorkerErrorToStepStatus(assigned.outcome)
+        else if (assigned.status === 'canceled') {
+          if (/Canceled by operator|Tier 3 approval/i.test(assigned.outcome ?? '')) reconciledStatus = 'canceled'
+          else { this.host.storage.updateChainStep(step.id, { status: 'ready', assignedWorkerId: null }); updatedAnyStep = true }
         }
         if (reconciledStatus && isTerminalStepStatus(reconciledStatus)) {
           this.host.storage.updateChainStep(step.id, { status: reconciledStatus, assignedWorkerId: assigned.id })

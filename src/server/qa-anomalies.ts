@@ -11,6 +11,7 @@ export const qaAnomalyKinds = [
   'zero_runtime_from_static',
   'ui_console_error',
   'layout_violation',
+  'run_invariant_violation',
 ] as const
 
 export type QaAnomalyKind = typeof qaAnomalyKinds[number]

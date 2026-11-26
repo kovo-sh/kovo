@@ -21,13 +21,16 @@ import {
   KillSwitchTrippedError,
 } from './kill-switch.ts'
 import type { KillSwitchOptions, KillSwitchState } from './kill-switch.ts'
+import type { LabRecoveryResult } from './container-supervisor.ts'
+import { getSharedLabRunner, type LabRunner } from './lab-runner.ts'
+import { consumeStoreStartupReclaimedContainers, type ReclaimedLabContainerRef } from './lifecycle.ts'
 import { cancelOobDrainForRun } from './oob-drain.ts'
 import { OobRelay } from './oob-relay.ts'
 import { assertValidRunId, InvalidRunIdError, RunContext } from './run-context.ts'
 import type { RunContextOptions, RunDrainReport } from './run-context.ts'
 import { resolveStorageMaintenancePolicy, StorageMaintenanceController } from './storage-maintenance.ts'
 import type { StorageMaintenanceOptions } from './storage-maintenance.ts'
-import { dataDirectory, Store, store as legacyStore } from './store.ts'
+import { dataDirectory, Store, store as legacyStore, type RecoveryReport } from './store.ts'
 
 export interface AppRuntimeOptions {
   /** Resolved data directory for SQLite store, OOB relay, and kill-switch backing file. */
@@ -67,6 +70,29 @@ export interface AppRuntimeDisposeReport {
   alreadyDisposed: boolean
 }
 
+export interface StartupRecoveryLabRunner {
+  recoverOnStartup?: LabRunner['recoverOnStartup']
+  ensureStartupRecovery?: LabRunner['supervisor']['ensureStartupRecovery']
+}
+
+export interface AppRuntimeStartupRecoveryOptions {
+  /** LabRunner (or ContainerSupervisor) instance to hand reclaimed `lab_containers` to (defaults to `getSharedLabRunner()`). */
+  labRunner?: StartupRecoveryLabRunner
+  /** Injectable clock for deterministic crash-recovery tests. */
+  now?: number
+  /** Forwarded to `labRunner.recoverOnStartup(...)` / `ensureStartupRecovery(...)`. */
+  includeLiveOwners?: boolean
+  /** Re-run recovery even if this `AppRuntime` already completed startup recovery once. */
+  force?: boolean
+}
+
+export interface AppRuntimeStartupRecoveryReport {
+  storeReport: RecoveryReport
+  reclaimedContainers: ReclaimedLabContainerRef[]
+  labResults: LabRecoveryResult[]
+  alreadyRecovered: boolean
+}
+
 const APP_RUNTIME_SYMBOL = Symbol.for('kovo.appRuntime')
 const STORE_SINGLETON_SYMBOL = Symbol.for('kovo.storeSingleton')
 
@@ -93,7 +119,7 @@ function getSharedStoreSlot(dir: string): Store {
   }
   let existing = registry.get(resolvedDir)
   if (!existing) {
-    existing = new Store(resolvedDir)
+    existing = new Store(resolvedDir, { autoRecover: false })
     registry.set(resolvedDir, existing)
   }
   return existing
@@ -117,6 +143,8 @@ export class AppRuntime {
   private readonly disposers = new Map<string, () => void | Promise<void>>()
   private disposed = false
   private disposePromise: Promise<AppRuntimeDisposeReport> | null = null
+  private startupRecoveryPromise: Promise<AppRuntimeStartupRecoveryReport> | null = null
+  private startupRecovered = false
 
   constructor(options: AppRuntimeOptions = {}) {
     this.dataDir = resolve(options.dataDir ?? dataDirectory())
@@ -176,7 +204,7 @@ export class AppRuntime {
       return this.storeInstance
     }
     if (!this.storeInstance) {
-      this.storeInstance = this.storeFactory ? this.storeFactory(this.dataDir) : new Store(this.dataDir)
+      this.storeInstance = this.storeFactory ? this.storeFactory(this.dataDir) : new Store(this.dataDir, { autoRecover: false })
       if (this.maintenanceEnabled && this.autoStartMaintenance) {
         this.ensureMaintenanceStarted()
       }
@@ -255,6 +283,57 @@ export class AppRuntime {
       if (this.maintenanceEnabled && this.autoStartMaintenance) {
         this.ensureMaintenanceStarted()
       }
+    }
+  }
+
+  /**
+   * Authoritative startup crash-recovery contract (`R3-20`):
+   *  1. Reconciles persisted SQLite state across ALL 7 `RunStatus` values via `store.recover()`.
+   *  2. Combines any stashed pre-attached reclaimed `lab_containers` rows with those reclaimed now.
+   *  3. Hands every reclaimed container row to `labRunner.ensureStartupRecovery(store, { persistedContainers })`
+   *     so web, CLI, and test entry points never leak Docker lab containers after a crash.
+   * Coalesces concurrent calls and is idempotent across restarts (pass `{ force: true }` to re-run).
+   */
+  startupRecover(options: AppRuntimeStartupRecoveryOptions = {}): Promise<AppRuntimeStartupRecoveryReport> {
+    this.assertNotDisposed()
+    if (!options.force && this.startupRecoveryPromise) {
+      return this.startupRecoveryPromise.then(report => ({
+        ...report,
+        alreadyRecovered: this.startupRecovered,
+      }))
+    }
+    const task = this.performStartupRecover(options)
+    this.startupRecoveryPromise = task
+    return task
+  }
+
+  private async performStartupRecover(
+    options: AppRuntimeStartupRecoveryOptions,
+  ): Promise<AppRuntimeStartupRecoveryReport> {
+    const storeInstance = this.store
+    const stashed = consumeStoreStartupReclaimedContainers(storeInstance)
+    const storeReport = storeInstance.recover(options.now)
+    const dedup = new Map<string, ReclaimedLabContainerRef>()
+    for (const ref of [...stashed, ...storeReport.reclaimedContainers]) {
+      dedup.set(`${ref.runId}\0${ref.containerName}`, ref)
+    }
+    const reclaimedContainers = [...dedup.values()]
+    const labRunner: StartupRecoveryLabRunner = options.labRunner ?? getSharedLabRunner()
+    const labOpts = {
+      persistedContainers: reclaimedContainers,
+      ...(options.includeLiveOwners !== undefined ? { includeLiveOwners: options.includeLiveOwners } : {}),
+    }
+    const labResults = labRunner.recoverOnStartup
+      ? await labRunner.recoverOnStartup(storeInstance, labOpts)
+      : labRunner.ensureStartupRecovery
+        ? await labRunner.ensureStartupRecovery(storeInstance, labOpts)
+        : []
+    this.startupRecovered = true
+    return {
+      storeReport,
+      reclaimedContainers,
+      labResults,
+      alreadyRecovered: false,
     }
   }
 

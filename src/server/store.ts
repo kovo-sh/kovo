@@ -24,6 +24,7 @@ import { FindingCodec } from './finding-codec.ts'
 import { cancelOobDrainForRun, isDeletedRunRaceError, isOobDrainActive } from './oob-drain.ts'
 import { listProjectPersonas } from './persona-vault.ts'
 import { deriveRunActivity, isRunDeleteBlocked, isTerminalRunStatus, type RunActivity } from './run-status.ts'
+import { recordStoreStartupReclaimedContainers } from './lifecycle.ts'
 import * as tables from './schema.ts'
 import { FindingsRepository } from './store-findings.ts'
 import { ProjectsRepository } from './store-projects.ts'
@@ -1554,8 +1555,7 @@ export class Store {
   private ftsAvailable = false
   /** True whenever the FTS5 virtual table exists, even if the active mode is `off`. */
   private ftsTableExists = false
-
-  constructor(directory: string, options: StoreOptions = {}) {
+  constructor(directory: string, options: StoreOptions & { autoRecover?: boolean } = {}) {
     this.directory = directory
     const requestedMode = options.ftsMode ?? DEFAULT_FTS_MODE
     if (!ftsModes.includes(requestedMode)) {
@@ -1647,7 +1647,7 @@ export class Store {
       this.projectsRepo = new ProjectsRepository(this.session)
       this.findingsRepo = new FindingsRepository(this.session)
       this.runsRepo = new RunsRepository(this.session, this.projectsRepo, this.findingsRepo)
-      this.recover()
+      if (options.autoRecover !== false) recordStoreStartupReclaimedContainers(this, this.recover().reclaimedContainers)
     } catch (error) {
       if (rawClient) {
         try { rawClient.close() } catch { /* teardown is best-effort */ }

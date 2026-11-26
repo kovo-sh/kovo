@@ -60,9 +60,48 @@ export interface RunDrainReport {
   alreadyDisposed: boolean
 }
 
+export type RunResourceHoldState = 'running' | 'paused' | 'budget_paused' | 'waiting'
+
+export interface RunResourceDescriptor {
+  /**
+   * Non-terminal run states in which this resource stays active instead of suspending.
+   * Defaults to `['running', 'paused', 'budget_paused', 'waiting']` so lab targets and
+   * pending OOB subscriptions remain held across pause/resume by default.
+   * Pass `holdIn: ['running']` (e.g. warm worker pool) to suspend on pause.
+   */
+  holdIn?: readonly RunResourceHoldState[]
+  /** Optional hook executed when the run enters a non-terminal state outside `holdIn`. */
+  suspend?: () => void | Promise<void>
+  /** Optional hook executed when the run re-enters a state in `holdIn` after being suspended. */
+  resume?: () => void | Promise<void>
+  /** Mandatory terminal teardown hook executed during `drainAndDispose()`. */
+  dispose: () => void | Promise<void>
+}
+
+export type RunResourceRegistration = (() => void | Promise<void>) | RunResourceDescriptor
+
+export interface RunResourceTransitionReport {
+  runId: string
+  targetState: RunResourceHoldState
+  suspended: string[]
+  resumed: string[]
+  errors: Array<{ name: string; action: 'suspend' | 'resume'; error: string }>
+}
+
+const DEFAULT_RESOURCE_HOLD_STATES: readonly RunResourceHoldState[] = [
+  'running',
+  'paused',
+  'budget_paused',
+  'waiting',
+]
+
 interface RegisteredResource {
   name: string
+  holdIn: ReadonlySet<RunResourceHoldState>
+  suspend?: () => void | Promise<void>
+  resume?: () => void | Promise<void>
   dispose: () => void | Promise<void>
+  suspended: boolean
 }
 
 interface TrackedTask {
@@ -87,6 +126,8 @@ export class RunContext {
   private releaseParentSignal: (() => void) | null = null
   private disposed = false
   private disposePromise: Promise<RunDrainReport> | null = null
+  private currentHoldState: RunResourceHoldState = 'running'
+  private resourceTransitionQueue: Promise<void> = Promise.resolve()
 
   constructor(options: RunContextOptions) {
     this.runId = assertValidRunId(options.runId, 'RunContext')
@@ -145,6 +186,20 @@ export class RunContext {
     return this.tasks.size
   }
 
+  /** Names of currently suspended pause-aware resources (e.g. warm pool while paused). */
+  get suspendedResourceNames(): string[] {
+    const out: string[] = []
+    for (const entry of this.resources.values()) {
+      if (entry.suspended) out.push(entry.name)
+    }
+    return out
+  }
+
+  /** Await any in-flight `reconcileResourcesForState()` suspend/resume transitions. */
+  whenResourcesSettled(): Promise<void> {
+    return this.resourceTransitionQueue
+  }
+
   /** Abort this run immediately with an optional reason. */
   abort(reason?: unknown): void {
     if (!this.abortController.signal.aborted) {
@@ -161,14 +216,18 @@ export class RunContext {
   }
 
   /**
-   * Register a disposable resource (vault eviction, browser context close, OOB unsubscribe, timer).
+   * Register a disposable (and optionally pause-aware) resource such as vault eviction,
+   * browser context close, OOB unsubscribe, warm pool, lab target, or timer.
    * Returns an unregister callback for resources that close cleanly before `drainAndDispose()`.
    */
-  registerResource(name: string, disposeFn: () => void | Promise<void>): () => void {
+  registerResource(name: string, disposeOrDescriptor: RunResourceRegistration): () => void {
     const label = name.trim() || 'resource'
+    const descriptor: RunResourceDescriptor = typeof disposeOrDescriptor === 'function'
+      ? { dispose: disposeOrDescriptor }
+      : disposeOrDescriptor
     if (this.disposed || this.disposePromise) {
       try {
-        const maybePromise = disposeFn()
+        const maybePromise = descriptor.dispose()
         if (maybePromise && typeof (maybePromise as Promise<void>).catch === 'function') {
           void (maybePromise as Promise<void>).catch(() => undefined)
         }
@@ -177,11 +236,112 @@ export class RunContext {
       }
       return () => {}
     }
+    const holdIn = new Set<RunResourceHoldState>(
+      descriptor.holdIn && descriptor.holdIn.length > 0
+        ? descriptor.holdIn
+        : DEFAULT_RESOURCE_HOLD_STATES,
+    )
     const id = this.nextResourceId++
-    this.resources.set(id, { name: label, dispose: disposeFn })
+    const entry: RegisteredResource = {
+      name: label,
+      holdIn,
+      suspend: descriptor.suspend,
+      resume: descriptor.resume,
+      dispose: descriptor.dispose,
+      suspended: false,
+    }
+    this.resources.set(id, entry)
+    if (!holdIn.has(this.currentHoldState)) {
+      entry.suspended = true
+      if (entry.suspend) {
+        const suspendFn = entry.suspend
+        this.resourceTransitionQueue = this.resourceTransitionQueue.then(async () => {
+          try { await suspendFn() } catch { /* best-effort initial suspension */ }
+        })
+      }
+    }
     return () => {
       this.resources.delete(id)
     }
+  }
+
+  /**
+   * Reconcile registered pause-aware resources against `targetState`:
+   *  - Resources whose `holdIn` excludes `targetState` suspend (`suspend()` hook).
+   *  - Previously suspended resources whose `holdIn` includes `targetState` resume (`resume()` hook).
+   * Resources without `holdIn` stay held across pause/budget_paused/waiting by default.
+   */
+  reconcileResourcesForState(targetState: RunResourceHoldState): Promise<RunResourceTransitionReport> {
+    this.currentHoldState = targetState
+    const runTransition = async (): Promise<RunResourceTransitionReport> => {
+      const report: RunResourceTransitionReport = {
+        runId: this.runId,
+        targetState,
+        suspended: [],
+        resumed: [],
+        errors: [],
+      }
+      if (this.disposed || this.disposePromise) return report
+
+      const toSuspend: RegisteredResource[] = []
+      const toResume: RegisteredResource[] = []
+      for (const entry of this.resources.values()) {
+        const shouldHold = entry.holdIn.has(targetState)
+        if (!shouldHold && !entry.suspended) {
+          entry.suspended = true
+          toSuspend.push(entry)
+        } else if (shouldHold && entry.suspended) {
+          entry.suspended = false
+          toResume.push(entry)
+        }
+      }
+
+      if (toSuspend.length > 0) {
+        const outcomes = await Promise.allSettled(
+          toSuspend.map(entry => Promise.resolve().then(() => entry.suspend?.())),
+        )
+        for (let i = 0; i < outcomes.length; i += 1) {
+          const outcome = outcomes[i]!
+          const entry = toSuspend[i]!
+          if (outcome.status === 'fulfilled') {
+            report.suspended.push(entry.name)
+          } else {
+            const err = outcome.reason
+            report.errors.push({
+              name: entry.name,
+              action: 'suspend',
+              error: err instanceof Error ? err.message : String(err),
+            })
+          }
+        }
+      }
+
+      if (toResume.length > 0) {
+        const outcomes = await Promise.allSettled(
+          toResume.map(entry => Promise.resolve().then(() => entry.resume?.())),
+        )
+        for (let i = 0; i < outcomes.length; i += 1) {
+          const outcome = outcomes[i]!
+          const entry = toResume[i]!
+          if (outcome.status === 'fulfilled') {
+            report.resumed.push(entry.name)
+          } else {
+            const err = outcome.reason
+            report.errors.push({
+              name: entry.name,
+              action: 'resume',
+              error: err instanceof Error ? err.message : String(err),
+            })
+          }
+        }
+      }
+
+      return report
+    }
+
+    const next = this.resourceTransitionQueue.then(runTransition, runTransition)
+    this.resourceTransitionQueue = next.then(() => undefined, () => undefined)
+    return next
   }
 
   /** Convenience helper to register a Node timeout/interval timer for guaranteed cleanup. */

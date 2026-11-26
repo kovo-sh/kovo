@@ -10,7 +10,7 @@ import { createHash } from 'node:crypto'
 import { lstatSync, readdirSync, rmdirSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import { collectProtectedEvidenceIdsForRun } from './evidence-citations.ts'
-import { isTerminalRunStatus } from './run-status.ts'
+import { isEligibleForArtifactTtlPurge, isTerminalRunStatus } from './run-status.ts'
 import type { Store } from './store.ts'
 
 export { isTerminalRunStatus }
@@ -217,7 +217,7 @@ export function purgeExpiredArtifacts(
   const isRunEligible = (row: { id: string; status: string }): boolean => {
     if (!skipNonTerminal) return true
     if (policy.activeRunIds?.has(row.id)) return false
-    return isTerminalRunStatus(row.status)
+    return isEligibleForArtifactTtlPurge(row.status)
   }
 
   // 1. Resolve candidate runs respecting optional runId, tenantId, and strict terminal-run safety.

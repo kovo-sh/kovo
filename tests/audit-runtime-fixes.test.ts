@@ -322,7 +322,8 @@ test('H1: RunActor reconciles multi-hop phase jumps, refreshes on resume-after-s
   assert.equal(actorJump2.state, 'completed')
   await ctxJump2.dispose()
 
-  // 2. Resume-after-stop refreshes a terminal/draining actor instead of wedging spawnRunTask.
+  // 2. Resume-after-disposal refreshes a draining/disposed actor instead of wedging spawnRunTask.
+  //    And terminal runs (`complete`, `stopped`, `failed`) refuse `resume` (`R3-20`).
   const { runId } = createApprovedRun(store, { phase: 'investigation', tenantId: 'tenant-h1-a' })
   const priv = exec as unknown as {
     ensureRunActor: (id: string) => RunActor
@@ -332,9 +333,9 @@ test('H1: RunActor reconciles multi-hop phase jumps, refreshes on resume-after-s
   // Keep investigation parked so we inspect the live resumed RunActor before auto-completion.
   priv.driveInvestigation = () => {}
   const actor1 = priv.ensureRunActor(runId)
-  store.command(runCommand.parse({ requestId: randomUUID(), runId, action: 'stop' }))
+  store.command(runCommand.parse({ requestId: randomUUID(), runId, action: 'pause' }))
+  await exec.disposeRun(runId, { terminalState: 'canceled', reason: 'simulate drained actor before resume' })
   exec.wake()
-  // Immediately resume while disposal may still be settling.
   store.command(runCommand.parse({ requestId: randomUUID(), runId, action: 'resume' }))
   assert.equal(store.run(runId).status, 'running')
   exec.wake()
@@ -349,13 +350,25 @@ test('H1: RunActor reconciles multi-hop phase jumps, refreshes on resume-after-s
     assert.equal(signal.aborted, false)
     ranAfterResume = true
   }).promise
-  assert.equal(ranAfterResume, true, 'spawnRunTask must execute on fresh actor after stop+resume')
+  assert.equal(ranAfterResume, true, 'spawnRunTask must execute on fresh actor after pause+dispose+resume')
 
-  // Completed runs cannot be resumed.
+  // Terminal runs (`complete`, `stopped`, `failed`) cannot be resumed.
   const { runId: completeRunId } = createApprovedRun(store, { phase: 'complete' })
   assert.throws(
     () => store.command(runCommand.parse({ requestId: randomUUID(), runId: completeRunId, action: 'resume' })),
-    /Completed runs cannot be resumed|not paused or stopped/i,
+    /Completed runs cannot be resumed|not paused|terminal/i,
+  )
+  const { runId: stoppedRunId } = createApprovedRun(store, { phase: 'investigation', tenantId: 'tenant-h1-a' })
+  store.command(runCommand.parse({ requestId: randomUUID(), runId: stoppedRunId, action: 'stop' }))
+  assert.throws(
+    () => store.command(runCommand.parse({ requestId: randomUUID(), runId: stoppedRunId, action: 'resume' })),
+    /terminal|cannot be resumed/i,
+  )
+  const { runId: failedRunId } = createApprovedRun(store, { phase: 'investigation', tenantId: 'tenant-h1-a' })
+  store.setStatus(store.run(failedRunId), 'failed')
+  assert.throws(
+    () => store.command(runCommand.parse({ requestId: randomUUID(), runId: failedRunId, action: 'resume' })),
+    /terminal|cannot be resumed/i,
   )
 
   // 3. Kill-switch trip pauses matching tenant's SQLite run and prevents wake() hot-loop dispatch.

@@ -47,6 +47,7 @@ import { CanaryBroker, scanSecondOrderMarkers, type SecondOrderStore } from './c
 import { hasCuratedAdvisory, queryCves } from './cve-broker.ts'
 import { DerivedCapabilityVault, resetRunCustodyBudgets } from './derived-custody.ts'
 import { runAllRunDisposers, settleOrReport, settleOrReportAsync } from './run-disposers.ts'
+import { emitRunLivenessViolations } from './lifecycle.ts'
 import { AssignmentClaimRegistry, claimAssignment, purgeActiveJobsForRun, reapOrphanedRunningAssignments, type ClaimHandle } from './assignment-claim.ts'
 import { normalizeEndpointTemplate } from './dedupe.ts'
 import {
@@ -429,10 +430,10 @@ export class Execution {
   private readonly budgetTracker: PhaseRequestBudgetTracker
   private readonly runtime: AppRuntime
   private readonly ownsLabRunner: boolean
-  /** Explicit per-run `RunActor` FSM + structured `TaskSupervisor` registry. */
   private readonly actors = new Map<string, RunActor>()
   private readonly timedOutActors = new Map<string, RunActor>()
   private readonly disposingRuns = new Map<string, Promise<RunDrainReport | null>>()
+  private readonly livenessEmittedByRun = new Map<string, Set<string>>()
   private readonly maintenanceTasks = new Set<Promise<unknown>>()
   private releaseRejectionGuard: (() => void) | null = null
   private unregisterRuntimeDisposer: (() => void) | null = null
@@ -807,6 +808,7 @@ export class Execution {
     unregisterScopedBrowserForRun(runId)
     resetRunCustodyBudgets(runId)
     runAllRunDisposers(runId)
+    this.livenessEmittedByRun.delete(runId)
     if (!actor || this.actors.get(runId) === actor) this.actors.delete(runId)
   }
 
@@ -897,25 +899,18 @@ export class Execution {
         this.runAuthInFlight.delete(runId)
       }
     })
-    actor.registerResource('lab:stop', async () => {
-      if (!this.startedLabRuns.has(runId) && !this.startedLabHandles.has(runId)) return
-      this.startedLabRuns.delete(runId)
-      this.startedLabHandles.delete(runId)
-      await this.labRunner.stopLabTarget(runId).catch(() => undefined)
+    actor.registerResource('lab:stop', {
+      holdIn: ['running', 'paused', 'budget_paused', 'waiting'],
+      dispose: async () => {
+        if (!this.startedLabRuns.has(runId) && !this.startedLabHandles.has(runId)) return
+        this.startedLabRuns.delete(runId); this.startedLabHandles.delete(runId)
+        await this.labRunner.stopLabTarget(runId).catch(() => undefined)
+      },
     })
-    actor.registerResource('warm-pool:evict', async () => {
-      await settleOrReportAsync(runId, 'warm_pool.evict', async () => { await this.backend.evictRunWarmPool?.(runId) }, (id, k, m, d) => this.safeEvent(id, k, m, d))
-    })
-    actor.registerResource('oob:canary-unsubscribe', () => {
-      try { this.canaryBroker.unsubscribeRun(runId) } catch { /* ignore */ }
-    })
-    actor.registerResource('trace:close', () => {
-      const trace = this.runTraces.get(runId)
-      if (trace) {
-        this.runTraces.delete(runId)
-        try { trace.closeTrace() } catch { /* ignore */ }
-      }
-    })
+    const evictWarmPool = async (kind: string) => { await settleOrReportAsync(runId, kind, async () => { await this.backend.evictRunWarmPool?.(runId) }, (id, k, m, d) => this.safeEvent(id, k, m, d)) }
+    actor.registerResource('warm-pool:evict', { holdIn: ['running'], suspend: () => evictWarmPool('warm_pool.suspend'), dispose: () => evictWarmPool('warm_pool.evict') })
+    actor.registerResource('oob:canary-unsubscribe', { holdIn: ['running', 'paused', 'budget_paused', 'waiting'], dispose: () => { try { this.canaryBroker.unsubscribeRun(runId) } catch { /* ignore */ } } })
+    actor.registerResource('trace:close', () => { const trace = this.runTraces.get(runId); if (trace) { this.runTraces.delete(runId); try { trace.closeTrace() } catch { /* ignore */ } } })
     actor.registerResource('broker-custody:dispose', () => { this.broker.disposeRun(runId); resetRunCustodyBudgets(runId) })
     actor.registerResource('run-state:cleanup', () => {
       this.cleanupRunState(runId, actor)
@@ -1030,6 +1025,7 @@ export class Execution {
     this.safetyTimer = setInterval(() => this.wake(), 2_000)
     this.safetyTimer.unref()
     const reclaim = () => {
+      void this.runtime.startupRecover({ labRunner: this.labRunner }).catch(() => undefined)
       if (this.backend instanceof LinuxWorkerBackend) {
         void this.backend.reclaimInactive().catch(() => { /* retry on next cycle */ })
       }
@@ -1835,10 +1831,7 @@ export class Execution {
           if ((current.status === 'complete' || current.phase === 'complete') && this.hasActiveRetest(runId)) {
             continue
           }
-          const terminalState: TerminalRunActorState =
-            current.status === 'failed' ? 'failed'
-              : current.status === 'stopped' ? 'canceled'
-                : 'completed'
+          const terminalState: TerminalRunActorState = current.status === 'failed' ? 'failed' : current.status === 'stopped' ? 'canceled' : 'completed'
           this.evictCapabilityVault(runId)
           this.scheduleRunDisposal(runId, terminalState, `run ${current.status}`)
         } else {
@@ -1846,8 +1839,10 @@ export class Execution {
           if (actor && !actor.isTerminal && actor.state !== 'stopping') {
             const targetState = deriveRunActorState(current)
             actor.reconcileWithPersisted(targetState, `wake:${current.status}:${current.phase}`)
+            if (current.status === 'paused' || current.status === 'budget_paused') this.trackMaintenance(actor.context.reconcileResourcesForState(current.status))
           }
         }
+        emitRunLivenessViolations(this.storage, current, new Set(this.active.keys()), this.livenessEmittedByRun, (id, k, m, d) => this.safeEvent(id, k, m, d))
       } catch {
         this.evictCapabilityVault(runId)
         this.scheduleRunDisposal(runId, 'canceled', 'run unavailable')
@@ -1931,6 +1926,7 @@ export class Execution {
       this.ensureVariantSweepsForConfirmedFindings(run)
       this.routeOperatorBoardMessages(run)
       this.reapOrphanedAssignments(run)
+      emitRunLivenessViolations(this.storage, run, new Set(this.active.keys()), this.livenessEmittedByRun, (id, k, m, d) => this.safeEvent(id, k, m, d))
 
       if (profiles.length) {
         this.reconPlanner.startCoordinator(run, profiles)

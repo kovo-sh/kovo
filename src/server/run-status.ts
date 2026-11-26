@@ -223,6 +223,76 @@ export function isNonTerminalRunStatus(status: string | null | undefined): boole
   return normalized !== null && NON_TERMINAL_RUN_STATUS_SET.has(normalized)
 }
 
+/**
+ * R3-20 product decision: `'stopped'` and `'failed'` are strictly terminal (alongside `'complete'`),
+ * matching `TERMINAL_RUN_STATUSES`, `artifact-ttl.ts`, `storage-maintenance.ts`, and `RunActor`.
+ * Only `'paused'` and `'budget_paused'` runs can be resumed.
+ */
+export function canResumeRunStatus(status: RunStatus | string | null | undefined): boolean {
+  const normalized = normalizeStatus(status)
+  if (!normalized || !isCanonicalRunStatus(normalized)) return false
+  switch (normalized) {
+    case 'paused':
+    case 'budget_paused':
+      return true
+    case 'waiting':
+    case 'running':
+    case 'stopped':
+    case 'failed':
+    case 'complete':
+      return false
+    default:
+      return assertNever(normalized, 'Unhandled RunStatus')
+  }
+}
+
+/**
+ * True when a run can transition back to active execution via the `resume` command.
+ * Strictly disjoint from `isTerminalRunStatus()` and `isEligibleForArtifactTtlPurge()`.
+ */
+export function canResumeRun(run: {
+  status: RunStatus | string | null | undefined
+  phase?: string | null
+}): boolean {
+  if (run.phase === 'complete') return false
+  return canResumeRunStatus(run.status)
+}
+
+/**
+ * True when the UI header should render the direct `Resume` button (`'paused'` runs;
+ * `'budget_paused'` renders `Raise budget` which resumes on raise; terminal runs render `Report`).
+ */
+export function canOfferResumeButton(run: {
+  status: RunStatus | string | null | undefined
+  phase?: string | null
+}): boolean {
+  if (run.phase === 'complete') return false
+  const normalized = normalizeStatus(run.status)
+  if (!normalized || !isCanonicalRunStatus(normalized)) return false
+  switch (normalized) {
+    case 'paused':
+      return true
+    case 'waiting':
+    case 'running':
+    case 'budget_paused':
+    case 'stopped':
+    case 'failed':
+    case 'complete':
+      return false
+    default:
+      return assertNever(normalized, 'Unhandled RunStatus')
+  }
+}
+
+/**
+ * Single authoritative retention/GC eligibility predicate shared by `artifact-ttl.ts` and
+ * `storage-maintenance.ts`. Structurally guarantees TTL purge and orphan sweeps NEVER select
+ * any run that `canResumeRun()` or the UI `Resume` button offers to resume.
+ */
+export function isEligibleForArtifactTtlPurge(status: RunStatus | string | null | undefined): boolean {
+  return isTerminalRunStatus(status) && !canResumeRunStatus(status)
+}
+
 // ---------------------------------------------------------------------------
 // Canonical WorkerStatus predicates (compile-time exhaustive)
 // ---------------------------------------------------------------------------

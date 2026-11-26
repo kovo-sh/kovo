@@ -1423,6 +1423,7 @@ async function main() {
   }
 
   initialize({ dataDir: directory, killSwitchFilePath })
+  await runtime.startupRecover().catch(() => undefined)
 
   const sharedStore = store()
   const sharedKillSwitch = configureGlobalKillSwitch({
