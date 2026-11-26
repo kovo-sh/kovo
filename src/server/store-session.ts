@@ -994,12 +994,18 @@ export class StoreSession implements DbSession {
   private readonly emitter: EventEmitter
   private readonly listPersonasFn: (projectId: string) => PublicPersona[]
   private _txDepth = 0
+  /** Deferred emitter callbacks per transaction nesting frame (flushed on outermost COMMIT, dropped on ROLLBACK). */
+  private deferredEmitStack: Array<Array<() => void>> = []
   /** Bounded async write queue for broker exchanges (flushed by microtask/size boundary). */
   private pendingExchanges: PendingExchangeWrite[] = []
+  private readonly exchangeAttempts = new WeakMap<PendingExchangeWrite, number>()
+  private readonly deadLetterExchanges: Array<{ item: PendingExchangeWrite; error: string; at: number }> = []
   private flushScheduled = false
   private _flushing = false
   private flushError: unknown = null
   private static readonly maxPendingExchanges = 128
+  private static readonly maxPoisonItemAttempts = 2
+  private static readonly maxDeadLetterExchanges = 256
 
   constructor(config: StoreSessionConfig) {
     this.db = config.db
@@ -1119,6 +1125,32 @@ export class StoreSession implements DbSession {
     return { journalMode, busyTimeoutMs }
   }
 
+  /** Inspect dead-lettered poison exchange writes (diagnostics & tests). */
+  getDeadLetterExchanges(): ReadonlyArray<{ item: PendingExchangeWrite; error: string; at: number }> {
+    return this.deadLetterExchanges
+  }
+
+  private recordDeadLetter(item: PendingExchangeWrite, error: unknown): void {
+    const base = error instanceof Error ? error.message : String(error)
+    const cause = error && typeof error === 'object' && 'cause' in error
+      ? (error as { cause?: unknown }).cause
+      : undefined
+    const causeMsg = cause instanceof Error ? cause.message : typeof cause === 'string' ? cause : ''
+    const message = causeMsg && !base.includes(causeMsg) ? `${base}: ${causeMsg}` : base
+    this.deadLetterExchanges.push({ item, error: message, at: Date.now() })
+    if (this.deadLetterExchanges.length > StoreSession.maxDeadLetterExchanges) {
+      this.deadLetterExchanges.shift()
+    }
+  }
+
+  private scheduleEmit(fn: () => void): void {
+    if (this._txDepth > 0 && this.deferredEmitStack.length > 0) {
+      this.deferredEmitStack[this.deferredEmitStack.length - 1]!.push(fn)
+      return
+    }
+    queueMicrotask(fn)
+  }
+
   /**
    * Durably flush every queued exchange write. Called by tests, teardown, snapshot capture and
    * every read-after-write path (`getExchange`, `runDetail`, `searchExchanges`, report authoring).
@@ -1142,6 +1174,7 @@ export class StoreSession implements DbSession {
         begun = true
         const inserted = this.applyExchangeBatch(batch)
         withBusyRetry(() => this.client.exec('COMMIT'))
+        // Successful flush recovers cleanly; clear any stale priorError.
         this.emitExchangeEvents(inserted)
       } catch (error) {
         if (begun) {
@@ -1150,48 +1183,47 @@ export class StoreSession implements DbSession {
           this.pendingExchanges.unshift(...batch)
           throw error
         }
-        // M-16: never poison the shared SQLite write queue when one run in a multi-run batch
-        // was deleted concurrently. Isolate per item: commit live-run rows, drop dead-run FK
-        // rows, and rethrow only genuine non-deleted-run storage errors.
-        if (isDeadRunFkError(error)) {
-          if (batch.length > 1) {
-            const failedItems: PendingExchangeWrite[] = []
-            let nonFkError: unknown = null
-            for (const item of batch) {
-              let itemBegun = false
-              try {
-                withBusyRetry(() => this.client.exec('BEGIN IMMEDIATE'))
-                itemBegun = true
-                const inserted = this.applyExchangeBatch([item])
-                withBusyRetry(() => this.client.exec('COMMIT'))
-                this.emitExchangeEvents(inserted)
-              } catch (itemError) {
-                if (itemBegun) {
-                  try { this.client.exec('ROLLBACK') } catch { /* ignore */ }
-                }
-                if (isDeadRunFkError(itemError)) {
-                  // Dead run / deleted assignment: drop this stale write cleanly.
-                  continue
-                }
-                failedItems.push(item)
-                nonFkError ??= itemError
-              }
+        // M-16 & M1: isolate per item on BOTH dead-run FK errors and non-FK poison rows so one
+        // bad row never head-of-line blocks healthy sibling writes or wedges unrelated readers.
+        const requeuedItems: PendingExchangeWrite[] = []
+        let firstError: unknown = null
+        for (const item of batch) {
+          let itemBegun = false
+          try {
+            withBusyRetry(() => this.client.exec('BEGIN IMMEDIATE'))
+            itemBegun = true
+            const inserted = this.applyExchangeBatch([item])
+            withBusyRetry(() => this.client.exec('COMMIT'))
+            this.emitExchangeEvents(inserted)
+          } catch (itemError) {
+            if (itemBegun) {
+              try { this.client.exec('ROLLBACK') } catch { /* ignore */ }
             }
-            if (failedItems.length > 0) {
-              this.pendingExchanges.unshift(...failedItems)
-              throw nonFkError
+            if (isDeadRunFkError(itemError)) {
+              // Dead run / deleted assignment: drop this stale write cleanly.
+              continue
+            }
+            const msg = itemError instanceof Error ? itemError.message : String(itemError)
+            const isTransientLock = /SQLITE_BUSY|database is locked/i.test(msg)
+            const attempts = (this.exchangeAttempts.get(item) ?? 0) + 1
+            this.exchangeAttempts.set(item, attempts)
+            if (isTransientLock || attempts < StoreSession.maxPoisonItemAttempts) {
+              requeuedItems.push(item)
+              firstError ??= itemError
+            } else {
+              // Repeated non-FK poison row: dead-letter it instead of infinite head-of-line blocking.
+              this.recordDeadLetter(item, itemError)
             }
           }
-          // Single-item dead-run FK write is dropped cleanly without poisoning future flushes.
-        } else {
-          this.pendingExchanges.unshift(...batch)
-          throw error
+        }
+        if (requeuedItems.length > 0) {
+          this.pendingExchanges.unshift(...requeuedItems)
+          throw firstError ?? error
         }
       }
     } finally {
       this._flushing = false
     }
-    if (priorError) throw priorError
   }
 
   /** Queue one fully-redacted exchange row, flushing synchronously at the bounded size boundary. */
@@ -1225,7 +1257,7 @@ export class StoreSession implements DbSession {
 
   private emitExchangeEvents(inserted: readonly (typeof tables.events.$inferSelect)[]): void {
     if (!inserted.length) return
-    queueMicrotask(() => {
+    this.scheduleEmit(() => {
       for (const event of inserted) {
         this.emitter.emit('run:' + event.runId, {
           id: event.id,
@@ -1293,22 +1325,36 @@ export class StoreSession implements DbSession {
         this._txDepth -= 1
         throw error
       }
+      const frame: Array<() => void> = []
+      this.deferredEmitStack.push(frame)
+      let committed = false
       try {
         const result = fn()
         withBusyRetry(() => this.client.exec('COMMIT'))
+        committed = true
         return result
       } catch (error) {
         try { this.client.exec('ROLLBACK') } catch { /* ignore */ }
         throw error
       } finally {
+        this.deferredEmitStack.pop()
         this._txDepth -= 1
+        if (committed && frame.length > 0) {
+          queueMicrotask(() => {
+            for (const cb of frame) cb()
+          })
+        }
       }
     }
     const sp = `sp_${++this._txDepth}`
     this.client.exec(`SAVEPOINT ${sp}`)
+    const childFrame: Array<() => void> = []
+    this.deferredEmitStack.push(childFrame)
+    let released = false
     try {
       const result = fn()
       this.client.exec(`RELEASE SAVEPOINT ${sp}`)
+      released = true
       return result
     } catch (error) {
       try {
@@ -1317,7 +1363,18 @@ export class StoreSession implements DbSession {
       } catch { /* ignore */ }
       throw error
     } finally {
+      this.deferredEmitStack.pop()
       this._txDepth -= 1
+      if (released && childFrame.length > 0) {
+        const parent = this.deferredEmitStack[this.deferredEmitStack.length - 1]
+        if (parent) {
+          parent.push(...childFrame)
+        } else {
+          queueMicrotask(() => {
+            for (const cb of childFrame) cb()
+          })
+        }
+      }
     }
   }
 
@@ -1351,7 +1408,7 @@ export class StoreSession implements DbSession {
   }
 
   emitWake(): void {
-    queueMicrotask(() => { this.emitter.emit('wake') })
+    this.scheduleEmit(() => { this.emitter.emit('wake') })
   }
 
   event(runId: string | null, kind: string, message: string, detail: Record<string, unknown> = {}) {
@@ -1365,7 +1422,7 @@ export class StoreSession implements DbSession {
       detail: inserted.detail,
       createdAt: inserted.createdAt,
     }
-    queueMicrotask(() => {
+    this.scheduleEmit(() => {
       if (runId) this.emitter.emit('run:' + runId, payload)
       this.emitter.emit('wake')
     })
@@ -1385,7 +1442,7 @@ export class StoreSession implements DbSession {
     this.db.insert(tables.messages).values({
       id, runId, threadId, role, content: redact(content, secrets), replyTo, evidenceIds, createdAt: Date.now(),
     }).onConflictDoNothing().run()
-    queueMicrotask(() => {
+    this.scheduleEmit(() => {
       this.emitter.emit('run:' + runId, { id: 0, kind: 'message', message: '', detail: { threadId, role }, createdAt: Date.now() })
     })
     return id

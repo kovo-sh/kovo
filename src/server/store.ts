@@ -180,85 +180,92 @@ export class Store {
       this.processLock.close()
       throw new Error('Another Kovo Hunter server is using this data directory.')
     }
-    const path = join(directory, 'kovo.sqlite')
-    if (!existsSync(path)) {
-      try {
-        writeFileSync(path, '', { flag: 'wx', mode: 0o600 })
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
-      }
-    }
-    const rawClient = new DatabaseSync(path, { timeout: 5000 })
-    // v6 scale pragmas: WAL keeps readers non-blocking under the batched writer; NORMAL skips the
-    // per-commit fsync (WAL still guarantees a consistent DB across process crashes), and the
-    // busy timeout lets concurrent readers/snapshot copies wait instead of failing fast.
-    rawClient.exec(
-      'PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON;',
-    )
-    // Transparent read-after-write safety: any direct `client.prepare/exec` (including engine code
-    // and tests that bypass Store helpers) flushes queued exchanges first. Flush/transaction
-    // internals are guarded, so this never recurses.
-    this.client = new Proxy(rawClient, {
-      get: (target, property) => {
-        const value = Reflect.get(target, property, target)
-        if (typeof value !== 'function') return value
-        if (property === 'prepare' || property === 'exec') {
-          return (...args: unknown[]) => {
-            if (this.session && !this.session.isFlushing && this.session.txDepth === 0) {
-              this.session.flushNow()
-            }
-            return (value as (...params: unknown[]) => unknown).apply(target, args)
-          }
+    let rawClient: DatabaseSync | null = null
+    try {
+      const path = join(directory, 'kovo.sqlite')
+      if (!existsSync(path)) {
+        try {
+          writeFileSync(path, '', { flag: 'wx', mode: 0o600 })
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
         }
-        return value.bind(target)
-      },
-    }) as DatabaseSync
-    this.db = drizzle({ client: this.client })
-    this.initCoreSchema()
-    this.initV3Schema()
-    this.initV4Schema()
-    this.initV5Schema()
-    this.initV6Schema()
-    this.initV7Schema()
-    this.initV8Schema()
-    // v6.2 full-body FTS size guard: refuse to switch on an expensive index over a database that is
-    // already large unless the operator explicitly forced it. Release the process lock so a
-    // subsequent correctly-configured reopen can proceed.
-    if (this.ftsMode === 'full' && !options.forceFullFts) {
-      const dbBytes = safeFileSize(path)
-      if (dbBytes > this.maxFullFtsDbBytes) {
-        try { rawClient.close() } catch { /* teardown is best-effort */ }
-        try { this.processLock.exec('ROLLBACK') } catch { /* ignore */ }
-        try { this.processLock.close() } catch { /* ignore */ }
-        throw new FtsModeRefusedError(dbBytes, this.maxFullFtsDbBytes)
       }
+      rawClient = new DatabaseSync(path, { timeout: 5000 })
+      // v6 scale pragmas: WAL keeps readers non-blocking under the batched writer; NORMAL skips the
+      // per-commit fsync (WAL still guarantees a consistent DB across process crashes), and the
+      // busy timeout lets concurrent readers/snapshot copies wait instead of failing fast.
+      rawClient.exec(
+        'PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON;',
+      )
+      // Transparent read-after-write safety: any direct `client.prepare/exec` (including engine code
+      // and tests that bypass Store helpers) flushes queued exchanges first. Flush/transaction
+      // internals are guarded, so this never recurses.
+      this.client = new Proxy(rawClient, {
+        get: (target, property) => {
+          const value = Reflect.get(target, property, target)
+          if (typeof value !== 'function') return value
+          if (property === 'prepare' || property === 'exec') {
+            return (...args: unknown[]) => {
+              if (this.session && !this.session.isFlushing && this.session.txDepth === 0) {
+                this.session.flushNow()
+              }
+              return (value as (...params: unknown[]) => unknown).apply(target, args)
+            }
+          }
+          return value.bind(target)
+        },
+      }) as DatabaseSync
+      this.db = drizzle({ client: this.client })
+      this.initCoreSchema()
+      this.initV3Schema()
+      this.initV4Schema()
+      this.initV5Schema()
+      this.initV6Schema()
+      this.initV7Schema()
+      this.initV8Schema()
+      // v6.2 full-body FTS size guard: refuse to switch on an expensive index over a database that is
+      // already large unless the operator explicitly forced it. Release the process lock so a
+      // subsequent correctly-configured reopen can proceed.
+      if (this.ftsMode === 'full' && !options.forceFullFts) {
+        const dbBytes = safeFileSize(path)
+        if (dbBytes > this.maxFullFtsDbBytes) {
+          throw new FtsModeRefusedError(dbBytes, this.maxFullFtsDbBytes)
+        }
+      }
+      this.initFts()
+      const current = this.db.select().from(tables.workspaces).limit(1).get()
+      this.workspace = current ?? this.db.insert(tables.workspaces).values({
+        id: randomUUID(),
+        actorId: randomUUID(),
+        name: 'Personal workspace',
+        createdAt: Date.now(),
+      }).returning().get()
+      this.recordStoreSettings()
+      this.session = new StoreSession({
+        db: this.db,
+        client: this.client,
+        workspace: this.workspace,
+        directory: this.directory,
+        emitter: this.emitter,
+        ftsMode: this.ftsMode,
+        ftsMaxBodyBytes: this.ftsMaxBodyBytes,
+        maxFullFtsDbBytes: this.maxFullFtsDbBytes,
+        ftsAvailable: this.ftsAvailable,
+        ftsTableExists: this.ftsTableExists,
+        listProjectPersonas: projectId => listProjectPersonas(this, projectId),
+      })
+      this.projectsRepo = new ProjectsRepository(this.session)
+      this.findingsRepo = new FindingsRepository(this.session)
+      this.runsRepo = new RunsRepository(this.session, this.projectsRepo, this.findingsRepo)
+      this.recover()
+    } catch (error) {
+      if (rawClient) {
+        try { rawClient.close() } catch { /* teardown is best-effort */ }
+      }
+      try { this.processLock.exec('ROLLBACK') } catch { /* ignore */ }
+      try { this.processLock.close() } catch { /* ignore */ }
+      throw error
     }
-    this.initFts()
-    const current = this.db.select().from(tables.workspaces).limit(1).get()
-    this.workspace = current ?? this.db.insert(tables.workspaces).values({
-      id: randomUUID(),
-      actorId: randomUUID(),
-      name: 'Personal workspace',
-      createdAt: Date.now(),
-    }).returning().get()
-    this.recordStoreSettings()
-    this.session = new StoreSession({
-      db: this.db,
-      client: this.client,
-      workspace: this.workspace,
-      directory: this.directory,
-      emitter: this.emitter,
-      ftsMode: this.ftsMode,
-      ftsMaxBodyBytes: this.ftsMaxBodyBytes,
-      maxFullFtsDbBytes: this.maxFullFtsDbBytes,
-      ftsAvailable: this.ftsAvailable,
-      ftsTableExists: this.ftsTableExists,
-      listProjectPersonas: projectId => listProjectPersonas(this, projectId),
-    })
-    this.projectsRepo = new ProjectsRepository(this.session)
-    this.findingsRepo = new FindingsRepository(this.session)
-    this.runsRepo = new RunsRepository(this.session, this.projectsRepo, this.findingsRepo)
-    this.recover()
   }
 
   private existingColumns(table: string): Set<string> {
@@ -1629,14 +1636,47 @@ export class Store {
 
 export type StoreRunDetail = ReturnType<Store['runDetail']>
 
+export class RunDeleteBusyError extends Error {
+  readonly code = 'RUN_DELETE_BUSY'
+  readonly status = 409
+  readonly activeRunIds: string[]
+
+  constructor(activeRunIds: readonly string[], message?: string) {
+    super(
+      message
+      ?? `Cannot delete while in-flight tasks are still draining for run(s): ${activeRunIds.join(', ')}. Retry after active work settles.`,
+    )
+    this.name = 'RunDeleteBusyError'
+    this.activeRunIds = [...activeRunIds]
+  }
+}
+
 export interface DeleteExecutionControl {
   wake: () => void
   getLabTargetHandle: (runId: string) => unknown
+  disposeRun?: (
+    runId: string,
+    options?: { terminalState?: 'completed' | 'failed' | 'canceled'; reason?: string; timeoutMs?: number },
+  ) => Promise<{ tasksTimedOut?: number } | null>
+  isRunTrackedActive?: (runId: string) => boolean
 }
 
 export interface DeleteLabControl {
   getTarget: (runId: string) => unknown
   stopLabTarget: (runId: string) => Promise<unknown>
+}
+
+function isRunActiveForDelete(
+  db: Store,
+  exec: DeleteExecutionControl,
+  labRunner: DeleteLabControl,
+  runId: string,
+): boolean {
+  return db.isRunActive(runId)
+    || isOobDrainActive(runId)
+    || Boolean(exec.isRunTrackedActive?.(runId))
+    || Boolean(exec.getLabTargetHandle(runId))
+    || Boolean(labRunner.getTarget(runId))
 }
 
 async function stopRunsBeforeDelete(
@@ -1646,6 +1686,7 @@ async function stopRunsBeforeDelete(
   runIds: readonly string[],
   waitTimeoutMs = 2_500,
 ): Promise<void> {
+  const timedOutRuns = new Set<string>()
   for (const runId of runIds) {
     cancelOobDrainForRun(runId)
     try {
@@ -1658,21 +1699,35 @@ async function stopRunsBeforeDelete(
       const msg = error instanceof Error ? error.message : ''
       if (!isDeletedRunRaceError(error) && !/already ended/i.test(msg)) throw error
     }
+    if (exec.disposeRun) {
+      const report = await exec.disposeRun(runId, {
+        terminalState: 'canceled',
+        reason: 'run deleted',
+        timeoutMs: waitTimeoutMs,
+      })
+      if (report && (report.tasksTimedOut ?? 0) > 0) {
+        timedOutRuns.add(runId)
+      }
+    }
     await labRunner.stopLabTarget(runId).catch(() => undefined)
   }
   exec.wake()
 
   const deadline = Date.now() + Math.max(0, waitTimeoutMs)
   while (Date.now() < deadline) {
-    const stillActive = runIds.some(runId =>
-      db.isRunActive(runId)
-      || isOobDrainActive(runId)
-      || Boolean(exec.getLabTargetHandle(runId))
-      || Boolean(labRunner.getTarget(runId)),
-    )
+    const stillActive = runIds.some(runId => isRunActiveForDelete(db, exec, labRunner, runId))
     if (!stillActive) break
     await new Promise(resolve => setTimeout(resolve, 100))
     exec.wake()
+  }
+
+  for (const runId of runIds) {
+    if (isRunActiveForDelete(db, exec, labRunner, runId)) {
+      timedOutRuns.add(runId)
+    }
+  }
+  if (timedOutRuns.size > 0) {
+    throw new RunDeleteBusyError([...timedOutRuns])
   }
 }
 
@@ -1682,10 +1737,7 @@ export async function deleteRunWithActiveGuard(
   labRunner: DeleteLabControl,
   input: { runId: string; stopActive?: boolean; waitTimeoutMs?: number },
 ): Promise<{ deleted: boolean; projectId: string; runId: string }> {
-  const isActive = db.isRunActive(input.runId)
-    || isOobDrainActive(input.runId)
-    || Boolean(exec.getLabTargetHandle(input.runId))
-    || Boolean(labRunner.getTarget(input.runId))
+  const isActive = isRunActiveForDelete(db, exec, labRunner, input.runId)
   if (isActive && !input.stopActive) {
     throw new Error('This run is currently active. Stop the run first (or choose Stop & Delete) before deleting it.')
   }
@@ -1693,6 +1745,16 @@ export async function deleteRunWithActiveGuard(
     await stopRunsBeforeDelete(db, exec, labRunner, [input.runId], input.waitTimeoutMs)
   } else {
     cancelOobDrainForRun(input.runId)
+    if (exec.disposeRun) {
+      const report = await exec.disposeRun(input.runId, {
+        terminalState: 'canceled',
+        reason: 'run deleted',
+        timeoutMs: input.waitTimeoutMs ?? 2_500,
+      })
+      if (report && (report.tasksTimedOut ?? 0) > 0) {
+        throw new RunDeleteBusyError([input.runId])
+      }
+    }
     await labRunner.stopLabTarget(input.runId).catch(() => undefined)
   }
   const result = db.deleteRun(input.runId)
@@ -1713,12 +1775,7 @@ export async function deleteProjectWithActiveGuard(
     return { deleted: false, projectId: input.projectId, deletedRuns: 0 }
   }
   const allRunIds = detail.runs.map(r => r.id)
-  const activeRunIds = allRunIds.filter(runId =>
-    db.isRunActive(runId)
-    || isOobDrainActive(runId)
-    || Boolean(exec.getLabTargetHandle(runId))
-    || Boolean(labRunner.getTarget(runId)),
-  )
+  const activeRunIds = allRunIds.filter(runId => isRunActiveForDelete(db, exec, labRunner, runId))
   if (activeRunIds.length > 0 && !input.stopActive) {
     throw new Error(
       `This project has ${activeRunIds.length} active ${activeRunIds.length === 1 ? 'run' : 'runs'}. Stop active runs first (or choose Stop & Delete) before deleting the project.`,
@@ -1726,11 +1783,23 @@ export async function deleteProjectWithActiveGuard(
   }
   if (activeRunIds.length > 0 && input.stopActive) {
     await stopRunsBeforeDelete(db, exec, labRunner, activeRunIds, input.waitTimeoutMs)
-  } else {
-    for (const runId of allRunIds) {
-      cancelOobDrainForRun(runId)
-      await labRunner.stopLabTarget(runId).catch(() => undefined)
+  }
+  const remainingRunIds = activeRunIds.length > 0 && input.stopActive
+    ? allRunIds.filter(runId => !activeRunIds.includes(runId))
+    : allRunIds
+  for (const runId of remainingRunIds) {
+    cancelOobDrainForRun(runId)
+    if (exec.disposeRun) {
+      const report = await exec.disposeRun(runId, {
+        terminalState: 'canceled',
+        reason: 'project deleted',
+        timeoutMs: input.waitTimeoutMs ?? 2_500,
+      })
+      if (report && (report.tasksTimedOut ?? 0) > 0) {
+        throw new RunDeleteBusyError([runId])
+      }
     }
+    await labRunner.stopLabTarget(runId).catch(() => undefined)
   }
   const result = db.deleteProject(input.projectId)
   if (result.deleted) exec.wake()

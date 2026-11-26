@@ -870,10 +870,18 @@ export class WarmSpecialistController {
     }
   }
 
-  register(handle: string, init: WarmSpecialistInit = {}): WarmSpecialistSession {
+  private sessionKey(handle: string, runId?: string): string | null {
     const normalized = normalizeBoardHandle(handle)
-    if (!normalized) throw new Error(`Invalid warm specialist handle "${handle}".`)
-    const existing = this.sessions.get(normalized)
+    if (!normalized) return null
+    const trimmedRun = runId?.trim()
+    return trimmedRun ? `${trimmedRun}\0${normalized}` : normalized
+  }
+
+  register(handle: string, init: WarmSpecialistInit = {}, runId?: string): WarmSpecialistSession {
+    const normalized = normalizeBoardHandle(handle)
+    const key = this.sessionKey(handle, runId)
+    if (!normalized || !key) throw new Error(`Invalid warm specialist handle "${handle}".`)
+    const existing = this.sessions.get(key)
     if (existing) return { ...existing }
     const now = this.config.now()
     const session: WarmSpecialistSession = {
@@ -892,23 +900,32 @@ export class WarmSpecialistController {
       createdAt: now,
       lastTransitionAt: now,
     }
-    this.sessions.set(normalized, session)
+    this.sessions.set(key, session)
     return { ...session }
   }
 
-  get(handle: string): WarmSpecialistSession | undefined {
-    const normalized = normalizeBoardHandle(handle)
-    const session = normalized ? this.sessions.get(normalized) : undefined
+  get(handle: string, runId?: string): WarmSpecialistSession | undefined {
+    const key = this.sessionKey(handle, runId)
+    const session = key ? this.sessions.get(key) : undefined
     return session ? { ...session } : undefined
   }
 
-  list(): WarmSpecialistSession[] {
-    return [...this.sessions.values()].map(session => ({ ...session }))
+  list(runId?: string): WarmSpecialistSession[] {
+    const trimmedRun = runId?.trim()
+    if (!trimmedRun) {
+      return [...this.sessions.values()].map(session => ({ ...session }))
+    }
+    const prefix = `${trimmedRun}\0`
+    const out: WarmSpecialistSession[] = []
+    for (const [key, session] of this.sessions) {
+      if (key.startsWith(prefix)) out.push({ ...session })
+    }
+    return out
   }
 
   /** waiting → working (same durable sessionId). paused requires resume(); retired refuses. */
-  wake(handle: string, activeAssignmentId?: string | null): WarmWakeResult {
-    const session = this.sessions.get(normalizeBoardHandle(handle) ?? '')
+  wake(handle: string, activeAssignmentId?: string | null, runId?: string): WarmWakeResult {
+    const session = this.sessions.get(this.sessionKey(handle, runId) ?? '')
     if (!session) return { ok: false, state: 'retired', sessionId: null, keptSession: false, reason: 'unknown' }
     if (session.state === 'retired') {
       return { ok: false, state: 'retired', sessionId: session.sessionId, keptSession: false, reason: 'retired' }
@@ -928,8 +945,8 @@ export class WarmSpecialistController {
   }
 
   /** working → waiting; the durable sessionId, cursor and counters are retained. */
-  sleep(handle: string): WarmSpecialistSession | undefined {
-    const session = this.sessions.get(normalizeBoardHandle(handle) ?? '')
+  sleep(handle: string, runId?: string): WarmSpecialistSession | undefined {
+    const session = this.sessions.get(this.sessionKey(handle, runId) ?? '')
     if (!session) return undefined
     if (session.state === 'working') {
       session.state = 'waiting'
@@ -939,8 +956,8 @@ export class WarmSpecialistController {
     return { ...session }
   }
 
-  pause(handle: string, activeAssignmentId: string | null = null): WarmSpecialistSession | undefined {
-    const session = this.sessions.get(normalizeBoardHandle(handle) ?? '')
+  pause(handle: string, activeAssignmentId: string | null = null, runId?: string): WarmSpecialistSession | undefined {
+    const session = this.sessions.get(this.sessionKey(handle, runId) ?? '')
     if (!session || session.state === 'retired') return session ? { ...session } : undefined
     session.state = 'paused'
     session.activeAssignmentId = activeAssignmentId
@@ -948,8 +965,8 @@ export class WarmSpecialistController {
     return { ...session }
   }
 
-  resume(handle: string, activeAssignmentId?: string | null): WarmWakeResult {
-    const session = this.sessions.get(normalizeBoardHandle(handle) ?? '')
+  resume(handle: string, activeAssignmentId?: string | null, runId?: string): WarmWakeResult {
+    const session = this.sessions.get(this.sessionKey(handle, runId) ?? '')
     if (!session) return { ok: false, state: 'retired', sessionId: null, keptSession: false, reason: 'unknown' }
     if (session.state === 'retired') {
       return { ok: false, state: 'retired', sessionId: session.sessionId, keptSession: false, reason: 'retired' }
@@ -961,8 +978,8 @@ export class WarmSpecialistController {
     return { ok: true, state: 'working', sessionId: session.sessionId, keptSession: true }
   }
 
-  retire(handle: string, reason: string): WarmSpecialistSession | undefined {
-    const session = this.sessions.get(normalizeBoardHandle(handle) ?? '')
+  retire(handle: string, reason: string, runId?: string): WarmSpecialistSession | undefined {
+    const session = this.sessions.get(this.sessionKey(handle, runId) ?? '')
     if (!session) return undefined
     session.state = 'retired'
     session.retiredReason = reason
@@ -972,8 +989,8 @@ export class WarmSpecialistController {
   }
 
   /** True when the member has crossed the turn ceiling or ~60% of the model context window. */
-  shouldRetire(handle: string): boolean {
-    const session = this.sessions.get(normalizeBoardHandle(handle) ?? '')
+  shouldRetire(handle: string, runId?: string): boolean {
+    const session = this.sessions.get(this.sessionKey(handle, runId) ?? '')
     if (!session) return false
     if (session.state === 'retired') return true
     if (session.turnsUsed >= this.config.maxTurnsCeiling) return true
@@ -985,8 +1002,12 @@ export class WarmSpecialistController {
    * Record a completed turn. Sleeps (waiting, same session) unless a ceiling is hit, in which
    * case it retires and reports `closureRequired` so execution can post the closure summary.
    */
-  completeTurn(handle: string, usage: { tokensUsed?: number; contextTokens?: number } = {}): WarmTurnResult | undefined {
-    const session = this.sessions.get(normalizeBoardHandle(handle) ?? '')
+  completeTurn(
+    handle: string,
+    usage: { tokensUsed?: number; contextTokens?: number } = {},
+    runId?: string,
+  ): WarmTurnResult | undefined {
+    const session = this.sessions.get(this.sessionKey(handle, runId) ?? '')
     if (!session) return undefined
     session.turnsUsed += 1
     if (typeof usage.contextTokens === 'number') session.contextTokens = Math.max(0, usage.contextTokens)
@@ -1020,29 +1041,50 @@ export class WarmSpecialistController {
     }
   }
 
-  noteEvidence(handle?: string): void {
-    const targets = handle ? [normalizeBoardHandle(handle) ?? ''] : [...this.sessions.keys()]
-    for (const target of targets) {
-      const session = this.sessions.get(target)
+  noteEvidence(handle?: string, runId?: string): void {
+    const trimmedRun = runId?.trim()
+    if (handle) {
+      const session = this.sessions.get(this.sessionKey(handle, trimmedRun) ?? '')
       if (session) session.peerHopsUsed = 0
+      return
+    }
+    const prefix = trimmedRun ? `${trimmedRun}\0` : null
+    for (const [key, session] of this.sessions) {
+      if (prefix && !key.startsWith(prefix)) continue
+      session.peerHopsUsed = 0
     }
   }
 
-  notePeerHop(handle: string): number {
-    const session = this.sessions.get(normalizeBoardHandle(handle) ?? '')
+  notePeerHop(handle: string, runId?: string): number {
+    const session = this.sessions.get(this.sessionKey(handle, runId) ?? '')
     if (!session) return 0
     session.peerHopsUsed += 1
     return session.peerHopsUsed
   }
 
-  canMentionPeer(handle: string): boolean {
-    const session = this.sessions.get(normalizeBoardHandle(handle) ?? '')
+  canMentionPeer(handle: string, runId?: string): boolean {
+    const session = this.sessions.get(this.sessionKey(handle, runId) ?? '')
     return Boolean(session) && session!.state !== 'retired' && session!.peerHopsUsed < boardPeerHopLimit
   }
 
-  noteBoardCursor(handle: string, lastReadSeq: number): void {
-    const session = this.sessions.get(normalizeBoardHandle(handle) ?? '')
+  noteBoardCursor(handle: string, lastReadSeq: number, runId?: string): void {
+    const session = this.sessions.get(this.sessionKey(handle, runId) ?? '')
     if (session) session.lastReadSeq = Math.max(0, Math.round(lastReadSeq))
+  }
+
+  /** Evict all warm specialist sessions scoped to `runId` without affecting sibling runs. */
+  evictRun(runId: string): number {
+    const trimmed = runId.trim()
+    if (!trimmed) return 0
+    const prefix = `${trimmed}\0`
+    let removed = 0
+    for (const key of [...this.sessions.keys()]) {
+      if (key.startsWith(prefix)) {
+        this.sessions.delete(key)
+        removed += 1
+      }
+    }
+    return removed
   }
 
   clear(): void {

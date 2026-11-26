@@ -1,8 +1,8 @@
 import { randomUUID } from 'node:crypto'
 import { existsSync, rmSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { and, eq } from 'drizzle-orm'
-import { getAppRuntime, type AppRuntime } from './app-runtime.ts'
+import { getAppRuntime, type AppRuntime, type KillSwitchState } from './app-runtime.ts'
 import {
   assetOriginForEnvironment,
   defaultWorkerConcurrency,
@@ -107,16 +107,22 @@ import {
   codeAuditSettlementMessage,
   computePlannerBackoffMs,
   deriveRunActorState,
+  drainTimedOutRunActor,
+  evictRunFromExecutionState,
   installRunActorRejectionGuard,
+  isExecutionRunTrackedActive,
   isTrustedHostControlFact,
+  pauseRunsForKillSwitch,
   recordRunAssignmentMetrics,
   recordRunFloorMetrics,
   resolvePhaseAFloorWallClockMs,
+  resolveRunTenantId,
   resolveSourceAuditMaxTurns,
   resolveSourceAuditSettlementMs,
   resolveSourceAuditWallClockMs,
   settleCodeAuditSuspects,
   teardownRunStaging,
+  trackDetLeadFactForRun,
   type RunActorDisposeOptions,
   type SpawnTaskOptions,
   type SupervisedTask,
@@ -154,6 +160,8 @@ import { cloneWorkerPersona } from './session-isolation.ts'
 import { buildStaticWorkspaceSnapshot } from './static-workspace-snapshot.ts'
 import {
   assessmentAssignments,
+  dataDirectory,
+  RunDeleteBusyError,
   store,
   type Assignment,
   type BoardMessageRow,
@@ -338,7 +346,7 @@ export class Execution {
   private readonly coordinator = new Map<string, CoordinatorTask>()
   private readonly threatModeling = new Map<string, CoordinatorTask>()
   private readonly plannerTasks = new Map<string, CoordinatorTask>()
-  private readonly plannerTimers = new Map<string, NodeJS.Timeout>()
+  private readonly plannerTimers = new Map<string, () => void>()
   private readonly plannerDirty = new Set<string>()
   private readonly plannerDoneRound = new Map<string, number>()
   private readonly plannerErrorState = new Map<string, {
@@ -442,8 +450,16 @@ export class Execution {
   private readonly ownsLabRunner: boolean
   /** Explicit per-run `RunActor` FSM + structured `TaskSupervisor` registry. */
   private readonly actors = new Map<string, RunActor>()
+  private readonly timedOutActors = new Map<string, RunActor>()
+  private readonly disposingRuns = new Map<string, Promise<RunDrainReport | null>>()
+  private readonly maintenanceTasks = new Set<Promise<unknown>>()
   private releaseRejectionGuard: (() => void) | null = null
+  private unregisterRuntimeDisposer: (() => void) | null = null
+  private unsubKillSwitch: (() => void) | null = null
+  private stopPromise: Promise<void> | null = null
+  private activeDetLeadRunId: string | null = null
   private readonly detLeadConsumed = new Set<string>()
+  private readonly detLeadConsumedByRun = new Map<string, Set<string>>()
   /** Tier-A Program-Graph facts/steps: seeded first, exempt from the generic lead cap. */
   private readonly tierAFactIds = new Set<string>()
   private readonly tierAStepIds = new Set<string>()
@@ -518,11 +534,35 @@ export class Execution {
       this.phaseRequestBudgets,
       (runId, kind, message, detail) => this.safeEvent(runId, kind, message, detail),
     )
-    this.canaryBroker = options.canaryBroker ?? new CanaryBroker({ storage })
+    const baseDetLeadAdd = this.detLeadConsumed.add.bind(this.detLeadConsumed)
+    this.detLeadConsumed.add = (factId: string) => {
+      baseDetLeadAdd(factId)
+      this.trackDetLeadConsumed(factId)
+      return this.detLeadConsumed
+    }
     this.runtime = options.runtime ?? getAppRuntime({
       dataDir: storage.directory,
       store: storage,
-      canaryBroker: this.canaryBroker,
+    })
+    if (options.canaryBroker) {
+      this.canaryBroker = options.canaryBroker
+      if (!this.runtime.isDisposed && !this.runtime.hasCanaryBroker()) {
+        this.runtime.attachCanaryBroker(this.canaryBroker)
+      }
+    } else if (!this.runtime.isDisposed && this.runtime.hasCanaryBroker()) {
+      this.canaryBroker = this.runtime.canaryBroker
+    } else {
+      this.canaryBroker = new CanaryBroker({ storage })
+      if (!this.runtime.isDisposed) {
+        this.runtime.attachCanaryBroker(this.canaryBroker)
+      }
+    }
+    this.unregisterRuntimeDisposer = this.runtime.registerDisposer(
+      `execution:${randomUUID()}`,
+      () => this.stop(),
+    )
+    this.unsubKillSwitch = this.runtime.killSwitch.onChange(state => {
+      if (state.active) this.handleKillSwitchTripped(state)
     })
     this.personaAuth = options.personaAuth ?? new PersonaAuthManager()
     this.broker = options.broker ?? createBroker({ storage, canaryBroker: this.canaryBroker })
@@ -688,6 +728,7 @@ export class Execution {
       phaseRequestRemaining: run => this.phaseRequestRemaining(run),
       postApprovalCard: (run, aid, input, secrets) => this.postApprovalCard(run, aid, input, secrets),
       postApprovalResolution: (run, aid, input) => this.postApprovalResolution(run, aid, input),
+      registerTimer: (runId, name, timer) => this.ensureRunActor(runId).registerTimer(name, timer),
       scheduleWake: () => this.scheduleWake(),
     })
   }
@@ -747,6 +788,47 @@ export class Execution {
     return this.actors.get(runId)
   }
 
+  private runTenantId(run: Pick<Run, 'id' | 'projectId'>): string | null {
+    return resolveRunTenantId(this.storage, run)
+  }
+
+  private trackDetLeadConsumed(factId: string): void {
+    trackDetLeadFactForRun(this.storage, this.detLeadConsumedByRun, this.activeDetLeadRunId, factId)
+  }
+
+  private trackMaintenance(task: Promise<unknown>): void {
+    const tracked = task.catch(() => undefined).finally(() => { this.maintenanceTasks.delete(tracked) })
+    this.maintenanceTasks.add(tracked)
+  }
+
+  private hasActiveRetest(runId: string): boolean {
+    for (const job of this.active.values()) {
+      if (job.assignment.runId === runId && job.assignment.phase === 'retest') return true
+    }
+    return false
+  }
+
+  private cleanupRunState(runId: string, actor?: RunActor): void {
+    evictRunFromExecutionState(runId, this as unknown as Parameters<typeof evictRunFromExecutionState>[1])
+    if (!actor || this.actors.get(runId) === actor) this.actors.delete(runId)
+  }
+
+  private scheduleRunDisposal(runId: string, terminalState: TerminalRunActorState, reason: string): Promise<RunDrainReport | null> {
+    const p = this.disposeRun(runId, { terminalState, reason })
+    this.trackMaintenance(p)
+    return p
+  }
+
+  private handleKillSwitchTripped(state: KillSwitchState): void {
+    if (this.stopped) return
+    pauseRunsForKillSwitch(
+      this.storage,
+      state,
+      (id, kind, msg, detail) => this.safeEvent(id, kind, msg, detail),
+      runId => { this.scheduleRunDisposal(runId, 'canceled', 'kill switch tripped') },
+    )
+  }
+
   /**
    * Ensure a per-run `RunActor` + `RunContext` exists and owns structured resource disposal
    * (staging cleanup, capability vault RAM+disk eviction, OOB unsubscribe, persona refreshers,
@@ -755,16 +837,22 @@ export class Execution {
   private ensureRunActor(runOrId: Run | string): RunActor {
     const runId = typeof runOrId === 'string' ? runOrId : runOrId.id
     const existing = this.actors.get(runId)
-    if (existing && !existing.isDisposed) return existing
+    if (existing) {
+      if (!existing.isDisposed && !existing.isTerminal && existing.state !== 'stopping' && !existing.signal.aborted) {
+        return existing
+      }
+      if (existing.isDisposed) {
+        this.actors.delete(runId)
+      } else {
+        return existing
+      }
+    }
 
     let run: Run | undefined = typeof runOrId === 'string' ? undefined : runOrId
     if (!run) {
       try { run = this.storage.run(runId) } catch { run = undefined }
     }
-    let tenantId: string | null = null
-    if (run) {
-      try { tenantId = this.storage.project(run.projectId).tenantId ?? null } catch { tenantId = null }
-    }
+    const tenantId = run ? this.runTenantId(run) : null
     const initialState = run ? deriveRunActorState(run) : 'queued'
     const context = this.runtime.getRunContext(runId) ?? this.runtime.createRunContext(runId, { tenantId })
     const actor = new RunActor({ context, initialState })
@@ -808,18 +896,7 @@ export class Execution {
       }
     })
     actor.registerResource('run-state:cleanup', () => {
-      const timer = this.plannerTimers.get(runId)
-      if (timer) {
-        clearTimeout(timer)
-        this.plannerTimers.delete(runId)
-      }
-      this.plannerDirty.delete(runId)
-      this.plannerErrorState.delete(runId)
-      this.phaseBControllers.delete(runId)
-      this.budgetTracker.deleteRun(runId)
-      if (this.actors.get(runId) === actor) {
-        this.actors.delete(runId)
-      }
+      this.cleanupRunState(runId, actor)
     })
 
     this.actors.set(runId, actor)
@@ -834,6 +911,20 @@ export class Execution {
     options?: SpawnTaskOptions,
   ): SupervisedTask<T> {
     return this.ensureRunActor(runId).spawn(label, fn, options)
+  }
+
+  /** Run a background action (e.g. subdomain discovery) supervised by `RunActor` + `TaskSupervisor`. */
+  runSupervisedBackgroundTask(
+    runId: string,
+    label: string,
+    fn: (signal: AbortSignal) => Promise<void>,
+  ): Promise<void> {
+    return this.spawnRunTask(runId, label, fn).promise.then(() => undefined)
+  }
+
+  /** True when `runId` has any tracked in-flight actor task, worker, planner, lane, or drain. */
+  isRunTrackedActive(runId: string): boolean {
+    return isExecutionRunTrackedActive(runId, this as unknown as Parameters<typeof isExecutionRunTrackedActive>[1])
   }
 
   private evictCapabilityVault(runId: string): void {
@@ -853,29 +944,51 @@ export class Execution {
    * Deterministically abort + drain all supervised jobs and dispose the run's `RunContext`
    * (evicting `capabilityVaults` RAM + disk, unsubscribing OOB, and releasing lab/auth resources).
    */
-  async disposeRun(runId: string, options: RunActorDisposeOptions = {}): Promise<RunDrainReport | null> {
-    const actor = this.actors.get(runId)
-    let report: RunDrainReport | null = null
-    if (actor) {
-      report = await actor.drainAndDispose(options)
-      if (this.actors.get(runId) === actor) this.actors.delete(runId)
-    } else if (this.runtime.getRunContext(runId)) {
-      report = await this.runtime.disposeRunContext(runId, options.timeoutMs)
-    }
-    this.evictCapabilityVault(runId)
-    try { this.canaryBroker.unsubscribeRun(runId) } catch { /* ignore */ }
-    return report
+  disposeRun(runId: string, options: RunActorDisposeOptions = {}): Promise<RunDrainReport | null> {
+    const inflight = this.disposingRuns.get(runId)
+    if (inflight) return inflight
+    const work = (async () => {
+      const actor = this.actors.get(runId)
+      let report: RunDrainReport | null = null
+      if (actor) {
+        report = await actor.drainAndDispose(options)
+        if (this.actors.get(runId) === actor) this.actors.delete(runId)
+        if (report.tasksTimedOut > 0 && actor.activeTaskCount > 0) this.timedOutActors.set(runId, actor)
+        else this.timedOutActors.delete(runId)
+      } else if (this.timedOutActors.has(runId)) {
+        report = await drainTimedOutRunActor(runId, this.timedOutActors, options.timeoutMs)
+      } else if (this.runtime.getRunContext(runId)) {
+        report = await this.runtime.disposeRunContext(runId, options.timeoutMs)
+      }
+      this.evictCapabilityVault(runId)
+      this.cleanupRunState(runId)
+      try { this.canaryBroker.unsubscribeRun(runId) } catch { /* ignore */ }
+      return report
+    })().finally(() => {
+      if (this.disposingRuns.get(runId) === work) this.disposingRuns.delete(runId)
+    })
+    this.disposingRuns.set(runId, work)
+    return work
   }
 
   /**
    * Drain and dispose all in-flight tasks for `runId` before deleting its SQLite rows and disk files
-   * (`M-16` / `H-26`: zero orphaned tasks write against a deleted run).
+   * (`M-16` / `H-26` / `C4`: fail closed if tracked tasks time out instead of deleting under live writers).
    */
-  async deleteRun(runId: string): Promise<{ deleted: boolean; projectId: string; runId: string; drainReport: RunDrainReport | null }> {
+  async deleteRun(
+    runId: string,
+    options: { timeoutMs?: number } = {},
+  ): Promise<{ deleted: boolean; projectId: string; runId: string; drainReport: RunDrainReport | null }> {
     const drainReport = await this.disposeRun(runId, {
       terminalState: 'canceled',
       reason: 'run deleted',
+      ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
     })
+    if (drainReport && drainReport.tasksTimedOut > 0) {
+      throw new RunDeleteBusyError([runId])
+    }
+    this.lastOobDrain.delete(runId)
+    this.lastAssignmentMetrics.delete(runId)
     const deleted = this.storage.deleteRun(runId)
     return { ...deleted, drainReport }
   }
@@ -902,8 +1015,19 @@ export class Execution {
     this.scheduleWake()
   }
 
-  async stop() {
+  stop(): Promise<void> {
+    if (this.stopPromise) return this.stopPromise
+    this.stopPromise = this.performStop()
+    return this.stopPromise
+  }
+
+  private async performStop() {
     this.stopped = true
+    unregisterExecutionInstance(this.storage.directory, this)
+    this.unregisterRuntimeDisposer?.()
+    this.unregisterRuntimeDisposer = null
+    this.unsubKillSwitch?.()
+    this.unsubKillSwitch = null
     try {
       const runIds = new Set<string>([
         ...[...this.active.values()].map(job => job.assignment.runId),
@@ -928,9 +1052,12 @@ export class Execution {
     // Abort & drain every active RunActor + RunContext deterministically before clearing residual state.
     const activeActors = [...this.actors.values()]
     this.actors.clear()
-    await Promise.allSettled(
-      activeActors.map(actor => actor.drainAndDispose({ terminalState: 'canceled', reason: 'execution stopped' })),
-    )
+    await Promise.allSettled([
+      ...activeActors.map(actor => actor.drainAndDispose({ terminalState: 'canceled', reason: 'execution stopped' })),
+      ...this.disposingRuns.values(),
+      ...this.maintenanceTasks,
+    ])
+    this.disposingRuns.clear()
 
     // Tear down any remaining staging grants not covered by an actor.
     for (const runId of [...this.stagingGrants.keys()]) {
@@ -946,9 +1073,14 @@ export class Execution {
       })
     }
 
-    for (const timer of this.plannerTimers.values()) clearTimeout(timer)
+    for (const cancelTimer of this.plannerTimers.values()) {
+      try { cancelTimer() } catch { /* ignore */ }
+    }
     this.plannerTimers.clear()
     this.plannerErrorState.clear()
+    this.detLeadConsumed.clear()
+    this.detLeadConsumedByRun.clear()
+    this.warm.clear()
     for (const job of this.active.values()) job.controller.abort()
     for (const task of this.coordinator.values()) task.controller.abort()
     for (const task of this.threatModeling.values()) task.controller.abort()
@@ -1440,7 +1572,14 @@ export class Execution {
   private detLeadSummaries(...a: Parameters<ExecReconPlanner['detLeadSummaries']>) { return this.reconPlanner.detLeadSummaries(...a) }
   private stepRepeatsConfirmedWork(...a: Parameters<ExecReconPlanner['stepRepeatsConfirmedWork']>) { return this.reconPlanner.stepRepeatsConfirmedWork(...a) }
   private queueTierALeadSteps(...a: Parameters<ExecReconPlanner['queueTierALeadSteps']>) { return this.reconPlanner.queueTierALeadSteps(...a) }
-  private queueDetLeadUpgradeSteps(...a: Parameters<ExecReconPlanner['queueDetLeadUpgradeSteps']>) { return this.reconPlanner.queueDetLeadUpgradeSteps(...a) }
+  private queueDetLeadUpgradeSteps(...a: Parameters<ExecReconPlanner['queueDetLeadUpgradeSteps']>) {
+    this.activeDetLeadRunId = a[0].id
+    try {
+      return this.reconPlanner.queueDetLeadUpgradeSteps(...a)
+    } finally {
+      this.activeDetLeadRunId = null
+    }
+  }
   private assignmentBriefForStep(...a: Parameters<ExecReconPlanner['assignmentBriefForStep']>) { return this.reconPlanner.assignmentBriefForStep(...a) }
 
   /** Return (or lazily create) the single run-scoped Layer-1 DerivedCapabilityVault shared across all workers. */
@@ -1630,13 +1769,13 @@ export class Execution {
     }
 
     // Slice 3: stop the concurrent deterministic lane as soon as its run leaves investigation or
-    // is no longer authorized. Fire-and-forget here; Phase-3 gates on the settle promise.
+    // is no longer authorized. Tracked via maintenanceTasks; Phase-3 gates on the settle promise.
     for (const [runId, lane] of this.agenticLaneJobs) {
       try {
         const current = this.storage.run(runId)
         const active = current.status === 'running'
           && (current.phase === 'investigation' || (Boolean(lane.allowThreatModelPhase) && current.phase === 'threat_model'))
-        if (!active) void this.abortAgenticLane(current, 'run left investigation').catch(() => undefined)
+        if (!active) this.trackMaintenance(this.abortAgenticLane(current, 'run left investigation'))
       } catch {
         try { lane.controller.abort(new Error('run unavailable')) } catch { /* already aborted */ }
         this.agenticLaneJobs.delete(runId)
@@ -1677,29 +1816,47 @@ export class Execution {
       try {
         const current = this.storage.run(runId)
         if (current.status === 'complete' || current.status === 'failed' || current.status === 'stopped' || current.phase === 'complete') {
+          if ((current.status === 'complete' || current.phase === 'complete') && this.hasActiveRetest(runId)) {
+            continue
+          }
           const terminalState: TerminalRunActorState =
             current.status === 'failed' ? 'failed'
               : current.status === 'stopped' ? 'canceled'
                 : 'completed'
           this.evictCapabilityVault(runId)
-          void this.disposeRun(runId, { terminalState, reason: `run ${current.status}` }).catch(() => undefined)
+          this.scheduleRunDisposal(runId, terminalState, `run ${current.status}`)
         } else {
           const actor = this.actors.get(runId)
-          if (actor && !actor.isTerminal) {
+          if (actor && !actor.isTerminal && actor.state !== 'stopping') {
             const targetState = deriveRunActorState(current)
-            if (actor.canTransitionTo(targetState)) {
-              actor.syncState(targetState, `wake:${current.status}:${current.phase}`)
-            }
+            actor.reconcileWithPersisted(targetState, `wake:${current.status}:${current.phase}`)
           }
         }
       } catch {
         this.evictCapabilityVault(runId)
-        void this.disposeRun(runId, { terminalState: 'canceled', reason: 'run unavailable' }).catch(() => undefined)
+        this.scheduleRunDisposal(runId, 'canceled', 'run unavailable')
       }
     }
 
     // 2. Dispatch pending one-click Verify Fix retests (works even on completed runs, Zero-LLM!)
     for (const run of this.storage.runsWithPendingRetests()) {
+      const tenantId = this.runTenantId(run)
+      if (this.runtime.killSwitch.isActive(tenantId)) continue
+      const draining = this.disposingRuns.get(run.id)
+      if (draining) {
+        this.trackMaintenance(draining.finally(() => this.scheduleWake()))
+        continue
+      }
+      const existingActor = this.actors.get(run.id)
+      if (existingActor && (existingActor.isTerminal || existingActor.state === 'stopping' || existingActor.signal.aborted)) {
+        if (!existingActor.isDisposed) {
+          this.trackMaintenance(
+            this.scheduleRunDisposal(run.id, 'canceled', 'reset actor before retest').finally(() => this.scheduleWake()),
+          )
+          continue
+        }
+        this.actors.delete(run.id)
+      }
       const retests = this.storage.workerList(run.id).filter(w => w.phase === 'retest' && w.status === 'queued')
       for (const worker of retests) {
         if (this.active.has(worker.id)) continue
@@ -1710,11 +1867,37 @@ export class Execution {
     // 3. Process runnable runs
     const profiles = privateModelProfiles(this.storage)
     for (const run of this.storage.runnable()) {
+      const tenantId = this.runTenantId(run)
+      if (this.runtime.killSwitch.isActive(tenantId)) {
+        try {
+          if (run.status === 'running') {
+            this.storage.updateRun(run.id, { status: 'paused' })
+            this.safeEvent(run.id, 'run.kill_switch_paused', 'Run paused because emergency kill switch is active.', {
+              tenantId,
+            })
+          }
+        } catch { /* run may be gone */ }
+        this.scheduleRunDisposal(run.id, 'canceled', 'kill switch tripped')
+        continue
+      }
+      const draining = this.disposingRuns.get(run.id)
+      if (draining) {
+        this.trackMaintenance(draining.finally(() => this.scheduleWake()))
+        continue
+      }
+      const existingActor = this.actors.get(run.id)
+      if (existingActor && (existingActor.isTerminal || existingActor.state === 'stopping' || existingActor.signal.aborted)) {
+        if (!existingActor.isDisposed) {
+          this.trackMaintenance(
+            this.scheduleRunDisposal(run.id, 'canceled', 'reset actor on resume').finally(() => this.scheduleWake()),
+          )
+          continue
+        }
+        this.actors.delete(run.id)
+      }
       const actor = this.ensureRunActor(run)
       const desiredState = deriveRunActorState(run)
-      if (!actor.isTerminal && actor.canTransitionTo(desiredState)) {
-        actor.syncState(desiredState, `runnable:${run.status}:${run.phase}`)
-      }
+      actor.reconcileWithPersisted(desiredState, `runnable:${run.status}:${run.phase}`)
       if (this.storage.checkBudgetExceeded(run.id)) continue
       this.ensureVariantSweepsForConfirmedFindings(run)
       this.routeOperatorBoardMessages(run)
@@ -2492,6 +2675,7 @@ export class Execution {
       agenticFloorFinishedAt: this.agenticFloorFinishedAt,
       agenticFloorDispatchedAt: this.agenticFloorDispatchedAt,
       detLeadConsumed: this.detLeadConsumed,
+      detLeadConsumedByRun: this.detLeadConsumedByRun,
       requestBudgetSnapshot: (id, floorReqs) => this.budgetTracker.snapshot(id, floorReqs),
     }, runId, reason)
   }
@@ -2805,7 +2989,7 @@ export class Execution {
     // assignments even before the planner's first LLM turn, so `floorLeadsEmitted > 0` can never
     // silently coexist with `floorLeadsConsumed === 0`.
     try {
-      if (!this.detLeadConsumed.size && this.agenticLaneCompleted.has(this.deterministicLaneKey(run))) {
+      if (!(this.detLeadConsumedByRun.get(run.id)?.size ?? 0) && this.agenticLaneCompleted.has(this.deterministicLaneKey(run))) {
         this.queueDetLeadUpgradeSteps(
           this.storage.run(run.id),
           this.approvedOriginsSet(run),
@@ -3140,7 +3324,7 @@ export class Execution {
     if (this.plannerTimers.has(runId) || this.plannerTasks.has(runId)) return
     const backoffRemaining = errState ? Math.max(0, errState.backoffUntil - Date.now()) : 0
     const effectiveDelayMs = Math.max(delayMs, backoffRemaining)
-    const timer = setTimeout(() => {
+    const cancel = this.ensureRunActor(runId).scheduleTimer('planner-debounce', effectiveDelayMs, () => {
       this.plannerTimers.delete(runId)
       this.plannerDirty.delete(runId)
       try {
@@ -3150,10 +3334,8 @@ export class Execution {
           this.startChainPlanner(run, profiles)
         }
       } catch { /* ignore */ }
-    }, effectiveDelayMs)
-    timer.unref?.()
-    this.plannerTimers.set(runId, timer)
-    try { this.ensureRunActor(runId).registerTimer('planner-debounce', timer) } catch { /* ignore */ }
+    })
+    this.plannerTimers.set(runId, cancel)
   }
 
   private startChainPlanner(run: Run, profiles: readonly ResolvedModelProfile[]) {
@@ -3183,9 +3365,9 @@ export class Execution {
         const msg = redact(error instanceof Error ? error.message : String(error)).slice(0, 300)
         if (breakerTripped) {
           this.plannerDirty.delete(run.id)
-          const pendingTimer = this.plannerTimers.get(run.id)
-          if (pendingTimer) {
-            clearTimeout(pendingTimer)
+          const cancelTimer = this.plannerTimers.get(run.id)
+          if (cancelTimer) {
+            cancelTimer()
             this.plannerTimers.delete(run.id)
           }
           this.safeEvent(
@@ -3329,8 +3511,8 @@ export class Execution {
         sessionId: assignment.sessionId,
         state: 'waiting',
         lastReadSeq: this.storage.boardMember(run.id, boardHandle)?.lastReadSeq ?? 0,
-      })
-      this.warm.wake(boardHandle, assignment.id)
+      }, run.id)
+      this.warm.wake(boardHandle, assignment.id, run.id)
     } catch { /* roster mirror is best-effort */ }
 
     this.postCoordinatorBrief(run, effectiveStep, boardHandle, targetOrigins)
@@ -3865,20 +4047,25 @@ export class Execution {
       relay: this.canaryBroker,
       draining: this.verificationDraining,
       lastDrain: this.lastOobDrain,
-      drain: runId => this.drainPendingOob(runId),
-    }, run)
-    if (!this.verificationDraining.has(run.id)) {
-      try {
-        const current = this.storage.run(run.id)
-        if (current.status === 'complete' || current.phase === 'complete') {
-          this.evictCapabilityVault(run.id)
-          void this.disposeRun(run.id, { terminalState: 'completed', reason: 'final report written' }).catch(() => undefined)
+      drain: (runId, signal) => this.drainPendingOob(runId, signal ? { signal } : {}),
+      spawn: (label, fn) => this.spawnRunTask(run.id, label, fn),
+      onFinalized: finalizedRunId => {
+        try {
+          const current = this.storage.run(finalizedRunId)
+          if (current.status === 'complete' || current.phase === 'complete') {
+            this.evictCapabilityVault(finalizedRunId)
+            queueMicrotask(() => {
+              this.scheduleRunDisposal(finalizedRunId, 'completed', 'final report written')
+            })
+          }
+        } catch {
+          this.evictCapabilityVault(finalizedRunId)
+          queueMicrotask(() => {
+            this.scheduleRunDisposal(finalizedRunId, 'completed', 'final report written')
+          })
         }
-      } catch {
-        this.evictCapabilityVault(run.id)
-        void this.disposeRun(run.id, { terminalState: 'completed', reason: 'final report written' }).catch(() => undefined)
-      }
-    }
+      },
+    }, run)
   }
 
   private advanceToVerification(run: Run) {
@@ -4042,11 +4229,12 @@ export class Execution {
         this.scheduleWake()
       }
     }
-    if (eventPrefix === 'worker') {
-      this.spawnRunTask(run.id, `verification:${claimed.id}`, runWork, { controller: job.controller })
-    } else {
-      void runWork()
-    }
+    this.spawnRunTask(
+      run.id,
+      `${eventPrefix === 'worker' ? 'verification' : 'retest'}:${claimed.id}`,
+      runWork,
+      { controller: job.controller },
+    )
   }
 
   private startVerificationWorker(run: Run, worker: Assignment) {
@@ -4225,7 +4413,23 @@ export class Execution {
   }
 }
 
-let instance: Execution | undefined
-export function execution() {
-  return instance ??= new Execution(store())
+const EXECUTION_SINGLETON_SYMBOL = Symbol.for('kovo.execution')
+function getExecutionRegistry(): Map<string, Execution> {
+  const g = globalThis as Record<symbol, Map<string, Execution> | undefined>
+  return (g[EXECUTION_SINGLETON_SYMBOL] ??= new Map<string, Execution>())
+}
+function unregisterExecutionInstance(directory: string, exec: Execution): void {
+  const key = resolve(directory)
+  const reg = getExecutionRegistry()
+  if (reg.get(key) === exec) reg.delete(key)
+}
+export function execution(): Execution {
+  const key = resolve(dataDirectory())
+  const reg = getExecutionRegistry()
+  let existing = reg.get(key)
+  if (!existing) {
+    existing = new Execution(store())
+    reg.set(key, existing)
+  }
+  return existing
 }

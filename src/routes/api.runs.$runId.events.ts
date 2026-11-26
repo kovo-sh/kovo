@@ -1,5 +1,6 @@
 import { createFileRoute } from '@tanstack/react-router'
 import { id } from '../domain.ts'
+import { getAppRuntime } from '../server/app-runtime.ts'
 import { store } from '../server/store.ts'
 
 export function eventsResponse(request: Request, runId: string) {
@@ -9,6 +10,26 @@ export function eventsResponse(request: Request, runId: string) {
     db.run(runId)
   } catch {
     return new Response('Run not found.', { status: 404 })
+  }
+  const runtime = getAppRuntime({ dataDir: db.directory })
+  let runTenantId: string | null = null
+  try {
+    const resolvedTenant = db.getRunTenant(runId)
+    runTenantId = resolvedTenant && resolvedTenant !== 'default' ? resolvedTenant : null
+  } catch {
+    runTenantId = null
+  }
+  if (runtime.killSwitch.isActive(runTenantId)) {
+    return new Response(
+      JSON.stringify({ error: 'Kill switch active.', code: 'KILL_SWITCH_TRIPPED' }),
+      {
+        status: 503,
+        headers: {
+          'content-type': 'application/json; charset=utf-8',
+          'cache-control': 'no-store',
+        },
+      },
+    )
   }
   const url = new URL(request.url)
   const supplied = request.headers.get('last-event-id') ?? url.searchParams.get('since') ?? '0'
@@ -59,15 +80,25 @@ export function eventsResponse(request: Request, runId: string) {
         stop()
         try { controller.close() } catch { /* already closed */ }
       }
+      const unsubscribeKillSwitch = runtime.killSwitch.onSseRevocation(state => {
+        if (state.tenantId === null || (runTenantId !== null && state.tenantId === runTenantId)) {
+          abort()
+        }
+      })
       stop = () => {
         closed = true
         if (stopped) return
         stopped = true
         unsubscribe()
+        unsubscribeKillSwitch()
         clearInterval(keepalive)
         request.signal.removeEventListener('abort', abort)
       }
       request.signal.addEventListener('abort', abort, { once: true })
+      if (runtime.killSwitch.isActive(runTenantId)) {
+        abort()
+        return
+      }
       write('retry: 700\n\n')
       flush()
       if (request.signal.aborted) abort()

@@ -112,18 +112,22 @@ export class GlobalKillSwitch {
   private db: DatabaseSync | null = null
   private pollIntervalMs = 25
   private lastExternalCheckMs = 0
-  private lastFileMtimeMs = -1
+  private lastFileStatKey: string | null = null
   private nowFn: () => number = Date.now
 
   constructor(options: KillSwitchOptions = {}) {
     this.configure(options)
   }
 
+  private fileStatKey(info: { mtimeMs: number; ctimeMs: number; size: number; ino: number }): string {
+    return `${info.mtimeMs}:${info.ctimeMs}:${info.size}:${info.ino}`
+  }
+
   /** Attach or update file/DB backing and clock without dropping registered controllers. */
   configure(options: KillSwitchOptions): void {
     if ('filePath' in options) {
       this.filePath = options.filePath ?? null
-      this.lastFileMtimeMs = -1
+      this.lastFileStatKey = null
     }
     if ('db' in options) {
       this.db = options.db ?? null
@@ -191,7 +195,7 @@ export class GlobalKillSwitch {
       try {
         chmodSync(tmp, 0o600)
         renameSync(tmp, this.filePath)
-        this.lastFileMtimeMs = statSync(this.filePath).mtimeMs
+        this.lastFileStatKey = this.fileStatKey(statSync(this.filePath))
       } catch (err) {
         rmSync(tmp, { force: true })
         throw err
@@ -199,44 +203,60 @@ export class GlobalKillSwitch {
     }
     if (this.db) {
       this.ensureDbTable(this.db)
-      this.db.prepare(`
-        INSERT INTO kill_switch_state (id, active, reason, tripped_by, tripped_at, tenant_id, generation)
-        VALUES (1, ?, ?, ?, ?, NULL, ?)
-        ON CONFLICT(id) DO UPDATE SET
-          active = excluded.active,
-          reason = excluded.reason,
-          tripped_by = excluded.tripped_by,
-          tripped_at = excluded.tripped_at,
-          tenant_id = NULL,
-          generation = excluded.generation
-      `).run(
-        this.globalState.active ? 1 : 0,
-        this.globalState.reason,
-        this.globalState.trippedBy,
-        this.globalState.trippedAt,
-        this.generation,
-      )
-      this.db.prepare('DELETE FROM kill_switch_tenants').run()
-      const upsertTenant = this.db.prepare(`
-        INSERT INTO kill_switch_tenants (tenant_id, active, reason, tripped_by, tripped_at, generation)
-        VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT(tenant_id) DO UPDATE SET
-          active = excluded.active,
-          reason = excluded.reason,
-          tripped_by = excluded.tripped_by,
-          tripped_at = excluded.tripped_at,
-          generation = excluded.generation
-      `)
-      for (const [tenantId, state] of this.tenantStates) {
-        if (!state.active) continue
-        upsertTenant.run(
-          tenantId,
-          1,
-          state.reason,
-          state.trippedBy,
-          state.trippedAt,
-          state.generation,
+      let begun = false
+      try {
+        this.db.exec('BEGIN IMMEDIATE')
+        begun = true
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        if (!/within a transaction/i.test(msg)) throw err
+      }
+      try {
+        this.db.prepare(`
+          INSERT INTO kill_switch_state (id, active, reason, tripped_by, tripped_at, tenant_id, generation)
+          VALUES (1, ?, ?, ?, ?, NULL, ?)
+          ON CONFLICT(id) DO UPDATE SET
+            active = excluded.active,
+            reason = excluded.reason,
+            tripped_by = excluded.tripped_by,
+            tripped_at = excluded.tripped_at,
+            tenant_id = NULL,
+            generation = excluded.generation
+        `).run(
+          this.globalState.active ? 1 : 0,
+          this.globalState.reason,
+          this.globalState.trippedBy,
+          this.globalState.trippedAt,
+          this.generation,
         )
+        this.db.prepare('DELETE FROM kill_switch_tenants').run()
+        const upsertTenant = this.db.prepare(`
+          INSERT INTO kill_switch_tenants (tenant_id, active, reason, tripped_by, tripped_at, generation)
+          VALUES (?, ?, ?, ?, ?, ?)
+          ON CONFLICT(tenant_id) DO UPDATE SET
+            active = excluded.active,
+            reason = excluded.reason,
+            tripped_by = excluded.tripped_by,
+            tripped_at = excluded.tripped_at,
+            generation = excluded.generation
+        `)
+        for (const [tenantId, state] of this.tenantStates) {
+          if (!state.active) continue
+          upsertTenant.run(
+            tenantId,
+            1,
+            state.reason,
+            state.trippedBy,
+            state.trippedAt,
+            state.generation,
+          )
+        }
+        if (begun) this.db.exec('COMMIT')
+      } catch (err) {
+        if (begun) {
+          try { this.db.exec('ROLLBACK') } catch { /* ignore */ }
+        }
+        throw err
       }
     }
   }
@@ -245,8 +265,9 @@ export class GlobalKillSwitch {
     if (this.filePath) {
       try {
         const info = statSync(this.filePath)
-        if (info.mtimeMs !== this.lastFileMtimeMs) {
-          this.lastFileMtimeMs = info.mtimeMs
+        const statKey = this.fileStatKey(info)
+        if (statKey !== this.lastFileStatKey) {
+          this.lastFileStatKey = statKey
           const parsed = JSON.parse(readFileSync(this.filePath, 'utf8')) as Partial<KillSwitchState> & {
             tenants?: Record<string, unknown>
           }
@@ -591,7 +612,11 @@ export class GlobalKillSwitch {
     tenantId: string | null = null,
   ): () => void {
     const normalizedTenant = normalizeTenantId(tenantId)
-    const active = this.resolveActiveState(normalizedTenant)
+    let active = this.resolveActiveState(normalizedTenant)
+    if (!active) {
+      this.syncFromExternal(false)
+      active = this.resolveActiveState(normalizedTenant)
+    }
     if (active) {
       if (!controller.signal.aborted) {
         controller.abort(new KillSwitchTrippedError(active))

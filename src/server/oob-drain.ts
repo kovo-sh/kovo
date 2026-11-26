@@ -162,7 +162,11 @@ export interface FinalizeHost {
   /** Last drain outcome per run, surfaced in report meta. */
   lastDrain: Map<string, OobDrainResult>
   /** Optional drain entry point (tests/benchmarks can substitute a fake-clock drain). */
-  drain?: (runId: string) => Promise<OobDrainResult>
+  drain?: (runId: string, signal?: AbortSignal) => Promise<OobDrainResult>
+  /** Optional structured task spawner (e.g. `RunActor.spawn`) to avoid detached `void` async chains. */
+  spawn?: (label: string, fn: (signal: AbortSignal) => Promise<void>) => unknown
+  /** Optional callback fired after `commitFinalReport` completes (sync or async). */
+  onFinalized?: (runId: string) => void
   /** Optional observer for unexpected non-deletion storage errors during async finalization. */
   onError?: (error: unknown) => void
 }
@@ -177,15 +181,16 @@ export function scheduleFinalReport(host: FinalizeHost, run: Run): void {
   try { pending = host.relay.pending(run.id).length } catch { pending = 0 }
   if (pending === 0) {
     commitFinalReport(host, run)
+    host.onFinalized?.(run.id)
     return
   }
   host.draining.add(run.id)
   activeFinalizingRuns.add(run.id)
-  const drain = host.drain ?? ((runId: string) => drainPendingOob(host.relay, runId))
-  void (async () => {
+  const drain = host.drain ?? ((runId: string, signal?: AbortSignal) => drainPendingOob(host.relay, runId, { signal }))
+  const runAsyncFinalize = async (signal?: AbortSignal) => {
     try {
       try {
-        const result = await drain(run.id)
+        const result = await drain(run.id, signal)
         host.lastDrain.set(run.id, result)
       } catch (error) {
         if (isDeletedRunRaceError(error)) {
@@ -194,7 +199,9 @@ export function scheduleFinalReport(host: FinalizeHost, run: Run): void {
         }
         // Transient drain failure must not block report finalization when the run still exists.
       }
+      if (signal?.aborted) return
       commitFinalReport(host, run)
+      host.onFinalized?.(run.id)
     } catch (error) {
       if (isDeletedRunRaceError(error)) {
         host.lastDrain.delete(run.id)
@@ -209,7 +216,12 @@ export function scheduleFinalReport(host: FinalizeHost, run: Run): void {
       host.draining.delete(run.id)
       activeFinalizingRuns.delete(run.id)
     }
-  })()
+  }
+  if (host.spawn) {
+    host.spawn('oob-final-report', signal => runAsyncFinalize(signal))
+  } else {
+    void runAsyncFinalize()
+  }
 }
 
 export function commitFinalReport(host: FinalizeHost, run: Run): void {

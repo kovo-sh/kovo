@@ -581,6 +581,8 @@ const maxTrackedSecondOrderSurfaces = 5_000
 const maxSurfacesPerCanary = 20
 /** Distinct surfaces already observed per canary id, keyed `(origin, endpoint, persona, mediaType)`. */
 const observedSecondOrderSurfaces = new Map<string, Map<string, SecondOrderSurface>>()
+/** Secondary runId -> canaryIds index so `unsubscribeRun(runId)` evicts observed surfaces cleanly. */
+const observedSecondOrderByRun = new Map<string, Set<string>>()
 
 function normalizeSurfaceEndpoint(endpoint: string): string {
   const pathOnly = endpoint.split('?')[0].split('#')[0].trim()
@@ -602,6 +604,14 @@ function recordObservedSurface(
     }
     byKey = new Map<string, SecondOrderSurface>()
     observedSecondOrderSurfaces.set(canaryId, byKey)
+  }
+  if (input.runId) {
+    let runCanaries = observedSecondOrderByRun.get(input.runId)
+    if (!runCanaries) {
+      runCanaries = new Set<string>()
+      observedSecondOrderByRun.set(input.runId, runCanaries)
+    }
+    runCanaries.add(canaryId)
   }
   const endpoint = normalizeSurfaceEndpoint(input.endpoint)
   const mediaType = input.mediaType?.trim().toLowerCase() || null
@@ -628,6 +638,25 @@ function recordObservedSurface(
 /** Test/diagnostic helper: drop in-memory surface tracking. */
 export function resetSecondOrderSurfaceTracking(): void {
   observedSecondOrderSurfaces.clear()
+  observedSecondOrderByRun.clear()
+}
+
+/** Evict all in-memory second-order surface entries owned by `runId`. */
+export function evictSecondOrderSurfacesForRun(runId: string): number {
+  const ids = observedSecondOrderByRun.get(runId)
+  if (!ids) return 0
+  let removed = 0
+  for (const canaryId of ids) {
+    if (observedSecondOrderSurfaces.delete(canaryId)) removed += 1
+  }
+  observedSecondOrderByRun.delete(runId)
+  return removed
+}
+
+/** Diagnostic count of tracked second-order canary surface sets (tests/telemetry). */
+export function trackedSecondOrderSurfaceCount(runId?: string): number {
+  if (runId !== undefined) return observedSecondOrderByRun.get(runId)?.size ?? 0
+  return observedSecondOrderSurfaces.size
 }
 
 export function scanSecondOrderMarkers(input: ScanSecondOrderInput): SecondOrderCanaryRecord[] {
@@ -1359,6 +1388,7 @@ export class CanaryBroker {
         evictedCanaries += 1
       }
     }
+    evictSecondOrderSurfacesForRun(validRunId)
     return { ...relayResult, evictedCanaries }
   }
 

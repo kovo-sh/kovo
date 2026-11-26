@@ -103,6 +103,7 @@ export class AppRuntime {
   private storeInstance: Store | null
   private oobRelayInstance: OobRelay | null
   private canaryBrokerInstance: CanaryBroker | null
+  private readonly disposers = new Map<string, () => void | Promise<void>>()
   private disposed = false
   private disposePromise: Promise<AppRuntimeDisposeReport> | null = null
 
@@ -156,6 +157,42 @@ export class AppRuntime {
   /** Whether `store` has been materialized yet (useful for lazy-init assertions). */
   hasStore(): boolean {
     return this.storeInstance !== null
+  }
+
+  /** Whether an OobRelay instance has been materialized or attached. */
+  hasOobRelay(): boolean {
+    return this.oobRelayInstance !== null
+  }
+
+  /** Whether a CanaryBroker instance has been materialized or attached. */
+  hasCanaryBroker(): boolean {
+    return this.canaryBrokerInstance !== null
+  }
+
+  /** Attach an externally constructed Store if none is attached yet. */
+  attachStore(storeInstance: Store): void {
+    this.assertNotDisposed()
+    if (!this.storeInstance) {
+      this.storeInstance = storeInstance
+    }
+  }
+
+  /**
+   * Register a shutdown disposer (e.g. `Execution.stop()`) executed during `AppRuntime.dispose()`
+   * BEFORE active RunContexts, OOB relay/broker, and Store are closed.
+   */
+  registerDisposer(name: string, disposeFn: () => void | Promise<void>): () => void {
+    const key = name.trim() || `disposer-${this.disposers.size + 1}`
+    if (this.disposed) {
+      try { void Promise.resolve(disposeFn()).catch(() => undefined) } catch { /* ignore */ }
+      return () => {}
+    }
+    this.disposers.set(key, disposeFn)
+    return () => {
+      if (this.disposers.get(key) === disposeFn) {
+        this.disposers.delete(key)
+      }
+    }
   }
 
   /** Lazily initialized durable OOB relay owned by this runtime. */
@@ -285,6 +322,21 @@ export class AppRuntime {
 
   private async performDispose(timeoutMs?: number): Promise<AppRuntimeDisposeReport> {
     const errors: string[] = []
+    const registeredDisposers = [...this.disposers.entries()].reverse()
+    this.disposers.clear()
+    if (registeredDisposers.length > 0) {
+      const disposerOutcomes = await Promise.allSettled(
+        registeredDisposers.map(([, fn]) => Promise.resolve().then(() => fn())),
+      )
+      for (let i = 0; i < disposerOutcomes.length; i += 1) {
+        const outcome = disposerOutcomes[i]!
+        if (outcome.status === 'rejected') {
+          const [name] = registeredDisposers[i]!
+          errors.push(`disposer(${name}): ${outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason)}`)
+        }
+      }
+    }
+
     const activeContexts = [...this.runs.values()]
     const runOutcomes = await Promise.allSettled(
       activeContexts.map(ctx => ctx.drainAndDispose(timeoutMs)),
@@ -367,6 +419,14 @@ export function getAppRuntime(options: AppRuntimeOptions = {}): AppRuntime {
   const registry = getAppRuntimeRegistry()
   const existing = registry.get(dir)
   if (existing && !existing.isDisposed) {
+    if (options.store && !existing.hasStore()) {
+      existing.attachStore(options.store)
+    }
+    if (options.canaryBroker && !existing.hasCanaryBroker()) {
+      existing.attachCanaryBroker(options.canaryBroker)
+    } else if (options.oobRelay && !existing.hasOobRelay()) {
+      existing.attachOobRelay(options.oobRelay)
+    }
     const ksOpts: KillSwitchOptions = {
       ...(options.killSwitchOptions ?? {}),
       ...(options.killSwitchFilePath !== undefined ? { filePath: options.killSwitchFilePath } : {}),

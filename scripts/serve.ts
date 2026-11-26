@@ -530,10 +530,32 @@ export function createKovoLocalServer(options: LocalSessionOptions): KovoLocalSe
       }
     }
 
+    const sseRunMatch = /^\/api\/runs\/([A-Za-z0-9_-]{1,128})\/events$/.exec(path.pathname)
+    let sseTenantId: string | null = null
+    if (sseRunMatch) {
+      const sseRunId = sseRunMatch[1]!
+      const ctxTenant = runtime?.getRunContext(sseRunId)?.tenantId ?? null
+      if (ctxTenant && ctxTenant !== 'default') {
+        sseTenantId = ctxTenant
+      } else if (storeHandle) {
+        try {
+          const resolvedTenant = storeHandle.getRunTenant(sseRunId)
+          sseTenantId = resolvedTenant && resolvedTenant !== 'default' ? resolvedTenant : null
+        } catch {
+          sseTenantId = null
+        }
+      }
+      if (killSwitch.isActive(sseTenantId)) {
+        return sendJson(res, 503, { error: 'Kill switch active.', code: 'KILL_SWITCH_TRIPPED' })
+      }
+    }
+
     const abort = new AbortController()
     const unsubscribeSseRevocation = path.pathname.endsWith('/events')
-      ? killSwitch.onSseRevocation(() => {
-          if (!abort.signal.aborted) abort.abort()
+      ? killSwitch.onSseRevocation(state => {
+          if (state.tenantId === null || (sseTenantId !== null && state.tenantId === sseTenantId)) {
+            if (!abort.signal.aborted) abort.abort()
+          }
         })
       : null
     res.once('close', () => {
