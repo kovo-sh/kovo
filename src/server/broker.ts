@@ -21,6 +21,11 @@ import { buildPersonaHeader, personaSecrets } from './persona-vault.ts'
 import type { ResolvedPersona } from './persona-vault.ts'
 import { redact, redactHeaders, scanSecretHeaders, scanSecrets } from './redact.ts'
 import type { NamedSecret, SecretMatch } from './redact.ts'
+import {
+  resolveRunSafetyBudgets,
+  RUN_SAFETY_BUDGET_DEFAULTS,
+  RUN_SAFETY_BUDGET_HARD_CEILINGS,
+} from './run-safety-budgets.ts'
 import type { ScopeHook, ScopePolicy } from './scope-policy.ts'
 import {
   defaultRequestAdmissionEngine,
@@ -455,8 +460,10 @@ export type BrokerOptions = {
   canaryBroker?: CanaryBroker
   maxJarsPerAssignment?: number
   maxCookiesPerJar?: number
-  /** Per-run fail-closed cap on dynamically registered redaction secrets (defaults to `DEFAULT_MAX_REDACTED_SECRETS_PER_RUN`). */
+  /** Per-run fail-closed cap on dynamically registered redaction secrets (defaults to `resolveRunSafetyBudgets().maxRedactedSecretsPerRun`). */
   maxRedactedSecretsPerRun?: number
+  /** Optional planned assignment workload used to scale `RunSafetyBudgets` (including `maxRedactedSecretsPerRun`). */
+  maxAssignments?: number
   /** Injectable clock (test-only) used by circuit-breaker accounting. */
   now?: () => number
   /**
@@ -569,6 +576,8 @@ interface SessionJar {
   scopeRevision: number
   cookies: Map<string, JarCookieEntry>
   csrfTokens: Map<string, StoredCsrfToken>
+  /** Active slot-to-secret bindings owned by this jar in `redactedSecretsByRun` for lifecycle-aware release. */
+  secretSlots: Map<string, string>
   /** Epoch ms when broker auto-reauth refreshed the owning persona's Vault credential. */
   vaultRefreshedAt?: number
   lastUsedAt: number
@@ -586,8 +595,8 @@ function sessionJarKey(assignmentKey: string, role: string, persona: string | un
   return `${assignmentKey}\0${role}\0${persona ? `p:${persona}` : 'p:'}\0${session ? `s:${session}` : 's:'}`
 }
 
-export const DEFAULT_MAX_REDACTED_SECRETS_PER_RUN = 5_000
-export const HARD_MAX_REDACTED_SECRETS_PER_RUN = 50_000
+export const DEFAULT_MAX_REDACTED_SECRETS_PER_RUN = RUN_SAFETY_BUDGET_DEFAULTS.maxRedactedSecretsPerRun
+export const HARD_MAX_REDACTED_SECRETS_PER_RUN = RUN_SAFETY_BUDGET_HARD_CEILINGS.maxRedactedSecretsPerRun
 
 export interface JarKeyScope {
   runId?: string
@@ -2003,6 +2012,14 @@ export class RequestBroker {
   private readonly personaSessionOwnersByRun = new Map<string, Map<string, string>>()
   /** Per-run fail-closed redaction registries (never evict live-run secrets; cleared on `disposeRun`). */
   private readonly redactedSecretsByRun = new Map<string, Map<string, NamedSecret>>()
+  /** Per-run lifecycle reference counts (`jarRefs` + `pinned`) for registered redaction secrets. */
+  private readonly redactedSecretRefsByRun = new Map<string, Map<string, { jarRefs: number; pinned: boolean }>>()
+  /** Per-run one-shot high-watermark (>=80%) capacity warning tracker. */
+  private readonly redactionCapacityWarnedByRun = new Set<string>()
+  /** Per-run flag set if a post-send mutating response overflowed capacity; forces pre-send fail-closed until headroom returns. */
+  private readonly redactionCapacitySaturatedByRun = new Set<string>()
+  /** Resolved per-run redaction secret cap from `RunSafetyBudgets`. */
+  private readonly resolvedMaxRedactedSecretsPerRun: number
   private readonly seenGcbTokens = new Map<string, { probeClass: string; verifyUsed: boolean }>()
   /** Q4: Run-scoped SHA-256 digests of signed/opaque tokens observed in non-privileged in-scope responses (never raw tokens). */
   private readonly ephemeralTokenDigestsByRun = new Map<string, Map<string, { origin: string; observedAt: number }>>()
@@ -2017,6 +2034,19 @@ export class RequestBroker {
   constructor(options: BrokerOptions = {}) {
     this.options = options
     this.reauthHandler = options.reauth
+    const safetyBudgets = resolveRunSafetyBudgets({
+      ...(options.maxAssignments !== undefined ? { maxAssignments: options.maxAssignments } : {}),
+      ...(options.maxRedactedSecretsPerRun !== undefined
+        ? { overrides: { maxRedactedSecretsPerRun: options.maxRedactedSecretsPerRun } }
+        : {}),
+    })
+    this.resolvedMaxRedactedSecretsPerRun = Math.max(
+      1,
+      Math.min(
+        HARD_MAX_REDACTED_SECRETS_PER_RUN,
+        safetyBudgets.maxRedactedSecretsPerRun || DEFAULT_MAX_REDACTED_SECRETS_PER_RUN,
+      ),
+    )
     this.transportConfig = resolveTransportConfig(process.env, options.transportConfig)
     this.httpTransport = options.transport ?? createHttpTransport(this.transportConfig, defaultTransport)
     this.admissionEngine = options.admissionEngine ?? defaultRequestAdmissionEngine
@@ -2206,11 +2236,120 @@ export class RequestBroker {
   }
 
   private maxRedactedSecretsPerRun(): number {
-    const raw = this.options.maxRedactedSecretsPerRun
-    if (typeof raw === 'number' && Number.isFinite(raw)) {
-      return Math.max(1, Math.min(HARD_MAX_REDACTED_SECRETS_PER_RUN, Math.floor(raw)))
+    return this.resolvedMaxRedactedSecretsPerRun
+  }
+
+  private isMutatingMethod(method: string, body?: string): boolean {
+    const upper = method.toUpperCase()
+    if (upper === 'GET' || upper === 'HEAD') return false
+    if (upper === 'OPTIONS' && (body === undefined || body === '')) return false
+    return true
+  }
+
+  private emitRedactionCapacityWarningIfNeeded(
+    runKey: string,
+    activeCount: number,
+    cap: number,
+    label: string,
+    storage?: SecondOrderStore,
+  ): void {
+    if (cap < 5 || this.redactionCapacityWarnedByRun.has(runKey)) return
+    const threshold = Math.ceil(cap * 0.8)
+    if (activeCount < threshold) return
+    this.redactionCapacityWarnedByRun.add(runKey)
+    try {
+      const store = storage ?? this.options.storage
+      store?.event?.(
+        runKey === 'default' ? null : runKey,
+        'broker.redaction_capacity_warning',
+        `Per-run redaction registry reached ${activeCount}/${cap} active secrets for run "${runKey}".`,
+        {
+          runId: runKey,
+          cap,
+          activeCount,
+          utilizationPct: Math.round((activeCount / cap) * 100),
+          label,
+        },
+      )
+    } catch { /* telemetry is best-effort */ }
+  }
+
+  private emitRedactionCapacityExceeded(
+    runKey: string,
+    activeCount: number,
+    cap: number,
+    label: string,
+    phase: 'pre_send' | 'post_send' | 'post_send_mutating_saturated',
+    storage?: SecondOrderStore,
+  ): void {
+    try {
+      const store = storage ?? this.options.storage
+      store?.event?.(
+        runKey === 'default' ? null : runKey,
+        'broker.redaction_capacity_exceeded',
+        `Per-run redaction registry cap (${cap}) reached for run "${runKey}"; failing closed instead of evicting live secrets.`,
+        {
+          runId: runKey,
+          cap,
+          activeCount,
+          label,
+          phase,
+          degradation: 'redaction_fail_closed',
+        },
+      )
+    } catch { /* telemetry is best-effort; fail-closed error still throws */ }
+  }
+
+  /**
+   * R4-H-19: Pre-send fail-closed placement guard.
+   * Rejects before any wire bytes are sent when the run's redaction registry is already saturated
+   * OR when a mutating jar/auth-bound request has zero remaining redaction headroom (preventing
+   * post-send `RedactionCapacityError` throws from discarding evidence of mutations already sent).
+   */
+  private assertRedactionCapacityBeforeSend(
+    runKey: string,
+    req: BrokerHttpRequest,
+    grant: Grant,
+    usesRedactionRegistry: boolean,
+  ): void {
+    if (!usesRedactionRegistry) return
+    const runSecrets = this.redactedSecretsByRun.get(runKey)
+    const activeCount = runSecrets?.size ?? 0
+    const cap = this.maxRedactedSecretsPerRun()
+    if (activeCount < cap) {
+      this.redactionCapacitySaturatedByRun.delete(runKey)
+      return
     }
-    return DEFAULT_MAX_REDACTED_SECRETS_PER_RUN
+    const saturated = this.redactionCapacitySaturatedByRun.has(runKey)
+    const mutating = this.isMutatingMethod(req.method, req.body)
+    if (saturated || mutating) {
+      this.emitRedactionCapacityExceeded(
+        runKey,
+        activeCount,
+        cap,
+        `pre_send:${req.method}`,
+        'pre_send',
+        this.options.storage ?? grant.storage,
+      )
+      throw new RedactionCapacityError(runKey, cap, activeCount)
+    }
+  }
+
+  private ensureRunRedactionMaps(runKey: string): {
+    runSecrets: Map<string, NamedSecret>
+    runRefs: Map<string, { jarRefs: number; pinned: boolean }>
+  } {
+    let runSecrets = this.redactedSecretsByRun.get(runKey)
+    if (!runSecrets) {
+      runSecrets = new Map<string, NamedSecret>()
+      this.redactedSecretsByRun.set(runKey, runSecrets)
+    }
+    let runRefs = this.redactedSecretRefsByRun.get(runKey)
+    if (!runRefs) {
+      runRefs = new Map<string, { jarRefs: number; pinned: boolean }>()
+      this.redactedSecretRefsByRun.set(runKey, runRefs)
+    }
+    return { runSecrets, runRefs }
   }
 
   private registerSecret(
@@ -2221,32 +2360,137 @@ export class RequestBroker {
   ): void {
     if (!value || value.length < 4) return
     const runKey = normalizeRunKey(runId)
-    let runSecrets = this.redactedSecretsByRun.get(runKey)
-    if (!runSecrets) {
-      runSecrets = new Map<string, NamedSecret>()
-      this.redactedSecretsByRun.set(runKey, runSecrets)
+    const { runSecrets, runRefs } = this.ensureRunRedactionMaps(runKey)
+    if (runSecrets.has(value)) {
+      const existingRef = runRefs.get(value)
+      if (existingRef) existingRef.pinned = true
+      else runRefs.set(value, { jarRefs: 0, pinned: true })
+      return
     }
-    if (runSecrets.has(value)) return
     const cap = this.maxRedactedSecretsPerRun()
     if (runSecrets.size >= cap) {
-      try {
-        const store = storage ?? this.options.storage
-        store?.event?.(
-          runKey === 'default' ? null : runKey,
-          'broker.redaction_capacity_exceeded',
-          `Per-run redaction registry cap (${cap}) reached for run "${runKey}"; failing closed instead of evicting live secrets.`,
-          {
-            runId: runKey,
-            cap,
-            activeCount: runSecrets.size,
-            label,
-            degradation: 'redaction_fail_closed',
-          },
-        )
-      } catch { /* telemetry is best-effort; fail-closed error still throws */ }
+      this.emitRedactionCapacityExceeded(runKey, runSecrets.size, cap, label, 'pre_send', storage)
       throw new RedactionCapacityError(runKey, cap, runSecrets.size)
     }
     runSecrets.set(value, { placeholder: `[redacted:${label}]`, value })
+    runRefs.set(value, { jarRefs: 0, pinned: true })
+    this.emitRedactionCapacityWarningIfNeeded(runKey, runSecrets.size, cap, label, storage)
+  }
+
+  private releaseSecretJarRef(runId: string, value: string, retiredSecrets?: NamedSecret[]): void {
+    const runKey = normalizeRunKey(runId)
+    const runSecrets = this.redactedSecretsByRun.get(runKey)
+    const runRefs = this.redactedSecretRefsByRun.get(runKey)
+    if (!runSecrets || !runRefs) return
+    const existing = runSecrets.get(value)
+    if (existing && retiredSecrets) {
+      retiredSecrets.push(existing)
+    }
+    const ref = runRefs.get(value)
+    if (!ref) return
+    ref.jarRefs = Math.max(0, ref.jarRefs - 1)
+    if (ref.jarRefs === 0 && !ref.pinned) {
+      runRefs.delete(value)
+      runSecrets.delete(value)
+      if (runSecrets.size === 0) {
+        this.redactedSecretsByRun.delete(runKey)
+        this.redactedSecretRefsByRun.delete(runKey)
+      }
+      if (runSecrets.size < this.maxRedactedSecretsPerRun()) {
+        this.redactionCapacitySaturatedByRun.delete(runKey)
+      }
+    }
+  }
+
+  private releaseJarSecretSlot(jar: SessionJar, slotId: string, retiredSecrets?: NamedSecret[]): void {
+    const prev = jar.secretSlots.get(slotId)
+    if (prev === undefined) return
+    jar.secretSlots.delete(slotId)
+    this.releaseSecretJarRef(jar.runId, prev, retiredSecrets)
+  }
+
+  private releaseAllJarSecrets(jar: SessionJar): void {
+    if (jar.secretSlots.size === 0) return
+    for (const value of jar.secretSlots.values()) {
+      this.releaseSecretJarRef(jar.runId, value)
+    }
+    jar.secretSlots.clear()
+  }
+
+  private deleteSessionJar(jarKey: string): void {
+    const jar = this.sessionJars.get(jarKey)
+    if (!jar) return
+    this.releaseAllJarSecrets(jar)
+    this.sessionJars.delete(jarKey)
+  }
+
+  /**
+   * Lifecycle-aware binding of a jar cookie / CSRF slot to `redactedSecretsByRun`.
+   * Replacing an active slot releases the superseded value (unless still referenced by another
+   * jar slot or pinned secret) BEFORE checking capacity, so rotating values reuse the active
+   * slot cleanly. Returns `false` only when an already-sent mutating response hits genuine cap
+   * saturation (recording the value in `transientSecrets` for this response's redaction and
+   * tripping `redactionCapacitySaturatedByRun` so the next pre-send fails closed without
+   * discarding evidence of the already-sent mutation).
+   */
+  private bindJarSecretSlot(
+    jar: SessionJar,
+    slotId: string,
+    label: string,
+    value: string | undefined,
+    opts: {
+      storage?: SecondOrderStore
+      wasMutating: boolean
+      retiredSecrets: NamedSecret[]
+      transientSecrets: NamedSecret[]
+    },
+  ): boolean {
+    const prev = jar.secretSlots.get(slotId)
+    if (!value || value.length < 4) {
+      if (prev !== undefined) this.releaseJarSecretSlot(jar, slotId, opts.retiredSecrets)
+      return true
+    }
+    if (prev === value) return true
+
+    const runKey = normalizeRunKey(jar.runId)
+    const cap = this.maxRedactedSecretsPerRun()
+    const existingRunSecrets = this.redactedSecretsByRun.get(runKey)
+    const existingRunRefs = this.redactedSecretRefsByRun.get(runKey)
+
+    if (existingRunSecrets?.has(value)) {
+      if (prev !== undefined) this.releaseJarSecretSlot(jar, slotId, opts.retiredSecrets)
+      const ref = existingRunRefs?.get(value)
+      if (ref) ref.jarRefs += 1
+      else this.ensureRunRedactionMaps(runKey).runRefs.set(value, { jarRefs: 1, pinned: false })
+      jar.secretSlots.set(slotId, value)
+      return true
+    }
+
+    const prevRef = prev !== undefined ? existingRunRefs?.get(prev) : undefined
+    const prevWillFree = prev !== undefined && Boolean(prevRef && prevRef.jarRefs <= 1 && !prevRef.pinned)
+    const currentSize = existingRunSecrets?.size ?? 0
+    const projectedSize = currentSize - (prevWillFree ? 1 : 0)
+
+    if (projectedSize >= cap) {
+      if (opts.wasMutating) {
+        opts.transientSecrets.push({ placeholder: `[redacted:${label}]`, value })
+        this.redactionCapacitySaturatedByRun.add(runKey)
+        this.emitRedactionCapacityExceeded(runKey, currentSize, cap, label, 'post_send_mutating_saturated', opts.storage)
+        return false
+      }
+      this.emitRedactionCapacityExceeded(runKey, currentSize, cap, label, 'post_send', opts.storage)
+      throw new RedactionCapacityError(runKey, cap, currentSize)
+    }
+
+    if (prev !== undefined) {
+      this.releaseJarSecretSlot(jar, slotId, opts.retiredSecrets)
+    }
+    const { runSecrets, runRefs } = this.ensureRunRedactionMaps(runKey)
+    runSecrets.set(value, { placeholder: `[redacted:${label}]`, value })
+    runRefs.set(value, { jarRefs: 1, pinned: false })
+    jar.secretSlots.set(slotId, value)
+    this.emitRedactionCapacityWarningIfNeeded(runKey, runSecrets.size, cap, label, opts.storage)
+    return true
   }
 
   resolveJarKey(req: JarKeyScope, grant?: Pick<Grant, 'scopePolicy'>): ResolvedJarKey {
@@ -2273,6 +2517,9 @@ export class RequestBroker {
     this.personaScopeMismatchKeysByRun.delete(key)
     this.ephemeralTokenDigestsByRun.delete(key)
     this.redactedSecretsByRun.delete(key)
+    this.redactedSecretRefsByRun.delete(key)
+    this.redactionCapacityWarnedByRun.delete(key)
+    this.redactionCapacitySaturatedByRun.delete(key)
     const runApexes = this.activeApexesByRun.get(key)
     this.activeApexesByRun.delete(key)
     if (runApexes) {
@@ -2346,9 +2593,9 @@ export class RequestBroker {
       if (scopeRevision > prev) {
         this.latestScopeRevisionByRun.set(runId, scopeRevision)
       }
-      for (const [key, jar] of this.sessionJars.entries()) {
+      for (const [key, jar] of [...this.sessionJars.entries()]) {
         if (jar.runId === runId && jar.scopeRevision < scopeRevision) {
-          this.sessionJars.delete(key)
+          this.deleteSessionJar(key)
         }
       }
       return
@@ -2360,9 +2607,9 @@ export class RequestBroker {
     if (scopeRevision > prev) {
       this.latestScopeRevisionByRun.set('default', scopeRevision)
     }
-    for (const [key, jar] of this.sessionJars.entries()) {
+    for (const [key, jar] of [...this.sessionJars.entries()]) {
       if (jar.scopeRevision < scopeRevision) {
-        this.sessionJars.delete(key)
+        this.deleteSessionJar(key)
       }
     }
   }
@@ -2370,6 +2617,9 @@ export class RequestBroker {
   purgeSessionJars(runId?: string, origin?: string) {
     const normalizedRunId = runId !== undefined ? normalizeRunKey(runId) : undefined
     if (!normalizedRunId && !origin) {
+      for (const jar of this.sessionJars.values()) {
+        this.releaseAllJarSecrets(jar)
+      }
       this.sessionJars.clear()
       this.ephemeralTokenDigestsByRun.clear()
       return
@@ -2385,10 +2635,10 @@ export class RequestBroker {
         if (tokens.size === 0) this.ephemeralTokenDigestsByRun.delete(rKey)
       }
     }
-    for (const [key, jar] of this.sessionJars.entries()) {
+    for (const [key, jar] of [...this.sessionJars.entries()]) {
       if (normalizedRunId && jar.runId !== normalizedRunId) continue
       if (!origin) {
-        this.sessionJars.delete(key)
+        this.deleteSessionJar(key)
         continue
       }
       let originHost = ''
@@ -2397,13 +2647,20 @@ export class RequestBroker {
       } catch {
         originHost = ''
       }
-      for (const [ck, c] of jar.cookies.entries()) {
+      for (const [ck, c] of [...jar.cookies.entries()]) {
         const domainScopedToOrigin = !c.hostOnly && originHost !== '' &&
           (c.domain === originHost || originHost.endsWith(`.${c.domain}`))
-        if (c.origin === origin || domainScopedToOrigin) jar.cookies.delete(ck)
+        if (c.origin === origin || domainScopedToOrigin) {
+          this.releaseJarSecretSlot(jar, `cookie:${ck}`)
+          jar.cookies.delete(ck)
+        }
       }
       for (const tokenKey of [...jar.csrfTokens.keys()]) {
-        if (tokenKey.startsWith(`${origin}\0`) || tokenKey === origin) jar.csrfTokens.delete(tokenKey)
+        if (tokenKey.startsWith(`${origin}\0`) || tokenKey === origin) {
+          this.releaseJarSecretSlot(jar, `csrf:${tokenKey}`)
+          this.releaseJarSecretSlot(jar, `csrf_raw:${tokenKey}`)
+          jar.csrfTokens.delete(tokenKey)
+        }
       }
     }
   }
@@ -2438,12 +2695,13 @@ export class RequestBroker {
       const toEvict = assignmentJars.length - maxJars + 1
       for (let i = 0; i < toEvict; i += 1) {
         const victim = assignmentJars[i]
-        if (victim) this.sessionJars.delete(victim.jarKey)
+        if (victim) this.deleteSessionJar(victim.jarKey)
       }
     }
 
     const cookies = new Map<string, JarCookieEntry>()
     const csrfTokens = new Map<string, StoredCsrfToken>()
+    const secretSlots = new Map<string, string>()
 
     // Only `setup` jars may seed `control` or `probe` via deep-clone on first access;
     // `control` and `probe` remain strictly isolated from each other.
@@ -2453,6 +2711,12 @@ export class RequestBroker {
       if (setupJar) {
         for (const [k, v] of setupJar.cookies.entries()) cookies.set(k, { ...v })
         for (const [k, v] of setupJar.csrfTokens.entries()) csrfTokens.set(k, { ...v })
+        const runRefs = this.redactedSecretRefsByRun.get(normalizeRunKey(runId))
+        for (const [slotId, secretVal] of setupJar.secretSlots.entries()) {
+          secretSlots.set(slotId, secretVal)
+          const ref = runRefs?.get(secretVal)
+          if (ref) ref.jarRefs += 1
+        }
       }
     }
 
@@ -2467,6 +2731,7 @@ export class RequestBroker {
       scopeRevision: effectiveRevision,
       cookies,
       csrfTokens,
+      secretSlots,
       lastUsedAt: Date.now(),
     }
     this.sessionJars.set(jarKey, created)
@@ -2480,39 +2745,82 @@ export class RequestBroker {
     mediaType: string,
     vaultCookiesAtRequest?: ReadonlyMap<string, string>,
     storage?: SecondOrderStore,
-  ) {
+    wasMutating = false,
+  ): { retiredSecrets: NamedSecret[]; transientSecrets: NamedSecret[] } {
+    const retiredSecrets: NamedSecret[] = []
+    const transientSecrets: NamedSecret[] = []
+    const bindOpts = { storage, wasMutating, retiredSecrets, transientSecrets }
     const maxCookies = Math.max(1, Math.min(this.options.maxCookiesPerJar ?? 32, 64))
     const parsedEntries = parseSetCookieHeaderEntries(response.headers, url)
     const csrfPathPrefix = normalizeCookiePath(undefined, url.pathname)
+    const csrfMapKey = `${url.origin}\0${csrfPathPrefix}`
+
+    const evictOldestCsrfIfNeeded = (incomingKey: string) => {
+      if (jar.csrfTokens.has(incomingKey)) {
+        jar.csrfTokens.delete(incomingKey)
+        return
+      }
+      while (jar.csrfTokens.size >= maxCookies) {
+        const oldest = jar.csrfTokens.keys().next().value
+        if (oldest === undefined) break
+        this.releaseJarSecretSlot(jar, `csrf:${oldest}`, retiredSecrets)
+        this.releaseJarSecretSlot(jar, `csrf_raw:${oldest}`, retiredSecrets)
+        jar.csrfTokens.delete(oldest)
+      }
+    }
+
     for (const item of parsedEntries) {
+      const cookieSlot = `cookie:${item.entry.key}`
       if (item.action === 'delete') {
+        this.releaseJarSecretSlot(jar, cookieSlot, retiredSecrets)
         jar.cookies.delete(item.entry.key)
         continue
       }
-      // Register secret BEFORE persisting cookie so a redaction-cap overflow fails closed.
-      this.registerSecret(jar.runId, `jar:${jar.session}:${item.entry.name}`, item.entry.value, storage)
       const existing = jar.cookies.get(item.entry.key)
+      if (!existing && jar.cookies.size >= maxCookies) {
+        while (jar.cookies.size >= maxCookies) {
+          const oldest = jar.cookies.keys().next().value
+          if (oldest === undefined) break
+          this.releaseJarSecretSlot(jar, `cookie:${oldest}`, retiredSecrets)
+          jar.cookies.delete(oldest)
+        }
+      }
+      // Register/replace secret BEFORE persisting cookie so a redaction-cap overflow fails closed.
+      const bound = this.bindJarSecretSlot(
+        jar,
+        cookieSlot,
+        `jar:${jar.session}:${item.entry.name}`,
+        item.entry.value,
+        bindOpts,
+      )
+      if (!bound) continue
       item.entry.writeCount = (existing?.writeCount ?? 0) + 1
       item.entry.rotatedFromResponse = true
       item.entry.vaultValueAtWrite = vaultCookiesAtRequest?.get(item.entry.name)
       if (existing) {
         jar.cookies.delete(item.entry.key)
-      } else if (jar.cookies.size >= maxCookies) {
-        while (jar.cookies.size >= maxCookies) {
-          const oldest = jar.cookies.keys().next().value
-          if (oldest === undefined) break
-          jar.cookies.delete(oldest)
-        }
       }
       jar.cookies.set(item.entry.key, item.entry)
 
       if (csrfCookieNameRegex.test(item.entry.name) && item.entry.value) {
-        jar.csrfTokens.set(`${url.origin}\0${csrfPathPrefix}`, {
-          value: decodeCsrfValue(item.entry.value),
-          sourceKind: 'cookie',
-          detectedName: item.entry.name,
-          updatedAt: Date.now(),
-        })
+        const decodedCsrf = decodeCsrfValue(item.entry.value)
+        evictOldestCsrfIfNeeded(csrfMapKey)
+        const csrfBound = this.bindJarSecretSlot(
+          jar,
+          `csrf:${csrfMapKey}`,
+          `csrf:${jar.session}:${item.entry.name}`,
+          decodedCsrf,
+          bindOpts,
+        )
+        this.releaseJarSecretSlot(jar, `csrf_raw:${csrfMapKey}`, retiredSecrets)
+        if (csrfBound) {
+          jar.csrfTokens.set(csrfMapKey, {
+            value: decodedCsrf,
+            sourceKind: 'cookie',
+            detectedName: item.entry.name,
+            updatedAt: Date.now(),
+          })
+        }
       }
     }
 
@@ -2522,25 +2830,59 @@ export class RequestBroker {
       const value = Array.isArray(raw) ? raw[0] : raw
       if (!value || !value.trim()) continue
       const token = decodeCsrfValue(value.trim())
-      this.registerSecret(jar.runId, `csrf:${jar.session}:${headerName}`, token, storage)
-      jar.csrfTokens.set(`${url.origin}\0${csrfPathPrefix}`, {
-        value: token,
-        sourceKind: 'header',
-        detectedName: headerName,
-        updatedAt: Date.now(),
-      })
+      evictOldestCsrfIfNeeded(csrfMapKey)
+      const csrfBound = this.bindJarSecretSlot(
+        jar,
+        `csrf:${csrfMapKey}`,
+        `csrf:${jar.session}:${headerName}`,
+        token,
+        bindOpts,
+      )
+      this.releaseJarSecretSlot(jar, `csrf_raw:${csrfMapKey}`, retiredSecrets)
+      if (csrfBound) {
+        jar.csrfTokens.set(csrfMapKey, {
+          value: token,
+          sourceKind: 'header',
+          detectedName: headerName,
+          updatedAt: Date.now(),
+        })
+      }
       break
     }
 
     const bodyCsrf = extractCsrfFromBody(mediaType, response.body ?? '')
     if (bodyCsrf) {
-      this.registerSecret(jar.runId, `csrf:${jar.session}:${bodyCsrf.detectedName ?? 'token'}`, bodyCsrf.value, storage)
-      jar.csrfTokens.set(`${url.origin}\0${csrfPathPrefix}`, {
-        ...bodyCsrf,
-        value: decodeCsrfValue(bodyCsrf.value),
-        updatedAt: Date.now(),
-      })
+      const decodedBodyCsrf = decodeCsrfValue(bodyCsrf.value)
+      evictOldestCsrfIfNeeded(csrfMapKey)
+      const csrfBound = this.bindJarSecretSlot(
+        jar,
+        `csrf:${csrfMapKey}`,
+        `csrf:${jar.session}:${bodyCsrf.detectedName ?? 'token'}`,
+        decodedBodyCsrf,
+        bindOpts,
+      )
+      let rawBound = true
+      if (bodyCsrf.value !== decodedBodyCsrf) {
+        rawBound = this.bindJarSecretSlot(
+          jar,
+          `csrf_raw:${csrfMapKey}`,
+          `csrf:${jar.session}:${bodyCsrf.detectedName ?? 'token'}`,
+          bodyCsrf.value,
+          bindOpts,
+        )
+      } else {
+        this.releaseJarSecretSlot(jar, `csrf_raw:${csrfMapKey}`, retiredSecrets)
+      }
+      if (csrfBound && rawBound) {
+        jar.csrfTokens.set(csrfMapKey, {
+          ...bodyCsrf,
+          value: decodedBodyCsrf,
+          updatedAt: Date.now(),
+        })
+      }
     }
+
+    return { retiredSecrets, transientSecrets }
   }
 
   /** Look up a CSRF token for a hop: `(origin, pathPrefix)` first, then most-recent origin fallback. */
@@ -2903,7 +3245,7 @@ export class RequestBroker {
         throw new BrokerCircuitOpen(origin, state.openReason)
       }
       if (routeTemplate) this.assertRouteCircuit(origin, routeTemplate)
-      const now = Date.now()
+      const now = this.now()
       const configuredRps = readConfiguredRps()
       const rps = Math.max(1, Math.min(configuredRps, state.adaptiveRps ?? configuredRps))
       const elapsedSec = Math.max(0, (now - state.lastRefill) / 1000)
@@ -3209,8 +3551,9 @@ export class RequestBroker {
     const cookieHeader = Object.entries(refreshedHeaders).find(([k]) => k.toLowerCase() === 'cookie')?.[1]
     if (!cookieHeader) return
     const refreshedNames = new Set(parseCookieHeaderPairs(cookieHeader).keys())
-    for (const [key, entry] of jar.cookies.entries()) {
+    for (const [key, entry] of [...jar.cookies.entries()]) {
       if (refreshedNames.has(entry.name)) {
+        this.releaseJarSecretSlot(jar, `cookie:${key}`)
         jar.cookies.delete(key)
       }
     }
@@ -3506,6 +3849,11 @@ export class RequestBroker {
     }
 
     const personaHandle = req.persona ?? req.personaHandle
+    const usesRedactionRegistry =
+      req.session !== undefined ||
+      (personaHandle !== undefined && req.csrfBind !== undefined) ||
+      Boolean(req.authMutation)
+    this.assertRedactionCapacityBeforeSend(scopeRunId, req, grant, usesRedactionRegistry)
     const syntheticAuth = isSyntheticAuthMutation(req.authMutation)
     const admissionReq = this.toAdmissionRequest(req, options, grant)
     const auditCtx = { pathAndQuery: req.pathAndQuery, persona: personaHandle, secrets: req.secrets, runId: req.runId }
@@ -3997,6 +4345,7 @@ export class RequestBroker {
 
     const redirectOrigins = new Set<string>([url.origin])
     const redirectPaths: string[] = []
+    const exchangeExtraSecrets: NamedSecret[] = []
     let activeMethod: BrokerHttpRequest['method'] = req.method
     let activeBody = prepared.preparedBody
     let activeHeaders = { ...cleanHeaders }
@@ -4377,7 +4726,16 @@ export class RequestBroker {
       }
 
       if (jar) {
-        this.storeJarCookiesAndCsrf(jar, url, response, obs.mediaType, vaultCookies, this.options.storage ?? grant.storage)
+        const jarDelta = this.storeJarCookiesAndCsrf(
+          jar,
+          url,
+          response,
+          obs.mediaType,
+          vaultCookies,
+          this.options.storage ?? grant.storage,
+          this.isMutatingMethod(activeMethod, hopBody ?? activeBody),
+        )
+        exchangeExtraSecrets.push(...jarDelta.retiredSecrets, ...jarDelta.transientSecrets)
       }
 
       if (followRedirects && [301, 302, 303, 307, 308].includes(response.status)) {
@@ -4432,6 +4790,7 @@ export class RequestBroker {
       const effectiveSecrets: NamedSecret[] = [
         ...secrets,
         ...this.getRegisteredSecrets(this.resolveScopeRunKey(req, grant)),
+        ...exchangeExtraSecrets,
       ]
       // Structural evidence must be captured from the pre-redaction bytes: redaction is correct
       // for logs/LLMs but erases what a disclosure verifier needs. Only bounded fingerprints leave
@@ -4543,10 +4902,10 @@ export class RequestBroker {
   }): Promise<{ invalidatedJars: number; reminted: boolean }> {
     const runKey = this.resolveScopeRunKey({ runId: input.runId }, input.grant as Grant | undefined)
     let invalidatedJars = 0
-    for (const [key, jar] of this.sessionJars.entries()) {
+    for (const [key, jar] of [...this.sessionJars.entries()]) {
       if (jar.runId !== runKey) continue
       if (jar.persona !== input.personaHandle) continue
-      this.sessionJars.delete(key)
+      this.deleteSessionJar(key)
       invalidatedJars += 1
     }
     const owners = this.personaSessionOwnersByRun.get(runKey)
@@ -4878,8 +5237,18 @@ export class RequestBroker {
         }
       }
 
+      const h2ExtraSecrets: NamedSecret[] = []
       if (jar) {
-        this.storeJarCookiesAndCsrf(jar, url, response, obs.mediaType, vaultCookies, this.options.storage ?? grant.storage)
+        const jarDelta = this.storeJarCookiesAndCsrf(
+          jar,
+          url,
+          response,
+          obs.mediaType,
+          vaultCookies,
+          this.options.storage ?? grant.storage,
+          this.isMutatingMethod(req.method, prepared.preparedBody),
+        )
+        h2ExtraSecrets.push(...jarDelta.retiredSecrets, ...jarDelta.transientSecrets)
       }
 
       const rawBody = response.body ?? ''
@@ -4899,6 +5268,7 @@ export class RequestBroker {
       const effectiveSecrets: NamedSecret[] = [
         ...secrets,
         ...this.getRegisteredSecrets(this.resolveScopeRunKey(req, grant)),
+        ...h2ExtraSecrets,
       ]
       const rawResponseHeaders = normalizeHeaders(response.headers)
       this.observeEphemeralResponseTokens({
