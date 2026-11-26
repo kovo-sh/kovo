@@ -157,8 +157,36 @@ export interface FloorBrowserInput {
   marker?: string
 }
 
+export interface FloorRestoreDegradationEvent {
+  recipeId: FloorRecipeId
+  role: string
+  actorHandle: string
+  origin: string
+  method: string
+  pathAndQuery: string
+  reason: string
+  status?: number | null
+  sessionInvalidated: boolean
+  sessionReminted: boolean
+}
+
 export interface FloorRecipeDeps {
   request(spec: FloorRequestSpec): Promise<FloorExchange> | FloorExchange
+  /**
+   * Optional broker cleanup-allowance request seam used when draining `ctx.registerRestore(...)`
+   * inside `runFloorRecipe`'s `finally` block (independent short timeout signal; strictly inside
+   * ScopePolicy and approval/lease gates). Defaults to `request` when omitted.
+   */
+  cleanupRequest?(spec: FloorRequestSpec): Promise<FloorExchange> | FloorExchange
+  /**
+   * Optional persona session invalidation + re-mint seam invoked if a registered state restore
+   * fails or is denied so drifted session state cannot bleed into subsequent probes.
+   */
+  invalidatePersonaSession?(actor: FloorActor): Promise<{ invalidated: boolean; reminted: boolean }> | { invalidated: boolean; reminted: boolean }
+  /**
+   * Optional structured degradation event sink invoked when a state restore fails or is denied.
+   */
+  onRestoreDegradation?(event: FloorRestoreDegradationEvent): void
   /** Optional synchronized concurrent burst execution (production wires `broker.executeRaceBurst`). */
   burst?(specs: readonly FloorRequestSpec[]): Promise<FloorExchange[]> | FloorExchange[]
   /** Durable callback lookup for the token the injection exchange carried. */
@@ -234,7 +262,17 @@ export interface PersistedMutationArgs extends FloorRecipeBaseArgs {
    * Reuses the existing persistence oracle (`findPersistence`): the write is a control arm and its
    * resulting value must differ from the probe's post-read.
    */
-  baselineWrite?: { body: Record<string, unknown>; actor?: FloorActor; method?: string }
+  baselineWrite?: {
+    body: Record<string, unknown>
+    actor?: FloorActor
+    method?: string
+    /** Primary mutated field chosen by `pickBaselineWrite`, prioritized when restoring original value. */
+    field?: string
+    /** Explicit restore body when the owner's pre-test value is already known. */
+    restoreBody?: Record<string, unknown>
+    /** Restore the owner's original value in `finally` (defaults to `true`). */
+    restoreOriginal?: boolean
+  }
   /**
    * Control write restoring the probe actor's own state before the proof. Self-service function
    * state (identity assumption) is a persistent session mutation, so without a reset the pre-read
@@ -477,6 +515,23 @@ export interface FloorRecipeRequireFailure {
   message: string
 }
 
+export interface FloorRestoreHandle {
+  /** Actor whose session should be invalidated/re-minted if this restore fails or is denied. */
+  actor?: FloorActor
+  /** Evidence/cleanup role label (defaults to `'state_restore'`). */
+  role?: string
+  method?: string
+  pathAndQuery?: string
+}
+
+export interface FloorRestoreCleanupApi {
+  sendCleanup(spec: FloorRequestSpec, options?: { recordInTranscript?: boolean }): Promise<FloorRecipeStep>
+}
+
+export type FloorRestoreCallback = (
+  cleanup: FloorRestoreCleanupApi,
+) => Promise<FloorRecipeStep | void> | FloorRecipeStep | void
+
 export interface FloorRecipeContext {
   readonly args: FloorRecipeArgs
   /** Exchanges recorded so far (bounded). */
@@ -496,6 +551,12 @@ export interface FloorRecipeContext {
     canaryToken: string
     actor: FloorActor
   }): Promise<FloorBrowserSessionResult | null>
+  /**
+   * Register a state-restore callback drained in LIFO order inside `runFloorRecipe`'s `finally`
+   * block using the broker cleanup allowance (independent short timeout signal, strictly inside
+   * ScopePolicy and approval/lease gates).
+   */
+  registerRestore(fn: FloorRestoreCallback, meta?: FloorRestoreHandle): void
   /**
    * Record a preconditions the oracle needs that the receipt gate alone cannot name. Returns the
    * condition so a recipe can continue gathering the rest of the minimum evidence.
@@ -521,6 +582,8 @@ export interface FloorRecipeRunResult {
   oobEventIds: string[]
   transcript: ReceiptTranscript
   verification: ReceiptVerification
+  /** Structured degradation events emitted when any `finally`-guarded state restore failed or was denied. */
+  restoreDegradations?: FloorRestoreDegradationEvent[]
 }
 
 export type FloorRecipeFailureCode =
@@ -578,15 +641,20 @@ function inferRequireSide(role: string): FloorRequireSide {
   return 'harness'
 }
 
+const MAX_FLOOR_RESTORE_STEPS = 4
+
 class RecipeContext implements FloorRecipeContext {
   readonly args: FloorRecipeArgs
   readonly steps: FloorRecipeStep[] = []
   readonly missing: RecordedMissing[] = []
+  readonly restoreDegradations: FloorRestoreDegradationEvent[] = []
   private readonly deps: FloorRecipeDeps
   private readonly entries: ReceiptTranscriptEntry[] = []
   private readonly oobEvents: ReceiptOobEvent[] = []
   private readonly traces: ReceiptBrowserTrace[] = []
+  private readonly restores: Array<{ fn: FloorRestoreCallback; meta?: FloorRestoreHandle }> = []
   private exchangeCount = 0
+  private cleanupCount = 0
 
   constructor(args: FloorRecipeArgs, deps: FloorRecipeDeps) {
     this.args = args
@@ -609,10 +677,12 @@ class RecipeContext implements FloorRecipeContext {
     }
   }
 
-  private recordExchange(spec: FloorRequestSpec, exchange: FloorExchange, index: number, measuredDurationMs?: number): FloorRecipeStep {
-    const exchangeId = exchange.exchangeId
-      ?? this.deps.nextExchangeId?.()
-      ?? `fr-${index}`
+  private buildRecordedStep(
+    spec: FloorRequestSpec,
+    exchange: FloorExchange,
+    index: number,
+    exchangeId: string,
+  ): FloorRecipeStep {
     const route = exchange.route ?? pathOnly(spec.pathAndQuery)
     const step: ImpactStep = {
       id: `s${index}:${spec.role}`,
@@ -641,7 +711,7 @@ class RecipeContext implements FloorRecipeContext {
       ...(exchange.secretMatches?.length ? { secretMatches: exchange.secretMatches.slice(0, 16) } : {}),
       evidenceRole: spec.role,
     }
-    const recorded: FloorRecipeStep = {
+    return {
       exchangeId,
       role: spec.role,
       arm: spec.arm,
@@ -649,15 +719,119 @@ class RecipeContext implements FloorRecipeContext {
       exchange,
       step,
     }
+  }
+
+  private recordExchange(spec: FloorRequestSpec, exchange: FloorExchange, index: number, measuredDurationMs?: number): FloorRecipeStep {
+    const exchangeId = exchange.exchangeId
+      ?? this.deps.nextExchangeId?.()
+      ?? `fr-${index}`
+    const recorded = this.buildRecordedStep(spec, exchange, index, exchangeId)
     this.steps.push(recorded)
     this.entries.push({
       exchangeId,
-      step,
+      step: recorded.step,
       durationMs: exchange.durationMs ?? measuredDurationMs ?? 0,
       carrierText: exchange.carrierText ?? carrierTextOf(spec),
       evidenceRole: spec.role,
     })
     return recorded
+  }
+
+  /**
+   * Best-effort non-transcript read used before `baseline_write` so a mutating recipe can capture
+   * the owner's pre-test value for `finally` restoration without altering receipt transcripts.
+   */
+  async readPreBaselineSnapshot(spec: FloorRequestSpec): Promise<FloorExchange | null> {
+    if (!spec.pathAndQuery.trim()) return null
+    try {
+      return await this.deps.request(spec)
+    } catch {
+      return null
+    }
+  }
+
+  registerRestore(fn: FloorRestoreCallback, meta?: FloorRestoreHandle): void {
+    this.restores.push({ fn, meta })
+  }
+
+  private async sendCleanup(
+    spec: FloorRequestSpec,
+    options: { recordInTranscript?: boolean } = {},
+  ): Promise<FloorRecipeStep> {
+    if (this.cleanupCount >= MAX_FLOOR_RESTORE_STEPS) {
+      throw new Error(`Cleanup exceeded the ${MAX_FLOOR_RESTORE_STEPS}-exchange restore budget.`)
+    }
+    if (!spec.pathAndQuery.trim()) {
+      throw new Error(`Cleanup sent an empty path for role ${spec.role}.`)
+    }
+    this.cleanupCount += 1
+    const startedAt = Date.now()
+    const sender = this.deps.cleanupRequest ?? this.deps.request
+    const exchange = await sender(spec)
+    const durationMs = Math.max(0, Date.now() - startedAt)
+    if (options.recordInTranscript) {
+      this.exchangeCount += 1
+      return this.recordExchange(spec, exchange, this.exchangeCount, durationMs)
+    }
+    const exchangeId = exchange.exchangeId ?? `fr-cleanup-${this.cleanupCount}`
+    return this.buildRecordedStep(spec, exchange, this.cleanupCount, exchangeId)
+  }
+
+  async drainRestores(recipeId: FloorRecipeId): Promise<void> {
+    if (this.restores.length === 0) return
+    const pending = [...this.restores].reverse()
+    this.restores.length = 0
+    for (const item of pending) {
+      let lastSpec: FloorRequestSpec | undefined
+      let failedReason: string | null = null
+      let failedStatus: number | null | undefined
+      try {
+        const result = await item.fn({
+          sendCleanup: async (spec, opts) => {
+            lastSpec = spec
+            return this.sendCleanup(spec, opts)
+          },
+        })
+        if (result && !isSuccess(result.exchange.status)) {
+          failedStatus = result.exchange.status
+          failedReason = `State restore returned non-2xx status (${result.exchange.status ?? 'no status'}).`
+        }
+      } catch (err) {
+        failedReason = err instanceof Error ? err.message.slice(0, 300) : String(err).slice(0, 300)
+      }
+      if (failedReason !== null) {
+        const actor = item.meta?.actor ?? lastSpec?.actor
+        let sessionInvalidated = false
+        let sessionReminted = false
+        if (actor && !ANONYMOUS_ACTOR_HANDLES.has(actor.handle.trim().toLowerCase()) && this.deps.invalidatePersonaSession) {
+          try {
+            const outcome = await this.deps.invalidatePersonaSession(actor)
+            sessionInvalidated = Boolean(outcome?.invalidated)
+            sessionReminted = Boolean(outcome?.reminted)
+          } catch {
+            // Session invalidation failure is itself captured by the degradation event below.
+          }
+        }
+        const event: FloorRestoreDegradationEvent = {
+          recipeId,
+          role: item.meta?.role ?? lastSpec?.role ?? 'state_restore',
+          actorHandle: actor?.handle ?? 'anonymous',
+          origin: this.args.origin,
+          method: (item.meta?.method ?? lastSpec?.method ?? this.args.method).toUpperCase(),
+          pathAndQuery: item.meta?.pathAndQuery ?? lastSpec?.pathAndQuery ?? this.args.pathAndQuery,
+          reason: failedReason,
+          ...(failedStatus !== undefined ? { status: failedStatus } : {}),
+          sessionInvalidated,
+          sessionReminted,
+        }
+        this.restoreDegradations.push(event)
+        try {
+          this.deps.onRestoreDegradation?.(event)
+        } catch {
+          // Degradation telemetry must never mask the primary recipe result.
+        }
+      }
+    }
   }
 
   async send(spec: FloorRequestSpec): Promise<FloorRecipeStep> {
@@ -879,6 +1053,78 @@ const accessBoundary = defineRecipe<AccessBoundaryArgs>('access_boundary', async
   })
 })
 
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
+function trailingResourceId(pathAndQuery: string): string | null {
+  const segments = pathOnly(pathAndQuery).split('/').filter(Boolean)
+  return segments.length > 0 ? segments[segments.length - 1]! : null
+}
+
+function findSnapshotRecord(
+  json: unknown,
+  targetKeys: readonly string[],
+  resourceId: string | null,
+): Record<string, unknown> | null {
+  const hasAnyKey = (obj: Record<string, unknown>) =>
+    targetKeys.some(key => Object.prototype.hasOwnProperty.call(obj, key) && obj[key] !== undefined)
+
+  if (Array.isArray(json)) {
+    const records = json.filter(isPlainRecord)
+    if (resourceId) {
+      const matched = records.find(rec =>
+        String(rec.id ?? rec._id ?? rec.uuid ?? rec.slug ?? '') === resourceId && hasAnyKey(rec))
+      if (matched) return matched
+    }
+    if (records.length === 1 && hasAnyKey(records[0]!)) return records[0]!
+    return null
+  }
+  if (!isPlainRecord(json)) return null
+  if (hasAnyKey(json)) return json
+  for (const wrapperKey of ['data', 'item', 'record', 'result']) {
+    const nested = findSnapshotRecord(json[wrapperKey], targetKeys, resourceId)
+    if (nested) return nested
+  }
+  for (const value of Object.values(json)) {
+    if (Array.isArray(value)) {
+      const nested = findSnapshotRecord(value, targetKeys, resourceId)
+      if (nested) return nested
+    }
+  }
+  return null
+}
+
+function deriveBaselineRestoreBody(
+  baselineWrite: NonNullable<PersistedMutationArgs['baselineWrite']>,
+  probeBody: Record<string, unknown>,
+  pathAndQuery: string,
+  snapshots: readonly unknown[],
+): Record<string, unknown> {
+  if (baselineWrite.restoreBody) return { ...baselineWrite.restoreBody }
+  const targetKeys = [...new Set([
+    ...(baselineWrite.field ? [baselineWrite.field] : []),
+    ...Object.keys(probeBody),
+    ...Object.keys(baselineWrite.body),
+  ])]
+  const resourceId = trailingResourceId(pathAndQuery)
+  for (const snapshot of snapshots) {
+    if (snapshot === undefined) continue
+    const record = findSnapshotRecord(snapshot, targetKeys, resourceId)
+    if (!record) continue
+    const restored: Record<string, unknown> = { ...baselineWrite.body }
+    let applied = false
+    for (const key of targetKeys) {
+      if (Object.prototype.hasOwnProperty.call(record, key) && record[key] !== undefined) {
+        restored[key] = record[key]
+        applied = true
+      }
+    }
+    if (applied) return restored
+  }
+  return { ...baselineWrite.body }
+}
+
 /**
  * Persisted mutation: baseline read, mutating probe carrying the candidate body, and a separate
  * post-mutation readback. The readback (not the mutation echo) is what the impact oracle accepts.
@@ -890,6 +1136,20 @@ const persistedMutation = defineRecipe<PersistedMutationArgs>('persisted_mutatio
   const readbackMethod = args.readbackMethod ?? baselineMethod
   const readbackActor = args.readbackActor ?? args.actor
   const bodyKeys = Object.keys(args.body).slice(0, 8)
+  const shouldRestoreBaselineWrite = Boolean(args.baselineWrite && args.baselineWrite.restoreOriginal !== false)
+
+  // Capture the owner's pre-test value before `baseline_write` overwrites it, so `finally`
+  // restores the owner's original state rather than leaving a synthetic baseline sentinel behind.
+  let preBaselineSnapshot: FloorExchange | null = null
+  if (shouldRestoreBaselineWrite && !args.baselineWrite!.restoreBody && ctx instanceof RecipeContext) {
+    preBaselineSnapshot = await ctx.readPreBaselineSnapshot({
+      arm: 'setup',
+      role: 'pre_baseline_snapshot',
+      method: baselineMethod,
+      pathAndQuery: baselinePath,
+      actor: readbackActor,
+    })
+  }
 
   // A self-service function state persists on the caller's own session, so a stale target value
   // from the probe phase would make a correct mutation look like an idempotent no-op. The reset is
@@ -908,6 +1168,7 @@ const persistedMutation = defineRecipe<PersistedMutationArgs>('persisted_mutatio
   }
   // A baseline write makes the probe body a genuine delta: the pre-read then holds a known
   // different value, and the persistence oracle can attribute the post-read change to the probe.
+  let baselineWriteApplied = false
   if (args.baselineWrite) {
     const baselineWrite = await ctx.send({
       arm: 'control',
@@ -918,16 +1179,91 @@ const persistedMutation = defineRecipe<PersistedMutationArgs>('persisted_mutatio
       jsonBody: args.baselineWrite.body,
       ...(args.headers ? { headers: args.headers } : {}),
     })
-    ctx.require(isSuccess(baselineWrite.exchange.status), 'baseline_write', `The baseline write was not accepted (${baselineWrite.exchange.status ?? 'no status'}).`, 'control')
+    baselineWriteApplied = isSuccess(baselineWrite.exchange.status)
+    ctx.require(baselineWriteApplied, 'baseline_write', `The baseline write was not accepted (${baselineWrite.exchange.status ?? 'no status'}).`, 'control')
   }
 
-  const baseline = await ctx.send({
-    arm: 'control',
-    role: 'baseline_read',
-    method: baselineMethod,
-    pathAndQuery: baselinePath,
-    actor: readbackActor,
-  })
+  const registerBaselineWriteRestore = (baselineJson?: unknown): void => {
+    if (!shouldRestoreBaselineWrite || !args.baselineWrite) return
+    const restoreMethod = args.baselineWrite.method ?? args.method
+    const restoreActor = args.baselineWrite.actor ?? readbackActor
+    const restoreBody = deriveBaselineRestoreBody(
+      args.baselineWrite,
+      args.body,
+      args.pathAndQuery,
+      [preBaselineSnapshot?.json, baselineJson],
+    )
+    ctx.registerRestore(
+      cleanup => cleanup.sendCleanup(
+        {
+          arm: 'cleanup',
+          role: 'state_restore',
+          method: restoreMethod,
+          pathAndQuery: args.pathAndQuery,
+          actor: restoreActor,
+          jsonBody: restoreBody,
+          ...(args.headers ? { headers: args.headers } : {}),
+        },
+        { recordInTranscript: false },
+      ),
+      {
+        actor: restoreActor,
+        role: 'state_restore',
+        method: restoreMethod,
+        pathAndQuery: args.pathAndQuery,
+      },
+    )
+  }
+
+  let baseline: FloorRecipeStep
+  try {
+    baseline = await ctx.send({
+      arm: 'control',
+      role: 'baseline_read',
+      method: baselineMethod,
+      pathAndQuery: baselinePath,
+      actor: readbackActor,
+    })
+  } catch (err) {
+    if (baselineWriteApplied) {
+      registerBaselineWriteRestore(undefined)
+    }
+    throw err
+  }
+
+  // Register `finally`-guarded restores immediately after `baseline_read` (before `mutation_probe`)
+  // so an abort, `BrokerDenied`, or timeout during `mutation_probe` or `post_mutation_read` still
+  // restores both self-service session resets (`hyp.functionState.reset`) and non-selfState
+  // `baselineWrite` owner values via the broker's cleanup allowance.
+  if (args.reset) {
+    const resetSpec = args.reset
+    const restoreMethod = resetSpec.method ?? args.method
+    const restoreActor = resetSpec.actor ?? args.actor
+    ctx.registerRestore(
+      cleanup => cleanup.sendCleanup(
+        {
+          arm: 'cleanup',
+          role: 'state_restore',
+          method: restoreMethod,
+          pathAndQuery: args.pathAndQuery,
+          actor: restoreActor,
+          jsonBody: resetSpec.body,
+          ...(args.headers ? { headers: args.headers } : {}),
+        },
+        { recordInTranscript: true },
+      ),
+      {
+        actor: restoreActor,
+        role: 'state_restore',
+        method: restoreMethod,
+        pathAndQuery: args.pathAndQuery,
+      },
+    )
+  }
+  if (shouldRestoreBaselineWrite) {
+    registerBaselineWriteRestore(baseline.exchange.json)
+  }
+
   const probe = await ctx.send({
     arm: 'probe',
     role: 'mutation_probe',
@@ -952,24 +1288,6 @@ const persistedMutation = defineRecipe<PersistedMutationArgs>('persisted_mutatio
   const tombstone = args.method.toUpperCase() === 'DELETE' &&
     (after.exchange.status === 404 || after.exchange.status === 410)
   ctx.require(after.exchange.json !== undefined || tombstone, 'post_mutation_read', 'The separate post-mutation GET recorded no JSON body.', 'control')
-
-  // An identity-assumption route (impersonate / act-as / tenant switch) pins the acting scope on
-  // the caller's *session*. The reset above re-establishes the actor's own baseline before the
-  // proof; the mutation itself then leaves the caller acting as the target tenant, so every later
-  // read by that persona would be served another tenant's data — the scope bleed. Restore the
-  // baseline again after the observation and before control returns to the run, so no later probe
-  // (by this persona or the next one) is served the wrong tenant.
-  if (args.reset) {
-    await ctx.send({
-      arm: 'cleanup',
-      role: 'state_restore',
-      method: args.reset.method ?? args.method,
-      pathAndQuery: args.pathAndQuery,
-      actor: args.reset.actor ?? args.actor,
-      jsonBody: args.reset.body,
-      ...(args.headers ? { headers: args.headers } : {}),
-    })
-  }
 
   return buildProofReceipt({
     vulnClass: args.vulnClass,
@@ -1784,6 +2102,8 @@ export async function runFloorRecipe(recipe: FloorRecipe, deps: FloorRecipeDeps)
       missingRoles: uniqueRoles(abort?.missingRoles ?? []),
     }
     receipt = fallbackReceipt(recipe.args, ctx.exchangeIds, ctx.oobEventIds)
+  } finally {
+    await ctx.drainRestores(recipe.id)
   }
 
   const transcript = ctx.transcript()
@@ -1829,6 +2149,7 @@ export async function runFloorRecipe(recipe: FloorRecipe, deps: FloorRecipeDeps)
     oobEventIds: ctx.oobEventIds,
     transcript,
     verification,
+    ...(ctx.restoreDegradations.length > 0 ? { restoreDegradations: [...ctx.restoreDegradations] } : {}),
   }
   return {
     result,
@@ -1958,6 +2279,10 @@ export interface FloorRecipeBrokerOptions {
   oob?: FloorRecipeDeps['oob']
   /** Brokers authenticate by persona handle; recipes name their actors by handle. */
   personaFor?: (actor: FloorActor) => string | null
+  /** Independent bounded timeout in ms for `finally`-guarded cleanup/restore requests (default 5000ms). */
+  cleanupTimeoutMs?: number
+  /** Optional observer for structured restore degradation events. */
+  onRestoreDegradation?: (event: FloorRestoreDegradationEvent) => void
   /** Test seam: override the exchange projection (never used in production). */
   mapExchange?: (exchange: BrokerExchangeResult, spec: FloorRequestSpec) => Omit<FloorExchange, 'exchangeId'>
 }
@@ -2035,6 +2360,48 @@ export function brokerFloorRecipeDeps(options: FloorRecipeBrokerOptions): FloorR
     async request(spec: FloorRequestSpec): Promise<FloorExchange> {
       const exchange = await options.broker.executeHttp(toBrokerRequest(spec), options.grant, options.signal)
       return project(exchange, spec)
+    },
+    async cleanupRequest(spec: FloorRequestSpec): Promise<FloorExchange> {
+      const exchange = await options.broker.executeCleanupHttp(
+        toBrokerRequest(spec),
+        options.grant,
+        ...(options.cleanupTimeoutMs !== undefined ? [{ timeoutMs: options.cleanupTimeoutMs }] : []),
+      )
+      return project(exchange, spec)
+    },
+    async invalidatePersonaSession(actor: FloorActor): Promise<{ invalidated: boolean; reminted: boolean }> {
+      const persona = personaFor(actor)
+      if (!persona) return { invalidated: false, reminted: false }
+      const outcome = await options.broker.invalidateAndRemintPersonaSession({
+        personaHandle: persona,
+        runId: options.runId,
+        origin: options.origin,
+        grant: options.grant,
+      })
+      return {
+        invalidated: outcome.invalidatedJars > 0 || outcome.reminted,
+        reminted: outcome.reminted,
+      }
+    },
+    onRestoreDegradation(event: FloorRestoreDegradationEvent): void {
+      options.broker.emitRestoreDegradationEvent({
+        runId: options.runId,
+        grant: options.grant,
+        message: `Floor recipe ${event.recipeId} state restore failed for ${event.actorHandle} on ${event.method} ${event.pathAndQuery}: ${event.reason}`,
+        detail: {
+          recipeId: event.recipeId,
+          role: event.role,
+          actorHandle: event.actorHandle,
+          origin: event.origin,
+          method: event.method,
+          pathAndQuery: event.pathAndQuery,
+          reason: event.reason,
+          ...(event.status !== undefined ? { status: event.status } : {}),
+          sessionInvalidated: event.sessionInvalidated,
+          sessionReminted: event.sessionReminted,
+        },
+      })
+      options.onRestoreDegradation?.(event)
     },
     async burst(specs: readonly FloorRequestSpec[]): Promise<FloorExchange[]> {
       const brokerReqs = specs.map(toBrokerRequest)

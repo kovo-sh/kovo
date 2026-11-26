@@ -178,3 +178,159 @@ export function resolveRunSafetyBudgets(options: RunSafetyBudgetOptions = {}): R
     ),
   }
 }
+
+// ---------------------------------------------------------------------------
+// R2-08: Fail-closed per-run async-poll safety budget policy & ledger
+// ---------------------------------------------------------------------------
+
+export const DEFAULT_MAX_ASYNC_POLL_CALLS_PER_RUN = 128
+export const HARD_MAX_ASYNC_POLL_CALLS_PER_RUN = 2_048
+export const DEFAULT_MAX_ASYNC_POLL_ATTEMPTS_PER_RUN = 512
+export const HARD_MAX_ASYNC_POLL_ATTEMPTS_PER_RUN = 8_192
+
+const DEFAULT_MAX_TRACKED_ASYNC_POLL_RUNS = 2_048
+const HARD_MAX_TRACKED_ASYNC_POLL_RUNS = 16_384
+const ASYNC_POLL_CALLS_ENV_KEY = 'KOVO_MAX_ASYNC_POLL_CALLS_PER_RUN'
+const ASYNC_POLL_ATTEMPTS_ENV_KEY = 'KOVO_MAX_ASYNC_POLL_ATTEMPTS_PER_RUN'
+const ASYNC_POLL_TRACKED_RUNS_ENV_KEY = 'KOVO_MAX_TRACKED_ASYNC_POLL_RUNS'
+
+export interface AsyncPollBudgetUsage {
+  calls: number
+  attempts: number
+  deniedCalls: number
+  deniedAttempts: number
+}
+
+export interface AsyncPollBudgetLedgerOptions {
+  defaultMaxCallsPerRun?: number
+  hardMaxCallsPerRun?: number
+  defaultMaxAttemptsPerRun?: number
+  hardMaxAttemptsPerRun?: number
+  maxTrackedRuns?: number
+  env?: Readonly<Record<string, string | undefined>>
+}
+
+/**
+ * Fail-closed per-run async-poll safety budget ledger (`RunSafetyBudgets`).
+ *
+ * Security & memory invariants:
+ *  - Requires an explicit non-empty `runId` (never silently folds missing ids into `'__default__'`).
+ *  - Never FIFO-evicts an active run at the tracked-runs capacity cap; denies fail-closed and
+ *    increments `capacityDenials` until run disposal (`registerRunDisposer`) removes completed runs.
+ *  - Denies fail-closed and increments per-run denial counters (`deniedCalls` / `deniedAttempts`)
+ *    whenever per-run call or attempt caps are reached; counters never silently reset.
+ */
+export class RunAsyncPollBudgetLedger {
+  private readonly runs = new Map<string, AsyncPollBudgetUsage>()
+  private capacityDenials = 0
+  private readonly defaultMaxCallsPerRun: number
+  private readonly hardMaxCallsPerRun: number
+  private readonly defaultMaxAttemptsPerRun: number
+  private readonly hardMaxAttemptsPerRun: number
+  private readonly defaultMaxTrackedRuns?: number
+  private readonly env?: Readonly<Record<string, string | undefined>>
+
+  constructor(options: AsyncPollBudgetLedgerOptions = {}) {
+    this.defaultMaxCallsPerRun = options.defaultMaxCallsPerRun ?? DEFAULT_MAX_ASYNC_POLL_CALLS_PER_RUN
+    this.hardMaxCallsPerRun = options.hardMaxCallsPerRun ?? HARD_MAX_ASYNC_POLL_CALLS_PER_RUN
+    this.defaultMaxAttemptsPerRun = options.defaultMaxAttemptsPerRun ?? DEFAULT_MAX_ASYNC_POLL_ATTEMPTS_PER_RUN
+    this.hardMaxAttemptsPerRun = options.hardMaxAttemptsPerRun ?? HARD_MAX_ASYNC_POLL_ATTEMPTS_PER_RUN
+    this.defaultMaxTrackedRuns = options.maxTrackedRuns
+    this.env = options.env
+  }
+
+  private requireRunId(runId: string): string {
+    const key = typeof runId === 'string' ? runId.trim() : ''
+    if (!key) {
+      throw new Error('async.awaitResult safety budget requires an explicit non-empty runId.')
+    }
+    return key
+  }
+
+  private resolveMaxTrackedRuns(override?: number): number {
+    return resolveBoundedBudgetCap(
+      override ?? this.defaultMaxTrackedRuns,
+      ASYNC_POLL_TRACKED_RUNS_ENV_KEY,
+      DEFAULT_MAX_TRACKED_ASYNC_POLL_RUNS,
+      HARD_MAX_TRACKED_ASYNC_POLL_RUNS,
+      this.env,
+    )
+  }
+
+  private getOrCreate(runId: string, maxTrackedRunsOverride?: number): AsyncPollBudgetUsage {
+    const key = this.requireRunId(runId)
+    let state = this.runs.get(key)
+    if (!state) {
+      const cap = this.resolveMaxTrackedRuns(maxTrackedRunsOverride)
+      if (this.runs.size >= cap) {
+        this.capacityDenials += 1
+        throw new Error(
+          `async.awaitResult tracked-run safety budget capacity reached (max ${cap} active runs; denials=${this.capacityDenials}).`,
+        )
+      }
+      state = { calls: 0, attempts: 0, deniedCalls: 0, deniedAttempts: 0 }
+      this.runs.set(key, state)
+    }
+    return state
+  }
+
+  consumeCall(runId: string, maxPerRun?: number, maxTrackedRuns?: number): number {
+    const cap = resolveBoundedBudgetCap(
+      maxPerRun,
+      ASYNC_POLL_CALLS_ENV_KEY,
+      this.defaultMaxCallsPerRun,
+      this.hardMaxCallsPerRun,
+      this.env,
+    )
+    const state = this.getOrCreate(runId, maxTrackedRuns)
+    if (state.calls >= cap) {
+      state.deniedCalls += 1
+      throw new Error(`async.awaitResult run call budget exceeded (max ${cap} per run; denied=${state.deniedCalls}).`)
+    }
+    state.calls += 1
+    return state.calls
+  }
+
+  consumeAttempt(runId: string, maxPerRun?: number, maxTrackedRuns?: number): number {
+    const cap = resolveBoundedBudgetCap(
+      maxPerRun,
+      ASYNC_POLL_ATTEMPTS_ENV_KEY,
+      this.defaultMaxAttemptsPerRun,
+      this.hardMaxAttemptsPerRun,
+      this.env,
+    )
+    const state = this.getOrCreate(runId, maxTrackedRuns)
+    if (state.attempts >= cap) {
+      state.deniedAttempts += 1
+      throw new Error(`async.awaitResult run poll-attempt budget exceeded (max ${cap} per run; denied=${state.deniedAttempts}).`)
+    }
+    state.attempts += 1
+    return state.attempts
+  }
+
+  getUsage(runId: string): AsyncPollBudgetUsage {
+    const key = typeof runId === 'string' ? runId.trim() : ''
+    if (!key) return { calls: 0, attempts: 0, deniedCalls: 0, deniedAttempts: 0 }
+    const state = this.runs.get(key)
+    return state ? { ...state } : { calls: 0, attempts: 0, deniedCalls: 0, deniedAttempts: 0 }
+  }
+
+  getCapacityStats(): { trackedRuns: number; capacityDenials: number } {
+    return { trackedRuns: this.runs.size, capacityDenials: this.capacityDenials }
+  }
+
+  has(runId: string): boolean {
+    const key = typeof runId === 'string' ? runId.trim() : ''
+    return key ? this.runs.has(key) : false
+  }
+
+  delete(runId?: string): void {
+    if (runId === undefined) {
+      this.runs.clear()
+      this.capacityDenials = 0
+      return
+    }
+    const key = typeof runId === 'string' ? runId.trim() : ''
+    if (key) this.runs.delete(key)
+  }
+}

@@ -49,6 +49,7 @@ import {
 import { CanaryBroker, scanSecondOrderMarkers, type SecondOrderStore } from './canary-broker.ts'
 import { hasCuratedAdvisory, queryCves, templateIdsForCves } from './cve-broker.ts'
 import { DerivedCapabilityVault, resetRunCustodyBudgets } from './derived-custody.ts'
+import { runAllRunDisposers } from './run-disposers.ts'
 import { normalizeEndpointTemplate } from './dedupe.ts'
 import {
   extractCreatedId,
@@ -794,6 +795,7 @@ export class Execution {
     this.broker.disposeRun(runId)
     unregisterScopedBrowserForRun(runId)
     resetRunCustodyBudgets(runId)
+    runAllRunDisposers(runId)
     if (!actor || this.actors.get(runId) === actor) this.actors.delete(runId)
   }
 

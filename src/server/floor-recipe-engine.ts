@@ -564,7 +564,7 @@ function planAuthzRecipe(input: FloorRecipePlanInput): FloorRecipePlan {
   const readbackActor = floorActorFor(hyp.readbackPersona ?? ownerHandle, input.personas)
   const selfState = Boolean(hyp.functionState?.bindings?.length)
   const baselineWrite = !functionLevel && !selfState && hyp.method !== 'DELETE' ? pickBaselineWrite(body) : null
-  const resetBody = selfState && hyp.functionState?.reset?.length
+  const resetBody = hyp.functionState?.reset?.length
     ? { ...body, ...Object.fromEntries(hyp.functionState.reset.map(item => [item.field, item.value])) }
     : null
   const args: PersistedMutationArgs = {
@@ -579,7 +579,17 @@ function planAuthzRecipe(input: FloorRecipePlanInput): FloorRecipePlan {
     readbackMethod: 'GET',
     readbackPathAndQuery: readbackPath,
     readbackActor,
-    ...(baselineWrite ? { baselineWrite: { body: baselineWrite.baselineBody, actor: owner, method: hyp.method } } : {}),
+    ...(baselineWrite
+      ? {
+          baselineWrite: {
+            body: baselineWrite.baselineBody,
+            actor: owner,
+            method: hyp.method,
+            field: baselineWrite.field,
+            restoreOriginal: true,
+          },
+        }
+      : {}),
     ...(resetBody ? { reset: { body: resetBody, actor: probe, method: hyp.method } } : {}),
     ...(hyp.authzRequiredRole ? { requiredRole: hyp.authzRequiredRole } : {}),
     ...(functionLevel && privileged && hyp.authzRequiredRole ? { oracleEvents: ['privilege_escalation'] } : {}),

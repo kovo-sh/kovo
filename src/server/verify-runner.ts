@@ -11,6 +11,7 @@ import { chmodSync, copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync,
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 import { redact } from './redact.ts'
+import { registerRunDisposer } from './run-disposers.ts'
 import { HostFactLog } from './host-fact-log.ts'
 import { classifyBoundaryClaim, classifyImpactDescriptor } from './oracle-invariants.ts'
 import {
@@ -166,6 +167,10 @@ export function resetKovoVerifyAliasUsage(runId?: string): void {
   }
   runAliasCounters.delete(runId)
 }
+
+registerRunDisposer('verify-runner:alias-counters', runId => {
+  resetKovoVerifyAliasUsage(runId)
+})
 
 /** Strip accidental outer markdown code fences (```ts ... ```) from LLM scripts. */
 function stripCodeFences(rawCode: string): string {

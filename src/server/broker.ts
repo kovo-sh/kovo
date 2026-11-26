@@ -4507,6 +4507,93 @@ export class RequestBroker {
   }
 
   /**
+   * R2-08: Execute a bounded state-restore/cleanup HTTP request with an independent short
+   * timeout signal so an aborted or timed-out caller signal does not prevent target restoration.
+   *
+   * Target-safety invariant: routes through the exact same `prepareHttpRequest` +
+   * `executePreparedHttp` pipeline (ScopePolicy, Tier-3 approval/lease gates, kill-switch,
+   * SSRF/DNS pinning, persona allowlists, and audit logging) — NEVER bypasses scope or approval.
+   */
+  async executeCleanupHttp(
+    req: BrokerHttpRequest,
+    grant: Grant,
+    options: { timeoutMs?: number; bypassConcurrency?: boolean } = {},
+  ): Promise<BrokerExchangeResult> {
+    const boundedTimeoutMs = Math.max(500, Math.min(options.timeoutMs ?? 5_000, 10_000))
+    const cleanupSignal = AbortSignal.timeout(boundedTimeoutMs)
+    const cleanupReq: BrokerHttpRequest = {
+      ...req,
+      sessionGroupRole: req.sessionGroupRole ?? 'cleanup',
+      timeoutMs: boundedTimeoutMs,
+    }
+    return this.executeHttpInternal(cleanupReq, grant, cleanupSignal, options.bypassConcurrency ?? true)
+  }
+
+  /**
+   * R2-08: Invalidate all broker session jars and session-ownership records for `personaHandle`
+   * within `runId`, and attempt to re-mint its session via `reauthHandler` when available.
+   * Called when a mutating floor-recipe state restore fails or is denied so drifted session
+   * state cannot bleed into subsequent probes.
+   */
+  async invalidateAndRemintPersonaSession(input: {
+    personaHandle: string
+    runId?: string
+    origin?: string
+    grant?: Pick<Grant, 'scopePolicy' | 'personas' | 'storage'>
+  }): Promise<{ invalidatedJars: number; reminted: boolean }> {
+    const runKey = this.resolveScopeRunKey({ runId: input.runId }, input.grant as Grant | undefined)
+    let invalidatedJars = 0
+    for (const [key, jar] of this.sessionJars.entries()) {
+      if (jar.runId !== runKey) continue
+      if (jar.persona !== input.personaHandle) continue
+      this.sessionJars.delete(key)
+      invalidatedJars += 1
+    }
+    const owners = this.personaSessionOwnersByRun.get(runKey)
+    if (owners) {
+      for (const [fp, ownerPersona] of owners.entries()) {
+        if (ownerPersona === input.personaHandle) owners.delete(fp)
+      }
+      if (owners.size === 0) this.personaSessionOwnersByRun.delete(runKey)
+    }
+    let reminted = false
+    if (this.reauthHandler) {
+      const reauthRunId = input.runId ?? input.grant?.scopePolicy?.runId ?? undefined
+      const refreshed = await this.reauthHandler(input.personaHandle, reauthRunId, input.origin).catch(() => false)
+      reminted = refreshed !== false
+    }
+    return { invalidatedJars, reminted }
+  }
+
+  /**
+   * R2-08: Emit a structured degradation event when a mutating floor-recipe state restore fails
+   * or is denied. Best-effort telemetry: never throws.
+   */
+  emitRestoreDegradationEvent(input: {
+    runId?: string
+    grant?: Pick<Grant, 'scopePolicy' | 'storage'>
+    detail: Record<string, unknown>
+    message: string
+  }): void {
+    try {
+      const runKey = this.resolveScopeRunKey({ runId: input.runId }, input.grant as Grant | undefined)
+      const store = input.grant?.storage ?? this.options.storage
+      store?.event?.(
+        runKey === 'default' ? null : runKey,
+        'floor_recipe.restore_degraded',
+        input.message,
+        {
+          runId: runKey,
+          degradation: 'floor_recipe_restore_failed',
+          ...input.detail,
+        },
+      )
+    } catch {
+      // Telemetry is best-effort and must never mask primary execution results.
+    }
+  }
+
+  /**
    * C-1: Canonical brokered HTTP/2 exchange enforcing kill-switch, RequestAdmissionEngine,
    * pinned DNS + SSRF checks, per-origin slot acquisition & concurrency/RPS caps, circuit breaker,
    * audit logging (`allowed` / `observed`), persona/jar credential binding + `wireCredentialProvenance`
