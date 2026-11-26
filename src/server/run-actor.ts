@@ -461,6 +461,46 @@ export class RunActor {
     return this.transition(to, reason)
   }
 
+  /**
+   * Reconcile a non-terminal actor with a persisted SQLite state jump (e.g. `queued -> verifying`,
+   * `recon -> verifying`, `investigating -> completed` after restore/skip) by walking the shortest
+   * legal path in `RUN_ACTOR_TRANSITIONS`. Terminal actors are never mutated (caller must dispose
+   * and mint a fresh actor on resume).
+   */
+  reconcileWithPersisted(to: RunActorState, reason = ''): RunActorState {
+    if (this.currentState === to || this.isTerminal) return this.currentState
+    if (canTransition(this.currentState, to)) {
+      return this.transition(to, reason)
+    }
+    const queue: Array<{ state: RunActorState; path: RunActorState[] }> = [
+      { state: this.currentState, path: [] },
+    ]
+    const visited = new Set<RunActorState>([this.currentState])
+    while (queue.length > 0) {
+      const current = queue.shift()!
+      const nextStates = RUN_ACTOR_TRANSITIONS[current.state]
+      if (!nextStates) continue
+      for (const next of nextStates) {
+        if (visited.has(next)) continue
+        if (next === 'stopping' && to !== 'stopping') continue
+        const nextPath = [...current.path, next]
+        if (next === to) {
+          for (let i = 0; i < nextPath.length; i += 1) {
+            const hop = nextPath[i]!
+            const hopReason = i === nextPath.length - 1 ? reason : `${reason || 'reconcile'}:hop`
+            this.transition(hop, hopReason)
+          }
+          return this.currentState
+        }
+        visited.add(next)
+        if (!isTerminalRunActorState(next)) {
+          queue.push({ state: next, path: nextPath })
+        }
+      }
+    }
+    return this.currentState
+  }
+
   /** Spawn a supervised async task bound to this run's `RunContext`. */
   spawn<T = void>(
     label: string,
@@ -1053,6 +1093,7 @@ export interface FloorMetricsContext {
   agenticFloorFinishedAt: Map<string, number>
   agenticFloorDispatchedAt: Map<string, number>
   detLeadConsumed: Set<string>
+  detLeadConsumedByRun?: Map<string, Set<string>>
   requestBudgetSnapshot: (runId: string, floorReportedRequests: number) => RequestBudgetSnapshot
 }
 
@@ -1109,6 +1150,9 @@ export function recordRunFloorMetrics(ctx: FloorMetricsContext, runId: string, r
     dispatchAfterFloorMs: dispatchedAt && floorFinishedAt ? Math.max(0, dispatchedAt - floorFinishedAt) : null,
   }
   const budget = ctx.requestBudgetSnapshot(runId, floorRequests)
+  const floorLeadsConsumed = ctx.detLeadConsumedByRun
+    ? (ctx.detLeadConsumedByRun.get(runId)?.size ?? 0)
+    : ctx.detLeadConsumed.size
   const detail = {
     reason,
     floorConfirmed,
@@ -1116,7 +1160,7 @@ export function recordRunFloorMetrics(ctx: FloorMetricsContext, runId: string, r
     preservationRatio,
     agenticConfirmed,
     floorLeadsEmitted,
-    floorLeadsConsumed: ctx.detLeadConsumed.size,
+    floorLeadsConsumed,
     laneWallMs,
     floorRequests: budget.floorRequests,
     floorRequestBudget: budget.floorRequestBudget,
@@ -1132,14 +1176,256 @@ export function recordRunFloorMetrics(ctx: FloorMetricsContext, runId: string, r
   }
   ctx.safeEvent(
     runId, 'deterministic_lane.metrics',
-    `Floor ${floorConfirmed} confirmed / agentic ${agenticConfirmed} confirmed; ${ctx.detLeadConsumed.size} det_lead(s) consumed; lane ${Math.round(laneWallMs / 1000)}s.`,
+    `Floor ${floorConfirmed} confirmed / agentic ${agenticConfirmed} confirmed; ${floorLeadsConsumed} det_lead(s) consumed; lane ${Math.round(laneWallMs / 1000)}s.`,
     detail,
   )
   ctx.safeEvent(
     runId, 'deterministic_floor.summary',
-    `Floor ${floorConfirmed}/${floorStandaloneExpected} preserved (${(preservationRatio * 100).toFixed(0)}%), ${floorLeadsEmitted} lead(s) emitted / ${ctx.detLeadConsumed.size} consumed, ${budget.floorRequests} floor request(s)${budget.floorRequestBudget !== null ? `/${budget.floorRequestBudget}` : ''}, ${budget.agentRequests ?? 0} agent request(s)${budget.agentRequestBudget !== null ? `/${budget.agentRequestBudget}` : ''}, Phase A ${Math.round(laneWallMs / 1000)}s${budget.terminationReason ? `, stopped: ${budget.terminationReason}` : ''}.`,
+    `Floor ${floorConfirmed}/${floorStandaloneExpected} preserved (${(preservationRatio * 100).toFixed(0)}%), ${floorLeadsEmitted} lead(s) emitted / ${floorLeadsConsumed} consumed, ${budget.floorRequests} floor request(s)${budget.floorRequestBudget !== null ? `/${budget.floorRequestBudget}` : ''}, ${budget.agentRequests ?? 0} agent request(s)${budget.agentRequestBudget !== null ? `/${budget.agentRequestBudget}` : ''}, Phase A ${Math.round(laneWallMs / 1000)}s${budget.terminationReason ? `, stopped: ${budget.terminationReason}` : ''}.`,
     detail,
   )
+}
+
+export interface ExecutionRunStateCleanupTargets {
+  plannerTimers: Map<string, () => void>
+  plannerDirty: Set<string>
+  plannerDoneRound: Map<string, number>
+  plannerErrorState: Map<string, unknown>
+  dryStreakObserved: Map<string, number>
+  programGraphLeadsSeeded: Set<string>
+  dispatchFunnels: Map<string, unknown>
+  strandedReadyEvents: Map<string, number>
+  reinvestigationGuards: Map<string, unknown>
+  recordedPersonaResources: Map<string, Set<string>>
+  circuitNotified: Set<string>
+  runAuthStarted: Map<string, string>
+  runAuthInFlight: Map<string, AbortController>
+  deterministicInFlight: Set<string>
+  deterministicCompleted: Set<string>
+  prePhase0SeededSteps: Map<string, boolean>
+  agenticLaneJobs: Map<string, { controller: AbortController }>
+  agenticLaneCompleted: Set<string>
+  agenticLaneStopping: Set<string>
+  verificationDraining: Set<string>
+  laneStartedAt: Map<string, number>
+  laneWallByRun: Map<string, number>
+  assignmentWallByRun: Map<string, number[]>
+  completedAssignmentWallByRun: Map<string, number[]>
+  turnLatencyByRun: Map<string, number[]>
+  earlyExitTurnsSavedByRun: Map<string, number>
+  proofObligationByRun: Map<string, unknown>
+  gapValidationByRun: Map<string, unknown>
+  providerStallTurnsByRun: Map<string, number>
+  providerStallRetriesByRun: Map<string, number>
+  providerStallTimeoutsByRun: Map<string, number>
+  providerStallWallSavedByRun: Map<string, number>
+  wallClockRotationsByRun: Map<string, number>
+  warmSecretEpochByRun: Map<string, string>
+  warmPoolPolicyRotationsByRun: Map<string, number>
+  agenticFloorDispatchedAt: Map<string, number>
+  agenticFloorStartedAt: Map<string, number>
+  agenticFloorFinishedAt: Map<string, number>
+  phaseBControllers: Map<string, unknown>
+  detLeadConsumed: Set<string>
+  detLeadConsumedByRun: Map<string, Set<string>>
+  budgetTracker: { deleteRun: (runId: string) => void }
+  board: { cleanupRun: (runId: string) => void }
+}
+
+/** Deterministically evict all per-run in-memory state from `Execution` on run completion/disposal. */
+export function evictRunFromExecutionState(runId: string, targets: ExecutionRunStateCleanupTargets): void {
+  const cancelTimer = targets.plannerTimers.get(runId)
+  if (cancelTimer) {
+    try { cancelTimer() } catch { /* ignore */ }
+    targets.plannerTimers.delete(runId)
+  }
+  targets.plannerDirty.delete(runId)
+  targets.plannerDoneRound.delete(runId)
+  targets.plannerErrorState.delete(runId)
+  targets.dryStreakObserved.delete(runId)
+  targets.dispatchFunnels.delete(runId)
+  targets.strandedReadyEvents.delete(runId)
+  targets.reinvestigationGuards.delete(runId)
+  targets.recordedPersonaResources.delete(runId)
+  targets.runAuthStarted.delete(runId)
+  const inflightAuth = targets.runAuthInFlight.get(runId)
+  if (inflightAuth) {
+    try { inflightAuth.abort() } catch { /* ignore */ }
+    targets.runAuthInFlight.delete(runId)
+  }
+  targets.prePhase0SeededSteps.delete(runId)
+  const lane = targets.agenticLaneJobs.get(runId)
+  if (lane) {
+    try { lane.controller.abort(new Error('run disposed')) } catch { /* ignore */ }
+    targets.agenticLaneJobs.delete(runId)
+  }
+  targets.agenticLaneStopping.delete(runId)
+  targets.verificationDraining.delete(runId)
+  targets.laneStartedAt.delete(runId)
+  targets.laneWallByRun.delete(runId)
+  targets.assignmentWallByRun.delete(runId)
+  targets.completedAssignmentWallByRun.delete(runId)
+  targets.turnLatencyByRun.delete(runId)
+  targets.earlyExitTurnsSavedByRun.delete(runId)
+  targets.proofObligationByRun.delete(runId)
+  targets.gapValidationByRun.delete(runId)
+  targets.providerStallTurnsByRun.delete(runId)
+  targets.providerStallRetriesByRun.delete(runId)
+  targets.providerStallTimeoutsByRun.delete(runId)
+  targets.providerStallWallSavedByRun.delete(runId)
+  targets.wallClockRotationsByRun.delete(runId)
+  targets.warmSecretEpochByRun.delete(runId)
+  targets.warmPoolPolicyRotationsByRun.delete(runId)
+  targets.agenticFloorDispatchedAt.delete(runId)
+  targets.agenticFloorStartedAt.delete(runId)
+  targets.agenticFloorFinishedAt.delete(runId)
+  targets.phaseBControllers.delete(runId)
+  const consumedForRun = targets.detLeadConsumedByRun.get(runId)
+  if (consumedForRun) {
+    for (const factId of consumedForRun) targets.detLeadConsumed.delete(factId)
+    targets.detLeadConsumedByRun.delete(runId)
+  }
+  const colonPrefix = `${runId}:`
+  const nullPrefix = `${runId}\0`
+  for (const key of [...targets.programGraphLeadsSeeded]) {
+    if (key.startsWith(nullPrefix)) targets.programGraphLeadsSeeded.delete(key)
+  }
+  for (const key of [...targets.circuitNotified]) {
+    if (key.startsWith(colonPrefix)) targets.circuitNotified.delete(key)
+  }
+  for (const key of [...targets.deterministicInFlight]) {
+    if (key.startsWith(colonPrefix)) targets.deterministicInFlight.delete(key)
+  }
+  for (const key of [...targets.deterministicCompleted]) {
+    if (key.startsWith(colonPrefix)) targets.deterministicCompleted.delete(key)
+  }
+  for (const key of [...targets.agenticLaneCompleted]) {
+    if (key.startsWith(colonPrefix)) targets.agenticLaneCompleted.delete(key)
+  }
+  targets.budgetTracker.deleteRun(runId)
+  targets.board.cleanupRun(runId)
+}
+
+export function resolveRunTenantId(storage: Store, run: Pick<Run, 'id' | 'projectId'>): string | null {
+  try {
+    const t = storage.getRunTenant(run.id)
+    return t && t !== 'default' ? t : null
+  } catch {
+    try {
+      const pt = storage.project(run.projectId).tenantId
+      return pt && pt !== 'default' ? pt : null
+    } catch {
+      return null
+    }
+  }
+}
+
+export function trackDetLeadFactForRun(
+  storage: Store,
+  detLeadConsumedByRun: Map<string, Set<string>>,
+  activeRunId: string | null,
+  factId: string,
+): void {
+  let runId = activeRunId
+  if (!runId) {
+    try {
+      const row = storage.client.prepare('SELECT run_id FROM facts WHERE id = ?').get(factId) as { run_id?: string } | undefined
+      runId = row?.run_id ?? null
+    } catch {
+      runId = null
+    }
+  }
+  if (!runId) return
+  let perRun = detLeadConsumedByRun.get(runId)
+  if (!perRun) {
+    perRun = new Set<string>()
+    detLeadConsumedByRun.set(runId, perRun)
+  }
+  perRun.add(factId)
+}
+
+export function pauseRunsForKillSwitch(
+  storage: Store,
+  state: { tenantId: string | null; reason: string | null },
+  safeEvent: (runId: string, kind: string, message: string, detail?: Record<string, unknown>) => void,
+  onDispose: (runId: string) => void,
+): void {
+  try {
+    for (const run of storage.runnable()) {
+      const tenantId = resolveRunTenantId(storage, run)
+      if (state.tenantId !== null && tenantId !== state.tenantId) continue
+      try {
+        storage.updateRun(run.id, { status: 'paused' })
+        safeEvent(run.id, 'run.kill_switch_paused', 'Run paused because emergency kill switch tripped.', {
+          tenantId,
+          reason: state.reason,
+        })
+      } catch { /* run may be gone or store closing */ }
+      onDispose(run.id)
+    }
+  } catch { /* store may be closed */ }
+}
+
+export interface TrackedActiveRunChecks {
+  disposingRuns: Map<string, unknown>
+  actors: Map<string, { activeTaskCount: number }>
+  timedOutActors: Map<string, { activeTaskCount: number }>
+  runtime: { getRunContext: (runId: string) => { activeTaskCount: number } | undefined }
+  coordinator: Map<string, unknown>
+  threatModeling: Map<string, unknown>
+  plannerTasks: Map<string, unknown>
+  runAuthInFlight: Map<string, unknown>
+  agenticLaneJobs: Map<string, unknown>
+  verificationDraining: Set<string>
+  active: Map<string, { assignment: { runId: string } }>
+}
+
+export function isExecutionRunTrackedActive(runId: string, checks: TrackedActiveRunChecks): boolean {
+  const timedOut = checks.timedOutActors.get(runId)
+  if (timedOut) {
+    if (timedOut.activeTaskCount > 0) return true
+    checks.timedOutActors.delete(runId)
+  }
+  if (
+    checks.disposingRuns.has(runId)
+    || (checks.actors.get(runId)?.activeTaskCount ?? 0) > 0
+    || (checks.runtime.getRunContext(runId)?.activeTaskCount ?? 0) > 0
+    || checks.coordinator.has(runId)
+    || checks.threatModeling.has(runId)
+    || checks.plannerTasks.has(runId)
+    || checks.runAuthInFlight.has(runId)
+    || checks.agenticLaneJobs.has(runId)
+    || checks.verificationDraining.has(runId)
+  ) {
+    return true
+  }
+  for (const job of checks.active.values()) {
+    if (job.assignment.runId === runId) return true
+  }
+  return false
+}
+
+export async function drainTimedOutRunActor(
+  runId: string,
+  timedOutActors: Map<string, RunActor>,
+  timeoutMs = 2_500,
+): Promise<RunDrainReport | null> {
+  const lingering = timedOutActors.get(runId)
+  if (!lingering) return null
+  const drain = await lingering.supervisor.drain(timeoutMs)
+  if (lingering.activeTaskCount === 0) timedOutActors.delete(runId)
+  return {
+    runId,
+    aborted: true,
+    alreadyDisposed: true,
+    tasksTotal: drain.total,
+    tasksDrained: drain.drained,
+    tasksTimedOut: lingering.activeTaskCount,
+    resourcesTotal: 0,
+    resourcesDisposed: 0,
+    resourceErrors: [],
+    durationMs: drain.durationMs,
+  }
 }
 
 export interface AssignmentMetricsContext {
@@ -1292,6 +1578,11 @@ export interface Tier3ApprovalCoordinatorHost {
     assignmentId: string,
     input: Parameters<ExecBoardManager['postApprovalResolution']>[2],
   ) => void
+  registerTimer?: (
+    runId: string,
+    name: string,
+    timer: ReturnType<typeof setInterval>,
+  ) => () => void
   scheduleWake: () => void
 }
 
@@ -1730,12 +2021,16 @@ export class RunTier3ApprovalCoordinator {
         const unsub = this.host.storage.onRunEvent(run.id, () => { checkCurrent() })
         const timer = setInterval(() => { checkCurrent() }, 1_000)
         timer.unref?.()
+        const unregisterTimer = this.host.registerTimer
+          ? this.host.registerTimer(run.id, 'tier3-approval-poll', timer)
+          : () => {}
         const onAbort = () => {
           cleanup()
           rejectDecision(signal.reason instanceof Error ? signal.reason : new Error('Aborted while waiting for approval.'))
         }
         const cleanup = () => {
           unsub()
+          unregisterTimer()
           clearInterval(timer)
           signal.removeEventListener('abort', onAbort)
         }

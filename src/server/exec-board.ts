@@ -38,6 +38,8 @@ export class ExecBoardManager {
   private readonly postedCanaryKeys = new Set<string>()
   private readonly boardScopeSync = new Map<string, string>()
   readonly trackedBoardRuns = new Set<string>()
+  private readonly stepIdsByRun = new Map<string, Set<string>>()
+  private readonly assignmentIdsByRun = new Map<string, Set<string>>()
 
   constructor(host: ExecBoardHost) {
     this.host = host
@@ -230,9 +232,9 @@ export class ExecBoardManager {
         sessionId: member.sessionId,
         state: toState === 'paused' ? 'working' : 'paused',
         lastReadSeq: member.lastReadSeq,
-      })
-      if (toState === 'paused') this.warm.pause(handle, assignmentId)
-      else this.warm.resume(handle, assignmentId)
+      }, run.id)
+      if (toState === 'paused') this.warm.pause(handle, assignmentId, run.id)
+      else this.warm.resume(handle, assignmentId, run.id)
     } catch { /* roster mirror is best-effort */ }
   }
 
@@ -306,7 +308,7 @@ export class ExecBoardManager {
     const delta = buildBoardDelta({ store: this.storage, run: run.id, handle, lastReadSeq })
     try {
       this.storage.updateBoardMemberState(run.id, handle, { lastReadSeq: delta.cursor })
-      this.warm.noteBoardCursor(handle, delta.cursor)
+      this.warm.noteBoardCursor(handle, delta.cursor, run.id)
     } catch { /* member may have been retired between turns */ }
     return { text: delta.text, cursor: delta.cursor }
   }
@@ -317,7 +319,7 @@ export class ExecBoardManager {
       if (member.peerHopsUsed === 0) continue
       try { this.storage.updateBoardMemberState(run.id, member.handle, { peerHopsUsed: 0 }) } catch { /* ignore */ }
     }
-    this.warm.noteEvidence()
+    this.warm.noteEvidence(undefined, run.id)
   }
 
   /** Retire/sleep warm members on stop, scope revoke, and mirror roster rows into the controller. */
@@ -330,14 +332,14 @@ export class ExecBoardManager {
         for (const member of this.storage.listBoardMembers(run.id)) {
           if (member.role !== 'specialist' || member.state === 'retired') continue
           try { this.storage.retireBoardMember(run, member.handle, `Run ${run.status}.`) } catch { /* ignore */ }
-          this.warm.retire(member.handle, `run_${run.status}`)
+          this.warm.retire(member.handle, `run_${run.status}`, run.id)
         }
         this.trackedBoardRuns.delete(run.id)
         return
       } else {
         try {
           const revoked = this.storage.taintBoardMessagesForRevokedOrigins(run.id, this.host.approvedOriginsSet(run))
-          for (const handle of revoked.retiredHandles) this.warm.retire(handle, 'scope_revoked')
+          for (const handle of revoked.retiredHandles) this.warm.retire(handle, 'scope_revoked', run.id)
         } catch { /* store may be closing */ }
       }
     }
@@ -349,8 +351,8 @@ export class ExecBoardManager {
         postsCount: member.postsCount,
         peerHopsUsed: member.peerHopsUsed,
         lastReadSeq: member.lastReadSeq,
-      })
-      if (member.state === 'retired') this.warm.retire(member.handle, 'roster_retired')
+      }, run.id)
+      if (member.state === 'retired') this.warm.retire(member.handle, 'roster_retired', run.id)
     }
   }
 
@@ -440,6 +442,12 @@ export class ExecBoardManager {
       specialistProfile: profile,
     })
     this.wakeHandleByStepId.set(step.id, handle)
+    let runSteps = this.stepIdsByRun.get(run.id)
+    if (!runSteps) {
+      runSteps = new Set<string>()
+      this.stepIdsByRun.set(run.id, runSteps)
+    }
+    runSteps.add(step.id)
     if (!member) {
       try {
         this.storage.upsertBoardMember(run, {
@@ -449,7 +457,7 @@ export class ExecBoardManager {
           state: 'waiting',
           sourceOrigins: origins,
         })
-        this.warm.register(handle, { state: 'waiting' })
+        this.warm.register(handle, { state: 'waiting' }, run.id)
       } catch { /* roster mirror is best-effort */ }
     }
     this.storage.event(run.id, 'board.wakeup', `@${handle} queued from @${message.authorHandle}'s ${message.kind} (board #${message.seq}).`, {
@@ -463,18 +471,20 @@ export class ExecBoardManager {
   finishBoardMember(run: Run, assignmentId: string): void {
     const handle = this.boardHandleByAssignment.get(assignmentId)
     if (!handle) return
-    const tokens = this.boardHandleTokens.get(handle) ?? this.boardAssignmentTokens.get(assignmentId) ?? 0
+    const handleTokenKey = `${run.id}\0${handle}`
+    const tokens = this.boardHandleTokens.get(handleTokenKey) ?? this.boardAssignmentTokens.get(assignmentId) ?? 0
     this.boardHandleByAssignment.delete(assignmentId)
     this.boardAssignmentTokens.delete(assignmentId)
+    this.assignmentIdsByRun.get(run.id)?.delete(assignmentId)
     let worker: Assignment | undefined
     try { worker = this.storage.worker(assignmentId) } catch { /* deleted */ }
     const succeeded = worker?.status === 'complete'
-    const completion = this.warm.completeTurn(handle, { tokensUsed: tokens })
+    const completion = this.warm.completeTurn(handle, { tokensUsed: tokens }, run.id)
     try {
       if (!succeeded || completion?.state === 'retired') {
-        this.warm.retire(handle, completion?.retiredReason ?? 'step_failed')
+        this.warm.retire(handle, completion?.retiredReason ?? 'step_failed', run.id)
         this.storage.updateBoardMemberState(run.id, handle, { state: 'retired', activeAssignmentId: null })
-        this.boardHandleTokens.delete(handle)
+        this.boardHandleTokens.delete(handleTokenKey)
       } else {
         this.storage.updateBoardMemberState(run.id, handle, { state: 'waiting', activeAssignmentId: null })
       }
@@ -491,9 +501,53 @@ export class ExecBoardManager {
     }
   }
 
-  noteTokens(assignmentId: string, handle: string, tokens: number): void {
+  noteTokens(assignmentId: string, handle: string, tokens: number, runId?: string): void {
+    const key = runId ? `${runId}\0${handle}` : handle
     this.boardAssignmentTokens.set(assignmentId, (this.boardAssignmentTokens.get(assignmentId) ?? 0) + tokens)
-    this.boardHandleTokens.set(handle, (this.boardHandleTokens.get(handle) ?? 0) + tokens)
+    this.boardHandleTokens.set(key, (this.boardHandleTokens.get(key) ?? 0) + tokens)
+    if (runId) {
+      let runAssigns = this.assignmentIdsByRun.get(runId)
+      if (!runAssigns) {
+        runAssigns = new Set<string>()
+        this.assignmentIdsByRun.set(runId, runAssigns)
+      }
+      runAssigns.add(assignmentId)
+    }
+  }
+
+  /** Evict all per-run board bookkeeping and warm-specialist sessions on run disposal. */
+  cleanupRun(runId: string): void {
+    this.warm.evictRun(runId)
+    this.trackedBoardRuns.delete(runId)
+    this.routedOperatorBoardSeq.delete(runId)
+    this.boardScopeSync.delete(runId)
+    const colonPrefix = `${runId}:`
+    const nullPrefix = `${runId}\0`
+    for (const key of [...this.wokenBoardMessageKeys]) {
+      if (key.startsWith(colonPrefix)) this.wokenBoardMessageKeys.delete(key)
+    }
+    for (const key of [...this.postedVerdictKeys]) {
+      if (key.startsWith(colonPrefix)) this.postedVerdictKeys.delete(key)
+    }
+    for (const key of [...this.postedCanaryKeys]) {
+      if (key.startsWith(colonPrefix)) this.postedCanaryKeys.delete(key)
+    }
+    for (const key of [...this.boardHandleTokens.keys()]) {
+      if (key.startsWith(nullPrefix)) this.boardHandleTokens.delete(key)
+    }
+    const stepIds = this.stepIdsByRun.get(runId)
+    if (stepIds) {
+      for (const stepId of stepIds) this.wakeHandleByStepId.delete(stepId)
+      this.stepIdsByRun.delete(runId)
+    }
+    const assignIds = this.assignmentIdsByRun.get(runId)
+    if (assignIds) {
+      for (const assignmentId of assignIds) {
+        this.boardAssignmentTokens.delete(assignmentId)
+        this.boardHandleByAssignment.delete(assignmentId)
+      }
+      this.assignmentIdsByRun.delete(runId)
+    }
   }
 
   syncTrackedRuns(): void {

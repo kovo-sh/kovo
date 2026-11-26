@@ -2715,6 +2715,9 @@ export class RunsRepository {
           this.writeReport(this.run(run.id), true)
           break
         case 'resume':
+          if (run.phase === 'complete') {
+            throw new Error('Completed runs cannot be resumed.')
+          }
           if (!['paused', 'budget_paused', 'stopped', 'failed'].includes(run.status)) {
             throw new Error('This run is not paused or stopped.')
           }

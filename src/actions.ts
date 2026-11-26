@@ -368,9 +368,12 @@ export function isSubdomainDiscoveryPendingFromEvents(
 export function launchSubdomainDiscoveryInBackground(
   db: Store,
   runId: string,
-  runDiscovery: () => Promise<RunDiscoverySubdomainsResult>,
+  runDiscovery: (signal?: AbortSignal) => Promise<RunDiscoverySubdomainsResult>,
   timeoutMs = SUBDOMAIN_DISCOVERY_TIMEOUT_MS,
+  options: { signal?: AbortSignal } = {},
 ): Promise<void> {
+  const signal = options.signal
+  if (signal?.aborted) return Promise.resolve()
   let startedEventId = 0
   try {
     db.event(
@@ -387,9 +390,11 @@ export function launchSubdomainDiscoveryInBackground(
   }
 
   return Promise.resolve()
-    .then(() => runDiscovery())
+    .then(() => runDiscovery(signal))
     .then(result => {
+      if (signal?.aborted) return
       try {
+        db.run(runId)
         const after = db.eventsAfter(runId, startedEventId, 100)
         if (!after.some(ev => ev.kind === 'discovery.subdomains_discovered')) {
           db.event(
@@ -411,11 +416,13 @@ export function launchSubdomainDiscoveryInBackground(
           )
         }
       } catch {
-        // Store may have closed before background discovery settled.
+        // Store may have closed or run may have been deleted before background discovery settled.
       }
     })
     .catch(err => {
+      if (signal?.aborted) return
       try {
+        db.run(runId)
         db.event(
           runId,
           'discovery.subdomains_discovered',
@@ -430,7 +437,7 @@ export function launchSubdomainDiscoveryInBackground(
           },
         )
       } catch {
-        // Store may have closed before background discovery rejected.
+        // Store may have closed or run may have been deleted before background discovery rejected.
       }
     })
 }
@@ -475,11 +482,19 @@ export const createRun = createServerFn({ method: 'POST' }).validator(newRun)
           action: 'discover',
           consent: true,
         })
-        void launchSubdomainDiscoveryInBackground(
-          db,
+        void execution().runSupervisedBackgroundTask(
           created.id,
-          () => runDiscoverySubdomainsForRun(db, created.id, { timeoutMs: SUBDOMAIN_DISCOVERY_TIMEOUT_MS }),
-          SUBDOMAIN_DISCOVERY_TIMEOUT_MS,
+          'subdomain-discovery',
+          signal => launchSubdomainDiscoveryInBackground(
+            db,
+            created.id,
+            sig => runDiscoverySubdomainsForRun(db, created.id, {
+              timeoutMs: SUBDOMAIN_DISCOVERY_TIMEOUT_MS,
+              ...(sig ? { signal: sig } : {}),
+            }),
+            SUBDOMAIN_DISCOVERY_TIMEOUT_MS,
+            { signal },
+          ),
         )
       }
     } catch {
@@ -544,11 +559,19 @@ export const commandRun = createServerFn({ method: 'POST' }).validator(runComman
     })()
     const result = db.command(data, data.action !== 'message' || modelReady())
     if (shouldDiscoverSubdomains) {
-      void launchSubdomainDiscoveryInBackground(
-        db,
+      void execution().runSupervisedBackgroundTask(
         data.runId,
-        () => runDiscoverySubdomainsForRun(db, data.runId, { timeoutMs: SUBDOMAIN_DISCOVERY_TIMEOUT_MS }),
-        SUBDOMAIN_DISCOVERY_TIMEOUT_MS,
+        'subdomain-discovery',
+        signal => launchSubdomainDiscoveryInBackground(
+          db,
+          data.runId,
+          sig => runDiscoverySubdomainsForRun(db, data.runId, {
+            timeoutMs: SUBDOMAIN_DISCOVERY_TIMEOUT_MS,
+            ...(sig ? { signal: sig } : {}),
+          }),
+          SUBDOMAIN_DISCOVERY_TIMEOUT_MS,
+          { signal },
+        ),
       )
     }
     execution().wake()

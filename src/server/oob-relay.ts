@@ -838,7 +838,7 @@ export class OobRelay {
     }
 
     const known = Boolean(binding) || this.client.prepare(
-      'SELECT 1 AS ok FROM pending_oob WHERE token = ? LIMIT 1',
+      "SELECT 1 AS ok FROM pending_oob WHERE token = ? AND status = 'pending' LIMIT 1",
     ).get(token)
     if (!known) return reject('unknown_token')
 
@@ -987,11 +987,13 @@ export class OobRelay {
       .find(callback => callback.claimedBy === null && this.matchesSubscription(subscription, callback))
     if (existing) {
       const promotion = this.claim(subscription, existing, this.now())
-      return {
-        matched: true,
-        stage: 'immediate',
-        subscription: promotion.subscription,
-        callback: promotion.callback,
+      if (promotion.subscription.status === 'promoted' && promotion.subscription.callbackId === existing.callbackId) {
+        return {
+          matched: true,
+          stage: 'immediate',
+          subscription: promotion.subscription,
+          callback: promotion.callback,
+        }
       }
     }
     while (this.now() < deadline) {
@@ -1001,11 +1003,13 @@ export class OobRelay {
         .find(callback => callback.claimedBy === null && this.matchesSubscription(subscription, callback))
       if (late) {
         const promotion = this.claim(subscription, late, this.now())
-        return {
-          matched: true,
-          stage: 'immediate',
-          subscription: promotion.subscription,
-          callback: promotion.callback,
+        if (promotion.subscription.status === 'promoted' && promotion.subscription.callbackId === late.callbackId) {
+          return {
+            matched: true,
+            stage: 'immediate',
+            subscription: promotion.subscription,
+            callback: promotion.callback,
+          }
         }
       }
     }
@@ -1054,7 +1058,10 @@ export class OobRelay {
         .map(callbackFromRow)
         .find(callback => this.matchesSubscription(subscription, callback))
       if (candidate) {
-        promotions.push(this.claim(subscription, candidate, now))
+        const promotion = this.claim(subscription, candidate, now)
+        if (promotion.subscription.status === 'promoted' && promotion.subscription.callbackId === candidate.callbackId) {
+          promotions.push(promotion)
+        }
         continue
       }
       if (now > subscription.expiresAt) {
@@ -1074,20 +1081,38 @@ export class OobRelay {
   }
 
   private claim(subscription: OobSubscription, callback: OobCallback, now: number): OobPromotion {
-    const changed = this.client.prepare(
-      'UPDATE oob_callbacks SET claimed_by = ? WHERE callback_id = ? AND claimed_by IS NULL',
-    ).run(subscription.id, callback.callbackId) as { changes?: number | bigint }
-    const claimed = Number(changed?.changes ?? 0) > 0
-    if (claimed) {
-      this.client.prepare(
-        'UPDATE pending_oob SET status = ?, callback_id = ?, promoted_at = ? WHERE id = ? AND status = ?',
-      ).run('promoted', callback.callbackId, now, subscription.id, 'pending')
+    this.client.exec('BEGIN IMMEDIATE')
+    try {
+      const subUpdated = this.client.prepare(
+        "UPDATE pending_oob SET status = 'promoted', callback_id = ?, promoted_at = ? WHERE id = ? AND status = 'pending'",
+      ).run(callback.callbackId, now, subscription.id) as { changes?: number | bigint }
+      if (Number(subUpdated?.changes ?? 0) > 0) {
+        const cbUpdated = this.client.prepare(
+          'UPDATE oob_callbacks SET claimed_by = ? WHERE callback_id = ? AND claimed_by IS NULL',
+        ).run(subscription.id, callback.callbackId) as { changes?: number | bigint }
+        if (Number(cbUpdated?.changes ?? 0) === 0) {
+          this.client.exec('ROLLBACK')
+          const current = this.subscription(subscription.id)
+          const currentCb = this.callback(callback.callbackId) ?? callback
+          return {
+            stage: now - subscription.createdAt <= subscription.immediateMs ? 'immediate' : 'late',
+            subscription: current,
+            callback: currentCb,
+            latencyMs: Math.max(0, callback.receivedAt - subscription.createdAt),
+          }
+        }
+      }
+      this.client.exec('COMMIT')
+    } catch (err) {
+      try { this.client.exec('ROLLBACK') } catch { /* ignore */ }
+      throw err
     }
     const updated = this.subscription(subscription.id)
+    const updatedCb = this.callback(callback.callbackId) ?? callback
     return {
       stage: now - subscription.createdAt <= subscription.immediateMs ? 'immediate' : 'late',
       subscription: updated,
-      callback: { ...callback, claimedBy: updated.callbackId ? subscription.id : callback.claimedBy },
+      callback: updatedCb,
       latencyMs: Math.max(0, callback.receivedAt - subscription.createdAt),
     }
   }
