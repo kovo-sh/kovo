@@ -3,6 +3,20 @@
   "side": "tp",
   "archetype": "auth-bypass-header",
   "description": "Unauthenticated control receives 401 while probe supplying a forged internal proxy header bypasses authentication without host credentials and retrieves protected audit records.",
+  "covers": {
+    "files": [
+      "src/server/floor-recipe-engine.ts",
+      "src/server/host-fact-log.ts",
+      "src/server/oracle-invariants.ts",
+      "src/server/proof-receipt.ts",
+      "src/server/replay-verifier.ts",
+      "src/server/verify-claims.ts",
+      "src/server/verify-support.ts"
+    ],
+    "classes": [
+      "auth_bypass"
+    ]
+  },
   "canonicalLabel": {
     "cwe": "CWE-287",
     "category": "auth-bypass",
@@ -37,7 +51,9 @@
       "persona": null,
       "status": 401,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"error\":\"authentication_required\"}"
     },
     {
@@ -47,10 +63,14 @@
       "method": "GET",
       "pathAndQuery": "/api/admin/audit-log",
       "persona": null,
-      "requestHeaders": { "x-forwarded-user": "synthetic-admin" },
+      "requestHeaders": {
+        "x-forwarded-user": "synthetic-admin"
+      },
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"auditEntries\":[{\"id\":\"aud-901\",\"actor\":\"ops@tenant-a.example\",\"action\":\"key_rotated\",\"recordCount\":14}]}"
     }
   ],
@@ -64,6 +84,10 @@
     "claimedDelta": "Forged x-forwarded-user header bypassed 401 authentication gate without host credentials and returned protected audit log."
   },
   "claims": [
-    { "kind": "boundary", "controlExchangeId": "ctl", "probeExchangeId": "prb" }
+    {
+      "kind": "boundary",
+      "controlExchangeId": "ctl",
+      "probeExchangeId": "prb"
+    }
   ]
 }

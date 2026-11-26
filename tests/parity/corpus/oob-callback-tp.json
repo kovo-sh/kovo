@@ -3,6 +3,19 @@
   "side": "tp",
   "archetype": "oob-durable-callback",
   "description": "Unique request-side canary carrier exchange followed chronologically by a host-signed out-of-band callback delivery.",
+  "covers": {
+    "files": [
+      "src/server/host-fact-log.ts",
+      "src/server/proof-receipt.ts",
+      "src/server/verify-claims.ts",
+      "src/server/verify-prove-handlers.ts",
+      "src/server/verify-rpc.ts"
+    ],
+    "classes": [
+      "oob",
+      "xxe"
+    ]
+  },
   "canonicalLabel": {
     "cwe": "CWE-611",
     "category": "xxe",
@@ -40,7 +53,9 @@
       "persona": null,
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"token\":\"kovo-canary-a1b2c3d4e5f6a1b2c3d4e5f6\"}"
     },
     {
@@ -50,10 +65,14 @@
       "method": "POST",
       "pathAndQuery": "/api/import/reference",
       "persona": null,
-      "requestJson": { "referenceUrl": "https://canary.kovo.invalid/kovo-canary-a1b2c3d4e5f6a1b2c3d4e5f6" },
+      "requestJson": {
+        "referenceUrl": "https://canary.kovo.invalid/kovo-canary-a1b2c3d4e5f6a1b2c3d4e5f6"
+      },
       "status": 202,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"queued\":true}"
     }
   ],
@@ -76,6 +95,10 @@
     ]
   },
   "claims": [
-    { "kind": "oob", "exchangeId": "oob_mint", "expectHit": true }
+    {
+      "kind": "oob",
+      "exchangeId": "oob_mint",
+      "expectHit": true
+    }
   ]
 }

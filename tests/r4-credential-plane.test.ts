@@ -1,3 +1,4 @@
+// @kernel @fixes R4-H-2, R4-H-3, R4-H-17
 /**
  * Fast class-level regression guards for WS-8 (CLAUDE_AUDIT_R4):
  *  - R4-H-2: Provenance-tiered exact-secret needle builder (`primary_credential` vs `heuristic_derived`)

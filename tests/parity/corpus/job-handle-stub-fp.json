@@ -3,6 +3,20 @@
   "side": "fp",
   "archetype": "job-handle-stub",
   "description": "Queued async export 202 job stub and handle poll without downloading substantive cross-tenant data.",
+  "covers": {
+    "files": [
+      "src/server/floor-recipe-engine.ts",
+      "src/server/host-fact-log.ts",
+      "src/server/oracle-invariants.ts",
+      "src/server/proof-receipt.ts",
+      "src/server/replay-verifier.ts",
+      "src/server/verify-claims.ts"
+    ],
+    "classes": [
+      "bola",
+      "authorization"
+    ]
+  },
   "canonicalLabel": {
     "cwe": "CWE-639",
     "category": "bola",
@@ -53,10 +67,14 @@
       "method": "POST",
       "pathAndQuery": "/v1/orgs/tenant-b/exports",
       "persona": "viewer_a",
-      "requestJson": { "format": "csv" },
+      "requestJson": {
+        "format": "csv"
+      },
       "status": 403,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"error\":\"forbidden\"}"
     },
     {
@@ -66,10 +84,14 @@
       "method": "POST",
       "pathAndQuery": "/v1/orgs/tenant-b/exports",
       "persona": "member_a",
-      "requestJson": { "format": "csv" },
+      "requestJson": {
+        "format": "csv"
+      },
       "status": 202,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"jobId\":\"job_99\",\"status\":\"queued\",\"tenant\":\"tenant-b\"}"
     },
     {
@@ -81,7 +103,9 @@
       "persona": "member_a",
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"job\":{\"id\":\"job_99\",\"status\":\"ready\",\"artifactKey\":\"tenant-b/data.csv\"}}"
     }
   ],
@@ -90,11 +114,29 @@
     "assertionsJq": "{ controlPassed: (.steps.ctl.status == 403), confirmed: (.steps.prb.status == 202 and .steps.poll.json.job.status == \"ready\"), observed: .steps.prb.json.jobId, expected: \"403\" }"
   },
   "claims": [
-    { "kind": "boundary", "boundaryClass": "access", "controlExchangeId": "ctl", "probeExchangeId": "prb", "expectControlDenied": true }
+    {
+      "kind": "boundary",
+      "boundaryClass": "access",
+      "controlExchangeId": "ctl",
+      "probeExchangeId": "prb",
+      "expectControlDenied": true
+    }
   ],
   "bareClaims": [
-    { "kind": "status", "exchangeId": "ctl", "expected": 403 },
-    { "kind": "status", "exchangeId": "prb", "expected": 202 },
-    { "kind": "status", "exchangeId": "poll", "expected": 200 }
+    {
+      "kind": "status",
+      "exchangeId": "ctl",
+      "expected": 403
+    },
+    {
+      "kind": "status",
+      "exchangeId": "prb",
+      "expected": 202
+    },
+    {
+      "kind": "status",
+      "exchangeId": "poll",
+      "expected": 200
+    }
   ]
 }

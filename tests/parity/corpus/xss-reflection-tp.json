@@ -3,6 +3,20 @@
   "side": "tp",
   "archetype": "xss-executable-reflection",
   "description": "HTML endpoint reflects an unescaped executable script/event-handler markup payload with browser execution attestation.",
+  "covers": {
+    "files": [
+      "src/server/host-fact-log.ts",
+      "src/server/oracle-invariants.ts",
+      "src/server/proof-receipt.ts",
+      "src/server/verify-claims.ts"
+    ],
+    "classes": [
+      "xss_reflected",
+      "xss",
+      "markup",
+      "browser_dom_xss"
+    ]
+  },
   "canonicalLabel": {
     "cwe": "CWE-79",
     "category": "xss",
@@ -37,7 +51,9 @@
       "persona": null,
       "status": 200,
       "mediaType": "text/html",
-      "responseHeaders": { "content-type": "text/html; charset=utf-8" },
+      "responseHeaders": {
+        "content-type": "text/html; charset=utf-8"
+      },
       "body": "<html><body><h1>Hello alice</h1></body></html>"
     },
     {
@@ -49,9 +65,13 @@
       "persona": null,
       "status": 200,
       "mediaType": "text/html",
-      "responseHeaders": { "content-type": "text/html; charset=utf-8" },
+      "responseHeaders": {
+        "content-type": "text/html; charset=utf-8"
+      },
       "body": "<html><body><h1>Hello <svg onload=kovoCanary()></h1></body></html>",
-      "executedSentinels": ["kovo-xss-sentinel"]
+      "executedSentinels": [
+        "kovo-xss-sentinel"
+      ]
     }
   ],
   "proofReceipt": {
@@ -60,11 +80,25 @@
     "targetPathAndQuery": "/greet",
     "claimedDelta": "Host-recorded browser trace observed executable DOM XSS sink execution on /greet.",
     "browserTraces": [
-      { "id": "trace-xss-parity-1", "sinks": ["dom_xss"] }
+      {
+        "id": "trace-xss-parity-1",
+        "sinks": [
+          "dom_xss"
+        ]
+      }
     ]
   },
   "claims": [
-    { "kind": "status", "exchangeId": "prb", "expected": 200 },
-    { "kind": "dom_sentinel", "exchangeId": "prb", "sentinel": "kovo-xss-sentinel", "mode": "executed" }
+    {
+      "kind": "status",
+      "exchangeId": "prb",
+      "expected": 200
+    },
+    {
+      "kind": "dom_sentinel",
+      "exchangeId": "prb",
+      "sentinel": "kovo-xss-sentinel",
+      "mode": "executed"
+    }
   ]
 }

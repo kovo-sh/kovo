@@ -3,6 +3,21 @@
   "side": "fp",
   "archetype": "r4-h7-permit-all-invalid-bearer-control",
   "description": "R4-H-7 FP: permit-all public catalog endpoint rejects an invalid bearer credential on the control arm with 401 while answering an anonymous probe carrying an ignored forwarding header with 200; must fail closed across all entry points because the control self-sabotaged with a credential the probe lacked and no bare anonymous ablation denial exists.",
+  "covers": {
+    "files": [
+      "src/server/floor-recipe-engine.ts",
+      "src/server/host-fact-log.ts",
+      "src/server/oracle-invariants.ts",
+      "src/server/proof-receipt.ts",
+      "src/server/replay-verifier.ts",
+      "src/server/verify-claims.ts",
+      "src/server/verify-rpc.ts",
+      "src/server/verify-support.ts"
+    ],
+    "classes": [
+      "auth_bypass"
+    ]
+  },
   "canonicalLabel": {
     "cwe": "CWE-287",
     "category": "auth-bypass",
@@ -35,10 +50,14 @@
       "method": "GET",
       "pathAndQuery": "/api/public/catalog",
       "persona": null,
-      "requestHeaders": { "authorization": "Bearer kovo-synth-invalid-0011223344556677" },
+      "requestHeaders": {
+        "authorization": "Bearer kovo-synth-invalid-0011223344556677"
+      },
       "status": 401,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"error\":\"invalid_bearer_token\"}"
     },
     {
@@ -48,10 +67,14 @@
       "method": "GET",
       "pathAndQuery": "/api/public/catalog",
       "persona": null,
-      "requestHeaders": { "x-forwarded-user": "synthetic-admin" },
+      "requestHeaders": {
+        "x-forwarded-user": "synthetic-admin"
+      },
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"catalogEntries\":[{\"id\":\"pub-101\",\"title\":\"Public Handbook\",\"tier\":\"public\"}]}"
     }
   ],
@@ -65,6 +88,10 @@
     "claimedDelta": "Synthetic invalid bearer control returned 401 while anonymous probe with ignored forwarding header returned 200 on a public route."
   },
   "claims": [
-    { "kind": "boundary", "controlExchangeId": "ctl", "probeExchangeId": "prb" }
+    {
+      "kind": "boundary",
+      "controlExchangeId": "ctl",
+      "probeExchangeId": "prb"
+    }
   ]
 }

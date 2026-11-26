@@ -1,3 +1,4 @@
+// @kernel @fixes R3-H-8
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'

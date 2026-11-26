@@ -1,3 +1,4 @@
+// @kernel @fixes R3-H-12
 /**
  * R3-H-12 regression tests:
  * 1. Static lint banning synchronous `extractProgramGraph(` calls in `src/server/` production host

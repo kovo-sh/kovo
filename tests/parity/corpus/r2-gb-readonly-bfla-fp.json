@@ -3,6 +3,20 @@
   "side": "fp",
   "archetype": "r2-gb-readonly-bfla",
   "description": "Move-1 GB FP (PG-D1 class): read-only GET member roster/directory listing claiming privilege_escalation without state mutation + readback or v8 oracle MUST reject as terminal_impact_unproven.",
+  "covers": {
+    "files": [
+      "src/server/composite-receipt.ts",
+      "src/server/composite-terminal.ts",
+      "src/server/host-fact-log.ts",
+      "src/server/oracle-invariants.ts",
+      "src/server/terminal-oracle-registry.ts",
+      "src/server/verify-claims.ts"
+    ],
+    "classes": [
+      "privilege_escalation",
+      "bfla"
+    ]
+  },
   "canonicalLabel": {
     "cwe": "CWE-862",
     "category": "bfla",
@@ -44,10 +58,14 @@
       "method": "POST",
       "pathAndQuery": "/api/v1/invites/resolve",
       "persona": "member_b",
-      "emittedCapabilities": ["cap:hop_1:invite_roster_tok"],
+      "emittedCapabilities": [
+        "cap:hop_1:invite_roster_tok"
+      ],
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"token\":\"resolved-invite-tok-1\",\"org\":\"org_a\"}"
     },
     {
@@ -59,7 +77,9 @@
       "persona": "member_b",
       "status": 403,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"error\":\"not_a_member\"}"
     },
     {
@@ -69,10 +89,14 @@
       "method": "GET",
       "pathAndQuery": "/api/v1/orgs/org_a/members",
       "persona": null,
-      "consumedCapabilities": ["cap:hop_1:invite_roster_tok"],
+      "consumedCapabilities": [
+        "cap:hop_1:invite_roster_tok"
+      ],
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"members\":[{\"id\":\"usr_1\",\"email\":\"owner@org-a.example\",\"role\":\"owner\"},{\"id\":\"usr_2\",\"email\":\"member@org-a.example\",\"role\":\"member\"}]}"
     }
   ],
@@ -82,9 +106,15 @@
     "oracleFamily": "",
     "capabilityToken": "invite_roster_tok",
     "terminalExchangeId": "hop2_prb",
-    "preChainControlIds": ["hop2_ctl"],
-    "attackerPersonas": ["member_b"],
-    "forbiddenShortcutPersonas": ["owner_a"],
+    "preChainControlIds": [
+      "hop2_ctl"
+    ],
+    "attackerPersonas": [
+      "member_b"
+    ],
+    "forbiddenShortcutPersonas": [
+      "owner_a"
+    ],
     "expectedFailedStage": "terminal_impact",
     "claimedDelta": "Read-only GET organization member roster listing without state mutation must fail closed for privilege_escalation."
   }

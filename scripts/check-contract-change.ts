@@ -17,12 +17,18 @@
  * never blocked before commit; pass `--strict-uncommitted` or `--staged` to enforce strictly.
  */
 import { execFileSync } from 'node:child_process'
-import { existsSync, readdirSync, readFileSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { basename, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 // Canonical KERNEL_TEST_RE imported from scripts/test-tiers.ts:
 // ^tests\/.*(?:oracle|receipt|confirm-consistency|floor-recipe|verify-kernel|dispatch-funnel|contract-canary|path-parity|taxonomy-conformance).*\.test\.ts$
-import { GATE_TEST_EXACT, KERNEL_TEST_RE } from './test-tiers.ts'
+import {
+  GATE_TEST_EXACT,
+  KERNEL_TEST_RE,
+  hasProtectedTestTag,
+  parseTestFileTags,
+  readTestFileTags,
+} from './test-tiers.ts'
 
 export type ContractChangeKind = 'tunable_constant_change' | 'gate_assert_literal_change'
 
@@ -49,6 +55,48 @@ export interface ParsedDiffFile {
   deleted?: boolean
 }
 
+export interface ParityCorpusCovers {
+  files: string[]
+  classes: string[]
+}
+
+export interface ParityCorpusCaseMeta {
+  id: string
+  file: string
+  side: 'tp' | 'fp' | 'retest' | null
+  covers?: ParityCorpusCovers
+}
+
+export interface CommitParitySlice {
+  sha: string
+  diffText: string
+  commitMessage: string
+}
+
+export interface MissingLooseningSide {
+  file: string
+  missing: Array<'tp' | 'fp'>
+}
+
+export interface CommitParityEvalResult {
+  sha: string
+  required: boolean
+  ok: boolean
+  warned: boolean
+  kernelFilesTouched: string[]
+  corpusFilesTouched: string[]
+  parityCaseTrailers: string[]
+  validParityCaseIds: string[]
+  invalidParityCaseIds: string[]
+  uncoveredKernelFiles: string[]
+  loosening: boolean
+  missingLooseningSides: MissingLooseningSide[]
+  reviewedByTrailers: string[]
+  overridden: boolean
+  overrideTrailer: string | null
+  reason: string | null
+}
+
 export interface ParityGateEvalResult {
   required: boolean
   ok: boolean
@@ -58,6 +106,13 @@ export interface ParityGateEvalResult {
   parityCaseTrailers: string[]
   validParityCaseIds: string[]
   invalidParityCaseIds: string[]
+  uncoveredKernelFiles: string[]
+  loosening: boolean
+  missingLooseningSides: MissingLooseningSide[]
+  reviewedByTrailers: string[]
+  overridden: boolean
+  overrideTrailer: string | null
+  commitResults?: CommitParityEvalResult[]
   reason: string | null
 }
 
@@ -95,7 +150,7 @@ export interface CheckGitRepoOptions {
 export const EXTENDED_CONTRACT_TEST_RE = /^tests\/(?:r2-|r3-|.*security).*\.test\.ts$/
 
 export const CONFIRMATION_KERNEL_FILE_RE =
-  /^src\/server\/(?:replay-verifier|verify-claims|proof-receipt|floor-recipe[^/]*|composite-receipt|composite-terminal|oracle-invariants|exec-verify|v8-oracle-[^/]*|verify-support)\.ts$/
+  /^src\/server\/(?:replay-verifier|verify-claims|proof-receipt|floor-recipe[^/]*|composite-receipt|composite-terminal|composite-autodag|oracle-invariants|exec-verify|v8-oracle-[^/]*|verify-support|terminal-oracle-registry|verify-prove-handlers|verify-rpc|agent-script-proof|host-fact-log|causal-proof-compiler|retest-health)\.ts$/
 
 const SCREAMING_TUNABLE_EXPORT_RE =
   /^\s*export\s+(?:const|let)\s+((?:[A-Z][A-Z0-9_]*_(?:DEFAULT|BUDGET|MS|CAP|IN_FLIGHT|RPS|LIMIT)|(?:[A-Z][A-Z0-9_]*_)?MAX_[A-Z0-9_]+))\b[^=]*=\s*(.+)$/
@@ -107,39 +162,112 @@ const NUMERIC_LITERAL_RE = /(?<![A-Za-z0-9_$])(?:\d[\d_]*(?:\.[\d_]+)?|\.\d[\d_]
 const CONTRACT_CHANGE_TRAILER_RE = /^\s*Contract-change:\s*(.+)$/im
 const CONTRACT_CHANGE_TRAILER_ALL_RE = /^\s*Contract-change:\s*(.+)$/gim
 const PARITY_CASE_TRAILER_ALL_RE = /^\s*Parity-case:\s*(.+)$/gim
+const KERNEL_CHANGE_TRAILER_ALL_RE = /^\s*Kernel-change:\s*(.+)$/gim
+const REVIEWED_BY_TRAILER_ALL_RE = /^\s*Reviewed-by:\s*(.+)$/gim
+const KERNEL_GATE_OVERRIDE_TRAILER_ALL_RE = /^\s*Kernel-gate-override:\s*(.+)$/gim
 
-export function isConfirmationKernelFile(relPath: string): boolean {
-  const norm = relPath.replace(/\\/g, '/').replace(/^\.\//, '')
+const kernelManifestCache = new Map<string, { mtimeMs: number; files: ReadonlySet<string> }>()
+
+function normalizeRel(relPath: string): string {
+  return relPath.replace(/\\/g, '/').replace(/^\.\//, '')
+}
+
+/**
+ * Load the generated confirmation-kernel file manifest (`scripts/kernel-manifest.json`).
+ * Returns `null` if no manifest exists in `rootDir`.
+ */
+export function loadKernelManifestFiles(rootDir: string = REPO_ROOT): ReadonlySet<string> | null {
+  const manifestPath = join(resolve(rootDir), 'scripts', 'kernel-manifest.json')
+  if (!existsSync(manifestPath)) return null
+  try {
+    const mtimeMs = statSync(manifestPath).mtimeMs
+    const cached = kernelManifestCache.get(manifestPath)
+    if (cached && cached.mtimeMs === mtimeMs) return cached.files
+    const parsed = JSON.parse(readFileSync(manifestPath, 'utf8')) as { files?: unknown }
+    if (!Array.isArray(parsed.files)) return null
+    const files = new Set(
+      parsed.files
+        .filter((f): f is string => typeof f === 'string' && f.trim().length > 0)
+        .map(f => normalizeRel(f.trim())),
+    )
+    kernelManifestCache.set(manifestPath, { mtimeMs, files })
+    return files
+  } catch {
+    return null
+  }
+}
+
+export function isConfirmationKernelFile(relPath: string, rootDir: string = REPO_ROOT): boolean {
+  const norm = normalizeRel(relPath)
   if (/(?:\.test|\.spec)\.[^./]+$/i.test(norm)) return false
+  const localManifest = loadKernelManifestFiles(rootDir)
+  if (localManifest) return localManifest.has(norm)
+  const repoManifest = rootDir !== REPO_ROOT ? loadKernelManifestFiles(REPO_ROOT) : null
+  if (repoManifest && repoManifest.has(norm)) return true
   return CONFIRMATION_KERNEL_FILE_RE.test(norm)
 }
 
 export function isParityCorpusFile(relPath: string): boolean {
-  const norm = relPath.replace(/\\/g, '/').replace(/^\.\//, '')
+  const norm = normalizeRel(relPath)
   return norm.startsWith('tests/parity/corpus/') && norm.endsWith('.json')
 }
 
-export function loadParityCorpusIds(rootDir: string = REPO_ROOT): Set<string> {
+function parseCorpusCaseObject(raw: unknown, relFile: string): ParityCorpusCaseMeta | null {
+  if (!raw || typeof raw !== 'object') return null
+  const obj = raw as {
+    id?: unknown
+    side?: unknown
+    covers?: { files?: unknown; classes?: unknown }
+  }
+  if (typeof obj.id !== 'string' || obj.id.trim().length === 0) return null
+  const side =
+    obj.side === 'tp' || obj.side === 'fp' || obj.side === 'retest' ? obj.side : null
+  let covers: ParityCorpusCovers | undefined
+  if (obj.covers && typeof obj.covers === 'object') {
+    const files = Array.isArray(obj.covers.files)
+      ? obj.covers.files
+          .filter((f): f is string => typeof f === 'string' && f.trim().length > 0)
+          .map(f => normalizeRel(f.trim()))
+      : []
+    const classes = Array.isArray(obj.covers.classes)
+      ? obj.covers.classes
+          .filter((c): c is string => typeof c === 'string' && c.trim().length > 0)
+          .map(c => c.trim())
+      : []
+    covers = { files, classes }
+  }
+  return {
+    id: obj.id.trim(),
+    file: normalizeRel(relFile),
+    side,
+    ...(covers ? { covers } : {}),
+  }
+}
+
+export function loadParityCorpusCases(rootDir: string = REPO_ROOT): Map<string, ParityCorpusCaseMeta> {
   const corpusDir = join(rootDir, 'tests', 'parity', 'corpus')
-  const ids = new Set<string>()
-  if (!existsSync(corpusDir)) return ids
+  const cases = new Map<string, ParityCorpusCaseMeta>()
+  if (!existsSync(corpusDir)) return cases
   let files: string[]
   try {
     files = readdirSync(corpusDir).filter(f => f.endsWith('.json')).sort()
   } catch {
-    return ids
+    return cases
   }
   for (const file of files) {
     try {
-      const parsed = JSON.parse(readFileSync(join(corpusDir, file), 'utf8')) as { id?: unknown }
-      if (typeof parsed.id === 'string' && parsed.id.trim().length > 0) {
-        ids.add(parsed.id.trim())
-      }
+      const parsed = JSON.parse(readFileSync(join(corpusDir, file), 'utf8')) as unknown
+      const meta = parseCorpusCaseObject(parsed, `tests/parity/corpus/${file}`)
+      if (meta) cases.set(meta.id, meta)
     } catch {
       // Ignore unreadable/invalid JSON here; path-parity.test.ts validates corpus schema.
     }
   }
-  return ids
+  return cases
+}
+
+export function loadParityCorpusIds(rootDir: string = REPO_ROOT): Set<string> {
+  return new Set(loadParityCorpusCases(rootDir).keys())
 }
 
 export function parseParityCaseTrailers(commitMessages: string): string[] {
@@ -154,9 +282,60 @@ export function parseParityCaseTrailers(commitMessages: string): string[] {
   return ids
 }
 
-export function isGateOrKernelTestFile(relPath: string): boolean {
-  const norm = relPath.replace(/\\/g, '/').replace(/^\.\//, '')
-  return GATE_TEST_EXACT.has(norm) || KERNEL_TEST_RE.test(norm) || EXTENDED_CONTRACT_TEST_RE.test(norm)
+export function parseKernelChangeTrailers(commitMessages: string): string[] {
+  const vals: string[] = []
+  KERNEL_CHANGE_TRAILER_ALL_RE.lastIndex = 0
+  for (const m of commitMessages.matchAll(KERNEL_CHANGE_TRAILER_ALL_RE)) {
+    const raw = (m[1] ?? '').trim()
+    if (raw.length > 0) vals.push(raw)
+  }
+  return vals
+}
+
+export function isKernelLooseningChange(commitMessages: string): boolean {
+  return parseKernelChangeTrailers(commitMessages).some(v => /^loosening\b/i.test(v))
+}
+
+export function parseReviewedByTrailers(commitMessages: string): string[] {
+  const vals: string[] = []
+  REVIEWED_BY_TRAILER_ALL_RE.lastIndex = 0
+  for (const m of commitMessages.matchAll(REVIEWED_BY_TRAILER_ALL_RE)) {
+    const raw = (m[1] ?? '').trim()
+    if (raw.length > 0) vals.push(raw)
+  }
+  return vals
+}
+
+/**
+ * Parse audited operator override trailers (`Kernel-gate-override: <ticket> <reason>`).
+ * Requires at least 2 tokens and >= 12 chars so trivial/empty overrides are rejected.
+ */
+export function parseKernelGateOverrideTrailers(commitMessages: string): string[] {
+  const valid: string[] = []
+  KERNEL_GATE_OVERRIDE_TRAILER_ALL_RE.lastIndex = 0
+  for (const m of commitMessages.matchAll(KERNEL_GATE_OVERRIDE_TRAILER_ALL_RE)) {
+    const raw = (m[1] ?? '').trim()
+    const tokens = raw.split(/\s+/).filter(Boolean)
+    if (raw.length >= 12 && tokens.length >= 2) {
+      valid.push(raw)
+    }
+  }
+  return valid
+}
+
+export function isGateOrKernelTestFile(
+  relPath: string,
+  opts?: { rootDir?: string; sourceText?: string },
+): boolean {
+  const norm = normalizeRel(relPath)
+  if (GATE_TEST_EXACT.has(norm) || KERNEL_TEST_RE.test(norm) || EXTENDED_CONTRACT_TEST_RE.test(norm)) {
+    return true
+  }
+  if (!norm.startsWith('tests/') || !norm.endsWith('.test.ts')) return false
+  const tags = opts?.sourceText !== undefined
+    ? parseTestFileTags(opts.sourceText)
+    : readTestFileTags(norm, opts?.rootDir ?? REPO_ROOT)
+  return hasProtectedTestTag(tags)
 }
 
 export function isTunableSourceFile(relPath: string): boolean {
@@ -288,13 +467,16 @@ function isSubMultiset(sub: readonly string[], sup: readonly string[]): boolean 
   return true
 }
 
-export function detectContractChanges(diffText: string): ContractChangeHit[] {
+export function detectContractChanges(
+  diffText: string,
+  opts?: { rootDir?: string },
+): ContractChangeHit[] {
   const parsedFiles = parseUnifiedDiff(diffText)
   const hits: ContractChangeHit[] = []
 
   for (const fileEntry of parsedFiles) {
     const tunable = isTunableSourceFile(fileEntry.file)
-    const gateTest = isGateOrKernelTestFile(fileEntry.file)
+    const gateTest = isGateOrKernelTestFile(fileEntry.file, { rootDir: opts?.rootDir })
     if (!tunable && !gateTest) continue
 
     for (const hunk of fileEntry.hunks) {
@@ -449,20 +631,56 @@ function matchPerIdTrailers(
   return { ok: missingIds.length === 0, missingIds }
 }
 
-export function evaluateParityGate(opts: {
+function parseCorpusCaseFromDiffFile(fileEntry: ParsedDiffFile, rootDir: string): ParityCorpusCaseMeta | null {
+  const fullPath = join(rootDir, fileEntry.file)
+  if (existsSync(fullPath)) {
+    try {
+      const parsed = JSON.parse(readFileSync(fullPath, 'utf8')) as unknown
+      const meta = parseCorpusCaseObject(parsed, fileEntry.file)
+      if (meta) return meta
+    } catch {
+      // Fall through to diff reconstruction.
+    }
+  }
+  const addedText = fileEntry.hunks.flatMap(h => h.added.map(a => a.text)).join('\n').trim()
+  if (addedText.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(addedText) as unknown
+      const meta = parseCorpusCaseObject(parsed, fileEntry.file)
+      if (meta) return meta
+    } catch {
+      // Partial diff hunk on an existing file not present on disk.
+    }
+  }
+  return null
+}
+
+function evaluateSingleDiffParityGate(opts: {
+  sha: string
   diffText: string
   commitMessages: string
   mode: 'strict' | 'warn'
-  rootDir?: string
-  knownParityCaseIds?: ReadonlySet<string>
-}): ParityGateEvalResult {
+  rootDir: string
+  corpusById: ReadonlyMap<string, ParityCorpusCaseMeta>
+  corpusByFile: ReadonlyMap<string, ParityCorpusCaseMeta>
+  corpusUsesCovers: boolean
+  requireReviewedByOnLoosening: boolean
+}): CommitParityEvalResult {
   const parsedFiles = parseUnifiedDiff(opts.diffText)
-  const kernelFilesTouched = [...new Set(parsedFiles.map(f => f.file).filter(isConfirmationKernelFile))]
-  const corpusFilesTouched = [...new Set(parsedFiles.filter(f => !f.deleted).map(f => f.file).filter(isParityCorpusFile))]
+  const kernelFilesTouched = [
+    ...new Set(parsedFiles.map(f => normalizeRel(f.file)).filter(f => isConfirmationKernelFile(f, opts.rootDir))),
+  ].sort()
+  const nonDeletedCorpusEntries = parsedFiles.filter(f => !f.deleted && isParityCorpusFile(f.file))
+  const corpusFilesTouched = [...new Set(nonDeletedCorpusEntries.map(f => normalizeRel(f.file)))].sort()
   const parityCaseTrailers = parseParityCaseTrailers(opts.commitMessages)
+  const loosening = isKernelLooseningChange(opts.commitMessages)
+  const reviewedByTrailers = parseReviewedByTrailers(opts.commitMessages)
+  const overrideTrailers = parseKernelGateOverrideTrailers(opts.commitMessages)
+  const rawOverrideLinePresent = /^\s*Kernel-gate-override:/im.test(opts.commitMessages)
 
   if (kernelFilesTouched.length === 0) {
     return {
+      sha: opts.sha,
       required: false,
       ok: true,
       warned: false,
@@ -471,17 +689,84 @@ export function evaluateParityGate(opts: {
       parityCaseTrailers,
       validParityCaseIds: [],
       invalidParityCaseIds: [],
+      uncoveredKernelFiles: [],
+      loosening,
+      missingLooseningSides: [],
+      reviewedByTrailers,
+      overridden: false,
+      overrideTrailer: null,
       reason: null,
     }
   }
 
-  const knownIds = opts.knownParityCaseIds ?? loadParityCorpusIds(opts.rootDir ?? REPO_ROOT)
-  const validParityCaseIds = parityCaseTrailers.filter(id => knownIds.has(id))
-  const invalidParityCaseIds = parityCaseTrailers.filter(id => !knownIds.has(id))
+  if (overrideTrailers.length > 0) {
+    return {
+      sha: opts.sha,
+      required: true,
+      ok: true,
+      warned: false,
+      kernelFilesTouched,
+      corpusFilesTouched,
+      parityCaseTrailers,
+      validParityCaseIds: [],
+      invalidParityCaseIds: [],
+      uncoveredKernelFiles: [],
+      loosening,
+      missingLooseningSides: [],
+      reviewedByTrailers,
+      overridden: true,
+      overrideTrailer: overrideTrailers[0]!,
+      reason: null,
+    }
+  }
+
+  if (rawOverrideLinePresent) {
+    const reason = 'Malformed Kernel-gate-override trailer (requires "<ticket> <justification>" with >= 2 tokens and >= 12 chars).'
+    return {
+      sha: opts.sha,
+      required: true,
+      ok: opts.mode === 'warn',
+      warned: opts.mode === 'warn',
+      kernelFilesTouched,
+      corpusFilesTouched,
+      parityCaseTrailers,
+      validParityCaseIds: [],
+      invalidParityCaseIds: [],
+      uncoveredKernelFiles: kernelFilesTouched,
+      loosening,
+      missingLooseningSides: [],
+      reviewedByTrailers,
+      overridden: false,
+      overrideTrailer: null,
+      reason,
+    }
+  }
+
+  // Merge any corpus files added/edited in this commit into the lookup maps for this commit.
+  const effectiveById = new Map<string, ParityCorpusCaseMeta>(opts.corpusById)
+  const effectiveByFile = new Map<string, ParityCorpusCaseMeta>(opts.corpusByFile)
+  let effectiveUsesCovers = opts.corpusUsesCovers
+  const touchedCases: ParityCorpusCaseMeta[] = []
+  for (const entry of nonDeletedCorpusEntries) {
+    const rel = normalizeRel(entry.file)
+    const fromDiff = parseCorpusCaseFromDiffFile(entry, opts.rootDir)
+    const existing = effectiveByFile.get(rel)
+    const resolved = fromDiff ?? existing
+    if (resolved) {
+      effectiveById.set(resolved.id, resolved)
+      effectiveByFile.set(rel, resolved)
+      if (resolved.covers) effectiveUsesCovers = true
+      touchedCases.push(resolved)
+    }
+  }
+
+  const validParityCaseIds = parityCaseTrailers.filter(id => effectiveById.has(id))
+  const invalidParityCaseIds = parityCaseTrailers.filter(id => !effectiveById.has(id))
 
   if (invalidParityCaseIds.length > 0) {
     const reason = `Unknown Parity-case ID(s): ${invalidParityCaseIds.join(', ')} (must match an existing case "id" in tests/parity/corpus/*.json).`
     return {
+      sha: opts.sha,
       required: true,
       ok: opts.mode === 'warn',
       warned: opts.mode === 'warn',
@@ -490,34 +775,257 @@ export function evaluateParityGate(opts: {
       parityCaseTrailers,
       validParityCaseIds,
       invalidParityCaseIds,
+      uncoveredKernelFiles: kernelFilesTouched,
+      loosening,
+      missingLooseningSides: [],
+      reviewedByTrailers,
+      overridden: false,
+      overrideTrailer: null,
       reason,
     }
   }
 
-  if (corpusFilesTouched.length > 0 || validParityCaseIds.length > 0) {
+  // Candidate parity cases for THIS commit: cited valid IDs + non-deleted corpus files touched in this commit.
+  const candidateByKey = new Map<string, ParityCorpusCaseMeta>()
+  for (const id of validParityCaseIds) {
+    const meta = effectiveById.get(id)
+    if (meta) candidateByKey.set(meta.id, meta)
+  }
+  for (const meta of touchedCases) {
+    candidateByKey.set(meta.id, meta)
+  }
+  const candidates = [...candidateByKey.values()]
+
+  if (corpusFilesTouched.length === 0 && validParityCaseIds.length === 0) {
+    const reason = `Confirmation-kernel diff (${kernelFilesTouched.join(', ')}) must touch tests/parity/corpus/*.json OR carry "Parity-case: <id>" naming a corpus case whose covers.files covers each changed kernel file.`
     return {
+      sha: opts.sha,
       required: true,
-      ok: true,
-      warned: false,
+      ok: opts.mode === 'warn',
+      warned: opts.mode === 'warn',
       kernelFilesTouched,
       corpusFilesTouched,
       parityCaseTrailers,
       validParityCaseIds,
       invalidParityCaseIds: [],
-      reason: null,
+      uncoveredKernelFiles: kernelFilesTouched,
+      loosening,
+      missingLooseningSides: [],
+      reviewedByTrailers,
+      overridden: false,
+      overrideTrailer: null,
+      reason,
     }
   }
 
-  const reason = `Confirmation-kernel diff (${kernelFilesTouched.join(', ')}) must touch tests/parity/corpus/*.json OR carry "Parity-case: <id>" naming an existing corpus case ID.`
+  // Semantic covers.files binding: every changed kernel file in this commit must be covered
+  // by at least one candidate case's covers.files when the corpus declares covers metadata.
+  let uncoveredKernelFiles: string[] = []
+  if (effectiveUsesCovers) {
+    const coveredFiles = new Set<string>()
+    for (const c of candidates) {
+      for (const f of c.covers?.files ?? []) {
+        coveredFiles.add(normalizeRel(f))
+      }
+    }
+    uncoveredKernelFiles = kernelFilesTouched.filter(kf => !coveredFiles.has(kf))
+  }
+
+  if (uncoveredKernelFiles.length > 0) {
+    const citedDesc = validParityCaseIds.length > 0 ? validParityCaseIds.join(', ') : 'none'
+    const touchedDesc = corpusFilesTouched.length > 0 ? corpusFilesTouched.join(', ') : 'none'
+    const reason =
+      `Confirmation-kernel file(s) not covered by commit Parity-case/corpus covers.files: ${uncoveredKernelFiles.join(', ')} ` +
+      `(cited Parity-case: ${citedDesc}; touched corpus: ${touchedDesc}).`
+    return {
+      sha: opts.sha,
+      required: true,
+      ok: opts.mode === 'warn',
+      warned: opts.mode === 'warn',
+      kernelFilesTouched,
+      corpusFilesTouched,
+      parityCaseTrailers,
+      validParityCaseIds,
+      invalidParityCaseIds: [],
+      uncoveredKernelFiles,
+      loosening,
+      missingLooseningSides: [],
+      reviewedByTrailers,
+      overridden: false,
+      overrideTrailer: null,
+      reason,
+    }
+  }
+
+  // Kernel-change: loosening requires BOTH a TP and an FP corpus case covering each changed kernel file.
+  const missingLooseningSides: MissingLooseningSide[] = []
+  if (loosening) {
+    for (const kf of kernelFilesTouched) {
+      const covering = effectiveUsesCovers
+        ? candidates.filter(c => (c.covers?.files ?? []).includes(kf))
+        : candidates
+      const hasTp = covering.some(c => c.side === 'tp')
+      const hasFp = covering.some(c => c.side === 'fp')
+      const missing: Array<'tp' | 'fp'> = []
+      if (!hasTp) missing.push('tp')
+      if (!hasFp) missing.push('fp')
+      if (missing.length > 0) {
+        missingLooseningSides.push({ file: kf, missing })
+      }
+    }
+    if (missingLooseningSides.length > 0) {
+      const detail = missingLooseningSides.map(m => `${m.file} missing ${m.missing.join('+')}`).join('; ')
+      const reason = `Kernel-change: loosening requires BOTH a TP and an FP corpus case covering each changed kernel file (${detail}).`
+      return {
+        sha: opts.sha,
+        required: true,
+        ok: opts.mode === 'warn',
+        warned: opts.mode === 'warn',
+        kernelFilesTouched,
+        corpusFilesTouched,
+        parityCaseTrailers,
+        validParityCaseIds,
+        invalidParityCaseIds: [],
+        uncoveredKernelFiles: [],
+        loosening,
+        missingLooseningSides,
+        reviewedByTrailers,
+        overridden: false,
+        overrideTrailer: null,
+        reason,
+      }
+    }
+    if (opts.requireReviewedByOnLoosening && reviewedByTrailers.length === 0) {
+      const reason = 'Kernel-change: loosening requires a "Reviewed-by: <reviewer-id> <case-id>" trailer.'
+      return {
+        sha: opts.sha,
+        required: true,
+        ok: opts.mode === 'warn',
+        warned: opts.mode === 'warn',
+        kernelFilesTouched,
+        corpusFilesTouched,
+        parityCaseTrailers,
+        validParityCaseIds,
+        invalidParityCaseIds: [],
+        uncoveredKernelFiles: [],
+        loosening,
+        missingLooseningSides: [],
+        reviewedByTrailers,
+        overridden: false,
+        overrideTrailer: null,
+        reason,
+      }
+    }
+  }
+
   return {
+    sha: opts.sha,
     required: true,
-    ok: opts.mode === 'warn',
-    warned: opts.mode === 'warn',
+    ok: true,
+    warned: false,
+    kernelFilesTouched,
+    corpusFilesTouched,
+    parityCaseTrailers,
+    validParityCaseIds,
+    invalidParityCaseIds: [],
+    uncoveredKernelFiles: [],
+    loosening,
+    missingLooseningSides: [],
+    reviewedByTrailers,
+    overridden: false,
+    overrideTrailer: null,
+    reason: null,
+  }
+}
+
+export function evaluateParityGate(opts: {
+  diffText: string
+  commitMessages: string
+  mode: 'strict' | 'warn'
+  rootDir?: string
+  knownParityCaseIds?: ReadonlySet<string>
+  knownParityCases?: ReadonlyMap<string, ParityCorpusCaseMeta>
+  commits?: ReadonlyArray<CommitParitySlice>
+  enforceCovers?: boolean
+  requireReviewedByOnLoosening?: boolean
+}): ParityGateEvalResult {
+  const rootDir = opts.rootDir ?? REPO_ROOT
+  let corpusById: Map<string, ParityCorpusCaseMeta>
+  if (opts.knownParityCases) {
+    corpusById = new Map(opts.knownParityCases)
+  } else if (opts.knownParityCaseIds) {
+    corpusById = new Map()
+    for (const id of opts.knownParityCaseIds) {
+      corpusById.set(id, { id, file: '', side: null })
+    }
+  } else {
+    corpusById = loadParityCorpusCases(rootDir)
+  }
+  const corpusByFile = new Map<string, ParityCorpusCaseMeta>()
+  let corpusUsesCovers = opts.enforceCovers === true
+  for (const meta of corpusById.values()) {
+    if (meta.file) corpusByFile.set(normalizeRel(meta.file), meta)
+    if (meta.covers) corpusUsesCovers = true
+  }
+  const requireReviewedByOnLoosening =
+    opts.requireReviewedByOnLoosening ?? process.env.KOVO_KERNEL_REVIEW_REQUIRED === '1'
+
+  const slices: ReadonlyArray<CommitParitySlice> =
+    opts.commits && opts.commits.length > 0
+      ? opts.commits
+      : [{ sha: 'diff', diffText: opts.diffText, commitMessage: opts.commitMessages }]
+
+  const commitResults = slices.map(slice =>
+    evaluateSingleDiffParityGate({
+      sha: slice.sha,
+      diffText: slice.diffText,
+      commitMessages: slice.commitMessage,
+      mode: opts.mode,
+      rootDir,
+      corpusById,
+      corpusByFile,
+      corpusUsesCovers,
+      requireReviewedByOnLoosening,
+    }),
+  )
+
+  const kernelFilesTouched = [...new Set(commitResults.flatMap(r => r.kernelFilesTouched))].sort()
+  const corpusFilesTouched = [...new Set(commitResults.flatMap(r => r.corpusFilesTouched))].sort()
+  const parityCaseTrailers = commitResults.flatMap(r => r.parityCaseTrailers)
+  const validParityCaseIds = [...new Set(commitResults.flatMap(r => r.validParityCaseIds))]
+  const invalidParityCaseIds = [...new Set(commitResults.flatMap(r => r.invalidParityCaseIds))]
+  const uncoveredKernelFiles = [...new Set(commitResults.flatMap(r => r.uncoveredKernelFiles))].sort()
+  const loosening = commitResults.some(r => r.loosening)
+  const missingLooseningSides = commitResults.flatMap(r => r.missingLooseningSides)
+  const reviewedByTrailers = commitResults.flatMap(r => r.reviewedByTrailers)
+  const overriddenResult = commitResults.find(r => r.overridden) ?? null
+  const required = commitResults.some(r => r.required)
+  const ok = commitResults.every(r => r.ok)
+  const warned = commitResults.some(r => r.warned)
+  const failures = commitResults.filter(r => r.reason !== null)
+  const reason =
+    failures.length === 0
+      ? null
+      : failures.length === 1 && slices.length === 1
+        ? failures[0]!.reason
+        : failures.map(f => `[${f.sha}] ${f.reason}`).join(' | ')
+
+  return {
+    required,
+    ok,
+    warned,
     kernelFilesTouched,
     corpusFilesTouched,
     parityCaseTrailers,
     validParityCaseIds,
     invalidParityCaseIds,
+    uncoveredKernelFiles,
+    loosening,
+    missingLooseningSides,
+    reviewedByTrailers,
+    overridden: overriddenResult !== null && ok,
+    overrideTrailer: overriddenResult?.overrideTrailer ?? null,
+    ...(opts.commits && opts.commits.length > 0 ? { commitResults } : {}),
     reason,
   }
 }
@@ -537,8 +1045,12 @@ export function evaluateContractChange(opts: {
   requirePerId?: boolean | 'strict'
   rootDir?: string
   knownParityCaseIds?: ReadonlySet<string>
+  knownParityCases?: ReadonlyMap<string, ParityCorpusCaseMeta>
+  commits?: ReadonlyArray<CommitParitySlice>
+  enforceCovers?: boolean
+  requireReviewedByOnLoosening?: boolean
 }): ContractChangeEvalResult {
-  const hits = detectContractChanges(opts.diffText)
+  const hits = detectContractChanges(opts.diffText, { rootDir: opts.rootDir })
   const trailers = parseContractChangeTrailers(opts.commitMessages)
   const parity = evaluateParityGate({
     diffText: opts.diffText,
@@ -546,6 +1058,10 @@ export function evaluateContractChange(opts: {
     mode: opts.mode,
     rootDir: opts.rootDir,
     knownParityCaseIds: opts.knownParityCaseIds,
+    knownParityCases: opts.knownParityCases,
+    commits: opts.commits,
+    enforceCovers: opts.enforceCovers,
+    requireReviewedByOnLoosening: opts.requireReviewedByOnLoosening,
   })
   if (hits.length === 0) {
     return {
@@ -677,6 +1193,94 @@ export function resolveCommitBaseRef(rootDir: string, explicitBase?: string | nu
   return null
 }
 
+function readSingleCommitDiffAndMsg(
+  rootDir: string,
+  sha: string,
+  commitMessageOverride?: string | null,
+): CommitParitySlice {
+  const shortSha = sha.slice(0, 7)
+  const diffRes = runGit(rootDir, [
+    '-c', 'diff.mnemonicPrefix=false',
+    '-c', 'diff.noprefix=false',
+    'diff-tree', '--no-commit-id', '-p', '-r', '--root', '--no-ext-diff', '--unified=3', sha,
+  ])
+  const msgRes = commitMessageOverride != null
+    ? { ok: true, stdout: commitMessageOverride }
+    : runGit(rootDir, ['log', '-1', '--format=%B', sha])
+  return {
+    sha: shortSha,
+    diffText: diffRes.stdout,
+    commitMessage: msgRes.stdout,
+  }
+}
+
+/**
+ * Read per-commit `{ sha, diffText, commitMessage }` slices for every non-merge commit in
+ * `range` (e.g. `baseRef..HEAD`). For a merge-only range, returns the range diff as a slice.
+ */
+export function readCommitRangeParitySlices(
+  rootDir: string,
+  range: string,
+  commitMessageOverride?: string | null,
+): CommitParitySlice[] {
+  const revRes = runGit(rootDir, ['rev-list', '--no-merges', '--reverse', range])
+  const shas = revRes.ok
+    ? revRes.stdout.split(/\r?\n/).map(s => s.trim()).filter(Boolean)
+    : []
+  if (shas.length > 0) {
+    return shas.map(sha =>
+      readSingleCommitDiffAndMsg(
+        rootDir,
+        sha,
+        shas.length === 1 ? commitMessageOverride : undefined,
+      ),
+    )
+  }
+  const diffRes = runGit(rootDir, [
+    '-c', 'diff.mnemonicPrefix=false',
+    '-c', 'diff.noprefix=false',
+    'diff', '--no-ext-diff', '--unified=3', range,
+  ])
+  const logRes = commitMessageOverride != null
+    ? { ok: true, stdout: commitMessageOverride }
+    : runGit(rootDir, ['log', '--format=%B', range])
+  return [{ sha: range, diffText: diffRes.stdout, commitMessage: logRes.stdout }]
+}
+
+/**
+ * Replay the per-commit parity gate directly against any historical git commit (regular OR
+ * merge commit — for merge commits `M`, evaluates every non-merge commit in `M^1..M`).
+ */
+export function evaluateSingleCommitParityGate(
+  rootDir: string,
+  commitRef: string,
+  opts?: {
+    mode?: 'strict' | 'warn'
+    knownParityCases?: ReadonlyMap<string, ParityCorpusCaseMeta>
+    enforceCovers?: boolean
+    requireReviewedByOnLoosening?: boolean
+  },
+): ParityGateEvalResult {
+  const absRoot = resolve(rootDir)
+  const parentsRes = runGit(absRoot, ['rev-list', '--parents', '-n', '1', commitRef])
+  const tokens = parentsRes.ok ? parentsRes.stdout.trim().split(/\s+/).filter(Boolean) : []
+  const sha = tokens[0] ?? commitRef
+  const isMerge = tokens.length >= 3
+  const commits: CommitParitySlice[] = isMerge
+    ? readCommitRangeParitySlices(absRoot, `${sha}^1..${sha}`)
+    : [readSingleCommitDiffAndMsg(absRoot, sha)]
+  return evaluateParityGate({
+    diffText: commits.map(c => c.diffText).join('\n'),
+    commitMessages: commits.map(c => c.commitMessage).join('\n'),
+    commits,
+    mode: opts?.mode ?? 'strict',
+    rootDir: absRoot,
+    knownParityCases: opts?.knownParityCases,
+    enforceCovers: opts?.enforceCovers,
+    requireReviewedByOnLoosening: opts?.requireReviewedByOnLoosening,
+  })
+}
+
 export function checkGitRepo(opts: CheckGitRepoOptions = {}): ContractChangeRepoResult {
   const startedAt = performance.now()
   const rootDir = resolve(opts.rootDir ?? REPO_ROOT)
@@ -711,9 +1315,11 @@ export function checkGitRepo(opts: CheckGitRepoOptions = {}): ContractChangeRepo
     const logRes = opts.commitMessageOverride != null
       ? { ok: true, stdout: opts.commitMessageOverride }
       : runGit(rootDir, ['log', '--format=%B', range])
+    const commits = readCommitRangeParitySlices(rootDir, range, opts.commitMessageOverride)
     committed = evaluateContractChange({
       diffText: diffRes.stdout,
       commitMessages: logRes.stdout,
+      commits,
       mode: 'strict',
       sourceLabel: `committed (${range})`,
       requirePerId: perIdMode,
@@ -785,7 +1391,9 @@ export function formatContractChangeReport(result: ContractChangeRepoResult): st
     }
     const p = sec.parity
     if (p?.required) {
-      if (p.ok && !p.warned) {
+      if (p.overridden && p.ok) {
+        lines.push(`parity-gate [${sec.sourceLabel}]: OVERRIDE (${p.kernelFilesTouched.length} confirmation-kernel file(s) overridden via Kernel-gate-override: ${p.overrideTrailer})`)
+      } else if (p.ok && !p.warned) {
         const via = p.corpusFilesTouched.length > 0
           ? `corpus diff (${p.corpusFilesTouched.length} file(s))`
           : `Parity-case: ${p.validParityCaseIds.join(', ')}`

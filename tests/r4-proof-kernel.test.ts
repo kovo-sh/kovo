@@ -1,3 +1,4 @@
+// @kernel @fixes R4-C-1, R4-C-2, R4-C-6, R4-H-7
 /**
  * Round-4 WS-2 Proof Kernel Regression & Class-Level Guards:
  *  - R4-C-1: `boolean` and `status_differential` receipt rules require host-minted stamped

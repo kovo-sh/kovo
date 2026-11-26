@@ -1,3 +1,4 @@
+// @kernel @fixes R3-H-10
 /**
  * Regression suite for CLAUDE_AUDIT_R3 R3-H-10:
  *  1. Outbound provider request scrubbing walks ONLY content-bearing leaves (`instructions`,

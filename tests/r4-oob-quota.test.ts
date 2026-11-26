@@ -1,3 +1,4 @@
+// @kernel @fixes R4-H-20
 /**
  * R4-H-20 (WS-14) class-level stress & invariant guards for OOB callback quotas,
  * hard-capped protected pending budget, amortized pruning, bounded-memory per-IP

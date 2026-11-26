@@ -1,3 +1,4 @@
+// @kernel @fixes R3-C-1
 import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'

@@ -3,6 +3,23 @@
   "side": "fp",
   "archetype": "r4-c3-sanitized-echo-fingerprint",
   "description": "R4-C-3 FP: probe splits a database error label with an empty inline markup tag so a tag-stripping target reflects the contiguous label; deletion-normalized anti-reflection rejects across all confirmation entry points.",
+  "covers": {
+    "files": [
+      "src/server/floor-recipe-engine.ts",
+      "src/server/floor-recipes.ts",
+      "src/server/host-fact-log.ts",
+      "src/server/oracle-invariants.ts",
+      "src/server/proof-receipt.ts",
+      "src/server/replay-verifier.ts",
+      "src/server/verify-claims.ts",
+      "src/server/verify-prove-handlers.ts"
+    ],
+    "classes": [
+      "sqli",
+      "sqli_error",
+      "injection"
+    ]
+  },
   "canonicalLabel": {
     "cwe": "CWE-89",
     "category": "sqli",
@@ -38,7 +55,9 @@
       "persona": null,
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"query\":\"books\",\"items\":[]}"
     },
     {
@@ -50,7 +69,9 @@
       "persona": null,
       "status": 400,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"error\":\"No results for: SQLITE_ERROR: near input\"}"
     }
   ],
@@ -71,12 +92,32 @@
     "claimedDelta": "Tag-stripped reflected error label must fail closed under R4-C-3 deletion-normalized anti-reflection."
   },
   "claims": [
-    { "kind": "status", "exchangeId": "ctl", "expected": 200 },
-    { "kind": "status", "exchangeId": "prb", "expected": 400 },
-    { "kind": "body_contains", "exchangeId": "prb", "text": "SQLITE_ERROR" }
+    {
+      "kind": "status",
+      "exchangeId": "ctl",
+      "expected": 200
+    },
+    {
+      "kind": "status",
+      "exchangeId": "prb",
+      "expected": 400
+    },
+    {
+      "kind": "body_contains",
+      "exchangeId": "prb",
+      "text": "SQLITE_ERROR"
+    }
   ],
   "bareClaims": [
-    { "kind": "status", "exchangeId": "ctl", "expected": 200 },
-    { "kind": "body_contains", "exchangeId": "prb", "text": "SQLITE_ERROR" }
+    {
+      "kind": "status",
+      "exchangeId": "ctl",
+      "expected": 200
+    },
+    {
+      "kind": "body_contains",
+      "exchangeId": "prb",
+      "text": "SQLITE_ERROR"
+    }
   ]
 }

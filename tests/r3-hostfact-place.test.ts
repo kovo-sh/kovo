@@ -1,3 +1,4 @@
+// @kernel @fixes R3-H-5, R3-C-3, R3-C-4
 /**
  * R3 Stream 4b Regression Suite — HostFactLog Placement, Bound SameSite, Broadened Redacted Guard,
  * Status-Differential Base Binding, and Active H-14 Wire-Provenance Auth-Bypass Enforcement.

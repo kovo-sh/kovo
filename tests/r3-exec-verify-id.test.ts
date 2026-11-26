@@ -1,3 +1,4 @@
+// @kernel @fixes R3-H-13, R3-H-15
 /**
  * Regression suite for R3-H-13 and R3-H-15 (`src/server/exec-verify.ts`):
  *  - R3-H-13:

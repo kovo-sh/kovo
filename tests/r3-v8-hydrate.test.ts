@@ -1,3 +1,4 @@
+// @kernel @fixes R3-C-5
 /**
  * R3-C-5 Regression Suite — V8 Hydration Host-Plane Isolation:
  *

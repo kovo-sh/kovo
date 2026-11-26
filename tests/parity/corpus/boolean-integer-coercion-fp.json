@@ -3,6 +3,22 @@
   "side": "fp",
   "archetype": "r3-c4-integer-coercion-boolean",
   "description": "R3-C-4 FP: integer-coercion boolean triangle where contradiction changes the base value from 1 to 999, producing 404 solely due to nonexistent record ID rather than predicate evaluation.",
+  "covers": {
+    "files": [
+      "src/server/host-fact-log.ts",
+      "src/server/oracle-invariants.ts",
+      "src/server/proof-receipt.ts",
+      "src/server/verify-claims.ts",
+      "src/server/verify-prove-handlers.ts",
+      "src/server/verify-support.ts"
+    ],
+    "classes": [
+      "sqli_status",
+      "boolean_differential",
+      "sqli",
+      "injection"
+    ]
+  },
   "canonicalLabel": {
     "cwe": "CWE-89",
     "category": "sqli",
@@ -39,7 +55,9 @@
       "persona": null,
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"id\":1,\"name\":\"Item 1\"}"
     },
     {
@@ -52,7 +70,9 @@
       "persona": null,
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"id\":1,\"name\":\"Item 1\"}"
     },
     {
@@ -65,7 +85,9 @@
       "persona": null,
       "status": 404,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"error\":\"not_found\"}"
     },
     {
@@ -78,7 +100,9 @@
       "persona": null,
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"id\":1,\"name\":\"Item 1\"}"
     },
     {
@@ -91,7 +115,9 @@
       "persona": null,
       "status": 200,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"id\":1,\"name\":\"Item 1\"}"
     },
     {
@@ -104,7 +130,9 @@
       "persona": null,
       "status": 404,
       "mediaType": "application/json",
-      "responseHeaders": { "content-type": "application/json" },
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
       "body": "{\"error\":\"not_found\"}"
     }
   ],
@@ -116,6 +144,14 @@
     "claimedDelta": "Status differential triangle with mismatched base value (1 vs 999) must fail closed under R3-C-4."
   },
   "claims": [
-    { "kind": "impact", "impactClass": "injection", "probeExchangeId": "f1", "controlExchangeIds": ["b1", "t1"] }
+    {
+      "kind": "impact",
+      "impactClass": "injection",
+      "probeExchangeId": "f1",
+      "controlExchangeIds": [
+        "b1",
+        "t1"
+      ]
+    }
   ]
 }
