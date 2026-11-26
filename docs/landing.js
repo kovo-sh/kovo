@@ -10,15 +10,13 @@
   // ------------------------------------------------------------ icons (icons.tsx, 16px grid, 1.5 stroke)
   const P = {
     menu: '<path d="M2.5 4.5h11M2.5 8h11M2.5 11.5h11"/>',
-    star: '<path d="M8 1.9l1.85 3.75 4.15.6-3 2.92.71 4.12L8 11.35 4.29 13.3 5 9.17 2 6.25l4.15-.6Z"/>',
+    github: '<path fill="currentColor" stroke="none" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/>',
     chat: '<path d="M2.75 3.25h10.5v7.5H7L4.25 13v-2.25h-1.5Z"/>',
-    report: '<path d="M4 1.75h5.25L12.25 4.75v9.5H4Z"/><path d="M9 1.75V5h3.25"/><path d="M6.25 8.25h3.5M6.25 10.75h3.5"/>',
     sun: '<circle cx="8" cy="8" r="2.75"/><path d="M8 1.5v1.5M8 13v1.5M1.5 8H3M13 8h1.5M3.4 3.4l1.06 1.06M11.54 11.54l1.06 1.06M3.4 12.6l1.06-1.06M11.54 4.46l1.06-1.06"/>',
     moon: '<path d="M13.25 9.5A5.5 5.5 0 0 1 6.5 2.75a5.5 5.5 0 1 0 6.75 6.75Z"/>',
     close: '<path d="M4 4l8 8M12 4l-8 8"/>',
     chev: '<path d="M4 6l4 4 4-4"/>',
     arrowR: '<path d="M3 8h10M9 4l4 4-4 4"/>',
-    ext: '<path d="M6 3.5H3.5v9h9V10M9 3.5h3.5V7M12.5 3.5 7 9"/>',
     lock: '<rect x="3.25" y="7" width="9.5" height="6.75" rx="1.25"/><path d="M5.25 7V5a2.75 2.75 0 0 1 5.5 0v2"/>',
     sliders: '<path d="M2.5 5h6M11.5 5h2M2.5 11h2M7.5 11h6"/><circle cx="10" cy="5" r="1.5"/><circle cx="6" cy="11" r="1.5"/>',
     check: '<path d="M3.5 8.5 6.5 11.5 12.5 4.5"/>',
@@ -267,26 +265,9 @@
     })
   })
 
-  // ------------------------------------------------------------ dialogs
-  const report = $('#report')
-  let lastFocus = null
-  function openDlg(d) {
-    if (d.open) return
-    $$('dialog[open]').forEach(x => x.close())
-    lastFocus = document.activeElement
-    d.showModal()
-  }
-  $$('dialog').forEach(d => {
-    d.addEventListener('click', e => { if (e.target === d) d.close() })
-    d.addEventListener('close', () => { if (lastFocus && lastFocus.focus) lastFocus.focus({ preventScroll: true }) })
-    $$('[data-close]', d).forEach(b => b.addEventListener('click', () => d.close()))
-  })
-
   // ------------------------------------------------------------ action buttons
   $$('[data-act]').forEach(b => b.addEventListener('click', () => {
-    const a = b.dataset.act
-    if (a === 'report') openDlg(report)
-    else if (a === 'theme') toggleTheme()
+    if (b.dataset.act === 'theme') toggleTheme()
   }))
   $$('a[href^="#"]').forEach(a => a.addEventListener('click', e => {
     const id = a.getAttribute('href').slice(1)
