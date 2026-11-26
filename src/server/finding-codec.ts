@@ -7,8 +7,9 @@
  * `Finding` / `TriagedFinding` return interface for all UI and API consumers.
  */
 import type { DatabaseSync } from 'node:sqlite'
-import { findingSeverities, findingStatuses } from '../domain.ts'
+import { findingStatuses } from '../domain.ts'
 import type { CodeLocation, Finding, FindingStatus, VerificationTier } from '../domain.ts'
+import { normalizeFindingSeverity, normalizeFindingSeverityOverride } from '../findings-view.ts'
 import type {
   FindingProvenance,
   FindingProvenanceFields,
@@ -31,11 +32,16 @@ export const operatorTriageStatuses = [
 ] as const
 export type OperatorTriageStatus = typeof operatorTriageStatuses[number]
 
+/**
+ * Accepted operator severity overrides: canonical severities matching `findingSeverities`
+ * (`'informational'`), plus legacy `'info'` decode alias canonicalized to `'informational'`.
+ */
 export const operatorSeverityOverrides = [
   'critical',
   'high',
   'medium',
   'low',
+  'informational',
   'info',
 ] as const
 export type OperatorSeverityOverride = typeof operatorSeverityOverrides[number]
@@ -69,7 +75,6 @@ export const CONFIRMED_FINDING_PREDICATE_SQL =
   "verification_class = 'runtime_confirmed' AND status = 'confirmed' AND superseded_by_finding_id IS NULL"
 
 const findingStatusSet = new Set<string>(findingStatuses)
-const findingSeveritySet = new Set<string>(findingSeverities)
 const operatorTriageStatusSet = new Set<string>(operatorTriageStatuses)
 
 export interface PromotedFindingColumns {
@@ -253,10 +258,11 @@ function normalizeStatus(value: unknown): FindingStatus {
 }
 
 function normalizeSeverity(value: unknown): Finding['severity'] {
-  if (typeof value === 'string' && findingSeveritySet.has(value)) {
-    return value as Finding['severity']
-  }
-  return 'medium'
+  return normalizeFindingSeverity(value, 'medium')
+}
+
+function normalizeSeverityOverride(value: unknown): Finding['severity'] | null {
+  return normalizeFindingSeverityOverride(value)
 }
 
 function normalizeCwe(value: unknown): string | null {
@@ -371,6 +377,7 @@ export const FindingCodec = {
       canonical.operatorTriage = {
         ...canonical.operatorTriage,
         status: promoted.triageStatus,
+        severityOverride: normalizeSeverityOverride(canonical.operatorTriage.severityOverride),
       }
     }
     return { canonical, promoted }
@@ -481,8 +488,8 @@ export const FindingCodec = {
       const status = row.status && findingStatusSet.has(row.status)
         ? (row.status as FindingStatus)
         : normalizeStatus(rawFinding.status)
-      const severity = row.severity && findingSeveritySet.has(row.severity)
-        ? (row.severity as Finding['severity'])
+      const severity = row.severity
+        ? normalizeSeverity(row.severity)
         : normalizeSeverity(rawFinding.severity)
       const origin = row.origin !== undefined && row.origin !== null && row.origin !== ''
         ? row.origin
@@ -497,6 +504,7 @@ export const FindingCodec = {
         ? {
             ...rawFinding.operatorTriage,
             status: colTriageStatus ?? rawFinding.operatorTriage.status,
+            severityOverride: normalizeSeverityOverride(rawFinding.operatorTriage.severityOverride),
           }
         : colTriageStatus && colTriageStatus !== 'open'
           ? { status: colTriageStatus, severityOverride: null, notes: '', updatedAt: 0 }
@@ -532,8 +540,8 @@ export const FindingCodec = {
     const status = row.status && findingStatusSet.has(row.status)
       ? (row.status as FindingStatus)
       : normalizeStatus(rawFinding.status)
-    const severity = row.severity && findingSeveritySet.has(row.severity)
-      ? (row.severity as Finding['severity'])
+    const severity = row.severity
+      ? normalizeSeverity(row.severity)
       : normalizeSeverity(rawFinding.severity)
     const origin = row.origin !== undefined && row.origin !== null && row.origin !== ''
       ? row.origin
@@ -548,6 +556,7 @@ export const FindingCodec = {
       ? {
           ...rawFinding.operatorTriage,
           status: colTriageStatus ?? rawFinding.operatorTriage.status,
+          severityOverride: normalizeSeverityOverride(rawFinding.operatorTriage.severityOverride),
         }
       : colTriageStatus && colTriageStatus !== 'open'
         ? { status: colTriageStatus, severityOverride: null, notes: '', updatedAt: 0 }
@@ -594,6 +603,7 @@ export const FindingCodec = {
           ELSE 'pending'
         END,
         severity = CASE
+          WHEN json_extract(finding, '$.severity') = 'info' THEN 'informational'
           WHEN json_extract(finding, '$.severity') IN ('critical', 'high', 'medium', 'low', 'informational')
             THEN json_extract(finding, '$.severity')
           ELSE 'medium'
@@ -614,6 +624,7 @@ export const FindingCodec = {
         END
         OR severity IS NULL
         OR severity <> CASE
+          WHEN json_extract(finding, '$.severity') = 'info' THEN 'informational'
           WHEN json_extract(finding, '$.severity') IN ('critical', 'high', 'medium', 'low', 'informational')
             THEN json_extract(finding, '$.severity')
           ELSE 'medium'
