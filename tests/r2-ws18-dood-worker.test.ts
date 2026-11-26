@@ -578,7 +578,7 @@ test('consent.tsx uses browser-safe PSL registrableApex & rankScopeAssets with z
   assert.equal(mod.isMultiTenantPublicSuffix('evil-other.vercel.app'), true)
   assert.equal(mod.isMultiTenantPublicSuffix('api.acme.co.uk'), false)
 
-  // Shared PaaS tenant isolation: sibling tenant on vercel.app must NOT match my-app.vercel.app includeSubdomains!
+  // Shared PaaS tenant isolation (R2-H-5 / R3-H-8): vercel.app refuses auto-admit anchor so only seed stays checked!
   const pickedPaas = mod.defaultScopeAssetIds(
     {
       scopeRevision: 0,
@@ -592,21 +592,21 @@ test('consent.tsx uses browser-safe PSL registrableApex & rankScopeAssets with z
     [],
     { includeSubdomainOrigins: ['https://my-app.vercel.app'] },
   )
-  assert.deepEqual(pickedPaas, ['seed-paas', 'sub-own'])
+  assert.deepEqual(pickedPaas, ['seed-paas'])
 
-  // Multi-part ccTLD (.co.uk) includeSubdomains selects api.acme.co.uk, not unrelated co.uk!
+  // Multi-part ccTLD (.co.uk) includeSubdomains on apex seed selects api.acme.co.uk, not unrelated co.uk!
   const pickedUk = mod.defaultScopeAssetIds(
     {
       scopeRevision: 0,
       approved: [],
       candidates: [
-        { id: 'seed-uk', origin: 'https://app.acme.co.uk', source: 'Project seed', thirdParty: false, includeSubdomains: true },
+        { id: 'seed-uk', origin: 'https://acme.co.uk', source: 'Project seed', thirdParty: false, includeSubdomains: true },
         { id: 'api-uk', origin: 'https://api.acme.co.uk', source: 'subdomain_discovery', thirdParty: false, dnsSource: {} },
         { id: 'other-uk', origin: 'https://evil.co.uk', source: 'subdomain_discovery', thirdParty: false, dnsSource: {} },
       ],
     },
     [],
-    { includeSubdomainOrigins: ['https://app.acme.co.uk'] },
+    { includeSubdomainOrigins: ['https://acme.co.uk'] },
   )
   assert.deepEqual(pickedUk, ['seed-uk', 'api-uk'])
 })

@@ -205,43 +205,72 @@ export function defaultScopeAssetIds(
       return origin.replace(/^https?:\/\//i, '').replace(/\/.*$/, '').replace(/:\d+$/, '').toLowerCase().replace(/\.$/, '')
     }
   }
-  const resolveApex = (origin: string): string | null => {
-    if (typeof registrableApex === 'function') return registrableApex(origin)
-    const parts = extractHostname(origin).split('.').filter(Boolean)
-    return parts.length < 2 ? null : parts.slice(-2).join('.')
+  const fallbackMultiTenant = new Set([
+    'vercel.app', 'netlify.app', 'github.io', 'pages.dev', 'fly.dev', 'herokuapp.com',
+    'onrender.com', 'workers.dev', 'web.app', 'firebaseapp.com', 'run.app', 'appspot.com',
+    'azurewebsites.net', 'cloudfront.net', 'amazonaws.com', 'railway.app', 'glitch.me',
+    'zendesk.com', 'atlassian.net', 'gitbook.io', 'shopify.com', 'myshopify.com', 'statuspage.io',
+  ])
+  const fallbackPublicSuffixes = new Set([
+    'co.uk', 'org.uk', 'gov.uk', 'ac.uk', 'com.au', 'net.au', 'org.au', 'co.jp', 'ne.jp', 'or.jp',
+    'com.br', 'co.nz', 'co.za', 'co.in', 'com.sg', 'com.hk', 'com.mx', 'com.tw', 'co.kr',
+  ])
+  const isMultiTenant = (hostname: string): boolean => {
+    if (typeof isMultiTenantPublicSuffix === 'function' && isMultiTenantPublicSuffix(hostname)) return true
+    for (const suffix of fallbackMultiTenant) {
+      if (hostname === suffix || hostname.endsWith(`.${suffix}`)) return true
+    }
+    return false
   }
-  const isMultiTenant = (hostname: string): boolean =>
-    typeof isMultiTenantPublicSuffix === 'function' ? isMultiTenantPublicSuffix(hostname) : false
+  const isLocalOrIp = (hostname: string): boolean =>
+    !hostname
+    || hostname === 'localhost'
+    || hostname.endsWith('.localhost')
+    || hostname.endsWith('.local')
+    || hostname.endsWith('.internal')
+    || hostname.endsWith('.home.arpa')
+    || /^\d{1,3}(?:\.\d{1,3}){3}$/.test(hostname)
+    || hostname.includes(':')
+  const isBarePublicSuffix = (hostname: string): boolean =>
+    !hostname.includes('.')
+    || fallbackPublicSuffixes.has(hostname)
+    || (typeof PSL_RULES !== 'undefined' && PSL_RULES.has(hostname))
+  /** Strict host-anchor fallback mirroring server `autoAdmitAnchorForOrigin` (R3-H-8). */
+  const resolveAutoAdmitAnchor = (origin: string): string | null => {
+    const h = extractHostname(origin)
+    if (isLocalOrIp(h) || isMultiTenant(h) || isBarePublicSuffix(h)) return null
+    const anchor = h.startsWith('www.') ? h.slice(4) : h
+    if (!anchor || isLocalOrIp(anchor) || isMultiTenant(anchor) || isBarePublicSuffix(anchor)) return null
+    return anchor
+  }
   const isDiscoveredSubdomain = (source?: string): boolean =>
     source === 'subdomain_discovery' || source === 'phase0_ct_discovery' || source === 'phase0_subdomain_discovery'
   const isBulkDnsImport = (c: { source?: string; dnsSource?: unknown }): boolean =>
     Boolean(c.dnsSource) && !isDiscoveredSubdomain(c.source)
 
   const seedOriginsForRank: string[] = []
-  const wildcardApexes = new Set<string>()
+  const autoAdmitAnchors = new Set<string>()
   for (const origin of options?.includeSubdomainOrigins ?? []) {
     seedOriginsForRank.push(origin)
-    const apex = resolveApex(origin)
-    if (apex) wildcardApexes.add(apex)
+    const anchor = resolveAutoAdmitAnchor(origin)
+    if (anchor) autoAdmitAnchors.add(anchor)
   }
   for (const c of run.candidates) {
     if (c.includeSubdomains && !c.thirdParty) {
       seedOriginsForRank.push(c.origin)
-      const apex = resolveApex(c.origin)
-      if (apex) wildcardApexes.add(apex)
+      const anchor = resolveAutoAdmitAnchor(c.origin)
+      if (anchor) autoAdmitAnchors.add(anchor)
     } else if (!c.thirdParty && !isBulkDnsImport(c) && !isDiscoveredSubdomain(c.source)) {
       seedOriginsForRank.push(c.origin)
     }
   }
 
-  const matchesWildcardParent = (origin: string): boolean => {
-    if (wildcardApexes.size === 0) return false
+  const matchesAnchoredParent = (origin: string): boolean => {
+    if (autoAdmitAnchors.size === 0) return false
     const h = extractHostname(origin)
-    const apex = resolveApex(origin)
-    if (apex && wildcardApexes.has(apex)) return true
-    if (isMultiTenant(h)) return false
-    for (const wApex of wildcardApexes) {
-      if (h === wApex || h.endsWith(`.${wApex}`)) return true
+    if (!h) return false
+    for (const anchor of autoAdmitAnchors) {
+      if (h.endsWith(`.${anchor}`)) return true
     }
     return false
   }
@@ -273,10 +302,10 @@ export function defaultScopeAssetIds(
   if (projectDefaultScope.length > 0) {
     const saved = new Set(projectDefaultScope)
     const savedIds = run.candidates.filter(a => saved.has(a.origin)).map(a => a.id)
-    if (wildcardApexes.size === 0) return savedIds
+    if (autoAdmitAnchors.size === 0) return savedIds
     const savedSet = new Set(savedIds)
     const extraSubs = run.candidates.filter(
-      a => !savedSet.has(a.id) && !a.thirdParty && isDiscoveredSubdomain(a.source) && matchesWildcardParent(a.origin),
+      a => !savedSet.has(a.id) && !a.thirdParty && isDiscoveredSubdomain(a.source) && matchesAnchoredParent(a.origin),
     )
     const remaining = Math.max(0, cap - savedIds.length)
     if (remaining === 0 || extraSubs.length === 0) return savedIds
@@ -288,13 +317,50 @@ export function defaultScopeAssetIds(
     if (a.thirdParty) return false
     if (isBulkDnsImport(a)) return false
     if (isDiscoveredSubdomain(a.source)) {
-      if (wildcardApexes.size > 0) return matchesWildcardParent(a.origin)
+      if (autoAdmitAnchors.size > 0) return matchesAnchoredParent(a.origin)
       return !hasExplicitParentConfig
     }
     return true
   })
 
   return pickRanked(eligible, cap)
+}
+
+/**
+ * Determine whether a candidate host is a same-apex sibling outside every seed's
+ * auto-admit host anchor (R3-H-8). Prefers server-authoritative `rankedAssets` metadata
+ * from `runData` when present, with a deterministic client fallback.
+ */
+export function isSameApexOutsideAnchor(
+  candidate: { id: string; origin: string; thirdParty: boolean; source?: string },
+  rankedById: ReadonlyMap<string, { sameApexAsSeed: boolean; sameApexOutsideAnchor?: boolean }>,
+  seedOrigins: readonly string[],
+): boolean {
+  if (candidate.thirdParty) return false
+  const ranked = rankedById.get(candidate.id)
+  if (ranked && typeof ranked.sameApexOutsideAnchor === 'boolean') {
+    return ranked.sameApexOutsideAnchor
+  }
+  const h = extractFallbackHost(candidate.origin)
+  if (!h || isMultiTenantPublicSuffix(h)) return false
+  const seedHosts = new Set<string>()
+  const seedAnchors = new Set<string>()
+  const seedApexes = new Set<string>()
+  for (const s of seedOrigins) {
+    const sh = extractFallbackHost(s)
+    if (!sh) continue
+    seedHosts.add(sh)
+    const anchor = sh.startsWith('www.') ? sh.slice(4) : sh
+    if (anchor && !isMultiTenantPublicSuffix(anchor)) seedAnchors.add(anchor)
+    const apex = registrableApex(s)
+    if (apex && !isMultiTenantPublicSuffix(apex)) seedApexes.add(apex)
+  }
+  if (seedHosts.has(h)) return false
+  for (const anchor of seedAnchors) {
+    if (h === anchor || h.endsWith(`.${anchor}`)) return false
+  }
+  const candidateApex = registrableApex(candidate.origin)
+  return Boolean(candidateApex && seedApexes.has(candidateApex))
 }
 
 /** Hosts and default selection for the scope sheet, per phase. */
@@ -304,10 +370,13 @@ function useScopeModel() {
   const p = detail.project
   const includeSubdomainOrigins = detail.includeSubdomainOrigins ?? []
   const serverRecommendedIds = detail.recommendedScopeAssetIds
+  const rankedAssets = detail.rankedAssets
   return useMemo(() => {
     const discovery = r.phase === 'consent'
+    const rankedById = new Map((rankedAssets ?? []).map(a => [a.id, a]))
+    const anchorSeeds = includeSubdomainOrigins.length > 0 ? includeSubdomainOrigins : p.seeds
     const hosts = discovery
-      ? p.seeds.map(s => ({ id: s, origin: s, thirdParty: false, source: 'Project seed', externalCname: null as string | null, dnsSource: null as unknown }))
+      ? p.seeds.map(s => ({ id: s, origin: s, thirdParty: false, source: 'Project seed', externalCname: null as string | null, dnsSource: null as unknown, sameApexOutsideAnchor: false }))
       : r.candidates.map(c => ({
         id: c.id,
         origin: c.origin,
@@ -315,6 +384,7 @@ function useScopeModel() {
         source: c.source,
         externalCname: c.dnsSource?.externalAliases?.[0] ?? null,
         dnsSource: c.dnsSource ?? null,
+        sameApexOutsideAnchor: isSameApexOutsideAnchor(c, rankedById, anchorSeeds),
       }))
     const defaults = defaultScopeAssetIds(r, p.defaultScope, {
       includeSubdomainOrigins,
@@ -322,7 +392,7 @@ function useScopeModel() {
       serverRecommendedIds,
     })
     return { discovery, hosts, defaults, includeSubdomainOrigins }
-  }, [r, p, includeSubdomainOrigins, serverRecommendedIds])
+  }, [r, p, includeSubdomainOrigins, serverRecommendedIds, rankedAssets])
 }
 
 function initialDraft(r: ReturnType<typeof useRun>['detail']['run'], defaults: string[], rpsMax: number): Draft {
@@ -703,7 +773,9 @@ function ScopeCard({
                 'flex cursor-pointer items-center gap-[7px] overflow-hidden whitespace-nowrap rounded-[4px] px-2 py-[3px] hover:bg-hover',
                 on ? 'text-fg-muted' : 'text-fg-faint',
               )}
-              title={`${h.origin} · ${h.source}`}
+              title={h.sameApexOutsideAnchor
+                ? `${h.origin} · ${h.source} · Same apex (different host) — unchecked by default`
+                : `${h.origin} · ${h.source}`}
             >
               <input
                 className="m-0 flex-none accent-[var(--accent)]"
@@ -716,6 +788,15 @@ function ScopeCard({
               {h.thirdParty && <span className="flex-none rounded bg-sunk px-1 py-px font-sans text-[10px] font-medium text-fg-subtle" title={h.externalCname ? `Third-party CNAME (${h.externalCname}) — unchecked by default` : 'Third-party host — unchecked by default'}>
                 3P
               </span>}
+              {!h.thirdParty && h.sameApexOutsideAnchor && (
+                <span
+                  data-testid="scope-apex-sibling-badge"
+                  className="flex-none rounded bg-warn-soft px-1 py-px font-sans text-[10px] font-medium text-warn"
+                  title="Same apex (different host) — outside seed anchor; unchecked by default"
+                >
+                  Same apex
+                </span>
+              )}
             </label>
           })}
           {filteredHosts.length === 0 && (
