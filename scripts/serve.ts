@@ -980,14 +980,18 @@ export function createKovoLocalServer(options: LocalSessionOptions): KovoLocalSe
 export interface HostHardeningStatus {
   prototypeClean: boolean
   prototypeSealed: boolean
-  disableProtoThrow: boolean
+  disableProtoDelete: boolean
   linearRegexpFallback: boolean
   regexpSelfCheckMs: number | null
   warnings: string[]
 }
 
+// Use --disable-proto=delete instead of --disable-proto=throw: playwright-core's colors helper assigns
+// `builder.__proto__ = proto` in formatCallLog (playwright-core/lib/utilsBundle.js:591), which throws
+// ERR_PROTO_ACCESS under --disable-proto=throw while --disable-proto=delete removes Object.prototype.__proto__
+// without breaking Playwright error formatting.
 const RECOMMENDED_HARDENING_FLAGS =
-  '--disable-proto=throw --enable-experimental-regexp-engine-on-excessive-backtracks --regexp-backtracks-before-fallback=10000'
+  '--disable-proto=delete --enable-experimental-regexp-engine-on-excessive-backtracks --regexp-backtracks-before-fallback=10000'
 
 /**
  * Verify that `Object.prototype` has no unexpected enumerable properties (detects pre-existing
@@ -1005,7 +1009,7 @@ export function assertObjectPrototypeIntegrity(): void {
  * 1. Verifies `Object.prototype` has no unexpected enumerable keys.
  * 2. Seals `Object.prototype` so no new properties can be attached process-wide (while preserving
  *    compatibility with third-party subclasses such as Playwright's SourceMapGenerator).
- * 3. Checks whether `--disable-proto=throw` and `--enable-experimental-regexp-engine-on-excessive-backtracks`
+ * 3. Checks whether `--disable-proto=delete` and `--enable-experimental-regexp-engine-on-excessive-backtracks`
  *    are active and runs a bounded exponential-regex self-check when the linear fallback is enabled.
  */
 export function hardenHostProcess(options?: {
@@ -1019,12 +1023,10 @@ export function hardenHostProcess(options?: {
     Object.seal(Object.prototype)
   }
 
-  let disableProtoThrow = false
-  try {
-    void (Object.prototype as Record<string, unknown>).__proto__
-  } catch (err) {
-    disableProtoThrow = (err as { code?: string })?.code === 'ERR_PROTO_ACCESS' || err instanceof Error
-  }
+  // Under --disable-proto=delete, Node removes `Object.prototype.__proto__` cleanly so `__proto__`
+  // reads return undefined and property assignment cannot mutate Object.prototype, while
+  // playwright-core/lib/utilsBundle.js:591 (`builder.__proto__ = proto`) does not crash.
+  const disableProtoDelete = Object.getOwnPropertyDescriptor(Object.prototype, '__proto__') === undefined
 
   const nodeOptionsTokens = (process.env.NODE_OPTIONS ?? '').trim().split(/\s+/).filter(Boolean)
   const linearFlagPresent =
@@ -1042,8 +1044,8 @@ export function hardenHostProcess(options?: {
   }
 
   const warnings: string[] = []
-  if (!disableProtoThrow) {
-    warnings.push(`Node started without --disable-proto=throw (recommended: node ${RECOMMENDED_HARDENING_FLAGS} scripts/serve.ts)`)
+  if (!disableProtoDelete) {
+    warnings.push(`Node started without --disable-proto=delete (recommended: node ${RECOMMENDED_HARDENING_FLAGS} scripts/serve.ts)`)
   }
   if (!linearRegexpFallback) {
     warnings.push(
@@ -1064,7 +1066,7 @@ export function hardenHostProcess(options?: {
   return {
     prototypeClean: true,
     prototypeSealed: Object.isSealed(Object.prototype),
-    disableProtoThrow,
+    disableProtoDelete,
     linearRegexpFallback,
     regexpSelfCheckMs,
     warnings,

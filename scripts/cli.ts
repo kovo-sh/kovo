@@ -1,4 +1,4 @@
-#!/usr/bin/env -S node --disable-proto=throw --enable-experimental-regexp-engine-on-excessive-backtracks --regexp-backtracks-before-fallback=10000
+#!/usr/bin/env -S node --disable-proto=delete --enable-experimental-regexp-engine-on-excessive-backtracks --regexp-backtracks-before-fallback=10000
 import { execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
@@ -443,14 +443,18 @@ export function mountLocalReposReadOnlyCopy(repos: readonly string[], destReposD
 export interface CliHardeningStatus {
   prototypeClean: boolean
   prototypeSealed: boolean
-  disableProtoThrow: boolean
+  disableProtoDelete: boolean
   linearRegexpFallback: boolean
   regexpSelfCheckMs: number | null
   warnings: string[]
 }
 
+// Use --disable-proto=delete instead of --disable-proto=throw: playwright-core's colors helper assigns
+// `builder.__proto__ = proto` in formatCallLog (playwright-core/lib/utilsBundle.js:591), which throws
+// ERR_PROTO_ACCESS under --disable-proto=throw while --disable-proto=delete removes Object.prototype.__proto__
+// without breaking Playwright error formatting.
 const CLI_RECOMMENDED_HARDENING_FLAGS =
-  '--disable-proto=throw --enable-experimental-regexp-engine-on-excessive-backtracks --regexp-backtracks-before-fallback=10000'
+  '--disable-proto=delete --enable-experimental-regexp-engine-on-excessive-backtracks --regexp-backtracks-before-fallback=10000'
 
 export function assertCliObjectPrototypeIntegrity(): void {
   const pollutedKeys = Object.keys(Object.prototype)
@@ -470,12 +474,10 @@ export function hardenCliProcess(options?: {
     Object.seal(Object.prototype)
   }
 
-  let disableProtoThrow = false
-  try {
-    void (Object.prototype as Record<string, unknown>).__proto__
-  } catch (err) {
-    disableProtoThrow = (err as { code?: string })?.code === 'ERR_PROTO_ACCESS' || err instanceof Error
-  }
+  // Under --disable-proto=delete, Node removes `Object.prototype.__proto__` cleanly so `__proto__`
+  // reads return undefined and property assignment cannot mutate Object.prototype, while
+  // playwright-core/lib/utilsBundle.js:591 (`builder.__proto__ = proto`) does not crash.
+  const disableProtoDelete = Object.getOwnPropertyDescriptor(Object.prototype, '__proto__') === undefined
 
   const nodeOptionsTokens = (process.env.NODE_OPTIONS ?? '').trim().split(/\s+/).filter(Boolean)
   const linearFlagPresent =
@@ -493,8 +495,8 @@ export function hardenCliProcess(options?: {
   }
 
   const warnings: string[] = []
-  if (!disableProtoThrow) {
-    warnings.push(`CLI started without --disable-proto=throw (recommended: node ${CLI_RECOMMENDED_HARDENING_FLAGS} scripts/cli.ts)`)
+  if (!disableProtoDelete) {
+    warnings.push(`CLI started without --disable-proto=delete (recommended: node ${CLI_RECOMMENDED_HARDENING_FLAGS} scripts/cli.ts)`)
   }
   if (!linearRegexpFallback) {
     warnings.push(
@@ -515,7 +517,7 @@ export function hardenCliProcess(options?: {
   return {
     prototypeClean: true,
     prototypeSealed: Object.isSealed(Object.prototype),
-    disableProtoThrow,
+    disableProtoDelete,
     linearRegexpFallback,
     regexpSelfCheckMs,
     warnings,

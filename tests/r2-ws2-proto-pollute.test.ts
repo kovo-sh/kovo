@@ -291,7 +291,7 @@ test('R2-C-2: probeSurface params mode filters reserved prototype keys and uses 
 
 test('WS-2: hardened Node flags pass serve/cli startup self-check, seal Object.prototype, and bound backtracking regexes under 50 ms', () => {
   const hardenedFlags = [
-    '--disable-proto=throw',
+    '--disable-proto=delete',
     '--enable-experimental-regexp-engine-on-excessive-backtracks',
     '--regexp-backtracks-before-fallback=10000',
   ]
@@ -304,6 +304,8 @@ test('WS-2: hardened Node flags pass serve/cli startup self-check, seal Object.p
     const cliStatus = hardenCliProcess({ requireFlags: true, quiet: true });
     let addBlocked = false;
     try { Object.prototype.${MARKER} = true; } catch { addBlocked = true; }
+    const parsed = JSON.parse('{"${DUNDER_PROTO}":{"${MARKER}":true}}');
+    Object.assign({}, parsed);
     const t0 = performance.now();
     /(a+)+b/.test('a'.repeat(35) + '!');
     const regexMs = performance.now() - t0;
@@ -311,6 +313,8 @@ test('WS-2: hardened Node flags pass serve/cli startup self-check, seal Object.p
       hostStatus,
       cliStatus,
       addBlocked,
+      protoDescUndefined: Object.getOwnPropertyDescriptor(Object.prototype, '${DUNDER_PROTO}') === undefined,
+      dunderProtoRead: ({}).${DUNDER_PROTO},
       sealed: Object.isSealed(Object.prototype),
       canaryAfter: ({}).${MARKER},
       regexMs,
@@ -325,7 +329,7 @@ test('WS-2: hardened Node flags pass serve/cli startup self-check, seal Object.p
     hostStatus: {
       prototypeClean: boolean
       prototypeSealed: boolean
-      disableProtoThrow: boolean
+      disableProtoDelete: boolean
       linearRegexpFallback: boolean
       regexpSelfCheckMs: number
       warnings: string[]
@@ -333,12 +337,14 @@ test('WS-2: hardened Node flags pass serve/cli startup self-check, seal Object.p
     cliStatus: {
       prototypeClean: boolean
       prototypeSealed: boolean
-      disableProtoThrow: boolean
+      disableProtoDelete: boolean
       linearRegexpFallback: boolean
       regexpSelfCheckMs: number
       warnings: string[]
     }
     addBlocked: boolean
+    protoDescUndefined: boolean
+    dunderProtoRead: unknown
     sealed: boolean
     canaryAfter: unknown
     regexMs: number
@@ -346,18 +352,20 @@ test('WS-2: hardened Node flags pass serve/cli startup self-check, seal Object.p
 
   assert.strictEqual(parsed.hostStatus.prototypeClean, true)
   assert.strictEqual(parsed.hostStatus.prototypeSealed, true)
-  assert.strictEqual(parsed.hostStatus.disableProtoThrow, true)
+  assert.strictEqual(parsed.hostStatus.disableProtoDelete, true)
   assert.strictEqual(parsed.hostStatus.linearRegexpFallback, true)
   assert.ok(parsed.hostStatus.regexpSelfCheckMs < 50, `expected self-check < 50ms, got ${parsed.hostStatus.regexpSelfCheckMs}`)
   assert.deepStrictEqual(parsed.hostStatus.warnings, [])
 
   assert.strictEqual(parsed.cliStatus.prototypeClean, true)
   assert.strictEqual(parsed.cliStatus.prototypeSealed, true)
-  assert.strictEqual(parsed.cliStatus.disableProtoThrow, true)
+  assert.strictEqual(parsed.cliStatus.disableProtoDelete, true)
   assert.strictEqual(parsed.cliStatus.linearRegexpFallback, true)
   assert.deepStrictEqual(parsed.cliStatus.warnings, [])
 
   assert.strictEqual(parsed.addBlocked, true)
+  assert.strictEqual(parsed.protoDescUndefined, true)
+  assert.strictEqual(parsed.dunderProtoRead, undefined)
   assert.strictEqual(parsed.sealed, true)
   assert.strictEqual(parsed.canaryAfter, undefined)
   assert.ok(parsed.regexMs < 50, `expected exponential regex < 50ms under linear fallback, got ${parsed.regexMs}`)
@@ -373,7 +381,100 @@ test('WS-2: hardened Node flags pass serve/cli startup self-check, seal Object.p
   // Verify Dockerfile enables Node hardening flags and enforces startup self-check.
   const dockerfile = readFileSync(resolve(REPO_ROOT, 'Dockerfile'), 'utf8')
   assert.match(dockerfile, /KOVO_REQUIRE_HARDENED_NODE=1/)
-  assert.match(dockerfile, /--disable-proto=throw/)
+  assert.match(dockerfile, /--disable-proto=delete/)
+  assert.doesNotMatch(dockerfile, /--disable-proto=throw/)
   assert.match(dockerfile, /--enable-experimental-regexp-engine-on-excessive-backtracks/)
   assert.match(dockerfile, /--regexp-backtracks-before-fallback=10000/)
+})
+
+test('WS-2 regression: hardened Node flags allow playwright-core formatCallLog errors without ERR_PROTO_ACCESS while blocking __proto__ pollution', () => {
+  const hardenedFlags = [
+    '--disable-proto=delete',
+    '--enable-experimental-regexp-engine-on-excessive-backtracks',
+    '--regexp-backtracks-before-fallback=10000',
+  ]
+
+  const script = `
+    import { createRequire } from 'node:module';
+    import { hardenHostProcess } from './scripts/serve.ts';
+    const status = hardenHostProcess({ requireFlags: true, quiet: true });
+    const require = createRequire(import.meta.url);
+    const { chromium } = require('playwright-core');
+    const browser = await chromium.launch({ headless: true });
+    try {
+      const page = await browser.newPage();
+      let clickErr = null;
+      try {
+        await page.locator('#r2-ws2-nonexistent-selector').click({ timeout: 50 });
+      } catch (err) {
+        clickErr = {
+          name: err?.name ?? null,
+          code: err?.code ?? null,
+          message: err?.message ?? String(err),
+        };
+      }
+      let gotoErr = null;
+      try {
+        await page.goto('http://127.0.0.1:1', { timeout: 250 });
+      } catch (err) {
+        gotoErr = {
+          name: err?.name ?? null,
+          code: err?.code ?? null,
+          message: err?.message ?? String(err),
+        };
+      }
+      const pollutedAttempt = JSON.parse('{"${DUNDER_PROTO}":{"${MARKER}":true}}');
+      Object.assign({}, pollutedAttempt);
+      console.log(JSON.stringify({
+        status,
+        clickErr,
+        gotoErr,
+        dunderProto: ({}).${DUNDER_PROTO},
+        canary: ({}).${MARKER},
+        sealed: Object.isSealed(Object.prototype),
+        protoKeys: Object.keys(Object.prototype),
+      }));
+    } finally {
+      await browser.close();
+    }
+  `
+
+  const stdout = execFileSync(process.execPath, [...hardenedFlags, '--input-type=module', '-e', script], {
+    cwd: REPO_ROOT,
+    encoding: 'utf8',
+    timeout: 30_000,
+  })
+  const parsed = JSON.parse(stdout.trim()) as {
+    status: {
+      disableProtoDelete: boolean
+      prototypeSealed: boolean
+      warnings: string[]
+    }
+    clickErr: { name: string | null; code: string | null; message: string } | null
+    gotoErr: { name: string | null; code: string | null; message: string } | null
+    dunderProto: unknown
+    canary: unknown
+    sealed: boolean
+    protoKeys: string[]
+  }
+
+  assert.strictEqual(parsed.status.disableProtoDelete, true)
+  assert.strictEqual(parsed.status.prototypeSealed, true)
+  assert.deepStrictEqual(parsed.status.warnings, [])
+
+  assert.ok(parsed.clickErr, 'expected selector timeout error')
+  assert.strictEqual(parsed.clickErr.name, 'TimeoutError')
+  assert.notStrictEqual(parsed.clickErr.code, 'ERR_PROTO_ACCESS')
+  assert.doesNotMatch(parsed.clickErr.message, /ERR_PROTO_ACCESS|--disable-proto=throw/)
+  assert.match(parsed.clickErr.message, /Call log:/)
+
+  assert.ok(parsed.gotoErr, 'expected unsafe-port navigation error')
+  assert.notStrictEqual(parsed.gotoErr.code, 'ERR_PROTO_ACCESS')
+  assert.doesNotMatch(parsed.gotoErr.message, /ERR_PROTO_ACCESS|--disable-proto=throw/)
+  assert.match(parsed.gotoErr.message, /Call log:/)
+
+  assert.strictEqual(parsed.dunderProto, undefined)
+  assert.strictEqual(parsed.canary, undefined)
+  assert.strictEqual(parsed.sealed, true)
+  assert.deepStrictEqual(parsed.protoKeys, [])
 })
