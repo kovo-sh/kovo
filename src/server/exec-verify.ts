@@ -4088,7 +4088,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       files: [{ name: 'verification-input.json', content: JSON.stringify(payload) }],
       command: verificationCommand,
       outputs: ['verification.json'],
-    }, job.controller.signal, reposDir ? { reposDir } : undefined) : undefined
+    }, job.controller.signal, reposDir ? { reposDir, runId: run.id } : { runId: run.id }) : undefined
 
     const outcomes = readComparisons(result?.exitCode === 0 ? result.outputs['verification.json'] : undefined, comparisons)
     const verified = inputs.flatMap(({ artifactId, reviews }) =>

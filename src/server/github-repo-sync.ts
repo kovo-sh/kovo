@@ -2,9 +2,12 @@ import { execFileSync, spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import {
   chmodSync,
+  closeSync,
+  constants as fsConstants,
   existsSync,
   lstatSync,
   mkdirSync,
+  openSync,
   promises as fsp,
   readdirSync,
   readFileSync,
@@ -14,6 +17,7 @@ import {
   rmSync,
   rmdirSync,
   writeFileSync,
+  writeSync,
 } from 'node:fs'
 import { dirname, join, relative, resolve, sep } from 'node:path'
 import { DEFAULT_GITHUB_API_BASE_URL, resolveFreshGithubCredential } from './github-auth.ts'
@@ -1492,29 +1496,67 @@ function stripGitSymlinks(dirPath: string): void {
   }
 }
 
-/** Strip credentials/headers from `.git/config` and neutralize hooks before mounting. */
+const NEUTRALIZED_GIT_ATTRIBUTES_CONTENT = '* -text -crlf -ident -working-tree-encoding -filter -eol\n'
+const MAX_GITATTRIBUTES_BLOB_BYTES = 256 * 1024
+
+/**
+ * Write `.git/info/attributes` neutralizing every built-in and custom checkout transform
+ * (`text`, `crlf`, `ident`, `working-tree-encoding`, `filter`, `eol`) so repo `.gitattributes`
+ * cannot amplify checked-out bytes on disk (R4-H-18).
+ */
+function writeNeutralizedGitAttributes(gitDir: string): void {
+  const infoDir = join(gitDir, 'info')
+  try {
+    if (existsSync(infoDir)) {
+      const st = lstatSync(infoDir)
+      if (st.isSymbolicLink() || !st.isDirectory()) {
+        rmSync(infoDir, { recursive: true, force: true })
+      }
+    }
+  } catch { /* best-effort */ }
+  mkdirSync(infoDir, { recursive: true, mode: 0o755 })
+  const attrsPath = join(infoDir, 'attributes')
+  try {
+    if (existsSync(attrsPath) && lstatSync(attrsPath).isSymbolicLink()) {
+      rmSync(attrsPath, { force: true })
+    }
+  } catch { /* best-effort */ }
+  writeFileSync(attrsPath, NEUTRALIZED_GIT_ATTRIBUTES_CONTENT, { mode: 0o644 })
+  chmodSync(attrsPath, 0o644)
+}
+
+/** Strip credentials/headers/filters from `.git/config`, neutralize hooks & `.git/info/attributes` before mounting. */
 function sanitizeGitMetadata(gitDir: string): void {
   stripGitSymlinks(gitDir)
   const configPath = join(gitDir, 'config')
   try {
-    if (!existsSync(configPath)) return
-    const raw = readFileSync(configPath, 'utf8')
-    const sections: string[] = []
-    let skippingCredentialSection = false
-    for (const line of raw.split('\n')) {
-      const section = /^\s*\[([^\]]+)\]\s*$/.exec(line)
-      if (section) {
-        skippingCredentialSection = /^credential(?:\s|$)/i.test(section[1])
-        if (!skippingCredentialSection) sections.push(line)
-        continue
+    if (existsSync(configPath)) {
+      const raw = readFileSync(configPath, 'utf8')
+      const sections: string[] = []
+      let skippingUnsafeSection = false
+      for (const line of raw.split('\n')) {
+        const section = /^\s*\[([^\]]+)\]\s*$/.exec(line)
+        if (section) {
+          skippingUnsafeSection = /^(?:credential|filter)(?:\s|$)/i.test(section[1]!)
+          if (!skippingUnsafeSection) sections.push(line)
+          continue
+        }
+        if (skippingUnsafeSection) continue
+        if (
+          /extraheader/i.test(line)
+          || /^\s*(?:username|password|token|attributesfile|autocrlf|eol|safecrlf)\s*=/i.test(line)
+        ) {
+          continue
+        }
+        sections.push(line.replace(/(https?:\/\/)[^/@\s]+@/gi, '$1'))
       }
-      if (skippingCredentialSection) continue
-      if (/extraheader/i.test(line) || /^\s*(?:username|password|token)\s*=/i.test(line)) continue
-      sections.push(line.replace(/(https?:\/\/)[^/@\s]+@/gi, '$1'))
+      writeFileSync(configPath, sections.join('\n'), { mode: 0o644 })
+      chmodSync(configPath, 0o644)
     }
-    writeFileSync(configPath, sections.join('\n'), { mode: 0o644 })
-    chmodSync(configPath, 0o644)
   } catch { /* best-effort: mount remains read-only */ }
+  try {
+    writeNeutralizedGitAttributes(gitDir)
+  } catch { /* best-effort; re-enforced fail-closed before checkout */ }
   const hooksDir = join(gitDir, 'hooks')
   try {
     if (existsSync(hooksDir)) {
@@ -1882,11 +1924,388 @@ async function checkGithubPreflightRepoSize(input: {
   }
 }
 
+interface GitTreeBlobEntry {
+  mode: string
+  oid: string
+  size: number
+  relPath: string
+}
+
 interface PreCheckoutTreeSummary {
   blobBytes: number
   fileCount: number
   inodeCount: number
   maxDepth: number
+  blobs: GitTreeBlobEntry[]
+  gitattributesBlobs: GitTreeBlobEntry[]
+}
+
+function buildHardenedGitCheckoutPrefix(stagingDir: string): string[] {
+  return [
+    '-C', stagingDir,
+    '-c', 'safe.directory=*',
+    '-c', 'core.hooksPath=/dev/null',
+    '-c', 'core.fsmonitor=false',
+    '-c', 'core.symlinks=false',
+    '-c', 'core.attributesFile=/dev/null',
+    '-c', 'core.autocrlf=false',
+    '-c', 'core.eol=lf',
+    '-c', 'core.safecrlf=false',
+    '-c', 'filter.lfs.smudge=',
+    '-c', 'filter.lfs.process=',
+    '-c', 'filter.lfs.required=false',
+    '-c', 'protocol.file.allow=never',
+    '-c', 'protocol.ext.allow=never',
+    '-c', 'submodule.recurse=false',
+  ]
+}
+
+function findAmplifyingGitAttributeToken(content: string): string | null {
+  for (const rawLine of content.split(/\r?\n/)) {
+    const line = rawLine.trim()
+    if (!line || line.startsWith('#')) continue
+    let idx = 0
+    if (line.startsWith('"')) {
+      idx = 1
+      while (idx < line.length) {
+        if (line[idx] === '\\' && idx + 1 < line.length) { idx += 2; continue }
+        if (line[idx] === '"') { idx += 1; break }
+        idx += 1
+      }
+    } else {
+      while (idx < line.length) {
+        if (line[idx] === '\\' && idx + 1 < line.length) { idx += 2; continue }
+        if (/\s/.test(line[idx]!)) break
+        idx += 1
+      }
+    }
+    const attrPart = line.slice(idx).trim()
+    if (!attrPart) continue
+    for (const token of attrPart.split(/\s+/)) {
+      if (!token || token.startsWith('-') || token.startsWith('!')) continue
+      if (/^(?:ident|working-tree-encoding(?:=.*)?)$/i.test(token)) {
+        return token
+      }
+    }
+  }
+  return null
+}
+
+async function inspectGitAttributesBeforeCheckout(input: {
+  stagingDir: string
+  fullName: string
+  gitEnv: NodeJS.ProcessEnv
+  secrets: readonly NamedSecret[]
+  gitattributesBlobs: readonly GitTreeBlobEntry[]
+  signal?: AbortSignal
+  timeoutMs: number
+}): Promise<void> {
+  if (input.gitattributesBlobs.length === 0) return
+  const prefix = buildHardenedGitCheckoutPrefix(input.stagingDir)
+  for (const entry of input.gitattributesBlobs) {
+    input.signal?.throwIfAborted()
+    if (entry.size > MAX_GITATTRIBUTES_BLOB_BYTES) {
+      const err = new Error(
+        `Rejected repository "${input.fullName}": .gitattributes file "${entry.relPath}" exceeds ${MAX_GITATTRIBUTES_BLOB_BYTES} bytes.`,
+      ) as Error & { code: string; status: number }
+      err.code = 'REPO_UNSAFE_GITATTRIBUTES'
+      err.status = 400
+      throw err
+    }
+    const res = await runGit(
+      [...prefix, 'cat-file', 'blob', entry.oid],
+      input.gitEnv,
+      input.secrets,
+      input.signal,
+      Math.min(input.timeoutMs, 15_000),
+    )
+    const unsafeToken = findAmplifyingGitAttributeToken(res.stdout)
+    if (unsafeToken) {
+      const err = new Error(
+        `Rejected repository "${input.fullName}": "${entry.relPath}" requests amplifying checkout attribute "${unsafeToken}".`,
+      ) as Error & { code: string; status: number }
+      err.code = 'REPO_UNSAFE_GITATTRIBUTES'
+      err.status = 400
+      throw err
+    }
+  }
+}
+
+/**
+ * Materialize a `--no-checkout` staging repository via ONE attribute-neutralized, streaming
+ * byte-accounted primitive (R4-H-18):
+ *   1. Re-writes `.git/info/attributes` neutralizing `* -text -crlf -ident -working-tree-encoding -filter -eol`.
+ *   2. Populates `.git/index` via `git read-tree HEAD` (with `-c core.attributesFile=/dev/null -c core.autocrlf=false -c core.eol=lf`)
+ *      so downstream symlink/index inspection works identically without running checkout filters.
+ *   3. Streams raw object bytes via `git cat-file --batch` directly to disk with hard per-chunk
+ *      byte accounting against `maxRepoDiskBytes` and `maxProjectDiskBytes`, aborting immediately
+ *      before disk writes can ever exceed quota.
+ */
+async function materializeGitTreeBounded(input: {
+  stagingDir: string
+  fullName: string
+  gitEnv: NodeJS.ProcessEnv
+  secrets: readonly NamedSecret[]
+  blobs: readonly GitTreeBlobEntry[]
+  maxRepoDiskBytes: number
+  maxProjectDiskBytes: number
+  existingProjectBytes: number
+  baseGitBytes: number
+  signal?: AbortSignal
+  timeoutMs: number
+}): Promise<{ bytesWritten: number; filesWritten: number }> {
+  input.signal?.throwIfAborted()
+  const gitDirPath = join(input.stagingDir, '.git')
+  writeNeutralizedGitAttributes(gitDirPath)
+
+  const prefix = buildHardenedGitCheckoutPrefix(input.stagingDir)
+  // Populate `.git/index` from HEAD without touching the working tree so `git ls-files -s` works cleanly.
+  await runGit([...prefix, 'read-tree', 'HEAD'], input.gitEnv, input.secrets, input.signal, input.timeoutMs)
+
+  if (input.blobs.length === 0) {
+    return { bytesWritten: 0, filesWritten: 0 }
+  }
+
+  const resolvedStaging = realpathSync(input.stagingDir)
+  const deadline = input.signal
+    ? AbortSignal.any([input.signal, AbortSignal.timeout(input.timeoutMs)])
+    : AbortSignal.timeout(input.timeoutMs)
+
+  return await new Promise((resolvePromise, rejectPromise) => {
+    const child = spawn('git', [...prefix, 'cat-file', '--batch'], {
+      env: input.gitEnv,
+      signal: deadline,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+
+    let entryIndex = 0
+    let state: 'header' | 'body' | 'trailing_lf' = 'header'
+    let headerBuf: Buffer = Buffer.alloc(0)
+    let remaining = 0
+    let currentFd: number | null = null
+    let currentDestPath: string | null = null
+    let currentFileMode = 0o644
+    let totalBytesWritten = 0
+    let abortError: Error | null = null
+    const errChunks: Buffer[] = []
+    let errLen = 0
+    const errCap = 64 * 1024
+    const maxHeaderBytes = 4096
+
+    const closeCurrentFd = () => {
+      if (currentFd !== null) {
+        const fd = currentFd
+        currentFd = null
+        try { closeSync(fd) } catch { /* ignore */ }
+      }
+    }
+
+    const failEarly = (err: Error) => {
+      if (abortError) return
+      abortError = err
+      closeCurrentFd()
+      try { child.stdin.destroy() } catch { /* ignore */ }
+      try { child.stdout.destroy() } catch { /* ignore */ }
+      try { child.kill('SIGKILL') } catch { /* ignore */ }
+    }
+
+    const checkBudget = (nextBytesWritten: number): boolean => {
+      const projectedRepoBytes = input.baseGitBytes + nextBytesWritten
+      if (projectedRepoBytes > input.maxRepoDiskBytes) {
+        failEarly(new RepoDiskQuotaExceededError('repo', input.fullName, projectedRepoBytes, input.maxRepoDiskBytes))
+        return false
+      }
+      const projectedProjectBytes = input.existingProjectBytes + projectedRepoBytes
+      if (projectedProjectBytes > input.maxProjectDiskBytes) {
+        failEarly(new RepoDiskQuotaExceededError('project', input.fullName, projectedProjectBytes, input.maxProjectDiskBytes))
+        return false
+      }
+      return true
+    }
+
+    const ensureSafeParentDirs = (destPath: string) => {
+      const relDir = relative(resolvedStaging, dirname(destPath))
+      if (!relDir || relDir === '.') return
+      const parts = relDir.split(sep).filter(Boolean)
+      let cur = resolvedStaging
+      for (const part of parts) {
+        cur = join(cur, part)
+        if (existsSync(cur)) {
+          const st = lstatSync(cur)
+          if (st.isSymbolicLink() || !st.isDirectory()) {
+            throw new Error(`Unsafe non-directory or symlink component while checking out "${input.fullName}".`)
+          }
+        } else {
+          mkdirSync(cur, { mode: 0o755 })
+          chmodSync(cur, 0o755)
+        }
+      }
+    }
+
+    // Feed blob OIDs to `git cat-file --batch` stdin with stream backpressure.
+    let feedIndex = 0
+    const pumpStdin = () => {
+      while (!abortError && feedIndex < input.blobs.length) {
+        const line = `${input.blobs[feedIndex]!.oid}\n`
+        feedIndex += 1
+        if (!child.stdin.write(line)) {
+          child.stdin.once('drain', pumpStdin)
+          return
+        }
+      }
+      if (!abortError) {
+        child.stdin.end()
+      }
+    }
+    child.stdin.on('error', () => { /* child exit/abort handler owns error reporting */ })
+    pumpStdin()
+
+    child.stdout.on('data', (chunk: Buffer) => {
+      if (abortError) return
+      let offset = 0
+      while (offset < chunk.length && !abortError) {
+        if (state === 'header') {
+          const nlIdx = chunk.indexOf(0x0a, offset)
+          if (nlIdx < 0) {
+            const slice = chunk.subarray(offset)
+            if (headerBuf.length + slice.length > maxHeaderBytes) {
+              failEarly(new Error(`Malformed git cat-file header while checking out "${input.fullName}".`))
+              return
+            }
+            headerBuf = headerBuf.length > 0 ? Buffer.concat([headerBuf, slice]) : Buffer.from(slice)
+            offset = chunk.length
+            break
+          }
+          const lineBuf = headerBuf.length > 0
+            ? Buffer.concat([headerBuf, chunk.subarray(offset, nlIdx)])
+            : chunk.subarray(offset, nlIdx)
+          headerBuf = Buffer.alloc(0)
+          offset = nlIdx + 1
+
+          if (entryIndex >= input.blobs.length) {
+            failEarly(new Error(`Unexpected extra git cat-file object while checking out "${input.fullName}".`))
+            return
+          }
+          const expected = input.blobs[entryIndex]!
+          const headerLine = lineBuf.toString('utf8').trim()
+          const parts = headerLine.split(' ')
+          if (parts.length !== 3 || parts[1] !== 'blob' || parts[0] !== expected.oid) {
+            failEarly(new Error(`Unexpected git cat-file header "${headerLine.slice(0, 120)}" for "${input.fullName}".`))
+            return
+          }
+          const actualSize = Number(parts[2])
+          if (!Number.isFinite(actualSize) || actualSize < 0) {
+            failEarly(new Error(`Invalid git blob byte count "${parts[2]}" for "${input.fullName}".`))
+            return
+          }
+          if (!checkBudget(totalBytesWritten + actualSize)) return
+
+          const destPath = resolve(resolvedStaging, expected.relPath)
+          if (!destPath.startsWith(resolvedStaging + sep)) {
+            failEarly(new Error(`Checkout path escapes staging directory in "${input.fullName}": ${expected.relPath}`))
+            return
+          }
+          try {
+            ensureSafeParentDirs(destPath)
+            currentFileMode = expected.mode === '100755' ? 0o755 : 0o644
+            currentDestPath = destPath
+            const openFlags = fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC | (fsConstants.O_NOFOLLOW ?? 0)
+            currentFd = openSync(destPath, openFlags, currentFileMode)
+          } catch (err) {
+            failEarly(err instanceof Error ? err : new Error(String(err)))
+            return
+          }
+
+          if (actualSize === 0) {
+            closeCurrentFd()
+            try { chmodSync(destPath, currentFileMode) } catch { /* best-effort */ }
+            currentDestPath = null
+            remaining = 0
+            state = 'trailing_lf'
+          } else {
+            remaining = actualSize
+            state = 'body'
+          }
+          continue
+        }
+
+        if (state === 'body') {
+          const take = Math.min(remaining, chunk.length - offset)
+          if (!checkBudget(totalBytesWritten + take)) return
+          try {
+            let written = 0
+            while (written < take) {
+              const n = writeSync(currentFd!, chunk, offset + written, take - written)
+              if (n <= 0) throw new Error(`Short write while checking out "${input.fullName}".`)
+              written += n
+            }
+          } catch (err) {
+            failEarly(err instanceof Error ? err : new Error(String(err)))
+            return
+          }
+          totalBytesWritten += take
+          remaining -= take
+          offset += take
+          if (remaining === 0) {
+            closeCurrentFd()
+            if (currentDestPath) {
+              try { chmodSync(currentDestPath, currentFileMode) } catch { /* best-effort */ }
+              currentDestPath = null
+            }
+            state = 'trailing_lf'
+          }
+          continue
+        }
+
+        // state === 'trailing_lf'
+        if (chunk[offset] !== 0x0a) {
+          failEarly(new Error(`Malformed git cat-file framing while checking out "${input.fullName}".`))
+          return
+        }
+        offset += 1
+        entryIndex += 1
+        state = 'header'
+      }
+    })
+
+    child.stderr.on('data', (chunk: Buffer) => {
+      if (errLen < errCap) {
+        errChunks.push(chunk.subarray(0, errCap - errLen))
+        errLen += chunk.length
+      }
+    })
+
+    child.once('error', err => {
+      closeCurrentFd()
+      if (abortError) {
+        rejectPromise(abortError)
+        return
+      }
+      if (deadline.aborted) {
+        rejectPromise(new Error(`git cat-file checkout aborted or timed out for "${input.fullName}".`))
+      } else {
+        rejectPromise(new Error(redact(err.message, input.secrets)))
+      }
+    })
+
+    child.once('close', code => {
+      closeCurrentFd()
+      if (abortError) {
+        rejectPromise(abortError)
+        return
+      }
+      if (code !== 0) {
+        const stderr = redact(Buffer.concat(errChunks).toString('utf8'), input.secrets).trim().slice(0, 300)
+        rejectPromise(new Error(`git cat-file checkout failed for "${input.fullName}" (exit ${code}): ${stderr}`))
+        return
+      }
+      if (entryIndex !== input.blobs.length || state !== 'header' || headerBuf.length > 0) {
+        rejectPromise(new Error(`Truncated git cat-file checkout stream for "${input.fullName}" (${entryIndex}/${input.blobs.length} files).`))
+        return
+      }
+      resolvePromise({ bytesWritten: totalBytesWritten, filesWritten: entryIndex })
+    })
+  })
 }
 
 /**
@@ -1922,6 +2341,9 @@ function inspectGitTreeBeforeCheckout(input: {
       '-c', 'core.hooksPath=/dev/null',
       '-c', 'core.fsmonitor=false',
       '-c', 'core.symlinks=false',
+      '-c', 'core.attributesFile=/dev/null',
+      '-c', 'core.autocrlf=false',
+      '-c', 'core.eol=lf',
       '-c', 'protocol.file.allow=never',
       '-c', 'protocol.ext.allow=never',
       'ls-tree', '-r', '-t', '-l', '-z', 'HEAD',
@@ -1936,6 +2358,8 @@ function inspectGitTreeBeforeCheckout(input: {
     let fileCount = 0
     let inodeCount = 0
     let maxDepth = 0
+    const blobs: GitTreeBlobEntry[] = []
+    const gitattributesBlobs: GitTreeBlobEntry[] = []
     let remainder: Buffer = Buffer.alloc(0)
     let abortError: Error | null = null
     const errChunks: Buffer[] = []
@@ -1964,9 +2388,19 @@ function inspectGitTreeBeforeCheckout(input: {
         failEarly(new Error(`Malformed git ls-tree header while inspecting "${input.fullName}".`))
         return
       }
+      const mode = parts[0]!
       const type = parts[1]!
+      const oid = parts[2]!
       const sizeToken = parts[3]!
       const segments = relPath.split('/').filter(Boolean)
+      if (
+        segments.length === 0
+        || relPath.startsWith('/')
+        || segments.some(seg => seg === '.' || seg === '..' || seg.toLowerCase() === '.git')
+      ) {
+        failEarly(new Error(`Unsafe git tree path "${relPath}" in "${input.fullName}".`))
+        return
+      }
       const dirDepth = type === 'tree'
         ? segments.length
         : Math.max(0, segments.length - 1)
@@ -2006,6 +2440,11 @@ function inspectGitTreeBeforeCheckout(input: {
         if (projectedProjectBytes > input.maxProjectDiskBytes) {
           failEarly(new RepoDiskQuotaExceededError('project', input.fullName, projectedProjectBytes, input.maxProjectDiskBytes))
           return
+        }
+        const blobEntry: GitTreeBlobEntry = { mode, oid, size, relPath }
+        blobs.push(blobEntry)
+        if (segments[segments.length - 1]?.toLowerCase() === '.gitattributes') {
+          gitattributesBlobs.push(blobEntry)
         }
       }
     }
@@ -2061,7 +2500,7 @@ function inspectGitTreeBeforeCheckout(input: {
         return
       }
       if (code === 0) {
-        resolvePromise({ blobBytes, fileCount, inodeCount, maxDepth })
+        resolvePromise({ blobBytes, fileCount, inodeCount, maxDepth, blobs, gitattributesBlobs })
         return
       }
       const stderr = redact(Buffer.concat(errChunks).toString('utf8'), input.secrets).trim().slice(0, 300)
@@ -2272,7 +2711,7 @@ export async function cloneGithubRepos(
             }
 
             // 4. Stream `git ls-tree -r -t -l -z HEAD` to enforce uncompressed blob bytes, file/inode cap,
-            //    and max directory depth BEFORE writing any working-tree file to disk.
+            //    and max directory depth, and inspect `.gitattributes` BEFORE writing any working-tree file to disk.
             const treeSummary: PreCheckoutTreeSummary = hasHead
               ? await inspectGitTreeBeforeCheckout({
                   stagingDir,
@@ -2288,7 +2727,19 @@ export async function cloneGithubRepos(
                   signal,
                   timeoutMs: cloneTimeoutMs,
                 })
-              : { blobBytes: 0, fileCount: 0, inodeCount: 0, maxDepth: 0 }
+              : { blobBytes: 0, fileCount: 0, inodeCount: 0, maxDepth: 0, blobs: [], gitattributesBlobs: [] }
+
+            if (hasHead && treeSummary.gitattributesBlobs.length > 0) {
+              await inspectGitAttributesBeforeCheckout({
+                stagingDir,
+                fullName,
+                gitEnv,
+                secrets,
+                gitattributesBlobs: treeSummary.gitattributesBlobs,
+                signal,
+                timeoutMs: cloneTimeoutMs,
+              })
+            }
 
             options.onBeforeCheckout?.({
               stagingDir,
@@ -2298,20 +2749,22 @@ export async function cloneGithubRepos(
               maxDepth: treeSummary.maxDepth,
             })
 
-            // 5. Only check out working tree after pre-checkout tree quota, file/inode, and depth checks pass.
+            // 5. Materialize working tree via ONE attribute-neutralized, streaming byte-accounted primitive
+            //    after pre-checkout tree quota, `.gitattributes`, file/inode, and depth checks pass.
             if (hasHead) {
-              await runGit(
-                [
-                  ...revParsePrefix,
-                  '-c', 'filter.lfs.smudge=',
-                  '-c', 'filter.lfs.process=',
-                  'checkout', '-f',
-                ],
+              await materializeGitTreeBounded({
+                stagingDir,
+                fullName,
                 gitEnv,
                 secrets,
+                blobs: treeSummary.blobs,
+                maxRepoDiskBytes,
+                maxProjectDiskBytes,
+                existingProjectBytes: existingOtherBytesPre,
+                baseGitBytes,
                 signal,
-                cloneTimeoutMs,
-              )
+                timeoutMs: cloneTimeoutMs,
+              })
             }
 
             // Reject any OS or git-tracked symlink escaping the checkout root, and strip all symlinks.

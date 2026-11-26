@@ -1501,7 +1501,7 @@ export async function runStaticAstProofRecipe(
       endLine: spec.endLine,
       engine: spec.engine,
       ruleOrPattern: spec.ruleOrPattern,
-    }, ctx.signal, { reposDir: ctx.reposDir })
+    }, ctx.signal, { reposDir: ctx.reposDir, ...(ctx.runId ? { runId: ctx.runId } : {}) })
     const evidencePayload = redactJsonValue({
       ...basePayload,
       repo: spec.repo,
