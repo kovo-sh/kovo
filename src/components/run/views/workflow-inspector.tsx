@@ -224,11 +224,13 @@ function useCancelStep(step: ChainStep | undefined) {
   const cancel = () => {
     if (!step) return
     setPending(step.id)
-    toast.undoable({
-      message: 'Step #' + step.seq + ' canceled', sub: step.title, icon: 'stop',
-      commit: () => send({ action: 'cancel_step', stepId: step.id }),
-      undo: () => setPending(null),
-    })
+    void send({ action: 'cancel_step', stepId: step.id }).then(
+      () => toast.show('Step #' + step.seq + ' canceled', { sub: step.title, icon: 'stop' }),
+      (e: unknown) => {
+        setPending(null)
+        toast.show(e instanceof Error ? e.message : 'Could not cancel step.', { tone: 'error' })
+      },
+    )
   }
   return { can, cancel, pending: !!step && pending === step.id }
 }
@@ -236,7 +238,7 @@ function useCancelStep(step: ChainStep | undefined) {
 function CancelFooter({ step, label }: { step: ChainStep; label?: ReactNode }) {
   const c = useCancelStep(step)
   if (!c.can && !c.pending) return null
-  return <PaneFooter stamped={c.pending ? <><Icon name="stop" />Canceling step #{step.seq}… <span className="ml-1 font-normal text-fg-subtle">Z to undo</span></> : undefined}>
+  return <PaneFooter stamped={c.pending ? <><Icon name="stop" />Canceling step #{step.seq}…</> : undefined}>
     <span className="min-w-0 truncate text-[12px] text-fg-subtle">{label ?? <>Step #{step.seq} · {stLabel(step.status)}</>}</span>
     <span className="flex-1" />
     <button type="button" className={runBtn()} onClick={c.cancel} title="Cancel this chain step (the worker stops and the step is not retried)"><Icon name="stop" />Cancel step</button>

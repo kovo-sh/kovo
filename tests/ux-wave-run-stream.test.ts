@@ -148,85 +148,50 @@ function makeFakeDetail(overrides: Partial<Detail> = {}): Detail {
 }
 
 // ---------------------------------------------------------------------------
-// A4: Toast deferred commits never dropped when another toast arrives
+// A4: Toast controller shows, replaces, and dismisses non-blocking toasts
 // ---------------------------------------------------------------------------
 
-test('A4: toast.show() flushes pending undoable commit before replacing the toast', async () => {
+test('A4: toast.show() replaces previous toast and dismiss() clears timer', async () => {
   const { createToastController } = evalTsSlice<{
     createToastController: (hooks: {
-      onPush: (item: { id: number; message: unknown; tone: string; hasUndo: boolean }) => void
+      onPush: (item: { id: number; message: unknown; tone: string; ms: number }) => void
       onClose: (id?: number) => void
       setTimer?: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>
       clearTimer?: (h: ReturnType<typeof setTimeout> | undefined) => void
     }) => {
       show: (msg: unknown, opts?: { tone?: 'default' | 'error'; ms?: number }) => void
-      undoable: (opts: { message: unknown; ms?: number; commit?: () => unknown; undo?: () => void }) => void
-      undoLast: () => boolean
-      flush: () => void
       dismiss: () => void
       dispose: () => void
-      hasPending: () => boolean
     }
   }>(['src', 'components', 'run', 'toast.tsx'], 'export function createToastController(', 'interface Item {')
 
-  const pushed: Array<{ id: number; message: unknown; tone: string; hasUndo: boolean }> = []
+  const pushed: Array<{ id: number; message: unknown; tone: string; ms: number }> = []
+  const closed: Array<number | undefined> = []
   const timers: { fn: (() => void) | null } = { fn: null }
+  let cleared = 0
   const ctrl = createToastController({
     onPush: item => pushed.push(item),
-    onClose: () => {},
+    onClose: id => closed.push(id),
     setTimer: fn => { timers.fn = fn; return 1 as unknown as ReturnType<typeof setTimeout> },
-    clearTimer: () => { timers.fn = null },
+    clearTimer: () => { timers.fn = null; cleared += 1 },
   })
 
-  // 1. undoable() then show() -> pending commit MUST fire immediately (never silently dropped)
-  let committed = 0
-  let undone = 0
-  ctrl.undoable({
-    message: 'Stopping the run',
-    commit: () => { committed += 1 },
-    undo: () => { undone += 1 },
-  })
-  assert.equal(ctrl.hasPending(), true)
-  ctrl.show('Copied run ID')
-  assert.equal(committed, 1, 'show() must flush pending undoable commit before replacing toast')
-  assert.equal(undone, 0)
-  assert.equal(ctrl.hasPending(), false)
-  assert.equal(ctrl.undoLast(), false)
-  // Timer firing for the second toast must NOT double-commit
+  ctrl.show('Stopping the run')
+  assert.equal(pushed.length, 1)
+  assert.equal(pushed[0]!.tone, 'default')
+  assert.equal(pushed[0]!.ms, 2000)
+
+  ctrl.show('Error saving', { tone: 'error' })
+  assert.equal(pushed.length, 2)
+  assert.equal(pushed[1]!.tone, 'error')
+  assert.equal(pushed[1]!.ms, 4000)
+  assert.ok(cleared >= 2)
+
   timers.fn?.()
-  assert.equal(committed, 1)
+  assert.deepEqual(closed, [2])
 
-  // 2. undoable(A) then undoLast() then show(B) -> A.undo runs, A.commit NEVER runs
-  let commitA = 0
-  let undoA = 0
-  ctrl.undoable({
-    message: 'Approve POST /api/reset',
-    commit: () => { commitA += 1 },
-    undo: () => { undoA += 1 },
-  })
-  assert.equal(ctrl.undoLast(), true)
-  assert.equal(undoA, 1)
-  assert.equal(commitA, 0)
-  ctrl.show('Restored to the queue')
-  assert.equal(commitA, 0)
-
-  // 3. undoable(A) then dismiss() -> A.commit flushes once
-  let commitDismiss = 0
-  ctrl.undoable({
-    message: 'Saving scope revision 2',
-    commit: () => { commitDismiss += 1 },
-  })
   ctrl.dismiss()
-  assert.equal(commitDismiss, 1)
-
-  // 4. Async commit failure surfaces an error toast without infinite recursion
-  ctrl.undoable({
-    message: 'Stopping the run',
-    commit: async () => { throw new Error('Server refused stop') },
-  })
-  ctrl.show('Something else')
-  await new Promise(resolvePromise => setTimeout(resolvePromise, 10))
-  assert.ok(pushed.some(item => item.tone === 'error' && item.message === 'Server refused stop'))
+  assert.deepEqual(closed, [2, undefined])
 })
 
 // ---------------------------------------------------------------------------

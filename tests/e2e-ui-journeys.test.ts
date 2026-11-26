@@ -339,6 +339,7 @@ async function startKovoServer(): Promise<SpawnedKovoServer> {
       PORT: String(port),
       KOVO_DATA_DIR: dataDir,
       KOVO_ALLOW_LOCAL_LAB: '1',
+      KOVO_ALLOW_LOCAL_MODEL: '1',
       KOVO_OFFLINE: '',
       KOVO_PUBLIC_ORIGIN: '',
     },

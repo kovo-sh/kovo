@@ -223,7 +223,10 @@ export function RunHeader() {
           <div className={RW.menuSep} />
           {editable && r.status !== 'waiting' && item('stop', 'Stop run', () => {
             setPop(null)
-            toast.undoable({ message: 'Stopping the run', sub: 'Sends when this closes; a partial report is saved', icon: 'stop', commit: () => send({ action: 'stop' }) })
+            void send({ action: 'stop' }).then(
+              () => toast.show('Stopping the run', { sub: 'A partial report is saved', icon: 'stop' }),
+              (e: unknown) => toast.show(e instanceof Error ? e.message : 'Could not stop the run.', { tone: 'error' }),
+            )
           }, { danger: true })}
           {item('trash', 'Delete run…', () => {
             setPop(null)
