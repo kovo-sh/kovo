@@ -827,14 +827,20 @@ function buildHeeStoreFixture(
   const probes = probeBodies.map((body, i) => {
     const ch = challenges[i]
     const rawRequestBody = JSON.stringify({ template: ch ? `{{ ${ch.expressionSyntax} }}` : `{{ member_template_slot_${i} }}`, note: `render request ${i}` })
-    return mk('probe', body, probeStatus, rawRequestBody, ch)
+    const rec = mk('probe', body, probeStatus, rawRequestBody, ch)
+    if (ch) {
+      const bound = defaultHostMintedOracle.bindExpressionChallenge(ch, { origin: ORIGIN, method: 'POST', route: '/api/v1/render', armRole: 'probe', exchangeId: rec.exchangeId }, rec.exchangeId)
+      store.updateHostStamps(rec.exchangeId, { hostExpressionChallenge: bound })
+    }
+    return rec
   })
   return { store, controlId: control.exchangeId, probeIds: probes.map(p => p.exchangeId) }
 }
 
 test('host_evaluated_expression: host-minted challenge oracle verifies computed output across control/probe with leakage and reflection guards', () => {
+  const runId = 'run-sys-host-autodag-1'
   // (a) Single host-minted challenge: probe computes it, control does not leak it, request never echoes it.
-  const ch = defaultHostMintedOracle.mintExpressionChallenge('ssti')
+  const ch = defaultHostMintedOracle.mintExpressionChallenge('ssti', '*', { runId })
   const probeBody = JSON.stringify({ rendered: `rendered marker ${ch.expectedOutput} ok` })
   const fx = buildHeeStoreFixture([probeBody], 200, [ch])
   const claim = {
@@ -843,14 +849,14 @@ test('host_evaluated_expression: host-minted challenge oracle verifies computed 
     probeIds: fx.probeIds,
     hostMintedChallengeIds: [ch.challengeId],
   }
-  const res = evaluateClaim(fx.store, claim, {})
+  const res = evaluateClaim(fx.store, claim, { runId })
   assert.equal(res.passed, true, res.detail)
   assert.match(res.detail, /ssti/)
   assert.equal((res.observed as { family?: string }).family, 'ssti')
   assert.equal((res.observed as { challengeCount?: number }).challengeCount, 1)
 
   // (b) Unknown / unregistered challenge ids fail closed.
-  const unknown = evaluateClaim(fx.store, { ...claim, hostMintedChallengeIds: ['expr_does_not_exist'] }, {})
+  const unknown = evaluateClaim(fx.store, { ...claim, hostMintedChallengeIds: ['expr_does_not_exist'] }, { runId })
   assert.equal(unknown.passed, false)
   assert.equal((unknown.observed as { rejectedBy?: string }).rejectedBy, 'host_evaluated_expression')
   assert.deepEqual(describeMissingEvidence(unknown), ['host_minted_expression_oracle'])
@@ -882,7 +888,7 @@ test('host_evaluated_expression: host-minted challenge oracle verifies computed 
   const leakRes = evaluateClaim(leakStore, {
     kind: 'host_evaluated_expression', controlIds: [leakCtl.exchangeId], probeIds: [leakPrb.exchangeId],
     hostMintedChallengeIds: [ch.challengeId],
-  }, {})
+  }, { runId })
   assert.equal(leakRes.passed, false, 'control-arm leakage of the computed output must fail')
 
   // (d) Reflection: the computed output echoed in the probe request -> fail closed.
@@ -901,22 +907,23 @@ test('host_evaluated_expression: host-minted challenge oracle verifies computed 
   const reflectRes = evaluateClaim(reflectStore.store, {
     kind: 'host_evaluated_expression', controlIds: [reflectStore.controlId], probeIds: [reflectProbe.exchangeId],
     hostMintedChallengeIds: [ch.challengeId],
-  }, {})
+  }, { runId })
   assert.equal(reflectRes.passed, false, 'reflected (request-echoed) output must fail')
 
   // (e) Non-2xx probe or missing computed output fail closed.
   const errFx = buildHeeStoreFixture([JSON.stringify({ rendered: 'nothing computed here' })], 500, [ch])
-  const errRes = evaluateClaim(errFx.store, { ...claim, probeIds: errFx.probeIds }, {})
+  const errRes = evaluateClaim(errFx.store, { ...claim, probeIds: errFx.probeIds }, { runId })
   assert.equal(errRes.passed, false, 'non-2xx probes must fail')
   const absentFx = buildHeeStoreFixture([JSON.stringify({ rendered: 'no marker at all' })], 200, [ch])
-  const absentRes = evaluateClaim(absentFx.store, { ...claim, probeIds: absentFx.probeIds }, {})
+  const absentRes = evaluateClaim(absentFx.store, { ...claim, probeIds: absentFx.probeIds }, { runId })
   assert.equal(absentRes.passed, false, 'absent computed output must fail')
 })
 
 test('host_evaluated_expression: varying multi-challenge operands pass, repeated non-varying operands fail, and the claim is a first-class terminal oracle', () => {
+  const runId = 'run-sys-host-autodag-2'
   // (a) Two independently minted challenges with per-probe outputs.
-  const ch1 = defaultHostMintedOracle.mintExpressionChallenge('ssti')
-  const ch2 = defaultHostMintedOracle.mintExpressionChallenge('ssti')
+  const ch1 = defaultHostMintedOracle.mintExpressionChallenge('ssti', '*', { runId })
+  const ch2 = defaultHostMintedOracle.mintExpressionChallenge('ssti', '*', { runId })
   const fx = buildHeeStoreFixture([
     JSON.stringify({ rendered: `marker a ${ch1.expectedOutput}` }),
     JSON.stringify({ rendered: `marker b ${ch2.expectedOutput}` }),
@@ -927,16 +934,16 @@ test('host_evaluated_expression: varying multi-challenge operands pass, repeated
     probeIds: fx.probeIds,
     hostMintedChallengeIds: [ch1.challengeId, ch2.challengeId],
   }
-  const res = evaluateClaim(fx.store, claim, {})
+  const res = evaluateClaim(fx.store, claim, { runId })
   assert.equal(res.passed, true, res.detail)
   assert.equal((res.observed as { challengeCount?: number }).challengeCount, 2)
 
   // (b) Repeating the same challenge for two probes is non-varying operand laundering -> fail.
-  const repeatRes = evaluateClaim(fx.store, { ...claim, hostMintedChallengeIds: [ch1.challengeId, ch1.challengeId] }, {})
+  const repeatRes = evaluateClaim(fx.store, { ...claim, hostMintedChallengeIds: [ch1.challengeId, ch1.challengeId] }, { runId })
   assert.equal(repeatRes.passed, false, 'repeated identical operands across probes must fail')
 
   // (c) evaluateClaims: a passing host_evaluated_expression claim alone carries the whole oracle verdict.
-  const oracle = evaluateClaims(fx.store, [claim])
+  const oracle = evaluateClaims(fx.store, [claim], { runId })
   assert.equal(oracle.passed, true, JSON.stringify(oracle.failures))
   assert.equal(oracle.rejectedBy, null)
   assert.equal(oracle.checks.length, 1)

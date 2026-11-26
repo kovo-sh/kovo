@@ -54,11 +54,12 @@ function mkStep(overrides: Partial<ImpactStep> & Pick<ImpactStep, 'id' | 'arm' |
 
 test('R4-C-1: HostMintedOracle.mintBooleanPair enforces non-empty base, equal length, and identical char multiset', () => {
   const oracle = new HostMintedOracle()
-  assert.throws(() => oracle.mintBooleanPair(''), /non-empty baseValue/i)
-  assert.throws(() => oracle.mintBooleanPair('   '), /non-empty baseValue/i)
+  const runId = 'run-r4-c1-unit'
+  assert.throws(() => oracle.mintBooleanPair('', { binding: { runId } }), /non-empty baseValue/i)
+  assert.throws(() => oracle.mintBooleanPair('   ', { binding: { runId } }), /non-empty baseValue/i)
 
   for (const style of ['numeric', 'single_quote', 'double_quote'] as const) {
-    const pair = oracle.mintBooleanPair('42', { style, param: 'id' })
+    const pair = oracle.mintBooleanPair('42', { style, param: 'id', binding: { runId } })
     assert.equal(pair.trueValue.length, pair.falseValue.length, `${style}: equal length invariant`)
     assert.notEqual(pair.trueValue, pair.falseValue)
     assert.equal(
@@ -72,13 +73,13 @@ test('R4-C-1: HostMintedOracle.mintBooleanPair enforces non-empty base, equal le
     const trueStamp = oracle.stampBooleanPairArm(pair, 'true')
     const falseStamp = oracle.stampBooleanPairArm(pair, 'false')
     const baseStamp = oracle.stampBooleanPairArm(pair, 'baseline')
-    assert.ok(oracle.verifyBooleanPair(trueStamp))
-    assert.ok(oracle.verifyBooleanPair(falseStamp))
-    assert.ok(oracle.verifyBooleanPair(baseStamp))
+    assert.ok(oracle.verifyBooleanPair(trueStamp, { runId, armRole: 'true' }))
+    assert.ok(oracle.verifyBooleanPair(falseStamp, { runId, armRole: 'false' }))
+    assert.ok(oracle.verifyBooleanPair(baseStamp, { runId, armRole: 'baseline' }))
 
     // Tampering with mintedValue or unknown challengeId fails closed
-    assert.equal(oracle.verifyBooleanPair({ ...trueStamp, mintedValue: `${trueStamp.mintedValue}0` }), null)
-    assert.equal(oracle.verifyBooleanPair({ ...trueStamp, challengeId: 'bool_unregistered' }), null)
+    assert.equal(oracle.verifyBooleanPair({ ...trueStamp, mintedValue: `${trueStamp.mintedValue}0` }, { runId, armRole: 'true' }), null)
+    assert.equal(oracle.verifyBooleanPair({ ...trueStamp, challengeId: 'bool_unregistered' }, { runId, armRole: 'true' }), null)
   }
 })
 
@@ -126,42 +127,45 @@ test('R4-C-1: boolean and status_differential receipt rules reject unminted work
   assert.match(unmintedStatus.reason, /R4-C-1|hostBooleanPair/i)
 
   // Negative 3: Stamped pair with cross-status-class false arm (400) on `boolean` rule -> REJECT
-  const pair1 = oracle.mintBooleanPair('1', { param: 'id', style: 'numeric' })
-  const pair2 = oracle.mintBooleanPair('1', { param: 'id', style: 'numeric' })
+  const boolRunId = 'run-r4-c1-bool'
+  const pair1 = oracle.mintBooleanPair('1', { param: 'id', style: 'numeric', binding: { runId: boolRunId, origin: ORIGIN, method: 'GET', route: '/api/items', param: 'id' } })
+  const pair2 = oracle.mintBooleanPair('1', { param: 'id', style: 'numeric', binding: { runId: boolRunId, origin: ORIGIN, method: 'GET', route: '/api/items', param: 'id' } })
   const crossStatusBool = verifyReceipt(boolReceipt, {
+    runId: boolRunId,
     entries: [
-      { exchangeId: 'b1', origin: ORIGIN, evidenceRole: 'benign_baseline', hostBooleanPair: oracle.stampBooleanPairArm(pair1, 'baseline'), step: mkStep({ id: 'b1', arm: 'control', method: 'GET', route: '/api/items', pathAndQuery: `/api/items?id=${encodeURIComponent(pair1.baseValue)}`, status: 200, json: { item: { id: 1 } } }) },
-      { exchangeId: 'c1', origin: ORIGIN, hostBooleanPair: oracle.stampBooleanPairArm(pair1, 'true'), step: mkStep({ id: 'c1', arm: 'control', method: 'GET', route: '/api/items', pathAndQuery: `/api/items?id=${encodeURIComponent(pair1.trueValue)}`, status: 200, json: { item: { id: 1 } } }) },
-      { exchangeId: 'p1', origin: ORIGIN, hostBooleanPair: oracle.stampBooleanPairArm(pair1, 'false'), step: mkStep({ id: 'p1', arm: 'probe', method: 'GET', route: '/api/items', pathAndQuery: `/api/items?id=${encodeURIComponent(pair1.falseValue)}`, status: 400, json: { error: 'validation_failed' } }) },
-      { exchangeId: 'b2', origin: ORIGIN, evidenceRole: 'benign_baseline', hostBooleanPair: oracle.stampBooleanPairArm(pair2, 'baseline'), step: mkStep({ id: 'b2', arm: 'control', method: 'GET', route: '/api/items', pathAndQuery: `/api/items?id=${encodeURIComponent(pair2.baseValue)}`, status: 200, json: { item: { id: 1 } } }) },
-      { exchangeId: 'c2', origin: ORIGIN, hostBooleanPair: oracle.stampBooleanPairArm(pair2, 'true'), step: mkStep({ id: 'c2', arm: 'control', method: 'GET', route: '/api/items', pathAndQuery: `/api/items?id=${encodeURIComponent(pair2.trueValue)}`, status: 200, json: { item: { id: 1 } } }) },
-      { exchangeId: 'p2', origin: ORIGIN, hostBooleanPair: oracle.stampBooleanPairArm(pair2, 'false'), step: mkStep({ id: 'p2', arm: 'probe', method: 'GET', route: '/api/items', pathAndQuery: `/api/items?id=${encodeURIComponent(pair2.falseValue)}`, status: 400, json: { error: 'validation_failed' } }) },
+      { exchangeId: 'b1', origin: ORIGIN, evidenceRole: 'benign_baseline', hostBooleanPair: oracle.stampBooleanPairArm(pair1, 'baseline', { exchangeId: 'b1' }), step: mkStep({ id: 'b1', arm: 'control', method: 'GET', route: '/api/items', pathAndQuery: `/api/items?id=${encodeURIComponent(pair1.baseValue)}`, status: 200, json: { item: { id: 1 } } }) },
+      { exchangeId: 'c1', origin: ORIGIN, hostBooleanPair: oracle.stampBooleanPairArm(pair1, 'true', { exchangeId: 'c1' }), step: mkStep({ id: 'c1', arm: 'control', method: 'GET', route: '/api/items', pathAndQuery: `/api/items?id=${encodeURIComponent(pair1.trueValue)}`, status: 200, json: { item: { id: 1 } } }) },
+      { exchangeId: 'p1', origin: ORIGIN, hostBooleanPair: oracle.stampBooleanPairArm(pair1, 'false', { exchangeId: 'p1' }), step: mkStep({ id: 'p1', arm: 'probe', method: 'GET', route: '/api/items', pathAndQuery: `/api/items?id=${encodeURIComponent(pair1.falseValue)}`, status: 400, json: { error: 'validation_failed' } }) },
+      { exchangeId: 'b2', origin: ORIGIN, evidenceRole: 'benign_baseline', hostBooleanPair: oracle.stampBooleanPairArm(pair2, 'baseline', { exchangeId: 'b2' }), step: mkStep({ id: 'b2', arm: 'control', method: 'GET', route: '/api/items', pathAndQuery: `/api/items?id=${encodeURIComponent(pair2.baseValue)}`, status: 200, json: { item: { id: 1 } } }) },
+      { exchangeId: 'c2', origin: ORIGIN, hostBooleanPair: oracle.stampBooleanPairArm(pair2, 'true', { exchangeId: 'c2' }), step: mkStep({ id: 'c2', arm: 'control', method: 'GET', route: '/api/items', pathAndQuery: `/api/items?id=${encodeURIComponent(pair2.trueValue)}`, status: 200, json: { item: { id: 1 } } }) },
+      { exchangeId: 'p2', origin: ORIGIN, hostBooleanPair: oracle.stampBooleanPairArm(pair2, 'false', { exchangeId: 'p2' }), step: mkStep({ id: 'p2', arm: 'probe', method: 'GET', route: '/api/items', pathAndQuery: `/api/items?id=${encodeURIComponent(pair2.falseValue)}`, status: 400, json: { error: 'validation_failed' } }) },
     ],
-  }, { hostMintedOracle: oracle })
+  }, { hostMintedOracle: oracle, runId: boolRunId })
   assert.equal(crossStatusBool.confirmed, false, '4xx false arm on boolean rule must be rejected')
 
   // Negative 4: Stamped pair whose request parameter was swapped by worker (byte-for-byte mismatch) -> REJECT
   const swappedParamBool = verifyReceipt(boolReceipt, {
+    runId: boolRunId,
     entries: [
-      { exchangeId: 'b1', origin: ORIGIN, evidenceRole: 'benign_baseline', hostBooleanPair: oracle.stampBooleanPairArm(pair1, 'baseline'), step: mkStep({ id: 'b1', arm: 'control', method: 'GET', route: '/api/items', pathAndQuery: `/api/items?id=${encodeURIComponent(pair1.baseValue)}`, status: 200, json: { item: { id: 1 } } }) },
-      { exchangeId: 'c1', origin: ORIGIN, hostBooleanPair: oracle.stampBooleanPairArm(pair1, 'true'), step: mkStep({ id: 'c1', arm: 'control', method: 'GET', route: '/api/items', pathAndQuery: `/api/items?id=${encodeURIComponent(pair1.trueValue)}`, status: 200, json: { item: { id: 1 } } }) },
-      { exchangeId: 'p1', origin: ORIGIN, hostBooleanPair: oracle.stampBooleanPairArm(pair1, 'false'), step: mkStep({ id: 'p1', arm: 'probe', method: 'GET', route: '/api/items', pathAndQuery: `/api/items?id=${encodeURIComponent('999 AND 1=2')}`, status: 200, json: { item: null } }) },
-      { exchangeId: 'b2', origin: ORIGIN, evidenceRole: 'benign_baseline', hostBooleanPair: oracle.stampBooleanPairArm(pair2, 'baseline'), step: mkStep({ id: 'b2', arm: 'control', method: 'GET', route: '/api/items', pathAndQuery: `/api/items?id=${encodeURIComponent(pair2.baseValue)}`, status: 200, json: { item: { id: 1 } } }) },
-      { exchangeId: 'c2', origin: ORIGIN, hostBooleanPair: oracle.stampBooleanPairArm(pair2, 'true'), step: mkStep({ id: 'c2', arm: 'control', method: 'GET', route: '/api/items', pathAndQuery: `/api/items?id=${encodeURIComponent(pair2.trueValue)}`, status: 200, json: { item: { id: 1 } } }) },
-      { exchangeId: 'p2', origin: ORIGIN, hostBooleanPair: oracle.stampBooleanPairArm(pair2, 'false'), step: mkStep({ id: 'p2', arm: 'probe', method: 'GET', route: '/api/items', pathAndQuery: `/api/items?id=${encodeURIComponent(pair2.falseValue)}`, status: 200, json: { item: null } }) },
+      { exchangeId: 'b1', origin: ORIGIN, evidenceRole: 'benign_baseline', hostBooleanPair: oracle.stampBooleanPairArm(pair1, 'baseline', { exchangeId: 'b1' }), step: mkStep({ id: 'b1', arm: 'control', method: 'GET', route: '/api/items', pathAndQuery: `/api/items?id=${encodeURIComponent(pair1.baseValue)}`, status: 200, json: { item: { id: 1 } } }) },
+      { exchangeId: 'c1', origin: ORIGIN, hostBooleanPair: oracle.stampBooleanPairArm(pair1, 'true', { exchangeId: 'c1' }), step: mkStep({ id: 'c1', arm: 'control', method: 'GET', route: '/api/items', pathAndQuery: `/api/items?id=${encodeURIComponent(pair1.trueValue)}`, status: 200, json: { item: { id: 1 } } }) },
+      { exchangeId: 'p1', origin: ORIGIN, hostBooleanPair: oracle.stampBooleanPairArm(pair1, 'false', { exchangeId: 'p1' }), step: mkStep({ id: 'p1', arm: 'probe', method: 'GET', route: '/api/items', pathAndQuery: `/api/items?id=${encodeURIComponent('999 AND 1=2')}`, status: 200, json: { item: null } }) },
+      { exchangeId: 'b2', origin: ORIGIN, evidenceRole: 'benign_baseline', hostBooleanPair: oracle.stampBooleanPairArm(pair2, 'baseline', { exchangeId: 'b2' }), step: mkStep({ id: 'b2', arm: 'control', method: 'GET', route: '/api/items', pathAndQuery: `/api/items?id=${encodeURIComponent(pair2.baseValue)}`, status: 200, json: { item: { id: 1 } } }) },
+      { exchangeId: 'c2', origin: ORIGIN, hostBooleanPair: oracle.stampBooleanPairArm(pair2, 'true', { exchangeId: 'c2' }), step: mkStep({ id: 'c2', arm: 'control', method: 'GET', route: '/api/items', pathAndQuery: `/api/items?id=${encodeURIComponent(pair2.trueValue)}`, status: 200, json: { item: { id: 1 } } }) },
+      { exchangeId: 'p2', origin: ORIGIN, hostBooleanPair: oracle.stampBooleanPairArm(pair2, 'false', { exchangeId: 'p2' }), step: mkStep({ id: 'p2', arm: 'probe', method: 'GET', route: '/api/items', pathAndQuery: `/api/items?id=${encodeURIComponent(pair2.falseValue)}`, status: 200, json: { item: null } }) },
     ],
-  }, { hostMintedOracle: oracle })
+  }, { hostMintedOracle: oracle, runId: boolRunId })
   assert.equal(swappedParamBool.confirmed, false, 'mismatched parameter vs stamped mintedValue must be rejected')
 
   // Positive: Properly host-stamped pairs confirm on both boolean and status_differential via HostFactLog
-  const factLog = new HostFactLog()
-  factLog.recordExchange({ seq: 1, exchangeId: 'b1', arm: 'control', evidenceRole: 'benign_baseline', hostBooleanPair: oracle.stampBooleanPairArm(pair1, 'baseline'), method: 'GET', origin: ORIGIN, pathAndQuery: `/api/items?id=${encodeURIComponent(pair1.baseValue)}`, status: 200, rawResponseBody: '{"item":{"id":1,"sku":"A"}}' })
-  factLog.recordExchange({ seq: 2, exchangeId: 'c1', arm: 'control', hostBooleanPair: oracle.stampBooleanPairArm(pair1, 'true'), method: 'GET', origin: ORIGIN, pathAndQuery: `/api/items?id=${encodeURIComponent(pair1.trueValue)}`, status: 200, rawResponseBody: '{"item":{"id":1,"sku":"A"}}' })
-  factLog.recordExchange({ seq: 3, exchangeId: 'p1', arm: 'probe', hostBooleanPair: oracle.stampBooleanPairArm(pair1, 'false'), method: 'GET', origin: ORIGIN, pathAndQuery: `/api/items?id=${encodeURIComponent(pair1.falseValue)}`, status: 200, rawResponseBody: '{"item":null,"matches":0}' })
-  factLog.recordExchange({ seq: 4, exchangeId: 'b2', arm: 'control', evidenceRole: 'benign_baseline', hostBooleanPair: oracle.stampBooleanPairArm(pair2, 'baseline'), method: 'GET', origin: ORIGIN, pathAndQuery: `/api/items?id=${encodeURIComponent(pair2.baseValue)}`, status: 200, rawResponseBody: '{"item":{"id":1,"sku":"A"}}' })
-  factLog.recordExchange({ seq: 5, exchangeId: 'c2', arm: 'control', hostBooleanPair: oracle.stampBooleanPairArm(pair2, 'true'), method: 'GET', origin: ORIGIN, pathAndQuery: `/api/items?id=${encodeURIComponent(pair2.trueValue)}`, status: 200, rawResponseBody: '{"item":{"id":1,"sku":"A"}}' })
-  factLog.recordExchange({ seq: 6, exchangeId: 'p2', arm: 'probe', hostBooleanPair: oracle.stampBooleanPairArm(pair2, 'false'), method: 'GET', origin: ORIGIN, pathAndQuery: `/api/items?id=${encodeURIComponent(pair2.falseValue)}`, status: 200, rawResponseBody: '{"item":null,"matches":0}' })
-  const validBool = verifyReceipt(boolReceipt, factLog.toReceiptTranscript(), { hostMintedOracle: oracle })
+  const factLog = new HostFactLog({ runId: boolRunId })
+  factLog.recordExchange({ seq: 1, exchangeId: 'b1', arm: 'control', evidenceRole: 'benign_baseline', hostBooleanPair: oracle.stampBooleanPairArm(pair1, 'baseline', { exchangeId: 'b1' }), method: 'GET', origin: ORIGIN, pathAndQuery: `/api/items?id=${encodeURIComponent(pair1.baseValue)}`, status: 200, rawResponseBody: '{"item":{"id":1,"sku":"A"}}' })
+  factLog.recordExchange({ seq: 2, exchangeId: 'c1', arm: 'control', hostBooleanPair: oracle.stampBooleanPairArm(pair1, 'true', { exchangeId: 'c1' }), method: 'GET', origin: ORIGIN, pathAndQuery: `/api/items?id=${encodeURIComponent(pair1.trueValue)}`, status: 200, rawResponseBody: '{"item":{"id":1,"sku":"A"}}' })
+  factLog.recordExchange({ seq: 3, exchangeId: 'p1', arm: 'probe', hostBooleanPair: oracle.stampBooleanPairArm(pair1, 'false', { exchangeId: 'p1' }), method: 'GET', origin: ORIGIN, pathAndQuery: `/api/items?id=${encodeURIComponent(pair1.falseValue)}`, status: 200, rawResponseBody: '{"item":null,"matches":0}' })
+  factLog.recordExchange({ seq: 4, exchangeId: 'b2', arm: 'control', evidenceRole: 'benign_baseline', hostBooleanPair: oracle.stampBooleanPairArm(pair2, 'baseline', { exchangeId: 'b2' }), method: 'GET', origin: ORIGIN, pathAndQuery: `/api/items?id=${encodeURIComponent(pair2.baseValue)}`, status: 200, rawResponseBody: '{"item":{"id":1,"sku":"A"}}' })
+  factLog.recordExchange({ seq: 5, exchangeId: 'c2', arm: 'control', hostBooleanPair: oracle.stampBooleanPairArm(pair2, 'true', { exchangeId: 'c2' }), method: 'GET', origin: ORIGIN, pathAndQuery: `/api/items?id=${encodeURIComponent(pair2.trueValue)}`, status: 200, rawResponseBody: '{"item":{"id":1,"sku":"A"}}' })
+  factLog.recordExchange({ seq: 6, exchangeId: 'p2', arm: 'probe', hostBooleanPair: oracle.stampBooleanPairArm(pair2, 'false', { exchangeId: 'p2' }), method: 'GET', origin: ORIGIN, pathAndQuery: `/api/items?id=${encodeURIComponent(pair2.falseValue)}`, status: 200, rawResponseBody: '{"item":null,"matches":0}' })
+  const validBool = verifyReceipt(boolReceipt, factLog.toReceiptTranscript(), { hostMintedOracle: oracle, runId: boolRunId })
   assert.equal(validBool.confirmed, true, validBool.reason)
   assert.equal(validBool.evidence?.hostMinted, true)
 })
@@ -172,8 +176,9 @@ test('R4-C-1: boolean and status_differential receipt rules reject unminted work
 
 test('R4-C-2: worker-sent probes without per-exchange hostExpressionChallenge stamp are rejected in both verifyReceipt and evaluateClaim', () => {
   const oracle = new HostMintedOracle()
-  const ch1 = oracle.mintExpressionChallenge('ssti')
-  const ch2 = oracle.mintExpressionChallenge('ssti')
+  const runId = 'run-r4-c2-neg'
+  const ch1 = oracle.mintExpressionChallenge('ssti', '*', { runId })
+  const ch2 = oracle.mintExpressionChallenge('ssti', '*', { runId })
 
   const receipt = buildProofReceipt({
     vulnClass: 'ssti',
@@ -196,7 +201,7 @@ test('R4-C-2: worker-sent probes without per-exchange hostExpressionChallenge st
   assert.equal(receiptVerdict.confirmed, false, 'worker-sent probe citing transcript-wide hostExpressionChallenges must be rejected')
 
   // Same check through evaluateClaim('host_evaluated_expression') using defaultHostMintedOracle
-  const defCh = defaultHostMintedOracle.mintExpressionChallenge('ssti')
+  const defCh = defaultHostMintedOracle.mintExpressionChallenge('ssti', '*', { runId })
   const store = new TranscriptStore()
   const ctl = store.record({
     op: 'http', startedAt: 1000, durationMs: 5,
@@ -221,7 +226,8 @@ test('R4-C-2: worker-sent probes without per-exchange hostExpressionChallenge st
 
 test('R4-C-2: malformed percent-escape echo, tag-stripped echo, zero-width echo, NFKC echo, and JSON unicode echo all reject', () => {
   const oracle = new HostMintedOracle()
-  const ch = oracle.mintExpressionChallenge('ssti')
+  const runId = 'run-r4-c2-echo'
+  const ch = oracle.mintExpressionChallenge('ssti', '*', { runId })
   const digits = ch.expectedOutput.split('')
 
   // 1) Malformed percent-escape in sibling query param alongside percent-encoded expected output -> FAIL CLOSED
@@ -235,6 +241,7 @@ test('R4-C-2: malformed percent-escape echo, tag-stripped echo, zero-width echo,
     controlBodies: ['Hello benign'],
     stampedChallenge: ch,
     oracle,
+    binding: { runId },
   })
   assert.equal(malformedCheck.ok, false, 'malformed percent-escape echo must fail closed')
   assert.match(malformedCheck.reason, /malformed/i)
@@ -250,6 +257,7 @@ test('R4-C-2: malformed percent-escape echo, tag-stripped echo, zero-width echo,
     controlBodies: ['Hello benign'],
     stampedChallenge: ch,
     oracle,
+    binding: { runId },
   })
   assert.equal(tagCheck.ok, false, 'tag-stripped expression echo must be rejected')
 
@@ -264,6 +272,7 @@ test('R4-C-2: malformed percent-escape echo, tag-stripped echo, zero-width echo,
     controlBodies: ['Hello benign'],
     stampedChallenge: ch,
     oracle,
+    binding: { runId },
   })
   assert.equal(zwCheck.ok, false, 'zero-width/non-digit split echo must be rejected')
 
@@ -278,11 +287,12 @@ test('R4-C-2: malformed percent-escape echo, tag-stripped echo, zero-width echo,
     controlBodies: ['Hello benign'],
     stampedChallenge: ch,
     oracle,
+    binding: { runId },
   })
   assert.equal(nfkcCheck.ok, false, 'NFKC fullwidth digit echo must be rejected')
 
   // 5) JSON unicode-escaped digits in request body -> REJECT (also verify via evaluateClaim!)
-  const defCh = defaultHostMintedOracle.mintExpressionChallenge('ssti')
+  const defCh = defaultHostMintedOracle.mintExpressionChallenge('ssti', '*', { runId })
   const jsonUniDigits = defCh.expectedOutput.split('').map(d => `\\u00${d.charCodeAt(0).toString(16)}`).join('')
   const rawJsonBody = `{"template":"{{${defCh.expressionSyntax}}} ${jsonUniDigits}"}`
   const store = new TranscriptStore()
@@ -306,7 +316,7 @@ test('R4-C-2: malformed percent-escape echo, tag-stripped echo, zero-width echo,
     controlIds: [ctl.exchangeId],
     probeIds: [uniPrb.exchangeId],
     hostMintedChallengeIds: [defCh.challengeId],
-  }, {})
+  }, { runId })
   assert.equal(uniClaim.passed, false, 'JSON unicode-escaped expression echo must be rejected by evaluateClaim')
 
   // 6) Genuine non-reflected host-stamped expression probe -> PASS
@@ -319,6 +329,7 @@ test('R4-C-2: malformed percent-escape echo, tag-stripped echo, zero-width echo,
     controlBodies: ['Hello benign'],
     stampedChallenge: ch,
     oracle,
+    binding: { runId },
   })
   assert.equal(cleanCheck.ok, true, cleanCheck.reason)
 

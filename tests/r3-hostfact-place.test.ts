@@ -590,7 +590,7 @@ test('R3-C-3: bare [redacted] and [redacted:...] placeholders in injection/marku
 
   // 4) proof-receipt.ts: host-minted expression evaluation with bare [redacted] fails closed
   const oracle = new HostMintedOracle()
-  const ch = oracle.mintExpressionChallenge('ssti')
+  const ch = oracle.mintExpressionChallenge('ssti', '*', { runId: 'run-r3-hfp-expr' })
   const sstiReceipt = buildProofReceipt({
     vulnClass: 'ssti',
     target: { origin: ORIGIN, method: 'GET', pathAndQuery: '/tpl?secret=[redacted]' },
@@ -673,18 +673,20 @@ test('R3-C-4: integer-coercion boolean triangle fails closed in statusDifferenti
 
   // 3) Positive control: host-minted identical-base pair across baseline/true/false confirms (R4-C-1)
   const statusOracle = new HostMintedOracle()
-  const pair1 = statusOracle.mintBooleanPair('1', { param: 'id', style: 'numeric' })
-  const pair2 = statusOracle.mintBooleanPair('1', { param: 'id', style: 'numeric' })
+  const statusRunId = 'run-r3-hfp-status'
+  const pair1 = statusOracle.mintBooleanPair('1', { param: 'id', style: 'numeric', binding: { runId: statusRunId, origin: ORIGIN, method: 'GET', route: '/api/items', param: 'id' } })
+  const pair2 = statusOracle.mintBooleanPair('1', { param: 'id', style: 'numeric', binding: { runId: statusRunId, origin: ORIGIN, method: 'GET', route: '/api/items', param: 'id' } })
   const validStatus = verifyReceipt(mkStatusReceipt(['b1', 't1', 'f1', 'b2', 't2', 'f2']), {
+    runId: statusRunId,
     entries: [
-      { exchangeId: 'b1', origin: ORIGIN, evidenceRole: 'benign_baseline', hostBooleanPair: statusOracle.stampBooleanPairArm(pair1, 'baseline'), step: mkStep({ id: 'b1', arm: 'control', method: 'GET', route: '/api/items', pathAndQuery: `/api/items?id=${encodeURIComponent(pair1.baseValue)}`, status: 200, evidenceRole: 'benign_baseline', body: '{"id":1}' }) },
-      { exchangeId: 't1', origin: ORIGIN, evidenceRole: 'tautology', hostBooleanPair: statusOracle.stampBooleanPairArm(pair1, 'true'), step: mkStep({ id: 't1', arm: 'probe', method: 'GET', route: '/api/items', pathAndQuery: `/api/items?id=${encodeURIComponent(pair1.trueValue)}`, status: 200, evidenceRole: 'tautology', body: '{"id":1}' }) },
-      { exchangeId: 'f1', origin: ORIGIN, evidenceRole: 'contradiction', hostBooleanPair: statusOracle.stampBooleanPairArm(pair1, 'false'), step: mkStep({ id: 'f1', arm: 'probe', method: 'GET', route: '/api/items', pathAndQuery: `/api/items?id=${encodeURIComponent(pair1.falseValue)}`, status: 404, evidenceRole: 'contradiction', body: '{"error":"not_found"}' }) },
-      { exchangeId: 'b2', origin: ORIGIN, evidenceRole: 'benign_baseline', hostBooleanPair: statusOracle.stampBooleanPairArm(pair2, 'baseline'), step: mkStep({ id: 'b2', arm: 'control', method: 'GET', route: '/api/items', pathAndQuery: `/api/items?id=${encodeURIComponent(pair2.baseValue)}`, status: 200, evidenceRole: 'benign_baseline', body: '{"id":1}' }) },
-      { exchangeId: 't2', origin: ORIGIN, evidenceRole: 'tautology', hostBooleanPair: statusOracle.stampBooleanPairArm(pair2, 'true'), step: mkStep({ id: 't2', arm: 'probe', method: 'GET', route: '/api/items', pathAndQuery: `/api/items?id=${encodeURIComponent(pair2.trueValue)}`, status: 200, evidenceRole: 'tautology', body: '{"id":1}' }) },
-      { exchangeId: 'f2', origin: ORIGIN, evidenceRole: 'contradiction', hostBooleanPair: statusOracle.stampBooleanPairArm(pair2, 'false'), step: mkStep({ id: 'f2', arm: 'probe', method: 'GET', route: '/api/items', pathAndQuery: `/api/items?id=${encodeURIComponent(pair2.falseValue)}`, status: 404, evidenceRole: 'contradiction', body: '{"error":"not_found"}' }) },
+      { exchangeId: 'b1', origin: ORIGIN, evidenceRole: 'benign_baseline', hostBooleanPair: statusOracle.stampBooleanPairArm(pair1, 'baseline', { exchangeId: 'b1' }), step: mkStep({ id: 'b1', arm: 'control', method: 'GET', route: '/api/items', pathAndQuery: `/api/items?id=${encodeURIComponent(pair1.baseValue)}`, status: 200, evidenceRole: 'benign_baseline', body: '{"id":1}' }) },
+      { exchangeId: 't1', origin: ORIGIN, evidenceRole: 'tautology', hostBooleanPair: statusOracle.stampBooleanPairArm(pair1, 'true', { exchangeId: 't1' }), step: mkStep({ id: 't1', arm: 'probe', method: 'GET', route: '/api/items', pathAndQuery: `/api/items?id=${encodeURIComponent(pair1.trueValue)}`, status: 200, evidenceRole: 'tautology', body: '{"id":1}' }) },
+      { exchangeId: 'f1', origin: ORIGIN, evidenceRole: 'contradiction', hostBooleanPair: statusOracle.stampBooleanPairArm(pair1, 'false', { exchangeId: 'f1' }), step: mkStep({ id: 'f1', arm: 'probe', method: 'GET', route: '/api/items', pathAndQuery: `/api/items?id=${encodeURIComponent(pair1.falseValue)}`, status: 404, evidenceRole: 'contradiction', body: '{"error":"not_found"}' }) },
+      { exchangeId: 'b2', origin: ORIGIN, evidenceRole: 'benign_baseline', hostBooleanPair: statusOracle.stampBooleanPairArm(pair2, 'baseline', { exchangeId: 'b2' }), step: mkStep({ id: 'b2', arm: 'control', method: 'GET', route: '/api/items', pathAndQuery: `/api/items?id=${encodeURIComponent(pair2.baseValue)}`, status: 200, evidenceRole: 'benign_baseline', body: '{"id":1}' }) },
+      { exchangeId: 't2', origin: ORIGIN, evidenceRole: 'tautology', hostBooleanPair: statusOracle.stampBooleanPairArm(pair2, 'true', { exchangeId: 't2' }), step: mkStep({ id: 't2', arm: 'probe', method: 'GET', route: '/api/items', pathAndQuery: `/api/items?id=${encodeURIComponent(pair2.trueValue)}`, status: 200, evidenceRole: 'tautology', body: '{"id":1}' }) },
+      { exchangeId: 'f2', origin: ORIGIN, evidenceRole: 'contradiction', hostBooleanPair: statusOracle.stampBooleanPairArm(pair2, 'false', { exchangeId: 'f2' }), step: mkStep({ id: 'f2', arm: 'probe', method: 'GET', route: '/api/items', pathAndQuery: `/api/items?id=${encodeURIComponent(pair2.falseValue)}`, status: 404, evidenceRole: 'contradiction', body: '{"error":"not_found"}' }) },
     ],
-  }, { hostMintedOracle: statusOracle })
+  }, { hostMintedOracle: statusOracle, runId: statusRunId })
   assert.equal(validStatus.confirmed, true, 'identical-base status_differential triangle must confirm')
 })
 

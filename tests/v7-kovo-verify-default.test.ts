@@ -277,7 +277,10 @@ test('kovo_verify ProofReceipt cleanly supports BOLA (CWE-639) boundary claims a
   assert.equal(bolaVerdict.confirmed, true, bolaVerdict.reason)
 
   // 2. SSTI via R2-C-6 host-minted evaluated expression (`kind: 'host_evaluated_expression'`)
-  const sstiChallenge = defaultHostMintedOracle.mintExpressionChallenge('ssti')
+  const sstiRunId = 'run-v7-kovo-verify-ssti'
+  const sstiChallenge = defaultHostMintedOracle.mintExpressionChallenge('ssti', '*', {
+    runId: sstiRunId, origin: ORIGIN, method: 'GET', route: '/api/v1/reports/render', param: 'tpl', armRole: 'probe', exchangeId: 'ex-p',
+  })
   const sstiExchanges: ScriptProofExchange[] = [
     {
       exchangeId: 'ex-c', method: 'GET', pathAndQuery: '/api/v1/reports/render?tpl=hello', origin: ORIGIN,
@@ -291,6 +294,7 @@ test('kovo_verify ProofReceipt cleanly supports BOLA (CWE-639) boundary claims a
   ]
   const sstiBuilt = buildAgentScriptReceipt({
     origin: ORIGIN,
+    runId: sstiRunId,
     title: 'Report SSTI template evaluation',
     exchanges: sstiExchanges,
     claims: [
@@ -305,7 +309,7 @@ test('kovo_verify ProofReceipt cleanly supports BOLA (CWE-639) boundary claims a
   assert.ok(sstiBuilt, 'host-minted evaluated-expression claim must build an SSTI ProofReceipt')
   assert.equal(sstiBuilt.receipt.vulnClass, 'ssti')
   assert.equal(agentProofAttribution(sstiBuilt.receipt.vulnClass).cwe, 'CWE-1336')
-  const sstiVerdict = verifyReceipt(sstiBuilt.receipt, sstiBuilt.transcript)
+  const sstiVerdict = verifyReceipt(sstiBuilt.receipt, sstiBuilt.transcript, { runId: sstiRunId })
   assert.equal(sstiVerdict.confirmed, true, sstiVerdict.reason)
 
   // 3. Anti-reflection: raw reflection where the request itself contained expectedOutput MUST fail closed,

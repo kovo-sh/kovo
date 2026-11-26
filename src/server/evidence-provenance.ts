@@ -247,12 +247,15 @@ export function deriveHostObservedDeletionTenant(steps: readonly ImpactStep[], m
   return hasBefore ? foreignTenant : null
 }
 
-/** True when an authenticated probe's JSON response body embeds its own actor's tenant marker (N3). */
-export function stepHasOwnTenantMarker(step: ImpactStep): boolean {
-  const pt = step.actor.tenant?.toLowerCase()
-  if (!pt) return false
-  const raw = step.json !== undefined ? JSON.stringify(step.json) : typeof step.body === 'string' ? step.body : ''
-  return raw.toLowerCase().includes(`"${pt}"`)
+/**
+ * True when an authenticated disclosure probe targets an admin/privileged function surface as a
+ * lower-privileged role (`viewer`/`member`, rank < `admin`). Prevents benign self-service API-key
+ * readback from receiving credential-pattern boundary credit (`N3'`).
+ */
+export function isAdminDisclosureSurfaceForLowerRole(step: ImpactStep): boolean {
+  const rank = HOST_ROLE_RANK[(step.actor.role ?? '').toLowerCase()] ?? 0
+  if (rank <= 0 || rank >= HOST_ROLE_RANK.admin!) return false
+  return ADMIN_FUNCTION_SURFACE_RE.test(step.route ?? step.pathAndQuery ?? '')
 }
 
 /** Host-derived required role strictly from host-recorded transcript steps (zero worker `requiredRole` scalars). */

@@ -7,11 +7,14 @@
     "files": [
       "src/server/composite-receipt.ts",
       "src/server/evidence-provenance.ts",
+      "src/server/floor-recipes.ts",
       "src/server/host-fact-log.ts",
       "src/server/nonce-ledger.ts",
       "src/server/proof-receipt.ts",
       "src/server/terminal-oracle-registry.ts",
-      "src/server/verify-prove-handlers.ts"
+      "src/server/verify-claims.ts",
+      "src/server/verify-prove-handlers.ts",
+      "src/server/verify-rpc.ts"
     ],
     "classes": [
       "bola",

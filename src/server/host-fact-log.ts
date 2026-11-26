@@ -36,6 +36,7 @@ import type {
 } from './composite-receipt.ts'
 import type {
   HostMintedExpressionChallenge,
+  HostMintedRedirectCanary,
   HostMintedTimingChallenge,
   HostStampedBooleanPair,
   ReceiptBrowserTrace,
@@ -198,6 +199,7 @@ export interface HostExchangeFact {
   readonly hostTimingChallenge?: HostMintedTimingChallenge
   readonly hostBooleanPair?: HostStampedBooleanPair
   readonly hostRedirectCanaryHost?: string | null
+  readonly hostRedirectCanary?: HostMintedRedirectCanary
   readonly oobCallbacks: readonly HostOobCallbackFact[]
   readonly durationMs: number
   readonly startedAt?: number
@@ -251,6 +253,7 @@ export interface HostExchangeFactInput {
   hostTimingChallenge?: HostMintedTimingChallenge
   hostBooleanPair?: HostStampedBooleanPair
   hostRedirectCanaryHost?: string | null
+  hostRedirectCanary?: HostMintedRedirectCanary
   armProvenance?: ArmProvenance
   oobCallbacks?: readonly HostOobCallbackFact[]
   durationMs?: number
@@ -302,6 +305,8 @@ export interface HostFactLogOptions {
   assertCleanRequestPlane?: boolean
   /** H-14: Optional HMAC-SHA256 signing key used to sign host fact entries (including `wireCredentialProvenance`). */
   signingKey?: string
+  /** R3-16: Host run identifier propagated into transcripts for per-run HMAC nonce verification. */
+  runId?: string
 }
 
 function canonicalStringifyForSign(value: unknown): string {
@@ -805,12 +810,14 @@ export class HostFactLog {
   private readonly sanitizer: EgressSanitizer
   private readonly assertCleanRequestPlane: boolean
   private readonly signingKey?: string
+  readonly runId?: string
   private nextSeq = 0
 
   constructor(options: HostFactLogOptions = {}) {
     this.sanitizer = options.sanitizer ?? createEgressSanitizer()
     this.assertCleanRequestPlane = options.assertCleanRequestPlane === true
     this.signingKey = options.signingKey
+    this.runId = options.runId
   }
 
   get size(): number {
@@ -934,6 +941,7 @@ export class HostFactLog {
       ...(input.hostTimingChallenge ? { hostTimingChallenge: Object.freeze({ ...input.hostTimingChallenge }) } : {}),
       ...(input.hostBooleanPair ? { hostBooleanPair: Object.freeze({ ...input.hostBooleanPair }) } : {}),
       ...(input.hostRedirectCanaryHost !== undefined ? { hostRedirectCanaryHost: input.hostRedirectCanaryHost } : {}),
+      ...(input.hostRedirectCanary ? { hostRedirectCanary: Object.freeze({ ...input.hostRedirectCanary }) } : {}),
       oobCallbacks,
       durationMs: Math.max(0, Number.isFinite(input.durationMs ?? 0) ? (input.durationMs ?? 0) : 0),
       ...(input.startedAt !== undefined ? { startedAt: input.startedAt } : {}),
@@ -1233,6 +1241,7 @@ export class HostFactLog {
         ...(fact.hostTimingChallenge ? { hostTimingChallenge: fact.hostTimingChallenge } : {}),
         ...(fact.hostBooleanPair ? { hostBooleanPair: fact.hostBooleanPair } : {}),
         ...(fact.hostRedirectCanaryHost !== undefined ? { hostRedirectCanaryHost: fact.hostRedirectCanaryHost } : {}),
+        ...(fact.hostRedirectCanary ? { hostRedirectCanary: fact.hostRedirectCanary } : {}),
         ...(fact.armProvenance ? { armProvenance: fact.armProvenance } : {}),
       }
     })
@@ -1240,6 +1249,7 @@ export class HostFactLog {
       entries,
       oobEvents: this.listOobEvents().map(ev => ({ ...ev })),
       browserTraces: this.listBrowserTraces().map(tr => ({ ...tr })),
+      ...(this.runId ? { runId: this.runId } : {}),
     }
   }
 
@@ -1285,6 +1295,7 @@ export class HostFactLog {
       ...(fact.hostTimingChallenge ? { hostTimingChallenge: fact.hostTimingChallenge } : {}),
       ...(fact.hostBooleanPair ? { hostBooleanPair: fact.hostBooleanPair } : {}),
       ...(fact.hostRedirectCanaryHost !== undefined ? { hostRedirectCanaryHost: fact.hostRedirectCanaryHost } : {}),
+      ...(fact.hostRedirectCanary ? { hostRedirectCanary: fact.hostRedirectCanary } : {}),
       ...(fact.armProvenance ? { armProvenance: fact.armProvenance } : {}),
       timestampMs: ts,
       actorPersona: fact.actor,
@@ -1344,6 +1355,7 @@ export class HostFactLog {
       oobEvents: this.listOobEvents().map(ev => ({ ...ev })),
       browserTraces: this.listBrowserTraces().map(tr => ({ ...tr })),
       asyncPollRecords: this.listAsyncPolls().map(p => ({ ...p })),
+      ...(this.runId ? { runId: this.runId } : {}),
     }
   }
 
@@ -1352,7 +1364,7 @@ export class HostFactLog {
     transcript: ReceiptTranscript | HostSignedTranscript,
     options?: HostFactLogOptions,
   ): HostFactLog {
-    const log = new HostFactLog(options)
+    const log = new HostFactLog({ ...options, ...(options?.runId ?? transcript.runId ? { runId: options?.runId ?? transcript.runId } : {}) })
     const entries = transcript.entries ?? []
     entries.forEach((rawEntry, index) => {
       const entry = rawEntry as HostTranscriptEntry
@@ -1390,6 +1402,7 @@ export class HostFactLog {
         ...(entry.hostTimingChallenge ? { hostTimingChallenge: entry.hostTimingChallenge } : {}),
         ...(entry.hostBooleanPair ? { hostBooleanPair: entry.hostBooleanPair } : {}),
         ...(entry.hostRedirectCanaryHost !== undefined ? { hostRedirectCanaryHost: entry.hostRedirectCanaryHost } : {}),
+        ...(entry.hostRedirectCanary ? { hostRedirectCanary: entry.hostRedirectCanary } : {}),
         durationMs: entry.durationMs ?? step.durationMs ?? 0,
         ...(entry.startedAt !== undefined ? { startedAt: entry.startedAt } : {}),
         ...(entry.endedAt !== undefined ? { endedAt: entry.endedAt } : {}),
@@ -1485,9 +1498,11 @@ export class HostFactLog {
       rawResponseBodies?: ReadonlyMap<string, string>
       hostTranscript?: HostSignedTranscript | null
       sanitizer?: EgressSanitizer
+      runId?: string
     },
   ): HostFactLog {
-    const log = new HostFactLog({ sanitizer: opts?.sanitizer })
+    const effRunId = opts?.runId ?? opts?.hostTranscript?.runId
+    const log = new HostFactLog({ sanitizer: opts?.sanitizer, ...(effRunId ? { runId: effRunId } : {}) })
     const hostEntriesById = new Map((opts?.hostTranscript?.entries ?? []).map(e => [e.exchangeId, e]))
     for (const record of store.list() as readonly VerifyTranscriptRecord[]) {
       const hostEntry = hostEntriesById.get(record.exchangeId)
@@ -1563,9 +1578,10 @@ export class HostFactLog {
           ? { raceBatchId: reqExtra?.raceBatchId ?? hostEntry?.raceBatchId }
           : {}),
         ...(hostEntry?.hostExpressionChallenge ?? record.hostExpressionChallenge ? { hostExpressionChallenge: hostEntry?.hostExpressionChallenge ?? record.hostExpressionChallenge } : {}),
-        ...(hostEntry?.hostTimingChallenge ? { hostTimingChallenge: hostEntry.hostTimingChallenge } : {}),
+        ...(hostEntry?.hostTimingChallenge ?? record.hostTimingStamp ? { hostTimingChallenge: hostEntry?.hostTimingChallenge ?? record.hostTimingStamp } : {}),
         ...(hostEntry?.hostBooleanPair ?? record.hostBooleanPair ? { hostBooleanPair: hostEntry?.hostBooleanPair ?? record.hostBooleanPair } : {}),
-        ...(hostEntry?.hostRedirectCanaryHost !== undefined ? { hostRedirectCanaryHost: hostEntry.hostRedirectCanaryHost } : {}),
+        ...((hostEntry?.hostRedirectCanaryHost ?? record.hostRedirectHost ?? record.hostRedirectCanary?.host) !== undefined ? { hostRedirectCanaryHost: hostEntry?.hostRedirectCanaryHost ?? record.hostRedirectHost ?? record.hostRedirectCanary?.host } : {}),
+        ...(hostEntry?.hostRedirectCanary ?? record.hostRedirectCanary ? { hostRedirectCanary: hostEntry?.hostRedirectCanary ?? record.hostRedirectCanary } : {}),
         durationMs: record.durationMs,
         startedAt: record.startedAt,
         endedAt: record.startedAt + Math.max(0, record.durationMs),

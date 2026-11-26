@@ -1249,8 +1249,8 @@ export class VerifyRpcServer {
       const record = this.transcript.record({
         op: proto, startedAt: started, durationMs: result.durationMs, request: stampedReqMeta, body: result.body,
         ...(prep.applied.brokerRequest.body !== undefined ? { rawRequestBody: this.scrubKernel(prep.applied.brokerRequest.body) } : {}),
-        ...(hostStamps?.hostExpressionChallenge ? { hostExpressionChallenge: hostStamps.hostExpressionChallenge } : {}),
-        ...(hostStamps?.hostBooleanPair ? { hostBooleanPair: hostStamps.hostBooleanPair } : {}),
+        ...(hostStamps?.hostExpressionChallenge ? { hostExpressionChallenge: hostStamps.hostExpressionChallenge } : {}), ...(hostStamps?.timingChallenge ? { hostTimingStamp: hostStamps.timingChallenge } : {}),
+        ...(hostStamps?.hostBooleanPair ? { hostBooleanPair: hostStamps.hostBooleanPair } : {}), ...(hostStamps?.redirectCanaryHost !== undefined ? { hostRedirectHost: hostStamps.redirectCanaryHost } : {}), ...(hostStamps?.redirectCanary ? { hostRedirectCanary: hostStamps.redirectCanary } : {}),
         response: {
           status: result.status, headers: kernelHeaders, bodyBytes: result.bodyBytes,
           bodySha256: result.bodySha256, mediaType: result.mediaType, redirectOrigins: result.redirectOrigins,
@@ -2169,8 +2169,8 @@ export class VerifyRpcServer {
         ...(prov?.cleanSession !== undefined ? { cleanSession: prov.cleanSession } : {}),
         ...(prov?.replayAttempt ? { replayAttempt: prov.replayAttempt } : {}),
         ...(prov?.raceBatchId ? { raceBatchId: prov.raceBatchId } : {}),
-        ...(record.hostExpressionChallenge ? { hostExpressionChallenge: record.hostExpressionChallenge } : {}),
-        ...(record.hostBooleanPair ? { hostBooleanPair: record.hostBooleanPair } : {}),
+        ...(record.hostExpressionChallenge ? { hostExpressionChallenge: record.hostExpressionChallenge } : {}), ...(record.hostTimingStamp ? { hostTimingChallenge: record.hostTimingStamp } : {}),
+        ...(record.hostBooleanPair ? { hostBooleanPair: record.hostBooleanPair } : {}), ...((record.hostRedirectHost ?? record.hostRedirectCanary?.host) !== undefined ? { hostRedirectCanaryHost: record.hostRedirectHost ?? record.hostRedirectCanary?.host } : {}), ...(record.hostRedirectCanary ? { hostRedirectCanary: record.hostRedirectCanary } : {}),
       }
       entries.push(sign(entry))
     }
@@ -2179,7 +2179,7 @@ export class VerifyRpcServer {
       asyncPollRecords.push(sign(poll))
     }
 
-    return { entries, oobEvents, browserTraces, asyncPollRecords }
+    return { entries, oobEvents, browserTraces, asyncPollRecords, runId: this.options.runId }
   }
 
   /** Verify a host-signed transcript record against this session's private HMAC key without exposing the key. */
@@ -2260,7 +2260,7 @@ export class VerifyRpcServer {
 
   private proveHost(): ProveHandlerHost {
     return {
-      transcript: this.transcript, defaultOrigin: this.options.targetOrigins?.[0],
+      runId: this.options.runId, transcript: this.transcript, defaultOrigin: this.options.targetOrigins?.[0],
       canaryBroker: this.options.canary ?? (this.options.grant as Grant & { canaryBroker?: VerifyCanaryBroker }).canaryBroker,
       diffDigestKey: this.compositeSigningKey,
       runHttpExchange: async (args, nonce, stamps) => await this.handleHttp(args, nonce, 'http', stamps) as ProveHttpExchangeResult,

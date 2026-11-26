@@ -21,8 +21,6 @@ import { registerRunDisposer } from './run-disposers.ts'
 
 export type NonceOracleId = 'timing' | 'redirect' | 'boolean' | 'expression' | 'canary'
 
-export const DEFAULT_NONCE_RUN_ID = 'default_host_run'
-
 /** Authoritative mapping of non-nonce binding kinds preserved alongside nonce-bound oracles. */
 export const NON_NONCE_ORACLE_BINDING_KINDS: ReadonlySet<OracleBindingKind> = new Set([
   'persona_tenant',
@@ -59,7 +57,7 @@ export interface NonceStamp {
 }
 
 export interface NonceVerifyExpected {
-  readonly runId?: string | null
+  readonly runId: string
   readonly oracleId: NonceOracleId
   readonly armRole?: string | null
   readonly origin?: string | null
@@ -125,41 +123,6 @@ export function stampMatchesChallengeId(stampId: string, challengeId: string): b
   return stampId === challengeId || stampId.startsWith(`${challengeId}@`)
 }
 
-/**
- * Build the expected `NonceBinding` tuple for receipt verification (`B1`):
- *  - On run-scoped stamps (`effectiveRunId` present or `stamp.runId !== DEFAULT_NONCE_RUN_ID`),
- *    requires EVERY observed target/arm/exchange dimension (ZERO wildcards!).
- *  - On legacy default-run stamps (unleased callers minting without `runId`), enforces every
- *    dimension present on the stamp so any bound-dimension mismatch still fails closed.
- */
-export function buildExpectedNonceBinding(
-  stamp: NonceStamp | undefined,
-  effectiveRunId: string | undefined,
-  observed: { origin?: string; method?: string; route?: string; param?: string; armRole?: string; exchangeId?: string },
-  requireExchangeOnRunScoped = true,
-): Partial<Omit<NonceBinding, 'oracleId'>> {
-  const runScoped = Boolean(effectiveRunId || (stamp && stamp.runId !== DEFAULT_NONCE_RUN_ID))
-  if (runScoped) {
-    return {
-      runId: effectiveRunId ?? stamp?.runId,
-      ...(observed.origin !== undefined ? { origin: observed.origin } : {}),
-      ...(observed.method !== undefined ? { method: observed.method } : {}),
-      ...(observed.route !== undefined ? { route: observed.route } : {}),
-      ...(observed.param !== undefined ? { param: observed.param } : {}),
-      ...(observed.armRole !== undefined ? { armRole: observed.armRole } : {}),
-      ...((requireExchangeOnRunScoped || stamp?.exchangeId !== null) && observed.exchangeId !== undefined ? { exchangeId: observed.exchangeId } : {}),
-    }
-  }
-  return {
-    ...(stamp?.origin !== null && observed.origin !== undefined ? { origin: observed.origin } : {}),
-    ...(stamp?.method !== null && observed.method !== undefined ? { method: observed.method } : {}),
-    ...(stamp?.route !== null && observed.route !== undefined ? { route: observed.route } : {}),
-    ...(stamp?.param !== null && observed.param !== undefined ? { param: observed.param } : {}),
-    ...(stamp?.armRole !== null && observed.armRole !== undefined ? { armRole: observed.armRole } : {}),
-    ...(stamp?.exchangeId !== null && observed.exchangeId !== undefined ? { exchangeId: observed.exchangeId } : {}),
-  }
-}
-
 function canonicalStampInput(stamp: Omit<NonceStamp, 'mac'>): string {
   return JSON.stringify({
     v: 1,
@@ -221,7 +184,13 @@ export function initNonceLedgerSchema(client: DatabaseSync): void {
   }
 }
 
-/** SQLite-backed persistence storing ONLY cited nonce stamps (lazy DDL; zero hot-path DB writes). */
+/**
+ * SQLite-backed persistence storing ONLY cited nonce stamps (lazy DDL; zero hot-path DB writes).
+ * Threat-model note: per-run HMAC keys (`nonce_ledger_run_keys`) and cited stamps (`nonce_ledger_stamps`)
+ * co-reside in the host SQLite database so post-restart re-verification detects non-keyed payload tampering
+ * or corruption, while an attacker with arbitrary host DB write access can modify both tables and is
+ * outside the SQLite-local key threat model.
+ */
 export class SqliteNonceLedgerPersistence implements NonceLedgerPersistence {
   private readonly client: DatabaseSync
   private schemaReady = false
@@ -396,16 +365,21 @@ export class NonceLedger {
   mintStamp(
     binding: NonceBinding,
     payload: unknown,
-    options: { stampId?: string; mintedAtMs?: number; persistPayload?: boolean } = {},
+    options: { stampId?: string; mintedAtMs?: number; persistPayload?: boolean; payloadDigestOverride?: string } = {},
   ): HostMinted<NonceStamp> {
-    const runId = normNullable(binding.runId) ?? DEFAULT_NONCE_RUN_ID
+    const runId = normNullable(binding.runId)
+    if (!runId) {
+      throw new Error('NonceLedger.mintStamp requires a non-empty host runId.')
+    }
     const key = this.getOrCreateRunKey(runId)
     const stampId = normNullable(options.stampId) ?? `nst_${binding.oracleId}_${randomUUID()}`
     const mintedAtMs = options.mintedAtMs ?? Date.now()
     const payloadJson = options.persistPayload === false
       ? null
       : (typeof payload === 'string' ? payload : JSON.stringify(payload ?? null))
-    const payloadDigest = hashNoncePayload(payloadJson ?? payload)
+    const payloadDigest = payloadJson === null && options.payloadDigestOverride
+      ? options.payloadDigestOverride
+      : hashNoncePayload(payloadJson ?? payload)
     const body: Omit<NonceStamp, 'mac'> = {
       stampId,
       runId,
@@ -454,8 +428,13 @@ export class NonceLedger {
         param: binding.param !== undefined ? binding.param : entry.stamp.param,
         exchangeId: binding.exchangeId !== undefined ? binding.exchangeId : entry.stamp.exchangeId,
       },
-      entry.payloadJson ?? entry.stamp.payloadDigest,
-      { stampId: `${rootId}@${cleanSuffix}`, persistPayload: entry.payloadJson !== null },
+      entry.payloadJson,
+      {
+        stampId: `${rootId}@${cleanSuffix}`,
+        mintedAtMs: entry.stamp.mintedAtMs,
+        persistPayload: entry.payloadJson !== null,
+        ...(entry.payloadJson === null ? { payloadDigestOverride: entry.stamp.payloadDigest } : {}),
+      },
     )
   }
 
@@ -555,8 +534,7 @@ export class NonceLedger {
     }
     if (stored.oracleId !== expected.oracleId) return null
     const expectedRunId = normNullable(expected.runId)
-    if (expectedRunId !== null && stored.runId !== expectedRunId) return null
-    if (expectedRunId === null && stored.runId !== DEFAULT_NONCE_RUN_ID) return null
+    if (expectedRunId === null || stored.runId !== expectedRunId) return null
 
     if (expected.origin !== undefined) {
       const expOrigin = normOrigin(expected.origin)

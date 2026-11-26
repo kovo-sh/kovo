@@ -54,17 +54,8 @@ import { createHash } from 'node:crypto'
 import { matchStrippedInjectionFingerprint } from './oracle-invariants.ts'
 import type { AmbientAuth, ImpactStep, InjectionFamily, RoleName } from './oracle-invariants.ts'
 import type { BrokerExchangeResult, BrokerHttpRequest, Grant, RequestBroker } from './broker.ts'
-import { buildProofReceipt, defaultHostMintedOracle, verifyReceipt } from './proof-receipt.ts'
-import type {
-  BooleanPairStyle,
-  HostStampedBooleanPair,
-  ProofReceipt,
-  ReceiptBrowserTrace,
-  ReceiptOobEvent,
-  ReceiptTranscript,
-  ReceiptTranscriptEntry,
-  ReceiptVerification,
-} from './proof-receipt.ts'
+import { buildProofReceipt, defaultHostMintedOracle, exactPathnameOf, verifyReceipt } from './proof-receipt.ts'
+import type { BooleanPairStyle, HostMintedRedirectCanary, HostStampedBooleanPair, ProofReceipt, ReceiptBrowserTrace, ReceiptOobEvent, ReceiptTranscript, ReceiptTranscriptEntry, ReceiptVerification } from './proof-receipt.ts'
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -128,8 +119,8 @@ export interface FloorRequestSpec {
   session?: string
   /** Bind the route's CSRF token (hidden field + cookie) on this arm. */
   csrfBind?: boolean
-  /** R4-C-1: Host-minted boolean predicate pair arm stamp. */
-  hostBooleanPair?: HostStampedBooleanPair
+  /** R4-C-1: Host-minted boolean predicate pair arm stamp & redirect canary. */
+  hostBooleanPair?: HostStampedBooleanPair; hostRedirectCanary?: HostMintedRedirectCanary
 }
 
 /** One host-recorded exchange. Ids/timings are the host's, never the recipe's. */
@@ -175,6 +166,7 @@ export interface FloorRestoreDegradationEvent {
 }
 
 export interface FloorRecipeDeps {
+  runId?: string
   request(spec: FloorRequestSpec): Promise<FloorExchange> | FloorExchange
   /**
    * Optional broker cleanup-allowance request seam used when draining `ctx.registerRestore(...)`
@@ -537,11 +529,13 @@ export type FloorRestoreCallback = (
 ) => Promise<FloorRecipeStep | void> | FloorRecipeStep | void
 
 export interface FloorRecipeContext {
+  readonly runId: string
   readonly args: FloorRecipeArgs
   /** Exchanges recorded so far (bounded). */
   readonly steps: readonly FloorRecipeStep[]
   /** Host exchange ids recorded so far, in order. */
   readonly exchangeIds: readonly string[]
+  bindEntryStamps(exchangeId: string, stamps: Partial<Pick<ReceiptTranscriptEntry, 'hostBooleanPair' | 'hostRedirectCanaryHost' | 'hostRedirectCanary'>>): void
   send(spec: FloorRequestSpec): Promise<FloorRecipeStep>
   /** Execute 2..8 requests concurrently (via `deps.burst` when wired, else `Promise.all`). */
   sendBurst(specs: readonly FloorRequestSpec[]): Promise<FloorRecipeStep[]>
@@ -648,6 +642,7 @@ function inferRequireSide(role: string): FloorRequireSide {
 const MAX_FLOOR_RESTORE_STEPS = 4
 
 class RecipeContext implements FloorRecipeContext {
+  readonly runId: string
   readonly args: FloorRecipeArgs
   readonly steps: FloorRecipeStep[] = []
   readonly missing: RecordedMissing[] = []
@@ -661,24 +656,19 @@ class RecipeContext implements FloorRecipeContext {
   private cleanupCount = 0
 
   constructor(args: FloorRecipeArgs, deps: FloorRecipeDeps) {
+    this.runId = (deps.runId ?? '').trim() || `floor_${createHash('sha256').update(JSON.stringify({ origin: args.origin, method: args.method, pathAndQuery: args.pathAndQuery, vulnClass: args.vulnClass })).digest('hex').slice(0, 16)}`
     this.args = args
     this.deps = deps
   }
 
-  get exchangeIds(): string[] {
-    return this.steps.map(step => step.exchangeId)
+  get exchangeIds(): string[] { return this.steps.map(step => step.exchangeId) }
+  get oobEventIds(): string[] { return this.oobEvents.map(event => event.id) }
+  bindEntryStamps(exchangeId: string, stamps: Partial<Pick<ReceiptTranscriptEntry, 'hostBooleanPair' | 'hostRedirectCanaryHost' | 'hostRedirectCanary'>>): void {
+    const idx = this.entries.findIndex(e => e.exchangeId === exchangeId)
+    if (idx >= 0) this.entries[idx] = { ...this.entries[idx]!, ...stamps }
   }
-
-  get oobEventIds(): string[] {
-    return this.oobEvents.map(event => event.id)
-  }
-
   transcript(): ReceiptTranscript {
-    return {
-      entries: [...this.entries],
-      oobEvents: [...this.oobEvents],
-      ...(this.traces.length > 0 ? { browserTraces: [...this.traces] } : {}),
-    }
+    return { runId: this.runId, entries: [...this.entries], oobEvents: [...this.oobEvents], ...(this.traces.length > 0 ? { browserTraces: [...this.traces] } : {}) }
   }
 
   private buildRecordedStep(
@@ -733,11 +723,13 @@ class RecipeContext implements FloorRecipeContext {
     this.steps.push(recorded)
     this.entries.push({
       exchangeId,
+      origin: this.args.origin,
       step: recorded.step,
       durationMs: exchange.durationMs ?? measuredDurationMs ?? 0,
       carrierText: exchange.carrierText ?? carrierTextOf(spec),
       evidenceRole: spec.role,
       ...(spec.hostBooleanPair ? { hostBooleanPair: spec.hostBooleanPair } : {}),
+      ...(spec.hostRedirectCanary ? { hostRedirectCanaryHost: spec.hostRedirectCanary.host, hostRedirectCanary: spec.hostRedirectCanary } : {}),
     })
     return recorded
   }
@@ -1416,34 +1408,23 @@ const booleanOrTiming = defineRecipe<BooleanOrTimingArgs>('boolean_or_timing', a
     const mintSpec = param
       ? extractFloorBooleanBaseAndStyle(param, controlPath, probePath, args.controlJsonBody, args.probeJsonBody)
       : null
+    const boolRoute = exactPathnameOf(controlPath)
     for (let round = 0; round < rounds; round += 1) {
       const pair = mintSpec && param
-        ? defaultHostMintedOracle.mintBooleanPair(mintSpec.baseValue, {
-            param,
-            style: mintSpec.style,
-            deterministicKey: `floor:boolean:${args.origin}:${args.method}:${controlPath}:${round}`,
-          })
+        ? defaultHostMintedOracle.mintBooleanPair(mintSpec.baseValue, { param, style: mintSpec.style, deterministicKey: `floor:boolean:${args.origin}:${args.method}:${controlPath}:${round}`, binding: { runId: ctx.runId, origin: args.origin, method: args.method, route: boolRoute, param } })
         : null
-      const roundCtlPath = pair && param && mintSpec?.carrier === 'query'
-        ? withReplacedQueryParam(controlPath, param, pair.trueValue)
-        : controlPath
-      const roundPrbPath = pair && param && mintSpec?.carrier === 'query'
-        ? withReplacedQueryParam(probePath, param, pair.falseValue)
-        : probePath
-      const roundCtlJson = pair && param && mintSpec?.carrier === 'json' && args.controlJsonBody && typeof args.controlJsonBody === 'object'
-        ? { ...(args.controlJsonBody as Record<string, unknown>), [param]: pair.trueValue }
-        : args.controlJsonBody
-      const roundPrbJson = pair && param && mintSpec?.carrier === 'json' && args.probeJsonBody && typeof args.probeJsonBody === 'object'
-        ? { ...(args.probeJsonBody as Record<string, unknown>), [param]: pair.falseValue }
-        : args.probeJsonBody
+      const roundCtlPath = pair && param && mintSpec?.carrier === 'query' ? withReplacedQueryParam(controlPath, param, pair.trueValue) : controlPath
+      const roundPrbPath = pair && param && mintSpec?.carrier === 'query' ? withReplacedQueryParam(probePath, param, pair.falseValue) : probePath
+      const roundCtlJson = pair && param && mintSpec?.carrier === 'json' && args.controlJsonBody && typeof args.controlJsonBody === 'object' ? { ...(args.controlJsonBody as Record<string, unknown>), [param]: pair.trueValue } : args.controlJsonBody
+      const roundPrbJson = pair && param && mintSpec?.carrier === 'json' && args.probeJsonBody && typeof args.probeJsonBody === 'object' ? { ...(args.probeJsonBody as Record<string, unknown>), [param]: pair.falseValue } : args.probeJsonBody
       const ctlReq = armRequest(args, 'control', roundCtlPath, roundCtlJson, actor)
       const prbReq = armRequest(args, 'probe', roundPrbPath, roundPrbJson, actor)
-      if (pair) {
-        ctlReq.hostBooleanPair = defaultHostMintedOracle.stampBooleanPairArm(pair, 'true')
-        prbReq.hostBooleanPair = defaultHostMintedOracle.stampBooleanPairArm(pair, 'false')
-      }
       const control = await ctx.send(ctlReq)
       const probe = await ctx.send(prbReq)
+      if (pair) {
+        ctx.bindEntryStamps(control.exchangeId, { hostBooleanPair: defaultHostMintedOracle.stampBooleanPairArm(pair, 'true', { origin: args.origin, method: args.method, route: exactPathnameOf(roundCtlPath), param: param ?? null, exchangeId: control.exchangeId }) })
+        ctx.bindEntryStamps(probe.exchangeId, { hostBooleanPair: defaultHostMintedOracle.stampBooleanPairArm(pair, 'false', { origin: args.origin, method: args.method, route: exactPathnameOf(roundPrbPath), param: param ?? null, exchangeId: probe.exchangeId }) })
+      }
       exchangeIds.push(control.exchangeId, probe.exchangeId)
       if ((control.exchange.status ?? 0) >= 500 || (probe.exchange.status ?? 0) >= 500) serverError = true
     }
@@ -1472,45 +1453,28 @@ const booleanOrTiming = defineRecipe<BooleanOrTimingArgs>('boolean_or_timing', a
     const mintSpec = param
       ? extractFloorBooleanBaseAndStyle(param, controlPath, probePath, args.controlJsonBody, args.probeJsonBody)
       : null
+    const statusRoute = exactPathnameOf(controlPath)
     for (let round = 0; round < rounds; round += 1) {
       const pair = mintSpec && param
-        ? defaultHostMintedOracle.mintBooleanPair(mintSpec.baseValue, {
-            param,
-            style: mintSpec.style,
-            deterministicKey: `floor:status:${args.origin}:${args.method}:${controlPath}:${round}`,
-          })
+        ? defaultHostMintedOracle.mintBooleanPair(mintSpec.baseValue, { param, style: mintSpec.style, deterministicKey: `floor:status:${args.origin}:${args.method}:${controlPath}:${round}`, binding: { runId: ctx.runId, origin: args.origin, method: args.method, route: statusRoute, param } })
         : null
-      const roundBasePath = pair && param && mintSpec?.carrier === 'query'
-        ? withReplacedQueryParam(controlPath, param, pair.baseValue)
-        : controlPath
-      const roundTruePath = pair && param && mintSpec?.carrier === 'query'
-        ? withReplacedQueryParam(probePath, param, pair.trueValue)
-        : probePath
-      const roundFalsePath = pair && param && mintSpec?.carrier === 'query'
-        ? withReplacedQueryParam(contradictionPath, param, pair.falseValue)
-        : contradictionPath
-      const roundBaseJson = pair && param && mintSpec?.carrier === 'json' && args.controlJsonBody && typeof args.controlJsonBody === 'object'
-        ? { ...(args.controlJsonBody as Record<string, unknown>), [param]: pair.baseValue }
-        : args.controlJsonBody
-      const roundTrueJson = pair && param && mintSpec?.carrier === 'json' && args.probeJsonBody && typeof args.probeJsonBody === 'object'
-        ? { ...(args.probeJsonBody as Record<string, unknown>), [param]: pair.trueValue }
-        : args.probeJsonBody
-      const roundFalseJson = pair && param && mintSpec?.carrier === 'json' && args.contradictionJsonBody && typeof args.contradictionJsonBody === 'object'
-        ? { ...(args.contradictionJsonBody as Record<string, unknown>), [param]: pair.falseValue }
-        : args.contradictionJsonBody
+      const roundBasePath = pair && param && mintSpec?.carrier === 'query' ? withReplacedQueryParam(controlPath, param, pair.baseValue) : controlPath
+      const roundTruePath = pair && param && mintSpec?.carrier === 'query' ? withReplacedQueryParam(probePath, param, pair.trueValue) : probePath
+      const roundFalsePath = pair && param && mintSpec?.carrier === 'query' ? withReplacedQueryParam(contradictionPath, param, pair.falseValue) : contradictionPath
+      const roundBaseJson = pair && param && mintSpec?.carrier === 'json' && args.controlJsonBody && typeof args.controlJsonBody === 'object' ? { ...(args.controlJsonBody as Record<string, unknown>), [param]: pair.baseValue } : args.controlJsonBody
+      const roundTrueJson = pair && param && mintSpec?.carrier === 'json' && args.probeJsonBody && typeof args.probeJsonBody === 'object' ? { ...(args.probeJsonBody as Record<string, unknown>), [param]: pair.trueValue } : args.probeJsonBody
+      const roundFalseJson = pair && param && mintSpec?.carrier === 'json' && args.contradictionJsonBody && typeof args.contradictionJsonBody === 'object' ? { ...(args.contradictionJsonBody as Record<string, unknown>), [param]: pair.falseValue } : args.contradictionJsonBody
       const benignReq = armRequest(args, 'control', roundBasePath, roundBaseJson, actor, 'benign_baseline')
       const tautReq = armRequest(args, 'probe', roundTruePath, roundTrueJson, actor, 'tautology')
       const contraReq = armRequest(args, 'probe', roundFalsePath, roundFalseJson, actor, 'contradiction')
-      if (pair) {
-        benignReq.hostBooleanPair = defaultHostMintedOracle.stampBooleanPairArm(pair, 'baseline')
-        tautReq.hostBooleanPair = defaultHostMintedOracle.stampBooleanPairArm(pair, 'true')
-        contraReq.hostBooleanPair = defaultHostMintedOracle.stampBooleanPairArm(pair, 'false')
-      }
-      // The benign baseline is what separates a predicate contrast from a single malformed request:
-      // it is the same request without the boolean operator and must answer 2xx.
       const benign = await ctx.send(benignReq)
       const tautology = await ctx.send(tautReq)
       const contradiction = await ctx.send(contraReq)
+      if (pair) {
+        ctx.bindEntryStamps(benign.exchangeId, { hostBooleanPair: defaultHostMintedOracle.stampBooleanPairArm(pair, 'baseline', { origin: args.origin, method: args.method, route: exactPathnameOf(roundBasePath), param: param ?? null, exchangeId: benign.exchangeId }) })
+        ctx.bindEntryStamps(tautology.exchangeId, { hostBooleanPair: defaultHostMintedOracle.stampBooleanPairArm(pair, 'true', { origin: args.origin, method: args.method, route: exactPathnameOf(roundTruePath), param: param ?? null, exchangeId: tautology.exchangeId }) })
+        ctx.bindEntryStamps(contradiction.exchangeId, { hostBooleanPair: defaultHostMintedOracle.stampBooleanPairArm(pair, 'false', { origin: args.origin, method: args.method, route: exactPathnameOf(roundFalsePath), param: param ?? null, exchangeId: contradiction.exchangeId }) })
+      }
       exchangeIds.push(benign.exchangeId, tautology.exchangeId, contradiction.exchangeId)
       ctx.require(isSuccess(benign.exchange.status), 'benign_baseline', `The benign baseline returned ${benign.exchange.status ?? 'no status'} instead of a 2xx.`, 'control')
       ctx.require(isSuccess(tautology.exchange.status), 'tautology', `The tautology arm returned ${tautology.exchange.status ?? 'no status'} instead of a 2xx.`, 'probe')
@@ -1809,23 +1773,19 @@ function isRedirectStatus(status: number | null): boolean {
 /** `http_chain` open_redirect / url_redirect → receipt `redirect` rule (off-origin Location). */
 const redirect = defineRecipe<RedirectArgs>('redirect', async (args, ctx) => {
   const controlPath = args.controlPathAndQuery ?? args.pathAndQuery
-  const probePath = args.probePathAndQuery ?? args.pathAndQuery
-  const control = await ctx.send({
-    arm: 'control',
-    role: 'same_origin_control',
-    method: args.method,
-    pathAndQuery: controlPath,
-    actor: args.actor,
-    ...(args.headers ? { headers: args.headers } : {}),
+  const rawProbePath = args.probePathAndQuery ?? args.pathAndQuery
+  const redirParam = deriveDifferingParam(controlPath, rawProbePath)
+  const canaryBase = args.canaryHost?.trim() || 'canary.kovo.invalid'
+  const canary = defaultHostMintedOracle.mintRedirectCanary(canaryBase, {
+    runId: ctx.runId, origin: args.origin, method: args.method, route: exactPathnameOf(rawProbePath), ...(redirParam ? { param: redirParam } : {}), armRole: 'probe',
   })
-  const probe = await ctx.send({
-    arm: 'probe',
-    role: 'redirect_probe',
-    method: args.method,
-    pathAndQuery: probePath,
-    actor: args.actor,
-    ...(args.headers ? { headers: args.headers } : {}),
-  })
+  const probePath = rawProbePath.includes('{{redirectHost}}')
+    ? rawProbePath.replaceAll('{{redirectHost}}', canary.host)
+    : (args.canaryHost && rawProbePath.includes(args.canaryHost) ? rawProbePath.replaceAll(args.canaryHost, canary.host) : rawProbePath)
+  const control = await ctx.send({ arm: 'control', role: 'same_origin_control', method: args.method, pathAndQuery: controlPath, actor: args.actor, ...(args.headers ? { headers: args.headers } : {}) })
+  const probe = await ctx.send({ arm: 'probe', role: 'redirect_probe', method: args.method, pathAndQuery: probePath, actor: args.actor, ...(args.headers ? { headers: args.headers } : {}) })
+  const boundCanary = defaultHostMintedOracle.bindRedirectCanaryToExchange(canary, probe.exchangeId)
+  ctx.bindEntryStamps(probe.exchangeId, { hostRedirectCanaryHost: boundCanary.host, hostRedirectCanary: boundCanary })
   const probeLocation = headerValue(probe.exchange.responseHeaders, 'location')
   const controlLocation = headerValue(control.exchange.responseHeaders, 'location')
   const targetHost = hostOfLocation(args.origin, args.origin)
@@ -1836,11 +1796,10 @@ const redirect = defineRecipe<RedirectArgs>('redirect', async (args, ctx) => {
   ctx.require(controlLocation !== probeLocation, 'same_origin_control', 'The same-origin control redirects to the same destination, so the destination is not attacker-controlled.', 'probe')
   return buildProofReceipt({
     vulnClass: args.vulnClass,
-    target: targetOf(args),
+    target: { ...targetOf(args), ...(redirParam ? { param: redirParam } : {}) },
     exchangeIds: [control.exchangeId, probe.exchangeId],
     browserTraceIds: [],
     claimedDelta: `The probe redirected to ${probeLocation ?? 'no destination'} (off-origin) while the same-origin control ${controlLocation ? `redirected to ${controlLocation}` : 'stayed on origin'}.`,
-    ...(args.canaryHost ? { proofPatterns: [escapeRegex(args.canaryHost)] } : {}),
   })
 })
 
@@ -2224,7 +2183,7 @@ export async function runFloorRecipe(recipe: FloorRecipe, deps: FloorRecipeDeps)
   }
 
   const transcript = ctx.transcript()
-  const verification = verifyReceipt(receipt, transcript)
+  const verification = verifyReceipt(receipt, transcript, { runId: ctx.runId })
   const missing = uniqueRoles([
     ...ctx.missing.flatMap(item => item.roles),
     ...(verification.confirmed ? [] : inferMissingRoles(recipe, receipt, transcript, verification)),

@@ -98,6 +98,7 @@ function makeMockProveHost(
   let clock = 1_700_000_000_000
 
   const host: ProveHandlerHost = {
+    runId: 'run-movea-mock-host',
     transcript,
     defaultOrigin: ORIGIN,
     canaryBroker: undefined,
@@ -218,8 +219,9 @@ function makeMockProveHost(
 
 test('R2-C-6: evaluated-expression oracle requires host-minted randomized operands, rejects worker markers, and downgrades plain body_contains pairs to leads', async () => {
   const oracle = new HostMintedOracle()
-  const ch1 = oracle.mintExpressionChallenge('ssti')
-  const ch2 = oracle.mintExpressionChallenge('ssti')
+  const exprRunId = 'run-movea-expr'
+  const ch1 = oracle.mintExpressionChallenge('ssti', '*', { runId: exprRunId, origin: ORIGIN, method: 'GET', route: '/api/render', param: 'name', armRole: 'probe', exchangeId: 'p1' })
+  const ch2 = oracle.mintExpressionChallenge('ssti', '*', { runId: exprRunId, origin: ORIGIN, method: 'GET', route: '/api/render', param: 'name', armRole: 'probe', exchangeId: 'p2' })
   assert.notEqual(ch1.expectedOutput, ch2.expectedOutput, 'host-minted outputs must vary across attempts')
   assert.equal(String(ch1.operandA * ch1.operandB), ch1.expectedOutput)
   assert.equal(String(ch2.operandA * ch2.operandB), ch2.expectedOutput)
@@ -263,6 +265,7 @@ test('R2-C-6: evaluated-expression oracle requires host-minted randomized operan
     claimedDelta: 'Host-minted arithmetic template expressions evaluated on server.',
   })
   const validTranscript: ReceiptTranscript = {
+    runId: exprRunId,
     hostExpressionChallenges: [ch1, ch2],
     entries: [
       { exchangeId: 'c1', origin: ORIGIN, step: mkStep({ id: 'c1', arm: 'control', method: 'GET', route: '/api/render', pathAndQuery: '/api/render?name=benign', status: 200, body: 'Hello benign' }) },
@@ -271,7 +274,7 @@ test('R2-C-6: evaluated-expression oracle requires host-minted randomized operan
       { exchangeId: 'p2', origin: ORIGIN, hostExpressionChallenge: ch2, step: mkStep({ id: 'p2', arm: 'probe', method: 'GET', route: '/api/render', pathAndQuery: `/api/render?name=${encodeURIComponent(`{{${ch2.expressionSyntax}}}`)}`, status: 200, body: `Hello ${ch2.expectedOutput}` }) },
     ],
   }
-  const positiveVerdict = verifyReceipt(validReceipt, validTranscript, { hostMintedOracle: oracle })
+  const positiveVerdict = verifyReceipt(validReceipt, validTranscript, { hostMintedOracle: oracle, runId: exprRunId })
   assert.equal(positiveVerdict.confirmed, true, positiveVerdict.reason)
   assert.equal(positiveVerdict.evidence?.hostMinted, true)
 
@@ -496,7 +499,8 @@ test('C-5: conserved_balance enforces host raceBatchId, rejects reserved evidenc
 
 test('H-15: timing oracle enforces strict timingArmIdentity, single differing param, status parity, >=5 interleaved arms, host-minted delay vs zero-delay control, and construct-family class', async () => {
   const oracle = new HostMintedOracle()
-  const cmdiChallenge = oracle.mintTimingChallenge('cmdi', 2_000)
+  const timingRunId = 'run-movea-timing'
+  const cmdiChallenge = oracle.mintTimingChallenge('cmdi', 2_000, undefined, { runId: timingRunId, origin: ORIGIN, method: 'GET', route: '/api/Search', param: 'q' })
   const buildEntries = (
     overrideProbe?: (i: number, base: ReceiptTranscriptEntry) => ReceiptTranscriptEntry,
     interleaved = true,
@@ -509,7 +513,7 @@ test('H-15: timing oracle enforces strict timingArmIdentity, single differing pa
       sessionId: 'sess-1',
       consumedCapabilities: ['cap:hop_1:a'],
       durationMs: 35,
-      hostTimingChallenge: cmdiChallenge,
+      hostTimingChallenge: oracle.stampTimingChallengeArm(cmdiChallenge, 'control', { exchangeId: `c${i}` }),
       step: mkStep({
         id: `c${i}`,
         arm: 'control',
@@ -527,7 +531,7 @@ test('H-15: timing oracle enforces strict timingArmIdentity, single differing pa
         sessionId: 'sess-1',
         consumedCapabilities: ['cap:hop_1:a'],
         durationMs: 2_100,
-        hostTimingChallenge: cmdiChallenge,
+        hostTimingChallenge: oracle.stampTimingChallengeArm(cmdiChallenge, 'probe', { exchangeId: `p${i}` }),
         step: mkStep({
           id: `p${i}`,
           arm: 'probe',
@@ -550,9 +554,10 @@ test('H-15: timing oracle enforces strict timingArmIdentity, single differing pa
 
   // Positive: >=5 interleaved arms with strict identity parity & host-minted cmdi challenge confirms as command_injection
   const positive = verifyReceipt(makeReceipt('timing'), {
+    runId: timingRunId,
     hostTimingChallenge: cmdiChallenge,
     entries: buildEntries(),
-  }, { hostMintedOracle: oracle })
+  }, { hostMintedOracle: oracle, runId: timingRunId })
   assert.equal(positive.confirmed, true, positive.reason)
   assert.equal(positive.vulnClass, 'command_injection', 'class must be derived from host construct family')
   assert.equal(positive.evidence?.constructFamily, 'cmdi')
@@ -651,7 +656,8 @@ test('H-15: timing oracle enforces strict timingArmIdentity, single differing pa
 
 test('R2-H-13: redirect rule requires same method/route/actor control, 3xx status, host-minted canary host in controlled param, and host-level comparison', () => {
   const oracle = new HostMintedOracle()
-  const canary = oracle.mintRedirectCanary()
+  const redirRunId = 'run-movea-redir'
+  const canary = oracle.mintRedirectCanary('canary.kovo.invalid', { runId: redirRunId, origin: ORIGIN, method: 'GET', route: '/login', param: 'next', armRole: 'probe', exchangeId: 'prb' })
 
   const receipt = buildProofReceipt({
     vulnClass: 'open_redirect',
@@ -662,11 +668,12 @@ test('R2-H-13: redirect rule requires same method/route/actor control, 3xx statu
 
   // Positive: matching control (stays local) + 302 probe carrying host-minted canary host in `next`
   const positive = verifyReceipt(receipt, {
+    runId: redirRunId,
     entries: [
       { exchangeId: 'ctl', origin: ORIGIN, step: mkStep({ id: 'ctl', arm: 'control', method: 'GET', route: '/login', pathAndQuery: '/login?next=/dashboard', status: 302, responseHeaders: { location: '/dashboard' } }) },
-      { exchangeId: 'prb', origin: ORIGIN, hostRedirectCanaryHost: canary.host, step: mkStep({ id: 'prb', arm: 'probe', method: 'GET', route: '/login', pathAndQuery: `/login?next=${encodeURIComponent(`https://${canary.host}/cb`)}`, status: 302, responseHeaders: { location: `https://${canary.host}/cb` } }) },
+      { exchangeId: 'prb', origin: ORIGIN, hostRedirectCanaryHost: canary.host, hostRedirectCanary: canary, step: mkStep({ id: 'prb', arm: 'probe', method: 'GET', route: '/login', pathAndQuery: `/login?next=${encodeURIComponent(`https://${canary.host}/cb`)}`, status: 302, responseHeaders: { location: `https://${canary.host}/cb` } }) },
     ],
-  }, { hostMintedOracle: oracle })
+  }, { hostMintedOracle: oracle, runId: redirRunId })
   assert.equal(positive.confirmed, true, positive.reason)
   assert.equal(positive.evidence?.locationHost, canary.host)
 
@@ -972,7 +979,7 @@ test('R2-C-9 & R2-H-6: kernel request plane rejects vault-scrubbed [redacted:cap
 
   // R2-C-9: verifyReceipt fails closed when kernel request plane contains `[redacted:cap:...]`
   const oracle = new HostMintedOracle()
-  const ch = oracle.mintExpressionChallenge('ssti')
+  const ch = oracle.mintExpressionChallenge('ssti', '*', { runId: 'run-movea-r2c9' })
   const scrubbedReceipt = buildProofReceipt({
     vulnClass: 'ssti',
     target: { origin: ORIGIN, method: 'GET', pathAndQuery: '/render?q=test' },

@@ -33,8 +33,10 @@ import {
   SqliteNonceLedgerPersistence,
 } from '../src/server/nonce-ledger.ts'
 import type { ImpactStep } from '../src/server/oracle-invariants.ts'
+import { cut3FloorRecipe, runCut3Recipe } from '../src/server/floor-recipes.ts'
 import {
   buildProofReceipt,
+  defaultHostMintedOracle,
   HostMintedOracle,
   proofReceiptSchema,
   verifyHostEvidence,
@@ -271,10 +273,11 @@ test('R3-16 Test 3: HMAC-bound stamps reject cross-run, cross-oracle, cross-exch
     runId: 'run-B', oracleId: 'timing', armRole: 'probe', origin: ORIGIN, method: 'GET', route: '/api/report', param: 'q', exchangeId: 'E1',
   }), null, 'cross-run citation must be rejected')
 
-  // Omitting runId (downgrade to default run) rejected
+  // Omitting/blank runId is rejected fail-closed (zero wildcard / default-run fallback)
   assert.equal(ledger.verifyStamp(stamp, {
-    oracleId: 'timing', armRole: 'probe', origin: ORIGIN, method: 'GET', route: '/api/report', param: 'q', exchangeId: 'E1',
-  }), null, 'omitted runId on run-scoped stamp must be rejected')
+    runId: '', oracleId: 'timing', armRole: 'probe', origin: ORIGIN, method: 'GET', route: '/api/report', param: 'q', exchangeId: 'E1',
+  }), null, 'empty runId on run-scoped stamp must be rejected')
+  assert.throws(() => ledger.mintStamp({ runId: '', oracleId: 'timing' }, { delayMs: 2_000 }), /runId/i)
 
   // Cross-oracle rejected
   assert.equal(ledger.verifyStamp(stamp, {
@@ -789,4 +792,212 @@ test('R3-16 Test 8 (B3): challenge/stamp mix-and-match and tampered SQLite paylo
   } finally {
     rmSync(tmpDir, { recursive: true, force: true })
   }
+})
+
+// ============================================================================
+// Test 9: B1 End-to-End Handler -> Transcript -> verifyReceipt WITH Real runId
+//         (Timing, Boolean, Expression, Redirect TPs + Cross-Exchange/Route/Run/No-RunId Negatives)
+//         + N3' Own-API-Key Self-Service FP Guard + bindStamp(payloadJson=null) Preservation
+// ============================================================================
+
+test('R3-16 Test 9 (B1 E2E + N3\'): handler->transcript->verifyReceipt with real runId confirms timing/boolean/expression/redirect TPs and rejects E2/R2/runB/no-runId reuse', async () => {
+  // Helper: build a ProveHandlerHost wired to a TranscriptStore that records stamps & returns them to HostFactLog
+  const makeE2eHost = (
+    runId: string,
+    responder: (args: Record<string, unknown>) => { status: number; body: string; durationMs?: number; headers?: Record<string, string> },
+  ) => {
+    const transcript = new TranscriptStore()
+    let seq = 0
+    const host: ProveHandlerHost = {
+      runId,
+      transcript,
+      defaultOrigin: ORIGIN,
+      canaryBroker: undefined,
+      scrubRecord: v => v,
+      async runOob() { return {} },
+      async runRace() { return {} },
+      async runHttpExchange(args, nonce, stamps) {
+        seq += 1
+        const method = String(args.method ?? 'GET').toUpperCase()
+        const pathAndQuery = String(args.path ?? '/')
+        const res = responder(args)
+        const durationMs = res.durationMs ?? 25
+        const rec = transcript.record({
+          op: 'http', startedAt: 1_000 + seq * 50, durationMs,
+          request: { origin: ORIGIN, method, pathAndQuery, headers: {}, bodyBytes: 0, bodySha256: '0'.repeat(64), nonce, sessionRole: String(args.sessionGroupRole ?? 'probe') },
+          body: res.body,
+          response: { status: res.status, headers: res.headers ?? { 'content-type': 'application/json' }, bodyBytes: Buffer.byteLength(res.body), bodySha256: '1'.repeat(64), mediaType: 'application/json', redirectOrigins: [] },
+          ...(stamps?.hostExpressionChallenge ? { hostExpressionChallenge: stamps.hostExpressionChallenge } : {}),
+          ...(stamps?.hostBooleanPair ? { hostBooleanPair: stamps.hostBooleanPair } : {}),
+          ...(stamps?.timingChallenge ? { hostTimingStamp: stamps.timingChallenge } : {}),
+        })
+        return { exchangeId: rec.exchangeId, status: res.status, method, pathAndQuery, headers: res.headers ?? { 'content-type': 'application/json' }, body: res.body, bodyPreview: res.body.slice(0, 120), bodyBytes: Buffer.byteLength(res.body), bodySha256: '1'.repeat(64), durationMs, personaHandle: null }
+      },
+    }
+    const toTranscript = () => {
+      const log = HostFactLog.fromTranscriptStore(transcript, { runId })
+      return log.toReceiptTranscript()
+    }
+    return { host, transcript, toTranscript }
+  }
+
+  // 1. TIMING E2E: handleProveDifferential(mode:'timing') -> post-send bindStampToExchange -> verifyReceipt
+  const timingRunId = 'run-e2e-timing-1'
+  const timingHarness = makeE2eHost(timingRunId, (args) => {
+    const p = String(args.path ?? '')
+    const isDelay = p.includes('delay=2000')
+    return { status: 200, body: '{"ok":true}', durationMs: isDelay ? 2_100 : 25 }
+  })
+  const timingOut = await handleProveDifferential(timingHarness.host, {
+    mode: 'timing', timingFamily: 'timing', rounds: 5,
+    control: '/api/Report?mode={{delayToken}}', variant: '/api/Report?mode={{delayToken}}',
+  }, 'n-e2e-t') as { ok: boolean; controlIds: string[]; variantIds: string[] }
+  assert.equal(timingOut.ok, true)
+  const timingTx = timingHarness.toTranscript()
+  // Verify post-send exchangeId binding was persisted onto every transcript entry!
+  for (const e of timingTx.entries!) {
+    assert.equal(e.hostTimingChallenge?.nonceStamp?.exchangeId, e.exchangeId, 'timing entry must carry exchangeId-bound child stamp')
+    assert.equal(e.hostTimingChallenge?.nonceStamp?.runId, timingRunId)
+  }
+  const timingIds = timingOut.controlIds.flatMap((cid, i) => [cid, timingOut.variantIds[i]!])
+  const timingReceipt = buildProofReceipt({
+    vulnClass: 'timing',
+    target: { origin: ORIGIN, method: 'GET', pathAndQuery: '/api/Report', param: 'mode' },
+    exchangeIds: timingIds,
+    claimedDelta: 'E2E timing confirmation with post-send exchange-bound stamps.',
+  })
+  const timingTp = verifyReceipt(timingReceipt, timingTx, { runId: timingRunId })
+  assert.equal(timingTp.confirmed, true, `Timing E2E TP must confirm: ${timingTp.reason}`)
+  // Negatives: cite exact stamp on E2, route R2, run B, or with no runId -> ALL REJECT
+  const swappedTimingEntries = timingTx.entries!.map((e, i) => i === 0 ? { ...e, hostTimingChallenge: timingTx.entries![2]!.hostTimingChallenge } : e)
+  assert.equal(verifyReceipt(timingReceipt, { ...timingTx, entries: swappedTimingEntries }, { runId: timingRunId }).confirmed, false, 'timing stamp reused on E2 must reject')
+  const route2TimingEntries = timingTx.entries!.map(e => ({ ...e, step: { ...e.step, route: '/api/Other', pathAndQuery: e.step.pathAndQuery?.replace('/api/Report', '/api/Other') } }))
+  assert.equal(verifyReceipt(buildProofReceipt({ ...timingReceipt, target: { ...timingReceipt.target, pathAndQuery: '/api/Other' } }), { ...timingTx, entries: route2TimingEntries }, { runId: timingRunId }).confirmed, false, 'timing stamp reused on route R2 must reject')
+  assert.equal(verifyReceipt(timingReceipt, { ...timingTx, runId: 'run-B' }, { runId: 'run-B' }).confirmed, false, 'timing stamp reused on run B must reject')
+  assert.equal(verifyReceipt(timingReceipt, { entries: timingTx.entries }).confirmed, false, 'timing without host runId must reject')
+
+  // 2. BOOLEAN E2E: handleProveDifferential(mode:'boolean') -> post-send bindStampToExchange -> verifyReceipt
+  const boolRunId = 'run-e2e-bool-1'
+  const boolHarness = makeE2eHost(boolRunId, (args) => {
+    const p = decodeURIComponent(String(args.path ?? ''))
+    const m = /AND (\d+)=(\d+)/.exec(p)
+    const isFalse = Boolean(m && m[1] !== m[2])
+    return { status: 200, body: isFalse ? '{"id":null,"rows":0,"status":"empty"}' : '{"id":7,"rows":1,"status":"active"}' }
+  })
+  const boolOut = await handleProveDifferential(boolHarness.host, {
+    mode: 'boolean', booleanBase: '7', booleanStyle: 'numeric', rounds: 2,
+    baseline: '/api/Items?id={{boolBase}}', control: '/api/Items?id={{boolTrue}}', variant: '/api/Items?id={{boolFalse}}',
+  }, 'n-e2e-b') as { ok: boolean; baselineIds: string[]; controlIds: string[]; variantIds: string[] }
+  assert.equal(boolOut.ok, true)
+  const boolTx = boolHarness.toTranscript()
+  for (const e of boolTx.entries!) {
+    assert.equal(e.hostBooleanPair?.nonceStamp?.exchangeId, e.exchangeId, 'boolean entry must carry exchangeId-bound child stamp')
+    assert.equal(e.hostBooleanPair?.nonceStamp?.runId, boolRunId)
+  }
+  const boolReceipt = buildProofReceipt({
+    vulnClass: 'sqli',
+    target: { origin: ORIGIN, method: 'GET', pathAndQuery: '/api/Items', param: 'id' },
+    exchangeIds: [...boolOut.baselineIds, ...boolOut.controlIds, ...boolOut.variantIds],
+    claimedDelta: 'E2E boolean confirmation with post-send exchange-bound stamps.',
+  })
+  const boolTp = verifyReceipt(boolReceipt, boolTx, { runId: boolRunId })
+  assert.equal(boolTp.confirmed, true, `Boolean E2E TP must confirm: ${boolTp.reason}`)
+  const swappedBoolEntries = boolTx.entries!.map((e, i) => i === 2 ? { ...e, hostBooleanPair: boolTx.entries![5]!.hostBooleanPair } : e)
+  assert.equal(verifyReceipt(boolReceipt, { ...boolTx, entries: swappedBoolEntries }, { runId: boolRunId }).confirmed, false, 'boolean stamp reused on E2 must reject')
+  const route2BoolEntries = boolTx.entries!.map(e => ({ ...e, step: { ...e.step, route: '/api/Other', pathAndQuery: e.step.pathAndQuery?.replace('/api/Items', '/api/Other') } }))
+  assert.equal(verifyReceipt(buildProofReceipt({ ...boolReceipt, target: { ...boolReceipt.target, pathAndQuery: '/api/Other' } }), { ...boolTx, entries: route2BoolEntries }, { runId: boolRunId }).confirmed, false, 'boolean stamp reused on route R2 must reject')
+  assert.equal(verifyReceipt(boolReceipt, { ...boolTx, runId: 'run-B' }, { runId: 'run-B' }).confirmed, false, 'boolean stamp reused on run B must reject')
+  assert.equal(verifyReceipt(boolReceipt, { entries: boolTx.entries }).confirmed, false, 'boolean without host runId must reject')
+
+  // 3. EXPRESSION E2E: handleProveInjection -> post-send bindStampToExchange -> verifyReceipt
+  const exprRunId = 'run-e2e-expr-1'
+  const exprHarness = makeE2eHost(exprRunId, (args) => {
+    const q = new URL(String(args.path ?? '/'), ORIGIN).searchParams.get('tpl') ?? ''
+    const m = /^(\d+)\*(\d+)$/.exec(q)
+    return { status: 200, body: m ? `Rendered ${Number(m[1]) * Number(m[2])}` : `Rendered ${q}` }
+  })
+  const exprOut = await handleProveInjection(exprHarness.host, {
+    expressionFamily: 'ssti', control: '/api/Render?tpl=hello', probe: '/api/Render?tpl={{expr}}',
+  }, 'n-e2e-e') as { ok: boolean; control: { exchangeId: string }; probe: { exchangeId: string }; probe2: { exchangeId: string }; control2: { exchangeId: string } }
+  assert.equal(exprOut.ok, true)
+  const exprTx = exprHarness.toTranscript()
+  const prbExprEntries = exprTx.entries!.filter(e => e.hostExpressionChallenge)
+  assert.equal(prbExprEntries.length, 2)
+  for (const e of prbExprEntries) {
+    assert.equal(e.hostExpressionChallenge?.nonceStamp?.exchangeId, e.exchangeId, 'expression probe must carry exchangeId-bound child stamp')
+    assert.equal(e.hostExpressionChallenge?.nonceStamp?.runId, exprRunId)
+  }
+  const exprReceipt = buildProofReceipt({
+    vulnClass: 'ssti',
+    target: { origin: ORIGIN, method: 'GET', pathAndQuery: '/api/Render', param: 'tpl' },
+    exchangeIds: [exprOut.control.exchangeId, exprOut.probe.exchangeId, exprOut.probe2.exchangeId, exprOut.control2.exchangeId],
+    claimedDelta: 'E2E expression confirmation with post-send exchange-bound stamps.',
+  })
+  const exprTp = verifyReceipt(exprReceipt, exprTx, { runId: exprRunId })
+  assert.equal(exprTp.confirmed, true, `Expression E2E TP must confirm: ${exprTp.reason}`)
+  const swappedExprEntries = exprTx.entries!.map(e => e.exchangeId === exprOut.probe.exchangeId ? { ...e, hostExpressionChallenge: prbExprEntries[1]!.hostExpressionChallenge } : e)
+  assert.equal(verifyReceipt(exprReceipt, { ...exprTx, entries: swappedExprEntries }, { runId: exprRunId }).confirmed, false, 'expression stamp reused on E2 must reject')
+  const route2ExprEntries = exprTx.entries!.map(e => ({ ...e, step: { ...e.step, route: '/api/Other', pathAndQuery: e.step.pathAndQuery?.replace('/api/Render', '/api/Other') } }))
+  assert.equal(verifyReceipt(buildProofReceipt({ ...exprReceipt, target: { ...exprReceipt.target, pathAndQuery: '/api/Other' } }), { ...exprTx, entries: route2ExprEntries }, { runId: exprRunId }).confirmed, false, 'expression stamp reused on route R2 must reject')
+  assert.equal(verifyReceipt(exprReceipt, { ...exprTx, runId: 'run-B' }, { runId: 'run-B' }).confirmed, false, 'expression stamp reused on run B must reject')
+  assert.equal(verifyReceipt(exprReceipt, { entries: exprTx.entries }).confirmed, false, 'expression without host runId must reject')
+
+  // 4. REDIRECT E2E: cut3FloorRecipe('redirect') -> full tuple mint + post-send per-probe child stamp -> verifyReceipt
+  const redirRunId = 'run-e2e-redir-1'
+  const redirExec = await runCut3Recipe(cut3FloorRecipe('redirect', {
+    origin: ORIGIN,
+    method: 'GET',
+    pathAndQuery: '/auth/Go?next=https://{{redirectHost}}/cb',
+    controlPathAndQuery: '/auth/Go?next=/dashboard',
+    probePathAndQuery: '/auth/Go?next=https://{{redirectHost}}/cb',
+    vulnClass: 'open_redirect',
+    actor: { handle: 'alice', role: 'member', tenant: 'acme', auth: 'cookie' },
+  }), {
+    runId: redirRunId,
+    request(spec) {
+      const next = new URL(spec.pathAndQuery, ORIGIN).searchParams.get('next') ?? '/home'
+      return { status: 302, responseHeaders: { location: next }, body: '' }
+    },
+  })
+  assert.equal(redirExec.result.confirmed, true, `Redirect E2E TP must confirm: ${redirExec.result.verification.reason}`)
+  const redirTx = redirExec.result.transcript
+  const redirProbeEntry = redirTx.entries!.find(e => e.step.arm === 'probe')!
+  assert.equal(redirProbeEntry.hostRedirectCanary?.nonceStamp?.exchangeId, redirProbeEntry.exchangeId, 'redirect probe must carry exchangeId-bound child stamp')
+  assert.equal(redirProbeEntry.hostRedirectCanary?.nonceStamp?.runId, redirRunId)
+  // Negatives: cite exact redirect stamp on E2, route R2, run B, or with no runId -> ALL REJECT
+  const e2RedirEntries = redirTx.entries!.map(e => e.step.arm === 'probe' ? { ...e, exchangeId: 'e2-other', step: { ...e.step, id: 'e2-other' } } : e)
+  assert.equal(verifyReceipt(buildProofReceipt({ ...redirExec.receipt, exchangeIds: e2RedirEntries.map(e => e.exchangeId) }), { ...redirTx, entries: e2RedirEntries }, { runId: redirRunId }).confirmed, false, 'redirect stamp reused on E2 must reject')
+  const r2RedirEntries = redirTx.entries!.map(e => ({ ...e, step: { ...e.step, route: '/auth/Other', pathAndQuery: e.step.pathAndQuery?.replace('/auth/Go', '/auth/Other') } }))
+  assert.equal(verifyReceipt(buildProofReceipt({ ...redirExec.receipt, target: { ...redirExec.receipt.target, pathAndQuery: redirExec.receipt.target.pathAndQuery?.replace('/auth/Go', '/auth/Other') } }), { ...redirTx, entries: r2RedirEntries }, { runId: redirRunId }).confirmed, false, 'redirect stamp reused on route R2 must reject')
+  assert.equal(verifyReceipt(redirExec.receipt, { ...redirTx, runId: 'run-B' }, { runId: 'run-B' }).confirmed, false, 'redirect stamp reused on run B must reject')
+  assert.equal(verifyReceipt(redirExec.receipt, { entries: redirTx.entries }).confirmed, false, 'redirect without host runId must reject')
+
+  // 5. N3' Self-service own-API-key readback (no tenant field, non-admin route, anon 401) -> MUST REJECT
+  const selfKeyReceipt = buildProofReceipt({
+    vulnClass: 'info_disclosure',
+    target: { origin: ORIGIN, method: 'GET', pathAndQuery: '/api/me/keys' },
+    exchangeIds: ['sk-anon', 'sk-me'],
+    claimedDelta: 'Authenticated user reads their own API key on /api/me/keys.',
+  })
+  const selfKeyVerdict = verifyReceipt(selfKeyReceipt, {
+    entries: [
+      { exchangeId: 'sk-anon', origin: ORIGIN, step: mkStep({ id: 'sk-anon', arm: 'control', method: 'GET', route: '/api/me/keys', status: 401, actor: { handle: null, role: null, tenant: null, auth: 'unknown', sameSite: null }, body: '{"error":"unauthorized"}' }) },
+      { exchangeId: 'sk-me', origin: ORIGIN, step: mkStep({ id: 'sk-me', arm: 'probe', method: 'GET', route: '/api/me/keys', status: 200, actor: { handle: 'alice', role: 'member', tenant: null, auth: 'bearer', sameSite: null }, body: '{"key":"sk_live_0123456789abcdef"}' }) },
+    ],
+  })
+  assert.equal(selfKeyVerdict.confirmed, false, 'N3\': benign self-service API key readback on /api/me/keys must NOT get credential-pattern boundary credit')
+
+  // 6. NonceLedger.bindStamp with persistPayload=false (payloadJson === null) preserves parent payloadDigest identically
+  const nullPayloadLedger = new NonceLedger()
+  const parentNoPayload = nullPayloadLedger.mintStamp({ runId: 'run-null-p', oracleId: 'timing', origin: ORIGIN, method: 'GET', route: '/api/t', param: 'q' }, { delayMs: 2_000 }, { persistPayload: false })
+  const childNoPayload = nullPayloadLedger.bindStampToExchange(parentNoPayload, 'ex-null-1', 'probe')
+  assert.ok(childNoPayload)
+  assert.equal(childNoPayload.payloadDigest, parentNoPayload.payloadDigest, 'bindStamp with payloadJson=null must preserve parent payloadDigest without re-hashing')
+  assert.ok(nullPayloadLedger.verifyStamp(childNoPayload, { runId: 'run-null-p', oracleId: 'timing', origin: ORIGIN, method: 'GET', route: '/api/t', param: 'q', armRole: 'probe', exchangeId: 'ex-null-1', payloadDigest: parentNoPayload.payloadDigest }))
+
+  // 7. Missing runId at mint throws fail-closed
+  assert.throws(() => defaultHostMintedOracle.mintTimingChallenge('sqli', 2_000), /runId/i)
+  assert.throws(() => defaultHostMintedOracle.mintRedirectCanary('canary.kovo.invalid'), /runId/i)
+  assert.throws(() => defaultHostMintedOracle.mintExpressionChallenge('ssti'), /runId/i)
+  assert.throws(() => defaultHostMintedOracle.mintBooleanPair('1'), /runId/i)
 })

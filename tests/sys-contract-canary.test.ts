@@ -1410,7 +1410,7 @@ test('Check 6: R4-C-1 & R4-C-2 — every host-minted oracle enforces per-exchang
   // 6d) Fast runtime fail-closed checks on the verification kernel across all 5 host-minted oracle families.
   const oracle = new HostMintedOracle()
   const origin = 'https://canary-stamp-guard.example.invalid'
-  const exprCh = oracle.mintExpressionChallenge('ssti')
+  const exprCh = oracle.mintExpressionChallenge('ssti', '*', { runId: 'run-sys-contract-canary' })
   const noStampExpr = verifyHostExpressionProbe({
     probeRequest: { pathAndQuery: `/render?q=${encodeURIComponent(exprCh.expressionSyntax)}` },
     probeBody: `result=${exprCh.expectedOutput}`,

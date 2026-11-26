@@ -74,13 +74,14 @@ function statusTriangle(options: {
   tautologyStatus?: number
   dropBenign?: boolean
   ids?: string[]
-} = {}): { entries: ReceiptTranscriptEntry[]; exchangeIds: string[] } {
+} = {}): { entries: ReceiptTranscriptEntry[]; exchangeIds: string[]; runId: string } {
   const rounds = options.rounds ?? 2
   const ids = options.ids ?? Array.from({ length: rounds * 3 }, (_, index) => `sd-${index + 1}`)
   const entries: ReceiptTranscriptEntry[] = []
   const exchangeIds: string[] = []
+  const runId = 'run-v7-cut3b-status'
   for (let round = 0; round < rounds; round += 1) {
-    const pair = defaultHostMintedOracle.mintBooleanPair('widget', { param: 'q', style: 'single_quote' })
+    const pair = defaultHostMintedOracle.mintBooleanPair('widget', { param: 'q', style: 'single_quote', binding: { runId, origin: ORIGIN, method: 'GET', route: '/api/search', param: 'q' } })
     const arms: Array<{ spec: Parameters<typeof step>[0]; pairArm: 'baseline' | 'true' | 'false' }> = [
       {
         pairArm: 'baseline',
@@ -119,10 +120,10 @@ function statusTriangle(options: {
       if (options.dropBenign && spec.evidenceRole === 'benign_baseline') continue
       const id = ids[exchangeIds.length]!
       exchangeIds.push(id)
-      entries.push(entry(id, step(spec), { hostBooleanPair: defaultHostMintedOracle.stampBooleanPairArm(pair, pairArm) }))
+      entries.push(entry(id, step(spec), { hostBooleanPair: defaultHostMintedOracle.stampBooleanPairArm(pair, pairArm, { origin: ORIGIN, method: 'GET', route: '/api/search', param: 'q', exchangeId: id }) }))
     }
   }
-  return { entries, exchangeIds }
+  return { entries, exchangeIds, runId }
 }
 
 function statusReceipt(exchangeIds: readonly string[], vulnClass = 'sqli_status') {
@@ -139,7 +140,7 @@ function statusReceipt(exchangeIds: readonly string[], vulnClass = 'sqli_status'
 test('status_differential confirms the benign/tautology/contradiction triangle across rounds', () => {
   assert.equal(receiptRuleFor('sqli_status').rule, 'status_differential')
   const triangle = statusTriangle()
-  const result = verifyReceipt(statusReceipt(triangle.exchangeIds), { entries: triangle.entries })
+  const result = verifyReceipt(statusReceipt(triangle.exchangeIds), { runId: triangle.runId, entries: triangle.entries }, { runId: triangle.runId })
   assert.equal(result.confirmed, true, result.reason)
   assert.equal(result.rule, 'status_differential')
   assert.match(result.reason, /benign baseline/)
@@ -147,20 +148,20 @@ test('status_differential confirms the benign/tautology/contradiction triangle a
 
 test('status_differential rejects a single malformed 200 -> 500', () => {
   const single = statusTriangle({ rounds: 1, contradictionStatus: 500 })
-  const result = verifyReceipt(statusReceipt(single.exchangeIds), { entries: single.entries })
+  const result = verifyReceipt(statusReceipt(single.exchangeIds), { runId: single.runId, entries: single.entries }, { runId: single.runId })
   assert.equal(result.confirmed, false)
   assert.match(result.reason, /500|contradiction|2xx baseline|complete/i)
 })
 
 test('status_differential rejects a triangle with no benign baseline', () => {
   const triangle = statusTriangle({ dropBenign: true })
-  const result = verifyReceipt(statusReceipt(triangle.exchangeIds), { entries: triangle.entries })
+  const result = verifyReceipt(statusReceipt(triangle.exchangeIds), { runId: triangle.runId, entries: triangle.entries }, { runId: triangle.runId })
   assert.equal(result.confirmed, false)
 })
 
 test('status_differential rejects a 5xx contradiction even across rounds', () => {
   const triangle = statusTriangle({ contradictionStatus: 500 })
-  const result = verifyReceipt(statusReceipt(triangle.exchangeIds), { entries: triangle.entries })
+  const result = verifyReceipt(statusReceipt(triangle.exchangeIds), { runId: triangle.runId, entries: triangle.entries }, { runId: triangle.runId })
   assert.equal(result.confirmed, false)
 })
 
@@ -168,7 +169,7 @@ test('status_differential rejects an unstable tautology/contradiction status pai
   const first = statusTriangle({ rounds: 1 })
   const second = statusTriangle({ rounds: 1, contradictionStatus: 403, ids: ['x2', 'x3', 'x4'] })
   const entries = [...first.entries, ...second.entries]
-  const result = verifyReceipt(statusReceipt([...first.exchangeIds, ...second.exchangeIds]), { entries })
+  const result = verifyReceipt(statusReceipt([...first.exchangeIds, ...second.exchangeIds]), { runId: first.runId, entries }, { runId: first.runId })
   assert.equal(result.confirmed, false)
   assert.match(result.reason, /unstable/i)
 })

@@ -1250,7 +1250,7 @@ test('path parity [evaluateClaims]: enforces identical TP/FP verdicts across all
     const templateVars: Record<string, string> = {}
     if (c.proofReceipt?.mintRedirectCanary) {
       const oracle = new HostMintedOracle()
-      templateVars.MINTED_REDIRECT_HOST = oracle.mintRedirectCanary().host
+      templateVars.MINTED_REDIRECT_HOST = oracle.mintRedirectCanary('canary.kovo.invalid', { runId: `parity_eval_${c.id}` }).host
     }
     const { store, idMap } = populateTranscriptStore(c, origin, templateVars)
     const factLog = HostFactLog.fromTranscriptStore(store)
@@ -1395,24 +1395,43 @@ test('path parity [verifyReceipt]: verifies all manifest receipt classes offline
   for (const c of corpus) {
     const pr = c.proofReceipt!
     const oracle = new HostMintedOracle()
+    const runId = `parity_run_${c.id}`
     const templateVars: Record<string, string> = {}
+    const redirProbeEx = pr.mintRedirectCanary ? c.exchanges.find(ex => ex.arm === 'probe') : undefined
     let hostRedirectCanaryHost: string | undefined
+    let hostRedirectCanary: ReturnType<HostMintedOracle['mintRedirectCanary']> | undefined
     if (pr.mintRedirectCanary) {
-      const canary = oracle.mintRedirectCanary('canary.kovo.invalid')
-      hostRedirectCanaryHost = canary.host
-      templateVars.MINTED_REDIRECT_HOST = canary.host
+      hostRedirectCanary = oracle.mintRedirectCanary('canary.kovo.invalid', {
+        runId,
+        origin: redirProbeEx?.originOverride ?? origin,
+        method: redirProbeEx?.method ?? pr.targetMethod ?? 'GET',
+        route: (redirProbeEx?.pathAndQuery ?? pr.targetPathAndQuery ?? '/').split('?')[0] ?? '/',
+        ...(pr.param ? { param: pr.param } : {}),
+        armRole: 'probe',
+        ...(redirProbeEx?.id ? { exchangeId: redirProbeEx.id } : {}),
+      })
+      hostRedirectCanaryHost = hostRedirectCanary.host
+      templateVars.MINTED_REDIRECT_HOST = hostRedirectCanary.host
     }
+    const firstTimingEx = pr.timingChallenge ? c.exchanges.find(ex => ex.op !== 'oob') : undefined
     const hostTimingChallenge = pr.timingChallenge
-      ? oracle.mintTimingChallenge(pr.timingChallenge.family, pr.timingChallenge.delayMs)
+      ? oracle.mintTimingChallenge(pr.timingChallenge.family, pr.timingChallenge.delayMs, undefined, {
+          runId,
+          origin: firstTimingEx?.originOverride ?? origin,
+          method: firstTimingEx?.method ?? pr.targetMethod ?? 'GET',
+          route: (firstTimingEx?.pathAndQuery ?? pr.targetPathAndQuery ?? '/').split('?')[0] ?? '/',
+          ...(pr.param ? { param: pr.param } : {}),
+        })
       : undefined
     const booleanPairsByRound = new Map<number, ReturnType<HostMintedOracle['mintBooleanPair']>>()
-    const getRoundBooleanPair = (round: number) => {
+    const getRoundBooleanPair = (round: number, exOrigin: string, exMethod: string, exRoute: string) => {
       if (!pr.mintBooleanPair) return undefined
       let pair = booleanPairsByRound.get(round)
       if (!pair) {
         pair = oracle.mintBooleanPair(pr.mintBooleanPair.baseValue, {
           param: pr.mintBooleanPair.param,
           style: pr.mintBooleanPair.style ?? 'numeric',
+          binding: { runId, origin: exOrigin, method: exMethod, route: exRoute, param: pr.mintBooleanPair.param },
         })
         booleanPairsByRound.set(round, pair)
       }
@@ -1428,14 +1447,21 @@ test('path parity [verifyReceipt]: verifies all manifest receipt classes offline
       seq += 1
       const p = ex.persona ? personaByHandle.get(ex.persona) : undefined
       let pathAndQuery = substituteTemplate(ex.pathAndQuery, templateVars)
+      const exOrigin = ex.originOverride ?? origin
+      const exRoute = pathAndQuery.split('?')[0] ?? '/'
       let hostBooleanPair: ReceiptTranscriptEntry['hostBooleanPair']
       if (pr.mintBooleanPair && ex.booleanPairArm) {
-        const pair = getRoundBooleanPair(ex.booleanPairRound ?? 1)!
-        hostBooleanPair = oracle.stampBooleanPairArm(pair, ex.booleanPairArm)
+        const pair = getRoundBooleanPair(ex.booleanPairRound ?? 1, exOrigin, ex.method, exRoute)!
+        hostBooleanPair = oracle.stampBooleanPairArm(pair, ex.booleanPairArm, {
+          origin: exOrigin, method: ex.method, route: exRoute, param: pr.mintBooleanPair.param, exchangeId: ex.id,
+        })
         const parsed = new URL(pathAndQuery, 'http://kovo.invalid')
         parsed.searchParams.set(pr.mintBooleanPair.param, hostBooleanPair.mintedValue)
         pathAndQuery = `${parsed.pathname}${parsed.search}`
       }
+      const entryTimingChallenge = hostTimingChallenge && (ex.arm === 'control' || ex.arm === 'probe')
+        ? oracle.stampTimingChallengeArm(hostTimingChallenge, ex.arm, { exchangeId: ex.id })
+        : hostTimingChallenge
       const responseHeaders = substituteHeaders(ex.responseHeaders, templateVars)
       const reqHeaders: Record<string, string> = {
         ...(p ? { [p.headerName]: p.headerValue } : {}),
@@ -1454,16 +1480,16 @@ test('path parity [verifyReceipt]: verifies all manifest receipt classes offline
         exchangeId: ex.id,
         seq,
         op: ex.op ?? 'http',
-        origin: ex.originOverride ?? origin,
+        origin: exOrigin,
         startedAt,
         endedAt,
         durationMs: ex.durationMs ?? 12,
         carrierText,
         ...(ex.evidenceRole ? { evidenceRole: ex.evidenceRole } : {}),
         ...(ex.raceBatchId ? { raceBatchId: ex.raceBatchId } : {}),
-        ...(hostTimingChallenge ? { hostTimingChallenge } : {}),
+        ...(entryTimingChallenge ? { hostTimingChallenge: entryTimingChallenge } : {}),
         ...(hostBooleanPair ? { hostBooleanPair } : {}),
-        ...(hostRedirectCanaryHost ? { hostRedirectCanaryHost } : {}),
+        ...(hostRedirectCanaryHost && ex.arm === 'probe' ? { hostRedirectCanaryHost, ...(hostRedirectCanary ? { hostRedirectCanary } : {}) } : {}),
         step: {
           id: ex.id,
           arm: ex.arm,
@@ -1526,6 +1552,7 @@ test('path parity [verifyReceipt]: verifies all manifest receipt classes offline
     })
 
     const transcript: ReceiptTranscript = {
+      runId,
       entries,
       oobEvents,
       browserTraces,
@@ -1533,7 +1560,7 @@ test('path parity [verifyReceipt]: verifies all manifest receipt classes offline
       ...(hostRedirectCanaryHost ? { hostRedirectCanaryHost } : {}),
       oobSigningKey: SIGNING_KEY,
     }
-    const ver = verifyReceipt(receipt, transcript, { signingKey: SIGNING_KEY, hostMintedOracle: oracle })
+    const ver = verifyReceipt(receipt, transcript, { signingKey: SIGNING_KEY, hostMintedOracle: oracle, runId })
     assert.equal(
       ver.confirmed,
       c.expected.confirmed,

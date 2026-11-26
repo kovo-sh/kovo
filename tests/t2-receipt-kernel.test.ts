@@ -662,19 +662,20 @@ test('H-14: auth_bypass rejects sealed capabilities, session cookies/jars, admin
 // ============================================================================
 
 test('H-15: timing differential confirms same-origin/method/route/persona with host-minted delay >=5 interleaved arms and rejects mismatched route, persona, method, origin, or 1+1 arms', () => {
-  const challenge = defaultHostMintedOracle.mintTimingChallenge('sqli', 1_800)
+  const timingRunId = 'run-t2-timing'
+  const challenge = defaultHostMintedOracle.mintTimingChallenge('sqli', 1_800, undefined, { runId: timingRunId, origin: ORIGIN, method: 'GET', route: '/api/search', param: 'q' })
   const mkTimingExchanges = (probeOverrides: Partial<ScriptProofExchange> = {}): ScriptProofExchange[] => [
     ...Array.from({ length: 5 }, (_, i) => ({
       exchangeId: `c${i}`, seq: i * 2, method: 'GET',
       pathAndQuery: `/api/search?q=${encodeURIComponent(challenge.controlToken)}`,
       origin: ORIGIN, status: 200, durationMs: 35, personaHandle: 'alice', body: '{"items":[]}',
-      hostTimingChallenge: challenge,
+      hostTimingChallenge: defaultHostMintedOracle.stampTimingChallengeArm(challenge, 'control', { exchangeId: `c${i}` }),
     })),
     ...Array.from({ length: 5 }, (_, i) => ({
       exchangeId: `p${i}`, seq: i * 2 + 1, method: 'GET',
       pathAndQuery: `/api/search?q=${encodeURIComponent(challenge.delayToken)}`,
       origin: ORIGIN, status: 200, durationMs: 1_800, personaHandle: 'alice', body: '{"items":[]}',
-      hostTimingChallenge: challenge,
+      hostTimingChallenge: defaultHostMintedOracle.stampTimingChallengeArm(challenge, 'probe', { exchangeId: `p${i}` }),
       ...probeOverrides,
     })),
   ]
@@ -688,24 +689,25 @@ test('H-15: timing differential confirms same-origin/method/route/persona with h
   // Positive: identical origin, method, route, persona, >=5 interleaved arms, host-minted delay vs zero-delay control
   const okBuilt = buildAgentScriptReceipt({
     origin: ORIGIN,
+    runId: timingRunId,
     title: 'Blind timing on /api/search',
     exchanges: mkTimingExchanges(),
     claims: [timingClaim],
   })
   assert.ok(okBuilt)
-  const okVerdict = verifyReceipt(okBuilt.receipt, okBuilt.transcript)
+  const okVerdict = verifyReceipt(okBuilt.receipt, okBuilt.transcript, { runId: timingRunId })
   assert.equal(okVerdict.confirmed, true, okVerdict.reason)
 
   // Negative 1 (buildAgentScriptReceipt): different routes (`/api/search` vs `/api/export`)
   assert.equal(
-    buildAgentScriptReceipt({ origin: ORIGIN, title: 'Cross-route timing', exchanges: mkTimingExchanges({ pathAndQuery: `/api/export?q=${encodeURIComponent(challenge.delayToken)}` }), claims: [timingClaim] }),
+    buildAgentScriptReceipt({ origin: ORIGIN, runId: timingRunId, title: 'Cross-route timing', exchanges: mkTimingExchanges({ pathAndQuery: `/api/export?q=${encodeURIComponent(challenge.delayToken)}` }), claims: [timingClaim] }),
     null,
     'buildAgentScriptReceipt must reject cross-route timing',
   )
 
   // Negative 2 (buildAgentScriptReceipt): different personas (`alice` vs `admin`)
   assert.equal(
-    buildAgentScriptReceipt({ origin: ORIGIN, title: 'Cross-persona timing', exchanges: mkTimingExchanges({ personaHandle: 'admin' }), claims: [timingClaim] }),
+    buildAgentScriptReceipt({ origin: ORIGIN, runId: timingRunId, title: 'Cross-persona timing', exchanges: mkTimingExchanges({ personaHandle: 'admin' }), claims: [timingClaim] }),
     null,
     'buildAgentScriptReceipt must reject cross-persona timing',
   )
@@ -719,12 +721,13 @@ test('H-15: timing differential confirms same-origin/method/route/persona with h
     claimedDelta: 'Single pair timing claim must fail closed.',
   })
   assert.equal(verifyReceipt(onePairReceipt, {
+    runId: timingRunId,
     hostTimingChallenge: challenge,
     entries: [
       { exchangeId: 'c0', seq: 1, origin: ORIGIN, durationMs: 40, step: mkStep({ id: 'c0', arm: 'control', method: 'GET', route: '/api/search', pathAndQuery: `/api/search?q=${encodeURIComponent(challenge.controlToken)}`, status: 200 }) },
       { exchangeId: 'p0', seq: 2, origin: ORIGIN, durationMs: 2_000, step: mkStep({ id: 'p0', arm: 'probe', method: 'GET', route: '/api/search', pathAndQuery: `/api/search?q=${encodeURIComponent(challenge.delayToken)}`, status: 200 }) },
     ],
-  }).confirmed, false, '1+1 timing arms must be rejected by R2 H-15')
+  }, { runId: timingRunId }).confirmed, false, '1+1 timing arms must be rejected by R2 H-15')
 
   const timingReceipt = buildProofReceipt({
     vulnClass: 'blind_sqli',
@@ -733,13 +736,14 @@ test('H-15: timing differential confirms same-origin/method/route/persona with h
     claimedDelta: 'Timing separation claimed across 5 interleaved host-minted rounds.',
   })
   const makeDirect = (probePatch: Partial<ReceiptTranscriptEntry> & { stepPatch?: Partial<ImpactStep> }): ReceiptTranscript => ({
+    runId: timingRunId,
     entries: Array.from({ length: 5 }, (_, i) => [
       {
         exchangeId: `c${i}`,
         seq: i * 2,
         origin: ORIGIN,
         durationMs: 40,
-        hostTimingChallenge: challenge,
+        hostTimingChallenge: defaultHostMintedOracle.stampTimingChallengeArm(challenge, 'control', { exchangeId: `c${i}` }),
         step: mkStep({ id: `c${i}`, arm: 'control', method: 'GET', route: '/api/search', pathAndQuery: `/api/search?q=${encodeURIComponent(challenge.controlToken)}`, status: 200 }),
       },
       {
@@ -747,16 +751,16 @@ test('H-15: timing differential confirms same-origin/method/route/persona with h
         seq: i * 2 + 1,
         origin: probePatch.origin ?? ORIGIN,
         durationMs: 2_000,
-        hostTimingChallenge: challenge,
+        hostTimingChallenge: defaultHostMintedOracle.stampTimingChallengeArm(challenge, 'probe', { exchangeId: `p${i}` }),
         step: mkStep({ id: `p${i}`, arm: 'probe', method: 'GET', route: '/api/search', pathAndQuery: `/api/search?q=${encodeURIComponent(challenge.delayToken)}`, status: 200, ...(probePatch.stepPatch ?? {}) }),
       },
     ]).flat(),
   })
-  assert.equal(verifyReceipt(timingReceipt, makeDirect({})).confirmed, true)
-  assert.equal(verifyReceipt(timingReceipt, makeDirect({ stepPatch: { route: '/api/slow-export', pathAndQuery: `/api/slow-export?q=${encodeURIComponent(challenge.delayToken)}` } })).confirmed, false)
-  assert.equal(verifyReceipt(timingReceipt, makeDirect({ stepPatch: { actor: { handle: 'admin', role: 'admin', tenant: 'acme', auth: 'bearer', sameSite: null } } })).confirmed, false)
-  assert.equal(verifyReceipt(timingReceipt, makeDirect({ stepPatch: { method: 'POST' } })).confirmed, false)
-  assert.equal(verifyReceipt(timingReceipt, makeDirect({ origin: OTHER_ORIGIN })).confirmed, false)
+  assert.equal(verifyReceipt(timingReceipt, makeDirect({}), { runId: timingRunId }).confirmed, true)
+  assert.equal(verifyReceipt(timingReceipt, makeDirect({ stepPatch: { route: '/api/slow-export', pathAndQuery: `/api/slow-export?q=${encodeURIComponent(challenge.delayToken)}` } }), { runId: timingRunId }).confirmed, false)
+  assert.equal(verifyReceipt(timingReceipt, makeDirect({ stepPatch: { actor: { handle: 'admin', role: 'admin', tenant: 'acme', auth: 'bearer', sameSite: null } } }), { runId: timingRunId }).confirmed, false)
+  assert.equal(verifyReceipt(timingReceipt, makeDirect({ stepPatch: { method: 'POST' } }), { runId: timingRunId }).confirmed, false)
+  assert.equal(verifyReceipt(timingReceipt, makeDirect({ origin: OTHER_ORIGIN }), { runId: timingRunId }).confirmed, false)
 })
 
 // ============================================================================

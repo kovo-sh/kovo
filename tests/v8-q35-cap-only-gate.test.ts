@@ -94,6 +94,7 @@ function makeInMemoryHost(
 ): { host: ProveHandlerHost; transcript: TranscriptStore } {
   const transcript = new TranscriptStore()
   const host: ProveHandlerHost = {
+    runId: 'run-v8-q35-cap-only',
     transcript,
     defaultOrigin: ORIGIN,
     canaryBroker: undefined,

@@ -567,8 +567,9 @@ describe('R3-08 entry guard: persona-secret-needles', () => {
 describe('R3-08 entry guard: host-minted-oracle-stamps', () => {
   test('production verifyReceipt fails closed when hostMintedOracle is omitted or exchange lacks per-exchange stamp', () => {
     const origin = 'https://app.northstar.example'
+    const runId = 'run-r3-08-entry-guard'
     const oracle = new HostMintedOracle()
-    const ch = oracle.mintExpressionChallenge('ssti')
+    const ch = oracle.mintExpressionChallenge('ssti', '*', { runId, origin, method: 'GET', route: '/render', param: 'q', armRole: 'probe', exchangeId: 'p1' })
     const receipt = buildProofReceipt({
       vulnClass: 'ssti',
       target: { origin, method: 'GET', pathAndQuery: '/render?q=hi', param: 'q' },
@@ -577,6 +578,7 @@ describe('R3-08 entry guard: host-minted-oracle-stamps', () => {
     })
 
     const transcript = {
+      runId,
       entries: [
         {
           exchangeId: 'c1',
@@ -601,16 +603,16 @@ describe('R3-08 entry guard: host-minted-oracle-stamps', () => {
     }
 
     // Without hostMintedOracle -> MUST fail closed (confirmed: false)!
-    const withoutOracle = verifyReceipt(receipt, transcript)
+    const withoutOracle = verifyReceipt(receipt, transcript, { runId })
     assert.equal(withoutOracle.confirmed, false, 'verifyReceipt without hostMintedOracle MUST fail closed')
 
     // With mismatched/fresh oracle that did not mint `ch` -> MUST fail closed!
     const foreignOracle = new HostMintedOracle()
-    const withForeignOracle = verifyReceipt(receipt, transcript, { hostMintedOracle: foreignOracle })
+    const withForeignOracle = verifyReceipt(receipt, transcript, { hostMintedOracle: foreignOracle, runId })
     assert.equal(withForeignOracle.confirmed, false, 'verifyReceipt with foreign HostMintedOracle MUST fail closed')
 
     // With the real minting oracle -> confirms!
-    const withMintingOracle = verifyReceipt(receipt, transcript, { hostMintedOracle: oracle })
+    const withMintingOracle = verifyReceipt(receipt, transcript, { hostMintedOracle: oracle, runId })
     assert.equal(withMintingOracle.confirmed, true, 'verifyReceipt with matching HostMintedOracle should confirm valid stamped probe')
   })
 })

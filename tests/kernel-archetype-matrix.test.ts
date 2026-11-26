@@ -268,7 +268,7 @@ function runImpactSubClasses(arch: BenignArchetypeDefinition): CellRunOutcome {
   // 1h. injection (sqli_error + host-minted expression challenge): benign validator/sanitizer/coercion response
   {
     const s = arch.createSession()
-    const exprChallenge = defaultHostMintedOracle.mintExpressionChallenge('ssti')
+    const exprChallenge = defaultHostMintedOracle.mintExpressionChallenge('ssti', '*', { runId: `matrix_${arch.id}_expr` })
     const ctlPath = withQueryParam(s.primaryRoute, s.queryParam, s.baseParamValue)
     const prbPath = withQueryParam(s.primaryRoute, s.queryParam, `${s.baseParamValue}_${exprChallenge.expressionSyntax}_overlong_probe`)
     s.send('inj_ctl', { method: 'GET', pathAndQuery: ctlPath, actor: MATRIX_ACTORS.viewerA, arm: 'control' })
@@ -339,6 +339,7 @@ function runBooleanRule(arch: BenignArchetypeDefinition): CellRunOutcome {
     const pair = defaultHostMintedOracle.mintBooleanPair(baseVal, {
       param: s.queryParam,
       style: /^\d+$/.test(baseVal) ? 'numeric' : 'single_quote',
+      binding: { runId: `matrix_${arch.id}_lateral` },
     })
     const bStamp = defaultHostMintedOracle.stampBooleanPairArm(pair, 'baseline')
     const tStamp = defaultHostMintedOracle.stampBooleanPairArm(pair, 'true')
@@ -391,6 +392,7 @@ function runStatusDifferentialRule(arch: BenignArchetypeDefinition): CellRunOutc
     const pair = defaultHostMintedOracle.mintBooleanPair(baseVal, {
       param: s.queryParam,
       style: /^\d+$/.test(baseVal) ? 'numeric' : 'single_quote',
+      binding: { runId: `matrix_${arch.id}_lateral` },
     })
     const bStamp = defaultHostMintedOracle.stampBooleanPairArm(pair, 'baseline')
     const tStamp = defaultHostMintedOracle.stampBooleanPairArm(pair, 'true')
@@ -437,7 +439,7 @@ function runStatusDifferentialRule(arch: BenignArchetypeDefinition): CellRunOutc
 
 function runTimingRule(arch: BenignArchetypeDefinition): CellRunOutcome {
   const s = arch.createSession()
-  const challenge = defaultHostMintedOracle.mintTimingChallenge('timing', 1500)
+  const challenge = defaultHostMintedOracle.mintTimingChallenge('timing', 1500, undefined, { runId: `matrix_${arch.id}_timing` })
   const exchangeIds: string[] = []
   // 5 interleaved control + 5 probe arms with realistic benign constant latency (~12-16ms)
   for (let i = 1; i <= 5; i += 1) {
@@ -532,7 +534,7 @@ function runBrowserRule(arch: BenignArchetypeDefinition): CellRunOutcome {
 
 function runRedirectRule(arch: BenignArchetypeDefinition): CellRunOutcome {
   const s = arch.createSession()
-  const canary = defaultHostMintedOracle.mintRedirectCanary('canary.kovo.invalid')
+  const canary = defaultHostMintedOracle.mintRedirectCanary('canary.kovo.invalid', { runId: `matrix_${arch.id}_redir` })
   const route = arch.id === 'cache_hit_and_pagination' ? '/auth/sso' : s.primaryRoute
   const ctlPath = withQueryParam(route, 'next', '/dashboard')
   const prbPath = withQueryParam(route, 'next', `https://${canary.host}/landing`)
@@ -1242,6 +1244,7 @@ test('R3-12 executable matrix: all SINGLE_HOP_ORACLE_RULES and REGISTERED_V8_ORA
     const pair = defaultHostMintedOracle.mintBooleanPair(baseVal, {
       param: s.queryParam,
       style: /^\d+$/.test(baseVal) ? 'numeric' : 'single_quote',
+      binding: { runId: `matrix_${arch.id}_lateral` },
     })
     const bStamp = defaultHostMintedOracle.stampBooleanPairArm(pair, 'baseline')
     const tStamp = defaultHostMintedOracle.stampBooleanPairArm(pair, 'true')

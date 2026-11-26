@@ -16,7 +16,7 @@ import {
 import type { AmbientAuth, BoundaryClass, ImpactClass, ImpactStep, InjectionFamily, InjectionFamilyScope, ActorIdentity, RoleName } from './oracle-invariants.ts'
 import { isJobOrHandleStub } from './v8-oracle-families.ts'
 import { deriveRecordAuthMeta, resolveCanonicalArm, stepHasRedactedRequestPlane, type HostFactLog } from './host-fact-log.ts'
-import { defaultHostMintedOracle, normalizeRequestCarrier, verifyHostExpressionProbe, verifySignedUrlMintPair, type HostMintedExpressionChallenge, type HostStampedBooleanPair } from './proof-receipt.ts'
+import { defaultHostMintedOracle, exactPathnameOf, normalizeRequestCarrier, verifyHostExpressionProbe, verifySignedUrlMintPair, type HostMintedExpressionChallenge, type HostMintedRedirectCanary, type HostMintedTimingChallenge, type HostStampedBooleanPair } from './proof-receipt.ts'
 import { compileSafeClaimRegex, MAX_CLAIM_REGEX_HAYSTACK } from './safe-regex.ts'
 export { compileSafeClaimRegex } from './safe-regex.ts'
 import { DEFAULT_ORACLE_SPEC_REGISTRY, evaluateRegisteredOracleClaim, isRegisteredImpactClass, isSignedUrlMintLabel, registerOracleClaimEvaluator, sealOracleClaimEvaluators } from './oracle-spec.ts'
@@ -108,8 +108,8 @@ export interface VerifyTranscriptRecord {
   request?: VerifyTranscriptRequest
   response?: VerifyTranscriptResponse
   artifact?: VerifyTranscriptArtifact
-  hostExpressionChallenge?: HostMintedExpressionChallenge
-  hostBooleanPair?: HostStampedBooleanPair
+  hostExpressionChallenge?: HostMintedExpressionChallenge; hostTimingStamp?: HostMintedTimingChallenge
+  hostBooleanPair?: HostStampedBooleanPair; hostRedirectHost?: string | null; hostRedirectCanary?: HostMintedRedirectCanary
   error?: string
   errorCode?: 'denied' | 'failed' | 'approval_required'
   signature: string
@@ -212,8 +212,8 @@ export class TranscriptStore {
     request?: VerifyTranscriptRequest
     response?: VerifyTranscriptResponse
     artifact?: VerifyTranscriptArtifact
-    hostExpressionChallenge?: HostMintedExpressionChallenge
-    hostBooleanPair?: HostStampedBooleanPair
+    hostExpressionChallenge?: HostMintedExpressionChallenge; hostTimingStamp?: HostMintedTimingChallenge
+    hostBooleanPair?: HostStampedBooleanPair; hostRedirectHost?: string | null; hostRedirectCanary?: HostMintedRedirectCanary
     error?: string
     errorCode?: 'denied' | 'failed' | 'approval_required'
     body?: string
@@ -230,8 +230,8 @@ export class TranscriptStore {
       ...(input.request ? { request: input.request } : {}),
       ...(input.response ? { response: input.response } : {}),
       ...(input.artifact ? { artifact: input.artifact } : {}),
-      ...(input.hostExpressionChallenge ? { hostExpressionChallenge: input.hostExpressionChallenge } : {}),
-      ...(input.hostBooleanPair ? { hostBooleanPair: input.hostBooleanPair } : {}),
+      ...(input.hostExpressionChallenge ? { hostExpressionChallenge: input.hostExpressionChallenge } : {}), ...(input.hostTimingStamp ? { hostTimingStamp: input.hostTimingStamp } : {}),
+      ...(input.hostBooleanPair ? { hostBooleanPair: input.hostBooleanPair } : {}), ...(input.hostRedirectHost !== undefined ? { hostRedirectHost: input.hostRedirectHost } : {}), ...(input.hostRedirectCanary ? { hostRedirectCanary: input.hostRedirectCanary } : {}),
       ...(input.error ? { error: input.error.slice(0, 1024) } : {}),
       ...(input.errorCode ? { errorCode: input.errorCode } : {}),
     }
@@ -254,21 +254,20 @@ export class TranscriptStore {
     return record
   }
 
-  get(exchangeId: string): VerifyTranscriptRecord | undefined {
-    return this.records.get(exchangeId)
+  /** R3-16: Persist post-send exchange-bound host stamps onto an existing signed transcript record. */
+  updateHostStamps(exchangeId: string, stamps: Partial<Pick<VerifyTranscriptRecord, 'hostExpressionChallenge' | 'hostTimingStamp' | 'hostBooleanPair' | 'hostRedirectHost' | 'hostRedirectCanary'>>): VerifyTranscriptRecord | null {
+    const existing = this.records.get(exchangeId)
+    if (!existing) return null
+    const { signature: _sig, ...rest } = existing
+    const unsigned: Omit<VerifyTranscriptRecord, 'signature'> = { ...rest, ...stamps }
+    const updated: VerifyTranscriptRecord = { ...unsigned, signature: this.sign(unsigned) }
+    this.records.set(exchangeId, updated)
+    return updated
   }
-
-  body(exchangeId: string): string | undefined {
-    return this.bodies.get(exchangeId)
-  }
-
-  requestBody(exchangeId: string): string | undefined {
-    return this.requestBodies.get(exchangeId)
-  }
-
-  list(): VerifyTranscriptRecord[] {
-    return [...this.records.values()]
-  }
+  get(exchangeId: string): VerifyTranscriptRecord | undefined { return this.records.get(exchangeId) }
+  body(exchangeId: string): string | undefined { return this.bodies.get(exchangeId) }
+  requestBody(exchangeId: string): string | undefined { return this.requestBodies.get(exchangeId) }
+  list(): VerifyTranscriptRecord[] { return [...this.records.values()] }
 
   summaries(): TranscriptSummary[] {
     return this.list().map(record => {
@@ -511,7 +510,7 @@ export interface VerifyClaimContext {
   /** Boundary class declared by the proof title/description; auth claims need a `boundary` claim. */
   claimedBoundary?: BoundaryClass
   /** Optional immutable HostFactLog; when present, all step facts derive exclusively from it. */
-  factLog?: HostFactLog
+  factLog?: HostFactLog; runId?: string
   /** Optional CWE/descriptor/family hints for label-invariant class & family binding. */
   cwe?: string | null; category?: string | null; title?: string | null; description?: string | null; injectionFamily?: InjectionFamily | null
 }
@@ -1452,8 +1451,9 @@ export function evaluateClaim(
   const requireRecord = (id: string): VerifyTranscriptRecord | null => requireAllowedRecord(store, context, id)
   switch (claim.kind) {
     case 'host_evaluated_expression': {
-      const verifiedChs = claim.hostMintedChallengeIds.map(id => defaultHostMintedOracle.verifyExpressionChallenge(defaultHostMintedOracle.getExpressionChallenge(id)))
-      if (verifiedChs.length === 0 || verifiedChs.some(c => !c)) return { claim, passed: false, detail: 'host_evaluated_expression references an unknown or unverified host-minted challenge.', observed: { rejectedBy: 'host_evaluated_expression' } }
+      const effRunId = context.runId ?? context.factLog?.runId ?? null
+      const verifiedChs = effRunId ? claim.hostMintedChallengeIds.map(id => defaultHostMintedOracle.verifyExpressionChallenge(defaultHostMintedOracle.getExpressionChallenge(id, effRunId), { runId: effRunId })) : []
+      if (!effRunId || verifiedChs.length === 0 || verifiedChs.some(c => !c)) return { claim, passed: false, detail: 'host_evaluated_expression references an unknown or unverified host-minted challenge (or lacks a host runId).', observed: { rejectedBy: 'host_evaluated_expression' } }
       const chs = verifiedChs as NonNullable<(typeof verifiedChs)[number]>[]
       const ctlRecs = claim.controlIds.map(requireRecord), prbRecs = claim.probeIds.map(requireRecord)
       if (ctlRecs.some(r => !r?.response) || prbRecs.some(r => !r?.response)) return { claim, passed: false, detail: 'host_evaluated_expression references an unknown or failed control/probe exchange.', observed: { rejectedBy: 'host_evaluated_expression' } }
@@ -1463,7 +1463,7 @@ export function evaluateClaim(
       const outputs = chs.map(c => c.expectedOutput), varying = outputs.length < 2 || new Set(outputs).size === outputs.length
       const matched = chs.length === prbBodies.length && chs.every((ch, i) => {
         const pid = claim.probeIds[i]!, fact = context.factLog?.getExchange(pid), prbRec = prbRecs[i]!
-        const check = verifyHostExpressionProbe({ probeRequest: { pathAndQuery: fact?.pathAndQuery ?? prbRec.request?.pathAndQuery, requestBody: fact?.rawRequestBody ?? store.requestBody(pid) ?? null, requestHeaders: fact?.requestHeaders ?? prbRec.request?.headers ?? null }, probeBody: prbBodies[i]!, probeStatus: recordStatus(prbRec), controlBodies: ctlBodies, stampedChallenge: fact?.hostExpressionChallenge ?? prbRec.hostExpressionChallenge, expectedChallengeId: ch.challengeId, vulnClass: claim.vulnClass })
+        const check = verifyHostExpressionProbe({ probeRequest: { pathAndQuery: fact?.pathAndQuery ?? prbRec.request?.pathAndQuery, requestBody: fact?.rawRequestBody ?? store.requestBody(pid) ?? null, requestHeaders: fact?.requestHeaders ?? prbRec.request?.headers ?? null }, probeBody: prbBodies[i]!, probeStatus: recordStatus(prbRec), controlBodies: ctlBodies, stampedChallenge: fact?.hostExpressionChallenge ?? prbRec.hostExpressionChallenge, expectedChallengeId: ch.challengeId, vulnClass: claim.vulnClass, binding: { runId: effRunId, origin: (fact?.origin || prbRec.request?.origin), method: (fact?.method || prbRec.request?.method), route: exactPathnameOf(fact?.pathAndQuery ?? prbRec.request?.pathAndQuery ?? '/'), armRole: 'probe', exchangeId: pid } })
         return check.ok && outputs.every((o, j) => j === i || !prbBodies[i]!.includes(o))
       })
       const passed = ctlRecs.every(ok2xx) && prbRecs.every(ok2xx) && varying && matched

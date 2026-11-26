@@ -480,7 +480,7 @@ test('R4-C-2: prove.injection stamps hostExpressionChallenge on transcript recor
 test('R4-C-1: verify-support enforces canonical skeleton / equal-length / same-charset and prove.differential stamps hostBooleanPair', async t => {
   // Pure unit guards on mintHostBooleanPair & verifyBooleanArmBaseParity
   assert.throws(() => mintHostBooleanPair('', { oracle: defaultHostMintedOracle }), /non-empty baseValue/i)
-  const pair = mintHostBooleanPair('10', { style: 'numeric', oracle: defaultHostMintedOracle })
+  const pair = mintHostBooleanPair('10', { style: 'numeric', oracle: { mintBooleanPair: (b, o) => defaultHostMintedOracle.mintBooleanPair(b, { ...o, binding: { runId: 'run-r4-c1-unit' } }) } })
   assert.equal(pair.trueValue.length, pair.falseValue.length)
   assert.equal([...pair.trueValue].sort().join(''), [...pair.falseValue].sort().join(''))
   assert.ok(defaultHostMintedOracle.getBooleanPair(pair.challengeId), 'mintHostBooleanPair with oracle must register in defaultHostMintedOracle')
