@@ -3,6 +3,12 @@ import { createHash, createHmac, randomBytes } from 'node:crypto'
 import { accessSync, chmodSync, constants, lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { buildSecretEncodingVariants, type NamedSecret } from './redact.ts'
+import {
+  DEFAULT_MAX_COMPOSITE_VERIFIES_PER_RUN, DEFAULT_MAX_SEAL_ATTEMPTS, DEFAULT_MAX_SEALS_PER_ENDPOINT, DEFAULT_MAX_SEALS_PER_RUN, DEFAULT_MAX_VAULT_ENTRIES,
+  HARD_MAX_COMPOSITE_VERIFIES_PER_RUN, HARD_MAX_SEAL_ATTEMPTS, HARD_MAX_SEALS_PER_ENDPOINT, HARD_MAX_SEALS_PER_RUN, HARD_MAX_VAULT_ENTRIES,
+  RUN_SAFETY_BUDGET_ENV_KEYS, resolveBoundedBudgetCap,
+} from './run-safety-budgets.ts'
+export { DEFAULT_MAX_COMPOSITE_VERIFIES_PER_RUN, DEFAULT_MAX_SEAL_ATTEMPTS, DEFAULT_MAX_SEALS_PER_ENDPOINT, DEFAULT_MAX_SEALS_PER_RUN, DEFAULT_MAX_VAULT_ENTRIES }
 
 export type DerivedCapabilityHandle = `cap:hop_${string}:${string}`
 export type DerivedSecretKind =
@@ -38,16 +44,10 @@ export interface MatchSealedHandlesInput { runId?: string; targetOrigin?: string
 const SAFE_ID_RE = /^[A-Za-z0-9._-]{1,128}$/, SAFE_SLOT_RE = /^[A-Za-z0-9._-]{1,64}$/
 const HANDLE_RE = /^cap:hop_([A-Za-z0-9._-]{1,128}):([A-Za-z0-9._-]{1,64})$/
 const HEADER_NAME_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]{1,64}$/, COOKIE_NAME_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]{1,256}$/, CRLF_RE = /[\r\n\0]/
-const MAX_SECRET_BYTES = 32_768, DEFAULT_MAX_ENTRIES = 4_096, DEFAULT_MAX_SEAL_ATTEMPTS = 8_192, DEFAULT_AUTOBIND_MIN_LENGTH = 8, MAX_TRACKED_RUN_BUDGETS = 2_048
-export const DEFAULT_MAX_SEALS_PER_RUN = 4_096, DEFAULT_MAX_SEALS_PER_ENDPOINT = 256, DEFAULT_MAX_COMPOSITE_VERIFIES_PER_RUN = 1_024
+const MAX_SECRET_BYTES = 32_768, DEFAULT_AUTOBIND_MIN_LENGTH = 8, MAX_TRACKED_RUN_BUDGETS = 2_048
 export const MIN_CRYPTO_KEY_LENGTH = 8, MIN_CRYPTO_KEY_ENTROPY_BITS = 1.5, MIN_SCRUB_LENGTH = 6
 export const SEAL_REGEX_RETIRED_ERROR = "capability.seal: regex selector is retired; use jsonPath (e.g. '$.token' or 'token'), header, setCookie, or value."
 export const SEAL_FIELD_NOT_FOUND_ERROR = 'capability.seal: structured field not found (checked jsonPath/header/setCookie/value; verify response status and top-level keys).'
-function resolveBudgetCap(explicit: number | undefined, envKey: string, fallback: number, hardMax: number): number {
-  if (explicit !== undefined && Number.isFinite(explicit)) return Math.max(1, Math.min(hardMax, Math.floor(explicit)))
-  const raw = process.env[envKey]?.trim(); const n = raw && /^\d+$/.test(raw) ? Number(raw) : NaN
-  return Number.isFinite(n) && n >= 1 ? Math.max(1, Math.min(hardMax, Math.floor(n))) : fallback
-}
 interface RunCustodyBudgetState { sealTotal: number; sealByEndpoint: Map<string, number>; compositeVerifyTotal: number }
 const runCustodyBudgets = new Map<string, RunCustodyBudgetState>()
 function getOrCreateRunBudget(runId: string): RunCustodyBudgetState {
@@ -61,8 +61,8 @@ function getOrCreateRunBudget(runId: string): RunCustodyBudgetState {
   return state
 }
 export function consumeRunSealBudget(runId: string, endpointKey?: string, limits: { maxPerRun?: number; maxPerEndpoint?: number } = {}): { runTotal: number; endpointTotal: number } {
-  const maxPerRun = resolveBudgetCap(limits.maxPerRun, 'KOVO_MAX_SEALS_PER_RUN', DEFAULT_MAX_SEALS_PER_RUN, 16_384)
-  const maxPerEndpoint = resolveBudgetCap(limits.maxPerEndpoint, 'KOVO_MAX_SEALS_PER_ENDPOINT', DEFAULT_MAX_SEALS_PER_ENDPOINT, 4_096)
+  const maxPerRun = resolveBoundedBudgetCap(limits.maxPerRun, RUN_SAFETY_BUDGET_ENV_KEYS.maxSealsPerRun, DEFAULT_MAX_SEALS_PER_RUN, HARD_MAX_SEALS_PER_RUN)
+  const maxPerEndpoint = resolveBoundedBudgetCap(limits.maxPerEndpoint, RUN_SAFETY_BUDGET_ENV_KEYS.maxSealsPerEndpoint, DEFAULT_MAX_SEALS_PER_ENDPOINT, HARD_MAX_SEALS_PER_ENDPOINT)
   const state = getOrCreateRunBudget(runId)
   assertCustody(state.sealTotal < maxPerRun, 'CAPACITY_EXCEEDED', `Run capability custody budget exceeded (max ${maxPerRun} per run).`)
   let endpointTotal = 0
@@ -75,7 +75,7 @@ export function consumeRunSealBudget(runId: string, endpointKey?: string, limits
   return { runTotal: state.sealTotal, endpointTotal }
 }
 export function consumeRunCompositeVerifyBudget(runId: string, maxPerRun?: number): number {
-  const cap = resolveBudgetCap(maxPerRun, 'KOVO_MAX_COMPOSITE_VERIFIES_PER_RUN', DEFAULT_MAX_COMPOSITE_VERIFIES_PER_RUN, 10_000), state = getOrCreateRunBudget(runId)
+  const cap = resolveBoundedBudgetCap(maxPerRun, RUN_SAFETY_BUDGET_ENV_KEYS.maxCompositeVerifiesPerRun, DEFAULT_MAX_COMPOSITE_VERIFIES_PER_RUN, HARD_MAX_COMPOSITE_VERIFIES_PER_RUN), state = getOrCreateRunBudget(runId)
   assertCustody(state.compositeVerifyTotal < cap, 'CAPACITY_EXCEEDED', `composite.verify run budget exceeded (max ${cap} per run).`)
   return ++state.compositeVerifyTotal
 }
@@ -216,10 +216,10 @@ export class DerivedCapabilityVault {
 
   constructor(options: DerivedCapabilityVaultOptions) {
     assertCustody(SAFE_ID_RE.test(options.runId), 'INVALID_INPUT', `Invalid runId "${options.runId}".`)
-    const maxEntries = options.maxEntries ?? DEFAULT_MAX_ENTRIES
-    assertCustody(Number.isInteger(maxEntries) && maxEntries >= 1 && maxEntries <= 10_000, 'INVALID_INPUT', 'maxEntries must be 1..10000.')
+    const maxEntries = options.maxEntries ?? DEFAULT_MAX_VAULT_ENTRIES
+    assertCustody(Number.isInteger(maxEntries) && maxEntries >= 1 && maxEntries <= HARD_MAX_VAULT_ENTRIES, 'INVALID_INPUT', `maxEntries must be 1..${HARD_MAX_VAULT_ENTRIES}.`)
     const maxSealAttempts = options.maxSealAttempts ?? DEFAULT_MAX_SEAL_ATTEMPTS
-    assertCustody(Number.isInteger(maxSealAttempts) && maxSealAttempts >= 1 && maxSealAttempts <= 100_000, 'INVALID_INPUT', 'maxSealAttempts must be 1..100000.')
+    assertCustody(Number.isInteger(maxSealAttempts) && maxSealAttempts >= 1 && maxSealAttempts <= HARD_MAX_SEAL_ATTEMPTS, 'INVALID_INPUT', `maxSealAttempts must be 1..${HARD_MAX_SEAL_ATTEMPTS}.`)
     assertCustody(options.defaultTtlMs === undefined || options.defaultTtlMs === null || (Number.isFinite(options.defaultTtlMs) && options.defaultTtlMs >= 0), 'INVALID_INPUT', 'defaultTtlMs must be a non-negative finite number or null.')
     this.runId = options.runId
     const state: VaultInternals = {
