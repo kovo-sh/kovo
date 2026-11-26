@@ -14,7 +14,7 @@
     "injectionFamily": "sqli"
   },
   "freeTextLabel": {
-    "title": "Database query syntax error in search parameter"
+    "title": "SQL injection database syntax error in search parameter"
   },
   "paths": {
     "replay": true,

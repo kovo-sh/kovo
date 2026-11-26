@@ -1,0 +1,177 @@
+{
+  "id": "timing-differential-tp",
+  "side": "tp",
+  "archetype": "timing-differential",
+  "description": "Five interleaved control/probe timing pairs carrying host-minted zero-delay vs 2000ms delay tokens with stable >3x wall-clock separation.",
+  "canonicalLabel": {
+    "cwe": "CWE-89",
+    "category": "sqli",
+    "title": "Time-based differential delay in report query",
+    "impact": "Host-minted delay construct causes reproducible >3x response latency separation across five interleaved pairs.",
+    "claimedImpact": "injection",
+    "claimedBoundary": "other",
+    "vulnClass": "timing",
+    "injectionFamily": "sqli"
+  },
+  "freeTextLabel": {
+    "title": "SQL injection time-based delay differential in report query"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": false,
+    "evaluateClaims": true,
+    "composite": false,
+    "floorInjectionRecipe": false,
+    "proofReceipt": true
+  },
+  "expected": {
+    "confirmed": true
+  },
+  "personas": [],
+  "exchanges": [
+    {
+      "id": "tc1",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/reports/run?mode=delay%3D0",
+      "persona": null,
+      "status": 200,
+      "durationMs": 22,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"status\":\"ok\",\"rows\":4}"
+    },
+    {
+      "id": "tp1",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/reports/run?mode=delay%3D2000",
+      "persona": null,
+      "status": 200,
+      "durationMs": 2045,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"status\":\"ok\",\"rows\":4}"
+    },
+    {
+      "id": "tc2",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/reports/run?mode=delay%3D0",
+      "persona": null,
+      "status": 200,
+      "durationMs": 19,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"status\":\"ok\",\"rows\":4}"
+    },
+    {
+      "id": "tp2",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/reports/run?mode=delay%3D2000",
+      "persona": null,
+      "status": 200,
+      "durationMs": 2060,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"status\":\"ok\",\"rows\":4}"
+    },
+    {
+      "id": "tc3",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/reports/run?mode=delay%3D0",
+      "persona": null,
+      "status": 200,
+      "durationMs": 25,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"status\":\"ok\",\"rows\":4}"
+    },
+    {
+      "id": "tp3",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/reports/run?mode=delay%3D2000",
+      "persona": null,
+      "status": 200,
+      "durationMs": 2080,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"status\":\"ok\",\"rows\":4}"
+    },
+    {
+      "id": "tc4",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/reports/run?mode=delay%3D0",
+      "persona": null,
+      "status": 200,
+      "durationMs": 21,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"status\":\"ok\",\"rows\":4}"
+    },
+    {
+      "id": "tp4",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/reports/run?mode=delay%3D2000",
+      "persona": null,
+      "status": 200,
+      "durationMs": 2030,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"status\":\"ok\",\"rows\":4}"
+    },
+    {
+      "id": "tc5",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/reports/run?mode=delay%3D0",
+      "persona": null,
+      "status": 200,
+      "durationMs": 24,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"status\":\"ok\",\"rows\":4}"
+    },
+    {
+      "id": "tp5",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/reports/run?mode=delay%3D2000",
+      "persona": null,
+      "status": 200,
+      "durationMs": 2095,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"status\":\"ok\",\"rows\":4}"
+    }
+  ],
+  "proofReceipt": {
+    "vulnClass": "timing",
+    "param": "mode",
+    "targetMethod": "GET",
+    "targetPathAndQuery": "/api/reports/run",
+    "claimedDelta": "Five interleaved host-minted timing pairs showed median 2060ms delay vs 25ms zero-delay control.",
+    "timingChallenge": {
+      "family": "timing",
+      "delayMs": 2000
+    }
+  },
+  "claims": [
+    { "kind": "timing", "controlIds": ["tc1", "tc2", "tc3", "tc4", "tc5"], "variantIds": ["tp1", "tp2", "tp3", "tp4", "tp5"], "minPairs": 5, "maxPValue": 0.05 }
+  ]
+}

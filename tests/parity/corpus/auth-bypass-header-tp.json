@@ -1,0 +1,69 @@
+{
+  "id": "auth-bypass-header-tp",
+  "side": "tp",
+  "archetype": "auth-bypass-header",
+  "description": "Unauthenticated control receives 401 while probe supplying a forged internal proxy header bypasses authentication without host credentials and retrieves protected audit records.",
+  "canonicalLabel": {
+    "cwe": "CWE-287",
+    "category": "auth-bypass",
+    "title": "Authentication bypass via trusted proxy header on audit endpoint",
+    "impact": "Unauthenticated client bypasses authentication by supplying a spoofed internal proxy header.",
+    "claimedImpact": "other",
+    "claimedBoundary": "auth",
+    "vulnClass": "auth_bypass"
+  },
+  "freeTextLabel": {
+    "title": "Authentication bypass via forged proxy identity header"
+  },
+  "paths": {
+    "replay": true,
+    "floorReceipt": true,
+    "evaluateClaims": true,
+    "composite": false,
+    "floorInjectionRecipe": false,
+    "proofReceipt": true
+  },
+  "expected": {
+    "confirmed": true
+  },
+  "personas": [],
+  "exchanges": [
+    {
+      "id": "ctl",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/admin/audit-log",
+      "persona": null,
+      "status": 401,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"error\":\"authentication_required\"}"
+    },
+    {
+      "id": "prb",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/admin/audit-log",
+      "persona": null,
+      "requestHeaders": { "x-forwarded-user": "synthetic-admin" },
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"auditEntries\":[{\"id\":\"aud-901\",\"actor\":\"ops@tenant-a.example\",\"action\":\"key_rotated\",\"recordCount\":14}]}"
+    }
+  ],
+  "replaySpec": {
+    "assertionsJq": "{ controlPassed: (.steps.ctl.status == 401), confirmed: (.steps.ctl.status == 401 and .steps.prb.status == 200 and (.steps.prb.json.auditEntries | length) > 0), observed: .steps.prb.json.auditEntries[0].action, expected: \"401\" }"
+  },
+  "proofReceipt": {
+    "vulnClass": "auth_bypass",
+    "targetMethod": "GET",
+    "targetPathAndQuery": "/api/admin/audit-log",
+    "claimedDelta": "Forged x-forwarded-user header bypassed 401 authentication gate without host credentials and returned protected audit log."
+  },
+  "claims": [
+    { "kind": "boundary", "controlExchangeId": "ctl", "probeExchangeId": "prb" }
+  ]
+}

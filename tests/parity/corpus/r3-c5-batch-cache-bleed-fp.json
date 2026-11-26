@@ -1,0 +1,85 @@
+{
+  "id": "r3-c5-batch-cache-bleed-fp",
+  "side": "fp",
+  "archetype": "r3-c5-batch-partial-cache-bleed",
+  "description": "R3-C-5(b)/(c) FP: batch endpoint echoing a foreign ID inside a denied error list while worker places target tenantId only in the request body must reject.",
+  "canonicalLabel": {
+    "cwe": "CWE-639",
+    "category": "bola",
+    "title": "Batch partial authorization forged via denied echo and request-body tenant",
+    "impact": "Server properly denied the foreign ID in the denied array; worker-supplied request body tenant marker must not confirm disclosure.",
+    "claimedImpact": "authorization",
+    "claimedBoundary": "access",
+    "vulnClass": "batch_partial_authz"
+  },
+  "freeTextLabel": {
+    "title": "Cross-tenant batch partial authorization disclosure"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": false,
+    "evaluateClaims": true,
+    "composite": true,
+    "floorInjectionRecipe": false
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [
+    {
+      "handle": "member_a",
+      "roleLabel": "member (org-a)",
+      "role": "member",
+      "tenant": "org-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-r3c5-batch-a"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "bpa_ctrl",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/v1/secrets/sec_foreign_2",
+      "persona": "member_a",
+      "status": 403,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"error\":\"forbidden\"}"
+    },
+    {
+      "id": "bpa_denied",
+      "arm": "probe",
+      "role": "probe",
+      "method": "POST",
+      "pathAndQuery": "/api/v1/secrets/batch",
+      "persona": "member_a",
+      "requestJson": { "ids": ["sec_own_1", "sec_foreign_2"], "tenantId": "org-victim" },
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"items\":[{\"id\":\"sec_own_1\",\"value\":\"own-secret-val\"}],\"denied\":[{\"id\":\"sec_foreign_2\",\"tenantId\":\"org-victim\",\"reason\":\"forbidden\"}]}"
+    }
+  ],
+  "composite": {
+    "chainId": "PARITY-R3-C5-BATCH-DENIED-FP",
+    "terminalVulnClass": "dual_tenant_abac",
+    "oracleFamily": "dual_tenant_abac",
+    "singleHop": true,
+    "terminalExchangeId": "bpa_denied",
+    "preChainControlIds": ["bpa_ctrl"],
+    "claimedDelta": "Echoed foreign ID in denied array with request-body tenantId must not confirm dual_tenant_abac batch_partial_authz.",
+    "v8OracleInput": {
+      "family": "dual_tenant_abac",
+      "rawInput": {
+        "mode": "batch_partial_authz",
+        "baselineDeniedControl": "bpa_ctrl",
+        "batchAccess": "bpa_denied",
+        "foreignResourceId": "sec_foreign_2",
+        "targetTenantId": "org-victim"
+      }
+    }
+  }
+}

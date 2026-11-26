@@ -1,0 +1,121 @@
+{
+  "id": "boolean-integer-coercion-fp",
+  "side": "fp",
+  "archetype": "r3-c4-integer-coercion-boolean",
+  "description": "R3-C-4 FP: integer-coercion boolean triangle where contradiction changes the base value from 1 to 999, producing 404 solely due to nonexistent record ID rather than predicate evaluation.",
+  "canonicalLabel": {
+    "cwe": "CWE-89",
+    "category": "sqli",
+    "title": "Boolean status differential with mismatched base identifier",
+    "impact": "Apparent 200 vs 404 difference caused by distinct integer base IDs (1 vs 999).",
+    "claimedImpact": "injection",
+    "claimedBoundary": "other",
+    "vulnClass": "sqli_status",
+    "injectionFamily": "sqli"
+  },
+  "freeTextLabel": {
+    "title": "SQL injection status differential on item lookup"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": false,
+    "evaluateClaims": true,
+    "composite": false,
+    "floorInjectionRecipe": false,
+    "proofReceipt": true
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [],
+  "exchanges": [
+    {
+      "id": "b1",
+      "arm": "control",
+      "role": "control",
+      "evidenceRole": "benign_baseline",
+      "method": "GET",
+      "pathAndQuery": "/api/items?id=1",
+      "persona": null,
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"id\":1,\"name\":\"Item 1\"}"
+    },
+    {
+      "id": "t1",
+      "arm": "probe",
+      "role": "probe",
+      "evidenceRole": "tautology",
+      "method": "GET",
+      "pathAndQuery": "/api/items?id=1%20AND%201%3D1",
+      "persona": null,
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"id\":1,\"name\":\"Item 1\"}"
+    },
+    {
+      "id": "f1",
+      "arm": "probe",
+      "role": "probe",
+      "evidenceRole": "contradiction",
+      "method": "GET",
+      "pathAndQuery": "/api/items?id=999%20AND%201%3D2",
+      "persona": null,
+      "status": 404,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"error\":\"not_found\"}"
+    },
+    {
+      "id": "b2",
+      "arm": "control",
+      "role": "control",
+      "evidenceRole": "benign_baseline",
+      "method": "GET",
+      "pathAndQuery": "/api/items?id=1",
+      "persona": null,
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"id\":1,\"name\":\"Item 1\"}"
+    },
+    {
+      "id": "t2",
+      "arm": "probe",
+      "role": "probe",
+      "evidenceRole": "tautology",
+      "method": "GET",
+      "pathAndQuery": "/api/items?id=1%20AND%202%3D2",
+      "persona": null,
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"id\":1,\"name\":\"Item 1\"}"
+    },
+    {
+      "id": "f2",
+      "arm": "probe",
+      "role": "probe",
+      "evidenceRole": "contradiction",
+      "method": "GET",
+      "pathAndQuery": "/api/items?id=999%20AND%202%3D3",
+      "persona": null,
+      "status": 404,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"error\":\"not_found\"}"
+    }
+  ],
+  "proofReceipt": {
+    "vulnClass": "sqli_status",
+    "param": "id",
+    "targetMethod": "GET",
+    "targetPathAndQuery": "/api/items?id=1",
+    "claimedDelta": "Status differential triangle with mismatched base value (1 vs 999) must fail closed under R3-C-4."
+  },
+  "claims": [
+    { "kind": "impact", "impactClass": "injection", "probeExchangeId": "f1", "controlExchangeIds": ["b1", "t1"] }
+  ]
+}

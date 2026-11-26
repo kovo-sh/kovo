@@ -20,7 +20,8 @@
     "floorReceipt": false,
     "evaluateClaims": true,
     "composite": false,
-    "floorInjectionRecipe": false
+    "floorInjectionRecipe": false,
+    "proofReceipt": true
   },
   "expected": {
     "confirmed": true
@@ -53,6 +54,15 @@
       "executedSentinels": ["kovo-xss-sentinel"]
     }
   ],
+  "proofReceipt": {
+    "vulnClass": "browser_dom_xss",
+    "targetMethod": "GET",
+    "targetPathAndQuery": "/greet",
+    "claimedDelta": "Host-recorded browser trace observed executable DOM XSS sink execution on /greet.",
+    "browserTraces": [
+      { "id": "trace-xss-parity-1", "sinks": ["dom_xss"] }
+    ]
+  },
   "claims": [
     { "kind": "status", "exchangeId": "prb", "expected": 200 },
     { "kind": "dom_sentinel", "exchangeId": "prb", "sentinel": "kovo-xss-sentinel", "mode": "executed" }

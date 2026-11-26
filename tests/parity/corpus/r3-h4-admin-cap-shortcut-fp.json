@@ -1,0 +1,99 @@
+{
+  "id": "r3-h4-admin-cap-shortcut-fp",
+  "side": "fp",
+  "archetype": "r3-h4-forbidden-admin-cap",
+  "description": "R3-H-4(a) FP: 2-hop chain where Hop 1 emits a capability under forbidden shortcut persona admin and Hop 2 spends it via cap handle to read admin vault.",
+  "canonicalLabel": {
+    "cwe": "CWE-862",
+    "category": "bfla",
+    "title": "Privilege escalation forged using forbidden admin-emitted capability",
+    "impact": "Chain relies on a forbidden admin shortcut persona in Hop 1 rather than an attacker persona.",
+    "claimedImpact": "bfla",
+    "claimedBoundary": "access",
+    "vulnClass": "privilege_escalation"
+  },
+  "freeTextLabel": {
+    "title": "Vertical privilege escalation to admin vault via capability token"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": false,
+    "evaluateClaims": true,
+    "composite": true,
+    "floorInjectionRecipe": false
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [
+    {
+      "handle": "member_a",
+      "roleLabel": "member (org_a)",
+      "role": "member",
+      "tenant": "org_a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-r3h4-member-a"
+    },
+    {
+      "handle": "admin",
+      "roleLabel": "admin (org_a)",
+      "role": "admin",
+      "tenant": "org_a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-r3h4-admin"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "hop1_ex",
+      "arm": "probe",
+      "role": "setup",
+      "method": "GET",
+      "pathAndQuery": "/api/admin/session",
+      "persona": "admin",
+      "emittedCapabilities": ["cap:hop_1:admin_shortcut_tok"],
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"token\":\"adm-shortcut-tok\"}"
+    },
+    {
+      "id": "hop2_ctl",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/admin/vault",
+      "persona": "member_a",
+      "status": 403,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"error\":\"forbidden\"}"
+    },
+    {
+      "id": "hop2_prb",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/admin/vault",
+      "persona": null,
+      "actorRoleLabel": "",
+      "consumedCapabilities": ["cap:hop_1:admin_shortcut_tok"],
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"tenantId\":\"org_b\",\"vaultSecret\":\"classified-record-99\"}"
+    }
+  ],
+  "composite": {
+    "chainId": "PARITY-R3-H4-ADMIN-CAP-FP",
+    "terminalVulnClass": "privilege_escalation",
+    "oracleFamily": "dual_tenant_abac",
+    "capabilityToken": "admin_shortcut_tok",
+    "attackerPersonas": ["member_a"],
+    "forbiddenShortcutPersonas": ["admin"],
+    "expectedFailedStage": "attacker_provenance",
+    "claimedDelta": "Admin-emitted shortcut capability must be rejected at attacker_provenance."
+  }
+}

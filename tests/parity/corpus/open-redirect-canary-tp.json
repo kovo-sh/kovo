@@ -1,0 +1,68 @@
+{
+  "id": "open-redirect-canary-tp",
+  "side": "tp",
+  "archetype": "open-redirect-canary",
+  "description": "Same-route control redirects locally while probe carrying a host-minted redirect canary host returns 302 Location to that external canary host.",
+  "canonicalLabel": {
+    "cwe": "CWE-601",
+    "category": "open_redirect",
+    "title": "Open redirect on post-login continue parameter",
+    "impact": "Unvalidated next parameter redirects victims to an attacker-controlled external host.",
+    "claimedImpact": "other",
+    "claimedBoundary": "other",
+    "vulnClass": "open_redirect"
+  },
+  "freeTextLabel": {
+    "title": "Open redirect via unvalidated next destination parameter"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": false,
+    "evaluateClaims": true,
+    "composite": false,
+    "floorInjectionRecipe": false,
+    "proofReceipt": true
+  },
+  "expected": {
+    "confirmed": true
+  },
+  "personas": [],
+  "exchanges": [
+    {
+      "id": "ctl",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/auth/continue?next=%2Fdashboard",
+      "persona": null,
+      "status": 302,
+      "mediaType": "text/plain",
+      "responseHeaders": { "location": "/dashboard" },
+      "body": ""
+    },
+    {
+      "id": "prb",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/auth/continue?next=https%3A%2F%2F{{MINTED_REDIRECT_HOST}}%2Flanding",
+      "persona": null,
+      "status": 302,
+      "mediaType": "text/plain",
+      "responseHeaders": { "location": "https://{{MINTED_REDIRECT_HOST}}/landing" },
+      "body": ""
+    }
+  ],
+  "proofReceipt": {
+    "vulnClass": "open_redirect",
+    "param": "next",
+    "targetMethod": "GET",
+    "targetPathAndQuery": "/auth/continue",
+    "claimedDelta": "Probe returned 302 redirecting to the host-minted canary destination host while matching control stayed local.",
+    "mintRedirectCanary": true
+  },
+  "claims": [
+    { "kind": "status", "exchangeId": "prb", "expected": 302 },
+    { "kind": "header", "exchangeId": "prb", "name": "location", "matches": "^https://redir-[0-9a-f]+\\.canary\\.kovo\\.invalid/landing$" }
+  ]
+}

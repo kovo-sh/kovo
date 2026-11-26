@@ -1,0 +1,99 @@
+{
+  "id": "r3-c5-signed-url-scope-fp",
+  "side": "fp",
+  "archetype": "r3-c5-signed-url-scope-replay",
+  "description": "R3-C-5(a) FP: identical signed download URL fetched twice with worker-supplied x-scope header cannot fabricate a cross-scope cryptographic replay.",
+  "canonicalLabel": {
+    "cwe": "CWE-639",
+    "category": "bola",
+    "title": "Signed URL scope replay forged via worker x-scope header",
+    "impact": "Worker appended an unverified x-scope header to an identical signed URL fetch without genuine cross-tenant or cross-route divergence.",
+    "claimedImpact": "authorization",
+    "claimedBoundary": "access",
+    "vulnClass": "cryptographic_scope_replay"
+  },
+  "freeTextLabel": {
+    "title": "Cryptographic scope replay on signed download URL"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": false,
+    "evaluateClaims": true,
+    "composite": true,
+    "floorInjectionRecipe": false
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [
+    {
+      "handle": "member_a",
+      "roleLabel": "member (org-a)",
+      "role": "member",
+      "tenant": "org-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-r3c5-member-a"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "csr_ctrl",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/v1/downloads/export-42?sig=tampered-bad-sig",
+      "persona": "member_a",
+      "status": 403,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"error\":\"invalid_signature\"}"
+    },
+    {
+      "id": "csr_issue",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/v1/downloads/export-42?sig=valid-sig-001",
+      "persona": "member_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"fileId\":\"export-42\",\"rows\":[{\"id\":\"r1\",\"amount\":500}]}"
+    },
+    {
+      "id": "csr_replay_hdr",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/v1/downloads/export-42?sig=valid-sig-001",
+      "persona": "member_a",
+      "requestHeaders": { "x-scope": "org-b:admin" },
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"fileId\":\"export-42\",\"rows\":[{\"id\":\"r1\",\"amount\":500}]}"
+    }
+  ],
+  "composite": {
+    "chainId": "PARITY-R3-C5-SIGNED-URL-FP",
+    "terminalVulnClass": "cryptographic_scope_replay",
+    "oracleFamily": "cryptographic_scope_replay",
+    "singleHop": true,
+    "terminalExchangeId": "csr_replay_hdr",
+    "preChainControlIds": ["csr_ctrl"],
+    "claimedDelta": "Identical signed URL re-fetched with worker x-scope header must not confirm cryptographic_scope_replay.",
+    "v8OracleInput": {
+      "family": "cryptographic_scope_replay",
+      "rawInput": {
+        "tamperedSignatureControl": "csr_ctrl",
+        "sourceValidIssuance": "csr_issue",
+        "replayedAcceptance": "csr_replay_hdr",
+        "sourceTenant": "org-a",
+        "sourceScope": "org-a:read",
+        "targetTenant": "org-b",
+        "targetScope": "org-b:admin"
+      }
+    }
+  }
+}
