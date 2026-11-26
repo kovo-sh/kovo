@@ -1,7 +1,9 @@
 import { createHash } from 'node:crypto'
 import { and, desc, eq } from 'drizzle-orm'
 import { id as evidenceId } from '../domain.ts'
-import type { EvidenceSummary } from '../domain.ts'
+import type { EvidenceSummary, Finding, ReportBody } from '../domain.ts'
+import { projectRunFindings } from '../findings-view.ts'
+import type { FindingsViewInputRow, OperatorTriageOverlay } from '../findings-view.ts'
 import {
   callerCompatibilityLabels,
   capabilityTierLabel,
@@ -9,7 +11,6 @@ import {
   collapseBaselineHeaderFindings,
   deduplicateChainFindings,
   dynamicRetestLabels,
-  filterActiveFindings,
   findingVerificationTier,
   isConsolidatedHeaderPostureFinding,
   owaspCategoryTitles,
@@ -22,8 +23,10 @@ import {
   suppliedResponseLabel,
   verificationTierLabels,
 } from '../report-summary.ts'
-import { buildCoverageGapReport, formatCoverageGapMarkdown } from './coverage-gaps.ts'
+import { buildCoverageGapReport, coverageGapKinds, formatCoverageGapMarkdown } from './coverage-gaps.ts'
+import type { CoverageGapEntry, CoverageGapKind, CoverageGapReport } from './coverage-gaps.ts'
 import type { CompositeProofReceipt } from './composite-receipt.ts'
+import { FindingCodec } from './finding-codec.ts'
 import { personaSecrets, resolveRunPersonas } from './persona-vault.ts'
 import {
   buildPortableCompositeReceiptRecord,
@@ -40,7 +43,7 @@ import type {
 import { redact, redactHeaders, redactZdr } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
 import { isReportSource, projectReportEvidence } from './report-evidence.ts'
-import { brokerExchanges, facts, replaySpecs, reports, retestRuns } from './schema.ts'
+import { brokerExchanges, coverageEntries, endpoints, events, facts, findings as findingsTable, replaySpecs, reports, retestRuns } from './schema.ts'
 import type { Store } from './store.ts'
 
 type Attachment = {
@@ -243,6 +246,152 @@ export interface ExportReportMarkdownOptions {
   compositeReceipts?: readonly CompositeChainMarkdownInput[]
 }
 
+type ReportBodyWithGapSnapshot = ReportBody & {
+  operationalCoverageGaps?: CoverageGapReport
+}
+
+/**
+ * Snapshot operational coverage gaps and open proof gaps onto a saved report version so
+ * version-N exports never drift when live run telemetry or gaps change later.
+ */
+export function snapshotReportCoverageGaps(
+  storage: Store,
+  runId: string,
+  reportId: string,
+  options: { approvedOrigins?: ReadonlySet<string>; secrets?: readonly NamedSecret[] } = {},
+): CoverageGapReport {
+  const run = storage.run(runId)
+  const report = storage.db.select().from(reports).where(and(eq(reports.runId, run.id), eq(reports.id, reportId))).get()
+  if (!report) throw new Error('Report version not found.')
+
+  const body = report.body as ReportBodyWithGapSnapshot
+  if (body.operationalCoverageGaps) {
+    return body.operationalCoverageGaps
+  }
+
+  const approved = options.approvedOrigins ?? new Set(body.scope.map(asset => asset.origin))
+  const secrets = options.secrets ?? (() => {
+    try {
+      return personaSecrets(resolveRunPersonas(storage, run.projectId, run.approvedPersonaIds))
+    } catch {
+      return [] as NamedSecret[]
+    }
+  })()
+
+  const liveReport = buildCoverageGapReport(storage, run.id, {
+    approvedOrigins: approved,
+    secrets,
+    zdr: false,
+    now: report.createdAt,
+  })
+
+  // Filter live telemetry strictly to records present at or before `report.createdAt` / `body.scopeRevision`.
+  const validEventIds = new Set(
+    storage.db.select({ id: events.id, createdAt: events.createdAt })
+      .from(events)
+      .where(eq(events.runId, run.id))
+      .all()
+      .filter(ev => ev.createdAt <= report.createdAt)
+      .map(ev => ev.id),
+  )
+  const validExchangeIds = new Set(
+    storage.db.select({ id: brokerExchanges.id, createdAt: brokerExchanges.createdAt, scopeRevision: brokerExchanges.scopeRevision })
+      .from(brokerExchanges)
+      .where(eq(brokerExchanges.runId, run.id))
+      .all()
+      .filter(ex => ex.createdAt <= report.createdAt && ex.scopeRevision <= body.scopeRevision)
+      .map(ex => ex.id),
+  )
+  const validEndpointKeys = new Set(
+    storage.db.select({
+      origin: endpoints.origin,
+      method: endpoints.method,
+      pathTemplate: endpoints.pathTemplate,
+      createdAt: endpoints.createdAt,
+      scopeRevision: endpoints.scopeRevision,
+    })
+      .from(endpoints)
+      .where(eq(endpoints.runId, run.id))
+      .all()
+      .filter(ep => ep.createdAt <= report.createdAt && ep.scopeRevision <= body.scopeRevision)
+      .map(ep => `${ep.origin}\0${ep.method.toUpperCase()} ${ep.pathTemplate}`),
+  )
+  const validCoverageOrigins = new Set(
+    storage.db.select({ origin: coverageEntries.origin, updatedAt: coverageEntries.updatedAt, scopeRevision: coverageEntries.scopeRevision })
+      .from(coverageEntries)
+      .where(eq(coverageEntries.runId, run.id))
+      .all()
+      .filter(c => c.updatedAt <= report.createdAt && c.scopeRevision <= body.scopeRevision)
+      .map(c => c.origin),
+  )
+
+  const filteredGaps: CoverageGapEntry[] = []
+  for (const entry of liveReport.gaps) {
+    if (entry.eventIds.length > 0 || entry.exchangeIds.length > 0) {
+      const keptEvents = entry.eventIds.filter(id => validEventIds.has(id))
+      const keptExchanges = entry.exchangeIds.filter(id => validExchangeIds.has(id))
+      if (keptEvents.length === 0 && keptExchanges.length === 0) continue
+      filteredGaps.push({
+        ...entry,
+        eventIds: keptEvents,
+        exchangeIds: keptExchanges,
+      })
+      continue
+    }
+    if (entry.kind === 'uncovered_routes') {
+      if (entry.route && !validEndpointKeys.has(`${entry.origin}\0${entry.route}`)) continue
+      filteredGaps.push(entry)
+      continue
+    }
+    if (!validCoverageOrigins.has(entry.origin) && !body.findings.some(f => f.origin === entry.origin)) {
+      continue
+    }
+    filteredGaps.push(entry)
+  }
+
+  const countsByKind: Record<CoverageGapKind, number> = {
+    auth_failed: 0,
+    waf_blocked: 0,
+    prod_readonly_skipped: 0,
+    oob_unreachable: 0,
+    uncovered_routes: 0,
+    precondition_unmet: 0,
+    capped_out: 0,
+    host_skipped: 0,
+  }
+  for (const g of filteredGaps) countsByKind[g.kind] += 1
+  const activeParts = coverageGapKinds.filter(k => countsByKind[k] > 0).map(k => `${countsByKind[k]} ${k}`)
+  const snapshot: CoverageGapReport = {
+    runId: run.id,
+    generatedAt: new Date(report.createdAt).toISOString(),
+    totalGaps: filteredGaps.length,
+    countsByKind,
+    gaps: filteredGaps,
+    honestSummary: filteredGaps.length === 0
+      ? 'No operational coverage gaps detected in recorded telemetry.'
+      : `Detected ${filteredGaps.length} operational coverage gap(s): ${activeParts.join(', ')}.`,
+  }
+
+  const snapshottedOpenProofGaps = body.openProofGaps !== undefined
+    ? body.openProofGaps
+    : storage.listOpenProofGaps(run.id, body.goalRevision)
+        .filter(g => approved.has(g.origin) && g.updatedAt <= report.createdAt && g.scopeRevision <= body.scopeRevision)
+        .map(g => ({
+          origin: g.origin,
+          category: g.category,
+          summary: g.summary,
+          proofGapReason: g.proofGapReason || g.summary,
+        }))
+
+  const updatedBody: ReportBodyWithGapSnapshot = {
+    ...body,
+    operationalCoverageGaps: snapshot,
+    openProofGaps: snapshottedOpenProofGaps,
+  }
+  storage.db.update(reports).set({ body: updatedBody }).where(eq(reports.id, report.id)).run()
+  return snapshot
+}
+
 export function exportReportMarkdown(
   storage: Store,
   runId: string,
@@ -380,16 +529,51 @@ export function exportReportMarkdown(
     return links.join(' · ')
   }
 
-  const rawFindings = filterActiveFindings(body.findings).filter(item =>
-    approved.has(item.origin) || item.status === 'static_verified' || item.verificationTier === 'static_verified',
+  const findingRowsById = new Map(
+    storage.db.select().from(findingsTable).where(eq(findingsTable.runId, run.id)).all().map(row => [row.id, row]),
   )
-  const { findings } = collapseBaselineHeaderFindings(deduplicateChainFindings(rawFindings))
+  const hydratedFindings = body.findings.map(item => {
+    const row = findingRowsById.get(item.id)
+    const decoded = row ? FindingCodec.fromRow(row) : undefined
+    return {
+      ...item,
+      verificationTier: item.verificationTier ?? row?.verificationTier ?? undefined,
+      verificationStatus: decoded?.verificationStatus ?? row?.verificationClass ?? undefined,
+      provenance: decoded?.provenance ?? row?.provenance ?? undefined,
+      sourceOrigins: row?.sourceOrigins ?? undefined,
+      assetId: row?.assetId ?? undefined,
+      supersededByFindingId: item.supersededByFindingId ?? row?.supersededByFindingId ?? undefined,
+      operatorTriage: (item as { operatorTriage?: OperatorTriageOverlay | null }).operatorTriage ?? decoded?.operatorTriage ?? undefined,
+    } as Finding & FindingsViewInputRow
+  })
+  const taintedFactIds = body.scopeRevision === run.scopeRevision
+    ? [...runFacts.values()].filter(f => f.tainted).map(f => f.id)
+    : []
+  const provenanceAllowedOrigins = [...(run.authOrigins ?? []), ...(run.assetOrigins ?? [])]
+  const projected = projectRunFindings(hydratedFindings, {
+    approvedOrigins: approved,
+    ...(provenanceAllowedOrigins.length ? { provenanceAllowedOrigins } : {}),
+    ...(taintedFactIds.length ? { taintedFactIds } : {}),
+  })
+  const activeProjected = [...projected.confirmed, ...projected.advisories, ...projected.unverified].map(item =>
+    item.effectiveSeverity === item.finding.severity
+      ? item.finding
+      : { ...item.finding, severity: item.effectiveSeverity },
+  )
+  const { findings } = collapseBaselineHeaderFindings(deduplicateChainFindings(activeProjected))
   const prominentFindings = findings.filter(item => !isConsolidatedHeaderPostureFinding(item))
   const headerPostureFindings = findings.filter(item => isConsolidatedHeaderPostureFinding(item))
-  const { coverage, confirmed, staticVerified, chainConfirmed, priority } = reportHighlights(body)
+  const { coverage, confirmed, staticVerified, chainConfirmed, priority } = reportHighlights(
+    { ...body, findings: hydratedFindings },
+    {
+      ...(provenanceAllowedOrigins.length ? { provenanceAllowedOrigins } : {}),
+      ...(taintedFactIds.length ? { taintedFactIds } : {}),
+    },
+  )
   const plan = reportPlanLabel(body.selectedChecks)
   const confirmedFindings = findings.filter(item => item.status === 'confirmed')
   const staticVerifiedFindings = findings.filter(item => item.status === 'static_verified')
+  const suppressedItems = projected.suppressed
   const confirmedProminent = prominentFindings.filter(item => item.status === 'confirmed')
   const staticAdvisoryProminent = prominentFindings.filter(item => item.status === 'static_verified')
   const unverifiedProminent = prominentFindings.filter(item => item.status !== 'confirmed' && item.status !== 'static_verified')
@@ -404,16 +588,14 @@ export function exportReportMarkdown(
     return count ? [`- **${severity[0].toUpperCase() + severity.slice(1)} (static verified)** ${count}`] : []
   })
 
-  const openProofGaps = body.openProofGaps?.length
-    ? body.openProofGaps.filter(g => approved.has(g.origin))
-    : storage.listOpenProofGaps(run.id, body.goalRevision)
-        .filter(g => approved.has(g.origin))
-        .map(g => ({
-          origin: g.origin,
-          category: g.category,
-          summary: g.summary,
-          proofGapReason: g.proofGapReason || g.summary,
-        }))
+  // Snapshot operational & open proof gaps on the report row so version-N exports never drift.
+  const operationalGaps = snapshotReportCoverageGaps(storage, run.id, report.id, {
+    approvedOrigins: approved,
+    secrets,
+  })
+  const refreshedReport = storage.db.select().from(reports).where(eq(reports.id, report.id)).get()
+  const openProofGaps = ((refreshedReport?.body.openProofGaps ?? body.openProofGaps) ?? [])
+    .filter(g => approved.has(g.origin))
 
   const patchProposals = body.patchProposals?.length
     ? body.patchProposals
@@ -611,6 +793,21 @@ export function exportReportMarkdown(
     }
   }
 
+  if (suppressedItems.length) {
+    lines.push(
+      '## Suppressed Findings (Operator Triage)', '',
+      'Findings marked `false_positive` or `accepted_risk` by operator triage are excluded from confirmed counts, Fix first, and remediation priority:', '',
+    )
+    for (const item of suppressedItems) {
+      const f = item.finding
+      const note = f.operatorTriage?.notes?.trim()
+      lines.push(
+        `- **${inline(f.title, secrets)}** (${inline(f.origin, secrets)}) · **Triage** \`${item.suppressedBy}\` · **Effective severity** ${inline(item.effectiveSeverity, secrets)}${note ? ` — ${inline(note, secrets)}` : ''}`,
+      )
+    }
+    lines.push('')
+  }
+
   const findingsMetaById = new Map(findings.map(f => [f.id, { title: f.title, severity: f.severity, cwe: f.cwe ?? null }]))
   const activeFindingIds = new Set(findings.map(f => f.id))
   const storeCompositeInputs = extractStoreCompositeReceipts([...runSpecs.values()], runRetests, findingsMetaById)
@@ -721,11 +918,6 @@ export function exportReportMarkdown(
 
   if (body.gaps.length) lines.push('## Coverage gaps', '', ...body.gaps.map(gap => '- ' + inline(gap, secrets)), '')
 
-  const operationalGaps = buildCoverageGapReport(storage, run.id, {
-    approvedOrigins: approved,
-    secrets,
-    zdr: options.zdr === true,
-  })
   if (operationalGaps.totalGaps > 0) {
     lines.push(formatCoverageGapMarkdown(operationalGaps))
   }

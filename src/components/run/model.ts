@@ -2,8 +2,9 @@
 // snapshot (memoised in `useRunModel()`). Views read from here instead of
 // re-deriving. Everything is real data; no links are invented.
 import type { RunDetail } from '../run-state.ts'
+import { projectRunFindings } from '../../findings-view.ts'
 import { capF, firstSentence, host, sharedApex, words } from './format.ts'
-import { COV_L, covCat, FSTAT_ORDER, normFStatus, PHASE_ORDER, SEV, SEV_ORDER } from './meta.ts'
+import { COV_L, covCat, FSTAT_ORDER, PHASE_ORDER, SEV, SEV_ORDER } from './meta.ts'
 import type { RiskTier, Severity } from './meta.ts'
 
 export type Detail = RunDetail
@@ -46,20 +47,41 @@ export interface Verdict {
     /** [count, colour, label] segments for the confidence meter. */
     seg: [number, string, string][]
   }
-  /** Counts by severity (excluding dismissed) and by raw status. */
+  /** Counts by severity (excluding dismissed/suppressed) and by projected disposition/status. */
   n: Record<string, number>
   hosts: number
   confirmed: number
+  reportable: number
+  suppressed: number
   followups: number
   pendingApprovals: Approval[]
 }
 
 export function buildVerdict(d: Detail, findings: readonly FindingRow[], interrupted: boolean): Verdict {
   const r = d.run
-  const n: Record<string, number> = { total: findings.length }
-  for (const s of SEV) n[s] = findings.filter(f => f.severity === s && f.status !== 'dismissed').length
-  for (const s of ['confirmed', 'static_verified', 'inconclusive', 'dismissed', 'pending']) n[s] = findings.filter(f => f.status === s).length
-  const confirmed = findings.filter(f => normFStatus(f.status) === 'confirmed')
+  const approvedSet = new Set(r.approved ?? [])
+  const approvedOrigins = (r.candidates ?? []).filter(c => approvedSet.has(c.id)).map(c => c.origin)
+  const hasScope = approvedOrigins.length > 0 || (r.scopeRevision ?? 0) > 0
+  const runExt = r as Run & { authOrigins?: string[]; assetOrigins?: string[] }
+  const provenanceAllowedOrigins = [...(runExt.authOrigins ?? []), ...(runExt.assetOrigins ?? [])]
+  const taintedFactIds = (d.facts ?? []).filter(f => f.tainted).map(f => f.id)
+  const view = projectRunFindings(findings, {
+    ...(hasScope ? { approvedOrigins, approvedAssetIds: approvedSet, provenanceAllowedOrigins } : {}),
+    ...(taintedFactIds.length ? { taintedFactIds } : {}),
+  })
+  const c = view.counts
+  const n: Record<string, number> = {
+    total: c.total,
+    ...c.bySeverity,
+    confirmed: c.confirmed,
+    static_verified: c.advisories,
+    inconclusive: c.inconclusive,
+    dismissed: c.dismissed,
+    pending: c.pending,
+    reportable: c.reportable,
+    suppressed: c.suppressed,
+  }
+  const confirmed = view.confirmed
   const hosts = r.approved.length || new Set(d.coverageEntries.map(x => x.origin)).size
   const pendingApprovals = d.approvals.filter(a => a.status === 'pending')
   const followups = d.coverageEntries.filter(x => x.status === 'needs_follow_up').length
@@ -67,39 +89,37 @@ export function buildVerdict(d: Detail, findings: readonly FindingRow[], interru
   let hed: string
   let dek: string | null = null
   let worst: FindingRow | null = null
-  const bySev = (a: FindingRow, b: FindingRow) => (SEV_ORDER[a.severity] ?? 9) - (SEV_ORDER[b.severity] ?? 9)
   const live = r.status !== 'complete' && r.status !== 'stopped' && r.status !== 'failed'
+  const wp = (k: number, s: string, p = s + 's') => capF(words(k)) + ' ' + (k === 1 ? s : p)
   if (r.status === 'waiting') {
     hed = 'Awaiting your consent to begin. Nothing has been sent.'
   } else if (live && confirmed.length === 0) {
     const p = pendingApprovals.length
     const state = r.status === 'running' ? 'the investigation is running' : r.status === 'budget_paused' ? 'the run is paused at its budget' : 'the investigation is paused'
-    hed = findings.length
-      ? capF(words(findings.length)) + ' finding' + (findings.length === 1 ? '' : 's') + ' drafted, none yet verified; ' + state + '.'
+    hed = c.total
+      ? wp(c.total, 'finding') + ' drafted, none yet verified; ' + state + '.'
       : 'No findings drafted yet; ' + state + '.'
     const dekParts: string[] = []
     if (interrupted) dekParts.push('The application restarted mid-round.')
-    if (p) {
-      dekParts.push(capF(words(p)) + ' approval-gated write request' + (p > 1 ? 's' : '') + ' waiting on your decision before work can resume.')
-    } else if (r.status !== 'running') {
-      dekParts.push('Resume to continue from saved evidence.')
-    }
+    if (p) dekParts.push(wp(p, 'approval-gated write request') + ' waiting on your decision before work can resume.')
+    else if (r.status !== 'running') dekParts.push('Resume to continue from saved evidence.')
     dek = dekParts.length ? dekParts.join(' ') : null
-    worst = findings.filter(f => f.status !== 'dismissed').slice().sort(bySev)[0] ?? null
+    worst = [...view.advisories, ...view.unverified.filter(x => x.finding.status !== 'dismissed')]
+      .sort((a, b) => (SEV_ORDER[a.effectiveSeverity] ?? 9) - (SEV_ORDER[b.effectiveSeverity] ?? 9))[0]?.finding ?? null
   } else {
-    const top = SEV.find(s => confirmed.some(f => f.severity === s))
+    const top = SEV.find(s => c.byConfirmedSeverity[s] > 0)
     if (!top) {
       hed = 'No weakness could be confirmed across ' + hostsW + '.'
       const dekParts: string[] = []
-      if (n.static_verified) dekParts.push(capF(words(n.static_verified)) + ' static ' + (n.static_verified === 1 ? 'advisory' : 'advisories') + ' (not runtime-confirmed).')
-      if (n.inconclusive) dekParts.push(capF(words(n.inconclusive)) + ' observation' + (n.inconclusive === 1 ? ' remains' : 's remain') + ' inconclusive.')
+      if (n.static_verified) dekParts.push(wp(n.static_verified, 'static advisory', 'static advisories') + ' (not runtime-confirmed).')
+      if (n.inconclusive) dekParts.push(wp(n.inconclusive, 'observation remains', 'observations remain') + ' inconclusive.')
       dek = dekParts.length ? dekParts.join(' ') : null
     } else {
-      const k = confirmed.filter(f => f.severity === top).length
+      const k = c.byConfirmedSeverity[top]
       const i = SEV.indexOf(top)
       const above = i === 2 ? '; nothing high or critical' : i > 2 ? '; nothing more severe' : ''
-      hed = capF(words(k)) + ' ' + top + '-severity weakness' + (k > 1 ? 'es' : '') + ' confirmed across ' + hostsW + above + '.'
-      worst = confirmed.filter(f => f.severity === top)
+      hed = wp(k, top + '-severity weakness', top + '-severity weaknesses') + ' confirmed across ' + hostsW + above + '.'
+      worst = confirmed.filter(x => x.effectiveSeverity === top).map(x => x.finding)
         .sort((a, b) => Number(b.findingKind === 'multi_step_chain') - Number(a.findingKind === 'multi_step_chain'))[0] ?? null
       if (live) dek = 'Provisional: the run is ' + (r.status === 'running' ? 'still running' : 'paused') + ', so more may follow.'
     }
@@ -108,18 +128,17 @@ export function buildVerdict(d: Detail, findings: readonly FindingRow[], interru
   if (r.status === 'waiting') {
     conf = { word: 'Not yet assessed', text: 'Confidence is earned by automated replay once work begins. Nothing has been observed.', seg: [] }
   } else {
-    const standing = findings.length - n.dismissed
+    const standing = c.total - n.dismissed
     const k = confirmed.length
     const ratio = standing ? k / standing : 0
-    let word = ratio >= 0.6 ? 'High' : ratio >= 0.3 ? 'Moderate' : 'Limited'
-    if (live) word = 'Provisional'
+    const word = live ? 'Provisional' : ratio >= 0.6 ? 'High' : ratio >= 0.3 ? 'Moderate' : 'Limited'
     const parts = [k + ' of ' + standing + ' standing findings confirmed by automated replay']
     if (n.static_verified) parts.push(n.static_verified + ' static ' + (n.static_verified === 1 ? 'advisory' : 'advisories'))
     if (n.dismissed) parts.push(n.dismissed + ' dismissed on replay')
     if (n.inconclusive) parts.push(n.inconclusive + ' inconclusive')
     if (n.pending) parts.push(n.pending + ' awaiting verification')
     let text = parts.join('; ') + '.'
-    if (followups) text += ' ' + capF(words(followups)) + ' coverage area' + (followups > 1 ? 's need' : ' needs') + ' follow-up.'
+    if (followups) text += ' ' + wp(followups, 'coverage area needs', 'coverage areas need') + ' follow-up.'
     conf = {
       word, text,
       seg: [
@@ -131,7 +150,7 @@ export function buildVerdict(d: Detail, findings: readonly FindingRow[], interru
       ],
     }
   }
-  return { hed, dek, worst, conf, n, hosts, confirmed: confirmed.length, followups, pendingApprovals }
+  return { hed, dek, worst, conf, n, hosts, confirmed: c.confirmed, reportable: c.reportable, suppressed: c.suppressed, followups, pendingApprovals }
 }
 
 // ---------------------------------------------------------------- queue (E's triage)
@@ -387,75 +406,42 @@ const group = <T, K>(items: readonly T[], key: (t: T) => K | null | undefined) =
   return m
 }
 
-function pushTimestamp(times: number[], value: unknown) {
-  if (typeof value === 'number' && Number.isFinite(value) && value > 0) times.push(value)
-}
-
-/**
- * Derive the latest known timestamp for a run without snapping backward when the run pauses
- * or finishes: incorporates `endedAt`/`updatedAt` on the run, assignments, chain steps,
- * coverage entries, board members, approvals (`decidedAt`), patch proposals, and endpoints.
- */
 export function computeRunEnd(d: Detail): number {
-  const times: number[] = []
-  const runMeta = d.run as Detail['run'] & { endedAt?: number | null; updatedAt?: number | null }
-  pushTimestamp(times, d.run.createdAt)
-  pushTimestamp(times, runMeta.endedAt)
-  pushTimestamp(times, runMeta.updatedAt)
-  pushTimestamp(times, d.run.phase0CompletedAt)
+  let max = d.run.createdAt
+  const p = (v: unknown) => { if (typeof v === 'number' && Number.isFinite(v) && v > max) max = v }
+  const r = d.run as Run & { endedAt?: number | null; updatedAt?: number | null }
+  p(r.endedAt); p(r.updatedAt); p(r.phase0CompletedAt)
   for (const e of d.exchangesSummary) {
-    pushTimestamp(times, e.createdAt)
-    if (typeof e.durationMs === 'number' && Number.isFinite(e.durationMs) && e.durationMs > 0) {
-      pushTimestamp(times, e.createdAt + e.durationMs)
-    }
+    p(e.createdAt)
+    if (typeof e.durationMs === 'number' && Number.isFinite(e.durationMs) && e.durationMs > 0) p(e.createdAt + e.durationMs)
   }
-  for (const a of d.assignments) {
-    const am = a as Assignment & { endedAt?: number | null; updatedAt?: number | null }
-    pushTimestamp(times, a.createdAt)
-    pushTimestamp(times, am.endedAt)
-    pushTimestamp(times, am.updatedAt)
+  for (const a of d.assignments as (Assignment & { endedAt?: number | null; updatedAt?: number | null })[]) {
+    p(a.createdAt); p(a.endedAt); p(a.updatedAt)
   }
-  for (const s of d.chainSteps) {
-    pushTimestamp(times, s.createdAt)
-    pushTimestamp(times, s.updatedAt)
+  for (const list of [d.chainSteps, d.boardMembers, d.patchProposals ?? [], d.endpoints ?? []]) {
+    for (const x of list) { p(x.createdAt); p(x.updatedAt) }
   }
-  for (const c of d.coverageEntries) pushTimestamp(times, c.updatedAt)
-  for (const a of d.approvals) {
-    pushTimestamp(times, a.createdAt)
-    pushTimestamp(times, a.decidedAt)
+  for (const c of d.coverageEntries) p(c.updatedAt)
+  for (const a of d.approvals) { p(a.createdAt); p(a.decidedAt) }
+  for (const list of [d.boardMessages, d.facts, d.evidence, d.messages, d.reports, d.retestRuns]) {
+    for (const x of list) p(x.createdAt)
   }
-  for (const b of d.boardMembers) {
-    pushTimestamp(times, b.createdAt)
-    pushTimestamp(times, b.updatedAt)
-  }
-  for (const b of d.boardMessages) pushTimestamp(times, b.createdAt)
-  for (const f of d.facts) pushTimestamp(times, f.createdAt)
-  for (const e of d.evidence) pushTimestamp(times, e.createdAt)
-  for (const m of d.messages) pushTimestamp(times, m.createdAt)
-  for (const r of d.reports) pushTimestamp(times, r.createdAt)
-  for (const r of d.retestRuns) pushTimestamp(times, r.createdAt)
-  for (const p of d.patchProposals ?? []) {
-    pushTimestamp(times, p.createdAt)
-    pushTimestamp(times, p.updatedAt)
-  }
-  for (const ep of d.endpoints ?? []) {
-    pushTimestamp(times, ep.createdAt)
-    pushTimestamp(times, ep.updatedAt)
-  }
-  return times.length ? Math.max(...times) : d.run.createdAt
+  return max
 }
 
 export function buildRunModel(d: Detail, now = Date.now()): RunModel {
+  const byId = <T extends { id: string }>(xs: readonly T[]) => new Map(xs.map(x => [x.id, x]))
+  const push = <K, V>(m: Map<K, V[]>, k: K, v: V) => { const a = m.get(k); if (a) a.push(v); else m.set(k, [v]) }
   const allFindings = d.findings
   const findings = allFindings.filter(f => !f.supersededByFindingId)
-  const findingById = new Map(allFindings.map(f => [f.id, f]))
-  const workerById = new Map(d.assignments.map(a => [a.id, a]))
-  const stepById = new Map(d.chainSteps.map(s => [s.id, s]))
+  const findingById = byId(allFindings)
+  const workerById = byId(d.assignments)
+  const stepById = byId(d.chainSteps)
   const stepByWorker = new Map(d.chainSteps.filter(s => s.assignedWorkerId).map(s => [s.assignedWorkerId!, s]))
-  const exchangeById = new Map(d.exchangesSummary.map(e => [e.id, e]))
-  const evidenceById = new Map(d.evidence.map(e => [e.id, e]))
-  const factById = new Map(d.facts.map(f => [f.id, f]))
-  const approvalById = new Map(d.approvals.map(a => [a.id, a]))
+  const exchangeById = byId(d.exchangesSummary)
+  const evidenceById = byId(d.evidence)
+  const factById = byId(d.facts)
+  const approvalById = byId(d.approvals)
   const factsByWorker = group(d.facts, f => f.assignmentId)
   const evidenceByWorker = group(d.evidence, e => e.assignmentId)
   const exchangesByWorker = group(d.exchangesSummary, e => e.assignmentId)
@@ -465,25 +451,21 @@ export function buildRunModel(d: Detail, now = Date.now()): RunModel {
   const workerFindings = new Map<string, FindingRow[]>()
   const exchangeFindings = new Map<string, FindingRow[]>()
   const evidenceFindings = new Map<string, FindingRow[]>()
-  // A worker counts for a finding only if it produced or verified it: it recorded the
-  // cited evidence, or it made a cited exchange. Chain facts are deliberately excluded:
-  // they are upstream inputs another worker built on (the workflow lineage shows them),
-  // so counting their authors inflated "Found by" and the "With findings" filter.
   for (const f of findings) {
     const w = new Set<string>()
     for (const e of f.evidenceIds) {
-      const ev = evidenceById.get(e)
-      if (ev?.assignmentId) w.add(ev.assignmentId)
-      evidenceFindings.set(e, [...(evidenceFindings.get(e) ?? []), f])
+      const aid = evidenceById.get(e)?.assignmentId
+      if (aid) w.add(aid)
+      push(evidenceFindings, e, f)
     }
     for (const e of f.exchangeIds ?? []) {
-      const ex = exchangeById.get(e)
-      if (ex?.assignmentId) w.add(ex.assignmentId)
-      exchangeFindings.set(e, [...(exchangeFindings.get(e) ?? []), f])
+      const aid = exchangeById.get(e)?.assignmentId
+      if (aid) w.add(aid)
+      push(exchangeFindings, e, f)
     }
     const ws = [...w].filter(a => workerById.has(a))
     findingWorkers.set(f.id, ws)
-    for (const a of ws) workerFindings.set(a, [...(workerFindings.get(a) ?? []), f])
+    for (const a of ws) push(workerFindings, a, f)
   }
 
   const end = computeRunEnd(d)

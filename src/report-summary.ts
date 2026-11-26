@@ -12,6 +12,8 @@ import type {
   VerificationTier,
 } from './domain.ts'
 import { ORIGIN_WIDE_CWE_KEYS } from './finding-keys.ts'
+import { projectRunFindings } from './findings-view.ts'
+import type { FindingsScopeContext, FindingsViewInputRow } from './findings-view.ts'
 
 export const checkLabels: Record<CheckCoverage['status'], string> = {
   met: 'Meets baseline',
@@ -440,7 +442,7 @@ function checkCount(count: number) {
   return count + (count === 1 ? ' check' : ' checks')
 }
 
-export function reportHighlights(body: ReportBody) {
+export function reportHighlights(body: ReportBody, scopeCtx?: Omit<FindingsScopeContext, 'approvedOrigins'>) {
   const scope = new Set(body.scope.map(asset => asset.origin))
   const rows = new Map(body.coverage.map(row => [row.origin, row.checks]))
   const counts: Record<CheckCoverage['status'], number> = { met: 0, gap: 0, inconclusive: 0, 'not-applicable': 0, untested: 0 }
@@ -465,13 +467,17 @@ export function reportHighlights(body: ReportBody) {
   }
   const coverage = coverageParts.join(' · ')
 
-  const scopedFindings = collapseBaselineHeaderFindings(
-    deduplicateChainFindings(filterActiveFindings(body.findings).filter(item =>
-      scope.has(item.origin) || item.status === 'static_verified' || item.verificationTier === 'static_verified',
-    )),
-  ).findings
-  const confirmed = scopedFindings.filter(item => item.status === 'confirmed')
-  const staticVerified = scopedFindings.filter(item => item.status === 'static_verified')
+  const projected = projectRunFindings(body.findings as readonly (Finding & FindingsViewInputRow)[], {
+    ...scopeCtx,
+    approvedOrigins: scope,
+  })
+  const activeProjected = [...projected.confirmed, ...projected.advisories, ...projected.unverified]
+    .map(item => (item.effectiveSeverity === item.finding.severity
+      ? item.finding
+      : { ...item.finding, severity: item.effectiveSeverity }))
+  const collapsed = collapseBaselineHeaderFindings(deduplicateChainFindings(activeProjected)).findings
+  const confirmed = collapsed.filter(item => item.status === 'confirmed' && item.verificationTier !== 'static_verified')
+  const staticVerified = collapsed.filter(item => item.status === 'static_verified' || item.verificationTier === 'static_verified')
   const chainConfirmed = confirmed.filter(item => item.findingKind === 'multi_step_chain').length
   const headerPostureCount = confirmed.filter(item => isConsolidatedHeaderPostureFinding(item)).length
   const prominentConfirmed = confirmed.filter(item => !isConsolidatedHeaderPostureFinding(item))
@@ -495,6 +501,8 @@ export function reportHighlights(body: ReportBody) {
     coverage,
     confirmed: confirmed.length,
     staticVerified: staticVerified.length,
+    reportable: confirmed.length + staticVerified.length,
+    suppressed: projected.counts.suppressed,
     chainConfirmed,
     headerPostureCount,
     openProofGapsCount,

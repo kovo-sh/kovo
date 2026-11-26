@@ -13,8 +13,10 @@ import { createHash, createHmac, createPrivateKey, createPublicKey, generateKeyP
 import type { KeyLike, KeyObject } from 'node:crypto'
 import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { desc, eq } from 'drizzle-orm'
+import { and, desc, eq } from 'drizzle-orm'
 import { normalizeCurlHttpMethod, quotePosixShellArg } from '../components/curl-parser.ts'
+import { projectRunFindings } from '../findings-view.ts'
+import type { CanonicalSeverity, FindingBackingKind, FindingDisposition, FindingsViewInputRow } from '../findings-view.ts'
 import { CAUSAL_EDGE_KINDS, REPLAY_MODES, compositeProofReceiptSchema } from './composite-receipt.ts'
 import type {
   CausalEdgeBinding,
@@ -27,12 +29,13 @@ import type {
 } from './composite-receipt.ts'
 import { buildCoverageGapReport } from './coverage-gaps.ts'
 import type { CoverageGapReport } from './coverage-gaps.ts'
+import { FindingCodec } from './finding-codec.ts'
 import type { CompositePatchRetestVerdict } from './patch-workflow.ts'
 import { personaSecrets, resolveRunPersonas } from './persona-vault.ts'
 import type { ProofReceipt } from './proof-receipt.ts'
 import { isZdrModeEnabled, redact, redactHeaders, redactPii } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
-import { brokerExchanges, findings as findingsTable, replaySpecs, retestRuns } from './schema.ts'
+import { brokerExchanges, facts as factsTable, findings as findingsTable, replaySpecs, retestRuns } from './schema.ts'
 import { canonicalJson } from './scope-policy.ts'
 import type { Store } from './store.ts'
 
@@ -89,8 +92,11 @@ export interface PortableReceiptRecord {
   findingId: string
   title: string
   severity: string
+  effectiveSeverity: CanonicalSeverity
   cwe: string | null
   status: string
+  disposition: FindingDisposition
+  backingKind: FindingBackingKind
   origin: string
   replaySpecId: string | null
   proofKind: string | null
@@ -210,6 +216,13 @@ export interface ProofReceiptExportPayload {
   tenantId: string
   zdrRedacted: boolean
   receiptCount: number
+  findingsSummary?: {
+    reportable: number
+    confirmed: number
+    advisories: number
+    suppressed: number
+    excluded: number
+  }
   records: PortableReceiptRecord[]
   compositeReceipts?: PortableCompositeReceiptRecord[]
   coverageGaps: CoverageGapReport
@@ -913,13 +926,62 @@ export function exportRunReceiptBundle(
     }
   }
 
+  const approvedSet = new Set(run.approved)
+  const approvedOrigins = run.candidates.filter(c => approvedSet.has(c.id)).map(c => c.origin)
+  const hasScope = approvedOrigins.length > 0 || run.scopeRevision > 0
+  const provenanceAllowedOrigins = [...(run.authOrigins ?? []), ...(run.assetOrigins ?? [])]
+  const taintedFactIds = storage.db
+    .select({ id: factsTable.id })
+    .from(factsTable)
+    .where(and(eq(factsTable.runId, run.id), eq(factsTable.tainted, true)))
+    .all()
+    .map(f => f.id)
+
+  type EnrichedReceiptRow = FindingsViewInputRow & {
+    row: (typeof findingRows)[number]
+    finding: ReturnType<typeof FindingCodec.fromRow>
+    specRow: (typeof specRows)[number] | undefined
+  }
+  const enrichedRows: EnrichedReceiptRow[] = [...findingRows]
+    .sort((a, b) => a.id.localeCompare(b.id))
+    .map(row => {
+      const f = FindingCodec.fromRow(row)
+      const specRow = (row.replaySpecId ? specsById.get(row.replaySpecId) : undefined) ?? specsByFindingId.get(row.id)
+      const rawProof = specRow?.proofReceipt as Record<string, unknown> | null | undefined
+      const hasCompositeReceipt = Boolean(rawProof && (rawProof.compositeReceipt || (Array.isArray(rawProof.hops) && typeof rawProof.chainId === 'string')))
+      const hasReceipt = Boolean(rawProof && 'receipt' in rawProof && rawProof.receipt)
+      const hasOobBacking = Boolean(hasReceipt && ((specRow?.proofReceipt?.receipt?.oobEventIds?.length ?? 0) > 0))
+      const replaySpecKind = specRow?.spec && typeof specRow.spec === 'object'
+        ? String((specRow.spec as { kind?: unknown }).kind ?? '')
+        : null
+      return {
+        ...f,
+        assetId: row.assetId,
+        sourceOrigins: row.sourceOrigins,
+        hasReceipt,
+        hasCompositeReceipt,
+        hasOobBacking,
+        replaySpecKind,
+        row,
+        finding: f,
+        specRow,
+      }
+    })
+
+  const view = projectRunFindings(enrichedRows, {
+    ...(hasScope ? { approvedOrigins, approvedAssetIds: approvedSet, provenanceAllowedOrigins } : {}),
+    ...(taintedFactIds.length > 0 ? { taintedFactIds } : {}),
+  })
+
   const records: PortableReceiptRecord[] = []
-  const sortedFindings = [...findingRows].sort((a, b) => a.id.localeCompare(b.id))
-  for (const row of sortedFindings) {
-    const f = row.finding
-    const specRow = (row.replaySpecId ? specsById.get(row.replaySpecId) : undefined) ?? specsByFindingId.get(row.id)
-    const persistedReceipt = specRow?.proofReceipt
-    if (f.status !== 'confirmed' && !persistedReceipt) continue
+  for (const item of view.items) {
+    if (item.excludedReason !== undefined) continue
+    if (item.disposition === 'suppressed') continue
+    const { row, finding: f, specRow } = item.finding
+    const persistedReceipt = specRow?.proofReceipt && 'receipt' in (specRow.proofReceipt as object)
+      ? specRow.proofReceipt
+      : undefined
+    if (item.disposition !== 'confirmed' && !persistedReceipt) continue
 
     const rawExchangeIds = persistedReceipt?.receipt.exchangeIds?.length
       ? persistedReceipt.receipt.exchangeIds
@@ -1034,8 +1096,11 @@ export function exportRunReceiptBundle(
       findingId: row.id,
       title: scrubText(f.title, secrets, zdr),
       severity: f.severity,
+      effectiveSeverity: item.effectiveSeverity,
       cwe: f.cwe ?? null,
       status: f.status,
+      disposition: item.disposition,
+      backingKind: item.backingKind,
       origin: f.origin,
       replaySpecId: specRow?.id ?? null,
       proofKind: specRow?.proofKind ?? null,
@@ -1080,6 +1145,13 @@ export function exportRunReceiptBundle(
     tenantId: runTenant,
     zdrRedacted: zdr,
     receiptCount: records.length,
+    findingsSummary: {
+      reportable: view.counts.reportable,
+      confirmed: view.counts.confirmed,
+      advisories: view.counts.advisories,
+      suppressed: view.counts.suppressed,
+      excluded: view.counts.excluded,
+    },
     records,
     ...(compositeReceipts.length > 0 ? { compositeReceipts } : {}),
     coverageGaps,

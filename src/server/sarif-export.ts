@@ -1,9 +1,12 @@
 import { createHash } from 'node:crypto'
 import { and, desc, eq } from 'drizzle-orm'
 import type { Finding, OwaspCategory } from '../domain.ts'
-import { deduplicateChainFindings, filterActiveFindings, owaspCategoryTitles } from '../report-summary.ts'
+import { normalizeFindingSeverity, projectRunFindings } from '../findings-view.ts'
+import type { OperatorTriageOverlay } from '../findings-view.ts'
+import { deduplicateChainFindings, owaspCategoryTitles } from '../report-summary.ts'
 import { computeFindingFingerprint } from './dedupe.ts'
 import type { CompositeProofReceipt } from './composite-receipt.ts'
+import { FindingCodec } from './finding-codec.ts'
 import { privateModelProfiles } from './model-settings.ts'
 import { personaSecrets, resolveRunPersonas } from './persona-vault.ts'
 import {
@@ -17,7 +20,7 @@ import type {
 } from './receipt-export.ts'
 import { redact, redactPii } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
-import { brokerExchanges, findings as findingsTable, replaySpecs, reports, retestRuns } from './schema.ts'
+import { brokerExchanges, facts as factsTable, findings as findingsTable, replaySpecs, reports, retestRuns } from './schema.ts'
 import type { Store } from './store.ts'
 import { parseUnifiedDiff } from './unified-diff.ts'
 
@@ -43,6 +46,15 @@ export interface SarifCodeFlowOptions {
 export interface SarifFindingInput extends Omit<Finding, 'status' | 'codeLocations' | 'verificationTier' | 'fingerprintHash' | 'counterevidence' | 'confidenceRationale' | 'severityChangeConditions' | 'runtimeProofGap'> {
   status: Finding['status'] | 'static_verified'
   verificationTier?: 'runtime_confirmed' | 'static_verified' | 'baseline_confirmed'
+  verificationStatus?: string | null
+  provenance?: string | null
+  sourceOrigins?: string[] | null
+  assetId?: string | null
+  operatorTriage?: OperatorTriageOverlay | null
+  hasReceipt?: boolean
+  hasCompositeReceipt?: boolean
+  hasOobBacking?: boolean
+  replaySpecKind?: string | null
   runtimeProofGap?: string | null
   fingerprintHash?: string | null
   counterevidence?: string | null
@@ -148,6 +160,13 @@ export interface SarifFix {
   artifactChanges: SarifArtifactChange[]
 }
 
+export interface SarifSuppression {
+  kind: 'inSource' | 'external'
+  status?: 'accepted' | 'underReview' | 'rejected'
+  justification?: string
+  properties?: Record<string, unknown>
+}
+
 export interface SarifResult {
   ruleId: string
   ruleIndex: number
@@ -158,6 +177,7 @@ export interface SarifResult {
   codeFlows?: SarifCodeFlow[]
   partialFingerprints?: Record<string, string>
   fixes?: SarifFix[]
+  suppressions?: SarifSuppression[]
   properties: {
     kovo: Record<string, unknown>
   }
@@ -195,6 +215,8 @@ export interface SarifBuildInput {
   scopeRevision: number
   goalRevision: number
   approvedOrigins: readonly string[]
+  provenanceAllowedOrigins?: readonly string[]
+  taintedFactIds?: readonly string[] | ReadonlySet<string>
   findings: readonly SarifFindingInput[]
   coverageEntries?: readonly SarifCoverageInput[]
   patches?: readonly SarifPatchInput[]
@@ -526,30 +548,54 @@ export function buildSarifLog(input: SarifBuildInput): SarifLog {
 
   const results: SarifResult[] = []
 
-  // Enforce canonical non-superseded projection so superseded upstream chain findings are never double-counted.
-  const activeFindings = filterActiveFindings(input.findings)
-  const supersededExcludedCount = input.findings.length - activeFindings.length
-  const STATIC_ANALYSIS_ORIGIN = 'https://static-analysis.invalid'
+  // Single canonical findings projection shared across headline, report, Markdown, SARIF & receipts.
+  const view = projectRunFindings(input.findings, {
+    approvedOrigins: approved,
+    ...(input.provenanceAllowedOrigins ? { provenanceAllowedOrigins: input.provenanceAllowedOrigins } : {}),
+    ...(input.taintedFactIds ? { taintedFactIds: input.taintedFactIds } : {}),
+  })
+  const supersededExcludedCount = view.counts.byExclusion.superseded ?? 0
+  const itemById = new Map(view.items.map(it => [it.finding.id, it]))
 
-  // Deduplicate chain findings while preserving all distinct findings inside approved scope.
-  const scopedFindings = activeFindings.filter(f =>
-    approved.has(f.origin)
-    || ((f.status === 'static_verified' || f.verificationTier === 'static_verified') && f.origin === STATIC_ANALYSIS_ORIGIN),
+  const activeDeduped = deduplicateChainFindings(
+    view.reportable.map(it => it.finding) as unknown as Finding[],
+  ) as unknown as SarifFindingInput[]
+  const suppressedReportable = view.suppressed.filter(it =>
+    it.finding.status === 'confirmed'
+    || it.finding.status === 'static_verified'
+    || it.finding.verificationTier === 'static_verified',
   )
-  const deduped = deduplicateChainFindings(scopedFindings as unknown as Finding[]) as unknown as SarifFindingInput[]
+  const suppressedDeduped = deduplicateChainFindings(
+    suppressedReportable.map(it => it.finding) as unknown as Finding[],
+  ) as unknown as SarifFindingInput[]
+
   let confirmedCount = 0
   let staticAdvisoryCount = 0
+  let suppressedCount = 0
 
-  for (const finding of deduped) {
+  const emitEntries: Array<{ finding: SarifFindingInput; suppressed: boolean }> = [
+    ...activeDeduped.map(finding => ({ finding, suppressed: false })),
+    ...suppressedDeduped.map(finding => ({ finding, suppressed: true })),
+  ]
+
+  for (const { finding, suppressed } of emitEntries) {
+    const projected = itemById.get(finding.id)
     const isStaticVerified = finding.status === 'static_verified' || finding.verificationTier === 'static_verified'
-    const isConfirmed = finding.status === 'confirmed' && !isStaticVerified
-    if (!isConfirmed && !isStaticVerified) continue
-    if (isStaticVerified) staticAdvisoryCount += 1
-    else confirmedCount += 1
+    if (suppressed) {
+      suppressedCount += 1
+    } else if (isStaticVerified) {
+      staticAdvisoryCount += 1
+    } else {
+      confirmedCount += 1
+    }
 
+    const effectiveSeverity = projected?.effectiveSeverity ?? normalizeFindingSeverity(finding.severity)
+    const machineSeverity = normalizeFindingSeverity(finding.severity)
+    const backingKind = projected?.backingKind ?? (isStaticVerified ? 'static_only' : 'unbacked')
+    const disposition = projected?.disposition ?? (suppressed ? 'suppressed' : isStaticVerified ? 'advisory' : 'confirmed')
     const ruleMeta = canonicalRuleId(finding)
-    const level = severityToSarifLevel(finding.severity)
-    const secScore = SEVERITY_TO_SCORE[finding.severity] ?? '5.5'
+    const level = severityToSarifLevel(effectiveSeverity)
+    const secScore = SEVERITY_TO_SCORE[effectiveSeverity] ?? '5.5'
 
     const ruleIndex = ensureRule(ruleMeta.id, () => ({
       id: ruleMeta.id,
@@ -679,6 +725,29 @@ export function buildSarifLog(input: SarifBuildInput): SarifLog {
       ? compositeReceiptsToSarifCodeFlows(matchedComposites, { secrets, zdr })
       : []
 
+    const triage = finding.operatorTriage
+    const suppressedBy = projected?.suppressedBy ?? (
+      triage?.status === 'false_positive' || triage?.status === 'accepted_risk' ? triage.status : undefined
+    )
+    const suppressions: SarifSuppression[] | undefined = suppressed && suppressedBy
+      ? [{
+          kind: 'external',
+          status: 'accepted',
+          justification: redact(
+            triage?.notes?.trim()
+              ? `[${suppressedBy}] ${triage.notes.trim()}`
+              : suppressedBy === 'false_positive'
+                ? 'Marked false positive via operator triage.'
+                : 'Marked accepted risk via operator triage.',
+            secrets,
+          ),
+          properties: {
+            triageStatus: suppressedBy,
+            ...(triage?.updatedAt ? { updatedAt: new Date(triage.updatedAt).toISOString() } : {}),
+          },
+        }]
+      : undefined
+
     results.push({
       ruleId: ruleMeta.id,
       ruleIndex,
@@ -692,17 +761,23 @@ export function buildSarifLog(input: SarifBuildInput): SarifLog {
         'primaryLocationLineHash': createHash('sha256').update(`${finding.id}:${fp}`).digest('hex').slice(0, 32),
       },
       ...(fixes.length > 0 ? { fixes } : {}),
+      ...(suppressions ? { suppressions } : {}),
       properties: {
         kovo: {
           findingId: finding.id,
           origin: finding.origin,
-          severity: finding.severity,
+          severity: effectiveSeverity,
+          effectiveSeverity,
+          machineSeverity,
           status: finding.status,
+          disposition,
+          backingKind,
+          ...(suppressedBy ? { triageStatus: suppressedBy } : {}),
           category: finding.category ?? null,
           cwe: ruleMeta.id,
           verificationTier,
           runtimeConfirmed: !isStaticVerified,
-          tierSection: isStaticVerified ? 'static_advisory' : 'confirmed',
+          tierSection: suppressed ? 'suppressed' : isStaticVerified ? 'static_advisory' : 'confirmed',
           ...(runtimeProofGap ? { runtimeProofGap } : {}),
           exchangeIds: approvedExchanges,
           ...(replaySpecSha256 ? { replaySpecSha256 } : {}),
@@ -823,7 +898,10 @@ export function buildSarifLog(input: SarifBuildInput): SarifLog {
           approvedScope: [...approved],
           confirmedCount,
           staticAdvisoryCount,
+          reportableCount: confirmedCount + staticAdvisoryCount,
+          suppressedCount,
           supersededExcludedCount,
+          excludedCount: view.counts.excluded,
         },
       },
     ],
@@ -832,15 +910,42 @@ export function buildSarifLog(input: SarifBuildInput): SarifLog {
   return redactDeep(log, secrets, zdr)
 }
 
-function hydrateFindingsForSarif(storage: Store, runId: string, baseFindings: readonly Finding[]): SarifFindingInput[] {
+function hydrateFindingsForSarif(
+  storage: Store,
+  runId: string,
+  baseFindings: readonly Finding[],
+  specRows: ReadonlyArray<typeof replaySpecs.$inferSelect>,
+): SarifFindingInput[] {
   const rowsById = new Map(
     storage.db.select().from(findingsTable).where(eq(findingsTable.runId, runId)).all().map(row => [row.id, row]),
   )
+  const specsById = new Map(specRows.map(s => [s.id, s]))
+  const specsByFindingId = new Map(specRows.map(s => [s.findingId, s]))
   return baseFindings.map(f => {
     const row = rowsById.get(f.id)
+    const decoded = row ? FindingCodec.fromRow(row) : undefined
+    const specRow = ((f.replaySpecId ?? row?.replaySpecId)
+      ? specsById.get((f.replaySpecId ?? row?.replaySpecId)!)
+      : undefined) ?? specsByFindingId.get(f.id)
+    const rawProof = specRow?.proofReceipt as Record<string, unknown> | null | undefined
+    const hasCompositeReceipt = Boolean(rawProof && (rawProof.compositeReceipt || (Array.isArray(rawProof.hops) && typeof rawProof.chainId === 'string')))
+    const hasReceipt = Boolean(rawProof && 'receipt' in rawProof && rawProof.receipt)
+    const hasOobBacking = Boolean(hasReceipt && ((specRow?.proofReceipt?.receipt?.oobEventIds?.length ?? 0) > 0))
+    const replaySpecKind = specRow?.spec && typeof specRow.spec === 'object'
+      ? String((specRow.spec as { kind?: unknown }).kind ?? '')
+      : null
     return {
       ...f,
       verificationTier: f.verificationTier ?? row?.verificationTier ?? undefined,
+      verificationStatus: decoded?.verificationStatus ?? row?.verificationClass ?? undefined,
+      provenance: decoded?.provenance ?? row?.provenance ?? undefined,
+      sourceOrigins: row?.sourceOrigins ?? undefined,
+      assetId: row?.assetId ?? undefined,
+      operatorTriage: (f as { operatorTriage?: OperatorTriageOverlay | null }).operatorTriage ?? decoded?.operatorTriage ?? undefined,
+      hasReceipt,
+      hasCompositeReceipt,
+      hasOobBacking,
+      replaySpecKind,
       fingerprintHash: f.fingerprintHash ?? row?.fingerprintHash ?? undefined,
       supersededByFindingId: f.supersededByFindingId ?? row?.supersededByFindingId ?? undefined,
       counterevidence: f.counterevidence ?? row?.counterevidence ?? undefined,
@@ -928,9 +1033,17 @@ export function exportReportSarif(
       .all()
       .map(row => row.finding)
 
-  const enrichedFindings = hydrateFindingsForSarif(storage, run.id, baseFindings)
-
   const specRows = storage.db.select().from(replaySpecs).where(eq(replaySpecs.runId, run.id)).all()
+  const enrichedFindings = hydrateFindingsForSarif(storage, run.id, baseFindings, specRows)
+  const taintedFactIds = (!report || scopeRevision === run.scopeRevision)
+    ? storage.db
+        .select({ id: factsTable.id })
+        .from(factsTable)
+        .where(and(eq(factsTable.runId, run.id), eq(factsTable.tainted, true)))
+        .all()
+        .map(f => f.id)
+    : []
+  const provenanceAllowedOrigins = [...(run.authOrigins ?? []), ...(run.assetOrigins ?? [])]
   const retestRows = storage.db.select().from(retestRuns)
     .where(eq(retestRuns.runId, run.id))
     .orderBy(desc(retestRuns.createdAt))
@@ -968,6 +1081,8 @@ export function exportReportSarif(
     scopeRevision,
     goalRevision,
     approvedOrigins,
+    ...(provenanceAllowedOrigins.length > 0 ? { provenanceAllowedOrigins } : {}),
+    ...(taintedFactIds.length > 0 ? { taintedFactIds } : {}),
     findings: enrichedFindings,
     coverageEntries: covEntries,
     patches,
