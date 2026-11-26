@@ -311,6 +311,7 @@ test('v6 scope: durable route lease is scoped, survives iterations/replay, and o
     seeds: [appOrigin], tier: 3, environment: 'public',
   })
   void assetIds
+  // R4-H-1: Approval leases NEVER override prod_readonly (`readonly_environment`).
   storage.setEnvironmentMode(storage.run(runId), 'prod_readonly')
   const lease = storage.grantApprovalLease(storage.run(runId), {
     origin: appOrigin,
@@ -322,7 +323,22 @@ test('v6 scope: durable route lease is scoped, survives iterations/replay, and o
 
   const leaseCheck = (o: string, m: string, p: string) => storage.leaseAuthorizes(runId, o, m, p)
   const broker = brokerFor([])
-  const grant = grantFor(policy(), { isStateChangeApproved: () => false, approvalLeases: leaseCheck })
+  const prodGrant = grantFor(policy(), { isStateChangeApproved: () => false, approvalLeases: leaseCheck })
+  await assert.rejects(
+    broker.executeHttp({
+      origin: appOrigin,
+      method: 'POST',
+      pathAndQuery: '/api/items/11111',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{"name":"iteration-11111"}',
+    }, prodGrant, AbortSignal.timeout(5_000)),
+    (error: unknown) => error instanceof BrokerDenied && /prod_readonly/.test(error.message),
+  )
+
+  // Under staging_isolated, the durable route lease authorizes repeated iterations and replays on the leased route.
+  storage.setEnvironmentMode(storage.run(runId), 'staging_isolated')
+  const stagingPolicy = storage.scopePolicy(runId)
+  const grant = grantFor(stagingPolicy, { isStateChangeApproved: () => false, approvalLeases: leaseCheck })
 
   for (const id of ['11111', '22222', '33333']) {
     const result = await broker.executeHttp({
@@ -337,7 +353,7 @@ test('v6 scope: durable route lease is scoped, survives iterations/replay, and o
   assert.equal(storage.listApprovalLeases(runId, 'active')[0]?.uses, 3, 'lease usage is audited')
 
   // Independent replay through a fresh broker/grant still matches the same durable lease.
-  const replayGrant = grantFor(policy(), { isStateChangeApproved: () => false, approvalLeases: leaseCheck })
+  const replayGrant = grantFor(stagingPolicy, { isStateChangeApproved: () => false, approvalLeases: leaseCheck })
   const replay = await brokerFor([]).executeHttp({
     origin: appOrigin,
     method: 'POST',
@@ -356,7 +372,7 @@ test('v6 scope: durable route lease is scoped, survives iterations/replay, and o
       headers: { 'Content-Type': 'application/json' },
       body: '{"role":"admin"}',
     }, grant, AbortSignal.timeout(5_000)),
-    (error: unknown) => error instanceof BrokerDenied && /prod_readonly/.test(error.message),
+    (error: unknown) => error instanceof BrokerDenied && /staging_isolated|tenant|prod_readonly/i.test(error.message),
   )
   assert.ok(run.id === runId)
 })

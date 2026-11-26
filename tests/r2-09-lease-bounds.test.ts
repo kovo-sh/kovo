@@ -588,11 +588,11 @@ test('R2-09 honest riskLevel audit attribution: bulk route/prefix/host approvals
   assert.equal(store.getApprovalRequest(runId, routeSibling.id).status, 'approved')
   assert.equal(store.getApprovalRequest(runId, routeSibling.id).riskLevel, 'medium', 'route bulk-approval must keep original medium riskLevel')
 
-  // Prefix bulk approval preserves 'medium' riskLevel on sibling card under same prefix.
+  // Prefix bulk approval preserves 'medium' riskLevel on sibling card under same 2-segment prefix.
   const prefixPrimary = store.createApprovalRequest(store.run(runId), worker, {
     origin: ORIGIN,
     method: 'POST',
-    pathAndQuery: '/_actions/saveDraft',
+    pathAndQuery: '/_actions/notes/saveDraft',
     rationale: 'Primary prefix write',
     requestPreview: '{}',
     riskLevel: 'low',
@@ -600,7 +600,7 @@ test('R2-09 honest riskLevel audit attribution: bulk route/prefix/host approvals
   const prefixSibling = store.createApprovalRequest(store.run(runId), worker, {
     origin: ORIGIN,
     method: 'POST',
-    pathAndQuery: '/_actions/publishNote',
+    pathAndQuery: '/_actions/notes/publishNote',
     rationale: 'Sibling medium prefix write',
     requestPreview: '{}',
     riskLevel: 'medium',

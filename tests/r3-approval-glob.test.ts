@@ -124,14 +124,34 @@ test('R3-H-9: card_path normalization (default) escapes literal * and ** segment
   }
 })
 
-test('R3-H-9: explicit operator_explicit opt-in honors ** prefix globs (requiring a fixed prefix) and rejects bare /**', () => {
-  const operatorPrefix = normalizeApprovalPathPattern('/api/**', { source: 'operator_explicit' })
-  assert.equal(operatorPrefix, '/api/**')
-  const patterns = [{ origin: ORIGIN, method: 'POST', pathPattern: operatorPrefix }]
+test('R3-H-9: explicit operator_explicit opt-in honors ** prefix globs (requiring >= 2 fixed segments and non-high-risk targets) and rejects bare /**', () => {
+  const operatorPrefix = normalizeApprovalPathPattern('/api/v1/**', { source: 'operator_explicit' })
+  assert.equal(operatorPrefix, '/api/v1/**')
+  const patterns = [{ origin: ORIGIN, method: 'POST', pathPattern: operatorPrefix, source: 'operator_explicit' as const }]
 
-  assert.ok(matchesApprovedEndpointPattern({ origin: ORIGIN, method: 'POST', pathAndQuery: '/api/admin/users/delete' }, patterns))
-  assert.ok(matchesApprovedEndpointPattern({ origin: ORIGIN, method: 'POST', pathAndQuery: '/api/items/123' }, patterns))
-  assert.equal(matchesApprovedEndpointPattern({ origin: ORIGIN, method: 'POST', pathAndQuery: '/other/admin/users/delete' }, patterns), undefined)
+  assert.ok(matchesApprovedEndpointPattern({ origin: ORIGIN, method: 'POST', pathAndQuery: '/api/v1/items/123' }, patterns))
+  assert.equal(
+    matchesApprovedEndpointPattern({ origin: ORIGIN, method: 'POST', pathAndQuery: '/api/v1/admin/users/delete' }, patterns),
+    undefined,
+    'R4-H-1: prefix patterns must refuse high-risk targets at match time',
+  )
+  assert.equal(matchesApprovedEndpointPattern({ origin: ORIGIN, method: 'POST', pathAndQuery: '/other/v1/items/123' }, patterns), undefined)
+
+  // Missing `source` defaults to `card_path` (never `operator_explicit`), and single-segment `/api/**` is rejected.
+  assert.equal(
+    matchesApprovedEndpointPattern(
+      { origin: ORIGIN, method: 'POST', pathAndQuery: '/api/v1/items/123' },
+      [{ origin: ORIGIN, method: 'POST', pathPattern: '/api/v1/**' }],
+    ),
+    undefined,
+  )
+  assert.equal(
+    matchesApprovedEndpointPattern(
+      { origin: ORIGIN, method: 'POST', pathAndQuery: '/api/items/123' },
+      [{ origin: ORIGIN, method: 'POST', pathPattern: '/api/**', source: 'operator_explicit' }],
+    ),
+    undefined,
+  )
 
   // Explicit operator single-segment wildcard and placeholders work only on ID-shaped targets.
   const operatorPlaceholder = normalizeApprovalPathPattern('/api/orders/:id', { source: 'operator_explicit' })

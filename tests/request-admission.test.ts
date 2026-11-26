@@ -342,16 +342,16 @@ test('RequestAdmissionEngine enforces Tier 0/1/2/3, sandboxWriteAllowlist, durab
   assert.equal(t3Unapproved.effectiveTier, 'autonomous')
   assert.ok(t3Unapproved.approvalContext?.bodyHash)
 
-  // Durable route lease overrides prod_readonly on leased route, never on compressed body or race burst or out-of-scope
-  const leasedGrant = makeGrant({
+  // R4-H-1: Durable leases NEVER override prod_readonly (readonly_environment), compressed bodies, or race bursts.
+  const prodLeasedGrant = makeGrant({
     tier: 3,
     scopePolicy: makeScope({ mode: 'prod_readonly' }),
     isStateChangeApproved: () => false,
     approvalLeases: (o, m, p) => o === APP_ORIGIN && m === 'POST' && p.startsWith('/api/items/'),
   })
-  const leasedOk = engine.admit({ origin: APP_ORIGIN, method: 'POST', pathAndQuery: '/api/items/42', body: '{"x":1}' }, leasedGrant)
-  assert.equal(leasedOk.outcome, 'allow')
-  assert.equal(leasedOk.reasonCode, 'allowed_approval_lease')
+  const prodLeasedDenied = engine.admit({ origin: APP_ORIGIN, method: 'POST', pathAndQuery: '/api/items/42', body: '{"x":1}' }, prodLeasedGrant)
+  assert.equal(prodLeasedDenied.outcome, 'deny')
+  assert.equal(prodLeasedDenied.reasonCode, 'readonly_environment')
 
   const leasedCompressed = engine.admit({
     origin: APP_ORIGIN,
@@ -359,7 +359,7 @@ test('RequestAdmissionEngine enforces Tier 0/1/2/3, sandboxWriteAllowlist, durab
     pathAndQuery: '/api/items/42',
     headers: { 'Content-Encoding': 'gzip' },
     body: 'compressed',
-  }, leasedGrant)
+  }, prodLeasedGrant)
   assert.equal(leasedCompressed.outcome, 'deny')
   assert.equal(leasedCompressed.reasonCode, 'readonly_environment')
 
@@ -369,9 +369,21 @@ test('RequestAdmissionEngine enforces Tier 0/1/2/3, sandboxWriteAllowlist, durab
     pathAndQuery: '/api/items/42',
     body: '{"x":1}',
     isRaceBurst: true,
-  }, leasedGrant)
+  }, prodLeasedGrant)
   assert.equal(leasedRace.outcome, 'deny')
   assert.equal(leasedRace.reasonCode, 'readonly_environment')
+
+  // In staging_isolated, an eligible durable route lease still authorizes the leased non-high-risk route.
+  const stagingLeasedGrant = makeGrant({
+    tier: 3,
+    scopePolicy: makeScope({ mode: 'staging_isolated' }),
+    approvalPolicy: 'auto_review',
+    isStateChangeApproved: () => false,
+    approvalLeases: (o, m, p) => o === APP_ORIGIN && m === 'POST' && p.startsWith('/api/items/'),
+  })
+  const leasedOk = engine.admit({ origin: APP_ORIGIN, method: 'POST', pathAndQuery: '/api/items/42', body: '{"x":1}' }, stagingLeasedGrant)
+  assert.equal(leasedOk.outcome, 'allow')
+  assert.equal(leasedOk.reasonCode, 'allowed_approval_lease')
 
   // Budget & rate-limit hooks run BEFORE consuming single-use approval grants
   let approvalCalls = 0
@@ -563,15 +575,17 @@ test('broker.ts and verify-rpc.ts share RequestAdmissionEngine with identical de
     })
     assert.equal(h2Gql.ok, true, h2Gql.error ?? 'expected verified read-only GraphQL on HTTP/2 to succeed')
 
-    // 4. Durable approval lease works identically on BOTH broker.executeHttp AND verify-rpc http2!
-    const brokerLeased = await broker.executeHttp({
-      origin: h2Fixture.origin,
-      method: 'POST',
-      pathAndQuery: '/leased/42',
-      headers: { 'Content-Type': 'application/json' },
-      body: '{"ok":true}',
-    }, parityGrant, AbortSignal.timeout(5_000))
-    assert.equal(brokerLeased.status, 200)
+    // 4. R4-H-1: Durable approval lease NEVER overrides prod_readonly on EITHER broker.executeHttp OR verify-rpc http2!
+    await assert.rejects(
+      broker.executeHttp({
+        origin: h2Fixture.origin,
+        method: 'POST',
+        pathAndQuery: '/leased/42',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{"ok":true}',
+      }, parityGrant, AbortSignal.timeout(5_000)),
+      (err: unknown) => err instanceof BrokerDenied && /prod_readonly/.test(err.message),
+    )
 
     const h2Leased = await rpcCall(rpcServer, 'http2', {
       origin: h2Fixture.origin,
@@ -580,7 +594,8 @@ test('broker.ts and verify-rpc.ts share RequestAdmissionEngine with identical de
       headers: { 'Content-Type': 'application/json' },
       body: '{"ok":true}',
     })
-    assert.equal(h2Leased.ok, true, h2Leased.error ?? 'expected durable lease on HTTP/2 to match broker parity')
+    assert.equal(h2Leased.ok, false, 'prod_readonly must refuse leased route on HTTP/2 with broker parity')
+    assert.match(h2Leased.error ?? '', /prod_readonly/i)
 
     // 5. Unleased mutation in prod_readonly denied on BOTH broker.executeHttp AND verify-rpc http2
     await assert.rejects(
@@ -607,8 +622,8 @@ test('broker.ts and verify-rpc.ts share RequestAdmissionEngine with identical de
     const rpcBrowserOk = await rpcCall(rpcServer, 'browser', { origin: h2Fixture.origin, path: '/home' })
     assert.equal(rpcBrowserOk.ok, true, rpcBrowserOk.error ?? 'expected in-scope browser GET to succeed')
     assert.equal(browserHits, 1)
-    assert.equal(httpHits, 2)
-    assert.equal(h2Hits, 2)
+    assert.equal(httpHits, 1)
+    assert.equal(h2Hits, 1)
 
     // 7. Ephemeral lab Tier 3 unapproved POST raises BrokerApprovalRequired on broker and approval error on verify-rpc http2
     const ephemeralGrant: Grant = {

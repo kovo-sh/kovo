@@ -22,7 +22,12 @@ import {
   isLocalLabAutoApprovalOrigin,
 } from './approval-judge.ts'
 import type { MultipartBodyPart, StateChangeApprovalContext } from './approval-judge.ts'
-import { computeApprovalHeadersDigest, normalizeOriginKey } from './approval-pattern.ts'
+import {
+  computeApprovalHeadersDigest,
+  evaluateLeaseEligibility,
+  normalizeOriginKey,
+} from './approval-pattern.ts'
+import type { LeaseEligibilityScope, LeaseMatchContext } from './approval-pattern.ts'
 import {
   canonicalPathAndQuery,
   detectMethodOverride,
@@ -181,7 +186,13 @@ export interface AdmissionGrant {
   approvalPolicy?: ApprovalPolicy
   tenantId?: string
   storage?: unknown
-  approvalLeases?: (origin: string, method: string, pathAndQuery: string, personaHandle?: string | null) => boolean
+  approvalLeases?: (
+    origin: string,
+    method: string,
+    pathAndQuery: string,
+    personaHandle?: string | null,
+    context?: LeaseMatchContext,
+  ) => boolean
   isStateChangeApproved?: (
     origin: string,
     method: string,
@@ -1055,38 +1066,39 @@ export function classifyRequestMutation(input: {
 }
 
 /**
- * Single authoritative durable-route-lease eligibility check (`R3-H-1(b)` & `R2-09`).
+ * Single authoritative durable-route-lease eligibility wrapper (`R3-H-1(b)` / `R2-09` / `R4-H-1`).
  *
- * Race bursts, compressed bodies, explicit method-override carriers, over-cap bodies (>64 KiB),
- * bodies whose override scan was incomplete, structural mutations (`DELETE`, multipart, etc.),
- * destructive/malformed JSON-RPC payloads, and unverified/mutating GraphQL payloads NEVER
- * satisfy a durable approval lease under any approval policy.
+ * Delegates directly to `evaluateLeaseEligibility` so broker admission and store lease matching
+ * share one authoritative predicate.
  */
 export function isDurableRouteLeaseEligible(
   classification: Pick<
     RequestMutationClassification,
     'hasCompressedBody' | 'hasMethodOverride' | 'hasOverCapBody' | 'overrideScanIncomplete' | 'hasOverrideRisk'
-  > & Partial<Pick<RequestMutationClassification, 'kind' | 'isStructuralMutation' | 'hasMultipart'>>,
-  options: { isRaceBurst?: boolean } = {},
+  > & Partial<Pick<RequestMutationClassification, 'kind' | 'isStructuralMutation' | 'hasMultipart' | 'effectiveMethod'>>,
+  options: {
+    isRaceBurst?: boolean
+    scope?: LeaseEligibilityScope
+    pathAndQuery?: string
+    context?: LeaseMatchContext
+  } = {},
 ): boolean {
-  if (options.isRaceBurst === true) return false
-  if (classification.hasCompressedBody) return false
-  if (classification.hasMethodOverride) return false
-  if (classification.hasOverCapBody) return false
-  if (classification.overrideScanIncomplete) return false
-  if (classification.hasOverrideRisk) return false
-  if (classification.hasMultipart) return false
-  if (classification.isStructuralMutation) return false
-  if (
-    classification.kind === 'jsonrpc_destructive' ||
-    classification.kind === 'jsonrpc_malformed' ||
-    classification.kind === 'graphql_mutation_or_unverified' ||
-    classification.kind === 'multipart_upload' ||
-    classification.kind === 'compressed_mutation'
-  ) {
-    return false
-  }
-  return true
+  return evaluateLeaseEligibility({
+    ...options.context,
+    scope: options.scope ?? 'route',
+    method: classification.effectiveMethod ?? 'POST',
+    effectiveMethod: classification.effectiveMethod ?? 'POST',
+    pathAndQuery: options.pathAndQuery ?? '/_lease/check',
+    hasCompressedBody: classification.hasCompressedBody,
+    hasMethodOverride: classification.hasMethodOverride,
+    hasOverCapBody: classification.hasOverCapBody,
+    overrideScanIncomplete: classification.overrideScanIncomplete,
+    hasOverrideRisk: classification.hasOverrideRisk,
+    hasMultipart: classification.hasMultipart,
+    isStructuralMutation: classification.isStructuralMutation,
+    mutationKind: classification.kind,
+    isRaceBurst: options.isRaceBurst === true,
+  }).eligible
 }
 
 // ---------------------------------------------------------------------------
@@ -1717,6 +1729,50 @@ export class RequestAdmissionEngine {
 
     // 9. ScopePolicy + Tier + Approval Policy + Leases + SandboxWriteAllowlist + Exact Grant
     const evaluateConsuming = internalOptions.evaluateConsumingHooks !== false
+    const multipartKind = detectMultipartRequest({
+      headers: decisionHeaders,
+      hasMultipart: classification.hasMultipart,
+      bodyPreview: hasMultipartParts ? null : (request.body ?? null),
+    })
+    const hostFloor = computeHostApprovalRiskFloor({
+      method: normalizedMethod,
+      pathAndQuery: canonical,
+      personaHandle: request.personaHandle ?? null,
+      bodyPreview: hasMultipartParts ? null : (request.body ?? null),
+      headers: decisionHeaders,
+      hasMultipart: classification.hasMultipart,
+      isRaceBurst: request.isRaceBurst === true,
+      hasCompressedBody: classification.hasCompressedBody,
+      hasMethodOverride: classification.hasMethodOverride,
+      isStructuralMutation: classification.isStructuralMutation,
+      mutationKind: classification.kind,
+    })
+    const leaseMatchContext: LeaseMatchContext = {
+      origin: initialOrigin,
+      body: hasMultipartParts ? null : (request.body ?? null),
+      headers: decisionHeaders,
+      hasMultipart: classification.hasMultipart,
+      multipartKind,
+      isRaceBurst: request.isRaceBurst === true,
+      hasCompressedBody: classification.hasCompressedBody,
+      hasMethodOverride: classification.hasMethodOverride,
+      hasOverCapBody: classification.hasOverCapBody,
+      overrideScanIncomplete: classification.overrideScanIncomplete,
+      hasOverrideRisk: classification.hasOverrideRisk,
+      isStructuralMutation: classification.isStructuralMutation,
+      mutationKind: classification.kind,
+      effectiveMethod: classification.effectiveMethod,
+      hostFloor,
+      environmentMode: effectiveScopePolicy?.mode ?? null,
+      ...(confirmedGraphqlEndpoints !== undefined ? { confirmedGraphqlEndpoints } : {}),
+    }
+    const leaseEligibleForRequest = isDurableRouteLeaseEligible(classification, {
+      isRaceBurst: request.isRaceBurst === true,
+      scope: 'any',
+      pathAndQuery: canonical,
+      context: leaseMatchContext,
+    })
+
     let contractApproved = false
     let approvedReasonCode: AdmissionReasonCode = classification.isReadOnly
       ? 'allowed_read_only'
@@ -1744,18 +1800,17 @@ export class RequestAdmissionEngine {
         surface: request.surface ?? (kind === 'browser' ? 'browser' : 'broker'),
       })
       const contractApplies = effectiveScopePolicy.mode !== 'ephemeral_lab'
-      const leaseClassificationEligible = isDurableRouteLeaseEligible(classification, {
-        isRaceBurst: request.isRaceBurst === true,
-      })
+      // R4-H-1: Single authoritative lease-eligibility predicate evaluated before calling
+      // `grant.approvalLeases`; any deterministic high-risk, GraphQL, JSON-RPC, or body-destructive
+      // classification is refused from lease bypass and routed to `isStateChangeApproved` / Judge.
       const checkLease = (): boolean =>
-        leaseClassificationEligible &&
-        !classification.hasMultipart &&
-        !classification.isStructuralMutation &&
+        leaseEligibleForRequest &&
         grant.approvalLeases?.(
           initialOrigin,
           classification.effectiveMethod,
           canonical,
           request.personaHandle ?? null,
+          leaseMatchContext,
         ) === true
 
       const sandboxPostAllowed =
@@ -1812,9 +1867,11 @@ export class RequestAdmissionEngine {
           }
         }
       } else {
+        // R4-H-1: Approval leases NEVER override `readonly_environment` (`prod_readonly`).
         const leaseEligible =
           contractApplies &&
-          leaseClassificationEligible &&
+          leaseEligibleForRequest &&
+          scopeDecision.code !== 'readonly_environment' &&
           scopeDecision.code !== 'out_of_scope' &&
           scopeDecision.code !== 'staging_denylist' &&
           scopeDecision.code !== 'invalid_path' &&
@@ -1890,24 +1947,6 @@ export class RequestAdmissionEngine {
             { normalizedOrigin: initialOrigin, normalizedPath, localLab, parsedUrl: url, classification },
           )
         }
-        const multipartKind = detectMultipartRequest({
-          headers: decisionHeaders,
-          hasMultipart: classification.hasMultipart,
-          bodyPreview: hasMultipartParts ? null : (request.body ?? null),
-        })
-        const hostFloor = computeHostApprovalRiskFloor({
-          method: normalizedMethod,
-          pathAndQuery: canonical,
-          personaHandle: request.personaHandle ?? null,
-          bodyPreview: hasMultipartParts ? null : (request.body ?? null),
-          headers: decisionHeaders,
-          hasMultipart: classification.hasMultipart,
-          isRaceBurst: request.isRaceBurst === true,
-          hasCompressedBody: classification.hasCompressedBody,
-          hasMethodOverride: classification.hasMethodOverride,
-          isStructuralMutation: classification.isStructuralMutation,
-          mutationKind: classification.kind,
-        })
         const approvalContext: StateChangeApprovalContext = {
           personaHandle: request.personaHandle ?? null,
           body: hasMultipartParts ? null : (request.body ?? null),

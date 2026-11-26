@@ -12,6 +12,7 @@ import {
   defaultMaxUsesForLeaseScope,
   defaultPrimaryApprovalScope,
   eligibleApprovalPrefixPattern,
+  formatApprovalScopeHint,
   isHostNonDestructiveEligibleCard,
   normalizeClientApprovalPath,
 } from '../../../domain.ts'
@@ -115,7 +116,7 @@ export function matchingPendingApprovalIds(
     if (scope === 'route') return approvalRouteDedupeKey(o) === key
     if (normOrg(o.origin) !== orig) return false
     if (scope === 'host_nondestructive') return isHostNonDestructiveEligibleCard(o)
-    if (o.riskLevel === 'high' || o.method.trim().toUpperCase() !== meth) return false
+    if (o.method.trim().toUpperCase() !== meth || !eligibleApprovalPrefixPattern(o)) return false
     const n = normalizeClientApprovalPath(o.pathAndQuery)
     return Boolean(n) && !n.includes('%2a') && (n === base || n.startsWith(`${base}/`))
   }).map(o => o.id)
@@ -129,14 +130,15 @@ export function formatApprovalBlastRadius(opts: {
   extraResolvedCount: number
   serverPreview?: ApprovalBlastRadiusPreview | null
 }): string {
-  const m = opts.ap.method.trim().toUpperCase()
   const total = opts.serverPreview ? Math.max(1, opts.serverPreview.pendingApprovalCount) : opts.extraResolvedCount + 1
   const extra = total - 1
-  if (opts.scope === 'once') return `Approve once: ${m} ${opts.routePattern} · single request only (no lease)`
-  const tail = extra > 0 ? `also resolves ${plural(total, 'pending card')}` : null
-  if (opts.scope === 'route') return `Approve route: ${m} ${opts.routePattern} · ${tail ?? 'reuses lease on this route'}`
-  if (opts.scope === 'prefix') return `Approve prefix: ${m} ${opts.prefixPattern || opts.routePattern} · ${tail ?? 'future non-high-risk probes under prefix'}`
-  return [`Approve host: POST/PUT/PATCH on ${host(opts.ap.origin)} (no DELETE or high-risk)`, tail].filter(Boolean).join(' · ')
+  return formatApprovalScopeHint(opts.scope, {
+    method: opts.ap.method,
+    originHost: host(opts.ap.origin),
+    routePattern: opts.routePattern,
+    prefixPattern: opts.prefixPattern,
+    tail: extra > 0 ? `also resolves ${plural(total, 'pending card')}` : null,
+  })
 }
 
 function openKeys(q: DecisionsApi) {
@@ -665,10 +667,14 @@ function QueueInspector({ sel }: InspectorProps) {
   const banner = bannerBody && <div className="mb-3 flex items-center gap-2 rounded-[7px] bg-sunk px-2.5 py-2 text-[12px] text-fg-muted shadow-[inset_0_0_0_1px_var(--line)]">{bannerBody}</div>
 
   const activeApproval = it.kind === 'approval' && sec !== 'done' && !expiredApproval ? it.ap : null
-  const primaryScope = activeApproval ? defaultPrimaryApprovalScope(activeApproval) : 'route'
+  const envCard = activeApproval ? { ...activeApproval, environmentMode: model.run.environmentMode } : null
+  const primaryScope = envCard ? defaultPrimaryApprovalScope(envCard) : 'route'
   const routePattern = activeApproval ? normalizeClientApprovalPath(activeApproval.pathAndQuery) : ''
-  const prefixPattern = activeApproval ? eligibleApprovalPrefixPattern(activeApproval) : null
-  const hostEligible = activeApproval ? isHostNonDestructiveEligibleCard(activeApproval) : false
+  const clientPrefix = envCard ? eligibleApprovalPrefixPattern(envCard) : null
+  const prefixPattern = clientPrefix && (serverPreviews ? serverPreviews.prefix.eligible : true)
+    ? (serverPreviews?.prefix.pattern || clientPrefix)
+    : null
+  const hostEligible = Boolean(envCard && isHostNonDestructiveEligibleCard(envCard) && (serverPreviews ? serverPreviews.host_nondestructive.eligible : true))
   const routeSiblings = activeApproval ? matchingPendingApprovalIds(activeApproval, q.activePendingApprovals, 'route') : []
   const effectivePreviewScope: ApprovalScope = previewScope ?? primaryScope
   const pendingPool = activeApproval
@@ -785,12 +791,12 @@ function QueueInspector({ sel }: InspectorProps) {
             )}
             {prefixPattern && scopeBtn('prefix', <span className="truncate">Prefix ({prefixPattern})</span>, {
               testId: 'approval-btn-prefix',
-              title: `Prefix ${activeApproval.method} ${prefixPattern}`,
+              title: formatApprovalScopeHint('prefix', { method: activeApproval.method, originHost: host(activeApproval.origin), routePattern, prefixPattern }),
               cls: 'max-w-[190px]',
             })}
             {hostEligible && scopeBtn('host_nondestructive', 'Host', {
               testId: 'approval-btn-host',
-              title: `POST/PUT/PATCH on ${host(activeApproval.origin)} (no DELETE/high-risk)`,
+              title: formatApprovalScopeHint('host_nondestructive', { method: activeApproval.method, originHost: host(activeApproval.origin), routePattern }),
             })}
             <button
               type="button"

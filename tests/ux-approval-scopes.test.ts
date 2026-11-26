@@ -97,22 +97,22 @@ function setupTier3Run(store: Store, origins: string[] = [ORIGIN, OTHER_ORIGIN])
 // 1. Unit tests for pure prefix / dedupe / host-safety primitives
 // ---------------------------------------------------------------------------
 
-test('deriveOperatorPrefixPattern & deriveApprovalPrefixPattern derive concrete prefixes and reject bare /** and worker globs', () => {
-  assert.equal(deriveOperatorPrefixPattern('/_actions/redeemReferralAwardAction'), '/_actions/**')
-  assert.equal(deriveApprovalPrefixPattern('/_actions/redeemReferralAwardAction'), '/_actions/**')
-  assert.equal(deriveOperatorPrefixPattern('/api/emails?page=2'), '/api/**')
-  assert.equal(deriveApprovalPrefixPattern('/api/emails?page=2'), '/api/**')
+test('deriveOperatorPrefixPattern & deriveApprovalPrefixPattern derive concrete >=2-segment prefixes and reject single-segment, bare /**, and worker globs', () => {
+  assert.equal(deriveOperatorPrefixPattern('/_actions/courses/redeemReferralAwardAction'), '/_actions/courses/**')
+  assert.equal(deriveApprovalPrefixPattern('/_actions/courses/redeemReferralAwardAction'), '/_actions/courses/**')
   assert.equal(deriveOperatorPrefixPattern('/api/v1/users/123'), '/api/v1/**')
   assert.equal(deriveApprovalPrefixPattern('/api/v1/users/123'), '/api/v1/**')
   assert.equal(deriveOperatorPrefixPattern('/api/orders/123'), '/api/orders/**')
 
-  // Bare root, single-segment paths, ID-leading paths, and worker globs MUST return null (never /**)
-  for (const bad of ['/', '/login', '/123/items', '/api/**', '/**', '/api/*/users', '/api/item*all']) {
+  // Bare root, single-segment prefixes (/api/**, /_actions/**), ID-leading paths, high-risk prefix bases, and worker globs MUST return null
+  for (const bad of ['/', '/login', '/_actions/redeemReferralAwardAction', '/api/emails?page=2', '/123/items', '/api/123/items', '/api/**', '/**', '/api/*/users', '/api/item*all']) {
     assert.equal(deriveOperatorPrefixPattern(bad), null, `deriveOperatorPrefixPattern(${bad}) must be null`)
     assert.equal(deriveApprovalPrefixPattern(bad), null, `deriveApprovalPrefixPattern(${bad}) must be null`)
   }
 
-  assert.equal(isPrefixApprovalPattern('/_actions/**'), true)
+  assert.equal(isPrefixApprovalPattern('/_actions/courses/**'), true)
+  assert.equal(isPrefixApprovalPattern('/_actions/**'), false)
+  assert.equal(isPrefixApprovalPattern('/api/**'), false)
   assert.equal(isPrefixApprovalPattern('/**'), false)
   assert.equal(isPrefixApprovalPattern('/api/orders/*'), false)
 })
@@ -138,9 +138,10 @@ test('high-risk path classification, default primary scope, and dedupe keys enfo
   assert.equal(defaultPrimaryApprovalScope({ method: 'POST', riskLevel: 'high' }), 'once')
   assert.equal(defaultPrimaryApprovalScope({ method: 'DELETE', riskLevel: 'low' }), 'once')
 
-  assert.equal(eligibleApprovalPrefixPattern({ method: 'POST', pathAndQuery: '/_actions/redeemReferralAwardAction', riskLevel: 'medium' }), '/_actions/**')
+  assert.equal(eligibleApprovalPrefixPattern({ method: 'POST', pathAndQuery: '/_actions/courses/redeemReferralAwardAction', riskLevel: 'medium' }), '/_actions/courses/**')
+  assert.equal(eligibleApprovalPrefixPattern({ method: 'POST', pathAndQuery: '/_actions/redeemReferralAwardAction', riskLevel: 'medium' }), null)
   assert.equal(eligibleApprovalPrefixPattern({ method: 'DELETE', pathAndQuery: '/api/items/42', riskLevel: 'medium' }), null)
-  assert.equal(eligibleApprovalPrefixPattern({ method: 'POST', pathAndQuery: '/_actions/redeem', riskLevel: 'high' }), null)
+  assert.equal(eligibleApprovalPrefixPattern({ method: 'POST', pathAndQuery: '/_actions/courses/redeem', riskLevel: 'high' }), null)
 
   assert.equal(isHostNonDestructiveEligibleCard({ method: 'POST', pathAndQuery: '/_actions/redeemReferralAwardAction', riskLevel: 'medium' }), true)
   assert.equal(isHostNonDestructiveEligibleCard({ method: 'DELETE', pathAndQuery: '/api/items/42', riskLevel: 'low' }), false)
@@ -297,14 +298,14 @@ test('scope=route creates route lease + approved pattern + bulk-approves matchin
   assert.equal(store.getApprovalRequest(runId, otherAction.id).status, 'pending')
 })
 
-test('scope=prefix uses operator_explicit prefix, bulk-approves non-high cards, and enforces R3-H-9 bare /** & worker-glob rejection', t => {
+test('scope=prefix uses operator_explicit >=2-segment prefix, bulk-approves non-high cards, and enforces R3-H-9/R4-H-1 bare /** & single-segment & worker-glob rejection', t => {
   const store = makeStore(t)
   const { runId, run, worker } = setupTier3Run(store)
 
   const action1 = store.createApprovalRequest(run, worker, {
     origin: ORIGIN,
     method: 'POST',
-    pathAndQuery: '/_actions/redeemReferralAwardAction',
+    pathAndQuery: '/_actions/courses/redeemReferralAwardAction',
     rationale: 'Action 1',
     requestPreview: '{"a":1}',
     riskLevel: 'medium',
@@ -312,7 +313,7 @@ test('scope=prefix uses operator_explicit prefix, bulk-approves non-high cards, 
   const action2 = store.createApprovalRequest(store.run(runId), worker, {
     origin: ORIGIN,
     method: 'POST',
-    pathAndQuery: '/_actions/submitQuiz',
+    pathAndQuery: '/_actions/courses/submitQuiz',
     rationale: 'Action 2',
     requestPreview: '{"a":2}',
     riskLevel: 'low',
@@ -320,7 +321,7 @@ test('scope=prefix uses operator_explicit prefix, bulk-approves non-high cards, 
   const highRiskAction = store.createApprovalRequest(store.run(runId), worker, {
     origin: ORIGIN,
     method: 'POST',
-    pathAndQuery: '/_actions/resetWorkspace',
+    pathAndQuery: '/_actions/courses/resetWorkspace',
     rationale: 'High-risk action under same prefix',
     requestPreview: '{"reset":true}',
     riskLevel: 'high',
@@ -344,21 +345,22 @@ test('scope=prefix uses operator_explicit prefix, bulk-approves non-high cards, 
   }))
 
   assert.equal(store.getApprovalRequest(runId, action1.id).status, 'approved')
-  assert.equal(store.getApprovalRequest(runId, action2.id).status, 'approved', 'prefix bulk-approves non-high cards under /_actions/**')
+  assert.equal(store.getApprovalRequest(runId, action2.id).status, 'approved', 'prefix bulk-approves non-high cards under /_actions/courses/**')
   assert.equal(store.getApprovalRequest(runId, highRiskAction.id).status, 'pending', 'prefix MUST keep high-risk cards pending')
   assert.equal(store.getApprovalRequest(runId, outsidePrefix.id).status, 'pending', 'prefix MUST NOT resolve paths outside prefix')
 
   const leases = store.listApprovalLeases(runId, 'active')
   assert.equal(leases.length, 1)
-  assert.equal(leases[0]!.routePattern, '/_actions/**')
-  assert.equal(store.run(runId).approvedEndpointPatterns[0]?.pathPattern, '/_actions/**')
+  assert.equal(leases[0]!.routePattern, '/_actions/courses/**')
+  assert.equal(store.run(runId).approvedEndpointPatterns[0]?.pathPattern, '/_actions/courses/**')
+  assert.equal(store.run(runId).approvedEndpointPatterns[0]?.source, 'operator_explicit')
 
-  assert.equal(store.leaseAuthorizes(runId, ORIGIN, 'POST', '/_actions/anotherAction'), true)
-  assert.equal(store.leaseAuthorizes(runId, ORIGIN, 'POST', '/_actions/nested/deep'), true)
-  assert.equal(store.leaseAuthorizes(runId, ORIGIN, 'DELETE', '/_actions/anotherAction'), false, 'prefix lease is method-bound')
+  assert.equal(store.leaseAuthorizes(runId, ORIGIN, 'POST', '/_actions/courses/anotherAction'), true)
+  assert.equal(store.leaseAuthorizes(runId, ORIGIN, 'POST', '/_actions/courses/nested/deep'), true)
+  assert.equal(store.leaseAuthorizes(runId, ORIGIN, 'DELETE', '/_actions/courses/anotherAction'), false, 'prefix lease is method-bound')
   assert.equal(store.leaseAuthorizes(runId, ORIGIN, 'POST', '/api/items'), false)
 
-  // R3-H-9: worker-glob cards, bare /**, single-segment paths, DELETE, and high-risk cards MUST reject scope=prefix
+  // R3-H-9 / R4-H-1: worker-glob cards, bare /**, single-segment paths, DELETE, and high-risk cards MUST reject scope=prefix
   const globCard = store.createApprovalRequest(store.run(runId), worker, {
     origin: ORIGIN,
     method: 'POST',
@@ -391,7 +393,7 @@ test('scope=prefix uses operator_explicit prefix, bulk-approves non-high cards, 
     approvalId: rootSegCard.id,
     decision: 'approved',
     scope: 'prefix',
-  })), /bare \/\*\* is forbidden/i)
+  })), /two concrete fixed prefix segments|bare \/\*\*/i)
 
   const deleteCard = store.createApprovalRequest(store.run(runId), worker, {
     origin: ORIGIN,
@@ -839,11 +841,11 @@ describe('Playwright E2E — Deduped Queue, Scoped Approvals, Blast-Radius Previ
       // Keep run paused so background workers do not mutate our deterministic approval fixtures.
       seedStore.updateRun(runId, { status: 'paused' })
 
-      // Seed one prefix lease + one host non-destructive lease so LeasesPopover displays both.
+      // Seed one 2-segment prefix lease + one host non-destructive lease so LeasesPopover displays both.
       seedStore.runsRepo.grantApprovalLease(seedStore.run(runId), {
         origin: ORIGIN,
         method: 'POST',
-        pathAndQuery: '/api/**',
+        pathAndQuery: '/api/v1/**',
         source: 'operator_explicit',
         leaseScope: 'prefix',
         createdBy: 'operator',
@@ -879,36 +881,36 @@ describe('Playwright E2E — Deduped Queue, Scoped Approvals, Blast-Radius Previ
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, NULL, ?, ?, ?)
       `)
       insert.run(
-        dup1Id, runId, workerId, scopeRevision, ORIGIN, 'POST', '/_actions/redeemReferralAwardAction',
+        dup1Id, runId, workerId, scopeRevision, ORIGIN, 'POST', '/_actions/courses/redeemReferralAwardAction',
         'qa_member', 'Verify referral award action authorization boundary with benign control payload.',
         JSON.stringify({
           method: 'POST',
           origin: ORIGIN,
-          pathAndQuery: '/_actions/redeemReferralAwardAction',
+          pathAndQuery: '/_actions/courses/redeemReferralAwardAction',
           headers: { 'content-type': 'application/json' },
           bodyPreview: { referralCode: 'qa-canary-01' },
         }),
         'medium', expiresAt, now - 4_000,
       )
       insert.run(
-        dup2Id, runId, workerId, scopeRevision, ORIGIN, 'POST', '/_actions/redeemReferralAwardAction?variant=2',
+        dup2Id, runId, workerId, scopeRevision, ORIGIN, 'POST', '/_actions/courses/redeemReferralAwardAction?variant=2',
         'qa_member', 'Verify referral award action idempotency with alternate benign control payload.',
         JSON.stringify({
           method: 'POST',
           origin: ORIGIN,
-          pathAndQuery: '/_actions/redeemReferralAwardAction?variant=2',
+          pathAndQuery: '/_actions/courses/redeemReferralAwardAction?variant=2',
           headers: { 'content-type': 'application/json' },
           bodyPreview: { referralCode: 'qa-canary-02' },
         }),
         'medium', expiresAt, now - 3_000,
       )
       insert.run(
-        quizId, runId, workerId, scopeRevision, ORIGIN, 'POST', '/_actions/submitQuiz',
+        quizId, runId, workerId, scopeRevision, ORIGIN, 'POST', '/_actions/courses/submitQuiz',
         'qa_member', 'Verify quiz submission endpoint access controls.',
         JSON.stringify({
           method: 'POST',
           origin: ORIGIN,
-          pathAndQuery: '/_actions/submitQuiz',
+          pathAndQuery: '/_actions/courses/submitQuiz',
           headers: { 'content-type': 'application/json' },
           bodyPreview: { quizId: 'intro-1', answers: ['a'] },
         }),
@@ -972,7 +974,7 @@ describe('Playwright E2E — Deduped Queue, Scoped Approvals, Blast-Radius Previ
     const blastRadius = page.getByTestId('approval-blast-radius')
     await blastRadius.waitFor({ state: 'visible', timeout: 10_000 })
     const defaultBlast = (await blastRadius.textContent()) ?? ''
-    assert.match(defaultBlast, /Approve route: POST \/_actions\/redeemreferralawardaction/i)
+    assert.match(defaultBlast, /Approve route: POST \/_actions\/courses\/redeemreferralawardaction/i)
     assert.match(defaultBlast, /also resolves 2 pending cards/i)
 
     await page.getByTestId('approval-btn-route').waitFor({ state: 'visible' })
@@ -980,7 +982,7 @@ describe('Playwright E2E — Deduped Queue, Scoped Approvals, Blast-Radius Previ
     await page.getByTestId('approval-btn-prefix').waitFor({ state: 'visible' })
     await page.getByTestId('approval-btn-host').waitFor({ state: 'visible' })
     await page.getByTestId('approval-btn-deny').waitFor({ state: 'visible' })
-    assert.match((await page.getByTestId('approval-btn-prefix').textContent()) ?? '', /Prefix \(\/_actions\/\*\*\)/)
+    assert.match((await page.getByTestId('approval-btn-prefix').textContent()) ?? '', /Prefix \(\/_actions\/courses\/\*\*\)/)
 
     // Geometry check + optional screenshot at 1280×720
     await assertActionBarGeometry(page, '1280x720')
@@ -1002,7 +1004,7 @@ describe('Playwright E2E — Deduped Queue, Scoped Approvals, Blast-Radius Previ
     await page.getByTestId('approval-btn-once').hover()
     assert.match((await blastRadius.textContent()) ?? '', /Approve once:.*no lease/i)
     await page.getByTestId('approval-btn-prefix').hover()
-    assert.match((await blastRadius.textContent()) ?? '', /Approve prefix: POST \/_actions\/\*\*.*3 pending cards/i)
+    assert.match((await blastRadius.textContent()) ?? '', /Approve prefix: POST \/_actions\/courses\/\*\*.*3 pending cards/i)
     await page.getByTestId('approval-btn-host').hover()
     assert.match((await blastRadius.textContent()) ?? '', /Approve host: POST\/PUT\/PATCH on academy\.dyad\.sh/i)
 
@@ -1033,7 +1035,7 @@ describe('Playwright E2E — Deduped Queue, Scoped Approvals, Blast-Radius Previ
     await hostLeaseItem.waitFor({ state: 'visible' })
     await prefixLeaseItem.waitFor({ state: 'visible' })
     assert.match((await hostLeaseItem.textContent()) ?? '', /HOST.*docs\.dyad\.sh/i)
-    assert.match((await prefixLeaseItem.textContent()) ?? '', /POST.*Prefix.*\/api\/\*\*/i)
+    assert.match((await prefixLeaseItem.textContent()) ?? '', /POST.*Prefix.*\/api\/v1\/\*\*/i)
 
     // 1-click revoke of host lease
     await hostLeaseItem.getByRole('button', { name: /Revoke/i }).click()

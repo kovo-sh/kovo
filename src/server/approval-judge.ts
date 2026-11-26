@@ -5,9 +5,12 @@ import { isHighRiskOrExternalMutationPath } from '../domain.ts'
 import type { ApprovalPolicy, ApprovedEndpointPattern } from '../domain.ts'
 import {
   computeApprovalHeadersDigest,
+  evaluateLeaseEligibility,
+  isPrefixApprovalPattern,
   matchesApprovedEndpointPattern,
   normalizeOriginKey,
 } from './approval-pattern.ts'
+import type { LeaseMatchContext } from './approval-pattern.ts'
 import { resolveProfilePoolForRole } from './model-settings.ts'
 import type { ResolvedModelProfile } from './model-settings.ts'
 import { classifyProviderFailure, providerPool } from './provider.ts'
@@ -519,11 +522,48 @@ export function authorizeStateChange(input: {
     hasMethodOverride: context?.hasMethodOverride,
   }))
   if (context && !context.isRaceBurst && !nonOverridable) {
+    const hostFloor = context.hostFloor ?? computeHostApprovalRiskFloor({
+      method: input.method,
+      pathAndQuery: input.pathAndQuery,
+      personaHandle: context.personaHandle ?? null,
+      bodyPreview: context.body ?? null,
+      headers: context.headers,
+      hasMultipart: context.hasMultipart,
+      isRceProof: context.isRceProof,
+      isRaceBurst: context.isRaceBurst,
+      hasCompressedBody: context.hasCompressedBody,
+      hasMethodOverride: context.hasMethodOverride,
+    })
+    const matchContext: LeaseMatchContext = {
+      origin: input.origin,
+      body: context.body ?? null,
+      headers: context.headers,
+      hasMultipart: context.hasMultipart,
+      multipartKind: context.multipartKind,
+      isRceProof: context.isRceProof,
+      isRaceBurst: context.isRaceBurst,
+      hasCompressedBody: context.hasCompressedBody,
+      hasMethodOverride: context.hasMethodOverride,
+      effectiveMethod: context.effectiveMethod,
+      hostFloor,
+      allowExplicitRouteStructural: true,
+    }
     const pattern = matchesApprovedEndpointPattern(
       { origin: input.origin, method: input.method, pathAndQuery: input.pathAndQuery },
       input.approvedPatterns,
+      matchContext,
     )
-    if (pattern) return { approved: true, via: 'operator_pattern', pattern }
+    if (pattern) {
+      const patternScope = isPrefixApprovalPattern(pattern.pathPattern) ? 'prefix' : 'route'
+      const elig = evaluateLeaseEligibility({
+        ...matchContext,
+        scope: patternScope,
+        method: input.method,
+        pathAndQuery: input.pathAndQuery,
+        routePattern: pattern.pathPattern,
+      })
+      if (elig.eligible) return { approved: true, via: 'operator_pattern', pattern }
+    }
   }
 
   if (context && input.ledger) {
@@ -1102,23 +1142,69 @@ export async function evaluateTier3Approval(
     }
   }
 
-  // Stage 1B — Operator-approved endpoint pattern ("Approve similar").
-  // Checked after non-overridable invariants so an operator's explicit "Approve similar" decision
-  // on a DELETE or well-formed multipart route suppresses repeat prompts on that exact route.
+  // Stage 1B — Operator-approved endpoint pattern ("Approve similar" / explicit prefix).
+  // Checked after non-overridable invariants and gated through the single authoritative
+  // `evaluateLeaseEligibility` predicate (R4-H-1): exact route patterns honor explicitly approved
+  // routes, while prefix patterns strictly refuse high-risk paths, DELETE, multipart, GraphQL/
+  // JSON-RPC mutations, body-destructive payloads, and prod_readonly.
+  const stage1bHostFloor = computeHostApprovalRiskFloor({
+    method,
+    pathAndQuery,
+    personaHandle: input.personaHandle ?? null,
+    bodyPreview: input.bodyPreview,
+    headers: input.headers,
+    hasMultipart: input.hasMultipart,
+    isRceProof: input.isRceProof,
+    isRaceBurst: input.isRaceBurst,
+    hasCompressedBody: input.hasCompressedBody,
+    hasMethodOverride: override.hasOverride,
+    isStructuralMutation: input.isStructuralMutation,
+    mutationKind: input.mutationKind,
+  })
+  const stage1bMatchContext: LeaseMatchContext = {
+    origin: input.origin,
+    body: input.bodyPreview ?? null,
+    headers: input.headers,
+    hasMultipart: input.hasMultipart,
+    isRceProof: input.isRceProof,
+    isRaceBurst: input.isRaceBurst,
+    hasCompressedBody: input.hasCompressedBody,
+    hasMethodOverride: override.hasOverride,
+    effectiveMethod: override.effectiveMethod,
+    isStructuralMutation: input.isStructuralMutation,
+    mutationKind: input.mutationKind,
+    hostFloor: input.hostFloor ? maxApprovalRiskLevel(input.hostFloor, stage1bHostFloor) : stage1bHostFloor,
+    environmentMode: input.mode ?? null,
+    ...(input.confirmedGraphqlEndpoints !== undefined
+      ? { confirmedGraphqlEndpoints: input.confirmedGraphqlEndpoints }
+      : {}),
+    allowExplicitRouteStructural: true,
+  }
   const matchedPattern = !input.isRceProof && !input.isRaceBurst && !override.hasOverride
     ? matchesApprovedEndpointPattern(
         { origin: input.origin, method: override.effectiveMethod, pathAndQuery },
         input.approvedPatterns,
+        stage1bMatchContext,
       )
     : undefined
   if (matchedPattern) {
-    return {
-      decision: 'approve',
-      decidedBy: 'auto-review:rule',
-      riskLevel: 'low',
-      reason: `Matched run-scoped approved endpoint pattern (${matchedPattern.method} ${matchedPattern.pathPattern}).`,
-      usedLlm: false,
-      stage: 'approved_pattern',
+    const patternScope = isPrefixApprovalPattern(matchedPattern.pathPattern) ? 'prefix' : 'route'
+    const elig = evaluateLeaseEligibility({
+      ...stage1bMatchContext,
+      scope: patternScope,
+      method: override.effectiveMethod,
+      pathAndQuery,
+      routePattern: matchedPattern.pathPattern,
+    })
+    if (elig.eligible) {
+      return {
+        decision: 'approve',
+        decidedBy: 'auto-review:rule',
+        riskLevel: 'low',
+        reason: `Matched run-scoped approved endpoint pattern (${matchedPattern.method} ${matchedPattern.pathPattern}).`,
+        usedLlm: false,
+        stage: 'approved_pattern',
+      }
     }
   }
 
