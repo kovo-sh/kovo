@@ -1,3 +1,4 @@
+import { setTimeout as delay } from 'node:timers/promises'
 import { createHash } from 'node:crypto'
 import { z } from 'zod'
 import { isHighRiskOrExternalMutationPath } from '../domain.ts'
@@ -9,8 +10,8 @@ import {
 } from './approval-pattern.ts'
 import { resolveProfilePoolForRole } from './model-settings.ts'
 import type { ResolvedModelProfile } from './model-settings.ts'
-import { providerPool } from './provider.ts'
-import type { UsageCallback } from './provider.ts'
+import { classifyProviderFailure, providerPool } from './provider.ts'
+import type { ProviderFailureKind, UsageCallback } from './provider.ts'
 import { redact } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
 import {
@@ -92,6 +93,19 @@ export interface Tier3ApprovalInput {
   offline?: boolean
 }
 
+export type ApprovalFailSafeReason =
+  | 'judge_offline'
+  | 'judge_unconfigured'
+  | 'judge_provider_rate_limited'
+  | 'judge_provider_quota'
+  | 'judge_provider_auth'
+  | 'judge_provider_server'
+  | 'judge_provider_stall'
+  | 'judge_provider_stream_drop'
+  | 'judge_provider_context_overflow'
+  | 'judge_invalid_response'
+  | 'judge_provider_unavailable'
+
 export interface Tier3ApprovalEvaluation {
   decision: ApprovalDecisionKind
   decidedBy: ApprovalDecidedBy
@@ -116,6 +130,14 @@ export interface Tier3ApprovalEvaluation {
     | 'benign_fast_path'
     | 'safety_judge'
     | 'fail_safe'
+  /** Structured flag distinguishing Safety Judge outage/misconfiguration from normal risk escalation. */
+  failSafe?: boolean
+  /** Machine-readable fail-safe cause for UI badges, audit records, and reports. */
+  failSafeReason?: ApprovalFailSafeReason
+  /** Redacted diagnostic summary when the Safety Judge failed safe. */
+  failSafeDetail?: string
+  /** Number of Stage-2 Safety Judge LLM attempts executed (1 normal, 2 after bounded transient retry). */
+  judgeAttempts?: number
 }
 
 // v6: keyword escalation ("billing", "delete", "admin", "password", …) is retired. The
@@ -719,6 +741,7 @@ export function createSafetyJudgeLlmCall(
     signal?: AbortSignal
     secrets?: readonly NamedSecret[]
     onUsage?: UsageCallback
+    fetch?: typeof fetch
   } = {},
 ): SafetyJudgeLlmCall {
   return async ({ systemPrompt, userPrompt }) => {
@@ -727,12 +750,14 @@ export function createSafetyJudgeLlmCall(
       signal: options.signal,
       secrets: options.secrets,
       onUsage: options.onUsage,
+      ...(options.fetch ? { fetch: options.fetch } : {}),
       maxCalls: 1,
+      maxTransportRetries: 0,
       thinkingLevel: 'off',
       roleAffinity: 'fast',
-      firstEventTimeoutMs: 25_000,
-      idleTimeoutMs: 25_000,
-      totalTimeoutMs: 35_000,
+      firstEventTimeoutMs: 20_000,
+      idleTimeoutMs: 20_000,
+      totalTimeoutMs: 30_000,
     })
     const stream = models.stream(model, {
       systemPrompt: redact(systemPrompt, options.secrets),
@@ -746,6 +771,11 @@ export function createSafetyJudgeLlmCall(
       }
     }
     const result = await stream.result()
+    if (result.stopReason === 'error') {
+      const msg = result.errorMessage ?? 'Safety Judge provider stream failed.'
+      const typed = classifyProviderFailure(msg, { emitted: text.length > 0 })
+      throw typed ?? new Error(msg)
+    }
     if (!text && Array.isArray(result.content)) {
       text = result.content
         .filter((part): part is { type: 'text'; text: string } => part.type === 'text' && typeof part.text === 'string')
@@ -1176,6 +1206,9 @@ export async function evaluateTier3Approval(
       reason: 'Offline mode active; escalating grey-area Tier 3 probe to human operator.',
       usedLlm: false,
       stage: 'fail_safe',
+      failSafe: true,
+      failSafeReason: 'judge_offline',
+      judgeAttempts: 0,
     }
   }
 
@@ -1197,6 +1230,9 @@ export async function evaluateTier3Approval(
       reason: 'No model profile configured for Safety Judge; escalating to human operator.',
       usedLlm: false,
       stage: 'fail_safe',
+      failSafe: true,
+      failSafeReason: 'judge_unconfigured',
+      judgeAttempts: 0,
     }
   }
 
@@ -1245,12 +1281,97 @@ export async function evaluateTier3Approval(
     ? maxApprovalRiskLevel(input.hostFloor, derivedHostFloor)
     : derivedHostFloor
 
-  try {
-    const raw = await llmCall({
-      systemPrompt: SAFETY_JUDGE_SYSTEM_PROMPT,
-      userPrompt,
-    })
-    const parsed = safetyJudgeResponseSchema.parse(extractJsonObject(raw))
+  const judgeFailSafeReasonForKind = (kind: ProviderFailureKind): ApprovalFailSafeReason => {
+    switch (kind) {
+      case 'rate_limited': return 'judge_provider_rate_limited'
+      case 'quota': return 'judge_provider_quota'
+      case 'auth': return 'judge_provider_auth'
+      case 'server': return 'judge_provider_server'
+      case 'stall': return 'judge_provider_stall'
+      case 'stream_drop': return 'judge_provider_stream_drop'
+      case 'context_overflow': return 'judge_provider_context_overflow'
+    }
+  }
+
+  const maxJudgeTransientRetries = 1
+  const judgeRetryBudgetMs = 30_000
+  const judgeRetryBackoffCapMs = 1_500
+  const judgeStartedAt = Date.now()
+  let attempts = 0
+  let lastJudgeError: unknown
+  let lastWasInvalidResponse = false
+  let parsed: z.infer<typeof safetyJudgeResponseSchema> | undefined
+
+  for (let attempt = 1; attempt <= 1 + maxJudgeTransientRetries; attempt++) {
+    attempts = attempt
+    lastWasInvalidResponse = false
+    try {
+      const raw = await llmCall({
+        systemPrompt: SAFETY_JUDGE_SYSTEM_PROMPT,
+        userPrompt,
+      })
+      try {
+        parsed = safetyJudgeResponseSchema.parse(extractJsonObject(raw))
+        break
+      } catch (parseErr) {
+        lastWasInvalidResponse = true
+        lastJudgeError = parseErr
+        break
+      }
+    } catch (err) {
+      lastJudgeError = err
+      const providerErr = classifyProviderFailure(err)
+      const elapsedMs = Date.now() - judgeStartedAt
+      const canRetryTransient =
+        attempt <= maxJudgeTransientRetries
+        && !input.signal?.aborted
+        && providerErr !== null
+        && providerErr.retryable
+        && elapsedMs < judgeRetryBudgetMs
+      if (!canRetryTransient) break
+      const remainingMs = Math.max(0, judgeRetryBudgetMs - elapsedMs)
+      const waitMs = Math.min(
+        remainingMs,
+        judgeRetryBackoffCapMs,
+        providerErr.retryAfterMs !== undefined && Number.isFinite(providerErr.retryAfterMs)
+          ? Math.max(0, Math.floor(providerErr.retryAfterMs))
+          : 50,
+      )
+      if (waitMs > 0) {
+        try {
+          await delay(waitMs, undefined, { signal: input.signal })
+        } catch {
+          break
+        }
+      }
+    }
+  }
+
+  if (!parsed) {
+    const providerErr = lastWasInvalidResponse ? null : classifyProviderFailure(lastJudgeError)
+    const failSafeReason: ApprovalFailSafeReason = lastWasInvalidResponse
+      ? 'judge_invalid_response'
+      : providerErr
+        ? judgeFailSafeReasonForKind(providerErr.kind)
+        : 'judge_provider_unavailable'
+    const rawDetail = lastJudgeError instanceof Error ? lastJudgeError.message : String(lastJudgeError ?? '')
+    const failSafeDetail = redact(rawDetail, secrets).slice(0, 200)
+    return {
+      decision: 'escalate_human',
+      decidedBy: 'operator',
+      riskLevel: maxApprovalRiskLevel(effectiveHostFloor, 'high'),
+      reason: `Safety Judge unavailable (${failSafeReason}); failing safe to human approval.`,
+      hostFloor: effectiveHostFloor,
+      usedLlm: true,
+      stage: 'fail_safe',
+      failSafe: true,
+      failSafeReason,
+      ...(failSafeDetail ? { failSafeDetail } : {}),
+      judgeAttempts: attempts,
+    }
+  }
+
+  {
     const redactedReason = redact(parsed.reason, secrets)
     const originalJudgeDecision = parsed.decision
     const originalRiskLevel = parseExplicitJudgeRiskLevel(parsed.riskLevel)
@@ -1262,6 +1383,7 @@ export async function evaluateTier3Approval(
       originalJudgeDecision,
       originalRiskLevel,
       hostFloor: effectiveHostFloor,
+      judgeAttempts: attempts,
     } as const
 
     if (parsed.decision === 'deny') {
@@ -1404,16 +1526,6 @@ export async function evaluateTier3Approval(
       ...auditFields,
       usedLlm: true,
       stage: 'safety_judge',
-    }
-  } catch {
-    return {
-      decision: 'escalate_human',
-      decidedBy: 'operator',
-      riskLevel: maxApprovalRiskLevel(effectiveHostFloor, 'high'),
-      reason: 'Safety Judge call failed or returned invalid JSON; failing safe to human approval.',
-      hostFloor: effectiveHostFloor,
-      usedLlm: true,
-      stage: 'fail_safe',
     }
   }
 }

@@ -61,12 +61,16 @@ import {
   buildBolaTestQueue,
   classifyWorkerErrorToStepStatus,
   collectAllPages,
+  computeDynamicStepBudget,
+  evaluateTransientProviderRetry,
   extractAssignedTargetRoutes,
+  hardChainStepsCeiling,
   isMultiHopChainStep,
   isRetryableChainStepStatus,
   mapSessionStatusToStepStatus,
   percentile,
   providerStallAbortMs,
+  reinvestigationKey,
   resolveWorkerSettlementMs,
   selectAssignmentBolaQueueItems,
   shouldRetryStalledAssignment,
@@ -97,9 +101,16 @@ import { resolveProfilePoolForRole, type ResolvedModelProfile } from './model-se
 import type { PersonaAuthManager, PersonaSessionClone } from './persona-auth.ts'
 import { crawlStateGraph } from './phase0-recon.ts'
 import { resolveProfileNoTokenWatchdogMs } from './provider-stream.ts'
-import { BudgetExceededError } from './provider.ts'
+import {
+  BudgetExceededError,
+  ProviderFailureError,
+  QuotaExhaustedError,
+  classifyProviderFailure,
+  evaluateRoleProviderCircuit,
+} from './provider.ts'
 import { redact, type NamedSecret } from './redact.ts'
 import { sanitizeWorkerFactData } from './run-actor.ts'
+import { resolveRunSafetyBudgets } from './run-safety-budgets.ts'
 import { brokerExchanges, type ChainStepTerminalStatus } from './schema.ts'
 import type {
   Assignment,
@@ -108,6 +119,7 @@ import type {
   Run,
 } from './store.ts'
 import { probeDifferential, probeSurface } from './surface-engine.ts'
+import { recordProviderUsageTelemetry } from './token-telemetry.ts'
 import { buildWarmPoolPolicy, type WorkerBackend } from './worker-backend.ts'
 
 type Active = ExecActiveJob
@@ -485,6 +497,67 @@ export interface ExecWorkerHost extends ExecCoreServices {
 }
 
 export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
+  private readonly turnStateByAssignment = new Map<string, {
+    turn: number
+    toolCallsInTurn: number
+    totalToolCalls: number
+    lastProviderFailure?: ProviderFailureError
+  }>()
+  private readonly providerRetryCountsByRun = new Map<string, Map<string, number>>()
+  private readonly providerRetriesTotalByRun = new Map<string, number>()
+
+  private pauseRunForProviderCircuit(
+    run: Run,
+    job: Active,
+    step: ChainStep,
+    input: {
+      failureKind: 'quota' | 'auth'
+      roleAffinity: string
+      profileIds: readonly string[]
+      reason: string
+    },
+  ): void {
+    const assignment = job.assignment
+    const label = input.failureKind === 'quota' ? 'provider quota exhaustion' : 'provider authentication failure'
+    this.storage.transaction(() => {
+      const currentRun = this.storage.run(run.id)
+      this.storage.updateWorker(assignment.id, {
+        status: 'paused',
+        outcome: `Paused due to ${label}: ${input.reason}`,
+        lease: null,
+        leaseExpiresAt: null,
+      })
+      this.storage.updateChainStep(step.id, { status: 'ready', assignedWorkerId: null })
+      if (currentRun.status === 'running') {
+        this.storage.setStatus(currentRun, 'paused')
+        this.storage.event(
+          run.id,
+          'run.provider_paused',
+          `Run paused (${input.failureKind}): all model profiles for role "${input.roleAffinity}" are hard-open (${input.reason}).`,
+          {
+            status: 'provider_paused',
+            reason: 'provider_paused',
+            failureKind: input.failureKind,
+            roleAffinity: input.roleAffinity,
+            profileIds: [...input.profileIds],
+            stepId: step.id,
+            assignmentId: assignment.id,
+            error: input.reason,
+          },
+        )
+      }
+    }, { behavior: 'immediate' })
+  }
+
+  private resolveStepProviderRetryKey(step: ChainStep): string {
+    const structuredTargets = this.host.reconPlanner.getStructuredStepTargets(step)
+    const primaryTarget = structuredTargets[0]
+    const primaryMethod = primaryTarget?.method ?? 'ANY'
+    const primaryRoute = primaryTarget?.route ?? (step.title || step.id)
+    const primaryClass = primaryTarget?.vulnClass ?? step.category ?? 'unknown'
+    return reinvestigationKey(`${primaryMethod} ${primaryRoute}`, primaryClass)
+  }
+
   /**
    * Record a negative-edge settlement (`invariant_enforced_hardened` | `control_blocked_cleanly` |
    * `decoy_guard_verified`) into `CapabilityLedger` and `FrontierWaveController` so dead-end
@@ -846,18 +919,44 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
     resolvedSpecialistId: string,
     budget: AssignmentBudget,
     error: unknown,
+    context?: { noToolCallExecuted?: boolean; providerFailure?: ProviderFailureError },
   ): void {
     const assignment = job.assignment
+    const turnState = this.turnStateByAssignment.get(assignment.id)
+    this.turnStateByAssignment.delete(assignment.id)
+    const noToolCallExecuted = context?.noToolCallExecuted ?? ((turnState?.toolCallsInTurn ?? 0) === 0)
+    const toolCallsExecutedInTurn = noToolCallExecuted ? 0 : Math.max(1, turnState?.toolCallsInTurn ?? 1)
+
     if (error instanceof BudgetExceededError) {
       this.storage.checkBudgetExceeded(run.id)
       return
     }
     // Provider-stream stall: aborting the assignment's provider call frees the slot without
-    // spending the rest of its wall budget. One retry is allowed per assignment.
+    // spending the rest of its wall budget. One retry is allowed per assignment (guarded by
+    // the target-safety idempotency invariant when tools already executed on the dropped turn).
     if (job.stallAbort) {
       const attempt = job.assignment.attempt
-      if (shouldRetryStalledAssignment(attempt)) {
+      if (shouldRetryStalledAssignment(attempt) && noToolCallExecuted) {
         this.host.providerStallRetriesByRun.set(run.id, (this.host.providerStallRetriesByRun.get(run.id) ?? 0) + 1)
+        const retryKey = this.resolveStepProviderRetryKey(step)
+        let runRetryMap = this.providerRetryCountsByRun.get(run.id)
+        if (!runRetryMap) {
+          runRetryMap = new Map<string, number>()
+          this.providerRetryCountsByRun.set(run.id, runRetryMap)
+        }
+        runRetryMap.set(retryKey, (runRetryMap.get(retryKey) ?? 0) + 1)
+        this.providerRetriesTotalByRun.set(run.id, (this.providerRetriesTotalByRun.get(run.id) ?? 0) + 1)
+        try {
+          recordProviderUsageTelemetry({
+            runId: run.id,
+            outcome: 'retried',
+            retried: true,
+            retryCount: 1,
+            stalled: true,
+            costUsd: 0,
+            countCall: false,
+          })
+        } catch { /* telemetry only */ }
         this.storage.transaction(() => {
           this.storage.updateWorker(assignment.id, {
             status: 'canceled',
@@ -868,21 +967,38 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
           })
           this.storage.updateChainStep(step.id, { status: 'ready', assignedWorkerId: null })
           this.storage.event(run.id, 'worker.stall_retry', `${step.title} provider stream stalled; requeued once.`, {
-            assignmentId: assignment.id, stepId: step.id, attempt: attempt + 1,
+            assignmentId: assignment.id, stepId: step.id, attempt: attempt + 1, retryKey, noToolCallExecuted,
           })
         })
         return
       }
+      if (!noToolCallExecuted) {
+        this.storage.event(
+          run.id,
+          'worker.provider_retry_blocked',
+          `${step.title} stalled mid-turn after tool execution; skipping retry to preserve target safety.`,
+          {
+            assignmentId: assignment.id,
+            stepId: step.id,
+            failureKind: 'stall',
+            reason: 'midstream_tool_call_executed',
+            emitted: true,
+            toolCallsExecutedInTurn,
+          },
+        )
+      }
       this.storage.transaction(() => {
         this.storage.updateWorker(assignment.id, {
           status: 'failed',
-          outcome: 'Provider stream stalled after retry; slot released.',
+          outcome: noToolCallExecuted
+            ? 'Provider stream stalled after retry; slot released.'
+            : 'Provider stream stalled after tool execution; retry blocked for target safety.',
           attempt: attempt + 1,
           lease: null,
           leaseExpiresAt: null,
         })
         this.storage.updateChainStep(step.id, { status: 'model_failure', assignedWorkerId: assignment.id })
-        this.storage.event(run.id, 'worker.stall_failed', `${step.title} provider stream stalled twice; assignment closed without consuming the wall cap.`, {
+        this.storage.event(run.id, 'worker.stall_failed', `${step.title} provider stream stalled; assignment closed without consuming the wall cap.`, {
           assignmentId: assignment.id, stepId: step.id, stepStatus: 'model_failure',
         })
       })
@@ -892,7 +1008,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
         stepStatus: 'model_failure',
         confirmed: false,
         gapCoded: false,
-        reason: 'provider_stream_stalled_after_retry',
+        reason: noToolCallExecuted ? 'provider_stream_stalled_after_retry' : 'midstream_tool_call_executed',
       })
       return
     }
@@ -926,14 +1042,155 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
     }
     if (!this.host.authorize(job) || job.controller.signal.aborted) return
     const msg = redact(error instanceof Error ? error.message : String(error)).slice(0, 400)
-    const stepStatus = classifyWorkerErrorToStepStatus(error)
+    const providerFailure = context?.providerFailure
+      ?? (error instanceof ProviderFailureError ? error : null)
+      ?? classifyProviderFailure(error)
+      ?? turnState?.lastProviderFailure
+      ?? null
+
+    // R2-13 Run-level provider_paused circuit: when every profile for the specialist's role is
+    // hard-open due to quota (402) or auth (401/403), pause the run cleanly within one tick and
+    // restore the step to `ready` so zero `model_failure` cascade occurs.
+    if (
+      providerFailure
+      && (providerFailure instanceof QuotaExhaustedError || providerFailure.kind === 'quota' || providerFailure.kind === 'auth')
+    ) {
+      const specialist = resolveSpecialistProfile(resolvedSpecialistId)
+      const liveRoleProfiles = resolveProfilePoolForRole(specialist.roleAffinity, this.storage)
+      const circuit = evaluateRoleProviderCircuit(liveRoleProfiles)
+      if (liveRoleProfiles.length === 0 || circuit.hardOpen) {
+        const failureKind: 'quota' | 'auth' = circuit.kind
+          ?? (providerFailure.kind === 'quota' ? 'quota' : 'auth')
+        const profileIds = circuit.profileIds.length
+          ? circuit.profileIds
+          : (providerFailure.profileId ? [providerFailure.profileId] : [])
+        this.pauseRunForProviderCircuit(run, job, step, {
+          failureKind,
+          roleAffinity: specialist.roleAffinity,
+          profileIds,
+          reason: msg,
+        })
+        return
+      }
+    }
+
+    // R2-13 Bounded transient retry (rate_limited, server, stall, stream_drop) under cq-5's
+    // 1-retry-per-key cap charged to RunSafetyBudgets + mid-stream tool-call idempotency guard.
+    if (providerFailure?.retryable) {
+      const retryKey = this.resolveStepProviderRetryKey(step)
+      let runRetryMap = this.providerRetryCountsByRun.get(run.id)
+      if (!runRetryMap) {
+        runRetryMap = new Map<string, number>()
+        this.providerRetryCountsByRun.set(run.id, runRetryMap)
+      }
+      const priorKeyRetries = runRetryMap.get(retryKey) ?? 0
+      const runProviderRetries = this.providerRetriesTotalByRun.get(run.id) ?? 0
+      const currentRun = this.storage.run(run.id)
+      const existingSteps = this.storage.listChainSteps(currentRun.id, currentRun.goalRevision)
+      const dynamicBudget = Math.min(
+        hardChainStepsCeiling,
+        currentRun.dynamicStepBudget ?? computeDynamicStepBudget(this.storage, currentRun.id),
+      )
+      const safetyBudgets = resolveRunSafetyBudgets({ maxAssignments: dynamicBudget })
+      const effectiveStepCap = Math.min(dynamicBudget, safetyBudgets.maxCompositeVerifiesPerRun)
+      const decision = evaluateTransientProviderRetry({
+        failure: providerFailure,
+        retryKey,
+        priorKeyRetries,
+        stepSkills: step.skills,
+        stepTrialIndex: step.trialIndex,
+        assignmentAttempt: assignment.attempt,
+        toolCallsExecutedInTurn,
+        runStatus: currentRun.status,
+        runPhase: currentRun.phase,
+        budgetExhausted: this.storage.checkBudgetExceeded(currentRun.id),
+        requestBudgetExhausted: currentRun.budgetRequests > 0 && currentRun.budgetRequests - currentRun.spentRequests <= 0,
+        wallClockExhausted: false,
+        existingStepCount: existingSteps.length,
+        effectiveStepCap,
+        runProviderRetries,
+      })
+      if (decision.retry) {
+        runRetryMap.set(retryKey, priorKeyRetries + 1)
+        this.providerRetriesTotalByRun.set(run.id, runProviderRetries + 1)
+        if (providerFailure.kind === 'stall') {
+          this.host.providerStallRetriesByRun.set(run.id, (this.host.providerStallRetriesByRun.get(run.id) ?? 0) + 1)
+        }
+        try {
+          recordProviderUsageTelemetry({
+            runId: run.id,
+            outcome: 'retried',
+            retried: true,
+            retryCount: 1,
+            stalled: providerFailure.kind === 'stall',
+            costUsd: 0,
+            countCall: false,
+          })
+        } catch { /* telemetry only */ }
+        const retrySkills = [...new Set([...step.skills, 'r213:provider_retry:1'])]
+        this.storage.transaction(() => {
+          this.storage.updateWorker(assignment.id, {
+            status: 'canceled',
+            outcome: `Transient provider failure (${providerFailure.kind}); requeued once through standard scope/tier/approval gates.`,
+            attempt: assignment.attempt + 1,
+            lease: null,
+            leaseExpiresAt: null,
+          })
+          this.storage.updateChainStep(step.id, {
+            status: 'ready',
+            assignedWorkerId: null,
+            skills: retrySkills,
+          })
+          this.storage.event(
+            run.id,
+            'worker.provider_retry',
+            `${step.title} hit transient provider failure (${providerFailure.kind}); requeued once.`,
+            {
+              assignmentId: assignment.id,
+              stepId: step.id,
+              failureKind: providerFailure.kind,
+              status: providerFailure.status ?? null,
+              retryAfterMs: providerFailure.retryAfterMs ?? null,
+              emitted: providerFailure.emitted,
+              noToolCallExecuted,
+              retryKey,
+              retryCount: priorKeyRetries + 1,
+              runProviderRetries: runProviderRetries + 1,
+              effectiveStepCap,
+            },
+          )
+        }, { behavior: 'immediate' })
+        return
+      }
+      if (decision.reason === 'midstream_tool_call_executed') {
+        this.storage.event(
+          run.id,
+          'worker.provider_retry_blocked',
+          `${step.title} hit mid-stream ${providerFailure.kind} after tool execution; retry blocked to preserve target safety.`,
+          {
+            assignmentId: assignment.id,
+            stepId: step.id,
+            failureKind: providerFailure.kind,
+            retryKey,
+            reason: decision.reason,
+            emitted: providerFailure.emitted,
+            toolCallsExecutedInTurn,
+          },
+        )
+      }
+    }
+
+    const stepStatus = classifyWorkerErrorToStepStatus(providerFailure ?? error)
     this.storage.transaction(() => {
       this.storage.updateWorker(assignment.id, {
         status: 'failed', outcome: msg, lease: null, leaseExpiresAt: null, attempt: assignment.attempt + 1,
       })
       this.storage.updateChainStep(step.id, { status: stepStatus, assignedWorkerId: assignment.id })
       this.storage.event(run.id, 'worker.failed', `${step.title} failed: ${msg}`, {
-        assignmentId: assignment.id, stepId: step.id, stepStatus,
+        assignmentId: assignment.id,
+        stepId: step.id,
+        stepStatus,
+        ...(providerFailure ? { failureKind: providerFailure.kind, emitted: providerFailure.emitted } : {}),
       })
     })
     this.emitStepTerminalEvent(run.id, {
@@ -954,6 +1211,36 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
     budget: AssignmentBudget,
   ) {
     const run = this.host.check(job)
+    const preflightSpecialist = resolveSpecialistProfile(
+      step.specialistProfile ?? routeStepToSpecialist({
+        title: step.title,
+        hypothesis: step.hypothesis,
+        category: step.category,
+        skills: step.skills,
+      }),
+    )
+    const liveRoleProfiles = resolveProfilePoolForRole(preflightSpecialist.roleAffinity, this.storage)
+    const effectiveRoleProfiles = liveRoleProfiles.length
+      ? liveRoleProfiles
+      : resolveProfilePoolForRole(preflightSpecialist.roleAffinity, profiles)
+    const preflightCircuit = evaluateRoleProviderCircuit(effectiveRoleProfiles)
+    if (preflightCircuit.hardOpen && preflightCircuit.kind) {
+      this.pauseRunForProviderCircuit(run, job, step, {
+        failureKind: preflightCircuit.kind,
+        roleAffinity: preflightSpecialist.roleAffinity,
+        profileIds: preflightCircuit.profileIds,
+        reason: preflightCircuit.reason ?? 'All profiles for role are hard-open.',
+      })
+      return
+    }
+    const turnState = {
+      turn: 0,
+      toolCallsInTurn: 0,
+      totalToolCalls: 0,
+      lastProviderFailure: undefined as ProviderFailureError | undefined,
+    }
+    this.turnStateByAssignment.set(job.assignment.id, turnState)
+
     const permittedAtAdmission = this.host.approvedOriginsSet(run)
     const { grant, secrets, currentSecrets } = this.host.buildGrant(job, run, permittedAtAdmission)
 
@@ -2208,7 +2495,16 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
         skills: step.skills,
       })
       const specialistConfig = resolveSpecialistProfile(specialistProfileId)
-      const scopedHandlers = filterHandlersForSpecialist(handlers, specialistConfig)
+      const rawScopedHandlers = filterHandlersForSpecialist(handlers, specialistConfig)
+      const scopedHandlers: WorkerToolHandlers = {}
+      for (const [toolName, handlerFn] of Object.entries(rawScopedHandlers)) {
+        if (typeof handlerFn !== 'function') continue
+        ;(scopedHandlers as Record<string, unknown>)[toolName] = (...args: unknown[]) => {
+          turnState.toolCallsInTurn += 1
+          turnState.totalToolCalls += 1
+          return (handlerFn as (...a: unknown[]) => unknown)(...args)
+        }
+      }
 
       const techTags = this.storage.listFacts(run.id, { includeTainted: false, kind: 'tech_fingerprint', limit: 30 })
         .flatMap(f => {
@@ -2427,6 +2723,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
 
       const sessionWallClockMs = wallPlan.hardWallClockCeilingMs
 
+      const baseLlmHooks = llmRunHooks(this.storage, run.id)
       let sessionResult: Awaited<ReturnType<typeof runAgentSession>>
       try {
         sessionResult = await runAgentSession({
@@ -2508,7 +2805,12 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
               throw new BudgetExceededError('Run spend or request budget exceeded.')
             }
           },
-          ...llmRunHooks(this.storage, run.id),
+          ...baseLlmHooks,
+          onProfileFailure: (profileId, err, hard) => {
+            baseLlmHooks.onProfileFailure(profileId, err, hard)
+            const classified = classifyProviderFailure(err, { profileId })
+            if (classified) turnState.lastProviderFailure = classified
+          },
           onUsage: usage => {
             const tokens = usage.inputTokens + usage.outputTokens
             this.storage.recordLlmSpend(run.id, { usd: usage.costUsd, tokens })
@@ -2539,6 +2841,9 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
           onStreamActivity: noteProviderToken,
           onTurnStart: turn => {
             generatingTurn = true
+            turnState.turn = turn
+            turnState.toolCallsInTurn = 0
+            turnState.lastProviderFailure = undefined
             armStallTimer(turn)
             const member = this.storage.boardMember(run.id, boardHandle)
             const delta = this.host.boardTurnDelta(this.storage.run(run.id), boardHandle, member?.lastReadSeq ?? 0)
@@ -2663,6 +2968,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
         )
       }
       const stepStatus = mapSessionStatusToStepStatus(sessionResult.status)
+      this.turnStateByAssignment.delete(job.assignment.id)
       this.storage.transaction(() => {
         this.completeWorker(job.assignment, latestRun, outcomeText, [], undefined, currentSecrets())
         this.storage.updateChainStep(step.id, { status: stepStatus, assignedWorkerId: job.assignment.id })

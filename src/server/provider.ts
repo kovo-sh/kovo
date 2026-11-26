@@ -371,10 +371,59 @@ export type UsageCallback = (usage: UsageEvent) => void
 
 export type TelemetryCallback = (event: ProviderUsageTelemetryInput) => void
 
-export class QuotaExhaustedError extends Error {
-  readonly status = 402
-  constructor(message: string) {
-    super(message)
+export type ProviderFailureKind =
+  | 'rate_limited'
+  | 'quota'
+  | 'auth'
+  | 'server'
+  | 'stall'
+  | 'stream_drop'
+  | 'context_overflow'
+
+export interface ProviderFailureOptions {
+  kind: ProviderFailureKind
+  status?: number
+  retryAfterMs?: number
+  emitted?: boolean
+  retryable?: boolean
+  hard?: boolean
+  profileId?: string
+  cause?: unknown
+}
+
+function isTransientProviderFailureKind(kind: ProviderFailureKind): boolean {
+  return kind === 'rate_limited' || kind === 'server' || kind === 'stall' || kind === 'stream_drop'
+}
+
+export class ProviderFailureError extends Error {
+  readonly kind: ProviderFailureKind
+  readonly status?: number
+  readonly retryAfterMs?: number
+  readonly emitted: boolean
+  readonly retryable: boolean
+  readonly hard: boolean
+  readonly profileId?: string
+
+  constructor(message: string, opts: ProviderFailureOptions) {
+    super(message, opts.cause !== undefined ? { cause: opts.cause } : undefined)
+    this.name = 'ProviderFailureError'
+    this.kind = opts.kind
+    this.status = opts.status
+    this.retryAfterMs = opts.retryAfterMs
+    this.emitted = Boolean(opts.emitted)
+    this.hard = opts.hard ?? (opts.kind === 'quota' || opts.kind === 'auth')
+    this.retryable = opts.retryable ?? isTransientProviderFailureKind(opts.kind)
+    this.profileId = opts.profileId
+  }
+}
+
+export class QuotaExhaustedError extends ProviderFailureError {
+  override readonly status = 402
+  constructor(
+    message: string,
+    opts: Omit<ProviderFailureOptions, 'kind' | 'status' | 'hard' | 'retryable'> = {},
+  ) {
+    super(message, { ...opts, kind: 'quota', status: 402, hard: true, retryable: false })
     this.name = 'QuotaExhaustedError'
   }
 }
@@ -445,6 +494,292 @@ export function isQuotaBody(body: string): boolean {
     return false
   }
   return /(?:insufficient[_\s]?(?:credits?|quota|balance|funds)|exceeded your current quota|billing|spend.?limit|credit.?limit|out of credits)/i.test(lower)
+}
+
+const CONTEXT_OVERFLOW_RE = /(?:context[_\s-]?(?:length|window|limit)|maximum context|too many tokens|token[\s_-]?limit|prompt is too long|exceeds the context)/i
+const NON_PROVIDER_ABORT_OR_LOCAL_RE = /(?:aborted|cancelled|canceled|budget|exceeded Kovo Hunter’s size limit|Unexpected model endpoint|Local provider request|refused by SSRF policy|never permitted|Plaintext HTTP egress|without local-lab or explicit loopback)/i
+const INFRA_ONLY_ERROR_RE = /\b(?:docker|container|sandbox|epipe|openSession|spawn)\b/i
+const MAX_PROVIDER_RETRY_AFTER_SLEEP_MS = 10_000
+
+function parseRetryAfterMs(headerValue: string | null | undefined, nowMs = Date.now()): number | undefined {
+  if (!headerValue) return undefined
+  const trimmed = headerValue.trim()
+  if (!trimmed) return undefined
+  if (/^\d+(?:\.\d+)?$/.test(trimmed)) {
+    const seconds = Number(trimmed)
+    return Number.isFinite(seconds) && seconds >= 0 ? Math.round(seconds * 1000) : undefined
+  }
+  const timestamp = Date.parse(trimmed)
+  if (!Number.isFinite(timestamp)) return undefined
+  return Math.max(0, timestamp - nowMs)
+}
+
+function boundedRetryWaitMs(retryAfterMs: number | undefined, fallbackMs: number): number {
+  if (retryAfterMs !== undefined && Number.isFinite(retryAfterMs) && retryAfterMs >= 0) {
+    return Math.min(MAX_PROVIDER_RETRY_AFTER_SLEEP_MS, Math.max(0, Math.floor(retryAfterMs)))
+  }
+  return Math.max(0, Math.floor(fallbackMs))
+}
+
+function withProviderFailureContext(
+  failure: ProviderFailureError,
+  opts: { emitted?: boolean; profileId?: string },
+): ProviderFailureError {
+  const nextEmitted = opts.emitted ?? failure.emitted
+  const nextProfileId = opts.profileId ?? failure.profileId
+  if (nextEmitted === failure.emitted && nextProfileId === failure.profileId) return failure
+  if (failure instanceof QuotaExhaustedError || failure.kind === 'quota') {
+    return new QuotaExhaustedError(failure.message, {
+      retryAfterMs: failure.retryAfterMs,
+      emitted: nextEmitted,
+      profileId: nextProfileId,
+      cause: failure.cause,
+    })
+  }
+  return new ProviderFailureError(failure.message, {
+    kind: failure.kind,
+    status: failure.status,
+    retryAfterMs: failure.retryAfterMs,
+    emitted: nextEmitted,
+    retryable: failure.retryable,
+    hard: failure.hard,
+    profileId: nextProfileId,
+    cause: failure.cause,
+  })
+}
+
+/**
+ * Single authoritative provider failure classifier across `makeFetch`, `providerPool`,
+ * `exec-dispatch`, `exec-worker-runner`, and `approval-judge`.
+ */
+export function classifyProviderFailure(
+  error: unknown,
+  opts: {
+    status?: number
+    retryAfterMs?: number
+    emitted?: boolean
+    profileId?: string
+    body?: string
+  } = {},
+): ProviderFailureError | null {
+  const emitted = Boolean(opts.emitted)
+  const profileId = opts.profileId
+  if (error instanceof ProviderFailureError) {
+    return withProviderFailureContext(error, {
+      ...(opts.emitted !== undefined ? { emitted: opts.emitted } : {}),
+      ...(profileId !== undefined ? { profileId } : {}),
+    })
+  }
+  if (
+    error
+    && typeof error === 'object'
+    && 'providerFailure' in error
+    && (error as { providerFailure?: unknown }).providerFailure instanceof ProviderFailureError
+  ) {
+    return withProviderFailureContext((error as { providerFailure: ProviderFailureError }).providerFailure, {
+      ...(opts.emitted !== undefined ? { emitted: opts.emitted } : {}),
+      ...(profileId !== undefined ? { profileId } : {}),
+    })
+  }
+  if (
+    error instanceof BudgetExceededError
+    || error instanceof EgressDeniedError
+    || error instanceof ProviderRequestMutationError
+  ) {
+    return null
+  }
+
+  const rawMessage = error instanceof Error
+    ? error.message
+    : typeof error === 'string'
+      ? error
+      : ''
+  const msg = rawMessage.trim()
+  const status = opts.status
+  const retryAfterMs = opts.retryAfterMs
+  const cause = error instanceof Error ? error : undefined
+
+  if (status !== undefined) {
+    const effectiveStatus = status === 429 && opts.body && isQuotaBody(opts.body) ? 402 : status
+    if (effectiveStatus === 402) {
+      return new QuotaExhaustedError(
+        msg || 'The provider quota or credit balance was exhausted.',
+        { emitted, profileId, cause },
+      )
+    }
+    if (effectiveStatus === 401 || effectiveStatus === 403) {
+      return new ProviderFailureError(
+        msg || 'The provider rejected the API key.',
+        { kind: 'auth', status: effectiveStatus, emitted, retryable: false, hard: true, profileId, cause },
+      )
+    }
+    if (effectiveStatus === 429) {
+      return new ProviderFailureError(
+        msg || 'The provider rate limit was reached.',
+        { kind: 'rate_limited', status: 429, retryAfterMs, emitted, retryable: true, hard: false, profileId, cause },
+      )
+    }
+    if (effectiveStatus === 404) {
+      return new ProviderFailureError(
+        msg || 'The provider endpoint or model was not found.',
+        { kind: 'server', status: 404, emitted, retryable: false, hard: true, profileId, cause },
+      )
+    }
+    if (effectiveStatus >= 500 && effectiveStatus <= 599) {
+      return new ProviderFailureError(
+        msg || `The model provider returned HTTP ${effectiveStatus}.`,
+        { kind: 'server', status: effectiveStatus, retryAfterMs, emitted, retryable: true, hard: false, profileId, cause },
+      )
+    }
+    if (effectiveStatus === 400 && (CONTEXT_OVERFLOW_RE.test(opts.body ?? '') || CONTEXT_OVERFLOW_RE.test(msg))) {
+      return new ProviderFailureError(
+        msg || 'The model provider rejected the request due to context length.',
+        { kind: 'context_overflow', status: 400, emitted, retryable: false, hard: false, profileId, cause },
+      )
+    }
+    return null
+  }
+
+  if (!msg) return null
+  if (/aborted due to timeout/i.test(msg)) {
+    return new ProviderFailureError(msg, { kind: 'stall', emitted, retryable: true, hard: false, profileId, cause })
+  }
+  if (INFRA_ONLY_ERROR_RE.test(msg)) return null
+  if (NON_PROVIDER_ABORT_OR_LOCAL_RE.test(msg)) return null
+
+  if (/\b402\b/.test(msg) || isQuotaBody(msg) || /quota or credit balance was exhausted/i.test(msg)) {
+    return new QuotaExhaustedError(msg, { emitted, profileId, cause })
+  }
+  if (/rejected the API key|\b401\b|\b403\b|invalid[_\s]?api[_\s]?key|unauthorized|authentication failed/i.test(msg)) {
+    const authStatus = /\b403\b/.test(msg) ? 403 : 401
+    return new ProviderFailureError(msg, {
+      kind: 'auth',
+      status: authStatus,
+      emitted,
+      retryable: false,
+      hard: true,
+      profileId,
+      cause,
+    })
+  }
+  if (/rate[\s_-]?limit|\b429\b|too many requests/i.test(msg)) {
+    return new ProviderFailureError(msg, {
+      kind: 'rate_limited',
+      status: 429,
+      retryAfterMs,
+      emitted,
+      retryable: true,
+      hard: false,
+      profileId,
+      cause,
+    })
+  }
+  if (CONTEXT_OVERFLOW_RE.test(msg)) {
+    return new ProviderFailureError(msg, {
+      kind: 'context_overflow',
+      emitted,
+      retryable: false,
+      hard: false,
+      profileId,
+      cause,
+    })
+  }
+  if (/endpoint or model was not found|\b404\b.*(?:model|provider|endpoint)|(?:model|provider|endpoint).*\b404\b/i.test(msg)) {
+    return new ProviderFailureError(msg, {
+      kind: 'server',
+      status: 404,
+      emitted,
+      retryable: false,
+      hard: true,
+      profileId,
+      cause,
+    })
+  }
+  if (/timed?\s*out|timeout|stream\s+stalled|no token/i.test(msg)) {
+    return new ProviderFailureError(msg, {
+      kind: 'stall',
+      emitted,
+      retryable: true,
+      hard: false,
+      profileId,
+      cause,
+    })
+  }
+  if (/stream\s+(?:dropped|ended unexpectedly|interrupted|closed)|socket\s+hang\s+up|ECONNRESET|premature\s+close|did not return a streaming response/i.test(msg)) {
+    return new ProviderFailureError(msg, {
+      kind: 'stream_drop',
+      emitted,
+      retryable: true,
+      hard: false,
+      profileId,
+      cause,
+    })
+  }
+  const serverStatusMatch = msg.match(/\bHTTP\s*(5\d\d)\b/i) ?? msg.match(/\b(50[0234])\b/)
+  if (serverStatusMatch || /bad gateway|service unavailable|gateway timeout|fetch failed|ETIMEDOUT/i.test(msg)) {
+    const serverStatus = serverStatusMatch ? Number(serverStatusMatch[1]) : undefined
+    return new ProviderFailureError(msg, {
+      kind: 'server',
+      ...(serverStatus ? { status: serverStatus } : {}),
+      retryAfterMs,
+      emitted,
+      retryable: true,
+      hard: false,
+      profileId,
+      cause,
+    })
+  }
+  if (/\b(?:model|provider|openrouter|anthropic|openai|llm)\b/i.test(msg) && /(?:ECONNREFUSED|socket|invalid[\s_-]?json|failed|error)/i.test(msg)) {
+    return new ProviderFailureError(msg, {
+      kind: 'stream_drop',
+      emitted,
+      retryable: true,
+      hard: false,
+      profileId,
+      cause,
+    })
+  }
+  return null
+}
+
+/**
+ * Evaluate whether every configured profile for a role is currently hard-open due to
+ * `quota` (402) or `auth` (401/403) exhaustion. When true, the run-level circuit should
+ * transition to `provider_paused` and stop dispatching new steps within one tick.
+ */
+export function evaluateRoleProviderCircuit(
+  profiles: readonly ResolvedModelProfile[],
+  now = Date.now(),
+): {
+  hardOpen: boolean
+  kind?: 'quota' | 'auth'
+  profileIds: string[]
+  reason?: string
+} {
+  if (!profiles.length) return { hardOpen: false, profileIds: [] }
+  let sawQuota = false
+  let sawAuth = false
+  const profileIds: string[] = []
+  for (const profile of profiles) {
+    const isOpen = profile.healthState === 'open' && profile.cooldownUntil !== null && profile.cooldownUntil > now
+    if (!isOpen) return { hardOpen: false, profileIds: [] }
+    const classified = classifyProviderFailure(profile.lastError ?? '')
+    if (!classified || (classified.kind !== 'quota' && classified.kind !== 'auth')) {
+      return { hardOpen: false, profileIds: [] }
+    }
+    if (classified.kind === 'quota') sawQuota = true
+    else sawAuth = true
+    profileIds.push(profile.id)
+  }
+  const kind: 'quota' | 'auth' = sawQuota ? 'quota' : 'auth'
+  return {
+    hardOpen: true,
+    kind,
+    profileIds,
+    reason: kind === 'quota'
+      ? `All ${profileIds.length} profile(s) for this role are hard-open due to quota exhaustion.`
+      : `All ${profileIds.length} profile(s) for this role are hard-open due to authentication failure.`,
+  }
 }
 
 export type ProviderConfig = Pick<ProviderSettings, 'endpoint' | 'model' | 'protocol' | 'key'> & Partial<ProviderSettings>
@@ -681,6 +1016,8 @@ interface MakeFetchInternalOptions {
   argTracker?: SseToolCallArgTracker
   /** Optional per-attempt marker set when `makeFetch` emits telemetry for this HTTP attempt. */
   attemptTelemetryState?: { recorded: boolean }
+  /** Optional per-attempt typed failure carrier populated by `makeFetch` for `providerPool` / callers. */
+  attemptFailureState?: { error?: ProviderFailureError }
 }
 
 const STALL_ERROR_RE = /stall|timed?\s*out|no token/i
@@ -802,6 +1139,7 @@ function makeFetch(
     for (;;) {
       internal.argTracker?.reset()
       if (internal.attemptTelemetryState) internal.attemptTelemetryState.recorded = false
+      if (internal.attemptFailureState) internal.attemptFailureState.error = undefined
       const totalSignal = AbortSignal.any([
         request.signal,
         AbortSignal.timeout(totalTimeoutMs),
@@ -809,7 +1147,10 @@ function makeFetch(
       ])
       const firstEventController = new AbortController()
       const streamAbortController = new AbortController()
-      const firstEventTimeoutError = () => new Error('The model provider timed out before returning the first event.')
+      const firstEventTimeoutError = () => new ProviderFailureError(
+        'The model provider timed out before returning the first event.',
+        { kind: 'stall', emitted: false, retryable: true, hard: false, profileId },
+      )
       let firstEventCleared = false
       let firstEventTimer: ReturnType<typeof setTimeout> | undefined
       let onFirstEventTimeout: ((err: Error) => void) | undefined
@@ -886,23 +1227,8 @@ function makeFetch(
         if (!response.ok) {
           clearFirstEventTimer()
           const errText = await response.text().catch(() => '')
+          const retryAfterMs = parseRetryAfterMs(response.headers.get('retry-after'))
           const effectiveStatus = response.status === 429 && isQuotaBody(errText) ? 402 : response.status
-          if (retryTransientInFetch && isTransientHttpStatus(effectiveStatus) && transportRetry < maxTransportRetries) {
-            transportRetry += 1
-            if (emitTelemetry) {
-              emitTelemetry({ outcome: 'retried', retried: true, costUsd: 0 })
-              if (internal.attemptTelemetryState) internal.attemptTelemetryState.recorded = true
-            }
-            const waitMs = Math.min(4_000, retryBaseMs * (2 ** (transportRetry - 1)))
-            if (waitMs > 0) {
-              await delay(waitMs, undefined, { signal: totalSignal })
-            }
-            continue
-          }
-          if (emitTelemetry && retryTransientInFetch) {
-            emitTelemetry({ outcome: 'error', costUsd: 0 })
-            if (internal.attemptTelemetryState) internal.attemptTelemetryState.recorded = true
-          }
           const localMutationDiagnostic = effectiveStatus === 400
             ? diagnoseLocalMutation400(errText, locallyMutated, settings.key, currentSecrets)
             : null
@@ -915,6 +1241,37 @@ function makeFetch(
                 : effectiveStatus === 429
                   ? 'The provider rate limit was reached.'
                   : localMutationDiagnostic ?? `The model provider returned HTTP ${effectiveStatus}.`
+          const typedFailure = localMutationDiagnostic
+            ? null
+            : classifyProviderFailure(message, {
+                status: effectiveStatus,
+                retryAfterMs,
+                emitted: false,
+                profileId,
+                body: errText,
+              })
+          if (internal.attemptFailureState) {
+            internal.attemptFailureState.error = typedFailure ?? undefined
+          }
+          if (retryTransientInFetch && typedFailure?.retryable && isTransientHttpStatus(effectiveStatus) && transportRetry < maxTransportRetries) {
+            transportRetry += 1
+            if (emitTelemetry) {
+              emitTelemetry({ outcome: 'retried', retried: true, costUsd: 0 })
+              if (internal.attemptTelemetryState) internal.attemptTelemetryState.recorded = true
+            }
+            const waitMs = boundedRetryWaitMs(
+              typedFailure.retryAfterMs,
+              Math.min(4_000, retryBaseMs * (2 ** (transportRetry - 1))),
+            )
+            if (waitMs > 0) {
+              await delay(waitMs, undefined, { signal: totalSignal })
+            }
+            continue
+          }
+          if (emitTelemetry && retryTransientInFetch) {
+            emitTelemetry({ outcome: 'error', costUsd: 0 })
+            if (internal.attemptTelemetryState) internal.attemptTelemetryState.recorded = true
+          }
           const error = JSON.stringify({ error: { message } })
           recordResponse?.(error)
           return new Response(error, { status: effectiveStatus, headers: { 'content-type': 'application/json' } })
@@ -923,7 +1280,12 @@ function makeFetch(
         if (!response.body || !contentType.toLowerCase().includes('text/event-stream')) {
           clearFirstEventTimer()
           await response.body?.cancel()
-          throw new Error('The provider did not return a streaming response.')
+          const dropErr = new ProviderFailureError(
+            'The provider did not return a streaming response.',
+            { kind: 'stream_drop', emitted: false, retryable: true, hard: false, profileId },
+          )
+          if (internal.attemptFailureState) internal.attemptFailureState.error = dropErr
+          throw dropErr
         }
 
         // Move O4: True pass-through TransformStream over sanitizeProviderStream.
@@ -939,6 +1301,7 @@ function makeFetch(
         let stalled = false
         let streamAborted = false
         let sawErrorFrame = false
+        let emittedAnyChunk = false
         let transformController: TransformStreamDefaultController<Uint8Array> | undefined
 
         const clearIdleTimer = () => {
@@ -1021,7 +1384,11 @@ function makeFetch(
           if (finalized || errored || !Number.isFinite(idleTimeoutMs) || idleTimeoutMs <= 0) return
           idleTimer = setTimeout(() => {
             idleTimer = undefined
-            const err = new Error('The model stream timed out while waiting for data.')
+            const err = new ProviderFailureError(
+              'The model stream timed out while waiting for data.',
+              { kind: 'stall', emitted: emittedAnyChunk, retryable: true, hard: false, profileId },
+            )
+            if (internal.attemptFailureState) internal.attemptFailureState.error = err
             stalled = true
             failStream(err)
             if (!streamAbortController.signal.aborted) {
@@ -1032,8 +1399,10 @@ function makeFetch(
         }
 
         onFirstEventTimeout = err => {
+          const typed = err instanceof ProviderFailureError ? err : firstEventTimeoutError()
+          if (internal.attemptFailureState) internal.attemptFailureState.error = typed
           stalled = true
-          failStream(err)
+          failStream(typed)
         }
         onTotalAbortHook = () => {
           const reason = totalSignal.reason
@@ -1041,7 +1410,20 @@ function makeFetch(
             ? reason
             : new Error(typeof reason === 'string' && reason ? reason : 'The model stream was aborted.')
           if (isStallAbortReason(reason ?? err)) {
+            const stallErr = err instanceof ProviderFailureError
+              ? withProviderFailureContext(err, { emitted: emittedAnyChunk, profileId })
+              : new ProviderFailureError(err.message, {
+                  kind: 'stall',
+                  emitted: emittedAnyChunk,
+                  retryable: true,
+                  hard: false,
+                  profileId,
+                  cause: err,
+                })
+            if (internal.attemptFailureState) internal.attemptFailureState.error = stallErr
             stalled = true
+            failStream(stallErr)
+            return
           } else {
             streamAborted = true
           }
@@ -1052,15 +1434,35 @@ function makeFetch(
           secrets: getSecrets,
           responseLimit,
           onFirstChunk: () => {
+            emittedAnyChunk = true
             clearFirstEventTimer()
             armIdleTimer()
           },
           onFrame: data => {
             usageAccumulator.feedData(data)
             internal.argTracker?.feedData(data)
-            if (emitTelemetry && data && data !== '[DONE]') {
+            if (data && data !== '[DONE]') {
               const t = data.type
-              if (t === 'error' || t === 'response.failed') sawErrorFrame = true
+              if (t === 'error' || t === 'response.failed') {
+                sawErrorFrame = true
+                if (internal.attemptFailureState && !internal.attemptFailureState.error) {
+                  const frameMsg =
+                    typeof (data.error as { message?: unknown } | undefined)?.message === 'string'
+                      ? (data.error as { message: string }).message
+                      : typeof ((data.response as { error?: { message?: unknown } } | undefined)?.error?.message) === 'string'
+                        ? (data.response as { error: { message: string } }).error.message
+                        : 'The model stream failed before completion.'
+                  internal.attemptFailureState.error =
+                    classifyProviderFailure(frameMsg, { emitted: emittedAnyChunk, profileId })
+                    ?? new ProviderFailureError(frameMsg, {
+                      kind: 'stream_drop',
+                      emitted: emittedAnyChunk,
+                      retryable: true,
+                      hard: false,
+                      profileId,
+                    })
+                }
+              }
             }
           },
           onActivity: () => {
@@ -1078,13 +1480,16 @@ function makeFetch(
               return
             }
             if (firstEventController.signal.aborted) {
+              const typed = firstEventTimeoutError()
+              if (internal.attemptFailureState) internal.attemptFailureState.error = typed
               stalled = true
-              failStream(firstEventTimeoutError())
+              failStream(typed)
               return
             }
             armIdleTimer()
           },
           transform(chunk, controller) {
+            emittedAnyChunk = true
             armIdleTimer()
             if (options.record) {
               const decoded = streamDecoder.decode(chunk, { stream: true })
@@ -1107,7 +1512,24 @@ function makeFetch(
 
         handoffToStream = true
         void sanitized.pipeTo(monitor.writable)
-          .catch(() => { errored = true })
+          .catch((pipeErr: unknown) => {
+            if (!errored && !stalled && !streamAborted) {
+              const dropErr = pipeErr instanceof ProviderFailureError
+                ? withProviderFailureContext(pipeErr, { emitted: emittedAnyChunk, profileId })
+                : new ProviderFailureError('The model stream dropped before completion.', {
+                    kind: 'stream_drop',
+                    emitted: emittedAnyChunk,
+                    retryable: true,
+                    hard: false,
+                    profileId,
+                    cause: pipeErr,
+                  })
+              if (internal.attemptFailureState) internal.attemptFailureState.error = dropErr
+              failStream(dropErr)
+              return
+            }
+            errored = true
+          })
           .finally(() => finalize())
 
         return new Response(monitor.readable, {
@@ -1116,13 +1538,15 @@ function makeFetch(
         })
       } catch (error) {
         if (firstEventController.signal.aborted && !totalSignal.aborted) {
+          const stallErr = firstEventController.signal.reason instanceof ProviderFailureError
+            ? firstEventController.signal.reason
+            : firstEventTimeoutError()
+          if (internal.attemptFailureState) internal.attemptFailureState.error = stallErr
           if (emitTelemetry) {
             emitTelemetry({ outcome: 'stalled', stalled: true, costUsd: 0 })
             if (internal.attemptTelemetryState) internal.attemptTelemetryState.recorded = true
           }
-          throw firstEventController.signal.reason instanceof Error
-            ? firstEventController.signal.reason
-            : firstEventTimeoutError()
+          throw stallErr
         }
         if (emitTelemetry) {
           const isStall = isStallAbortReason(totalSignal.aborted ? totalSignal.reason : error)
@@ -1135,6 +1559,13 @@ function makeFetch(
           } else if (retryTransientInFetch) {
             emitTelemetry({ outcome: 'error', costUsd: 0 })
             if (internal.attemptTelemetryState) internal.attemptTelemetryState.recorded = true
+          }
+        }
+        if (!totalSignal.aborted) {
+          const classified = classifyProviderFailure(error, { emitted: false, profileId })
+          if (classified) {
+            if (internal.attemptFailureState) internal.attemptFailureState.error = classified
+            throw classified
           }
         }
         throw error
@@ -1377,19 +1808,11 @@ export function provider(
 let rrCounter = 0
 
 export function classifyFailoverError(message: string): { failover: boolean; hard: boolean } {
-  if (/aborted due to timeout/i.test(message)) {
-    return { failover: true, hard: false }
-  }
-  if (/aborted|cancelled|canceled|budget|exceeded Kovo Hunter’s size limit|Unexpected model endpoint|Local provider request|refused by SSRF policy|never permitted|Plaintext HTTP egress|without local-lab or explicit loopback/i.test(message)) {
+  const classified = classifyProviderFailure(message)
+  if (!classified || classified.kind === 'context_overflow') {
     return { failover: false, hard: false }
   }
-  if (/rejected the API key|quota|credit balance|401|402|403|404|not found/i.test(message)) {
-    return { failover: true, hard: true }
-  }
-  if (/rate limit|429|HTTP 5\d\d|timed out|timeout|fetch failed|ECONNREFUSED|ECONNRESET|ETIMEDOUT|socket/i.test(message)) {
-    return { failover: true, hard: false }
-  }
-  return { failover: false, hard: false }
+  return { failover: true, hard: classified.hard }
 }
 
 function roleRank(profile: ResolvedModelProfile, preferredRole?: RoleAffinity): number {
@@ -1486,8 +1909,13 @@ export function providerPool(
     if (attemptState) attemptState.recorded = true
   }
 
+  type PoolCallBox = { thrown?: unknown; lastFailure?: ProviderFailureError }
+  const pendingCallBoxes: PoolCallBox[] = []
+  const takeCallBox = (): PoolCallBox | undefined => pendingCallBoxes.shift()
+
   const wrapMethod = (method: 'stream' | 'streamSimple'): ProviderStreams['stream'] => {
     return (_selected, transcript, sOpts) => {
+      const callBox = takeCallBox()
       const estimatedTokens = tokenEstimator.estimate(transcript)
       const ordered = orderProfiles(sorted, estimatedTokens, options.roleAffinity)
 
@@ -1497,7 +1925,9 @@ export function providerPool(
         // or failover hop), bounded separately by `maxTransportRetries`.
         options.beforeCall?.()
         if (callCounter.count + 1 > callCounter.maxCalls) {
-          throw new BudgetExceededError('The model call budget for this operation was reached.')
+          const budgetErr = new BudgetExceededError('The model call budget for this operation was reached.')
+          if (callBox) callBox.thrown = budgetErr
+          throw budgetErr
         }
         callCounter.count += 1
 
@@ -1509,35 +1939,55 @@ export function providerPool(
 
         for (let idx = 0; idx < ordered.length; idx++) {
           const candidate = ordered[idx]
-          if (options.signal?.aborted) throw options.signal.reason ?? new Error('Aborted')
+          if (options.signal?.aborted) {
+            const abortErr = options.signal.reason ?? new Error('Aborted')
+            if (callBox) callBox.thrown = abortErr
+            throw abortErr
+          }
 
           let attempt = 0
           for (;;) {
             const attemptTelemetryState = emitTelemetry ? { recorded: false } : undefined
+            const attemptFailureState: { error?: ProviderFailureError } = {}
             const built = buildSingleStreamImpl(candidate, scenario, poolOptions, callCounter, candidate.id, {
               chargeLogicalTurn: false,
               retryTransientInFetch: false,
+              attemptFailureState,
               ...(attemptTelemetryState ? { attemptTelemetryState } : {}),
             })
             const candidateOpts = { ...sOpts, apiKey: candidate.key }
             const stream = built.implementation[method](built.model, transcript, candidateOpts)
             let emitted = false
             let retrySame = false
+            let retryWaitMs = 0
             let failedOver = false
+
+            const resolveTypedFailure = (errOrMsg: unknown, hasEmitted: boolean): ProviderFailureError | null => {
+              const fromFetch = attemptFailureState.error
+              if (fromFetch) {
+                return withProviderFailureContext(fromFetch, { emitted: hasEmitted, profileId: candidate.id })
+              }
+              return classifyProviderFailure(errOrMsg, { emitted: hasEmitted, profileId: candidate.id })
+            }
 
             try {
               for await (const event of stream) {
                 if (event.type === 'error' && !emitted) {
                   const msg = String((event as { error?: { errorMessage?: string } }).error?.errorMessage ?? 'Model error')
-                  const decision = classifyFailoverError(msg)
-                  if (decision.failover) {
-                    options.onProfileFailure?.(candidate.id, msg, decision.hard)
-                    lastError = new Error(msg)
+                  const typed = resolveTypedFailure(msg, false)
+                  if (typed && typed.kind !== 'context_overflow') {
+                    options.onProfileFailure?.(candidate.id, typed.message, typed.hard)
+                    lastError = typed
+                    if (callBox) callBox.lastFailure = typed
                     failedOver = true
-                    if (!decision.hard && idx === ordered.length - 1 && transientAttempts < maxTransportRetries) {
+                    if (typed.retryable && !typed.hard && idx === ordered.length - 1 && transientAttempts < maxTransportRetries) {
                       transientAttempts++
                       attempt++
                       retrySame = true
+                      retryWaitMs = boundedRetryWaitMs(
+                        typed.retryAfterMs,
+                        Math.min(4_000, retryBaseMs * 2 ** (attempt - 1)),
+                      )
                     }
                     recordPoolAttemptFailure(attemptTelemetryState, retrySame || idx + 1 < ordered.length)
                     break
@@ -1548,8 +1998,7 @@ export function providerPool(
               }
 
               if (retrySame) {
-                const waitMs = Math.min(4_000, retryBaseMs * 2 ** (attempt - 1))
-                if (waitMs > 0) await delay(waitMs, undefined, { signal: options.signal })
+                if (retryWaitMs > 0) await delay(retryWaitMs, undefined, { signal: options.signal })
                 continue
               }
               if (failedOver) break
@@ -1557,16 +2006,20 @@ export function providerPool(
               const res = await stream.result()
               if (!emitted && res.stopReason === 'error') {
                 const msg = res.errorMessage ?? 'Model error'
-                const decision = classifyFailoverError(msg)
-                if (decision.failover) {
-                  options.onProfileFailure?.(candidate.id, msg, decision.hard)
-                  lastError = new Error(msg)
-                  const willRetrySame = !decision.hard && idx === ordered.length - 1 && transientAttempts < maxTransportRetries
+                const typed = resolveTypedFailure(msg, false)
+                if (typed && typed.kind !== 'context_overflow') {
+                  options.onProfileFailure?.(candidate.id, typed.message, typed.hard)
+                  lastError = typed
+                  if (callBox) callBox.lastFailure = typed
+                  const willRetrySame = typed.retryable && !typed.hard && idx === ordered.length - 1 && transientAttempts < maxTransportRetries
                   recordPoolAttemptFailure(attemptTelemetryState, willRetrySame || idx + 1 < ordered.length)
                   if (willRetrySame) {
                     transientAttempts++
                     attempt++
-                    const waitMs = Math.min(4_000, retryBaseMs * 2 ** (attempt - 1))
+                    const waitMs = boundedRetryWaitMs(
+                      typed.retryAfterMs,
+                      Math.min(4_000, retryBaseMs * 2 ** (attempt - 1)),
+                    )
                     if (waitMs > 0) await delay(waitMs, undefined, { signal: options.signal })
                     continue
                   }
@@ -1574,27 +2027,45 @@ export function providerPool(
                 }
               }
               if (res.stopReason === 'error') {
+                const midTyped = resolveTypedFailure(res.errorMessage ?? 'Model error', emitted)
+                if (midTyped && callBox) callBox.lastFailure = midTyped
                 recordPoolAttemptFailure(attemptTelemetryState, false)
               } else {
                 options.onProfileSuccess?.(candidate.id)
               }
               return res
             } catch (error) {
-              if (emitted) throw error
-              const msg = error instanceof Error ? error.message : String(error)
-              const decision = classifyFailoverError(msg)
-              if (!decision.failover) {
-                recordPoolAttemptFailure(attemptTelemetryState, false)
-                throw error
+              if (emitted) {
+                const typed = resolveTypedFailure(error, true)
+                const finalErr = typed ?? error
+                if (callBox) {
+                  callBox.thrown = finalErr
+                  if (typed) callBox.lastFailure = typed
+                }
+                throw finalErr
               }
-              options.onProfileFailure?.(candidate.id, msg, decision.hard)
-              lastError = error
-              const willRetrySame = !decision.hard && idx === ordered.length - 1 && transientAttempts < maxTransportRetries
+              const typed = resolveTypedFailure(error, false)
+              if (!typed || typed.kind === 'context_overflow') {
+                recordPoolAttemptFailure(attemptTelemetryState, false)
+                const finalErr = typed ?? error
+                if (callBox) {
+                  callBox.thrown = finalErr
+                  if (typed) callBox.lastFailure = typed
+                }
+                throw finalErr
+              }
+              options.onProfileFailure?.(candidate.id, typed.message, typed.hard)
+              lastError = typed
+              if (callBox) callBox.lastFailure = typed
+              const willRetrySame = typed.retryable && !typed.hard && idx === ordered.length - 1 && transientAttempts < maxTransportRetries
               recordPoolAttemptFailure(attemptTelemetryState, willRetrySame || idx + 1 < ordered.length)
               if (willRetrySame) {
                 transientAttempts++
                 attempt++
-                const waitMs = Math.min(4_000, retryBaseMs * 2 ** (attempt - 1))
+                const waitMs = boundedRetryWaitMs(
+                  typed.retryAfterMs,
+                  Math.min(4_000, retryBaseMs * 2 ** (attempt - 1)),
+                )
                 if (waitMs > 0) await delay(waitMs, undefined, { signal: options.signal })
                 continue
               }
@@ -1602,7 +2073,16 @@ export function providerPool(
             }
           }
         }
-        throw lastError instanceof Error ? lastError : new Error('All configured model profiles failed.')
+        const finalError = lastError instanceof Error
+          ? lastError
+          : new ProviderFailureError('All configured model profiles failed.', {
+              kind: 'server',
+              emitted: false,
+              retryable: false,
+              hard: false,
+            })
+        if (callBox) callBox.thrown = finalError
+        throw finalError
       })()
 
       let cachedResult: Promise<Awaited<ReturnType<ReturnType<ProviderStreams['stream']>['result']>>> | undefined
@@ -1649,6 +2129,43 @@ export function providerPool(
     api: implementation,
     models: [primaryBuilt.model],
   }))
+
+  // `pi-ai`'s `createModels` wraps provider streams in `AssistantMessageEventStream`, which catches
+  // thrown errors and flattens them into `{ stopReason: 'error', errorMessage }`. Re-surface typed
+  // `ProviderFailureError` / `QuotaExhaustedError` throws from `wrapMethod` cleanly while keeping
+  // mid-stream `stopReason: 'error'` results intact with non-enumerable `providerFailure` attached.
+  const wrapModelStreamMethod = <T extends (selected: any, transcript: any, ...rest: any[]) => any>(orig: T): T =>
+    ((selected: any, transcript: any, ...rest: any[]) => {
+      const box: PoolCallBox = {}
+      pendingCallBoxes.push(box)
+      const inner = orig.call(models, selected, transcript, ...rest)
+      return {
+        async *[Symbol.asyncIterator]() {
+          for await (const ev of inner) {
+            if (ev && typeof ev === 'object' && (ev as { type?: unknown }).type === 'error' && box.thrown !== undefined) {
+              throw box.thrown
+            }
+            yield ev
+          }
+          if (box.thrown !== undefined) throw box.thrown
+        },
+        async result() {
+          const res = await inner.result()
+          if (box.thrown !== undefined) throw box.thrown
+          if (res && typeof res === 'object' && res.stopReason === 'error' && box.lastFailure) {
+            Object.defineProperty(res, 'providerFailure', {
+              value: box.lastFailure,
+              enumerable: false,
+              configurable: true,
+            })
+          }
+          return res
+        },
+      }
+    }) as T
+  models.stream = wrapModelStreamMethod(models.stream)
+  models.streamSimple = wrapModelStreamMethod(models.streamSimple)
+
   return { models, model: primaryBuilt.model }
 }
 
@@ -1685,8 +2202,9 @@ export async function testProvider(
     if (/(?:Egress host|Egress origin|Plaintext HTTP egress|SSRF policy|never permitted|explicit loopback allowlist|redirect)/i.test(error)) {
       throw new EgressDeniedError('scope_denied', error)
     }
-    const match = error.match(/The (?:provider rejected the API key|provider quota or credit balance was exhausted|provider endpoint or model was not found|provider rate limit was reached|model provider returned HTTP \d+)\./)
-    throw new Error(match?.[0] ?? 'The provider connection failed. Check the base URL, model, key, and protocol.')
+    const typed = classifyProviderFailure(error, { profileId: settings.id })
+    if (typed) throw typed
+    throw new Error('The provider connection failed. Check the base URL, model, key, and protocol.')
   }
   if (
     !toolEvents ||
