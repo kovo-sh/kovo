@@ -61,7 +61,7 @@ import {
   TemplateValidationError,
 } from '../src/templates/loader.ts'
 import { parseCliArgs } from '../scripts/cli.ts'
-import { createApp } from './app.ts'
+import { createApp, HARDENED_NODE_FLAGS } from './app.ts'
 import { validateSarif21 } from './v3-fullstack-lab/sarif-validate.ts'
 import {
   asBrokerRequest,
@@ -7950,6 +7950,7 @@ describe('Tier 4 — Concurrency, Crash Recovery, Stress & Real-World E2E (14 ca
     const cliPath = resolve(repoRoot, 'scripts/cli.ts')
     const exitCode = await new Promise<number>((resolveExit, rejectExit) => {
       execFile(process.execPath, [
+        ...HARDENED_NODE_FLAGS,
         cliPath,
         'scan', '--local-lab', '--origin', fx.origin, '--tier', '2',
         '--output-dir', outDir, '--sarif', sarifPath, '--fail-on', 'high', '--timeout-sec', '45',

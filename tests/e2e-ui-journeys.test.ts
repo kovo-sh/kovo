@@ -14,6 +14,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { after, before, describe, it } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import type { Browser, BrowserContext, Page } from '@playwright/test'
+import { HARDENED_NODE_FLAGS } from './app.ts'
 
 const SYSTEM_CHROMIUM_CANDIDATES = [
   '/usr/bin/chromium',
@@ -332,7 +333,7 @@ async function startKovoServer(): Promise<SpawnedKovoServer> {
   const origin = `http://127.0.0.1:${port}`
   let output = ''
 
-  const child: ChildProcess = spawn(process.execPath, ['scripts/serve.ts'], {
+  const child: ChildProcess = spawn(process.execPath, [...HARDENED_NODE_FLAGS, 'scripts/serve.ts'], {
     cwd: process.cwd(),
     env: {
       ...process.env,

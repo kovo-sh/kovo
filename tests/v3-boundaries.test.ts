@@ -41,6 +41,7 @@ import { probeDifferential, probeSurface, runSafeTemplates } from '../src/server
 import { LinuxWorkerBackend } from '../src/server/worker-backend.ts'
 import { loadSafeTemplates, parseSafeTemplateYaml, TemplateValidationError } from '../src/templates/loader.ts'
 import { determineExitCode, loadPersonaFile, parseCliArgs } from '../scripts/cli.ts'
+import { HARDENED_NODE_FLAGS } from './app.ts'
 import { createSuiteBLab, LAB_PERSONA_A_TOKEN } from './v3-fullstack-lab/lab-server.ts'
 import { createSuiteBMockRepo } from './v3-fullstack-lab/mock-repo.ts'
 import { validateSarif21 } from './v3-fullstack-lab/sarif-validate.ts'
@@ -560,7 +561,7 @@ test('A6 CLI: exit codes 0/1/2, --help, flag validation, local-lab gate, 0600 pe
   const run = (args: string[], env: Record<string, string | undefined> = {}) => new Promise<{ code: number; stdout: string; stderr: string }>(resolve => {
     const childEnv = { ...process.env, ...env } as NodeJS.ProcessEnv
     for (const [k, v] of Object.entries(env)) if (v === undefined) delete childEnv[k]
-    execFile(process.execPath, [cli, ...args], { env: childEnv, timeout: 60_000 }, (error, stdout, stderr) => {
+    execFile(process.execPath, [...HARDENED_NODE_FLAGS, cli, ...args], { env: childEnv, timeout: 60_000 }, (error, stdout, stderr) => {
       resolve({ code: error ? (typeof error.code === 'number' ? error.code : 1) : 0, stdout, stderr })
     })
   })

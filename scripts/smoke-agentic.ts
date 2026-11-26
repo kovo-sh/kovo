@@ -32,6 +32,11 @@ const ROOT = resolve(HERE, '..')
 const CORPUS_PATH = join(ROOT, 'benchmarks/realism-suite/traps/fp-archetypes.json')
 const DEFAULT_DATA_DIR = process.env.KOVO_DATA_DIR ?? '/home/omarchy/guardian-data'
 const DEFAULT_OUT = join(ROOT, '.kovo/smoke-battery')
+const HARDENED_NODE_FLAGS = [
+  '--disable-proto=delete',
+  '--enable-experimental-regexp-engine-on-excessive-backtracks',
+  '--regexp-backtracks-before-fallback=10000',
+] as const
 
 export const SMOKE_VERSION = 1
 export const LIFT_APPS = ['acme-saas'] as const
@@ -1245,7 +1250,7 @@ export function planTierOne(opts: SmokeArgs): CellPlan[] {
       app: 'zero-vuln',
       source: 'local',
       outDir: join(opts.outDir, 'cells', 'trap'),
-      command: 'node scripts/cli.ts',
+      command: `node ${HARDENED_NODE_FLAGS.join(' ')} scripts/cli.ts`,
       args: ['scan'],
     },
     {
@@ -1457,6 +1462,7 @@ async function runTrapCell(plan: CellPlan, opts: SmokeArgs): Promise<CellMetrics
     const result = await spawnLogged({
       command: 'node',
       args: [
+        ...HARDENED_NODE_FLAGS,
         'scripts/cli.ts', 'scan',
         '--origin', trap.origins.app!,
         '--local-lab',

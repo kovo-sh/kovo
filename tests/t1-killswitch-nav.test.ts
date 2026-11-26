@@ -24,6 +24,7 @@ import { PersonaAuthManager, personaPoolKey, PersonaSessionPool } from '../src/s
 import type { MintedPersonaSession } from '../src/server/persona-vault.ts'
 import { Store, store } from '../src/server/store.ts'
 import type { RunDiscoverySubdomainsResult } from '../src/server/subdomain-discovery.ts'
+import { HARDENED_NODE_FLAGS } from './app.ts'
 
 const REPO_ROOT = resolve(import.meta.dirname, '..')
 
@@ -671,7 +672,7 @@ test('booting scripts/serve.ts against built build/server/server.js succeeds wit
   const dataDir = mkdtempSync(join(tmpdir(), 'kovo-serve-boot-'))
   const port = await availablePort()
   let output = ''
-  const child = spawn(process.execPath, ['scripts/serve.ts'], {
+  const child = spawn(process.execPath, [...HARDENED_NODE_FLAGS, 'scripts/serve.ts'], {
     cwd: REPO_ROOT,
     env: {
       ...process.env,
