@@ -13,11 +13,13 @@ import {
   importProjectSpec,
   isLocalLabEnvEnabled,
   labConfigSchema,
+  maxProjectSeeds,
   newProject,
   newRun,
   projectAsset,
   providerSettings,
   runCommand,
+  shortText,
   updatePersona as updatePersonaSchema,
 } from './domain.ts'
 import { execution } from './server/execution.ts'
@@ -150,8 +152,26 @@ export const projectData = createServerFn({ method: 'GET' })
     }
   })
 
+export const updateWorkspaceAction = createServerFn({ method: 'POST' })
+  .validator(z.object({
+    requestId: id,
+    workspaceId: id.optional(),
+    name: shortText,
+  }))
+  .handler(({ data }) => store().projectsRepo.updateWorkspaceName(data))
+
 export const createProject = createServerFn({ method: 'POST' }).validator(newProject)
   .handler(({ data }) => store().createProject(data))
+
+export const updateProjectAction = createServerFn({ method: 'POST' })
+  .validator(z.object({
+    requestId: id,
+    projectId: id,
+    name: shortText.optional(),
+    environment: z.enum(['public', 'local-lab']).optional(),
+    seeds: z.array(z.string().trim().min(1).max(253)).min(1).max(maxProjectSeeds).optional(),
+  }))
+  .handler(({ data }) => store().projectsRepo.updateProject(data))
 
 export const removeProject = createServerFn({ method: 'POST' })
   .validator(z.object({
@@ -165,6 +185,33 @@ export const removeProject = createServerFn({ method: 'POST' })
 
 export const addProjectAsset = createServerFn({ method: 'POST' }).validator(projectAsset)
   .handler(({ data }) => store().addProjectAsset(data))
+
+export const updateProjectAssetAction = createServerFn({ method: 'POST' })
+  .validator(z.object({
+    requestId: id,
+    projectId: id,
+    assetId: id,
+    origin: z.string().trim().min(1).max(253).optional(),
+    source: shortText.optional(),
+    thirdParty: z.boolean().optional(),
+  }))
+  .handler(({ data }) => store().projectsRepo.updateProjectAsset(data))
+
+export const clearProjectAssetAccessPolicyAction = createServerFn({ method: 'POST' })
+  .validator(z.object({
+    requestId: id,
+    projectId: id,
+    assetId: id,
+  }))
+  .handler(({ data }) => store().projectsRepo.clearProjectAssetAccessPolicy(data))
+
+export const removeProjectAsset = createServerFn({ method: 'POST' })
+  .validator(z.object({
+    requestId: id,
+    projectId: id,
+    assetId: id,
+  }))
+  .handler(({ data }) => store().projectsRepo.deleteProjectAsset(data))
 
 export const updateProjectAssetScope = createServerFn({ method: 'POST' })
   .validator(z.object({

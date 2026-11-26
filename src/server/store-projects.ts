@@ -11,7 +11,7 @@ import { join } from 'node:path'
 import { and, desc, eq } from 'drizzle-orm'
 import type { z } from 'zod'
 import type { importAccessPolicy } from '../access-policy.ts'
-import { assetOriginForEnvironment, isLocalLabEnvEnabled } from '../domain.ts'
+import { assetOriginForEnvironment, isLocalLabEnvEnabled, maxProjectSeeds, shortText } from '../domain.ts'
 import type {
   ApprovedEndpointPattern,
   Candidate,
@@ -57,6 +57,25 @@ export class ProjectsRepository {
         .where(eq(tables.projects.workspaceId, this.session.workspace.id))
         .orderBy(desc(tables.projects.createdAt)).all(),
     }
+  }
+
+  updateWorkspaceName(input: { requestId: string; workspaceId?: string; name: string }) {
+    return this.session.operate(input, () => {
+      if (input.workspaceId && input.workspaceId !== this.session.workspace.id) {
+        throw new Error('Workspace not found.')
+      }
+      const cleanName = redact(shortText.parse(input.name))
+      this.session.db.update(tables.workspaces)
+        .set({ name: cleanName })
+        .where(eq(tables.workspaces.id, this.session.workspace.id))
+        .run()
+      this.session.workspace.name = cleanName
+      this.session.event(null, 'workspace.renamed', `Renamed workspace to ${cleanName}.`, {
+        workspaceId: this.session.workspace.id,
+        name: cleanName,
+      })
+      return { id: this.session.workspace.id, name: cleanName }
+    })
   }
 
   /** Typed workspace dashboard summary (projects with run/host/latest-run rollups + recent runs). */
@@ -370,6 +389,75 @@ export class ProjectsRepository {
     })
   }
 
+  updateProject(input: {
+    requestId: string
+    projectId: string
+    name?: string
+    environment?: 'public' | 'local-lab'
+    seeds?: string[]
+  }) {
+    return this.session.operate(input, () => {
+      const project = this.project(input.projectId)
+      const nextName = input.name !== undefined ? redact(shortText.parse(input.name)) : project.name
+      const nextEnvironment = input.environment ?? project.environment
+      const rawSeeds = input.seeds ?? project.seeds
+      if (rawSeeds.length === 0 || rawSeeds.length > maxProjectSeeds) {
+        throw new Error(`Project must have between 1 and ${maxProjectSeeds} seed origins.`)
+      }
+      const originValidator = assetOriginForEnvironment(nextEnvironment)
+      const nextSeeds = [...new Set(rawSeeds.map(seed => originValidator.parse(seed)))]
+      const prevSeeds = new Set(project.seeds)
+      const nextSeedSet = new Set(nextSeeds)
+      const removedSeeds = new Set(project.seeds.filter(seed => !nextSeedSet.has(seed)))
+      const addedSeeds = nextSeeds.filter(seed => !prevSeeds.has(seed))
+
+      const nextDefaultScope = [
+        ...project.defaultScope.filter(origin => !removedSeeds.has(origin)),
+        ...addedSeeds.filter(origin => !project.defaultScope.includes(origin)),
+      ]
+      const nextLabConfig = nextEnvironment === 'local-lab' ? project.labConfig : null
+
+      this.session.db.update(tables.projects)
+        .set({
+          name: nextName,
+          environment: nextEnvironment,
+          seeds: nextSeeds,
+          defaultScope: nextDefaultScope,
+          labConfig: nextLabConfig,
+        })
+        .where(eq(tables.projects.id, project.id))
+        .run()
+
+      if (addedSeeds.length > 0) {
+        this.session.db.insert(tables.projectAssets)
+          .values(addedSeeds.map(origin => ({
+            id: randomUUID(),
+            projectId: project.id,
+            origin,
+            source: 'Project seed',
+            thirdParty: false,
+            includeSubdomains: false,
+          })))
+          .onConflictDoNothing()
+          .run()
+      }
+
+      this.session.event(null, 'project.updated', `Updated project ${nextName}.`, {
+        projectId: project.id,
+        name: nextName,
+        environment: nextEnvironment,
+        seedsCount: nextSeeds.length,
+      })
+      return {
+        id: project.id,
+        name: nextName,
+        environment: nextEnvironment,
+        seeds: nextSeeds,
+        defaultScope: nextDefaultScope,
+      }
+    })
+  }
+
   updateProjectLabConfig(input: { requestId: string; projectId: string; labConfig: LabConfig | null }) {
     return this.session.operate(input, () => {
       const project = this.project(input.projectId)
@@ -486,6 +574,107 @@ export class ProjectsRepository {
         includeSubdomains: nextIncludeSubdomains,
         approvedInDefaultScope: nextDefaultScope.includes(asset.origin),
       }
+    })
+  }
+
+  updateProjectAsset(input: {
+    requestId: string
+    projectId: string
+    assetId: string
+    origin?: string
+    source?: string
+    thirdParty?: boolean
+  }) {
+    return this.session.operate(input, () => {
+      const project = this.project(input.projectId)
+      const asset = this.session.db.select().from(tables.projectAssets)
+        .where(and(eq(tables.projectAssets.projectId, project.id), eq(tables.projectAssets.id, input.assetId)))
+        .get()
+      if (!asset) throw new Error('Project asset not found.')
+
+      const nextOrigin = input.origin !== undefined && input.origin.trim() !== asset.origin
+        ? assetOriginForEnvironment(project.environment).parse(input.origin)
+        : asset.origin
+      if (nextOrigin !== asset.origin) {
+        const collision = this.session.db.select({ id: tables.projectAssets.id })
+          .from(tables.projectAssets)
+          .where(and(eq(tables.projectAssets.projectId, project.id), eq(tables.projectAssets.origin, nextOrigin)))
+          .get()
+        if (collision && collision.id !== asset.id) {
+          throw new Error('A host with that origin already exists in this project.')
+        }
+      }
+
+      const nextSource = input.source !== undefined ? redact(shortText.parse(input.source)) : asset.source
+      const nextThirdParty = input.thirdParty !== undefined ? Boolean(input.thirdParty) : asset.thirdParty
+      const nextIncludeSubdomains = project.environment === 'public' && !nextThirdParty && Boolean(asset.includeSubdomains)
+      const nextAccessPolicy = asset.accessPolicy && nextOrigin !== asset.origin
+        ? { ...asset.accessPolicy, origin: nextOrigin }
+        : asset.accessPolicy
+
+      this.session.db.update(tables.projectAssets)
+        .set({
+          origin: nextOrigin,
+          source: nextSource,
+          thirdParty: nextThirdParty,
+          includeSubdomains: nextIncludeSubdomains,
+          ...(nextAccessPolicy !== undefined ? { accessPolicy: nextAccessPolicy } : {}),
+        })
+        .where(eq(tables.projectAssets.id, asset.id))
+        .run()
+
+      if (nextOrigin !== asset.origin) {
+        const nextDefaultScope = [...new Set(project.defaultScope.map(o => (o === asset.origin ? nextOrigin : o)))]
+        const nextSeeds = [...new Set(project.seeds.map(o => (o === asset.origin ? nextOrigin : o)))]
+        if (
+          nextDefaultScope.length !== project.defaultScope.length ||
+          nextSeeds.length !== project.seeds.length ||
+          nextDefaultScope.some((o, i) => o !== project.defaultScope[i]) ||
+          nextSeeds.some((o, i) => o !== project.seeds[i])
+        ) {
+          this.session.db.update(tables.projects)
+            .set({ defaultScope: nextDefaultScope, seeds: nextSeeds })
+            .where(eq(tables.projects.id, project.id))
+            .run()
+        }
+      }
+
+      this.session.event(null, 'inventory.asset_updated', `Updated host ${nextOrigin}.`, {
+        projectId: project.id,
+        assetId: asset.id,
+        origin: nextOrigin,
+        source: nextSource,
+        thirdParty: nextThirdParty,
+        includeSubdomains: nextIncludeSubdomains,
+      })
+      return {
+        id: asset.id,
+        origin: nextOrigin,
+        source: nextSource,
+        thirdParty: nextThirdParty,
+        includeSubdomains: nextIncludeSubdomains,
+      }
+    })
+  }
+
+  clearProjectAssetAccessPolicy(input: { requestId: string; projectId: string; assetId: string }) {
+    return this.session.operate(input, () => {
+      const project = this.project(input.projectId)
+      const asset = this.session.db.select().from(tables.projectAssets)
+        .where(and(eq(tables.projectAssets.projectId, project.id), eq(tables.projectAssets.id, input.assetId)))
+        .get()
+      if (!asset) throw new Error('Project asset not found.')
+
+      this.session.db.update(tables.projectAssets)
+        .set({ accessPolicy: null })
+        .where(eq(tables.projectAssets.id, asset.id))
+        .run()
+      this.session.event(null, 'inventory.access_policy_cleared', `Cleared access policy for ${asset.origin}.`, {
+        projectId: project.id,
+        assetId: asset.id,
+        origin: asset.origin,
+      })
+      return { id: asset.id, origin: asset.origin, cleared: asset.accessPolicy !== null }
     })
   }
 

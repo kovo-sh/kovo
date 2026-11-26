@@ -9,6 +9,8 @@ import {
   saveGithubToken,
   testModel,
   toggleModelProfile,
+  updateWorkspaceAction,
+  workspaceData,
 } from '../actions.ts'
 import { formatHumanTime, useAction } from '../components/common.tsx'
 import { useGithubDeviceFlow } from '../components/github/useGithubDeviceFlow.ts'
@@ -61,8 +63,12 @@ function ModelProfilesEmptyIllustration() {
 export const Route = createFileRoute('/settings')({
   validateSearch: (search): { runId?: string } => ({ runId: id.safeParse(search.runId).data }),
   loader: async () => {
-    const [profiles, githubStatus] = await Promise.all([listModels(), getGithubStatus()])
-    return { profiles, githubStatus }
+    const [profiles, githubStatus, workspaceSummary] = await Promise.all([
+      listModels(),
+      getGithubStatus(),
+      workspaceData(),
+    ])
+    return { profiles, githubStatus, workspace: workspaceSummary.workspace }
   },
   component: SettingsWorkbenchPage,
 })
@@ -591,8 +597,87 @@ function statusTextClass(tone: 'ok' | 'warn' | 'bad' | 'off'): string {
   }
 }
 
+function WorkspaceSettingsBand({ workspace }: { workspace: { id: string; name: string } }) {
+  const [name, setName] = useState(() => workspace.name)
+  const [notice, setNotice] = useState('')
+  const action = useAction()
+
+  useEffect(() => {
+    setName(workspace.name)
+  }, [workspace.name])
+
+  const trimmed = name.trim()
+  const unchanged = trimmed === workspace.name
+
+  return (
+    <section className="flex flex-col gap-3.5 border-t border-line pt-6" aria-labelledby="workspace-settings-heading">
+      <div className="flex flex-wrap items-end justify-between gap-4">
+        <div>
+          <p className="m-0 mb-0.5 text-[11.5px] font-medium text-fg-subtle">General</p>
+          <h2 id="workspace-settings-heading" className="m-0 text-[16px] font-semibold leading-[22px] tracking-[-0.015em] text-fg">
+            Workspace
+          </h2>
+        </div>
+      </div>
+
+      <Card className="overflow-hidden border-line">
+        <form
+          onSubmit={event => {
+            event.preventDefault()
+            if (!trimmed || unchanged) return
+            setNotice('')
+            void action.submit(() => updateWorkspaceAction({
+              data: {
+                requestId: crypto.randomUUID(),
+                workspaceId: workspace.id,
+                name: trimmed,
+              },
+            }), () => setNotice('Workspace name updated.'))
+          }}
+        >
+          <div className="flex flex-col gap-2.5 px-4 py-3.5 sm:flex-row sm:items-end sm:gap-3">
+            <label className="grid flex-1 gap-1.5 text-[12px] font-medium text-fg-muted">
+              Workspace name
+              <Input
+                className="w-full"
+                name="workspaceName"
+                value={name}
+                onChange={e => {
+                  setName(e.target.value)
+                  if (notice) setNotice('')
+                }}
+                placeholder="Personal workspace"
+                maxLength={160}
+                required
+                disabled={action.pending}
+              />
+            </label>
+            <Button
+              type="submit"
+              variant="default"
+              disabled={action.pending || !trimmed || unchanged}
+            >
+              {action.pending ? 'Saving…' : 'Save'}
+            </Button>
+          </div>
+          {action.error && (
+            <div role="alert" className="border-t border-line bg-danger-soft px-4 py-[9px] text-[12px] text-danger">
+              {action.error}
+            </div>
+          )}
+          {notice && !action.error && (
+            <div role="status" className="border-t border-line bg-ok-soft px-4 py-[9px] text-[12px] text-ok">
+              {notice}
+            </div>
+          )}
+        </form>
+      </Card>
+    </section>
+  )
+}
+
 function SettingsWorkbenchPage() {
-  const { profiles, githubStatus } = Route.useLoaderData()
+  const { profiles, githubStatus, workspace } = Route.useLoaderData()
   const { runId } = Route.useSearch()
   const navigate = useNavigate()
   const poolAction = useAction()
@@ -921,6 +1006,7 @@ function SettingsWorkbenchPage() {
         </section>
 
         <GithubConnectionBand initialStatus={githubStatus} />
+        <WorkspaceSettingsBand workspace={workspace} />
       </div>
 
       <ModelProfileSheet
