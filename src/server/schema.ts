@@ -116,7 +116,7 @@ export const runs = sqliteTable('runs', {
   spentTokens: integer('spent_tokens').default(0).notNull(),
   spentRequests: integer('spent_requests').default(0).notNull(),
   turnsUsed: integer('turns_used').default(0).notNull(),
-  maxRpsPerOrigin: integer('max_rps_per_origin').default(5).notNull(),
+  maxRpsPerOrigin: integer('max_rps_per_origin').default(10).notNull(),
   workerConcurrency: integer('worker_concurrency').default(6).notNull(),
   workerMaxTurns: integer('worker_max_turns').default(150).notNull(),
   dynamicStepBudget: integer('dynamic_step_budget'),
