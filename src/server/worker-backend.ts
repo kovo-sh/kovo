@@ -3,6 +3,7 @@ import type { ChildProcess } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import {
   chmodSync,
+  chownSync,
   copyFileSync,
   existsSync,
   lstatSync,
@@ -888,19 +889,44 @@ const resultRefSchema = z.object({
 })
 const oneShotRefSchema = resultRefSchema.extend({ path: z.string().regex(oneShotRefPath) })
 
+/**
+ * Resolve the supplementary host GID passed to `--group-add` so non-root container UID `10001`
+ * can access group-scoped (`0o750`/`0o770`/`0o640`/`0o660`) RPC/IPC mounts without world bits.
+ * Returns `null` when host runs as UID `10001` (owner-only `0o700`/`0o600`), root (`uid=0`),
+ * or when no positive non-root GID is available (never emits `--group-add 0`).
+ */
+export function resolveWorkerSharedGid(env: NodeJS.ProcessEnv = process.env): number | null {
+  if (isContainerUid10001()) return null
+  if (typeof process.getuid === 'function' && process.getuid() === 0) return null
+  const override = env.KOVO_WORKER_SHARED_GID?.trim()
+  if (override) {
+    const parsed = Number(override)
+    if (Number.isInteger(parsed) && parsed > 0) return parsed
+  }
+  if (typeof process.getgid === 'function') {
+    const gid = process.getgid()
+    if (Number.isInteger(gid) && gid > 0) return gid
+  }
+  return null
+}
+
 /** Per-one-shot tmpfs (or per-session DooD scratch) directory mounted at `/kovo-ipc`. */
 function makeOneShotIpcDir(sessionId?: string, env: NodeJS.ProcessEnv = process.env): { ipcDir: string; cleanupDir: string } {
-  const ipcMode = isContainerUid10001() ? 0o700 : 0o777
+  const hostUid = typeof process.getuid === 'function' ? process.getuid() : -1
+  const ownerOnly = isContainerUid10001() || hostUid === 0
+  const ipcMode = ownerOnly ? 0o700 : 0o770
   const dood = resolveDoodScratchConfig(env)
   if (dood) {
     const sid = sessionId ?? `ipc-${randomUUID()}`
     const ipcDir = prepareSessionScratchDir(sid, 'ipc', env)
     chmodSync(ipcDir, ipcMode)
+    if (hostUid === 0) { try { chownSync(ipcDir, 10001, 10001) } catch { /* non-fatal */ } }
     return { ipcDir, cleanupDir: ipcDir }
   }
   const base = existsSync('/dev/shm') ? '/dev/shm' : tmpdir()
   const dir = mkdtempSync(join(base, 'kovo-ipc-'))
   chmodSync(dir, ipcMode)
+  if (hostUid === 0) { try { chownSync(dir, 10001, 10001) } catch { /* non-fatal */ } }
   return { ipcDir: dir, cleanupDir: dir }
 }
 
@@ -1572,41 +1598,28 @@ export function ensureRpcMountReadable(rpcDir: string): string {
   const resolved = realpathSync(rpcDir)
   if (/[\0,\r\n]/.test(resolved)) throw new Error('Invalid resolved verification RPC mount path.')
 
-  if (isContainerUid10001()) {
-    // Inside Option B container, both kovo-hunter and sibling kovo-worker containers run as
-    // UID 10001: keep IPC directory and token/context/socket strictly owner-only (0o700 / 0o600).
-    chmodSync(resolved, 0o700)
-    for (const name of [VERIFY_RPC_TOKEN_NAME, VERIFY_RPC_CONTEXT_NAME]) {
-      const filePath = join(resolved, name)
-      if (!existsSync(filePath)) continue
-      const fileStat = lstatSync(filePath)
-      if (fileStat.isFile()) chmodSync(filePath, 0o600)
-    }
-    const socketPath = join(resolved, VERIFY_RPC_SOCKET_NAME)
-    if (existsSync(socketPath)) {
-      const sockStat = lstatSync(socketPath)
-      if (sockStat.isSocket() || sockStat.isFile()) chmodSync(socketPath, 0o600)
-    }
-    return resolved
-  }
-
-  // Non-root UID 10001 needs o+x (e.g. 0o711 or 0o755) to traverse `/kovo-rpc` when host UID != 10001.
-  if ((st.mode & 0o001) !== 0o001) {
-    chmodSync(resolved, (st.mode & 0o777) | 0o011)
-  }
+  const hostUid = typeof process.getuid === 'function' ? process.getuid() : -1
+  const ownerOnly = isContainerUid10001() || hostUid === 0
+  const dirMode = ownerOnly ? 0o700 : 0o750
+  const fileMode = ownerOnly ? 0o600 : 0o640
+  const sockMode = ownerOnly ? 0o600 : 0o660
+  chmodSync(resolved, dirMode)
+  if (hostUid === 0) { try { chownSync(resolved, 10001, 10001) } catch { /* non-fatal */ } }
   for (const name of [VERIFY_RPC_TOKEN_NAME, VERIFY_RPC_CONTEXT_NAME]) {
     const filePath = join(resolved, name)
     if (!existsSync(filePath)) continue
     const fileStat = lstatSync(filePath)
-    if (fileStat.isFile() && (fileStat.mode & 0o004) !== 0o004) {
-      chmodSync(filePath, (fileStat.mode & 0o777) | 0o044)
+    if (fileStat.isFile()) {
+      chmodSync(filePath, fileMode)
+      if (hostUid === 0) { try { chownSync(filePath, 10001, 10001) } catch { /* non-fatal */ } }
     }
   }
   const socketPath = join(resolved, VERIFY_RPC_SOCKET_NAME)
   if (existsSync(socketPath)) {
     const sockStat = lstatSync(socketPath)
-    if ((sockStat.isSocket() || sockStat.isFile()) && (sockStat.mode & 0o006) !== 0o006) {
-      chmodSync(socketPath, (sockStat.mode & 0o777) | 0o066)
+    if (sockStat.isSocket() || sockStat.isFile()) {
+      chmodSync(socketPath, sockMode)
+      if (hostUid === 0) { try { chownSync(socketPath, 10001, 10001) } catch { /* non-fatal */ } }
     }
   }
   return resolved
@@ -1642,12 +1655,15 @@ export function workerContainerCreateArgs(input: ContainerArgsInput): string[] {
   const ownerPidNs = input.ownerPidNs !== undefined ? input.ownerPidNs : currentPidNamespace()
   const ownerStartTime = input.ownerStartTime !== undefined ? input.ownerStartTime : readProcStartTicks('self')
   const sessionId = input.sessionId ?? processSessionId
+  const sharedGid = resolveWorkerSharedGid(input.env)
   return [
     // No `--rm`: Docker's automatic removal races the explicit `rm --force` below and the
     // daemon answers "removal of container ... is already in progress", which previously
     // surfaced as a failed worker session. Explicit removal is the single mechanism.
     'container', 'create', '--name', input.name, '--interactive', '--pull', 'never',
-    '--network', 'none', '--user', '10001:10001', '--read-only', '--cap-drop', 'ALL',
+    '--network', 'none', '--user', '10001:10001',
+    ...(sharedGid !== null ? ['--group-add', String(sharedGid)] : []),
+    '--read-only', '--cap-drop', 'ALL',
     '--security-opt', 'no-new-privileges',
     '--pids-limit', String(pidsLimit),
     '--cpus', String(cpus),

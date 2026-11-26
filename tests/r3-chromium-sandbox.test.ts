@@ -248,19 +248,26 @@ describe('R3-H-6 Chromium sandbox enforcement', () => {
     assert.equal(contradictoryAttempts, 0)
   })
 
-  test('static guard: scoped-browser.ts and persona-auth.ts have no bypass of launchPlaywrightChromium', () => {
+  test('static guard: scoped-browser.ts, persona-auth.ts, and browser-session-auth.ts delegate solely to chromium-launch.ts', () => {
     const stripComments = (src: string) =>
       src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+    const chromiumLaunchSrc = stripComments(readFileSync(new URL('../src/server/chromium-launch.ts', import.meta.url), 'utf8'))
     const scopedSrc = stripComments(readFileSync(new URL('../src/server/scoped-browser.ts', import.meta.url), 'utf8'))
     const personaSrc = stripComments(readFileSync(new URL('../src/server/persona-auth.ts', import.meta.url), 'utf8'))
+    const browserSessionSrc = stripComments(readFileSync(new URL('../src/server/browser-session-auth.ts', import.meta.url), 'utf8'))
 
-    // Neither file should call launchPersistentContext or raw *.chromium.launch outside launchPlaywrightChromium.
-    assert.equal(/launchPersistentContext\s*\(/.test(scopedSrc), false)
-    assert.equal(/launchPersistentContext\s*\(/.test(personaSrc), false)
-    assert.equal(/\bchromium\.launch\s*\(/.test(scopedSrc), false)
-    assert.equal(/\.chromium\.launch\s*\(/.test(personaSrc), false)
-    // Only the single centralized call inside launchPlaywrightChromium should exist.
-    const launchMatches = personaSrc.match(/\bchromium\.launch\s*\(/g) ?? []
-    assert.equal(launchMatches.length, 1, 'Expected exactly one centralized chromium.launch call in persona-auth.ts')
+    // None of the caller files may call launchPersistentContext or raw chromium.launch directly.
+    for (const [name, src] of [
+      ['scoped-browser.ts', scopedSrc],
+      ['persona-auth.ts', personaSrc],
+      ['browser-session-auth.ts', browserSessionSrc],
+    ] as const) {
+      assert.equal(/launchPersistentContext\s*\(/.test(src), false, `${name} must not call launchPersistentContext`)
+      assert.equal(/\bchromium\.launch\s*\(/.test(src), false, `${name} must not call chromium.launch directly`)
+    }
+    assert.equal(/launchPersistentContext\s*\(/.test(chromiumLaunchSrc), false)
+    // Only the single centralized call inside chromium-launch.ts should exist.
+    const launchMatches = chromiumLaunchSrc.match(/\bchromium\.launch\s*\(/g) ?? []
+    assert.equal(launchMatches.length, 1, 'Expected exactly one centralized chromium.launch call in chromium-launch.ts')
   })
 })

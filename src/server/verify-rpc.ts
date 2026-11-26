@@ -22,7 +22,7 @@
  * path through the pure `oracle-invariants` module, so both paths dismiss the same over-claims.
  */
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, chownSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { tmpdir } from 'node:os'
@@ -414,31 +414,37 @@ export class VerifyRpcServer {
 
   async start(): Promise<this> {
     if (this.started) return this
+    const hostUid = typeof process.getuid === 'function' ? process.getuid() : -1
+    const ownerOnly = hostUid === 10001 || hostUid === 0
+    const dirMode = ownerOnly ? 0o700 : 0o750
+    const fileMode = ownerOnly ? 0o600 : 0o640
+    const sockMode = ownerOnly ? 0o600 : 0o660
     const configured = this.options.hostDir
     if (configured) {
-      mkdirSync(configured, { recursive: true, mode: 0o711 })
+      mkdirSync(configured, { recursive: true, mode: dirMode })
       this.hostDirValue = configured
     } else {
       const scratchRaw = resolveVerifyRpcScratchRoot()
       if (scratchRaw) {
         const scratchRoot = resolve(scratchRaw)
         if (scratchRoot === '/') throw new Error('KOVO_CONTAINER_SCRATCH_DIR must not be root "/".')
-        mkdirSync(scratchRoot, { recursive: true, mode: 0o711 })
+        mkdirSync(scratchRoot, { recursive: true, mode: dirMode })
         this.hostDirValue = mkdtempSync(join(scratchRoot, 'kovo-verify-rpc-'))
       } else {
         const tmpfsBase = existsSync('/dev/shm') ? '/dev/shm' : tmpdir()
         try { this.hostDirValue = mkdtempSync(join(tmpfsBase, 'kovo-verify-rpc-')) } catch { this.hostDirValue = mkdtempSync(join(tmpdir(), 'kovo-verify-rpc-')) }
       }
     }
-    // 0711: the sandbox uid can traverse to the mounted files without listing the host directory.
-    // Explicit chmodSync on every file bypasses restrictive host umasks (e.g. 0077) so the
-    // non-root worker container UID (10001) never hits EACCES reading /kovo-rpc/*.
-    chmodSync(this.hostDirValue, 0o711)
+    // Group-scoped (0750/0640/0660 paired with container --group-add <hostGid>) or owner-only
+    // (0700/0600 when UID 10001/0): eliminates world-readable/writable modes while bypassing umask 0077.
+    chmodSync(this.hostDirValue, dirMode)
+    if (hostUid === 0) { try { chownSync(this.hostDirValue, 10001, 10001) } catch { /* non-fatal */ } }
     this.socketPathValue = join(this.hostDirValue, VERIFY_RPC_SOCKET_NAME)
     this.tokenValue = randomBytes(24).toString('hex')
     const tokenPath = join(this.hostDirValue, VERIFY_RPC_TOKEN_NAME)
-    writeFileSync(tokenPath, this.tokenValue + '\n', { mode: 0o444 })
-    chmodSync(tokenPath, 0o444)
+    writeFileSync(tokenPath, this.tokenValue + '\n', { mode: fileMode })
+    chmodSync(tokenPath, fileMode)
+    if (hostUid === 0) { try { chownSync(tokenPath, 10001, 10001) } catch { /* non-fatal */ } }
     const context = {
       nonce: this.nonce,
       runId: this.options.runId,
@@ -447,8 +453,9 @@ export class VerifyRpcServer {
       sdkVersion: VERIFY_RPC_SDK_VERSION,
     }
     const contextPath = join(this.hostDirValue, VERIFY_RPC_CONTEXT_NAME)
-    writeFileSync(contextPath, JSON.stringify(context, null, 2), { mode: 0o444 })
-    chmodSync(contextPath, 0o444)
+    writeFileSync(contextPath, JSON.stringify(context, null, 2), { mode: fileMode })
+    chmodSync(contextPath, fileMode)
+    if (hostUid === 0) { try { chownSync(contextPath, 10001, 10001) } catch { /* non-fatal */ } }
 
     const server = createServer((req, res) => { void this.handle(req, res) })
     server.on('clientError', (_err, socket) => {
@@ -461,7 +468,8 @@ export class VerifyRpcServer {
       server.once('listening', onListening)
       server.listen(this.socketPathValue)
     })
-    chmodSync(this.socketPathValue, 0o666)
+    chmodSync(this.socketPathValue, sockMode)
+    if (hostUid === 0) { try { chownSync(this.socketPathValue, 10001, 10001) } catch { /* non-fatal */ } }
     this.server = server
     this.started = true
     return this

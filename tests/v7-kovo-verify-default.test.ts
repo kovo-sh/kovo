@@ -631,10 +631,14 @@ test('VerifyRpcServer stages hostDir, token, context.json, and verify.sock with 
   const contextMode = statSync(join(server.hostDir, VERIFY_RPC_CONTEXT_NAME)).mode & 0o777
   const tokenMode = statSync(join(server.hostDir, VERIFY_RPC_TOKEN_NAME)).mode & 0o777
   const socketMode = statSync(server.socketPath).mode & 0o777
-  assert.ok((dirMode & 0o001) !== 0, `RPC hostDir must be traversable by container UID 10001 (got 0${dirMode.toString(8)})`)
-  assert.ok((contextMode & 0o004) !== 0, `context.json must be world-readable for container UID 10001 (got 0${contextMode.toString(8)})`)
-  assert.ok((tokenMode & 0o004) !== 0, `token must be world-readable for container UID 10001 (got 0${tokenMode.toString(8)})`)
-  assert.equal(socketMode & 0o006, 0o006, `verify.sock must be connectable by container UID 10001 (got 0${socketMode.toString(8)})`)
+  assert.equal(dirMode, 0o750, `RPC hostDir must be group-scoped 0o750 for container --group-add (got 0${dirMode.toString(8)})`)
+  assert.equal(contextMode, 0o640, `context.json must be group-scoped 0o640 (got 0${contextMode.toString(8)})`)
+  assert.equal(tokenMode, 0o640, `token must be group-scoped 0o640 (got 0${tokenMode.toString(8)})`)
+  assert.equal(socketMode, 0o660, `verify.sock must be group-scoped 0o660 (got 0${socketMode.toString(8)})`)
+  assert.equal(dirMode & 0o007, 0, 'RPC hostDir must have zero world bits')
+  assert.equal(contextMode & 0o007, 0, 'context.json must have zero world bits')
+  assert.equal(tokenMode & 0o007, 0, 'token must have zero world bits')
+  assert.equal(socketMode & 0o007, 0, 'verify.sock must have zero world bits')
 })
 
 test('TS wrapper edge cases (markdown fences, inline semicolon export default, standalone async fn)', async t => {
