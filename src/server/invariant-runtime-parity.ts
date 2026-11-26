@@ -1,5 +1,6 @@
 /** Runtime Parity Adapter & Shared Normalization Primitives for v8 Layer 2 Invariant Synthesis. */
 import { createHash } from 'node:crypto'
+import { classifyStructuralFieldEdgeKind, isOpaqueResourceId, type ResponseSignalEdgeKind } from './resource-harvest.ts'
 import type {
   CapabilityKind,
   CapabilitySeedRecord,
@@ -157,6 +158,126 @@ const hasOpenApiRoleRestriction = (op: RuntimeOpenApiOperation): boolean =>
   Boolean(op.authRequirement && PRIVILEGED_HINT_RE.test(op.authRequirement))
   || Boolean(op.security?.some(req => Object.entries(req).some(([s, sc]) => PRIVILEGED_HINT_RE.test(s) || (Array.isArray(sc) && sc.some(v => PRIVILEGED_HINT_RE.test(v) || /(?:write|admin|delete|manage|approve|grant)/i.test(v))))))
 
+export type RuntimeDependencyEdgeKind = 'await_async' | 'hmac_sign' | 'lifecycle_chain' | 'signed_url' | 'generic'
+const REBIND_STAGE_RE = /\/(?:rebind|update|assign|delegate|transfer|approve|reassign|edit|modify|attach|link|role|owner|member)(?:\/|$)/i
+const FINALIZE_STAGE_RE = /\/(?:finalize|settle|release|complete|commit|publish|capture|execute|export|dispatch|confirm|submit|payout|withdraw|close)(?:\/|$)/i
+const ASYNC_ROUTE_RE = /\/(?:jobs?|tasks?|exports?|reports?|status|poll|results?|progress|queues?|workers?|async|batches?)(?:\/|$)/i
+const WEBHOOK_ROUTE_RE = /\/(?:webhooks?|callbacks?|hooks?|events?\/ingest|notify)(?:\/|$)/i
+const STORAGE_ROUTE_RE = /\/(?:downloads?|files?|artifacts?|storage|buckets?|signed-url|presign|blobs?)(?:\/|$)/i
+const PARAM_CANON_RE = /[^a-z0-9]/g
+const canonicalParamToken = (name: string): string => name.toLowerCase().replace(/^x-/, '').replace(PARAM_CANON_RE, '')
+
+/** Normalize route paths so concrete IDs and `{param}`/`:param` templates match consistently. */
+function normalizeRouteMatchPath(rawPath: string): string {
+  const bare = (rawPath.split(/[?#]/, 1)[0] || '/').replace(/\/+$/, '') || '/'
+  if (bare === '/') return '/'
+  return '/' + bare.split('/').filter(Boolean).map(seg =>
+    /^[:{<*]/.test(seg) || seg.endsWith('}') || isOpaqueResourceId(seg) ? ':*' : seg.toLowerCase(),
+  ).join('/')
+}
+
+/** Exclude `surface_probe` ghost endpoints whose observed exchanges only ever returned 404/405 with zero non-404 live responses and no OpenAPI/JS/DOM evidence. */
+export function filterGhostSurfaceProbeEndpoints<T extends { origin: string; method: string; pathTemplate: string; source?: string | null }>(
+  endpoints: readonly T[],
+  brokerExchanges: ReadonlyArray<{ origin: string; method: string; pathAndQuery: string; status: number }>,
+  evidencedRouteKeys?: ReadonlySet<string>,
+): T[] {
+  const evidenced = new Set<string>(evidencedRouteKeys ?? [])
+  for (const ep of endpoints) {
+    if (ep.source && ep.source !== 'surface_probe') {
+      const np = normalizeRouteMatchPath(ep.pathTemplate)
+      evidenced.add(`${ep.origin}|${np}`)
+      evidenced.add(`${ep.origin}|${ep.method.toUpperCase()}|${np}`)
+    }
+  }
+  const byExact = new Map<string, { total: number; nonGhost: number }>()
+  const byPath = new Map<string, { total: number; nonGhost: number }>()
+  const bump = (map: Map<string, { total: number; nonGhost: number }>, key: string, status: number) => {
+    const rec = map.get(key) ?? { total: 0, nonGhost: 0 }
+    rec.total += 1
+    if (status !== 404 && status !== 405) rec.nonGhost += 1
+    map.set(key, rec)
+  }
+  for (const ex of brokerExchanges) {
+    const np = normalizeRouteMatchPath(ex.pathAndQuery)
+    bump(byExact, `${ex.origin}|${ex.method.toUpperCase()}|${np}`, ex.status)
+    bump(byPath, `${ex.origin}|${np}`, ex.status)
+  }
+  return endpoints.filter(ep => {
+    if (ep.source !== 'surface_probe') return true
+    const np = normalizeRouteMatchPath(ep.pathTemplate)
+    const mKey = `${ep.origin}|${ep.method.toUpperCase()}|${np}`, pKey = `${ep.origin}|${np}`
+    if (evidenced.has(mKey) || evidenced.has(pKey)) return true
+    const exact = byExact.get(mKey), pathStats = byPath.get(pKey)
+    const stats = exact && exact.total > 0 ? exact : pathStats
+    return !(stats && stats.total > 0 && stats.nonGhost === 0)
+  })
+}
+
+/** Classify a producer -> consumer runtime dependency into a prioritized grey-box workflow edge family. */
+export function classifyRuntimeDependencyEdgeKind(
+  dep: Pick<RuntimeApiDependency, 'producer' | 'consumer' | 'resourceKey' | 'observedTransitions'>,
+): RuntimeDependencyEdgeKind {
+  const transitions = (dep.observedTransitions ?? []).join(' ').toLowerCase()
+  if (transitions.includes('hmac_sign')) return 'hmac_sign'
+  if (transitions.includes('await_async') || transitions.includes('status:202')) return 'await_async'
+  if (transitions.includes('lifecycle_chain') || transitions.includes('create->rebind') || transitions.includes('rebind->finalize')) return 'lifecycle_chain'
+  if (transitions.includes('signed_url')) return 'signed_url'
+  const prod = parseMethodAndPath(dep.producer), cons = parseMethodAndPath(dep.consumer)
+  const key = dep.resourceKey.trim()
+  const keyKind = classifyStructuralFieldEdgeKind(key, key.includes('-') ? 'header' : 'json')
+    ?? classifyStructuralFieldEdgeKind(key, 'json')
+  if (keyKind === 'hmac_sign' || ((WEBHOOK_ROUTE_RE.test(prod.path) || WEBHOOK_ROUTE_RE.test(cons.path)) && /(?:secret|sign|hmac|key|token|signature)/i.test(`${key} ${prod.path} ${cons.path}`))) return 'hmac_sign'
+  if (keyKind === 'await_async' || key === 'status:202' || (ASYNC_ROUTE_RE.test(cons.path) && /(?:job|task|export|status|poll|async|batch|operation|location)/i.test(`${key} ${prod.path} ${cons.path}`))) return 'await_async'
+  if (keyKind === 'signed_url' || (STORAGE_ROUTE_RE.test(cons.path) && /(?:url|token|link|download|signed|presign|artifact)/i.test(`${key} ${prod.path}`))) return 'signed_url'
+  const isMutProd = MUTATING_METHOD_RE.test(prod.method), isMutCons = MUTATING_METHOD_RE.test(cons.method)
+  if ((isMutProd && (cons.method === 'PATCH' || cons.method === 'PUT' || REBIND_STAGE_RE.test(cons.path) || FINALIZE_STAGE_RE.test(cons.path)))
+    || (isMutCons && (REBIND_STAGE_RE.test(prod.path) || FINALIZE_STAGE_RE.test(cons.path)))
+    || ((isMutProd || isMutCons) && detectLifecyclePatterns(`${prod.path} ${cons.path} ${key}`).length > 0)) {
+    return 'lifecycle_chain'
+  }
+  return 'generic'
+}
+
+const isCreateRebindFinalizeChain = (p: { pm: string; pp: string; cm: string; cp: string }, n: { cm: string; cp: string }): boolean =>
+  p.pm === 'POST'
+  && (p.cm === 'PATCH' || p.cm === 'PUT' || REBIND_STAGE_RE.test(p.cp))
+  && (MUTATING_METHOD_RE.test(n.cm) || FINALIZE_STAGE_RE.test(n.cp))
+
+/** Resolve OpenAPI schema `$ref`s (local `#/components/schemas/...` / `#/definitions/...`) safely with cycle protection. */
+function collectOpenApiSchemaProperties(
+  doc: Record<string, unknown>,
+  schemaNode: unknown,
+  out: Set<string>,
+  seenRefs: Set<string> = new Set(),
+  depth = 0,
+): void {
+  if (depth > 6 || out.size >= 40 || !schemaNode || typeof schemaNode !== 'object' || Array.isArray(schemaNode)) return
+  const node = schemaNode as Record<string, unknown>
+  if (typeof node.$ref === 'string' && node.$ref.startsWith('#/')) {
+    if (seenRefs.has(node.$ref)) return
+    seenRefs.add(node.$ref)
+    let cur: unknown = doc
+    for (const rawSeg of node.$ref.slice(2).split('/')) {
+      const seg = rawSeg.replace(/~1/g, '/').replace(/~0/g, '~')
+      if (!cur || typeof cur !== 'object' || Array.isArray(cur)) { cur = undefined; break }
+      cur = (cur as Record<string, unknown>)[seg]
+    }
+    if (cur) collectOpenApiSchemaProperties(doc, cur, out, seenRefs, depth + 1)
+  }
+  if (node.properties && typeof node.properties === 'object' && !Array.isArray(node.properties)) {
+    for (const [k, v] of Object.entries(node.properties as Record<string, unknown>)) {
+      if (out.size >= 40) break
+      if (k && k !== '__proto__' && k !== 'constructor') out.add(k)
+      if (v && typeof v === 'object' && depth < 3) collectOpenApiSchemaProperties(doc, v, out, seenRefs, depth + 1)
+    }
+  }
+  for (const kw of ['allOf', 'oneOf', 'anyOf'] as const) {
+    if (Array.isArray(node[kw])) for (const sub of node[kw] as unknown[]) collectOpenApiSchemaProperties(doc, sub, out, seenRefs, depth + 1)
+  }
+  if (node.items && typeof node.items === 'object') collectOpenApiSchemaProperties(doc, node.items, out, seenRefs, depth + 1)
+}
+
 /** Populate `InvariantHypothesis` & `CapabilitySeedRecord` in grey/black-box mode from diffs, OpenAPI/GraphQL, SPA routes & API dependencies. */
 export function inferRuntimeInvariantHypotheses(input: RuntimeDiscoveryInput): RuntimeInvariantParityResult {
   const hypotheses: InvariantHypothesis[] = []
@@ -308,8 +429,8 @@ export function inferRuntimeInvariantHypotheses(input: RuntimeDiscoveryInput): R
     }))
   }
 
-  // 4. Producer -> Consumer API dependency edges (same-origin, transitive chains & cross-origin trust boundaries).
-  type ParsedDep = { raw: RuntimeApiDependency; pm: string; pp: string; cm: string; cp: string; entity: string; xOrigin: boolean; mut: boolean; life: LifecyclePatternKind[] }
+  // 4. Producer -> Consumer API dependency edges (same-origin, transitive chains, typed workflows & cross-origin trust boundaries).
+  type ParsedDep = { raw: RuntimeApiDependency; pm: string; pp: string; cm: string; cp: string; entity: string; xOrigin: boolean; mut: boolean; life: LifecyclePatternKind[]; edgeKind: RuntimeDependencyEdgeKind }
   const parsedDeps: ParsedDep[] = [], depsByProd = new Map<string, ParsedDep[]>()
   for (const dep of apiDependencies) {
     const prod = parseMethodAndPath(dep.producer), cons = parseMethodAndPath(dep.consumer)
@@ -319,38 +440,52 @@ export function inferRuntimeInvariantHypotheses(input: RuntimeDiscoveryInput): R
       raw: dep, pm: prod.method, pp, cm: cons.method, cp, entity: inferEntityName(cp, dep.resourceKey, `${pp} ${(dep.observedTransitions ?? []).join(' ')}`),
       xOrigin: Boolean(dep.producerOrigin && dep.consumerOrigin && dep.producerOrigin !== dep.consumerOrigin),
       mut: MUTATING_METHOD_RE.test(cons.method), life: detectLifecyclePatterns(`${pp} ${cp} ${dep.resourceKey} ${(dep.observedTransitions ?? []).join(' ')}`),
+      edgeKind: classifyRuntimeDependencyEdgeKind(dep),
     }
     parsedDeps.push(item); pushMap(depsByProd, pp, item)
+  }
+  const edgeMeta = (ek: RuntimeDependencyEdgeKind, fallbackSurface: CapabilitySurface, pRef: string, cRef: string, rk: string, nRef?: string) => {
+    if (ek === 'hmac_sign') return { cap: 'signing_material' as CapabilityKind, surf: 'webhook' as CapabilitySurface, boost: 0.16, tags: ['edge_kind:hmac_sign', 'workflow:webhook_signing'], hint: `Seal signing material "${rk}" from ${pRef} via ctx.seal_capability, compute callback signature with ctx.hmac_sign, and verify authorization on ${nRef ?? cRef}.` }
+    if (ek === 'await_async') return { cap: 'state_handle' as CapabilityKind, surf: 'async_job' as CapabilitySurface, boost: 0.15, tags: ['edge_kind:await_async', 'workflow:async_poll'], hint: `Trigger ${pRef} (202/async), seal "${rk}" via ctx.seal_capability, poll via ctx.await_async against ${nRef ?? cRef}, and verify cross-tenant isolation.` }
+    if (ek === 'lifecycle_chain') return { cap: 'state_handle' as CapabilityKind, surf: fallbackSurface, boost: 0.12, tags: ['edge_kind:lifecycle_chain', ...(nRef ? ['workflow:create_rebind_finalize'] : [])], hint: `Sequence create -> rebind -> finalize (${pRef} -> ${cRef}${nRef ? ` -> ${nRef}` : ''}) with denied control and ctx.prove_composite to test ownership/state invariants.` }
+    if (ek === 'signed_url') return { cap: 'signed_artifact_or_url' as CapabilityKind, surf: fallbackSurface === 'http' ? 'storage' as CapabilitySurface : fallbackSurface, boost: 0.10, tags: ['edge_kind:signed_url'], hint: `Harvest signed handle "${rk}" from ${pRef}, seal via ctx.seal_capability, and replay against ${nRef ?? cRef} as a distinct tenant/persona.` }
+    return { cap: 'opaque_object_ref' as CapabilityKind, surf: fallbackSurface, boost: 0, tags: [] as string[], hint: `Harvest "${rk}" from ${pRef}, establish a denied control, then replay against ${nRef ?? cRef} as a distinct persona.` }
   }
   for (const d of parsedDeps) {
     const pRef = `${d.pm} ${d.pp}`, cRef = `${d.cm} ${d.cp}`, targetOrigin = d.raw.consumerOrigin ?? d.raw.producerOrigin
     const next = (depsByProd.get(d.cp) ?? []).find(n => n.cp !== d.pp && n.cp !== d.cp)
     if (next) {
       const nRef = `${next.cm} ${next.cp}`, xChain = d.xOrigin || next.xOrigin || Boolean(d.raw.producerOrigin && next.raw.consumerOrigin && d.raw.producerOrigin !== next.raw.consumerOrigin)
+      const chainKind: RuntimeDependencyEdgeKind = d.edgeKind === 'hmac_sign' || next.edgeKind === 'hmac_sign' ? 'hmac_sign'
+        : d.edgeKind === 'await_async' || next.edgeKind === 'await_async' ? 'await_async'
+          : isCreateRebindFinalizeChain(d, next) || d.edgeKind === 'lifecycle_chain' || next.edgeKind === 'lifecycle_chain' ? 'lifecycle_chain'
+            : d.edgeKind !== 'generic' ? d.edgeKind : next.edgeKind
+      const m = edgeMeta(chainKind, classifySurface(next.cp, next.cm), pRef, cRef, d.raw.resourceKey, nRef)
       hypotheses.push(makeHypothesis({
-        id: stableId('hyp_dep_chain', `${pRef}|${cRef}|${nRef}|${d.raw.resourceKey}`), kind: xChain ? 'trust_boundary_mismatch' : 'lifecycle_invariant', capabilityKind: 'state_handle',
-        mode: input.mode, entity: next.entity || d.entity, surface: classifySurface(next.cp, next.cm), ...(next.raw.consumerOrigin ?? targetOrigin ? { serviceOrigin: next.raw.consumerOrigin ?? targetOrigin } : {}),
-        targetRoute: nRef, score: 0.72 + (xChain ? 0.12 : 0) + (next.mut ? 0.06 : 0),
-        summary: `Runtime API dependency chain propagates "${d.raw.resourceKey}" across 3 stages: ${pRef} -> ${cRef} -> ${nRef}.`,
-        preconditions: [`api_dependency:${d.raw.resourceKey}`, 'multi_hop_dependency', ...(xChain && d.raw.producerOrigin && (next.raw.consumerOrigin ?? d.raw.consumerOrigin) ? [`cross_origin_edge:${d.raw.producerOrigin}->${next.raw.consumerOrigin ?? d.raw.consumerOrigin}`] : [])],
-        verificationHint: `Obtain "${d.raw.resourceKey}" from ${pRef}, pivot through ${cRef}, and verify authorization/state invariants on ${nRef}.`,
-        evidence: [`api_dep_producer=${pRef}`, `api_dep_consumer=${cRef}`, `api_dep_next=${nRef}`, `resource_key=${d.raw.resourceKey}`],
+        id: stableId('hyp_dep_chain', `${pRef}|${cRef}|${nRef}|${d.raw.resourceKey}`), kind: xChain ? 'trust_boundary_mismatch' : 'lifecycle_invariant', capabilityKind: chainKind === 'generic' ? 'state_handle' : m.cap,
+        mode: input.mode, entity: next.entity || d.entity, surface: m.surf, ...(next.raw.consumerOrigin ?? targetOrigin ? { serviceOrigin: next.raw.consumerOrigin ?? targetOrigin } : {}),
+        targetRoute: nRef, score: 0.72 + (xChain ? 0.12 : 0) + (next.mut ? 0.06 : 0) + m.boost,
+        summary: `Runtime API dependency chain${chainKind !== 'generic' ? ` [${chainKind}]` : ''} propagates "${d.raw.resourceKey}" across 3 stages: ${pRef} -> ${cRef} -> ${nRef}.`,
+        preconditions: [`api_dependency:${d.raw.resourceKey}`, 'multi_hop_dependency', ...m.tags, ...(xChain && d.raw.producerOrigin && (next.raw.consumerOrigin ?? d.raw.consumerOrigin) ? [`cross_origin_edge:${d.raw.producerOrigin}->${next.raw.consumerOrigin ?? d.raw.consumerOrigin}`] : [])],
+        verificationHint: chainKind !== 'generic' ? m.hint : `Obtain "${d.raw.resourceKey}" from ${pRef}, pivot through ${cRef}, and verify authorization/state invariants on ${nRef}.`,
+        evidence: [`api_dep_producer=${pRef}`, `api_dep_consumer=${cRef}`, `api_dep_next=${nRef}`, `resource_key=${d.raw.resourceKey}`, ...(chainKind !== 'generic' ? [`edge_kind=${chainKind}`] : [])],
       }))
       continue
     }
     const isPriv = PRIVILEGED_ROUTE_RE.test(d.cp)
-    if (!d.xOrigin && !d.mut && !d.life.length && !isPriv && d.raw.testedBola) continue
+    if (!d.xOrigin && !d.mut && !d.life.length && !isPriv && d.edgeKind === 'generic' && d.raw.testedBola) continue
+    const m = edgeMeta(d.edgeKind, classifySurface(d.cp, d.cm), pRef, cRef, d.raw.resourceKey)
     hypotheses.push(makeHypothesis({
       id: stableId('hyp_dep', `${pRef}|${cRef}|${d.raw.resourceKey}|${d.raw.consumerOrigin ?? ''}`),
-      kind: d.xOrigin ? 'trust_boundary_mismatch' : d.life.length ? 'lifecycle_invariant' : 'runtime_surface_asymmetry',
-      capabilityKind: d.life.length ? 'state_handle' : 'opaque_object_ref', mode: input.mode, entity: d.entity, surface: classifySurface(d.cp, d.cm),
+      kind: d.xOrigin ? 'trust_boundary_mismatch' : (d.life.length || d.edgeKind === 'lifecycle_chain' || d.edgeKind === 'await_async') ? 'lifecycle_invariant' : d.edgeKind === 'hmac_sign' ? 'trust_boundary_mismatch' : 'runtime_surface_asymmetry',
+      capabilityKind: d.edgeKind !== 'generic' ? m.cap : d.life.length ? 'state_handle' : 'opaque_object_ref', mode: input.mode, entity: d.entity, surface: m.surf,
       ...(targetOrigin ? { serviceOrigin: targetOrigin } : {}), targetRoute: cRef,
-      score: (d.xOrigin ? 0.76 : d.life.length ? 0.64 + Math.min(0.14, d.life.length * 0.06) : 0.60) + (d.mut ? 0.08 : 0) + (isPriv ? 0.06 : 0),
-      summary: d.xOrigin ? `Cross-origin API dependency flows "${d.raw.resourceKey}" from ${pRef} (${d.raw.producerOrigin}) -> ${cRef} (${d.raw.consumerOrigin}).`
-        : `Producer ${pRef} -> Consumer ${cRef} propagates "${d.raw.resourceKey}"${d.life.length ? ` [${d.life.join(', ')}]` : ''}; verify ownership enforcement.`,
-      preconditions: [`api_dependency:${d.raw.resourceKey}`, ...(d.xOrigin ? [`cross_origin_edge:${d.raw.producerOrigin}->${d.raw.consumerOrigin}`] : []), ...(d.raw.personaHandle ? [`persona:${d.raw.personaHandle}`] : [])],
-      verificationHint: `Harvest "${d.raw.resourceKey}" from ${pRef}, establish a denied control, then replay against ${cRef} as a distinct persona.`,
-      evidence: [`api_dep_producer=${pRef}`, `api_dep_consumer=${cRef}`, `resource_key=${d.raw.resourceKey}`, ...(d.xOrigin ? [`cross_origin=${d.raw.producerOrigin} -> ${d.raw.consumerOrigin}`] : [])],
+      score: (d.xOrigin ? 0.76 : d.life.length ? 0.64 + Math.min(0.14, d.life.length * 0.06) : 0.60) + (d.mut ? 0.08 : 0) + (isPriv ? 0.06 : 0) + m.boost,
+      summary: d.xOrigin ? `Cross-origin API dependency${d.edgeKind !== 'generic' ? ` [${d.edgeKind}]` : ''} flows "${d.raw.resourceKey}" from ${pRef} (${d.raw.producerOrigin}) -> ${cRef} (${d.raw.consumerOrigin}).`
+        : `Producer ${pRef} -> Consumer ${cRef}${d.edgeKind !== 'generic' ? ` [${d.edgeKind}]` : ''} propagates "${d.raw.resourceKey}"${d.life.length ? ` [${d.life.join(', ')}]` : ''}; verify ownership/workflow invariants.`,
+      preconditions: [`api_dependency:${d.raw.resourceKey}`, ...m.tags, ...(d.xOrigin ? [`cross_origin_edge:${d.raw.producerOrigin}->${d.raw.consumerOrigin}`] : []), ...(d.raw.personaHandle ? [`persona:${d.raw.personaHandle}`] : [])],
+      verificationHint: m.hint,
+      evidence: [`api_dep_producer=${pRef}`, `api_dep_consumer=${cRef}`, `resource_key=${d.raw.resourceKey}`, ...(d.edgeKind !== 'generic' ? [`edge_kind=${d.edgeKind}`] : []), ...(d.xOrigin ? [`cross_origin=${d.raw.producerOrigin} -> ${d.raw.consumerOrigin}`] : [])],
     }))
   }
 
@@ -408,43 +543,75 @@ export function extractRuntimeCatalogFromFacts(facts: ReadonlyArray<{ origin?: s
 }
 
 export interface BuildRuntimeDiscoveryInputParams {
-  approvedOrigins?: ReadonlySet<string>; endpoints?: ReadonlyArray<{ origin: string; method: string; pathTemplate: string; authRequirement?: string | null }>
+  approvedOrigins?: ReadonlySet<string>; endpoints?: ReadonlyArray<{ origin: string; method: string; pathTemplate: string; authRequirement?: string | null; source?: string | null }>
   specs?: ReadonlyArray<{ kind: string; origin?: string | null; content: string }>; facts?: ReadonlyArray<{ origin?: string; data?: Record<string, unknown> | null; tainted?: boolean }>
   brokerExchanges?: ReadonlyArray<{ origin: string; method: string; pathAndQuery: string; status: number; personaHandle?: string | null; respHeaders?: Record<string, string> | null; respHeadersJson?: string | null }>
   apiDependencies?: readonly RuntimeApiDependency[]; spaRoutes?: readonly RuntimeSpaRoute[]; graphqlCatalog?: RuntimeGraphqlCatalog; graphqlCatalogs?: readonly RuntimeGraphqlCatalog[]; maxHypotheses?: number
 }
 
-/** Pure builder combining endpoints, OpenAPI specs (inheriting doc `security`), Phase-0 catalog facts, multi-persona exchanges & `apiDependencies`. */
+/** Pure builder combining endpoints (filtering 404/405-only `surface_probe` ghosts), OpenAPI specs (with `$ref` response schemas), Phase-0 catalogs, live response headers & synthesized `produces -> consumes` edges. */
 export function buildRuntimeDiscoveryInput(params: BuildRuntimeDiscoveryInputParams): Omit<RuntimeDiscoveryInput, 'mode'> {
   const approved = params.approvedOrigins, ok = (o?: string | null): boolean => !approved?.size || !o || approved.has(o)
   const extracted = extractRuntimeCatalogFromFacts(params.facts ?? [], approved), openApiByKey = new Map<string, RuntimeOpenApiOperation>()
+  const evidencedRoutes = new Set<string>()
+  const markEvidenced = (o: string | undefined | null, p: string, m?: string) => {
+    const np = normalizeRouteMatchPath(p); evidencedRoutes.add(`${o ?? ''}|${np}`); if (m) evidencedRoutes.add(`${o ?? ''}|${m.toUpperCase()}|${np}`)
+  }
+  for (const op of extracted.openApiOperations) markEvidenced(op.serviceOrigin, op.path, op.method)
+  for (const r of [...extracted.spaRoutes, ...(params.spaRoutes ?? [])]) for (const c of r.apiCalls ?? []) markEvidenced(c.serviceOrigin ?? r.serviceOrigin, c.path, c.method)
+  for (const g of [...extracted.graphqlCatalogs, ...(params.graphqlCatalog ? [params.graphqlCatalog] : []), ...(params.graphqlCatalogs ?? [])]) markEvidenced(g.serviceOrigin, g.endpoint ?? '/graphql')
+  const parsedSpecs: Array<{ origin?: string; doc: Record<string, unknown> }> = []
+  for (const spec of (params.specs ?? []).slice(0, 8)) {
+    if (spec.kind !== 'openapi' || !ok(spec.origin)) continue
+    try {
+      const doc = JSON.parse(spec.content) as Record<string, unknown>
+      if (doc && typeof doc === 'object' && !Array.isArray(doc)) {
+        parsedSpecs.push({ ...(spec.origin ? { origin: spec.origin } : {}), doc })
+        for (const pk of Object.keys((doc.paths as Record<string, unknown>) ?? {})) markEvidenced(spec.origin, pk)
+      }
+    } catch { /* non-JSON specs handled by Phase-0 parseOpenApiDoc */ }
+  }
   const upsertOp = (op: RuntimeOpenApiOperation): void => {
     if (!ok(op.serviceOrigin)) return
     const k = `${op.serviceOrigin ?? ''}|${op.method.toUpperCase()}|${op.path}`, prev = openApiByKey.get(k)
     openApiByKey.set(k, prev ? { ...prev, ...op, method: op.method.toUpperCase(), operationId: op.operationId ?? prev.operationId, security: op.security !== undefined ? op.security : prev.security, authRequirement: op.authRequirement ?? prev.authRequirement, parameters: op.parameters?.length ? op.parameters : prev.parameters, requestBodyKeys: op.requestBodyKeys?.length ? op.requestBodyKeys : prev.requestBodyKeys, tags: op.tags?.length ? op.tags : prev.tags } : { ...op, method: op.method.toUpperCase() })
   }
-  for (const ep of params.endpoints ?? []) {
-    if (!ok(ep.origin)) continue
+  const liveEndpoints = filterGhostSurfaceProbeEndpoints((params.endpoints ?? []).filter(ep => ok(ep.origin)), params.brokerExchanges ?? [], evidencedRoutes)
+  for (const ep of liveEndpoints) {
     const ar = ep.authRequirement?.trim() || null
     upsertOp({ method: ep.method, path: ep.pathTemplate, serviceOrigin: ep.origin, ...(ar ? { authRequirement: ar, security: MISSING_AUTH_REQ_RE.test(ar) ? [] : [{ [ar]: [] }] } : {}) })
   }
   for (const op of extracted.openApiOperations) upsertOp(op)
-  for (const spec of (params.specs ?? []).slice(0, 8)) {
-    if (spec.kind !== 'openapi' || !ok(spec.origin)) continue
-    try {
-      const parsed = JSON.parse(spec.content) as { security?: Array<Record<string, string[]>>; paths?: Record<string, Record<string, { operationId?: string; security?: Array<Record<string, string[]>>; tags?: string[]; parameters?: Array<{ name?: string }>; requestBody?: { content?: Record<string, { schema?: { properties?: Record<string, unknown> } }> } }>> }
-      const docSec = Array.isArray(parsed.security) ? parsed.security : undefined
-      for (const [pathKey, methods] of Object.entries(parsed.paths ?? {})) {
-        if (!methods || typeof methods !== 'object') continue
-        for (const [method, op] of Object.entries(methods)) {
-          if (!/^(?:get|post|put|patch|delete|options|head)$/i.test(method)) continue
-          const sec = Array.isArray(op?.security) ? op.security : docSec
-          const requestBodyKeys = [...new Set(Object.values(op?.requestBody?.content ?? {}).flatMap(m => Object.keys(m?.schema?.properties ?? {})))]
-          const parameters = (op?.parameters ?? []).map(p => p?.name).filter((n): n is string => typeof n === 'string' && n.length > 0)
-          upsertOp({ method: method.toUpperCase(), path: pathKey, ...(op?.operationId ? { operationId: op.operationId } : {}), ...(sec !== undefined ? { security: sec } : {}), ...(parameters.length ? { parameters } : {}), ...(requestBodyKeys.length ? { requestBodyKeys } : {}), ...(Array.isArray(op?.tags) ? { tags: op.tags } : {}), ...(spec.origin ? { serviceOrigin: spec.origin } : {}) })
+  const producedByRoute = new Map<string, { origin?: string; method: string; path: string; fields: Map<string, ResponseSignalEdgeKind> }>()
+  const noteProduced = (origin: string | undefined, method: string, path: string, field: string, kind: ResponseSignalEdgeKind) => {
+    const rk = `${origin ?? ''}|${method.toUpperCase()}|${normalizeDepPath(path)}`
+    let rec = producedByRoute.get(rk)
+    if (!rec) { rec = { ...(origin ? { origin } : {}), method: method.toUpperCase(), path: normalizeDepPath(path), fields: new Map() }; producedByRoute.set(rk, rec) }
+    if (rec.fields.size < 24 && !rec.fields.has(field)) rec.fields.set(field, kind)
+  }
+  for (const { origin, doc } of parsedSpecs) {
+    const docSec = Array.isArray(doc.security) ? doc.security as Array<Record<string, string[]>> : undefined
+    for (const [pathKey, methods] of Object.entries((doc.paths as Record<string, Record<string, Record<string, unknown>>>) ?? {})) {
+      if (!methods || typeof methods !== 'object') continue
+      for (const [method, op] of Object.entries(methods)) {
+        if (!/^(?:get|post|put|patch|delete|options|head)$/i.test(method) || !op || typeof op !== 'object') continue
+        const sec = Array.isArray(op.security) ? op.security as Array<Record<string, string[]>> : docSec
+        const reqProps = new Set<string>()
+        for (const m of Object.values(((op.requestBody as { content?: Record<string, { schema?: unknown }> })?.content) ?? {})) collectOpenApiSchemaProperties(doc, m?.schema, reqProps)
+        const parameters = (Array.isArray(op.parameters) ? op.parameters : []).map(p => (p as { name?: string })?.name).filter((n): n is string => typeof n === 'string' && n.length > 0)
+        upsertOp({ method: method.toUpperCase(), path: pathKey, ...(typeof op.operationId === 'string' ? { operationId: op.operationId } : {}), ...(sec !== undefined ? { security: sec } : {}), ...(parameters.length ? { parameters } : {}), ...(reqProps.size ? { requestBodyKeys: [...reqProps] } : {}), ...(Array.isArray(op.tags) ? { tags: op.tags as string[] } : {}), ...(origin ? { serviceOrigin: origin } : {}) })
+        for (const [statusKey, rawResp] of Object.entries((op.responses as Record<string, Record<string, unknown>>) ?? {})) {
+          if (!/^(?:2\d\d|default)$/i.test(statusKey) || !rawResp || typeof rawResp !== 'object') continue
+          const stNum = /^\d+$/.test(statusKey) ? Number(statusKey) : 200
+          if (stNum === 202) noteProduced(origin, method, pathKey, 'status:202', 'await_async')
+          const respProps = new Set<string>()
+          if (rawResp.schema) collectOpenApiSchemaProperties(doc, rawResp.schema, respProps)
+          for (const m of Object.values(((rawResp.content as Record<string, { schema?: unknown }>) ?? {}))) collectOpenApiSchemaProperties(doc, m?.schema, respProps)
+          for (const f of respProps) { const k = classifyStructuralFieldEdgeKind(f, 'json'); if (k) noteProduced(origin, method, pathKey, f, stNum === 202 && k === 'lifecycle_state' ? 'await_async' : k) }
+          for (const h of Object.keys((rawResp.headers as Record<string, unknown>) ?? {})) { const k = classifyStructuralFieldEdgeKind(h, 'header', { status: stNum }); if (k) noteProduced(origin, method, pathKey, h.toLowerCase(), k) }
         }
       }
-    } catch { /* non-JSON specs handled by Phase-0 parseOpenApiDoc */ }
+    }
   }
   const personaObservations: PersonaSurfaceObservation[] = []
   for (const row of params.brokerExchanges ?? []) {
@@ -452,12 +619,50 @@ export function buildRuntimeDiscoveryInput(params: BuildRuntimeDiscoveryInputPar
     const pathOnly = row.pathAndQuery.split(/[?#]/, 1)[0] || '/'
     let responseHeaders = row.respHeaders ?? undefined
     if (!responseHeaders && row.respHeadersJson) { try { responseHeaders = JSON.parse(row.respHeadersJson) as Record<string, string> } catch { /* ignore */ } }
-    personaObservations.push({ persona: row.personaHandle?.trim() || 'anonymous', surface: classifySurface(pathOnly, row.method), serviceOrigin: row.origin, method: row.method.toUpperCase(), path: pathOnly, status: row.status, ...(responseHeaders ? { responseHeaders } : {}), isBatch: /\/(?:batch|bulk|multi)(?:\/|$)/i.test(pathOnly) })
+    const headerSignals: string[] = []
+    if (row.status >= 200 && row.status < 300) {
+      if (row.status === 202) { noteProduced(row.origin, row.method, pathOnly, 'status:202', 'await_async'); headerSignals.push('status:202') }
+      for (const [hk, hv] of Object.entries(responseHeaders ?? {})) {
+        const lower = hk.trim().toLowerCase()
+        const k = classifyStructuralFieldEdgeKind(lower, 'header', { status: row.status, headerValueHint: typeof hv === 'string' ? hv : undefined })
+        if (k) { noteProduced(row.origin, row.method, pathOnly, lower, k); headerSignals.push(lower) }
+      }
+    }
+    personaObservations.push({ persona: row.personaHandle?.trim() || 'anonymous', surface: classifySurface(pathOnly, row.method), serviceOrigin: row.origin, method: row.method.toUpperCase(), path: pathOnly, status: row.status, ...(responseHeaders ? { responseHeaders } : {}), ...(headerSignals.length ? { bodyKeys: headerSignals } : {}), isBatch: /\/(?:batch|bulk|multi)(?:\/|$)/i.test(pathOnly) })
+  }
+  // Synthesize dynamic cross-route `produces -> consumes` edges from harvested OpenAPI responses & live headers.
+  const allOps = [...openApiByKey.values()], synthesizedDeps: RuntimeApiDependency[] = [], seenSynth = new Set<string>()
+  const consumerByTok = new Map<string, RuntimeOpenApiOperation[]>(), asyncOps: RuntimeOpenApiOperation[] = [], webhookOps: RuntimeOpenApiOperation[] = [], storageOps: RuntimeOpenApiOperation[] = []
+  for (const op of allOps) {
+    const s = classifySurface(op.path, op.method, op.operationId ?? '')
+    if (s === 'async_job' || ASYNC_ROUTE_RE.test(op.path)) asyncOps.push(op)
+    if (s === 'webhook' || WEBHOOK_ROUTE_RE.test(op.path)) webhookOps.push(op)
+    if (s === 'storage' || STORAGE_ROUTE_RE.test(op.path)) storageOps.push(op)
+    const pNames = [...(op.parameters ?? []), ...(op.requestBodyKeys ?? []), ...[...op.path.matchAll(/(?::([a-zA-Z0-9_-]+)|\{([a-zA-Z0-9_-]+)\})/g)].map(m => m[1] ?? m[2] ?? '')]
+    for (const pn of pNames) { const t = canonicalParamToken(pn); if (t.length >= 3 && t !== 'id') pushMap(consumerByTok, t, op) }
+  }
+  const addSynthDep = (pOrigin: string | undefined, pRef: string, cOp: RuntimeOpenApiOperation, rk: string, kind: string) => {
+    if (synthesizedDeps.length >= 48) return
+    const cRef = `${cOp.method.toUpperCase()} ${normalizeDepPath(cOp.path)}`
+    if (pRef === cRef && (pOrigin ?? '') === (cOp.serviceOrigin ?? '')) return
+    const dk = `${pOrigin ?? ''}|${pRef}|${cOp.serviceOrigin ?? ''}|${cRef}|${rk}`
+    if (seenSynth.has(dk)) return
+    seenSynth.add(dk)
+    synthesizedDeps.push({ producer: pRef, consumer: cRef, resourceKey: rk, ...(pOrigin ? { producerOrigin: pOrigin } : {}), ...(cOp.serviceOrigin ? { consumerOrigin: cOp.serviceOrigin } : {}), observedTransitions: [`edge_kind:${kind}`] })
+  }
+  for (const prod of producedByRoute.values()) {
+    const pRef = `${prod.method} ${prod.path}`
+    for (const [field, kind] of prod.fields) {
+      for (const c of consumerByTok.get(canonicalParamToken(field)) ?? []) addSynthDep(prod.origin, pRef, c, field, kind)
+      if (kind === 'await_async') for (const c of asyncOps.slice(0, 4)) addSynthDep(prod.origin, pRef, c, field, 'await_async')
+      if (kind === 'hmac_sign') for (const c of webhookOps.slice(0, 4)) addSynthDep(prod.origin, pRef, c, field, 'hmac_sign')
+      if (kind === 'signed_url') for (const c of storageOps.slice(0, 4)) addSynthDep(prod.origin, pRef, c, field, 'signed_url')
+    }
   }
   const graphqlCatalogs = [...extracted.graphqlCatalogs, ...(params.graphqlCatalog ? [params.graphqlCatalog] : []), ...(params.graphqlCatalogs ?? [])].filter(c => ok(c.serviceOrigin))
   const spaRoutes = [...extracted.spaRoutes, ...(params.spaRoutes ?? [])].filter(r => ok(r.serviceOrigin))
-  const apiDependencies = [...extracted.apiDependencies, ...(params.apiDependencies ?? [])].filter(d => ok(d.producerOrigin) && ok(d.consumerOrigin))
-  return { personaObservations, openApiOperations: [...openApiByKey.values()], ...(graphqlCatalogs[0] ? { graphqlCatalog: graphqlCatalogs[0] } : {}), ...(graphqlCatalogs.length ? { graphqlCatalogs } : {}), ...(spaRoutes.length ? { spaRoutes } : {}), ...(apiDependencies.length ? { apiDependencies } : {}), ...(params.maxHypotheses !== undefined ? { maxHypotheses: params.maxHypotheses } : {}) }
+  const apiDependencies = [...extracted.apiDependencies, ...(params.apiDependencies ?? []), ...synthesizedDeps].filter(d => ok(d.producerOrigin) && ok(d.consumerOrigin))
+  return { personaObservations, openApiOperations: allOps, ...(graphqlCatalogs[0] ? { graphqlCatalog: graphqlCatalogs[0] } : {}), ...(graphqlCatalogs.length ? { graphqlCatalogs } : {}), ...(spaRoutes.length ? { spaRoutes } : {}), ...(apiDependencies.length ? { apiDependencies } : {}), ...(params.maxHypotheses !== undefined ? { maxHypotheses: params.maxHypotheses } : {}) }
 }
 
 /** Pre-floor & post-Phase-A-floor helper for `exec-recon-planner.ts` returning full and incremental runtime invariants. */

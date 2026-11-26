@@ -52,11 +52,17 @@ import {
 export { extractHtmlLinksAndScripts, parseJsonOrYaml, parseYamlLikeDocument }
 import {
   classifySurface,
+  type RuntimeApiDependency,
   type RuntimeGraphqlCatalog,
   type RuntimeGraphqlField,
   type RuntimeOpenApiOperation,
   type RuntimeSpaRoute,
 } from './invariant-synthesizer.ts'
+import {
+  classifyStructuralFieldEdgeKind,
+  extractResponseStructuralSignals,
+  type ResponseSignalEdgeKind,
+} from './resource-harvest.ts'
 import type { EndpointRow, Store } from './store.ts'
 import { parseGraphqlIntrospection, parseGraphqlSdl, probeSurface, runSafeTemplates, surfaceProbeTimeoutMs } from './surface-engine.ts'
 
@@ -5100,15 +5106,34 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       }
     }
 
+    // Bounded secret-free structural signals (JSON keys, workflow headers, 202 status) per route template.
+    const producerResponseSignals = new Map<string, { method: string; template: string; signals: Map<string, ResponseSignalEdgeKind> }>()
     // Calibrated protected/API path hints for safe-template path variables (`{{discovered_*_path}}`)
     // plus wire-observed redirect query harvesting across BOTH 3xx Location headers and followed
     // `ex.redirectPaths` / `ex.redirectOrigins` hops.
     const noteDiscoveryResponse = (ex: BrokerExchangeResult): void => {
       const method = ex.method.toUpperCase()
-      if (method !== 'GET' && method !== 'HEAD') return
       const bare = ex.pathAndQuery.split('?')[0] || '/'
       if (!bare.startsWith('/') || bare.startsWith('//')) return
       if (/[:{}[\]]/.test(bare) || /[\r\n\0]/.test(bare) || STATIC_ASSET_RE.test(bare)) return
+      // Secret-free structural response harvesting across all 2xx/202 responses (JSON keys + headers).
+      if (ex.status >= 200 && ex.status < 300 && producerResponseSignals.size < 120) {
+        const extractedSignals = extractResponseStructuralSignals(ex, 24)
+        if (extractedSignals.length > 0) {
+          const tmpl = normalizeDiscoveryTemplate(bare)
+          const sigKey = `${method} ${tmpl}`
+          let bucket = producerResponseSignals.get(sigKey)
+          if (!bucket) {
+            bucket = { method, template: tmpl, signals: new Map() }
+            producerResponseSignals.set(sigKey, bucket)
+          }
+          for (const sig of extractedSignals) {
+            if (bucket.signals.size >= 24) break
+            if (!bucket.signals.has(sig.field)) bucket.signals.set(sig.field, sig.edgeKind)
+          }
+        }
+      }
+      if (method !== 'GET' && method !== 'HEAD') return
       const is3xx = [301, 302, 303, 307, 308].includes(ex.status)
       const redirectPaths = Array.isArray(ex.redirectPaths) ? ex.redirectPaths : []
       const redirectOrigins = Array.isArray(ex.redirectOrigins) && ex.redirectOrigins.length > 0
@@ -6629,6 +6654,81 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
           break
         }
       }
+      // Cross-route produces -> consumes synthesis from harvested structural JSON/header/202 signals
+      // matched against consumer endpoint_params + OpenAPI schemas (even without shared /collection prefix).
+      const canonTok = (s: string): string => s.toLowerCase().replace(/^x-/, '').replace(/[^a-z0-9]/g, '')
+      const consumerByTok = new Map<string, Array<{ ep: typeof originEndpoints[number]; param: string }>>()
+      const asyncConsumers: typeof originEndpoints = [], webhookConsumers: typeof originEndpoints = [], storageConsumers: typeof originEndpoints = []
+      for (const ep of originEndpoints) {
+        const clean = ep.pathTemplate.replace(/\/+$/, '') || '/', surf = classifySurface(clean, ep.method)
+        if (surf === 'async_job' || /\/(?:status|poll|result|progress|export|job|task)(?:\/|$)/i.test(clean)) asyncConsumers.push(ep)
+        if (surf === 'webhook' || /\/(?:webhooks?|callbacks?|hooks?)(?:\/|$)/i.test(clean)) webhookConsumers.push(ep)
+        if (surf === 'storage' || /\/(?:downloads?|files?|artifacts?|signed-url)(?:\/|$)/i.test(clean)) storageConsumers.push(ep)
+        const oaOp = runtimeOpenApiMap.get(`${origin}|${ep.method.toUpperCase()}|${ep.pathTemplate}`)
+        const pNames = new Set<string>([
+          ...storage.listEndpointParams(runId, ep.id).map(p => p.name),
+          ...(oaOp?.parameters ?? []), ...(oaOp?.requestBodyKeys ?? []),
+        ])
+        for (const m of clean.matchAll(/(?::([a-zA-Z0-9_-]+)|\{([a-zA-Z0-9_-]+)\})/g)) pNames.add(m[1] ?? m[2] ?? '')
+        for (const pn of pNames) {
+          const tok = canonTok(pn)
+          if (tok.length < 3 || tok === 'id') continue
+          const list = consumerByTok.get(tok) ?? []; list.push({ ep, param: pn }); consumerByTok.set(tok, list)
+        }
+      }
+      let crossRouteEdges = 0
+      const seenCross = new Set<string>()
+      const emitCross = (prod: typeof originEndpoints[number], cons: typeof originEndpoints[number], rk: string, kind: string) => {
+        if (crossRouteEdges >= 48 || prod.id === cons.id) return
+        const k = `${prod.id}|${cons.id}|${rk}`
+        if (seenCross.has(k)) return
+        seenCross.add(k); crossRouteEdges += 1
+        storage.recordApiDependency({
+          runId, producerEndpointId: prod.id, consumerEndpointId: cons.id, resourceKey: rk,
+          sampleResourceIdHash: `sha256:${createHash('sha256').update(`${origin}:${prod.pathTemplate}:${cons.pathTemplate}:${rk}`).digest('hex').slice(0, 16)}`,
+          personaHandle: params.personas?.[0] ?? null, observedTransitions: [`edge_kind:${kind}`],
+        })
+      }
+      for (const ep of originEndpoints) {
+        const clean = ep.pathTemplate.replace(/\/+$/, '') || '/'
+        const normTmpl = normalizeDiscoveryTemplate(clean)
+        const sigMap = new Map<string, ResponseSignalEdgeKind>(
+          producerResponseSignals.get(`${ep.method.toUpperCase()} ${normTmpl}`)?.signals
+            ?? producerResponseSignals.get(`${ep.method.toUpperCase()} ${clean}`)?.signals
+            ?? [],
+        )
+        const ev = paramEvidence.get(ep.pathTemplate) ?? paramEvidence.get(normTmpl)
+        for (const f of ev?.fields ?? []) {
+          const k = classifyStructuralFieldEdgeKind(f, 'json')
+          if (k && !sigMap.has(f)) sigMap.set(f, k)
+        }
+        for (const [field, kind] of sigMap) {
+          const tok = canonTok(field)
+          for (const hit of consumerByTok.get(tok) ?? []) emitCross(ep, hit.ep, field, kind)
+          if (kind === 'await_async') for (const c of asyncConsumers.slice(0, 4)) emitCross(ep, c, field, 'await_async')
+          if (kind === 'hmac_sign') for (const c of webhookConsumers.slice(0, 4)) emitCross(ep, c, field, 'hmac_sign')
+          if (kind === 'signed_url') for (const c of storageConsumers.slice(0, 4)) emitCross(ep, c, field, 'signed_url')
+        }
+      }
+      // Synthesize create -> rebind -> finalize lifecycle chains on shared collection entities.
+      const lifeByBase = new Map<string, { creates: typeof originEndpoints; rebinds: typeof originEndpoints; finalizes: typeof originEndpoints }>()
+      for (const ep of originEndpoints) {
+        const segs = ep.pathTemplate.split('/').filter(s => s && !/^[:{]/.test(s) && !/^(?:api|v\d+)$/i.test(s))
+        const entitySeg = segs[0]?.toLowerCase()
+        if (!entitySeg) continue
+        const b = lifeByBase.get(entitySeg) ?? { creates: [], rebinds: [], finalizes: [] }
+        const m = ep.method.toUpperCase()
+        if (m === 'POST' && !/\/(?:rebind|update|approve|transfer|finalize|settle|release|export|complete|cancel)(?:\/|$)/i.test(ep.pathTemplate)) b.creates.push(ep)
+        else if (m === 'PATCH' || m === 'PUT' || /\/(?:rebind|update|assign|delegate|transfer|approve)(?:\/|$)/i.test(ep.pathTemplate)) b.rebinds.push(ep)
+        if (/\/(?:finalize|settle|release|complete|commit|publish|capture|export|dispatch|confirm|payout)(?:\/|$)/i.test(ep.pathTemplate)) b.finalizes.push(ep)
+        lifeByBase.set(entitySeg, b)
+      }
+      for (const [entitySeg, b] of lifeByBase) {
+        const cr = b.creates[0], rb = b.rebinds[0], fn = b.finalizes.find(f => f.id !== cr?.id && f.id !== rb?.id)
+        if (cr && rb) emitCross(cr, rb, `${entitySeg}Id`, 'lifecycle_chain')
+        if (rb && fn) emitCross(rb, fn, `${entitySeg}Id`, 'lifecycle_chain')
+        else if (cr && fn) emitCross(cr, fn, `${entitySeg}Id`, 'lifecycle_chain')
+      }
     } catch { /* best-effort static edge inference */ }
 
     // 2f-bis. Parameter discovery from crawl evidence. A held-out surface can randomize the search
@@ -6875,16 +6975,18 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
   noteTruncation('runtime_openapi_operations', 1000, allRuntimeOpenApiOps.length)
   const runtimeOpenApiOperations = allRuntimeOpenApiOps.slice(0, 1000)
 
-  if (runtimeSpaRoutes.length > 0 || runtimeGraphqlCatalogs.length > 0 || runtimeOpenApiOperations.length > 0) {
+  const persistedApiDeps = storage.listApiDependencies(runId)
+  if (runtimeSpaRoutes.length > 0 || runtimeGraphqlCatalogs.length > 0 || runtimeOpenApiOperations.length > 0 || persistedApiDeps.length > 0) {
     storage.event(
       runId,
       'phase0.runtime_catalog',
-      `Phase-0 runtime catalog: ${runtimeSpaRoutes.length} SPA route(s), ${runtimeGraphqlCatalogs.reduce((sum, c) => sum + c.fields.length, 0)} GraphQL field(s) across ${runtimeGraphqlCatalogs.length} catalog(s), ${runtimeOpenApiOperations.length} OpenAPI op(s).`,
+      `Phase-0 runtime catalog: ${runtimeSpaRoutes.length} SPA route(s), ${runtimeGraphqlCatalogs.reduce((sum, c) => sum + c.fields.length, 0)} GraphQL field(s) across ${runtimeGraphqlCatalogs.length} catalog(s), ${runtimeOpenApiOperations.length} OpenAPI op(s), ${persistedApiDeps.length} API dependency edge(s).`,
       {
         spaRoutes: runtimeSpaRoutes.length,
         graphqlCatalogs: runtimeGraphqlCatalogs.length,
         graphqlFields: runtimeGraphqlCatalogs.reduce((sum, c) => sum + c.fields.length, 0),
         openApiOperations: runtimeOpenApiOperations.length,
+        apiDependencies: persistedApiDeps.length,
       },
     )
     // Persist bounded summary facts so `collectRuntimeDiscoveryInput` / `extractRuntimeCatalogFromFacts`
@@ -6956,6 +7058,37 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
                 openApiOperations: ops.slice(0, 120),
               },
               sourceOrigins: [opOrigin],
+            })
+          }
+        }
+        if (persistedApiDeps.length > 0 && primaryOrigin) {
+          const epById = new Map(storage.listEndpoints(runId, { limit: 500 }).map(e => [e.id, e]))
+          const depsByOrigin = new Map<string, RuntimeApiDependency[]>()
+          for (const d of persistedApiDeps) {
+            const pEp = epById.get(d.producerEndpointId), cEp = epById.get(d.consumerEndpointId)
+            if (!pEp || !cEp) continue
+            const depOrigin = pEp.origin || primaryOrigin
+            const list = depsByOrigin.get(depOrigin) ?? []
+            if (list.length >= 60) continue
+            list.push({
+              producer: `${pEp.method.toUpperCase()} ${pEp.pathTemplate}`,
+              consumer: `${cEp.method.toUpperCase()} ${cEp.pathTemplate}`,
+              resourceKey: d.resourceKey,
+              producerOrigin: pEp.origin,
+              consumerOrigin: cEp.origin,
+              ...(d.personaHandle !== undefined ? { personaHandle: d.personaHandle } : {}),
+              ...(d.observedTransitions?.length ? { observedTransitions: d.observedTransitions } : {}),
+              testedBola: d.testedBola,
+            })
+            depsByOrigin.set(depOrigin, list)
+          }
+          for (const [depOrigin, deps] of depsByOrigin) {
+            storage.addFact(runRow, assignmentRow, {
+              kind: 'note',
+              origin: depOrigin,
+              summary: `Phase-0 runtime API dependency graph (${deps.length} produces->consumes edge(s)) on ${depOrigin}.`,
+              data: { subkind: 'runtime_api_dependencies', origin: depOrigin, apiDependencies: deps },
+              sourceOrigins: [...new Set([depOrigin, ...deps.map(x => x.consumerOrigin).filter((o): o is string => Boolean(o))])],
             })
           }
         }

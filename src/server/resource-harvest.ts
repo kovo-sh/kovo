@@ -208,3 +208,88 @@ export function extractResourceRefsFromExchange(ex: ResourceHarvestExchange): Ex
 
   return found
 }
+
+export type ResponseSignalEdgeKind = 'await_async' | 'hmac_sign' | 'lifecycle_state' | 'signed_url'
+export interface ExtractedResponseStructuralSignal {
+  field: string
+  source: 'json' | 'header' | 'status'
+  edgeKind: ResponseSignalEdgeKind
+}
+
+const SAFE_STRUCTURAL_FIELD_RE = /^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/
+const ASYNC_JSON_KEY_RE = /^(?:(?:job|task|export|report|batch|run|workflow|operation|async|poll|queue|delivery|build|import|sync)[_-]?(?:id|uid|uuid|key|handle|token|ref|url|uri|href|path|endpoint|status|state)|(?:status|poll|result|progress|check)[_-]?(?:url|uri|href|path|endpoint))$/i
+const HMAC_JSON_KEY_RE = /^(?:(?:webhook|signing|hmac|callback|hook|client|shared|integration)[_-]?(?:secret|key|signing[_-]?key|token|signature|hash|digest)|signing[_-]?(?:secret|key|material)|secret[_-]?key|hmac[_-]?(?:secret|key|signature)|signature[_-]?header|x[_-]?signature)$/i
+const SIGNED_URL_JSON_KEY_RE = /^(?:(?:signed|presigned|pre[_-]?signed|download|upload|artifact|file|preview|share|temporary|temp|capability|access|storage)[_-]?(?:url|uri|href|link|path|token)|download[_-]?token|capability[_-]?token|share[_-]?token)$/i
+const LIFECYCLE_JSON_KEY_RE = /^(?:status|state|phase|stage|lifecycle|workflow[_-]?state|approval[_-]?status|settlement[_-]?status|created[_-]?by|creator[_-]?id|owner[_-]?id|approver[_-]?id|approved[_-]?by|assignee[_-]?id|tenant[_-]?id|org[_-]?id|workspace[_-]?id|account[_-]?id|balance|amount|credit|debit|escrow|quota|version|etag|revision)$/i
+const ASYNC_HEADER_RE = /^(?:x-(?:job|task|export|operation|async|queue|batch|run)-id|content-location|retry-after)$/i
+const HMAC_HEADER_RE = /^(?:x-(?:hub-)?signature(?:-\d+)?|x-(?:webhook|hmac|request)-signature|x-signing-key|x-signature-timestamp|webhook-signature|signature)$/i
+const SIGNED_URL_HEADER_RE = /^(?:x-(?:request|capability)-token|x-(?:download|signed|artifact|storage)-?(?:url|token|link))$/i
+const LIFECYCLE_HEADER_RE = /^(?:etag|x-(?:resource|entity)-id|x-state|x-version)$/i
+const SIGNED_URL_QUERY_HINT_RE = /[?&](?:sig|signature|token|expires|x-amz-|access_token)=/i
+
+/** Secret-free field/header classifier into typed workflow edge kinds (preserves `RESOURCE_SECRET_VALUE_RE`). */
+export function classifyStructuralFieldEdgeKind(
+  fieldName: string,
+  source: 'json' | 'header' = 'json',
+  opts?: { status?: number; headerValueHint?: string },
+): ResponseSignalEdgeKind | null {
+  const clean = fieldName.trim()
+  if (!clean || !SAFE_STRUCTURAL_FIELD_RE.test(clean) || RESOURCE_SECRET_VALUE_RE.test(clean)) return null
+  if (source === 'header') {
+    const lower = clean.toLowerCase()
+    if (HMAC_HEADER_RE.test(lower)) return 'hmac_sign'
+    if (ASYNC_HEADER_RE.test(lower)) return 'await_async'
+    if (SIGNED_URL_HEADER_RE.test(lower)) return 'signed_url'
+    if (lower === 'location') {
+      if (opts?.status === 202) return 'await_async'
+      if (opts?.headerValueHint && SIGNED_URL_QUERY_HINT_RE.test(opts.headerValueHint)) return 'signed_url'
+      return opts?.status === 201 ? 'lifecycle_state' : null
+    }
+    return LIFECYCLE_HEADER_RE.test(lower) ? 'lifecycle_state' : null
+  }
+  if (HMAC_JSON_KEY_RE.test(clean)) return 'hmac_sign'
+  if (ASYNC_JSON_KEY_RE.test(clean)) return 'await_async'
+  if (SIGNED_URL_JSON_KEY_RE.test(clean)) return 'signed_url'
+  return LIFECYCLE_JSON_KEY_RE.test(clean) || RESOURCE_ID_KEY_RE.test(clean) ? 'lifecycle_state' : null
+}
+
+/** Secret-free structural signal extractor returning ONLY bounded field/header names & edge-kind tags. */
+export function extractResponseStructuralSignals(
+  ex: Pick<ResourceHarvestExchange, 'status' | 'pathAndQuery' | 'mediaType' | 'body' | 'respHeaders'>,
+  maxSignals = 32,
+): ExtractedResponseStructuralSignal[] {
+  if (ex.status < 200 || ex.status >= 400) return []
+  if (RESOURCE_STATIC_ASSET_RE.test(ex.pathAndQuery) || ex.pathAndQuery.startsWith('/_next/static/')) return []
+  const cap = Math.max(1, Math.min(64, Math.floor(maxSignals)))
+  const out: ExtractedResponseStructuralSignal[] = [], seen = new Set<string>()
+  const push = (field: string, source: 'json' | 'header' | 'status', edgeKind: ResponseSignalEdgeKind) => {
+    if (out.length >= cap) return
+    const key = `${source}:${field.toLowerCase()}:${edgeKind}`
+    if (seen.has(key)) return
+    seen.add(key); out.push({ field, source, edgeKind })
+  }
+  if (ex.status === 202) push('status:202', 'status', 'await_async')
+  for (const [rawName, rawVal] of Object.entries(ex.respHeaders ?? {})) {
+    if (out.length >= cap) break
+    const lower = rawName.trim().toLowerCase()
+    const hint = typeof rawVal === 'string' && !RESOURCE_SECRET_VALUE_RE.test(rawVal) ? rawVal : undefined
+    const edgeKind = classifyStructuralFieldEdgeKind(lower, 'header', { status: ex.status, headerValueHint: hint })
+    if (edgeKind) push(lower, 'header', edgeKind)
+  }
+  if (ex.mediaType.toLowerCase().includes('json') && ex.body && ex.body.length <= 512 * 1024) {
+    try {
+      const walk = (node: unknown, depth: number) => {
+        if (depth > 6 || out.length >= cap || !node || typeof node !== 'object') return
+        if (Array.isArray(node)) { for (const item of node.slice(0, 3)) walk(item, depth + 1); return }
+        for (const [key, val] of Object.entries(node as Record<string, unknown>)) {
+          if (out.length >= cap) break
+          const edgeKind = classifyStructuralFieldEdgeKind(key, 'json')
+          if (edgeKind) push(key, 'json', edgeKind)
+          if (val && typeof val === 'object') walk(val, depth + 1)
+        }
+      }
+      walk(JSON.parse(ex.body) as unknown, 1)
+    } catch { /* non-JSON or truncated body */ }
+  }
+  return out
+}
