@@ -15,7 +15,7 @@ import {
 } from './oracle-invariants.ts'
 import type { AmbientAuth, BoundaryClass, ImpactClass, ImpactStep, InjectionFamily, ActorIdentity } from './oracle-invariants.ts'
 import { isJobOrHandleStub } from './v8-oracle-families.ts'
-import { deriveAmbientAuthFromHeaders, resolveCanonicalArm, type HostFactLog } from './host-fact-log.ts'
+import { deriveRecordAuthMeta, resolveCanonicalArm, stepHasRedactedRequestPlane, type HostFactLog } from './host-fact-log.ts'
 import { defaultHostMintedOracle } from './proof-receipt.ts'
 import { compileSafeClaimRegex, MAX_CLAIM_REGEX_HAYSTACK } from './safe-regex.ts'
 export { compileSafeClaimRegex } from './safe-regex.ts'
@@ -933,30 +933,14 @@ export function mannWhitneyU(control: number[], variant: number[]): MannWhitneyR
 
 function observedHeader(record: VerifyTranscriptRecord, name: string): string | undefined {
   const wanted = name.toLowerCase()
-  for (const [key, value] of Object.entries(record.response?.headers ?? {})) {
-    if (key.toLowerCase() === wanted) return value
-  }
+  for (const [key, value] of Object.entries(record.response?.headers ?? {})) if (key.toLowerCase() === wanted) return value
   return undefined
 }
 
-export function sameSiteFromRecord(record: VerifyTranscriptRecord | undefined): string | null {
-  if (!record) return null
-  const raw = observedHeader(record, 'set-cookie')
-  if (!raw) return null
-  const match = /samesite\s*=\s*([a-z]+)/i.exec(raw)
-  return match ? match[1] ?? null : null
-}
+export const sameSiteFromRecord = (record: VerifyTranscriptRecord | undefined): string | null => deriveRecordAuthMeta(record).sameSite
 
 /** Normalize a recorded exchange into the shared impact-evidence shape (HostFactLog-first, H-13 host-only). */
-function toTranscriptStep(
-  store: TranscriptStore,
-  id: string,
-  arm: ImpactStep['arm'],
-  opts?: {
-    factLog?: HostFactLog
-    defaultSameSite?: string | null
-  },
-): ImpactStep | null {
+function toTranscriptStep(store: TranscriptStore, id: string, arm: ImpactStep['arm'], opts?: { factLog?: HostFactLog; defaultSameSite?: string | null }): ImpactStep | null {
   const hostFact = opts?.factLog?.getExchange(id)
   if (hostFact) {
     const step = opts?.factLog?.toImpactStep(id, { arm })
@@ -964,19 +948,14 @@ function toTranscriptStep(
   }
   const record = store.get(id)
   if (!record) return null
-  const body = store.body(id)
-  const json = parseJsonBody(body)
-  const handle = record.request?.personaHandle ?? null
+  const body = store.body(id), json = parseJsonBody(body), handle = record.request?.personaHandle ?? null
   // H-13: Strictly host-derived role, tenant, auth, SameSite, and request body; drop all script-declared fallbacks.
   const signedLabel = record.request?.actorRoleLabel ?? null
-  const role = signedLabel !== null
-    ? normalizeRole(signedLabel) ?? normalizeRole(handle) ?? null
-    : normalizeRole(handle) ?? null
-  const tenant = signedLabel !== null
-    ? parseRoleLabel(signedLabel).tenant ?? parseRoleLabel(handle).tenant ?? null
-    : parseRoleLabel(handle).tenant ?? null
-  const hostAuth = deriveAmbientAuthFromHeaders(record.request?.headers)
-  const hostSameSite = sameSiteFromRecord(record) ?? opts?.defaultSameSite ?? null
+  const role = (signedLabel !== null ? normalizeRole(signedLabel) : null) ?? normalizeRole(handle) ?? null
+  const tenant = (signedLabel !== null ? parseRoleLabel(signedLabel).tenant : null) ?? parseRoleLabel(handle).tenant ?? null
+  const authMeta = deriveRecordAuthMeta(record)
+  const hostAuth = authMeta.ambientAuth
+  const hostSameSite = authMeta.sameSite ?? (hostAuth === 'cookie' && !authMeta.placement.mixed ? (opts?.defaultSameSite ?? null) : null)
   const hostRawReq = store.requestBody(id)
   const requestJson = hostRawReq !== undefined ? (parseJsonBody(hostRawReq) ?? hostRawReq) : undefined
   const actor: ActorIdentity = { handle, role, tenant, auth: hostAuth, sameSite: hostSameSite }
@@ -1147,7 +1126,7 @@ function evaluateImpactClaim(
   for (const id of ids) {
     if (!requireRecord(id)) return { claim, passed: false, detail: `Unknown exchange ${id} for an impact claim.` }
   }
-  const defaultSameSite = ids.map(id => sameSiteFromRecord(store.get(id))).find(Boolean) ?? null
+  const defaultSameSite = deriveRecordAuthMeta(store.get(claim.probeExchangeId), ids.map(id => store.get(id))).sameSite
   const steps: ImpactStep[] = []
   const stepOpts = { factLog: context.factLog, defaultSameSite }
   const add = (id: string | undefined, arm: ImpactStep['arm']) => {
@@ -1160,6 +1139,9 @@ function evaluateImpactClaim(
   for (const id of claim.controlExchangeIds ?? []) add(id, 'control')
   add(claim.afterExchangeId, 'control')
   steps.sort((a, b) => ((a as unknown as { seq?: number }).seq ?? 0) - ((b as unknown as { seq?: number }).seq ?? 0))
+  if ((claim.impactClass === 'injection' || claim.impactClass === 'markup') && steps.some(stepHasRedactedRequestPlane)) {
+    return { claim, passed: false, detail: `Kernel request plane contains a vault-scrubbed/redacted placeholder ([redacted...]); anti-reflection for ${claim.impactClass} fails closed.`, observed: { rejectedBy: 'redacted_request_plane' } }
+  }
   const probeRecord = store.get(claim.probeExchangeId)
   const assessment = assessImpactEvidence({
     impactClass: claim.impactClass,
@@ -1209,7 +1191,9 @@ function implicitMarkupEvidence(
 ): { satisfied: boolean; reason: string } {
   const browserExecutionAttested = claims.some(c => c.kind === 'dom_sentinel' && c.mode === 'executed' &&
     Boolean(store.get(c.exchangeId)?.artifact?.executedSentinels?.includes(c.sentinel)))
-  const assessment = assessMarkupImpact({ impactClass: 'markup', steps: claimedSteps(store, claims, context), oracleEvents: [], browserExecutionAttested })
+  const steps = claimedSteps(store, claims, context)
+  if (steps.some(stepHasRedactedRequestPlane)) return { satisfied: false, reason: 'kernel request plane contains a redacted placeholder ([redacted...]); markup anti-reflection fails closed' }
+  const assessment = assessMarkupImpact({ impactClass: 'markup', steps, oracleEvents: [], browserExecutionAttested })
   return { satisfied: assessment.satisfied, reason: assessment.reason }
 }
 
@@ -1611,6 +1595,7 @@ export function evaluateClaim(
       const chs = verifiedChs as NonNullable<(typeof verifiedChs)[number]>[]
       const ctlRecs = claim.controlIds.map(requireRecord), prbRecs = claim.probeIds.map(requireRecord)
       if (ctlRecs.some(r => !r?.response) || prbRecs.some(r => !r?.response)) return { claim, passed: false, detail: 'host_evaluated_expression references an unknown or failed control/probe exchange.', observed: { rejectedBy: 'host_evaluated_expression' } }
+      if ([...claim.controlIds, ...claim.probeIds].some(id => { const s = toTranscriptStep(store, id, 'probe', { factLog: context.factLog }); return Boolean(s && stepHasRedactedRequestPlane(s)) })) return { claim, passed: false, detail: 'host_evaluated_expression rejected: kernel request plane contains a redacted placeholder ([redacted...]).', observed: { rejectedBy: 'redacted_request_plane' } }
       const ok2xx = (r: VerifyTranscriptRecord | null) => { const s = recordStatus(r ?? undefined); return s !== null && s >= 200 && s < 300 }
       const ctlBodies = claim.controlIds.map(id => store.body(id) ?? ''), prbBodies = claim.probeIds.map(id => store.body(id) ?? '')
       const outputs = chs.map(c => c.expectedOutput), varying = outputs.length < 2 || new Set(outputs).size === outputs.length
@@ -1783,7 +1768,7 @@ function claimHasStrippedFingerprint(store: TranscriptStore, check: VerifyClaimC
   return ids.some(id => {
     if (store.get(id)?.request?.sessionRole === 'control') return false
     const step = toTranscriptStep(store, id, 'probe', { factLog })
-    const fp = step ? matchStrippedInjectionFingerprint(step, family) : null
+    const fp = step && !stepHasRedactedRequestPlane(step) ? matchStrippedInjectionFingerprint(step, family) : null
     return Boolean(fp && !controls.some(ctrl => ctrl.route === step!.route && matchStrippedInjectionFingerprint(ctrl, fp.family) !== null))
   })
 }
