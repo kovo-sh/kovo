@@ -27,6 +27,7 @@ import {
   redactHeaders,
   type NamedSecret,
 } from './redact.ts'
+import { compileSafeClaimRegex } from './safe-regex.ts'
 
 export { SENSITIVE_HTTP_HEADER_RE, buildSecretEncodingVariants }
 
@@ -42,16 +43,18 @@ export type PublicDerivedCapabilityMeta = Omit<DerivedCapabilityMeta, 'sha256' |
 
 export type CapabilitySealSelectorKind = 'jsonPath' | 'header' | 'cookie' | 'regex' | 'value'
 
-export const DEFAULT_MIN_CAPABILITY_SECRET_LENGTH = 8
+export const DEFAULT_MIN_CAPABILITY_SECRET_LENGTH = 6
 export const MIN_STRUCTURED_SEAL_LENGTH = 6
 export const MIN_ORACLE_SELECTOR_SEAL_LENGTH = 8
 export const DEFAULT_MAX_SEALS_PER_EXCHANGE = 12
 export const DEFAULT_MAX_SEALS_PER_SESSION = 128
+export const MAX_SEAL_REGEX_HAYSTACK_BYTES = 65_536
 
 const EPHEMERAL_CAP_PLACEHOLDER_RE = /\[persona:(cap:hop_[A-Za-z0-9._-]+:[A-Za-z0-9._-]+):secret\]/g
 const RAW_COOKIE_FIELD_RE = /^(?:cookie|set-cookie)$/i
 const HEADER_OBJECT_KEYS = new Set(['headers', 'reqHeaders', 'respHeaders', 'requestHeaders', 'responseHeaders', 'upgradeHeaders'])
 const REPEATED_SINGLE_CHAR_RE = /^(.)\1+$/
+const STANDARD_CHAR_CLASS_RANGES = new Set(['a-z', 'A-Z', '0-9', 'a-f', 'A-F'])
 
 export interface EgressSanitizerOptions {
   /** Static or dynamically-resolved registered vault/persona/session secrets. */
@@ -99,7 +102,7 @@ export function redactSecrets(
     if (s.value && s.value.length >= minSecretLength) combined.push(s)
   }
   for (const vault of options.capabilityVaults ?? []) {
-    for (const desc of vaultScrubDescriptors(vault)) {
+    for (const desc of vaultScrubDescriptors(vault, minCapLength)) {
       if (desc.value.length >= minCapLength) combined.push(desc)
     }
   }
@@ -142,10 +145,22 @@ export function toPublicCapabilityMeta(meta: DerivedCapabilityMeta): PublicDeriv
   }
 }
 
+function shannonEntropyBitsPerChar(value: string): number {
+  if (!value.length) return 0
+  const freq = new Map<string, number>()
+  for (const ch of value) freq.set(ch, (freq.get(ch) ?? 0) + 1)
+  let entropy = 0
+  for (const count of freq.values()) {
+    const p = count / value.length
+    entropy -= p * Math.log2(p)
+  }
+  return entropy
+}
+
 /**
- * C-3 anti-oracle validation on `capability.seal` extracted values:
- * rejects 1-char / short / trivial repeated-character probes so workers cannot recover hidden
- * response bytes character-by-character via regex or substring membership queries.
+ * C-3 / H-8 anti-oracle validation on `capability.seal` extracted values:
+ * rejects 1-char / short / trivial repeated-character / low-entropy probes so workers cannot
+ * recover hidden response bytes character-by-character via regex or substring membership queries.
  */
 export function validateCapabilitySealValue(rawValue: string, selector: CapabilitySealSelectorKind): void {
   const trimmed = rawValue.trim()
@@ -160,6 +175,207 @@ export function validateCapabilitySealValue(rawValue: string, selector: Capabili
   if (REPEATED_SINGLE_CHAR_RE.test(trimmed)) {
     throw new Error('capability.seal rejected trivial repeated-character value.')
   }
+  const distinctChars = new Set(trimmed).size
+  if (distinctChars < 3) {
+    throw new Error('capability.seal rejected low-entropy extracted value (fewer than 3 distinct characters).')
+  }
+  const minEntropy = (selector === 'regex' || selector === 'value') ? 1.5 : 1.2
+  if (shannonEntropyBitsPerChar(trimmed) < minEntropy) {
+    throw new Error(`capability.seal rejected low-entropy extracted value for "${selector}" selector.`)
+  }
+}
+
+/**
+ * Inspect a character class body (the text between `[` and `]`) to detect binary-search
+ * alphabet partitioning (e.g. `[a-m]`, `[n-z]`, `[0-4]`, `[5-9]`, `[abcdef]`) used to leak
+ * hidden response bytes 1 bit per call. Standard full token classes (`a-z`, `A-Z`, `0-9`,
+ * `a-f`, `A-F`) and negated delimiter classes (`[^"\\s]`) are allowed.
+ */
+function inspectSealCharClass(body: string, isQuantifiedWide: boolean): string | null {
+  if (!body) return 'Empty character class in seal regex.'
+  // Negated delimiter classes (e.g. [^"]+ or [^\s]+) are standard token extractors.
+  if (body[0] === '^') return null
+
+  let hasStandardRange = false
+  let literalAlnumCount = 0
+  for (let i = 0; i < body.length; ) {
+    const ch = body[i]!
+    if (ch === '\\') {
+      const next = body[i + 1]
+      if (next === 'w' || next === 'd' || next === 's' || next === 'S' || next === 'W' || next === 'D') {
+        hasStandardRange = true
+      }
+      i += 2
+      continue
+    }
+    if (i + 2 < body.length && body[i + 1] === '-' && body[i + 2] !== ']') {
+      const rangeToken = `${ch}-${body[i + 2]!}`
+      if (!STANDARD_CHAR_CLASS_RANGES.has(rangeToken)) {
+        return `Seal regex character range "[${rangeToken}]" is rejected (partial-alphabet binary-search oracle guard).`
+      }
+      hasStandardRange = true
+      i += 3
+      continue
+    }
+    if (/[A-Za-z0-9]/.test(ch)) literalAlnumCount += 1
+    i += 1
+  }
+
+  // Reject unquantified/narrow enumerated alphanumeric subset classes like `[abcdefghijklm]` or `[01234]`
+  // that act as binary-search partitions without using a `-` range.
+  if (!hasStandardRange && !isQuantifiedWide && literalAlnumCount >= 2) {
+    return 'Seal regex unquantified alphanumeric subset class is rejected (binary-search oracle guard).'
+  }
+  return null
+}
+
+function readSealQuantifierMax(pattern: string, idx: number): { max: number; end: number } | null {
+  const ch = pattern[idx]
+  if (ch === '+' || ch === '*') {
+    const end = pattern[idx + 1] === '?' ? idx + 2 : idx + 1
+    return { max: Infinity, end }
+  }
+  if (ch === '?') {
+    const end = pattern[idx + 1] === '?' ? idx + 2 : idx + 1
+    return { max: 1, end }
+  }
+  if (ch === '{') {
+    const m = /^\{(\d+)(?:,(\d*))?\}/.exec(pattern.slice(idx))
+    if (!m) return null
+    const min = Number(m[1])
+    const max = m[0].includes(',') ? (m[2] ? Number(m[2]) : Infinity) : min
+    const rawEnd = idx + m[0].length
+    const end = pattern[rawEnd] === '?' ? rawEnd + 1 : rawEnd
+    return { max, end }
+  }
+  return null
+}
+
+/**
+ * H-8 hardened regex compiler for `capability.seal`:
+ *  1. Enforces static ReDoS safety via `compileSafeClaimRegex` (length, nesting, backtracking,
+ *     lookarounds, backreferences).
+ *  2. Blocks byte-by-byte / binary-search oracle probes: partial-alphabet character ranges
+ *     (`[a-m]`, `[0-4]`), unquantified alphanumeric subset classes (`[abcdef]`), and fixed-prefix
+ *     1-char suffix padding probes that lack a wide variable token capture.
+ *  3. Preserves legitimate `kovo_verify` SSE / JSON / Bearer / JWT / hex token regexes.
+ */
+export function compileSafeSealRegex(pattern: string): RegExp {
+  const compiled = compileSafeClaimRegex(pattern)
+  if (!compiled.ok) {
+    throw new Error(`capability.seal regex rejected: ${compiled.reason}`)
+  }
+
+  // Scan top-level and capture-group tokens for binary-search character classes and verify
+  // that the regex captures/matches a genuine variable token (not a 1-char probe padded by literals).
+  let hasCaptureGroup = false
+  let captureHasWideVariableToken = false
+  let topHasWideVariableToken = false
+  let captureDepth = 0
+  let nonCapturingDepth = 0
+  const groupKindStack: Array<'capture' | 'noncapture'> = []
+
+  for (let i = 0; i < pattern.length; ) {
+    const ch = pattern[i]!
+    if (ch === '\\') {
+      const esc = pattern[i + 1]
+      const isWildcardEsc = esc === 'w' || esc === 'd' || esc === 'S' || esc === 'W' || esc === 'D'
+      const q = readSealQuantifierMax(pattern, i + 2)
+      const isWide = isWildcardEsc && Boolean(q && q.max >= MIN_ORACLE_SELECTOR_SEAL_LENGTH)
+      if (isWide) {
+        if (captureDepth > 0) captureHasWideVariableToken = true
+        topHasWideVariableToken = true
+      }
+      i = q ? q.end : i + 2
+      continue
+    }
+    if (ch === '[') {
+      let end = i + 1
+      while (end < pattern.length) {
+        if (pattern[end] === '\\') { end += 2; continue }
+        if (pattern[end] === ']') break
+        end += 1
+      }
+      const classBody = pattern.slice(i + 1, end)
+      const q = readSealQuantifierMax(pattern, end + 1)
+      const isWide = Boolean(q && q.max >= MIN_ORACLE_SELECTOR_SEAL_LENGTH)
+      const classErr = inspectSealCharClass(classBody, isWide)
+      if (classErr) {
+        throw new Error(`capability.seal regex rejected: ${classErr}`)
+      }
+      if (isWide) {
+        if (captureDepth > 0) captureHasWideVariableToken = true
+        topHasWideVariableToken = true
+      }
+      i = q ? q.end : end + 1
+      continue
+    }
+    if (ch === '(') {
+      if (pattern[i + 1] === '?' && pattern[i + 2] === ':') {
+        nonCapturingDepth += 1
+        groupKindStack.push('noncapture')
+        i += 3
+      } else {
+        hasCaptureGroup = true
+        captureDepth += 1
+        groupKindStack.push('capture')
+        i += 1
+      }
+      continue
+    }
+    if (ch === ')') {
+      const kind = groupKindStack.pop()
+      if (kind === 'capture') captureDepth = Math.max(0, captureDepth - 1)
+      else if (kind === 'noncapture') nonCapturingDepth = Math.max(0, nonCapturingDepth - 1)
+      i += 1
+      continue
+    }
+    if (ch === '.') {
+      const q = readSealQuantifierMax(pattern, i + 1)
+      const isWide = Boolean(q && q.max >= MIN_ORACLE_SELECTOR_SEAL_LENGTH)
+      if (isWide) {
+        if (captureDepth > 0) captureHasWideVariableToken = true
+        topHasWideVariableToken = true
+      }
+      i = q ? q.end : i + 1
+      continue
+    }
+    i += 1
+  }
+  void nonCapturingDepth
+
+  if (hasCaptureGroup && !captureHasWideVariableToken) {
+    throw new Error(
+      `capability.seal regex rejected: capture group must match a variable token of at least ${MIN_ORACLE_SELECTOR_SEAL_LENGTH} characters (prevents byte-oracle probing).`,
+    )
+  }
+  if (!hasCaptureGroup && !topHasWideVariableToken) {
+    throw new Error(
+      `capability.seal regex rejected: pattern must match a variable token of at least ${MIN_ORACLE_SELECTOR_SEAL_LENGTH} characters (prevents byte-oracle probing).`,
+    )
+  }
+  return compiled.regex
+}
+
+/**
+ * Safely execute a seal regex against a bounded response body slice and validate the extracted
+ * secret value against anti-oracle length/entropy guards.
+ */
+export function extractSafeSealRegexMatch(
+  pattern: string,
+  body: string,
+  options: { maxHaystackBytes?: number } = {},
+): string {
+  const re = compileSafeSealRegex(pattern)
+  const cap = Math.max(1024, options.maxHaystackBytes ?? MAX_SEAL_REGEX_HAYSTACK_BYTES)
+  const bounded = body.length > cap ? body.slice(0, cap) : body
+  const match = re.exec(bounded)
+  const extracted = match?.[1] ?? match?.[0]
+  if (!extracted) {
+    throw new Error('Regex did not match response body.')
+  }
+  validateCapabilitySealValue(extracted, 'regex')
+  return extracted
 }
 
 /** C-3 per-exchange and per-session seal rate-limit guard (counts every attempt, hit or miss). */

@@ -4,8 +4,9 @@ import { stream as responses, streamSimple as simpleResponses } from '@earendil-
 import { stream as messages, streamSimple as simpleMessages } from '@earendil-works/pi-ai/api/anthropic-messages'
 import type { Api, Model, ProviderStreams } from '@earendil-works/pi-ai'
 import { obj, str } from '@earendil-works/pi-schema'
-import { DEFAULT_PROVIDER } from '../domain.ts'
+import { DEFAULT_PROVIDER, isLocalModelEnvEnabled } from '../domain.ts'
 import type { ProviderSettings, RoleAffinity, ThinkingLevel } from '../domain.ts'
+import { EgressDeniedError, EgressGateway } from './egress-gateway.ts'
 import type { ResolvedModelProfile } from './model-settings.ts'
 import { defaultStreamResponseLimit, redactProviderText, sanitizeProviderStream, sanitizeProviderValue } from './provider-stream.ts'
 import { redact } from './redact.ts'
@@ -88,6 +89,10 @@ export type ProviderOptions = {
   onStreamActivity?: () => void
   onProfileSuccess?: (profileId: string) => void
   onProfileFailure?: (profileId: string, err: string, hard: boolean) => void
+  /** Optional test/embedder fetch seam (production traffic always routes through `EgressGateway`). */
+  fetch?: typeof fetch
+  /** Optional injectable DNS resolver passed to `EgressGateway` for deterministic SSRF/rebinding tests. */
+  resolveHost?: (hostname: string) => Promise<string[]>
 }
 
 function clampContextWindow(value?: number): number {
@@ -238,7 +243,7 @@ function makeFetch(
     const beta = settings.protocol === 'messages' && actual.search === '?beta=true'
     if (beta) actual.search = ''
     if (actual.href !== endpoint || request.method !== 'POST') throw new Error('Unexpected model endpoint.')
-    if (process.env.KOVO_OFFLINE === '1' && actual.hostname !== '127.0.0.1') {
+    if (process.env.KOVO_OFFLINE === '1' && actual.hostname !== '127.0.0.1' && actual.hostname !== 'localhost') {
       throw new Error('Offline mode requires a loopback model fixture endpoint.')
     }
     const headers = new Headers(request.headers)
@@ -282,15 +287,36 @@ function makeFetch(
     // Enforce firstEventTimeoutMs ONLY until the first chunk/event arrives (disarmed via
     // clearFirstEventTimer), so healthy multi-chunk streams are never aborted mid-body.
     const fetchSignal = AbortSignal.any([totalSignal, firstEventController.signal])
+    const targetUrl = beta ? endpoint + '?beta=true' : endpoint
+    const allowLocalModel = isLocalModelEnvEnabled()
 
     try {
-      const response = await fetch(beta ? endpoint + '?beta=true' : endpoint, {
-        method: 'POST',
-        headers,
-        body: raw,
-        redirect: 'error',
-        signal: fetchSignal,
-      })
+      const response = options.fetch
+        ? await options.fetch(targetUrl, {
+            method: 'POST',
+            headers,
+            body: raw,
+            redirect: 'error',
+            signal: fetchSignal,
+          })
+        : await EgressGateway.egressFetchStream(
+            targetUrl,
+            {
+              method: 'POST',
+              headers,
+              body: raw,
+              redirect: 'error',
+              signal: fetchSignal,
+            },
+            {
+              allowLocalLab: false,
+              allowHttp: allowLocalModel,
+              allowedLoopbackOnlyHosts: allowLocalModel ? ['127.0.0.1', 'localhost'] : undefined,
+              timeoutMs: totalTimeoutMs,
+              maxResponseBytes: Math.max(responseLimit * 2, 4 * 1024 * 1024),
+              ...(options.resolveHost ? { resolveHost: options.resolveHost } : {}),
+            },
+          )
 
       const contentType = response.headers.get('content-type') ?? 'application/json'
       const recordResponse = options.record && ((body: string) => options.record!({
@@ -487,7 +513,7 @@ export function classifyFailoverError(message: string): { failover: boolean; har
   if (/aborted due to timeout/i.test(message)) {
     return { failover: true, hard: false }
   }
-  if (/aborted|cancelled|canceled|budget|exceeded Kovo Hunter’s size limit|Unexpected model endpoint/i.test(message)) {
+  if (/aborted|cancelled|canceled|budget|exceeded Kovo Hunter’s size limit|Unexpected model endpoint|refused by SSRF policy|never permitted|Plaintext HTTP egress|without local-lab or explicit loopback/i.test(message)) {
     return { failover: false, hard: false }
   }
   if (/rejected the API key|quota|credit balance|401|402|403|404|not found/i.test(message)) {
@@ -695,8 +721,19 @@ export function providerPool(
   return { models, model: primaryBuilt.model }
 }
 
-export async function testProvider(settings: ProviderConfig, record?: CallRecorder): Promise<{ ok: true }> {
-  const { models, model } = provider(settings, 'connection', { record, maxCalls: 2, firstEventTimeoutMs: 35_000, idleTimeoutMs: 35_000, totalTimeoutMs: 45_000 })
+export async function testProvider(
+  settings: ProviderConfig,
+  record?: CallRecorder,
+  extraOptions: Pick<ProviderOptions, 'fetch' | 'resolveHost'> = {},
+): Promise<{ ok: true }> {
+  const { models, model } = provider(settings, 'connection', {
+    record,
+    maxCalls: 2,
+    firstEventTimeoutMs: 35_000,
+    idleTimeoutMs: 35_000,
+    totalTimeoutMs: 45_000,
+    ...extraOptions,
+  })
   const stream = models.stream(model, {
     systemPrompt: 'Kovo Hunter connection test. Call kovo_connection with status ready. Do not add prose.',
     messages: [{ role: 'user', content: 'Check the Kovo Hunter connection.', timestamp: Date.now() }],
@@ -713,6 +750,9 @@ export async function testProvider(settings: ProviderConfig, record?: CallRecord
   const result = await stream.result()
   if (result.stopReason === 'error' || result.stopReason === 'aborted') {
     const error = redact(result.errorMessage ?? '').slice(0, 350)
+    if (/(?:Egress host|Egress origin|Plaintext HTTP egress|SSRF policy|never permitted|explicit loopback allowlist|redirect)/i.test(error)) {
+      throw new EgressDeniedError('scope_denied', error)
+    }
     const match = error.match(/The (?:provider rejected the API key|provider quota or credit balance was exhausted|provider endpoint or model was not found|provider rate limit was reached|model provider returned HTTP \d+)\./)
     throw new Error(match?.[0] ?? 'The provider connection failed. Check the base URL, model, key, and protocol.')
   }

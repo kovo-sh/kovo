@@ -271,13 +271,13 @@ describe('H-24: pooled browser context activeGrant lifecycle', () => {
     grant1Revoked = true
     const grant1ChecksAfterAsgn1 = grant1Checks.length
 
-    // Assignment 2 reuses the EXACT SAME pooled context (same runId + persona) with grant2.
+    // Assignment 2 on the SAME origin reuses the EXACT SAME pooled context (same runId + persona + origin) with grant2.
     const [r2] = await browser.visitPages(
-      [{ origin: originB, pathAndQuery: '/page-2', runId: 'run-h24', persona: 'admin', assignmentId: 'asgn-2' }],
+      [{ origin: originA, pathAndQuery: '/page-2', runId: 'run-h24', persona: 'admin', assignmentId: 'asgn-2' }],
       grant2,
       AbortSignal.timeout(10_000),
     )
-    assert.equal(browser.getPoolStats().contextsCreated, 1, 'pooled context must be reused across assignments')
+    assert.equal(browser.getPoolStats().contextsCreated, 1, 'same-origin pooled context must be reused across assignments')
     assert.equal(r2.status, 200, 'Assignment 2 must succeed using grant2 instead of failing on revoked grant1')
     assert.equal(r2.exchanges.length, 1)
     assert.deepEqual(seenGrants, [
@@ -285,18 +285,27 @@ describe('H-24: pooled browser context activeGrant lifecycle', () => {
       { path: '/page-2', grantId: 'grant-2' },
     ])
     assert.equal(grant1Checks.length, grant1ChecksAfterAsgn1, 'revoked grant1 must not be consulted during Assignment 2')
-    assert.ok(grant2Checks.includes(originB), 'live grant2 must be consulted during Assignment 2')
+    assert.ok(grant2Checks.includes(originA), 'live grant2 must be consulted during Assignment 2')
     assert.deepEqual(wsResults, [
       { phase: 'asgn-1', connected: true, closedCode: undefined },
       { phase: 'asgn-2', connected: true, closedCode: undefined },
     ], 'WebSocket guard must also read the live activeGrant on each assignment')
 
+    // Assignment 3 on a DIFFERENT origin (originB) MUST isolate into a new pooled context (H9: no cross-origin cookie/storage bleed).
+    const [r3] = await browser.visitPages(
+      [{ origin: originB, pathAndQuery: '/page-3', runId: 'run-h24', persona: 'admin', assignmentId: 'asgn-3' }],
+      grant2,
+      AbortSignal.timeout(10_000),
+    )
+    assert.equal(r3.status, 200)
+    assert.equal(browser.getPoolStats().contextsCreated, 2, 'cross-origin visit must allocate a distinct isolated pooled context')
+
     // After release (no active checkout), stray HTTP and WS requests must fail closed.
     const ctx = fake.contexts[0]!
     const abortedBefore = ctx.aborted.length
-    await ctx.routeHandler!(new FakeRoute({ url: `${originB}/stray`, method: 'GET' }, ctx))
+    await ctx.routeHandler!(new FakeRoute({ url: `${originA}/stray`, method: 'GET' }, ctx))
     assert.equal(ctx.aborted.length, abortedBefore + 1, 'stray HTTP request after release must be aborted fail-closed')
-    const strayWs = new FakeWebSocketRoute('wss://app-b.fixture.test/stray')
+    const strayWs = new FakeWebSocketRoute('wss://app-a.fixture.test/stray')
     await ctx.wsHandler!(strayWs)
     assert.equal(strayWs.connected, false, 'stray WS upgrade after release must fail closed')
     assert.equal(strayWs.closedWith?.code, 1008)

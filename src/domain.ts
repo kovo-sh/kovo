@@ -868,14 +868,78 @@ export const DEFAULT_PROVIDER = {
   outputCostPerMtok: 0.60,
 }
 
+export function isLocalModelEnvEnabled(): boolean {
+  return typeof process !== 'undefined' && (
+    process.env?.KOVO_OFFLINE === '1' ||
+    process.env?.KOVO_ALLOW_LOCAL_MODEL === '1'
+  )
+}
+
+function isBlockedProviderHostname(rawHostname: string): boolean {
+  const bare = rawHostname.trim().toLowerCase().replace(/^\[|\]$/g, '').split('%')[0] ?? ''
+  if (!bare) return true
+  if (
+    bare === 'localhost' ||
+    bare.endsWith('.localhost') ||
+    bare === 'metadata' ||
+    bare === 'metadata.google.internal' ||
+    bare === 'metadata.goog' ||
+    bare === 'instance-data'
+  ) {
+    return true
+  }
+  const ipv4Match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(bare)
+  if (ipv4Match) {
+    const octets = ipv4Match.slice(1).map(Number)
+    if (octets.some(o => !Number.isInteger(o) || o < 0 || o > 255)) return true
+    const [a, b] = octets
+    if (
+      a === 0 ||
+      a === 10 ||
+      a === 127 ||
+      (a === 100 && b >= 64 && b <= 127) ||
+      (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168) ||
+      (a === 192 && b === 0) ||
+      (a === 198 && (b === 18 || b === 19)) ||
+      a >= 224 ||
+      bare === '100.100.100.200'
+    ) {
+      return true
+    }
+    return false
+  }
+  // Reject non-public IPv6 literals (loopback ::1, unspecified ::, ULA fc00::/7, link-local fe80::/10,
+  // IPv4-mapped ::ffff:*, multicast ff00::/8, AWS IPv6 IMDS fd00:ec2::254). Only global unicast 2000::/3 is public.
+  if (bare.includes(':')) {
+    if (bare === '::' || bare === '::1' || bare.startsWith('::ffff:')) return true
+    const firstHextet = bare.split(':')[0] ?? ''
+    if (!/^[0-9a-f]{1,4}$/.test(firstHextet)) return true
+    const firstWord = parseInt(firstHextet, 16)
+    // Global unicast 2000::/3 -> top 3 bits === 001 (0x2000..0x3fff)
+    if (firstWord < 0x2000 || firstWord > 0x3fff) return true
+    return false
+  }
+  return false
+}
+
 const providerUrl = z.string().trim().min(1).max(300).transform((input, ctx) => {
   try {
     const url = new URL(input)
-    const local = url.protocol === 'http:' && url.hostname === '127.0.0.1' && Boolean(url.port)
-    if ((!local && url.protocol !== 'https:') || url.username || url.password || url.search || url.hash) throw new Error()
+    if (url.username || url.password || url.search || url.hash) throw new Error()
+    const host = url.hostname.toLowerCase()
+    const isLocalLoopbackHttp = url.protocol === 'http:' && Boolean(url.port) && (
+      host === '127.0.0.1' ||
+      (host === 'localhost' && isLocalModelEnvEnabled())
+    )
+    if (isLocalLoopbackHttp) {
+      return url.origin + url.pathname.replace(/\/+$/, '')
+    }
+    if (url.protocol !== 'https:' || isBlockedProviderHostname(host)) throw new Error()
     return url.origin + url.pathname.replace(/\/+$/, '')
   } catch {
-    ctx.addIssue({ code: 'custom', message: 'Enter an HTTPS provider base URL or a local model endpoint on 127.0.0.1.' })
+    ctx.addIssue({ code: 'custom', message: 'Enter a public HTTPS provider base URL (or an explicitly enabled local loopback model endpoint).' })
     return z.NEVER
   }
 })

@@ -19,6 +19,7 @@
  *     stripped on cross-origin hops.
  *  6. Original `Host` header and TLS SNI (`servername`) preserved when dialing pinned IPs.
  */
+import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { lookup as dnsLookup } from 'node:dns/promises'
 import { createServer as createHttpServer, request as httpRequest } from 'node:http'
 import type { IncomingHttpHeaders, IncomingMessage, Server as HttpServer, ServerResponse } from 'node:http'
@@ -32,6 +33,8 @@ import type { Duplex } from 'node:stream'
 import { createBrotliDecompress, createGunzip, createInflate } from 'node:zlib'
 import ipaddr from 'ipaddr.js'
 import { isIpLiteralHost, normalizeHostname } from './public-suffix.ts'
+import { evaluateBrowserScopeRequest } from './scope-policy.ts'
+import type { ScopePolicy } from './scope-policy.ts'
 
 // ---------------------------------------------------------------------------
 // Error & Classification Types
@@ -51,6 +54,7 @@ export type EgressDenyCode =
   | 'redirect_limit'
   | 'response_too_large'
   | 'proxy_connect_denied'
+  | 'proxy_auth_required'
 
 export class EgressDeniedError extends Error {
   readonly code: EgressDenyCode
@@ -164,6 +168,8 @@ export interface LoopbackProxyPolicy extends Omit<EgressPolicy, 'allowLocalLab' 
   allowLocalLab?: boolean | (() => boolean)
   /** Static or dynamically evaluated origin allowlist. */
   allowedOrigins?: readonly string[] | (() => readonly string[] | undefined)
+  /** Optional ScopePolicy enforced on both proxied HTTP requests and CONNECT tunnels. */
+  scopePolicy?: ScopePolicy | (() => ScopePolicy | undefined)
   /** Dynamic scope predicate (evaluated per HTTP request and per CONNECT tunnel). */
   allowOrigin?: (
     origin: string,
@@ -180,11 +186,27 @@ export interface LoopbackProxyPolicy extends Omit<EgressPolicy, 'allowLocalLab' 
   unref?: boolean
 }
 
+export interface LoopbackProxyCredentials {
+  readonly username: string
+  readonly password: string
+}
+
+export interface LoopbackProxyContextBinding {
+  readonly credentials: LoopbackProxyCredentials
+  readonly authorizationHeader: string
+  readonly proxyConfig: { server: string; username: string; password: string }
+  updatePolicy(patch: Partial<LoopbackProxyPolicy>): void
+  unregister(): void
+}
+
 export interface EgressLoopbackProxy {
   readonly url: string
   readonly host: '127.0.0.1'
   readonly port: number
-  readonly proxyConfig: { server: string }
+  readonly credentials: LoopbackProxyCredentials
+  readonly authorizationHeader: string
+  readonly proxyConfig: { server: string; username: string; password: string }
+  registerContextPolicy(policy: LoopbackProxyPolicy): LoopbackProxyContextBinding
   updatePolicy(patch: Partial<LoopbackProxyPolicy>): void
   close(): Promise<void>
 }
@@ -447,7 +469,8 @@ export async function resolveAndValidateHost(
   const loopbackOnlyHostAllowed = matchesHostList(hostname, policy.allowedLoopbackOnlyHosts)
   const exactOriginAllowed = matchesOriginList(url.origin, policy.allowedOrigins)
 
-  if (policy.allowedOrigins !== undefined && !exactOriginAllowed && !policy.allowOrigin) {
+  // H10-egress: intersect `allowedOrigins` AND `allowOrigin` (never OR) when both are specified.
+  if (policy.allowedOrigins !== undefined && !exactOriginAllowed) {
     denyWithAudit(policy, url.href, url.origin, 'scope_denied', `Egress origin "${url.origin}" is outside the allowed origins.`)
   }
   if (policy.allowOrigin) {
@@ -790,6 +813,226 @@ export async function egressFetch(
 }
 
 /**
+ * Streaming pinned-IP HTTP/1.1 fetch for SSE / long-lived responses (e.g., LLM providers in `provider.ts`).
+ * Resolves DNS once, validates all IPs against SSRF/metadata/scope rules, dials ONLY the pinned IP
+ * with preserved `Host` + TLS SNI, refuses redirects when `init.redirect === 'error'`, transparently
+ * decompresses gzip/deflate/br, and streams response chunks while enforcing `maxResponseBytes`.
+ */
+export async function egressFetchStream(
+  urlInput: string | URL,
+  init: RequestInit = {},
+  policy: EgressPolicy = {},
+): Promise<Response> {
+  warnIfEnvProxyEnabled()
+
+  const timeoutMs = Math.max(250, policy.timeoutMs ?? DEFAULT_TIMEOUT_MS)
+  const maxResponseBytes = Math.max(1024, policy.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES)
+  const rejectUnauthorized = policy.rejectUnauthorized ?? true
+  const method = (init.method ?? 'GET').toUpperCase()
+  const headers = headersToRecord(init.headers)
+  const body = await normalizeRequestBody(init.body)
+  const signal = init.signal ?? undefined
+
+  const validated = await resolveAndValidateHost(urlInput, policy, method)
+  const pinned = validated.addresses[0]!
+  policy.onAllow?.({
+    url: validated.url.href,
+    origin: validated.url.origin,
+    pinnedAddress: pinned.address,
+  })
+
+  const reqHeaders: Record<string, string> = { ...headers }
+  if (!Object.keys(reqHeaders).some(k => k.toLowerCase() === 'host')) {
+    reqHeaders.host = validated.url.host
+  }
+  if (body && !Object.keys(reqHeaders).some(k => k.toLowerCase() === 'content-length')) {
+    reqHeaders['content-length'] = String(body.byteLength)
+  }
+
+  const requestFn = validated.url.protocol === 'https:' ? httpsRequest : httpRequest
+  return await new Promise<Response>((resolve, reject) => {
+    let headersSettled = false
+    const finishHeaders = (err: unknown, value?: Response) => {
+      if (headersSettled) return
+      headersSettled = true
+      if (err) {
+        signal?.removeEventListener('abort', onAbort)
+        reject(err)
+      } else {
+        resolve(value!)
+      }
+    }
+
+    const req = requestFn({
+      protocol: validated.url.protocol,
+      hostname: validated.hostname,
+      port: validated.url.port || undefined,
+      path: `${validated.url.pathname}${validated.url.search}`,
+      method,
+      headers: reqHeaders,
+      agent: false,
+      lookup: createPinnedLookup(validated.hostname, validated.addresses) as never,
+      ...(validated.url.protocol === 'https:'
+        ? {
+            servername: !isIpLiteralHost(validated.hostname) ? validated.hostname : undefined,
+            rejectUnauthorized,
+          }
+        : {}),
+    }, res => {
+      const status = res.statusCode ?? 0
+      if (init.redirect === 'error' && isRedirectStatus(status)) {
+        const err = new EgressDeniedError(
+          'redirect_blocked',
+          `Egress streaming request refused HTTP ${status} redirect.`,
+        )
+        policy.onDenied?.({
+          url: validated.url.href,
+          origin: validated.url.origin,
+          code: 'redirect_blocked',
+          reason: err.message,
+        })
+        req.destroy(err)
+        finishHeaders(err)
+        return
+      }
+
+      const rawEncoding = res.headers['content-encoding']
+      const encoding = (Array.isArray(rawEncoding) ? rawEncoding.join(', ') : (rawEncoding ?? '')).toLowerCase().trim()
+      let source: NodeJS.ReadableStream = res
+      let decompressed = false
+      if (encoding === 'gzip' || encoding === 'x-gzip') {
+        const gunzip = createGunzip()
+        res.pipe(gunzip)
+        source = gunzip
+        decompressed = true
+      } else if (encoding === 'deflate') {
+        const inflate = createInflate()
+        res.pipe(inflate)
+        source = inflate
+        decompressed = true
+      } else if (encoding === 'br') {
+        const brotli = createBrotliDecompress()
+        res.pipe(brotli)
+        source = brotli
+        decompressed = true
+      }
+
+      const respHeaders = responseHeadersFromNode(res.headers)
+      if (decompressed) {
+        respHeaders.delete('content-encoding')
+        respHeaders.delete('content-length')
+      }
+
+      if (status === 204 || status === 304) {
+        signal?.removeEventListener('abort', onAbort)
+        res.resume()
+        finishHeaders(null, new Response(null, { status, statusText: res.statusMessage ?? '', headers: respHeaders }))
+        return
+      }
+
+      let streamClosed = false
+      let totalBytes = 0
+      const readable = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const cleanup = () => {
+            signal?.removeEventListener('abort', onStreamAbort)
+          }
+          const onStreamAbort = () => {
+            if (streamClosed) return
+            streamClosed = true
+            const reason = signal?.reason instanceof Error ? signal.reason : new Error('Egress stream aborted.')
+            req.destroy(reason)
+            try { controller.error(reason) } catch { /* ignore */ }
+            cleanup()
+          }
+          if (signal?.aborted) {
+            onStreamAbort()
+            return
+          }
+          signal?.removeEventListener('abort', onAbort)
+          signal?.addEventListener('abort', onStreamAbort, { once: true })
+
+          source.on('data', (chunk: Buffer) => {
+            if (streamClosed) return
+            totalBytes += chunk.byteLength
+            if (totalBytes > maxResponseBytes) {
+              streamClosed = true
+              const err = new EgressDeniedError(
+                'response_too_large',
+                `Egress streaming response exceeded the ${maxResponseBytes}-byte size limit.`,
+              )
+              req.destroy(err)
+              try { controller.error(err) } catch { /* ignore */ }
+              cleanup()
+              return
+            }
+            try {
+              controller.enqueue(new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength))
+            } catch {
+              streamClosed = true
+              req.destroy()
+              cleanup()
+            }
+          })
+          source.once('end', () => {
+            if (streamClosed) return
+            streamClosed = true
+            try { controller.close() } catch { /* ignore */ }
+            cleanup()
+          })
+          source.once('error', err => {
+            if (streamClosed) return
+            streamClosed = true
+            try { controller.error(err) } catch { /* ignore */ }
+            cleanup()
+          })
+          if (source !== res) {
+            res.once('error', err => {
+              if (streamClosed) return
+              streamClosed = true
+              try { controller.error(err) } catch { /* ignore */ }
+              cleanup()
+            })
+          }
+        },
+        cancel() {
+          streamClosed = true
+          signal?.removeEventListener('abort', onAbort)
+          req.destroy()
+        },
+      })
+
+      finishHeaders(null, new Response(readable, {
+        status,
+        statusText: res.statusMessage ?? '',
+        headers: respHeaders,
+      }))
+    })
+
+    req.setTimeout(timeoutMs, () => {
+      const err = new Error(`Egress streaming request timed out after ${timeoutMs}ms.`)
+      req.destroy(err)
+      finishHeaders(err)
+    })
+    req.on('error', err => finishHeaders(err))
+
+    const onAbort = () => {
+      const reason = signal?.reason instanceof Error ? signal.reason : new Error('Egress streaming request aborted.')
+      req.destroy(reason)
+      finishHeaders(reason)
+    }
+    if (signal?.aborted) {
+      onAbort()
+      return
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+
+    if (body) req.write(body)
+    req.end()
+  })
+}
+
+/**
  * Canonical pinned-IP HTTP/1.1 raw transport hook for `RequestBroker` (`defaultTransport`).
  *
  * Preserves exact caller header ordering, optional body skipping (`readBody: false` / `HEAD`),
@@ -1043,8 +1286,50 @@ export async function egressHttp2(
       let status = 0
       const rawHeaders: Record<string, string> = {}
       const chunks: Buffer[] = []
+      let rawCaptured = 0
       let captured = 0
       let truncated = false
+      let decompressed = false
+      let bodyStream: NodeJS.ReadableStream = stream
+      let bodyListenersAttached = false
+
+      const attachBodyListeners = (targetStream: NodeJS.ReadableStream) => {
+        if (bodyListenersAttached) return
+        bodyListenersAttached = true
+        targetStream.on('data', (chunk: Buffer) => {
+          if (settled) return
+          captured += chunk.length
+          if (captured > maxResponseBytes) {
+            truncated = true
+            stream.close(http2Constants.NGHTTP2_CANCEL)
+            finish(new EgressDeniedError(
+              'response_too_large',
+              `HTTP/2 egress response exceeded the ${maxResponseBytes}-byte limit.`,
+            ))
+            return
+          }
+          chunks.push(chunk)
+        })
+        targetStream.once('error', err => finish(err))
+        targetStream.once('end', () => {
+          const body = Buffer.concat(chunks).toString('utf8')
+          const outHeaders = { ...rawHeaders }
+          if (decompressed) {
+            delete outHeaders['content-encoding']
+            delete outHeaders['content-length']
+          }
+          finish(null, {
+            status,
+            headers: outHeaders,
+            rawHeaders,
+            body,
+            bodyBytes: captured,
+            bodyTruncated: truncated,
+            pinnedAddress: pinned.address,
+            durationMs: Date.now() - started,
+          })
+        })
+      }
 
       stream.on('response', value => {
         status = Number(value[':status'] ?? 0)
@@ -1052,34 +1337,33 @@ export async function egressHttp2(
           if (k.startsWith(':') || v === undefined) continue
           rawHeaders[k.toLowerCase()] = Array.isArray(v) ? v.join(', ') : String(v)
         }
-      })
-      stream.on('data', (chunk: Buffer) => {
-        captured += chunk.length
-        if (captured > maxResponseBytes) {
-          truncated = true
-          stream.close(http2Constants.NGHTTP2_CANCEL)
-          finish(new EgressDeniedError(
-            'response_too_large',
-            `HTTP/2 egress response exceeded the ${maxResponseBytes}-byte limit.`,
-          ))
-          return
+        const encoding = (rawHeaders['content-encoding'] ?? '').toLowerCase().trim()
+        if (encoding === 'gzip' || encoding === 'x-gzip' || encoding === 'deflate' || encoding === 'br') {
+          const decoder = encoding === 'br'
+            ? createBrotliDecompress()
+            : encoding === 'deflate'
+              ? createInflate()
+              : createGunzip()
+          decompressed = true
+          // Also enforce raw compressed byte cap to prevent decompression-bomb DoS.
+          stream.on('data', (rawChunk: Buffer) => {
+            rawCaptured += rawChunk.length
+            if (rawCaptured > maxResponseBytes) {
+              truncated = true
+              stream.close(http2Constants.NGHTTP2_CANCEL)
+              decoder.destroy()
+              finish(new EgressDeniedError(
+                'response_too_large',
+                `HTTP/2 egress response exceeded the ${maxResponseBytes}-byte limit.`,
+              ))
+            }
+          })
+          stream.pipe(decoder)
+          bodyStream = decoder
         }
-        chunks.push(chunk)
+        attachBodyListeners(bodyStream)
       })
       stream.once('error', err => finish(err))
-      stream.once('end', () => {
-        const body = Buffer.concat(chunks).toString('utf8')
-        finish(null, {
-          status,
-          headers: { ...rawHeaders },
-          rawHeaders,
-          body,
-          bodyBytes: captured,
-          bodyTruncated: truncated,
-          pinnedAddress: pinned.address,
-          durationMs: Date.now() - started,
-        })
-      })
       stream.end(bodyBuf)
     })
   } finally {
@@ -1112,7 +1396,13 @@ function parseConnectAuthority(rawAuthority: string): { hostname: string; port: 
   return { hostname, port, hostHeader: `${hostname}:${port}` }
 }
 
-function writeProxyErrorResponse(res: ServerResponse, status: number, code: string, message: string): void {
+function writeProxyErrorResponse(
+  res: ServerResponse,
+  status: number,
+  code: string,
+  message: string,
+  extraHeaders: Record<string, string> = {},
+): void {
   if (res.headersSent) {
     res.destroy()
     return
@@ -1121,16 +1411,25 @@ function writeProxyErrorResponse(res: ServerResponse, status: number, code: stri
     'content-type': 'text/plain; charset=utf-8',
     'x-kovo-egress-denied': code,
     connection: 'close',
+    ...extraHeaders,
   })
   res.end(message)
 }
 
-function writeConnectError(socket: Duplex, status: number, statusText: string, code: string): void {
+function writeConnectError(
+  socket: Duplex,
+  status: number,
+  statusText: string,
+  code: string,
+  extraHeaders: Record<string, string> = {},
+): void {
   if (socket.destroyed || !socket.writable) return
   try {
+    const extra = Object.entries(extraHeaders).map(([k, v]) => `${k}: ${v}\r\n`).join('')
     socket.end(
       `HTTP/1.1 ${status} ${statusText}\r\n` +
       `X-Kovo-Egress-Denied: ${code}\r\n` +
+      extra +
       'Connection: close\r\n\r\n',
     )
   } catch {
@@ -1138,33 +1437,99 @@ function writeConnectError(socket: Duplex, status: number, statusText: string, c
   }
 }
 
-function resolveDynamicLoopbackPolicy(state: LoopbackProxyPolicy): EgressPolicy {
+function constantTimeStringEqual(a: string, b: string): boolean {
+  const ab = Buffer.from(a, 'utf8')
+  const bb = Buffer.from(b, 'utf8')
+  if (ab.length !== bb.length) return false
+  return timingSafeEqual(ab, bb)
+}
+
+function mintLoopbackProxyCredentials(): {
+  credentials: LoopbackProxyCredentials
+  authorizationHeader: string
+} {
+  const username = `kovo-${randomBytes(8).toString('hex')}`
+  const password = randomBytes(24).toString('base64url')
+  const authorizationHeader = `Basic ${Buffer.from(`${username}:${password}`, 'utf8').toString('base64')}`
+  return { credentials: { username, password }, authorizationHeader }
+}
+
+function parseBasicProxyAuthorization(rawHeader: string | string[] | undefined): { username: string; password: string } | null {
+  const raw = Array.isArray(rawHeader) ? rawHeader[0] : rawHeader
+  if (!raw) return null
+  const match = /^Basic\s+([A-Za-z0-9+/=_-]+)$/i.exec(raw.trim())
+  if (!match?.[1]) return null
+  let decoded: string
+  try {
+    decoded = Buffer.from(match[1], 'base64').toString('utf8')
+  } catch {
+    return null
+  }
+  const colonIdx = decoded.indexOf(':')
+  if (colonIdx <= 0) return null
+  return { username: decoded.slice(0, colonIdx), password: decoded.slice(colonIdx + 1) }
+}
+
+function collectAllowedPortsFromPolicy(policy: EgressPolicy, scopePolicy?: ScopePolicy): Set<number> {
+  const ports = new Set<number>([443])
+  const addOrigins = (origins: readonly string[] | undefined) => {
+    for (const raw of origins ?? []) {
+      try {
+        const parsed = new URL(raw)
+        const port = parsed.port ? Number(parsed.port) : (parsed.protocol === 'https:' ? 443 : 80)
+        if (Number.isInteger(port) && port >= 1 && port <= 65_535) ports.add(port)
+      } catch {
+        // Ignore malformed entries.
+      }
+    }
+  }
+  addOrigins(policy.allowedOrigins)
+  if (scopePolicy) {
+    addOrigins(scopePolicy.targetOrigins)
+    addOrigins(scopePolicy.authOrigins)
+    addOrigins(scopePolicy.assetOrigins)
+  }
+  return ports
+}
+
+function resolveDynamicLoopbackPolicy(state: LoopbackProxyPolicy): {
+  egress: EgressPolicy
+  scopePolicy?: ScopePolicy
+} {
   const allowLocalLab = typeof state.allowLocalLab === 'function' ? state.allowLocalLab() : Boolean(state.allowLocalLab)
   const allowedOrigins = typeof state.allowedOrigins === 'function' ? state.allowedOrigins() : state.allowedOrigins
+  const scopePolicy = typeof state.scopePolicy === 'function' ? state.scopePolicy() : state.scopePolicy
   return {
-    allowLocalLab,
-    ...(state.allowHttp !== undefined ? { allowHttp: state.allowHttp } : {}),
-    ...(allowedOrigins !== undefined ? { allowedOrigins } : {}),
-    ...(state.allowOrigin ? { allowOrigin: state.allowOrigin } : {}),
-    ...(state.allowedPrivateHosts ? { allowedPrivateHosts: state.allowedPrivateHosts } : {}),
-    ...(state.allowedLoopbackOnlyHosts ? { allowedLoopbackOnlyHosts: state.allowedLoopbackOnlyHosts } : {}),
-    ...(state.deniedHosts ? { deniedHosts: state.deniedHosts } : {}),
-    ...(state.timeoutMs !== undefined ? { timeoutMs: state.timeoutMs } : {}),
-    ...(state.maxResponseBytes !== undefined ? { maxResponseBytes: state.maxResponseBytes } : {}),
-    ...(state.rejectUnauthorized !== undefined ? { rejectUnauthorized: state.rejectUnauthorized } : {}),
-    ...(state.resolveHost ? { resolveHost: state.resolveHost } : {}),
-    ...(state.onDenied ? { onDenied: state.onDenied } : {}),
-    ...(state.onAllow ? { onAllow: state.onAllow } : {}),
+    egress: {
+      allowLocalLab,
+      ...(state.allowHttp !== undefined ? { allowHttp: state.allowHttp } : {}),
+      ...(allowedOrigins !== undefined ? { allowedOrigins } : {}),
+      ...(state.allowOrigin ? { allowOrigin: state.allowOrigin } : {}),
+      ...(state.allowedPrivateHosts ? { allowedPrivateHosts: state.allowedPrivateHosts } : {}),
+      ...(state.allowedLoopbackOnlyHosts ? { allowedLoopbackOnlyHosts: state.allowedLoopbackOnlyHosts } : {}),
+      ...(state.deniedHosts ? { deniedHosts: state.deniedHosts } : {}),
+      ...(state.timeoutMs !== undefined ? { timeoutMs: state.timeoutMs } : {}),
+      ...(state.maxResponseBytes !== undefined ? { maxResponseBytes: state.maxResponseBytes } : {}),
+      ...(state.rejectUnauthorized !== undefined ? { rejectUnauthorized: state.rejectUnauthorized } : {}),
+      ...(state.resolveHost ? { resolveHost: state.resolveHost } : {}),
+      ...(state.onDenied ? { onDenied: state.onDenied } : {}),
+      ...(state.onAllow ? { onAllow: state.onAllow } : {}),
+    },
+    ...(scopePolicy ? { scopePolicy } : {}),
   }
 }
 
 /**
  * Lightweight host-loopback (`127.0.0.1:0`) HTTP + HTTPS `CONNECT` proxy for Chromium contexts.
- * Every plain HTTP request and every CONNECT tunnel passes through `resolveAndValidateHost` and
- * dials ONLY the validated pinned IP, enforcing SSRF, cloud-metadata, denylist, and scope rules.
+ * Requires per-instance (or per-context) random `Proxy-Authorization` credentials, rejecting
+ * unauthenticated local connections with `407 Proxy Authentication Required`.
+ * Every plain HTTP request and every CONNECT tunnel passes through `resolveAndValidateHost`,
+ * `allowConnectPort`, `scopePolicy`, `maxResponseBytes`, and dials ONLY the validated pinned IP.
  */
 export async function createLoopbackProxy(initialPolicy: LoopbackProxyPolicy = {}): Promise<EgressLoopbackProxy> {
-  const state: LoopbackProxyPolicy = { ...initialPolicy }
+  const defaultState: LoopbackProxyPolicy = { ...initialPolicy }
+  const defaultAuth = mintLoopbackProxyCredentials()
+  const contextPolicies = new Map<string, { credentials: LoopbackProxyCredentials; state: LoopbackProxyPolicy }>()
   const activeSockets = new Set<Duplex>()
 
   const trackSocket = (socket: Duplex) => {
@@ -1172,9 +1537,48 @@ export async function createLoopbackProxy(initialPolicy: LoopbackProxyPolicy = {
     socket.once('close', () => activeSockets.delete(socket))
   }
 
+  const authenticate = (req: IncomingMessage): LoopbackProxyPolicy | null => {
+    const parsed = parseBasicProxyAuthorization(req.headers['proxy-authorization'])
+    if (!parsed) return null
+    if (
+      constantTimeStringEqual(parsed.username, defaultAuth.credentials.username) &&
+      constantTimeStringEqual(parsed.password, defaultAuth.credentials.password)
+    ) {
+      return defaultState
+    }
+    const ctxEntry = contextPolicies.get(parsed.username)
+    if (
+      ctxEntry &&
+      constantTimeStringEqual(parsed.username, ctxEntry.credentials.username) &&
+      constantTimeStringEqual(parsed.password, ctxEntry.credentials.password)
+    ) {
+      return ctxEntry.state
+    }
+    return null
+  }
+
   const server: HttpServer = createHttpServer((req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
       if (req.socket) trackSocket(req.socket)
+
+      const state = authenticate(req)
+      if (!state) {
+        defaultState.onDenied?.({
+          url: req.url ?? '',
+          origin: '',
+          code: 'proxy_auth_required',
+          reason: 'Loopback proxy rejected unauthenticated request.',
+        })
+        writeProxyErrorResponse(
+          res,
+          407,
+          'proxy_auth_required',
+          'Proxy authentication required.',
+          { 'proxy-authenticate': 'Basic realm="Kovo-Egress-Proxy"' },
+        )
+        return
+      }
+
       const rawUrl = req.url ?? ''
       let targetUrl: URL
       try {
@@ -1190,7 +1594,26 @@ export async function createLoopbackProxy(initialPolicy: LoopbackProxyPolicy = {
       }
 
       const method = (req.method ?? 'GET').toUpperCase()
-      const policy = resolveDynamicLoopbackPolicy(state)
+      const { egress: policy, scopePolicy } = resolveDynamicLoopbackPolicy(state)
+
+      if (scopePolicy) {
+        const decision = evaluateBrowserScopeRequest(scopePolicy, {
+          origin: targetUrl.origin,
+          method,
+          pathAndQuery: `${targetUrl.pathname}${targetUrl.search}`,
+          redirectHop: true,
+        })
+        if (!decision.allowed) {
+          policy.onDenied?.({
+            url: targetUrl.href,
+            origin: targetUrl.origin,
+            code: 'scope_denied',
+            reason: decision.reason,
+          })
+          writeProxyErrorResponse(res, 403, 'scope_denied', decision.reason)
+          return
+        }
+      }
 
       let validated: { url: URL; hostname: string; addresses: PinnedAddress[] }
       try {
@@ -1224,6 +1647,7 @@ export async function createLoopbackProxy(initialPolicy: LoopbackProxyPolicy = {
       }
 
       const timeoutMs = Math.max(250, policy.timeoutMs ?? DEFAULT_TIMEOUT_MS)
+      const maxResponseBytes = Math.max(1024, policy.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES)
       const requestFn = validated.url.protocol === 'https:' ? httpsRequest : httpRequest
       const upstream = requestFn({
         protocol: validated.url.protocol,
@@ -1241,20 +1665,103 @@ export async function createLoopbackProxy(initialPolicy: LoopbackProxyPolicy = {
             }
           : {}),
       }, upRes => {
+        const rawContentLen = upRes.headers['content-length']
+        const declaredLen = typeof rawContentLen === 'string' && /^\d+$/.test(rawContentLen.trim())
+          ? Number(rawContentLen.trim())
+          : NaN
+        if (Number.isFinite(declaredLen) && declaredLen > maxResponseBytes) {
+          policy.onDenied?.({
+            url: validated.url.href,
+            origin: validated.url.origin,
+            code: 'response_too_large',
+            reason: `Proxied response declared Content-Length ${declaredLen} exceeding ${maxResponseBytes}-byte limit.`,
+          })
+          upRes.destroy()
+          writeProxyErrorResponse(
+            res,
+            502,
+            'response_too_large',
+            `Proxied response exceeded the ${maxResponseBytes}-byte limit.`,
+          )
+          return
+        }
+
         let respHeaders: IncomingHttpHeaders = { ...upRes.headers }
         for (const h of HOP_BY_HOP_HEADERS) delete respHeaders[h]
         if (state.transformResponseHeaders) {
           respHeaders = state.transformResponseHeaders(validated.url, respHeaders)
         }
-        res.writeHead(upRes.statusCode ?? 502, upRes.statusMessage, respHeaders)
-        upRes.pipe(res)
+
+        let headersFlushed = false
+        let totalReceived = 0
+        let abortedLarge = false
+
+        const flushHeaders = () => {
+          if (headersFlushed || res.headersSent) return
+          headersFlushed = true
+          res.writeHead(upRes.statusCode ?? 502, upRes.statusMessage, respHeaders)
+        }
+
+        upRes.on('data', (chunk: Buffer) => {
+          if (abortedLarge) return
+          totalReceived += chunk.byteLength
+          if (totalReceived > maxResponseBytes) {
+            abortedLarge = true
+            policy.onDenied?.({
+              url: validated.url.href,
+              origin: validated.url.origin,
+              code: 'response_too_large',
+              reason: `Proxied response exceeded the ${maxResponseBytes}-byte limit.`,
+            })
+            upRes.destroy()
+            upstream.destroy()
+            if (!res.headersSent) {
+              writeProxyErrorResponse(
+                res,
+                502,
+                'response_too_large',
+                `Proxied response exceeded the ${maxResponseBytes}-byte limit.`,
+              )
+            } else {
+              res.destroy()
+            }
+            return
+          }
+          flushHeaders()
+          if (!res.destroyed) {
+            const ok = res.write(chunk)
+            if (!ok) {
+              upRes.pause()
+              res.once('drain', () => {
+                if (!abortedLarge && !upRes.destroyed) upRes.resume()
+              })
+            }
+          }
+        })
+        upRes.once('end', () => {
+          if (abortedLarge) return
+          flushHeaders()
+          if (!res.destroyed) res.end()
+        })
+        upRes.once('error', () => {
+          if (abortedLarge) return
+          if (!res.headersSent) {
+            writeProxyErrorResponse(res, 502, 'upstream_error', 'Upstream response failed.')
+          } else {
+            res.destroy()
+          }
+        })
       })
 
       upstream.setTimeout(timeoutMs, () => {
         upstream.destroy(new Error('Upstream proxy request timed out.'))
       })
       upstream.on('error', () => {
-        writeProxyErrorResponse(res, 502, 'upstream_error', 'Upstream connection failed.')
+        if (!res.headersSent) {
+          writeProxyErrorResponse(res, 502, 'upstream_error', 'Upstream connection failed.')
+        } else {
+          res.destroy()
+        }
       })
       req.on('aborted', () => upstream.destroy())
       req.pipe(upstream)
@@ -1266,41 +1773,99 @@ export async function createLoopbackProxy(initialPolicy: LoopbackProxyPolicy = {
       trackSocket(clientSocket)
       clientSocket.on('error', () => { /* handled via close cleanup */ })
 
+      const state = authenticate(req)
+      if (!state) {
+        defaultState.onDenied?.({
+          url: req.url ?? '',
+          origin: '',
+          code: 'proxy_auth_required',
+          reason: 'Loopback proxy rejected unauthenticated CONNECT request.',
+        })
+        writeConnectError(
+          clientSocket,
+          407,
+          'Proxy Authentication Required',
+          'proxy_auth_required',
+          { 'Proxy-Authenticate': 'Basic realm="Kovo-Egress-Proxy"' },
+        )
+        return
+      }
+
       const parsed = parseConnectAuthority(req.url ?? '')
       if (!parsed) {
         writeConnectError(clientSocket, 400, 'Bad Request', 'invalid_url')
         return
       }
 
-      const policy = resolveDynamicLoopbackPolicy(state)
+      const { egress: policy, scopePolicy } = resolveDynamicLoopbackPolicy(state)
       const allowLocalLab = Boolean(policy.allowLocalLab)
 
-      if (state.allowConnectPort && !state.allowConnectPort(parsed.port, parsed.hostname)) {
-        policy.onDenied?.({
-          url: `https://${parsed.hostHeader}`,
-          origin: `https://${parsed.hostHeader}`,
-          code: 'proxy_connect_denied',
-          reason: `CONNECT port ${parsed.port} is not permitted.`,
-        })
-        writeConnectError(clientSocket, 403, 'Forbidden', 'proxy_connect_denied')
-        return
-      }
-
-      // In local-lab mode, Chromium may tunnel `ws://` via CONNECT to a port allowlisted as `http://`.
       const candidateOrigin = parsed.port === 443
         ? `https://${parsed.hostname.includes(':') ? `[${parsed.hostname}]` : parsed.hostname}`
         : `https://${parsed.hostHeader}`
+
+      if (state.allowConnectPort) {
+        if (!state.allowConnectPort(parsed.port, parsed.hostname)) {
+          policy.onDenied?.({
+            url: candidateOrigin,
+            origin: candidateOrigin,
+            code: 'proxy_connect_denied',
+            reason: `CONNECT port ${parsed.port} is not permitted.`,
+          })
+          writeConnectError(clientSocket, 403, 'Forbidden', 'proxy_connect_denied')
+          return
+        }
+      } else if (!allowLocalLab) {
+        const defaultPorts = collectAllowedPortsFromPolicy(policy, scopePolicy)
+        if (!defaultPorts.has(parsed.port)) {
+          policy.onDenied?.({
+            url: candidateOrigin,
+            origin: candidateOrigin,
+            code: 'proxy_connect_denied',
+            reason: `CONNECT port ${parsed.port} is not permitted outside local-lab.`,
+          })
+          writeConnectError(clientSocket, 403, 'Forbidden', 'proxy_connect_denied')
+          return
+        }
+      }
+
+      if (scopePolicy) {
+        const checkScope = (o: string): boolean => evaluateBrowserScopeRequest(scopePolicy, {
+          origin: o,
+          method: 'GET',
+          pathAndQuery: '/',
+          redirectHop: true,
+        }).allowed
+        const httpsOk = checkScope(candidateOrigin)
+        const httpAltOk = allowLocalLab && checkScope(candidateOrigin.replace(/^https:/i, 'http:'))
+        if (!httpsOk && !httpAltOk) {
+          policy.onDenied?.({
+            url: candidateOrigin,
+            origin: candidateOrigin,
+            code: 'scope_denied',
+            reason: `CONNECT origin "${candidateOrigin}" is denied by ScopePolicy.`,
+          })
+          writeConnectError(clientSocket, 403, 'Forbidden', 'scope_denied')
+          return
+        }
+      }
+
+      // In local-lab mode, Chromium may tunnel `ws://` via CONNECT to a port allowlisted as `http://`.
       const effectivePolicy: EgressPolicy = allowLocalLab && (policy.allowOrigin || policy.allowedOrigins)
         ? {
             ...policy,
             allowedOrigins: undefined,
             allowOrigin: (origin, method, url) => {
               const checkOne = (o: string): boolean => {
+                // H10-egress: intersect allowedOrigins AND allowOrigin when both are set.
+                if (policy.allowedOrigins !== undefined && !matchesOriginList(o, policy.allowedOrigins)) {
+                  return false
+                }
                 if (policy.allowOrigin) {
                   const v = policy.allowOrigin(o, method, url)
                   return typeof v === 'boolean' ? v : v.allowed
                 }
-                return matchesOriginList(o, policy.allowedOrigins)
+                return true
               }
               if (checkOne(origin)) return true
               const httpAlt = origin.replace(/^https:/i, 'http:')
@@ -1363,7 +1928,7 @@ export async function createLoopbackProxy(initialPolicy: LoopbackProxyPolicy = {
     })
   })
 
-  if (state.unref !== false) {
+  if (defaultState.unref !== false) {
     server.unref()
   }
 
@@ -1375,13 +1940,40 @@ export async function createLoopbackProxy(initialPolicy: LoopbackProxyPolicy = {
     url,
     host: '127.0.0.1',
     port: addr.port,
-    proxyConfig: { server: url },
+    credentials: defaultAuth.credentials,
+    authorizationHeader: defaultAuth.authorizationHeader,
+    proxyConfig: {
+      server: url,
+      username: defaultAuth.credentials.username,
+      password: defaultAuth.credentials.password,
+    },
+    registerContextPolicy(policy: LoopbackProxyPolicy): LoopbackProxyContextBinding {
+      const ctxAuth = mintLoopbackProxyCredentials()
+      const ctxState: LoopbackProxyPolicy = { ...policy }
+      contextPolicies.set(ctxAuth.credentials.username, { credentials: ctxAuth.credentials, state: ctxState })
+      return {
+        credentials: ctxAuth.credentials,
+        authorizationHeader: ctxAuth.authorizationHeader,
+        proxyConfig: {
+          server: url,
+          username: ctxAuth.credentials.username,
+          password: ctxAuth.credentials.password,
+        },
+        updatePolicy(patch: Partial<LoopbackProxyPolicy>): void {
+          Object.assign(ctxState, patch)
+        },
+        unregister(): void {
+          contextPolicies.delete(ctxAuth.credentials.username)
+        },
+      }
+    },
     updatePolicy(patch: Partial<LoopbackProxyPolicy>): void {
-      Object.assign(state, patch)
+      Object.assign(defaultState, patch)
     },
     async close(): Promise<void> {
       if (closed) return
       closed = true
+      contextPolicies.clear()
       for (const socket of activeSockets) {
         try { socket.destroy() } catch { /* ignore */ }
       }
@@ -1397,6 +1989,7 @@ export async function createLoopbackProxy(initialPolicy: LoopbackProxyPolicy = {
 
 export const EgressGateway = {
   egressFetch,
+  egressFetchStream,
   egressRawHttp1,
   egressHttp2,
   createLoopbackProxy,
