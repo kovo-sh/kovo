@@ -160,6 +160,7 @@ import type { RunDrainReport } from './run-context.ts'
 import { approvalRequests, findings } from './schema.ts'
 import { tenantTagForRun } from './scope-policy.ts'
 import { ScopedBrowser } from './scoped-browser.ts'
+import { bindScopedBrowserToGrant, registerScopedBrowserForRun, unregisterScopedBrowserForRun } from './verify-support.ts'
 import { runThreeStageSemanticAudit, toChainStepInputs, type SemanticAuditSuspect } from './semantic-audit.ts'
 import { cloneWorkerPersona } from './session-isolation.ts'
 import { buildStaticWorkspaceSnapshotInWorker } from './static-workspace-snapshot.ts'
@@ -791,6 +792,7 @@ export class Execution {
     this.budgetTracker.deleteRun(runId)
     this.board.cleanupRun(runId)
     this.broker.disposeRun(runId)
+    unregisterScopedBrowserForRun(runId)
     resetRunCustodyBudgets(runId)
     if (!actor || this.actors.get(runId) === actor) this.actors.delete(runId)
   }
@@ -1519,6 +1521,10 @@ export class Execution {
           }
         }
       },
+    }
+    if (run.capabilityTier >= 1) {
+      bindScopedBrowserToGrant(grant, this.browser)
+      registerScopedBrowserForRun(run.id, this.browser)
     }
     return { grant, secrets, currentSecrets }
   }
