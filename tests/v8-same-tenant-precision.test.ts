@@ -82,7 +82,7 @@ describe('v8 same-tenant BOLA precision and role@tenant identity parsing', () =>
   test('personaPicks pairs only strictly disjoint cross-tenant personas and never pairs same-tenant peers', () => {
     // Multi-tenant SaaS where EnginePersona.tenant was left undefined by a caller that only parsed `(tenant)`.
     const multiTenantPersonas: EnginePersona[] = [
-      { handle: 'owner_a', roleLabel: 'owner@org_a', privilege: 'member' },
+      { handle: 'owner_a', roleLabel: 'owner@org_a', privilege: 'owner' },
       { handle: 'member_a', roleLabel: 'member@org_a', privilege: 'member' },
       { handle: 'viewer_a', roleLabel: 'viewer@org_a', privilege: 'viewer' },
       { handle: 'dual_member', roleLabel: 'admin@org_a, viewer@org_b', privilege: 'admin' },
@@ -95,7 +95,7 @@ describe('v8 same-tenant BOLA precision and role@tenant identity parsing', () =>
 
     // When all seeded personas belong to the SAME tenant, crossTenant must stay undefined.
     const sameTenantOnly: EnginePersona[] = [
-      { handle: 'owner_a', roleLabel: 'owner@org_a', privilege: 'member' },
+      { handle: 'owner_a', roleLabel: 'owner@org_a', privilege: 'owner' },
       { handle: 'member_a', roleLabel: 'member@org_a', privilege: 'member' },
       { handle: 'viewer_a', roleLabel: 'viewer@org_a', privilege: 'viewer' },
     ]
