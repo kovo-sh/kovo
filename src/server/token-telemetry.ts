@@ -9,6 +9,7 @@
  *
  * Never stores raw prompts, payloads, headers, tool arguments, tool bodies, or secrets.
  */
+import { registerRunDisposer } from './run-disposers.ts'
 
 export const MAX_TRACKED_RUN_TELEMETRY = 512
 export const MAX_TOOLS_PER_RUN_TELEMETRY = 128
@@ -402,3 +403,7 @@ export function disposeRunTokenTelemetry(runId: string): boolean {
   if (!normalized) return false
   return runTelemetryStore.delete(normalized)
 }
+
+registerRunDisposer('token-telemetry:run-store', runId => {
+  disposeRunTokenTelemetry(runId)
+})

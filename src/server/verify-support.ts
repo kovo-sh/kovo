@@ -23,7 +23,15 @@ import { isDerivedCapabilityHandle, type InjectCapabilityTarget } from './derive
 import type { HostCredentialPlacement } from './host-fact-log.ts'
 import type { ResolvedPersona } from './persona-vault.ts'
 import { responseSimilarity } from './probes/context.ts'
-import { resolveBoundedBudgetCap } from './run-safety-budgets.ts'
+import { registerRunDisposer } from './run-disposers.ts'
+import {
+  DEFAULT_MAX_ASYNC_POLL_ATTEMPTS_PER_RUN,
+  DEFAULT_MAX_ASYNC_POLL_CALLS_PER_RUN,
+  HARD_MAX_ASYNC_POLL_ATTEMPTS_PER_RUN,
+  HARD_MAX_ASYNC_POLL_CALLS_PER_RUN,
+  RunAsyncPollBudgetLedger,
+  type AsyncPollBudgetUsage,
+} from './run-safety-budgets.ts'
 import { compileSafeClaimRegex, MAX_CLAIM_REGEX_HAYSTACK } from './safe-regex.ts'
 import type { Store } from './store.ts'
 
@@ -224,60 +232,39 @@ export function evaluateWorkerStructuralDiff(
 // R3-H-2: Safe async.awaitResult predicate & run-scoped call/attempt budget
 // ---------------------------------------------------------------------------
 
-export const DEFAULT_MAX_ASYNC_POLL_CALLS_PER_RUN = 128
-export const HARD_MAX_ASYNC_POLL_CALLS_PER_RUN = 2_048
-export const DEFAULT_MAX_ASYNC_POLL_ATTEMPTS_PER_RUN = 512
-export const HARD_MAX_ASYNC_POLL_ATTEMPTS_PER_RUN = 8_192
-const ASYNC_POLL_CALLS_ENV = 'KOVO_MAX_ASYNC_POLL_CALLS_PER_RUN'
-const ASYNC_POLL_ATTEMPTS_ENV = 'KOVO_MAX_ASYNC_POLL_ATTEMPTS_PER_RUN'
-const MAX_TRACKED_ASYNC_BUDGETS = 2_048
-
-interface AsyncPollBudgetState { calls: number; attempts: number }
-const runAsyncPollBudgets = new Map<string, AsyncPollBudgetState>()
-
-function getOrCreateAsyncBudget(runId: string): AsyncPollBudgetState {
-  const key = runId.trim() || '__default__'
-  let state = runAsyncPollBudgets.get(key)
-  if (!state) {
-    if (runAsyncPollBudgets.size >= MAX_TRACKED_ASYNC_BUDGETS) {
-      const oldest = runAsyncPollBudgets.keys().next().value
-      if (oldest !== undefined) runAsyncPollBudgets.delete(oldest)
-    }
-    state = { calls: 0, attempts: 0 }
-    runAsyncPollBudgets.set(key, state)
-  }
-  return state
+export {
+  DEFAULT_MAX_ASYNC_POLL_CALLS_PER_RUN,
+  HARD_MAX_ASYNC_POLL_CALLS_PER_RUN,
+  DEFAULT_MAX_ASYNC_POLL_ATTEMPTS_PER_RUN,
+  HARD_MAX_ASYNC_POLL_ATTEMPTS_PER_RUN,
 }
 
-export function consumeRunAsyncPollCallBudget(runId: string, maxPerRun?: number): number {
-  const cap = resolveBoundedBudgetCap(maxPerRun, ASYNC_POLL_CALLS_ENV, DEFAULT_MAX_ASYNC_POLL_CALLS_PER_RUN, HARD_MAX_ASYNC_POLL_CALLS_PER_RUN)
-  const state = getOrCreateAsyncBudget(runId)
-  if (state.calls >= cap) {
-    throw new Error(`async.awaitResult run call budget exceeded (max ${cap} per run).`)
-  }
-  state.calls += 1
-  return state.calls
+const runAsyncPollBudgets = new RunAsyncPollBudgetLedger({
+  defaultMaxCallsPerRun: DEFAULT_MAX_ASYNC_POLL_CALLS_PER_RUN,
+  hardMaxCallsPerRun: HARD_MAX_ASYNC_POLL_CALLS_PER_RUN,
+  defaultMaxAttemptsPerRun: DEFAULT_MAX_ASYNC_POLL_ATTEMPTS_PER_RUN,
+  hardMaxAttemptsPerRun: HARD_MAX_ASYNC_POLL_ATTEMPTS_PER_RUN,
+})
+
+export function consumeRunAsyncPollCallBudget(runId: string, maxPerRun?: number, maxTrackedRuns?: number): number {
+  return runAsyncPollBudgets.consumeCall(runId, maxPerRun, maxTrackedRuns)
 }
 
-export function consumeRunAsyncPollAttemptBudget(runId: string, maxPerRun?: number): number {
-  const cap = resolveBoundedBudgetCap(maxPerRun, ASYNC_POLL_ATTEMPTS_ENV, DEFAULT_MAX_ASYNC_POLL_ATTEMPTS_PER_RUN, HARD_MAX_ASYNC_POLL_ATTEMPTS_PER_RUN)
-  const state = getOrCreateAsyncBudget(runId)
-  if (state.attempts >= cap) {
-    throw new Error(`async.awaitResult run poll-attempt budget exceeded (max ${cap} per run).`)
-  }
-  state.attempts += 1
-  return state.attempts
+export function consumeRunAsyncPollAttemptBudget(runId: string, maxPerRun?: number, maxTrackedRuns?: number): number {
+  return runAsyncPollBudgets.consumeAttempt(runId, maxPerRun, maxTrackedRuns)
 }
 
-export function getRunAsyncPollBudgetUsage(runId: string): { calls: number; attempts: number } {
-  const state = runAsyncPollBudgets.get(runId.trim() || '__default__')
-  return state ? { calls: state.calls, attempts: state.attempts } : { calls: 0, attempts: 0 }
+export function getRunAsyncPollBudgetUsage(runId: string): AsyncPollBudgetUsage {
+  return runAsyncPollBudgets.getUsage(runId)
 }
 
 export function resetRunAsyncPollBudgets(runId?: string): void {
-  if (runId === undefined) runAsyncPollBudgets.clear()
-  else runAsyncPollBudgets.delete(runId.trim() || '__default__')
+  runAsyncPollBudgets.delete(runId)
 }
+
+registerRunDisposer('verify-support:async-poll-budgets', runId => {
+  resetRunAsyncPollBudgets(runId)
+})
 
 export interface CompiledAsyncPredicate {
   readonly empty: boolean
