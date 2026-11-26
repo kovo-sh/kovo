@@ -4,6 +4,9 @@
  * consume it without creating a runtime import cycle through `model-settings.ts` -> `store.ts`.
  */
 import { createHash } from 'node:crypto'
+import { normalizeCwe } from '../finding-keys.ts'
+
+export { ORIGIN_WIDE_CWE_KEYS, isOriginWideCwe, normalizeCwe } from '../finding-keys.ts'
 
 /** The explicitly mutated input reported by a proof script (never inferred from body key order). */
 export type MutatedInputKind = 'param' | 'header' | 'graphql' | 'rpc'
@@ -48,26 +51,6 @@ export interface ComputedFindingFingerprint {
   mutatedSource: 'explicit' | 'legacy'
 }
 
-// Origin-wide vulnerability classes where distinct probe paths on the same origin
-// typically share a single middleware/edge/server root cause.
-export const ORIGIN_WIDE_CWES: ReadonlySet<string> = new Set([
-  'CWE-942', // Permissive Cross-domain Policy (CORS)
-  'CWE-346', // Origin Validation Error
-  'CWE-693', // Protection Mechanism Failure (CSP / security headers)
-  'CWE-1021', // Clickjacking / Frame Protection
-  'CWE-319', // Cleartext Transmission / HSTS
-  'CWE-295', // Improper Certificate Validation / TLS
-  'CWE-327', // Broken/Risky Crypto / TLS cipher
-  'CWE-614', // Sensitive Cookie without Secure
-  'CWE-1004', // Sensitive Cookie without HttpOnly
-  'CWE-1275', // Sensitive Cookie SameSite
-])
-
-/** True for vulnerability classes whose root cause is shared by every route on an origin. */
-export function isOriginWideCwe(cwe?: string | null, category?: string | null): boolean {
-  return ORIGIN_WIDE_CWES.has(normalizeCwe(cwe, category))
-}
-
 const UUID_SEGMENT = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const MONGO_ID_SEGMENT = /^[0-9a-f]{24}$/i
 const NUMERIC_SEGMENT = /^\d+$/
@@ -102,15 +85,6 @@ export function normalizeOrigin(origin: string): string {
   } catch {
     return trimmed.replace(/\/+$/, '')
   }
-}
-
-export function normalizeCwe(cwe?: string | null, category?: string | null): string {
-  const cleanCwe = cwe?.trim().toUpperCase()
-  if (cleanCwe && /^CWE-\d{1,5}$/.test(cleanCwe)) return cleanCwe
-  const digits = cleanCwe?.match(/(\d{1,5})/)
-  if (cleanCwe && digits && cleanCwe.includes('CWE')) return `CWE-${digits[1]}`
-  const cleanCat = category?.trim().toLowerCase()
-  return cleanCat || 'unknown'
 }
 
 /**
