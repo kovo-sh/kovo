@@ -115,6 +115,7 @@ import {
   evaluateRoleProviderCircuit,
 } from './provider.ts'
 import { redact, type NamedSecret } from './redact.ts'
+import { defaultRetryGovernor, peekLatestProviderFailureForProfile } from './retry-governor.ts'
 import { sanitizeWorkerFactData } from './run-actor.ts'
 import { resolveRunSafetyBudgets } from './run-safety-budgets.ts'
 import { brokerExchanges, type ChainStepTerminalStatus } from './schema.ts'
@@ -509,8 +510,34 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
     lastProviderFailure?: ProviderFailureError
   }>()
   private readonly runState = this.host.runState ?? createAutoDisposedRunState()
-  private readonly providerRetryCountsByRun = this.runState.mapView('providerRetryCounts')
-  private readonly providerRetriesTotalByRun = this.runState.mapView('providerRetriesTotal')
+
+  private recordWorkerProfileFailure(
+    turnState: { lastProviderFailure?: ProviderFailureError },
+    profileId: string,
+    err: string,
+    hard: boolean,
+    notify: (profileId: string, err: string, hard: boolean) => void,
+  ): void {
+    const handedOff = peekLatestProviderFailureForProfile(profileId)
+    notify(profileId, err, hard)
+    const classified = handedOff
+      ? new ProviderFailureError(err, { kind: handedOff.kind, hard: handedOff.hard, ...(handedOff.status !== null ? { status: handedOff.status } : {}), profileId })
+      : classifyProviderFailure(err, { profileId })
+    if (classified) turnState.lastProviderFailure = classified
+  }
+
+  private resolveRunRetryContext(run: Run) {
+    void this.runState
+    const currentRun = this.storage.run(run.id)
+    const existingSteps = this.storage.listChainSteps(currentRun.id, currentRun.goalRevision)
+    const dynamicBudget = Math.min(hardChainStepsCeiling, currentRun.dynamicStepBudget ?? computeDynamicStepBudget(this.storage, currentRun.id))
+    const effectiveStepCap = Math.min(dynamicBudget, resolveRunSafetyBudgets({ maxAssignments: dynamicBudget }).maxCompositeVerifiesPerRun)
+    const maxDurationMs = this.host.reconPlanner?.getRunMaxDurationMs?.(currentRun as { maxDurationMs?: number })
+      ?? (Number((currentRun as { maxDurationMs?: number }).maxDurationMs) || 0)
+    const budgetExhausted = this.storage.checkBudgetExceeded(currentRun.id)
+    const requestBudgetExhausted = currentRun.budgetRequests > 0 && currentRun.budgetRequests - currentRun.spentRequests <= 0
+    return { currentRun, existingSteps, effectiveStepCap, maxDurationMs, budgetExhausted, requestBudgetExhausted }
+  }
 
   private pauseRunForProviderCircuit(
     run: Run,
@@ -965,29 +992,27 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
       return
     }
     // Provider-stream stall: aborting the assignment's provider call frees the slot without
-    // spending the rest of its wall budget. One retry is allowed per assignment (guarded by
-    // the target-safety idempotency invariant when tools already executed on the dropped turn).
+    // spending the rest of its wall budget. Routed through the single RetryGovernor so per-key
+    // caps, USD/request/step budgets, run wall-clock, and mid-stream tool-call safety apply.
     if (job.stallAbort) {
       const attempt = job.assignment.attempt
-      if (shouldRetryStalledAssignment(attempt) && noToolCallExecuted) {
+      const retryKey = this.resolveStepProviderRetryKey(step)
+      const retryCtx = this.resolveRunRetryContext(run)
+      const stallDecision = defaultRetryGovernor.evaluate({
+        runId: run.id, path: 'provider_stall', retryKey, retryable: shouldRetryStalledAssignment(attempt),
+        failureCode: 'stall', emitted: true, toolCallsExecutedInTurn, stepSkills: step.skills,
+        stepTrialIndex: step.trialIndex, assignmentAttempt: attempt, runStatus: retryCtx.currentRun.status,
+        runPhase: retryCtx.currentRun.phase, budgetExhausted: retryCtx.budgetExhausted,
+        requestBudgetExhausted: retryCtx.requestBudgetExhausted, runCreatedAt: retryCtx.currentRun.createdAt,
+        maxDurationMs: retryCtx.maxDurationMs, existingStepCount: retryCtx.existingSteps.length,
+        effectiveStepCap: retryCtx.effectiveStepCap,
+      })
+      if (stallDecision.allowed) {
         this.host.providerStallRetriesByRun.set(run.id, (this.host.providerStallRetriesByRun.get(run.id) ?? 0) + 1)
-        const retryKey = this.resolveStepProviderRetryKey(step)
-        let runRetryMap = this.providerRetryCountsByRun.get(run.id)
-        if (!runRetryMap) {
-          runRetryMap = new Map<string, number>()
-          this.providerRetryCountsByRun.set(run.id, runRetryMap)
-        }
-        runRetryMap.set(retryKey, (runRetryMap.get(retryKey) ?? 0) + 1)
-        this.providerRetriesTotalByRun.set(run.id, (this.providerRetriesTotalByRun.get(run.id) ?? 0) + 1)
+        defaultRetryGovernor.recordRetry(run.id, retryKey, 'provider_stall')
         try {
           recordProviderUsageTelemetry({
-            runId: run.id,
-            outcome: 'retried',
-            retried: true,
-            retryCount: 1,
-            stalled: true,
-            costUsd: 0,
-            countCall: false,
+            runId: run.id, outcome: 'retried', retried: true, retryCount: 1, stalled: true, costUsd: 0, countCall: false,
           })
         } catch { /* telemetry only */ }
         this.storage.transaction(() => {
@@ -1005,18 +1030,14 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
         })
         return
       }
-      if (!noToolCallExecuted) {
+      if (stallDecision.reason === 'midstream_tool_call_executed') {
         this.storage.event(
           run.id,
           'worker.provider_retry_blocked',
           `${step.title} stalled mid-turn after tool execution; skipping retry to preserve target safety.`,
           {
-            assignmentId: assignment.id,
-            stepId: step.id,
-            failureKind: 'stall',
-            reason: 'midstream_tool_call_executed',
-            emitted: true,
-            toolCallsExecutedInTurn,
+            assignmentId: assignment.id, stepId: step.id, failureKind: 'stall',
+            reason: 'midstream_tool_call_executed', emitted: true, toolCallsExecutedInTurn,
           },
         )
       }
@@ -1032,7 +1053,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
         })
         this.storage.updateChainStep(step.id, { status: 'model_failure', assignedWorkerId: assignment.id })
         this.storage.event(run.id, 'worker.stall_failed', `${step.title} provider stream stalled; assignment closed without consuming the wall cap.`, {
-          assignmentId: assignment.id, stepId: step.id, stepStatus: 'model_failure',
+          assignmentId: assignment.id, stepId: step.id, stepStatus: 'model_failure', reason: stallDecision.reason,
         })
       })
       this.emitStepTerminalEvent(run.id, {
@@ -1041,7 +1062,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
         stepStatus: 'model_failure',
         confirmed: false,
         gapCoded: false,
-        reason: noToolCallExecuted ? 'provider_stream_stalled_after_retry' : 'midstream_tool_call_executed',
+        reason: noToolCallExecuted ? stallDecision.reason : 'midstream_tool_call_executed',
       })
       return
     }
@@ -1107,57 +1128,37 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
       }
     }
 
-    // R2-13 Bounded transient retry (rate_limited, server, stall, stream_drop) under cq-5's
-    // 1-retry-per-key cap charged to RunSafetyBudgets + mid-stream tool-call idempotency guard.
+    // R2-13 / R3-14 Bounded transient retry (rate_limited, server, stall, stream_drop) routed
+    // through the single RetryGovernor with real wall-clock exhaustion & mid-stream safety.
     if (providerFailure?.retryable) {
       const retryKey = this.resolveStepProviderRetryKey(step)
-      let runRetryMap = this.providerRetryCountsByRun.get(run.id)
-      if (!runRetryMap) {
-        runRetryMap = new Map<string, number>()
-        this.providerRetryCountsByRun.set(run.id, runRetryMap)
-      }
-      const priorKeyRetries = runRetryMap.get(retryKey) ?? 0
-      const runProviderRetries = this.providerRetriesTotalByRun.get(run.id) ?? 0
-      const currentRun = this.storage.run(run.id)
-      const existingSteps = this.storage.listChainSteps(currentRun.id, currentRun.goalRevision)
-      const dynamicBudget = Math.min(
-        hardChainStepsCeiling,
-        currentRun.dynamicStepBudget ?? computeDynamicStepBudget(this.storage, currentRun.id),
-      )
-      const safetyBudgets = resolveRunSafetyBudgets({ maxAssignments: dynamicBudget })
-      const effectiveStepCap = Math.min(dynamicBudget, safetyBudgets.maxCompositeVerifiesPerRun)
-      const decision = evaluateTransientProviderRetry({
-        failure: providerFailure,
-        retryKey,
-        priorKeyRetries,
-        stepSkills: step.skills,
-        stepTrialIndex: step.trialIndex,
-        assignmentAttempt: assignment.attempt,
-        toolCallsExecutedInTurn,
-        runStatus: currentRun.status,
-        runPhase: currentRun.phase,
-        budgetExhausted: this.storage.checkBudgetExceeded(currentRun.id),
-        requestBudgetExhausted: currentRun.budgetRequests > 0 && currentRun.budgetRequests - currentRun.spentRequests <= 0,
-        wallClockExhausted: false,
-        existingStepCount: existingSteps.length,
-        effectiveStepCap,
-        runProviderRetries,
+      const retryCtx = this.resolveRunRetryContext(run)
+      const decision = defaultRetryGovernor.evaluate({
+        runId: run.id, path: 'provider_transient', retryKey, retryable: providerFailure.retryable,
+        failureCode: providerFailure.kind, emitted: providerFailure.emitted, toolCallsExecutedInTurn,
+        stepSkills: step.skills, stepTrialIndex: step.trialIndex, assignmentAttempt: assignment.attempt,
+        runStatus: retryCtx.currentRun.status, runPhase: retryCtx.currentRun.phase,
+        budgetExhausted: retryCtx.budgetExhausted, requestBudgetExhausted: retryCtx.requestBudgetExhausted,
+        runCreatedAt: retryCtx.currentRun.createdAt, maxDurationMs: retryCtx.maxDurationMs,
+        existingStepCount: retryCtx.existingSteps.length, effectiveStepCap: retryCtx.effectiveStepCap,
       })
-      if (decision.retry) {
-        runRetryMap.set(retryKey, priorKeyRetries + 1)
-        this.providerRetriesTotalByRun.set(run.id, runProviderRetries + 1)
+      const policyDecision = evaluateTransientProviderRetry({
+        failure: providerFailure, retryKey, priorKeyRetries: decision.priorKeyRetries,
+        stepSkills: step.skills, stepTrialIndex: step.trialIndex, assignmentAttempt: assignment.attempt,
+        toolCallsExecutedInTurn, runStatus: retryCtx.currentRun.status, runPhase: retryCtx.currentRun.phase,
+        budgetExhausted: retryCtx.budgetExhausted, requestBudgetExhausted: retryCtx.requestBudgetExhausted,
+        wallClockExhausted: decision.wallClockExhausted, existingStepCount: retryCtx.existingSteps.length,
+        effectiveStepCap: retryCtx.effectiveStepCap, runProviderRetries: decision.runProviderRetries,
+      })
+      if (decision.allowed && policyDecision.retry) {
+        const rec = defaultRetryGovernor.recordRetry(run.id, retryKey, 'provider_transient')
         if (providerFailure.kind === 'stall') {
           this.host.providerStallRetriesByRun.set(run.id, (this.host.providerStallRetriesByRun.get(run.id) ?? 0) + 1)
         }
         try {
           recordProviderUsageTelemetry({
-            runId: run.id,
-            outcome: 'retried',
-            retried: true,
-            retryCount: 1,
-            stalled: providerFailure.kind === 'stall',
-            costUsd: 0,
-            countCall: false,
+            runId: run.id, outcome: 'retried', retried: true, retryCount: 1,
+            stalled: providerFailure.kind === 'stall', costUsd: 0, countCall: false,
           })
         } catch { /* telemetry only */ }
         const retrySkills = [...new Set([...step.skills, 'r213:provider_retry:1'])]
@@ -1169,27 +1170,17 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
             lease: null,
             leaseExpiresAt: null,
           })
-          this.storage.updateChainStep(step.id, {
-            status: 'ready',
-            assignedWorkerId: null,
-            skills: retrySkills,
-          })
+          this.storage.updateChainStep(step.id, { status: 'ready', assignedWorkerId: null, skills: retrySkills })
           this.storage.event(
             run.id,
             'worker.provider_retry',
             `${step.title} hit transient provider failure (${providerFailure.kind}); requeued once.`,
             {
-              assignmentId: assignment.id,
-              stepId: step.id,
-              failureKind: providerFailure.kind,
-              status: providerFailure.status ?? null,
-              retryAfterMs: providerFailure.retryAfterMs ?? null,
-              emitted: providerFailure.emitted,
-              noToolCallExecuted,
-              retryKey,
-              retryCount: priorKeyRetries + 1,
-              runProviderRetries: runProviderRetries + 1,
-              effectiveStepCap,
+              assignmentId: assignment.id, stepId: step.id, failureKind: providerFailure.kind,
+              status: providerFailure.status ?? null, retryAfterMs: providerFailure.retryAfterMs ?? null,
+              emitted: providerFailure.emitted, noToolCallExecuted, retryKey,
+              retryCount: rec.keyRetries, runProviderRetries: rec.runProviderRetries,
+              effectiveStepCap: retryCtx.effectiveStepCap,
             },
           )
         }, { behavior: 'immediate' })
@@ -1201,13 +1192,8 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
           'worker.provider_retry_blocked',
           `${step.title} hit mid-stream ${providerFailure.kind} after tool execution; retry blocked to preserve target safety.`,
           {
-            assignmentId: assignment.id,
-            stepId: step.id,
-            failureKind: providerFailure.kind,
-            retryKey,
-            reason: decision.reason,
-            emitted: providerFailure.emitted,
-            toolCallsExecutedInTurn,
+            assignmentId: assignment.id, stepId: step.id, failureKind: providerFailure.kind,
+            retryKey, reason: decision.reason, emitted: providerFailure.emitted, toolCallsExecutedInTurn,
           },
         )
       }
@@ -2907,11 +2893,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
             }
           },
           ...baseLlmHooks,
-          onProfileFailure: (profileId, err, hard) => {
-            baseLlmHooks.onProfileFailure(profileId, err, hard)
-            const classified = classifyProviderFailure(err, { profileId })
-            if (classified) turnState.lastProviderFailure = classified
-          },
+          onProfileFailure: (profileId, err, hard) => this.recordWorkerProfileFailure(turnState, profileId, err, hard, baseLlmHooks.onProfileFailure),
           onUsage: usage => {
             const tokens = usage.inputTokens + usage.outputTokens
             this.storage.recordLlmSpend(run.id, { usd: usage.costUsd, tokens })

@@ -15,6 +15,7 @@
     "src/server/proof-receipt.ts",
     "src/server/replay-verifier.ts",
     "src/server/retest-health.ts",
+    "src/server/retry-governor.ts",
     "src/server/terminal-oracle-registry.ts",
     "src/server/v8-oracle-families.ts",
     "src/server/v8-oracle-hydrate.ts",
@@ -202,6 +203,16 @@
         "assessRetestHealth"
       ],
       "reachableFrom": []
+    },
+    {
+      "file": "src/server/retry-governor.ts",
+      "reasons": [
+        "call_graph_reachable"
+      ],
+      "matchedExports": [],
+      "reachableFrom": [
+        "src/server/proof-receipt.ts::verifyReceipt"
+      ]
     },
     {
       "file": "src/server/terminal-oracle-registry.ts",

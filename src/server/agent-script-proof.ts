@@ -40,6 +40,7 @@ import {
 import {
   assessRetestHealth,
   buildAgentScriptRetestInputs,
+  classifyAgentScriptOracleFailure,
   isFixedEligibleFailureReason,
   type RetestFailureReason,
   type RetestHealthAssessment,
@@ -655,28 +656,18 @@ export async function runAgentScriptProof(params: AgentScriptProofParams): Promi
     let typedVerdict: AgentScriptVerifyVerdict = verdict
     if (!verdict.confirmed && verdict.reason === 'oracle_failed') {
       const hasCompositeFailure = verdict.attempts.some(att => att.failures.some(f => f.startsWith('composite_receipt:')))
-      const drifted = hasAuthenticated401(exchanges)
-        || verdict.attempts.some(att => att.nonceMismatch || !att.signaturesValid)
-      const fallbackOrigin = exchanges.find(exchange => exchange.sessionRole === 'probe')?.origin
-        ?? exchanges[0]?.origin
-        ?? params.targetOrigins[0]
-        ?? ''
-      const receiptUnbuildable = !hasCompositeFailure && !drifted && Boolean(latestCapture) && !buildAgentScriptReceipt({
-        claims: latestCapture!.claims,
-        exchanges,
-        factLog: latestCapture!.factLog,
-        origin: fallbackOrigin,
-        title: params.title?.trim() || verdict.claimTitle || 'Agent script proof',
-      })
+      const drifted = hasAuthenticated401(exchanges) || verdict.attempts.some(att => att.nonceMismatch || !att.signaturesValid)
+      const fallbackOrigin = exchanges.find(exchange => exchange.sessionRole === 'probe')?.origin ?? exchanges[0]?.origin ?? params.targetOrigins[0] ?? ''
+      const hasCaptureWithClaims = Boolean(latestCapture && latestCapture.claims.length > 0)
+      const builtFallbackReceipt = !hasCompositeFailure && !drifted && hasCaptureWithClaims
+        ? buildAgentScriptReceipt({ claims: latestCapture!.claims, exchanges, factLog: latestCapture!.factLog, origin: fallbackOrigin, title: params.title?.trim() || verdict.claimTitle || 'Agent script proof' })
+        : null
+      const fallbackOracleCode = builtFallbackReceipt
+        ? defaultTerminalOracleRegistry.evaluate(builtFallbackReceipt.factLog, { kind: 'single_hop', receipt: builtFallbackReceipt.receipt, armOverrides: builtFallbackReceipt.armOverrides, ...(builtFallbackReceipt.evidenceRoleOverrides ? { evidenceRoleOverrides: builtFallbackReceipt.evidenceRoleOverrides } : {}) }, { strictHostDerivation: true, ...(builtFallbackReceipt.receipt.oracleEvents?.length ? { trustedOracleEvents: builtFallbackReceipt.receipt.oracleEvents } : {}) }).singleHop?.failureCode ?? null
+        : null
       typedVerdict = {
         ...verdict,
-        reason: hasCompositeFailure
-          ? 'composite_stage_rejected'
-          : drifted
-            ? 'session_drifted'
-            : receiptUnbuildable
-              ? 'receipt_unbuildable'
-              : 'claim_not_reproduced',
+        reason: classifyAgentScriptOracleFailure({ hasCompositeFailure, drifted, hasCaptureWithClaims, receiptBuilt: Boolean(builtFallbackReceipt), verdictReason: verdict.reason, oracleFailureCode: fallbackOracleCode, verdictDetail: verdict.detail, attempts: verdict.attempts, exchanges, vulnClass: builtFallbackReceipt?.receipt.vulnClass ?? null }),
       }
     }
     return {
@@ -755,13 +746,17 @@ export async function runAgentScriptProof(params: AgentScriptProofParams): Promi
     expected: 'host-custody verified single-hop receipt',
   }
   if (!verification.confirmed) {
-    const drifted = hasAuthenticated401(exchanges)
-    const structuralFailure = /missing|unbuildable|stub|decoy|echoed|schema|no control|anonymous|unauthenticated/i.test(verification.reason)
+    const reason = classifyAgentScriptOracleFailure({
+      hasCompositeFailure: false, drifted: hasAuthenticated401(exchanges), hasCaptureWithClaims: true,
+      receiptBuilt: verification.rule !== 'none', verdictReason: verdict.reason,
+      oracleFailureCode: verification.failureCode ?? null, rejectedByReceipt: true,
+      verdictDetail: verification.reason, attempts: verdict.attempts, exchanges, vulnClass: built.receipt.vulnClass,
+    })
     return {
       verdict: {
         ...verdict,
         confirmed: false,
-        reason: drifted ? 'session_drifted' : structuralFailure ? 'receipt_unbuildable' : 'claim_not_reproduced',
+        reason,
         detail: `ProofReceipt verification rejected the script claim (${verification.rule}): ${verification.reason}`,
         rejectedBy: 'receipt',
       },

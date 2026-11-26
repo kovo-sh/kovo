@@ -27,6 +27,7 @@ import {
 import type { ProviderStreamTelemetry, SecretSource } from './provider-stream.ts'
 import { redact } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
+import { computeProviderRetryBackoffMs, noteLatestProviderFailureForProfile, shouldRetryProviderTransport } from './retry-governor.ts'
 import {
   recordProviderUsageTelemetry,
   type ProviderUsageTelemetryInput,
@@ -776,11 +777,11 @@ export function evaluateRoleProviderCircuit(
   for (const profile of profiles) {
     const isOpen = profile.healthState === 'open' && profile.cooldownUntil !== null && profile.cooldownUntil > now
     if (!isOpen) return { hardOpen: false, profileIds: [] }
-    const classified = classifyProviderFailure(profile.lastError ?? '')
-    if (!classified || (classified.kind !== 'quota' && classified.kind !== 'auth')) {
+    const failureKind = profile.failureKind
+    if (failureKind !== 'quota' && failureKind !== 'auth') {
       return { hardOpen: false, profileIds: [] }
     }
-    if (classified.kind === 'quota') sawQuota = true
+    if (failureKind === 'quota') sawQuota = true
     else sawAuth = true
     profileIds.push(profile.id)
   }
@@ -2109,18 +2110,16 @@ export function providerPool(
                   const msg = String((event as { error?: { errorMessage?: string } }).error?.errorMessage ?? 'Model error')
                   const typed = resolveTypedFailure(msg, false)
                   if (typed && typed.kind !== 'context_overflow') {
+                    noteLatestProviderFailureForProfile(candidate.id, { kind: typed.kind, hard: typed.hard, status: typed.status ?? null, recordedAt: Date.now() })
                     options.onProfileFailure?.(candidate.id, typed.message, typed.hard)
                     lastError = typed
                     if (callBox) callBox.lastFailure = typed
                     failedOver = true
-                    if (typed.retryable && !typed.hard && idx === ordered.length - 1 && transientAttempts < maxTransportRetries) {
+                    if (shouldRetryProviderTransport({ retryable: typed.retryable, hard: typed.hard, isLastCandidate: idx === ordered.length - 1, transientAttempts, maxTransportRetries })) {
                       transientAttempts++
                       attempt++
                       retrySame = true
-                      retryWaitMs = boundedRetryWaitMs(
-                        typed.retryAfterMs,
-                        Math.min(4_000, retryBaseMs * 2 ** (attempt - 1)),
-                      )
+                      retryWaitMs = computeProviderRetryBackoffMs({ retryAfterMs: typed.retryAfterMs, attempt, baseMs: retryBaseMs })
                     }
                     recordPoolAttemptFailure(attemptTelemetryState, retrySame || idx + 1 < ordered.length)
                     break
@@ -2141,18 +2140,16 @@ export function providerPool(
                 const msg = res.errorMessage ?? 'Model error'
                 const typed = resolveTypedFailure(msg, false)
                 if (typed && typed.kind !== 'context_overflow') {
+                  noteLatestProviderFailureForProfile(candidate.id, { kind: typed.kind, hard: typed.hard, status: typed.status ?? null, recordedAt: Date.now() })
                   options.onProfileFailure?.(candidate.id, typed.message, typed.hard)
                   lastError = typed
                   if (callBox) callBox.lastFailure = typed
-                  const willRetrySame = typed.retryable && !typed.hard && idx === ordered.length - 1 && transientAttempts < maxTransportRetries
+                  const willRetrySame = shouldRetryProviderTransport({ retryable: typed.retryable, hard: typed.hard, isLastCandidate: idx === ordered.length - 1, transientAttempts, maxTransportRetries })
                   recordPoolAttemptFailure(attemptTelemetryState, willRetrySame || idx + 1 < ordered.length)
                   if (willRetrySame) {
                     transientAttempts++
                     attempt++
-                    const waitMs = boundedRetryWaitMs(
-                      typed.retryAfterMs,
-                      Math.min(4_000, retryBaseMs * 2 ** (attempt - 1)),
-                    )
+                    const waitMs = computeProviderRetryBackoffMs({ retryAfterMs: typed.retryAfterMs, attempt, baseMs: retryBaseMs })
                     if (waitMs > 0) await delay(waitMs, undefined, { signal: options.signal })
                     continue
                   }
@@ -2187,18 +2184,16 @@ export function providerPool(
                 }
                 throw finalErr
               }
+              noteLatestProviderFailureForProfile(candidate.id, { kind: typed.kind, hard: typed.hard, status: typed.status ?? null, recordedAt: Date.now() })
               options.onProfileFailure?.(candidate.id, typed.message, typed.hard)
               lastError = typed
               if (callBox) callBox.lastFailure = typed
-              const willRetrySame = typed.retryable && !typed.hard && idx === ordered.length - 1 && transientAttempts < maxTransportRetries
+              const willRetrySame = shouldRetryProviderTransport({ retryable: typed.retryable, hard: typed.hard, isLastCandidate: idx === ordered.length - 1, transientAttempts, maxTransportRetries })
               recordPoolAttemptFailure(attemptTelemetryState, willRetrySame || idx + 1 < ordered.length)
               if (willRetrySame) {
                 transientAttempts++
                 attempt++
-                const waitMs = boundedRetryWaitMs(
-                  typed.retryAfterMs,
-                  Math.min(4_000, retryBaseMs * 2 ** (attempt - 1)),
-                )
+                const waitMs = computeProviderRetryBackoffMs({ retryAfterMs: typed.retryAfterMs, attempt, baseMs: retryBaseMs })
                 if (waitMs > 0) await delay(waitMs, undefined, { signal: options.signal })
                 continue
               }
