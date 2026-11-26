@@ -55,6 +55,7 @@ import type { NamedSecret } from "./redact.ts"
 import { MAX_CLAIM_REGEX_HAYSTACK, compileSafeClaimRegex } from "./safe-regex.ts"
 import { listSkills, listSkillTags, loadSkill, searchSkills, selectPreInjectionSkills, skillsByTag } from "./skills.ts"
 import {
+  ALL_SPEC_PROOF_GAP_CODES,
   EARLY_EXIT_GRACE_TURNS,
   EARLY_EXIT_HARDENED_STATUSES,
   EARLY_EXIT_STATE_CHANGE_METHODS,
@@ -125,6 +126,7 @@ import type {
   ProofObligationEvent,
   ProofObligationStats,
   ProofRouteObligation,
+  PromptAssignmentBudget,
   ReadEvidenceSliceArgs,
   ReadRepoFileArgs,
   RejectedProofGap,
@@ -139,8 +141,42 @@ import type {
   SpecSubmissionSnapshot,
   WorkerToolHandlers,
 } from "./agent-prompts.ts"
+import {
+  AGENT_TOOL_NAMES,
+  AGENT_TOOL_REGISTRY,
+  NETWORK_TOOLS,
+  PARALLEL_READ_ONLY_TOOLS,
+  ROUTE_EVIDENCE_TOOLS,
+  SETTLEMENT_ALLOWED_TOOLS,
+  SETTLEMENT_REVOKED_TOOLS,
+  SETTLEMENT_SPEC_PAUSED_TOOLS,
+  SETTLEMENT_WRAPUP_TOOLS,
+  SPEC_SUBMISSION_TOOLS,
+  getAgentToolMetadata,
+} from "./agent-tool-registry.ts"
+import type {
+  AgentToolMetadata,
+  AgentToolName,
+  SettlementToolPhase,
+} from "./agent-tool-registry.ts"
+import type { KovoVerifyAliasKey } from "./verify-runner.ts"
 
 export {
+  AGENT_TOOL_NAMES,
+  AGENT_TOOL_REGISTRY,
+  NETWORK_TOOLS,
+  PARALLEL_READ_ONLY_TOOLS,
+  ROUTE_EVIDENCE_TOOLS,
+  SETTLEMENT_ALLOWED_TOOLS,
+  SETTLEMENT_REVOKED_TOOLS,
+  SETTLEMENT_SPEC_PAUSED_TOOLS,
+  SETTLEMENT_WRAPUP_TOOLS,
+  SPEC_SUBMISSION_TOOLS,
+  getAgentToolMetadata,
+} from "./agent-tool-registry.ts"
+
+export {
+  ALL_SPEC_PROOF_GAP_CODES,
   AGENTIC_CONTRACT_LINES,
   AGENTIC_DET_LEAD_LIMIT,
   AGENTIC_MAX_MAX_TURNS,
@@ -330,37 +366,15 @@ export {
 } from "./board-tools.ts"
 
 
-/** Settlement: probe tools revoked at 85%; read/query tools kept until the final turn; kovo_verify stays available through the final turn as the primary proof submission tool. */
-const SETTLEMENT_REVOKED_TOOLS = new Set(['request_http', 'request_http_batch', 'request_http_race', 'requestHttpRace', 'browser_visit', 'browser_session', 'probe_surface', 'probe_differential', 'run_safe_templates', 'probe_websocket'])
-const SETTLEMENT_WRAPUP_TOOLS = new Set(['verify_replay_spec', 'search_facts', 'search_exchanges', 'get_exchange', 'read_peer_trace', 'expand_digest', 'board_read', 'query_cves', 'load_skill', 'read_repo_file', 'search_repo', 'read_evidence_slice'])
+export type {
+  AgentToolMetadata,
+  AgentToolName,
+  PromptAssignmentBudget,
+  SettlementToolPhase,
+}
 
-/**
- * Tools that count as route evidence (the worker actually requested a target route) and as spec
- * submission (a persisted/attempted replay spec). Kept separate so a proof-gap settlement is only
- * required when a route was really probed, never for a pure offline/static assignment.
- */
-export const ROUTE_EVIDENCE_TOOLS: ReadonlySet<string> = new Set([
-  'request_http', 'request_http_batch', 'request_http_race', 'requestHttpRace', 'browser_visit',
-  'browser_session', 'probe_surface', 'probe_differential', 'run_safe_templates', 'probe_websocket',
-])
-export const SPEC_SUBMISSION_TOOLS: ReadonlySet<string> = new Set([
-  'kovo_verify', 'verify_replay_spec', 'propose_chain_finding', 'update_proposed_finding',
-])
-/** Tools whose arguments carry a replay spec/script we can bind to route evidence. */
-const ROUTE_BOUND_SPEC_TOOLS: ReadonlySet<string> = new Set([
-  'kovo_verify', 'verify_replay_spec', 'propose_chain_finding', 'update_proposed_finding',
-])
-
-/**
- * Offline/analysis tools paused during settlement while a probed route still has no spec. The
- * reserved wrap-up turn is for one kovo_verify call or an explicit coded proof gap, not more
- * analysis. Network tools are already revoked above; verification/closure tools stay available.
- */
-const SETTLEMENT_SPEC_PAUSED_TOOLS = new Set([
-  'derive_evidence', 'analyze_artifact', 'run_sast_scan', 'run_offline_script',
-  'query_endpoints', 'query_program_graph', 'query_facts', 'query_findings',
-  'list_second_order_canaries', 'board_post', 'suggest_candidate_host',
-])
+/** Tools whose arguments carry a replay spec/script we can bind to route evidence (derived from `agent-tool-registry.ts`). */
+const ROUTE_BOUND_SPEC_TOOLS: ReadonlySet<string> = SPEC_SUBMISSION_TOOLS
 
 
 const SPEC_ROUTE_PATH_RE = /^[A-Za-z0-9._~\-/[\]{}:@!$&()*+,;=%]*$/
@@ -879,6 +893,7 @@ export class SpecSubmissionTracker {
         if (statuses.some(status => status >= 200 && status < 300)) return { ok: false, missing: 'evidence that the runtime is unavailable (a 2xx exchange was recorded)' }
         return { ok: true, evidence: 'no successful exchange on the route' }
       case 'no_spec_shape':
+      case 'cannot_build_spec':
       case 'baseline_empty':
       case 'no_control_path':
       default:
@@ -1150,7 +1165,7 @@ export function settlementToolBlock(input: {
 }): string | undefined {
   if (!input.settling) return undefined
   const finalTurn = input.finalTurn ?? input.maxTurns
-  if (SETTLEMENT_REVOKED_TOOLS.has(input.name)) {
+  if (!SETTLEMENT_ALLOWED_TOOLS.has(input.name)) {
     return `Settlement wrap-up active (${input.turnsUsed}/${input.maxTurns} turns). ${input.name} is disabled during settlement. Finalize offline analysis, commit record_fact / record_coverage / propose_chain_finding, and call complete_intent.`
   }
   if (input.turnsUsed >= finalTurn && SETTLEMENT_WRAPUP_TOOLS.has(input.name)) {
@@ -1855,6 +1870,10 @@ export interface SpecSubmissionToolOptions {
   tracker?: SpecSubmissionTracker
   /** Called once per rejected simple conclusion so the caller can emit `agent.spec_submission_required`. */
   onRequired?: (info: { status: string; count: number; route?: SpecRouteEvidence }) => void
+  /** Live predicate reporting whether settlement is currently active (controls truthful gap-rejection wording). */
+  isSettling?: () => boolean
+  /** Optional callback receiving host-side `kovo_verify` tool-arg alias hits (`code`/`source`). */
+  onVerifyAliasUsed?: (aliases: readonly KovoVerifyAliasKey[]) => void
   /** Explicitly opt in to registering legacy `verify_replay_spec` while `kovo_verify` is active (default false to prevent LLM DSL dilution). */
   allowLegacyReplaySpec?: boolean
   /** Staged read-only repositories root on host for fast parallel `read_repo_file` / `search_repo`. */
@@ -3059,6 +3078,9 @@ export function buildWorkerTools(
             }],
           }
         }
+        const toolArgAlias: 'code' | 'source' | undefined = !args.script?.trim()
+          ? (args.code?.trim() ? 'code' : args.source?.trim() ? 'source' : undefined)
+          : undefined
         const inlineScript = (args.script ?? args.code ?? args.source)?.trim()
         const scriptPath = args.scriptPath?.trim()
         const rawRuntime = args.runtime as string | undefined
@@ -3075,7 +3097,7 @@ export function buildWorkerTools(
           gvValidationErrors += 1
           const example = '{"script":"await ctx.prove_access_boundary({ controlPersona: \'user_b\', probePersona: \'user_a\', route: \'/api/items/1\' }); return ctx.result({ title: \'BOLA read\' })","runtime":"ts"}'
           const loopStop = gvValidationErrors >= 3
-            ? ` Repeated kovo_verify validation errors (${gvValidationErrors}x): stop retrying malformed calls — either pass a non-empty \`script\` string matching the example or call record_coverage(proofGapReason="cannot_build_spec") and complete_intent.`
+            ? ` Repeated kovo_verify validation errors (${gvValidationErrors}x): stop retrying malformed calls — either pass a non-empty \`script\` string matching the example or call record_coverage(proofGapReason="no_spec_shape") and complete_intent.`
             : ''
           return {
             isError: true,
@@ -3085,6 +3107,11 @@ export function buildWorkerTools(
             }],
           }
         }
+        if (toolArgAlias) {
+          try {
+            specSubmission?.onVerifyAliasUsed?.([toolArgAlias === 'code' ? 'tool_arg:code' : 'tool_arg:source'])
+          } catch { /* telemetry only */ }
+        }
         gvValidationErrors = 0
         const runtime: KovoVerifyRuntime = 'ts'
         const payload: KovoVerifyArgs = {
@@ -3092,6 +3119,7 @@ export function buildWorkerTools(
           runtime,
           ...(args.title?.trim() ? { title: scrubExact(args.title.trim()) } : {}),
           ...(args.timeoutMs !== undefined ? { timeoutMs: args.timeoutMs } : {}),
+          ...(toolArgAlias ? { aliasUsed: toolArgAlias } : {}),
         }
         return wrapExec(
           'kovo_verify',
@@ -3430,7 +3458,13 @@ export function buildWorkerTools(
             })
             return {
               isError: true,
-              output: [{ type: 'text' as const, text: gapValidationRejectedMessage(gapCheck.rejected, target, { hasKovoVerify: hasKovoVerify && !allowLegacyReplaySpec }) }],
+              output: [{
+                type: 'text' as const,
+                text: gapValidationRejectedMessage(gapCheck.rejected, target, {
+                  hasKovoVerify: hasKovoVerify && !allowLegacyReplaySpec,
+                  settling: specSubmission?.isSettling?.() ?? true,
+                }),
+              }],
             }
           }
         }
@@ -3463,14 +3497,6 @@ export function buildWorkerTools(
   // v6 Phase 4: read/query tools run concurrently; network/mutation tools stay sequential.
   return tools.map(tool => ({ ...tool, executionMode: PARALLEL_READ_ONLY_TOOLS.has(tool.name) ? 'parallel' as const : 'sequential' as const }))
 }
-
-/** Read-only tools safe to execute concurrently inside a single tool round. */
-export const PARALLEL_READ_ONLY_TOOLS: ReadonlySet<string> = new Set([
-  'search_facts', 'search_exchanges', 'get_exchange', 'read_peer_trace', 'expand_digest',
-  'query_endpoints', 'query_program_graph', 'query_facts', 'query_findings',
-  'board_read', 'query_cves', 'load_skill', 'list_second_order_canaries',
-  'read_repo_file', 'search_repo', 'read_evidence_slice', 'derive_evidence',
-])
 
 // ---------------------------------------------------------------------------
 // High-Limit Multi-Turn Pi Durable Runner
@@ -3604,23 +3630,29 @@ export interface RunAgentSessionOptions {
   prompt: string
   instructions?: string
   signal: AbortSignal
+  /** Authoritative `AssignmentBudget` (single source of truth for maxTurns, settlementTurn, and wall-clock settlement). */
+  budget?: PromptAssignmentBudget
   maxTurns?: number
   thinkingLevel?: ThinkingLevel
   roleAffinity?: RoleAffinity
   compaction?: boolean
   inlineToolOutputBytes?: number
-  /** Enable 85% Graceful Settlement wrap-up (default: true when complete_intent handler is present). */
+  /** Enable Graceful Settlement wrap-up (default: true when complete_intent handler is present). */
   enableSettlement?: boolean
-  /** Optional external settlement trigger (e.g., 85% wall-clock or request budget reached). */
+  /** Optional external settlement trigger (e.g., wall-clock or request budget reached). */
   shouldSettle?: () => boolean
-  /** Optional wall-clock budget for the session; settles at `max(wallClockMs - 15s, 80%)` and hard-rotates at `wallClockMs`. */
+  /** Optional wall-clock budget for the session; settles at `wallClockSettlementMs` (or `budget.wallClockSettlementMs`) and hard-rotates at `wallClockMs`. */
   wallClockMs?: number
+  /** Explicit wall-clock settlement threshold in ms relative to session start (overrides default recompute when provided). */
+  wallClockSettlementMs?: number
   /** Optional pause-aware clock for wall-clock settlement & rotation (auto-pauses on approval waits / run pause). */
   activeClock?: ActiveClock
   /** Optional grace window when a proof call (`kovo_verify`) is actively running at `wallClockMs` (default 5s). */
   wallClockGraceMs?: number
   /** Called once when the hard per-assignment `wallClockMs` deadline triggers a bounded rotation. */
   onWallClockRotate?: (info: { elapsedMs: number; wallClockMs: number; turnsUsed: number; graceUsedMs: number }) => void
+  /** Optional telemetry callback when `kovo_verify` tool-arg aliases (`code`/`source`) are used. */
+  onVerifyAliasUsed?: (aliases: readonly KovoVerifyAliasKey[]) => void
   /** Require complete_intent before finishing (with up to 2 empty-turn nudges; default: true when complete_intent handler is present). */
   requireCompleteIntent?: boolean
   handlers?: WorkerToolHandlers
@@ -3728,7 +3760,8 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
         : options.scenario === 'worker-investigation'
           ? defaultWorkerMaxTurns
           : (primarySettings.protocol === 'messages' ? 3 : 1)
-  const maxTurns = Math.max(1, Math.min(maxWorkerMaxTurns, Math.floor(options.maxTurns ?? defaultTurns)))
+  const budget = options.budget
+  const maxTurns = Math.max(1, Math.min(maxWorkerMaxTurns, Math.floor(options.maxTurns ?? budget?.maxTurns ?? defaultTurns)))
   const inlineLimit = Math.max(
     1024,
     Math.min(maxInlineToolOutputBytes, Math.floor(options.inlineToolOutputBytes ?? defaultInlineToolOutputBytes)),
@@ -3769,12 +3802,21 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
   options.signal.addEventListener('abort', onParentAbort, { once: true })
   if (options.signal.aborted) sessionController.abort(options.signal.reason)
 
-  const effectiveWallClockMs = options.wallClockMs && Number.isFinite(options.wallClockMs) && options.wallClockMs > 0
-    ? Math.max(1, Math.floor(options.wallClockMs))
+  const rawWallClockMs = options.wallClockMs ?? budget?.wallClockMs
+  const effectiveWallClockMs = rawWallClockMs && Number.isFinite(rawWallClockMs) && rawWallClockMs > 0
+    ? Math.max(1, Math.floor(rawWallClockMs))
     : undefined
-  const wallClockSettlementBudgetMs = effectiveWallClockMs !== undefined
-    ? wallClockSettlementMs(effectiveWallClockMs)
-    : undefined
+  const displayWallClockMs = budget?.wallClockMs && Number.isFinite(budget.wallClockMs) && budget.wallClockMs > 0
+    ? Math.max(1, Math.floor(budget.wallClockMs))
+    : effectiveWallClockMs
+  const rawWallClockSettlementMs = options.wallClockSettlementMs ?? budget?.wallClockSettlementMs
+  const wallClockSettlementBudgetMs = rawWallClockSettlementMs !== undefined
+    && Number.isFinite(rawWallClockSettlementMs)
+    && rawWallClockSettlementMs > 0
+    ? Math.max(1, Math.floor(rawWallClockSettlementMs))
+    : effectiveWallClockMs !== undefined
+      ? wallClockSettlementMs(effectiveWallClockMs, budget?.budgetClass === 'multi_hop_chain')
+      : undefined
   const proofGraceMs = effectiveWallClockMs === undefined
     ? 0
     : options.wallClockGraceMs !== undefined
@@ -3816,8 +3858,10 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
   const handlers = options.handlers ?? {}
   const enableSettlement = options.enableSettlement ?? Boolean(handlers.complete_intent && maxTurns >= 4)
   const requireCompleteIntent = options.requireCompleteIntent ?? Boolean(handlers.complete_intent)
-  const settlementTurn = Math.max(1, Math.floor(maxTurns * 0.85))
-  const settlementNudgeTurn = settlementNudgeTurnFor(maxTurns)
+  const settlementTurn = budget && Number.isFinite(budget.settlementTurn) && budget.settlementTurn > 0
+    ? Math.max(1, Math.min(maxTurns, Math.floor(budget.settlementTurn)))
+    : settlementNudgeTurnFor(maxTurns)
+  const settlementNudgeTurn = settlementTurn
   const wallClockDeadline = wallClockSettlementBudgetMs
 
   let turnsUsed = 0
@@ -3971,6 +4015,8 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
         repairTurn = turnsUsed
         options.onSpecSubmissionRequired?.(info)
       },
+      isSettling,
+      ...(options.onVerifyAliasUsed ? { onVerifyAliasUsed: options.onVerifyAliasUsed } : {}),
       ...(options.allowLegacyReplaySpec ? { allowLegacyReplaySpec: true } : {}),
       ...(resolvedReposDir ? { reposDir: resolvedReposDir } : {}),
       ...(options.evidenceDir ? { evidenceDir: options.evidenceDir } : {}),
@@ -4013,7 +4059,7 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
             role: 'user' as const,
             content: wallClockSettlementMessage({
               elapsedMs: sessionActiveElapsedMs(),
-              wallClockMs: effectiveWallClockMs,
+              wallClockMs: displayWallClockMs ?? effectiveWallClockMs,
               proofTools: registeredProofTools,
               ...(specDirective ? { specDirective } : {}),
             }),
@@ -4022,13 +4068,13 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
         } else if (settlingNow) {
           extraMessages.push({
             role: 'user' as const,
-            content: settlementBannerMessage({ turnsUsed, maxTurns, proofTools: registeredProofTools, ...(specDirective ? { specDirective } : {}) }),
+            content: settlementBannerMessage({ turnsUsed, maxTurns, settlementTurn, proofTools: registeredProofTools, ...(specDirective ? { specDirective } : {}) }),
             timestamp: Date.now(),
           })
         } else if (handlers.complete_intent && turnsUsed + 1 === settlementNudgeTurn) {
           extraMessages.push({
             role: 'user' as const,
-            content: settlementNudgeMessage({ turn: turnsUsed + 1, maxTurns, proofTools: registeredProofTools, ...(specDirective ? { specDirective } : {}) }),
+            content: settlementNudgeMessage({ turn: turnsUsed + 1, maxTurns, settlementTurn, proofTools: registeredProofTools, ...(specDirective ? { specDirective } : {}) }),
             timestamp: Date.now(),
           })
         }

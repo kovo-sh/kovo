@@ -39,6 +39,7 @@ import type { DifferentialProbeClass, SurfaceWordlistName } from "./surface-engi
 import type { SastEngine } from "./worker-backend.ts"
 import type { MissionKind } from "./assignment-brief.ts"
 import { ASSIGNMENT_BRIEF_MAX_BYTES_WITH_CODE, renderSettlementSpecDirective } from "./assignment-brief.ts"
+import { SETTLEMENT_REVOKED_TOOLS } from "./agent-tool-registry.ts"
 
 
 export function truncateUtf8Head(text: string, maxBytes: number): string {
@@ -59,18 +60,23 @@ export const defaultPatchMaxTurns = 20
 export const maxEmptyTurnNudges = 2
 
 /**
- * Agentic lane budgets (v5.1). Flash-class models do well on short, batched micro-tasks and badly on
- * long open exploration. These are exported so the lane can wire 8-10 turns / 75-90 s without
- * touching tests that assert the legacy defaults; `runAgentSession` still honors an explicit
- * `maxTurns` and adds an opt-in `wallClockMs`.
+ * @deprecated Compatibility constants retained only for legacy v5 callers/tests outside the
+ * authoritative `AssignmentBudget` path (`resolveAssignmentBudget` in `exec-dispatch.ts`).
+ * Live prompts and `runAgentSession` derive all turn and wall-clock thresholds directly from
+ * `AssignmentBudget`.
  */
 export const AGENTIC_SPECIALIST_MAX_TURNS = 9
+/** @deprecated Use `resolveAssignmentBudget` (`AssignmentBudget`) instead. */
 export const AGENTIC_UPGRADE_MAX_TURNS = 7
+/** @deprecated Use `resolveAssignmentBudget` (`AssignmentBudget`) instead. */
 export const AGENTIC_MIN_MAX_TURNS = 6
+/** @deprecated Use `resolveAssignmentBudget` (`AssignmentBudget`) instead. */
 export const AGENTIC_MAX_MAX_TURNS = 10
+/** @deprecated Use `resolveAssignmentBudget` (`AssignmentBudget`) instead. */
 export const AGENTIC_SPECIALIST_WALL_CLOCK_MS = 80_000
 export const AGENTIC_DET_LEAD_LIMIT = 8
 
+/** @deprecated Use `resolveAssignmentBudget` (`AssignmentBudget`) instead. */
 export function resolveAgenticTurnBudget(missionKind?: MissionKind): number {
   switch (missionKind) {
     case 'det_lead_upgrade':
@@ -81,20 +87,38 @@ export function resolveAgenticTurnBudget(missionKind?: MissionKind): number {
   }
 }
 
+/** Structural contract matching `AssignmentBudget` from `exec-dispatch.ts` (single source of truth). */
+export interface PromptAssignmentBudget {
+  kind?: 'single_step' | 'chain'
+  budgetClass?: 'single_step' | 'multi_step' | 'multi_hop_chain'
+  maxTurns: number
+  wallClockMs?: number
+  wallClockSettlementMs?: number
+  settlementTurn: number
+}
+
 /** Bounded grace window for an actively executing `kovo_verify` / proof call at `wallClockMs`. */
 export const WALL_CLOCK_PROOF_GRACE_MS = 5_000
 
+const STANDARD_WALL_CLOCK_SETTLEMENT_BUFFER_MS = 15_000
+const STANDARD_WALL_CLOCK_SETTLEMENT_SHARE = 0.8
+const MULTIHOP_WALL_CLOCK_SETTLEMENT_BUFFER_MS = 25_000
+const MULTIHOP_WALL_CLOCK_SETTLEMENT_SHARE = 0.82
+
 /**
- * Elapsed-ms threshold at which the final wall-clock settlement nudge fires:
- * `max(wallClockMs - 15s, wallClockMs * 0.8)` so every assignment gets a crisp wrap-up window
- * before the hard `wallClockMs` rotation deadline aborts the session.
+ * Single authoritative elapsed-ms threshold at which wall-clock settlement fires:
+ *  - Multi-hop `chain` assignments settle at `max(wallClockMs - 25s, wallClockMs * 0.82)`.
+ *  - Standard assignments settle at `max(wallClockMs - 15s, wallClockMs * 0.80)`.
  */
-export function wallClockSettlementMs(wallClockMs: number): number {
+export function wallClockSettlementMs(wallClockMs: number, isMultiHop = false): number {
   const wall = Math.max(1, Math.floor(wallClockMs))
-  return Math.max(1, Math.floor(Math.max(wall - 15_000, wall * 0.8)))
+  if (isMultiHop) {
+    return Math.max(1, Math.min(wall, Math.max(wall - MULTIHOP_WALL_CLOCK_SETTLEMENT_BUFFER_MS, Math.floor(wall * MULTIHOP_WALL_CLOCK_SETTLEMENT_SHARE))))
+  }
+  return Math.max(1, Math.min(wall, Math.max(wall - STANDARD_WALL_CLOCK_SETTLEMENT_BUFFER_MS, Math.floor(wall * STANDARD_WALL_CLOCK_SETTLEMENT_SHARE))))
 }
 
-/** Hard settlement nudge at N-2 turns (independent of the 85% network-revocation threshold). */
+/** Single authoritative settlement turn threshold: `max(1, floor(maxTurns) - 2)` (N-2). */
 export function settlementNudgeTurnFor(maxTurns: number): number {
   return Math.max(1, Math.floor(maxTurns) - 2)
 }
@@ -126,21 +150,23 @@ export function settlementDue(input: {
 export function settlementNudgeMessage(input: {
   turn: number
   maxTurns: number
+  settlementTurn?: number
   proofTools?: readonly string[]
   specDirective?: string
 }): string {
+  const settleAt = input.settlementTurn ?? settlementNudgeTurnFor(input.maxTurns)
   const typed = (input.proofTools ?? []).filter(name => name.trim())
   const proofPath = typed.length
     ? `submit your proof now via ${typed.join(', ')} (auto-persists confirmed findings; prefer over legacy propose_chain_finding)`
     : 'submit your best proof now via propose_chain_finding/update_proposed_finding'
   return [
     `[KOVO SETTLEMENT NUDGE — Turn ${input.turn}/${input.maxTurns}]`,
-    `Hard settlement starts at turn ${settlementNudgeTurnFor(input.maxTurns)} (N-2). ${proofPath}, or call complete_intent with status (proved | ruled_out | blocked | partial) and a concise summary. Do not start new exploration.`,
+    `Hard settlement starts at turn ${settleAt} (N-2). ${proofPath}, or call complete_intent with status (proved | ruled_out | blocked | partial) and a concise summary. Do not start new exploration.`,
     ...(input.specDirective ? [input.specDirective] : []),
   ].join(' ')
 }
 
-/** Final wall-clock settlement nudge injected at `max(wallClockMs - 15s, wallClockMs * 0.8)`. */
+/** Final wall-clock settlement nudge injected at `budget.wallClockSettlementMs`. */
 export function wallClockSettlementMessage(input: {
   elapsedMs: number
   wallClockMs: number
@@ -160,20 +186,23 @@ export function wallClockSettlementMessage(input: {
   ].join(' ')
 }
 
-/** 85% settlement banner: network tools are revoked, offline wrap-up only. */
+/** Settlement banner: network tools derived from `SETTLEMENT_REVOKED_TOOLS` are revoked; offline wrap-up & proof tools stay available. */
 export function settlementBannerMessage(input: {
   turnsUsed: number
   maxTurns: number
+  settlementTurn?: number
   proofTools?: readonly string[]
   specDirective?: string
 }): string {
+  const settleAt = input.settlementTurn ?? settlementNudgeTurnFor(input.maxTurns)
+  const revokedList = [...SETTLEMENT_REVOKED_TOOLS].join(', ')
   const typed = (input.proofTools ?? []).filter(name => name.trim())
   const proofPath = typed.length
     ? `submit or update any ready candidate findings via ${typed.join('/')} (auto-persists confirmed findings; avoid legacy propose_chain_finding for runtime issues)`
     : 'submit or update any ready candidate findings via propose_chain_finding/update_proposed_finding'
   return [
     `[KOVO SETTLEMENT NOTICE — Turn ${input.turnsUsed}/${input.maxTurns}]`,
-    'You have reached the 85% settlement threshold. Network probing tools (request_http, request_http_batch, request_http_race, browser_visit, probe_surface, probe_differential, run_safe_templates, probe_websocket) are now revoked; graph/query tools and kovo_verify remain available until the final turn.',
+    `You have reached the settlement threshold (turn ${settleAt}/${input.maxTurns}). Network probing tools (${revokedList}) are now revoked; graph/query tools and kovo_verify remain available until the final turn.`,
     `Use your remaining turns ONLY to: (1) finish offline analysis with derive_evidence/analyze_artifact/run_sast_scan/run_offline_script or query recorded facts/exchanges, (2) commit unrecorded facts via record_fact and 3-state closure entries via record_coverage (with enforcingControl or proofGapReason), (3) ${proofPath} and verify with kovo_verify, and (4) call complete_intent with your final status and summary.`,
     ...(input.specDirective ? [input.specDirective] : []),
   ].join(' ')
@@ -227,17 +256,24 @@ export const SPEC_PROOF_GAP_ALIASES = [
   'method_not_allowed',
   'no_readback_surface',
   'hardened_or_no_anomaly',
+  'cannot_build_spec',
   ...NEGATIVE_EDGE_PROOF_GAP_CODES,
 ] as const
 
-export type SpecProofGapCode = typeof SPEC_PROOF_GAP_CODES[number] | typeof SPEC_PROOF_GAP_ALIASES[number]
+/** Full canonical + alias proof-gap code enum accepted by `parseProofGapCode`. */
+export const ALL_SPEC_PROOF_GAP_CODES = [
+  ...SPEC_PROOF_GAP_CODES,
+  ...SPEC_PROOF_GAP_ALIASES,
+] as const
+
+export type SpecProofGapCode = typeof ALL_SPEC_PROOF_GAP_CODES[number]
 
 /** Extract a leading machine-readable proof-gap code, if present (e.g. `no_spec_shape: step request...`). */
 export function parseProofGapCode(reason: string | undefined | null): SpecProofGapCode | null {
   const value = (reason ?? '').trim().toLowerCase()
   if (!value) return null
   const head = value.split(/[^a-z0-9_]+/, 1)[0] ?? ''
-  const known: readonly string[] = [...SPEC_PROOF_GAP_CODES, ...SPEC_PROOF_GAP_ALIASES]
+  const known: readonly string[] = ALL_SPEC_PROOF_GAP_CODES
   return known.includes(head) ? head as SpecProofGapCode : null
 }
 
@@ -693,17 +729,21 @@ export function specSubmissionRequiredMessage(
 export function gapValidationRejectedMessage(
   rejected: readonly RejectedProofGap[],
   route?: SpecRouteEvidence,
-  options?: { hasKovoVerify?: boolean },
+  options?: { hasKovoVerify?: boolean; settling?: boolean },
 ): string {
   const evidence = rejected.map(gap => `- ${gap.code} on ${gap.key}: missing ${gap.missing}`).join('; ')
   const routeText = route ? ` for ${route.method} ${route.path}` : ''
   const scriptOnly = options?.hasKovoVerify === true
+  const settling = options?.settling !== false
   const repairProof = scriptOnly
     ? `call kovo_verify(script="<inline TS using ctx.prove_*>", runtime="ts")${routeText}`
     : `call kovo_verify(script="<inline TS using ctx.prove_*>", runtime="ts")${routeText} (or verify_replay_spec with DeclarativeReplaySpec: ${KOVO_VERIFY_SPEC_SHAPE})`
+  const repairAlternative = settling
+    ? 'or inspect recorded evidence with search_exchanges/get_exchange and update record_coverage with a proofGapReason supported by those exchanges (network probing tools are revoked during settlement).'
+    : 'or record the missing exchange with request_http and re-record record_coverage with the same route.'
   return [
     `complete_intent rejected (agent.gap_validation): the coded proof gap is not supported by the recorded Layer-1 exchange transcript (${evidence}).`,
-    `Repair now: ${repairProof}, or probe the route to record the missing exchange and re-record the proof gap with the same route.`,
+    `Repair now: ${repairProof}, ${repairAlternative}`,
     'Each route gap is validated once per assignment: a repeated unsupported gap will not block completion again. complete_intent(status="blocked") remains accepted.',
   ].join(' ')
 }
@@ -766,7 +806,7 @@ export const KOVO_VERIFY_TOOL_DESCRIPTION =
 /** Hard budget for the guidance block added on top of the script-first base description. */
 export const KOVO_VERIFY_HELPER_GUIDANCE_MAX_BYTES = 2048
 
-export interface KovoVerifyArgs { script?: string; scriptPath?: string; runtime?: KovoVerifyRuntime; title?: string; timeoutMs?: number }
+export interface KovoVerifyArgs { script?: string; scriptPath?: string; runtime?: KovoVerifyRuntime; title?: string; timeoutMs?: number; aliasUsed?: 'code' | 'source' }
 export interface KovoVerifyAttemptSummary { attempt: number; oraclePassed: boolean; exitCode: number; exchangeCount: number; transcriptDigest: string; signaturesValid: boolean; failures: string[] }
 export interface KovoVerifySealedCapabilitySummary { handle: string; kind: string; sha256Prefix: string; derivedFromCapabilityId?: string }
 export interface KovoVerifyHopSummary { hopReceiptId: string; edgeId: string; binding: string; postconditionCapId?: string | null; terminalImpact?: string | null }
@@ -1506,6 +1546,8 @@ export interface AgenticPromptContextInput {
   detLeads?: readonly DetLeadSummary[]
   detLeadLimit?: number
   assignmentBrief?: string
+  budget?: PromptAssignmentBudget
+  maxTurns?: number
 }
 
 function cleanPromptValue(value: unknown, maxBytes: number): string {
@@ -1648,6 +1690,23 @@ export function buildAgenticPromptContext(input: AgenticPromptContextInput = {})
   const brief = input.assignmentBrief
     ? truncateUtf8Head(input.assignmentBrief, ASSIGNMENT_BRIEF_MAX_BYTES_WITH_CODE)
     : ''
+  const effectiveMaxTurns = input.budget?.maxTurns ?? input.maxTurns
+  const effectiveSettlementTurn = input.budget?.settlementTurn
+    ?? (effectiveMaxTurns !== undefined ? settlementNudgeTurnFor(effectiveMaxTurns) : undefined)
+  const effectiveWallSec = input.budget?.wallClockMs !== undefined
+    ? Math.round(input.budget.wallClockMs / 1000)
+    : undefined
+  const effectiveWallSettleSec = input.budget?.wallClockSettlementMs !== undefined
+    ? Math.round(input.budget.wallClockSettlementMs / 1000)
+    : input.budget?.wallClockMs !== undefined
+      ? Math.round(wallClockSettlementMs(input.budget.wallClockMs, input.budget.budgetClass === 'multi_hop_chain') / 1000)
+      : undefined
+  const turnBudgetGuidance = effectiveMaxTurns !== undefined
+    ? `${effectiveMaxTurns} turns (settlement starts at turn ${effectiveSettlementTurn}${effectiveWallSec !== undefined ? `; ${effectiveWallSec}s wall-clock, wall-clock settlement at ${effectiveWallSettleSec}s` : ''}).`
+    : 'Derived per assignment from AssignmentBudget (maxTurns and settlementTurn = maxTurns - 2).'
+  const settlementGuidance = effectiveSettlementTurn !== undefined
+    ? `At turn ${effectiveSettlementTurn} (N-2), submit your proof via kovo_verify(script="...") (auto-persists confirmed findings; avoid legacy propose_chain_finding for runtime issues) or call complete_intent; do not start new exploration.`
+    : 'At turn N-2 (budget.settlementTurn), submit your proof via kovo_verify(script="...") (auto-persists confirmed findings; avoid legacy propose_chain_finding for runtime issues) or call complete_intent; do not start new exploration.'
 
   return {
     contract: [...AGENTIC_CONTRACT_LINES],
@@ -1679,8 +1738,8 @@ export function buildAgenticPromptContext(input: AgenticPromptContextInput = {})
       batching: 'Use request_http_batch for 4-8 independent probes per turn on baseline+differential turns; use a single request_http only for a sequential dependency.',
       parallelReadOnly: 'Batch independent read-only calls (read_repo_file, search_repo, read_evidence_slice, get_exchange, search_facts, search_exchanges, board_read) in parallel; use derive_evidence only for jq/pipelines.',
       assignmentTarget: 'One assignment = one hypothesis cluster (1-3 linked routes) or one det_lead upgrade.',
-      turnBudget: '8-10 turns; 6-8 turns for det_lead upgrades and chain step 2.',
-      settlement: 'At turn N-2, submit your proof via kovo_verify(script="...") (auto-persists confirmed findings; avoid legacy propose_chain_finding for runtime issues) or call complete_intent; do not start new exploration.',
+      turnBudget: turnBudgetGuidance,
+      settlement: settlementGuidance,
       // Durable even when the skill catalog is slimmed: the same guidance lives on the tool.
       proofTools: kovoVerifyPromptHint(),
     },
@@ -1780,7 +1839,7 @@ export function codeAuditPrompt(input: CodeAuditPromptInput): string {
     mountedRepos: input.mountedRepos,
     reposRoot: '/repos',
     maxTurns,
-    settlementStartsAtTurn: Math.max(1, Math.floor(maxTurns * 0.85)),
+    settlementStartsAtTurn: settlementNudgeTurnFor(maxTurns),
     recordingPolicy: {
       mode: 'incremental',
       rule: 'Call record_fact(kind="code_audit_suspect") IMMEDIATELY as soon as you spot each high-signal defect in a service or handler file. Do NOT wait until you have read every file in the repository before recording facts.',
@@ -2142,6 +2201,7 @@ export function workerInvestigationPrompt(input: {
   origins: readonly string[]
   capabilityTier: CapabilityTier
   maxTurns: number
+  budget?: PromptAssignmentBudget
   personas?: readonly { handle: string; roleLabel: string; originAllowlist: readonly string[] }[]
   bolaTestQueue?: readonly PersonaResourceQueueItem[]
   parentFacts?: readonly { id: string; kind: string; origin: string; summary: string; data?: Record<string, unknown> }[]
@@ -2172,6 +2232,20 @@ export function workerInvestigationPrompt(input: {
     dependsOnFactIds: input.step.dependsOnFactIds
       ?? (input.parentFacts?.length ? input.parentFacts.map(f => f.id) : undefined),
   })
+  const effectiveMaxTurns = input.budget?.maxTurns ?? input.maxTurns
+  const effectiveSettlementTurn = input.budget?.settlementTurn ?? settlementNudgeTurnFor(effectiveMaxTurns)
+  const effectiveWallClockMs = input.budget?.wallClockMs
+  const effectiveWallClockSettlementMs = input.budget?.wallClockSettlementMs
+    ?? (effectiveWallClockMs !== undefined
+      ? wallClockSettlementMs(effectiveWallClockMs, input.budget?.budgetClass === 'multi_hop_chain' || isMultiHopStep)
+      : undefined)
+  const promptBudget: PromptAssignmentBudget = {
+    ...(input.budget ?? {}),
+    maxTurns: effectiveMaxTurns,
+    settlementTurn: effectiveSettlementTurn,
+    ...(effectiveWallClockMs !== undefined ? { wallClockMs: effectiveWallClockMs } : {}),
+    ...(effectiveWallClockSettlementMs !== undefined ? { wallClockSettlementMs: effectiveWallClockSettlementMs } : {}),
+  }
   return JSON.stringify({
     task: 'defensive chain investigation',
     ...(specialistConfig ? { specialistProfile: specialistConfig.id, specialistFocus: specialistConfig.focusPrompt } : {}),
@@ -2197,9 +2271,11 @@ export function workerInvestigationPrompt(input: {
     step: input.step,
     targetOrigins: input.origins,
     capabilityTier: input.capabilityTier,
-    maxTurns: input.maxTurns,
-    settlementStartsAtTurn: Math.max(1, Math.floor(input.maxTurns * 0.85)),
-    settlementNudgeAtTurn: settlementNudgeTurnFor(input.maxTurns),
+    maxTurns: effectiveMaxTurns,
+    settlementStartsAtTurn: effectiveSettlementTurn,
+    settlementNudgeAtTurn: effectiveSettlementTurn,
+    ...(effectiveWallClockMs !== undefined ? { wallClockMs: effectiveWallClockMs, wallClockSettlementMs: effectiveWallClockSettlementMs } : {}),
+    ...(input.budget?.budgetClass ? { budgetClass: input.budget.budgetClass } : {}),
     personas: input.personas ?? [],
     bolaTestQueue: input.bolaTestQueue ?? [],
     parentFacts: input.parentFacts ?? [],
@@ -2221,6 +2297,7 @@ export function workerInvestigationPrompt(input: {
       detLeads,
       detLeadLimit: input.detLeadLimit,
       assignmentBrief: input.assignmentBrief,
+      budget: promptBudget,
     }),
   })
 }
