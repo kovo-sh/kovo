@@ -1,0 +1,104 @@
+{
+  "id": "r3-16-custody-cross-binding-fp",
+  "side": "fp",
+  "archetype": "r3-16-worker-scalar-custody-strip",
+  "description": "R3-16 FP: benign self-service profile readback with worker-supplied claim scalars (requiredRole, resourceTenant, expectControlDenied, oracleEvents) must fail closed under strict allowlist host custody and mandatory TerminalOracleRegistry.",
+  "covers": {
+    "files": [
+      "src/server/composite-receipt.ts",
+      "src/server/evidence-provenance.ts",
+      "src/server/host-fact-log.ts",
+      "src/server/nonce-ledger.ts",
+      "src/server/proof-receipt.ts",
+      "src/server/terminal-oracle-registry.ts",
+      "src/server/verify-prove-handlers.ts"
+    ],
+    "classes": [
+      "bola",
+      "bfla",
+      "mass_assignment",
+      "open_redirect",
+      "timing"
+    ]
+  },
+  "canonicalLabel": {
+    "cwe": "CWE-639",
+    "category": "access-control",
+    "title": "Benign own-tenant profile note update with untrusted worker claim scalars must dismiss under host allowlist custody",
+    "impact": "Authenticated member reads and updates their own profile note within their own tenant; worker claim scalars cannot fabricate privilege or cross-tenant impact.",
+    "claimedImpact": "authorization",
+    "claimedBoundary": "access",
+    "vulnClass": "bola"
+  },
+  "freeTextLabel": {
+    "title": "Own-tenant profile update without cross-tenant data or boundary denial"
+  },
+  "paths": {
+    "replay": true,
+    "floorReceipt": true,
+    "evaluateClaims": true,
+    "composite": false,
+    "floorInjectionRecipe": false,
+    "proofReceipt": true
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [
+    {
+      "handle": "member_a",
+      "roleLabel": "member (tenant-a)",
+      "role": "member",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-r316-member-a-token"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "ctl_own_read",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/v1/profile/me",
+      "persona": "member_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"id\":\"u-a1\",\"tenant_id\":\"tenant-a\",\"role\":\"member\",\"note\":\"initial\"}"
+    },
+    {
+      "id": "prb_own_read",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/v1/profile/me",
+      "persona": "member_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"id\":\"u-a1\",\"tenant_id\":\"tenant-a\",\"role\":\"member\",\"note\":\"initial\"}"
+    }
+  ],
+  "replaySpec": {
+    "assertionsJq": "{ controlPassed: (.steps.ctl_own_read.status == 200), confirmed: (.steps.prb_own_read.status == 200), observed: \"own-tenant profile\", expected: \"403\" }"
+  },
+  "proofReceipt": {
+    "vulnClass": "bola",
+    "targetMethod": "GET",
+    "targetPathAndQuery": "/api/v1/profile/me",
+    "claimedDelta": "Own-tenant profile read with worker-supplied requiredRole/resourceTenant scalars must be stripped by allowlist custody and rejected."
+  },
+  "claims": [
+    {
+      "kind": "impact",
+      "impactClass": "authorization",
+      "probeExchangeId": "prb_own_read",
+      "controlExchangeIds": ["ctl_own_read"],
+      "requiredRole": "admin",
+      "resourceTenant": "tenant-b",
+      "expectControlDenied": true
+    }
+  ]
+}

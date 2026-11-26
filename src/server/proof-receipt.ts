@@ -16,6 +16,19 @@ import { createHmac, randomBytes, randomInt, randomUUID, timingSafeEqual } from 
 import { z } from 'zod'
 import { scopedAssetOrigin } from '../domain.ts'
 import {
+  constructHostEvidence,
+  isHostEvidence,
+  type ArmProvenance,
+  type HostEvidence,
+  type HostSanitizedReceipt,
+} from './evidence-provenance.ts'
+import {
+  DEFAULT_NONCE_RUN_ID,
+  NonceLedger,
+  type NonceBinding,
+  type NonceStamp,
+} from './nonce-ledger.ts'
+import {
   HostFactLog,
   deriveCredentialPlacement,
   hasVaultScrubbedRequestPlane,
@@ -96,6 +109,7 @@ export interface HostMintedExpressionChallenge {
   readonly expectedOutput: string
   readonly expressionSyntax: string
   readonly mintedAtMs: number
+  readonly nonceStamp?: NonceStamp
 }
 
 export type TimingConstructFamily = 'sqli' | 'nosqli' | 'cmdi' | 'timing'
@@ -108,12 +122,14 @@ export interface HostMintedTimingChallenge {
   readonly delayToken: string
   readonly controlToken: string
   readonly mintedAtMs: number
+  readonly nonceStamp?: NonceStamp
 }
 
 export interface HostMintedRedirectCanary {
   readonly canaryId: string
   readonly host: string
   readonly mintedAtMs: number
+  readonly nonceStamp?: NonceStamp
 }
 
 export type BooleanPairStyle = 'numeric' | 'single_quote' | 'double_quote'
@@ -129,6 +145,7 @@ export interface HostMintedBooleanPairChallenge {
   readonly trueValue: string
   readonly falseValue: string
   readonly mintedAtMs: number
+  readonly nonceStamp?: NonceStamp
 }
 
 /**
@@ -146,6 +163,7 @@ export interface HostStampedBooleanPair {
   readonly falseValue: string
   readonly param?: string | null
   readonly style?: BooleanPairStyle
+  readonly nonceStamp?: NonceStamp
 }
 
 function sortedCharMultiset(value: string): string {
@@ -153,279 +171,146 @@ function sortedCharMultiset(value: string): string {
 }
 
 /**
- * HostMintedOracle — host-owned randomized oracle state (Move A Part 3a: R2-C-6, H-15, R2-H-13;
- * R4-C-1 host-minted boolean pairs).
- *
- * Mints per-attempt expression operands, timing delay tokens, boolean predicate pairs, and
- * redirect canary hosts on the host side so workers can never supply their own expected markers,
- * predicate pairs, delay tokens, or external redirect destinations to forge confirmations.
+ * HostMintedOracle — host-owned randomized oracle state backed by per-run HMAC `NonceLedger`
+ * (`R3-16`, Move A Part 3a: R2-C-6, H-15, R2-H-13; R4-C-1 host-minted boolean pairs).
  */
 export class HostMintedOracle {
+  readonly ledger: NonceLedger
   private readonly expressionChallenges = new Map<string, HostMintedExpressionChallenge>()
   private readonly recentExpressionOutputs = new Set<string>()
   private readonly timingChallenges = new Map<string, HostMintedTimingChallenge>()
   private readonly redirectCanaries = new Map<string, HostMintedRedirectCanary>()
   private readonly booleanPairs = new Map<string, HostMintedBooleanPairChallenge>()
 
-  mintExpressionChallenge(
-    family: ExpressionConstructFamily = 'ssti',
-    operator: '*' | '+' = '*',
-  ): HostMintedExpressionChallenge {
-    let operandA = 0
-    let operandB = 0
-    let expectedOutput = ''
+  constructor(ledger?: NonceLedger) { this.ledger = ledger ?? new NonceLedger() }
+  citeChallenge(stampIdOrStamp: string | NonceStamp): boolean { return this.ledger.citeStamp(stampIdOrStamp) }
+  private capMap<K, V>(map: Map<K, V>): void { if (map.size > 512) { const oldest = map.keys().next().value; if (oldest !== undefined) map.delete(oldest) } }
+
+  mintExpressionChallenge(family: ExpressionConstructFamily = 'ssti', operator: '*' | '+' = '*', binding?: Partial<Omit<NonceBinding, 'oracleId'>>): HostMintedExpressionChallenge {
+    let operandA = 0, operandB = 0, expectedOutput = ''
     for (let attempt = 0; attempt < 32; attempt += 1) {
-      operandA = randomInt(113, 997)
-      operandB = randomInt(113, 997)
+      operandA = randomInt(113, 997); operandB = randomInt(113, 997)
       if (operandA === operandB) operandB = operandA === 996 ? 113 : operandA + 1
-      const computed = operator === '+' ? operandA + operandB : operandA * operandB
-      expectedOutput = String(computed)
-      if (expectedOutput.length >= 5 && !this.recentExpressionOutputs.has(expectedOutput)) {
-        break
-      }
+      expectedOutput = String(operator === '+' ? operandA + operandB : operandA * operandB)
+      if (expectedOutput.length >= 5 && !this.recentExpressionOutputs.has(expectedOutput)) break
     }
     this.recentExpressionOutputs.add(expectedOutput)
-    if (this.recentExpressionOutputs.size > 512) {
-      const oldest = this.recentExpressionOutputs.values().next().value
-      if (oldest !== undefined) this.recentExpressionOutputs.delete(oldest)
-    }
-    const expressionSyntax = `${operandA}${operator}${operandB}`
-    const challenge: HostMintedExpressionChallenge = Object.freeze({
-      challengeId: `expr_${randomUUID()}`,
-      family,
-      operandA,
-      operandB,
-      operator,
-      expectedOutput,
-      expressionSyntax,
-      mintedAtMs: Date.now(),
-    })
-    this.expressionChallenges.set(challenge.challengeId, challenge)
-    if (this.expressionChallenges.size > 512) {
-      const oldest = this.expressionChallenges.keys().next().value
-      if (oldest !== undefined) this.expressionChallenges.delete(oldest)
-    }
+    if (this.recentExpressionOutputs.size > 512) { const oldest = this.recentExpressionOutputs.values().next().value; if (oldest !== undefined) this.recentExpressionOutputs.delete(oldest) }
+    const challengeId = `expr_${randomUUID()}`, mintedAtMs = Date.now()
+    const base = { challengeId, family, operandA, operandB, operator, expectedOutput, expressionSyntax: `${operandA}${operator}${operandB}`, mintedAtMs }
+    const nonceStamp = this.ledger.mintStamp({ runId: binding?.runId ?? DEFAULT_NONCE_RUN_ID, ...binding, oracleId: 'expression' }, base, { stampId: challengeId, mintedAtMs })
+    const challenge: HostMintedExpressionChallenge = Object.freeze({ ...base, nonceStamp })
+    this.expressionChallenges.set(challengeId, challenge); this.capMap(this.expressionChallenges)
     return challenge
   }
 
   getExpressionChallenge(challengeId: string): HostMintedExpressionChallenge | undefined {
-    return this.expressionChallenges.get(challengeId)
+    return this.expressionChallenges.get(challengeId) ?? this.ledger.getVerifiedPayload<HostMintedExpressionChallenge>(challengeId) ?? undefined
   }
 
-  verifyExpressionChallenge(challenge: HostMintedExpressionChallenge | null | undefined): HostMintedExpressionChallenge | null {
+  verifyExpressionChallenge(challenge: HostMintedExpressionChallenge | null | undefined, expected?: Partial<Omit<NonceBinding, 'oracleId'>>): HostMintedExpressionChallenge | null {
     if (!challenge || typeof challenge.challengeId !== 'string') return null
-    const stored = this.expressionChallenges.get(challenge.challengeId)
-    if (!stored) return null
-    const expected = stored.operator === '+'
-      ? String(stored.operandA + stored.operandB)
-      : String(stored.operandA * stored.operandB)
-    if (
-      stored.operandA !== challenge.operandA ||
-      stored.operandB !== challenge.operandB ||
-      stored.operator !== challenge.operator ||
-      stored.expectedOutput !== expected ||
-      challenge.expectedOutput !== expected
-    ) {
-      return null
-    }
-    return stored
+    const stored = this.expressionChallenges.get(challenge.challengeId) ?? (challenge.nonceStamp ? this.ledger.getVerifiedPayload<HostMintedExpressionChallenge>(challenge.nonceStamp.stampId) : null)
+    if (!stored || stored.challengeId !== challenge.challengeId) return null
+    const stamp = challenge.nonceStamp ?? stored.nonceStamp
+    if (!stamp || !this.ledger.verifyStamp(stamp, { oracleId: 'expression', ...expected })) return null
+    const expectedOut = stored.operator === '+' ? String(stored.operandA + stored.operandB) : String(stored.operandA * stored.operandB)
+    return (stored.operandA === challenge.operandA && stored.operandB === challenge.operandB && stored.operator === challenge.operator && stored.expectedOutput === expectedOut && challenge.expectedOutput === expectedOut) ? stored : null
   }
 
-  mintTimingChallenge(
-    family: TimingConstructFamily = 'sqli',
-    delayMs = 2_000,
-    tokens?: { delayToken?: string; controlToken?: string },
-  ): HostMintedTimingChallenge {
-    const safeDelayMs = Math.max(1_000, Math.min(Math.round(delayMs), 15_000))
-    const delaySec = Math.max(1, Math.round(safeDelayMs / 1000))
-    const defaultDelayToken = family === 'sqli'
-      ? `SLEEP(${delaySec})`
-      : family === 'cmdi'
-        ? `sleep ${delaySec}`
-        : family === 'nosqli'
-          ? `sleep(${safeDelayMs})`
-          : `delay=${safeDelayMs}`
-    const defaultControlToken = family === 'sqli'
-      ? 'SLEEP(0)'
-      : family === 'cmdi'
-        ? 'sleep 0'
-        : family === 'nosqli'
-          ? 'sleep(0)'
-          : 'delay=0'
-    const challenge: HostMintedTimingChallenge = Object.freeze({
-      challengeId: `time_${randomUUID()}`,
-      family,
-      delayMs: safeDelayMs,
-      controlDelayMs: 0,
-      delayToken: tokens?.delayToken?.trim() || defaultDelayToken,
-      controlToken: tokens?.controlToken?.trim() || defaultControlToken,
-      mintedAtMs: Date.now(),
-    })
-    this.timingChallenges.set(challenge.challengeId, challenge)
-    if (this.timingChallenges.size > 512) {
-      const oldest = this.timingChallenges.keys().next().value
-      if (oldest !== undefined) this.timingChallenges.delete(oldest)
-    }
+  mintTimingChallenge(family: TimingConstructFamily = 'sqli', delayMs = 2_000, tokens?: { delayToken?: string; controlToken?: string }, binding?: Partial<Omit<NonceBinding, 'oracleId'>>): HostMintedTimingChallenge {
+    const safeDelayMs = Math.max(1_000, Math.min(Math.round(delayMs), 15_000)), delaySec = Math.max(1, Math.round(safeDelayMs / 1000))
+    const defaultDelayToken = family === 'sqli' ? `SLEEP(${delaySec})` : family === 'cmdi' ? `sleep ${delaySec}` : family === 'nosqli' ? `sleep(${safeDelayMs})` : `delay=${safeDelayMs}`
+    const defaultControlToken = family === 'sqli' ? 'SLEEP(0)' : family === 'cmdi' ? 'sleep 0' : family === 'nosqli' ? 'sleep(0)' : 'delay=0'
+    const challengeId = `time_${randomUUID()}`, mintedAtMs = Date.now()
+    const base = { challengeId, family, delayMs: safeDelayMs, controlDelayMs: 0 as const, delayToken: tokens?.delayToken?.trim() || defaultDelayToken, controlToken: tokens?.controlToken?.trim() || defaultControlToken, mintedAtMs }
+    const nonceStamp = this.ledger.mintStamp({ runId: binding?.runId ?? DEFAULT_NONCE_RUN_ID, ...binding, oracleId: 'timing' }, base, { stampId: challengeId, mintedAtMs })
+    const challenge: HostMintedTimingChallenge = Object.freeze({ ...base, nonceStamp })
+    this.timingChallenges.set(challengeId, challenge); this.capMap(this.timingChallenges)
     return challenge
   }
 
   getTimingChallenge(challengeId: string): HostMintedTimingChallenge | undefined {
-    return this.timingChallenges.get(challengeId)
+    return this.timingChallenges.get(challengeId) ?? this.ledger.getVerifiedPayload<HostMintedTimingChallenge>(challengeId) ?? undefined
   }
 
-  verifyTimingChallenge(challenge: HostMintedTimingChallenge | null | undefined): HostMintedTimingChallenge | null {
+  verifyTimingChallenge(challenge: HostMintedTimingChallenge | null | undefined, expected?: Partial<Omit<NonceBinding, 'oracleId'>>): HostMintedTimingChallenge | null {
     if (!challenge || typeof challenge.challengeId !== 'string') return null
-    const stored = this.timingChallenges.get(challenge.challengeId)
-    if (!stored) return null
-    if (
-      stored.family !== challenge.family ||
-      stored.delayMs !== challenge.delayMs ||
-      stored.controlDelayMs !== 0 ||
-      challenge.controlDelayMs !== 0 ||
-      stored.delayToken !== challenge.delayToken ||
-      stored.controlToken !== challenge.controlToken
-    ) {
-      return null
-    }
-    return stored
+    const stored = this.timingChallenges.get(challenge.challengeId) ?? (challenge.nonceStamp ? this.ledger.getVerifiedPayload<HostMintedTimingChallenge>(challenge.nonceStamp.stampId) : null)
+    if (!stored || stored.challengeId !== challenge.challengeId) return null
+    const stamp = challenge.nonceStamp ?? stored.nonceStamp
+    if (!stamp || !this.ledger.verifyStamp(stamp, { oracleId: 'timing', ...expected })) return null
+    return (stored.family === challenge.family && stored.delayMs === challenge.delayMs && stored.controlDelayMs === 0 && challenge.controlDelayMs === 0 && stored.delayToken === challenge.delayToken && stored.controlToken === challenge.controlToken) ? stored : null
   }
 
-  mintRedirectCanary(baseDomain = 'canary.kovo.invalid'): HostMintedRedirectCanary {
+  mintRedirectCanary(baseDomain = 'canary.kovo.invalid', binding?: Partial<Omit<NonceBinding, 'oracleId'>>): HostMintedRedirectCanary {
     const cleanBase = baseDomain.trim().toLowerCase().replace(/^\.+|\.+$/g, '') || 'canary.kovo.invalid'
-    const nonce = randomBytes(6).toString('hex')
-    const host = `redir-${nonce}.${cleanBase}`
-    const canary: HostMintedRedirectCanary = Object.freeze({
-      canaryId: `redir_${randomUUID()}`,
-      host,
-      mintedAtMs: Date.now(),
-    })
-    this.redirectCanaries.set(host, canary)
-    if (this.redirectCanaries.size > 512) {
-      const oldest = this.redirectCanaries.keys().next().value
-      if (oldest !== undefined) this.redirectCanaries.delete(oldest)
-    }
+    const host = `redir-${randomBytes(6).toString('hex')}.${cleanBase}`, canaryId = `redir_${randomUUID()}`, mintedAtMs = Date.now()
+    const base = { canaryId, host, mintedAtMs }
+    const nonceStamp = this.ledger.mintStamp({ runId: binding?.runId ?? DEFAULT_NONCE_RUN_ID, ...binding, oracleId: 'redirect' }, base, { stampId: canaryId, mintedAtMs })
+    const canary: HostMintedRedirectCanary = Object.freeze({ ...base, nonceStamp })
+    this.redirectCanaries.set(host, canary); this.capMap(this.redirectCanaries)
     return canary
   }
 
-  isMintedRedirectHost(host: string | null | undefined): boolean {
+  isMintedRedirectHost(host: string | null | undefined, expected?: Partial<Omit<NonceBinding, 'oracleId'>>): boolean {
     if (!host) return false
-    return this.redirectCanaries.has(host.trim().toLowerCase())
+    const canary = this.redirectCanaries.get(host.trim().toLowerCase())
+    return Boolean(canary?.nonceStamp && this.ledger.verifyStamp(canary.nonceStamp, { oracleId: 'redirect', ...expected }) !== null)
   }
 
-  /**
-   * R4-C-1: Mint a randomized host-owned boolean predicate pair bound to a non-empty `baseValue`.
-   * Uses a digit-permutation pair `(a, b)` so `trueValue` and `falseValue` have identical byte
-   * length and identical character multiset, preventing input length/charset validator differentials.
-   */
-  mintBooleanPair(
-    baseValue: string,
-    options: { style?: BooleanPairStyle; param?: string | null; deterministicKey?: string } = {},
-  ): HostMintedBooleanPairChallenge {
-    if (typeof baseValue !== 'string' || baseValue.trim().length === 0) {
-      throw new Error('mintBooleanPair requires a non-empty baseValue (empty-base standalone predicates are forbidden).')
-    }
+  verifyRedirectCanary(canary: HostMintedRedirectCanary | null | undefined, expected?: Partial<Omit<NonceBinding, 'oracleId'>>): HostMintedRedirectCanary | null {
+    if (!canary || typeof canary.canaryId !== 'string' || typeof canary.host !== 'string') return null
+    const stored = this.redirectCanaries.get(canary.host.trim().toLowerCase()) ?? (canary.nonceStamp ? this.ledger.getVerifiedPayload<HostMintedRedirectCanary>(canary.nonceStamp.stampId) : null)
+    if (!stored || stored.canaryId !== canary.canaryId || stored.host !== canary.host) return null
+    const stamp = canary.nonceStamp ?? stored.nonceStamp
+    return (stamp && this.ledger.verifyStamp(stamp, { oracleId: 'redirect', ...expected })) ? stored : null
+  }
+
+  mintBooleanPair(baseValue: string, options: { style?: BooleanPairStyle; param?: string | null; deterministicKey?: string; binding?: Partial<Omit<NonceBinding, 'oracleId'>> } = {}): HostMintedBooleanPairChallenge {
+    if (typeof baseValue !== 'string' || baseValue.trim().length === 0) throw new Error('mintBooleanPair requires a non-empty baseValue (empty-base standalone predicates are forbidden).')
     const style: BooleanPairStyle = options.style ?? 'numeric'
-    let d1: number
-    let d2: number
-    let d3: number
-    let challengeId: string
-    let mintedAtMs: number
+    let d1: number, d2: number, d3: number, challengeId: string, mintedAtMs: number
     if (options.deterministicKey) {
-      const digest = createHmac('sha256', 'kovo-floor-boolean-pair-v1')
-        .update(`${options.deterministicKey}\0${baseValue}\0${style}\0${options.param ?? ''}`, 'utf8')
-        .digest()
-      d1 = (digest[0]! % 9) + 1
-      d2 = ((d1 + (digest[1]! % 8)) % 9) + 1
-      d3 = digest[2]! % 10
-      challengeId = `bool_${digest.subarray(0, 16).toString('hex')}`
-      mintedAtMs = 0
+      const digest = createHmac('sha256', 'kovo-floor-boolean-pair-v1').update(`${options.deterministicKey}\0${baseValue}\0${style}\0${options.param ?? ''}`, 'utf8').digest()
+      d1 = (digest[0]! % 9) + 1; d2 = ((d1 + (digest[1]! % 8)) % 9) + 1; d3 = digest[2]! % 10
+      challengeId = `bool_${digest.subarray(0, 16).toString('hex')}`; mintedAtMs = 0
     } else {
-      d1 = randomInt(1, 10)
-      d2 = ((d1 + randomInt(0, 8)) % 9) + 1
-      d3 = randomInt(0, 10)
-      challengeId = `bool_${randomUUID()}`
-      mintedAtMs = Date.now()
+      d1 = randomInt(1, 10); d2 = ((d1 + randomInt(0, 8)) % 9) + 1; d3 = randomInt(0, 10)
+      challengeId = `bool_${randomUUID()}`; mintedAtMs = Date.now()
     }
-    const a = d1 * 100 + d2 * 10 + d3
-    const b = d2 * 100 + d1 * 10 + d3
-    const trueSuffix = style === 'single_quote'
-      ? `' AND '${a}'='${a}'--`
-      : style === 'double_quote'
-        ? `" AND "${a}"="${a}"--`
-        : ` AND ${a}=${a}`
-    const falseSuffix = style === 'single_quote'
-      ? `' AND '${a}'='${b}'--`
-      : style === 'double_quote'
-        ? `" AND "${a}"="${b}"--`
-        : ` AND ${a}=${b}`
-    const pair: HostMintedBooleanPairChallenge = Object.freeze({
-      challengeId,
-      baseValue,
-      style,
-      ...(options.param !== undefined ? { param: options.param } : {}),
-      trueSuffix,
-      falseSuffix,
-      trueValue: `${baseValue}${trueSuffix}`,
-      falseValue: `${baseValue}${falseSuffix}`,
-      mintedAtMs,
-    })
-    this.booleanPairs.set(pair.challengeId, pair)
-    if (this.booleanPairs.size > 512) {
-      const oldest = this.booleanPairs.keys().next().value
-      if (oldest !== undefined) this.booleanPairs.delete(oldest)
-    }
+    const a = d1 * 100 + d2 * 10 + d3, b = d2 * 100 + d1 * 10 + d3
+    const trueSuffix = style === 'single_quote' ? `' AND '${a}'='${a}'--` : style === 'double_quote' ? `" AND "${a}"="${a}"--` : ` AND ${a}=${a}`
+    const falseSuffix = style === 'single_quote' ? `' AND '${a}'='${b}'--` : style === 'double_quote' ? `" AND "${a}"="${b}"--` : ` AND ${a}=${b}`
+    const base = { challengeId, baseValue, style, ...(options.param !== undefined ? { param: options.param } : {}), trueSuffix, falseSuffix, trueValue: `${baseValue}${trueSuffix}`, falseValue: `${baseValue}${falseSuffix}`, mintedAtMs }
+    const nonceStamp = this.ledger.mintStamp({ runId: options.binding?.runId ?? DEFAULT_NONCE_RUN_ID, param: options.param ?? null, ...options.binding, oracleId: 'boolean' }, base, { stampId: challengeId, mintedAtMs })
+    const pair: HostMintedBooleanPairChallenge = Object.freeze({ ...base, nonceStamp })
+    this.booleanPairs.set(challengeId, pair); this.capMap(this.booleanPairs)
     return pair
   }
 
-  stampBooleanPairArm(
-    challenge: HostMintedBooleanPairChallenge,
-    arm: BooleanPairArm,
-  ): HostStampedBooleanPair {
-    const mintedValue = arm === 'baseline'
-      ? challenge.baseValue
-      : arm === 'true'
-        ? challenge.trueValue
-        : challenge.falseValue
-    return Object.freeze({
-      challengeId: challenge.challengeId,
-      arm,
-      mintedValue,
-      baseValue: challenge.baseValue,
-      trueValue: challenge.trueValue,
-      falseValue: challenge.falseValue,
-      ...(challenge.param !== undefined ? { param: challenge.param } : {}),
-      style: challenge.style,
-    })
+  stampBooleanPairArm(challenge: HostMintedBooleanPairChallenge, arm: BooleanPairArm, exchangeBinding?: { exchangeId?: string }): HostStampedBooleanPair {
+    const mintedValue = arm === 'baseline' ? challenge.baseValue : arm === 'true' ? challenge.trueValue : challenge.falseValue
+    const armStamp = challenge.nonceStamp && exchangeBinding?.exchangeId ? (this.ledger.bindStampToExchange(challenge.nonceStamp, exchangeBinding.exchangeId, arm) ?? challenge.nonceStamp) : challenge.nonceStamp
+    return Object.freeze({ challengeId: challenge.challengeId, arm, mintedValue, baseValue: challenge.baseValue, trueValue: challenge.trueValue, falseValue: challenge.falseValue, ...(challenge.param !== undefined ? { param: challenge.param } : {}), style: challenge.style, ...(armStamp ? { nonceStamp: armStamp } : {}) })
   }
 
   getBooleanPair(challengeId: string): HostMintedBooleanPairChallenge | undefined {
-    return this.booleanPairs.get(challengeId)
+    return this.booleanPairs.get(challengeId) ?? this.ledger.getVerifiedPayload<HostMintedBooleanPairChallenge>(challengeId) ?? undefined
   }
 
-  verifyBooleanPair(stamp: HostStampedBooleanPair | null | undefined): HostMintedBooleanPairChallenge | null {
+  verifyBooleanPair(stamp: HostStampedBooleanPair | null | undefined, expected?: Partial<Omit<NonceBinding, 'oracleId'>>): HostMintedBooleanPairChallenge | null {
     if (!stamp || typeof stamp.challengeId !== 'string') return null
-    const stored = this.booleanPairs.get(stamp.challengeId)
-    if (!stored) return null
-    if (stored.baseValue.trim().length === 0) return null
-    if (stored.trueValue.length !== stored.falseValue.length) return null
-    if (stored.trueValue === stored.falseValue) return null
-    if (!stored.trueValue.startsWith(stored.baseValue) || !stored.falseValue.startsWith(stored.baseValue)) return null
-    if (sortedCharMultiset(stored.trueValue) !== sortedCharMultiset(stored.falseValue)) return null
-    if (
-      stamp.baseValue !== stored.baseValue ||
-      stamp.trueValue !== stored.trueValue ||
-      stamp.falseValue !== stored.falseValue
-    ) {
-      return null
-    }
+    const stored = this.booleanPairs.get(stamp.challengeId) ?? (stamp.nonceStamp ? this.ledger.getVerifiedPayload<HostMintedBooleanPairChallenge>(stamp.nonceStamp.stampId) : null)
+    if (!stored || stored.challengeId !== stamp.challengeId) return null
+    const nonceStamp = stamp.nonceStamp ?? stored.nonceStamp
+    if (!nonceStamp || !this.ledger.verifyStamp(nonceStamp, { oracleId: 'boolean', ...expected })) return null
+    if (stored.baseValue.trim().length === 0 || stored.trueValue.length !== stored.falseValue.length || stored.trueValue === stored.falseValue) return null
+    if (!stored.trueValue.startsWith(stored.baseValue) || !stored.falseValue.startsWith(stored.baseValue) || sortedCharMultiset(stored.trueValue) !== sortedCharMultiset(stored.falseValue)) return null
+    if (stamp.baseValue !== stored.baseValue || stamp.trueValue !== stored.trueValue || stamp.falseValue !== stored.falseValue) return null
     if (stamp.arm !== 'baseline' && stamp.arm !== 'true' && stamp.arm !== 'false') return null
-    const expectedValue = stamp.arm === 'baseline'
-      ? stored.baseValue
-      : stamp.arm === 'true'
-        ? stored.trueValue
-        : stored.falseValue
-    if (stamp.mintedValue !== expectedValue) return null
-    if (stored.param && stamp.param && stored.param !== stamp.param) return null
+    const expectedValue = stamp.arm === 'baseline' ? stored.baseValue : stamp.arm === 'true' ? stored.trueValue : stored.falseValue
+    if (stamp.mintedValue !== expectedValue || (stored.param && stamp.param && stored.param !== stamp.param)) return null
     return stored
   }
 }
@@ -510,6 +395,10 @@ export interface ReceiptTranscriptEntry {
   hostBooleanPair?: HostStampedBooleanPair
   /** R2-H-13: Host-minted redirect canary host bound to this redirect probe. */
   hostRedirectCanaryHost?: string | null
+  /** R3-16: Optional full host-minted redirect canary stamp (enables restart re-verification). */
+  hostRedirectCanary?: HostMintedRedirectCanary
+  /** R3-16: Provenance of `step.arm` ('host_assigned' vs 'worker_selected'). */
+  armProvenance?: ArmProvenance
 }
 
 /** One durable OOB delivery promoted by the relay (host-observed, not model-supplied). */
@@ -548,6 +437,8 @@ export interface ReceiptTranscript {
   hostRedirectCanaryHost?: string | null
   /** R2-H-11: Optional host key for verifying signed OOB callback timestamps/ids. */
   oobSigningKey?: string
+  /** R3-16: Host run identifier for per-run HMAC nonce-ledger verification. */
+  runId?: string
 }
 
 export interface VerifyReceiptOptions {
@@ -555,6 +446,8 @@ export interface VerifyReceiptOptions {
   signingKey?: string
   /** Host-minted oracle instance (defaults to `defaultHostMintedOracle`). */
   hostMintedOracle?: HostMintedOracle
+  /** R3-16: Host run identifier for per-run HMAC nonce-ledger binding verification. */
+  runId?: string
 }
 
 export interface ReceiptVerification {
@@ -571,12 +464,12 @@ export interface ReceiptVerification {
 }
 
 /** Classify a receipt's vulnerability label via the authoritative `OracleSpec` registry (`R3-13`). */
-export function receiptRuleFor(vulnClass: string, receipt?: Pick<ProofReceipt, 'oobEventIds'>): { rule: ReceiptVerification['rule']; impactClass?: ImpactClass } {
+export function receiptRuleFor(vulnClass: string, receipt?: { readonly oobEventIds: readonly string[] }): { rule: ReceiptVerification['rule']; impactClass?: ImpactClass } {
   const { rule, impactClass } = resolveReceiptRule(vulnClass, receipt)
   return impactClass ? { rule, impactClass } : { rule }
 }
 
-function reject(receipt: ProofReceipt, rule: ReceiptVerification['rule'], reason: string, failureCode: OracleFailureCode = 'oracle_disagreement'): ReceiptVerification {
+function reject(receipt: Pick<HostSanitizedReceipt, 'vulnClass' | 'claimedDelta'>, rule: ReceiptVerification['rule'], reason: string, failureCode: OracleFailureCode = 'oracle_disagreement'): ReceiptVerification {
   return { confirmed: false, vulnClass: receipt.vulnClass, rule, failureCode, reason, observed: receipt.claimedDelta, expected: 'host-recorded evidence that substantiates the claimed delta' }
 }
 
@@ -688,6 +581,19 @@ function webhookReadbackBound(steps: readonly ImpactStep[], probeIndex: number, 
  * event, a mismatched target, or an impact claim the oracle model cannot substantiate is rejected —
  * there is no "trust me" branch.
  */
+/** R3-16: Verify a sealed `HostEvidence` view constructed exclusively by host custody (`constructHostEvidence`). */
+export function verifyHostEvidence(evidence: HostEvidence, options: VerifyReceiptOptions = {}): ReceiptVerification {
+  if (!isHostEvidence(evidence)) {
+    throw new Error('verifyHostEvidence requires a sealed HostEvidence instance from constructHostEvidence.')
+  }
+  const runId = options.runId ?? evidence.runId
+  return verifyReceipt(evidence.receipt, {
+    entries: evidence.entries, oobEvents: evidence.oobEvents, browserTraces: evidence.browserTraces,
+    ...(evidence.oobSigningKey ? { oobSigningKey: evidence.oobSigningKey } : {}),
+    ...(runId ? { runId } : {}),
+  }, { ...options, ...(runId ? { runId } : {}) })
+}
+
 export function verifyReceipt(
   rawReceipt: unknown,
   transcript: ReceiptTranscript,
@@ -703,16 +609,21 @@ export function verifyReceipt(
       observed: 'invalid receipt', expected: 'a well-formed ProofReceipt',
     }
   }
-  const receipt = parsed.data
+  const effectiveRunId = options.runId ?? transcript.runId
+  const rawValidated = parsed.data
+  const hostEvidence = constructHostEvidence({
+    receipt: rawValidated, transcript,
+    trustedOracleEvents: rawValidated.oracleEvents,
+    ...(effectiveRunId ? { runId: effectiveRunId } : {}),
+  })
+  const receipt: HostSanitizedReceipt = hostEvidence.receipt
   const { rule, impactClass } = receiptRuleFor(receipt.vulnClass, receipt)
-  if (rule === 'none') {
-    return reject(receipt, rule, `No confirmation rule for vulnerability class "${receipt.vulnClass}".`, 'receipt_unbuildable')
-  }
+  if (rule === 'none') return reject(receipt, rule, `No confirmation rule for vulnerability class "${receipt.vulnClass}".`, 'receipt_unbuildable')
 
-  const entries = transcript.entries ?? []
+  const entries = hostEvidence.entries
   const entriesById = new Map(entries.map(entry => [entry.exchangeId, entry]))
-  const oobById = new Map((transcript.oobEvents ?? []).map(event => [event.id, event]))
-  const tracesById = new Map((transcript.browserTraces ?? []).map(trace => [trace.id, trace]))
+  const oobById = new Map(hostEvidence.oobEvents.map(event => [event.id, event]))
+  const tracesById = new Map(hostEvidence.browserTraces.map(trace => [trace.id, trace]))
 
   // Boundary: every id the receipt cites must exist in the host transcript.
   const missingExchange = receipt.exchangeIds.find(id => !entriesById.has(id))
@@ -747,7 +658,7 @@ export function verifyReceipt(
           return reject(receipt, rule, `OOB event ${event.id} is missing a host-signed callback signature.`)
         }
       }
-      const injectedAt = receipt.injectedAtMs ?? event.injectedAtMs
+      const injectedAt = event.injectedAtMs
       if (injectedAt !== undefined && event.receivedAtMs < injectedAt) {
         return reject(receipt, rule, `OOB event ${event.id} arrived before the canary was injected.`)
       }
@@ -838,12 +749,8 @@ export function verifyReceipt(
       const control = controls[index]!
       const probe = probes[index]!
       const pairCheck = verifyStampedBooleanPairRound({
-        baseline,
-        armA: control,
-        armB: probe,
-        param,
-        requireBaseline: false,
-        oracle,
+        baseline, armA: control, armB: probe, param, requireBaseline: false, oracle,
+        ...(effectiveRunId ? { runId: effectiveRunId } : {}),
       })
       if (!pairCheck.ok) {
         return reject(receipt, rule, `Boolean differential round ${index + 1} rejected (R4-C-1): ${pairCheck.reason}`)
@@ -932,13 +839,9 @@ export function verifyReceipt(
         return reject(receipt, rule, `Status differential round ${index + 1} must name the injected parameter.`)
       }
       const pairCheck = verifyStampedBooleanPairRound({
-        baseline: benignEntry,
-        armA: tautologyEntry,
-        armB: contradictionEntry,
-        param: roundParam,
-        requireBaseline: true,
-        requireArmATrue: true,
-        oracle,
+        baseline: benignEntry, armA: tautologyEntry, armB: contradictionEntry, param: roundParam,
+        requireBaseline: true, requireArmATrue: true, oracle,
+        ...(effectiveRunId ? { runId: effectiveRunId } : {}),
       })
       if (!pairCheck.ok) {
         return reject(receipt, rule, `Status differential round ${index + 1} rejected (R4-C-1): ${pairCheck.reason}`)
@@ -1106,18 +1009,23 @@ export function verifyReceipt(
       }
     }
 
-    // H-15: Require host-minted delay construct vs zero-delay control arm, and derive class from
-    // the host-controlled construct family.
-    const rawChallenge = transcript.hostTimingChallenge
-      ?? probes.find(p => p.hostTimingChallenge)?.hostTimingChallenge
-      ?? controls.find(c => c.hostTimingChallenge)?.hostTimingChallenge
-    const verifiedChallenge = oracle.verifyTimingChallenge(rawChallenge)
-    if (!verifiedChallenge) {
-      return reject(
-        receipt,
-        rule,
-        'Timing receipt requires a host-minted delay vs zero-delay timing challenge registered in HostMintedOracle.',
-      )
+    // R3-16 / H-15: Require per-exchange host-minted timing challenge on every control and probe arm
+    // (transcript-level and any-arm fallbacks deleted) verified against per-run HMAC NonceLedger.
+    const allTimingEntries = [...controls, ...probes]
+    const firstChallenge = probes[0]?.hostTimingChallenge
+    if (!firstChallenge || allTimingEntries.some(e => !e.hostTimingChallenge || e.hostTimingChallenge.challengeId !== firstChallenge.challengeId)) {
+      return reject(receipt, rule, 'Timing receipt requires a matching per-exchange hostTimingChallenge stamp on every control and probe arm (transcript-level and any-arm fallbacks are forbidden).')
+    }
+    const timingBindBase = {
+      ...(effectiveRunId ? { runId: effectiveRunId } : {}),
+      origin: baseIdentity.origin || targetOrigin,
+      method: baseIdentity.method,
+      route: baseIdentity.path,
+      param: differingParam,
+    }
+    const verifiedChallenge = oracle.verifyTimingChallenge(firstChallenge, timingBindBase)
+    if (!verifiedChallenge || allTimingEntries.some(e => !oracle.verifyTimingChallenge(e.hostTimingChallenge, { ...timingBindBase, armRole: e.step.arm, exchangeId: e.exchangeId }))) {
+      return reject(receipt, rule, 'Timing receipt requires a verified host-minted timing challenge bound to this run/target/exchange in HostMintedOracle.')
     }
     if (!baseProbeVal.includes(verifiedChallenge.delayToken)) {
       return reject(
@@ -1261,18 +1169,23 @@ export function verifyReceipt(
         `The matching control arm already redirects to host "${locationHost}"; destination host is not attacker-controlled.`,
       )
     }
-    // Require a host-minted canary destination host carried in the controlled parameter.
-    const mintedHost = (transcript.hostRedirectCanaryHost ?? probe.hostRedirectCanaryHost ?? '').trim().toLowerCase()
+    // R3-16: Require per-exchange hostRedirectCanaryHost bound to this probe (transcript-level and
+    // any-minted-host fallbacks deleted) verified against per-run HMAC NonceLedger.
+    const mintedHost = (probe.hostRedirectCanaryHost ?? '').trim().toLowerCase()
+    const redirExpected = {
+      ...(effectiveRunId ? { runId: effectiveRunId } : {}),
+      origin: probeOrigin, method: probeMethod, route: probeRoute,
+      ...(receipt.target.param ? { param: receipt.target.param } : {}),
+      armRole: 'probe', exchangeId: probe.exchangeId,
+    }
     const isHostMintedCanary = Boolean(
-      (mintedHost && mintedHost === locationHost && oracle.isMintedRedirectHost(mintedHost)) ||
-      oracle.isMintedRedirectHost(locationHost),
+      mintedHost && mintedHost === locationHost && (
+        oracle.isMintedRedirectHost(mintedHost, redirExpected) ||
+        Boolean(probe.hostRedirectCanary && probe.hostRedirectCanary.host.toLowerCase() === mintedHost && oracle.verifyRedirectCanary(probe.hostRedirectCanary, redirExpected))
+      ),
     )
     if (!isHostMintedCanary) {
-      return reject(
-        receipt,
-        rule,
-        `Redirect destination host "${locationHost}" is not a host-minted redirect canary host.`,
-      )
+      return reject(receipt, rule, `Redirect destination host "${locationHost}" is not bound to this probe exchange's host-minted redirect canary.`)
     }
     const matchedControl = matchingControls.find(ctrl => {
       const diff = diffRequestParams(ctrl, probe)
@@ -1426,15 +1339,16 @@ export function verifyReceipt(
     }
   }
   const oracleEvents = (receipt.oracleEvents ?? []).filter(knownOracleEvent)
+  const hostCredentialPatterns = rawValidated.proofPatterns ?? (impactClass === 'disclosure' ? ['\\b[a-z]{2,5}_[a-z]{2,8}_[0-9a-f]{10,}\\b', '\\bAKIA[0-9A-Z]{16}\\b'] : null)
   const input: ImpactInput = {
     impactClass: impactClass!,
     steps,
-    requiredRole: receipt.requiredRole ?? null,
-    resourceTenant: receipt.resourceTenant ?? null,
-    expectControlDenied: receipt.expectControlDenied,
+    requiredRole: rawValidated.requiredRole ?? null,
+    resourceTenant: rawValidated.resourceTenant ?? null,
+    expectControlDenied: rawValidated.expectControlDenied,
     oracleEvents,
     targetOrigin: receipt.target.origin,
-    credentialPatterns: receipt.proofPatterns ?? null,
+    credentialPatterns: hostCredentialPatterns,
   }
   const assessment = assessImpactEvidence(input)
   if (!assessment.required) {
@@ -1442,7 +1356,7 @@ export function verifyReceipt(
   }
   if (!assessment.satisfied) {
     if (impactClass === 'injection') {
-      const evaluated = verifyEvaluatedExpression(receipt, entriesById, transcript, oracle)
+      const evaluated = verifyEvaluatedExpression(receipt, entriesById, transcript, oracle, effectiveRunId)
       if (evaluated) return evaluated
     }
     return {
@@ -1461,7 +1375,7 @@ export function verifyReceipt(
     if (readProbe && !isObjectScopedRequest(readProbe)) {
       const evidence = assessment.evidence as { crossTenant?: boolean } | undefined
       const hasForeign = evidence?.crossTenant === true ||
-        hasForeignTenantOrOwnerDisclosure(steps, readProbe, receipt.resourceTenant ?? null)
+        hasForeignTenantOrOwnerDisclosure(steps, readProbe, null)
       if (!hasForeign) {
         return reject(
           receipt,
@@ -1504,25 +1418,13 @@ export function verifyReceipt(
         const pf = routeFamily(p.route ?? p.pathAndQuery ?? '')
         return cf !== '' && pf !== '' && (cf === pf || cf.startsWith(`${pf}/`) || pf.startsWith(`${cf}/`))
       }))
-    const authEvidence = assessment.evidence as {
-      crossTenant?: boolean
-      roleDifferential?: boolean
-      credentialPatternMatched?: boolean
-    } | undefined
-    const hasCredentialPatternDisclosure = Boolean(
-      impactClass === 'disclosure' &&
-      receipt.proofPatterns &&
-      receipt.proofPatterns.length > 0 &&
-      authEvidence?.credentialPatternMatched === true,
-    )
-    const hasVerifiedBoundaryDiff =
-      authEvidence?.crossTenant === true ||
-      authEvidence?.roleDifferential === true ||
-      hasCredentialPatternDisclosure
+    const authEvidence = assessment.evidence as { crossTenant?: boolean; roleDifferential?: boolean; credentialPatternMatched?: boolean } | undefined
+    const hasVerifiedBoundaryDiff = authEvidence?.crossTenant === true || authEvidence?.roleDifferential === true
+      || Boolean(impactClass === 'disclosure' && authEvidence?.credentialPatternMatched === true)
     if (deniedCtrls.length > 0 && !hasAuthDeniedCtrl && !hasVerifiedBoundaryDiff && okAuthProbes.length > 0) {
       const hasForeign = okAuthProbes.some(p => {
         if (stepMutatesState(p)) return false
-        if (hasForeignTenantOrOwnerDisclosure(steps, p, receipt.resourceTenant ?? null)) return true
+        if (hasForeignTenantOrOwnerDisclosure(steps, p, null)) return true
         const obj = parseStepJson(p)
         if (!obj || typeof obj !== 'object') return false
         const pt = p.actor.tenant?.toLowerCase() ?? null, ph = p.actor.handle?.toLowerCase() ?? null
@@ -1706,7 +1608,7 @@ function entryWindow(entry: ReceiptTranscriptEntry): { start: number; end: numbe
  *      per-mutation debit derived/bounded strictly from host-recorded exchanges.
  */
 function verifyConservedBalanceReceipt(
-  receipt: ProofReceipt,
+  receipt: HostSanitizedReceipt,
   entriesById: ReadonlyMap<string, ReceiptTranscriptEntry>,
   transcriptOrder: ReadonlyMap<string, number>,
 ): ReceiptVerification {
@@ -1903,7 +1805,7 @@ function verifyConservedBalanceReceipt(
     return reject(receipt, rule, 'Post-burst readback timestamp precedes the concurrent burst in the host transcript.')
   }
 
-  const conserved = sharedConservedField(baselineEntry.step, postEntry.step, receipt.conservedBalance?.balanceField)
+  const conserved = sharedConservedField(baselineEntry.step, postEntry.step)
   if (!conserved) {
     return reject(
       receipt,
@@ -1914,7 +1816,7 @@ function verifyConservedBalanceReceipt(
 
   const actualBurstDebit = conserved.pre - conserved.post
   const actualBurstCredit = conserved.post - conserved.pre
-  const cap = findCapValue(baselineEntry.step, postEntry.step, conserved.field, receipt.conservedBalance?.capField)
+  const cap = findCapValue(baselineEntry.step, postEntry.step, conserved.field)
 
   // Locate serial control exchanges (must not be interleaved inside the burst).
   const serialIndices: number[] = []
@@ -1994,7 +1896,7 @@ function verifyConservedBalanceReceipt(
 
   let serialControlKind: 'serial_debit_exact' | 'serial_rejection' | null = null
   let serialDebitObserved: number | null = null
-  const declaredUnitDebit = receipt.conservedBalance?.unitDebit
+  const declaredUnitDebit: number | undefined = undefined
   if (serialConflictAfter2xx.length > 0 && !serialPostEntry) {
     serialControlKind = 'serial_rejection'
   } else {
@@ -2475,7 +2377,7 @@ function collectSubstantiveAuthDataFields(value: unknown, prefix = '', depth = 0
  *     (rejecting status-only, empty, boilerplate `{ok:true}`, error-only, and HTML shell responses).
  */
 function verifyAuthBypassReceipt(
-  receipt: ProofReceipt,
+  receipt: HostSanitizedReceipt,
   entriesById: ReadonlyMap<string, ReceiptTranscriptEntry>,
   allEntries: readonly ReceiptTranscriptEntry[] = [...entriesById.values()],
 ): ReceiptVerification {
@@ -3343,6 +3245,7 @@ export function verifyHostExpressionProbe(input: {
   expectedChallengeId?: string
   vulnClass?: string
   oracle?: HostMintedOracle
+  binding?: Partial<Omit<NonceBinding, 'oracleId'>>
 }): EvaluatedExpressionProbeCheck {
   const oracle = input.oracle ?? defaultHostMintedOracle
   if (!input.stampedChallenge) {
@@ -3352,7 +3255,7 @@ export function verifyHostExpressionProbe(input: {
       challenge: null,
     }
   }
-  const verified = oracle.verifyExpressionChallenge(input.stampedChallenge)
+  const verified = oracle.verifyExpressionChallenge(input.stampedChallenge, input.binding)
   if (!verified) {
     return {
       ok: false,
@@ -3494,14 +3397,24 @@ function verifyStampedBooleanPairRound(input: {
   requireBaseline: boolean
   requireArmATrue?: boolean
   oracle: HostMintedOracle
+  runId?: string
 }): { ok: true; challenge: HostMintedBooleanPairChallenge } | { ok: false; reason: string } {
   const stampA = input.armA.hostBooleanPair
   const stampB = input.armB.hostBooleanPair
   if (!stampA || !stampB) {
     return { ok: false, reason: 'missing host-minted hostBooleanPair stamp on true/false arms; worker-chosen boolean predicate pairs are rejected.' }
   }
-  const verifiedA = input.oracle.verifyBooleanPair(stampA)
-  const verifiedB = input.oracle.verifyBooleanPair(stampB)
+  const bindFor = (e: ReceiptTranscriptEntry, arm: BooleanPairArm) => ({
+    ...(input.runId ? { runId: input.runId } : {}),
+    ...(e.origin ? { origin: e.origin } : {}),
+    method: e.step.method,
+    route: routeOf(e.step),
+    param: input.param,
+    armRole: arm,
+    exchangeId: e.exchangeId,
+  })
+  const verifiedA = input.oracle.verifyBooleanPair(stampA, bindFor(input.armA, stampA.arm))
+  const verifiedB = input.oracle.verifyBooleanPair(stampB, bindFor(input.armB, stampB.arm))
   if (!verifiedA || !verifiedB) {
     return { ok: false, reason: 'hostBooleanPair stamp failed HostMintedOracle verification (unminted challengeId, mismatched values, unequal length, or mismatched character multiset).' }
   }
@@ -3520,7 +3433,7 @@ function verifyStampedBooleanPairRound(input: {
     if (!input.baseline?.hostBooleanPair) {
       return { ok: false, reason: 'baseline arm is missing its host-minted hostBooleanPair stamp.' }
     }
-    const verifiedBase = input.oracle.verifyBooleanPair(input.baseline.hostBooleanPair)
+    const verifiedBase = input.oracle.verifyBooleanPair(input.baseline.hostBooleanPair, bindFor(input.baseline, 'baseline'))
     if (!verifiedBase || verifiedBase.challengeId !== verifiedA.challengeId || input.baseline.hostBooleanPair.arm !== 'baseline') {
       return { ok: false, reason: 'baseline arm hostBooleanPair stamp does not match the round challengeId/baseline role.' }
     }
@@ -3549,10 +3462,11 @@ function verifyStampedBooleanPairRound(input: {
  * anti-reflection checks through `verifyHostExpressionProbe()` + `normalizeRequestCarrier()`.
  */
 function verifyEvaluatedExpression(
-  receipt: ProofReceipt,
+  receipt: HostSanitizedReceipt,
   entriesById: ReadonlyMap<string, ReceiptTranscriptEntry>,
   _transcript: ReceiptTranscript,
   oracle: HostMintedOracle,
+  runId?: string,
 ): ReceiptVerification | null {
   const cited = receipt.exchangeIds.map(id => entriesById.get(id)!)
   const controls = cited.filter(entry => entry.step.arm === 'control' && is2xxStatus(entry.step.status))
@@ -3610,6 +3524,7 @@ function verifyEvaluatedExpression(
       stampedChallenge: probe.hostExpressionChallenge,
       vulnClass: receipt.vulnClass,
       oracle,
+      binding: { ...(runId ? { runId } : {}), origin: probeOrigin, method: probeMethod, route: probeRoute, param: differingParam, armRole: 'probe', exchangeId: probe.exchangeId },
     })
     if (!check.ok || !check.challenge) continue
     verifiedProbes.push({ probe, control: matchingControl, challenge: check.challenge, param: differingParam })
@@ -4001,7 +3916,7 @@ export function verifySignedUrlMintPair(input: {
 }
 
 function verifySignedUrlMintReceipt(
-  receipt: ProofReceipt,
+  receipt: HostSanitizedReceipt,
   entriesById: ReadonlyMap<string, ReceiptTranscriptEntry>,
   rule: ReceiptVerification['rule'],
 ): ReceiptVerification {
@@ -4518,6 +4433,9 @@ export function buildAgentScriptReceipt(input: {
       })
       if (!allConsistent) continue
       const derivedClass = derivedTimingVulnClassForFamily(verifiedChallenge.family)
+      const stampedEntries = (baseTranscript.entries ?? []).map(entry =>
+        armOverrides.has(entry.exchangeId) ? { ...entry, hostTimingChallenge: verifiedChallenge } : entry,
+      )
       return {
         receipt: buildProofReceipt({
           vulnClass: derivedClass,
@@ -4532,10 +4450,7 @@ export function buildAgentScriptReceipt(input: {
           browserTraceIds: [],
           claimedDelta: `${input.title} — host-minted ${verifiedChallenge.family} timing separation over ${controls.length}/${variants.length} interleaved arms.`.slice(0, 1200),
         }),
-        transcript: {
-          ...baseTranscript,
-          hostTimingChallenge: verifiedChallenge,
-        },
+        transcript: { ...baseTranscript, entries: stampedEntries },
         factLog,
         armOverrides,
       }

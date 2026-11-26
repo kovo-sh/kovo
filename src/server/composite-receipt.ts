@@ -10,9 +10,9 @@ import { augmentCompositeReceiptWithAutoDag, matchesBoundTerminalControl, matche
 import { analyzeCrossTenantTerminalEvidence, collectCitedReceiptExchanges, evaluateExchangeTenantPrivilege, inferV8OracleFamilyFromInput, isReadOnlyDirectoryOrMetadataImpact, normalizeCompositeTerminalEndpoint, parsePersonaPrivilegeProfile, verifyReadOnlyStateTransitionGuard } from './causal-proof-compiler.ts'
 import { resolveCompositeTerminalExchange } from './composite-terminal.ts'
 import { HostFactLog } from './host-fact-log.ts'
-import { proofReceiptSchema, receiptIdSchema, verifyReceipt } from './proof-receipt.ts'
-import { evaluateV8OracleFamily, extractTenantMarkers, isJobOrHandleStub, type HostSignedRecord as V8OracleRecord, type V8OracleFamily, type V8OracleInputMap } from './v8-oracle-families.ts'
-import { TERMINAL_CLASS_CONTRACT, buildCapOriginIndex, canonicalNonAuthQuery, cleanExactPath, entryCarriesRequestToken, entryMatchesCorrelation, entryMatchesEntity, hydrateV8OracleInput, isHydratedStub, isPrivilegedActorOrRole, matchesHydratedRecord, resolveEntryIdentity, resolveTerminalContract, sanitizeEmbeddedProofReceipt, selectStateTransitionPair, type CapOriginIndex, type EconomicAutoHydrateContext, type TerminalContractKind } from './v8-oracle-hydrate.ts'
+import { proofReceiptSchema, receiptIdSchema } from './proof-receipt.ts'
+import { extractTenantMarkers, isJobOrHandleStub, type V8OracleFamily } from './v8-oracle-families.ts'
+import { TERMINAL_CLASS_CONTRACT, buildCapOriginIndex, canonicalNonAuthQuery, cleanExactPath, entryCarriesRequestToken, entryMatchesCorrelation, entryMatchesEntity, isHydratedStub, isPrivilegedActorOrRole, resolveEntryIdentity, resolveTerminalContract, sanitizeEmbeddedProofReceipt, selectStateTransitionPair, type CapOriginIndex, type EconomicAutoHydrateContext, type TerminalContractKind } from './v8-oracle-hydrate.ts'
 export { TERMINAL_CLASS_CONTRACT, type TerminalContractKind }
 import type { ProofReceipt, ReceiptBrowserTrace, ReceiptOobEvent, ReceiptTranscript, ReceiptTranscriptEntry, ReceiptVerification } from './proof-receipt.ts'
 
@@ -542,18 +542,17 @@ function verifyReplayMode(receipt: CompositeProofReceipt, dag: DagTopology, idx:
 type DefaultV8Ctx = { termEndpoint: string; termFam: string; hasOob: boolean; hasBrowser: boolean; hasBody: boolean; isStub: boolean; ownTenantOnly: boolean; hasForeignTenantData: boolean; hasVerifiedTermEdge: boolean }
 let defaultOracleEvaluator: CompositeOracleEvaluator | null = null
 export function registerDefaultCompositeOracleEvaluator(evaluator: CompositeOracleEvaluator | null): void { defaultOracleEvaluator = evaluator }
-const fallbackOracleEvaluator: CompositeOracleEvaluator = {
-  evaluate(factLog, ref, policy = {}) {
-    const tr = factLog.toHostSignedTranscript()
-    if (ref.kind === 'single_hop') { const p = proofReceiptSchema.safeParse(ref.receipt); if (!p.success) return { confirmed: false, reason: 'Receipt failed schema validation.' }; const v = verifyReceipt(p.data, tr, policy.signingKey ? { signingKey: policy.signingKey } : undefined); return { confirmed: v.confirmed, reason: v.reason, singleHop: v } }
-    const signed = new Map((tr.entries ?? []).map(e => [e.exchangeId, e])), entriesById = new Map([...signed].map(([id, e]) => { const raw = factLog.getExchange(id)?.rawRequestBody; return [id, e.step.requestJson === undefined && raw != null ? { ...e, step: { ...e.step, requestJson: raw } } : e] as const }))
-    const oobById = new Map((tr.oobEvents ?? []).map(o => [o.id, o])), tracesById = new Map((tr.browserTraces ?? []).map(t => [t.id, t])), pollsById = new Map((tr.asyncPollRecords ?? []).map(p => [p.id, p])), idx = { entriesById, oobById, tracesById }, fallbackSig = policy.signingKey ? '' : 'host-verified-sig'
-    const verifySignature = (rec: V8OracleRecord): boolean => { const e = entriesById.get(rec.id) ?? oobById.get(rec.id) ?? tracesById.get(rec.id) ?? pollsById.get(rec.id); if (!e) return false; const s = signed.get(rec.id) ?? e; return (!policy.signingKey || (s.hostSignature === rec.hostSignature && verifyHostRecordSignature(s, policy.signingKey))) && (pollsById.has(rec.id) || matchesHydratedRecord(rec, idx, fallbackSig)) }
-    const hydrated = hydrateV8OracleInput(ref.family, ref.rawInput ?? {}, idx, fallbackSig, ref.econCtx); if (ref.family === 'economic_conservation' && isHydratedStub(hydrated.finalReadback)) return { confirmed: false, reason: 'terminal_impact_unproven_intermediate_stub' }
-    const dec = evaluateV8OracleFamily(ref.family, { ...hydrated, verifySignature } as V8OracleInputMap[typeof ref.family]); return { confirmed: dec.required && dec.satisfied, reason: dec.reason }
-  },
+export class UnregisteredOracleEvaluatorError extends Error {
+  constructor(message = 'CompositeProofReceipt verification failed closed: no TerminalOracleRegistry evaluator is registered (unsanitized fallback evaluator removed in R3-16).') {
+    super(message)
+    this.name = 'UnregisteredOracleEvaluatorError'
+  }
 }
-const resolveOracleEvaluator = (options: CompositeVerifyOptions): CompositeOracleEvaluator => options.oracleEvaluator ?? defaultOracleEvaluator ?? fallbackOracleEvaluator
+const resolveOracleEvaluator = (options: CompositeVerifyOptions): CompositeOracleEvaluator => {
+  const evaluator = options.oracleEvaluator ?? defaultOracleEvaluator
+  if (!evaluator) throw new UnregisteredOracleEvaluatorError()
+  return evaluator
+}
 
 function dispatchDefaultV8Oracle(
   receipt: CompositeProofReceipt, dag: DagTopology, idx: IndexedTranscript, factLog: HostFactLog, termEx: HostTranscriptEntry | undefined, options: CompositeVerifyOptions,

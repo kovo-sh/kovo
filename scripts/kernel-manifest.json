@@ -7,10 +7,12 @@
     "src/server/composite-autodag.ts",
     "src/server/composite-receipt.ts",
     "src/server/composite-terminal.ts",
+    "src/server/evidence-provenance.ts",
     "src/server/exec-verify.ts",
     "src/server/floor-recipe-engine.ts",
     "src/server/floor-recipes.ts",
     "src/server/host-fact-log.ts",
+    "src/server/nonce-ledger.ts",
     "src/server/oracle-invariants.ts",
     "src/server/oracle-spec.ts",
     "src/server/proof-receipt.ts",
@@ -81,6 +83,19 @@
       ]
     },
     {
+      "file": "src/server/evidence-provenance.ts",
+      "reasons": [
+        "call_graph_reachable"
+      ],
+      "matchedExports": [],
+      "reachableFrom": [
+        "src/server/proof-receipt.ts::verifyReceipt",
+        "src/server/terminal-oracle-registry.ts::evaluateTerminalOracle",
+        "src/server/verify-prove-handlers.ts::handleProveInjection",
+        "src/server/verify-prove-handlers.ts::handleProveRace"
+      ]
+    },
+    {
       "file": "src/server/exec-verify.ts",
       "reasons": [
         "confirmation_entrypoint"
@@ -127,6 +142,19 @@
         "src/server/verify-claims.ts::evaluateClaims",
         "src/server/verify-prove-handlers.ts::handleProveRace",
         "src/server/verify-prove-handlers.ts::handleProveSignedUrlMint"
+      ]
+    },
+    {
+      "file": "src/server/nonce-ledger.ts",
+      "reasons": [
+        "call_graph_reachable"
+      ],
+      "matchedExports": [],
+      "reachableFrom": [
+        "src/server/proof-receipt.ts::verifyReceipt",
+        "src/server/verify-prove-handlers.ts::handleProveDifferential",
+        "src/server/verify-prove-handlers.ts::handleProveInjection",
+        "src/server/verify-prove-handlers.ts::handleProveRace"
       ]
     },
     {

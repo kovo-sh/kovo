@@ -26,9 +26,13 @@ import {
 import type { HostFactLog } from './host-fact-log.ts'
 import type { ImpactStep } from './oracle-invariants.ts'
 import {
+  constructHostEvidence,
+  sanitizeReceiptByAllowlist,
+} from './evidence-provenance.ts'
+import {
   proofReceiptSchema,
   receiptRuleFor,
-  verifyReceipt,
+  verifyHostEvidence,
   type ProofReceipt,
   type ReceiptVerification,
 } from './proof-receipt.ts'
@@ -105,6 +109,8 @@ export interface TerminalOraclePolicyContext {
   strictHostDerivation?: boolean
   /** Explicitly host-trusted oracle events (e.g. from floor spec or host CSRF observation). */
   trustedOracleEvents?: readonly string[]
+  /** Optional host run identifier for per-run HMAC nonce-ledger binding (`R3-16`). */
+  runId?: string
   /** Explicitly host-trusted composite verification options. */
   compositeOptions?: Omit<CompositeVerifyOptions, 'signingKey'>
 }
@@ -149,23 +155,12 @@ export function sanitizeSingleHopReceiptForHostCustody(
     ? [...orderedIds, ...missingIds]
     : orderedIds
 
-  // Strict host custody (H-13 / R2-H-6): unconditionally neutralize untrusted worker-supplied
-  // scalar hints so mutating them (or passing strictHostDerivation:false) can never flip an
-  // oracle verdict; preserve only host-trusted oracleEvents if explicitly passed by host code.
-  const { requiredRole: _dropRole, resourceTenant: _dropTenant, oracleEvents: _dropEvents, conservedBalance, ...rest } = receipt
-  const cleanConserved = conservedBalance
-    ? {
-        ...(conservedBalance.balanceField ? { balanceField: conservedBalance.balanceField } : {}),
-        ...(conservedBalance.capField ? { capField: conservedBalance.capField } : {}),
-      }
-    : undefined
-  const trustedEvents = policy.trustedOracleEvents?.length ? [...policy.trustedOracleEvents] : undefined
-  return {
-    ...rest,
-    exchangeIds: hostOrderedExchangeIds,
-    ...(trustedEvents ? { oracleEvents: trustedEvents } : {}),
-    ...(cleanConserved && Object.keys(cleanConserved).length > 0 ? { conservedBalance: cleanConserved } : {}),
-  }
+  // R3-16 strict allowlist host custody (ZERO spread of untrusted keys): preserves ONLY
+  // allowlisted routing/citation fields + host-ordered exchangeIds + explicitly host-trusted
+  // oracleEvents. Unconditionally strips requiredRole, resourceTenant, expectControlDenied,
+  // proofPatterns, injectedAtMs, conservedBalance (balanceField/capField/unitDebit), worker
+  // oracleEvents, and any unknown/future worker scalars.
+  return sanitizeReceiptByAllowlist(receipt, hostOrderedExchangeIds, policy.trustedOracleEvents)
 }
 
 function sanitizeEmbeddedReceiptField(
@@ -320,8 +315,16 @@ function defaultSingleHopHandler(
     ...policy,
     strictHostDerivation: true,
   })
-  return verifyReceipt(canonicalReceipt, transcript, {
+  const hostEvidence = constructHostEvidence({
+    receipt: canonicalReceipt,
+    transcript,
+    hostOrderedExchangeIds: canonicalReceipt.exchangeIds,
+    trustedOracleEvents: policy.trustedOracleEvents,
+    ...(policy.runId ? { runId: policy.runId } : {}),
+  })
+  return verifyHostEvidence(hostEvidence, {
     ...(policy.signingKey ? { signingKey: policy.signingKey } : {}),
+    ...(policy.runId ? { runId: policy.runId } : {}),
   })
 }
 
@@ -368,16 +371,25 @@ function defaultV8FamilyHandler(
   return evaluateV8OracleFamily(family, { ...hydrated, verifySignature } as V8OracleInputMap[typeof family])
 }
 
+export class UnregisteredTerminalOracleError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'UnregisteredTerminalOracleError'
+  }
+}
+
 export class TerminalOracleRegistry {
   private readonly singleHopRules = new Map<SingleHopOracleRule, SingleHopRuleHandler>()
   private readonly v8Families = new Map<V8OracleFamily, V8FamilyHandler>()
 
-  constructor() {
-    for (const rule of SINGLE_HOP_ORACLE_RULES) {
-      this.singleHopRules.set(rule, defaultSingleHopHandler)
-    }
-    for (const family of REGISTERED_V8_ORACLE_FAMILIES) {
-      this.v8Families.set(family, defaultV8FamilyHandler)
+  constructor(options: { registerDefaults?: boolean } = {}) {
+    if (options.registerDefaults !== false) {
+      for (const rule of SINGLE_HOP_ORACLE_RULES) {
+        this.singleHopRules.set(rule, defaultSingleHopHandler)
+      }
+      for (const family of REGISTERED_V8_ORACLE_FAMILIES) {
+        this.v8Families.set(family, defaultV8FamilyHandler)
+      }
     }
   }
 
@@ -430,12 +442,7 @@ export class TerminalOracleRegistry {
     if (pointerRef.kind === 'v8_family') {
       const handler = this.v8Families.get(pointerRef.family)
       if (!handler) {
-        return {
-          confirmed: false,
-          kind: 'v8_family',
-          familyOrRule: pointerRef.family,
-          reason: `Unregistered v8 oracle family "${pointerRef.family}".`,
-        }
+        throw new UnregisteredTerminalOracleError(`Unregistered v8 oracle family "${pointerRef.family}" in TerminalOracleRegistry (fail-closed; no fallback evaluator).`)
       }
       const decision = handler(factLog, pointerRef.family, pointerRef.rawInput ?? {}, policyContext, {
         ...(pointerRef.econCtx ? { econCtx: pointerRef.econCtx } : {}),
@@ -535,21 +542,7 @@ export class TerminalOracleRegistry {
     })
     const handler = this.singleHopRules.get(rule)
     if (!handler) {
-      const singleHop: ReceiptVerification = {
-        confirmed: false,
-        vulnClass: receipt.vulnClass,
-        rule,
-        reason: `Single-hop rule "${rule}" is not registered in TerminalOracleRegistry.`,
-        observed: receipt.claimedDelta,
-        expected: 'a registered single-hop oracle handler',
-      }
-      return {
-        confirmed: false,
-        kind: 'single_hop',
-        familyOrRule: rule,
-        reason: singleHop.reason,
-        singleHop,
-      }
+      throw new UnregisteredTerminalOracleError(`Single-hop rule "${rule}" is not registered in TerminalOracleRegistry (fail-closed; no unsanitized fallback).`)
     }
 
     if (pointerRef.enforceCompositeEnvelope) {
@@ -602,12 +595,22 @@ export class TerminalOracleRegistry {
 }
 
 export const defaultTerminalOracleRegistry = new TerminalOracleRegistry()
-registerDefaultCompositeOracleEvaluator(defaultTerminalOracleRegistry)
+let activeDefaultTerminalOracleRegistry: TerminalOracleRegistry | null = null
+
+export function registerDefaultTerminalOracleRegistry(registry: TerminalOracleRegistry | null): void {
+  activeDefaultTerminalOracleRegistry = registry
+  registerDefaultCompositeOracleEvaluator(registry)
+}
+
+registerDefaultTerminalOracleRegistry(defaultTerminalOracleRegistry)
 
 export function evaluateTerminalOracle(
   factLog: HostFactLog,
   pointerRef: TerminalOraclePointerRef,
   policyContext: TerminalOraclePolicyContext = {},
 ): TerminalOracleResult {
-  return defaultTerminalOracleRegistry.evaluate(factLog, pointerRef, policyContext)
+  if (!activeDefaultTerminalOracleRegistry) {
+    throw new UnregisteredTerminalOracleError('TerminalOracleRegistry is not registered (fail-closed; zero unsanitized fallback).')
+  }
+  return activeDefaultTerminalOracleRegistry.evaluate(factLog, pointerRef, policyContext)
 }

@@ -17,6 +17,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { performance } from 'node:perf_hooks'
 import test from 'node:test'
+import '../src/server/terminal-oracle-registry.ts'
 
 import {
   sha256Hex,

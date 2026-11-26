@@ -14,6 +14,8 @@
  */
 import { createHash, createHmac } from 'node:crypto'
 import { createEgressSanitizer, EgressSanitizer, type EgressChannel } from './egress-sanitizer.ts'
+import type { ArmProvenance } from './evidence-provenance.ts'
+export type { ArmProvenance } from './evidence-provenance.ts'
 import { resolvePersonaIdentity, type AmbientAuth, type ImpactStep, type RoleName } from './oracle-invariants.ts'
 import type { BrokerExchangeResult, BrokerHttpRequest, WireCredentialProvenance } from './broker.ts'
 export type { WireCredentialProvenance } from './broker.ts'
@@ -202,6 +204,7 @@ export interface HostExchangeFact {
   readonly endedAt?: number
   readonly timestampMs?: number
   readonly arm?: ImpactStep['arm']
+  readonly armProvenance?: ArmProvenance
   readonly sessionRole?: string | null
   readonly evidenceRole?: string
   readonly sessionId?: string | null
@@ -248,6 +251,7 @@ export interface HostExchangeFactInput {
   hostTimingChallenge?: HostMintedTimingChallenge
   hostBooleanPair?: HostStampedBooleanPair
   hostRedirectCanaryHost?: string | null
+  armProvenance?: ArmProvenance
   oobCallbacks?: readonly HostOobCallbackFact[]
   durationMs?: number
   startedAt?: number
@@ -761,6 +765,30 @@ export function resolveCanonicalArm(
   return 'probe'
 }
 
+export interface ResolvedCanonicalArm {
+  readonly arm: ImpactStep['arm']
+  readonly provenance: ArmProvenance
+}
+
+/**
+ * R3-16: Derive canonical `ImpactStep['arm']` together with explicit provenance
+ * (`'host_assigned'` vs `'worker_selected'`) so host-assigned prove.* arms are
+ * distinguishable from worker-supplied `sessionRole` hints.
+ */
+export function resolveCanonicalArmWithProvenance(
+  sessionRole: string | null | undefined,
+  explicitArm?: ImpactStep['arm'],
+  explicitProvenance?: ArmProvenance,
+): ResolvedCanonicalArm {
+  const arm = resolveCanonicalArm(sessionRole, explicitArm)
+  if (explicitProvenance) return Object.freeze({ arm, provenance: explicitProvenance })
+  if (explicitArm) return Object.freeze({ arm, provenance: 'host_assigned' })
+  if (sessionRole === 'control' || sessionRole === 'probe' || sessionRole === 'setup' || sessionRole === 'cleanup') {
+    return Object.freeze({ arm, provenance: 'worker_selected' })
+  }
+  return Object.freeze({ arm, provenance: 'host_assigned' })
+}
+
 export interface HostExchangeCapabilityFlow {
   readonly exchangeId: string
   readonly seq: number
@@ -915,6 +943,7 @@ export class HostFactLog {
       ...(input.endedAt !== undefined ? { endedAt: input.endedAt } : {}),
       ...(input.timestampMs !== undefined ? { timestampMs: input.timestampMs } : {}),
       ...(input.arm !== undefined ? { arm: input.arm } : {}),
+      armProvenance: resolveCanonicalArmWithProvenance(input.sessionRole, input.arm, input.armProvenance).provenance,
       ...(input.sessionRole !== undefined ? { sessionRole: input.sessionRole } : {}),
       ...(input.evidenceRole !== undefined ? { evidenceRole: input.evidenceRole } : {}),
       ...(resolvedSessionId !== undefined ? { sessionId: resolvedSessionId } : {}),
@@ -1207,6 +1236,7 @@ export class HostFactLog {
         ...(fact.hostTimingChallenge ? { hostTimingChallenge: fact.hostTimingChallenge } : {}),
         ...(fact.hostBooleanPair ? { hostBooleanPair: fact.hostBooleanPair } : {}),
         ...(fact.hostRedirectCanaryHost !== undefined ? { hostRedirectCanaryHost: fact.hostRedirectCanaryHost } : {}),
+        ...(fact.armProvenance ? { armProvenance: fact.armProvenance } : {}),
       }
     })
     return {
@@ -1258,6 +1288,7 @@ export class HostFactLog {
       ...(fact.hostTimingChallenge ? { hostTimingChallenge: fact.hostTimingChallenge } : {}),
       ...(fact.hostBooleanPair ? { hostBooleanPair: fact.hostBooleanPair } : {}),
       ...(fact.hostRedirectCanaryHost !== undefined ? { hostRedirectCanaryHost: fact.hostRedirectCanaryHost } : {}),
+      ...(fact.armProvenance ? { armProvenance: fact.armProvenance } : {}),
       timestampMs: ts,
       actorPersona: fact.actor,
       ...(fact.actorRoleLabel !== undefined ? { actorRoleLabel: fact.actorRoleLabel } : {}),
@@ -1367,6 +1398,7 @@ export class HostFactLog {
         ...(entry.endedAt !== undefined ? { endedAt: entry.endedAt } : {}),
         ...(entry.timestampMs !== undefined ? { timestampMs: entry.timestampMs } : {}),
         arm: step.arm,
+        ...(entry.armProvenance ? { armProvenance: entry.armProvenance } : {}),
         ...(entry.evidenceRole ?? step.evidenceRole ? { evidenceRole: entry.evidenceRole ?? step.evidenceRole } : {}),
         ...(entry.sessionId !== undefined
           ? { sessionId: entry.sessionId }
@@ -1542,6 +1574,7 @@ export class HostFactLog {
         endedAt: record.startedAt + Math.max(0, record.durationMs),
         timestampMs: hostEntry?.timestampMs ?? record.startedAt,
         arm: hostEntry?.step.arm,
+        ...(hostEntry?.armProvenance ? { armProvenance: hostEntry.armProvenance } : {}),
         sessionRole: req?.sessionRole ?? null,
         ...((reqExtra?.sessionId ?? hostEntry?.sessionId ?? reqExtra?.wireCredentialProvenance?.session ?? hostEntry?.wireCredentialProvenance?.session) !== undefined
           ? { sessionId: reqExtra?.sessionId ?? hostEntry?.sessionId ?? reqExtra?.wireCredentialProvenance?.session ?? hostEntry?.wireCredentialProvenance?.session ?? null }
@@ -1602,6 +1635,7 @@ export class HostFactLog {
     exchange: BrokerExchangeResult,
     meta?: {
       arm?: ImpactStep['arm']
+      armProvenance?: ArmProvenance
       actorRoleLabel?: string | null
       actorRole?: RoleName | null
       actorPrivilege?: RoleName | null
@@ -1629,6 +1663,7 @@ export class HostFactLog {
       durationMs: exchange.durationMs,
       ...(meta?.startedAt !== undefined ? { startedAt: meta.startedAt, endedAt: meta.startedAt + exchange.durationMs } : {}),
       ...(meta?.arm ? { arm: meta.arm } : {}),
+      ...(meta?.armProvenance ? { armProvenance: meta.armProvenance } : {}),
       ...(meta?.evidenceRole ? { evidenceRole: meta.evidenceRole } : {}),
       ...(request.session ? { sessionId: request.session } : {}),
       ...(exchange.wireCredentialProvenance ? { wireCredentialProvenance: exchange.wireCredentialProvenance } : {}),

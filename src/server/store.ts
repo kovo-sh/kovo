@@ -14,11 +14,8 @@ import {
 } from '../domain.ts'
 import { purgeExpiredArtifacts } from './artifact-ttl.ts'
 import type { ArtifactTtlPolicy, ArtifactTtlPurgeResult } from './artifact-ttl.ts'
-import {
-  CapabilityLedger,
-  initCapabilityLedgerSchema,
-  type CapabilityLedgerOptions,
-} from './capability-ledger.ts'
+import { CapabilityLedger, initCapabilityLedgerSchema, type CapabilityLedgerOptions } from './capability-ledger.ts'
+import { SqliteNonceLedgerPersistence } from './nonce-ledger.ts'
 import { validateCitingColumnsAgainstTables } from './evidence-citations.ts'
 import { FindingCodec } from './finding-codec.ts'
 import { cancelOobDrainForRun, isDeletedRunRaceError, isOobDrainActive } from './oob-drain.ts'
@@ -1550,6 +1547,7 @@ export class Store {
   readonly projectsRepo: ProjectsRepository
   readonly findingsRepo: FindingsRepository
   readonly runsRepo: RunsRepository
+  readonly nonceLedgerPersistence: SqliteNonceLedgerPersistence
   private readonly processLock: DatabaseSync
   private readonly emitter = new EventEmitter()
   private ftsAvailable = false
@@ -1623,30 +1621,18 @@ export class Store {
       }
       this.initFts()
       const current = this.db.select().from(tables.workspaces).limit(1).get()
-      this.workspace = current ?? this.db.insert(tables.workspaces).values({
-        id: randomUUID(),
-        actorId: randomUUID(),
-        name: 'Personal workspace',
-        createdAt: Date.now(),
-      }).returning().get()
+      this.workspace = current ?? this.db.insert(tables.workspaces).values({ id: randomUUID(), actorId: randomUUID(), name: 'Personal workspace', createdAt: Date.now() }).returning().get()
       this.recordStoreSettings()
       this.session = new StoreSession({
-        db: this.db,
-        client: this.client,
-        rawClient,
-        workspace: this.workspace,
-        directory: this.directory,
-        emitter: this.emitter,
-        ftsMode: this.ftsMode,
-        ftsMaxBodyBytes: this.ftsMaxBodyBytes,
-        maxFullFtsDbBytes: this.maxFullFtsDbBytes,
-        ftsAvailable: this.ftsAvailable,
-        ftsTableExists: this.ftsTableExists,
+        db: this.db, client: this.client, rawClient, workspace: this.workspace, directory: this.directory,
+        emitter: this.emitter, ftsMode: this.ftsMode, ftsMaxBodyBytes: this.ftsMaxBodyBytes,
+        maxFullFtsDbBytes: this.maxFullFtsDbBytes, ftsAvailable: this.ftsAvailable, ftsTableExists: this.ftsTableExists,
         listProjectPersonas: projectId => listProjectPersonas(this, projectId),
       })
       this.projectsRepo = new ProjectsRepository(this.session)
       this.findingsRepo = new FindingsRepository(this.session)
       this.runsRepo = new RunsRepository(this.session, this.projectsRepo, this.findingsRepo)
+      this.nonceLedgerPersistence = new SqliteNonceLedgerPersistence(this.client)
       if (options.autoRecover !== false) recordStoreStartupReclaimedContainers(this, this.recover().reclaimedContainers)
     } catch (error) {
       if (rawClient) {

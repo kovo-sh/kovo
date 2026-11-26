@@ -733,13 +733,13 @@ test('H-15: timing differential confirms same-origin/method/route/persona with h
     claimedDelta: 'Timing separation claimed across 5 interleaved host-minted rounds.',
   })
   const makeDirect = (probePatch: Partial<ReceiptTranscriptEntry> & { stepPatch?: Partial<ImpactStep> }): ReceiptTranscript => ({
-    hostTimingChallenge: challenge,
     entries: Array.from({ length: 5 }, (_, i) => [
       {
         exchangeId: `c${i}`,
         seq: i * 2,
         origin: ORIGIN,
         durationMs: 40,
+        hostTimingChallenge: challenge,
         step: mkStep({ id: `c${i}`, arm: 'control', method: 'GET', route: '/api/search', pathAndQuery: `/api/search?q=${encodeURIComponent(challenge.controlToken)}`, status: 200 }),
       },
       {
@@ -747,6 +747,7 @@ test('H-15: timing differential confirms same-origin/method/route/persona with h
         seq: i * 2 + 1,
         origin: probePatch.origin ?? ORIGIN,
         durationMs: 2_000,
+        hostTimingChallenge: challenge,
         step: mkStep({ id: `p${i}`, arm: 'probe', method: 'GET', route: '/api/search', pathAndQuery: `/api/search?q=${encodeURIComponent(challenge.delayToken)}`, status: 200, ...(probePatch.stepPatch ?? {}) }),
       },
     ]).flat(),

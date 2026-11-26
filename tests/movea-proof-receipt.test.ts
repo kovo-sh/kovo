@@ -509,6 +509,7 @@ test('H-15: timing oracle enforces strict timingArmIdentity, single differing pa
       sessionId: 'sess-1',
       consumedCapabilities: ['cap:hop_1:a'],
       durationMs: 35,
+      hostTimingChallenge: cmdiChallenge,
       step: mkStep({
         id: `c${i}`,
         arm: 'control',
@@ -526,6 +527,7 @@ test('H-15: timing oracle enforces strict timingArmIdentity, single differing pa
         sessionId: 'sess-1',
         consumedCapabilities: ['cap:hop_1:a'],
         durationMs: 2_100,
+        hostTimingChallenge: cmdiChallenge,
         step: mkStep({
           id: `p${i}`,
           arm: 'probe',
@@ -616,7 +618,7 @@ test('H-15: timing oracle enforces strict timingArmIdentity, single differing pa
 
   // (J) Missing host-minted timing challenge OR class laundering (`cmdi` claiming `blind_sqli`)
   assert.equal(verifyReceipt(makeReceipt('timing'), {
-    entries: buildEntries(),
+    entries: buildEntries().map(({ hostTimingChallenge: _drop, ...e }) => e),
   }, { hostMintedOracle: oracle }).confirmed, false, 'timing without host-minted challenge must be rejected')
   assert.equal(verifyReceipt(makeReceipt('blind_sqli'), {
     hostTimingChallenge: cmdiChallenge,
@@ -660,10 +662,9 @@ test('R2-H-13: redirect rule requires same method/route/actor control, 3xx statu
 
   // Positive: matching control (stays local) + 302 probe carrying host-minted canary host in `next`
   const positive = verifyReceipt(receipt, {
-    hostRedirectCanaryHost: canary.host,
     entries: [
       { exchangeId: 'ctl', origin: ORIGIN, step: mkStep({ id: 'ctl', arm: 'control', method: 'GET', route: '/login', pathAndQuery: '/login?next=/dashboard', status: 302, responseHeaders: { location: '/dashboard' } }) },
-      { exchangeId: 'prb', origin: ORIGIN, step: mkStep({ id: 'prb', arm: 'probe', method: 'GET', route: '/login', pathAndQuery: `/login?next=${encodeURIComponent(`https://${canary.host}/cb`)}`, status: 302, responseHeaders: { location: `https://${canary.host}/cb` } }) },
+      { exchangeId: 'prb', origin: ORIGIN, hostRedirectCanaryHost: canary.host, step: mkStep({ id: 'prb', arm: 'probe', method: 'GET', route: '/login', pathAndQuery: `/login?next=${encodeURIComponent(`https://${canary.host}/cb`)}`, status: 302, responseHeaders: { location: `https://${canary.host}/cb` } }) },
     ],
   }, { hostMintedOracle: oracle })
   assert.equal(positive.confirmed, true, positive.reason)

@@ -6,6 +6,7 @@
  * receives host runtime capabilities via the narrow `ProveHandlerHost` seam.
  */
 import { randomBytes, randomUUID } from 'node:crypto'
+import type { ArmProvenance } from './evidence-provenance.ts'
 import type { BoundaryClass, ImpactClass } from './oracle-invariants.ts'
 import { isReservedEvidenceRole } from './host-fact-log.ts'
 import {
@@ -58,9 +59,13 @@ export type ProveHttpExchangeResult = {
 export interface ProveHttpExchangeStamps {
   hostExpressionChallenge?: HostMintedExpressionChallenge
   hostBooleanPair?: HostStampedBooleanPair
+  timingChallenge?: HostMintedTimingChallenge
+  armProvenance?: ArmProvenance
+  hostAssignedArm?: 'control' | 'probe' | 'setup' | 'cleanup'
 }
 
 export interface ProveHandlerHost {
+  readonly runId?: string
   readonly transcript: TranscriptStore
   readonly defaultOrigin: string | undefined
   readonly canaryBroker: VerifyCanaryBroker | undefined
@@ -70,6 +75,17 @@ export interface ProveHandlerHost {
   runOob(args: Record<string, unknown>): Promise<unknown>
   runRace(args: Record<string, unknown>, nonce: string): Promise<unknown>
   scrubRecord<T>(value: T): T
+}
+
+function proveMintBinding(host: ProveHandlerHost): { runId?: string; origin?: string } {
+  return { ...(host.runId ? { runId: host.runId } : {}), ...(host.defaultOrigin ? { origin: host.defaultOrigin } : {}) }
+}
+
+function hostAssignedStamp(
+  arm: 'control' | 'probe' | 'setup' | 'cleanup',
+  extra?: Omit<ProveHttpExchangeStamps, 'armProvenance' | 'hostAssignedArm'>,
+): ProveHttpExchangeStamps {
+  return { ...(extra ?? {}), armProvenance: 'host_assigned', hostAssignedArm: arm }
 }
 
 function parseJsonSafe(raw: unknown): unknown {
@@ -262,8 +278,8 @@ export async function handleProveAccessBoundary(host: ProveHandlerHost, args: Re
     sessionGroupRole: 'probe',
     session: probeSession,
   })
-  const control = await host.runHttpExchange(controlArgs, nonce)
-  const probe = await host.runHttpExchange(probeArgs, nonce)
+  const control = await host.runHttpExchange(controlArgs, nonce, hostAssignedStamp('control'))
+  const probe = await host.runHttpExchange(probeArgs, nonce, hostAssignedStamp('probe'))
 
   const expectControlDenied = (args.expectControlDenied ?? args.expect_control_denied) !== false
   const rawVuln = args.vulnClass ?? args.vuln_class
@@ -339,7 +355,7 @@ export async function handleProvePersistedMutation(host: ProveHandlerHost, args:
     ...(readPersona ? { persona: readPersona } : {}),
     sessionGroupRole: 'control',
     session: readSession,
-  }), nonce)
+  }), nonce, hostAssignedStamp('control'))
 
   const mutArgs = normalizeArmTarget(host.defaultOrigin, mutationSpec, {
     method: typeof (mutNested.method ?? mutRec?.method) === 'string' ? String(mutNested.method ?? mutRec?.method).toUpperCase() : 'POST',
@@ -353,13 +369,13 @@ export async function handleProvePersistedMutation(host: ProveHandlerHost, args:
       mutArgs.headers = { 'content-type': 'application/json', ...(h ?? {}) }
     }
   }
-  const mutation = await host.runHttpExchange(mutArgs, nonce)
+  const mutation = await host.runHttpExchange(mutArgs, nonce, hostAssignedStamp('probe'))
   const after = await host.runHttpExchange(normalizeArmTarget(host.defaultOrigin, readRoute, {
     method: readMethod,
     ...(readPersona ? { persona: readPersona } : {}),
     sessionGroupRole: 'control',
     session: readSession,
-  }), nonce)
+  }), nonce, hostAssignedStamp('control'))
 
   const beforeJson = parseJsonSafe(before.body)
   const afterJson = parseJsonSafe(after.body)
@@ -596,19 +612,12 @@ export async function handleProveDifferential(host: ProveHandlerHost, args: Reco
         : rawStyle === 'double_quote' || rawStyle === 'double'
           ? 'double_quote'
           : 'numeric'
-      booleanPair = mintHostBooleanPair(baseVal, { style, oracle: defaultHostMintedOracle })
-      const replacements: Record<string, string> = {
-        '{{boolBase}}': booleanPair.baseValue,
-        '{{boolTrue}}': booleanPair.trueValue,
-        '{{boolFalse}}': booleanPair.falseValue,
-        '{{boolTrueSuffix}}': booleanPair.trueSuffix,
-        '{{boolFalseSuffix}}': booleanPair.falseSuffix,
-      }
+      const mintBinding = proveMintBinding(host)
+      booleanPair = mintHostBooleanPair(baseVal, { style, oracle: { mintBooleanPair: (b, o) => defaultHostMintedOracle.mintBooleanPair(b, { ...o, binding: mintBinding }) } })
+      const replacements: Record<string, string> = { '{{boolBase}}': booleanPair.baseValue, '{{boolTrue}}': booleanPair.trueValue, '{{boolFalse}}': booleanPair.falseValue, '{{boolTrueSuffix}}': booleanPair.trueSuffix, '{{boolFalseSuffix}}': booleanPair.falseSuffix }
       controlTemplate = renderTemplateStrings(args.control, replacements)
       variantTemplate = renderTemplateStrings(args.variant, replacements)
-      if (baselineTemplate !== undefined && baselineTemplate !== null) {
-        baselineTemplate = renderTemplateStrings(baselineTemplate, replacements)
-      }
+      if (baselineTemplate !== undefined && baselineTemplate !== null) baselineTemplate = renderTemplateStrings(baselineTemplate, replacements)
     }
   }
   if (mode === 'timing') {
@@ -651,10 +660,7 @@ export async function handleProveDifferential(host: ProveHandlerHost, args: Reco
       })
     }
     const requestedDelayMs = Number(args.delayMs ?? args.delay_ms ?? 2_000)
-    timingChallenge = defaultHostMintedOracle.mintTimingChallenge(
-      family,
-      Number.isFinite(requestedDelayMs) ? requestedDelayMs : 2_000,
-    )
+    timingChallenge = defaultHostMintedOracle.mintTimingChallenge(family, Number.isFinite(requestedDelayMs) ? requestedDelayMs : 2_000, undefined, proveMintBinding(host))
     const delaySec = String(Math.max(1, Math.round(timingChallenge.delayMs / 1000)))
     controlTemplate = renderTemplateStrings(args.control, {
       '{{delayToken}}': timingChallenge.controlToken,
@@ -753,12 +759,12 @@ export async function handleProveDifferential(host: ProveHandlerHost, args: Reco
     }
   }
 
-  // R4-C-1: Stamp host-minted boolean pair arms onto every baseline/true/false exchange at send time.
-  const baselineStamp = booleanPair ? { hostBooleanPair: defaultHostMintedOracle.stampBooleanPairArm(booleanPair, 'baseline') } : undefined
+  // R4-C-1 / R3-16: Stamp host-minted boolean/timing challenges and host-assigned arm provenance at send time.
+  const baselineStamp = hostAssignedStamp('setup', booleanPair ? { hostBooleanPair: defaultHostMintedOracle.stampBooleanPairArm(booleanPair, 'baseline') } : undefined)
   const controlBoolArm: 'true' | 'false' = boolParity?.ok && boolParity.controlTruth === false ? 'false' : 'true'
   const variantBoolArm: 'true' | 'false' = controlBoolArm === 'true' ? 'false' : 'true'
-  const controlStamp = booleanPair ? { hostBooleanPair: defaultHostMintedOracle.stampBooleanPairArm(booleanPair, controlBoolArm) } : undefined
-  const variantStamp = booleanPair ? { hostBooleanPair: defaultHostMintedOracle.stampBooleanPairArm(booleanPair, variantBoolArm) } : undefined
+  const controlStamp = hostAssignedStamp('control', { ...(booleanPair ? { hostBooleanPair: defaultHostMintedOracle.stampBooleanPairArm(booleanPair, controlBoolArm) } : {}), ...(timingChallenge ? { timingChallenge } : {}) })
+  const variantStamp = hostAssignedStamp('probe', { ...(booleanPair ? { hostBooleanPair: defaultHostMintedOracle.stampBooleanPairArm(booleanPair, variantBoolArm) } : {}), ...(timingChallenge ? { timingChallenge } : {}) })
 
   const baselineExchanges: Array<ProveHttpExchangeResult> = []
   const controlExchanges: Array<ProveHttpExchangeResult> = []
@@ -975,7 +981,7 @@ export async function handleProveOob(host: ProveHandlerHost, args: Record<string
           sessionGroupRole: 'probe',
           session: 'oob-injection',
         })
-        injection = await host.runHttpExchange(injectArgs, nonce)
+        injection = await host.runHttpExchange(injectArgs, nonce, hostAssignedStamp('probe'))
       }
     } catch (error) {
       injectionError = error instanceof Error ? error.message : 'OOB injection failed.'
@@ -1141,7 +1147,7 @@ export async function handleProveRace(host: ProveHandlerHost, args: Record<strin
       ...(readPersona ? { persona: readPersona } : {}),
       sessionGroupRole: 'setup',
       session: sessionBase ? `${sessionBase}-baseline` : 'race-baseline',
-    }), nonce)
+    }), nonce, hostAssignedStamp('setup'))
   }
 
   const raceRes = await host.runRace({ requests: normalizedRequests, raceBatchId }, nonce) as {
@@ -1207,7 +1213,7 @@ export async function handleProveRace(host: ProveHandlerHost, args: Record<strin
     ...(readPersona ? { persona: readPersona } : {}),
     sessionGroupRole: 'control',
     session: sessionBase ? `${sessionBase}-post` : 'race-post',
-  }), nonce)
+  }), nonce, hostAssignedStamp('control'))
 
   // C-5: Serial control arm MUST be the exact identical request as the concurrent burst arm
   // (`normalizedRequests[0]`), ignoring any worker `serialRequest` override.
@@ -1217,7 +1223,7 @@ export async function handleProveRace(host: ProveHandlerHost, args: Record<strin
     sessionGroupRole: 'control',
     session: sessionBase ? `${sessionBase}-serial` : 'race-serial',
   }
-  const serial = await host.runHttpExchange(serialArgs, nonce)
+  const serial = await host.runHttpExchange(serialArgs, nonce, hostAssignedStamp('control'))
   let serialPost: ProveHttpExchangeResult | null = null
   if (serial.status >= 200 && serial.status < 300) {
     serialPost = await host.runHttpExchange(normalizeArmTarget(host.defaultOrigin, readRoute, {
@@ -1225,7 +1231,7 @@ export async function handleProveRace(host: ProveHandlerHost, args: Record<strin
       ...(readPersona ? { persona: readPersona } : {}),
       sessionGroupRole: 'control',
       session: sessionBase ? `${sessionBase}-serial-post` : 'race-serial-post',
-    }), nonce)
+    }), nonce, hostAssignedStamp('control'))
   }
 
   const ackedCount = exchanges.filter(item => item.status >= 200 && item.status < 300).length
@@ -1344,11 +1350,10 @@ export async function handleProveInjection(host: ProveHandlerHost, args: Record<
         : rawFamily === 'expression'
           ? 'expression'
           : 'ssti'
-    const ch1: HostMintedExpressionChallenge = defaultHostMintedOracle.mintExpressionChallenge(family)
-    let ch2: HostMintedExpressionChallenge = defaultHostMintedOracle.mintExpressionChallenge(family)
-    if (ch2.expectedOutput === ch1.expectedOutput) {
-      ch2 = defaultHostMintedOracle.mintExpressionChallenge(family)
-    }
+    const exprBind = proveMintBinding(host)
+    const ch1: HostMintedExpressionChallenge = defaultHostMintedOracle.mintExpressionChallenge(family, '*', exprBind)
+    let ch2: HostMintedExpressionChallenge = defaultHostMintedOracle.mintExpressionChallenge(family, '*', exprBind)
+    if (ch2.expectedOutput === ch1.expectedOutput) ch2 = defaultHostMintedOracle.mintExpressionChallenge(family, '*', exprBind)
     const renderChallenge = (spec: unknown, ch: HostMintedExpressionChallenge) =>
       renderTemplateStrings(spec, {
         '{{expr}}': ch.expressionSyntax,
@@ -1374,11 +1379,11 @@ export async function handleProveInjection(host: ProveHandlerHost, args: Record<
       })
     }
 
-    // R4-C-2: Stamp non-transferable per-exchange `hostExpressionChallenge` at send time.
-    const control = await host.runHttpExchange(controlArgs, nonce)
-    const probe1 = await host.runHttpExchange(probeArgs1, nonce, { hostExpressionChallenge: ch1 })
-    const probe2 = await host.runHttpExchange(probeArgs2, nonce, { hostExpressionChallenge: ch2 })
-    const control2 = await host.runHttpExchange(controlArgs, nonce)
+    // R4-C-2 / R3-16: Stamp non-transferable per-exchange `hostExpressionChallenge` and host-assigned arm provenance.
+    const control = await host.runHttpExchange(controlArgs, nonce, hostAssignedStamp('control'))
+    const probe1 = await host.runHttpExchange(probeArgs1, nonce, { hostExpressionChallenge: ch1, armProvenance: 'host_assigned', hostAssignedArm: 'probe' })
+    const probe2 = await host.runHttpExchange(probeArgs2, nonce, { hostExpressionChallenge: ch2, armProvenance: 'host_assigned', hostAssignedArm: 'probe' })
+    const control2 = await host.runHttpExchange(controlArgs, nonce, hostAssignedStamp('control'))
     const transcriptSummary = [
       proofEntry('control', control),
       proofEntry('probe', probe1),
@@ -1398,12 +1403,8 @@ export async function handleProveInjection(host: ProveHandlerHost, args: Record<
         requestBody: host.transcript.requestBody(probe1.exchangeId) ?? (typeof probeArgs1.body === 'string' ? probeArgs1.body : null),
         requestHeaders: rec1?.request?.headers ?? (asRecord(probeArgs1.headers) as Record<string, string> | null),
       },
-      probeBody: rawProbe1,
-      probeStatus: probe1.status,
-      controlBodies: [rawCtrl1, rawCtrl2],
-      stampedChallenge: rec1?.hostExpressionChallenge ?? ch1,
-      expectedChallengeId: ch1.challengeId,
-      vulnClass: derivedClass,
+      probeBody: rawProbe1, probeStatus: probe1.status, controlBodies: [rawCtrl1, rawCtrl2],
+      stampedChallenge: rec1?.hostExpressionChallenge ?? ch1, expectedChallengeId: ch1.challengeId, vulnClass: derivedClass, binding: exprBind,
     })
     const check2 = verifyHostExpressionProbe({
       probeRequest: {
@@ -1411,12 +1412,8 @@ export async function handleProveInjection(host: ProveHandlerHost, args: Record<
         requestBody: host.transcript.requestBody(probe2.exchangeId) ?? (typeof probeArgs2.body === 'string' ? probeArgs2.body : null),
         requestHeaders: rec2?.request?.headers ?? (asRecord(probeArgs2.headers) as Record<string, string> | null),
       },
-      probeBody: rawProbe2,
-      probeStatus: probe2.status,
-      controlBodies: [rawCtrl1, rawCtrl2],
-      stampedChallenge: rec2?.hostExpressionChallenge ?? ch2,
-      expectedChallengeId: ch2.challengeId,
-      vulnClass: derivedClass,
+      probeBody: rawProbe2, probeStatus: probe2.status, controlBodies: [rawCtrl1, rawCtrl2],
+      stampedChallenge: rec2?.hostExpressionChallenge ?? ch2, expectedChallengeId: ch2.challengeId, vulnClass: derivedClass, binding: exprBind,
     })
     const crossIsolated = !rawProbe1.includes(ch2.expectedOutput) && !rawProbe2.includes(ch1.expectedOutput)
     const varying = ch1.expectedOutput !== ch2.expectedOutput
@@ -1492,8 +1489,8 @@ export async function handleProveInjection(host: ProveHandlerHost, args: Record<
   const controlArgs = normalizeArmTarget(host.defaultOrigin, rawControl, { sessionGroupRole: 'control', session })
   const probeArgs = normalizeArmTarget(host.defaultOrigin, rawProbe, { sessionGroupRole: 'probe', session })
   const probeReqBody = typeof probeArgs.body === 'string' ? (parseJsonSafe(probeArgs.body) ?? probeArgs.body) : undefined
-  const control = await host.runHttpExchange(controlArgs, nonce)
-  const probe = await host.runHttpExchange(probeArgs, nonce)
+  const control = await host.runHttpExchange(controlArgs, nonce, hostAssignedStamp('control'))
+  const probe = await host.runHttpExchange(probeArgs, nonce, hostAssignedStamp('probe'))
   const transcriptSummary = [
     proofEntry('control', control),
     proofEntry('probe', probe),
@@ -1700,21 +1697,21 @@ export async function handleProveSignedUrlMint(
       sessionGroupRole: 'probe',
       session,
     })
-    control = await host.runHttpExchange(controlArgs, nonce)
-    probe = await host.runHttpExchange(probeArgs, nonce)
+    control = await host.runHttpExchange(controlArgs, nonce, hostAssignedStamp('control'))
+    probe = await host.runHttpExchange(probeArgs, nonce, hostAssignedStamp('probe'))
     if (rawAblation) {
       const ablationArgs = normalizeArmTarget(host.defaultOrigin, rawAblation, {
         ...(typeof baseOpts.method === 'string' && !(asRecord(rawAblation)?.method || asRecord(asRecord(rawAblation)?.options)?.method) ? { method: baseOpts.method } : {}),
         sessionGroupRole: 'control',
         session,
       })
-      ablation = await host.runHttpExchange(ablationArgs, nonce)
+      ablation = await host.runHttpExchange(ablationArgs, nonce, hostAssignedStamp('control'))
     } else if (control.status >= 200 && control.status < 300 && variant !== 'unauth_write_mint') {
       const armParity = checkArmIdentityParity(host.defaultOrigin, controlArgs, probeArgs)
       if (armParity.ok) {
         const autoAblArgs = buildSignedUrlAblationArgs(controlArgs, armParity.differingParam, nonce)
         if (autoAblArgs) {
-          try { ablation = await host.runHttpExchange(autoAblArgs, nonce) } catch { ablation = null }
+          try { ablation = await host.runHttpExchange(autoAblArgs, nonce, hostAssignedStamp('control')) } catch { ablation = null }
         }
       }
     }

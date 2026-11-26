@@ -14,6 +14,7 @@ import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
+import '../src/server/terminal-oracle-registry.ts'
 import { scanSourceTreeForContamination } from '../scripts/check-v8-contamination.ts'
 import {
   sha256Hex,
