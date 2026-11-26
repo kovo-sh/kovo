@@ -40,6 +40,8 @@ export interface DiscoveredSubdomain {
   thirdParty: boolean
   thirdPartyVendor: string | null
   cnameTarget: string | null
+  /** True when the host only answered identically to the apex wildcard DNS probe. */
+  wildcardOnly?: boolean
   sources?: SubdomainDiscoverySource[]
 }
 
@@ -73,11 +75,69 @@ export interface SubdomainDiscoveryResult {
 }
 
 /**
- * @deprecated Superseded by universal PSL CNAME apex ownership checks in
- * `classifyThirdPartyCname` (any CNAME resolving to a different registrable apex outside
- * pure CDN / first-party PaaS hosting proxies is classified as external automatically).
+ * Managed multi-tenant SaaS vendor CNAME suffixes (help-desk, issue-tracker, SSO, CMS, status,
+ * docs, commerce). Always classified as third-party on both discovered hosts and seed hosts,
+ * and never widened into first-party apex discovery (`R2-H-5`).
  */
-export const THIRD_PARTY_SAAS_CNAME_SUFFIXES: readonly string[] = []
+export const THIRD_PARTY_SAAS_CNAME_SUFFIXES: readonly string[] = [
+  'zendesk.com',
+  'freshdesk.com',
+  'helpscoutdocs.com',
+  'helpscout.net',
+  'intercom.help',
+  'statuspage.io',
+  'gitbook.io',
+  'readme.io',
+  'notion.site',
+  'webflow.io',
+  'myshopify.com',
+  'atlassian.net',
+  'okta.com',
+  'oktapreview.com',
+  'auth0.com',
+  'onelogin.com',
+  'ghost.io',
+  'squarespace.com',
+  'wixsite.com',
+  'hubspot.com',
+  'salesforce.com',
+  'force.com',
+  'pagerduty.com',
+  'typeform.com',
+  'calendly.com',
+  'greenhouse.io',
+  'lever.co',
+  'ashbyhq.com',
+  'bamboohr.com',
+  'linear.app',
+  'workday.com',
+  'servicenow.com',
+]
+
+const MULTI_TENANT_SAAS_SUFFIXES: ReadonlySet<string> = new Set([
+  ...THIRD_PARTY_SAAS_CNAME_SUFFIXES,
+  'intercom.io',
+  'jira.com',
+  'duosecurity.com',
+  'clerk.accounts.dev',
+  'shopify.com',
+  'substack.com',
+  'marketo.com',
+  'airtable.com',
+  'coda.io',
+  'retool.com',
+  'bubble.io',
+  'glideapps.io',
+  'weebly.com',
+  'wordpress.com',
+  'tumblr.com',
+  'medium.com',
+  'blogspot.com',
+  'kayako.com',
+  'desk.com',
+  'figma.com',
+  'miro.com',
+])
 
 /**
  * Pure CDN / edge proxy and first-party PaaS hosting apexes where organizations host
@@ -203,6 +263,23 @@ function extractLocalApex(hostname: string): string | null {
  * `bucket.s3.amazonaws.com`, `d111111abcdef8.cloudfront.net`, `acme-svc.a.run.app`).
  * Backed by the vendored Public Suffix List private-section classifier.
  */
+export function isMultiTenantSaasHost(hostname: string): boolean {
+  const host = normalizeHostname(hostname)
+  if (!host) return false
+  for (const suffix of MULTI_TENANT_SAAS_SUFFIXES) {
+    if (host === suffix || host.endsWith(`.${suffix}`)) return true
+  }
+  return false
+}
+
+export function isMultiTenantSaasOrigin(origin: string): boolean {
+  try {
+    return isMultiTenantSaasHost(new URL(origin).hostname)
+  } catch {
+    return false
+  }
+}
+
 export function isSharedPaasHost(hostname: string): boolean {
   const host = normalizeHostname(hostname)
   if (!host) return false
@@ -220,10 +297,49 @@ export function isSharedPaasOrigin(origin: string): boolean {
 export function apexDomainOfHost(hostname: string): string | null {
   const host = normalizeHostname(hostname)
   if (isLocalOrNonPublicHost(host) || !VALID_HOSTNAME_RE.test(host)) return null
-  if (isMultiTenantPublicSuffix(host) || isPublicSuffixHost(host)) return null
+  if (isMultiTenantPublicSuffix(host) || isPublicSuffixHost(host) || isMultiTenantSaasHost(host)) return null
   const registrable = registrableDomain(host)
-  if (!registrable || isMultiTenantPublicSuffix(registrable) || isPublicSuffixHost(registrable)) return null
+  if (
+    !registrable ||
+    isMultiTenantPublicSuffix(registrable) ||
+    isPublicSuffixHost(registrable) ||
+    isMultiTenantSaasHost(registrable)
+  ) {
+    return null
+  }
   return registrable
+}
+
+/**
+ * Compute the strict auto-admission anchor host for an approved asset origin (`R2-H-5`):
+ * - Anchors at the approved asset's hostname with only a leading `www.` stripped (never
+ *   widening `tenant.vendor.io` or `app.corp.example` up to the registrable apex).
+ * - Refuses local/IP hosts, bare public suffixes, PSL shared PaaS suffixes, and known
+ *   multi-tenant SaaS vendor domains.
+ */
+export function autoAdmitAnchorForOrigin(origin: string): string | null {
+  let url: URL
+  try {
+    url = new URL(origin)
+  } catch {
+    return null
+  }
+  if (url.protocol !== 'https:' && url.protocol !== 'http:') return null
+  const host = normalizeHostname(url.hostname)
+  if (isLocalOrNonPublicHost(host) || !VALID_HOSTNAME_RE.test(host)) return null
+  if (isSharedPaasHost(host) || isPublicSuffixHost(host) || isMultiTenantSaasHost(host)) return null
+  const anchor = host.startsWith('www.') ? host.slice(4) : host
+  if (!anchor || !VALID_HOSTNAME_RE.test(anchor)) return null
+  if (isSharedPaasHost(anchor) || isPublicSuffixHost(anchor) || isMultiTenantSaasHost(anchor)) return null
+  return anchor
+}
+
+/** Returns true strictly when `hostname` is a proper subdomain of `anchor` (`*.anchor`). */
+export function matchesAutoAdmitAnchor(hostname: string, anchor: string): boolean {
+  const host = normalizeHostname(hostname)
+  const normAnchor = normalizeHostname(anchor)
+  if (!host || !normAnchor) return false
+  return host.endsWith(`.${normAnchor}`)
 }
 
 /**
@@ -315,6 +431,19 @@ export function classifyThirdPartyCname(
     if (firstCname === null) {
       firstCname = target
       firstCnameApex = effectiveApex
+    }
+
+    const matchedKnownSaas = [...MULTI_TENANT_SAAS_SUFFIXES].find(
+      suffix => target === suffix || target.endsWith(`.${suffix}`),
+    )
+    if (matchedKnownSaas) {
+      return {
+        thirdParty: true,
+        externalCname: true,
+        matchedVendor: matchedKnownSaas,
+        cnameApex: effectiveApex,
+        cnameTarget: target,
+      }
     }
 
     // Same-apex CNAME hop (e.g. `api.acme.co.uk -> lb.acme.co.uk`) stays first-party.
@@ -827,10 +956,16 @@ export async function discoverSubdomainsForOrigins(
   const apexToParent = new Map<string, string>()
 
   for (const origin of origins) {
+    let seedHost: string
     try {
       const parsed = new URL(origin)
-      excludedHosts.add(normalizeHostname(parsed.hostname))
+      seedHost = normalizeHostname(parsed.hostname)
+      excludedHosts.add(seedHost)
     } catch {
+      skippedOrigins.push(origin)
+      continue
+    }
+    if (isSharedPaasHost(seedHost) || isMultiTenantSaasHost(seedHost)) {
       skippedOrigins.push(origin)
       continue
     }
@@ -838,6 +973,23 @@ export async function discoverSubdomainsForOrigins(
     if (!apex) {
       skippedOrigins.push(origin)
       continue
+    }
+    // R2-H-5: Check third-party CNAME ownership on subdomain seeds before using them as discovery anchors.
+    if (seedHost !== apex) {
+      try {
+        const seedDns = await withTimeout(
+          dnsResolver(seedHost, options.signal),
+          dnsTimeoutMs,
+          { cnames: [], addresses: [] },
+        )
+        const seedCnames = (seedDns.cnames ?? []).map(normalizeHostname).filter(Boolean)
+        if (classifyThirdPartyCname(seedCnames, seedHost).thirdParty) {
+          skippedOrigins.push(origin)
+          continue
+        }
+      } catch {
+        // Best-effort DNS check for seed CNAME ownership
+      }
     }
     if (!apexToParent.has(apex)) {
       apexToParent.set(apex, origin)
@@ -908,6 +1060,14 @@ export async function discoverSubdomainsForOrigins(
 
     const discoveredByOrigin = new Map<string, DiscoveredSubdomain>()
     let apexEmittedCount = 0
+    let wildcardProbeSignature: { cnamesKey: string; addressesKey: string } | null = null
+
+    const isWildcardEquivalentDns = (dns: DnsLookupResult): boolean => {
+      if (!wildcardProbeSignature) return false
+      const cnamesKey = [...dns.cnames].sort().join(',')
+      const addressesKey = [...dns.addresses].sort().join(',')
+      return cnamesKey === wildcardProbeSignature.cnamesKey && addressesKey === wildcardProbeSignature.addressesKey
+    }
 
     const emitLiveBatch = (hosts: readonly string[], source: SubdomainDiscoverySource) => {
       const liveForSource: string[] = []
@@ -934,6 +1094,7 @@ export async function discoverSubdomainsForOrigins(
         const dns = resolvedDns.get(hostname)
         if (!dns) continue
         const classification = classifyThirdPartyCname(dns.cnames, hostname)
+        const wildcardOnly = isWildcardEquivalentDns(dns)
         const entry: DiscoveredSubdomain = {
           hostname,
           origin,
@@ -944,6 +1105,7 @@ export async function discoverSubdomainsForOrigins(
           thirdParty: classification.thirdParty,
           thirdPartyVendor: classification.matchedVendor,
           cnameTarget: classification.cnameTarget,
+          ...(wildcardOnly ? { wildcardOnly: true } : {}),
           sources: [...(sourcesByHost.get(hostname) ?? [source])],
         }
         if (!entry.sources!.includes(source)) entry.sources!.push(source)
@@ -986,6 +1148,12 @@ export async function discoverSubdomainsForOrigins(
         const probeCnames = (probe.cnames ?? []).map(normalizeHostname).filter(Boolean)
         const probeAddrs = (probe.addresses ?? []).filter(Boolean)
         isWildcard = probeCnames.length > 0 || probeAddrs.length > 0
+        if (isWildcard) {
+          wildcardProbeSignature = {
+            cnamesKey: [...probeCnames].sort().join(','),
+            addressesKey: [...probeAddrs].sort().join(','),
+          }
+        }
       } catch {
         isWildcard = false
       }
@@ -1152,6 +1320,7 @@ export async function discoverSubdomainsForOrigins(
       const dns = resolvedDns.get(hostname)
       if (!dns) continue
       const classification = classifyThirdPartyCname(dns.cnames, hostname)
+      const wildcardOnly = isWildcardEquivalentDns(dns)
       seenOrigins.add(originKey)
       const entry: DiscoveredSubdomain = {
         hostname,
@@ -1163,6 +1332,7 @@ export async function discoverSubdomainsForOrigins(
         thirdParty: classification.thirdParty,
         thirdPartyVendor: classification.matchedVendor,
         cnameTarget: classification.cnameTarget,
+        ...(wildcardOnly ? { wildcardOnly: true } : {}),
         sources: [...(sourcesByHost.get(hostname) ?? [])],
       }
       discoveredByOrigin.set(origin, entry)
@@ -1205,13 +1375,14 @@ function buildDnsSource(sub: DiscoveredSubdomain): DnsSource {
 }
 
 /**
- * Apply Phase-0 discovered subdomains to a run:
- * - When an approved first-party parent asset for the apex has `includeSubdomains: true` AND the
- *   subdomain is NOT an external third-party CNAME (`!sub.thirdParty`), admit the discovered origin
- *   into `run.approved` and `project_assets` (`source: 'phase0_ct_discovery'`, `thirdParty: false`)
- *   so Phase-0 crawls and workers test it in the SAME run.
- * - Otherwise (`sub.thirdParty` or strict single-host parent), record as an unapproved candidate
- *   only (never auto-admitted or actively probed unless the operator explicitly approves it).
+ * Apply Phase-0 discovered subdomains to a run (`R2-H-5`):
+ * - Anchors auto-admission strictly at each approved non-third-party first-party asset's host
+ *   (stripping only a leading `www.`), admitting ONLY `*.anchor` — never widening to a shared
+ *   PaaS/SaaS vendor apex.
+ * - Never auto-admits origins declined by the operator in scope review (`runs.declined_origins`),
+ *   nor hosts that only answered because of wildcard DNS (`wildcardOnly` or `wildcardApexes`).
+ * - Routes all dynamic admissions through `storage.runsRepo.admitDynamicOrigin`, which bumps
+ *   `scopeRevision` and emits `asset.auto_admitted`.
  */
 export function applyDiscoveredSubdomainsToRun(
   storage: Store,
@@ -1221,16 +1392,22 @@ export function applyDiscoveredSubdomainsToRun(
 ): AppliedSubdomainDiscovery {
   const run = storage.run(runId)
   const detail = storage.projectDetail(run.projectId)
-  const wildcardApexes = new Set<string>()
-  for (const asset of detail.assets) {
+  const allowedAnchors = new Set<string>()
+  const approvedAnchorAssets = [
+    ...detail.assets,
+    ...run.candidates.filter(c => !detail.assets.some(a => a.origin === c.origin)),
+  ]
+  for (const asset of approvedAnchorAssets) {
     if (!asset.includeSubdomains || asset.thirdParty) continue
     if (!approvedOrigins.has(asset.origin)) continue
-    if (isSharedPaasOrigin(asset.origin)) continue
-    const apex = extractDiscoverableApex(asset.origin)
-    if (apex && !isSharedPaasHost(apex) && !isPublicSuffixHost(apex)) {
-      wildcardApexes.add(apex)
+    if (isSharedPaasOrigin(asset.origin) || isMultiTenantSaasOrigin(asset.origin)) continue
+    if (asset.dnsSource?.externalAliases?.length) continue
+    const anchor = autoAdmitAnchorForOrigin(asset.origin)
+    if (anchor) {
+      allowedAnchors.add(anchor)
     }
   }
+  const wildcardApexSet = new Set((result.wildcardApexes ?? []).map(normalizeHostname).filter(Boolean))
 
   const admitted: Candidate[] = []
   const candidatesOnly: Candidate[] = []
@@ -1241,23 +1418,35 @@ export function applyDiscoveredSubdomainsToRun(
 
   for (const sub of result.discovered) {
     if (approvedOrigins.has(sub.origin)) continue
-    // Defense-in-depth: PSL private multi-tenant hosts and bare public suffixes must never
-    // auto-admit sibling tenants even if a caller supplies synthetic discovery entries directly.
+    // Defense-in-depth: PSL private multi-tenant hosts, known multi-tenant SaaS vendors, and bare
+    // public suffixes must never auto-admit sibling tenants even from synthetic discovery entries.
+    const subHost = normalizeHostname(sub.hostname)
     const subApex = apexDomainOfHost(sub.hostname)
     const isSharedOrUnsafeTenant =
       isSharedPaasHost(sub.hostname) ||
       isSharedPaasOrigin(sub.origin) ||
       isSharedPaasHost(sub.apexDomain) ||
       isSharedPaasOrigin(sub.parentOrigin) ||
+      isMultiTenantSaasHost(sub.hostname) ||
+      isMultiTenantSaasOrigin(sub.origin) ||
+      isMultiTenantSaasHost(sub.apexDomain) ||
+      isMultiTenantSaasOrigin(sub.parentOrigin) ||
       isPublicSuffixHost(sub.apexDomain)
     if (isSharedOrUnsafeTenant) continue
 
     const dnsSource = buildDnsSource(sub)
+    const isWildcardHost =
+      Boolean(sub.wildcardOnly) ||
+      (subApex !== null && wildcardApexSet.has(subApex)) ||
+      wildcardApexSet.has(normalizeHostname(sub.apexDomain))
+    const matchedAnchor = [...allowedAnchors].find(anchor => matchesAutoAdmitAnchor(subHost, anchor)) ?? null
+    const isDeclined = storage.runsRepo.isOriginDeclined(runId, sub.origin)
     const shouldAutoAdmit =
       !sub.thirdParty &&
-      subApex !== null &&
-      subApex === normalizeHostname(sub.apexDomain) &&
-      wildcardApexes.has(subApex)
+      !isWildcardHost &&
+      !isDeclined &&
+      matchedAnchor !== null &&
+      subApex !== null
 
     const latestRun: Run = storage.run(runId)
     storage.suggestCandidateHost(latestRun, sub.origin, 'phase0_ct_discovery', sub.thirdParty, dnsSource)
@@ -1266,12 +1455,23 @@ export function applyDiscoveredSubdomainsToRun(
     if (!cand) continue
 
     if (shouldAutoAdmit) {
-      if (!withCand.approved.includes(cand.id)) {
-        storage.updateRun(runId, { approved: [...withCand.approved, cand.id] })
+      const admitRes = storage.runsRepo.admitDynamicOrigin({
+        runId,
+        origin: sub.origin,
+        source: 'phase0_ct_discovery',
+        thirdParty: sub.thirdParty,
+        dnsSource,
+        anchor: matchedAnchor,
+        reason: 'phase0_subdomain_auto_admit',
+      })
+      if (admitRes.admitted && admitRes.candidate) {
+        approvedOrigins.add(sub.origin)
+        admitted.push(admitRes.candidate)
+        admittedOrigins.push(sub.origin)
+      } else {
+        candidatesOnly.push(cand)
+        candidateOrigins.push(sub.origin)
       }
-      approvedOrigins.add(sub.origin)
-      admitted.push(cand)
-      admittedOrigins.push(sub.origin)
     } else {
       candidatesOnly.push(cand)
       candidateOrigins.push(sub.origin)

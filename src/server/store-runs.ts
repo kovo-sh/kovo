@@ -135,11 +135,75 @@ export class RunsRepository {
   private readonly projects: ProjectsRepository
   private readonly findings: FindingsRepository
   private runLabelColumnKnown = false
+  private runDeclinedOriginsColumnKnown = false
 
   constructor(session: DbSession, projects: ProjectsRepository, findings: FindingsRepository) {
     this.session = session
     this.projects = projects
     this.findings = findings
+  }
+
+  private hasDeclinedOriginsColumn(): boolean {
+    if (this.runDeclinedOriginsColumnKnown) return true
+    const cols = this.session.client.prepare('PRAGMA table_info(runs)').all() as Array<{ name: string }>
+    const present = cols.some(c => c.name === 'declined_origins')
+    if (present) this.runDeclinedOriginsColumnKnown = true
+    return present
+  }
+
+  private ensureDeclinedOriginsColumn(): void {
+    if (this.hasDeclinedOriginsColumn()) return
+    this.session.client.exec("ALTER TABLE runs ADD COLUMN declined_origins TEXT NOT NULL DEFAULT '[]';")
+    this.runDeclinedOriginsColumnKnown = true
+  }
+
+  private normalizeDeclinedOrigin(origin: string): string | null {
+    const normalized = normalizeScopeOrigin(origin)
+    if (normalized) return normalized
+    const trimmed = origin.trim().toLowerCase().replace(/\/+$/, '')
+    return trimmed || null
+  }
+
+  /** Origins explicitly declined/excluded by the operator in scope review (`R2-H-5`). */
+  getDeclinedOrigins(runId: string): string[] {
+    this.run(runId)
+    if (!this.hasDeclinedOriginsColumn()) return []
+    const row = this.session.client.prepare('SELECT declined_origins AS declinedOrigins FROM runs WHERE id = ?').get(runId) as
+      | { declinedOrigins?: string | null }
+      | undefined
+    if (!row?.declinedOrigins) return []
+    try {
+      const parsed = JSON.parse(row.declinedOrigins) as unknown
+      if (!Array.isArray(parsed)) return []
+      const out = new Set<string>()
+      for (const item of parsed) {
+        if (typeof item !== 'string') continue
+        const norm = this.normalizeDeclinedOrigin(item)
+        if (norm) out.add(norm)
+      }
+      return [...out]
+    } catch {
+      return []
+    }
+  }
+
+  isOriginDeclined(runId: string, origin: string): boolean {
+    const norm = this.normalizeDeclinedOrigin(origin)
+    if (!norm) return false
+    return this.getDeclinedOrigins(runId).includes(norm)
+  }
+
+  private writeDeclinedOrigins(runId: string, origins: Iterable<string>): string[] {
+    this.ensureDeclinedOriginsColumn()
+    const out = new Set<string>()
+    for (const origin of origins) {
+      const norm = this.normalizeDeclinedOrigin(origin)
+      if (norm) out.add(norm)
+    }
+    const sorted = [...out].sort()
+    this.session.client.prepare('UPDATE runs SET declined_origins = ? WHERE id = ? AND workspace_id = ?')
+      .run(JSON.stringify(sorted), runId, this.session.workspace.id)
+    return sorted
   }
 
   private hasRunLabelColumn(): boolean {
@@ -442,6 +506,13 @@ export class RunsRepository {
       authOrigins: role === 'auth' ? [...new Set([...without(run.authOrigins), normalized])] : without(run.authOrigins),
       assetOrigins: role === 'asset' ? [...new Set([...without(run.assetOrigins), normalized])] : without(run.assetOrigins),
     })
+    const declined = new Set(this.getDeclinedOrigins(run.id))
+    if (role === 'target') {
+      declined.delete(normalized)
+    } else {
+      declined.add(normalized)
+    }
+    this.writeDeclinedOrigins(run.id, declined)
     this.session.event(run.id, 'scope.origin_role', `Origin ${normalized} assigned the ${role} role.`, {
       origin: normalized, role,
     })
@@ -1941,6 +2012,79 @@ export class RunsRepository {
     return { added: true, id: asset.id, origin: asset.origin }
   }
 
+  /**
+   * Canonical server-side gate for every dynamic/automatic scope admission (Phase-0 subdomain
+   * auto-admit, local-lab runner boot, etc.). Enforces operator-declined persistence (`R2-H-5`),
+   * refuses third-party origins, bumps `scopeRevision`, and emits `asset.auto_admitted`.
+   */
+  admitDynamicOrigin(input: {
+    runId: string
+    origin: string
+    source: string
+    thirdParty?: boolean
+    dnsSource?: DnsSource | null
+    anchor?: string | null
+    reason?: string
+  }): {
+    admitted: boolean
+    reason: 'admitted' | 'already_approved' | 'declined_by_operator' | 'third_party' | 'run_ended' | 'invalid_origin'
+    candidate?: Candidate
+    scopeRevision: number
+  } {
+    return this.session.transaction(() => {
+      const run = this.run(input.runId)
+      if (['complete', 'stopped', 'failed'].includes(run.status)) {
+        return { admitted: false, reason: 'run_ended', scopeRevision: run.scopeRevision }
+      }
+      const normalizedOrigin = normalizeScopeOrigin(input.origin)
+      if (!normalizedOrigin) {
+        return { admitted: false, reason: 'invalid_origin', scopeRevision: run.scopeRevision }
+      }
+      const project = this.projects.project(run.projectId)
+      try {
+        assetOriginForEnvironment(project.environment).parse(normalizedOrigin)
+      } catch {
+        return { admitted: false, reason: 'invalid_origin', scopeRevision: run.scopeRevision }
+      }
+
+      this.suggestCandidateHost(run, normalizedOrigin, input.source, Boolean(input.thirdParty), input.dnsSource)
+      const withCand = this.run(run.id)
+      const cand = withCand.candidates.find(c => (normalizeScopeOrigin(c.origin) ?? c.origin) === normalizedOrigin)
+      if (!cand) {
+        return { admitted: false, reason: 'invalid_origin', scopeRevision: withCand.scopeRevision }
+      }
+      if (input.thirdParty || cand.thirdParty) {
+        return { admitted: false, reason: 'third_party', candidate: cand, scopeRevision: withCand.scopeRevision }
+      }
+      if (this.isOriginDeclined(withCand.id, normalizedOrigin)) {
+        return { admitted: false, reason: 'declined_by_operator', candidate: cand, scopeRevision: withCand.scopeRevision }
+      }
+      if (withCand.approved.includes(cand.id)) {
+        return { admitted: false, reason: 'already_approved', candidate: cand, scopeRevision: withCand.scopeRevision }
+      }
+
+      const nextScopeRevision = withCand.scopeRevision + 1
+      this.updateRun(withCand.id, {
+        approved: [...withCand.approved, cand.id],
+        scopeRevision: nextScopeRevision,
+      })
+      this.session.event(withCand.id, 'asset.auto_admitted', `Auto-admitted host ${cand.origin} at scope revision ${nextScopeRevision}.`, {
+        id: cand.id,
+        origin: cand.origin,
+        source: redact(input.source),
+        anchor: input.anchor ?? null,
+        reason: input.reason ?? 'dynamic_scope_admission',
+        scopeRevision: nextScopeRevision,
+      })
+      return {
+        admitted: true,
+        reason: 'admitted',
+        candidate: cand,
+        scopeRevision: nextScopeRevision,
+      }
+    }, { behavior: 'immediate' })
+  }
+
   makeWorker(
     run: Run,
     phase: WorkerPhase,
@@ -2318,6 +2462,21 @@ export class RunsRepository {
       ...(cmd.maxRpsPerOrigin !== undefined ? { maxRpsPerOrigin: cmd.maxRpsPerOrigin } : {}),
     })
 
+    // R2-H-5: Persist operator-declined/excluded origins so Phase-0 auto-admission can never
+    // override scope-review deselection; an explicit re-approval in a later setScope clears it.
+    const declinedSet = new Set(this.getDeclinedOrigins(run.id))
+    const approvedSet = new Set(approved)
+    for (const asset of updated.candidates) {
+      const norm = this.normalizeDeclinedOrigin(asset.origin)
+      if (!norm) continue
+      if (approvedSet.has(asset.id)) {
+        declinedSet.delete(norm)
+      } else {
+        declinedSet.add(norm)
+      }
+    }
+    const declinedOrigins = this.writeDeclinedOrigins(run.id, declinedSet)
+
     if (saveProject) {
       this.session.db.update(tables.projects).set({
         defaultScope: run.candidates.filter(asset => approved.includes(asset.id)).map(asset => asset.origin),
@@ -2341,6 +2500,7 @@ export class RunsRepository {
       approvedPersonaIds,
       approved: updated.candidates.filter(asset => approved.includes(asset.id)).map(asset => asset.origin),
       excluded: updated.candidates.filter(asset => !approved.includes(asset.id)).map(asset => asset.origin),
+      declinedOrigins,
       removed,
       added,
     })

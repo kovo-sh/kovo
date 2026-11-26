@@ -2,14 +2,15 @@ import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { once } from 'node:events'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { test } from 'node:test'
 import { promisify } from 'node:util'
+import ts from 'typescript'
 import { declarativeReplaySpecSchema, containsDestructivePayload } from '../src/replay-spec.ts'
 import type { DeclarativeReplaySpec } from '../src/replay-spec.ts'
 import {
@@ -354,7 +355,7 @@ test('isolates persona secrets at 0600, strips auth on cross-origin redirect, an
   const broker = new RequestBroker({
     resolve: async () => [publicAddr],
     transport: async (url, _addr, _sig, opts) => {
-      sentAuthByOrigin.push({ origin: url.origin, auth: opts?.headers?.Authorization })
+      sentAuthByOrigin.push({ origin: url.origin, auth: opts?.headers?.Authorization ?? opts?.headers?.authorization })
       if (url.origin === northstar && url.pathname === '/redirect-cross') {
         return { status: 302, headers: { location: docsOrigin + '/landing' } }
       }
@@ -448,7 +449,7 @@ test('isolates persona secrets at 0600, strips auth on cross-origin redirect, an
   const rotateBroker = new RequestBroker({
     resolve: async () => [publicAddr],
     transport: async (_url, _addr, _sig, opts) => {
-      echoedAuth = opts?.headers?.Authorization
+      echoedAuth = opts?.headers?.Authorization ?? opts?.headers?.authorization
       return {
         status: 200,
         headers: { 'content-type': 'application/json', 'x-echo-old': rawSecret, 'x-echo-new': rotatedSecret },
@@ -1457,4 +1458,180 @@ test('clones full repos without .git/credentials, extracts deep lockfiles, and m
   }, AbortSignal.timeout(15_000), { reposDir })
   assert.equal(oneShot.exitCode, 0)
   assert.match(oneShot.outputs['out.txt'], /apps\/admin\/api\/auth\.ts/)
+})
+
+// ============================================================================
+// 11. WS-20 CI AST Lints (Non-Literal RegExp & EgressGateway Confinement)
+// ============================================================================
+
+function walkServerTsFiles(dir: string): string[] {
+  const out: string[] = []
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const full = join(dir, entry.name)
+    if (entry.isDirectory()) {
+      out.push(...walkServerTsFiles(full))
+    } else if (entry.name.endsWith('.ts') || entry.name.endsWith('.tsx')) {
+      out.push(full)
+    }
+  }
+  return out.sort()
+}
+
+test('WS-20 AST lint: zero unallowlisted non-literal RegExp calls in src/server/', () => {
+  const repoRoot = resolve(import.meta.dirname, '..')
+  const serverDir = join(repoRoot, 'src', 'server')
+  const files = walkServerTsFiles(serverDir)
+
+  // Core regex/redaction/escaped-literal modules allowed to construct RegExp instances.
+  const coreAllowlist = new Set([
+    'src/server/safe-regex.ts',
+    'src/server/redact.ts',
+    'src/server/approval-pattern.ts',
+  ])
+
+  // Escaped-literal / static-.source / numeric-template builders + shrinking pending-WS caps.
+  // Any NEW file or count increase fails immediately so untrusted dynamic regexes cannot creep in.
+  const perFileMaxNonLiteralCounts: Record<string, number> = {
+    'src/server/broker.ts': 1,
+    'src/server/composite-receipt.ts': 3,
+    'src/server/deterministic-engine.ts': 2,
+    'src/server/floor-recipe-engine.ts': 3,
+    'src/server/lab-telemetry.ts': 1,
+    'src/server/oracle-invariants.ts': 4,
+    'src/server/patch-workflow.ts': 1,
+    'src/server/phase0-recon.ts': 1,
+    'src/server/probes/mass-assignment.ts': 1,
+    'src/server/proof-receipt.ts': 2,
+    'src/server/replay-verifier.ts': 1,
+    'src/server/semantic-audit.ts': 2,
+    'src/server/surface-engine.ts': 2,
+    'src/server/v8-oracle-hydrate.ts': 1,
+    'src/server/verify-rpc.ts': 9,
+  }
+
+  const hitsByFile = new Map<string, string[]>()
+  for (const full of files) {
+    const rel = full.slice(repoRoot.length + 1).replace(/\\/g, '/')
+    if (coreAllowlist.has(rel)) continue
+    const src = readFileSync(full, 'utf8')
+    const sf = ts.createSourceFile(full, src, ts.ScriptTarget.Latest, true)
+    const visit = (node: ts.Node) => {
+      if (
+        (ts.isNewExpression(node) || ts.isCallExpression(node)) &&
+        ts.isIdentifier(node.expression) &&
+        node.expression.text === 'RegExp'
+      ) {
+        const arg0 = node.arguments?.[0]
+        const isStaticLiteral = arg0 !== undefined && (ts.isStringLiteral(arg0) || ts.isNoSubstitutionTemplateLiteral(arg0))
+        if (!isStaticLiteral) {
+          const { line } = sf.getLineAndCharacterOfPosition(node.getStart(sf))
+          const list = hitsByFile.get(rel) ?? []
+          list.push(`${rel}:${line + 1}: ${node.getText(sf).replace(/\s+/g, ' ').slice(0, 100)}`)
+          hitsByFile.set(rel, list)
+        }
+      }
+      ts.forEachChild(node, visit)
+    }
+    visit(sf)
+  }
+
+  const violations: string[] = []
+  for (const [rel, hits] of hitsByFile) {
+    const cap = perFileMaxNonLiteralCounts[rel] ?? 0
+    if (hits.length > cap) {
+      violations.push(`${rel} has ${hits.length} non-literal RegExp calls (allowed <= ${cap}):\n  ${hits.join('\n  ')}`)
+    }
+  }
+  assert.deepEqual(
+    violations,
+    [],
+    `Unallowlisted non-literal RegExp call(s) detected in src/server/:\n${violations.join('\n')}`,
+  )
+})
+
+test('WS-20 AST lint: EgressGateway direct egress* and loopback-proxy usage stays confined to allowlisted modules', () => {
+  const repoRoot = resolve(import.meta.dirname, '..')
+  const serverDir = join(repoRoot, 'src', 'server')
+  const files = walkServerTsFiles(serverDir)
+
+  // Direct EgressGateway.egress* transport calls are strictly confined to broker/gateway/provider/auth
+  // (plus <= 1 transitional HTTP/2 site in verify-rpc.ts pending WS-10 migration).
+  const egressCallAllowlist: Record<string, number> = {
+    'src/server/egress-gateway.ts': Number.POSITIVE_INFINITY,
+    'src/server/broker.ts': Number.POSITIVE_INFINITY,
+    'src/server/provider.ts': Number.POSITIVE_INFINITY,
+    'src/server/persona-auth.ts': Number.POSITIVE_INFINITY,
+    'src/server/verify-rpc.ts': 1,
+  }
+
+  const loopbackProxyAllowlist = new Set([
+    'src/server/egress-gateway.ts',
+    'src/server/persona-auth.ts',
+    'src/server/browser-session-auth.ts',
+    'src/server/scoped-browser.ts',
+  ])
+
+  const egressHits = new Map<string, string[]>()
+  const violations: string[] = []
+
+  for (const full of files) {
+    const rel = full.slice(repoRoot.length + 1).replace(/\\/g, '/')
+    const src = readFileSync(full, 'utf8')
+    const sf = ts.createSourceFile(full, src, ts.ScriptTarget.Latest, true)
+
+    const recordMember = (memberName: string, node: ts.Node) => {
+      const { line } = sf.getLineAndCharacterOfPosition(node.getStart(sf))
+      if (memberName.startsWith('egress')) {
+        const list = egressHits.get(rel) ?? []
+        list.push(`${rel}:${line + 1}: EgressGateway.${memberName}`)
+        egressHits.set(rel, list)
+      } else if (memberName === 'createLoopbackProxy' && !loopbackProxyAllowlist.has(rel)) {
+        violations.push(`${rel}:${line + 1}: unallowlisted EgressGateway.createLoopbackProxy usage`)
+      }
+    }
+
+    const visit = (node: ts.Node) => {
+      if (
+        ts.isPropertyAccessExpression(node) &&
+        ts.isIdentifier(node.expression) &&
+        node.expression.text === 'EgressGateway'
+      ) {
+        recordMember(node.name.text, node)
+      } else if (
+        ts.isElementAccessExpression(node) &&
+        ts.isIdentifier(node.expression) &&
+        node.expression.text === 'EgressGateway' &&
+        ts.isStringLiteral(node.argumentExpression)
+      ) {
+        recordMember(node.argumentExpression.text, node)
+      } else if (
+        ts.isVariableDeclaration(node) &&
+        ts.isObjectBindingPattern(node.name) &&
+        node.initializer &&
+        ts.isIdentifier(node.initializer) &&
+        node.initializer.text === 'EgressGateway'
+      ) {
+        for (const el of node.name.elements) {
+          const propName = el.propertyName
+            ? (ts.isIdentifier(el.propertyName) ? el.propertyName.text : '')
+            : (ts.isIdentifier(el.name) ? el.name.text : '')
+          if (propName) recordMember(propName, el)
+        }
+      }
+      ts.forEachChild(node, visit)
+    }
+    visit(sf)
+  }
+
+  for (const [rel, hits] of egressHits) {
+    const cap = egressCallAllowlist[rel] ?? 0
+    if (hits.length > cap) {
+      violations.push(`${rel} has ${hits.length} direct EgressGateway.egress* call(s) (allowed <= ${cap}):\n  ${hits.join('\n  ')}`)
+    }
+  }
+  assert.deepEqual(
+    violations,
+    [],
+    `Unallowlisted EgressGateway direct egress* bypass detected:\n${violations.join('\n')}`,
+  )
 })

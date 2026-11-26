@@ -191,13 +191,15 @@ test('A9a: Supabase adapter auto-extracts URL + anon key from target JS bundle, 
   const refresh1 = 'supa_refresh_token_one_secret'
   const refresh2 = 'supa_refresh_token_two_secret'
 
-  // Verify credential host policy allows discovered *.supabase.co but rejects arbitrary attacker domains
-  assert.equal(isSupabaseCredentialHost(supabaseOrigin, [targetOrigin], undefined, supabaseOrigin), true)
+  // R2-H-3: Discovered *.supabase.co origins are NEVER self-authorizing; require explicit allowlist or operator loginUrl
+  assert.equal(isSupabaseCredentialHost(supabaseOrigin, [targetOrigin], undefined, supabaseOrigin), false)
+  assert.equal(isSupabaseCredentialHost(supabaseOrigin, [targetOrigin, supabaseOrigin]), true)
+  assert.equal(isSupabaseCredentialHost(supabaseOrigin, [targetOrigin], supabaseOrigin), true)
   assert.equal(isSupabaseCredentialHost('https://evil.example', [targetOrigin], undefined, 'https://evil.example'), false)
 
   // Verify service_role JWTs are never adopted as anon keys
   const serviceRoleJwt = makeFakeJwt({ iss: 'supabase', ref: 'projref1234', role: 'service_role' }, 'svc_sig')
-  const extractedBad = extractSupabaseConfigFromText(`const k = "${serviceRoleJwt}";`, [targetOrigin])
+  const extractedBad = extractSupabaseConfigFromText(`const k = "${serviceRoleJwt}";`, [targetOrigin, supabaseOrigin])
   assert.equal(extractedBad.supabaseAnonKey, null)
 
   const dir = mkdtempSync(join(tmpdir(), 'kovo-a9a-supabase-'))
@@ -212,12 +214,29 @@ test('A9a: Supabase adapter auto-extracts URL + anon key from target JS bundle, 
     environment: 'public',
   })
 
+  // Unapproved HTML/JS-discovered Supabase origin must be refused when absent from originAllowlist and loginUrl
+  const unapprovedPersona = createProjectPersona(storage, {
+    requestId: randomUUID(),
+    projectId,
+    handle: 'supa_unapproved',
+    roleLabel: 'Supabase Unapproved',
+    originAllowlist: [targetOrigin],
+    authKind: 'login',
+    loginConfig: {
+      adapter: 'auto',
+      email: 'alice@northstar.example',
+    },
+    secret: 'SupaStrongPass!9',
+    canaryMarkers: [],
+  })
+
+  // Operator-allowlisted Supabase origin permits JS-bundle anon key extraction and login/refresh
   const persona = createProjectPersona(storage, {
     requestId: randomUUID(),
     projectId,
     handle: 'supa_auto',
     roleLabel: 'Supabase Member',
-    originAllowlist: [targetOrigin],
+    originAllowlist: [targetOrigin, supabaseOrigin],
     authKind: 'login',
     loginConfig: {
       adapter: 'auto',
@@ -271,6 +290,16 @@ test('A9a: Supabase adapter auto-extracts URL + anon key from target JS bundle, 
     },
   })
   t.after(() => manager.stopAll())
+
+  await assert.rejects(
+    manager.authenticatePersona(storage, projectId, unapprovedPersona.id),
+    /login|Supabase|URL|form|JSON/i,
+  )
+  assert.equal(
+    seenRequests.some(r => r.url.startsWith(supabaseOrigin)),
+    false,
+    'R2-H-3: unapproved HTML/JS Supabase origin must never receive credentials',
+  )
 
   const authRes = await manager.authenticatePersona(storage, projectId, persona.id)
   assert.equal(authRes.adapterUsed, 'supabase')

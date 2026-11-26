@@ -355,6 +355,7 @@ jobs:
           docker buildx imagetools inspect "$first_tag"
 
       - name: Attest kovo-worker provenance
+        if: github.event.repository.private == false
         uses: actions/attest-build-provenance@v2
         with:
           subject-name: ${{ env.REGISTRY }}/${{ steps.prep.outputs.owner }}/kovo-worker
@@ -398,6 +399,7 @@ jobs:
           docker buildx imagetools inspect "$first_tag"
 
       - name: Attest kovo-hunter provenance
+        if: github.event.repository.private == false
         uses: actions/attest-build-provenance@v2
         with:
           subject-name: ${{ env.REGISTRY }}/${{ steps.prep.outputs.owner }}/kovo-hunter

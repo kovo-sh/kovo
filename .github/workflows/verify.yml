@@ -25,7 +25,10 @@ jobs:
       - run: npm run check
       - run: npm run worker:build
       - run: bash scripts/docker-smoke.sh
-      - run: npm run test:boundaries
+      - name: Run npm run test:boundaries
+        env:
+          KOVO_ALLOW_LOCAL_MODEL: "1"
+        run: npm run test:boundaries
       - name: Run live Chromium E2E journeys
         timeout-minutes: 12
         run: npm run build && KOVO_ALLOW_LOCAL_MODEL=1 node --test tests/e2e-ui-journeys.test.ts
