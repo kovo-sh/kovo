@@ -27,8 +27,9 @@ import { createServer } from 'node:http'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
-import type { BrokerExchangeResult, BrokerHttpRequest, Grant, RequestBroker } from './broker.ts'
-import { EgressDeniedError, EgressGateway } from './egress-gateway.ts'
+import { BrokerApprovalRequired, BrokerDenied } from './broker.ts'
+import type { BrokerExchangeResult, BrokerHttpRequest, Grant, RequestBroker, WireCredentialProvenance } from './broker.ts'
+import { EgressDeniedError } from './egress-gateway.ts'
 import { buildPersonaHeader, personaSecrets } from './persona-vault.ts'
 import type { ResolvedPersona } from './persona-vault.ts'
 import { redact, type NamedSecret } from './redact.ts'
@@ -42,7 +43,6 @@ import {
   validateCapabilitySealValue,
   type CapabilitySealSelectorKind,
 } from './egress-sanitizer.ts'
-import { globalKillSwitch, KillSwitchTrippedError, type GlobalKillSwitch } from './kill-switch.ts'
 import { defaultRequestAdmissionEngine, type RequestAdmissionEngine } from './request-admission.ts'
 import {
   DerivedCapabilityVault,
@@ -62,7 +62,7 @@ import type {
   HostJwtAlg,
   InjectCapabilityTarget,
 } from './derived-custody.ts'
-import { signHostRecord } from './composite-receipt.ts'
+import { signHostRecord, verifyHostRecordSignature } from './composite-receipt.ts'
 import type {
   CompositeReceiptVerification,
   CompositeVerifyOptions,
@@ -70,10 +70,11 @@ import type {
   HostBrowserTrace,
   HostCryptoAttestation,
   HostOobEvent,
+  HostSignableRecord,
   HostSignedTranscript,
   HostTranscriptEntry,
 } from './composite-receipt.ts'
-import { HostFactLog, deriveAmbientAuthFromHeaders } from './host-fact-log.ts'
+import { HostFactLog, deriveAmbientAuthFromHeaders, deriveCredentialPlacement } from './host-fact-log.ts'
 import { defaultTerminalOracleRegistry } from './terminal-oracle-registry.ts'
 import { isReadMethod, normalizeRole, parseRoleLabel } from './oracle-invariants.ts'
 import type { ImpactStep } from './oracle-invariants.ts'
@@ -270,6 +271,7 @@ interface HostExchangeProvenance {
   kernelRequestHeaders?: Record<string, string>
   kernelRequestBody?: string
   authCapabilityActor?: AuthCapabilityActor
+  wireCredentialProvenance?: WireCredentialProvenance
   carrierText?: string
 }
 
@@ -1069,6 +1071,7 @@ export class VerifyRpcServer {
     cryptoAttestations: HostCryptoAttestation[],
     cleanSession: boolean,
     authCapabilityActor: AuthCapabilityActor | null = null,
+    wireCredentialProvenance?: WireCredentialProvenance,
   ): void {
     this.rawBodies.set(exchangeId, result.body)
     this.rawResponseHeaders.set(exchangeId, { ...result.respHeaders })
@@ -1086,6 +1089,7 @@ export class VerifyRpcServer {
     prov.kernelRequestHeaders = kernelReqHeaders
     prov.kernelRequestBody = kernelReqBody
     if (authCapabilityActor) prov.authCapabilityActor = authCapabilityActor
+    if (wireCredentialProvenance) prov.wireCredentialProvenance = wireCredentialProvenance
     prov.carrierText = this.scrubKernel([kernelPath, ...Object.entries(kernelReqHeaders).map(([k, v]) => `${k}: ${v}`), kernelReqBody ?? ''].join('\n'))
     for (const attestation of attestations) {
       prov.consumedCapabilities.add(attestation.consumedCapabilityId)
@@ -1127,6 +1131,7 @@ export class VerifyRpcServer {
     consumedCapabilityId?: string | null
     consumedCapabilities?: string[]
     derivedFromCapabilityIds?: string[]
+    protocol?: 'h2'
   }) {
     // R2-H-4: Always redact the FULL raw body BEFORE slicing/truncating so secrets crossing a slice boundary never leak prefixes.
     const scrubbedFullBody = redact(this.scrub(result.body))
@@ -1146,6 +1151,7 @@ export class VerifyRpcServer {
       bodySha256: result.bodySha256,
       durationMs: result.durationMs,
       personaHandle: record.request?.personaHandle ?? null,
+      ...(extra?.protocol ? { protocol: extra.protocol } : {}),
       ...(extra?.consumedCapabilityId ? { consumedCapabilityId: extra.consumedCapabilityId } : {}),
       ...(extra?.consumedCapabilities?.length ? { consumedCapabilities: extra.consumedCapabilities } : {}),
       ...(extra?.derivedFromCapabilityIds?.length ? { derivedFromCapabilityIds: extra.derivedFromCapabilityIds } : {}),
@@ -1189,10 +1195,14 @@ export class VerifyRpcServer {
   private async handleHttp(args: Record<string, unknown>, nonce: string, proto: 'http' | 'http2'): Promise<unknown> {
     const prep = this.prepareCapRequest(args, nonce)
     const started = this.nextHostTimestampMs()
+    const signal = AbortSignal.timeout(this.options.callTimeoutMs ?? 30_000)
     try {
       const rawBox: { value: { body: string; headers: Record<string, string> } | null } = { value: null }
       const reqWithRaw: BrokerHttpRequest = { ...prep.applied.brokerRequest, onRawResponse: raw => { rawBox.value = raw } }
-      const result = await this.options.broker.executeHttp(reqWithRaw, prep.applied.grant, AbortSignal.timeout(this.options.callTimeoutMs ?? 30_000))
+      // C-1: Route both HTTP/1.1 and HTTP/2 strictly through RequestBroker (slot/audit/circuit-breaker/admission/H-14).
+      const result = proto === 'http2'
+        ? await this.options.broker.executeHttp2Exchange(reqWithRaw, prep.applied.grant, signal)
+        : await this.options.broker.executeHttp(reqWithRaw, prep.applied.grant, signal)
       this.recordSessionMutation(prep.sessionKey, prep.applied.brokerRequest.method, prep.entityIds, prep.isControlOrAblation, result.status)
       // H-9 / R2-C-9: TranscriptStore retains kernel truth (kernel-sanitized only, never capability-rewritten);
       // worker-facing RPC egress masks sealed capabilities & headers via EgressSanitizer.
@@ -1207,54 +1217,31 @@ export class VerifyRpcServer {
         },
       })
       const rawProv = rawBox.value ? { body: rawBox.value.body, respHeaders: rawBox.value.headers } : { body: result.body, respHeaders: result.respHeaders }
-      this.recordRequestProvenance(record.exchangeId, started, args, prep.applied.brokerRequest, prep.requestMeta, rawProv, prep.applied.attestations, prep.cryptoAttestations, prep.cleanSession, prep.applied.authCapabilityActor)
+      this.recordRequestProvenance(
+        record.exchangeId, started, args, prep.applied.brokerRequest, prep.requestMeta, rawProv,
+        prep.applied.attestations, prep.cryptoAttestations, prep.cleanSession, prep.applied.authCapabilityActor,
+        result.wireCredentialProvenance,
+      )
       return this.exchangeView(record, result, {
         consumedCapabilityId: prep.applied.attestation?.consumedCapabilityId ?? null,
         consumedCapabilities: prep.consumedIds,
         derivedFromCapabilityIds: prep.derivedFromCapabilityIds,
+        ...(proto === 'http2' ? { protocol: 'h2' as const } : {}),
       })
     } catch (error) {
-      const msg = this.scrub(error instanceof Error ? error.message : 'HTTP exchange failed.')
-      const record = this.transcript.record({ op: proto, startedAt: started, durationMs: Date.now() - started, request: prep.requestMeta, error: msg, errorCode: /scope|denied|approval|forbidden|outside|header/i.test(msg) ? 'denied' : 'failed' })
+      const msg = this.scrub(error instanceof Error ? error.message : (proto === 'http2' ? 'HTTP/2 exchange failed.' : 'HTTP exchange failed.'))
+      const isPolicyDeny = error instanceof BrokerDenied
+        || error instanceof BrokerApprovalRequired
+        || (error instanceof EgressDeniedError && error.code !== 'response_too_large')
+        || /scope|denied|approval|forbidden|outside|header|kill.?switch/i.test(msg)
+      const record = this.transcript.record({ op: proto, startedAt: started, durationMs: Date.now() - started, request: prep.requestMeta, error: msg, errorCode: isPolicyDeny ? 'denied' : 'failed' })
       throw new Error(`${record.exchangeId}: ${msg}`)
     }
   }
 
-  private async handleHttp2(args: Record<string, unknown>, nonce: string): Promise<unknown> {
-    const prep = this.prepareCapRequest(args, nonce)
-    const started = this.nextHostTimestampMs()
-    const signal = AbortSignal.timeout(this.options.callTimeoutMs ?? 30_000)
-    try {
-      const h2 = await this.executeHttp2(prep.applied.brokerRequest, signal, prep.applied.grant)
-      this.recordSessionMutation(prep.sessionKey, prep.applied.brokerRequest.method, prep.entityIds, prep.isControlOrAblation, h2.status)
-      const kernelBody = this.scrubKernel(h2.body)
-      const kernelHeaders = this.kernelSanitizer.sanitizeHttpHeaders(h2.rawHeaders, 'storage_log')
-      const record = this.transcript.record({
-        op: 'http2', startedAt: started, durationMs: h2.durationMs, request: prep.requestMeta, body: kernelBody,
-        ...(prep.applied.brokerRequest.body !== undefined ? { rawRequestBody: this.scrubKernel(prep.applied.brokerRequest.body) } : {}),
-        response: {
-          status: h2.status, headers: kernelHeaders, bodyBytes: Buffer.byteLength(h2.body),
-          bodySha256: createHash('sha256').update(kernelBody).digest('hex'), mediaType: kernelHeaders['content-type'] ?? 'application/octet-stream',
-        },
-      })
-      this.recordRequestProvenance(record.exchangeId, started, args, prep.applied.brokerRequest, prep.requestMeta, { body: h2.body, respHeaders: h2.rawHeaders }, prep.applied.attestations, prep.cryptoAttestations, prep.cleanSession, prep.applied.authCapabilityActor)
-      const egressBody = redact(this.scrub(h2.body))
-      const egressHeaders = this.egress.sanitizeHttpHeaders(h2.rawHeaders, 'worker_rpc')
-      return this.scrubRecord({
-        exchangeId: record.exchangeId, status: h2.status, headers: egressHeaders, body: egressBody.slice(0, 512 * 1024),
-        bodyBytes: Buffer.byteLength(h2.body), bodySha256: record.response?.bodySha256, durationMs: h2.durationMs,
-        mediaType: record.response?.mediaType, protocol: 'h2',
-        ...(prep.applied.attestation?.consumedCapabilityId ? { consumedCapabilityId: prep.applied.attestation.consumedCapabilityId } : {}),
-        ...(prep.consumedIds.length ? { consumedCapabilities: prep.consumedIds } : {}),
-        ...(prep.derivedFromCapabilityIds.length ? { derivedFromCapabilityIds: prep.derivedFromCapabilityIds } : {}),
-      })
-    } catch (error) {
-      const msg = this.scrub(error instanceof Error ? error.message : 'HTTP/2 exchange failed.')
-      const isPolicyDeny = (error instanceof EgressDeniedError && error.code !== 'response_too_large')
-        || /scope|denied|approval|forbidden|outside|header|kill.?switch/i.test(msg)
-      const record = this.transcript.record({ op: 'http2', startedAt: started, durationMs: Date.now() - started, request: prep.requestMeta, error: msg, errorCode: isPolicyDeny ? 'denied' : 'failed' })
-      throw new Error(`${record.exchangeId}: ${msg}`)
-    }
+  /** C-1: HTTP/2 RPC routes exclusively through RequestBroker.executeHttp2Exchange. */
+  private handleHttp2(args: Record<string, unknown>, nonce: string): Promise<unknown> {
+    return this.handleHttp(args, nonce, 'http2')
   }
 
   private resolvePersonaHeaders(grant: Grant, personaHandle: string, origin: string): Record<string, string> {
@@ -1263,55 +1250,6 @@ export class VerifyRpcServer {
     const injected = buildPersonaHeader(persona, origin)
     if (!injected) throw new Error(`Persona "${personaHandle}" does not have an active authenticated session.`)
     return injected
-  }
-
-  /** HTTP/2 stays on the same grant, canonical RequestAdmissionEngine, and EgressGateway.egressHttp2. */
-  private async executeHttp2(req: BrokerHttpRequest, signal: AbortSignal, grant: Grant = this.options.grant): Promise<{ status: number; headers: Record<string, string>; rawHeaders: Record<string, string>; body: string; durationMs: number }> {
-    const ks = (this.options.broker as unknown as { options?: { killSwitch?: GlobalKillSwitch } })?.options?.killSwitch ?? globalKillSwitch
-    const tenantId = grant.tenantId ?? null
-    ks.assertAllowed(tenantId)
-    const decision = this.admissionEngine.admit({ kind: 'http2', origin: req.origin, method: req.method, pathAndQuery: req.pathAndQuery, headers: req.headers, body: req.body, personaHandle: req.persona ?? req.personaHandle ?? null, scopeHook: req.scopeHook ?? null, stripPseudoHeaders: true, runId: req.runId, assignmentId: req.assignmentId }, grant)
-    if (!decision.allowed || !decision.parsedUrl) throw new Error(decision.reason)
-    const url = decision.parsedUrl
-    const localLab = Boolean(decision.localLab)
-    const headers: Record<string, string> = {}
-    for (const [key, value] of Object.entries(req.headers ?? {})) {
-      if (!key.trimStart().startsWith(':')) headers[key.toLowerCase()] = value
-    }
-    const personaHandle = req.persona ?? req.personaHandle
-    if (personaHandle) {
-      for (const [k, v] of Object.entries(this.resolvePersonaHeaders(grant, personaHandle, url.origin))) headers[k.toLowerCase()] = v
-    }
-    const ksBound = ks.bindSignal(signal, tenantId)
-    try {
-      ksBound.signal.throwIfAborted()
-      const response = await EgressGateway.egressHttp2(url, {
-        method: req.method,
-        headers,
-        body: req.body || undefined,
-        signal: ksBound.signal,
-      }, {
-        allowLocalLab: localLab,
-        allowedOrigins: [url.origin],
-        timeoutMs: this.options.callTimeoutMs ?? 30_000,
-        maxResponseBytes: 2 * 1024 * 1024,
-        rejectUnauthorized: true,
-      })
-      return {
-        status: response.status,
-        headers: this.egress.sanitizeHttpHeaders(response.headers, 'worker_rpc'),
-        rawHeaders: response.rawHeaders,
-        body: response.body,
-        durationMs: response.durationMs,
-      }
-    } catch (err) {
-      if (ksBound.signal.aborted && ksBound.signal.reason instanceof KillSwitchTrippedError) {
-        throw ksBound.signal.reason
-      }
-      throw err
-    } finally {
-      ksBound.release()
-    }
   }
 
   private async handleBrowser(args: Record<string, unknown>, nonce: string): Promise<unknown> {
@@ -1400,7 +1338,12 @@ export class VerifyRpcServer {
           response: { status: result.status, headers: this.kernelSanitizer.sanitizeHttpHeaders(result.respHeaders, 'storage_log'), bodyBytes: result.bodyBytes, bodySha256: result.bodySha256, mediaType: result.mediaType },
         })
         const capRaw = rawCaptures[index]
-        this.recordRequestProvenance(record.exchangeId, started, itemArgs, prep.applied.brokerRequest, prep.requestMeta, capRaw ? { body: capRaw.body, respHeaders: capRaw.headers } : { body: result.body, respHeaders: result.respHeaders }, prep.applied.attestations, prep.cryptoAttestations, prep.cleanSession, prep.applied.authCapabilityActor)
+        this.recordRequestProvenance(
+          record.exchangeId, started, itemArgs, prep.applied.brokerRequest, prep.requestMeta,
+          capRaw ? { body: capRaw.body, respHeaders: capRaw.headers } : { body: result.body, respHeaders: result.respHeaders },
+          prep.applied.attestations, prep.cryptoAttestations, prep.cleanSession, prep.applied.authCapabilityActor,
+          result.wireCredentialProvenance,
+        )
         return this.exchangeView(record, result, {
           consumedCapabilityId: prep.applied.attestation?.consumedCapabilityId ?? null,
           consumedCapabilities: prep.consumedIds,
@@ -1982,7 +1925,11 @@ export class VerifyRpcServer {
       })
       const mergedPollArgs = { ...pollReqArgs, ...(args.entityId !== undefined ? { entityId: args.entityId } : {}), ...(args.correlationId !== undefined ? { correlationId: args.correlationId } : {}), ...(args.correlationIds !== undefined ? { correlationIds: args.correlationIds } : {}) }
       const rawProv = last.rawResp ? { body: last.rawResp.body, respHeaders: last.rawResp.headers } : { body: last.result.body, respHeaders: last.result.respHeaders }
-      this.recordRequestProvenance(finalRecord.exchangeId, last.startedAt, mergedPollArgs, last.applied.brokerRequest, reqMeta, rawProv, last.applied.attestations, last.cryptoAtts, last.cleanSession, last.applied.authCapabilityActor)
+      this.recordRequestProvenance(
+        finalRecord.exchangeId, last.startedAt, mergedPollArgs, last.applied.brokerRequest, reqMeta, rawProv,
+        last.applied.attestations, last.cryptoAtts, last.cleanSession, last.applied.authCapabilityActor,
+        last.result.wireCredentialProvenance,
+      )
       finalExchangeView = this.exchangeView(finalRecord, last.result, {
         consumedCapabilityId: last.applied.attestation?.consumedCapabilityId ?? null,
         consumedCapabilities: last.applied.attestations.map(a => a.consumedCapabilityId),
@@ -2133,11 +2080,14 @@ export class VerifyRpcServer {
         ? Number(record.response.status)
         : (record.op === 'crypto' || record.op === 'capability' ? 200 : null)
 
+      const wireProv = prov?.wireCredentialProvenance
+      const wirePlacement = wireProv ? deriveCredentialPlacement(kernelReqHeaders, undefined, wireProv) : undefined
       const entry: HostTranscriptEntry = {
         exchangeId: record.exchangeId,
         durationMs: record.durationMs,
         ...(prov?.carrierText ? { carrierText: prov.carrierText } : {}),
         ...(prov?.evidenceRole ? { evidenceRole: prov.evidenceRole } : (record.op === 'crypto' || record.op === 'capability' ? { evidenceRole: `host_${record.op}_op` } : {})),
+        ...(wireProv ? { wireCredentialProvenance: wireProv } : {}),
         step: {
           id: record.exchangeId,
           arm,
@@ -2149,7 +2099,7 @@ export class VerifyRpcServer {
             handle,
             role,
             tenant,
-            auth: deriveAmbientAuthFromHeaders(kernelReqHeaders),
+            auth: deriveAmbientAuthFromHeaders(kernelReqHeaders, undefined, wirePlacement),
             sameSite: sameSiteFromRecord(record),
           },
           ...(parsedJson !== undefined ? { json: parsedJson } : {}),
@@ -2181,6 +2131,11 @@ export class VerifyRpcServer {
     }
 
     return { entries, oobEvents, browserTraces, asyncPollRecords }
+  }
+
+  /** Verify a host-signed transcript record against this session's private HMAC key without exposing the key. */
+  verifyHostSignature(record: HostSignableRecord): boolean {
+    return verifyHostRecordSignature(record, this.compositeSigningKey)
   }
 
   /** Build a read-only kernel-plane HostFactLog from this session's host-signed transcript. */
