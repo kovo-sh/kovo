@@ -309,7 +309,7 @@ export interface InjectionEvidence {
    * failing contradiction arm that differs only by the boolean predicate. A single malformed
    * request that turns 200 into 500 is not this shape.
    */
-  statusBoolean?: { benign: ImpactStep; tautology: ImpactStep; contradiction: ImpactStep }
+  statusBoolean?: { benign: ImpactStep; tautology: ImpactStep; contradiction: ImpactStep; param?: string | null }
 }
 
 export interface ImpactInput {
@@ -319,6 +319,8 @@ export interface ImpactInput {
   resourceTenant?: string | null
   expectControlDenied?: boolean
   oracleEvents?: readonly string[]
+  /** Optional host-declared business-invariant field names/paths for `stateDelta` & repeated-transition checks (`R3-C-2`). */
+  invariantFields?: readonly string[] | null
   catalogPrices?: readonly number[]
   targetOrigin?: string | null
   /**
@@ -746,13 +748,57 @@ function selectPrimaryReadProbe(probeReads: readonly ImpactStep[], controls: rea
 }
 
 export function isProtectedField(path: string): boolean {
-  const leaf = path.split('.').pop()?.toLowerCase() ?? ''
+  const leaf = path.replace(/\[\d+\]/g, '').split('.').pop()?.toLowerCase() ?? ''
   return PROTECTED_FIELD_RE.test(leaf)
 }
 
 export function isPriceField(path: string): boolean {
-  const leaf = path.split('.').pop()?.toLowerCase() ?? ''
+  const leaf = path.replace(/\[\d+\]/g, '').split('.').pop()?.toLowerCase() ?? ''
   return PRICE_FIELD_RE.test(leaf)
+}
+
+/**
+ * Volatile metadata leaves (`R3-C-2`): timestamps, optimistic-lock versions, etags, revisions,
+ * trace/request correlation IDs, and generic edit/access counters that churn on any idempotent
+ * write or readback. Excluded from `stateDelta` by default so idempotent CRUD writes cannot
+ * manufacture a state delta.
+ */
+const VOLATILE_METADATA_FIELD_RE = /^(?:(?:updated|modified|created|edited|touched|accessed|synced|refreshed|checked|seen|fetched|read|written|last_updated|last_modified|last_edited|last_accessed|last_seen|last_touched)_at|last_(?:modified|updated|edited|accessed|seen|synced|refreshed)(?:_time|_timestamp|_ms)?|(?:server_|client_|event_|record_|row_)?(?:timestamp|time_ms|epoch_ms|ts)|mtime|atime|ctime|(?:row_|lock_|optimistic_|entity_|record_|doc_|schema_|data_|object_)?(?:version|ver|rev|revision|generation)|e_?tag|__?v|__?rev|__?etag|__?ts|(?:request|req|trace|correlation|span|tx|transaction|audit|event|invocation|operation|call)_id|nonce|csrf_?token|xsrf_?token|seq(?:uence)?(?:_?(?:num|number|id|no))?|(?:update|edit|write|mutation|modify|access|view|hit|read|sync|monotonic)_(?:count|counter|num|number)|monotonic_?counter|checksum|digest)$/i
+
+/**
+ * Business-logic invariant leaves (`R3-C-2`): ledger/balance/refund/quota/redemption/inventory
+ * fields whose cumulative shift across identical mutations proves a real business-logic defect
+ * (distinct from ordinary CRUD content fields like `title`/`note` and volatile metadata).
+ */
+const BUSINESS_INVARIANT_FIELD_RE = /^(?:[a-z0-9]+_)*(?:cents|balance|credits?|debits?|refund(?:ed)?(?:_cents|_amount|_count)?|refunds?|discount(?:_cents|_amount)?|total(?:_cents|_amount)?|subtotal(?:_cents)?|paid(?:_cents|_amount)?|payout(?:_cents|_amount)?|withdraw(?:al|n)?(?:_cents|_amount)?|deposit(?:ed)?(?:_cents|_amount)?|bonus(?:_cents|_amount)?|reward(?:s|_points|_cents)?|points|wallet|funds|ledger|redeem(?:ed)?(?:_count|_coupons)?|redemptions?(?:_count)?|applied_coupons?|coupons?|vouchers?|uses(?:_remaining)?|remaining(?:_uses|_count|_balance|_credits|_quota|_stock|_quantity)?|used(?:_count)?|usage(?:_count)?|quota(?:_used|_remaining|_limit)?|limit|stock|inventory|quantity|qty|available(?:_qty|_stock|_count)?|reserved(?:_qty|_stock|_count)?|claimed(?:_count)?|claims?(?:_count)?|votes?(?:_count)?|grants?(?:_count)?|allocations?|consumed|spent|transfers?(?:_count)?)$/i
+
+/** Normalize a flattened JSON field path's leaf to lowercase snake_case for field classification. */
+function normalizeFieldLeaf(path: string): string {
+  const leaf = path.replace(/\[\d+\]/g, '').split('.').pop()?.trim() ?? ''
+  return leaf.replace(/([a-z0-9])([A-Z])/g, '$1_$2').replace(/-/g, '_').toLowerCase()
+}
+
+/** True when a flattened JSON path ends in a volatile metadata leaf (`R3-C-2`). */
+function isVolatileMetadataField(path: string): boolean {
+  const normalized = normalizeFieldLeaf(path)
+  if (!normalized) return false
+  if (VOLATILE_METADATA_FIELD_RE.test(normalized)) return true
+  const stripped = normalized.replace(/^_+/, '')
+  return stripped.length > 0 && stripped !== normalized && VOLATILE_METADATA_FIELD_RE.test(stripped)
+}
+
+/** True when a flattened JSON path names a protected or business-logic invariant leaf (never volatile). */
+function isBusinessInvariantField(
+  path: string,
+  hostInvariantFields?: ReadonlySet<string> | null,
+): boolean {
+  if (isVolatileMetadataField(path)) return false
+  const normalized = normalizeFieldLeaf(path)
+  if (hostInvariantFields && hostInvariantFields.size > 0) {
+    if (hostInvariantFields.has(path) || hostInvariantFields.has(normalized)) return true
+  }
+  if (isProtectedField(path)) return true
+  return BUSINESS_INVARIANT_FIELD_RE.test(normalized)
 }
 
 /** Flatten a JSON object into `path -> primitive string` pairs (bounded; no arrays of objects). */
@@ -781,19 +827,49 @@ export interface StateDelta {
   deleted: boolean
 }
 
-export function stateDelta(before: unknown, after: unknown, afterStatus?: number | null): StateDelta {
+export interface StateDeltaOptions {
+  /** Restrict deltas to fields in this set (exact path or normalized leaf) plus invariant fields if enabled. */
+  allowedFields?: ReadonlySet<string> | null
+  /** Include business-invariant/protected fields even when not listed in `allowedFields`. */
+  includeInvariantFields?: boolean
+  /** Host-declared invariant fields (exact paths or normalized leaves). */
+  hostInvariantFields?: ReadonlySet<string> | null
+  /** Exclude volatile metadata leaves (default: `true`). */
+  excludeVolatile?: boolean
+}
+
+export function stateDelta(
+  before: unknown,
+  after: unknown,
+  afterStatus?: number | null,
+  options?: StateDeltaOptions,
+): StateDelta {
   const beforeFields = before === undefined ? null : flattenJson(before)
   const afterFields = after === undefined ? null : flattenJson(after)
   const deleted = afterFields === null && (afterStatus === 404 || afterStatus === 204 || afterStatus === 410)
+  const excludeVolatile = options?.excludeVolatile !== false
+  const allowedFields = options?.allowedFields ?? null
+  const includeInvariantFields = options?.includeInvariantFields === true
+  const hostInvariantFields = options?.hostInvariantFields ?? null
+  const pathAllowed = (path: string): boolean => {
+    if (excludeVolatile && isVolatileMetadataField(path)) return false
+    if (!allowedFields) return true
+    const leaf = normalizeFieldLeaf(path)
+    if (allowedFields.has(path) || allowedFields.has(leaf)) return true
+    if (includeInvariantFields && isBusinessInvariantField(path, hostInvariantFields)) return true
+    return false
+  }
   const changed: string[] = []
   const added: string[] = []
   const removed: string[] = []
   if (beforeFields && afterFields) {
     for (const [path, value] of afterFields) {
+      if (!pathAllowed(path)) continue
       if (!beforeFields.has(path)) added.push(path)
       else if (beforeFields.get(path) !== value) changed.push(path)
     }
     for (const path of beforeFields.keys()) {
+      if (!pathAllowed(path)) continue
       if (!afterFields.has(path)) removed.push(path)
     }
   }
@@ -1857,17 +1933,93 @@ function pathAddressesResource(pathAndQuery: string | null | undefined, id: stri
   })
 }
 
+function normalizedReadTarget(step: Pick<ImpactStep, 'route' | 'pathAndQuery'>): string {
+  const raw = (step.pathAndQuery ?? step.route ?? '').trim()
+  if (!raw) return ''
+  try {
+    const url = new URL(raw, 'http://kovo.invalid')
+    const pathname = url.pathname.replace(/\/+$/, '') || '/'
+    const query = [...url.searchParams.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => `${k}=${v}`).join('&')
+    return query ? `${pathname}?${query}` : pathname
+  } catch {
+    return raw.replace(/\/+$/, '')
+  }
+}
+
+function sameReadTarget(a: Pick<ImpactStep, 'route' | 'pathAndQuery'>, b: Pick<ImpactStep, 'route' | 'pathAndQuery'>): boolean {
+  const left = normalizedReadTarget(a)
+  const right = normalizedReadTarget(b)
+  return left !== '' && left === right
+}
+
+function collectRequestWrittenFields(step: Pick<ImpactStep, 'requestJson' | 'requestBody'>): {
+  fields: Set<string>
+  valuesByPath: Map<string, string>
+  valuesByLeaf: Map<string, string>
+} {
+  const fields = new Set<string>()
+  const valuesByPath = new Map<string, string>()
+  const valuesByLeaf = new Map<string, string>()
+  if (step.requestJson !== undefined && step.requestJson !== null && typeof step.requestJson === 'object') {
+    for (const [path, val] of flattenJson(step.requestJson)) {
+      const leaf = normalizeFieldLeaf(path)
+      fields.add(path)
+      if (leaf) fields.add(leaf)
+      valuesByPath.set(path, val)
+      if (leaf) valuesByLeaf.set(leaf, val)
+    }
+  } else if (typeof step.requestBody === 'string' && step.requestBody.includes('=') && !step.requestBody.trim().startsWith('<')) {
+    try {
+      for (const [k, v] of new URLSearchParams(step.requestBody.trim())) {
+        const leaf = normalizeFieldLeaf(k)
+        fields.add(k)
+        if (leaf) fields.add(leaf)
+        valuesByPath.set(k, v)
+        if (leaf) valuesByLeaf.set(leaf, v)
+      }
+    } catch { /* ignore non-form body */ }
+  }
+  return { fields, valuesByPath, valuesByLeaf }
+}
+
+function parseFiniteNumber(value: string | undefined): number | null {
+  if (value === undefined) return null
+  const trimmed = value.trim()
+  if (!trimmed || !/^-?\d+(?:\.\d+)?$/.test(trimmed)) return null
+  const n = Number(trimmed)
+  return Number.isFinite(n) ? n : null
+}
+
+function arrayParentPath(path: string): string | null {
+  const idx = path.lastIndexOf('[')
+  if (idx < 0 || !/\[\d+\]/.test(path.slice(idx))) return null
+  return path.slice(0, idx)
+}
+
 /**
- * Verify a repeated terminal transition (`R2-C-7` / `C-6`):
+ * Verify a repeated terminal transition (`R3-C-2` / `R2-C-7` / `C-6`):
  *  1. Two ordered successful identical mutations targeting an existing concrete resource ID
  *     (never bare duplicate collection creates);
- *  2. An intermediate post-state readback strictly between the two mutations on a related route
- *     (and if a pre-first readback exists, it must differ from the intermediate readback);
- *  3. A post-second readback strictly after the second mutation proving a verified second state delta.
+ *  2. Deltas are computed strictly over request-written fields and business-invariant /
+ *     host-declared invariant fields, excluding all volatile metadata leaves (`updated_at`,
+ *     `version`, `etag`, `rev`, `timestamp`, `request_id`, etc.);
+ *  3. An intermediate 2xx post-state readback strictly between the two mutations on the same
+ *     read target as the post-second readback (and pre-first readback when present);
+ *  4. Stale-404 rule: a 404/410/204 post-second readback NEVER counts as a second delta unless a
+ *     successful 2xx read of the *same object* (object-scoped, non-array, matching target identity)
+ *     sits strictly between the two mutations and observed a real first invariant delta;
+ *  5. Genuine semantic double effect: cumulative numeric shift in the same direction across both
+ *     mutations, cumulative array/ledger growth, or a non-idempotent multi-step invariant shift
+ *     (never an idempotent overwrite or volatile metadata churn).
  */
-function findVerifiedRepeatedTransition(steps: readonly ImpactStep[]): {
+function findVerifiedRepeatedTransition(
+  steps: readonly ImpactStep[],
+  hostInvariantFields?: ReadonlySet<string> | null,
+  oracleDeclared = false,
+): {
   verified: boolean
   changedFields: string[]
+  invariantFields: string[]
 } {
   for (let i = 0; i < steps.length; i += 1) {
     const first = steps[i]!
@@ -1876,54 +2028,153 @@ function findVerifiedRepeatedTransition(steps: readonly ImpactStep[]): {
     const firstHasExistingResource = isObjectScopedRequest(first) || firstBodyIds.size > 0
     if (!firstHasExistingResource) continue
 
+    const written = collectRequestWrittenFields(first)
+    const deltaOpts: StateDeltaOptions = {
+      allowedFields: written.fields,
+      includeInvariantFields: true,
+      hostInvariantFields: hostInvariantFields ?? null,
+      excludeVolatile: true,
+    }
+    const matchesRequestLiteral = (path: string, value: string | undefined): boolean => {
+      if (value === undefined) return false
+      if (written.valuesByPath.get(path) === value) return true
+      const leaf = normalizeFieldLeaf(path)
+      return leaf !== '' && written.valuesByLeaf.get(leaf) === value
+    }
+
     for (let j = i + 1; j < steps.length; j += 1) {
       const second = steps[j]!
       if (first.arm !== 'probe' && second.arm !== 'probe') continue
       if (!isSuccess(second.status) || !sameMutatingRequest(first, second)) continue
 
-      // Optional pre-first readback to ensure the first call actually moved the object into post-state.
-      let beforeFirst: ImpactStep | null = null
-      for (let k = i - 1; k >= 0; k -= 1) {
-        const candidate = steps[k]!
-        if (stepReadsState(candidate) && isSuccess(candidate.status) &&
-            candidate.json !== undefined && candidate.json !== null && relatedRoute(candidate, first)) {
-          beforeFirst = candidate
-          break
-        }
-      }
-
-      // Intermediate post-state readback strictly between `first` and `second`.
-      let midRead: ImpactStep | null = null
+      // Evaluate every candidate intermediate 2xx readback strictly between `first` and `second`.
       for (let m = i + 1; m < j; m += 1) {
-        const candidate = steps[m]!
-        if (!stepReadsState(candidate) || !isSuccess(candidate.status) ||
-            candidate.json === undefined || candidate.json === null || !relatedRoute(candidate, first)) continue
-        const midIds = resourceIdsInJson(candidate.json)
+        const midRead = steps[m]!
+        if (!stepReadsState(midRead) || !isSuccess(midRead.status) ||
+            midRead.json === undefined || midRead.json === null || !relatedRoute(midRead, first)) continue
+        const midIds = resourceIdsInJson(midRead.json)
         if (firstBodyIds.size > 0 && midIds.size > 0 && ![...firstBodyIds].some(id => midIds.has(id))) continue
+
+        // Pre-first readback on the *same read target* as `midRead` (if present).
+        let beforeFirst: ImpactStep | null = null
+        for (let k = i - 1; k >= 0; k -= 1) {
+          const candidate = steps[k]!
+          if (stepReadsState(candidate) && isSuccess(candidate.status) &&
+              candidate.json !== undefined && candidate.json !== null &&
+              sameReadTarget(candidate, midRead)) {
+            beforeFirst = candidate
+            break
+          }
+        }
+
+        const beforeFlat = beforeFirst ? flattenJson(beforeFirst.json) : null
+        const midFlat = flattenJson(midRead.json)
+        let d1: StateDelta | null = null
         if (beforeFirst) {
-          const d1 = stateDelta(beforeFirst.json, candidate.json, candidate.status)
+          d1 = stateDelta(beforeFirst.json, midRead.json, midRead.status, deltaOpts)
           if (!d1.deleted && d1.changed.length + d1.added.length + d1.removed.length === 0) continue
         }
-        midRead = candidate
-        break
-      }
-      if (!midRead) continue
 
-      // Post-second readback strictly after `second` showing a verified second state delta.
-      for (let n = j + 1; n < steps.length; n += 1) {
-        const afterSecond = steps[n]!
-        if (!stepReadsState(afterSecond) || !relatedRoute(afterSecond, second)) continue
-        if (!isSuccess(afterSecond.status) && afterSecond.status !== 404 && afterSecond.status !== 410) continue
-        if (isSuccess(afterSecond.status) && (afterSecond.json === undefined || afterSecond.json === null)) continue
-        const d2 = stateDelta(midRead.json, afterSecond.json, afterSecond.status)
-        const changed2 = [...d2.changed, ...d2.added, ...d2.removed]
-        if (d2.deleted || changed2.length > 0) {
-          return { verified: true, changedFields: changed2 }
+        // Post-second readback strictly after `second` on the *same read target* as `midRead`.
+        for (let n = j + 1; n < steps.length; n += 1) {
+          const afterSecond = steps[n]!
+          if (!stepReadsState(afterSecond) || !relatedRoute(afterSecond, second)) continue
+          if (!isSuccess(afterSecond.status) && afterSecond.status !== 404 && afterSecond.status !== 410 && afterSecond.status !== 204) continue
+          if (!sameReadTarget(midRead, afterSecond)) continue
+          if (isSuccess(afterSecond.status) && afterSecond.status !== 204 &&
+              (afterSecond.json === undefined || afterSecond.json === null)) continue
+
+          const d2 = stateDelta(midRead.json, afterSecond.json, afterSecond.status, deltaOpts)
+
+          // Stale-404 rule: 404/410/204 readback NEVER counts as a second delta unless `midRead`
+          // was a successful 2xx read of the *same concrete object* (object-scoped, non-array)
+          // AND `beforeFirst -> midRead` already proved a real first invariant delta.
+          if (d2.deleted) {
+            const midIsSameObject = isObjectScopedRequest(midRead) && !Array.isArray(midRead.json)
+            const d1InvariantFields = d1
+              ? [...d1.changed, ...d1.added, ...d1.removed].filter(path => isBusinessInvariantField(path, hostInvariantFields))
+              : []
+            if (midIsSameObject && beforeFirst !== null && d1 !== null && (d1InvariantFields.length > 0 || oracleDeclared)) {
+              return {
+                verified: true,
+                changedFields: d1InvariantFields,
+                invariantFields: d1InvariantFields,
+              }
+            }
+            continue
+          }
+
+          if (afterSecond.json === undefined || afterSecond.json === null) continue
+          const afterFlat = flattenJson(afterSecond.json)
+          const semanticChanged: string[] = []
+          const semanticInvariants: string[] = []
+          const d1AddedParents = new Set<string>()
+          if (d1) {
+            for (const p of d1.added) {
+              const parent = arrayParentPath(p)
+              if (parent !== null) d1AddedParents.add(parent)
+            }
+          }
+
+          for (const path of d2.changed) {
+            const v1 = midFlat.get(path)
+            const v2 = afterFlat.get(path)
+            if (v1 === v2) continue
+            const isInv = isBusinessInvariantField(path, hostInvariantFields)
+            const n1 = parseFiniteNumber(v1)
+            const n2 = parseFiniteNumber(v2)
+            if (n1 !== null && n2 !== null && n2 !== n1) {
+              if (beforeFlat) {
+                const n0 = parseFiniteNumber(beforeFlat.get(path))
+                if (n0 !== null) {
+                  const delta1 = n1 - n0
+                  const delta2 = n2 - n1
+                  // Cumulative numeric shift in the same direction (e.g. double-refund, double-decrement).
+                  if ((delta1 > 0 && delta2 > 0) || (delta1 < 0 && delta2 < 0)) {
+                    semanticChanged.push(path)
+                    if (isInv) semanticInvariants.push(path)
+                    continue
+                  }
+                }
+              } else if (isInv && !matchesRequestLiteral(path, v2)) {
+                semanticChanged.push(path)
+                semanticInvariants.push(path)
+                continue
+              }
+            }
+            // Non-numeric multi-step invariant state shift (distinct from pre-state & not an idempotent overwrite).
+            if ((isInv || oracleDeclared) && !matchesRequestLiteral(path, v2)) {
+              const v0 = beforeFlat?.get(path)
+              if (beforeFlat ? (v0 !== undefined && v0 !== v1 && v0 !== v2) : isInv) {
+                semanticChanged.push(path)
+                if (isInv) semanticInvariants.push(path)
+              }
+            }
+          }
+
+          for (const path of d2.added) {
+            const parent = arrayParentPath(path)
+            if (parent === null) continue
+            const isInv = isBusinessInvariantField(path, hostInvariantFields) ||
+              isBusinessInvariantField(parent, hostInvariantFields)
+            if (isInv && (!beforeFlat || d1AddedParents.has(parent))) {
+              semanticChanged.push(path)
+              semanticInvariants.push(path)
+            }
+          }
+
+          if (semanticChanged.length > 0) {
+            return {
+              verified: true,
+              changedFields: [...new Set(semanticChanged)],
+              invariantFields: [...new Set(semanticInvariants)],
+            }
+          }
         }
       }
     }
   }
-  return { verified: false, changedFields: [] }
+  return { verified: false, changedFields: [], invariantFields: [] }
 }
 
 /**
@@ -1931,8 +2182,9 @@ function findVerifiedRepeatedTransition(steps: readonly ImpactStep[]): {
  * A self-service owner mutation of a field the caller is entitled to edit is in policy; impact
  * requires a host-recorded boundary (denied equal-or-higher peer or object-bound cross-tenant read)
  * backed by persisted attributable state change, a verified repeated terminal transition with
- * intermediate post-state readback and second state delta, a persisted *protected* field change,
- * or a declared invariant event. `resourceBound` proves attribution only, never impact (`R2-C-7`).
+ * intermediate post-state readback, semantic double effect, and boundary/invariant signal, a
+ * persisted *protected* field change, or a declared invariant event. `resourceBound` proves
+ * attribution only, never impact (`R2-C-7`, `R3-C-2`).
  */
 export function assessBusinessLogicImpact(input: ImpactInput): BusinessLogicAssessment {
   const steps = input.steps
@@ -1955,17 +2207,21 @@ export function assessBusinessLogicImpact(input: ImpactInput): BusinessLogicAsse
     }
   }
 
+  const hostInvariantFields = input.invariantFields && input.invariantFields.length > 0
+    ? new Set(input.invariantFields.flatMap(field => [field, normalizeFieldLeaf(field)]).filter(Boolean))
+    : null
+
   // Compute persistence and attribution up front so boundary paths never bypass state-delta proof.
   const reads = steps.filter(step => stepReadsState(step) && step.json !== undefined && step.json !== null)
   const beforeRead = [...reads].reverse().find(step => steps.indexOf(step) < steps.indexOf(mutatingProbe) && isSuccess(step.status)) ?? null
   const afterRead = reads.find(step => steps.indexOf(step) > steps.indexOf(mutatingProbe) &&
     (isSuccess(step.status) || step.status === 404 || step.status === 410)) ?? null
-  const delta = beforeRead && afterRead ? stateDelta(beforeRead.json, afterRead.json, afterRead.status) : null
+  const delta = beforeRead && afterRead ? stateDelta(beforeRead.json, afterRead.json, afterRead.status, { excludeVolatile: true }) : null
   labels.persisted = Boolean(delta && (delta.deleted || delta.changed.length + delta.added.length + delta.removed.length > 0))
   if (delta) {
     labels.changedFields = [...delta.changed, ...delta.added, ...delta.removed]
   }
-  labels.protectedFields = labels.changedFields.filter(isProtectedField)
+  labels.protectedFields = labels.changedFields.filter(path => isProtectedField(path) || (hostInvariantFields ? isBusinessInvariantField(path, hostInvariantFields) : false))
   labels.oracleDeclared = hasOracle(input.oracleEvents, ['invariant_violation', 'workflow_skip', 'race_double_spend', 'state_delta', 'privilege_escalation'])
 
   // A creator step can establish ownership of a fresh resource id for *attribution* only (binding
@@ -2050,20 +2306,23 @@ export function assessBusinessLogicImpact(input: ImpactInput): BusinessLogicAsse
     }
   }
 
-  // Verified repeated terminal transition: existing resource ID + intermediate post-state readback
-  // + verified second state delta.
-  const repeated = findVerifiedRepeatedTransition(steps)
-  labels.repeatedTransition = repeated.verified
+  // Verified repeated terminal transition (`R3-C-2`): existing resource ID + intermediate same-object
+  // post-state readback + semantic double effect + boundary or invariant signal (never short-circuit
+  // with `boundary: false`, `oracleDeclared: false`, and no protected/invariant fields).
+  const repeated = findVerifiedRepeatedTransition(steps, hostInvariantFields, labels.oracleDeclared)
+  const repeatedProtected = [...new Set([...labels.protectedFields, ...repeated.invariantFields])]
+  const repeatedHasSignal = labels.boundary || labels.oracleDeclared || repeatedProtected.length > 0
+  labels.repeatedTransition = repeated.verified && repeatedHasSignal
   if (labels.repeatedTransition) {
-    if (repeated.changedFields.length > 0 && labels.changedFields.length === 0) {
-      labels.changedFields = repeated.changedFields
-      labels.protectedFields = repeated.changedFields.filter(isProtectedField)
+    if (repeated.changedFields.length > 0) {
+      labels.changedFields = [...new Set([...labels.changedFields, ...repeated.changedFields])]
     }
+    labels.protectedFields = repeatedProtected
     labels.persisted = true
     return {
       required: true,
       satisfied: true,
-      reason: 'A terminal transition on an existing resource was accepted a second time after an intermediate post-state readback and produced a verified second state delta.',
+      reason: 'A terminal transition on an existing resource was accepted a second time after an intermediate post-state readback and produced a verified semantic double effect on an invariant/boundary.',
       evidence: labels,
     }
   }
@@ -2155,6 +2414,7 @@ export interface BooleanDifferentialAssessment extends ImpactAssessment {
     hasBaseline?: boolean
     baselineStable?: boolean
     trueMatchesBaseline?: boolean
+    baseBindingMismatch?: boolean
   }
 }
 
@@ -2373,45 +2633,220 @@ function rawTextBodyOf(arm: BooleanDifferentialArm): string | undefined {
   return undefined
 }
 
-function injectedParamValue(arm: BooleanDifferentialArm, param: string): string | null {
+function extractBooleanParamValue(arm: BooleanDifferentialArm, param: string): string | null {
   return paramValueFromQuery(arm.pathAndQuery, param) ??
     paramValueFromJson(arm.requestJson, param) ??
     paramValueFromTextBody(rawTextBodyOf(arm), param) ??
     paramValueFromHeader(arm.requestHeaders, param)
 }
 
+function injectedParamValue(arm: BooleanDifferentialArm, param: string): string | null {
+  return extractBooleanParamValue(arm, param)
+}
+
+export interface ParsedBooleanPredicate {
+  /** Byte-exact base value preceding the boolean predicate clause. */
+  baseValue: string
+  /** Recorded predicate clause stripped from the parameter value. */
+  predicateClause: string
+  /** Leading breakout quote delimiter (`''`, `"'"`, or `'"'`). */
+  quoteDelimiter: '' | "'" | '"'
+  /** Leading numeric operand when `baseValue === ''` (closes empty-base `1=1` vs `999=0` coercion). */
+  leadingOperand: string | null
+  /** Evaluated boolean truth of the predicate clause. */
+  truth: boolean
+}
+
+const MAX_PREDICATE_INPUT_LEN = 4096
+const TRAILING_NUMERIC_PRED_RE = /(\bNOT\s+)?(?:\(\s*)?(\d{1,12})\s*(==|=|!=|<>)\s*(\d{1,12})(?:\s*([+-])\s*(\d{1,12}))?\s*$/i
+const TRAILING_STRING_PRED_RE = /(\bNOT\s+)?(?:\(\s*)?(['"])([^'"]{0,64})\2\s*(==|=|!=|<>)\s*(['"])([^'"]{0,64})\5\s*$/i
+const TRAILING_UNCLOSED_STRING_PRED_RE = /(\bNOT\s+)?(?:\(\s*)?(['"])([^'"]{0,64})\2\s*(==|=|!=|<>)\s*\2([^'"]{0,64})$/i
+const TRAILING_LITERAL_PRED_RE = /(\bNOT\s+)?(?:\(\s*)?(TRUE|FALSE)\s*$/i
+const TRAILING_INLINE_COMMENT_RE = /\/\*[^*]{0,128}\*\/\s*$/
+
+function stripTrailingSeparators(text: string): { rest: string; stripped: boolean } {
+  let rest = text
+  let stripped = false
+  for (let i = 0; i < 4; i += 1) {
+    const trimmed = rest.replace(/[ \t\r\n]+$/, '')
+    if (trimmed.length !== rest.length) {
+      rest = trimmed
+      stripped = true
+    }
+    const commentMatch = TRAILING_INLINE_COMMENT_RE.exec(rest)
+    if (commentMatch) {
+      rest = rest.slice(0, commentMatch.index)
+      stripped = true
+      continue
+    }
+    break
+  }
+  return { rest, stripped }
+}
+
+function parseBooleanPredicateCore(text: string, allowCompoundCheck: boolean): ParsedBooleanPredicate | null {
+  if (!text || text.length > MAX_PREDICATE_INPUT_LEN) return null
+
+  // Strip trailing `;`, whitespace, and up to 3 closing parens at the end of the expression.
+  let expr = text.replace(/[ \t\r\n]+$/, '')
+  if (expr.endsWith(';')) expr = expr.slice(0, -1).replace(/[ \t\r\n]+$/, '')
+  for (let i = 0; i < 3 && expr.endsWith(')'); i += 1) {
+    expr = expr.slice(0, -1).replace(/[ \t\r\n]+$/, '')
+  }
+
+  let matchIndex = -1
+  let truth: boolean | null = null
+  let isLiteralOnly = false
+  let leadingOperand: string | null = null
+
+  const numMatch = TRAILING_NUMERIC_PRED_RE.exec(expr)
+  if (numMatch) {
+    matchIndex = numMatch.index
+    const negated = Boolean(numMatch[1])
+    const left = Number(numMatch[2])
+    let right = Number(numMatch[4])
+    if (numMatch[5] && numMatch[6]) right += numMatch[5] === '-' ? -Number(numMatch[6]) : Number(numMatch[6])
+    const equal = left === right
+    const rawTruth = numMatch[3] === '!=' || numMatch[3] === '<>' ? !equal : equal
+    truth = negated ? !rawTruth : rawTruth
+    leadingOperand = numMatch[2]!
+  } else {
+    const strMatch = TRAILING_STRING_PRED_RE.exec(expr)
+    if (strMatch) {
+      matchIndex = strMatch.index
+      const negated = Boolean(strMatch[1])
+      const equal = strMatch[3] === strMatch[6]
+      const rawTruth = strMatch[4] === '!=' || strMatch[4] === '<>' ? !equal : equal
+      truth = negated ? !rawTruth : rawTruth
+    } else {
+      const unclosedMatch = TRAILING_UNCLOSED_STRING_PRED_RE.exec(expr)
+      if (unclosedMatch) {
+        matchIndex = unclosedMatch.index
+        const negated = Boolean(unclosedMatch[1])
+        const equal = unclosedMatch[3] === unclosedMatch[5]
+        const rawTruth = unclosedMatch[4] === '!=' || unclosedMatch[4] === '<>' ? !equal : equal
+        truth = negated ? !rawTruth : rawTruth
+      } else {
+        const litMatch = TRAILING_LITERAL_PRED_RE.exec(expr)
+        if (litMatch) {
+          matchIndex = litMatch.index
+          const negated = Boolean(litMatch[1])
+          const rawTruth = litMatch[2]!.toLowerCase() === 'true'
+          truth = negated ? !rawTruth : rawTruth
+          isLiteralOnly = true
+        }
+      }
+    }
+  }
+
+  if (truth === null || matchIndex < 0) return null
+  const prefix = expr.slice(0, matchIndex)
+
+  // Standalone predicate (empty base): allowed only for explicit comparisons (never bare TRUE/FALSE).
+  if (prefix.trim() === '') {
+    if (isLiteralOnly || prefix.length > 0) return null
+    return {
+      baseValue: '',
+      predicateClause: text,
+      quoteDelimiter: '',
+      leadingOperand,
+      truth,
+    }
+  }
+
+  // Attached predicate: `prefix` must end with a boolean combinator (`AND`, `OR`, `&&`, `||`).
+  const afterComb = stripTrailingSeparators(prefix)
+  const combMatch = /(AND|OR|&&|\|\|)$/i.exec(afterComb.rest)
+  if (!combMatch) return null
+  const combText = combMatch[1]!.toUpperCase()
+  const isWordComb = combText === 'AND' || combText === 'OR'
+  if (isWordComb && !afterComb.stripped && !expr.slice(matchIndex).startsWith('(')) return null
+
+  const beforeCombRaw = afterComb.rest.slice(0, combMatch.index)
+  const beforeComb = stripTrailingSeparators(beforeCombRaw)
+  let base = beforeComb.rest
+  let hadParen = false
+  for (let i = 0; i < 2 && base.endsWith(')'); i += 1) {
+    base = base.slice(0, -1)
+    hadParen = true
+  }
+  let quoteDelimiter: '' | "'" | '"' = ''
+  if (base.endsWith("'") || base.endsWith('"')) {
+    quoteDelimiter = base.slice(-1) as "'" | '"'
+    base = base.slice(0, -1)
+  }
+
+  // A word combinator (`AND`/`OR`) with a non-empty base requires a separator, closing paren, or quote
+  // breakout so words like `band` or `order` are never misparsed as a boolean clause.
+  if (isWordComb && base.length > 0 && !beforeComb.stripped && !hadParen && quoteDelimiter === '') {
+    return null
+  }
+
+  // Reject compound/ambiguous multi-predicate clauses (e.g. `42 AND 1=1 AND 1=2`).
+  if (allowCompoundCheck && base.length > 0 && parseBooleanPredicateCore(base, false) !== null) {
+    return null
+  }
+
+  return {
+    baseValue: base,
+    predicateClause: text.slice(base.length),
+    quoteDelimiter,
+    leadingOperand: null,
+    truth,
+  }
+}
+
 /**
- * Evaluate explicit boolean predicate expressions only (`C-7`).
+ * Parse an explicit boolean predicate clause strictly from a single parameter value (`R3-C-4` / `C-7`).
+ * Extracts the byte-exact base value before the predicate suffix and rejects bare literals
+ * (`1`/`0`, `true`/`false`), compound ambiguous predicates, and trailing non-comment garbage.
+ */
+export function parseBooleanPredicate(raw: string | null): ParsedBooleanPredicate | null {
+  if (raw === null || raw.length === 0 || raw.length > MAX_PREDICATE_INPUT_LEN) return null
+
+  // 1. Try unstripped first so `--` or `#` inside a legitimate base value (e.g. `item--1`) stays intact.
+  const direct = parseBooleanPredicateCore(raw, true)
+  if (direct) return direct
+
+  // 2. Strip a trailing inline block comment (`/*...*/`).
+  const blockComment = TRAILING_INLINE_COMMENT_RE.exec(raw)
+  if (blockComment) {
+    const parsed = parseBooleanPredicateCore(raw.slice(0, blockComment.index), true)
+    if (parsed) {
+      return { ...parsed, predicateClause: raw.slice(parsed.baseValue.length) }
+    }
+  }
+
+  // 3. Strip trailing line comments (`--...` or `#...`), scanning rightmost markers first (bounded).
+  for (const marker of ['--', '#'] as const) {
+    let searchFrom = raw.length
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const idx = raw.lastIndexOf(marker, searchFrom - 1)
+      if (idx < 0) break
+      const candidate = raw.slice(0, idx)
+      const parsed = parseBooleanPredicateCore(candidate, true)
+      if (parsed) {
+        return { ...parsed, predicateClause: raw.slice(parsed.baseValue.length) }
+      }
+      searchFrom = idx
+    }
+  }
+  return null
+}
+
+/**
+ * Evaluate explicit boolean predicate expressions only (`C-7`, `R3-C-4`).
  * Bare literals (`1`/`0`, `true`/`false`) are deliberately rejected so ordinary filter flags and
  * integer IDs (`in_stock=1` vs `in_stock=0`, `id=1` vs `id=0`) can never confirm boolean SQLi.
  */
 export function booleanPredicateTruth(raw: string | null): boolean | null {
   if (raw === null) return null
-  let text = decodedText(raw)
-  text = text.replace(/--[^\r\n]*/g, ' ').replace(/\/\*[\s\S]*?\*\//g, ' ').trim()
-  if (!text) return null
-
-  const numeric = [...text.matchAll(/\b(\d+)\s*(==|=|!=|<>)\s*(\d+)(?:\s*([+-])\s*(\d+))?\b/gi)]
-  if (numeric.length === 1) {
-    const match = numeric[0]!
-    const left = Number(match[1])
-    let right = Number(match[3])
-    if (match[4] && match[5]) right += match[4] === '-' ? -Number(match[5]) : Number(match[5])
-    const equal = left === right
-    return match[2] === '!=' || match[2] === '<>' ? !equal : equal
-  }
-
-  const strings = [...text.matchAll(/(['"])([^'"]*)\1\s*(==|=|!=|<>)\s*(['"])([^'"]*)\4/g)]
-  if (strings.length === 1) {
-    const match = strings[0]!
-    const equal = match[2] === match[5]
-    return match[3] === '!=' || match[3] === '<>' ? !equal : equal
-  }
-
-  const literal = /\b(?:AND|OR)\s+(NOT\s+)?(TRUE|FALSE)\b/i.exec(text)
-  if (literal) {
-    const truth = literal[2]!.toLowerCase() === 'true'
-    return literal[1] ? !truth : truth
+  const direct = parseBooleanPredicate(raw)
+  if (direct) return direct.truth
+  const decoded = decodedText(raw)
+  if (decoded !== raw) {
+    const parsedDecoded = parseBooleanPredicate(decoded)
+    if (parsedDecoded) return parsedDecoded.truth
   }
   return null
 }
@@ -2430,16 +2865,18 @@ function maskJsonParam(value: unknown, param: string): unknown {
   return walk(value)
 }
 
-function maskedPath(pathAndQuery: string | undefined, param: string): string {
+function maskedPath(pathAndQuery: string | undefined, param: string, maskSegmentIndex?: number | null): string {
   if (!pathAndQuery) return ''
   try {
     const url = new URL(pathAndQuery, 'http://kovo.invalid')
     if (url.searchParams.has(param)) url.searchParams.set(param, '{{injected}}')
     let pathname = url.pathname
-    // A path-carried parameter shows up as a segment carrying SQL syntax (quote/comment/operator).
-    // Masking that segment is masking the injected value itself, not a different route.
-    if (!url.searchParams.has(param) && /(?:%27|'|%20AND%20|%20OR%20|--|%2F\*)/i.test(pathname)) {
-      pathname = pathname.replace(/\/[^/]+$/, '/{{injected}}')
+    if (maskSegmentIndex !== undefined && maskSegmentIndex !== null && maskSegmentIndex >= 0) {
+      const segments = pathname.split('/')
+      if (maskSegmentIndex < segments.length) {
+        segments[maskSegmentIndex] = '{{injected}}'
+        pathname = segments.join('/')
+      }
     }
     return `${pathname}?${[...url.searchParams.entries()].map(([k, v]) => `${k}=${v}`).sort().join('&')}`
   } catch {
@@ -2482,18 +2919,272 @@ function canonicalHeaders(headers: Record<string, string> | null | undefined, pa
   return out
 }
 
-function requestShape(arm: BooleanDifferentialArm, param: string): string {
+function requestShape(arm: BooleanDifferentialArm, param: string, maskSegmentIndex?: number | null): string {
   const rawBody = rawTextBodyOf(arm)
   return JSON.stringify({
     origin: (arm.origin ?? '').trim().toLowerCase(),
     persona: (arm.persona ?? '').trim().toLowerCase(),
     authDigest: computeAuthDigest(arm.requestHeaders, arm.authDigest, param),
     method: (arm.method ?? '').toUpperCase(),
-    path: maskedPath(arm.pathAndQuery, param),
+    path: maskedPath(arm.pathAndQuery, param, maskSegmentIndex),
     json: arm.requestJson === undefined || typeof arm.requestJson === 'string' ? null : maskJsonParam(arm.requestJson, param),
     body: rawBody === undefined ? null : maskTextBodyParam(rawBody, param),
     headers: canonicalHeaders(arm.requestHeaders, param),
   })
+}
+
+function collectArmParams(arm: BooleanDifferentialArm): Map<string, string> {
+  const out = new Map<string, string>()
+  if (arm.pathAndQuery) {
+    try {
+      const url = new URL(arm.pathAndQuery, 'http://kovo.invalid')
+      for (const [key, val] of url.searchParams.entries()) {
+        if (!out.has(key)) out.set(key, val)
+      }
+    } catch { /* ignore */ }
+  }
+  if (arm.requestJson !== undefined && arm.requestJson !== null && typeof arm.requestJson === 'object') {
+    for (const [path, val] of flattenJson(arm.requestJson)) {
+      const leaf = path.split('.').pop() ?? path
+      if (!out.has(leaf)) out.set(leaf, val)
+    }
+  }
+  const rawBody = rawTextBodyOf(arm)
+  if (rawBody && rawBody.trim()) {
+    const trimmed = rawBody.trim().slice(0, 64 * 1024)
+    if (!trimmed.startsWith('<') && trimmed.includes('=')) {
+      try {
+        for (const [key, val] of new URLSearchParams(trimmed)) {
+          if (!out.has(key)) out.set(key, val)
+        }
+      } catch { /* ignore */ }
+    }
+  }
+  for (const [key, val] of Object.entries(arm.requestHeaders ?? {})) {
+    const lower = key.toLowerCase()
+    if (booleanVolatileHeaders.has(lower)) continue
+    if (!out.has(lower)) out.set(lower, val)
+  }
+  return out
+}
+
+function extractDifferingPathSegment(
+  baseline: BooleanDifferentialArm,
+  armA: BooleanDifferentialArm,
+  armB: BooleanDifferentialArm,
+): { segmentIndex: number; baseVal: string; valA: string; valB: string } | null {
+  if (!baseline.pathAndQuery || !armA.pathAndQuery || !armB.pathAndQuery) return null
+  try {
+    const baseSegs = new URL(baseline.pathAndQuery, 'http://kovo.invalid').pathname.split('/')
+    const aSegs = new URL(armA.pathAndQuery, 'http://kovo.invalid').pathname.split('/')
+    const bSegs = new URL(armB.pathAndQuery, 'http://kovo.invalid').pathname.split('/')
+    if (baseSegs.length !== aSegs.length || baseSegs.length !== bSegs.length) return null
+    const diffIndices: number[] = []
+    for (let i = 0; i < baseSegs.length; i += 1) {
+      if (baseSegs[i] !== aSegs[i] || baseSegs[i] !== bSegs[i] || aSegs[i] !== bSegs[i]) {
+        diffIndices.push(i)
+      }
+    }
+    if (diffIndices.length !== 1) return null
+    const idx = diffIndices[0]!
+    return {
+      segmentIndex: idx,
+      baseVal: decodedText(baseSegs[idx]!),
+      valA: decodedText(aSegs[idx]!),
+      valB: decodedText(bSegs[idx]!),
+    }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Derive the unique differing structured parameter name across `(baseline, armA, armB)`.
+ * Returns `null` when zero or more than one parameter differs so predicate checks never fall back
+ * to raw concatenated request strings (`R3-C-4`).
+ */
+function deriveUniqueBooleanParam(
+  baseline: BooleanDifferentialArm,
+  armA: BooleanDifferentialArm,
+  armB: BooleanDifferentialArm,
+): string | null {
+  const bMap = collectArmParams(baseline)
+  const aMap = collectArmParams(armA)
+  const cMap = collectArmParams(armB)
+  const allKeys = new Set([...bMap.keys(), ...aMap.keys(), ...cMap.keys()])
+  const differing: string[] = []
+  for (const key of allKeys) {
+    const bv = bMap.get(key)
+    const av = aMap.get(key)
+    const cv = cMap.get(key)
+    if (bv !== av || bv !== cv || av !== cv) differing.push(key)
+  }
+  return differing.length === 1 ? differing[0]! : null
+}
+
+export interface BooleanTriangleBindingResult {
+  ok: boolean
+  param: string | null
+  baseValue: string | null
+  /** Which arm carried the `true` predicate (`'armA'` or `'armB'`). */
+  trueArm: 'armA' | 'armB' | null
+  /** Reason category for diagnostics (`shape`, `param`, `predicate`, `base_binding`, or `ok`). */
+  code: 'ok' | 'param' | 'shape' | 'predicate' | 'base_binding'
+  reason: string
+  /** Non-null when the bound injected parameter is a path segment rather than query/body/header. */
+  pathSegmentIndex: number | null
+}
+
+/**
+ * Shared kernel-side boolean triangle base-binding verifier (`R3-C-4`):
+ *  - parses boolean predicates strictly from the named injected parameter (or unique differing
+ *    structured parameter when `requireNamedParam` is false; never concatenated raw requests);
+ *  - enforces identical request shape across baseline/true/false arms (origin, persona, authDigest,
+ *    method, route, and all non-injected query/body/header values);
+ *  - requires the baseline arm to carry a benign non-predicate value;
+ *  - requires true and false arms to carry opposite explicit boolean predicates;
+ *  - strips the predicate clause from both arms and requires the stripped base values to be
+ *    byte-identical to each other AND byte-identical to the baseline arm's value (with matching
+ *    breakout quote delimiters, and matching leading numeric operands when base is empty).
+ */
+export function verifyBooleanTriangleBinding(input: {
+  baseline: BooleanDifferentialArm
+  armA: BooleanDifferentialArm
+  armB: BooleanDifferentialArm
+  param?: string | null
+  requireNamedParam?: boolean
+}): BooleanTriangleBindingResult {
+  const fail = (
+    code: BooleanTriangleBindingResult['code'],
+    reason: string,
+    param: string | null = null,
+    pathSegmentIndex: number | null = null,
+  ): BooleanTriangleBindingResult => ({
+    ok: false,
+    param,
+    baseValue: null,
+    trueArm: null,
+    code,
+    reason,
+    pathSegmentIndex,
+  })
+
+  const explicitParam = input.param?.trim() || ''
+  let param = explicitParam || (input.requireNamedParam ? '' : (deriveUniqueBooleanParam(input.baseline, input.armA, input.armB) ?? ''))
+
+  let baselineVal: string | null = param ? extractBooleanParamValue(input.baseline, param) : null
+  let valA: string | null = param ? extractBooleanParamValue(input.armA, param) : null
+  let valB: string | null = param ? extractBooleanParamValue(input.armB, param) : null
+  let pathSegmentIndex: number | null = null
+
+  // If the parameter is carried in a path segment (not present in query/body/header on any arm),
+  // bind strictly to the single differing path segment across all three arms.
+  if (baselineVal === null && valA === null && valB === null) {
+    const pathDiff = extractDifferingPathSegment(input.baseline, input.armA, input.armB)
+    if (pathDiff && (param !== '' || !input.requireNamedParam)) {
+      pathSegmentIndex = pathDiff.segmentIndex
+      baselineVal = pathDiff.baseVal
+      valA = pathDiff.valA
+      valB = pathDiff.valB
+      if (!param) param = `$path[${pathDiff.segmentIndex}]`
+    }
+  }
+
+  if (!param) {
+    return fail('param', 'A boolean differential must name a single injected parameter.')
+  }
+
+  const baseShape = requestShape(input.baseline, param, pathSegmentIndex)
+  if (baseShape !== requestShape(input.armA, param, pathSegmentIndex) ||
+      baseShape !== requestShape(input.armB, param, pathSegmentIndex)) {
+    return fail(
+      'shape',
+      'The baseline, true-variant, and false-variant arms differ beyond the injected parameter (origin, persona, auth, or request shape mismatch).',
+      param,
+      pathSegmentIndex,
+    )
+  }
+
+  if (baselineVal === null || valA === null || valB === null) {
+    return fail(
+      'base_binding',
+      `The named injected parameter "${param}" must be present in the baseline, true-variant, and false-variant arms.`,
+      param,
+      pathSegmentIndex,
+    )
+  }
+
+  if (parseBooleanPredicate(baselineVal) !== null) {
+    return fail(
+      'predicate',
+      'The baseline arm must carry a benign non-predicate value, not an injected boolean expression.',
+      param,
+      pathSegmentIndex,
+    )
+  }
+
+  const parsedA = parseBooleanPredicate(valA)
+  const parsedB = parseBooleanPredicate(valB)
+  if (!parsedA || !parsedB || parsedA.truth === parsedB.truth) {
+    return fail(
+      'predicate',
+      'The true and false variant arms must carry opposite, explicit boolean predicate expressions on the named parameter; bare literals (1/0, true/false) and arbitrary content differences are not a boolean oracle.',
+      param,
+      pathSegmentIndex,
+    )
+  }
+
+  const trueParsed = parsedA.truth ? parsedA : parsedB
+  const falseParsed = parsedA.truth ? parsedB : parsedA
+
+  if (trueParsed.baseValue !== falseParsed.baseValue) {
+    return fail(
+      'base_binding',
+      `The true and false arms do not share a byte-identical base value for "${param}" once the predicate clause is stripped (integer-coercion/base-value mismatch).`,
+      param,
+      pathSegmentIndex,
+    )
+  }
+
+  if (trueParsed.baseValue !== baselineVal) {
+    return fail(
+      'base_binding',
+      `The stripped base value for "${param}" in the true/false arms does not equal the baseline arm's value (base-value binding mismatch).`,
+      param,
+      pathSegmentIndex,
+    )
+  }
+
+  if (trueParsed.quoteDelimiter !== falseParsed.quoteDelimiter) {
+    return fail(
+      'base_binding',
+      `The true and false arms use mismatched quote breakout delimiters on "${param}".`,
+      param,
+      pathSegmentIndex,
+    )
+  }
+
+  if (trueParsed.baseValue === '' &&
+      trueParsed.leadingOperand !== null &&
+      falseParsed.leadingOperand !== null &&
+      trueParsed.leadingOperand !== falseParsed.leadingOperand) {
+    return fail(
+      'base_binding',
+      `Standalone numeric predicates on "${param}" must share the same leading numeric operand so integer-coercing endpoints cannot diverge.`,
+      param,
+      pathSegmentIndex,
+    )
+  }
+
+  return {
+    ok: true,
+    param,
+    baseValue: baselineVal,
+    trueArm: parsedA.truth ? 'armA' : 'armB',
+    code: 'ok',
+    reason: '',
+    pathSegmentIndex,
+  }
 }
 
 /**
@@ -2586,6 +3277,7 @@ export function assessBooleanDifferential(input: {
     hasBaseline: false,
     baselineStable: false,
     trueMatchesBaseline: false,
+    baseBindingMismatch: false,
   }
   const reject = (reason: string): BooleanDifferentialAssessment => ({
     required: true,
@@ -2603,37 +3295,30 @@ export function assessBooleanDifferential(input: {
     if (!baseline) {
       return reject('A boolean differential requires a full baseline / true-variant / false-variant triangle in every round; bare two-arm structural_diff alone cannot confirm.')
     }
-    const baselineVal = injectedParamValue(baseline, param)
-    if (baselineVal !== null && booleanPredicateTruth(baselineVal) !== null) {
-      return reject('The baseline arm must carry a benign non-predicate value, not an injected boolean expression.')
+    if ((baseline.status ?? 0) >= 500 || (round.control.status ?? 0) >= 500 || (round.probe.status ?? 0) >= 500) {
+      evidence.serverErrors = true
+      return reject('A boolean differential arm returned a server error (5xx); error behaviour is not proof.')
     }
-    const controlTruth = booleanPredicateTruth(injectedParamValue(round.control, param))
-    const probeTruth = booleanPredicateTruth(injectedParamValue(round.probe, param))
-    if (controlTruth === null || probeTruth === null || controlTruth === probeTruth) {
-      return reject('The true and false variant arms must carry opposite, explicit boolean predicate expressions; bare literals (1/0, true/false) and arbitrary content differences are not a boolean oracle.')
+    const binding = verifyBooleanTriangleBinding({
+      baseline,
+      armA: round.control,
+      armB: round.probe,
+      param,
+      requireNamedParam: true,
+    })
+    if (!binding.ok) {
+      if (binding.code === 'shape') evidence.requestShapeMismatch = true
+      if (binding.code === 'base_binding') evidence.baseBindingMismatch = true
+      return reject(binding.reason)
     }
     triangles.push({
       baseline,
-      trueArm: controlTruth ? round.control : round.probe,
-      falseArm: controlTruth ? round.probe : round.control,
+      trueArm: binding.trueArm === 'armA' ? round.control : round.probe,
+      falseArm: binding.trueArm === 'armA' ? round.probe : round.control,
     })
   }
   evidence.hasBaseline = true
   evidence.predicateContrast = true
-
-  for (const tri of triangles) {
-    if ((tri.baseline.status ?? 0) >= 500 || (tri.trueArm.status ?? 0) >= 500 || (tri.falseArm.status ?? 0) >= 500) {
-      evidence.serverErrors = true
-      return reject('A boolean differential arm returned a server error (5xx); error behaviour is not proof.')
-    }
-  }
-  for (const tri of triangles) {
-    const baseShape = requestShape(tri.baseline, param)
-    if (baseShape !== requestShape(tri.trueArm, param) || baseShape !== requestShape(tri.falseArm, param)) {
-      evidence.requestShapeMismatch = true
-      return reject('The baseline, true-variant, and false-variant arms differ beyond the injected parameter (origin, persona, auth, or request shape mismatch).')
-    }
-  }
 
   const baselineSignatures = triangles.map(tri => signatureMapKey(bodySignature(tri.baseline, param)))
   const trueSignatures = triangles.map(tri => signatureMapKey(bodySignature(tri.trueArm, param)))
@@ -3076,25 +3761,6 @@ function jsonStructureShape(value: unknown): unknown {
     .map(([key, child]) => [key, jsonStructureShape(child)]))
 }
 
-function requestEnvelopeShape(step: ImpactStep): string {
-  let pathname = step.pathAndQuery ?? step.route ?? ''
-  let queryKeys: string[] = []
-  try {
-    const url = new URL(step.pathAndQuery ?? step.route ?? '', 'http://kovo.invalid')
-    pathname = url.pathname
-    queryKeys = [...new Set([...url.searchParams.keys()])].sort()
-  } catch { /* retain the raw target shape */ }
-  return JSON.stringify({
-    method: step.method.toUpperCase(),
-    pathname,
-    queryKeys,
-    persona: (step.actor.handle ?? '').toLowerCase(),
-    authDigest: computeAuthDigest(step.requestHeaders),
-    json: step.requestJson === undefined ? null : jsonStructureShape(step.requestJson),
-    headerNames: Object.keys(step.requestHeaders ?? {}).map(name => name.toLowerCase()).sort(),
-  })
-}
-
 function formBodyKeys(rawBody: string | undefined): string[] | null {
   if (!rawBody || !rawBody.trim() || rawBody.trim().startsWith('<')) return null
   if (!rawBody.includes('=')) return null
@@ -3143,9 +3809,18 @@ function controlMatchesInjectionShape(control: ImpactStep, probe: ImpactStep): b
   return true
 }
 
-function booleanRequestTruth(step: ImpactStep): boolean | null {
-  const raw = `${step.pathAndQuery ?? ''}${safeJson(step.requestJson)}${step.requestBody ?? ''}`
-  return booleanPredicateTruth(decodedText(raw))
+function impactStepToBooleanArm(step: ImpactStep): BooleanDifferentialArm {
+  return {
+    status: step.status,
+    method: step.method,
+    persona: step.actor.handle ?? null,
+    pathAndQuery: step.pathAndQuery ?? step.route,
+    ...(step.requestJson !== undefined ? { requestJson: step.requestJson } : {}),
+    ...(step.requestBody !== undefined ? { requestBody: step.requestBody } : {}),
+    requestHeaders: step.requestHeaders ?? null,
+    ...(step.json !== undefined ? { json: step.json } : {}),
+    ...(step.body !== undefined ? { body: step.body } : {}),
+  }
 }
 
 /**
@@ -3237,21 +3912,23 @@ export function assessInjectionImpact(input: ImpactInput): ImpactAssessment {
     const tautologyOk = isSuccess(tautology.status)
     const contradictionFails = contradiction.status !== null &&
       contradiction.status >= 400 && contradiction.status < 500
-    const sameShape = sameInjectionRoute(benign, tautology) &&
-      sameInjectionRoute(benign, contradiction) &&
-      requestEnvelopeShape(benign) === requestEnvelopeShape(tautology) &&
-      requestEnvelopeShape(benign) === requestEnvelopeShape(contradiction)
-    // The third arm is a real confirmation only when it is the false predicate counterpart of the
-    // tautology, not merely another malformed value containing AND/OR.
-    const tautologyTruth = booleanRequestTruth(tautology)
-    const contradictionTruth = booleanRequestTruth(contradiction)
-    const contrast = tautologyTruth === true && contradictionTruth === false
-    if (benignOk && tautologyOk && contradictionFails && sameShape && contrast) {
+    const sameRoute = sameInjectionRoute(benign, tautology) && sameInjectionRoute(benign, contradiction)
+    // R3-C-4: Apply the exact same named-parameter, request-shape, and base-binding rules as
+    // `assessBooleanDifferential` (never parse boolean predicates from concatenated raw requests).
+    const binding = verifyBooleanTriangleBinding({
+      baseline: impactStepToBooleanArm(benign),
+      armA: impactStepToBooleanArm(tautology),
+      armB: impactStepToBooleanArm(contradiction),
+      param: statusBoolean.param ?? input.injection?.param ?? null,
+      requireNamedParam: false,
+    })
+    const contrast = binding.ok && binding.trueArm === 'armA'
+    if (benignOk && tautologyOk && contradictionFails && sameRoute && contrast) {
       evidence.statusBoolean = true
       return {
         required: true,
         satisfied: true,
-        reason: `Status-only boolean exception: the benign baseline (${benign.status}) and tautology arm (${tautology.status}) are 2xx while the contradiction arm fails (${contradiction.status}) on the same request shape; this is a paired predicate contrast, not a single malformed request.`,
+        reason: `Status-only boolean exception: the benign baseline (${benign.status}) and tautology arm (${tautology.status}) are 2xx while the contradiction arm fails (${contradiction.status}) on the same request shape and base value for "${binding.param}"; this is a paired predicate contrast, not a single malformed request.`,
         evidence,
       }
     }
