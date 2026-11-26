@@ -7,6 +7,7 @@ import { z } from 'zod'
 import { scopedAssetOrigin } from '../domain.ts'
 import { parseRoleLabel, routeFamily, stepReadsState } from './oracle-invariants.ts'
 import { augmentCompositeReceiptWithAutoDag, matchesNormalizedCtrlPath } from './composite-autodag.ts'
+import { resolveCompositeTerminalExchange } from './composite-terminal.ts'
 import { HostFactLog } from './host-fact-log.ts'
 import { proofReceiptSchema, receiptIdSchema, verifyReceipt } from './proof-receipt.ts'
 import { evaluateV8OracleFamily, extractTenantMarkers, isJobOrHandleStub, type HostSignedRecord as V8OracleRecord, type V8OracleFamily, type V8OracleInputMap } from './v8-oracle-families.ts'
@@ -234,12 +235,7 @@ function indexAndVerifyCitations(receipt: CompositeProofReceipt, transcript: Hos
 }
 
 export function deriveSignedTerminalOrigin(receipt: CompositeProofReceipt, entries: readonly Pick<HostTranscriptEntry, 'exchangeId' | 'origin' | 'step'>[] | ReadonlyMap<string, Pick<HostTranscriptEntry, 'exchangeId' | 'origin' | 'step'>>): string | null {
-  const byId: ReadonlyMap<string, Pick<HostTranscriptEntry, 'exchangeId' | 'origin' | 'step'>> = 'get' in entries ? entries : new Map(entries.map(e => [e.exchangeId, e]))
-  const termHop = receipt.hops.find(h => h.hopId === receipt.terminalImpact.terminalHopId) ?? receipt.hops[receipt.hops.length - 1]
-  if (!termHop) return null
-  const cited = termHop.exchangeIds.map(id => byId.get(id)).filter((e): e is Pick<HostTranscriptEntry, 'exchangeId' | 'origin' | 'step'> => Boolean(e))
-  const pick = (receipt.terminalImpact.terminalExchangeId ? byId.get(receipt.terminalImpact.terminalExchangeId) : undefined) ?? [...cited].reverse().find(e => e.step.arm === 'probe' && is2xx(e.step.status)) ?? [...cited].reverse().find(e => e.step.arm === 'probe') ?? cited.find(e => Boolean(e.origin?.trim()))
-  return pick?.origin?.trim() || null
+  return resolveCompositeTerminalExchange(receipt, entries)?.origin?.trim() || null
 }
 export function verifyHopTargetsAgainstExchanges(receipt: CompositeProofReceipt, entriesById: ReadonlyMap<string, HostTranscriptEntry>, tracesById?: ReadonlyMap<string, HostBrowserTrace>, oobById?: ReadonlyMap<string, HostOobEvent>): { ok: true } | { ok: false; reason: string } {
   const matchesEntry = (h: HopReceipt, e: HostTranscriptEntry): string | null => {

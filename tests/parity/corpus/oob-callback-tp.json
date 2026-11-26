@@ -1,0 +1,81 @@
+{
+  "id": "oob-callback-tp",
+  "side": "tp",
+  "archetype": "oob-durable-callback",
+  "description": "Unique request-side canary carrier exchange followed chronologically by a host-signed out-of-band callback delivery.",
+  "canonicalLabel": {
+    "cwe": "CWE-611",
+    "category": "xxe",
+    "title": "Out-of-band callback triggered via external reference parameter",
+    "impact": "Target server fetched the unique host-minted OOB canary URL after request submission.",
+    "claimedImpact": "other",
+    "claimedBoundary": "other",
+    "vulnClass": "oob"
+  },
+  "freeTextLabel": {
+    "title": "Out-of-band external entity callback triggered by document import"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": false,
+    "evaluateClaims": true,
+    "composite": false,
+    "floorInjectionRecipe": false,
+    "proofReceipt": true
+  },
+  "expected": {
+    "confirmed": true
+  },
+  "personas": [],
+  "exchanges": [
+    {
+      "id": "oob_mint",
+      "arm": "setup",
+      "role": "setup",
+      "op": "oob",
+      "oobToken": "kovo-canary-a1b2c3d4e5f6a1b2c3d4e5f6",
+      "oobHit": true,
+      "method": "POST",
+      "pathAndQuery": "/oob/mint",
+      "persona": null,
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"token\":\"kovo-canary-a1b2c3d4e5f6a1b2c3d4e5f6\"}"
+    },
+    {
+      "id": "oob_carry",
+      "arm": "probe",
+      "role": "probe",
+      "method": "POST",
+      "pathAndQuery": "/api/import/reference",
+      "persona": null,
+      "requestJson": { "referenceUrl": "https://canary.kovo.invalid/kovo-canary-a1b2c3d4e5f6a1b2c3d4e5f6" },
+      "status": 202,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"queued\":true}"
+    }
+  ],
+  "proofReceipt": {
+    "vulnClass": "oob",
+    "targetMethod": "POST",
+    "targetPathAndQuery": "/api/import/reference",
+    "claimedDelta": "Host-signed OOB relay recorded callback delivery for canary token carried uniquely in POST /api/import/reference.",
+    "oobEvents": [
+      {
+        "id": "oob-evt-parity-1",
+        "canaryId": "can-parity-1",
+        "token": "kovo-canary-a1b2c3d4e5f6a1b2c3d4e5f6",
+        "delivered": true,
+        "stage": "immediate",
+        "latencyMs": 35,
+        "receivedAtOffsetMs": 600,
+        "injectedAtOffsetMs": 150
+      }
+    ]
+  },
+  "claims": [
+    { "kind": "oob", "exchangeId": "oob_mint", "expectHit": true }
+  ]
+}

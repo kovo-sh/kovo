@@ -21,7 +21,16 @@ import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import type { DeclarativeReplaySpec } from '../src/replay-spec.ts'
 import { RequestBroker, type BrokerExchangeResult, type Grant } from '../src/server/broker.ts'
-import { signHostRecord, verifyCompositeReceipt, type CompositeProofReceipt, type HostSignedTranscript, type HostTranscriptEntry } from '../src/server/composite-receipt.ts'
+import {
+  deriveSignedTerminalOrigin,
+  signHostRecord,
+  verifyCompositeReceipt,
+  type CompositeProofReceipt,
+  type HostSignedTranscript,
+  type HostTranscriptEntry,
+} from '../src/server/composite-receipt.ts'
+import { resolveCompositeTerminalExchange } from '../src/server/composite-terminal.ts'
+import { inspectCompositeHostOrigin, type HostRecordedExchangeView } from '../src/server/exec-verify.ts'
 import {
   RECEIPT_EXEMPT_HOST_SPEC_KINDS,
   classifyRetestHealth,
@@ -32,9 +41,24 @@ import {
 import { cut3FloorRecipe, runCut3Recipe, type FloorRecipeExecution } from '../src/server/floor-recipes.ts'
 import { HostFactLog } from '../src/server/host-fact-log.ts'
 import { classifyBoundaryClaim, classifyImpactDescriptor, type BoundaryClass, type ImpactClass, type ImpactStep, type InjectionFamily, type RoleName } from '../src/server/oracle-invariants.ts'
-import { isPureJobOrHandleStubChain, proofReceiptMode } from '../src/server/proof-receipt.ts'
+import {
+  HostMintedOracle,
+  buildProofReceipt,
+  isPureJobOrHandleStubChain,
+  proofReceiptMode,
+  receiptRuleFor,
+  signOobCallback,
+  verifyReceipt,
+  type ReceiptBrowserTrace,
+  type ReceiptOobEvent,
+  type ReceiptTranscript,
+  type ReceiptTranscriptEntry,
+  type ReceiptVerification,
+} from '../src/server/proof-receipt.ts'
 import { retestPersistedAgentScript, retestReplaySpec, verifyReplaySpec } from '../src/server/replay-verifier.ts'
 import { assessDeclarativeRetestHealth, assessRetestHealth, type RetestFailureReason, type RetestHealthAssessment } from '../src/server/retest-health.ts'
+import { defaultTerminalOracleRegistry } from '../src/server/terminal-oracle-registry.ts'
+import type { V8OracleFamily } from '../src/server/v8-oracle-families.ts'
 import { TranscriptStore, evaluateClaims, type VerifyClaim } from '../src/server/verify-claims.ts'
 import { VERIFY_NONCE_HEADER, VERIFY_RPC_CONTEXT_NAME, VERIFY_RPC_HEADER, VERIFY_RPC_SOCKET_NAME, VERIFY_RPC_TOKEN_NAME } from '../src/server/verify-rpc.ts'
 import type { VerifyScriptRequest, VerifyScriptResult, WorkerBackend, WorkerSession, WorkerSessionOptions } from '../src/server/worker-backend.ts'
@@ -61,6 +85,18 @@ interface ParityExchange {
   id: string
   arm: 'control' | 'probe' | 'setup' | 'cleanup'
   role: 'control' | 'probe' | 'setup' | 'cleanup'
+  op?: 'http' | 'http2' | 'race' | 'oob' | 'browser'
+  evidenceRole?: string
+  raceBatchId?: string
+  durationMs?: number
+  startedAtOffsetMs?: number
+  endedAtOffsetMs?: number
+  actorRoleLabel?: string
+  emittedCapabilities?: string[]
+  consumedCapabilities?: string[]
+  originOverride?: string
+  oobToken?: string
+  oobHit?: boolean
   method: string
   pathAndQuery: string
   persona: string | null
@@ -97,6 +133,7 @@ interface ParityCase {
     evaluateClaims: boolean
     composite: boolean
     floorInjectionRecipe: boolean
+    proofReceipt?: boolean
     retest?: boolean
   }
   expected: { confirmed: boolean }
@@ -120,19 +157,247 @@ interface ParityCase {
     payload: string
     family?: InjectionFamily
   }
+  proofReceipt?: {
+    vulnClass?: string
+    param?: string
+    claimedDelta: string
+    targetMethod?: string
+    targetPathAndQuery?: string
+    oobEvents?: Array<{
+      id: string
+      canaryId: string
+      token: string
+      delivered: boolean
+      stage?: 'immediate' | 'late'
+      latencyMs?: number
+      receivedAtOffsetMs: number
+      injectedAtOffsetMs?: number
+    }>
+    browserTraces?: Array<{
+      id: string
+      sinks: string[]
+    }>
+    timingChallenge?: {
+      family: 'timing' | 'sqli' | 'nosqli' | 'cmdi'
+      delayMs: number
+    }
+    mintRedirectCanary?: boolean
+    conservedBalance?: {
+      balanceField?: string
+      capField?: string
+      unitDebit?: number
+    }
+  }
   claims?: VerifyClaim[]
   bareClaims?: VerifyClaim[]
   composite?: {
     chainId: string
     terminalVulnClass: string
     oracleFamily: string
-    capabilityToken: string
+    capabilityToken?: string
     claimedDelta: string
+    singleHop?: boolean
+    omitTerminalExchangeId?: boolean
+    attackerPersonas?: string[]
+    forbiddenShortcutPersonas?: string[]
+    expectedFailedStage?: string
+    hop1TargetOverride?: { origin?: string; method?: string; pathAndQuery?: string }
+    hop2TargetOverride?: { origin?: string; method?: string; pathAndQuery?: string }
+    preChainControlIds?: string[]
+    terminalExchangeId?: string
+    v8OracleInput?: {
+      family: V8OracleFamily
+      rawInput: Record<string, unknown>
+    }
   }
 }
 
-type PermutationKind = 'canonical' | 'other' | 'cwe_20' | 'cwe_only' | 'free_text'
-const PERMUTATIONS: readonly PermutationKind[] = ['canonical', 'other', 'cwe_20', 'cwe_only', 'free_text']
+export type PermutationKind = 'canonical' | 'cwe_only' | 'free_text' | 'adversarial_title' | 'cwe_20' | 'other'
+export const PERMUTATIONS: readonly PermutationKind[] = [
+  'canonical',
+  'cwe_only',
+  'free_text',
+  'adversarial_title',
+  'cwe_20',
+  'other',
+]
+
+export type ParityEntryPoint =
+  | 'verifyReplaySpec'
+  | 'floor-recipe-engine'
+  | 'evaluateClaims'
+  | 'verifyCompositeReceipt'
+
+export interface OtherLabelLayeringException {
+  readonly entryPoint: ParityEntryPoint
+  readonly permutation: 'other' | 'cwe_20' | 'free_text'
+  readonly impactFilter?: 'all' | 'injection' | 'non_injection'
+  readonly tpExpectedConfirmed: boolean
+  readonly fpExpectedConfirmed: false
+  readonly invariant: string
+  readonly rationale: string
+}
+
+/**
+ * R2-11 explicit typed layering table documenting why strict declarative/floor receipt paths
+ * fail closed on unmodelled labels (`other`, `cwe_20`, and schema-required `CWE-0` in
+ * `verifyReplaySpec` under `free_text`), while structured-claim (`evaluateClaims`) and
+ * self-bound composite (`verifyCompositeReceipt`) entry points confirm genuine TPs.
+ *
+ * Every `(entryPoint, side, permutation)` cell asserts a deterministic verdict through this table.
+ */
+export const OTHER_LABEL_EXCEPTION_TABLE: ReadonlyArray<OtherLabelLayeringException> = [
+  {
+    entryPoint: 'verifyReplaySpec',
+    permutation: 'other',
+    tpExpectedConfirmed: false,
+    fpExpectedConfirmed: false,
+    invariant: 'R2-H-14',
+    rationale: 'DeclarativeReplaySpec requires a modelled CWE; generic "other"/CWE-0 fails closed in strict ProofReceipt mode.',
+  },
+  {
+    entryPoint: 'verifyReplaySpec',
+    permutation: 'cwe_20',
+    tpExpectedConfirmed: false,
+    fpExpectedConfirmed: false,
+    invariant: 'R2-H-14',
+    rationale: 'Unmodelled CWE-20 has no strict receipt rule in CWE_TO_RECEIPT_CLASS and fails closed.',
+  },
+  {
+    entryPoint: 'verifyReplaySpec',
+    permutation: 'free_text',
+    tpExpectedConfirmed: false,
+    fpExpectedConfirmed: false,
+    invariant: 'R2-H-14',
+    rationale: 'declarativeReplaySpecSchema mandates /^CWE-\\d{1,5}$/; free-text-only specs carry placeholder CWE-0 which fails closed under CWE-first classification.',
+  },
+  {
+    entryPoint: 'floor-recipe-engine',
+    permutation: 'other',
+    tpExpectedConfirmed: false,
+    fpExpectedConfirmed: false,
+    invariant: 'R2-H-14',
+    rationale: 'receiptCheckForResult has no strict receipt rule for generic "other" labels without CWE or class keywords.',
+  },
+  {
+    entryPoint: 'floor-recipe-engine',
+    permutation: 'cwe_20',
+    tpExpectedConfirmed: false,
+    fpExpectedConfirmed: false,
+    invariant: 'R2-H-14',
+    rationale: 'receiptCheckForResult rejects unmodelled CWE-20 strictly (CWE-first classification forbids keyword bypass).',
+  },
+  {
+    entryPoint: 'floor-recipe-engine',
+    permutation: 'free_text',
+    impactFilter: 'non_injection',
+    tpExpectedConfirmed: true,
+    fpExpectedConfirmed: false,
+    invariant: 'R2-H-14',
+    rationale: 'When CWE is omitted on an in-memory floor spec, receiptVulnClassFor falls back to unambiguous free-text keywords for non-injection classes so valid TPs confirm while FPs fail closed.',
+  },
+  {
+    entryPoint: 'floor-recipe-engine',
+    permutation: 'free_text',
+    impactFilter: 'injection',
+    tpExpectedConfirmed: false,
+    fpExpectedConfirmed: false,
+    invariant: 'oracle-invariants:594',
+    rationale: 'classifyImpactDescriptor classifies injection strictly from CWE or category (never free-text prose alone) to prevent narrative rebranding; free-text-only injection specs fail closed in receiptCheckForResult.',
+  },
+  {
+    entryPoint: 'evaluateClaims',
+    permutation: 'other',
+    tpExpectedConfirmed: true,
+    fpExpectedConfirmed: false,
+    invariant: 'R2-11',
+    rationale: 'Structured kernel claims carry self-contained oracle proofs independent of outer label; TPs pass while FPs fail closed via transcript-shape inference.',
+  },
+  {
+    entryPoint: 'evaluateClaims',
+    permutation: 'cwe_20',
+    tpExpectedConfirmed: true,
+    fpExpectedConfirmed: false,
+    invariant: 'R2-11',
+    rationale: 'Structured kernel claims prove impact directly from host transcript even when outer finding CWE is generic CWE-20; FPs fail closed.',
+  },
+  {
+    entryPoint: 'evaluateClaims',
+    permutation: 'free_text',
+    tpExpectedConfirmed: true,
+    fpExpectedConfirmed: false,
+    invariant: 'R2-11',
+    rationale: 'Structured kernel claims confirm TPs and reject FPs uniformly under free-text-only labels.',
+  },
+  {
+    entryPoint: 'verifyCompositeReceipt',
+    permutation: 'other',
+    tpExpectedConfirmed: true,
+    fpExpectedConfirmed: false,
+    invariant: 'R2-11',
+    rationale: 'CompositeProofReceipt binds terminalVulnClass inside the host-verified receipt rather than outer labels; TPs confirm and FPs fail closed.',
+  },
+  {
+    entryPoint: 'verifyCompositeReceipt',
+    permutation: 'cwe_20',
+    tpExpectedConfirmed: true,
+    fpExpectedConfirmed: false,
+    invariant: 'R2-11',
+    rationale: 'CompositeProofReceipt terminal oracle is bound to receipt.terminalVulnClass, invariant to outer CWE-20 labels.',
+  },
+  {
+    entryPoint: 'verifyCompositeReceipt',
+    permutation: 'free_text',
+    tpExpectedConfirmed: true,
+    fpExpectedConfirmed: false,
+    invariant: 'R2-11',
+    rationale: 'CompositeProofReceipt terminal oracle is invariant to outer free-text labels.',
+  },
+]
+
+function expectedVerdictFor(
+  entryPoint: ParityEntryPoint,
+  c: Pick<ParityCase, 'side' | 'canonicalLabel'>,
+  perm: PermutationKind,
+): boolean {
+  if (c.side === 'fp') return false
+  if (perm === 'canonical' || perm === 'cwe_only' || perm === 'adversarial_title') return true
+  const isInjection = c.canonicalLabel.claimedImpact === 'injection'
+  const row = OTHER_LABEL_EXCEPTION_TABLE.find(e =>
+    e.entryPoint === entryPoint &&
+    e.permutation === perm &&
+    (!e.impactFilter || e.impactFilter === 'all' || (e.impactFilter === 'injection' ? isInjection : !isInjection)),
+  )
+  assert.ok(row, `Missing OTHER_LABEL_EXCEPTION_TABLE entry for (${entryPoint}, ${perm}, injection=${isInjection})`)
+  return row.tpExpectedConfirmed
+}
+
+type ManifestReceiptRule = Exclude<ReceiptVerification['rule'], 'none'>
+const MANIFEST_RECEIPT_RULES: readonly ManifestReceiptRule[] = [
+  'impact',
+  'boolean',
+  'status_differential',
+  'timing',
+  'oob',
+  'redirect',
+  'conserved_balance',
+  'auth_bypass',
+  'webhook',
+  'browser',
+]
+
+interface CorpusClassExemption {
+  readonly rule: ManifestReceiptRule
+  readonly ticket: string
+  readonly reason: string
+  readonly expires: string
+}
+
+/**
+ * Ticketed exemption list for manifest receipt classes that cannot run purely offline.
+ * Currently empty because every manifest receipt rule has at least one offline corpus fixture.
+ */
+export const CORPUS_CLASS_EXEMPTIONS: ReadonlyArray<CorpusClassExemption> = []
 
 function loadCorpus(): ParityCase[] {
   const files = readdirSync(CORPUS_DIR).filter(f => f.endsWith('.json')).sort()
@@ -174,6 +439,19 @@ function permuteLabel(c: ParityCase, perm: PermutationKind): ParityLabel {
         claimedBoundary: derivedBoundary,
       }
     }
+    case 'adversarial_title': {
+      const cwe = c.canonicalLabel.cwe
+      const derivedImpact = classifyImpactDescriptor({ cwe })
+      const derivedBoundary = classifyBoundaryClaim({ cwe })
+      return {
+        ...(cwe ? { cwe } : {}),
+        category: 'other',
+        title: 'Routine telemetry status notice',
+        impact: 'Normal benign endpoint diagnostic observation.',
+        claimedImpact: derivedImpact,
+        claimedBoundary: derivedBoundary,
+      }
+    }
     case 'free_text': {
       const title = c.freeTextLabel.title
       const impact = c.freeTextLabel.impact ?? title
@@ -211,14 +489,20 @@ function buildGrant(origin: string, personas: readonly ParityPersona[]): Grant {
   })
 }
 
-function buildReplaySpec(c: ParityCase, origin: string, label: ParityLabel): DeclarativeReplaySpec {
+function buildReplaySpec(
+  c: ParityCase,
+  origin: string,
+  label: ParityLabel,
+  opts?: { allowEmptyCwe?: boolean },
+): DeclarativeReplaySpec {
+  const cweValue = label.cwe ?? (opts?.allowEmptyCwe ? '' : 'CWE-0')
   return {
     version: 1,
     kind: 'http_chain',
     origin,
     title: label.title ?? 'Security finding',
     category: label.category ?? 'other',
-    cwe: label.cwe ?? 'CWE-0',
+    cwe: cweValue,
     severity: 'high',
     severityRationale: 'Parity corpus evaluation.',
     impact: label.impact ?? 'Observed behavior.',
@@ -245,45 +529,71 @@ function buildReplaySpec(c: ParityCase, origin: string, label: ParityLabel): Dec
   } as unknown as DeclarativeReplaySpec
 }
 
-function populateTranscriptStore(c: ParityCase, origin: string): { store: TranscriptStore; idMap: Map<string, string> } {
+function substituteTemplate(text: string, vars: Readonly<Record<string, string>>): string {
+  let out = text
+  for (const [k, v] of Object.entries(vars)) {
+    out = out.replaceAll(`{{${k}}}`, v)
+  }
+  return out
+}
+
+function substituteHeaders(headers: Record<string, string>, vars: Readonly<Record<string, string>>): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const [k, v] of Object.entries(headers)) out[k] = substituteTemplate(v, vars)
+  return out
+}
+
+function populateTranscriptStore(
+  c: ParityCase,
+  origin: string,
+  templateVars: Readonly<Record<string, string>> = {},
+): { store: TranscriptStore; idMap: Map<string, string> } {
   const store = new TranscriptStore(Buffer.alloc(32, 7))
   const personaByHandle = new Map(c.personas.map(p => [p.handle, p]))
   const idMap = new Map<string, string>()
-  let ts = 1_700_000_000_000
+  const baseTs = 1_700_000_000_000
+  let ts = baseTs
   for (const ex of c.exchanges) {
-    ts += 100
+    ts = ex.startedAtOffsetMs !== undefined ? baseTs + ex.startedAtOffsetMs : ts + 100
     const persona = ex.persona ? personaByHandle.get(ex.persona) : undefined
-    const reqHeaders: Record<string, string> = { ...(ex.requestHeaders ?? {}) }
+    const reqHeaders: Record<string, string> = substituteHeaders(ex.requestHeaders ?? {}, templateVars)
     if (persona) reqHeaders[persona.headerName.toLowerCase()] = persona.headerValue
+    const pathAndQuery = substituteTemplate(ex.pathAndQuery, templateVars)
+    const responseHeaders = substituteHeaders(ex.responseHeaders, templateVars)
+    const body = substituteTemplate(ex.body, templateVars)
     const reqBody = ex.requestJson !== undefined ? JSON.stringify(ex.requestJson) : ''
+    const op = ex.op ?? (ex.executedSentinels?.length ? 'browser' : 'http')
+    const artifact = ex.op === 'oob'
+      ? { kind: 'oob-mint' as const, token: ex.oobToken, hit: Boolean(ex.oobHit) }
+      : ex.executedSentinels?.length
+        ? { kind: 'browser' as const, executedSentinels: ex.executedSentinels }
+        : undefined
     const rec = store.record({
-      op: ex.executedSentinels?.length ? 'browser' : 'http',
+      op,
       startedAt: ts,
-      durationMs: 12,
+      durationMs: ex.durationMs ?? 12,
       request: {
-        origin,
+        origin: ex.originOverride ?? origin,
         method: ex.method,
-        pathAndQuery: ex.pathAndQuery,
+        pathAndQuery,
         headers: reqHeaders,
         bodyBytes: Buffer.byteLength(reqBody, 'utf8'),
         bodySha256: sha256(reqBody),
         personaHandle: persona?.handle ?? null,
         sessionRole: ex.arm,
-        actorRoleLabel: persona?.roleLabel ?? null,
+        actorRoleLabel: ex.actorRoleLabel !== undefined ? (ex.actorRoleLabel || null) : (persona?.roleLabel ?? null),
         nonce: 'parity-nonce',
       },
       response: {
         status: ex.status,
-        headers: ex.responseHeaders,
-        bodyBytes: Buffer.byteLength(ex.body, 'utf8'),
-        bodySha256: sha256(ex.body),
+        headers: responseHeaders,
+        bodyBytes: Buffer.byteLength(body, 'utf8'),
+        bodySha256: sha256(body),
         mediaType: ex.mediaType,
       },
-      ...(ex.executedSentinels?.length
-        ? { artifact: { kind: 'browser', executedSentinels: ex.executedSentinels } }
-        : {}),
+      ...(artifact ? { artifact } : {}),
       rawRequestBody: reqBody || undefined,
-      body: ex.body,
+      body,
     })
     idMap.set(ex.id, rec.exchangeId)
   }
@@ -338,16 +648,23 @@ function buildCompositeFixture(c: ParityCase, origin: string): {
   transcript: HostSignedTranscript
   store: TranscriptStore
   claim: VerifyClaim
+  options: { signingKey: string; attackerPersonas?: string[]; forbiddenShortcutPersonas?: string[] }
+  exchangeById: Map<string, HostRecordedExchangeView>
 } {
   const comp = c.composite!
   const personaByHandle = new Map(c.personas.map(p => [p.handle, p]))
-  const capHandle = `cap:hop_1:${comp.capabilityToken}`
+  const capHandle = comp.capabilityToken ? `cap:hop_1:${comp.capabilityToken}` : null
   const entries: HostTranscriptEntry[] = []
   let ts = 1_700_000_000_000
+  let seq = 0
   for (const ex of c.exchanges) {
     ts += 250
+    seq += 1
     const p = ex.persona ? personaByHandle.get(ex.persona) : undefined
     const json = parseJsonSafe(ex.body)
+    const emitted = ex.emittedCapabilities ?? (capHandle && ex.id === 'hop1_ex' ? [capHandle] : undefined)
+    const consumed = ex.consumedCapabilities ?? (capHandle && ex.id === 'hop2_prb' ? [capHandle] : undefined)
+    const capActor = !p && consumed?.length ? consumed[0]! : null
     const step: ImpactStep = {
       id: ex.id,
       arm: ex.arm,
@@ -356,110 +673,186 @@ function buildCompositeFixture(c: ParityCase, origin: string): {
       pathAndQuery: ex.pathAndQuery,
       status: ex.status,
       actor: {
-        handle: p?.handle ?? null,
+        handle: p?.handle ?? capActor,
         role: p?.role ?? null,
         tenant: p?.tenant ?? null,
-        auth: p?.auth ?? 'unknown',
+        auth: p?.auth ?? (capActor ? 'bearer' : 'unknown'),
         sameSite: null,
       },
       ...(json !== undefined ? { json } : {}),
       body: ex.body,
       ...(ex.requestJson !== undefined ? { requestJson: ex.requestJson } : {}),
-      requestHeaders: p ? { [p.headerName]: p.headerValue } : null,
+      requestHeaders: {
+        ...(p ? { [p.headerName]: p.headerValue } : {}),
+        ...(ex.requestHeaders ?? {}),
+      },
       responseHeaders: ex.responseHeaders,
     }
     const extra: Partial<HostTranscriptEntry> = {
+      seq,
+      origin: ex.originOverride ?? origin,
       timestampMs: ts,
-      actorPersona: p?.handle ?? null,
+      actorPersona: p?.handle ?? capActor,
+      actorRoleLabel: ex.actorRoleLabel !== undefined ? (ex.actorRoleLabel || null) : (p?.roleLabel ?? null),
       cleanSession: true,
-      ...(ex.id === 'hop1_ex' ? { emittedCapabilities: [capHandle] } : {}),
-      ...(ex.id === 'hop2_prb' ? { consumedCapabilities: [capHandle] } : {}),
+      ...(emitted?.length ? { emittedCapabilities: emitted } : {}),
+      ...(consumed?.length ? { consumedCapabilities: consumed } : {}),
     }
     const base: HostTranscriptEntry = { exchangeId: ex.id, step, ...extra }
     entries.push({ ...base, hostSignature: signHostRecord(base, SIGNING_KEY) })
   }
-  const hop1 = c.exchanges.find(e => e.id === 'hop1_ex')!
-  const hop2 = c.exchanges.find(e => e.id === 'hop2_prb')!
-  const receipt: CompositeProofReceipt = {
+
+  let receipt: CompositeProofReceipt
+  if (comp.singleHop) {
+    const termExId = comp.terminalExchangeId ?? c.exchanges[c.exchanges.length - 1]!.id
+    const termEx = c.exchanges.find(e => e.id === termExId) ?? c.exchanges[c.exchanges.length - 1]!
+    const preCtrls = comp.preChainControlIds ?? c.exchanges.filter(e => e.arm === 'control').map(e => e.id)
+    const hopExIds = c.exchanges.filter(e => !preCtrls.includes(e.id)).map(e => e.id)
+    receipt = {
+      chainId: comp.chainId,
+      terminalVulnClass: comp.terminalVulnClass,
+      hops: [
+        {
+          hopId: 'hop_1',
+          surface: 'http',
+          target: {
+            origin: comp.hop1TargetOverride?.origin ?? origin,
+            method: comp.hop1TargetOverride?.method ?? termEx.method,
+            pathAndQuery: comp.hop1TargetOverride?.pathAndQuery ?? termEx.pathAndQuery,
+          },
+          exchangeIds: hopExIds.length > 0 ? hopExIds : [termEx.id],
+          oobEventIds: [],
+          browserTraceIds: [],
+          claimedDelta: comp.claimedDelta,
+          producedCapabilities: [],
+          consumedCapabilities: [],
+        },
+      ],
+      causalEdges: [],
+      terminalImpact: {
+        terminalHopId: 'hop_1',
+        ...(comp.omitTerminalExchangeId ? {} : { terminalExchangeId: termEx.id }),
+        claimedImpact: comp.claimedDelta,
+        summary: comp.claimedDelta,
+        preChainControlExchangeIds: preCtrls,
+        postChainReadbackExchangeIds: [],
+      },
+      replayMode: 'fresh_clean_replay',
+    }
+  } else {
+    const hop1 = c.exchanges.find(e => e.id === 'hop1_ex')!
+    const hop2 = c.exchanges.find(e => e.id === 'hop2_prb')!
+    const hop2Ctl = c.exchanges.find(e => e.id === 'hop2_ctl')
+    const hop2ExIds = hop2Ctl ? [hop2Ctl.id, hop2.id] : [hop2.id]
+    receipt = {
+      chainId: comp.chainId,
+      terminalVulnClass: comp.terminalVulnClass,
+      hops: [
+        {
+          hopId: 'hop_1',
+          surface: 'http',
+          target: {
+            origin: comp.hop1TargetOverride?.origin ?? origin,
+            method: comp.hop1TargetOverride?.method ?? hop1.method,
+            pathAndQuery: comp.hop1TargetOverride?.pathAndQuery ?? hop1.pathAndQuery,
+          },
+          exchangeIds: [hop1.id],
+          oobEventIds: [],
+          browserTraceIds: [],
+          claimedDelta: 'Minted cross-tenant capability handle.',
+          producedCapabilities: capHandle ? [capHandle] : [],
+          consumedCapabilities: [],
+        },
+        {
+          hopId: 'hop_2',
+          surface: 'http',
+          target: {
+            origin: comp.hop2TargetOverride?.origin ?? origin,
+            method: comp.hop2TargetOverride?.method ?? hop2.method,
+            pathAndQuery: comp.hop2TargetOverride?.pathAndQuery ?? hop2.pathAndQuery,
+          },
+          exchangeIds: hop2ExIds,
+          oobEventIds: [],
+          browserTraceIds: [],
+          claimedDelta: comp.claimedDelta,
+          producedCapabilities: [],
+          consumedCapabilities: capHandle ? [capHandle] : [],
+        },
+      ],
+      causalEdges: capHandle
+        ? [
+            {
+              fromHopId: 'hop_1',
+              toHopId: 'hop_2',
+              kind: 'value_binding',
+              capabilityHandle: capHandle,
+              sourceExchangeId: hop1.id,
+              targetExchangeId: hop2.id,
+            },
+          ]
+        : [],
+      terminalImpact: {
+        terminalHopId: 'hop_2',
+        ...(comp.omitTerminalExchangeId ? {} : { terminalExchangeId: hop2.id }),
+        claimedImpact: comp.claimedDelta,
+        summary: comp.claimedDelta,
+        preChainControlExchangeIds: comp.preChainControlIds ?? (hop2Ctl ? [hop2Ctl.id] : []),
+        postChainReadbackExchangeIds: [],
+      },
+      replayMode: 'fresh_clean_replay',
+    }
+  }
+
+  const transcript: HostSignedTranscript = { entries }
+  const options = {
+    signingKey: SIGNING_KEY,
+    ...(comp.attackerPersonas ? { attackerPersonas: comp.attackerPersonas } : {}),
+    ...(comp.forbiddenShortcutPersonas ? { forbiddenShortcutPersonas: comp.forbiddenShortcutPersonas } : {}),
+  }
+  const hostCompRes = verifyCompositeReceipt(receipt, transcript, options)
+  const { store, idMap } = populateTranscriptStore(c, origin)
+  const storeExchangeIds = c.exchanges.map(e => idMap.get(e.id)!)
+  const verifiedRec = store.recordCompositeVerification({
     chainId: comp.chainId,
     terminalVulnClass: comp.terminalVulnClass,
-    hops: [
-      {
-        hopId: 'hop_1',
-        surface: 'http',
-        target: { origin, method: hop1.method, pathAndQuery: hop1.pathAndQuery },
-        exchangeIds: ['hop1_ex'],
-        oobEventIds: [],
-        browserTraceIds: [],
-        claimedDelta: 'Minted cross-tenant export token handle.',
-        producedCapabilities: [capHandle],
-        consumedCapabilities: [],
-      },
-      {
-        hopId: 'hop_2',
-        surface: 'http',
-        target: { origin, method: hop2.method, pathAndQuery: hop2.pathAndQuery },
-        exchangeIds: ['hop2_ctl', 'hop2_prb'],
-        oobEventIds: [],
-        browserTraceIds: [],
-        claimedDelta: comp.claimedDelta,
-        producedCapabilities: [],
-        consumedCapabilities: [capHandle],
-      },
-    ],
-    causalEdges: [
-      {
-        fromHopId: 'hop_1',
-        toHopId: 'hop_2',
-        kind: 'value_binding',
-        capabilityHandle: capHandle,
-        sourceExchangeId: 'hop1_ex',
-        targetExchangeId: 'hop2_prb',
-      },
-    ],
-    terminalImpact: {
-      terminalHopId: 'hop_2',
-      terminalExchangeId: 'hop2_prb',
-      claimedImpact: comp.claimedDelta,
-      summary: comp.claimedDelta,
-      preChainControlExchangeIds: ['hop2_ctl'],
-      postChainReadbackExchangeIds: [],
-    },
-    replayMode: 'fresh_clean_replay',
-  }
-  const transcript: HostSignedTranscript = { entries }
-  const { store } = populateTranscriptStore(c, origin)
-  const storeEntries = store.list()
-  const storeExchangeIds = storeEntries.map(e => e.exchangeId)
+    confirmed: hostCompRes.confirmed,
+    hopCount: hostCompRes.hopCount,
+    verifiedEdgeCount: hostCompRes.verifiedEdges.filter(e => e.verified).length,
+    replayMode: hostCompRes.replayMode,
+    reason: hostCompRes.reason,
+    ...(hostCompRes.failedStage ? { failedStage: hostCompRes.failedStage } : {}),
+    rejectedBy: hostCompRes.rejectedBy ?? null,
+    missingEvidence: hostCompRes.missingEvidence ?? [],
+    exchangeIds: storeExchangeIds,
+  })
   const claim: VerifyClaim = {
     kind: 'composite_receipt',
+    verificationId: verifiedRec.verificationId,
     chainId: comp.chainId,
     terminalVulnClass: comp.terminalVulnClass,
     exchangeIds: storeExchangeIds,
-    terminalExchangeId: storeExchangeIds[2]!,
-    compositeReceipt: {
-      ...receipt,
-      hops: receipt.hops.map((h, i) => ({
-        ...h,
-        exchangeIds: i === 0 ? [storeExchangeIds[0]!] : [storeExchangeIds[1]!, storeExchangeIds[2]!],
-      })),
-      causalEdges: receipt.causalEdges.map(edge => ({
-        ...edge,
-        sourceExchangeId: storeExchangeIds[0]!,
-        targetExchangeId: storeExchangeIds[2]!,
-      })),
-      terminalImpact: {
-        ...receipt.terminalImpact,
-        terminalExchangeId: storeExchangeIds[2]!,
-        preChainControlExchangeIds: [storeExchangeIds[1]!],
-      },
-    } as unknown as Record<string, unknown>,
+    ...(comp.omitTerminalExchangeId
+      ? {}
+      : { terminalExchangeId: idMap.get(receipt.terminalImpact.terminalExchangeId ?? '') ?? storeExchangeIds[storeExchangeIds.length - 1]! }),
   }
-  return { receipt, transcript, store, claim }
+  const exchangeById = new Map<string, HostRecordedExchangeView>(
+    entries.map(e => [
+      e.exchangeId,
+      {
+        exchangeId: e.exchangeId,
+        origin: e.origin ?? '',
+        method: e.step.method.toUpperCase(),
+        pathAndQuery: e.step.pathAndQuery ?? e.step.route ?? '',
+        status: e.step.status,
+        sessionRole: e.step.arm,
+      },
+    ]),
+  )
+  return { receipt, transcript, store, claim, options, exchangeById }
 }
 
 // ============================================================================
-// 1. Corpus completeness check
+// 1. Corpus completeness, >=2 entry points per case, & manifest class coverage
 // ============================================================================
 
 test('parity corpus: covers both TP and FP sides including anon-control authz and error-status-only injection', () => {
@@ -468,6 +861,7 @@ test('parity corpus: covers both TP and FP sides including anon-control authz an
   const fps = corpus.filter(c => c.side === 'fp')
   assert.ok(tps.length >= 5, `expected >= 5 TP corpus cases, got ${tps.length}`)
   assert.ok(fps.length >= 8, `expected >= 8 FP corpus cases, got ${fps.length}`)
+  assert.ok(corpus.length >= 29, `expected >= 29 total parity corpus cases after R2-11 backfill, got ${corpus.length}`)
   const archetypes = new Set(corpus.map(c => c.archetype))
   assert.ok(archetypes.has('anon-control-authz'), 'missing anon-control-authz archetype')
   assert.ok(archetypes.has('error-status-only-injection'), 'missing error-status-only-injection archetype')
@@ -478,6 +872,63 @@ test('parity corpus: covers both TP and FP sides including anon-control authz an
   assert.ok(archetypes.has('job-handle-stub'), 'missing job-handle-stub archetype')
   assert.ok(archetypes.has('composite-multihop-cross-tenant'), 'missing composite-multihop archetype')
   assert.ok(archetypes.has('composite-stub-decoy'), 'missing composite-stub-decoy archetype')
+  // R2-11 backfilled missing receipt classes & R3 kernel classes
+  for (const requiredArchetype of [
+    'boolean-differential',
+    'r3-c4-integer-coercion-boolean',
+    'timing-differential',
+    'oob-durable-callback',
+    'ssrf-oob-callback',
+    'open-redirect-canary',
+    'race-conserved-balance',
+    'auth-bypass-header',
+    'webhook-inline-hmac',
+    'r3-c5-signed-url-scope-replay',
+    'r3-c5-batch-partial-cache-bleed',
+    'r3-h4-forbidden-admin-cap',
+    'r3-h4-junk-bearer-control',
+    'r3-h13-hop-target-mismatch',
+    'composite-no-terminal-exchange-id',
+  ]) {
+    assert.ok(archetypes.has(requiredArchetype), `missing R2-11 required archetype: ${requiredArchetype}`)
+  }
+
+  // R2-11: Every corpus case MUST assert at least TWO entry points (preventing single-path placeholders).
+  for (const c of corpus) {
+    if (c.side === 'retest') {
+      assert.equal(c.paths.retest, true, `retest case ${c.id} must enable retest (3 engines: floor + declarative + agent-script)`)
+      continue
+    }
+    const activeCount = [
+      c.paths.replay,
+      c.paths.floorReceipt,
+      c.paths.evaluateClaims,
+      c.paths.composite,
+      c.paths.floorInjectionRecipe,
+      Boolean(c.paths.proofReceipt),
+    ].filter(Boolean).length
+    assert.ok(
+      activeCount >= 2,
+      `R2-11: corpus case ${c.id} must assert at least 2 entry points, found ${activeCount}`,
+    )
+  }
+
+  // R2-11: Every manifest receipt class must be covered by the corpus or carry a valid ticketed exemption.
+  const coveredRules = new Set<ManifestReceiptRule>()
+  for (const c of corpus) {
+    const cls = c.proofReceipt?.vulnClass ?? c.canonicalLabel.vulnClass
+    if (!cls) continue
+    const oobIds = c.proofReceipt?.oobEvents?.map(e => e.id) ?? []
+    const { rule } = receiptRuleFor(cls, { oobEventIds: oobIds })
+    if (rule !== 'none') coveredRules.add(rule)
+  }
+  const exemptionsByRule = new Map(CORPUS_CLASS_EXEMPTIONS.map(ex => [ex.rule, ex]))
+  for (const rule of MANIFEST_RECEIPT_RULES) {
+    if (coveredRules.has(rule)) continue
+    const ex = exemptionsByRule.get(rule)
+    assert.ok(ex, `R2-11 manifest receipt class "${rule}" has zero parity corpus coverage and no ticketed exemption`)
+    assert.ok(ex.ticket.trim().length > 0 && ex.reason.trim().length > 0 && /^\d{4}-\d{2}-\d{2}$/.test(ex.expires))
+  }
 })
 
 // ============================================================================
@@ -532,32 +983,26 @@ test('path parity [verifyReplaySpec]: enforces TP/FP verdicts and fail-closed la
         grant,
         signal: AbortSignal.timeout(15_000),
       })
-      if (c.side === 'fp') {
+      const wantConfirmed = expectedVerdictFor('verifyReplaySpec', c, perm)
+      if (wantConfirmed) {
+        assert.equal(
+          res.verdict,
+          'confirmed',
+          `TP case ${c.id} MUST confirm in verifyReplaySpec under permutation "${perm}" (got ${res.verdict}: ${res.outcome.reason ?? 'none'})`,
+        )
+        assert.equal(res.receipt?.mode, 'strict')
+        assert.equal(res.receipt?.verification.confirmed, true)
+      } else {
         assert.notEqual(
           res.verdict,
           'confirmed',
-          `FP case ${c.id} MUST NOT confirm in verifyReplaySpec under permutation "${perm}" (reason=${res.outcome.reason ?? 'none'})`,
+          `${c.side.toUpperCase()} case ${c.id} MUST NOT confirm in verifyReplaySpec under permutation "${perm}" (reason=${res.outcome.reason ?? 'none'})`,
         )
         // Pin the closed replay-verifier.ts:508 gap: error-status-only-injection must fail proofStrength even under 'other'/'cwe_20'!
         if (c.id === 'error-status-only-injection-fp') {
           const ps = res.evidencePayload.proofStrength as { satisfied?: boolean } | undefined
           assert.equal(ps?.satisfied, false, `proofStrength must reject error-status-only under "${perm}"`)
         }
-      } else if (perm === 'canonical') {
-        assert.equal(
-          res.verdict,
-          'confirmed',
-          `TP case ${c.id} must confirm in verifyReplaySpec under canonical label (got ${res.verdict}: ${res.outcome.reason ?? 'none'})`,
-        )
-        assert.equal(res.receipt?.mode, 'strict')
-        assert.equal(res.receipt?.verification.confirmed, true)
-      } else if (perm === 'other' || perm === 'cwe_20') {
-        // R2-H-14: unmodelled 'other' / CWE-20 MUST fail closed in strict receipt mode, never silently confirm.
-        assert.notEqual(
-          res.verdict,
-          'confirmed',
-          `R2-H-14: unmodelled permutation "${perm}" on ${c.id} must fail closed in strict verifyReplaySpec`,
-        )
       }
     }
   }
@@ -588,7 +1033,10 @@ test('path parity [floor-recipe-engine]: receiptCheckForResult + injection_finge
         ...(json !== undefined ? { json } : {}),
         mediaType: ex.mediaType,
         responseHeaders: ex.responseHeaders,
-        requestHeaders: p ? { [p.headerName]: p.headerValue } : {},
+        requestHeaders: {
+          ...(p ? { [p.headerName]: p.headerValue } : {}),
+          ...(ex.requestHeaders ?? {}),
+        },
         ...(ex.requestJson !== undefined ? { requestBody: JSON.stringify(ex.requestJson) } : {}),
         ...(p ? { personaHandle: p.handle, actorRole: p.role, actorTenant: p.tenant, ambientAuth: p.auth } : {}),
         exchangeId: exId,
@@ -614,7 +1062,7 @@ test('path parity [floor-recipe-engine]: receiptCheckForResult + injection_finge
 
     for (const perm of PERMUTATIONS) {
       const label = permuteLabel(c, perm)
-      const spec = buildReplaySpec(c, origin, label)
+      const spec = buildReplaySpec(c, origin, label, { allowEmptyCwe: true })
       const checked = receiptCheckForResult({
         mode: 'strict',
         verdict: 'confirmed',
@@ -627,20 +1075,19 @@ test('path parity [floor-recipe-engine]: receiptCheckForResult + injection_finge
         exchangeIds,
         exchanges,
       })
-      if (c.side === 'fp') {
-        assert.notEqual(
-          checked.verdict,
-          'confirmed',
-          `FP case ${c.id} MUST NOT confirm in receiptCheckForResult under "${perm}"`,
-        )
-      } else if (perm === 'canonical') {
+      const wantConfirmed = expectedVerdictFor('floor-recipe-engine', c, perm)
+      if (wantConfirmed) {
         assert.equal(
           checked.verdict,
           'confirmed',
-          `TP case ${c.id} must confirm in receiptCheckForResult under canonical label (reason=${checked.outcome.reason ?? 'none'})`,
+          `TP case ${c.id} MUST confirm in receiptCheckForResult under permutation "${perm}" (reason=${checked.outcome.reason ?? 'none'})`,
         )
-      } else if (perm === 'other' || perm === 'cwe_20') {
-        assert.notEqual(checked.verdict, 'confirmed', `unmodelled "${perm}" on ${c.id} must fail closed in receiptCheckForResult`)
+      } else {
+        assert.notEqual(
+          checked.verdict,
+          'confirmed',
+          `${c.side.toUpperCase()} case ${c.id} MUST NOT confirm in receiptCheckForResult under permutation "${perm}"`,
+        )
       }
     }
   }
@@ -712,7 +1159,12 @@ test('path parity [evaluateClaims]: enforces identical TP/FP verdicts across all
   assert.ok(corpus.length >= 10)
 
   for (const c of corpus) {
-    const { store, idMap } = populateTranscriptStore(c, origin)
+    const templateVars: Record<string, string> = {}
+    if (c.proofReceipt?.mintRedirectCanary) {
+      const oracle = new HostMintedOracle()
+      templateVars.MINTED_REDIRECT_HOST = oracle.mintRedirectCanary().host
+    }
+    const { store, idMap } = populateTranscriptStore(c, origin, templateVars)
     const factLog = HostFactLog.fromTranscriptStore(store)
     const allowedExchangeIds = new Set(store.list().map(r => r.exchangeId))
     const claimSets: Array<{ label: string; claims: VerifyClaim[] }> = []
@@ -735,17 +1187,12 @@ test('path parity [evaluateClaims]: enforces identical TP/FP verdicts across all
           ...(lbl.injectionFamily ? { injectionFamily: lbl.injectionFamily } : {}),
         })
         verdicts.set(perm, res.passed)
-        if (c.side === 'fp') {
+        if (c.side === 'fp' || setName === 'structured') {
+          const wantPassed = expectedVerdictFor('evaluateClaims', c, perm)
           assert.equal(
             res.passed,
-            false,
-            `FP case ${c.id} (${setName}) MUST FAIL evaluateClaims under permutation "${perm}"`,
-          )
-        } else if (setName === 'structured') {
-          assert.equal(
-            res.passed,
-            true,
-            `TP case ${c.id} (${setName}) MUST PASS evaluateClaims under permutation "${perm}" (failures: ${res.failures.join('; ')})`,
+            wantPassed,
+            `${c.side.toUpperCase()} case ${c.id} (${setName}) evaluateClaims mismatch under permutation "${perm}" (expected=${wantPassed}, failures: ${res.failures.join('; ')})`,
           )
         }
       }
@@ -762,34 +1209,226 @@ test('path parity [evaluateClaims]: enforces identical TP/FP verdicts across all
 // 5. Entry point 4: verifyCompositeReceipt + evaluateClaims(composite_receipt)
 // ============================================================================
 
-test('path parity [verifyCompositeReceipt]: multi-hop TP confirms and stub decoy FP fails closed across permutations', () => {
+test('path parity [verifyCompositeReceipt]: multi-hop TP confirms and stub/R3 FPs fail closed across ALL 6 label permutations', () => {
   const origin = 'http://127.0.0.1:4300'
   const corpus = loadCorpus().filter(c => c.paths.composite)
   assert.ok(corpus.length >= 2)
+  assert.ok(corpus.length >= 8, `expected >= 8 composite corpus cases after R2-11 backfill, got ${corpus.length}`)
 
   for (const c of corpus) {
-    const { receipt, transcript, store, claim } = buildCompositeFixture(c, origin)
-    const compRes = verifyCompositeReceipt(receipt, transcript, { signingKey: SIGNING_KEY })
+    const { receipt, transcript, store, claim, options, exchangeById } = buildCompositeFixture(c, origin)
+    const compRes = verifyCompositeReceipt(receipt, transcript, options)
     assert.equal(
       compRes.confirmed,
       c.expected.confirmed,
       `verifyCompositeReceipt mismatch for ${c.id}: expected ${c.expected.confirmed}, got ${compRes.confirmed} (${compRes.reason})`,
     )
-    // Also verify label permutations on evaluateClaims(composite_receipt) reject decoy FP uniformly
-    if (c.side === 'fp') {
-      const factLog = HostFactLog.fromTranscriptStore(store)
-      for (const perm of PERMUTATIONS) {
-        const lbl = permuteLabel(c, perm)
-        const ev = evaluateClaims(store, [claim], {
-          factLog,
-          claimedImpact: lbl.claimedImpact,
-          claimedBoundary: lbl.claimedBoundary,
-          cwe: lbl.cwe ?? null,
-          title: lbl.title ?? null,
-        })
-        assert.equal(ev.passed, false, `composite decoy FP ${c.id} must fail evaluateClaims under "${perm}"`)
-      }
+    if (c.composite?.expectedFailedStage) {
+      assert.equal(
+        compRes.failedStage,
+        c.composite.expectedFailedStage,
+        `expected failedStage=${c.composite.expectedFailedStage} for ${c.id}, got ${compRes.failedStage ?? 'none'}`,
+      )
     }
+
+    // R2-11: Verify single canonical terminal-exchange resolver parity between composite-receipt and exec-verify
+    const entries = transcript.entries ?? []
+    const resolvedFromReceipt = resolveCompositeTerminalExchange(receipt, entries)
+    const resolvedFromExec = resolveCompositeTerminalExchange(receipt, exchangeById)
+    assert.equal(
+      resolvedFromReceipt?.exchangeId,
+      resolvedFromExec?.exchangeId,
+      `composite-terminal divergence on ${c.id}: composite-receipt picked ${resolvedFromReceipt?.exchangeId} vs exec-verify ${resolvedFromExec?.exchangeId}`,
+    )
+    const derivedOrigin = deriveSignedTerminalOrigin(receipt, entries)
+    const execOrigin = inspectCompositeHostOrigin(receipt, exchangeById)
+    if (c.composite?.omitTerminalExchangeId) {
+      assert.equal(receipt.terminalImpact.terminalExchangeId, undefined, `${c.id} must omit explicit terminalExchangeId`)
+      assert.equal(compRes.confirmed, true)
+      assert.equal(derivedOrigin, origin)
+      assert.equal(execOrigin.ok, true)
+      if (execOrigin.ok) assert.equal(execOrigin.origin, derivedOrigin)
+    }
+    if (c.archetype === 'r3-h13-hop-target-mismatch') {
+      assert.equal(execOrigin.ok, false, 'exec-verify inspectCompositeHostOrigin must also reject R3-H-13 origin mismatch')
+    }
+
+    // R3-C-5: Also cross-check direct terminalOracleRegistry evaluation when fixture specifies v8OracleInput
+    if (c.composite?.v8OracleInput) {
+      const factLog = HostFactLog.fromTranscript(transcript)
+      const regRes = defaultTerminalOracleRegistry.evaluate(
+        factLog,
+        {
+          kind: 'v8_family',
+          family: c.composite.v8OracleInput.family,
+          rawInput: c.composite.v8OracleInput.rawInput,
+        },
+        { signingKey: SIGNING_KEY },
+      )
+      assert.equal(
+        regRes.confirmed,
+        c.expected.confirmed,
+        `terminalOracleRegistry mismatch on ${c.id}: expected ${c.expected.confirmed}, got ${regRes.confirmed} (${regRes.reason})`,
+      )
+    }
+
+    // Assert BOTH TP and FP verdicts across ALL 6 label permutations in evaluateClaims(composite_receipt)!
+    const factLog = HostFactLog.fromTranscriptStore(store)
+    for (const perm of PERMUTATIONS) {
+      const lbl = permuteLabel(c, perm)
+      const ev = evaluateClaims(store, [claim], {
+        factLog,
+        claimedImpact: lbl.claimedImpact,
+        claimedBoundary: lbl.claimedBoundary,
+        cwe: lbl.cwe ?? null,
+        category: lbl.category ?? null,
+        title: lbl.title ?? null,
+        description: lbl.impact ?? null,
+      })
+      const wantPassed = expectedVerdictFor('verifyCompositeReceipt', c, perm)
+      assert.equal(
+        ev.passed,
+        wantPassed,
+        `composite ${c.side.toUpperCase()} ${c.id} evaluateClaims mismatch under "${perm}" (expected=${wantPassed}, failures: ${ev.failures.join('; ')})`,
+      )
+    }
+  }
+})
+
+// ============================================================================
+// 5b. Entry point 5: Direct verifyReceipt for boolean, timing, OOB, SSRF, redirect, race, auth_bypass, webhook, browser
+// ============================================================================
+
+test('path parity [verifyReceipt]: verifies all manifest receipt classes offline with host-minted oracles', () => {
+  const origin = 'http://127.0.0.1:4400'
+  const corpus = loadCorpus().filter(c => c.paths.proofReceipt && c.proofReceipt)
+  assert.ok(corpus.length >= 9, `expected >= 9 direct proofReceipt corpus cases, got ${corpus.length}`)
+
+  for (const c of corpus) {
+    const pr = c.proofReceipt!
+    const oracle = new HostMintedOracle()
+    const templateVars: Record<string, string> = {}
+    let hostRedirectCanaryHost: string | undefined
+    if (pr.mintRedirectCanary) {
+      const canary = oracle.mintRedirectCanary('canary.kovo.invalid')
+      hostRedirectCanaryHost = canary.host
+      templateVars.MINTED_REDIRECT_HOST = canary.host
+    }
+    const hostTimingChallenge = pr.timingChallenge
+      ? oracle.mintTimingChallenge(pr.timingChallenge.family, pr.timingChallenge.delayMs)
+      : undefined
+
+    const personaByHandle = new Map(c.personas.map(p => [p.handle, p]))
+    const baseTs = 1_700_000_000_000
+    let seq = 0
+    const entries: ReceiptTranscriptEntry[] = []
+    for (const ex of c.exchanges) {
+      if (ex.op === 'oob') continue
+      seq += 1
+      const p = ex.persona ? personaByHandle.get(ex.persona) : undefined
+      const pathAndQuery = substituteTemplate(ex.pathAndQuery, templateVars)
+      const responseHeaders = substituteHeaders(ex.responseHeaders, templateVars)
+      const reqHeaders: Record<string, string> = {
+        ...(p ? { [p.headerName]: p.headerValue } : {}),
+        ...substituteHeaders(ex.requestHeaders ?? {}, templateVars),
+      }
+      const body = substituteTemplate(ex.body, templateVars)
+      const json = parseJsonSafe(body)
+      const startedAt = ex.startedAtOffsetMs !== undefined ? baseTs + ex.startedAtOffsetMs : baseTs + seq * 100
+      const endedAt = ex.endedAtOffsetMs !== undefined ? baseTs + ex.endedAtOffsetMs : startedAt + (ex.durationMs ?? 12)
+      const carrierText = [
+        `${ex.method} ${pathAndQuery}`,
+        ...Object.entries(reqHeaders).map(([k, v]) => `${k}: ${v}`),
+        ex.requestJson !== undefined ? JSON.stringify(ex.requestJson) : '',
+      ].filter(Boolean).join('\n')
+      entries.push({
+        exchangeId: ex.id,
+        seq,
+        op: ex.op ?? 'http',
+        origin: ex.originOverride ?? origin,
+        startedAt,
+        endedAt,
+        durationMs: ex.durationMs ?? 12,
+        carrierText,
+        ...(ex.evidenceRole ? { evidenceRole: ex.evidenceRole } : {}),
+        ...(ex.raceBatchId ? { raceBatchId: ex.raceBatchId } : {}),
+        ...(hostTimingChallenge ? { hostTimingChallenge } : {}),
+        ...(hostRedirectCanaryHost ? { hostRedirectCanaryHost } : {}),
+        step: {
+          id: ex.id,
+          arm: ex.arm,
+          method: ex.method,
+          route: pathAndQuery.split('?')[0] ?? '/',
+          pathAndQuery,
+          status: ex.status,
+          durationMs: ex.durationMs ?? 12,
+          ...(ex.evidenceRole ? { evidenceRole: ex.evidenceRole } : {}),
+          actor: {
+            handle: p?.handle ?? null,
+            role: p?.role ?? null,
+            tenant: p?.tenant ?? null,
+            auth: p?.auth ?? 'unknown',
+            sameSite: null,
+          },
+          ...(json !== undefined ? { json } : {}),
+          body,
+          ...(ex.requestJson !== undefined ? { requestJson: ex.requestJson } : {}),
+          requestHeaders: Object.keys(reqHeaders).length > 0 ? reqHeaders : null,
+          responseHeaders,
+        },
+      })
+    }
+
+    const oobEvents: ReceiptOobEvent[] = (pr.oobEvents ?? []).map(evt => {
+      const baseEvt: ReceiptOobEvent = {
+        id: evt.id,
+        canaryId: evt.canaryId,
+        token: evt.token,
+        targetOrigin: origin,
+        delivered: evt.delivered,
+        stage: evt.stage,
+        latencyMs: evt.latencyMs,
+        receivedAtMs: baseTs + evt.receivedAtOffsetMs,
+        ...(evt.injectedAtOffsetMs !== undefined ? { injectedAtMs: baseTs + evt.injectedAtOffsetMs } : {}),
+      }
+      return { ...baseEvt, callbackSignature: signOobCallback(baseEvt, SIGNING_KEY) }
+    })
+
+    const browserTraces: ReceiptBrowserTrace[] = (pr.browserTraces ?? []).map(tr => ({
+      id: tr.id,
+      origin,
+      sinks: tr.sinks,
+    }))
+
+    const receipt = buildProofReceipt({
+      vulnClass: pr.vulnClass ?? c.canonicalLabel.vulnClass ?? 'other',
+      target: {
+        origin,
+        ...(pr.targetMethod ? { method: pr.targetMethod } : {}),
+        ...(pr.targetPathAndQuery ? { pathAndQuery: pr.targetPathAndQuery } : {}),
+        ...(pr.param ? { param: pr.param } : {}),
+      },
+      exchangeIds: entries.map(e => e.exchangeId),
+      oobEventIds: oobEvents.map(e => e.id),
+      browserTraceIds: browserTraces.map(t => t.id),
+      claimedDelta: pr.claimedDelta,
+      ...(pr.conservedBalance ? { conservedBalance: pr.conservedBalance } : {}),
+    })
+
+    const transcript: ReceiptTranscript = {
+      entries,
+      oobEvents,
+      browserTraces,
+      ...(hostTimingChallenge ? { hostTimingChallenge } : {}),
+      ...(hostRedirectCanaryHost ? { hostRedirectCanaryHost } : {}),
+      oobSigningKey: SIGNING_KEY,
+    }
+    const ver = verifyReceipt(receipt, transcript, { signingKey: SIGNING_KEY, hostMintedOracle: oracle })
+    assert.equal(
+      ver.confirmed,
+      c.expected.confirmed,
+      `verifyReceipt mismatch for ${c.id} (rule=${ver.rule}): expected ${c.expected.confirmed}, got ${ver.confirmed} (${ver.reason})`,
+    )
   }
 })
 

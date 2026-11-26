@@ -1,0 +1,81 @@
+{
+  "id": "ssrf-oob-tp",
+  "side": "tp",
+  "archetype": "ssrf-oob-callback",
+  "description": "Server-side request forgery on webhook preview endpoint verified by a unique request-side canary URL carrier and host-signed OOB callback.",
+  "canonicalLabel": {
+    "cwe": "CWE-918",
+    "category": "ssrf",
+    "title": "Server-side request forgery in webhook preview fetcher",
+    "impact": "Server initiates outbound HTTP request to arbitrary supplied callback URL.",
+    "claimedImpact": "other",
+    "claimedBoundary": "other",
+    "vulnClass": "ssrf"
+  },
+  "freeTextLabel": {
+    "title": "SSRF server-side request forgery in webhook preview fetcher"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": false,
+    "evaluateClaims": true,
+    "composite": false,
+    "floorInjectionRecipe": false,
+    "proofReceipt": true
+  },
+  "expected": {
+    "confirmed": true
+  },
+  "personas": [],
+  "exchanges": [
+    {
+      "id": "ssrf_mint",
+      "arm": "setup",
+      "role": "setup",
+      "op": "oob",
+      "oobToken": "kovo-canary-11223344556677889900aabb",
+      "oobHit": true,
+      "method": "POST",
+      "pathAndQuery": "/oob/mint",
+      "persona": null,
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"token\":\"kovo-canary-11223344556677889900aabb\"}"
+    },
+    {
+      "id": "ssrf_probe",
+      "arm": "probe",
+      "role": "probe",
+      "method": "POST",
+      "pathAndQuery": "/api/webhooks/preview",
+      "persona": null,
+      "requestJson": { "callbackUrl": "https://canary.kovo.invalid/kovo-canary-11223344556677889900aabb" },
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"fetched\":true,\"bytes\":48}"
+    }
+  ],
+  "proofReceipt": {
+    "vulnClass": "ssrf",
+    "targetMethod": "POST",
+    "targetPathAndQuery": "/api/webhooks/preview",
+    "claimedDelta": "Webhook preview endpoint initiated a server-side outbound fetch delivering the host-signed SSRF canary callback.",
+    "oobEvents": [
+      {
+        "id": "oob-evt-ssrf-1",
+        "canaryId": "can-ssrf-1",
+        "token": "kovo-canary-11223344556677889900aabb",
+        "delivered": true,
+        "stage": "immediate",
+        "latencyMs": 42,
+        "receivedAtOffsetMs": 700,
+        "injectedAtOffsetMs": 150
+      }
+    ]
+  },
+  "claims": [
+    { "kind": "oob", "exchangeId": "ssrf_mint", "expectHit": true }
+  ]
+}

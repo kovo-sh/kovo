@@ -17,8 +17,8 @@
  * never blocked before commit; pass `--strict-uncommitted` or `--staged` to enforce strictly.
  */
 import { execFileSync } from 'node:child_process'
-import { readFileSync } from 'node:fs'
-import { basename, resolve } from 'node:path'
+import { existsSync, readdirSync, readFileSync } from 'node:fs'
+import { basename, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 // Canonical KERNEL_TEST_RE imported from scripts/test-tiers.ts:
 // ^tests\/.*(?:oracle|receipt|confirm-consistency|floor-recipe|verify-kernel|dispatch-funnel|contract-canary|path-parity|taxonomy-conformance).*\.test\.ts$
@@ -46,6 +46,19 @@ export interface ParsedDiffHunk {
 export interface ParsedDiffFile {
   file: string
   hunks: ParsedDiffHunk[]
+  deleted?: boolean
+}
+
+export interface ParityGateEvalResult {
+  required: boolean
+  ok: boolean
+  warned: boolean
+  kernelFilesTouched: string[]
+  corpusFilesTouched: string[]
+  parityCaseTrailers: string[]
+  validParityCaseIds: string[]
+  invalidParityCaseIds: string[]
+  reason: string | null
 }
 
 export interface ContractChangeEvalResult {
@@ -58,6 +71,7 @@ export interface ContractChangeEvalResult {
   trailers: string[]
   missingTrailerIds: string[]
   warned: boolean
+  parity?: ParityGateEvalResult
 }
 
 export interface ContractChangeRepoResult {
@@ -80,6 +94,9 @@ export interface CheckGitRepoOptions {
 
 export const EXTENDED_CONTRACT_TEST_RE = /^tests\/(?:r2-|r3-|.*security).*\.test\.ts$/
 
+export const CONFIRMATION_KERNEL_FILE_RE =
+  /^src\/server\/(?:replay-verifier|verify-claims|proof-receipt|floor-recipe[^/]*|composite-receipt|composite-terminal|oracle-invariants|exec-verify|v8-oracle-[^/]*|verify-support)\.ts$/
+
 const SCREAMING_TUNABLE_EXPORT_RE =
   /^\s*export\s+(?:const|let)\s+((?:[A-Z][A-Z0-9_]*_(?:DEFAULT|BUDGET|MS|CAP|IN_FLIGHT|RPS|LIMIT)|(?:[A-Z][A-Z0-9_]*_)?MAX_[A-Z0-9_]+))\b[^=]*=\s*(.+)$/
 const CAMEL_TUNABLE_EXPORT_RE =
@@ -89,6 +106,53 @@ const ASSERT_CALL_RE = /\bassert\.[A-Za-z_]\w*\s*\(/
 const NUMERIC_LITERAL_RE = /(?<![A-Za-z0-9_$])(?:\d[\d_]*(?:\.[\d_]+)?|\.\d[\d_]*)(?![A-Za-z0-9_$])/g
 const CONTRACT_CHANGE_TRAILER_RE = /^\s*Contract-change:\s*(.+)$/im
 const CONTRACT_CHANGE_TRAILER_ALL_RE = /^\s*Contract-change:\s*(.+)$/gim
+const PARITY_CASE_TRAILER_ALL_RE = /^\s*Parity-case:\s*(.+)$/gim
+
+export function isConfirmationKernelFile(relPath: string): boolean {
+  const norm = relPath.replace(/\\/g, '/').replace(/^\.\//, '')
+  if (/(?:\.test|\.spec)\.[^./]+$/i.test(norm)) return false
+  return CONFIRMATION_KERNEL_FILE_RE.test(norm)
+}
+
+export function isParityCorpusFile(relPath: string): boolean {
+  const norm = relPath.replace(/\\/g, '/').replace(/^\.\//, '')
+  return norm.startsWith('tests/parity/corpus/') && norm.endsWith('.json')
+}
+
+export function loadParityCorpusIds(rootDir: string = REPO_ROOT): Set<string> {
+  const corpusDir = join(rootDir, 'tests', 'parity', 'corpus')
+  const ids = new Set<string>()
+  if (!existsSync(corpusDir)) return ids
+  let files: string[]
+  try {
+    files = readdirSync(corpusDir).filter(f => f.endsWith('.json')).sort()
+  } catch {
+    return ids
+  }
+  for (const file of files) {
+    try {
+      const parsed = JSON.parse(readFileSync(join(corpusDir, file), 'utf8')) as { id?: unknown }
+      if (typeof parsed.id === 'string' && parsed.id.trim().length > 0) {
+        ids.add(parsed.id.trim())
+      }
+    } catch {
+      // Ignore unreadable/invalid JSON here; path-parity.test.ts validates corpus schema.
+    }
+  }
+  return ids
+}
+
+export function parseParityCaseTrailers(commitMessages: string): string[] {
+  const ids: string[] = []
+  PARITY_CASE_TRAILER_ALL_RE.lastIndex = 0
+  for (const m of commitMessages.matchAll(PARITY_CASE_TRAILER_ALL_RE)) {
+    const raw = (m[1] ?? '').trim()
+    if (!raw) continue
+    const token = raw.split(/\s+/)[0]!.replace(/[,;:]+$/, '').trim()
+    if (token.length > 0) ids.push(token)
+  }
+  return ids
+}
 
 export function isGateOrKernelTestFile(relPath: string): boolean {
   const norm = relPath.replace(/\\/g, '/').replace(/^\.\//, '')
@@ -183,6 +247,7 @@ export function parseUnifiedDiff(diffText: string): ParsedDiffFile[] {
     }
     if (rawLine.startsWith('+++ /dev/null')) {
       // File deleted; keep old filename from header so deleted constants can still be observed.
+      if (currentFile) currentFile.deleted = true
       continue
     }
     if (rawLine.startsWith('@@ ')) {
@@ -384,6 +449,79 @@ function matchPerIdTrailers(
   return { ok: missingIds.length === 0, missingIds }
 }
 
+export function evaluateParityGate(opts: {
+  diffText: string
+  commitMessages: string
+  mode: 'strict' | 'warn'
+  rootDir?: string
+  knownParityCaseIds?: ReadonlySet<string>
+}): ParityGateEvalResult {
+  const parsedFiles = parseUnifiedDiff(opts.diffText)
+  const kernelFilesTouched = [...new Set(parsedFiles.map(f => f.file).filter(isConfirmationKernelFile))]
+  const corpusFilesTouched = [...new Set(parsedFiles.filter(f => !f.deleted).map(f => f.file).filter(isParityCorpusFile))]
+  const parityCaseTrailers = parseParityCaseTrailers(opts.commitMessages)
+
+  if (kernelFilesTouched.length === 0) {
+    return {
+      required: false,
+      ok: true,
+      warned: false,
+      kernelFilesTouched: [],
+      corpusFilesTouched,
+      parityCaseTrailers,
+      validParityCaseIds: [],
+      invalidParityCaseIds: [],
+      reason: null,
+    }
+  }
+
+  const knownIds = opts.knownParityCaseIds ?? loadParityCorpusIds(opts.rootDir ?? REPO_ROOT)
+  const validParityCaseIds = parityCaseTrailers.filter(id => knownIds.has(id))
+  const invalidParityCaseIds = parityCaseTrailers.filter(id => !knownIds.has(id))
+
+  if (invalidParityCaseIds.length > 0) {
+    const reason = `Unknown Parity-case ID(s): ${invalidParityCaseIds.join(', ')} (must match an existing case "id" in tests/parity/corpus/*.json).`
+    return {
+      required: true,
+      ok: opts.mode === 'warn',
+      warned: opts.mode === 'warn',
+      kernelFilesTouched,
+      corpusFilesTouched,
+      parityCaseTrailers,
+      validParityCaseIds,
+      invalidParityCaseIds,
+      reason,
+    }
+  }
+
+  if (corpusFilesTouched.length > 0 || validParityCaseIds.length > 0) {
+    return {
+      required: true,
+      ok: true,
+      warned: false,
+      kernelFilesTouched,
+      corpusFilesTouched,
+      parityCaseTrailers,
+      validParityCaseIds,
+      invalidParityCaseIds: [],
+      reason: null,
+    }
+  }
+
+  const reason = `Confirmation-kernel diff (${kernelFilesTouched.join(', ')}) must touch tests/parity/corpus/*.json OR carry "Parity-case: <id>" naming an existing corpus case ID.`
+  return {
+    required: true,
+    ok: opts.mode === 'warn',
+    warned: opts.mode === 'warn',
+    kernelFilesTouched,
+    corpusFilesTouched,
+    parityCaseTrailers,
+    validParityCaseIds,
+    invalidParityCaseIds,
+    reason,
+  }
+}
+
 export function evaluateContractChange(opts: {
   diffText: string
   commitMessages: string
@@ -397,12 +535,21 @@ export function evaluateContractChange(opts: {
    * - `'strict'`: requires explicit ID mention even on single-ID changes.
    */
   requirePerId?: boolean | 'strict'
+  rootDir?: string
+  knownParityCaseIds?: ReadonlySet<string>
 }): ContractChangeEvalResult {
   const hits = detectContractChanges(opts.diffText)
   const trailers = parseContractChangeTrailers(opts.commitMessages)
+  const parity = evaluateParityGate({
+    diffText: opts.diffText,
+    commitMessages: opts.commitMessages,
+    mode: opts.mode,
+    rootDir: opts.rootDir,
+    knownParityCaseIds: opts.knownParityCaseIds,
+  })
   if (hits.length === 0) {
     return {
-      ok: true,
+      ok: parity.ok,
       mode: opts.mode,
       sourceLabel: opts.sourceLabel,
       hits: [],
@@ -410,7 +557,8 @@ export function evaluateContractChange(opts: {
       trailerValue: null,
       trailers,
       missingTrailerIds: [],
-      warned: false,
+      warned: parity.warned,
+      parity,
     }
   }
   const firstTrailer = trailers[0] ?? null
@@ -421,7 +569,7 @@ export function evaluateContractChange(opts: {
 
   if (authorized.ok) {
     return {
-      ok: true,
+      ok: parity.ok,
       mode: opts.mode,
       sourceLabel: opts.sourceLabel,
       hits,
@@ -429,12 +577,13 @@ export function evaluateContractChange(opts: {
       trailerValue: firstTrailer,
       trailers,
       missingTrailerIds: [],
-      warned: false,
+      warned: parity.warned,
+      parity,
     }
   }
   if (opts.mode === 'warn') {
     return {
-      ok: true,
+      ok: parity.ok,
       mode: opts.mode,
       sourceLabel: opts.sourceLabel,
       hits,
@@ -443,6 +592,7 @@ export function evaluateContractChange(opts: {
       trailers,
       missingTrailerIds: authorized.missingIds,
       warned: true,
+      parity,
     }
   }
   return {
@@ -455,6 +605,7 @@ export function evaluateContractChange(opts: {
     trailers,
     missingTrailerIds: authorized.missingIds,
     warned: false,
+    parity,
   }
 }
 
@@ -541,6 +692,7 @@ export function checkGitRepo(opts: CheckGitRepoOptions = {}): ContractChangeRepo
       mode,
       sourceLabel: 'staged (--cached)',
       requirePerId: perIdMode,
+      rootDir,
     })
     return {
       ok: committed.ok,
@@ -565,6 +717,7 @@ export function checkGitRepo(opts: CheckGitRepoOptions = {}): ContractChangeRepo
       mode: 'strict',
       sourceLabel: `committed (${range})`,
       requirePerId: perIdMode,
+      rootDir,
     })
   } else {
     committed = {
@@ -587,6 +740,7 @@ export function checkGitRepo(opts: CheckGitRepoOptions = {}): ContractChangeRepo
     mode: opts.strictUncommitted ? 'strict' : 'warn',
     sourceLabel: 'working tree (uncommitted)',
     requirePerId: perIdMode,
+    rootDir,
   })
 
   return {
@@ -602,29 +756,44 @@ export function formatContractChangeReport(result: ContractChangeRepoResult): st
   const lines: string[] = []
   const sections = [result.committed, ...(result.uncommitted ? [result.uncommitted] : [])]
   for (const sec of sections) {
-    if (sec.hits.length === 0) continue
-    if (sec.ok && !sec.warned) {
-      lines.push(
-        `contract-change [${sec.sourceLabel}]: PASS (${sec.hits.length} edit(s) authorized by ${sec.trailers.length} trailer(s): Contract-change: ${sec.trailerValue})`,
-      )
-    } else if (sec.warned) {
-      lines.push(
-        `contract-change [${sec.sourceLabel}]: WARN (${sec.hits.length} uncommitted contract edit(s) — add one "Contract-change: <id> <reason>" trailer per changed ID when committing):`,
-      )
-      for (const h of sec.hits) {
-        const sym = h.symbol ? ` ${h.symbol}` : ''
-        lines.push(`  ${h.file}:${h.line} [${h.kind}]${sym}: ${h.before} -> ${h.after}`)
+    if (sec.hits.length > 0) {
+      const contractOk = sec.missingTrailerIds.length === 0
+      if (contractOk && !(sec.mode === 'warn' && !sec.trailerPresent)) {
+        lines.push(
+          `contract-change [${sec.sourceLabel}]: PASS (${sec.hits.length} edit(s) authorized by ${sec.trailers.length} trailer(s): Contract-change: ${sec.trailerValue})`,
+        )
+      } else if (sec.mode === 'warn') {
+        lines.push(
+          `contract-change [${sec.sourceLabel}]: WARN (${sec.hits.length} uncommitted contract edit(s) — add one "Contract-change: <id> <reason>" trailer per changed ID when committing):`,
+        )
+        for (const h of sec.hits) {
+          const sym = h.symbol ? ` ${h.symbol}` : ''
+          lines.push(`  ${h.file}:${h.line} [${h.kind}]${sym}: ${h.before} -> ${h.after}`)
+        }
+      } else {
+        const missingNote = sec.missingTrailerIds.length > 0
+          ? ` — missing per-ID trailers for: ${sec.missingTrailerIds.join(', ')}`
+          : ''
+        lines.push(
+          `contract-change [${sec.sourceLabel}]: FAIL (${sec.hits.length} contract edit(s) require one "Contract-change: <id> <reason>" commit trailer per changed tunable/gate ID${missingNote}):`,
+        )
+        for (const h of sec.hits) {
+          const sym = h.symbol ? ` ${h.symbol}` : ''
+          lines.push(`  ${h.file}:${h.line} [${h.kind}]${sym}: ${h.before} -> ${h.after}`)
+        }
       }
-    } else {
-      const missingNote = sec.missingTrailerIds.length > 0
-        ? ` — missing per-ID trailers for: ${sec.missingTrailerIds.join(', ')}`
-        : ''
-      lines.push(
-        `contract-change [${sec.sourceLabel}]: FAIL (${sec.hits.length} contract edit(s) require one "Contract-change: <id> <reason>" commit trailer per changed tunable/gate ID${missingNote}):`,
-      )
-      for (const h of sec.hits) {
-        const sym = h.symbol ? ` ${h.symbol}` : ''
-        lines.push(`  ${h.file}:${h.line} [${h.kind}]${sym}: ${h.before} -> ${h.after}`)
+    }
+    const p = sec.parity
+    if (p?.required) {
+      if (p.ok && !p.warned) {
+        const via = p.corpusFilesTouched.length > 0
+          ? `corpus diff (${p.corpusFilesTouched.length} file(s))`
+          : `Parity-case: ${p.validParityCaseIds.join(', ')}`
+        lines.push(`parity-gate [${sec.sourceLabel}]: PASS (${p.kernelFilesTouched.length} confirmation-kernel file(s) covered by ${via})`)
+      } else if (p.warned) {
+        lines.push(`parity-gate [${sec.sourceLabel}]: WARN (${p.reason})`)
+      } else {
+        lines.push(`parity-gate [${sec.sourceLabel}]: FAIL (${p.reason})`)
       }
     }
   }

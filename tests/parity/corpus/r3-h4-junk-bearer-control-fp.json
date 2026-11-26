@@ -1,0 +1,80 @@
+{
+  "id": "r3-h4-junk-bearer-control-fp",
+  "side": "fp",
+  "archetype": "r3-h4-junk-bearer-control",
+  "description": "R3-H-4(b) FP: member reads own object and uses a non-auth opaque value sealed as a junk Bearer capability control to elicit a 403/401.",
+  "canonicalLabel": {
+    "cwe": "CWE-639",
+    "category": "bola",
+    "title": "BOLA forged via junk-credential Bearer capability control",
+    "impact": "403 control came from sending a non-credential opaque string as Bearer rather than a genuine unentitled authenticated peer.",
+    "claimedImpact": "authorization",
+    "claimedBoundary": "access",
+    "vulnClass": "bola"
+  },
+  "freeTextLabel": {
+    "title": "Cross-tenant BOLA access using junk Bearer control"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": false,
+    "evaluateClaims": true,
+    "composite": true,
+    "floorInjectionRecipe": false
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [
+    {
+      "handle": "member_a",
+      "roleLabel": "member (org_a)",
+      "role": "member",
+      "tenant": "org_a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-r3h4b-member-a"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "ex_own",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/items/item-own-1",
+      "persona": "member_a",
+      "emittedCapabilities": ["cap:hop_0:junk_value_from_member"],
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"id\":\"item-own-1\",\"title\":\"Own private note\",\"opaqueRef\":\"ref_9f8e7d6c5b4a\"}"
+    },
+    {
+      "id": "ex_ctrl_403",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/items/item-own-1",
+      "persona": null,
+      "actorRoleLabel": "member (org_a)",
+      "consumedCapabilities": ["cap:hop_0:junk_value_from_member"],
+      "status": 403,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"error\":\"token_rejected\"}"
+    }
+  ],
+  "composite": {
+    "chainId": "PARITY-R3-H4B-JUNK-BEARER-FP",
+    "terminalVulnClass": "bola",
+    "oracleFamily": "dual_tenant_abac",
+    "singleHop": true,
+    "terminalExchangeId": "ex_own",
+    "preChainControlIds": ["ex_ctrl_403"],
+    "attackerPersonas": ["member_a"],
+    "forbiddenShortcutPersonas": ["admin"],
+    "expectedFailedStage": "terminal_impact",
+    "claimedDelta": "Junk-credential Bearer capability control must fail closed and never confirm BOLA on own object."
+  }
+}

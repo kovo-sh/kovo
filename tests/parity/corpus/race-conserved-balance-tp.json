@@ -1,0 +1,154 @@
+{
+  "id": "race-conserved-balance-tp",
+  "side": "tp",
+  "archetype": "race-conserved-balance",
+  "description": "Concurrent wallet redemption burst overlaps in time and drives conserved balance negative while serial control enforces 409 rejection after a single redemption.",
+  "canonicalLabel": {
+    "cwe": "CWE-840",
+    "category": "business-logic",
+    "title": "Race condition double-spend on wallet voucher redemption",
+    "impact": "Synchronized concurrent redemptions overdraw conserved wallet balance from 100 to -100 while serial requests reject the second attempt.",
+    "claimedImpact": "business_logic",
+    "claimedBoundary": "other",
+    "vulnClass": "race_double_spend"
+  },
+  "freeTextLabel": {
+    "title": "Concurrent race condition double-spend violating conserved wallet balance"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": false,
+    "evaluateClaims": true,
+    "composite": false,
+    "floorInjectionRecipe": false,
+    "proofReceipt": true
+  },
+  "expected": {
+    "confirmed": true
+  },
+  "personas": [
+    {
+      "handle": "member_a",
+      "roleLabel": "member (tenant-a)",
+      "role": "member",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-race-member-a-token"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "baseline_bal",
+      "arm": "control",
+      "role": "control",
+      "evidenceRole": "baseline_read",
+      "method": "GET",
+      "pathAndQuery": "/api/wallet/balance",
+      "persona": "member_a",
+      "startedAtOffsetMs": 100,
+      "endedAtOffsetMs": 115,
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"walletId\":\"w-1\",\"balance\":100}"
+    },
+    {
+      "id": "burst_1",
+      "arm": "probe",
+      "role": "probe",
+      "op": "race",
+      "evidenceRole": "burst_mutation_1",
+      "raceBatchId": "batch-parity-race-1",
+      "method": "POST",
+      "pathAndQuery": "/api/wallet/redeem",
+      "persona": "member_a",
+      "requestJson": { "amount": 100 },
+      "startedAtOffsetMs": 200,
+      "endedAtOffsetMs": 260,
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"txId\":\"tx-race-1\",\"debited\":100,\"remaining\":0}"
+    },
+    {
+      "id": "burst_2",
+      "arm": "probe",
+      "role": "probe",
+      "op": "race",
+      "evidenceRole": "burst_mutation_2",
+      "raceBatchId": "batch-parity-race-1",
+      "method": "POST",
+      "pathAndQuery": "/api/wallet/redeem",
+      "persona": "member_a",
+      "requestJson": { "amount": 100 },
+      "startedAtOffsetMs": 205,
+      "endedAtOffsetMs": 265,
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"txId\":\"tx-race-2\",\"debited\":100,\"remaining\":-100}"
+    },
+    {
+      "id": "post_bal",
+      "arm": "control",
+      "role": "control",
+      "evidenceRole": "post_burst_read",
+      "method": "GET",
+      "pathAndQuery": "/api/wallet/balance",
+      "persona": "member_a",
+      "startedAtOffsetMs": 320,
+      "endedAtOffsetMs": 335,
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"walletId\":\"w-1\",\"balance\":-100}"
+    },
+    {
+      "id": "serial_1",
+      "arm": "control",
+      "role": "control",
+      "evidenceRole": "serial_mutation_1",
+      "method": "POST",
+      "pathAndQuery": "/api/wallet/redeem",
+      "persona": "member_a",
+      "requestJson": { "amount": 100 },
+      "startedAtOffsetMs": 400,
+      "endedAtOffsetMs": 420,
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"txId\":\"tx-serial-1\",\"debited\":100,\"remaining\":0}"
+    },
+    {
+      "id": "serial_2",
+      "arm": "control",
+      "role": "control",
+      "evidenceRole": "serial_mutation_2",
+      "method": "POST",
+      "pathAndQuery": "/api/wallet/redeem",
+      "persona": "member_a",
+      "requestJson": { "amount": 100 },
+      "startedAtOffsetMs": 450,
+      "endedAtOffsetMs": 470,
+      "status": 409,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"error\":\"insufficient_funds\"}"
+    }
+  ],
+  "proofReceipt": {
+    "vulnClass": "race_double_spend",
+    "targetMethod": "POST",
+    "targetPathAndQuery": "/api/wallet/redeem",
+    "claimedDelta": "Two overlapping concurrent redemptions drove wallet balance from 100 to -100 while serial control enforced 409 rejection.",
+    "conservedBalance": {
+      "balanceField": "balance",
+      "unitDebit": 100
+    }
+  },
+  "claims": [
+    { "kind": "race", "exchangeIds": ["burst_1", "burst_2"], "expectAllSuccess": true, "minDistinctOutcomes": 2 },
+    { "kind": "impact", "impactClass": "business_logic", "probeExchangeId": "burst_2", "beforeExchangeId": "baseline_bal", "afterExchangeId": "post_bal", "controlExchangeIds": ["serial_1", "serial_2"] }
+  ]
+}

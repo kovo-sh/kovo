@@ -45,6 +45,7 @@ import type {
   CompositeProofReceipt,
   CompositeReceiptVerification,
 } from './composite-receipt.ts'
+import { resolveCompositeTerminalExchange as resolveCanonicalCompositeTerminalExchange } from './composite-terminal.ts'
 import {
   DerivedCapabilityVault,
   scrubDerivedSecrets,
@@ -634,20 +635,7 @@ export function resolveCompositeTerminalExchange(
   receipt: CompositeProofReceipt,
   exchangeById: ReadonlyMap<string, HostRecordedExchangeView>,
 ): HostRecordedExchangeView | undefined {
-  const termExId = receipt.terminalImpact?.terminalExchangeId
-  if (termExId && exchangeById.has(termExId)) return exchangeById.get(termExId)
-  const terminalHop = receipt.hops.find(h => h.hopId === receipt.terminalImpact?.terminalHopId)
-    ?? receipt.hops[receipt.hops.length - 1]
-  if (!terminalHop) return undefined
-  const hopExchanges = [...terminalHop.exchangeIds]
-    .reverse()
-    .map(id => exchangeById.get(id))
-    .filter((ex): ex is HostRecordedExchangeView => Boolean(ex))
-  return (
-    hopExchanges.find(ex => ex.sessionRole === 'probe' && typeof ex.status === 'number' && ex.status >= 200 && ex.status < 300)
-    ?? hopExchanges.find(ex => ex.sessionRole === 'probe')
-    ?? hopExchanges[0]
-  )
+  return resolveCanonicalCompositeTerminalExchange(receipt, exchangeById)
 }
 
 /**

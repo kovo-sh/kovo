@@ -1,0 +1,117 @@
+{
+  "id": "boolean-differential-tp",
+  "side": "tp",
+  "archetype": "boolean-differential",
+  "description": "Two paired control/probe rounds with identical stripped base value and arithmetic tautology vs contradiction predicates producing a stable structural JSON differential.",
+  "canonicalLabel": {
+    "cwe": "CWE-89",
+    "category": "sqli",
+    "title": "Boolean differential predicate evaluation in catalog filter",
+    "impact": "Server evaluates supplied boolean tautology vs contradiction predicates into distinct stable responses.",
+    "claimedImpact": "injection",
+    "claimedBoundary": "other",
+    "vulnClass": "boolean_differential",
+    "injectionFamily": "sqli"
+  },
+  "freeTextLabel": {
+    "title": "SQL injection boolean differential in catalog filter"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": false,
+    "evaluateClaims": true,
+    "composite": false,
+    "floorInjectionRecipe": false,
+    "proofReceipt": true
+  },
+  "expected": {
+    "confirmed": true
+  },
+  "personas": [],
+  "exchanges": [
+    {
+      "id": "base1",
+      "arm": "control",
+      "role": "control",
+      "evidenceRole": "benign_baseline",
+      "method": "GET",
+      "pathAndQuery": "/api/catalog?id=1",
+      "persona": null,
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"item\":{\"id\":1,\"sku\":\"BOOK-101\",\"title\":\"Handbook\",\"inStock\":true}}"
+    },
+    {
+      "id": "ctl1",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/catalog?id=1%20AND%201%3D1",
+      "persona": null,
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"item\":{\"id\":1,\"sku\":\"BOOK-101\",\"title\":\"Handbook\",\"inStock\":true}}"
+    },
+    {
+      "id": "prb1",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/catalog?id=1%20AND%201%3D2",
+      "persona": null,
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"item\":null,\"matches\":0}"
+    },
+    {
+      "id": "base2",
+      "arm": "control",
+      "role": "control",
+      "evidenceRole": "benign_baseline",
+      "method": "GET",
+      "pathAndQuery": "/api/catalog?id=1",
+      "persona": null,
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"item\":{\"id\":1,\"sku\":\"BOOK-101\",\"title\":\"Handbook\",\"inStock\":true}}"
+    },
+    {
+      "id": "ctl2",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/catalog?id=1%20AND%202%3D2",
+      "persona": null,
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"item\":{\"id\":1,\"sku\":\"BOOK-101\",\"title\":\"Handbook\",\"inStock\":true}}"
+    },
+    {
+      "id": "prb2",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/catalog?id=1%20AND%202%3D3",
+      "persona": null,
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"item\":null,\"matches\":0}"
+    }
+  ],
+  "proofReceipt": {
+    "vulnClass": "boolean_differential",
+    "param": "id",
+    "targetMethod": "GET",
+    "targetPathAndQuery": "/api/catalog?id=1",
+    "claimedDelta": "Paired boolean tautology and contradiction predicates on identical base value produced a stable structural JSON delta across two rounds."
+  },
+  "claims": [
+    { "kind": "structural_diff", "controlIds": ["ctl1", "ctl2"], "variantIds": ["prb1", "prb2"], "minRounds": 2, "minDeltaTokens": 1 }
+  ]
+}

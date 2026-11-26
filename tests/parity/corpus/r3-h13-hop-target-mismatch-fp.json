@@ -1,0 +1,98 @@
+{
+  "id": "r3-h13-hop-target-mismatch-fp",
+  "side": "fp",
+  "archetype": "r3-h13-hop-target-mismatch",
+  "description": "R3-H-13 / R3-H-15 FP: 2-hop composite whose declared terminal hop target origin disagrees with its cited host-signed terminal exchange origin.",
+  "canonicalLabel": {
+    "cwe": "CWE-639",
+    "category": "bola",
+    "title": "Composite receipt declaring mismatched terminal hop origin",
+    "impact": "Declared terminal hop targets an unrelated origin that disagrees with the host-signed terminal exchange.",
+    "claimedImpact": "authorization",
+    "claimedBoundary": "access",
+    "vulnClass": "bola"
+  },
+  "freeTextLabel": {
+    "title": "Multi-hop cross-tenant disclosure with mismatched hop target origin"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": false,
+    "evaluateClaims": true,
+    "composite": true,
+    "floorInjectionRecipe": false
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [
+    {
+      "handle": "member_a",
+      "roleLabel": "member (tenant-a)",
+      "role": "member",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-r3h13-member-a"
+    },
+    {
+      "handle": "viewer_a",
+      "roleLabel": "viewer (tenant-a)",
+      "role": "viewer",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-r3h13-viewer-a"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "hop1_ex",
+      "arm": "setup",
+      "role": "setup",
+      "method": "POST",
+      "pathAndQuery": "/v1/exports/request",
+      "persona": "member_a",
+      "requestJson": { "tenant": "tenant-b", "scope": "ledger" },
+      "status": 201,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"jobId\":\"job_88\",\"downloadToken\":\"tok_exp_mismatch_1234\"}"
+    },
+    {
+      "id": "hop2_ctl",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/v1/exports/download?token=invalid_tok",
+      "persona": "viewer_a",
+      "status": 403,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"error\":\"forbidden\"}"
+    },
+    {
+      "id": "hop2_prb",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/v1/exports/download?token=tok_exp_mismatch_1234",
+      "persona": "member_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"tenant_id\":\"tenant-b\",\"owner_id\":\"owner_b\",\"email\":\"payroll@tenant-b.example\",\"ledger_balance\":945000}"
+    }
+  ],
+  "composite": {
+    "chainId": "PARITY-R3-H13-TARGET-MISMATCH-FP",
+    "terminalVulnClass": "bola",
+    "oracleFamily": "dual_tenant_abac",
+    "capabilityToken": "tok_exp_mismatch_1234",
+    "hop2TargetOverride": {
+      "origin": "http://127.0.0.1:4999"
+    },
+    "expectedFailedStage": "transcript_integrity",
+    "claimedDelta": "Declared hop target origin disagreeing with host-signed terminal exchange must fail closed at transcript_integrity."
+  }
+}
