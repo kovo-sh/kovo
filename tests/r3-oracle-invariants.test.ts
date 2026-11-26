@@ -182,10 +182,11 @@ describe('R3-C-2: business_logic volatile-field exclusion, semantic double effec
     assert.equal(alreadyGone.evidence.repeatedTransition, false)
   })
 
-  test('confirms genuine repeated business-logic transitions with semantic double effect (balance decrement, coupon double-redeem, cumulative ledger, host-declared invariant)', () => {
-    // 1. Balance double-decrement alongside volatile updated_at/version churn
+  test('confirms genuine repeated business-logic transitions with semantic double effect and host-declared bound or refusal control (balance floor, coupon single-use, refusal control)', () => {
+    // 1. Balance double-decrement crossing host-declared floor (min: 0) alongside volatile updated_at/version churn
     const doubleWithdraw = assessBusinessLogicImpact({
       impactClass: 'business_logic',
+      invariantBounds: [{ field: 'balance', kind: 'floor', min: 0 }],
       steps: [
         makeStep({ id: 'r0', arm: 'control', method: 'GET', route: '/api/wallets/w-7', pathAndQuery: '/api/wallets/w-7', status: 200, json: { id: 'w-7', balance: 1000, updated_at: 'T0', version: 1 } }),
         makeStep({ id: 't1', arm: 'probe', method: 'POST', route: '/api/wallets/w-7/withdraw', pathAndQuery: '/api/wallets/w-7/withdraw', status: 200, requestJson: { amount: 600 }, json: { ok: true } }),
@@ -198,10 +199,11 @@ describe('R3-C-2: business_logic volatile-field exclusion, semantic double effec
     assert.equal(doubleWithdraw.evidence.repeatedTransition, true)
     assert.ok(doubleWithdraw.evidence.protectedFields.includes('balance'))
 
-    // 2. Coupon double-redeem with cumulative applied_coupons array growth + discount shift
+    // 2. Coupon double-redeem backed by host-recorded single-use refusal control (409)
     const couponDoubleRedeem = assessBusinessLogicImpact({
       impactClass: 'business_logic',
       steps: [
+        makeStep({ id: 'refusal', arm: 'control', method: 'POST', route: '/api/carts/cart-9/coupons', pathAndQuery: '/api/carts/cart-9/coupons', status: 409, requestJson: { code: 'USED_ONCE' }, json: { error: 'already_redeemed' } }),
         makeStep({ id: 'r0', arm: 'control', method: 'GET', route: '/api/carts/cart-9', pathAndQuery: '/api/carts/cart-9', status: 200, json: { id: 'cart-9', discount_cents: 0, applied_coupons: [] } }),
         makeStep({ id: 't1', arm: 'probe', method: 'POST', route: '/api/carts/cart-9/coupons', pathAndQuery: '/api/carts/cart-9/coupons', status: 200, requestJson: { code: 'SAVE20' }, json: { ok: true } }),
         makeStep({ id: 'r1', arm: 'control', method: 'GET', route: '/api/carts/cart-9', pathAndQuery: '/api/carts/cart-9', status: 200, json: { id: 'cart-9', discount_cents: 2000, applied_coupons: ['SAVE20'] } }),
@@ -212,10 +214,11 @@ describe('R3-C-2: business_logic volatile-field exclusion, semantic double effec
     assert.equal(couponDoubleRedeem.satisfied, true, couponDoubleRedeem.reason)
     assert.equal(couponDoubleRedeem.evidence.repeatedTransition, true)
 
-    // 3. Host-declared invariant field cumulative shift
+    // 3. Host-declared invariant field with explicit cap bound (max: 5) crossed by second transition
     const hostDeclared = assessBusinessLogicImpact({
       impactClass: 'business_logic',
       invariantFields: ['custom_tally'],
+      invariantBounds: [{ field: 'custom_tally', kind: 'cap', max: 5 }],
       steps: [
         makeStep({ id: 'r0', arm: 'control', method: 'GET', route: '/api/tasks/tsk-1', pathAndQuery: '/api/tasks/tsk-1', status: 200, json: { id: 'tsk-1', custom_tally: 0 } }),
         makeStep({ id: 't1', arm: 'probe', method: 'POST', route: '/api/tasks/tsk-1/claim', pathAndQuery: '/api/tasks/tsk-1/claim', status: 200, requestJson: {}, json: { ok: true } }),
@@ -357,14 +360,20 @@ describe('R3-C-4: boolean-differential and status-boolean base-value binding', (
   })
 
   test('confirms same-base boolean-differential and statusBoolean triangles (query, JSON, and path segment) and exposes shared binding helper', () => {
-    // 1. Query param with identical numeric base
-    const sameNum = queryTriangle('42', '42 AND 7919=7919', '42 AND 7919=7920')
+    // 1. Query param with identical numeric base (R4-C-1: false arm stays in baseline 2xx status class)
+    const sameNum = queryTriangle('42', '42 AND 7919=7919', '42 AND 7919=7920', {
+      falseStatus: 200,
+      falseJson: { id: null, items: [] },
+    })
     const numRes = assessBooleanDifferential({ param: 'id', rounds: [sameNum, sameNum] })
     assert.equal(numRes.satisfied, true, numRes.reason)
     assert.equal(numRes.evidence.baseBindingMismatch, false)
 
-    // 2. Query param with identical quoted string base
-    const sameStr = queryTriangle('widget', "widget' AND 7919=7919-- -", "widget' AND 7919=7920-- -")
+    // 2. Query param with identical quoted string base (R4-C-1: same 2xx status class)
+    const sameStr = queryTriangle('widget', "widget' AND 7919=7919-- -", "widget' AND 7919=7920-- -", {
+      falseStatus: 200,
+      falseJson: { id: null, items: [] },
+    })
     const strRes = assessBooleanDifferential({ param: 'id', rounds: [sameStr, sameStr] })
     assert.equal(strRes.satisfied, true, strRes.reason)
 
@@ -380,17 +389,17 @@ describe('R3-C-4: boolean-differential and status-boolean base-value binding', (
     assert.equal(sbRes.satisfied, true, sbRes.reason)
     assert.equal(sbRes.evidence?.statusBoolean, true)
 
-    // 4. Path-segment triangle: same base confirms, integer-coercion different base rejects
+    // 4. Path-segment triangle: same base + same 2xx status class confirms, integer-coercion different base rejects
     const pathSameRound: BooleanDifferentialRound = {
       baseline: { status: 200, method: 'GET', origin: 'https://app.example.test', persona: 'viewer_a', pathAndQuery: '/api/items/42', json: { id: 42, name: 'Widget' } },
       control: { status: 200, method: 'GET', origin: 'https://app.example.test', persona: 'viewer_a', pathAndQuery: '/api/items/42%20AND%201%3D1', json: { id: 42, name: 'Widget' } },
-      probe: { status: 404, method: 'GET', origin: 'https://app.example.test', persona: 'viewer_a', pathAndQuery: '/api/items/42%20AND%201%3D2', json: { error: 'not found' } },
+      probe: { status: 200, method: 'GET', origin: 'https://app.example.test', persona: 'viewer_a', pathAndQuery: '/api/items/42%20AND%201%3D2', json: { id: null, items: [] } },
     }
     assert.equal(assessBooleanDifferential({ param: 'id', rounds: [pathSameRound, pathSameRound] }).satisfied, true)
 
     const pathCoercionRound: BooleanDifferentialRound = {
       ...pathSameRound,
-      probe: { status: 404, method: 'GET', origin: 'https://app.example.test', persona: 'viewer_a', pathAndQuery: '/api/items/999%20AND%201%3D2', json: { error: 'not found' } },
+      probe: { status: 200, method: 'GET', origin: 'https://app.example.test', persona: 'viewer_a', pathAndQuery: '/api/items/999%20AND%201%3D2', json: { id: null, items: [] } },
     }
     assert.equal(assessBooleanDifferential({ param: 'id', rounds: [pathCoercionRound, pathCoercionRound] }).satisfied, false)
 

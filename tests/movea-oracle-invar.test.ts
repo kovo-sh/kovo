@@ -355,9 +355,10 @@ describe('R2-C-7 / C-6: business_logic invariant hardening', () => {
     assert.equal(peerDenialWithPersist.evidence.boundary, true)
     assert.equal(peerDenialWithPersist.evidence.persisted, true)
 
-    // Repeated transition on an existing resource ID with intermediate post-state readback + second delta
+    // Repeated transition on an existing resource ID with intermediate post-state readback + equal-magnitude second delta + refusal/bound control (R4-C-4)
     const doubleRedeem = assessBusinessLogicImpact({
       impactClass: 'business_logic',
+      invariantBounds: [{ field: 'refundedCents', kind: 'cap', max: 1000 }],
       steps: [
         makeStep({ id: 'r0', arm: 'control', method: 'GET', route: '/api/orders/ord-42', pathAndQuery: '/api/orders/ord-42', status: 200, actor: memberAcme, json: { id: 'ord-42', status: 'paid', refundedCents: 0 } }),
         makeStep({ id: 't1', arm: 'probe', method: 'POST', route: '/api/orders/ord-42/refund', pathAndQuery: '/api/orders/ord-42/refund', status: 200, actor: memberAcme, requestJson: { reason: 'dup' }, json: { ok: true } }),

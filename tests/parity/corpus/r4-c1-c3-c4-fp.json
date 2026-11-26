@@ -1,0 +1,82 @@
+{
+  "id": "r4-c1-c3-c4-fp",
+  "side": "fp",
+  "archetype": "r4-c3-sanitized-echo-fingerprint",
+  "description": "R4-C-3 FP: probe splits a database error label with an empty inline markup tag so a tag-stripping target reflects the contiguous label; deletion-normalized anti-reflection rejects across all confirmation entry points.",
+  "canonicalLabel": {
+    "cwe": "CWE-89",
+    "category": "sqli",
+    "title": "Sanitized tag-stripped reflection of engine error label in search",
+    "impact": "Server stripped inline markup tags and reflected the sanitized query text verbatim.",
+    "claimedImpact": "injection",
+    "claimedBoundary": "other",
+    "vulnClass": "sqli",
+    "injectionFamily": "sqli"
+  },
+  "freeTextLabel": {
+    "title": "Reflected engine error label after inline tag stripping in search response"
+  },
+  "paths": {
+    "replay": true,
+    "floorReceipt": true,
+    "evaluateClaims": true,
+    "composite": false,
+    "floorInjectionRecipe": true,
+    "proofReceipt": true
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [],
+  "exchanges": [
+    {
+      "id": "ctl",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/search?q=books",
+      "persona": null,
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"query\":\"books\",\"items\":[]}"
+    },
+    {
+      "id": "prb",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/search?q=SQLI%3Cb%3E%3C%2Fb%3ETE_ERROR%3A+near+input",
+      "persona": null,
+      "status": 400,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"error\":\"No results for: SQLITE_ERROR: near input\"}"
+    }
+  ],
+  "replaySpec": {
+    "assertionsJq": "{ controlPassed: (.steps.ctl.status == 200), confirmed: (.steps.prb.body | contains(\"SQLITE_ERROR\")), observed: .steps.prb.body, expected: \"no error\" }"
+  },
+  "injectionRecipe": {
+    "param": "q",
+    "controlValue": "books",
+    "payload": "SQLI<b></b>TE_ERROR: near input",
+    "family": "sqli"
+  },
+  "proofReceipt": {
+    "vulnClass": "sqli_error",
+    "param": "q",
+    "targetMethod": "GET",
+    "targetPathAndQuery": "/api/search?q=books",
+    "claimedDelta": "Tag-stripped reflected error label must fail closed under R4-C-3 deletion-normalized anti-reflection."
+  },
+  "claims": [
+    { "kind": "status", "exchangeId": "ctl", "expected": 200 },
+    { "kind": "status", "exchangeId": "prb", "expected": 400 },
+    { "kind": "body_contains", "exchangeId": "prb", "text": "SQLITE_ERROR" }
+  ],
+  "bareClaims": [
+    { "kind": "status", "exchangeId": "ctl", "expected": 200 },
+    { "kind": "body_contains", "exchangeId": "prb", "text": "SQLITE_ERROR" }
+  ]
+}

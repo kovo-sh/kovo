@@ -281,12 +281,42 @@ export interface ImpactStep {
   structuredSecretMatches?: readonly StructuredSecretFingerprint[]
   /** Host-recorded wall-clock duration (timing-differential evidence). */
   durationMs?: number
+  /** HostFactLog monotonic sequence number for cited-window completeness checks (`R4-C-4`). */
+  seq?: number
   /**
    * Evidence role the recipe asked this exchange to fill (`benign_baseline`, `tautology`,
    * `contradiction`, `denied_control`, ...). Optional: the shared oracles infer what they can
    * from arm/status/shape, and use the role only to pair the status-differential triangle.
    */
   evidenceRole?: string
+}
+
+/**
+ * Explicit host-declared business-logic invariant bound (`R4-C-4`).
+ * Field names alone may classify, never satisfy; a repeated transition without a host-recorded
+ * refusal/boundary control must cross an explicit host-declared bound (single-use, floor, or cap).
+ */
+export interface BusinessInvariantBound {
+  /** Exact flattened JSON path or normalized leaf name (e.g. `balance`, `applied_coupons`, `refunded_cents`). */
+  field: string
+  /** Invariant kind: `single_use` (at most one effect), `floor` (must not drop below `min`), or `cap` (must not exceed `max`). */
+  kind: 'single_use' | 'floor' | 'cap'
+  /** Lower bound (required when `kind === 'floor'`). */
+  min?: number
+  /** Upper bound (required when `kind === 'cap'`). */
+  max?: number
+}
+
+/**
+ * Host-minted boolean predicate pair binding (`R4-C-1`).
+ * When supplied by the kernel, true and false arms must match these values byte-for-byte with
+ * equal length and identical character-class / punctuation signature.
+ */
+export interface HostBooleanPairBinding {
+  challengeId?: string
+  baseValue: string
+  trueValue: string
+  falseValue: string
 }
 
 /**
@@ -300,16 +330,26 @@ export interface InjectionEvidence {
   param?: string
   /** Paired control/probe rounds (>=2) with a stable structural delta. */
   rounds?: readonly BooleanDifferentialRound[]
+  /** Optional host-minted boolean pair binding (`R4-C-1`). */
+  hostPair?: HostBooleanPairBinding | null
   /** Host-recorded control/probe durations for a jitter-tolerant timing arm. */
   timing?: { controlMs: number; probeMs: number }
   /** A verified out-of-band callback delivered after the injected marker reached the target. */
   oobDelivered?: boolean
   /**
    * The narrow status-only boolean exception: a benign 2xx baseline, a 2xx tautology arm and a
-   * failing contradiction arm that differs only by the boolean predicate. A single malformed
-   * request that turns 200 into 500 is not this shape.
+   * non-validation contradiction arm (`403`/`404`) that differs only by an equal-length,
+   * same-skeleton boolean predicate (never 400/422/5xx). Optionally carries a swapped-length
+   * second round and/or host-minted pair binding (`R4-C-1`).
    */
-  statusBoolean?: { benign: ImpactStep; tautology: ImpactStep; contradiction: ImpactStep; param?: string | null }
+  statusBoolean?: {
+    benign: ImpactStep
+    tautology: ImpactStep
+    contradiction: ImpactStep
+    param?: string | null
+    swappedRound?: { benign: ImpactStep; tautology: ImpactStep; contradiction: ImpactStep; param?: string | null } | null
+    hostPair?: HostBooleanPairBinding | null
+  }
 }
 
 export interface ImpactInput {
@@ -319,8 +359,16 @@ export interface ImpactInput {
   resourceTenant?: string | null
   expectControlDenied?: boolean
   oracleEvents?: readonly string[]
-  /** Optional host-declared business-invariant field names/paths for `stateDelta` & repeated-transition checks (`R3-C-2`). */
+  /** Optional host-declared business-invariant field names/paths for `stateDelta` classification (`R3-C-2`; classifies only, never satisfies on its own under `R4-C-4`). */
   invariantFields?: readonly string[] | null
+  /** Explicit host-declared business-logic invariant bounds (`R4-C-4`: single-use / floor / cap). */
+  invariantBounds?: readonly BusinessInvariantBound[] | null
+  /**
+   * Full HostFactLog sequence window (all host-recorded exchanges in the transcript) for
+   * cited-window completeness enforcement (`R4-C-4`). Any uncited mutating exchange targeting the
+   * same resource strictly inside the cited window rejects the claim.
+   */
+  allTranscriptSteps?: readonly ImpactStep[] | null
   catalogPrices?: readonly number[]
   targetOrigin?: string | null
   /**
@@ -1991,7 +2039,58 @@ export interface BusinessLogicAssessment extends ImpactAssessment {
     repeatedTransition: boolean
     boundary: boolean
     oracleDeclared: boolean
+    refusalControl?: boolean
+    boundCrossed?: boolean
+    citedWindowIncomplete?: boolean
+    uncitedMutatingIds?: string[]
   }
+}
+
+export interface CitedWindowCompletenessResult {
+  complete: boolean
+  uncitedMutatingIds: string[]
+}
+
+export interface RepeatedTransitionNumericDelta {
+  path: string
+  before: number
+  mid: number
+  after: number
+  delta1: number
+  delta2: number
+}
+
+export interface RepeatedTransitionArrayDelta {
+  parentPath: string
+  addedPaths: string[]
+  beforeCount: number
+  midCount: number
+  afterCount: number
+  delta1: number
+  delta2: number
+}
+
+export interface RepeatedTransitionCandidate {
+  verified: boolean
+  changedFields: string[]
+  invariantFields: string[]
+  firstStep: ImpactStep | null
+  secondStep: ImpactStep | null
+  beforeFirst: ImpactStep | null
+  midRead: ImpactStep | null
+  afterSecond: ImpactStep | null
+  numericTransitions: RepeatedTransitionNumericDelta[]
+  arrayTransitions: RepeatedTransitionArrayDelta[]
+  citedWindowIncomplete: boolean
+  uncitedMutatingIds: string[]
+}
+
+export interface RepeatedTransitionControlResult {
+  satisfied: boolean
+  kind: 'boundary' | 'refusal_control' | 'bound_crossed' | 'oracle_declared' | 'none'
+  reason: string
+  refusalControlId: string | null
+  crossedBoundField: string | null
 }
 
 function sameRequestBody(a: ImpactStep, b: ImpactStep): boolean {
@@ -2095,31 +2194,333 @@ function arrayParentPath(path: string): string | null {
   return path.slice(0, idx)
 }
 
+function stepSeqOf(step: ImpactStep, fallbackOrder?: ReadonlyMap<string, number>): number | null {
+  if (typeof step.seq === 'number' && Number.isFinite(step.seq)) return step.seq
+  if (fallbackOrder && fallbackOrder.has(step.id)) return fallbackOrder.get(step.id)!
+  return null
+}
+
+function stepResourceIds(step: ImpactStep): Set<string> {
+  const ids = new Set<string>()
+  for (const id of resourceIdsInJson(step.requestJson)) ids.add(id)
+  for (const id of resourceIdsInJson(step.json)) ids.add(id)
+  const raw = (step.pathAndQuery ?? step.route ?? '').split('?')[0] ?? ''
+  for (const seg of raw.split('/').filter(Boolean)) {
+    const trimmed = seg.trim()
+    if (trimmed && !trimmed.startsWith(':') && /\d/.test(trimmed) && trimmed.length <= 128) {
+      ids.add(trimmed)
+    }
+  }
+  return ids
+}
+
+function targetsSameResourceForWindow(candidate: ImpactStep, anchors: readonly ImpactStep[]): boolean {
+  const candIds = stepResourceIds(candidate)
+  for (const anchor of anchors) {
+    if (!relatedRoute(candidate, anchor) && !sameRoute(candidate, anchor)) continue
+    const anchorIds = stepResourceIds(anchor)
+    if (candIds.size > 0 && anchorIds.size > 0) {
+      if ([...candIds].some(id => anchorIds.has(id))) return true
+      continue
+    }
+    return true
+  }
+  return false
+}
+
 /**
- * Verify a repeated terminal transition (`R3-C-2` / `R2-C-7` / `C-6`):
+ * Enforce cited-window completeness from `HostFactLog` sequence ordering (`R4-C-4`):
+ * reject if any uncited mutating exchange targeting the same resource falls strictly inside the
+ * cited sequence window `[windowStartSeq, windowEndSeq]`.
+ */
+export function checkCitedWindowCompleteness(input: {
+  citedSteps: readonly ImpactStep[]
+  allTranscriptSteps?: readonly ImpactStep[] | null
+  windowStartSeq?: number | null
+  windowEndSeq?: number | null
+  anchorSteps?: readonly ImpactStep[]
+}): CitedWindowCompletenessResult {
+  const transcript = input.allTranscriptSteps
+  if (!transcript || transcript.length === 0) {
+    return { complete: true, uncitedMutatingIds: [] }
+  }
+  const fallbackOrder = new Map<string, number>()
+  for (let idx = 0; idx < transcript.length; idx += 1) {
+    fallbackOrder.set(transcript[idx]!.id, idx + 1)
+  }
+  const citedIds = new Set(input.citedSteps.map(step => step.id))
+  const anchors = input.anchorSteps && input.anchorSteps.length > 0 ? input.anchorSteps : input.citedSteps
+  const anchorSeqs = anchors
+    .map(step => stepSeqOf(step, fallbackOrder))
+    .filter((n): n is number => n !== null)
+  const startSeq = input.windowStartSeq ?? (anchorSeqs.length > 0 ? Math.min(...anchorSeqs) : null)
+  const endSeq = input.windowEndSeq ?? (anchorSeqs.length > 0 ? Math.max(...anchorSeqs) : null)
+  if (startSeq === null || endSeq === null || endSeq <= startSeq) {
+    return { complete: true, uncitedMutatingIds: [] }
+  }
+  const uncitedMutatingIds: string[] = []
+  for (const entry of transcript) {
+    if (citedIds.has(entry.id)) continue
+    if (!stepMutatesState(entry)) continue
+    const seq = stepSeqOf(entry, fallbackOrder)
+    if (seq === null || seq <= startSeq || seq >= endSeq) continue
+    if (!targetsSameResourceForWindow(entry, anchors)) continue
+    uncitedMutatingIds.push(entry.id)
+  }
+  return { complete: uncitedMutatingIds.length === 0, uncitedMutatingIds }
+}
+
+function arrayLengthForParent(flat: ReadonlyMap<string, string>, parentPath: string): number {
+  const indices = new Set<number>()
+  const prefix = `${parentPath}[`
+  for (const key of flat.keys()) {
+    if (!key.startsWith(prefix)) continue
+    const closeIdx = key.indexOf(']', prefix.length)
+    if (closeIdx < 0) continue
+    const idx = Number(key.slice(prefix.length, closeIdx))
+    if (Number.isInteger(idx) && idx >= 0) indices.add(idx)
+  }
+  return indices.size
+}
+
+function boundMatchesFieldPath(boundField: string, path: string): boolean {
+  const trimmed = boundField.trim()
+  if (!trimmed) return false
+  if (path === trimmed) return true
+  const normBound = normalizeFieldLeaf(trimmed)
+  const normPath = normalizeFieldLeaf(path)
+  return normBound !== '' && normBound === normPath
+}
+
+function requestJsonKeySignature(step: Pick<ImpactStep, 'requestJson'>): string | null {
+  if (step.requestJson === undefined || step.requestJson === null || typeof step.requestJson !== 'object' || Array.isArray(step.requestJson)) {
+    return null
+  }
+  return Object.keys(step.requestJson as Record<string, unknown>).sort().join(',')
+}
+
+const REFUSAL_CONTROL_STATUSES = new Set([403, 409, 422, 429])
+
+/**
+ * Shared refusal/bound control gate for repeated business-logic transitions (`R4-C-4`).
+ * Used by `assessBusinessLogicImpact` and reusable by `race_burst` floor recipes.
+ *
+ * Field names matching `BUSINESS_INVARIANT_FIELD_RE` (or bare `invariantFields` names) may
+ * classify, NEVER satisfy the proof on their own. A verified repeated double-effect satisfies
+ * ONLY when at least one of the following holds:
+ *   (a) a host-recorded boundary or refusal control (peer denial, or an authenticated
+ *       single-use / limit refusal control on the same route/method with compatible request shape);
+ *   (b) an explicit host-declared invariant with an explicit bound (`single_use`, `floor`, `cap`)
+ *       that the second transition actually crosses; or
+ *   (c) a host-declared oracle event (`oracleDeclared`).
+ */
+export function verifyRepeatedTransitionControl(input: {
+  steps: readonly ImpactStep[]
+  repeated: RepeatedTransitionCandidate
+  boundary: boolean
+  oracleDeclared: boolean
+  invariantBounds?: readonly BusinessInvariantBound[] | null
+}): RepeatedTransitionControlResult {
+  const { steps, repeated, boundary, oracleDeclared, invariantBounds } = input
+  if (!repeated.verified || !repeated.firstStep || !repeated.secondStep) {
+    return { satisfied: false, kind: 'none', reason: 'No verified repeated equal-magnitude transition with pre-first, intermediate, and post-second readbacks.', refusalControlId: null, crossedBoundField: null }
+  }
+  if (repeated.citedWindowIncomplete) {
+    return {
+      satisfied: false,
+      kind: 'none',
+      reason: `Cited repeated-transition window is incomplete: uncited mutating exchange(s) (${repeated.uncitedMutatingIds.slice(0, 6).join(', ')}) targeted the same resource inside the window.`,
+      refusalControlId: null,
+      crossedBoundField: null,
+    }
+  }
+  if (boundary) {
+    return {
+      satisfied: true,
+      kind: 'boundary',
+      reason: 'Host-recorded authorization/boundary control corroborated the repeated transition.',
+      refusalControlId: null,
+      crossedBoundField: null,
+    }
+  }
+
+  // (a) Host-recorded single-use or limit refusal control: authenticated same-tenant (when scoped)
+  // control mutation on the same/related route with matching method & request schema that returned
+  // a refusal status (403/409/422/429, or 400 on identical request body — never anonymous 401 or
+  // bogus-ID 404).
+  const first = repeated.firstStep
+  const firstTenants = actorTenants(first.actor)
+  const firstRank = roleRank(first.actor.role)
+  const firstKeys = requestJsonKeySignature(first)
+  const refusalControl = steps.find(control => {
+    if (control.arm !== 'control') return false
+    if (control === first || control === repeated.secondStep) return false
+    if (!control.actor.handle) return false
+    if (!stepMutatesState(control)) return false
+    if ((control.method ?? '').toUpperCase() !== (first.method ?? '').toUpperCase()) return false
+    if (!relatedRoute(control, first) && !sameRoute(control, first)) return false
+    if (isBogusIdSelectivity404(control, first)) return false
+    const status = control.status
+    if (status === null) return false
+    const isRefusalStatus = REFUSAL_CONTROL_STATUSES.has(status) || (status === 400 && sameRequestBody(control, first))
+    if (!isRefusalStatus) return false
+    const controlTenants = actorTenants(control.actor)
+    if (controlTenants.size > 0 || firstTenants.size > 0) {
+      if (controlTenants.size === 0 || firstTenants.size === 0 || !actorsShareTenant(control.actor, first.actor)) {
+        return false
+      }
+    }
+    const controlRank = roleRank(control.actor.role)
+    if (controlRank !== null && firstRank !== null && controlRank < firstRank) return false
+    const controlKeys = requestJsonKeySignature(control)
+    if (firstKeys !== null && controlKeys !== null && controlKeys !== firstKeys) return false
+    return true
+  }) ?? null
+
+  if (refusalControl) {
+    return {
+      satisfied: true,
+      kind: 'refusal_control',
+      reason: `Host-recorded refusal control (${refusalControl.id}, HTTP ${refusalControl.status}) demonstrated a single-use/limit boundary while the repeated transition produced an equal-magnitude double effect.`,
+      refusalControlId: refusalControl.id,
+      crossedBoundField: null,
+    }
+  }
+
+  // (b) Explicit host-declared invariant with an explicit bound (single_use / floor / cap) that
+  // the second transition actually crosses.
+  for (const bound of invariantBounds ?? []) {
+    if (!bound || !bound.field || !bound.field.trim()) continue
+    if (bound.kind === 'single_use') {
+      const hitNumeric = repeated.numericTransitions.find(t => boundMatchesFieldPath(bound.field, t.path))
+      if (hitNumeric) {
+        return {
+          satisfied: true,
+          kind: 'bound_crossed',
+          reason: `Second transition violated host-declared single-use bound on "${hitNumeric.path}" (${hitNumeric.before} -> ${hitNumeric.mid} -> ${hitNumeric.after}).`,
+          refusalControlId: null,
+          crossedBoundField: hitNumeric.path,
+        }
+      }
+      const hitArray = repeated.arrayTransitions.find(t =>
+        boundMatchesFieldPath(bound.field, t.parentPath) || t.addedPaths.some(p => boundMatchesFieldPath(bound.field, p)))
+      if (hitArray) {
+        return {
+          satisfied: true,
+          kind: 'bound_crossed',
+          reason: `Second transition violated host-declared single-use bound on "${hitArray.parentPath}" (count ${hitArray.beforeCount} -> ${hitArray.midCount} -> ${hitArray.afterCount}).`,
+          refusalControlId: null,
+          crossedBoundField: hitArray.parentPath,
+        }
+      }
+    } else if (bound.kind === 'floor' && typeof bound.min === 'number' && Number.isFinite(bound.min)) {
+      const hit = repeated.numericTransitions.find(t =>
+        boundMatchesFieldPath(bound.field, t.path) &&
+        t.delta1 < 0 &&
+        t.delta2 < 0 &&
+        t.mid >= bound.min! &&
+        t.after < bound.min!)
+      if (hit) {
+        return {
+          satisfied: true,
+          kind: 'bound_crossed',
+          reason: `Second transition crossed host-declared floor bound (${bound.min}) on "${hit.path}" (${hit.before} -> ${hit.mid} -> ${hit.after}).`,
+          refusalControlId: null,
+          crossedBoundField: hit.path,
+        }
+      }
+    } else if (bound.kind === 'cap' && typeof bound.max === 'number' && Number.isFinite(bound.max)) {
+      const hitNumeric = repeated.numericTransitions.find(t =>
+        boundMatchesFieldPath(bound.field, t.path) &&
+        t.delta1 > 0 &&
+        t.delta2 > 0 &&
+        t.mid <= bound.max! &&
+        t.after > bound.max!)
+      if (hitNumeric) {
+        return {
+          satisfied: true,
+          kind: 'bound_crossed',
+          reason: `Second transition crossed host-declared cap bound (${bound.max}) on "${hitNumeric.path}" (${hitNumeric.before} -> ${hitNumeric.mid} -> ${hitNumeric.after}).`,
+          refusalControlId: null,
+          crossedBoundField: hitNumeric.path,
+        }
+      }
+      const hitArray = repeated.arrayTransitions.find(t =>
+        (boundMatchesFieldPath(bound.field, t.parentPath) || t.addedPaths.some(p => boundMatchesFieldPath(bound.field, p))) &&
+        t.midCount <= bound.max! &&
+        t.afterCount > bound.max!)
+      if (hitArray) {
+        return {
+          satisfied: true,
+          kind: 'bound_crossed',
+          reason: `Second transition crossed host-declared cap bound (${bound.max}) on "${hitArray.parentPath}" (count ${hitArray.beforeCount} -> ${hitArray.midCount} -> ${hitArray.afterCount}).`,
+          refusalControlId: null,
+          crossedBoundField: hitArray.parentPath,
+        }
+      }
+    }
+  }
+
+  // (c) Host-declared oracle event.
+  if (oracleDeclared) {
+    return {
+      satisfied: true,
+      kind: 'oracle_declared',
+      reason: 'Host-declared invariant oracle event corroborated the verified repeated transition.',
+      refusalControlId: null,
+      crossedBoundField: null,
+    }
+  }
+
+  return {
+    satisfied: false,
+    kind: 'none',
+    reason: 'Repeated transition moved named field(s), but field names classify only and never prove an invariant violation on their own: require a host-recorded refusal/boundary control or an explicit host-declared bound (single_use/floor/cap) crossed by the second effect.',
+    refusalControlId: null,
+    crossedBoundField: null,
+  }
+}
+
+/**
+ * Verify a repeated terminal transition (`R4-C-4` / `R3-C-2` / `R2-C-7` / `C-6`):
  *  1. Two ordered successful identical mutations targeting an existing concrete resource ID
  *     (never bare duplicate collection creates);
- *  2. Deltas are computed strictly over request-written fields and business-invariant /
- *     host-declared invariant fields, excluding all volatile metadata leaves (`updated_at`,
- *     `version`, `etag`, `rev`, `timestamp`, `request_id`, etc.);
- *  3. An intermediate 2xx post-state readback strictly between the two mutations on the same
- *     read target as the post-second readback (and pre-first readback when present);
- *  4. Stale-404 rule: a 404/410/204 post-second readback NEVER counts as a second delta unless a
- *     successful 2xx read of the *same object* (object-scoped, non-array, matching target identity)
- *     sits strictly between the two mutations and observed a real first invariant delta;
- *  5. Genuine semantic double effect: cumulative numeric shift in the same direction across both
- *     mutations, cumulative array/ledger growth, or a non-idempotent multi-step invariant shift
- *     (never an idempotent overwrite or volatile metadata churn).
+ *  2. Deltas are computed strictly over request-written fields and classified invariant /
+ *     host-declared fields, excluding all volatile metadata leaves (`updated_at`, `version`, etc.);
+ *  3. Mandatory pre-first (`beforeFirst`), intermediate (`midRead`), and post-second (`afterSecond`)
+ *     readbacks on the same read target (the `no-before-read` branch is dropped under `R4-C-4`);
+ *  4. Cited-window completeness enforced against `allTranscriptSteps` (HostFactLog seq ordering):
+ *     any uncited mutating exchange on the same resource inside `[beforeFirst, afterSecond]` fails closed;
+ *  5. Equal-magnitude same-direction deltas required across both identical mutations (numeric
+ *     `delta1 === delta2` or equal-count array growth);
+ *  6. Stale-404 rule preserved for object deletion after a verified first invariant delta.
+ *
+ * NOTE: `findVerifiedRepeatedTransition` verifies the transition mechanics and classifies fields;
+ * callers MUST pass the result through `verifyRepeatedTransitionControl` so field names alone
+ * NEVER confirm business-logic impact (`R4-C-4`).
  */
 function findVerifiedRepeatedTransition(
   steps: readonly ImpactStep[],
   hostInvariantFields?: ReadonlySet<string> | null,
   oracleDeclared = false,
-): {
-  verified: boolean
-  changedFields: string[]
-  invariantFields: string[]
-} {
+  allTranscriptSteps?: readonly ImpactStep[] | null,
+): RepeatedTransitionCandidate {
+  const empty = (incomplete = false, uncited: string[] = []): RepeatedTransitionCandidate => ({
+    verified: false,
+    changedFields: [],
+    invariantFields: [],
+    firstStep: null,
+    secondStep: null,
+    beforeFirst: null,
+    midRead: null,
+    afterSecond: null,
+    numericTransitions: [],
+    arrayTransitions: [],
+    citedWindowIncomplete: incomplete,
+    uncitedMutatingIds: uncited,
+  })
+  let incompleteWindowIds: string[] = []
+
   for (let i = 0; i < steps.length; i += 1) {
     const first = steps[i]!
     if (!stepMutatesState(first) || !isSuccess(first.status)) continue
@@ -2133,12 +2534,6 @@ function findVerifiedRepeatedTransition(
       includeInvariantFields: true,
       hostInvariantFields: hostInvariantFields ?? null,
       excludeVolatile: true,
-    }
-    const matchesRequestLiteral = (path: string, value: string | undefined): boolean => {
-      if (value === undefined) return false
-      if (written.valuesByPath.get(path) === value) return true
-      const leaf = normalizeFieldLeaf(path)
-      return leaf !== '' && written.valuesByLeaf.get(leaf) === value
     }
 
     for (let j = i + 1; j < steps.length; j += 1) {
@@ -2154,7 +2549,7 @@ function findVerifiedRepeatedTransition(
         const midIds = resourceIdsInJson(midRead.json)
         if (firstBodyIds.size > 0 && midIds.size > 0 && ![...firstBodyIds].some(id => midIds.has(id))) continue
 
-        // Pre-first readback on the *same read target* as `midRead` (if present).
+        // R4-C-4: Mandatory pre-first readback on the *same read target* as `midRead` (no-before-read dropped).
         let beforeFirst: ImpactStep | null = null
         for (let k = i - 1; k >= 0; k -= 1) {
           const candidate = steps[k]!
@@ -2165,14 +2560,12 @@ function findVerifiedRepeatedTransition(
             break
           }
         }
+        if (!beforeFirst) continue
 
-        const beforeFlat = beforeFirst ? flattenJson(beforeFirst.json) : null
+        const beforeFlat = flattenJson(beforeFirst.json)
         const midFlat = flattenJson(midRead.json)
-        let d1: StateDelta | null = null
-        if (beforeFirst) {
-          d1 = stateDelta(beforeFirst.json, midRead.json, midRead.status, deltaOpts)
-          if (!d1.deleted && d1.changed.length + d1.added.length + d1.removed.length === 0) continue
-        }
+        const d1 = stateDelta(beforeFirst.json, midRead.json, midRead.status, deltaOpts)
+        if (!d1.deleted && d1.changed.length + d1.added.length + d1.removed.length === 0) continue
 
         // Post-second readback strictly after `second` on the *same read target* as `midRead`.
         for (let n = j + 1; n < steps.length; n += 1) {
@@ -2183,6 +2576,31 @@ function findVerifiedRepeatedTransition(
           if (isSuccess(afterSecond.status) && afterSecond.status !== 204 &&
               (afterSecond.json === undefined || afterSecond.json === null)) continue
 
+          // Enforce monotonic HostFactLog seq ordering when seq metadata is attached.
+          const seqBefore = stepSeqOf(beforeFirst)
+          const seqFirst = stepSeqOf(first)
+          const seqMid = stepSeqOf(midRead)
+          const seqSecond = stepSeqOf(second)
+          const seqAfter = stepSeqOf(afterSecond)
+          if (seqBefore !== null && seqFirst !== null && seqMid !== null && seqSecond !== null && seqAfter !== null) {
+            if (!(seqBefore < seqFirst && seqFirst < seqMid && seqMid < seqSecond && seqSecond < seqAfter)) {
+              continue
+            }
+          }
+
+          // R4-C-4: Cited-window completeness check against full HostFactLog transcript.
+          const completeness = checkCitedWindowCompleteness({
+            citedSteps: steps,
+            allTranscriptSteps,
+            windowStartSeq: seqBefore,
+            windowEndSeq: seqAfter,
+            anchorSteps: [beforeFirst, first, midRead, second, afterSecond],
+          })
+          if (!completeness.complete) {
+            incompleteWindowIds = [...new Set([...incompleteWindowIds, ...completeness.uncitedMutatingIds])]
+            continue
+          }
+
           const d2 = stateDelta(midRead.json, afterSecond.json, afterSecond.status, deltaOpts)
 
           // Stale-404 rule: 404/410/204 readback NEVER counts as a second delta unless `midRead`
@@ -2190,14 +2608,21 @@ function findVerifiedRepeatedTransition(
           // AND `beforeFirst -> midRead` already proved a real first invariant delta.
           if (d2.deleted) {
             const midIsSameObject = isObjectScopedRequest(midRead) && !Array.isArray(midRead.json)
-            const d1InvariantFields = d1
-              ? [...d1.changed, ...d1.added, ...d1.removed].filter(path => isBusinessInvariantField(path, hostInvariantFields))
-              : []
-            if (midIsSameObject && beforeFirst !== null && d1 !== null && (d1InvariantFields.length > 0 || oracleDeclared)) {
+            const d1InvariantFields = [...d1.changed, ...d1.added, ...d1.removed].filter(path => isBusinessInvariantField(path, hostInvariantFields))
+            if (midIsSameObject && (d1InvariantFields.length > 0 || oracleDeclared)) {
               return {
                 verified: true,
                 changedFields: d1InvariantFields,
                 invariantFields: d1InvariantFields,
+                firstStep: first,
+                secondStep: second,
+                beforeFirst,
+                midRead,
+                afterSecond,
+                numericTransitions: [],
+                arrayTransitions: [],
+                citedWindowIncomplete: false,
+                uncitedMutatingIds: [],
               }
             }
             continue
@@ -2207,58 +2632,63 @@ function findVerifiedRepeatedTransition(
           const afterFlat = flattenJson(afterSecond.json)
           const semanticChanged: string[] = []
           const semanticInvariants: string[] = []
-          const d1AddedParents = new Set<string>()
-          if (d1) {
-            for (const p of d1.added) {
-              const parent = arrayParentPath(p)
-              if (parent !== null) d1AddedParents.add(parent)
+          const numericTransitions: RepeatedTransitionNumericDelta[] = []
+          const arrayTransitions: RepeatedTransitionArrayDelta[] = []
+
+          const d1AddedCounts = new Map<string, number>()
+          for (const p of d1.added) {
+            const parent = arrayParentPath(p)
+            if (parent !== null) d1AddedCounts.set(parent, (d1AddedCounts.get(parent) ?? 0) + 1)
+          }
+          const d2AddedByParent = new Map<string, string[]>()
+          for (const p of d2.added) {
+            const parent = arrayParentPath(p)
+            if (parent !== null) {
+              const list = d2AddedByParent.get(parent) ?? []
+              list.push(p)
+              d2AddedByParent.set(parent, list)
             }
           }
 
           for (const path of d2.changed) {
+            const v0 = beforeFlat.get(path)
             const v1 = midFlat.get(path)
             const v2 = afterFlat.get(path)
             if (v1 === v2) continue
             const isInv = isBusinessInvariantField(path, hostInvariantFields)
+            const n0 = parseFiniteNumber(v0)
             const n1 = parseFiniteNumber(v1)
             const n2 = parseFiniteNumber(v2)
-            if (n1 !== null && n2 !== null && n2 !== n1) {
-              if (beforeFlat) {
-                const n0 = parseFiniteNumber(beforeFlat.get(path))
-                if (n0 !== null) {
-                  const delta1 = n1 - n0
-                  const delta2 = n2 - n1
-                  // Cumulative numeric shift in the same direction (e.g. double-refund, double-decrement).
-                  if ((delta1 > 0 && delta2 > 0) || (delta1 < 0 && delta2 < 0)) {
-                    semanticChanged.push(path)
-                    if (isInv) semanticInvariants.push(path)
-                    continue
-                  }
-                }
-              } else if (isInv && !matchesRequestLiteral(path, v2)) {
-                semanticChanged.push(path)
-                semanticInvariants.push(path)
-                continue
-              }
-            }
-            // Non-numeric multi-step invariant state shift (distinct from pre-state & not an idempotent overwrite).
-            if ((isInv || oracleDeclared) && !matchesRequestLiteral(path, v2)) {
-              const v0 = beforeFlat?.get(path)
-              if (beforeFlat ? (v0 !== undefined && v0 !== v1 && v0 !== v2) : isInv) {
+            if (n0 !== null && n1 !== null && n2 !== null && n2 !== n1) {
+              const delta1 = n1 - n0
+              const delta2 = n2 - n1
+              const sameDirection = (delta1 > 0 && delta2 > 0) || (delta1 < 0 && delta2 < 0)
+              // R4-C-4: Require equal-magnitude deltas for identical repeated transitions.
+              const equalMagnitude = Math.abs(delta1 - delta2) <= 1e-9 * Math.max(1, Math.abs(delta1))
+              if (sameDirection && equalMagnitude) {
                 semanticChanged.push(path)
                 if (isInv) semanticInvariants.push(path)
+                numericTransitions.push({ path, before: n0, mid: n1, after: n2, delta1, delta2 })
               }
             }
           }
 
-          for (const path of d2.added) {
-            const parent = arrayParentPath(path)
-            if (parent === null) continue
-            const isInv = isBusinessInvariantField(path, hostInvariantFields) ||
-              isBusinessInvariantField(parent, hostInvariantFields)
-            if (isInv && (!beforeFlat || d1AddedParents.has(parent))) {
-              semanticChanged.push(path)
-              semanticInvariants.push(path)
+          for (const [parent, addedPaths] of d2AddedByParent) {
+            const delta1 = d1AddedCounts.get(parent) ?? 0
+            const delta2 = addedPaths.length
+            // R4-C-4: Require equal-magnitude array growth across both identical transitions.
+            if (delta1 <= 0 || delta2 !== delta1) continue
+            const isInv = isBusinessInvariantField(parent, hostInvariantFields) ||
+              addedPaths.some(p => isBusinessInvariantField(p, hostInvariantFields))
+            if (isInv || oracleDeclared) {
+              const beforeCount = arrayLengthForParent(beforeFlat, parent)
+              const midCount = arrayLengthForParent(midFlat, parent)
+              const afterCount = arrayLengthForParent(afterFlat, parent)
+              for (const p of addedPaths) {
+                semanticChanged.push(p)
+                if (isInv) semanticInvariants.push(p)
+              }
+              arrayTransitions.push({ parentPath: parent, addedPaths, beforeCount, midCount, afterCount, delta1, delta2 })
             }
           }
 
@@ -2267,13 +2697,22 @@ function findVerifiedRepeatedTransition(
               verified: true,
               changedFields: [...new Set(semanticChanged)],
               invariantFields: [...new Set(semanticInvariants)],
+              firstStep: first,
+              secondStep: second,
+              beforeFirst,
+              midRead,
+              afterSecond,
+              numericTransitions,
+              arrayTransitions,
+              citedWindowIncomplete: false,
+              uncitedMutatingIds: [],
             }
           }
         }
       }
     }
   }
-  return { verified: false, changedFields: [], invariantFields: [] }
+  return empty(incompleteWindowIds.length > 0, incompleteWindowIds)
 }
 
 /**
@@ -2281,21 +2720,26 @@ function findVerifiedRepeatedTransition(
  * A self-service owner mutation of a field the caller is entitled to edit is in policy; impact
  * requires a host-recorded boundary (denied equal-or-higher peer or object-bound cross-tenant read)
  * backed by persisted attributable state change, a verified repeated terminal transition with
- * intermediate post-state readback, semantic double effect, and boundary/invariant signal, a
- * persisted *protected* field change, or a declared invariant event. `resourceBound` proves
- * attribution only, never impact (`R2-C-7`, `R3-C-2`).
+ * mandatory pre-first/intermediate/post-second readbacks, equal-magnitude deltas, complete cited
+ * window, and a refusal/boundary control or crossed host-declared bound (`R4-C-4`), a directly
+ * persisted *protected* field tamper, or a declared invariant event. Field names matching
+ * `BUSINESS_INVARIANT_FIELD_RE` classify only and NEVER satisfy the proof on their own (`R4-C-4`).
  */
 export function assessBusinessLogicImpact(input: ImpactInput): BusinessLogicAssessment {
   const steps = input.steps
   const probes = steps.filter(step => step.arm === 'probe')
   const mutatingProbe = probes.find(step => stepMutatesState(step) && isSuccess(step.status)) ?? null
-  const labels = {
+  const labels: BusinessLogicAssessment['evidence'] = {
     persisted: false,
     changedFields: [] as string[],
     protectedFields: [] as string[],
     repeatedTransition: false,
     boundary: false,
     oracleDeclared: false,
+    refusalControl: false,
+    boundCrossed: false,
+    citedWindowIncomplete: false,
+    uncitedMutatingIds: [],
   }
   if (!mutatingProbe) {
     return {
@@ -2306,8 +2750,31 @@ export function assessBusinessLogicImpact(input: ImpactInput): BusinessLogicAsse
     }
   }
 
+  // R4-C-4: Enforce cited-window completeness across the full HostFactLog transcript if supplied.
+  const overallWindow = checkCitedWindowCompleteness({
+    citedSteps: steps,
+    allTranscriptSteps: input.allTranscriptSteps,
+    anchorSteps: steps.filter(step => stepMutatesState(step) || stepReadsState(step)),
+  })
+  if (!overallWindow.complete) {
+    labels.citedWindowIncomplete = true
+    labels.uncitedMutatingIds = overallWindow.uncitedMutatingIds
+    return {
+      required: true,
+      satisfied: false,
+      reason: `Cited business-logic window is incomplete: uncited mutating exchange(s) (${overallWindow.uncitedMutatingIds.slice(0, 6).join(', ')}) targeted the same resource inside the cited sequence window.`,
+      evidence: labels,
+    }
+  }
+
   const hostInvariantFields = input.invariantFields && input.invariantFields.length > 0
     ? new Set(input.invariantFields.flatMap(field => [field, normalizeFieldLeaf(field)]).filter(Boolean))
+    : null
+  const boundFieldSet = input.invariantBounds && input.invariantBounds.length > 0
+    ? new Set(input.invariantBounds.flatMap(b => [b.field, normalizeFieldLeaf(b.field)]).filter(Boolean))
+    : null
+  const combinedHostFields = hostInvariantFields || boundFieldSet
+    ? new Set([...(hostInvariantFields ?? []), ...(boundFieldSet ?? [])])
     : null
 
   // Compute persistence and attribution up front so boundary paths never bypass state-delta proof.
@@ -2320,7 +2787,7 @@ export function assessBusinessLogicImpact(input: ImpactInput): BusinessLogicAsse
   if (delta) {
     labels.changedFields = [...delta.changed, ...delta.added, ...delta.removed]
   }
-  labels.protectedFields = labels.changedFields.filter(path => isProtectedField(path) || (hostInvariantFields ? isBusinessInvariantField(path, hostInvariantFields) : false))
+  labels.protectedFields = labels.changedFields.filter(path => isProtectedField(path))
   labels.oracleDeclared = hasOracle(input.oracleEvents, ['invariant_violation', 'workflow_skip', 'race_double_spend', 'state_delta', 'privilege_escalation'])
 
   // A creator step can establish ownership of a fresh resource id for *attribution* only (binding
@@ -2405,23 +2872,52 @@ export function assessBusinessLogicImpact(input: ImpactInput): BusinessLogicAsse
     }
   }
 
-  // Verified repeated terminal transition (`R3-C-2`): existing resource ID + intermediate same-object
-  // post-state readback + semantic double effect + boundary or invariant signal (never short-circuit
-  // with `boundary: false`, `oracleDeclared: false`, and no protected/invariant fields).
-  const repeated = findVerifiedRepeatedTransition(steps, hostInvariantFields, labels.oracleDeclared)
-  const repeatedProtected = [...new Set([...labels.protectedFields, ...repeated.invariantFields])]
-  const repeatedHasSignal = labels.boundary || labels.oracleDeclared || repeatedProtected.length > 0
-  labels.repeatedTransition = repeated.verified && repeatedHasSignal
+  // Verified repeated terminal transition (`R4-C-4`): existing resource ID + mandatory pre-first,
+  // intermediate, and post-second readbacks + equal-magnitude double effect + complete cited window
+  // + host-recorded refusal/boundary control OR crossed host-declared bound (field names alone
+  // classify only and NEVER satisfy the proof!).
+  const repeated = findVerifiedRepeatedTransition(steps, combinedHostFields, labels.oracleDeclared, input.allTranscriptSteps)
+  if (repeated.citedWindowIncomplete) {
+    labels.citedWindowIncomplete = true
+    labels.uncitedMutatingIds = repeated.uncitedMutatingIds
+    return {
+      required: true,
+      satisfied: false,
+      reason: `Repeated transition rejected: uncited mutating exchange(s) (${repeated.uncitedMutatingIds.slice(0, 6).join(', ')}) fell inside the cited sequence window.`,
+      evidence: labels,
+    }
+  }
+  const repeatedControl = verifyRepeatedTransitionControl({
+    steps,
+    repeated,
+    boundary: labels.boundary,
+    oracleDeclared: labels.oracleDeclared,
+    invariantBounds: input.invariantBounds,
+  })
+  labels.refusalControl = repeatedControl.kind === 'refusal_control'
+  labels.boundCrossed = repeatedControl.kind === 'bound_crossed'
+  labels.repeatedTransition = repeated.verified && repeatedControl.satisfied
   if (labels.repeatedTransition) {
     if (repeated.changedFields.length > 0) {
       labels.changedFields = [...new Set([...labels.changedFields, ...repeated.changedFields])]
     }
-    labels.protectedFields = repeatedProtected
+    labels.protectedFields = [...new Set([...labels.protectedFields, ...repeated.invariantFields])]
     labels.persisted = true
     return {
       required: true,
       satisfied: true,
-      reason: 'A terminal transition on an existing resource was accepted a second time after an intermediate post-state readback and produced a verified semantic double effect on an invariant/boundary.',
+      reason: `A terminal transition on an existing resource was accepted a second time with equal-magnitude double effect: ${repeatedControl.reason}`,
+      evidence: labels,
+    }
+  }
+  // R4-C-4: A repeated equal-magnitude transition on a named field WITHOUT a refusal/boundary
+  // control or crossed host-declared bound (e.g. normal add-to-cart, wallet deposit, quantity
+  // increment twice) MUST reject here and never fall through to single-step protected-field shortcuts.
+  if (repeated.verified && !repeatedControl.satisfied) {
+    return {
+      required: true,
+      satisfied: false,
+      reason: repeatedControl.reason,
       evidence: labels,
     }
   }
@@ -2459,7 +2955,7 @@ export function assessBusinessLogicImpact(input: ImpactInput): BusinessLogicAsse
     required: true,
     satisfied: false,
     reason: labels.persisted
-      ? `The mutation persisted only non-protected field(s) (${labels.changedFields.slice(0, 6).join(', ') || 'none'}) by an entitled actor in its own tenant: a self-service state change is not a business-invariant violation (no persisted peer boundary, no verified repeated terminal transition, no protected field, no declared invariant event).`
+      ? `The mutation persisted only non-protected field(s) (${labels.changedFields.slice(0, 6).join(', ') || 'none'}) by an entitled actor in its own tenant: a self-service state change is not a business-invariant violation (no persisted peer boundary, no refusal/bound-backed repeated terminal transition, no protected field, no declared invariant event).`
       : 'No before/after readback proves the asserted invariant moved; the mutation response echo is not a state delta.',
     evidence: labels,
   }
@@ -2496,6 +2992,8 @@ export interface BooleanDifferentialRound {
   baseline?: BooleanDifferentialArm
   control: BooleanDifferentialArm
   probe: BooleanDifferentialArm
+  /** Optional host-minted boolean pair binding (`R4-C-1`). */
+  hostPair?: HostBooleanPairBinding | null
 }
 
 export interface BooleanDifferentialAssessment extends ImpactAssessment {
@@ -2514,6 +3012,7 @@ export interface BooleanDifferentialAssessment extends ImpactAssessment {
     baselineStable?: boolean
     trueMatchesBaseline?: boolean
     baseBindingMismatch?: boolean
+    statusClassMismatch?: boolean
   }
 }
 
@@ -2744,24 +3243,74 @@ function injectedParamValue(arm: BooleanDifferentialArm, param: string): string 
 }
 
 export interface ParsedBooleanPredicate {
-  /** Byte-exact base value preceding the boolean predicate clause. */
+  /** Byte-exact non-empty base value preceding the boolean predicate clause. */
   baseValue: string
   /** Recorded predicate clause stripped from the parameter value. */
   predicateClause: string
+  /** Exact structural prefix from end of `baseValue` up to the first comparison operand. */
+  predicatePrefix: string
+  /** Normalized canonical structural template (`R4-C-1`, operands replaced with `<NUM>` / `<STR>` / `<BOOL>`). */
+  skeleton: string
   /** Leading breakout quote delimiter (`''`, `"'"`, or `'"'`). */
   quoteDelimiter: '' | "'" | '"'
-  /** Leading numeric operand when `baseValue === ''` (closes empty-base `1=1` vs `999=0` coercion). */
+  /** Normalized boolean combinator (`'AND' | 'OR' | '&&' | '||' | ''`). */
+  combinator: 'AND' | 'OR' | '&&' | '||' | ''
+  /** Comparison kind. */
+  comparisonKind: 'numeric' | 'string' | 'unclosed_string' | 'literal'
+  /** Exact comparison operator (`'=' | '==' | '!=' | '<>' | ''`). */
+  operator: string
+  /** Optional arithmetic operator on numeric RHS (`'+' | '-' | null`). */
+  arithmeticOp: '+' | '-' | null
+  /** Whether a leading `NOT` keyword was present. */
+  negated: boolean
+  /** Extracted operand strings. */
+  operands: readonly string[]
+  /** Raw length of the parameter value. */
+  rawLength: number
+  /** Character-class mask + sorted non-alphanumeric multiset of the comparison operands. */
+  operandCharClass: string
+  /** Character-class mask + sorted non-alphanumeric multiset of the full predicate clause. */
+  clauseCharClass: string
+  /** Leading numeric operand (retained for diagnostics; empty-base predicates are rejected under `R4-C-1`). */
   leadingOperand: string | null
   /** Evaluated boolean truth of the predicate clause. */
   truth: boolean
 }
 
+/** Shared canonical boolean predicate skeleton (`R4-C-1`, consumed by kernel & verify-support). */
+export type CanonicalPredicateSkeleton = ParsedBooleanPredicate
+
 const MAX_PREDICATE_INPUT_LEN = 4096
-const TRAILING_NUMERIC_PRED_RE = /(\bNOT\s+)?(?:\(\s*)?(\d{1,12})\s*(==|=|!=|<>)\s*(\d{1,12})(?:\s*([+-])\s*(\d{1,12}))?\s*$/i
-const TRAILING_STRING_PRED_RE = /(\bNOT\s+)?(?:\(\s*)?(['"])([^'"]{0,64})\2\s*(==|=|!=|<>)\s*(['"])([^'"]{0,64})\5\s*$/i
-const TRAILING_UNCLOSED_STRING_PRED_RE = /(\bNOT\s+)?(?:\(\s*)?(['"])([^'"]{0,64})\2\s*(==|=|!=|<>)\s*\2([^'"]{0,64})$/i
-const TRAILING_LITERAL_PRED_RE = /(\bNOT\s+)?(?:\(\s*)?(TRUE|FALSE)\s*$/i
+const TRAILING_NUMERIC_PRED_RE = /(\bNOT\s+)?(\(\s*)?(\d{1,12})(\s*)(==|=|!=|<>)(\s*)(\d{1,12})(?:(\s*)([+-])(\s*)(\d{1,12}))?\s*$/i
+const TRAILING_STRING_PRED_RE = /(\bNOT\s+)?(\(\s*)?(['"])([^'"]{0,64})\3(\s*)(==|=|!=|<>)(\s*)(['"])([^'"]{0,64})\8\s*$/i
+const TRAILING_UNCLOSED_STRING_PRED_RE = /(\bNOT\s+)?(\(\s*)?(['"])([^'"]{0,64})\3(\s*)(==|=|!=|<>)(\s*)\3([^'"]{0,64})$/i
+const TRAILING_LITERAL_PRED_RE = /(\bNOT\s+)?(\(\s*)?(TRUE|FALSE)\s*$/i
 const TRAILING_INLINE_COMMENT_RE = /\/\*[^*]{0,128}\*\/\s*$/
+
+/**
+ * Deterministic character-class signature (lowercase / uppercase / digit / non-ASCII flags plus
+ * exact sorted non-alphanumeric character multiset) so charset-validator allowlists cannot
+ * accept one boolean arm and reject the other (`R4-C-1`).
+ */
+function charClassSignature(text: string): string {
+  let hasLower = false
+  let hasUpper = false
+  let hasDigit = false
+  let hasNonAscii = false
+  const nonAlnum: string[] = []
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i)
+    if (code >= 97 && code <= 122) hasLower = true
+    else if (code >= 65 && code <= 90) hasUpper = true
+    else if (code >= 48 && code <= 57) hasDigit = true
+    else {
+      if (code > 127) hasNonAscii = true
+      nonAlnum.push(text[i]!)
+    }
+  }
+  nonAlnum.sort()
+  return `${hasLower ? 'L' : ''}${hasUpper ? 'U' : ''}${hasDigit ? 'D' : ''}${hasNonAscii ? 'N' : ''}|${nonAlnum.join('')}`
+}
 
 function stripTrailingSeparators(text: string): { rest: string; stripped: boolean } {
   let rest = text
@@ -2783,7 +3332,12 @@ function stripTrailingSeparators(text: string): { rest: string; stripped: boolea
   return { rest, stripped }
 }
 
-function parseBooleanPredicateCore(text: string, allowCompoundCheck: boolean): ParsedBooleanPredicate | null {
+function parseBooleanPredicateCore(
+  text: string,
+  allowCompoundCheck: boolean,
+  allowStandalone = false,
+  fullRaw?: string,
+): ParsedBooleanPredicate | null {
   if (!text || text.length > MAX_PREDICATE_INPUT_LEN) return null
 
   // Strip trailing `;`, whitespace, and up to 3 closing parens at the end of the expression.
@@ -2797,42 +3351,91 @@ function parseBooleanPredicateCore(text: string, allowCompoundCheck: boolean): P
   let truth: boolean | null = null
   let isLiteralOnly = false
   let leadingOperand: string | null = null
+  let negated = false
+  let comparisonKind: ParsedBooleanPredicate['comparisonKind'] = 'numeric'
+  let operator = ''
+  let arithmeticOp: '+' | '-' | null = null
+  let operands: string[] = []
+  let leadPrefix = ''
+  let comparisonSkeleton = ''
 
   const numMatch = TRAILING_NUMERIC_PRED_RE.exec(expr)
   if (numMatch) {
     matchIndex = numMatch.index
-    const negated = Boolean(numMatch[1])
-    const left = Number(numMatch[2])
-    let right = Number(numMatch[4])
-    if (numMatch[5] && numMatch[6]) right += numMatch[5] === '-' ? -Number(numMatch[6]) : Number(numMatch[6])
+    negated = Boolean(numMatch[1])
+    leadPrefix = `${numMatch[1] ?? ''}${numMatch[2] ?? ''}`
+    const leftStr = numMatch[3]!
+    const ws1 = numMatch[4] ?? ''
+    operator = numMatch[5]!
+    const ws2 = numMatch[6] ?? ''
+    const rightStr = numMatch[7]!
+    const ws3 = numMatch[8] ?? ''
+    const arith = (numMatch[9] as '+' | '-' | undefined) ?? null
+    const ws4 = numMatch[10] ?? ''
+    const deltaStr = numMatch[11]
+    const left = Number(leftStr)
+    let right = Number(rightStr)
+    if (arith && deltaStr) right += arith === '-' ? -Number(deltaStr) : Number(deltaStr)
     const equal = left === right
-    const rawTruth = numMatch[3] === '!=' || numMatch[3] === '<>' ? !equal : equal
+    const rawTruth = operator === '!=' || operator === '<>' ? !equal : equal
     truth = negated ? !rawTruth : rawTruth
-    leadingOperand = numMatch[2]!
+    leadingOperand = leftStr
+    comparisonKind = 'numeric'
+    arithmeticOp = arith
+    operands = deltaStr ? [leftStr, rightStr, deltaStr] : [leftStr, rightStr]
+    comparisonSkeleton = arith && deltaStr
+      ? `<NUM>${ws1}${operator}${ws2}<NUM>${ws3}${arith}${ws4}<NUM>`
+      : `<NUM>${ws1}${operator}${ws2}<NUM>`
   } else {
     const strMatch = TRAILING_STRING_PRED_RE.exec(expr)
     if (strMatch) {
       matchIndex = strMatch.index
-      const negated = Boolean(strMatch[1])
-      const equal = strMatch[3] === strMatch[6]
-      const rawTruth = strMatch[4] === '!=' || strMatch[4] === '<>' ? !equal : equal
+      negated = Boolean(strMatch[1])
+      leadPrefix = `${strMatch[1] ?? ''}${strMatch[2] ?? ''}`
+      const q1 = strMatch[3]!
+      const leftStr = strMatch[4]!
+      const ws1 = strMatch[5] ?? ''
+      operator = strMatch[6]!
+      const ws2 = strMatch[7] ?? ''
+      const q2 = strMatch[8]!
+      const rightStr = strMatch[9]!
+      const equal = leftStr === rightStr
+      const rawTruth = operator === '!=' || operator === '<>' ? !equal : equal
       truth = negated ? !rawTruth : rawTruth
+      comparisonKind = 'string'
+      operands = [leftStr, rightStr]
+      comparisonSkeleton = `${q1}<STR>${q1}${ws1}${operator}${ws2}${q2}<STR>${q2}`
     } else {
       const unclosedMatch = TRAILING_UNCLOSED_STRING_PRED_RE.exec(expr)
       if (unclosedMatch) {
         matchIndex = unclosedMatch.index
-        const negated = Boolean(unclosedMatch[1])
-        const equal = unclosedMatch[3] === unclosedMatch[5]
-        const rawTruth = unclosedMatch[4] === '!=' || unclosedMatch[4] === '<>' ? !equal : equal
+        negated = Boolean(unclosedMatch[1])
+        leadPrefix = `${unclosedMatch[1] ?? ''}${unclosedMatch[2] ?? ''}`
+        const q1 = unclosedMatch[3]!
+        const leftStr = unclosedMatch[4]!
+        const ws1 = unclosedMatch[5] ?? ''
+        operator = unclosedMatch[6]!
+        const ws2 = unclosedMatch[7] ?? ''
+        const rightStr = unclosedMatch[8]!
+        const equal = leftStr === rightStr
+        const rawTruth = operator === '!=' || operator === '<>' ? !equal : equal
         truth = negated ? !rawTruth : rawTruth
+        comparisonKind = 'unclosed_string'
+        operands = [leftStr, rightStr]
+        comparisonSkeleton = `${q1}<STR>${q1}${ws1}${operator}${ws2}${q1}<STR>`
       } else {
         const litMatch = TRAILING_LITERAL_PRED_RE.exec(expr)
         if (litMatch) {
           matchIndex = litMatch.index
-          const negated = Boolean(litMatch[1])
-          const rawTruth = litMatch[2]!.toLowerCase() === 'true'
+          negated = Boolean(litMatch[1])
+          leadPrefix = `${litMatch[1] ?? ''}${litMatch[2] ?? ''}`
+          const litStr = litMatch[3]!
+          const rawTruth = litStr.toLowerCase() === 'true'
           truth = negated ? !rawTruth : rawTruth
           isLiteralOnly = true
+          comparisonKind = 'literal'
+          operands = [litStr]
+          comparisonSkeleton = '<BOOL>'
         }
       }
     }
@@ -2840,14 +3443,30 @@ function parseBooleanPredicateCore(text: string, allowCompoundCheck: boolean): P
 
   if (truth === null || matchIndex < 0) return null
   const prefix = expr.slice(0, matchIndex)
+  const rawSource = fullRaw ?? text
+  const trailingSuffix = rawSource.slice(expr.length)
 
-  // Standalone predicate (empty base): allowed only for explicit comparisons (never bare TRUE/FALSE).
+  // R4-C-1: Reject empty-base standalone predicates outright in `parseBooleanPredicate` /
+  // `canonicalPredicateSkeleton` (closes negated/parenthesised empty-base coercion bypasses).
+  // `allowStandalone` is enabled strictly for pure expression truth evaluation (`booleanPredicateTruth`).
   if (prefix.trim() === '') {
-    if (isLiteralOnly || prefix.length > 0) return null
+    if (!allowStandalone || isLiteralOnly || prefix.length > 0) return null
+    const predicatePrefix = leadPrefix
     return {
       baseValue: '',
-      predicateClause: text,
+      predicateClause: rawSource,
+      predicatePrefix,
+      skeleton: `${predicatePrefix}${comparisonSkeleton}${trailingSuffix}`,
       quoteDelimiter: '',
+      combinator: '',
+      comparisonKind,
+      operator,
+      arithmeticOp,
+      negated,
+      operands,
+      rawLength: rawSource.length,
+      operandCharClass: charClassSignature(operands.join('')),
+      clauseCharClass: charClassSignature(rawSource),
       leadingOperand,
       truth,
     }
@@ -2857,7 +3476,7 @@ function parseBooleanPredicateCore(text: string, allowCompoundCheck: boolean): P
   const afterComb = stripTrailingSeparators(prefix)
   const combMatch = /(AND|OR|&&|\|\|)$/i.exec(afterComb.rest)
   if (!combMatch) return null
-  const combText = combMatch[1]!.toUpperCase()
+  const combText = combMatch[1]!.toUpperCase() as 'AND' | 'OR' | '&&' | '||'
   const isWordComb = combText === 'AND' || combText === 'OR'
   if (isWordComb && !afterComb.stripped && !expr.slice(matchIndex).startsWith('(')) return null
 
@@ -2875,45 +3494,62 @@ function parseBooleanPredicateCore(text: string, allowCompoundCheck: boolean): P
     base = base.slice(0, -1)
   }
 
+  // R4-C-1: Reject empty-base predicates outright (both standalone and empty-base attached forms).
+  if (base.length === 0) return null
+
   // A word combinator (`AND`/`OR`) with a non-empty base requires a separator, closing paren, or quote
   // breakout so words like `band` or `order` are never misparsed as a boolean clause.
-  if (isWordComb && base.length > 0 && !beforeComb.stripped && !hadParen && quoteDelimiter === '') {
+  if (isWordComb && !beforeComb.stripped && !hadParen && quoteDelimiter === '') {
     return null
   }
 
   // Reject compound/ambiguous multi-predicate clauses (e.g. `42 AND 1=1 AND 1=2`).
-  if (allowCompoundCheck && base.length > 0 && parseBooleanPredicateCore(base, false) !== null) {
+  if (allowCompoundCheck && parseBooleanPredicateCore(base, false, true) !== null) {
     return null
   }
 
+  const predicateClause = rawSource.slice(base.length)
+  const predicatePrefix = `${expr.slice(base.length, matchIndex)}${leadPrefix}`
+  const skeleton = `${predicatePrefix}${comparisonSkeleton}${trailingSuffix}`
+
   return {
     baseValue: base,
-    predicateClause: text.slice(base.length),
+    predicateClause,
+    predicatePrefix,
+    skeleton,
     quoteDelimiter,
+    combinator: combText,
+    comparisonKind,
+    operator,
+    arithmeticOp,
+    negated,
+    operands,
+    rawLength: rawSource.length,
+    operandCharClass: charClassSignature(operands.join('')),
+    clauseCharClass: charClassSignature(predicateClause),
     leadingOperand: null,
     truth,
   }
 }
 
 /**
- * Parse an explicit boolean predicate clause strictly from a single parameter value (`R3-C-4` / `C-7`).
- * Extracts the byte-exact base value before the predicate suffix and rejects bare literals
- * (`1`/`0`, `true`/`false`), compound ambiguous predicates, and trailing non-comment garbage.
+ * Parse an explicit boolean predicate clause strictly from a single parameter value (`R4-C-1` / `R3-C-4` / `C-7`).
+ * Extracts the byte-exact non-empty base value before the predicate suffix and its canonical
+ * structural skeleton; rejects empty-base / standalone predicates, bare literals (`1`/`0`,
+ * `true`/`false`), compound ambiguous predicates, and trailing non-comment garbage.
  */
 export function parseBooleanPredicate(raw: string | null): ParsedBooleanPredicate | null {
   if (raw === null || raw.length === 0 || raw.length > MAX_PREDICATE_INPUT_LEN) return null
 
   // 1. Try unstripped first so `--` or `#` inside a legitimate base value (e.g. `item--1`) stays intact.
-  const direct = parseBooleanPredicateCore(raw, true)
+  const direct = parseBooleanPredicateCore(raw, true, false, raw)
   if (direct) return direct
 
   // 2. Strip a trailing inline block comment (`/*...*/`).
   const blockComment = TRAILING_INLINE_COMMENT_RE.exec(raw)
   if (blockComment) {
-    const parsed = parseBooleanPredicateCore(raw.slice(0, blockComment.index), true)
-    if (parsed) {
-      return { ...parsed, predicateClause: raw.slice(parsed.baseValue.length) }
-    }
+    const parsed = parseBooleanPredicateCore(raw.slice(0, blockComment.index), true, false, raw)
+    if (parsed) return parsed
   }
 
   // 3. Strip trailing line comments (`--...` or `#...`), scanning rightmost markers first (bounded).
@@ -2923,14 +3559,20 @@ export function parseBooleanPredicate(raw: string | null): ParsedBooleanPredicat
       const idx = raw.lastIndexOf(marker, searchFrom - 1)
       if (idx < 0) break
       const candidate = raw.slice(0, idx)
-      const parsed = parseBooleanPredicateCore(candidate, true)
-      if (parsed) {
-        return { ...parsed, predicateClause: raw.slice(parsed.baseValue.length) }
-      }
+      const parsed = parseBooleanPredicateCore(candidate, true, false, raw)
+      if (parsed) return parsed
       searchFrom = idx
     }
   }
   return null
+}
+
+/**
+ * Shared canonical predicate skeleton parser (`R4-C-1`), used by the kernel (`verifyBooleanTriangleBinding`)
+ * and `verify-support.ts` so both layers parse boolean predicates with identical rules and can never drift.
+ */
+export function canonicalPredicateSkeleton(raw: string | null): CanonicalPredicateSkeleton | null {
+  return parseBooleanPredicate(raw)
 }
 
 /**
@@ -2940,11 +3582,11 @@ export function parseBooleanPredicate(raw: string | null): ParsedBooleanPredicat
  */
 export function booleanPredicateTruth(raw: string | null): boolean | null {
   if (raw === null) return null
-  const direct = parseBooleanPredicate(raw)
+  const direct = parseBooleanPredicate(raw) ?? parseBooleanPredicateCore(raw, true, true, raw)
   if (direct) return direct.truth
   const decoded = decodedText(raw)
   if (decoded !== raw) {
-    const parsedDecoded = parseBooleanPredicate(decoded)
+    const parsedDecoded = parseBooleanPredicate(decoded) ?? parseBooleanPredicateCore(decoded, true, true, decoded)
     if (parsedDecoded) return parsedDecoded.truth
   }
   return null
@@ -3127,24 +3769,31 @@ export interface BooleanTriangleBindingResult {
   baseValue: string | null
   /** Which arm carried the `true` predicate (`'armA'` or `'armB'`). */
   trueArm: 'armA' | 'armB' | null
-  /** Reason category for diagnostics (`shape`, `param`, `predicate`, `base_binding`, or `ok`). */
-  code: 'ok' | 'param' | 'shape' | 'predicate' | 'base_binding'
+  /** Reason category for diagnostics (`shape`, `param`, `predicate`, `base_binding`, `skeleton`, or `ok`). */
+  code: 'ok' | 'param' | 'shape' | 'predicate' | 'base_binding' | 'skeleton'
   reason: string
   /** Non-null when the bound injected parameter is a path segment rather than query/body/header. */
   pathSegmentIndex: number | null
+  /** Canonical predicate skeleton shared by the true and false arms when `ok` is true. */
+  skeleton?: string | null
+  /** Raw byte/char lengths of the true and false arm parameter values when `ok` is true. */
+  trueArmLength?: number
+  falseArmLength?: number
 }
 
 /**
- * Shared kernel-side boolean triangle base-binding verifier (`R3-C-4`):
- *  - parses boolean predicates strictly from the named injected parameter (or unique differing
- *    structured parameter when `requireNamedParam` is false; never concatenated raw requests);
+ * Shared kernel-side boolean triangle base-binding & skeleton verifier (`R4-C-1` / `R3-C-4`):
+ *  - parses boolean predicates strictly from the named injected parameter via `canonicalPredicateSkeleton`
+ *    (rejecting empty-base standalone predicates, bare literals, and compound clauses);
  *  - enforces identical request shape across baseline/true/false arms (origin, persona, authDigest,
  *    method, route, and all non-injected query/body/header values);
- *  - requires the baseline arm to carry a benign non-predicate value;
- *  - requires true and false arms to carry opposite explicit boolean predicates;
- *  - strips the predicate clause from both arms and requires the stripped base values to be
- *    byte-identical to each other AND byte-identical to the baseline arm's value (with matching
- *    breakout quote delimiters, and matching leading numeric operands when base is empty).
+ *  - requires the baseline arm to carry a non-empty benign non-predicate value;
+ *  - requires true and false arms to carry opposite explicit boolean predicates sharing:
+ *      * byte-identical non-empty `baseValue` equal to `baselineVal`,
+ *      * identical `quoteDelimiter`, `predicatePrefix`, and `skeleton`,
+ *      * equal raw length and per-operand length (defeats length-cap validators),
+ *      * identical clause & operand character-class + non-alphanumeric multiset (defeats charset validators);
+ *  - when `hostPair` is supplied, requires byte-for-byte parity with the host-minted pair.
  */
 export function verifyBooleanTriangleBinding(input: {
   baseline: BooleanDifferentialArm
@@ -3152,6 +3801,9 @@ export function verifyBooleanTriangleBinding(input: {
   armB: BooleanDifferentialArm
   param?: string | null
   requireNamedParam?: boolean
+  hostPair?: HostBooleanPairBinding | null
+  /** Only for swapped-length symmetry verification on `statusBoolean` when a verified swapped counterpart exists. */
+  allowUnequalLength?: boolean
 }): BooleanTriangleBindingResult {
   const fail = (
     code: BooleanTriangleBindingResult['code'],
@@ -3166,6 +3818,7 @@ export function verifyBooleanTriangleBinding(input: {
     code,
     reason,
     pathSegmentIndex,
+    skeleton: null,
   })
 
   const explicitParam = input.param?.trim() || ''
@@ -3213,7 +3866,17 @@ export function verifyBooleanTriangleBinding(input: {
     )
   }
 
-  if (parseBooleanPredicate(baselineVal) !== null) {
+  // R4-C-1: Reject empty baseline values outright (closes empty-base standalone/negated coercion).
+  if (baselineVal.trim() === '') {
+    return fail(
+      'base_binding',
+      `The baseline arm for "${param}" must carry a non-empty benign value; empty-base predicates are rejected.`,
+      param,
+      pathSegmentIndex,
+    )
+  }
+
+  if (canonicalPredicateSkeleton(baselineVal) !== null || parseBooleanPredicateCore(baselineVal, true, true, baselineVal) !== null) {
     return fail(
       'predicate',
       'The baseline arm must carry a benign non-predicate value, not an injected boolean expression.',
@@ -3222,12 +3885,35 @@ export function verifyBooleanTriangleBinding(input: {
     )
   }
 
-  const parsedA = parseBooleanPredicate(valA)
-  const parsedB = parseBooleanPredicate(valB)
+  // R4-C-1: Enforce byte-for-byte host-minted pair binding when supplied.
+  if (input.hostPair) {
+    const pair = input.hostPair
+    if (baselineVal !== pair.baseValue) {
+      return fail(
+        'base_binding',
+        `The baseline value for "${param}" does not match the host-minted boolean pair base value.`,
+        param,
+        pathSegmentIndex,
+      )
+    }
+    const matchesDirect = valA === pair.trueValue && valB === pair.falseValue
+    const matchesSwapped = valA === pair.falseValue && valB === pair.trueValue
+    if (!matchesDirect && !matchesSwapped) {
+      return fail(
+        'base_binding',
+        `The true and false arm values for "${param}" do not match the host-minted boolean pair byte-for-byte.`,
+        param,
+        pathSegmentIndex,
+      )
+    }
+  }
+
+  const parsedA = canonicalPredicateSkeleton(valA)
+  const parsedB = canonicalPredicateSkeleton(valB)
   if (!parsedA || !parsedB || parsedA.truth === parsedB.truth) {
     return fail(
       'predicate',
-      'The true and false variant arms must carry opposite, explicit boolean predicate expressions on the named parameter; bare literals (1/0, true/false) and arbitrary content differences are not a boolean oracle.',
+      'The true and false variant arms must carry opposite, explicit non-empty-base boolean predicate expressions on the named parameter; standalone empty-base predicates and bare literals (1/0, true/false) are rejected.',
       param,
       pathSegmentIndex,
     )
@@ -3235,6 +3921,15 @@ export function verifyBooleanTriangleBinding(input: {
 
   const trueParsed = parsedA.truth ? parsedA : parsedB
   const falseParsed = parsedA.truth ? parsedB : parsedA
+
+  if (trueParsed.baseValue === '' || falseParsed.baseValue === '') {
+    return fail(
+      'base_binding',
+      `Empty-base boolean predicates on "${param}" are rejected.`,
+      param,
+      pathSegmentIndex,
+    )
+  }
 
   if (trueParsed.baseValue !== falseParsed.baseValue) {
     return fail(
@@ -3263,16 +3958,41 @@ export function verifyBooleanTriangleBinding(input: {
     )
   }
 
-  if (trueParsed.baseValue === '' &&
-      trueParsed.leadingOperand !== null &&
-      falseParsed.leadingOperand !== null &&
-      trueParsed.leadingOperand !== falseParsed.leadingOperand) {
+  // R4-C-1: Require identical predicate prefix and canonical skeleton (combinator, negation,
+  // parens, operator, arithmetic structure, and trailing comment suffix).
+  if (trueParsed.predicatePrefix !== falseParsed.predicatePrefix || trueParsed.skeleton !== falseParsed.skeleton) {
     return fail(
-      'base_binding',
-      `Standalone numeric predicates on "${param}" must share the same leading numeric operand so integer-coercing endpoints cannot diverge.`,
+      'skeleton',
+      `The true and false arms on "${param}" do not share the same canonical predicate skeleton (validator/operator asymmetry rejected).`,
       param,
       pathSegmentIndex,
     )
+  }
+
+  // R4-C-1: Require identical character classes and non-alphanumeric symbol multisets across both
+  // the full predicate clause and the comparison operands (closes charset-validator asymmetry).
+  if (trueParsed.clauseCharClass !== falseParsed.clauseCharClass ||
+      trueParsed.operandCharClass !== falseParsed.operandCharClass) {
+    return fail(
+      'skeleton',
+      `The true and false arms on "${param}" use differing character classes or symbol multisets (charset-validator asymmetry rejected).`,
+      param,
+      pathSegmentIndex,
+    )
+  }
+
+  // R4-C-1: Require equal raw length and equal per-operand length (closes length-cap validators).
+  if (!input.allowUnequalLength) {
+    const operandLengthsMatch = trueParsed.operands.length === falseParsed.operands.length &&
+      trueParsed.operands.every((op, idx) => op.length === falseParsed.operands[idx]!.length)
+    if (trueParsed.rawLength !== falseParsed.rawLength || !operandLengthsMatch) {
+      return fail(
+        'skeleton',
+        `The true and false arms on "${param}" have unequal lengths (${trueParsed.rawLength} vs ${falseParsed.rawLength}); length-asymmetric predicate pairs are rejected.`,
+        param,
+        pathSegmentIndex,
+      )
+    }
   }
 
   return {
@@ -3283,6 +4003,9 @@ export function verifyBooleanTriangleBinding(input: {
     code: 'ok',
     reason: '',
     pathSegmentIndex,
+    skeleton: trueParsed.skeleton,
+    trueArmLength: trueParsed.rawLength,
+    falseArmLength: falseParsed.rawLength,
   }
 }
 
@@ -3360,6 +4083,7 @@ export function assessBooleanDifferential(input: {
   rounds: readonly BooleanDifferentialRound[]
   param?: string | null
   baseline?: BooleanDifferentialArm
+  hostPair?: HostBooleanPairBinding | null
 }): BooleanDifferentialAssessment {
   const param = input.param?.trim() || ''
   const evidence: BooleanDifferentialAssessment['evidence'] = {
@@ -3377,6 +4101,7 @@ export function assessBooleanDifferential(input: {
     baselineStable: false,
     trueMatchesBaseline: false,
     baseBindingMismatch: false,
+    statusClassMismatch: false,
   }
   const reject = (reason: string): BooleanDifferentialAssessment => ({
     required: true,
@@ -3404,17 +4129,26 @@ export function assessBooleanDifferential(input: {
       armB: round.probe,
       param,
       requireNamedParam: true,
+      hostPair: round.hostPair ?? input.hostPair ?? null,
     })
     if (!binding.ok) {
       if (binding.code === 'shape') evidence.requestShapeMismatch = true
       if (binding.code === 'base_binding') evidence.baseBindingMismatch = true
       return reject(binding.reason)
     }
-    triangles.push({
-      baseline,
-      trueArm: binding.trueArm === 'armA' ? round.control : round.probe,
-      falseArm: binding.trueArm === 'armA' ? round.probe : round.control,
-    })
+    const trueArm = binding.trueArm === 'armA' ? round.control : round.probe
+    const falseArm = binding.trueArm === 'armA' ? round.probe : round.control
+    // R4-C-1: Require both true and false arms to remain in the baseline HTTP status class
+    // (explicitly rejects 4xx false arms when baseline is 2xx, closing validator 400/422/404 FPs).
+    const baseClass = baseline.status === null ? null : Math.floor(baseline.status / 100)
+    const trueClass = trueArm.status === null ? null : Math.floor(trueArm.status / 100)
+    const falseClass = falseArm.status === null ? null : Math.floor(falseArm.status / 100)
+    if (baseClass === null || trueClass === null || falseClass === null ||
+        trueClass !== baseClass || falseClass !== baseClass) {
+      evidence.statusClassMismatch = true
+      return reject(`Boolean differential arms must remain in the baseline HTTP status class (${baseline.status ?? 'none'} vs true=${trueArm.status ?? 'none'} / false=${falseArm.status ?? 'none'}); 4xx validator/error divergences are rejected.`)
+    }
+    triangles.push({ baseline, trueArm, falseArm })
   }
   evidence.hasBaseline = true
   evidence.predicateContrast = true
@@ -3526,36 +4260,266 @@ function responseText(step: ImpactStep): string {
 }
 
 function decodeHtmlAndNumericEntities(input: string): string {
-  return input
-    .replace(/&#(\d{2,3});/g, (full, num) => {
-      const code = Number(num)
-      return code >= 32 && code <= 126 ? String.fromCharCode(code) : full
-    })
-    .replace(/&#x([0-9a-f]{2});/gi, (full, hex) => {
-      const code = Number.parseInt(hex, 16)
-      return code >= 32 && code <= 126 ? String.fromCharCode(code) : full
-    })
-    .replace(/&quot;/gi, '"')
-    .replace(/&apos;/gi, "'")
-    .replace(/&lt;/gi, '<')
-    .replace(/&gt;/gi, '>')
-    .replace(/&amp;/gi, '&')
+  let out = input
+  for (let pass = 0; pass < 2; pass += 1) {
+    const next = out
+      .replace(/&#0*(\d{1,7});/g, (full, num) => {
+        const code = Number(num)
+        if (!Number.isInteger(code) || code < 1 || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) return full
+        try { return String.fromCodePoint(code) } catch { return full }
+      })
+      .replace(/&#x0*([0-9a-f]{1,6});/gi, (full, hex) => {
+        const code = Number.parseInt(hex, 16)
+        if (!Number.isInteger(code) || code < 1 || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) return full
+        try { return String.fromCodePoint(code) } catch { return full }
+      })
+      .replace(/&nbsp;/gi, ' ')
+      .replace(/&quot;/gi, '"')
+      .replace(/&apos;/gi, "'")
+      .replace(/&lt;/gi, '<')
+      .replace(/&gt;/gi, '>')
+      .replace(/&amp;/gi, '&')
+    if (next === out) break
+    out = next
+  }
+  return out
+}
+
+function isHexDigitCode(code: number): boolean {
+  return (code >= 48 && code <= 57) || (code >= 65 && code <= 70) || (code >= 97 && code <= 102)
 }
 
 /**
- * Canonicalize text before echo comparison (`H-16` / `R2-H-10`): decodes HTML/numeric entities,
- * percent-encoding, and common backslash escapes, collapses whitespace, and lowercases.
+ * Linear per-escape URL percent decoder (`R4-C-3` / `R4-C-2`):
+ *  - decodes every valid `%XX` run even when another malformed escape (`%ZZ`, truncated `%2`)
+ *    appears elsewhere in the same string (never falls back to undecoded raw text on `URIError`),
+ *  - records `hadMalformedEscape: true` so callers can fail closed on malformed percent-escapes,
+ *  - runs up to 2 passes to catch double-encoded carriers (`%2553...`).
  */
-function normalizeEchoComparable(value: string): string {
-  let out = decodeHtmlAndNumericEntities(value)
-  out = decodedText(out)
-  out = out
+function decodePercentComponentSafe(raw: string): { decoded: string; hadMalformedEscape: boolean } {
+  const bounded = raw.slice(0, 64 * 1024)
+  let current = bounded
+  let hadMalformedEscape = false
+
+  for (let pass = 0; pass < 2; pass += 1) {
+    if (!current.includes('%')) break
+    let out = ''
+    let changed = false
+    let i = 0
+    while (i < current.length) {
+      if (current[i] !== '%') {
+        out += current[i]!
+        i += 1
+        continue
+      }
+      if (i + 2 >= current.length ||
+          !isHexDigitCode(current.charCodeAt(i + 1)) ||
+          !isHexDigitCode(current.charCodeAt(i + 2))) {
+        hadMalformedEscape = true
+        out += '%'
+        i += 1
+        continue
+      }
+      // Gather contiguous `%XX` run so multi-byte UTF-8 sequences decode intact.
+      let runEnd = i
+      while (runEnd + 2 < current.length &&
+          current[runEnd] === '%' &&
+          isHexDigitCode(current.charCodeAt(runEnd + 1)) &&
+          isHexDigitCode(current.charCodeAt(runEnd + 2))) {
+        runEnd += 3
+      }
+      const run = current.slice(i, runEnd)
+      try {
+        const dec = decodeURIComponent(run)
+        out += dec
+        if (dec !== run) changed = true
+      } catch {
+        hadMalformedEscape = true
+        // Decode valid single-byte ASCII escapes individually so adjacent valid bytes never hide.
+        for (let k = i; k < runEnd; k += 3) {
+          const byte = Number.parseInt(current.slice(k + 1, k + 3), 16)
+          if (byte >= 0x09 && byte <= 0x7e) {
+            out += String.fromCharCode(byte)
+            changed = true
+          } else {
+            out += current.slice(k, k + 3)
+          }
+        }
+      }
+      i = runEnd
+    }
+    current = out
+    if (!changed) break
+  }
+
+  return { decoded: current, hadMalformedEscape }
+}
+
+function decodeJsonUnicodeAndBackslashEscapes(input: string): string {
+  return input
+    .replace(/\\u\{([0-9a-f]{1,6})\}/gi, (full, hex) => {
+      const code = Number.parseInt(hex, 16)
+      if (!Number.isInteger(code) || code < 1 || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) return full
+      try { return String.fromCodePoint(code) } catch { return full }
+    })
+    .replace(/\\u([0-9a-f]{4})/gi, (_full, hex) => String.fromCharCode(Number.parseInt(hex, 16)))
     .replace(/\\(["'\\/])/g, '$1')
     .replace(/\\[nrt]/g, ' ')
+}
+
+/** Strip zero-width, invisible Unicode format (`\p{Cf}`), soft-hyphen, bidi, and control chars (`R4-C-3`). */
+function stripZeroWidthAndInvisible(input: string): string {
+  return input
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\u00AD\u034F\u061C\u115F\u1160\u17B4\u17B5\u180E\u200B-\u200F\u202A-\u202E\u2060-\u206F\u3164\uFE00-\uFE0F\uFEFF\uFFA0]/g, '')
+    .replace(/\p{Cf}/gu, '')
+}
+
+/** Strip HTML comments and markup tags (`<...>`) in strictly linear O(n) time (`R4-C-3`). */
+function stripMarkupTagsLinear(input: string): string {
+  let current = input
+  for (let pass = 0; pass < 3; pass += 1) {
+    const withoutComments = stripHtmlComments(current)
+    let out = ''
+    let i = 0
+    while (i < withoutComments.length) {
+      const ch = withoutComments[i]!
+      if (ch === '<') {
+        const next = withoutComments[i + 1] ?? ''
+        const isTagStart = (next >= 'a' && next <= 'z') || (next >= 'A' && next <= 'Z') ||
+          next === '/' || next === '!' || next === '?'
+        if (isTagStart) {
+          let closeIdx = -1
+          const limit = Math.min(withoutComments.length, i + 512)
+          for (let j = i + 1; j < limit; j += 1) {
+            if (withoutComments[j] === '>') {
+              closeIdx = j
+              break
+            }
+            if (withoutComments[j] === '<') break
+          }
+          if (closeIdx > i) {
+            i = closeIdx + 1
+            continue
+          }
+        }
+      }
+      out += ch
+      i += 1
+    }
+    if (out === current) break
+    current = out
+  }
+  return current
+}
+
+export interface NormalizedCarrier {
+  /** Deletion-normalized comparable text (percent/JSON/HTML decoded, NFKC-folded, zero-width & tags stripped, whitespace-collapsed, lowercased). */
+  comparable: string
+  /** Alphanumeric core (lowercase letters + digits only after full deletion normalization). */
+  alnumCore: string
+  /** True when a malformed percent-escape was encountered in the carrier (callers may fail closed). */
+  hadMalformedPercentEscape: boolean
+}
+
+/**
+ * Shared fail-closed deletion-normalized carrier normalizer (`R4-C-3`, reusable by `R4-C-2` / `R4-C-6`):
+ *  1. Per-escape URL percent decode (flags malformed escapes rather than failing open to raw text);
+ *  2. JSON `\uXXXX` and backslash escape decode;
+ *  3. HTML named & numeric (decimal/hex) entity decode;
+ *  4. Unicode NFKC folding;
+ *  5. Zero-width, invisible format (`\p{Cf}`), bidi, and control character deletion;
+ *  6. Linear-time HTML comment and markup tag deletion;
+ *  7. Lowercase comparable text AND stripped alphanumeric core token (`alnumCore`).
+ */
+export function normalizeCarrierForAntiReflection(
+  value: string,
+  options?: { decodePercent?: boolean },
+): NormalizedCarrier {
+  const bounded = value.slice(0, 64 * 1024)
+  const pct = options?.decodePercent === false
+    ? { decoded: bounded, hadMalformedEscape: false }
+    : decodePercentComponentSafe(bounded)
+  const unescaped = decodeJsonUnicodeAndBackslashEscapes(pct.decoded)
+  const entitiesDecoded = decodeHtmlAndNumericEntities(unescaped)
+  const folded = entitiesDecoded.normalize('NFKC')
+  const noInvisible = stripZeroWidthAndInvisible(folded)
+  const noTags = stripMarkupTagsLinear(noInvisible)
+  const comparable = noTags.replace(/\s+/g, ' ').trim().toLowerCase()
+  const alnumCore = comparable.replace(/[^a-z0-9]/g, '')
+  return {
+    comparable,
+    alnumCore,
+    hadMalformedPercentEscape: pct.hadMalformedEscape,
+  }
+}
+
+/** Convenience deletion-normalized alphanumeric core token helper (`R4-C-3`). */
+export function deletionNormalizeComparable(value: string): string {
+  return normalizeCarrierForAntiReflection(value).alnumCore
+}
+
+/**
+ * Canonicalize text before echo comparison (`R4-C-3` / `H-16` / `R2-H-10`):
+ * decodes percent escapes safely, JSON unicode/backslash escapes, HTML/numeric entities,
+ * applies NFKC folding, strips zero-width/invisible characters, collapses whitespace, and lowercases.
+ * (Preserves tag word boundaries on the response plane so HTML error pages remain matchable.)
+ */
+function normalizeEchoComparable(value: string): string {
+  const pct = decodePercentComponentSafe(value)
+  const unescaped = decodeJsonUnicodeAndBackslashEscapes(pct.decoded)
+  const entitiesDecoded = decodeHtmlAndNumericEntities(unescaped)
+  const folded = entitiesDecoded.normalize('NFKC')
+  const noInvisible = stripZeroWidthAndInvisible(folded)
+  return noInvisible
     .replace(/\s+/g, ' ')
     .trim()
     .toLowerCase()
-  return out
+}
+
+/**
+ * True when any URL path/query component or form-urlencoded request body carries a malformed
+ * percent-escape (`R4-C-3` / `R4-C-2`: fail closed instead of falling back to undecoded raw text).
+ */
+function hasMalformedUrlPercentEscape(step: ImpactStep): boolean {
+  if (step.pathAndQuery) {
+    const qIdx = step.pathAndQuery.indexOf('?')
+    const rawPath = qIdx >= 0 ? step.pathAndQuery.slice(0, qIdx) : step.pathAndQuery
+    for (const seg of rawPath.split('/').filter(Boolean)) {
+      if (decodePercentComponentSafe(seg).hadMalformedEscape) return true
+    }
+    if (qIdx >= 0) {
+      const rawQuery = step.pathAndQuery.slice(qIdx + 1)
+      for (const pair of rawQuery.split('&')) {
+        if (!pair) continue
+        const eq = pair.indexOf('=')
+        if (eq >= 0) {
+          if (decodePercentComponentSafe(pair.slice(0, eq)).hadMalformedEscape) return true
+          if (decodePercentComponentSafe(pair.slice(eq + 1)).hadMalformedEscape) return true
+        } else if (decodePercentComponentSafe(pair).hadMalformedEscape) {
+          return true
+        }
+      }
+    }
+  }
+  const rawBody = typeof step.requestBody === 'string'
+    ? step.requestBody
+    : typeof step.requestJson === 'string'
+      ? step.requestJson
+      : null
+  if (rawBody) {
+    const trimmed = rawBody.trim().slice(0, 32 * 1024)
+    if (trimmed && !trimmed.startsWith('<') && !trimmed.startsWith('--') && !trimmed.startsWith('{') && !trimmed.startsWith('[') && trimmed.includes('=')) {
+      for (const pair of trimmed.split('&')) {
+        if (!pair) continue
+        const eq = pair.indexOf('=')
+        if (eq >= 0) {
+          if (decodePercentComponentSafe(pair.slice(0, eq)).hadMalformedEscape) return true
+          if (decodePercentComponentSafe(pair.slice(eq + 1)).hadMalformedEscape) return true
+        }
+      }
+    }
+  }
+  return false
 }
 
 function tokenizeNonJsonRequestBody(rawBody: string, add: (val: string | null | undefined) => void): void {
@@ -3597,7 +4561,7 @@ function tokenizeNonJsonRequestBody(rawBody: string, add: (val: string | null | 
     }
   }
 
-  // Form-urlencoded (`k=v&k2=v2`): extract values via URLSearchParams and raw `&`/`=` split.
+  // Form-urlencoded (`k=v&k2=v2`): decode per component via safe percent decoder + URLSearchParams.
   if (trimmed.includes('=')) {
     try {
       const sp = new URLSearchParams(trimmed)
@@ -3606,21 +4570,28 @@ function tokenizeNonJsonRequestBody(rawBody: string, add: (val: string | null | 
         add(v)
       }
     } catch { /* ignore */ }
+    const formValues: string[] = []
     for (const pair of trimmed.split('&')) {
       const eq = pair.indexOf('=')
       if (eq >= 0) {
+        const rawKey = pair.slice(0, eq)
         const rawVal = pair.slice(eq + 1)
+        const decVal = decodePercentComponentSafe(rawVal.replace(/\+/g, ' ')).decoded
+        add(decodePercentComponentSafe(rawKey.replace(/\+/g, ' ')).decoded)
         add(rawVal)
         add(rawVal.replace(/\+/g, ' '))
-        add(decodedText(rawVal.replace(/\+/g, ' ')))
+        add(decVal)
+        if (decVal) formValues.push(decVal)
       }
     }
+    if (formValues.length > 1) add(formValues.join(''))
   }
 }
 
 /**
- * Request values across ALL carriers (path segments, query params, JSON leaves, form-urlencoded,
- * XML, multipart, headers, and cookie sub-values) that an error page might echo back (`H-16`).
+ * Request values across ALL carriers (path segments, per-component query params, JSON leaves,
+ * form-urlencoded, XML, multipart, headers, and cookie sub-values) that an error page might echo
+ * back (`R4-C-3` / `H-16`).
  */
 function requestEchoTokens(step: ImpactStep): string[] {
   const tokens = new Set<string>()
@@ -3629,30 +4600,59 @@ function requestEchoTokens(step: ImpactStep): string[] {
     const trimmed = value.trim()
     if (trimmed.length < 4) return
     tokens.add(trimmed)
-    const dec = decodedText(trimmed)
+    const dec = decodePercentComponentSafe(trimmed).decoded
     if (dec.length >= 4) tokens.add(dec)
   }
   if (step.pathAndQuery) {
     add(step.pathAndQuery)
+    const qIdx = step.pathAndQuery.indexOf('?')
+    const rawPath = qIdx >= 0 ? step.pathAndQuery.slice(0, qIdx) : step.pathAndQuery
+    for (const seg of rawPath.split('/').filter(Boolean)) {
+      add(seg)
+      add(seg.replace(/\+/g, ' '))
+    }
+    if (qIdx >= 0) {
+      const rawQuery = step.pathAndQuery.slice(qIdx + 1)
+      const queryValues: string[] = []
+      for (const pair of rawQuery.split('&')) {
+        if (!pair) continue
+        const eq = pair.indexOf('=')
+        if (eq >= 0) {
+          const rawKey = pair.slice(0, eq)
+          const rawVal = pair.slice(eq + 1)
+          const decVal = decodePercentComponentSafe(rawVal.replace(/\+/g, ' ')).decoded
+          add(decodePercentComponentSafe(rawKey.replace(/\+/g, ' ')).decoded)
+          add(rawVal)
+          add(rawVal.replace(/\+/g, ' '))
+          add(decVal)
+          if (decVal) queryValues.push(decVal)
+        } else {
+          const dec = decodePercentComponentSafe(pair.replace(/\+/g, ' ')).decoded
+          add(pair)
+          add(dec)
+          if (dec) queryValues.push(dec)
+        }
+      }
+      if (queryValues.length > 1) add(queryValues.join(''))
+    }
     try {
       const url = new URL(step.pathAndQuery, 'http://kovo.invalid')
-      for (const seg of url.pathname.split('/').filter(Boolean)) {
-        add(seg)
-        add(seg.replace(/\+/g, ' '))
-      }
       for (const [key, value] of url.searchParams.entries()) {
         add(key)
         add(value)
       }
-    } catch {
-      for (const seg of step.pathAndQuery.split('?')[0]!.split('/').filter(Boolean)) add(seg)
-    }
+    } catch { /* per-component extraction above already handled raw path & query */ }
   }
   if (step.requestJson !== undefined) {
     if (typeof step.requestJson === 'string') {
       tokenizeNonJsonRequestBody(step.requestJson, add)
     } else {
-      for (const value of flattenJson(step.requestJson).values()) add(value)
+      const jsonValues: string[] = []
+      for (const value of flattenJson(step.requestJson).values()) {
+        add(value)
+        if (value) jsonValues.push(value)
+      }
+      if (jsonValues.length > 1) add(jsonValues.join(''))
     }
   }
   if (typeof step.requestBody === 'string' && step.requestBody.length > 0) {
@@ -3677,9 +4677,10 @@ function requestEchoTokens(step: ImpactStep): string[] {
 }
 
 /**
- * Remove echoed probe material before looking for engine/parser errors (`H-16` / `R2-H-10`).
- * Normalizes case, whitespace, HTML/numeric entities, and backslash escapes before stripping so
- * transformed reflections cannot masquerade as server-side engine errors.
+ * Remove echoed probe material before looking for engine/parser errors (`R4-C-3` / `H-16` / `R2-H-10`).
+ * Routes request carriers through the deletion-normalized anti-reflection primitive so tag stripping,
+ * zero-width deletion, NFKC folding, entity/JSON/percent decoding, and case/whitespace changes
+ * cannot reconstruct a server-side engine fingerprint from split request tokens.
  */
 export function stripRequestEchoes(step: ImpactStep): string {
   let text = responseText(step)
@@ -3690,14 +4691,21 @@ export function stripRequestEchoes(step: ImpactStep): string {
       .replaceAll('"', '&quot;').replaceAll("'", '&#39;')
     const escapedHtml039 = token.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
       .replaceAll('"', '&quot;').replaceAll("'", '&#039;')
-    for (const variant of new Set([token, decodedText(token), encodeURIComponent(token), escapedJson, escapedHtml, escapedHtml039])) {
+    const safeDecoded = decodePercentComponentSafe(token).decoded
+    for (const variant of new Set([token, safeDecoded, encodeURIComponent(token), escapedJson, escapedHtml, escapedHtml039])) {
       if (variant.length >= 4) text = text.split(variant).join(' ')
     }
   }
-  // Normalized pass: strip case/entity/escape/whitespace-transformed echoes.
+  // Deletion-normalized pass: strip case/entity/escape/NFKC/zero-width/tag-stripped echoes.
   let normalized = normalizeEchoComparable(text)
-  const normalizedTokens = [...new Set(rawTokens.map(normalizeEchoComparable).filter(t => t.length >= 4))]
-    .sort((a, b) => b.length - a.length)
+  const normalizedTokenSet = new Set<string>()
+  for (const rawTok of rawTokens) {
+    const basic = normalizeEchoComparable(rawTok)
+    if (basic.length >= 4) normalizedTokenSet.add(basic)
+    const deleted = normalizeCarrierForAntiReflection(rawTok).comparable
+    if (deleted.length >= 4) normalizedTokenSet.add(deleted)
+  }
+  const normalizedTokens = [...normalizedTokenSet].sort((a, b) => b.length - a.length)
   for (const normToken of normalizedTokens) {
     if (normalized.includes(normToken)) {
       normalized = normalized.split(normToken).join(' ')
@@ -3791,11 +4799,20 @@ export function matchStrippedInjectionFingerprint(
   family?: InjectionFamilyScope | null,
 ): InjectionFingerprintMatch | null {
   if (family === 'ambiguous') return null
+  // R4-C-3 / R4-C-2: Fail closed when any URL/form request carrier contains a malformed percent-escape.
+  if (hasMalformedUrlPercentEscape(step)) return null
   const stripped = stripRequestEchoes(step)
   if (!stripped) return null
-  const normalizedRequestTokens = requestEchoTokens(step)
-    .map(normalizeEchoComparable)
-    .filter(token => token.length >= 4)
+  const rawTokens = requestEchoTokens(step)
+  const normalizedRequestTokens: string[] = []
+  const requestAlnumCores: string[] = []
+  for (const rawTok of rawTokens) {
+    const basic = normalizeEchoComparable(rawTok)
+    if (basic.length >= 4) normalizedRequestTokens.push(basic)
+    const carrier = normalizeCarrierForAntiReflection(rawTok)
+    if (carrier.comparable.length >= 4) normalizedRequestTokens.push(carrier.comparable)
+    if (carrier.alnumCore.length >= 4) requestAlnumCores.push(carrier.alnumCore)
+  }
 
   const bounded = stripped.slice(0, 32 * 1024)
   for (const entry of INJECTION_FINGERPRINTS) {
@@ -3809,9 +4826,15 @@ export function matchStrippedInjectionFingerprint(
       const absIndex = offset + match.index
       offset = absIndex + Math.max(1, matchedText.length)
       const normMatch = normalizeEchoComparable(matchedText)
-      // Containment rule: if the matched fingerprint text already appeared anywhere inside a
-      // normalized request token, treat it as an echoed/truncated reflection, never an engine error.
+      const coreMatch = deletionNormalizeComparable(matchedText)
+      // R4-C-3 Containment rule: if the matched fingerprint text OR its deletion-normalized
+      // alphanumeric core can be reconstructed from any request carrier (after URL/JSON/entity
+      // decode, NFKC fold, zero-width deletion, and markup-tag stripping), treat it as a
+      // sanitized/echoed reflection, NEVER an engine error.
       if (normMatch.length >= 4 && normalizedRequestTokens.some(tok => tok.includes(normMatch))) {
+        continue
+      }
+      if (coreMatch.length >= 4 && requestAlnumCores.some(core => core.includes(coreMatch))) {
         continue
       }
       if (entry.family === 'xxe') {
@@ -4046,6 +5069,7 @@ export function assessInjectionImpact(input: ImpactInput): ImpactAssessment {
     const assessment = assessBooleanDifferential({
       rounds: input.injection.rounds,
       param: input.injection.param ?? null,
+      hostPair: input.injection.hostPair ?? null,
     })
     if (assessment.satisfied) {
       evidence.booleanRounds = input.injection.rounds.length
@@ -4078,28 +5102,59 @@ export function assessInjectionImpact(input: ImpactInput): ImpactAssessment {
   }
   const statusBoolean = input.injection?.statusBoolean
   if (booleanFamilyAllowed && statusBoolean) {
-    const { benign, tautology, contradiction } = statusBoolean
+    const { benign, tautology, contradiction, swappedRound, hostPair } = statusBoolean
     const benignOk = isSuccess(benign.status)
     const tautologyOk = isSuccess(tautology.status)
-    const contradictionFails = contradiction.status !== null &&
-      contradiction.status >= 400 && contradiction.status < 500
+    // R4-C-1: Reject validation/auth/rate-limit 4xx responses (400/401/405/413/414/422/429);
+    // only resource-lookup/access contradiction statuses (403/404) are permitted for statusBoolean.
+    const contradictionFails = contradiction.status === 403 || contradiction.status === 404
     const sameRoute = sameInjectionRoute(benign, tautology) && sameInjectionRoute(benign, contradiction)
-    // R3-C-4: Apply the exact same named-parameter, request-shape, and base-binding rules as
-    // `assessBooleanDifferential` (never parse boolean predicates from concatenated raw requests).
+    const allowUnequalWithSwapped = Boolean(swappedRound)
+    // R4-C-1 / R3-C-4: Apply the exact same canonical-skeleton, equal-length, charset, and
+    // non-empty base-binding rules as `assessBooleanDifferential` (and host-minted pair parity when supplied).
     const binding = verifyBooleanTriangleBinding({
       baseline: impactStepToBooleanArm(benign),
       armA: impactStepToBooleanArm(tautology),
       armB: impactStepToBooleanArm(contradiction),
       param: statusBoolean.param ?? input.injection?.param ?? null,
       requireNamedParam: false,
+      hostPair: hostPair ?? input.injection?.hostPair ?? null,
+      allowUnequalLength: allowUnequalWithSwapped,
     })
-    const contrast = binding.ok && binding.trueArm === 'armA'
+    let swappedOk = true
+    if (swappedRound && binding.ok) {
+      const sBenignOk = isSuccess(swappedRound.benign.status)
+      const sTautologyOk = isSuccess(swappedRound.tautology.status)
+      const sContradictionMatches = swappedRound.contradiction.status === contradiction.status
+      const sSameRoute = sameInjectionRoute(benign, swappedRound.benign) &&
+        sameInjectionRoute(swappedRound.benign, swappedRound.tautology) &&
+        sameInjectionRoute(swappedRound.benign, swappedRound.contradiction)
+      const sBinding = verifyBooleanTriangleBinding({
+        baseline: impactStepToBooleanArm(swappedRound.benign),
+        armA: impactStepToBooleanArm(swappedRound.tautology),
+        armB: impactStepToBooleanArm(swappedRound.contradiction),
+        param: swappedRound.param ?? statusBoolean.param ?? input.injection?.param ?? null,
+        requireNamedParam: false,
+        allowUnequalLength: true,
+      })
+      const pTrueLen = binding.trueArmLength ?? 0
+      const pFalseLen = binding.falseArmLength ?? 0
+      const sTrueLen = sBinding.trueArmLength ?? 0
+      const sFalseLen = sBinding.falseArmLength ?? 0
+      const lengthsSymmetric = (pTrueLen === pFalseLen && sTrueLen === sFalseLen) ||
+        (pTrueLen < pFalseLen && sTrueLen > sFalseLen) ||
+        (pTrueLen > pFalseLen && sTrueLen < sFalseLen)
+      swappedOk = sBenignOk && sTautologyOk && sContradictionMatches && sSameRoute &&
+        sBinding.ok && sBinding.trueArm === 'armA' && sBinding.baseValue === binding.baseValue &&
+        lengthsSymmetric
+    }
+    const contrast = binding.ok && binding.trueArm === 'armA' && swappedOk
     if (benignOk && tautologyOk && contradictionFails && sameRoute && contrast) {
       evidence.statusBoolean = true
       return {
         required: true,
         satisfied: true,
-        reason: `Status-only boolean exception: the benign baseline (${benign.status}) and tautology arm (${tautology.status}) are 2xx while the contradiction arm fails (${contradiction.status}) on the same request shape and base value for "${binding.param}"; this is a paired predicate contrast, not a single malformed request.`,
+        reason: `Status-only boolean exception: the benign baseline (${benign.status}) and tautology arm (${tautology.status}) are 2xx while the contradiction arm fails (${contradiction.status}) on the same request shape, canonical predicate skeleton, charset, and base value for "${binding.param}"; this is a paired predicate contrast, not a validator or malformed request.`,
         evidence,
       }
     }
