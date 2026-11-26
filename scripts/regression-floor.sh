@@ -106,7 +106,7 @@ if (( ${#SUITES[@]} > 0 )); then
       fi
 
       if (( WRITE_BASELINE == 1 )); then
-        node --input-type=module - "$BASELINE_PATH" "$suite" "$out_json" <<'EOF'
+        if node --input-type=module - "$BASELINE_PATH" "$suite" "$out_json" <<'EOF'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 
@@ -116,12 +116,24 @@ const baseline = existsSync(baselinePath)
   ? JSON.parse(readFileSync(baselinePath, 'utf8'))
   : { schemaVersion: 1, suites: {} }
 baseline.suites = baseline.suites || {}
+const rawGitSha = typeof actual.gitSha === 'string' ? actual.gitSha.trim() : ''
 const confirmedIds = Array.isArray(actual.perTarget)
   ? actual.perTarget.filter(t => t && t.outcome === 'confirmed').map(t => String(t.id)).sort()
   : []
+const writeReasons = []
+if (!rawGitSha || rawGitSha.toLowerCase() === 'null' || rawGitSha.toLowerCase() === 'unknown') {
+  writeReasons.push(`missing or null gitSha (got ${JSON.stringify(actual.gitSha ?? null)})`)
+}
+if (confirmedIds.length === 0) {
+  writeReasons.push('empty confirmedIds (refusing to write a vacuous baseline)')
+}
+if (writeReasons.length > 0) {
+  console.error(`FAIL [${suite}] refusing to write vacuous baseline ${baselinePath}: ${writeReasons.join('; ')}`)
+  process.exit(1)
+}
 baseline.updatedAt = new Date().toISOString()
 baseline.suites[suite] = {
-  gitSha: actual.gitSha || null,
+  gitSha: rawGitSha,
   targetsTotal: Number(actual.targetsTotal ?? 0),
   confirmedCount: Number(actual.confirmedCount ?? 0),
   falsePositiveCount: Number(actual.falsePositiveCount ?? 0),
@@ -131,6 +143,9 @@ mkdirSync(dirname(baselinePath), { recursive: true })
 writeFileSync(baselinePath, `${JSON.stringify(baseline, null, 2)}\n`, 'utf8')
 console.log(`Updated baseline ${baselinePath} [${suite}]: confirmed=${baseline.suites[suite].confirmedCount}/${baseline.suites[suite].targetsTotal}, fp=${baseline.suites[suite].falsePositiveCount}`)
 EOF
+        then :; else
+          fail=1
+        fi
       else
         if node --input-type=module - "$BASELINE_PATH" "$suite" "$out_json" <<'EOF'
 import { readFileSync } from 'node:fs'
@@ -156,6 +171,7 @@ if (baselinePath.endsWith('.jsonl')) {
           .sort()
       : []
     expected = {
+      gitSha: latest.gitSha ?? null,
       confirmedCount: Number(latest.confirmed ?? 0),
       falsePositiveCount: Number(latest.decoyFalsePositives ?? 0) + Number(latest.unmatchedFalsePositives ?? 0),
       confirmedIds,
@@ -171,6 +187,24 @@ if (!expected || typeof expected !== 'object') {
   process.exit(1)
 }
 
+const baselineReasons = []
+const rawGitSha = typeof expected.gitSha === 'string' ? expected.gitSha.trim() : ''
+if (!rawGitSha || rawGitSha.toLowerCase() === 'null' || rawGitSha.toLowerCase() === 'unknown') {
+  baselineReasons.push(`missing or null gitSha (got ${JSON.stringify(expected.gitSha ?? null)})`)
+}
+const expectedIds = Array.isArray(expected.confirmedIds)
+  ? expected.confirmedIds.map(id => String(id).trim()).filter(Boolean)
+  : []
+if (expectedIds.length === 0) {
+  baselineReasons.push('empty confirmedIds (vacuous lost-TP baseline is forbidden)')
+}
+if (baselineReasons.length > 0) {
+  console.error(
+    `FAIL [${suite}] refusing vacuous/unprovenanced baseline ${baselinePath}: ${baselineReasons.join('; ')} — regenerate via --write-baseline from a real run`,
+  )
+  process.exit(1)
+}
+
 const actualConfirmed = Number(actual.confirmedCount ?? 0)
 const actualFp = Number(actual.falsePositiveCount ?? 0)
 const expectedConfirmed = Number(expected.confirmedCount ?? 0)
@@ -181,7 +215,6 @@ const actualIds = new Set(
     ? actual.perTarget.filter(t => t && t.outcome === 'confirmed').map(t => String(t.id))
     : [],
 )
-const expectedIds = Array.isArray(expected.confirmedIds) ? expected.confirmedIds.map(String) : []
 const lostIds = expectedIds.filter(id => !actualIds.has(id))
 
 const reasons = []

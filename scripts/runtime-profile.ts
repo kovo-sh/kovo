@@ -74,6 +74,7 @@ export function buildHermeticTestEnv(
   // Linux 108-byte Unix domain socket sun_path limit.
   const childTmp = join(resolvedTmp, 't')
   env.KOVO_DATA_DIR = join(resolvedTmp, 'd')
+  env.KOVO_LEDGER_ROOT = join(resolvedTmp, 'ledger')
   env.TMPDIR = childTmp
   env.TMP = childTmp
   env.TEMP = childTmp
@@ -111,6 +112,7 @@ export function prepareHermeticTestDir(rootTmpDir: string = tmpdir(), prefix = '
   mkdirSync(effectiveRoot, { recursive: true })
   const dir = mkdtempSync(join(effectiveRoot, prefix))
   mkdirSync(join(dir, 'd'), { recursive: true, mode: 0o700 })
+  mkdirSync(join(dir, 'ledger'), { recursive: true, mode: 0o700 })
   mkdirSync(join(dir, 't'), { recursive: true, mode: 0o700 })
   mkdirSync(join(dir, 'xdg-d'), { recursive: true, mode: 0o700 })
   mkdirSync(join(dir, 'xdg-c'), { recursive: true, mode: 0o700 })

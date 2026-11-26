@@ -49,6 +49,7 @@ import {
   compareLedgerRows,
   computeCostPerConfirmed,
   readLedgerRows,
+  resolveGitState,
   type LedgerRow,
 } from '../scripts/bench-ledger.ts'
 import { makeStore } from './v4-tier-helpers.ts'
@@ -82,12 +83,14 @@ function responsesSse(eventsList: Record<string, unknown>[]): string {
   return eventsList.map(ev => `data: ${JSON.stringify(ev)}\n\n`).join('')
 }
 
+const TEST_GIT_SHA = resolveGitState().gitSha
+
 function makeLedgerRow(overrides: Partial<LedgerRow> = {}): LedgerRow {
   return {
     schemaVersion: LEDGER_SCHEMA_VERSION,
     recordedAt: '2026-11-26T00:00:00.000Z',
     suite: 'realistic-bench',
-    gitSha: 'abc123456789',
+    gitSha: TEST_GIT_SHA,
     dirty: false,
     benchmarkVersion: 'a'.repeat(64),
     effectiveConfigHash: 'b'.repeat(64),
@@ -590,17 +593,17 @@ describe('R2-21d: bench-ledger persists record-only costPerConfirmed and wastedU
     assert.equal(computeCostPerConfirmed(2.5, 0), null)
 
     // Auto-computed costPerConfirmed + explicit wastedUsd
-    const row1 = appendLedgerRow(makeLedgerRow({ gitSha: 'sha-1', confirmed: 10, costUsd: 2.5, wastedUsd: 0.42 }), ledgerPath)
+    const row1 = appendLedgerRow(makeLedgerRow({ gitSha: TEST_GIT_SHA, confirmed: 10, costUsd: 2.5, wastedUsd: 0.42 }), ledgerPath)
     assert.equal(row1.costPerConfirmed, 0.25)
     assert.equal(row1.wastedUsd, 0.42)
 
     // Zero confirmed -> costPerConfirmed is null; omitted wastedUsd -> null
-    const row2 = appendLedgerRow(makeLedgerRow({ gitSha: 'sha-2', confirmed: 0, recall: 0, costUsd: 5.0 }), ledgerPath)
+    const row2 = appendLedgerRow(makeLedgerRow({ gitSha: TEST_GIT_SHA, confirmed: 0, recall: 0, costUsd: 5.0 }), ledgerPath)
     assert.equal(row2.costPerConfirmed, null)
     assert.equal(row2.wastedUsd, null)
 
     // Record-only / no gate: arbitrarily high costPerConfirmed & wastedUsd still succeed cleanly
-    const row3 = appendLedgerRow(makeLedgerRow({ gitSha: 'sha-3', confirmed: 1, costUsd: 999.0, wastedUsd: 500.0 }), ledgerPath)
+    const row3 = appendLedgerRow(makeLedgerRow({ gitSha: TEST_GIT_SHA, confirmed: 1, costUsd: 999.0, wastedUsd: 500.0 }), ledgerPath)
     assert.equal(row3.costPerConfirmed, 999.0)
     assert.equal(row3.wastedUsd, 500.0)
 
