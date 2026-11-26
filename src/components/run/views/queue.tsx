@@ -27,7 +27,6 @@ import { PaneBody, PaneHeader } from '../pane.tsx'
 import type { InspectorMap, InspectorProps } from '../pane.tsx'
 import { usePaletteCommands } from '../palette.tsx'
 import { useToast } from '../toast.tsx'
-import type { ToastApi } from '../toast.tsx'
 import { cn, runBtn, runDec, runIconBtn, runStamp, RW } from '../tw.ts'
 import { QGlyph, ReadApproval, ReadConsent, ReadFinding, ReadFollow, VState } from './queue-read.tsx'
 
@@ -43,9 +42,6 @@ const subscribe = (f: () => void) => { subs.add(f); return () => { subs.delete(f
 const useMotion = () => useSyncExternalStore(subscribe, () => motion, () => motion)
 /** Keys of open rows in display order, published by the list (falls back to the sections). */
 let visibleOrder: string[] = []
-
-const STAMP_MS = 340
-const COLLAPSE_MS = 240
 
 function openKeys(q: DecisionsApi) {
   return [...q.sections.decide, ...q.sections.review, ...q.sections.follow].map(i => i.key)
@@ -77,13 +73,13 @@ function decisionMessage(it: QueueItem, act: DecisionAct, similar?: boolean): st
   return A.label
 }
 
-interface ActDeps { q: DecisionsApi; nav: NavApi; model: RunModel; toast: ToastApi }
+interface ActDeps { q: DecisionsApi; nav: NavApi; model: RunModel }
 
-/** decide → stamp → collapse → advance. Returns false when the action does not apply. */
+/** decide → advance immediately. Returns false when the action does not apply. */
 function runDecision(deps: ActDeps, key: string, act: DecisionAct, opts: { similar?: boolean } = {}) {
   const { q, nav, model } = deps
   const it = model.queueItem.get(key)
-  if (!it || motion.phase !== 'idle') return false
+  if (!it) return false
   if (it.kind === 'consent') { nav.setView('overview'); return true }
   if (!q.canAct(key, act)) return false
   const command = commandFor(it, act, model, opts.similar)
@@ -92,29 +88,15 @@ function runDecision(deps: ActDeps, key: string, act: DecisionAct, opts: { simil
   const idx = order.indexOf(key)
   const open = new Set(openKeys(q))
   const nextKey = order.slice(idx + 1).find(k => open.has(k) && k !== key) ?? order.slice(0, Math.max(0, idx)).reverse().find(k => open.has(k)) ?? null
-  const commit = () => {
-    q.decide(key, act, {
-      command,
-      message: decisionMessage(it, act, opts.similar),
-      sub: 'Sends when this closes',
-      onUndo: () => {
-        setMotion({ enter: key })
-        setTimeout(() => { if (motion.enter === key) setMotion({ enter: null }) }, 600)
-        if (nav.view === 'queue') nav.select({ kind: 'queue', id: key })
-        setTimeout(() => deps.toast.show('Restored to the queue', { icon: 'undo' }), T(60))
-      },
-    })
-    setMotion({ key: null, act: null, phase: 'idle' })
-    if (nav.view === 'queue' && nav.sel?.kind === 'queue' && nav.sel.id === key) {
-      if (nextKey) nav.select({ kind: 'queue', id: nextKey }, { anim: 'left' })
-      else nav.close()
-    }
+  q.decide(key, act, {
+    command,
+    message: decisionMessage(it, act, opts.similar),
+  })
+  setMotion({ key: null, act: null, phase: 'idle' })
+  if (nav.view === 'queue' && nav.sel?.kind === 'queue' && nav.sel.id === key) {
+    if (nextKey) nav.select({ kind: 'queue', id: nextKey }, { anim: 'left' })
+    else nav.close()
   }
-  const stampMs = T(STAMP_MS)
-  if (!stampMs) { commit(); return true }
-  setMotion({ key, act, phase: 'stamp', enter: null })
-  setTimeout(() => setMotion({ phase: 'leave' }), stampMs)
-  setTimeout(commit, stampMs + COLLAPSE_MS)
   return true
 }
 
@@ -122,9 +104,8 @@ function useDecide() {
   const q = useDecisions()
   const nav = useNav()
   const model = useRunModel()
-  const toast = useToast()
-  const deps = useRef<ActDeps>({ q, nav, model, toast })
-  deps.current = { q, nav, model, toast }
+  const deps = useRef<ActDeps>({ q, nav, model })
+  deps.current = { q, nav, model }
   return (key: string, act: DecisionAct, opts?: { similar?: boolean }) => runDecision(deps.current, key, act, opts)
 }
 
@@ -258,7 +239,7 @@ export function QueueView() {
     </span>
     <span className="min-w-2 flex-1" />
     <span className="inline-flex flex-none items-center gap-1.5 whitespace-nowrap text-[11.5px] text-fg-subtle [&_.kbd]:ml-1.5">
-      <Kbd>A</Kbd>approve<Kbd>D</Kbd>deny<Kbd>Z</Kbd>undo
+      <Kbd>A</Kbd>approve<Kbd>D</Kbd>deny
     </span>
   </div>
   if (!initial && !q.sections.done.length) {
@@ -291,12 +272,11 @@ export function QueueView() {
                 data-testid="queue-approve-all"
                 onClick={e => {
                   e.stopPropagation()
-                  toast.undoable({
-                    message: `Approving ${plural(activePendingApprovals.length, 'pending request')}`,
-                    icon: 'check',
-                    sub: 'Sends when this closes',
-                    commit: () => send({ action: 'approve_all_pending' }),
-                  })
+                  const count = activePendingApprovals.length
+                  void send({ action: 'approve_all_pending' }).then(
+                    () => toast.show(`Approved ${plural(count, 'pending request')}`, { icon: 'check' }),
+                    (err: unknown) => toast.show(err instanceof Error ? err.message : 'Could not approve pending requests.', { tone: 'error' }),
+                  )
                 }}
               >
                 <Icon name="check" />Approve all pending ({activePendingApprovals.length})
@@ -439,7 +419,7 @@ function DoneRow({ it, cur, entering, onSelect }: { it: QueueItem; cur: boolean;
   if (dec) {
     const A = ACTIONS[dec.act]
     right = <span className={cn(runDec({ tone: A.tone === 'no' ? 'default' : A.tone }), '[&_svg]:size-[13px]')}>
-      <Icon name={A.icon} />{A.label}{dec.state === 'pending' ? ' · sending' : ''}
+      <Icon name={A.icon} />{A.label}
     </span>
   } else if (it.kind === 'finding') right = <VState status={it.status} />
   else if (it.kind === 'approval') right = <span className={cn(runDec(), '[&_svg]:size-[13px]')}>
@@ -523,8 +503,7 @@ function QueueInspector({ sel }: InspectorProps) {
   let banner: ReactNode = null
   if (dec) {
     banner = <div className={bannerCls}><Icon name={ACTIONS[dec.act].icon} />
-      <span>{ACTIONS[dec.act].label} by you · {fmtTimeS(dec.at)}{dec.state === 'pending' ? ' · sending when the undo window closes' : dec.state === 'sent' ? ' · sent to Kovo Hunter' : ''}</span>
-      {dec.state !== 'sent' && <button type="button" className={cn(runBtn({ variant: 'ghost' }), 'ml-auto')} onClick={() => q.reopen(it.key)}><Icon name="undo" />Move back</button>}
+      <span>{ACTIONS[dec.act].label} by you · {fmtTimeS(dec.at)}{dec.state === 'sent' ? ' · sent to Kovo Hunter' : ''}</span>
     </div>
   } else if (expiredApproval) {
     banner = <div className={bannerCls}><StatusGlyph status="expired" /><span>Expired · this approval window closed at {fmtTimeS(it.ap.expiresAt)}.</span></div>

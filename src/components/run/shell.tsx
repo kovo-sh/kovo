@@ -294,13 +294,12 @@ function RunBanners() {
   </>
 }
 
-/** Global keyboard model: ⌘K, ?, g+letter, 1–8, [ ], ⇧T, C, Esc stack, Z / ⌘Z undo. */
+/** Global keyboard model: ⌘K, ?, g+letter, 1–8, [ ], ⇧T, C, Esc stack. */
 function useGlobalShortcuts(hideBoardBeforeApproval: boolean) {
   const nav = useNav()
   const pal = usePalette()
   const { runs, detail } = useRun()
   const { toggle } = useTheme()
-  const toast = useToast()
   const switchBy = (d: number) => {
     const ids = runs.map(r => r.id)
     if (ids.length < 2) return
@@ -308,7 +307,6 @@ function useGlobalShortcuts(hideBoardBeforeApproval: boolean) {
     i = (i + ids.length) % ids.length
     nav.switchRun(ids[i])
   }
-  const undo = () => { if (!toast.undoLast()) toast.show('Nothing to undo') }
   useShortcuts([
     { key: 'mod+k', allowInInput: true, run: () => (pal.isOpen ? pal.close() : pal.open()) },
     { key: '?', run: () => pal.openHelp() },
@@ -317,8 +315,6 @@ function useGlobalShortcuts(hideBoardBeforeApproval: boolean) {
     { key: '[', run: () => switchBy(-1) },
     { key: ']', run: () => { if (hideBoardBeforeApproval) return false; nav.togglePane() } },
     { key: 'c', run: () => { if (hideBoardBeforeApproval) return false; nav.openChat(null) } },
-    { key: 'mod+z', run: undo },
-    { key: 'z', run: undo },
     { key: 'Escape', run: () => {
       if (nav.chat && nav.sel) { nav.closeChat(); return }
       if (nav.chat) { nav.closeChat(); return }

@@ -1,16 +1,9 @@
-// Toasts and undo. One toast at a time, bottom centre, springs up.
-//
-// Deferred commits: an undoable action's `commit` runs when its toast
-// expires, when another toast replaces it (whether `show` or `undoable`),
-// or when the run unmounts. Until then Undo cancels it, so nothing is sent.
-// This is how real, irreversible commands (approvals, consent, stop) get an
-// undo window without ever being silently dropped.
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
+// Toasts. One toast at a time, bottom centre, springs up.
+import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
-import { Kbd } from './display.tsx'
 import { Icon } from './icons.tsx'
 import type { IconName } from './icons.tsx'
-import { T, useReducedMotion } from './motion.tsx'
+import { T } from './motion.tsx'
 import { cn } from './tw.ts'
 
 export interface ToastOptions {
@@ -19,40 +12,16 @@ export interface ToastOptions {
   tone?: 'default' | 'error'
   ms?: number
 }
-export interface UndoableOptions {
-  message: ReactNode
-  sub?: string
-  icon?: IconName
-  /** Window length in ms (default 6000). */
-  ms?: number
-  /** Runs when the window closes without undo. May be async; failures surface as an error toast. */
-  commit?: () => unknown | Promise<unknown>
-  /** Runs when the user undoes. */
-  undo?: () => void
-}
 export interface ToastApi {
   show: (message: ReactNode, opts?: ToastOptions) => void
-  undoable: (opts: UndoableOptions) => void
-  /** Undo the open undoable action, if any. Returns false when there is nothing to undo. */
-  undoLast: () => boolean
-  /** Commit the open undoable action now (no-op if none). */
-  flush: () => void
   dismiss: () => void
 }
 
-export interface PendingUndoable {
-  id: number
-  commit?: UndoableOptions['commit']
-  undo?: () => void
-}
-
 /**
- * Pure toast + deferred-commit controller shared by `ToastProvider` and unit tests.
- * Guarantees that any pending undoable commit is flushed before another toast
- * replaces it (`show` or `undoable`), when its window expires, or on dispose.
+ * Pure toast controller shared by `ToastProvider` and unit tests.
  */
 export function createToastController(hooks: {
-  onPush: (item: { id: number; message: ReactNode; sub?: string; icon?: IconName; tone: 'default' | 'error'; ms: number; hasUndo: boolean }) => void
+  onPush: (item: { id: number; message: ReactNode; sub?: string; icon?: IconName; tone: 'default' | 'error'; ms: number }) => void
   onClose: (id?: number) => void
   setTimer?: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>
   clearTimer?: (handle: ReturnType<typeof setTimeout> | undefined) => void
@@ -61,77 +30,33 @@ export function createToastController(hooks: {
   const cancel = hooks.clearTimer ?? (h => { if (h !== undefined) clearTimeout(h) })
   let nextId = 1
   let timer: ReturnType<typeof setTimeout> | undefined
-  let pending: PendingUndoable | null = null
 
-  const runCommit = (p: PendingUndoable | null) => {
-    if (!p?.commit) return
-    try {
-      const r = p.commit()
-      if (r && typeof (r as Promise<unknown>).then === 'function') {
-        ;(r as Promise<unknown>).catch((e: unknown) => api.show(e instanceof Error ? e.message : 'Kovo Hunter could not complete the action.', { tone: 'error' }))
-      }
-    } catch (e) {
-      api.show(e instanceof Error ? e.message : 'Kovo Hunter could not complete the action.', { tone: 'error' })
-    }
-  }
-
-  const flush = () => {
-    const p = pending
-    pending = null
-    runCommit(p)
-  }
-
-  const push = (item: { message: ReactNode; sub?: string; icon?: IconName; tone: 'default' | 'error'; ms: number; hasUndo: boolean }) => {
+  const push = (item: { message: ReactNode; sub?: string; icon?: IconName; tone: 'default' | 'error'; ms: number }) => {
     cancel(timer)
     const id = nextId++
     hooks.onPush({ ...item, id })
     timer = schedule(() => {
-      if (pending?.id === id) flush()
       hooks.onClose(id)
     }, item.ms)
     return id
   }
 
-  const api: ToastApi & { dispose: () => void; hasPending: () => boolean } = {
+  const api: ToastApi & { dispose: () => void } = {
     show(message, opts = {}) {
-      // Flush any open undoable action before replacing its toast and clearing its timer.
-      flush()
       push({
         message,
         sub: opts.sub,
         icon: opts.icon ?? (opts.tone === 'error' ? 'alert' : undefined),
         tone: opts.tone ?? 'default',
         ms: opts.ms ?? (opts.tone === 'error' ? 4000 : 2000),
-        hasUndo: false,
       })
     },
-    undoable(opts) {
-      flush() // a previous pending action commits when replaced
-      const ms = opts.ms ?? 6000
-      const id = push({ message: opts.message, sub: opts.sub, icon: opts.icon, tone: 'default', ms, hasUndo: true })
-      pending = { id, commit: opts.commit, undo: opts.undo }
-    },
-    undoLast() {
-      const p = pending
-      if (!p) return false
-      pending = null
-      cancel(timer)
-      p.undo?.()
-      hooks.onClose(p.id)
-      return true
-    },
-    flush,
     dismiss() {
-      flush()
       cancel(timer)
       hooks.onClose()
     },
     dispose() {
       cancel(timer)
-      flush()
-    },
-    hasPending() {
-      return pending !== null
     },
   }
   return api
@@ -144,7 +69,6 @@ interface Item {
   icon?: IconName
   tone: 'default' | 'error'
   ms: number
-  undo?: () => void
   out: boolean
 }
 
@@ -155,63 +79,36 @@ export function useToast(): ToastApi {
   return v
 }
 
-function ToastProgress({ ms }: { ms: number }) {
-  const rm = useReducedMotion()
-  const [shrunk, setShrunk] = useState(false)
-  useEffect(() => {
-    if (rm) return
-    const raf = requestAnimationFrame(() => setShrunk(true))
-    return () => cancelAnimationFrame(raf)
-  }, [rm])
-  return <span
-    className="absolute bottom-0 left-0 h-0.5 w-full origin-left bg-[color-mix(in_srgb,var(--panel)_45%,transparent)] transition-transform ease-linear motion-reduce:transition-none"
-    style={{
-      transform: shrunk ? 'scaleX(0)' : 'scaleX(1)',
-      transitionDuration: ms + 'ms',
-    }}
-  />
-}
-
 export function ToastProvider({ children }: { children: ReactNode }) {
   const [items, setItems] = useState<Item[]>([])
-  const controllerRef = useRef<ReturnType<typeof createToastController> | null>(null)
 
   const close = useCallback((id?: number) => {
     setItems(list => list.map(t => (id == null || t.id === id ? { ...t, out: true } : t)))
     setTimeout(() => setItems(list => list.filter(t => !t.out)), T(180))
   }, [])
 
-  const controller = useMemo(() => {
-    const ctrl = createToastController({
-      onPush(item) {
-        const next: Item = {
-          id: item.id,
-          message: item.message,
-          sub: item.sub,
-          icon: item.icon,
-          tone: item.tone,
-          ms: item.ms,
-          undo: item.hasUndo ? () => controllerRef.current?.undoLast() : undefined,
-          out: false,
-        }
-        setItems(list => [...list.map(t => ({ ...t, out: true })), next])
-        setTimeout(() => setItems(list => list.filter(t => !t.out || t.id === item.id)), T(180))
-      },
-      onClose: close,
-    })
-    controllerRef.current = ctrl
-    return ctrl
-  }, [close])
+  const controller = useMemo(() => createToastController({
+    onPush(item) {
+      const next: Item = {
+        id: item.id,
+        message: item.message,
+        sub: item.sub,
+        icon: item.icon,
+        tone: item.tone,
+        ms: item.ms,
+        out: false,
+      }
+      setItems(list => [...list.map(t => ({ ...t, out: true })), next])
+      setTimeout(() => setItems(list => list.filter(t => !t.out || t.id === item.id)), T(180))
+    },
+    onClose: close,
+  }), [close])
 
   const api = useMemo<ToastApi>(() => ({
     show: controller.show,
-    undoable: controller.undoable,
-    undoLast: controller.undoLast,
-    flush: controller.flush,
     dismiss: controller.dismiss,
   }), [controller])
 
-  // Commit anything still pending when the run unmounts (navigating away).
   useEffect(() => () => { controller.dispose() }, [controller])
 
   return <ToastContext.Provider value={api}>
@@ -220,7 +117,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
       {items.map(t => <div
         key={t.id}
         className={cn(
-          'pointer-events-auto relative flex min-w-[280px] max-w-[520px] items-center gap-2.5 overflow-hidden rounded-[9px] py-2 pl-3 pr-2 text-[12.5px] shadow-[0_10px_30px_-10px_rgba(0,0,0,.4)] transition-[opacity,transform] duration-[var(--d2)] ease-kovo',
+          'pointer-events-auto relative flex min-w-[280px] max-w-[520px] items-center gap-2.5 overflow-hidden rounded-[9px] py-2 pl-3 pr-3 text-[12.5px] shadow-[0_10px_30px_-10px_rgba(0,0,0,.4)] transition-[opacity,transform] duration-[var(--d2)] ease-kovo',
           t.tone === 'error' ? 'bg-danger text-white' : 'bg-fg text-panel',
           t.out ? 'translate-y-2 opacity-0' : 'translate-y-0 opacity-100',
         )}
@@ -230,16 +127,6 @@ export function ToastProvider({ children }: { children: ReactNode }) {
           {t.message}
           {t.sub && <small className="block truncate text-[11.5px] text-current opacity-65">{t.sub}</small>}
         </div>
-        {t.undo && <>
-          <button
-            type="button"
-            className="inline-flex h-[26px] cursor-pointer items-center gap-1.5 rounded-control border-0 bg-[color-mix(in_srgb,var(--panel)_14%,transparent)] px-2 font-sans text-[12.5px] font-medium text-panel shadow-none transition-colors duration-[var(--d1)] hover:bg-[color-mix(in_srgb,var(--panel)_22%,transparent)]"
-            onClick={t.undo}
-          >
-            Undo <Kbd inverted>Z</Kbd>
-          </button>
-          <ToastProgress ms={t.ms} />
-        </>}
       </div>)}
     </div>
   </ToastContext.Provider>

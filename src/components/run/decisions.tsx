@@ -1,16 +1,13 @@
-// One decision store for the queue, the coordinator's pinned approvals and
-// the consent sheet (F: "Approvals in the coordinator card and in the queue
-// share one decision store").
+// One decision store for the queue and the coordinator's pinned approvals
+// (F: "Approvals in the coordinator card and in the queue share one decision store").
 //
 //   const q = useDecisions()
 //   q.sections.decide / review / follow / done   // base queue minus decided items
 //   q.decide('ap:<id>', 'approve', { command: approvalCommand(id, 'approve'), message: 'Approved POST …' })
-//   q.reopen(key)                                // move back to the queue (not yet sent)
 //
-// Every queue decision is a real server command: it stamps immediately, shows an
-// undo toast, and sends when the 6 s window closes (or when another toast
-// replaces it). Undo inside the window sends nothing. Local-only browser triage
-// is intentionally absent so Queue never contradicts Report/SARIF/Overview.
+// Every queue decision is a real server command: it stamps immediately and
+// sends to the server right away. Local-only browser triage is intentionally
+// absent so Queue never contradicts Report/SARIF/Overview.
 import { createContext, useCallback, useContext, useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
 import { useRun } from './data.tsx'
@@ -57,8 +54,8 @@ export function computeQueueProgress(openCount: number, handledCount: number) {
 export interface Decision {
   act: DecisionAct
   at: number
-  /** pending = inside the undo window; sent = command delivered; failed = command rejected */
-  state: 'pending' | 'sent' | 'failed'
+  /** sent = command delivered; failed = command rejected */
+  state: 'sent' | 'failed'
 }
 
 export interface DecisionsApi {
@@ -73,10 +70,7 @@ export interface DecisionsApi {
   handledCount: number
   sectionOf: (key: string) => QueueSection | null
   canAct: (key: string, act: DecisionAct) => boolean
-  decide: (key: string, act: DecisionAct, opts?: { command?: Command; message?: ReactNode; sub?: string; onUndo?: () => void; silent?: boolean }) => boolean
-  reopen: (key: string) => void
-  /** Retained for compatibility; local-only triage has been removed so this is always false. */
-  undoLastLocal: () => boolean
+  decide: (key: string, act: DecisionAct, opts?: { command?: Command; message?: ReactNode; sub?: string; silent?: boolean }) => boolean
 }
 
 const DecisionsContext = createContext<DecisionsApi | null>(null)
@@ -113,39 +107,19 @@ export function DecisionsProvider({ children }: { children: ReactNode }) {
   const decide = useCallback<DecisionsApi['decide']>((key, act, opts = {}) => {
     if (!canAct(key, act)) return false
     if (!opts.command) return false
-    setAll(prev => ({ ...prev, [key]: { act, at: Date.now(), state: 'pending' } }))
-    const undo = () => {
-      setAll(prev => { const n = { ...prev }; delete n[key]; return n })
-      opts.onUndo?.()
+    setAll(prev => ({ ...prev, [key]: { act, at: Date.now(), state: 'sent' } }))
+    if (!opts.silent) {
+      toast.show(opts.message ?? ACTIONS[act].label, {
+        sub: opts.sub,
+        icon: ACTIONS[act].icon,
+      })
     }
-    if (opts.silent) return true
-    toast.undoable({
-      message: opts.message ?? ACTIONS[act].label,
-      sub: opts.sub ?? 'Sends when this closes',
-      icon: ACTIONS[act].icon,
-      undo,
-      commit: async () => {
-        try {
-          await send(opts.command!)
-          setAll(prev => prev[key] ? { ...prev, [key]: { ...prev[key], state: 'sent' } } : prev)
-        } catch (e) {
-          setAll(prev => { const n = { ...prev }; delete n[key]; return n })
-          throw e
-        }
-      },
+    void send(opts.command).catch((e: unknown) => {
+      setAll(prev => { const n = { ...prev }; delete n[key]; return n })
+      toast.show(e instanceof Error ? e.message : 'Kovo Hunter could not complete the action.', { tone: 'error' })
     })
     return true
   }, [canAct, toast, send])
-
-  const reopen = useCallback((key: string) => {
-    const d = all[key]
-    if (d && d.state === 'sent') { toast.show('Already sent to Kovo Hunter; it can’t be moved back.'); return }
-    if (d?.state === 'pending') { toast.undoLast(); return }
-    setAll(prev => { const n = { ...prev }; delete n[key]; return n })
-    toast.show('Moved back to the queue', { icon: 'undo' })
-  }, [all, toast])
-
-  const undoLastLocal = useCallback(() => false, [])
 
   const value = useMemo<DecisionsApi>(() => {
     const openCount = sections.decide.length + sections.review.length + sections.follow.length
@@ -157,9 +131,9 @@ export function DecisionsProvider({ children }: { children: ReactNode }) {
       decideCount: sections.decide.length,
       initialCount: progress.initialCount,
       handledCount: progress.handledCount,
-      sectionOf, canAct, decide, reopen, undoLastLocal,
+      sectionOf, canAct, decide,
     }
-  }, [model, all, sections, sectionOf, canAct, decide, reopen, undoLastLocal])
+  }, [model, all, sections, sectionOf, canAct, decide])
 
   return <DecisionsContext.Provider value={value}>{children}</DecisionsContext.Provider>
 }

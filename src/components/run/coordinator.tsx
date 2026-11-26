@@ -3,8 +3,8 @@
 //
 // - Compact filter bar + Agents dropdown with live state (working / waiting /
 //   paused / retired); a member filters the timeline, ↗ opens its active worker.
-// - Pending approvals pinned on top (shared decision store: stamp now, send
-//   `decide_approval` when the 6 s undo window closes).
+// - Pending approvals pinned on top (shared decision store: Approve/Deny
+//   executes `decide_approval` immediately).
 // - Timeline: board posts (kind label, mentions, reply, fact / exchange /
 //   finding / step chips with inline detail + cross-link, inline approval cards)
 //   merged with the coordinator thread.
@@ -153,12 +153,9 @@ function ApprovalRow({ a, inset = false, now }: { a: Approval; inset?: boolean; 
     >
       {host(a.origin)}<span className="text-fg-subtle">{a.pathAndQuery}</span>
     </span>
-    {d ? <>
-      <span className="flex flex-none items-center gap-[5px] text-[11.5px] text-fg-subtle">
-        <Icon name={ACTIONS[d.act].icon} />{ACTIONS[d.act].label}{d.state === 'pending' ? ' · sending' : ''}
-      </span>
-      {d.state !== 'sent' && <button type="button" className={runIconBtn({ size: 'sm' })} title="Undo" aria-label="Undo" onClick={() => q.reopen('ap:' + a.id)}><Icon name="undo" /></button>}
-    </> : expired
+    {d ? <span className="flex flex-none items-center gap-[5px] text-[11.5px] text-fg-subtle">
+      <Icon name={ACTIONS[d.act].icon} />{ACTIONS[d.act].label}
+    </span> : expired
       ? <span className="flex flex-none items-center gap-[5px] text-[11.5px] text-fg-subtle"><StatusGlyph status="expired" />Expired</span>
       : a.status !== 'pending'
         ? <span className="flex flex-none items-center gap-[5px] text-[11.5px] text-fg-subtle"><StatusGlyph status={a.status} />{cap(a.status)}</span>

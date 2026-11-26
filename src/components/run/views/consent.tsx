@@ -9,14 +9,12 @@ import { approvalPolicyMeta, capabilityTierMeta } from '../../run-state.ts'
 import { Dialog, DialogContent, DialogTitle } from '../../ui/dialog.tsx'
 import { useRun } from '../data.tsx'
 import type { Command } from '../data.tsx'
-import { useDecisions } from '../decisions.tsx'
 import { Kbd } from '../display.tsx'
 import { fmtN, fmtUsd, host, plural, words } from '../format.ts'
 import { StatusGlyph } from '../glyphs.tsx'
 import { Icon } from '../icons.tsx'
 import { useShortcuts } from '../keyboard.tsx'
 import { runStatusLabel } from '../meta.ts'
-import { consentKey } from '../model.ts'
 import { useOverlays } from '../overlays.tsx'
 import { useToast } from '../toast.tsx'
 import { cn, runBtn, RW } from '../tw.ts'
@@ -659,7 +657,6 @@ const STEPS: [string, string][] = [
 /** Overview for a waiting run: "Nothing has been sent yet." */
 export function ConsentView() {
   const { detail, send } = useRun()
-  const q = useDecisions()
   const toast = useToast()
   const r = detail.run
   const rpsMax = detail.project.environment === 'local-lab' ? maxRpsPerOriginCeiling : PUBLIC_MAX_RPS_CAP
@@ -674,18 +671,15 @@ export function ConsentView() {
   const [syncedDefaultsKey, setSyncedDefaultsKey] = useState(defaultsKey)
   const [draft, setDraftState] = useState<Draft>(() => initialDraft(r, defaults, rpsMax))
   const setDraft = (fn: (d: Draft) => Draft) => setDraftState(fn)
-  const ck = consentKey(r)
-  const decision = q.get(ck)
-  const scoped = Boolean(decision)
 
   // Reset full draft and default editing state when run/phase/revision transitions.
-  if (syncedRunKey !== runSyncKey && !scoped) {
+  if (syncedRunKey !== runSyncKey) {
     setSyncedRunKey(runSyncKey)
     setSyncedDefaultsKey(defaultsKey)
     setUserTouchedHosts(false)
     setEditing(!discovery)
     setDraftState(initialDraft(r, defaults, rpsMax))
-  } else if (syncedDefaultsKey !== defaultsKey && !userTouchedHosts && !scoped) {
+  } else if (syncedDefaultsKey !== defaultsKey && !userTouchedHosts) {
     // Auto-check newly streamed first-party subdomains (up to Top 30) unless the user has manually toggled hosts,
     // preserving any Scan Mode / Budget / RPS / Persona edits already made in `draft`.
     setSyncedDefaultsKey(defaultsKey)
@@ -695,7 +689,7 @@ export function ConsentView() {
   const nw = (r.goal || '').split(/\s+/).filter(Boolean).length
   const count = discovery ? hosts.length : draft.assetIds.length
   const overLimit = draft.assetIds.length > maxScopeHosts
-  const canApprove = !approving && q.canAct(ck, 'scope') && (discovery || (count > 0 && !overLimit))
+  const canApprove = !approving && canReviewScope(r.phase, r.status) && (discovery || (count > 0 && !overLimit))
   const footerNote = overLimit
     ? `Choose up to ${maxScopeHosts} hosts.`
     : !discovery && count === 0
@@ -720,13 +714,11 @@ export function ConsentView() {
   }
   useShortcuts([{ key: 'a', run: () => { if (!canApprove) return false; void approve() } }])
 
-  const eyebrow = scoped
-    ? decision!.state === 'sent' ? 'Approved · the coordinator is starting' : 'Approved · sends when the undo window closes'
-    : r.phase === 'review' ? 'Waiting on your scope approval' : 'Waiting on your consent'
+  const eyebrow = r.phase === 'review' ? 'Waiting on your scope approval' : 'Waiting on your consent'
   return <div className="min-h-0 flex-1 overflow-auto px-10 pb-12 pt-11">
     <div className="mx-auto max-w-[680px]">
       <span className="inline-flex items-center gap-2 text-[12px] font-medium text-fg-muted">
-        <StatusGlyph status={scoped ? 'complete' : 'waiting'} />{eyebrow}
+        <StatusGlyph status="waiting" />{eyebrow}
       </span>
       <div className="mb-2 mt-3 text-[24px] font-semibold leading-[31px] tracking-[-0.02em] text-fg">
         Nothing has been sent <em className="not-italic text-fg-subtle">yet.</em>
@@ -750,20 +742,16 @@ export function ConsentView() {
             <span className="mr-auto text-[12px] text-fg-subtle">
               {footerNote}
             </span>
-            {scoped
-              ? decision!.state !== 'sent' && <button type="button" className={runBtn()} onClick={() => q.reopen(ck)}><Icon name="undo" />Undo</button>
-              : <>
-                {!discovery && <button type="button" className={runBtn({ variant: 'ghost' })} onClick={() => { if (editing) { setUserTouchedHosts(false); setDraftState(initialDraft(r, defaults, rpsMax)) } else { setEditing(true) } }}>{editing ? 'Reset' : 'Edit scope'}</button>}
-                <button type="button" className={runBtn({ variant: 'primary' })} disabled={!canApprove} onClick={() => void approve()}>
-                  {approving ? 'Starting…' : <>Approve &amp; start<Kbd inverted className="ml-0.5">A</Kbd></>}
-                </button>
-              </>}
+            {!discovery && <button type="button" className={runBtn({ variant: 'ghost' })} onClick={() => { if (editing) { setUserTouchedHosts(false); setDraftState(initialDraft(r, defaults, rpsMax)) } else { setEditing(true) } }}>{editing ? 'Reset' : 'Edit scope'}</button>}
+            <button type="button" className={runBtn({ variant: 'primary' })} disabled={!canApprove} onClick={() => void approve()}>
+              {approving ? 'Starting…' : <>Approve &amp; start<Kbd inverted className="ml-0.5">A</Kbd></>}
+            </button>
           </div>
         }
       />
       <div className="mt-[26px] grid grid-cols-5 border-t border-line">
         {STEPS.map((s, i) => {
-          const cur = (scoped ? 1 : 0) === i
+          const cur = i === 0
           return <div
             key={s[0]}
             className={cn(
