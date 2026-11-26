@@ -21,7 +21,7 @@ import {
 } from './benchmark-parallel.ts'
 
 interface Cell { app: string; seed: number }
-interface CellResult {
+export interface CellResult {
   app: string
   seed: number
   ok: boolean
@@ -29,14 +29,29 @@ interface CellResult {
   runtimeMs: number
   confirmed: number
   targets: number
-  recall: number
-  precision: number
+  recall: number | null
+  precision: number | null
   decoyFp: number
   decoys: number
   unmatchedFp: number
   costUsd: number
   funnel?: Record<string, number>
   error?: string
+}
+
+export interface RealisticMatrixTotals {
+  status: 'VALID' | 'INVALID'
+  cells: number
+  ok: number
+  failed: number
+  confirmed: number
+  targets: number
+  recall: number | null
+  precision: number | null
+  decoyFp: number
+  decoys: number
+  unmatchedFp: number
+  costUsd: number
 }
 
 type MatrixSuite = 'realistic' | 'xben-25' | 'held-out-saas'
@@ -127,10 +142,18 @@ function readScorecard(file: string): Partial<CellResult> | null {
     const num = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0)
     // realistic-bench scorecards use `targets`; recall benchmarks use `targetsTotal`/`confirmedCount`.
     const funnel = (c.funnel ?? c.funnelCounts) as Record<string, number> | undefined
+    const confirmed = num(c.confirmed ?? c.confirmedCount)
+    const targets = num(c.targets ?? c.targetsTotal)
+    const decoyFp = num(c.decoyFalsePositives ?? c.falsePositiveCount)
+    const decoys = num(c.decoys ?? c.decoysTotal)
+    const unmatchedFp = num(c.unmatchedFalsePositives)
+    const tpPlusFp = confirmed + decoyFp + unmatchedFp
+    const rawPrecision = typeof c.precision === 'number' && Number.isFinite(c.precision) ? c.precision : null
+    const precision = tpPlusFp > 0 ? (rawPrecision ?? confirmed / tpPlusFp) : null
     return {
-      confirmed: num(c.confirmed ?? c.confirmedCount), targets: num(c.targets ?? c.targetsTotal), recall: num(c.recall),
-      precision: num(c.precision), decoyFp: num(c.decoyFalsePositives ?? c.falsePositiveCount), decoys: num(c.decoys ?? c.decoysTotal),
-      unmatchedFp: num(c.unmatchedFalsePositives), costUsd: num(c.totalCostUsd),
+      confirmed, targets, recall: targets > 0 ? num(c.recall) : 0,
+      precision, decoyFp, decoys,
+      unmatchedFp, costUsd: num(c.totalCostUsd),
       funnel: funnel && typeof funnel === 'object' ? funnel : undefined,
     }
   } catch { return null }
@@ -185,22 +208,70 @@ function runCell(cell: Cell, opts: ReturnType<typeof parseArgs>): Promise<CellRe
     const timer = setTimeout(() => { child.kill('SIGKILL') }, opts.timeoutMs)
     child.on('error', err => {
       clearTimeout(timer)
-      resolvePromise({ app: cell.app, seed: cell.seed, ok: false, exitCode: null, runtimeMs: Date.now() - started, confirmed: 0, targets: 0, recall: 0, precision: 0, decoyFp: 0, decoys: 0, unmatchedFp: 0, costUsd: 0, error: err.message })
+      resolvePromise({ app: cell.app, seed: cell.seed, ok: false, exitCode: null, runtimeMs: Date.now() - started, confirmed: 0, targets: 0, recall: null, precision: null, decoyFp: 0, decoys: 0, unmatchedFp: 0, costUsd: 0, error: err.message })
     })
     child.on('close', code => {
       clearTimeout(timer)
       const score = readScorecard(json)
       const firstError = logText.split('\n').find(line => /^error:/i.test(line.trim()))?.slice(0, 180)
+      const ok = code === 0 && score !== null
       resolvePromise({
-        app: cell.app, seed: cell.seed, ok: code === 0 && score !== null, exitCode: code,
+        app: cell.app, seed: cell.seed, ok, exitCode: code,
         runtimeMs: Date.now() - started,
-        confirmed: score?.confirmed ?? 0, targets: score?.targets ?? 0, recall: score?.recall ?? 0,
-        precision: score?.precision ?? 0, decoyFp: score?.decoyFp ?? 0, decoys: score?.decoys ?? 0,
+        confirmed: score?.confirmed ?? 0, targets: score?.targets ?? 0,
+        recall: ok ? (score?.recall ?? 0) : null,
+        precision: ok ? (score?.precision ?? null) : null,
+        decoyFp: score?.decoyFp ?? 0, decoys: score?.decoys ?? 0,
         unmatchedFp: score?.unmatchedFp ?? 0, costUsd: score?.costUsd ?? 0, funnel: score?.funnel,
         ...(code === 0 ? {} : { error: firstError ?? `exit ${code}` }),
       })
     })
   })
+}
+
+const fmtPct = (v: number | null): string => (v === null ? 'n/a' : `${(v * 100).toFixed(1)}%`)
+
+export function summarizeMatrix(results: readonly CellResult[]): RealisticMatrixTotals {
+  const failed = results.filter(r => !r.ok).length
+  const status: 'VALID' | 'INVALID' = failed > 0 ? 'INVALID' : 'VALID'
+  const confirmed = results.reduce((n, r) => n + r.confirmed, 0)
+  const targets = results.reduce((n, r) => n + r.targets, 0)
+  const decoyFp = results.reduce((n, r) => n + r.decoyFp, 0)
+  const decoys = results.reduce((n, r) => n + r.decoys, 0)
+  const unmatchedFp = results.reduce((n, r) => n + r.unmatchedFp, 0)
+  const costUsd = results.reduce((n, r) => n + r.costUsd, 0)
+  const tpPlusFp = confirmed + decoyFp + unmatchedFp
+  return {
+    status,
+    cells: results.length,
+    ok: results.length - failed,
+    failed,
+    confirmed,
+    targets,
+    recall: failed > 0 ? null : (targets > 0 ? confirmed / targets : 0),
+    precision: tpPlusFp > 0 ? confirmed / tpPlusFp : null,
+    decoyFp,
+    decoys,
+    unmatchedFp,
+    costUsd,
+  }
+}
+
+export function formatMatrixSummaryLine(input: {
+  suite: MatrixSuite
+  totals: RealisticMatrixTotals
+  concurrency: number
+  wallSec: string
+  pauseCount: number
+  pauses: string
+  orphans: number
+  outDir: string
+}): string {
+  const { suite, totals, concurrency, wallSec, pauseCount, pauses, orphans, outDir } = input
+  if (totals.status === 'INVALID') {
+    return `[matrix] status=INVALID suite=${suite} cells=${totals.cells} failed=${totals.failed} concurrency=${concurrency} wall=${wallSec}s precision=${fmtPct(totals.precision)} decoyFP=${totals.decoyFp} unmatchedFP=${totals.unmatchedFp} cost=$${totals.costUsd.toFixed(3)} pauses=${pauseCount} [${pauses}] orphans=${orphans} out=${outDir}`
+  }
+  return `[matrix] status=VALID suite=${suite} cells=${totals.cells} failed=${totals.failed} concurrency=${concurrency} wall=${wallSec}s confirmed=${totals.confirmed}/${totals.targets} recall=${fmtPct(totals.recall)} precision=${fmtPct(totals.precision)} decoyFP=${totals.decoyFp} unmatchedFP=${totals.unmatchedFp} cost=$${totals.costUsd.toFixed(3)} pauses=${pauseCount} [${pauses}] orphans=${orphans} out=${outDir}`
 }
 
 async function main(): Promise<number> {
@@ -242,7 +313,7 @@ async function main(): Promise<number> {
         results.push(result)
         await reaper.reap(cellIds[index]!)
         const verdict = result.ok
-          ? `recall=${result.confirmed}/${result.targets} (${(result.recall * 100).toFixed(1)}%) precision=${(result.precision * 100).toFixed(1)}% decoyFP=${result.decoyFp}/${result.decoys} unmatchedFP=${result.unmatchedFp}`
+          ? `recall=${result.confirmed}/${result.targets} (${fmtPct(result.recall)}) precision=${fmtPct(result.precision)} decoyFP=${result.decoyFp}/${result.decoys} unmatchedFP=${result.unmatchedFp}`
           : `ERROR ${result.error ?? 'failed'} exit=${result.exitCode}`
         console.log(`[cell] ${cellIds[index]} ${(result.runtimeMs / 1000).toFixed(1)}s ${verdict}`)
       }
@@ -255,20 +326,15 @@ async function main(): Promise<number> {
   }
 
   results.sort((a, b) => a.app.localeCompare(b.app) || a.seed - b.seed)
-  const totalConfirmed = results.reduce((n, r) => n + r.confirmed, 0)
-  const totalTargets = results.reduce((n, r) => n + r.targets, 0)
-  const totalDecoyFp = results.reduce((n, r) => n + r.decoyFp, 0)
-  const totalUnmatched = results.reduce((n, r) => n + r.unmatchedFp, 0)
-  const totalCost = results.reduce((n, r) => n + r.costUsd, 0)
-  const failures = results.filter(r => !r.ok).length
+  const totals = summarizeMatrix(results)
   const table = [
     '',
     ['cell'.padEnd(40), 'recall'.padEnd(11), 'prec'.padEnd(7), 'decoy/unmFP'.padEnd(12), 'wall'.padEnd(7), 'cost'.padEnd(8), 'status'].join(' '),
     '-'.repeat(90),
     ...results.map(result => [
       (opts.suite === 'realistic' ? `realistic-${result.app}-seed${result.seed}` : `${opts.suite}-seed${result.seed}`).padEnd(40),
-      `${result.confirmed}/${result.targets}`.padEnd(11),
-      `${(result.precision * 100).toFixed(1)}%`.padEnd(7),
+      (result.ok ? `${result.confirmed}/${result.targets}` : 'n/a').padEnd(11),
+      fmtPct(result.precision).padEnd(7),
       `${result.decoyFp}/${result.unmatchedFp}`.padEnd(12),
       `${(result.runtimeMs / 1000).toFixed(1)}s`.padEnd(7),
       `$${result.costUsd.toFixed(3)}`.padEnd(8),
@@ -279,8 +345,17 @@ async function main(): Promise<number> {
     ? guard.events.map(e => `${e.reason}@${Math.round(e.at / 1000)}s${e.resumedAt ? `->${Math.round(e.resumedAt / 1000)}s` : '(open)'}`).join(' ')
     : 'none'
   console.log(table)
-  console.log(`[matrix] suite=${opts.suite} cells=${results.length} failed=${failures} concurrency=${Math.min(opts.concurrency, cells.length)} wall=${((Date.now() - startedAt) / 1000).toFixed(1)}s confirmed=${totalConfirmed}/${totalTargets} recall=${totalTargets ? ((totalConfirmed / totalTargets) * 100).toFixed(1) : '0.0'}% decoyFP=${totalDecoyFp} unmatchedFP=${totalUnmatched} cost=$${totalCost.toFixed(3)} pauses=${guard.events.length} [${pauses}] orphans=${orphans} out=${opts.outDir}`)
-  return failures === 0 ? 0 : 1
+  console.log(formatMatrixSummaryLine({
+    suite: opts.suite,
+    totals,
+    concurrency: Math.min(opts.concurrency, cells.length),
+    wallSec: ((Date.now() - startedAt) / 1000).toFixed(1),
+    pauseCount: guard.events.length,
+    pauses,
+    orphans,
+    outDir: opts.outDir,
+  }))
+  return totals.failed === 0 ? 0 : 1
 }
 
 const entry = process.argv[1] ?? ''

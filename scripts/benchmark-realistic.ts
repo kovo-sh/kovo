@@ -163,7 +163,7 @@ export interface RealisticArgs {
   workerConcurrency: number
   dataDir?: string
   noLlm: boolean
-  /** Conventional noun/action route wordlists (local-lab convenience). Default ON. */
+  /** Conventional noun/action route wordlists (local-lab opt-in only; non-reportable when ON). Default OFF. */
   conventionalWordlist: boolean
   isolateDataDir: boolean
   keepDataDirs: boolean
@@ -226,10 +226,13 @@ Flags:
                           (default: $KOVO_DATA_DIR or <out-dir>/data/<cell>)
   --no-llm                force the deterministic/Zero-LLM path; the run uses an
                           isolated data dir and never loads a model profile
+  --conventional-wordlist
+                          opt-in local-lab convenience: enable the conventional noun/action
+                          route wordlist (default OFF). Stamps scorecard wordlistOn=true
+                          and reportable=false.
   --no-conventional-wordlist
-                          run the deterministic engine without the conventional
-                          noun/action route wordlist (local-lab convenience). Only
-                          target-discovered/declared surface is probed.
+                          explicitly keep the conventional noun/action route wordlist OFF
+                          (the default). Only target-discovered/declared surface is probed.
   --isolate-data-dir      per-cell data dir initialized from --data-dir: copies only
                           enabled model_profiles rows and reads host credentials via
                           KOVO_CREDENTIALS_DIR (read-only, no symlink, key not copied)
@@ -392,13 +395,17 @@ export function parseRealisticArgs(argv: string[], env: NodeJS.ProcessEnv = proc
     'app', 'seed', 'seeds', 'held-out', 'mode', 'budget-usd', 'max-duration-ms',
     'budget-requests', 'floor-request-budget', 'agent-request-budget', 'total-request-budget',
     'max-rps',
-    'out-dir', 'concurrency', 'worker-concurrency', 'data-dir', 'no-llm', 'no-conventional-wordlist', 'isolate-data-dir', 'keep-data-dirs',
+    'out-dir', 'concurrency', 'worker-concurrency', 'data-dir', 'no-llm',
+    'conventional-wordlist', 'no-conventional-wordlist', 'isolate-data-dir', 'keep-data-dirs',
     'allow-inert-workers', 'verifier', 'reuse-recon', 'refresh-recon', 'help',
     'snapshot-after-floor', 'resume-snapshot', 'snapshot-max-age-ms', 'snapshot-refresh',
     'allow-heldout-snapshot',
   ])
   for (const key of Object.keys(a)) {
     if (!known.has(key)) fail(`unknown flag --${key}`)
+  }
+  if (a['conventional-wordlist'] === true && a['no-conventional-wordlist'] === true) {
+    fail('use either --conventional-wordlist or --no-conventional-wordlist, not both')
   }
 
   if (a.help === true) {
@@ -413,7 +420,7 @@ export function parseRealisticArgs(argv: string[], env: NodeJS.ProcessEnv = proc
       outDir: resolve('.kovo/realistic-bench'), concurrency: DEFAULT_CONCURRENCY,
       workerConcurrency: defaultWorkerConcurrency(Boolean(a['no-llm'])),
       noLlm: Boolean(a['no-llm']), isolateDataDir: Boolean(a['isolate-data-dir']),
-      conventionalWordlist: a['no-conventional-wordlist'] !== true,
+      conventionalWordlist: a['conventional-wordlist'] === true,
       keepDataDirs: Boolean(a['keep-data-dirs']),
       allowInertWorkers: Boolean(a['allow-inert-workers']),
       verifier: 'auto', refreshRecon: a['refresh-recon'] === true, help: true,
@@ -535,7 +542,7 @@ export function parseRealisticArgs(argv: string[], env: NodeJS.ProcessEnv = proc
     workerConcurrency,
     ...(dataDirRaw ? { dataDir: isAbsolute(dataDirRaw) ? dataDirRaw : resolve(dataDirRaw) } : {}),
     noLlm,
-    conventionalWordlist: a['no-conventional-wordlist'] !== true,
+    conventionalWordlist: a['conventional-wordlist'] === true,
     isolateDataDir: a['isolate-data-dir'] === true,
     keepDataDirs: a['keep-data-dirs'] === true,
     allowInertWorkers: a['allow-inert-workers'] === true,
@@ -695,6 +702,8 @@ export interface ReplaySpecLike {
   spec: unknown
   createdAt: number
   verifiedInline?: boolean
+  lastVerificationDiff?: { verdict?: string } | null
+  proofReceipt?: unknown
 }
 
 export interface EndpointLike {
@@ -885,6 +894,15 @@ export function withFalsePositiveEvidence<T extends Record<string, unknown>>(
   return evidence.length ? { ...artifact, falsePositiveEvidence: [...evidence] } : artifact
 }
 
+/** Stamp scorecard reportability: any run with conventional wordlist ON is non-reportable. */
+export function withScorecardReportability<T extends Record<string, unknown>>(
+  artifact: T,
+  conventionalWordlist: boolean,
+): T & { wordlistOn: boolean; reportable: boolean } {
+  const wordlistOn = Boolean(conventionalWordlist)
+  return { ...artifact, wordlistOn, reportable: !wordlistOn }
+}
+
 interface ExtractedEndpoint { method?: string; path: string }
 
 function pathOf(value: unknown): string | null {
@@ -923,23 +941,265 @@ export function endpointsFromReplaySpec(spec: unknown): ExtractedEndpoint[] {
   return out
 }
 
-function specParams(spec: unknown): string[] {
-  const names = new Set<string>()
-  const visit = (node: unknown, depth: number): void => {
-    if (!node || typeof node !== 'object' || depth > 8) return
-    if (Array.isArray(node)) { for (const item of node) visit(item, depth + 1); return }
-    const rec = node as Record<string, unknown>
-    if (typeof rec.paramName === 'string') names.add(rec.paramName)
-    for (const key of ['params', 'jsonBody', 'formFields', 'variables']) {
-      const value = rec[key]
-      if (value && typeof value === 'object' && !Array.isArray(value)) {
-        for (const name of Object.keys(value as Record<string, unknown>)) names.add(name)
+const CANONICAL_VULN_CLASSES = new Set([
+  'idor', 'bola', 'bfla', 'graphql_bola', 'mass_assignment', 'auth_bypass', 'jwt', 'oauth',
+  'csrf', 'sqli', 'ssti', 'ssrf', 'xxe', 'xss_stored', 'xss_reflected', 'path_traversal',
+  'command_injection', 'cache_poisoning', 'cache_deception', 'race_condition', 'business_logic',
+  'workflow_bypass', 'open_redirect', 'webhook_forgery', 'info_disclosure', 'rate_limit_bypass',
+])
+
+const PROBE_CLASS_TO_VULN_CLASS: Record<string, string> = {
+  sqli_boolean: 'sqli',
+  sqli_time_diff: 'sqli',
+  sql_boolean_diff: 'sqli',
+  sql_time_diff: 'sqli',
+  sql_injection: 'sqli',
+  authz_matrix: 'bola',
+  authorization: 'bola',
+  access_boundary: 'bola',
+  cross_tenant_read: 'bola',
+  cross_tenant_write: 'bola',
+  dual_tenant_abac: 'bola',
+  privilege_escalation: 'bfla',
+  ssti_math: 'ssti',
+  template_injection: 'ssti',
+  ssrf_canary: 'ssrf',
+  ssrf_oob: 'ssrf',
+  xxe_canary: 'xxe',
+  xxe_oob: 'xxe',
+  xss_context: 'xss_reflected',
+  dom_xss: 'xss_reflected',
+  browser_dom: 'xss_reflected',
+  xss: 'xss_reflected',
+  path_traversal_benign: 'path_traversal',
+  directory_traversal: 'path_traversal',
+  lfi: 'path_traversal',
+  path_escape: 'path_traversal',
+  cache_poison_deception: 'cache_poisoning',
+  cache_differential: 'cache_poisoning',
+  cache_poison: 'cache_poisoning',
+  race_burst: 'race_condition',
+  race_double_spend: 'race_condition',
+  race: 'race_condition',
+  workflow_invariant: 'business_logic',
+  workflow_skip: 'workflow_bypass',
+  price_tampering: 'business_logic',
+  invariant_violation: 'business_logic',
+  conserved_balance: 'business_logic',
+  auth_protocol_audit: 'jwt',
+  token_forgery: 'jwt',
+  graphql_audit: 'graphql_bola',
+  graphql_authz: 'graphql_bola',
+  rce_proof: 'command_injection',
+  rce: 'command_injection',
+  os_command: 'command_injection',
+  secret_disclosed: 'info_disclosure',
+  disclosure: 'info_disclosure',
+  redirect: 'open_redirect',
+  csrf_state_change: 'csrf',
+}
+
+/** Map a verifier/spec probe class or receipt class to a realistic-bench `vulnClass` key. */
+export function probeClassToVulnClass(raw: string | null | undefined): string | undefined {
+  if (typeof raw !== 'string') return undefined
+  const key = raw.trim().toLowerCase()
+  if (!key || key === 'unknown') return undefined
+  if (CANONICAL_VULN_CLASSES.has(key)) return key
+  return PROBE_CLASS_TO_VULN_CLASS[key]
+}
+
+/** Derive the canonical `vulnClass` from the verifying spec's probe class / recipe / receipt. */
+export function vulnClassFromSpec(spec: unknown, proofReceipt?: unknown): string | undefined {
+  const rec = spec && typeof spec === 'object' && !Array.isArray(spec)
+    ? spec as Record<string, unknown>
+    : null
+  const receiptObj = proofReceipt && typeof proofReceipt === 'object' && !Array.isArray(proofReceipt)
+    ? proofReceipt as Record<string, unknown>
+    : null
+  const receiptInner = receiptObj?.receipt && typeof receiptObj.receipt === 'object' && !Array.isArray(receiptObj.receipt)
+    ? receiptObj.receipt as Record<string, unknown>
+    : null
+  const receiptVer = receiptObj?.verification && typeof receiptObj.verification === 'object' && !Array.isArray(receiptObj.verification)
+    ? receiptObj.verification as Record<string, unknown>
+    : null
+  const agentScript = rec?.agentScript && typeof rec.agentScript === 'object' && !Array.isArray(rec.agentScript)
+    ? rec.agentScript as Record<string, unknown>
+    : null
+  const recipe = rec?.recipe && typeof rec.recipe === 'object' && !Array.isArray(rec.recipe)
+    ? rec.recipe as Record<string, unknown>
+    : null
+  const recipeArgs = recipe?.args && typeof recipe.args === 'object' && !Array.isArray(recipe.args)
+    ? recipe.args as Record<string, unknown>
+    : null
+
+  const explicitCandidates = [
+    rec?.probeClass,
+    rec?.vulnClass,
+    agentScript?.vulnClass,
+    recipeArgs?.vulnClass,
+    recipeArgs?.probeClass,
+    receiptInner?.vulnClass,
+    receiptVer?.vulnClass,
+    receiptInner?.terminalVulnClass,
+    receiptVer?.terminalVulnClass,
+  ]
+  for (const candidate of explicitCandidates) {
+    if (typeof candidate === 'string') {
+      const mapped = probeClassToVulnClass(candidate)
+      if (mapped) return mapped
+    }
+  }
+
+  const kind = typeof rec?.kind === 'string' ? rec.kind : ''
+  if (kind === 'sql_boolean_diff' || kind === 'sql_time_diff') return 'sqli'
+  if (kind === 'cache_differential') return rec?.mode === 'deception' ? 'cache_deception' : 'cache_poisoning'
+  if (kind === 'browser_chain' || kind === 'browser_dom') return 'xss_reflected'
+  if (kind === 'auth_protocol_proof') {
+    const protocol = typeof rec?.protocol === 'string' ? rec.protocol : 'jwt'
+    return protocol === 'oauth' || protocol === 'oidc' ? 'oauth' : 'jwt'
+  }
+  if (kind === 'race_burst') return 'race_condition'
+  if (kind === 'rce_proof') return 'command_injection'
+
+  const recipeId = typeof recipe?.recipeId === 'string' ? recipe.recipeId : ''
+  if (recipeId) {
+    const mapped = probeClassToVulnClass(recipeId)
+    if (mapped) return mapped
+    if (recipeId === 'boolean_or_timing') return 'sqli'
+    if (recipeId === 'browser_sink') return 'xss_reflected'
+  }
+  return undefined
+}
+
+const VALID_PARAM_NAME = /^[A-Za-z0-9_.\-[\]]{1,128}$/
+
+function queryParamMap(pathAndQuery: unknown): Map<string, string> {
+  const out = new Map<string, string>()
+  if (typeof pathAndQuery !== 'string') return out
+  const qIndex = pathAndQuery.indexOf('?')
+  if (qIndex < 0) return out
+  try {
+    const params = new URLSearchParams(pathAndQuery.slice(qIndex + 1).split('#', 1)[0])
+    for (const [k, v] of params.entries()) {
+      if (k === '_gcb') continue
+      out.set(k, v)
+    }
+  } catch { /* ignore malformed query */ }
+  return out
+}
+
+function bodyFieldMap(request: Record<string, unknown>): Map<string, string> {
+  const out = new Map<string, string>()
+  for (const key of ['jsonBody', 'formFields', 'variables', 'params']) {
+    const value = request[key]
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+        out.set(k, JSON.stringify(v))
       }
     }
-    for (const value of Object.values(rec)) if (value && typeof value === 'object') visit(value, depth + 1)
   }
-  visit(spec, 0)
-  return [...names].filter(n => /^[A-Za-z0-9_.\-[\]]{1,128}$/.test(n)).slice(0, 24)
+  return out
+}
+
+function requestOfStep(step: unknown): Record<string, unknown> | null {
+  if (!step || typeof step !== 'object' || Array.isArray(step)) return null
+  const rec = step as Record<string, unknown>
+  if (rec.request && typeof rec.request === 'object' && !Array.isArray(rec.request)) {
+    return rec.request as Record<string, unknown>
+  }
+  return rec
+}
+
+/** Extract ONLY the mutated parameter names carried by a replay spec (never endpoint inventory). */
+export function specMutatedParams(spec: unknown): string[] {
+  const names = new Set<string>()
+  const add = (value: unknown) => {
+    if (typeof value === 'string' && VALID_PARAM_NAME.test(value)) names.add(value)
+  }
+  if (!spec || typeof spec !== 'object' || Array.isArray(spec)) return []
+  const rec = spec as Record<string, unknown>
+
+  // 1. Explicit mutated-input declarations take precedence (never widen to unrelated body fields).
+  add(rec.paramName)
+  if (Array.isArray(rec.mutatedParams)) {
+    for (const item of rec.mutatedParams) add(item)
+  }
+  const recipe = rec.recipe && typeof rec.recipe === 'object' && !Array.isArray(rec.recipe)
+    ? rec.recipe as Record<string, unknown>
+    : null
+  const recipeArgs = recipe?.args && typeof recipe.args === 'object' && !Array.isArray(recipe.args)
+    ? recipe.args as Record<string, unknown>
+    : null
+  if (recipeArgs) {
+    for (const key of ['paramName', 'param', 'fieldName', 'field']) add(recipeArgs[key])
+    if (Array.isArray(recipeArgs.mutatedParams)) {
+      for (const item of recipeArgs.mutatedParams) add(item)
+    }
+  }
+  const uploadStep = rec.uploadStep && typeof rec.uploadStep === 'object' && !Array.isArray(rec.uploadStep)
+    ? rec.uploadStep as Record<string, unknown>
+    : null
+  if (uploadStep) add(uploadStep.fieldName)
+  if (names.size > 0) return [...names].slice(0, 24)
+
+  // 2. Step-based specs: collect query/body params introduced or mutated in probe steps vs control.
+  const controlReqs: Record<string, unknown>[] = []
+  const probeReqs: Record<string, unknown>[] = []
+  if (Array.isArray(rec.steps)) {
+    for (const step of rec.steps) {
+      if (!step || typeof step !== 'object' || Array.isArray(step)) continue
+      const role = (step as Record<string, unknown>).role
+      const req = requestOfStep(step)
+      if (!req) continue
+      if (role === 'control') controlReqs.push(req)
+      else if (role === 'probe') probeReqs.push(req)
+    }
+  }
+  const ctrlStepReq = requestOfStep(rec.controlStep)
+  if (ctrlStepReq) controlReqs.push(ctrlStepReq)
+  const probeStepReq = requestOfStep(rec.probeStep)
+  if (probeStepReq) probeReqs.push(probeStepReq)
+  if (Array.isArray(rec.burst)) {
+    for (const item of rec.burst) {
+      const req = requestOfStep(item)
+      if (req) probeReqs.push(req)
+    }
+  }
+
+  if (probeReqs.length > 0) {
+    const controlQuery = new Map<string, Set<string>>()
+    const controlBody = new Map<string, Set<string>>()
+    for (const req of controlReqs) {
+      for (const [k, v] of queryParamMap(req.pathAndQuery ?? req.path)) {
+        const set = controlQuery.get(k) ?? new Set<string>()
+        set.add(v)
+        controlQuery.set(k, set)
+      }
+      for (const [k, v] of bodyFieldMap(req)) {
+        const set = controlBody.get(k) ?? new Set<string>()
+        set.add(v)
+        controlBody.set(k, set)
+      }
+    }
+    for (const req of probeReqs) {
+      for (const [k, v] of queryParamMap(req.pathAndQuery ?? req.path)) {
+        const baseline = controlQuery.get(k)
+        if (!baseline || !baseline.has(v)) add(k)
+      }
+      for (const [k, v] of bodyFieldMap(req)) {
+        const baseline = controlBody.get(k)
+        if (!baseline || !baseline.has(v)) add(k)
+      }
+    }
+    return [...names].slice(0, 24)
+  }
+
+  // 3. Flat spec without steps: query/body keys on the spec itself.
+  for (const key of ['probePath', 'pathAndQuery', 'path']) {
+    for (const k of queryParamMap(rec[key]).keys()) add(k)
+  }
+  for (const k of bodyFieldMap(rec).keys()) add(k)
+  return [...names].slice(0, 24)
 }
 
 /**
@@ -948,6 +1208,11 @@ function specParams(spec: unknown): string[] {
  * inconclusive claims are preserved as proposed/open_proof_gap so the precision
  * denominator reflects what was actually submitted. Dismissed and superseded
  * rows are dropped (the grader treats those as ruled_out).
+ *
+ * Fail-closed invariants:
+ *  - `vulnClass` comes from the verifying spec's probe class (never wildcard-matched).
+ *  - `params` come ONLY from the verifying spec's mutated inputs (never widened to endpoint inventory).
+ *  - Findings with neither a CWE nor a class are stamped `vulnClass: 'unmatched_classless'`.
  */
 export function translateFindings(input: TranslateInput): SubmittedFinding[] {
   const now = input.now ?? Date.now()
@@ -960,12 +1225,6 @@ export function translateFindings(input: TranslateInput): SubmittedFinding[] {
   }
   for (const list of specsByFinding.values()) list.sort((a, b) => b.createdAt - a.createdAt)
   const exchangeById = new Map((input.exchanges ?? []).map(ex => [ex.id, ex]))
-  const paramsByEndpoint = new Map<string, string[]>()
-  for (const p of input.endpointParams ?? []) {
-    const list = paramsByEndpoint.get(p.endpointId) ?? []
-    list.push(p.name)
-    paramsByEndpoint.set(p.endpointId, list)
-  }
 
   const out: SubmittedFinding[] = []
   for (const finding of input.findings) {
@@ -975,11 +1234,16 @@ export function translateFindings(input: TranslateInput): SubmittedFinding[] {
     if (finding.status === 'dismissed') continue
     if (finding.supersededByFindingId) continue
     const specs = specsByFinding.get(finding.id) ?? []
+    const verifyingSpec = specs.find(s => s.lastVerificationDiff?.verdict === 'confirmed')
+      ?? specs.find(s => s.verifiedInline)
+      ?? specs[0]
     const endpoints: ExtractedEndpoint[] = []
     const params = new Set<string>()
     for (const spec of specs.slice(0, 3)) {
       for (const ep of endpointsFromReplaySpec(spec.spec)) endpoints.push(ep)
-      for (const name of specParams(spec.spec)) params.add(name)
+    }
+    if (verifyingSpec) {
+      for (const name of specMutatedParams(verifyingSpec.spec)) params.add(name)
     }
     // Fallback: exchanges persisted with the finding (when no replay spec survived).
     if (!endpoints.length) {
@@ -991,12 +1255,14 @@ export function translateFindings(input: TranslateInput): SubmittedFinding[] {
     const unique = new Map<string, ExtractedEndpoint>()
     for (const ep of endpoints) unique.set(`${ep.method ?? '*'}:${ep.path}`, ep)
     const clean = [...unique.values()]
-    for (const ep of clean) {
-      for (const row of input.endpoints ?? []) {
-        if (!endpointMatches(ep, { method: row.method, path: row.pathTemplate })) continue
-        for (const name of paramsByEndpoint.get(row.id) ?? []) params.add(name)
-      }
-    }
+
+    const specVulnClass = verifyingSpec
+      ? vulnClassFromSpec(verifyingSpec.spec, verifyingSpec.proofReceipt)
+      : undefined
+    const findingClass = probeClassToVulnClass(finding.category)
+    const resolvedVulnClass = specVulnClass ?? findingClass
+    const cwe = finding.cwe?.trim() || undefined
+    const vulnClass = resolvedVulnClass ?? (cwe ? undefined : 'unmatched_classless')
 
     const status: SubmittedFinding['status'] = finding.status === 'confirmed'
       ? 'runtime_confirmed'
@@ -1006,12 +1272,13 @@ export function translateFindings(input: TranslateInput): SubmittedFinding[] {
           ? 'proposed'
           : 'open_proof_gap'
 
-    const submittedAtMs = specs[0]?.createdAt ?? now
+    const submittedAtMs = verifyingSpec?.createdAt ?? specs[0]?.createdAt ?? now
     const severity = finding.severity === 'informational' ? 'low' : finding.severity
     out.push({
       id: finding.id,
       title: redact(finding.title, input.secrets ?? []).slice(0, 200),
-      ...(finding.cwe ? { cwe: finding.cwe } : {}),
+      ...(cwe ? { cwe } : {}),
+      ...(vulnClass ? { vulnClass } : {}),
       severity,
       endpoints: clean,
       ...(params.size ? { params: [...params] } : {}),
@@ -2509,6 +2776,10 @@ export interface CellMeta {
   mode: BenchMode
   /** Effective conventional noun/action route wordlist switch for the deterministic engine. */
   conventionalWordlist: boolean
+  /** True when the conventional noun/action route wordlist was opted in. */
+  wordlistOn: boolean
+  /** False whenever wordlistOn is true (non-reportable). */
+  reportable: boolean
   origin: string
   loginPath: string | null
   gitSha: string
@@ -2680,8 +2951,8 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
   const startedAt = nowMs()
   const slug = cellSlug(app, seed, args.mode)
   // The deterministic engine reads the switch from the environment (same mechanism as
-  // KOVO_DETERMINISTIC_ENGINE). Record the effective value in cell meta as well.
-  if (args.conventionalWordlist) delete process.env.KOVO_CONVENTIONAL_WORDLIST
+  // KOVO_DETERMINISTIC_ENGINE). Record the effective value in cell meta and scorecard JSON.
+  if (args.conventionalWordlist) process.env.KOVO_CONVENTIONAL_WORDLIST = '1'
   else process.env.KOVO_CONVENTIONAL_WORDLIST = '0'
   // The product surface benefits from response-driven object siblings; the procedural capability
   // harness keeps its historical corpus (the flag is opt-in in phase0-recon).
@@ -3277,7 +3548,13 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
     const submitted = translateFindings({
       findings: runtimeFindings,
       replaySpecs: detail.replaySpecs.map(row => ({
-        id: row.id, findingId: row.findingId, spec: row.spec, createdAt: row.createdAt,
+        id: row.id,
+        findingId: row.findingId,
+        spec: row.spec,
+        createdAt: row.createdAt,
+        verifiedInline: row.verifiedInline,
+        lastVerificationDiff: row.lastVerificationDiff,
+        proofReceipt: row.proofReceipt,
       })),
       endpoints: detail.endpoints,
       endpointParams: detail.endpointParams,
@@ -3356,6 +3633,8 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
       loginPath,
       gitSha,
       conventionalWordlist: args.conventionalWordlist,
+      wordlistOn: args.conventionalWordlist,
+      reportable: !args.conventionalWordlist,
       model,
       verifierBackend: backendKind,
       ...concurrencyMeta(args),
@@ -3453,9 +3732,12 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
     const jsonPath = join(args.outDir, `${slug}.json`)
     const mdPath = join(args.outDir, `${slug}.md`)
     const metaPath = join(args.outDir, `${slug}.meta.json`)
-    writeFileSync(jsonPath, `${JSON.stringify(withFalsePositiveEvidence(
-      card as unknown as Record<string, unknown>,
-      falsePositiveEvidence,
+    writeFileSync(jsonPath, `${JSON.stringify(withScorecardReportability(
+      withFalsePositiveEvidence(
+        card as unknown as Record<string, unknown>,
+        falsePositiveEvidence,
+      ),
+      args.conventionalWordlist,
     ), null, 2)}\n`, { mode: 0o600 })
     writeFileSync(mdPath, `${renderScorecard(card, 'md')}\n`, { mode: 0o600 })
 
@@ -3534,7 +3816,22 @@ async function runWithConcurrency<T, R>(
 
 function writeSummary(outDir: string, results: CellResult[]): void {
   const cards = results.map(r => r.scorecard)
-  writeFileSync(join(outDir, 'summary.json'), `${renderScorecard(cards, 'json')}\n`, { mode: 0o600 })
+  const wordlistOn = results.some(r => r.meta.wordlistOn)
+  const rendered = renderScorecard(cards, 'json')
+  try {
+    const parsed = JSON.parse(rendered) as unknown
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      writeFileSync(
+        join(outDir, 'summary.json'),
+        `${JSON.stringify(withScorecardReportability(parsed as Record<string, unknown>, wordlistOn), null, 2)}\n`,
+        { mode: 0o600 },
+      )
+    } else {
+      writeFileSync(join(outDir, 'summary.json'), `${rendered}\n`, { mode: 0o600 })
+    }
+  } catch {
+    writeFileSync(join(outDir, 'summary.json'), `${rendered}\n`, { mode: 0o600 })
+  }
   writeFileSync(join(outDir, 'summary.md'), `${renderScorecard(cards, 'md')}\n`, { mode: 0o600 })
 }
 

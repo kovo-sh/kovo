@@ -11,6 +11,7 @@
 // on synthetic, authorized loopback targets. It never attacks third-party systems.
 
 import { spawn, spawnSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -181,7 +182,8 @@ export interface SmokeArgs {
   dataDir: string
   snapshotRoot: string
   floorScorecard?: string
-  liftBaseline: number
+  /** Explicit prior agentic net-new baseline; null unless --lift-baseline is passed. */
+  liftBaseline: number | null
   corpusPath: string
   json: boolean
   calibrate: boolean
@@ -210,8 +212,8 @@ Tier 1 (~6 min, ~$1, four parallel cells):
   1. paired lift       acme-saas post-floor snapshot, 300 s agentic; reports net-new
                        vs the floor and floor preservation.
   2. rotating app      shopflow or opsportal post-floor snapshot, 300 s; rotates by
-                       --cell-index or day of year. Missing snapshot falls back to a
-                       cold run and captures a snapshot for next time.
+                       --cell-index or deterministically from seed/SHA. Missing snapshot
+                       falls back to a cold run and captures a snapshot for next time.
   3. precision trap    hardened zero-vuln target with writable-looking decoys, 240 s;
                        any confirmed vulnerability finding fails the cell.
   4. micro-slice       realism #2 (async OOB), #3 (staging race/write-BOLA), #4
@@ -226,7 +228,7 @@ Tier 2 (documented, not run by default):
 Flags:
   --tier <0|1|2>            default 1 (runs Tier 0 then Tier 1); 2 prints docs only
   --dry-run                 plan cells and evaluate the corpus; no model/worker calls
-  --cell-index <n>          rotation index (default 0; date is used when omitted)
+  --cell-index <n>          rotation index (default: deterministic from seed/SHA)
   --seed <n>                dev seed for lift/rotation/trap (default 1)
   --duration-sec <n>        lift/rotation budget (default 300)
   --trap-duration-sec <n>   trap budget (default 240)
@@ -238,9 +240,9 @@ Flags:
   --data-dir <path>         Kovo Hunter data dir (default $KOVO_DATA_DIR or
                             /home/omarchy/guardian-data)
   --snapshot-root <path>    post-floor checkpoints (default <out-dir>/snapshots)
-  --floor-scorecard <path>  baseline floor scorecard used for net-new/preservation
-                            (default <snapshot-root>/baseline/<app>-seed<n>-grey-box.json)
-  --lift-baseline <n>       prior agentic net-new baseline (default 0)
+  --floor-scorecard <path>  pinned baseline floor scorecard used for net-new/preservation
+                            (required with or instead of --lift-baseline; otherwise UNMEASURED)
+  --lift-baseline <n>       explicit prior agentic net-new baseline (no default; UNMEASURED if omitted without pinned --floor-scorecard)
   --corpus <path>           archetype corpus JSON (default traps/fp-archetypes.json)
   --micro-fixtures <csv>    micro-slice fixtures (default #2,#3,#4)
   --budget-usd-per-cell <n> USD cap per cell (default 0.80)
@@ -326,7 +328,7 @@ export function parseSmokeArgs(argv: string[], _env: NodeJS.ProcessEnv = process
       microReconTimeoutSec: DEFAULT_MICRO_RECON_TIMEOUT_SEC,
       outDir: DEFAULT_OUT,
       dataDir: DEFAULT_DATA_DIR, snapshotRoot: join(DEFAULT_OUT, 'snapshots'),
-      liftBaseline: 0, corpusPath: CORPUS_PATH, json: false, calibrate: false,
+      liftBaseline: null, corpusPath: CORPUS_PATH, json: false, calibrate: false,
       rerunOnMinusOne: false, skipWorkerGate: false, microFixtures: [...MICRO_FIXTURES],
       budgetUsdPerCell: 0.8, help: true,
     }
@@ -345,17 +347,22 @@ export function parseSmokeArgs(argv: string[], _env: NodeJS.ProcessEnv = process
     : [...MICRO_FIXTURES]
   const budget = Number(str(flags, 'budget-usd-per-cell') ?? '0.8')
   if (!Number.isFinite(budget) || budget <= 0) fail('--budget-usd-per-cell must be a positive number')
-  const liftBaselineRaw = Number(str(flags, 'lift-baseline') ?? '0')
-  if (!Number.isFinite(liftBaselineRaw) || liftBaselineRaw < 0) fail('--lift-baseline must be >= 0')
-  const now = new Date()
-  const defaultCellIndex = Math.floor((now.getTime() - Date.UTC(now.getUTCFullYear(), 0, 0)) / 86_400_000)
+  const liftBaselineFlag = str(flags, 'lift-baseline')
+  let liftBaseline: number | null = null
+  if (liftBaselineFlag !== undefined) {
+    const parsed = Number(liftBaselineFlag)
+    if (!Number.isFinite(parsed) || parsed < 0) fail('--lift-baseline must be >= 0')
+    liftBaseline = parsed
+  }
+  const seed = positiveInt(str(flags, 'seed'), '--seed', 1)
+  const defaultCellIndex = deterministicRotationIndex(seed, gitSha()) % ROTATION_APPS.length
   if (flags.calibrate === true && !str(flags, 'variants')) fail('--calibrate requires --variants <json>')
   return {
     repoRoot: ROOT,
     tier: Number(tierRaw) as Tier,
     dryRun: flags['dry-run'] === true,
     cellIndex: nonNegativeInt(str(flags, 'cell-index'), '--cell-index', defaultCellIndex),
-    seed: positiveInt(str(flags, 'seed'), '--seed', 1),
+    seed,
     durationSec: positiveInt(str(flags, 'duration-sec'), '--duration-sec', 300),
     trapDurationSec: positiveInt(str(flags, 'trap-duration-sec'), '--trap-duration-sec', 240),
     microDurationSec: positiveInt(str(flags, 'micro-duration-sec'), '--micro-duration-sec', 300),
@@ -366,7 +373,7 @@ export function parseSmokeArgs(argv: string[], _env: NodeJS.ProcessEnv = process
     dataDir: str(flags, 'data-dir') ?? DEFAULT_DATA_DIR,
     snapshotRoot,
     floorScorecard: str(flags, 'floor-scorecard'),
-    liftBaseline: liftBaselineRaw,
+    liftBaseline,
     corpusPath: str(flags, 'corpus') ?? CORPUS_PATH,
     json: flags.json === true,
     calibrate: flags.calibrate === true,
@@ -530,15 +537,33 @@ export function runCorpus(path: string): { results: ArchetypeResult[]; pass: boo
 // Rotation
 // ---------------------------------------------------------------------------
 
-export function rotateSecondApp(opts: { cellIndex?: number; date?: Date } = {}): typeof ROTATION_APPS[number] {
+/** Deterministic rotation index derived strictly from (seed, sha) — never wall-clock date. */
+export function deterministicRotationIndex(seed: number, sha?: string): number {
+  const key = `${Math.trunc(seed)}:${(sha ?? '').trim()}`
+  return createHash('sha256').update(key).digest().readUInt32BE(0)
+}
+
+export function rotateSecondApp(
+  opts: { cellIndex?: number; seed?: number; sha?: string; date?: Date } = {},
+): typeof ROTATION_APPS[number] {
   const index = opts.cellIndex
   if (index !== undefined && Number.isFinite(index)) {
     return ROTATION_APPS[Math.abs(Math.trunc(index)) % ROTATION_APPS.length]!
   }
-  const date = opts.date ?? new Date()
-  const start = Date.UTC(date.getUTCFullYear(), 0, 0)
-  const dayOfYear = Math.floor((date.getTime() - start) / 86_400_000)
-  return ROTATION_APPS[Math.abs(dayOfYear) % ROTATION_APPS.length]!
+  if (opts.seed !== undefined || opts.sha !== undefined) {
+    const seed = opts.seed ?? 1
+    const derived = opts.sha
+      ? deterministicRotationIndex(seed, opts.sha)
+      : Math.abs(Math.trunc(seed))
+    return ROTATION_APPS[derived % ROTATION_APPS.length]!
+  }
+  if (opts.date !== undefined) {
+    const start = Date.UTC(opts.date.getUTCFullYear(), 0, 0)
+    const dayOfYear = Math.floor((opts.date.getTime() - start) / 86_400_000)
+    return ROTATION_APPS[Math.abs(dayOfYear) % ROTATION_APPS.length]!
+  }
+  const derived = deterministicRotationIndex(1, gitSha())
+  return ROTATION_APPS[derived % ROTATION_APPS.length]!
 }
 
 // ---------------------------------------------------------------------------
@@ -578,16 +603,41 @@ export interface GateResult {
   id: string
   label: string
   pass: boolean
+  status?: 'PASS' | 'FAIL' | 'UNMEASURED'
   observed: string
 }
 
 export interface GateInput {
   cells: CellMetrics[]
-  liftBaseline: number
+  liftBaseline: number | null
   baselineConversion: number | null
+  /** True when a pinned floor scorecard path was explicitly provided and loaded. */
+  hasPinnedBaseline?: boolean
   trapConfirmed: number
   rerunExecuted: boolean
+  /** Both runs when `runLiftCellTwice` executed a rerun; gating uses the worse run. */
+  liftRuns?: CellMetrics[]
   perCellBudgetUsd: number
+}
+
+/** Fail-closed comparison of two lift runs: returns the worse run for gating. */
+export function selectWorseLiftRun(first: CellMetrics, second: CellMetrics): CellMetrics {
+  const rank = (cell: CellMetrics): [number, number, number, number, number, number, number, number] => [
+    cell.error !== undefined ? 0 : 1,
+    -cell.crashes,
+    -(cell.decoyFalsePositives + cell.unmatchedFalsePositives),
+    cell.precision,
+    cell.netNew === null ? Number.NEGATIVE_INFINITY : cell.netNew,
+    cell.conversion === null ? Number.NEGATIVE_INFINITY : cell.conversion,
+    cell.confirmed,
+    -cell.costUsd,
+  ]
+  const a = rank(first)
+  const b = rank(second)
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i]! !== b[i]!) return a[i]! < b[i]! ? first : second
+  }
+  return first
 }
 
 const pct = (value: number | null | undefined): string =>
@@ -595,8 +645,14 @@ const pct = (value: number | null | undefined): string =>
 
 /** Gates are pure so CI fixtures can exercise pass/fail without starting a run. */
 export function evaluateGates(input: GateInput): GateResult[] {
-  const agentic = input.cells.filter(cell => cell.kind === 'lift' || cell.kind === 'rotation')
-  const lift = input.cells.find(cell => cell.kind === 'lift') ?? null
+  const worstLiftFromRuns = input.liftRuns && input.liftRuns.length > 0
+    ? input.liftRuns.reduce(selectWorseLiftRun)
+    : null
+  const effectiveCells = worstLiftFromRuns
+    ? input.cells.map(cell => (cell.kind === 'lift' ? worstLiftFromRuns : cell))
+    : input.cells
+  const agentic = effectiveCells.filter(cell => cell.kind === 'lift' || cell.kind === 'rotation')
+  const lift = worstLiftFromRuns ?? effectiveCells.find(cell => cell.kind === 'lift') ?? null
   const gates: GateResult[] = []
 
   const precisionFailures = agentic.filter(cell =>
@@ -620,28 +676,42 @@ export function evaluateGates(input: GateInput): GateResult[] {
   })
 
   const netNew = lift?.netNew ?? null
-  const canAllowMinusOne = input.rerunExecuted
-  const netNewPass = netNew !== null && (
-    netNew >= input.liftBaseline ||
-    (canAllowMinusOne && netNew === input.liftBaseline - 1 &&
-      lift !== null && input.baselineConversion !== null &&
-      (lift.conversion ?? -1) >= input.baselineConversion)
-  )
-  gates.push({
-    id: 'paired-net-new',
-    label: `paired net-new >= baseline (${input.liftBaseline})`,
-    pass: netNewPass,
-    observed: netNew === null
-      ? 'not measured'
-      : `${netNew} (${canAllowMinusOne ? '-1 rerun allowance active' : 'no -1 allowance'})`,
-  })
+  const hasExplicitBaseline = input.liftBaseline !== null || input.hasPinnedBaseline === true
+  if (!hasExplicitBaseline) {
+    gates.push({
+      id: 'paired-net-new',
+      label: 'paired net-new >= baseline (unconfigured)',
+      pass: false,
+      status: 'UNMEASURED',
+      observed: 'UNMEASURED (pass --lift-baseline <n> or pinned --floor-scorecard <path>)',
+    })
+  } else {
+    const threshold = input.liftBaseline ?? 0
+    const canAllowMinusOne = input.rerunExecuted && input.liftBaseline !== null
+    const netNewPass = netNew !== null && (
+      netNew >= threshold ||
+      (canAllowMinusOne && netNew === threshold - 1 &&
+        lift !== null && input.baselineConversion !== null &&
+        (lift.conversion ?? -1) >= input.baselineConversion)
+    )
+    gates.push({
+      id: 'paired-net-new',
+      label: `paired net-new >= baseline (${threshold})`,
+      pass: netNewPass,
+      status: netNewPass ? 'PASS' : 'FAIL',
+      observed: netNew === null
+        ? 'UNMEASURED (no floor baseline scorecard)'
+        : `${netNew} (${canAllowMinusOne ? '-1 rerun allowance active' : 'no -1 allowance'})`,
+    })
+  }
 
   if (input.baselineConversion === null) {
     gates.push({
       id: 'conversion',
       label: 'conversion drop <= 10pp',
       pass: false,
-      observed: 'baseline conversion not measured',
+      status: 'UNMEASURED',
+      observed: 'UNMEASURED (baseline conversion not measured)',
     })
   } else {
     const conversion = lift?.conversion ?? null
@@ -655,13 +725,13 @@ export function evaluateGates(input: GateInput): GateResult[] {
     })
   }
 
-  const crashes = input.cells.reduce((sum, cell) => sum + cell.crashes, 0)
+  const crashes = effectiveCells.reduce((sum, cell) => sum + cell.crashes, 0)
   gates.push({
     id: 'crashes',
     label: '0 RPC/sandbox crashes',
-    pass: input.cells.length > 0 && crashes === 0 && input.cells.every(cell => cell.error === undefined),
+    pass: effectiveCells.length > 0 && crashes === 0 && effectiveCells.every(cell => cell.error === undefined),
     observed: crashes === 0
-      ? (input.cells.some(cell => cell.error !== undefined) ? `cell error: ${input.cells.find(cell => cell.error)!.id}` : '0')
+      ? (effectiveCells.some(cell => cell.error !== undefined) ? `cell error: ${effectiveCells.find(cell => cell.error)!.id}` : '0')
       : String(crashes),
   })
 
@@ -685,15 +755,15 @@ export function evaluateGates(input: GateInput): GateResult[] {
     observed: lift ? `${lift.completedAssignments} completed` : 'not measured',
   })
 
-  const overBudget = input.cells.filter(cell => cell.costUsd > input.perCellBudgetUsd)
+  const overBudget = effectiveCells.filter(cell => cell.costUsd > input.perCellBudgetUsd)
   gates.push({
     id: 'cost',
     label: `cost <= $${input.perCellBudgetUsd.toFixed(2)}/cell`,
-    pass: input.cells.length > 0 && overBudget.length === 0,
-    observed: input.cells.length === 0
+    pass: effectiveCells.length > 0 && overBudget.length === 0,
+    observed: effectiveCells.length === 0
       ? 'not measured'
       : overBudget.length === 0
-        ? `total $${input.cells.reduce((sum, cell) => sum + cell.costUsd, 0).toFixed(4)}`
+        ? `total $${effectiveCells.reduce((sum, cell) => sum + cell.costUsd, 0).toFixed(4)}`
         : `over: ${overBudget.map(cell => `${cell.id}=$${cell.costUsd.toFixed(3)}`).join(', ')}`,
   })
 
@@ -733,12 +803,12 @@ export function confirmedSiteIds(card: ScorecardLike | null): string[] {
 }
 
 export function preservedSiteIds(card: ScorecardLike | null, baselineIds: string[]): number {
-  const matched = new Set(
+  const confirmed = new Set(
     (card?.vulns ?? [])
-      .filter(vuln => vuln.outcome === 'confirmed' || (vuln.matchedFindingIds?.length ?? 0) > 0)
+      .filter(vuln => vuln.outcome === 'confirmed')
       .map(vuln => vuln.siteId),
   )
-  return baselineIds.filter(id => matched.has(id)).length
+  return baselineIds.filter(id => confirmed.has(id)).length
 }
 
 /**
@@ -768,7 +838,7 @@ export interface CellAccountingInput {
   source: CellMetrics['source']
   card: ScorecardLike | null
   baseline: ScorecardLike | null
-  liftBaseline: number
+  liftBaseline: number | null
   /** Finding IDs already `runtime_confirmed` inside the resumed snapshot's `kovo.sqlite`. */
   snapshotFindingIds?: ReadonlySet<string>
   /** Finding IDs currently `runtime_confirmed` inside the resumed run's `kovo.sqlite`. */
@@ -800,19 +870,19 @@ export interface CellAccounting {
  * lost floor findings genuinely drop conversion and fail the `conversion drop <= 10pp` gate).
  */
 export function computeCellAccounting(input: CellAccountingInput): CellAccounting {
-  const { kind, source, card, baseline, liftBaseline } = input
+  const { kind, source, card, baseline } = input
   const confirmed = card?.confirmed ?? 0
   const baselineIds = confirmedSiteIds(baseline)
   const snapIds = input.snapshotFindingIds ?? new Set<string>()
   const resumedIds = input.resumedFindingIds
-  const floorConfirmed = baseline?.confirmed ?? (kind === 'lift' ? liftBaseline : (source === 'snapshot' && snapIds.size > 0 ? snapIds.size : null))
+  const floorConfirmed = baseline?.confirmed ?? (source === 'snapshot' && snapIds.size > 0 ? snapIds.size : null)
 
   if (source !== 'snapshot') {
     const floorPreserved = kind === 'lift' && baselineIds.length > 0
       ? preservedSiteIds(card, baselineIds)
       : null
     const netNew = kind === 'lift'
-      ? Math.max(0, confirmed - (floorConfirmed ?? 0))
+      ? (card && floorConfirmed !== null ? confirmed - floorConfirmed : null)
       : (card ? confirmed : null)
     const conversion = (card?.targets ?? 0) > 0 ? confirmed / card!.targets! : conversionOf(card)
     return { confirmed, floorConfirmed, floorPreserved, netNew, effectiveConfirmed: confirmed, conversion }
@@ -825,7 +895,10 @@ export function computeCellAccounting(input: CellAccountingInput): CellAccountin
   if (baselineIds.length > 0) {
     const matched = new Set(
       vulns
-        .filter(vuln => vuln.outcome === 'confirmed' || (vuln.matchedFindingIds?.length ?? 0) > 0)
+        .filter(vuln =>
+          vuln.outcome === 'confirmed' ||
+          (snapIds.size > 0 && (vuln.matchedFindingIds ?? []).some(id => snapIds.has(id) && (!resumedIds || resumedIds.has(id)))),
+        )
         .map(vuln => vuln.siteId),
     )
     preservedSites = new Set(baselineIds.filter(id => matched.has(id)))
@@ -1632,27 +1705,46 @@ async function runMicroCell(plan: CellPlan, opts: SmokeArgs): Promise<CellMetric
   }
 }
 
-async function runLiftCellTwice(plan: CellPlan, opts: SmokeArgs): Promise<{ cell: CellMetrics; rerun: boolean }> {
-  const first = await runRealisticCell(plan, opts)
-  if (!opts.rerunOnMinusOne || first.netNew === null) return { cell: first, rerun: false }
-  const resolved = resolveLiftBaseline({
-    floorScorecard: opts.floorScorecard,
-    snapshotRoot: opts.snapshotRoot,
-    defaultSnapshotRoot: join(DEFAULT_OUT, 'snapshots'),
-    snapshotDir: plan.snapshot,
-    app: plan.app,
-    seed: opts.seed,
-    liftTargets: first.targets,
-  })
+export interface LiftRunOutcome {
+  /** Worse run of the pair when rerun occurred; used for all gating decisions. */
+  cell: CellMetrics
+  /** All executed lift runs (length 1 normally, length 2 on rerun), preserved for reporting. */
+  runs: CellMetrics[]
+  rerun: boolean
+}
+
+export async function runLiftCellTwice(
+  plan: CellPlan,
+  opts: SmokeArgs,
+  runCellFn: (plan: CellPlan, opts: SmokeArgs) => Promise<CellMetrics> = runRealisticCell,
+  baselineOverride?: ResolvedLiftBaseline | null,
+): Promise<LiftRunOutcome> {
+  const first = await runCellFn(plan, opts)
+  if (!opts.rerunOnMinusOne || opts.liftBaseline === null || first.netNew === null) {
+    return { cell: first, runs: [first], rerun: false }
+  }
+  const resolved = baselineOverride !== undefined
+    ? baselineOverride
+    : resolveLiftBaseline({
+        floorScorecard: opts.floorScorecard,
+        snapshotRoot: opts.snapshotRoot,
+        defaultSnapshotRoot: join(DEFAULT_OUT, 'snapshots'),
+        snapshotDir: plan.snapshot,
+        app: plan.app,
+        seed: opts.seed,
+        liftTargets: first.targets,
+      })
   const baselineConversion = resolved?.conversion ?? null
   const improved = baselineConversion !== null && (first.conversion ?? -1) > baselineConversion
   if (first.netNew === opts.liftBaseline - 1 && improved) {
-    // Re-run only the lift cell, into a sibling directory so the first artifact is preserved.
+    // Re-run only the lift cell into a sibling directory so both artifacts are preserved;
+    // report BOTH runs and gate on the worse run (never cherry-pick the rerun).
     const rerunPlan: CellPlan = { ...plan, outDir: `${plan.outDir}-rerun` }
-    const second = await runRealisticCell(rerunPlan, opts)
-    return { cell: second, rerun: true }
+    const second = await runCellFn(rerunPlan, opts)
+    const worse = selectWorseLiftRun(first, second)
+    return { cell: worse, runs: [first, second], rerun: true }
   }
-  return { cell: first, rerun: false }
+  return { cell: first, runs: [first], rerun: false }
 }
 
 // ---------------------------------------------------------------------------
@@ -1671,6 +1763,8 @@ export interface SmokeReport {
     pass: boolean
   }
   cells: CellMetrics[]
+  /** All runs executed for the lift cell (both runs when rerun triggered; gated on the worse one). */
+  liftRuns?: CellMetrics[]
   gates: GateResult[]
   totals: {
     confirmed: number
@@ -1757,6 +1851,12 @@ async function runTierOne(opts: SmokeArgs, report: SmokeReport): Promise<void> {
     runMicroCell(microPlan, opts),
   ])
   report.cells = [lift.cell, rotation, trap, micro]
+  report.liftRuns = lift.runs
+  if (lift.runs.length > 1) {
+    report.notes.push(
+      `lift rerun executed (${lift.runs.map((r, i) => `run${i + 1}: netNew=${r.netNew ?? 'n/a'} conv=${pct(r.conversion)} prec=${pct(r.precision)}`).join(', ')}); gating on worse run`,
+    )
+  }
   const baseline = resolveLiftBaseline({
     floorScorecard: opts.floorScorecard,
     snapshotRoot: opts.snapshotRoot,
@@ -1766,12 +1866,15 @@ async function runTierOne(opts: SmokeArgs, report: SmokeReport): Promise<void> {
     seed: opts.seed,
     liftTargets: lift.cell.targets,
   })
+  const hasPinnedBaseline = Boolean(opts.floorScorecard && baseline?.source === 'floor-scorecard')
   report.gates = evaluateGates({
     cells: report.cells,
     liftBaseline: opts.liftBaseline,
     baselineConversion: baseline?.conversion ?? null,
+    hasPinnedBaseline,
     trapConfirmed: trap.confirmed,
     rerunExecuted: lift.rerun,
+    liftRuns: lift.runs,
     perCellBudgetUsd: opts.budgetUsdPerCell,
   })
   report.totals = {
@@ -1971,7 +2074,8 @@ function printReport(report: SmokeReport, opts: SmokeArgs): void {
   if (report.gates.length > 0) {
     process.stdout.write('\n')
     for (const gate of report.gates) {
-      process.stdout.write(`${gate.pass ? 'PASS' : 'FAIL'}  ${gate.id.padEnd(18)} ${gate.observed}\n`)
+      const tag = gate.status ?? (gate.pass ? 'PASS' : 'FAIL')
+      process.stdout.write(`${tag.padEnd(10)} ${gate.id.padEnd(18)} ${gate.observed}\n`)
     }
     process.stdout.write(`\ntotal cost: $${report.totals.costUsd.toFixed(4)}; net-new: ${report.totals.netNew ?? 'n/a'}\n`)
   }

@@ -69,6 +69,8 @@ export interface TargetTrace {
   spaCatchall?: boolean
   /** The run budget (requests/time) ran out before the target was fully processed. */
   budgetExhausted?: boolean
+  /** True when a confirmed claim had no compatible manifest entry (off-manifest over-claim). */
+  unmatchedConfirmed?: boolean
   notes?: string[]
 }
 
@@ -164,9 +166,57 @@ export function buildFailureTaxonomy(traces: readonly TargetTrace[]): FailureTax
   return taxonomy
 }
 
-/** Decoys that reached `confirmed` count as false positives. */
-export function countFalsePositives(traces: readonly TargetTrace[]): number {
-  return traces.filter(t => t.isDecoy && normalizeTrace(t).confirmed).length
+export interface FalsePositiveBreakdown {
+  decoyFalsePositives: number
+  unmatchedConfirmed: number
+  total: number
+}
+
+function extraUnmatchedCount(unmatchedConfirmed?: readonly unknown[] | number): number {
+  if (typeof unmatchedConfirmed === 'number') {
+    return Number.isFinite(unmatchedConfirmed) ? Math.max(0, Math.trunc(unmatchedConfirmed)) : 0
+  }
+  return Array.isArray(unmatchedConfirmed) ? unmatchedConfirmed.length : 0
+}
+
+/** Separate decoy FPs from off-manifest unmatched confirmed claims and sum both. */
+export function countFalsePositiveBreakdown(
+  traces: readonly TargetTrace[],
+  unmatchedConfirmed?: readonly unknown[] | number,
+): FalsePositiveBreakdown {
+  const decoyFalsePositives = traces.filter(t => t.isDecoy && normalizeTrace(t).confirmed).length
+  const traceUnmatched = traces.filter(t => !t.isDecoy && t.unmatchedConfirmed === true && normalizeTrace(t).confirmed).length
+  const unmatched = traceUnmatched + extraUnmatchedCount(unmatchedConfirmed)
+  return {
+    decoyFalsePositives,
+    unmatchedConfirmed: unmatched,
+    total: decoyFalsePositives + unmatched,
+  }
+}
+
+/**
+ * Decoys that reached `confirmed` plus off-manifest `unmatchedConfirmed` claims count as false
+ * positives. Pass `{ includeBreakdown: true }` to inspect decoy vs unmatched counts separately.
+ */
+export function countFalsePositives(traces: readonly TargetTrace[]): number
+export function countFalsePositives(
+  traces: readonly TargetTrace[],
+  unmatchedConfirmed: readonly unknown[] | number,
+): number
+export function countFalsePositives(
+  traces: readonly TargetTrace[],
+  options: { includeBreakdown: true; unmatchedConfirmed?: readonly unknown[] | number },
+): FalsePositiveBreakdown
+export function countFalsePositives(
+  traces: readonly TargetTrace[],
+  unmatchedOrOptions?: readonly unknown[] | number | { includeBreakdown?: boolean; unmatchedConfirmed?: readonly unknown[] | number },
+): number | FalsePositiveBreakdown {
+  if (unmatchedOrOptions && typeof unmatchedOrOptions === 'object' && !Array.isArray(unmatchedOrOptions)) {
+    const opts = unmatchedOrOptions as { includeBreakdown?: boolean; unmatchedConfirmed?: readonly unknown[] | number }
+    const breakdown = countFalsePositiveBreakdown(traces, opts.unmatchedConfirmed)
+    return opts.includeBreakdown ? breakdown : breakdown.total
+  }
+  return countFalsePositiveBreakdown(traces, unmatchedOrOptions as readonly unknown[] | number | undefined).total
 }
 
 // ---------------------------------------------------------------------------
@@ -800,6 +850,7 @@ export interface BenchmarkSuiteResult {
   decoysTotal: number
   confirmedCount: number
   falsePositiveCount: number
+  unmatchedConfirmedCount?: number
   funnelCounts: BenchmarkFunnel
   failureTaxonomy: FailureTaxonomy
   recall: number
@@ -858,7 +909,7 @@ export function formatBenchmarkMarkdown(result: BenchmarkSuiteResult): string {
   lines.push(`| Recall | ${pct(result.recall)} | ${pct(diff?.baselineRecall ?? null)} | ${signedPct(diff?.recallDelta ?? null)} |`)
   lines.push(`| Precision | ${pct(result.precision)} | ${pct(diff?.baselinePrecision ?? null)} | ${signedPct(diff?.precisionDelta ?? null)} |`)
   lines.push(`| Confirmed | ${result.confirmedCount}/${result.targetsTotal} | n/a | ${signed(diff?.confirmedDelta ?? null)} |`)
-  lines.push(`| False positives (decoys: ${result.decoysTotal}) | ${result.falsePositiveCount} | n/a | ${signed(diff?.fpDelta ?? null)} |`)
+  lines.push(`| False positives (decoys: ${result.decoysTotal}${result.unmatchedConfirmedCount !== undefined ? `, unmatchedConfirmed: ${result.unmatchedConfirmedCount}` : ''}) | ${result.falsePositiveCount} | n/a | ${signed(diff?.fpDelta ?? null)} |`)
   lines.push(`| Cost per vuln | ${usd(result.costPerVuln)} | ${usd(diff?.baselineCostPerVuln ?? null)} | ${signed(diff?.costPerVulnDelta ?? null, 4)} |`)
   lines.push('')
   lines.push('## Funnel')

@@ -93,28 +93,30 @@ export interface ScoringInput {
 }
 
 const classCompat: Array<[RegExp, string[]]> = [
-  [/sqli_time|time/i, ['sqli_time_diff']],
-  [/sqli|sql/i, ['sqli_boolean', 'sqli_time_diff']],
-  [/idor|bola|bfla|authz|access/i, ['authz_matrix']],
-  [/ssti|template/i, ['ssti_math']],
-  [/ssrf/i, ['ssrf_canary']],
-  [/xxe/i, ['xxe_canary']],
-  [/xss|browser|dom/i, ['xss_context']],
-  [/jwt|oauth|auth/i, ['auth_protocol_audit']],
-  [/path|traversal/i, ['path_traversal_benign']],
-  [/mass/i, ['mass_assignment']],
-  [/cache/i, ['cache_poison_deception']],
-  [/graphql/i, ['graphql_audit', 'sqli_boolean', 'authz_matrix']],
-  [/second_order|stored/i, ['xss_context', 'ssrf_canary']],
-  [/race/i, ['race_burst', 'workflow_invariant']],
-  [/workflow|business/i, ['workflow_invariant', 'race_burst']],
-  [/command|os_command|rce/i, ['command_injection']],
-  [/csrf/i, ['sqli_boolean', 'authz_matrix', 'xss_context']],
+  [/^(?:decoy_)?sqli_time(?:_blind|_diff)?$/i, ['sqli_time_diff']],
+  [/^(?:decoy_|graphql_)?sqli(?:_boolean|_form_csrf)?$/i, ['sqli_boolean', 'sqli_time_diff']],
+  [/^(?:decoy_|graphql_|server_action_)?(?:idor|bola|bfla|authz|access_control)$/i, ['authz_matrix']],
+  [/^(?:decoy_)?(?:ssti|template_injection)$/i, ['ssti_math']],
+  [/^(?:decoy_|second_order_)?ssrf$/i, ['ssrf_canary']],
+  [/^(?:decoy_)?xxe$/i, ['xxe_canary']],
+  [/^(?:decoy_|second_order_)?(?:xss|xss_reflected|xss_stored|dom_xss|browser_chain|browser_dom)$/i, ['xss_context']],
+  [/^(?:decoy_)?(?:jwt(?:_[a-z0-9_]+)?|oauth|auth_oauth|auth_bypass|auth_protocol)$/i, ['auth_protocol_audit']],
+  [/^(?:decoy_)?(?:path_traversal|directory_traversal|lfi)$/i, ['path_traversal_benign']],
+  [/^(?:decoy_)?mass_assignment$/i, ['mass_assignment']],
+  [/^(?:decoy_)?cache(?:_poison|_poisoning|_deception)?$/i, ['cache_poison_deception']],
+  [/^(?:decoy_)?graphql(?:_audit|_introspection)?$/i, ['graphql_audit']],
+  [/^second_order$/i, ['xss_context', 'ssrf_canary']],
+  [/^(?:decoy_)?race(?:_condition|_burst|_double_spend)?$/i, ['race_burst']],
+  [/^(?:decoy_)?(?:workflow_skip|workflow_bypass|workflow_invariant|business_logic)$/i, ['workflow_invariant']],
+  [/^(?:decoy_)?(?:command_injection|os_command|rce)$/i, ['command_injection']],
+  [/^(?:decoy_)?csrf$/i, ['csrf']],
 ]
 
 export function compatibleClasses(vulnClass: string): string[] | null {
+  const normalized = vulnClass.trim()
+  if (!normalized) return null
   const out = new Set<string>()
-  for (const [re, classes] of classCompat) if (re.test(vulnClass)) for (const c of classes) out.add(c)
+  for (const [re, classes] of classCompat) if (re.test(normalized)) for (const c of classes) out.add(c)
   return out.size ? [...out] : null
 }
 
@@ -163,4 +165,26 @@ export function scoreChallenge(c: ManifestChallenge, input: ScoringInput): Targe
 
 export function scoreManifest(challenges: readonly ManifestChallenge[], input: ScoringInput): TargetTrace[] {
   return challenges.map(c => scoreChallenge(c, input))
+}
+
+/**
+ * Confirmed outcomes that did not match any manifest entry (neither a planted vuln nor a decoy).
+ * Surfaces off-manifest over-claims so legacy 100%-precision gates cannot ignore them.
+ */
+export function findUnmatchedConfirmedOutcomes(
+  challenges: readonly ManifestChallenge[],
+  input: Pick<ScoringInput, 'outcomes' | 'sharedEndpointKeys'>,
+): ScoredOutcome[] {
+  const shared = input.sharedEndpointKeys ?? sharedEndpointKeys(challenges)
+  return input.outcomes.filter(outcome => {
+    if (!outcome.confirmed) return false
+    const matchedAny = challenges.some(c => {
+      if (!endpointMatches(c.endpoint, outcome.path)) return false
+      const compat = compatibleClasses(c.vulnClass)
+      if (!compat || !compat.includes(outcome.probeClass)) return false
+      const strictBinding = shared.has(endpointKey(c.endpoint))
+      return !strictBinding || specBindsParam(outcome.specSubject, c.param)
+    })
+    return !matchedAny
+  })
 }
