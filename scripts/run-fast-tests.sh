@@ -494,6 +494,85 @@ let idx = 0
 const results = []
 const preferredTmpRoot = process.env.TMPDIR || undefined
 
+function formatFailureDiagnostic(rawError) {
+  if (!rawError) return ''
+  const lines = String(rawError)
+    .split(/\r?\n/)
+    .map(l => l.trim())
+    .filter(Boolean)
+    .slice(0, 3)
+  if (lines.length === 0) return ''
+  const joined = lines.join('\n')
+  return joined.length > 300 ? `${joined.slice(0, 297)}...` : joined
+}
+
+function extractMultilineTapErrors(tapText) {
+  const lines = tapText.split(/\r?\n/)
+  const out = []
+  let i = 0
+  while (i < lines.length) {
+    const resM = /^((?:    )*)not ok \d+(?: - (.*))?$/.exec(lines[i])
+    if (!resM) {
+      i += 1
+      continue
+    }
+    let type = 'test'
+    let failureType = ''
+    let errorLines = []
+    if (i + 1 < lines.length && /^(\s+)---$/.test(lines[i + 1])) {
+      const yamlIndent = /^(\s+)---$/.exec(lines[i + 1])[1]
+      const blockPrefix = `${yamlIndent}  `
+      i += 2
+      let inErrorBlock = false
+      while (i < lines.length && lines[i] !== `${yamlIndent}...`) {
+        const yLine = lines[i]
+        if (inErrorBlock) {
+          if (yLine.startsWith(blockPrefix) || yLine.trim() === '') {
+            const txt = yLine.trim()
+            if (txt && errorLines.length < 4) errorLines.push(txt)
+            i += 1
+            continue
+          }
+          inErrorBlock = false
+        }
+        if (yLine.startsWith(yamlIndent)) {
+          const trimmed = yLine.slice(yamlIndent.length)
+          const tm = /^type:\s*'?([^']+)'?$/.exec(trimmed)
+          if (tm) type = tm[1].trim()
+          const fm = /^failureType:\s*'?([^']+)'?$/.exec(trimmed)
+          if (fm) failureType = fm[1].trim()
+          const em = /^error:\s*(.*)$/.exec(trimmed)
+          if (em) {
+            const val = em[1].trim()
+            if (val === '|-' || val === '|' || val === '>-' || val === '>') {
+              inErrorBlock = true
+            } else if (val) {
+              errorLines = [val.replace(/^['"]|['"]$/g, '').trim()]
+            }
+          }
+        }
+        i += 1
+      }
+    }
+    if (failureType !== 'subtestsFailed' && type !== 'suite') {
+      out.push(formatFailureDiagnostic(errorLines.join('\n')))
+    }
+    i += 1
+  }
+  return out
+}
+
+function enrichTapFailureErrors(parsed, tapText) {
+  const failing = parsed.cases.filter(c => c.status === 'fail')
+  if (failing.length === 0 || failing.every(c => c.error && c.error.trim())) return
+  const extracted = extractMultilineTapErrors(tapText)
+  for (let i = 0; i < failing.length; i += 1) {
+    if (!failing[i].error && extracted[i]) {
+      failing[i].error = extracted[i]
+    }
+  }
+}
+
 function evaluateFileExecution(file, execRes) {
   const qMap = quarantinedByFile.get(file) || new Map()
   const { parsed, err, ms, timedOut, stderrSnippet } = execRes
@@ -546,8 +625,14 @@ function evaluateFileExecution(file, execRes) {
   let reason = ''
   if (unlistedFailures.length > 0) {
     const first = unlistedFailures[0]
-    const errPart = first.error ? ` — ${first.error}` : ''
-    reason = `${first.name}${errPart}`.slice(0, 180)
+    const errInline = first.error ? first.error.replace(/\s+/g, ' ').trim() : ''
+    if (errInline) {
+      const nameCap = Math.min(first.name.length, 90)
+      const shortName = first.name.length > nameCap ? `${first.name.slice(0, nameCap - 1)}…` : first.name
+      reason = `${shortName} — ${errInline}`.slice(0, 260)
+    } else {
+      reason = first.name.slice(0, 180)
+    }
   }
 
   return {
@@ -590,6 +675,7 @@ function runOneRaw(file) {
         const tapText = existsSync(tapPath) ? readFileSync(tapPath, 'utf8') : ''
         rmSync(sandboxDir, { recursive: true, force: true })
         const parsed = parseTapOutput(tapText, repoRoot)
+        enrichTapFailureErrors(parsed, tapText)
         const timedOut = Boolean(err && err.killed)
         const combined = `${stderr || ''}\n${stdout || ''}`
         const errLine = combined
@@ -767,6 +853,12 @@ if (jsonOut) {
       console.log(`  FAIL ${r.file} (${r.fail} unlisted / ${r.tests} cases, ${r.ms}ms) — ${r.reason}`)
       for (const f of r.unlistedFailures.slice(0, 5)) {
         console.log(`    - [unlisted] ${f.name}${f.location ? ` (${f.location})` : ''}`)
+        const diag = formatFailureDiagnostic(f.error)
+        if (diag) {
+          for (const diagLine of diag.split('\n')) {
+            console.log(`      ${diagLine}`)
+          }
+        }
       }
     }
   }

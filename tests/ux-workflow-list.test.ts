@@ -162,6 +162,32 @@ async function startKovoServer(): Promise<SpawnedKovoServer> {
   return { origin, dataDir, bootstrapSecret, stop }
 }
 
+async function waitForHydrated(page: Page, selector: string, timeoutMs: number): Promise<void> {
+  await page.waitForFunction(
+    (sel: string) => {
+      if (document.readyState !== 'complete') return false
+      const el = document.querySelector(sel)
+      if (!el) return false
+      return Object.keys(el).some(k => k.startsWith('__reactProps$') || k.startsWith('__reactFiber$'))
+    },
+    selector,
+    { timeout: timeoutMs },
+  )
+}
+
+async function waitForLayoutSettled(page: Page): Promise<void> {
+  await page.evaluate(async () => {
+    if (document.fonts?.ready) {
+      try {
+        await document.fonts.ready
+      } catch {
+        // Ignore font-ready failures in offline headless environments
+      }
+    }
+    await new Promise<void>(r => requestAnimationFrame(() => requestAnimationFrame(() => r())))
+  })
+}
+
 function withSqlite<T>(dataDir: string, fn: (db: DatabaseSync) => T): T {
   const db = new DatabaseSync(join(dataDir, 'kovo.sqlite'))
   try {
@@ -358,14 +384,16 @@ describe('Workflow UX upgrades & terminal assignment settlement', () => {
       })
 
       await page.goto(`${kovo.origin}/?bootstrap=${encodeURIComponent(kovo.bootstrapSecret)}`, {
-        waitUntil: 'domcontentloaded',
+        waitUntil: 'load',
       })
       await page.getByRole('heading', { name: 'Projects', level: 1 }).waitFor({ state: 'visible', timeout: 15_000 * CI_TIMEOUT_MULT })
+      await waitForHydrated(page, 'button', 15_000 * CI_TIMEOUT_MULT)
       await page.getByLabel('Project name').fill('Acme Cloud Workflow QA')
       await page.getByLabel('Sites').fill('https://app.acme-cloud.example\nhttps://api.acme-cloud.example\nhttps://admin.acme-cloud.example')
       await page.getByRole('button', { name: 'Create project', exact: true }).click()
       await page.waitForURL(/\/projects\/[a-f0-9-]+/, { timeout: 15_000 * CI_TIMEOUT_MULT })
 
+      await waitForHydrated(page, 'button', 15_000 * CI_TIMEOUT_MULT)
       await page.getByRole('button', { name: 'New run', exact: true }).click()
       const dialog = page.getByRole('dialog')
       await dialog.waitFor({ state: 'visible', timeout: 10_000 * CI_TIMEOUT_MULT })
@@ -395,10 +423,13 @@ describe('Workflow UX upgrades & terminal assignment settlement', () => {
         assert.ok(meta?.workspace_id)
         const goalRev = meta.goal_revision ?? 1
 
+        // Keep run status='paused' (non-terminal) so scripts/serve.ts's live Execution loop
+        // does not pick up the synthetic fixture via Store.runnable() and spawn a duplicate
+        // Round-0 Threat Model worker while Playwright inspects the 3 seeded active rows.
         db.prepare(
           `UPDATE runs
              SET phase = 'threat_model',
-                 status = 'running',
+                 status = 'paused',
                  scope_revision = 1,
                  candidates = ?,
                  approved = ?,
@@ -493,7 +524,7 @@ describe('Workflow UX upgrades & terminal assignment settlement', () => {
       }
 
       await page.setViewportSize({ width: 1280, height: 720 })
-      await page.goto(`${kovo.origin}/runs/${runId}?view=workflow`, { waitUntil: 'domcontentloaded' })
+      await page.goto(`${kovo.origin}/runs/${runId}?view=workflow`, { waitUntil: 'load' })
 
       // 1. Sidebar: Workflow is inside Investigation (NOT Telemetry)
       const invNav = page.getByRole('navigation', { name: 'Investigation views' })
@@ -502,15 +533,29 @@ describe('Workflow UX upgrades & terminal assignment settlement', () => {
       await invWfBtn.waitFor({ state: 'visible', timeout: 10_000 * CI_TIMEOUT_MULT })
       assert.equal(await invWfBtn.getAttribute('aria-current'), 'page')
 
+      // Wait for TanStack Start client bundle to hydrate React click handlers on the run workspace
+      await waitForHydrated(page, 'button[aria-controls="rail-telemetry-nav"]', 15_000 * CI_TIMEOUT_MULT)
+      await waitForHydrated(page, '[role="radio"][aria-label="Graph"]', 15_000 * CI_TIMEOUT_MULT)
+
       const telemetryToggle = page.getByRole('button', { name: /^Telemetry/ })
       if ((await telemetryToggle.getAttribute('aria-expanded')) !== 'true') {
         await telemetryToggle.click()
+        await page.waitForFunction(
+          () => document.querySelector('button[aria-controls="rail-telemetry-nav"]')?.getAttribute('aria-expanded') === 'true',
+          undefined,
+          { timeout: 10_000 * CI_TIMEOUT_MULT },
+        )
       }
       const telemetryNav = page.getByRole('navigation', { name: 'Telemetry views' })
       await telemetryNav.waitFor({ state: 'visible', timeout: 5_000 * CI_TIMEOUT_MULT })
       assert.equal(await telemetryNav.getByRole('button', { name: /^Workflow/ }).count(), 0, 'Workflow must not appear inside Telemetry')
       // Collapse Telemetry back so screenshots show clean default rail
       await telemetryToggle.click()
+      await page.waitForFunction(
+        () => document.querySelector('button[aria-controls="rail-telemetry-nav"]')?.getAttribute('aria-expanded') === 'false',
+        undefined,
+        { timeout: 10_000 * CI_TIMEOUT_MULT },
+      )
 
       // 2. Default mode is List (with Graph toggle working)
       const listRadio = page.getByRole('radio', { name: 'List' })
@@ -522,6 +567,14 @@ describe('Workflow UX upgrades & terminal assignment settlement', () => {
       // 3. Active now (3) section is pinned at top above completed phase groups
       const activeSection = page.getByTestId('workflow-active-section')
       await activeSection.waitFor({ state: 'visible', timeout: 10_000 * CI_TIMEOUT_MULT })
+      await page.waitForFunction(
+        () => {
+          const el = document.querySelector('[data-testid="workflow-active-section"]')
+          return Boolean(el && el.textContent && el.textContent.includes('2/5 Crawl'))
+        },
+        undefined,
+        { timeout: 10_000 * CI_TIMEOUT_MULT },
+      )
       const activeText = await activeSection.innerText()
       assert.match(activeText, /Active now \(3\)/)
       assert.match(activeText, /Round-0 Threat Model & Surface Ranking/)
@@ -533,7 +586,7 @@ describe('Workflow UX upgrades & terminal assignment settlement', () => {
 
       const verifyViewportGeometry = async (width: number, height: number, shotName?: string) => {
         await page!.setViewportSize({ width, height })
-        await delay(200)
+        await waitForLayoutSettled(page!)
         const geo = await page!.evaluate(() => {
           const docOverflow = document.documentElement.scrollWidth > document.documentElement.clientWidth
           const list = document.querySelector<HTMLElement>('[role="region"][aria-label="Worker list"]')
@@ -551,14 +604,30 @@ describe('Workflow UX upgrades & terminal assignment settlement', () => {
           }
           const activeAboveGroups = Boolean(activeRect && groupRect && activeRect.bottom <= groupRect.top + 2)
           const activeVisibleAboveFold = Boolean(activeRect && activeRect.top >= 0 && activeRect.bottom <= window.innerHeight)
-          return { docOverflow, listOverflow, overlap, activeAboveGroups, activeVisibleAboveFold, activeRowCount: activeRows.length }
+          return {
+            docOverflow,
+            docScrollW: document.documentElement.scrollWidth,
+            docClientW: document.documentElement.clientWidth,
+            listOverflow,
+            listScrollW: list?.scrollWidth ?? -1,
+            listClientW: list?.clientWidth ?? -1,
+            overlap,
+            activeAboveGroups,
+            activeVisibleAboveFold,
+            activeTop: activeRect?.top ?? -1,
+            activeBottom: activeRect?.bottom ?? -1,
+            groupTop: groupRect?.top ?? -1,
+            innerHeight: window.innerHeight,
+            activeRowCount: activeRows.length,
+          }
         })
-        assert.equal(geo.docOverflow, false, `Zero document overflow at ${width}x${height}`)
-        assert.equal(geo.listOverflow, false, `Zero worker list horizontal overflow at ${width}x${height}`)
-        assert.equal(geo.overlap, false, `Zero overlapping active rows at ${width}x${height}`)
-        assert.equal(geo.activeAboveGroups, true, `Active now section must sit above phase groups at ${width}x${height}`)
-        assert.equal(geo.activeVisibleAboveFold, true, `Active now section must be visible above the fold at ${width}x${height}`)
-        assert.equal(geo.activeRowCount, 3)
+        const diag = JSON.stringify(geo)
+        assert.equal(geo.docOverflow, false, `Zero document overflow at ${width}x${height}: ${diag}`)
+        assert.equal(geo.listOverflow, false, `Zero worker list horizontal overflow at ${width}x${height}: ${diag}`)
+        assert.equal(geo.overlap, false, `Zero overlapping active rows at ${width}x${height}: ${diag}`)
+        assert.equal(geo.activeAboveGroups, true, `Active now section must sit above phase groups at ${width}x${height}: ${diag}`)
+        assert.equal(geo.activeVisibleAboveFold, true, `Active now section must be visible above the fold at ${width}x${height}: ${diag}`)
+        assert.equal(geo.activeRowCount, 3, `Expected 3 active rows at ${width}x${height}: ${diag}`)
 
         const shotDir = process.env.WORKFLOW_LIST_SCREENSHOT_DIR
         if (shotDir && shotName) {
@@ -572,26 +641,46 @@ describe('Workflow UX upgrades & terminal assignment settlement', () => {
 
       // 4. Graph toggle & explicit ?mode=graph still work 100%
       await graphRadio.click()
+      await page.waitForFunction(
+        () =>
+          document.querySelector('[role="radio"][aria-label="Graph"]')?.getAttribute('aria-checked') === 'true'
+          && new URLSearchParams(window.location.search).get('mode') === 'graph',
+        undefined,
+        { timeout: 10_000 * CI_TIMEOUT_MULT },
+      )
       assert.equal(await graphRadio.getAttribute('aria-checked'), 'true')
       assert.match(page.url(), /mode=graph/)
-      await page.locator('[data-n="w-inv-live"]').waitFor({ state: 'visible', timeout: 10_000 * CI_TIMEOUT_MULT })
+      await page.locator('[data-wf-kind="worker"][data-n="w-inv-live"]').waitFor({ state: 'visible', timeout: 10_000 * CI_TIMEOUT_MULT })
 
       await listRadio.click()
+      await page.waitForFunction(
+        () =>
+          document.querySelector('[role="radio"][aria-label="List"]')?.getAttribute('aria-checked') === 'true'
+          && !new URLSearchParams(window.location.search).has('mode'),
+        undefined,
+        { timeout: 10_000 * CI_TIMEOUT_MULT },
+      )
       assert.equal(await listRadio.getAttribute('aria-checked'), 'true')
       assert.equal(page.url().includes('mode=graph'), false)
       await activeSection.waitFor({ state: 'visible', timeout: 10_000 * CI_TIMEOUT_MULT })
 
-      await page.goto(`${kovo.origin}/runs/${runId}?view=workflow&mode=graph`, { waitUntil: 'domcontentloaded' })
+      await page.goto(`${kovo.origin}/runs/${runId}?view=workflow&mode=graph`, { waitUntil: 'load' })
       await page.getByLabel(/Workflow graph/).waitFor({ state: 'visible', timeout: 10_000 * CI_TIMEOUT_MULT })
       await page.locator('[data-wf-kind="worker"][data-n="w-inv-live"]').waitFor({ state: 'visible', timeout: 10_000 * CI_TIMEOUT_MULT })
+      await page.waitForFunction(
+        () => document.querySelector('[role="radio"][aria-label="Graph"]')?.getAttribute('aria-checked') === 'true',
+        undefined,
+        { timeout: 10_000 * CI_TIMEOUT_MULT },
+      )
       assert.equal(await page.getByRole('radio', { name: 'Graph' }).getAttribute('aria-checked'), 'true')
 
       // 5. Terminal run never displays "Active now" or stale pulsing spinners (even if a legacy row was running in SQLite)
       withSqlite(kovo.dataDir, db => {
         db.prepare(`UPDATE runs SET status = 'complete', phase = 'complete' WHERE id = ?`).run(runId)
       })
-      await page.goto(`${kovo.origin}/runs/${runId}?view=workflow`, { waitUntil: 'domcontentloaded' })
+      await page.goto(`${kovo.origin}/runs/${runId}?view=workflow`, { waitUntil: 'load' })
       await page.getByRole('region', { name: 'Worker list' }).waitFor({ state: 'visible', timeout: 10_000 * CI_TIMEOUT_MULT })
+      await waitForHydrated(page, '[role="region"][aria-label="Worker list"]', 10_000 * CI_TIMEOUT_MULT)
       assert.equal(await page.getByTestId('workflow-active-section').count(), 0, 'Completed run must never show Active now section')
       const liveDots = await page.locator('[role="region"][aria-label="Worker list"] .animate-ping').count()
       assert.equal(liveDots, 0, 'Completed run must never show pulsing live spinners')
