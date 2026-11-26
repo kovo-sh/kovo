@@ -403,8 +403,8 @@ describe('C-7: boolean differential oracle hardening', () => {
     trueMatchesBase?: boolean
   } = {}): BooleanDifferentialRound {
     const baseVal = overrides.baseVal ?? 'widget'
-    const trueVal = overrides.trueVal ?? '7919=7919'
-    const falseVal = overrides.falseVal ?? '7919=7920'
+    const trueVal = overrides.trueVal ?? `${baseVal}' AND 7919=7919--`
+    const falseVal = overrides.falseVal ?? `${baseVal}' AND 7919=7920--`
     const origin = overrides.origin ?? 'https://app.example.test'
     const persona = overrides.persona ?? 'viewer_a'
     const authHeader = overrides.authHeader ?? 'Bearer tok-viewer-1'
