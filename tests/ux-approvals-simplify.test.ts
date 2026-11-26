@@ -240,21 +240,70 @@ test('Tier 3 + strict asks every write, and Tier 3 + auto_review escalates unapp
   )
   assert.equal(strictCalls.length, 0)
 
-  // Auto-Review: tagged non-structural POST auto-approves; DELETE escalates via BrokerApprovalRequired
+  // Auto-Review (R3-H-1(a)): derived staging_isolated NEVER auto-approves writes via tenant tags alone —
+  // unapproved tagged POST routes through isStateChangeApproved (BrokerApprovalRequired, never silent BrokerDenied);
+  // once approved in the state-change ledger it succeeds, while unapproved DELETE still escalates.
   const autoRun = createPublicRun(storage, { tier: 3, approvalPolicy: 'auto_review' })
-  approveScopeForRun(storage, autoRun.runId)
+  const approvedAutoRun = approveScopeForRun(storage, autoRun.runId)
   const autoTag = storage.scopePolicy(autoRun.runId).tenantTag!
   const autoCalls: Array<{ method: string; url: string }> = []
   const autoExec = new Execution(storage, { broker: makeBroker(autoCalls) })
   t.after(() => autoExec.stop())
   const autoGrant = buildExecutionGrant(autoExec, storage, autoRun.runId)
 
+  const taggedPostPath = `/api/items?tenant=${autoTag}1`
+  const taggedPostHeaders = { 'Content-Type': 'application/json' }
+  const taggedPostBody = '{"name":"safe"}'
+
+  await assert.rejects(
+    autoExec.broker.executeHttp({
+      origin: APP_ORIGIN,
+      method: 'POST',
+      pathAndQuery: taggedPostPath,
+      headers: taggedPostHeaders,
+      body: taggedPostBody,
+    }, autoGrant, AbortSignal.timeout(5_000)),
+    BrokerApprovalRequired,
+    'R3-H-1(a): derived staging_isolated + auto_review must route unapproved tagged POST through isStateChangeApproved',
+  )
+  assert.equal(autoCalls.length, 0)
+
+  // Once the auto_review Safety Judge / operator records a single-use grant in the approval ledger, the exact POST succeeds.
+  const autoExecInternals = autoExec as unknown as {
+    stateChangeApprovals: {
+      grant: (
+        input: {
+          runId: string
+          origin: string
+          method: string
+          pathAndQuery: string
+          body: string
+          headers: Record<string, string>
+          scopeRevision: number
+        },
+        options: { expiresAt: number },
+      ) => string
+    }
+  }
+  autoExecInternals.stateChangeApprovals.grant(
+    {
+      runId: autoRun.runId,
+      origin: APP_ORIGIN,
+      method: 'POST',
+      pathAndQuery: taggedPostPath,
+      body: taggedPostBody,
+      headers: taggedPostHeaders,
+      scopeRevision: approvedAutoRun.scopeRevision,
+    },
+    { expiresAt: Date.now() + 60_000 },
+  )
+
   const safePost = await autoExec.broker.executeHttp({
     origin: APP_ORIGIN,
     method: 'POST',
-    pathAndQuery: `/api/items?tenant=${autoTag}1`,
-    headers: { 'Content-Type': 'application/json' },
-    body: '{"name":"safe"}',
+    pathAndQuery: taggedPostPath,
+    headers: taggedPostHeaders,
+    body: taggedPostBody,
   }, autoGrant, AbortSignal.timeout(5_000))
   assert.equal(safePost.status, 200)
   assert.equal(autoCalls.length, 1)
