@@ -34,6 +34,313 @@ export const defaultMaxCalls = 220
 export const defaultMaxTransportRetries = 2
 const defaultTransportRetryBaseMs = 350
 
+/**
+ * Explicit repair hint attached to `toolCall.argumentsError` whenever upstream SSE tool-call JSON
+ * arguments are truncated or syntactically malformed (instead of silently erasing them to `{}`).
+ */
+export const TOOL_CALL_JSON_REPAIR_HINT =
+  'Tool call arguments were truncated/malformed JSON; keep the script concise or split into smaller steps and retry'
+
+export interface ToolCallArgParseDiagnostic {
+  callId?: string
+  itemId?: string
+  name?: string
+  outputIndex?: number
+  kind: 'truncated_json' | 'malformed_json'
+  rawBytes: number
+  parseError: string
+  errorMessage: string
+}
+
+interface TrackedToolCallSlot {
+  ordinal: number
+  outputIndex?: number
+  callId?: string
+  itemId?: string
+  name?: string
+  deltaText: string
+  doneText?: string
+  itemDoneText?: string
+}
+
+function sanitizeJsonParseErrorMessage(rawMessage: string): string {
+  // Strip any quoted token echo from V8 SyntaxError messages (e.g. `"..." is not valid JSON`)
+  // so truncated tool-call payloads containing secrets are never echoed into diagnostics.
+  const withoutQuotedSnippets = rawMessage
+    .replace(/"[^"]*"/g, '"<snippet>"')
+    .replace(/'[^']*'/g, "'<snippet>'")
+    .trim()
+  return (withoutQuotedSnippets || 'invalid JSON').slice(0, 160)
+}
+
+/**
+ * Observes raw upstream SSE frames (before `sanitizeProviderStream` collapses unparseable JSON
+ * tool-call arguments to `'{}'`) and preserves structured parse-error diagnostics per tool call.
+ *
+ * When a model emits truncated (`max_tokens` / `response.incomplete`) or malformed JSON arguments,
+ * `annotateToolCall` stamps `toolCall.argumentsError` with `TOOL_CALL_JSON_REPAIR_HINT` so tool
+ * validation returns an actionable repair message instead of blaming missing schema fields.
+ */
+export class SseToolCallArgTracker {
+  private readonly slotsByIndex = new Map<number, TrackedToolCallSlot>()
+  private readonly slotsByKey = new Map<string, TrackedToolCallSlot>()
+  private readonly orderedSlots: TrackedToolCallSlot[] = []
+  private truncatedByMaxTokens = false
+
+  reset(): void {
+    this.slotsByIndex.clear()
+    this.slotsByKey.clear()
+    this.orderedSlots.length = 0
+    this.truncatedByMaxTokens = false
+  }
+
+  private getOrCreateSlot(index: number | undefined, keys: readonly (string | undefined)[]): TrackedToolCallSlot {
+    if (index !== undefined) {
+      const existing = this.slotsByIndex.get(index)
+      if (existing) {
+        this.registerKeys(existing, keys)
+        return existing
+      }
+    }
+    for (const key of keys) {
+      if (!key) continue
+      const existing = this.slotsByKey.get(key)
+      if (existing) {
+        if (index !== undefined && existing.outputIndex === undefined) {
+          existing.outputIndex = index
+          this.slotsByIndex.set(index, existing)
+        }
+        this.registerKeys(existing, keys)
+        return existing
+      }
+    }
+    const slot: TrackedToolCallSlot = {
+      ordinal: this.orderedSlots.length,
+      ...(index !== undefined ? { outputIndex: index } : {}),
+      deltaText: '',
+    }
+    this.orderedSlots.push(slot)
+    if (index !== undefined) this.slotsByIndex.set(index, slot)
+    this.registerKeys(slot, keys)
+    return slot
+  }
+
+  private registerKeys(slot: TrackedToolCallSlot, keys: readonly (string | undefined)[]): void {
+    for (const key of keys) {
+      if (key) this.slotsByKey.set(key, slot)
+    }
+    if (slot.callId && slot.itemId) {
+      this.slotsByKey.set(`${slot.callId}|${slot.itemId}`, slot)
+    }
+  }
+
+  private recordFunctionCallItem(
+    index: number | undefined,
+    item: Record<string, unknown>,
+    isDone: boolean,
+  ): void {
+    const callId = typeof item.call_id === 'string' && item.call_id ? item.call_id : undefined
+    const itemId = typeof item.id === 'string' && item.id ? item.id : undefined
+    const name = typeof item.name === 'string' && item.name ? item.name : undefined
+    const slot = this.getOrCreateSlot(index, [callId, itemId])
+    if (callId) slot.callId = callId
+    if (itemId) slot.itemId = itemId
+    if (name) slot.name = name
+    this.registerKeys(slot, [callId, itemId])
+    if (typeof item.arguments === 'string' && item.arguments.length > 0) {
+      if (isDone) slot.itemDoneText = item.arguments
+      else if (!slot.deltaText) slot.deltaText += item.arguments
+    }
+  }
+
+  feedData(data: Record<string, unknown> | '[DONE]' | undefined): void {
+    if (!data || data === '[DONE]') return
+    const type = typeof data.type === 'string' ? data.type : ''
+
+    // OpenAI Responses API events
+    if (type === 'response.output_item.added' || type === 'response.output_item.done') {
+      const item = data.item && typeof data.item === 'object' && !Array.isArray(data.item)
+        ? data.item as Record<string, unknown>
+        : undefined
+      if (item?.type === 'function_call') {
+        const index = typeof data.output_index === 'number' ? data.output_index : undefined
+        this.recordFunctionCallItem(index, item, type === 'response.output_item.done')
+      }
+      return
+    }
+    if (type === 'response.function_call_arguments.delta') {
+      const index = typeof data.output_index === 'number' ? data.output_index : undefined
+      const itemId = typeof data.item_id === 'string' && data.item_id ? data.item_id : undefined
+      const slot = this.getOrCreateSlot(index, [itemId])
+      if (itemId) slot.itemId = itemId
+      if (typeof data.delta === 'string') slot.deltaText += data.delta
+      return
+    }
+    if (type === 'response.function_call_arguments.done') {
+      const index = typeof data.output_index === 'number' ? data.output_index : undefined
+      const itemId = typeof data.item_id === 'string' && data.item_id ? data.item_id : undefined
+      const name = typeof data.name === 'string' && data.name ? data.name : undefined
+      const slot = this.getOrCreateSlot(index, [itemId])
+      if (itemId) slot.itemId = itemId
+      if (name) slot.name = name
+      if (typeof data.arguments === 'string') slot.doneText = data.arguments
+      return
+    }
+    if (type === 'response.completed' || type === 'response.incomplete') {
+      const response = data.response && typeof data.response === 'object' && !Array.isArray(data.response)
+        ? data.response as Record<string, unknown>
+        : undefined
+      const incompleteDetails = response?.incomplete_details && typeof response.incomplete_details === 'object'
+        ? response.incomplete_details as Record<string, unknown>
+        : undefined
+      if (
+        type === 'response.incomplete'
+        || response?.status === 'incomplete'
+        || incompleteDetails?.reason === 'max_output_tokens'
+      ) {
+        this.truncatedByMaxTokens = true
+      }
+      if (Array.isArray(response?.output)) {
+        for (let i = 0; i < response.output.length; i++) {
+          const entry = response.output[i]
+          if (entry && typeof entry === 'object' && !Array.isArray(entry)) {
+            const rec = entry as Record<string, unknown>
+            if (rec.type === 'function_call') {
+              this.recordFunctionCallItem(i, rec, true)
+            }
+          }
+        }
+      }
+      return
+    }
+
+    // Anthropic Messages API events
+    if (type === 'content_block_start') {
+      const block = data.content_block && typeof data.content_block === 'object' && !Array.isArray(data.content_block)
+        ? data.content_block as Record<string, unknown>
+        : undefined
+      if (block?.type === 'tool_use') {
+        const index = typeof data.index === 'number' ? data.index : undefined
+        const callId = typeof block.id === 'string' && block.id ? block.id : undefined
+        const name = typeof block.name === 'string' && block.name ? block.name : undefined
+        const slot = this.getOrCreateSlot(index, [callId])
+        if (callId) slot.callId = callId
+        if (name) slot.name = name
+      }
+      return
+    }
+    if (type === 'content_block_delta') {
+      const delta = data.delta && typeof data.delta === 'object' && !Array.isArray(data.delta)
+        ? data.delta as Record<string, unknown>
+        : undefined
+      if (delta?.type === 'input_json_delta' && typeof delta.partial_json === 'string') {
+        const index = typeof data.index === 'number' ? data.index : undefined
+        const slot = this.getOrCreateSlot(index, [])
+        slot.deltaText += delta.partial_json
+      }
+      return
+    }
+    if (type === 'message_delta') {
+      const delta = data.delta && typeof data.delta === 'object' && !Array.isArray(data.delta)
+        ? data.delta as Record<string, unknown>
+        : undefined
+      if (delta?.stop_reason === 'max_tokens') {
+        this.truncatedByMaxTokens = true
+      }
+    }
+  }
+
+  private resolveSlot(toolCall: { id?: string; name?: string }, ordinal?: number): TrackedToolCallSlot | undefined {
+    const id = typeof toolCall.id === 'string' ? toolCall.id : ''
+    if (id) {
+      const direct = this.slotsByKey.get(id)
+      if (direct) return direct
+      if (id.includes('|')) {
+        const [callPart, itemPart] = id.split('|')
+        const byCall = callPart ? this.slotsByKey.get(callPart) : undefined
+        if (byCall) return byCall
+        const byItem = itemPart ? this.slotsByKey.get(itemPart) : undefined
+        if (byItem) return byItem
+      }
+    }
+    if (ordinal !== undefined && this.orderedSlots[ordinal]) {
+      const candidate = this.orderedSlots[ordinal]
+      if (!toolCall.name || !candidate.name || candidate.name === toolCall.name) {
+        return candidate
+      }
+    }
+    if (toolCall.name) {
+      const matching = this.orderedSlots.filter(s => s.name === toolCall.name)
+      if (matching.length === 1) return matching[0]
+    }
+    return undefined
+  }
+
+  private evaluateSlot(
+    slot: TrackedToolCallSlot,
+    redactError?: (text: string) => string,
+  ): ToolCallArgParseDiagnostic | undefined {
+    const deltaTrimmed = slot.deltaText.trim()
+    let raw = ''
+    if (slot.doneText !== undefined && slot.doneText.trim()) {
+      raw = slot.doneText.trim() === '{}' && deltaTrimmed.length > 2 ? slot.deltaText : slot.doneText
+    } else if (slot.itemDoneText !== undefined && slot.itemDoneText.trim()) {
+      raw = slot.itemDoneText.trim() === '{}' && deltaTrimmed.length > 2 ? slot.deltaText : slot.itemDoneText
+    } else {
+      raw = slot.deltaText
+    }
+    if (!raw.trim()) return undefined
+
+    let parseFailure: string | undefined
+    try {
+      const parsed: unknown = JSON.parse(raw)
+      if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+        parseFailure = 'Tool arguments must be a JSON object'
+      }
+    } catch (error) {
+      parseFailure = error instanceof Error ? error.message : String(error)
+    }
+    if (!parseFailure) return undefined
+
+    const rawBytes = Buffer.byteLength(raw, 'utf8')
+    const truncated = this.truncatedByMaxTokens
+      || /unexpected end of json|unterminated string|end of (?:json )?input/i.test(parseFailure)
+    const kind: 'truncated_json' | 'malformed_json' = truncated ? 'truncated_json' : 'malformed_json'
+    const sanitized = sanitizeJsonParseErrorMessage(parseFailure)
+    const safeParseError = redactError ? redactError(sanitized) : sanitized
+    const errorMessage = `${TOOL_CALL_JSON_REPAIR_HINT} (${kind}, ${rawBytes} bytes: ${safeParseError}).`
+    return {
+      ...(slot.callId ? { callId: slot.callId } : {}),
+      ...(slot.itemId ? { itemId: slot.itemId } : {}),
+      ...(slot.name ? { name: slot.name } : {}),
+      ...(slot.outputIndex !== undefined ? { outputIndex: slot.outputIndex } : {}),
+      kind,
+      rawBytes,
+      parseError: safeParseError,
+      errorMessage,
+    }
+  }
+
+  diagnosticForToolCall(
+    toolCall: { id?: string; name?: string },
+    ordinal?: number,
+    redactError?: (text: string) => string,
+  ): ToolCallArgParseDiagnostic | undefined {
+    const slot = this.resolveSlot(toolCall, ordinal)
+    if (!slot) return undefined
+    return this.evaluateSlot(slot, redactError)
+  }
+
+  allDiagnostics(redactError?: (text: string) => string): ToolCallArgParseDiagnostic[] {
+    const out: ToolCallArgParseDiagnostic[] = []
+    for (const slot of this.orderedSlots) {
+      const diag = this.evaluateSlot(slot, redactError)
+      if (diag) out.push(diag)
+    }
+    return out
+  }
+}
+
 export type ProviderCall = {
   scenario: string
   endpoint: string
@@ -292,6 +599,8 @@ interface MakeFetchInternalOptions {
   chargeLogicalTurn?: boolean
   /** Retry transient 429/5xx HTTP errors inside `makeFetch` without incrementing `callCounter` (true for single `provider()`). */
   retryTransientInFetch?: boolean
+  /** Optional per-call tracker that captures raw tool-call JSON parse errors before stream redaction. */
+  argTracker?: SseToolCallArgTracker
 }
 
 function isTransientHttpStatus(status: number): boolean {
@@ -375,6 +684,7 @@ function makeFetch(
 
     let transportRetry = 0
     for (;;) {
+      internal.argTracker?.reset()
       const totalSignal = AbortSignal.any([
         request.signal,
         AbortSignal.timeout(totalTimeoutMs),
@@ -573,6 +883,7 @@ function makeFetch(
           },
           onFrame: data => {
             usageAccumulator.feedData(data)
+            internal.argTracker?.feedData(data)
           },
           onActivity: () => {
             clearFirstEventTimer()
@@ -641,6 +952,83 @@ function makeFetch(
   return send
 }
 
+type ToolCallLike = {
+  type?: unknown
+  id?: string
+  name?: string
+  arguments?: unknown
+  argumentsError?: string
+}
+
+function annotateToolCallPart(
+  part: ToolCallLike | undefined,
+  tracker: SseToolCallArgTracker,
+  ordinal: number | undefined,
+  redactError: (text: string) => string,
+): void {
+  if (!part || part.type !== 'toolCall') return
+  if (typeof part.argumentsError === 'string' && part.argumentsError.trim()) {
+    if (!part.argumentsError.includes(TOOL_CALL_JSON_REPAIR_HINT)) {
+      const diag = tracker.diagnosticForToolCall(part, ordinal, redactError)
+      part.argumentsError = diag
+        ? diag.errorMessage
+        : `${TOOL_CALL_JSON_REPAIR_HINT} (${redactError(sanitizeJsonParseErrorMessage(part.argumentsError))}).`
+    }
+    return
+  }
+  const diag = tracker.diagnosticForToolCall(part, ordinal, redactError)
+  if (diag) {
+    part.argumentsError = diag.errorMessage
+  }
+}
+
+function annotateAssistantMessageToolCalls(
+  message: { content?: unknown } | undefined,
+  tracker: SseToolCallArgTracker,
+  redactError: (text: string) => string,
+): void {
+  if (!message || !Array.isArray(message.content)) return
+  let toolOrdinal = 0
+  for (const part of message.content) {
+    if (part && typeof part === 'object' && (part as ToolCallLike).type === 'toolCall') {
+      annotateToolCallPart(part as ToolCallLike, tracker, toolOrdinal, redactError)
+      toolOrdinal += 1
+    }
+  }
+}
+
+function wrapStreamWithToolCallIntegrity<TStream extends ReturnType<ProviderStreams['stream']>>(
+  rawStream: TStream,
+  tracker: SseToolCallArgTracker,
+  redactError: (text: string) => string,
+): TStream {
+  let seenToolEnds = 0
+  const annotateEvent = (event: unknown) => {
+    if (!event || typeof event !== 'object') return
+    const rec = event as { type?: unknown; toolCall?: ToolCallLike; message?: { content?: unknown } }
+    if (rec.type === 'toolcall_end' && rec.toolCall) {
+      annotateToolCallPart(rec.toolCall, tracker, seenToolEnds, redactError)
+      seenToolEnds += 1
+    } else if (rec.type === 'done' && rec.message) {
+      annotateAssistantMessageToolCalls(rec.message, tracker, redactError)
+    }
+  }
+  const wrapped = {
+    async *[Symbol.asyncIterator]() {
+      for await (const event of rawStream) {
+        annotateEvent(event)
+        yield event
+      }
+    },
+    async result() {
+      const res = await rawStream.result()
+      annotateAssistantMessageToolCalls(res as { content?: unknown }, tracker, redactError)
+      return res
+    },
+  }
+  return wrapped as unknown as TStream
+}
+
 function buildSingleStreamImpl(
   settings: ProviderConfig,
   scenario: string,
@@ -673,59 +1061,93 @@ function buildSingleStreamImpl(
       cacheWrite: 0,
     },
   }
-  const send = makeFetch(settings, scenario, options, callCounter, profileId, fetchInternal)
   const connection = scenario === 'connection'
   const chooseEvidenceTool = (transcript: { messages: { role: string }[] }) =>
     (scenario === 'worker-analysis' || scenario === 'response-analysis') && transcript.messages.at(-1)?.role === 'user'
-  const streamOpts = {
-    fetch: send,
-    maxTokens,
-    maxRetries: 0,
-    // Total call ceiling for the SDK; per-chunk idle timeouts are enforced inside `makeFetch`
-    // and reset in real time on every upstream SSE frame via `sanitizeProviderStream`.
-    timeoutMs: options.totalTimeoutMs ?? defaultTotalTimeoutMs,
-    // R2-H-2: Applied LAST in `streamOpts` so primary/caller `sOpts.apiKey` can never overwrite it.
-    apiKey: settings.key,
+  const redactError = (text: string) => redactProviderText(text, settings.key, options.secrets)
+  const makeCallContext = () => {
+    const tracker = new SseToolCallArgTracker()
+    const send = makeFetch(settings, scenario, options, callCounter, profileId, {
+      ...fetchInternal,
+      argTracker: tracker,
+    })
+    const streamOpts = {
+      fetch: send,
+      maxTokens,
+      maxRetries: 0,
+      // Total call ceiling for the SDK; per-chunk idle timeouts are enforced inside `makeFetch`
+      // and reset in real time on every upstream SSE frame via `sanitizeProviderStream`.
+      timeoutMs: options.totalTimeoutMs ?? defaultTotalTimeoutMs,
+      // R2-H-2: Applied LAST in `streamOpts` so primary/caller `sOpts.apiKey` can never overwrite it.
+      apiKey: settings.key,
+    }
+    return { tracker, streamOpts }
   }
 
   const implementation: ProviderStreams = api === 'openai-responses' ? {
-    stream: (selected, transcript, sOpts) => responses(selected as Model<'openai-responses'>, transcript, {
-      ...sOpts,
-      ...streamOpts,
-      ...(effectiveThinking !== 'off' ? { reasoningEffort: effectiveThinking } : { reasoningEffort: undefined }),
-      ...(connection ? { toolChoice: 'required' as const } : {}),
-    }),
-    streamSimple: (selected, transcript, sOpts) =>
-      chooseEvidenceTool(transcript)
-        ? responses({ ...(selected as Model<'openai-responses'>), reasoning: false }, transcript, {
-            ...sOpts,
-            ...streamOpts,
-            reasoningEffort: undefined,
-            toolChoice: 'required',
-          })
-        : simpleResponses(selected as Model<'openai-responses'>, transcript, {
-            ...sOpts,
-            ...streamOpts,
-            ...(effectiveThinking !== 'off' ? { reasoning: effectiveThinking } : { reasoning: undefined }),
-          }),
-  } : {
-    stream: (selected, transcript, sOpts) => messages(selected as Model<'anthropic-messages'>, transcript, {
-      ...sOpts,
-      ...streamOpts,
-      thinkingEnabled,
-      ...(thinkingEnabled ? { effort: effectiveThinking } : {}),
-      ...(connection ? { toolChoice: { type: 'tool' as const, name: 'kovo_connection' } } : {}),
-    }),
-    streamSimple: (selected, transcript, sOpts) =>
-      chooseEvidenceTool(transcript)
-        ? messages(selected as Model<'anthropic-messages'>, transcript, {
-          ...sOpts, ...streamOpts, thinkingEnabled: false, toolChoice: { type: 'tool', name: 'derive_evidence' },
-        })
-        : simpleMessages(selected as Model<'anthropic-messages'>, transcript, {
+    stream: (selected, transcript, sOpts) => {
+      const { tracker, streamOpts } = makeCallContext()
+      return wrapStreamWithToolCallIntegrity(
+        responses(selected as Model<'openai-responses'>, transcript, {
           ...sOpts,
           ...streamOpts,
-          ...(thinkingEnabled ? { reasoning: effectiveThinking } : {}),
+          ...(effectiveThinking !== 'off' ? { reasoningEffort: effectiveThinking } : { reasoningEffort: undefined }),
+          ...(connection ? { toolChoice: 'required' as const } : {}),
         }),
+        tracker,
+        redactError,
+      )
+    },
+    streamSimple: (selected, transcript, sOpts) => {
+      const { tracker, streamOpts } = makeCallContext()
+      return wrapStreamWithToolCallIntegrity(
+        chooseEvidenceTool(transcript)
+          ? responses({ ...(selected as Model<'openai-responses'>), reasoning: false }, transcript, {
+              ...sOpts,
+              ...streamOpts,
+              reasoningEffort: undefined,
+              toolChoice: 'required',
+            })
+          : simpleResponses(selected as Model<'openai-responses'>, transcript, {
+              ...sOpts,
+              ...streamOpts,
+              ...(effectiveThinking !== 'off' ? { reasoning: effectiveThinking } : { reasoning: undefined }),
+            }),
+        tracker,
+        redactError,
+      )
+    },
+  } : {
+    stream: (selected, transcript, sOpts) => {
+      const { tracker, streamOpts } = makeCallContext()
+      return wrapStreamWithToolCallIntegrity(
+        messages(selected as Model<'anthropic-messages'>, transcript, {
+          ...sOpts,
+          ...streamOpts,
+          thinkingEnabled,
+          ...(thinkingEnabled ? { effort: effectiveThinking } : {}),
+          ...(connection ? { toolChoice: { type: 'tool' as const, name: 'kovo_connection' } } : {}),
+        }),
+        tracker,
+        redactError,
+      )
+    },
+    streamSimple: (selected, transcript, sOpts) => {
+      const { tracker, streamOpts } = makeCallContext()
+      return wrapStreamWithToolCallIntegrity(
+        chooseEvidenceTool(transcript)
+          ? messages(selected as Model<'anthropic-messages'>, transcript, {
+            ...sOpts, ...streamOpts, thinkingEnabled: false, toolChoice: { type: 'tool', name: 'derive_evidence' },
+          })
+          : simpleMessages(selected as Model<'anthropic-messages'>, transcript, {
+            ...sOpts,
+            ...streamOpts,
+            ...(thinkingEnabled ? { reasoning: effectiveThinking } : {}),
+          }),
+        tracker,
+        redactError,
+      )
+    },
   }
 
   return { model, implementation }

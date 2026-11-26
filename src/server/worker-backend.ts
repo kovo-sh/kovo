@@ -516,14 +516,16 @@ export interface WorkerBackend {
   run(job: WorkerJob, signal: AbortSignal, options?: WorkerSessionOptions): Promise<WorkerResult>
   openSession(assignmentId: string, signal: AbortSignal, options?: WorkerSessionOptions): Promise<WorkerSession>
   verifyStaticAst(assignmentId: string, req: AstVerifyRequest, signal: AbortSignal, options?: WorkerSessionOptions): Promise<AstVerifyResult>
+  /** Container image tag used by this backend (container-visible isolation input for warm-pool keying). */
+  readonly workerImage?: string
   /** Container-reuse counters (diagnostic seam; optional for test/fake backends). */
   containerStats?(): WorkerContainerStats | undefined
   /** Size the warm idle pool to the run's worker-slot count (one container per slot). */
   setWarmCapacity?(slots: number): void
   /**
-   * Install the run's pool policy (run identity + credential generation, plus optional read-only
-   * repo mount). A changed policy discards idle containers instead of reusing them across runs,
-   * tenants, repo mounts, or secret rotations.
+   * Install the run's pool policy (run identity + container-visible mount/image policy, plus
+   * optional read-only repo mount). A changed policy discards idle containers instead of reusing
+   * them across runs, tenants, or repo mounts.
    */
   setWarmPoolPolicy?(policy: string, options?: { reposDir?: string }): void
   /** Evict and close all warm-pool containers/leases owned by `runId` on run disposal. */
@@ -1673,6 +1675,35 @@ function normalizeReposDirKey(reposDir?: string): string | undefined {
   }
 }
 
+/**
+ * Build a deterministic warm-pool isolation key strictly from container-visible state
+ * (`runId`, normalized read-only `reposDir`, sorted `mountedRepos`, and container `image`).
+ *
+ * Host-only persona credential refresh generations MUST NEVER be hashed here: Docker worker
+ * containers run `--network none` and never hold persona secrets, so credential auto-refresh
+ * on the host must not tear down idle warm containers or re-stage `/repos`.
+ */
+export function buildWarmPoolPolicy(input: {
+  runId: string
+  reposDir?: string
+  mountedRepos?: readonly string[]
+  image?: string
+}): string {
+  const cleanRunId = input.runId.trim()
+  const normalizedReposDir = normalizeReposDirKey(input.reposDir) ?? ''
+  const normalizedRepos = [...new Set((input.mountedRepos ?? []).map(r => r.trim()).filter(Boolean))].sort()
+  const normalizedImage = input.image?.trim() ?? ''
+  const mountHash = createHash('sha256')
+    .update(normalizedReposDir)
+    .update('\0')
+    .update(normalizedRepos.join('\n'))
+    .update('\0')
+    .update(normalizedImage)
+    .digest('hex')
+    .slice(0, 12)
+  return `${cleanRunId}:${mountHash}`
+}
+
 interface WarmReposLease {
   sourceDir: string
   prepared: PreparedReposMount
@@ -1694,6 +1725,10 @@ interface WarmPoolSlot {
   reposSource?: string
   preparedRepos?: WarmReposLease
   warmed: boolean
+  /** Concurrent in-flight `openSession` calls + active sessions referencing this slot. */
+  activeSessions: number
+  /** Marked true once replaced/evicted so containers don't recycle into a retired slot. */
+  retired: boolean
 }
 
 /**
@@ -1724,7 +1759,7 @@ function sharedWarmPool(input: {
     return existing
   }
   if (existing) warmPools.delete(key)
-  const pool = new WarmWorkerPool({ ...input, options: sanitizedOptions })
+  const pool = new WarmWorkerPool({ ...input, options: sanitizedOptions, registryKey: key })
   warmPools.set(key, pool)
   return pool
 }
@@ -1746,7 +1781,9 @@ export class WarmWorkerPool {
   private readonly owner?: string
   private readonly options: WorkerSessionOptions
   private readonly signature: string
+  private readonly registryKey?: string
   private preparedRepos?: PreparedReposMount | null
+  private preparedReposRetired = false
   private capacity: number
   private readonly idle: string[] = []
   private readonly createdAtByName = new Map<string, number>()
@@ -1773,12 +1810,14 @@ export class WarmWorkerPool {
     options?: WorkerSessionOptions
     capacity?: number
     idleMaxAgeMs?: number
+    registryKey?: string
   }) {
     this.cell = input.cell
     this.image = input.image
     this.docker = input.dockerRunner
     this.runLabel = input.runLabel
     this.owner = input.owner
+    this.registryKey = input.registryKey
     this.options = { ...(input.options ?? {}) }
     delete this.options.rpcMountDir
     delete this.options.warmPoolPolicy
@@ -1788,6 +1827,7 @@ export class WarmWorkerPool {
   }
 
   get enabled(): boolean { return !this.disabled && !this.closed }
+  get outstandingCount(): number { return this.outstanding.size }
   get state(): 'warming' | 'ready' | 'disabled' | 'closed' {
     if (this.closed) return 'closed'
     if (this.disabled) return 'disabled'
@@ -1820,11 +1860,11 @@ export class WarmWorkerPool {
   }
 
   /** Resize the idle pool to one container per worker slot; never shrinks below `idle.length`. */
-  setCapacity(slots: number): void {
+  setCapacity(slots: number, prefill = true): void {
     const next = Math.max(1, Math.min(MAX_WARM_POOL_CAPACITY, Math.floor(slots)))
     if (next === this.capacity) return
     this.capacity = next
-    this.fill()
+    if (prefill) this.fill()
   }
 
   /** True when the pool currently owns an idle container with this name. */
@@ -1832,10 +1872,18 @@ export class WarmWorkerPool {
     return this.idle.includes(name)
   }
 
+  private cleanupRetiredPreparedRepos(): void {
+    if (!this.preparedReposRetired || this.outstanding.size > 0) return
+    const staged = this.preparedRepos
+    this.preparedRepos = undefined
+    staged?.cleanup()
+  }
+
   /** A pooled container died or was removed mid-session: stop accounting for it and refill. */
   forget(name: string): void {
     this.outstanding.delete(name)
     this.used.delete(name)
+    this.cleanupRetiredPreparedRepos()
     this.fill()
   }
 
@@ -1983,6 +2031,7 @@ export class WarmWorkerPool {
     if (!this.enabled) {
       this.discarded += 1
       await this.removeIdle(name)
+      this.cleanupRetiredPreparedRepos()
       return false
     }
     let status = ''
@@ -2010,18 +2059,21 @@ export class WarmWorkerPool {
 
   async close(): Promise<void> {
     this.closed = true
+    if (this.registryKey && warmPools.get(this.registryKey) === this) {
+      warmPools.delete(this.registryKey)
+    }
     const idle = this.idle.splice(0)
     this.createdAtByName.clear()
     await Promise.all(idle.map(name => this.removeIdle(name)))
-    const staged = this.preparedRepos
-    this.preparedRepos = undefined
-    staged?.cleanup()
+    this.preparedReposRetired = true
+    this.cleanupRetiredPreparedRepos()
   }
 }
 
 export class LinuxWorkerBackend implements WorkerBackend {
   private readonly instanceId = randomUUID()
   private readonly image: string
+  get workerImage(): string { return this.image }
   private readonly owner?: string
   private readonly runId?: string
   private readonly cell?: string
@@ -2144,7 +2196,28 @@ export class LinuxWorkerBackend implements WorkerBackend {
     this.warmPools.set(slot.policy, slot)
   }
 
+  private acquireWarmSlot(slot: WarmPoolSlot): void {
+    slot.activeSessions += 1
+  }
+
+  private releaseWarmSlot(slot: WarmPoolSlot): void {
+    slot.activeSessions = Math.max(0, slot.activeSessions - 1)
+    if (slot.activeSessions === 0) {
+      this.evictExcessIdlePools()
+    }
+  }
+
+  private evictExcessIdlePools(): void {
+    if (this.warmPools.size <= this.maxWarmPools) return
+    for (const candidate of [...this.warmPools.values()]) {
+      if (this.warmPools.size <= this.maxWarmPools) break
+      if (candidate.activeSessions > 0 || candidate.pool.outstandingCount > 0) continue
+      void this.retireSlot(candidate)
+    }
+  }
+
   private retireSlot(slot: WarmPoolSlot, awaitClose = false): Promise<void> {
+    slot.retired = true
     if (this.warmPools.get(slot.policy) === slot) {
       this.warmPools.delete(slot.policy)
     }
@@ -2172,7 +2245,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
     if (!poolCell || !warmWorkersEnabled()) return
     const nextReposSource = normalizeReposDirKey(options?.reposDir)
     const existing = this.warmPools.get(policy)
-    if (existing && existing.reposSource === nextReposSource && existing.pool.state !== 'closed') {
+    if (existing && !existing.retired && existing.reposSource === nextReposSource && existing.pool.state !== 'closed') {
       this.touchWarmSlot(existing)
       this.activeWarmPoolPolicy = policy
       if (warmNow && !existing.warmed) {
@@ -2184,27 +2257,40 @@ export class LinuxWorkerBackend implements WorkerBackend {
     // Retire any unused lazy placeholder installed at construction time before the first run policy.
     const defaultPolicy = this.defaultWarmPolicy()
     const placeholder = this.warmPools.get(defaultPolicy)
-    if (placeholder && !placeholder.warmed && placeholder.policy !== policy && placeholder.pool.stats.created === 0) {
+    if (
+      placeholder
+      && !placeholder.warmed
+      && placeholder.policy !== policy
+      && placeholder.pool.stats.created === 0
+      && placeholder.activeSessions === 0
+    ) {
       void this.retireSlot(placeholder)
     }
-    // Retire any existing pool for the SAME run (e.g. secret-epoch rotation or reposDir change),
-    // while leaving every other concurrent run's pool intact.
+    // Retire any existing pool for the SAME run (e.g. reposDir/mount policy change), while
+    // leaving every other concurrent run's pool intact. Never clobber a matching-policy slot
+    // that still has concurrent workers mid-`openSession`.
     const runKey = policyRunKey(policy)
     for (const slot of [...this.warmPools.values()]) {
+      if (slot.policy === policy && slot.reposSource === nextReposSource && !slot.retired && slot.pool.state !== 'closed') {
+        continue
+      }
       if (slot.runKey === runKey || slot.policy === policy) {
         void this.retireSlot(slot)
       }
     }
-    // Enforce bounded LRU across distinct runs so long-lived servers never leak idle pools.
+    // Enforce bounded LRU across distinct runs so long-lived servers never leak idle pools,
+    // NEVER evicting a slot that currently has concurrent workers mid-`openSession` or active
+    // sessions; if all slots are active, excess pools are reclaimed as soon as sessions close.
     while (this.warmPools.size >= this.maxWarmPools) {
-      const oldestKey = this.warmPools.keys().next().value
-      if (oldestKey === undefined) break
-      const oldest = this.warmPools.get(oldestKey)
-      if (!oldest) {
-        this.warmPools.delete(oldestKey)
-        continue
+      let evictCandidate: WarmPoolSlot | undefined
+      for (const candidate of this.warmPools.values()) {
+        if (candidate.activeSessions === 0 && candidate.pool.outstandingCount === 0) {
+          evictCandidate = candidate
+          break
+        }
       }
-      void this.retireSlot(oldest)
+      if (!evictCandidate) break
+      void this.retireSlot(evictCandidate)
     }
     let preparedRepos: WarmReposLease | undefined
     let poolOptions: WorkerSessionOptions | undefined
@@ -2236,6 +2322,8 @@ export class LinuxWorkerBackend implements WorkerBackend {
       reposSource: nextReposSource,
       preparedRepos,
       warmed: warmNow,
+      activeSessions: 0,
+      retired: false,
     }
     this.warmPools.set(policy, slot)
     this.activeWarmPoolPolicy = policy
@@ -2313,7 +2401,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
   setWarmCapacity(slots: number): void {
     this.desiredWarmCapacity = slots
     for (const slot of this.warmPools.values()) {
-      slot.pool.setCapacity(slots)
+      slot.pool.setCapacity(slots, slot.warmed)
     }
   }
 
@@ -2564,11 +2652,23 @@ export class LinuxWorkerBackend implements WorkerBackend {
     // current active policy when omitted) so concurrent runs never take or evict each other's
     // containers. Per-call `rpcMountDir` sockets always bypass the pool for strict isolation.
     const requestedPolicy = options?.warmPoolPolicy?.trim()
-    const activeSlot = requestedPolicy
+    const candidateSlot = requestedPolicy
       ? this.warmPools.get(requestedPolicy)
       : (this.activeWarmPoolPolicy ? this.warmPools.get(this.activeWarmPoolPolicy) : undefined)
+    const activeSlot = candidateSlot && !candidateSlot.retired ? candidateSlot : undefined
+    let heldSlot: WarmPoolSlot | undefined
+    let releasedSlot = false
+    const releaseSlot = () => {
+      if (releasedSlot) return
+      releasedSlot = true
+      const slot = heldSlot
+      heldSlot = undefined
+      if (slot) this.releaseWarmSlot(slot)
+    }
     if (activeSlot) {
       this.touchWarmSlot(activeSlot)
+      this.acquireWarmSlot(activeSlot)
+      heldSlot = activeSlot
     }
     const activePool = activeSlot?.pool
     const warmRepos = activeSlot?.preparedRepos
@@ -2600,9 +2700,13 @@ export class LinuxWorkerBackend implements WorkerBackend {
       warm = activePool && !options?.rpcMountDir ? await activePool.take(signal, takeOptions) : null
     } catch (error) {
       releaseWarmRepos()
+      releaseSlot()
       throw error
     }
-    if (warm === null) releaseWarmRepos()
+    if (warm === null) {
+      releaseWarmRepos()
+      releaseSlot()
+    }
     let pooled = warm !== null
     let name = warm ?? 'kovo-' + randomUUID()
     this.sessionsServed += 1
@@ -2624,6 +2728,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
         await this.removeContainer(name)
         cleanupRepos()
         releaseWarmRepos()
+        releaseSlot()
         this.activeContainers.delete(name)
         liveContainers.delete(name)
         throw error
@@ -2639,6 +2744,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
       await this.removeContainer(name)
       cleanupRepos()
       releaseWarmRepos()
+      releaseSlot()
       this.activeContainers.delete(name)
       liveContainers.delete(name)
       if (!pooled) throw error
@@ -2741,7 +2847,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
       this.activeContainers.delete(name)
       if (!preserveOnExit) {
         liveContainers.delete(name)
-        void removeContainer().finally(() => { cleanupRepos(); releaseWarmRepos() })
+        void removeContainer().finally(() => { cleanupRepos(); releaseWarmRepos(); releaseSlot() })
       }
     })
     cli.once('error', error => {
@@ -2752,7 +2858,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
       preserveOnExit = false
       this.activeContainers.delete(name)
       liveContainers.delete(name)
-      void removeContainer().finally(() => { cleanupRepos(); releaseWarmRepos() })
+      void removeContainer().finally(() => { cleanupRepos(); releaseWarmRepos(); releaseSlot() })
     })
 
     const close = () => {
@@ -2765,6 +2871,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
         const reusable = pooled
           && activePool?.enabled === true
           && activeSlot !== undefined
+          && !activeSlot.retired
           && this.warmPools.get(activeSlot.policy) === activeSlot
           && pending.size === 0
           && !exited
@@ -2810,6 +2917,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
             this.pooled.delete(name)
             this.activeContainers.delete(name)
             releaseWarmRepos()
+            releaseSlot()
             // release() re-tracks the container as live: the pool (not this session) owns it now.
             return
           }
@@ -2818,6 +2926,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
         await this.removeContainer(name)
         cleanupRepos()
         releaseWarmRepos()
+        releaseSlot()
         this.pooled.delete(name)
         this.activeContainers.delete(name)
         liveContainers.delete(name)
