@@ -26,6 +26,7 @@ import type {
 } from './composite-receipt.ts'
 import { buildCoverageGapReport } from './coverage-gaps.ts'
 import type { CoverageGapReport } from './coverage-gaps.ts'
+import type { CompositePatchRetestVerdict } from './patch-workflow.ts'
 import { personaSecrets, resolveRunPersonas } from './persona-vault.ts'
 import type { ProofReceipt } from './proof-receipt.ts'
 import { isZdrModeEnabled, redact, redactHeaders, redactPii } from './redact.ts'
@@ -78,6 +79,8 @@ export interface PortablePatchRetestProof {
   summary: string
   exchangeIds: string[]
   testedAt: string
+  compositeVerdict?: CompositePatchRetestVerdict
+  patchBrokeHopId?: string | null
 }
 
 export interface PortableReceiptRecord {
@@ -124,6 +127,8 @@ export interface CompositeReceiptExportInput {
   patchBrokeHopId?: string | null
   /** Optional post-patch retest verdict if retested. */
   patchRetestVerdict?: 'reproduced' | 'fixed' | 'inconclusive' | null
+  /** Optional structured multi-hop composite verdict (`fixed` | `still_vulnerable` | `inconclusive` | `precondition_changed`). */
+  compositeVerdict?: CompositePatchRetestVerdict | null
 }
 
 export interface PortableCompositeHopSummary {
@@ -191,6 +196,7 @@ export interface PortableCompositeReceiptRecord {
   }
   patchBrokeHopId: string | null
   patchRetestVerdict: 'reproduced' | 'fixed' | 'inconclusive' | null
+  compositeVerdict?: CompositePatchRetestVerdict | null
   transcriptSlices: PortableTranscriptSlice[]
   recordSha256: string
 }
@@ -589,6 +595,16 @@ export function buildPortableCompositeReceiptRecord(
     }
   }
 
+  const resolvedCompositeVerdict = isValidCompositeVerdict(input.compositeVerdict) ? input.compositeVerdict : null
+  const effectiveRetestVerdict: 'reproduced' | 'fixed' | 'inconclusive' | null = resolvedCompositeVerdict
+    ? mapCompositeVerdictToRetestVerdict(resolvedCompositeVerdict)
+    : (input.patchRetestVerdict ?? null)
+  const effectivePatchBrokeHopId = resolvedCompositeVerdict && resolvedCompositeVerdict !== 'fixed'
+    ? null
+    : (effectiveRetestVerdict && effectiveRetestVerdict !== 'fixed')
+      ? null
+      : (input.patchBrokeHopId ? scrubText(input.patchBrokeHopId, secrets, zdr) : null)
+
   const baseRecord: Omit<PortableCompositeReceiptRecord, 'recordSha256'> = {
     chainId: receipt.chainId,
     findingId: input.findingId ?? null,
@@ -610,8 +626,9 @@ export function buildPortableCompositeReceiptRecord(
       postChainReadbackExchangeIds: [...receipt.terminalImpact.postChainReadbackExchangeIds],
       modeAFailureExchangeId: receipt.terminalImpact.modeAFailureExchangeId ?? null,
     },
-    patchBrokeHopId: input.patchBrokeHopId ? scrubText(input.patchBrokeHopId, secrets, zdr) : null,
-    patchRetestVerdict: input.patchRetestVerdict ?? null,
+    patchBrokeHopId: effectivePatchBrokeHopId,
+    patchRetestVerdict: effectiveRetestVerdict,
+    ...(resolvedCompositeVerdict ? { compositeVerdict: resolvedCompositeVerdict } : {}),
     transcriptSlices,
   }
 
@@ -621,16 +638,156 @@ export function buildPortableCompositeReceiptRecord(
   }
 }
 
-const PATCH_BROKE_HOP_RE = /\bpatchBrokeHopId\s*[:=]\s*["']?([A-Za-z0-9._:-]{1,128})["']?/i
+const VALID_COMPOSITE_VERDICTS = new Set<CompositePatchRetestVerdict>([
+  'fixed', 'still_vulnerable', 'inconclusive', 'precondition_changed',
+])
+
+function isValidCompositeVerdict(value: unknown): value is CompositePatchRetestVerdict {
+  return typeof value === 'string' && VALID_COMPOSITE_VERDICTS.has(value as CompositePatchRetestVerdict)
+}
+
+function mapCompositeVerdictToRetestVerdict(verdict: CompositePatchRetestVerdict): 'reproduced' | 'fixed' | 'inconclusive' {
+  if (verdict === 'fixed') return 'fixed'
+  if (verdict === 'still_vulnerable') return 'reproduced'
+  // Fail-closed invariant: precondition_changed and inconclusive NEVER map to 'fixed'.
+  return 'inconclusive'
+}
+
+function isHopIdChar(code: number): boolean {
+  return (code >= 48 && code <= 57) // 0-9
+    || (code >= 65 && code <= 90) // A-Z
+    || (code >= 97 && code <= 122) // a-z
+    || code === 45 // -
+    || code === 46 // .
+    || code === 58 // :
+    || code === 95 // _
+}
 
 /**
- * Best-effort extraction of persisted `CompositeProofReceipt` records from `replaySpecs` and
- * matching `retestRuns` (e.g., `patchBrokeHopId`) without requiring schema migrations.
+ * Legacy pre-Q8 fallback parser for old retest summaries that lacked structured `patchBrokeHopId` /
+ * `compositeVerdict` fields. Only invoked when NO structured metadata is present AND verdict === 'fixed'.
+ */
+function parseLegacyPatchBrokeHopId(summary: string): string | null {
+  const needle = 'patchBrokeHopId'
+  const lower = summary.toLowerCase()
+  let pos = 0
+  while (pos < lower.length) {
+    const idx = lower.indexOf(needle.toLowerCase(), pos)
+    if (idx < 0) return null
+    if (idx > 0 && isHopIdChar(summary.charCodeAt(idx - 1))) {
+      pos = idx + needle.length
+      continue
+    }
+    let cur = idx + needle.length
+    while (cur < summary.length && (summary[cur] === ' ' || summary[cur] === '\t')) cur += 1
+    if (summary[cur] !== ':' && summary[cur] !== '=') {
+      pos = idx + needle.length
+      continue
+    }
+    cur += 1
+    while (cur < summary.length && (summary[cur] === ' ' || summary[cur] === '\t')) cur += 1
+    if (summary[cur] === '"' || summary[cur] === "'") cur += 1
+    const start = cur
+    while (cur < summary.length && cur - start < 128 && isHopIdChar(summary.charCodeAt(cur))) cur += 1
+    if (cur > start) return summary.slice(start, cur)
+    pos = idx + needle.length
+  }
+  return null
+}
+
+interface StructuredCompositeRetestMeta {
+  patchBrokeHopId: string | null
+  compositeVerdict: CompositePatchRetestVerdict | null
+  patchRetestVerdict: 'reproduced' | 'fixed' | 'inconclusive' | null
+  hasStructured: boolean
+}
+
+function parseCompositeRetestObject(raw: unknown): {
+  patchBrokeHopId: string | null
+  compositeVerdict: CompositePatchRetestVerdict | null
+  hasStructured: boolean
+} {
+  if (!raw || typeof raw !== 'object') return { patchBrokeHopId: null, compositeVerdict: null, hasStructured: false }
+  const rec = raw as Record<string, unknown>
+  const nested = rec.compositeRetest && typeof rec.compositeRetest === 'object'
+    ? rec.compositeRetest as Record<string, unknown>
+    : null
+  const rawVerdict = rec.compositeVerdict ?? nested?.compositeVerdict
+  const compositeVerdict = isValidCompositeVerdict(rawVerdict) ? rawVerdict : null
+  const rawHop = rec.patchBrokeHopId !== undefined ? rec.patchBrokeHopId : nested?.patchBrokeHopId
+  const patchBrokeHopId = typeof rawHop === 'string' && rawHop.trim() ? rawHop.trim() : null
+  const hasStructured = compositeVerdict !== null
+    || rawHop !== undefined
+    || nested !== null
+  return { patchBrokeHopId, compositeVerdict, hasStructured }
+}
+
+function resolveStructuredCompositeRetestMeta(
+  specProofObj: Record<string, unknown>,
+  latestRetest: typeof retestRuns.$inferSelect | undefined,
+  retestArtifactsById?: ReadonlyMap<string, Record<string, unknown>>,
+): StructuredCompositeRetestMeta {
+  // 1) Prefer structured fields directly on the retest record (or its linked structured artifact).
+  const fromRetestRow = parseCompositeRetestObject(latestRetest)
+  let fromArtifact: { patchBrokeHopId: string | null; compositeVerdict: CompositePatchRetestVerdict | null; hasStructured: boolean } = {
+    patchBrokeHopId: null, compositeVerdict: null, hasStructured: false,
+  }
+  if (!fromRetestRow.hasStructured && latestRetest && retestArtifactsById) {
+    for (const evId of latestRetest.evidenceIds ?? []) {
+      const art = retestArtifactsById.get(evId)
+      if (art) {
+        const parsed = parseCompositeRetestObject(art)
+        if (parsed.hasStructured) {
+          fromArtifact = parsed
+          break
+        }
+      }
+    }
+  }
+  const fromSpecProof = parseCompositeRetestObject(specProofObj)
+
+  const primary = fromRetestRow.hasStructured
+    ? fromRetestRow
+    : fromArtifact.hasStructured
+      ? fromArtifact
+      : fromSpecProof
+
+  const compositeVerdict = primary.compositeVerdict
+  const patchRetestVerdict: 'reproduced' | 'fixed' | 'inconclusive' | null = compositeVerdict
+    ? mapCompositeVerdictToRetestVerdict(compositeVerdict)
+    : (latestRetest?.verdict ?? null)
+
+  let patchBrokeHopId: string | null = primary.patchBrokeHopId
+  // Legacy fallback ONLY when NO structured fields exist anywhere AND the retest verdict is 'fixed'.
+  if (!primary.hasStructured && !patchBrokeHopId && latestRetest && latestRetest.verdict === 'fixed') {
+    patchBrokeHopId = parseLegacyPatchBrokeHopId(latestRetest.summary)
+  }
+
+  // Fail-closed invariant: non-fixed verdicts NEVER carry a patchBrokeHopId.
+  if (compositeVerdict && compositeVerdict !== 'fixed') {
+    patchBrokeHopId = null
+  } else if (patchRetestVerdict && patchRetestVerdict !== 'fixed') {
+    patchBrokeHopId = null
+  }
+
+  return {
+    patchBrokeHopId,
+    compositeVerdict,
+    patchRetestVerdict,
+    hasStructured: primary.hasStructured,
+  }
+}
+
+/**
+ * Extract persisted `CompositeProofReceipt` records from `replaySpecs` and matching `retestRuns`
+ * using structured `patchBrokeHopId` and `compositeVerdict` metadata (falling back cleanly only
+ * for legacy pre-Q8 records that lack structured fields).
  */
 export function extractStoreCompositeReceipts(
   specRows: ReadonlyArray<typeof replaySpecs.$inferSelect>,
   retestRows: ReadonlyArray<typeof retestRuns.$inferSelect> = [],
   findingsById?: ReadonlyMap<string, { title?: string; severity?: string; cwe?: string | null }>,
+  retestArtifactsById?: ReadonlyMap<string, Record<string, unknown>>,
 ): CompositeReceiptExportInput[] {
   const retestsByFinding = new Map<string, Array<typeof retestRuns.$inferSelect>>()
   for (const rt of retestRows) {
@@ -651,16 +808,7 @@ export function extractStoreCompositeReceipts(
 
     const findingMeta = findingsById?.get(specRow.findingId)
     const latestRetest = (retestsByFinding.get(specRow.findingId) ?? [])[0]
-    let patchBrokeHopId: string | null = typeof obj.patchBrokeHopId === 'string' ? obj.patchBrokeHopId : null
-    if (!patchBrokeHopId && latestRetest) {
-      const rtAny = latestRetest as unknown as Record<string, unknown>
-      if (typeof rtAny.patchBrokeHopId === 'string' && rtAny.patchBrokeHopId.trim()) {
-        patchBrokeHopId = rtAny.patchBrokeHopId.trim()
-      } else {
-        const match = PATCH_BROKE_HOP_RE.exec(latestRetest.summary)
-        if (match?.[1]) patchBrokeHopId = match[1]
-      }
-    }
+    const meta = resolveStructuredCompositeRetestMeta(obj, latestRetest, retestArtifactsById)
     const rawVer = obj.compositeVerification as CompositeReceiptExportInput['verification'] | undefined
     const hopActors = (obj.hopActors && typeof obj.hopActors === 'object')
       ? obj.hopActors as Record<string, string | null>
@@ -674,8 +822,9 @@ export function extractStoreCompositeReceipts(
       receipt: parsed.data,
       ...(rawVer ? { verification: rawVer } : {}),
       ...(hopActors ? { hopActors } : {}),
-      ...(patchBrokeHopId ? { patchBrokeHopId } : {}),
-      ...(latestRetest ? { patchRetestVerdict: latestRetest.verdict } : {}),
+      ...(meta.patchBrokeHopId ? { patchBrokeHopId: meta.patchBrokeHopId } : {}),
+      ...(meta.patchRetestVerdict ? { patchRetestVerdict: meta.patchRetestVerdict } : {}),
+      ...(meta.compositeVerdict ? { compositeVerdict: meta.compositeVerdict } : {}),
     })
   }
   return extracted
@@ -734,6 +883,20 @@ export function exportRunReceiptBundle(
     const arr = retestsByFinding.get(rt.findingId) ?? []
     arr.push(rt)
     retestsByFinding.set(rt.findingId, arr)
+  }
+
+  const retestArtifactsById = new Map<string, Record<string, unknown>>()
+  for (const rt of retestRows) {
+    for (const evId of rt.evidenceIds ?? []) {
+      if (retestArtifactsById.has(evId)) continue
+      try {
+        const art = storage.artifact(run.id, evId)
+        const parsed = JSON.parse(art.content) as unknown
+        if (parsed && typeof parsed === 'object' && (parsed as Record<string, unknown>).kind === 'composite_patch_retest') {
+          retestArtifactsById.set(evId, parsed as Record<string, unknown>)
+        }
+      } catch { /* non-JSON or missing artifact */ }
+    }
   }
 
   const records: PortableReceiptRecord[] = []
@@ -824,13 +987,34 @@ export function exportRunReceiptBundle(
       })
     }
 
-    const patchRetests: PortablePatchRetestProof[] = (retestsByFinding.get(row.id) ?? []).map(rt => ({
-      retestId: rt.id,
-      verdict: rt.verdict,
-      summary: scrubText(rt.summary, secrets, zdr),
-      exchangeIds: [...rt.exchangeIds],
-      testedAt: new Date(rt.createdAt).toISOString(),
-    }))
+    const patchRetests: PortablePatchRetestProof[] = (retestsByFinding.get(row.id) ?? []).map(rt => {
+      const rtDirect = parseCompositeRetestObject(rt)
+      let rtStruct = rtDirect
+      if (!rtStruct.hasStructured) {
+        for (const evId of rt.evidenceIds ?? []) {
+          const art = retestArtifactsById.get(evId)
+          if (art) {
+            const parsed = parseCompositeRetestObject(art)
+            if (parsed.hasStructured) { rtStruct = parsed; break }
+          }
+        }
+      }
+      const effectiveVerdict = rtStruct.compositeVerdict
+        ? mapCompositeVerdictToRetestVerdict(rtStruct.compositeVerdict)
+        : rt.verdict
+      const effectiveHopId = rtStruct.compositeVerdict
+        ? (rtStruct.compositeVerdict === 'fixed' && rtStruct.patchBrokeHopId ? scrubText(rtStruct.patchBrokeHopId, secrets, zdr) : null)
+        : (rtStruct.hasStructured && effectiveVerdict === 'fixed' && rtStruct.patchBrokeHopId ? scrubText(rtStruct.patchBrokeHopId, secrets, zdr) : undefined)
+      return {
+        retestId: rt.id,
+        verdict: effectiveVerdict,
+        summary: scrubText(rt.summary, secrets, zdr),
+        exchangeIds: [...rt.exchangeIds],
+        testedAt: new Date(rt.createdAt).toISOString(),
+        ...(rtStruct.compositeVerdict ? { compositeVerdict: rtStruct.compositeVerdict } : {}),
+        ...(effectiveHopId !== undefined ? { patchBrokeHopId: effectiveHopId } : {}),
+      }
+    })
 
     const baseRecord: Omit<PortableReceiptRecord, 'recordSha256'> = {
       findingId: row.id,
@@ -864,7 +1048,7 @@ export function exportRunReceiptBundle(
     findingRows.map(row => [row.id, { title: row.finding.title, severity: row.finding.severity, cwe: row.finding.cwe ?? null }]),
   )
   const compositeInputByChain = new Map<string, CompositeReceiptExportInput>()
-  for (const extracted of extractStoreCompositeReceipts(specRows, retestRows, findingsMetaById)) {
+  for (const extracted of extractStoreCompositeReceipts(specRows, retestRows, findingsMetaById, retestArtifactsById)) {
     compositeInputByChain.set(extracted.receipt.chainId, extracted)
   }
   for (const supplied of options.compositeReceipts ?? []) {
@@ -983,6 +1167,9 @@ export function verifyProofReceiptBundle(
     for (const comp of rawComposites) {
       if (!isPortableCompositeReceiptRecord(comp) || !VALID_REPLAY_MODES.has(comp.replayMode)) {
         return { valid: false, reason: 'Composite receipt record is malformed.', verifiedRecords: 0 }
+      }
+      if (comp.compositeVerdict !== undefined && comp.compositeVerdict !== null && !isValidCompositeVerdict(comp.compositeVerdict)) {
+        return { valid: false, reason: `Composite receipt ${comp.chainId} contains an invalid compositeVerdict.`, verifiedRecords: 0 }
       }
       for (const edge of comp.causalEdges) {
         if (!edge || typeof edge !== 'object' || !VALID_EDGE_KINDS.has(edge.kind)) {
