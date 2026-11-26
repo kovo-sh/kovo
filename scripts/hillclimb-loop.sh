@@ -46,7 +46,7 @@ fi
 if [[ "${HILLCLIMB_SKIP_AGENTIC:-0}" != "1" ]]; then
   if ! docker ps >/dev/null 2>&1; then
     echo "agentic: skipped (docker socket unavailable; run under: newgrp docker -c 'bash scripts/hillclimb-loop.sh')" >"$OUT/agentic.log"
-    echo 0 >"$OUT/agentic.rc"
+    echo 1 >"$OUT/agentic.rc"
   elif [[ "$MODE" == "--full" ]]; then
     run agentic env KOVO_ALLOW_LOCAL_LAB=1 node "$ROOT/scripts/benchmark-agentic-matrix.ts" \
       --apps acme-saas,shopflow,opsportal --seeds 1 --modes grey-box --budget-usd 2 \
@@ -75,7 +75,7 @@ fi
 
 section "agentic ($MODE)"
 if [[ -f "$OUT/agentic.log" ]]; then
-  grep -E 'TOTAL|confirmed=|workerFailureRate|inert=' "$OUT/agentic.log" | tail -6
+  grep -E 'TOTAL|confirmed=|workerFailureRate|inert=|skipped' "$OUT/agentic.log" | tail -6
   [[ "$(cat "$OUT/agentic.rc" 2>/dev/null)" == "0" ]] || status=1
 else
   echo "skipped"

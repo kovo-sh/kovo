@@ -52,10 +52,16 @@ import { DerivedCapabilityVault, resetRunCustodyBudgets } from './derived-custod
 import { runAllRunDisposers } from './run-disposers.ts'
 import { normalizeEndpointTemplate } from './dedupe.ts'
 import {
+  conventionalWordlistEnabled,
+  defaultEngineMaxDurationMs,
+  defaultEngineMaxRequests,
+  deterministicWallMarginMs,
   extractCreatedId,
   stagingProbeTag,
   tagStagingEntityBody,
 } from './deterministic-engine.ts'
+import { proofReceiptMode } from './proof-receipt.ts'
+import { VERIFY_RPC_SDK_VERSION } from './verify-rpc.ts'
 import {
   createExchangeRecorder,
   findFindingRow,
@@ -603,6 +609,7 @@ export class Execution {
       createConfirmedReplaySpec: (run, assignment, findingId, spec, origins, result, secrets) =>
         this.storage.createReplaySpec(run, assignment, findingId, spec, origins, {
           verifiedInline: true,
+          backingKind: 'floor_engine',
           lastVerificationDiff: buildInlineVerifyFeedback(spec, result, 1, maxInlineVerifyRetries, secrets),
         }),
     })
@@ -1916,6 +1923,7 @@ export class Execution {
       const actor = this.ensureRunActor(run)
       const desiredState = deriveRunActorState(run)
       actor.reconcileWithPersisted(desiredState, `runnable:${run.status}:${run.phase}`)
+      this.ensureEffectiveConfigRecorded(run, profiles)
       if (this.storage.checkBudgetExceeded(run.id)) continue
       this.ensureVariantSweepsForConfirmedFindings(run)
       this.routeOperatorBoardMessages(run)
@@ -1951,6 +1959,82 @@ export class Execution {
         continue
       }
     }
+  }
+
+  private ensureEffectiveConfigRecorded(run: Run, profiles: readonly ResolvedModelProfile[]): void {
+    try {
+      const existing = this.storage.client.prepare(
+        `SELECT 1 FROM events WHERE run_id = ? AND kind = 'run.effective_config' LIMIT 1`,
+      ).get(run.id)
+      if (existing) return
+    } catch {
+      return
+    }
+    const scopePolicy = (() => {
+      try { return this.storage.scopePolicy(run) } catch { return { mode: 'ephemeral_lab' as const } }
+    })()
+    const environment = (() => {
+      try { return this.storage.project(run.projectId).environment } catch { return scopePolicy.mode === 'ephemeral_lab' ? 'local-lab' : 'public' }
+    })()
+    const wordlistOn = conventionalWordlistEnabled()
+    const conventionalEndpointsProbed = (() => {
+      try {
+        const row = this.storage.client.prepare(
+          `SELECT COUNT(*) AS cnt FROM endpoints WHERE run_id = ? AND source = 'conventional'`,
+        ).get(run.id) as { cnt?: number } | undefined
+        return Number(row?.cnt ?? 0)
+      } catch {
+        return 0
+      }
+    })()
+    const resolvedReceiptMode = (() => {
+      try { return proofReceiptMode() } catch { return (process.env.KOVO_PROOF_RECEIPT ?? 'strict').trim().toLowerCase() || 'strict' }
+    })()
+    const siblings = /^(?:1|true|on|yes)$/i.test((process.env.KOVO_RECON_SIBLINGS ?? '').trim())
+    const runMaxDuration = Number((run as { maxDurationMs?: number }).maxDurationMs)
+    const effectiveMaxDurationMs = Number.isFinite(runMaxDuration) && runMaxDuration > 0
+      ? runMaxDuration
+      : this.maxDurationMs
+    const floorDurationMs = this.deterministicOnly
+      ? defaultEngineMaxDurationMs
+      : this.deterministicLaneDeadlineMs(run)
+    const floorRequestCap = this.phaseRequestBudgets?.floor ?? Math.min(defaultEngineMaxRequests, run.budgetRequests)
+    const floorPolicy = this.deterministicOnly
+      ? 'no_llm_240s'
+      : scopePolicy.mode === 'staging_isolated'
+        ? 'staging_isolated'
+        : 'phase_a_12pct_cap_75s'
+    const modelProfileId = this.deterministicOnly ? null : (profiles[0]?.id ?? null)
+    const backendImage = (this.backend as { image?: unknown } | undefined)?.image
+    const workerImageId = this.backend instanceof LinuxWorkerBackend
+      ? (typeof backendImage === 'string' && backendImage.trim()
+          ? backendImage.trim()
+          : (process.env.KOVO_WORKER_IMAGE?.trim() || 'kovo-worker:v4'))
+      : null
+    this.safeEvent(
+      run.id,
+      'run.effective_config',
+      `Effective run config recorded (env=${environment}/${scopePolicy.mode}, tier=${run.capabilityTier}, wordlist=${wordlistOn ? 'on' : 'off'}, floor=${Math.round(floorDurationMs / 1000)}s, sdk=${VERIFY_RPC_SDK_VERSION}).`,
+      {
+        environment,
+        environmentMode: scopePolicy.mode,
+        tier: run.capabilityTier,
+        approvalPolicy: run.approvalPolicy ?? 'auto_review',
+        deterministicOnly: this.deterministicOnly,
+        wordlistOn,
+        conventionalEndpointsProbed,
+        proofReceiptMode: resolvedReceiptMode,
+        siblings,
+        floorDurationMs,
+        floorWallMarginMs: deterministicWallMarginMs,
+        maxDurationMs: effectiveMaxDurationMs,
+        floorRequestCap,
+        floorPolicy,
+        modelProfileId,
+        workerImageId,
+        sdkVersion: VERIFY_RPC_SDK_VERSION,
+      },
+    )
   }
 
   private runAuthKey(run: Run): string {
@@ -2583,8 +2667,10 @@ export class Execution {
   }
 
   /**
-   * Phase A: start the deterministic floor as the first, blocking investigation phase. It uses the
-   * exact `--no-llm` implementation and deep policy; agents are not dispatched until it settles.
+   * Phase A: start the deterministic floor as the first, blocking investigation phase. It runs the
+   * shared deterministic engine under the agentic Phase-A wall-clock cap (`min(75s, 12% × maxDurationMs)`
+   * plus the 120s emergency margin, vs. 240s + 120s in `--no-llm` mode; `staging_isolated` uses its
+   * own duration branch) with the same default request cap; agents are not dispatched until it settles.
    * Returns true when the floor is (or remains) in flight, so `driveInvestigation` yields to it.
    */
   private startDeterministicLane(
@@ -3011,10 +3097,10 @@ export class Execution {
       } catch { /* seeding is additive */ }
     }
 
-    // Phase A: the deterministic floor runs sequentially *before* any agent dispatch, using the
-    // same deep implementation/policy as `--no-llm`. It is not a sibling lane: dispatch yields
-    // until it settles, so workers never race or clobber floor probe state and the floor cannot be
-    // starved by specialist request/rate/budget pressure.
+    // Phase A: the deterministic floor runs sequentially *before* any agent dispatch, sharing the
+    // deterministic engine under the Phase-A wall-clock cap (recorded in `run.effective_config`).
+    // It is not a sibling lane: dispatch yields until it settles, so workers never race or clobber
+    // floor probe state and the floor cannot be starved by specialist request/rate/budget pressure.
     try { this.ensureRunTrace(run, profiles) } catch { /* tracing is best-effort */ }
     if (this.startDeterministicLane(run, profiles)) return
     if (!this.agenticFloorDispatchedAt.has(run.id)) this.agenticFloorDispatchedAt.set(run.id, Date.now())

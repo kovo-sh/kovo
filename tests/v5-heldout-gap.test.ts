@@ -40,10 +40,12 @@ function endpoint(over: Partial<EngineEndpoint> & Pick<EngineEndpoint, 'method' 
 }
 
 describe('conventional wordlist switch', () => {
-  test('defaults ON for local-lab compatibility', () => {
-    assert.equal(conventionalWordlistEnabled({}), true)
-    assert.equal(conventionalWordlistEnabled({ KOVO_CONVENTIONAL_WORDLIST: '' }), true)
+  test('defaults OFF and requires explicit opt-in', () => {
+    assert.equal(conventionalWordlistEnabled({}), false)
+    assert.equal(conventionalWordlistEnabled({ KOVO_CONVENTIONAL_WORDLIST: '' }), false)
     assert.equal(conventionalWordlistEnabled({ KOVO_CONVENTIONAL_WORDLIST: 'on' }), true)
+    assert.equal(conventionalWordlistEnabled({ KOVO_CONVENTIONAL_WORDLIST: '1' }), true)
+    assert.equal(conventionalWordlistEnabled({ KOVO_CONVENTIONAL_WORDLIST: 'true' }), true)
   })
 
   test('explicit OFF values disable only wordlist-only endpoints', () => {    for (const value of ['0', 'off', 'false', 'no', ' OFF ']) {

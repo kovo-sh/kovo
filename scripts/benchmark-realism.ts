@@ -605,6 +605,8 @@ export function translateFindings(input: {
     if (finding.findingKind === 'baseline_check') continue
     if (IGNORED_FINDING_STATUSES.has(finding.status)) continue
     if (finding.supersededByFindingId) continue
+    if ((finding as { provenance?: unknown }).provenance === 'harness_assisted') continue
+    if ((finding as { harnessAssisted?: unknown }).harnessAssisted === true) continue
     const endpoints: DeclaredEndpoint[] = []
     for (const spec of (specsByFinding.get(finding.id) ?? []).slice(0, 3)) {
       const declared = declaredEndpointsFromReplaySpec(spec.spec)
@@ -2747,6 +2749,16 @@ export interface SpaCapabilityLaneInput {
 
 export interface SpaCapabilityLaneResult {
   confirmed: string[]
+  /** Harness-built non-browser SPA checks tagged `harness_assisted` (excluded from product confirmed recall). */
+  harnessAssisted: Array<{
+    vulnClass: string
+    cwe: string
+    origin: string
+    endpoint: string
+    title: string
+    reason: string
+    tag: 'harness_assisted'
+  }>
   notes: string[]
 }
 
@@ -2843,6 +2855,7 @@ function spaCollectTenants(value: unknown, out: Set<string>, depth = 0): void {
 export async function runSpaCapabilityLane(input: SpaCapabilityLaneInput): Promise<SpaCapabilityLaneResult> {
   const notes: string[] = []
   const confirmed: string[] = []
+  const harnessAssisted: SpaCapabilityLaneResult['harnessAssisted'] = []
   const targetOrigins = Object.entries(input.scopes)
     .filter(([, role]) => role === 'target')
     .map(([label]) => input.origins[label])
@@ -2852,7 +2865,7 @@ export async function runSpaCapabilityLane(input: SpaCapabilityLaneInput): Promi
     .map(([label]) => input.origins[label])
     .filter((value): value is string => typeof value === 'string')
   const allOrigins = Object.values(input.origins).filter((value): value is string => typeof value === 'string')
-  if (targetOrigins.length === 0 || input.routes.length === 0) return { confirmed, notes }
+  if (targetOrigins.length === 0 || input.routes.length === 0) return { confirmed, harnessAssisted, notes }
 
   const routePath = (route: RouteRef): string => (route.path.split('?')[0] ?? route.path)
   const isTemplated = (route: RouteRef): boolean => /[:{}[\]]/.test(routePath(route))
@@ -2990,31 +3003,46 @@ export async function runSpaCapabilityLane(input: SpaCapabilityLaneInput): Promi
         },
       ],
     }
+    // Non-browser SPA lane checks are harness-built (no verifier-issued ProofReceipt): tag them
+    // `harness_assisted` and NEVER persist them into the Store as `runtime_confirmed` product recall.
+    if (!proof.browserTrace) {
+      harnessAssisted.push({
+        vulnClass: proof.vulnClass,
+        cwe: proof.cwe,
+        origin: proof.origin,
+        endpoint: proof.endpoint,
+        title: proof.title,
+        reason: proof.reason,
+        tag: 'harness_assisted',
+      })
+      notes.push(`spa-lane [harness_assisted]: ${proof.vulnClass} ${proof.endpoint} excluded from product confirmed recall (no verifier-issued ProofReceipt)`)
+      return
+    }
     const evidenceIds: string[] = []
     let verification = proof.verification
-    if (proof.browserTrace) {
-      const receipt = buildProofReceipt({
-        vulnClass: 'dom_xss',
-        target: { origin: proof.origin, method: proof.probe.method, pathAndQuery: proof.probe.pathAndQuery },
-        // The browser rule verifies the cited trace; the HTTP exchange is cited on the finding.
-        exchangeIds: [],
-        browserTraceIds: [proof.browserTrace.id],
-        claimedDelta: proof.reason.slice(0, 1200),
-      })
-      const checked = verifyReceipt(receipt, { entries: [], browserTraces: [proof.browserTrace] })
-      if (!checked.confirmed) {
-        notes.push(`spa-lane: ${proof.vulnClass} receipt rejected: ${checked.reason.slice(0, 160)}`)
-        return
-      }
-      const digest = createHash('sha256').update(JSON.stringify(receipt)).digest('hex')
-      try {
-        evidenceIds.push(input.storage.addArtifact(
-          input.run, assignment, 'replay', `ProofReceipt · ${proof.title.slice(0, 120)}`,
-          JSON.stringify({ receipt, verification: checked }, null, 2), `receipt:${digest}`, [],
-        ).id)
-      } catch { /* artifact is best-effort; the verified receipt text still backs the finding */ }
-      verification = `${proof.verification} ProofReceipt ${digest.slice(0, 16)} verified (${checked.rule}): ${checked.reason.slice(0, 260)}`
+    const receipt = buildProofReceipt({
+      vulnClass: 'dom_xss',
+      target: { origin: proof.origin, method: proof.probe.method, pathAndQuery: proof.probe.pathAndQuery },
+      // The browser rule verifies the cited trace; the HTTP exchange is cited on the finding.
+      exchangeIds: [],
+      browserTraceIds: [proof.browserTrace.id],
+      claimedDelta: proof.reason.slice(0, 1200),
+    })
+    const checked = verifyReceipt(receipt, { entries: [], browserTraces: [proof.browserTrace] })
+    if (!checked.confirmed) {
+      notes.push(`spa-lane: ${proof.vulnClass} receipt rejected: ${checked.reason.slice(0, 160)}`)
+      return
     }
+    const digest = createHash('sha256').update(JSON.stringify(receipt)).digest('hex')
+    let artifactId: string | null = null
+    try {
+      artifactId = input.storage.addArtifact(
+        input.run, assignment, 'replay', `ProofReceipt · ${proof.title.slice(0, 120)}`,
+        JSON.stringify({ receipt, verification: checked }, null, 2), `receipt:${digest}`, [],
+      ).id
+      evidenceIds.push(artifactId)
+    } catch { /* artifact is best-effort; the verified receipt still backs the finding */ }
+    verification = `${proof.verification} ProofReceipt ${digest.slice(0, 16)} verified (${checked.rule}): ${checked.reason.slice(0, 260)}`
     const finding: Finding = {
       id: randomUUID(),
       origin: proof.origin,
@@ -3052,6 +3080,16 @@ export async function runSpaCapabilityLane(input: SpaCapabilityLaneInput): Promi
       const specRow = input.storage.createReplaySpec(input.run, assignment, finding.id, spec, [proof.origin], {
         verifiedInline: true,
         lastVerificationDiff: feedback,
+        proof: {
+          replaySpecId: '',
+          findingId: finding.id,
+          verdict: 'confirmed',
+          runtime: 'ts',
+          scriptSha256: digest,
+          artifactId,
+          receipt: { receipt, verification: checked },
+          createdAt: Date.now(),
+        },
       })
       input.storage.upsertChainFinding(input.run, input.assetId, { ...finding, replaySpecId: specRow.id }, specRow.id, [proof.origin], {
         provenance: 'agent_only',
@@ -3328,7 +3366,7 @@ export async function runSpaCapabilityLane(input: SpaCapabilityLaneInput): Promi
     if (input.createBrowser) await laneBrowser.close().catch(() => undefined)
   }
 
-  return { confirmed, notes }
+  return { confirmed, harnessAssisted, notes }
 }
 
 export async function runCell(args: RealismArgs, fixtureName: string, signal: AbortSignal, log: (line: string) => void): Promise<RealismCellResult> {
@@ -3694,6 +3732,9 @@ export async function runCell(args: RealismArgs, fixtureName: string, signal: Ab
         })
         notes.push(...lane.notes)
         if (lane.confirmed.length > 0) notes.push(`spa capability lane confirmed: ${lane.confirmed.join(', ')}`)
+        if (lane.harnessAssisted.length > 0) {
+          notes.push(`spa capability lane harness_assisted (excluded from product confirmed recall): ${lane.harnessAssisted.map(h => `${h.vulnClass} ${h.endpoint}`).join(', ')}`)
+        }
       } catch (error) {
         notes.push(`spa capability lane failed: ${redact(error instanceof Error ? error.message : String(error)).slice(0, 200)}`)
       } finally {

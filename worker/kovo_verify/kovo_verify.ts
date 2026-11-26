@@ -100,15 +100,17 @@ export interface ChainProveOptions { terminalHopId?: string; claimedImpact?: str
 interface HopRecorder { hopId: string; target?: HopTargetObject; exchangeIds: string[]; oobEventIds: string[]; browserTraceIds: string[]; producedCapabilities: string[]; consumedCapabilities: string[]; entityId?: string; correlationIds: string[]; capConsumeExchange: Map<string, string>; cryptoConsumptions: Array<{ sourceCapabilityId: string; derivedCapabilityId?: string; alg?: string }>; asyncPolls: Array<{ pollRecordId: string; correlationId?: string; triggerExchangeId?: string }>; onProduce(cap: string, exchangeId?: string): void; onExchange(exchangeId: string): void; onCorrelation(correlationId: string): void }
 interface RpcTransport { socketPath: string; token: string; nonce: string }
 
+export const KOVO_VERIFY_SDK_VERSION = 'kovo_verify/v8'
+
 function readContext(): RpcContext {
   const raw = JSON.parse(readFileSync(process.env.KOVO_RPC_CONTEXT_FILE ?? '/kovo-rpc/context.json', 'utf8')) as Record<string, unknown>
-  return { nonce: typeof raw.nonce === 'string' ? raw.nonce : '', runId: typeof raw.runId === 'string' ? raw.runId : 'unknown-run', targetOrigins: Array.isArray(raw.targetOrigins) ? raw.targetOrigins.filter((v): v is string => typeof v === 'string') : [], sdkVersion: typeof raw.sdkVersion === 'string' ? raw.sdkVersion : 'kovo_verify/v8' }
+  return { nonce: typeof raw.nonce === 'string' ? raw.nonce : '', runId: typeof raw.runId === 'string' ? raw.runId : 'unknown-run', targetOrigins: Array.isArray(raw.targetOrigins) ? raw.targetOrigins.filter((v): v is string => typeof v === 'string') : [], sdkVersion: typeof raw.sdkVersion === 'string' ? raw.sdkVersion : KOVO_VERIFY_SDK_VERSION }
 }
 
 function sendRpc(transport: RpcTransport, op: string, args: Record<string, unknown>, timeoutMs = 60_000): Promise<unknown> {
   const payload = JSON.stringify({ op, args })
   return new Promise((resolve, reject) => {
-    const req = httpRequest({ socketPath: transport.socketPath, path: '/rpc', method: 'POST', timeout: timeoutMs, headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload), 'x-kovo-rpc-token': transport.token, 'x-kovo-verify-nonce': transport.nonce } }, res => {
+    const req = httpRequest({ socketPath: transport.socketPath, path: '/rpc', method: 'POST', timeout: timeoutMs, headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload), 'x-kovo-rpc-token': transport.token, 'x-kovo-verify-nonce': transport.nonce, 'x-kovo-sdk-version': KOVO_VERIFY_SDK_VERSION } }, res => {
       const chunks: Buffer[] = []; let size = 0
       res.on('data', (chunk: Buffer) => { size += chunk.length; if (size > 8 * 1024 * 1024) { res.destroy(); reject(new Error('Verification RPC response exceeded the SDK limit.')); return } chunks.push(chunk) })
       res.on('end', () => {
@@ -493,6 +495,7 @@ export class VerifyContext {
     for (const src of ex.derivedFromCapabilityIds ?? []) if (src && !hop.cryptoConsumptions.some(c => c.sourceCapabilityId === src)) { pushUnique(hop.consumedCapabilities, src); hop.cryptoConsumptions.push({ sourceCapabilityId: src }) }
   }
   private callRpc(op: string, args: Record<string, unknown>, timeoutMs = 60_000): Promise<unknown> { this._lastRpcOp = op; return sendRpc(this.transport, op, args, timeoutMs) }
+  hello(sdkVersion: string = KOVO_VERIFY_SDK_VERSION): Promise<{ sdkVersion: string; nonce: string; runId: string }> { return this.callRpc('hello', { sdkVersion }) as Promise<{ sdkVersion: string; nonce: string; runId: string }> }
 
   chain(opts: ChainBuilderOptions): ChainBuilder
   chain(chainId: string, terminalVulnClass: string, opts?: Omit<ChainBuilderOptions, 'chainId' | 'terminalVulnClass'>): ChainBuilder

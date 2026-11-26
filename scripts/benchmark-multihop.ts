@@ -66,8 +66,9 @@ import type { SnapshotCheckpoint } from '../src/server/run-snapshot.ts'
 import { Store } from '../src/server/store.ts'
 import type { WorkerBackend } from '../src/server/worker-backend.ts'
 import { LinuxWorkerBackend } from '../src/server/worker-backend.ts'
-import type { VerifierBackendKind } from './benchmark-backend.ts'
-import { selectVerifierBackend } from './benchmark-backend.ts'
+import { VERIFY_RPC_SDK_VERSION } from '../src/server/verify-rpc.ts'
+import type { VerifierBackendKind, WorkerImageIdentity } from './benchmark-backend.ts'
+import { resolveWorkerImageRef, selectVerifierBackend } from './benchmark-backend.ts'
 import { resolveOobCallbackPorts } from './benchmark-env.ts'
 import {
   PreflightError,
@@ -98,7 +99,9 @@ import {
   appendLedgerRow,
   computeBenchmarkVersion,
   computeEffectiveConfig,
+  extractObservedEffectiveConfig,
   resolveGitState,
+  type EffectiveConfigSnapshot,
 } from './bench-ledger.ts'
 
 // ---------------------------------------------------------------------------------------------
@@ -2596,6 +2599,12 @@ export interface MultihopCellMeta {
   status?: 'VALID' | 'INVALID'
   benchmarkVersion?: string
   effectiveConfigHash?: string
+  effectiveConfig?: EffectiveConfigSnapshot
+  wordlistOn?: boolean
+  reportable?: boolean
+  workerImageId?: string | null
+  workerSourceHash?: string | null
+  sdkVersion?: string | null
   app: MultihopAppName
   sealed: boolean
   seed: number
@@ -3007,8 +3016,13 @@ export async function runCell(
       }
     })()
     backendKind = selected.kind
+    const workerImage: WorkerImageIdentity | null = selected.workerImage
+    const resolvedWorkerImageRef = resolveWorkerImageRef()
     backend = selected.kind === 'docker'
-      ? new LinuxWorkerBackend({ workspace: { id: storage.workspace.id, directory: storage.directory } })
+      ? new LinuxWorkerBackend({
+          image: workerImage?.imageRef ?? resolvedWorkerImageRef,
+          workspace: { id: storage.workspace.id, directory: storage.directory },
+        })
       : selected.backend
 
     const capability = await detectWorkerSessions(backend)
@@ -3337,18 +3351,23 @@ export async function runCell(
       secrets: cellSecrets,
     })
     const { benchmarkVersion } = computeBenchmarkVersion('multihop-saas')
-    const { effectiveConfigHash } = computeEffectiveConfig({
+    const runEvents = storage.eventsAfter(runId, 0, 500)
+    const observedEffectiveConfig = extractObservedEffectiveConfig(runEvents)
+    const { effectiveConfigHash, effectiveConfig } = computeEffectiveConfig({
+      observed: observedEffectiveConfig,
       deterministicOnly: args.noLlm,
       environment: 'local-lab',
       approvalPolicy: 'auto_review',
-      wordlistOn: false,
       verifierBackend: backendKind,
       mode: args.mode,
+      ...(workerImage?.imageId ? { workerImageId: workerImage.imageId } : {}),
+      ...(workerImage?.sourceHash ? { workerSourceHash: workerImage.sourceHash } : {}),
+      sdkVersion: VERIFY_RPC_SDK_VERSION,
     })
     const costUsd = num(card.totalCostUsd, finalRun.spentUsd)
     const efficiency = computeEfficiencyMetrics({ confirmedChains: chainsConfirmed, costUsd, durationMs })
 
-    const failureEvents = storage.eventsAfter(runId, 0, 500)
+    const failureEvents = runEvents
       .filter(event => event.kind === 'worker.failed' || event.kind === 'worker.canceled')
       .map(event => event.message)
     const assignmentDiagnostics: AssignmentDiagnostics = summarizeAssignments(
@@ -3382,6 +3401,12 @@ export async function runCell(
       status: inert ? 'INVALID' : 'VALID',
       benchmarkVersion,
       effectiveConfigHash,
+      effectiveConfig,
+      wordlistOn: effectiveConfig.wordlistOn,
+      reportable: !inert && !effectiveConfig.wordlistOn,
+      workerImageId: workerImage?.imageId ?? effectiveConfig.workerImageId ?? null,
+      workerSourceHash: workerImage?.sourceHash ?? effectiveConfig.workerSourceHash ?? null,
+      sdkVersion: effectiveConfig.sdkVersion ?? VERIFY_RPC_SDK_VERSION,
       app,
       sealed,
       seed,
@@ -4059,14 +4084,28 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     const floorExtra = readMetaArtifacts(args.floorFrom).filter(c => c.llm === 'deterministic-no-llm')
     const curveExtra = readMetaArtifacts(args.curveFrom)
     const { benchmarkVersion } = computeBenchmarkVersion('multihop-saas')
-    const { effectiveConfigHash, effectiveConfig } = computeEffectiveConfig({
-      deterministicOnly: args.noLlm,
-      environment: 'local-lab',
-      approvalPolicy: 'auto_review',
-      wordlistOn: false,
-      verifierBackend: args.verifier,
-      mode: args.mode,
-    })
+    const firstObservedCfg = currentMeta.find(c => c.effectiveConfig)?.effectiveConfig
+    const computedCfg = firstObservedCfg
+      ? {
+          effectiveConfigHash: currentMeta.find(c => c.effectiveConfigHash)?.effectiveConfigHash ?? computeEffectiveConfig({
+            observed: firstObservedCfg,
+            deterministicOnly: args.noLlm,
+            environment: 'local-lab',
+            approvalPolicy: 'auto_review',
+            verifierBackend: args.verifier,
+            mode: args.mode,
+          }).effectiveConfigHash,
+          effectiveConfig: firstObservedCfg,
+        }
+      : computeEffectiveConfig({
+          deterministicOnly: args.noLlm,
+          environment: 'local-lab',
+          approvalPolicy: 'auto_review',
+          verifierBackend: args.verifier,
+          mode: args.mode,
+          sdkVersion: VERIFY_RPC_SDK_VERSION,
+        })
+    const { effectiveConfigHash, effectiveConfig } = computedCfg
     const gitState = resolveGitState()
     const report = buildMultihopReport(
       currentMeta,
@@ -4088,6 +4127,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
         for (const ch of cellMeta.chains) {
           siteOutcomes[ch.chainId] = ch.twoSideConfirmed ? 'confirmed' : (ch.dropReason ?? 'missed')
         }
+        const cellEffectiveConfig = cellMeta.effectiveConfig ?? effectiveConfig
         appendLedgerRow({
           schemaVersion: LEDGER_SCHEMA_VERSION,
           recordedAt: report.generatedAt,
@@ -4096,7 +4136,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
           dirty: gitState.dirty,
           benchmarkVersion: cellMeta.benchmarkVersion ?? benchmarkVersion,
           effectiveConfigHash: cellMeta.effectiveConfigHash ?? effectiveConfigHash,
-          effectiveConfig,
+          effectiveConfig: cellEffectiveConfig,
+          workerImageId: cellMeta.workerImageId ?? cellEffectiveConfig.workerImageId ?? null,
+          workerSourceHash: cellMeta.workerSourceHash ?? cellEffectiveConfig.workerSourceHash ?? null,
+          sdkVersion: cellMeta.sdkVersion ?? cellEffectiveConfig.sdkVersion ?? VERIFY_RPC_SDK_VERSION,
           app: cellMeta.app,
           split: cellMeta.sealed ? 'sealed' : cellMeta.seedSet,
           mode: cellMeta.mode,
@@ -4104,7 +4147,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
           seed: cellMeta.seed,
           repeat: 1,
           certifying: false,
-          reportable: true,
+          reportable: cellMeta.reportable ?? (!cellMeta.inert && !cellEffectiveConfig.wordlistOn),
           status: cellMeta.status ?? (cellMeta.inert ? 'INVALID' : 'VALID'),
           targets: cellMeta.chainsTotal,
           confirmed: cellMeta.chainsConfirmed,

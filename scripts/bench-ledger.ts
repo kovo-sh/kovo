@@ -23,6 +23,7 @@ import {
   listHeldoutSeedsWithIndices,
   type SeedDomain,
 } from '../benchmarks/realistic-bench/generator/seeds.ts'
+import { conventionalWordlistEnabled } from '../src/server/deterministic-engine.ts'
 
 export const LEDGER_SCHEMA_VERSION = 1 as const
 export const DEFAULT_LEDGER_PATH = 'benchmarks/results/ledger.jsonl'
@@ -142,24 +143,136 @@ export function computeBenchmarkVersion(
   }
 }
 
+export interface ObservedEffectiveConfig {
+  environment?: string
+  environmentMode?: string
+  tier?: number
+  approvalPolicy?: string
+  deterministicOnly?: boolean
+  wordlistOn?: boolean
+  conventionalEndpointsProbed?: number
+  proofReceiptMode?: string
+  siblings?: boolean
+  floorDurationMs?: number | null
+  floorWallMarginMs?: number | null
+  floorRequestCap?: number | null
+  floorPolicy?: string | null
+  modelProfileId?: string | null
+  workerImageId?: string | null
+  workerSourceHash?: string | null
+  sdkVersion?: string | null
+}
+
+export interface EffectiveConfigMismatch {
+  field: string
+  declared: unknown
+  observed: unknown
+}
+
+export class EffectiveConfigMismatchError extends Error {
+  readonly mismatches: EffectiveConfigMismatch[]
+  constructor(mismatches: EffectiveConfigMismatch[]) {
+    const summary = mismatches
+      .map(m => `${m.field} (declared=${JSON.stringify(m.declared)}, observed=${JSON.stringify(m.observed)})`)
+      .join('; ')
+    super(`computeEffectiveConfig: caller-declared config disagrees with observed run.effective_config event: ${summary}`)
+    this.name = 'EffectiveConfigMismatchError'
+    this.mismatches = mismatches
+  }
+}
+
+/** Extract the latest engine-emitted `run.effective_config` payload from a run's event list. */
+export function extractObservedEffectiveConfig(
+  events: readonly { kind?: unknown; detail?: unknown }[],
+): ObservedEffectiveConfig | null {
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const ev = events[i]
+    if (!ev || ev.kind !== 'run.effective_config') continue
+    let detail = ev.detail
+    if (typeof detail === 'string') {
+      try { detail = JSON.parse(detail) } catch { continue }
+    }
+    if (!detail || typeof detail !== 'object' || Array.isArray(detail)) continue
+    const rec = detail as Record<string, unknown>
+    return {
+      ...(typeof rec.environment === 'string' ? { environment: rec.environment } : {}),
+      ...(typeof rec.environmentMode === 'string' ? { environmentMode: rec.environmentMode } : {}),
+      ...(typeof rec.tier === 'number' && Number.isFinite(rec.tier) ? { tier: rec.tier } : {}),
+      ...(typeof rec.approvalPolicy === 'string' ? { approvalPolicy: rec.approvalPolicy } : {}),
+      ...(typeof rec.deterministicOnly === 'boolean' ? { deterministicOnly: rec.deterministicOnly } : {}),
+      ...(typeof rec.wordlistOn === 'boolean' ? { wordlistOn: rec.wordlistOn } : {}),
+      ...(typeof rec.conventionalEndpointsProbed === 'number' && Number.isFinite(rec.conventionalEndpointsProbed)
+        ? { conventionalEndpointsProbed: rec.conventionalEndpointsProbed }
+        : {}),
+      ...(typeof rec.proofReceiptMode === 'string' ? { proofReceiptMode: rec.proofReceiptMode } : {}),
+      ...(typeof rec.siblings === 'boolean' ? { siblings: rec.siblings } : {}),
+      ...(typeof rec.floorDurationMs === 'number' || rec.floorDurationMs === null
+        ? { floorDurationMs: rec.floorDurationMs as number | null }
+        : {}),
+      ...(typeof rec.floorWallMarginMs === 'number' || rec.floorWallMarginMs === null
+        ? { floorWallMarginMs: rec.floorWallMarginMs as number | null }
+        : {}),
+      ...(typeof rec.floorRequestCap === 'number' || rec.floorRequestCap === null
+        ? { floorRequestCap: rec.floorRequestCap as number | null }
+        : {}),
+      ...(typeof rec.floorPolicy === 'string' || rec.floorPolicy === null
+        ? { floorPolicy: rec.floorPolicy as string | null }
+        : {}),
+      ...(typeof rec.modelProfileId === 'string' || rec.modelProfileId === null
+        ? { modelProfileId: rec.modelProfileId as string | null }
+        : {}),
+      ...(typeof rec.workerImageId === 'string' || rec.workerImageId === null
+        ? { workerImageId: rec.workerImageId as string | null }
+        : {}),
+      ...(typeof rec.workerSourceHash === 'string' || rec.workerSourceHash === null
+        ? { workerSourceHash: rec.workerSourceHash as string | null }
+        : {}),
+      ...(typeof rec.sdkVersion === 'string' || rec.sdkVersion === null
+        ? { sdkVersion: rec.sdkVersion as string | null }
+        : {}),
+    }
+  }
+  return null
+}
+
 export interface EffectiveConfigInput {
   env?: NodeJS.ProcessEnv
+  /** Engine-emitted `run.effective_config` payload (preferred source of truth; mismatches throw). */
+  observed?: ObservedEffectiveConfig | null
+  /** Run event stream from which `run.effective_config` is extracted when `observed` is omitted. */
+  observedEvents?: readonly { kind?: unknown; detail?: unknown }[]
   deterministicOnly?: boolean
   environment?: string
+  environmentMode?: string
   approvalPolicy?: string
   wordlistOn?: boolean
   proofReceiptMode?: string
   verifierBackend?: string
   mode?: string
+  workerImageId?: string | null
+  workerSourceHash?: string | null
+  sdkVersion?: string | null
   extra?: Record<string, string | number | boolean | null | undefined>
 }
 
 export interface EffectiveConfigSnapshot {
   deterministicOnly: boolean
   environment: string
+  environmentMode?: string
+  tier?: number
   approvalPolicy: string
   wordlistOn: boolean
+  conventionalEndpointsProbed?: number
   proofReceiptMode: string
+  siblings?: boolean
+  floorDurationMs?: number | null
+  floorWallMarginMs?: number | null
+  floorRequestCap?: number | null
+  floorPolicy?: string | null
+  modelProfileId?: string | null
+  workerImageId?: string | null
+  workerSourceHash?: string | null
+  sdkVersion?: string | null
   verifierBackend: string
   mode: string
   kovoEnv: Record<string, string>
@@ -184,9 +297,42 @@ function stableJson(value: unknown): string {
  * Fingerprint every behavior-changing `KOVO_*` environment variable plus the core execution
  * switches (`deterministicOnly`, `environment`, `approvalPolicy`, `wordlistOn`, `proofReceiptMode`)
  * into a stable SHA-256 `effectiveConfigHash`. Secrets, salts, tokens, and host paths are stripped.
+ *
+ * When an engine-emitted `run.effective_config` event (`observed` or `observedEvents`) is supplied,
+ * every caller-declared switch is cross-checked against what the engine actually ran; ANY mismatch
+ * throws `EffectiveConfigMismatchError` fail-closed.
  */
 export function computeEffectiveConfig(opts: EffectiveConfigInput = {}): EffectiveConfigResult {
   const env = opts.env ?? process.env
+  const observed = opts.observed ?? (opts.observedEvents ? extractObservedEffectiveConfig(opts.observedEvents) : null)
+
+  if (observed) {
+    const mismatches: EffectiveConfigMismatch[] = []
+    const check = (field: string, declared: unknown, actual: unknown): void => {
+      if (declared === undefined || actual === undefined) return
+      const normDeclared = typeof declared === 'string' ? declared.trim().toLowerCase() : declared
+      const normActual = typeof actual === 'string' ? actual.trim().toLowerCase() : actual
+      if (normDeclared !== normActual) {
+        mismatches.push({ field, declared, observed: actual })
+      }
+    }
+    check('deterministicOnly', opts.deterministicOnly, observed.deterministicOnly)
+    check('environment', opts.environment, observed.environment)
+    check('environmentMode', opts.environmentMode, observed.environmentMode)
+    check('approvalPolicy', opts.approvalPolicy, observed.approvalPolicy)
+    check('wordlistOn', opts.wordlistOn, observed.wordlistOn)
+    check('proofReceiptMode', opts.proofReceiptMode, observed.proofReceiptMode)
+    if (opts.workerImageId !== undefined && observed.workerImageId !== undefined && observed.workerImageId !== null && opts.workerImageId !== null) {
+      check('workerImageId', opts.workerImageId, observed.workerImageId)
+    }
+    if (opts.sdkVersion !== undefined && observed.sdkVersion !== undefined && observed.sdkVersion !== null && opts.sdkVersion !== null) {
+      check('sdkVersion', opts.sdkVersion, observed.sdkVersion)
+    }
+    if (mismatches.length > 0) {
+      throw new EffectiveConfigMismatchError(mismatches)
+    }
+  }
+
   const kovoEnv: Record<string, string> = {}
   const keys = Object.keys(env).sort()
   for (const key of keys) {
@@ -198,7 +344,7 @@ export function computeEffectiveConfig(opts: EffectiveConfigInput = {}): Effecti
     kovoEnv[key] = raw.trim()
   }
 
-  const proofReceiptRaw = opts.proofReceiptMode ?? env.KOVO_PROOF_RECEIPT
+  const proofReceiptRaw = observed?.proofReceiptMode ?? opts.proofReceiptMode ?? env.KOVO_PROOF_RECEIPT
   const proofReceiptMode =
     typeof proofReceiptRaw === 'string' && proofReceiptRaw.trim().length > 0
       ? proofReceiptRaw.trim().toLowerCase()
@@ -213,12 +359,31 @@ export function computeEffectiveConfig(opts: EffectiveConfigInput = {}): Effecti
     }
   }
 
+  const resolvedWorkerImageId = opts.workerImageId ?? observed?.workerImageId
+  const resolvedWorkerSourceHash = opts.workerSourceHash ?? observed?.workerSourceHash
+  const resolvedSdkVersion = opts.sdkVersion ?? observed?.sdkVersion
+  const resolvedEnvironmentMode = opts.environmentMode ?? observed?.environmentMode
+
   const effectiveConfig: EffectiveConfigSnapshot = {
-    deterministicOnly: Boolean(opts.deterministicOnly ?? false),
-    environment: (opts.environment ?? 'local-lab').trim(),
-    approvalPolicy: (opts.approvalPolicy ?? 'auto_review').trim(),
-    wordlistOn: Boolean(opts.wordlistOn ?? false),
+    deterministicOnly: Boolean(observed?.deterministicOnly ?? opts.deterministicOnly ?? false),
+    environment: (observed?.environment ?? opts.environment ?? 'local-lab').trim(),
+    ...(resolvedEnvironmentMode !== undefined ? { environmentMode: resolvedEnvironmentMode.trim() } : {}),
+    ...(observed?.tier !== undefined ? { tier: observed.tier } : {}),
+    approvalPolicy: (observed?.approvalPolicy ?? opts.approvalPolicy ?? 'auto_review').trim(),
+    wordlistOn: Boolean(observed?.wordlistOn ?? opts.wordlistOn ?? conventionalWordlistEnabled(env)),
+    ...(observed?.conventionalEndpointsProbed !== undefined
+      ? { conventionalEndpointsProbed: observed.conventionalEndpointsProbed }
+      : {}),
     proofReceiptMode,
+    ...(observed?.siblings !== undefined ? { siblings: observed.siblings } : {}),
+    ...(observed?.floorDurationMs !== undefined ? { floorDurationMs: observed.floorDurationMs } : {}),
+    ...(observed?.floorWallMarginMs !== undefined ? { floorWallMarginMs: observed.floorWallMarginMs } : {}),
+    ...(observed?.floorRequestCap !== undefined ? { floorRequestCap: observed.floorRequestCap } : {}),
+    ...(observed?.floorPolicy !== undefined ? { floorPolicy: observed.floorPolicy } : {}),
+    ...(observed?.modelProfileId !== undefined ? { modelProfileId: observed.modelProfileId } : {}),
+    ...(resolvedWorkerImageId !== undefined ? { workerImageId: resolvedWorkerImageId } : {}),
+    ...(resolvedWorkerSourceHash !== undefined ? { workerSourceHash: resolvedWorkerSourceHash } : {}),
+    ...(resolvedSdkVersion !== undefined ? { sdkVersion: resolvedSdkVersion } : {}),
     verifierBackend: (opts.verifierBackend ?? 'auto').trim(),
     mode: (opts.mode ?? 'grey-box').trim(),
     kovoEnv,
@@ -541,6 +706,10 @@ export interface LedgerRow {
   preservationRatio?: number | null
   floorConfirmed?: number | null
   agenticConfirmed?: number | null
+  /** Optional R2-06 worker image & SDK identity fields. */
+  workerImageId?: string | null
+  workerSourceHash?: string | null
+  sdkVersion?: string | null
   exposedHeldoutSeeds?: number[]
   siteOutcomes?: Record<string, string>
   notes?: string[]

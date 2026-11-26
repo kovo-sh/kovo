@@ -134,6 +134,11 @@ COPY analyzers.ts bridge.ts ./
 RUN chmod 0644 /opt/kovo-worker/analyzers.ts /opt/kovo-worker/bridge.ts /opt/kovo-worker/package.json /opt/kovo-worker/package-lock.json \
   && chmod -R a+rX /opt/kovo-worker /opt/kovo-rules
 
+ARG KOVO_WORKER_SOURCE_HASH=unknown
+ARG KOVO_WORKER_SDK_VERSION=kovo_verify/v8
+LABEL kovo.worker.source_hash="${KOVO_WORKER_SOURCE_HASH}" \
+      kovo.worker.sdk_version="${KOVO_WORKER_SDK_VERSION}"
+
 ENV PATH="/opt/kovo-venv/bin:/opt/kovo-worker/node_modules/.bin:/usr/local/bin:/usr/bin:/bin" \
     HOME="/tmp" \
     XDG_CACHE_HOME="/tmp/.cache" \
