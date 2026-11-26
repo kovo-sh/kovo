@@ -1844,20 +1844,80 @@ function assertValidSourceCredentialsDir(sourceCredentials: string, label: strin
   }
 }
 
+function lstatIfPresent(path: string): ReturnType<typeof lstatSync> | null {
+  try {
+    return lstatSync(path)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return null
+    throw error
+  }
+}
+
+function assertValidCredentialFile(credentialPath: string, profileLabel: string, dirLabel?: string): void {
+  let info
+  try {
+    info = lstatSync(credentialPath)
+  } catch {
+    throw new PreflightError(
+      dirLabel
+        ? `profile '${profileLabel}' has no readable credential file in ${dirLabel}`
+        : `profile '${profileLabel}' has no readable credential file in the source data dir`,
+    )
+  }
+  if (info.isSymbolicLink()) {
+    throw new PreflightError(`profile '${profileLabel}' credential must not be a symbolic link`)
+  }
+  if (!info.isFile()) {
+    throw new PreflightError(
+      dirLabel
+        ? `profile '${profileLabel}' has no readable credential file in ${dirLabel}`
+        : `profile '${profileLabel}' has no readable credential file in the source data dir`,
+    )
+  }
+  if ((info.mode & 0o077) !== 0) {
+    throw new PreflightError(`profile '${profileLabel}' credential must be owner-only (mode 600)`)
+  }
+}
+
 /**
  * Create a per-cell Kovo Hunter Store from a source data dir without copying or symlinking keys:
  * only enabled model_profiles rows + the workspace identity are copied into the isolated SQLite DB;
  * callers reference the real host `credentialsDir` via `KOVO_CREDENTIALS_DIR` (read-only),
  * keeping M-15 anti-symlink hardening intact and giving each cell its own `credentials/` for
  * persona secrets and receipt keys.
+ *
+ * Supports nested isolation (e.g. `benchmark-agentic-matrix.ts` model-gate data dirs): when a
+ * gated/already-isolated source dir has an empty `credentials/` directory and `KOVO_CREDENTIALS_DIR`
+ * (or `input.sourceCredentialsDir`) points at the real host credentials directory, credential files
+ * are validated there without ever copying or symlinking keys.
  */
-export function prepareIsolatedDataDir(input: { sourceDataDir: string; targetDir: string }): IsolatedDataDirResult {
+export function prepareIsolatedDataDir(input: {
+  sourceDataDir: string
+  targetDir: string
+  sourceCredentialsDir?: string
+}): IsolatedDataDirResult {
   const source = resolve(input.sourceDataDir)
   const target = resolve(input.targetDir)
   const sourceDb = join(source, 'kovo.sqlite')
-  const sourceCredentials = join(source, 'credentials')
+  const localCredentials = join(source, 'credentials')
+  const explicitCredentials = input.sourceCredentialsDir?.trim()
+    ? resolve(input.sourceCredentialsDir.trim())
+    : null
+  const envCredentials = process.env.KOVO_CREDENTIALS_DIR?.trim()
+    ? resolve(process.env.KOVO_CREDENTIALS_DIR.trim())
+    : null
+
   if (!existsSync(sourceDb)) throw new PreflightError(`--isolate-data-dir source has no kovo.sqlite: ${source}`)
-  assertValidSourceCredentialsDir(sourceCredentials, '--isolate-data-dir source')
+  if (explicitCredentials) {
+    assertValidSourceCredentialsDir(explicitCredentials, '--isolate-data-dir source')
+  } else if (lstatIfPresent(localCredentials)) {
+    // Always enforce anti-symlink / owner-only checks on source/credentials when it exists.
+    assertValidSourceCredentialsDir(localCredentials, '--isolate-data-dir source')
+  } else if (envCredentials) {
+    assertValidSourceCredentialsDir(envCredentials, '--isolate-data-dir source KOVO_CREDENTIALS_DIR')
+  } else {
+    assertValidSourceCredentialsDir(localCredentials, '--isolate-data-dir source')
+  }
 
   unlockAndRemove(target)
   mkdirSync(target, { recursive: true, mode: 0o700 })
@@ -1876,23 +1936,20 @@ export function prepareIsolatedDataDir(input: { sourceDataDir: string; targetDir
     ).all() as Array<Record<string, string | number>>
     if (!rows.length) throw new PreflightError(`--isolate-data-dir source has no enabled model profile: ${source}`)
 
+    let sourceCredentials = explicitCredentials ?? localCredentials
+    if (!explicitCredentials && envCredentials) {
+      const localDirPresent = Boolean(lstatIfPresent(localCredentials))
+      const anyMissingLocally = !localDirPresent || rows.some(
+        row => lstatIfPresent(join(localCredentials, String(row.credential_id))) === null,
+      )
+      if (anyMissingLocally) {
+        assertValidSourceCredentialsDir(envCredentials, '--isolate-data-dir source KOVO_CREDENTIALS_DIR')
+        sourceCredentials = envCredentials
+      }
+    }
+
     for (const row of rows) {
-      const credentialPath = join(sourceCredentials, String(row.credential_id))
-      let info
-      try {
-        info = lstatSync(credentialPath)
-      } catch {
-        throw new PreflightError(`profile '${String(row.name)}' has no readable credential file in the source data dir`)
-      }
-      if (info.isSymbolicLink()) {
-        throw new PreflightError(`profile '${String(row.name)}' credential must not be a symbolic link`)
-      }
-      if (!info.isFile()) {
-        throw new PreflightError(`profile '${String(row.name)}' has no readable credential file in the source data dir`)
-      }
-      if ((info.mode & 0o077) !== 0) {
-        throw new PreflightError(`profile '${String(row.name)}' credential must be owner-only (mode 600)`)
-      }
+      assertValidCredentialFile(join(sourceCredentials, String(row.credential_id)), String(row.name))
     }
 
     storage = new Store(target)
@@ -2763,9 +2820,18 @@ export function linkSnapshotModelCredentials(input: {
       + 'profile whose key the resumed run must use',
     )
   }
-  const sourceCredentials = join(resolve(input.sourceDataDir), 'credentials')
+  const localSourceCredentials = join(resolve(input.sourceDataDir), 'credentials')
+  const envCredentials = process.env.KOVO_CREDENTIALS_DIR?.trim()
+    ? resolve(process.env.KOVO_CREDENTIALS_DIR.trim())
+    : null
   try {
-    assertValidSourceCredentialsDir(sourceCredentials, '--resume-snapshot source')
+    if (lstatIfPresent(localSourceCredentials)) {
+      assertValidSourceCredentialsDir(localSourceCredentials, '--resume-snapshot source')
+    } else if (envCredentials) {
+      assertValidSourceCredentialsDir(envCredentials, '--resume-snapshot source KOVO_CREDENTIALS_DIR')
+    } else {
+      assertValidSourceCredentialsDir(localSourceCredentials, '--resume-snapshot source')
+    }
     const targetCredentials = join(resolve(input.targetDataDir), 'credentials')
     mkdirSync(targetCredentials, { recursive: true, mode: 0o700 })
     chmodSync(targetCredentials, 0o700)
@@ -2784,6 +2850,23 @@ export function linkSnapshotModelCredentials(input: {
         sourceRows = []
       } finally {
         source.close()
+      }
+    }
+
+    let sourceCredentials = localSourceCredentials
+    if (envCredentials) {
+      const localDirPresent = Boolean(lstatIfPresent(localSourceCredentials))
+      const anyMissingLocally = !localDirPresent || rows.some(row => {
+        const id = row.credential_id ? String(row.credential_id) : ''
+        if (!id) return false
+        if (lstatIfPresent(join(localSourceCredentials, id)) !== null) return false
+        const match = sourceRows.find(candidate =>
+          candidate.credential_id && candidate.name === row.name && candidate.model === row.model)
+        return !(match?.credential_id && lstatIfPresent(join(localSourceCredentials, String(match.credential_id))) !== null)
+      })
+      if (anyMissingLocally) {
+        assertValidSourceCredentialsDir(envCredentials, '--resume-snapshot source KOVO_CREDENTIALS_DIR')
+        sourceCredentials = envCredentials
       }
     }
 

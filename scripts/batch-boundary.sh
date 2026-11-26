@@ -76,6 +76,89 @@ if ! [[ "$HELDOUT_COUNT" =~ ^[1-9][0-9]*$ ]]; then
   exit 2
 fi
 
+# Validate --apps, --modes, --verifier, --no-llm-verifier, and seed lists BEFORE any
+# dirty-tree / seed-draw work so invalid invocations fail fast with zero side effects.
+validate_csv_enum() {
+  local flag="$1"
+  local raw="$2"
+  shift 2
+  local -a allowed=("$@")
+  if [[ -z "$raw" ]]; then
+    echo "error: ${flag} must not be empty" >&2
+    exit 2
+  fi
+  local IFS=','
+  local -a items=()
+  read -r -a items <<< "$raw"
+  local seen=0
+  local item trimmed ok val
+  for item in "${items[@]}"; do
+    trimmed="${item#"${item%%[![:space:]]*}"}"
+    trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+    if [[ -z "$trimmed" ]]; then
+      continue
+    fi
+    seen=1
+    ok=0
+    for val in "${allowed[@]}"; do
+      if [[ "$trimmed" == "$val" ]]; then
+        ok=1
+        break
+      fi
+    done
+    if (( ok == 0 )); then
+      echo "error: unknown ${flag} value '${trimmed}' (allowed: ${allowed[*]})" >&2
+      exit 2
+    fi
+  done
+  if (( seen == 0 )); then
+    echo "error: ${flag} must specify at least one value" >&2
+    exit 2
+  fi
+}
+
+validate_seed_list() {
+  local flag="$1"
+  local raw="$2"
+  local IFS=','
+  local -a items=()
+  read -r -a items <<< "$raw"
+  local seen=0
+  local item trimmed
+  for item in "${items[@]}"; do
+    trimmed="${item#"${item%%[![:space:]]*}"}"
+    trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+    if [[ -z "$trimmed" ]]; then
+      continue
+    fi
+    seen=1
+    if ! [[ "$trimmed" =~ ^[1-9][0-9]*$ ]]; then
+      echo "error: ${flag} seed '${trimmed}' must be a positive integer" >&2
+      exit 2
+    fi
+  done
+  if (( seen == 0 )); then
+    echo "error: ${flag} must specify at least one seed" >&2
+    exit 2
+  fi
+}
+
+if [[ "$APPS" != "all" ]]; then
+  validate_csv_enum "--apps" "$APPS" acme-saas shopflow opsportal
+fi
+validate_csv_enum "--modes" "$MODES" black-box grey-box white-box
+validate_csv_enum "--verifier" "$VERIFIER" auto docker local-jq
+validate_csv_enum "--no-llm-verifier" "$NO_LLM_VERIFIER" auto docker local-jq
+validate_seed_list "--dev-seeds" "$DEV_SEEDS"
+if [[ -n "$HELDOUT_SEEDS" ]]; then
+  validate_seed_list "--heldout-seeds" "$HELDOUT_SEEDS"
+fi
+
+if (( SKIP_AGENTIC == 0 && DRY_RUN == 0 )) && [[ -z "$DATA_DIR" ]]; then
+  echo "FAIL: agentic legs require --data-dir or KOVO_DATA_DIR (or pass --skip-agentic for non-certifying floor-only runs)." >&2
+  exit 2
+fi
+
 if [[ -z "$RUNS_DIR" ]]; then
   RUNS_DIR="${OUT_DIR}/ledger-runs"
 fi
@@ -105,29 +188,38 @@ fi
 
 # ---------------------------------------------------------------------------
 # 2. Fresh salted held-out seed draw (salt is never printed or logged)
+#    Draw with recordExposure: false so EXPOSED_SEEDS.json is NOT written before
+#    the certifying benchmark legs run (keeping `git status --porcelain` clean
+#    so every certifying leg observes `dirty: false`). Exposure is recorded only
+#    after held-out legs actually run.
 # ---------------------------------------------------------------------------
+HELDOUT_DRAWN=0
+HELDOUT_START_INDEX=""
+HELDOUT_END_INDEX=""
+HELDOUT_STARTED=0
+HELDOUT_EXPOSURE_RECORDED=0
+
 if (( SKIP_HELDOUT == 0 )) && [[ -z "$HELDOUT_SEEDS" ]]; then
   if [[ -z "${KOVO_RB_HELDOUT_SALT:-}" ]] && [[ -f "${HOME}/.config/guardian-bench/heldout.salt" ]]; then
     KOVO_RB_HELDOUT_SALT="$(tr -d '\r\n' < "${HOME}/.config/guardian-bench/heldout.salt")"
     export KOVO_RB_HELDOUT_SALT
   fi
   if [[ -n "${KOVO_RB_HELDOUT_SALT:-}" ]]; then
-    HELDOUT_SEEDS="$(node --input-type=module - "$HELDOUT_COUNT" "$DRY_RUN" "$GIT_SHA" <<'EOF'
-import { drawUnburnedHeldoutSeeds } from './scripts/bench-ledger.ts'
+    DRAW_META="$(node --input-type=module - "$HELDOUT_COUNT" <<'EOF'
+import { drawUnburnedHeldoutSeedsWithMeta } from './scripts/bench-ledger.ts'
 
-const [countRaw, dryRunRaw, gitSha] = process.argv.slice(2)
+const [countRaw] = process.argv.slice(2)
 const count = Number(countRaw)
-const dryRun = dryRunRaw === '1'
 const salt = process.env.KOVO_RB_HELDOUT_SALT ?? ''
-const seeds = drawUnburnedHeldoutSeeds(count, salt, undefined, undefined, {
+const drawn = drawUnburnedHeldoutSeedsWithMeta(count, salt, undefined, process.cwd(), {
   domain: 'certify',
-  recordExposure: !dryRun,
-  certificateId: `batch-boundary-${new Date().toISOString()}`,
-  gitSha,
+  recordExposure: false,
 })
-process.stdout.write(seeds.join(','))
+process.stdout.write(`${drawn.seeds.join(',')}\t${drawn.startIndex}\t${drawn.endIndex}`)
 EOF
 )"
+    IFS=$'\t' read -r HELDOUT_SEEDS HELDOUT_START_INDEX HELDOUT_END_INDEX <<< "$DRAW_META"
+    HELDOUT_DRAWN=1
   elif (( DRY_RUN == 1 )); then
     HELDOUT_SEEDS="<draw:${HELDOUT_COUNT}-fresh-salted-seeds>"
   else
@@ -136,10 +228,35 @@ EOF
   fi
 fi
 
-if (( SKIP_AGENTIC == 0 && DRY_RUN == 0 )) && [[ -z "$DATA_DIR" ]]; then
-  echo "FAIL: agentic legs require --data-dir or KOVO_DATA_DIR (or pass --skip-agentic for non-certifying floor-only runs)." >&2
-  exit 2
-fi
+record_heldout_exposure() {
+  if (( DRY_RUN == 1 || HELDOUT_DRAWN == 0 || HELDOUT_STARTED == 0 || HELDOUT_EXPOSURE_RECORDED == 1 )); then
+    return 0
+  fi
+  HELDOUT_EXPOSURE_RECORDED=1
+  node --input-type=module - "$HELDOUT_SEEDS" "$HELDOUT_START_INDEX" "$HELDOUT_END_INDEX" "$GIT_SHA" "$STAMP" <<'EOF'
+import { recordExposedHeldoutSeeds } from './scripts/bench-ledger.ts'
+
+const [seedsRaw, startRaw, endRaw, gitSha, stamp] = process.argv.slice(2)
+const seeds = seedsRaw
+  .split(',')
+  .map(s => Number(s.trim()))
+  .filter(n => Number.isInteger(n) && n > 0)
+const startIndex = Number(startRaw)
+const endIndex = Number(endRaw)
+recordExposedHeldoutSeeds(
+  {
+    certificateId: `batch-boundary-${stamp}`,
+    domain: 'certify',
+    startIndex,
+    endIndex,
+    seeds,
+    gitSha,
+  },
+  undefined,
+  process.cwd(),
+)
+EOF
+}
 
 DEV_RUNS_DIR="${RUNS_DIR}/dev"
 HELDOUT_RUNS_DIR="${RUNS_DIR}/heldout"
@@ -210,6 +327,7 @@ if (( DRY_RUN == 1 )); then
 fi
 
 mkdir -p "$OUT_DIR" "$DEV_RUNS_DIR" "$HELDOUT_RUNS_DIR"
+trap record_heldout_exposure EXIT
 
 # ---------------------------------------------------------------------------
 # 3. Execute benchmark legs into isolated per-batch KOVO_LEDGER_ROOT
@@ -237,6 +355,7 @@ if (( SKIP_AGENTIC == 0 )); then
 fi
 
 if (( SKIP_HELDOUT == 0 )); then
+  HELDOUT_STARTED=1
   step "held-out --no-llm (seeds=${HELDOUT_SEEDS})"
   KOVO_ALLOW_LOCAL_LAB=1 KOVO_LEDGER_ROOT="$HELDOUT_RUNS_DIR" \
     node scripts/benchmark-agentic-matrix.ts \
@@ -259,6 +378,11 @@ if (( SKIP_HELDOUT == 0 )); then
       --data-dir "$DATA_DIR" \
       --out-dir "${OUT_DIR}/heldout-agentic"
   fi
+
+  if (( HELDOUT_DRAWN == 1 )); then
+    step "recordExposedHeldoutSeeds (seeds=${HELDOUT_SEEDS})"
+    record_heldout_exposure
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -274,6 +398,7 @@ const skipHeldout = skipHeldoutRaw === '1'
 
 const devPromo = promoteLedgerRows(devDir, {
   targetLedgerPath,
+  repoRoot: process.cwd(),
   requireValid: true,
   requireCertifying: false,
 })
@@ -284,6 +409,7 @@ console.log(
 if (!skipHeldout) {
   const heldPromo = promoteLedgerRows(heldoutDir, {
     targetLedgerPath,
+    repoRoot: process.cwd(),
     requireValid: true,
     requireCertifying: certifying,
   })
