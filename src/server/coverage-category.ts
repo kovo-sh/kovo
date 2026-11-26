@@ -8,6 +8,7 @@
  * inside existing `coverage_entries` text columns (no schema migration needed).
  */
 import { owaspCategories, type CoverageClosureStatus, type OwaspCategory } from '../domain.ts'
+import { CANONICAL_CLASS_TO_OWASP } from '../vuln-taxonomy.ts'
 
 export interface CoverageEvidenceMetadata {
   route: string | null
@@ -82,22 +83,8 @@ const CLASS_TO_OWASP: Readonly<Record<string, OwaspCategory>> = {
   'hmac-bypass': 'auth-identity',
   'signature-bypass': 'auth-identity',
 
-  // Injection & Input Validation
+  // Injection & Input Validation (canonical xxe/sqli/nosqli/cmdi/ssti/cache entries derived from src/vuln-taxonomy.ts)
   'injection-input': 'injection-input',
-  sqli: 'injection-input',
-  'sql-injection': 'injection-input',
-  nosqli: 'injection-input',
-  'nosql-injection': 'injection-input',
-  cmdi: 'injection-input',
-  'command-injection': 'injection-input',
-  'os-command-injection': 'injection-input',
-  'code-injection': 'injection-input',
-  rce: 'injection-input',
-  ssti: 'injection-input',
-  'template-injection': 'injection-input',
-  xxe: 'injection-input',
-  'blind-xxe': 'injection-input',
-  'xml-external-entity': 'injection-input',
   ldapi: 'injection-input',
   'ldap-injection': 'injection-input',
   'xpath-injection': 'injection-input',
@@ -107,35 +94,18 @@ const CLASS_TO_OWASP: Readonly<Record<string, OwaspCategory>> = {
   deserialization: 'injection-input',
   'insecure-deserialization': 'injection-input',
   'prototype-pollution': 'injection-input',
-  injection: 'injection-input',
-  'eval-injection': 'injection-input',
   'expression-language': 'injection-input',
   'el-injection': 'injection-input',
   ognl: 'injection-input',
   'log-injection': 'injection-input',
-  'http-request-smuggling': 'injection-input',
-  'request-smuggling': 'injection-input',
-  smuggling: 'injection-input',
   cache: 'injection-input',
-  'cache-poisoning': 'injection-input',
   'cwe-89': 'injection-input',
 
-  // CORS & Client-Side
+  // CORS & Client-Side (canonical xss/csrf/postmessage entries derived from src/vuln-taxonomy.ts)
   'cors-client-side': 'cors-client-side',
-  xss: 'cors-client-side',
-  'xss-reflected': 'cors-client-side',
-  'reflected-xss': 'cors-client-side',
-  'xss-stored': 'cors-client-side',
-  'stored-xss': 'cors-client-side',
-  'dom-xss': 'cors-client-side',
-  'cross-site-scripting': 'cors-client-side',
-  csrf: 'cors-client-side',
-  xsrf: 'cors-client-side',
-  'cross-site-request-forgery': 'cors-client-side',
   cors: 'cors-client-side',
   'cors-misconfiguration': 'cors-client-side',
   clickjacking: 'cors-client-side',
-  postmessage: 'cors-client-side',
   'dom-clobbering': 'cors-client-side',
   csti: 'cors-client-side',
   'client-side': 'cors-client-side',
@@ -288,6 +258,8 @@ export function categoryToOwaspCoverageCategory(category: string | null | undefi
   const normalized = trimmed.replace(/[\s_/]+/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '')
   if (!normalized) return null
   if (OWASP_SET.has(normalized)) return normalized as OwaspCategory
+  const canonical = CANONICAL_CLASS_TO_OWASP[normalized]
+  if (canonical) return canonical
   const exact = CLASS_TO_OWASP[normalized]
   if (exact) return exact
   for (const [pattern, mapped] of PREFIX_FALLBACKS) {

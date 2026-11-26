@@ -118,10 +118,26 @@ export async function selectVerifierBackend(
     if (!workerImage) {
       throw new Error(`Docker worker backend requested but Docker or the ${imageRef} image is unavailable.`)
     }
-    return { kind: 'docker', backend: new LinuxWorkerBackend({ image: imageRef }), workerImage }
+    return {
+      kind: 'docker',
+      backend: new LinuxWorkerBackend({
+        image: imageRef,
+        imageId: workerImage.imageId,
+        sourceHash: workerImage.sourceHash,
+      }),
+      workerImage,
+    }
   }
   if (workerImage) {
-    return { kind: 'docker', backend: new LinuxWorkerBackend({ image: imageRef }), workerImage }
+    return {
+      kind: 'docker',
+      backend: new LinuxWorkerBackend({
+        image: imageRef,
+        imageId: workerImage.imageId,
+        sourceHash: workerImage.sourceHash,
+      }),
+      workerImage,
+    }
   }
   const probe = await execFileText('jq', ['--version'], 5_000)
   if (probe.code !== 0) throw new Error('No usable verifier backend: Docker worker unavailable and jq not found on PATH.')

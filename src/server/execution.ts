@@ -46,7 +46,8 @@ import {
 import { CanaryBroker, scanSecondOrderMarkers, type SecondOrderStore } from './canary-broker.ts'
 import { hasCuratedAdvisory, queryCves } from './cve-broker.ts'
 import { DerivedCapabilityVault, resetRunCustodyBudgets } from './derived-custody.ts'
-import { runAllRunDisposers } from './run-disposers.ts'
+import { runAllRunDisposers, settleOrReport, settleOrReportAsync } from './run-disposers.ts'
+import { AssignmentClaimRegistry, claimAssignment, purgeActiveJobsForRun, reapOrphanedRunningAssignments, type ClaimHandle } from './assignment-claim.ts'
 import { normalizeEndpointTemplate } from './dedupe.ts'
 import {
   conventionalWordlistEnabled,
@@ -185,14 +186,13 @@ import {
   planTier3ApprovalTargets,
   registerStateChangeGrant,
 } from './tier3-approval.ts'
-import { LinuxWorkerBackend, type WorkerBackend } from './worker-backend.ts'
+import { LinuxWorkerBackend, type WorkerBackend, type WorkerSession } from './worker-backend.ts'
 export { DEFAULT_OOB_DRAIN_MS, OOB_DRAIN_POLL_MS, resolveOobDrainMs } from './oob-drain.ts'
 export { selectRankedProbeTargets, type Phase0GraphwireExtras, type Phase0ProbePlanSummary } from './probe-plan.ts'
 export { extractResourceRefsFromExchange as extractPersonaResourcesFromExchange } from './store.ts'
 import {
   diminishingReturnsDryThreshold,
   plannerDebounceMs,
-  intentLeaseMs,
   resolvePhaseRequestBudgets,
   resolveFloorLaneMode,
   chainHypothesisDispatchSteps,
@@ -457,6 +457,7 @@ export class Execution {
   private readonly stagingCreatedEntities = this.runState.mapView('stagingCreatedEntities')
   private readonly stagingGrants = this.runState.mapView('stagingGrant')
   private readonly boardHandleByAssignment = new Map<string, string>()
+  private readonly claimRegistry = new AssignmentClaimRegistry()
   private readonly board: ExecBoardManager
   private readonly floorLane: ExecFloorLane
   private readonly verifier: ExecVerifier
@@ -470,6 +471,9 @@ export class Execution {
   private wakeScheduled = false
   /** Set by stop(); prevents queued microtasks/timers from touching a closed store. */
   private stopped = false
+
+  /** Read-only view of whether `stop()` has been invoked on this Execution instance. */
+  get isStopped(): boolean { return this.stopped }
 
   constructor(storage: Store, options: ExecutionOptions = {}) {
     this.storage = storage
@@ -792,6 +796,7 @@ export class Execution {
   }
 
   private cleanupRunState(runId: string, actor?: RunActor): void {
+    purgeActiveJobsForRun(this.active, runId, this.claimRegistry)
     this.reconPlanner.clearRunState(runId)
     this.runState.disposeRun(runId, {
       onDetLeadConsumedIds: ids => { for (const factId of ids) this.detLeadConsumed.delete(factId) },
@@ -899,7 +904,7 @@ export class Execution {
       await this.labRunner.stopLabTarget(runId).catch(() => undefined)
     })
     actor.registerResource('warm-pool:evict', async () => {
-      try { await this.backend.evictRunWarmPool?.(runId) } catch { /* best-effort warm pool eviction */ }
+      await settleOrReportAsync(runId, 'warm_pool.evict', async () => { await this.backend.evictRunWarmPool?.(runId) }, (id, k, m, d) => this.safeEvent(id, k, m, d))
     })
     actor.registerResource('oob:canary-unsubscribe', () => {
       try { this.canaryBroker.unsubscribeRun(runId) } catch { /* ignore */ }
@@ -978,7 +983,7 @@ export class Execution {
         report = await this.runtime.disposeRunContext(runId, options.timeoutMs)
       }
       if (!actor) {
-        try { await this.backend.evictRunWarmPool?.(runId) } catch { /* best-effort warm pool eviction */ }
+        await settleOrReportAsync(runId, 'warm_pool.evict', async () => { await this.backend.evictRunWarmPool?.(runId) }, (id, k, m, d) => this.safeEvent(id, k, m, d))
       }
       this.evictCapabilityVault(runId)
       this.cleanupRunState(runId)
@@ -1756,7 +1761,7 @@ export class Execution {
     for (const [id, job] of [...this.active.entries()]) {
       if (this.authorize(job)) continue
       job.controller.abort()
-      try {
+      settleOrReport(job.assignment.runId, 'worker.cancel_unauthorized', () => {
         const current = this.storage.worker(id)
         if ((current.status === 'running' || current.status === 'waiting_approval') && current.lease === job.assignment.lease) {
           this.storage.transaction(() => {
@@ -1764,7 +1769,8 @@ export class Execution {
             this.storage.event(current.runId, 'worker.canceled', 'Assignment canceled after scope or status change.', { assignmentId: id })
           })
         }
-      } catch { /* ignore */ }
+      }, (rid, k, m, d) => this.safeEvent(rid, k, m, d), { assignmentId: id })
+      this.claimRegistry.unregister(id, job.assignment.lease ?? undefined)
       this.active.delete(id)
     }
 
@@ -1886,14 +1892,12 @@ export class Execution {
     for (const run of this.storage.runnable()) {
       const tenantId = this.runTenantId(run)
       if (this.runtime.killSwitch.isActive(tenantId)) {
-        try {
+        settleOrReport(run.id, 'run.kill_switch_pause', () => {
           if (run.status === 'running') {
             this.storage.updateRun(run.id, { status: 'paused' })
-            this.safeEvent(run.id, 'run.kill_switch_paused', 'Run paused because emergency kill switch is active.', {
-              tenantId,
-            })
+            this.safeEvent(run.id, 'run.kill_switch_paused', 'Run paused because emergency kill switch is active.', { tenantId })
           }
-        } catch { /* run may be gone */ }
+        }, (rid, k, m, d) => this.safeEvent(rid, k, m, d), { tenantId })
         this.scheduleRunDisposal(run.id, 'canceled', 'kill switch tripped')
         continue
       }
@@ -1926,6 +1930,7 @@ export class Execution {
       if (this.storage.checkBudgetExceeded(run.id)) continue
       this.ensureVariantSweepsForConfirmedFindings(run)
       this.routeOperatorBoardMessages(run)
+      this.reapOrphanedAssignments(run)
 
       if (profiles.length) {
         this.reconPlanner.startCoordinator(run, profiles)
@@ -2004,12 +2009,8 @@ export class Execution {
         ? 'staging_isolated'
         : 'phase_a_12pct_cap_75s'
     const modelProfileId = this.deterministicOnly ? null : (profiles[0]?.id ?? null)
-    const backendImage = (this.backend as { image?: unknown } | undefined)?.image
-    const workerImageId = this.backend instanceof LinuxWorkerBackend
-      ? (typeof backendImage === 'string' && backendImage.trim()
-          ? backendImage.trim()
-          : (process.env.KOVO_WORKER_IMAGE?.trim() || 'kovo-worker:v4'))
-      : null
+    const workerImageId = this.backend?.workerImageId ?? null
+    const workerSourceHash = this.backend?.workerSourceHash ?? null
     this.safeEvent(
       run.id,
       'run.effective_config',
@@ -2031,6 +2032,7 @@ export class Execution {
         floorPolicy,
         modelProfileId,
         workerImageId,
+        workerSourceHash,
         sdkVersion: VERIFY_RPC_SDK_VERSION,
       },
     )
@@ -2223,46 +2225,41 @@ export class Execution {
     const auditMaxTurns = resolveSourceAuditMaxTurns(run.workerMaxTurns, effectiveMaxDurationMs)
     const auditPhase = run.phase === 'investigation' ? 'investigation' : 'threat_model'
     const auditWorker = this.storage.makeWorker(
-      run,
-      auditPhase,
-      approvedAssets[0],
+      run, auditPhase, approvedAssets[0],
       `Source-First Code Audit · ${mountedRepos.slice(0, 2).join(', ')}`,
       `Inspect read-only mounted source repositories (${mountedRepos.join(', ')}) under /repos before live HTTP probing to build a Route/Server Action/Webhook Authz Matrix and record code_audit_suspect facts.`,
       { maxTurns: auditMaxTurns, sourceOrigins: [...approvedOrigins] },
     )
-    const claimed = this.storage.updateWorker(auditWorker.id, {
-      status: 'running',
-      lease: randomUUID(),
-      leaseExpiresAt: Date.now() + 10 * 60_000,
+    const reportErr = (id: string, k: string, m: string, d?: Record<string, unknown>) => this.safeEvent(id, k, m, d)
+    const claim = claimAssignment(this.storage, {
+      runId: run.id, assignmentId: auditWorker.id, leaseKind: 'code_audit', registry: this.claimRegistry,
+      reportError: reportErr, releaseStatus: 'failed', releaseOutcome: 'Source-First Code Audit exited without settlement.',
     })!
+    const claimed = claim.assignment
     const controller = new AbortController()
     const onParentAbort = () => controller.abort(signal.reason)
-    signal.addEventListener('abort', onParentAbort, { once: true })
-    if (signal.aborted) controller.abort(signal.reason)
-
     const job: Active = { assignment: claimed, origins: new Set(approvedOrigins), controller }
-    this.active.set(claimed.id, job)
-    this.storage.event(run.id, 'code_audit.started', `Source-First Code Audit started across ${mountedRepos.length} mounted ${mountedRepos.length === 1 ? 'repo' : 'repos'} (wall cap ${Math.round(auditWallMs / 1000)}s, max ${auditMaxTurns} turns).`, {
-      assignmentId: claimed.id, mountedRepos, auditWallMs,
-      auditSettlementMs: sessionSettlementMs,
-      codeAuditSettlementMs: auditSettlementMs,
-      semanticTimeoutMs, auditMaxTurns,
-    })
-
-    // Overlap Phase A: start deterministic floor concurrently with `--network none` code_audit
-    // (0 target HTTP requests, preserving split `floor_settled` accounting). Phase B still waits.
-    if (!controller.signal.aborted) {
-      try { this.ensureRunTrace(run, profiles) } catch { /* tracing is best-effort */ }
-      this.startDeterministicLane(run, profiles, { allowThreatModelPhase: true })
-    }
-
-    const { grant, secrets, currentSecrets } = this.buildGrant(job, run, approvedOrigins)
-    const session = await this.backend.openSession(claimed.id, controller.signal, { reposDir, runId: run.id })
-    const startedAt = Date.now()
+    let session: WorkerSession | null = null
     let codeAuditSettlementPrompted = false
     let semanticSuspects: SemanticAuditSuspect[] = []
 
     try {
+      signal.addEventListener('abort', onParentAbort, { once: true })
+      if (signal.aborted) controller.abort(signal.reason)
+      this.active.set(claimed.id, job)
+      this.storage.event(run.id, 'code_audit.started', `Source-First Code Audit started across ${mountedRepos.length} mounted ${mountedRepos.length === 1 ? 'repo' : 'repos'} (wall cap ${Math.round(auditWallMs / 1000)}s, max ${auditMaxTurns} turns).`, {
+        assignmentId: claimed.id, mountedRepos, auditWallMs, auditSettlementMs: sessionSettlementMs,
+        codeAuditSettlementMs: auditSettlementMs, semanticTimeoutMs, auditMaxTurns,
+      })
+      // Overlap Phase A: start deterministic floor concurrently with `--network none` code_audit
+      // (0 target HTTP requests, preserving split `floor_settled` accounting). Phase B still waits.
+      if (!controller.signal.aborted) {
+        try { this.ensureRunTrace(run, profiles) } catch { /* tracing is best-effort */ }
+        this.startDeterministicLane(run, profiles, { allowThreatModelPhase: true })
+      }
+      const { grant, secrets, currentSecrets } = this.buildGrant(job, run, approvedOrigins)
+      session = await this.backend.openSession(claimed.id, controller.signal, { reposDir, runId: run.id })
+      const startedAt = Date.now()
       const stagedSpecs = await this.stageProjectSpecs(run.projectId, session, controller.signal)
       const staticSnapshot = await buildStaticWorkspaceSnapshotInWorker(reposDir, {
         mountedRepos,
@@ -2442,10 +2439,15 @@ export class Execution {
         assignmentId: claimed.id, suspectsCount: suspects.length, stepsCreated: stepsCreated.length,
       })
       return { suspects, stepsCreated }
+    } catch (error) {
+      const msg = redact(error instanceof Error ? error.message : String(error)).slice(0, 400)
+      claim.settle({ status: 'failed', outcome: msg, eventKind: 'code_audit.failed', eventMessage: `Source-First Code Audit failed: ${msg}`, eventDetail: { error: msg } })
+      throw error
     } finally {
       signal.removeEventListener('abort', onParentAbort)
       this.active.delete(claimed.id)
-      await session.close().catch(() => undefined)
+      claim.release()
+      if (session) await session.close().catch(() => undefined)
     }
   }
 
@@ -3060,7 +3062,7 @@ export class Execution {
   }
 
   private driveInvestigation(run: Run, profiles: readonly ResolvedModelProfile[]) {
-    try { this.reconcileSettledApprovalWorkers(run) } catch { /* reconciliation is best-effort */ }
+    settleOrReport(run.id, 'approval.reconcile', () => this.reconcileSettledApprovalWorkers(run), (id, k, m, d) => this.safeEvent(id, k, m, d))
 
     if (!profiles.length) {
       // Explicit --no-llm mode runs the deterministic engine. Without that flag the legacy M1
@@ -3085,10 +3087,10 @@ export class Execution {
     // Queue drain: a paused/queued assignment whose step is still `running` (pause mid-flight,
     // restart, reclaimed slot) never re-enters dispatch by itself. Requeue it so a slot that
     // freed is used instead of the step starving behind a dead assignment.
-    try {
+    settleOrReport(run.id, 'scheduler.queue_drain', () => {
       const recovered = requeueInterruptedAssignments(this.storage, run)
       if (recovered > 0) this.storage.event(run.id, 'scheduler.queue_drain', `Requeued ${recovered} interrupted assignment(s).`, { recovered })
-    } catch { /* drain is best-effort */ }
+    }, (id, k, m, d) => this.safeEvent(id, k, m, d))
 
     this.storage.refreshReadyChainSteps(run.id, run.goalRevision)
 
@@ -3651,33 +3653,31 @@ export class Execution {
       },
     )
 
-    const assignment = this.storage.transaction(() => {
+    const claim = this.storage.transaction(() => {
       const worker = this.storage.makeWorker(run, 'investigation', primaryAsset, step.title, step.hypothesis, {
         stepId: step.id,
         maxTurns: budget.maxTurns,
         parentFactIds: step.dependsOnFactIds,
         sourceOrigins: targetOrigins,
       })
-      const claimed = this.storage.updateWorker(worker.id, {
-        status: 'running',
+      return claimAssignment(this.storage, {
+        runId: run.id,
+        assignmentId: worker.id,
+        leaseKind: 'investigation',
         ...(warmSessionId ? { sessionId: warmSessionId } : {}),
-        lease: randomUUID(),
-        leaseExpiresAt: Date.now() + intentLeaseMs,
+        registry: this.claimRegistry,
+        reportError: (id, k, m, d) => this.safeEvent(id, k, m, d),
+        releaseStatus: 'failed', releaseOutcome: 'Investigation assignment exited without settlement.',
+        afterClaimInTx: claimed => {
+          this.storage.updateChainStep(step.id, { status: 'running', assignedWorkerId: claimed.id, specialistProfile: resolvedSpecialistId })
+          this.storage.addGraphEdge(run.id, { fromKind: 'step', fromId: step.id, toKind: 'assignment', toId: claimed.id, edgeKind: 'spawns' })
+          this.storage.event(run.id, 'worker.started', `${step.title} started.`, {
+            assignmentId: claimed.id, stepId: step.id, specialistProfile: resolvedSpecialistId, assignmentBudget: budget,
+          })
+        },
       })!
-      this.storage.updateChainStep(step.id, {
-        status: 'running',
-        assignedWorkerId: claimed.id,
-        specialistProfile: resolvedSpecialistId,
-      })
-      this.storage.addGraphEdge(run.id, {
-        fromKind: 'step', fromId: step.id, toKind: 'assignment', toId: claimed.id, edgeKind: 'spawns',
-      })
-      this.storage.event(run.id, 'worker.started', `${step.title} started.`, {
-        assignmentId: claimed.id, stepId: step.id, specialistProfile: resolvedSpecialistId,
-        assignmentBudget: budget,
-      })
-      return claimed
     }, { behavior: 'immediate' })
+    const assignment = claim.assignment
     const effectiveStep: ChainStep = { ...step, specialistProfile: resolvedSpecialistId }
 
     const baselineFacts = this.storage.listFacts(run.id, { includeTainted: false, limit: 500 }).length
@@ -3722,6 +3722,7 @@ export class Execution {
         this.workerRunner.handleInvestigationWorkerError(run, job, effectiveStep, resolvedSpecialistId, budget, error)
       } finally {
         this.active.delete(assignment.id)
+        claim.release()
         try { this.board.finishBoardMember(this.storage.run(run.id), assignment.id) } catch { /* run may be gone */ }
         // Avoid premature mid-wave planner triggers when Wave 2+ still buffers >= maxConc ready steps
         // and this assignment produced no new fact or finding.
@@ -3751,6 +3752,7 @@ export class Execution {
     }, { controller: job.controller })
     if (!spawned.started) {
       this.active.delete(assignment.id)
+      this.claimRegistry.unregister(assignment.id, assignment.lease ?? undefined)
       this.boardHandleByAssignment.delete(assignment.id)
       rollbackRejectedInvestigationSpawn(this.storage, run.id, step.id, assignment)
       const draining = this.disposingRuns.get(run.id)
@@ -3944,8 +3946,23 @@ export class Execution {
     this.scheduleWake()
   }
 
+  private reapOrphanedAssignments(run: Run): number {
+    const activeLeases = new Set<string>(this.claimRegistry.activeLeases())
+    for (const j of this.active.values()) if (j.assignment.lease) activeLeases.add(j.assignment.lease)
+    const hasActiveDet = this.agenticLaneJobs.has(run.id) || [...this.deterministicInFlight].some(k => k.startsWith(`${run.id}:`))
+    return reapOrphanedRunningAssignments(this.storage, run, {
+      activeAssignmentIds: new Set(this.active.keys()),
+      activeLeases, claimRegistry: this.claimRegistry, hasActiveDeterministicPass: hasActiveDet,
+      reportError: (id, k, m, d) => this.safeEvent(id, k, m, d),
+      onVerificationOrRetestExpired: (w, reason) => {
+        recordVerificationOrRetestFailure(this.storage, run, w, w.phase === 'retest' ? 'retest' : 'worker',
+          w.phase === 'retest' ? 'Retest lease expired' : 'Verification lease expired', reason)
+      },
+    }).reapedIds.length
+  }
+
   private driveVerification(run: Run) {
-    try { this.reconcileSettledApprovalWorkers(run) } catch { /* reconciliation is best-effort */ }
+    settleOrReport(run.id, 'approval.reconcile', () => this.reconcileSettledApprovalWorkers(run), (id, k, m, d) => this.safeEvent(id, k, m, d))
     const approvedOrigins = this.approvedOriginsSet(run)
     const workers = this.storage.workerList(run.id)
     const maxConc = Math.max(1, Math.min(maxWorkerConcurrency, run.workerConcurrency || defaultWorkerConcurrency))
@@ -3995,16 +4012,8 @@ export class Execution {
       w.phase === 'verification' && w.goalRevision === run.goalRevision &&
       w.sourceOrigins.every(o => approvedOrigins.has(o)))
 
-    // H-27 lease watchdog: reclaim verification workers whose lease expired with no live active job.
-    const now = Date.now()
-    let reclaimedExpired = false
-    for (const w of updatedWorkers) {
-      if (w.status === 'running' && !this.active.has(w.id) && w.leaseExpiresAt !== null && w.leaseExpiresAt <= now) {
-        recordVerificationOrRetestFailure(this.storage, run, w, 'worker', 'Verification lease expired', 'Worker lease expired before completion.')
-        reclaimedExpired = true
-      }
-    }
-    if (reclaimedExpired) {
+    // R3-07 phase-agnostic reaper (replaces H-27 verification-only loop).
+    if (this.reapOrphanedAssignments(run) > 0) {
       updatedWorkers = this.storage.workerList(run.id).filter(w =>
         w.phase === 'verification' && w.goalRevision === run.goalRevision &&
         w.sourceOrigins.every(o => approvedOrigins.has(o)))
@@ -4036,14 +4045,15 @@ export class Execution {
     work: (job: Active) => Promise<void>,
     skipIfUnauthorized: boolean,
   ): boolean {
-    const claimed = this.storage.transaction(() => {
-      const w = this.storage.updateWorker(worker.id, {
-        status: 'running', lease: randomUUID(), leaseExpiresAt: Date.now() + 10 * 60_000, outcome: null,
-      })
-      this.storage.event(run.id, `${eventPrefix}.started`, worker.title + ' started.', { assignmentId: worker.id })
-      return w
+    const claim = claimAssignment(this.storage, {
+      runId: run.id, assignmentId: worker.id,
+      leaseKind: eventPrefix === 'retest' ? 'retest' : 'verification', outcome: null,
+      registry: this.claimRegistry, reportError: (id, k, m, d) => this.safeEvent(id, k, m, d),
+      releaseStatus: 'queued',
+      afterClaimInTx: () => { this.storage.event(run.id, `${eventPrefix}.started`, worker.title + ' started.', { assignmentId: worker.id }) },
     })
-    if (!claimed) return false
+    if (!claim) return false
+    const claimed = claim.assignment
     const job: Active = { assignment: claimed, origins: new Set(claimed.sourceOrigins), controller: new AbortController() }
     this.active.set(claimed.id, job)
     const runWork = async () => {
@@ -4055,17 +4065,14 @@ export class Execution {
         recordVerificationOrRetestFailure(this.storage, run, claimed, eventPrefix, failureLabel, msg)
       } finally {
         this.active.delete(claimed.id)
+        claim.release()
         this.scheduleWake()
       }
     }
-    const task = this.spawnRunTask(
-      run.id,
-      `${eventPrefix === 'worker' ? 'verification' : 'retest'}:${claimed.id}`,
-      runWork,
-      { controller: job.controller },
-    )
+    const task = this.spawnRunTask(run.id, `${eventPrefix === 'worker' ? 'verification' : 'retest'}:${claimed.id}`, runWork, { controller: job.controller })
     if (!task.started) {
       this.active.delete(claimed.id)
+      this.claimRegistry.unregister(claimed.id, claimed.lease ?? undefined)
       rollbackRejectedWorkerSpawn(this.storage, claimed)
       const draining = this.disposingRuns.get(run.id)
       if (draining) this.trackMaintenance(draining.finally(() => this.scheduleWake()))
@@ -4119,7 +4126,7 @@ export class Execution {
     // Gate 6: when a local-lab target exists, rebuild the patched lab and replay the finding's spec.
     // A temporary `retest` assignment supplies the scoped grant (no interactive worker needed).
     let labRetest: Parameters<typeof generateAndReviewPatch>[0]['labRetest'] | undefined
-    let retestWorkerId: string | null = null
+    let retestClaim: ClaimHandle | null = null
     const labHandle = this.getLabTargetHandle(run.id)
     const findingSpecId = findingRow.replaySpecId ?? hydratedFinding.replaySpecId ?? null
     if (labHandle && findingSpecId) {
@@ -4128,19 +4135,16 @@ export class Execution {
         const approvedOrigins = this.approvedOriginsSet(run)
         if (specRow.sourceOrigins.every(o => approvedOrigins.has(o))) {
           const retestWorker = this.storage.makeWorker(
-            run,
-            'retest',
-            run.candidates.find(c => c.id === findingRow.assetId),
+            run, 'retest', run.candidates.find(c => c.id === findingRow.assetId),
             `Patch Gate 6 retest · ${hydratedFinding.title.slice(0, 70)}`,
             `Deterministic post-patch retest of replay spec ${specRow.id}.`,
             { stepId: findingRow.id, sourceOrigins: specRow.sourceOrigins },
           )
-          const claimedRetest = this.storage.updateWorker(retestWorker.id, {
-            status: 'running',
-            lease: randomUUID(),
-            leaseExpiresAt: Date.now() + 15 * 60_000,
-          }) ?? retestWorker
-          retestWorkerId = claimedRetest.id
+          retestClaim = claimAssignment(this.storage, {
+            runId: run.id, assignmentId: retestWorker.id, leaseKind: 'patch_retest',
+            registry: this.claimRegistry, reportError: (id, k, m, d) => this.safeEvent(id, k, m, d),
+          })
+          const claimedRetest = retestClaim?.assignment ?? retestWorker
           const retestJob: Active = { assignment: claimedRetest, origins: new Set(specRow.sourceOrigins), controller: new AbortController() }
           const { grant: retestGrant } = this.buildGrant(retestJob, run, approvedOrigins)
           const controlStep = specRow.spec.kind === 'http_chain'
@@ -4191,11 +4195,7 @@ export class Execution {
         onUsage: u => this.storage.recordLlmSpend(run.id, { usd: u.costUsd, tokens: u.inputTokens + u.outputTokens }),
       })
     } finally {
-      if (retestWorkerId) {
-        try {
-          this.storage.updateWorker(retestWorkerId, { status: 'complete', outcome: 'Patch Gate 6 retest finished.', lease: null, leaseExpiresAt: null })
-        } catch { /* run may be gone */ }
-      }
+      retestClaim?.settle({ status: 'complete', outcome: 'Patch Gate 6 retest finished.' })
     }
 
     const saved = this.storage.savePatchProposal({

@@ -28,6 +28,11 @@ export const RUN_SAFETY_BUDGET_DEFAULTS = {
   oobMaxCallbacksPerRun: 2_048,
   oobMaxProtectedCallbacks: 1_024,
   oobMaxCallbacksPerIpWindow: 120,
+  /** R3-07: Centralized assignment claim lease & orphan-reaper budgets. */
+  assignmentLeaseMs: 10 * 60_000,
+  investigationLeaseMs: 30 * 60_000,
+  patchRetestLeaseMs: 15 * 60_000,
+  assignmentReaperGraceMs: 5_000,
 } as const
 
 /** Hard finite OOM ceilings that neither run-scaling nor env/caller overrides may exceed. */
@@ -48,6 +53,10 @@ export const RUN_SAFETY_BUDGET_HARD_CEILINGS = {
   oobMaxCallbacksPerRun: 16_384,
   oobMaxProtectedCallbacks: 8_192,
   oobMaxCallbacksPerIpWindow: 2_048,
+  assignmentLeaseMs: 60 * 60_000,
+  investigationLeaseMs: 120 * 60_000,
+  patchRetestLeaseMs: 60 * 60_000,
+  assignmentReaperGraceMs: 5 * 60_000,
 } as const
 
 export const RUN_SAFETY_BUDGET_ENV_KEYS = {
@@ -67,6 +76,10 @@ export const RUN_SAFETY_BUDGET_ENV_KEYS = {
   oobMaxCallbacksPerRun: 'KOVO_OOB_MAX_CALLBACKS_PER_RUN',
   oobMaxProtectedCallbacks: 'KOVO_OOB_MAX_PROTECTED_CALLBACKS',
   oobMaxCallbacksPerIpWindow: 'KOVO_OOB_MAX_CALLBACKS_PER_IP_WINDOW',
+  assignmentLeaseMs: 'KOVO_ASSIGNMENT_LEASE_MS',
+  investigationLeaseMs: 'KOVO_INVESTIGATION_LEASE_MS',
+  patchRetestLeaseMs: 'KOVO_PATCH_RETEST_LEASE_MS',
+  assignmentReaperGraceMs: 'KOVO_ASSIGNMENT_REAPER_GRACE_MS',
 } as const
 
 export const DEFAULT_MAX_COMPOSITE_VERIFIES_PER_RUN = RUN_SAFETY_BUDGET_DEFAULTS.maxCompositeVerifiesPerRun
@@ -98,6 +111,10 @@ export interface RunSafetyBudgets {
   readonly oobMaxCallbacksPerRun: number
   readonly oobMaxProtectedCallbacks: number
   readonly oobMaxCallbacksPerIpWindow: number
+  readonly assignmentLeaseMs: number
+  readonly investigationLeaseMs: number
+  readonly patchRetestLeaseMs: number
+  readonly assignmentReaperGraceMs: number
 }
 
 export interface RunSafetyBudgetOverrides {
@@ -117,6 +134,10 @@ export interface RunSafetyBudgetOverrides {
   oobMaxCallbacksPerRun?: number
   oobMaxProtectedCallbacks?: number
   oobMaxCallbacksPerIpWindow?: number
+  assignmentLeaseMs?: number
+  investigationLeaseMs?: number
+  patchRetestLeaseMs?: number
+  assignmentReaperGraceMs?: number
 }
 
 export interface RunSafetyBudgetOptions {
@@ -168,6 +189,42 @@ export function resolveBoundedBudgetCap(
     return clampBoundedInt(fromEnv, hardMax)
   }
   return clampBoundedInt(fallback, hardMax)
+}
+
+function resolveAssignmentLeaseBudgets(
+  overrides: RunSafetyBudgetOverrides,
+  env: Readonly<Record<string, string | undefined>>,
+): Pick<RunSafetyBudgets, 'assignmentLeaseMs' | 'investigationLeaseMs' | 'patchRetestLeaseMs' | 'assignmentReaperGraceMs'> {
+  return {
+    assignmentLeaseMs: resolveBoundedBudgetCap(
+      overrides.assignmentLeaseMs,
+      RUN_SAFETY_BUDGET_ENV_KEYS.assignmentLeaseMs,
+      RUN_SAFETY_BUDGET_DEFAULTS.assignmentLeaseMs,
+      RUN_SAFETY_BUDGET_HARD_CEILINGS.assignmentLeaseMs,
+      env,
+    ),
+    investigationLeaseMs: resolveBoundedBudgetCap(
+      overrides.investigationLeaseMs,
+      RUN_SAFETY_BUDGET_ENV_KEYS.investigationLeaseMs,
+      RUN_SAFETY_BUDGET_DEFAULTS.investigationLeaseMs,
+      RUN_SAFETY_BUDGET_HARD_CEILINGS.investigationLeaseMs,
+      env,
+    ),
+    patchRetestLeaseMs: resolveBoundedBudgetCap(
+      overrides.patchRetestLeaseMs,
+      RUN_SAFETY_BUDGET_ENV_KEYS.patchRetestLeaseMs,
+      RUN_SAFETY_BUDGET_DEFAULTS.patchRetestLeaseMs,
+      RUN_SAFETY_BUDGET_HARD_CEILINGS.patchRetestLeaseMs,
+      env,
+    ),
+    assignmentReaperGraceMs: resolveBoundedBudgetCap(
+      overrides.assignmentReaperGraceMs,
+      RUN_SAFETY_BUDGET_ENV_KEYS.assignmentReaperGraceMs,
+      RUN_SAFETY_BUDGET_DEFAULTS.assignmentReaperGraceMs,
+      RUN_SAFETY_BUDGET_HARD_CEILINGS.assignmentReaperGraceMs,
+      env,
+    ),
+  }
 }
 
 /**
@@ -321,6 +378,60 @@ export function resolveRunSafetyBudgets(options: RunSafetyBudgetOptions = {}): R
       RUN_SAFETY_BUDGET_HARD_CEILINGS.oobMaxCallbacksPerIpWindow,
       env,
     ),
+    ...resolveAssignmentLeaseBudgets(overrides, env),
+  }
+}
+
+export type AssignmentLeaseKind =
+  | 'default'
+  | 'code_audit'
+  | 'investigation'
+  | 'verification'
+  | 'retest'
+  | 'patch_retest'
+  | 'resume_parked'
+
+export interface ResolvedAssignmentLeaseBudget {
+  readonly kind: AssignmentLeaseKind
+  readonly leaseMs: number
+  readonly hardMaxMs: number
+  readonly clamped: boolean
+  readonly requestedMs?: number
+}
+
+/**
+ * Resolve a bounded assignment claim lease duration from `RunSafetyBudgets` (`R3-07`),
+ * returning clamping telemetry whenever a caller or env override exceeds `[1, hardMaxMs]`.
+ */
+export function resolveAssignmentLeaseBudget(
+  kind: AssignmentLeaseKind = 'default',
+  options: {
+    requestedMs?: number
+    env?: Readonly<Record<string, string | undefined>>
+  } = {},
+): ResolvedAssignmentLeaseBudget {
+  const env = options.env ?? process.env
+  const key: 'investigationLeaseMs' | 'patchRetestLeaseMs' | 'assignmentLeaseMs' =
+    kind === 'investigation'
+      ? 'investigationLeaseMs'
+      : kind === 'patch_retest'
+        ? 'patchRetestLeaseMs'
+        : 'assignmentLeaseMs'
+  const fallback = RUN_SAFETY_BUDGET_DEFAULTS[key]
+  const hardMaxMs = RUN_SAFETY_BUDGET_HARD_CEILINGS[key]
+  const envKey = RUN_SAFETY_BUDGET_ENV_KEYS[key]
+  const rawRequested =
+    options.requestedMs !== undefined && Number.isFinite(options.requestedMs)
+      ? Math.floor(options.requestedMs)
+      : parseBoundedBudgetEnv(envKey, env)
+  const leaseMs = resolveBoundedBudgetCap(options.requestedMs, envKey, fallback, hardMaxMs, env)
+  const clamped = rawRequested !== undefined && rawRequested !== leaseMs
+  return {
+    kind,
+    leaseMs,
+    hardMaxMs,
+    clamped,
+    ...(rawRequested !== undefined ? { requestedMs: rawRequested } : {}),
   }
 }
 

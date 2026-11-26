@@ -8,6 +8,7 @@
  * `ProjectsRepository` and `FindingsRepository` (never imports `store.ts`).
  */
 import { randomUUID } from 'node:crypto'
+import { claimAssignment as claimAssignmentHandle, type ClaimAssignmentInput, type ClaimHandle } from './assignment-claim.ts'
 import { and, asc, desc, eq, gt, inArray, sql } from 'drizzle-orm'
 import type { z } from 'zod'
 import {
@@ -2605,23 +2606,16 @@ export class RunsRepository {
     return updated
   }
 
-  /** Resume a parked assignment with a fresh worker lease (caller re-enters the scheduler). */
+  /** Resume a parked assignment with a fresh budgeted claim handle (`R3-07`). */
   resumeParkedWorker(run: Run, assignmentId: string): Assignment {
     const existing = this.worker(assignmentId)
     if (existing.runId !== run.id) throw new Error('Assignment does not belong to this run.')
-    if (existing.status !== 'waiting_approval') {
-      throw new Error(`Assignment is not awaiting approval (state ${existing.status}).`)
-    }
-    const updated = this.updateWorker(assignmentId, {
-      status: 'running',
-      approvalParkedAt: null,
-      lease: randomUUID(),
-      leaseExpiresAt: Date.now() + 10 * 60_000,
-    })!
-    this.session.event(run.id, 'approval.worker_resumed', `Worker resumed with a fresh slot lease.`, {
-      assignmentId, leaseExpiresAt: updated.leaseExpiresAt,
+    if (existing.status !== 'waiting_approval') throw new Error(`Assignment is not awaiting approval (state ${existing.status}).`)
+    const claim = this.claimAssignment({
+      runId: run.id, assignmentId, leaseKind: 'resume_parked', approvalParkedAt: null,
+      afterClaimInTx: u => { this.session.event(run.id, 'approval.worker_resumed', 'Worker resumed with a fresh slot lease.', { assignmentId, leaseExpiresAt: u.leaseExpiresAt }) },
     })
-    return updated
+    return claim!.assignment
   }
 
   parkedWorkerCount(runId: string): number {
@@ -3471,6 +3465,12 @@ export class RunsRepository {
     return terminalStatus ? this.session.transaction(apply, { behavior: 'immediate' }) : apply()
   }
 
+  claimAssignment(input: ClaimAssignmentInput): ClaimHandle | null {
+    return claimAssignmentHandle({
+      worker: id => this.worker(id), workerList: r => this.workerList(r), updateWorker: (id, s) => this.updateWorker(id, s),
+      event: (r, k, m, d) => this.session.event(r, k, m, d), transaction: (fn, o) => this.session.transaction(fn, o), run: id => this.run(id),
+    }, input)
+  }
   updateWorker(assignmentId: string, state: Partial<Assignment>) {
     const existing = this.session.db.select({ id: tables.assignments.id, runId: tables.assignments.runId })
       .from(tables.assignments).where(eq(tables.assignments.id, assignmentId)).get()
