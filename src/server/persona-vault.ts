@@ -154,6 +154,21 @@ export interface MintedPersonaSession {
   /** Composite v6 credential bundle (cookies + headers + storage + per-origin rules). */
   bundle?: PersonaCredentialBundle
   updatedAt?: number
+  /** Live pool generation last served to a cloned worker session (runtime-only, not persisted). */
+  generation?: number
+}
+
+/** True when a minted session is absent or its `expiresAt` is at or past `nowMs + skewMs`. */
+export function isSessionExpired(
+  session: MintedPersonaSession | null | undefined,
+  nowMs = Date.now(),
+  skewMs = 5_000,
+): boolean {
+  if (!session) return true
+  if (typeof session.expiresAt !== 'number' || !Number.isFinite(session.expiresAt) || session.expiresAt <= 0) {
+    return false
+  }
+  return session.expiresAt <= nowMs + Math.max(0, skewMs)
 }
 
 export interface ResolvedPersona {

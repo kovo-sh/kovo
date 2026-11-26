@@ -15,8 +15,10 @@ import {
 import type { AddressClass, EgressLoopbackProxy } from './egress-gateway.ts'
 import {
   isBrowserSessionConfig,
+  isSessionExpired,
   normalizeClerkClientCookie,
   normalizePersonaBundle,
+  personaSecrets,
   readBrowserSessionCredentialFile,
   readLoginCredentialFile,
   resolveRunPersonas,
@@ -31,6 +33,8 @@ import type {
   ResolvedPersona,
 } from './persona-vault.ts'
 import { bundleSecrets, frameForSessionOrigin } from './persona-vault.ts'
+import { globalKillSwitch, KillSwitchTrippedError } from './kill-switch.ts'
+import type { GlobalKillSwitch } from './kill-switch.ts'
 import { isCredentialScopeHost, normalizeHostname, registrableDomain } from './public-suffix.ts'
 import { redact } from './redact.ts'
 import type { Store } from './store.ts'
@@ -63,7 +67,7 @@ export interface AuthenticateResult {
   headerType: 'cookie' | 'bearer' | 'header'
   expiresAt?: number
   refreshIntervalSec?: number
-  refresh?: () => Promise<void>
+  refresh?: (signal?: AbortSignal) => Promise<void>
   /** Composite v6 session (cookies/headers/storage bundle) for per-worker clone seeding. */
   session?: MintedPersonaSession
 }
@@ -143,6 +147,10 @@ export interface PersonaAuthManagerOptions {
   reauthMinIntervalMs?: number
   /** Injectable DNS resolver for deterministic SSRF/rebinding checks in tests. */
   resolveHost?: (hostname: string) => Promise<string[]>
+  /** Kill switch checked before every credential/refresh request (defaults to `globalKillSwitch`). */
+  killSwitch?: GlobalKillSwitch
+  /** Optional pacing/backoff/circuit options for the owned `PersonaSessionPool`. */
+  sessionPoolOptions?: PersonaSessionPoolOptions
 }
 
 const DEFAULT_TIMEOUT_MS = 15_000
@@ -900,20 +908,24 @@ export function isHostedSupabaseHost(originOrHost: string): boolean {
 /**
  * A Supabase Auth credential destination must either lie inside the persona allowlist, or be a
  * strict hosted Supabase project origin (`https://<ref>.supabase.co|in|net`) explicitly named by
- * the operator or discovered directly from the allowlisted target origin's HTML/JS.
+ * the operator (`loginUrl`) or explicitly allowlisted. Untrusted HTML/JS-discovered origins are
+ * NEVER self-authorizing (R2-H-3).
  */
 export function isSupabaseCredentialHost(
   originOrHost: string,
   allowlist: readonly string[],
   operatorNamed?: string,
-  discoveredOrigin?: string | null,
+  /** @deprecated Ignored for R2-H-3 security; untrusted discovered origins are never self-authorizing. */
+  _deprecatedDiscoveredOrigin?: string | null,
 ): boolean {
+  void _deprecatedDiscoveredOrigin
   let parsed: URL
   try {
     parsed = originOrHost.includes('://') ? new URL(originOrHost) : new URL(`https://${originOrHost}`)
   } catch {
     return false
   }
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return false
   if (parsed.username || parsed.password) return false
   if (isOriginInScope(parsed.origin, allowlist)) return true
   if (allowlist.some(entry => {
@@ -925,13 +937,6 @@ export function isSupabaseCredentialHost(
       if (new URL(operatorNamed).origin === parsed.origin) return true
     } catch {
       // Ignore malformed operator URL.
-    }
-  }
-  if (discoveredOrigin) {
-    try {
-      if (new URL(discoveredOrigin).origin === parsed.origin) return true
-    } catch {
-      // Ignore malformed discovered URL.
     }
   }
   return false
@@ -952,10 +957,71 @@ function decodeJwtPayloadObject(jwt: string): Record<string, unknown> | null {
   }
 }
 
+const MAX_SUPABASE_SCAN_CHARS = 256 * 1024
+const MAX_LINEAR_JWT_LENGTH = 4_096
+
+function isJwtTokenCharCode(code: number): boolean {
+  return (
+    (code >= 48 && code <= 57) || // 0-9
+    (code >= 65 && code <= 90) || // A-Z
+    (code >= 97 && code <= 122) || // a-z
+    code === 45 || // -
+    code === 95 || // _
+    code === 46 // .
+  )
+}
+
+/**
+ * Strictly linear O(N) single-pass JWT candidate scanner (R2-H-23).
+ * Visits every character at most once by partitioning input into disjoint `[A-Za-z0-9_.-]+` runs,
+ * eliminating quadratic backtracking on crafted `-eyJ...` or dotted inputs.
+ */
+export function scanJwtCandidatesLinear(
+  text: string,
+  options: { maxInputChars?: number; maxTokenChars?: number; maxCandidates?: number } = {},
+): string[] {
+  const limit = Math.min(text.length, Math.max(0, options.maxInputChars ?? MAX_SUPABASE_SCAN_CHARS))
+  const maxTokenChars = Math.max(64, options.maxTokenChars ?? MAX_LINEAR_JWT_LENGTH)
+  const maxCandidates = Math.max(1, options.maxCandidates ?? 24)
+  const out: string[] = []
+  let i = 0
+  while (i < limit) {
+    if (!isJwtTokenCharCode(text.charCodeAt(i))) {
+      i += 1
+      continue
+    }
+    const start = i
+    let dot1 = -1
+    let dot2 = -1
+    let extraDot = false
+    while (i < limit && isJwtTokenCharCode(text.charCodeAt(i))) {
+      if (text.charCodeAt(i) === 46) {
+        if (dot1 === -1) dot1 = i
+        else if (dot2 === -1) dot2 = i
+        else extraDot = true
+      }
+      i += 1
+    }
+    const len = i - start
+    if (extraDot || dot1 === -1 || dot2 === -1) continue
+    if (len < 38 || len > maxTokenChars) continue
+    const seg1Len = dot1 - start
+    const seg2Len = dot2 - (dot1 + 1)
+    const seg3Len = i - (dot2 + 1)
+    if (seg1Len < 13 || seg2Len < 13 || seg3Len < 10) continue
+    if (!text.startsWith('eyJ', start) || !text.startsWith('eyJ', dot1 + 1)) continue
+    out.push(text.slice(start, i))
+    if (out.length >= maxCandidates) break
+  }
+  return out
+}
+
 export function extractSupabaseConfigFromText(
   text: string,
   allowlist: readonly string[],
+  operatorLoginUrl?: string,
 ): { supabaseOrigin: string | null; supabaseAnonKey: string | null } {
+  const boundedText = text.length > MAX_SUPABASE_SCAN_CHARS ? text.slice(0, MAX_SUPABASE_SCAN_CHARS) : text
   let supabaseOrigin: string | null = null
   let supabaseAnonKey: string | null = null
 
@@ -963,82 +1029,112 @@ export function extractSupabaseConfigFromText(
     try {
       const parsed = new URL(candidate.trim())
       if ((parsed.protocol !== 'https:' && parsed.protocol !== 'http:') || parsed.username || parsed.password) return null
-      if (isHostedSupabaseHost(parsed.origin)) return parsed.origin
-      if (isOriginInScope(parsed.origin, allowlist)) return parsed.origin
+      if (isSupabaseCredentialHost(parsed.origin, allowlist, operatorLoginUrl)) return parsed.origin
       return null
     } catch {
       return null
     }
   }
 
-  // 1. Hosted Supabase URLs directly embedded in HTML or JS bundles
-  const hostedMatch = /https:\/\/([a-z0-9][a-z0-9-]{1,62}\.supabase\.(?:co|in|net))\b/i.exec(text)
-  if (hostedMatch?.[1]) {
-    supabaseOrigin = acceptOrigin(`https://${hostedMatch[1].toLowerCase()}`)
-  }
-
-  // 2. Named Supabase URL config keys or data attributes (supports self-hosted / allowlisted origins too)
-  if (!supabaseOrigin) {
-    const namedUrlPatterns = [
-      /(?:NEXT_PUBLIC_SUPABASE_URL|VITE_SUPABASE_URL|PUBLIC_SUPABASE_URL|REACT_APP_SUPABASE_URL|NUXT_PUBLIC_SUPABASE_URL|SUPABASE_URL|supabaseUrl|supabase_url)\s*[:=]\s*["'`](https?:\/\/[^"'`\s]+)["'`]/i,
-      /data-supabase-url=["'](https?:\/\/[^"'\s]+)["']/i,
-      /["'`](https?:\/\/[^"'`\s]+?)\/auth\/v1\b/i,
-    ]
-    for (const pattern of namedUrlPatterns) {
-      const match = pattern.exec(text)
-      if (match?.[1]) {
-        const accepted = acceptOrigin(match[1])
-        if (accepted) {
-          supabaseOrigin = accepted
-          break
-        }
-      }
-    }
-  }
-
-  // 3. Modern Supabase publishable key (`sb_publishable_...`)
-  const publishableMatch = /\b(sb_publishable_[A-Za-z0-9_-]{16,})\b/.exec(text)
-  if (publishableMatch?.[1]) {
-    supabaseAnonKey = publishableMatch[1]
-  }
-
-  // 4. Named Supabase anon/publishable key config entries or data attributes
-  if (!supabaseAnonKey) {
-    const namedKeyPatterns = [
-      /(?:NEXT_PUBLIC_SUPABASE_ANON_KEY|NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY|VITE_SUPABASE_ANON_KEY|VITE_SUPABASE_PUBLISHABLE_KEY|PUBLIC_SUPABASE_ANON_KEY|REACT_APP_SUPABASE_ANON_KEY|NUXT_PUBLIC_SUPABASE_ANON_KEY|SUPABASE_ANON_KEY|SUPABASE_PUBLISHABLE_KEY|supabaseAnonKey|supabaseKey|supabase_anon_key|anonKey)\s*[:=]\s*["'`]([A-Za-z0-9._-]{16,2048})["'`]/i,
-      /data-supabase-(?:anon-key|publishable-key|key)=["']([A-Za-z0-9._-]{16,2048})["']/i,
-    ]
-    for (const pattern of namedKeyPatterns) {
-      const match = pattern.exec(text)
-      if (match?.[1]) {
-        const candidate = match[1].trim()
-        // Never accidentally adopt a service_role JWT even if embedded in a broken app.
-        if (candidate.startsWith('eyJ')) {
-          const payload = decodeJwtPayloadObject(candidate)
-          if (payload && payload.role === 'service_role') continue
-        }
-        supabaseAnonKey = candidate
+  // 1. Hosted Supabase URLs embedded in HTML/JS — ONLY accepted when explicitly allowlisted
+  //    or matching the operator-configured `loginUrl` origin (R2-H-3).
+  let hostedChecked = 0
+  for (const hostedMatch of boundedText.matchAll(/https:\/\/([a-z0-9][a-z0-9-]{1,62}\.supabase\.(?:co|in|net))\b/gi)) {
+    if (++hostedChecked > 24) break
+    if (hostedMatch[1]) {
+      const accepted = acceptOrigin(`https://${hostedMatch[1].toLowerCase()}`)
+      if (accepted) {
+        supabaseOrigin = accepted
         break
       }
     }
   }
 
-  // 5. Classic Supabase anon JWTs (`role === 'anon'`), also deriving `https://<ref>.supabase.co` if needed
+  // 2. Named Supabase URL config keys or data attributes (supports self-hosted / allowlisted origins too)
+  if (!supabaseOrigin) {
+    const namedUrlPatterns = [
+      /(?:NEXT_PUBLIC_SUPABASE_URL|VITE_SUPABASE_URL|PUBLIC_SUPABASE_URL|REACT_APP_SUPABASE_URL|NUXT_PUBLIC_SUPABASE_URL|SUPABASE_URL|supabaseUrl|supabase_url)\s*[:=]\s*["'`](https?:\/\/[^"'`\s]{1,1024})["'`]/gi,
+      /data-supabase-url=["'](https?:\/\/[^"'\s]{1,1024})["']/gi,
+      /["'`](https?:\/\/[^"'`\s]{1,1024}?)\/auth\/v1\b/gi,
+    ]
+    for (const pattern of namedUrlPatterns) {
+      let checked = 0
+      for (const match of boundedText.matchAll(pattern)) {
+        if (++checked > 16) break
+        if (match[1]) {
+          const accepted = acceptOrigin(match[1])
+          if (accepted) {
+            supabaseOrigin = accepted
+            break
+          }
+        }
+      }
+      if (supabaseOrigin) break
+    }
+  }
+
+  // 3. Modern Supabase publishable key (`sb_publishable_...`)
+  const publishableMatch = /\b(sb_publishable_[A-Za-z0-9_-]{16,512})\b/.exec(boundedText)
+  if (publishableMatch?.[1]) {
+    supabaseAnonKey = publishableMatch[1]
+  }
+
+  const isAuthorizedAnonJwt = (candidate: string): { ok: boolean; refOrigin: string | null } => {
+    const payload = decodeJwtPayloadObject(candidate)
+    if (!payload) return { ok: false, refOrigin: null }
+    if (payload.role === 'service_role') return { ok: false, refOrigin: null }
+    const ref = typeof payload.ref === 'string' ? payload.ref.trim().toLowerCase() : ''
+    const refOrigin = /^[a-z0-9][a-z0-9-]{3,62}$/.test(ref) ? acceptOrigin(`https://${ref}.supabase.co`) : null
+    if (ref && !refOrigin) {
+      // Do not adopt an anon JWT bound to a hosted Supabase project outside allowlist / operator loginUrl
+      // unless we already resolved an authorized self-hosted Supabase origin.
+      const hasSelfHostedOrigin = supabaseOrigin !== null && !isHostedSupabaseHost(supabaseOrigin)
+      if (!hasSelfHostedOrigin) return { ok: false, refOrigin: null }
+    }
+    return { ok: true, refOrigin }
+  }
+
+  // 4. Named Supabase anon/publishable key config entries or data attributes
+  if (!supabaseAnonKey) {
+    const namedKeyPatterns = [
+      /(?:NEXT_PUBLIC_SUPABASE_ANON_KEY|NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY|VITE_SUPABASE_ANON_KEY|VITE_SUPABASE_PUBLISHABLE_KEY|PUBLIC_SUPABASE_ANON_KEY|REACT_APP_SUPABASE_ANON_KEY|NUXT_PUBLIC_SUPABASE_ANON_KEY|SUPABASE_ANON_KEY|SUPABASE_PUBLISHABLE_KEY|supabaseAnonKey|supabaseKey|supabase_anon_key|anonKey)\s*[:=]\s*["'`]([A-Za-z0-9._-]{16,2048})["'`]/gi,
+      /data-supabase-(?:anon-key|publishable-key|key)=["']([A-Za-z0-9._-]{16,2048})["']/gi,
+    ]
+    for (const pattern of namedKeyPatterns) {
+      let checked = 0
+      for (const match of boundedText.matchAll(pattern)) {
+        if (++checked > 16) break
+        if (match[1]) {
+          const candidate = match[1].trim()
+          // Never accidentally adopt a service_role JWT or an unauthorized foreign project's JWT.
+          if (candidate.startsWith('eyJ')) {
+            const verdict = isAuthorizedAnonJwt(candidate)
+            if (!verdict.ok) continue
+            if (!supabaseOrigin && verdict.refOrigin) supabaseOrigin = verdict.refOrigin
+          }
+          supabaseAnonKey = candidate
+          break
+        }
+      }
+      if (supabaseAnonKey) break
+    }
+  }
+
+  // 5. Classic Supabase anon JWTs (`role === 'anon'`), scanned strictly in O(N) linear time (R2-H-23).
   if (!supabaseAnonKey || !supabaseOrigin) {
-    const jwtRegex = /\b(eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})\b/g
-    let checked = 0
-    for (const match of text.matchAll(jwtRegex)) {
-      if (++checked > 24) break
-      const token = match[1]!
+    const candidates = scanJwtCandidatesLinear(boundedText, { maxInputChars: MAX_SUPABASE_SCAN_CHARS, maxCandidates: 24 })
+    for (const token of candidates) {
       const payload = decodeJwtPayloadObject(token)
       if (!payload) continue
       if (payload.role !== 'anon') continue
       const iss = typeof payload.iss === 'string' ? payload.iss.toLowerCase() : ''
       const ref = typeof payload.ref === 'string' ? payload.ref.trim().toLowerCase() : ''
       if (iss === 'supabase' || iss.includes('supabase') || /^[a-z0-9-]{8,63}$/.test(ref)) {
+        const verdict = isAuthorizedAnonJwt(token)
+        if (!verdict.ok) continue
         if (!supabaseAnonKey) supabaseAnonKey = token
-        if (!supabaseOrigin && /^[a-z0-9][a-z0-9-]{3,62}$/.test(ref)) {
-          supabaseOrigin = acceptOrigin(`https://${ref}.supabase.co`)
+        if (!supabaseOrigin && verdict.refOrigin) {
+          supabaseOrigin = verdict.refOrigin
         }
         break
       }
@@ -1046,6 +1142,96 @@ export function extractSupabaseConfigFromText(
   }
 
   return { supabaseOrigin, supabaseAnonKey }
+}
+
+export interface SessionExpiryResponseInput {
+  status: number
+  headers?: Record<string, string | string[] | undefined>
+  body?: string
+  requestOrigin?: string
+  loginUrl?: string | null
+}
+
+export interface SessionExpirySignal {
+  expired: boolean
+  reason: 'http_401' | 'http_403_session_expired' | 'login_redirect' | 'clerk_signed_out' | null
+  redirectTarget?: string
+}
+
+const LOGIN_REDIRECT_PATH_RE = /(?:^|\/)(?:sign[-_]?in|log[-_]?in|auth(?:enticate)?|session\/new|sso(?:\/|$)|oauth2?\/authorize|oidc\/auth|accounts\/login)(?:\/|$|\?)/i
+const LOGIN_REDIRECT_QUERY_RE = /[?&](?:session_expired|expired|reauth)=(?:1|true)\b/i
+const SESSION_EXPIRED_403_BODY_RE = /(?:(?:session|token|jwt|cookie|credential)s?\s+(?:has\s+)?(?:expired|invalid|revoked|missing|not\s+found)|(?:expired|invalid|revoked|missing)\s+(?:session|token|jwt|auth(?:entication)?|credential)|(?:token_expired|session_expired|invalid_token|jwt_expired|unauthenticated|not_authenticated|login_required|authentication_required|please\s+(?:log|sign)\s*in|must\s+be\s+(?:logged|signed)\s*in))/i
+const SESSION_EXPIRED_WWW_AUTH_RE = /(?:invalid_token|expired|token_expired|session_expired)/i
+
+function headerFirstValue(
+  headers: Record<string, string | string[] | undefined> | undefined,
+  nameLower: string,
+): string {
+  if (!headers) return ''
+  for (const [k, v] of Object.entries(headers)) {
+    if (k.toLowerCase() !== nameLower) continue
+    if (typeof v === 'string') return v
+    if (Array.isArray(v) && typeof v[0] === 'string') return v[0]
+  }
+  return ''
+}
+
+/**
+ * Cleanly detect session expiry across HTTP 401, Clerk `signed-out` headers, 3xx login redirects,
+ * and 403 responses that explicitly indicate an expired/invalid session (without false-triggering
+ * on normal RBAC 403 authorization denials).
+ */
+export function detectSessionExpiry(input: SessionExpiryResponseInput): SessionExpirySignal {
+  const clerkStatus = headerFirstValue(input.headers, 'x-clerk-auth-status').trim().toLowerCase()
+  if (clerkStatus === 'signed-out') {
+    return { expired: true, reason: 'clerk_signed_out' }
+  }
+
+  if (input.status === 401) {
+    return { expired: true, reason: 'http_401' }
+  }
+
+  if (input.status === 301 || input.status === 302 || input.status === 303 || input.status === 307 || input.status === 308) {
+    const location = headerFirstValue(input.headers, 'location').trim()
+    if (location) {
+      let resolved: URL | null = null
+      try {
+        resolved = input.requestOrigin ? new URL(location, input.requestOrigin) : new URL(location)
+      } catch {
+        resolved = null
+      }
+      if (input.loginUrl && resolved) {
+        try {
+          const configured = new URL(input.loginUrl)
+          if (
+            resolved.origin === configured.origin &&
+            (resolved.pathname === configured.pathname || resolved.pathname.startsWith(configured.pathname.replace(/\/+$/, '') + '/'))
+          ) {
+            return { expired: true, reason: 'login_redirect', redirectTarget: location }
+          }
+        } catch {
+          // Ignore malformed loginUrl.
+        }
+      }
+      const pathAndQuery = resolved ? `${resolved.pathname}${resolved.search}` : location
+      if (LOGIN_REDIRECT_PATH_RE.test(pathAndQuery) || LOGIN_REDIRECT_QUERY_RE.test(pathAndQuery)) {
+        return { expired: true, reason: 'login_redirect', redirectTarget: location }
+      }
+    }
+  }
+
+  if (input.status === 403) {
+    const wwwAuth = headerFirstValue(input.headers, 'www-authenticate')
+    if (wwwAuth && SESSION_EXPIRED_WWW_AUTH_RE.test(wwwAuth)) {
+      return { expired: true, reason: 'http_403_session_expired' }
+    }
+    const sample = (input.body ?? '').slice(0, 4_096)
+    if (sample && SESSION_EXPIRED_403_BODY_RE.test(sample)) {
+      return { expired: true, reason: 'http_403_session_expired' }
+    }
+  }
+
+  return { expired: false, reason: null }
 }
 
 /**
@@ -1058,23 +1244,84 @@ export function extractSupabaseConfigFromText(
  * - `rotate()` bumps the shared generation after an out-of-band rotation (logout probe,
  *   token swap) so sibling workers retry with the fresh credential instead of re-authenticating.
  */
-export type PersonaSessionRefreshOutcome = 'refreshed' | 'already-fresh' | 'failed' | 'logged-out' | 'unknown'
+export type PersonaSessionRefreshOutcome =
+  | 'refreshed'
+  | 'already-fresh'
+  | 'paced'
+  | 'circuit-open'
+  | 'failed'
+  | 'logged-out'
+  | 'unknown'
+
+export interface PersonaSessionRefreshOptions {
+  /** Bypass the post-success pacing window (used by scheduled periodic timers). */
+  force?: boolean
+  /** AbortSignal threaded into the upstream refresh closure. */
+  signal?: AbortSignal
+}
+
+export interface PersonaSessionPoolOptions {
+  /** Minimum interval between successful upstream refreshes for the same entry (default 5_000 ms). */
+  minRefreshIntervalMs?: number
+  /** Base exponential backoff after a failed refresh (default 2_000 ms). */
+  failureBackoffBaseMs?: number
+  /** Maximum exponential backoff cap after repeated failures (default 60_000 ms). */
+  failureBackoffMaxMs?: number
+  /** Consecutive failures before opening the circuit breaker (default 3). */
+  circuitBreakerThreshold?: number
+  /** How long the circuit breaker stays open before a half-open probe (default 60_000 ms). */
+  circuitBreakerOpenMs?: number
+  /** Injectable clock for deterministic tests. */
+  now?: () => number
+  /** When true, omitting `runId` never falls back to a run-scoped entry. */
+  strictRunScope?: boolean
+}
+
+interface ResolvedSessionPoolPolicy {
+  minRefreshIntervalMs: number
+  failureBackoffBaseMs: number
+  failureBackoffMaxMs: number
+  circuitBreakerThreshold: number
+  circuitBreakerOpenMs: number
+  now: () => number
+  strictRunScope: boolean
+}
+
+const DEFAULT_SESSION_POOL_POLICY: ResolvedSessionPoolPolicy = {
+  minRefreshIntervalMs: 5_000,
+  failureBackoffBaseMs: 2_000,
+  failureBackoffMaxMs: 60_000,
+  circuitBreakerThreshold: 3,
+  circuitBreakerOpenMs: 60_000,
+  now: () => Date.now(),
+  strictRunScope: false,
+}
 
 export interface PersonaSessionRegistration {
   session: MintedPersonaSession
   allowlist: readonly string[]
   /** Upstream renewer (adapter refresh closure or full re-authentication). */
-  refresh?: () => Promise<MintedPersonaSession | null>
+  refresh?: (signal?: AbortSignal) => Promise<MintedPersonaSession | null>
   /** Optional run namespace so concurrent runs sharing a handle never overwrite each other. */
   runId?: string
+  /** Optional tenant scope for kill-switch enforcement on background/on-demand refreshes. */
+  tenantId?: string | null
+  /** Optional callback invoked when an upstream refresh fails. */
+  onRefreshError?: (error: unknown) => void
 }
 
 export interface PersonaSessionClone {
   readonly id: string
   readonly handle: string
   readonly runId?: string
-  /** Shared credential generation this clone has observed. */
+  /** Shared credential generation this clone has observed for 401 dedup. */
   readonly generation: number
+  /** Credential generation most recently served by this clone's header/cookie/storage accessors. */
+  readonly servedGeneration: number
+  /** Live generation currently active in the owning pool entry. */
+  readonly poolGeneration: number
+  /** Synchronize `servedGeneration` to the owning pool entry's current generation. */
+  syncServedGeneration(): number
   isLoggedOut(): boolean
   /** Headers (incl. scoped `Cookie`) for one origin, or null when outside the allowlist. */
   headersFor(origin: string): Record<string, string> | null
@@ -1082,8 +1329,8 @@ export interface PersonaSessionClone {
   cookiesFor(origin: string): PersonaCookieRecord[]
   /** Rotate this clone's cookie jar only (a logout/token-swap probe never touches siblings). */
   applySetCookie(origin: string, setCookieLines: readonly string[]): void
-  /** Report a 401 from this clone; deduped across siblings into one upstream refresh. */
-  reportUnauthorized(observedGeneration?: number): Promise<PersonaSessionRefreshOutcome>
+  /** Report a 401/403/login-redirect expiry from this clone; deduped across siblings into one upstream refresh. */
+  reportUnauthorized(observedGeneration?: number, options?: PersonaSessionRefreshOptions): Promise<PersonaSessionRefreshOutcome>
   /** Drop this clone's credentials without invalidating the shared session. */
   logout(): void
   dispose(): void
@@ -1104,13 +1351,20 @@ export function personaPoolKey(handle: string, runId?: string | null): string {
 interface PersonaSessionPoolEntry {
   key: string
   runId?: string
+  tenantId?: string | null
   handle: string
   session: MintedPersonaSession
   allowlist: string[]
   generation: number
-  refresh?: () => Promise<MintedPersonaSession | null>
+  refresh?: (signal?: AbortSignal) => Promise<MintedPersonaSession | null>
+  onRefreshError?: (error: unknown) => void
   inFlight?: Promise<PersonaSessionRefreshOutcome>
   refreshCount: number
+  lastRefreshedAt: number
+  consecutiveFailures: number
+  nextRetryAt: number
+  circuitOpenUntil: number
+  policy: ResolvedSessionPoolPolicy
   clones: Set<PersonaSessionCloneImpl>
 }
 
@@ -1187,6 +1441,7 @@ export class PersonaSessionCloneImpl implements PersonaSessionClone {
   private loggedOut = false
   private localCookies: PersonaCookieRecord[] = []
   private seenGeneration: number
+  private lastServedGeneration: number
   private readonly entry: PersonaSessionPoolEntry
 
   constructor(handle: string, entry: PersonaSessionPoolEntry, id?: string) {
@@ -1195,14 +1450,25 @@ export class PersonaSessionCloneImpl implements PersonaSessionClone {
     this.runId = entry.runId
     this.entry = entry
     this.seenGeneration = entry.generation
+    this.lastServedGeneration = entry.generation
     entry.clones.add(this)
   }
 
   get generation(): number { return this.seenGeneration }
 
+  get servedGeneration(): number { return this.lastServedGeneration }
+
+  get poolGeneration(): number { return this.entry.generation }
+
+  syncServedGeneration(): number {
+    this.lastServedGeneration = this.entry.generation
+    return this.lastServedGeneration
+  }
+
   isLoggedOut(): boolean { return this.loggedOut }
 
   private view(): MintedPersonaSession {
+    this.lastServedGeneration = this.entry.generation
     if (!this.localCookies.length) return this.entry.session
     return {
       ...this.entry.session,
@@ -1242,17 +1508,26 @@ export class PersonaSessionCloneImpl implements PersonaSessionClone {
     ), ...next]
   }
 
-  async reportUnauthorized(observedGeneration?: number): Promise<PersonaSessionRefreshOutcome> {
+  async reportUnauthorized(
+    observedGeneration?: number,
+    options?: PersonaSessionRefreshOptions,
+  ): Promise<PersonaSessionRefreshOutcome> {
     if (this.loggedOut) return 'logged-out'
     const observed = observedGeneration ?? this.seenGeneration
-    const outcome = await this.entryPoolRefresh(observed)
-    if (outcome === 'refreshed' || outcome === 'already-fresh') this.seenGeneration = this.entry.generation
+    const outcome = await this.entryPoolRefresh(observed, options)
+    if (outcome === 'refreshed' || outcome === 'already-fresh') {
+      this.seenGeneration = this.entry.generation
+      this.lastServedGeneration = this.entry.generation
+    }
     return outcome
   }
 
-  private entryPoolRefresh(observed: number): Promise<PersonaSessionRefreshOutcome> {
+  private entryPoolRefresh(
+    observed: number,
+    options?: PersonaSessionRefreshOptions,
+  ): Promise<PersonaSessionRefreshOutcome> {
     // The pool owns the single-flight promise; this indirection keeps the clone bound to its entry.
-    return PersonaSessionPool.refreshEntry(this.entry, observed)
+    return PersonaSessionPool.refreshEntry(this.entry, observed, options)
   }
 
   logout(): void {
@@ -1268,6 +1543,19 @@ export class PersonaSessionCloneImpl implements PersonaSessionClone {
 
 export class PersonaSessionPool {
   private readonly entries = new Map<string, PersonaSessionPoolEntry>()
+  private readonly policy: ResolvedSessionPoolPolicy
+
+  constructor(options: PersonaSessionPoolOptions = {}) {
+    this.policy = {
+      minRefreshIntervalMs: Math.max(0, options.minRefreshIntervalMs ?? DEFAULT_SESSION_POOL_POLICY.minRefreshIntervalMs),
+      failureBackoffBaseMs: Math.max(0, options.failureBackoffBaseMs ?? DEFAULT_SESSION_POOL_POLICY.failureBackoffBaseMs),
+      failureBackoffMaxMs: Math.max(0, options.failureBackoffMaxMs ?? DEFAULT_SESSION_POOL_POLICY.failureBackoffMaxMs),
+      circuitBreakerThreshold: Math.max(1, options.circuitBreakerThreshold ?? DEFAULT_SESSION_POOL_POLICY.circuitBreakerThreshold),
+      circuitBreakerOpenMs: Math.max(0, options.circuitBreakerOpenMs ?? DEFAULT_SESSION_POOL_POLICY.circuitBreakerOpenMs),
+      now: options.now ?? DEFAULT_SESSION_POOL_POLICY.now,
+      strictRunScope: options.strictRunScope ?? DEFAULT_SESSION_POOL_POLICY.strictRunScope,
+    }
+  }
 
   private resolveEntry(handle: string, runId?: string): PersonaSessionPoolEntry | undefined {
     const normalized = normalizePoolRunId(runId)
@@ -1276,13 +1564,19 @@ export class PersonaSessionPool {
     }
     const exact = this.entries.get(handle)
     if (exact) return exact
-    // Backwards-compatible fallback for callers/tests omitting `runId`: return the most recently
-    // registered run-scoped entry for `handle`, if any.
+    if (this.policy.strictRunScope) return undefined
+    // Backwards-compatible fallback ONLY when unambiguous (exactly one run holds this handle);
+    // fail closed if multiple concurrent runs share the handle to prevent cross-run bleed.
     let matched: PersonaSessionPoolEntry | undefined
+    let count = 0
     for (const entry of this.entries.values()) {
-      if (entry.handle === handle) matched = entry
+      if (entry.handle === handle) {
+        matched = entry
+        count += 1
+        if (count > 1) return undefined
+      }
     }
-    return matched
+    return count === 1 ? matched : undefined
   }
 
   register(handle: string, registration: PersonaSessionRegistration, runId?: string): void {
@@ -1293,18 +1587,30 @@ export class PersonaSessionPool {
       existing.session = registration.session
       existing.allowlist = [...registration.allowlist]
       if (registration.refresh) existing.refresh = registration.refresh
+      if (registration.tenantId !== undefined) existing.tenantId = registration.tenantId
+      if (registration.onRefreshError !== undefined) existing.onRefreshError = registration.onRefreshError
       existing.generation += 1
+      existing.consecutiveFailures = 0
+      existing.nextRetryAt = 0
+      existing.circuitOpenUntil = 0
       return
     }
     this.entries.set(key, {
       key,
       ...(effectiveRunId ? { runId: effectiveRunId } : {}),
+      ...(registration.tenantId !== undefined ? { tenantId: registration.tenantId } : {}),
       handle,
       session: registration.session,
       allowlist: [...registration.allowlist],
       generation: 1,
       ...(registration.refresh ? { refresh: registration.refresh } : {}),
+      ...(registration.onRefreshError ? { onRefreshError: registration.onRefreshError } : {}),
       refreshCount: 0,
+      lastRefreshedAt: 0,
+      consecutiveFailures: 0,
+      nextRetryAt: 0,
+      circuitOpenUntil: 0,
+      policy: this.policy,
       clones: new Set(),
     })
   }
@@ -1335,7 +1641,15 @@ export class PersonaSessionPool {
 
   session(handle: string, runId?: string): MintedPersonaSession | null { return this.resolveEntry(handle, runId)?.session ?? null }
 
+  tenantId(handle: string, runId?: string): string | null { return this.resolveEntry(handle, runId)?.tenantId ?? null }
+
   refreshCount(handle: string, runId?: string): number { return this.resolveEntry(handle, runId)?.refreshCount ?? 0 }
+
+  isExpired(handle: string, runId?: string, skewMs = 5_000): boolean {
+    const entry = this.resolveEntry(handle, runId)
+    if (!entry) return true
+    return isSessionExpired(entry.session, this.policy.now(), skewMs)
+  }
 
   clone(handle: string, id?: string, runId?: string): PersonaSessionClone | null {
     const entry = this.resolveEntry(handle, runId)
@@ -1362,31 +1676,85 @@ export class PersonaSessionPool {
     if (!entry) return null
     entry.session = session
     entry.generation += 1
+    entry.consecutiveFailures = 0
+    entry.nextRetryAt = 0
+    entry.circuitOpenUntil = 0
     return entry.generation
   }
 
-  async refresh(handle: string, observedGeneration?: number, runId?: string): Promise<PersonaSessionRefreshOutcome> {
+  async refresh(
+    handle: string,
+    observedGeneration?: number,
+    runId?: string,
+    options?: PersonaSessionRefreshOptions,
+  ): Promise<PersonaSessionRefreshOutcome> {
     const entry = this.resolveEntry(handle, runId)
     if (!entry) return 'unknown'
-    return PersonaSessionPool.refreshEntry(entry, observedGeneration)
+    return PersonaSessionPool.refreshEntry(entry, observedGeneration, options)
+  }
+
+  private static recordRefreshFailure(entry: PersonaSessionPoolEntry): void {
+    const policy = entry.policy
+    const now = policy.now()
+    entry.consecutiveFailures += 1
+    const exp = Math.min(10, Math.max(0, entry.consecutiveFailures - 1))
+    const backoffMs = Math.min(policy.failureBackoffMaxMs, policy.failureBackoffBaseMs * (2 ** exp))
+    entry.nextRetryAt = now + backoffMs
+    if (entry.consecutiveFailures >= policy.circuitBreakerThreshold) {
+      entry.circuitOpenUntil = now + policy.circuitBreakerOpenMs
+    }
   }
 
   static async refreshEntry(
     entry: PersonaSessionPoolEntry,
     observedGeneration?: number,
+    options?: PersonaSessionRefreshOptions,
   ): Promise<PersonaSessionRefreshOutcome> {
-    if (observedGeneration !== undefined && entry.generation > observedGeneration) return 'already-fresh'
-    if (!entry.refresh) return entry.inFlight ? await entry.inFlight : 'unknown'
+    const force = options?.force === true
+    const signal = options?.signal
+    if (signal?.aborted) return 'failed'
+    if (!force && observedGeneration !== undefined && entry.generation > observedGeneration) {
+      return 'already-fresh'
+    }
     if (entry.inFlight) return entry.inFlight
+    if (!entry.refresh) return 'unknown'
+
+    const policy = entry.policy
+    const now = policy.now()
+    if (entry.circuitOpenUntil > now) {
+      return 'circuit-open'
+    }
+    if (entry.nextRetryAt > now) {
+      return 'paced'
+    }
+    if (!force && entry.lastRefreshedAt > 0 && policy.minRefreshIntervalMs > 0 && (now - entry.lastRefreshedAt) < policy.minRefreshIntervalMs) {
+      // A refresh already completed moments ago:
+      // - callers omitting observedGeneration (legacy broker retries) retry with the fresh credential
+      // - callers that already observed the latest generation are paced without thrashing the IdP.
+      return observedGeneration === undefined ? 'already-fresh' : 'paced'
+    }
+
     const run = (async (): Promise<PersonaSessionRefreshOutcome> => {
       try {
-        const next = await entry.refresh!()
-        if (!next) return 'failed'
+        const next = await entry.refresh!(signal)
+        if (!next) {
+          PersonaSessionPool.recordRefreshFailure(entry)
+          return 'failed'
+        }
         entry.session = next
         entry.generation += 1
         entry.refreshCount += 1
+        entry.lastRefreshedAt = policy.now()
+        entry.consecutiveFailures = 0
+        entry.nextRetryAt = 0
+        entry.circuitOpenUntil = 0
         return 'refreshed'
-      } catch {
+      } catch (err) {
+        if (err instanceof KillSwitchTrippedError) {
+          throw err
+        }
+        PersonaSessionPool.recordRefreshFailure(entry)
+        try { entry.onRefreshError?.(err) } catch { /* ignore listener errors */ }
         return 'failed'
       } finally {
         entry.inFlight = undefined
@@ -1397,6 +1765,41 @@ export class PersonaSessionPool {
   }
 }
 
+export interface EphemeralPersonaSessionHandle {
+  readonly scopeId: string
+  readonly ready: boolean
+  /** Login persona handles authenticated and registered under `scopeId`. */
+  readonly authenticatedHandles: string[]
+  /** Login personas that could not be bootstrapped/refreshed (redacted reasons). */
+  readonly unavailable: Array<{
+    personaId: string
+    handle: string
+    reason: string
+    code?: PersonaAuthErrorCode
+  }>
+  /** True when any required login persona failed to bootstrap — retest callers MUST report inconclusive, never fixed. */
+  readonly inconclusive: boolean
+  /** Human-readable explanation when `inconclusive` is true. */
+  readonly reason?: string
+  /** Tear down ephemeral pool entries and abort any in-flight refresh for this retest scope. */
+  dispose: () => void
+}
+
+export interface EphemeralSessionBootstrapOptions {
+  scopeId: string
+  projectId: string
+  approvedPersonaIds: readonly string[]
+  /** Optional subset of persona handles required by the retest (defaults to all login personas in `approvedPersonaIds`). */
+  requiredHandles?: readonly string[]
+  signal?: AbortSignal
+}
+
+interface RunRefresherControllerEntry {
+  controller: AbortController
+  releaseKillSwitch: () => void
+  releaseOuterSignal?: () => void
+}
+
 export class PersonaAuthManager {
   private readonly fetchImpl: typeof fetch | undefined
   private readonly fetchImplInjected: boolean
@@ -1405,10 +1808,12 @@ export class PersonaAuthManager {
   private readonly timeoutMs: number
   private readonly reauthMinIntervalMs: number
   private readonly resolveHost: (hostname: string) => Promise<string[]>
+  private readonly killSwitch: GlobalKillSwitch
   private readonly hostSafety = new Map<string, { at: number; addresses: string[]; safe: boolean }>()
   private readonly runTimers = new Map<string, NodeJS.Timeout[]>()
-  private readonly reauthHandlers = new Map<string, { fn: () => Promise<void>; lastAt: number; inFlight?: Promise<boolean> }>()
-  private readonly sessionPool = new PersonaSessionPool()
+  private readonly runControllers = new Map<string, RunRefresherControllerEntry>()
+  private readonly reauthHandlers = new Map<string, { fn: () => Promise<void>; lastAt: number; inFlight?: Promise<boolean>; tenantId?: string | null }>()
+  private readonly sessionPool: PersonaSessionPool
 
   constructor(options: PersonaAuthManagerOptions = {}) {
     this.fetchImplInjected = Boolean(options.fetchImpl)
@@ -1417,14 +1822,22 @@ export class PersonaAuthManager {
     this.launchBrowser = options.launchBrowser ?? launchDefaultChromium
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
     // Legacy pacing for raw registerReauth() handlers only. Session clones (the product path)
-    // never use a time-based lockout; they coordinate through PersonaSessionPool generations.
+    // coordinate through PersonaSessionPool generations + per-entry pacing/circuit breaker.
     this.reauthMinIntervalMs = Math.max(1_000, options.reauthMinIntervalMs ?? 60_000)
     this.resolveHost = options.resolveHost ?? defaultResolveHost
+    this.killSwitch = options.killSwitch ?? globalKillSwitch
+    this.sessionPool = new PersonaSessionPool(options.sessionPoolOptions)
+  }
+
+  /** Active kill switch enforcing immediate halt on credential & refresher egress. */
+  getKillSwitch(): GlobalKillSwitch {
+    return this.killSwitch
   }
 
   /**
    * Credential transport routed exclusively through `EgressGateway.egressFetch`.
    * An injected `fetchImpl` (tests/embedders) keeps the existing mock-fetch contract.
+   * Always gated by `killSwitch` (both pre-flight and live abort mid-request).
    */
   private async credentialFetch(
     url: string,
@@ -1432,32 +1845,45 @@ export class PersonaAuthManager {
     target: ValidatedCredentialTarget,
     signal?: AbortSignal,
     timeoutMs = this.timeoutMs,
+    tenantId?: string | null,
   ): Promise<Response> {
-    warnIfEnvProxyEnabled()
-    if (this.fetchImpl) {
-      return await fetchWithInjectedTransport(this.fetchImpl, url, init, timeoutMs, signal)
+    this.killSwitch.assertAllowed(tenantId ?? null)
+    if (signal?.aborted) {
+      throw (signal.reason instanceof Error ? signal.reason : new PersonaAuthError('AUTH_FAILED', 'Authentication request aborted.'))
     }
-    const hostname = normalizeHostname(target.url.hostname.replace(/^\[|\]$/g, ''))
-    const allowLoopback = target.exactAllowlisted
+    const baseSignal = signal ?? new AbortController().signal
+    const ksBound = this.killSwitch.bindSignal(baseSignal, tenantId ?? null)
     try {
-      return await EgressGateway.egressFetch(
-        url,
-        { ...init, redirect: 'manual', signal },
-        {
-          pinnedAddresses: target.addresses,
-          resolveHost: this.resolveHost,
-          timeoutMs,
-          maxResponseBytes: MAX_PINNED_RESPONSE_BYTES,
-          followRedirects: false,
-          allowHttp: allowLoopback && isLoopbackLiteral(hostname),
-          ...(allowLoopback ? { allowedLoopbackOnlyHosts: [hostname] } : {}),
-        },
-      )
-    } catch (err) {
-      if (err instanceof EgressDeniedError) {
-        throw new PersonaAuthError('AUTH_FAILED', err.message)
+      warnIfEnvProxyEnabled()
+      if (this.fetchImpl) {
+        return await fetchWithInjectedTransport(this.fetchImpl, url, init, timeoutMs, ksBound.signal)
       }
-      throw err
+      const hostname = normalizeHostname(target.url.hostname.replace(/^\[|\]$/g, ''))
+      const allowLoopback = target.exactAllowlisted
+      try {
+        return await EgressGateway.egressFetch(
+          url,
+          { ...init, redirect: 'manual', signal: ksBound.signal },
+          {
+            pinnedAddresses: target.addresses,
+            resolveHost: this.resolveHost,
+            timeoutMs,
+            maxResponseBytes: MAX_PINNED_RESPONSE_BYTES,
+            followRedirects: false,
+            allowHttp: allowLoopback && isLoopbackLiteral(hostname),
+            ...(allowLoopback ? { allowedLoopbackOnlyHosts: [hostname] } : {}),
+          },
+        )
+      } catch (err) {
+        if (err instanceof KillSwitchTrippedError) throw err
+        if (this.killSwitch.isActive(tenantId ?? null)) this.killSwitch.assertAllowed(tenantId ?? null)
+        if (err instanceof EgressDeniedError) {
+          throw new PersonaAuthError('AUTH_FAILED', err.message)
+        }
+        throw err
+      }
+    } finally {
+      ksBound.release()
     }
   }
 
@@ -1465,6 +1891,8 @@ export class PersonaAuthManager {
     targetOrigin: string,
     allowlist: readonly string[],
     signal?: AbortSignal,
+    operatorLoginUrl?: string,
+    tenantId?: string | null,
   ): Promise<{
     html: string
     headers: Headers
@@ -1483,6 +1911,7 @@ export class PersonaAuthManager {
       supabaseAnonKey: null,
       hasSupabase: false,
     }
+    this.killSwitch.assertAllowed(tenantId ?? null)
     try {
       const target = await this.assertCredentialTarget(targetOrigin, allowlist, 'Target origin')
       // No redirects while discovering provider configuration: a redirect target must never decide
@@ -1493,6 +1922,7 @@ export class PersonaAuthManager {
         target,
         signal,
         Math.min(this.timeoutMs, 8_000),
+        tenantId,
       )
       if (res.status < 200 || res.status >= 300) {
         return { ...empty, headers: res.headers }
@@ -1524,7 +1954,7 @@ export class PersonaAuthManager {
         /data-clerk-publishable-key|@clerk\/|clerk-js|__clerk_db_jwt/i.test(html),
       )
 
-      let { supabaseOrigin, supabaseAnonKey } = extractSupabaseConfigFromText(html, allowlist)
+      let { supabaseOrigin, supabaseAnonKey } = extractSupabaseConfigFromText(html, allowlist, operatorLoginUrl)
 
       // Scan up to 4 same-origin JS bundles when Supabase URL or public anon key is not inline in HTML.
       if (!supabaseOrigin || !supabaseAnonKey) {
@@ -1556,25 +1986,30 @@ export class PersonaAuthManager {
               target,
               signal,
               Math.min(this.timeoutMs, 4_000),
+              tenantId,
             )
             if (sRes.status < 200 || sRes.status >= 300) continue
-            const jsText = (await sRes.text()).slice(0, 512_000)
-            const found = extractSupabaseConfigFromText(jsText, allowlist)
+            const jsText = (await sRes.text()).slice(0, MAX_SUPABASE_SCAN_CHARS)
+            const found = extractSupabaseConfigFromText(jsText, allowlist, operatorLoginUrl)
             if (!supabaseOrigin && found.supabaseOrigin) supabaseOrigin = found.supabaseOrigin
             if (!supabaseAnonKey && found.supabaseAnonKey) supabaseAnonKey = found.supabaseAnonKey
-          } catch {
+          } catch (err) {
+            if (err instanceof KillSwitchTrippedError) throw err
             // Best-effort JS bundle discovery.
           }
         }
       }
 
+      // R2-H-3: Do NOT switch auto-adapter to Supabase on unapproved third-party `supabase.co` URLs;
+      // require either an authorized Supabase origin (allowlist or operator loginUrl) or a self-hosted
+      // Supabase anon key paired with the Supabase JS client on the target origin.
       const hasSupabase = Boolean(
         supabaseOrigin ||
-        supabaseAnonKey ||
-        /@supabase\/supabase-js|supabase\.co\/auth\/v1/i.test(html),
+        (supabaseAnonKey && /@supabase\/supabase-js/i.test(html)),
       )
       return { html, headers: res.headers, clerkFapiOrigin, hasClerk, supabaseOrigin, supabaseAnonKey, hasSupabase }
-    } catch {
+    } catch (err) {
+      if (err instanceof KillSwitchTrippedError) throw err
       return empty
     }
   }
@@ -1728,27 +2163,41 @@ export class PersonaAuthManager {
   }
 
   /**
-   * Invoked by RequestBroker on a persona-bound 401. Returns true when a session refresh ran
-   * (or a sibling already refreshed this generation, in which case the caller retries with the
-   * fresh credential). Pool-backed personas never use the 60 s lockout.
+   * Invoked by RequestBroker on a persona-bound 401/403/login-redirect expiry. Returns true when a
+   * session refresh ran (or a sibling already refreshed this generation, in which case the caller
+   * retries with the fresh credential). Pool-backed personas coordinate via generation dedup +
+   * per-entry pacing/circuit breaker and are always gated by `killSwitch`.
    */
-  async requestReauth(handle: string, observedGeneration?: number, runId?: string): Promise<boolean> {
+  async requestReauth(
+    handle: string,
+    observedGeneration?: number,
+    runId?: string,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    if (signal?.aborted) return false
     if (this.sessionPool.has(handle, runId)) {
-      const outcome = await this.sessionPool.refresh(handle, observedGeneration, runId)
-      return outcome === 'refreshed' || outcome === 'already-fresh'
+      const tenantId = this.sessionPool.tenantId(handle, runId)
+      if (this.killSwitch.isActive(tenantId)) return false
+      const normalizedRunId = normalizePoolRunId(runId)
+      const runSignal = normalizedRunId ? this.runControllers.get(normalizedRunId)?.controller.signal : undefined
+      const effectiveSignal = signal && runSignal
+        ? AbortSignal.any([signal, runSignal])
+        : (signal ?? runSignal)
+      if (effectiveSignal?.aborted) return false
+      try {
+        const outcome = await this.sessionPool.refresh(handle, observedGeneration, runId, { signal: effectiveSignal })
+        return outcome === 'refreshed' || outcome === 'already-fresh'
+      } catch (err) {
+        if (err instanceof KillSwitchTrippedError) return false
+        return false
+      }
     }
     const normalizedRunId = normalizePoolRunId(runId)
     const entry = normalizedRunId
       ? this.reauthHandlers.get(personaPoolKey(handle, normalizedRunId))
-      : this.reauthHandlers.get(handle) ?? (() => {
-          const suffix = `:${handle}`
-          let matched: { fn: () => Promise<void>; lastAt: number; inFlight?: Promise<boolean> } | undefined
-          for (const [k, v] of this.reauthHandlers.entries()) {
-            if (k.endsWith(suffix)) matched = v
-          }
-          return matched
-        })()
+      : this.reauthHandlers.get(handle)
     if (!entry) return false
+    if (this.killSwitch.isActive(entry.tenantId ?? null)) return false
     if (entry.inFlight) return entry.inFlight
     const now = Date.now()
     if (now - entry.lastAt < this.reauthMinIntervalMs) return false
@@ -1809,6 +2258,12 @@ export class PersonaAuthManager {
     personaId: string,
     signal?: AbortSignal,
   ): Promise<AuthenticateResult> {
+    const project = storage.project(projectId)
+    const tenantId = project.tenantId ?? null
+    this.killSwitch.assertAllowed(tenantId)
+    if (signal?.aborted) {
+      throw (signal.reason instanceof Error ? signal.reason : new PersonaAuthError('AUTH_FAILED', 'Persona authentication aborted.'))
+    }
     const resolved = resolveRunPersonas(storage, projectId, [personaId])
     const persona = [...resolved.values()][0]
     if (!persona) throw new PersonaAuthError('AUTH_FAILED', 'Persona not found.')
@@ -1828,7 +2283,7 @@ export class PersonaAuthManager {
     // Universal IdP-agnostic browser session path (primary): refresh via headless Playwright
     // storageState with zero IdP-specific code.
     if (isBrowserSessionConfig(config as { adapter?: string })) {
-      return await this.authenticateBrowserSession(storage, projectId, persona, config as unknown as BrowserSessionLoginConfig, targetOrigin, signal)
+      return await this.authenticateBrowserSession(storage, projectId, persona, config as unknown as BrowserSessionLoginConfig, targetOrigin, signal, tenantId)
     }
 
     const { email, password } = readLoginCredentialFile(persona.secretPath, {
@@ -1852,7 +2307,7 @@ export class PersonaAuthManager {
     if ((config.adapter as string) === 'oidc') {
       adapter = 'oidc'
     } else if (config.adapter === 'auto') {
-      const inspected = await this.inspectTargetOrigin(targetOrigin, persona.originAllowlist, signal)
+      const inspected = await this.inspectTargetOrigin(targetOrigin, persona.originAllowlist, signal, config.loginUrl, tenantId)
       if (config.loginUrl && (/\/auth\/v1\/token\b/i.test(config.loginUrl) || isHostedSupabaseHost(config.loginUrl))) {
         adapter = 'supabase'
         detectedSupabase = { origin: inspected.supabaseOrigin, apiKey: inspected.supabaseAnonKey }
@@ -1879,20 +2334,20 @@ export class PersonaAuthManager {
     switch (adapter) {
       /** @deprecated Prefer universal `browser_session` for SSO / OIDC / MFA apps. Kept for backward compatibility. */
       case 'oidc':
-        return await this.authenticateOidc(persona, config, email, password, targetOrigin, signal)
+        return await this.authenticateOidc(persona, config, email, password, targetOrigin, signal, tenantId)
       /** @deprecated Prefer universal `browser_session` for Clerk apps. Kept for backward compatibility. */
       case 'clerk':
-        return await this.authenticateClerk(persona, config, email, password, targetOrigin, detectedClerkFapiOrigin, signal)
+        return await this.authenticateClerk(persona, config, email, password, targetOrigin, detectedClerkFapiOrigin, signal, tenantId)
       /** @deprecated Prefer universal `browser_session` for Clerk apps. Kept for backward compatibility. */
       case 'clerk_client':
-        return await this.authenticateClerkClientCookie(persona, config, password, targetOrigin, signal)
+        return await this.authenticateClerkClientCookie(persona, config, password, targetOrigin, signal, tenantId)
       /** @deprecated Prefer universal `browser_session` for Supabase apps. Kept for backward compatibility. */
       case 'supabase':
-        return await this.authenticateSupabase(persona, config, email, password, targetOrigin, detectedSupabase, signal)
+        return await this.authenticateSupabase(persona, config, email, password, targetOrigin, detectedSupabase, signal, tenantId)
       case 'json':
-        return await this.authenticateJson(persona, config, email, password, targetOrigin, signal)
+        return await this.authenticateJson(persona, config, email, password, targetOrigin, signal, tenantId)
       case 'form':
-        return await this.authenticateForm(persona, config, email, password, targetOrigin)
+        return await this.authenticateForm(persona, config, email, password, targetOrigin, signal, tenantId)
     }
   }
 
@@ -1910,8 +2365,10 @@ export class PersonaAuthManager {
     config: BrowserSessionLoginConfig,
     targetOrigin: string,
     signal?: AbortSignal,
+    tenantId?: string | null,
   ): Promise<AuthenticateResult> {
     const project = storage.project(projectId)
+    const effectiveTenantId = tenantId !== undefined ? tenantId : (project.tenantId ?? null)
     const allowLocalLab = project.environment === 'local-lab' && isLocalLabEnvEnabled()
     const verifyPath = (() => {
       if (typeof config.verifyPath === 'string' && config.verifyPath.startsWith('/')) {
@@ -1930,29 +2387,45 @@ export class PersonaAuthManager {
       return '/'
     })()
 
-    const runRefreshOnce = async (innerSignal?: AbortSignal) => {
-      const { bundle } = readBrowserSessionCredentialFile(persona.secretPath!)
-      try {
-        const refreshed = await refreshBrowserSession({
-          storageState: bundle.storageState,
-          targetOrigin,
-          originAllowlist: persona.originAllowlist,
-          verifyPath,
-          allowLocalLab,
-          priorObservedHeaders: bundle.observedHeaders,
-          persistBundlePath: persona.secretPath!,
-          signal: innerSignal,
-          resolveHost: this.resolveHost,
-        })
-        writePersonaSessionFile(persona.sessionPath!, refreshed.session)
-        return refreshed
-      } catch (err) {
-        if (err instanceof PersonaAuthError) throw err
-        throw new PersonaAuthError(
-          'AUTH_FAILED',
-          err instanceof Error ? err.message : 'Browser session refresh failed.',
-        )
+    let refreshInFlight: Promise<Awaited<ReturnType<typeof refreshBrowserSession>>> | null = null
+    const runRefreshOnce = (innerSignal?: AbortSignal) => {
+      this.killSwitch.assertAllowed(effectiveTenantId)
+      if (innerSignal?.aborted) {
+        return Promise.reject(innerSignal.reason instanceof Error ? innerSignal.reason : new PersonaAuthError('AUTH_FAILED', 'Browser session refresh aborted.'))
       }
+      if (refreshInFlight) return refreshInFlight
+      const task = (async () => {
+        const ksBound = this.killSwitch.bindSignal(innerSignal ?? new AbortController().signal, effectiveTenantId)
+        try {
+          const { bundle } = readBrowserSessionCredentialFile(persona.secretPath!)
+          const refreshed = await refreshBrowserSession({
+            storageState: bundle.storageState,
+            targetOrigin,
+            originAllowlist: persona.originAllowlist,
+            verifyPath,
+            allowLocalLab,
+            priorObservedHeaders: bundle.observedHeaders,
+            persistBundlePath: persona.secretPath!,
+            signal: ksBound.signal,
+            resolveHost: this.resolveHost,
+          })
+          writePersonaSessionFile(persona.sessionPath!, refreshed.session)
+          return refreshed
+        } catch (err) {
+          if (err instanceof KillSwitchTrippedError) throw err
+          if (this.killSwitch.isActive(effectiveTenantId)) this.killSwitch.assertAllowed(effectiveTenantId)
+          if (err instanceof PersonaAuthError) throw err
+          throw new PersonaAuthError(
+            'AUTH_FAILED',
+            err instanceof Error ? err.message : 'Browser session refresh failed.',
+          )
+        } finally {
+          ksBound.release()
+          refreshInFlight = null
+        }
+      })()
+      refreshInFlight = task
+      return task
     }
 
     const initial = await runRefreshOnce(signal)
@@ -1974,8 +2447,8 @@ export class PersonaAuthManager {
       headerType: initial.session.headerType,
       ...(initial.expiresAt ? { expiresAt: initial.expiresAt } : {}),
       refreshIntervalSec,
-      refresh: async () => {
-        await runRefreshOnce()
+      refresh: async (refreshSignal?: AbortSignal) => {
+        await runRefreshOnce(refreshSignal)
       },
       session: initial.session,
     }
@@ -1987,6 +2460,7 @@ export class PersonaAuthManager {
     targetOrigin: string,
     detectedFapiOrigin: string | null,
     signal?: AbortSignal,
+    tenantId?: string | null,
   ): Promise<string> {
     const allowlist = persona.originAllowlist
     let operatorOriginFallback: string | null = null
@@ -2006,7 +2480,7 @@ export class PersonaAuthManager {
       }
     }
     if (detectedFapiOrigin && isClerkCredentialHost(detectedFapiOrigin, allowlist, config.loginUrl)) return detectedFapiOrigin
-    const inspected = await this.inspectTargetOrigin(targetOrigin, allowlist, signal)
+    const inspected = await this.inspectTargetOrigin(targetOrigin, allowlist, signal, config.loginUrl, tenantId)
     if (inspected.clerkFapiOrigin) return inspected.clerkFapiOrigin
     if (operatorOriginFallback) return operatorOriginFallback
     // Only the target origin's registrable domain may host its Clerk instance, and only when the
@@ -2064,89 +2538,111 @@ export class PersonaAuthManager {
     authHeaderToken?: string
     email: string
     extraSecrets?: readonly string[]
+    tenantId?: string | null
   }): {
-    mintFreshToken: () => Promise<{ jwt: string; expiresAt: number }>
+    mintFreshToken: (signal?: AbortSignal) => Promise<{ jwt: string; expiresAt: number }>
     getClientCookie: () => string
   } {
     let clientCookie = params.initialClientCookie
     let jwt = ''
+    let inFlight: Promise<{ jwt: string; expiresAt: number }> | null = null
     const extraSecrets = (params.extraSecrets ?? []).filter(Boolean)
 
-    const mintFreshToken = async (): Promise<{ jwt: string; expiresAt: number }> => {
-      if (!params.sessionId) {
-        throw new PersonaAuthError('AUTH_FAILED', 'Clerk sign-in did not return a session ID for token refresh.')
-      }
-      const tokenHeaders: Record<string, string> = {
-        Accept: 'application/json',
-        Origin: params.targetOrigin,
-      }
-      if (clientCookie) tokenHeaders.Cookie = `__client=${clientCookie}`
-      else if (params.authHeaderToken) tokenHeaders.Authorization = params.authHeaderToken
-
-      const tokenUrl = `${params.fapiOrigin}/v1/client/sessions/${encodeURIComponent(params.sessionId)}/tokens`
-      const tokenTarget = await this.assertCredentialTarget(tokenUrl, params.clerkAllowlist, 'Clerk token URL')
-      const tokRes = await this.credentialFetch(
-        tokenUrl,
-        { method: 'POST', headers: tokenHeaders },
-        tokenTarget,
-      )
-      const tokText = await tokRes.text()
-      rejectUnexpectedRedirect(tokRes, 'Clerk token refresh')
-      let tokJson: Record<string, unknown> = {}
-      let tokParsed = false
-      try {
-        tokJson = tokText ? (JSON.parse(tokText) as Record<string, unknown>) : {}
-        tokParsed = true
-      } catch {
-        // Non-JSON response checked below
-      }
-      if (!tokParsed) {
-        checkResponseForCaptchaOrMfa(tokText, params.fapiOrigin, params.email)
-      }
-      const tokErrors = Array.isArray(tokJson.errors) ? (tokJson.errors as Array<Record<string, unknown>>) : []
-      for (const errObj of tokErrors) {
-        const joined = `${String(errObj.code ?? '')} ${String(errObj.message ?? '')} ${String(errObj.long_message ?? '')}`
-        checkResponseForCaptchaOrMfa(joined, params.fapiOrigin, params.email)
-      }
-      if (!tokRes.ok) {
-        throw new PersonaAuthError(
-          'AUTH_FAILED',
-          `Clerk token refresh failed (${tokRes.status}): ${sanitizeErrorText(tokText, [...extraSecrets, clientCookie, jwt])}`,
+    const mintFreshToken = (refreshSignal?: AbortSignal): Promise<{ jwt: string; expiresAt: number }> => {
+      this.killSwitch.assertAllowed(params.tenantId ?? null)
+      if (refreshSignal?.aborted) {
+        return Promise.reject(
+          refreshSignal.reason instanceof Error
+            ? refreshSignal.reason
+            : new PersonaAuthError('AUTH_FAILED', 'Clerk token refresh aborted.'),
         )
       }
-      if (!tokParsed) {
-        throw new PersonaAuthError('AUTH_FAILED', 'Clerk token refresh returned non-JSON response.')
-      }
-      const rotatedCookies = extractSetCookies(tokRes.headers)
-      const rotatedClient = rotatedCookies.get('__client')
-      const previousClientCookie = clientCookie
-      if (rotatedClient) clientCookie = rotatedClient
+      if (inFlight) return inFlight
+      const task = (async (): Promise<{ jwt: string; expiresAt: number }> => {
+        try {
+          if (!params.sessionId) {
+            throw new PersonaAuthError('AUTH_FAILED', 'Clerk sign-in did not return a session ID for token refresh.')
+          }
+          const tokenHeaders: Record<string, string> = {
+            Accept: 'application/json',
+            Origin: params.targetOrigin,
+          }
+          if (clientCookie) tokenHeaders.Cookie = `__client=${clientCookie}`
+          else if (params.authHeaderToken) tokenHeaders.Authorization = params.authHeaderToken
 
-      const freshJwt = typeof tokJson.jwt === 'string' ? tokJson.jwt : ''
-      if (!freshJwt) {
-        throw new PersonaAuthError('AUTH_FAILED', 'Clerk token refresh response did not contain a JWT.')
-      }
-      const claims = decodeJwtPayload(freshJwt)
-      const iat = claims?.iat ?? Math.floor(Date.now() / 1000)
-      const expiresAt = claims?.exp ? claims.exp * 1000 : Date.now() + 55_000
-      const cookieHeader = `__session=${freshJwt}; __client_uat=${iat}`
-      const scrubTokens = [
-        freshJwt,
-        previousClientCookie,
-        clientCookie,
-        rotatedClient ?? '',
-        params.authHeaderToken ?? '',
-        ...extraSecrets,
-      ].filter(Boolean)
-      writePersonaSessionFile(params.persona.sessionPath!, {
-        headerType: 'cookie',
-        value: cookieHeader,
-        expiresAt,
-        adapterUsed: 'clerk',
-        scrubTokens,
-      })
-      jwt = freshJwt
-      return { jwt: freshJwt, expiresAt }
+          const tokenUrl = `${params.fapiOrigin}/v1/client/sessions/${encodeURIComponent(params.sessionId)}/tokens`
+          const tokenTarget = await this.assertCredentialTarget(tokenUrl, params.clerkAllowlist, 'Clerk token URL')
+          const tokRes = await this.credentialFetch(
+            tokenUrl,
+            { method: 'POST', headers: tokenHeaders },
+            tokenTarget,
+            refreshSignal,
+            this.timeoutMs,
+            params.tenantId,
+          )
+          const tokText = await tokRes.text()
+          rejectUnexpectedRedirect(tokRes, 'Clerk token refresh')
+          let tokJson: Record<string, unknown> = {}
+          let tokParsed = false
+          try {
+            tokJson = tokText ? (JSON.parse(tokText) as Record<string, unknown>) : {}
+            tokParsed = true
+          } catch {
+            // Non-JSON response checked below
+          }
+          if (!tokParsed) {
+            checkResponseForCaptchaOrMfa(tokText, params.fapiOrigin, params.email)
+          }
+          const tokErrors = Array.isArray(tokJson.errors) ? (tokJson.errors as Array<Record<string, unknown>>) : []
+          for (const errObj of tokErrors) {
+            const joined = `${String(errObj.code ?? '')} ${String(errObj.message ?? '')} ${String(errObj.long_message ?? '')}`
+            checkResponseForCaptchaOrMfa(joined, params.fapiOrigin, params.email)
+          }
+          if (!tokRes.ok) {
+            throw new PersonaAuthError(
+              'AUTH_FAILED',
+              `Clerk token refresh failed (${tokRes.status}): ${sanitizeErrorText(tokText, [...extraSecrets, clientCookie, jwt])}`,
+            )
+          }
+          if (!tokParsed) {
+            throw new PersonaAuthError('AUTH_FAILED', 'Clerk token refresh returned non-JSON response.')
+          }
+          const rotatedCookies = extractSetCookies(tokRes.headers)
+          const rotatedClient = rotatedCookies.get('__client')
+          const previousClientCookie = clientCookie
+          if (rotatedClient) clientCookie = rotatedClient
+
+          const freshJwt = typeof tokJson.jwt === 'string' ? tokJson.jwt : ''
+          if (!freshJwt) {
+            throw new PersonaAuthError('AUTH_FAILED', 'Clerk token refresh response did not contain a JWT.')
+          }
+          const claims = decodeJwtPayload(freshJwt)
+          const iat = claims?.iat ?? Math.floor(Date.now() / 1000)
+          const expiresAt = claims?.exp ? claims.exp * 1000 : Date.now() + 55_000
+          const cookieHeader = `__session=${freshJwt}; __client_uat=${iat}`
+          const scrubTokens = [
+            freshJwt,
+            previousClientCookie,
+            clientCookie,
+            rotatedClient ?? '',
+            params.authHeaderToken ?? '',
+            ...extraSecrets,
+          ].filter(Boolean)
+          writePersonaSessionFile(params.persona.sessionPath!, {
+            headerType: 'cookie',
+            value: cookieHeader,
+            expiresAt,
+            adapterUsed: 'clerk',
+            scrubTokens,
+          })
+          jwt = freshJwt
+          return { jwt: freshJwt, expiresAt }
+        } finally {
+          inFlight = null
+        }
+      })()
+      inFlight = task
+      return task
     }
 
     return {
@@ -2161,6 +2657,7 @@ export class PersonaAuthManager {
     rawClientCookie: string,
     targetOrigin: string,
     signal?: AbortSignal,
+    tenantId?: string | null,
   ): Promise<AuthenticateResult> {
     const initialClientCookie = normalizeClerkClientCookie(rawClientCookie)
     if (!initialClientCookie) {
@@ -2170,7 +2667,7 @@ export class PersonaAuthManager {
       )
     }
 
-    const fapiOrigin = await this.resolveClerkFapiOrigin(persona, config, targetOrigin, null, signal)
+    const fapiOrigin = await this.resolveClerkFapiOrigin(persona, config, targetOrigin, null, signal, tenantId)
     if (!isClerkCredentialHost(fapiOrigin, persona.originAllowlist, config.loginUrl)) {
       throw new PersonaAuthError('AUTH_FAILED', `Clerk Frontend API host ${fapiOrigin} is outside the persona origin allowlist.`)
     }
@@ -2190,6 +2687,8 @@ export class PersonaAuthManager {
       },
       clientTarget,
       signal,
+      this.timeoutMs,
+      tenantId,
     )
 
     const rawText = await res.text()
@@ -2263,9 +2762,10 @@ export class PersonaAuthManager {
       initialClientCookie: effectiveClientCookie,
       email: actorLabel,
       extraSecrets: [rawClientCookie, initialClientCookie, effectiveClientCookie],
+      tenantId,
     })
 
-    const { expiresAt } = await mintFreshToken()
+    const { expiresAt } = await mintFreshToken(signal)
     const refreshIntervalSec = config.refreshIntervalSec ?? DEFAULT_CLERK_REFRESH_SEC
     return {
       personaId: persona.id,
@@ -2274,7 +2774,7 @@ export class PersonaAuthManager {
       headerType: 'cookie',
       expiresAt,
       refreshIntervalSec,
-      refresh: async () => { await mintFreshToken() },
+      refresh: async (refreshSignal?: AbortSignal) => { await mintFreshToken(refreshSignal) },
     }
   }
 
@@ -2286,8 +2786,9 @@ export class PersonaAuthManager {
     targetOrigin: string,
     detectedClerkFapiOrigin: string | null,
     signal?: AbortSignal,
+    tenantId?: string | null,
   ): Promise<AuthenticateResult> {
-    const fapiOrigin = await this.resolveClerkFapiOrigin(persona, config, targetOrigin, detectedClerkFapiOrigin, signal)
+    const fapiOrigin = await this.resolveClerkFapiOrigin(persona, config, targetOrigin, detectedClerkFapiOrigin, signal, tenantId)
     const clerkAllowlist = this.clerkFapiAllowlist(persona, config, fapiOrigin)
     const signInUrl = `${fapiOrigin}/v1/client/sign_ins`
     const signInTarget = await this.assertCredentialTarget(signInUrl, clerkAllowlist, 'Clerk sign-in URL')
@@ -2310,6 +2811,8 @@ export class PersonaAuthManager {
       },
       signInTarget,
       signal,
+      this.timeoutMs,
+      tenantId,
     )
 
     const rawText = await res.text()
@@ -2392,6 +2895,7 @@ export class PersonaAuthManager {
       authHeaderToken,
       email,
       extraSecrets: [password],
+      tenantId,
     })
 
     let expiresAt: number
@@ -2402,7 +2906,7 @@ export class PersonaAuthManager {
           `Clerk sign-in succeeded (status=${statusStr || 'unknown'}) but returned no __session JWT or refreshable __client session.`,
         )
       }
-      const minted = await mintFreshToken()
+      const minted = await mintFreshToken(signal)
       jwt = minted.jwt
       expiresAt = minted.expiresAt
     } else {
@@ -2429,7 +2933,7 @@ export class PersonaAuthManager {
       headerType: 'cookie',
       expiresAt,
       refreshIntervalSec: canRefresh ? refreshIntervalSec : undefined,
-      refresh: canRefresh ? async () => { await mintFreshToken() } : undefined,
+      refresh: canRefresh ? async (refreshSignal?: AbortSignal) => { await mintFreshToken(refreshSignal) } : undefined,
     }
   }
 
@@ -2437,13 +2941,12 @@ export class PersonaAuthManager {
     persona: ResolvedPersona,
     config: PersonaLoginConfig,
     loginUrl: string,
-    discoveredOrigin: string | null,
   ): readonly string[] {
     try {
       const parsed = new URL(loginUrl)
       if (
         isHostedSupabaseHost(parsed.origin) &&
-        isSupabaseCredentialHost(parsed.origin, persona.originAllowlist, config.loginUrl, discoveredOrigin)
+        isSupabaseCredentialHost(parsed.origin, persona.originAllowlist, config.loginUrl)
       ) {
         return [...persona.originAllowlist, parsed.origin]
       }
@@ -2461,6 +2964,7 @@ export class PersonaAuthManager {
     targetOrigin: string,
     detectedSupabase?: { origin: string | null; apiKey: string | null },
     signal?: AbortSignal,
+    tenantId?: string | null,
   ): Promise<AuthenticateResult> {
     const ext = config as PersonaLoginConfig & {
       apikey?: string
@@ -2489,7 +2993,7 @@ export class PersonaAuthManager {
     let discoveredOrigin = detectedSupabase?.origin ?? null
     let discoveredApiKey = detectedSupabase?.apiKey ?? null
     if (!detectedSupabase && (!explicitApiKey || !config.loginUrl)) {
-      const inspected = await this.inspectTargetOrigin(targetOrigin, persona.originAllowlist, signal)
+      const inspected = await this.inspectTargetOrigin(targetOrigin, persona.originAllowlist, signal, config.loginUrl, tenantId)
       discoveredOrigin = inspected.supabaseOrigin
       discoveredApiKey = inspected.supabaseAnonKey
     }
@@ -2509,14 +3013,14 @@ export class PersonaAuthManager {
       loginUrl = parsed.toString()
     } else if (
       discoveredOrigin &&
-      isSupabaseCredentialHost(discoveredOrigin, persona.originAllowlist, config.loginUrl, discoveredOrigin)
+      isSupabaseCredentialHost(discoveredOrigin, persona.originAllowlist, config.loginUrl)
     ) {
       loginUrl = `${discoveredOrigin}/auth/v1/token?grant_type=password`
     } else {
       loginUrl = `${targetOrigin}/auth/v1/token?grant_type=password`
     }
 
-    const supabaseAllowlist = this.supabaseAuthAllowlist(persona, config, loginUrl, discoveredOrigin)
+    const supabaseAllowlist = this.supabaseAuthAllowlist(persona, config, loginUrl)
     const loginTarget = await this.assertCredentialTarget(loginUrl, supabaseAllowlist, 'Supabase login URL')
     const baseHeaders: Record<string, string> = {
       ...safeCustomHeaders,
@@ -2534,6 +3038,8 @@ export class PersonaAuthManager {
       },
       loginTarget,
       signal,
+      this.timeoutMs,
+      tenantId,
     )
 
     const rawText = await res.text()
@@ -2581,40 +3087,61 @@ export class PersonaAuthManager {
     const refreshUrl = refreshUrlObj.toString()
 
     const refreshIntervalSec = config.refreshIntervalSec ?? Math.max(15, Math.min(1800, Math.floor(expiresInSec * 0.75)))
-    const doRefresh = async () => {
-      if (!refreshToken) return
-      const refreshTarget = await this.assertCredentialTarget(refreshUrl, supabaseAllowlist, 'Supabase refresh URL')
-      const rRes = await this.credentialFetch(
-        refreshUrl,
-        {
-          method: 'POST',
-          headers: baseHeaders,
-          body: JSON.stringify({ refresh_token: refreshToken }),
-        },
-        refreshTarget,
-      )
-      const rText = await rRes.text()
-      rejectUnexpectedRedirect(rRes, 'Supabase token refresh')
-      checkResponseForCaptchaOrMfa(rText, refreshUrl, email)
-      if (!rRes.ok) {
-        throw new PersonaAuthError('AUTH_FAILED', `Supabase token refresh failed (${rRes.status}): ${sanitizeErrorText(rText, [password, refreshToken])}`)
+    let refreshInFlight: Promise<void> | null = null
+    const doRefresh = (refreshSignal?: AbortSignal): Promise<void> => {
+      this.killSwitch.assertAllowed(tenantId ?? null)
+      if (refreshSignal?.aborted) {
+        return Promise.reject(
+          refreshSignal.reason instanceof Error
+            ? refreshSignal.reason
+            : new PersonaAuthError('AUTH_FAILED', 'Supabase token refresh aborted.'),
+        )
       }
-      const rBody = JSON.parse(rText) as Record<string, unknown>
-      const nextAccess = typeof rBody.access_token === 'string' ? rBody.access_token : ''
-      if (!nextAccess) throw new PersonaAuthError('AUTH_FAILED', 'Supabase refresh response missing access_token.')
-      const nextRefresh = typeof rBody.refresh_token === 'string' && rBody.refresh_token ? rBody.refresh_token : refreshToken
-      const nextExpIn = typeof rBody.expires_in === 'number' && rBody.expires_in > 0 ? rBody.expires_in : expiresInSec
-      const nextExpiresAt = typeof rBody.expires_at === 'number'
-        ? rBody.expires_at * 1000
-        : Date.now() + nextExpIn * 1000
-      refreshToken = nextRefresh
-      writePersonaSessionFile(persona.sessionPath!, {
-        headerType: 'bearer',
-        value: nextAccess,
-        expiresAt: nextExpiresAt,
-        adapterUsed: 'supabase',
-        scrubTokens: [nextAccess, nextRefresh].filter(Boolean),
-      })
+      if (!refreshToken) return Promise.resolve()
+      if (refreshInFlight) return refreshInFlight
+      const task = (async () => {
+        try {
+          const refreshTarget = await this.assertCredentialTarget(refreshUrl, supabaseAllowlist, 'Supabase refresh URL')
+          const rRes = await this.credentialFetch(
+            refreshUrl,
+            {
+              method: 'POST',
+              headers: baseHeaders,
+              body: JSON.stringify({ refresh_token: refreshToken }),
+            },
+            refreshTarget,
+            refreshSignal,
+            this.timeoutMs,
+            tenantId,
+          )
+          const rText = await rRes.text()
+          rejectUnexpectedRedirect(rRes, 'Supabase token refresh')
+          checkResponseForCaptchaOrMfa(rText, refreshUrl, email)
+          if (!rRes.ok) {
+            throw new PersonaAuthError('AUTH_FAILED', `Supabase token refresh failed (${rRes.status}): ${sanitizeErrorText(rText, [password, refreshToken])}`)
+          }
+          const rBody = JSON.parse(rText) as Record<string, unknown>
+          const nextAccess = typeof rBody.access_token === 'string' ? rBody.access_token : ''
+          if (!nextAccess) throw new PersonaAuthError('AUTH_FAILED', 'Supabase refresh response missing access_token.')
+          const nextRefresh = typeof rBody.refresh_token === 'string' && rBody.refresh_token ? rBody.refresh_token : refreshToken
+          const nextExpIn = typeof rBody.expires_in === 'number' && rBody.expires_in > 0 ? rBody.expires_in : expiresInSec
+          const nextExpiresAt = typeof rBody.expires_at === 'number'
+            ? rBody.expires_at * 1000
+            : Date.now() + nextExpIn * 1000
+          refreshToken = nextRefresh
+          writePersonaSessionFile(persona.sessionPath!, {
+            headerType: 'bearer',
+            value: nextAccess,
+            expiresAt: nextExpiresAt,
+            adapterUsed: 'supabase',
+            scrubTokens: [nextAccess, nextRefresh].filter(Boolean),
+          })
+        } finally {
+          refreshInFlight = null
+        }
+      })()
+      refreshInFlight = task
+      return task
     }
 
     return {
@@ -2635,6 +3162,7 @@ export class PersonaAuthManager {
     password: string,
     targetOrigin: string,
     signal?: AbortSignal,
+    tenantId?: string | null,
   ): Promise<AuthenticateResult> {
     // Optional v5 session-hardening knobs (accepted structurally so older persisted configs stay valid).
     const ext = config as PersonaLoginConfig & {
@@ -2660,6 +3188,7 @@ export class PersonaAuthManager {
           csrfTarget,
           signal,
           Math.min(this.timeoutMs, 8_000),
+          tenantId,
         )
         const csrfText = (await csrfRes.text()).slice(0, 100_000)
         checkResponseForCaptchaOrMfa(csrfText, ext.csrfPrefetchUrl, email)
@@ -2680,6 +3209,7 @@ export class PersonaAuthManager {
         }
         if (token) loginHeaders['X-CSRF-Token'] = token
       } catch (err) {
+        if (err instanceof KillSwitchTrippedError) throw err
         if (err instanceof PersonaAuthError) throw err
         // Pre-fetch is best-effort; the login itself remains authoritative.
       }
@@ -2695,6 +3225,8 @@ export class PersonaAuthManager {
       },
       loginTarget,
       signal,
+      this.timeoutMs,
+      tenantId,
     )
 
     const rawText = await res.text()
@@ -2728,36 +3260,57 @@ export class PersonaAuthManager {
       const claims = decodeJwtPayload(token)
       const expiresAt = claims?.exp ? claims.exp * 1000 : undefined
       let currentRefreshToken = refreshToken
+      let refreshInFlight: Promise<void> | null = null
       const doRefresh = refreshUrl && refreshToken
-        ? async () => {
-            const refreshTarget = await this.assertCredentialTarget(refreshUrl, persona.originAllowlist, 'JSON refresh URL')
-            const rr = await this.credentialFetch(
-              refreshUrl,
-              {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-                body: JSON.stringify({ refresh_token: currentRefreshToken }),
-              },
-              refreshTarget,
-            )
-            const rt = await rr.text()
-            rejectUnexpectedRedirect(rr, 'JSON refresh')
-            if (!rr.ok) {
-              throw new PersonaAuthError('AUTH_FAILED', `JSON refresh failed (${rr.status}): ${sanitizeErrorText(rt.slice(0, 160), [currentRefreshToken ?? '', password])}`)
+        ? (refreshSignal?: AbortSignal): Promise<void> => {
+            this.killSwitch.assertAllowed(tenantId ?? null)
+            if (refreshSignal?.aborted) {
+              return Promise.reject(
+                refreshSignal.reason instanceof Error
+                  ? refreshSignal.reason
+                  : new PersonaAuthError('AUTH_FAILED', 'JSON token refresh aborted.'),
+              )
             }
-            let rb: unknown = null
-            try { rb = rt ? JSON.parse(rt) : null } catch { rb = null }
-            const nextToken = rb ? getJsonPath(rb, tokenPath) : null
-            if (!nextToken) throw new PersonaAuthError('AUTH_FAILED', 'JSON refresh response missing access token.')
-            const nextRefresh = rb ? getJsonPath(rb, refreshTokenPath) : null
-            currentRefreshToken = nextRefresh ?? currentRefreshToken
-            writePersonaSessionFile(persona.sessionPath!, {
-              headerType: 'bearer',
-              value: nextToken,
-              expiresAt: decodeJwtPayload(nextToken)?.exp ? decodeJwtPayload(nextToken)!.exp! * 1000 : undefined,
-              adapterUsed: 'json',
-              scrubTokens: [nextToken, currentRefreshToken ?? '', ...scrub],
-            })
+            if (refreshInFlight) return refreshInFlight
+            const task = (async () => {
+              try {
+                const refreshTarget = await this.assertCredentialTarget(refreshUrl, persona.originAllowlist, 'JSON refresh URL')
+                const rr = await this.credentialFetch(
+                  refreshUrl,
+                  {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+                    body: JSON.stringify({ refresh_token: currentRefreshToken }),
+                  },
+                  refreshTarget,
+                  refreshSignal,
+                  this.timeoutMs,
+                  tenantId,
+                )
+                const rt = await rr.text()
+                rejectUnexpectedRedirect(rr, 'JSON refresh')
+                if (!rr.ok) {
+                  throw new PersonaAuthError('AUTH_FAILED', `JSON refresh failed (${rr.status}): ${sanitizeErrorText(rt.slice(0, 160), [currentRefreshToken ?? '', password])}`)
+                }
+                let rb: unknown = null
+                try { rb = rt ? JSON.parse(rt) : null } catch { rb = null }
+                const nextToken = rb ? getJsonPath(rb, tokenPath) : null
+                if (!nextToken) throw new PersonaAuthError('AUTH_FAILED', 'JSON refresh response missing access token.')
+                const nextRefresh = rb ? getJsonPath(rb, refreshTokenPath) : null
+                currentRefreshToken = nextRefresh ?? currentRefreshToken
+                writePersonaSessionFile(persona.sessionPath!, {
+                  headerType: 'bearer',
+                  value: nextToken,
+                  expiresAt: decodeJwtPayload(nextToken)?.exp ? decodeJwtPayload(nextToken)!.exp! * 1000 : undefined,
+                  adapterUsed: 'json',
+                  scrubTokens: [nextToken, currentRefreshToken ?? '', ...scrub],
+                })
+              } finally {
+                refreshInFlight = null
+              }
+            })()
+            refreshInFlight = task
+            return task
           }
         : undefined
       writePersonaSessionFile(persona.sessionPath!, {
@@ -2846,7 +3399,12 @@ export class PersonaAuthManager {
     password: string,
     targetOrigin: string,
     signal?: AbortSignal,
+    tenantId?: string | null,
   ): Promise<AuthenticateResult> {
+    this.killSwitch.assertAllowed(tenantId ?? null)
+    if (signal?.aborted) {
+      throw (signal.reason instanceof Error ? signal.reason : new PersonaAuthError('AUTH_FAILED', 'OIDC login aborted.'))
+    }
     const ext = config as PersonaLoginConfig & {
       authOrigins?: string[]
       totpSeed?: string
@@ -3252,7 +3810,13 @@ export class PersonaAuthManager {
     email: string,
     password: string,
     targetOrigin: string,
+    signal?: AbortSignal,
+    tenantId?: string | null,
   ): Promise<AuthenticateResult> {
+    this.killSwitch.assertAllowed(tenantId ?? null)
+    if (signal?.aborted) {
+      throw (signal.reason instanceof Error ? signal.reason : new PersonaAuthError('AUTH_FAILED', 'Form login aborted.'))
+    }
     const loginUrl = config.loginUrl || `${targetOrigin}/login`
     // Form login types the password into this page: validate it exactly like an API credential
     // destination (allowlist + HTTPS, loopback only when explicitly allowlisted). Resolution is
@@ -3590,16 +4154,56 @@ export class PersonaAuthManager {
     this.stopRunRefreshers(runId)
     if (!approvedPersonaIds.length) return []
 
+    const project = storage.project(projectId)
+    const tenantId = project.tenantId ?? null
+    this.killSwitch.assertAllowed(tenantId)
+    if (signal?.aborted) {
+      throw (signal.reason instanceof Error ? signal.reason : new PersonaAuthError('AUTH_FAILED', 'Run authentication aborted.'))
+    }
+
     const resolved = resolveRunPersonas(storage, projectId, approvedPersonaIds)
     const loginPersonas = [...resolved.values()].filter(p => p.authKind === 'login')
     if (!loginPersonas.length) return []
+
+    const runController = new AbortController()
+    const releaseKillSwitch = this.killSwitch.registerAbortController(runController, tenantId)
+    let releaseOuterSignal: (() => void) | undefined
+    if (signal) {
+      if (signal.aborted) {
+        releaseKillSwitch()
+        runController.abort(signal.reason)
+        throw (signal.reason instanceof Error ? signal.reason : new PersonaAuthError('AUTH_FAILED', 'Run authentication aborted.'))
+      }
+      const onOuterAbort = () => {
+        runController.abort(signal.reason)
+        this.stopRunRefreshers(runId)
+      }
+      signal.addEventListener('abort', onOuterAbort, { once: true })
+      releaseOuterSignal = () => signal.removeEventListener('abort', onOuterAbort)
+    }
+    const onRunAbort = () => {
+      this.stopRunRefreshers(runId)
+    }
+    runController.signal.addEventListener('abort', onRunAbort, { once: true })
+    this.runControllers.set(runId, {
+      controller: runController,
+      releaseKillSwitch,
+      releaseOuterSignal: () => {
+        releaseOuterSignal?.()
+        runController.signal.removeEventListener('abort', onRunAbort)
+      },
+    })
 
     const results: AuthenticateResult[] = []
     const timers: NodeJS.Timeout[] = []
 
     try {
       for (const persona of loginPersonas) {
-        const result = await this.authenticatePersona(storage, projectId, persona.id, signal)
+        this.killSwitch.assertAllowed(tenantId)
+        if (runController.signal.aborted) {
+          throw (runController.signal.reason instanceof Error ? runController.signal.reason : new PersonaAuthError('AUTH_FAILED', 'Run authentication aborted.'))
+        }
+        const result = await this.authenticatePersona(storage, projectId, persona.id, runController.signal)
         results.push(result)
         const reauthRefresh = result.refresh
         const reloadSession = (): MintedPersonaSession | null => {
@@ -3609,28 +4213,43 @@ export class PersonaAuthManager {
             return null
           }
         }
-        const runRefresh = async (): Promise<MintedPersonaSession | null> => {
-          if (reauthRefresh) await reauthRefresh()
-          else await this.authenticatePersona(storage, projectId, persona.id, signal)
+        const runRefresh = async (refreshSignal?: AbortSignal): Promise<MintedPersonaSession | null> => {
+          this.killSwitch.assertAllowed(tenantId)
+          const effectiveSignal = refreshSignal && refreshSignal !== runController.signal
+            ? AbortSignal.any([runController.signal, refreshSignal])
+            : runController.signal
+          if (effectiveSignal.aborted) return null
+          if (reauthRefresh) await reauthRefresh(effectiveSignal)
+          else await this.authenticatePersona(storage, projectId, persona.id, effectiveSignal)
           return reloadSession()
+        }
+        const onRefreshError = (err: unknown) => {
+          if (err instanceof KillSwitchTrippedError) return
+          const safeMsg = sanitizeErrorText(err instanceof Error ? err.message : String(err), [persona.secret])
+          try {
+            storage.event(
+              runId,
+              'persona.refresh_failed',
+              `Session refresh warning for persona ${persona.handle}: ${safeMsg}`,
+              { personaId: persona.id, handle: persona.handle, adapter: result.adapterUsed },
+            )
+          } catch {
+            // Storage may have closed during shutdown.
+          }
         }
         const seeded = reloadSession() ?? result.session ?? null
         if (seeded) {
-          // v6 + H-22: per-worker clones coordinate a single-flight refresh with no 60 s lockout,
-          // keyed by `${runId}:${handle}` so concurrent runs never swap or clobber credentials.
+          // H-23: PersonaSessionPool is the SOLE single-flight refresh owner (shared by both
+          // periodic timers and on-demand 401/403/login-redirect reauths), keyed by `${runId}:${handle}`.
           this.registerSession(persona.handle, {
             session: seeded,
             allowlist: persona.originAllowlist,
             refresh: runRefresh,
             runId,
+            tenantId,
+            onRefreshError,
           }, runId)
         }
-        // Raw-handler registration is kept for embedders that call requestReauth() directly
-        // without the pool; pool-backed requests bypass this pacing entirely.
-        this.registerReauth(persona.handle, async () => {
-          const fresh = await runRefresh()
-          if (fresh) this.sessionPool.rotate(persona.handle, fresh, runId)
-        }, runId)
         storage.event(
           runId,
           'persona.authenticated',
@@ -3645,28 +4264,23 @@ export class PersonaAuthManager {
         )
 
         if (result.refresh && result.refreshIntervalSec && result.refreshIntervalSec > 0) {
-          let refreshing = false
           const intervalMs = result.refreshIntervalSec * 1000
-          const refreshFn = result.refresh
           const timer = setInterval(() => {
-            if (refreshing) return
-            refreshing = true
-            void refreshFn().catch(err => {
-              const safeMsg = sanitizeErrorText(err instanceof Error ? err.message : String(err), [persona.secret])
-              try {
-                storage.event(
-                  runId,
-                  'persona.refresh_failed',
-                  `Session refresh warning for persona ${persona.handle}: ${safeMsg}`,
-                  { personaId: persona.id, handle: persona.handle, adapter: result.adapterUsed },
-                )
-              } catch {
-                // Storage may have closed during shutdown.
+            if (runController.signal.aborted || this.killSwitch.isActive(tenantId)) {
+              this.stopRunRefreshers(runId)
+              return
+            }
+            // Route periodic refresh through PersonaSessionPool single-flight so a concurrent
+            // 401 reauth and timer tick NEVER replay the same rotating refresh token.
+            void this.sessionPool.refresh(persona.handle, undefined, runId, {
+              force: true,
+              signal: runController.signal,
+            }).catch(err => {
+              if (err instanceof KillSwitchTrippedError) {
+                this.stopRunRefreshers(runId)
+                return
               }
-            }).finally(() => {
-              refreshing = false
-              const latest = reloadSession()
-              if (latest) this.sessionPool.rotate(persona.handle, latest, runId)
+              onRefreshError(err)
             })
           }, intervalMs)
           timer.unref?.()
@@ -3675,14 +4289,184 @@ export class PersonaAuthManager {
       }
     } catch (err) {
       for (const t of timers) clearInterval(t)
-      this.sessionPool.unregisterRun(runId)
+      this.stopRunRefreshers(runId)
       throw err
     }
 
     if (timers.length > 0) {
-      this.runTimers.set(runId, timers)
+      if (runController.signal.aborted || this.killSwitch.isActive(tenantId)) {
+        for (const t of timers) clearInterval(t)
+        this.stopRunRefreshers(runId)
+      } else {
+        this.runTimers.set(runId, timers)
+      }
     }
     return results
+  }
+
+  /**
+   * H-23: Bootstrap ephemeral, short-lived persona sessions for post-completion retests
+   * (Verify Fix / Patch Gate 6) without mutating or leaking background timers on finished runs.
+   *
+   * When any required login persona cannot be freshly authenticated, returns
+   * `{ ready: false, inconclusive: true, unavailable, reason }` cleanly so callers report
+   * `inconclusive` instead of running against an expired `.session` and falsely declaring `fixed`.
+   */
+  async bootstrapEphemeralRunSessions(
+    storage: Store,
+    opts: EphemeralSessionBootstrapOptions,
+  ): Promise<EphemeralPersonaSessionHandle> {
+    const scopeId = normalizePoolRunId(opts.scopeId)
+    if (!scopeId) {
+      throw new PersonaAuthError('AUTH_FAILED', 'Ephemeral session bootstrap requires a non-empty scopeId.')
+    }
+    const project = storage.project(opts.projectId)
+    const tenantId = project.tenantId ?? null
+    this.killSwitch.assertAllowed(tenantId)
+    if (opts.signal?.aborted) {
+      throw (opts.signal.reason instanceof Error ? opts.signal.reason : new PersonaAuthError('AUTH_FAILED', 'Ephemeral session bootstrap aborted.'))
+    }
+
+    const resolved = resolveRunPersonas(storage, opts.projectId, opts.approvedPersonaIds)
+    const requiredSet = opts.requiredHandles?.length ? new Set(opts.requiredHandles) : null
+    const loginPersonas = [...resolved.values()].filter(
+      p => p.authKind === 'login' && (!requiredSet || requiredSet.has(p.handle)),
+    )
+    if (!loginPersonas.length) {
+      return {
+        scopeId,
+        ready: true,
+        authenticatedHandles: [],
+        unavailable: [],
+        inconclusive: false,
+        dispose: () => {
+          this.stopRunRefreshers(scopeId)
+        },
+      }
+    }
+
+    const controller = new AbortController()
+    const releaseKillSwitch = this.killSwitch.registerAbortController(controller, tenantId)
+    let releaseOuterSignal: (() => void) | undefined
+    if (opts.signal) {
+      const onAbort = () => controller.abort(opts.signal?.reason)
+      opts.signal.addEventListener('abort', onAbort, { once: true })
+      releaseOuterSignal = () => opts.signal?.removeEventListener('abort', onAbort)
+    }
+
+    let disposed = false
+    const dispose = () => {
+      if (disposed) return
+      disposed = true
+      releaseOuterSignal?.()
+      releaseKillSwitch()
+      if (!controller.signal.aborted) {
+        controller.abort(new Error('Ephemeral retest session disposed.'))
+      }
+      this.runControllers.delete(scopeId)
+      this.sessionPool.unregisterRun(scopeId)
+    }
+    this.runControllers.set(scopeId, { controller, releaseKillSwitch, releaseOuterSignal })
+
+    const authenticatedHandles: string[] = []
+    const unavailable: EphemeralPersonaSessionHandle['unavailable'] = []
+    const secrets = personaSecrets(resolved)
+
+    for (const persona of loginPersonas) {
+      this.killSwitch.assertAllowed(tenantId)
+      if (controller.signal.aborted) {
+        dispose()
+        throw (controller.signal.reason instanceof Error ? controller.signal.reason : new PersonaAuthError('AUTH_FAILED', 'Ephemeral session bootstrap aborted.'))
+      }
+      try {
+        const authRes = await this.authenticatePersona(storage, opts.projectId, persona.id, controller.signal)
+        const reloadSession = (): MintedPersonaSession | null => {
+          try {
+            return resolveRunPersonas(storage, opts.projectId, [persona.id]).get(persona.handle)?.session ?? null
+          } catch {
+            return null
+          }
+        }
+        const seeded = reloadSession() ?? authRes.session ?? null
+        if (!seeded) {
+          unavailable.push({
+            personaId: persona.id,
+            handle: persona.handle,
+            reason: `Authentication completed for "${persona.handle}" without a usable session.`,
+            code: 'AUTH_FAILED',
+          })
+          continue
+        }
+        const reauthRefresh = authRes.refresh
+        const runRefresh = async (refreshSignal?: AbortSignal): Promise<MintedPersonaSession | null> => {
+          this.killSwitch.assertAllowed(tenantId)
+          const effectiveSignal = refreshSignal && refreshSignal !== controller.signal
+            ? AbortSignal.any([controller.signal, refreshSignal])
+            : controller.signal
+          if (effectiveSignal.aborted) return null
+          if (reauthRefresh) await reauthRefresh(effectiveSignal)
+          else await this.authenticatePersona(storage, opts.projectId, persona.id, effectiveSignal)
+          return reloadSession()
+        }
+        this.registerSession(persona.handle, {
+          session: seeded,
+          allowlist: persona.originAllowlist,
+          refresh: runRefresh,
+          runId: scopeId,
+          tenantId,
+        }, scopeId)
+        authenticatedHandles.push(persona.handle)
+      } catch (err) {
+        if (err instanceof KillSwitchTrippedError) {
+          dispose()
+          throw err
+        }
+        const rawMsg = err instanceof Error ? err.message : String(err)
+        const safeReason = redact(rawMsg, secrets).slice(0, 320)
+        unavailable.push({
+          personaId: persona.id,
+          handle: persona.handle,
+          reason: safeReason,
+          ...(err instanceof PersonaAuthError ? { code: err.code } : {}),
+        })
+      }
+    }
+
+    if (unavailable.length > 0) {
+      const summary = unavailable.map(u => `${u.handle}: ${u.reason}`).join('; ')
+      return {
+        scopeId,
+        ready: false,
+        authenticatedHandles,
+        unavailable,
+        inconclusive: true,
+        reason: `Inconclusive: unable to refresh ephemeral retest session (${summary})`,
+        dispose,
+      }
+    }
+
+    return {
+      scopeId,
+      ready: true,
+      authenticatedHandles,
+      unavailable: [],
+      inconclusive: false,
+      dispose,
+    }
+  }
+
+  /** Run a post-completion retest callback inside an auto-disposed ephemeral session scope. */
+  async withEphemeralRunSessions<T>(
+    storage: Store,
+    opts: EphemeralSessionBootstrapOptions,
+    fn: (handle: EphemeralPersonaSessionHandle) => Promise<T>,
+  ): Promise<T> {
+    const handle = await this.bootstrapEphemeralRunSessions(storage, opts)
+    try {
+      return await fn(handle)
+    } finally {
+      handle.dispose()
+    }
   }
 
   stopRunRefreshers(runId: string): void {
@@ -3690,6 +4474,15 @@ export class PersonaAuthManager {
     if (timers) {
       for (const timer of timers) clearInterval(timer)
       this.runTimers.delete(runId)
+    }
+    const ctrl = this.runControllers.get(runId)
+    if (ctrl) {
+      this.runControllers.delete(runId)
+      ctrl.releaseOuterSignal?.()
+      ctrl.releaseKillSwitch()
+      if (!ctrl.controller.signal.aborted) {
+        ctrl.controller.abort(new Error(`Persona refreshers stopped for run ${runId}.`))
+      }
     }
     this.sessionPool.unregisterRun(runId)
     const prefix = `${runId}:`
@@ -3699,11 +4492,15 @@ export class PersonaAuthManager {
   }
 
   stopAll(): void {
-    for (const [runId, timers] of this.runTimers.entries()) {
-      for (const timer of timers) clearInterval(timer)
-      this.sessionPool.unregisterRun(runId)
+    const allRunIds = new Set<string>([
+      ...this.runTimers.keys(),
+      ...this.runControllers.keys(),
+    ])
+    for (const runId of allRunIds) {
+      this.stopRunRefreshers(runId)
     }
     this.runTimers.clear()
+    this.runControllers.clear()
     this.reauthHandlers.clear()
   }
 }

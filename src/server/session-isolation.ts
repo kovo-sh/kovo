@@ -153,7 +153,10 @@ export function cloneWorkerPersona(
     get value(): string {
       if (clone.isLoggedOut()) return ''
       const pool = livePoolSession()
-      if (pool) return pool.value
+      if (pool) {
+        clone.syncServedGeneration?.()
+        return pool.value
+      }
       return extractLiveHeaderValue(clone, persona.originAllowlist, base.headerType, fallbackHeaderName)?.value ?? ''
     },
     get adapterUsed(): string {
@@ -168,12 +171,17 @@ export function cloneWorkerPersona(
     get updatedAt(): number | undefined {
       return livePoolSession()?.updatedAt ?? base.updatedAt
     },
+    get generation(): number {
+      if (clone.isLoggedOut()) return 0
+      return clone.servedGeneration ?? clone.generation
+    },
     get bundle(): PersonaCredentialBundle {
       // A logged-out clone exposes no credential material at all: no cookies, headers, storage.
       if (clone.isLoggedOut()) return { v: 2 }
       const cookies = collectCookies()
       const pool = livePoolSession()
       if (pool) {
+        clone.syncServedGeneration?.()
         if (!pool.bundle) {
           return { v: 2, ...(cookies.length ? { cookies } : {}) }
         }

@@ -5,7 +5,9 @@ import { asc, eq } from 'drizzle-orm'
 import { isLocalLabEnvEnabled } from '../domain.ts'
 import type { RequestBroker } from './broker.ts'
 import { listMountedRepos, projectReposDir } from './github-connector.ts'
-import { PersonaAuthManager } from './persona-auth.ts'
+import { globalKillSwitch, KillSwitchTrippedError } from './kill-switch.ts'
+import type { GlobalKillSwitch } from './kill-switch.ts'
+import { detectSessionExpiry, PersonaAuthManager } from './persona-auth.ts'
 import { personaSecrets, refreshPersonaSession, resolveRunPersonas } from './persona-vault.ts'
 import { redact } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
@@ -312,6 +314,11 @@ export async function testPersonaAuth(
   authHint: string
 }> {
   const project = storage.project(input.projectId)
+  const tenantId = project.tenantId ?? null
+  const brokerKs = (broker as unknown as { options?: { killSwitch?: GlobalKillSwitch } })?.options?.killSwitch
+  const ks = brokerKs ?? personaAuth?.getKillSwitch() ?? globalKillSwitch
+  ks.assertAllowed(tenantId)
+
   const resolved = resolveRunPersonas(storage, project.id, [input.personaId])
   const persona = [...resolved.values()][0]
   if (!persona) throw new Error('Persona not found.')
@@ -329,12 +336,14 @@ export async function testPersonaAuth(
   const timeoutMs = persona.authKind === 'login' ? 60_000 : 20_000
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), timeoutMs)
+  const ksBound = ks.bindSignal(controller.signal, tenantId)
   try {
     let loginAdapterHint: string | null = null
     if (persona.authKind === 'login') {
-      const authManager = personaAuth ?? new PersonaAuthManager()
+      const authManager = personaAuth ?? new PersonaAuthManager({ killSwitch: ks })
       try {
-        const authRes = await authManager.authenticatePersona(storage, project.id, persona.id, controller.signal)
+        ks.assertAllowed(tenantId)
+        const authRes = await authManager.authenticatePersona(storage, project.id, persona.id, ksBound.signal)
         refreshPersonaSession(persona)
         if (authRes.adapterUsed === 'clerk') {
           loginAdapterHint = `Clerk (auto-refresh ${authRes.refreshIntervalSec ?? 35}s)`
@@ -342,19 +351,25 @@ export async function testPersonaAuth(
           loginAdapterHint = 'Supabase Auth'
         } else if (authRes.adapterUsed === 'json') {
           loginAdapterHint = 'JSON API'
+        } else if (authRes.adapterUsed === 'browser_session') {
+          loginAdapterHint = 'Browser Session'
         } else {
           loginAdapterHint = 'Browser Form'
         }
       } catch (err) {
+        if (err instanceof KillSwitchTrippedError) throw err
+        if (ks.isActive(tenantId)) ks.assertAllowed(tenantId)
         const safeSecrets = personaSecrets(resolved)
         const safeMsg = redact(err instanceof Error ? err.message : String(err), safeSecrets)
         throw new Error(safeMsg)
       }
     }
 
+    ks.assertAllowed(tenantId)
     const secrets = personaSecrets(resolved)
     const grant = {
       origin,
+      tenantId: project.tenantId,
       tier: 2 as const,
       maxRpsPerOrigin: 6,
       allowLocalLab: project.environment === 'local-lab' && isLocalLabEnvEnabled(),
@@ -373,7 +388,7 @@ export async function testPersonaAuth(
         followRedirects: false,
       },
       grant,
-      controller.signal,
+      ksBound.signal,
     )
 
     let res = firstAuthRes
@@ -381,9 +396,17 @@ export async function testPersonaAuth(
     let authRedirectPath: string | null = null
     let totalDurationMs = firstAuthRes.durationMs
     let headersLower = lowercaseHeaders(res.respHeaders)
+    const firstExpiry = detectSessionExpiry({
+      status: firstAuthRes.status,
+      headers: firstAuthRes.respHeaders,
+      body: firstAuthRes.body,
+      requestOrigin: origin,
+      loginUrl: persona.loginConfig?.loginUrl,
+    })
 
-    // Follow at most 1 same-origin redirect (e.g. GET / -> 302 /dashboard).
-    if (res.status >= 300 && res.status < 400 && headersLower['location']) {
+    // Follow at most 1 same-origin non-login redirect (e.g. GET / -> 302 /dashboard).
+    // Never follow a 3xx login redirect into a 200 sign-in page and misreport it as authenticated.
+    if (!firstExpiry.expired && res.status >= 300 && res.status < 400 && headersLower['location']) {
       const sameOriginNext = resolveSameOriginRedirectPath(origin, headersLower['location'])
       if (sameOriginNext && sameOriginNext !== initialPath) {
         authRedirectPath = sameOriginNext
@@ -397,13 +420,21 @@ export async function testPersonaAuth(
             followRedirects: false,
           },
           grant,
-          controller.signal,
+          ksBound.signal,
         )
         res = hopped
         totalDurationMs += hopped.durationMs
         headersLower = lowercaseHeaders(res.respHeaders)
       }
     }
+
+    const finalExpiry = detectSessionExpiry({
+      status: res.status,
+      headers: res.respHeaders,
+      body: res.body,
+      requestOrigin: origin,
+      loginUrl: persona.loginConfig?.loginUrl,
+    })
 
     const hints: string[] = []
     if (authRedirectPath) {
@@ -421,10 +452,15 @@ export async function testPersonaAuth(
     if (res.status >= 300 && res.status < 400 && headersLower['location']) {
       hints.push(`redirect -> ${redact(headersLower['location'], secrets).slice(0, 80)}`)
     }
+    if (finalExpiry.reason === 'login_redirect') {
+      hints.push('Session expired (redirected to login)')
+    } else if (finalExpiry.reason === 'http_403_session_expired') {
+      hints.push('Session expired (HTTP 403)')
+    }
 
     const explicitClerkSignedIn = headersLower['x-clerk-auth-status'] === 'signed-in'
     const explicitClerkSignedOut = headersLower['x-clerk-auth-status'] === 'signed-out'
-    let ok = res.status >= 200 && res.status < 300 && !explicitClerkSignedOut
+    let ok = res.status >= 200 && res.status < 300 && !explicitClerkSignedOut && !finalExpiry.expired
     let inconclusive = false
 
     // Diff authenticated vs anonymous GET so identical public 200 SPA shells are flagged
@@ -439,7 +475,7 @@ export async function testPersonaAuth(
             followRedirects: false,
           },
           grant,
-          controller.signal,
+          ksBound.signal,
         )
         let anonRes = firstAnonRes
         let anonHeadersLower = lowercaseHeaders(anonRes.respHeaders)
@@ -458,7 +494,7 @@ export async function testPersonaAuth(
                   followRedirects: false,
                 },
                 grant,
-                controller.signal,
+                ksBound.signal,
               )
               anonHeadersLower = lowercaseHeaders(anonRes.respHeaders)
             }
@@ -490,7 +526,11 @@ export async function testPersonaAuth(
         } else {
           hints.push(loginAdapterHint ? 'signed-in (differs from anonymous)' : `Authenticated GET differs from anonymous (${res.mediaType || 'ok'})`)
         }
-      } catch {
+      } catch (err) {
+        if (err instanceof KillSwitchTrippedError || ks.isActive(tenantId)) {
+          ks.assertAllowed(tenantId)
+          throw err
+        }
         // Anonymous comparison failed (e.g. transient error); fall back to authenticated response alone.
       }
     }
@@ -518,6 +558,7 @@ export async function testPersonaAuth(
       authHint: redact(hints.join(' · '), secrets),
     }
   } finally {
+    ksBound.release()
     clearTimeout(timeout)
   }
 }
