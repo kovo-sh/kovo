@@ -46,15 +46,73 @@ export function resolveSeed(seed: number, salt?: string): ResolvedSeed {
   return { seed, seedSet, prng: createPrng(seed) }
 }
 
-/** Enumerate reproducible seeds. Dev => [1..n]. Held-out => opaque HMAC-derived seeds (needs salt). */
-export function listSeeds(set: SeedSet, n = 5, salt?: string): number[] {
-  if (set === 'dev') return Array.from({ length: n }, (_, i) => DEV_MIN + i)
+export type SeedDomain = 'certify' | 'smoke'
+
+export interface ListSeedsOptions {
+  /** Starting HMAC derivation index (default 0; certifying draws advance past highest exposed index). */
+  startIndex?: number
+  /** HMAC domain separation: `'certify'` for certification runs, `'smoke'` for non-certifying smoke runs. */
+  domain?: SeedDomain
+}
+
+export interface DerivedHeldoutSeed {
+  index: number
+  seed: number
+  domain: SeedDomain
+}
+
+function heldoutDomainPrefix(domain: SeedDomain): string {
+  return domain === 'smoke'
+    ? 'realistic-bench:held-out-smoke-seed:'
+    : 'realistic-bench:held-out-seed:'
+}
+
+/** Derive one opaque salted held-out seed at a specific HMAC index and domain. */
+export function deriveHeldoutSeedAt(
+  index: number,
+  salt?: string,
+  domain: SeedDomain = 'certify',
+): DerivedHeldoutSeed {
+  if (!Number.isInteger(index) || index < 0) {
+    throw new Error(`deriveHeldoutSeedAt: index must be a non-negative integer (got ${index})`)
+  }
   const s = requireHeldOutSalt(salt)
-  const out: number[] = []
-  for (let i = 0; out.length < n; i++) {
-    const mac = createHmac('sha256', s).update(`realistic-bench:held-out-seed:${i}`).digest()
-    const value = HELDOUT_MIN + (mac.readUInt32BE(0) % HELDOUT_SPAN)
-    if (!out.includes(value)) out.push(value)
+  const mac = createHmac('sha256', s).update(`${heldoutDomainPrefix(domain)}${index}`).digest()
+  const seed = HELDOUT_MIN + (mac.readUInt32BE(0) % HELDOUT_SPAN)
+  return { index, seed, domain }
+}
+
+/** Enumerate salted held-out seeds together with their HMAC indices, starting at `startIndex`. */
+export function listHeldoutSeedsWithIndices(
+  n = 5,
+  salt?: string,
+  options: ListSeedsOptions = {},
+): DerivedHeldoutSeed[] {
+  const startIndex = options.startIndex ?? 0
+  if (!Number.isInteger(startIndex) || startIndex < 0) {
+    throw new Error(`listHeldoutSeedsWithIndices: startIndex must be a non-negative integer (got ${startIndex})`)
+  }
+  const domain: SeedDomain = options.domain ?? 'certify'
+  const s = requireHeldOutSalt(salt)
+  const out: DerivedHeldoutSeed[] = []
+  const seen = new Set<number>()
+  for (let i = startIndex; out.length < n; i++) {
+    const derived = deriveHeldoutSeedAt(i, s, domain)
+    if (!seen.has(derived.seed)) {
+      seen.add(derived.seed)
+      out.push(derived)
+    }
   }
   return out
+}
+
+/** Enumerate reproducible seeds. Dev => [1..n]. Held-out => opaque HMAC-derived seeds (needs salt). */
+export function listSeeds(
+  set: SeedSet,
+  n = 5,
+  salt?: string,
+  options: ListSeedsOptions = {},
+): number[] {
+  if (set === 'dev') return Array.from({ length: n }, (_, i) => DEV_MIN + i)
+  return listHeldoutSeedsWithIndices(n, salt, options).map(entry => entry.seed)
 }

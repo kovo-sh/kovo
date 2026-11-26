@@ -16,7 +16,7 @@ import { createEngineEnv, discoverEndpoints } from './benchmark-env.ts'
 import type { EngineEnv } from './benchmark-env.ts'
 import { formHypotheses, needsCsrf, profileCaps, runHypothesis } from './benchmark-probes.ts'
 import type { Hypothesis, HypothesisOutcome } from './benchmark-probes.ts'
-import { compatibleClasses, endpointKey, endpointMatches, scoreManifest, sharedEndpointKeys, specBindsParam, specSubjectOf } from './benchmark-score.ts'
+import { compatibleClasses, endpointKey, endpointMatches, findUnmatchedConfirmedOutcomes, scoreManifest, sharedEndpointKeys, specBindsParam, specSubjectOf } from './benchmark-score.ts'
 import type { ScoredOutcome } from './benchmark-score.ts'
 import { synthesizeSpecs } from './benchmark-specs.ts'
 import {
@@ -78,6 +78,8 @@ export interface ConfirmedFinding {
 export interface LivePipelineOutcome {
   traces: TargetTrace[]
   findings: ConfirmedFinding[]
+  /** Off-manifest confirmed outcomes that matched no planted target or decoy (counted as FP). */
+  unmatchedConfirmed: ScoredOutcome[]
   totalCostUsd: number
   verifierBackend: string | null
   notes: string[]
@@ -265,7 +267,7 @@ interface TaskResult {
   scored: ExecutedOutcome
 }
 
-async function execute(env: EngineEnv, args: LivePipelineArgs, notes: string[]): Promise<{ traces: TargetTrace[]; findings: ConfirmedFinding[]; backendKind: string }> {
+async function execute(env: EngineEnv, args: LivePipelineArgs, notes: string[]): Promise<{ traces: TargetTrace[]; findings: ConfirmedFinding[]; unmatchedConfirmed: ScoredOutcome[]; backendKind: string }> {
   const caps = profileCaps(args.profileMode)
   const config: BenchmarkOrchestrationConfig = resolveBenchOrchestrationConfig(process.env, args.orchestration ?? {})
   const executeStarted = Date.now()
@@ -436,18 +438,23 @@ async function execute(env: EngineEnv, args: LivePipelineArgs, notes: string[]):
     notes.push(`Class stat: ${probeClass} hypotheses=${s.hypotheses} skipped=${s.skipped} requests=${s.requests} ms=${s.ms} signals=${s.signals} confirmed=${s.confirmed}`)
   }
 
+  const sharedKeys = sharedEndpointKeys(args.manifest.challenges)
   const traces = scoreManifest(args.manifest.challenges, {
     discoveredPaths: endpoints.map(e => e.path),
     outcomes: executed,
     encodingSkipPaths: plan.encodingSkips.map(s => s.path),
     budgetSkippedPaths: [...budgetSkipped],
-    sharedEndpointKeys: sharedEndpointKeys(args.manifest.challenges),
+    sharedEndpointKeys: sharedKeys,
+  })
+  const unmatchedConfirmed = findUnmatchedConfirmedOutcomes(args.manifest.challenges, {
+    outcomes: executed,
+    sharedEndpointKeys: sharedKeys,
   })
   notes.push(`Requests used: ${env.requestsUsed()} / ${config.maxRequests}; hypotheses=${discoveredCount}; executed=${executed.length}; budgetSkipped=${budgetSkipped.size}`)
   const executeWallMs = Math.max(1, Date.now() - executeStarted)
   const httpExchanges = Math.round(env.requestsUsed() / 2)
   notes.push(`Orchestration utilization: wallMs=${executeWallMs} httpExchanges≈${httpExchanges} effectiveRps=${(httpExchanges / (executeWallMs / 1000)).toFixed(1)}`)
-  return { traces, findings: collectConfirmedFindings(args.manifest, executed, traces), backendKind: verifier.kind }
+  return { traces, findings: collectConfirmedFindings(args.manifest, executed, traces), unmatchedConfirmed, backendKind: verifier.kind }
 }
 
 /**
@@ -526,8 +533,8 @@ async function runPipelineWithPatches(args: LivePipelineArgs, patchedIds: string
   let env: EngineEnv | null = null
   try {
     env = await createEngineEnv(handle, caps, args.suite)
-    const { traces, findings, backendKind } = await execute(env, args, notes)
-    return { traces, findings, totalCostUsd: 0, verifierBackend: backendKind, notes }
+    const { traces, findings, unmatchedConfirmed, backendKind } = await execute(env, args, notes)
+    return { traces, findings, unmatchedConfirmed, totalCostUsd: 0, verifierBackend: backendKind, notes }
   } finally {
     if (env) await env.cleanup()
     await handle.close()

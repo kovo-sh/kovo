@@ -12,6 +12,7 @@ import type { GradeEntry } from './match.ts'
 import { attributeEvent, classifyFailure, computeFunnel } from './attribution.ts'
 import type { FailureContext, FunnelStage } from './attribution.ts'
 import { budgetCurve, findingCostUsd } from './budget.ts'
+import { ratioOrNull } from '../../../scripts/score-primitives.ts'
 
 const severities: Severity[] = ['critical', 'high', 'medium', 'low']
 export const ANTI_HEURISTIC_FLOOR_MAX = 0.15
@@ -209,7 +210,9 @@ export function gradeRun(input: GradeInput): Scorecard {
   for (const list of vulnMatched.values()) if (list.length > 1) duplicateFindings += list.length - 1
 
   const denom = tp + decoyFalsePositives + unmatchedFalsePositives
-  const precision = findings.length === 0 ? 1 : denom === 0 ? 1 : tp / denom
+  // Fail closed (R2-05): empty claims (denom === 0) return null, NEVER 1.
+  const precision = ratioOrNull(tp, denom)
+  const rawPrecision = ratioOrNull(tp, denom)
 
   const recallBySeverity = {} as Scorecard['recallBySeverity']
   for (const sev of severities) {
@@ -265,6 +268,7 @@ export function gradeRun(input: GradeInput): Scorecard {
     recallByFamily,
     staticRecall: targets > 0 ? (confirmed + staticOnly) / targets : 0,
     precision,
+    rawPrecision,
     decoys: gt.decoys.length,
     decoyFalsePositives,
     decoyFalsePositiveRate: gt.decoys.length > 0 ? decoyFalsePositives / gt.decoys.length : 0,

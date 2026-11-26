@@ -9,6 +9,7 @@ import type { GradeEntry } from './match.ts'
 import { attributeEvent, classifyFailure, computeFunnel } from './attribution.ts'
 import type { FailureContext, FunnelStage } from './attribution.ts'
 import { budgetCurve, findingCostUsd } from './budget.ts'
+import { ratioOrNull } from '../../../scripts/score-primitives.ts'
 
 const severities: Severity[] = ['critical', 'high', 'medium', 'low']
 
@@ -263,16 +264,17 @@ export function gradeRun(input: GradeInput, options?: GradeRunOptions): GradedSc
   for (const list of vulnMatched.values()) if (list.length > 1) duplicateFindings += list.length - 1
 
   const denom = tp + decoyFalsePositives + unmatchedFalsePositives
-  const precision = findings.length === 0 ? 1 : denom === 0 ? 1 : tp / denom
+  // Fail closed (R2-05): empty claims (denom === 0) return null, NEVER 1.
+  const precision = ratioOrNull(tp, denom)
   // Reviewer-mandated conservative metric: the sibling tolerance is never free. Strict precision
   // charges every uncharged misclassification exactly once, so a run cannot improve strict numbers
   // by mislabelling; Phase-1 also requires `incompatibleClassCount === 0`.
   const strictDenom = denom + misclassified.length
-  const strictPrecision = findings.length === 0 ? 1 : strictDenom === 0 ? 1 : tp / strictDenom
+  const strictPrecision = ratioOrNull(tp, strictDenom)
   // Headline pre-adjudication precision (Item #2): charges every decoy, unmatched, and
-  // misclassified claim and fails closed to `null` when no findings are graded (denom === 0).
+  // misclassified claim and fails closed to `null` when no findings are graded (strictDenom === 0).
   // `validUnplanted` is strictly a side column and NEVER reduces `rawPrecision` or `strictPrecision`.
-  const rawPrecision = strictDenom > 0 ? tp / strictDenom : null
+  const rawPrecision = ratioOrNull(tp, strictDenom)
 
   const unmatchedIdSet = new Set(unmatched.map((f) => f.id))
   const validUnplanted: ValidUnplantedEntry[] = []

@@ -31,11 +31,19 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   DEFAULT_LEDGER_PATH,
-  LEDGER_SCHEMA_VERSION,
   appendLedgerRow,
+  appendPerRunLedgerRow,
   computeBenchmarkVersion,
+  promoteLedgerRows,
   resolveGitState,
+  type LedgerRow,
 } from './bench-ledger.ts'
+import {
+  ScorecardReader,
+  buildLedgerRow,
+  ratioOrNull,
+  type CellReadState,
+} from './score-primitives.ts'
 
 // ---------------------------------------------------------------------------
 // Constants & Thresholds
@@ -272,6 +280,7 @@ export interface MultihopCellInput {
 
 export interface NormalizedMultihopCell {
   status: 'VALID' | 'INVALID'
+  cellState: CellReadState
   failed: boolean
   benchmarkVersion?: string
   effectiveConfigHash?: string
@@ -297,6 +306,8 @@ export interface NormalizedMultihopCell {
   chainsConfirmed: number
   recall: number
   precision: number | null
+  rawPrecision: number | null
+  strictPrecision: number | null
   hardenedTwinsTotal: number
   hardenedTwinDecoyFps: number
   unmatchedFalsePositives: number
@@ -359,13 +370,14 @@ export interface OssCorpusInput {
 
 export interface NormalizedOssSummary {
   runs: number
+  failedRuns: number
   totalAnchors: number
   tpCount: number
   sealedAnchors: number
   sealedTpCount: number
   sealedRecall: number | null
   overallRecall: number
-  worstRunPrecision: number
+  worstRunPrecision: number | null
   totalFpCount: number
   unmatchedFpCount: number
   spuriousAnchorFpCount: number
@@ -638,6 +650,7 @@ export interface CertifyV8CliArgs {
   outMd?: string
   outJson?: string
   ledgerPath?: string
+  promoteLedgerPath?: string
   allowMissingV7Floor: boolean
   help: boolean
 }
@@ -912,21 +925,32 @@ export function normalizeCell(raw: MultihopCellInput): NormalizedMultihopCell {
     twinFpsFromArray,
   )
   const unmatchedFalsePositives = nonNegNum(raw.unmatchedFalsePositives, 0)
-  const totalFps = hardenedTwinDecoyFps + unmatchedFalsePositives
-  const precisionDenom = chainsConfirmed + totalFps
-  // Fail closed: empty cells (tp + fp === 0) report precision = null, never 1.
-  const computedPrecision: number | null =
-    precisionDenom > 0 ? safeRatio(chainsConfirmed, precisionDenom) : null
-  const reportedPrecision = optionalNum(raw.precision)
-  // Worst of reported precision and recomputed precision so a misreported 1.0 never masks an FP.
-  const precision: number | null =
-    computedPrecision === null
-      ? null
-      : reportedPrecision === null
-        ? computedPrecision
-        : Math.min(reportedPrecision, computedPrecision)
-  const failed = raw.failed === true || raw.status === 'INVALID'
-  const status: 'VALID' | 'INVALID' = failed ? 'INVALID' : 'VALID'
+  const inert = raw.inert === true
+  const readerCell = ScorecardReader.read(
+    {
+      ...raw,
+      app,
+      seed,
+      seedSet,
+      split,
+      mode,
+      llm,
+      targets: chainsTotal,
+      confirmed: chainsConfirmed,
+      decoys: hardenedTwinsTotal,
+      decoyFalsePositives: hardenedTwinDecoyFps,
+      unmatchedFalsePositives,
+    },
+    {
+      failed: raw.failed === true || raw.status === 'INVALID',
+      inert,
+    },
+  )
+  const precision: number | null = readerCell.headlinePrecision
+  const rawPrecision: number | null = readerCell.rawPrecision
+  const strictPrecision: number | null = readerCell.strictPrecision
+  const failed = readerCell.state === 'failed_inert'
+  const status: 'VALID' | 'INVALID' = readerCell.status
 
   const budgetUsd = nonNegNum(raw.budgetUsd, 0)
   const maxDurationMs = nonNegNum(raw.maxDurationMs, 0)
@@ -945,7 +969,6 @@ export function normalizeCell(raw: MultihopCellInput): NormalizedMultihopCell {
     derivedShortcutViolations,
   )
   const modeBViolations = Math.max(nonNegNum(raw.modeBViolations, 0), derivedModeBViolations)
-  const inert = raw.inert === true
   const hopFunnel = raw.hopFunnel
     ? normalizeHopFunnel(raw.hopFunnel, {
         totalChains: chainsTotal,
@@ -1030,6 +1053,7 @@ export function normalizeCell(raw: MultihopCellInput): NormalizedMultihopCell {
 
   return {
     status,
+    cellState: readerCell.state,
     failed,
     ...(raw.benchmarkVersion ? { benchmarkVersion: raw.benchmarkVersion } : {}),
     ...(raw.effectiveConfigHash ? { effectiveConfigHash: raw.effectiveConfigHash } : {}),
@@ -1055,6 +1079,8 @@ export function normalizeCell(raw: MultihopCellInput): NormalizedMultihopCell {
     chainsConfirmed,
     recall,
     precision,
+    rawPrecision,
+    strictPrecision,
     hardenedTwinsTotal,
     hardenedTwinDecoyFps,
     unmatchedFalsePositives,
@@ -1381,7 +1407,8 @@ export function normalizeOssInputs(
   let tpCount = 0
   let sealedAnchors = 0
   let sealedTpCount = 0
-  let worstRunPrecision = 1
+  let worstRunPrecision: number | null = null
+  let failedRuns = 0
   let totalFpCount = 0
   let unmatchedFpCount = 0
   let spuriousAnchorFpCount = 0
@@ -1426,14 +1453,27 @@ export function normalizeOssInputs(
     cleanControlUnexpectedOracles += ccUnexpectedFromDetail
     totalFpCount += itemTotalFp
 
-    const computedPrec =
-      itemTp + itemTotalFp > 0 ? safeRatio(itemTp, itemTp + itemTotalFp) : 1
+    const ossCell = ScorecardReader.read({
+      ...(item as unknown as Record<string, unknown>),
+      targets: itemAnchors,
+      confirmed: itemTp,
+      decoyFalsePositives: ccFps,
+      unmatchedFalsePositives: Math.max(0, itemTotalFp - ccFps),
+    })
+    if (ossCell.state === 'failed_inert') {
+      failedRuns += 1
+    }
+    // Fail closed (R2-05): 0 claims -> precision is null, NEVER 1.
+    const computedPrec = ratioOrNull(itemTp, itemTp + itemTotalFp)
     const reportedPrec = optionalNum(item.precision)
     const reportedWorstPrec = optionalNum(item.worstRunPrecision)
-    let itemPrec = computedPrec
-    if (reportedPrec !== null) itemPrec = Math.min(itemPrec, reportedPrec)
-    if (reportedWorstPrec !== null) itemPrec = Math.min(itemPrec, reportedWorstPrec)
-    worstRunPrecision = Math.min(worstRunPrecision, itemPrec)
+    if (computedPrec !== null) {
+      let itemPrec = computedPrec
+      if (reportedPrec !== null) itemPrec = Math.min(itemPrec, reportedPrec)
+      if (reportedWorstPrec !== null) itemPrec = Math.min(itemPrec, reportedWorstPrec)
+      worstRunPrecision =
+        worstRunPrecision === null ? itemPrec : Math.min(worstRunPrecision, itemPrec)
+    }
 
     if (Array.isArray(item.anchorResults) && item.anchorResults.length > 0) {
       for (const a of item.anchorResults) {
@@ -1471,6 +1511,7 @@ export function normalizeOssInputs(
 
   return {
     runs: list.length,
+    failedRuns,
     totalAnchors,
     tpCount,
     sealedAnchors,
@@ -1650,7 +1691,15 @@ export function evaluateV8Certification(input: CertifyV8Input): V8CertificationR
   }
 
   const totalOssFps = oss ? oss.totalFpCount : 0
-  if (oss && (worstRunPrecision === null || oss.worstRunPrecision < worstRunPrecision)) {
+  if (oss && oss.failedRuns > 0) {
+    failedCells += oss.failedRuns
+    failedCellLabels.push(`oss-multihop (${oss.failedRuns} failed)`)
+  }
+  if (
+    oss &&
+    oss.worstRunPrecision !== null &&
+    (worstRunPrecision === null || oss.worstRunPrecision < worstRunPrecision)
+  ) {
     worstRunPrecision = oss.worstRunPrecision
     if (oss.worstRunPrecision < 1 - EPS) worstRunCell = 'oss-multihop'
   }
@@ -2264,6 +2313,7 @@ export function evaluateV8Certification(input: CertifyV8Input): V8CertificationR
         oss !== null &&
         oss.sealedRecall !== null &&
         oss.sealedRecall >= V8_THRESHOLDS.m4.ossSealedRecallMin - EPS &&
+        oss.worstRunPrecision !== null &&
         oss.worstRunPrecision >= 1 - EPS &&
         oss.totalFpCount === 0
           ? 'PASS'
@@ -2389,7 +2439,7 @@ export function evaluateV8Certification(input: CertifyV8Input): V8CertificationR
       })
 
       const rAgentic = v7Floor?.reasonBench?.agenticRecall ?? null
-      const rPrec = v7Floor?.reasonBench?.worstPrecision ?? 1
+      const rPrec = v7Floor?.reasonBench?.worstPrecision ?? null
       addCheck({
         id: 'm4_v7_reason_agentic',
         category: 'v7-floor',
@@ -2402,6 +2452,7 @@ export function evaluateV8Certification(input: CertifyV8Input): V8CertificationR
         status:
           rAgentic !== null &&
           rAgentic >= V8_THRESHOLDS.m4.v7ReasonAgenticMin - EPS &&
+          rPrec !== null &&
           rPrec >= 1 - EPS
             ? 'PASS'
             : 'FAIL',
@@ -2985,6 +3036,7 @@ export function parseCertifyV8Args(argv: readonly string[]): CertifyV8CliArgs {
   let outMd: string | undefined
   let outJson: string | undefined
   let ledgerPath: string | undefined
+  let promoteLedgerPath: string | undefined
   let allowMissingV7Floor = false
   let help = false
 
@@ -3062,6 +3114,11 @@ export function parseCertifyV8Args(argv: readonly string[]): CertifyV8CliArgs {
       ledgerPath = next ?? DEFAULT_LEDGER_PATH
       continue
     }
+    if (token === '--promote-ledger') {
+      const next = inlineVal ?? (argv[i + 1] && !isFlagToken(argv[i + 1]!) ? argv[++i] : undefined)
+      promoteLedgerPath = next ?? DEFAULT_LEDGER_PATH
+      continue
+    }
     throw new Error(`Unknown CLI argument: ${rawToken}`)
   }
 
@@ -3078,9 +3135,85 @@ export function parseCertifyV8Args(argv: readonly string[]): CertifyV8CliArgs {
     outMd,
     outJson,
     ledgerPath,
+    promoteLedgerPath,
     allowMissingV7Floor,
     help,
   }
+}
+
+export function writeV8CertifyLedgerRows(input: {
+  cells: readonly MultihopCellInput[]
+  report: V8CertificationReport
+  runId?: string
+  runsDir?: string
+  ledgerPath?: string
+  promoteLedgerPath?: string
+  repoRoot?: string
+}): { perRunPath: string; rows: LedgerRow[] } {
+  const gitState = resolveGitState(input.repoRoot)
+  const normalized = input.cells.map(normalizeCell)
+  const rows: LedgerRow[] = []
+  let perRunPath = ''
+  const runId = input.runId ?? `certify-v8-${input.report.gate}-${input.report.generatedAt.replace(/[:.]/g, '-')}-${process.pid}`
+  for (const c of normalized) {
+    const readerCell = ScorecardReader.read(
+      {
+        app: c.app,
+        seed: c.seed,
+        seedSet: c.seedSet,
+        split: c.split,
+        mode: c.mode,
+        llm: c.llm,
+        targets: c.chainsTotal,
+        confirmed: c.chainsConfirmed,
+        precision: c.precision,
+        rawPrecision: c.rawPrecision,
+        strictPrecision: c.strictPrecision,
+        decoys: c.hardenedTwinsTotal,
+        decoyFalsePositives: c.hardenedTwinDecoyFps,
+        unmatchedFalsePositives: c.unmatchedFalsePositives,
+        costUsd: c.costUsd,
+        durationMs: c.durationMs,
+      },
+      { failed: c.failed || c.status === 'INVALID', inert: c.inert },
+    )
+    const row = buildLedgerRow({
+      cell: readerCell,
+      recordedAt: input.report.generatedAt,
+      suite: 'multihop-saas',
+      gitSha: c.gitSha ?? input.report.gitSha,
+      dirty: gitState.dirty,
+      benchmarkVersion: c.benchmarkVersion ?? input.report.benchmarkVersion,
+      effectiveConfigHash: c.effectiveConfigHash ?? input.report.effectiveConfigHash ?? '0'.repeat(64),
+      app: c.app,
+      split: c.split,
+      mode: c.mode,
+      llm: c.llm,
+      seed: c.seed,
+      repeat: Number(c.repeatId ?? 1) || 1,
+      certifying: input.report.verdict === 'PASS' && c.status === 'VALID',
+      reportable: true,
+      costUsd: c.costUsd,
+      durationMs: c.durationMs,
+    })
+    const appended = appendPerRunLedgerRow(row, {
+      runId,
+      runsDir: input.runsDir,
+      repoRoot: input.repoRoot,
+    })
+    perRunPath = appended.path
+    if (input.ledgerPath) {
+      appendLedgerRow(row, input.ledgerPath, input.repoRoot)
+    }
+    rows.push(row)
+  }
+  if (input.promoteLedgerPath && perRunPath) {
+    promoteLedgerRows(perRunPath, {
+      targetLedgerPath: input.promoteLedgerPath,
+      repoRoot: input.repoRoot,
+    })
+  }
+  return { perRunPath, rows }
 }
 
 export function main(argv: readonly string[] = process.argv.slice(2)): number {
@@ -3137,40 +3270,14 @@ export function main(argv: readonly string[] = process.argv.slice(2)): number {
     mkdirSync(dirname(absJson), { recursive: true })
     writeFileSync(absJson, json, 'utf8')
   }
-  if (args.ledgerPath) {
-    const gitState = resolveGitState()
-    const normalized = cells.map(normalizeCell)
-    for (const c of normalized) {
-      appendLedgerRow({
-        schemaVersion: LEDGER_SCHEMA_VERSION,
-        recordedAt: report.generatedAt,
-        suite: 'multihop-saas',
-        gitSha: c.gitSha ?? report.gitSha,
-        dirty: gitState.dirty,
-        benchmarkVersion: c.benchmarkVersion ?? report.benchmarkVersion,
-        effectiveConfigHash: c.effectiveConfigHash ?? report.effectiveConfigHash ?? '0'.repeat(64),
-        app: c.app,
-        split: c.split,
-        mode: c.mode,
-        llm: c.llm,
-        seed: c.seed,
-        repeat: Number(c.repeatId ?? 1) || 1,
-        certifying: report.verdict === 'PASS',
-        reportable: true,
-        status: c.status,
-        targets: c.chainsTotal,
-        confirmed: c.chainsConfirmed,
-        recall: c.status === 'INVALID' ? null : c.recall,
-        rawPrecision: c.precision,
-        strictPrecision: c.precision,
-        precision: c.precision,
-        decoyFalsePositives: c.hardenedTwinDecoyFps,
-        unmatchedFalsePositives: c.unmatchedFalsePositives,
-        costUsd: c.costUsd,
-        durationMs: c.durationMs,
-      }, args.ledgerPath)
-    }
-  }
+  // Default per-run ledger writing (gitignored benchmarks/results/runs/<run-id>.jsonl);
+  // promote to committed ledger via --promote-ledger (or legacy --ledger).
+  writeV8CertifyLedgerRows({
+    cells,
+    report,
+    ledgerPath: args.ledgerPath,
+    promoteLedgerPath: args.promoteLedgerPath,
+  })
 
   process.stdout.write(
     `[certify-v8] gate=${report.gate} verdict=${report.verdict} ` +

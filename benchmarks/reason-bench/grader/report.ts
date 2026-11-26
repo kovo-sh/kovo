@@ -5,8 +5,8 @@ import type { BenchmarkFunnel, Scorecard } from '../lib/types.ts'
 import { failureTaxonomyBuckets } from '../lib/types.ts'
 import { aggregateScorecards } from './aggregate.ts'
 
-function pct(x: number | undefined): string {
-  return x == null ? '-' : (x * 100).toFixed(1) + '%'
+function pct(x: number | null | undefined): string {
+  return x == null ? 'n/a' : (x * 100).toFixed(1) + '%'
 }
 function usd(x: number): string {
   return '$' + x.toFixed(2)

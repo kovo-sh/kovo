@@ -30,6 +30,16 @@ import {
   perTargetOutcomes,
   simulateTraceFromManifest,
 } from './benchmark-core.ts'
+import {
+  DEFAULT_LEDGER_PATH,
+  appendLedgerRow,
+  appendPerRunLedgerRow,
+  computeBenchmarkVersion,
+  computeEffectiveConfig,
+  promoteLedgerRows,
+  resolveGitState,
+} from './bench-ledger.ts'
+import { ScorecardReader, buildLedgerRow, ratioOrNull } from './score-primitives.ts'
 import type {
   BenchmarkManifest,
   BenchmarkOrchestrationOverrides,
@@ -83,6 +93,12 @@ export interface RunBenchmarkOptions {
   repoRootDir?: string
   /** Wall-clock/request/concurrency knobs for the live pipeline (env supplies the rest). */
   orchestration?: BenchmarkOrchestrationOverrides
+  /** Optional custom directory for default per-run ledger JSONL files. */
+  ledgerRunsDir?: string
+  /** Optional legacy explicit ledger JSONL path. */
+  ledgerPath?: string
+  /** Optional target ledger path to promote validated per-run rows into. */
+  promoteLedgerPath?: string
 }
 
 export const benchmarkRepoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
@@ -160,6 +176,7 @@ async function runSingleSuite(suite: BenchmarkSuiteName, opts: RunBenchmarkOptio
   const notes: string[] = []
 
   let traces: TargetTrace[]
+  let unmatchedConfirmed: readonly unknown[] | number = 0
   let totalCostUsd = 0
   let verifierBackend: string | null = null
   let patchVerification: PatchVerificationSummary | null = null
@@ -182,6 +199,7 @@ async function runSingleSuite(suite: BenchmarkSuiteName, opts: RunBenchmarkOptio
       ...(opts.orchestration ? { orchestration: opts.orchestration } : {}),
     })
     traces = outcome.traces
+    unmatchedConfirmed = outcome.unmatchedConfirmed ?? 0
     totalCostUsd = outcome.totalCostUsd
     verifierBackend = outcome.verifierBackend
     notes.push(...outcome.notes)
@@ -202,7 +220,8 @@ async function runSingleSuite(suite: BenchmarkSuiteName, opts: RunBenchmarkOptio
   const funnelCounts = buildFunnel(normalized)
   assertMonotonicFunnel(funnelCounts)
   const failureTaxonomy = buildFailureTaxonomy(normalized)
-  const falsePositiveCount = countFalsePositives(normalized)
+  const fpBreakdown = countFalsePositives(normalized, { includeBreakdown: true, unmatchedConfirmed })
+  const falsePositiveCount = fpBreakdown.total
   const targetsTotal = funnelCounts.targetVulns
   const confirmedCount = funnelCounts.zeroLlmConfirmed
   const decoysTotal = normalized.filter(t => t.isDecoy).length
@@ -243,7 +262,7 @@ async function runSingleSuite(suite: BenchmarkSuiteName, opts: RunBenchmarkOptio
       : null,
   )
 
-  return {
+  const recallResult: BenchmarkSuiteResult = {
     suite,
     profileMode,
     dryRun: Boolean(opts.dryRun),
@@ -254,10 +273,11 @@ async function runSingleSuite(suite: BenchmarkSuiteName, opts: RunBenchmarkOptio
     decoysTotal,
     confirmedCount,
     falsePositiveCount,
+    unmatchedConfirmedCount: fpBreakdown.unmatchedConfirmed,
     funnelCounts,
     failureTaxonomy,
     recall: computeRecall(confirmedCount, targetsTotal),
-    precision: computePrecision(confirmedCount, falsePositiveCount),
+    precision: ratioOrNull(confirmedCount, confirmedCount + falsePositiveCount),
     totalCostUsd,
     costPerVuln: computeCostPerVuln(totalCostUsd, confirmedCount),
     durationMs,
@@ -275,6 +295,68 @@ async function runSingleSuite(suite: BenchmarkSuiteName, opts: RunBenchmarkOptio
     patchVerification,
     notes,
   }
+
+  // Default per-run ledger writing for live runs (gitignored benchmarks/results/runs/<run-id>.jsonl).
+  if (!opts.dryRun || opts.ledgerRunsDir || opts.ledgerPath || opts.promoteLedgerPath) {
+    try {
+      const { benchmarkVersion } = computeBenchmarkVersion(suite, rootDir)
+      const { effectiveConfigHash, effectiveConfig } = computeEffectiveConfig({
+        deterministicOnly: true,
+        environment: 'local-lab',
+        approvalPolicy: 'auto_review',
+        wordlistOn: false,
+        verifierBackend: verifierBackend ?? opts.verifierBackend ?? 'auto',
+        mode: profileMode,
+      })
+      const gitState = resolveGitState(rootDir)
+      const readerCell = ScorecardReader.read({
+        app: suite,
+        seed: 0,
+        mode: profileMode,
+        llm: 'deterministic-no-llm',
+        targets: targetsTotal,
+        confirmed: confirmedCount,
+        decoys: decoysTotal,
+        decoyFalsePositives: fpBreakdown.decoyFalsePositives,
+        unmatchedFalsePositives: fpBreakdown.unmatchedConfirmed,
+        totalCostUsd,
+        durationMs,
+      })
+      const siteOutcomes: Record<string, string> = {}
+      for (const t of recallResult.perTarget) siteOutcomes[t.id] = t.outcome
+      const ledgerRow = buildLedgerRow({
+        cell: readerCell,
+        suite,
+        gitSha,
+        dirty: gitState.dirty,
+        benchmarkVersion,
+        effectiveConfigHash,
+        effectiveConfig,
+        app: suite,
+        split: suite === 'held-out-saas' ? 'held-out' : 'dev',
+        mode: profileMode,
+        llm: 'deterministic-no-llm',
+        seed: 0,
+        repeat: 1,
+        certifying: false,
+        reportable: !opts.dryRun,
+        siteOutcomes,
+      })
+      const appended = appendPerRunLedgerRow(ledgerRow, {
+        runId: `recall-${suite}-${row.id}`,
+        runsDir: opts.ledgerRunsDir,
+        repoRoot: rootDir,
+      })
+      if (opts.ledgerPath) appendLedgerRow(ledgerRow, opts.ledgerPath, rootDir)
+      if (opts.promoteLedgerPath) {
+        promoteLedgerRows(appended.path, { targetLedgerPath: opts.promoteLedgerPath, repoRoot: rootDir })
+      }
+    } catch {
+      // Non-fatal in synthetic unit tests with mock repoRootDir missing benchmark dirs.
+    }
+  }
+
+  return recallResult
 }
 
 function aggregateResults(children: BenchmarkSuiteResult[], gitSha: string, opts: RunBenchmarkOptions): BenchmarkSuiteResult {
@@ -282,6 +364,7 @@ function aggregateResults(children: BenchmarkSuiteResult[], gitSha: string, opts
   const failureTaxonomy = emptyFailureTaxonomy()
   let confirmedCount = 0
   let falsePositiveCount = 0
+  let unmatchedConfirmedCount = 0
   let decoysTotal = 0
   let totalCostUsd = 0
   let durationMs = 0
@@ -290,6 +373,7 @@ function aggregateResults(children: BenchmarkSuiteResult[], gitSha: string, opts
     for (const key of Object.keys(failureTaxonomy) as Array<keyof typeof failureTaxonomy>) failureTaxonomy[key] += c.failureTaxonomy[key]
     confirmedCount += c.confirmedCount
     falsePositiveCount += c.falsePositiveCount
+    unmatchedConfirmedCount += c.unmatchedConfirmedCount ?? 0
     decoysTotal += c.decoysTotal
     totalCostUsd += c.totalCostUsd
     durationMs += c.durationMs
@@ -306,6 +390,7 @@ function aggregateResults(children: BenchmarkSuiteResult[], gitSha: string, opts
     decoysTotal,
     confirmedCount,
     falsePositiveCount,
+    unmatchedConfirmedCount,
     funnelCounts,
     failureTaxonomy,
     recall: computeRecall(confirmedCount, targetsTotal),
@@ -414,6 +499,7 @@ export function parseBenchmarkCliArgs(argv: readonly string[]): BenchmarkCliOpti
   const valueFlags = new Set([
     '--suite', '--profile-mode', '--baseline-sha', '--git-sha', '--out-json', '--out-md', '--out-dir', '--db', '--verifier-backend',
     '--max-requests', '--deadline-ms', '--probe-concurrency', '--verify-concurrency', '--slow-probes',
+    '--ledger', '--promote-ledger',
   ])
   for (let i = 0; i < argv.length; i += 1) {
     let arg = argv[i]
@@ -456,6 +542,8 @@ export function parseBenchmarkCliArgs(argv: readonly string[]): BenchmarkCliOpti
       case '--probe-concurrency': orchestration.probeConcurrency = parseCountArg('--probe-concurrency', value, 1, 8); break
       case '--verify-concurrency': orchestration.verifyConcurrency = parseCountArg('--verify-concurrency', value, 1, 4); break
       case '--slow-probes': orchestration.slowProbes = parseCountArg('--slow-probes', value, 0, 64); break
+      case '--ledger': out.ledgerPath = value || DEFAULT_LEDGER_PATH; break
+      case '--promote-ledger': out.promoteLedgerPath = value || DEFAULT_LEDGER_PATH; break
     }
   }
   if (Object.keys(orchestration).length > 0) out.orchestration = orchestration

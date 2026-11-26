@@ -4,7 +4,7 @@ import type { Scorecard } from '../lib/types.ts'
 export interface AggregateScorecard {
   count: number
   recall: { mean: number; min: number; max: number }
-  precision: { mean: number; min: number; max: number }
+  precision: { mean: number | null; min: number | null; max: number | null }
   pooledDecoyFpRate: number
   pooledRecallByClass: Record<string, { targets: number; confirmed: number; recall: number }>
 }
@@ -14,7 +14,7 @@ export function aggregateScorecards(list: Scorecard[]): AggregateScorecard {
     return {
       count: 0,
       recall: { mean: 0, min: 0, max: 0 },
-      precision: { mean: 0, min: 0, max: 0 },
+      precision: { mean: null, min: null, max: null },
       pooledDecoyFpRate: 0,
       pooledRecallByClass: {},
     }
@@ -24,6 +24,9 @@ export function aggregateScorecards(list: Scorecard[]): AggregateScorecard {
     min: Math.min(...xs),
     max: Math.max(...xs),
   })
+  const precisions = list
+    .map((s) => s.precision)
+    .filter((p): p is number => typeof p === 'number' && Number.isFinite(p))
   const totalDecoys = list.reduce((a, s) => a + s.decoys, 0)
   const totalDecoyFp = list.reduce((a, s) => a + s.decoyFalsePositives, 0)
   const pooledRecallByClass: AggregateScorecard['pooledRecallByClass'] = {}
@@ -39,7 +42,7 @@ export function aggregateScorecards(list: Scorecard[]): AggregateScorecard {
   return {
     count: list.length,
     recall: stat(list.map((s) => s.recall)),
-    precision: stat(list.map((s) => s.precision)),
+    precision: precisions.length > 0 ? stat(precisions) : { mean: null, min: null, max: null },
     pooledDecoyFpRate: totalDecoys > 0 ? totalDecoyFp / totalDecoys : 0,
     pooledRecallByClass,
   }

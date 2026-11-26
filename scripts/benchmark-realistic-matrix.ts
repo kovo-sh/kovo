@@ -21,13 +21,22 @@ import {
 } from './benchmark-parallel.ts'
 import {
   DEFAULT_LEDGER_PATH,
-  LEDGER_SCHEMA_VERSION,
   appendLedgerRow,
+  appendPerRunLedgerRow,
   computeBenchmarkVersion,
   computeEffectiveConfig,
+  promoteLedgerRows,
   resolveGitState,
   type BenchmarkSuiteName,
+  type EffectiveConfigSnapshot,
+  type LedgerRow,
 } from './bench-ledger.ts'
+import {
+  ScorecardReader,
+  buildLedgerRow,
+  ratioOrNull,
+  type CellReadState,
+} from './score-primitives.ts'
 
 interface Cell { app: string; seed: number }
 export interface CellResult {
@@ -40,9 +49,13 @@ export interface CellResult {
   targets: number
   recall: number | null
   precision: number | null
+  rawPrecision?: number | null
+  strictPrecision?: number | null
+  cellState?: CellReadState
   decoyFp: number
   decoys: number
   unmatchedFp: number
+  misclassifiedCount?: number
   costUsd: number
   funnel?: Record<string, number>
   error?: string
@@ -75,7 +88,7 @@ function parseArgs(argv: readonly string[]): {
   outDir: string; timeoutMs: number; mode: string; profileMode: string
   maxRequests?: number; probeConcurrency?: number; verifyConcurrency?: number; slowProbes?: number
   minFreeMemGb: number; maxActiveWorkers: number; warmWorkers: boolean
-  ledgerPath?: string
+  ledgerPath?: string; promoteLedgerPath?: string
 } {
   const out = {
     suite: 'realistic' as MatrixSuite,
@@ -92,6 +105,7 @@ function parseArgs(argv: readonly string[]): {
       ? Math.floor(Number(process.env.KOVO_MATRIX_MAX_WORKERS)) : DEFAULT_MAX_ACTIVE_WORKERS,
     warmWorkers: !envFlagDisabled(process.env, 'KOVO_WARM_WORKERS'),
     ledgerPath: undefined as string | undefined,
+    promoteLedgerPath: undefined as string | undefined,
   }
   const int = (arg: string, value: string, min: number, max: number): number => {
     const n = Number(value)
@@ -137,6 +151,14 @@ function parseArgs(argv: readonly string[]): {
         }
         break
       }
+      case '--promote-ledger': {
+        if (value !== undefined && !value.startsWith('--')) {
+          out.promoteLedgerPath = take()
+        } else {
+          out.promoteLedgerPath = DEFAULT_LEDGER_PATH
+        }
+        break
+      }
       case '--help': case '-h':
         console.log('Usage: node scripts/benchmark-realistic-matrix.ts [--suite realistic|xben-25|held-out-saas] [--apps a,b] [--seeds 1,2] [--split dev|heldout] [--concurrency N] [--out-dir DIR] [--timeout-ms N] [--mode grey-box] [--profile-mode v4-full] [--max-requests N] [--probe-concurrency 1-8] [--verify-concurrency 1-4] [--slow-probes N] [--min-free-gb N] [--max-workers N] [--no-warm-workers]')
         process.exit(0)
@@ -157,22 +179,23 @@ function parseArgs(argv: readonly string[]): {
 function readScorecard(file: string): Partial<CellResult> | null {
   if (!existsSync(file)) return null
   try {
-    const c = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>
-    const num = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0)
-    // realistic-bench scorecards use `targets`; recall benchmarks use `targetsTotal`/`confirmedCount`.
-    const funnel = (c.funnel ?? c.funnelCounts) as Record<string, number> | undefined
-    const confirmed = num(c.confirmed ?? c.confirmedCount)
-    const targets = num(c.targets ?? c.targetsTotal)
-    const decoyFp = num(c.decoyFalsePositives ?? c.falsePositiveCount)
-    const decoys = num(c.decoys ?? c.decoysTotal)
-    const unmatchedFp = num(c.unmatchedFalsePositives)
-    const tpPlusFp = confirmed + decoyFp + unmatchedFp
-    const rawPrecision = typeof c.precision === 'number' && Number.isFinite(c.precision) ? c.precision : null
-    const precision = tpPlusFp > 0 ? (rawPrecision ?? confirmed / tpPlusFp) : null
+    const raw = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>
+    const normalized = ScorecardReader.read(raw)
+    if (normalized.state === 'failed_inert') return null
+    const funnel = (raw.funnel ?? raw.funnelCounts) as Record<string, number> | undefined
     return {
-      confirmed, targets, recall: targets > 0 ? num(c.recall) : 0,
-      precision, decoyFp, decoys,
-      unmatchedFp, costUsd: num(c.totalCostUsd),
+      confirmed: normalized.confirmed,
+      targets: normalized.targets,
+      recall: normalized.recall,
+      precision: normalized.headlinePrecision,
+      rawPrecision: normalized.rawPrecision,
+      strictPrecision: normalized.strictPrecision,
+      cellState: normalized.state,
+      decoyFp: normalized.decoyFalsePositives,
+      decoys: normalized.decoys,
+      unmatchedFp: normalized.unmatchedFalsePositives,
+      misclassifiedCount: normalized.misclassifiedCount,
+      costUsd: normalized.costUsd,
       funnel: funnel && typeof funnel === 'object' ? funnel : undefined,
     }
   } catch { return null }
@@ -238,10 +261,15 @@ function runCell(cell: Cell, opts: ReturnType<typeof parseArgs>): Promise<CellRe
         app: cell.app, seed: cell.seed, ok, exitCode: code,
         runtimeMs: Date.now() - started,
         confirmed: score?.confirmed ?? 0, targets: score?.targets ?? 0,
-        recall: ok ? (score?.recall ?? 0) : null,
+        recall: ok ? (score?.recall ?? null) : null,
         precision: ok ? (score?.precision ?? null) : null,
+        rawPrecision: ok ? (score?.rawPrecision ?? null) : null,
+        strictPrecision: ok ? (score?.strictPrecision ?? null) : null,
+        cellState: ok ? (score?.cellState ?? 'ok_no_claims') : 'failed_inert',
         decoyFp: score?.decoyFp ?? 0, decoys: score?.decoys ?? 0,
-        unmatchedFp: score?.unmatchedFp ?? 0, costUsd: score?.costUsd ?? 0, funnel: score?.funnel,
+        unmatchedFp: score?.unmatchedFp ?? 0,
+        misclassifiedCount: score?.misclassifiedCount ?? 0,
+        costUsd: score?.costUsd ?? 0, funnel: score?.funnel,
         ...(code === 0 ? {} : { error: firstError ?? `exit ${code}` }),
       })
     })
@@ -251,7 +279,7 @@ function runCell(cell: Cell, opts: ReturnType<typeof parseArgs>): Promise<CellRe
 const fmtPct = (v: number | null): string => (v === null ? 'n/a' : `${(v * 100).toFixed(1)}%`)
 
 export function summarizeMatrix(results: readonly CellResult[]): RealisticMatrixTotals {
-  const failed = results.filter(r => !r.ok).length
+  const failed = results.filter(r => !r.ok || r.cellState === 'failed_inert').length
   const status: 'VALID' | 'INVALID' = failed > 0 ? 'INVALID' : 'VALID'
   const confirmed = results.reduce((n, r) => n + r.confirmed, 0)
   const targets = results.reduce((n, r) => n + r.targets, 0)
@@ -267,13 +295,99 @@ export function summarizeMatrix(results: readonly CellResult[]): RealisticMatrix
     failed,
     confirmed,
     targets,
-    recall: failed > 0 ? null : (targets > 0 ? confirmed / targets : 0),
-    precision: tpPlusFp > 0 ? confirmed / tpPlusFp : null,
+    recall: failed > 0 ? null : ratioOrNull(confirmed, targets),
+    precision: ratioOrNull(confirmed, tpPlusFp),
     decoyFp,
     decoys,
     unmatchedFp,
     costUsd,
   }
+}
+
+export function writeRealisticMatrixLedgerRows(input: {
+  results: readonly CellResult[]
+  suiteName: BenchmarkSuiteName
+  split: 'dev' | 'held-out'
+  mode: string
+  recordedAt: string
+  gitSha: string
+  dirty: boolean
+  benchmarkVersion: string
+  effectiveConfigHash: string
+  effectiveConfig?: EffectiveConfigSnapshot
+  runId?: string
+  runsDir?: string
+  ledgerPath?: string
+  promoteLedgerPath?: string
+  repoRoot?: string
+}): { perRunPath: string; rows: LedgerRow[] } {
+  const rows: LedgerRow[] = []
+  let perRunPath = ''
+  const runId = input.runId ?? `realistic-matrix-${input.recordedAt.replace(/[:.]/g, '-')}-${process.pid}`
+  for (const r of input.results) {
+    const normalized = ScorecardReader.read(
+      {
+        app: r.app,
+        seed: r.seed,
+        split: input.split,
+        mode: input.mode,
+        llm: 'deterministic-no-llm',
+        targets: r.targets,
+        confirmed: r.confirmed,
+        precision: r.precision,
+        rawPrecision: r.rawPrecision,
+        strictPrecision: r.strictPrecision,
+        decoys: r.decoys,
+        decoyFalsePositives: r.decoyFp,
+        unmatchedFalsePositives: r.unmatchedFp,
+        misclassifiedCount: r.misclassifiedCount ?? 0,
+        totalCostUsd: r.costUsd,
+        durationMs: r.runtimeMs,
+      },
+      {
+        failed: !r.ok || r.cellState === 'failed_inert',
+        exitCode: r.exitCode,
+        error: r.error,
+      },
+    )
+    const row = buildLedgerRow({
+      cell: normalized,
+      recordedAt: input.recordedAt,
+      suite: input.suiteName,
+      gitSha: input.gitSha,
+      dirty: input.dirty,
+      benchmarkVersion: input.benchmarkVersion,
+      effectiveConfigHash: input.effectiveConfigHash,
+      effectiveConfig: input.effectiveConfig,
+      app: r.app,
+      split: input.split,
+      mode: input.mode,
+      llm: 'deterministic-no-llm',
+      seed: r.seed,
+      repeat: 1,
+      certifying: false,
+      reportable: true,
+      costUsd: r.costUsd,
+      durationMs: r.runtimeMs,
+    })
+    const appended = appendPerRunLedgerRow(row, {
+      runId,
+      runsDir: input.runsDir,
+      repoRoot: input.repoRoot,
+    })
+    perRunPath = appended.path
+    if (input.ledgerPath) {
+      appendLedgerRow(row, input.ledgerPath, input.repoRoot)
+    }
+    rows.push(row)
+  }
+  if (input.promoteLedgerPath && perRunPath) {
+    promoteLedgerRows(perRunPath, {
+      targetLedgerPath: input.promoteLedgerPath,
+      repoRoot: input.repoRoot,
+    })
+  }
+  return { perRunPath, rows }
 }
 
 export function formatMatrixSummaryLine(input: {
@@ -372,39 +486,22 @@ async function main(): Promise<number> {
     }, null, 2)}\n`,
     { mode: 0o600 },
   )
-  if (opts.ledgerPath) {
-    for (const r of results) {
-      appendLedgerRow({
-        schemaVersion: LEDGER_SCHEMA_VERSION,
-        recordedAt,
-        suite: suiteName,
-        gitSha: gitState.gitSha,
-        dirty: gitState.dirty,
-        benchmarkVersion,
-        effectiveConfigHash,
-        effectiveConfig,
-        app: r.app,
-        split: opts.split === 'heldout' ? 'held-out' : 'dev',
-        mode: opts.mode,
-        llm: 'deterministic-no-llm',
-        seed: r.seed,
-        repeat: 1,
-        certifying: false,
-        reportable: true,
-        status: r.ok ? 'VALID' : 'INVALID',
-        targets: r.targets,
-        confirmed: r.confirmed,
-        recall: r.recall,
-        rawPrecision: r.precision,
-        strictPrecision: r.precision,
-        precision: r.precision,
-        decoyFalsePositives: r.decoyFp,
-        unmatchedFalsePositives: r.unmatchedFp,
-        costUsd: r.costUsd,
-        durationMs: r.runtimeMs,
-      }, opts.ledgerPath)
-    }
-  }
+  // Default per-run ledger writing (gitignored benchmarks/results/runs/<run-id>.jsonl);
+  // promote to committed ledger only via --promote-ledger (or explicit --ledger).
+  writeRealisticMatrixLedgerRows({
+    results,
+    suiteName,
+    split: opts.split === 'heldout' ? 'held-out' : 'dev',
+    mode: opts.mode,
+    recordedAt,
+    gitSha: gitState.gitSha,
+    dirty: gitState.dirty,
+    benchmarkVersion,
+    effectiveConfigHash,
+    effectiveConfig,
+    ledgerPath: opts.ledgerPath,
+    promoteLedgerPath: opts.promoteLedgerPath,
+  })
   const table = [
     '',
     ['cell'.padEnd(40), 'recall'.padEnd(11), 'prec'.padEnd(7), 'decoy/unmFP'.padEnd(12), 'wall'.padEnd(7), 'cost'.padEnd(8), 'status'].join(' '),
