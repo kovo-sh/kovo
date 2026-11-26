@@ -1,10 +1,10 @@
 # Multi-Hop Chain Playbook
 Tags: multihop, hop-checkpoint, composite-receipt, derived-custody, async-pivot, hardened-twin
-Summary: Verify 3-6 hop CompositeProofReceipt chains via seal_capability, hmac_sign/jwt_sign, await_async, prove_composite.
+Summary: Verify N-hop CompositeProofReceipt chains via seal_capability, hmac_sign/jwt_sign, await_async, prove_composite.
 
 ## 1. Quick-Reference Contract
 1. **Origin:** ONE low-priv/derived persona (NEVER `owner`/`admin`); minted: `kind:"bearer_token"`, `{capability:{handle,target:"bearer"}}`, OMIT `as`.
-2. **Composite:** Stage 1->2->3->4->`ctx.prove_composite` in ONE script; NEVER stop at job creation, cache prime, or link/token stubs, and NEVER use standalone `prove_race_burst`/`prove_access_boundary`/`prove_persisted_mutation` after setup hops.
+2. **Composite:** N-hop chain->`ctx.prove_composite` in ONE script; NEVER stop at job creation, cache prime, or link/token stubs, or use standalone `prove_race_burst`/`prove_access_boundary`/`prove_persisted_mutation` after setup hops.
 3. **Helpers:** `ctx.seal_capability`, `ctx.hmac_sign`/`ctx.jwt_sign`, `ctx.await_async`, `ctx.prove_race_burst`.
 4. **Control/Econ:** Denied `role:"control"` BEFORE Stage 1 (`state_transition_binding`); `economic_conservation`: baseline+final (`baselineReadbackExchangeId`/`finalReadbackExchangeId`).
 5. **DAG/Twins:** Declare EVERY executed causal hop (Hop 1->terminal) in `hops[]`->`terminalHopId` via `causalEdges[]` (no orphan hops); `fresh_clean_replay`+`ctx.result`; blocked->`invariant_enforced_hardened`.
@@ -42,8 +42,8 @@ When a multi-hop workflow requires signing a webhook body, token, or request wit
 For asynchronous cross-service hops (document/PDF renderers, webhook delivery logs, batch export workers, async queues, or simulated review-bot workflows) where side effects converge on an internal service rather than an external OOB collector:
 - **Do NOT stop at intermediate artifacts (Stage 2 stubs):** Creating an async job/export ID, priming a shared cache, or generating a link/token/signed URL is ONLY an intermediate capability — seal it with `ctx.seal_capability`, continue in the **same verification script** through `ctx.await_async`, `ctx.hmac_sign`/`ctx.jwt_sign`, or `ctx.prove_race_burst` to reach the final foreign-tenant data readback or persisted state change, and only then call `ctx.prove_composite`!
 - Trigger the async action in Hop `i` and pass `triggerExchangeId: triggerEx.exchangeId` (or `tTriggerMs`) plus run-scoped `correlationId` / `entityId`.
-- **1-line pattern:** `const pol = await ctx.await_async({ pollRequest, matchPredicate, profile: "fast_lab", triggerExchangeId: h1.exchangeId, correlationId: id })` (optional `timeoutMs`, `intervalMs`, `maxAttempts`, `tTriggerMs`, `correlationIds`, `entityId`; profiles `"fast_lab"` | `"wan"`):
-  - `fast_lab`: default/max `5,000 ms` (`150 ms` interval).
+- **1-line pattern:** `const pol = await ctx.await_async({ pollRequest, matchPredicate, timeoutMs: 5000, intervalMs: 150, triggerExchangeId: h1.exchangeId, correlationId: id })` (optional `profile: "wan"`, `timeoutMs`, `intervalMs`, `maxAttempts`, `tTriggerMs`, `correlationIds`, `entityId`):
+  - Default local timing: `timeoutMs: 5000` (`150 ms` interval).
   - `wan`: default/max `30,000 ms` (`500 ms` interval).
   - `matchPredicate` supports `{ status?, bodyContains?, bodyMatches?, jsonPath?, equals?, in?, matches?, header?: { name, equals?, matches? } }`.
 - **Read job/export ID before polling & follow the artifact URL:** Extract the job/export ID from the creation exchange (`const jobId = h.json?.id ?? h.json?.jobId`), seal it (`ctx.seal_capability`), pass it into `pollRequest` + `correlationId`, and once `pol.converged` is true, read the download/artifact URL or token from the converged response and fetch it in a subsequent hop (never stop at the job creation or readiness stub!).
@@ -66,8 +66,8 @@ A multi-hop finding confirms ONLY when `ctx.prove_composite` verifies a complete
 
 ```ts
 // Mode-A defensive verification shape (all IDs reference host-signed transcript records)
-const preDenied = await ctx.http_send('/api/v1/terminal', { as: 'member_b', role: 'control' })
-const ex1 = await ctx.http_send('/api/v1/resource-meta', { as: 'member_b', role: 'probe' })
+const preDenied = await ctx.http_send('/api/v1/terminal', { as: 'actor_low', role: 'control' })
+const ex1 = await ctx.http_send('/api/v1/resource-meta', { as: 'actor_low', role: 'probe' })
 if (!(ex1.status >= 200 && ex1.status < 300)) throw new Error(`Hop 1 failed: ${ex1.status}`)
 const cap1 = await ctx.seal_capability({ exchange: ex1, hopReceiptId: '1', slot: 'scoped_tok', jsonPath: '$.token', kind: 'bearer_token' })
 const postReadback = await ctx.http_send('/api/v1/terminal', { capability: cap1.handle, role: 'probe' })
@@ -109,13 +109,13 @@ return ctx.result({ title: 'Multi-hop cross-tenant capability pivot' })
 ```
 
 ### Copy-Pasteable 4-Hop Crypto + Async Recipe (`seal_capability` -> `hmac_sign`/`jwt_sign` + `await_async` -> `prove_composite`)
-Use this exact pattern whenever a chain crosses signing, token-forgery, or background-job boundaries (all probe-arm hops run as ONE low-privilege starting persona `member_b`; never stop at the Hop 1 disclosure):
+Use this exact pattern whenever a chain crosses signing, token-forgery, or background-job boundaries (all probe-arm hops run as ONE low-privilege starting persona `actor_low`; never stop at the Hop 1 disclosure):
 
 ```ts
 // Pre-chain denied control on the exact terminal route (401/403/404)
-const preDenied = await ctx.http_send('/api/v1/exports/foreign-item', { as: 'member_b', role: 'control' })
+const preDenied = await ctx.http_send('/api/v1/exports/foreign-item', { as: 'actor_low', role: 'control' })
 // Hop 1: low-priv persona retrieves intermediate signing material (seal it; do NOT file as standalone CWE-200)
-const h1 = await ctx.http_send('/api/v1/service-meta', { as: 'member_b', role: 'probe' })
+const h1 = await ctx.http_send('/api/v1/service-meta', { as: 'actor_low', role: 'probe' })
 if (!(h1.status >= 200 && h1.status < 300)) throw new Error(`Hop 1 failed: ${h1.status}`)
 const keyCap = await ctx.seal_capability({ exchange: h1, hopReceiptId: '1', slot: 'signing_key', jsonPath: '$.signingKey', kind: 'hmac_key' })
 // Hop 2: derive host-attested HMAC signature (or forged JWT via ctx.jwt_sign) and trigger async job
@@ -124,7 +124,7 @@ const sig = await ctx.hmac_sign({ secretHandle: keyCap.handle, payload, alg: 'sh
 // For token forgery instead of HMAC:
 // const minted = await ctx.jwt_sign({ secretHandle: keyCap.handle, claims: { sub: 'svc', role: 'admin' }, alg: 'HS256', hopReceiptId: '2', slot: 'forged_jwt' })
 const h2 = await ctx.http_send('/api/v1/webhooks/trigger', {
-  method: 'POST', as: 'member_b', role: 'probe',
+  method: 'POST', as: 'actor_low', role: 'probe',
   headers: { 'x-signature': sig.signature, 'content-type': 'application/json' },
   body: payload, correlationIds: ['corr-1'],
 })
@@ -132,9 +132,9 @@ if (!(h2.status >= 200 && h2.status < 300)) throw new Error(`Hop 2 failed: ${h2.
 const jobCap = await ctx.seal_capability({ exchange: h2, hopReceiptId: '2', slot: 'job_id', jsonPath: '$.jobId' })
 // Hop 3: bounded host-tracked async convergence (never unbounded sleeps; never stop at the job handle)
 const pol = await ctx.await_async({
-  pollRequest: { path: '/api/v1/jobs/status?corr=corr-1', as: 'member_b', role: 'probe' },
+  pollRequest: { path: '/api/v1/jobs/status?corr=corr-1', as: 'actor_low', role: 'probe' },
   matchPredicate: { status: 200, jsonPath: '$.state', equals: 'ready' },
-  triggerExchangeId: h2.exchangeId, correlationId: 'corr-1', profile: 'fast_lab',
+  triggerExchangeId: h2.exchangeId, correlationId: 'corr-1', timeoutMs: 5000, intervalMs: 150,
 })
 if (!pol.exchange || !(pol.exchange.status >= 200 && pol.exchange.status < 300)) throw new Error('Hop 3 async poll did not yield 2xx')
 const exportCap = await ctx.seal_capability({ exchange: pol.exchange, hopReceiptId: '3', slot: 'export_tok', jsonPath: '$.downloadToken', kind: 'bearer_token' })
@@ -147,7 +147,7 @@ await ctx.prove_composite({
   hops: [
     { hopId: 'hop_1', surface: 'http', target: { origin: ctx.targetOrigin, method: 'GET', pathAndQuery: '/api/v1/service-meta' }, exchangeIds: [h1.exchangeId], claimedDelta: 'Low-priv persona obtains intermediate signing material.', producedCapabilities: [keyCap.handle], consumedCapabilities: [] },
     { hopId: 'hop_2', surface: 'webhook', target: { origin: ctx.targetOrigin, method: 'POST', pathAndQuery: '/api/v1/webhooks/trigger' }, exchangeIds: [sig.exchangeId, h2.exchangeId], claimedDelta: 'Host-attested HMAC signature triggers privileged async export job.', producedCapabilities: [jobCap.handle], consumedCapabilities: [keyCap.handle] },
-    { hopId: 'hop_3', surface: 'async_job', target: { origin: ctx.targetOrigin, method: 'GET', pathAndQuery: '/api/v1/jobs/status?corr=corr-1' }, exchangeIds: [pol.exchangeId], claimedDelta: 'Async worker converges and yields export capability.', producedCapabilities: [exportCap.handle], consumedCapabilities: [jobCap.handle] },
+    { hopId: 'hop_3', surface: 'async_job', target: { origin: ctx.targetOrigin, method: 'GET', pathAndQuery: '/api/v1/jobs/status?corr=corr-1' }, exchangeIds: [pol.exchange.exchangeId], claimedDelta: 'Async worker converges and yields export capability.', producedCapabilities: [exportCap.handle], consumedCapabilities: [jobCap.handle] },
     { hopId: 'hop_4', surface: 'http', target: { origin: ctx.targetOrigin, method: 'GET', pathAndQuery: '/api/v1/exports/foreign-item' }, exchangeIds: [postReadback.exchangeId], claimedDelta: 'Terminal cross-tenant business record retrieved via derived capability.', producedCapabilities: [], consumedCapabilities: [exportCap.handle] },
   ],
   causalEdges: [
@@ -170,18 +170,18 @@ return ctx.result({ title: '4-hop cross-service signing and async export pivot' 
 - Every non-root hop must connect causally via host-signed transcript evidence:
 1. **`value_binding`:** `{ kind: "value_binding", fromHopId, toHopId, capabilityHandle?, valueDigest?, sourceExchangeId?, targetExchangeId? }` — **requires `capabilityHandle` (or `valueDigest`)**: verbatim `cap:hop_<id>:<slot>` handle or `sha256(extractedValue)` observed in Hop `i` output and injected into Hop `j` request (`t_i <= t_j`).
 2. **`derived_crypto_binding`:** `{ kind: "derived_crypto_binding", fromHopId, toHopId, sourceCapabilityId, derivedCapabilityId?, alg? }` — backed by a host-signed `derivedFromCapabilityId` attestation from `ctx.hmac_sign`, `ctx.jwt_sign`, or host-tracked token exchange.
-3. **`state_transition_binding`:** `{ kind: "state_transition_binding", fromHopId, toHopId, entityId, ablationExchangeIds: [cleanAblation.exchangeId], mutationKind? }` — Hop `i` mutates shared entity/cache state without issuing a new token; **requires `entityId` AND `ablationExchangeIds` (baseline exchange proving target fails before the state-mutating hop!)** in a clean session (`cleanSession=true`) (`401`/`403`/`404`/`409`/`412`/`422`), whereas `Hop i -> Hop j` succeeds. **Clean-Control Order Rule:** ALWAYS execute `const cleanAblation = await ctx.http_send('/api/v1/target', { as: 'member_b', role: 'control', entityId })` **BEFORE** Stage 1 mutates shared/cache state (or against a fresh untouched sibling entity with matching `entityId`) — running the control *after* Stage 1 marks the session dirty (`cleanSession=false`) and fails `state_transition_binding`.
+3. **`state_transition_binding`:** `{ kind: "state_transition_binding", fromHopId, toHopId, entityId, ablationExchangeIds: [cleanAblation.exchangeId], mutationKind? }` — Hop `i` mutates shared entity/cache state without issuing a new token; **requires `entityId` AND `ablationExchangeIds` (baseline exchange proving target fails before the state-mutating hop!)** in a clean session (`cleanSession=true`) (`401`/`403`/`404`/`409`/`412`/`422`), whereas `Hop i -> Hop j` succeeds. **Clean-Control Order Rule:** ALWAYS execute `const cleanAblation = await ctx.http_send('/api/v1/target', { as: 'actor_low', role: 'control', entityId })` **BEFORE** Stage 1 mutates shared/cache state (or against a fresh untouched sibling entity with matching `entityId`) — running the control *after* Stage 1 marks the session dirty (`cleanSession=false`) and fails `state_transition_binding`.
 4. **`async_pivot_binding`:** `{ kind: "async_pivot_binding", fromHopId, toHopId, correlationId, channel: "poll_convergence" | "oob_relay" | "browser_trace" | "async_job", pollRecordId? | oobEventId? | browserTraceId? }` — connects trigger Hop `i` to downstream effect Hop `j` with monotonic timestamps (`t_i <= t_j`) and run-scoped correlation.
 
-### White-Box Single-Script Consolidation (3–5 Stage Workflows)
+### White-Box Single-Script Consolidation (N-Hop Causal Workflows)
 - Once source routes across services are known from code-audit facts, do **not** burn 10–15 turns probing isolated stages one by one. Write **ONE cohesive `kovo_verify` script** that runs:
   1. **Clean Baseline Control (`role: "control"`):** BEFORE Stage 1 mutates any entity/cache state (or on a fresh untouched sibling entity), record both `preChainControlExchangeIds` and any `state_transition_binding` `ablationExchangeIds`.
-  2. **Stage 1 -> Stage 2 -> Stage 3 -> Stage 4:** Seal each intermediate capability (`ctx.seal_capability`), bridge signing/token boundaries (`ctx.hmac_sign`/`ctx.jwt_sign`), poll async convergence (`ctx.await_async`), or test concurrent settlement bursts (`ctx.prove_race_burst`) in the same script.
+  2. **N-hop causal chain (Hop 1 -> ... -> terminal hop):** Seal each intermediate capability (`ctx.seal_capability`), bridge signing/token boundaries (`ctx.hmac_sign`/`ctx.jwt_sign`), poll async convergence (`ctx.await_async`), or test concurrent settlement bursts (`ctx.prove_race_burst`) in the same script.
   3. **Terminal Verification (`ctx.prove_composite`):** Fetch the final foreign-tenant business record or persisted state-mutation readback (`postChainReadbackExchangeIds`) — never stopping at job creation, cache priming, or token/link stubs — then call `ctx.prove_composite` and `return ctx.result(...)`.
 
 ### Attacker-Origin Provenance & Replay Mode Discipline
-- **Attacker-Origin Provenance (Anti-Shortcutting & No Cross-Tenant Probe-Arm Collusion):** ALL probe-arm hops MUST execute strictly under a SINGLE starting low-privilege persona (e.g., `member_a`, `viewer_a`, `member_b`, `dual_member`, or `anonymous` / freshly derived credential), and every subsequent privileged step must use either that same starting persona or a capability derived inside the DAG. NEVER use a pre-seeded privileged/owner persona (`owner_a`, `admin`) or a target-tenant persona on the probe arm to mint handles or tokens for your starting persona — target-tenant personas may appear ONLY in baseline, negative-control, or independent readback checks.
-- **No Premature Single-Hop Filing:** Never stop at an intermediate single-hop info-disclosure, handle, or directory leak when downstream cross-service, auth, or state-machine pivots are reachable — seal it with `ctx.seal_capability(...)` and continue through Hops 2–4 to `ctx.prove_composite(...)`.
+- **Attacker-Origin Provenance (Anti-Shortcutting & No Cross-Tenant Probe-Arm Collusion):** ALL probe-arm hops MUST execute strictly under a SINGLE starting low-privilege persona (e.g., `actor_low`, `actor_dual`, or `anonymous` / freshly derived credential), and every subsequent privileged step must use either that same starting persona or a capability derived inside the DAG. NEVER use a pre-seeded privileged/owner persona (`actor_victim`, `admin`) or a target-tenant persona on the probe arm to mint handles or tokens for your starting persona — target-tenant personas may appear ONLY in baseline, negative-control, or independent readback checks.
+- **No Premature Single-Hop Filing:** Never stop at an intermediate single-hop info-disclosure, handle, or directory leak when downstream cross-service, auth, or state-machine pivots are reachable — seal it with `ctx.seal_capability(...)` and continue through downstream hops to `ctx.prove_composite(...)`.
 - **Mode A (`fresh_clean_replay`, mandatory default):** Re-executes the full DAG plus ablation controls in a clean session with fresh nonces. Always design renewable setup/probes so Mode A passes deterministically.
 - **Mode B (`one_shot_transcript`):** Fail-closed fallback permitted only on irreversible non-benchmark production states where Mode A hits a verified consumed-state conflict (`409`/`410`) AND the original signed transcript has pre-chain denied control + 100% unbroken edge bindings + post-chain readback.
 
@@ -196,9 +196,9 @@ Verify terminal impact against the applicable invariant family:
 
 ```ts
 // Economic conservation pattern (balance_minting / over_refund / underpaid_fulfillment / ineligible_discount)
-const base = await ctx.http_send('/api/v1/ledger/balance', { as: 'member_b', role: 'control' })
-const act1 = await ctx.http_send('/api/v1/ledger/credit', { method: 'POST', as: 'member_b', role: 'probe', body: { amount: 100 } })
-const after = await ctx.http_send('/api/v1/ledger/balance', { as: 'member_b', role: 'control' })
+const base = await ctx.http_send('/api/v1/ledger/balance', { as: 'actor_low', role: 'control' })
+const act1 = await ctx.http_send('/api/v1/ledger/credit', { method: 'POST', as: 'actor_low', role: 'probe', body: { amount: 100 } })
+const after = await ctx.http_send('/api/v1/ledger/balance', { as: 'actor_low', role: 'control' })
 await ctx.prove_composite({
   chainId: 'chain-econ-conservation-1',
   terminalVulnClass: 'economic_conservation',

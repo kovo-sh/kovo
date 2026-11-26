@@ -21,7 +21,6 @@ Summary: Audit OAuth/OIDC authorization flows, redirect_uri validation, state/PK
   - Verify logout/revocation invalidates server-side session or JWT (do not mutate operator personas unless Tier 3 approved).
   - Verify auth error responses do not leak session tokens, reset tokens, or cross-tenant metadata.
 
-## 3. Replay Verification Discipline
-- Always set `followRedirects: false` in `http_chain` steps when proving open redirect or auth bypass redirects.
-- Control step: safe same-origin `next=/dashboard` (or unauthenticated request to gated route returning `302`/`401`/`403`).
-- Probe step: external `https://example.invalid` asserting `status` is `301|302|303|307|308` AND `Location` header parses to host `example.invalid` (never merely matching substring in a query param!).
+## 3. `kovo_verify` Verification Discipline
+- Always pass `followRedirects: false` to `ctx.http(...)` when proving open redirect or auth bypass redirects.
+- Compare a clean control (`next=/dashboard` or unauthenticated gated route returning `302`/`401`/`403`) against an external redirect probe (`https://example.invalid`) using `ctx.expect.status(probe, [301, 302, 303, 307, 308])` and `ctx.expect.header(probe, 'location', { matches: '^https://example\\.invalid(?:/|$)' })` (or `ctx.prove_access_boundary({ boundaryClass: 'auth', ... })` for auth bypasses), then `return ctx.result({ title })`.

@@ -29,6 +29,6 @@ Inspect `/repos` via `run_sast_scan` (`engines: ["opengrep", "ast-grep"]`) befor
 - Run `run_safe_templates` (`techTags: ["nestjs"]`) and `probe_surface` (`mode: "paths"`, `wordlist: "api-routes"`).
 - Use `probe_differential` (`authz_matrix`, `graphql_audit`, `nosqli_type`, `sqli_boolean`) and `probe_websocket` (with spoofed `Origin: https://evil.invalid` vs same-origin control) via `RequestBroker`.
 
-## 4. Closure & Replay Spec Discipline
-- Confirm runtime flaws using `http_chain`, `ws_chain`, or `sql_boolean_diff` Replay Specs with negative controls and strong `counterevidence`.
+## 4. Closure & `kovo_verify` Discipline
+- Confirm runtime flaws via `kovo_verify` (`ctx.prove_access_boundary`, `ctx.prove_boolean_or_timing_diff`, `ctx.http` + `ctx.expect`, or `ctx.seal_capability` + `ctx.prove_composite` for multi-hop chains) + `return ctx.result({ title })`.
 - Record `ruled_out` only when quoting the exact `file:line` of the active `Guard` + ownership check or negative-control `exchangeId`.

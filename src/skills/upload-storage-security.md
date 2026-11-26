@@ -18,6 +18,6 @@ Summary: Audit upload endpoints, presigned object-storage URLs, MIME/content-dis
 - **Path Normalization Review:**
   - Verify upload/download filename parameters reject relative path segments and remain confined to the expected tenant prefix (observe validation errors safely without attempting sensitive host file reads).
 
-## 3. Verification & Replay Spec Guidelines
-- Use `kind: "http_chain"` with a `control` request (legitimate static asset or unauthorized control) and a `probe` request verifying exact response status, `Content-Type`, missing `Content-Disposition: attachment` or exposed XML `<ListBucketResult>`, or cross-tenant `persona` read.
+## 3. `kovo_verify` Verification Guidelines
+- Use `kovo_verify`: call `ctx.prove_access_boundary` for cross-tenant storage reads, or `ctx.http` with a clean `control` and `probe` plus `ctx.expect.status` / `ctx.expect.header` / `ctx.expect.bodyContains` verifying exact status, `Content-Type`, missing `Content-Disposition: attachment`, or exposed XML `<ListBucketResult>`, then `return ctx.result({ title })`.
 - Never upload malicious executables or oversized files; state-changing upload probes require Tier 3 HITL approval.

@@ -20,6 +20,6 @@ Summary: Evaluate URL-fetching parameters, webhook/preview endpoints, and HTTP r
    - If `KOVO_CANARY_BASE_URL` (or a local lab listener) is active, supply the benign canary URL as the external URL input (subject to Tier 2/3 method rules) and call `check_canary` to observe whether the server initiated an outbound fetch, along with its `User-Agent` and timing.
    - Verify whether the server enforces protocol allowlists (`https:` only), blocks redirects to internal hosts, and validates response `Content-Type` and size limits.
 
-## 4. Replay Spec Standards
-- For open redirects: `kind: "http_chain"` with `followRedirects: false` on both `control` and `probe`, asserting exact `Location` host match in `assertionsJq`.
-- For server-side fetch / blind callback findings: require both a clean `control` step and a benign Kovo Hunter canary verification proving outbound request initiation without touching private infrastructure.
+## 4. `kovo_verify` Verification Standards
+- For open redirects: use `ctx.http(target, { followRedirects: false })` for both clean `control` and `probe`, asserting `ctx.expect.status(probe, [301, 302, 303, 307, 308])` and `ctx.expect.header(probe, "location", { matches: "^https://example\\.invalid(?:/|$)" })`, then `return ctx.result({ title })`.
+- For server-side fetch / blind callback findings: use `ctx.prove_oob_callback({ inject: async (canary) => ctx.http(...), timeoutMs: 6000 })` (with a clean control check) proving outbound request initiation without touching private infrastructure, then `return ctx.result({ title })`.

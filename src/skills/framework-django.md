@@ -27,7 +27,7 @@ Audit `/repos` with `run_sast_scan` (`engines: ["opengrep", "bandit", "ast-grep"
 - Use `probe_differential` (`authz_matrix` for BOLA/BFLA; `sqli_boolean` for suspected raw SQL; `ssti_math` for suspected dynamic `Template()` rendering).
 - Test `DELETE`/`PATCH` BOLA only at Tier 3 (with HITL approval) or `local-lab` against disposable test resources.
 
-## 4. Closure & Replay Spec Discipline
-- Confirm dynamic BOLA/SQLi/SSTI with `http_chain` or `sql_boolean_diff` Replay Specs including negative controls.
+## 4. Closure & `kovo_verify` Discipline
+- Confirm dynamic BOLA/SQLi/SSTI via `kovo_verify` (`ctx.prove_access_boundary`, `ctx.prove_boolean_or_timing_diff`, `ctx.prove_injection_differential`, or `ctx.http` + `ctx.expect`) + `return ctx.result({ title })`.
 - For static-only code findings (e.g., `DEBUG=True` or unreached raw SQL sink), submit `static_ast_proof` (`static_verified`) with exact `file:line`.
 - Close clean views with `record_coverage` (`status: "ruled_out"`, `enforcingControl: "<file:line>"`).

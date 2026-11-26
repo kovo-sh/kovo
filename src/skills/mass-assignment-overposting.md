@@ -18,7 +18,7 @@ Run `run_sast_scan` (`opengrep`, `ast-grep`) and inspect request handlers via `d
 - **Static First:** Compare the schema/response fields returned by `GET /api/profile` or `GET /api/users/me` against the request validation layer in `/repos`.
 - **Live Verification (Tier 3 / `local-lab` only):** On a disposable test persona (`user_a`), first capture baseline `GET` state (control), send a benign `PATCH`/`PUT` attempting to set a non-destructive extra marker or check whether an unauthorized field change is accepted vs rejected (`400`/`422`/ignored), then re-fetch `GET` state to verify persistence and restore/clean up state if changed. Never alter real user accounts or production privileges.
 
-## 4. Closure & Replay Spec Discipline
-- Confirm dynamic over-posting via an `http_chain` Replay Spec (`setup`/`control` baseline `GET`, `probe` `PATCH`/`PUT`, verification `GET` confirming persisted privileged field change, optional `cleanup` step).
+## 4. Closure & `kovo_verify` Discipline
+- Confirm dynamic over-posting via `kovo_verify` using `ctx.prove_persisted_mutation({ readRoute, mutation: { path, method: "PATCH", body, as }, fieldPath, expectDelta })` (or `ctx.http` baseline `GET` / `PATCH` / readback `GET` + `ctx.expect.jsonPath`) + `return ctx.result({ title })`.
 - Confirm source-only unsafe bindings via `static_ast_proof` (`static_verified`) citing exact handler `file:line`.
 - Close properly allowlisted handlers via `record_coverage` (`status: "ruled_out"`, `enforcingControl: "<file:line of DTO/schema pick/whitelist>"`).

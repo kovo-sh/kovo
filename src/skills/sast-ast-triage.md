@@ -13,8 +13,8 @@ A raw SAST hit is NEVER a confirmed finding. For every high/critical candidate:
 1. **Reachability Check:** Trace backward from the sink (`file:line`) to an entry point (HTTP route, Server Action, GraphQL resolver, WebSocket handler, webhook, or CI trigger). Is the input actually caller-controlled, or is it hardcoded/config-derived?
 2. **Sanitizer & Guard Check:** Trace every intermediate function and middleware on the path. Look for schema validation (Zod, Pydantic, class-validator), parameterized queries, explicit allowlists, authentication guards, or tenant `WHERE` filters.
 3. **Runtime vs Static Path:**
-   - If the target is reachable live (or in `local-lab`), convert the suspect into a `code_audit_suspect` fact and prove exploitability dynamically via `RequestBroker` + Zero-LLM `ReplayVerifier` (`runtime_confirmed` tier).
-   - If runtime verification is genuinely unavailable (e.g., Tier 0 CI source-only review), construct a deterministic `static_ast_proof` Replay Spec referencing the exact `repo`, `file`, `startLine`, `endLine`, `engine`, and `ruleOrPattern` (`static_verified` tier — never conflated with `confirmed`).
+   - If the target is reachable live (or in `local-lab`), convert the suspect into a `code_audit_suspect` fact and prove exploitability dynamically via `kovo_verify` (`runtime_confirmed` tier).
+   - If runtime verification is genuinely unavailable (e.g., Tier 0 CI source-only review), submit a deterministic `static_ast_proof` via `propose_chain_finding` referencing the exact `repo`, `file`, `startLine`, `endLine`, `engine`, and `ruleOrPattern` (`static_verified` tier — never conflated with `confirmed`).
 4. **3-State Closure:**
    - Confirmed or static-verified → `record_coverage` (`status: "reported"`, `linkedFindingId`).
    - Mitigated on the exact path → `record_coverage` (`status: "ruled_out"`, `enforcingControl: "<file:line>"`).

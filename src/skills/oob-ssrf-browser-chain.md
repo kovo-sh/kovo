@@ -1,11 +1,11 @@
 # OOB Canary SSRF & Broker-Proxied Browser Chain Verification
 Tags: ssrf, oob, canary, browser-chain, playwright, postmessage, cors, dom, redirects
-Summary: Verify blind server-side outbound fetches using Kovo Hunter’s live OOB Canary Broker and validate multi-step client-side or cross-origin browser chains using Zero-LLM broker-proxied Playwright browser_chain Replay Specs.
+Summary: Verify blind server-side outbound fetches using Kovo Hunter’s live OOB Canary Broker and validate multi-step client-side or cross-origin browser chains using kovo_verify (ctx.prove_oob_callback, ctx.browser, ctx.prove_composite).
 
 ## 1. Strict Defensive Boundaries
-- **Zero internal network probing:** Never pass loopback (`127.0.0.1`, `::1`, `localhost`), RFC1918 private IPs, or cloud metadata addresses (`169.254.169.254`, `metadata.google.internal`) in URL parameters or Replay Specs. Kovo Hunter's broker and schema strictly block them.
+- **Zero internal network probing:** Never pass loopback (`127.0.0.1`, `::1`, `localhost`), RFC1918 private IPs, or cloud metadata addresses (`169.254.169.254`, `metadata.google.internal`) in URL parameters or `kovo_verify` scripts. Kovo Hunter's broker and schema strictly block them.
 - **Zero weaponized payloads:** Never craft exploit shells, credential stealers, persistent defacement, or destructive actions. Prove reachability and policy gaps exclusively with benign signed Kovo Hunter canary tokens and non-destructive read-only checks.
-- **100% broker-proxied browser:** `browser_visit` and `browser_chain` route every request through Kovo Hunter's RequestBroker and abort any unapproved third-party origin automatically.
+- **100% broker-proxied browser:** `browser_visit` and `ctx.browser` route every request through Kovo Hunter's RequestBroker and abort any unapproved third-party origin automatically.
 
 ## 2. Out-of-Band (OOB) Benign Canary Workflow (`mint_canary` / `check_canary`)
 Use OOB canaries to prove blind server-side URL fetching (SSRF sinks, webhook test buttons, OpenGraph/link-preview fetchers, avatar/image importers, PDF/screenshot renderers, Server Actions calling `fetch(userUrl)`):
@@ -20,30 +20,7 @@ Use OOB canaries to prove blind server-side URL fetching (SSRF sinks, webhook te
    - Does it follow HTTP redirects blindly, expose backend `User-Agent`/internal headers, or leak response bodies back to the caller?
    - Record concrete `endpoint` / `policy_gap` facts referencing the `exchangeId` and canary `token`.
 
-## 3. Multi-Step Browser Chain Verification (`kind: "browser_chain"`)
-Use `browser_chain` Replay Specs (Zero-LLM Playwright verification via `ScopedBrowser`) when a vulnerability requires real browser execution across 2–8 steps—for example:
-- Cross-origin credentialed `fetch` (`credentials: "include"`) from an approved sibling/sandbox origin (e.g., `sandpack.*`) to a crown-jewel API/auth origin (`clerk.*`, `api.*`) reflecting permissive CORS.
-- Cross-origin `postMessage` listener accepting messages from untrusted origins (`action: "postmessage_probe"`).
-- Authenticated DOM/storage/XHR exposure or benign DOM reflection checks (`action: "dom_check"` with `checkKind: "dom_xss" | "postmessage" | "client_storage" | "xhr_leak"`).
-- Browser-side redirect chains (`action: "redirect_observe"`).
-
-### Exact `browser_chain` Replay Spec Schema
-- Top-level fields:
-  - `version: 1`, `kind: "browser_chain"`, `origin` (primary approved origin), `title`, `category`, `cwe`, `severity`, `severityRationale`, `impact`, `remediation`, `recheckInstructions`, `assertionsJq`
-  - `spaCatchallControl?: boolean` (set `true` on SPA hosts to guard against catch-all HTML false positives)
-  - `steps`: array of **2 to 8** `BrowserChainStep` objects, containing at least one `role: "control"` step and at least one `role: "probe"` step.
-- Each `BrowserChainStep`:
-  - `id`: short slug (`^[a-z0-9_-]{1,32}$`)
-  - `role`: `"setup" | "control" | "probe" | "cleanup"`
-  - `description`: concise explanation
-  - `origin`: approved HTTPS origin
-  - `pathAndQuery`: path starting with `/`
-  - `persona?`: approved opaque persona handle
-  - `action?`: `"navigate" | "dom_check" | "postmessage_probe" | "same_site_fetch" | "redirect_observe"`
-  - `checkKind?`: `"dom_xss" | "postmessage" | "client_storage" | "xhr_leak"`
-  - `selector?`: optional CSS selector to wait for/inspect
-  - `fetchTarget?`: `{ origin, pathAndQuery, method?: "GET"|"HEAD"|"OPTIONS", credentials?: "include"|"same-origin"|"omit" }` (for `same_site_fetch` read-only CORS/session proof)
-  - `postMessageOrigin?`, `postMessagePayload?` (benign canary string only), `waitAfterLoadMs?`
-- `assertionsJq` runs over `/evidence/replay-results.json`:
-  `{ kind, origin, replayedAt, canaryToken, steps, pages, consoleMessages, requests, domResults, control, probe, spaCatchall? }`
-  and MUST output `{ "confirmed": boolean, "controlPassed": boolean, "observed": string, "expected": string }`.
+## 3. `kovo_verify` OOB & Browser Verification
+- **OOB SSRF Proof:** Call `ctx.prove_oob_callback({ inject: async (canary) => ctx.http('/api/fetch', { method: 'POST', as: 'actor_low', body: { url: canary.url } }), timeoutMs: 6000 })` and `return ctx.result({ title })`.
+- **Browser / DOM / CORS / postMessage Proof:** Use `ctx.browser(target, { as?, waitForSelector?, timeoutMs? })` (paired with a clean control URL) and assert DOM execution or state with `ctx.expect.domSentinel(probeEx, sentinel, 'executed')`, `ctx.expect.css(...)`, or `ctx.expect.status(...)` + `ctx.expect.header(...)`, verifying non-SPA target responses before calling `return ctx.result({ title })`.
+- **Multi-Hop Browser + API Pivot:** When a browser interaction or OOB callback yields a reusable token or triggers an internal hop, seal any extracted artifact with `ctx.seal_capability`, continue in the same `kovo_verify` script, and confirm the full DAG with `ctx.prove_composite({ replayMode: 'fresh_clean_replay', ... })` (`surface: 'browser'`).

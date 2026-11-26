@@ -17,6 +17,6 @@ Use Kovo Hunter’s host-side `probe_differential` (`probeClass: "nosqli_type"`)
 - Checks for deterministic status, body-length, or record-count divergence while verifying negative controls and SPA-catchall exclusion.
 - Keep Tier 1/2 checks strictly read-only; never probe mutating auth/account endpoints without Tier 3 HITL approval or `local-lab` isolation.
 
-## 3. Closure, Replay Spec & Remediation
+## 3. Closure, `kovo_verify` & Remediation
 - **Remediation:** Enforce strict runtime schema validation requiring primitive types (`z.string()`, `typeof x === 'string'`), enable `mongoose.set('sanitizeFilter', true)`, reject keys starting with `$` or containing `.`, and avoid passing raw request objects into query builders.
-- **Closure:** Confirm live read-only operator divergence via an `http_chain` Replay Spec (baseline control + invalid-type control + operator-object probe + strict `assertionsJq`) with non-empty `counterevidence`. For static-only code sinks, submit `static_ast_proof` (`static_verified`). Close validated handlers via `record_coverage` (`status: "ruled_out"`, `enforcingControl: "<file:line>"`).
+- **Closure:** Confirm live read-only operator divergence via `kovo_verify` using `ctx.prove_boolean_or_timing_diff({ control, variant, mode: "boolean" })` (or `ctx.http` baseline + invalid-type control + operator-object probe + `ctx.expect`) and `return ctx.result({ title })`. For static-only code sinks, submit `static_ast_proof` (`static_verified`). Close validated handlers via `record_coverage` (`status: "ruled_out"`, `enforcingControl: "<file:line>"`).

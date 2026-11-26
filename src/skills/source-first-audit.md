@@ -58,7 +58,7 @@ For EVERY genuine gap or high-leverage suspect (skip clean, well-protected handl
     "authCheck": "session checked via getUser()",
     "ownershipCheck": "none — queries by params.id with service_role client",
     "sinkKind": "db_query",
-    "hypothesis": "Authenticated user_b can read user_a's project record via GET /api/projects/<user_a_id> due to missing user_id filter on service-role query.",
+    "hypothesis": "Authenticated actor_low can read actor_victim's project record via GET /api/projects/<actor_victim_id> due to missing user_id filter on service-role query.",
     "recommendedTier": 2
   }
   ```

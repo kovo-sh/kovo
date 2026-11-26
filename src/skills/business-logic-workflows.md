@@ -17,8 +17,8 @@ Start by mapping domain state machines in `/repos` (`run_sast_scan`, `derive_evi
 
 ## 3. Safe Verification (`RequestBroker`)
 - Always restrict mutating workflow tests to Tier 2/3 (with HITL approval) or `local-lab` using dedicated disposable test personas/resources.
-- For suspected TOCTOU/concurrency bugs on single-use test actions, use `request_http_race` (2–10 synchronized requests) and confirm with a `race_burst` Replay Spec checking that multiple concurrent requests succeeded when only one should have.
-- For negative-value/step-skipping logic flaws, verify with an `http_chain` Replay Spec containing a valid baseline control and the invalid state-transition probe.
+- For suspected TOCTOU/concurrency bugs on single-use test actions, confirm via `kovo_verify` using `ctx.prove_race_burst({ requests, readRoute, balanceField, unitDebit })` (`2–10` synchronized requests) verifying that multiple concurrent requests succeeded when only one should have.
+- For negative-value/step-skipping logic flaws, verify via `kovo_verify` using `ctx.prove_persisted_mutation({ readRoute, mutation, fieldPath, expectDelta })` (or `ctx.http` + `ctx.expect`, or `ctx.seal_capability` + `ctx.prove_composite` for multi-hop workflows), then `return ctx.result({ title })`.
 
 ## 4. Closure & Counterevidence
 - In `counterevidence`, evaluate whether an asynchronous reconciliation job, database constraint, or Stripe/payment-provider authoritative check prevents real financial or integrity impact.

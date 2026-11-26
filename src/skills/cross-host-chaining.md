@@ -11,11 +11,11 @@ Evaluate every pair of approved origins `(Origin A, Origin B)` against these def
 1. **Permissive Subdomain Credentialed CORS + User-Controlled Execution / Sandbox Origin:**
    - **Primitive A (Crown Jewel):** Auth, account, or API host (`clerk.*`, `accounts.*`, `api.*`) reflects `Access-Control-Allow-Origin: https://<any-subdomain>.example.com` WITH `Access-Control-Allow-Credentials: true` (or accepts `Origin: null`).
    - **Primitive B (Execution / UGC / Sandbox Host):** Another subdomain (`sandpack.*`, `preview.*`, `bundler.*`, or a host with DOM XSS / untrusted HTML upload) allows untrusted scripts or user-authored code to execute in that subdomain's origin.
-   - **Verification:** Confirm Origin A returns authenticated/session data with `ACAO: <Origin B>` and `ACAC: true`, AND confirm Origin B is a trusted sibling origin capable of executing untrusted script/frames. Use `browser_chain` or `http_chain` Replay Specs (strictly benign read-only markers—never exfiltrate real credentials).
+   - **Verification:** Confirm Origin A returns authenticated/session data with `ACAO: <Origin B>` and `ACAC: true`, AND confirm Origin B is a trusted sibling origin capable of executing untrusted script/frames. Verify via `kovo_verify` (`ctx.http` / `ctx.browser` + `ctx.expect` and `ctx.seal_capability` + `ctx.prove_composite` with strictly benign read-only markers—never exfiltrate real credentials).
 
 2. **Wildcard Trust / Cookie Domain (`Domain=.example.com`) + Dangling CNAME / Subdomain Takeover:**
    - **Primitive A:** Crown-jewel host sets session/CSRF cookies scoped to parent domain (`Domain=.example.com`), trusts `*.example.com` in CORS, or allows `*.example.com` in OAuth `redirect_uri` / `postMessage` origin checks.
-   - **Primitive B:** Sibling subdomain has an unclaimed third-party CNAME (`dns_takeover` fact / NXDOMAIN / provider unclaimed fingerprint).
+   - **Primitive B:** Sibling subdomain has an unclaimed third-party CNAME (NXDOMAIN / provider unclaimed fingerprint).
    - **Impact Elevation:** An unclaimed subdomain elevates from informational/medium brand risk to High/Critical session fixation, credentialed CORS read, or OAuth token interception.
 
 3. **OAuth / SSO Redirect Allowlist + Open Redirect or Unmaintained Sibling Host:**
@@ -30,10 +30,10 @@ Evaluate every pair of approved origins `(Origin A, Origin B)` against these def
 
 5. **Cross-Origin `postMessage` & Iframe Trust Mismatch:**
    - **Primitive A:** Host A embeds Host B (or vice versa) and exchanges sensitive state/tokens via `postMessage` with `targetOrigin: '*'` or weak `event.origin.includes(...)` / missing `event.origin` checks.
-   - **Verification:** Use `browser_visit` (`domCheck: 'postmessage'`) and `browser_chain` Replay Specs with benign canary strings to verify cross-origin message acceptance without destructive payloads.
+   - **Verification:** Use `browser_visit` (`domCheck: 'postmessage'`) for discovery and verify via `kovo_verify` (`ctx.browser` + `ctx.expect.domSentinel` / `ctx.prove_composite`) with benign canary strings to prove cross-origin message acceptance without destructive payloads.
 
 ## 3. Quality Bar & Zero False Positives
 - Every cross-host hypothesis MUST cite concrete recorded `factIds` from **>= 2 distinct approved origins** (or 1 origin + a shared parent-domain trust boundary).
 - Do NOT chain benign public `Access-Control-Allow-Origin: *` (without `ACAC: true`) on static assets, or routine missing security headers (HSTS/Referrer-Policy/X-Content-Type-Options).
 - Focus cross-host chains on at least one `crown_jewel` origin (auth, billing, API, LLM proxy, uploads, admin, sandbox).
-- Never reference unapproved origins in `chainSteps` or Replay Specs.
+- Never reference unapproved origins in `chainSteps` or `kovo_verify` scripts.

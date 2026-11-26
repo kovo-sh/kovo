@@ -20,7 +20,7 @@ Audit `/repos` via `run_sast_scan` (`opengrep`, `ast-grep`) and `derive_evidence
 - **Client-Side DOM Verification:** Use Kovo Hunter’s broker-proxied `browser_visit` with `dom_xss_sink_hook` and a benign non-destructive marker query parameter (comparing clean baseline control vs canary parameter) to detect whether a client-side parser mutates a harmless custom test property or reaches a DOM sink.
 - **Offline Proof via `run_offline_script`:** When source code is mounted, validate the exact merge/setter function behavior offline inside the air-gapped `--network none` Node runtime on isolated synthetic inputs.
 
-## 3. Closure & Replay Spec Discipline
-- Confirm client-side DOM impact via `browser_dom` or `browser_chain` Replay Specs with clean control vs probe steps.
+## 3. Closure & `kovo_verify` Discipline
+- Confirm client-side DOM impact via `kovo_verify` using `ctx.browser(target, { as? })` + `ctx.expect.domSentinel(probeEx, sentinel, "executed")` (comparing a clean control URL vs probe URL) + `return ctx.result({ title })`.
 - Confirm server-side source sinks via `static_ast_proof` (`static_verified`) citing the exact merge/setter `file:line`, plus concrete `counterevidence` analyzing whether `JSON.parse` / `Object.hasOwn` / schema validation blocks dangerous keys upstream.
 - Close safe implementations via `record_coverage` (`status: "ruled_out"`, `enforcingControl: "<file:line>"`).

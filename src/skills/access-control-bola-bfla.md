@@ -19,10 +19,9 @@ Summary: Prove broken object-level authorization (BOLA/IDOR), broken function-le
    - Test `orgId`, `workspaceId`, `userId`, `tenantId` query parameters and `X-Organization-Id` / `X-Tenant-Id` headers when authenticated as `tenant_b` referencing `tenant_a`'s ID.
    - Check Supabase PostgREST endpoints (`/rest/v1/<table>?select=*`) if a public `anon` key and Supabase URL were harvested—verify whether Row Level Security (RLS) restricts private user tables.
 5. **Race Conditions / TOCTOU (Tier 2/3):**
-   - On quota/credit/coupon/redemption endpoints, use `request_http_batch` (`2..10` synchronized requests) only when non-destructive or Tier-3 approved.
+   - On quota/credit/coupon/redemption endpoints, verify concurrency via `kovo_verify` using `ctx.prove_race_burst({ requests, readRoute, balanceField, unitDebit })` (`2..10` synchronized requests) only when non-destructive or Tier-3 approved.
 
-## 3. Declarative Replay Spec Requirements
-- Use `kind: "http_chain"` with `spaCatchallControl: true`.
-- Reference personas ONLY via `request.persona` (never raw `Authorization` or `Cookie`).
-- Extract `<id_a>` dynamically in a `setup` step (`extract: [{ varName: "target_id", from: "json", selector: "..." }]`) so the replay verifier reproduces the chain cleanly from scratch.
-- In `assertionsJq`, assert owner baseline succeeded (`200`), unauthenticated control failed (`401|403`), AND cross-tenant probe returned `200` with `tenant_a`'s specific identifier/field!
+## 3. `kovo_verify` Verification Requirements
+- Use `kovo_verify` with `ctx.prove_access_boundary({ controlPersona, probePersona, route, method? })` for direct BOLA/BFLA checks, or `ctx.http` + `ctx.seal_capability` + `ctx.prove_composite` when the target ID must be harvested in a prerequisite setup hop (`replayMode: "fresh_clean_replay"`).
+- Reference personas ONLY via opaque handles (`as` / `controlPersona` / `probePersona`, never raw `Authorization` or `Cookie`).
+- Assert non-SPA content and concrete differential outcomes via `ctx.expect.status` / `ctx.expect.jsonPath` / `ctx.expect.bodyContains` and finish with `return ctx.result({ title })`.
