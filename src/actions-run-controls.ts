@@ -1,9 +1,30 @@
 import { randomUUID } from 'node:crypto'
 import { createServerFn } from '@tanstack/react-start'
 import { z } from 'zod'
-import { id, runLabelText } from './domain.ts'
+import { approvalScopes, id, runLabelText } from './domain.ts'
 import { execution } from './server/execution.ts'
 import { store } from './server/store.ts'
+
+export const decideApprovalAction = createServerFn({ method: 'POST' })
+  .validator(z.object({
+    requestId: id.optional(),
+    runId: id,
+    approvalId: id,
+    decision: z.enum(['approved', 'denied']),
+    scope: z.enum(approvalScopes).optional(),
+  }))
+  .handler(({ data }) => {
+    const result = store().command({
+      requestId: data.requestId ?? randomUUID(),
+      runId: data.runId,
+      action: 'decide_approval',
+      approvalId: data.approvalId,
+      decision: data.decision,
+      ...(data.scope ? { scope: data.scope } : {}),
+    })
+    execution().wake()
+    return result
+  })
 
 export const revokeApprovalLeaseAction = createServerFn({ method: 'POST' })
   .validator(z.object({

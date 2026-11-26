@@ -3,15 +3,30 @@
  * path primitive, keeping admission, leases, denylists, and approvals on one interpretation.
  */
 import { createHash } from 'node:crypto'
+import {
+  deriveOperatorPrefixPatternFromNormalized,
+  HOST_NONDESTRUCTIVE_LEASE_METHOD,
+  HOST_NONDESTRUCTIVE_LEASE_PATTERN,
+  isConcreteApprovalIdSegment,
+  isHighRiskOrExternalMutationPath,
+  isHostNonDestructiveLease,
+  isNonDestructiveMutationMethod,
+  isPrefixApprovalPattern,
+  NON_DESTRUCTIVE_MUTATION_METHODS,
+} from '../domain.ts'
 import type { ApprovedEndpointPattern } from '../domain.ts'
 import { canonicalPathAndQuery } from './scope-policy.ts'
 
-const UUID_SEGMENT = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
-const MONGO_ID_SEGMENT = /^[0-9a-f]{24}$/i
-const NUMERIC_SEGMENT = /^\d+$/
-const LONG_HEX_SEGMENT = /^[0-9a-f]{16,}$/i
-const PREFIXED_ID_SEGMENT = /^[a-z]{2,10}_[a-zA-Z0-9]{8,}$/
-const OPAQUE_TOKEN_SEGMENT = /^(?=.*\d)(?=.*[a-zA-Z])[a-zA-Z0-9_-]{14,}$/
+export {
+  HOST_NONDESTRUCTIVE_LEASE_METHOD,
+  HOST_NONDESTRUCTIVE_LEASE_PATTERN,
+  isHighRiskOrExternalMutationPath,
+  isHostNonDestructiveLease,
+  isNonDestructiveMutationMethod,
+  isPrefixApprovalPattern,
+  NON_DESTRUCTIVE_MUTATION_METHODS,
+}
+
 const PLACEHOLDER_SEGMENT = /^(?::[A-Za-z0-9_]+|\{[A-Za-z0-9_]+\}|\[[A-Za-z0-9_]+\])$/
 
 /**
@@ -21,14 +36,7 @@ const PLACEHOLDER_SEGMENT = /^(?::[A-Za-z0-9_]+|\{[A-Za-z0-9_]+\}|\[[A-Za-z0-9_]
  * `POST /api/items/<id>` used to cover `POST /api/items/delete`.
  */
 function isConcreteIdSegment(segment: string): boolean {
-  return (
-    UUID_SEGMENT.test(segment) ||
-    MONGO_ID_SEGMENT.test(segment) ||
-    NUMERIC_SEGMENT.test(segment) ||
-    LONG_HEX_SEGMENT.test(segment) ||
-    PREFIXED_ID_SEGMENT.test(segment) ||
-    OPAQUE_TOKEN_SEGMENT.test(segment)
-  )
+  return isConcreteApprovalIdSegment(segment)
 }
 
 function isIdLikeSegment(segment: string): boolean {
@@ -183,6 +191,20 @@ export function normalizeApprovalPathPattern(
   })
 
   return segments.join('/') || '/'
+}
+
+/**
+ * Derive an explicit operator-authored prefix pattern (e.g. `/_actions/redeemReferralAwardAction`
+ * -> `/_actions/**`, `/api/emails` -> `/api/**`) from a worker-submitted request path.
+ *
+ * R3-H-9 invariant: returns `null` whenever the card path contains ANY glob metacharacter (`*`),
+ * is malformed, or has no concrete leading prefix segment (never emits bare `/**`).
+ */
+export function deriveOperatorPrefixPattern(pathAndQuery: string): string | null {
+  if (hasApprovalPathGlobMetacharacters(pathAndQuery)) return null
+  const normalized = normalizeApprovalPathPattern(pathAndQuery, { source: 'card_path' })
+  if (!normalized) return null
+  return deriveOperatorPrefixPatternFromNormalized(normalized, false)
 }
 
 /**

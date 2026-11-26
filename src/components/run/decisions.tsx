@@ -10,6 +10,7 @@
 // absent so Queue never contradicts Report/SARIF/Overview.
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
+import type { ApprovalScope } from '../../domain.ts'
 import { useRun } from './data.tsx'
 import type { Command } from './data.tsx'
 import { plural } from './format.ts'
@@ -32,15 +33,21 @@ export function actionsFor(it: QueueItem | undefined | null, now = Date.now()): 
   if (it.kind === 'consent') return [['scope', 'Approve scope', 'a', true]]
   if (it.kind === 'approval') {
     if (isApprovalExpired(it.ap, now)) return []
-    return [['approve', 'Approve', 'a', true], ['deny', 'Deny', 'd', false]]
+    const isHighOrDelete = it.ap.riskLevel === 'high' || String(it.ap.method ?? '').trim().toUpperCase() === 'DELETE'
+    return [['approve', isHighOrDelete ? 'Approve once' : 'Approve route', 'a', true], ['deny', 'Deny', 'd', false]]
   }
   if (it.kind === 'follow') return [['queue', 'Queue follow-up', 'a', true]]
   return []
 }
 
 /** The real command for an approval decision. */
-export function approvalCommand(approvalId: string, act: 'approve' | 'deny'): Command {
-  return { action: 'decide_approval', approvalId, decision: act === 'approve' ? 'approved' : 'denied' }
+export function approvalCommand(approvalId: string, act: 'approve' | 'deny', scope?: ApprovalScope): Command {
+  return {
+    action: 'decide_approval',
+    approvalId,
+    decision: act === 'approve' ? 'approved' : 'denied',
+    ...(scope ? { scope } : {}),
+  }
 }
 
 /** Queue progress summary ensuring `handledCount <= initialCount` and ratio stays within `[0, 1]`. */
@@ -189,7 +196,7 @@ export interface DecisionsApi {
   handledCount: number
   sectionOf: (key: string) => QueueSection | null
   canAct: (key: string, act: DecisionAct) => boolean
-  decide: (key: string, act: DecisionAct, opts?: { command?: Command; message?: ReactNode; sub?: string; silent?: boolean }) => boolean
+  decide: (key: string, act: DecisionAct, opts?: { command?: Command; message?: ReactNode; sub?: string; silent?: boolean; alsoKeys?: readonly string[] }) => boolean
   approvingAll: boolean
   approveAllPending: (command?: Command) => Promise<boolean>
 }
@@ -247,7 +254,13 @@ export function DecisionsProvider({ children }: { children: ReactNode }) {
   const decide = useCallback<DecisionsApi['decide']>((key, act, opts = {}) => {
     if (!canAct(key, act)) return false
     if (!opts.command) return false
-    setAll(prev => ({ ...prev, [key]: { act, at: Date.now(), state: 'sent' } }))
+    const affectedKeys = [key, ...(opts.alsoKeys ?? []).filter(k => k !== key && !reconciledAll[k])]
+    const at = Date.now()
+    setAll(prev => {
+      const next = { ...prev }
+      for (const k of affectedKeys) next[k] = { act, at, state: 'sent' }
+      return next
+    })
     if (!opts.silent) {
       toast.show(opts.message ?? ACTIONS[act].label, {
         sub: opts.sub,
@@ -257,19 +270,22 @@ export function DecisionsProvider({ children }: { children: ReactNode }) {
     void send(opts.command).then(
       () => {
         setSessionHandledKeys(prev => {
-          if (prev.has(key)) return prev
           const next = new Set(prev)
-          next.add(key)
+          for (const k of affectedKeys) next.add(k)
           return next
         })
       },
       (e: unknown) => {
-        setAll(prev => { const n = { ...prev }; delete n[key]; return n })
+        setAll(prev => {
+          const n = { ...prev }
+          for (const k of affectedKeys) delete n[k]
+          return n
+        })
         toast.show(e instanceof Error ? e.message : 'Kovo Hunter could not complete the action.', { tone: 'error' })
       },
     )
     return true
-  }, [canAct, toast, send])
+  }, [canAct, reconciledAll, toast, send])
 
   const approveAllPending = useCallback<DecisionsApi['approveAllPending']>(async (command = { action: 'approve_all_pending' }) => {
     const count = activePendingApprovals.length

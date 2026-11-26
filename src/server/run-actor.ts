@@ -25,6 +25,11 @@ import {
   StateChangeApprovalLedger,
 } from './approval-judge.ts'
 import {
+  hasApprovalPathGlobMetacharacters,
+  isHighRiskOrExternalMutationPath,
+  isNonDestructiveMutationMethod,
+} from './approval-pattern.ts'
+import {
   BrokerApprovalRequired,
   BrokerDenied,
   type BrokerExchangeResult,
@@ -1904,6 +1909,39 @@ export class RunTier3ApprovalCoordinator {
         }
       } else {
         for (const { target, idx, evaluation } of escalatedTargets) {
+          // If an earlier card in this batch granted a durable route/prefix/host lease, honor it
+          // for subsequent non-high-risk, non-multipart, non-race-burst targets on non-local-lab runs.
+          const canReuseDurableLease =
+            project.environment !== 'local-lab' &&
+            !options.isRaceBurst &&
+            !target.hasMultipart &&
+            evaluation.stage !== 'hard_escalation' &&
+            evaluation.riskLevel !== 'high' &&
+            isNonDestructiveMutationMethod(target.method) &&
+            !hasApprovalPathGlobMetacharacters(target.pathAndQuery) &&
+            !isHighRiskOrExternalMutationPath(target.pathAndQuery) &&
+            this.host.storage.leaseAuthorizes(run.id, target.origin, target.method, target.pathAndQuery)
+          if (canReuseDurableLease) {
+            this.host.storage.recordAutoApprovalDecision(run, job.assignment, {
+              origin: target.origin, method: target.method, pathAndQuery: target.pathAndQuery,
+              personaHandle: target.personaHandle,
+              rationale: multiTarget
+                ? `${options.rationale} (target ${idx + 1}/${distinctTargets.length}: ${target.method.toUpperCase()} ${target.pathAndQuery})`
+                : options.rationale,
+              requestPreview: options.requestPreview,
+              riskLevel: 'low',
+              policyNote: 'Authorized by active durable operator approval lease.',
+              secrets: options.secrets,
+              decision: 'approved',
+              decidedBy: 'auto-review:rule',
+            })
+            approvedGrants.push({
+              origin: target.origin, method: target.method, pathAndQuery: target.pathAndQuery,
+              personaHandle: target.personaHandle, bodyHash: target.bodyHash, bodyPreview: target.bodyPreview,
+              hasMultipart: target.hasMultipart, isRaceBurst: false, instances: target.instances,
+            })
+            continue
+          }
           const targetPreview = multiTarget
             ? JSON.stringify({
                 batchItem: `${idx + 1}/${distinctTargets.length}`,
@@ -2081,6 +2119,37 @@ export class RunTier3ApprovalCoordinator {
         decidedBy: approved ? (evaluation.decidedBy === 'operator' ? 'auto-review:rule' : evaluation.decidedBy) : 'auto-review:judge',
       })
       if (!approved) return { approved: false, deniedReason: evaluation.reason }
+      const targetGrant = grantTarget()
+      if (!input.deferGrant) {
+        registerStateChangeGrant(this.host.stateChangeApprovals, this.host.burstApprovalInstances, run, targetGrant)
+      }
+      return { approved: true, grantTarget: targetGrant }
+    }
+
+    // Honor an active durable operator lease (route / prefix / non-destructive host) only when the
+    // request did NOT trigger a hard escalation or high-risk rating, is not a race burst / RCE proof /
+    // multipart upload, and is not an ephemeral local-lab run (where single-use ledger is authoritative).
+    const canReuseDurableLease =
+      project.environment !== 'local-lab' &&
+      !input.isRceProof &&
+      !input.isRaceBurst &&
+      !input.hasMultipart &&
+      evaluation.stage !== 'hard_escalation' &&
+      evaluation.riskLevel !== 'high' &&
+      isNonDestructiveMutationMethod(input.method) &&
+      !hasApprovalPathGlobMetacharacters(input.pathAndQuery) &&
+      !isHighRiskOrExternalMutationPath(input.pathAndQuery) &&
+      this.host.storage.leaseAuthorizes(run.id, input.origin, input.method, input.pathAndQuery)
+    if (canReuseDurableLease) {
+      this.host.storage.recordAutoApprovalDecision(run, job.assignment, {
+        origin: input.origin, method: input.method, pathAndQuery: input.pathAndQuery,
+        personaHandle: input.personaHandle, rationale: input.rationale,
+        requestPreview: input.requestPreview, riskLevel: 'low',
+        policyNote: 'Authorized by active durable operator approval lease.',
+        secrets: input.secrets,
+        decision: 'approved',
+        decidedBy: 'auto-review:rule',
+      })
       const targetGrant = grantTarget()
       if (!input.deferGrant) {
         registerStateChangeGrant(this.host.stateChangeApprovals, this.host.burstApprovalInstances, run, targetGrant)

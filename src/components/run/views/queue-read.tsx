@@ -416,7 +416,7 @@ interface RequestPreview { method?: string; origin?: string; pathAndQuery?: stri
 function parsePreview(a: Approval): RequestPreview {
   try { const v = JSON.parse(a.requestPreview) as unknown; return v && typeof v === 'object' ? v as RequestPreview : {} } catch { return {} }
 }
-export function ReadApproval({ it, now = Date.now() }: { it: ApprovalItem; now?: number }) {
+export function ReadApproval({ it, now = Date.now(), duplicateCount = 1 }: { it: ApprovalItem; now?: number; duplicateCount?: number }) {
   const model = useRunModel()
   const links = useLinks()
   const a = it.ap
@@ -428,6 +428,7 @@ export function ReadApproval({ it, now = Date.now() }: { it: ApprovalItem; now?:
   const persona = a.personaHandle && a.personaHandle !== 'None' ? a.personaHandle : null
   const policy = model.run.approvalPolicy
   const expired = isApprovalExpired(a, now)
+  const decidedLabel = [cap(a.status), a.decidedBy].filter(Boolean).join(' · ')
   return <>
     <div className="mb-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-[12px] text-fg-subtle">
       <span className="inline-flex items-center gap-1.5 font-medium text-warn" title="State-changing request requiring approval"><Icon name="shield" />State-change approval</span><span>·</span>
@@ -444,7 +445,15 @@ export function ReadApproval({ it, now = Date.now() }: { it: ApprovalItem; now?:
         ? <Tag tone="warn">Expired</Tag>
         : a.status === 'pending'
           ? <Tag className="tabular-nums">Expires {fmtTime(a.expiresAt)}</Tag>
-          : <Tag>{cap(a.status)}{a.decidedBy ? ' · ' + a.decidedBy : ''}</Tag>}
+          : <Tag>{decidedLabel}</Tag>}
+      {a.status === 'pending' && !expired && duplicateCount > 1 && (
+        <span
+          className="inline-flex h-5 items-center rounded-[10px] bg-warn-soft px-[7px] text-[11.5px] leading-none tabular-nums text-warn shadow-[inset_0_0_0_1px_var(--warn-line)]"
+          data-testid="inspector-dedupe-tag"
+        >
+          ×{duplicateCount} pending on this route
+        </span>
+      )}
     </div>
     <Section title="Why">
       <p className="text-fg!">{a.rationale}</p>

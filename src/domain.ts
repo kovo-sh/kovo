@@ -31,6 +31,197 @@ export type CapabilityTier = typeof capabilityTiers[number]
 export const approvalPolicies = ['auto_review', 'yolo', 'strict'] as const
 export type ApprovalPolicy = typeof approvalPolicies[number]
 
+export const approvalScopes = ['once', 'route', 'prefix', 'host_nondestructive'] as const
+export type ApprovalScope = typeof approvalScopes[number]
+
+export const NON_DESTRUCTIVE_MUTATION_METHODS = new Set(['POST', 'PUT', 'PATCH'])
+export const HOST_NONDESTRUCTIVE_LEASE_METHOD = 'NON_DESTRUCTIVE'
+export const HOST_NONDESTRUCTIVE_LEASE_PATTERN = 'host:non_destructive'
+
+export function isNonDestructiveMutationMethod(method: string): boolean {
+  return NON_DESTRUCTIVE_MUTATION_METHODS.has(method.trim().toUpperCase())
+}
+
+export function isHostNonDestructiveLease(lease: { method: string; routePattern: string }): boolean {
+  return (
+    lease.method.trim().toUpperCase() === HOST_NONDESTRUCTIVE_LEASE_METHOD &&
+    lease.routePattern.trim() === HOST_NONDESTRUCTIVE_LEASE_PATTERN
+  )
+}
+
+export function isPrefixApprovalPattern(pathPattern: string): boolean {
+  const trimmed = pathPattern.trim()
+  return trimmed.endsWith('/**') && trimmed !== '/**' && trimmed.length > 3
+}
+
+const APPROVAL_UUID_SEG = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+const APPROVAL_MONGO_ID_SEG = /^[0-9a-f]{24}$/i
+const APPROVAL_NUMERIC_SEG = /^\d+$/
+const APPROVAL_LONG_HEX_SEG = /^[0-9a-f]{16,}$/i
+const APPROVAL_PREFIXED_ID_SEG = /^[a-z]{2,10}_[a-zA-Z0-9]{8,}$/
+const APPROVAL_OPAQUE_TOKEN_SEG = /^(?=.*\d)(?=.*[a-zA-Z])[a-zA-Z0-9_-]{14,}$/
+const APPROVAL_ORIGIN_PREFIX_RE = /^[a-z][a-z0-9+.-]*:\/\/[^/?#]*/i
+
+export function isConcreteApprovalIdSegment(segment: string): boolean {
+  return (
+    APPROVAL_UUID_SEG.test(segment) ||
+    APPROVAL_MONGO_ID_SEG.test(segment) ||
+    APPROVAL_NUMERIC_SEG.test(segment) ||
+    APPROVAL_LONG_HEX_SEG.test(segment) ||
+    APPROVAL_PREFIXED_ID_SEG.test(segment) ||
+    APPROVAL_OPAQUE_TOKEN_SEG.test(segment)
+  )
+}
+
+const HIGH_RISK_PATH_TOKENS = new Set([
+  // Destructive verbs
+  'delete', 'destroy', 'purge', 'drop', 'truncate', 'wipe', 'terminate', 'deactivate', 'unregister', 'unsubscribe',
+  // Billing / financial / external payments
+  'billing', 'payment', 'payments', 'charge', 'charges', 'refund', 'refunds', 'payout', 'payouts',
+  'transfer', 'transfers', 'wire', 'withdraw', 'withdrawal', 'checkout', 'stripe', 'invoice', 'invoices',
+  // External communications / webhooks
+  'email', 'emails', 'mail', 'sendgrid', 'sms', 'webhook', 'webhooks', 'broadcast',
+  // Privilege / credentials / admin
+  'admin', 'superadmin', 'iam', 'rbac', 'roles', 'permissions', 'revoke', 'apikey', 'apikeys',
+  'password', 'passwd', 'mfa', '2fa', 'sso',
+  // Uploads / code execution / deployment
+  'upload', 'uploads', 'import', 'exec', 'eval', 'shell', 'deploy',
+])
+
+function extractRawPathname(pathAndQuery: string): string {
+  const trimmed = (pathAndQuery || '').trim()
+  if (!trimmed) return '/'
+  const withoutOrigin = APPROVAL_ORIGIN_PREFIX_RE.test(trimmed)
+    ? trimmed.replace(APPROVAL_ORIGIN_PREFIX_RE, '')
+    : trimmed
+  const q = withoutOrigin.indexOf('?')
+  const h = withoutOrigin.indexOf('#')
+  const cut = q >= 0 && h >= 0 ? Math.min(q, h) : q >= 0 ? q : h
+  const raw = (cut >= 0 ? withoutOrigin.slice(0, cut) : withoutOrigin) || '/'
+  return raw.startsWith('/') ? raw : `/${raw}`
+}
+
+/**
+ * Browser-safe normalization mirroring `normalizeApprovalPathPattern(..., { source: 'card_path' })`:
+ * collapses concrete ID segments to `*`, escapes worker `*`/`**` segments to `%2a`/`%2a%2a`, and
+ * lowercases literal segments so Queue deduping and blast-radius previews match server leases 1:1.
+ */
+export function normalizeClientApprovalPath(pathAndQuery: string): string {
+  let pathname = extractRawPathname(pathAndQuery)
+  try {
+    pathname = decodeURIComponent(pathname)
+  } catch {
+    // Keep raw pathname when percent-encoding is malformed.
+  }
+  pathname = pathname.replace(/\/{2,}/g, '/')
+  if (pathname.length > 1 && pathname.endsWith('/')) {
+    pathname = pathname.slice(0, -1)
+  }
+  const segments = pathname.split('/').map((seg, idx) => {
+    if (idx === 0 && seg === '') return ''
+    if (!seg) return ''
+    if (seg === '*' || seg === '**') return seg === '**' ? '%2a%2a' : '%2a'
+    if (isConcreteApprovalIdSegment(seg)) return '*'
+    return seg.toLowerCase()
+  })
+  return segments.join('/') || '/'
+}
+
+/**
+ * True when a request path targets a high-risk, destructive, financial, external-comms, admin,
+ * credential, upload, or worker-glob route that a host-wide non-destructive lease MUST NEVER cover.
+ */
+export function isHighRiskOrExternalMutationPath(pathAndQuery: string): boolean {
+  let pathname = extractRawPathname(pathAndQuery)
+  try {
+    pathname = decodeURIComponent(pathname)
+  } catch {
+    // Keep raw pathname when percent-encoding is malformed.
+  }
+  for (const seg of pathname.split('/')) {
+    if (!seg) continue
+    if (seg.includes('*')) return true
+    const camelSplit = seg.replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase()
+    const tokens = camelSplit.split(/[^a-z0-9]+/).filter(Boolean)
+    for (const token of tokens) {
+      if (HIGH_RISK_PATH_TOKENS.has(token)) return true
+    }
+  }
+  return false
+}
+
+/**
+ * Derive a concrete operator-explicit prefix pattern (e.g. `/_actions/**`, `/api/**`, `/api/v1/**`)
+ * from an already-normalized `card_path` pattern. Returns `null` when the path has worker glob
+ * metacharacters, fewer than 2 path segments, or no leading concrete literal segment (never `/**`).
+ */
+export function deriveOperatorPrefixPatternFromNormalized(
+  normalizedCardPath: string,
+  hasGlobMetacharacters: boolean,
+): string | null {
+  if (hasGlobMetacharacters || !normalizedCardPath) return null
+  const segs = normalizedCardPath.split('/').filter(Boolean)
+  if (segs.length < 2) return null
+  const prefixSegs: string[] = []
+  const limit = Math.min(segs.length - 1, 2)
+  for (let i = 0; i < limit; i += 1) {
+    const seg = segs[i]!
+    if (!seg || seg === '*' || seg === '**' || seg.includes('*') || seg.includes('%2a')) break
+    prefixSegs.push(seg)
+  }
+  if (prefixSegs.length === 0) return null
+  return `/${prefixSegs.join('/')}/**`
+}
+
+/** Browser-safe operator prefix derivation for UI action buttons and blast-radius previews. */
+export function deriveApprovalPrefixPattern(pathAndQuery: string): string | null {
+  let pathname = extractRawPathname(pathAndQuery)
+  try {
+    pathname = decodeURIComponent(pathname)
+  } catch {
+    // Keep raw pathname when percent-encoding is malformed.
+  }
+  const hasGlob = pathname.split('/').some(seg => seg.includes('*'))
+  if (hasGlob) return null
+  return deriveOperatorPrefixPatternFromNormalized(normalizeClientApprovalPath(pathAndQuery), false)
+}
+
+/** Stable dedupe key for collapsing duplicate pending approval cards for the exact same normalized route. */
+export function approvalRouteDedupeKey(ap: { origin: string; method: string; pathAndQuery: string }): string {
+  const origin = ap.origin.trim().toLowerCase().replace(/\/+$/, '')
+  const method = ap.method.trim().toUpperCase()
+  const route = normalizeClientApprovalPath(ap.pathAndQuery)
+  return `${origin}|${method}|${route}`
+}
+
+/** Default primary approval scope for a card: `once` on `high`-risk or `DELETE`, `route` otherwise. */
+export function defaultPrimaryApprovalScope(ap: { method?: string | null; riskLevel?: string | null }): 'once' | 'route' {
+  if (ap.riskLevel === 'high' || (ap.method ?? '').trim().toUpperCase() === 'DELETE') return 'once'
+  return 'route'
+}
+
+/** Returns the concrete prefix pattern when a card is eligible for `prefix` approval, else `null`. */
+export function eligibleApprovalPrefixPattern(ap: {
+  method: string
+  pathAndQuery: string
+  riskLevel?: string | null
+}): string | null {
+  if (ap.riskLevel === 'high' || ap.method.trim().toUpperCase() === 'DELETE') return null
+  return deriveApprovalPrefixPattern(ap.pathAndQuery)
+}
+
+/** True when a card is eligible for `host_nondestructive` approval (`POST`/`PUT`/`PATCH`, non-`high`, non-high-risk path). */
+export function isHostNonDestructiveEligibleCard(ap: {
+  method: string
+  pathAndQuery: string
+  riskLevel?: string | null
+}): boolean {
+  if (ap.riskLevel === 'high') return false
+  if (!isNonDestructiveMutationMethod(ap.method)) return false
+  if (isHighRiskOrExternalMutationPath(ap.pathAndQuery)) return false
+  return true
+}
+
 export interface ApprovedEndpointPattern {
   origin: string
   method: string
@@ -638,7 +829,12 @@ export const runCommand = z.discriminatedUnion('action', [
   }),
   commandBase.extend({ action: z.literal('retire_member'), handle: boardHandle }),
   commandBase.extend({ action: z.literal('inject_hint'), hint: goalText, targetAssetId: id.optional() }),
-  commandBase.extend({ action: z.literal('decide_approval'), approvalId: id, decision: z.enum(['approved', 'denied']) }),
+  commandBase.extend({
+    action: z.literal('decide_approval'),
+    approvalId: id,
+    decision: z.enum(['approved', 'denied']),
+    scope: z.enum(approvalScopes).optional(),
+  }),
   commandBase.extend({ action: z.literal('set_approval_policy'), approvalPolicy: z.enum(approvalPolicies) }),
   commandBase.extend({ action: z.literal('approve_similar_endpoint'), approvalId: id }),
   commandBase.extend({ action: z.literal('approve_all_pending') }),
