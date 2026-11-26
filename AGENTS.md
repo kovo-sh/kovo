@@ -57,6 +57,17 @@ While a multi-stream batch is in flight:
 4. **Use the slice runner.** Iterate one app/class with `scripts/bench-slice.sh --app <app> --class <class>`; no ad-hoc diagnostic scripts once it exists.
 5. **Know which harness you are running.** `scripts/benchmark-realistic.ts` scores the **product** (`Execution`); `benchmarks/realistic-bench/benchmark-realistic.ts` (or `scripts/bench-slice.sh` / `scripts/benchmark-realistic-matrix.ts`) scores the **deterministic capability** harness. A 0/56 from the first is the known v5.0 product gap, not a regression.
 
+## Systemic fixes over point patches
+
+Before writing a fix for any bug, benchmark drop, or audit finding, classify the **failure class** — not just the failing test case — and eliminate the class:
+
+1. **Fix the mechanism, not the symptom.** If a failure comes from a hardcoded micro-cap, a dual code path, runtime↔prompt drift, silent error/JSON erasure, or manual LLM wiring of host-known state, fix the shared primitive across all callers instead of adding a local `if` branch or bumping one constant.
+2. **One authoritative path (retire dual paths).** Never keep two mechanisms doing the same job (e.g., `kovo_verify` vs. legacy `propose_chain_finding` on live targets, duplicate role/arm classifiers, or copy-pasted heuristic tables). When a stronger primitive lands, route all callers through it, delete or gate off the legacy path, and add a static guard so it cannot regress.
+3. **Contract-test every cross-layer boundary.** Any change to RPC selectors, SDK methods, receipt stages, or tool schemas must update prompts/skills in the same batch and stay green under `tests/sys-contract-canary.test.ts` (in `scripts/worker-gate.sh`) so runtime, JSON schema, and prompt/skill examples can never drift.
+4. **No silent fallbacks or unscaled micro-caps.** Put run/worker/discovery ceilings in `src/server/run-safety-budgets.ts` (scaled to run workload, bounded by finite OOM/DoS caps) and emit structured truncation telemetry when hit. Never silently swallow errors into `catch {}`, `{}` tool args, or an unintended `deterministic-no-llm` fallback — fail fast on misconfiguration and surface actionable diagnostics.
+5. **Turn every real-run failure into a fast class-level guard.** Unit tests on 1-shot happy paths miss scale, rotation, and messy-LLM bugs. Every live-scan or benchmark regression must add a fast (<5s) class-level guard (run-scale stress, malformed/messy input, or multi-cell concurrency) to `scripts/worker-gate.sh` before re-running long benchmarks.
+6. **Escalate repeat patches to an architecture move.** If the same subsystem needs a second point patch in a batch, pause and propose a systemic refactor instead of stacking another workaround.
+
 ## Gemini Coding Guidelines
 
 1. **Never `read_file` or `cat` raw debug dumps or benchmark logs (main session OR sub-agents):**
