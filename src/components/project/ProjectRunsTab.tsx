@@ -1,6 +1,7 @@
 import { Link, useNavigate, useRouter } from '@tanstack/react-router'
-import { useMemo, useState } from 'react'
-import { removeRun } from '../../actions.ts'
+import { useEffect, useMemo, useState } from 'react'
+import { createRun, removeRun } from '../../actions.ts'
+import { getRunRerunPresetAction, listProjectRunLabelsAction } from '../../actions-run-controls.ts'
 import type { ApprovalPolicy, CapabilityTier } from '../../domain.ts'
 import { cn } from '../../lib/cn.ts'
 import { fmtDur } from '../run/format.ts'
@@ -77,17 +78,19 @@ export function filterProjectRuns<
   T extends Pick<ProjectRunSummary, 'id' | 'goal' | 'status' | 'phase' | 'capabilityTier' | 'approvalPolicy' | 'isActive'>,
 >(
   runs: readonly T[],
-  options: { statusFilter: RunStatusFilter; query: string },
+  options: { statusFilter: RunStatusFilter; query: string; labels?: Record<string, string | null> },
 ): T[] {
   const q = options.query.trim().toLowerCase()
   return runs.filter(run => {
     if (!matchesRunStatusFilter(run, options.statusFilter)) return false
     if (!q) return true
+    const runLabel = (options.labels?.[run.id] || (run as { label?: string | null }).label || '').toLowerCase()
     const modeLabel = scanModeBadgeInfo(run).label.toLowerCase()
     const statusLabel = runStatusLabel(run.status).toLowerCase()
     const phaseLabel = (phaseNames[run.phase] ?? run.phase).toLowerCase()
     return (
-      run.goal.toLowerCase().includes(q)
+      runLabel.includes(q)
+      || run.goal.toLowerCase().includes(q)
       || run.id.toLowerCase().includes(q)
       || modeLabel.includes(q)
       || statusLabel.includes(q)
@@ -136,6 +139,43 @@ export function ProjectRunsTab({ data, onNewRun }: Props) {
   const [runToDelete, setRunToDelete] = useState<ProjectRunSummary | null>(null)
   const [deletingRun, setDeletingRun] = useState(false)
   const [deleteError, setDeleteError] = useState('')
+  const [rerunningRunId, setRerunningRunId] = useState<string | null>(null)
+  const [rerunError, setRerunError] = useState('')
+  const [runLabels, setRunLabels] = useState<Record<string, string | null>>({})
+  const runIdsKey = runs.map(r => r.id).join(',')
+
+  useEffect(() => {
+    let active = true
+    void listProjectRunLabelsAction({ data: { projectId: project.id } }).then(
+      labels => {
+        if (active) setRunLabels(labels)
+      },
+      () => {},
+    )
+    return () => { active = false }
+  }, [project.id, runIdsKey])
+
+  const displayRunLabel = (run: ProjectRunSummary): string =>
+    runLabels[run.id] || (run as { label?: string | null }).label || run.goal
+
+  async function handleRerun(run: ProjectRunSummary) {
+    if (rerunningRunId) return
+    setRerunningRunId(run.id)
+    setRerunError('')
+    try {
+      const preset = await getRunRerunPresetAction({ data: { runId: run.id } })
+      const created = await createRun({
+        data: {
+          requestId: crypto.randomUUID(),
+          ...preset,
+        },
+      })
+      await navigate({ to: '/runs/$runId', params: { runId: created.id } })
+    } catch (err) {
+      setRerunError(err instanceof Error ? err.message : 'Could not start a re-run.')
+      setRerunningRunId(null)
+    }
+  }
 
   const statusCounts = useMemo(() => {
     const counts: Record<RunStatusFilter, number> = {
@@ -155,8 +195,8 @@ export function ProjectRunsTab({ data, onNewRun }: Props) {
   }, [runs])
 
   const filteredRuns = useMemo(
-    () => filterProjectRuns(runs, { statusFilter, query }),
-    [runs, statusFilter, query],
+    () => filterProjectRuns(runs, { statusFilter, query, labels: runLabels }),
+    [runs, statusFilter, query, runLabels],
   )
 
   function handleNewRun() {
@@ -199,10 +239,13 @@ export function ProjectRunsTab({ data, onNewRun }: Props) {
             {hasFilters ? `${filteredRuns.length} of ${runs.length}` : runs.length}
           </span>
         </div>
-        <Button type="button" variant="default" onClick={handleNewRun}>
-          <Icon name="plus" size={13} />
-          New run
-        </Button>
+        <div className="flex items-center gap-3">
+          {rerunError && <span className="text-[12px] text-danger" role="alert">{rerunError}</span>}
+          <Button type="button" variant="default" onClick={handleNewRun}>
+            <Icon name="plus" size={13} />
+            New run
+          </Button>
+        </div>
       </div>
 
       {runs.length > 0 && (
@@ -293,6 +336,7 @@ export function ProjectRunsTab({ data, onNewRun }: Props) {
             const modeBadge = scanModeBadgeInfo(run)
             const active = Boolean(run.isActive || run.status === 'running')
             const durationLabel = active ? fmtDur(Math.max(0, now - run.createdAt)) : null
+            const runTitle = displayRunLabel(run)
 
             return (
               <div
@@ -309,7 +353,9 @@ export function ProjectRunsTab({ data, onNewRun }: Props) {
                   </span>
                   <span className="flex min-w-0 flex-1 flex-col gap-0.5">
                     <span className="flex min-w-0 flex-wrap items-center gap-2">
-                      <span className="truncate font-medium text-fg">{run.goal}</span>
+                      <span className="truncate font-medium text-fg" title={runTitle !== run.goal ? run.goal : undefined}>
+                        {runTitle}
+                      </span>
                       <Badge variant={modeBadge.variant}>{modeBadge.label}</Badge>
                     </span>
                     <span className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[12px] tabular-nums text-fg-subtle">
@@ -345,13 +391,26 @@ export function ProjectRunsTab({ data, onNewRun }: Props) {
                     </time>
                   </span>
                 </Link>
+                {run.status === 'complete' && (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    className="h-7 flex-none px-2 text-[12px] text-fg-muted hover:text-fg"
+                    disabled={rerunningRunId !== null}
+                    aria-label={`Re-run: ${runTitle}`}
+                    onClick={() => void handleRerun(run)}
+                  >
+                    <Icon name="replay" size={12} />
+                    {rerunningRunId === run.id ? 'Starting…' : 'Re-run'}
+                  </Button>
+                )}
                 <Button
                   type="button"
                   variant="ghost"
                   size="icon"
                   className="mr-1 flex-none text-fg-subtle opacity-55 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100 data-[slot=button]:hover:bg-danger-soft data-[slot=button]:hover:text-danger"
                   title="Delete run"
-                  aria-label={`Delete run: ${run.goal}`}
+                  aria-label={`Delete run: ${runTitle}`}
                   onClick={() => {
                     setDeleteError('')
                     setRunToDelete(run)
@@ -407,7 +466,7 @@ export function ProjectRunsTab({ data, onNewRun }: Props) {
                 </DialogDescription>
                 <div className="flex flex-col gap-2 rounded-lg border border-line bg-sunk px-3 py-2.5">
                   <div className="line-clamp-2 text-[13px] font-medium text-fg" title={runToDelete.goal}>
-                    {runToDelete.goal}
+                    {displayRunLabel(runToDelete)}
                   </div>
                   <div className="flex flex-wrap items-center gap-1.5 tabular-nums">
                     <Badge variant="neutral" className="bg-panel capitalize">
