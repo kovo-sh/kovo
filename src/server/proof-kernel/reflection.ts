@@ -436,7 +436,7 @@ function ingestCarrierBody(
     const trimmed = rawBody.trim()
     const isForm = contentType.includes('application/x-www-form-urlencoded')
       || (!contentType.includes('json') && !trimmed.startsWith('{') && !trimmed.startsWith('[') && !trimmed.startsWith('<') && !trimmed.startsWith('--') && trimmed.includes('=') && !trimmed.includes('\n'))
-    const looksJson = contentType.includes('json') || trimmed.startsWith('{') || trimmed.startsWith('[')
+    const looksJson = contentType.includes('json') || trimmed.startsWith('{') || trimmed.startsWith('[') || trimmed.startsWith('"')
     if (isForm) {
       for (const pair of rawBody.split('&')) {
         if (!pair) continue

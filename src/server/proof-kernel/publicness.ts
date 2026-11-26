@@ -80,8 +80,9 @@ export interface PublicnessStageInput {
    */
   readonly replayProbe?: (target: { method: string; route: string }) => ImpactStep | null
   /**
-   * When `true`, denying an active replay via `replayBudget.admit()` (`allowed: false`) fails closed
-   * (`passed: false`) instead of proceeding with transcript-only evidence.
+   * When `true` (default whenever `replayProbe` is supplied), denying an active replay via
+   * `replayBudget.admit()` (`allowed: false`) fails closed (`passed: false`) instead of proceeding
+   * with transcript-only evidence. Pass `false` explicitly to allow transcript-only pass on denial.
    */
   readonly failClosedOnReplayDenied?: boolean
 }
@@ -593,7 +594,8 @@ export function evaluateMustBeNonPublicStage(input: PublicnessStageInput): Publi
     })
     if (!replayTelemetry.allowed) {
       replaySkipped = true
-      if (input.failClosedOnReplayDenied) {
+      const failClosedOnDenied = input.failClosedOnReplayDenied ?? Boolean(input.replayProbe)
+      if (failClosedOnDenied) {
         return {
           required: true,
           executed: true,

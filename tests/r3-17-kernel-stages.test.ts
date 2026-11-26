@@ -354,7 +354,7 @@ test('R3-17 control legitimacy: preserves v8:temporal_revocation time difference
     probe: {
       id: 'ex-secondary-ok',
       method: 'GET',
-      route: '/api/ws/events',
+      route: '/api/session/me',
       status: 200,
       actorHandle: 'member_a',
       actorRole: 'member',
@@ -364,6 +364,31 @@ test('R3-17 control legitimacy: preserves v8:temporal_revocation time difference
   })
   assert.equal(cleanTemporal.ok, true, 'v8:temporal_revocation legitimate post-revocation time difference must be preserved')
   assert.equal(cleanTemporal.contractRole, 'denied_revoked')
+
+  // R1: temporal_revocation MUST NOT relax route parity when control hits a different route
+  const wrongRouteTemporal = assertLegitimateControl({
+    spec: temporalSpec,
+    control: {
+      id: 'ex-primary-wrong-route',
+      method: 'GET',
+      route: '/api/admin/revoked',
+      status: 401,
+      actorHandle: 'member_a',
+      actorRole: 'member',
+      timestampMs: 1_700_000_010_000,
+    },
+    probe: {
+      id: 'ex-secondary-ok',
+      method: 'GET',
+      route: '/api/session/me',
+      status: 200,
+      actorHandle: 'member_a',
+      actorRole: 'member',
+      timestampMs: 1_700_000_020_000,
+    },
+  })
+  assert.equal(wrongRouteTemporal.ok, false)
+  assert.equal(wrongRouteTemporal.rejectedBy, 'self_sabotaged_control')
 
   // Self-sabotaged control on temporal revocation MUST reject
   const sabotagedTemporal = assertLegitimateControl({
@@ -379,7 +404,7 @@ test('R3-17 control legitimacy: preserves v8:temporal_revocation time difference
     probe: {
       id: 'ex-secondary-ok',
       method: 'GET',
-      route: '/api/ws/events',
+      route: '/api/session/me',
       status: 200,
       timestampMs: 1_700_000_020_000,
     },
@@ -684,6 +709,55 @@ test('R3-17 review guards (B1/B1b/B2): differsOnlyIn parity, fail-closed registr
   assert.equal(extraBodyKey.ok, false)
   assert.equal(extraBodyKey.rejectedBy, 'self_sabotaged_control')
 
+  // R1: v8:dual_tenant_abac control on a different route template MUST be rejected with self_sabotaged_control
+  //     (request_payload relaxes body-shape parity ONLY, never route/method/query parity)
+  const dualTenantSpec = DEFAULT_ORACLE_SPEC_REGISTRY.get('v8:dual_tenant_abac')!
+  const dualTenantWrongRoute = assertLegitimateControl({
+    spec: dualTenantSpec,
+    control: {
+      id: 'dt-ctl-wrong-route',
+      method: 'GET',
+      route: '/api/admin/orders/ord-a-1',
+      pathAndQuery: '/api/admin/orders/ord-a-1',
+      status: 403,
+      actorHandle: 'member_b',
+      actorRole: 'member',
+    },
+    probe: {
+      id: 'dt-prb-orders',
+      method: 'GET',
+      route: '/api/orders/ord-a-1',
+      pathAndQuery: '/api/orders/ord-a-1',
+      status: 200,
+      actorHandle: 'member_a',
+      actorRole: 'member',
+    },
+  })
+  assert.equal(dualTenantWrongRoute.ok, false, 'v8:dual_tenant_abac control on a different route template must fail closed')
+  assert.equal(dualTenantWrongRoute.rejectedBy, 'self_sabotaged_control')
+
+  // R1: v8:dual_tenant_abac still permits body-shape differences on the SAME route template
+  const dualTenantBodyDiffOk = assertLegitimateControl({
+    spec: dualTenantSpec,
+    control: {
+      id: 'dt-ctl-body',
+      method: 'POST',
+      route: '/api/orders/export',
+      status: 403,
+      actorHandle: 'member_b',
+      requestJson: { singleId: 'ord-a-1' },
+    },
+    probe: {
+      id: 'dt-prb-body',
+      method: 'POST',
+      route: '/api/orders/export',
+      status: 200,
+      actorHandle: 'member_a',
+      requestJson: { batchIds: ['ord-a-1', 'ord-b-1'] },
+    },
+  })
+  assert.equal(dualTenantBodyDiffOk.ok, true, dualTenantBodyDiffOk.reason)
+
   // B1: Legitimate same-template sibling BOLA control (differs only in persona/tenant + resource ID) PASSES
   const legitBola = assertLegitimateControl({
     spec: authzSpec,
@@ -831,7 +905,7 @@ test('R3-17 review guards (B1/B1b/B2): differsOnlyIn parity, fail-closed registr
   assert.equal(signedMintPub.public, true)
   assert.equal(signedMintPub.referenceId, 'mint-anon')
 
-  // B2b: Active replay gating + failClosedOnReplayDenied + run-disposer eviction + empty runId rejection
+  // B2b: Active replay gating defaults failClosedOnReplayDenied=true when replayProbe is supplied + run-disposer eviction + empty runId rejection
   const activeLedger = new PublicnessReplayBudgetLedger({ maxPerRun: 2, maxPerRoute: 1 })
   assert.equal(activeLedger.admit({ runId: '   ', method: 'GET', route: '/api/x' }).skippedReason, 'missing_run_id')
   let replayCalls = 0
@@ -843,10 +917,9 @@ test('R3-17 review guards (B1/B1b/B2): differsOnlyIn parity, fail-closed registr
     runId: 'run-dispose-1',
     environmentMode: 'prod_readonly',
     replayProbe: () => { replayCalls += 1; return null },
-    failClosedOnReplayDenied: true,
   })
   assert.equal(replayCalls, 0, 'prod_readonly must NEVER invoke replayProbe for POST')
-  assert.equal(deniedPostReplay.passed, false)
+  assert.equal(deniedPostReplay.passed, false, 'denied active replayProbe must fail closed by default')
   assert.equal(deniedPostReplay.replaySkipped, true)
 
   const getProbe: ImpactStep = {

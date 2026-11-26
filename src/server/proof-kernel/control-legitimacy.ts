@@ -464,6 +464,22 @@ function isAllowedExtraControlKey(key: string, allowed: ReadonlySet<string>): bo
   return false
 }
 
+function hasSharedSealedCapability(
+  control: ControlLegitimacyExchange,
+  probe: ControlLegitimacyExchange,
+): boolean {
+  const ctlCaps = new Set<string>([
+    ...(control.consumedCapabilityId ? [control.consumedCapabilityId] : []),
+    ...(control.consumedCapabilities ?? []),
+  ])
+  if (ctlCaps.size === 0) return false
+  const prbCaps = [
+    ...(probe.consumedCapabilityId ? [probe.consumedCapabilityId] : []),
+    ...(probe.consumedCapabilities ?? []),
+  ]
+  return prbCaps.some(cap => ctlCaps.has(cap))
+}
+
 /**
  * Enforce declarative `contract.differsOnlyIn` request-shape parity between a denied control
  * and the probe (`R3-17` B1): compares encoding validity, HTTP method, normalized route,
@@ -492,9 +508,14 @@ function checkControlContractParity(
   if (!probe || !isDeniedStatus) return null
 
   const allowed = new Set<string>(contract.differsOnlyIn)
-  const allowsArbitraryShape = allowed.has('request_payload') || allowed.has('time_after_revocation')
+  // Cross-surface `denied_revoked` (e.g. HTTP REST 401 vs GraphQL 200) is permitted ONLY when
+  // both exchanges are cryptographically bound to the exact same host-sealed revoked capability.
+  const isCapabilityBoundCrossSurfaceRevocation =
+    contract.role === 'denied_revoked' &&
+    (control.status === 401 || control.status === 403) &&
+    hasSharedSealedCapability(control, probe)
 
-  // 1. HTTP method parity
+  // 1. HTTP method parity (enforced for ALL denied controls; never relaxed by request_payload or unbound time_after_revocation).
   //    On `denied_unauthorized` mutating write proofs (PATCH/POST/PUT/DELETE), a denied GET/HEAD
   //    read/publicness probe (401/403/404/405) on the same resource (or parent resource prefix) is
   //    legitimate pre-write / non-publicness evidence synthesized for mutating endpoints.
@@ -505,21 +526,28 @@ function checkControlContractParity(
     (control.status === 401 || control.status === 403 || control.status === 404 || control.status === 405) &&
     (ctlMethod === 'GET' || ctlMethod === 'HEAD') &&
     (prbMethod === 'POST' || prbMethod === 'PUT' || prbMethod === 'PATCH' || prbMethod === 'DELETE')
-  if (!allowsArbitraryShape && ctlMethod && prbMethod && ctlMethod !== prbMethod && !isLegitDeniedReadForMutatingProbe) {
+  if (ctlMethod && prbMethod && ctlMethod !== prbMethod && !isLegitDeniedReadForMutatingProbe && !isCapabilityBoundCrossSurfaceRevocation) {
     return `Control legitimacy rejected (R3-17): denied control method "${ctlMethod}" differs from probe method "${prbMethod}", which is outside contract.differsOnlyIn (${contract.differsOnlyIn.join(', ')}).`
   }
 
-  // 2. Normalized route parity (exact route for denied_unauthenticated; template parity for denied_unauthorized/denied_tampered)
+  // 2. Normalized route parity (exact route for denied_unauthenticated; route-template parity for all other denied roles).
+  //    Never relaxed by `request_payload` or unbound `time_after_revocation` (`R3-17` R1).
   const ctlRouteRaw = control.route ?? control.pathAndQuery
   const prbRouteRaw = probe.route ?? probe.pathAndQuery
-  if (!allowsArbitraryShape && ctlRouteRaw && prbRouteRaw) {
+  if (ctlRouteRaw && prbRouteRaw && !isCapabilityBoundCrossSurfaceRevocation) {
     const ctlRoute = contract.role === 'denied_unauthenticated'
       ? normalizeRoutePath(ctlRouteRaw)
       : normalizeRouteTemplate(ctlRouteRaw)
     const prbRoute = contract.role === 'denied_unauthenticated'
       ? normalizeRoutePath(prbRouteRaw)
       : normalizeRouteTemplate(prbRouteRaw)
-    const routeMatches = ctlRoute === prbRoute || (
+    const isSameCollectionBatch =
+      isLegitDeniedReadForMutatingProbe &&
+      ctlRoute.endsWith('/:id') &&
+      ctlRoute.length > 5 &&
+      prbRoute.startsWith(`${ctlRoute.slice(0, -4)}/`) &&
+      /^\/(?:batch|bulk)$/.test(prbRoute.slice(ctlRoute.length - 4))
+    const routeMatches = ctlRoute === prbRoute || isSameCollectionBatch || (
       isLegitDeniedReadForMutatingProbe &&
       ctlRoute.length > 1 &&
       prbRoute.startsWith(`${ctlRoute}/`)
@@ -529,19 +557,17 @@ function checkControlContractParity(
     }
   }
 
-  // 3. Query-key parity: reject extraneous query keys added on the denied control absent from the probe
-  if (!allowsArbitraryShape) {
-    const prbQueryKeys = extractRawQueryKeys(probe.pathAndQuery ?? probe.route)
-    const extraQueryKeys = [...extractRawQueryKeys(control.pathAndQuery ?? control.route)].filter(
-      k => !prbQueryKeys.has(k) && !isAllowedExtraControlKey(k, allowed),
-    )
-    if (extraQueryKeys.length > 0) {
-      return `Control legitimacy rejected (R3-17): denied control adds extraneous query parameter(s) [${extraQueryKeys.join(', ')}] absent from the probe (outside contract.differsOnlyIn: ${contract.differsOnlyIn.join(', ')}).`
-    }
+  // 3. Query-key parity: reject extraneous query keys added on the denied control absent from the probe.
+  const prbQueryKeys = extractRawQueryKeys(probe.pathAndQuery ?? probe.route)
+  const extraQueryKeys = [...extractRawQueryKeys(control.pathAndQuery ?? control.route)].filter(
+    k => !prbQueryKeys.has(k) && !isAllowedExtraControlKey(k, allowed),
+  )
+  if (extraQueryKeys.length > 0) {
+    return `Control legitimacy rejected (R3-17): denied control adds extraneous query parameter(s) [${extraQueryKeys.join(', ')}] absent from the probe (outside contract.differsOnlyIn: ${contract.differsOnlyIn.join(', ')}).`
   }
 
-  // 4. Body-shape parity: reject extraneous top-level body keys or control-only bodies absent from the probe
-  if (!allowsArbitraryShape && !allowed.has('signature_or_scope')) {
+  // 4. Body-shape parity: `request_payload` / `signature_or_scope` relax body-shape parity ONLY (never route/method/query).
+  if (!allowed.has('request_payload') && !allowed.has('signature_or_scope')) {
     const ctlBody = extractTopLevelBodyKeys(control.requestJson)
     const prbBody = extractTopLevelBodyKeys(probe.requestJson)
     if (ctlBody.hasBody && !prbBody.hasBody) {
@@ -807,7 +833,7 @@ export function extractV8KernelStageContext(
       const e = entryFromField(f)
       if (e) controlEntries.push(e)
     }
-    probeEntry = entryFromField('bledAccess') ?? entryFromField('postTransferReadback') ?? entryFromField('batchRequest') ?? entryFromField('transferRecord')
+    probeEntry = entryFromField('bledAccess') ?? entryFromField('transferRecord') ?? entryFromField('batchRequest') ?? entryFromField('postTransferReadback')
   } else if (family === 'temporal_revocation') {
     const c = entryFromField('primaryDeniedCheck')
     if (c) controlEntries.push(c)
