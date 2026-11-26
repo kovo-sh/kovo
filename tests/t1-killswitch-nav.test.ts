@@ -243,8 +243,14 @@ test('H-2: GlobalKillSwitch isolates tenant trips from global state, preserves g
   assert.equal(ks.status().active, true)
   assert.equal(ks.isActive('tenant-a'), true)
 
-  // Full global reset clears global AND tenants
+  // Global reset() preserves active per-tenant trips; resetAll() clears global AND tenants (H-2)
   ks.reset()
+  assert.equal(ks.status().active, false)
+  assert.equal(ks.isActive('tenant-b'), true, 'reset() must preserve active per-tenant trip')
+
+  const cleared = ks.resetAll()
+  assert.equal(cleared.active, false)
+  assert.deepEqual(cleared.releasedTenants, ['tenant-b'])
   assert.equal(ks.status().active, false)
   assert.equal(ks.isActive('tenant-a'), false)
   assert.equal(ks.isActive('tenant-b'), false)

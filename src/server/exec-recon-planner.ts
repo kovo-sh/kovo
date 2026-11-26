@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs'
-import { extname, isAbsolute, join, relative, resolve as resolvePath, sep } from 'node:path'
+import { basename, extname, isAbsolute, join, relative, resolve as resolvePath, sep } from 'node:path'
 import { and, asc, eq } from 'drizzle-orm'
 import {
   defaultWorkerConcurrency,
@@ -170,6 +170,7 @@ import {
   applyDiscoveredSubdomainsToRun,
   discoverSubdomainsForOrigins,
   extractDiscoverableApex,
+  isMultiTenantSaasOrigin,
   isSharedPaasOrigin,
 } from './subdomain-discovery.ts'
 import type { Phase0GraphwireExtras, ProbePlanRegistry } from './probe-plan.ts'
@@ -239,6 +240,69 @@ function buildObservationFromHeaders(
 
 export const VARIANT_SWEEP_MAX_FILE_BYTES = 256 * 1024
 
+const SENSITIVE_DOT_DIRS = new Set(['.ssh', '.aws', '.gnupg', '.kube', '.docker', '.git'])
+const SENSITIVE_EXACT_FILES = new Set([
+  '.git-credentials',
+  '.netrc',
+  '.npmrc',
+  '.pypirc',
+  '.htpasswd',
+  'id_rsa',
+  'id_ed25519',
+  'id_ecdsa',
+  'id_dsa',
+  'github-app.json',
+  'credentials.json',
+  'service-account.json',
+  'vault.json',
+  'vault.key',
+  'token.txt',
+  'secrets.json',
+])
+const SENSITIVE_FILE_EXT_RE = /\.(?:pat|salt|pem|key|p12|pfx|jks|keystore|kdbx|token)$/i
+const SAFE_ENV_TEMPLATE_RE = /^\.env\.(?:example|sample|template|dist|schema)$/i
+const SOURCE_CODE_EXT_RE = /\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs|py|go|rs|java|kt|rb|php|cs|c|h|cc|cpp|hpp|swift|scala|sql|graphql|gql|md|html|css|scss|vue|svelte)$/i
+const GIT_CREDENTIAL_FILE_RE = /(?:^|\/)\.git\/(?:config|credentials|fetch_head)$/i
+
+/**
+ * Shared sensitive-entry filter (`H-39` sibling) matching worker-backend's `/repos` staging policy
+ * so variant-sweep reads and sibling walks on host `reposDir` never read `.env`, `.env.*.js`,
+ * `.ssh/*`, `.git/config`, keys, or credential stores.
+ */
+export function isSensitiveRepoEntry(relPosixPath: string, entryName: string, isDir: boolean): boolean {
+  const relLower = relPosixPath.toLowerCase()
+  const nameLower = entryName.toLowerCase()
+  if (isDir) {
+    if (SENSITIVE_DOT_DIRS.has(nameLower)) return true
+    if (relLower === '.git/hooks' || relLower.endsWith('/.git/hooks')) return true
+    return false
+  }
+  if (GIT_CREDENTIAL_FILE_RE.test(relLower)) return true
+  if (SENSITIVE_EXACT_FILES.has(nameLower)) return true
+  if (SENSITIVE_FILE_EXT_RE.test(nameLower)) return true
+  if (nameLower === '.env' || (nameLower.startsWith('.env.') && !SAFE_ENV_TEMPLATE_RE.test(nameLower))) {
+    return true
+  }
+  const parentSegments = relLower.split('/').slice(0, -1)
+  if (parentSegments.includes('credentials') && !SOURCE_CODE_EXT_RE.test(nameLower)) {
+    return true
+  }
+  return false
+}
+
+/** True when any directory segment or the leaf file in `relPosixPath` is sensitive (`H-39`). */
+export function isSensitiveRepoRelativePath(relPosixPath: string): boolean {
+  const cleaned = relPosixPath.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '')
+  if (!cleaned) return false
+  const parts = cleaned.split('/').filter(Boolean)
+  for (let i = 0; i < parts.length - 1; i += 1) {
+    const prefix = parts.slice(0, i + 1).join('/')
+    if (isSensitiveRepoEntry(prefix, parts[i]!, true)) return true
+  }
+  const leaf = parts[parts.length - 1] ?? ''
+  return isSensitiveRepoEntry(cleaned, leaf, false)
+}
+
 function isPathStrictlyInside(canonicalRoot: string, candidatePath: string): boolean {
   const rel = relative(canonicalRoot, candidatePath)
   if (!rel || rel === '.' || rel === '..') return false
@@ -251,8 +315,9 @@ function isPathStrictlyInside(canonicalRoot: string, candidatePath: string): boo
  * Enforces:
  *  (a) canonical `realpathSync` strictly contained inside the canonical root (rejects `..` escapes,
  *      null bytes, and symlinks pointing outside the root),
- *  (b) `stat.isFile()` (rejects directories, FIFOs, sockets, devices),
- *  (c) bounded file size (`<= maxBytes`, default 256 KiB).
+ *  (b) `isSensitiveRepoRelativePath` refusal (rejects `.env`, `.env.*.js`, `.ssh/*`, `.git/*`, keys),
+ *  (c) `stat.isFile()` (rejects directories, FIFOs, sockets, devices),
+ *  (d) bounded file size (`<= maxBytes`, default 256 KiB).
  */
 export function resolveSafeVariantSweepFile(
   allowedRootDir: string,
@@ -281,6 +346,9 @@ export function resolveSafeVariantSweepFile(
     : resolvePath(canonicalRoot, candidatePath)
   if (!isPathStrictlyInside(canonicalRoot, resolvedCandidate)) return null
 
+  const candidateRelPosix = relative(canonicalRoot, resolvedCandidate).split(sep).join('/')
+  if (isSensitiveRepoRelativePath(candidateRelPosix)) return null
+
   let canonicalTarget: string
   try {
     canonicalTarget = realpathSync(resolvedCandidate)
@@ -288,6 +356,9 @@ export function resolveSafeVariantSweepFile(
     return null
   }
   if (!isPathStrictlyInside(canonicalRoot, canonicalTarget)) return null
+
+  const canonicalRelPosix = relative(canonicalRoot, canonicalTarget).split(sep).join('/')
+  if (isSensitiveRepoRelativePath(canonicalRelPosix)) return null
 
   let targetStat
   try {
@@ -297,6 +368,86 @@ export function resolveSafeVariantSweepFile(
   }
   if (!targetStat.isFile() || targetStat.size > maxBytes) return null
   return { realPath: canonicalTarget, size: targetStat.size }
+}
+
+const VARIANT_SWEEP_SCAN_EXT = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.py', '.go', '.java', '.rb'])
+const VARIANT_SWEEP_SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'build'])
+
+/**
+ * Deterministic variant-sweep sibling walker over mounted `/repos` (`H-39` sibling).
+ * Enforces `isSensitiveRepoEntry` on every directory and file and `resolveSafeVariantSweepFile`
+ * before reading so worker-excluded files (`.env.*.js`, `.ssh/*`, `.git/config`, keys) can never
+ * be echoed into chain-step hypotheses.
+ */
+export function collectVariantSweepSiblingHits(
+  reposDir: string,
+  mountedRepos: readonly string[],
+  searchTokens: readonly string[],
+  excludeLocations: readonly { repo?: string; file: string; startLine: number; endLine: number }[] = [],
+  maxHits = 20,
+): Array<{ repo: string; file: string; line: number; preview: string }> {
+  const siblingHits: Array<{ repo: string; file: string; line: number; preview: string }> = []
+  if (searchTokens.length === 0) return siblingHits
+
+  let canonicalReposRoot: string | null = null
+  try { canonicalReposRoot = realpathSync(reposDir) } catch { canonicalReposRoot = null }
+  if (!canonicalReposRoot) return siblingHits
+
+  const seenHit = new Set<string>()
+  const overlapsOriginal = (repo: string, file: string, line: number) =>
+    excludeLocations.some(l => l.repo === repo && l.file === file && line >= l.startLine - 1 && line <= l.endLine + 1)
+
+  for (const mountedRepo of mountedRepos) {
+    if (siblingHits.length >= maxHits) break
+    const repoRel = mountedRepo.replace(/^\/repos\//, '').replace(/\/+$/, '')
+    if (!repoRel || repoRel.includes('\0') || isAbsolute(repoRel)) continue
+    const repoRootCandidate = resolvePath(canonicalReposRoot, repoRel)
+    const repoRelCheck = relative(canonicalReposRoot, repoRootCandidate)
+    if (!repoRelCheck || repoRelCheck === '..' || repoRelCheck.startsWith(`..${sep}`) || isAbsolute(repoRelCheck)) continue
+    let canonicalRepoRoot: string
+    try { canonicalRepoRoot = realpathSync(repoRootCandidate) } catch { continue }
+    const canonicalRepoRel = relative(canonicalReposRoot, canonicalRepoRoot)
+    if (!canonicalRepoRel || canonicalRepoRel === '..' || canonicalRepoRel.startsWith(`..${sep}`) || isAbsolute(canonicalRepoRel)) continue
+
+    const stack = [canonicalRepoRoot]
+    while (stack.length > 0 && siblingHits.length < maxHits) {
+      const dir = stack.pop()!
+      let entries: string[]
+      try { entries = readdirSync(dir) } catch { continue }
+      for (const entry of entries) {
+        if (VARIANT_SWEEP_SKIP_DIRS.has(entry)) continue
+        const full = join(dir, entry)
+        let lst
+        try { lst = lstatSync(full) } catch { continue }
+        if (lst.isSymbolicLink()) continue
+        const relEntryPosix = relative(canonicalRepoRoot, full).split(sep).join('/')
+        if (lst.isDirectory()) {
+          if (isSensitiveRepoEntry(relEntryPosix, entry, true)) continue
+          stack.push(full)
+          continue
+        }
+        if (isSensitiveRepoEntry(relEntryPosix, entry, false)) continue
+        if (!VARIANT_SWEEP_SCAN_EXT.has(extname(entry).toLowerCase())) continue
+        const safeSibling = resolveSafeVariantSweepFile(canonicalRepoRoot, full, VARIANT_SWEEP_MAX_FILE_BYTES)
+        if (!safeSibling) continue
+        const relFile = relative(canonicalRepoRoot, safeSibling.realPath).split(sep).join('/')
+        if (isSensitiveRepoEntry(relFile, basename(safeSibling.realPath), false)) continue
+        let content: string
+        try { content = readFileSync(safeSibling.realPath, 'utf8') } catch { continue }
+        const lines = content.split('\n')
+        for (let i = 0; i < lines.length && siblingHits.length < maxHits; i += 1) {
+          const line = lines[i]!
+          const lineNo = i + 1
+          if (!searchTokens.some(tok => line.includes(tok)) || overlapsOriginal(repoRel, relFile, lineNo)) continue
+          const key = `${repoRel}:${relFile}:${lineNo}`
+          if (seenHit.has(key)) continue
+          seenHit.add(key)
+          siblingHits.push({ repo: repoRel, file: relFile, line: lineNo, preview: line.trim().slice(0, 180) })
+        }
+      }
+    }
+  }
+  return siblingHits
 }
 
 /**
@@ -1783,7 +1934,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       this.storage.commitReviewPlan(run, selection)
     }
 
-    const freshRun = this.storage.run(run.id)
+    let freshRun = this.storage.run(run.id)
     // Slice 3 guard input: remember whether any investigation step was already seeded BEFORE the
     // Phase-0 recon / threat-model seeding ran. A resumed or operator-seeded run skips the
     // concurrent lane (unless deterministicSweep === 'always').
@@ -1853,19 +2004,21 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
                 seededPersonas: handle.seededPersonas.map(p => p.handle),
               },
             )
-            // Expose the booted local-lab origin & any seeded personas into the run scope
+            // Expose the booted local-lab origin & any seeded personas into the run scope via canonical admission
             let scopeChanged = false
             if (!approvedOrigins.has(handle.origin)) {
-              const latestForOrigin = this.storage.run(freshRun.id)
-              this.storage.suggestCandidateHost(latestForOrigin, handle.origin, 'lab_runner', false)
-              const withCand = this.storage.run(freshRun.id)
-              const cand = withCand.candidates.find(c => c.origin === handle.origin)
-              if (cand && !withCand.approved.includes(cand.id)) {
-                this.storage.updateRun(freshRun.id, { approved: [...withCand.approved, cand.id] })
+              const admitRes = this.storage.runsRepo.admitDynamicOrigin({
+                runId: freshRun.id,
+                origin: handle.origin,
+                source: 'lab_runner',
+                thirdParty: false,
+                reason: 'lab_runner_boot',
+              })
+              if (admitRes.admitted) {
+                approvedOrigins.add(handle.origin)
+                job.origins.add(handle.origin)
+                scopeChanged = true
               }
-              approvedOrigins.add(handle.origin)
-              job.origins.add(handle.origin)
-              scopeChanged = true
             }
             const seededPersonaIds = handle.seededPersonas
               .map(p => p.personaId)
@@ -1879,7 +2032,8 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
               }
             }
             if (scopeChanged) {
-              const refreshed = this.host.buildGrant(job, this.storage.run(freshRun.id), approvedOrigins)
+              freshRun = this.storage.run(freshRun.id)
+              const refreshed = this.host.buildGrant(job, freshRun, approvedOrigins)
               grant = refreshed.grant
               secrets = refreshed.secrets
             }
@@ -1895,16 +2049,20 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       // 0c. Zero-LLM Phase-0 deterministic surface mapper (runs before LLM Turn 1)
       const phase0RootExchanges = new Map<string, BrokerExchangeResult>()
       if (!freshRun.phase0CompletedAt && approvedOrigins.size > 0 && this.host.authorize(job)) {
-        // Passive CT-log + live DNS subdomain discovery for public HTTPS origins only (skipped for local-lab/localhost and shared-PaaS hosts).
+        // Passive CT-log + live DNS subdomain discovery for public HTTPS origins only (skipped for local-lab/localhost, shared-PaaS, SaaS, and third-party CNAME hosts).
         if (
           freshRun.sourceMode !== 'prepared' &&
           freshRun.capabilityTier > 0 &&
           this.storage.project(freshRun.projectId).environment === 'public'
         ) {
           try {
-            const discoverableOrigins = [...approvedOrigins].filter(
-              origin => !isSharedPaasOrigin(origin) && extractDiscoverableApex(origin) !== null,
-            )
+            const discoverableOrigins = [...approvedOrigins].filter(origin => {
+              if (isSharedPaasOrigin(origin) || isMultiTenantSaasOrigin(origin)) return false
+              if (extractDiscoverableApex(origin) === null) return false
+              const asset = approvedAssets.find(a => a.origin === origin)
+              if (asset && (asset.thirdParty || (asset.dnsSource?.externalAliases?.length ?? 0) > 0)) return false
+              return true
+            })
             if (discoverableOrigins.length > 0) {
               const subResult = await discoverSubdomainsForOrigins(discoverableOrigins, {
                 signal: task.controller.signal,
@@ -1913,13 +2071,14 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
                 const applied = applyDiscoveredSubdomainsToRun(this.storage, freshRun.id, subResult, approvedOrigins)
                 if (applied.admitted.length > 0) {
                   for (const cand of applied.admitted) {
-                    if (isSharedPaasOrigin(cand.origin)) continue
+                    if (isSharedPaasOrigin(cand.origin) || isMultiTenantSaasOrigin(cand.origin)) continue
                     job.origins.add(cand.origin)
                     if (!approvedAssets.some(a => a.origin === cand.origin)) {
                       approvedAssets.push(cand)
                     }
                   }
-                  const refreshed = this.host.buildGrant(job, this.storage.run(freshRun.id), approvedOrigins)
+                  freshRun = this.storage.run(freshRun.id)
+                  const refreshed = this.host.buildGrant(job, freshRun, approvedOrigins)
                   grant = refreshed.grant
                   secrets = refreshed.secrets
                 }
@@ -2338,13 +2497,8 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     const asset = this.approvedAsset(run, targetOrigin) ?? run.candidates.find(c => run.approved.includes(c.id))
     if (!asset) return
 
-    const siblingHits: Array<{ repo: string; file: string; line: number; preview: string }> = []
-    const seenHit = new Set<string>()
-    const overlapsOriginal = (repo: string, file: string, line: number) =>
-      locs.some(l => l.repo === repo && l.file === file && line >= l.startLine - 1 && line <= l.endLine + 1)
-
     // 1. Fast deterministic sibling pattern sweep over mounted /repos (matches static_ast_proof ruleOrPattern or primary call signature)
-    let searchTokens: string[] = []
+    const searchTokens: string[] = []
     if (findingRow.replaySpecId) {
       try {
         const sp = this.storage.getReplaySpec(run.id, findingRow.replaySpecId)
@@ -2369,52 +2523,8 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       } catch { /* ignore */ }
     }
 
-    if (searchTokens.length > 0) {
-      const scanExt = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.py', '.go', '.java', '.rb'])
-      const skipDirs = new Set(['node_modules', '.git', 'dist', 'build'])
-      let canonicalReposRoot: string | null = null
-      try { canonicalReposRoot = realpathSync(reposDir) } catch { canonicalReposRoot = null }
-      for (const mountedRepo of mountedRepos) {
-        if (!canonicalReposRoot) break
-        const repoRel = mountedRepo.replace(/^\/repos\//, '').replace(/\/+$/, '')
-        if (!repoRel || repoRel.includes('\0') || isAbsolute(repoRel)) continue
-        const repoRootCandidate = resolvePath(canonicalReposRoot, repoRel)
-        const repoRelCheck = relative(canonicalReposRoot, repoRootCandidate)
-        if (!repoRelCheck || repoRelCheck === '..' || repoRelCheck.startsWith(`..${sep}`) || isAbsolute(repoRelCheck)) continue
-        let canonicalRepoRoot: string
-        try { canonicalRepoRoot = realpathSync(repoRootCandidate) } catch { continue }
-        const canonicalRepoRel = relative(canonicalReposRoot, canonicalRepoRoot)
-        if (!canonicalRepoRel || canonicalRepoRel === '..' || canonicalRepoRel.startsWith(`..${sep}`) || isAbsolute(canonicalRepoRel)) continue
-        const stack = [canonicalRepoRoot]
-        while (stack.length > 0 && siblingHits.length < 20) {
-          const dir = stack.pop()!
-          let entries: string[]
-          try { entries = readdirSync(dir) } catch { continue }
-          for (const entry of entries) {
-            if (skipDirs.has(entry)) continue
-            const full = join(dir, entry)
-            let lst
-            try { lst = lstatSync(full) } catch { continue }
-            if (lst.isSymbolicLink()) continue
-            if (lst.isDirectory()) { stack.push(full); continue }
-            if (!scanExt.has(extname(entry).toLowerCase())) continue
-            const safeSibling = resolveSafeVariantSweepFile(canonicalRepoRoot, full, VARIANT_SWEEP_MAX_FILE_BYTES)
-            if (!safeSibling) continue
-            const relFile = relative(canonicalRepoRoot, safeSibling.realPath).split(sep).join('/')
-            let content: string
-            try { content = readFileSync(safeSibling.realPath, 'utf8') } catch { continue }
-            content.split('\n').forEach((line, i) => {
-              const lineNo = i + 1
-              if (!searchTokens.some(tok => line.includes(tok)) || overlapsOriginal(repoRel, relFile, lineNo)) return
-              const key = `${repoRel}:${relFile}:${lineNo}`
-              if (seenHit.has(key)) return
-              seenHit.add(key)
-              siblingHits.push({ repo: repoRel, file: relFile, line: lineNo, preview: line.trim().slice(0, 180) })
-            })
-          }
-        }
-      }
-    }
+    const siblingHits = collectVariantSweepSiblingHits(reposDir, mountedRepos, searchTokens, locs)
+    const seenHit = new Set<string>(siblingHits.map(h => `${h.repo}:${h.file}:${h.line}`))
 
     // 2. Also invoke runVariantSweepForFinding (semantic-audit.ts) when no direct deterministic sibling hits were found
     if (siblingHits.length === 0) {
