@@ -800,3 +800,23 @@ One writer per file. Streams marked **∥** can run in parallel with every other
 - WS-3's `getKernelSecrets` change follows WS-8's shared needle builder.
 
 **Cross-cutting guard:** extend `tests/sys-contract-canary.test.ts` so that `scripts/unwired-baseline.json` may not list any symbol from a security fix (the R4-H-3 class), and so that every oracle claiming "host-minted" asserts a per-exchange stamp (the R4-C-1 and R4-C-2 class).
+
+## Execution log
+
+| WS | Stream | Closes | Status | Merge SHA | Gate / Guard Result |
+|---|---|---|---|---|---|
+| 1 | `r4-oracle-invariants` | `R4-C-1` (kernel), `R4-C-3`, `R4-C-4` | **MERGED** | `9cbe3f9` | **PASS** (`tsc` 0 err, `check-unwired` PASS, 56/56 r4/r3/movea/parity/taxonomy) |
+| 2 | `r4-proof-kernel` | `R4-C-1` (receipts), `R4-C-2`, `R4-C-6` (receipts), `R4-H-7` | **MERGED** | `ed26d6a` | **PASS** (`tsc` 0 err, `check-unwired` PASS, 90/91 [1 pre-existing quarantined H-5]) |
+| 3 | `r4-verify-handlers` | `R4-C-1/2/6` (handlers), `R4-H-4` | **MERGED** | `02def86` | **PASS** (`tsc` 0 err, `check-unwired` PASS, `verify-rpc.ts <= 2300` LOC, 31/31 handlers/receipts/signed-url) |
+| 4 | `r4-v8-scope` | `R4-C-5` | **MERGED** | `4a49d16` | **PASS** (`tsc` 0 err, `check-unwired` PASS, 27/27 + 12/12 golden chains / 0/9 twins) |
+| 5 | `r4-composite-binding` | `R4-C-5` (prov), `R4-H-5`, `R4-H-6` | **MERGED** | `09da617` | **PASS** (`tsc` 0 err, `check-unwired` PASS, `composite-receipt.ts = 749 <= 750`, 62/62 incl. 12/12 golden chains / 0/9 twins) |
+| 6 | `r4-approval-leases` | `R4-H-1` | **MERGED** | `c0658ed` | **PASS** (`tsc` 0 err, build `479.54 kB`, `check-unwired` PASS, 50/50 lease/admission/Playwright) |
+| 7 | `r4-override-scan` | `R4-H-14` | **MERGED** | `1b1cc70` | **PASS** (`tsc` 0 err, `check-unwired` PASS, 2 MiB `classifyRequestMutation` 1.13ms median `<50ms`, 21/21) |
+| 8 | `r4-credential-plane` | `R4-H-2`, `R4-H-17`, `R4-H-3` | **MERGED** | `1193182` | **PASS** (`tsc` 0 err, `check-unwired` PASS, 41/41 credential/scrub/browser-session) |
+| 9 | `r4-budgets-broker` | `R4-H-19` + budget keys | **MERGED** | `0f50ea2` | **PASS** (`tsc` 0 err, `check-unwired` PASS, 24/24 incl. 10k rotating cookies/CSRF flat registry) |
+| 10 | `r4-orch-lifecycle` | `R4-H-11`, `R4-H-12`, `R4-H-13` backstop, `R4-H-8` (`execution.ts`), `R4-H-16` (`exec-recon-planner.ts`) | **MERGED** | `23c4c00` | **PASS** (`tsc` 0 err, `check-unwired` PASS, 95/95 orchestration/dispatch/step-status/origin-map) |
+| 11 | `r4-host-compute` | `R4-H-15`, `R4-H-16` | **MERGED** | `01c4a1f` | **PASS** (`tsc` 0 err, `check-unwired` PASS, 42/42 host-compute/graph/regex/repo-tools; 128KB/273KB scanners <10ms) |
+| 12 | `r4-gate6-retest` | `R4-H-9`, `R4-H-10`, `R4-H-8` (patch-workflow) | **MERGED** | `a1fb6bc` | **PASS** (`tsc` 0 err, `check-unwired` PASS, 51/51 gate6/retest/export/cascade; proposal-scoped & faithful replay) |
+| 13 | `r4-repo-isolation` | `R4-H-8`, `R4-H-18` | **MERGED** | `7181691` | **PASS** (`tsc` 0 err, `check-unwired` PASS, 53/53 repo-isolation/snapshots/quota/warmpool) |
+| 14 | `r4-oob-quota` | `R4-H-20` | **MERGED** | `1c13c21` | **PASS** (`tsc` 0 err, `check-unwired` PASS, 54/54 OOB/canary/quota; >10k flood flat & bounded) |
+| X | `r4-cross-guards` | L800 (`getKernelSecrets`) + L802 (`sys-contract-canary`) | **MERGED** | `40f5a17` | **PASS** (`tsc` 0 err, `verify-rpc.ts = 2275 <= 2300`, `check-unwired` PASS, 28/28 incl. Checks 5 & 6) |

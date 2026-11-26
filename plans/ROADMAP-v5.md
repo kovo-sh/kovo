@@ -1046,3 +1046,38 @@ Major verified milestones merged onto `main` through `eec6419` (all backed by `w
    - Shipped Option 3 unified `.rw` left-rail workbench (`/` Projects Home, 5-tab `/projects/$projectId`, `/settings`, global `⌘K`), Kovo Hunter SVG/favicon kit, vault-backed `0600` Fine-Grained GitHub PAT + repo auto-discovery (in both `/projects/$projectId` and `Create project` modal), Phase-0 CT-log subdomain discovery (`*.domain` opt-in + unchecked third-party CNAMEs with explicit approval), multi-device ephemeral pairing links + session rotation, Prototype A `New run` dialog, and `Test Accounts` UI rename.
 6. **Next — Queue #13b Final Unified Agentic Certification (`eec6419`, IN FLIGHT):**
    - Running serialized Docker matrices on `eec6419` (`deepseek/deepseek-v4.1-flash-1017`): Dev unified (`>= 40/59` target), Salted held-out unified (`>= 32/58` target), and Tier-1 Smoke (`8/8` warm agentic post-floor snapshots). Results will be recorded in `VERIFICATION-v5.md` §V7.7 upon completion.
+
+### 2026-11-25 — systemic quality audit triage (`plans/claude_quality.md`, reviewer pane 0:2.1)
+
+Claude Code ran a read-only systemic audit: 8 lens-specific finders, then clustering, then 2 adversarial verifiers per theme. It produced 13 ranked improvements, written to `plans/claude_quality.md`. The reviewer (agy) triaged them against `main` @ `4c2a45d` and the active Option A `sys-*` streams. Full table, leases and merge order are in that file under *Reviewer triage*.
+
+| # | Item | Verdict | Stream / wave |
+|---|---|---|---|
+| 1 | fail-closed scoring + wordlist OFF by default | **ACCEPT** P0 | `cq-1` Wave 1 (no `sys-*` overlap) |
+| 2 | versioned results ledger + retire seed 1000042 | **ACCEPT** P1 | `cq-2` Wave 1, after `cq-1` |
+| 3 | blocking behavioral merge gate | **ACCEPT, narrowed**: regression floor at batch boundary, not per merge; `worker-gate` stays under 60 s | `cq-3` Wave 2 |
+| 4 | confirmation-path parity corpus | **ACCEPT** P0 precision guardrail | `cq-4` Wave 2, after `sys-host-autodag` and `cq-13a` |
+| 5 | typed terminal outcomes + loss accounting | **ACCEPT** | `cq-5` Wave 3, after `sys-q1` and `cq-6` |
+| 6 | agent contract single-source | **ACCEPT** P0 | `cq-6` Wave 2, after `sys-q1` and `sys-q2` |
+| 7 | one floor policy across modes | **DEFER** post-M2: does not affect v8 M2; 3-arm A/B once the ledger exists | `cq-7` Wave 4 |
+| 8 | EffectiveConfig + shipped parity | **ACCEPT, phased**: keep local-lab double gating | `cq-8` Wave 3 |
+| 9 | fixture-leak lint + novel-vocab cell | **ACCEPT** | `cq-9` Wave 3, after `sys-q5`, `cq-5` and `cq-8` |
+| 10 | typed persona/step semantics | **ACCEPT** | `cq-10` Wave 3, after `cq-4` and `cq-5` |
+| 11 | capability manifest + unwired/cycle ratchet | **ACCEPT, narrowed**: drop the `parallel-pulse`/backlog work | `cq-11` Wave 3 |
+| 12 | single taxonomy contract | **ACCEPT Stage 1** (conformance test + 3 drift fixes) / **DEFER Stage 2** (L refactor) | `cq-12a` Wave 3, `cq-12b` Wave 4 |
+| 13 | scope isolation | **SPLIT**: 13a P0 (per-run fail-closed redaction registry, `finally` restore, `disposeRun` purge) promoted to Wave 2; 13b (`RunScoped`, `strictRunScope` flip) deferred | `cq-13a` Wave 2, after `sys-q4`; `cq-13b` Wave 4 |
+
+Coordinator triage of the reviewer's changes:
+- **Accept** the 13a promotion: the redaction cap fail-open is a safety invariant.
+- **Accept** batch-boundary regression floors, because per-merge matrices would stall the swarm.
+- **Accept** the #7 deferral.
+- **Accept** dropping the pulse/backlog tooling, since it is retiring to `/swarm`.
+
+No streams started yet; operator approval pending. Expected recall discontinuity from #1/#2/#8/#9 must be re-baselined once, explicitly.
+
+### 2026-11-26 — Round-2 systemic quality audit triage & Wave 1 dispatch (`plans/claude_quality_2.md`)
+
+Triaged all 23 ranked items (`R2-01`..`R2-23`) in [`plans/claude_quality_2.md`](claude_quality_2.md) against `main` (post-`ux-workflow-list`) and the 7 active product/QA/M2 streams:
+- **22 ACCEPTED** (3 narrowed/phased: `R2-02` defers `package.json` to `R2-05` while `qa-move1-crawler` holds it and tracks ~20 pre-existing failing kernel cases as explicit `<=14d` per-case v2 entries for dedicated triage without bulk-realign; `R2-03` drops `parallel-pulse.sh` churn retiring to `/swarm` and gates CI behind `R2-02`; `R2-16` staged value-preserving snapshot + polite-target fixture before per-lane migrations).
+- **1 DEFERRED (`R2-23`)**: `cq-7` 2-arm 75s vs 165s A/B deferred to Wave 4 once `R2-05`/`R2-06` populate `benchmarks/results/ledger.jsonl` (docstring & ledger fields fold into `R2-05`/`R2-06`).
+- **Wave 1 dispatched immediately (5 disjoint `share` worktrees):** `r2-01-fail-closed` (`R2-01`), `r2-02-quarantine` (`R2-02`), `r2-04-retest-truth` (`R2-04`), `r2-07-step-status` (`R2-07`), `r2-10-dedupe-veto` (`R2-10`). Full triage table, hot-file serialization order, and merge log live in `plans/claude_quality_2.md`.
