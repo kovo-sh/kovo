@@ -112,26 +112,6 @@ export function validateDiffPath(rawPath: string, role: 'old' | 'new'): string {
   return stripped
 }
 
-function isNextFileOrSectionHeader(line: string | undefined): boolean {
-  if (line === undefined) return true
-  return (
-    line.startsWith('diff --git ')
-    || line.startsWith('--- ')
-    || line.startsWith('@@ ')
-    || line.startsWith('index ')
-    || line.startsWith('old mode ')
-    || line.startsWith('new mode ')
-    || line.startsWith('new file mode ')
-    || line.startsWith('deleted file mode ')
-    || line.startsWith('similarity index ')
-    || line.startsWith('dissimilarity index ')
-    || line.startsWith('rename from ')
-    || line.startsWith('rename to ')
-    || line.startsWith('copy from ')
-    || line.startsWith('copy to ')
-  )
-}
-
 /**
  * Parse and strictly validate a unified diff string using declared hunk line counts.
  */
@@ -414,4 +394,28 @@ export function validateUnifiedDiff(
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) }
   }
+}
+
+/**
+ * Produce the exact inverse unified diff so a previously applied patch can be cleanly reverted.
+ * File creations invert to deletions (`/dev/null` target) and file deletions invert to creations.
+ */
+export function invertUnifiedDiff(diffText: string): string {
+  const patches = parseUnifiedDiff(diffText)
+  const out: string[] = []
+  for (const patch of patches) {
+    const invOldHeader = patch.isDelete ? '/dev/null' : `a/${patch.normalizedPath}`
+    const invNewHeader = patch.isCreate ? '/dev/null' : `b/${patch.normalizedPath}`
+    out.push(`--- ${invOldHeader}`, `+++ ${invNewHeader}`)
+    for (const hunk of patch.hunks) {
+      const ctx = hunk.headerContext ? ` ${hunk.headerContext}` : ''
+      out.push(`@@ -${hunk.newStart},${hunk.newCount} +${hunk.oldStart},${hunk.oldCount} @@${ctx}`)
+      for (const entry of hunk.entries) {
+        if (entry.kind === 'context') out.push(` ${entry.text}`)
+        else if (entry.kind === 'add') out.push(`-${entry.text}`)
+        else out.push(`+${entry.text}`)
+      }
+    }
+  }
+  return out.join('\n') + '\n'
 }

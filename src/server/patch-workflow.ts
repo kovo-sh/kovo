@@ -1,195 +1,131 @@
 import { execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { closeSync, constants as fsConstants, cpSync, existsSync, lstatSync, mkdtempSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, statSync } from 'node:fs'
+import {
+  closeSync, constants as fsConstants, cpSync, existsSync, lstatSync,
+  mkdtempSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, statSync,
+} from 'node:fs'
+import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { extname, join, relative, resolve } from 'node:path'
 import { z } from 'zod'
 import type { Finding } from '../domain.ts'
-import type { DeclarativeReplaySpec } from '../replay-spec.ts'
+import type { DeclarativeReplaySpec, ReplayStep } from '../replay-spec.ts'
 import type { BrokerHttpRequest, Grant, RequestBroker } from './broker.ts'
 import type { CanaryBroker } from './canary-broker.ts'
 import {
-  compositeProofReceiptSchema,
-  sha256Hex,
-  verifyCompositeReceipt,
-  verifyHostRecordSignature,
+  compositeProofReceiptSchema, sha256Hex, verifyCompositeReceipt, verifyHostRecordSignature,
+  type CausalEdgeBinding, type CausalEdgeKind, type CompositeProofReceipt, type CompositeReceiptVerification,
+  type CompositeVerifyOptions, type HopReceipt, type HopSurface, type HostAsyncPollRecord,
+  type HostBrowserTrace, type HostOobEvent, type HostSignableRecord, type HostSignedTranscript, type HostTranscriptEntry,
 } from './composite-receipt.ts'
-import type {
-  CausalEdgeBinding,
-  CausalEdgeKind,
-  CompositeProofReceipt,
-  CompositeReceiptVerification,
-  CompositeVerifyOptions,
-  HopReceipt,
-  HopSurface,
-  HostAsyncPollRecord,
-  HostBrowserTrace,
-  HostOobEvent,
-  HostSignableRecord,
-  HostSignedTranscript,
-  HostTranscriptEntry,
-} from './composite-receipt.ts'
-import { applyUnifiedDiffToDirectory } from './lab-runner.ts'
-import type { LabRunner } from './lab-runner.ts'
-import { isProfileHealthy, resolveProfilePoolForRole } from './model-settings.ts'
-import type { ResolvedModelProfile } from './model-settings.ts'
-import { providerPool } from './provider.ts'
-import type { UsageCallback } from './provider.ts'
-import { redact } from './redact.ts'
-import type { NamedSecret } from './redact.ts'
+import { isSensitiveRepoEntry, isSensitiveRepoRelativePath } from './exec-verify.ts'
+import { applyUnifiedDiffToDirectory, type LabRunner } from './lab-runner.ts'
+import { isProfileHealthy, resolveProfilePoolForRole, type ResolvedModelProfile } from './model-settings.ts'
+import { providerPool, type UsageCallback } from './provider.ts'
+import { redact, type NamedSecret } from './redact.ts'
 import { retestReplaySpec } from './replay-verifier.ts'
 import type { ScopedBrowser } from './scoped-browser.ts'
+import type { BrokerExchange } from './store-session.ts'
 import type { Store } from './store.ts'
-import { parseUnifiedDiff } from './unified-diff.ts'
+import { invertUnifiedDiff, parseUnifiedDiff } from './unified-diff.ts'
 import type { WorkerBackend } from './worker-backend.ts'
 
 export type PatchStatus = 'draft' | 'approved' | 'rejected' | 'withheld'
 export type CallerCompatibility = 'attacker_only' | 'needs_operator_step' | 'breaks_callers'
 export type DynamicRetestVerdict = 'fixed' | 'reproduced' | 'skipped'
 
-export interface PatchCodeLocation {
-  repo: string
-  file: string
-  startLine: number
-  endLine: number
-  snippet?: string
-  label?: string
-}
-
+export interface PatchCodeLocation { repo: string; file: string; startLine: number; endLine: number; snippet?: string; label?: string }
 export interface CoverageInventoryEntry {
-  file: string
-  line?: number
-  symbol: string
+  file: string; line?: number; symbol: string
   role: 'primary_sink' | 'sibling_route' | 'sibling_writer' | 'middleware' | 'helper'
-  coveredByPatch: boolean
-  notes: string
+  coveredByPatch: boolean; notes: string
 }
-
-export interface PatchSyntaxCheckResult {
-  ran: boolean
-  command?: string
-  passed: boolean
-  output?: string
+export interface PatchSyntaxCheckResult { ran: boolean; command?: string; passed: boolean; output?: string; toolchainUnavailable?: boolean }
+export interface PatchApplicabilityResult {
+  applicable: boolean; filesModified: string[]; syntaxCheck: PatchSyntaxCheckResult
+  hasSubstantiveDiffChange: boolean; citedFileModified: boolean; fixAppliedToCitedFile: boolean; error?: string
 }
-
 export interface PatchAuthorOutput {
-  repo: string
-  coverageInventory: CoverageInventoryEntry[]
-  fixBefore: string
-  fixAfter: string
-  diff: string
-  codeLocations: PatchCodeLocation[]
-  rationale: string
-  syntaxCheck: PatchSyntaxCheckResult
+  repo: string; coverageInventory: CoverageInventoryEntry[]; fixBefore: string; fixAfter: string
+  diff: string; codeLocations: PatchCodeLocation[]; rationale: string; syntaxCheck: PatchSyntaxCheckResult
+  applicability?: PatchApplicabilityResult
 }
-
 export interface PatchGateResult {
   gate: 1 | 2 | 3 | 4 | 5 | 6
-  name:
-    | 'applicability'
-    | 'security_closure'
-    | 'sibling_coverage'
-    | 'caller_compatibility'
-    | 'repo_conventions'
-    | 'dynamic_retest'
-  passed: boolean
-  detail: string
-  enforcingLocation?: string
+  name: 'applicability' | 'security_closure' | 'sibling_coverage' | 'caller_compatibility' | 'repo_conventions' | 'dynamic_retest'
+  passed: boolean; detail: string; enforcingLocation?: string
 }
-
 export interface PatchReviewOutput {
-  approved: boolean
-  status: PatchStatus
-  callerCompatibility: CallerCompatibility
-  gates: PatchGateResult[]
-  reviewNotes: string
-  enforcingLocation?: string
+  approved: boolean; status: PatchStatus; callerCompatibility: CallerCompatibility
+  gates: PatchGateResult[]; reviewNotes: string; enforcingLocation?: string
 }
-
 export interface PatchProposalResult {
-  id: string
-  runId: string
-  findingId: string
-  repo: string
-  status: PatchStatus
-  callerCompatibility: CallerCompatibility
-  fixBefore: string
-  fixAfter: string
-  diff: string
-  codeLocations: PatchCodeLocation[]
-  coverageInventory: CoverageInventoryEntry[]
-  gates: PatchGateResult[]
-  reviewNotes: string
-  dynamicRetestVerdict: DynamicRetestVerdict
-  dynamicRetestSummary?: string
-  createdAt: number
-  updatedAt: number
+  id: string; runId: string; findingId: string; repo: string; status: PatchStatus
+  callerCompatibility: CallerCompatibility; fixBefore: string; fixAfter: string; diff: string
+  codeLocations: PatchCodeLocation[]; coverageInventory: CoverageInventoryEntry[]; gates: PatchGateResult[]
+  reviewNotes: string; dynamicRetestVerdict: DynamicRetestVerdict; dynamicRetestSummary?: string
+  createdAt: number; updatedAt: number
 }
-
 export type PatchLlmCall = (prompt: { systemPrompt: string; userPrompt: string }) => Promise<string>
 
 export interface PatchLabRetestContext {
-  labRunner: LabRunner
-  runId: string
-  /** Optional explicit sanitized lab workspace path (auto-resolved from `labRunner.supervisor` when omitted). */
-  sanitizedRepoDir?: string
-  replaySpec: DeclarativeReplaySpec
-  broker: RequestBroker
-  browser?: ScopedBrowser
-  canaryBroker?: CanaryBroker
-  backend: WorkerBackend
-  grant: Grant
-  storage?: Store
-  assignmentId?: string
-  /**
-   * Authorized (legitimate) baseline request that must still succeed after the rebuild.
-   * Gate 6 only passes when the exploit is fixed AND this caller remains 2xx.
-   */
-  baselineCaller?: BrokerHttpRequest
-  baselineExpectStatus?: number[]
+  labRunner: LabRunner; runId: string; sanitizedRepoDir?: string; replaySpec: DeclarativeReplaySpec
+  replaySpecId?: string; envelopeTrust?: 'host_persisted' | 'untrusted'
+  broker: RequestBroker; browser?: ScopedBrowser; canaryBroker?: CanaryBroker
+  backend: WorkerBackend; grant: Grant; storage?: Store; assignmentId?: string
+  baselineCaller?: BrokerHttpRequest; baselineExpectStatus?: number[]
 }
-
 export interface PatchWorkflowParams {
-  runId: string
-  finding: Finding & { codeLocations?: PatchCodeLocation[] }
-  repo: string
-  reposDir: string
-  backend?: WorkerBackend
-  authorLlmCall?: PatchLlmCall
-  reviewerLlmCall?: PatchLlmCall
-  modelProfiles?: readonly ResolvedModelProfile[]
-  candidatePatch?: Partial<PatchAuthorOutput>
-  labRetest?: PatchLabRetestContext
-  signal?: AbortSignal
-  secrets?: readonly NamedSecret[]
-  onUsage?: UsageCallback
+  runId: string; finding: Finding & { codeLocations?: PatchCodeLocation[] }; repo: string; reposDir: string
+  backend?: WorkerBackend; authorLlmCall?: PatchLlmCall; reviewerLlmCall?: PatchLlmCall
+  modelProfiles?: readonly ResolvedModelProfile[]; candidatePatch?: Partial<PatchAuthorOutput>
+  labRetest?: PatchLabRetestContext; signal?: AbortSignal; secrets?: readonly NamedSecret[]; onUsage?: UsageCallback
+}
+export interface FocusedFileContext {
+  file: string; startLine?: number; endLine?: number; totalLines: number
+  truncated: boolean; includedRanges: Array<[number, number]>; content: string | null
+}
+export interface SynthesizedBaselineCaller {
+  caller: BrokerHttpRequest; expectStatus: number[]
+  source: 'explicit' | 'receipt_exchange' | 'recipe_control' | 'spec_control' | 'phase0_exchange'
 }
 
 const NO_FOLLOW = (fsConstants as { O_NOFOLLOW?: number }).O_NOFOLLOW ?? 0
+const MAX_FULL_FILE_CONTEXT_CHARS = 48_000
+const CONTEXT_HEADER_LINES = 40
+const CONTEXT_WINDOW_PAD = 120
+const MAX_SIBLING_SCAN_FILES = 150
+const MAX_SIBLING_HINTS = 10
+const SKIP_SCAN_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.next', '.venv', 'venv', '__pycache__', 'target', 'vendor'])
 
-function isSymlink(path: string): boolean {
+const requireFromHere = createRequire(import.meta.url)
+let cachedTsMod: typeof import('typescript') | null | undefined
+
+function loadTypeScriptSync(): typeof import('typescript') | null {
+  if (cachedTsMod !== undefined) return cachedTsMod
   try {
-    return lstatSync(path).isSymbolicLink()
-  } catch {
-    return false
-  }
+    const loaded = requireFromHere('typescript') as typeof import('typescript') & { default?: typeof import('typescript') }
+    cachedTsMod = loaded.default ?? loaded
+  } catch { cachedTsMod = null }
+  return cachedTsMod
 }
 
-/** Read a file only if it is a regular file, never following a symlink (O_NOFOLLOW closes races). */
+function isSymlink(path: string): boolean {
+  try { return lstatSync(path).isSymbolicLink() } catch { return false }
+}
+
 function readRegularFileNoFollow(path: string): string | null {
   let fd: number | undefined
   try {
     if (!lstatSync(path).isFile()) return null
     fd = openSync(path, fsConstants.O_RDONLY | NO_FOLLOW)
     return readFileSync(fd, 'utf8')
-  } catch {
-    return null
-  } finally {
-    if (fd !== undefined) {
-      try { closeSync(fd) } catch { /* already closed */ }
-    }
+  } catch { return null } finally {
+    if (fd !== undefined) { try { closeSync(fd) } catch { /* ignore */ } }
   }
 }
+
+const normalizeRepoRelPath = (file: string): string => file.replace(/^\/+/, '').replace(/\\/g, '/').replace(/^[ab]\//, '')
 
 function validateRepoPath(reposDir: string, repo: string): string {
   const cleanRepo = repo.replace(/^\/+|\/+$/g, '')
@@ -198,61 +134,164 @@ function validateRepoPath(reposDir: string, repo: string): string {
   }
   const baseReal = realpathSync(reposDir)
   const target = resolve(baseReal, cleanRepo)
-  const rel = relative(baseReal, target)
-  if (rel.startsWith('..') || !existsSync(target) || !statSync(target).isDirectory()) {
+  if (relative(baseReal, target).startsWith('..') || !existsSync(target) || !statSync(target).isDirectory()) {
     throw new Error(`Mounted repository not found: ${cleanRepo}`)
   }
-  // A project mount may be replaced by a link to an outside directory; patch authoring must not
-  // read or write through it.
-  if (isSymlink(target)) {
-    throw new Error(`Mounted repository is a symlink and cannot be patched: ${cleanRepo}`)
-  }
+  if (isSymlink(target)) throw new Error(`Mounted repository is a symlink and cannot be patched: ${cleanRepo}`)
   return realpathSync(target)
 }
 
+/** Safely read a repo-relative regular file; refuses traversal, symlinks in any segment, and H-39 sensitive paths. */
 function safeReadRepoFile(repoRoot: string, relFile: string): string | null {
-  const clean = relFile.replace(/^\/+/, '').replace(/\\/g, '/')
-  if (!clean || clean.includes('\0') || clean.split('/').some(seg => seg === '..')) return null
+  const clean = normalizeRepoRelPath(relFile)
+  if (!clean || clean.includes('\0') || clean.split('/').some(seg => !seg || seg === '.' || seg === '..')) return null
+  if (isSensitiveRepoRelativePath(clean)) return null
   const full = resolve(repoRoot, clean)
-  const rel = relative(repoRoot, full)
-  if (rel.startsWith('..') || !existsSync(full)) return null
+  if (relative(repoRoot, full).startsWith('..') || !existsSync(full)) return null
+  let cur = repoRoot
+  for (const seg of clean.split('/')) {
+    cur = join(cur, seg)
+    if (isSymlink(cur)) return null
+  }
   return readRegularFileNoFollow(full)
 }
 
-/**
- * Copy a repo into an isolated work dir without following links. A repository may contain a link
- * to /etc/passwd or to an outside directory; following it in the patch work copy would let a diff
- * read or write host files. `dereference: false` keeps entries as links, and the filter drops them.
- */
-export function copyRepoTreeWithoutSymlinks(repoRoot: string, destRoot: string): void {
+/** Copy a repo into an isolated work dir without following links (optionally excluding H-39 sensitive entries). */
+export function copyRepoTreeWithoutSymlinks(
+  repoRoot: string,
+  destRoot: string,
+  options: { excludeSensitive?: boolean } = {},
+): void {
+  const excludeSensitive = options.excludeSensitive === true
   cpSync(repoRoot, destRoot, {
     recursive: true,
     dereference: false,
     verbatimSymlinks: false,
-    filter: src => !isSymlink(src),
+    filter: src => {
+      if (isSymlink(src)) return false
+      if (!excludeSensitive || src === repoRoot) return true
+      const relPosix = relative(repoRoot, src).replace(/\\/g, '/')
+      if (!relPosix || relPosix.startsWith('..')) return false
+      const name = relPosix.split('/').pop() ?? relPosix
+      try { return !isSensitiveRepoEntry(relPosix, name, lstatSync(src).isDirectory()) } catch { return false }
+    },
   })
   const stack: string[] = [destRoot]
   while (stack.length > 0) {
     const dir = stack.pop()!
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
       const full = join(dir, entry.name)
-      if (isSymlink(full)) {
-        throw new Error(`Refusing patch work copy containing a symlink: ${entry.name}`)
-      }
+      if (isSymlink(full)) throw new Error(`Refusing patch work copy containing a symlink: ${entry.name}`)
       if (entry.isDirectory()) stack.push(full)
     }
   }
 }
 
+const FUNC_DECL_RE = /^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function\b|class\b|def\b|func\b|fn\b|public\b|private\b|protected\b|(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*=\s*(?:async\s*)?\(|(?:app|router|server|fastify)\.(?:get|post|put|patch|delete|use|all)\s*\(|@[A-Za-z_])/
+
+/** Extract full-file or function-centered line-windowed context (never byte-0 truncated blind). Enforces H-39. */
+export function extractFocusedFileContext(
+  repoRoot: string,
+  relFile: string,
+  targetRanges: ReadonlyArray<{ startLine: number; endLine?: number }>,
+  maxChars = MAX_FULL_FILE_CONTEXT_CHARS,
+): FocusedFileContext {
+  const text = safeReadRepoFile(repoRoot, relFile)
+  if (text === null) return { file: relFile, totalLines: 0, truncated: false, includedRanges: [], content: null }
+  const lines = text.replace(/\r\n/g, '\n').split('\n')
+  const totalLines = lines.length
+  const first = targetRanges[0]
+  if (text.length <= maxChars) {
+    return {
+      file: relFile, ...(first ? { startLine: first.startLine, endLine: first.endLine ?? first.startLine } : {}),
+      totalLines, truncated: false, includedRanges: totalLines > 0 ? [[1, totalLines]] : [], content: text,
+    }
+  }
+
+  const rawWindows: Array<[number, number]> = totalLines > 0 ? [[1, Math.min(totalLines, CONTEXT_HEADER_LINES)]] : []
+  const targets = targetRanges.length > 0 ? targetRanges : [{ startLine: 1, endLine: Math.min(totalLines, CONTEXT_WINDOW_PAD) }]
+  for (const r of targets) {
+    const s = Math.max(1, Math.min(totalLines, r.startLine))
+    const e = Math.max(s, Math.min(totalLines, r.endLine ?? r.startLine))
+    let winStart = Math.max(1, s - CONTEXT_WINDOW_PAD)
+    for (let ln = s; ln >= winStart; ln -= 1) {
+      if (FUNC_DECL_RE.test(lines[ln - 1] ?? '')) { winStart = Math.max(1, ln - 5); break }
+    }
+    rawWindows.push([winStart, Math.min(totalLines, e + CONTEXT_WINDOW_PAD)])
+  }
+
+  rawWindows.sort((a, b) => a[0] - b[0] || a[1] - b[1])
+  const merged: Array<[number, number]> = []
+  for (const w of rawWindows) {
+    const prev = merged[merged.length - 1]
+    if (prev && w[0] <= prev[1] + 8) prev[1] = Math.max(prev[1], w[1])
+    else merged.push([w[0], w[1]])
+  }
+
+  const chunks: string[] = [], included: Array<[number, number]> = []
+  let usedChars = 0
+  for (const [start, end] of merged) {
+    const block = `--- lines ${start}-${end} of ${totalLines} ---\n`
+      + lines.slice(start - 1, end).map((line, idx) => `${start + idx}: ${line}`).join('\n') + '\n'
+    if (usedChars + block.length <= maxChars || included.length === 0) {
+      chunks.push(block.slice(0, Math.max(256, maxChars - usedChars)))
+      included.push([start, end])
+      usedChars += block.length
+    }
+  }
+  return {
+    file: relFile, ...(first ? { startLine: first.startLine, endLine: first.endLine ?? first.startLine } : {}),
+    totalLines, truncated: true, includedRanges: included, content: chunks.join('\n'),
+  }
+}
+
+function collectSiblingHints(
+  repoRoot: string,
+  excludedFiles: ReadonlySet<string>,
+  searchTerms: readonly string[],
+): Array<{ file: string; line: number; excerpt: string }> {
+  const cleanTerms = [...new Set(searchTerms.map(t => t.trim()).filter(t => t.length >= 4 && t.length <= 80))].slice(0, 6)
+  if (!cleanTerms.length) return []
+  const hits: Array<{ file: string; line: number; excerpt: string }> = []
+  const stack: string[] = ['']
+  let scanned = 0
+  while (stack.length > 0 && scanned < MAX_SIBLING_SCAN_FILES && hits.length < MAX_SIBLING_HINTS) {
+    const relDir = stack.pop()!
+    const absDir = relDir ? join(repoRoot, relDir) : repoRoot
+    let entries
+    try { entries = readdirSync(absDir, { withFileTypes: true }) } catch { continue }
+    for (const entry of entries) {
+      if (scanned >= MAX_SIBLING_SCAN_FILES || hits.length >= MAX_SIBLING_HINTS) break
+      const relPosix = relDir ? `${relDir}/${entry.name}` : entry.name
+      const full = join(absDir, entry.name)
+      if (isSymlink(full)) continue
+      if (entry.isDirectory()) {
+        if (!SKIP_SCAN_DIRS.has(entry.name) && !isSensitiveRepoEntry(relPosix, entry.name, true)) stack.push(relPosix)
+        continue
+      }
+      if (!entry.isFile() || excludedFiles.has(relPosix) || isSensitiveRepoEntry(relPosix, entry.name, false)) continue
+      if (!/\.(?:[cm]?[jt]sx?|py|go|java|kt|rb|php|rs|cs)$/i.test(entry.name)) continue
+      scanned += 1
+      const content = readRegularFileNoFollow(full)
+      if (!content || content.length > 256_000) continue
+      const lines = content.split('\n')
+      for (let i = 0; i < lines.length && hits.length < MAX_SIBLING_HINTS; i += 1) {
+        if (cleanTerms.some(term => lines[i]!.includes(term))) {
+          hits.push({ file: relPosix, line: i + 1, excerpt: lines[i]!.trim().slice(0, 180) })
+          break
+        }
+      }
+    }
+  }
+  return hits
+}
+
 function extractJsonBlock(raw: string): unknown {
   const trimmed = raw.trim()
   const fence = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i)
-  const body = fence ? fence[1].trim() : trimmed
-  const start = body.indexOf('{')
-  const end = body.lastIndexOf('}')
-  if (start === -1 || end <= start) {
-    throw new Error('Expected JSON object in patch agent response.')
-  }
+  const body = fence ? fence[1]!.trim() : trimmed
+  const start = body.indexOf('{'), end = body.lastIndexOf('}')
+  if (start === -1 || end <= start) throw new Error('Expected JSON object in patch agent response.')
   return JSON.parse(body.slice(start, end + 1))
 }
 
@@ -263,19 +302,11 @@ function makeFreshProviderCall(
 ): PatchLlmCall {
   return async ({ systemPrompt, userPrompt }) => {
     const routed = resolveProfilePoolForRole('reasoning', profiles)
-    const now = Date.now()
-    const primary = routed.find(p => isProfileHealthy(p, now)) ?? routed[0]
-    const effectiveThinking = primary?.thinkingLevel === 'off' ? 'off' : 'high'
+    const primary = routed.find(p => isProfileHealthy(p, Date.now())) ?? routed[0]
     const { models, model } = providerPool(routed, scenario, {
-      signal: options.signal,
-      secrets: options.secrets,
-      onUsage: options.onUsage,
-      maxCalls: 2,
-      thinkingLevel: effectiveThinking,
-      roleAffinity: 'reasoning',
-      firstEventTimeoutMs: 60_000,
-      idleTimeoutMs: 60_000,
-      totalTimeoutMs: 120_000,
+      signal: options.signal, secrets: options.secrets, onUsage: options.onUsage, maxCalls: 2,
+      thinkingLevel: primary?.thinkingLevel === 'off' ? 'off' : 'high', roleAffinity: 'reasoning',
+      firstEventTimeoutMs: 60_000, idleTimeoutMs: 60_000, totalTimeoutMs: 120_000,
     })
     const stream = models.stream(model, {
       systemPrompt: redact(systemPrompt, options.secrets),
@@ -283,412 +314,192 @@ function makeFreshProviderCall(
       tools: [],
     })
     let out = ''
-    for await (const ev of stream) {
-      if (ev.type === 'text_delta' && typeof ev.delta === 'string') out += ev.delta
-    }
+    for await (const ev of stream) if (ev.type === 'text_delta' && typeof ev.delta === 'string') out += ev.delta
     const res = await stream.result()
     if (!out && Array.isArray(res.content)) {
-      out = res.content
-        .filter((p): p is { type: 'text'; text: string } => p.type === 'text' && typeof p.text === 'string')
-        .map(p => p.text)
-        .join('')
+      out = res.content.filter((p): p is { type: 'text'; text: string } => p.type === 'text' && typeof p.text === 'string').map(p => p.text).join('')
     }
     return out.trim()
   }
 }
 
+/** Build a hunk-counted unified diff replacing `fixBefore` with `fixAfter` (disambiguating by `hintStartLine` and handling mid-line snippets). */
 export function buildUnifiedDiffFromSnippet(
   relFile: string,
   originalContent: string,
   fixBefore: string,
   fixAfter: string,
+  hintStartLine?: number,
 ): { diff: string; startLine: number; endLine: number } {
-  const idx = originalContent.indexOf(fixBefore)
-  if (idx === -1) {
-    throw new Error(`fixBefore snippet not found verbatim in ${relFile}.`)
-  }
-  const updatedContent = originalContent.slice(0, idx) + fixAfter + originalContent.slice(idx + fixBefore.length)
   const normOrig = originalContent.replace(/\r\n/g, '\n')
-  const normUpdated = updatedContent.replace(/\r\n/g, '\n')
-  const origLines = normOrig === ''
-    ? []
-    : (normOrig.endsWith('\n') ? normOrig.slice(0, -1).split('\n') : normOrig.split('\n'))
-  const newLines = normUpdated === ''
-    ? []
-    : (normUpdated.endsWith('\n') ? normUpdated.slice(0, -1).split('\n') : normUpdated.split('\n'))
-
-  const startLine = originalContent.slice(0, idx).replace(/\r\n/g, '\n').split('\n').length
   const normBefore = fixBefore.replace(/\r\n/g, '\n')
   const normAfter = fixAfter.replace(/\r\n/g, '\n')
-  const oldSpanLines = normBefore.endsWith('\n') ? normBefore.slice(0, -1).split('\n') : normBefore.split('\n')
-  const newSpanLines = normAfter === ''
-    ? []
-    : (normAfter.endsWith('\n') ? normAfter.slice(0, -1).split('\n') : normAfter.split('\n'))
-  const endLine = Math.min(origLines.length, startLine + oldSpanLines.length - 1)
+  if (!normBefore) throw new Error(`fixBefore snippet cannot be empty for ${relFile}.`)
 
-  const ctxStart = Math.max(0, startLine - 1 - 2)
+  let idx = -1
+  if (hintStartLine && hintStartLine > 0) {
+    let bestDist = Number.POSITIVE_INFINITY
+    for (let pos = 0; pos <= normOrig.length;) {
+      const found = normOrig.indexOf(normBefore, pos)
+      if (found === -1) break
+      const dist = Math.abs(normOrig.slice(0, found).split('\n').length - hintStartLine)
+      if (dist < bestDist) { bestDist = dist; idx = found }
+      pos = found + 1
+    }
+  } else {
+    idx = normOrig.indexOf(normBefore)
+  }
+  if (idx === -1) throw new Error(`fixBefore snippet not found verbatim in ${relFile}.`)
+
+  const updated = normOrig.slice(0, idx) + normAfter + normOrig.slice(idx + normBefore.length)
+  const splitLines = (s: string) => s === '' ? [] : (s.endsWith('\n') ? s.slice(0, -1).split('\n') : s.split('\n'))
+  const origLines = splitLines(normOrig), newLines = splitLines(updated)
+  const startLine = normOrig.slice(0, idx).split('\n').length
+  const matchEnd = idx + normBefore.length
+  const endProbe = matchEnd > idx && normBefore.endsWith('\n') ? matchEnd - 1 : matchEnd
+  const endLine = Math.min(origLines.length, Math.max(startLine, normOrig.slice(0, endProbe).split('\n').length))
+  const newEndLine = Math.max(startLine - 1, endLine + (newLines.length - origLines.length))
+
+  const ctxStart = Math.max(0, startLine - 3)
   const oldCtxEnd = Math.min(origLines.length, endLine + 2)
-  const delta = newSpanLines.length - oldSpanLines.length
-  const newCtxEnd = Math.min(newLines.length, oldCtxEnd + delta)
-
   const preCtx = origLines.slice(ctxStart, startLine - 1).map(l => ' ' + l)
   const removed = origLines.slice(startLine - 1, endLine).map(l => '-' + l)
-  const added = newLines.slice(startLine - 1, startLine - 1 + newSpanLines.length).map(l => '+' + l)
+  const added = newLines.slice(startLine - 1, newEndLine).map(l => '+' + l)
   const postCtx = origLines.slice(endLine, oldCtxEnd).map(l => ' ' + l)
-
-  const oldCount = preCtx.length + removed.length + postCtx.length
-  const newCount = preCtx.length + added.length + postCtx.length
-  const header = [
-    `--- a/${relFile}`,
-    `+++ b/${relFile}`,
-    `@@ -${ctxStart + 1},${oldCount} +${ctxStart + 1},${newCount} @@`,
-  ]
-
-  // Keep newCtxEnd referenced cleanly (used to verify slice alignment)
-  void newCtxEnd
+  const cleanRel = normalizeRepoRelPath(relFile)
   return {
-    diff: [...header, ...preCtx, ...removed, ...added, ...postCtx].join('\n') + '\n',
+    diff: [
+      `--- a/${cleanRel}`, `+++ b/${cleanRel}`,
+      `@@ -${ctxStart + 1},${preCtx.length + removed.length + postCtx.length} +${ctxStart + 1},${preCtx.length + added.length + postCtx.length} @@`,
+      ...preCtx, ...removed, ...added, ...postCtx,
+    ].join('\n') + '\n',
     startLine,
     endLine,
   }
 }
 
-export interface PatchApplicabilityResult {
-  applicable: boolean
-  filesModified: string[]
-  syntaxCheck: PatchSyntaxCheckResult
-  hasSubstantiveDiffChange: boolean
-  citedFileModified: boolean
-  fixAppliedToCitedFile: boolean
-  error?: string
-}
-
-function normalizeRepoRelPath(file: string): string {
-  return file.replace(/^\/+/, '').replace(/\\/g, '/').replace(/^[ab]\//, '')
-}
-
 function isFixAfterInChangedHunks(
   parsedPatches: ReturnType<typeof parseUnifiedDiff>,
   primaryRelFile: string,
-  normOrig: string,
   normPatched: string,
   normFixBefore: string,
   normFixAfter: string,
 ): boolean {
-  const matchingPatches = parsedPatches.filter(
-    fp => normalizeRepoRelPath(fp.normalizedPath) === primaryRelFile,
-  )
-  if (!matchingPatches.length) return false
+  const matching = parsedPatches.filter(fp => normalizeRepoRelPath(fp.normalizedPath) === primaryRelFile)
+  if (!matching.length) return false
   if (normFixAfter.trim() === '') {
-    const removedLines = matchingPatches.flatMap(fp =>
-      fp.hunks.flatMap(h => h.entries.filter(e => e.kind === 'remove').map(e => e.text)),
-    )
+    const removed = matching.flatMap(fp => fp.hunks.flatMap(h => h.entries.filter(e => e.kind === 'remove').map(e => e.text)))
     const beforeNonEmpty = normFixBefore.replace(/\n$/, '').split('\n').filter(l => l.trim() !== '')
-    const removedMatches = beforeNonEmpty.length === 0
-      ? removedLines.length > 0
-      : beforeNonEmpty.every(line => removedLines.some(r => r.includes(line) || line.includes(r)))
-    return removedMatches && !normPatched.includes(normFixBefore)
+    const ok = beforeNonEmpty.length === 0 ? removed.length > 0 : beforeNonEmpty.every(line => removed.some(r => r.includes(line) || line.includes(r)))
+    return ok && !normPatched.includes(normFixBefore)
   }
-
   const targetAfter = normFixAfter.replace(/\n$/, '')
   const targetLines = targetAfter.split('\n').filter(l => l.trim() !== '')
   const beforeSet = new Set(normFixBefore.replace(/\n$/, '').split('\n'))
-  const changedAfterLines = targetLines.filter(l => !beforeSet.has(l))
-  const requiredAddedLines = changedAfterLines.length > 0 ? changedAfterLines : targetLines
-
-  for (const fp of matchingPatches) {
-    for (const hunk of fp.hunks) {
-      const addedBlock = hunk.entries.filter(e => e.kind === 'add').map(e => e.text).join('\n')
-      if (addedBlock.includes(targetAfter)) return true
-      const hunkNewBlock = hunk.entries
-        .filter(e => e.kind === 'add' || e.kind === 'context')
-        .map(e => e.text)
-        .join('\n')
-      if (!hunkNewBlock.includes(targetAfter)) continue
-      const addedLines = hunk.entries.filter(e => e.kind === 'add').map(e => e.text)
-      if (requiredAddedLines.length > 0 && requiredAddedLines.every(line => addedLines.some(a => a === line || a.includes(line)))) {
-        return true
-      }
+  const changed = targetLines.filter(l => !beforeSet.has(l))
+  const required = changed.length > 0 ? changed : targetLines
+  for (const fp of matching) {
+    for (const h of fp.hunks) {
+      const added = h.entries.filter(e => e.kind === 'add').map(e => e.text)
+      if (added.join('\n').includes(targetAfter)) return true
+      const newBlock = h.entries.filter(e => e.kind === 'add' || e.kind === 'context').map(e => e.text).join('\n')
+      if (newBlock.includes(targetAfter) && required.length > 0 && required.every(line => added.some(a => a === line || a.includes(line)))) return true
     }
   }
-  void normOrig
   return false
 }
+
+const SYNTAX_UNAVAILABLE_PREFIX = 'KOVO_SYNTAX_UNAVAILABLE:'
 
 const PATCH_SYNTAX_CHECK_SCRIPT = [
   "import { execFileSync } from 'node:child_process'",
   "import { copyFileSync, cpSync, mkdirSync, readFileSync, rmSync } from 'node:fs'",
   "import { dirname, join, resolve } from 'node:path'",
   "const manifest = JSON.parse(readFileSync('/evidence/patch_syntax_manifest.json', 'utf8'))",
-  "const reposRoot = resolve('/repos')",
-  "const repoSrc = resolve(reposRoot, manifest.repo)",
+  "const reposRoot = resolve('/repos'), repoSrc = resolve(reposRoot, manifest.repo)",
   "if (!repoSrc.startsWith(reposRoot + '/')) throw new Error('Invalid repo path')",
-  "const workRepo = resolve('/tmp/work-repo')",
-  "mkdirSync(workRepo, { recursive: true })",
-  "cpSync(repoSrc, workRepo, { recursive: true })",
-  "for (const rel of manifest.deletedFiles ?? []) {",
-  "  const target = resolve(workRepo, rel)",
-  "  if (!target.startsWith(workRepo + '/')) throw new Error('Invalid deleted file path')",
-  "  rmSync(target, { force: true })",
-  "}",
-  "for (const entry of manifest.files ?? []) {",
-  "  const target = resolve(workRepo, entry.origName)",
-  "  if (!target.startsWith(workRepo + '/')) throw new Error('Invalid modified file path')",
-  "  mkdirSync(dirname(target), { recursive: true })",
-  "  copyFileSync(join('/evidence', entry.stagedName), target)",
-  "}",
-  "const runBin = (bin, args, optional = false) => {",
-  "  try {",
-  "    const out = execFileSync(bin, args, { cwd: workRepo, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })",
-  "    if (out) process.stdout.write(out)",
-  "  } catch (err) {",
-  "    if (optional && err && err.code === 'ENOENT') { console.log(`${bin} toolchain unavailable (skipped)`); return }",
-  "    if (err && err.stdout) process.stdout.write(String(err.stdout))",
-  "    if (err && err.stderr) process.stderr.write(String(err.stderr))",
-  "    process.exit(typeof err?.status === 'number' && err.status !== 0 ? err.status : 1)",
-  "  }",
-  "}",
+  "const workRepo = resolve('/tmp/work-repo'); mkdirSync(workRepo, { recursive: true }); cpSync(repoSrc, workRepo, { recursive: true })",
+  "for (const rel of manifest.deletedFiles ?? []) { const t = resolve(workRepo, rel); if (!t.startsWith(workRepo + '/')) throw new Error('Invalid deleted file path'); rmSync(t, { force: true }) }",
+  "for (const e of manifest.files ?? []) { const t = resolve(workRepo, e.origName); if (!t.startsWith(workRepo + '/')) throw new Error('Invalid modified file path'); mkdirSync(dirname(t), { recursive: true }); copyFileSync(join('/evidence', e.stagedName), t) }",
+  "const unavailable = []",
+  "const runBin = (bin, args, origName) => { try { const out = execFileSync(bin, args, { cwd: workRepo, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }); if (out) process.stdout.write(out); return true } catch (err) { if (err && err.code === 'ENOENT') { const l = '" + SYNTAX_UNAVAILABLE_PREFIX + "' + bin + ':' + origName; unavailable.push(l); console.log(l); return false } if (err?.stdout) process.stdout.write(String(err.stdout)); if (err?.stderr) process.stderr.write(String(err.stderr)); process.exit(typeof err?.status === 'number' && err.status !== 0 ? err.status : 1) } }",
   "let ranCheck = false",
-  "for (const entry of manifest.files ?? []) {",
-  "  const origName = entry.origName",
-  "  const staged = join('/evidence', entry.stagedName)",
-  "  if (/\\.(?:[cm]?js)$/i.test(origName)) { ranCheck = true; runBin(process.execPath, ['--check', staged]) }",
-  "  else if (/\\.py$/i.test(origName)) { ranCheck = true; runBin('python3', ['-m', 'py_compile', staged]) }",
-  "  else if (/\\.go$/i.test(origName)) { ranCheck = true; runBin('go', ['vet', './' + origName], true) }",
-  "  else if (/\\.(?:java|kt)$/i.test(origName)) { ranCheck = true; mkdirSync('/tmp/kovo-javac', { recursive: true }); runBin('javac', ['-proc:none', '-d', '/tmp/kovo-javac', staged], true) }",
+  "for (const e of manifest.files ?? []) { const n = e.origName, s = join('/evidence', e.stagedName)",
+  "  if (/\\.(?:[cm]?js)$/i.test(n)) ranCheck = runBin(process.execPath, ['--check', s], n) || ranCheck",
+  "  else if (/\\.py$/i.test(n)) ranCheck = runBin('python3', ['-m', 'py_compile', s], n) || ranCheck",
+  "  else if (/\\.go$/i.test(n)) ranCheck = runBin('go', ['vet', './' + n], n) || ranCheck",
+  "  else if (/\\.(?:java|kt)$/i.test(n)) { mkdirSync('/tmp/kovo-javac', { recursive: true }); ranCheck = runBin('javac', ['-proc:none', '-d', '/tmp/kovo-javac', s], n) || ranCheck }",
+  "  else if (/\\.jsx$/i.test(n)) { const l = '" + SYNTAX_UNAVAILABLE_PREFIX + "jsx:' + n; unavailable.push(l); console.log(l) }",
   "}",
-  "if ((manifest.files ?? []).some(e => /\\.(?:[cm]?ts|tsx)$/i.test(e.origName)) && manifest.hasTsconfig) {",
-  "  ranCheck = true",
-  "  runBin('tsc', ['--noEmit', '--skipLibCheck', '-p', join(workRepo, 'tsconfig.json')], true)",
-  "}",
-  "if (!ranCheck) console.log('syntax-ok')",
+  "const tsFiles = (manifest.files ?? []).filter(e => /\\.(?:[cm]?ts|tsx)$/i.test(e.origName))",
+  "if (tsFiles.length > 0) { if (manifest.hasTsconfig) ranCheck = runBin('tsc', ['--noEmit', '--skipLibCheck', '-p', join(workRepo, 'tsconfig.json')], tsFiles.map(e => e.origName).join(',')) || ranCheck; else for (const f of tsFiles) { const l = '" + SYNTAX_UNAVAILABLE_PREFIX + "tsc_no_tsconfig:' + f.origName; unavailable.push(l); console.log(l) } }",
+  "if (!ranCheck && unavailable.length === 0) console.log('syntax-ok')",
 ].join('\n') + '\n'
 
-export async function verifyPatchApplicability(params: {
-  repoRoot: string
-  repo: string
-  reposDir: string
-  diff: string
-  fixBefore: string
-  fixAfter?: string
-  codeLocations: readonly PatchCodeLocation[]
-  backend?: WorkerBackend
-  signal?: AbortSignal
-}): Promise<PatchApplicabilityResult> {
-  const { repoRoot, repo, reposDir, diff, fixBefore, fixAfter, codeLocations, backend, signal } = params
-
-  // Verify fixBefore matches verbatim in at least one referenced file when provided.
-  let originalCitedContent: string | null = null
-  const primaryRelFile = codeLocations.length > 0 ? normalizeRepoRelPath(codeLocations[0]!.file) : null
-  if (primaryRelFile) {
-    originalCitedContent = safeReadRepoFile(repoRoot, primaryRelFile)
-  }
-  if (fixBefore.trim() && codeLocations.length > 0) {
-    const primary = codeLocations[0]!
-    if (originalCitedContent === null) {
-      return {
-        applicable: false,
-        filesModified: [],
-        syntaxCheck: { ran: false, passed: false, output: `File not found: ${primary.file}` },
-        hasSubstantiveDiffChange: false,
-        citedFileModified: false,
-        fixAppliedToCitedFile: false,
-        error: `Referenced file ${primary.file} does not exist in ${repo}.`,
-      }
-    }
-    if (!originalCitedContent.includes(fixBefore)) {
-      return {
-        applicable: false,
-        filesModified: [],
-        syntaxCheck: { ran: false, passed: false, output: 'fixBefore mismatch' },
-        hasSubstantiveDiffChange: false,
-        citedFileModified: false,
-        fixAppliedToCitedFile: false,
-        error: `fixBefore does not match ${primary.file} verbatim.`,
-      }
-    }
-  }
-
-  // Test applying unified diff in an isolated temporary clone (never mutating /repos!).
-  const workDir = mkdtempSync(join(tmpdir(), 'kovo-patch-check-'))
-  try {
-    // M-24: Strictly validate hunk counts, headers, paths, binary/symlink markers first.
-    const parsedPatches = parseUnifiedDiff(diff)
-    const hasSubstantiveDiffChange = parsedPatches.some(fp =>
-      fp.hunks.some(h => h.entries.some(e => e.kind === 'add' || e.kind === 'remove')),
-    )
-
-    copyRepoTreeWithoutSymlinks(repoRoot, workDir)
-    const { filesModified } = applyUnifiedDiffToDirectory(workDir, diff)
-
-    const deletedPaths = new Set(
-      parsedPatches.filter(fp => fp.isDelete).map(fp => normalizeRepoRelPath(fp.normalizedPath)),
-    )
-    const survivingFiles = filesModified.filter(f => !deletedPaths.has(normalizeRepoRelPath(f)))
-
-    const normalizedModified = new Set(filesModified.map(normalizeRepoRelPath))
-    const citedFileModified = primaryRelFile ? normalizedModified.has(primaryRelFile) : filesModified.length > 0
-    let fixAppliedToCitedFile = false
-    if (primaryRelFile && citedFileModified) {
-      if (deletedPaths.has(primaryRelFile)) {
-        fixAppliedToCitedFile = fixAfter !== undefined && fixAfter.trim() === ''
-      } else {
-        const patchedCitedContent = safeReadRepoFile(workDir, primaryRelFile)
-        if (patchedCitedContent !== null && originalCitedContent !== null) {
-          const normOrig = originalCitedContent.replace(/\r\n/g, '\n')
-          const normPatched = patchedCitedContent.replace(/\r\n/g, '\n')
-          const changed = normPatched !== normOrig
-          if (changed) {
-            if (fixAfter !== undefined) {
-              const normFixAfter = fixAfter.replace(/\r\n/g, '\n')
-              const normFixBefore = fixBefore.replace(/\r\n/g, '\n')
-              fixAppliedToCitedFile = isFixAfterInChangedHunks(
-                parsedPatches,
-                primaryRelFile,
-                normOrig,
-                normPatched,
-                normFixBefore,
-                normFixAfter,
-              )
-            } else {
-              fixAppliedToCitedFile = true
-            }
-          }
-        }
-      }
-    } else if (!primaryRelFile && hasSubstantiveDiffChange && filesModified.length > 0) {
-      fixAppliedToCitedFile = true
-    }
-
-    // Run offline syntax check inside air-gapped --network none worker container if backend provided,
-    // or local Node syntax check on surviving modified JS/TS/MJS/CJS files as fallback.
-    let syntaxCheck: PatchSyntaxCheckResult = { ran: false, passed: true }
-
-    const jsLike = survivingFiles.filter(f => /\.(?:[cm]?js|[cm]?ts|jsx|tsx)$/i.test(f))
-    const pyLike = survivingFiles.filter(f => /\.py$/i.test(f))
-
-    if (backend) {
-      try {
-        const assignmentId = randomUUID()
-        const safeRepo = repo.replace(/^\/+|\/+$/g, '')
-        if (!safeRepo || safeRepo.startsWith('-') || safeRepo.includes('..') || /[\x00-\x1f\x7f\\]/.test(safeRepo)) {
-          throw new Error(`Unsafe repository name for syntax check: ${repo}`)
-        }
-        const manifestEntries = survivingFiles.map((f, idx) => ({
-          origName: f,
-          stagedName: `patched_${idx}${extname(f) || '.txt'}`,
-        }))
-        const scriptFiles = [
-          ...survivingFiles.map((f, idx) => ({
-            name: `patched_${idx}${extname(f) || '.txt'}`,
-            content: readFileSync(join(workDir, f), 'utf8'),
-          })),
-          {
-            name: 'patch_syntax_manifest.json',
-            content: JSON.stringify({
-              repo: safeRepo,
-              files: manifestEntries,
-              deletedFiles: [...deletedPaths],
-              hasTsconfig: existsSync(join(workDir, 'tsconfig.json')),
-            }),
-          },
-          {
-            name: 'patch_syntax_check.mjs',
-            content: PATCH_SYNTAX_CHECK_SCRIPT,
-          },
-        ]
-        const checkDescriptions = survivingFiles.flatMap((origName) => {
-          if (/\.(?:[cm]?js)$/i.test(origName)) return [`node --check ${origName}`]
-          if (/\.py$/i.test(origName)) return [`py_compile ${origName}`]
-          if (/\.go$/i.test(origName)) return [`go vet ${origName}`]
-          if (/\.(?:java|kt)$/i.test(origName)) return [`javac ${origName}`]
-          return []
-        })
-        if (survivingFiles.some(f => /\.(?:[cm]?ts|tsx)$/i.test(f)) && existsSync(join(workDir, 'tsconfig.json'))) {
-          checkDescriptions.push('tsc --noEmit')
-        }
-        const res = await backend.run(
-          {
-            assignmentId,
-            files: scriptFiles,
-            command: 'node /evidence/patch_syntax_check.mjs',
-            outputs: [],
-            timeoutMs: 30_000,
-          },
-          signal ?? AbortSignal.timeout(35_000),
-          { reposDir },
-        )
-        syntaxCheck = {
-          ran: true,
-          command: checkDescriptions.length ? checkDescriptions.join(' && ') : 'air-gapped tmpfs copy check',
-          passed: res.exitCode === 0,
-          output: (res.stdout + '\n' + res.stderr).trim().slice(0, 2000),
-        }
-      } catch (err) {
-        // If worker container image lacks python3 or node syntax binary inside just-bash, fall back gracefully to local syntax check.
-        syntaxCheck = await runLocalOfflineSyntaxCheck(workDir, jsLike, pyLike, err instanceof Error ? err.message : undefined)
-      }
-    } else {
-      syntaxCheck = await runLocalOfflineSyntaxCheck(workDir, jsLike, pyLike)
-    }
-
-    const staticAst = verifyStaticAstPostPatch(workDir, survivingFiles)
-    if (!staticAst.ok) {
-      syntaxCheck = {
-        ...syntaxCheck,
-        ran: true,
-        passed: false,
-        output: [syntaxCheck.output ?? '', ...staticAst.issues.map(i => `FAIL: static AST: ${i}`)].join('\n').trim().slice(0, 2000),
-      }
-    } else if (!syntaxCheck.ran) {
-      syntaxCheck = {
-        ...syntaxCheck,
-        ran: true,
-        command: 'offline static AST sanity',
-        output: 'OK: static AST sanity check',
-      }
-    }
-
-    return {
-      applicable: true,
-      filesModified,
-      syntaxCheck,
-      hasSubstantiveDiffChange,
-      citedFileModified,
-      fixAppliedToCitedFile,
-      ...(syntaxCheck.ran && !syntaxCheck.passed ? { error: `Offline syntax check failed: ${syntaxCheck.output}` } : {}),
-    }
-  } catch (err) {
-    return {
-      applicable: false,
-      filesModified: [],
-      syntaxCheck: { ran: false, passed: false },
-      hasSubstantiveDiffChange: false,
-      citedFileModified: false,
-      fixAppliedToCitedFile: false,
-      error: err instanceof Error ? err.message : String(err),
-    }
-  } finally {
-    rmSync(workDir, { recursive: true, force: true })
-  }
+function checkTsSyntaxSync(tsMod: typeof import('typescript'), fileName: string, source: string): string | null {
+  const res = tsMod.transpileModule(source, {
+    fileName,
+    reportDiagnostics: true,
+    compilerOptions: { allowJs: true, jsx: tsMod.JsxEmit.Preserve, target: tsMod.ScriptTarget.ESNext, module: tsMod.ModuleKind.ESNext },
+  })
+  const errs = (res.diagnostics ?? []).filter(d => d.category === tsMod.DiagnosticCategory.Error)
+  return errs.length > 0 ? errs.map(d => tsMod.flattenDiagnosticMessageText(d.messageText, '\n')).join('; ') : null
 }
 
-/** Deterministic post-patch static AST sanity check (conflict markers + parse health). */
-export function verifyStaticAstPostPatch(workDir: string, filesModified: readonly string[]): { ok: boolean; issues: string[] } {
-  const issues: string[] = []
-  for (const rel of filesModified) {
-    if (!/\.(?:[cm]?[jt]sx?|py|go|java|kt|rb)$/i.test(rel)) continue
-    let content = ''
-    try {
-      content = readFileSync(join(workDir, rel), 'utf8')
-    } catch {
-      issues.push(`${rel}: unreadable after patch`)
+function checkBalancedDelimiters(content: string, isPython: boolean): string | null {
+  const stack: string[] = []
+  const pairs: Record<string, string> = { '(': ')', '[': ']', '{': '}' }
+  let mode: '' | "'" | '"' | '`' | "'''" | '"""' | 'line' | 'block' = ''
+  for (let i = 0; i < content.length; i += 1) {
+    const ch = content[i]!, next = content[i + 1] ?? '', tri = content.slice(i, i + 3)
+    if (mode === 'line') { if (ch === '\n') mode = ''; continue }
+    if (mode === 'block') { if (ch === '*' && next === '/') { mode = ''; i += 1 } continue }
+    if (mode === "'''" || mode === '"""') {
+      if (ch === '\\') { i += 1; continue }
+      if (tri === mode) { mode = ''; i += 2 }
       continue
     }
-    if (/^(?:<{7}|={7}|>{7})/m.test(content)) issues.push(`${rel}: unresolved merge-conflict marker`)
-    if (/\b(?:eval|new Function)\s*\(/.test(content)) {
-      // Informational only: do not fail a defensive patch for existing eval usage.
+    if (mode === "'" || mode === '"' || mode === '`') {
+      if (ch === '\\') { i += 1; continue }
+      if (ch === mode || (mode !== '`' && ch === '\n')) mode = ''
+      continue
     }
+    if (isPython && ch === '#') { mode = 'line'; continue }
+    if (!isPython && ch === '/' && next === '/') { mode = 'line'; i += 1; continue }
+    if (!isPython && ch === '/' && next === '*') { mode = 'block'; i += 1; continue }
+    if (isPython && (tri === "'''" || tri === '"""')) { mode = tri; i += 2; continue }
+    if (ch === "'" || ch === '"' || (!isPython && ch === '`')) { mode = ch; continue }
+    if (pairs[ch]) stack.push(pairs[ch]!)
+    else if (ch === ')' || ch === ']' || ch === '}') {
+      const exp = stack.pop()
+      if (exp !== ch) return `unbalanced delimiter "${ch}"${exp ? ` (expected "${exp}")` : ''}`
+    }
+  }
+  return stack.length > 0 ? `unclosed delimiter(s): expected ${stack.reverse().join('')}` : null
+}
+
+/** Deterministic post-patch static AST sanity check (TS/JS parse, JSON parse, conflict markers, balanced delimiters). */
+export function verifyStaticAstPostPatch(workDir: string, filesModified: readonly string[]): { ok: boolean; issues: string[] } {
+  const issues: string[] = []
+  const tsMod = loadTypeScriptSync()
+  for (const rel of filesModified) {
+    const isJsTs = /\.(?:[cm]?[jt]sx?)$/i.test(rel), isJson = /\.json$/i.test(rel)
+    const isOtherCode = /\.(?:py|go|java|kt|rb|php|rs|cs|c|cc|cpp|h|hpp)$/i.test(rel)
+    if (!isJsTs && !isJson && !isOtherCode) continue
+    let content = ''
+    try { content = readFileSync(join(workDir, rel), 'utf8') } catch { issues.push(`${rel}: unreadable after patch`); continue }
+    if (/^(?:<{7}|={7}|>{7})/m.test(content)) issues.push(`${rel}: unresolved merge-conflict marker`)
+    if (isJson) {
+      try { JSON.parse(content) } catch (err) { issues.push(`${rel}: invalid JSON (${err instanceof Error ? err.message : String(err)})`) }
+      continue
+    }
+    if (isJsTs && tsMod) {
+      const err = checkTsSyntaxSync(tsMod, rel, content)
+      if (err) issues.push(`${rel}: syntax error (${err})`)
+      continue
+    }
+    const delimErr = checkBalancedDelimiters(content, /\.py$/i.test(rel))
+    if (delimErr) issues.push(`${rel}: ${delimErr}`)
   }
   return { ok: issues.length === 0, issues }
 }
@@ -700,105 +511,191 @@ async function runLocalOfflineSyntaxCheck(
   fallbackNote?: string,
 ): Promise<PatchSyntaxCheckResult> {
   const outputs: string[] = []
-  let ran = false
-  let passed = true
-
-  if (jsLike.length > 0) {
-    let tsMod: typeof import('typescript') | null = null
-    try {
-      const imported = await import('typescript')
-      tsMod = imported.default ?? imported
-    } catch {
-      tsMod = null
-    }
-
-    for (const rel of jsLike) {
-      const fullPath = join(workDir, rel)
+  let ran = false, passed = true, toolchainUnavailable = false
+  let tsMod = loadTypeScriptSync()
+  if (jsLike.length > 0 && !tsMod) {
+    try { const imp = await import('typescript'); tsMod = imp.default ?? imp } catch { tsMod = null }
+  }
+  for (const rel of jsLike) {
+    const fullPath = join(workDir, rel)
+    if (tsMod) {
       ran = true
-      if (tsMod) {
-        const source = readFileSync(fullPath, 'utf8')
-        const res = tsMod.transpileModule(source, {
-          fileName: rel,
-          reportDiagnostics: true,
-          compilerOptions: {
-            allowJs: true,
-            jsx: tsMod.JsxEmit.Preserve,
-            target: tsMod.ScriptTarget.ESNext,
-            module: tsMod.ModuleKind.ESNext,
-          },
-        })
-        const syntaxErrors = (res.diagnostics ?? []).filter(
-          d => d.category === tsMod!.DiagnosticCategory.Error,
-        )
-        if (syntaxErrors.length === 0) {
-          outputs.push(`OK: ts syntax check ${rel}`)
-        } else {
-          passed = false
-          const msg = syntaxErrors
-            .map(d => tsMod!.flattenDiagnosticMessageText(d.messageText, '\n'))
-            .join('; ')
-          outputs.push(`FAIL: ${rel}: ${msg}`)
-        }
-      } else if (!/\.(?:[cm]?ts|tsx|jsx)$/i.test(rel)) {
-        try {
-          execFileSync(process.execPath, ['--check', fullPath], { stdio: 'pipe', timeout: 10_000 })
-          outputs.push(`OK: node --check ${rel}`)
-        } catch (err) {
-          passed = false
-          const stderr = (err as { stderr?: Buffer }).stderr?.toString('utf8') ?? String(err)
-          outputs.push(`FAIL: ${rel}: ${stderr.trim()}`)
+      const err = checkTsSyntaxSync(tsMod, rel, readFileSync(fullPath, 'utf8'))
+      if (!err) outputs.push(`OK: ts syntax check ${rel}`)
+      else { passed = false; outputs.push(`FAIL: ${rel}: ${err}`) }
+    } else if (!/\.(?:[cm]?ts|tsx|jsx)$/i.test(rel)) {
+      ran = true
+      try { execFileSync(process.execPath, ['--check', fullPath], { stdio: 'pipe', timeout: 10_000 }); outputs.push(`OK: node --check ${rel}`) }
+      catch (err) { passed = false; outputs.push(`FAIL: ${rel}: ${((err as { stderr?: Buffer }).stderr?.toString('utf8') ?? String(err)).trim()}`) }
+    } else {
+      toolchainUnavailable = true; passed = false; outputs.push(`toolchain_unavailable: typescript (${rel})`)
+    }
+  }
+  for (const rel of pyLike) {
+    try { execFileSync('python3', ['-m', 'py_compile', join(workDir, rel)], { stdio: 'pipe', timeout: 10_000 }); ran = true; outputs.push(`OK: py_compile ${rel}`) }
+    catch (err) {
+      if ((err as { code?: string })?.code === 'ENOENT') { toolchainUnavailable = true; passed = false; outputs.push(`toolchain_unavailable: python3 (${rel})`) }
+      else { ran = true; passed = false; outputs.push(`FAIL: ${rel}: ${((err as { stderr?: Buffer }).stderr?.toString('utf8') ?? String(err)).trim()}`) }
+    }
+  }
+  if (fallbackNote && !ran) outputs.push(fallbackNote)
+  return {
+    ran, command: ran ? 'offline syntax check (ts/node/py_compile) + static AST sanity' : undefined,
+    passed, ...(toolchainUnavailable ? { toolchainUnavailable: true } : {}), output: outputs.join('\n').slice(0, 2000) || undefined,
+  }
+}
+
+const failApplicability = (error: string, output?: string): PatchApplicabilityResult => ({
+  applicable: false, filesModified: [], syntaxCheck: { ran: false, passed: false, ...(output ? { output } : {}) },
+  hasSubstantiveDiffChange: false, citedFileModified: false, fixAppliedToCitedFile: false, error,
+})
+
+export async function verifyPatchApplicability(params: {
+  repoRoot: string; repo: string; reposDir: string; diff: string; fixBefore: string
+  fixAfter?: string; codeLocations: readonly PatchCodeLocation[]; backend?: WorkerBackend; signal?: AbortSignal
+}): Promise<PatchApplicabilityResult> {
+  const { repoRoot, repo, reposDir, diff, fixBefore, fixAfter, codeLocations, backend, signal } = params
+  const primaryRelFile = codeLocations.length > 0 ? normalizeRepoRelPath(codeLocations[0]!.file) : null
+  if (primaryRelFile && isSensitiveRepoRelativePath(primaryRelFile)) {
+    return failApplicability(`Refusing access to sensitive repository path: ${primaryRelFile}.`, `Sensitive path denied: ${primaryRelFile}`)
+  }
+  const originalCitedContent = primaryRelFile ? safeReadRepoFile(repoRoot, primaryRelFile) : null
+  if (fixBefore.trim() && codeLocations.length > 0) {
+    const primary = codeLocations[0]!
+    if (originalCitedContent === null) return failApplicability(`Referenced file ${primary.file} does not exist in ${repo}.`, `File not found: ${primary.file}`)
+    if (!originalCitedContent.includes(fixBefore)) return failApplicability(`fixBefore does not match ${primary.file} verbatim.`, 'fixBefore mismatch')
+  }
+
+  const workDir = mkdtempSync(join(tmpdir(), 'kovo-patch-check-'))
+  try {
+    const parsedPatches = parseUnifiedDiff(diff)
+    const sensitiveTarget = parsedPatches.find(fp => isSensitiveRepoRelativePath(fp.normalizedPath))
+    if (sensitiveTarget) {
+      return failApplicability(`Refusing patch targeting sensitive repository path: ${sensitiveTarget.normalizedPath}.`, `Sensitive path denied: ${sensitiveTarget.normalizedPath}`)
+    }
+    const hasSubstantiveDiffChange = parsedPatches.some(fp => fp.hunks.some(h => h.entries.some(e => e.kind === 'add' || e.kind === 'remove')))
+    copyRepoTreeWithoutSymlinks(repoRoot, workDir, { excludeSensitive: true })
+    const { filesModified } = applyUnifiedDiffToDirectory(workDir, diff)
+
+    const deletedPaths = new Set(parsedPatches.filter(fp => fp.isDelete).map(fp => normalizeRepoRelPath(fp.normalizedPath)))
+    const survivingFiles = filesModified.filter(f => !deletedPaths.has(normalizeRepoRelPath(f)))
+    const normalizedModified = new Set(filesModified.map(normalizeRepoRelPath))
+    const citedFileModified = primaryRelFile ? normalizedModified.has(primaryRelFile) : filesModified.length > 0
+
+    let fixAppliedToCitedFile = false
+    if (primaryRelFile && citedFileModified) {
+      if (deletedPaths.has(primaryRelFile)) {
+        fixAppliedToCitedFile = fixAfter !== undefined && fixAfter.trim() === ''
+      } else {
+        const patched = safeReadRepoFile(workDir, primaryRelFile)
+        if (patched !== null && originalCitedContent !== null && patched.replace(/\r\n/g, '\n') !== originalCitedContent.replace(/\r\n/g, '\n')) {
+          fixAppliedToCitedFile = fixAfter !== undefined
+            ? isFixAfterInChangedHunks(parsedPatches, primaryRelFile, patched.replace(/\r\n/g, '\n'), fixBefore.replace(/\r\n/g, '\n'), fixAfter.replace(/\r\n/g, '\n'))
+            : true
         }
       }
+    } else if (!primaryRelFile && hasSubstantiveDiffChange && filesModified.length > 0) {
+      fixAppliedToCitedFile = true
     }
-  }
 
-  for (const rel of pyLike) {
-    ran = true
-    try {
-      execFileSync('python3', ['-m', 'py_compile', join(workDir, rel)], { stdio: 'pipe', timeout: 10_000 })
-      outputs.push(`OK: py_compile ${rel}`)
-    } catch (err) {
-      passed = false
-      const stderr = (err as { stderr?: Buffer }).stderr?.toString('utf8') ?? String(err)
-      outputs.push(`FAIL: ${rel}: ${stderr.trim()}`)
+    const jsLike = survivingFiles.filter(f => /\.(?:[cm]?js|[cm]?ts|jsx|tsx)$/i.test(f))
+    const pyLike = survivingFiles.filter(f => /\.py$/i.test(f))
+    const compiledExternal = survivingFiles.filter(f => /\.(?:go|java|kt)$/i.test(f))
+    let syntaxCheck: PatchSyntaxCheckResult = { ran: false, passed: true }
+    const unavailableTools: string[] = []
+
+    if (backend) {
+      try {
+        const safeRepo = repo.replace(/^\/+|\/+$/g, '')
+        if (!safeRepo || safeRepo.startsWith('-') || safeRepo.includes('..') || /[\x00-\x1f\x7f\\]/.test(safeRepo)) {
+          throw new Error(`Unsafe repository name for syntax check: ${repo}`)
+        }
+        const manifestEntries = survivingFiles.map((f, idx) => ({ origName: f, stagedName: `patched_${idx}${extname(f) || '.txt'}` }))
+        const scriptFiles = [
+          ...survivingFiles.map((f, idx) => ({ name: `patched_${idx}${extname(f) || '.txt'}`, content: readFileSync(join(workDir, f), 'utf8') })),
+          { name: 'patch_syntax_manifest.json', content: JSON.stringify({ repo: safeRepo, files: manifestEntries, deletedFiles: [...deletedPaths], hasTsconfig: existsSync(join(workDir, 'tsconfig.json')) }) },
+          { name: 'patch_syntax_check.mjs', content: PATCH_SYNTAX_CHECK_SCRIPT },
+        ]
+        const descs = survivingFiles.flatMap(n => /\.(?:[cm]?js)$/i.test(n) ? [`node --check ${n}`] : /\.py$/i.test(n) ? [`py_compile ${n}`] : /\.go$/i.test(n) ? [`go vet ${n}`] : /\.(?:java|kt)$/i.test(n) ? [`javac ${n}`] : [])
+        if (survivingFiles.some(f => /\.(?:[cm]?ts|tsx)$/i.test(f)) && existsSync(join(workDir, 'tsconfig.json'))) descs.push('tsc --noEmit')
+
+        const res = await backend.run(
+          { assignmentId: randomUUID(), files: scriptFiles, command: 'node /evidence/patch_syntax_check.mjs', outputs: [], timeoutMs: 30_000 },
+          signal ?? AbortSignal.timeout(35_000),
+          { reposDir },
+        )
+        const combinedOut = (res.stdout + '\n' + res.stderr).trim()
+        if (res.exitCode !== 0) {
+          syntaxCheck = { ran: true, command: descs.join(' && ') || 'air-gapped tmpfs copy check', passed: false, output: combinedOut.slice(0, 2000) }
+        } else {
+          const unavailJsTs: string[] = [], unavailPy: string[] = []
+          for (const line of combinedOut.split('\n').map(l => l.trim()).filter(l => l.startsWith(SYNTAX_UNAVAILABLE_PREFIX))) {
+            const rest = line.slice(SYNTAX_UNAVAILABLE_PREFIX.length), colon = rest.indexOf(':')
+            const tool = colon >= 0 ? rest.slice(0, colon) : rest, files = colon >= 0 ? rest.slice(colon + 1) : ''
+            if (tool === 'tsc' || tool === 'tsc_no_tsconfig' || tool === 'jsx') unavailJsTs.push(...files.split(',').filter(Boolean))
+            else if (tool === 'python3') unavailPy.push(...files.split(',').filter(Boolean))
+            else unavailableTools.push(`${tool}:${files}`)
+          }
+          if (unavailJsTs.length || unavailPy.length) {
+            const localRes = await runLocalOfflineSyntaxCheck(workDir, [...new Set(unavailJsTs)], [...new Set(unavailPy)])
+            if (localRes.toolchainUnavailable) unavailableTools.push(localRes.output ?? 'local_fallback_unavailable')
+            syntaxCheck = {
+              ran: localRes.ran || descs.length > 0, command: [descs.join(' && '), localRes.command].filter(Boolean).join(' + ') || 'offline syntax fallback',
+              passed: localRes.passed && unavailableTools.length === 0, ...(unavailableTools.length > 0 ? { toolchainUnavailable: true } : {}),
+              output: [combinedOut, localRes.output ?? ''].filter(Boolean).join('\n').slice(0, 2000),
+            }
+          } else {
+            syntaxCheck = {
+              ran: unavailableTools.length === 0, command: descs.join(' && ') || 'air-gapped tmpfs copy check',
+              passed: unavailableTools.length === 0, ...(unavailableTools.length > 0 ? { toolchainUnavailable: true } : {}),
+              output: (unavailableTools.length > 0 ? `toolchain_unavailable: ${unavailableTools.join(', ')}\n${combinedOut}` : combinedOut).trim().slice(0, 2000),
+            }
+          }
+        }
+      } catch (err) {
+        syntaxCheck = await runLocalOfflineSyntaxCheck(workDir, jsLike, pyLike, err instanceof Error ? err.message : undefined)
+        unavailableTools.push(...compiledExternal.map(f => `${extname(f).slice(1)}:${f}`))
+      }
+    } else {
+      syntaxCheck = await runLocalOfflineSyntaxCheck(workDir, jsLike, pyLike)
+      unavailableTools.push(...compiledExternal.map(f => `${extname(f).slice(1)}:${f}`))
     }
-  }
 
-  if (fallbackNote && !ran) outputs.push(fallbackNote)
-  const astCheck = verifyStaticAstPostPatch(workDir, [...jsLike, ...pyLike])
-  if (!astCheck.ok) {
-    passed = false
-    outputs.push(...astCheck.issues.map(issue => `FAIL: static AST: ${issue}`))
-  } else if (ran || jsLike.length + pyLike.length > 0) {
-    outputs.push('OK: static AST sanity check (no conflict markers / unreadable patch target)')
-  }
-  return {
-    ran,
-    command: ran ? 'offline syntax check (ts/node/py_compile) + static AST sanity' : undefined,
-    passed,
-    output: outputs.join('\n').slice(0, 2000) || undefined,
+    const staticAst = verifyStaticAstPostPatch(workDir, survivingFiles)
+    if (!staticAst.ok) {
+      syntaxCheck = { ...syntaxCheck, ran: true, passed: false, output: [syntaxCheck.output ?? '', ...staticAst.issues.map(i => `FAIL: static AST: ${i}`)].filter(Boolean).join('\n').slice(0, 2000) }
+    } else if (unavailableTools.length > 0) {
+      syntaxCheck = { ...syntaxCheck, ran: false, passed: false, toolchainUnavailable: true, output: [`toolchain_unavailable: ${unavailableTools.join(', ')}`, syntaxCheck.output ?? ''].filter(Boolean).join('\n').slice(0, 2000) }
+    } else if (!syntaxCheck.ran) {
+      syntaxCheck = { ...syntaxCheck, ran: true, command: 'offline static AST sanity', output: 'OK: static AST sanity check' }
+    }
+
+    return {
+      applicable: true, filesModified, syntaxCheck, hasSubstantiveDiffChange, citedFileModified, fixAppliedToCitedFile,
+      ...(!syntaxCheck.passed ? {
+        error: syntaxCheck.toolchainUnavailable
+          ? `Syntax toolchain unavailable (refusing false-green pass): ${syntaxCheck.output}`
+          : `Offline syntax check failed: ${syntaxCheck.output}`,
+      } : {}),
+    }
+  } catch (err) {
+    return failApplicability(err instanceof Error ? err.message : String(err))
+  } finally {
+    rmSync(workDir, { recursive: true, force: true })
   }
 }
 
 const authorOutputSchema = z.object({
   coverageInventory: z.array(z.object({
-    file: z.string().min(1),
-    line: z.number().int().positive().optional(),
-    symbol: z.string().min(1),
+    file: z.string().min(1), line: z.number().int().positive().optional(), symbol: z.string().min(1),
     role: z.enum(['primary_sink', 'sibling_route', 'sibling_writer', 'middleware', 'helper']),
-    coveredByPatch: z.boolean(),
-    notes: z.string(),
+    coveredByPatch: z.boolean(), notes: z.string(),
   })).default([]),
-  fixBefore: z.string().min(1),
-  fixAfter: z.string(),
-  diff: z.string().optional(),
+  fixBefore: z.string().min(1), fixAfter: z.string(), diff: z.string().optional(),
   codeLocations: z.array(z.object({
-    repo: z.string().min(1).optional(),
-    file: z.string().min(1),
-    startLine: z.number().int().positive(),
-    endLine: z.number().int().positive(),
-    snippet: z.string().optional(),
-    label: z.string().optional(),
+    repo: z.string().min(1).optional(), file: z.string().min(1),
+    startLine: z.number().int().positive(), endLine: z.number().int().positive(),
+    snippet: z.string().optional(), label: z.string().optional(),
   })).min(1),
   rationale: z.string().min(1),
 })
@@ -807,168 +704,69 @@ export async function runPatchAuthor(params: PatchWorkflowParams): Promise<Patch
   const repoRoot = validateRepoPath(params.reposDir, params.repo)
   const findingLocations = params.finding.codeLocations ?? []
 
+  let locations: PatchCodeLocation[], fixBefore: string, fixAfter: string, diff: string
+  let coverageInventory: CoverageInventoryEntry[], rationale: string
+
   if (params.candidatePatch?.diff || (params.candidatePatch?.fixBefore && params.candidatePatch?.fixAfter !== undefined)) {
-    const locations: PatchCodeLocation[] = (params.candidatePatch.codeLocations?.length
-      ? params.candidatePatch.codeLocations
-      : findingLocations
-    ).map(loc => ({ ...loc, repo: loc.repo || params.repo }))
-
-    let diff = params.candidatePatch.diff ?? ''
-    let fixBefore = params.candidatePatch.fixBefore ?? ''
-    let fixAfter = params.candidatePatch.fixAfter ?? ''
-
-    if (!diff && locations.length > 0 && fixBefore) {
-      const content = safeReadRepoFile(repoRoot, locations[0].file)
-      if (content !== null) {
-        const built = buildUnifiedDiffFromSnippet(locations[0].file, content, fixBefore, fixAfter)
-        diff = built.diff
-      }
-    }
-
-    const check = await verifyPatchApplicability({
-      repoRoot,
-      repo: params.repo,
-      reposDir: params.reposDir,
-      diff,
-      fixBefore,
-      fixAfter,
-      codeLocations: locations,
-      backend: params.backend,
-      signal: params.signal,
-    })
-
-    const coverageInventory: CoverageInventoryEntry[] = params.candidatePatch.coverageInventory?.length
+    locations = (params.candidatePatch.codeLocations?.length ? params.candidatePatch.codeLocations : findingLocations).map(loc => ({ ...loc, repo: loc.repo || params.repo }))
+    diff = params.candidatePatch.diff ?? ''
+    fixBefore = params.candidatePatch.fixBefore ?? ''
+    fixAfter = params.candidatePatch.fixAfter ?? ''
+    coverageInventory = params.candidatePatch.coverageInventory?.length
       ? params.candidatePatch.coverageInventory
-      : locations.map(loc => ({
-        file: loc.file,
-        line: loc.startLine,
-        symbol: loc.label || 'primary_handler',
-        role: 'primary_sink' as const,
-        coveredByPatch: true,
-        notes: 'Primary vulnerable code location.',
-      }))
+      : locations.map(loc => ({ file: loc.file, line: loc.startLine, symbol: loc.label || 'primary_handler', role: 'primary_sink' as const, coveredByPatch: true, notes: 'Primary vulnerable code location.' }))
+    rationale = params.candidatePatch.rationale || `Minimal patch for ${params.finding.title}.`
+  } else {
+    const authorCall = params.authorLlmCall
+      ?? (params.modelProfiles?.length ? makeFreshProviderCall(params.modelProfiles, 'patch-author', { signal: params.signal, secrets: params.secrets, onUsage: params.onUsage }) : undefined)
+    if (!authorCall) throw new Error('Patch author requires either candidatePatch, authorLlmCall, or configured modelProfiles.')
 
-    return {
+    const locsByFile = new Map<string, Array<{ startLine: number; endLine: number }>>()
+    for (const loc of findingLocations) {
+      const k = normalizeRepoRelPath(loc.file)
+      locsByFile.set(k, [...(locsByFile.get(k) ?? []), { startLine: loc.startLine, endLine: loc.endLine }])
+    }
+    const fileExcerpts = [...locsByFile.entries()].map(([file, ranges]) => extractFocusedFileContext(repoRoot, file, ranges))
+    const systemPrompt = [
+      'You are Kovo Hunter’s air-gapped Patch Author (Stage 1).',
+      'Produce a minimal, repository-native security patch that closes the confirmed vulnerability WITHOUT breaking legitimate callers.',
+      '1. Build a Coverage Inventory listing the primary vulnerable sink and any sibling routes/handlers/writers sharing the broken invariant.',
+      '2. Provide exact verbatim `fixBefore` and `fixAfter`, plus a valid unified `diff` (`--- a/<file>`, `+++ b/<file>`, `@@ ... @@`).',
+      '3. Keep edits minimal and strictly adhere to repository conventions. Never introduce hardcoded secrets or block legitimate authenticated callers.',
+      'Return STRICT JSON ONLY matching: { coverageInventory, fixBefore, fixAfter, diff, codeLocations, rationale }.',
+    ].join('\n')
+    const userPrompt = JSON.stringify({
       repo: params.repo,
-      coverageInventory,
-      fixBefore,
-      fixAfter,
-      diff,
-      codeLocations: locations,
-      rationale: params.candidatePatch.rationale || `Minimal patch for ${params.finding.title}.`,
-      syntaxCheck: check.syntaxCheck,
-    }
+      finding: { id: params.finding.id, title: params.finding.title, cwe: params.finding.cwe, category: params.finding.category, severity: params.finding.severity, origin: params.finding.origin, reason: params.finding.reason, impact: params.finding.impact, remediation: params.finding.remediation },
+      files: fileExcerpts,
+    }, null, 2)
+    const parsed = authorOutputSchema.parse(extractJsonBlock(await authorCall({ systemPrompt, userPrompt })))
+    locations = parsed.codeLocations.map(l => ({ ...l, repo: l.repo || params.repo }))
+    fixBefore = parsed.fixBefore; fixAfter = parsed.fixAfter; diff = parsed.diff ?? ''
+    coverageInventory = parsed.coverageInventory; rationale = parsed.rationale
   }
 
-  const authorCall = params.authorLlmCall
-    ?? (params.modelProfiles?.length
-      ? makeFreshProviderCall(params.modelProfiles, 'patch-author', {
-        signal: params.signal,
-        secrets: params.secrets,
-        onUsage: params.onUsage,
-      })
-      : undefined)
-
-  if (!authorCall) {
-    throw new Error('Patch author requires either candidatePatch, authorLlmCall, or configured modelProfiles.')
+  if (!diff && locations.length > 0 && fixBefore) {
+    const content = safeReadRepoFile(repoRoot, locations[0]!.file)
+    if (content !== null) diff = buildUnifiedDiffFromSnippet(locations[0]!.file, content, fixBefore, fixAfter, locations[0]!.startLine).diff
   }
-
-  const fileExcerpts = findingLocations.map(loc => {
-    const text = safeReadRepoFile(repoRoot, loc.file)
-    return {
-      file: loc.file,
-      startLine: loc.startLine,
-      endLine: loc.endLine,
-      content: text ? text.slice(0, 16_000) : null,
-    }
-  })
-
-  const systemPrompt = [
-    'You are Kovo Hunter’s air-gapped Patch Author (Stage 1).',
-    'Produce a minimal, repository-native security patch that closes the confirmed vulnerability WITHOUT breaking legitimate callers.',
-    '1. Build a Coverage Inventory listing the primary vulnerable sink and any sibling routes/handlers/writers sharing the broken invariant.',
-    '2. Provide exact verbatim `fixBefore` and `fixAfter`, plus a valid unified `diff` (`--- a/<file>`, `+++ b/<file>`, `@@ ... @@`).',
-    '3. Keep edits minimal and strictly adhere to repository conventions. Never introduce hardcoded secrets or block legitimate authenticated callers.',
-    'Return STRICT JSON ONLY matching: { coverageInventory, fixBefore, fixAfter, diff, codeLocations, rationale }.',
-  ].join('\n')
-
-  const userPrompt = JSON.stringify({
-    repo: params.repo,
-    finding: {
-      id: params.finding.id,
-      title: params.finding.title,
-      cwe: params.finding.cwe,
-      category: params.finding.category,
-      severity: params.finding.severity,
-      origin: params.finding.origin,
-      reason: params.finding.reason,
-      impact: params.finding.impact,
-      remediation: params.finding.remediation,
-    },
-    files: fileExcerpts,
-  }, null, 2)
-
-  const raw = await authorCall({ systemPrompt, userPrompt })
-  const parsed = authorOutputSchema.parse(extractJsonBlock(raw))
-  const locations: PatchCodeLocation[] = parsed.codeLocations.map(l => ({ ...l, repo: l.repo || params.repo }))
-
-  let diff = parsed.diff ?? ''
-  if (!diff && locations.length > 0) {
-    const content = safeReadRepoFile(repoRoot, locations[0].file)
-    if (content !== null) {
-      diff = buildUnifiedDiffFromSnippet(locations[0].file, content, parsed.fixBefore, parsed.fixAfter).diff
-    }
-  }
-
-  const check = await verifyPatchApplicability({
-    repoRoot,
-    repo: params.repo,
-    reposDir: params.reposDir,
-    diff,
-    fixBefore: parsed.fixBefore,
-    fixAfter: parsed.fixAfter,
-    codeLocations: locations,
-    backend: params.backend,
-    signal: params.signal,
-  })
-
-  return {
-    repo: params.repo,
-    coverageInventory: parsed.coverageInventory,
-    fixBefore: parsed.fixBefore,
-    fixAfter: parsed.fixAfter,
-    diff,
-    codeLocations: locations,
-    rationale: parsed.rationale,
-    syntaxCheck: check.syntaxCheck,
-  }
+  const check = await verifyPatchApplicability({ repoRoot, repo: params.repo, reposDir: params.reposDir, diff, fixBefore, fixAfter, codeLocations: locations, backend: params.backend, signal: params.signal })
+  return { repo: params.repo, coverageInventory, fixBefore, fixAfter, diff, codeLocations: locations, rationale, syntaxCheck: check.syntaxCheck, applicability: check }
 }
 
-const reviewerGateSchema = z.object({
-  passed: z.boolean(),
-  detail: z.string().min(1),
-})
-
-const reviewerSecurityGateSchema = reviewerGateSchema.extend({
-  enforcingLocation: z.string().optional(),
-})
-
+const reviewerGateSchema = z.object({ passed: z.boolean(), detail: z.string().min(1) })
 const reviewerGatesObjectSchema = z.object({
   applicability: reviewerGateSchema,
-  security_closure: reviewerSecurityGateSchema,
+  security_closure: reviewerGateSchema.extend({ enforcingLocation: z.string().optional() }),
   sibling_coverage: reviewerGateSchema,
   caller_compatibility: reviewerGateSchema,
   repo_conventions: reviewerGateSchema,
 })
-
 const reviewerGateArrayItemSchema = z.object({
   gate: z.number().int().min(1).max(6).optional(),
   name: z.enum(['applicability', 'security_closure', 'sibling_coverage', 'caller_compatibility', 'repo_conventions', 'dynamic_retest']),
-  passed: z.boolean(),
-  detail: z.string().min(1),
-  enforcingLocation: z.string().optional(),
+  passed: z.boolean(), detail: z.string().min(1), enforcingLocation: z.string().optional(),
 })
-
 function normalizeReviewerGates(
   raw: z.output<typeof reviewerGatesObjectSchema> | Array<z.output<typeof reviewerGateArrayItemSchema>>,
   ctx: z.RefinementCtx,
@@ -976,129 +774,144 @@ function normalizeReviewerGates(
   if (!Array.isArray(raw)) return raw
   const byName = new Map<string, z.output<typeof reviewerGateArrayItemSchema>>()
   for (const item of raw) {
-    if (byName.has(item.name)) {
-      ctx.addIssue({ code: 'custom', message: `Duplicate reviewer gate "${item.name}".` })
-      return z.NEVER
-    }
+    if (byName.has(item.name)) { ctx.addIssue({ code: 'custom', message: `Duplicate reviewer gate "${item.name}".` }); return z.NEVER }
     byName.set(item.name, item)
   }
-  const required = ['applicability', 'security_closure', 'sibling_coverage', 'caller_compatibility', 'repo_conventions'] as const
-  for (const name of required) {
-    if (!byName.has(name)) {
-      ctx.addIssue({ code: 'custom', message: `Missing required reviewer gate "${name}".` })
-      return z.NEVER
-    }
+  for (const name of ['applicability', 'security_closure', 'sibling_coverage', 'caller_compatibility', 'repo_conventions'] as const) {
+    if (!byName.has(name)) { ctx.addIssue({ code: 'custom', message: `Missing required reviewer gate "${name}".` }); return z.NEVER }
   }
   const sec = byName.get('security_closure')!
   return {
     applicability: { passed: byName.get('applicability')!.passed, detail: byName.get('applicability')!.detail },
-    security_closure: {
-      passed: sec.passed,
-      detail: sec.detail,
-      ...(sec.enforcingLocation ? { enforcingLocation: sec.enforcingLocation } : {}),
-    },
+    security_closure: { passed: sec.passed, detail: sec.detail, ...(sec.enforcingLocation ? { enforcingLocation: sec.enforcingLocation } : {}) },
     sibling_coverage: { passed: byName.get('sibling_coverage')!.passed, detail: byName.get('sibling_coverage')!.detail },
     caller_compatibility: { passed: byName.get('caller_compatibility')!.passed, detail: byName.get('caller_compatibility')!.detail },
     repo_conventions: { passed: byName.get('repo_conventions')!.passed, detail: byName.get('repo_conventions')!.detail },
   }
 }
-
 const reviewerOutputSchema = z.object({
-  approved: z.boolean(),
-  callerCompatibility: z.enum(['attacker_only', 'needs_operator_step', 'breaks_callers']),
+  approved: z.boolean(), callerCompatibility: z.enum(['attacker_only', 'needs_operator_step', 'breaks_callers']),
   enforcingLocation: z.string().optional(),
-  gates: z.union([
-    reviewerGatesObjectSchema,
-    z.array(reviewerGateArrayItemSchema).min(5),
-  ]).transform(normalizeReviewerGates),
+  gates: z.union([reviewerGatesObjectSchema, z.array(reviewerGateArrayItemSchema).min(5)]).transform(normalizeReviewerGates),
   reviewNotes: z.string().min(1),
 })
 
-const BLOCKING_STATEMENT_RE = /^(?:return\s+.*\b(?:status\s*\(\s*(?:401|403|404|500)|new\s+Response\s*\([^)]*(?:401|403))|res(?:ponse)?\.status\s*\(\s*(?:401|403)\s*\)\s*\.|throw\s+new\s+Error\s*\(\s*['"](?:disabled|forbidden|unauthorized)['"])/i
+const BLOCKING_STATEMENT_RE = /^(?:return\s+.*\b(?:status\s*\(\s*(?:401|403|404|500)|new\s+Response\s*\([^)]*(?:401|403)|(?:abort|Response|JSONResponse|HttpResponseForbidden)\s*\([^)]*(?:401|403))|res(?:ponse)?\.status\s*\(\s*(?:401|403)\s*\)\s*\.|throw\s+new\s+Error\s*\(\s*['"](?:disabled|forbidden|unauthorized)['"]|raise\s+(?:HTTPException|PermissionDenied|Forbidden)\b|abort\s*\(\s*(?:401|403)\s*\))/i
 
-/** Extract added content lines using the hunk-counted unified diff parser (never matching `+++` headers). */
 function extractAddedDiffLines(diff: string): string[] {
   try {
-    const patches = parseUnifiedDiff(diff, { allowEmpty: true })
-    const added: string[] = []
-    for (const fp of patches) {
-      for (const hunk of fp.hunks) {
-        for (const entry of hunk.entries) {
-          if (entry.kind === 'add') added.push(entry.text)
-        }
-      }
-    }
-    return added
+    return parseUnifiedDiff(diff, { allowEmpty: true }).flatMap(fp => fp.hunks.flatMap(h => h.entries.filter(e => e.kind === 'add').map(e => e.text)))
   } catch {
     const added: string[] = []
     let inHunk = false
     for (const raw of diff.replace(/\r\n/g, '\n').split('\n')) {
-      if (raw.startsWith('@@ ')) {
-        inHunk = true
-        continue
-      }
-      if (!inHunk) continue
-      if (raw.startsWith('+') && !raw.startsWith('+++ ')) added.push(raw.slice(1))
+      if (raw.startsWith('@@ ')) { inHunk = true; continue }
+      if (inHunk && raw.startsWith('+') && !raw.startsWith('+++ ')) added.push(raw.slice(1))
     }
     return added
   }
 }
 
-/**
- * Detect a patch that unconditionally blocks legitimate callers.
- *
- * The v4 regex matched any added `return res.status(403)` line, including the body of
- * a legitimate guard such as `if (!authorized) { return res.status(403) }`. We now parse
- * hunks via `parseUnifiedDiff` (M-24) and track conditional/block scope per hunk, flagging
- * blocking statements that are *not* nested inside an `if`/`else`/`switch`/`catch`/loop.
- * `if (true)` counts as unconditional.
- */
+function measureIndent(text: string): number {
+  let count = 0
+  for (const ch of text) { if (ch === ' ') count += 1; else if (ch === '\t') count += 4; else break }
+  return count
+}
+
+function stripLeadingConditionalHeader(trimmed: string): { isCond: boolean; alwaysTrue: boolean; rest: string } {
+  const atParen = /^if\s*\(\s*(?:true|1)\s*\)\s*(.*)$/i.exec(trimmed)
+  if (atParen) return { isCond: true, alwaysTrue: true, rest: atParen[1] ?? '' }
+  const atColon = /^if\s+(?:True|1)\s*:\s*(.*)$/.exec(trimmed)
+  if (atColon) return { isCond: true, alwaysTrue: true, rest: atColon[1] ?? '' }
+  const kwMatch = /^(?:else\s+if|if|elif|unless|while|for|switch|catch|except|when|case|else)\b/.exec(trimmed)
+  if (!kwMatch) return { isCond: false, alwaysTrue: false, rest: trimmed }
+  const kw = kwMatch[0]!
+  let after = trimmed.slice(kw.length).trimStart()
+  if (/^(?:else\s+if|if|unless|while|for|switch|catch|when)$/.test(kw) && after.startsWith('(')) {
+    let depth = 0, idx = 0
+    for (; idx < after.length; idx += 1) {
+      if (after[idx] === '(') depth += 1
+      else if (after[idx] === ')' && --depth === 0) { idx += 1; break }
+    }
+    return { isCond: true, alwaysTrue: false, rest: depth === 0 ? after.slice(idx).trimStart() : '' }
+  }
+  const colonIdx = /^(?:if|elif|unless|while|for|except|else|case)$/.test(kw) ? after.indexOf(':') : -1
+  return { isCond: true, alwaysTrue: false, rest: colonIdx >= 0 ? after.slice(colonIdx + 1).trimStart() : after }
+}
+
+/** Detect unconditional caller-breaking blocks while respecting braces, braceless single/multiline `if`, and Python indentation. */
 export function detectUnconditionalCallerBreak(diff: string): boolean {
   const hunkGroups: Array<Array<{ added: boolean; text: string }>> = []
   try {
-    const patches = parseUnifiedDiff(diff, { allowEmpty: true })
-    for (const fp of patches) {
-      for (const hunk of fp.hunks) {
-        const group: Array<{ added: boolean; text: string }> = []
-        for (const entry of hunk.entries) {
-          if (entry.kind === 'add') group.push({ added: true, text: entry.text })
-          else if (entry.kind === 'context') group.push({ added: false, text: entry.text })
-          // Removed lines are irrelevant: they no longer exist in the patched program.
-        }
-        if (group.length > 0) hunkGroups.push(group)
+    for (const fp of parseUnifiedDiff(diff, { allowEmpty: true })) {
+      for (const h of fp.hunks) {
+        const g = h.entries.filter(e => e.kind !== 'remove').map(e => ({ added: e.kind === 'add', text: e.text }))
+        if (g.length) hunkGroups.push(g)
       }
     }
   } catch {
-    // Fallback for informal partial diff snippets passed directly to unit tests.
-    const lines: Array<{ added: boolean; text: string }> = []
+    const g: Array<{ added: boolean; text: string }> = []
     for (const raw of diff.replace(/\r\n/g, '\n').split('\n')) {
       if (raw.startsWith('+++ ') || raw.startsWith('--- ') || raw.startsWith('@@ ')) continue
-      if (raw.startsWith('+')) lines.push({ added: true, text: raw.slice(1) })
-      else if (raw.startsWith(' ')) lines.push({ added: false, text: raw.slice(1) })
+      if (raw.startsWith('+')) g.push({ added: true, text: raw.slice(1) })
+      else if (raw.startsWith(' ')) g.push({ added: false, text: raw.slice(1) })
     }
-    if (lines.length > 0) hunkGroups.push(lines)
+    if (g.length) hunkGroups.push(g)
   }
 
   for (const lines of hunkGroups) {
-    const addedCount = lines.filter(l => l.added).length
-    if (addedCount === 0) continue
-    const frames: Array<{ conditional: boolean }> = []
+    if (!lines.some(l => l.added)) continue
+    const braceFrames: Array<{ conditional: boolean }> = []
+    const indentFrames: Array<{ indent: number; conditional: boolean }> = []
+    let pendingBraceless = false, multiDepth = 0, multiAlwaysTrue = false
+
     for (const entry of lines) {
       const trimmed = entry.text.trim()
-      if (!trimmed) continue
-      // Close scopes that end on this line before evaluating it.
+      if (!trimmed || /^(?:\/\/|#|\/\*|\*)/.test(trimmed)) continue
+      const indent = measureIndent(entry.text)
       const leadingCloses = (trimmed.match(/^\}+/) ?? [''])[0].length
-      for (let i = 0; i < leadingCloses; i += 1) frames.pop()
+      for (let i = 0; i < leadingCloses; i += 1) braceFrames.pop()
+      while (indentFrames.length > 0 && indent <= indentFrames[indentFrames.length - 1]!.indent) indentFrames.pop()
 
-      const isConditionalOpener = /^(?:if|else|switch|catch|for|while|unless|when|case|elif)\b/.test(trimmed)
-        && !/^if\s*\(\s*true\s*\)/.test(trimmed)
-      const blockingInline = BLOCKING_STATEMENT_RE.test(trimmed) && !/^if\b/.test(trimmed)
-      if (entry.added && blockingInline && !frames.some(f => f.conditional)) return true
+      if (multiDepth > 0) {
+        for (const ch of trimmed) { if (ch === '(') multiDepth += 1; else if (ch === ')') multiDepth = Math.max(0, multiDepth - 1) }
+        if (multiDepth === 0) {
+          const opens = (trimmed.match(/\{/g) ?? []).length, closes = (trimmed.match(/\}/g) ?? []).length - leadingCloses
+          if (opens > 0) { for (let i = 0; i < opens; i += 1) braceFrames.push({ conditional: !multiAlwaysTrue }); for (let i = 0; i < Math.max(0, closes); i += 1) braceFrames.pop(); pendingBraceless = false }
+          else if (trimmed.endsWith(':')) { indentFrames.push({ indent, conditional: !multiAlwaysTrue }); pendingBraceless = false }
+          else pendingBraceless = !multiAlwaysTrue
+          multiAlwaysTrue = false
+        }
+        continue
+      }
 
-      const opens = (trimmed.match(/\{/g) ?? []).length
-      const closes = (trimmed.match(/\}/g) ?? []).length - leadingCloses
-      for (let i = 0; i < opens; i += 1) frames.push({ conditional: isConditionalOpener })
-      for (let i = 0; i < Math.max(0, closes); i += 1) frames.pop()
+      const cond = stripLeadingConditionalHeader(trimmed)
+      const inCond = braceFrames.some(f => f.conditional) || indentFrames.some(f => f.conditional) || pendingBraceless
+      if (entry.added && !inCond && (
+        (cond.isCond && cond.alwaysTrue && cond.rest && BLOCKING_STATEMENT_RE.test(cond.rest))
+        || (!cond.isCond && BLOCKING_STATEMENT_RE.test(trimmed))
+      )) return true
+
+      const opens = (trimmed.match(/\{/g) ?? []).length, closes = (trimmed.match(/\}/g) ?? []).length - leadingCloses
+      if (cond.isCond) {
+        const pOpens = (trimmed.match(/\(/g) ?? []).length, pCloses = (trimmed.match(/\)/g) ?? []).length
+        if (pOpens > pCloses && !trimmed.includes('{') && !trimmed.endsWith(':')) {
+          multiDepth = pOpens - pCloses; multiAlwaysTrue = cond.alwaysTrue; pendingBraceless = false
+        } else if (opens > 0) {
+          for (let i = 0; i < opens; i += 1) braceFrames.push({ conditional: !cond.alwaysTrue })
+          for (let i = 0; i < Math.max(0, closes); i += 1) braceFrames.pop()
+          pendingBraceless = false
+        } else if (trimmed.endsWith(':')) {
+          indentFrames.push({ indent, conditional: !cond.alwaysTrue }); pendingBraceless = false
+        } else {
+          pendingBraceless = !cond.rest && !cond.alwaysTrue
+        }
+      } else {
+        for (let i = 0; i < opens; i += 1) braceFrames.push({ conditional: false })
+        for (let i = 0; i < Math.max(0, closes); i += 1) braceFrames.pop()
+        if (trimmed.endsWith(':') && /^(?:def|async\s+def|class|try|finally|with)\b/.test(trimmed)) indentFrames.push({ indent, conditional: false })
+        pendingBraceless = false
+      }
     }
   }
   return false
@@ -1107,184 +920,67 @@ export function detectUnconditionalCallerBreak(diff: string): boolean {
 const HARDCODED_SECRET_LINE_RE = /(?:sk-or-v1-|sk-ant-|ghp_|github_pat_|-----BEGIN [A-Z ]*PRIVATE KEY-----)/
 const DEBUG_ARTIFACT_LINE_RE = /(?:\b(?:console\.log\(['"]DEBUG|debugger;)|^(?:<{7}|={7}|>{7}))/
 const OPERATOR_ENV_LINE_RE = /\bprocess\.env\.[A-Z0-9_]+/
+const hasHardcodedSecretInDiff = (diff: string) => extractAddedDiffLines(diff).some(l => HARDCODED_SECRET_LINE_RE.test(l))
+const hasDebugArtifactInDiff = (diff: string) => extractAddedDiffLines(diff).some(l => DEBUG_ARTIFACT_LINE_RE.test(l))
+const hasOperatorEnvInDiff = (diff: string) => extractAddedDiffLines(diff).some(l => OPERATOR_ENV_LINE_RE.test(l))
+const detectDeterministicCallerBreak = (a: PatchAuthorOutput) => detectUnconditionalCallerBreak(a.diff) || (!a.fixAfter.trim() && a.fixBefore.trim().length > 40)
+const isGate1SyntaxPassing = (app: PatchApplicabilityResult) => app.applicable && !app.syntaxCheck.toolchainUnavailable && (!app.syntaxCheck.ran || app.syntaxCheck.passed)
 
-function hasHardcodedSecretInDiff(diff: string): boolean {
-  return extractAddedDiffLines(diff).some(line => HARDCODED_SECRET_LINE_RE.test(line))
-}
-
-function hasDebugArtifactInDiff(diff: string): boolean {
-  return extractAddedDiffLines(diff).some(line => DEBUG_ARTIFACT_LINE_RE.test(line))
-}
-
-function hasOperatorEnvInDiff(diff: string): boolean {
-  return extractAddedDiffLines(diff).some(line => OPERATOR_ENV_LINE_RE.test(line))
-}
-
-function detectDeterministicCallerBreak(authorOutput: PatchAuthorOutput): boolean {
-  return detectUnconditionalCallerBreak(authorOutput.diff)
-    || (!authorOutput.fixAfter.trim() && authorOutput.fixBefore.trim().length > 40)
-}
-
-function deterministicOfflineReview(
-  authorOutput: PatchAuthorOutput,
-  applicability: PatchApplicabilityResult,
-): PatchReviewOutput {
+function deterministicOfflineReview(authorOutput: PatchAuthorOutput, applicability: PatchApplicabilityResult): PatchReviewOutput {
   const primaryLoc = authorOutput.codeLocations[0]
   const enforcingLocation = primaryLoc ? `${primaryLoc.file}:${primaryLoc.startLine}` : undefined
-
-  const gate1Passed = applicability.applicable && (!applicability.syntaxCheck.ran || applicability.syntaxCheck.passed)
-  const gate1: PatchGateResult = {
-    gate: 1,
-    name: 'applicability',
-    passed: gate1Passed,
-    detail: gate1Passed
-      ? `Diff applied cleanly to ${applicability.filesModified.join(', ')}${applicability.syntaxCheck.ran ? ' and passed offline syntax check.' : '.'}`
-      : (applicability.error || 'Patch failed applicability or syntax check.'),
-  }
-
-  // M-22: Gate 2 must verify real hunk changes in the cited file transforming fixBefore -> fixAfter,
-  // never approving on a header `+++` or an unrelated-file edit.
-  const diffHasSubstantiveChange =
-    authorOutput.fixBefore.trim() !== authorOutput.fixAfter.trim()
-    && applicability.hasSubstantiveDiffChange
-    && applicability.citedFileModified
-    && applicability.fixAppliedToCitedFile
+  const gate1Passed = isGate1SyntaxPassing(applicability)
+  const diffHasSubstantiveChange = authorOutput.fixBefore.trim() !== authorOutput.fixAfter.trim() && applicability.hasSubstantiveDiffChange && applicability.citedFileModified && applicability.fixAppliedToCitedFile
   const gate2Passed = Boolean(enforcingLocation && /^[^:\s]+:\d+$/.test(enforcingLocation) && diffHasSubstantiveChange)
-  const gate2: PatchGateResult = {
-    gate: 2,
-    name: 'security_closure',
-    passed: gate2Passed,
-    enforcingLocation,
-    detail: gate2Passed
-      ? `Security control enforced at ${enforcingLocation}.`
-      : (!applicability.citedFileModified
-          ? `Patch diff does not modify the cited enforcing file (${primaryLoc?.file ?? 'unknown'}).`
-          : !applicability.fixAppliedToCitedFile
-            ? `Patch diff does not apply fixBefore -> fixAfter in ${primaryLoc?.file ?? 'cited file'}.`
-            : 'Patch lacks a concrete enforcing file:line location or substantive fix.'),
-  }
-
-  const uncoveredSiblings = authorOutput.coverageInventory.filter(
-    item => (item.role === 'sibling_route' || item.role === 'sibling_writer') && !item.coveredByPatch,
-  )
-  const gate3Passed = uncoveredSiblings.length === 0
-  const gate3: PatchGateResult = {
-    gate: 3,
-    name: 'sibling_coverage',
-    passed: gate3Passed,
-    detail: gate3Passed
-      ? `All ${authorOutput.coverageInventory.length} inventoried sibling/primary handlers covered.`
-      : `Uncovered sibling handler(s): ${uncoveredSiblings.map(s => `${s.file}:${s.symbol}`).join(', ')}.`,
-  }
-
-  const breaksCallers = detectDeterministicCallerBreak(authorOutput)
-  const needsOperatorStep = hasOperatorEnvInDiff(authorOutput.diff) && !breaksCallers
-  const callerCompatibility: CallerCompatibility = breaksCallers
-    ? 'breaks_callers'
-    : needsOperatorStep
-      ? 'needs_operator_step'
-      : 'attacker_only'
-
+  const uncovered = authorOutput.coverageInventory.filter(i => (i.role === 'sibling_route' || i.role === 'sibling_writer') && !i.coveredByPatch)
+  const gate3Passed = uncovered.length === 0
+  const breaks = detectDeterministicCallerBreak(authorOutput)
+  const callerCompatibility: CallerCompatibility = breaks ? 'breaks_callers' : hasOperatorEnvInDiff(authorOutput.diff) ? 'needs_operator_step' : 'attacker_only'
   const gate4Passed = callerCompatibility !== 'breaks_callers'
-  const gate4: PatchGateResult = {
-    gate: 4,
-    name: 'caller_compatibility',
-    passed: gate4Passed,
-    detail: callerCompatibility === 'breaks_callers'
-      ? 'Patch unconditionally blocks or removes legitimate caller behavior; automatically withheld.'
-      : callerCompatibility === 'needs_operator_step'
-        ? 'Patch requires an operator configuration/env step but preserves legitimate callers.'
-        : 'Patch refuses attacker input while preserving legitimate callers.',
-  }
+  const hasSecret = hasHardcodedSecretInDiff(authorOutput.diff), hasDebug = hasDebugArtifactInDiff(authorOutput.diff)
+  const gate5Passed = !hasSecret && !hasDebug && applicability.filesModified.length <= 12
 
-  const hasSecretLeak = hasHardcodedSecretInDiff(authorOutput.diff)
-  const hasDebugArtifacts = hasDebugArtifactInDiff(authorOutput.diff)
-  const gate5Passed = !hasSecretLeak && !hasDebugArtifacts && applicability.filesModified.length <= 12
-  const gate5: PatchGateResult = {
-    gate: 5,
-    name: 'repo_conventions',
-    passed: gate5Passed,
-    detail: hasSecretLeak
-      ? 'Patch introduces hardcoded credentials/secret material.'
-      : hasDebugArtifacts
-        ? 'Patch introduces debug artifacts.'
-        : 'Patch is minimal and conforms to repository conventions.',
-  }
-
-  const gate6: PatchGateResult = {
-    gate: 6,
-    name: 'dynamic_retest',
-    passed: false,
-    detail: 'Dynamic retest unverified (skipped unless an authorized local-lab retest with a baseline caller is available).',
-  }
-
-  const gates = [gate1, gate2, gate3, gate4, gate5, gate6]
-
-  // HARD INVARIANT: Any patch classified breaks_callers is automatically withheld!
-  let status: PatchStatus
-  if (callerCompatibility === 'breaks_callers') {
-    status = 'withheld'
-  } else if (gate1Passed && gate2Passed && gate3Passed && gate4Passed && gate5Passed) {
-    status = 'approved'
-  } else {
-    status = 'rejected'
-  }
-
-  return {
-    approved: status === 'approved',
-    status,
-    callerCompatibility,
-    gates,
-    enforcingLocation,
-    reviewNotes: gates.map(g => `Gate ${g.gate} (${g.name}): ${g.passed ? 'PASS' : 'FAIL'} — ${g.detail}`).join('\n'),
-  }
+  const gates: PatchGateResult[] = [
+    { gate: 1, name: 'applicability', passed: gate1Passed, detail: gate1Passed ? `Diff applied cleanly to ${applicability.filesModified.join(', ')}${applicability.syntaxCheck.ran ? ' and passed offline syntax check.' : '.'}` : (applicability.error || 'Patch failed applicability or syntax check.') },
+    { gate: 2, name: 'security_closure', passed: gate2Passed, enforcingLocation, detail: gate2Passed ? `Security control enforced at ${enforcingLocation}.` : (!applicability.citedFileModified ? `Patch diff does not modify the cited enforcing file (${primaryLoc?.file ?? 'unknown'}).` : !applicability.fixAppliedToCitedFile ? `Patch diff does not apply fixBefore -> fixAfter in ${primaryLoc?.file ?? 'cited file'}.` : 'Patch lacks a concrete enforcing file:line location or substantive fix.') },
+    { gate: 3, name: 'sibling_coverage', passed: gate3Passed, detail: gate3Passed ? `All ${authorOutput.coverageInventory.length} inventoried sibling/primary handlers covered.` : `Uncovered sibling handler(s): ${uncovered.map(s => `${s.file}:${s.symbol}`).join(', ')}.` },
+    { gate: 4, name: 'caller_compatibility', passed: gate4Passed, detail: callerCompatibility === 'breaks_callers' ? 'Patch unconditionally blocks or removes legitimate caller behavior; automatically withheld.' : callerCompatibility === 'needs_operator_step' ? 'Patch requires an operator configuration/env step but preserves legitimate callers.' : 'Patch refuses attacker input while preserving legitimate callers.' },
+    { gate: 5, name: 'repo_conventions', passed: gate5Passed, detail: hasSecret ? 'Patch introduces hardcoded credentials/secret material.' : hasDebug ? 'Patch introduces debug artifacts.' : 'Patch is minimal and conforms to repository conventions.' },
+    { gate: 6, name: 'dynamic_retest', passed: false, detail: 'Dynamic retest unverified (skipped unless an authorized local-lab retest with a baseline caller is available).' },
+  ]
+  const status: PatchStatus = callerCompatibility === 'breaks_callers' ? 'withheld' : (gate1Passed && gate2Passed && gate3Passed && gate4Passed && gate5Passed ? 'approved' : 'rejected')
+  return { approved: status === 'approved', status, callerCompatibility, gates, enforcingLocation, reviewNotes: gates.map(g => `Gate ${g.gate} (${g.name}): ${g.passed ? 'PASS' : 'FAIL'} — ${g.detail}`).join('\n') }
 }
 
 export async function runPatchReviewer(params: {
-  finding: Finding & { codeLocations?: PatchCodeLocation[] }
-  repo: string
-  reposDir: string
-  authorOutput: PatchAuthorOutput
-  backend?: WorkerBackend
-  reviewerLlmCall?: PatchLlmCall
-  modelProfiles?: readonly ResolvedModelProfile[]
-  signal?: AbortSignal
-  secrets?: readonly NamedSecret[]
-  onUsage?: UsageCallback
+  finding: Finding & { codeLocations?: PatchCodeLocation[] }; repo: string; reposDir: string
+  authorOutput: PatchAuthorOutput; precomputedApplicability?: PatchApplicabilityResult
+  backend?: WorkerBackend; reviewerLlmCall?: PatchLlmCall; modelProfiles?: readonly ResolvedModelProfile[]
+  signal?: AbortSignal; secrets?: readonly NamedSecret[]; onUsage?: UsageCallback
 }): Promise<PatchReviewOutput> {
   const repoRoot = validateRepoPath(params.reposDir, params.repo)
-  const applicability = await verifyPatchApplicability({
-    repoRoot,
-    repo: params.repo,
-    reposDir: params.reposDir,
-    diff: params.authorOutput.diff,
-    fixBefore: params.authorOutput.fixBefore,
-    fixAfter: params.authorOutput.fixAfter,
-    codeLocations: params.authorOutput.codeLocations,
-    backend: params.backend,
-    signal: params.signal,
-  })
+  const applicability = params.precomputedApplicability ?? params.authorOutput.applicability
+    ?? await verifyPatchApplicability({ repoRoot, repo: params.repo, reposDir: params.reposDir, diff: params.authorOutput.diff, fixBefore: params.authorOutput.fixBefore, fixAfter: params.authorOutput.fixAfter, codeLocations: params.authorOutput.codeLocations, backend: params.backend, signal: params.signal })
 
-  // Always run in a fresh clean context with ZERO shared conversation history with patch-author.
   const reviewerCall = params.reviewerLlmCall
-    ?? (params.modelProfiles?.length
-      ? makeFreshProviderCall(params.modelProfiles, 'patch-reviewer', {
-        signal: params.signal,
-        secrets: params.secrets,
-        onUsage: params.onUsage,
-      })
-      : undefined)
+    ?? (params.modelProfiles?.length ? makeFreshProviderCall(params.modelProfiles, 'patch-reviewer', { signal: params.signal, secrets: params.secrets, onUsage: params.onUsage }) : undefined)
+  if (!reviewerCall) return deterministicOfflineReview(params.authorOutput, applicability)
 
-  if (!reviewerCall) {
-    return deterministicOfflineReview(params.authorOutput, applicability)
+  const rangesByFile = new Map<string, Array<{ startLine: number; endLine?: number }>>()
+  const addRange = (file: string, startLine: number, endLine?: number) => {
+    const k = normalizeRepoRelPath(file)
+    if (k) rangesByFile.set(k, [...(rangesByFile.get(k) ?? []), { startLine, ...(endLine !== undefined ? { endLine } : {}) }])
   }
+  for (const loc of params.authorOutput.codeLocations) addRange(loc.file, loc.startLine, loc.endLine)
+  for (const item of params.authorOutput.coverageInventory) addRange(item.file, item.line ?? 1)
+  try {
+    for (const fp of parseUnifiedDiff(params.authorOutput.diff, { allowEmpty: true })) {
+      for (const h of fp.hunks) addRange(fp.normalizedPath, Math.max(1, h.oldStart), Math.max(1, h.oldStart + h.oldCount))
+    }
+  } catch { /* reflected in applicability */ }
 
-  const fileContext = params.authorOutput.codeLocations.map(loc => ({
-    file: loc.file,
-    startLine: loc.startLine,
-    endLine: loc.endLine,
-    content: safeReadRepoFile(repoRoot, loc.file)?.slice(0, 12_000) ?? null,
-  }))
+  const fileContext = [...rangesByFile.entries()].map(([file, ranges]) => extractFocusedFileContext(repoRoot, file, ranges))
+  const siblingHints = collectSiblingHints(repoRoot, new Set(rangesByFile.keys()), [...params.authorOutput.coverageInventory.map(c => c.symbol), ...params.authorOutput.codeLocations.map(l => l.label ?? '')])
 
   const systemPrompt = [
     'You are Kovo Hunter’s independent air-gapped Patch Reviewer (Stage 2).',
@@ -1296,237 +992,320 @@ export async function runPatchReviewer(params: {
     '5. repo_conventions: Is the patch minimal, clean, idiomatic, and free of hardcoded secrets or debug artifacts?',
     'Return STRICT JSON ONLY with keys: { approved, callerCompatibility, enforcingLocation, gates: { applicability, security_closure, sibling_coverage, caller_compatibility, repo_conventions }, reviewNotes }.',
   ].join('\n')
-
   const userPrompt = JSON.stringify({
-    finding: {
-      title: params.finding.title,
-      cwe: params.finding.cwe,
-      category: params.finding.category,
-      severity: params.finding.severity,
-      origin: params.finding.origin,
-      reason: params.finding.reason,
-      impact: params.finding.impact,
-    },
-    proposedPatch: {
-      repo: params.repo,
-      diff: params.authorOutput.diff,
-      fixBefore: params.authorOutput.fixBefore,
-      fixAfter: params.authorOutput.fixAfter,
-      coverageInventory: params.authorOutput.coverageInventory,
-      applicabilityCheck: applicability,
-    },
+    finding: { title: params.finding.title, cwe: params.finding.cwe, category: params.finding.category, severity: params.finding.severity, origin: params.finding.origin, reason: params.finding.reason, impact: params.finding.impact },
+    proposedPatch: { repo: params.repo, diff: params.authorOutput.diff, fixBefore: params.authorOutput.fixBefore, fixAfter: params.authorOutput.fixAfter, coverageInventory: params.authorOutput.coverageInventory, applicabilityCheck: applicability },
     repoFiles: fileContext,
+    ...(siblingHints.length > 0 ? { siblingHints } : {}),
   }, null, 2)
 
   try {
     const raw = await reviewerCall({ systemPrompt, userPrompt })
-    if (typeof raw !== 'string' || !raw.trim()) {
-      throw new Error('Empty response from patch reviewer.')
-    }
+    if (typeof raw !== 'string' || !raw.trim()) throw new Error('Empty response from patch reviewer.')
     const parsed = reviewerOutputSchema.parse(extractJsonBlock(raw))
 
-    // Enforce deterministic hard gates regardless of LLM optimism.
-    const gate1Passed = applicability.applicable
-      && (!applicability.syntaxCheck.ran || applicability.syntaxCheck.passed)
-      && parsed.gates.applicability.passed
-
+    const gate1Passed = isGate1SyntaxPassing(applicability) && parsed.gates.applicability.passed
     const enforcingLocation = parsed.gates.security_closure.enforcingLocation || parsed.enforcingLocation
-    const validEnforcingLoc = Boolean(enforcingLocation && /^[^:\s]+:\d+$/.test(enforcingLocation.trim()))
-    const enforcingFile = validEnforcingLoc ? normalizeRepoRelPath(enforcingLocation!.trim().split(':')[0]!) : null
-    const modifiedSet = new Set(applicability.filesModified.map(normalizeRepoRelPath))
-    const enforcingFileTouched = Boolean(enforcingFile && modifiedSet.has(enforcingFile))
-    const gate2Passed = parsed.gates.security_closure.passed
-      && validEnforcingLoc
-      && enforcingFileTouched
-      && applicability.hasSubstantiveDiffChange
-      && applicability.fixAppliedToCitedFile
-
+    const validLoc = Boolean(enforcingLocation && /^[^:\s]+:\d+$/.test(enforcingLocation.trim()))
+    const enforcingFile = validLoc ? normalizeRepoRelPath(enforcingLocation!.trim().split(':')[0]!) : null
+    const touched = Boolean(enforcingFile && new Set(applicability.filesModified.map(normalizeRepoRelPath)).has(enforcingFile))
+    const gate2Passed = parsed.gates.security_closure.passed && validLoc && touched && applicability.hasSubstantiveDiffChange && applicability.fixAppliedToCitedFile
     const gate3Passed = parsed.gates.sibling_coverage.passed
-    const deterministicBreaksCallers = detectDeterministicCallerBreak(params.authorOutput)
-    const callerCompatibility: CallerCompatibility = deterministicBreaksCallers
-      ? 'breaks_callers'
-      : parsed.callerCompatibility
-    // HARD INVARIANT: breaks_callers ALWAYS fails Gate 4 and forces status='withheld' (even if LLM approved)!
+    const detBreaks = detectDeterministicCallerBreak(params.authorOutput)
+    const callerCompatibility: CallerCompatibility = detBreaks ? 'breaks_callers' : parsed.callerCompatibility
     const gate4Passed = callerCompatibility !== 'breaks_callers' && parsed.gates.caller_compatibility.passed
     const gate5Passed = parsed.gates.repo_conventions.passed && !hasHardcodedSecretInDiff(params.authorOutput.diff)
 
-    const gate2Detail = !validEnforcingLoc
-      ? `${parsed.gates.security_closure.detail} (Missing exact file:line citation.)`
-      : !enforcingFileTouched
-        ? `${parsed.gates.security_closure.detail} (Cited file "${enforcingFile}" was not modified by the diff.)`
-        : !applicability.hasSubstantiveDiffChange || !applicability.fixAppliedToCitedFile
-          ? `${parsed.gates.security_closure.detail} (Diff did not apply a substantive fixBefore -> fixAfter change to the cited file.)`
+    const gate2Detail = !validLoc ? `${parsed.gates.security_closure.detail} (Missing exact file:line citation.)`
+      : !touched ? `${parsed.gates.security_closure.detail} (Cited file "${enforcingFile}" was not modified by the diff.)`
+        : !applicability.hasSubstantiveDiffChange || !applicability.fixAppliedToCitedFile ? `${parsed.gates.security_closure.detail} (Diff did not apply a substantive fixBefore -> fixAfter change to the cited file.)`
           : parsed.gates.security_closure.detail
 
     const gates: PatchGateResult[] = [
       { gate: 1, name: 'applicability', passed: gate1Passed, detail: gate1Passed ? parsed.gates.applicability.detail : (applicability.error || parsed.gates.applicability.detail) },
       { gate: 2, name: 'security_closure', passed: gate2Passed, enforcingLocation, detail: gate2Detail },
       { gate: 3, name: 'sibling_coverage', passed: gate3Passed, detail: parsed.gates.sibling_coverage.detail },
-      {
-        gate: 4,
-        name: 'caller_compatibility',
-        passed: gate4Passed,
-        detail: deterministicBreaksCallers
-          ? `Automatically withheld (deterministic breaks_callers pattern matched; overriding LLM reviewer): ${parsed.gates.caller_compatibility.detail}`
-          : callerCompatibility === 'breaks_callers'
-            ? `Automatically withheld (breaks_callers): ${parsed.gates.caller_compatibility.detail}`
-            : parsed.gates.caller_compatibility.detail,
-      },
+      { gate: 4, name: 'caller_compatibility', passed: gate4Passed, detail: detBreaks ? `Automatically withheld (deterministic breaks_callers pattern matched; overriding LLM reviewer): ${parsed.gates.caller_compatibility.detail}` : callerCompatibility === 'breaks_callers' ? `Automatically withheld (breaks_callers): ${parsed.gates.caller_compatibility.detail}` : parsed.gates.caller_compatibility.detail },
       { gate: 5, name: 'repo_conventions', passed: gate5Passed, detail: parsed.gates.repo_conventions.detail },
       { gate: 6, name: 'dynamic_retest', passed: false, detail: 'Dynamic retest unverified (pending optional local-lab retest with baseline caller).' },
     ]
-
-    let status: PatchStatus
-    if (callerCompatibility === 'breaks_callers') {
-      status = 'withheld'
-    } else if (parsed.approved && gate1Passed && gate2Passed && gate3Passed && gate4Passed && gate5Passed) {
-      status = 'approved'
-    } else {
-      status = 'rejected'
-    }
-
-    return {
-      approved: status === 'approved',
-      status,
-      callerCompatibility,
-      gates,
-      enforcingLocation,
-      reviewNotes: redact(parsed.reviewNotes, params.secrets),
-    }
+    const status: PatchStatus = callerCompatibility === 'breaks_callers' ? 'withheld' : (parsed.approved && gate1Passed && gate2Passed && gate3Passed && gate4Passed && gate5Passed ? 'approved' : 'rejected')
+    return { approved: status === 'approved', status, callerCompatibility, gates, enforcingLocation, reviewNotes: redact(parsed.reviewNotes, params.secrets) }
   } catch (err) {
-    // M-22: Strictly FAIL CLOSED when an LLM reviewer call throws, times out, returns
-    // malformed/truncated JSON, or omits required verdict fields. Never silently approve!
     const reason = redact(err instanceof Error ? err.message : String(err), params.secrets).slice(0, 300)
-    const deterministicBreaksCallers = detectDeterministicCallerBreak(params.authorOutput)
-    const callerCompatibility: CallerCompatibility = deterministicBreaksCallers
-      ? 'breaks_callers'
-      : 'attacker_only'
-    const status: PatchStatus = deterministicBreaksCallers ? 'withheld' : 'rejected'
-    const gate1Passed = applicability.applicable && (!applicability.syntaxCheck.ran || applicability.syntaxCheck.passed)
-
+    const detBreaks = detectDeterministicCallerBreak(params.authorOutput)
+    const callerCompatibility: CallerCompatibility = detBreaks ? 'breaks_callers' : 'attacker_only'
+    const status: PatchStatus = detBreaks ? 'withheld' : 'rejected'
+    const gate1Passed = isGate1SyntaxPassing(applicability)
     const gates: PatchGateResult[] = [
-      {
-        gate: 1,
-        name: 'applicability',
-        passed: gate1Passed,
-        detail: gate1Passed
-          ? `Diff applied cleanly to ${applicability.filesModified.join(', ')}.`
-          : (applicability.error || 'Patch failed applicability or syntax check.'),
-      },
-      {
-        gate: 2,
-        name: 'security_closure',
-        passed: false,
-        detail: `Fail-closed: automated patch reviewer error (${reason}); security closure unverified.`,
-      },
-      {
-        gate: 3,
-        name: 'sibling_coverage',
-        passed: false,
-        detail: 'Fail-closed: automated patch reviewer unavailable or returned an invalid verdict.',
-      },
-      {
-        gate: 4,
-        name: 'caller_compatibility',
-        passed: false,
-        detail: deterministicBreaksCallers
-          ? 'Automatically withheld (deterministic breaks_callers pattern matched while reviewer failed closed).'
-          : 'Fail-closed: caller compatibility unverified due to reviewer error.',
-      },
-      {
-        gate: 5,
-        name: 'repo_conventions',
-        passed: false,
-        detail: 'Fail-closed: repository conventions unverified due to reviewer error.',
-      },
-      {
-        gate: 6,
-        name: 'dynamic_retest',
-        passed: false,
-        detail: 'Dynamic retest skipped because patch review failed closed.',
-      },
+      { gate: 1, name: 'applicability', passed: gate1Passed, detail: gate1Passed ? `Diff applied cleanly to ${applicability.filesModified.join(', ')}.` : (applicability.error || 'Patch failed applicability or syntax check.') },
+      { gate: 2, name: 'security_closure', passed: false, detail: `Fail-closed: automated patch reviewer error (${reason}); security closure unverified.` },
+      { gate: 3, name: 'sibling_coverage', passed: false, detail: 'Fail-closed: automated patch reviewer unavailable or returned an invalid verdict.' },
+      { gate: 4, name: 'caller_compatibility', passed: false, detail: detBreaks ? 'Automatically withheld (deterministic breaks_callers pattern matched while reviewer failed closed).' : 'Fail-closed: caller compatibility unverified due to reviewer error.' },
+      { gate: 5, name: 'repo_conventions', passed: false, detail: 'Fail-closed: repository conventions unverified due to reviewer error.' },
+      { gate: 6, name: 'dynamic_retest', passed: false, detail: 'Dynamic retest skipped because patch review failed closed.' },
     ]
-
-    return {
-      approved: false,
-      status,
-      callerCompatibility,
-      gates,
-      reviewNotes: redact(
-        `Patch review failed closed (${status}): reviewer error or invalid response — ${reason}`,
-        params.secrets,
-      ),
-    }
+    return { approved: false, status, callerCompatibility, gates, reviewNotes: redact(`Patch review failed closed (${status}): reviewer error or invalid response — ${reason}`, params.secrets) }
   }
 }
 
-/** Per-run Gate-6 serialization mutex (M-7): prevents concurrent candidate patches from racing on one lab workspace. */
+// ============================================================================
+// Gate-6 Baseline Synthesis, H-5 Envelope Trust & Rollback Consistency
+// ============================================================================
+
+const SAFE_BASELINE_METHODS = new Set(['GET', 'HEAD'])
+const STRIPPED_BASELINE_HEADERS = new Set(['authorization', 'proxy-authorization', 'cookie', 'host', 'content-length', 'connection', 'transfer-encoding'])
+const SUSPICIOUS_BASELINE_PATH_RE = /(?:\{\{|[\r\n\0'"<>`]|(?:^|[/?&=])(?:\.\.\/|\.\.\\)|%27|%22|%3c|%3e|union\s+select|pg_sleep|sleep\s*\(|waitfor\s+delay|\bor\s+1\s*=\s*1\b|--\s*$)/i
+
+function sanitizeBaselineHeaders(headers: Record<string, string> | undefined): Record<string, string> | undefined {
+  if (!headers) return undefined
+  const out: Record<string, string> = {}
+  for (const [k, v] of Object.entries(headers)) {
+    if (!STRIPPED_BASELINE_HEADERS.has(k.toLowerCase()) && typeof v === 'string' && !/[\r\n\0]/.test(v)) out[k] = v
+  }
+  return Object.keys(out).length > 0 ? out : undefined
+}
+
+const isSafeBaselinePath = (p: unknown): p is string =>
+  typeof p === 'string' && p.startsWith('/') && !p.startsWith('//') && p.length <= 2048 && !SUSPICIOUS_BASELINE_PATH_RE.test(p)
+
+function buildSafeBaselineCandidate(input: { origin?: unknown; method?: unknown; pathAndQuery?: unknown; persona?: unknown; headers?: Record<string, string>; grant?: Grant }): BrokerHttpRequest | null {
+  const origin = typeof input.origin === 'string' ? input.origin.trim() : ''
+  const method = typeof input.method === 'string' ? input.method.trim().toUpperCase() : 'GET'
+  if (!origin || !SAFE_BASELINE_METHODS.has(method) || !isSafeBaselinePath(input.pathAndQuery)) return null
+  if (input.grant && !input.grant.canRead(origin)) return null
+  const persona = typeof input.persona === 'string' && input.persona.trim() ? input.persona.trim() : undefined
+  const headers = sanitizeBaselineHeaders(input.headers)
+  return { origin, method: method as BrokerHttpRequest['method'], pathAndQuery: input.pathAndQuery, ...(persona ? { persona } : {}), ...(headers ? { headers } : {}) }
+}
+
+const routePathOnly = (pq: string | undefined): string | null => {
+  if (!pq) return null
+  const base = (pq.includes('?') ? pq.slice(0, pq.indexOf('?')) : pq).trim()
+  return base.startsWith('/') ? base : null
+}
+
+function inferSpecRouteHint(spec: DeclarativeReplaySpec, finding?: Finding): string | null {
+  if (typeof spec.recipe?.args?.pathAndQuery === 'string') return routePathOnly(spec.recipe.args.pathAndQuery)
+  if ('pathAndQuery' in spec && typeof spec.pathAndQuery === 'string') return routePathOnly(spec.pathAndQuery)
+  if ('controlPath' in spec && typeof spec.controlPath === 'string') return routePathOnly(spec.controlPath)
+  if ('steps' in spec && Array.isArray(spec.steps)) {
+    const st = spec.steps.find(s => 'request' in s ? Boolean(s.request?.pathAndQuery) : Boolean(s.pathAndQuery))
+    if (st) return routePathOnly('request' in st ? st.request.pathAndQuery : st.pathAndQuery)
+  }
+  return routePathOnly((finding as { endpoint?: string } | undefined)?.endpoint)
+}
+
+function pickBestExchangeBaseline(exchanges: readonly BrokerExchange[], specOrigin: string, routeHint: string | null, grant?: Grant): BrokerHttpRequest | null {
+  let best: { req: BrokerHttpRequest; score: number } | null = null
+  for (const ex of exchanges) {
+    if (ex.status < 200 || ex.status >= 300) continue
+    const req = buildSafeBaselineCandidate({ origin: ex.origin, method: ex.method, pathAndQuery: ex.pathAndQuery, persona: ex.personaHandle ?? undefined, grant })
+    if (!req) continue
+    const exPath = routePathOnly(ex.pathAndQuery)
+    const hintBase = routeHint ? routeHint.split('/').slice(0, 3).join('/') : ''
+    const score = (ex.origin === specOrigin ? 20 : 0) + (ex.personaHandle ? 30 : 0) + (ex.method.toUpperCase() === 'GET' ? 5 : 0)
+      + (routeHint && exPath ? (exPath === routeHint ? 50 : hintBase.length > 1 && exPath.startsWith(hintBase) ? 25 : 0) : 0)
+    if (!best || score > best.score) best = { req, score }
+  }
+  return best?.req ?? null
+}
+
+function synthesizeFromRecipe(spec: DeclarativeReplaySpec, grant?: Grant): { caller: BrokerHttpRequest; expectStatus: number[] } | null {
+  if (!spec.recipe) return null
+  const args = spec.recipe.args as Record<string, unknown>
+  const origin = (typeof args.origin === 'string' && args.origin) || spec.origin
+  const actorOf = (o: unknown) => o && typeof o === 'object' && typeof (o as { handle?: unknown }).handle === 'string' ? (o as { handle: string }).handle : undefined
+  const baseH = args.headers && typeof args.headers === 'object' && !Array.isArray(args.headers) ? (args.headers as Record<string, string>) : undefined
+  const tryReq = (method: unknown, pathAndQuery: unknown, persona?: string, headers?: Record<string, string>, expectStatus = [200, 201, 202, 204]) => {
+    const caller = buildSafeBaselineCandidate({ origin, method, pathAndQuery, persona, headers, grant })
+    return caller ? { caller, expectStatus } : null
+  }
+  switch (spec.recipe.recipeId) {
+    case 'access_boundary':
+    case 'disclosure':
+      return tryReq(args.method ?? 'GET', args.baselinePathAndQuery ?? args.pathAndQuery, actorOf(args.owner), baseH)
+        ?? (typeof args.baselinePathAndQuery === 'string' ? tryReq('GET', args.baselinePathAndQuery, actorOf(args.owner), baseH) : null)
+    case 'persisted_mutation':
+      return tryReq(args.readbackMethod ?? args.baselineMethod ?? 'GET', args.readbackPathAndQuery ?? args.baselinePathAndQuery, actorOf(args.readbackActor) ?? actorOf(args.actor), baseH)
+    case 'boolean_or_timing': {
+      const ctrl = args.controlRequest as { pathAndQuery?: unknown; headers?: Record<string, string> } | undefined
+      return tryReq(args.method ?? 'GET', ctrl?.pathAndQuery ?? args.controlPathAndQuery ?? args.pathAndQuery, actorOf(args.actor), ctrl?.headers ?? baseH)
+        ?? (typeof args.primePath === 'string' ? tryReq('GET', args.primePath, actorOf(args.actor)) : null)
+    }
+    case 'conserved_balance': {
+      const rb = args.readback as { method?: unknown; pathAndQuery?: unknown; actor?: unknown; headers?: Record<string, string> } | undefined
+      return rb ? tryReq(rb.method ?? 'GET', rb.pathAndQuery, actorOf(rb.actor) ?? actorOf(args.actor), rb.headers) : null
+    }
+    case 'redirect':
+      return tryReq(args.method ?? 'GET', args.controlPathAndQuery ?? args.pathAndQuery, actorOf(args.actor), baseH, [200, 201, 202, 204, 301, 302, 303, 307, 308])
+    case 'browser_sink': {
+      const ctrl = Array.isArray(args.steps) ? (args.steps as Array<{ role?: string; pathAndQuery?: string; persona?: string }>).find(s => s.role === 'control' && typeof s.pathAndQuery === 'string') : undefined
+      return tryReq('GET', ctrl?.pathAndQuery ?? args.pathAndQuery, ctrl?.persona ?? actorOf(args.actor))
+    }
+    case 'injection_fingerprint':
+    case 'oob_callback':
+      return tryReq(args.method ?? 'GET', args.pathAndQuery, actorOf(args.actor), baseH)
+    case 'race_burst': {
+      for (const st of Array.isArray(args.setupSteps) ? (args.setupSteps as Array<{ method?: string; pathAndQuery?: string; actor?: unknown; headers?: Record<string, string> }>) : []) {
+        const hit = tryReq(st.method, st.pathAndQuery, actorOf(st.actor) ?? actorOf(args.actor), st.headers)
+        if (hit) return hit
+      }
+      return tryReq(args.method, args.pathAndQuery, actorOf(args.actor), baseH)
+    }
+    default: return null
+  }
+}
+
+function synthesizeFromStep(step: ReplayStep | undefined, grant?: Grant): BrokerHttpRequest | null {
+  if (!step || step.request.authMutation) return null
+  return buildSafeBaselineCandidate({ origin: step.request.origin, method: step.request.method, pathAndQuery: step.request.pathAndQuery, persona: step.request.persona, headers: step.request.headers, grant })
+}
+
+function synthesizeFromDeclarativeSpec(spec: DeclarativeReplaySpec, grant?: Grant): BrokerHttpRequest | null {
+  switch (spec.kind) {
+    case 'http_chain':
+    case 'auth_protocol_proof':
+      return synthesizeFromStep(spec.steps.find(s => s.role === 'control' && !s.request.authMutation), grant)
+    case 'sql_boolean_diff':
+    case 'sql_time_diff':
+      return synthesizeFromStep(spec.controlStep, grant) ?? buildSafeBaselineCandidate({ origin: spec.targetOrigin, method: spec.method, pathAndQuery: spec.pathAndQuery, persona: spec.persona, headers: spec.headers, grant })
+    case 'race_burst':
+    case 'rce_proof':
+    case 'upload_probe':
+      return synthesizeFromStep(spec.controlStep, grant)
+    case 'browser_dom':
+      return buildSafeBaselineCandidate({ origin: spec.targetOrigin, method: 'GET', pathAndQuery: spec.controlPath, persona: spec.persona, grant })
+    case 'browser_chain': {
+      const c = spec.steps.find(s => s.role === 'control' && typeof s.pathAndQuery === 'string')
+      return c ? buildSafeBaselineCandidate({ origin: c.origin, method: 'GET', pathAndQuery: c.pathAndQuery, persona: c.persona, grant }) : null
+    }
+    case 'cache_differential':
+      return buildSafeBaselineCandidate({ origin: spec.targetOrigin, method: spec.method, pathAndQuery: spec.controlPath, persona: spec.controlPersona, grant })
+    default: return null
+  }
+}
+
+/** Derive Gate-6 `envelopeTrust` cleanly (H-5): explicit override > DB verification when replaySpecId claimed > host_persisted. */
+export function deriveGate6EnvelopeTrust(
+  lr: Pick<PatchLabRetestContext, 'envelopeTrust' | 'storage' | 'runId' | 'replaySpecId'>,
+  finding?: Pick<Finding, 'replaySpecId'>,
+): 'host_persisted' | 'untrusted' {
+  if (lr.envelopeTrust !== undefined) return lr.envelopeTrust
+  const claimedSpecId = lr.replaySpecId ?? finding?.replaySpecId ?? undefined
+  if (lr.storage && claimedSpecId) {
+    try { return lr.storage.getReplaySpec(lr.runId, claimedSpecId) ? 'host_persisted' : 'untrusted' } catch { return 'untrusted' }
+  }
+  return 'host_persisted'
+}
+
+/** Synthesize a safe read-only/idempotent (`GET`/`HEAD`) baseline caller for Gate 6 across all proof kinds. */
+export function synthesizeGate6BaselineCaller(params: {
+  explicitBaselineCaller?: BrokerHttpRequest; explicitExpectStatus?: number[]
+  replaySpec: DeclarativeReplaySpec; finding?: Finding; storage?: Store; runId?: string; grant?: Grant
+}): SynthesizedBaselineCaller | null {
+  const defaultStatuses = params.explicitExpectStatus ?? [200, 201, 202, 204]
+  if (params.explicitBaselineCaller) return { caller: params.explicitBaselineCaller, expectStatus: defaultStatuses, source: 'explicit' }
+  const specOrigin = params.replaySpec.origin || params.finding?.origin || ''
+  const routeHint = inferSpecRouteHint(params.replaySpec, params.finding)
+
+  if (params.storage && params.runId) {
+    const citedIds = new Set<string>([...(params.replaySpec.agentScript?.exchangeIds ?? []), ...(params.finding?.exchangeIds ?? [])])
+    if (params.finding?.id) {
+      try {
+        const agentProof = params.storage.agentProofForFinding(params.runId, params.finding.id)
+        for (const id of agentProof?.receipt?.receipt?.exchangeIds ?? []) citedIds.add(id)
+      } catch { /* optional */ }
+    }
+    const citedExchanges: BrokerExchange[] = []
+    for (const id of citedIds) {
+      try { citedExchanges.push(params.storage.getExchange(params.runId, id)) } catch { /* pruned */ }
+    }
+    const picked = pickBestExchangeBaseline(citedExchanges, specOrigin, routeHint, params.grant)
+    if (picked) return { caller: picked, expectStatus: defaultStatuses, source: 'receipt_exchange' }
+  }
+
+  const fromRecipe = synthesizeFromRecipe(params.replaySpec, params.grant)
+  if (fromRecipe) return { caller: fromRecipe.caller, expectStatus: params.explicitExpectStatus ?? fromRecipe.expectStatus, source: 'recipe_control' }
+
+  const fromSpec = synthesizeFromDeclarativeSpec(params.replaySpec, params.grant)
+  if (fromSpec) return { caller: fromSpec, expectStatus: defaultStatuses, source: 'spec_control' }
+
+  if (params.storage && params.runId && specOrigin) {
+    try {
+      const picked = pickBestExchangeBaseline(params.storage.searchExchanges(params.runId, '', { origin: specOrigin, limit: 100 }), specOrigin, routeHint, params.grant)
+      if (picked) return { caller: picked, expectStatus: defaultStatuses, source: 'phase0_exchange' }
+    } catch { /* fail closed */ }
+  }
+  return null
+}
+
 const gate6RunLocks = new Map<string, Promise<void>>()
 
 async function withGate6RunLock<T>(runId: string, fn: () => Promise<T>): Promise<T> {
   const prev = gate6RunLocks.get(runId) ?? Promise.resolve()
   let release!: () => void
-  const gate = new Promise<void>(resolve => { release = resolve })
+  const gate = new Promise<void>(r => { release = r })
   const tail = prev.then(() => gate, () => gate)
   gate6RunLocks.set(runId, tail)
   await prev.catch(() => undefined)
-  try {
-    return await fn()
-  } finally {
+  try { return await fn() } finally {
     release()
-    if (gate6RunLocks.get(runId) === tail) {
-      gate6RunLocks.delete(runId)
-    }
+    if (gate6RunLocks.get(runId) === tail) gate6RunLocks.delete(runId)
   }
-}
-
-function invertUnifiedDiff(diffText: string): string {
-  const patches = parseUnifiedDiff(diffText)
-  const out: string[] = []
-  for (const patch of patches) {
-    const invOldHeader = patch.isDelete ? '/dev/null' : `a/${patch.normalizedPath}`
-    const invNewHeader = patch.isCreate ? '/dev/null' : `b/${patch.normalizedPath}`
-    out.push(`--- ${invOldHeader}`, `+++ ${invNewHeader}`)
-    for (const hunk of patch.hunks) {
-      const ctx = hunk.headerContext ? ` ${hunk.headerContext}` : ''
-      out.push(`@@ -${hunk.newStart},${hunk.newCount} +${hunk.oldStart},${hunk.oldCount} @@${ctx}`)
-      for (const entry of hunk.entries) {
-        if (entry.kind === 'context') out.push(` ${entry.text}`)
-        else if (entry.kind === 'add') out.push(`-${entry.text}`)
-        else out.push(`+${entry.text}`)
-      }
-    }
-  }
-  return out.join('\n') + '\n'
 }
 
 function restoreWorkspaceSnapshot(targetDir: string, backupDir: string): void {
   if (!existsSync(targetDir) || !existsSync(backupDir)) return
-  for (const entry of readdirSync(targetDir)) {
-    rmSync(join(targetDir, entry), { recursive: true, force: true })
-  }
+  for (const entry of readdirSync(targetDir)) rmSync(join(targetDir, entry), { recursive: true, force: true })
   copyRepoTreeWithoutSymlinks(backupDir, targetDir)
 }
 
+function workspaceMatchesBackupForPaths(targetDir: string, backupDir: string, touchedPaths: readonly string[]): boolean {
+  for (const rel of touchedPaths) {
+    const clean = normalizeRepoRelPath(rel)
+    if (!clean) continue
+    const tPath = join(targetDir, clean), bPath = join(backupDir, clean)
+    const tExists = existsSync(tPath), bExists = existsSync(bPath)
+    if (tExists !== bExists) return false
+    if (tExists && bExists && readRegularFileNoFollow(tPath) !== readRegularFileNoFollow(bPath)) return false
+  }
+  return true
+}
+
+function buildIdentityDiffForDir(rootDir: string, preferredRelFiles: readonly string[]): string | null {
+  const tryFile = (rel: string): string | null => {
+    const clean = normalizeRepoRelPath(rel)
+    if (!clean || isSensitiveRepoRelativePath(clean)) return null
+    const content = readRegularFileNoFollow(join(rootDir, clean))
+    if (!content) return null
+    const firstLine = content.replace(/\r\n/g, '\n').split('\n')[0] ?? ''
+    return [`--- a/${clean}`, `+++ b/${clean}`, '@@ -1,1 +1,1 @@', `-${firstLine}`, `+${firstLine}`, ''].join('\n')
+  }
+  for (const rel of preferredRelFiles) { const d = tryFile(rel); if (d) return d }
+  const stack: string[] = ['']
+  while (stack.length > 0) {
+    const relDir = stack.pop()!, absDir = relDir ? join(rootDir, relDir) : rootDir
+    let entries
+    try { entries = readdirSync(absDir, { withFileTypes: true }) } catch { continue }
+    for (const entry of entries) {
+      const relPosix = relDir ? `${relDir}/${entry.name}` : entry.name
+      if (isSymlink(join(absDir, entry.name))) continue
+      if (entry.isDirectory()) { if (!SKIP_SCAN_DIRS.has(entry.name)) stack.push(relPosix) }
+      else if (entry.isFile()) { const d = tryFile(relPosix); if (d) return d }
+    }
+  }
+  return null
+}
+
 export async function generateAndReviewPatch(params: PatchWorkflowParams): Promise<PatchProposalResult> {
-  const now = Date.now()
-  const proposalId = randomUUID()
-
-  // Stage 1: Air-gapped Patch Author
+  const now = Date.now(), proposalId = randomUUID()
   const authorOutput = await runPatchAuthor(params)
-
-  // Stage 2: Independent Patch Reviewer (fresh clean context, 6 ordered gates)
   const review = await runPatchReviewer({
-    finding: params.finding,
-    repo: params.repo,
-    reposDir: params.reposDir,
-    authorOutput,
-    backend: params.backend,
-    reviewerLlmCall: params.reviewerLlmCall,
-    modelProfiles: params.modelProfiles,
-    signal: params.signal,
-    secrets: params.secrets,
-    onUsage: params.onUsage,
+    finding: params.finding, repo: params.repo, reposDir: params.reposDir, authorOutput,
+    precomputedApplicability: authorOutput.applicability, backend: params.backend,
+    reviewerLlmCall: params.reviewerLlmCall, modelProfiles: params.modelProfiles,
+    signal: params.signal, secrets: params.secrets, onUsage: params.onUsage,
   })
 
   let finalStatus: PatchStatus = review.status
@@ -1534,1529 +1313,556 @@ export async function generateAndReviewPatch(params: PatchWorkflowParams): Promi
   let dynamicRetestSummary: string | undefined
   const gates = [...review.gates]
 
-  // Stage 3: Optional local-lab dynamic fix retest (reproduced -> fixed) with authorized baseline caller.
-  // M-7: Serialize concurrent Gate-6 retests per run, validate diff applicability in an isolated temp
-  // copy first, and snapshot/restore `sanitizedRepoDir` so candidate patches never leave the live
-  // run workspace mutated.
   if (params.labRetest && finalStatus === 'approved') {
     const lr = params.labRetest
     await withGate6RunLock(lr.runId, async () => {
-      const activeRunState = lr.labRunner?.supervisor?.getActiveRun?.(lr.runId)
-      const sanitizedRepoDir = lr.sanitizedRepoDir ?? activeRunState?.handle?.sanitizedRepoDir
-      let scratchDir: string | null = null
-      let backupDir: string | null = null
-      let rebuildSucceeded = false
+      const sanitizedRepoDir = lr.sanitizedRepoDir ?? lr.labRunner?.supervisor?.getActiveRun?.(lr.runId)?.handle?.sanitizedRepoDir
+      let scratchDir: string | null = null, backupDir: string | null = null, rebuildSucceeded = false
+      let touchedPaths: string[] = [], rollbackError: string | null = null
+
       try {
+        try { touchedPaths = parseUnifiedDiff(authorOutput.diff).map(fp => fp.normalizedPath) }
+        catch { touchedPaths = authorOutput.applicability?.filesModified ?? [] }
+
         if (sanitizedRepoDir && existsSync(sanitizedRepoDir)) {
-          // 1. Validate the candidate diff in an isolated temporary copy before touching the live lab dir.
           scratchDir = mkdtempSync(join(tmpdir(), 'kovo-patch-gate6-work-'))
           copyRepoTreeWithoutSymlinks(sanitizedRepoDir, scratchDir)
           applyUnifiedDiffToDirectory(scratchDir, authorOutput.diff)
-
-          // 2. Capture a clean pre-retest snapshot for guaranteed rollback in `finally`.
           backupDir = mkdtempSync(join(tmpdir(), 'kovo-patch-gate6-backup-'))
           copyRepoTreeWithoutSymlinks(sanitizedRepoDir, backupDir)
         }
 
         await lr.labRunner.rebuildWithPatch(lr.runId, authorOutput.diff, params.signal)
         rebuildSucceeded = true
+
         const retest = await retestReplaySpec({
-          spec: lr.replaySpec,
-          broker: lr.broker,
-          browser: lr.browser,
-          canaryBroker: lr.canaryBroker,
-          backend: lr.backend,
-          grant: lr.grant,
-          signal: params.signal ?? AbortSignal.timeout(60_000),
-          storage: lr.storage,
-          runId: lr.runId,
-          assignmentId: lr.assignmentId,
-          envelopeTrust: 'host_persisted',
+          spec: lr.replaySpec, broker: lr.broker, browser: lr.browser, canaryBroker: lr.canaryBroker,
+          backend: lr.backend, grant: lr.grant, signal: params.signal ?? AbortSignal.timeout(60_000),
+          storage: lr.storage, runId: lr.runId, assignmentId: lr.assignmentId,
+          envelopeTrust: deriveGate6EnvelopeTrust(lr, params.finding),
         })
 
-        let baselineStatus: number | null = null
-        let baselineOk = false
-        if (lr.baselineCaller) {
+        const resolvedBaseline = synthesizeGate6BaselineCaller({
+          explicitBaselineCaller: lr.baselineCaller, explicitExpectStatus: lr.baselineExpectStatus,
+          replaySpec: lr.replaySpec, finding: params.finding, storage: lr.storage, runId: lr.runId, grant: lr.grant,
+        })
+
+        let baselineStatus: number | null = null, baselineOk = false
+        if (resolvedBaseline) {
           try {
-            const baseline = await lr.broker.executeHttp(lr.baselineCaller, lr.grant, params.signal ?? AbortSignal.timeout(30_000))
+            const baseline = await lr.broker.executeHttp(resolvedBaseline.caller, lr.grant, params.signal ?? AbortSignal.timeout(30_000))
             baselineStatus = baseline.status
-            const expected = lr.baselineExpectStatus ?? [200, 201, 202, 204]
-            baselineOk = expected.includes(baseline.status)
-          } catch {
-            baselineOk = false
-          }
+            baselineOk = resolvedBaseline.expectStatus.includes(baseline.status)
+          } catch { baselineOk = false }
         }
 
-        if (retest.verdict === 'fixed' && lr.baselineCaller && baselineOk) {
+        if (retest.verdict === 'fixed' && resolvedBaseline && baselineOk) {
           dynamicRetestVerdict = 'fixed'
-          dynamicRetestSummary = `Zero-LLM dynamic fix retest confirmed reproduced → fixed: ${retest.replay.outcome.observed}; authorized baseline caller still HTTP ${baselineStatus}`
+          const tag = resolvedBaseline.source === 'explicit' ? '' : ` [${resolvedBaseline.source}]`
+          dynamicRetestSummary = `Zero-LLM dynamic fix retest confirmed reproduced → fixed: ${retest.replay.outcome.observed}; authorized baseline caller${tag} (${resolvedBaseline.caller.method} ${resolvedBaseline.caller.pathAndQuery}) still HTTP ${baselineStatus}`
           gates[5] = { gate: 6, name: 'dynamic_retest', passed: true, detail: dynamicRetestSummary }
-        } else if (retest.verdict === 'fixed' && !lr.baselineCaller) {
-          dynamicRetestVerdict = 'skipped'
-          dynamicRetestSummary = `Exploit replay reports fixed, but Gate 6 is unverified: no authorized baseline caller was supplied to prove legitimate traffic still succeeds.`
+        } else if (retest.verdict === 'fixed' && !resolvedBaseline) {
+          dynamicRetestVerdict = 'skipped'; finalStatus = 'withheld'
+          dynamicRetestSummary = 'Exploit replay reports fixed, but Gate 6 is unverified: no safe read-only/idempotent baseline caller could be resolved to prove legitimate traffic still succeeds.'
           gates[5] = { gate: 6, name: 'dynamic_retest', passed: false, detail: dynamicRetestSummary }
-          finalStatus = 'withheld'
-        } else if (retest.verdict === 'fixed' && lr.baselineCaller && !baselineOk) {
-          dynamicRetestVerdict = 'skipped'
-          dynamicRetestSummary = `Exploit replay reports fixed, but the authorized baseline caller regressed (HTTP ${baselineStatus ?? 'error'}); patch breaks legitimate traffic.`
+        } else if (retest.verdict === 'fixed' && resolvedBaseline && !baselineOk) {
+          dynamicRetestVerdict = 'skipped'; finalStatus = 'rejected'
+          dynamicRetestSummary = `Exploit replay reports fixed, but the authorized baseline caller (${resolvedBaseline.caller.method} ${resolvedBaseline.caller.pathAndQuery}) regressed (HTTP ${baselineStatus ?? 'error'}); patch breaks legitimate traffic.`
           gates[5] = { gate: 6, name: 'dynamic_retest', passed: false, detail: dynamicRetestSummary }
-          finalStatus = 'rejected'
         } else if (retest.verdict === 'reproduced') {
-          dynamicRetestVerdict = 'reproduced'
+          dynamicRetestVerdict = 'reproduced'; finalStatus = 'rejected'
           dynamicRetestSummary = `Vulnerability still reproduced after patch rebuild: ${retest.replay.outcome.observed}`
           gates[5] = { gate: 6, name: 'dynamic_retest', passed: false, detail: dynamicRetestSummary }
-          finalStatus = 'rejected'
         } else {
-          dynamicRetestVerdict = 'skipped'
+          dynamicRetestVerdict = 'skipped'; finalStatus = 'withheld'
           dynamicRetestSummary = `Dynamic fix retest inconclusive: ${retest.replay.outcome.observed}`
           gates[5] = { gate: 6, name: 'dynamic_retest', passed: false, detail: dynamicRetestSummary }
-          finalStatus = 'withheld'
         }
       } catch (err) {
-        dynamicRetestVerdict = 'skipped'
+        dynamicRetestVerdict = 'skipped'; finalStatus = 'withheld'
         dynamicRetestSummary = `Dynamic fix retest failed: ${err instanceof Error ? err.message : String(err)}`
         gates[5] = { gate: 6, name: 'dynamic_retest', passed: false, detail: dynamicRetestSummary }
-        finalStatus = 'withheld'
       } finally {
         if (rebuildSucceeded) {
+          let reverseOk = false, lastErr: unknown = null
           try {
-            const reverseDiff = invertUnifiedDiff(authorOutput.diff)
-            await lr.labRunner.rebuildWithPatch(lr.runId, reverseDiff, AbortSignal.timeout(30_000))
-          } catch { /* rollback rebuild is best-effort; filesystem snapshot restore runs next */ }
+            await lr.labRunner.rebuildWithPatch(lr.runId, invertUnifiedDiff(authorOutput.diff), AbortSignal.timeout(30_000))
+            reverseOk = true
+          } catch (err) { lastErr = err }
+
+          const diskClean = !sanitizedRepoDir || !backupDir || workspaceMatchesBackupForPaths(sanitizedRepoDir, backupDir, touchedPaths)
+          if ((!reverseOk || !diskClean) && sanitizedRepoDir && backupDir) {
+            try {
+              restoreWorkspaceSnapshot(sanitizedRepoDir, backupDir)
+              const idDiff = buildIdentityDiffForDir(sanitizedRepoDir, touchedPaths)
+              if (!idDiff) throw new Error('Could not construct identity diff to rebuild clean container after snapshot restore.')
+              await lr.labRunner.rebuildWithPatch(lr.runId, idDiff, AbortSignal.timeout(30_000))
+              reverseOk = true; lastErr = null
+            } catch (recoveryErr) { reverseOk = false; lastErr = recoveryErr }
+          }
+          if (!reverseOk) {
+            rollbackError = `Gate-6 rollback desync: failed to revert live container to pre-trial state (${lastErr instanceof Error ? lastErr.message : String(lastErr)})`
+          }
+        } else if (sanitizedRepoDir && backupDir) {
+          try { restoreWorkspaceSnapshot(sanitizedRepoDir, backupDir) }
+          catch (err) { rollbackError = `Gate-6 workspace snapshot restore failed (${err instanceof Error ? err.message : String(err)})` }
         }
-        if (sanitizedRepoDir && backupDir) {
-          try {
-            restoreWorkspaceSnapshot(sanitizedRepoDir, backupDir)
-          } catch { /* rollback is best-effort */ }
+
+        if (rollbackError) {
+          dynamicRetestVerdict = 'skipped'; finalStatus = 'withheld'
+          dynamicRetestSummary = dynamicRetestSummary ? `${dynamicRetestSummary}; ${rollbackError}` : rollbackError
+          gates[5] = { gate: 6, name: 'dynamic_retest', passed: false, detail: dynamicRetestSummary }
         }
-        if (scratchDir) {
-          try { rmSync(scratchDir, { recursive: true, force: true }) } catch { /* ignore */ }
-        }
-        if (backupDir) {
-          try { rmSync(backupDir, { recursive: true, force: true }) } catch { /* ignore */ }
-        }
+        if (scratchDir) { try { rmSync(scratchDir, { recursive: true, force: true }) } catch { /* ignore */ } }
+        if (backupDir) { try { rmSync(backupDir, { recursive: true, force: true }) } catch { /* ignore */ } }
       }
     })
   } else if (params.labRetest && finalStatus !== 'approved') {
-    gates[5] = {
-      gate: 6,
-      name: 'dynamic_retest',
-      passed: false,
-      detail: `Dynamic retest skipped because static review status was "${finalStatus}".`,
-    }
+    gates[5] = { gate: 6, name: 'dynamic_retest', passed: false, detail: `Dynamic retest skipped because static review status was "${finalStatus}".` }
   }
-
-  const reviewNotes = redact(
-    [
-      review.reviewNotes,
-      ...(dynamicRetestSummary ? [`Dynamic retest (${dynamicRetestVerdict}): ${dynamicRetestSummary}`] : []),
-    ].join('\n'),
-    params.secrets,
-  )
 
   return {
-    id: proposalId,
-    runId: params.runId,
-    findingId: params.finding.id,
-    repo: params.repo,
-    status: finalStatus,
-    callerCompatibility: review.callerCompatibility,
-    fixBefore: redact(authorOutput.fixBefore, params.secrets),
-    fixAfter: redact(authorOutput.fixAfter, params.secrets),
-    diff: redact(authorOutput.diff, params.secrets),
-    codeLocations: authorOutput.codeLocations,
-    coverageInventory: authorOutput.coverageInventory,
-    gates,
-    reviewNotes,
-    dynamicRetestVerdict,
-    dynamicRetestSummary: dynamicRetestSummary ? redact(dynamicRetestSummary, params.secrets) : undefined,
-    createdAt: now,
-    updatedAt: Date.now(),
+    id: proposalId, runId: params.runId, findingId: params.finding.id, repo: params.repo,
+    status: finalStatus, callerCompatibility: review.callerCompatibility,
+    fixBefore: redact(authorOutput.fixBefore, params.secrets), fixAfter: redact(authorOutput.fixAfter, params.secrets),
+    diff: redact(authorOutput.diff, params.secrets), codeLocations: authorOutput.codeLocations,
+    coverageInventory: authorOutput.coverageInventory, gates,
+    reviewNotes: redact([review.reviewNotes, ...(dynamicRetestSummary ? [`Dynamic retest (${dynamicRetestVerdict}): ${dynamicRetestSummary}`] : [])].join('\n'), params.secrets),
+    dynamicRetestVerdict, dynamicRetestSummary: dynamicRetestSummary ? redact(dynamicRetestSummary, params.secrets) : undefined,
+    createdAt: now, updatedAt: Date.now(),
   }
 }
 
 // ============================================================================
-// v8 Stream B — Multi-Hop CompositeProofReceipt DAG Patch-Retest
+// Multi-Hop CompositeProofReceipt DAG Patch-Retest (consolidated compat surface)
 // ============================================================================
 
-export type CompositePatchRetestVerdict =
-  | 'fixed'
-  | 'still_vulnerable'
-  | 'inconclusive'
-  | 'precondition_changed'
-
-export type CompositeHopReplayOutcome =
-  | 'succeeded'
-  | 'blocked'
-  | 'transport_error'
-  | 'auth_setup_failed'
-  | 'precondition_changed'
-  | 'inconclusive'
-
-export interface CompositeBrokeCausalEdge {
-  edgeIndex: number
-  kind: CausalEdgeKind
-  fromHopId: string
-  toHopId: string
-}
-
+export type CompositePatchRetestVerdict = 'fixed' | 'still_vulnerable' | 'inconclusive' | 'precondition_changed'
+export type CompositeHopReplayOutcome = 'succeeded' | 'blocked' | 'transport_error' | 'auth_setup_failed' | 'precondition_changed' | 'inconclusive'
+export interface CompositeBrokeCausalEdge { edgeIndex: number; kind: CausalEdgeKind; fromHopId: string; toHopId: string }
 export interface CompositeHopReplaySummary {
-  hopId: string
-  surface: HopSurface
-  outcome: CompositeHopReplayOutcome | 'skipped_after_break'
-  httpStatuses: number[]
-  exchangeIds: string[]
-  oobEventIds: string[]
-  browserTraceIds: string[]
-  emittedCapabilities: string[]
-  consumedCapabilities: string[]
-  reason?: string
-  errorCode?: string
+  hopId: string; surface: HopSurface; outcome: CompositeHopReplayOutcome | 'skipped_after_break'
+  httpStatuses: number[]; exchangeIds: string[]; oobEventIds: string[]; browserTraceIds: string[]
+  emittedCapabilities: string[]; consumedCapabilities: string[]; reason?: string; errorCode?: string
 }
-
 export interface CompositeHopReplayContext {
-  receipt: CompositeProofReceipt
-  hop: HopReceipt
-  hopIndex: number
-  topoOrder: readonly string[]
-  incomingEdges: readonly CausalEdgeBinding[]
-  outgoingEdges: readonly CausalEdgeBinding[]
-  availableCapabilities: readonly string[]
-  priorHopResults: Readonly<Record<string, CompositeHopReplaySummary>>
-  transcriptSoFar: HostSignedTranscript
-  signal?: AbortSignal
+  receipt: CompositeProofReceipt; hop: HopReceipt; hopIndex: number; topoOrder: readonly string[]
+  incomingEdges: readonly CausalEdgeBinding[]; outgoingEdges: readonly CausalEdgeBinding[]
+  availableCapabilities: readonly string[]; priorHopResults: Readonly<Record<string, CompositeHopReplaySummary>>
+  transcriptSoFar: HostSignedTranscript; signal?: AbortSignal
 }
-
 export interface CompositeHopReplayResult {
-  outcome?: CompositeHopReplayOutcome
-  entries?: readonly HostTranscriptEntry[]
-  oobEvents?: readonly HostOobEvent[]
-  browserTraces?: readonly HostBrowserTrace[]
-  asyncPollRecords?: readonly HostAsyncPollRecord[]
-  replayedExchangeIds?: readonly string[]
-  replayedOobEventIds?: readonly string[]
-  replayedBrowserTraceIds?: readonly string[]
-  replayedAblationExchangeIds?: Readonly<Record<string, readonly string[]>>
-  replayedPollRecordIds?: Readonly<Record<string, string>>
-  preChainControlExchangeIds?: readonly string[]
-  postChainReadbackExchangeIds?: readonly string[]
-  reason?: string
-  errorCode?: string
-  httpStatus?: number | null
+  outcome?: CompositeHopReplayOutcome; entries?: readonly HostTranscriptEntry[]; oobEvents?: readonly HostOobEvent[]
+  browserTraces?: readonly HostBrowserTrace[]; asyncPollRecords?: readonly HostAsyncPollRecord[]
+  replayedExchangeIds?: readonly string[]; replayedOobEventIds?: readonly string[]; replayedBrowserTraceIds?: readonly string[]
+  replayedAblationExchangeIds?: Readonly<Record<string, readonly string[]>>; replayedPollRecordIds?: Readonly<Record<string, string>>
+  preChainControlExchangeIds?: readonly string[]; postChainReadbackExchangeIds?: readonly string[]
+  reason?: string; errorCode?: string; httpStatus?: number | null
 }
-
 export interface CompositePreconditionSetupResult {
   status: 'ok' | 'precondition_changed' | 'transport_error' | 'auth_setup_failed' | 'inconclusive'
-  reason?: string
-  errorCode?: string
-  httpStatus?: number | null
-  entries?: readonly HostTranscriptEntry[]
-  oobEvents?: readonly HostOobEvent[]
-  browserTraces?: readonly HostBrowserTrace[]
-  asyncPollRecords?: readonly HostAsyncPollRecord[]
+  reason?: string; errorCode?: string; httpStatus?: number | null
+  entries?: readonly HostTranscriptEntry[]; oobEvents?: readonly HostOobEvent[]
+  browserTraces?: readonly HostBrowserTrace[]; asyncPollRecords?: readonly HostAsyncPollRecord[]
   preChainControlExchangeIds?: readonly string[]
 }
-
 export interface CompositePatchReplayRunner {
-  preparePreconditions?: (ctx: {
-    receipt: CompositeProofReceipt
-    topoOrder: readonly string[]
-    signal?: AbortSignal
-  }) => Promise<CompositePreconditionSetupResult> | CompositePreconditionSetupResult
+  preparePreconditions?: (ctx: { receipt: CompositeProofReceipt; topoOrder: readonly string[]; signal?: AbortSignal }) => Promise<CompositePreconditionSetupResult> | CompositePreconditionSetupResult
   replayHop: (ctx: CompositeHopReplayContext) => Promise<CompositeHopReplayResult> | CompositeHopReplayResult
-  readbackTerminalState?: (ctx: {
-    receipt: CompositeProofReceipt
-    transcriptSoFar: HostSignedTranscript
-    signal?: AbortSignal
-  }) => Promise<{
+  readbackTerminalState?: (ctx: { receipt: CompositeProofReceipt; transcriptSoFar: HostSignedTranscript; signal?: AbortSignal }) => Promise<{
     status?: 'ok' | 'transport_error' | 'precondition_changed' | 'inconclusive'
-    reason?: string
-    errorCode?: string
-    httpStatus?: number | null
-    entries?: readonly HostTranscriptEntry[]
-    postChainReadbackExchangeIds?: readonly string[]
+    reason?: string; errorCode?: string; httpStatus?: number | null; entries?: readonly HostTranscriptEntry[]; postChainReadbackExchangeIds?: readonly string[]
   }> | {
     status?: 'ok' | 'transport_error' | 'precondition_changed' | 'inconclusive'
-    reason?: string
-    errorCode?: string
-    httpStatus?: number | null
-    entries?: readonly HostTranscriptEntry[]
-    postChainReadbackExchangeIds?: readonly string[]
+    reason?: string; errorCode?: string; httpStatus?: number | null; entries?: readonly HostTranscriptEntry[]; postChainReadbackExchangeIds?: readonly string[]
   }
 }
-
 export interface RetestCompositeChainParams {
-  receipt: CompositeProofReceipt
-  runner: CompositePatchReplayRunner
-  verifyOptions?: CompositeVerifyOptions
-  retestId?: string
-  targetRevision?: string
-  patchId?: string
-  secrets?: readonly NamedSecret[]
-  signal?: AbortSignal
-  now?: () => number
+  receipt: CompositeProofReceipt; runner: CompositePatchReplayRunner; verifyOptions?: CompositeVerifyOptions
+  retestId?: string; targetRevision?: string; patchId?: string; secrets?: readonly NamedSecret[]; signal?: AbortSignal; now?: () => number
 }
-
 export interface CompositePatchRetestProof {
-  schemaVersion: 1
-  retestId: string
-  chainId: string
-  terminalVulnClass: string
-  terminalHopId: string
-  verdict: CompositePatchRetestVerdict
-  /** True strictly when verdict === 'fixed' (fail-closed OSS M4 grading signal). */
-  patchClosed: boolean
-  /** Exact hop where the patch broke the multi-hop chain (non-null iff verdict === 'fixed'). */
-  patchBrokeHopId: string | null
-  /** Causal edge disrupted by the patch when applicable. */
-  brokeCausalEdge: CompositeBrokeCausalEdge | null
-  /** Redacted explanation of how the patch broke the chain (non-null iff verdict === 'fixed'). */
-  brokeReason: string | null
-  /** Ordered topological prefix of hops that still succeeded benignly before `patchBrokeHopId`. */
-  benignPrefixHops: string[]
-  /** Topological execution order of the DAG. */
-  topoOrder: string[]
-  /** Per-hop redacted replay summaries in topological order. */
-  hopResults: CompositeHopReplaySummary[]
-  /** All host-recorded exchange IDs captured during the retest. */
-  exchangeIds: string[]
-  /** Concise redacted verdict summary suitable for portable receipt export & reports. */
-  summary: string
-  /** Underlying `verifyCompositeReceipt()` result when full DAG verification ran. */
-  compositeVerification?: CompositeReceiptVerification
-  targetRevision?: string
-  patchId?: string
-  testedAt: string
-  /** Canonical SHA-256 hex digest of this proof record (excluding `proofSha256`). */
-  proofSha256: string
+  schemaVersion: 1; retestId: string; chainId: string; terminalVulnClass: string; terminalHopId: string
+  verdict: CompositePatchRetestVerdict; patchClosed: boolean; patchBrokeHopId: string | null
+  brokeCausalEdge: CompositeBrokeCausalEdge | null; brokeReason: string | null; benignPrefixHops: string[]
+  topoOrder: string[]; hopResults: CompositeHopReplaySummary[]; exchangeIds: string[]; summary: string
+  compositeVerification?: CompositeReceiptVerification; targetRevision?: string; patchId?: string; testedAt: string; proofSha256: string
 }
-
 export interface PortableCompositePatchRetestRecord {
-  retestId: string
-  verdict: 'reproduced' | 'fixed' | 'inconclusive'
-  compositeVerdict: CompositePatchRetestVerdict
-  chainId: string
-  terminalVulnClass: string
-  patchClosed: boolean
-  patchBrokeHopId: string | null
-  brokeCausalEdge: CompositeBrokeCausalEdge | null
-  brokeReason: string | null
-  benignPrefixHops: string[]
-  summary: string
-  exchangeIds: string[]
-  testedAt: string
-  proofSha256: string
+  retestId: string; verdict: 'reproduced' | 'fixed' | 'inconclusive'; compositeVerdict: CompositePatchRetestVerdict
+  chainId: string; terminalVulnClass: string; patchClosed: boolean; patchBrokeHopId: string | null
+  brokeCausalEdge: CompositeBrokeCausalEdge | null; brokeReason: string | null; benignPrefixHops: string[]
+  summary: string; exchangeIds: string[]; testedAt: string; proofSha256: string
 }
-
 export interface CompositePatchClosureSummary {
-  total: number
-  fixed: number
-  stillVulnerable: number
-  inconclusive: number
-  preconditionChanged: number
-  closureRate: number
-  meetsM4ClosureGate: boolean
+  total: number; fixed: number; stillVulnerable: number; inconclusive: number; preconditionChanged: number
+  closureRate: number; meetsM4ClosureGate: boolean
 }
 
-interface IndexedDagEdge {
-  edgeIndex: number
-  edge: CausalEdgeBinding
+const TRANSPORT_ERR_RE = /^(?:ECONNREFUSED|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|EPIPE|EHOSTUNREACH|ENETUNREACH|UND_ERR_[A-Z_]+|TIMEOUT|ABORTED|ABORT_ERR|TLS_ERROR|AUTH_SETUP_FAILED)$/i
+const is2xx = (st: number | null | undefined) => typeof st === 'number' && st >= 200 && st < 300
+const isFiniteTs = (ts: unknown): ts is number => typeof ts === 'number' && Number.isFinite(ts) && ts >= 0
+const isTransportOr5xx = (st: number | null | undefined) => st == null || !Number.isFinite(st) || st === 0 || st === 429 || st >= 500
+const isSecurity4xx = (st: number | null | undefined) => typeof st === 'number' && st >= 400 && st < 500 && st !== 429
+
+function canonicalProofJson(v: unknown): string {
+  if (v === null || typeof v !== 'object') return JSON.stringify(v)
+  if (Array.isArray(v)) return `[${v.map(canonicalProofJson).join(',')}]`
+  return `{${Object.entries(v as Record<string, unknown>).filter(([k, val]) => k !== 'proofSha256' && val !== undefined).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([k, val]) => `${JSON.stringify(k)}:${canonicalProofJson(val)}`).join(',')}}`
 }
 
-interface CompositeDagLayout {
-  hopsById: Map<string, HopReceipt>
-  topoOrder: string[]
-  roots: string[]
-  incomingByHop: Map<string, IndexedDagEdge[]>
-  outgoingByHop: Map<string, IndexedDagEdge[]>
-}
+export const computeCompositeRetestProofDigest = (proof: Omit<CompositePatchRetestProof, 'proofSha256'> & { proofSha256?: string }): string =>
+  sha256Hex(canonicalProofJson(proof))
 
-interface ReplayedHopArtifacts {
-  exchangeIds: string[]
-  oobEventIds: string[]
-  browserTraceIds: string[]
-  entries: HostTranscriptEntry[]
-  oobEvents: HostOobEvent[]
-  browserTraces: HostBrowserTrace[]
-  asyncPollRecords: HostAsyncPollRecord[]
-  ablationByEdge: Record<string, readonly string[]>
-  pollByEdge: Record<string, string>
-}
+export const verifyCompositePatchRetestProofIntegrity = (proof: CompositePatchRetestProof): boolean =>
+  Boolean(proof && typeof proof.proofSha256 === 'string' && /^[0-9a-f]{64}$/i.test(proof.proofSha256) && proof.proofSha256.toLowerCase() === computeCompositeRetestProofDigest(proof))
 
-const TRANSPORT_ERROR_CODE_RE =
-  /^(?:ECONNREFUSED|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|EPIPE|EHOSTUNREACH|ENETUNREACH|UND_ERR_[A-Z_]+|TIMEOUT|ABORTED|ABORT_ERR|TLS_ERROR|AUTH_SETUP_FAILED)$/i
+export const toPortablePatchRetestProof = (p: CompositePatchRetestProof): PortableCompositePatchRetestRecord => ({
+  retestId: p.retestId, verdict: p.verdict === 'fixed' ? 'fixed' : p.verdict === 'still_vulnerable' ? 'reproduced' : 'inconclusive',
+  compositeVerdict: p.verdict, chainId: p.chainId, terminalVulnClass: p.terminalVulnClass, patchClosed: p.patchClosed,
+  patchBrokeHopId: p.patchBrokeHopId, brokeCausalEdge: p.brokeCausalEdge, brokeReason: p.brokeReason,
+  benignPrefixHops: [...p.benignPrefixHops], summary: p.summary, exchangeIds: [...p.exchangeIds], testedAt: p.testedAt, proofSha256: p.proofSha256,
+})
 
-function canonicalProofStringify(value: unknown): string {
-  if (value === null || typeof value !== 'object') return JSON.stringify(value)
-  if (Array.isArray(value)) return `[${value.map(canonicalProofStringify).join(',')}]`
-  const entries = Object.entries(value as Record<string, unknown>)
-    .filter(([k, v]) => k !== 'proofSha256' && v !== undefined)
-    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
-  return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalProofStringify(v)}`).join(',')}}`
-}
-
-export function computeCompositeRetestProofDigest(
-  proof: Omit<CompositePatchRetestProof, 'proofSha256'> & { proofSha256?: string },
-): string {
-  return sha256Hex(canonicalProofStringify(proof))
-}
-
-export function verifyCompositePatchRetestProofIntegrity(proof: CompositePatchRetestProof): boolean {
-  if (!proof || typeof proof.proofSha256 !== 'string' || !/^[0-9a-f]{64}$/i.test(proof.proofSha256)) {
-    return false
-  }
-  return proof.proofSha256.toLowerCase() === computeCompositeRetestProofDigest(proof)
-}
-
-export function toPortablePatchRetestProof(proof: CompositePatchRetestProof): PortableCompositePatchRetestRecord {
-  const verdict: PortableCompositePatchRetestRecord['verdict'] =
-    proof.verdict === 'fixed'
-      ? 'fixed'
-      : proof.verdict === 'still_vulnerable'
-        ? 'reproduced'
-        : 'inconclusive'
-  return {
-    retestId: proof.retestId,
-    verdict,
-    compositeVerdict: proof.verdict,
-    chainId: proof.chainId,
-    terminalVulnClass: proof.terminalVulnClass,
-    patchClosed: proof.patchClosed,
-    patchBrokeHopId: proof.patchBrokeHopId,
-    brokeCausalEdge: proof.brokeCausalEdge,
-    brokeReason: proof.brokeReason,
-    benignPrefixHops: [...proof.benignPrefixHops],
-    summary: proof.summary,
-    exchangeIds: [...proof.exchangeIds],
-    testedAt: proof.testedAt,
-    proofSha256: proof.proofSha256,
-  }
-}
-
-export function summarizeCompositePatchClosure(
-  proofs: readonly CompositePatchRetestProof[],
-  threshold = 0.8,
-): CompositePatchClosureSummary {
-  let fixed = 0
-  let stillVulnerable = 0
-  let inconclusive = 0
-  let preconditionChanged = 0
+export function summarizeCompositePatchClosure(proofs: readonly CompositePatchRetestProof[], threshold = 0.8): CompositePatchClosureSummary {
+  let fixed = 0, stillVulnerable = 0, inconclusive = 0, preconditionChanged = 0
   for (const p of proofs) {
     if (p.verdict === 'fixed') fixed += 1
     else if (p.verdict === 'still_vulnerable') stillVulnerable += 1
     else if (p.verdict === 'precondition_changed') preconditionChanged += 1
     else inconclusive += 1
   }
-  const total = proofs.length
-  const closureRate = total > 0 ? fixed / total : 0
-  return {
-    total,
-    fixed,
-    stillVulnerable,
-    inconclusive,
-    preconditionChanged,
-    closureRate,
-    meetsM4ClosureGate: total > 0 && closureRate >= threshold,
-  }
+  const total = proofs.length, closureRate = total > 0 ? fixed / total : 0
+  return { total, fixed, stillVulnerable, inconclusive, preconditionChanged, closureRate, meetsM4ClosureGate: total > 0 && closureRate >= threshold }
 }
 
-function computeCompositeDagLayout(
-  receipt: CompositeProofReceipt,
-): { ok: true; dag: CompositeDagLayout } | { ok: false; reason: string } {
+type IndexedEdge = { edgeIndex: number; edge: CausalEdgeBinding }
+type HopArt = { exchangeIds: string[]; oobEventIds: string[]; browserTraceIds: string[]; entries: HostTranscriptEntry[]; oobEvents: HostOobEvent[]; browserTraces: HostBrowserTrace[]; asyncPollRecords: HostAsyncPollRecord[]; ablationByEdge: Record<string, readonly string[]>; pollByEdge: Record<string, string> }
+
+function buildCompositeDag(receipt: CompositeProofReceipt) {
   const hopsById = new Map<string, HopReceipt>()
-  for (const hop of receipt.hops) {
-    if (hopsById.has(hop.hopId)) return { ok: false, reason: `Duplicate hopId "${hop.hopId}".` }
-    hopsById.set(hop.hopId, hop)
-  }
-  if (!hopsById.has(receipt.terminalImpact.terminalHopId)) {
-    return { ok: false, reason: `terminalHopId "${receipt.terminalImpact.terminalHopId}" not in hops.` }
-  }
-  if (receipt.hops.length === 1 && receipt.causalEdges.length > 0) {
-    return { ok: false, reason: 'A 1-hop receipt cannot declare causalEdges.' }
-  }
-
-  const inDeg = new Map<string, number>(receipt.hops.map(h => [h.hopId, 0]))
-  const outAdj = new Map<string, string[]>(receipt.hops.map(h => [h.hopId, []]))
-  const revAdj = new Map<string, string[]>(receipt.hops.map(h => [h.hopId, []]))
-  const incomingByHop = new Map<string, IndexedDagEdge[]>(receipt.hops.map(h => [h.hopId, []]))
-  const outgoingByHop = new Map<string, IndexedDagEdge[]>(receipt.hops.map(h => [h.hopId, []]))
+  for (const h of receipt.hops) { if (hopsById.has(h.hopId)) return { ok: false as const, reason: `Duplicate hopId "${h.hopId}".` }; hopsById.set(h.hopId, h) }
+  if (!hopsById.has(receipt.terminalImpact.terminalHopId)) return { ok: false as const, reason: `terminalHopId "${receipt.terminalImpact.terminalHopId}" not in hops.` }
+  if (receipt.hops.length === 1 && receipt.causalEdges.length > 0) return { ok: false as const, reason: 'A 1-hop receipt cannot declare causalEdges.' }
+  const inDeg = new Map(receipt.hops.map(h => [h.hopId, 0])), outAdj = new Map(receipt.hops.map(h => [h.hopId, [] as string[]])), revAdj = new Map(receipt.hops.map(h => [h.hopId, [] as string[]]))
+  const incomingByHop = new Map(receipt.hops.map(h => [h.hopId, [] as IndexedEdge[]])), outgoingByHop = new Map(receipt.hops.map(h => [h.hopId, [] as IndexedEdge[]]))
   const seen = new Set<string>()
-
   for (let i = 0; i < receipt.causalEdges.length; i += 1) {
-    const e = receipt.causalEdges[i]!
-    if (!hopsById.has(e.fromHopId) || !hopsById.has(e.toHopId)) {
-      return { ok: false, reason: `Edge #${i} references unknown hop.` }
-    }
-    if (e.fromHopId === e.toHopId) {
-      return { ok: false, reason: `Edge #${i} forms a self-loop on "${e.fromHopId}".` }
-    }
-    const key = `${e.fromHopId}->${e.toHopId}:${e.kind}`
-    if (seen.has(key)) return { ok: false, reason: `Duplicate causal edge "${key}".` }
-    seen.add(key)
-    outAdj.get(e.fromHopId)!.push(e.toHopId)
-    revAdj.get(e.toHopId)!.push(e.fromHopId)
-    inDeg.set(e.toHopId, (inDeg.get(e.toHopId) ?? 0) + 1)
-    incomingByHop.get(e.toHopId)!.push({ edgeIndex: i, edge: e })
-    outgoingByHop.get(e.fromHopId)!.push({ edgeIndex: i, edge: e })
+    const e = receipt.causalEdges[i]!, key = `${e.fromHopId}->${e.toHopId}:${e.kind}`
+    if (!hopsById.has(e.fromHopId) || !hopsById.has(e.toHopId)) return { ok: false as const, reason: `Edge #${i} references unknown hop.` }
+    if (e.fromHopId === e.toHopId) return { ok: false as const, reason: `Edge #${i} forms a self-loop on "${e.fromHopId}".` }
+    if (seen.has(key)) return { ok: false as const, reason: `Duplicate causal edge "${key}".` }
+    seen.add(key); outAdj.get(e.fromHopId)!.push(e.toHopId); revAdj.get(e.toHopId)!.push(e.fromHopId)
+    inDeg.set(e.toHopId, (inDeg.get(e.toHopId) ?? 0) + 1); incomingByHop.get(e.toHopId)!.push({ edgeIndex: i, edge: e }); outgoingByHop.get(e.fromHopId)!.push({ edgeIndex: i, edge: e })
   }
-
-  const roots = receipt.hops.filter(h => inDeg.get(h.hopId) === 0).map(h => h.hopId)
-  const queue = [...roots]
-  const rem = new Map(inDeg)
-  const topoOrder: string[] = []
-  while (queue.length > 0) {
-    const hopId = queue.shift()!
-    topoOrder.push(hopId)
-    for (const next of outAdj.get(hopId) ?? []) {
-      const d = (rem.get(next) ?? 0) - 1
-      rem.set(next, d)
-      if (d === 0) queue.push(next)
-    }
+  const q = receipt.hops.filter(h => inDeg.get(h.hopId) === 0).map(h => h.hopId), rem = new Map(inDeg), topoOrder: string[] = []
+  while (q.length) {
+    const id = q.shift()!; topoOrder.push(id)
+    for (const next of outAdj.get(id) ?? []) { const d = (rem.get(next) ?? 0) - 1; rem.set(next, d); if (d === 0) q.push(next) }
   }
-  if (topoOrder.length !== receipt.hops.length) {
-    return { ok: false, reason: 'Causal DAG contains a cycle.' }
-  }
-
-  const reachesTerminal = new Set<string>([receipt.terminalImpact.terminalHopId])
-  const rq = [receipt.terminalImpact.terminalHopId]
-  while (rq.length > 0) {
-    const cur = rq.shift()!
-    for (const prev of revAdj.get(cur) ?? []) {
-      if (!reachesTerminal.has(prev)) {
-        reachesTerminal.add(prev)
-        rq.push(prev)
-      }
-    }
-  }
-  const orphan = receipt.hops.find(h => !reachesTerminal.has(h.hopId))
-  if (orphan) {
-    return { ok: false, reason: `Hop "${orphan.hopId}" does not reach terminalHopId.` }
-  }
-  return { ok: true, dag: { hopsById, topoOrder, roots, incomingByHop, outgoingByHop } }
+  if (topoOrder.length !== receipt.hops.length) return { ok: false as const, reason: 'Causal DAG contains a cycle.' }
+  const reaches = new Set([receipt.terminalImpact.terminalHopId]), rq = [receipt.terminalImpact.terminalHopId]
+  while (rq.length) for (const prev of revAdj.get(rq.shift()!) ?? []) if (!reaches.has(prev)) { reaches.add(prev); rq.push(prev) }
+  const orphan = receipt.hops.find(h => !reaches.has(h.hopId))
+  return orphan ? { ok: false as const, reason: `Hop "${orphan.hopId}" does not reach terminalHopId.` } : { ok: true as const, dag: { hopsById, topoOrder, incomingByHop, outgoingByHop } }
 }
 
-const is2xxStatus = (status: number | null | undefined): boolean =>
-  typeof status === 'number' && status >= 200 && status < 300
-
-const isFiniteTimestamp = (ts: unknown): ts is number =>
-  typeof ts === 'number' && Number.isFinite(ts) && ts >= 0
-
-const isTransportOrServerFailureStatus = (status: number | null | undefined): boolean =>
-  status === null || status === undefined || !Number.isFinite(status) || status === 0 || status === 429 || status >= 500
-
-const isSecurityDenialStatus = (status: number | null | undefined): boolean =>
-  typeof status === 'number' && status >= 400 && status < 500 && status !== 429
-
-function extractErrorCode(err: unknown): string | undefined {
-  if (!err || typeof err !== 'object') return undefined
-  const rec = err as { code?: unknown; name?: unknown; cause?: { code?: unknown } }
-  if (typeof rec.code === 'string' && rec.code.trim()) return rec.code.trim()
-  if (typeof rec.cause?.code === 'string' && rec.cause.code.trim()) return rec.cause.code.trim()
-  if (typeof rec.name === 'string' && rec.name.trim() && rec.name !== 'Error') return rec.name.trim()
-  return undefined
+function collectLeafTokens(v: unknown, out: Set<string>, d = 0): void {
+  if (d > 5 || out.size > 256 || v == null) return
+  if (typeof v === 'string') { const t = v.trim(); if (t.length > 0 && t.length <= 2048) out.add(t) }
+  else if (typeof v === 'number' || typeof v === 'boolean') out.add(String(v))
+  else if (Array.isArray(v)) for (const x of v) collectLeafTokens(x, out, d + 1)
+  else if (typeof v === 'object') for (const x of Object.values(v as Record<string, unknown>)) collectLeafTokens(x, out, d + 1)
 }
-
-function collectRetestLeaves(value: unknown, out: Set<string>, depth = 0): void {
-  if (depth > 5 || out.size > 256 || value == null) return
-  if (typeof value === 'string') {
-    const t = value.trim()
-    if (t.length > 0 && t.length <= 2048) out.add(t)
-  } else if (typeof value === 'number' || typeof value === 'boolean') {
-    out.add(String(value))
-  } else if (Array.isArray(value)) {
-    for (const item of value) collectRetestLeaves(item, out, depth + 1)
-  } else if (typeof value === 'object') {
-    for (const item of Object.values(value as Record<string, unknown>)) {
-      collectRetestLeaves(item, out, depth + 1)
-    }
-  }
-}
-
-function collectRetestHeaderTokens(headers: Record<string, string> | null | undefined, out: Set<string>): void {
+function collectHdrTokens(headers: Record<string, string> | null | undefined, out: Set<string>): void {
   if (!headers) return
   for (const raw of Object.values(headers)) {
-    const t = raw.trim()
-    if (!t) continue
-    out.add(t)
-    const scheme = /^(?:Bearer|Basic|Token|ApiKey)\s+(.+)$/i.exec(t)
-    if (scheme?.[1]) out.add(scheme[1].trim())
-    if (t.includes('=')) {
-      for (const part of t.split(';')) {
-        const eq = part.indexOf('=')
-        if (eq > 0 && part.slice(eq + 1).trim()) out.add(part.slice(eq + 1).trim())
-      }
-    }
+    const t = raw.trim(); if (!t) continue; out.add(t)
+    const m = /^(?:Bearer|Basic|Token|ApiKey)\s+(.+)$/i.exec(t); if (m?.[1]) out.add(m[1].trim())
+    if (t.includes('=')) for (const p of t.split(';')) { const eq = p.indexOf('='); if (eq > 0 && p.slice(eq + 1).trim()) out.add(p.slice(eq + 1).trim()) }
   }
 }
-
-function collectResponseDigests(entry: HostTranscriptEntry): Set<string> {
-  const digests = new Set<string>()
-  const leaves = new Set<string>()
-  for (const d of [...(entry.observedResponseDigests ?? []), ...(entry.step.secretMatches ?? [])]) {
-    digests.add(d.toLowerCase())
-  }
-  collectRetestLeaves(entry.step.json, leaves)
-  collectRetestHeaderTokens(entry.step.responseHeaders, leaves)
-  for (const leaf of leaves) digests.add(sha256Hex(leaf))
-  return digests
+function entryHasToken(e: HostTranscriptEntry, tok: string, withHdrs: boolean): boolean {
+  if (e.entityId === tok || e.correlationIds?.includes(tok) || (withHdrs && e.carrierText?.includes(tok))) return true
+  const path = e.step.pathAndQuery ?? e.step.route ?? ''
+  if (path && new RegExp(`(?:^|[/=?&])${tok.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:$|[/&?#])`).test(path)) return true
+  const leaves = new Set<string>(); collectLeafTokens(e.step.requestJson, leaves); collectLeafTokens(e.step.json, leaves)
+  if (withHdrs) { collectHdrTokens(e.step.requestHeaders, leaves); collectHdrTokens(e.step.responseHeaders, leaves) }
+  return withHdrs ? [...leaves].some(l => l === tok || l.includes(tok)) : leaves.has(tok)
 }
 
-function retestEntryMatchesEntity(entry: HostTranscriptEntry, entityId: string): boolean {
-  if (entry.entityId === entityId) return true
-  const path = entry.step.pathAndQuery ?? entry.step.route ?? ''
-  if (path && new RegExp(`(?:^|[/=?&])${entityId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:$|[/&?#])`).test(path)) {
-    return true
-  }
-  const leaves = new Set<string>()
-  collectRetestLeaves(entry.step.requestJson, leaves)
-  collectRetestLeaves(entry.step.json, leaves)
-  return leaves.has(entityId)
-}
-
-function retestEntryMatchesCorrelation(entry: HostTranscriptEntry, correlationId: string): boolean {
-  if (
-    entry.correlationIds?.includes(correlationId)
-    || entry.entityId === correlationId
-    || entry.carrierText?.includes(correlationId)
-  ) {
-    return true
-  }
-  const leaves = new Set<string>()
-  collectRetestLeaves(entry.step.requestJson, leaves)
-  collectRetestLeaves(entry.step.json, leaves)
-  collectRetestHeaderTokens(entry.step.requestHeaders, leaves)
-  collectRetestHeaderTokens(entry.step.responseHeaders, leaves)
-  for (const leaf of leaves) {
-    if (leaf === correlationId || leaf.includes(correlationId)) return true
-  }
-  return false
-}
-
-function inspectRecordsForTransportOrSignatureError(
-  records: {
-    entries?: readonly HostTranscriptEntry[]
-    oobEvents?: readonly HostOobEvent[]
-    browserTraces?: readonly HostBrowserTrace[]
-    asyncPollRecords?: readonly HostAsyncPollRecord[]
-  },
+function inspectRecordsForError(
+  rec: { entries?: readonly HostTranscriptEntry[]; oobEvents?: readonly HostOobEvent[]; browserTraces?: readonly HostBrowserTrace[]; asyncPollRecords?: readonly HostAsyncPollRecord[] },
   signingKey?: string,
 ): { failed: false } | { failed: true; reason: string; errorCode: string } {
-  for (const entry of records.entries ?? []) {
-    if (isTransportOrServerFailureStatus(entry.step.status)) {
-      const st = entry.step.status
-      return {
-        failed: true,
-        reason: `Exchange "${entry.exchangeId}" returned ${st === null || st === undefined ? 'no HTTP status' : `HTTP ${st}`} (transport/server failure; failing closed).`,
-        errorCode: typeof st === 'number' && st > 0 ? `HTTP_${st}` : 'TRANSPORT_NO_STATUS',
-      }
+  for (const e of rec.entries ?? []) {
+    if (isTransportOr5xx(e.step.status)) {
+      const st = e.step.status
+      return { failed: true, reason: `Exchange "${e.exchangeId}" returned ${st == null ? 'no HTTP status' : `HTTP ${st}`} (transport/server failure; failing closed).`, errorCode: typeof st === 'number' && st > 0 ? `HTTP_${st}` : 'TRANSPORT_NO_STATUS' }
     }
   }
   if (signingKey) {
-    const check = (list: readonly HostSignableRecord[] | undefined, label: string, idOf: (r: HostSignableRecord) => string) => {
-      for (const rec of list ?? []) {
-        if (!verifyHostRecordSignature(rec, signingKey)) {
-          return {
-            failed: true as const,
-            reason: `Host transcript signature verification failed on ${label} "${idOf(rec)}" (failing closed).`,
-            errorCode: 'HOST_SIGNATURE_INVALID',
-          }
-        }
-      }
-      return null
+    const checks: Array<[readonly HostSignableRecord[] | undefined, string, (r: HostSignableRecord) => string]> = [
+      [rec.entries, 'exchange', r => (r as HostTranscriptEntry).exchangeId], [rec.oobEvents, 'OOB event', r => (r as HostOobEvent).id],
+      [rec.browserTraces, 'browser trace', r => (r as HostBrowserTrace).id], [rec.asyncPollRecords, 'async poll record', r => (r as HostAsyncPollRecord).id],
+    ]
+    for (const [list, label, idOf] of checks) {
+      for (const item of list ?? []) if (!verifyHostRecordSignature(item, signingKey)) return { failed: true, reason: `Host transcript signature verification failed on ${label} "${idOf(item)}" (failing closed).`, errorCode: 'HOST_SIGNATURE_INVALID' }
     }
-    const sigErr =
-      check(records.entries, 'exchange', r => (r as HostTranscriptEntry).exchangeId)
-      ?? check(records.oobEvents, 'OOB event', r => (r as HostOobEvent).id)
-      ?? check(records.browserTraces, 'browser trace', r => (r as HostBrowserTrace).id)
-      ?? check(records.asyncPollRecords, 'async poll record', r => (r as HostAsyncPollRecord).id)
-    if (sigErr) return sigErr
   }
   return { failed: false }
 }
 
-function collectHopEmittedCapabilities(
-  entries: readonly HostTranscriptEntry[],
-  oobEvents: readonly HostOobEvent[],
-  browserTraces: readonly HostBrowserTrace[],
-  asyncPollRecords: readonly HostAsyncPollRecord[],
-): string[] {
-  const out = new Set<string>()
+function collectEmitted(entries: readonly HostTranscriptEntry[], oob: readonly HostOobEvent[], traces: readonly HostBrowserTrace[], polls: readonly HostAsyncPollRecord[], requireTs = false) {
+  const caps = new Set<string>(), digests = new Set<string>()
+  let hasTs = false
   for (const e of entries) {
-    for (const c of e.emittedCapabilities ?? []) out.add(c)
-    for (const a of e.cryptoAttestations ?? []) if (a.derivedCapabilityId) out.add(a.derivedCapabilityId)
+    if (requireTs && !isFiniteTs(e.timestampMs)) continue
+    hasTs = true
+    for (const c of e.emittedCapabilities ?? []) caps.add(c)
+    for (const a of e.cryptoAttestations ?? []) if (a.derivedCapabilityId) caps.add(a.derivedCapabilityId)
+    for (const d of [...(e.observedResponseDigests ?? []), ...(e.step.secretMatches ?? [])]) digests.add(d.toLowerCase())
+    const l = new Set<string>(); collectLeafTokens(e.step.json, l); collectHdrTokens(e.step.responseHeaders, l); for (const v of l) digests.add(sha256Hex(v))
   }
-  for (const o of oobEvents) for (const c of o.emittedCapabilities ?? []) out.add(c)
-  for (const t of browserTraces) for (const c of t.emittedCapabilities ?? []) out.add(c)
-  for (const p of asyncPollRecords) for (const c of p.emittedCapabilities ?? []) out.add(c)
-  return [...out]
+  for (const o of oob) {
+    if (requireTs && (!o.delivered || !isFiniteTs(o.receivedAtMs))) continue
+    hasTs = true; for (const c of o.emittedCapabilities ?? []) caps.add(c); for (const d of o.observedValueDigests ?? []) digests.add(d.toLowerCase()); if (o.token) digests.add(sha256Hex(o.token))
+  }
+  for (const t of traces) {
+    if (requireTs && !isFiniteTs(t.timestampMs)) continue
+    hasTs = true; for (const c of t.emittedCapabilities ?? []) caps.add(c); for (const d of t.observedValueDigests ?? []) digests.add(d.toLowerCase())
+  }
+  for (const p of polls) for (const c of p.emittedCapabilities ?? []) caps.add(c)
+  return { caps, digests, hasTs }
 }
 
-function collectHopConsumedCapabilities(entries: readonly HostTranscriptEntry[]): string[] {
-  const out = new Set<string>()
-  for (const e of entries) {
-    for (const c of e.consumedCapabilities ?? []) out.add(c)
-    for (const a of e.cryptoAttestations ?? []) out.add(a.derivedFromCapabilityId)
-  }
-  return [...out]
-}
-
-function classifyHopReplayOutcome(
-  hop: HopReceipt,
-  result: CompositeHopReplayResult,
-  signingKey?: string,
-): { outcome: CompositeHopReplayOutcome; reason?: string; errorCode?: string; blockedWith4xx: boolean } {
-  const entries = result.entries ?? []
-  const oobEvents = result.oobEvents ?? []
-  const browserTraces = result.browserTraces ?? []
-  const asyncPollRecords = result.asyncPollRecords ?? []
-
-  // Transport, server 5xx/429, auth setup, and host-signature failures ALWAYS take precedence (fail closed).
-  if (
-    result.outcome === 'transport_error'
-    || result.outcome === 'auth_setup_failed'
-    || result.outcome === 'inconclusive'
-  ) {
-    return {
-      outcome: result.outcome,
-      reason: result.reason ?? `Hop "${hop.hopId}" encountered ${result.outcome}.`,
-      errorCode: result.errorCode ?? result.outcome.toUpperCase(),
-      blockedWith4xx: false,
-    }
-  }
-  if (result.httpStatus !== undefined && isTransportOrServerFailureStatus(result.httpStatus)) {
-    return {
-      outcome: 'transport_error',
-      reason: result.reason ?? `Hop "${hop.hopId}" returned HTTP ${result.httpStatus ?? 'error'} (transport/server failure).`,
-      errorCode: result.errorCode ?? (result.httpStatus ? `HTTP_${result.httpStatus}` : 'TRANSPORT_ERROR'),
-      blockedWith4xx: false,
-    }
-  }
-  if (result.errorCode && TRANSPORT_ERROR_CODE_RE.test(result.errorCode)) {
-    return {
-      outcome: result.errorCode === 'AUTH_SETUP_FAILED' ? 'auth_setup_failed' : 'transport_error',
-      reason: result.reason ?? `Hop "${hop.hopId}" failed with ${result.errorCode}.`,
-      errorCode: result.errorCode,
-      blockedWith4xx: false,
-    }
-  }
-  const recErr = inspectRecordsForTransportOrSignatureError({ entries, oobEvents, browserTraces, asyncPollRecords }, signingKey)
-  if (recErr.failed) {
-    return { outcome: 'transport_error', reason: recErr.reason, errorCode: recErr.errorCode, blockedWith4xx: false }
-  }
-
-  if (result.outcome === 'precondition_changed') {
-    return {
-      outcome: 'precondition_changed',
-      reason: result.reason ?? `Target route or schema changed before/during hop "${hop.hopId}".`,
-      errorCode: result.errorCode ?? 'PRECONDITION_CHANGED',
-      blockedWith4xx: false,
-    }
-  }
-
-  const probeEntries = entries.filter(e => e.step.arm === 'probe' && e.replayAttempt !== 'ablation_control')
-  const probe4xx = probeEntries.length > 0 && probeEntries.every(e => isSecurityDenialStatus(e.step.status))
-  const result4xx = isSecurityDenialStatus(result.httpStatus)
-
-  if (result.outcome === 'blocked') {
-    const statuses = probeEntries.map(e => e.step.status).filter((s): s is number => typeof s === 'number')
-    const statusHint = statuses.length > 0 ? ` (HTTP ${statuses.join(', ')})` : result4xx ? ` (HTTP ${result.httpStatus})` : ''
-    return {
-      outcome: 'blocked',
-      reason: result.reason ?? `Hop "${hop.hopId}" was cleanly blocked by patched target${statusHint}.`,
-      errorCode: result.errorCode,
-      blockedWith4xx: probe4xx || result4xx,
-    }
-  }
-
-  // Implicit block detection: every probe exchange in the hop was denied (4xx non-429) and no side-channel/capability succeeded.
-  const emittedCaps = collectHopEmittedCapabilities(entries, oobEvents, browserTraces, asyncPollRecords)
-  const hasOob = oobEvents.some(o => o.delivered)
-  const hasTrace = browserTraces.some(t => (t.sinks?.length ?? 0) > 0 || (t.emittedCapabilities?.length ?? 0) > 0)
-  const hasPoll = asyncPollRecords.some(p => p.converged)
-
-  if (probe4xx && emittedCaps.length === 0 && !hasOob && !hasTrace && !hasPoll) {
-    const statuses = probeEntries.map(e => e.step.status).join(', ')
-    return {
-      outcome: 'blocked',
-      reason: result.reason ?? `Hop "${hop.hopId}" probe denied by patched target (HTTP ${statuses}).`,
-      errorCode: result.errorCode,
-      blockedWith4xx: true,
-    }
-  }
-
-  return { outcome: 'succeeded', reason: result.reason, errorCode: result.errorCode, blockedWith4xx: false }
-}
-
-function hopSatisfiesOutgoingProducerEdge(
-  edge: CausalEdgeBinding,
-  fromHop: HopReceipt,
-  artifacts: ReplayedHopArtifacts,
-): { ok: true } | { ok: false; reason: string } {
-  const hopEntries = artifacts.entries.filter(e => artifacts.exchangeIds.includes(e.exchangeId))
-  const hopOob = artifacts.oobEvents.filter(o => artifacts.oobEventIds.includes(o.id))
-  const hopTraces = artifacts.browserTraces.filter(t => artifacts.browserTraceIds.includes(t.id))
-
+function checkProducerEdge(edge: CausalEdgeBinding, fromHop: HopReceipt, art: HopArt): { ok: true } | { ok: false; reason: string } {
+  const he = art.entries.filter(e => art.exchangeIds.includes(e.exchangeId)), ho = art.oobEvents.filter(o => art.oobEventIds.includes(o.id)), ht = art.browserTraces.filter(t => art.browserTraceIds.includes(t.id))
+  const { caps, digests, hasTs } = collectEmitted(he, ho, ht, [], true)
   if (edge.kind === 'value_binding') {
-    const emittedCaps = new Set<string>()
-    const digests = new Set<string>()
-    let hasTimestampedOutput = false
-    for (const e of hopEntries) {
-      if (!isFiniteTimestamp(e.timestampMs)) continue
-      hasTimestampedOutput = true
-      for (const c of e.emittedCapabilities ?? []) emittedCaps.add(c)
-      for (const a of e.cryptoAttestations ?? []) if (a.derivedCapabilityId) emittedCaps.add(a.derivedCapabilityId)
-      for (const d of collectResponseDigests(e)) digests.add(d)
-    }
-    for (const o of hopOob) {
-      if (!o.delivered || !isFiniteTimestamp(o.receivedAtMs)) continue
-      hasTimestampedOutput = true
-      for (const c of o.emittedCapabilities ?? []) emittedCaps.add(c)
-      for (const d of o.observedValueDigests ?? []) digests.add(d.toLowerCase())
-      if (o.token) digests.add(sha256Hex(o.token))
-    }
-    for (const t of hopTraces) {
-      if (!isFiniteTimestamp(t.timestampMs)) continue
-      hasTimestampedOutput = true
-      for (const c of t.emittedCapabilities ?? []) emittedCaps.add(c)
-      for (const d of t.observedValueDigests ?? []) digests.add(d.toLowerCase())
-    }
-    if (!hasTimestampedOutput) {
-      return { ok: false, reason: `Hop "${fromHop.hopId}" produced no host-timestamped output for value_binding to "${edge.toHopId}".` }
-    }
-    if (edge.capabilityHandle && !emittedCaps.has(edge.capabilityHandle)) {
-      return { ok: false, reason: `Hop "${fromHop.hopId}" no longer emits required capability "${edge.capabilityHandle}" for "${edge.toHopId}".` }
-    }
-    if (edge.valueDigest && !digests.has(edge.valueDigest.toLowerCase())) {
-      return { ok: false, reason: `Hop "${fromHop.hopId}" no longer emits required value digest for "${edge.toHopId}".` }
-    }
+    if (!hasTs) return { ok: false, reason: `Hop "${fromHop.hopId}" produced no host-timestamped output for value_binding to "${edge.toHopId}".` }
+    if (edge.capabilityHandle && !caps.has(edge.capabilityHandle)) return { ok: false, reason: `Hop "${fromHop.hopId}" no longer emits required capability "${edge.capabilityHandle}" for "${edge.toHopId}".` }
+    if (edge.valueDigest && !digests.has(edge.valueDigest.toLowerCase())) return { ok: false, reason: `Hop "${fromHop.hopId}" no longer emits required value digest for "${edge.toHopId}".` }
     return { ok: true }
   }
-
-  if (edge.kind === 'derived_crypto_binding') {
-    const emittedCaps = new Set<string>()
-    for (const e of hopEntries) {
-      if (!isFiniteTimestamp(e.timestampMs)) continue
-      for (const c of e.emittedCapabilities ?? []) emittedCaps.add(c)
-      for (const a of e.cryptoAttestations ?? []) if (a.derivedCapabilityId) emittedCaps.add(a.derivedCapabilityId)
-    }
-    for (const o of hopOob) {
-      if (o.delivered && isFiniteTimestamp(o.receivedAtMs)) {
-        for (const c of o.emittedCapabilities ?? []) emittedCaps.add(c)
-      }
-    }
-    for (const t of hopTraces) {
-      if (isFiniteTimestamp(t.timestampMs)) {
-        for (const c of t.emittedCapabilities ?? []) emittedCaps.add(c)
-      }
-    }
-    if (!emittedCaps.has(edge.sourceCapabilityId)) {
-      return { ok: false, reason: `Hop "${fromHop.hopId}" no longer emits signing material "${edge.sourceCapabilityId}" for derived_crypto_binding to "${edge.toHopId}".` }
-    }
-    return { ok: true }
-  }
-
-  if (edge.kind === 'state_transition_binding') {
-    const okMutation = hopEntries.some(
-      e => is2xxStatus(e.step.status) && isFiniteTimestamp(e.timestampMs) && retestEntryMatchesEntity(e, edge.entityId),
-    )
-    if (!okMutation) {
-      return { ok: false, reason: `Hop "${fromHop.hopId}" no longer succeeds on shared entity "${edge.entityId}" for state_transition_binding to "${edge.toHopId}".` }
-    }
-    return { ok: true }
-  }
-
-  // async_pivot_binding
-  const triggered =
-    hopEntries.some(e => is2xxStatus(e.step.status) && isFiniteTimestamp(e.timestampMs) && retestEntryMatchesCorrelation(e, edge.correlationId))
-    || hopTraces.some(t => isFiniteTimestamp(t.timestampMs) && (t.correlationIds?.includes(edge.correlationId) ?? false))
-  if (!triggered) {
-    return { ok: false, reason: `Hop "${fromHop.hopId}" no longer produces async trigger "${edge.correlationId}" for "${edge.toHopId}".` }
-  }
-  return { ok: true }
+  if (edge.kind === 'derived_crypto_binding') return caps.has(edge.sourceCapabilityId) ? { ok: true } : { ok: false, reason: `Hop "${fromHop.hopId}" no longer emits signing material "${edge.sourceCapabilityId}" for derived_crypto_binding to "${edge.toHopId}".` }
+  if (edge.kind === 'state_transition_binding') return he.some(e => is2xx(e.step.status) && isFiniteTs(e.timestampMs) && entryHasToken(e, edge.entityId, false)) ? { ok: true } : { ok: false, reason: `Hop "${fromHop.hopId}" no longer succeeds on shared entity "${edge.entityId}" for state_transition_binding to "${edge.toHopId}".` }
+  return (he.some(e => is2xx(e.step.status) && isFiniteTs(e.timestampMs) && entryHasToken(e, edge.correlationId, true)) || ht.some(t => isFiniteTs(t.timestampMs) && (t.correlationIds?.includes(edge.correlationId) ?? false)))
+    ? { ok: true } : { ok: false, reason: `Hop "${fromHop.hopId}" no longer produces async trigger "${edge.correlationId}" for "${edge.toHopId}".` }
 }
 
-function selectBrokeEdgeForBlockedHop(
-  hopId: string,
-  blockedWith4xx: boolean,
-  dag: CompositeDagLayout,
-): CompositeBrokeCausalEdge | null {
-  const incoming = dag.incomingByHop.get(hopId) ?? []
-  const outgoing = dag.outgoingByHop.get(hopId) ?? []
-  const chosen = blockedWith4xx
-    ? (incoming[0] ?? outgoing[0])
-    : (outgoing[0] ?? incoming[0])
-  if (!chosen) return null
-  return {
-    edgeIndex: chosen.edgeIndex,
-    kind: chosen.edge.kind,
-    fromHopId: chosen.edge.fromHopId,
-    toHopId: chosen.edge.toHopId,
-  }
+const errCodeOf = (err: unknown): string | undefined => {
+  if (!err || typeof err !== 'object') return undefined
+  const r = err as { code?: unknown; name?: unknown; cause?: { code?: unknown } }
+  return typeof r.code === 'string' && r.code.trim() ? r.code.trim() : typeof r.cause?.code === 'string' && r.cause.code.trim() ? r.cause.code.trim() : typeof r.name === 'string' && r.name.trim() && r.name !== 'Error' ? r.name.trim() : undefined
 }
+const emptyHopSummary = (hopId: string, surface: HopSurface, outcome: CompositeHopReplaySummary['outcome'], reason?: string, errorCode?: string): CompositeHopReplaySummary =>
+  ({ hopId, surface, outcome, httpStatuses: [], exchangeIds: [], oobEventIds: [], browserTraceIds: [], emittedCapabilities: [], consumedCapabilities: [], ...(reason ? { reason } : {}), ...(errorCode ? { errorCode } : {}) })
 
-function buildReplayedCompositeReceipt(
-  receipt: CompositeProofReceipt,
-  dag: CompositeDagLayout,
-  hopArtifacts: ReadonlyMap<string, ReplayedHopArtifacts>,
-  allEntriesById: ReadonlyMap<string, HostTranscriptEntry>,
-  allOobById: ReadonlyMap<string, HostOobEvent>,
-  allTracesById: ReadonlyMap<string, HostBrowserTrace>,
-  allPollsById: ReadonlyMap<string, HostAsyncPollRecord>,
-  extraPreChainControlIds: readonly string[],
-  extraPostChainReadbackIds: readonly string[],
-): CompositeProofReceipt {
-  const exchangeIdMap = new Map<string, string>()
-  const oobIdMap = new Map<string, string>()
-  const traceIdMap = new Map<string, string>()
+export async function retestCompositeChainPatch(params: RetestCompositeChainParams): Promise<CompositePatchRetestProof> {
+  const retestId = params.retestId ?? randomUUID(), testedAt = () => new Date((params.now ?? Date.now)()).toISOString()
+  const finalize = (chainId: string, terminalVulnClass: string, terminalHopId: string, verdict: CompositePatchRetestVerdict, summary: string, opts: {
+    topoOrder?: string[]; hopResults?: CompositeHopReplaySummary[]; exchangeIds?: string[]; patchBrokeHopId?: string | null
+    brokeCausalEdge?: CompositeBrokeCausalEdge | null; brokeReason?: string | null; benignPrefixHops?: string[]; compositeVerification?: CompositeReceiptVerification
+  } = {}): CompositePatchRetestProof => {
+    const isFixed = verdict === 'fixed'
+    const base: Omit<CompositePatchRetestProof, 'proofSha256'> = {
+      schemaVersion: 1, retestId, chainId, terminalVulnClass, terminalHopId, verdict, patchClosed: isFixed,
+      patchBrokeHopId: isFixed ? (opts.patchBrokeHopId ?? null) : null, brokeCausalEdge: isFixed ? (opts.brokeCausalEdge ?? null) : null,
+      brokeReason: isFixed && opts.brokeReason ? redact(opts.brokeReason, params.secrets) : null,
+      benignPrefixHops: isFixed ? [...(opts.benignPrefixHops ?? [])] : [], topoOrder: [...(opts.topoOrder ?? [])],
+      hopResults: (opts.hopResults ?? []).map(hr => ({ ...hr, ...(hr.reason !== undefined ? { reason: redact(hr.reason, params.secrets) } : {}) })),
+      exchangeIds: [...new Set(opts.exchangeIds ?? [])], summary: redact(summary, params.secrets),
+      ...(opts.compositeVerification ? { compositeVerification: opts.compositeVerification } : {}),
+      ...(params.targetRevision ? { targetRevision: params.targetRevision } : {}), ...(params.patchId ? { patchId: params.patchId } : {}),
+      testedAt: testedAt(),
+    }
+    return { ...base, proofSha256: computeCompositeRetestProofDigest(base) }
+  }
 
-  const replayedHops: HopReceipt[] = receipt.hops.map(hop => {
-    const art = hopArtifacts.get(hop.hopId)
-    if (!art) return hop
-    if (hop.exchangeIds.length === art.exchangeIds.length) {
-      for (let i = 0; i < hop.exchangeIds.length; i += 1) {
-        exchangeIdMap.set(hop.exchangeIds[i]!, art.exchangeIds[i]!)
+  const parsed = compositeProofReceiptSchema.safeParse(params.receipt)
+  if (!parsed.success) {
+    const issue = parsed.error.issues[0]
+    return finalize('invalid', 'invalid', 'invalid', 'inconclusive', `Composite patch retest inconclusive: Invalid CompositeProofReceipt schema: ${issue?.path.join('.') || 'receipt'} ${issue?.message ?? ''}`.trim())
+  }
+  const receipt = parsed.data, dagRes = buildCompositeDag(receipt)
+  if (!dagRes.ok) return finalize(receipt.chainId, receipt.terminalVulnClass, receipt.terminalImpact.terminalHopId, 'inconclusive', `Composite patch retest inconclusive: invalid DAG topology (${dagRes.reason})`)
+
+  const { dag } = dagRes, signingKey = params.verifyOptions?.signingKey
+  const allEntries: HostTranscriptEntry[] = [], allOob: HostOobEvent[] = [], allTraces: HostBrowserTrace[] = [], allPolls: HostAsyncPollRecord[] = []
+  const extraPreCtrl: string[] = [], extraPostRb: string[] = [], hopResults: CompositeHopReplaySummary[] = []
+  const priorHops: Record<string, CompositeHopReplaySummary> = {}, hopArtifacts = new Map<string, HopArt>(), availCaps = new Set<string>()
+  const emit = (verdict: CompositePatchRetestVerdict, summary: string, extra: Parameters<typeof finalize>[5] = {}) =>
+    finalize(receipt.chainId, receipt.terminalVulnClass, receipt.terminalImpact.terminalHopId, verdict, summary, { topoOrder: dag.topoOrder, hopResults, exchangeIds: allEntries.map(e => e.exchangeId), ...extra })
+
+  if (params.signal?.aborted) return emit('inconclusive', 'Composite patch retest inconclusive: aborted during initialization.')
+
+  if (params.runner.preparePreconditions) {
+    let setup: CompositePreconditionSetupResult
+    try { setup = await params.runner.preparePreconditions({ receipt, topoOrder: dag.topoOrder, signal: params.signal }) }
+    catch (err) { const c = errCodeOf(err); return emit('inconclusive', `Composite patch retest inconclusive: pre-chain setup failed${c ? ` (${c})` : ''}: ${err instanceof Error ? err.message : String(err)}`) }
+    if (setup.entries) allEntries.push(...setup.entries); if (setup.oobEvents) allOob.push(...setup.oobEvents); if (setup.browserTraces) allTraces.push(...setup.browserTraces); if (setup.asyncPollRecords) allPolls.push(...setup.asyncPollRecords)
+    if (setup.preChainControlExchangeIds) extraPreCtrl.push(...setup.preChainControlExchangeIds)
+    const recErr = inspectRecordsForError(setup, signingKey)
+    if (setup.status === 'transport_error' || setup.status === 'auth_setup_failed' || setup.status === 'inconclusive' || (setup.httpStatus !== undefined && isTransportOr5xx(setup.httpStatus)) || recErr.failed) {
+      return emit('inconclusive', `Composite patch retest inconclusive: ${setup.reason ?? (recErr.failed ? recErr.reason : `Pre-chain setup returned "${setup.status}".`)}`)
+    }
+    if (setup.status === 'precondition_changed') return emit('precondition_changed', `Composite patch retest precondition changed: ${setup.reason ?? 'Target route or schema changed.'}`)
+  }
+
+  for (let hopIndex = 0; hopIndex < dag.topoOrder.length; hopIndex += 1) {
+    const hopId = dag.topoOrder[hopIndex]!, hop = dag.hopsById.get(hopId)!
+    if (params.signal?.aborted) return emit('inconclusive', `Composite patch retest inconclusive: aborted during hop "${hopId}".`)
+    let rawResult: CompositeHopReplayResult
+    try {
+      rawResult = await params.runner.replayHop({
+        receipt, hop, hopIndex, topoOrder: dag.topoOrder, incomingEdges: (dag.incomingByHop.get(hopId) ?? []).map(x => x.edge),
+        outgoingEdges: (dag.outgoingByHop.get(hopId) ?? []).map(x => x.edge), availableCapabilities: [...availCaps], priorHopResults: { ...priorHops },
+        transcriptSoFar: { entries: [...allEntries], oobEvents: [...allOob], browserTraces: [...allTraces], asyncPollRecords: [...allPolls] }, signal: params.signal,
+      })
+    } catch (err) {
+      const code = errCodeOf(err), msg = err instanceof Error ? err.message : String(err)
+      hopResults.push(emptyHopSummary(hopId, hop.surface, 'transport_error', msg, code))
+      return emit('inconclusive', `Composite patch retest inconclusive at hop "${hopId}"${code ? ` (${code})` : ''}: ${msg}`)
+    }
+
+    const entries = [...(rawResult.entries ?? [])], oob = [...(rawResult.oobEvents ?? [])], traces = [...(rawResult.browserTraces ?? [])], polls = [...(rawResult.asyncPollRecords ?? [])]
+    allEntries.push(...entries); allOob.push(...oob); allTraces.push(...traces); allPolls.push(...polls)
+    if (rawResult.preChainControlExchangeIds) extraPreCtrl.push(...rawResult.preChainControlExchangeIds)
+    if (rawResult.postChainReadbackExchangeIds) extraPostRb.push(...rawResult.postChainReadbackExchangeIds)
+
+    const eSet = new Set(entries.map(e => e.exchangeId)), oSet = new Set(oob.map(o => o.id)), tSet = new Set(traces.map(t => t.id))
+    const hopExIds = rawResult.replayedExchangeIds ? [...rawResult.replayedExchangeIds] : (hop.exchangeIds.length && hop.exchangeIds.every(id => eSet.has(id)) ? [...hop.exchangeIds] : entries.filter(e => e.replayAttempt !== 'ablation_control').map(e => e.exchangeId))
+    const hopOobIds = rawResult.replayedOobEventIds ? [...rawResult.replayedOobEventIds] : (hop.oobEventIds.length && hop.oobEventIds.every(id => oSet.has(id)) ? [...hop.oobEventIds] : oob.map(o => o.id))
+    const hopTraceIds = rawResult.replayedBrowserTraceIds ? [...rawResult.replayedBrowserTraceIds] : (hop.browserTraceIds.length && hop.browserTraceIds.every(id => tSet.has(id)) ? [...hop.browserTraceIds] : traces.map(t => t.id))
+
+    const emittedCaps = [...collectEmitted(entries, oob, traces, polls).caps]
+    const consumedCaps = [...new Set(entries.flatMap(e => [...(e.consumedCapabilities ?? []), ...(e.cryptoAttestations ?? []).map(a => a.derivedFromCapabilityId)]))]
+    const recErr = inspectRecordsForError({ entries, oobEvents: oob, browserTraces: traces, asyncPollRecords: polls }, signingKey)
+
+    let outcome: CompositeHopReplayOutcome = 'succeeded', reason = rawResult.reason, errorCode = rawResult.errorCode, blockedWith4xx = false
+    if (rawResult.outcome === 'transport_error' || rawResult.outcome === 'auth_setup_failed' || rawResult.outcome === 'inconclusive') {
+      outcome = rawResult.outcome; reason ??= `Hop "${hopId}" encountered ${outcome}.`; errorCode ??= outcome.toUpperCase()
+    } else if (rawResult.httpStatus !== undefined && isTransportOr5xx(rawResult.httpStatus)) {
+      outcome = 'transport_error'; reason ??= `Hop "${hopId}" returned HTTP ${rawResult.httpStatus ?? 'error'}.`; errorCode ??= rawResult.httpStatus ? `HTTP_${rawResult.httpStatus}` : 'TRANSPORT_ERROR'
+    } else if (rawResult.errorCode && TRANSPORT_ERR_RE.test(rawResult.errorCode)) {
+      outcome = rawResult.errorCode === 'AUTH_SETUP_FAILED' ? 'auth_setup_failed' : 'transport_error'; reason ??= `Hop "${hopId}" failed with ${rawResult.errorCode}.`
+    } else if (recErr.failed) {
+      outcome = 'transport_error'; reason = recErr.reason; errorCode = recErr.errorCode
+    } else if (rawResult.outcome === 'precondition_changed') {
+      outcome = 'precondition_changed'; reason ??= `Target route or schema changed before/during hop "${hopId}".`; errorCode ??= 'PRECONDITION_CHANGED'
+    } else {
+      const probes = entries.filter(e => e.step.arm === 'probe' && e.replayAttempt !== 'ablation_control')
+      const probe4xx = probes.length > 0 && probes.every(e => isSecurity4xx(e.step.status))
+      const hasEffect = emittedCaps.length > 0 || oob.some(o => o.delivered) || traces.some(t => (t.sinks?.length ?? 0) > 0 || (t.emittedCapabilities?.length ?? 0) > 0) || polls.some(p => p.converged)
+      if (rawResult.outcome === 'blocked' || (probe4xx && !hasEffect)) {
+        outcome = 'blocked'; blockedWith4xx = probe4xx || isSecurity4xx(rawResult.httpStatus)
+        const stList = probes.map(e => e.step.status).filter((s): s is number => typeof s === 'number').join(', ')
+        reason ??= `Hop "${hopId}" blocked by patched target${stList ? ` (HTTP ${stList})` : ''}.`
       }
     }
-    if (hop.oobEventIds.length === art.oobEventIds.length) {
-      for (let i = 0; i < hop.oobEventIds.length; i += 1) {
-        oobIdMap.set(hop.oobEventIds[i]!, art.oobEventIds[i]!)
+
+    const httpStatuses = entries.map(e => e.step.status).filter((s): s is number => typeof s === 'number' && Number.isFinite(s))
+    if (!httpStatuses.length && typeof rawResult.httpStatus === 'number' && Number.isFinite(rawResult.httpStatus)) httpStatuses.push(rawResult.httpStatus)
+    const summaryRec: CompositeHopReplaySummary = { hopId, surface: hop.surface, outcome, httpStatuses, exchangeIds: hopExIds, oobEventIds: hopOobIds, browserTraceIds: hopTraceIds, emittedCapabilities: emittedCaps, consumedCapabilities: consumedCaps, ...(reason ? { reason } : {}), ...(errorCode ? { errorCode } : {}) }
+    hopResults.push(summaryRec); priorHops[hopId] = summaryRec
+    const art: HopArt = { exchangeIds: hopExIds, oobEventIds: hopOobIds, browserTraceIds: hopTraceIds, entries, oobEvents: oob, browserTraces: traces, asyncPollRecords: polls, ablationByEdge: rawResult.replayedAblationExchangeIds ? { ...rawResult.replayedAblationExchangeIds } : {}, pollByEdge: rawResult.replayedPollRecordIds ? { ...rawResult.replayedPollRecordIds } : {} }
+    hopArtifacts.set(hopId, art)
+
+    if (outcome === 'transport_error' || outcome === 'auth_setup_failed' || outcome === 'inconclusive') return emit('inconclusive', `Composite patch retest inconclusive at hop "${hopId}": ${reason ?? outcome}`)
+    if (outcome === 'precondition_changed') return emit('precondition_changed', `Composite patch retest precondition changed at hop "${hopId}": ${reason ?? 'target route/schema drifted'}`)
+
+    const skipRest = () => { for (let j = hopIndex + 1; j < dag.topoOrder.length; j += 1) { const rid = dag.topoOrder[j]!; hopResults.push(emptyHopSummary(rid, dag.hopsById.get(rid)!.surface, 'skipped_after_break', `Skipped because predecessor hop "${hopId}" broke the chain.`)) } }
+    const benignPrefix = dag.topoOrder.slice(0, hopIndex).filter(id => priorHops[id]?.outcome === 'succeeded')
+    const pNote = benignPrefix.length ? ` (benign prefix succeeded: ${benignPrefix.join(' -> ')})` : ''
+
+    if (outcome === 'blocked') {
+      skipRest()
+      const inc = dag.incomingByHop.get(hopId) ?? [], outg = dag.outgoingByHop.get(hopId) ?? []
+      const ch = blockedWith4xx ? (inc[0] ?? outg[0]) : (outg[0] ?? inc[0])
+      const brokeReason = reason ?? `Hop "${hopId}" was blocked by the patched target.`
+      return emit('fixed', `Fixed: multi-hop chain broke cleanly at "${hopId}"${pNote}: ${brokeReason}`, { patchBrokeHopId: hopId, brokeCausalEdge: ch ? { edgeIndex: ch.edgeIndex, kind: ch.edge.kind, fromHopId: ch.edge.fromHopId, toHopId: ch.edge.toHopId } : null, brokeReason, benignPrefixHops: benignPrefix })
+    }
+    for (const oe of dag.outgoingByHop.get(hopId) ?? []) {
+      const check = checkProducerEdge(oe.edge, hop, art)
+      if (!check.ok) {
+        summaryRec.outcome = 'blocked'; summaryRec.reason = check.reason; skipRest()
+        return emit('fixed', `Fixed: multi-hop chain broke cleanly at "${hopId}"${pNote}: ${check.reason}`, { patchBrokeHopId: hopId, brokeCausalEdge: { edgeIndex: oe.edgeIndex, kind: oe.edge.kind, fromHopId: oe.edge.fromHopId, toHopId: oe.edge.toHopId }, brokeReason: check.reason, benignPrefixHops: benignPrefix })
       }
     }
-    if (hop.browserTraceIds.length === art.browserTraceIds.length) {
-      for (let i = 0; i < hop.browserTraceIds.length; i += 1) {
-        traceIdMap.set(hop.browserTraceIds[i]!, art.browserTraceIds[i]!)
-      }
-    }
-    return {
-      ...hop,
-      exchangeIds: art.exchangeIds,
-      oobEventIds: art.oobEventIds,
-      browserTraceIds: art.browserTraceIds,
-    }
+    for (const cap of emittedCaps) availCaps.add(cap)
+  }
+
+  if (params.runner.readbackTerminalState) {
+    if (params.signal?.aborted) return emit('inconclusive', 'Composite patch retest inconclusive: aborted during terminal readback.')
+    try {
+      const rb = await params.runner.readbackTerminalState({ receipt, transcriptSoFar: { entries: [...allEntries], oobEvents: [...allOob], browserTraces: [...allTraces], asyncPollRecords: [...allPolls] }, signal: params.signal })
+      if (rb.entries) allEntries.push(...rb.entries); if (rb.postChainReadbackExchangeIds) extraPostRb.push(...rb.postChainReadbackExchangeIds)
+      const rbErr = inspectRecordsForError({ entries: rb.entries }, signingKey)
+      if (rb.status === 'transport_error' || rb.status === 'inconclusive' || (rb.httpStatus !== undefined && isTransportOr5xx(rb.httpStatus)) || rbErr.failed) return emit('inconclusive', `Composite patch retest inconclusive during terminal readback: ${rb.reason ?? (rbErr.failed ? rbErr.reason : 'Terminal readback failed.')}`)
+      if (rb.status === 'precondition_changed') return emit('precondition_changed', `Composite patch retest precondition changed during terminal readback: ${rb.reason ?? 'schema/route changed'}`)
+    } catch (err) { const c = errCodeOf(err); return emit('inconclusive', `Composite patch retest inconclusive during terminal readback${c ? ` (${c})` : ''}: ${err instanceof Error ? err.message : String(err)}`) }
+  }
+
+  const exById = new Map(allEntries.map(e => [e.exchangeId, e])), oobById = new Map(allOob.map(o => [o.id, o])), trById = new Map(allTraces.map(t => [t.id, t])), pollById = new Map(allPolls.map(p => [p.id, p]))
+  const exMap = new Map<string, string>(), oobMap = new Map<string, string>(), trMap = new Map<string, string>()
+  const replayedHops = receipt.hops.map(h => {
+    const a = hopArtifacts.get(h.hopId); if (!a) return h
+    if (h.exchangeIds.length === a.exchangeIds.length) h.exchangeIds.forEach((id, i) => exMap.set(id, a.exchangeIds[i]!))
+    if (h.oobEventIds.length === a.oobEventIds.length) h.oobEventIds.forEach((id, i) => oobMap.set(id, a.oobEventIds[i]!))
+    if (h.browserTraceIds.length === a.browserTraceIds.length) h.browserTraceIds.forEach((id, i) => trMap.set(id, a.browserTraceIds[i]!))
+    return { ...h, exchangeIds: a.exchangeIds, oobEventIds: a.oobEventIds, browserTraceIds: a.browserTraceIds }
   })
-
-  const remapEx = (id: string): string => (allEntriesById.has(id) ? id : (exchangeIdMap.get(id) ?? id))
-  const remapOob = (id: string): string => (allOobById.has(id) ? id : (oobIdMap.get(id) ?? id))
-  const remapTrace = (id: string): string => (allTracesById.has(id) ? id : (traceIdMap.get(id) ?? id))
+  const remapEx = (id: string) => exById.has(id) ? id : (exMap.get(id) ?? id), remapOob = (id: string) => oobById.has(id) ? id : (oobMap.get(id) ?? id), remapTr = (id: string) => trById.has(id) ? id : (trMap.get(id) ?? id)
 
   const replayedEdges: CausalEdgeBinding[] = receipt.causalEdges.map(edge => {
-    const edgeKey = `${edge.fromHopId}->${edge.toHopId}`
-    const typedEdgeKey = `${edgeKey}:${edge.kind}`
-    const toArt = hopArtifacts.get(edge.toHopId)
-
+    const k = `${edge.fromHopId}->${edge.toHopId}`, tk = `${k}:${edge.kind}`, toArt = hopArtifacts.get(edge.toHopId)
     if (edge.kind === 'value_binding') {
-      const src = edge.sourceExchangeId
-        ? (allEntriesById.has(edge.sourceExchangeId) ? edge.sourceExchangeId : exchangeIdMap.get(edge.sourceExchangeId))
-        : undefined
-      const tgt = edge.targetExchangeId
-        ? (allEntriesById.has(edge.targetExchangeId) ? edge.targetExchangeId : exchangeIdMap.get(edge.targetExchangeId))
-        : undefined
-      return {
-        ...edge,
-        ...(src ? { sourceExchangeId: src } : { sourceExchangeId: undefined }),
-        ...(tgt ? { targetExchangeId: tgt } : { targetExchangeId: undefined }),
-      }
+      const src = edge.sourceExchangeId ? (exById.has(edge.sourceExchangeId) ? edge.sourceExchangeId : exMap.get(edge.sourceExchangeId)) : undefined
+      const tgt = edge.targetExchangeId ? (exById.has(edge.targetExchangeId) ? edge.targetExchangeId : exMap.get(edge.targetExchangeId)) : undefined
+      return { ...edge, sourceExchangeId: src, targetExchangeId: tgt }
     }
     if (edge.kind === 'state_transition_binding') {
-      const explicitAblation = toArt?.ablationByEdge[typedEdgeKey] ?? toArt?.ablationByEdge[edgeKey]
-      let ablationIds: string[]
-      if (explicitAblation && explicitAblation.length > 0) {
-        ablationIds = [...explicitAblation]
-      } else if (edge.ablationExchangeIds.every(id => allEntriesById.has(id))) {
-        ablationIds = [...edge.ablationExchangeIds]
-      } else {
-        const inferred = (toArt?.entries ?? [])
-          .filter(e => e.replayAttempt === 'ablation_control')
-          .map(e => e.exchangeId)
-        ablationIds = inferred.length > 0 ? inferred : edge.ablationExchangeIds.map(remapEx)
-      }
-      return { ...edge, ablationExchangeIds: ablationIds }
+      const exp = toArt?.ablationByEdge[tk] ?? toArt?.ablationByEdge[k], inf = (toArt?.entries ?? []).filter(e => e.replayAttempt === 'ablation_control').map(e => e.exchangeId)
+      return { ...edge, ablationExchangeIds: exp?.length ? [...exp] : edge.ablationExchangeIds.every(id => exById.has(id)) ? [...edge.ablationExchangeIds] : (inf.length ? inf : edge.ablationExchangeIds.map(remapEx)) }
     }
     if (edge.kind === 'async_pivot_binding') {
-      const explicitPoll = toArt?.pollByEdge[typedEdgeKey] ?? toArt?.pollByEdge[edgeKey]
-      const pollRecordId = explicitPoll
-        ?? (edge.pollRecordId
-          ? (allPollsById.has(edge.pollRecordId) ? edge.pollRecordId : toArt?.asyncPollRecords[0]?.id ?? edge.pollRecordId)
-          : undefined)
-      return {
-        ...edge,
-        ...(edge.oobEventId ? { oobEventId: remapOob(edge.oobEventId) } : {}),
-        ...(edge.browserTraceId ? { browserTraceId: remapTrace(edge.browserTraceId) } : {}),
-        ...(pollRecordId ? { pollRecordId } : {}),
-      }
+      const pollRecordId = toArt?.pollByEdge[tk] ?? toArt?.pollByEdge[k] ?? (edge.pollRecordId ? (pollById.has(edge.pollRecordId) ? edge.pollRecordId : toArt?.asyncPollRecords[0]?.id ?? edge.pollRecordId) : undefined)
+      return { ...edge, ...(edge.oobEventId ? { oobEventId: remapOob(edge.oobEventId) } : {}), ...(edge.browserTraceId ? { browserTraceId: remapTr(edge.browserTraceId) } : {}), ...(pollRecordId ? { pollRecordId } : {}) }
     }
     return edge
   })
 
   const ti = receipt.terminalImpact
-  const preChainIds = extraPreChainControlIds.length > 0
-    ? [...new Set(extraPreChainControlIds)]
-    : ti.preChainControlExchangeIds.map(remapEx).filter(id => allEntriesById.has(id))
-  const postChainIds = extraPostChainReadbackIds.length > 0
-    ? [...new Set(extraPostChainReadbackIds)]
-    : ti.postChainReadbackExchangeIds.map(remapEx).filter(id => allEntriesById.has(id))
-
-  const remappedTerminalProof = ti.proofReceipt
-    ? {
-        ...ti.proofReceipt,
-        exchangeIds: ti.proofReceipt.exchangeIds.map(remapEx),
-        oobEventIds: ti.proofReceipt.oobEventIds.map(remapOob),
-        browserTraceIds: ti.proofReceipt.browserTraceIds.map(remapTrace),
-      }
-    : undefined
-
-  void dag
-  return {
-    ...receipt,
-    hops: replayedHops,
-    causalEdges: replayedEdges,
+  const replayedReceipt: CompositeProofReceipt = {
+    ...receipt, hops: replayedHops, causalEdges: replayedEdges, replayMode: 'fresh_clean_replay',
     terminalImpact: {
-      ...ti,
-      preChainControlExchangeIds: preChainIds,
-      postChainReadbackExchangeIds: postChainIds,
-      ...(remappedTerminalProof ? { proofReceipt: remappedTerminalProof } : {}),
-      modeAFailureExchangeId: undefined,
+      ...ti, modeAFailureExchangeId: undefined,
+      preChainControlExchangeIds: extraPreCtrl.length ? [...new Set(extraPreCtrl)] : ti.preChainControlExchangeIds.map(remapEx).filter(id => exById.has(id)),
+      postChainReadbackExchangeIds: extraPostRb.length ? [...new Set(extraPostRb)] : ti.postChainReadbackExchangeIds.map(remapEx).filter(id => exById.has(id)),
+      ...(ti.proofReceipt ? { proofReceipt: { ...ti.proofReceipt, exchangeIds: ti.proofReceipt.exchangeIds.map(remapEx), oobEventIds: ti.proofReceipt.oobEventIds.map(remapOob), browserTraceIds: ti.proofReceipt.browserTraceIds.map(remapTr) } } : {}),
     },
-    replayMode: 'fresh_clean_replay',
   }
-}
+  const verification = verifyCompositeReceipt(replayedReceipt, { entries: allEntries, oobEvents: allOob, browserTraces: allTraces, asyncPollRecords: allPolls }, params.verifyOptions)
 
-function finalizeCompositeRetestProof(args: {
-  retestId: string
-  chainId: string
-  terminalVulnClass: string
-  terminalHopId: string
-  verdict: CompositePatchRetestVerdict
-  patchBrokeHopId: string | null
-  brokeCausalEdge: CompositeBrokeCausalEdge | null
-  brokeReason: string | null
-  benignPrefixHops: string[]
-  topoOrder: string[]
-  hopResults: CompositeHopReplaySummary[]
-  exchangeIds: string[]
-  summary: string
-  compositeVerification?: CompositeReceiptVerification
-  targetRevision?: string
-  patchId?: string
-  testedAt: string
-  secrets?: readonly NamedSecret[]
-}): CompositePatchRetestProof {
-  const isFixed = args.verdict === 'fixed'
-  const redactedHopResults: CompositeHopReplaySummary[] = args.hopResults.map(hr => ({
-    ...hr,
-    ...(hr.reason !== undefined ? { reason: redact(hr.reason, args.secrets) } : {}),
-  }))
-  const base: Omit<CompositePatchRetestProof, 'proofSha256'> = {
-    schemaVersion: 1,
-    retestId: args.retestId,
-    chainId: args.chainId,
-    terminalVulnClass: args.terminalVulnClass,
-    terminalHopId: args.terminalHopId,
-    verdict: args.verdict,
-    patchClosed: isFixed,
-    patchBrokeHopId: isFixed ? args.patchBrokeHopId : null,
-    brokeCausalEdge: isFixed ? args.brokeCausalEdge : null,
-    brokeReason: isFixed && args.brokeReason ? redact(args.brokeReason, args.secrets) : null,
-    benignPrefixHops: isFixed ? [...args.benignPrefixHops] : [],
-    topoOrder: [...args.topoOrder],
-    hopResults: redactedHopResults,
-    exchangeIds: [...new Set(args.exchangeIds)],
-    summary: redact(args.summary, args.secrets),
-    ...(args.compositeVerification ? { compositeVerification: args.compositeVerification } : {}),
-    ...(args.targetRevision ? { targetRevision: args.targetRevision } : {}),
-    ...(args.patchId ? { patchId: args.patchId } : {}),
-    testedAt: args.testedAt,
+  if (verification.confirmed) return emit('still_vulnerable', `Still vulnerable: full ${receipt.hops.length}-hop DAG confirmed against patched target (${verification.reason}).`, { compositeVerification: verification })
+  if (verification.failedStage === 'schema' || verification.failedStage === 'dag_topology' || verification.failedStage === 'transcript_integrity' || verification.failedStage === 'attacker_provenance' || verification.failedStage === 'replay_mode') {
+    return emit('inconclusive', `Composite patch retest inconclusive (${verification.failedStage}): ${verification.reason}`, { compositeVerification: verification })
   }
-  return {
-    ...base,
-    proofSha256: computeCompositeRetestProofDigest(base),
-  }
-}
-
-/**
- * Full `CompositeProofReceipt` DAG patch-retest (v8 Stream B / Open Decision #3).
- *
- * Replays hops in strict topological order against the patched target via an injected host
- * replay runner and verifies full chain completion via `verifyCompositeReceipt()`.
- *
- * Distinguishes 4 honest verdicts (strictly fail-closed — transport/network/auth errors and
- * precondition drift NEVER falsely claim `'fixed'`):
- *  - `'fixed'`: chain cleanly breaks at `patchBrokeHopId` (even when benign prefix hops still succeed)
- *    and terminal impact is no longer achievable.
- *  - `'still_vulnerable'`: full DAG completes and confirms via `verifyCompositeReceipt()`.
- *  - `'inconclusive'`: transport/network/5xx/429/auth setup/signature failure or invalid DAG.
- *  - `'precondition_changed'`: target route/schema changed so pre-chain setup could not execute cleanly.
- */
-export async function retestCompositeChainPatch(
-  params: RetestCompositeChainParams,
-): Promise<CompositePatchRetestProof> {
-  const retestId = params.retestId ?? randomUUID()
-  const nowFn = params.now ?? Date.now
-  const testedAt = () => new Date(nowFn()).toISOString()
-
-  const emitEarly = (
-    chainId: string,
-    terminalVulnClass: string,
-    terminalHopId: string,
-    summary: string,
-  ) =>
-    finalizeCompositeRetestProof({
-      retestId,
-      chainId,
-      terminalVulnClass,
-      terminalHopId,
-      verdict: 'inconclusive',
-      patchBrokeHopId: null,
-      brokeCausalEdge: null,
-      brokeReason: null,
-      benignPrefixHops: [],
-      topoOrder: [],
-      hopResults: [],
-      exchangeIds: [],
-      summary,
-      targetRevision: params.targetRevision,
-      patchId: params.patchId,
-      testedAt: testedAt(),
-      secrets: params.secrets,
-    })
-
-  const parsed = compositeProofReceiptSchema.safeParse(params.receipt)
-  if (!parsed.success) {
-    const issue = parsed.error.issues[0]
-    const detail = `Invalid CompositeProofReceipt schema: ${issue?.path.join('.') || 'receipt'} ${issue?.message ?? ''}`.trim()
-    return emitEarly('invalid', 'invalid', 'invalid', `Composite patch retest inconclusive: ${detail}`)
-  }
-
-  const receipt = parsed.data
-  const dagRes = computeCompositeDagLayout(receipt)
-  if (!dagRes.ok) {
-    return emitEarly(
-      receipt.chainId,
-      receipt.terminalVulnClass,
-      receipt.terminalImpact.terminalHopId,
-      `Composite patch retest inconclusive: invalid DAG topology (${dagRes.reason})`,
-    )
-  }
-
-  const { dag } = dagRes
-  const signingKey = params.verifyOptions?.signingKey
-  const allEntries: HostTranscriptEntry[] = []
-  const allOob: HostOobEvent[] = []
-  const allTraces: HostBrowserTrace[] = []
-  const allPolls: HostAsyncPollRecord[] = []
-  const extraPreChainControlIds: string[] = []
-  const extraPostChainReadbackIds: string[] = []
-  const hopResults: CompositeHopReplaySummary[] = []
-  const priorHopResults: Record<string, CompositeHopReplaySummary> = {}
-  const hopArtifacts = new Map<string, ReplayedHopArtifacts>()
-  const availableCapabilities = new Set<string>()
-
-  const emit = (
-    verdict: CompositePatchRetestVerdict,
-    summary: string,
-    extra: {
-      patchBrokeHopId?: string | null
-      brokeCausalEdge?: CompositeBrokeCausalEdge | null
-      brokeReason?: string | null
-      benignPrefixHops?: string[]
-      compositeVerification?: CompositeReceiptVerification
-    } = {},
-  ) =>
-    finalizeCompositeRetestProof({
-      retestId,
-      chainId: receipt.chainId,
-      terminalVulnClass: receipt.terminalVulnClass,
-      terminalHopId: receipt.terminalImpact.terminalHopId,
-      verdict,
-      patchBrokeHopId: extra.patchBrokeHopId ?? null,
-      brokeCausalEdge: extra.brokeCausalEdge ?? null,
-      brokeReason: extra.brokeReason ?? null,
-      benignPrefixHops: extra.benignPrefixHops ?? [],
-      topoOrder: dag.topoOrder,
-      hopResults,
-      exchangeIds: allEntries.map(e => e.exchangeId),
-      summary,
-      compositeVerification: extra.compositeVerification,
-      targetRevision: params.targetRevision,
-      patchId: params.patchId,
-      testedAt: testedAt(),
-      secrets: params.secrets,
-    })
-
-  const appendRecords = (rec: {
-    entries?: readonly HostTranscriptEntry[]
-    oobEvents?: readonly HostOobEvent[]
-    browserTraces?: readonly HostBrowserTrace[]
-    asyncPollRecords?: readonly HostAsyncPollRecord[]
-  }) => {
-    if (rec.entries) allEntries.push(...rec.entries)
-    if (rec.oobEvents) allOob.push(...rec.oobEvents)
-    if (rec.browserTraces) allTraces.push(...rec.browserTraces)
-    if (rec.asyncPollRecords) allPolls.push(...rec.asyncPollRecords)
-  }
-
-  const abortCheck = (stage: string): CompositePatchRetestProof | null =>
-    params.signal?.aborted ? emit('inconclusive', `Composite patch retest inconclusive: aborted during ${stage}.`) : null
-
-  const abortedStart = abortCheck('initialization')
-  if (abortedStart) return abortedStart
-
-  // Step 1: Optional pre-chain setup / precondition verification.
-  if (params.runner.preparePreconditions) {
-    let setup: CompositePreconditionSetupResult
-    try {
-      setup = await params.runner.preparePreconditions({
-        receipt,
-        topoOrder: dag.topoOrder,
-        signal: params.signal,
-      })
-    } catch (err) {
-      const code = extractErrorCode(err)
-      const msg = err instanceof Error ? err.message : String(err)
-      return emit('inconclusive', `Composite patch retest inconclusive: pre-chain setup failed${code ? ` (${code})` : ''}: ${msg}`)
-    }
-
-    appendRecords(setup)
-    if (setup.preChainControlExchangeIds) extraPreChainControlIds.push(...setup.preChainControlExchangeIds)
-
-    const setupRecErr = inspectRecordsForTransportOrSignatureError(setup, signingKey)
-    if (
-      setup.status === 'transport_error'
-      || setup.status === 'auth_setup_failed'
-      || setup.status === 'inconclusive'
-      || (setup.httpStatus !== undefined && isTransportOrServerFailureStatus(setup.httpStatus))
-      || setupRecErr.failed
-    ) {
-      const reason = setup.reason ?? (setupRecErr.failed ? setupRecErr.reason : `Pre-chain setup returned "${setup.status}".`)
-      return emit('inconclusive', `Composite patch retest inconclusive: ${reason}`)
-    }
-
-    if (setup.status === 'precondition_changed') {
-      const reason = setup.reason ?? 'Target route or schema changed; pre-chain setup could not execute cleanly.'
-      return emit('precondition_changed', `Composite patch retest precondition changed: ${reason}`)
-    }
-  }
-
-  // Step 2: Replay every hop strictly in topological order.
-  for (let hopIndex = 0; hopIndex < dag.topoOrder.length; hopIndex += 1) {
-    const hopId = dag.topoOrder[hopIndex]!
-    const hop = dag.hopsById.get(hopId)!
-    const aborted = abortCheck(`hop "${hopId}"`)
-    if (aborted) return aborted
-
-    const incomingEdges = (dag.incomingByHop.get(hopId) ?? []).map(x => x.edge)
-    const outgoingEdges = (dag.outgoingByHop.get(hopId) ?? []).map(x => x.edge)
-
-    let rawResult: CompositeHopReplayResult
-    try {
-      rawResult = await params.runner.replayHop({
-        receipt,
-        hop,
-        hopIndex,
-        topoOrder: dag.topoOrder,
-        incomingEdges,
-        outgoingEdges,
-        availableCapabilities: [...availableCapabilities],
-        priorHopResults: { ...priorHopResults },
-        transcriptSoFar: {
-          entries: [...allEntries],
-          oobEvents: [...allOob],
-          browserTraces: [...allTraces],
-          asyncPollRecords: [...allPolls],
-        },
-        signal: params.signal,
-      })
-    } catch (err) {
-      const code = extractErrorCode(err)
-      const msg = err instanceof Error ? err.message : String(err)
-      hopResults.push({
-        hopId,
-        surface: hop.surface,
-        outcome: 'transport_error',
-        httpStatuses: [],
-        exchangeIds: [],
-        oobEventIds: [],
-        browserTraceIds: [],
-        emittedCapabilities: [],
-        consumedCapabilities: [],
-        reason: msg,
-        ...(code ? { errorCode: code } : {}),
-      })
-      return emit('inconclusive', `Composite patch retest inconclusive at hop "${hopId}"${code ? ` (${code})` : ''}: ${msg}`)
-    }
-
-    const entries = [...(rawResult.entries ?? [])]
-    const oobEvents = [...(rawResult.oobEvents ?? [])]
-    const browserTraces = [...(rawResult.browserTraces ?? [])]
-    const asyncPollRecords = [...(rawResult.asyncPollRecords ?? [])]
-    appendRecords({ entries, oobEvents, browserTraces, asyncPollRecords })
-    if (rawResult.preChainControlExchangeIds) extraPreChainControlIds.push(...rawResult.preChainControlExchangeIds)
-    if (rawResult.postChainReadbackExchangeIds) extraPostChainReadbackIds.push(...rawResult.postChainReadbackExchangeIds)
-
-    const entryIdSet = new Set(entries.map(e => e.exchangeId))
-    const oobIdSet = new Set(oobEvents.map(o => o.id))
-    const traceIdSet = new Set(browserTraces.map(t => t.id))
-
-    const hopExchangeIds = rawResult.replayedExchangeIds
-      ? [...rawResult.replayedExchangeIds]
-      : (hop.exchangeIds.length > 0 && hop.exchangeIds.every(id => entryIdSet.has(id))
-          ? [...hop.exchangeIds]
-          : entries.filter(e => e.replayAttempt !== 'ablation_control').map(e => e.exchangeId))
-    const hopOobIds = rawResult.replayedOobEventIds
-      ? [...rawResult.replayedOobEventIds]
-      : (hop.oobEventIds.length > 0 && hop.oobEventIds.every(id => oobIdSet.has(id))
-          ? [...hop.oobEventIds]
-          : oobEvents.map(o => o.id))
-    const hopTraceIds = rawResult.replayedBrowserTraceIds
-      ? [...rawResult.replayedBrowserTraceIds]
-      : (hop.browserTraceIds.length > 0 && hop.browserTraceIds.every(id => traceIdSet.has(id))
-          ? [...hop.browserTraceIds]
-          : browserTraces.map(t => t.id))
-
-    const classified = classifyHopReplayOutcome(hop, rawResult, signingKey)
-    const emittedCapabilities = collectHopEmittedCapabilities(entries, oobEvents, browserTraces, asyncPollRecords)
-    const consumedCapabilities = collectHopConsumedCapabilities(entries)
-    const httpStatuses = entries
-      .map(e => e.step.status)
-      .filter((s): s is number => typeof s === 'number' && Number.isFinite(s))
-    if (httpStatuses.length === 0 && typeof rawResult.httpStatus === 'number' && Number.isFinite(rawResult.httpStatus)) {
-      httpStatuses.push(rawResult.httpStatus)
-    }
-
-    const summaryRec: CompositeHopReplaySummary = {
-      hopId,
-      surface: hop.surface,
-      outcome: classified.outcome,
-      httpStatuses,
-      exchangeIds: hopExchangeIds,
-      oobEventIds: hopOobIds,
-      browserTraceIds: hopTraceIds,
-      emittedCapabilities,
-      consumedCapabilities,
-      ...(classified.reason ? { reason: classified.reason } : {}),
-      ...(classified.errorCode ? { errorCode: classified.errorCode } : {}),
-    }
-    hopResults.push(summaryRec)
-    priorHopResults[hopId] = summaryRec
-
-    const artifacts: ReplayedHopArtifacts = {
-      exchangeIds: hopExchangeIds,
-      oobEventIds: hopOobIds,
-      browserTraceIds: hopTraceIds,
-      entries,
-      oobEvents,
-      browserTraces,
-      asyncPollRecords,
-      ablationByEdge: rawResult.replayedAblationExchangeIds ? { ...rawResult.replayedAblationExchangeIds } : {},
-      pollByEdge: rawResult.replayedPollRecordIds ? { ...rawResult.replayedPollRecordIds } : {},
-    }
-    hopArtifacts.set(hopId, artifacts)
-
-    if (
-      classified.outcome === 'transport_error'
-      || classified.outcome === 'auth_setup_failed'
-      || classified.outcome === 'inconclusive'
-    ) {
-      return emit('inconclusive', `Composite patch retest inconclusive at hop "${hopId}": ${classified.reason ?? classified.outcome}`)
-    }
-
-    if (classified.outcome === 'precondition_changed') {
-      return emit('precondition_changed', `Composite patch retest precondition changed at hop "${hopId}": ${classified.reason ?? 'target route/schema drifted'}`)
-    }
-
-    const markRemainingSkipped = () => {
-      for (let j = hopIndex + 1; j < dag.topoOrder.length; j += 1) {
-        const remId = dag.topoOrder[j]!
-        const remHop = dag.hopsById.get(remId)!
-        hopResults.push({
-          hopId: remId,
-          surface: remHop.surface,
-          outcome: 'skipped_after_break',
-          httpStatuses: [],
-          exchangeIds: [],
-          oobEventIds: [],
-          browserTraceIds: [],
-          emittedCapabilities: [],
-          consumedCapabilities: [],
-          reason: `Skipped because predecessor hop "${hopId}" broke the chain.`,
-        })
-      }
-    }
-
-    const benignPrefix = dag.topoOrder.slice(0, hopIndex).filter(id => priorHopResults[id]?.outcome === 'succeeded')
-    const prefixNote = benignPrefix.length > 0 ? ` (benign prefix succeeded: ${benignPrefix.join(' -> ')})` : ''
-
-    if (classified.outcome === 'blocked') {
-      markRemainingSkipped()
-      const brokeEdge = selectBrokeEdgeForBlockedHop(hopId, classified.blockedWith4xx, dag)
-      const brokeReason = classified.reason ?? `Hop "${hopId}" was blocked by the patched target.`
-      return emit('fixed', `Fixed: multi-hop chain broke cleanly at "${hopId}"${prefixNote}: ${brokeReason}`, {
-        patchBrokeHopId: hopId,
-        brokeCausalEdge: brokeEdge,
-        brokeReason,
-        benignPrefixHops: benignPrefix,
-      })
-    }
-
-    // Even when a hop returned 2xx (e.g., sanitized response), verify whether it still produced
-    // the causal outputs required by its outgoing edges before advancing downstream hops.
-    for (const outEdge of dag.outgoingByHop.get(hopId) ?? []) {
-      const prodCheck = hopSatisfiesOutgoingProducerEdge(outEdge.edge, hop, artifacts)
-      if (!prodCheck.ok) {
-        summaryRec.outcome = 'blocked'
-        summaryRec.reason = prodCheck.reason
-        markRemainingSkipped()
-        return emit('fixed', `Fixed: multi-hop chain broke cleanly at "${hopId}"${prefixNote}: ${prodCheck.reason}`, {
-          patchBrokeHopId: hopId,
-          brokeCausalEdge: {
-            edgeIndex: outEdge.edgeIndex,
-            kind: outEdge.edge.kind,
-            fromHopId: outEdge.edge.fromHopId,
-            toHopId: outEdge.edge.toHopId,
-          },
-          brokeReason: prodCheck.reason,
-          benignPrefixHops: benignPrefix,
-        })
-      }
-    }
-
-    for (const cap of emittedCapabilities) availableCapabilities.add(cap)
-  }
-
-  // Step 3: Optional terminal state readback when all hops ran cleanly.
-  if (params.runner.readbackTerminalState) {
-    const abortedReadback = abortCheck('terminal readback')
-    if (abortedReadback) return abortedReadback
-    try {
-      const rb = await params.runner.readbackTerminalState({
-        receipt,
-        transcriptSoFar: {
-          entries: [...allEntries],
-          oobEvents: [...allOob],
-          browserTraces: [...allTraces],
-          asyncPollRecords: [...allPolls],
-        },
-        signal: params.signal,
-      })
-      if (rb.entries) allEntries.push(...rb.entries)
-      if (rb.postChainReadbackExchangeIds) extraPostChainReadbackIds.push(...rb.postChainReadbackExchangeIds)
-      const rbErr = inspectRecordsForTransportOrSignatureError({ entries: rb.entries }, signingKey)
-      if (
-        rb.status === 'transport_error'
-        || rb.status === 'inconclusive'
-        || (rb.httpStatus !== undefined && isTransportOrServerFailureStatus(rb.httpStatus))
-        || rbErr.failed
-      ) {
-        const reason = rb.reason ?? (rbErr.failed ? rbErr.reason : 'Terminal readback failed.')
-        return emit('inconclusive', `Composite patch retest inconclusive during terminal readback: ${reason}`)
-      }
-      if (rb.status === 'precondition_changed') {
-        return emit('precondition_changed', `Composite patch retest precondition changed during terminal readback: ${rb.reason ?? 'schema/route changed'}`)
-      }
-    } catch (err) {
-      const code = extractErrorCode(err)
-      const msg = err instanceof Error ? err.message : String(err)
-      return emit('inconclusive', `Composite patch retest inconclusive during terminal readback${code ? ` (${code})` : ''}: ${msg}`)
-    }
-  }
-
-  // Step 4: Verify the replayed DAG strictly through `verifyCompositeReceipt()`.
-  const allEntriesById = new Map(allEntries.map(e => [e.exchangeId, e]))
-  const allOobById = new Map(allOob.map(o => [o.id, o]))
-  const allTracesById = new Map(allTraces.map(t => [t.id, t]))
-  const allPollsById = new Map(allPolls.map(p => [p.id, p]))
-
-  const replayedReceipt = buildReplayedCompositeReceipt(
-    receipt,
-    dag,
-    hopArtifacts,
-    allEntriesById,
-    allOobById,
-    allTracesById,
-    allPollsById,
-    extraPreChainControlIds,
-    extraPostChainReadbackIds,
-  )
-  const replayedTranscript: HostSignedTranscript = {
-    entries: allEntries,
-    oobEvents: allOob,
-    browserTraces: allTraces,
-    asyncPollRecords: allPolls,
-  }
-
-  const verification = verifyCompositeReceipt(replayedReceipt, replayedTranscript, params.verifyOptions)
-
-  if (verification.confirmed) {
-    return emit(
-      'still_vulnerable',
-      `Still vulnerable: full ${receipt.hops.length}-hop DAG confirmed against patched target (${verification.reason}).`,
-      { compositeVerification: verification },
-    )
-  }
-
-  // Fail closed on harness/signing/provenance/replay-mode errors — never falsely claim 'fixed'.
-  if (
-    verification.failedStage === 'schema'
-    || verification.failedStage === 'dag_topology'
-    || verification.failedStage === 'transcript_integrity'
-    || verification.failedStage === 'attacker_provenance'
-    || verification.failedStage === 'replay_mode'
-  ) {
-    return emit('inconclusive', `Composite patch retest inconclusive (${verification.failedStage}): ${verification.reason}`, {
-      compositeVerification: verification,
-    })
-  }
-
   if (verification.failedStage === 'edge_binding') {
-    const failedEdge = verification.verifiedEdges.find(e => !e.verified)
-    if (failedEdge) {
-      const edgeObj = replayedReceipt.causalEdges[failedEdge.edgeIndex]
-      const fromArt = hopArtifacts.get(failedEdge.fromHopId)
-      const fromHop = dag.hopsById.get(failedEdge.fromHopId)
-      const fromProduced = edgeObj && fromArt && fromHop
-        ? hopSatisfiesOutgoingProducerEdge(edgeObj, fromHop, fromArt).ok
-        : true
-      const brokeHopId = fromProduced ? failedEdge.toHopId : failedEdge.fromHopId
-      const brokeIdx = dag.topoOrder.indexOf(brokeHopId)
-      const benignPrefix = brokeIdx > 0
-        ? dag.topoOrder.slice(0, brokeIdx).filter(id => priorHopResults[id]?.outcome === 'succeeded')
-        : []
-      const prefixNote = benignPrefix.length > 0 ? ` (benign prefix succeeded: ${benignPrefix.join(' -> ')})` : ''
-      return emit(
-        'fixed',
-        `Fixed: causal edge ${failedEdge.fromHopId} -> ${failedEdge.toHopId} (${failedEdge.kind}) broke at "${brokeHopId}"${prefixNote}: ${failedEdge.reason}`,
-        {
-          patchBrokeHopId: brokeHopId,
-          brokeCausalEdge: {
-            edgeIndex: failedEdge.edgeIndex,
-            kind: failedEdge.kind,
-            fromHopId: failedEdge.fromHopId,
-            toHopId: failedEdge.toHopId,
-          },
-          brokeReason: failedEdge.reason,
-          benignPrefixHops: benignPrefix,
-          compositeVerification: verification,
-        },
-      )
+    const fe = verification.verifiedEdges.find(e => !e.verified)
+    if (fe) {
+      const eObj = replayedReceipt.causalEdges[fe.edgeIndex], fArt = hopArtifacts.get(fe.fromHopId), fHop = dag.hopsById.get(fe.fromHopId)
+      const brokeHopId = (eObj && fArt && fHop ? checkProducerEdge(eObj, fHop, fArt).ok : true) ? fe.toHopId : fe.fromHopId
+      const idx = dag.topoOrder.indexOf(brokeHopId), bp = idx > 0 ? dag.topoOrder.slice(0, idx).filter(id => priorHops[id]?.outcome === 'succeeded') : []
+      return emit('fixed', `Fixed: causal edge ${fe.fromHopId} -> ${fe.toHopId} (${fe.kind}) broke at "${brokeHopId}"${bp.length ? ` (benign prefix succeeded: ${bp.join(' -> ')})` : ''}: ${fe.reason}`, {
+        patchBrokeHopId: brokeHopId, brokeCausalEdge: { edgeIndex: fe.edgeIndex, kind: fe.kind, fromHopId: fe.fromHopId, toHopId: fe.toHopId }, brokeReason: fe.reason, benignPrefixHops: bp, compositeVerification: verification,
+      })
     }
   }
-
-  // `failedStage === 'terminal_impact'` (all hops & causal edges ran cleanly, terminal impact neutralized).
-  const terminalHopId = receipt.terminalImpact.terminalHopId
-  const terminalIdx = dag.topoOrder.indexOf(terminalHopId)
-  const benignPrefix = terminalIdx > 0
-    ? dag.topoOrder.slice(0, terminalIdx).filter(id => priorHopResults[id]?.outcome === 'succeeded')
-    : []
-  const prefixNote = benignPrefix.length > 0 ? ` (benign prefix succeeded: ${benignPrefix.join(' -> ')})` : ''
-  return emit(
-    'fixed',
-    `Fixed: terminal impact neutralized at "${terminalHopId}"${prefixNote}: ${verification.reason}`,
-    {
-      patchBrokeHopId: terminalHopId,
-      brokeCausalEdge: null,
-      brokeReason: verification.reason,
-      benignPrefixHops: benignPrefix,
-      compositeVerification: verification,
-    },
-  )
+  const termId = receipt.terminalImpact.terminalHopId, termIdx = dag.topoOrder.indexOf(termId)
+  const bp = termIdx > 0 ? dag.topoOrder.slice(0, termIdx).filter(id => priorHops[id]?.outcome === 'succeeded') : []
+  return emit('fixed', `Fixed: terminal impact neutralized at "${termId}"${bp.length ? ` (benign prefix succeeded: ${bp.join(' -> ')})` : ''}: ${verification.reason}`, {
+    patchBrokeHopId: termId, brokeCausalEdge: null, brokeReason: verification.reason, benignPrefixHops: bp, compositeVerification: verification,
+  })
 }
