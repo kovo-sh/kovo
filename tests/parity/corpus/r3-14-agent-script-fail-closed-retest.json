@@ -6,7 +6,8 @@
   "covers": {
     "files": [
       "src/server/agent-script-proof.ts",
-      "src/server/retest-health.ts"
+      "src/server/retest-health.ts",
+      "src/server/retry-governor.ts"
     ],
     "classes": [
       "bola",
