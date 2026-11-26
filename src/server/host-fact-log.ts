@@ -12,10 +12,18 @@
  *   Worker-facing projections (`buildWorkerView`) are derived lazily through `EgressSanitizer`
  *   without ever calling `rescrubBodies()` or mutating the host fact plane.
  */
-import { createHash } from 'node:crypto'
+import { createHash, createHmac } from 'node:crypto'
 import { createEgressSanitizer, EgressSanitizer, type EgressChannel } from './egress-sanitizer.ts'
 import { normalizeRole, parseRoleLabel, type AmbientAuth, type ImpactStep, type RoleName } from './oracle-invariants.ts'
-import type { BrokerExchangeResult, BrokerHttpRequest } from './broker.ts'
+import type { BrokerExchangeResult, BrokerHttpRequest, WireCredentialProvenance } from './broker.ts'
+export type { WireCredentialProvenance } from './broker.ts'
+
+declare module './proof-receipt.ts' {
+  interface ReceiptTranscriptEntry {
+    /** H-14: Broker-observed non-secret wire credential provenance (header/cookie names & auth sources). */
+    wireCredentialProvenance?: Readonly<WireCredentialProvenance>
+  }
+}
 import type {
   HostAsyncPollRecord,
   HostBrowserTrace,
@@ -161,6 +169,8 @@ export interface HostExchangeFact {
   readonly ambientAuth: AmbientAuth
   readonly sameSite: string | null
   readonly credentialPlacement?: HostCredentialPlacement
+  /** H-14: Broker-observed wire credential provenance (header/cookie names & auth sources, never secret values). */
+  readonly wireCredentialProvenance?: Readonly<WireCredentialProvenance>
   readonly setCookieSameSiteByName?: Readonly<Record<string, string | null>>
   readonly raceBatchId?: string | null
   readonly requestPlaneVaultScrubbed?: boolean
@@ -212,6 +222,7 @@ export interface HostExchangeFactInput {
   ambientAuth?: AmbientAuth
   sameSite?: string | null
   credentialPlacement?: HostCredentialPlacement
+  wireCredentialProvenance?: WireCredentialProvenance
   raceBatchId?: string | null
   hostExpressionChallenge?: HostMintedExpressionChallenge
   hostTimingChallenge?: HostMintedTimingChallenge
@@ -264,6 +275,42 @@ export interface HostFactLogOptions {
   sanitizer?: EgressSanitizer
   /** R2-C-9: When true, `recordExchange` throws if the kernel request plane contains `[redacted:cap:...]`. */
   assertCleanRequestPlane?: boolean
+  /** H-14: Optional HMAC-SHA256 signing key used to sign host fact entries (including `wireCredentialProvenance`). */
+  signingKey?: string
+}
+
+function canonicalStringifyForSign(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value)
+  if (Array.isArray(value)) return `[${value.map(canonicalStringifyForSign).join(',')}]`
+  return `{${Object.entries(value as Record<string, unknown>)
+    .filter(([k, v]) => k !== 'hostSignature' && v !== undefined)
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([k, v]) => `${JSON.stringify(k)}:${canonicalStringifyForSign(v)}`)
+    .join(',')}}`
+}
+
+function signHostTranscriptEntry(entry: HostTranscriptEntry, signingKey: string): string {
+  return createHmac('sha256', signingKey).update(canonicalStringifyForSign(entry), 'utf8').digest('hex')
+}
+
+function freezeWireCredentialProvenance(
+  prov: WireCredentialProvenance | undefined,
+): Readonly<WireCredentialProvenance> | undefined {
+  if (!prov) return undefined
+  return Object.freeze({
+    authenticated: Boolean(prov.authenticated),
+    source: prov.source,
+    sources: Object.freeze([...prov.sources]) as WireCredentialProvenance['sources'],
+    personaHandle: prov.personaHandle ?? null,
+    session: prov.session ?? null,
+    headerNames: Object.freeze([...prov.headerNames]) as string[],
+    cookieNames: Object.freeze([...prov.cookieNames]) as string[],
+    vaultCookieNames: Object.freeze([...prov.vaultCookieNames]) as string[],
+    jarCookieNames: Object.freeze([...prov.jarCookieNames]) as string[],
+    vaultHeaderNames: Object.freeze([...prov.vaultHeaderNames]) as string[],
+    callerAuthHeaderNames: Object.freeze([...prov.callerAuthHeaderNames]) as string[],
+    authMutated: Boolean(prov.authMutated),
+  })
 }
 
 function headerLookup(headers: Readonly<Record<string, string>> | null | undefined, name: string): string | null {
@@ -399,22 +446,35 @@ export function parseSetCookieSameSiteMap(
 export function deriveCredentialPlacement(
   headers: Readonly<Record<string, string>> | null | undefined,
   explicit?: HostCredentialPlacement,
+  wireProvenance?: Readonly<WireCredentialProvenance>,
 ): HostCredentialPlacement {
   const authHeader = headerLookup(headers, 'authorization')
   const apiKeyHeader = headerLookup(headers, 'x-api-key')
   const authTokenHeader = headerLookup(headers, 'x-auth-token')
   const cookieHeader = headerLookup(headers, 'cookie')
   const cookieNamesFromHeader = parseCookieHeaderNames(cookieHeader)
+  const headerNamesFromHeaders = [
+    ...(authHeader ? ['authorization'] : []),
+    ...(apiKeyHeader ? ['x-api-key'] : []),
+    ...(authTokenHeader ? ['x-auth-token'] : []),
+  ]
+  const useWireFallback = !explicit && headerNamesFromHeaders.length === 0 && cookieNamesFromHeader.length === 0 && Boolean(wireProvenance)
+  const wireCookieNames = useWireFallback ? (wireProvenance?.cookieNames ?? []) : []
+  const wireNonCookieAuthHeaders = useWireFallback
+    ? (wireProvenance?.headerNames ?? []).filter(
+        h => h !== 'cookie' && h !== 'x-csrf-token' && h !== 'x-xsrf-token',
+      )
+    : []
   const jarCookieNames = explicit?.jarCookieNames?.length
     ? [...explicit.jarCookieNames]
-    : cookieNamesFromHeader
+    : cookieNamesFromHeader.length > 0
+      ? cookieNamesFromHeader
+      : [...wireCookieNames]
   const headerNames = explicit?.headerNames?.length
     ? [...explicit.headerNames]
-    : [
-        ...(authHeader ? ['authorization'] : []),
-        ...(apiKeyHeader ? ['x-api-key'] : []),
-        ...(authTokenHeader ? ['x-auth-token'] : []),
-      ]
+    : headerNamesFromHeaders.length > 0
+      ? headerNamesFromHeaders
+      : [...wireNonCookieAuthHeaders]
   const capTargets = explicit?.capabilityTargets ? [...explicit.capabilityTargets] : []
 
   const hasBearer = explicit?.personaAuthKind === 'bearer'
@@ -423,6 +483,7 @@ export function deriveCredentialPlacement(
   const hasHeaderAuth = explicit?.personaAuthKind === 'header'
     || capTargets.includes('header')
     || Boolean(apiKeyHeader || authTokenHeader || (authHeader && !/^bearer\s+/i.test(authHeader)))
+    || wireNonCookieAuthHeaders.length > 0
   const hasCookie = explicit?.personaAuthKind === 'cookie'
     || capTargets.includes('cookie')
     || jarCookieNames.length > 0
@@ -460,13 +521,15 @@ export function deriveAmbientAuthFromHeaders(
   if (placement) {
     // H-13: Mixed auth (e.g. bearer persona + junk cookie capability) MUST NEVER classify as `cookie`.
     if (placement.mixed) {
-      if (placement.personaAuthKind === 'bearer' || placement.capabilityTargets?.includes('bearer')) return 'bearer'
+      if (placement.personaAuthKind === 'bearer' || placement.capabilityTargets?.includes('bearer') || explicit === 'bearer') return 'bearer'
       const auth = headerLookup(headers, 'authorization')
       if (auth && /^bearer\s+/i.test(auth)) return 'bearer'
       return 'header'
     }
     if (placement.personaAuthKind === 'bearer' || placement.capabilityTargets?.includes('bearer')) return 'bearer'
-    if (placement.personaAuthKind === 'header' || placement.capabilityTargets?.includes('header')) return 'header'
+    if (placement.personaAuthKind === 'header' || placement.capabilityTargets?.includes('header')) {
+      return explicit === 'bearer' ? 'bearer' : 'header'
+    }
     if (placement.personaAuthKind === 'cookie') return 'cookie'
   }
   if (headers) {
@@ -574,11 +637,13 @@ export class HostFactLog {
   private readonly asyncPolls = new Map<string, HostAsyncPollRecord>()
   private readonly sanitizer: EgressSanitizer
   private readonly assertCleanRequestPlane: boolean
+  private readonly signingKey?: string
   private nextSeq = 0
 
   constructor(options: HostFactLogOptions = {}) {
     this.sanitizer = options.sanitizer ?? createEgressSanitizer()
     this.assertCleanRequestPlane = options.assertCleanRequestPlane === true
+    this.signingKey = options.signingKey
   }
 
   get size(): number {
@@ -621,7 +686,8 @@ export class HostFactLog {
     const parsedLabel = parseRoleLabel(roleSource)
     const actorRole: RoleName | null = input.actorRole ?? parsedLabel.role ?? normalizeRole(actor ?? undefined) ?? null
     const actorTenant: string | null = input.actorTenant ?? parsedLabel.tenant ?? parseRoleLabel(actor ?? null).tenant ?? null
-    const credentialPlacement = deriveCredentialPlacement(requestHeaders, input.credentialPlacement)
+    const wireCredentialProvenance = freezeWireCredentialProvenance(input.wireCredentialProvenance)
+    const credentialPlacement = deriveCredentialPlacement(requestHeaders, input.credentialPlacement, wireCredentialProvenance)
     const ambientAuth = deriveAmbientAuthFromHeaders(requestHeaders, input.ambientAuth, credentialPlacement)
     const setCookieMap = parseSetCookieSameSiteMap(responseHeaders)
     const hasSetCookie = Object.keys(setCookieMap).length > 0
@@ -673,6 +739,7 @@ export class HostFactLog {
       ambientAuth,
       sameSite,
       credentialPlacement,
+      ...(wireCredentialProvenance ? { wireCredentialProvenance } : {}),
       ...(hasSetCookie ? { setCookieSameSiteByName: Object.freeze(setCookieMap) } : {}),
       ...(input.raceBatchId !== undefined ? { raceBatchId: input.raceBatchId } : {}),
       ...(requestPlaneVaultScrubbed ? { requestPlaneVaultScrubbed: true } : {}),
@@ -708,6 +775,14 @@ export class HostFactLog {
         : {}),
     })
     this.exchanges.set(fact.exchangeId, fact)
+    if (this.signingKey && !fact.hostSignature) {
+      const unsignedEntry = this.projectFactToHostEntry(fact)
+      const hostSignature = signHostTranscriptEntry(unsignedEntry, this.signingKey)
+      const signedFact: HostExchangeFact = Object.freeze({ ...fact, hostSignature })
+      this.exchanges.set(signedFact.exchangeId, signedFact)
+      this.signedEntries.set(signedFact.exchangeId, freezeHostEntry({ ...unsignedEntry, hostSignature }))
+      return signedFact
+    }
     return fact
   }
 
@@ -937,6 +1012,7 @@ export class HostFactLog {
         ...(evidenceRole ? { evidenceRole } : {}),
         ...(fact.raceBatchId !== undefined ? { raceBatchId: fact.raceBatchId } : {}),
         ...(fact.credentialPlacement ? { credentialPlacement: fact.credentialPlacement } : {}),
+        ...(fact.wireCredentialProvenance ? { wireCredentialProvenance: fact.wireCredentialProvenance } : {}),
         ...(fact.requestPlaneVaultScrubbed ? { requestPlaneVaultScrubbed: true } : {}),
         ...(fact.hostExpressionChallenge ? { hostExpressionChallenge: fact.hostExpressionChallenge } : {}),
         ...(fact.hostTimingChallenge ? { hostTimingChallenge: fact.hostTimingChallenge } : {}),
@@ -950,11 +1026,64 @@ export class HostFactLog {
     }
   }
 
+  private projectFactToHostEntry(
+    fact: HostExchangeFact,
+    overrides?: { arm?: ImpactStep['arm']; evidenceRole?: string },
+  ): HostTranscriptEntry {
+    const evidenceRole = overrides?.evidenceRole ?? fact.evidenceRole ?? fact.sessionRole ?? undefined
+    const step = this.toImpactStep(fact.exchangeId, {
+      ...(overrides?.arm !== undefined ? { arm: overrides.arm } : {}),
+      ...(evidenceRole ? { evidenceRole } : {}),
+    })!
+    const ts = fact.timestampMs ?? fact.startedAt ?? fact.seq
+    const observedDigests = fact.observedResponseDigests && fact.observedResponseDigests.length > 0
+      ? [...fact.observedResponseDigests]
+      : fact.rawResponseBody !== null
+        ? [createHash('sha256').update(fact.rawResponseBody, 'utf8').digest('hex')]
+        : undefined
+    return {
+      exchangeId: fact.exchangeId,
+      step,
+      durationMs: fact.durationMs,
+      ...(fact.op ? { op: fact.op } : {}),
+      seq: fact.seq,
+      ...(fact.startedAt !== undefined ? { startedAt: fact.startedAt } : {}),
+      ...(fact.endedAt !== undefined ? { endedAt: fact.endedAt } : {}),
+      ...(fact.origin ? { origin: fact.origin } : {}),
+      ...(fact.consumedCapabilityId !== undefined ? { consumedCapabilityId: fact.consumedCapabilityId } : {}),
+      ...(fact.consumedCapabilities ? { consumedCapabilities: [...fact.consumedCapabilities] } : {}),
+      ...(fact.sessionId !== undefined ? { sessionId: fact.sessionId } : {}),
+      ...(fact.carrierText ? { carrierText: fact.carrierText } : {}),
+      ...(evidenceRole ? { evidenceRole } : {}),
+      ...(fact.raceBatchId !== undefined ? { raceBatchId: fact.raceBatchId } : {}),
+      ...(fact.credentialPlacement ? { credentialPlacement: fact.credentialPlacement } : {}),
+      ...(fact.wireCredentialProvenance ? { wireCredentialProvenance: fact.wireCredentialProvenance } : {}),
+      ...(fact.requestPlaneVaultScrubbed ? { requestPlaneVaultScrubbed: true } : {}),
+      ...(fact.hostExpressionChallenge ? { hostExpressionChallenge: fact.hostExpressionChallenge } : {}),
+      ...(fact.hostTimingChallenge ? { hostTimingChallenge: fact.hostTimingChallenge } : {}),
+      ...(fact.hostRedirectCanaryHost !== undefined ? { hostRedirectCanaryHost: fact.hostRedirectCanaryHost } : {}),
+      timestampMs: ts,
+      actorPersona: fact.actor,
+      ...(fact.actorRoleLabel !== undefined ? { actorRoleLabel: fact.actorRoleLabel } : {}),
+      ...(fact.emittedCapabilities ? { emittedCapabilities: [...fact.emittedCapabilities] } : {}),
+      ...(observedDigests ? { observedResponseDigests: observedDigests } : {}),
+      ...(fact.injectedRequestDigests ? { injectedRequestDigests: [...fact.injectedRequestDigests] } : {}),
+      ...(fact.cryptoAttestations ? { cryptoAttestations: fact.cryptoAttestations.map(a => ({ ...a })) } : {}),
+      ...(fact.entityId !== undefined ? { entityId: fact.entityId } : {}),
+      ...(fact.correlationIds ? { correlationIds: [...fact.correlationIds] } : {}),
+      ...(fact.cleanSession !== undefined ? { cleanSession: fact.cleanSession } : {}),
+      ...(fact.replayAttempt !== undefined ? { replayAttempt: fact.replayAttempt } : {}),
+      ...(fact.hostSignature !== undefined ? { hostSignature: fact.hostSignature } : {}),
+    }
+  }
+
   /** Project the host log onto a `HostSignedTranscript` for unified 1-hop / multi-hop verification. */
   toHostSignedTranscript(options?: {
     armOverrides?: ReadonlyMap<string, ImpactStep['arm']>
     evidenceRoleOverrides?: ReadonlyMap<string, string>
+    signingKey?: string
   }): HostSignedTranscript {
+    const effectiveSigningKey = options?.signingKey ?? this.signingKey
     const entries: HostTranscriptEntry[] = this.orderedExchanges().map(fact => {
       // A signature covers the original signed entry, not a later projection with derived defaults;
       // only project overrides when explicitly requested and different from the signed entry.
@@ -975,50 +1104,14 @@ export class HostFactLog {
           },
         }
       }
-      const evidenceRole = options?.evidenceRoleOverrides?.get(fact.exchangeId) ?? fact.evidenceRole ?? fact.sessionRole ?? undefined
-      const step = this.toImpactStep(fact.exchangeId, {
-        ...(options?.armOverrides?.has(fact.exchangeId) ? { arm: options.armOverrides.get(fact.exchangeId)! } : {}),
-        ...(evidenceRole ? { evidenceRole } : {}),
-      })!
-      const ts = fact.timestampMs ?? fact.startedAt ?? fact.seq
-      const observedDigests = fact.observedResponseDigests && fact.observedResponseDigests.length > 0
-        ? [...fact.observedResponseDigests]
-        : fact.rawResponseBody !== null
-          ? [createHash('sha256').update(fact.rawResponseBody, 'utf8').digest('hex')]
-          : undefined
-      return {
-        exchangeId: fact.exchangeId,
-        step,
-        durationMs: fact.durationMs,
-        ...(fact.op ? { op: fact.op } : {}),
-        seq: fact.seq,
-        ...(fact.startedAt !== undefined ? { startedAt: fact.startedAt } : {}),
-        ...(fact.endedAt !== undefined ? { endedAt: fact.endedAt } : {}),
-        ...(fact.origin ? { origin: fact.origin } : {}),
-        ...(fact.consumedCapabilityId !== undefined ? { consumedCapabilityId: fact.consumedCapabilityId } : {}),
-        ...(fact.consumedCapabilities ? { consumedCapabilities: [...fact.consumedCapabilities] } : {}),
-        ...(fact.sessionId !== undefined ? { sessionId: fact.sessionId } : {}),
-        ...(fact.carrierText ? { carrierText: fact.carrierText } : {}),
-        ...(evidenceRole ? { evidenceRole } : {}),
-        ...(fact.raceBatchId !== undefined ? { raceBatchId: fact.raceBatchId } : {}),
-        ...(fact.credentialPlacement ? { credentialPlacement: fact.credentialPlacement } : {}),
-        ...(fact.requestPlaneVaultScrubbed ? { requestPlaneVaultScrubbed: true } : {}),
-        ...(fact.hostExpressionChallenge ? { hostExpressionChallenge: fact.hostExpressionChallenge } : {}),
-        ...(fact.hostTimingChallenge ? { hostTimingChallenge: fact.hostTimingChallenge } : {}),
-        ...(fact.hostRedirectCanaryHost !== undefined ? { hostRedirectCanaryHost: fact.hostRedirectCanaryHost } : {}),
-        timestampMs: ts,
-        actorPersona: fact.actor,
-        ...(fact.actorRoleLabel !== undefined ? { actorRoleLabel: fact.actorRoleLabel } : {}),
-        ...(fact.emittedCapabilities ? { emittedCapabilities: [...fact.emittedCapabilities] } : {}),
-        ...(observedDigests ? { observedResponseDigests: observedDigests } : {}),
-        ...(fact.injectedRequestDigests ? { injectedRequestDigests: [...fact.injectedRequestDigests] } : {}),
-        ...(fact.cryptoAttestations ? { cryptoAttestations: fact.cryptoAttestations.map(a => ({ ...a })) } : {}),
-        ...(fact.entityId !== undefined ? { entityId: fact.entityId } : {}),
-        ...(fact.correlationIds ? { correlationIds: [...fact.correlationIds] } : {}),
-        ...(fact.cleanSession !== undefined ? { cleanSession: fact.cleanSession } : {}),
-        ...(fact.replayAttempt !== undefined ? { replayAttempt: fact.replayAttempt } : {}),
-        ...(fact.hostSignature !== undefined ? { hostSignature: fact.hostSignature } : {}),
+      const entry = this.projectFactToHostEntry(fact, {
+        ...(armOverride !== undefined ? { arm: armOverride } : {}),
+        ...(roleOverride !== undefined ? { evidenceRole: roleOverride } : {}),
+      })
+      if (effectiveSigningKey && !entry.hostSignature) {
+        return { ...entry, hostSignature: signHostTranscriptEntry(entry, effectiveSigningKey) }
       }
+      return entry
     })
     return {
       entries,
@@ -1065,6 +1158,7 @@ export class HostFactLog {
         ambientAuth: step.actor.auth,
         ...(step.actor.sameSite !== null && step.actor.sameSite !== undefined ? { sameSite: step.actor.sameSite } : {}),
         ...(entry.credentialPlacement ? { credentialPlacement: entry.credentialPlacement } : {}),
+        ...(entry.wireCredentialProvenance ? { wireCredentialProvenance: entry.wireCredentialProvenance } : {}),
         ...(entry.raceBatchId !== undefined ? { raceBatchId: entry.raceBatchId } : {}),
         ...(entry.hostExpressionChallenge ? { hostExpressionChallenge: entry.hostExpressionChallenge } : {}),
         ...(entry.hostTimingChallenge ? { hostTimingChallenge: entry.hostTimingChallenge } : {}),
@@ -1179,6 +1273,7 @@ export class HostFactLog {
         rawHeaders?: Record<string, string>
         raceBatchId?: string | null
         credentialPlacement?: HostCredentialPlacement
+        wireCredentialProvenance?: WireCredentialProvenance
       }) | undefined
       const artExtra = record.artifact as (typeof record.artifact & {
         subscriptionId?: string
@@ -1224,6 +1319,9 @@ export class HostFactLog {
           : {}),
         ...(reqExtra?.credentialPlacement ?? hostEntry?.credentialPlacement
           ? { credentialPlacement: reqExtra?.credentialPlacement ?? hostEntry?.credentialPlacement }
+          : {}),
+        ...(reqExtra?.wireCredentialProvenance ?? hostEntry?.wireCredentialProvenance
+          ? { wireCredentialProvenance: reqExtra?.wireCredentialProvenance ?? hostEntry?.wireCredentialProvenance }
           : {}),
         ...(reqExtra?.raceBatchId ?? hostEntry?.raceBatchId !== undefined
           ? { raceBatchId: reqExtra?.raceBatchId ?? hostEntry?.raceBatchId }
@@ -1312,6 +1410,7 @@ export class HostFactLog {
       ...(meta?.arm ? { arm: meta.arm } : {}),
       ...(meta?.evidenceRole ? { evidenceRole: meta.evidenceRole } : {}),
       ...(request.session ? { sessionId: request.session } : {}),
+      ...(exchange.wireCredentialProvenance ? { wireCredentialProvenance: exchange.wireCredentialProvenance } : {}),
       ...(exchange.secretMatches?.length
         ? { secretMatches: exchange.secretMatches.slice(0, 16).map(m => m.sha256Prefix) }
         : {}),

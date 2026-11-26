@@ -1554,14 +1554,14 @@ test('WS-20 AST lint: EgressGateway direct egress* and loopback-proxy usage stay
   const serverDir = join(repoRoot, 'src', 'server')
   const files = walkServerTsFiles(serverDir)
 
-  // Direct EgressGateway.egress* transport calls are strictly confined to broker/gateway/provider/auth
-  // (plus <= 1 transitional HTTP/2 site in verify-rpc.ts pending WS-10 migration).
+  // Direct EgressGateway.egress* / egressHttp2 transport calls are strictly confined to broker/gateway/provider/auth
+  // (verify-rpc.ts has strictly 0 allowed bypasses after C-1 broker HTTP/2 migration).
   const egressCallAllowlist: Record<string, number> = {
     'src/server/egress-gateway.ts': Number.POSITIVE_INFINITY,
     'src/server/broker.ts': Number.POSITIVE_INFINITY,
     'src/server/provider.ts': Number.POSITIVE_INFINITY,
     'src/server/persona-auth.ts': Number.POSITIVE_INFINITY,
-    'src/server/verify-rpc.ts': 1,
+    'src/server/verify-rpc.ts': 0,
   }
 
   const loopbackProxyAllowlist = new Set([
@@ -1592,6 +1592,20 @@ test('WS-20 AST lint: EgressGateway direct egress* and loopback-proxy usage stay
 
     const visit = (node: ts.Node) => {
       if (
+        ts.isImportDeclaration(node) &&
+        ts.isStringLiteral(node.moduleSpecifier) &&
+        /(?:^|\/)egress-gateway(?:\.ts)?$/.test(node.moduleSpecifier.text) &&
+        node.importClause?.namedBindings &&
+        ts.isNamedImports(node.importClause.namedBindings)
+      ) {
+        for (const el of node.importClause.namedBindings.elements) {
+          if (el.isTypeOnly) continue
+          const importedName = (el.propertyName ?? el.name).text
+          if (importedName.startsWith('egress') || importedName === 'createLoopbackProxy') {
+            recordMember(importedName, el)
+          }
+        }
+      } else if (
         ts.isPropertyAccessExpression(node) &&
         ts.isIdentifier(node.expression) &&
         node.expression.text === 'EgressGateway'
