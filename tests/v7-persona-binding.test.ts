@@ -294,6 +294,7 @@ test('an identity-assumption proof restores the actor baseline before the next p
     readbackMethod: 'GET',
     readbackPathAndQuery: '/api/v1/session',
   }), {
+    runId: 'run-v7-persona-binding',
     request: req => handle(req),
     nextExchangeId: (() => { let n = 0; return () => `ex-${++n}` })(),
   })

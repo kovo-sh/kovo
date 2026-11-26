@@ -777,7 +777,7 @@ export async function runPlannedRecipe(input: RunPlannedRecipeInput): Promise<Fl
     signal: input.signal,
     origin: input.plan.args.origin || input.hypothesis.endpoint.origin,
     probeClass: input.hypothesis.probeClass,
-    ...(input.runId ? { runId: input.runId } : {}),
+    runId: (input.runId ?? '').trim() || `floor_ephemeral_${randomUUID()}`,
     ...(input.assignmentId ? { assignmentId: input.assignmentId } : {}),
     ...(input.headers ? { headers: input.headers } : {}),
     ...(input.recordExchange ? { recordExchange: input.recordExchange } : {}),
@@ -1181,7 +1181,7 @@ export async function retestPersistedRecipe(input: {
       signal: input.signal,
       origin: input.origin,
       ...(input.probeClass ? { probeClass: input.probeClass } : {}),
-      ...(input.runId ? { runId: input.runId } : {}),
+      runId: (input.runId ?? '').trim() || `floor_retest_${randomUUID()}`,
       ...(input.assignmentId ? { assignmentId: input.assignmentId } : {}),
       ...(input.recordExchange ? { recordExchange: input.recordExchange } : {}),
     })

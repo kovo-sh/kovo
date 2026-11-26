@@ -83,7 +83,7 @@ test('v7 retest receipts: a recipe-confirmed spec persists its recipe envelope',
     mode: 'boolean',
     rounds: 2,
   }
-  const execution = await runFloorRecipe(floorRecipe('boolean_or_timing', args), brokerFloorRecipeDeps({ broker, grant, signal, origin }))
+  const execution = await runFloorRecipe(floorRecipe('boolean_or_timing', args), brokerFloorRecipeDeps({ broker, grant, signal, origin, runId: 'run-v7-retest-receipts' }))
   assert.equal(execution.result.confirmed, true, execution.failure?.message ?? execution.result.verification.reason)
 
   const plan: FloorRecipePlan = { recipeId: 'boolean_or_timing', specKind: 'sql_boolean_diff', vulnClass: 'sqli', endpoint: '/api/search', args }
@@ -115,7 +115,7 @@ test('v7 retest receipts: retest re-runs the recipe and never consults the decla
     mode: 'boolean',
     rounds: 2,
   }
-  const execution = await runFloorRecipe(floorRecipe('boolean_or_timing', args), brokerFloorRecipeDeps({ broker, grant, signal, origin }))
+  const execution = await runFloorRecipe(floorRecipe('boolean_or_timing', args), brokerFloorRecipeDeps({ broker, grant, signal, origin, runId: 'run-v7-retest-receipts' }))
   assert.equal(execution.result.confirmed, true, execution.failure?.message ?? execution.result.verification.reason)
   const plan: FloorRecipePlan = { recipeId: 'boolean_or_timing', specKind: 'sql_boolean_diff', vulnClass: 'sqli', endpoint: '/api/search', args }
   const record = recipeSpecRecord(plan, execution)

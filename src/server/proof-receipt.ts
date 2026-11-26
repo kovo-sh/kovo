@@ -1237,10 +1237,10 @@ export function verifyReceipt(
     // any-minted-host fallbacks deleted) verified against per-run HMAC NonceLedger.
     if (!effectiveRunId) return reject(receipt, rule, 'Redirect receipt requires a host runId for per-run HMAC nonce verification.')
     const mintedHost = (probe.hostRedirectCanaryHost ?? '').trim().toLowerCase()
+    const inferredRedirParam = receipt.target.param ?? matchingControls.map(c => diffRequestParams(c, probe).differingKeys).find(k => k.length === 1)?.[0]
     const redirExpected = {
       runId: effectiveRunId, origin: probeOrigin, method: probeMethod, route: exactPathnameOf(probe.step.pathAndQuery ?? probe.step.route ?? '/'),
-      ...(receipt.target.param ? { param: receipt.target.param } : {}),
-      armRole: 'probe', exchangeId: probe.exchangeId,
+      ...(inferredRedirParam ? { param: inferredRedirParam } : {}), armRole: 'probe', exchangeId: probe.exchangeId,
     }
     const isHostMintedCanary = Boolean(
       mintedHost && mintedHost === locationHost && (
@@ -4471,16 +4471,6 @@ export function buildAgentScriptReceipt(input: {
       const probe = factLog.getExchange(variants[0]!)
       const baseline = factLog.getExchange(controls[0]!)
       if (!probe || !baseline) continue
-      // H-15: Require host-minted timing challenge and strict timingArmIdentity consistency.
-      const challengeId = typeof recordField(claim, 'hostMintedTimingChallengeId') === 'string'
-        ? (recordField(claim, 'hostMintedTimingChallengeId') as string).trim()
-        : ''
-      const rawChallenge = (challengeId ? defaultHostMintedOracle.getTimingChallenge(challengeId, factLog.runId) : undefined)
-        ?? probe.hostTimingChallenge
-        ?? baseline.hostTimingChallenge
-      const verifiedChallenge = factLog.runId ? defaultHostMintedOracle.verifyTimingChallenge(rawChallenge, { runId: factLog.runId, ...(rawChallenge?.nonceStamp?.exchangeId ? { exchangeId: rawChallenge.nonceStamp.exchangeId } : {}) }) : null
-      if (!verifiedChallenge) continue
-
       const armOverrides = new Map<string, ImpactStep['arm']>()
       for (const id of controls) armOverrides.set(id, 'control')
       for (const id of variants) armOverrides.set(id, 'probe')
@@ -4492,6 +4482,15 @@ export function buildAgentScriptReceipt(input: {
       const paramDiff = diffRequestParams(controlEntry, probeEntry)
       if (paramDiff.differingKeys.length !== 1) continue
       const param = paramDiff.differingKeys[0]!
+      // H-15: Require host-minted timing challenge and strict timingArmIdentity consistency.
+      const challengeId = typeof recordField(claim, 'hostMintedTimingChallengeId') === 'string'
+        ? (recordField(claim, 'hostMintedTimingChallengeId') as string).trim()
+        : ''
+      const rawChallenge = (challengeId ? defaultHostMintedOracle.getTimingChallenge(challengeId, factLog.runId) : undefined)
+        ?? probe.hostTimingChallenge
+        ?? baseline.hostTimingChallenge
+      const verifiedChallenge = factLog.runId ? defaultHostMintedOracle.verifyTimingChallenge(rawChallenge, { runId: factLog.runId, origin: probe.origin || input.origin, method: probe.method, route: exactPathnameOf(probe.pathAndQuery), param, ...(rawChallenge === probe.hostTimingChallenge ? { armRole: 'probe', exchangeId: probe.exchangeId } : rawChallenge === baseline.hostTimingChallenge ? { armRole: 'control', exchangeId: baseline.exchangeId } : {}) }) : null
+      if (!verifiedChallenge) continue
       const baseId = timingArmIdentityOf(controlEntry, param)
       const allConsistent = [...controls, ...variants].every(id => {
         const entry = byId.get(id)

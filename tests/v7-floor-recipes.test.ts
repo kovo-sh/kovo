@@ -36,6 +36,7 @@ function fixtureDeps(
 ): FloorRecipeDeps {
   let seq = 0
   return {
+    runId: 'run-v7-floor-recipes',
     request: spec => handler(spec),
     nextExchangeId: () => `fx-${++seq}`,
     ...(oob ? { oob } : {}),

@@ -241,6 +241,7 @@ test('R2-08.1b: throw injected during post_mutation_read (BrokerDenied) triggers
       readbackPathAndQuery: '/api/v1/session',
     }),
     {
+      runId: 'run-r2-08-1b',
       request: spec => {
         if (spec.role === 'post_mutation_read') {
           throw new BrokerDenied('Injected BrokerDenied during post_mutation_read')
@@ -436,6 +437,7 @@ test('R2-08.3a: non-selfState baselineWrite restores owner original value on suc
   }
 
   const execution = await runFloorRecipe(floorRecipe('persisted_mutation', args), {
+    runId: 'run-r2-08-3',
     request: spec => {
       if (spec.method === 'GET') {
         const doc = { id: 'inv-42', title: invoiceTitle, amount: 100 }
@@ -488,6 +490,7 @@ test('R2-08.3b: non-selfState baselineWrite restores owner original value on col
   }
 
   const execution = await runFloorRecipe(floorRecipe('persisted_mutation', args), {
+    runId: 'run-r2-08-3',
     request: spec => {
       if (spec.role === 'post_mutation_read') {
         throw new Error('simulated transport timeout during post_mutation_read')

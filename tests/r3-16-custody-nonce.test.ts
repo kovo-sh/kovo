@@ -1001,3 +1001,58 @@ test('R3-16 Test 9 (B1 E2E + N3\'): handler->transcript->verifyReceipt with real
   assert.throws(() => defaultHostMintedOracle.mintExpressionChallenge('ssti'), /runId/i)
   assert.throws(() => defaultHostMintedOracle.mintBooleanPair('1'), /runId/i)
 })
+
+// ============================================================================
+// Test 10 (R3-05 C1a, C1b, C2): Strict caller-omission rejection, strictly
+// monotonic bindStamp (E1/R1 -> R2/E2 returns null), and mandatory FloorRecipeDeps.runId
+// ============================================================================
+
+test('R3-16 Test 10 (C1a/C1b/C2): verifyStamp rejects omitted non-null dims, bindStamp is strictly monotonic, and floor recipes reject blank runId', async () => {
+  const ledger = new NonceLedger()
+  const runId = 'run-c1-strict-1'
+  const parent = ledger.mintStamp(
+    { runId, oracleId: 'timing', origin: ORIGIN, method: 'GET', route: '/api/R1', param: 'q' },
+    { delayMs: 2_000 },
+  )
+  // Monotonic refinement: parent has armRole=null, exchangeId=null -> child fills both
+  const bound = ledger.bindStamp(parent, { armRole: 'probe', exchangeId: 'E1' }, 'E1')
+  assert.ok(bound, 'monotonic child filling null armRole/exchangeId must succeed')
+
+  // C1(a): full expected tuple passes, omitting ANY non-null dimension fails closed
+  const fullExpected = {
+    runId, oracleId: 'timing' as const, origin: ORIGIN, method: 'GET',
+    route: '/api/R1', param: 'q', armRole: 'probe', exchangeId: 'E1',
+  }
+  assert.ok(ledger.verifyStamp(bound, fullExpected), 'full expected tuple must verify')
+  for (const omittedKey of ['origin', 'method', 'route', 'param', 'armRole', 'exchangeId'] as const) {
+    const partial = { ...fullExpected }
+    delete (partial as Record<string, unknown>)[omittedKey]
+    assert.equal(
+      ledger.verifyStamp(bound, partial),
+      null,
+      `C1(a): omitting bound dimension "${omittedKey}" must fail closed`,
+    )
+  }
+
+  // C1(b): strictly monotonic bindStamp rejects overriding ANY non-null parent dimension
+  assert.equal(ledger.bindStamp(bound, { route: '/api/R2' }, 'R2'), null, 're-binding E1/R1 stamp to route R2 must return null')
+  assert.equal(ledger.bindStamp(bound, { exchangeId: 'E2' }, 'E2'), null, 're-binding E1/R1 stamp to exchange E2 must return null')
+  assert.equal(ledger.bindStampToExchange(bound, 'E2'), null, 'bindStampToExchange on already-bound E1 stamp to E2 must return null')
+  assert.equal(ledger.bindStamp(bound, { origin: 'https://other.example.invalid' }), null, 'overriding origin must return null')
+  assert.equal(ledger.bindStamp(bound, { method: 'POST' }), null, 'overriding method must return null')
+  assert.equal(ledger.bindStamp(bound, { param: 'other' }), null, 'overriding param must return null')
+  assert.equal(ledger.bindStamp(bound, { armRole: 'control' }), null, 'overriding armRole must return null')
+  assert.equal(ledger.bindStamp(bound, { route: null }), null, 'clearing non-null route to null must return null')
+  assert.ok(ledger.bindStamp(bound, { route: '/api/R1', exchangeId: 'E1' }, 'E1'), 'idempotent repeat of identical parent dims succeeds')
+
+  // C2: FloorRecipeDeps.runId is mandatory (blank/missing throws fail-closed)
+  await assert.rejects(
+    () => runCut3Recipe(cut3FloorRecipe('redirect', {
+      origin: ORIGIN, method: 'GET', pathAndQuery: '/auth/Go?next=/home',
+      controlPathAndQuery: '/auth/Go?next=/home', probePathAndQuery: '/auth/Go?next=https://{{redirectHost}}/ok',
+      vulnClass: 'open_redirect', actor: { handle: 'alice', role: 'member', tenant: 'acme' },
+    }), { runId: '', request: () => ({ status: 302, body: '' }) }),
+    /runId/i,
+    'C2: runCut3Recipe must throw fail-closed when FloorRecipeDeps.runId is empty',
+  )
+})

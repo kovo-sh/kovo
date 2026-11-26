@@ -401,8 +401,9 @@ export class NonceLedger {
 
   /**
    * Derive a target/arm/exchange-bound child stamp (`<rootId>@<suffix>`) from an existing minted
-   * stamp (in-memory only), preserving `payloadDigest` and binding target dimensions (`origin`,
-   * `method`, `route`, `param`, `armRole`, optional `exchangeId`).
+   * stamp (in-memory only), preserving `payloadDigest`. Strictly monotonic (R3-16 C1b): a child
+   * may ONLY fill `null` parent dimensions; overriding any non-null parent dimension with a
+   * different value (or `null`) fails closed and returns `null`.
    */
   bindStamp(
     baseStamp: NonceStamp,
@@ -415,18 +416,40 @@ export class NonceLedger {
     if (!key) return null
     const expectedMac = computeStampMac(key, entry.stamp)
     if (!constantTimeHexEqual(baseStamp.mac, expectedMac)) return null
+    const mergeDim = (
+      parent: string | null,
+      requested: string | null | undefined,
+      normalize: (value: string | null | undefined) => string | null,
+    ): string | null | undefined => {
+      if (requested === undefined) return parent
+      const normReq = normalize(requested)
+      if (parent !== null) return normReq === parent ? parent : undefined
+      return normReq
+    }
+    const armRole = mergeDim(entry.stamp.armRole, binding.armRole, normArmRole)
+    const origin = mergeDim(entry.stamp.origin, binding.origin, normOrigin)
+    const method = mergeDim(entry.stamp.method, binding.method, normMethod)
+    const route = mergeDim(entry.stamp.route, binding.route, normRoute)
+    const param = mergeDim(entry.stamp.param, binding.param, normNullable)
+    const exchangeId = mergeDim(entry.stamp.exchangeId, binding.exchangeId, normNullable)
+    if (
+      armRole === undefined || origin === undefined || method === undefined ||
+      route === undefined || param === undefined || exchangeId === undefined
+    ) {
+      return null
+    }
     const rootId = entry.stamp.stampId.split('@')[0]!
     const cleanSuffix = normNullable(suffix) ?? normNullable(binding.exchangeId) ?? normArmRole(binding.armRole) ?? randomUUID().slice(0, 8)
     return this.mintStamp(
       {
         runId: entry.stamp.runId,
         oracleId: entry.stamp.oracleId,
-        armRole: binding.armRole !== undefined ? binding.armRole : entry.stamp.armRole,
-        origin: binding.origin !== undefined ? binding.origin : entry.stamp.origin,
-        method: binding.method !== undefined ? binding.method : entry.stamp.method,
-        route: binding.route !== undefined ? binding.route : entry.stamp.route,
-        param: binding.param !== undefined ? binding.param : entry.stamp.param,
-        exchangeId: binding.exchangeId !== undefined ? binding.exchangeId : entry.stamp.exchangeId,
+        armRole,
+        origin,
+        method,
+        route,
+        param,
+        exchangeId,
       },
       entry.payloadJson,
       {
@@ -539,22 +562,32 @@ export class NonceLedger {
     if (expected.origin !== undefined) {
       const expOrigin = normOrigin(expected.origin)
       if (expOrigin === null || stored.origin === null || stored.origin !== expOrigin) return null
+    } else if (stored.origin !== null) {
+      return null
     }
     if (expected.method !== undefined) {
       const expMethod = normMethod(expected.method)
       if (expMethod === null || stored.method === null || stored.method !== expMethod) return null
+    } else if (stored.method !== null) {
+      return null
     }
     if (expected.route !== undefined) {
       const expRoute = normRoute(expected.route)
       if (expRoute === null || stored.route === null || stored.route !== expRoute) return null
+    } else if (stored.route !== null) {
+      return null
     }
     if (expected.param !== undefined) {
       const expParam = normNullable(expected.param)
       if (expParam === null || stored.param === null || stored.param !== expParam) return null
+    } else if (stored.param !== null) {
+      return null
     }
     if (expected.armRole !== undefined) {
       const expArmRole = normArmRole(expected.armRole)
       if (expArmRole === null || stored.armRole === null || stored.armRole !== expArmRole) return null
+    } else if (stored.armRole !== null) {
+      return null
     }
     if (expected.exchangeId !== undefined) {
       const expExchangeId = normNullable(expected.exchangeId)

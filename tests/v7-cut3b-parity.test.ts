@@ -278,6 +278,7 @@ test('access_boundary confirms a cross-actor read behind an authenticated bogus-
         : '{"error":"not found"}',
       route: req.pathAndQuery.split('?')[0],
     }),
+    runId: 'run-v7-cut3b-parity',
     nextExchangeId: seq(),
   })
   assert.equal(execution.result.confirmed, true, execution.failure?.message ?? execution.result.verification.reason)
@@ -304,6 +305,7 @@ test('access_boundary rejects the same cross-actor read when the probe gets no v
       body: req.pathAndQuery.includes('order-bogus') ? '{"error":"not found"}' : '{"ok":true}',
       route: req.pathAndQuery.split('?')[0],
     }),
+    runId: 'run-v7-cut3b-parity',
     nextExchangeId: seq(),
   })
   assert.equal(execution.result.confirmed, false)
@@ -332,6 +334,7 @@ test('access_boundary accepts the collection-reference shape: a distinct 2xx con
         route: '/api/assets',
       }
     },
+    runId: 'run-v7-cut3b-parity',
     nextExchangeId: seq(),
   })
   assert.equal(execution.result.confirmed, true, execution.failure?.message ?? execution.result.verification.reason)
@@ -354,6 +357,7 @@ test('access_boundary still rejects a distinct control when the recipe asked for
       body: req.pathAndQuery.includes('bogus') ? '{"assets":[]}' : '{"assets":[{"id":"a1","private_note":"victim data"}]}',
       route: '/api/assets',
     }),
+    runId: 'run-v7-cut3b-parity',
     nextExchangeId: seq(),
   })
   assert.equal(execution.result.confirmed, false)
@@ -400,6 +404,7 @@ test('persisted_mutation confirms an authz write through a fresh baseline write 
       state = body.status ?? state
       return { status: 204, body: '', route: '/api/v1/shipments/shipment-victim' }
     },
+    runId: 'run-v7-cut3b-parity',
     nextExchangeId: seq(),
   })
   assert.equal(execution.result.confirmed, true, execution.failure?.message ?? execution.result.verification.reason)
@@ -424,6 +429,7 @@ test('persisted_mutation rejects an idempotent authz write (identical post-get r
       }
       return { status: 204, body: '', route: '/api/v1/shipments/shipment-victim' }
     },
+    runId: 'run-v7-cut3b-parity',
     nextExchangeId: seq(),
   })
   assert.equal(execution.result.confirmed, false)
@@ -463,6 +469,7 @@ test('persisted_mutation resets self-service state before the proof (bfla impers
       sessions.set(persona, body.store ?? 'own-store')
       return { status: 200, body: '{"ok":true}', route: '/api/v1/admin/impersonate' }
     },
+    runId: 'run-v7-cut3b-parity',
     nextExchangeId: seq(),
   })
   assert.equal(execution.result.confirmed, true, execution.failure?.message ?? execution.result.verification.reason)
@@ -494,6 +501,7 @@ test('persisted_mutation confirms a DELETE when the post-read tombstone is 404 w
       deleted = true
       return { status: 204, body: '', route: '/api/admin/people/person-victim' }
     },
+    runId: 'run-v7-cut3b-parity',
     nextExchangeId: seq(),
   })
   assert.equal(execution.result.confirmed, true, execution.failure?.message ?? execution.result.verification.reason)
@@ -517,6 +525,7 @@ test('persisted_mutation rejects a DELETE whose post-read still serves the resou
     request: req => req.method === 'GET'
       ? { status: 200, json: { id: 'person-victim' }, body: '{"id":"person-victim"}', route: '/api/people/person-victim' }
       : { status: 204, body: '', route: '/api/admin/people/person-victim' },
+    runId: 'run-v7-cut3b-parity',
     nextExchangeId: seq(),
   })
   assert.equal(execution.result.confirmed, false)
@@ -703,6 +712,7 @@ test('a wired status differential round-trips through the recipe surface', async
         ? { status: 200, body: JSON.stringify({ rows: [{ id: 1 }] }), route: '/api/search' }
         : { status: 404, body: '{"error":"not_found"}', route: '/api/search' }
     },
+    runId: 'run-v7-cut3b-parity',
     nextExchangeId: seq(),
   })
   assert.equal(execution.result.confirmed, true, execution.failure?.message ?? execution.result.verification.reason)

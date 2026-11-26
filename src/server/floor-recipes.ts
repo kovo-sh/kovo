@@ -166,7 +166,8 @@ export interface FloorRestoreDegradationEvent {
 }
 
 export interface FloorRecipeDeps {
-  runId?: string
+  /** R3-16 (C2): Mandatory host runId for per-run HMAC nonce ledger binding (throws if empty). */
+  runId: string
   request(spec: FloorRequestSpec): Promise<FloorExchange> | FloorExchange
   /**
    * Optional broker cleanup-allowance request seam used when draining `ctx.registerRestore(...)`
@@ -656,7 +657,9 @@ class RecipeContext implements FloorRecipeContext {
   private cleanupCount = 0
 
   constructor(args: FloorRecipeArgs, deps: FloorRecipeDeps) {
-    this.runId = (deps.runId ?? '').trim() || `floor_${createHash('sha256').update(JSON.stringify({ origin: args.origin, method: args.method, pathAndQuery: args.pathAndQuery, vulnClass: args.vulnClass })).digest('hex').slice(0, 16)}`
+    const cleanRunId = typeof deps.runId === 'string' ? deps.runId.trim() : ''
+    if (!cleanRunId) throw new Error('FloorRecipeDeps.runId is required (silent synthetic runId fallback is forbidden).')
+    this.runId = cleanRunId
     this.args = args
     this.deps = deps
   }
@@ -2338,7 +2341,8 @@ export interface FloorRecipeBrokerOptions {
   signal: AbortSignal
   /** Assignment origin every recipe exchange is sent to. */
   origin: string
-  runId?: string
+  /** R3-16 (C2): Mandatory host runId for per-run HMAC nonce ledger binding (throws if empty). */
+  runId: string
   assignmentId?: string
   /**
    * Probe class carried on every brokered request. The broker uses it for the same policy,
@@ -2396,6 +2400,8 @@ export function exchangeToFloorExchange(
  * receipt cites persisted exchange ids.
  */
 export function brokerFloorRecipeDeps(options: FloorRecipeBrokerOptions): FloorRecipeDeps {
+  const cleanRunId = typeof options.runId === 'string' ? options.runId.trim() : ''
+  if (!cleanRunId) throw new Error('FloorRecipeBrokerOptions.runId is required (silent synthetic runId fallback is forbidden).')
   const personaFor = options.personaFor
     ?? ((actor: FloorActor) => (ANONYMOUS_ACTOR_HANDLES.has(actor.handle.trim().toLowerCase()) ? null : actor.handle))
   const toBrokerRequest = (spec: FloorRequestSpec): BrokerHttpRequest => {
@@ -2433,6 +2439,7 @@ export function brokerFloorRecipeDeps(options: FloorRecipeBrokerOptions): FloorR
     }
   }
   return {
+    runId: cleanRunId,
     async request(spec: FloorRequestSpec): Promise<FloorExchange> {
       const exchange = await options.broker.executeHttp(toBrokerRequest(spec), options.grant, options.signal)
       return project(exchange, spec)

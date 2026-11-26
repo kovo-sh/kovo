@@ -697,6 +697,7 @@ test('H-17: BFLA recipe planner never sets denied === owner on the same path, an
     probe: { handle: 'member', role: 'member', tenant: 'acme' },
     denied: { handle: 'admin', role: 'admin', tenant: 'acme' },
   }), {
+    runId: 'run-movea-retest-norm',
     request: async () => {
       sent += 1
       return { status: 200, body: '{}' }

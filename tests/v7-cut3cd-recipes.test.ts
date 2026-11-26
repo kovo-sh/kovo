@@ -38,6 +38,7 @@ interface Reply {
 function depsFor(handler: (spec: FloorRequestSpec) => Reply, extra: Partial<FloorRecipeDeps> = {}): FloorRecipeDeps {
   let counter = 0
   return {
+    runId: 'run-v7-cut3cd-recipes',
     request: (spec): FloorExchange => {
       const reply = handler(spec)
       counter += 1
@@ -426,6 +427,7 @@ function conservedDeps(state: ConservedState, racy: boolean): FloorRecipeDeps {
     durationMs: 5,
   })
   return {
+    runId: 'run-v7-cut3cd-conserved',
     request: (spec: FloorRequestSpec): FloorExchange => {
       const amount = Number((spec.jsonBody as { amount?: number } | undefined)?.amount ?? 0)
       if (spec.role.includes('read') || amount === 0) return reply(200, { balance: state.balance })

@@ -7,6 +7,7 @@
     "files": [
       "src/server/composite-receipt.ts",
       "src/server/evidence-provenance.ts",
+      "src/server/floor-recipe-engine.ts",
       "src/server/floor-recipes.ts",
       "src/server/host-fact-log.ts",
       "src/server/nonce-ledger.ts",

@@ -253,6 +253,7 @@ test('recipe-wired boolean receipts are byte-identical across runs on identical 
       broker: fake.broker as unknown as RequestBroker,
       grant,
       signal,
+      runId: 'run-v7-cut3a-deterministic',
       recordExchange: () => `ex-${++cursor}`,
     })
     return {

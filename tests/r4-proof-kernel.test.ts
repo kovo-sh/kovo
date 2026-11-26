@@ -73,13 +73,13 @@ test('R4-C-1: HostMintedOracle.mintBooleanPair enforces non-empty base, equal le
     const trueStamp = oracle.stampBooleanPairArm(pair, 'true')
     const falseStamp = oracle.stampBooleanPairArm(pair, 'false')
     const baseStamp = oracle.stampBooleanPairArm(pair, 'baseline')
-    assert.ok(oracle.verifyBooleanPair(trueStamp, { runId, armRole: 'true' }))
-    assert.ok(oracle.verifyBooleanPair(falseStamp, { runId, armRole: 'false' }))
-    assert.ok(oracle.verifyBooleanPair(baseStamp, { runId, armRole: 'baseline' }))
+    assert.ok(oracle.verifyBooleanPair(trueStamp, { runId, param: 'id', armRole: 'true' }))
+    assert.ok(oracle.verifyBooleanPair(falseStamp, { runId, param: 'id', armRole: 'false' }))
+    assert.ok(oracle.verifyBooleanPair(baseStamp, { runId, param: 'id', armRole: 'baseline' }))
 
     // Tampering with mintedValue or unknown challengeId fails closed
-    assert.equal(oracle.verifyBooleanPair({ ...trueStamp, mintedValue: `${trueStamp.mintedValue}0` }, { runId, armRole: 'true' }), null)
-    assert.equal(oracle.verifyBooleanPair({ ...trueStamp, challengeId: 'bool_unregistered' }, { runId, armRole: 'true' }), null)
+    assert.equal(oracle.verifyBooleanPair({ ...trueStamp, mintedValue: `${trueStamp.mintedValue}0` }, { runId, param: 'id', armRole: 'true' }), null)
+    assert.equal(oracle.verifyBooleanPair({ ...trueStamp, challengeId: 'bool_unregistered' }, { runId, param: 'id', armRole: 'true' }), null)
   }
 })
 

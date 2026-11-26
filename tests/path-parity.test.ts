@@ -1198,6 +1198,7 @@ test('path parity [floor-recipe-engine]: receiptCheckForResult + injection_finge
         actor: { handle: 'anonymous' },
       }),
       {
+        runId: `parity_floor_${c.id}`,
         request: (req) => {
           const ex = req.arm === 'control' ? ctlEx : prbEx
           return {
@@ -1229,6 +1230,7 @@ test('path parity [floor-recipe-engine]: receiptCheckForResult + injection_finge
       actor: { handle: 'anonymous' },
     }),
     {
+      runId: 'parity_floor_cross_family',
       request: (req) => req.arm === 'control'
         ? { status: 200, body: '{"items":[]}', json: { items: [] } }
         : { status: 500, body: '{"error":"sh: 1: kovo_cmd: not found"}', json: { error: 'sh: 1: kovo_cmd: not found' } },

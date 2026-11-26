@@ -16,7 +16,7 @@ import {
 import type { AmbientAuth, BoundaryClass, ImpactClass, ImpactStep, InjectionFamily, InjectionFamilyScope, ActorIdentity, RoleName } from './oracle-invariants.ts'
 import { isJobOrHandleStub } from './v8-oracle-families.ts'
 import { deriveRecordAuthMeta, resolveCanonicalArm, stepHasRedactedRequestPlane, type HostFactLog } from './host-fact-log.ts'
-import { defaultHostMintedOracle, exactPathnameOf, normalizeRequestCarrier, verifyHostExpressionProbe, verifySignedUrlMintPair, type HostMintedExpressionChallenge, type HostMintedRedirectCanary, type HostMintedTimingChallenge, type HostStampedBooleanPair } from './proof-receipt.ts'
+import { defaultHostMintedOracle, diffRequestParams, exactPathnameOf, normalizeRequestCarrier, verifyHostExpressionProbe, verifySignedUrlMintPair, type HostMintedExpressionChallenge, type HostMintedRedirectCanary, type HostMintedTimingChallenge, type HostStampedBooleanPair } from './proof-receipt.ts'
 import { compileSafeClaimRegex, MAX_CLAIM_REGEX_HAYSTACK } from './safe-regex.ts'
 export { compileSafeClaimRegex } from './safe-regex.ts'
 import { DEFAULT_ORACLE_SPEC_REGISTRY, evaluateRegisteredOracleClaim, isRegisteredImpactClass, isSignedUrlMintLabel, registerOracleClaimEvaluator, sealOracleClaimEvaluators } from './oracle-spec.ts'
@@ -1452,21 +1452,19 @@ export function evaluateClaim(
   switch (claim.kind) {
     case 'host_evaluated_expression': {
       const effRunId = context.runId ?? context.factLog?.runId ?? null
-      const verifiedChs = effRunId ? claim.hostMintedChallengeIds.map(id => defaultHostMintedOracle.verifyExpressionChallenge(defaultHostMintedOracle.getExpressionChallenge(id, effRunId), { runId: effRunId })) : []
-      if (!effRunId || verifiedChs.length === 0 || verifiedChs.some(c => !c)) return { claim, passed: false, detail: 'host_evaluated_expression references an unknown or unverified host-minted challenge (or lacks a host runId).', observed: { rejectedBy: 'host_evaluated_expression' } }
-      const chs = verifiedChs as NonNullable<(typeof verifiedChs)[number]>[]
+      if (!effRunId || claim.hostMintedChallengeIds.length === 0) return { claim, passed: false, detail: 'host_evaluated_expression references an unknown or unverified host-minted challenge (or lacks a host runId).', observed: { rejectedBy: 'host_evaluated_expression' } }
       const ctlRecs = claim.controlIds.map(requireRecord), prbRecs = claim.probeIds.map(requireRecord)
       if (ctlRecs.some(r => !r?.response) || prbRecs.some(r => !r?.response)) return { claim, passed: false, detail: 'host_evaluated_expression references an unknown or failed control/probe exchange.', observed: { rejectedBy: 'host_evaluated_expression' } }
       if ([...claim.controlIds, ...claim.probeIds].some(id => { const s = toTranscriptStep(store, id, 'probe', { factLog: context.factLog }); return Boolean(s && stepHasRedactedRequestPlane(s)) })) return { claim, passed: false, detail: 'host_evaluated_expression rejected: kernel request plane contains a redacted placeholder ([redacted...]).', observed: { rejectedBy: 'redacted_request_plane' } }
-      const ok2xx = (r: VerifyTranscriptRecord | null) => { const s = recordStatus(r ?? undefined); return s !== null && s >= 200 && s < 300 }
-      const ctlBodies = claim.controlIds.map(id => store.body(id) ?? ''), prbBodies = claim.probeIds.map(id => store.body(id) ?? '')
-      const outputs = chs.map(c => c.expectedOutput), varying = outputs.length < 2 || new Set(outputs).size === outputs.length
-      const matched = chs.length === prbBodies.length && chs.every((ch, i) => {
-        const pid = claim.probeIds[i]!, fact = context.factLog?.getExchange(pid), prbRec = prbRecs[i]!
-        const check = verifyHostExpressionProbe({ probeRequest: { pathAndQuery: fact?.pathAndQuery ?? prbRec.request?.pathAndQuery, requestBody: fact?.rawRequestBody ?? store.requestBody(pid) ?? null, requestHeaders: fact?.requestHeaders ?? prbRec.request?.headers ?? null }, probeBody: prbBodies[i]!, probeStatus: recordStatus(prbRec), controlBodies: ctlBodies, stampedChallenge: fact?.hostExpressionChallenge ?? prbRec.hostExpressionChallenge, expectedChallengeId: ch.challengeId, vulnClass: claim.vulnClass, binding: { runId: effRunId, origin: (fact?.origin || prbRec.request?.origin), method: (fact?.method || prbRec.request?.method), route: exactPathnameOf(fact?.pathAndQuery ?? prbRec.request?.pathAndQuery ?? '/'), armRole: 'probe', exchangeId: pid } })
-        return check.ok && outputs.every((o, j) => j === i || !prbBodies[i]!.includes(o))
-      })
-      const passed = ctlRecs.every(ok2xx) && prbRecs.every(ok2xx) && varying && matched
+      const ok2xx = (r: VerifyTranscriptRecord | null) => { const s = recordStatus(r ?? undefined); return s !== null && s >= 200 && s < 300 }, ctlBodies = claim.controlIds.map(id => store.body(id) ?? ''), prbBodies = claim.probeIds.map(id => store.body(id) ?? '')
+      const ctlStep = claim.controlIds[0] ? toTranscriptStep(store, claim.controlIds[0], 'control', { factLog: context.factLog }) : null, ctlEntry = ctlStep ? { exchangeId: claim.controlIds[0]!, step: ctlStep, carrierText: context.factLog?.getExchange(claim.controlIds[0]!)?.rawRequestBody ?? store.requestBody(claim.controlIds[0]!) ?? undefined } : null
+      const checks = claim.hostMintedChallengeIds.length === prbBodies.length ? claim.hostMintedChallengeIds.map((chId, i) => {
+        const pid = claim.probeIds[i]!, fact = context.factLog?.getExchange(pid), prbRec = prbRecs[i]!, prbStep = toTranscriptStep(store, pid, 'probe', { factLog: context.factLog }), diff = ctlEntry && prbStep ? diffRequestParams(ctlEntry, { exchangeId: pid, step: prbStep, carrierText: fact?.rawRequestBody ?? store.requestBody(pid) ?? undefined }) : null, param = diff && diff.differingKeys.length === 1 ? diff.differingKeys[0] : undefined, origin = fact?.origin || prbRec.request?.origin, method = fact?.method || prbRec.request?.method
+        return verifyHostExpressionProbe({ probeRequest: { pathAndQuery: fact?.pathAndQuery ?? prbRec.request?.pathAndQuery, requestBody: fact?.rawRequestBody ?? store.requestBody(pid) ?? null, requestHeaders: fact?.requestHeaders ?? prbRec.request?.headers ?? null }, probeBody: prbBodies[i]!, probeStatus: recordStatus(prbRec), controlBodies: ctlBodies, stampedChallenge: fact?.hostExpressionChallenge ?? prbRec.hostExpressionChallenge, expectedChallengeId: chId, vulnClass: claim.vulnClass, binding: { runId: effRunId, ...(origin ? { origin } : {}), ...(method ? { method } : {}), route: exactPathnameOf(fact?.pathAndQuery ?? prbRec.request?.pathAndQuery ?? '/'), ...(param ? { param } : {}), armRole: 'probe', exchangeId: pid } })
+      }) : []
+      const chs = checks.map(c => c.challenge).filter((c): c is HostMintedExpressionChallenge => Boolean(c))
+      if (chs.length === 0 || chs.length !== claim.hostMintedChallengeIds.length) return { claim, passed: false, detail: 'host_evaluated_expression references an unknown or unverified host-minted challenge (or lacks a host runId).', observed: { rejectedBy: 'host_evaluated_expression' } }
+      const outputs = chs.map(c => c.expectedOutput), varying = outputs.length < 2 || new Set(outputs).size === outputs.length, matched = checks.every((c, i) => c.ok && outputs.every((o, j) => j === i || !prbBodies[i]!.includes(o))), passed = ctlRecs.every(ok2xx) && prbRecs.every(ok2xx) && varying && matched
       return { claim, passed, detail: passed ? `Host-minted ${chs[0]!.family} expression evaluation verified across ${chs.length} challenge(s).` : 'Host-minted evaluated-expression verification failed (missing per-exchange stamp, malformed escape, non-varying operands, control leakage, reflection, or absent computed output).', observed: { passed, family: chs[0]!.family, challengeCount: chs.length, vulnClass: claim.vulnClass ?? null } }
     }
     case 'status': {
