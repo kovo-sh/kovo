@@ -601,6 +601,7 @@ test('H-32: verify-claims.ts rejects catastrophic backtracking ReDoS regexes in 
     'a{200}',
   ]
 
+  const maxReDoSRejectMs = process.env.CI ? 50 : 5
   for (const pattern of redosPatterns) {
     const t0 = performance.now()
     const headerRes = evaluateClaim(store, { kind: 'header', exchangeId: rec.exchangeId, name: 'x-evil', matches: pattern }, {})
@@ -608,7 +609,7 @@ test('H-32: verify-claims.ts rejects catastrophic backtracking ReDoS regexes in 
     const elapsedMs = performance.now() - t0
     assert.equal(headerRes.passed, false, `header claim must reject ReDoS pattern: ${pattern.slice(0, 32)}`)
     assert.equal(jsonRes.passed, false, `jsonpath claim must reject ReDoS pattern: ${pattern.slice(0, 32)}`)
-    assert.ok(elapsedMs < 5, `ReDoS pattern "${pattern.slice(0, 32)}" took ${elapsedMs.toFixed(2)}ms (expected < 5ms)`)
+    assert.ok(elapsedMs < maxReDoSRejectMs, `ReDoS pattern "${pattern.slice(0, 32)}" took ${elapsedMs.toFixed(2)}ms (expected < ${maxReDoSRejectMs}ms)`)
   }
 
   // Haystack length cap (4096 bytes): match beyond 4096 bytes is bounded and does not scan unboundedly

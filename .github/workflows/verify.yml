@@ -22,22 +22,30 @@ jobs:
           node-version: '24'
           cache: npm
       - run: npm ci
-      - name: Fast static ratchets (v8 contamination, unwired exports, contract-change)
+      - run: npm run worker:install
+      - name: Fast static ratchets (v8 contamination, fixture contamination, unwired exports, contract-change)
         env:
           CONTRACT_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: |
           node scripts/check-v8-contamination.ts
+          node scripts/check-fixture-contamination.ts
           node scripts/check-unwired.ts
           node scripts/check-contract-change.ts --base "$CONTRACT_BASE"
-      - run: npm run check
-      - name: Run fast hermetic unit suites (quarantine & orphan enforced)
-        run: bash scripts/run-fast-tests.sh --suites-only --quarantine tests/QUARANTINE.json
+      - name: Typecheck and enforce tsc memory/time budget
+        env:
+          NODE_OPTIONS: "--max-old-space-size=6144"
+        run: |
+          npm run check -- --extendedDiagnostics | tee /tmp/tsc-extended-diagnostics.txt
+          node scripts/check-tsc-budget.ts --from-file /tmp/tsc-extended-diagnostics.txt
+      - run: npm run build
       - run: npx playwright install --with-deps chromium
       - name: Enable unprivileged userns for Chromium sandbox (Ubuntu 24.04)
         run: |
           if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
+      - name: Run fast hermetic unit suites (quarantine & orphan enforced)
+        run: bash scripts/run-fast-tests.sh --suites-only --quarantine tests/QUARANTINE.json --jobs 2
       - run: npm run worker:build
       - run: bash scripts/docker-smoke.sh
       - name: Run npm run test:boundaries

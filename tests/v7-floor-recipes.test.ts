@@ -498,14 +498,29 @@ test('disclosure rejects a response that only contains the probe actor\'s own da
 // Runner invariants
 // ============================================================================
 
+function normalizeTranscriptTiming(run: Awaited<ReturnType<typeof runFloorRecipe>>) {
+  return {
+    ...run,
+    result: {
+      ...run.result,
+      transcript: {
+        ...run.result.transcript,
+        ...(run.result.transcript.entries
+          ? { entries: run.result.transcript.entries.map(entry => ({ ...entry, durationMs: null })) }
+          : {}),
+      },
+    },
+  }
+}
+
 test('runs are byte-deterministic for identical fixtures', async () => {
   const first = await runFloorRecipe(floorRecipe('access_boundary', accessArgs()), accessDeps())
   const second = await runFloorRecipe(floorRecipe('access_boundary', accessArgs()), accessDeps())
-  assert.equal(JSON.stringify(first), JSON.stringify(second))
+  assert.equal(JSON.stringify(normalizeTranscriptTiming(first)), JSON.stringify(normalizeTranscriptTiming(second)))
 
   const rejectedFirst = await runFloorRecipe(floorRecipe('persisted_mutation', mutationArgs()), mutationDeps({ owner_id: 'u1' }))
   const rejectedSecond = await runFloorRecipe(floorRecipe('persisted_mutation', mutationArgs()), mutationDeps({ owner_id: 'u1' }))
-  assert.equal(JSON.stringify(rejectedFirst), JSON.stringify(rejectedSecond))
+  assert.equal(JSON.stringify(normalizeTranscriptTiming(rejectedFirst)), JSON.stringify(normalizeTranscriptTiming(rejectedSecond)))
 })
 
 test('runFloorRecipe validates the receipt against the transcript (no ghost exchanges)', async () => {

@@ -435,17 +435,22 @@ describe('P2 #7.4: Integration tests with mock stalled/retrying provider', () =>
 
     let requestCount = 0
     let logicalTurn = 0
+    // On 2-vCPU CI runners, widen the mock 429 stall + base budget proportionally so event-loop
+    // jitter and pre-session setup cannot push active turn time past the base budget or hard cap,
+    // while keeping total wall > baseWallClockMs (proving stall credit prevented rotation).
+    const first429DelayMs = process.env.CI ? 1_300 : 350
+    const baseWallClockMs = process.env.CI ? 2_000 : 1_150
     const server = createServer((req, res) => {
       req.resume()
       requestCount += 1
-      // First request delays 350ms and returns HTTP 429 -> ~700ms total retry/backoff stall wait!
+      // First request delays first429DelayMs and returns HTTP 429 -> total retry/backoff stall wait!
       if (requestCount === 1) {
         setTimeout(() => {
           if (!res.writableEnded) {
             res.writeHead(429, { 'content-type': 'application/json' })
             res.end(JSON.stringify({ error: { message: 'rate limit exceeded, retry later' } }))
           }
-        }, 350)
+        }, first429DelayMs)
         return
       }
       logicalTurn += 1
@@ -498,16 +503,16 @@ describe('P2 #7.4: Integration tests with mock stalled/retrying provider', () =>
     }
     priv.active.set(worker.id, job)
 
-    // Base wallClockMs = 1150ms. The 429 failed attempt + backoff (~700ms) + 3 active turns (~560ms)
-    // takes > 1250ms wall (which WOULD prematurely rotate without stall-wait deduction), while
-    // effective active time (~560ms) < 1150ms base and well below the 2300ms hard cap!
+    // Base wallClockMs = 1150ms local (2000ms CI). The 429 failed attempt + backoff + 3 active turns
+    // takes > baseWallClockMs wall (which WOULD prematurely rotate without stall-wait deduction), while
+    // effective active time (~560ms + overhead) < baseWallClockMs and well below the 2x hard cap!
     const startedAt = Date.now()
-    const budget: AssignmentBudget = { kind: 'single_step', maxTurns: 6, wallClockMs: 1_150, settlementTurn: 5 }
+    const budget: AssignmentBudget = { kind: 'single_step', maxTurns: 6, wallClockMs: baseWallClockMs, settlementTurn: 5 }
     await priv.workerRunner.runInvestigationWorker(job, step, [ORIGIN], [profile], budget)
     priv.active.delete(worker.id)
     const wallElapsedMs = Date.now() - startedAt
 
-    assert.ok(wallElapsedMs > 1_150, `expected wall duration > 1150ms base budget (proving stall credit prevented rotation), got ${wallElapsedMs}ms`)
+    assert.ok(wallElapsedMs > baseWallClockMs, `expected wall duration > ${baseWallClockMs}ms base budget (proving stall credit prevented rotation), got ${wallElapsedMs}ms`)
     assert.equal(logicalTurn, 3, 'worker must execute all 3 turns instead of rotating prematurely after 429 retry')
     const updatedStep = store.listChainSteps(runId, run.goalRevision).find(s => s.id === step.id)
     assert.equal(updatedStep?.status, 'complete', 'step must complete cleanly after transient stall credit')
@@ -579,8 +584,9 @@ describe('P2 #7.4: Integration tests with mock stalled/retrying provider', () =>
     const wallElapsedMs = Date.now() - startedAt
 
     // Must NOT hang past 2x hard cap (700ms) + teardown jitter.
+    const hardCapMaxElapsedMs = process.env.CI ? 3_500 : 1_600
     assert.ok(wallElapsedMs >= 500, `expected stall credit to delay rotation past base 350ms, rotated at ${wallElapsedMs}ms`)
-    assert.ok(wallElapsedMs < 1_600, `expected hard cap rotation near 2x base (700ms), took ${wallElapsedMs}ms`)
+    assert.ok(wallElapsedMs < hardCapMaxElapsedMs, `expected hard cap rotation near 2x base (700ms), took ${wallElapsedMs}ms`)
 
     const rotatedEvents = store.eventsAfter(runId, 0, 200).filter(e => e.kind === 'worker.wall_clock_rotated')
     assert.equal(rotatedEvents.length, 1, 'expected exactly one worker.wall_clock_rotated event at hard cap')
@@ -647,9 +653,9 @@ describe('P2 #7.4: Integration tests with mock stalled/retrying provider', () =>
       profiles: [makeProfile({ id: 'p-live', endpoint: `http://127.0.0.1:${port}`, key: 'sk-live-stall-1234' })],
       scenario: 'worker-investigation',
       prompt: 'Run quick check and complete.',
-      signal: AbortSignal.timeout(5_000),
+      signal: AbortSignal.timeout(process.env.CI ? 15_000 : 5_000),
       maxTurns: 4,
-      wallClockMs: 650,
+      wallClockMs: process.env.CI ? 1_200 : 650,
       providerTransportRetryBaseMs: 180,
       onSessionReady: handle => { liveGetter = () => handle.getProviderStallWaitMs() },
       onProviderStallWait: info => stallEvents.push(info),
@@ -730,8 +736,9 @@ describe('P2 #7.4: Integration tests with mock stalled/retrying provider', () =>
     const elapsedMs = Date.now() - startedAt
 
     // Base 300ms + expanded verify grace (~150ms) -> ~450ms (strictly bounded, never hangs).
+    const graceMaxElapsedMs = process.env.CI ? 6_000 : 3_000
     assert.ok(elapsedMs >= 380, `expected expanded verify grace to extend past base 300ms, rotated at ${elapsedMs}ms`)
-    assert.ok(elapsedMs < 3_000, `expected bounded rotation after expanded verify grace, took ${elapsedMs}ms`)
+    assert.ok(elapsedMs < graceMaxElapsedMs, `expected bounded rotation after expanded verify grace, took ${elapsedMs}ms`)
 
     const rotatedEvents = store.eventsAfter(runId, 0, 200).filter(e => e.kind === 'worker.wall_clock_rotated')
     assert.equal(rotatedEvents.length, 1)

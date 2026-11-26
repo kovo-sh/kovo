@@ -13,6 +13,107 @@ json=0
 now_epoch="$(date +%s)"
 now="$(date '+%Y-%m-%d %H:%M:%S')"
 main_rev="$(git rev-parse --short main 2>/dev/null || echo unknown)"
+STATE_DIR="${KOVO_GATE_STATE_DIR:-${HOME}/.config/kovo}"
+GH_BIN="${KOVO_GH_BIN:-gh}"
+
+# Audit main reflog since guard install / last pulse for non-queue merges.
+installed_epoch=0
+installed_main_sha=""
+guard_stamp="${STATE_DIR}/main-guard-installed"
+if [[ -f "$guard_stamp" ]]; then
+  installed_epoch="$(awk -F= '/^installed_epoch=/{print $2; exit}' "$guard_stamp" 2>/dev/null || echo 0)"
+  installed_main_sha="$(awk -F= '/^main_sha=/{print $2; exit}' "$guard_stamp" 2>/dev/null || true)"
+  case "$installed_epoch" in ''|*[!0-9]*) installed_epoch=0;; esac
+fi
+last_pulse_epoch=0
+pulse_stamp="${STATE_DIR}/last-pulse"
+if [[ -f "$pulse_stamp" ]]; then
+  last_pulse_epoch="$(cat "$pulse_stamp" 2>/dev/null || echo 0)"
+  case "$last_pulse_epoch" in ''|*[!0-9]*) last_pulse_epoch=0;; esac
+fi
+if [[ -n "${KOVO_PULSE_SINCE_EPOCH:-}" ]]; then
+  since_epoch="$KOVO_PULSE_SINCE_EPOCH"
+elif (( installed_epoch > 0 || last_pulse_epoch > 0 )); then
+  since_epoch=$(( installed_epoch > last_pulse_epoch ? installed_epoch : last_pulse_epoch ))
+else
+  since_epoch=$(( now_epoch - 86400 ))
+fi
+stop_sha="${KOVO_PULSE_SINCE_SHA:-$installed_main_sha}"
+
+non_queue_rows=""
+non_queue_count=0
+checked_reflog=0
+if git rev-parse --verify refs/heads/main >/dev/null 2>&1; then
+  while IFS='|' read -r entry_sha entry_gd entry_subject; do
+    [[ -z "${entry_sha:-}" ]] && continue
+    checked_reflog=$((checked_reflog + 1))
+    if (( checked_reflog > 50 )); then break; fi
+    if [[ -n "$stop_sha" && "$stop_sha" != "unknown" && "$entry_sha" == "$stop_sha" ]]; then
+      break
+    fi
+    entry_epoch=""
+    if [[ "$entry_gd" =~ \{([0-9]+)\} ]]; then
+      entry_epoch="${BASH_REMATCH[1]}"
+    fi
+    if [[ -n "$entry_epoch" && "$since_epoch" -gt 0 ]] && (( entry_epoch < since_epoch )); then
+      break
+    fi
+    is_ff=0
+    if [[ "$entry_subject" == *[Ff]ast-forward* ]]; then
+      is_ff=1
+    fi
+    has_valid_note=0
+    expected_tree="$(git rev-parse --verify "${entry_sha}^{tree}" 2>/dev/null || true)"
+    note_body="$(git notes --ref=refs/notes/merge-gate show "$entry_sha" 2>/dev/null || true)"
+    if [[ -n "$expected_tree" && -n "$note_body" ]]; then
+      while IFS= read -r note_line; do
+        if [[ "$note_line" =~ ^merge-gate:\ PASS\ ([a-f0-9]{16,64})\ ([a-f0-9]{40})$ ]] && [[ "${BASH_REMATCH[2]}" == "$expected_tree" ]]; then
+          has_valid_note=1
+          break
+        fi
+      done <<< "$note_body"
+    fi
+    if (( is_ff == 0 || has_valid_note == 0 )); then
+      reason=""
+      (( is_ff == 0 )) && reason="not-fast-forward"
+      if (( has_valid_note == 0 )); then
+        reason="${reason:+${reason},}missing-merge-gate-note"
+      fi
+      non_queue_count=$((non_queue_count + 1))
+      non_queue_rows+="${entry_sha:0:8}|${entry_subject}|${reason}"$'\n'
+    fi
+  done < <(git reflog show --date=unix --format='%H|%gd|%gs' main 2>/dev/null || true)
+fi
+
+# Query latest GitHub Actions verify.yml status on main.
+ci_state="unavailable"
+ci_conclusion=""
+ci_run_id=""
+ci_head_sha=""
+if [[ "${KOVO_PULSE_SKIP_CI_CHECK:-0}" != "1" ]] && { command -v "$GH_BIN" >/dev/null 2>&1 || [[ -x "$GH_BIN" ]]; }; then
+  ci_raw="$("$GH_BIN" run list --workflow verify.yml --branch main --limit 1 --json conclusion,status,databaseId,headSha 2>/dev/null || true)"
+  if [[ -n "$ci_raw" ]]; then
+    ci_parsed="$(node -e '
+      try {
+        const runs = JSON.parse(process.argv[1]);
+        if (Array.isArray(runs) && runs.length > 0) {
+          const r = runs[0] || {};
+          console.log(`${r.conclusion || ""}|${r.status || ""}|${r.databaseId || ""}|${r.headSha || ""}`);
+        }
+      } catch {}
+    ' "$ci_raw" 2>/dev/null || true)"
+    if [[ -n "$ci_parsed" ]]; then
+      IFS='|' read -r ci_conclusion ci_status_raw ci_run_id ci_head_sha <<< "$ci_parsed"
+      if [[ "$ci_conclusion" == "failure" ]]; then
+        ci_state="red"
+      elif [[ "$ci_conclusion" == "success" ]]; then
+        ci_state="green"
+      elif [[ -n "$ci_status_raw" ]]; then
+        ci_state="$ci_status_raw"
+      fi
+    fi
+  fi
+fi
 
 rows=""
 active=0
@@ -51,13 +152,36 @@ done < <(git worktree list --porcelain | awk '/^worktree / {print $2}')
 if (( json )); then
   node -e '
     const rows=process.argv[1].trim();
+    const nq=process.argv[4].trim();
     const parse=s=>s? s.split("\n").map(l=>{const p=l.split("|");return {branch:p[0],commitsAhead:Number(p[1]),state:p[2],lastCommitAge:p[3],worktree:p[4]}}):[];
-    console.log(JSON.stringify({when:process.argv[2],main:process.argv[3],active:parse(rows)},null,1));
-  ' "$rows" "$now" "$main_rev"
+    const parseNq=s=>s? s.split("\n").map(l=>{const p=l.split("|");return {sha:p[0],subject:p[1],reason:p[2]}}):[];
+    console.log(JSON.stringify({
+      when:process.argv[2],
+      main:process.argv[3],
+      active:parse(rows),
+      nonQueueMerges:parseNq(nq),
+      ci:{state:process.argv[5],conclusion:process.argv[6]||null,runId:process.argv[7]||null,headSha:process.argv[8]||null}
+    },null,1));
+  ' "$rows" "$now" "$main_rev" "$non_queue_rows" "$ci_state" "$ci_conclusion" "$ci_run_id" "$ci_head_sha"
   exit 0
 fi
 
 printf 'parallel pulse %s  (main %s)\n' "$now" "$main_rev"
+if [[ "$ci_state" == "red" ]]; then
+  printf 'CI RED: latest verify.yml run #%s on main concluded failure (sha %s)\n' "${ci_run_id:-unknown}" "${ci_head_sha:0:8}"
+elif [[ "$ci_state" == "green" ]]; then
+  printf 'CI status: GREEN (verify.yml run #%s)\n' "${ci_run_id:-unknown}"
+elif [[ "$ci_state" != "unavailable" ]]; then
+  printf 'CI status: %s (verify.yml run #%s)\n' "$ci_state" "${ci_run_id:-unknown}"
+else
+  printf 'CI status: unavailable (gh check skipped)\n'
+fi
+if (( non_queue_count > 0 )); then
+  printf '%s' "$non_queue_rows" | while IFS='|' read -r sha subj reason; do
+    [[ -z "$sha" ]] && continue
+    printf 'ACTION NON-QUEUE MERGE: %s (%s) — %s\n' "$sha" "$subj" "$reason"
+  done
+fi
 if [[ -z "$rows" ]]; then
   printf 'active streams: none\n'
 else

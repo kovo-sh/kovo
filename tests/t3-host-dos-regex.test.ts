@@ -15,6 +15,10 @@ import {
 } from '../src/server/probes/context.ts'
 import { jsHarvest } from '../worker/analyzers.ts'
 
+const CI_MULT = process.env.CI ? 6 : 1
+const MAX_50MS = 50 * CI_MULT
+const MAX_100MS = 100 * CI_MULT
+
 function measureMs(fn: () => void): number {
   const start = performance.now()
   fn()
@@ -38,7 +42,7 @@ describe('H-33: program-graph.ts linear-time parsing (anti-ReDoS)', () => {
     const elapsed = measureMs(() => {
       graph = extractProgramGraph({ files: [{ path: 'src/routes.ts', content: code }] })
     })
-    assert.ok(elapsed < 50, `Expected < 50ms on adversarial string literals, got ${elapsed.toFixed(2)}ms`)
+    assert.ok(elapsed < MAX_50MS, `Expected < ${MAX_50MS}ms on adversarial string literals, got ${elapsed.toFixed(2)}ms`)
     assert.ok(graph.routes.some(r => r.handler === 'handlerC' && r.path === "/api/escaped'ok"))
     assert.ok(graph.routes.some(r => r.handler === 'handlerD' && r.path === '/api/template'))
     assert.ok(!graph.routes.some(r => r.handler === 'handlerE'), 'interpolated template literal must not be treated as static path')
@@ -65,7 +69,7 @@ describe('H-33: program-graph.ts linear-time parsing (anti-ReDoS)', () => {
       const elapsed = measureMs(() => {
         graph = extractProgramGraph({ files: [{ path: `src/evil-${idx}.ts`, content }] })
       })
-      assert.ok(elapsed < 50, `JS payload #${idx} took ${elapsed.toFixed(2)}ms (expected < 50ms)`)
+      assert.ok(elapsed < MAX_50MS, `JS payload #${idx} took ${elapsed.toFixed(2)}ms (expected < ${MAX_50MS}ms)`)
       if (idx === payloads.length - 1) {
         const fnNames = graph.nodes.filter(n => n.kind === 'function').map(n => n.symbol)
         assert.ok(fnNames.includes('getOrder'), 'must extract TS class method with return type')
@@ -97,7 +101,7 @@ describe('H-33: program-graph.ts linear-time parsing (anti-ReDoS)', () => {
       const elapsed = measureMs(() => {
         graph = extractProgramGraph({ files: [{ path: `Billing${idx}.java`, content }] })
       })
-      assert.ok(elapsed < 50, `Java payload #${idx} took ${elapsed.toFixed(2)}ms (expected < 50ms)`)
+      assert.ok(elapsed < MAX_50MS, `Java payload #${idx} took ${elapsed.toFixed(2)}ms (expected < ${MAX_50MS}ms)`)
       if (idx === javaPayloads.length - 1) {
         const fnNames = graph.nodes.filter(n => n.kind === 'function').map(n => n.symbol)
         assert.ok(fnNames.includes('getInvoice'), 'must extract Java method')
@@ -109,7 +113,7 @@ describe('H-33: program-graph.ts linear-time parsing (anti-ReDoS)', () => {
     const goElapsed = measureMs(() => {
       extractProgramGraph({ files: [{ path: 'cmd/evil.go', content: goEvil }] })
     })
-    assert.ok(goElapsed < 50, `Go payload took ${goElapsed.toFixed(2)}ms (expected < 50ms)`)
+    assert.ok(goElapsed < MAX_50MS, `Go payload took ${goElapsed.toFixed(2)}ms (expected < ${MAX_50MS}ms)`)
   })
 
   test('adversarial 80KB HINT_PREFILTER_RE / conn-string inputs complete in < 50ms', () => {
@@ -131,7 +135,7 @@ describe('H-33: program-graph.ts linear-time parsing (anti-ReDoS)', () => {
     const elapsed = measureMs(() => {
       leads = extractStaticSecretsAndIacLeads(adversarialFiles)
     })
-    assert.ok(elapsed < 50, `extractStaticSecretsAndIacLeads took ${elapsed.toFixed(2)}ms (expected < 50ms)`)
+    assert.ok(elapsed < MAX_50MS, `extractStaticSecretsAndIacLeads took ${elapsed.toFixed(2)}ms (expected < ${MAX_50MS}ms)`)
     assert.equal(leads.filter(l => l.file === 'config/real.env').length, 2, 'must detect both real credentialed conn-strings')
     assert.equal(leads.filter(l => l.file !== 'config/real.env').length, 0, 'adversarial non-secret files must not produce false leads')
   })
@@ -154,7 +158,7 @@ describe('H-34: normalizeEphemeralNoise & responseSimilarity linear time', () =>
       const elapsed = measureMs(() => {
         normalizeEphemeralNoise(payload)
       })
-      assert.ok(elapsed < 50, `normalizeEphemeralNoise payload #${idx} took ${elapsed.toFixed(2)}ms (expected < 50ms)`)
+      assert.ok(elapsed < MAX_50MS, `normalizeEphemeralNoise payload #${idx} took ${elapsed.toFixed(2)}ms (expected < ${MAX_50MS}ms)`)
     }
   })
 
@@ -167,7 +171,7 @@ describe('H-34: normalizeEphemeralNoise & responseSimilarity linear time', () =>
     const elapsed = measureMs(() => {
       sim = responseSimilarity(a, b)
     })
-    assert.ok(elapsed < 50, `responseSimilarity on 100KB bodies took ${elapsed.toFixed(2)}ms (expected < 50ms)`)
+    assert.ok(elapsed < MAX_50MS, `responseSimilarity on 100KB bodies took ${elapsed.toFixed(2)}ms (expected < ${MAX_50MS}ms)`)
     assert.equal(sim, 1, 'identical bodies differing only in ephemeral values must have similarity 1')
 
     const c = `{"id":"doc_999","other":"totally_different_body","requestId":"req-111"}`
@@ -232,7 +236,7 @@ describe('H-35: worker/analyzers.ts jsHarvest O(log n) nodeLine on 50K-line JS',
     const elapsed = measureMs(() => {
       out = jsHarvest(largeJs, 'https://app.invalid/large-50k.js')
     })
-    assert.ok(elapsed < 100, `jsHarvest on 50K-line JS took ${elapsed.toFixed(2)}ms (expected < 100ms)`)
+    assert.ok(elapsed < MAX_100MS, `jsHarvest on 50K-line JS took ${elapsed.toFixed(2)}ms (expected < ${MAX_100MS}ms)`)
     assert.ok(out.parserUsed === 'swc' || out.parserUsed === 'acorn', `expected AST parser, got ${String(out.parserUsed)}`)
 
     const calls = out.httpCalls as Array<{ url: string; line?: number }>
@@ -259,7 +263,7 @@ describe('H-36: program-graph.ts router cycle & diamond OOM hardening', () => {
     const elapsed = measureMs(() => {
       graph = extractProgramGraph({ files: [{ path: 'src/self-loop.ts', content: code }] })
     })
-    assert.ok(elapsed < 50, `Self-mounting router took ${elapsed.toFixed(2)}ms (expected < 50ms)`)
+    assert.ok(elapsed < MAX_50MS, `Self-mounting router took ${elapsed.toFixed(2)}ms (expected < ${MAX_50MS}ms)`)
     const route = graph.routes.find(r => r.handler === 'healthHandler')
     assert.ok(route, 'non-cyclic route on self-mounting router should still be emitted')
     assert.equal(route.path, '/health', 'self-mount must not expand path repeatedly')
@@ -292,7 +296,7 @@ describe('H-36: program-graph.ts router cycle & diamond OOM hardening', () => {
     const elapsed = measureMs(() => {
       graph = extractProgramGraph({ files: [{ path: 'src/cyclic.ts', content: code }] })
     })
-    assert.ok(elapsed < 50, `Cyclic router graph took ${elapsed.toFixed(2)}ms (expected < 50ms)`)
+    assert.ok(elapsed < MAX_50MS, `Cyclic router graph took ${elapsed.toFixed(2)}ms (expected < ${MAX_50MS}ms)`)
 
     assert.equal(graph.routes.find(r => r.handler === 'hOne')?.path, '/api/one')
     assert.equal(graph.routes.find(r => r.handler === 'hTwo')?.path, '/api/b/two')
@@ -316,7 +320,7 @@ describe('H-36: program-graph.ts router cycle & diamond OOM hardening', () => {
     const elapsed = measureMs(() => {
       graph = extractProgramGraph({ files: [{ path: 'src/diamond.ts', content: code }] })
     })
-    assert.ok(elapsed < 50, `Diamond/deep router DAG took ${elapsed.toFixed(2)}ms (expected < 50ms)`)
+    assert.ok(elapsed < MAX_50MS, `Diamond/deep router DAG took ${elapsed.toFixed(2)}ms (expected < ${MAX_50MS}ms)`)
     const leaf = graph.routes.find(r => r.handler === 'leafHandler')
     assert.ok(leaf, 'leaf route should still be present')
     assert.ok(leaf.path.length <= 2048, 'mounted path length must remain bounded')

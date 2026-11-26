@@ -1577,8 +1577,12 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
         if (prematureRuledOutStrikes >= 1) return
         const corpus = [check.category, check.hypothesisClass, step.category, step.title, step.hypothesis, step.skills.join(' ')].filter(Boolean).join(' ')
         const isAuthz = multiPersonaAuthzRe.test(corpus)
-        const isMultiStep = multiStepWorkflowRe.test(corpus) || isMultiHopChainStep(step) || isPersistentWorkflowContinuationStep(step)
-        if (!((isAuthz && personasPub.length >= 2) || (isMultiStep && (personasPub.length >= 2 || isMultiHopChainStep(step) || isPersistentWorkflowContinuationStep(step))))) return
+        const stepLane = (step as { lane?: string | null }).lane
+        const isWorkflowOrChain = multiStepWorkflowRe.test(corpus)
+          || isMultiHopChainStep(step)
+          || stepLane === 'workflow'
+          || stepLane === 'business_logic'
+        if (!((isAuthz && personasPub.length >= 2) || isWorkflowOrChain)) return
         const citationText = `${check.enforcingControl ?? ''} ${check.summary ?? ''}`
         if (whiteboxFileLineRe.test(citationText)) return
         const extractedIds = [

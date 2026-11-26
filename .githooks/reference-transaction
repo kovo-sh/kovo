@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# R3-01 (`plans/claude_quality_3.md` §1) — Main-ref guard (`core.hooksPath=.githooks`).
+#
+# Refuses ANY update to `refs/heads/main` unless the target commit SHA carries a valid
+# `refs/notes/merge-gate` note matching:
+#   merge-gate: PASS <gate-digest> <merged-tree-sha>
+# where `<merged-tree-sha>` equals `git rev-parse <new-sha>^{tree}`.
+#
+# Emergency bypass:
+#   KOVO_MAIN_GUARD_OVERRIDE=1 [KOVO_MAIN_GUARD_OVERRIDE_REASON="..."] git ...
+# appends an audit event to `${KOVO_GATE_STATE_DIR:-$HOME/.config/kovo}/main-guard-overrides.log`.
+set -euo pipefail
+
+STATE="${1:-}"
+# Only enforce on the `prepared` phase (non-zero aborts the ref transaction).
+if [[ "$STATE" != "prepared" ]]; then
+  exit 0
+fi
+
+STATE_DIR="${KOVO_GATE_STATE_DIR:-${HOME}/.config/kovo}"
+OVERRIDE_LOG="${STATE_DIR}/main-guard-overrides.log"
+ZERO_SHA="0000000000000000000000000000000000000000"
+
+while IFS=' ' read -r old_sha new_sha ref_name; do
+  [[ -z "${ref_name:-}" ]] && continue
+  if [[ "$ref_name" != "refs/heads/main" ]]; then
+    continue
+  fi
+  if [[ "$old_sha" == "$new_sha" ]]; then
+    continue
+  fi
+
+  if [[ "${KOVO_MAIN_GUARD_OVERRIDE:-0}" == "1" ]]; then
+    mkdir -p "$STATE_DIR"
+    repo_dir="$(git rev-parse --git-common-dir 2>/dev/null || pwd)"
+    reason="${KOVO_MAIN_GUARD_OVERRIDE_REASON:-unspecified}"
+    reason="${reason//$'\n'/ }"
+    printf '%s repo=%s ref=%s old=%s new=%s user=%s reason=%s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$repo_dir" "$ref_name" "$old_sha" "$new_sha" "${USER:-unknown}" "$reason" \
+      >>"$OVERRIDE_LOG"
+    echo "main-guard: WARNING — KOVO_MAIN_GUARD_OVERRIDE=1 used for refs/heads/main (${old_sha:0:8} -> ${new_sha:0:8}); audit logged to ${OVERRIDE_LOG}" >&2
+    continue
+  fi
+
+  if [[ "$new_sha" == "$ZERO_SHA" ]]; then
+    echo "main-guard: REFUSED deleting refs/heads/main (set KOVO_MAIN_GUARD_OVERRIDE=1 with a reason to audit-override)." >&2
+    exit 1
+  fi
+
+  expected_tree="$(git rev-parse --verify "${new_sha}^{tree}" 2>/dev/null || true)"
+  if [[ -z "$expected_tree" ]]; then
+    echo "main-guard: REFUSED refs/heads/main update to ${new_sha:0:12} — unable to resolve target tree SHA." >&2
+    exit 1
+  fi
+
+  note_body="$(git notes --ref=refs/notes/merge-gate show "$new_sha" 2>/dev/null || true)"
+  valid_note=0
+  if [[ -n "$note_body" ]]; then
+    while IFS= read -r note_line; do
+      if [[ "$note_line" =~ ^merge-gate:\ PASS\ ([a-f0-9]{16,64})\ ([a-f0-9]{40})$ ]]; then
+        note_tree="${BASH_REMATCH[2]}"
+        if [[ "$note_tree" == "$expected_tree" ]]; then
+          valid_note=1
+          break
+        fi
+      fi
+    done <<< "$note_body"
+  fi
+
+  if (( valid_note != 1 )); then
+    echo "main-guard: REFUSED direct update to refs/heads/main (${old_sha:0:8} -> ${new_sha:0:8})." >&2
+    echo "main-guard: Target commit is missing a valid refs/notes/merge-gate note ('merge-gate: PASS <digest> ${expected_tree}')." >&2
+    echo "main-guard: Land changes ONLY via 'scripts/merge-stream.sh <branch>' (emergency audited bypass: KOVO_MAIN_GUARD_OVERRIDE=1)." >&2
+    exit 1
+  fi
+done
+
+exit 0
