@@ -160,18 +160,21 @@ test('TerminalOracleRegistry: dispatches single-hop ProofReceipt rules (incl. 1-
   assert.deepEqual(new Set(registry.listRegisteredRules()), new Set(SINGLE_HOP_ORACLE_RULES))
   assert.deepEqual(new Set(registry.listRegisteredV8Families()), new Set(REGISTERED_V8_ORACLE_FAMILIES))
 
-  // 3a. Single-hop form-encoded boolean differential via HostFactLog + TerminalOracleRegistry
+  // 3a. Single-hop form-encoded boolean differential (3-arm baseline/true/false triangle) via HostFactLog + TerminalOracleRegistry
   const formLog = new HostFactLog()
+  const formBase = 'q=1'
   const formTrue = 'q=1%27+AND+7919%3D7919--+-'
   const formFalse = 'q=1%27+AND+7919%3D7920--+-'
-  formLog.recordExchange({ seq: 1, exchangeId: 'c1', arm: 'control', method: 'POST', origin: ORIGIN, pathAndQuery: '/bool-form', status: 200, requestHeaders: { 'content-type': 'application/x-www-form-urlencoded' }, rawRequestBody: formTrue, rawResponseBody: '{"rows":["a","b","c"]}' })
-  formLog.recordExchange({ seq: 2, exchangeId: 'p1', arm: 'probe', method: 'POST', origin: ORIGIN, pathAndQuery: '/bool-form', status: 200, requestHeaders: { 'content-type': 'application/x-www-form-urlencoded' }, rawRequestBody: formFalse, rawResponseBody: '{"rows":[]}' })
-  formLog.recordExchange({ seq: 3, exchangeId: 'c2', arm: 'control', method: 'POST', origin: ORIGIN, pathAndQuery: '/bool-form', status: 200, requestHeaders: { 'content-type': 'application/x-www-form-urlencoded' }, rawRequestBody: formTrue, rawResponseBody: '{"rows":["a","b","c"]}' })
-  formLog.recordExchange({ seq: 4, exchangeId: 'p2', arm: 'probe', method: 'POST', origin: ORIGIN, pathAndQuery: '/bool-form', status: 200, requestHeaders: { 'content-type': 'application/x-www-form-urlencoded' }, rawRequestBody: formFalse, rawResponseBody: '{"rows":[]}' })
+  formLog.recordExchange({ seq: 1, exchangeId: 'b1', arm: 'control', evidenceRole: 'benign_baseline', method: 'POST', origin: ORIGIN, pathAndQuery: '/bool-form', status: 200, requestHeaders: { 'content-type': 'application/x-www-form-urlencoded' }, rawRequestBody: formBase, rawResponseBody: '{"rows":["a","b","c"]}' })
+  formLog.recordExchange({ seq: 2, exchangeId: 'c1', arm: 'control', evidenceRole: 'tautology', method: 'POST', origin: ORIGIN, pathAndQuery: '/bool-form', status: 200, requestHeaders: { 'content-type': 'application/x-www-form-urlencoded' }, rawRequestBody: formTrue, rawResponseBody: '{"rows":["a","b","c"]}' })
+  formLog.recordExchange({ seq: 3, exchangeId: 'p1', arm: 'probe', evidenceRole: 'contradiction', method: 'POST', origin: ORIGIN, pathAndQuery: '/bool-form', status: 200, requestHeaders: { 'content-type': 'application/x-www-form-urlencoded' }, rawRequestBody: formFalse, rawResponseBody: '{"rows":[]}' })
+  formLog.recordExchange({ seq: 4, exchangeId: 'b2', arm: 'control', evidenceRole: 'benign_baseline', method: 'POST', origin: ORIGIN, pathAndQuery: '/bool-form', status: 200, requestHeaders: { 'content-type': 'application/x-www-form-urlencoded' }, rawRequestBody: formBase, rawResponseBody: '{"rows":["a","b","c"]}' })
+  formLog.recordExchange({ seq: 5, exchangeId: 'c2', arm: 'control', evidenceRole: 'tautology', method: 'POST', origin: ORIGIN, pathAndQuery: '/bool-form', status: 200, requestHeaders: { 'content-type': 'application/x-www-form-urlencoded' }, rawRequestBody: formTrue, rawResponseBody: '{"rows":["a","b","c"]}' })
+  formLog.recordExchange({ seq: 6, exchangeId: 'p2', arm: 'probe', evidenceRole: 'contradiction', method: 'POST', origin: ORIGIN, pathAndQuery: '/bool-form', status: 200, requestHeaders: { 'content-type': 'application/x-www-form-urlencoded' }, rawRequestBody: formFalse, rawResponseBody: '{"rows":[]}' })
   const formReceipt = buildProofReceipt({
     vulnClass: 'sqli',
     target: { origin: ORIGIN, method: 'POST', pathAndQuery: '/bool-form', param: 'q' },
-    exchangeIds: ['c1', 'p1', 'c2', 'p2'],
+    exchangeIds: ['b1', 'c1', 'p1', 'b2', 'c2', 'p2'],
     claimedDelta: 'Form-encoded boolean predicate differential reproduced across 2 rounds.',
   })
   const formRes = registry.evaluate(formLog, { kind: 'single_hop', receipt: formReceipt })

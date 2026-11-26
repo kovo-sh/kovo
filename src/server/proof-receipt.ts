@@ -706,8 +706,13 @@ export function verifyReceipt(
       return reject(receipt, rule, 'A boolean differential needs at least two paired control/probe rounds.')
     }
     const arms = receipt.exchangeIds.map(id => entriesById.get(id)!)
-    const controls = arms.filter(arm => arm.step.arm === 'control')
-    const probes = arms.filter(arm => arm.step.arm === 'probe')
+    const isBaselineEntry = (arm: ReceiptTranscriptEntry): boolean => {
+      const role = (arm.evidenceRole ?? '').trim().toLowerCase()
+      return role === 'benign_baseline' || role === 'baseline'
+    }
+    const baselines = arms.filter(isBaselineEntry)
+    const controls = arms.filter(arm => arm.step.arm === 'control' && !isBaselineEntry(arm))
+    const probes = arms.filter(arm => arm.step.arm === 'probe' && !isBaselineEntry(arm))
     if (controls.length !== probes.length || controls.length < 2) {
       return reject(receipt, rule, 'A boolean differential needs an equal number (>=2) of control and probe arms.')
     }
@@ -735,6 +740,7 @@ export function verifyReceipt(
       }
     }
     const rounds: BooleanDifferentialRound[] = controls.map((control, index) => ({
+      ...(baselines.length > 0 ? { baseline: toArm(baselines[index] ?? baselines[baselines.length - 1]!) } : {}),
       control: toArm(control),
       probe: toArm(probes[index]!),
     }))
@@ -2514,24 +2520,39 @@ function expressionClassCompatibleWithFamily(vulnClass: string, family: Expressi
   return false
 }
 
-function escapeRegExpLiteral(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-}
-
 function probeCarriesExpressionWithOperands(
   probeReqText: string,
   challenge: HostMintedExpressionChallenge,
 ): boolean {
-  const a = escapeRegExpLiteral(String(challenge.operandA))
-  const b = escapeRegExpLiteral(String(challenge.operandB))
-  const op = challenge.operator === '+' ? '\\+' : '(?:\\*|\\\\\\*)'
-  // Recognize standard expression / template / shell / SQL arithmetic constructs carrying the
-  // exact host-minted operands (never bare plain values).
-  const exprRe = new RegExp(
-    `(?:\\{\\{[^}]*|\\$\\{[^}]*|<%[=-]?[^%]*|#\\{[^}]*|\\$\\(\\([^)]*|\\bexpr\\s+[^\\n;|&]*|\\bSELECT\\s+[^\\n;]*|\\bpython\\d?\\s+-c\\s+[^\\n;]*|\\bawk\\b[^\\n;]*|\\bprint\\s*\\(?[^\\n;]*|['"\`]?\\s*)${a}\\s*${op}\\s*${b}`,
-    'i',
-  )
-  return exprRe.test(probeReqText)
+  const a = String(challenge.operandA)
+  const b = String(challenge.operandB)
+  if (!a || !b) return false
+  const isSpace = (code: number): boolean => code === 32 || code === 9 || code === 10 || code === 13 || code === 11 || code === 12
+  let pos = 0
+  while (pos <= probeReqText.length - a.length) {
+    const idx = probeReqText.indexOf(a, pos)
+    if (idx < 0) return false
+    let cursor = idx + a.length
+    while (cursor < probeReqText.length && isSpace(probeReqText.charCodeAt(cursor))) cursor += 1
+    if (challenge.operator === '+') {
+      if (probeReqText[cursor] !== '+') {
+        pos = idx + 1
+        continue
+      }
+      cursor += 1
+    } else if (probeReqText[cursor] === '*') {
+      cursor += 1
+    } else if (probeReqText.startsWith('\\*', cursor)) {
+      cursor += 2
+    } else {
+      pos = idx + 1
+      continue
+    }
+    while (cursor < probeReqText.length && isSpace(probeReqText.charCodeAt(cursor))) cursor += 1
+    if (probeReqText.startsWith(b, cursor)) return true
+    pos = idx + 1
+  }
+  return false
 }
 
 /**

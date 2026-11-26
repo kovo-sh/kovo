@@ -478,7 +478,7 @@ test('broker.ts and verify-rpc.ts share RequestAdmissionEngine with identical de
   })
   const broker = new RequestBroker({
     admissionEngine: sharedEngine,
-    resolve: async () => [PUBLIC_ADDR],
+    resolve: async host => (host === '127.0.0.1' ? [{ address: '127.0.0.1', family: 4 }] : [PUBLIC_ADDR]),
     transport: async () => {
       httpHits += 1
       return { status: 200, headers: { 'content-type': 'application/json' }, body: '{"ok":true}' }
