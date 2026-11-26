@@ -54,6 +54,7 @@ import {
 import { basename, dirname, join, relative, resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { pathToFileURL } from 'node:url'
+import { VERIFY_RPC_SDK_VERSION } from '../src/server/verify-rpc.ts'
 import { MAX_RUN_WORKER_CONCURRENCY } from './benchmark-env.ts'
 import {
   CERTIFYING_MIN_HELDOUT_SEEDS,
@@ -69,6 +70,7 @@ import {
   promoteLedgerRows,
   recordExposedHeldoutSeeds,
   resolveGitState,
+  type EffectiveConfigSnapshot,
   type LedgerRow,
 } from './bench-ledger.ts'
 import {
@@ -159,6 +161,13 @@ export interface ScorecardLike {
   provenance?: unknown
   provenanceCounts?: unknown
   llm?: string
+  benchmarkVersion?: string | null
+  effectiveConfigHash?: string | null
+  effectiveConfig?: EffectiveConfigSnapshot | null
+  reportable?: boolean
+  wordlistOn?: boolean
+  workerImageId?: string | null
+  sdkVersion?: string | null
 }
 
 export type FindingProvenance = 'floor' | 'agent_only' | 'chain_from_floor'
@@ -234,6 +243,13 @@ export interface RealismRun {
   advisories: number
   contractLeaks: number
   notes: string[]
+  benchmarkVersion?: string | null
+  effectiveConfigHash?: string | null
+  effectiveConfig?: EffectiveConfigSnapshot | null
+  reportable?: boolean
+  wordlistOn?: boolean
+  workerImageId?: string | null
+  sdkVersion?: string | null
 }
 
 export interface ReasonSiteLike {
@@ -1016,6 +1032,41 @@ function realismRunFromCard(
   const recall = asNumber(card.recall, ratio(card.confirmed, card.targets))
   const db = resolveRunDatabase(dir, card)
   const evidence = buildRunEvidence(card, meta, db?.findings ?? [])
+  const rawBenchmarkVersion =
+    'benchmarkVersion' in card
+      ? (card.benchmarkVersion ?? null)
+      : (meta && 'benchmarkVersion' in meta ? (typeof meta.benchmarkVersion === 'string' ? meta.benchmarkVersion : null) : undefined)
+  const rawEffectiveConfigHash =
+    'effectiveConfigHash' in card
+      ? (card.effectiveConfigHash ?? null)
+      : (meta && 'effectiveConfigHash' in meta ? (typeof meta.effectiveConfigHash === 'string' ? meta.effectiveConfigHash : null) : undefined)
+  const rawEffectiveConfig =
+    (isRecord(card.effectiveConfig) ? (card.effectiveConfig as unknown as EffectiveConfigSnapshot) : undefined)
+    ?? (meta && isRecord(meta.effectiveConfig) ? (meta.effectiveConfig as unknown as EffectiveConfigSnapshot) : undefined)
+  const rawReportable =
+    typeof card.reportable === 'boolean'
+      ? card.reportable
+      : (typeof meta?.reportable === 'boolean' ? meta.reportable : undefined)
+  const rawWordlistOn =
+    typeof card.wordlistOn === 'boolean'
+      ? card.wordlistOn
+      : typeof meta?.wordlistOn === 'boolean'
+        ? meta.wordlistOn
+        : typeof rawEffectiveConfig?.wordlistOn === 'boolean'
+          ? rawEffectiveConfig.wordlistOn
+          : undefined
+  const rawWorkerImageId =
+    typeof card.workerImageId === 'string'
+      ? card.workerImageId
+      : typeof meta?.workerImageId === 'string'
+        ? meta.workerImageId
+        : (typeof rawEffectiveConfig?.workerImageId === 'string' ? rawEffectiveConfig.workerImageId : undefined)
+  const rawSdkVersion =
+    typeof card.sdkVersion === 'string'
+      ? card.sdkVersion
+      : typeof meta?.sdkVersion === 'string'
+        ? meta.sdkVersion
+        : (typeof rawEffectiveConfig?.sdkVersion === 'string' ? rawEffectiveConfig.sdkVersion : undefined)
   return {
     id: `${dir}#${file ?? 'summary'}#${cellSlug(card.app, card.seed, card.mode ?? 'grey-box')}`,
     dir,
@@ -1048,6 +1099,13 @@ function realismRunFromCard(
     advisories: evidence.advisories,
     contractLeaks: evidence.contractLeaks,
     notes,
+    ...(rawBenchmarkVersion !== undefined ? { benchmarkVersion: rawBenchmarkVersion } : {}),
+    ...(rawEffectiveConfigHash !== undefined ? { effectiveConfigHash: rawEffectiveConfigHash } : {}),
+    ...(rawEffectiveConfig !== undefined ? { effectiveConfig: rawEffectiveConfig } : {}),
+    ...(rawReportable !== undefined ? { reportable: rawReportable } : {}),
+    ...(rawWordlistOn !== undefined ? { wordlistOn: rawWordlistOn } : {}),
+    ...(rawWorkerImageId !== undefined ? { workerImageId: rawWorkerImageId } : {}),
+    ...(rawSdkVersion !== undefined ? { sdkVersion: rawSdkVersion } : {}),
   }
 }
 
@@ -1264,8 +1322,8 @@ export interface Certificate {
   failedCells: number
   generatedAt: string
   gitSha: string
-  benchmarkVersion: string
-  effectiveConfigHash: string
+  benchmarkVersion: string | null
+  effectiveConfigHash: string | null
   certifying: boolean
   nonCertifyingReason: string | null
   heldoutSeeds: number[]
@@ -1952,14 +2010,85 @@ export function evaluateCertification(
     }
   }
 
-  const { benchmarkVersion } = computeBenchmarkVersion('realistic-bench')
-  const { effectiveConfigHash } = computeEffectiveConfig({
-    deterministicOnly: false,
-    environment: 'local-lab',
-    approvalPolicy: 'auto_review',
-    wordlistOn: false,
-    mode: 'grey-box',
-  })
+  const ingestRefusals: string[] = []
+  const explicitVersions = runs
+    .filter(r => r.benchmarkVersion !== undefined)
+    .map(r => (typeof r.benchmarkVersion === 'string' ? r.benchmarkVersion.trim() : ''))
+  const nonEmptyVersions = [...new Set(explicitVersions.filter(Boolean))]
+  const nullVersionCount = explicitVersions.filter(v => !v).length
+  if (nullVersionCount > 0) ingestRefusals.push(`${nullVersionCount} run(s) have null/empty benchmarkVersion`)
+  if (nonEmptyVersions.length > 1) {
+    ingestRefusals.push(`mixed benchmarkVersion across runs (${nonEmptyVersions.map(v => v.slice(0, 12)).join(', ')})`)
+  }
+  const benchmarkVersion: string | null =
+    nonEmptyVersions.length > 1
+      ? 'MIXED'
+      : nullVersionCount > 0
+        ? null
+        : nonEmptyVersions.length === 1
+          ? nonEmptyVersions[0]!
+          : computeBenchmarkVersion('realistic-bench').benchmarkVersion
+
+  const explicitConfigs = runs
+    .filter(r => r.effectiveConfigHash !== undefined)
+    .map(r => (typeof r.effectiveConfigHash === 'string' ? r.effectiveConfigHash.trim() : ''))
+  const nonEmptyConfigs = [...new Set(explicitConfigs.filter(Boolean))]
+  const nullConfigCount = explicitConfigs.filter(v => !v).length
+  if (nullConfigCount > 0) ingestRefusals.push(`${nullConfigCount} run(s) have null/empty effectiveConfigHash`)
+  if (nonEmptyConfigs.length > 1) {
+    ingestRefusals.push(`mixed effectiveConfigHash across runs (${nonEmptyConfigs.map(v => v.slice(0, 12)).join(', ')})`)
+  }
+  const effectiveConfigHash: string | null =
+    nullConfigCount > 0 || nonEmptyConfigs.length > 1
+      ? null
+      : nonEmptyConfigs.length === 1
+        ? nonEmptyConfigs[0]!
+        : computeEffectiveConfig({
+            deterministicOnly: false,
+            environment: 'local-lab',
+            approvalPolicy: 'auto_review',
+            wordlistOn: false,
+            mode: 'grey-box',
+          }).effectiveConfigHash
+
+  const nonReportableRuns = runs.filter(r => r.reportable === false)
+  if (nonReportableRuns.length > 0) {
+    ingestRefusals.push(`${nonReportableRuns.length} run(s) marked reportable=false`)
+  }
+  const wordlistOnRuns = runs.filter(r => r.wordlistOn === true || r.effectiveConfig?.wordlistOn === true)
+  if (wordlistOnRuns.length > 0) {
+    ingestRefusals.push(`${wordlistOnRuns.length} run(s) ran with wordlistOn=true`)
+  }
+  const observedSdks = [...new Set(
+    runs
+      .map(r => (r.sdkVersion ?? r.effectiveConfig?.sdkVersion ?? '').trim())
+      .filter(Boolean),
+  )]
+  const wrongSdks = observedSdks.filter(v => v !== VERIFY_RPC_SDK_VERSION)
+  if (wrongSdks.length > 0) {
+    ingestRefusals.push(`sdkVersion mismatch (expected ${VERIFY_RPC_SDK_VERSION}, observed ${wrongSdks.join(', ')})`)
+  }
+  const observedImages = [...new Set(
+    runs
+      .map(r => (r.workerImageId ?? r.effectiveConfig?.workerImageId ?? '').trim())
+      .filter(Boolean),
+  )]
+  if (observedImages.length > 1) {
+    ingestRefusals.push(`mismatched workerImageId across runs (${observedImages.map(v => v.slice(0, 20)).join(', ')})`)
+  }
+
+  const finalCertStatus: 'VALID' | 'INVALID' =
+    certStatus === 'INVALID' || ingestRefusals.length > 0 ? 'INVALID' : 'VALID'
+
+  if (ingestRefusals.length > 0) {
+    criteria.unshift(criterion(
+      'provenance_integrity',
+      'Runs share one non-null benchmarkVersion & effectiveConfigHash, reportable=true, wordlistOn=false, and matching worker image/sdkVersion',
+      '0 provenance/ingest refusals',
+      `REFUSED: ${ingestRefusals.join('; ')}`,
+      false,
+    ))
+  }
 
   if (failedCells > 0) {
     criteria.unshift(criterion(
@@ -1971,10 +2100,10 @@ export function evaluateCertification(
     ))
   }
 
-  const verdict = certStatus === 'VALID' && criteria.every(item => item.status === 'PASS') ? 'PASS' : 'FAIL'
+  const verdict = finalCertStatus === 'VALID' && criteria.every(item => item.status === 'PASS') ? 'PASS' : 'FAIL'
   return {
     schemaVersion: 1,
-    status: certStatus,
+    status: finalCertStatus,
     failedCells,
     generatedAt: options.generatedAt ?? new Date().toISOString(),
     gitSha: options.gitSha ?? resolveGitSha(),
@@ -2784,14 +2913,21 @@ export function writePhase1CertifyLedgerRows(input: {
         contractLeaks: run.contractLeaks,
       },
     )
+    const rowBenchmarkVersion = run.benchmarkVersion ?? input.certificate.benchmarkVersion
+    const rowConfigHash = run.effectiveConfigHash ?? input.certificate.effectiveConfigHash
+    if (!rowBenchmarkVersion || !rowConfigHash) {
+      throw new Error(
+        `Refusing to write Phase-1 ledger row for ${run.app}@${run.seed}: missing benchmarkVersion or effectiveConfigHash.`,
+      )
+    }
     const row = buildLedgerRow({
       cell: readerCell,
       recordedAt: input.certificate.generatedAt,
       suite: 'realistic-bench',
       gitSha: input.certificate.gitSha,
       dirty: gitState.dirty,
-      benchmarkVersion: input.certificate.benchmarkVersion,
-      effectiveConfigHash: input.certificate.effectiveConfigHash,
+      benchmarkVersion: rowBenchmarkVersion,
+      effectiveConfigHash: rowConfigHash,
       app: run.app,
       split: run.seedSet,
       mode: run.mode,
@@ -2799,7 +2935,7 @@ export function writePhase1CertifyLedgerRows(input: {
       seed: run.seed,
       repeat: 1,
       certifying: input.certificate.certifying && input.certificate.verdict === 'PASS' && readerCell.state !== 'failed_inert',
-      reportable: true,
+      reportable: run.reportable !== false && run.wordlistOn !== true,
       preservationRatio: input.certificate.preservation.median,
       floorConfirmed: run.floor.floorConfirmed,
       agenticConfirmed: run.provenance ? run.provenance.agentOnly + run.provenance.chainFromFloor : null,

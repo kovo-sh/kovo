@@ -29,13 +29,16 @@ import { execFileSync } from 'node:child_process'
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { VERIFY_RPC_SDK_VERSION } from '../src/server/verify-rpc.ts'
 import {
   DEFAULT_LEDGER_PATH,
   appendLedgerRow,
   appendPerRunLedgerRow,
   computeBenchmarkVersion,
+  computeEffectiveConfig,
   promoteLedgerRows,
   resolveGitState,
+  type EffectiveConfigSnapshot,
   type LedgerRow,
 } from './bench-ledger.ts'
 import {
@@ -212,8 +215,14 @@ export interface MultihopCellInput {
   schemaVersion?: number
   status?: 'VALID' | 'INVALID'
   failed?: boolean
-  benchmarkVersion?: string
-  effectiveConfigHash?: string
+  benchmarkVersion?: string | null
+  effectiveConfigHash?: string | null
+  effectiveConfig?: EffectiveConfigSnapshot | null
+  reportable?: boolean
+  wordlistOn?: boolean
+  workerImageId?: string | null
+  workerSourceHash?: string | null
+  sdkVersion?: string | null
   app: string
   sealed?: boolean
   seed: number
@@ -282,8 +291,14 @@ export interface NormalizedMultihopCell {
   status: 'VALID' | 'INVALID'
   cellState: CellReadState
   failed: boolean
-  benchmarkVersion?: string
-  effectiveConfigHash?: string
+  benchmarkVersion?: string | null
+  effectiveConfigHash?: string | null
+  effectiveConfig?: EffectiveConfigSnapshot | null
+  reportable?: boolean
+  wordlistOn?: boolean
+  workerImageId?: string | null
+  workerSourceHash?: string | null
+  sdkVersion?: string | null
   app: string
   sealed: boolean
   seed: number
@@ -1055,8 +1070,30 @@ export function normalizeCell(raw: MultihopCellInput): NormalizedMultihopCell {
     status,
     cellState: readerCell.state,
     failed,
-    ...(raw.benchmarkVersion ? { benchmarkVersion: raw.benchmarkVersion } : {}),
-    ...(raw.effectiveConfigHash ? { effectiveConfigHash: raw.effectiveConfigHash } : {}),
+    ...('benchmarkVersion' in raw ? { benchmarkVersion: raw.benchmarkVersion ?? null } : {}),
+    ...('effectiveConfigHash' in raw ? { effectiveConfigHash: raw.effectiveConfigHash ?? null } : {}),
+    ...(raw.effectiveConfig !== undefined ? { effectiveConfig: raw.effectiveConfig } : {}),
+    ...(typeof raw.reportable === 'boolean' ? { reportable: raw.reportable } : {}),
+    ...(typeof raw.wordlistOn === 'boolean'
+      ? { wordlistOn: raw.wordlistOn }
+      : typeof raw.effectiveConfig?.wordlistOn === 'boolean'
+        ? { wordlistOn: raw.effectiveConfig.wordlistOn }
+        : {}),
+    ...(raw.workerImageId !== undefined
+      ? { workerImageId: raw.workerImageId }
+      : raw.effectiveConfig?.workerImageId !== undefined
+        ? { workerImageId: raw.effectiveConfig.workerImageId }
+        : {}),
+    ...(raw.workerSourceHash !== undefined
+      ? { workerSourceHash: raw.workerSourceHash }
+      : raw.effectiveConfig?.workerSourceHash !== undefined
+        ? { workerSourceHash: raw.effectiveConfig.workerSourceHash }
+        : {}),
+    ...(raw.sdkVersion !== undefined
+      ? { sdkVersion: raw.sdkVersion }
+      : raw.effectiveConfig?.sdkVersion !== undefined
+        ? { sdkVersion: raw.effectiveConfig.sdkVersion }
+        : {}),
     app,
     sealed,
     seed,
@@ -2477,24 +2514,91 @@ export function evaluateV8Certification(input: CertifyV8Input): V8CertificationR
     }
   }
 
+  const ingestRefusals: string[] = []
+  const explicitVersions = cells
+    .filter((c) => c.benchmarkVersion !== undefined)
+    .map((c) => (typeof c.benchmarkVersion === 'string' ? c.benchmarkVersion.trim() : ''))
+  const cellVersions = [...new Set(explicitVersions.filter(Boolean))]
+  const nullVersionCount = explicitVersions.filter((v) => !v).length
+  if (nullVersionCount > 0) ingestRefusals.push(`${nullVersionCount} cell(s) have null/empty benchmarkVersion`)
+  if (cellVersions.length > 1) {
+    ingestRefusals.push(`mixed benchmarkVersion across cells (${cellVersions.map((v) => v.slice(0, 12)).join(', ')})`)
+  }
+  const benchmarkVersion: string =
+    cellVersions.length > 1
+      ? 'MIXED'
+      : nullVersionCount > 0
+        ? ''
+        : cellVersions.length === 1
+          ? cellVersions[0]!
+          : computeBenchmarkVersion('multihop-saas').benchmarkVersion
+
+  const explicitConfigs = cells
+    .filter((c) => c.effectiveConfigHash !== undefined)
+    .map((c) => (typeof c.effectiveConfigHash === 'string' ? c.effectiveConfigHash.trim() : ''))
+  const cellConfigs = [...new Set(explicitConfigs.filter(Boolean))]
+  const nullConfigCount = explicitConfigs.filter((v) => !v).length
+  if (nullConfigCount > 0) ingestRefusals.push(`${nullConfigCount} cell(s) have null/empty effectiveConfigHash`)
+  if (cellConfigs.length > 1) {
+    ingestRefusals.push(`mixed effectiveConfigHash across cells (${cellConfigs.map((v) => v.slice(0, 12)).join(', ')})`)
+  }
+  const effectiveConfigHash: string | null =
+    nullConfigCount > 0 || cellConfigs.length > 1
+      ? null
+      : cellConfigs.length === 1
+        ? cellConfigs[0]!
+        : null
+
+  const nonReportableCells = cells.filter((c) => c.reportable === false)
+  if (nonReportableCells.length > 0) {
+    ingestRefusals.push(`${nonReportableCells.length} cell(s) marked reportable=false`)
+  }
+  const wordlistOnCells = cells.filter((c) => c.wordlistOn === true || c.effectiveConfig?.wordlistOn === true)
+  if (wordlistOnCells.length > 0) {
+    ingestRefusals.push(`${wordlistOnCells.length} cell(s) ran with wordlistOn=true`)
+  }
+  const observedSdks = [...new Set(
+    cells
+      .map((c) => (c.sdkVersion ?? c.effectiveConfig?.sdkVersion ?? '').trim())
+      .filter(Boolean),
+  )]
+  const wrongSdks = observedSdks.filter((v) => v !== VERIFY_RPC_SDK_VERSION)
+  if (wrongSdks.length > 0) {
+    ingestRefusals.push(`sdkVersion mismatch (expected ${VERIFY_RPC_SDK_VERSION}, observed ${wrongSdks.join(', ')})`)
+  }
+  const observedImages = [...new Set(
+    cells
+      .map((c) => (c.workerImageId ?? c.effectiveConfig?.workerImageId ?? '').trim())
+      .filter(Boolean),
+  )]
+  if (observedImages.length > 1) {
+    ingestRefusals.push(`mismatched workerImageId across cells (${observedImages.map((v) => v.slice(0, 20)).join(', ')})`)
+  }
+
+  if (ingestRefusals.length > 0) {
+    addCheck({
+      id: 'provenance_integrity',
+      category: 'precision',
+      description: 'Cells share one non-null benchmarkVersion & effectiveConfigHash, reportable=true, wordlistOn=false, and matching worker image/sdkVersion',
+      threshold: '0 provenance/ingest refusals',
+      observed: `REFUSED: ${ingestRefusals.join('; ')}`,
+      status: 'FAIL',
+    })
+  }
+
+  const finalReportStatus: 'VALID' | 'INVALID' =
+    reportStatus === 'INVALID' || ingestRefusals.length > 0 ? 'INVALID' : 'VALID'
   const failedChecks = checks.filter((c) => c.status === 'FAIL')
   const verdict: 'PASS' | 'FAIL' =
-    reportStatus === 'VALID' && failedChecks.length === 0 ? 'PASS' : 'FAIL'
+    finalReportStatus === 'VALID' && failedChecks.length === 0 ? 'PASS' : 'FAIL'
   const gitSha =
     input.options?.gitSha ??
     cells.find((c) => c.gitSha && c.gitSha !== 'unknown')?.gitSha ??
     resolveGitSha()
-  const cellVersions = [...new Set(cells.map((c) => c.benchmarkVersion).filter((v): v is string => Boolean(v)))]
-  const benchmarkVersion =
-    cellVersions.length === 1
-      ? cellVersions[0]!
-      : computeBenchmarkVersion('multihop-saas').benchmarkVersion
-  const cellConfigs = [...new Set(cells.map((c) => c.effectiveConfigHash).filter((v): v is string => Boolean(v)))]
-  const effectiveConfigHash = cellConfigs.length === 1 ? cellConfigs[0]! : null
 
   return {
     schemaVersion: V8_CERTIFY_SCHEMA_VERSION,
-    status: reportStatus,
+    status: finalReportStatus,
     failedCells,
     benchmarkVersion,
     effectiveConfigHash,
@@ -3177,14 +3281,32 @@ export function writeV8CertifyLedgerRows(input: {
       },
       { failed: c.failed || c.status === 'INVALID', inert: c.inert },
     )
+    const rowBenchmarkVersion = c.benchmarkVersion === undefined ? input.report.benchmarkVersion : c.benchmarkVersion
+    const explicitNullConfig = c.effectiveConfigHash === null || c.effectiveConfigHash === ''
+    const hasMixedConfig = input.report.checks.some((chk) => chk.id === 'provenance_integrity' && chk.status === 'FAIL')
+    if (!rowBenchmarkVersion || !/^[0-9a-f]{16,64}$/i.test(rowBenchmarkVersion) || explicitNullConfig || hasMixedConfig) {
+      throw new Error(
+        `Refusing to write v8 ledger row for ${c.app}@${c.seed}: missing, null, or mixed benchmarkVersion/effectiveConfigHash.`,
+      )
+    }
+    const rowConfigHash =
+      c.effectiveConfigHash
+      ?? input.report.effectiveConfigHash
+      ?? computeEffectiveConfig({
+        deterministicOnly: c.llm === 'deterministic-no-llm',
+        environment: 'local-lab',
+        approvalPolicy: 'auto_review',
+        wordlistOn: c.wordlistOn ?? false,
+        mode: c.mode,
+      }).effectiveConfigHash
     const row = buildLedgerRow({
       cell: readerCell,
       recordedAt: input.report.generatedAt,
       suite: 'multihop-saas',
       gitSha: c.gitSha ?? input.report.gitSha,
       dirty: gitState.dirty,
-      benchmarkVersion: c.benchmarkVersion ?? input.report.benchmarkVersion,
-      effectiveConfigHash: c.effectiveConfigHash ?? input.report.effectiveConfigHash ?? '0'.repeat(64),
+      benchmarkVersion: rowBenchmarkVersion,
+      effectiveConfigHash: rowConfigHash,
       app: c.app,
       split: c.split,
       mode: c.mode,
@@ -3192,7 +3314,7 @@ export function writeV8CertifyLedgerRows(input: {
       seed: c.seed,
       repeat: Number(c.repeatId ?? 1) || 1,
       certifying: input.report.verdict === 'PASS' && c.status === 'VALID',
-      reportable: true,
+      reportable: c.reportable !== false && c.wordlistOn !== true,
       costUsd: c.costUsd,
       durationMs: c.durationMs,
     })

@@ -60,26 +60,70 @@ export class LocalJqBackend implements WorkerBackend {
   }
 }
 
-async function dockerWorkerUsable(): Promise<boolean> {
-  const info = await execFileText('docker', ['info', '--format', '{{.ServerVersion}}'], 8_000)
-  if (info.code !== 0) return false
-  const image = await execFileText('docker', ['image', 'inspect', 'kovo-worker:v4'], 8_000)
-  return image.code === 0
+export const DEFAULT_WORKER_IMAGE = 'kovo-worker:v4'
+
+export interface WorkerImageIdentity {
+  imageRef: string
+  imageId: string | null
+  sourceHash: string | null
+  sdkVersion: string | null
 }
 
-export async function selectVerifierBackend(choice: 'auto' | 'docker' | 'local-jq'): Promise<{ kind: VerifierBackendKind; backend: WorkerBackend }> {
+/** Resolve the exact Docker worker image ref that `LinuxWorkerBackend` honors (`KOVO_WORKER_IMAGE` or default). */
+export function resolveWorkerImageRef(
+  env: NodeJS.ProcessEnv = process.env,
+  explicitImage?: string,
+): string {
+  return explicitImage?.trim() || env.KOVO_WORKER_IMAGE?.trim() || DEFAULT_WORKER_IMAGE
+}
+
+type ExecTextFn = (file: string, args: string[], timeoutMs: number) => Promise<{ code: number; stdout: string; stderr: string }>
+
+/** Inspect the resolved worker image via `docker image inspect` for immutable image ID and build LABELs. */
+export async function inspectDockerWorkerImage(
+  imageRef: string = resolveWorkerImageRef(),
+  execFn: ExecTextFn = execFileText,
+): Promise<WorkerImageIdentity | null> {
+  const info = await execFn('docker', ['info', '--format', '{{.ServerVersion}}'], 8_000)
+  if (info.code !== 0) return null
+  const format = '{{.Id}}\t{{index .Config.Labels "kovo.worker.source_hash"}}\t{{index .Config.Labels "kovo.worker.sdk_version"}}'
+  const res = await execFn('docker', ['image', 'inspect', '--format', format, imageRef], 8_000)
+  if (res.code !== 0) return null
+  const line = res.stdout.trim().split(/\r?\n/)[0] ?? ''
+  const [rawId = '', rawHash = '', rawSdk = ''] = line.split('\t')
+  const clean = (v: string): string | null => {
+    const trimmed = v.trim()
+    return trimmed && trimmed !== '<no value>' ? trimmed : null
+  }
+  return {
+    imageRef,
+    imageId: clean(rawId),
+    sourceHash: clean(rawHash),
+    sdkVersion: clean(rawSdk),
+  }
+}
+
+export async function selectVerifierBackend(
+  choice: 'auto' | 'docker' | 'local-jq',
+  opts: { env?: NodeJS.ProcessEnv; image?: string } = {},
+): Promise<{ kind: VerifierBackendKind; backend: WorkerBackend; workerImage: WorkerImageIdentity | null }> {
   if (choice === 'local-jq') {
     const probe = await execFileText('jq', ['--version'], 5_000)
     if (probe.code !== 0) throw new Error('--verifier-backend local-jq requires jq on PATH.')
-    return { kind: 'local-jq', backend: new LocalJqBackend() }
+    return { kind: 'local-jq', backend: new LocalJqBackend(), workerImage: null }
   }
-  const dockerOk = await dockerWorkerUsable()
+  const imageRef = resolveWorkerImageRef(opts.env, opts.image)
+  const workerImage = await inspectDockerWorkerImage(imageRef)
   if (choice === 'docker') {
-    if (!dockerOk) throw new Error('Docker worker backend requested but Docker or the kovo-worker:v4 image is unavailable.')
-    return { kind: 'docker', backend: new LinuxWorkerBackend() }
+    if (!workerImage) {
+      throw new Error(`Docker worker backend requested but Docker or the ${imageRef} image is unavailable.`)
+    }
+    return { kind: 'docker', backend: new LinuxWorkerBackend({ image: imageRef }), workerImage }
   }
-  if (dockerOk) return { kind: 'docker', backend: new LinuxWorkerBackend() }
+  if (workerImage) {
+    return { kind: 'docker', backend: new LinuxWorkerBackend({ image: imageRef }), workerImage }
+  }
   const probe = await execFileText('jq', ['--version'], 5_000)
   if (probe.code !== 0) throw new Error('No usable verifier backend: Docker worker unavailable and jq not found on PATH.')
-  return { kind: 'local-jq', backend: new LocalJqBackend() }
+  return { kind: 'local-jq', backend: new LocalJqBackend(), workerImage: null }
 }

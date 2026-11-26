@@ -93,6 +93,7 @@ import {
   type Assignment,
   type BenchmarkRunRow,
   type BrokerExchange,
+  type ConfirmationBackingKind,
   type ConfirmationEvidence,
   type CoverageEntry,
   type DbSession,
@@ -1015,6 +1016,43 @@ export class FindingsRepository {
 
   // --- Replay Specs, Retests, Coverage, Findings ---
 
+  private hasConfirmedProofReceipt(proof: AgentScriptProofRecord | null | undefined): boolean {
+    const raw = proof?.receipt as unknown as Record<string, unknown> | null | undefined
+    if (!raw || typeof raw !== 'object') return false
+    const single = Boolean(
+      raw.receipt
+      && typeof raw.receipt === 'object'
+      && (raw.verification as { confirmed?: unknown } | undefined)?.confirmed === true,
+    )
+    const composite = Boolean(
+      raw.compositeReceipt
+      && typeof raw.compositeReceipt === 'object'
+      && (raw.compositeVerification as { confirmed?: unknown } | undefined)?.confirmed === true,
+    )
+    return single || composite
+  }
+
+  private isAuthorizedHostBackingKind(kind: ConfirmationBackingKind | undefined): boolean {
+    return (
+      kind === 'inline_verifier'
+      || kind === 'floor_engine'
+      || kind === 'oob_receipt'
+      || kind === 'baseline'
+      || kind === 'verifier_receipt'
+    )
+  }
+
+  private isScriptHarnessCaller(stack: string | undefined = new Error().stack): boolean {
+    if (!stack) return false
+    const frames = stack.split('\n').slice(1)
+    for (const frame of frames) {
+      if (/[\\/]src[\\/]server[\\/]store(?:-[a-z]+)?\.ts/.test(frame)) continue
+      if (/[\\/]scripts[\\/][^)]+\.(?:ts|js|mjs|cjs)/.test(frame)) return true
+      if (/[\\/]src[\\/]server[\\/]/.test(frame)) return false
+    }
+    return false
+  }
+
   createReplaySpec(
     run: Run,
     assignment: Assignment,
@@ -1026,9 +1064,31 @@ export class FindingsRepository {
       verifiedInline?: boolean
       lastVerificationDiff?: InlineVerifyFeedback | null
       proof?: AgentScriptProofRecord | null
+      backingKind?: ConfirmationBackingKind
+      requireReceiptOrBackingKind?: boolean
     },
   ): ReplaySpecRow {
     this.assertTenantRun(run.id)
+    if (options?.verifiedInline === true) {
+      if (options.backingKind === 'harness_assisted') {
+        throw new InvariantError(
+          'invariant.harness_assisted_confirmation',
+          `Invariant: harness_assisted proofs cannot persist verifiedInline=true for finding ${findingId}.`,
+        )
+      }
+      const hasReceipt = this.hasConfirmedProofReceipt(options.proof)
+      const hasAuthorizedBacking = this.isAuthorizedHostBackingKind(options.backingKind)
+      const diffVerdict = options.lastVerificationDiff?.verdict
+      const hasConfirmingDiff = diffVerdict === 'confirmed' || diffVerdict === 'static_verified'
+      if (!hasReceipt && !hasAuthorizedBacking) {
+        if (!hasConfirmingDiff || options.requireReceiptOrBackingKind === true || this.isScriptHarnessCaller()) {
+          throw new InvariantError(
+            'invariant.unbacked_verified_inline',
+            `Invariant: createReplaySpec(verifiedInline=true) requires a verifier-issued ProofReceipt or an authorized host backingKind for finding ${findingId}.`,
+          )
+        }
+      }
+    }
     const specSha256 = createHash('sha256').update(JSON.stringify(spec)).digest('hex')
     return this.session.db.insert(tables.replaySpecs).values({
       id: randomUUID(),
@@ -1143,6 +1203,7 @@ export class FindingsRepository {
     verificationTier?: VerificationTier | null
     provenance?: FindingProvenance | null
     status?: Finding['status'] | null
+    requireReceiptOnly?: boolean
   }): ConfirmationEvidence {
     const replaySpecId = input.replaySpecId ?? null
     if (input.findingKind === 'baseline_check' || input.verificationTier === 'baseline_confirmed') {
@@ -1154,12 +1215,12 @@ export class FindingsRepository {
         )).get()
       : undefined
     const verdict = spec?.lastVerificationDiff?.verdict ?? null
-    if (replayVerdictConfirmsRuntime(verdict)) {
+    if (!input.requireReceiptOnly && replayVerdictConfirmsRuntime(verdict)) {
       return { backed: true, contradicted: false, kind: 'spec', verdict, replaySpecId }
     }
     // An explicit non-confirming verdict on the linked replay spec always contradicts the claim
     // (including prior ProofReceipt / OOB confirmations) so contradicting retries demote cleanly.
-    if (verdict !== null) {
+    if (verdict !== null && !replayVerdictConfirmsRuntime(verdict)) {
       return { backed: false, contradicted: true, kind: 'spec', verdict, replaySpecId }
     }
 
@@ -1224,6 +1285,7 @@ export class FindingsRepository {
     verificationTier?: VerificationTier | null
     provenance?: FindingProvenance | null
     status?: Finding['status'] | null
+    requireReceiptOnly?: boolean
   }): ConfirmationEvidence {
     const evidence = this.confirmationEvidenceFor(runId, input)
     if (!evidence.backed) {
@@ -2327,6 +2389,16 @@ export class FindingsRepository {
       // chokepoint for every chain finding write (inline replay, floor, receipt promotion). It throws
       // a typed InvariantError so an inconclusive result structurally cannot become confirmed.
       if (storedFinding.status === 'confirmed') {
+        if (options.backingKind === 'harness_assisted') {
+          throw new InvariantError(
+            'invariant.harness_assisted_confirmation',
+            `Invariant: harness_assisted findings cannot persist as runtime_confirmed for ${storedFinding.id}.`,
+          )
+        }
+        const hasAuthorizedBacking = this.isAuthorizedHostBackingKind(options.backingKind)
+        const requireReceiptOnly =
+          !hasAuthorizedBacking
+          && (options.requireReceiptOrBackingKind === true || this.isScriptHarnessCaller())
         this.assertConfirmationEvidence(run.id, {
           findingId: storedFinding.id,
           replaySpecId: canonicalSpecId,
@@ -2339,6 +2411,7 @@ export class FindingsRepository {
           status: options.provenance === 'floor'
             ? storedFinding.status
             : (targetRow?.finding.status ?? storedFinding.status),
+          requireReceiptOnly,
         })
       }
 

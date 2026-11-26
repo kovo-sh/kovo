@@ -232,6 +232,15 @@ export interface ConfirmationEvidence {
   replaySpecId: string | null
 }
 
+/** Authorized host/verifier backing kinds that may establish `verifiedInline` / `runtime_confirmed`. */
+export type ConfirmationBackingKind =
+  | 'inline_verifier'
+  | 'floor_engine'
+  | 'oob_receipt'
+  | 'baseline'
+  | 'verifier_receipt'
+  | 'harness_assisted'
+
 export interface FindingProvenanceOptions {
   /** Explicit attribution. `floor` is reserved for the deterministic floor's own confirmations. */
   provenance?: FindingProvenance
@@ -239,6 +248,10 @@ export interface FindingProvenanceOptions {
   parentFindingIds?: readonly string[]
   /** Explicit verification class; confirmed + non-runtime is rejected by the store. */
   verificationClass?: FindingVerificationClass
+  /** Explicit host/verifier backing kind (`harness_assisted` is always refused for confirmed writes). */
+  backingKind?: ConfirmationBackingKind
+  /** When true, require a verifier-issued receipt or authorized host backing kind (no bare diff). */
+  requireReceiptOrBackingKind?: boolean
 }
 
 /**

@@ -89,18 +89,19 @@ export const engineDisableEnv = 'KOVO_DETERMINISTIC_ENGINE'
 /**
  * Conventional noun/action route wordlists (e.g. `/api/tokens`, `/api/admin/users`) are a local-lab
  * convenience: they only match when the target happens to use the same English nouns as the list.
- * They stay ON by default for local-lab compatibility, but a run can turn them OFF so capability is
- * measured from discovered/declared surface only. The switch never changes what is probed on a route
- * the target itself exposed; it only drops endpoints whose sole source is that wordlist.
+ * They default OFF (`false`) so capability is measured from discovered/declared surface only unless
+ * a caller explicitly opts in (`KOVO_CONVENTIONAL_WORDLIST=1|true|on|yes`). The switch never changes
+ * what is probed on a route the target itself exposed; it only drops endpoints whose sole source is
+ * that wordlist.
  */
 export const conventionalWordlistEnv = 'KOVO_CONVENTIONAL_WORDLIST'
 
 export function conventionalWordlistEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   const raw = env[conventionalWordlistEnv]
-  if (raw === undefined) return true
+  if (raw === undefined) return false
   const value = raw.trim().toLowerCase()
-  if (value === '') return true
-  return !(value === '0' || value === 'off' || value === 'false' || value === 'no')
+  if (value === '') return false
+  return value === '1' || value === 'true' || value === 'on' || value === 'yes'
 }
 
 /** Endpoints the deterministic engine may triage, honouring the conventional-wordlist switch. */

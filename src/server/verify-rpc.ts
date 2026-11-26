@@ -138,6 +138,8 @@ import type { ProveHandlerHost, ProveHttpExchangeResult } from './verify-prove-h
 import { buildLocalAttemptFactory } from './verify-runner.ts'
 import type { LocalAttemptFactoryBaseOptions } from './verify-runner.ts'
 
+export const VERIFY_RPC_SDK_VERSION = 'kovo_verify/v8'
+export const VERIFY_SDK_HEADER = 'x-kovo-sdk-version'
 export {
   VERIFY_RPC_CONTAINER_DIR,
   VERIFY_RPC_SOCKET_NAME,
@@ -480,7 +482,7 @@ export class VerifyRpcServer {
       runId: this.options.runId,
       assignmentId: this.options.assignmentId,
       targetOrigins: this.options.targetOrigins ?? [],
-      sdkVersion: 'kovo_verify/v6-mvp',
+      sdkVersion: VERIFY_RPC_SDK_VERSION,
     }
     const contextPath = join(this.hostDirValue, VERIFY_RPC_CONTEXT_NAME)
     writeFileSync(contextPath, JSON.stringify(context, null, 2), { mode: 0o444 })
@@ -533,6 +535,8 @@ export class VerifyRpcServer {
     if (nonce !== this.nonce) {
       return reply(403, { ok: false, error: 'Stale verification nonce; scripts must run inside a fresh attempt session.' })
     }
+    const providedSdk = req.headers[VERIFY_SDK_HEADER]
+    if (providedSdk !== undefined && String(providedSdk).trim() !== VERIFY_RPC_SDK_VERSION) return reply(403, { ok: false, error: `Verification SDK version mismatch: expected ${VERIFY_RPC_SDK_VERSION}, got ${String(providedSdk).trim() || '<empty>'}.` })
     const limit = this.options.maxRpcBodyBytes ?? MAX_RPC_BODY_BYTES
     let body = ''
     try {
@@ -556,6 +560,11 @@ export class VerifyRpcServer {
   private async dispatch(payload: RpcPayload, nonce: string): Promise<unknown> {
     const op = payload.op
     const args = asRecord(payload.args) ?? {}
+    if (op === 'hello') {
+      const clientSdk = typeof args.sdkVersion === 'string' ? args.sdkVersion.trim() : ''
+      if (clientSdk !== VERIFY_RPC_SDK_VERSION) throw new Error(`Verification SDK version mismatch: expected ${VERIFY_RPC_SDK_VERSION}, got ${clientSdk || '<missing>'}.`)
+      return { sdkVersion: VERIFY_RPC_SDK_VERSION, nonce, runId: this.options.runId }
+    }
     if (op === 'transcript') return this.handleTranscript(args)
     if (op === 'http' || op === 'http.send') return this.handleHttp(args, nonce, 'http')
     if (op === 'http2') return this.handleHttp2(args, nonce)
