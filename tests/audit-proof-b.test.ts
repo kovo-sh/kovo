@@ -1172,12 +1172,13 @@ test('M-3b: agent-script-proof checks terminalEndpoint & terminalOracleFamily ag
   })
 
   // Verify staging root alignment with KOVO_CONTAINER_SCRATCH_DIR + empty-vulnClass hasConfirmedProof check.
+  const emptyVulnScript = 'export async function verify() { return { claims: [] } }'
   const emptyVulnRetest = await retestPersistedAgentScript(
     {
       kind: 'agent_script',
       runtime: 'ts',
-      script: 'export async function verify() { return { claims: [] } }',
-      scriptSha256: createHash('sha256').update('x').digest('hex'),
+      script: emptyVulnScript,
+      scriptSha256: createHash('sha256').update(emptyVulnScript).digest('hex'),
       verdict: 'confirmed',
       vulnClass: '',
       exchangeIds: [],
