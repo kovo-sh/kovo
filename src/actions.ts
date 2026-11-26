@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
 import { createServerFn } from '@tanstack/react-start'
+import { and, desc, eq, inArray, lt, sql } from 'drizzle-orm'
 import { z } from 'zod'
 import { importAccessPolicy } from './access-policy.ts'
 import {
@@ -54,13 +55,19 @@ import {
 } from './server/persona-vault.ts'
 import { exportReportMarkdown } from './server/report-export.ts'
 import { exportReportSarif } from './server/sarif-export.ts'
+import * as tables from './server/schema.ts'
 import {
   deleteProjectWithActiveGuard,
   deleteRunWithActiveGuard,
   store,
 } from './server/store.ts'
 import type { Store } from './server/store.ts'
-import { runDiscoverySubdomainsForRun } from './server/subdomain-discovery.ts'
+import {
+  isMultiTenantPublicSuffix,
+  rankScopeAssets,
+  registrableApex,
+  runDiscoverySubdomainsForRun,
+} from './server/subdomain-discovery.ts'
 import type { RunDiscoverySubdomainsResult } from './server/subdomain-discovery.ts'
 import { readWorkerSession, resolvePrimaryLabRepoDir, testPersonaAuth } from './server/worker-session-reader.ts'
 
@@ -494,24 +501,474 @@ export function launchSubdomainDiscoveryInBackground(
     })
 }
 
+/** Default inline projection caps for `runData` so huge runs never blow browser RAM on SSE refresh ticks. */
+export const RUN_DETAIL_PROJECTION_CAPS = {
+  evidence: 500,
+  facts: 500,
+  exchanges: 500,
+  endpoints: 500,
+  messages: 500,
+  boardMessages: 500,
+  events: 2000,
+} as const
+
+export interface ServerRankedScopeAsset {
+  id: string
+  origin: string
+  score: number
+  apex: string | null
+  sameApexAsSeed: boolean
+  depth: number
+  noisy: boolean
+}
+
+export interface ServerScopeRanking {
+  rankedAssets: ServerRankedScopeAsset[]
+  recommendedScopeAssetIds: string[]
+  highSignalScopeAssetIds: string[]
+}
+
+function isDiscoveredSubdomainSourceServer(source?: string): boolean {
+  return (
+    source === 'subdomain_discovery'
+    || source === 'phase0_ct_discovery'
+    || source === 'phase0_subdomain_discovery'
+  )
+}
+
+function extractHostnameServer(origin: string): string {
+  try {
+    return new URL(origin).hostname.toLowerCase().replace(/\.$/, '')
+  } catch {
+    return origin.replace(/^https?:\/\//i, '').replace(/\/.*$/, '').replace(/:\d+$/, '').toLowerCase().replace(/\.$/, '')
+  }
+}
+
+export interface ScopeRankingDeps {
+  rankScopeAssets: typeof rankScopeAssets
+  registrableApex: typeof registrableApex
+  isMultiTenantPublicSuffix: typeof isMultiTenantPublicSuffix
+}
+
+/**
+ * Server-authoritative PSL-backed scope ranking (`src/server/subdomain-discovery.ts` +
+ * `src/server/public-suffix.ts`) so the browser bundle never ships the 142 KB PSL dataset.
+ * Dependencies are injected by `runData`'s server handler so TanStack Start never bundles
+ * server-only modules into the client chunk.
+ */
+export function computeServerScopeRanking(
+  run: {
+    scopeRevision: number
+    approved: readonly string[]
+    candidates: readonly {
+      id: string
+      origin: string
+      source?: string
+      thirdParty: boolean
+      includeSubdomains?: boolean
+      dnsSource?: unknown
+    }[]
+  },
+  project: {
+    seeds: readonly string[]
+    defaultScope: readonly string[]
+  },
+  includeSubdomainOrigins: readonly string[],
+  deps: ScopeRankingDeps,
+  maxAutoSelect = 30,
+): ServerScopeRanking {
+  const cap = Math.max(1, Math.min(Math.floor(maxAutoSelect), 30))
+  const isBulkDnsImport = (c: { source?: string; dnsSource?: unknown }): boolean =>
+    Boolean(c.dnsSource) && !isDiscoveredSubdomainSourceServer(c.source)
+
+  const computeFor = (
+    effectiveRun: typeof run,
+    projectDefaultScope: readonly string[],
+    effectiveIncludeSubdomains: readonly string[],
+  ): { ranked: ServerRankedScopeAsset[]; selectedIds: string[] } => {
+    const seedOriginsForRank: string[] = []
+    const wildcardApexes = new Set<string>()
+    for (const origin of effectiveIncludeSubdomains) {
+      seedOriginsForRank.push(origin)
+      const apex = deps.registrableApex(origin)
+      if (apex) wildcardApexes.add(apex)
+    }
+    for (const c of effectiveRun.candidates) {
+      if (c.includeSubdomains && !c.thirdParty) {
+        seedOriginsForRank.push(c.origin)
+        const apex = deps.registrableApex(c.origin)
+        if (apex) wildcardApexes.add(apex)
+      } else if (!c.thirdParty && !isBulkDnsImport(c) && !isDiscoveredSubdomainSourceServer(c.source)) {
+        seedOriginsForRank.push(c.origin)
+      }
+    }
+
+    const rankedAll = deps.rankScopeAssets(effectiveRun.candidates, seedOriginsForRank).map(entry => ({
+      id: entry.asset.id,
+      origin: entry.asset.origin,
+      score: entry.score,
+      apex: entry.apex,
+      sameApexAsSeed: entry.sameApexAsSeed,
+      depth: entry.depth,
+      noisy: entry.noisy,
+    }))
+
+    if (effectiveRun.scopeRevision > 0) {
+      return { ranked: rankedAll, selectedIds: [...effectiveRun.approved] }
+    }
+
+    const matchesWildcardParent = (origin: string): boolean => {
+      if (wildcardApexes.size === 0) return false
+      const h = extractHostnameServer(origin)
+      const apex = deps.registrableApex(origin)
+      if (apex && wildcardApexes.has(apex)) return true
+      if (deps.isMultiTenantPublicSuffix(h)) return false
+      for (const wApex of wildcardApexes) {
+        if (h === wApex || h.endsWith(`.${wApex}`)) return true
+      }
+      return false
+    }
+
+    const pickRanked = (
+      list: typeof effectiveRun.candidates,
+      limit: number,
+    ): string[] => {
+      if (list.length <= limit) return list.map(c => c.id)
+      const chosen = new Set(deps.rankScopeAssets(list, seedOriginsForRank, { maxAssets: limit }).map(r => r.asset.id))
+      return list.filter(c => chosen.has(c.id)).map(c => c.id)
+    }
+
+    if (projectDefaultScope.length > 0) {
+      const saved = new Set(projectDefaultScope)
+      const savedIds = effectiveRun.candidates.filter(a => saved.has(a.origin)).map(a => a.id)
+      if (wildcardApexes.size === 0) return { ranked: rankedAll, selectedIds: savedIds }
+      const savedSet = new Set(savedIds)
+      const extraSubs = effectiveRun.candidates.filter(
+        a => !savedSet.has(a.id) && !a.thirdParty && isDiscoveredSubdomainSourceServer(a.source) && matchesWildcardParent(a.origin),
+      )
+      const remaining = Math.max(0, cap - savedIds.length)
+      if (remaining === 0 || extraSubs.length === 0) return { ranked: rankedAll, selectedIds: savedIds }
+      return { ranked: rankedAll, selectedIds: [...savedIds, ...pickRanked(extraSubs, remaining)] }
+    }
+
+    const eligible = effectiveRun.candidates.filter(a => {
+      if (a.thirdParty) return false
+      if (isBulkDnsImport(a)) return false
+      if (isDiscoveredSubdomainSourceServer(a.source)) {
+        if (wildcardApexes.size > 0) return matchesWildcardParent(a.origin)
+        return false
+      }
+      return true
+    })
+    return { ranked: rankedAll, selectedIds: pickRanked(eligible, cap) }
+  }
+
+  const recommended = computeFor(run, project.defaultScope, includeSubdomainOrigins)
+  const highSignal = computeFor(
+    { scopeRevision: 0, approved: [], candidates: run.candidates },
+    [],
+    includeSubdomainOrigins.length > 0 ? includeSubdomainOrigins : project.seeds,
+  )
+
+  return {
+    rankedAssets: recommended.ranked,
+    recommendedScopeAssetIds: recommended.selectedIds,
+    highSignalScopeAssetIds: highSignal.selectedIds,
+  }
+}
+
+export type SerializableJsonValue =
+  | string
+  | number
+  | boolean
+  | null
+  | SerializableJsonValue[]
+  | { [key: string]: SerializableJsonValue }
+
+export interface SerializableRunEvent {
+  id: number
+  runId: string | null
+  kind: string
+  message: string
+  detail: Record<string, SerializableJsonValue>
+  createdAt: number
+}
+
+export interface RunProjectionQueryDeps extends ScopeRankingDeps {
+  tables: typeof tables
+  and: typeof and
+  desc: typeof desc
+  eq: typeof eq
+  inArray: typeof inArray
+  lt: typeof lt
+  sql: typeof sql
+}
+
+/**
+ * Build a strictly bounded run-detail projection with exact `totals` and cursor metadata,
+ * avoiding full `projectDetail` aggregation and unbounded table dumps on every SSE refresh tick.
+ */
+export function buildBoundedRunProjection(
+  db: Store,
+  runId: string,
+  deps: RunProjectionQueryDeps,
+  options?: { limits?: Partial<Record<keyof typeof RUN_DETAIL_PROJECTION_CAPS, number>> },
+) {
+  const clampCap = (val: number | undefined, fallback: number) =>
+    Math.max(1, Math.min(Math.floor(val ?? fallback), 5000))
+  const caps = {
+    evidence: clampCap(options?.limits?.evidence, RUN_DETAIL_PROJECTION_CAPS.evidence),
+    facts: clampCap(options?.limits?.facts, RUN_DETAIL_PROJECTION_CAPS.facts),
+    exchanges: clampCap(options?.limits?.exchanges, RUN_DETAIL_PROJECTION_CAPS.exchanges),
+    endpoints: clampCap(options?.limits?.endpoints, RUN_DETAIL_PROJECTION_CAPS.endpoints),
+    messages: clampCap(options?.limits?.messages, RUN_DETAIL_PROJECTION_CAPS.messages),
+    boardMessages: clampCap(options?.limits?.boardMessages, RUN_DETAIL_PROJECTION_CAPS.boardMessages),
+    events: clampCap(options?.limits?.events, RUN_DETAIL_PROJECTION_CAPS.events),
+  }
+
+  const detail = db.runDetail(runId, {
+    evidence: { limit: caps.evidence },
+    facts: { limit: caps.facts },
+    exchanges: { limit: caps.exchanges },
+    endpoints: { limit: caps.endpoints },
+    messages: { limit: caps.messages },
+    boardMessages: { limit: caps.boardMessages },
+    includeTotals: true,
+  })
+
+  const subdomainDiscoveryPending = detail.run.phase === 'review'
+    ? isSubdomainDiscoveryPendingFromEvents(
+        db.db
+          .select({ id: deps.tables.events.id, kind: deps.tables.events.kind })
+          .from(deps.tables.events)
+          .where(deps.and(
+            deps.eq(deps.tables.events.runId, runId),
+            deps.inArray(deps.tables.events.kind, ['discovery.subdomains_started', 'discovery.subdomains_discovered']),
+          ))
+          .orderBy(deps.desc(deps.tables.events.id))
+          .limit(4)
+          .all(),
+      )
+    : false
+
+  // Query only project asset flags needed for subdomain inheritance — never aggregate full `projectDetail`.
+  const includeSubdomainOrigins = db.db
+    .select({
+      origin: deps.tables.projectAssets.origin,
+      includeSubdomains: deps.tables.projectAssets.includeSubdomains,
+      thirdParty: deps.tables.projectAssets.thirdParty,
+    })
+    .from(deps.tables.projectAssets)
+    .where(deps.eq(deps.tables.projectAssets.projectId, detail.run.projectId))
+    .all()
+    .filter(a => a.includeSubdomains && !a.thirdParty)
+    .map(a => a.origin)
+
+  const eventsCountRow = db.db
+    .select({ count: deps.sql<number>`count(*)` })
+    .from(deps.tables.events)
+    .where(deps.eq(deps.tables.events.runId, runId))
+    .get()
+  const eventsTotal = Number(eventsCountRow?.count ?? 0)
+
+  const totals = {
+    evidence: detail.paging?.totals?.evidence ?? detail.evidence.length,
+    facts: detail.paging?.totals?.facts ?? detail.facts.length,
+    exchanges: detail.paging?.totals?.exchanges ?? detail.exchangesSummary.length,
+    endpoints: detail.paging?.totals?.endpoints ?? detail.endpoints.length,
+    endpointParams: detail.paging?.totals?.endpointParams ?? detail.endpointParams.length,
+    messages: detail.paging?.totals?.messages ?? detail.messages.length,
+    boardMessages: detail.paging?.totals?.boardMessages ?? detail.boardMessages.length,
+    events: eventsTotal,
+  }
+
+  const scopeRanking = computeServerScopeRanking(detail.run, detail.project, includeSubdomainOrigins, deps)
+
+  return {
+    ...detail,
+    subdomainDiscoveryPending,
+    includeSubdomainOrigins,
+    rankedAssets: scopeRanking.rankedAssets,
+    recommendedScopeAssetIds: scopeRanking.recommendedScopeAssetIds,
+    highSignalScopeAssetIds: scopeRanking.highSignalScopeAssetIds,
+    projection: {
+      bounded: true as const,
+      caps,
+      totals,
+      truncated: {
+        evidence: totals.evidence > detail.evidence.length,
+        facts: totals.facts > detail.facts.length,
+        exchanges: totals.exchanges > detail.exchangesSummary.length,
+        endpoints: totals.endpoints > detail.endpoints.length,
+        messages: totals.messages > detail.messages.length,
+        boardMessages: totals.boardMessages > detail.boardMessages.length,
+        events: totals.events > caps.events,
+      },
+      cursors: {
+        eventsHead: detail.cursor,
+        exchangesOffset: detail.exchangesSummary.length,
+        messagesOffset: detail.messages.length,
+        factsOffset: detail.facts.length,
+        evidenceOffset: detail.evidence.length,
+        endpointsOffset: detail.endpoints.length,
+        boardMessagesOffset: detail.boardMessages.length,
+      },
+    },
+  }
+}
+
+/** Cursor-paginated event history loader (older-than `beforeId`, newer-than `afterId`, or newest page). */
+export function queryRunEventsPage(
+  db: Store,
+  runId: string,
+  deps: Pick<RunProjectionQueryDeps, 'tables' | 'and' | 'desc' | 'eq' | 'lt' | 'sql'>,
+  options: { beforeId?: number; afterId?: number; limit?: number } = {},
+): {
+  events: SerializableRunEvent[]
+  hasMore: boolean
+  oldestId: number | null
+  newestId: number | null
+  totalCount: number
+} {
+  db.run(runId)
+  const limit = Math.max(1, Math.min(Math.floor(options.limit ?? 200), 1000))
+  const totalRow = db.db
+    .select({ count: deps.sql<number>`count(*)` })
+    .from(deps.tables.events)
+    .where(deps.eq(deps.tables.events.runId, runId))
+    .get()
+  const totalCount = Number(totalRow?.count ?? 0)
+
+  if (options.afterId !== undefined) {
+    const rows = db.eventsAfter(runId, options.afterId, limit + 1)
+    const hasMore = rows.length > limit
+    const events = (hasMore ? rows.slice(0, limit) : rows).map(ev => ({
+      id: ev.id,
+      runId,
+      kind: ev.kind,
+      message: ev.message,
+      detail: ev.detail as Record<string, SerializableJsonValue>,
+      createdAt: ev.createdAt,
+    }))
+    return {
+      events,
+      hasMore,
+      oldestId: events.length ? events[0]!.id : null,
+      newestId: events.length ? events[events.length - 1]!.id : null,
+      totalCount,
+    }
+  }
+
+  const rowsDesc = db.db
+    .select()
+    .from(deps.tables.events)
+    .where(options.beforeId !== undefined
+      ? deps.and(deps.eq(deps.tables.events.runId, runId), deps.lt(deps.tables.events.id, options.beforeId))
+      : deps.eq(deps.tables.events.runId, runId))
+    .orderBy(deps.desc(deps.tables.events.id))
+    .limit(limit + 1)
+    .all()
+  const hasMore = rowsDesc.length > limit
+  const pageDesc = hasMore ? rowsDesc.slice(0, limit) : rowsDesc
+  const events: SerializableRunEvent[] = pageDesc.reverse().map(ev => ({
+    id: ev.id,
+    runId: ev.runId,
+    kind: ev.kind,
+    message: ev.message,
+    detail: ev.detail as Record<string, SerializableJsonValue>,
+    createdAt: ev.createdAt,
+  }))
+  return {
+    events,
+    hasMore,
+    oldestId: events.length ? events[0]!.id : null,
+    newestId: events.length ? events[events.length - 1]!.id : null,
+    totalCount,
+  }
+}
+
 export const runData = createServerFn({ method: 'GET' })
   .validator(z.object({ runId: id }))
   .handler(({ data }) => {
     const db = store()
-    const detail = db.runDetail(data.runId)
-    const subdomainDiscoveryPending = detail.run.phase === 'review'
-      ? isSubdomainDiscoveryPendingFromEvents(db.eventsAfter(data.runId, 0, 1000))
-      : false
-    const includeSubdomainOrigins = db.projectDetail(detail.run.projectId).assets
-      .filter(a => a.includeSubdomains && !a.thirdParty)
-      .map(a => a.origin)
+    const projected = buildBoundedRunProjection(db, data.runId, {
+      rankScopeAssets,
+      registrableApex,
+      isMultiTenantPublicSuffix,
+      tables,
+      and,
+      desc,
+      eq,
+      inArray,
+      lt,
+      sql,
+    })
     return {
-      ...detail,
-      subdomainDiscoveryPending,
-      includeSubdomainOrigins,
+      ...projected,
       labTarget: serializeLabTarget(execution().labRunner.getTarget(data.runId)),
       localLabEnvEnabled: isLocalLabEnvEnabled(),
       hasModel: modelReady(db),
+    }
+  })
+
+export const readRunEventsPage = createServerFn({ method: 'GET' })
+  .validator(z.object({
+    runId: id,
+    beforeId: z.number().int().positive().optional(),
+    afterId: z.number().int().nonnegative().optional(),
+    limit: z.number().int().min(1).max(1000).optional(),
+  }))
+  .handler(({ data }) => queryRunEventsPage(
+    store(),
+    data.runId,
+    { tables, and, desc, eq, lt, sql },
+    {
+      beforeId: data.beforeId,
+      afterId: data.afterId,
+      limit: data.limit,
+    },
+  ))
+
+export const readRunDetailSlice = createServerFn({ method: 'GET' })
+  .validator(z.object({
+    runId: id,
+    section: z.enum(['exchanges', 'messages', 'facts', 'evidence', 'endpoints', 'boardMessages']),
+    offset: z.number().int().min(0).default(0),
+    limit: z.number().int().min(1).max(1000).default(200),
+  }))
+  .handler(({ data }) => {
+    const db = store()
+    const page = { offset: data.offset, limit: data.limit }
+    const detail = db.runDetail(data.runId, {
+      includeTotals: true,
+      evidence: data.section === 'evidence' ? page : { limit: 1 },
+      facts: data.section === 'facts' ? page : { limit: 1 },
+      exchanges: data.section === 'exchanges' ? page : { limit: 1 },
+      endpoints: data.section === 'endpoints' ? page : { limit: 1 },
+      messages: data.section === 'messages' ? page : { limit: 1 },
+      boardMessages: data.section === 'boardMessages' ? page : { limit: 1 },
+    })
+    const totals = detail.paging?.totals
+    const items = data.section === 'exchanges'
+      ? detail.exchangesSummary
+      : data.section === 'messages'
+        ? detail.messages
+        : data.section === 'facts'
+          ? detail.facts
+          : data.section === 'evidence'
+            ? detail.evidence
+            : data.section === 'endpoints'
+              ? detail.endpoints
+              : detail.boardMessages
+    const totalCount = totals ? totals[data.section] : items.length
+    const nextOffset = data.offset + items.length
+    return {
+      section: data.section,
+      items,
+      totalCount,
+      offset: data.offset,
+      nextOffset,
+      hasMore: nextOffset < totalCount,
     }
   })
 

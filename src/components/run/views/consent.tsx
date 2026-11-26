@@ -5,7 +5,6 @@ import { useEffect, useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
 import { canReviewScope, maxBudgetRequests, maxRpsPerOriginCeiling, maxScopeHosts } from '../../../domain.ts'
 import type { ApprovalPolicy, CapabilityTier } from '../../../domain.ts'
-import { publicSuffixRules } from '../../../server/public-suffix-list.ts'
 import { approvalPolicyMeta, capabilityTierMeta } from '../../run-state.ts'
 import { Dialog, DialogContent, DialogTitle } from '../../ui/dialog.tsx'
 import { useRun } from '../data.tsx'
@@ -49,281 +48,94 @@ interface Draft {
   maxRpsPerOrigin: number
 }
 
-const PSL_RULES: ReadonlySet<string> = new Set(
-  publicSuffixRules
-    .split('\n')
-    .map(line => line.trim())
-    .filter(Boolean),
-)
-
-const PSL_ICANN_GENERIC_MULTI_TLDS = new Set(['aero', 'arpa', 'edu', 'gov', 'int', 'mil', 'museum', 'pro'])
-const PSL_ICANN_CC_SLDS = new Set([
-  'co', 'com', 'net', 'org', 'gov', 'edu', 'ac', 'mil', 'int', 'sch', 'ltd', 'plc',
-  'go', 'or', 'ne', 'ed', 'ad', 'gr', 'lg', 'gob', 'gouv', 'asso', 'tm', 'nom', 'name',
-  'info', 'biz', 'pro', 'id', 'me', 'med', 'art', 'firm', 'store', 'web', 'rec', 'ind',
-  'gen', 'cri', 'geek', 'school', 'govt', 'health', 'parliament', 'nhs', 'police', 'mod',
-  'nic', 'coop', 'ngo', 'priv', 'presse', 'asn', 'conf', 'oz', 'csiro', 'iwi', 'maori', 'kiwi',
-  'k12', 'lib', 'cc', 'fed', 'isa', 'nsn', 'dni', 'museum', 'law', 'eng', 'vet', 'bio', 'agr',
-  'adm', 'adv', 'am', 'arq', 'ato', 'bmd', 'cim', 'cng', 'cnt', 'ecn', 'esp', 'etc', 'eti',
-  'far', 'flog', 'fm', 'fnd', 'fot', 'fst', 'g12', 'ggf', 'imb', 'inf', 'jor', 'jus', 'leg',
-  'lel', 'mat', 'mp', 'mus', 'not', 'ntr', 'odo', 'ppg', 'psc', 'psi', 'qsl', 'radio', 'slg',
-  'srv', 'taxi', 'teo', 'tmp', 'trd', 'tur', 'tv', 'vlog', 'wiki', 'zlg', 'in', 'ai', 'sc',
-  'act', 'nsw', 'nt', 'qld', 'sa', 'tas', 'vic', 'wa', 'ab', 'bc', 'mb', 'nb', 'nf', 'nl',
-  'ns', 'nu', 'on', 'pe', 'qc', 'sk', 'yk', 'pp', 'spb', 'msk', 'its', 'res', 'sld', 'fin',
-  'per', 'nat', 'pol', 'soc', 'sci', 'tec', 'ong', 'red', 'gub', 'city', 'pref', 'metro',
-  'state', 'council', 'service', 'api', 'campaign',
+// Lightweight client fallback for standalone unit tests when server-authoritative PSL
+// ranking (`detail.recommendedScopeAssetIds` / `detail.highSignalScopeAssetIds`) is absent.
+// Authoritative full-PSL ranking runs strictly on the server in `src/actions.ts`.
+const PSL_RULES: ReadonlySet<string> = new Set([
+  'co.uk', 'org.uk', 'gov.uk', 'ac.uk', 'com.au', 'net.au', 'org.au', 'co.jp', 'ne.jp', 'or.jp',
+  'com.br', 'co.nz', 'co.za', 'co.in', 'com.sg', 'com.hk', 'com.mx', 'com.tw', 'co.kr',
+  'vercel.app', 'netlify.app', 'github.io', 'pages.dev', 'fly.dev', 'herokuapp.com',
+  'onrender.com', 'workers.dev', 'web.app', 'firebaseapp.com', 'run.app', 'appspot.com',
+  'azurewebsites.net', 'cloudfront.net', 'amazonaws.com', 'railway.app', 'glitch.me',
 ])
-const PSL_COMMERCIAL_CC_SLDS = new Set(['co', 'com', 'net', 'org', 'biz', 'info', 'web', 'me', 'nom', 'name'])
-const PSL_GEO_CCTLDS = new Set([
-  'jp', 'no', 'it', 'pl', 'ua', 'cn', 'us', 'ru', 'br', 'kr', 'tw', 'au', 'ca', 'in', 'za', 'nz',
-  'ar', 'mx', 'cl', 'pe', 've', 'id', 'my', 'ph', 'th', 'vn', 'tr', 'il', 'sa', 'ae', 'eg', 'ng',
-  'ke', 'gr', 'es', 'fr', 'de', 'nl', 'be', 'ch', 'at', 'se', 'dk', 'fi', 'ie', 'pt', 'hu', 'ro',
-  'bg', 'hr', 'si', 'sk', 'cz', 'ee', 'lv', 'lt', 'by', 'kz',
+const FALLBACK_MULTI_TENANT_SUFFIXES: ReadonlySet<string> = new Set([
+  'vercel.app', 'netlify.app', 'github.io', 'pages.dev', 'fly.dev', 'herokuapp.com',
+  'onrender.com', 'workers.dev', 'web.app', 'firebaseapp.com', 'run.app', 'appspot.com',
+  'azurewebsites.net', 'cloudfront.net', 'amazonaws.com', 'railway.app', 'glitch.me',
 ])
-const PSL_MUNICIPAL_CCTLDS = new Set(['jp', 'no', 'it', 'pl', 'ua'])
-const PSL_GOV_EDU_SLDS = new Set(['gov', 'edu', 'ac', 'mil', 'sch', 'gob', 'gouv', 'k12', 'lg', 'city', 'pref', 'state'])
-const PSL_GOV_EDU_SUBLABELS = new Set([
-  'service', 'api', 'campaign', 'k12', 'lib', 'cc', 'city', 'pref',
-  'nsw', 'vic', 'qld', 'wa', 'sa', 'tas', 'act', 'nt', 'gov', 'edu', 'ac',
-])
-const PSL_SUPPLEMENTAL_MULTI_TENANT_ROOTS = ['amazonaws.com', 'railway.app', 'glitch.me']
 
-function isPrivatePslRule(rule: string): boolean {
-  if (rule.startsWith('!')) return false
-  const isWild = rule.startsWith('*.')
-  const bare = isWild ? rule.slice(2) : rule
-  const labels = bare.split('.')
-  if (labels.length < 2) return false
-  const tld = labels[labels.length - 1]!
-  if (tld.length > 2 && !tld.startsWith('xn--')) return !PSL_ICANN_GENERIC_MULTI_TLDS.has(tld)
-  if (tld.startsWith('xn--')) return labels.length > 2
-  if (isWild) {
-    const sld = labels[labels.length - 2]!
-    return !(PSL_ICANN_CC_SLDS.has(sld) && !PSL_COMMERCIAL_CC_SLDS.has(sld))
-  }
-  if (labels.length === 2) {
-    const sld = labels[0]!
-    if (PSL_ICANN_CC_SLDS.has(sld)) return false
-    if (sld.length === 2 && PSL_GEO_CCTLDS.has(tld)) return false
-    if (PSL_MUNICIPAL_CCTLDS.has(tld)) return false
-    return true
-  }
-  const sld = labels[labels.length - 2]!
-  if (PSL_COMMERCIAL_CC_SLDS.has(sld)) return true
-  if (PSL_GOV_EDU_SLDS.has(sld)) {
-    const first = labels[0]!
-    if (PSL_GOV_EDU_SUBLABELS.has(first)) return false
-    if (labels.length === 3 && (sld === 'gov' || sld === 'edu' || sld === 'ac' || sld === 'mil' || sld === 'gob' || sld === 'gouv')) {
-      return false
-    }
-  }
-  if ((PSL_MUNICIPAL_CCTLDS.has(tld) || tld === 'us') && labels.length === 3 && !labels[0]!.includes('-')) {
-    return false
-  }
-  return true
-}
-
-const PSL_PRIVATE_RULES: ReadonlySet<string> = new Set([...PSL_RULES].filter(isPrivatePslRule))
-
-function normalizeHostBrowserSafe(hostname: string): string {
-  const trimmed = hostname.trim().toLowerCase().replace(/\.+$/, '')
-  if (!trimmed || trimmed.includes(':')) return trimmed
+function extractFallbackHost(raw: string): string {
+  const t = raw.trim()
+  if (!t) return ''
   try {
-    return new URL(`http://${trimmed}`).hostname.toLowerCase()
+    return (/^[a-z][a-z0-9+.-]*:\/\//i.test(t) ? new URL(t).hostname : t.replace(/\/.*$/, '').replace(/:\d+$/, ''))
+      .toLowerCase()
+      .replace(/\.+$/, '')
   } catch {
-    return trimmed
-  }
-}
-
-function isIpLiteralBrowserSafe(hostname: string): boolean {
-  const bare = hostname.replace(/^\[|\]$/g, '')
-  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(bare)) {
-    return bare.split('.').every(part => Number(part) <= 255)
-  }
-  return bare.includes(':') && /^[0-9a-f:.]+$/i.test(bare)
-}
-
-function extractHostFromOrigin(raw: string): string {
-  const trimmed = raw.trim()
-  if (!trimmed) return ''
-  let host = trimmed
-  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed)) {
-    try {
-      host = new URL(trimmed).hostname
-    } catch {
-      return ''
-    }
-  } else if (trimmed.includes('/') || (trimmed.includes(':') && !trimmed.startsWith('[') && trimmed.indexOf(':') === trimmed.lastIndexOf(':'))) {
-    host = trimmed.replace(/\/.*$/, '').replace(/:\d+$/, '')
-  }
-  return normalizeHostBrowserSafe(host)
-}
-
-function matchPublicSuffixClient(labels: readonly string[]): { labelCount: number; section: 'icann' | 'private' } {
-  const n = labels.length
-  let bestCount = 1
-  let bestRule: string | null = null
-  for (let i = 0; i < n; i += 1) {
-    const candidate = labels.slice(i).join('.')
-    if (PSL_RULES.has(`!${candidate}`)) {
-      const excRule = `!${candidate}`
-      return {
-        labelCount: Math.max(1, n - i - 1),
-        section: PSL_PRIVATE_RULES.has(excRule) ? 'private' : 'icann',
-      }
-    }
-    if (PSL_RULES.has(candidate) && n - i > bestCount) {
-      bestCount = n - i
-      bestRule = candidate
-    }
-    if (i < n - 1) {
-      const wildRule = `*.${labels.slice(i + 1).join('.')}`
-      if (PSL_RULES.has(wildRule) && n - i > bestCount) {
-        bestCount = n - i
-        bestRule = wildRule
-      }
-    }
-  }
-  return {
-    labelCount: bestCount,
-    section: bestRule !== null && PSL_PRIVATE_RULES.has(bestRule) ? 'private' : 'icann',
+    return ''
   }
 }
 
 export function isMultiTenantPublicSuffix(hostname: string): boolean {
-  const host = normalizeHostBrowserSafe(hostname)
-  if (!host || isIpLiteralBrowserSafe(host)) return false
-  const labels = host.split('.').filter(Boolean)
-  if (labels.length < 2) return false
-  if (matchPublicSuffixClient(labels).section === 'private') return true
-  return PSL_SUPPLEMENTAL_MULTI_TENANT_ROOTS.some(root => host === root || host.endsWith(`.${root}`))
+  const h = extractFallbackHost(hostname)
+  if (!h || /^\d{1,3}(?:\.\d{1,3}){3}$/.test(h) || h.includes(':')) return false
+  for (const suffix of FALLBACK_MULTI_TENANT_SUFFIXES) {
+    if (h === suffix || h.endsWith(`.${suffix}`)) return true
+  }
+  return false
 }
 
 export function registrableApex(hostOrOrigin: string): string | null {
-  const host = extractHostFromOrigin(hostOrOrigin)
-  if (!host || host === 'localhost' || isIpLiteralBrowserSafe(host)) return null
-  const labels = host.split('.').filter(Boolean)
+  const h = extractFallbackHost(hostOrOrigin)
+  if (!h || h === 'localhost' || /^\d{1,3}(?:\.\d{1,3}){3}$/.test(h) || h.includes(':')) return null
+  const labels = h.split('.').filter(Boolean)
   if (labels.length < 2) return null
-  const suffixCount = matchPublicSuffixClient(labels).labelCount
-  if (labels.length <= suffixCount) return null
-  return labels.slice(-(suffixCount + 1)).join('.')
+  const suffixLen = labels.length >= 2 && PSL_RULES.has(labels.slice(-2).join('.')) ? 2 : 1
+  return labels.length <= suffixLen ? null : labels.slice(-(suffixLen + 1)).join('.')
 }
 
 const SCOPE_TIER1 = new Set([
   'api', 'app', 'auth', 'admin', 'billing', 'oauth', 'sso', 'login', 'portal',
   'dashboard', 'console', 'graphql', 'gateway', 'accounts', 'account',
 ])
-const SCOPE_TIER2 = new Set([
-  'www', 'pay', 'payments', 'checkout', 'mcp', 'cloud', 'engine', 'internal',
-  'staging', 'stage', 'dev', 'beta', 'sandbox', 'studio', 'web', 'my', 'id',
-  'identity', 'token', 'webhooks', 'webhook', 'docs', 'blog', 'status',
-])
-
-function isSprawlPrefix(prefix: string): boolean {
-  for (const label of prefix.split('.')) {
-    if (/^(?:pr|deploy-preview|preview)-\d+$/.test(label)) return true
-    if (/^[a-z0-9-]+-\d{3,}$/.test(label)) return true
-    const hexDeploy = /^[a-z0-9-]+-([0-9a-f]{7,})$/.exec(label)
-    if (hexDeploy && /\d/.test(hexDeploy[1]!)) return true
-  }
-  return false
-}
+const SCOPE_NOISY_RE = /(?:^|\.)(?:(?:pr|deploy-preview|preview)-\d+|[a-z0-9-]+-\d{3,})(?:\.|$)/i
 
 export function rankScopeAssets<T extends { id?: string; origin: string; source?: string; thirdParty?: boolean; dnsSource?: unknown }>(
   assets: readonly T[],
   seedOrigins: readonly string[],
   options: { maxAssets?: number } = {},
 ): Array<{ asset: T; score: number; apex: string | null; sameApexAsSeed: boolean; depth: number; noisy: boolean }> {
-  const canonicalOrigin = (origin: string): string => {
-    try {
-      return new URL(origin).origin.toLowerCase()
-    } catch {
-      return origin.trim().toLowerCase().replace(/\/+$/, '')
-    }
-  }
-  const isDiscovered = (source?: string): boolean =>
-    source === 'subdomain_discovery' || source === 'phase0_ct_discovery' || source === 'phase0_subdomain_discovery'
-
-  const seedOriginSet = new Set(seedOrigins.map(canonicalOrigin))
-  const seedHostSet = new Set(seedOrigins.map(extractHostFromOrigin).filter(Boolean))
-  const seedApexes = new Set<string>()
-  for (const seed of seedOrigins) {
-    const seedHost = extractHostFromOrigin(seed)
-    if (!seedHost || isMultiTenantPublicSuffix(seedHost)) continue
-    const apex = registrableApex(seed)
-    if (apex && !isMultiTenantPublicSuffix(apex)) seedApexes.add(apex)
-  }
-
-  const ranked: Array<{ asset: T; score: number; apex: string | null; sameApexAsSeed: boolean; depth: number; noisy: boolean; _idx: number; _hostLen: number }> = []
-  for (let idx = 0; idx < assets.length; idx += 1) {
-    const asset = assets[idx]!
-    const hostName = extractHostFromOrigin(asset.origin)
+  const seedHosts = new Set(seedOrigins.map(extractFallbackHost).filter(Boolean))
+  const seedApexes = new Set(seedOrigins.map(registrableApex).filter((a): a is string => Boolean(a && !isMultiTenantPublicSuffix(a))))
+  const ranked = assets.map((asset, idx) => {
+    const h = extractFallbackHost(asset.origin)
     const apex = registrableApex(asset.origin)
-    const isExactSeed = seedOriginSet.has(canonicalOrigin(asset.origin)) || (seedHostSet.has(hostName) && !isDiscovered(asset.source))
-    const isSharedTenant = hostName ? isMultiTenantPublicSuffix(hostName) : false
-    const sameApexAsSeed = isExactSeed || (!isSharedTenant && apex !== null && seedApexes.has(apex))
-
-    let relativePrefix = ''
-    let depth = 0
-    if (apex && hostName === apex) {
-      depth = 0
-    } else if (apex && hostName.endsWith(`.${apex}`)) {
-      relativePrefix = hostName.slice(0, -(apex.length + 1))
-      depth = relativePrefix.split('.').filter(Boolean).length
-    } else if (hostName) {
-      const parts = hostName.split('.').filter(Boolean)
-      depth = Math.max(0, parts.length - 2)
-      relativePrefix = depth > 0 ? parts.slice(0, depth).join('.') : ''
-    }
-
-    const firstLabel = relativePrefix ? (relativePrefix.split('.')[0] ?? '') : ''
-    const noisy = relativePrefix ? isSprawlPrefix(relativePrefix) : false
+    const isDisc = asset.source === 'subdomain_discovery' || asset.source === 'phase0_ct_discovery' || asset.source === 'phase0_subdomain_discovery'
+    const exactSeed = seedHosts.has(h) && !isDisc
+    const sameApexAsSeed = exactSeed || (!isMultiTenantPublicSuffix(h) && apex !== null && seedApexes.has(apex))
+    const prefix = apex && h.endsWith(`.${apex}`) ? h.slice(0, -(apex.length + 1)) : ''
+    const depth = prefix ? prefix.split('.').filter(Boolean).length : 0
+    const noisy = prefix ? SCOPE_NOISY_RE.test(prefix) : false
     const src = (asset.source ?? '').toLowerCase()
-    let score: number
-    if (isExactSeed || src === 'project seed' || (!asset.dnsSource && !isDiscovered(asset.source) && src === '')) {
-      score = 1000
-    } else if (/repo|spec|openapi|swagger|github|graphql/.test(src)) {
-      score = 850
-    } else if (depth === 0 && sameApexAsSeed) {
-      score = 760
-    } else if (noisy) {
-      score = 50
-    } else if (SCOPE_TIER1.has(firstLabel)) {
-      score = Math.max(300, 700 - Math.max(0, depth - 1) * 40)
-    } else if (SCOPE_TIER2.has(firstLabel)) {
-      score = Math.max(200, 550 - Math.max(0, depth - 1) * 40)
-    } else {
-      score = Math.max(100, 440 - depth * 40)
-    }
+    let score = exactSeed || src === 'project seed' || (!asset.dnsSource && !isDisc && src === '')
+      ? 1000
+      : /repo|spec|openapi|swagger|github|graphql/.test(src)
+        ? 850
+        : noisy
+          ? 50
+          : SCOPE_TIER1.has(prefix.split('.')[0] ?? '') ? 700 : Math.max(100, 440 - depth * 40)
     if (seedOrigins.length > 0 && !sameApexAsSeed) score -= 200
     if (asset.thirdParty) score -= 500
-
-    ranked.push({ asset, score, apex, sameApexAsSeed, depth, noisy, _idx: idx, _hostLen: hostName.length })
-  }
-
-  ranked.sort((a, b) => {
-    if (b.score !== a.score) return b.score - a.score
-    if (a.depth !== b.depth) return a.depth - b.depth
-    if (a._hostLen !== b._hostLen) return a._hostLen - b._hostLen
-    const cmp = a.asset.origin.localeCompare(b.asset.origin)
-    return cmp !== 0 ? cmp : a._idx - b._idx
-  })
-  const limited = options.maxAssets !== undefined
-    ? ranked.slice(0, Math.max(0, Math.floor(options.maxAssets)))
-    : ranked
-  return limited.map(({ asset, score, apex, sameApexAsSeed, depth, noisy }) => ({
-    asset, score, apex, sameApexAsSeed, depth, noisy,
-  }))
+    return { asset, score, apex, sameApexAsSeed, depth, noisy, idx }
+  }).sort((a, b) => (b.score - a.score) || (a.depth - b.depth) || a.asset.origin.localeCompare(b.asset.origin) || (a.idx - b.idx))
+  const limited = options.maxAssets !== undefined ? ranked.slice(0, Math.max(0, Math.floor(options.maxAssets))) : ranked
+  return limited.map(({ asset, score, apex, sameApexAsSeed, depth, noisy }) => ({ asset, score, apex, sameApexAsSeed, depth, noisy }))
 }
 
 /**
  * Resolve default checked candidate IDs for scope review.
- * - Honors `run.approved` when `scopeRevision > 0`.
- * - Preserves saved `projectDefaultScope` hosts (including explicitly approved third-party hosts).
- * - Does NOT exclude `subdomain_discovery` or `phase0_ct_discovery` hosts via `!a.dnsSource`;
- *   only bulk BIND DNS zone imports and third-party CNAMEs stay unchecked by default.
- * - When a parent seed has `includeSubdomains: true`, pre-selects first-party live subdomains
- *   up to Top 30 ranked by PSL-backed `rankScopeAssets` (seeds, repo/spec matches, and high-value prefixes first).
+ * Consumes server-authoritative `options.serverRecommendedIds` (computed with full PSL in
+ * `src/actions.ts`) when present, with a small pure fallback for standalone unit tests.
  */
 export function defaultScopeAssetIds(
   run: {
@@ -342,12 +154,16 @@ export function defaultScopeAssetIds(
   options?: {
     includeSubdomainOrigins?: readonly string[]
     maxAutoSelect?: number
+    serverRecommendedIds?: readonly string[]
   },
 ): string[] {
   if (run.scopeRevision > 0) return [...run.approved]
+  if (options?.serverRecommendedIds) {
+    const validIds = new Set(run.candidates.map(c => c.id))
+    return options.serverRecommendedIds.filter(assetId => validIds.has(assetId))
+  }
 
   const cap = Math.max(1, Math.min(options?.maxAutoSelect ?? 30, 30))
-
   const extractHostname = (origin: string): string => {
     try {
       return new URL(origin).hostname.toLowerCase().replace(/\.$/, '')
@@ -355,22 +171,15 @@ export function defaultScopeAssetIds(
       return origin.replace(/^https?:\/\//i, '').replace(/\/.*$/, '').replace(/:\d+$/, '').toLowerCase().replace(/\.$/, '')
     }
   }
-
   const resolveApex = (origin: string): string | null => {
     if (typeof registrableApex === 'function') return registrableApex(origin)
-    const h = extractHostname(origin)
-    if (!h) return null
-    const parts = h.split('.').filter(Boolean)
-    if (parts.length < 2) return null
-    return parts.slice(-2).join('.')
+    const parts = extractHostname(origin).split('.').filter(Boolean)
+    return parts.length < 2 ? null : parts.slice(-2).join('.')
   }
-
   const isMultiTenant = (hostname: string): boolean =>
     typeof isMultiTenantPublicSuffix === 'function' ? isMultiTenantPublicSuffix(hostname) : false
-
   const isDiscoveredSubdomain = (source?: string): boolean =>
     source === 'subdomain_discovery' || source === 'phase0_ct_discovery' || source === 'phase0_subdomain_discovery'
-
   const isBulkDnsImport = (c: { source?: string; dnsSource?: unknown }): boolean =>
     Boolean(c.dnsSource) && !isDiscoveredSubdomain(c.source)
 
@@ -460,6 +269,7 @@ function useScopeModel() {
   const r = detail.run
   const p = detail.project
   const includeSubdomainOrigins = detail.includeSubdomainOrigins ?? []
+  const serverRecommendedIds = detail.recommendedScopeAssetIds
   return useMemo(() => {
     const discovery = r.phase === 'consent'
     const hosts = discovery
@@ -475,9 +285,10 @@ function useScopeModel() {
     const defaults = defaultScopeAssetIds(r, p.defaultScope, {
       includeSubdomainOrigins,
       maxAutoSelect: MAX_AUTO_SELECT_HOSTS,
+      serverRecommendedIds,
     })
     return { discovery, hosts, defaults, includeSubdomainOrigins }
-  }, [r, p, includeSubdomainOrigins])
+  }, [r, p, includeSubdomainOrigins, serverRecommendedIds])
 }
 
 function initialDraft(r: ReturnType<typeof useRun>['detail']['run'], defaults: string[], rpsMax: number): Draft {
@@ -611,6 +422,7 @@ function ScopeCard({
       {
         includeSubdomainOrigins: includeSubdomainOrigins.length > 0 ? includeSubdomainOrigins : detail.project.seeds,
         maxAutoSelect: MAX_AUTO_SELECT_HOSTS,
+        serverRecommendedIds: detail.highSignalScopeAssetIds,
       },
     )
     setDraft(d => ({ ...d, assetIds: ranked }))
