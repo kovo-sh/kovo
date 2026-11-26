@@ -98,6 +98,7 @@ const CLASS_TO_OWASP: Readonly<Record<string, OwaspCategory>> = {
   'el-injection': 'injection-input',
   ognl: 'injection-input',
   'log-injection': 'injection-input',
+  cache: 'injection-input',
   'cwe-89': 'injection-input',
 
   // CORS & Client-Side (canonical xss/csrf/postmessage entries derived from src/vuln-taxonomy.ts)

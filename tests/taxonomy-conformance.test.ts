@@ -41,6 +41,7 @@ import {
   bindConfirmedFindingIdentity,
   cweFamilyForReceiptClass,
   deriveSeverityBandForClass,
+  isCweConsistentWithReceiptClass,
   isSensitiveRepoEntry as execVerifyIsSensitiveRepoEntry,
   isSensitiveRepoRelativePath as execVerifyIsSensitiveRepoRelativePath,
 } from '../src/server/exec-verify.ts'
@@ -64,23 +65,29 @@ import { REGISTERED_V8_ORACLE_FAMILIES } from '../src/server/terminal-oracle-reg
 import { inferInjectionFamily } from '../src/server/verify-claims.ts'
 import {
   CANONICAL_CLASS_TO_OWASP,
+  DEDUPE_FAMILY_EXCEPTIONS,
   UNCLASSIFIED_TAXONOMY_KEY,
   VULN_TAXONOMY,
+  cweFamiliesIntersect,
   lookupVulnTaxonomy,
 } from '../src/vuln-taxonomy.ts'
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 
 /**
- * Baselined cross-table taxonomy disagreements (shrunk from 41 -> 11 in R3-11).
- * All 12 `owasp-vs-exec-verify` disagreements and 18 `exec-verify-missing` disagreements were
+ * Baselined cross-table taxonomy disagreements (shrunk from 41 -> 14 in R3-11).
+ * All 12 `owasp-vs-exec-verify` disagreements and 15 `exec-verify-missing` disagreements were
  * eliminated by unifying `exec-verify.ts` and `coverage-category.ts` on `src/vuln-taxonomy.ts`.
- * Remaining 11 entries live in `floor-recipe-engine.ts` / `oracle-invariants.ts` (scheduled for
- * R3-13 registry unification). Entries may only be removed, never added.
+ * Generic `injection` intentionally keeps a tight `['CWE-74']` family (F1 drift-gate invariant);
+ * the remaining 14 entries live in `floor-recipe-engine.ts` / `oracle-invariants.ts` (scheduled
+ * for R3-13 registry unification). Entries may only be removed, never added.
  */
 const KNOWN_TAXONOMY_DISAGREEMENTS: ReadonlySet<string> = new Set([
   'exec-verify-missing:CWE-1021:in:bola',
   'exec-verify-missing:CWE-362:in:bola',
+  'exec-verify-missing:CWE-564:in:injection',
+  'exec-verify-missing:CWE-89:in:injection',
+  'exec-verify-missing:CWE-943:in:injection',
   'grader-vs-receipt:CWE-284:bfla!=bola',
   'grader-vs-receipt:CWE-362:race_condition!=bola',
   'grader-vs-receipt:CWE-566:bfla!=bola',
@@ -731,12 +738,25 @@ test('R3-11: live mislabels eliminated (cross_tenant_read/write, injection CWE-8
   assert.equal(cweFamilyForReceiptClass('workflow_bypass').cwe, 'CWE-840')
   assert.equal(cweFamilyForReceiptClass('workflow_bypass').category, 'business-logic-race')
 
-  // 3. Injection family includes CWE-89, CWE-943, and CWE-564 consistently.
+  // 3. Injection drift-gate invariant (F1): specific receipts accept their CWE + generic CWE-74
+  //    one-directionally, while generic `injection` stays tight (['CWE-74']) so re-verifying a
+  //    confirmed CWE-89/CWE-78/CWE-1336/CWE-943 finding under generic `injection` reports drift.
+  const sqliFam = cweFamilyForReceiptClass('sqli')
+  assert.ok(sqliFam.family.includes('CWE-89') && sqliFam.family.includes('CWE-564') && sqliFam.family.includes('CWE-74'))
+  const nosqliFam = cweFamilyForReceiptClass('nosqli')
+  assert.ok(nosqliFam.family.includes('CWE-943') && nosqliFam.family.includes('CWE-74'))
+  assert.equal(nosqliFam.family.includes('CWE-89'), false, 'nosqli family must not accept SQLi CWE-89')
   const inj = cweFamilyForReceiptClass('injection')
-  assert.ok(inj.family.includes('CWE-89'), 'injection family must include CWE-89')
-  assert.ok(inj.family.includes('CWE-943'), 'injection family must include CWE-943')
-  assert.ok(inj.family.includes('CWE-564'), 'injection family must include CWE-564')
+  assert.deepEqual(inj.family, ['CWE-74'], 'generic injection family must stay tight (CWE-74 only)')
   assert.equal(inj.category, 'injection-input')
+  assert.equal(isCweConsistentWithReceiptClass('CWE-89', 'injection'), false, 'CWE-89 under generic injection receipt must report drift')
+  assert.equal(isCweConsistentWithReceiptClass('CWE-78', 'injection'), false, 'CWE-78 under generic injection receipt must report drift')
+  assert.equal(isCweConsistentWithReceiptClass('CWE-1336', 'injection'), false, 'CWE-1336 under generic injection receipt must report drift')
+  assert.equal(isCweConsistentWithReceiptClass('CWE-943', 'injection'), false, 'CWE-943 under generic injection receipt must report drift')
+  assert.equal(isCweConsistentWithReceiptClass('CWE-74', 'injection'), true)
+  assert.equal(isCweConsistentWithReceiptClass('CWE-74', 'sqli'), true, 'specific sqli receipt may confirm generic CWE-74 one-directionally')
+  assert.equal(isCweConsistentWithReceiptClass('CWE-89', 'sqli'), true)
+  assert.equal(isCweConsistentWithReceiptClass('CWE-943', 'nosqli'), true)
 
   // 4. XSS, XXE, CSRF, and webhook_forgery OWASP cells match across exec-verify and coverage-category.
   for (const [cls, expectedOwasp, expectedCwe] of [
@@ -914,4 +934,32 @@ test('R3-11: src/vuln-taxonomy.ts is browser-safe, shared by coverage-category, 
   // Safety-primitive consolidation in exec-verify.ts (R3-11 retires final R3-10 clone debt).
   assert.strictEqual(execVerifyIsSensitiveRepoEntry, safetyIsSensitiveRepoEntry)
   assert.strictEqual(execVerifyIsSensitiveRepoRelativePath, safetyIsSensitiveRepoRelativePath)
+
+  // R3-11 F2 single-source conformance guard: every VULN_TAXONOMY entry's canonicalCwe MUST
+  // dedupe-intersect every member of its cweFamily, except explicitly documented exceptions.
+  const exceptionSet = new Set(DEDUPE_FAMILY_EXCEPTIONS.map(ex => `${ex.entryId}::${ex.cwe}`))
+  for (const entry of VULN_TAXONOMY) {
+    for (const memberCwe of entry.cweFamily) {
+      const key = `${entry.id}::${memberCwe}`
+      if (exceptionSet.has(key)) {
+        assert.equal(
+          cweFamiliesIntersect(entry.canonicalCwe, memberCwe),
+          false,
+          `documented dedupe veto exception ${key} should remain disjoint`,
+        )
+        continue
+      }
+      assert.equal(
+        cweFamiliesIntersect(entry.canonicalCwe, memberCwe),
+        true,
+        `VULN_TAXONOMY ${entry.id}: canonicalCwe ${entry.canonicalCwe} must dedupe-intersect cweFamily member ${memberCwe}`,
+      )
+    }
+  }
+
+  // R3-11 N2: overly broad non-kernel aliases must not bind to specific CWEs in VULN_TAXONOMY.
+  for (const broad of ['cache', 'auth', 'authn', 'authentication', 'session', 'replay_attack', 'rate_limit_bypass', 'webhook']) {
+    assert.equal(lookupVulnTaxonomy(broad), null, `overly broad alias "${broad}" must not map in VULN_TAXONOMY`)
+    assert.equal(cweFamilyForReceiptClass(broad).unclassified, true, `broad alias "${broad}" must remain unclassified`)
+  }
 })

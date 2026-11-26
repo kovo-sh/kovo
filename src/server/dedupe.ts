@@ -1,6 +1,6 @@
 import { z } from 'zod'
 import type { Finding } from '../domain.ts'
-import { cweFamiliesIntersect, isConcreteCwe } from '../vuln-taxonomy.ts'
+import { UNCLASSIFIED_TAXONOMY_KEY, cweFamiliesConflict } from '../vuln-taxonomy.ts'
 import {
   ORIGIN_WIDE_CWE_KEYS,
   computeFindingFingerprint,
@@ -630,10 +630,23 @@ function evaluateSameFindingPredicate(
     }
   }
 
-  // R3-11 CWE-family veto: when both findings carry known concrete CWEs whose families do not
-  // intersect (e.g., SQLi CWE-89 vs CMDi CWE-78 or SSTI CWE-1336 sharing `injection-input`, or
-  // BOLA CWE-639 vs Mass Assignment CWE-915), never collapse them on the same surface.
-  if (isConcreteCwe(candCwe) && isConcreteCwe(exCwe) && !cweFamiliesIntersect(candCwe, exCwe)) {
+  // R3-11 CWE-family veto:
+  //  - Keep 'unclassified' findings visible and separate from classified findings on the same surface.
+  //  - When BOTH findings carry taxonomy-known CWEs from strictly disjoint derived families (e.g.,
+  //    SQLi CWE-89 vs CMDi CWE-78 / SSTI CWE-1336 / NoSQLi CWE-943 / XXE CWE-611 sharing
+  //    `injection-input`, or BOLA CWE-639 vs Mass Assignment CWE-915), never collapse them.
+  //  - Unlisted CWEs (e.g. generic CWE-20) are not treated as conflicting singletons.
+  if (
+    (candCwe === UNCLASSIFIED_TAXONOMY_KEY || exCwe === UNCLASSIFIED_TAXONOMY_KEY)
+    && candCwe !== exCwe
+  ) {
+    return {
+      allowed: false,
+      reason: 'cwe_family_conflict',
+      detail: `unclassified finding cannot merge with classified CWE (${candCwe} vs ${exCwe})`,
+    }
+  }
+  if (cweFamiliesConflict(candCwe, exCwe)) {
     return {
       allowed: false,
       reason: 'cwe_family_conflict',

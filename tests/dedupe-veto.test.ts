@@ -12,7 +12,7 @@ import { resolve } from 'node:path'
 import { describe, test } from 'node:test'
 
 import { ORIGIN_WIDE_CWE_KEYS, isOriginWideCwe, normalizeCwe } from '../src/finding-keys.ts'
-import { cweFamiliesIntersect } from '../src/vuln-taxonomy.ts'
+import { UNCLASSIFIED_TAXONOMY_KEY, cweFamiliesConflict, cweFamiliesIntersect } from '../src/vuln-taxonomy.ts'
 import * as reportSummary from '../src/report-summary.ts'
 import * as dedupe from '../src/server/dedupe.ts'
 import {
@@ -561,6 +561,48 @@ describe('R2-10: LLM semantic dedupe deterministic veto', () => {
       assert.equal(res.isDuplicate, true)
       assert.equal(res.duplicateOfId, existing.id)
     }
+
+    // R3-11 F2: unlisted CWEs (e.g. generic CWE-20) are NOT treated as conflicting singletons.
+    assert.equal(cweFamiliesConflict('CWE-20', 'CWE-89'), false)
+    const unlistedCand: DedupeCandidate = {
+      origin,
+      title: 'Input validation SQLi candidate',
+      cwe: 'CWE-20',
+      category: 'injection-input',
+      severity: 'high',
+      endpoint: '/api/v1/search',
+      method: 'GET',
+      param: 'q',
+    }
+    const sqliExisting: ExistingFindingRef = {
+      id: 'f-sqli-search',
+      origin,
+      title: 'SQL injection on /api/v1/search',
+      status: 'confirmed',
+      cwe: 'CWE-89',
+      category: 'injection-input',
+      severity: 'high',
+      endpoint: '/api/v1/search',
+      method: 'GET',
+      param: 'q',
+    }
+    assert.equal(sameFindingPredicate(unlistedCand, sqliExisting), true)
+
+    // R3-11 N1: unclassified findings must never silently merge into classified findings on the same surface.
+    const unclassifiedCand: DedupeCandidate = {
+      origin,
+      title: 'Unclassified boundary finding',
+      cwe: UNCLASSIFIED_TAXONOMY_KEY,
+      category: UNCLASSIFIED_TAXONOMY_KEY,
+      severity: 'high',
+      endpoint: '/api/v1/search',
+      method: 'GET',
+      param: 'q',
+    }
+    assert.equal(sameFindingPredicate(unclassifiedCand, sqliExisting), false)
+    const unclassifiedVeto = await judgeSemanticDuplicate(unclassifiedCand, [sqliExisting], alwaysDuplicateLlm(sqliExisting.id))
+    assert.equal(unclassifiedVeto.isDuplicate, false)
+    assert.equal(unclassifiedVeto.vetoReason, 'cwe_family_conflict')
   })
 })
 
