@@ -1422,7 +1422,8 @@ export function searchRepoHost(reposDir: string, args: SearchRepoArgs): HostSear
   let regexMatcher: RegExp | null = null
   const literalNeedle = caseSensitive ? query : query.toLowerCase()
   if (useRegex) {
-    const compiled = compileSafeClaimRegex(query, { flags: caseSensitive ? '' : 'i', maxLength: 256 })
+    // Compile without `i`/`u` flags so V8's linear-time fallback engine engages (R3-H-11).
+    const compiled = compileSafeClaimRegex(query, { flags: '', maxLength: 256 })
     if (!compiled.ok) {
       throw new Error(`Unsafe or invalid search_repo regex rejected: ${compiled.reason} Use literal search (regex: false) or a simpler linear pattern.`)
     }
@@ -2525,7 +2526,7 @@ export function buildWorkerTools(
         pathPrefix: opt(str({ description: 'Optional repo or directory prefix (e.g. /repos/owner/repo/src).', maxLength: 512 })),
         maxMatches: opt(int({ description: 'Max matching lines to return (default 50, max 200).', minimum: 1, maximum: 200 })),
         regex: opt(bool({ description: 'Evaluate query as a ReDoS-safe regex (default false = fast literal match).' })),
-        caseSensitive: opt(bool({ description: 'Case-sensitive match (default false).' })),
+        caseSensitive: opt(bool({ description: 'Case-sensitive match for literal mode (default false; regex mode is always case-sensitive to preserve V8 linear-time engine guarantees).' })),
       }),
       replay: 'safe',
       outputLimits,
