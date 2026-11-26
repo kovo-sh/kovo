@@ -46,7 +46,7 @@ import { appNames } from '../benchmarks/realistic-bench/lib/types.ts'
 import { startRealisticApp, briefingFor, gradeRun, renderScorecard } from '../benchmarks/realistic-bench/run.ts'
 import { assertLocalLabAllowed } from '../benchmarks/realistic-bench/lib/safety.ts'
 import { endpointMatches } from '../benchmarks/realistic-bench/grader/match.ts'
-import { maxRpsPerOriginCeiling } from '../src/domain.ts'
+import { isLocalModelEnvEnabled, maxRpsPerOriginCeiling } from '../src/domain.ts'
 import type { EndpointSource, Finding, ParamLocation, PersonaPrivilege } from '../src/domain.ts'
 import { CanaryBroker } from '../src/server/canary-broker.ts'
 import { resolveOobCallbackPorts, defaultWorkerConcurrency, resolveWorkerConcurrency, MAX_RUN_WORKER_CONCURRENCY } from './benchmark-env.ts'
@@ -1445,14 +1445,42 @@ export interface AgenticPreflightInput {
   backendKind: VerifierBackendKind
   workerSessions: boolean
   workerSessionsDetail?: string
+  profileEndpoints?: readonly string[]
+  localModelEnabled?: boolean
+}
+
+function findBlockedLoopbackModelOrigin(endpoints: readonly string[] | undefined): string | null {
+  if (!endpoints?.length) return null
+  for (const raw of endpoints) {
+    try {
+      const url = new URL(raw)
+      const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, '')
+      if (url.protocol === 'http:' && (host === '127.0.0.1' || host === 'localhost' || host === '::1')) {
+        return url.origin
+      }
+    } catch {
+      // Invalid URLs are rejected by profile schema validation.
+    }
+  }
+  return null
 }
 
 /**
  * Fail fast instead of producing an inert run: a model profile will send work to
  * specialist workers, and only a worker-session-capable backend (docker) can run them.
+ * Loopback HTTP model profiles (such as the matrix ModelGate) also require
+ * `KOVO_ALLOW_LOCAL_MODEL=1` or `EgressGateway` will reject every turn before egress.
  */
 export function assertAgenticPreflight(input: AgenticPreflightInput): void {
   if (!input.hasProfiles || input.noLlm || input.allowInertWorkers) return
+  const blockedLoopback = findBlockedLoopbackModelOrigin(input.profileEndpoints)
+  if (blockedLoopback && !(input.localModelEnabled ?? isLocalModelEnvEnabled())) {
+    throw new PreflightError(
+      `agentic model profile points to loopback HTTP endpoint (${blockedLoopback}) without KOVO_ALLOW_LOCAL_MODEL=1; `
+      + 'EgressGateway will block all model requests (peak=0). Set KOVO_ALLOW_LOCAL_MODEL=1 for loopback ModelGate/fixtures '
+      + 'or pass --no-model-gate to dial HTTPS provider endpoints directly.',
+    )
+  }
   if (input.workerSessions) return
   const detail = input.workerSessionsDetail ? ` (${input.workerSessionsDetail})` : ''
   if (input.backendKind === 'docker') {
@@ -3425,6 +3453,7 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
       backendKind,
       workerSessions: capability.supported,
       workerSessionsDetail: capability.detail,
+      profileEndpoints: profiles.map(p => p.endpoint),
     })
     notes.push(`verifier backend ${backendKind}; workerSessions=${capability.supported}${capability.supported ? '' : ` (${capability.detail})`}`)
 

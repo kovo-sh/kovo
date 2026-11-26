@@ -4569,9 +4569,9 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
         })
       }
     }
-
     if (result.status !== 'done' || !result.answer) {
-      throw new Error(`The model did not finish the requested turn (${result.status === 'unanswered' ? result.reason : 'unknown'}).`)
+      const detail = result.status === 'unanswered' && 'detail' in result && typeof result.detail === 'string' ? result.detail.trim() : ''
+      throw new Error(`The model did not finish the requested turn (${result.status === 'unanswered' ? result.reason : 'unknown'})${detail ? `: ${scrubForDisplay(detail).slice(0, 300)}` : '.'}`)
     }
 
     const view = await conversation.context(context, { at: result.answer })

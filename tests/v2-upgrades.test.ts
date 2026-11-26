@@ -706,6 +706,12 @@ test('verifyReplaySpec & retestReplaySpec verify race_burst and browser_chain sp
 // ============================================================================
 
 test('Source-First Code Audit reads mounted /repos via derive_evidence, records code_audit_suspect facts, queues targeted chain_steps, and skips gracefully when no repos are mounted', async t => {
+  const prevLocalModel = process.env.KOVO_ALLOW_LOCAL_MODEL
+  process.env.KOVO_ALLOW_LOCAL_MODEL = '1'
+  t.after(() => {
+    if (prevLocalModel === undefined) delete process.env.KOVO_ALLOW_LOCAL_MODEL
+    else process.env.KOVO_ALLOW_LOCAL_MODEL = prevLocalModel
+  })
   const dir = mkdtempSync(join(tmpdir(), 'kovo-code-audit-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const storage = new Store(dir)

@@ -586,6 +586,9 @@ export function cellEnv(
   env.KOVO_RUN_LABEL = id
   env.KOVO_WARM_WORKERS = args.warmWorkers === false ? '0' : '1'
   if (!args.modelGate) env.KOVO_MODEL_GATE = '0'
+  if (!args.noLlm && args.modelGate !== false && (args.dataDirOverrides?.[cell.label] || args.dataDir)) {
+    env.KOVO_ALLOW_LOCAL_MODEL = '1'
+  }
   if (args.dataDir) {
     env.KOVO_DATA_DIR = args.dataDirOverrides?.[cell.label] ?? resolve(args.outDir, 'data', cell.label)
     if (!args.noLlm && !env.KOVO_CREDENTIALS_DIR?.trim()) {

@@ -27,11 +27,14 @@ import { describe, test } from 'node:test'
 import { pathToFileURL } from 'node:url'
 
 import { CREDENTIALS_DIR_ENV, privateModelProfiles } from '../src/server/model-settings.ts'
+import { runAgentSession } from '../src/server/agent-session.ts'
+import { classifyProviderFailure, providerPool } from '../src/server/provider.ts'
 import { Store } from '../src/server/store.ts'
 import { ModelGate } from '../scripts/benchmark-parallel.ts'
 import {
   PreflightError,
   acquireCredentialsDirEnv,
+  assertAgenticPreflight,
   prepareIsolatedDataDir,
 } from '../scripts/benchmark-realistic.ts'
 import {
@@ -166,10 +169,14 @@ describe('R3-02 batch-fix: gated matrix nested isolation resolves host credentia
     )
     assert.equal(childEnvironment[CREDENTIALS_DIR_ENV], host.credDir)
     assert.equal(childEnvironment.KOVO_DATA_DIR, gatedDir)
+    assert.equal(childEnvironment.KOVO_ALLOW_LOCAL_MODEL, '1', 'gated agentic cell must export KOVO_ALLOW_LOCAL_MODEL=1 for loopback ModelGate')
 
-    // --no-llm must NOT export KOVO_CREDENTIALS_DIR
+    // --no-llm and --no-model-gate must NOT widen egress with KOVO_ALLOW_LOCAL_MODEL
     const noLlmEnv = cellEnv(cell, { ...args, noLlm: true }, { PATH: process.env.PATH })
     assert.equal(noLlmEnv[CREDENTIALS_DIR_ENV], undefined)
+    assert.equal(noLlmEnv.KOVO_ALLOW_LOCAL_MODEL, undefined)
+    const noGateEnv = cellEnv(cell, { ...args, modelGate: false }, { PATH: process.env.PATH })
+    assert.equal(noGateEnv.KOVO_ALLOW_LOCAL_MODEL, undefined)
 
     // Simulate child benchmark-realistic.ts running prepareIsolatedDataDir on the gated source dir
     const cellDataDir = join(outDir, 'cell-runtime-data')
@@ -480,5 +487,155 @@ describe('R3-02 batch-fix: scripts/batch-boundary.sh arg validation & deferred E
     assert.equal(passRun.stdout.includes(salt), false, 'salt must never appear in stdout')
     assert.equal(passRun.stderr.includes(salt), false, 'salt must never appear in stderr')
     assert.equal(readFileSync(exposedFile, 'utf8').includes(salt), false, 'salt must never appear in EXPOSED_SEEDS.json')
+  })
+})
+
+describe('R3-02 loopback ModelGate egress, preflight fail-fast, and model_error detail preservation', () => {
+  test('gated cell profile streams through loopback ModelGate (peak>=1) with cellEnv, fails closed without KOVO_ALLOW_LOCAL_MODEL, and preserves EgressDenied detail without stream_drop misclassification', async (t) => {
+    const host = createHostSourceDataDir(t)
+    const outDir = makeTmpDir(t, 'r302-gate-e2e-')
+    const responseId = 'resp_r302_gate_ok'
+    const ssePayload = [
+      `event: response.created\ndata: ${JSON.stringify({ type: 'response.created', response: { id: responseId, status: 'in_progress', output: [] } })}\n\n`,
+      `event: response.output_item.added\ndata: ${JSON.stringify({ type: 'response.output_item.added', output_index: 0, item: { id: 'msg_1', type: 'message', status: 'in_progress', role: 'assistant', content: [] } })}\n\n`,
+      `event: response.output_text.delta\ndata: ${JSON.stringify({ type: 'response.output_text.delta', output_index: 0, item_id: 'msg_1', content_index: 0, delta: 'gate-ok' })}\n\n`,
+      `event: response.output_text.done\ndata: ${JSON.stringify({ type: 'response.output_text.done', output_index: 0, item_id: 'msg_1', content_index: 0, text: 'gate-ok' })}\n\n`,
+      `event: response.output_item.done\ndata: ${JSON.stringify({ type: 'response.output_item.done', output_index: 0, item: { id: 'msg_1', type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: 'gate-ok' }] } })}\n\n`,
+      `event: response.completed\ndata: ${JSON.stringify({ type: 'response.completed', response: { id: responseId, status: 'completed', output: [{ id: 'msg_1', type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'gate-ok' }] }], usage: { input_tokens: 10, output_tokens: 4, total_tokens: 14 } } })}\n\n`,
+    ].join('')
+    const gate = new ModelGate({
+      maxInFlightStreams: 4,
+      fetchImpl: (async () => new Response(ssePayload, {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+      })) as typeof fetch,
+    })
+    await gate.start()
+    t.after(async () => { await gate.close() })
+
+    const args = parseMatrixArgs(
+      ['--apps', 'acme-saas', '--seeds', '1', '--modes', 'grey-box', '--data-dir', host.dir, '--out-dir', outDir],
+      {},
+    )
+    const overrides = prepareGatedCellDataDirs(args, gate)
+    const cell: MatrixCell = {
+      app: 'acme-saas',
+      seed: 1,
+      mode: 'grey-box',
+      seedSet: 'dev',
+      label: 'acme-saas-seed1-grey-box',
+    }
+    const childEnvironment = cellEnv(
+      cell,
+      { ...args, dataDirOverrides: overrides, credentialsDirOverride: host.credDir },
+      { PATH: process.env.PATH },
+    )
+    assert.equal(childEnvironment.KOVO_ALLOW_LOCAL_MODEL, '1')
+
+    const prevCredEnv = process.env[CREDENTIALS_DIR_ENV]
+    const prevLocalModel = process.env.KOVO_ALLOW_LOCAL_MODEL
+    const prevOffline = process.env.KOVO_OFFLINE
+    process.env[CREDENTIALS_DIR_ENV] = childEnvironment[CREDENTIALS_DIR_ENV]
+    t.after(() => {
+      if (prevCredEnv === undefined) delete process.env[CREDENTIALS_DIR_ENV]
+      else process.env[CREDENTIALS_DIR_ENV] = prevCredEnv
+      if (prevLocalModel === undefined) delete process.env.KOVO_ALLOW_LOCAL_MODEL
+      else process.env.KOVO_ALLOW_LOCAL_MODEL = prevLocalModel
+      if (prevOffline === undefined) delete process.env.KOVO_OFFLINE
+      else process.env.KOVO_OFFLINE = prevOffline
+    })
+
+    const cellDataDir = join(outDir, 'cell-runtime')
+    const nested = prepareIsolatedDataDir({ sourceDataDir: overrides[cell.label]!, targetDir: cellDataDir })
+    const release = acquireCredentialsDirEnv(nested.credentialsDir)
+    t.after(() => release())
+    const cellStore = new Store(cellDataDir)
+    t.after(() => cellStore.close())
+    const resolved = privateModelProfiles(cellStore)
+    assert.equal(resolved.length, 1)
+
+    // 1. Without KOVO_ALLOW_LOCAL_MODEL: EgressGateway blocks before hitting gate (peak=0),
+    //    runAgentSession preserves the redacted EgressDenied detail, and classifyProviderFailure
+    //    MUST NOT misclassify it as retryable stream_drop.
+    delete process.env.KOVO_ALLOW_LOCAL_MODEL
+    delete process.env.KOVO_OFFLINE
+    const sessionDir = makeTmpDir(t, 'r302-session-')
+    let blockedErr: Error | null = null
+    try {
+      await runAgentSession({
+        directory: sessionDir,
+        sessionId: 'r302-blocked-check',
+        requestId: randomUUID(),
+        settings: resolved[0]!,
+        profiles: resolved,
+        scenario: 'worker-investigation',
+        prompt: 'ping',
+        signal: AbortSignal.timeout(10_000),
+      })
+    } catch (err) {
+      blockedErr = err instanceof Error ? err : new Error(String(err))
+    }
+    assert.ok(blockedErr, 'loopback ModelGate call without KOVO_ALLOW_LOCAL_MODEL must fail closed')
+    assert.match(blockedErr.message, /model_error.*Plaintext HTTP egress/i, 'runAgentSession must preserve redacted model_error detail')
+    assert.equal(blockedErr.message.includes(TEST_KEY_CANARY), false, 'error detail must never leak API key')
+    assert.equal(gate.stats().peak, 0, 'EgressGateway must block before reaching loopback gate when KOVO_ALLOW_LOCAL_MODEL is unset')
+    assert.equal(
+      classifyProviderFailure(blockedErr),
+      null,
+      'EgressDenied detail in model_error must never be misclassified as retryable stream_drop',
+    )
+
+    // 2. With childEnvironment.KOVO_ALLOW_LOCAL_MODEL applied: providerPool reaches the loopback
+    //    ModelGate cleanly and streams the response (peak >= 1).
+    process.env.KOVO_ALLOW_LOCAL_MODEL = childEnvironment.KOVO_ALLOW_LOCAL_MODEL
+    const { models, model } = providerPool(resolved, 'worker-investigation', {
+      signal: AbortSignal.timeout(10_000),
+      maxCalls: 2,
+      maxTransportRetries: 0,
+    })
+    const stream = models.stream(model, {
+      systemPrompt: 'Reply concisely.',
+      messages: [{ role: 'user', content: 'ping', timestamp: Date.now() }],
+      tools: [],
+    })
+    for await (const _ev of stream) { /* consume */ }
+    const res = await stream.result()
+    assert.equal(res.stopReason, 'stop')
+    assert.ok(gate.stats().peak >= 1, `expected loopback ModelGate peak >= 1, got ${gate.stats().peak}`)
+  })
+
+  test('assertAgenticPreflight fails fast (PreflightError exit 2) on loopback HTTP model profiles without KOVO_ALLOW_LOCAL_MODEL', () => {
+    assert.throws(
+      () => assertAgenticPreflight({
+        hasProfiles: true,
+        noLlm: false,
+        allowInertWorkers: false,
+        backendKind: 'docker',
+        workerSessions: true,
+        profileEndpoints: ['http://127.0.0.1:41234/kovo-gate/aHR0cHM6Ly9vcGVucm91dGVyLmFpL2FwaS92MQ'],
+        localModelEnabled: false,
+      }),
+      (err: unknown) => err instanceof PreflightError && err.exitCode === 2 && /KOVO_ALLOW_LOCAL_MODEL=1/.test(err.message),
+    )
+
+    // Passes when KOVO_ALLOW_LOCAL_MODEL is enabled or when endpoint is public HTTPS
+    assert.doesNotThrow(() => assertAgenticPreflight({
+      hasProfiles: true,
+      noLlm: false,
+      allowInertWorkers: false,
+      backendKind: 'docker',
+      workerSessions: true,
+      profileEndpoints: ['http://127.0.0.1:41234/kovo-gate/aHR0cHM6Ly9vcGVucm91dGVyLmFpL2FwaS92MQ'],
+      localModelEnabled: true,
+    }))
+    assert.doesNotThrow(() => assertAgenticPreflight({
+      hasProfiles: true,
+      noLlm: false,
+      allowInertWorkers: false,
+      backendKind: 'docker',
+      workerSessions: true,
+      profileEndpoints: ['https://openrouter.ai/api/v1'],
+      localModelEnabled: false,
+    }))
   })
 })
