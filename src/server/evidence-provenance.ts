@@ -7,6 +7,7 @@
  * (`requiredRole`, `resourceTenant`, `expectControlDenied`, `proofPatterns`, `injectedAtMs`,
  * `conservedBalance`, `oracleEvents`) can never leak into oracle bodies.
  */
+import type { ImpactClass, ImpactStep, RoleName } from './oracle-invariants.ts'
 import type {
   ProofReceipt,
   ReceiptBrowserTrace,
@@ -21,7 +22,8 @@ declare const WORKER_SELECTED_BRAND: unique symbol
 declare const WORKER_ASSERTED_BRAND: unique symbol
 declare const HOST_EVIDENCE_BRAND: unique symbol
 
-const HOST_EVIDENCE_SEAL = Symbol('kovo.HostEvidence.seal')
+/** N2: Module-private WeakSet seal so `{ ...genuine, receipt: forged }` fails `isHostEvidence`. */
+const SEALED_HOST_EVIDENCE = new WeakSet<object>()
 
 /** Immutable evidence recorded directly by the host broker/transport/store. */
 export type HostObserved<T> = Readonly<T> & { readonly [HOST_OBSERVED_BRAND]: 'host_observed' }
@@ -99,8 +101,8 @@ export interface HostSanitizedReceipt {
   readonly vulnClass: WorkerSelected<string>
   readonly target: HostSanitizedTarget
   readonly exchangeIds: HostObserved<readonly string[]>
-  readonly oobEventIds: HostObserved<readonly string[]>
-  readonly browserTraceIds: HostObserved<readonly string[]>
+  readonly oobEventIds: WorkerSelected<readonly string[]>
+  readonly browserTraceIds: WorkerSelected<readonly string[]>
   readonly claimedDelta: WorkerAsserted<string>
   readonly oracleEvents?: HostObserved<readonly string[]>
 }
@@ -108,11 +110,11 @@ export interface HostSanitizedReceipt {
 /**
  * Sealed host-custody view consumed by receipt/oracle evaluators.
  * Can ONLY be constructed through `constructHostEvidence` (runtime-checked via module-private
- * Symbol seal and compile-time branded via `HOST_EVIDENCE_BRAND`).
+ * WeakSet seal — immune to `{ ...genuine, receipt: forged }` spread cloning — and compile-time
+ * branded via `HOST_EVIDENCE_BRAND`).
  */
 export interface HostEvidence {
   readonly [HOST_EVIDENCE_BRAND]: 'host_evidence'
-  readonly [HOST_EVIDENCE_SEAL]: true
   readonly receipt: HostSanitizedReceipt
   readonly entries: HostObserved<readonly ReceiptTranscriptEntry[]>
   readonly oobEvents: HostObserved<readonly ReceiptOobEvent[]>
@@ -178,8 +180,8 @@ export function buildHostSanitizedReceipt(
     vulnClass: asWorkerSelected(plain.vulnClass),
     target,
     exchangeIds: asHostObserved(Object.freeze([...plain.exchangeIds])),
-    oobEventIds: asHostObserved(Object.freeze([...plain.oobEventIds])),
-    browserTraceIds: asHostObserved(Object.freeze([...plain.browserTraceIds])),
+    oobEventIds: asWorkerSelected(Object.freeze([...plain.oobEventIds])),
+    browserTraceIds: asWorkerSelected(Object.freeze([...plain.browserTraceIds])),
     claimedDelta: asWorkerAsserted(plain.claimedDelta),
     ...(plain.oracleEvents ? { oracleEvents: asHostObserved(Object.freeze([...plain.oracleEvents])) } : {}),
   })
@@ -195,29 +197,105 @@ export interface ConstructHostEvidenceInput {
 
 /**
  * Sole authorized host custody constructor for `HostEvidence`.
- * Applies the strict receipt allowlist, freezes host-observed transcript arrays, and seals the
- * resulting view with the module-private `HOST_EVIDENCE_SEAL` symbol.
+ * Applies the strict receipt allowlist, freezes host-observed transcript arrays, and registers the
+ * frozen view in the module-private `SEALED_HOST_EVIDENCE` WeakSet (rejecting casts and spreads).
  */
 export function constructHostEvidence(input: ConstructHostEvidenceInput): HostEvidence {
   const orderedIds = input.hostOrderedExchangeIds ?? input.receipt.exchangeIds
   const sanitized = buildHostSanitizedReceipt(input.receipt, orderedIds, input.trustedOracleEvents)
-  const view = {
-    [HOST_EVIDENCE_SEAL]: true as const,
+  const view = Object.freeze({
     receipt: sanitized,
     entries: asHostObserved(Object.freeze([...(input.transcript.entries ?? [])])),
     oobEvents: asHostObserved(Object.freeze([...(input.transcript.oobEvents ?? [])])),
     browserTraces: asHostObserved(Object.freeze([...(input.transcript.browserTraces ?? [])])),
     ...(input.transcript.oobSigningKey ? { oobSigningKey: asHostMinted(input.transcript.oobSigningKey) } : {}),
     ...(input.runId ? { runId: asHostMinted(input.runId) } : {}),
-  }
-  return Object.freeze(view) as unknown as HostEvidence
+  })
+  SEALED_HOST_EVIDENCE.add(view)
+  return view as unknown as HostEvidence
 }
 
-/** Runtime verification that `value` was constructed by `constructHostEvidence` (rejects casts). */
+/** Runtime verification that `value` is a genuine sealed `HostEvidence` (rejects casts and `{ ...genuine }` clones). */
 export function isHostEvidence(value: unknown): value is HostEvidence {
-  return Boolean(
-    value &&
-    typeof value === 'object' &&
-    (value as Record<PropertyKey, unknown>)[HOST_EVIDENCE_SEAL] === true,
-  )
+  return Boolean(value && typeof value === 'object' && SEALED_HOST_EVIDENCE.has(value))
+}
+
+/** Strict host-owned secret-prefix patterns for disclosure verification (never generic handles, never worker `proofPatterns`). */
+export const HOST_DISCLOSURE_SECRET_PATTERNS: readonly string[] = Object.freeze([
+  '\\bsk_[a-zA-Z0-9]{2,12}_[0-9a-fA-F]{10,}\\b',
+  '\\bpk_[a-zA-Z0-9]{2,12}_[0-9a-fA-F]{10,}\\b',
+  '\\brk_[a-zA-Z0-9]{2,12}_[0-9a-fA-F]{10,}\\b',
+  '\\brbs_[a-zA-Z0-9]{2,12}_[0-9a-fA-F]{10,}\\b',
+  '\\bAKIA[0-9A-Z]{16}\\b',
+])
+
+const ADMIN_FUNCTION_SURFACE_RE = /\/(?:admin|manage|staff|internal|system|superuser|operator|roles?|permissions?|grants?|impersonat)\b/i
+const HOST_ROLE_RANK: Readonly<Record<string, number>> = { viewer: 1, member: 2, admin: 3, owner: 4 }
+const is2xxStep = (status: number | null): boolean => status !== null && status >= 200 && status < 300
+
+/** Host-derived cross-tenant deletion target tenant from pre-2xx + post-404/410 control readbacks (zero worker scalars). */
+export function deriveHostObservedDeletionTenant(steps: readonly ImpactStep[], mutatingProbe: ImpactStep | undefined): string | null {
+  if (!mutatingProbe || mutatingProbe.method.toUpperCase() !== 'DELETE') return null
+  const probeTenant = mutatingProbe.actor.tenant?.trim().toLowerCase() ?? null
+  if (!probeTenant) return null
+  const probeIdx = steps.indexOf(mutatingProbe)
+  if (probeIdx < 0) return null
+  const afterTombstone = steps.slice(probeIdx + 1).find(s => s.arm === 'control' && (s.status === 404 || s.status === 410) && s.actor.tenant && s.actor.tenant.trim().toLowerCase() !== probeTenant)
+  const foreignTenant = afterTombstone?.actor.tenant?.trim().toLowerCase() ?? null
+  if (!foreignTenant) return null
+  const hasBefore = steps.slice(0, probeIdx).some(s => s.arm === 'control' && is2xxStep(s.status) && s.actor.tenant?.trim().toLowerCase() === foreignTenant)
+  return hasBefore ? foreignTenant : null
+}
+
+/** True when an authenticated probe's JSON response body embeds its own actor's tenant marker (N3). */
+export function stepHasOwnTenantMarker(step: ImpactStep): boolean {
+  const pt = step.actor.tenant?.toLowerCase()
+  if (!pt) return false
+  const raw = step.json !== undefined ? JSON.stringify(step.json) : typeof step.body === 'string' ? step.body : ''
+  return raw.toLowerCase().includes(`"${pt}"`)
+}
+
+/** Host-derived required role strictly from host-recorded transcript steps (zero worker `requiredRole` scalars). */
+export function deriveHostObservedRequiredRole(
+  steps: readonly ImpactStep[],
+  impactClass: ImpactClass | undefined,
+  mutatingProbe: ImpactStep | undefined,
+  routeOfStep: (step: ImpactStep) => string,
+): RoleName | null {
+  if (mutatingProbe && mutatingProbe.method.toUpperCase() === 'DELETE' && ADMIN_FUNCTION_SURFACE_RE.test(mutatingProbe.route ?? mutatingProbe.pathAndQuery ?? '')) {
+    const probeRank = HOST_ROLE_RANK[(mutatingProbe.actor.role ?? '').toLowerCase()] ?? 0
+    const probeIdx = steps.indexOf(mutatingProbe)
+    const hasPreRead = probeIdx > 0 && steps.slice(0, probeIdx).some(s => s.method.toUpperCase() === 'GET' && is2xxStep(s.status))
+    const hasTombstone = probeIdx >= 0 && steps.slice(probeIdx + 1).some(s => s.method.toUpperCase() === 'GET' && (s.status === 404 || s.status === 410))
+    if (probeRank > 0 && hasPreRead && hasTombstone) {
+      let bestRole: RoleName | null = null
+      let bestRank = probeRank
+      for (const s of steps) {
+        const r = (s.actor.role ?? '').toLowerCase()
+        const rank = HOST_ROLE_RANK[r] ?? 0
+        if (rank > bestRank) { bestRank = rank; bestRole = r as RoleName }
+      }
+      if (bestRole) return bestRole
+    }
+  }
+  if (impactClass === 'disclosure' && !mutatingProbe) {
+    const okProbes = steps.filter(s => s.arm === 'probe' && is2xxStep(s.status) && s.actor.handle !== null)
+    const controls = steps.filter(s => s.arm === 'control')
+    const secretRes = HOST_DISCLOSURE_SECRET_PATTERNS.map(p => new RegExp(p))
+    const textOf = (s: ImpactStep) => typeof s.body === 'string' ? s.body : s.json !== undefined ? JSON.stringify(s.json) : ''
+    for (const p of okProbes) {
+      const pRank = HOST_ROLE_RANK[(p.actor.role ?? '').toLowerCase()] ?? 0
+      if (pRank <= 0) continue
+      const matched = secretRes.filter(re => re.test(textOf(p)))
+      if (matched.length === 0) continue
+      const pRoute = routeOfStep(p)
+      const higherSameRouteCtrl = controls.find(c =>
+        is2xxStep(c.status) && routeOfStep(c) === pRoute &&
+        (HOST_ROLE_RANK[(c.actor.role ?? '').toLowerCase()] ?? 0) > pRank &&
+        matched.every(re => !re.test(textOf(c))),
+      )
+      if (higherSameRouteCtrl?.actor.role) return higherSameRouteCtrl.actor.role.toLowerCase() as RoleName
+    }
+  }
+  return null
 }

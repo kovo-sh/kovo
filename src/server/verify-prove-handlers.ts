@@ -7,6 +7,7 @@
  */
 import { randomBytes, randomUUID } from 'node:crypto'
 import type { ArmProvenance } from './evidence-provenance.ts'
+import type { NonceBinding } from './nonce-ledger.ts'
 import type { BoundaryClass, ImpactClass } from './oracle-invariants.ts'
 import { isReservedEvidenceRole } from './host-fact-log.ts'
 import {
@@ -79,6 +80,25 @@ export interface ProveHandlerHost {
 
 function proveMintBinding(host: ProveHandlerHost): { runId?: string; origin?: string } {
   return { ...(host.runId ? { runId: host.runId } : {}), ...(host.defaultOrigin ? { origin: host.defaultOrigin } : {}) }
+}
+
+function targetBindingFromArgs(
+  host: ProveHandlerHost,
+  armArgs: Record<string, unknown>,
+  param?: string,
+  armRole?: string,
+): Partial<Omit<NonceBinding, 'oracleId'>> {
+  const origin = typeof armArgs.origin === 'string' && armArgs.origin ? armArgs.origin : host.defaultOrigin
+  const method = typeof armArgs.method === 'string' && armArgs.method ? armArgs.method.toUpperCase() : 'GET'
+  const route = exactPathnameOf(typeof armArgs.path === 'string' ? armArgs.path : '/')
+  return {
+    ...(host.runId ? { runId: host.runId } : {}),
+    ...(origin ? { origin } : {}),
+    method,
+    route,
+    ...(param ? { param } : {}),
+    ...(armRole ? { armRole } : {}),
+  }
 }
 
 function hostAssignedStamp(
@@ -759,12 +779,13 @@ export async function handleProveDifferential(host: ProveHandlerHost, args: Reco
     }
   }
 
-  // R4-C-1 / R3-16: Stamp host-minted boolean/timing challenges and host-assigned arm provenance at send time.
-  const baselineStamp = hostAssignedStamp('setup', booleanPair ? { hostBooleanPair: defaultHostMintedOracle.stampBooleanPairArm(booleanPair, 'baseline') } : undefined)
+  // R4-C-1 / R3-16: Stamp host-minted boolean/timing challenges with full target/arm binding & provenance.
+  const targetBind = targetBindingFromArgs(host, baseVariantArgs, parity.differingParam)
+  const baselineStamp = hostAssignedStamp('setup', booleanPair ? { hostBooleanPair: defaultHostMintedOracle.stampBooleanPairArm(booleanPair, 'baseline', targetBind) } : undefined)
   const controlBoolArm: 'true' | 'false' = boolParity?.ok && boolParity.controlTruth === false ? 'false' : 'true'
   const variantBoolArm: 'true' | 'false' = controlBoolArm === 'true' ? 'false' : 'true'
-  const controlStamp = hostAssignedStamp('control', { ...(booleanPair ? { hostBooleanPair: defaultHostMintedOracle.stampBooleanPairArm(booleanPair, controlBoolArm) } : {}), ...(timingChallenge ? { timingChallenge } : {}) })
-  const variantStamp = hostAssignedStamp('probe', { ...(booleanPair ? { hostBooleanPair: defaultHostMintedOracle.stampBooleanPairArm(booleanPair, variantBoolArm) } : {}), ...(timingChallenge ? { timingChallenge } : {}) })
+  const controlStamp = hostAssignedStamp('control', { ...(booleanPair ? { hostBooleanPair: defaultHostMintedOracle.stampBooleanPairArm(booleanPair, controlBoolArm, targetBind) } : {}), ...(timingChallenge ? { timingChallenge: defaultHostMintedOracle.stampTimingChallengeArm(timingChallenge, 'control', targetBind) } : {}) })
+  const variantStamp = hostAssignedStamp('probe', { ...(booleanPair ? { hostBooleanPair: defaultHostMintedOracle.stampBooleanPairArm(booleanPair, variantBoolArm, targetBind) } : {}), ...(timingChallenge ? { timingChallenge: defaultHostMintedOracle.stampTimingChallengeArm(timingChallenge, 'probe', targetBind) } : {}) })
 
   const baselineExchanges: Array<ProveHttpExchangeResult> = []
   const controlExchanges: Array<ProveHttpExchangeResult> = []
@@ -1379,10 +1400,14 @@ export async function handleProveInjection(host: ProveHandlerHost, args: Record<
       })
     }
 
-    // R4-C-2 / R3-16: Stamp non-transferable per-exchange `hostExpressionChallenge` and host-assigned arm provenance.
+    // R4-C-2 / R3-16: Bind full target/arm tuple and stamp per-exchange `hostExpressionChallenge` + provenance.
+    const exprBind1 = targetBindingFromArgs(host, probeArgs1, parity1.differingParam, 'probe')
+    const exprBind2 = targetBindingFromArgs(host, probeArgs2, parity2.differingParam, 'probe')
+    const boundCh1 = defaultHostMintedOracle.bindExpressionChallenge(ch1, exprBind1, 'probe1')
+    const boundCh2 = defaultHostMintedOracle.bindExpressionChallenge(ch2, exprBind2, 'probe2')
     const control = await host.runHttpExchange(controlArgs, nonce, hostAssignedStamp('control'))
-    const probe1 = await host.runHttpExchange(probeArgs1, nonce, { hostExpressionChallenge: ch1, armProvenance: 'host_assigned', hostAssignedArm: 'probe' })
-    const probe2 = await host.runHttpExchange(probeArgs2, nonce, { hostExpressionChallenge: ch2, armProvenance: 'host_assigned', hostAssignedArm: 'probe' })
+    const probe1 = await host.runHttpExchange(probeArgs1, nonce, { hostExpressionChallenge: boundCh1, armProvenance: 'host_assigned', hostAssignedArm: 'probe' })
+    const probe2 = await host.runHttpExchange(probeArgs2, nonce, { hostExpressionChallenge: boundCh2, armProvenance: 'host_assigned', hostAssignedArm: 'probe' })
     const control2 = await host.runHttpExchange(controlArgs, nonce, hostAssignedStamp('control'))
     const transcriptSummary = [
       proofEntry('control', control),
@@ -1404,7 +1429,7 @@ export async function handleProveInjection(host: ProveHandlerHost, args: Record<
         requestHeaders: rec1?.request?.headers ?? (asRecord(probeArgs1.headers) as Record<string, string> | null),
       },
       probeBody: rawProbe1, probeStatus: probe1.status, controlBodies: [rawCtrl1, rawCtrl2],
-      stampedChallenge: rec1?.hostExpressionChallenge ?? ch1, expectedChallengeId: ch1.challengeId, vulnClass: derivedClass, binding: exprBind,
+      stampedChallenge: rec1?.hostExpressionChallenge ?? boundCh1, expectedChallengeId: boundCh1.challengeId, vulnClass: derivedClass, binding: exprBind1,
     })
     const check2 = verifyHostExpressionProbe({
       probeRequest: {
@@ -1413,7 +1438,7 @@ export async function handleProveInjection(host: ProveHandlerHost, args: Record<
         requestHeaders: rec2?.request?.headers ?? (asRecord(probeArgs2.headers) as Record<string, string> | null),
       },
       probeBody: rawProbe2, probeStatus: probe2.status, controlBodies: [rawCtrl1, rawCtrl2],
-      stampedChallenge: rec2?.hostExpressionChallenge ?? ch2, expectedChallengeId: ch2.challengeId, vulnClass: derivedClass, binding: exprBind,
+      stampedChallenge: rec2?.hostExpressionChallenge ?? boundCh2, expectedChallengeId: boundCh2.challengeId, vulnClass: derivedClass, binding: exprBind2,
     })
     const crossIsolated = !rawProbe1.includes(ch2.expectedOutput) && !rawProbe2.includes(ch1.expectedOutput)
     const varying = ch1.expectedOutput !== ch2.expectedOutput

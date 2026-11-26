@@ -783,10 +783,7 @@ export function resolveCanonicalArmWithProvenance(
   const arm = resolveCanonicalArm(sessionRole, explicitArm)
   if (explicitProvenance) return Object.freeze({ arm, provenance: explicitProvenance })
   if (explicitArm) return Object.freeze({ arm, provenance: 'host_assigned' })
-  if (sessionRole === 'control' || sessionRole === 'probe' || sessionRole === 'setup' || sessionRole === 'cleanup') {
-    return Object.freeze({ arm, provenance: 'worker_selected' })
-  }
-  return Object.freeze({ arm, provenance: 'host_assigned' })
+  return Object.freeze({ arm, provenance: 'worker_selected' })
 }
 
 export interface HostExchangeCapabilityFlow {

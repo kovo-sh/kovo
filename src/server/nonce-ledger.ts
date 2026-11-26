@@ -108,7 +108,7 @@ function normRoute(v: string | null | undefined): string | null {
   const s = normNullable(v)
   if (!s) return null
   const noQuery = s.split('?')[0]!.split('#')[0]!
-  return (noQuery.replace(/\/+$/, '') || '/').toLowerCase()
+  return noQuery.replace(/\/+$/, '') || '/'
 }
 
 function normArmRole(v: string | null | undefined): string | null {
@@ -119,6 +119,45 @@ function normArmRole(v: string | null | undefined): string | null {
 export function hashNoncePayload(payload: unknown): string {
   const serialized = typeof payload === 'string' ? payload : JSON.stringify(payload ?? null)
   return createHash('sha256').update(serialized, 'utf8').digest('hex')
+}
+
+export function stampMatchesChallengeId(stampId: string, challengeId: string): boolean {
+  return stampId === challengeId || stampId.startsWith(`${challengeId}@`)
+}
+
+/**
+ * Build the expected `NonceBinding` tuple for receipt verification (`B1`):
+ *  - On run-scoped stamps (`effectiveRunId` present or `stamp.runId !== DEFAULT_NONCE_RUN_ID`),
+ *    requires EVERY observed target/arm/exchange dimension (ZERO wildcards!).
+ *  - On legacy default-run stamps (unleased callers minting without `runId`), enforces every
+ *    dimension present on the stamp so any bound-dimension mismatch still fails closed.
+ */
+export function buildExpectedNonceBinding(
+  stamp: NonceStamp | undefined,
+  effectiveRunId: string | undefined,
+  observed: { origin?: string; method?: string; route?: string; param?: string; armRole?: string; exchangeId?: string },
+  requireExchangeOnRunScoped = true,
+): Partial<Omit<NonceBinding, 'oracleId'>> {
+  const runScoped = Boolean(effectiveRunId || (stamp && stamp.runId !== DEFAULT_NONCE_RUN_ID))
+  if (runScoped) {
+    return {
+      runId: effectiveRunId ?? stamp?.runId,
+      ...(observed.origin !== undefined ? { origin: observed.origin } : {}),
+      ...(observed.method !== undefined ? { method: observed.method } : {}),
+      ...(observed.route !== undefined ? { route: observed.route } : {}),
+      ...(observed.param !== undefined ? { param: observed.param } : {}),
+      ...(observed.armRole !== undefined ? { armRole: observed.armRole } : {}),
+      ...((requireExchangeOnRunScoped || stamp?.exchangeId !== null) && observed.exchangeId !== undefined ? { exchangeId: observed.exchangeId } : {}),
+    }
+  }
+  return {
+    ...(stamp?.origin !== null && observed.origin !== undefined ? { origin: observed.origin } : {}),
+    ...(stamp?.method !== null && observed.method !== undefined ? { method: observed.method } : {}),
+    ...(stamp?.route !== null && observed.route !== undefined ? { route: observed.route } : {}),
+    ...(stamp?.param !== null && observed.param !== undefined ? { param: observed.param } : {}),
+    ...(stamp?.armRole !== null && observed.armRole !== undefined ? { armRole: observed.armRole } : {}),
+    ...(stamp?.exchangeId !== null && observed.exchangeId !== undefined ? { exchangeId: observed.exchangeId } : {}),
+  }
 }
 
 function canonicalStampInput(stamp: Omit<NonceStamp, 'mac'>): string {
@@ -387,13 +426,14 @@ export class NonceLedger {
   }
 
   /**
-   * Derive a per-exchange HMAC-bound stamp from an existing minted stamp (in-memory only).
-   * Binds `exchangeId` (and optional `armRole`) so the stamp cannot be cited on any other exchange.
+   * Derive a target/arm/exchange-bound child stamp (`<rootId>@<suffix>`) from an existing minted
+   * stamp (in-memory only), preserving `payloadDigest` and binding target dimensions (`origin`,
+   * `method`, `route`, `param`, `armRole`, optional `exchangeId`).
    */
-  bindStampToExchange(
+  bindStamp(
     baseStamp: NonceStamp,
-    exchangeId: string,
-    armRole?: string | null,
+    binding: Partial<Omit<NonceBinding, 'runId' | 'oracleId'>>,
+    suffix?: string,
   ): HostMinted<NonceStamp> | null {
     const entry = this.resolveEntry(baseStamp.stampId)
     if (!entry) return null
@@ -401,19 +441,42 @@ export class NonceLedger {
     if (!key) return null
     const expectedMac = computeStampMac(key, entry.stamp)
     if (!constantTimeHexEqual(baseStamp.mac, expectedMac)) return null
+    const rootId = entry.stamp.stampId.split('@')[0]!
+    const cleanSuffix = normNullable(suffix) ?? normNullable(binding.exchangeId) ?? normArmRole(binding.armRole) ?? randomUUID().slice(0, 8)
     return this.mintStamp(
       {
         runId: entry.stamp.runId,
         oracleId: entry.stamp.oracleId,
-        armRole: armRole !== undefined ? armRole : entry.stamp.armRole,
-        origin: entry.stamp.origin,
-        method: entry.stamp.method,
-        route: entry.stamp.route,
-        param: entry.stamp.param,
-        exchangeId,
+        armRole: binding.armRole !== undefined ? binding.armRole : entry.stamp.armRole,
+        origin: binding.origin !== undefined ? binding.origin : entry.stamp.origin,
+        method: binding.method !== undefined ? binding.method : entry.stamp.method,
+        route: binding.route !== undefined ? binding.route : entry.stamp.route,
+        param: binding.param !== undefined ? binding.param : entry.stamp.param,
+        exchangeId: binding.exchangeId !== undefined ? binding.exchangeId : entry.stamp.exchangeId,
       },
       entry.payloadJson ?? entry.stamp.payloadDigest,
-      { persistPayload: entry.payloadJson !== null },
+      { stampId: `${rootId}@${cleanSuffix}`, persistPayload: entry.payloadJson !== null },
+    )
+  }
+
+  /**
+   * Derive a per-exchange HMAC-bound stamp from an existing minted stamp (in-memory only).
+   * Binds `exchangeId` (and optional `armRole` / target refinements) with a deterministic
+   * child stampId (`<parentStampId>@<exchangeId>`) while preserving `payloadDigest` so the
+   * stamp cannot be cited on any other exchange or swapped onto another challenge payload.
+   */
+  bindStampToExchange(
+    baseStamp: NonceStamp,
+    exchangeId: string,
+    armRole?: string | null,
+    extra?: { origin?: string | null; method?: string | null; route?: string | null; param?: string | null },
+  ): HostMinted<NonceStamp> | null {
+    const cleanExId = normNullable(exchangeId)
+    if (!cleanExId) return null
+    return this.bindStamp(
+      baseStamp,
+      { ...extra, ...(armRole !== undefined ? { armRole } : {}), exchangeId: cleanExId },
+      cleanExId,
     )
   }
 
@@ -440,10 +503,21 @@ export class NonceLedger {
     return true
   }
 
-  /** Load persisted/in-memory non-secret payload JSON for a verified stamp (used on restart retest). */
-  getVerifiedPayload<T = unknown>(stampId: string): T | null {
+  /**
+   * Load persisted/in-memory non-secret payload JSON for a stamp ONLY after verifying its
+   * per-run HMAC MAC, `runId` (when supplied), and `hashNoncePayload(payloadJson) === payloadDigest`
+   * (B3: rejects tampered SQLite `payload_json` rows fail-closed).
+   */
+  getVerifiedPayload<T = unknown>(stampId: string, expectedRunId?: string | null): T | null {
     const entry = this.resolveEntry(stampId)
-    if (!entry?.payloadJson) return null
+    if (!entry || entry.payloadJson === null) return null
+    const key = this.lookupRunKey(entry.stamp.runId)
+    if (!key) return null
+    const expectedMac = computeStampMac(key, entry.stamp)
+    if (!constantTimeHexEqual(entry.stamp.mac, expectedMac)) return null
+    const normRun = normNullable(expectedRunId)
+    if (normRun !== null && entry.stamp.runId !== normRun) return null
+    if (hashNoncePayload(entry.payloadJson) !== entry.stamp.payloadDigest) return null
     try {
       return JSON.parse(entry.payloadJson) as T
     } catch {
@@ -453,8 +527,8 @@ export class NonceLedger {
 
   /**
    * Cryptographically verify a `NonceStamp` against its per-run HMAC key AND expected binding tuple.
-   * Rejects any cross-run, cross-oracle, cross-exchange, cross-arm, cross-origin, cross-method,
-   * cross-route, cross-param, tampered-MAC, or unknown-stamp citation.
+   * B1: ZERO wildcards — whenever `expected.X !== undefined`, `stored.X` MUST be non-null and equal.
+   * B3: Re-checks `hashNoncePayload(payloadJson) === stored.payloadDigest` whenever payload is stored.
    */
   verifyStamp(
     stamp: NonceStamp | null | undefined,
@@ -468,16 +542,15 @@ export class NonceLedger {
     const key = this.lookupRunKey(stored.runId)
     if (!key) return null
 
-    // 1. Constant-time HMAC verification against the per-run secret key.
+    // 1. Constant-time HMAC verification + payloadDigest integrity check.
     const recomputedMac = computeStampMac(key, stored)
     if (!constantTimeHexEqual(stored.mac, recomputedMac)) return null
     if (!constantTimeHexEqual(stamp.mac, recomputedMac)) return null
     if (canonicalStampInput(stamp) !== canonicalStampInput(stored)) return null
+    if (entry.payloadJson !== null && hashNoncePayload(entry.payloadJson) !== stored.payloadDigest) return null
 
-    // 2. Strict binding tuple checks (fail closed on ANY cross-binding mismatch).
+    // 2. Strict binding tuple checks (B1: fail closed on ANY missing/null or mismatched dimension).
     if (NON_NONCE_ORACLE_BINDING_KINDS.has(stored.oracleId as unknown as OracleBindingKind)) {
-      // Non-nonce binding kinds (e.g. persona_tenant, state_ledger, crypto_signature) are not nonce stamps;
-      // canary may carry either a nonce stamp or an OOB callback signature.
       if (stored.oracleId !== 'canary') return null
     }
     if (stored.oracleId !== expected.oracleId) return null
@@ -485,25 +558,37 @@ export class NonceLedger {
     if (expectedRunId !== null && stored.runId !== expectedRunId) return null
     if (expectedRunId === null && stored.runId !== DEFAULT_NONCE_RUN_ID) return null
 
-    const expOrigin = normOrigin(expected.origin)
-    if (expected.origin !== undefined && stored.origin !== null && stored.origin !== expOrigin) return null
+    if (expected.origin !== undefined) {
+      const expOrigin = normOrigin(expected.origin)
+      if (expOrigin === null || stored.origin === null || stored.origin !== expOrigin) return null
+    }
+    if (expected.method !== undefined) {
+      const expMethod = normMethod(expected.method)
+      if (expMethod === null || stored.method === null || stored.method !== expMethod) return null
+    }
+    if (expected.route !== undefined) {
+      const expRoute = normRoute(expected.route)
+      if (expRoute === null || stored.route === null || stored.route !== expRoute) return null
+    }
+    if (expected.param !== undefined) {
+      const expParam = normNullable(expected.param)
+      if (expParam === null || stored.param === null || stored.param !== expParam) return null
+    }
+    if (expected.armRole !== undefined) {
+      const expArmRole = normArmRole(expected.armRole)
+      if (expArmRole === null || stored.armRole === null || stored.armRole !== expArmRole) return null
+    }
+    if (expected.exchangeId !== undefined) {
+      const expExchangeId = normNullable(expected.exchangeId)
+      if (expExchangeId === null || stored.exchangeId === null || stored.exchangeId !== expExchangeId) return null
+    } else if (stored.exchangeId !== null) {
+      return null
+    }
 
-    const expMethod = normMethod(expected.method)
-    if (expected.method !== undefined && stored.method !== null && stored.method !== expMethod) return null
-
-    const expRoute = normRoute(expected.route)
-    if (expected.route !== undefined && stored.route !== null && stored.route !== expRoute) return null
-
-    const expParam = normNullable(expected.param)
-    if (expected.param !== undefined && stored.param !== null && stored.param !== expParam) return null
-
-    const expArmRole = normArmRole(expected.armRole)
-    if (expected.armRole !== undefined && stored.armRole !== null && stored.armRole !== expArmRole) return null
-
-    const expExchangeId = normNullable(expected.exchangeId)
-    if (stored.exchangeId !== null && stored.exchangeId !== expExchangeId) return null
-
-    if (expected.payloadDigest && stored.payloadDigest !== expected.payloadDigest) return null
+    if (expected.payloadDigest !== undefined) {
+      const expDigest = normNullable(expected.payloadDigest)
+      if (expDigest === null || stored.payloadDigest !== expDigest) return null
+    }
 
     if (options.citeOnVerify) {
       this.citeStamp(stored)
@@ -532,6 +617,14 @@ export class NonceLedger {
     if (inMem) return inMem
     const persisted = this.#persistence?.loadCitedStamp(stampId)
     if (!persisted) return null
+    // B3: Cryptographically verify MAC and payloadDigest BEFORE hydrating any persisted SQLite row.
+    const key = this.lookupRunKey(persisted.stamp.runId)
+    if (!key) return null
+    const expectedMac = computeStampMac(key, persisted.stamp)
+    if (!constantTimeHexEqual(persisted.stamp.mac, expectedMac)) return null
+    if (persisted.payloadJson !== null && hashNoncePayload(persisted.payloadJson) !== persisted.stamp.payloadDigest) {
+      return null
+    }
     const hydrated: InMemoryStampEntry = {
       stamp: asHostMinted(persisted.stamp),
       payloadJson: persisted.payloadJson,

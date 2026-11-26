@@ -1,0 +1,116 @@
+{
+  "id": "r3-16-claude-bypass-review-fp",
+  "side": "fp",
+  "source": "independent_review",
+  "archetype": "r3-16-wildcard-binding-and-default-pattern-fp",
+  "description": "Benign own-tenant profile read, replayed from a second route with worker claim scalars and handle-shaped ids. Must dismiss: no cross-exchange/route stamp reuse (unbound-stamp wildcard), no worker scalar or oracleEvents trust, no host default disclosure pattern boundary credit on own-tenant data.",
+  "covers": {
+    "files": [
+      "src/server/composite-receipt.ts",
+      "src/server/evidence-provenance.ts",
+      "src/server/host-fact-log.ts",
+      "src/server/nonce-ledger.ts",
+      "src/server/proof-receipt.ts",
+      "src/server/terminal-oracle-registry.ts",
+      "src/server/verify-prove-handlers.ts"
+    ],
+    "classes": [
+      "bola",
+      "timing",
+      "open_redirect",
+      "disclosure"
+    ]
+  },
+  "canonicalLabel": {
+    "cwe": "CWE-639",
+    "category": "access-control",
+    "title": "Own-tenant readback with worker claim scalars and handle-shaped ids must dismiss",
+    "impact": "Member reads own-tenant records; nothing crosses a tenant or role boundary.",
+    "claimedImpact": "authorization",
+    "claimedBoundary": "access",
+    "vulnClass": "bola"
+  },
+  "freeTextLabel": {
+    "title": "Own-tenant note readback, no boundary crossed"
+  },
+  "paths": {
+    "replay": true,
+    "floorReceipt": true,
+    "evaluateClaims": true,
+    "composite": false,
+    "floorInjectionRecipe": false,
+    "proofReceipt": true
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [
+    {
+      "handle": "member_a",
+      "roleLabel": "member (tenant-a)",
+      "role": "member",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-r316-review-member-a"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "ctl_notes_list",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/v1/notes",
+      "persona": "member_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"items\":[{\"id\":\"usr_note_0a1b2c3d4e5f\",\"tenant_id\":\"tenant-a\",\"owner\":\"u-a1\"}]}"
+    },
+    {
+      "id": "prb_note_item",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/v1/notes/usr_note_0a1b2c3d4e5f",
+      "persona": "member_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"id\":\"usr_note_0a1b2c3d4e5f\",\"tenant_id\":\"tenant-a\",\"owner\":\"u-a1\",\"text\":\"mine\"}"
+    }
+  ],
+  "replaySpec": {
+    "assertionsJq": "{ controlPassed: (.steps.ctl_notes_list.status == 200), confirmed: (.steps.prb_note_item.status == 200), observed: \"own-tenant note\", expected: \"403\" }"
+  },
+  "proofReceipt": {
+    "vulnClass": "bola",
+    "targetMethod": "GET",
+    "targetPathAndQuery": "/api/v1/notes/usr_note_0a1b2c3d4e5f",
+    "claimedDelta": "Own-tenant note read; worker supplies requiredRole, resourceTenant, expectControlDenied, oracleEvents and proofPatterns, and cites the control from a different route."
+  },
+  "claims": [
+    {
+      "kind": "impact",
+      "impactClass": "authorization",
+      "probeExchangeId": "prb_note_item",
+      "controlExchangeIds": [
+        "ctl_notes_list"
+      ],
+      "requiredRole": "admin",
+      "resourceTenant": "tenant-b",
+      "expectControlDenied": true,
+      "oracleEvents": [
+        "csrf_missing"
+      ],
+      "proofPatterns": [
+        "usr_note_[0-9a-f]{12}"
+      ]
+    }
+  ]
+}

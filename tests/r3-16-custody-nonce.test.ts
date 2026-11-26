@@ -358,17 +358,34 @@ test('R3-16 Test 4: cited stamps persist and re-verify after simulated restart w
     assert.equal(countRows(store.client, 'nonce_ledger_stamps'), 0, 'uncited hot-path probes must not write to nonce_ledger_stamps')
     assert.equal(countRows(store.client, 'nonce_ledger_run_keys'), 0, 'uncited hot-path probes must not write to nonce_ledger_run_keys')
 
-    // Mint & cite 1 timing challenge and 1 redirect canary
-    const citedTiming = oracle1.mintTimingChallenge('timing', 2_000, undefined, {
+    // Mint & cite per-exchange bound timing arm stamps and 1 redirect canary
+    const citedTimingBase = oracle1.mintTimingChallenge('timing', 2_000, undefined, {
       runId, origin: ORIGIN, method: 'GET', route: '/api/report', param: 'mode',
     })
+    const citedTimingEntries: ReceiptTranscriptEntry[] = Array.from({ length: 5 }, (_, i) => {
+      const ctlCh = oracle1.stampTimingChallengeArm(citedTimingBase, 'control', { exchangeId: `rc${i}` })
+      const prbCh = oracle1.stampTimingChallengeArm(citedTimingBase, 'probe', { exchangeId: `rp${i}` })
+      assert.equal(oracle1.citeChallenge(ctlCh.nonceStamp!), true)
+      assert.equal(oracle1.citeChallenge(prbCh.nonceStamp!), true)
+      return [
+        {
+          exchangeId: `rc${i}`, seq: i * 2 + 1, origin: ORIGIN, durationMs: 25,
+          hostTimingChallenge: ctlCh,
+          step: mkStep({ id: `rc${i}`, arm: 'control', method: 'GET', route: '/api/report', pathAndQuery: `/api/report?mode=${encodeURIComponent(citedTimingBase.controlToken)}`, status: 200 }),
+        },
+        {
+          exchangeId: `rp${i}`, seq: i * 2 + 2, origin: ORIGIN, durationMs: 2_100,
+          hostTimingChallenge: prbCh,
+          step: mkStep({ id: `rp${i}`, arm: 'probe', method: 'GET', route: '/api/report', pathAndQuery: `/api/report?mode=${encodeURIComponent(citedTimingBase.delayToken)}`, status: 200 }),
+        },
+      ]
+    }).flat()
     const citedRedir = oracle1.mintRedirectCanary('canary.kovo.invalid', {
       runId, origin: ORIGIN, method: 'GET', route: '/auth/continue', param: 'next', armRole: 'probe', exchangeId: 'r-prb',
     })
-    assert.equal(oracle1.citeChallenge(citedTiming.challengeId), true)
     assert.equal(oracle1.citeChallenge(citedRedir.canaryId), true)
 
-    assert.equal(countRows(store.client, 'nonce_ledger_stamps'), 2, 'only cited stamps should be persisted')
+    assert.equal(countRows(store.client, 'nonce_ledger_stamps'), 11, 'only cited stamps (10 timing arms + 1 redirect) should be persisted')
     assert.equal(countRows(store.client, 'nonce_ledger_run_keys'), 1, 'run key written once on first citation')
 
     // Simulate process restart: fresh in-memory NonceLedger + HostMintedOracle backed by reopened SQLite DB
@@ -386,25 +403,13 @@ test('R3-16 Test 4: cited stamps persist and re-verify after simulated restart w
       )
 
       // Cited timing receipt re-verifies cleanly after restart!
-      const timingEntries: ReceiptTranscriptEntry[] = Array.from({ length: 5 }, (_, i) => [
-        {
-          exchangeId: `rc${i}`, seq: i * 2 + 1, origin: ORIGIN, durationMs: 25,
-          hostTimingChallenge: citedTiming,
-          step: mkStep({ id: `rc${i}`, arm: 'control', method: 'GET', route: '/api/report', pathAndQuery: `/api/report?mode=${encodeURIComponent(citedTiming.controlToken)}`, status: 200 }),
-        },
-        {
-          exchangeId: `rp${i}`, seq: i * 2 + 2, origin: ORIGIN, durationMs: 2_100,
-          hostTimingChallenge: citedTiming,
-          step: mkStep({ id: `rp${i}`, arm: 'probe', method: 'GET', route: '/api/report', pathAndQuery: `/api/report?mode=${encodeURIComponent(citedTiming.delayToken)}`, status: 200 }),
-        },
-      ]).flat()
       const timingReceipt = buildProofReceipt({
         vulnClass: 'timing',
         target: { origin: ORIGIN, method: 'GET', pathAndQuery: '/api/report', param: 'mode' },
-        exchangeIds: timingEntries.map(e => e.exchangeId),
+        exchangeIds: citedTimingEntries.map(e => e.exchangeId),
         claimedDelta: 'Post-restart retest of cited timing stamp.',
       })
-      const timingRes = verifyReceipt(timingReceipt, { entries: timingEntries, runId }, { hostMintedOracle: restartedOracle, runId })
+      const timingRes = verifyReceipt(timingReceipt, { entries: citedTimingEntries, runId }, { hostMintedOracle: restartedOracle, runId })
       assert.equal(timingRes.confirmed, true, `restarted timing retest should pass: ${timingRes.reason}`)
 
       // Cited redirect receipt re-verifies cleanly after restart (and fails on wrong runId)!
@@ -441,16 +446,16 @@ test('R3-16 Test 5: timing rejects transcript-only/partial-arm challenges; redir
     runId, origin: ORIGIN, method: 'GET', route: '/api/report', param: 'mode',
   })
 
-  const makeTimingEntries = (stampControl: boolean, stampProbe: boolean): ReceiptTranscriptEntry[] =>
+  const makeTimingEntries = (stampControl: boolean, stampProbe: boolean, bindArmExchange = true): ReceiptTranscriptEntry[] =>
     Array.from({ length: 5 }, (_, i) => [
       {
         exchangeId: `tc${i}`, seq: i * 2 + 1, origin: ORIGIN, durationMs: 20,
-        ...(stampControl ? { hostTimingChallenge: timingChallenge } : {}),
+        ...(stampControl ? { hostTimingChallenge: bindArmExchange ? oracle.stampTimingChallengeArm(timingChallenge, 'control', { exchangeId: `tc${i}` }) : timingChallenge } : {}),
         step: mkStep({ id: `tc${i}`, arm: 'control', method: 'GET', route: '/api/report', pathAndQuery: `/api/report?mode=${encodeURIComponent(timingChallenge.controlToken)}`, status: 200 }),
       },
       {
         exchangeId: `tp${i}`, seq: i * 2 + 2, origin: ORIGIN, durationMs: 2_100,
-        ...(stampProbe ? { hostTimingChallenge: timingChallenge } : {}),
+        ...(stampProbe ? { hostTimingChallenge: bindArmExchange ? oracle.stampTimingChallengeArm(timingChallenge, 'probe', { exchangeId: `tp${i}` }) : timingChallenge } : {}),
         step: mkStep({ id: `tp${i}`, arm: 'probe', method: 'GET', route: '/api/report', pathAndQuery: `/api/report?mode=${encodeURIComponent(timingChallenge.delayToken)}`, status: 200 }),
       },
     ]).flat()
@@ -474,15 +479,22 @@ test('R3-16 Test 5: timing rejects transcript-only/partial-arm challenges; redir
   }, { hostMintedOracle: oracle, runId })
   assert.equal(partialArmTiming.confirmed, false, 'partial-arm timing challenge must be rejected')
 
-  // (c) All control & probe arms stamped -> CONFIRMED
+  // (b2) B1: Unbound run-scoped timing stamp (armRole/exchangeId = null) -> REJECTED (zero wildcard!)
+  const unboundTiming = verifyReceipt(timingReceipt, {
+    runId, entries: makeTimingEntries(true, true, false),
+  }, { hostMintedOracle: oracle, runId })
+  assert.equal(unboundTiming.confirmed, false, 'unbound run-scoped timing stamp (null armRole/exchangeId) must be rejected')
+
+  // (c) All control & probe arms stamped with per-arm/per-exchange bindings -> CONFIRMED
   const fullBoundTiming = verifyReceipt(timingReceipt, {
-    runId, entries: makeTimingEntries(true, true),
+    runId, entries: makeTimingEntries(true, true, true),
   }, { hostMintedOracle: oracle, runId })
   assert.equal(fullBoundTiming.confirmed, true, fullBoundTiming.reason)
 
-  // (d) Redirect: transcript-only OR unassociated minted host -> REJECTED
-  const redirCanary = oracle.mintRedirectCanary('canary.kovo.invalid', { runId, origin: ORIGIN, method: 'GET', route: '/go', param: 'next' })
-  const otherCanary = oracle.mintRedirectCanary('canary.kovo.invalid', { runId, origin: ORIGIN, method: 'GET', route: '/other', param: 'next' })
+  // (d) Redirect: transcript-only, unbound, OR unassociated minted host -> REJECTED
+  const unboundRedirCanary = oracle.mintRedirectCanary('canary.kovo.invalid', { runId, origin: ORIGIN, method: 'GET', route: '/go', param: 'next' })
+  const redirCanary = oracle.mintRedirectCanary('canary.kovo.invalid', { runId, origin: ORIGIN, method: 'GET', route: '/go', param: 'next', armRole: 'probe', exchangeId: 'rp' })
+  const otherCanary = oracle.mintRedirectCanary('canary.kovo.invalid', { runId, origin: ORIGIN, method: 'GET', route: '/other', param: 'next', armRole: 'probe', exchangeId: 'rp' })
   const redirReceipt = buildProofReceipt({
     vulnClass: 'open_redirect',
     target: { origin: ORIGIN, method: 'GET', pathAndQuery: `/go?next=https://${redirCanary.host}/x`, param: 'next' },
@@ -503,6 +515,24 @@ test('R3-16 Test 5: timing rejects transcript-only/partial-arm challenges; redir
     false,
     'transcript-level hostRedirectCanaryHost fallback must be rejected',
   )
+  const unboundRedirReceipt = buildProofReceipt({
+    vulnClass: 'open_redirect',
+    target: { origin: ORIGIN, method: 'GET', pathAndQuery: `/go?next=https://${unboundRedirCanary.host}/x`, param: 'next' },
+    exchangeIds: ['rc', 'rp'],
+    claimedDelta: 'Unbound redirect guard check.',
+  })
+  assert.equal(
+    verifyReceipt(unboundRedirReceipt, {
+      runId,
+      entries: [ctlEntry, {
+        ...unstampedProbe,
+        hostRedirectCanaryHost: unboundRedirCanary.host,
+        step: mkStep({ id: 'rp', arm: 'probe', method: 'GET', route: '/go', pathAndQuery: `/go?next=${encodeURIComponent(`https://${unboundRedirCanary.host}/x`)}`, status: 302, responseHeaders: { location: `https://${unboundRedirCanary.host}/x` } }),
+      }],
+    }, { hostMintedOracle: oracle, runId }).confirmed,
+    false,
+    'B1: unbound run-scoped redirect canary (null armRole/exchangeId) must be rejected',
+  )
   assert.equal(
     verifyReceipt(redirReceipt, { runId, entries: [ctlEntry, { ...unstampedProbe, hostRedirectCanaryHost: otherCanary.host }] }, { hostMintedOracle: oracle, runId }).confirmed,
     false,
@@ -514,8 +544,10 @@ test('R3-16 Test 5: timing rejects transcript-only/partial-arm challenges; redir
     'probe-bound redirect canary host must confirm',
   )
 
-  // (e) Arm provenance tracking in HostFactLog and verify-prove-handlers
+  // (e) Arm provenance tracking in HostFactLog and verify-prove-handlers (N1: absent sessionRole -> worker_selected)
   assert.deepEqual(resolveCanonicalArmWithProvenance('control'), { arm: 'control', provenance: 'worker_selected' })
+  assert.deepEqual(resolveCanonicalArmWithProvenance(null), { arm: 'probe', provenance: 'worker_selected' })
+  assert.deepEqual(resolveCanonicalArmWithProvenance(undefined), { arm: 'probe', provenance: 'worker_selected' })
   assert.deepEqual(resolveCanonicalArmWithProvenance(null, 'probe'), { arm: 'probe', provenance: 'host_assigned' })
   assert.deepEqual(resolveCanonicalArmWithProvenance('probe', 'control', 'host_assigned'), { arm: 'control', provenance: 'host_assigned' })
 
@@ -563,24 +595,198 @@ test('R3-16 Test 5: timing rejects transcript-only/partial-arm challenges; redir
   seenStamps.length = 0
   await handleProveDifferential(mockHost, {
     mode: 'timing', timingFamily: 'timing', rounds: 5,
-    control: '/api/report?mode={{delayToken}}', variant: '/api/report?mode={{delayToken}}',
+    control: '/api/Report?mode={{delayToken}}', variant: '/api/Report?mode={{delayToken}}',
   }, 'n2')
   assert.ok(seenStamps.length === 10)
+  const ctlTimingStamps = seenStamps.filter(s => s?.hostAssignedArm === 'control')
+  const prbTimingStamps = seenStamps.filter(s => s?.hostAssignedArm === 'probe')
+  assert.equal(ctlTimingStamps.length, 5)
+  assert.equal(prbTimingStamps.length, 5)
   for (const st of seenStamps) {
+    const ns = st?.timingChallenge?.nonceStamp
     assert.equal(st?.armProvenance, 'host_assigned')
-    assert.equal(st?.timingChallenge?.nonceStamp?.runId, 'run-prove-arm-1')
+    assert.equal(ns?.runId, 'run-prove-arm-1')
+    assert.equal(ns?.origin, ORIGIN)
+    assert.equal(ns?.method, 'GET')
+    assert.equal(ns?.route, '/api/Report')
+    assert.equal(ns?.param, 'mode')
+    assert.equal(ns?.armRole, st?.hostAssignedArm)
   }
+  assert.notEqual(
+    ctlTimingStamps[0]?.timingChallenge?.nonceStamp?.stampId,
+    prbTimingStamps[0]?.timingChallenge?.nonceStamp?.stampId,
+    'control and probe timing arms must carry distinct per-arm HMAC stamps',
+  )
 
   seenStamps.length = 0
   await handleProveInjection(mockHost, {
     expressionFamily: 'expression',
-    control: '/api/calc?expr=1',
-    probe: '/api/calc?expr={{expr}}',
+    control: '/api/Calc?expr=1',
+    probe: '/api/Calc?expr={{expr}}',
   }, 'n3')
   const exprStamps = seenStamps.filter(s => s?.hostExpressionChallenge)
   assert.equal(exprStamps.length, 2)
   for (const st of exprStamps) {
+    const ns = st?.hostExpressionChallenge?.nonceStamp
     assert.equal(st?.armProvenance, 'host_assigned')
-    assert.equal(st?.hostExpressionChallenge?.nonceStamp?.runId, 'run-prove-arm-1')
+    assert.equal(ns?.runId, 'run-prove-arm-1')
+    assert.equal(ns?.origin, ORIGIN)
+    assert.equal(ns?.method, 'GET')
+    assert.equal(ns?.route, '/api/Calc')
+    assert.equal(ns?.param, 'expr')
+    assert.equal(ns?.armRole, 'probe')
+  }
+})
+
+// ============================================================================
+// Test 6: B1 Zero-Wildcard Verification & N5 Case-Preserving Route Binding
+// ============================================================================
+
+test('R3-16 Test 6 (B1/N5): unbound null-field stamps fail closed and route binding is case-sensitive', () => {
+  const ledger = new NonceLedger()
+  const runId = 'run-b1-strict'
+
+  // Unbound stamp (origin/method/route/param/armRole/exchangeId all null) must NEVER match expected dimensions
+  const unbound = ledger.mintStamp({ runId, oracleId: 'timing' }, { delayMs: 2_000 })
+  assert.equal(ledger.verifyStamp(unbound, { runId, oracleId: 'timing', origin: ORIGIN }), null, 'null origin must fail closed')
+  assert.equal(ledger.verifyStamp(unbound, { runId, oracleId: 'timing', method: 'GET' }), null, 'null method must fail closed')
+  assert.equal(ledger.verifyStamp(unbound, { runId, oracleId: 'timing', route: '/api/R1' }), null, 'null route must fail closed')
+  assert.equal(ledger.verifyStamp(unbound, { runId, oracleId: 'timing', param: 'q' }), null, 'null param must fail closed')
+  assert.equal(ledger.verifyStamp(unbound, { runId, oracleId: 'timing', armRole: 'probe' }), null, 'null armRole must fail closed')
+  assert.equal(ledger.verifyStamp(unbound, { runId, oracleId: 'timing', exchangeId: 'E1' }), null, 'null exchangeId must fail closed')
+
+  // Case-sensitive route binding (N5): /api/Items != /api/items
+  const cased = ledger.mintStamp(
+    { runId, oracleId: 'redirect', origin: ORIGIN, method: 'GET', route: '/api/Items', param: 'next', armRole: 'probe', exchangeId: 'E1' },
+    { host: 'redir-a.canary.kovo.invalid' },
+  )
+  assert.ok(ledger.verifyStamp(cased, { runId, oracleId: 'redirect', origin: ORIGIN, method: 'GET', route: '/api/Items', param: 'next', armRole: 'probe', exchangeId: 'E1' }))
+  assert.equal(ledger.verifyStamp(cased, { runId, oracleId: 'redirect', origin: ORIGIN, method: 'GET', route: '/api/items', param: 'next', armRole: 'probe', exchangeId: 'E1' }), null, 'case-mismatched route must be rejected')
+  assert.equal(ledger.verifyStamp(cased, { runId, oracleId: 'redirect', origin: ORIGIN, method: 'GET', route: '/api/Items', param: 'next', armRole: 'probe', exchangeId: 'E2' }), null, 'cross-exchange must be rejected')
+  assert.equal(ledger.verifyStamp(cased, { runId, oracleId: 'redirect', origin: ORIGIN, method: 'GET', route: '/api/Items', param: 'next', armRole: 'probe' }), null, 'omitting exchangeId on exchange-bound stamp must be rejected')
+
+  // HostMintedOracle timing & redirect cross-route / cross-exchange / swapped-arm rejection
+  const oracle = new HostMintedOracle(ledger)
+  const tBase = oracle.mintTimingChallenge('timing', 2_000, undefined, { runId, origin: ORIGIN, method: 'GET', route: '/api/R1', param: 'q' })
+  const tProbeE1 = oracle.stampTimingChallengeArm(tBase, 'probe', { exchangeId: 'E1' })
+  assert.ok(oracle.verifyTimingChallenge(tProbeE1, { runId, origin: ORIGIN, method: 'GET', route: '/api/R1', param: 'q', armRole: 'probe', exchangeId: 'E1' }))
+  assert.equal(oracle.verifyTimingChallenge(tProbeE1, { runId, origin: ORIGIN, method: 'GET', route: '/api/R2', param: 'q', armRole: 'probe', exchangeId: 'E1' }), null, 'cross-route timing rejected')
+  assert.equal(oracle.verifyTimingChallenge(tProbeE1, { runId, origin: ORIGIN, method: 'GET', route: '/api/R1', param: 'q', armRole: 'probe', exchangeId: 'E2' }), null, 'cross-exchange timing rejected')
+  assert.equal(oracle.verifyTimingChallenge(tProbeE1, { runId, origin: ORIGIN, method: 'GET', route: '/api/R1', param: 'q', armRole: 'control', exchangeId: 'E1' }), null, 'swapped control/probe arm timing rejected')
+})
+
+// ============================================================================
+// Test 7: B2 Direct verifyReceipt Custody & N2 WeakSet Spread-Clone Rejection
+// ============================================================================
+
+test('R3-16 Test 7 (B2/N2): direct verifyReceipt ignores worker scalars/oracleEvents and WeakSet seal rejects spread clones', () => {
+  // B2a: Direct verifyReceipt on own-tenant benign note read with ALL worker claim scalars + handle-shaped ID -> REJECTED
+  const ownTenantEntries: ReceiptTranscriptEntry[] = [
+    {
+      exchangeId: 'ctl_notes', origin: ORIGIN,
+      step: mkStep({ id: 'ctl_notes', arm: 'control', method: 'GET', route: '/api/v1/notes', pathAndQuery: '/api/v1/notes', status: 200, actor: { handle: 'member_a', role: 'member', tenant: 'tenant-a', auth: 'bearer', sameSite: null }, body: '{"items":[{"id":"usr_note_0a1b2c3d4e5f","tenant_id":"tenant-a","owner":"u-a1"}]}' }),
+    },
+    {
+      exchangeId: 'prb_note', origin: ORIGIN,
+      step: mkStep({ id: 'prb_note', arm: 'probe', method: 'GET', route: '/api/v1/notes/usr_note_0a1b2c3d4e5f', pathAndQuery: '/api/v1/notes/usr_note_0a1b2c3d4e5f', status: 200, actor: { handle: 'member_a', role: 'member', tenant: 'tenant-a', auth: 'bearer', sameSite: null }, body: '{"id":"usr_note_0a1b2c3d4e5f","tenant_id":"tenant-a","owner":"u-a1","text":"mine"}' }),
+    },
+  ]
+  const pollutedBola = buildProofReceipt({
+    vulnClass: 'bola',
+    target: { origin: ORIGIN, method: 'GET', pathAndQuery: '/api/v1/notes/usr_note_0a1b2c3d4e5f' },
+    exchangeIds: ['ctl_notes', 'prb_note'],
+    claimedDelta: 'Worker-polluted own-tenant read.',
+    requiredRole: 'admin',
+    resourceTenant: 'tenant-b',
+    expectControlDenied: true,
+    oracleEvents: ['privilege_escalation', 'csrf_missing'],
+    proofPatterns: ['usr_note_[0-9a-f]{12}'],
+  })
+  assert.equal(verifyReceipt(pollutedBola, { entries: ownTenantEntries }).confirmed, false, 'direct verifyReceipt must ignore all worker scalars and dismiss own-tenant read')
+
+  // B2b: Direct verifyReceipt with forged oracleEvents=['mass_assignment'] on non-protected self-bio edit -> REJECTED
+  const bioEntries: ReceiptTranscriptEntry[] = [
+    { exchangeId: 'b1', origin: ORIGIN, step: mkStep({ id: 'b1', arm: 'control', method: 'GET', route: '/api/profile', status: 200, body: '{"bio":"old","role":"member"}' }) },
+    { exchangeId: 'b2', origin: ORIGIN, step: mkStep({ id: 'b2', arm: 'probe', method: 'PATCH', route: '/api/profile', status: 200, requestBody: '{"bio":"new"}', body: '{"bio":"new","role":"member"}' }) },
+    { exchangeId: 'b3', origin: ORIGIN, step: mkStep({ id: 'b3', arm: 'control', method: 'GET', route: '/api/profile', status: 200, body: '{"bio":"new","role":"member"}' }) },
+  ]
+  const forgedMass = buildProofReceipt({
+    vulnClass: 'mass_assignment',
+    target: { origin: ORIGIN, method: 'PATCH', pathAndQuery: '/api/profile' },
+    exchangeIds: ['b1', 'b2', 'b3'],
+    claimedDelta: 'Worker forged oracleEvents on benign bio edit.',
+    oracleEvents: ['mass_assignment', 'privilege_escalation'],
+    requiredRole: 'admin',
+  })
+  assert.equal(verifyReceipt(forgedMass, { entries: bioEntries }).confirmed, false, 'direct verifyReceipt must strip forged worker oracleEvents')
+
+  // N2: WeakSet seal rejects spread-cloning `{ ...genuine, receipt: forged }`
+  const genuine = constructHostEvidence({ receipt: pollutedBola, transcript: { entries: ownTenantEntries }, runId: 'run-n2' })
+  assert.equal(isHostEvidence(genuine), true)
+  const spreadClone = { ...genuine, receipt: { ...genuine.receipt, vulnClass: 'rce' } }
+  assert.equal(isHostEvidence(spreadClone), false, 'spread clone of HostEvidence must NOT pass WeakSet seal')
+  assert.throws(() => verifyHostEvidence(spreadClone as unknown as HostEvidence), /sealed HostEvidence/i)
+})
+
+// ============================================================================
+// Test 8: B3 Payload-Digest Mix-and-Match & SQLite DB-Tamper Fail-Closed
+// ============================================================================
+
+test('R3-16 Test 8 (B3): challenge/stamp mix-and-match and tampered SQLite payload_json fail closed', () => {
+  const tmpDir = mkdtempSync(join(tmpdir(), 'kovo-r3-16-b3-'))
+  try {
+    const store = new Store(tmpDir)
+    const runId = 'run-b3-integrity'
+    const oracle1 = new HostMintedOracle(new NonceLedger({ persistence: store.nonceLedgerPersistence }))
+
+    // 1. Mix-and-match: Challenge A's payload paired with Challenge B's valid same-oracle nonceStamp -> REJECTED
+    const exprA = oracle1.mintExpressionChallenge('ssti', '*', { runId, origin: ORIGIN, method: 'GET', route: '/e', param: 'q', armRole: 'probe' })
+    const exprB = oracle1.mintExpressionChallenge('ssti', '*', { runId, origin: ORIGIN, method: 'GET', route: '/e', param: 'q', armRole: 'probe' })
+    assert.equal(oracle1.verifyExpressionChallenge({ ...exprA, nonceStamp: exprB.nonceStamp }, { runId, origin: ORIGIN, method: 'GET', route: '/e', param: 'q', armRole: 'probe' }), null, 'expression mix-and-match must fail closed')
+
+    const timeA = oracle1.mintTimingChallenge('timing', 2_000, undefined, { runId, origin: ORIGIN, method: 'GET', route: '/t', param: 'q', armRole: 'probe' })
+    const timeB = oracle1.mintTimingChallenge('timing', 3_000, undefined, { runId, origin: ORIGIN, method: 'GET', route: '/t', param: 'q', armRole: 'probe' })
+    assert.equal(oracle1.verifyTimingChallenge({ ...timeA, nonceStamp: timeB.nonceStamp }, { runId, origin: ORIGIN, method: 'GET', route: '/t', param: 'q', armRole: 'probe' }), null, 'timing mix-and-match must fail closed')
+
+    const redirA = oracle1.mintRedirectCanary('canary.kovo.invalid', { runId, origin: ORIGIN, method: 'GET', route: '/r', param: 'next', armRole: 'probe' })
+    const redirB = oracle1.mintRedirectCanary('canary.kovo.invalid', { runId, origin: ORIGIN, method: 'GET', route: '/r', param: 'next', armRole: 'probe' })
+    assert.equal(oracle1.verifyRedirectCanary({ ...redirA, nonceStamp: redirB.nonceStamp }, { runId, origin: ORIGIN, method: 'GET', route: '/r', param: 'next', armRole: 'probe' }), null, 'redirect mix-and-match must fail closed')
+
+    const boolA = oracle1.mintBooleanPair('10', { style: 'numeric', param: 'id', binding: { runId, origin: ORIGIN, method: 'GET', route: '/b' } })
+    const boolB = oracle1.mintBooleanPair('20', { style: 'numeric', param: 'id', binding: { runId, origin: ORIGIN, method: 'GET', route: '/b' } })
+    const stampedA = oracle1.stampBooleanPairArm(boolA, 'true', { exchangeId: 'eb1' })
+    const stampedB = oracle1.stampBooleanPairArm(boolB, 'true', { exchangeId: 'eb1' })
+    assert.equal(oracle1.verifyBooleanPair({ ...stampedA, nonceStamp: stampedB.nonceStamp }, { runId, origin: ORIGIN, method: 'GET', route: '/b', param: 'id', armRole: 'true', exchangeId: 'eb1' }), null, 'boolean pair mix-and-match must fail closed')
+
+    // 2. SQLite payload_json tamper test: cite challenges, tamper persisted payload_json, reopen fresh ledger -> FAIL CLOSED
+    assert.equal(oracle1.citeChallenge(timeA.challengeId), true)
+    assert.equal(oracle1.citeChallenge(exprA.challengeId), true)
+    assert.equal(oracle1.citeChallenge(redirA.canaryId), true)
+
+    const tamperedTimePayload = JSON.stringify({ ...timeA, delayMs: 1_000, delayToken: 'delay=0' })
+    const tamperedExprPayload = JSON.stringify({ ...exprA, expectedOutput: '00000' })
+    const tamperedRedirPayload = JSON.stringify({ ...redirA, host: 'evil.example.invalid' })
+    store.client.prepare('UPDATE nonce_ledger_stamps SET payload_json = ? WHERE stamp_id = ?').run(tamperedTimePayload, timeA.challengeId)
+    store.client.prepare('UPDATE nonce_ledger_stamps SET payload_json = ? WHERE stamp_id = ?').run(tamperedExprPayload, exprA.challengeId)
+    store.client.prepare('UPDATE nonce_ledger_stamps SET payload_json = ? WHERE stamp_id = ?').run(tamperedRedirPayload, redirA.canaryId)
+    store.close()
+
+    const reopened = new Store(tmpDir)
+    try {
+      const restartedLedger = new NonceLedger({ persistence: reopened.nonceLedgerPersistence })
+      const restartedOracle = new HostMintedOracle(restartedLedger)
+      assert.equal(restartedLedger.getVerifiedPayload(timeA.challengeId, runId), null, 'tampered timing payload_json must fail digest verification')
+      assert.equal(restartedLedger.getVerifiedPayload(exprA.challengeId, runId), null, 'tampered expression payload_json must fail digest verification')
+      assert.equal(restartedLedger.getVerifiedPayload(redirA.canaryId, runId), null, 'tampered redirect payload_json must fail digest verification')
+      assert.equal(restartedOracle.getTimingChallenge(timeA.challengeId, runId), undefined)
+      assert.equal(restartedOracle.getExpressionChallenge(exprA.challengeId, runId), undefined)
+      assert.equal(restartedOracle.verifyTimingChallenge(timeA, { runId, origin: ORIGIN, method: 'GET', route: '/t', param: 'q', armRole: 'probe' }), null)
+      assert.equal(restartedOracle.verifyExpressionChallenge(exprA, { runId, origin: ORIGIN, method: 'GET', route: '/e', param: 'q', armRole: 'probe' }), null)
+      assert.equal(restartedOracle.verifyRedirectCanary(redirA, { runId, origin: ORIGIN, method: 'GET', route: '/r', param: 'next', armRole: 'probe' }), null)
+    } finally {
+      reopened.close()
+    }
+  } finally {
+    rmSync(tmpDir, { recursive: true, force: true })
   }
 })
