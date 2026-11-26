@@ -1,0 +1,250 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "key": "src/server/deterministic-engine.ts::blueprint_route::/api/admin/people/:param",
+      "file": "src/server/deterministic-engine.ts",
+      "category": "blueprint_route",
+      "token": "/api/admin/people/:param",
+      "count": 1
+    },
+    {
+      "key": "src/server/deterministic-specs.ts::canary_grammar::rb[s]_",
+      "file": "src/server/deterministic-specs.ts",
+      "category": "canary_grammar",
+      "token": "rb[s]_",
+      "count": 1
+    },
+    {
+      "key": "src/server/exec-floor-lane.ts::blueprint_route::/api/accounts/search",
+      "file": "src/server/exec-floor-lane.ts",
+      "category": "blueprint_route",
+      "token": "/api/accounts/search",
+      "count": 1
+    },
+    {
+      "key": "src/server/exec-floor-lane.ts::blueprint_route::/api/admin/activity",
+      "file": "src/server/exec-floor-lane.ts",
+      "category": "blueprint_route",
+      "token": "/api/admin/activity",
+      "count": 1
+    },
+    {
+      "key": "src/server/exec-floor-lane.ts::blueprint_route::/api/admin/impersonate",
+      "file": "src/server/exec-floor-lane.ts",
+      "category": "blueprint_route",
+      "token": "/api/admin/impersonate",
+      "count": 1
+    },
+    {
+      "key": "src/server/exec-floor-lane.ts::blueprint_route::/api/apps/import",
+      "file": "src/server/exec-floor-lane.ts",
+      "category": "blueprint_route",
+      "token": "/api/apps/import",
+      "count": 1
+    },
+    {
+      "key": "src/server/exec-floor-lane.ts::blueprint_route::/api/checkout/return",
+      "file": "src/server/exec-floor-lane.ts",
+      "category": "blueprint_route",
+      "token": "/api/checkout/return",
+      "count": 2
+    },
+    {
+      "key": "src/server/exec-floor-lane.ts::blueprint_route::/api/downloads/reports",
+      "file": "src/server/exec-floor-lane.ts",
+      "category": "blueprint_route",
+      "token": "/api/downloads/reports",
+      "count": 1
+    },
+    {
+      "key": "src/server/exec-floor-lane.ts::blueprint_route::/api/enrollments/accept",
+      "file": "src/server/exec-floor-lane.ts",
+      "category": "blueprint_route",
+      "token": "/api/enrollments/accept",
+      "count": 1
+    },
+    {
+      "key": "src/server/exec-floor-lane.ts::blueprint_route::/api/hooks/:param/ping",
+      "file": "src/server/exec-floor-lane.ts",
+      "category": "blueprint_route",
+      "token": "/api/hooks/:param/ping",
+      "count": 1
+    },
+    {
+      "key": "src/server/exec-floor-lane.ts::blueprint_route::/api/issues/:param/notes",
+      "file": "src/server/exec-floor-lane.ts",
+      "category": "blueprint_route",
+      "token": "/api/issues/:param/notes",
+      "count": 1
+    },
+    {
+      "key": "src/server/exec-floor-lane.ts::blueprint_route::/api/issues/:param/view",
+      "file": "src/server/exec-floor-lane.ts",
+      "category": "blueprint_route",
+      "token": "/api/issues/:param/view",
+      "count": 1
+    },
+    {
+      "key": "src/server/exec-floor-lane.ts::blueprint_route::/api/jobs/:param/complete",
+      "file": "src/server/exec-floor-lane.ts",
+      "category": "blueprint_route",
+      "token": "/api/jobs/:param/complete",
+      "count": 1
+    },
+    {
+      "key": "src/server/exec-floor-lane.ts::blueprint_route::/api/jobs/:param/trigger",
+      "file": "src/server/exec-floor-lane.ts",
+      "category": "blueprint_route",
+      "token": "/api/jobs/:param/trigger",
+      "count": 1
+    },
+    {
+      "key": "src/server/exec-floor-lane.ts::blueprint_route::/api/links/:param/fetch",
+      "file": "src/server/exec-floor-lane.ts",
+      "category": "blueprint_route",
+      "token": "/api/links/:param/fetch",
+      "count": 1
+    },
+    {
+      "key": "src/server/exec-floor-lane.ts::blueprint_route::/api/logs/filter",
+      "file": "src/server/exec-floor-lane.ts",
+      "category": "blueprint_route",
+      "token": "/api/logs/filter",
+      "count": 1
+    },
+    {
+      "key": "src/server/exec-floor-lane.ts::blueprint_route::/api/logs/view",
+      "file": "src/server/exec-floor-lane.ts",
+      "category": "blueprint_route",
+      "token": "/api/logs/view",
+      "count": 1
+    },
+    {
+      "key": "src/server/exec-floor-lane.ts::blueprint_route::/api/orders/:param/confirm",
+      "file": "src/server/exec-floor-lane.ts",
+      "category": "blueprint_route",
+      "token": "/api/orders/:param/confirm",
+      "count": 2
+    },
+    {
+      "key": "src/server/exec-floor-lane.ts::blueprint_route::/api/product-import",
+      "file": "src/server/exec-floor-lane.ts",
+      "category": "blueprint_route",
+      "token": "/api/product-import",
+      "count": 1
+    },
+    {
+      "key": "src/server/exec-floor-lane.ts::blueprint_route::/api/queries/run",
+      "file": "src/server/exec-floor-lane.ts",
+      "category": "blueprint_route",
+      "token": "/api/queries/run",
+      "count": 1
+    },
+    {
+      "key": "src/server/exec-floor-lane.ts::blueprint_route::/api/refunds/lines",
+      "file": "src/server/exec-floor-lane.ts",
+      "category": "blueprint_route",
+      "token": "/api/refunds/lines",
+      "count": 1
+    },
+    {
+      "key": "src/server/exec-floor-lane.ts::blueprint_route::/api/reports/sales",
+      "file": "src/server/exec-floor-lane.ts",
+      "category": "blueprint_route",
+      "token": "/api/reports/sales",
+      "count": 2
+    },
+    {
+      "key": "src/server/exec-floor-lane.ts::blueprint_route::/api/sso/import",
+      "file": "src/server/exec-floor-lane.ts",
+      "category": "blueprint_route",
+      "token": "/api/sso/import",
+      "count": 1
+    },
+    {
+      "key": "src/server/exec-floor-lane.ts::blueprint_route::/api/staff/:param/role",
+      "file": "src/server/exec-floor-lane.ts",
+      "category": "blueprint_route",
+      "token": "/api/staff/:param/role",
+      "count": 1
+    },
+    {
+      "key": "src/server/exec-floor-lane.ts::blueprint_route::/api/v1/downloads/download",
+      "file": "src/server/exec-floor-lane.ts",
+      "category": "blueprint_route",
+      "token": "/api/v1/downloads/download",
+      "count": 1
+    },
+    {
+      "key": "src/server/exec-floor-lane.ts::blueprint_route::/api/wares/:param/photos",
+      "file": "src/server/exec-floor-lane.ts",
+      "category": "blueprint_route",
+      "token": "/api/wares/:param/photos",
+      "count": 2
+    },
+    {
+      "key": "src/server/exec-floor-lane.ts::blueprint_route::/app-config.json",
+      "file": "src/server/exec-floor-lane.ts",
+      "category": "blueprint_route",
+      "token": "/app-config.json",
+      "count": 2
+    },
+    {
+      "key": "src/server/phase0-recon.ts::blueprint_route::/api/billing-docs/:param",
+      "file": "src/server/phase0-recon.ts",
+      "category": "blueprint_route",
+      "token": "/api/billing-docs/:param",
+      "count": 1
+    },
+    {
+      "key": "src/server/probes/authz.ts::canary_grammar::rb[s]_",
+      "file": "src/server/probes/authz.ts",
+      "category": "canary_grammar",
+      "token": "rb[s]_",
+      "count": 1
+    },
+    {
+      "key": "src/server/probes/traversal.ts::vfs_path::/app/.env",
+      "file": "src/server/probes/traversal.ts",
+      "category": "vfs_path",
+      "token": "/app/.env",
+      "count": 1
+    },
+    {
+      "key": "src/server/probes/traversal.ts::vfs_path::/app/config/secrets.env",
+      "file": "src/server/probes/traversal.ts",
+      "category": "vfs_path",
+      "token": "/app/config/secrets.env",
+      "count": 1
+    },
+    {
+      "key": "src/server/probes/traversal.ts::vfs_path::/var/log/system/audit.log",
+      "file": "src/server/probes/traversal.ts",
+      "category": "vfs_path",
+      "token": "/var/log/system/audit.log",
+      "count": 2
+    },
+    {
+      "key": "src/server/probes/xxe.ts::canary_grammar::rbs_",
+      "file": "src/server/probes/xxe.ts",
+      "category": "canary_grammar",
+      "token": "rbs_",
+      "count": 1
+    },
+    {
+      "key": "src/server/probes/xxe.ts::vfs_path::/app/.env",
+      "file": "src/server/probes/xxe.ts",
+      "category": "vfs_path",
+      "token": "/app/.env",
+      "count": 1
+    },
+    {
+      "key": "src/server/probes/xxe.ts::vfs_path::/app/config/secrets.env",
+      "file": "src/server/probes/xxe.ts",
+      "category": "vfs_path",
+      "token": "/app/config/secrets.env",
+      "count": 1
+    }
+  ]
+}
