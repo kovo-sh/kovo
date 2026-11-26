@@ -134,6 +134,7 @@ const is2xx = (st: number | null | undefined): boolean => typeof st === 'number'
 const isFiniteTs = (ts: unknown): ts is number => typeof ts === 'number' && Number.isFinite(ts) && ts >= 0
 const normRouteFam = (p: string | null | undefined, eid?: string): string => !p ? '' : routeFamily(p.split(/[?#]/, 1)[0]!.split('/').map(s => (s && ((eid && s === eid) || /^\d+$/.test(s))) ? ':id' : s).join('/'))
 const actorOf = (e: HostTranscriptEntry): string | null => (e.actorPersona !== undefined ? e.actorPersona : (e.step.actor.handle ?? null))
+const resolvedActorOf = (e: HostTranscriptEntry, capIdx: CapOriginIndex): string | null => { const a = actorOf(e); return a?.startsWith('cap:') ? (capIdx.actorOf(a) ?? a) : (a ?? (e.consumedCapabilities ?? []).map(c => capIdx.actorOf(c)).find(Boolean) ?? null) }
 const roleOf = (e: HostTranscriptEntry): string | null => (e.actorRoleLabel ? parseRoleLabel(e.actorRoleLabel).role : (e.step.actor.role ?? null))
 const probeTenantsOf = (e: HostTranscriptEntry, capIdx?: CapOriginIndex): string[] => { const out: string[] = [], a = actorOf(e), dt = (!a || ANON_ACTOR_RE.test(a) || a.startsWith('cap:')) ? null : ((e.step.actor.tenant ?? parseRoleLabel(e.actorRoleLabel ?? e.actorPersona ?? '').tenant ?? '').trim().toLowerCase() || null); if (dt) out.push(dt); if (capIdx) for (const c of [...(a?.startsWith('cap:') ? [a] : []), ...(e.consumedCapabilities ?? [])]) { const lt = capIdx.loginTenantOf(c); if (lt && !out.includes(lt)) out.push(lt) } return out }
 const probeTenantOf = (e: HostTranscriptEntry, capIdx?: CapOriginIndex): string | null => probeTenantsOf(e, capIdx)[0] ?? null
@@ -349,9 +350,9 @@ function verifyStateTransitionBinding(
     const side = sel.reason === 'missing_to' || sel.missingSide === 'to' ? 'to' : 'from', hop = side === 'to' ? toHop : fromHop
     return edgeFail(base, `${side}Hop "${hop.hopId}" has no succeeding exchange on "${edge.entityId}" ${hopDiag(hop, side)}${sel.reason === 'actor_discontinuity' ? ' [actor_discontinuity]' : ''}.`)
   }
-  const pair = { from: sel.from, to: sel.to }, { logicalFallback } = sel, toActor = actorOf(pair.to), toFam = normRouteFam(pair.to.step.route ?? pair.to.step.pathAndQuery, edge.entityId)
+  const pair = { from: sel.from, to: sel.to }, { logicalFallback } = sel, toRawActor = actorOf(pair.to), toActor = resolvedActorOf(pair.to, capIdx), toFam = normRouteFam(pair.to.step.route ?? pair.to.step.pathAndQuery, edge.entityId)
   const hopExSet = new Set([...fromHop.exchangeIds, ...toHop.exchangeIds])
-  const toUsesNewCap = (pair.to.consumedCapabilities ?? []).some(c => dagDerivedCaps.has(c)) || (pair.to.cryptoAttestations ?? []).some(x => dagDerivedCaps.has(x.derivedFromCapabilityId)) || Boolean(toActor && dagDerivedCaps.has(toActor))
+  const toUsesNewCap = (pair.to.consumedCapabilities ?? []).some(c => dagDerivedCaps.has(c)) || (pair.to.cryptoAttestations ?? []).some(x => dagDerivedCaps.has(x.derivedFromCapabilityId)) || Boolean(toRawActor && dagDerivedCaps.has(toRawActor))
   const normActor = (a: string | null) => (!a || ANON_ACTOR_RE.test(a.trim())) ? null : a.trim().toLowerCase()
   // Sibling is untouched when no succeeding state-changing exchange on it precedes the ablation (missing timestamps count as touched).
   const touchedBefore = (eid: string, ab: HostTranscriptEntry) => [...idx.entriesById.values()].some(e => e.exchangeId !== ab.exchangeId && is2xx(e.step.status) && !stepReadsState(e.step) && (!isFiniteTs(e.timestampMs) || !isFiniteTs(ab.timestampMs) || e.timestampMs <= ab.timestampMs) && entryMatchesEntity(e, eid))
@@ -370,8 +371,8 @@ function verifyStateTransitionBinding(
       const sibling = Boolean(ab.entityId && ab.entityId.trim().toLowerCase() !== edge.entityId.trim().toLowerCase() && !touchedBefore(ab.entityId, ab))
       if (ab.cleanSession !== true || !denied || !(before || sibling)) { diags.push(`${abId}: unlabeled_control (cleanSession=${ab.cleanSession ?? 'unset'}, status=${st ?? 'null'}, beforeFromHop=${before}, untouchedSibling=${sibling}; pass role: "control")`); continue }
     }
-    const abActor = actorOf(ab) ?? (ab.consumedCapabilities ?? []).map(c => capIdx.actorOf(c)).find(Boolean) ?? null
-    if (!toUsesNewCap && toActor && (logicalFallback ? normActor(abActor) !== normActor(toActor) : (abActor && abActor !== toActor))) return edgeFail(base, `Ablation "${abId}" actor "${abActor ?? 'anon'}" mismatches toHop actor "${toActor}" [actor_mismatch].`)
+    const abActor = resolvedActorOf(ab, capIdx)
+    if (!toUsesNewCap && toActor && (logicalFallback ? normActor(abActor) !== normActor(toActor) : (abActor && normActor(abActor) !== normActor(toActor)))) return edgeFail(base, `Ablation "${abId}" actor "${abActor ?? 'anon'}" mismatches toHop actor "${toActor}" [actor_mismatch].`)
     if (denied || (!logicalFallback && labeled && ab.step.evidenceRole === 'invariant_preserved')) validAblation = ab
     else diags.push(`${abId}: status=${st ?? 'null'} not a denial (401/403/404/409/412/422)`)
   }
@@ -461,18 +462,25 @@ function verifyAttackerProvenance(
     }
     return null
   }
+  const resolveActor = (e: HostTranscriptEntry) => {
+    const a = actorOf(e), r = roleOf(e), isCap = Boolean(a?.startsWith('cap:')), fromDag = Boolean(isCap && dagCaps.has(a!))
+    if (!isCap || fromDag) return { a: fromDag ? null : a, r, rl: e.actorRoleLabel, isCap, fromDag, missingOrigin: false }
+    const em = capIdx.emitterActorOf(a!)
+    return em ? { a: em.actor, r: em.role ?? r, rl: em.roleLabel ?? e.actorRoleLabel, isCap, fromDag, missingOrigin: false } : { a, r, rl: e.actorRoleLabel, isCap, fromDag, missingOrigin: true }
+  }
   for (const hopId of dag.topoOrder) {
     const hop = dag.hopsById.get(hopId)!, isRoot = rootSet.has(hopId), isTermHop = hopId === receipt.terminalImpact.terminalHopId
     const nonControls = hop.exchangeIds.map(id => idx.entriesById.get(id)!).filter(e => e.step.arm !== 'control'), probes = nonControls.filter(e => e.step.arm === 'probe')
     if (isRoot && (hop.exchangeIds.length > 0 || (hop.oobEventIds.length === 0 && hop.browserTraceIds.length === 0)) && probes.length === 0) return { ok: false, reason: `Root hop "${hopId}" requires an attacker-origin probe.` }
     for (const e of nonControls) {
-      const a = actorOf(e), r = roleOf(e), usesDag = (e.consumedCapabilities ?? []).some(c => dagCaps.has(c)) || (e.cryptoAttestations ?? []).some(x => dagCaps.has(x.derivedFromCapabilityId))
-      const termMarkers = isTermHop && !usesDag ? extractTenantMarkers(e.step.json, e.step.body) : new Set<string>()
-      if (isForbidden(a, r, e.actorRoleLabel, termMarkers.size === 1 ? [...termMarkers][0]! : null)) return { ok: false, reason: `Attacker-origin violation in "${hopId}" ("${e.exchangeId}"): pre-seeded persona "${a ?? r}" is forbidden.` }
+      const ra = resolveActor(e), usesDag = ra.fromDag || (e.consumedCapabilities ?? []).some(c => dagCaps.has(c)) || (e.cryptoAttestations ?? []).some(x => dagCaps.has(x.derivedFromCapabilityId))
+      const termMarkers = isTermHop && !usesDag ? extractTenantMarkers(e.step.json, e.step.body) : new Set<string>(), tt = termMarkers.size === 1 ? [...termMarkers][0]! : null
+      if (ra.missingOrigin) return { ok: false, reason: `Attacker-origin violation in "${hopId}" ("${e.exchangeId}"): capability "${ra.a}" has unknown origin.` }
+      if (!ra.fromDag && (isForbidden(ra.a, ra.r, ra.rl, tt) || (ra.isCap && !allowedSet && isPrivilegedActorOrRole(null, roleOf(e), e.actorRoleLabel, tt)))) return { ok: false, reason: `Attacker-origin violation in "${hopId}" ("${e.exchangeId}"): pre-seeded persona "${ra.a ?? ra.r}" is forbidden.` }
       const capErr = checkExternalCaps(e, `"${hopId}"`); if (capErr) return { ok: false, reason: capErr }
       if (e.step.arm !== 'probe') continue
-      if (isRoot && allowedSet && !isAllowed(a, r, e.actorRoleLabel)) return { ok: false, reason: `Root hop "${hopId}" ("${e.exchangeId}") must start from an allowed attackerPersona.` }
-      if (!isRoot && !(a !== null && isAllowed(a, r, e.actorRoleLabel)) && !usesDag) return { ok: false, reason: `Hop "${hopId}" ("${e.exchangeId}") lacks attacker persona or DAG-derived capability.` }
+      if (isRoot && allowedSet && !isAllowed(ra.a, ra.r, ra.rl)) return { ok: false, reason: `Root hop "${hopId}" ("${e.exchangeId}") must start from an allowed attackerPersona.` }
+      if (!isRoot && !(ra.a !== null && isAllowed(ra.a, ra.r, ra.rl)) && !usesDag) return { ok: false, reason: `Hop "${hopId}" ("${e.exchangeId}") lacks attacker persona or DAG-derived capability.` }
       for (const pt of probeTenantsOf(e, capIdx)) probeTenants.add(pt)
     }
     recordHopCapabilities(hop, idx, dagCaps)
@@ -480,8 +488,9 @@ function verifyAttackerProvenance(
   const extraIds = [...receipt.terminalImpact.postChainReadbackExchangeIds, ...(receipt.terminalImpact.modeAFailureExchangeId ? [receipt.terminalImpact.modeAFailureExchangeId] : []), ...(receipt.terminalImpact.proofReceipt?.exchangeIds ?? []), ...receipt.hops.flatMap(h => h.proofReceipt?.exchangeIds ?? [])]
   for (const id of extraIds) {
     const e = idx.entriesById.get(id); if (!e || e.step.arm === 'control') continue
-    const a = actorOf(e), r = roleOf(e)
-    if (isForbidden(a, r, e.actorRoleLabel)) return { ok: false, reason: `Attacker-origin violation on cited non-control exchange "${id}": pre-seeded persona "${a ?? r}" is forbidden.` }
+    const ra = resolveActor(e)
+    if (ra.missingOrigin) return { ok: false, reason: `Attacker-origin violation on cited non-control exchange "${id}": capability "${ra.a}" has unknown origin.` }
+    if (!ra.fromDag && isForbidden(ra.a, ra.r, ra.rl)) return { ok: false, reason: `Attacker-origin violation on cited non-control exchange "${id}": pre-seeded persona "${ra.a ?? ra.r}" is forbidden.` }
     const capErr = checkExternalCaps(e, 'cited non-control'); if (capErr) return { ok: false, reason: capErr }
   }
   if (probeTenants.size > 1) return { ok: false, reason: `Cross-tenant probe-arm persona mismatch: pre-seeded probe hops mixed distinct tenants (${[...probeTenants].sort().join(', ')}). All pre-seeded probe-arm hops must belong to a single starting tenant (or anonymous/DAG-minted credentials); use target-tenant personas only on control or readback arms.` }
@@ -578,7 +587,7 @@ function dispatchDefaultV8Oracle(
 
 function verifyTerminalImpactGate(
   receipt: CompositeProofReceipt, dag: DagTopology, idx: IndexedTranscript, factLog: HostFactLog, verifiedEdges: VerifiedEdgeResult[],
-  hostTranscript: HostSignedTranscript, attackerTenants: ReadonlySet<string>, dagCaps: ReadonlySet<string>, options: CompositeVerifyOptions,
+  hostTranscript: HostSignedTranscript, attackerTenants: ReadonlySet<string>, dagCaps: ReadonlySet<string>, capIdx: CapOriginIndex, options: CompositeVerifyOptions,
 ): { ok: true; terminalVerification?: ReceiptVerification; terminalOracleFamily?: V8OracleFamily | string; terminalEndpoint?: string } | { ok: false; reason: string; rejectedBy?: string; missingEvidence?: string[]; terminalVerification?: ReceiptVerification } {
   const ti = receipt.terminalImpact, effSummary = ti.summary !== undefined ? ti.summary : ti.claimedImpact
   if (effSummary.replace(/\s+/g, '').length < 12) return { ok: false, reason: 'terminal_impact_summary_missing: terminalImpact.summary must be a meaningful non-empty description (>= 12 non-whitespace chars).', rejectedBy: 'terminal_impact_summary_missing', missingEvidence: ['terminal_impact_summary_missing'] }
@@ -634,8 +643,8 @@ function verifyTerminalImpactGate(
   if (ti.terminalExchangeId && (!termEx || termEx.step.arm !== 'probe' || !is2xx(termEx.step.status))) return failUnproven(`terminalExchangeId "${ti.terminalExchangeId}" is not a succeeding probe exchange.`)
   if (termEx && (termEx.evidenceRole === 'host_capability_op' || termEx.evidenceRole === 'host_crypto_op')) return failUnproven()
   const hasPostMutation = Boolean(postMutRb), termHopSet = new Set(termHop.exchangeIds), nonTermExSet = new Set(receipt.hops.filter(h => h.hopId !== termHop.hopId).flatMap(h => h.exchangeIds).filter(id => !termHopSet.has(id)))
-  const termActor = termEx ? actorOf(termEx) : null, termAuthd = Boolean(termActor && !ANON_ACTOR_RE.test(termActor)), normAct = (a: string | null) => (!a || ANON_ACTOR_RE.test(a.trim())) ? null : a.trim().toLowerCase()
-  const termUsesDagCap = Boolean(termEx && ((termEx.consumedCapabilities ?? []).some(c => dagCaps.has(c)) || (termEx.cryptoAttestations ?? []).some(x => dagCaps.has(x.derivedFromCapabilityId)) || (termActor && dagCaps.has(termActor))))
+  const termRawActor = termEx ? actorOf(termEx) : null, termActor = termEx ? resolvedActorOf(termEx, capIdx) : null, termAuthd = Boolean(termActor && !ANON_ACTOR_RE.test(termActor)), normAct = (a: string | null) => (!a || ANON_ACTOR_RE.test(a.trim())) ? null : a.trim().toLowerCase()
+  const termUsesDagCap = Boolean(termEx && ((termEx.consumedCapabilities ?? []).some(c => dagCaps.has(c)) || (termEx.cryptoAttestations ?? []).some(x => dagCaps.has(x.derivedFromCapabilityId)) || (termRawActor && dagCaps.has(termRawActor))))
   const ctrlCandidates = [...ti.preChainControlExchangeIds, ...termHop.exchangeIds, ...receipt.causalEdges.flatMap(ed => ed.kind === 'state_transition_binding' && ed.toHopId === termHop.hopId ? ed.ablationExchangeIds : [])]
   const matchesCtrlTarget = (c: HostTranscriptEntry, ref: HostTranscriptEntry): boolean => {
     const cRaw = c.step.pathAndQuery ?? c.step.route ?? '', rRaw = ref.step.pathAndQuery ?? ref.step.route ?? '', hostEid = ref.entityId?.trim()
@@ -644,7 +653,7 @@ function verifyTerminalImpactGate(
   }
   const terminalCtrl = ctrlCandidates.map(id => idx.entriesById.get(id)).find((c): c is HostTranscriptEntry => {
     if (!c || (termEx && c.exchangeId === termEx.exchangeId) || nonTermExSet.has(c.exchangeId) || (c.step.arm !== 'control' && c.replayAttempt !== 'ablation_control') || typeof c.step.status !== 'number' || !DENIED_CONTROL_STATUSES.has(c.step.status)) return false
-    const ca = actorOf(c)
+    const ca = resolvedActorOf(c, capIdx)
     if ((c.step.status === 401 && termAuthd && (!ca || ANON_ACTOR_RE.test(ca))) || (!termUsesDagCap && termAuthd && normAct(ca) !== normAct(termActor))) return false
     return Boolean((termEx && matchesCtrlTarget(c, termEx)) || (postMutRb && matchesCtrlTarget(c, postMutRb)))
   })
@@ -707,7 +716,7 @@ export function verifyCompositeReceipt(rawReceipt: unknown, hostTranscript: Host
   const replayRes = verifyReplayMode(receipt, dag, idx, options)
   if (!replayRes.ok) return fail('replay_mode', replayRes.reason, verifiedEdges)
   const factLog = options.factLog ?? HostFactLog.fromTranscript(hostTranscript)
-  const termRes = verifyTerminalImpactGate(receipt, dag, idx, factLog, verifiedEdges, hostTranscript, provRes.attackerTenants, new Set(provRes.derivedCapabilities), options)
+  const termRes = verifyTerminalImpactGate(receipt, dag, idx, factLog, verifiedEdges, hostTranscript, provRes.attackerTenants, new Set(provRes.derivedCapabilities), capIdx, options)
   if (!termRes.ok) return fail('terminal_impact', termRes.reason, verifiedEdges, termRes.terminalVerification, termRes.rejectedBy, termRes.missingEvidence)
   return {
     confirmed: true, chainId: receipt.chainId, terminalVulnClass: receipt.terminalVulnClass, replayMode: receipt.replayMode,

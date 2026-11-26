@@ -120,7 +120,12 @@ const INVALID_PATH_CHARS_RE = /[\r\n\0]/
  * canonical request path, even when a particular parser happens to normalize it today.
  */
 export function hasUnsafeAdmissionPath(pathAndQuery: string): boolean {
-  return UNSAFE_PATH_RE.test(pathAndQuery) || INVALID_PATH_CHARS_RE.test(pathAndQuery)
+  if (INVALID_PATH_CHARS_RE.test(pathAndQuery)) return true
+  const q = pathAndQuery.indexOf('?')
+  const h = pathAndQuery.indexOf('#')
+  const cut = q >= 0 && h >= 0 ? Math.min(q, h) : q >= 0 ? q : h
+  const pathPart = cut >= 0 ? pathAndQuery.slice(0, cut) : pathAndQuery
+  return UNSAFE_PATH_RE.test(pathPart)
 }
 
 /** Canonical path + query view. All scope/approval/denylist consumers must use this form. */

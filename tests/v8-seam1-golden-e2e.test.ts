@@ -493,7 +493,7 @@ const parsed = new URL(signedUrl)
 if (parsed.origin !== origin('edge')) throw new Error('signed URL escaped public origins')
 const sigMatch = /[?&]sig=([^&]+)/.exec(signedUrl)
 if (!sigMatch) return ctx.result({ title })
-const sigCap = await seal(h4, 'pg-c3-h4', 'export_signature', { regex: '[?&]sig=([^&]+)' }, 'signed_url')
+const sigCap = await seal(h4, 'pg-c3-h4', 'export_signature', { value: sigMatch[1] }, 'signed_url')
 parsed.pathname = parsed.pathname.replace(\`/files/export/\${cfg.tenantB}\`, \`/files/export/\${cfg.tenantC}\`)
 const terminalPath = parsed.pathname + '?job=' + encodeURIComponent(jobId) + '&tenant=' + encodeURIComponent(cfg.tenantB)
 const terminalControl = await ctx.http_send(parsed.origin + terminalPath + '&sig=invalid', {
@@ -708,7 +708,11 @@ const poll = await ctx.await_async({
 })
 if (!poll.converged || !poll.exchange) return ctx.result({ title })
 const h2 = poll.exchange
-const artifactCap = await seal(h2, 'sf-c2-h2', 'artifact_handle', { regex: 'artifactHandle":"([^"]+)' })
+const h2Frame = h2.text.split('\n').filter((line: string) => line.startsWith('data: '))
+  .map((line: string) => { try { return JSON.parse(line.slice(6)) } catch { return null } })
+  .find((item: any) => item?.type === 'artifact.ready' && item.artifactHandle)
+if (!h2Frame) return ctx.result({ title })
+const artifactCap = await seal(h2, 'sf-c2-h2', 'artifact_handle', { value: String(h2Frame.artifactHandle) })
 const workerAblation = await send('scm', \`/repos/\${projectId}/archive\`, {
   as: 'dual_member',
   role: 'control',
@@ -780,7 +784,7 @@ if (h3.status !== 200) return ctx.result({ title })
 const tokenMatch = /mh_fake_internal_[a-z0-9]+/.exec(h3.text)
 if (!tokenMatch) return ctx.result({ title })
 const token = tokenMatch[0]
-const tokenCap = await seal(h3, 'sf-c3-h3', 'registry_token', { regex: 'mh_fake_internal_[a-z0-9]+' }, 'api_token')
+const tokenCap = await seal(h3, 'sf-c3-h3', 'registry_token', { value: token }, 'api_token')
 const tokenDerived = await ctx.hmac_sign(tokenCap.handle, cfg.tenantB)
 const h4 = await send('api', \`\${cfg.routePrefix}/integrations/registry/sync\`, {
   ...bearer(member, 'member_a'),

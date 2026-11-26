@@ -579,7 +579,7 @@ export class VerifyContext {
     const alg = isPos ? posOpts.alg : r.alg, encoding = isPos ? (encodingArg ?? posOpts.encoding) : r.encoding
     const res = await this.callRpc('crypto.hmacSign', { secretHandle, payload: normalizePayloadStr(isPos ? payloadArg : r.payload), ...(alg ? { alg } : {}), ...(encoding ? { encoding } : {}) }, 30_000) as HmacSignResult
     const handle = res.handle ?? res.derivedHandle ?? res.signature
-    const out = { ...res, signature: res.signature, handle, derivedHandle: res.derivedHandle ?? handle }
+    const out = { ...res, signature: res.signature ?? handle, handle, derivedHandle: res.derivedHandle ?? handle }
     this.recordCrypto(secretHandle, out.exchangeId, out.derivedHandle, out.attestation?.alg ?? alg)
     return out
   }
