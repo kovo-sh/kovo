@@ -22,6 +22,7 @@ import { fileURLToPath } from 'node:url'
 import ipaddr from 'ipaddr.js'
 import { z } from 'zod'
 import type { AnalyzerName } from '../../worker/analyzers.ts'
+import { isSensitiveRepoEntry } from './safety-primitives.ts'
 import {
   VERIFY_RPC_CONTAINER_DIR,
   VERIFY_RPC_CONTEXT_ENV,
@@ -1229,30 +1230,6 @@ export interface PreparedReposMount {
   cleanup(): void
 }
 
-const SENSITIVE_DOT_DIRS = new Set(['.ssh', '.aws', '.gnupg', '.kube', '.docker'])
-const SENSITIVE_EXACT_FILES = new Set([
-  '.git-credentials',
-  '.netrc',
-  '.npmrc',
-  '.pypirc',
-  '.htpasswd',
-  'id_rsa',
-  'id_ed25519',
-  'id_ecdsa',
-  'id_dsa',
-  'github-app.json',
-  'credentials.json',
-  'service-account.json',
-  'vault.json',
-  'vault.key',
-  'token.txt',
-  'secrets.json',
-])
-const SENSITIVE_FILE_EXT_RE = /\.(?:pat|salt|pem|key|p12|pfx|jks|keystore|kdbx|token)$/i
-const SAFE_ENV_TEMPLATE_RE = /^\.env\.(?:example|sample|template|dist|schema)$/i
-const SOURCE_CODE_EXT_RE = /\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs|py|go|rs|java|kt|rb|php|cs|c|h|cc|cpp|hpp|swift|scala|sql|graphql|gql|md|html|css|scss|vue|svelte)$/i
-const GIT_CREDENTIAL_FILE_RE = /(?:^|\/)\.git\/(?:config|credentials|fetch_head)$/i
-
 export const DEFAULT_MAX_STAGE_BYTES = 256 * 1024 * 1024
 const MAX_STAGE_BYTES_ENV_CEILING = 1024 * 1024 * 1024
 export const DEFAULT_MAX_STAGE_FILES = 50_000
@@ -1329,27 +1306,6 @@ function resolveStageLimits(
     Math.floor(options?.maxDepth ?? parsePositiveStageEnvInt(env, 'KOVO_MAX_STAGE_REPO_DEPTH') ?? DEFAULT_MAX_STAGE_DEPTH),
   )
   return { maxBytes, maxFiles, maxInodes, maxDepth }
-}
-
-function isSensitiveRepoEntry(relPosixPath: string, entryName: string, isDir: boolean): boolean {
-  const relLower = relPosixPath.toLowerCase()
-  const nameLower = entryName.toLowerCase()
-  if (isDir) {
-    if (SENSITIVE_DOT_DIRS.has(nameLower)) return true
-    if (relLower === '.git/hooks' || relLower.endsWith('/.git/hooks')) return true
-    return false
-  }
-  if (GIT_CREDENTIAL_FILE_RE.test(relLower)) return true
-  if (SENSITIVE_EXACT_FILES.has(nameLower)) return true
-  if (SENSITIVE_FILE_EXT_RE.test(nameLower)) return true
-  if (nameLower === '.env' || (nameLower.startsWith('.env.') && !SAFE_ENV_TEMPLATE_RE.test(nameLower))) {
-    return true
-  }
-  const parentSegments = relLower.split('/').slice(0, -1)
-  if (parentSegments.includes('credentials') && !SOURCE_CODE_EXT_RE.test(nameLower)) {
-    return true
-  }
-  return false
 }
 
 function resolveStageReposBaseDir(stageDirMode: number, env: NodeJS.ProcessEnv = process.env): string {

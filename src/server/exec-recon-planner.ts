@@ -19,6 +19,8 @@ import {
 import { suppliedResponseLabel } from '../report-summary.ts'
 import { isContinuableStepStatus } from '../step-status.ts'
 import { accessPolicyReviews } from './access-policy-checks.ts'
+import { isSensitiveRepoEntry, isSensitiveRepoRelativePath } from './safety-primitives.ts'
+export { isSensitiveRepoEntry, isSensitiveRepoRelativePath }
 import {
   agentTurn,
   classifyHostTier,
@@ -278,69 +280,6 @@ function buildObservationFromHeaders(
 }
 
 export const VARIANT_SWEEP_MAX_FILE_BYTES = 256 * 1024
-
-const SENSITIVE_DOT_DIRS = new Set(['.ssh', '.aws', '.gnupg', '.kube', '.docker', '.git'])
-const SENSITIVE_EXACT_FILES = new Set([
-  '.git-credentials',
-  '.netrc',
-  '.npmrc',
-  '.pypirc',
-  '.htpasswd',
-  'id_rsa',
-  'id_ed25519',
-  'id_ecdsa',
-  'id_dsa',
-  'github-app.json',
-  'credentials.json',
-  'service-account.json',
-  'vault.json',
-  'vault.key',
-  'token.txt',
-  'secrets.json',
-])
-const SENSITIVE_FILE_EXT_RE = /\.(?:pat|salt|pem|key|p12|pfx|jks|keystore|kdbx|token)$/i
-const SAFE_ENV_TEMPLATE_RE = /^\.env\.(?:example|sample|template|dist|schema)$/i
-const SOURCE_CODE_EXT_RE = /\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs|py|go|rs|java|kt|rb|php|cs|c|h|cc|cpp|hpp|swift|scala|sql|graphql|gql|md|html|css|scss|vue|svelte)$/i
-const GIT_CREDENTIAL_FILE_RE = /(?:^|\/)\.git\/(?:config|credentials|fetch_head)$/i
-
-/**
- * Shared sensitive-entry filter (`H-39` sibling) matching worker-backend's `/repos` staging policy
- * so variant-sweep reads and sibling walks on host `reposDir` never read `.env`, `.env.*.js`,
- * `.ssh/*`, `.git/config`, keys, or credential stores.
- */
-export function isSensitiveRepoEntry(relPosixPath: string, entryName: string, isDir: boolean): boolean {
-  const relLower = relPosixPath.toLowerCase()
-  const nameLower = entryName.toLowerCase()
-  if (isDir) {
-    if (SENSITIVE_DOT_DIRS.has(nameLower)) return true
-    if (relLower === '.git/hooks' || relLower.endsWith('/.git/hooks')) return true
-    return false
-  }
-  if (GIT_CREDENTIAL_FILE_RE.test(relLower)) return true
-  if (SENSITIVE_EXACT_FILES.has(nameLower)) return true
-  if (SENSITIVE_FILE_EXT_RE.test(nameLower)) return true
-  if (nameLower === '.env' || (nameLower.startsWith('.env.') && !SAFE_ENV_TEMPLATE_RE.test(nameLower))) {
-    return true
-  }
-  const parentSegments = relLower.split('/').slice(0, -1)
-  if (parentSegments.includes('credentials') && !SOURCE_CODE_EXT_RE.test(nameLower)) {
-    return true
-  }
-  return false
-}
-
-/** True when any directory segment or the leaf file in `relPosixPath` is sensitive (`H-39`). */
-export function isSensitiveRepoRelativePath(relPosixPath: string): boolean {
-  const cleaned = relPosixPath.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '')
-  if (!cleaned) return false
-  const parts = cleaned.split('/').filter(Boolean)
-  for (let i = 0; i < parts.length - 1; i += 1) {
-    const prefix = parts.slice(0, i + 1).join('/')
-    if (isSensitiveRepoEntry(prefix, parts[i]!, true)) return true
-  }
-  const leaf = parts[parts.length - 1] ?? ''
-  return isSensitiveRepoEntry(cleaned, leaf, false)
-}
 
 function isPathStrictlyInside(canonicalRoot: string, candidatePath: string): boolean {
   const rel = relative(canonicalRoot, candidatePath)

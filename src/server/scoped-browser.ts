@@ -1,6 +1,7 @@
-import { randomBytes, timingSafeEqual } from 'node:crypto'
+import { randomBytes } from 'node:crypto'
 import { containsDestructivePayload } from '../replay-spec.ts'
 import type { BrowserBuiltinCheck, CsrfBind } from '../replay-spec.ts'
+import { constantTimeStringEqual } from './safety-primitives.ts'
 import { BrokerDenied, RequestBroker } from './broker.ts'
 import type { BrokerExchangeResult, Grant } from './broker.ts'
 import { scanSecondOrderMarkers } from './canary-broker.ts'
@@ -830,13 +831,6 @@ function buildDomSinkHookScript(canaryToken: string | null): string {
 export const KOVO_EXECUTION_ATTESTATION_BINDING = '__kovoAttestExecution'
 
 const ATTESTATION_SINK_TAG_RE = /^[A-Za-z0-9_.:-]{1,64}$/
-
-function constantTimeStringEqual(a: string, b: string): boolean {
-  const bufA = Buffer.from(a, 'utf8')
-  const bufB = Buffer.from(b, 'utf8')
-  if (bufA.length !== bufB.length) return false
-  return timingSafeEqual(bufA, bufB)
-}
 
 /** Mint a cryptographically random per-probe nonce on the host (never deterministic). */
 export function mintExecutionAttestationNonce(): string {
