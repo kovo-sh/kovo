@@ -168,6 +168,30 @@ function buildTier3VerifyGateReq(spec: Extract<DeclarativeReplaySpec, { kind: 'r
 
 type ReplayVerificationResult = Awaited<ReturnType<typeof verifyReplaySpec>>
 
+/**
+ * Returns true when this run has live runtime verification available (`kovo_verify` supported by
+ * the active worker backend AND the run is NOT an offline / static-repo-only Tier 0 or `prepared`
+ * audit). On live-target runtime runs, static AST pattern matches cannot distinguish hardened/decoy
+ * controls from runtime-exploitable vulnerabilities and must be recorded as `code_audit_suspect`
+ * facts + proved with `kovo_verify` rather than persisted as findings.
+ */
+export function isLiveRuntimeVerificationRun(
+  run: Pick<Run, 'capabilityTier' | 'sourceMode'>,
+  supportsVerifyScript: boolean,
+): boolean {
+  return supportsVerifyScript && run.capabilityTier > 0 && run.sourceMode !== 'prepared'
+}
+
+export const STATIC_AST_LIVE_TARGET_REJECT_MESSAGE =
+  "Live target is reachable — static_ast_proof cannot be submitted as a finding because static pattern matches cannot prove runtime exploitability or rule out runtime guards. Record static code observations with record_fact(kind='code_audit_suspect') and prove runtime exploitability with kovo_verify instead."
+
+export interface InlineDeferredFindingCandidate {
+  assetId: string
+  finding: Finding
+  sourceOrigins: string[]
+  validFactIds: string[]
+}
+
 
 function deriveReplayOutcomeStatus(spec: DeclarativeReplaySpec, replay: ReplayVerificationResult) {
   const staticSpec = spec.kind === 'static_ast_proof' ? spec : null
@@ -1933,7 +1957,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
   private persistReplayConfirmation(
     run: Run,
     assignment: Assignment,
-    findingRow: typeof findings.$inferSelect,
+    findingRow: Pick<typeof findings.$inferSelect, 'id' | 'assetId' | 'finding'>,
     spec: DeclarativeReplaySpec,
     specRowId: string,
     origins: string[],
@@ -2333,6 +2357,31 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
     const permittedAtAdmission = this.host.approvedOriginsSet(run)
     const { grant, secrets, currentSecrets } = this.host.buildGrant(job, run, permittedAtAdmission)
     const { reposDir } = this.host.projectReposMount(run.projectId)
+
+    if (
+      specRow.spec.kind === 'static_ast_proof'
+      && isLiveRuntimeVerificationRun(run, this.backendSupportsVerifyScript())
+    ) {
+      const current = this.host.check(job)
+      const updatedFinding: Finding = {
+        ...findingRow.finding,
+        status: 'dismissed',
+        verificationTier: undefined,
+        confidence: 'low',
+        reason: STATIC_AST_LIVE_TARGET_REJECT_MESSAGE,
+        verification: 'Dismissed: static_ast_proof is disallowed as a standalone finding on live-target runtime verification runs.',
+      }
+      this.storage.updateProposedFinding(current, findingRow.id, { verificationTier: null, finding: updatedFinding })
+      this.host.completeWorker(
+        job.assignment,
+        current,
+        'Dismissed: static_ast_proof is disallowed on live-target runtime verification runs.',
+        [],
+        undefined,
+        secrets,
+      )
+      return
+    }
 
     await this.ensureCanaryListenerForSpec(specRow.spec)
 
@@ -3265,6 +3314,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
     spec: DeclarativeReplaySpec
     findingId?: string
     replaySpecId?: string
+    deferredCandidate?: InlineDeferredFindingCandidate
     onExchangeObserved?: (curRun: Run, ex: BrokerExchangeResult, exchangeId: string) => void
   }): Promise<{
     findingId?: string
@@ -3298,6 +3348,12 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
         })()
       : params.spec
     const parsed = declarativeReplaySpecSchema.parse(sanitizedSpecInput)
+    if (
+      parsed.kind === 'static_ast_proof'
+      && isLiveRuntimeVerificationRun(curRun, this.backendSupportsVerifyScript())
+    ) {
+      throw new Error(STATIC_AST_LIVE_TARGET_REJECT_MESSAGE)
+    }
     const specOrigins = replaySpecOrigins(parsed)
     const currentApproved = this.host.approvedOriginsSet(curRun)
     if (specOrigins.some(o => !currentApproved.has(o))) {
@@ -3490,18 +3546,46 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
           replaySpecId: updatedSpec.id, sourceOrigins: mergedOrigins, verificationTier: null, finding: nextFindingPatch,
         })
       }
+    } else if (!findingRow && params.deferredCandidate && finalStatus === 'confirmed') {
+      const cand = params.deferredCandidate
+      const mergedOrigins = [...new Set([...cand.sourceOrigins, ...specOrigins])]
+      const { patch } = buildReplayFindingPatch(
+        parsed, replay, cand.finding, finalStatus, verificationTier, 'inline replay', params.currentSecrets(),
+      )
+      const nextFinding: Finding = {
+        ...cand.finding,
+        ...patch,
+        replaySpecId: updatedSpec.id,
+        evidenceIds: [...new Set([...cand.finding.evidenceIds, receipt.id])],
+        exchangeIds: [...new Set([...(cand.finding.exchangeIds ?? []), ...replay.exchangeIds])],
+        scopeRevision: latestRun.scopeRevision,
+      }
+      this.persistReplayConfirmation(
+        latestRun, params.job.assignment,
+        { id: cand.finding.id, assetId: cand.assetId, finding: cand.finding },
+        parsed, updatedSpec.id, mergedOrigins,
+        nextFinding, replay, finalStatus, params.job.assignment.stepId,
+      )
+      for (const fid of cand.validFactIds) {
+        this.storage.addGraphEdge(latestRun.id, { fromKind: 'fact', fromId: fid, toKind: 'finding', toId: cand.finding.id, edgeKind: 'proves' })
+      }
+      this.storage.addGraphEdge(latestRun.id, { fromKind: 'assignment', fromId: params.job.assignment.id, toKind: 'finding', toId: cand.finding.id, edgeKind: 'proves' })
     }
 
     // The persisted row is the single source of truth: a non-confirming attempt may have just
     // demoted an already-confirmed finding (finding.confirmation_conflict). Never report the
     // pre-attempt status in that case.
     const verdictRun = this.storage.run(params.job.assignment.runId)
-    const verdictRow = this.host.resolveInlineVerdictRow(verdictRun.id, findingRow)
+    const persistedFindingRow = findingRow
+      ?? (params.deferredCandidate && finalStatus === 'confirmed'
+        ? findFindingRow(this.storage, verdictRun.id, params.deferredCandidate.finding.id)
+        : undefined)
+    const verdictRow = this.host.resolveInlineVerdictRow(verdictRun.id, persistedFindingRow)
     const verdictStatus = verdictRow?.finding.status ?? finalStatus
     const verdictTier = verdictRow?.verificationTier ?? (verdictStatus === 'confirmed' ? verificationTier : undefined)
     this.host.postVerificationVerdict(verdictRun, {
       replaySpecId: updatedSpec.id,
-      findingId: findingRow?.id ?? params.findingId ?? null,
+      findingId: persistedFindingRow?.id ?? (params.deferredCandidate ? null : (params.findingId ?? null)),
       title: verdictRow?.finding.title ?? parsed.title,
       status: verdictStatus,
       verificationTier: verdictTier,
@@ -3511,7 +3595,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
       attempt: updatedSpec.attemptCount,
     })
     return {
-      findingId: findingRow?.id,
+      findingId: persistedFindingRow?.id,
       replaySpecId: updatedSpec.id,
       attemptCount: updatedSpec.attemptCount,
       status: verdictStatus,
