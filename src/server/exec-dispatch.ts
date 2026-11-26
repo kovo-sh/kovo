@@ -27,6 +27,7 @@ import {
   type NegativeEdgeReason as LedgerNegativeEdgeReason,
 } from './capability-ledger.ts'
 import { normalizeEndpointTemplate } from './dedupe.ts'
+import { registerRunDisposer } from './run-disposers.ts'
 import type { DerivedCapabilityVault } from './derived-custody.ts'
 import { hasDynamicIdSegment, identifierFormsForRoute, intentFamily } from './deterministic-engine.ts'
 import type { ExecCoordinatorTask } from './exec-exchange.ts'
@@ -3834,13 +3835,6 @@ export const MAX_PROVIDER_STALL_RETRIES = 1
  */
 export const PROVIDER_STALL_NO_TOKEN_MS = 28_000
 
-/** Env override for the no-token watchdog (bounded 5–120 s; the product default is 28 s). */
-export function resolveProviderStallNoTokenMs(env: NodeJS.ProcessEnv = process.env): number {
-  const raw = Number(env.KOVO_PROVIDER_NO_TOKEN_MS)
-  if (!Number.isFinite(raw) || raw <= 0) return PROVIDER_STALL_NO_TOKEN_MS
-  return Math.max(5_000, Math.min(120_000, Math.floor(raw)))
-}
-
 /**
  * Per-turn watchdog that fires only after `thresholdMs()` of **no token activity**. `noteToken()`
  * re-arms the full threshold, so streaming turns never trip it; a silent provider stream does.
@@ -3857,13 +3851,13 @@ export class ProviderNoTokenWatchdog {
   private readonly clearTimer: (timer: NodeJS.Timeout) => void
 
   constructor(input: {
-    thresholdMs: () => number
+    thresholdMs?: () => number
     onStall: (info: { turn: number; idleMs: number; thresholdMs: number }) => void
     clock?: () => number
     setTimer?: (fn: () => void, ms: number) => NodeJS.Timeout
     clearTimer?: (timer: NodeJS.Timeout) => void
   }) {
-    this.thresholdMs = input.thresholdMs
+    this.thresholdMs = input.thresholdMs ?? (() => PROVIDER_STALL_NO_TOKEN_MS)
     this.onStall = input.onStall
     this.clock = input.clock ?? (() => Date.now())
     this.setTimer = input.setTimer ?? ((fn, ms) => {
@@ -5702,6 +5696,8 @@ export interface RunOrchestrationState {
   providerStallRetries?: number
   providerStallTimeouts?: number
   providerStallWallSaved?: number
+  providerRetryCounts?: Map<string, number>
+  providerRetriesTotal?: number
   wallClockRotations?: number
   warmSecretEpoch?: string
   warmPoolPolicyRotations?: number
@@ -5967,3 +5963,7 @@ export class RunOrchestrationStateStore {
     })
   }
 }
+
+const autoDisposedRunStates = new Set<WeakRef<RunOrchestrationStateStore>>()
+registerRunDisposer('exec-dispatch:auto-run-states', runId => { for (const r of [...autoDisposedRunStates]) { const s = r.deref(); if (!s) autoDisposedRunStates.delete(r); else s.disposeRun(runId) } })
+export function createAutoDisposedRunState(): RunOrchestrationStateStore { const s = new RunOrchestrationStateStore(); autoDisposedRunStates.add(new WeakRef(s)); return s }

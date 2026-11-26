@@ -79,6 +79,21 @@ export interface StaleDocCitation {
   excerpt: string
 }
 
+export interface ReachabilitySummary {
+  /** Number of declared production entrypoint files seeded for the reachability walk. */
+  entrypoints: number
+  /** Server value exports reachable via value references from declared production entrypoints. */
+  reachable: number
+  /** Server value exports unreachable from production entrypoints, imported only by tests. */
+  testOnly: number
+  /** Server value exports unreachable from both production entrypoints and tests. */
+  unreachable: number
+  /** Sorted keys (`<file>::<symbol>`) classified as test-only by the reachability walk. */
+  testOnlyKeys: string[]
+  /** Sorted keys (`<file>::<symbol>`) classified as unreachable by the reachability walk. */
+  unreachableKeys: string[]
+}
+
 export interface UnwiredCheckResult {
   ok: boolean
   rootDir: string
@@ -97,6 +112,8 @@ export interface UnwiredCheckResult {
   staleKeepUnwired: StaleKeepUnwiredEntry[]
   invalidTicketedAdditions: string[]
   staleDocCitations: StaleDocCitation[]
+  /** Production-entrypoint value-reference reachability walk summary (R3-09; warn-only during rollout). */
+  reachability: ReachabilitySummary
   durationMs: number
 }
 
@@ -222,6 +239,12 @@ interface ParsedFileInfo {
   namespaceProps: Map<string, Set<string>>
   /** Namespace imports used as whole values (e.g. passed to a function, spread, etc.). */
   wholeNamespacesUsed: Set<string>
+  /** Per-symbol value references inside its declaring top-level statement (for reachability BFS). */
+  symbolInternalRefs: Map<string, Set<string>>
+  /** Identifiers referenced by eager top-level module-init statements (run on module load). */
+  moduleInitRefs: Set<string>
+  /** Namespace re-exports (`export * as ns from './x'`): exportedNsName -> targetFile. */
+  namespaceReexports: Map<string, string>
 }
 
 function isProductionEntrypoint(relPath: string): boolean {
@@ -232,6 +255,15 @@ function isProductionEntrypoint(relPath: string): boolean {
     || relPath.startsWith('src/routes/')
     || relPath.startsWith('scripts/')
     || relPath.startsWith('worker/')
+  )
+}
+
+function isReachabilityEntrypoint(relPath: string): boolean {
+  if (TEST_FILE_RE.test(relPath)) return false
+  return (
+    isProductionEntrypoint(relPath)
+    || relPath === 'src/router.tsx'
+    || relPath === 'src/client.tsx'
   )
 }
 
@@ -268,6 +300,9 @@ function parseFileInfo(rootDir: string, relPath: string): ParsedFileInfo {
     sameFileCallers: new Set(),
     namespaceProps: new Map(),
     wholeNamespacesUsed: new Set(),
+    symbolInternalRefs: new Map(),
+    moduleInitRefs: new Set(),
+    namespaceReexports: new Map(),
   }
 
   for (const stmt of sf.statements) {
@@ -314,6 +349,7 @@ function parseFileInfo(rootDir: string, relPath: string): ParsedFileInfo {
         } else if (ts.isNamespaceExport(stmt.exportClause)) {
           info.runtimeDeps.add(target)
           info.declaredValueExports.add(stmt.exportClause.name.text)
+          info.namespaceReexports.set(stmt.exportClause.name.text, target)
           info.starReexports.add(target)
         } else {
           let hasRuntime = false
@@ -462,6 +498,44 @@ function parseFileInfo(rootDir: string, relPath: string): ParsedFileInfo {
         info.sameFileCallers.add(ref)
       }
     }
+
+    // Record per-symbol internal references & eager module-init references for reachability walk.
+    const recordSymbolRefs = (symName: string, refs: ReadonlySet<string>) => {
+      let set = info.symbolInternalRefs.get(symName)
+      if (!set) { set = new Set(); info.symbolInternalRefs.set(symName, set) }
+      for (const r of refs) {
+        if (r !== symName) set.add(r)
+      }
+    }
+    if (ts.isExportAssignment(stmt) && !stmt.isExportEquals) {
+      recordSymbolRefs('default', stmtRefs)
+    } else if (ownNames.size > 0) {
+      const isDefaultExport = hasExportModifier(stmt) && hasDefaultModifier(stmt)
+      for (const symName of ownNames) {
+        recordSymbolRefs(symName, stmtRefs)
+      }
+      if (isDefaultExport) {
+        recordSymbolRefs('default', stmtRefs)
+      }
+      // Variable statements whose initializers execute eagerly (not pure function/arrow defs)
+      // also contribute to moduleInitRefs when the module is loaded.
+      if (ts.isVariableStatement(stmt)) {
+        const allLazyFns = stmt.declarationList.declarations.every(
+          d => d.initializer && (ts.isArrowFunction(d.initializer) || ts.isFunctionExpression(d.initializer)),
+        )
+        if (!allLazyFns) {
+          for (const ref of stmtRefs) info.moduleInitRefs.add(ref)
+        }
+      }
+    } else if (
+      !ts.isImportDeclaration(stmt)
+      && !ts.isExportDeclaration(stmt)
+      && !ts.isInterfaceDeclaration(stmt)
+      && !ts.isTypeAliasDeclaration(stmt)
+      && !(ts.isFunctionDeclaration(stmt) && !stmt.body)
+    ) {
+      for (const ref of stmtRefs) info.moduleInitRefs.add(ref)
+    }
   }
 
   return info
@@ -554,6 +628,7 @@ function analyzeUnwiredExports(files: Map<string, ParsedFileInfo>): {
   liveDocKeys: Set<string>
   unwired: UnwiredExportFinding[]
   declaredBySymbol: Map<string, string[]>
+  testImportersByKey: Map<string, Set<string>>
 } {
   // Build reverse index: for every (file, exportName), trace whether any non-test caller uses it,
   // propagating backward through re-exports (`export { a as b } from './x'`, `export * from './x'`).
@@ -699,7 +774,167 @@ function analyzeUnwiredExports(files: Map<string, ParsedFileInfo>): {
     }
   }
 
-  return { totalServerValueExports, wiredKeys, ownModuleUsedKeys, liveDocKeys, unwired, declaredBySymbol }
+  return { totalServerValueExports, wiredKeys, ownModuleUsedKeys, liveDocKeys, unwired, declaredBySymbol, testImportersByKey }
+}
+
+/**
+ * Production-entrypoint value-reference reachability walk (R3-09).
+ *
+ * Unlike syntactic `prodUsed` (which counts imports from any non-test file, even dead modules,
+ * and filters out `usedInternallyInModule` even when the caller itself is dead), this performs
+ * a symbol-level BFS rooted strictly at declared production entrypoints (`src/server.ts`,
+ * `src/actions.ts`, `src/routes/**`, `src/router.tsx`, `src/client.tsx`, `worker/**`,
+ * `scripts/**`, plus `src/server/execution.ts::Execution`).
+ *
+ * Classifies every declared value export in `src/server/**` into exactly one of:
+ *   - `reachable`: reached via value references / module-init edges from a production entrypoint
+ *   - `testOnly`: NOT reachable from production entrypoints, imported by >=1 test file
+ *   - `unreachable`: NOT reachable from production entrypoints and NOT imported by any test
+ */
+export function analyzeProductionReachability(
+  files: Map<string, ParsedFileInfo>,
+  testImportersByKey: Map<string, Set<string>>,
+): ReachabilitySummary {
+  const loadedModules = new Set<string>()
+  const reachedSymbols = new Set<string>() // key: `${file}::${symbolName}`
+  const symQueue: Array<{ file: string; sym: string }> = []
+
+  const markSymbol = (file: string, sym: string): void => {
+    const key = `${file}::${sym}`
+    if (reachedSymbols.has(key)) return
+    reachedSymbols.add(key)
+    symQueue.push({ file, sym })
+  }
+
+  const loadModule = (file: string): void => {
+    if (loadedModules.has(file)) return
+    const info = files.get(file)
+    if (!info || info.isTest) return
+    loadedModules.add(file)
+    for (const ref of info.moduleInitRefs) {
+      markSymbol(file, ref)
+    }
+    for (const sideTarget of info.sideEffectImports) {
+      loadModule(sideTarget)
+    }
+  }
+
+  const markAllExports = (file: string, seen = new Set<string>()): void => {
+    if (seen.has(file)) return
+    seen.add(file)
+    const info = files.get(file)
+    if (!info || info.isTest) return
+    loadModule(file)
+    for (const exp of info.declaredValueExports) markSymbol(file, exp)
+    for (const exp of info.reexports.keys()) markSymbol(file, exp)
+    for (const starTarget of info.starReexports) markAllExports(starTarget, seen)
+  }
+
+  let entrypoints = 0
+  for (const info of files.values()) {
+    if (!isReachabilityEntrypoint(info.relPath)) continue
+    entrypoints += 1
+    loadModule(info.relPath)
+    for (const exp of info.declaredValueExports) markSymbol(info.relPath, exp)
+    for (const exp of info.reexports.keys()) markSymbol(info.relPath, exp)
+    for (const starTarget of info.starReexports) markAllExports(starTarget)
+  }
+  if (files.has('src/server/execution.ts')) {
+    loadModule('src/server/execution.ts')
+    markSymbol('src/server/execution.ts', 'Execution')
+  }
+
+  while (symQueue.length > 0) {
+    const { file, sym } = symQueue.shift()!
+    const info = files.get(file)
+    if (!info || info.isTest) continue
+    loadModule(file)
+
+    // 1. Named import in `file` -> target module export
+    const namedImp = info.namedImports.get(sym)
+    if (namedImp) {
+      loadModule(namedImp.from)
+      markSymbol(namedImp.from, namedImp.importedName)
+    }
+
+    // 2. Namespace import in `file` -> accessed props or all exports
+    const nsTarget = info.namespaceImports.get(sym)
+    if (nsTarget) {
+      loadModule(nsTarget)
+      if (info.wholeNamespacesUsed.has(sym)) {
+        markAllExports(nsTarget)
+      } else {
+        for (const prop of info.namespaceProps.get(sym) ?? []) {
+          markSymbol(nsTarget, prop)
+        }
+      }
+    }
+
+    // 3. Exported local alias (`export { local as exported }`)
+    const localAlias = info.localExportAliases.get(sym)
+    if (localAlias) {
+      markSymbol(file, localAlias)
+    }
+
+    // 4. Direct re-export (`export { a as b } from './x'`)
+    const reexp = info.reexports.get(sym)
+    if (reexp) {
+      loadModule(reexp.from)
+      markSymbol(reexp.from, reexp.importedName)
+    }
+
+    // 5. Namespace re-export (`export * as ns from './x'`)
+    const nsReexpTarget = info.namespaceReexports.get(sym)
+    if (nsReexpTarget) {
+      markAllExports(nsReexpTarget)
+    }
+
+    // 6. Star re-export passthrough (`export * from './x'`)
+    if (!info.declaredValueExports.has(sym) && !reexp && !localAlias && info.starReexports.size > 0) {
+      for (const starTarget of info.starReexports) {
+        loadModule(starTarget)
+        markSymbol(starTarget, sym)
+      }
+    }
+
+    // 7. Local declaration body references -> follow intra-module call/value edges
+    const internalRefs = info.symbolInternalRefs.get(sym)
+    if (internalRefs) {
+      for (const ref of internalRefs) {
+        markSymbol(file, ref)
+      }
+    }
+  }
+
+  let reachable = 0
+  const testOnlyKeys: string[] = []
+  const unreachableKeys: string[] = []
+
+  const serverFiles = [...files.values()]
+    .filter(f => f.relPath.startsWith('src/server/') && !f.isTest)
+    .sort((a, b) => a.relPath.localeCompare(b.relPath))
+
+  for (const info of serverFiles) {
+    for (const sym of [...info.declaredValueExports].sort()) {
+      const key = `${info.relPath}::${sym}`
+      if (reachedSymbols.has(key)) {
+        reachable += 1
+      } else if ((testImportersByKey.get(key)?.size ?? 0) > 0) {
+        testOnlyKeys.push(key)
+      } else {
+        unreachableKeys.push(key)
+      }
+    }
+  }
+
+  return {
+    entrypoints,
+    reachable,
+    testOnly: testOnlyKeys.length,
+    unreachable: unreachableKeys.length,
+    testOnlyKeys,
+    unreachableKeys,
+  }
 }
 
 const PENDING_DOC_QUALIFIER_RE =
@@ -828,9 +1063,19 @@ export function runUnwiredCheck(options: {
   )
 
   // 2. Unwired / test-only value exports (with own-module noise filtered out)
-  const { totalServerValueExports, wiredKeys, ownModuleUsedKeys, liveDocKeys, unwired, declaredBySymbol } =
-    analyzeUnwiredExports(parsedFiles)
+  const {
+    totalServerValueExports,
+    wiredKeys,
+    ownModuleUsedKeys,
+    liveDocKeys,
+    unwired,
+    declaredBySymbol,
+    testImportersByKey,
+  } = analyzeUnwiredExports(parsedFiles)
   const unwiredKeySet = new Set(unwired.map(u => u.key))
+
+  // 2b. Production-entrypoint reachability walk (R3-09; warn-only during rollout batch)
+  const reachability = analyzeProductionReachability(parsedFiles, testImportersByKey)
 
   const invalidKeepUnwired: string[] = []
   const staleKeepUnwired: StaleKeepUnwiredEntry[] = []
@@ -903,6 +1148,7 @@ export function runUnwiredCheck(options: {
     staleKeepUnwired,
     invalidTicketedAdditions,
     staleDocCitations,
+    reachability,
     durationMs: Date.now() - started,
   }
 }
@@ -1136,7 +1382,9 @@ function main(argv: string[] = process.argv.slice(2)): void {
     + `serverExports=${res.totalServerValueExports}, wired=${res.wiredExportCount}, `
     + `ownModuleOnly=${res.ownModuleOnlyExportCount}, unwired=${res.unwiredExports.length}, `
     + `newUnwired=${res.newUnwiredExports.length}, resolvedBaseline=${res.resolvedBaselineExports.length}, `
-    + `staleKeep=${res.staleKeepUnwired.length}, staleDocCitations=${res.staleDocCitations.length}, ${res.durationMs}ms)`,
+    + `staleKeep=${res.staleKeepUnwired.length}, staleDocCitations=${res.staleDocCitations.length}, `
+    + `reachability=[entrypoints=${res.reachability.entrypoints}, reachable=${res.reachability.reachable}, `
+    + `testOnly=${res.reachability.testOnly}, unreachable=${res.reachability.unreachable}], ${res.durationMs}ms)`,
   )
 
   if (res.proofKernelCyclePresent) {

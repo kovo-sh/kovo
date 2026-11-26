@@ -471,6 +471,9 @@ export class Execution {
   /** Set by stop(); prevents queued microtasks/timers from touching a closed store. */
   private stopped = false
 
+  /** Read-only view of whether `stop()` has been invoked on this Execution instance. */
+  get isStopped(): boolean { return this.stopped }
+
   constructor(storage: Store, options: ExecutionOptions = {}) {
     this.storage = storage
     this.deterministicOnly = options.deterministicOnly === true
@@ -2004,12 +2007,8 @@ export class Execution {
         ? 'staging_isolated'
         : 'phase_a_12pct_cap_75s'
     const modelProfileId = this.deterministicOnly ? null : (profiles[0]?.id ?? null)
-    const backendImage = (this.backend as { image?: unknown } | undefined)?.image
-    const workerImageId = this.backend instanceof LinuxWorkerBackend
-      ? (typeof backendImage === 'string' && backendImage.trim()
-          ? backendImage.trim()
-          : (process.env.KOVO_WORKER_IMAGE?.trim() || 'kovo-worker:v4'))
-      : null
+    const workerImageId = this.backend?.workerImageId ?? null
+    const workerSourceHash = this.backend?.workerSourceHash ?? null
     this.safeEvent(
       run.id,
       'run.effective_config',
@@ -2031,6 +2030,7 @@ export class Execution {
         floorPolicy,
         modelProfileId,
         workerImageId,
+        workerSourceHash,
         sdkVersion: VERIFY_RPC_SDK_VERSION,
       },
     )

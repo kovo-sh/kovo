@@ -57,7 +57,7 @@ import {
 } from './dedupe.ts'
 import type { ExecBoardManager } from './exec-board.ts'
 import {
-  ProviderNoTokenWatchdog,
+  ProviderNoTokenWatchdog, createAutoDisposedRunState, type RunOrchestrationStateStore,
   buildBolaTestQueue,
   classifyWorkerErrorToStepStatus,
   collectAllPages,
@@ -441,6 +441,7 @@ export function assertSafeParamName(name: string, fieldLabel = 'paramName'): str
 }
 
 export interface ExecWorkerHost extends ExecCoreServices {
+  runState?: RunOrchestrationStateStore
   personaAuth: PersonaAuthManager
   board: ExecBoardManager
   verifier: ExecVerifier
@@ -504,13 +505,12 @@ export interface ExecWorkerHost extends ExecCoreServices {
 
 export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
   private readonly turnStateByAssignment = new Map<string, {
-    turn: number
-    toolCallsInTurn: number
-    totalToolCalls: number
+    turn: number; toolCallsInTurn: number; totalToolCalls: number
     lastProviderFailure?: ProviderFailureError
   }>()
-  private readonly providerRetryCountsByRun = new Map<string, Map<string, number>>()
-  private readonly providerRetriesTotalByRun = new Map<string, number>()
+  private readonly runState = this.host.runState ?? createAutoDisposedRunState()
+  private readonly providerRetryCountsByRun = this.runState.mapView('providerRetryCounts')
+  private readonly providerRetriesTotalByRun = this.runState.mapView('providerRetriesTotal')
 
   private pauseRunForProviderCircuit(
     run: Run,

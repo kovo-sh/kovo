@@ -30,10 +30,16 @@ JOBS_OVERRIDE=""
 JSON_OUT=0
 SKIP_GIT_CAP_CHECK=0
 SHARD_SPEC=""
+BACKLOG_PATH=""
+PREV_QUARANTINE_PATH=""
+FORBID_KERNEL_VERDICTS=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --quarantine) QUARANTINE_PATH="${2:?--quarantine requires a path}"; shift 2;;
+    --backlog) BACKLOG_PATH="${2:?--backlog requires a path}"; shift 2;;
+    --prev-quarantine) PREV_QUARANTINE_PATH="${2:?--prev-quarantine requires a path}"; shift 2;;
+    --forbid-kernel-verdicts) FORBID_KERNEL_VERDICTS=1; shift;;
     --suites-only) SUITES_ONLY=1; shift;;
     --check-only) CHECK_ONLY=1; SUITES_ONLY=1; shift;;
     --now) NOW_DATE="${2:?--now requires YYYY-MM-DD}"; shift 2;;
@@ -142,6 +148,9 @@ export FAST_TEST_JSON="$JSON_OUT"
 export FAST_TEST_SKIP_GIT_CAP="$SKIP_GIT_CAP_CHECK"
 export FAST_TEST_SHARD_INDEX="$SHARD_INDEX"
 export FAST_TEST_SHARD_TOTAL="$SHARD_TOTAL"
+export FAST_TEST_BACKLOG="$BACKLOG_PATH"
+export FAST_TEST_PREV_QUARANTINE="$PREV_QUARANTINE_PATH"
+export FAST_TEST_FORBID_KERNEL_VERDICTS="$FORBID_KERNEL_VERDICTS"
 
 node --input-type=module <<'EOF'
 import { execFile, execFileSync } from 'node:child_process'
@@ -154,10 +163,18 @@ const tiersMod = await import(pathToFileURL(resolve(repoRoot, 'scripts/test-tier
 const profileMod = await import(pathToFileURL(resolve(repoRoot, 'scripts/runtime-profile.ts')).href)
 
 const {
+  DEFAULT_STREAM_BACKLOG_REL,
   isCoreGateInvariantTestFile,
-  isKernelOrCriticalTestFile,
+  isExplicitVerdictQuarantineEntry,
   isGenericTriageOwner,
+  isKernelOrCriticalTestFile,
+  isKernelVerdictTriageClass,
+  isLiveBacklogOwner,
   MAX_KERNEL_QUARANTINE_DAYS,
+  readStreamBacklog,
+  readTestFileTags,
+  VALID_QUARANTINE_ASSERTION_KINDS,
+  VALID_QUARANTINE_TRIAGE_CLASSES,
 } = tiersMod
 
 const {
@@ -173,6 +190,9 @@ const testsDirAbs = resolve(testsDirArg)
 const checkOnly = process.env.FAST_TEST_CHECK_ONLY === '1'
 const jsonOut = process.env.FAST_TEST_JSON === '1'
 const quarantinePath = (process.env.FAST_TEST_QUARANTINE || '').trim()
+const backlogPathArg = (process.env.FAST_TEST_BACKLOG || '').trim()
+const prevQuarantineArg = (process.env.FAST_TEST_PREV_QUARANTINE || '').trim()
+const forbidKernelVerdicts = process.env.FAST_TEST_FORBID_KERNEL_VERDICTS === '1'
 const todayStr = (process.env.FAST_TEST_NOW || '').trim() || new Date().toISOString().slice(0, 10)
 const jobs = Math.max(1, Number(process.env.FAST_TEST_JOBS) || 8)
 const skipGitCapCheck = process.env.FAST_TEST_SKIP_GIT_CAP === '1' || !isDefaultTestsDir
@@ -229,21 +249,70 @@ function diffCalendarDays(laterIso, earlierIso) {
   return Math.round((t1 - t2) / 86_400_000)
 }
 
-function readGitV2QuarantineCap(ref, relPath) {
+function parseQuarantineSnapshot(label, raw) {
+  try {
+    const parsed = JSON.parse(raw)
+    if (!parsed || parsed.version !== 2) return null
+    const entriesByKey = new Map()
+    if (Array.isArray(parsed.entries)) {
+      for (const e of parsed.entries) {
+        if (!e || typeof e !== 'object') continue
+        const file = typeof e.file === 'string' ? e.file.trim() : ''
+        const testName = typeof e.testName === 'string' ? e.testName.trim() : ''
+        if (!file || !testName) continue
+        entriesByKey.set(`${file}\0${testName}`, {
+          expires: typeof e.expires === 'string' ? e.expires.trim() : '',
+          triageClass: typeof e.triageClass === 'string' ? e.triageClass.trim() : '',
+        })
+      }
+    }
+    return {
+      label,
+      maxQuarantinedCases: Number.isInteger(parsed.maxQuarantinedCases) ? parsed.maxQuarantinedCases : null,
+      maxKernelVerdictQuarantinedCases: Number.isInteger(parsed.maxKernelVerdictQuarantinedCases)
+        ? parsed.maxKernelVerdictQuarantinedCases
+        : null,
+      entriesByKey,
+    }
+  } catch {
+    return null
+  }
+}
+
+function readGitV2QuarantineSnapshot(ref, relPath) {
   try {
     const raw = execFileSync('git', ['show', `${ref}:${relPath}`], {
       cwd: repoRoot,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
     })
-    const parsed = JSON.parse(raw)
-    if (parsed && parsed.version === 2 && Number.isInteger(parsed.maxQuarantinedCases)) {
-      return parsed.maxQuarantinedCases
-    }
+    return parseQuarantineSnapshot(ref, raw)
   } catch {
     // Ref or file absent in git history; ignore.
   }
   return null
+}
+
+function loadPreviousQuarantineSnapshots(absQ) {
+  const snapshots = []
+  if (prevQuarantineArg) {
+    const absPrev = resolve(prevQuarantineArg)
+    if (existsSync(absPrev)) {
+      const snap = parseQuarantineSnapshot(prevQuarantineArg, readFileSync(absPrev, 'utf8'))
+      if (snap) snapshots.push(snap)
+    } else {
+      errors.push(`Previous quarantine snapshot not found: ${prevQuarantineArg}`)
+    }
+    return snapshots
+  }
+  if (!skipGitCapCheck) {
+    const relQ = relative(repoRoot, absQ).split(sep).join(posix.sep)
+    for (const ref of ['HEAD', 'main']) {
+      const snap = readGitV2QuarantineSnapshot(ref, relQ)
+      if (snap) snapshots.push(snap)
+    }
+  }
+  return snapshots
 }
 
 const errors = []
@@ -254,14 +323,28 @@ const topLevelGlob = allDiscovered.filter(f => /^tests\/[^/]+\.test\.ts$/.test(f
 const nestedFiles = allDiscovered.filter(f => !/^tests\/[^/]+\.test\.ts$/.test(f))
 const discoveredSet = new Set(allDiscovered)
 
-// 2. Validate QUARANTINE.json (schema v2: per-case entries)
+// 2. Validate QUARANTINE.json (schema v2: per-case entries + R3-06 hardened rules)
 // Map<file, Map<testName, entry>>
 const quarantinedByFile = new Map()
 const seenCaseKeys = new Set()
 let maxQuarantinedCases = null
+let maxKernelVerdictQuarantinedCases = null
 let totalQuarantinedCases = 0
 let earliestExpiry = null
 let kernelQuarantinedCases = 0
+let kernelVerdictQuarantinedCases = 0
+
+const backlogCheckActive = Boolean(backlogPathArg) || isDefaultTestsDir
+const backlogRel = backlogPathArg || DEFAULT_STREAM_BACKLOG_REL
+let backlogRows = []
+if (quarantinePath && backlogCheckActive) {
+  const absBacklog = resolve(repoRoot, backlogRel)
+  if (!existsSync(absBacklog)) {
+    errors.push(`Stream backlog file not found: ${backlogRel}`)
+  } else {
+    backlogRows = readStreamBacklog(absBacklog, repoRoot)
+  }
+}
 
 if (quarantinePath) {
   const absQ = resolve(quarantinePath)
@@ -294,13 +377,38 @@ if (quarantinePath) {
           errors.push(`${quarantinePath}: maxQuarantinedCases must be a non-negative integer`)
         }
 
-        if (!skipGitCapCheck && maxQuarantinedCases !== null && parsed.version === 2) {
-          const relQ = relative(repoRoot, absQ).split(sep).join(posix.sep)
-          for (const ref of ['HEAD', 'main']) {
-            const prevCap = readGitV2QuarantineCap(ref, relQ)
-            if (prevCap !== null && maxQuarantinedCases > prevCap) {
+        if (parsed.maxKernelVerdictQuarantinedCases !== undefined) {
+          if (
+            Number.isInteger(parsed.maxKernelVerdictQuarantinedCases) &&
+            parsed.maxKernelVerdictQuarantinedCases >= 0
+          ) {
+            maxKernelVerdictQuarantinedCases = parsed.maxKernelVerdictQuarantinedCases
+          } else {
+            errors.push(`${quarantinePath}: maxKernelVerdictQuarantinedCases must be a non-negative integer`)
+          }
+        }
+
+        const prevSnapshots = parsed.version === 2 ? loadPreviousQuarantineSnapshots(absQ) : []
+
+        if (maxQuarantinedCases !== null && parsed.version === 2) {
+          for (const prev of prevSnapshots) {
+            if (prev.maxQuarantinedCases !== null && maxQuarantinedCases > prev.maxQuarantinedCases) {
               errors.push(
-                `${quarantinePath}: quarantine cap grew (${maxQuarantinedCases} > ${prevCap} on ${ref}); maxQuarantinedCases may only decrease`,
+                `${quarantinePath}: quarantine cap grew (${maxQuarantinedCases} > ${prev.maxQuarantinedCases} on ${prev.label}); maxQuarantinedCases may only decrease`,
+              )
+              break
+            }
+          }
+        }
+
+        if (maxKernelVerdictQuarantinedCases !== null && parsed.version === 2) {
+          for (const prev of prevSnapshots) {
+            if (
+              prev.maxKernelVerdictQuarantinedCases !== null &&
+              maxKernelVerdictQuarantinedCases > prev.maxKernelVerdictQuarantinedCases
+            ) {
+              errors.push(
+                `${quarantinePath}: kernel verdict quarantine cap grew (${maxKernelVerdictQuarantinedCases} > ${prev.maxKernelVerdictQuarantinedCases} on ${prev.label}); maxKernelVerdictQuarantinedCases may only decrease`,
               )
               break
             }
@@ -334,6 +442,8 @@ if (quarantinePath) {
             const effectiveOwner = ownerStream || legacyOwner
             const reason = typeof e.reason === 'string' ? e.reason.trim() : ''
             const expires = typeof e.expires === 'string' ? e.expires.trim() : ''
+            const triageClass = typeof e.triageClass === 'string' ? e.triageClass.trim() : ''
+            const assertionKind = typeof e.assertionKind === 'string' ? e.assertionKind.trim() : ''
 
             if (!file) {
               errors.push(`${quarantinePath}: entries[${i}].file must be a non-empty string`)
@@ -345,6 +455,16 @@ if (quarantinePath) {
             }
             if (e.assertionLocation !== undefined && (typeof e.assertionLocation !== 'string' || !assertionLocation)) {
               errors.push(`${quarantinePath}: entries[${i}] (${file || 'unknown'}) invalid 'assertionLocation' (must be non-empty string if provided)`)
+            }
+            if (e.triageClass !== undefined && (!triageClass || !VALID_QUARANTINE_TRIAGE_CLASSES.has(triageClass))) {
+              errors.push(
+                `${quarantinePath}: entries[${i}] (${file || 'unknown'}) invalid 'triageClass' '${String(e.triageClass)}' (expected one of: ${[...VALID_QUARANTINE_TRIAGE_CLASSES].join(', ')})`,
+              )
+            }
+            if (e.assertionKind !== undefined && (!assertionKind || !VALID_QUARANTINE_ASSERTION_KINDS.has(assertionKind))) {
+              errors.push(
+                `${quarantinePath}: entries[${i}] (${file || 'unknown'}) invalid 'assertionKind' '${String(e.assertionKind)}' (expected one of: ${[...VALID_QUARANTINE_ASSERTION_KINDS].join(', ')})`,
+              )
             }
             if (!effectiveOwner) {
               errors.push(`${quarantinePath}: entries[${i}] (${file || 'unknown'}) missing required non-empty 'owner' ('ownerStream')`)
@@ -368,10 +488,27 @@ if (quarantinePath) {
               }
             }
 
+            if (file && testName && expiresValid && prevSnapshots.length > 0) {
+              const caseKeyForHistory = `${file}\0${testName}`
+              for (const prev of prevSnapshots) {
+                const prevEntry = prev.entriesByKey.get(caseKeyForHistory)
+                if (prevEntry && isValidIsoDate(prevEntry.expires) && expires > prevEntry.expires) {
+                  errors.push(
+                    `${quarantinePath}: quarantine expiry extended for ${file} :: ${testName} (${prevEntry.expires} -> ${expires} vs ${prev.label}); quarantine expiries may never increase`,
+                  )
+                  break
+                }
+              }
+            }
+
             if (file) {
+              const absTestFile = isDefaultTestsDir ? resolve(repoRoot, file) : join(testsDirAbs, file.replace(/^tests\//, ''))
+              const isTaggedKernel = existsSync(absTestFile) && readTestFileTags(absTestFile).kernel
+              const isKernelOrCritical = isKernelOrCriticalTestFile(file) || isTaggedKernel
+
               if (isCoreGateInvariantTestFile(file)) {
                 errors.push(`${quarantinePath}: core gate invariant suite ${file} cannot be quarantined`)
-              } else if (isKernelOrCriticalTestFile(file)) {
+              } else if (isKernelOrCritical) {
                 kernelQuarantinedCases += 1
                 if (expiresValid && isValidIsoDate(todayStr)) {
                   const days = diffCalendarDays(expires, todayStr)
@@ -385,6 +522,30 @@ if (quarantinePath) {
                   errors.push(
                     `${quarantinePath}: kernel/critical suite ${file}${testName ? ` :: ${testName}` : ''} forbids generic triage owner '${effectiveOwner}'; assign a concrete ownerStream (e.g. triage-kernel-<slug>)`,
                   )
+                } else if (effectiveOwner && backlogCheckActive && !isLiveBacklogOwner(effectiveOwner, backlogRows)) {
+                  errors.push(
+                    `${quarantinePath}: kernel/critical suite ${file}${testName ? ` :: ${testName}` : ''} ownerStream '${effectiveOwner}' does not resolve to a live (ready/active) row in ${backlogRel}`,
+                  )
+                }
+                if (isExplicitVerdictQuarantineEntry({ testName, assertionKind })) {
+                  errors.push(
+                    `${quarantinePath}: kernel/critical verdict assertion ${file}${testName ? ` :: ${testName}` : ''} cannot be quarantined; only non-verdict/prose assertions may be quarantined`,
+                  )
+                }
+                if (backlogCheckActive && !triageClass) {
+                  errors.push(
+                    `${quarantinePath}: kernel/critical suite ${file}${testName ? ` :: ${testName}` : ''} missing required 'triageClass' (run scripts/triage-quarantine.ts)`,
+                  )
+                }
+                if (isKernelVerdictTriageClass(triageClass)) {
+                  kernelVerdictQuarantinedCases += 1
+                  const caseKeyCheck = `${file}\0${testName}`
+                  const existedPreviously = prevSnapshots.some(s => s.entriesByKey.has(caseKeyCheck))
+                  if (forbidKernelVerdicts || (prevSnapshots.length > 0 && !existedPreviously)) {
+                    errors.push(
+                      `${quarantinePath}: kernel/critical verdict assertion ${file}${testName ? ` :: ${testName}` : ''} (triageClass=${triageClass}) cannot be quarantined; only non-verdict/prose assertions may be quarantined`,
+                    )
+                  }
                 }
               }
 
@@ -409,10 +570,29 @@ if (quarantinePath) {
                     ownerStream: effectiveOwner,
                     reason,
                     expires,
+                    triageClass: triageClass || undefined,
+                    assertionKind: assertionKind || undefined,
                   })
                 }
               }
             }
+          }
+
+          if (
+            maxKernelVerdictQuarantinedCases !== null &&
+            kernelVerdictQuarantinedCases > maxKernelVerdictQuarantinedCases
+          ) {
+            errors.push(
+              `${quarantinePath}: kernel verdict quarantine cap exceeded (${kernelVerdictQuarantinedCases} > maxKernelVerdictQuarantinedCases=${maxKernelVerdictQuarantinedCases}); retire existing verdict debt instead of adding new entries`,
+            )
+          } else if (
+            backlogCheckActive &&
+            kernelVerdictQuarantinedCases > 0 &&
+            maxKernelVerdictQuarantinedCases === null
+          ) {
+            errors.push(
+              `${quarantinePath}: missing required monotone cap 'maxKernelVerdictQuarantinedCases' for ${kernelVerdictQuarantinedCases} legacy kernel verdict quarantine entries`,
+            )
           }
         }
       }
@@ -464,8 +644,10 @@ if (errors.length > 0) {
       quarantinedCases: totalQuarantinedCases,
       quarantinedFiles: quarantinedFileCount,
       kernelQuarantinedCases,
+      kernelVerdictQuarantinedCases,
       maxQuarantined: maxQuarantinedCases,
       maxQuarantinedCases,
+      maxKernelVerdictQuarantinedCases,
       orphans: orphanFiles,
       errors,
     }, null, 2))
@@ -511,15 +693,17 @@ if (checkOnly) {
       quarantinedCases: totalQuarantinedCases,
       quarantinedFiles: quarantinedFileCount,
       kernelQuarantinedCases,
+      kernelVerdictQuarantinedCases,
       maxQuarantined: maxQuarantinedCases,
       maxQuarantinedCases,
+      maxKernelVerdictQuarantinedCases,
       earliestExpiry,
       orphans: [],
       errors: [],
     }, null, 2))
   } else {
     const qNote = quarantinePath
-      ? `, ${totalQuarantinedCases}/${maxQuarantinedCases} quarantined cases across ${quarantinedFileCount} files (${kernelQuarantinedCases} kernel/critical, earliest expiry ${earliestExpiry || 'n/a'})`
+      ? `, ${totalQuarantinedCases}/${maxQuarantinedCases} quarantined cases across ${quarantinedFileCount} files (${kernelQuarantinedCases} kernel/critical, ${kernelVerdictQuarantinedCases} legacy kernel verdict, earliest expiry ${earliestExpiry || 'n/a'})`
       : ''
     const shardNote = shardActive ? `, shard ${shardIndex}/${shardTotal}: ${selectedRunFiles.length} files` : ''
     console.log(

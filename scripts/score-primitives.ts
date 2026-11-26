@@ -43,7 +43,7 @@ export interface ScorecardReadMeta {
   mode?: string
   llm?: ScorecardLlmMode
   durationMs?: number
-  costUsd?: number
+  costUsd?: number | null
   /** Human-readable failure reason from child logs. */
   error?: string
 }
@@ -75,7 +75,8 @@ export interface NormalizedScorecardCell {
   rawPrecision: number | null
   /** Conservative strict precision (charges misclassifications + contract leaks), or null on empty/failed. */
   strictPrecision: number | null
-  costUsd: number
+  /** Observed spend in USD: `0` for `--no-llm` when absent; `null` when agentic cost telemetry is missing. */
+  costUsd: number | null
   durationMs: number
   benchmarkVersion: string | null
   effectiveConfigHash: string | null
@@ -102,7 +103,7 @@ export interface BuildLedgerRowInput {
   certifying?: boolean
   reportable?: boolean
   validUnplantedCount?: number
-  costUsd?: number
+  costUsd?: number | null
   durationMs?: number
   siteOutcomes?: Record<string, string>
   notes?: string[]
@@ -130,6 +131,21 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function finiteNumberOrNull(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+/**
+ * Resolve honest cost telemetry (R3-09):
+ *  - Returns the first finite non-negative cost value when telemetry is present.
+ *  - When cost telemetry is absent: returns `0` ONLY for `'deterministic-no-llm'` runs
+ *    (which genuinely invoke no LLM), and `null` for `'agentic'` runs — never coercing
+ *    missing agentic spend to `0`.
+ */
+function resolveHonestCostUsd(llm: ScorecardLlmMode, ...candidates: readonly unknown[]): number | null {
+  for (const cand of candidates) {
+    const n = finiteNumberOrNull(cand)
+    if (n !== null) return Math.max(0, n)
+  }
+  return llm === 'deterministic-no-llm' ? 0 : null
 }
 
 function nonNegativeIntOrNull(value: unknown): number | null {
@@ -224,6 +240,7 @@ export class ScorecardReader {
       reasons.push('missing_or_malformed_scorecard')
       const seed = meta.seed ?? 0
       const { seedSet, split } = normalizeSplit(meta.split, undefined, seed, false, meta.split)
+      const llm = meta.llm ?? 'agentic'
       return {
         state: 'failed_inert',
         status: 'INVALID',
@@ -236,7 +253,7 @@ export class ScorecardReader {
         seedSet,
         split,
         mode: meta.mode ?? 'grey-box',
-        llm: meta.llm ?? 'agentic',
+        llm,
         targets: 0,
         confirmed: 0,
         recall: null,
@@ -248,7 +265,7 @@ export class ScorecardReader {
         headlinePrecision: null,
         rawPrecision: null,
         strictPrecision: null,
-        costUsd: Math.max(0, finiteNumberOrNull(meta.costUsd) ?? 0),
+        costUsd: resolveHonestCostUsd(llm, meta.costUsd),
         durationMs: Math.max(0, finiteNumberOrNull(meta.durationMs) ?? 0),
         benchmarkVersion: null,
         effectiveConfigHash: null,
@@ -326,10 +343,7 @@ export class ScorecardReader {
       nonNegativeIntOrNull(meta.contractLeaks) ?? nonNegativeIntOrNull(raw.contractLeaks) ?? 0,
     )
 
-    const costUsd = Math.max(
-      0,
-      finiteNumberOrNull(raw.totalCostUsd ?? raw.costUsd) ?? meta.costUsd ?? 0,
-    )
+    const costUsd = resolveHonestCostUsd(llm, raw.totalCostUsd, raw.costUsd, meta.costUsd)
     const durationMs = Math.max(
       0,
       finiteNumberOrNull(raw.durationMs ?? raw.wallMs) ?? meta.durationMs ?? 0,
@@ -481,6 +495,12 @@ export function buildLedgerRow(input: BuildLedgerRowInput): LedgerRow {
   const rawPrecision = isFailed ? null : cell.rawPrecision
   const strictPrecision = isFailed ? null : cell.strictPrecision
 
+  const resolvedLlm = input.llm ?? cell.llm
+  const resolvedCostUsd: number | null =
+    input.costUsd === null
+      ? null
+      : resolveHonestCostUsd(resolvedLlm, input.costUsd, cell.costUsd)
+
   const row: LedgerRow = {
     schemaVersion: LEDGER_SCHEMA_VERSION,
     recordedAt: input.recordedAt ?? new Date().toISOString(),
@@ -493,7 +513,7 @@ export function buildLedgerRow(input: BuildLedgerRowInput): LedgerRow {
     app: input.app ?? cell.app,
     split: input.split ?? cell.split,
     mode: input.mode ?? cell.mode,
-    llm: input.llm ?? cell.llm,
+    llm: resolvedLlm,
     seed: input.seed ?? cell.seed,
     repeat: input.repeat ?? 1,
     certifying: Boolean(input.certifying) && !isFailed,
@@ -510,7 +530,7 @@ export function buildLedgerRow(input: BuildLedgerRowInput): LedgerRow {
     decoyFalsePositives: cell.decoyFalsePositives,
     unmatchedFalsePositives: cell.unmatchedFalsePositives,
     ...(input.validUnplantedCount !== undefined ? { validUnplantedCount: input.validUnplantedCount } : {}),
-    costUsd: input.costUsd ?? cell.costUsd,
+    costUsd: resolvedCostUsd,
     ...(input.durationMs !== undefined || cell.durationMs > 0
       ? { durationMs: input.durationMs ?? cell.durationMs }
       : {}),

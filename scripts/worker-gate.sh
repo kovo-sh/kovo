@@ -44,10 +44,24 @@ run() { step "$1"; shift; if "$@"; then :; else echo "FAILED: $1" >&2; fail=1; f
 # 1. Fast static lints & structural wiring invariants (<2s total).
 run "v8 anti-contamination lint" node scripts/check-v8-contamination.ts
 run "fixture-contamination ratchet lint" node scripts/check-fixture-contamination.ts
-if [[ -n "${KOVO_CONTRACT_BASE:-}" ]]; then
-  run "contract-change trailer lint" node scripts/check-contract-change.ts --base "$KOVO_CONTRACT_BASE"
+run "direct DB writes ratchet" node scripts/check-direct-db-writes.ts
+run "run-scoped state ratchet" node scripts/check-run-scoped-state.ts
+run "clone & safety-primitive dedup ratchet" node scripts/check-clones.ts
+run "function growth & file size baseline ratchet" node scripts/check-function-growth.ts --baseline
+run "test-shape source-text regex ratchet" node scripts/check-test-shape.ts
+CONTRACT_BASE="${KOVO_CONTRACT_BASE:-}"
+if [[ -n "$CONTRACT_BASE" ]]; then
+  run "contract-change trailer lint" node scripts/check-contract-change.ts --base "$CONTRACT_BASE"
+  run "verdict-flip & gate-repair guard" node scripts/check-verdict-flip.ts --base "$CONTRACT_BASE"
+  run "fix provenance trailer guard" node scripts/check-fix-provenance.ts --base "$CONTRACT_BASE"
 else
   run "contract-change trailer lint" node scripts/check-contract-change.ts
+  run "verdict-flip & gate-repair guard" node scripts/check-verdict-flip.ts
+  if [[ "$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)" != "main" ]] && git rev-parse --verify main^{commit} >/dev/null 2>&1; then
+    run "fix provenance trailer guard" node scripts/check-fix-provenance.ts --base main
+  else
+    run "fix provenance trailer guard" node scripts/check-fix-provenance.ts --head
+  fi
 fi
 
 step "dispatch funnel wiring invariant"
