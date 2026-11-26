@@ -30,8 +30,8 @@
 import { execFileSync } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import {
-  chmodSync, cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync,
-  symlinkSync, writeFileSync,
+  chmodSync, cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync,
+  writeFileSync,
 } from 'node:fs'
 import { isAbsolute, join, resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
@@ -56,7 +56,7 @@ import {
   Execution,
 } from '../src/server/execution.ts'
 import { projectReposDir } from '../src/server/github-connector.ts'
-import { privateModelProfiles } from '../src/server/model-settings.ts'
+import { inspectModelProfileLoad, privateModelProfiles } from '../src/server/model-settings.ts'
 import type { ResolvedModelProfile } from '../src/server/model-settings.ts'
 import { createProjectPersona, resolveRunPersonas } from '../src/server/persona-vault.ts'
 import type { NamedSecret } from '../src/server/redact.ts'
@@ -231,7 +231,8 @@ Flags:
                           noun/action route wordlist (local-lab convenience). Only
                           target-discovered/declared surface is probed.
   --isolate-data-dir      per-cell data dir initialized from --data-dir: copies only
-                          enabled model_profiles rows and symlinks credentials/
+                          enabled model_profiles rows and reads host credentials via
+                          KOVO_CREDENTIALS_DIR (read-only, no symlink, key not copied)
                           (default: on when --concurrency > 1)
   --keep-data-dirs        keep per-cell isolated data dirs after grading (default:
                           remove them)
@@ -272,8 +273,9 @@ Environment:
 
 Parallel agentic matrix:
   --concurrency 3 --isolate-data-dir  gives each cell its own Store under
-  <out-dir>/data/<cell>/ with copied profile metadata and a credentials symlink,
-  so cells never contend for the source data-dir lock. The key is never copied.
+  <out-dir>/data/<cell>/ with copied profile metadata and reads the real host
+  credentials directory via KOVO_CREDENTIALS_DIR (no symlink, key never copied),
+  so cells never contend for the source data-dir lock.
   --worker-concurrency controls worker slots *inside* each cell and is unrelated
   to how many cells run in parallel.
 
@@ -1440,9 +1442,50 @@ export function concurrencyMeta(
   }
 }
 
-export interface IsolatedDataDirResult {  directory: string
+export interface IsolatedDataDirResult {
+  directory: string
   source: string
+  credentialsDir: string
   profileNames: string[]
+}
+
+let credentialsDirScopeCount = 0
+let credentialsDirScopePrev: string | undefined
+let credentialsDirScopeOwned = false
+
+/**
+ * Ref-counted helper that binds `KOVO_CREDENTIALS_DIR` to the real host credentials directory
+ * while one or more isolated benchmark cells run concurrently in this process.
+ * Respects any pre-existing explicit `KOVO_CREDENTIALS_DIR` set by the caller.
+ */
+export function acquireCredentialsDirEnv(credentialsDir: string): () => void {
+  const resolved = resolve(credentialsDir)
+  if (credentialsDirScopeCount === 0) {
+    credentialsDirScopePrev = process.env.KOVO_CREDENTIALS_DIR
+    if (!credentialsDirScopePrev?.trim()) {
+      process.env.KOVO_CREDENTIALS_DIR = resolved
+      credentialsDirScopeOwned = true
+    } else {
+      credentialsDirScopeOwned = false
+    }
+  } else if (credentialsDirScopeOwned) {
+    process.env.KOVO_CREDENTIALS_DIR = resolved
+  }
+  credentialsDirScopeCount += 1
+  let released = false
+  return () => {
+    if (released) return
+    released = true
+    credentialsDirScopeCount = Math.max(0, credentialsDirScopeCount - 1)
+    if (credentialsDirScopeCount === 0) {
+      if (credentialsDirScopeOwned) {
+        if (credentialsDirScopePrev === undefined) delete process.env.KOVO_CREDENTIALS_DIR
+        else process.env.KOVO_CREDENTIALS_DIR = credentialsDirScopePrev
+      }
+      credentialsDirScopePrev = undefined
+      credentialsDirScopeOwned = false
+    }
+  }
 }
 
 /** Per-cell isolation is explicit, or implicit for a parallel matrix with a source data dir. */
@@ -1450,10 +1493,31 @@ export function shouldIsolateDataDir(args: Pick<RealisticArgs, 'isolateDataDir' 
   return Boolean(!args.noLlm && args.dataDir && (args.isolateDataDir || args.concurrency > 1))
 }
 
+function assertValidSourceCredentialsDir(sourceCredentials: string, label: string): void {
+  let dirInfo
+  try {
+    dirInfo = lstatSync(sourceCredentials)
+  } catch {
+    throw new PreflightError(`${label} has no credentials dir: ${sourceCredentials}`)
+  }
+  if (dirInfo.isSymbolicLink()) {
+    throw new PreflightError(`${label} credentials dir must not be a symbolic link: ${sourceCredentials}`)
+  }
+  if (!dirInfo.isDirectory()) {
+    throw new PreflightError(`${label} credentials path is not a directory: ${sourceCredentials}`)
+  }
+  const modeBits = dirInfo.mode & 0o7777
+  if (modeBits !== 0o700 && modeBits !== 0o500) {
+    throw new PreflightError(`${label} credentials dir must be owner-only (mode 0700 or 0500): ${sourceCredentials}`)
+  }
+}
+
 /**
- * Create a per-cell Kovo Hunter Store from a source data dir without copying the key:
- * only enabled model_profiles rows + the workspace identity are copied; credentials/
- * becomes a symlink to the source credentials dir.
+ * Create a per-cell Kovo Hunter Store from a source data dir without copying or symlinking keys:
+ * only enabled model_profiles rows + the workspace identity are copied into the isolated SQLite DB;
+ * callers reference the real host `credentialsDir` via `KOVO_CREDENTIALS_DIR` (read-only),
+ * keeping M-15 anti-symlink hardening intact and giving each cell its own `credentials/` for
+ * persona secrets and receipt keys.
  */
 export function prepareIsolatedDataDir(input: { sourceDataDir: string; targetDir: string }): IsolatedDataDirResult {
   const source = resolve(input.sourceDataDir)
@@ -1461,7 +1525,7 @@ export function prepareIsolatedDataDir(input: { sourceDataDir: string; targetDir
   const sourceDb = join(source, 'kovo.sqlite')
   const sourceCredentials = join(source, 'credentials')
   if (!existsSync(sourceDb)) throw new PreflightError(`--isolate-data-dir source has no kovo.sqlite: ${source}`)
-  if (!existsSync(sourceCredentials)) throw new PreflightError(`--isolate-data-dir source has no credentials dir: ${source}`)
+  assertValidSourceCredentialsDir(sourceCredentials, '--isolate-data-dir source')
 
   unlockAndRemove(target)
   mkdirSync(target, { recursive: true, mode: 0o700 })
@@ -1482,15 +1546,19 @@ export function prepareIsolatedDataDir(input: { sourceDataDir: string; targetDir
 
     for (const row of rows) {
       const credentialPath = join(sourceCredentials, String(row.credential_id))
-      let mode: number
+      let info
       try {
-        const info = statSync(credentialPath)
-        if (!info.isFile()) throw new Error('not a file')
-        mode = info.mode
+        info = lstatSync(credentialPath)
       } catch {
         throw new PreflightError(`profile '${String(row.name)}' has no readable credential file in the source data dir`)
       }
-      if ((mode & 0o077) !== 0) {
+      if (info.isSymbolicLink()) {
+        throw new PreflightError(`profile '${String(row.name)}' credential must not be a symbolic link`)
+      }
+      if (!info.isFile()) {
+        throw new PreflightError(`profile '${String(row.name)}' has no readable credential file in the source data dir`)
+      }
+      if ((info.mode & 0o077) !== 0) {
         throw new PreflightError(`profile '${String(row.name)}' credential must be owner-only (mode 600)`)
       }
     }
@@ -1526,12 +1594,16 @@ export function prepareIsolatedDataDir(input: { sourceDataDir: string; targetDir
       targetClient.close()
     }
 
-    // Never copy keys: make the isolated credentials dir a symlink to the source dir.
-    rmSync(join(target, 'credentials'), { recursive: true, force: true })
-    symlinkSync(sourceCredentials, join(target, 'credentials'), 'dir')
+    // Never copy or symlink model keys: keep target/credentials as a real owner-only dir
+    // for per-cell persona credentials and receipt keys, and read model credentials from
+    // `sourceCredentials` via KOVO_CREDENTIALS_DIR.
+    const targetCredentials = join(target, 'credentials')
+    rmSync(targetCredentials, { recursive: true, force: true })
+    mkdirSync(targetCredentials, { recursive: true, mode: 0o700 })
+    chmodSync(targetCredentials, 0o700)
 
     const profileNames = rows.map(row => String(row.name))
-    return { directory: target, source, profileNames }
+    return { directory: target, source, credentialsDir: sourceCredentials, profileNames }
   } catch (error) {
     try { storage?.close() } catch { /* already closed */ }
     try { unlockAndRemove(target) } catch { /* best-effort */ }
@@ -2327,81 +2399,103 @@ export function resolveResumeSnapshotDirectory(
 }
 
 /**
- * Link the snapshot's model profile credential files from the source data dir into the fresh
- * resume data dir. The provider key is never copied; only an owner-only symlink is created, the
- * same invariant `prepareIsolatedDataDir` uses. Persona credentials are written separately.
+ * Validate and bind the snapshot's model profile credentials against the real host source
+ * credentials directory without copying or symlinking keys. Callers reference the returned
+ * `credentialsDir` via `KOVO_CREDENTIALS_DIR` (read-only), keeping M-15 anti-symlink hardening
+ * intact. Persona credentials are written separately into `targetDataDir/credentials`.
  */
 export function linkSnapshotModelCredentials(input: {
   snapshotDb: string
   sourceDataDir?: string
   targetDataDir: string
-}): { profiles: number; linked: number } {
-  const snapshot = new DatabaseSync(input.snapshotDb, { readOnly: true })
-  let rows: Array<{ credential_id?: string; name?: string; model?: string }> = []
+}): { profiles: number; linked: number; credentialsDir?: string } {
+  const snapshot = new DatabaseSync(input.snapshotDb)
+  let rows: Array<{ id?: string; credential_id?: string; name?: string; model?: string }> = []
   try {
     rows = snapshot.prepare(
-      'select credential_id, name, model from model_profiles where enabled = 1 order by priority desc, updated_at desc',
-    ).all() as Array<{ credential_id?: string; name?: string; model?: string }>
+      'select id, credential_id, name, model from model_profiles where enabled = 1 order by priority desc, updated_at desc',
+    ).all() as Array<{ id?: string; credential_id?: string; name?: string; model?: string }>
   } catch {
     rows = []
-  } finally {
-    snapshot.close()
   }
-  if (!rows.length) return { profiles: 0, linked: 0 }
+  if (!rows.length) {
+    snapshot.close()
+    return { profiles: 0, linked: 0 }
+  }
   if (!input.sourceDataDir) {
+    snapshot.close()
     throw new PreflightError(
       '--resume-snapshot needs --data-dir (or KOVO_DATA_DIR) pointing at the enabled model '
       + 'profile whose key the resumed run must use',
     )
   }
   const sourceCredentials = join(resolve(input.sourceDataDir), 'credentials')
-  const targetCredentials = join(resolve(input.targetDataDir), 'credentials')
-  mkdirSync(targetCredentials, { recursive: true, mode: 0o700 })
+  try {
+    assertValidSourceCredentialsDir(sourceCredentials, '--resume-snapshot source')
+    const targetCredentials = join(resolve(input.targetDataDir), 'credentials')
+    mkdirSync(targetCredentials, { recursive: true, mode: 0o700 })
+    chmodSync(targetCredentials, 0o700)
 
-  // Fall back to matching the profile by name/model when the source credential id differs
-  // (e.g. the checkpoint came from a different isolated copy of the same profile).
-  let sourceRows: Array<{ credential_id?: string; name?: string; model?: string }> = []
-  const sourceDb = join(resolve(input.sourceDataDir), 'kovo.sqlite')
-  if (existsSync(sourceDb)) {
-    const source = new DatabaseSync(sourceDb, { readOnly: true })
-    try {
-      sourceRows = source.prepare(
-        'select credential_id, name, model from model_profiles where enabled = 1',
-      ).all() as Array<{ credential_id?: string; name?: string; model?: string }>
-    } catch {
-      sourceRows = []
-    } finally {
-      source.close()
+    // Fall back to matching the profile by name/model when the source credential id differs
+    // (e.g. the checkpoint came from a different isolated copy of the same profile).
+    let sourceRows: Array<{ credential_id?: string; name?: string; model?: string }> = []
+    const sourceDb = join(resolve(input.sourceDataDir), 'kovo.sqlite')
+    if (existsSync(sourceDb)) {
+      const source = new DatabaseSync(sourceDb, { readOnly: true })
+      try {
+        sourceRows = source.prepare(
+          'select credential_id, name, model from model_profiles where enabled = 1',
+        ).all() as Array<{ credential_id?: string; name?: string; model?: string }>
+      } catch {
+        sourceRows = []
+      } finally {
+        source.close()
+      }
     }
-  }
 
-  let linked = 0
-  for (const row of rows) {
-    const id = row.credential_id ? String(row.credential_id) : ''
-    if (!id) continue
-    let sourcePath = join(sourceCredentials, id)
-    if (!existsSync(sourcePath)) {
-      const match = sourceRows.find(candidate =>
-        candidate.credential_id && candidate.name === row.name && candidate.model === row.model)
-      if (match?.credential_id) sourcePath = join(sourceCredentials, String(match.credential_id))
-    }
-    if (!existsSync(sourcePath)) {
-      throw new PreflightError(
-        `profile '${String(row.name ?? id)}' has no credential file in ${sourceCredentials}; `
-        + 'resume needs the same --data-dir source that captured the checkpoint',
-      )
-    }
-    const mode = statSync(sourcePath).mode
-    if ((mode & 0o077) !== 0) {
-      throw new PreflightError(`profile '${String(row.name ?? id)}' credential must be owner-only (mode 600)`)
-    }
-    const targetPath = join(targetCredentials, id)
-    if (!existsSync(targetPath)) {
-      symlinkSync(sourcePath, targetPath)
+    let linked = 0
+    for (const row of rows) {
+      const id = row.credential_id ? String(row.credential_id) : ''
+      if (!id) continue
+      let effectiveCredId = id
+      let sourcePath = join(sourceCredentials, effectiveCredId)
+      if (!existsSync(sourcePath)) {
+        const match = sourceRows.find(candidate =>
+          candidate.credential_id && candidate.name === row.name && candidate.model === row.model)
+        if (match?.credential_id) {
+          effectiveCredId = String(match.credential_id)
+          sourcePath = join(sourceCredentials, effectiveCredId)
+        }
+      }
+      let info
+      try {
+        info = lstatSync(sourcePath)
+      } catch {
+        throw new PreflightError(
+          `profile '${String(row.name ?? id)}' has no credential file in ${sourceCredentials}; `
+          + 'resume needs the same --data-dir source that captured the checkpoint',
+        )
+      }
+      if (info.isSymbolicLink()) {
+        throw new PreflightError(`profile '${String(row.name ?? id)}' credential must not be a symbolic link`)
+      }
+      if (!info.isFile()) {
+        throw new PreflightError(
+          `profile '${String(row.name ?? id)}' has no readable credential file in ${sourceCredentials}`,
+        )
+      }
+      if ((info.mode & 0o077) !== 0) {
+        throw new PreflightError(`profile '${String(row.name ?? id)}' credential must be owner-only (mode 600)`)
+      }
+      if (effectiveCredId !== id && row.id) {
+        snapshot.prepare('update model_profiles set credential_id = ? where id = ?').run(effectiveCredId, String(row.id))
+      }
       linked += 1
     }
+    return { profiles: rows.length, linked, credentialsDir: sourceCredentials }
+  } finally {
+    snapshot.close()
   }
-  return { profiles: rows.length, linked }
 }
 
 export interface CellMeta {
@@ -2612,6 +2706,7 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
 
   let dataDir = join(args.outDir, 'data', slug)
   let isolated: IsolatedDataDirResult | undefined
+  let releaseCredentialsDir: (() => void) | undefined
   let loadedSnapshot: LoadedRunSnapshot | undefined
   if (resumeRequested) {
     const resumeDir = resolveResumeSnapshotDirectory(args.resumeSnapshotDir!, app, seed, args.mode)
@@ -2645,13 +2740,17 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
       ...(sourceDataDir ? { sourceDataDir } : {}),
       targetDataDir: dataDir,
     })
+    if (linked.credentialsDir) {
+      releaseCredentialsDir = acquireCredentialsDirEnv(linked.credentialsDir)
+    }
     notes.push(
       `resume snapshot loaded from ${resumeDir} (captured ${new Date(targetApp.capturedAt).toISOString()}, `
       + `age ${Math.round(usable.ageMs / 1000)}s, checkpoint skipped ${Math.round(usable.skippedMs / 1000)}s of cold work); `
-      + `${linked.linked} model credential link(s)`,
+      + `${linked.linked} model credential binding(s) via KOVO_CREDENTIALS_DIR`,
     )
   } else if (isolate && sourceDataDir) {
     isolated = prepareIsolatedDataDir({ sourceDataDir, targetDir: dataDir })
+    releaseCredentialsDir = acquireCredentialsDirEnv(isolated.credentialsDir)
   } else if (sourceDataDir) {
     dataDir = cellCount === 1 ? sourceDataDir : join(sourceDataDir, slug)
   }
@@ -2662,6 +2761,7 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
     try {
       return openCellStore(dataDir)
     } catch (error) {
+      releaseCredentialsDir?.()
       if (isolated) { try { unlockAndRemove(dataDir) } catch { /* best-effort */ } }
       throw error
     }
@@ -2679,7 +2779,7 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
   }
   if (isolated) {
     notes.push(
-      `isolated data dir from ${isolated.source}; profile(s): ${isolated.profileNames.join(', ')}; credentials symlinked (key not copied)`,
+      `isolated data dir from ${isolated.source}; profile(s): ${isolated.profileNames.join(', ')}; credentials referenced via KOVO_CREDENTIALS_DIR (read-only, no symlink, key not copied)`,
     )
   }
 
@@ -2691,10 +2791,27 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
   try {
     // --- Preflight (before booting the app): model mode + real worker-session capability ---
     let profiles: ResolvedModelProfile[] = []
-    try {
-      profiles = privateModelProfiles(storage)
-    } catch (error) {
-      notes.push(`model profile lookup failed: ${redact((error as Error).message).slice(0, 160)}`)
+    let profileLoadErrors: string[] = []
+    if (!args.noLlm) {
+      try {
+        const load = inspectModelProfileLoad(storage)
+        profiles = load.profiles
+        profileLoadErrors = load.errors.map(msg => redact(msg).slice(0, 160))
+        if (profileLoadErrors.length) {
+          notes.push(`model profile lookup diagnostic: ${profileLoadErrors.join('; ')}`)
+        }
+      } catch (error) {
+        const detail = redact((error as Error).message).slice(0, 160)
+        profileLoadErrors.push(detail)
+        notes.push(`model profile lookup failed: ${detail}`)
+      }
+      if (isolated && profiles.length === 0) {
+        const detail = profileLoadErrors.length ? ` (${profileLoadErrors.join('; ')})` : ''
+        throw new PreflightError(
+          `isolated agentic data dir prepared from ${isolated.source} loaded 0 usable model profiles${detail}. `
+          + 'Verify KOVO_CREDENTIALS_DIR and source credentials are non-symlink owner-only files/dirs.',
+        )
+      }
     }
     if (args.noLlm) notes.push('--no-llm: model profiles ignored; isolated deterministic data dir')
     const model = describeModelMode(args.noLlm ? [] : profiles)
@@ -3360,6 +3477,7 @@ export async function runCell(args: RealisticArgs, app: AppName, seed: number, l
       try { unlockAndRemove(whiteBoxRoot) } catch { /* best-effort */ }
     }
     try { storage.close() } catch { /* already closed */ }
+    releaseCredentialsDir?.()
     if (isolated && !args.keepDataDirs) {
       try { unlockAndRemove(dataDir) } catch { /* best-effort */ }
     }
