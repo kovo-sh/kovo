@@ -3,7 +3,7 @@
 
 FROM node:24-bookworm-slim@sha256:dc26ae92c9fb15cf6b1d63e20f0944b2efe0f115b20e00be48fb23fceb061c54 AS tools-downloader
 
-ARG TARGETARCH=amd64
+ARG TARGETARCH
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates curl tar gzip \
@@ -12,20 +12,21 @@ RUN apt-get update \
 
 # Pinned SHA-256 offline SAST / secret / IaC binaries
 RUN set -eux; \
-  case "${TARGETARCH}" in \
-    amd64) \
+  effective_arch="${TARGETARCH:-$(uname -m)}"; \
+  case "${effective_arch}" in \
+    amd64|x86_64) \
       GITLEAKS_ARCH="x64"; GITLEAKS_SHA="551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"; \
       TRUFFLEHOG_ARCH="amd64"; TRUFFLEHOG_SHA="b2d85eba59865e98f45c9fc9f77d2c6d62df529fdd5755af121304ea5a7cecbb"; \
       TRIVY_ARCH="64bit"; TRIVY_SHA="bc0fc726e017b8927a62b2d3531d7a84ee01769daf5c99ed866dced54089fdbf"; \
       OPENGREP_ASSET="opengrep_linux_x86"; OPENGREP_SHA="37e93f4da5fd04a18c5c1febbdd12f7e98dfccd4d0c9cf2593bcb25eeb462da0"; \
       ;; \
-    arm64) \
+    arm64|aarch64) \
       GITLEAKS_ARCH="arm64"; GITLEAKS_SHA="e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080"; \
       TRUFFLEHOG_ARCH="arm64"; TRUFFLEHOG_SHA="aa61657049229ae523e8455fcbba87dff57b0a2ba6bdb391a38cf75e6d4016dd"; \
       TRIVY_ARCH="ARM64"; TRIVY_SHA="ab9d51f86e6a5fb936f605faff6b593ac51bc378fff4d3e8b9d58358b9c367c3"; \
       OPENGREP_ASSET="opengrep_linux_aarch64"; OPENGREP_SHA="6257b65423a744b704af2ff9beeb8f222c2f6925236af386b56b031d4c06d6d8"; \
       ;; \
-    *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    *) echo "Unsupported TARGETARCH: ${effective_arch}" >&2; exit 1 ;; \
   esac; \
   \
   # 1. gitleaks v8.30.1
@@ -50,6 +51,12 @@ RUN set -eux; \
   curl -fsSL "https://github.com/opengrep/opengrep/releases/download/v2.0.0/${OPENGREP_ASSET}" -o /out/bin/opengrep; \
   echo "${OPENGREP_SHA}  /out/bin/opengrep" | sha256sum -c -; \
   chmod 0755 /out/bin/opengrep; \
+  \
+  # Build-time architecture & binary execution sanity check (catches Exec format error early)
+  /out/bin/gitleaks version; \
+  /out/bin/trufflehog --version; \
+  /out/bin/trivy --version; \
+  /out/bin/opengrep --version; \
   rm -rf /tmp/dl
 
 FROM node:24-bookworm-slim@sha256:dc26ae92c9fb15cf6b1d63e20f0944b2efe0f115b20e00be48fb23fceb061c54

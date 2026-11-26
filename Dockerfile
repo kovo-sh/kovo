@@ -52,8 +52,7 @@ RUN groupadd --gid 10001 kovo \
   && useradd --uid 10001 --gid 10001 --create-home --home-dir /home/kovo --shell /bin/sh kovo \
   && mkdir -p /data /scratch /home/kovo \
   && chown -R 10001:10001 /data /scratch /home/kovo \
-  && chmod 0700 /data \
-  && chmod 0755 /scratch \
+  && chmod 0700 /data /scratch \
   && chmod -R a+rX /app /opt/ms-playwright
 
 USER 10001:10001

@@ -17,6 +17,7 @@ import {
 import { basename, dirname, isAbsolute, join, posix, relative, sep } from 'node:path'
 import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
+import ipaddr from 'ipaddr.js'
 import { z } from 'zod'
 import type { AnalyzerName } from '../../worker/analyzers.ts'
 import {
@@ -417,6 +418,11 @@ export interface WorkerSessionOptions {
    * at `/kovo-rpc`; the rest of the container filesystem stays read-only.
    */
   rpcMountDir?: string
+  /**
+   * Optional warm-pool policy key (`${runId}:${secretEpoch}`). When provided, `openSession`
+   * acquires strictly from that policy's pool and never takes a container from another run's pool.
+   */
+  warmPoolPolicy?: string
 }
 
 /** Container-reuse counters for one backend/pool (diagnostic seam; no secrets). */
@@ -448,6 +454,8 @@ export interface WorkerBackend {
    * tenants, repo mounts, or secret rotations.
    */
   setWarmPoolPolicy?(policy: string, options?: { reposDir?: string }): void
+  /** Evict and close all warm-pool containers/leases owned by `runId` on run disposal. */
+  evictRunWarmPool?(runId: string): Promise<void>
   /** Remove idle warm containers on teardown instead of leaving them on the host. */
   closeWarmPool?(): Promise<void>
 }
@@ -455,6 +463,10 @@ export interface WorkerBackend {
 function clamp(val: number | undefined, fallback: number, min: number, max: number): number {
   if (val === undefined || !Number.isFinite(val)) return fallback
   return Math.max(min, Math.min(max, val))
+}
+
+function isContainerUid10001(): boolean {
+  return typeof process.getuid === 'function' && process.getuid() === 10001
 }
 
 function isDoodScratchConfigured(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -470,13 +482,31 @@ function parseDockerTcpHost(host: string): { hostname: string; port: number } | 
   return { hostname: m[1].toLowerCase(), port }
 }
 
-function isLocalDockerProxyTcp(host: string): boolean {
+const COMPOSE_SERVICE_LABEL_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i
+const BLOCKED_COMPOSE_HOSTNAMES = new Set(['metadata', 'metadata.google.internal'])
+
+function isAllowedDockerTcpHost(host: string, env: NodeJS.ProcessEnv): boolean {
   const parsed = parseDockerTcpHost(host)
   if (!parsed) return false
-  return parsed.hostname === 'docker-proxy'
-    || parsed.hostname === 'localhost'
-    || parsed.hostname === '127.0.0.1'
-    || parsed.hostname === '[::1]'
+  if (env.KOVO_ALLOW_REMOTE_DOCKER_HOST === '1') return true
+  const bare = parsed.hostname.startsWith('[') && parsed.hostname.endsWith(']')
+    ? parsed.hostname.slice(1, -1)
+    : parsed.hostname
+  if (bare === 'docker-proxy' || bare === 'localhost') return true
+  if (ipaddr.isValid(bare)) {
+    const range = ipaddr.process(bare).range()
+    if (range === 'loopback') return true
+    if (isDoodScratchConfigured(env) && (range === 'private' || range === 'uniqueLocal')) return true
+    return false
+  }
+  if (!isDoodScratchConfigured(env)) return false
+  if (BLOCKED_COMPOSE_HOSTNAMES.has(bare)) return false
+  // Allow single-label Docker Compose DNS proxy names (e.g. `docker-proxy`, `custom-socket-proxy`),
+  // `host.docker.internal`, or explicit `.local` compose suffixes — never arbitrary public/metadata domains.
+  if (COMPOSE_SERVICE_LABEL_RE.test(bare)) return true
+  if (bare === 'host.docker.internal') return true
+  if (bare.endsWith('.local') && /^[a-z0-9-]+(?:\.[a-z0-9-]+)*\.local$/i.test(bare) && !bare.includes('metadata')) return true
+  return false
 }
 
 export function dockerHost(env: NodeJS.ProcessEnv = process.env): string {
@@ -484,7 +514,7 @@ export function dockerHost(env: NodeJS.ProcessEnv = process.env): string {
   if (/^unix:\/\/\/[^/?#\r\n][^?#\r\n]*$/.test(host)) {
     return host
   }
-  if ((isDoodScratchConfigured(env) && parseDockerTcpHost(host) !== null) || isLocalDockerProxyTcp(host)) {
+  if (isAllowedDockerTcpHost(host, env)) {
     return host
   }
   throw new Error('Kovo Hunter requires a local Docker Unix socket.')
@@ -612,10 +642,11 @@ export function prepareSessionScratchDir(
   }
   const safeSession = assertValidScratchSessionId(sessionId)
   const baseDir = config.containerScratchDir
-  mkdirSync(baseDir, { recursive: true, mode: 0o755 })
+  const dirMode = isContainerUid10001() ? 0o700 : 0o755
+  mkdirSync(baseDir, { recursive: true, mode: dirMode })
   const sessionDir = join(baseDir, safeSession)
-  mkdirSync(sessionDir, { recursive: true, mode: 0o755 })
-  chmodSync(sessionDir, 0o755)
+  mkdirSync(sessionDir, { recursive: true, mode: dirMode })
+  chmodSync(sessionDir, dirMode)
   let targetDir = sessionDir
   if (subdir !== undefined) {
     if (/[\0,\r\n]/.test(subdir) || subdir.startsWith('/') || subdir.startsWith('\\') || hasDotDotSegment(subdir)) {
@@ -626,8 +657,8 @@ export function prepareSessionScratchDir(
       throw new Error('Invalid worker scratch subdirectory.')
     }
     targetDir = join(sessionDir, ...parts)
-    mkdirSync(targetDir, { recursive: true, mode: 0o755 })
-    chmodSync(targetDir, 0o755)
+    mkdirSync(targetDir, { recursive: true, mode: dirMode })
+    chmodSync(targetDir, dirMode)
   }
   relativeScratchSubpath(baseDir, targetDir)
   return targetDir
@@ -783,16 +814,17 @@ const oneShotRefSchema = resultRefSchema.extend({ path: z.string().regex(oneShot
 
 /** Per-one-shot tmpfs (or per-session DooD scratch) directory mounted at `/kovo-ipc`. */
 function makeOneShotIpcDir(sessionId?: string, env: NodeJS.ProcessEnv = process.env): { ipcDir: string; cleanupDir: string } {
+  const ipcMode = isContainerUid10001() ? 0o700 : 0o777
   const dood = resolveDoodScratchConfig(env)
   if (dood) {
     const sid = sessionId ?? `ipc-${randomUUID()}`
     const ipcDir = prepareSessionScratchDir(sid, 'ipc', env)
-    chmodSync(ipcDir, 0o777)
+    chmodSync(ipcDir, ipcMode)
     return { ipcDir, cleanupDir: ipcDir }
   }
   const base = existsSync('/dev/shm') ? '/dev/shm' : tmpdir()
   const dir = mkdtempSync(join(base, 'kovo-ipc-'))
-  chmodSync(dir, 0o777)
+  chmodSync(dir, ipcMode)
   return { ipcDir: dir, cleanupDir: dir }
 }
 
@@ -880,14 +912,17 @@ export function prepareVerifySdkMount(sdkDir?: string): PreparedReadableMount {
     }
   }
 
+  const sameContainerUid = isContainerUid10001()
+  const stageDirMode = sameContainerUid ? 0o700 : 0o755
+  const stageFileMode = sameContainerUid ? 0o600 : 0o644
   const rawStageDir = mkdtempSync(join(tmpdir(), 'kovo-sdk-'))
-  chmodSync(rawStageDir, 0o755)
+  chmodSync(rawStageDir, stageDirMode)
   const mountDir = realpathSync(rawStageDir)
   try {
     for (const file of available) {
       const dstPath = join(mountDir, file.name)
       copyFileSync(file.fullPath, dstPath)
-      chmodSync(dstPath, 0o644)
+      chmodSync(dstPath, stageFileMode)
     }
   } catch (error) {
     try { rmSync(mountDir, { recursive: true, force: true }) } catch { /* ignore */ }
@@ -1184,12 +1219,15 @@ function reposTreeNeedsStaging(resolvedRoot: string): boolean {
 }
 
 function stageReadableReposTree(resolvedRoot: string, targetDir?: string): { mountDir: string; excludedCount: number } {
+  const sameContainerUid = isContainerUid10001()
+  const stageDirMode = sameContainerUid ? 0o700 : 0o755
+  const stageFileMode = sameContainerUid ? 0o600 : 0o644
   let mountDir: string
   if (targetDir) {
     mountDir = realpathSync(targetDir)
   } else {
     const rawStageDir = mkdtempSync(join(tmpdir(), 'kovo-repos-'))
-    chmodSync(rawStageDir, 0o755)
+    chmodSync(rawStageDir, stageDirMode)
     mountDir = realpathSync(rawStageDir)
   }
   let excludedCount = 0
@@ -1210,7 +1248,7 @@ function stageReadableReposTree(resolvedRoot: string, targetDir?: string): { mou
         }
         const dstChild = join(dstDir, entry.name)
         mkdirSync(dstChild)
-        chmodSync(dstChild, 0o755)
+        chmodSync(dstChild, stageDirMode)
         copyDir(srcChild, dstChild)
       } else if (st.isFile()) {
         if (isSensitiveRepoEntry(relPosix, entry.name, false)) {
@@ -1219,7 +1257,7 @@ function stageReadableReposTree(resolvedRoot: string, targetDir?: string): { mou
         }
         const dstChild = join(dstDir, entry.name)
         copyFileSync(srcChild, dstChild)
-        chmodSync(dstChild, 0o644)
+        chmodSync(dstChild, stageFileMode)
       }
     }
   }
@@ -1327,7 +1365,25 @@ export function ensureRpcMountReadable(rpcDir: string): string {
   const resolved = realpathSync(rpcDir)
   if (/[\0,\r\n]/.test(resolved)) throw new Error('Invalid resolved verification RPC mount path.')
 
-  // Non-root UID 10001 needs o+x (e.g. 0o711 or 0o755) to traverse `/kovo-rpc`.
+  if (isContainerUid10001()) {
+    // Inside Option B container, both kovo-hunter and sibling kovo-worker containers run as
+    // UID 10001: keep IPC directory and token/context/socket strictly owner-only (0o700 / 0o600).
+    chmodSync(resolved, 0o700)
+    for (const name of [VERIFY_RPC_TOKEN_NAME, VERIFY_RPC_CONTEXT_NAME]) {
+      const filePath = join(resolved, name)
+      if (!existsSync(filePath)) continue
+      const fileStat = lstatSync(filePath)
+      if (fileStat.isFile()) chmodSync(filePath, 0o600)
+    }
+    const socketPath = join(resolved, VERIFY_RPC_SOCKET_NAME)
+    if (existsSync(socketPath)) {
+      const sockStat = lstatSync(socketPath)
+      if (sockStat.isSocket() || sockStat.isFile()) chmodSync(socketPath, 0o600)
+    }
+    return resolved
+  }
+
+  // Non-root UID 10001 needs o+x (e.g. 0o711 or 0o755) to traverse `/kovo-rpc` when host UID != 10001.
   if ((st.mode & 0o001) !== 0o001) {
     chmodSync(resolved, (st.mode & 0o777) | 0o011)
   }
@@ -1448,6 +1504,22 @@ interface WarmReposLease {
   retired: boolean
 }
 
+export const MAX_ACTIVE_WARM_POOLS = 16
+
+function policyRunKey(policy: string): string {
+  const idx = policy.lastIndexOf(':')
+  return idx > 0 ? policy.slice(0, idx) : policy
+}
+
+interface WarmPoolSlot {
+  policy: string
+  runKey: string
+  pool: WarmWorkerPool
+  reposSource?: string
+  preparedRepos?: WarmReposLease
+  warmed: boolean
+}
+
 /**
  * One pool per (cell, image, runLabel, owner, options) per process: Execution may construct more
  * than one backend, and a cell must not accumulate one idle container per backend.
@@ -1463,7 +1535,10 @@ function sharedWarmPool(input: {
   capacity?: number
 }): WarmWorkerPool {
   const sanitizedOptions = input.options ? { ...input.options } : undefined
-  if (sanitizedOptions) delete sanitizedOptions.rpcMountDir
+  if (sanitizedOptions) {
+    delete sanitizedOptions.rpcMountDir
+    delete sanitizedOptions.warmPoolPolicy
+  }
   // Owner (tenant/workspace) and container options (including read-only reposDir) are part of the
   // key: two tenants or different repo mounts must never share an idle container.
   const key = `${input.cell}\0${input.image}\0${input.runLabel}\0${input.owner ?? ''}\0${workerOptionsSignature(sanitizedOptions)}`
@@ -1472,6 +1547,7 @@ function sharedWarmPool(input: {
     if (input.capacity !== undefined) existing.setCapacity(input.capacity)
     return existing
   }
+  if (existing) warmPools.delete(key)
   const pool = new WarmWorkerPool({ ...input, options: sanitizedOptions })
   warmPools.set(key, pool)
   return pool
@@ -1526,6 +1602,7 @@ export class WarmWorkerPool {
     this.owner = input.owner
     this.options = { ...(input.options ?? {}) }
     delete this.options.rpcMountDir
+    delete this.options.warmPoolPolicy
     this.signature = workerOptionsSignature(this.options)
     this.capacity = Math.max(1, Math.min(MAX_WARM_POOL_CAPACITY, Math.floor(input.capacity ?? warmPoolCapacity())))
   }
@@ -1729,18 +1806,16 @@ export class LinuxWorkerBackend implements WorkerBackend {
   private readonly spawnSession: (name: string) => ChildProcess
   private readonly staleCreatedMs: number
   private readonly isPidAlive: (pid: number) => boolean
-  private warmPool?: WarmWorkerPool
-  /** Last pool policy installed by Execution (run id + credential generation). */
-  private warmPoolPolicy?: string
-  /** Normalized host reposDir currently baked into the warm pool, if any. */
-  private warmPoolReposSource?: string
-  /** Prepared read-only `/repos` mount owned by the current warm pool (staged once per policy). */
-  private preparedWarmRepos?: WarmReposLease
+  private readonly warmPools = new Map<string, WarmPoolSlot>()
+  /** Most recently installed policy key (used when `openSession` omits `options.warmPoolPolicy`). */
+  private activeWarmPoolPolicy?: string
+  /** Hard bound on concurrent per-policy warm pools retained in `this.warmPools` (LRU evicted). */
+  private readonly maxWarmPools: number
   /** Desired warm-pool slot capacity preserved across policy rotations. */
   private desiredWarmCapacity?: number
-  /** Cumulative stats of pools retired by a policy change (metrics stay run-wide). */
+  /** Cumulative stats of pools retired by a policy change or eviction (metrics stay run-wide). */
   private retiredPoolStats = { created: 0, reused: 0, failures: 0 }
-  private readonly pooled = new Set<string>()
+  private readonly pooled = new Map<string, WarmWorkerPool>()
   private readonly activeContainers = new Set<string>()
   private readonly removals = new Map<string, Promise<void>>()
   private sessionsServed = 0
@@ -1764,8 +1839,10 @@ export class LinuxWorkerBackend implements WorkerBackend {
     cell?: string
     /** Test seam: check whether a container owner PID is alive (defaults to `isOwnerPidAlive`). */
     isPidAlive?: (pid: number) => boolean
+    /** Optional max concurrent per-policy warm pools (bounded LRU; defaults to `MAX_ACTIVE_WARM_POOLS`). */
+    maxWarmPools?: number
   } = {}) {
-    const { image = 'kovo-worker:v4', workspace, runId, dockerRunner, sessionSpawner, staleCreatedMs, cell, isPidAlive } = input
+    const { image = 'kovo-worker:v4', workspace, runId, dockerRunner, sessionSpawner, staleCreatedMs, cell, isPidAlive, maxWarmPools } = input
     this.image = input.image ?? (process.env.KOVO_WORKER_IMAGE?.trim() || image)
     this.runId = runId
     this.docker = dockerRunner ?? docker
@@ -1775,6 +1852,8 @@ export class LinuxWorkerBackend implements WorkerBackend {
     }))
     this.staleCreatedMs = Math.max(0, staleCreatedMs ?? DEFAULT_STALE_CREATED_MS)
     this.isPidAlive = isPidAlive ?? isOwnerPidAlive
+    const envMaxPools = Number(process.env.KOVO_MAX_WARM_POOLS)
+    this.maxWarmPools = Math.round(clamp(maxWarmPools ?? (Number.isFinite(envMaxPools) && envMaxPools > 0 ? envMaxPools : undefined), MAX_ACTIVE_WARM_POOLS, 1, 64))
     const cellId = cell ?? process.env.KOVO_CELL_ID
     this.cell = cellId && cellId.trim() ? cellId.trim() : undefined
     if (workspace) {
@@ -1806,32 +1885,85 @@ export class LinuxWorkerBackend implements WorkerBackend {
     return this.runId ?? (this.owner ? `workspace-${this.owner.slice(0, 12)}` : `adhoc-${processSessionId.slice(0, 8)}`)
   }
 
+  private currentWarmSlot(): WarmPoolSlot | undefined {
+    if (!this.activeWarmPoolPolicy) return undefined
+    return this.warmPools.get(this.activeWarmPoolPolicy)
+  }
+
+  private touchWarmSlot(slot: WarmPoolSlot): void {
+    if (this.warmPools.get(slot.policy) !== slot) return
+    this.warmPools.delete(slot.policy)
+    this.warmPools.set(slot.policy, slot)
+  }
+
+  private retireSlot(slot: WarmPoolSlot, awaitClose = false): Promise<void> {
+    if (this.warmPools.get(slot.policy) === slot) {
+      this.warmPools.delete(slot.policy)
+    }
+    if (this.activeWarmPoolPolicy === slot.policy) {
+      let lastPolicy: string | undefined
+      for (const key of this.warmPools.keys()) lastPolicy = key
+      this.activeWarmPoolPolicy = lastPolicy
+    }
+    for (const [containerName, ownerPool] of this.pooled) {
+      if (ownerPool === slot.pool) this.pooled.delete(containerName)
+    }
+    const stats = slot.pool.stats
+    this.retiredPoolStats.created += stats.created
+    this.retiredPoolStats.reused += stats.reused
+    this.retiredPoolStats.failures += stats.failures
+    // Close removes idle containers; a session still holding one releases into a closed pool,
+    // which discards instead of reusing. Never carry an old-generation container forward.
+    const closing = slot.pool.close().catch(() => undefined)
+    this.retireWarmRepos(slot.preparedRepos)
+    return awaitClose ? closing : Promise.resolve()
+  }
+
   private installWarmPool(policy: string, warmNow = true, options?: { reposDir?: string }): void {
     const poolCell = this.poolCell()
     if (!poolCell || !warmWorkersEnabled()) return
     const nextReposSource = normalizeReposDirKey(options?.reposDir)
-    if (this.warmPool && this.warmPoolPolicy === policy && this.warmPoolReposSource === nextReposSource) return
-    const previous = this.warmPool
-    const previousRepos = this.preparedWarmRepos
-    this.warmPool = undefined
-    this.warmPoolPolicy = undefined
-    this.warmPoolReposSource = undefined
-    this.preparedWarmRepos = undefined
-    if (previous) {
-      const stats = previous.stats
-      this.retiredPoolStats.created += stats.created
-      this.retiredPoolStats.reused += stats.reused
-      this.retiredPoolStats.failures += stats.failures
-      // Close removes idle containers; a session still holding one releases into a closed pool,
-      // which discards instead of reusing. Never carry an old-generation container forward.
-      void previous.close().catch(() => undefined)
+    const existing = this.warmPools.get(policy)
+    if (existing && existing.reposSource === nextReposSource && existing.pool.state !== 'closed') {
+      this.touchWarmSlot(existing)
+      this.activeWarmPoolPolicy = policy
+      if (warmNow && !existing.warmed) {
+        existing.warmed = true
+        void existing.pool.warm()
+      }
+      return
     }
-    this.retireWarmRepos(previousRepos)
+    // Retire any unused lazy placeholder installed at construction time before the first run policy.
+    const defaultPolicy = this.defaultWarmPolicy()
+    const placeholder = this.warmPools.get(defaultPolicy)
+    if (placeholder && !placeholder.warmed && placeholder.policy !== policy && placeholder.pool.stats.created === 0) {
+      void this.retireSlot(placeholder)
+    }
+    // Retire any existing pool for the SAME run (e.g. secret-epoch rotation or reposDir change),
+    // while leaving every other concurrent run's pool intact.
+    const runKey = policyRunKey(policy)
+    for (const slot of [...this.warmPools.values()]) {
+      if (slot.runKey === runKey || slot.policy === policy) {
+        void this.retireSlot(slot)
+      }
+    }
+    // Enforce bounded LRU across distinct runs so long-lived servers never leak idle pools.
+    while (this.warmPools.size >= this.maxWarmPools) {
+      const oldestKey = this.warmPools.keys().next().value
+      if (oldestKey === undefined) break
+      const oldest = this.warmPools.get(oldestKey)
+      if (!oldest) {
+        this.warmPools.delete(oldestKey)
+        continue
+      }
+      void this.retireSlot(oldest)
+    }
+    let preparedRepos: WarmReposLease | undefined
     let poolOptions: WorkerSessionOptions | undefined
     if (options?.reposDir) {
-      const prepared = prepareReposMount(options.reposDir, { sessionId: `pool-${this.instanceId}` })
+      const prepared = prepareReposMount(options.reposDir, { sessionId: `pool-${this.instanceId}-${randomUUID().slice(0, 8)}` })
       if (prepared) {
-        this.preparedWarmRepos = {
+        preparedRepos = {
           sourceDir: nextReposSource ?? prepared.mountDir,
           prepared,
           activeSessions: 0,
@@ -1840,10 +1972,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
         poolOptions = { reposDir: prepared.mountDir }
       }
     }
-    this.warmPoolPolicy = policy
-    this.warmPoolReposSource = nextReposSource
-    this.pooled.clear()
-    this.warmPool = sharedWarmPool({
+    const pool = sharedWarmPool({
       cell: poolCell,
       image: this.image,
       dockerRunner: this.docker,
@@ -1852,15 +1981,24 @@ export class LinuxWorkerBackend implements WorkerBackend {
       ...(poolOptions ? { options: poolOptions } : {}),
       ...(this.desiredWarmCapacity !== undefined ? { capacity: this.desiredWarmCapacity } : {}),
     })
+    const slot: WarmPoolSlot = {
+      policy,
+      runKey,
+      pool,
+      reposSource: nextReposSource,
+      preparedRepos,
+      warmed: warmNow,
+    }
+    this.warmPools.set(policy, slot)
+    this.activeWarmPoolPolicy = policy
     // Kick the first create early; failure only disables the pool (cold path remains).
-    if (warmNow) void this.warmPool.warm()
+    if (warmNow) void pool.warm()
   }
 
   /**
-   * Install the run's warm-pool policy: run identity + credential generation, plus optional
-   * read-only `reposDir`. A policy or repo-mount change (new run, tenant, secret rotation,
-   * scope/option change) retires the pool and rebuilds it, so an idle container created under
-   * earlier credentials or another repo mount is never reused.
+   * Install a run's warm-pool policy: run identity + credential generation (`${runId}:${secretEpoch}`),
+   * plus optional read-only `reposDir`. Concurrent runs retain isolated pools keyed by policy;
+   * a rotation or repo-mount change within the same run retires only that run's prior pool.
    */
   setWarmPoolPolicy(policy: string, options?: { reposDir?: string }): void {
     const normalized = policy.trim()
@@ -1868,46 +2006,67 @@ export class LinuxWorkerBackend implements WorkerBackend {
     this.installWarmPool(normalized, true, options)
   }
 
-  /** Shutdown seam: remove idle containers so a finished run leaves no warm pool behind. */
-  async closeWarmPool(): Promise<void> {
-    const pool = this.warmPool
-    const warmRepos = this.preparedWarmRepos
-    this.warmPool = undefined
-    this.warmPoolPolicy = undefined
-    this.warmPoolReposSource = undefined
-    this.preparedWarmRepos = undefined
-    if (pool) {
-      const stats = pool.stats
-      this.retiredPoolStats.created += stats.created
-      this.retiredPoolStats.reused += stats.reused
-      this.retiredPoolStats.failures += stats.failures
-      await pool.close().catch(() => undefined)
-    }
-    this.retireWarmRepos(warmRepos)
+  /** Evict and close all warm-pool containers/leases owned by `runId` on run disposal. */
+  async evictRunWarmPool(runId: string): Promise<void> {
+    const normalized = runId.trim()
+    if (!normalized) return
+    const targets = [...this.warmPools.values()].filter(
+      slot => slot.runKey === normalized || slot.policy === normalized,
+    )
+    await Promise.all(targets.map(slot => this.retireSlot(slot, true)))
   }
 
-  /** Warm-pool state (test/diagnostic seam; never contains secrets). */
+  /** Shutdown seam: remove idle containers across all run pools so teardown leaves none behind. */
+  async closeWarmPool(): Promise<void> {
+    const slots = [...this.warmPools.values()]
+    this.activeWarmPoolPolicy = undefined
+    await Promise.all(slots.map(slot => this.retireSlot(slot, true)))
+  }
+
+  /** Active warm-pool state (test/diagnostic seam; never contains secrets). */
   get warmPoolStats(): WarmWorkerPool['stats'] | undefined {
-    return this.warmPool?.stats
+    return this.currentWarmSlot()?.pool.stats
+  }
+
+  /** Per-policy warm-pool stats (test/diagnostic seam; never contains secrets). */
+  getWarmPoolStats(policy: string): WarmWorkerPool['stats'] | undefined {
+    return this.warmPools.get(policy.trim())?.pool.stats
+  }
+
+  /** Number of per-policy warm pools currently retained in this backend. */
+  get activeWarmPoolCount(): number {
+    return this.warmPools.size
   }
 
   /** Container-reuse counters for the run's diagnostics event. */
   containerStats(): WorkerContainerStats {
-    const pool = this.warmPool?.stats
+    let created = this.retiredPoolStats.created + this.coldSessionCreates
+    let reused = this.retiredPoolStats.reused
+    let idle = 0
+    let capacity = 0
+    for (const slot of this.warmPools.values()) {
+      const s = slot.pool.stats
+      created += s.created
+      reused += s.reused
+      idle += s.idle
+      capacity += s.capacity
+    }
     return {
-      created: this.retiredPoolStats.created + (pool?.created ?? 0) + this.coldSessionCreates,
-      reused: this.retiredPoolStats.reused + (pool?.reused ?? 0),
+      created,
+      reused,
       sessions: this.sessionsServed,
       coldSessions: this.coldSessionCreates,
-      idle: pool?.idle ?? 0,
-      capacity: pool?.capacity ?? 0,
+      idle,
+      capacity,
     }
   }
 
   /** One warm idle container per worker slot (called by Execution after slot planning). */
   setWarmCapacity(slots: number): void {
     this.desiredWarmCapacity = slots
-    this.warmPool?.setCapacity(slots)
+    for (const slot of this.warmPools.values()) {
+      slot.pool.setCapacity(slots)
+    }
   }
 
   /**
@@ -1937,8 +2096,14 @@ export class LinuxWorkerBackend implements WorkerBackend {
   private removeContainer(name: string) {
     // Coalesce concurrent removals: `finally` + the session close/error handlers can race,
     // and a second `docker rm` reports "removal ... already in progress" instead of a clean exit.
-    if (this.warmPool?.owns(name)) return Promise.resolve()
-    if (this.pooled.delete(name)) this.warmPool?.forget(name)
+    for (const slot of this.warmPools.values()) {
+      if (slot.pool.owns(name)) return Promise.resolve()
+    }
+    const ownerPool = this.pooled.get(name)
+    if (ownerPool) {
+      this.pooled.delete(name)
+      ownerPool.forget(name)
+    }
     const existing = this.removals.get(name)
     if (existing) return existing
     const removal = this.docker(['container', 'rm', '--force', name], AbortSignal.timeout(5_000))
@@ -2121,11 +2286,18 @@ export class LinuxWorkerBackend implements WorkerBackend {
     await ensureWorkerImageAvailable(this.image, this.docker, signal)
     await this.reclaimInactive()
     signal.throwIfAborted()
-    // Warm pool first (best-effort): a pre-created session container skips the create
-    // round-trip (and reuses the pool's prepared read-only `/repos` mount when `reposDir`
-    // matches). Per-call `rpcMountDir` sockets always bypass the pool for strict isolation.
-    const activePool = this.warmPool
-    const warmRepos = this.preparedWarmRepos
+    // Warm pool first (best-effort): resolve strictly from the caller's `warmPoolPolicy` (or
+    // current active policy when omitted) so concurrent runs never take or evict each other's
+    // containers. Per-call `rpcMountDir` sockets always bypass the pool for strict isolation.
+    const requestedPolicy = options?.warmPoolPolicy?.trim()
+    const activeSlot = requestedPolicy
+      ? this.warmPools.get(requestedPolicy)
+      : (this.activeWarmPoolPolicy ? this.warmPools.get(this.activeWarmPoolPolicy) : undefined)
+    if (activeSlot) {
+      this.touchWarmSlot(activeSlot)
+    }
+    const activePool = activeSlot?.pool
+    const warmRepos = activeSlot?.preparedRepos
     const matchesWarmRepos = Boolean(
       activePool
       && !options?.rpcMountDir
@@ -2160,7 +2332,7 @@ export class LinuxWorkerBackend implements WorkerBackend {
     const pooled = warm !== null
     const name = warm ?? 'kovo-' + randomUUID()
     this.sessionsServed += 1
-    if (pooled) this.pooled.add(name)
+    if (pooled && activePool) this.pooled.set(name, activePool)
     else this.coldSessionCreates += 1
     this.activeContainers.add(name)
     trackLiveContainer(name)
@@ -2297,7 +2469,12 @@ export class LinuxWorkerBackend implements WorkerBackend {
         // Warm reuse: a clean session (no pending op, process still alive) resets `/tmp` first,
         // then asks the worker to shut down so the stopped container can serve the next
         // assignment without a cold `container create`.
-        const reusable = pooled && activePool?.enabled === true && this.warmPool === activePool && pending.size === 0 && !exited
+        const reusable = pooled
+          && activePool?.enabled === true
+          && activeSlot !== undefined
+          && this.warmPools.get(activeSlot.policy) === activeSlot
+          && pending.size === 0
+          && !exited
         let recycled = false
         if (reusable) {
           // 1) Reset the tmpfs scratch while the bridge is still running; 2) stop the container
