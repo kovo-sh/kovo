@@ -12,7 +12,7 @@ import { createHash } from 'node:crypto'
 import { parseBodyFromCarrierText } from './host-fact-log.ts'
 import { ROLE_RANK, normalizeRole, parseRoleLabel, parseRoleMemberships, stepReadsState, type RoleName } from './oracle-invariants.ts'
 import type { ProofReceipt } from './proof-receipt.ts'
-import { extractTenantMarkers, isJobOrHandleStub, type HostSignedRecord, type V8OracleFamily } from './v8-oracle-families.ts'
+import { extractResponseScope, extractTenantMarkers, findNonErrorBatchRecord, isJobOrHandleStub, type HostSignedRecord, type V8OracleFamily } from './v8-oracle-families.ts'
 
 export interface HydratableEntry {
   exchangeId: string
@@ -332,8 +332,8 @@ export function buildCapOriginIndex(entries: Iterable<HydratableEntry>, anonActo
       if (hit) return hit
     }
     if (isLoginEx(e)) {
-      return findFirstStringByKeys(e.step.requestJson, LOGIN_EMAIL_KEYS)
-        ?? findFirstStringByKeys(e.step.json, LOGIN_EMAIL_KEYS)
+      return findFirstStringByKeys(e.step.json, LOGIN_EMAIL_KEYS)
+        ?? findFirstStringByKeys(e.step.requestJson, LOGIN_EMAIL_KEYS)
     }
     return null
   }
@@ -871,36 +871,26 @@ export function hydrateV8OracleInput(
     }
     const tenantOf = (e: HydratableEntry | undefined): string | null =>
       (e?.step.actor.tenant ?? parseRoleLabel(e?.actorRoleLabel ?? e?.actorPersona ?? '').tenant ?? '').trim().toLowerCase() || null
-    const markersOf = (e: HydratableEntry | undefined): Set<string> => new Set([
-      ...extractTenantMarkers(e?.step.json, e?.step.body),
-      ...extractTenantMarkers(e?.step.requestJson),
-      ...extractTenantMarkers(undefined, typeof e?.step.requestJson === 'string' ? e.step.requestJson : undefined),
-    ])
+    // R3-C-5: derive tenant markers strictly from response-side non-error fields — NEVER requestJson/body.
+    const markersOf = (e: HydratableEntry | undefined): Set<string> => e ? extractTenantMarkers(e.step.json, e.step.body, true) : new Set<string>()
+    const hostKnownTenants = new Set<string>()
+    for (const e of idx.entriesById.values()) { const t = tenantOf(e); if (t) hostKnownTenants.add(t); if (e.actorRoleLabel) for (const m of parseRoleMemberships(e.actorRoleLabel)) if (m.tenant) hostKnownTenants.add(m.tenant.trim().toLowerCase()) }
     if (mode === 'cross_org_transfer') {
       const rb = isRecObj(out.postTransferReadback) ? out.postTransferReadback : undefined
-      const xferEntry = citedEntry('transferRecord')
-      const ctrlEntry = citedEntry('sourceControlDenied')
+      const xferEntry = citedEntry('transferRecord'), ctrlEntry = citedEntry('sourceControlDenied')
       const sourceTenant = tenantOf(ctrlEntry)
       const ownerTenant = findStringField(parseRecJson(rb), ['ownertenantid', 'owner_tenant_id', 'ownerorgid', 'owner_org_id', 'destinationtenant', 'destination_tenant', 'desttenantid', 'dest_tenant_id', 'tenantid', 'tenant_id', 'tenant', 'orgid', 'org_id'])?.trim().toLowerCase()
       if (sourceTenant) out.sourceTenantId = sourceTenant
-      if (ownerTenant) out.destTenantId = ownerTenant
+      if (ownerTenant) { out.destTenantId = ownerTenant; out.observedOwnerTenantId = ownerTenant }
       const eid = typeof out.entityId === 'string' ? out.entityId : ''
-      const entityBound = Boolean(
-        eid && rb && recordContainsToken(rb, eid)
-        && (entryReferencesToken(xferEntry, eid) || entryReferencesToken(ctrlEntry, eid) || recordContainsToken(isRecObj(out.transferRecord) ? out.transferRecord : undefined, eid)),
-      )
-      if (!entityBound) delete out.entityId
-      if (ownerTenant) out.observedOwnerTenantId = ownerTenant
+      if (!(eid && rb && recordContainsToken(rb, eid) && (entryReferencesToken(xferEntry, eid) || entryReferencesToken(ctrlEntry, eid) || recordContainsToken(isRecObj(out.transferRecord) ? out.transferRecord : undefined, eid)))) delete out.entityId
     } else if (mode === 'dual_org_cache_bleed') {
       const bled = isRecObj(out.bledAccess) ? out.bledAccess : undefined
-      const primeEntry = citedEntry('primeAction'), controlEntry = citedEntry('baselineDeniedControl')
-      const primeTenant = tenantOf(primeEntry) ?? tenantOf(controlEntry)
+      const primeTenant = tenantOf(citedEntry('primeAction')) ?? tenantOf(citedEntry('baselineDeniedControl'))
       const markers = markersOf(citedEntry('bledAccess'))
       if (primeTenant) out.primeTenantId = primeTenant
-      if (markers.size === 1) {
-        const target = [...markers][0]!
-        if (target !== primeTenant) out.targetTenantId = target
-      }
+      const foreignMarkers = new Set(markers); if (primeTenant) foreignMarkers.delete(primeTenant)
+      if (foreignMarkers.size === 1) out.targetTenantId = [...foreignMarkers][0]
       if (bled) {
         const target = typeof out.targetTenantId === 'string' ? out.targetTenantId.trim().toLowerCase() : ''
         if (target && markers.has(target)) out.observedTenantId = out.targetTenantId
@@ -911,38 +901,27 @@ export function hydrateV8OracleInput(
     } else if (mode === 'batch_partial_authz') {
       const batchRec = isRecObj(out.batchRequest) ? out.batchRequest : undefined
       const batchEntry = batchRec ? idx.entriesById.get(batchRec.id) : undefined
-      const ctrlEntry = citedEntry('singleForeignControlDenied')
+      const ctrlEntry = citedEntry('singleForeignControlDenied'), mutRb = isRecObj(out.postMutationReadback) ? out.postMutationReadback : undefined
       const ownTenant = tenantOf(batchEntry) ?? tenantOf(ctrlEntry)
-      const foreignTenants = new Set([...markersOf(batchEntry), ...markersOf(ctrlEntry)])
-      if (ownTenant) {
-        out.ownTenantId = ownTenant
-        foreignTenants.delete(ownTenant)
-      }
-      if (foreignTenants.size === 1) out.foreignTenantId = [...foreignTenants][0]
+      if (ownTenant) out.ownTenantId = ownTenant
       if (Array.isArray(rawInput.requestedIds) && batchEntry) {
-        const rawIds = rawInput.requestedIds
-          .filter((x): x is string => typeof x === 'string' && x.trim().length >= MIN_TOKEN_LEN && x.length <= 128)
-          .map(x => x.trim()).slice(0, 32)
-        // Strictly derive requestedIds by exact host-recorded request reference (never substring).
-        out.requestedIds = rawIds.filter(id => entryReferencesToken(batchEntry, id))
+        out.requestedIds = rawInput.requestedIds.filter((x): x is string => typeof x === 'string' && x.trim().length >= MIN_TOKEN_LEN && x.length <= 128).map(x => x.trim()).slice(0, 32).filter(id => entryReferencesToken(batchEntry, id))
       }
       const foreignId = typeof out.foreignRecordId === 'string' ? out.foreignRecordId : ''
-      if (ctrlEntry && foreignId && (ctrlEntry.step.pathAndQuery || ctrlEntry.step.requestJson !== undefined)) {
-        if (!entryReferencesToken(ctrlEntry, foreignId)) delete out.foreignRecordId
-      }
-      if (batchRec && foreignId && recordContainsToken(batchRec, foreignId) && !isHydratedStub(batchRec)) {
-        out.returnedForeignIds = [foreignId]
-        out.foreignDataObserved = true
-      } else {
-        out.returnedForeignIds = []
-        out.foreignDataObserved = false
-      }
-      const mutRb = isRecObj(out.postMutationReadback) ? out.postMutationReadback : undefined
+      if (ctrlEntry && foreignId && (ctrlEntry.step.pathAndQuery || ctrlEntry.step.requestJson !== undefined) && !entryReferencesToken(ctrlEntry, foreignId)) delete out.foreignRecordId
+      const vFid = typeof out.foreignRecordId === 'string' ? out.foreignRecordId : ''
+      const matchedItem = batchRec && vFid && !isHydratedStub(batchRec) ? findNonErrorBatchRecord(batchRec.json, batchRec.body, vFid) : null
+      out.returnedForeignIds = matchedItem ? [vFid] : []; out.foreignDataObserved = Boolean(matchedItem)
       if (mutRb) {
-        out.foreignMutationPersisted = Boolean(
-          is2xx(mutRb.status) && !isHydratedStub(mutRb) && foreignId && recordContainsToken(mutRb, foreignId),
-        )
+        const mutIsJson = mutRb.json !== undefined || (typeof mutRb.body === 'string' && /^[\[{]/.test(mutRb.body.trim()))
+        out.foreignMutationPersisted = Boolean(is2xx(mutRb.status) && !isHydratedStub(mutRb) && vFid && (mutIsJson ? findNonErrorBatchRecord(mutRb.json, mutRb.body, vFid) !== null : recordContainsToken(mutRb, vFid)))
       }
+      const respForeign = new Set<string>([...(matchedItem ? extractTenantMarkers(matchedItem, undefined, true) : []), ...markersOf(batchEntry), ...markersOf(citedEntry('postMutationReadback'))])
+      if (ownTenant) respForeign.delete(ownTenant)
+      const rawForeign = pickStr(rawInput, 'foreignTenantId', 128)?.toLowerCase() ?? ''
+      if (respForeign.size === 1) out.foreignTenantId = [...respForeign][0]
+      else if (respForeign.size > 1 && rawForeign && respForeign.has(rawForeign)) out.foreignTenantId = rawForeign
+      else if (rawForeign && rawForeign !== ownTenant && hostKnownTenants.has(rawForeign)) out.foreignTenantId = rawForeign
     }
     return out
   }
@@ -979,28 +958,32 @@ export function hydrateV8OracleInput(
     const tEntry = tRec ? idx.entriesById.get(tRec.id) : undefined
     const sEntry = sRec ? idx.entriesById.get(sRec.id) : undefined
     const rEntry = rRec ? idx.entriesById.get(rRec.id) : undefined
-    // R2-C-8: derive source/target tenant and scope strictly from host transcript records (never free-form untrusted strings).
-    const hostSrcTenant = (sEntry?.step.actor.tenant ?? parseRoleLabel(sEntry?.actorRoleLabel ?? '').tenant ?? [...extractTenantMarkers(sEntry?.step.json, sEntry?.step.body)][0] ?? [...extractTenantMarkers(sEntry?.step.requestJson)][0] ?? '').trim().toLowerCase()
-    const rRespMarkers = rEntry ? extractTenantMarkers(rEntry.step.json, rEntry.step.body) : new Set<string>()
-    const rReqMarkers = rEntry ? extractTenantMarkers(rEntry.step.requestJson) : new Set<string>()
+    // R3-C-5: derive source/target tenant & scope strictly from host persona/capability metadata and response-side markers.
+    const capIdx = buildCapOriginIndex(idx.entriesById.values(), ANON_HANDLE_RE)
+    const capTenantOf = (e: HydratableEntry | undefined): string => {
+      if (!e) return ''
+      for (const c of [...(e.actorPersona?.startsWith('cap:') ? [e.actorPersona] : []), ...(e.consumedCapabilities ?? []), ...(e.emittedCapabilities ?? [])]) { const t = capIdx.emitterActorOf(c)?.tenant; if (t) return t }
+      return ''
+    }
+    const hostActorOf = (e: HydratableEntry | undefined): string => { const a = e ? actorOfEntry(e)?.trim().toLowerCase() ?? '' : ''; return a && !ANON_HANDLE_RE.test(a) && !a.startsWith('cap:') ? a : '' }
+    const hostPersonaTenantOf = (e: HydratableEntry | undefined): string => (e?.step.actor.tenant ?? parseRoleLabel(e?.actorRoleLabel ?? '').tenant ?? capTenantOf(e) ?? '').trim().toLowerCase()
+    const sRespMarkers = sEntry ? extractTenantMarkers(sEntry.step.json, sEntry.step.body, true) : new Set<string>()
+    const rRespMarkers = rEntry ? extractTenantMarkers(rEntry.step.json, rEntry.step.body, true) : new Set<string>()
+    const hostSrcTenant = (hostPersonaTenantOf(sEntry) || [...sRespMarkers][0] || '').trim().toLowerCase()
     const rawTarget = pickStr(rawInput, 'targetTenant', 128)?.toLowerCase() ?? ''
-    const allRMarkers = new Set([...rRespMarkers, ...rReqMarkers])
-    const hostDstTenant = (rawTarget && allRMarkers.has(rawTarget) ? rawTarget : [...rRespMarkers][0] ?? [...rReqMarkers][0] ?? (rEntry?.step.actor.tenant ?? parseRoleLabel(rEntry?.actorRoleLabel ?? '').tenant ?? '')).trim().toLowerCase()
-    const hostScopeOf = (entry: HydratableEntry | undefined, tenant: string): string => {
+    const hostDstTenant = ((rawTarget && rRespMarkers.has(rawTarget) ? rawTarget : [...rRespMarkers][0]) || hostPersonaTenantOf(rEntry)).trim().toLowerCase()
+    const sActor = hostActorOf(sEntry), rActor = hostActorOf(rEntry), distinctPersonas = Boolean(sActor && rActor && sActor !== rActor)
+    const hostScopeOf = (entry: HydratableEntry | undefined, tenant: string, actor: string): string => {
       if (!entry) return ''
-      const hdrScope = headerLookupCI(entry.step.requestHeaders, 'x-scope')
-      if (hdrScope) return hdrScope.toLowerCase()
-      const jsonScope = findStringField(entry.step.json, ['scope']) ?? findStringField(entry.step.requestJson, ['scope'])
-      if (jsonScope) return jsonScope.toLowerCase()
+      const respScope = extractResponseScope(entry.step.json, entry.step.body)
+      if (respScope) return respScope
       const rt = (entry.step.route ?? entry.step.pathAndQuery ?? '').split('?', 1)[0]?.replace(/\/+$/, '').toLowerCase() ?? ''
+      if (distinctPersonas && actor && rt) return tenant ? `${tenant}:${actor}:${rt}` : `${actor}:${rt}`
       return rt && tenant ? `${tenant}:${rt}` : rt
     }
-    if (hostSrcTenant) out.sourceTenant = hostSrcTenant
-    if (hostDstTenant) out.targetTenant = hostDstTenant
-    const hostSrcScope = hostScopeOf(sEntry, hostSrcTenant)
-    const hostDstScope = hostScopeOf(rEntry, hostDstTenant)
-    if (hostSrcScope) out.sourceScope = hostSrcScope
-    if (hostDstScope) out.targetScope = hostDstScope
+    if (hostSrcTenant) out.sourceTenant = hostSrcTenant; if (hostDstTenant) out.targetTenant = hostDstTenant
+    const hostSrcScope = hostScopeOf(sEntry, hostSrcTenant, sActor), hostDstScope = hostScopeOf(rEntry, hostDstTenant, rActor)
+    if (hostSrcScope) out.sourceScope = hostSrcScope; if (hostDstScope) out.targetScope = hostDstScope
     // Bind cryptographic digests STRICTLY to cryptoAttestations or request signature/token headers/query —
     // NEVER response-body hashes (`observedResponseDigests` / `rec.artifactDigest`), and NEVER same exchange.
     const sameIssReplay = Boolean(sRec && rRec && sRec.id === rRec.id)
