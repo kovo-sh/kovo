@@ -1,9 +1,11 @@
 // Finding inspector (owned by Agent Q). Opened from Findings, and by every
 // cross-link to a finding (Surface, Workflow, Exchanges, palette…).
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import type { ReactNode } from 'react'
 
 import { generatePatchAction } from '../../../actions.ts'
+import { reviewPatchProposalAction, triageFindingAction } from '../../../actions-triage.ts'
+import type { OperatorSeverityOverride, OperatorTriageStatus, PatchProposalReviewStatus } from '../../../actions-triage.ts'
 import { callerCompatibilityLabels, dynamicRetestLabels, patchStatusLabels } from '../../../report-summary.ts'
 import { useRun, useRunModel } from '../data.tsx'
 import { Disclosure, EmptyState, LinkRow, Props, Section, Tag } from '../display.tsx'
@@ -11,12 +13,14 @@ import { cap, fmtDate, host, plural } from '../format.ts'
 import { SevGlyph, StatusGlyph } from '../glyphs.tsx'
 import { Icon } from '../icons.tsx'
 import { covCat, normFStatus, prettyCat, SEV_LABEL, stLabel } from '../meta.ts'
-import type { FindingRow } from '../model.ts'
+import type { Detail, FindingRow } from '../model.ts'
 import { useLinks } from '../nav.tsx'
 import { ExchangeLink, PaneBody, PaneHeader } from '../pane.tsx'
 import type { InspectorProps } from '../pane.tsx'
 import { useToast } from '../toast.tsx'
 import { cn, runBtn, RW } from '../tw.ts'
+import { getTriageStatusMeta, getTriageStatusOptions } from './findings.tsx'
+import type { FindingWithTriage } from './findings.tsx'
 import { CodeLocations, CopyCurlButton, FoundBy, OnSurface } from './queue-read.tsx'
 
 /** Unified Verify Fix gate across FindingInspector and ReportView: server requires `replaySpecId`. */
@@ -34,6 +38,196 @@ const RETEST_L: Record<string, string> = { reproduced: 'Still reproducible', fix
 const RETEST_ST: Record<string, string> = { reproduced: 'failed', fixed: 'confirmed', inconclusive: 'inconclusive' }
 
 const text = (v: unknown) => v == null ? '' : typeof v === 'string' ? v : JSON.stringify(v)
+
+const SEVERITY_OVERRIDE_OPTIONS: readonly { value: OperatorSeverityOverride; label: string }[] = [
+  { value: 'critical', label: 'Critical' },
+  { value: 'high', label: 'High' },
+  { value: 'medium', label: 'Medium' },
+  { value: 'low', label: 'Low' },
+  { value: 'info', label: 'Info' },
+]
+
+export type PatchProposalItem = Detail['patchProposals'][number]
+
+/** Shared Approve / Reject + editable review notes control for patch proposals in FindingInspector and ReportView. */
+export function PatchProposalReview({
+  runId,
+  proposal,
+  onReviewed,
+  compact = false,
+}: {
+  runId: string
+  proposal: PatchProposalItem
+  onReviewed: () => Promise<void>
+  compact?: boolean
+}) {
+  const toast = useToast()
+  const [notes, setNotes] = useState(proposal.reviewNotes ?? '')
+  const [busy, setBusy] = useState<'approved' | 'rejected' | 'notes' | null>(null)
+
+  useEffect(() => {
+    setNotes(proposal.reviewNotes ?? '')
+  }, [proposal.id, proposal.updatedAt, proposal.reviewNotes])
+
+  const notesDirty = notes.trim() !== (proposal.reviewNotes ?? '').trim()
+
+  const submit = async (status: PatchProposalReviewStatus, mode: 'approved' | 'rejected' | 'notes') => {
+    setBusy(mode)
+    try {
+      await reviewPatchProposalAction({
+        data: {
+          runId,
+          proposalId: proposal.id,
+          status,
+          reviewNotes: notes,
+        },
+      })
+      await onReviewed()
+      toast.show(
+        mode === 'approved' ? 'Patch approved' : mode === 'rejected' ? 'Patch rejected' : 'Patch review notes saved',
+        { icon: 'check' },
+      )
+    } catch (e) {
+      toast.show(e instanceof Error ? e.message : 'Kovo Hunter could not update this patch review.', { tone: 'error' })
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const currentReviewStatus: PatchProposalReviewStatus = proposal.status === 'approved'
+    ? 'approved'
+    : proposal.status === 'rejected'
+      ? 'rejected'
+      : 'pending'
+
+  return <div className="mt-1.5" data-slot="patch-proposal-review">
+    <textarea
+      aria-label="Patch review notes"
+      rows={compact ? 2 : 2}
+      className={cn(RW.fieldTextarea, 'w-full')}
+      placeholder="Operator review notes…"
+      value={notes}
+      disabled={busy !== null}
+      onChange={e => setNotes(e.target.value)}
+    />
+    <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+      <button
+        type="button"
+        className={runBtn({ variant: proposal.status === 'approved' ? 'primary' : 'default', size: 'sm' })}
+        disabled={busy !== null}
+        onClick={() => void submit('approved', 'approved')}
+      >
+        <Icon name="check" />{busy === 'approved' ? 'Approving…' : 'Approve'}
+      </button>
+      <button
+        type="button"
+        className={runBtn({ variant: proposal.status === 'rejected' ? 'dangerSolid' : 'default', size: 'sm' })}
+        disabled={busy !== null}
+        onClick={() => void submit('rejected', 'rejected')}
+      >
+        <Icon name="x" />{busy === 'rejected' ? 'Rejecting…' : 'Reject'}
+      </button>
+      {notesDirty && <button
+        type="button"
+        className={runBtn({ variant: 'ghost', size: 'sm' })}
+        disabled={busy !== null}
+        onClick={() => void submit(currentReviewStatus, 'notes')}
+      >
+        {busy === 'notes' ? 'Saving…' : 'Save notes'}
+      </button>}
+    </div>
+  </div>
+}
+
+/** Compact operator triage bar persisted alongside machine-verified verdict/severity. */
+function TriageBar({ runId, f }: { runId: string; f: FindingWithTriage }) {
+  const { refresh } = useRun()
+  const toast = useToast()
+  const triage = f.operatorTriage ?? null
+  const savedStatus: OperatorTriageStatus = triage?.status ?? 'open'
+  const savedSeverity: OperatorSeverityOverride | null = triage?.severityOverride ?? null
+  const savedNotes = triage?.notes ?? ''
+
+  const [status, setStatus] = useState<OperatorTriageStatus>(savedStatus)
+  const [severityOverride, setSeverityOverride] = useState<OperatorSeverityOverride | null>(savedSeverity)
+  const [notes, setNotes] = useState(savedNotes)
+  const [saving, setSaving] = useState(false)
+
+  useEffect(() => {
+    setStatus(savedStatus)
+    setSeverityOverride(savedSeverity)
+    setNotes(savedNotes)
+  }, [f.id, triage?.updatedAt, savedStatus, savedSeverity, savedNotes])
+
+  const dirty = status !== savedStatus || severityOverride !== savedSeverity || notes.trim() !== savedNotes.trim()
+  const statusOptions = getTriageStatusOptions()
+
+  const save = async () => {
+    setSaving(true)
+    try {
+      await triageFindingAction({
+        data: {
+          runId,
+          findingId: f.id,
+          status,
+          severityOverride,
+          notes,
+        },
+      })
+      await refresh()
+      toast.show('Triage saved', { icon: 'check', sub: f.title })
+    } catch (e) {
+      toast.show(e instanceof Error ? e.message : 'Kovo Hunter could not save triage.', { tone: 'error' })
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return <div data-slot="finding-triage-bar" className="mb-4 rounded-[7px] bg-sunk px-2.5 py-2 shadow-[inset_0_0_0_1px_var(--line)]">
+    <div className="mb-1.5 flex items-center justify-between gap-2">
+      <span className="text-[11.5px] font-medium text-fg-subtle">Triage</span>
+      {triage?.updatedAt ? <span className="text-[11px] text-fg-subtle">Updated {fmtDate(triage.updatedAt)}</span> : null}
+    </div>
+    <div className="flex flex-wrap items-center gap-1.5">
+      <select
+        aria-label="Triage status"
+        className={cn(RW.fieldInput, 'min-w-[130px] flex-1')}
+        value={status}
+        disabled={saving}
+        onChange={e => setStatus(e.target.value as OperatorTriageStatus)}
+      >
+        {statusOptions.map(opt => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
+      </select>
+      <select
+        aria-label="Severity override"
+        className={cn(RW.fieldInput, 'min-w-[135px]')}
+        value={severityOverride ?? ''}
+        disabled={saving}
+        onChange={e => setSeverityOverride((e.target.value || null) as OperatorSeverityOverride | null)}
+      >
+        <option value="">Severity: Machine ({SEV_LABEL[f.severity] ?? f.severity})</option>
+        {SEVERITY_OVERRIDE_OPTIONS.map(opt => <option key={opt.value} value={opt.value}>Override: {opt.label}</option>)}
+      </select>
+      <button
+        type="button"
+        className={runBtn({ variant: dirty ? 'primary' : 'default', size: 'sm' })}
+        disabled={!dirty || saving}
+        onClick={() => void save()}
+      >
+        <Icon name="check" />{saving ? 'Saving…' : 'Save'}
+      </button>
+    </div>
+    <textarea
+      aria-label="Operator triage notes"
+      rows={2}
+      className={cn(RW.fieldTextarea, 'mt-1.5 w-full')}
+      placeholder="Operator triage notes…"
+      value={notes}
+      disabled={saving}
+      onChange={e => setNotes(e.target.value)}
+    />
+  </div>
+}
 
 /** Primary action row inside Beat 3 ("How to fix & verify"): Copy as cURL + immediate Verify Fix + Generate verified patch + retest & patch history. */
 function FixVerifyActions({ f, primaryExchangeId }: { f: FindingRow; primaryExchangeId?: string }) {
@@ -97,12 +291,12 @@ function FixVerifyActions({ f, primaryExchangeId }: { f: FindingRow; primaryExch
     {patches.length > 0 && <div className="mt-2 divide-y divide-dashed divide-line">
       {patches.map(p => <div key={p.id} className="py-2 text-[12px] leading-[18px] text-fg-muted">
         <div className="mb-1 flex flex-wrap items-center gap-1.5">
-          <Tag tone={p.status === 'withheld' || p.status === 'rejected' ? 'warn' : undefined}>{patchStatusLabels[p.status]}</Tag>
+          <Tag tone={p.status === 'withheld' || p.status === 'rejected' ? 'warn' : p.status === 'approved' ? 'accent' : undefined}>{patchStatusLabels[p.status]}</Tag>
           <Tag>{callerCompatibilityLabels[p.callerCompatibility]}</Tag>
           <Tag>{dynamicRetestLabels[p.dynamicRetestVerdict]}</Tag>
         </div>
-        {p.reviewNotes && <p className="m-0 mb-1 text-[12px] text-fg-muted">{p.reviewNotes}</p>}
-        {p.status === 'approved' && p.diff.trim() && <pre className={cn(RW.pre, 'max-h-[240px]')}>{p.diff}</pre>}
+        {p.status === 'approved' && p.diff.trim() && <pre className={cn(RW.pre, 'mt-1.5 max-h-[240px]')}>{p.diff}</pre>}
+        <PatchProposalReview runId={detail.run.id} proposal={p} onReviewed={refresh} compact />
       </div>)}
     </div>}
   </>
@@ -132,6 +326,8 @@ export function FindingInspector({ sel }: InspectorProps) {
   const codeLocs = f.codeLocations ?? []
   const diff = replay?.lastVerificationDiff as unknown
   const hasPatches = (model.detail.patchProposals ?? []).some(p => p.findingId === f.id)
+  const triage = (f as FindingWithTriage).operatorTriage ?? null
+  const triageMeta = triage ? getTriageStatusMeta(triage.status) : null
 
   const hasTechnicalDetails = Boolean(
     f.verification || replay || diff != null || f.counterevidence
@@ -154,6 +350,8 @@ export function FindingInspector({ sel }: InspectorProps) {
         <div className="mb-2.5 flex flex-wrap gap-1.5">
           <Tag><SevGlyph sev={f.severity} />{SEV_LABEL[f.severity] ?? f.severity}</Tag>
           <Tag tone={st === 'confirmed' ? 'accent' : undefined}><StatusGlyph status={st} />{stLabel(f.status === 'static_verified' ? 'static_verified' : st)}</Tag>
+          {triage && triage.status !== 'open' && triageMeta && <Tag tone={triageMeta.tone}>Triage: {triageMeta.short}</Tag>}
+          {triage?.severityOverride && <Tag>Override: {SEV_LABEL[triage.severityOverride] ?? triage.severityOverride}</Tag>}
         </div>
         <h2 className="m-0 mb-3 break-words text-[15px] font-semibold leading-[22px] tracking-[-0.012em] text-fg">{f.title}</h2>
         <Props rows={[
@@ -163,6 +361,7 @@ export function FindingInspector({ sel }: InspectorProps) {
           ...(f.verificationTier ? [['Verified', TIER_L[f.verificationTier] ?? cap(f.verificationTier)] as [string, ReactNode]] : []),
           ...(spans.length > 1 ? [['Spans', <span className="rw-wrap break-all whitespace-normal font-mono text-[11.5px]">{spans.map(host).join(', ')}</span>] as [string, ReactNode]] : []),
         ]} />
+        <TriageBar runId={model.detail.run.id} f={f as FindingWithTriage} />
 
         {(f.reason || (f.check && (f.check.expected || obs !== undefined))) && <Section title="What happened">
           {f.reason && <p className="text-fg!">{f.reason}</p>}
