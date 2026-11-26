@@ -16,6 +16,7 @@ import { isLocalLabAutoApprovalOrigin } from './approval-judge.ts'
 import type { StateChangeApprovalContext } from './approval-judge.ts'
 import { scanSecondOrderMarkers } from './canary-broker.ts'
 import type { CanaryBroker, SecondOrderStore } from './canary-broker.ts'
+import { detectSessionExpiry, scanJwtCandidatesLinear } from './persona-auth.ts'
 import { buildPersonaHeader, personaSecrets } from './persona-vault.ts'
 import type { ResolvedPersona } from './persona-vault.ts'
 import { redact, redactHeaders, scanSecretHeaders, scanSecrets } from './redact.ts'
@@ -29,7 +30,7 @@ import {
   RequestAdmissionEngine,
   validateCallerHeaders,
 } from './request-admission.ts'
-import type { AdmissionDecision, AdmissionRequest } from './request-admission.ts'
+import type { AdmissionDecision, AdmissionRequest, ValidateCallerHeadersOptions } from './request-admission.ts'
 import { globalKillSwitch, KillSwitchTrippedError } from './kill-switch.ts'
 import type { GlobalKillSwitch } from './kill-switch.ts'
 import {
@@ -170,6 +171,7 @@ export type WireCredentialSource =
   | 'persona_vault'
   | 'session_jar'
   | 'caller_self_minted'
+  | 'ephemeral_observed'
   | 'persona_and_jar'
 
 /**
@@ -183,7 +185,7 @@ export interface WireCredentialProvenance {
   /** Primary auth source summary for the final hop. */
   source: WireCredentialSource
   /** Distinct contributing credential sources on the wire. */
-  sources: Array<'persona_vault' | 'session_jar' | 'caller_self_minted' | 'csrf_bind'>
+  sources: Array<'persona_vault' | 'session_jar' | 'caller_self_minted' | 'ephemeral_observed' | 'csrf_bind'>
   /** Declared persona handle if persona credentials were transmitted on the final hop. */
   personaHandle: string | null
   /** Session jar label attached to this exchange, if any. */
@@ -511,11 +513,15 @@ interface JarCookieEntry {
   /** Epoch ms of the most recent Set-Cookie write for this jar entry. */
   setAt: number
   /**
-   * Number of Set-Cookie writes observed for this entry inside the current jar.
-   * `>= 2` marks an in-jar rotation, which is allowed to supersede a stale
-   * Persona Vault cookie (a single colliding write never may — that invariant
-   * prevents a target from hijacking the operator-approved credential).
+   * Q4: True when this cookie entry was explicitly issued by a server `Set-Cookie` response.
+   * Paired with `vaultValueAtWrite` and timestamp checks so the very first server-issued
+   * rotation supersedes a stale Persona Vault cookie immediately while untouched Vault seed
+   * cookies and fresher post-reauth Vault refreshes win cleanly.
    */
+  rotatedFromResponse: boolean
+  /** Vault cookie value observed on the request that received this `Set-Cookie`, if any. */
+  vaultValueAtWrite?: string
+  /** Number of Set-Cookie writes observed for this entry inside the current jar. */
   writeCount: number
 }
 
@@ -550,6 +556,8 @@ interface SessionJar {
   scopeRevision: number
   cookies: Map<string, JarCookieEntry>
   csrfTokens: Map<string, StoredCsrfToken>
+  /** Epoch ms when broker auto-reauth refreshed the owning persona's Vault credential. */
+  vaultRefreshedAt?: number
   lastUsedAt: number
 }
 
@@ -696,6 +704,7 @@ function parseSetCookieHeaderEntries(
         sameSite,
         expiresAt,
         setAt: now,
+        rotatedFromResponse: true,
         writeCount: 0,
       },
     })
@@ -1489,7 +1498,7 @@ function normalizeHeaders(headers: IncomingHttpHeaders | Record<string, string>)
 
 function canonicalizeCallerHeaders(
   headers: Record<string, string> | undefined,
-  options: { allowSelfMintedBearer?: boolean; stripPseudoHeaders?: boolean } = {},
+  options: ValidateCallerHeadersOptions = {},
 ): Record<string, string> {
   const checked = validateCallerHeaders(headers, options)
   if (!checked.ok) throw new BrokerDenied(checked.reason)
@@ -1543,6 +1552,135 @@ function setHeaderCaseInsensitive(headers: Record<string, string>, key: string, 
   headers[key] = value
 }
 
+const LOGOUT_PATH_RE = /(?:^|\/)(?:log[-_]?out|sign[-_]?out)(?:\/|$)/i
+const PRIVILEGED_PERSONA_RE =
+  /(?:^|[^a-z0-9])(?:admin|administrator|owner|root|superadmin|superuser|staff|operator|system|internal|service|moderator|privileged)(?:$|[^a-z0-9])/i
+const EPHEMERAL_TOKEN_KEY_RE =
+  /^(?:access_?token|auth_?token|id_?token|jwt|jwt_?token|bearer_?token|session_?token|api_?token|token)$/i
+const EPHEMERAL_TOKEN_HEADERS = [
+  'authorization',
+  'x-auth-token',
+  'x-access-token',
+  'x-jwt-token',
+  'x-session-token',
+] as const
+const MAX_EPHEMERAL_RUNS = 64
+const MAX_EPHEMERAL_TOKENS_PER_RUN = 256
+const MAX_EPHEMERAL_BODY_SCAN_BYTES = 256 * 1024
+const MAX_EPHEMERAL_TEXT_SCAN_BYTES = 64 * 1024
+
+function sha256Hex(value: string): string {
+  return createHash('sha256').update(value, 'utf8').digest('hex')
+}
+
+function isPrivilegedPersona(handle: string | undefined, roleLabel: string | undefined): boolean {
+  if (handle && PRIVILEGED_PERSONA_RE.test(handle)) return true
+  if (roleLabel && PRIVILEGED_PERSONA_RE.test(roleLabel)) return true
+  return false
+}
+
+function personaVaultUpdatedAtMs(persona: ResolvedPersona | undefined): number {
+  if (!persona) return 0
+  return Math.max(
+    persona.session?.updatedAt ?? 0,
+    persona.sessionMtimeMs ?? 0,
+    persona.secretMtimeMs ?? 0,
+  )
+}
+
+function jarCookieSupersedesVault(
+  entry: JarCookieEntry,
+  vaultValue: string,
+  vaultUpdatedAtMs: number,
+  jarVaultRefreshedAtMs: number,
+): boolean {
+  if (!entry.rotatedFromResponse) return false
+  if (entry.value === vaultValue) return false
+  if (entry.vaultValueAtWrite !== vaultValue) return false
+  if (jarVaultRefreshedAtMs > 0 && entry.setAt < jarVaultRefreshedAtMs) return false
+  if (vaultUpdatedAtMs > 0 && Math.floor(vaultUpdatedAtMs) > entry.setAt) return false
+  return true
+}
+
+function isSignedJwtToken(value: string): boolean {
+  if (value.length < 24 || value.length > 8192 || !value.startsWith('eyJ')) return false
+  const parts = value.split('.')
+  if (parts.length !== 3) return false
+  return (
+    parts[0]!.length >= 8 &&
+    parts[1]!.length >= 8 &&
+    parts[2]!.length >= 8 &&
+    /^[A-Za-z0-9_-]+$/.test(parts[0]!) &&
+    /^[A-Za-z0-9_-]+$/.test(parts[1]!) &&
+    /^[A-Za-z0-9_-]+$/.test(parts[2]!)
+  )
+}
+
+function extractCandidateEphemeralTokens(
+  rawHeaders: Record<string, string>,
+  rawBody: string,
+  mediaType: string,
+): string[] {
+  const candidates = new Set<string>()
+  const push = (raw: string) => {
+    if (candidates.size >= 32) return
+    const trimmed = raw.trim().replace(/^Bearer\s+/i, '').trim()
+    if (trimmed.length < 16 || trimmed.length > 8192 || /[\s\r\n\0]/.test(trimmed)) return
+    candidates.add(trimmed)
+  }
+
+  for (const name of EPHEMERAL_TOKEN_HEADERS) {
+    const val = rawHeaders[name]
+    if (val) push(val)
+  }
+
+  if (rawBody && rawBody.length <= MAX_EPHEMERAL_BODY_SCAN_BYTES) {
+    const lowerMedia = mediaType.toLowerCase()
+    const trimmedBody = rawBody.trimStart()
+    if (lowerMedia.includes('json') || trimmedBody.startsWith('{') || trimmedBody.startsWith('[')) {
+      try {
+        const parsed = JSON.parse(rawBody) as unknown
+        let visited = 0
+        const walk = (node: unknown, depth: number) => {
+          if (depth > 6 || visited >= 256 || candidates.size >= 32 || !node) return
+          visited += 1
+          if (Array.isArray(node)) {
+            for (const item of node.slice(0, 64)) walk(item, depth + 1)
+            return
+          }
+          if (typeof node === 'object') {
+            for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
+              if (candidates.size >= 32) break
+              if (typeof v === 'string') {
+                if (EPHEMERAL_TOKEN_KEY_RE.test(k) || isSignedJwtToken(v)) {
+                  push(v)
+                }
+              } else if (v && typeof v === 'object') {
+                walk(v, depth + 1)
+              }
+            }
+          }
+        }
+        walk(parsed, 0)
+      } catch {
+        // Not valid JSON; fall through to linear JWT scan below.
+      }
+    }
+  }
+
+  if (rawBody && candidates.size < 32) {
+    const sample = rawBody.length > MAX_EPHEMERAL_TEXT_SCAN_BYTES
+      ? rawBody.slice(0, MAX_EPHEMERAL_TEXT_SCAN_BYTES)
+      : rawBody
+    for (const jwt of scanJwtCandidatesLinear(sample)) {
+      if (isSignedJwtToken(jwt)) push(jwt)
+      if (candidates.size >= 32) break
+    }
+  }
+
+  return [...candidates]
+}
+
 function buildWireCredentialProvenance(input: {
   outboundHeaders: Record<string, string>
   vaultHeaderNames: readonly string[]
@@ -1553,6 +1691,7 @@ function buildWireCredentialProvenance(input: {
   personaHandle: string | null
   session: string | null
   authMutated: boolean
+  ephemeralObservedAuth?: boolean
 }): WireCredentialProvenance {
   const vaultHeaderSet = new Set(input.vaultHeaderNames.map(h => h.toLowerCase()))
   const vaultCookies = [...new Set(input.vaultCookieNames)].sort()
@@ -1590,11 +1729,16 @@ function buildWireCredentialProvenance(input: {
   const hasPersonaVault = vaultHeaders.length > 0 || vaultCookies.length > 0
   const hasSessionJar = jarCookies.length > 0
   const hasCallerAuth = callerAuthHeaders.length > 0
+  const hasEphemeralObserved = hasCallerAuth && input.ephemeralObservedAuth === true && callerAuthSet.has('authorization')
 
   const sources: WireCredentialProvenance['sources'] = []
   if (hasPersonaVault) sources.push('persona_vault')
   if (hasSessionJar) sources.push('session_jar')
-  if (hasCallerAuth) sources.push('caller_self_minted')
+  if (hasEphemeralObserved) {
+    sources.push('ephemeral_observed')
+  } else if (hasCallerAuth) {
+    sources.push('caller_self_minted')
+  }
   if (csrfLower && headerNamesSet.has(csrfLower)) sources.push('csrf_bind')
 
   const source: WireCredentialSource =
@@ -1604,9 +1748,11 @@ function buildWireCredentialProvenance(input: {
         ? 'persona_vault'
         : hasSessionJar
           ? 'session_jar'
-          : hasCallerAuth
-            ? 'caller_self_minted'
-            : 'none'
+          : hasEphemeralObserved
+            ? 'ephemeral_observed'
+            : hasCallerAuth
+              ? 'caller_self_minted'
+              : 'none'
 
   return {
     authenticated: hasPersonaVault || hasSessionJar || hasCallerAuth,
@@ -1720,6 +1866,8 @@ export class RequestBroker {
   private readonly personaSessionOwners = new Map<string, string>()
   private readonly redactedSecrets = new Map<string, NamedSecret>()
   private readonly seenGcbTokens = new Map<string, { probeClass: string; verifyUsed: boolean }>()
+  /** Q4: Run-scoped SHA-256 digests of signed/opaque tokens observed in non-privileged in-scope responses (never raw tokens). */
+  private readonly ephemeralTokenDigestsByRun = new Map<string, Map<string, { origin: string; observedAt: number }>>()
   private readonly transportConfig: TransportConfig
   private readonly httpTransport: Transport
   private readonly admissionEngine: RequestAdmissionEngine
@@ -1955,7 +2103,19 @@ export class RequestBroker {
   purgeSessionJars(runId?: string, origin?: string) {
     if (!runId && !origin) {
       this.sessionJars.clear()
+      this.ephemeralTokenDigestsByRun.clear()
       return
+    }
+    if (!origin && runId) {
+      this.ephemeralTokenDigestsByRun.delete(runId)
+    } else if (origin) {
+      for (const [rKey, tokens] of this.ephemeralTokenDigestsByRun.entries()) {
+        if (runId && rKey !== runId) continue
+        for (const [digest, meta] of tokens.entries()) {
+          if (meta.origin === origin) tokens.delete(digest)
+        }
+        if (tokens.size === 0) this.ephemeralTokenDigestsByRun.delete(rKey)
+      }
     }
     for (const [key, jar] of this.sessionJars.entries()) {
       if (runId && jar.runId !== runId) continue
@@ -2054,6 +2214,7 @@ export class RequestBroker {
     url: URL,
     response: RawHttpResponse,
     mediaType: string,
+    vaultCookiesAtRequest?: ReadonlyMap<string, string>,
   ) {
     const maxCookies = Math.max(1, Math.min(this.options.maxCookiesPerJar ?? 32, 64))
     const parsedEntries = parseSetCookieHeaderEntries(response.headers, url)
@@ -2065,6 +2226,8 @@ export class RequestBroker {
       }
       const existing = jar.cookies.get(item.entry.key)
       item.entry.writeCount = (existing?.writeCount ?? 0) + 1
+      item.entry.rotatedFromResponse = true
+      item.entry.vaultValueAtWrite = vaultCookiesAtRequest?.get(item.entry.name)
       if (existing) {
         jar.cookies.delete(item.entry.key)
       } else if (jar.cookies.size >= maxCookies) {
@@ -2552,12 +2715,149 @@ export class RequestBroker {
     }
   }
 
+  private collectVaultSecretDigests(req: BrokerHttpRequest, grant: Grant): Set<string> {
+    const digests = new Set<string>()
+    const addSecret = (raw: string | undefined) => {
+      if (!raw || raw.length < 8) return
+      digests.add(sha256Hex(raw))
+      const stripped = raw.replace(/^Bearer\s+/i, '').trim()
+      if (stripped && stripped !== raw && stripped.length >= 8) {
+        digests.add(sha256Hex(stripped))
+      }
+    }
+    for (const s of collectSecrets(req, grant)) addSecret(s.value)
+    for (const s of this.redactedSecrets.values()) addSecret(s.value)
+    return digests
+  }
+
+  private observeEphemeralResponseTokens(input: {
+    req: BrokerHttpRequest
+    grant: Grant
+    url: URL
+    status: number
+    rawResponseHeaders: Record<string, string>
+    rawBody: string
+    mediaType: string
+    includePersona: boolean
+    personaHandle: string | undefined
+    effectiveSecrets: readonly NamedSecret[]
+  }): void {
+    if (input.status < 200 || input.status >= 400) return
+    if (input.includePersona && input.personaHandle) {
+      const persona = input.grant.personas?.get(input.personaHandle)
+      if (isPrivilegedPersona(input.personaHandle, persona?.roleLabel)) return
+    }
+    const candidates = extractCandidateEphemeralTokens(input.rawResponseHeaders, input.rawBody, input.mediaType)
+    if (candidates.length === 0) return
+
+    const vaultDigests = new Set<string>()
+    for (const s of input.effectiveSecrets) {
+      if (!s.value || s.value.length < 8) continue
+      vaultDigests.add(sha256Hex(s.value))
+      const stripped = s.value.replace(/^Bearer\s+/i, '').trim()
+      if (stripped && stripped !== s.value && stripped.length >= 8) {
+        vaultDigests.add(sha256Hex(stripped))
+      }
+    }
+
+    const runKey = this.resolveScopeRunKey(input.req, input.grant)
+    let runTokens = this.ephemeralTokenDigestsByRun.get(runKey)
+    if (!runTokens) {
+      while (this.ephemeralTokenDigestsByRun.size >= MAX_EPHEMERAL_RUNS) {
+        const oldestRun = this.ephemeralTokenDigestsByRun.keys().next().value
+        if (oldestRun === undefined) break
+        this.ephemeralTokenDigestsByRun.delete(oldestRun)
+      }
+      runTokens = new Map()
+      this.ephemeralTokenDigestsByRun.set(runKey, runTokens)
+    } else {
+      // Refresh run LRU order
+      this.ephemeralTokenDigestsByRun.delete(runKey)
+      this.ephemeralTokenDigestsByRun.set(runKey, runTokens)
+    }
+
+    const now = Date.now()
+    for (const token of candidates) {
+      const digest = sha256Hex(token)
+      // H-8: Never allow a Vault/pre-seeded persona secret to enter the ephemeral caller channel.
+      if (vaultDigests.has(digest)) continue
+      if (runTokens.has(digest)) {
+        runTokens.delete(digest)
+      } else if (runTokens.size >= MAX_EPHEMERAL_TOKENS_PER_RUN) {
+        const oldest = runTokens.keys().next().value
+        if (oldest !== undefined) runTokens.delete(oldest)
+      }
+      runTokens.set(digest, { origin: input.url.origin, observedAt: now })
+    }
+  }
+
+  private isEphemeralTokenAuthorized(
+    runKey: string,
+    tokenDigestSha256: string,
+    req: BrokerHttpRequest,
+    grant: Grant,
+  ): boolean {
+    const runTokens = this.ephemeralTokenDigestsByRun.get(runKey)
+    if (!runTokens || !runTokens.has(tokenDigestSha256)) return false
+    // H-8 defense-in-depth: refuse even if a Vault secret was added/rotated after observation.
+    const vaultDigests = this.collectVaultSecretDigests(req, grant)
+    if (vaultDigests.has(tokenDigestSha256)) return false
+    return true
+  }
+
+  private shouldAutoReauthOnResponse(
+    response: RawHttpResponse,
+    url: URL,
+    personaHandle: string,
+    grant: Grant,
+  ): boolean {
+    const persona = grant.personas?.get(personaHandle)
+    const signal = detectSessionExpiry({
+      status: response.status,
+      headers: response.headers,
+      body: response.body,
+      requestOrigin: url.origin,
+      loginUrl: persona?.loginConfig?.loginUrl ?? null,
+    })
+    if (!signal.expired) return false
+    // Do not auto-reauth an intentional logout/signout redirect back to /login.
+    if (
+      (signal.reason === 'login_redirect' || signal.reason === 'clerk_signed_out') &&
+      LOGOUT_PATH_RE.test(url.pathname)
+    ) {
+      return false
+    }
+    return true
+  }
+
+  private clearRefreshedJarCookies(
+    jar: SessionJar | undefined,
+    refreshedHeaders: Record<string, string> | null,
+  ): void {
+    if (!jar) return
+    jar.vaultRefreshedAt = Date.now()
+    if (!refreshedHeaders) return
+    const cookieHeader = Object.entries(refreshedHeaders).find(([k]) => k.toLowerCase() === 'cookie')?.[1]
+    if (!cookieHeader) return
+    const refreshedNames = new Set(parseCookieHeaderPairs(cookieHeader).keys())
+    for (const [key, entry] of jar.cookies.entries()) {
+      if (refreshedNames.has(entry.name)) {
+        jar.cookies.delete(key)
+      }
+    }
+  }
+
   private toAdmissionRequest(
     req: BrokerHttpRequest,
     opts: { raceBurst?: boolean; kind?: 'http' | 'http2' } = {},
+    grant?: Grant,
   ): AdmissionRequest {
     const kind = opts.kind ?? 'http'
     const stripPseudoHeaders = kind === 'http2'
+    const runKey = this.resolveScopeRunKey(req, grant)
+    const isAuthorizedEphemeralBearer = grant
+      ? (digest: string) => this.isEphemeralTokenAuthorized(runKey, digest, req, grant)
+      : undefined
     return {
       kind,
       origin: req.origin,
@@ -2570,7 +2870,7 @@ export class RequestBroker {
       authMutation: req.authMutation,
       scopeHook: req.scopeHook ?? null,
       stripPseudoHeaders,
-      normalizedHeaders: canonicalizeCallerHeaders(req.headers, { allowSelfMintedBearer: true, stripPseudoHeaders }),
+      ...(isAuthorizedEphemeralBearer ? { isAuthorizedEphemeralBearer } : {}),
       isRaceBurst: opts.raceBurst === true,
       runId: req.runId,
       assignmentId: req.assignmentId,
@@ -2804,6 +3104,7 @@ export class RequestBroker {
     personaHandle: string | undefined
     resolvedPersonaHeaders: Record<string, string> | undefined
     cleanHeaders: Record<string, string>
+    ephemeralObservedAuth: boolean
     preparedBody: string | undefined
     secrets: NamedSecret[]
     followRedirects: boolean
@@ -2830,7 +3131,7 @@ export class RequestBroker {
     }
 
     const personaHandle = req.persona ?? req.personaHandle
-    const admissionReq = this.toAdmissionRequest(req, options)
+    const admissionReq = this.toAdmissionRequest(req, options, grant)
     const auditCtx = { pathAndQuery: req.pathAndQuery, persona: personaHandle, secrets: req.secrets, runId: req.runId }
 
     // Pre-flight static admission when persona or cache-buster checks must fail before consuming
@@ -2866,7 +3167,16 @@ export class RequestBroker {
       ? this.resolvePersonaHeadersForRequest(req, grant, initialOrigin, personaHandle)
       : undefined
 
-    const cleanHeaders = { ...(decision.normalizedHeaders ?? canonicalizeCallerHeaders(req.headers)) }
+    const cleanHeaders = {
+      ...(decision.normalizedHeaders ?? canonicalizeCallerHeaders(req.headers, {
+        allowSelfMintedBearer: true,
+        stripPseudoHeaders: options.kind === 'http2',
+        ...(admissionReq.isAuthorizedEphemeralBearer
+          ? { isAuthorizedEphemeralBearer: admissionReq.isAuthorizedEphemeralBearer }
+          : {}),
+      })),
+    }
+    const ephemeralObservedAuth = Boolean(decision.ephemeralObservedAuth)
     const hasMultipart = Array.isArray(req.multipartParts) && req.multipartParts.length > 0
     let preparedBody = req.body
     if (hasMultipart) {
@@ -2907,6 +3217,7 @@ export class RequestBroker {
       personaHandle,
       resolvedPersonaHeaders,
       cleanHeaders,
+      ephemeralObservedAuth,
       preparedBody,
       secrets,
       followRedirects,
@@ -3430,15 +3741,18 @@ export class RequestBroker {
       }
       const jarCookieNames: string[] = []
       const vaultCookieNames: string[] = []
+      const personaUpdatedAtMs = personaVaultUpdatedAtMs(personaHandle ? grant.personas?.get(personaHandle) : undefined)
+      const jarVaultRefreshedAtMs = jar?.vaultRefreshedAt ?? 0
       for (const [name, entry] of jarCookieByName) {
-        if (!vaultCookies.has(name) || entry.writeCount > 1) {
+        const vaultVal = vaultCookies.get(name)
+        if (vaultVal === undefined || jarCookieSupersedesVault(entry, vaultVal, personaUpdatedAtMs, jarVaultRefreshedAtMs)) {
           mergedCookies.set(name, entry.value)
           jarCookieNames.push(name)
         }
       }
       for (const [k, v] of vaultCookies) {
         const jarEntry = jarCookieByName.get(k)
-        if (jarEntry && jarEntry.writeCount > 1) continue
+        if (jarEntry && jarCookieSupersedesVault(jarEntry, v, personaUpdatedAtMs, jarVaultRefreshedAtMs)) continue
         mergedCookies.set(k, v)
         vaultCookieNames.push(k)
       }
@@ -3560,6 +3874,7 @@ export class RequestBroker {
         personaHandle: includePersona ? (personaHandle ?? null) : null,
         session: jar ? jar.session : null,
         authMutated: Boolean(req.authMutation),
+        ephemeralObservedAuth: prepared.ephemeralObservedAuth,
       })
 
       const hopRouteTemplate = routeTemplateForPath(url.pathname)
@@ -3608,25 +3923,24 @@ export class RequestBroker {
 
       const requestOriginHeader = cleanHeaders.origin
       const obs = observed(initialOrigin, url, response, this.options.source ?? 'public response', requestOriginHeader)
-      if (jar) {
-        this.storeJarCookiesAndCsrf(jar, url, response, obs.mediaType)
-      }
 
-      // 401 auto-refresh: invoke the rate-limited persona re-auth callback once, then retry.
+      // Session-expiry auto-refresh (401, pre-redirect 3xx login redirect, 403 session-expired, Clerk signed-out):
+      // invoke the rate-limited persona re-auth callback once, then retry with fresh Vault credentials.
       if (
-        response.status === 401 &&
         includePersona &&
         personaHandle &&
         !req.authMutation &&
         !options.reauthAttempted &&
         this.reauthHandler &&
-        !deadline.aborted
+        !deadline.aborted &&
+        this.shouldAutoReauthOnResponse(response, url, personaHandle, grant)
       ) {
         const reauthRunId = req.runId ?? grant.scopePolicy?.runId ?? undefined
         const refreshed = await this.reauthHandler(personaHandle, reauthRunId, url.origin).catch(() => false)
         if (refreshed !== false) {
           const refreshedPersona = grant.personas?.get(personaHandle)
           const rebuilt = refreshedPersona ? buildPersonaHeader(refreshedPersona, initialOrigin) : null
+          this.clearRefreshedJarCookies(jar, rebuilt)
           const refreshedPrepared = { ...prepared, secrets: collectSecrets(req, grant) }
           return this.executePreparedHttp(refreshedPrepared, req, grant, signal, {
             ...options,
@@ -3634,6 +3948,10 @@ export class RequestBroker {
             ...(rebuilt ? { refreshedPersonaHeaders: rebuilt } : {}),
           })
         }
+      }
+
+      if (jar) {
+        this.storeJarCookiesAndCsrf(jar, url, response, obs.mediaType, vaultCookies)
       }
 
       if (followRedirects && [301, 302, 303, 307, 308].includes(response.status)) {
@@ -3693,6 +4011,18 @@ export class RequestBroker {
       // for logs/LLMs but erases what a disclosure verifier needs. Only bounded fingerprints leave
       // this scope; raw values stay in memory for the duration of the scan.
       const rawResponseHeaders = normalizeHeaders(response.headers)
+      this.observeEphemeralResponseTokens({
+        req,
+        grant,
+        url,
+        status: response.status,
+        rawResponseHeaders,
+        rawBody,
+        mediaType: obs.mediaType,
+        includePersona,
+        personaHandle,
+        effectiveSecrets,
+      })
       if (req.onRawResponse) {
         try { req.onRawResponse({ body: rawBody, headers: { ...rawResponseHeaders } }) } catch { /* host hook must never abort exchange */ }
       }
@@ -3889,15 +4219,18 @@ export class RequestBroker {
       }
       const jarCookieNames: string[] = []
       const vaultCookieNames: string[] = []
+      const personaUpdatedAtMs = personaVaultUpdatedAtMs(personaHandle ? grant.personas?.get(personaHandle) : undefined)
+      const jarVaultRefreshedAtMs = jar?.vaultRefreshedAt ?? 0
       for (const [name, entry] of jarCookieByName) {
-        if (!vaultCookies.has(name) || entry.writeCount > 1) {
+        const vaultVal = vaultCookies.get(name)
+        if (vaultVal === undefined || jarCookieSupersedesVault(entry, vaultVal, personaUpdatedAtMs, jarVaultRefreshedAtMs)) {
           mergedCookies.set(name, entry.value)
           jarCookieNames.push(name)
         }
       }
       for (const [k, v] of vaultCookies) {
         const jarEntry = jarCookieByName.get(k)
-        if (jarEntry && jarEntry.writeCount > 1) continue
+        if (jarEntry && jarCookieSupersedesVault(jarEntry, v, personaUpdatedAtMs, jarVaultRefreshedAtMs)) continue
         mergedCookies.set(k, v)
         vaultCookieNames.push(k)
       }
@@ -3918,6 +4251,7 @@ export class RequestBroker {
         personaHandle: includePersona ? (personaHandle ?? null) : null,
         session: jar ? jar.session : null,
         authMutated: Boolean(req.authMutation),
+        ephemeralObservedAuth: prepared.ephemeralObservedAuth,
       })
 
       const hopRouteTemplate = routeTemplateForPath(url.pathname)
@@ -4003,30 +4337,32 @@ export class RequestBroker {
 
       const requestOriginHeader = cleanHeaders.origin
       const obs = observed(initialOrigin, url, response, this.options.source ?? 'public response', requestOriginHeader)
-      if (jar) {
-        this.storeJarCookiesAndCsrf(jar, url, response, obs.mediaType)
-      }
 
-      // 401 auto-refresh on HTTP/2: invoke rate-limited persona re-auth once, then retry.
+      // Session-expiry auto-refresh on HTTP/2: invoke rate-limited persona re-auth once, then retry.
       if (
-        response.status === 401 &&
         includePersona &&
         personaHandle &&
         !req.authMutation &&
         !internalOptions.reauthAttempted &&
         this.reauthHandler &&
-        !deadline.aborted
+        !deadline.aborted &&
+        this.shouldAutoReauthOnResponse(response, url, personaHandle, grant)
       ) {
         const reauthRunId = req.runId ?? grant.scopePolicy?.runId ?? undefined
         const refreshed = await this.reauthHandler(personaHandle, reauthRunId, url.origin).catch(() => false)
         if (refreshed !== false) {
           const refreshedPersona = grant.personas?.get(personaHandle)
           const rebuilt = refreshedPersona ? buildPersonaHeader(refreshedPersona, initialOrigin) : null
+          this.clearRefreshedJarCookies(jar, rebuilt)
           return this.executeHttp2Exchange(req, grant, signal, {
             reauthAttempted: true,
             ...(rebuilt ? { refreshedPersonaHeaders: rebuilt } : {}),
           })
         }
+      }
+
+      if (jar) {
+        this.storeJarCookiesAndCsrf(jar, url, response, obs.mediaType, vaultCookies)
       }
 
       const rawBody = response.body ?? ''
@@ -4048,6 +4384,18 @@ export class RequestBroker {
         ...this.redactedSecrets.values(),
       ]
       const rawResponseHeaders = normalizeHeaders(response.headers)
+      this.observeEphemeralResponseTokens({
+        req,
+        grant,
+        url,
+        status: response.status,
+        rawResponseHeaders,
+        rawBody,
+        mediaType: obs.mediaType,
+        includePersona,
+        personaHandle,
+        effectiveSecrets,
+      })
       if (req.onRawResponse) {
         try { req.onRawResponse({ body: rawBody, headers: { ...rawResponseHeaders } }) } catch { /* host hook must never abort exchange */ }
       }
@@ -4107,7 +4455,7 @@ export class RequestBroker {
     // H-4: Admit EVERY target individually through RequestAdmissionEngine up-front before releasing
     // any bytes onto the wire, so an unapproved or denied sibling never lets an earlier item send.
     const batchDecision = this.admissionEngine.admitBatch(
-      reqs.map(req => this.toAdmissionRequest(req)),
+      reqs.map(req => this.toAdmissionRequest(req, {}, grant)),
       grant,
       { isRaceBurst: false },
     )
@@ -4165,7 +4513,7 @@ export class RequestBroker {
     // 1. Validate every request up-front through RequestAdmissionEngine (H-4 per-target validation)
     //    before sending any bytes.
     const batchDecision = this.admissionEngine.admitBatch(
-      requests.map(req => this.toAdmissionRequest(req, { raceBurst: true })),
+      requests.map(req => this.toAdmissionRequest(req, { raceBurst: true }, grant)),
       grant,
       { isRaceBurst: true },
     )
@@ -4434,7 +4782,7 @@ export class RequestBroker {
         )
       : undefined
 
-    const cleanHeaders = { ...(decision.normalizedHeaders ?? canonicalizeCallerHeaders(req.headers)) }
+    const cleanHeaders = { ...(decision.normalizedHeaders ?? canonicalizeCallerHeaders(req.headers, { allowSelfMintedBearer: false })) }
     const effectiveOriginHeader = req.originHeader ?? cleanHeaders.origin ?? initialOrigin
     if (/[\r\n\0]/.test(effectiveOriginHeader)) {
       this.auditDenied(grant, initialOrigin, { reason: 'Invalid WebSocket Origin header.', method: 'WS', path: req.pathAndQuery, ...(personaHandle ? { persona: personaHandle } : {}) }, req.secrets)

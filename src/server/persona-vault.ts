@@ -67,6 +67,8 @@ export interface BrowserStorageBundle {
   storageState: PlaywrightStorageState
   /** Optional Authorization / custom auth headers observed on target-origin requests. */
   observedHeaders?: Record<string, string>
+  /** Q4: Optional per-origin observed auth headers when captured across sibling origins. */
+  observedHeadersByOrigin?: Record<string, Record<string, string>>
 }
 
 export type BrowserSessionLoginConfig = Omit<PersonaLoginConfig, 'adapter'> & {
@@ -129,6 +131,8 @@ export interface PersonaCredentialBundle {
   storage?: PersonaStorageSnapshot
   /** Origins allowed to receive `storage` defaults when no attachment explicitly opts in. */
   storageOrigins?: string[]
+  /** Q4: Per-origin storage snapshots so sibling origins never clobber same-named keys. */
+  storageByOrigin?: Record<string, PersonaStorageSnapshot>
 }
 
 /** Headers, scoped cookies, and storage that may be attached to one origin. */
@@ -342,6 +346,78 @@ function sanitizeAttachments(input: unknown): PersonaOriginAttachment[] {
   return out
 }
 
+function sanitizeStorageByOrigin(input: unknown): Record<string, PersonaStorageSnapshot> {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return {}
+  const out: Record<string, PersonaStorageSnapshot> = {}
+  let count = 0
+  for (const [rawOrigin, rawSnapshot] of Object.entries(input as Record<string, unknown>)) {
+    if (count >= MAX_BUNDLE_ATTACHMENTS) break
+    const origin = sanitizeOriginPattern(rawOrigin)
+    if (!origin) continue
+    const snapshot = sanitizeStorageSnapshot(rawSnapshot)
+    if (!snapshot) continue
+    out[origin] = snapshot
+    count += 1
+  }
+  return out
+}
+
+function sanitizeHeadersByOrigin(input: unknown): Record<string, Record<string, string>> {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return {}
+  const out: Record<string, Record<string, string>> = {}
+  let count = 0
+  for (const [rawOrigin, rawHeaders] of Object.entries(input as Record<string, unknown>)) {
+    if (count >= MAX_BUNDLE_ATTACHMENTS) break
+    const origin = sanitizeOriginPattern(rawOrigin)
+    if (!origin) continue
+    const headers = sanitizeHeaders(rawHeaders)
+    if (!Object.keys(headers).length) continue
+    out[origin] = headers
+    count += 1
+  }
+  return out
+}
+
+function mergeHeadersCaseInsensitive(
+  base: Record<string, string> | undefined,
+  override: Record<string, string> | undefined,
+): Record<string, string> {
+  const out: Record<string, string> = {}
+  const apply = (src: Record<string, string> | undefined) => {
+    if (!src) return
+    for (const [k, v] of Object.entries(src)) {
+      const lower = k.toLowerCase()
+      for (const existing of Object.keys(out)) {
+        if (existing.toLowerCase() === lower) delete out[existing]
+      }
+      out[k] = v
+    }
+  }
+  apply(base)
+  apply(override)
+  return out
+}
+
+function matchingStorageByOrigin(
+  bundle: PersonaCredentialBundle,
+  origin: string,
+): PersonaStorageSnapshot | null {
+  const map = bundle.storageByOrigin
+  if (!map) return null
+  if (Object.prototype.hasOwnProperty.call(map, origin)) return map[origin] ?? null
+  let best: PersonaStorageSnapshot | null = null
+  let bestScore = -1
+  for (const [pattern, snapshot] of Object.entries(map)) {
+    if (!originMatchesAttachment(origin, pattern)) continue
+    const score = pattern.includes('*') ? pattern.length : 10_000
+    if (score > bestScore) {
+      best = snapshot
+      bestScore = score
+    }
+  }
+  return best
+}
+
 /** Normalize an untrusted bundle (operator import, persisted file, adapter output). */
 export function normalizePersonaBundle(input: unknown): PersonaCredentialBundle | undefined {
   if (!input || typeof input !== 'object' || Array.isArray(input)) return undefined
@@ -350,12 +426,14 @@ export function normalizePersonaBundle(input: unknown): PersonaCredentialBundle 
   const headers = sanitizeHeaders(rec.headers)
   const attachments = sanitizeAttachments(rec.attachments)
   const storage = sanitizeStorageSnapshot(rec.storage)
+  const storageByOrigin = sanitizeStorageByOrigin(rec.storageByOrigin)
   const storageOrigins = Array.isArray(rec.storageOrigins)
     ? [...new Set(rec.storageOrigins
         .map(sanitizeOriginPattern)
         .filter((origin): origin is string => Boolean(origin)))].slice(0, MAX_BUNDLE_ATTACHMENTS)
     : []
-  if (!cookies.length && !Object.keys(headers).length && !attachments.length && !storage) return undefined
+  const hasStorageByOrigin = Object.keys(storageByOrigin).length > 0
+  if (!cookies.length && !Object.keys(headers).length && !attachments.length && !storage && !hasStorageByOrigin) return undefined
   return {
     v: 2,
     ...(cookies.length ? { cookies } : {}),
@@ -363,6 +441,7 @@ export function normalizePersonaBundle(input: unknown): PersonaCredentialBundle 
     ...(attachments.length ? { attachments } : {}),
     ...(storage ? { storage } : {}),
     ...(storageOrigins.length ? { storageOrigins } : {}),
+    ...(hasStorageByOrigin ? { storageByOrigin } : {}),
   }
 }
 
@@ -459,24 +538,31 @@ export function frameForSessionOrigin(
     return cookieAppliesToOrigin(cookie, parsedOrigin, false)
   })
 
-  const headers: Record<string, string> = { ...(bundle.headers ?? {}) }
-  if (attachment?.headers) Object.assign(headers, attachment.headers)
+  const headers = mergeHeadersCaseInsensitive(bundle.headers, attachment?.headers)
   if (cookies.length) {
+    for (const existing of Object.keys(headers)) {
+      if (existing.toLowerCase() === 'cookie') delete headers[existing]
+    }
     headers.Cookie = cookies.map(cookie => `${cookie.name}=${cookie.value}`).join('; ')
   }
 
+  const originStorage = matchingStorageByOrigin(bundle, origin)
+  const hasPerOriginStorageMap = Boolean(bundle.storageByOrigin && Object.keys(bundle.storageByOrigin).length > 0)
+  const storageSource = originStorage ?? (hasPerOriginStorageMap ? null : (bundle.storage ?? null))
   const storageMode = attachment?.storage ?? (
-    bundle.storageOrigins?.length
-      ? (bundle.storageOrigins.some(pattern => originMatchesAttachment(origin, pattern)) ? 'both' : false)
-      : (attachmentsDeclared ? false : 'both')
+    originStorage
+      ? 'both'
+      : bundle.storageOrigins?.length
+        ? (bundle.storageOrigins.some(pattern => originMatchesAttachment(origin, pattern)) ? 'both' : false)
+        : (attachmentsDeclared ? false : 'both')
   )
-  const storage = bundle.storage && storageMode !== false
+  const storage = storageSource && storageMode !== false
     ? {
-        ...(storageMode !== 'session' && bundle.storage.localStorage
-          ? { localStorage: { ...bundle.storage.localStorage } }
+        ...(storageMode !== 'session' && storageSource.localStorage
+          ? { localStorage: { ...storageSource.localStorage } }
           : {}),
-        ...(storageMode !== 'local' && bundle.storage.sessionStorage
-          ? { sessionStorage: { ...bundle.storage.sessionStorage } }
+        ...(storageMode !== 'local' && storageSource.sessionStorage
+          ? { sessionStorage: { ...storageSource.sessionStorage } }
           : {}),
       }
     : null
@@ -518,10 +604,16 @@ export function bundleSecrets(bundle: PersonaCredentialBundle | undefined): stri
   for (const [name, value] of Object.entries(bundle.headers ?? {})) {
     addHeaderValue(name, value)
   }
-  for (const scope of [bundle.storage?.localStorage, bundle.storage?.sessionStorage]) {
-    for (const [key, value] of Object.entries(scope ?? {})) {
-      if (value.length >= 4 && /token|jwt|auth|secret|key|session|credential/i.test(key)) out.add(value)
+  const collectStorageSecrets = (snapshot: PersonaStorageSnapshot | undefined) => {
+    for (const scope of [snapshot?.localStorage, snapshot?.sessionStorage]) {
+      for (const [key, value] of Object.entries(scope ?? {})) {
+        if (value.length >= 4 && /token|jwt|auth|secret|key|session|credential/i.test(key)) out.add(value)
+      }
     }
+  }
+  collectStorageSecrets(bundle.storage)
+  for (const snapshot of Object.values(bundle.storageByOrigin ?? {})) {
+    collectStorageSecrets(snapshot)
   }
   for (const attachment of bundle.attachments ?? []) {
     for (const [name, value] of Object.entries(attachment.headers ?? {})) {
@@ -794,6 +886,9 @@ export function normalizeBrowserStorageBundle(
       : {}),
     ...(extraObservedHeaders ?? {}),
   })
+  const observedHeadersByOrigin = isWrapped
+    ? sanitizeHeadersByOrigin(rec.observedHeadersByOrigin)
+    : {}
   return {
     v: 1,
     kind: 'browser_session',
@@ -803,6 +898,7 @@ export function normalizeBrowserStorageBundle(
       : Date.now(),
     storageState,
     ...(Object.keys(mergedHeaders).length ? { observedHeaders: mergedHeaders } : {}),
+    ...(Object.keys(observedHeadersByOrigin).length ? { observedHeadersByOrigin } : {}),
   }
 }
 
@@ -823,17 +919,23 @@ export function extractBrowserBundleSecrets(bundle: BrowserStorageBundle): strin
       }
     }
   }
-  for (const [name, value] of Object.entries(bundle.observedHeaders ?? {})) {
-    const trimmed = value.replace(/^Bearer\s+/i, '').trim()
-    if (trimmed.length >= 4) out.add(trimmed)
-    if (name.toLowerCase() === 'cookie') {
-      for (const pair of value.split(';')) {
-        const eq = pair.indexOf('=')
-        if (eq <= 0) continue
-        const val = pair.slice(eq + 1).trim()
-        if (val.length >= 8) out.add(val)
+  const addHeaderMap = (headers: Record<string, string> | undefined) => {
+    for (const [name, value] of Object.entries(headers ?? {})) {
+      const trimmed = value.replace(/^Bearer\s+/i, '').trim()
+      if (trimmed.length >= 4) out.add(trimmed)
+      if (name.toLowerCase() === 'cookie') {
+        for (const pair of value.split(';')) {
+          const eq = pair.indexOf('=')
+          if (eq <= 0) continue
+          const val = pair.slice(eq + 1).trim()
+          if (val.length >= 8) out.add(val)
+        }
       }
     }
+  }
+  addHeaderMap(bundle.observedHeaders)
+  for (const originHeaders of Object.values(bundle.observedHeadersByOrigin ?? {})) {
+    addHeaderMap(originHeaders)
   }
   return [...out]
 }
@@ -938,34 +1040,56 @@ export function buildSessionFromBrowserBundle(
     })
   }
 
-  const localStorageMap: Record<string, string> = {}
+  const storageByOrigin: Record<string, PersonaStorageSnapshot> = {}
   const storageOrigins: string[] = []
   for (const originEntry of bundle.storageState.origins) {
     if (!allowedOrigins.some(a => a.origin === originEntry.origin)) continue
     if (!originEntry.localStorage.length) continue
-    storageOrigins.push(originEntry.origin)
+    const perOriginLocal: Record<string, string> = {
+      ...(storageByOrigin[originEntry.origin]?.localStorage ?? {}),
+    }
     for (const pair of originEntry.localStorage) {
-      localStorageMap[pair.name] = pair.value
+      perOriginLocal[pair.name] = pair.value
+    }
+    if (Object.keys(perOriginLocal).length) {
+      storageByOrigin[originEntry.origin] = { localStorage: perOriginLocal }
+      if (!storageOrigins.includes(originEntry.origin)) storageOrigins.push(originEntry.origin)
     }
   }
 
   const observedHeaders = sanitizeHeaders(bundle.observedHeaders ?? {})
-  const authHeaderEntry = Object.entries(observedHeaders).find(([k]) => k.toLowerCase() === 'authorization')
+  const observedHeadersByOrigin = sanitizeHeadersByOrigin(bundle.observedHeadersByOrigin)
+  const hasPerOriginHeaders = Object.keys(observedHeadersByOrigin).length > 0
+  const primaryOrigin =
+    allowedOrigins.find(a => a.origin === bundle.targetOrigin) ??
+    allowedOrigins[0]
+  const primaryOriginHeaders = primaryOrigin
+    ? (observedHeadersByOrigin[primaryOrigin.origin] ?? (Object.keys(observedHeaders).length ? observedHeaders : undefined))
+    : (Object.keys(observedHeaders).length ? observedHeaders : undefined)
+  const effectiveTopHeaders =
+    primaryOriginHeaders ??
+    Object.values(observedHeadersByOrigin)[0] ??
+    {}
+  const authHeaderEntry = Object.entries(effectiveTopHeaders).find(([k]) => k.toLowerCase() === 'authorization')
   const bearerMatch = authHeaderEntry ? /^Bearer\s+(\S+)$/i.exec(authHeaderEntry[1].trim()) : null
   const bearerToken = bearerMatch?.[1]?.trim() || null
 
-  const attachments: PersonaOriginAttachment[] = allowedOrigins.map(({ origin }) => ({
-    origin,
-    ...(Object.keys(observedHeaders).length ? { headers: { ...observedHeaders } } : {}),
-    ...(storageOrigins.includes(origin) ? { storage: 'both' as const } : {}),
-  }))
+  const attachments: PersonaOriginAttachment[] = allowedOrigins.map(({ origin }) => {
+    const originHeaders = observedHeadersByOrigin[origin]
+      ?? (!hasPerOriginHeaders && Object.keys(observedHeaders).length ? observedHeaders : undefined)
+    return {
+      origin,
+      ...(originHeaders && Object.keys(originHeaders).length ? { headers: { ...originHeaders } } : {}),
+      ...(storageOrigins.includes(origin) ? { storage: 'both' as const } : {}),
+    }
+  })
 
-  const hasStorage = Object.keys(localStorageMap).length > 0
-  if (!scopedCookies.length && !Object.keys(observedHeaders).length && !hasStorage) {
+  const hasStorage = storageOrigins.length > 0
+  const hasAnyHeaders = Object.keys(observedHeaders).length > 0 || hasPerOriginHeaders
+  if (!scopedCookies.length && !hasAnyHeaders && !hasStorage) {
     throw new Error('Browser session contains no usable cookies, auth headers, or localStorage for the allowed origins.')
   }
 
-  const primaryOrigin = allowedOrigins[0]
   const primaryCookies = primaryOrigin
     ? scopedCookies.filter(c => cookieMatchesOriginHost(c.domain, primaryOrigin.url.hostname))
     : scopedCookies
@@ -973,10 +1097,19 @@ export function buildSessionFromBrowserBundle(
     .map(c => `${c.name}=${c.value}`)
     .join('; ')
 
+  const primaryStorage = primaryOrigin ? storageByOrigin[primaryOrigin.origin] : undefined
+  const fallbackStorage = primaryStorage ?? (storageOrigins[0] ? storageByOrigin[storageOrigins[0]] : undefined)
+
   const personaBundle = normalizePersonaBundle({
     cookies: scopedCookies,
-    ...(Object.keys(observedHeaders).length ? { headers: observedHeaders } : {}),
-    ...(hasStorage ? { storage: { localStorage: localStorageMap }, storageOrigins } : {}),
+    ...(!hasPerOriginHeaders && Object.keys(observedHeaders).length ? { headers: observedHeaders } : {}),
+    ...(hasStorage
+      ? {
+          ...(fallbackStorage ? { storage: fallbackStorage } : {}),
+          storageOrigins,
+          storageByOrigin,
+        }
+      : {}),
     attachments,
   })
 
@@ -999,7 +1132,7 @@ export function buildSessionFromBrowserBundle(
     : cookieHeader
       ? 'cookie'
       : 'header'
-  const firstCustomHeader = Object.entries(observedHeaders)[0]
+  const firstCustomHeader = Object.entries(effectiveTopHeaders)[0]
   const value = bearerToken
     ? bearerToken
     : cookieHeader || firstCustomHeader?.[1] || 'browser-session-state'
