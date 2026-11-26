@@ -1,0 +1,94 @@
+{
+  "id": "r4-c5-signed-link-fp",
+  "side": "fp",
+  "archetype": "r4-c5-signed-link-scope-replay",
+  "description": "R4-C-5 FP: benign signed-link mint on /share followed by tampered-signature 403 control and valid redemption on /download for the exact same signed resource must reject as same_principal_not_replay.",
+  "canonicalLabel": {
+    "cwe": "CWE-347",
+    "category": "auth_crypto",
+    "title": "Benign signed download link mint-to-redemption route difference",
+    "impact": "Issuance route differs from redemption route for the identical signed resource without cross-resource or cross-tenant signature replay.",
+    "claimedImpact": "authorization",
+    "claimedBoundary": "access",
+    "vulnClass": "cryptographic_scope_replay"
+  },
+  "freeTextLabel": {
+    "title": "Signed export link verification across issuance and download routes"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": false,
+    "evaluateClaims": true,
+    "composite": true,
+    "floorInjectionRecipe": false
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [
+    {
+      "handle": "member_a",
+      "roleLabel": "member (org-a)",
+      "role": "member",
+      "tenant": "org-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-r4c5-member-a"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "r4c5_ctrl",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/v1/downloads/export-42?sig=tampered-sig-r4c5",
+      "persona": "member_a",
+      "status": 403,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"error\":\"invalid_signature\"}"
+    },
+    {
+      "id": "r4c5_mint",
+      "arm": "probe",
+      "role": "probe",
+      "method": "POST",
+      "pathAndQuery": "/api/v1/exports/share",
+      "persona": "member_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"signedUrl\":\"https://api.example.test/api/v1/downloads/export-42?exp=1700000900&sig=valid-sig-r4c5\"}"
+    },
+    {
+      "id": "r4c5_download",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/v1/downloads/export-42?exp=1700000900&sig=valid-sig-r4c5",
+      "persona": "member_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"fileId\":\"export-42\",\"rows\":[{\"id\":\"r1\",\"amount\":500}]}"
+    }
+  ],
+  "composite": {
+    "chainId": "PARITY-R4-C5-SIGNED-LINK-FP",
+    "terminalVulnClass": "cryptographic_scope_replay",
+    "oracleFamily": "cryptographic_scope_replay",
+    "singleHop": true,
+    "terminalExchangeId": "r4c5_download",
+    "preChainControlIds": ["r4c5_ctrl"],
+    "claimedDelta": "Single-persona mint on /share followed by valid download on /download for the same signed resource must not confirm cryptographic_scope_replay.",
+    "v8OracleInput": {
+      "family": "cryptographic_scope_replay",
+      "rawInput": {
+        "tamperedSignatureControl": "r4c5_ctrl",
+        "sourceValidIssuance": "r4c5_mint",
+        "replayedAcceptance": "r4c5_download"
+      }
+    }
+  }
+}

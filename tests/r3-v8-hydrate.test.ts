@@ -5,7 +5,8 @@
  * (`x-scope` header, request JSON, or raw request body) across:
  *  (a) `cryptographic_scope_replay`: identical signed URL with an extra worker `x-scope`
  *      header or request-body `scope`/`tenantId` MUST fail closed (`same_tenant_and_scope_not_replay`),
- *      while genuine cross-tenant / cross-route / cross-persona replays confirm cleanly.
+ *      while genuine cross-tenant / cross-resource replays confirm cleanly and route-only
+ *      (mint→download) or caller-only (identical bearer signed URL) flows reject (`same_principal_not_replay`).
  *  (b) `batch_partial_authz`: worker-injected tenant fields in request body NEVER become
  *      `foreignTenantId`, and echoed foreign IDs inside `denied`/`errors`/`forbidden` or
  *      per-item error entries NEVER count as `foreignDataObserved`; genuine cross-tenant
@@ -210,8 +211,8 @@ test('R3-C-5(a): identical signed URL fetched twice with worker x-scope header o
   assert.equal(directRes.reason, 'same_tenant_and_scope_not_replay')
 })
 
-test('R3-C-5(a): genuine cross-tenant and cross-route cryptographic scope replays still confirm cleanly', () => {
-  // 1. Cross-route + response-side tenant/scope replay
+test('R3-C-5(a) + R4-C-5: genuine cross-tenant/cross-resource replay confirms while caller-only and route-only bearer flows MUST reject', () => {
+  // 1. Genuine cross-tenant + cross-resource signed-URL replay (org-a/report sig replayed on org-b/treasury) -> confirms
   const ctrl = signedEntry('csr-ok-ctrl', makeStep({
     id: 'csr-ok-ctrl', arm: 'control', method: 'GET', status: 403,
     pathAndQuery: '/api/v1/exports/org-b/treasury?sig=bad-sig',
@@ -243,7 +244,7 @@ test('R3-C-5(a): genuine cross-tenant and cross-route cryptographic scope replay
   )
   assert.equal(crossTenantRes.confirmed, true, crossTenantRes.reason)
 
-  // 2. Cross-persona replay on the same route (member_a issues, member_b in org-b replays)
+  // 2. R4-C-5 FLIPPED: cross-persona fetch of a byte-identical signed bearer URL MUST reject (caller-only difference)
   const ctrlP = signedEntry('csr-p-ctrl', makeStep({
     id: 'csr-p-ctrl', arm: 'control', method: 'GET', status: 403,
     pathAndQuery: '/api/v1/downloads/shared?sig=bad-sig',
@@ -276,7 +277,41 @@ test('R3-C-5(a): genuine cross-tenant and cross-route cryptographic scope replay
     },
     { signingKey: SIGNING_KEY },
   )
-  assert.equal(crossPersonaRes.confirmed, true, crossPersonaRes.reason)
+  assert.equal(crossPersonaRes.confirmed, false, 'byte-identical bearer signed URL across personas must not confirm replay')
+  assert.equal(crossPersonaRes.reason, 'same_principal_not_replay')
+
+  // 3. R4-C-5 FLIPPED: route-only mint (/share) -> download (/download) for the same signed resource MUST reject
+  const ctrlR = signedEntry('csr-r-ctrl', makeStep({
+    id: 'csr-r-ctrl', arm: 'control', method: 'GET', status: 403,
+    pathAndQuery: '/api/v1/downloads/export-42?sig=bad-sig',
+    json: { error: 'invalid_signature' },
+  }), { seq: 1, timestampMs: 1000 })
+  const issR = signedEntry('csr-r-iss', makeStep({
+    id: 'csr-r-iss', arm: 'probe', method: 'POST', status: 200,
+    pathAndQuery: '/api/v1/exports/share',
+    json: { signedUrl: 'https://api.example.test/api/v1/downloads/export-42?exp=1700000900&sig=valid-sig-004' },
+  }), { seq: 2, timestampMs: 1100 })
+  const repR = signedEntry('csr-r-rep', makeStep({
+    id: 'csr-r-rep', arm: 'probe', method: 'GET', status: 200,
+    pathAndQuery: '/api/v1/downloads/export-42?exp=1700000900&sig=valid-sig-004',
+    json: { fileId: 'export-42', rows: [{ id: 'r1', amount: 500 }] },
+  }), { seq: 3, timestampMs: 1200 })
+
+  const crossRouteRes = defaultTerminalOracleRegistry.evaluate(
+    HostFactLog.fromTranscript({ entries: [ctrlR, issR, repR] }),
+    {
+      kind: 'v8_family',
+      family: 'cryptographic_scope_replay',
+      rawInput: {
+        tamperedSignatureControl: 'csr-r-ctrl',
+        sourceValidIssuance: 'csr-r-iss',
+        replayedAcceptance: 'csr-r-rep',
+      },
+    },
+    { signingKey: SIGNING_KEY },
+  )
+  assert.equal(crossRouteRes.confirmed, false, 'single-persona mint-to-download route difference must not confirm replay')
+  assert.equal(crossRouteRes.reason, 'same_principal_not_replay')
 })
 
 // ============================================================================

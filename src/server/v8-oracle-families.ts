@@ -19,8 +19,8 @@ export type CausalBindingKind = 'value_binding' | 'derived_crypto_binding' | 'st
 export type SignatureVerifier = (record: HostSignedRecord) => boolean
 
 export interface HostSignedRecord {
-  id: string; hostSignature: string; timestampMs: number; status?: number | null; method?: string; route?: string; surface?: V8SurfaceKind
-  actorId?: string | null; tenantId?: string | null; body?: string; json?: unknown
+  id: string; hostSignature: string; timestampMs: number; status?: number | null; method?: string; route?: string; pathAndQuery?: string; surface?: V8SurfaceKind
+  actorId?: string | null; tenantId?: string | null; entityId?: string | null; body?: string; json?: unknown
   requestHeaders?: Readonly<Record<string, string>> | null; responseHeaders?: Readonly<Record<string, string>> | null
   capabilityHandle?: string | null; artifactDigest?: string | null; derivedFromCapabilityId?: string | null
 }
@@ -162,6 +162,57 @@ export function extractTenantMarkers(json: unknown, body?: string, skipDenied = 
   }
   walk(val, 0); return out
 }
+const SIGNED_AUTH_QUERY_KEYS = new Set(['sig', 'signature', 'hmac', 'mac', 'token', 'access_token', 'code', 'state', 'nonce', 'ts', 'timestamp', 'expires', 'exp', 'googleaccessid', 'x-amz-signature', 'x-amz-credential', 'x-amz-date', 'x-amz-expires', 'x-amz-signedheaders', 'x-amz-security-token', 'x-amz-algorithm', 'x-goog-signature', 'x-goog-credential', 'x-goog-date', 'x-goog-expires', 'x-goog-signedheaders', 'x-goog-algorithm'])
+const SIGNED_URL_PRIMARY_KEYS = new Set(['signedurl', 'signed_url', 'presignedurl', 'presigned_url', 'downloadurl', 'download_url', 'shareurl', 'share_url', 'exporturl', 'export_url', 'verifyurl', 'verify_url', 'inviteurl', 'invite_url', 'redemptionurl', 'redemption_url'])
+const SIGNED_URL_FALLBACK_KEYS = new Set(['url', 'href', 'link', 'uri', 'location'])
+const SIGNED_URL_SIG_QUERY_RE = /[?&](?:sig|signature|hmac|mac|token|x-amz-signature|x-goog-signature)=/i
+export function canonicalSignedResource(rawPathOrUrl: string | null | undefined): string {
+  const raw = normStr(rawPathOrUrl); if (!raw) return ''
+  let pathPart = '', queryPart = ''
+  if (/^https?:\/\//i.test(raw)) { try { const u = new URL(raw); pathPart = u.pathname; queryPart = u.search.startsWith('?') ? u.search.slice(1) : '' } catch { return '' } }
+  else { const noHash = raw.split('#', 1)[0] ?? '', qIdx = noHash.indexOf('?'); pathPart = qIdx >= 0 ? noHash.slice(0, qIdx) : noHash; queryPart = qIdx >= 0 ? noHash.slice(qIdx + 1) : '' }
+  const cleanPath = pathPart.replace(/\/+$/, '').toLowerCase() || (pathPart.startsWith('/') ? '/' : '')
+  if (!cleanPath || !queryPart) return cleanPath
+  const pairs: [string, string][] = []
+  for (const [k, v] of new URLSearchParams(queryPart).entries()) { const lk = k.trim().toLowerCase(); if (!SIGNED_AUTH_QUERY_KEYS.has(lk)) pairs.push([lk, v.trim()]) }
+  if (pairs.length === 0) return cleanPath
+  pairs.sort(([a, av], [b, bv]) => (a < b ? -1 : a > b ? 1 : av < bv ? -1 : av > bv ? 1 : 0))
+  return `${cleanPath}?${pairs.map(([k, v]) => `${k}=${v}`).join('&')}`
+}
+export function extractIssuedSignedUrl(json: unknown, body?: string): string {
+  let fallback = ''
+  const walk = (v: unknown, d: number): string => {
+    if (d > 4 || v == null || typeof v !== 'object') return ''
+    if (Array.isArray(v)) { for (const x of v.slice(0, 32)) { const h = walk(x, d + 1); if (h) return h } return '' }
+    const obj = v as Record<string, unknown>; if (isErrorOrDeniedBatchObj(obj)) return ''
+    for (const [k, x] of Object.entries(obj)) {
+      if (BATCH_DENIAL_KEY_RE.test(k) || typeof x !== 'string') continue
+      const s = x.trim(), lk = k.toLowerCase(); if (!s || !/^(?:https?:\/\/|\/)/i.test(s)) continue
+      if (SIGNED_URL_PRIMARY_KEYS.has(lk)) return s
+      if (!fallback && SIGNED_URL_FALLBACK_KEYS.has(lk) && SIGNED_URL_SIG_QUERY_RE.test(s)) fallback = s
+    }
+    for (const [k, x] of Object.entries(obj)) if (!BATCH_DENIAL_KEY_RE.test(k) && x && typeof x === 'object') { const h = walk(x, d + 1); if (h) return h }
+    return ''
+  }
+  return walk(parseJsonOrBody(json, body), 0) || fallback
+}
+export interface HostAuthzDimension { tenant: string; responseTenants: Set<string>; personaTenant: string; responseScope: string; issuedSignedResource: string; requestSignedResource: string }
+/** Shared host-attested authorization-dimension primitive (R4-C-5): symmetric tenant derivation + signed-resource scope. */
+export function deriveRecordAuthzDimension(rec: Pick<HostSignedRecord, 'route' | 'pathAndQuery' | 'json' | 'body' | 'tenantId'> | undefined, opts?: { personaTenant?: string | null; preferredTenant?: string | null; stripUrlTokens?: boolean }): HostAuthzDimension {
+  if (!rec) return { tenant: '', responseTenants: new Set<string>(), personaTenant: '', responseScope: '', issuedSignedResource: '', requestSignedResource: '' }
+  let responseTenants = extractTenantMarkers(rec.json, rec.body, true)
+  const rawPq = rec.pathAndQuery ?? rec.route ?? ''
+  if (opts?.stripUrlTokens && responseTenants.size > 0 && rawPq) {
+    const [p = '', q = ''] = rawPq.split('?', 2), u = new Set<string>()
+    for (const s of p.split('/')) if (s) { u.add(s.toLowerCase()); try { u.add(decodeURIComponent(s).toLowerCase()) } catch {} }
+    if (q) for (const v of new URLSearchParams(q.split('#', 1)[0]!).values()) if (v.trim()) u.add(v.trim().toLowerCase())
+    responseTenants = new Set([...responseTenants].filter(t => !u.has(t)))
+  }
+  const personaTenant = normKey(opts?.personaTenant ?? rec.tenantId), pref = normKey(opts?.preferredTenant)
+  const tenant = (pref && responseTenants.has(pref) ? pref : [...responseTenants][0]) || personaTenant
+  return { tenant, responseTenants, personaTenant, responseScope: extractResponseScope(rec.json, rec.body), issuedSignedResource: canonicalSignedResource(extractIssuedSignedUrl(rec.json, rec.body)), requestSignedResource: canonicalSignedResource(rawPq) }
+}
+
 export function extractResponseScope(json: unknown, body?: string): string {
   const walk = (v: unknown, d: number): string => {
     if (d > 4 || v == null || typeof v !== 'object') return ''
@@ -340,42 +391,26 @@ export function evaluateDualTenantAbac(input: DualTenantAbacInput): V8OracleDeci
     if (!hasTenantRoleAtLeast(input.actor, ownTenant, req)) return deny(f, 'actor_lacks_own_tenant_role', sub)
     if (hasTenantRoleAtLeast(input.actor, foreignTenant, req)) return deny(f, 'actor_authorized_in_foreign_tenant', sub)
 
-    const ownId = normStr(input.ownRecordId), foreignId = normStr(input.foreignRecordId)
-    const reqSet = new Set((input.requestedIds ?? []).map(normStr))
+    const ownId = normStr(input.ownRecordId), foreignId = normStr(input.foreignRecordId), reqSet = new Set((input.requestedIds ?? []).map(normStr))
     if (!ownId || !foreignId || ownId === foreignId) return deny(f, 'invalid_batch_record_pair', sub)
     if (!reqSet.has(ownId) || !reqSet.has(foreignId)) return deny(f, 'batch_missing_own_and_foreign_ids', sub)
-
     const recErr = checkRecords([[input.singleForeignControlDenied, 'single_foreign_control'], [input.batchRequest, 'batch_request']], input.verifySignature)
     if (recErr) return deny(f, recErr, sub)
     if (!isDenied(input.singleForeignControlDenied.status)) return deny(f, 'single_foreign_control_not_denied', sub)
     if (!isOk(input.batchRequest.status)) return deny(f, 'batch_request_denied_or_failed', sub)
     const cAct = normKey(input.singleForeignControlDenied.actorId), bAct = normKey(input.batchRequest.actorId)
     if (input.singleForeignControlDenied.status === 401 && (!cAct || !bAct || cAct !== bAct)) return deny(f, 'unauthenticated_baseline_control', sub)
-
     const batchHasJson = parseJsonOrBody(input.batchRequest.json, input.batchRequest.body) !== undefined
-    const foreignRead = !stubRec(input.batchRequest) &&
-      new Set((input.returnedForeignIds ?? []).map(normStr)).has(foreignId) &&
-      (!batchHasJson || findNonErrorBatchRecord(input.batchRequest.json, input.batchRequest.body, foreignId) !== null) &&
-      (input.foreignDataObserved === true || hasSubstantivePayload(input.batchRequest))
+    const foreignRead = !stubRec(input.batchRequest) && new Set((input.returnedForeignIds ?? []).map(normStr)).has(foreignId) && (!batchHasJson || findNonErrorBatchRecord(input.batchRequest.json, input.batchRequest.body, foreignId) !== null) && (input.foreignDataObserved === true || hasSubstantivePayload(input.batchRequest))
     let foreignMut = false
     if (input.postMutationReadback) {
-      const mutErr = checkRecord(input.postMutationReadback, 'post_mutation_readback', input.verifySignature)
-      if (mutErr) return deny(f, mutErr, sub)
+      const mutErr = checkRecord(input.postMutationReadback, 'post_mutation_readback', input.verifySignature); if (mutErr) return deny(f, mutErr, sub)
       if (stubRec(input.postMutationReadback)) return deny(f, 'terminal_impact_unproven_intermediate_stub', sub)
-      foreignMut = isOk(input.postMutationReadback.status) &&
-        input.postMutationReadback.timestampMs >= input.batchRequest.timestampMs && input.foreignMutationPersisted === true
+      foreignMut = isOk(input.postMutationReadback.status) && input.postMutationReadback.timestampMs >= input.batchRequest.timestampMs && input.foreignMutationPersisted === true
     }
-    if (!foreignRead && !foreignMut) {
-      if (stubRec(input.batchRequest)) return deny(f, 'terminal_impact_unproven_intermediate_stub', sub)
-      return deny(f, 'foreign_record_not_returned_or_mutated', sub)
-    }
-
-    return ok(f, sub, 'batch_partial_authorization_bypass_confirmed', {
-      actorId: input.actor.actorId, ownTenantId: ownTenant, foreignTenantId: foreignTenant, foreignRecordId: foreignId,
-      impactMode: foreignMut ? 'mutation' : 'read', controlId: input.singleForeignControlDenied.id, batchRequestId: input.batchRequest.id,
-    })
+    if (!foreignRead && !foreignMut) return deny(f, stubRec(input.batchRequest) ? 'terminal_impact_unproven_intermediate_stub' : 'foreign_record_not_returned_or_mutated', sub)
+    return ok(f, sub, 'batch_partial_authorization_bypass_confirmed', { actorId: input.actor.actorId, ownTenantId: ownTenant, foreignTenantId: foreignTenant, foreignRecordId: foreignId, impactMode: foreignMut ? 'mutation' : 'read', controlId: input.singleForeignControlDenied.id, batchRequestId: input.batchRequest.id })
   }
-
   return deny(f, 'unknown_dual_tenant_mode')
 }
 
@@ -490,38 +525,24 @@ export function evaluateEconomicConservation(input: EconomicConservationInput): 
 
   if (input.equation === 'underpaid_fulfillment') {
     if (!allFiniteNonNeg(input.paidAmount) || !Number.isFinite(input.fulfilledValue) || input.fulfilledValue <= 0) return deny(f, 'invalid_fulfillment_amounts', sub)
-    const state = normKey(input.fulfillmentState)
-    if (!FINALIZED_STATES.has(state)) return deny(f, 'order_not_finalized', sub, { fulfillmentState: state })
+    const state = normKey(input.fulfillmentState); if (!FINALIZED_STATES.has(state)) return deny(f, 'order_not_finalized', sub, { fulfillmentState: state })
     if (input.fulfilledValue <= input.paidAmount + tol) return deny(f, 'fulfillment_payment_conserved', sub)
-    return ok(f, sub, 'underpaid_fulfillment_conservation_violated', {
-      paidAmount: input.paidAmount, fulfilledValue: input.fulfilledValue,
-      shortfall: Number((input.fulfilledValue - input.paidAmount).toFixed(6)), fulfillmentState: state, finalReadbackId: input.finalReadback.id,
-    })
+    return ok(f, sub, 'underpaid_fulfillment_conservation_violated', { paidAmount: input.paidAmount, fulfilledValue: input.fulfilledValue, shortfall: Number((input.fulfilledValue - input.paidAmount).toFixed(6)), fulfillmentState: state, finalReadbackId: input.finalReadback.id })
   }
-
   if (input.equation === 'ineligible_discount') {
-    if (!allFiniteNonNeg(input.subtotalAmount, input.discountApplied) || !Number.isFinite(input.requiredThreshold) || input.requiredThreshold <= 0) {
-      return deny(f, 'invalid_discount_parameters', sub)
-    }
+    if (!allFiniteNonNeg(input.subtotalAmount, input.discountApplied) || !Number.isFinite(input.requiredThreshold) || input.requiredThreshold <= 0) return deny(f, 'invalid_discount_parameters', sub)
     if (input.subtotalAmount + tol >= input.requiredThreshold) return deny(f, 'discount_threshold_satisfied_eligible', sub)
     if (input.discountApplied <= tol) return deny(f, 'ineligible_discount_not_applied', sub)
-    if (input.finalTotalPaid !== undefined && (!allFiniteNonNeg(input.finalTotalPaid) || input.finalTotalPaid > input.subtotalAmount - input.discountApplied + tol || input.finalTotalPaid >= input.subtotalAmount - tol)) {
-      return deny(f, 'discount_not_reflected_in_final_total', sub)
-    }
-    return ok(f, sub, 'ineligible_discount_applied_below_threshold', {
-      subtotalAmount: input.subtotalAmount, requiredThreshold: input.requiredThreshold,
-      discountApplied: input.discountApplied, finalReadbackId: input.finalReadback.id,
-    })
+    if (input.finalTotalPaid !== undefined && (!allFiniteNonNeg(input.finalTotalPaid) || input.finalTotalPaid > input.subtotalAmount - input.discountApplied + tol || input.finalTotalPaid >= input.subtotalAmount - tol)) return deny(f, 'discount_not_reflected_in_final_total', sub)
+    return ok(f, sub, 'ineligible_discount_applied_below_threshold', { subtotalAmount: input.subtotalAmount, requiredThreshold: input.requiredThreshold, discountApplied: input.discountApplied, finalReadbackId: input.finalReadback.id })
   }
-
   return deny(f, 'unknown_economic_equation')
 }
 
 /* ───────────────── 4. Cryptographic Scope Replay Evaluator ───────────────── */
-
 export interface CryptographicScopeReplayInput extends WithVerifier {
   tamperedSignatureControl: HostSignedRecord; sourceValidIssuance: HostSignedRecord; replayedAcceptance: HostSignedRecord
-  sourceTenant: string; sourceScope: string; targetTenant: string; targetScope: string
+  sourceTenant: string; sourceScope: string; targetTenant: string; targetScope: string; sourceSignedResource?: string; targetSignedResource?: string
   tamperedSignatureDigest?: string; signatureDigest?: string; replayedSignatureDigest?: string; persistedImpact?: boolean
 }
 export function evaluateCryptographicScopeReplay(input: CryptographicScopeReplayInput): V8OracleDecision {
@@ -539,13 +560,19 @@ export function evaluateCryptographicScopeReplay(input: CryptographicScopeReplay
   if (tRoute && rRoute && tRoute !== rRoute) return deny(f, 'tampered_control_and_replay_route_mismatch')
   const srcT = normKey(input.sourceTenant), srcS = normKey(input.sourceScope), dstT = normKey(input.targetTenant), dstS = normKey(input.targetScope)
   if (!srcT || !srcS || !dstT || !dstS) return deny(f, 'missing_tenant_or_scope_context')
-  if (srcT === dstT && srcS === dstS) return deny(f, 'same_tenant_and_scope_not_replay')
   const sRec = input.sourceValidIssuance, rRec = input.replayedAcceptance, sRoute = normRoute(sRec.route)
-  if (sRoute && rRoute && sRoute === rRoute) {
-    const sM = extractTenantMarkers(sRec.json, sRec.body, true), rM = extractTenantMarkers(rRec.json, rRec.body, true)
-    const sameM = sM.size === rM.size && [...sM].every(m => rM.has(m))
-    if (normKey(sRec.actorId) === normKey(rRec.actorId) && normKey(sRec.tenantId) === normKey(rRec.tenantId) && (!normKey(sRec.method) || !normKey(rRec.method) || normKey(sRec.method) === normKey(rRec.method)) && sameM && extractResponseScope(sRec.json, sRec.body) === extractResponseScope(rRec.json, rRec.body)) return deny(f, 'same_tenant_and_scope_not_replay')
-  }
+  const sDim = deriveRecordAuthzDimension(sRec), rDim = deriveRecordAuthzDimension(rRec)
+  const sSignedRes = normKey(input.sourceSignedResource) || sDim.issuedSignedResource || (sRoute && rRoute && sRoute === rRoute ? sDim.requestSignedResource : '')
+  const rSignedRes = normKey(input.targetSignedResource) || rDim.requestSignedResource
+  const callerDiff = normKey(sRec.actorId) !== normKey(rRec.actorId) || normKey(sRec.tenantId) !== normKey(rRec.tenantId), routeDiff = Boolean(sRoute && rRoute && sRoute !== rRoute)
+  const sameReason = callerDiff || routeDiff ? 'same_principal_not_replay' : 'same_tenant_and_scope_not_replay'
+  if (srcT === dstT && srcS === dstS) return deny(f, sameReason)
+  const sameRespTenants = sDim.responseTenants.size === rDim.responseTenants.size && [...sDim.responseTenants].every(m => rDim.responseTenants.has(m))
+  const hasRespTenantDiff = Boolean(sDim.tenant && rDim.responseTenants.size > 0 && !sameRespTenants && !rDim.responseTenants.has(sDim.tenant))
+  const hasRespScopeDiff = Boolean(sDim.responseScope && rDim.responseScope && sDim.responseScope !== rDim.responseScope)
+  const sameMethod = !normKey(sRec.method) || !normKey(rRec.method) || normKey(sRec.method) === normKey(rRec.method)
+  if (sSignedRes && rSignedRes && sSignedRes === rSignedRes && (Boolean(sDim.issuedSignedResource) || sameMethod) && !hasRespTenantDiff && !hasRespScopeDiff) return deny(f, sameReason)
+  if (srcT === dstT && !sSignedRes && !hasRespTenantDiff && !hasRespScopeDiff && routeDiff && (srcS === sRoute || srcS.endsWith(`:${sRoute}`)) && (dstS === rRoute || dstS.endsWith(`:${rRoute}`))) return deny(f, 'same_principal_not_replay')
   const tamperedDigest = normStr(input.tamperedSignatureDigest), validDigest = normStr(input.signatureDigest), replayedDigest = normStr(input.replayedSignatureDigest)
   if (!tamperedDigest || !validDigest || !replayedDigest) return deny(f, 'missing_signature_digest_binding')
   if (tamperedDigest === validDigest) return deny(f, 'tampered_digest_matches_valid_signature')
@@ -556,96 +583,66 @@ export function evaluateCryptographicScopeReplay(input: CryptographicScopeReplay
 }
 
 /* ───────────────── 5. Parser / Cache Differential Evaluator ──────────────── */
-
 export interface ParserDifferentialInput extends WithVerifier {
   mode: 'parser_differential'; differentialKind: 'duplicate_json_key' | 'path_normalization' | 'header_normalization' | 'hop_by_hop_smuggling' | 'content_type_confusion'
   differentialFeature: string; canonicalValue?: string; variantValue?: string; impactKind: 'read' | 'mutation'
-  cleanControl: HostSignedRecord; differentialProbe: HostSignedRecord; isolatedControl?: boolean
-  postMutationReadback?: HostSignedRecord; mutationPersisted?: boolean; unauthorizedDigest?: string
+  cleanControl: HostSignedRecord; differentialProbe: HostSignedRecord; isolatedControl?: boolean; postMutationReadback?: HostSignedRecord; mutationPersisted?: boolean; unauthorizedDigest?: string
 }
 export interface CachePrimedDifferentialInput extends WithVerifier {
-  mode: 'cache_primed'; cacheKey: string; victimArtifactDigest: string; cleanControl: HostSignedRecord
-  cleanControlContainsVictimData?: boolean; victimOrPrimeRequest: HostSignedRecord; attackerProbe: HostSignedRecord
-  isolatedControl?: boolean; cacheHitObserved?: boolean
+  mode: 'cache_primed'; cacheKey: string; victimArtifactDigest: string; cleanControl: HostSignedRecord; cleanControlContainsVictimData?: boolean
+  victimOrPrimeRequest: HostSignedRecord; attackerProbe: HostSignedRecord; isolatedControl?: boolean; cacheHitObserved?: boolean
 }
 export type ParserCacheDifferentialInput = ParserDifferentialInput | CachePrimedDifferentialInput
-
 export function evaluateParserCacheDifferential(input: ParserCacheDifferentialInput): V8OracleDecision {
   const f: V8OracleFamily = 'parser_cache_differential'
   if (!input) return deny(f, 'missing_input')
-
   if (input.mode === 'parser_differential') {
     const sub = input.differentialKind
     if (!normStr(input.differentialFeature)) return deny(f, 'missing_differential_feature', sub)
-    if (input.canonicalValue === undefined || input.variantValue === undefined || input.canonicalValue === input.variantValue) {
-      return deny(f, 'no_request_differential_between_control_and_probe', sub)
-    }
-
+    if (input.canonicalValue === undefined || input.variantValue === undefined || input.canonicalValue === input.variantValue) return deny(f, 'no_request_differential_between_control_and_probe', sub)
     const recErr = checkRecords([[input.cleanControl, 'clean_control'], [input.differentialProbe, 'differential_probe']], input.verifySignature)
     if (recErr) return deny(f, recErr, sub)
     if (!isDenied(input.cleanControl.status)) return deny(f, 'clean_control_not_denied', sub)
     if (!isOk(input.differentialProbe.status)) return deny(f, 'differential_probe_rejected', sub)
-    const cMeth = normKey(input.cleanControl.method), pMeth = normKey(input.differentialProbe.method)
-    if (cMeth && pMeth && cMeth !== pMeth) return deny(f, 'control_and_probe_method_mismatch', sub)
-    const cAct = normKey(input.cleanControl.actorId), pAct = normKey(input.differentialProbe.actorId)
-    if (cAct !== pAct && (cAct || pAct)) return deny(f, 'control_and_probe_actor_mismatch', sub)
-    const cRt = normRoute(input.cleanControl.route), pRt = normRoute(input.differentialProbe.route)
-    if (sub !== 'path_normalization' && cRt && pRt && cRt !== pRt) return deny(f, 'control_and_probe_route_mismatch', sub)
+    const cMeth = normKey(input.cleanControl.method), pMeth = normKey(input.differentialProbe.method); if (cMeth && pMeth && cMeth !== pMeth) return deny(f, 'control_and_probe_method_mismatch', sub)
+    const cAct = normKey(input.cleanControl.actorId), pAct = normKey(input.differentialProbe.actorId); if (cAct !== pAct && (cAct || pAct)) return deny(f, 'control_and_probe_actor_mismatch', sub)
+    const cRt = normRoute(input.cleanControl.route), pRt = normRoute(input.differentialProbe.route); if (sub !== 'path_normalization' && cRt && pRt && cRt !== pRt) return deny(f, 'control_and_probe_route_mismatch', sub)
     if (!input.isolatedControl && input.differentialProbe.timestampMs < input.cleanControl.timestampMs) return deny(f, 'probe_precedes_clean_control', sub)
-
     if (input.impactKind === 'mutation') {
-      const mutErr = checkRecord(input.postMutationReadback, 'post_mutation_readback', input.verifySignature)
-      if (mutErr) return deny(f, mutErr, sub)
+      const mutErr = checkRecord(input.postMutationReadback, 'post_mutation_readback', input.verifySignature); if (mutErr) return deny(f, mutErr, sub)
       if (!isOk(input.postMutationReadback!.status)) return deny(f, 'mutation_readback_failed', sub)
       if (input.postMutationReadback!.timestampMs < input.differentialProbe.timestampMs) return deny(f, 'mutation_readback_precedes_probe', sub)
       if (stubRec(input.postMutationReadback!)) return deny(f, 'terminal_impact_unproven_intermediate_stub', sub)
       if (input.mutationPersisted !== true) return deny(f, 'mutation_not_persisted', sub)
     } else {
       if (stubRec(input.differentialProbe)) return deny(f, 'terminal_impact_unproven_intermediate_stub', sub)
-      const probeDigest = normStr(input.unauthorizedDigest ?? input.differentialProbe.artifactDigest)
-      const ctrlDigest = normStr(input.cleanControl.artifactDigest)
+      const probeDigest = normStr(input.unauthorizedDigest ?? input.differentialProbe.artifactDigest), ctrlDigest = normStr(input.cleanControl.artifactDigest)
       if (probeDigest && ctrlDigest && probeDigest === ctrlDigest) return deny(f, 'probe_artifact_already_in_control', sub)
       if (!probeDigest && !hasSubstantivePayload(input.differentialProbe)) return deny(f, 'differential_read_missing_substantive_data', sub)
     }
-
-    return ok(f, sub, 'parser_differential_bypass_confirmed', {
-      differentialKind: sub, differentialFeature: input.differentialFeature, impactKind: input.impactKind,
-      cleanControlId: input.cleanControl.id, differentialProbeId: input.differentialProbe.id,
-    })
+    return ok(f, sub, 'parser_differential_bypass_confirmed', { differentialKind: sub, differentialFeature: input.differentialFeature, impactKind: input.impactKind, cleanControlId: input.cleanControl.id, differentialProbeId: input.differentialProbe.id })
   }
-
   if (input.mode === 'cache_primed') {
     const sub = input.mode, victimDigest = normStr(input.victimArtifactDigest)
     if (!normStr(input.cacheKey)) return deny(f, 'missing_cache_key', sub)
     if (!victimDigest) return deny(f, 'missing_victim_artifact_digest', sub)
-
     const recErr = checkRecords([[input.cleanControl, 'clean_control'], [input.victimOrPrimeRequest, 'victim_prime'], [input.attackerProbe, 'attacker_probe']], input.verifySignature)
     if (recErr) return deny(f, recErr, sub)
-
-    const ctrlDenied = isDenied(input.cleanControl.status)
-    const ctrlLeaked = input.cleanControlContainsVictimData === true || normStr(input.cleanControl.artifactDigest) === victimDigest
+    const ctrlDenied = isDenied(input.cleanControl.status), ctrlLeaked = input.cleanControlContainsVictimData === true || normStr(input.cleanControl.artifactDigest) === victimDigest
     if (!ctrlDenied && ctrlLeaked) return deny(f, 'resource_already_exposed_in_clean_control', sub)
     if (!ctrlDenied && !isOk(input.cleanControl.status) && input.cleanControl.status !== 404) return deny(f, 'invalid_clean_control_status', sub)
     if (!isOk(input.victimOrPrimeRequest.status)) return deny(f, 'victim_prime_failed', sub)
     if (!isOk(input.attackerProbe.status)) return deny(f, 'attacker_probe_rejected', sub)
     if (!input.isolatedControl && input.victimOrPrimeRequest.timestampMs < input.cleanControl.timestampMs) return deny(f, 'prime_precedes_clean_control', sub)
     if (input.attackerProbe.timestampMs < input.victimOrPrimeRequest.timestampMs) return deny(f, 'attacker_probe_precedes_cache_prime', sub)
-
-    const vActor = normKey(input.victimOrPrimeRequest.actorId), aActor = normKey(input.attackerProbe.actorId)
-    const vTenant = normKey(input.victimOrPrimeRequest.tenantId), aTenant = normKey(input.attackerProbe.tenantId)
+    const vActor = normKey(input.victimOrPrimeRequest.actorId), aActor = normKey(input.attackerProbe.actorId), vTenant = normKey(input.victimOrPrimeRequest.tenantId), aTenant = normKey(input.attackerProbe.tenantId)
     const sameActor = Boolean(vActor && aActor && vActor === aActor), sameTenant = Boolean(vTenant && aTenant && vTenant === aTenant)
     if ((!vActor && !vTenant) || (sameActor && (sameTenant || (!vTenant && !aTenant)))) return deny(f, 'victim_and_attacker_not_distinct', sub)
-
     if (stubRec(input.attackerProbe)) return deny(f, 'terminal_impact_unproven_intermediate_stub', sub)
     if (input.cacheHitObserved !== true && !hasCacheHitHeader(input.attackerProbe.responseHeaders)) return deny(f, 'no_cache_hit_evidence', sub)
     if (normStr(input.attackerProbe.artifactDigest) !== victimDigest) return deny(f, 'attacker_did_not_receive_victim_artifact', sub)
-
-    return ok(f, sub, 'cache_primed_cross_principal_bleed_confirmed', {
-      cacheKey: input.cacheKey, victimArtifactDigest: victimDigest,
-      cleanControlId: input.cleanControl.id, victimPrimeId: input.victimOrPrimeRequest.id, attackerProbeId: input.attackerProbe.id,
-    })
+    return ok(f, sub, 'cache_primed_cross_principal_bleed_confirmed', { cacheKey: input.cacheKey, victimArtifactDigest: victimDigest, cleanControlId: input.cleanControl.id, victimPrimeId: input.victimOrPrimeRequest.id, attackerProbeId: input.attackerProbe.id })
   }
-
   return deny(f, 'unknown_parser_cache_mode')
 }
 
