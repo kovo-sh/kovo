@@ -1,9 +1,8 @@
 import { createFileRoute, Link, useLocation, useNavigate, useRouter } from '@tanstack/react-router'
-import { createServerFn } from '@tanstack/react-start'
 import { useEffect, useMemo, useState } from 'react'
-import { z } from 'zod'
-import { projectData, removeProject, testPersonaAuthAction } from '../actions.ts'
+import { projectData, removeProject, removeProjectAsset, testPersonaAuthAction } from '../actions.ts'
 import { Icon } from '../components/run/icons.tsx'
+import { ProjectEditModal } from '../components/project/ProjectEditModal.tsx'
 import { ProjectGuardrailsTab } from '../components/project/ProjectGuardrailsTab.tsx'
 import { ProjectInventoryTab } from '../components/project/ProjectInventoryTab.tsx'
 import { ProjectNewRunSheet } from '../components/project/ProjectNewRunSheet.tsx'
@@ -27,17 +26,11 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '../components/ui/dropdown-menu.tsx'
-import { id, type PublicPersona } from '../domain.ts'
+import { type PublicPersona } from '../domain.ts'
 import { cn } from '../lib/cn.ts'
-
-const removeProjectAsset = createServerFn({ method: 'POST' })
-  .validator(z.object({ requestId: id, projectId: id, assetId: id }))
-  .handler(async ({ data }) => {
-    const { store } = await import('../server/store.ts')
-    return store().projectsRepo.deleteProjectAsset(data)
-  })
 
 type ProjectSearch = {
   tab?: ProjectTabId
@@ -73,6 +66,7 @@ function ProjectPageContent({ data }: { data: ProjectLoaderData }) {
   const hashWantsNewRun = location.hash === 'new-run' || location.hash === '#new-run'
   const [newRunOpen, setNewRunOpen] = useState(() => Boolean(search.newRun) || hashWantsNewRun)
   const [syncErrorBanner, setSyncErrorBanner] = useState(() => search.syncError ?? '')
+  const [editProjectOpen, setEditProjectOpen] = useState(false)
   const [deleteProjectOpen, setDeleteProjectOpen] = useState(false)
   const [deletingProject, setDeletingProject] = useState(false)
   const [deleteProjectError, setDeleteProjectError] = useState('')
@@ -234,6 +228,14 @@ function ProjectPageContent({ data }: { data: ProjectLoaderData }) {
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end" className="min-w-[168px]">
                 <DropdownMenuItem
+                  className="justify-start gap-2"
+                  onClick={() => setEditProjectOpen(true)}
+                >
+                  <Icon name="edit" size={13} />
+                  Edit project
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
                   variant="destructive"
                   className="justify-start gap-2"
                   onClick={() => {
@@ -360,6 +362,12 @@ function ProjectPageContent({ data }: { data: ProjectLoaderData }) {
         setSelectedPersonaIds={setSelectedPersonaIds}
         personaTests={personaTests}
         onTestPersona={persona => void handleTestPersonaAuth(persona)}
+      />
+
+      <ProjectEditModal
+        open={editProjectOpen}
+        project={project}
+        onClose={() => setEditProjectOpen(false)}
       />
 
       <Dialog

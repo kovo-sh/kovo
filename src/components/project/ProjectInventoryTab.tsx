@@ -1,5 +1,10 @@
 import { useState } from 'react'
-import { addProjectAsset, updateProjectAssetScope } from '../../actions.ts'
+import {
+  addProjectAsset,
+  clearProjectAssetAccessPolicyAction,
+  updateProjectAssetAction,
+  updateProjectAssetScope,
+} from '../../actions.ts'
 import { AccessPolicyImport } from '../access-policy-import.tsx'
 import { formatHumanTime, FormError, useAction } from '../common.tsx'
 import { DnsInventoryImport } from '../dns-inventory-import.tsx'
@@ -39,6 +44,10 @@ export function ProjectInventoryTab({ data, onDeleteAsset }: Props) {
   const { project, assets } = data
   const [panel, setPanel] = useState<'dns' | 'access'>()
   const [addHostOpen, setAddHostOpen] = useState(false)
+  const [assetToEdit, setAssetToEdit] = useState<ProjectLoaderData['assets'][number] | null>(null)
+  const [editOrigin, setEditOrigin] = useState('')
+  const [editSource, setEditSource] = useState('')
+  const [editThirdParty, setEditThirdParty] = useState(false)
   const [assetToDelete, setAssetToDelete] = useState<ProjectLoaderData['assets'][number] | null>(null)
   const [candidateOrigin, setCandidateOrigin] = useState('')
   const [candidateSource, setCandidateSource] = useState('')
@@ -58,6 +67,14 @@ export function ProjectInventoryTab({ data, onDeleteAsset }: Props) {
     setCandidateSource('')
     setCandidateThirdParty(false)
     setCandidateIncludeSubdomains(false)
+  }
+
+  function openEditAsset(asset: ProjectLoaderData['assets'][number]) {
+    setEditOrigin(asset.origin)
+    setEditSource(asset.source)
+    setEditThirdParty(Boolean(asset.thirdParty))
+    setAssetToEdit(asset)
+    setNotice('')
   }
 
   const searchTerm = hostSearch.trim().toLowerCase()
@@ -153,6 +170,35 @@ export function ProjectInventoryTab({ data, onDeleteAsset }: Props) {
             />
             <span>{isDefaultApproved ? 'Approved in scope' : 'Approve in scope'}</span>
           </label>
+          {asset.accessPolicy && (
+            <Button
+              type="button"
+              variant="ghost"
+              disabled={inventoryAction.pending}
+              aria-label={`Clear access policy for ${hostLabel}`}
+              onClick={() => {
+                setNotice('')
+                void inventoryAction.submit(() => clearProjectAssetAccessPolicyAction({
+                  data: {
+                    requestId: crypto.randomUUID(),
+                    projectId: project.id,
+                    assetId: asset.id,
+                  },
+                }), () => setNotice(`Cleared access policy for ${hostLabel}.`))
+              }}
+            >
+              Clear policy
+            </Button>
+          )}
+          <Button
+            type="button"
+            variant="ghost"
+            disabled={inventoryAction.pending}
+            aria-label={`Edit host ${hostLabel}`}
+            onClick={() => openEditAsset(asset)}
+          >
+            Edit
+          </Button>
           <Button
             type="button"
             variant="ghost"
@@ -229,6 +275,7 @@ export function ProjectInventoryTab({ data, onDeleteAsset }: Props) {
           {notice}
         </p>
       )}
+      {!addHostOpen && !assetToDelete && !assetToEdit && <FormError error={inventoryAction.error} />}
 
       {panel === 'dns' && (
         <div className="mb-3.5">
@@ -425,6 +472,107 @@ export function ProjectInventoryTab({ data, onDeleteAsset }: Props) {
               </Button>
             </DialogFooter>
           </form>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={Boolean(assetToEdit)}
+        closeOnEscape={!inventoryAction.pending}
+        onOpenChange={nextOpen => {
+          if (!nextOpen && !inventoryAction.pending) setAssetToEdit(null)
+        }}
+      >
+        <DialogContent className="flex max-h-[calc(100vh-56px)] max-w-[480px] flex-col overflow-hidden p-0">
+          {assetToEdit && (
+            <form
+              className="flex min-h-0 flex-1 flex-col"
+              onSubmit={event => {
+                event.preventDefault()
+                const target = assetToEdit
+                void inventoryAction.submit(() => updateProjectAssetAction({
+                  data: {
+                    requestId: crypto.randomUUID(),
+                    projectId: project.id,
+                    assetId: target.id,
+                    origin: editOrigin.trim(),
+                    source: editSource.trim() || 'Manual entry',
+                    thirdParty: editThirdParty,
+                  },
+                }), updated => {
+                  setAssetToEdit(null)
+                  setNotice(`Updated host ${safeHost(updated.origin) || updated.origin}.`)
+                })
+              }}
+            >
+              <DialogHeader className="flex-row items-center justify-between gap-2.5 border-b border-line bg-raise px-4 py-2.5">
+                <DialogTitle className="text-[13px] font-semibold text-fg">Edit host</DialogTitle>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  className="size-[26px]"
+                  disabled={inventoryAction.pending}
+                  onClick={() => setAssetToEdit(null)}
+                  aria-label="Close"
+                >
+                  <Icon name="close" size={14} />
+                </Button>
+              </DialogHeader>
+              <DialogBody className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-4">
+                <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
+                  Host
+                  <Input
+                    className="w-full font-mono text-[12px]"
+                    name="editAssetOrigin"
+                    value={editOrigin}
+                    onChange={e => setEditOrigin(e.target.value)}
+                    required
+                    disabled={inventoryAction.pending}
+                  />
+                </label>
+                <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
+                  Source
+                  <Input
+                    className="w-full"
+                    name="editAssetSource"
+                    value={editSource}
+                    onChange={e => setEditSource(e.target.value)}
+                    maxLength={160}
+                    required
+                    disabled={inventoryAction.pending}
+                  />
+                </label>
+                <label className="inline-flex cursor-pointer select-none items-center gap-[7px] text-[12.5px] font-normal text-fg-muted">
+                  <Checkbox
+                    name="editAssetThirdParty"
+                    checked={editThirdParty}
+                    disabled={inventoryAction.pending}
+                    aria-label="Third-party service"
+                    onCheckedChange={checked => setEditThirdParty(Boolean(checked))}
+                  />
+                  <span>Third-party service</span>
+                </label>
+                <FormError error={inventoryAction.error} />
+              </DialogBody>
+              <DialogFooter>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  disabled={inventoryAction.pending}
+                  onClick={() => setAssetToEdit(null)}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  type="submit"
+                  variant="default"
+                  disabled={inventoryAction.pending || !editOrigin.trim() || !editSource.trim()}
+                >
+                  {inventoryAction.pending ? 'Saving…' : 'Save changes'}
+                </Button>
+              </DialogFooter>
+            </form>
+          )}
         </DialogContent>
       </Dialog>
 
