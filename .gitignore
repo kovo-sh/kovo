@@ -4,6 +4,8 @@ dist/app.js
 /build/
 # Local run state, incl. opt-in agentic traces (.kovo/traces/<traceId>/)
 /.kovo/
+.guardian/
+.kovo-scratch/
 /playwright-report/
 /test-results/
 /node_modules/
