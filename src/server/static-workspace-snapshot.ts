@@ -19,7 +19,7 @@ import {
 } from 'node:fs'
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { extractProgramGraph, type ProgramGraph } from './program-graph.ts'
-import { extractProgramGraphInWorker } from './untrusted-compute-pool.ts'
+import { UntrustedComputeAbortedError, extractProgramGraphInWorker } from './untrusted-compute-pool.ts'
 
 // ============================================================================
 // Bounds & Exclusion Rules
@@ -349,6 +349,9 @@ function collectWorkspaceSnapshotInputs(
   const stack: Array<{ dir: string; depth: number; seg1?: string }> = [{ dir: rootReal, depth: 0 }]
 
   while (stack.length > 0 && filesScanned < maxFiles) {
+    if (options.signal?.aborted) {
+      throw new UntrustedComputeAbortedError()
+    }
     const current = stack.pop()!
     let entries: string[]
     try {
@@ -532,7 +535,13 @@ export async function buildStaticWorkspaceSnapshotInWorker(
   reposDir: string,
   options: BuildStaticWorkspaceSnapshotOptions = {},
 ): Promise<StaticWorkspaceSnapshot> {
+  if (options.signal?.aborted) {
+    throw new UntrustedComputeAbortedError()
+  }
   const collected = collectWorkspaceSnapshotInputs(reposDir, options)
+  if (options.signal?.aborted) {
+    throw new UntrustedComputeAbortedError()
+  }
   if (collected.empty) return collected.empty
   const files = collected.graphSourceFiles ?? []
   const programGraph = files.length === 0

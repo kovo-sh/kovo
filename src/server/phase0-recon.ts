@@ -1549,7 +1549,27 @@ const JS_RESERVED_BODY_KEYS = /^(?:query|variables|operationName|method|headers|
  * JSON/urlencoded body keys, and XML element names adjacent to a concatenation. Deterministic and
  * dependency-free (works when the AST parser is unavailable).
  */
-export function harvestJsRequestParams(code: string): JsRequestSpec[] {
+const MAX_PHASE0_JS_SCAN_BYTES = 512 * 1024
+const PROTO_POLLUTION_SEGMENTS = new Set(['__proto__', 'constructor', 'prototype'])
+
+/** Reject prototype-accessor segments in dotted/bracketed parameter paths (`R2-C-2`). */
+export function hasPrototypePollutionSegment(name: string): boolean {
+  if (!name) return false
+  for (const rawSeg of name.split(/[.[\]]+/)) {
+    const seg = rawSeg.trim()
+    if (seg && PROTO_POLLUTION_SEGMENTS.has(seg)) return true
+  }
+  return false
+}
+
+const PARAM_NAME_RE = /^[A-Za-z_][A-Za-z0-9_.[-]{0,63}$/
+
+function isSafeParamName(name: string): boolean {
+  return PARAM_NAME_RE.test(name) && !hasPrototypePollutionSegment(name)
+}
+
+export function harvestJsRequestParams(rawCode: string): JsRequestSpec[] {
+  const code = rawCode.length > MAX_PHASE0_JS_SCAN_BYTES ? rawCode.slice(0, MAX_PHASE0_JS_SCAN_BYTES) : rawCode
   const out: JsRequestSpec[] = []
   const seen = new Set<string>()
   const pushSpec = (method: string, rawPath: string, params: JsRequestParam[]) => {
@@ -1559,7 +1579,7 @@ export function harvestJsRequestParams(code: string): JsRequestSpec[] {
     const deduped: JsRequestParam[] = []
     const keys = new Set<string>()
     for (const p of params) {
-      if (!p.name || !/^[A-Za-z_][A-Za-z0-9_.[-]{0,63}$/.test(p.name)) continue
+      if (!p.name || !isSafeParamName(p.name)) continue
       const key = `${p.name}|${p.location}`
       if (keys.has(key)) continue
       keys.add(key)
@@ -1570,7 +1590,7 @@ export function harvestJsRequestParams(code: string): JsRequestSpec[] {
     if (qIdx >= 0) {
       try {
         for (const name of new URL(path, 'http://kovo.invalid').searchParams.keys()) {
-          if (!/^[A-Za-z_][A-Za-z0-9_.[-]{0,63}$/.test(name)) continue
+          if (!isSafeParamName(name)) continue
           const key = `${name}|query`
           if (keys.has(key)) continue
           keys.add(key)
@@ -1660,7 +1680,7 @@ export function harvestJsRequestParams(code: string): JsRequestSpec[] {
     }
     const params: JsRequestParam[] = []
     const collect = (block: string, location: 'json' | 'form', skipInitOptions: boolean, target: JsRequestParam[] = params) => {
-      for (const m of block.matchAll(/([A-Za-z_$][\w$]*)\s*:/g)) {
+      for (const m of block.matchAll(/(?<![\w$])([A-Za-z_$][\w$]{0,63})[ \t]{0,16}:/g)) {
         const name = m[1]
         if (skipInitOptions && JS_RESERVED_BODY_KEYS.test(name)) continue
         if (!skipInitOptions && /^(?:query|variables|operationName)$/i.test(name)) continue
@@ -1721,30 +1741,29 @@ export interface RouteMapParamBinding {
   location: 'json' | 'form' | 'query'
 }
 
-const PARAM_NAME_RE = /^[A-Za-z_][A-Za-z0-9_.[-]{0,63}$/
-
 /** Extract runtime parameter names that the SPA binds to a named API client call. */
-export function harvestConfigParamBindings(code: string): RouteMapParamBinding[] {
+export function harvestConfigParamBindings(rawCode: string): RouteMapParamBinding[] {
+  const code = rawCode.length > MAX_PHASE0_JS_SCAN_BYTES ? rawCode.slice(0, MAX_PHASE0_JS_SCAN_BYTES) : rawCode
   const out: RouteMapParamBinding[] = []
   const seen = new Set<string>()
-  const aliasRe = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*\(?\s*[A-Za-z_$][\w$.]*\.params\s*&&\s*[A-Za-z_$][\w$.]*\.params(?:\.([A-Za-z_$][\w$]*)|\[\s*(['"])([^'"]+)\3\s*\])/g
+  const aliasRe = /(?<![\w$])(?:const|let|var)[ \t]{1,16}([A-Za-z_$][\w$]{0,63})[ \t]{0,16}=[ \t]{0,16}\(?[ \t]{0,16}[A-Za-z_$][\w$.]{0,127}\.params[ \t]{0,16}&&[ \t]{0,16}[A-Za-z_$][\w$.]{0,127}\.params(?:\.([A-Za-z_$][\w$]{0,63})|\[[ \t]{0,16}(['"])([^'"\r\n]{1,64})\3[ \t]{0,16}\])/g
   for (const match of code.matchAll(aliasRe)) {
     const alias = match[1] ?? ''
     const paramName = (match[2] ?? match[4] ?? '').trim()
-    if (!alias || !PARAM_NAME_RE.test(paramName)) continue
+    if (!alias || !isSafeParamName(paramName)) continue
     const start = match.index ?? 0
     const declarationWindow = code.slice(start, Math.min(code.length, start + 1600))
     const escaped = alias.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    const usage = new RegExp(`\\[\\s*${escaped}\\s*\\]\\s*=`).exec(declarationWindow)
+    const usage = new RegExp(`\\[[ \\t]{0,16}${escaped}[ \\t]{0,16}\\][ \\t]{0,16}=`).exec(declarationWindow)
     if (!usage) continue
     const window = declarationWindow.slice(usage.index, Math.min(declarationWindow.length, usage.index + 900))
-    const call = /(?:api|call|routePath|request|mutate|send)\s*\(\s*(['"])([A-Za-z0-9_.:-]{1,80})\1/.exec(window)
+    const call = /(?:api|call|routePath|request|mutate|send)[ \t]{0,16}\([ \t]{0,16}(['"])([A-Za-z0-9_.:-]{1,80})\1/.exec(window)
     if (!call) continue
     const routeKey = call[2]
     const probes = window.slice(0, 500)
     const location: RouteMapParamBinding['location'] =
-      /URLSearchParams|FormData\s*\(/.test(probes) ? 'form'
-        : /JSON\.stringify\s*\(/.test(probes) ? 'json'
+      /URLSearchParams|FormData[ \t]{0,8}\(/.test(probes) ? 'form'
+        : /JSON\.stringify[ \t]{0,8}\(/.test(probes) ? 'json'
           : 'form'
     const dedupe = `${routeKey}|${paramName}|${location}`
     if (seen.has(dedupe)) continue
@@ -1760,7 +1779,8 @@ export function harvestConfigParamBindings(code: string): RouteMapParamBinding[]
  * import). SPA bootstrap bundles usually keep their API client in an imported chunk, so following
  * these is required before request-literal scanning can see config fetches.
  */
-export function extractJsModuleImports(code: string): string[] {
+export function extractJsModuleImports(rawCode: string): string[] {
+  const code = rawCode.length > MAX_PHASE0_JS_SCAN_BYTES ? rawCode.slice(0, MAX_PHASE0_JS_SCAN_BYTES) : rawCode
   const out: string[] = []
   const seen = new Set<string>()
   const push = (specifier: string | undefined) => {
@@ -1772,9 +1792,9 @@ export function extractJsModuleImports(code: string): string[] {
     seen.add(clean)
     out.push(clean)
   }
-  for (const match of code.matchAll(/\bimport\s+(?:[^'";]{0,200}?\s+from\s+)?(['"])([^'"]{1,200})\1/g)) push(match[2])
-  for (const match of code.matchAll(/\bexport\s+[^'";]{0,200}?\s+from\s+(['"])([^'"]{1,200})\1/g)) push(match[2])
-  for (const match of code.matchAll(/\bimport\s*\(\s*(['"`])([^'"`]{1,200})\1\s*\)/g)) push(match[2])
+  for (const match of code.matchAll(/\bimport[ \t\r\n]{1,16}(?:[^'";]{0,200}?[ \t\r\n]{1,16}from[ \t\r\n]{1,16})?(['"])([^'"\r\n]{1,200})\1/g)) push(match[2])
+  for (const match of code.matchAll(/\bexport[ \t\r\n]{1,16}[^'";]{0,200}?[ \t\r\n]{1,16}from[ \t\r\n]{1,16}(['"])([^'"\r\n]{1,200})\1/g)) push(match[2])
+  for (const match of code.matchAll(/\bimport[ \t]{0,16}\([ \t]{0,16}(['"`])([^'"`\r\n]{1,200})\1[ \t]{0,16}\)/g)) push(match[2])
   return out
 }
 
@@ -1782,7 +1802,8 @@ export function extractJsModuleImports(code: string): string[] {
  * Same-origin build-asset references (JS chunks, source maps, manifest JSON) found in HTML,
  * bundles or webpack chunk maps. Used to drain the JS queue breadth-first beyond entry scripts.
  */
-export function extractAssetReferences(code: string, max = 32): string[] {
+export function extractAssetReferences(rawCode: string, max = 32): string[] {
+  const code = rawCode.length > MAX_PHASE0_JS_SCAN_BYTES ? rawCode.slice(0, MAX_PHASE0_JS_SCAN_BYTES) : rawCode
   const out: string[] = []
   const seen = new Set<string>()
   const push = (raw: string) => {
@@ -1795,8 +1816,8 @@ export function extractAssetReferences(code: string, max = 32): string[] {
     seen.add(clean)
     out.push(clean)
   }
-  for (const match of code.matchAll(/["'`]((?:\/|\.{1,2}\/)[^"'`\s]{1,180}?\.(?:m?js|json))(?:\?[^"'`]*)?["'`]/g)) push(match[1])
-  for (const match of code.matchAll(/\b(?:chunk|asset|file|src|url)\s*[:=]\s*["'`]([^"'`\s]{1,180})["'`]/g)) push(match[1])
+  for (const match of code.matchAll(/["'`]((?:\/|\.{1,2}\/)[^"'`\s]{1,180}?\.(?:m?js|json))(?:\?[^"'`\s]{0,120})?["'`]/g)) push(match[1])
+  for (const match of code.matchAll(/\b(?:chunk|asset|file|src|url)[ \t]{0,16}[:=][ \t]{0,16}["'`]([^"'`\s]{1,180})["'`]/g)) push(match[1])
   return out
 }
 
@@ -1806,7 +1827,8 @@ export interface TrpcProcedure {
 }
 
 /** Bounded scan for tRPC procedure references (`trpc.<router>.<proc>.useQuery`, literal paths). */
-export function harvestTrpcProcedures(code: string): TrpcProcedure[] {
+export function harvestTrpcProcedures(rawCode: string): TrpcProcedure[] {
+  const code = rawCode.length > MAX_PHASE0_JS_SCAN_BYTES ? rawCode.slice(0, MAX_PHASE0_JS_SCAN_BYTES) : rawCode
   const out: TrpcProcedure[] = []
   const seen = new Set<string>()
   const push = (router: string | undefined, procedure: string | undefined) => {
@@ -1818,11 +1840,11 @@ export function harvestTrpcProcedures(code: string): TrpcProcedure[] {
     seen.add(key)
     out.push({ router: r, procedure: p })
   }
-  for (const match of code.matchAll(/\btrpc\s*\.\s*([A-Za-z_$][\w$]*)\s*\.\s*([A-Za-z_$][\w$]*)\s*\.\s*(?:useQuery|useMutation|useInfiniteQuery|query|mutation|fetch|mutate)\b/g)) {
+  for (const match of code.matchAll(/\btrpc[ \t]{0,8}\.[ \t]{0,8}([A-Za-z_$][\w$]{0,63})[ \t]{0,8}\.[ \t]{0,8}([A-Za-z_$][\w$]{0,63})[ \t]{0,8}\.[ \t]{0,8}(?:useQuery|useMutation|useInfiniteQuery|query|mutation|fetch|mutate)\b/g)) {
     push(match[1], match[2])
   }
-  for (const match of code.matchAll(/\btrpc\s*\[\s*['"]([\w$]+)['"]\s*\]\s*\[\s*['"]([\w$]+)['"]\s*\]/g)) push(match[1], match[2])
-  for (const match of code.matchAll(/["'`]\/trpc\/([A-Za-z0-9_$]+)\.([A-Za-z0-9_$]+)/g)) push(match[1], match[2])
+  for (const match of code.matchAll(/\btrpc[ \t]{0,8}\[[ \t]{0,8}['"]([\w$]{1,64})['"][ \t]{0,8}\][ \t]{0,8}\[[ \t]{0,8}['"]([\w$]{1,64})['"][ \t]{0,8}\]/g)) push(match[1], match[2])
+  for (const match of code.matchAll(/["'`]\/trpc\/([A-Za-z0-9_$]{1,64})\.([A-Za-z0-9_$]{1,64})/g)) push(match[1], match[2])
   return out
 }
 
@@ -1882,7 +1904,7 @@ export function extractJsonFieldNames(rawBody: string, max = 24): string[] {
   const responseOnly = /^(?:html|output|error|errors|message|messages|ok|success|detail|error_description|authenticated)$/i
   const push = (key: string) => {
     if (names.length >= max) return
-    if (!PARAM_NAME_RE.test(key) || responseOnly.test(key) || /^(?:__proto__|constructor|prototype)$/.test(key)) return
+    if (!isSafeParamName(key) || responseOnly.test(key)) return
     if (seen.has(key)) return
     seen.add(key)
     names.push(key)
@@ -1984,7 +2006,7 @@ export function inferXhrRequestShape(input: {
   const params: JsRequestParam[] = []
   const seen = new Set<string>()
   const push = (name: string, location: JsRequestParam['location']) => {
-    if (!PARAM_NAME_RE.test(name)) return
+    if (!isSafeParamName(name)) return
     const dedupe = `${name}|${location}`
     if (seen.has(dedupe)) return
     seen.add(dedupe)
@@ -2073,8 +2095,9 @@ export function harvestValidationFieldHints(body: string): string[] {
   const out = new Set<string>()
   const push = (raw: unknown) => {
     if (typeof raw !== 'string') return
+    if (hasPrototypePollutionSegment(raw)) return
     const name = raw.split('.').pop()?.trim() ?? ''
-    if (/^[A-Za-z_][A-Za-z0-9_-]{0,63}$/.test(name)) out.add(name)
+    if (/^[A-Za-z_][A-Za-z0-9_-]{0,63}$/.test(name) && !hasPrototypePollutionSegment(name)) out.add(name)
   }
   let parsed: unknown
   try { parsed = JSON.parse(body) } catch { parsed = undefined }
@@ -2250,7 +2273,7 @@ const PARAM_NOISE_RE = /^(?:undefined|null|true|false|nan|this|self|window|docum
 
 /** Whether a harvested literal is plausibly a request parameter (drops obvious JS/UI noise). */
 export function isUsefulParamName(name: string): boolean {
-  if (!PARAM_NAME_RE.test(name)) return false
+  if (!isSafeParamName(name)) return false
   if (PARAM_NOISE_RE.test(name)) return false
   if (/^\d+$/.test(name)) return false
   if (/^(?:on[a-z]|aria-|data-)/i.test(name) && name.length > 2) return false
@@ -2330,7 +2353,7 @@ export function deriveResponseFieldParams(
 export function paramCandidatesFromRedirect(searchParams: Iterable<string>): DiscoveredParamCandidate[] {
   const out: DiscoveredParamCandidate[] = []
   for (const name of searchParams) {
-    if (!PARAM_NAME_RE.test(name)) continue
+    if (!isSafeParamName(name)) continue
     out.push({ name, location: 'query', source: 'observed:redirect_query' })
   }
   return orderDiscoveredParams(out)
@@ -2528,7 +2551,7 @@ export interface RouteMapParamHints {
 /** Collect logical->actual parameter dictionaries from a route-map/config document. */
 export function harvestRouteMapParamHints(raw: unknown): RouteMapParamHints {
   const paramHints: string[] = []
-  const paramMap: Record<string, string> = {}
+  const paramMap: Record<string, string> = Object.create(null) as Record<string, string>
   let visited = 0
   const walk = (node: unknown, depth: number): void => {
     if (!node || typeof node !== 'object' || depth > 6 || visited > 600) return
@@ -2541,13 +2564,13 @@ export function harvestRouteMapParamHints(raw: unknown): RouteMapParamHints {
       if (/^(?:params|paramNames|paramMap|parameterNames)$/i.test(key)) {
         if (Array.isArray(value)) {
           for (const item of value.slice(0, 40)) {
-            if (typeof item === 'string' && PARAM_NAME_RE.test(item)) paramHints.push(item)
+            if (typeof item === 'string' && isSafeParamName(item)) paramHints.push(item)
           }
         } else if (value && typeof value === 'object') {
           for (const [logical, actual] of Object.entries(value as Record<string, unknown>)) {
-            if (typeof actual !== 'string' || !PARAM_NAME_RE.test(actual.trim())) continue
+            if (typeof actual !== 'string' || !isSafeParamName(actual.trim())) continue
             paramHints.push(actual.trim())
-            if (PARAM_NAME_RE.test(logical.trim())) paramMap[logical.trim()] = actual.trim()
+            if (isSafeParamName(logical.trim())) paramMap[logical.trim()] = actual.trim()
           }
         }
         continue
@@ -2605,7 +2628,7 @@ export function parseRouteMapDoc(
   const created: Array<{ id: string; key?: string; method: string; path: string }> = []
   const paramKeys = new Set<string>()
   const addParam = (endpointId: string, name: string, location: RouteMapEntry['params'][number]['location']) => {
-    if (!PARAM_NAME_RE.test(name)) return
+    if (!isSafeParamName(name)) return
     const dedupe = `${endpointId}|${name}|${location}`
     if (paramKeys.has(dedupe)) return
     paramKeys.add(dedupe)
@@ -2641,7 +2664,7 @@ export function parseRouteMapDoc(
   // Attach logical->actual parameter hints to same-resource write/read routes by shared name tokens.
   const attachedHints = new Set<string>()
   const attachHint = (matchKey: string, actualName: string) => {
-    if (attachedHints.has(actualName) || !PARAM_NAME_RE.test(actualName)) return
+    if (attachedHints.has(actualName) || !isSafeParamName(actualName)) return
     dynamicParams.add(actualName)
     const hintTokens = new Set(routeKeyTokens(matchKey))
     if (hintTokens.size === 0) return
@@ -3021,7 +3044,7 @@ export function parseOpenApiDoc(
 
   const addParam = (endpointId: string, name: string, location: ParamLocation, inferredType?: string | null) => {
     const clean = name.trim()
-    if (!clean || !PARAM_NAME_RE.test(clean)) return
+    if (!clean || !isSafeParamName(clean)) return
     storage.upsertEndpointParam({
       runId,
       endpointId,
@@ -3053,10 +3076,14 @@ export function parseOpenApiDoc(
     }
     const schema = resolveNode(schemaNode)
     if (!schema) return
-    const props: Record<string, unknown> = {}
+    const props: Record<string, unknown> = Object.create(null) as Record<string, unknown>
     const collectProps = (node: Record<string, unknown>, depth: number) => {
       if (depth > 3) return
-      if (isRecord(node.properties)) Object.assign(props, node.properties)
+      if (isRecord(node.properties)) {
+        for (const [k, v] of Object.entries(node.properties)) {
+          if (!hasPrototypePollutionSegment(k)) props[k] = v
+        }
+      }
       for (const composite of ['allOf']) {
         const list = node[composite]
         if (Array.isArray(list)) {
@@ -3082,7 +3109,7 @@ export function parseOpenApiDoc(
     collectProps(schema, 0)
 
     for (const [propName, propNode] of Object.entries(props)) {
-      if (!propName || params >= 800) continue
+      if (!propName || hasPrototypePollutionSegment(propName) || params >= 800) continue
       const propSchema = resolveNode(propNode) ?? {}
       const inferredType = typeof propSchema.type === 'string' ? propSchema.type : null
       const xmlName = location === 'xml' && isRecord(propSchema.xml) && typeof propSchema.xml.name === 'string'
@@ -3745,10 +3772,15 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
 
   // Build or reuse ONE StaticWorkspaceSnapshot per Phase 0 run so manifests, regex fallback routes,
   // and ProgramGraph extraction all read from memory without redundant repo filesystem walks.
-  const staticSnapshot = params.staticSnapshot
-    ?? (params.reposDir && existsSync(params.reposDir)
-      ? await getOrBuildStaticWorkspaceSnapshotInWorker(params.reposDir, undefined, { signal })
-      : undefined)
+  let staticSnapshot: StaticWorkspaceSnapshot | undefined = params.staticSnapshot
+  if (!staticSnapshot && params.reposDir && existsSync(params.reposDir)) {
+    try {
+      staticSnapshot = await getOrBuildStaticWorkspaceSnapshotInWorker(params.reposDir, undefined, { signal })
+    } catch (err) {
+      if (signal.aborted || err instanceof UntrustedComputeAbortedError) throw err
+      staticSnapshot = undefined
+    }
+  }
 
   // Repo dependency manifests contribute tech tags even when live responses are uninformative
   // (or when Tier 0 sends no requests at all).
@@ -3805,6 +3837,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       endpointsDiscovered += 1
       dynamicPaths.add(route.pathTemplate)
       for (const p of route.params) {
+        if (!p.name || hasPrototypePollutionSegment(p.name)) continue
         storage.upsertEndpointParam({
           runId,
           endpointId: ep.id,
@@ -5246,7 +5279,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
               }
             }
             for (const arg of [...args].slice(0, 24)) {
-              if (!arg || !/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(arg)) continue
+              if (!arg || !/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(arg) || hasPrototypePollutionSegment(arg)) continue
               storage.upsertEndpointParam({
                 runId,
                 endpointId: gqlEp.id,

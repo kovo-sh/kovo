@@ -24,19 +24,23 @@ function maskToken(raw: string): string {
   return `${trimmed.slice(0, 4)}…[masked:${trimmed.length}]…${trimmed.slice(-4)}`
 }
 
+const MAX_JS_AST_NESTING_DEPTH = 512
+const MAX_JS_AST_WALK_NODES = 120_000
+const MAX_JS_HARVEST_REGEX_BYTES = 512 * 1024
+
 const ANALYZER_SECRET_PATTERNS: RegExp[] = [
-  /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g,
-  /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[^\n]*/g,
+  /-----BEGIN [A-Z0-9 ]{0,32}PRIVATE KEY-----[\s\S]{0,8192}?-----END [A-Z0-9 ]{0,32}PRIVATE KEY-----/g,
+  /-----BEGIN [A-Z0-9 ]{0,32}PRIVATE KEY-----[^\n]{0,256}/g,
   /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g,
-  /\bgh[pousr]_[A-Za-z0-9_]{20,}\b/g,
-  /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g,
-  /\b(?:sk|rk|pk)_(?:live|test)_[0-9a-zA-Z]{16,}\b/g,
-  /\bsk-(?:proj-|ant-|live-|test-)?[A-Za-z0-9_-]{20,}\b/g,
-  /\bAIza[0-9A-Za-z_-]{35}\b/g,
-  /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g,
-  /\bSG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}\b/g,
-  /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{8,}\b/g,
-  /https:\/\/hooks\.slack\.com\/services\/[A-Za-z0-9/]+/g,
+  /\bgh[pousr]_[A-Za-z0-9_]{20,256}\b/g,
+  /\bgithub_pat_[A-Za-z0-9_]{20,256}\b/g,
+  /\b(?:sk|rk|pk)_(?:live|test)_[0-9a-zA-Z]{16,256}\b/g,
+  /(?<![A-Za-z0-9_-])sk-(?:proj-|ant-|live-|test-)?[A-Za-z0-9_-]{20,256}(?![A-Za-z0-9_-])/g,
+  /(?<![A-Za-z0-9_-])AIza[0-9A-Za-z_-]{35}(?![A-Za-z0-9_-])/g,
+  /(?<![A-Za-z0-9-])xox[baprs]-[A-Za-z0-9-]{10,256}(?![A-Za-z0-9-])/g,
+  /(?<![A-Za-z0-9_-])SG\.[A-Za-z0-9_-]{16,128}\.[A-Za-z0-9_-]{16,128}(?![A-Za-z0-9_-])/g,
+  /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,1024}\.[A-Za-z0-9_-]{10,4096}\.[A-Za-z0-9_-]{8,1024}(?![A-Za-z0-9_-])/g,
+  /https:\/\/hooks\.slack\.com\/services\/[A-Za-z0-9/]{10,128}/g,
 ]
 
 function maskSecretsInText(input: string): string {
@@ -46,7 +50,7 @@ function maskSecretsInText(input: string): string {
     out = out.replace(re, match => (match.startsWith('-----BEGIN') ? '[masked:private-key]' : maskToken(match)))
   }
   out = out.replace(
-    /(\b(?:SERVICE_ROLE_KEY|SUPABASE_SERVICE_ROLE|OPENAI_API_KEY|ANTHROPIC_API_KEY|DATABASE_URL|POSTGRES_URL|JWT_SECRET|NEXTAUTH_SECRET|API_KEY|API_SECRET|SECRET_KEY|PRIVATE_KEY|STRIPE_SECRET|WEBHOOK_SECRET)\s*[:=]\s*["'`])([^"'`\r\n]{6,})(["'`])/gi,
+    /(\b(?:SERVICE_ROLE_KEY|SUPABASE_SERVICE_ROLE|OPENAI_API_KEY|ANTHROPIC_API_KEY|DATABASE_URL|POSTGRES_URL|JWT_SECRET|NEXTAUTH_SECRET|API_KEY|API_SECRET|SECRET_KEY|PRIVATE_KEY|STRIPE_SECRET|WEBHOOK_SECRET)[ \t]{0,16}[:=][ \t]{0,16}["'`])([^"'`\r\n]{6,256})(["'`])/gi,
     (_m, pre: string, val: string, q: string) => `${pre}${maskToken(val)}${q}`,
   )
   return out
@@ -98,9 +102,130 @@ function loadAcorn(): AcornApi | null {
 
 type AstParserKind = 'swc' | 'acorn' | 'regex'
 
+/**
+ * Strictly O(n) single-pass nesting-depth pre-scan guarding native `@swc/core` `parseSync`
+ * and Acorn against stack-overflow SIGSEGV / RangeError on deeply nested untrusted JS.
+ * Tracks delimiter nesting both outside strings and inside any single unclosed quote so
+ * regex literals containing quotes (e.g. `/'/`) cannot blind the guard.
+ */
+export function exceedsJsAstNestingDepth(content: string, maxDepth = MAX_JS_AST_NESTING_DEPTH): boolean {
+  let depth = 0
+  let angleDepth = 0
+  let jsxDepth = 0
+  let unaryRun = 0
+  let exprOpChain = 0
+  let inQuoteDepth = 0
+  let quote = 0
+  const len = content.length
+  const isIdentLike = (c: number): boolean =>
+    (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 95 || c === 36
+  const isTagStart = (c: number): boolean =>
+    (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95 || c === 36 || c === 62
+
+  for (let i = 0; i < len; i += 1) {
+    const ch = content.charCodeAt(i)
+    if (quote !== 0) {
+      if (ch === 92) { // '\\'
+        i += 1
+        continue
+      }
+      if (ch === quote || (quote !== 96 && (ch === 10 || ch === 13))) {
+        quote = 0
+        inQuoteDepth = 0
+        continue
+      }
+      if (ch === 40 || ch === 91 || ch === 123) { // ( [ {
+        inQuoteDepth += 1
+        if (depth + inQuoteDepth > maxDepth) return true
+      } else if (ch === 41 || ch === 93 || ch === 125) { // ) ] }
+        if (inQuoteDepth > 0) inQuoteDepth -= 1
+      }
+      continue
+    }
+    if (ch === 47) { // '/'
+      const next = i + 1 < len ? content.charCodeAt(i + 1) : 0
+      if (next === 47) { // '//'
+        const nl = content.indexOf('\n', i + 2)
+        if (nl < 0) break
+        i = nl
+        continue
+      }
+      if (next === 42) { // '/*'
+        const end = content.indexOf('*/', i + 2)
+        if (end < 0) break
+        i = end + 1
+        continue
+      }
+      if (next === 62) { // '/>' self-closing JSX
+        if (jsxDepth > 0) jsxDepth -= 1
+        if (angleDepth > 0) angleDepth -= 1
+        i += 1
+        unaryRun = 0
+        continue
+      }
+    }
+    if (ch === 34 || ch === 39 || ch === 96) { // " ' `
+      quote = ch
+      inQuoteDepth = 0
+      unaryRun = 0
+      continue
+    }
+    if (ch === 59 || ch === 44) { // ';' or ','
+      unaryRun = 0
+      exprOpChain = 0
+      continue
+    }
+    if (ch === 33 || ch === 126 || ch === 43 || ch === 45) { // ! ~ + -
+      unaryRun += 1
+      exprOpChain += 1
+      if (unaryRun > maxDepth || exprOpChain > maxDepth) return true
+      continue
+    }
+    if (ch === 42 || ch === 37 || ch === 38 || ch === 124 || ch === 94 || ch === 63 || ch === 61 || ch === 46) {
+      // * % & | ^ ? = . (recursive binary/ternary/assignment/member chains in SWC)
+      unaryRun = 0
+      exprOpChain += 1
+      if (exprOpChain > maxDepth) return true
+      continue
+    }
+    if (ch !== 32 && ch !== 9 && ch !== 10 && ch !== 13) {
+      unaryRun = 0
+    }
+    if (ch === 40 || ch === 91 || ch === 123) { // ( [ {
+      if (ch === 123) exprOpChain = 0
+      depth += 1
+      if (depth > maxDepth) return true
+    } else if (ch === 41 || ch === 93 || ch === 125) { // ) ] }
+      if (ch === 125) exprOpChain = 0
+      if (depth > 0) depth -= 1
+    } else if (ch === 60) { // '<'
+      const next = i + 1 < len ? content.charCodeAt(i + 1) : 0
+      if (next === 47) { // '</' closing JSX tag
+        if (jsxDepth > 0) jsxDepth -= 1
+        i += 1
+      } else if (isTagStart(next)) {
+        angleDepth += 1
+        if (angleDepth > maxDepth) return true
+        const prev = i > 0 ? content.charCodeAt(i - 1) : 0
+        if (!isIdentLike(prev)) {
+          jsxDepth += 1
+          if (jsxDepth > maxDepth) return true
+        }
+      }
+    } else if (ch === 62) { // '>'
+      if (angleDepth > 0) angleDepth -= 1
+    }
+  }
+  return false
+}
+
 function parseJsTsAst(content: string): { ast: unknown; kind: AstParserKind } {
-  // Skip AST parsing on massive (> 2 MiB) or HTML-only documents
-  if (content.length > 2 * 1024 * 1024 || /^\s*<!doctype\s+html|^\s*<html/i.test(content)) {
+  // Skip AST parsing on massive (> 2 MiB), HTML-only, or deeply nested (> 512) documents
+  if (
+    content.length > 2 * 1024 * 1024
+    || /^\s*<!doctype\s+html|^\s*<html/i.test(content.slice(0, 256))
+    || exceedsJsAstNestingDepth(content, MAX_JS_AST_NESTING_DEPTH)
+  ) {
     return { ast: null, kind: 'regex' }
   }
   const swc = loadSwc()
@@ -166,26 +291,57 @@ function isAstNode(v: unknown): v is AstNode {
   return Boolean(v && typeof v === 'object' && !Array.isArray(v) && typeof (v as AstNode).type === 'string')
 }
 
-function walkAst(node: unknown, visit: (n: AstNode, ancestors: AstNode[]) => void, ancestors: AstNode[] = []): void {
-  if (!node || typeof node !== 'object') return
-  if (Array.isArray(node)) {
-    for (let i = 0; i < node.length; i += 1) walkAst(node[i], visit, ancestors)
-    return
-  }
-  const rec = node as AstNode
-  if (typeof rec.type === 'string') {
-    visit(rec, ancestors)
-    ancestors.push(rec)
-    for (const k in rec) {
-      if (k === 'span' || k === 'loc' || k === 'type') continue
-      const v = rec[k]
-      if (v && typeof v === 'object') walkAst(v, visit, ancestors)
+const AST_EXIT_SENTINEL = Symbol('ast_exit')
+
+/**
+ * Iterative pre-order AST walker with explicit node-budget cap (`R2-H-23`).
+ * Maintains exact `ancestors` semantics without call-stack recursion.
+ */
+function walkAst(
+  root: unknown,
+  visit: (n: AstNode, ancestors: AstNode[]) => void,
+  initialAncestors: AstNode[] = [],
+  maxNodes = MAX_JS_AST_WALK_NODES,
+): void {
+  if (!root || typeof root !== 'object') return
+  const ancestors = initialAncestors.slice()
+  const stack: unknown[] = [root]
+  let visited = 0
+
+  while (stack.length > 0) {
+    const item = stack.pop()
+    if (item === AST_EXIT_SENTINEL) {
+      ancestors.pop()
+      continue
     }
-    ancestors.pop()
-  } else {
-    for (const k in rec) {
-      const v = rec[k]
-      if (v && typeof v === 'object') walkAst(v, visit, ancestors)
+    if (!item || typeof item !== 'object') continue
+    if (Array.isArray(item)) {
+      for (let i = item.length - 1; i >= 0; i -= 1) {
+        const el = item[i]
+        if (el && typeof el === 'object') stack.push(el)
+      }
+      continue
+    }
+    visited += 1
+    if (visited > maxNodes) break
+    const rec = item as AstNode
+    if (typeof rec.type === 'string') {
+      visit(rec, ancestors)
+      ancestors.push(rec)
+      stack.push(AST_EXIT_SENTINEL)
+      const keys = Object.keys(rec)
+      for (let i = keys.length - 1; i >= 0; i -= 1) {
+        const k = keys[i]
+        if (k === 'span' || k === 'loc' || k === 'type') continue
+        const v = rec[k]
+        if (v && typeof v === 'object') stack.push(v)
+      }
+    } else {
+      const keys = Object.keys(rec)
+      for (let i = keys.length - 1; i >= 0; i -= 1) {
+        const v = rec[keys[i]]
+        if (v && typeof v === 'object') stack.push(v)
+      }
     }
   }
 }
@@ -200,28 +356,49 @@ function getPropName(node: unknown): string | null {
 }
 
 function getCalleeParts(callee: unknown): string[] {
-  if (!isAstNode(callee)) return []
-  if (callee.type === 'Identifier') {
-    const n = getPropName(callee)
-    return n ? [n] : []
+  const reversed: string[] = []
+  let cur: unknown = callee
+  let steps = 0
+  while (isAstNode(cur) && steps < 64) {
+    steps += 1
+    if (cur.type === 'Identifier') {
+      const n = getPropName(cur)
+      if (n) reversed.push(n)
+      break
+    }
+    if (cur.type === 'MemberExpression') {
+      const prop = getPropName(cur.property)
+      if (prop) reversed.push(prop)
+      cur = cur.object
+      continue
+    }
+    if (cur.type === 'ChainExpression' && cur.expression) {
+      cur = cur.expression
+      continue
+    }
+    break
   }
-  if (callee.type === 'MemberExpression') {
-    const obj = getCalleeParts(callee.object)
-    const prop = getPropName(callee.property)
-    return prop ? [...obj, prop] : obj
-  }
-  if (callee.type === 'ChainExpression' && callee.expression) {
-    return getCalleeParts(callee.expression)
-  }
-  return []
+  return reversed.reverse()
 }
 
 function unwrapExpr(node: unknown): unknown {
-  if (!isAstNode(node)) return node
-  if (node.type === 'ParenthesisExpression' || node.type === 'ChainExpression' || node.type === 'TsAsExpression' || node.type === 'TsTypeAssertion' || node.type === 'TsNonNullExpression') {
-    return unwrapExpr(node.expression)
+  let cur: unknown = node
+  let steps = 0
+  while (isAstNode(cur) && steps < 64) {
+    steps += 1
+    if (
+      cur.type === 'ParenthesisExpression'
+      || cur.type === 'ChainExpression'
+      || cur.type === 'TsAsExpression'
+      || cur.type === 'TsTypeAssertion'
+      || cur.type === 'TsNonNullExpression'
+    ) {
+      cur = cur.expression
+      continue
+    }
+    break
   }
-  return node
+  return cur
 }
 
 function resolveStringValue(rawNode: unknown, envConsts?: Map<string, string>, depth = 0): string | null {
@@ -292,7 +469,8 @@ function getObjectProps(objNode: unknown): Array<{ key: string; value: unknown }
   return out
 }
 
-function extractBodyKeysFromExpr(expr: unknown): string[] {
+function extractBodyKeysFromExpr(expr: unknown, depth = 0): string[] {
+  if (depth > 6) return []
   const unwrapped = unwrapExpr(expr)
   if (!isAstNode(unwrapped)) return []
   if (unwrapped.type === 'ObjectExpression') {
@@ -302,14 +480,14 @@ function extractBodyKeysFromExpr(expr: unknown): string[] {
     const parts = getCalleeParts(unwrapped.callee)
     if (parts.join('.') === 'JSON.stringify') {
       const first = getCallArgs(unwrapped)[0]
-      return extractBodyKeysFromExpr(first)
+      return extractBodyKeysFromExpr(first, depth + 1)
     }
   }
   if (unwrapped.type === 'NewExpression') {
     const parts = getCalleeParts(unwrapped.callee)
     if (parts[0] === 'URLSearchParams' || parts[0] === 'FormData') {
       const first = getCallArgs(unwrapped)[0]
-      return extractBodyKeysFromExpr(first)
+      return extractBodyKeysFromExpr(first, depth + 1)
     }
   }
   return []
@@ -437,6 +615,35 @@ interface JsHarvestDomSinkDetail {
   snippet?: string
 }
 
+/** Linear-time `<script id="__NEXT_DATA__">...</script>` body extraction (zero regex backtracking). */
+function extractNextDataScriptBody(content: string): string | null {
+  let searchFrom = 0
+  while (searchFrom < content.length) {
+    const markerIdx = content.indexOf('__NEXT_DATA__', searchFrom)
+    if (markerIdx < 0) return null
+    searchFrom = markerIdx + 13
+    const lookbackStart = Math.max(0, markerIdx - 256)
+    const before = content.slice(lookbackStart, markerIdx)
+    const lowerBefore = before.toLowerCase()
+    const scriptRel = lowerBefore.lastIndexOf('<script')
+    if (scriptRel < 0) continue
+    // Ensure there is no closing '>' between '<script' and '__NEXT_DATA__'.
+    if (before.indexOf('>', scriptRel) >= 0) continue
+    const attrStart = lookbackStart + scriptRel
+    const openEnd = content.indexOf('>', markerIdx)
+    if (openEnd < 0 || openEnd - attrStart > 512) continue
+    const openTag = content.slice(attrStart, openEnd + 1)
+    if (!/\bid[ \t]{0,8}=[ \t]{0,8}["']__NEXT_DATA__["']/i.test(openTag)) continue
+    const bodyStart = openEnd + 1
+    const bodyLimit = Math.min(content.length, bodyStart + MAX_JS_HARVEST_REGEX_BYTES)
+    const bodyWindow = content.slice(bodyStart, bodyLimit)
+    const closeRel = bodyWindow.toLowerCase().indexOf('</script>')
+    if (closeRel < 0) return null
+    return bodyWindow.slice(0, closeRel)
+  }
+  return null
+}
+
 export function jsHarvest(content: string, sourceName = '', options?: JsHarvestOptions): Record<string, unknown> {
   const routes: JsHarvestRoute[] = []
   const httpCalls: JsHarvestHttpCall[] = []
@@ -447,237 +654,248 @@ export function jsHarvest(content: string, sourceName = '', options?: JsHarvestO
   const astPaths: string[] = []
   const astDomSinks: string[] = []
 
-  const { ast, kind: parserUsed } = parseJsTsAst(content)
+  const parsedAst = parseJsTsAst(content)
+  let parserUsed: AstParserKind = parsedAst.kind
 
-  if (ast) {
-    const lineOffsets = buildLineOffsets(content)
-    // Pass 0: collect simple top-level/local string variable assignments for `fetch(e, ...)` resolution
-    const stringConsts = new Map<string, string>()
-    walkAst(ast, node => {
-      if (node.type === 'VariableDeclarator') {
-        const name = getPropName(node.id)
-        if (name && node.init) {
-          const val = resolveStringValue(node.init, stringConsts)
-          if (val !== null && val.length <= 240) stringConsts.set(name, val)
-        }
-      }
-    })
-
-    // Pass 1: single AST walk for routes, HTTP/RPC calls, GraphQL, Next-Action, feature flags, DOM sinks
-    walkAst(ast, node => {
-      let cachedLine: number | undefined
-      let lineResolved = false
-      const getLine = (): number | undefined => {
-        if (!lineResolved) {
-          cachedLine = nodeLine(node, content, lineOffsets)
-          lineResolved = true
-        }
-        return cachedLine
-      }
-
-      // 1. Router config objects: { path: '...' }
-      if (node.type === 'KeyValueProperty' || node.type === 'Property') {
-        const key = getPropName(node.key)
-        if (key === 'path' || key === 'route' || key === 'endpoint') {
-          const val = resolveStringValue(node.value, stringConsts)
-          if (val && val.startsWith('/') && val.length <= 200) {
-            routes.push({ path: maskSecretsInText(val), kind: 'router', line: getLine() })
-            astPaths.push(val)
+  if (parsedAst.ast) {
+    try {
+      const ast = parsedAst.ast
+      const lineOffsets = buildLineOffsets(content)
+      // Pass 0: collect simple top-level/local string variable assignments for `fetch(e, ...)` resolution
+      const stringConsts = new Map<string, string>()
+      walkAst(ast, node => {
+        if (node.type === 'VariableDeclarator') {
+          const name = getPropName(node.id)
+          if (name && node.init) {
+            const val = resolveStringValue(node.init, stringConsts)
+            if (val !== null && val.length <= 240) stringConsts.set(name, val)
           }
         }
-        if (key && key.toLowerCase() === 'next-action') {
-          const val = resolveStringValue(node.value, stringConsts)
-          if (val && val.length >= 8) {
-            nextActions.push({ id: maskSecretsInText(val.slice(0, 80)), source: 'header', preview: `Next-Action: ${val.slice(0, 48)}` })
+      })
+
+      // Pass 1: single AST walk for routes, HTTP/RPC calls, GraphQL, Next-Action, feature flags, DOM sinks
+      walkAst(ast, node => {
+        let cachedLine: number | undefined
+        let lineResolved = false
+        const getLine = (): number | undefined => {
+          if (!lineResolved) {
+            cachedLine = nodeLine(node, content, lineOffsets)
+            lineResolved = true
           }
+          return cachedLine
         }
-        if (key && FEATURE_FLAG_IDENT_RE.test(key)) {
-          featureFlags.push(key)
-        }
-      }
 
-      // 2. JSX Route/Link & dangerouslySetInnerHTML
-      if (node.type === 'JSXAttribute') {
-        const attrName = getPropName(node.name)
-        if (attrName === 'dangerouslySetInnerHTML') {
-          astDomSinks.push('dangerouslySetInnerHTML')
-          domSinkDetails.push({ kind: 'dangerouslySetInnerHTML', line: getLine() })
-        } else if (attrName === 'path' || attrName === 'to' || attrName === 'href') {
-          const val = extractJsxStringAttr(node.value)
-          if (val && val.startsWith('/') && val.length <= 200) {
-            routes.push({ path: maskSecretsInText(val), kind: 'jsx', line: getLine() })
-            astPaths.push(val)
+        // 1. Router config objects: { path: '...' }
+        if (node.type === 'KeyValueProperty' || node.type === 'Property') {
+          const key = getPropName(node.key)
+          if (key === 'path' || key === 'route' || key === 'endpoint') {
+            const val = resolveStringValue(node.value, stringConsts)
+            if (val && val.startsWith('/') && val.length <= 200) {
+              routes.push({ path: maskSecretsInText(val), kind: 'router', line: getLine() })
+              astPaths.push(val)
+            }
           }
-        }
-      }
-
-      // 3. Call expressions: fetch, axios, router nav, trpc, addEventListener('message'), feature flags, createServerReference
-      if (node.type === 'CallExpression') {
-        const parts = getCalleeParts(node.callee)
-        const joined = parts.join('.')
-        const last = parts[parts.length - 1] ?? ''
-        const args = getCallArgs(node)
-
-        // Navigation calls: router.push, history.push, navigate, redirect
-        if (['push', 'replace', 'navigate', 'redirect'].includes(last) &&
-          (parts.length === 1 || /^(?:router|history|navigation|Router|NextResponse)$/i.test(parts[0] ?? ''))) {
-          const dest = resolveStringValue(args[0], stringConsts)
-          if (dest && dest.startsWith('/')) {
-            routes.push({ path: maskSecretsInText(dest), kind: 'nav', line: getLine() })
-            astPaths.push(dest)
+          if (key && key.toLowerCase() === 'next-action') {
+            const val = resolveStringValue(node.value, stringConsts)
+            if (val && val.length >= 8) {
+              nextActions.push({ id: maskSecretsInText(val.slice(0, 80)), source: 'header', preview: `Next-Action: ${val.slice(0, 48)}` })
+            }
+          }
+          if (key && FEATURE_FLAG_IDENT_RE.test(key)) {
+            featureFlags.push(key)
           }
         }
 
-        // fetch(url, init)
-        if (last === 'fetch' && parts.length <= 2 && args.length >= 1) {
-          const url = resolveStringValue(args[0], stringConsts)
-          let method = 'GET'
-          let bodyKeys: string[] = []
-          if (args[1]) {
-            for (const p of getObjectProps(args[1])) {
-              if (p.key === 'method') {
-                const m = resolveStringValue(p.value, stringConsts)
-                if (m) method = m.toUpperCase()
-              } else if (p.key === 'body') {
-                bodyKeys = extractBodyKeysFromExpr(p.value)
+        // 2. JSX Route/Link & dangerouslySetInnerHTML
+        if (node.type === 'JSXAttribute') {
+          const attrName = getPropName(node.name)
+          if (attrName === 'dangerouslySetInnerHTML') {
+            astDomSinks.push('dangerouslySetInnerHTML')
+            domSinkDetails.push({ kind: 'dangerouslySetInnerHTML', line: getLine() })
+          } else if (attrName === 'path' || attrName === 'to' || attrName === 'href') {
+            const val = extractJsxStringAttr(node.value)
+            if (val && val.startsWith('/') && val.length <= 200) {
+              routes.push({ path: maskSecretsInText(val), kind: 'jsx', line: getLine() })
+              astPaths.push(val)
+            }
+          }
+        }
+
+        // 3. Call expressions: fetch, axios, router nav, trpc, addEventListener('message'), feature flags, createServerReference
+        if (node.type === 'CallExpression') {
+          const parts = getCalleeParts(node.callee)
+          const joined = parts.join('.')
+          const last = parts[parts.length - 1] ?? ''
+          const args = getCallArgs(node)
+
+          // Navigation calls: router.push, history.push, navigate, redirect
+          if (['push', 'replace', 'navigate', 'redirect'].includes(last) &&
+            (parts.length === 1 || /^(?:router|history|navigation|Router|NextResponse)$/i.test(parts[0] ?? ''))) {
+            const dest = resolveStringValue(args[0], stringConsts)
+            if (dest && dest.startsWith('/')) {
+              routes.push({ path: maskSecretsInText(dest), kind: 'nav', line: getLine() })
+              astPaths.push(dest)
+            }
+          }
+
+          // fetch(url, init)
+          if (last === 'fetch' && parts.length <= 2 && args.length >= 1) {
+            const url = resolveStringValue(args[0], stringConsts)
+            let method = 'GET'
+            let bodyKeys: string[] = []
+            if (args[1]) {
+              for (const p of getObjectProps(args[1])) {
+                if (p.key === 'method') {
+                  const m = resolveStringValue(p.value, stringConsts)
+                  if (m) method = m.toUpperCase()
+                } else if (p.key === 'body') {
+                  bodyKeys = extractBodyKeysFromExpr(p.value)
+                }
+              }
+            }
+            if (url) {
+              httpCalls.push({ client: 'fetch', url: maskSecretsInText(url), method, bodyKeys, line: getLine() })
+              if (url.startsWith('/')) astPaths.push(url)
+            }
+          }
+
+          // axios.get/post/... or axios({ url, method, data })
+          if (parts[0] === 'axios') {
+            if (parts.length === 2 && ['get', 'post', 'put', 'patch', 'delete', 'head', 'options'].includes(last)) {
+              const url = resolveStringValue(args[0], stringConsts)
+              const method = last.toUpperCase()
+              const bodyKeys = ['POST', 'PUT', 'PATCH'].includes(method) ? extractBodyKeysFromExpr(args[1]) : []
+              if (url) {
+                httpCalls.push({ client: 'axios', url: maskSecretsInText(url), method, bodyKeys, line: getLine() })
+                if (url.startsWith('/')) astPaths.push(url)
+              }
+            } else if (parts.length === 1 && args[0]) {
+              let url = ''
+              let method = 'GET'
+              let bodyKeys: string[] = []
+              for (const p of getObjectProps(args[0])) {
+                if (p.key === 'url') url = resolveStringValue(p.value, stringConsts) ?? ''
+                if (p.key === 'method') method = (resolveStringValue(p.value, stringConsts) ?? 'GET').toUpperCase()
+                if (p.key === 'data' || p.key === 'params') bodyKeys = extractBodyKeysFromExpr(p.value)
+              }
+              if (url) {
+                httpCalls.push({ client: 'axios', url: maskSecretsInText(url), method, bodyKeys, line: getLine() })
+                if (url.startsWith('/')) astPaths.push(url)
               }
             }
           }
-          if (url) {
-            httpCalls.push({ client: 'fetch', url: maskSecretsInText(url), method, bodyKeys, line: getLine() })
-            if (url.startsWith('/')) astPaths.push(url)
-          }
-        }
 
-        // axios.get/post/... or axios({ url, method, data })
-        if (parts[0] === 'axios') {
-          if (parts.length === 2 && ['get', 'post', 'put', 'patch', 'delete', 'head', 'options'].includes(last)) {
-            const url = resolveStringValue(args[0], stringConsts)
-            const method = last.toUpperCase()
-            const bodyKeys = ['POST', 'PUT', 'PATCH'].includes(method) ? extractBodyKeysFromExpr(args[1]) : []
-            if (url) {
-              httpCalls.push({ client: 'axios', url: maskSecretsInText(url), method, bodyKeys, line: getLine() })
-              if (url.startsWith('/')) astPaths.push(url)
-            }
-          } else if (parts.length === 1 && args[0]) {
-            let url = ''
-            let method = 'GET'
-            let bodyKeys: string[] = []
-            for (const p of getObjectProps(args[0])) {
-              if (p.key === 'url') url = resolveStringValue(p.value, stringConsts) ?? ''
-              if (p.key === 'method') method = (resolveStringValue(p.value, stringConsts) ?? 'GET').toUpperCase()
-              if (p.key === 'data' || p.key === 'params') bodyKeys = extractBodyKeysFromExpr(p.value)
-            }
-            if (url) {
-              httpCalls.push({ client: 'axios', url: maskSecretsInText(url), method, bodyKeys, line: getLine() })
-              if (url.startsWith('/')) astPaths.push(url)
+          // trpc.<router>.<proc>.query|mutate|useQuery|useMutation(input)
+          if ((parts[0] === 'trpc' || parts.includes('trpc')) && parts.length >= 3 &&
+            ['query', 'mutate', 'useQuery', 'useMutation'].includes(last)) {
+            const procPath = parts.slice(parts.indexOf('trpc') + 1, -1).join('.')
+            if (procPath) {
+              const url = `/trpc/${procPath}`
+              const method = last.toLowerCase().includes('mutat') ? 'POST' : 'GET'
+              const bodyKeys = extractBodyKeysFromExpr(args[0])
+              httpCalls.push({ client: 'trpc', url, method, bodyKeys, line: getLine() })
+              astPaths.push(url)
             }
           }
-        }
 
-        // trpc.<router>.<proc>.query|mutate|useQuery|useMutation(input)
-        if ((parts[0] === 'trpc' || parts.includes('trpc')) && parts.length >= 3 &&
-          ['query', 'mutate', 'useQuery', 'useMutation'].includes(last)) {
-          const procPath = parts.slice(parts.indexOf('trpc') + 1, -1).join('.')
-          if (procPath) {
-            const url = `/trpc/${procPath}`
-            const method = last.toLowerCase().includes('mutat') ? 'POST' : 'GET'
-            const bodyKeys = extractBodyKeysFromExpr(args[0])
-            httpCalls.push({ client: 'trpc', url, method, bodyKeys, line: getLine() })
-            astPaths.push(url)
+          // Feature flag calls
+          if (['useFeatureFlag', 'isFeatureEnabled', 'getFeatureFlag', 'variation', 'hasFlag'].includes(last)) {
+            const flagName = resolveStringValue(args[0], stringConsts)
+            if (flagName && flagName.length <= 100) featureFlags.push(flagName)
+          }
+
+          // Next.js createServerReference(actionId, ...)
+          if (last === 'createServerReference') {
+            const actionId = resolveStringValue(args[0], stringConsts)
+            if (actionId) {
+              nextActions.push({ id: maskSecretsInText(actionId), source: 'reference', preview: `createServerReference(${actionId.slice(0, 48)})` })
+            }
+          }
+
+          // DOM sinks: addEventListener('message', fn), postMessage, eval, document.write, window.open
+          if (last === 'addEventListener' && resolveStringValue(args[0], stringConsts) === 'message') {
+            astDomSinks.push('message-listener')
+            const missingOrigin = args[1] ? !subtreeHasOriginCheck(args[1]) : false
+            if (missingOrigin) astDomSinks.push('message-listener-missing-origin')
+            domSinkDetails.push({ kind: 'message-listener', line: getLine(), missingOriginCheck: missingOrigin })
+          }
+          if (last === 'postMessage') {
+            astDomSinks.push('postMessage')
+            domSinkDetails.push({ kind: 'postMessage', line: getLine() })
+          }
+          if (joined === 'eval' || joined === 'document.write' || joined === 'document.writeln' || joined === 'window.open') {
+            astDomSinks.push(joined)
+            domSinkDetails.push({ kind: joined, line: getLine() })
           }
         }
 
-        // Feature flag calls
-        if (['useFeatureFlag', 'isFeatureEnabled', 'getFeatureFlag', 'variation', 'hasFlag'].includes(last)) {
-          const flagName = resolveStringValue(args[0], stringConsts)
-          if (flagName && flagName.length <= 100) featureFlags.push(flagName)
-        }
-
-        // Next.js createServerReference(actionId, ...)
-        if (last === 'createServerReference') {
-          const actionId = resolveStringValue(args[0], stringConsts)
-          if (actionId) {
-            nextActions.push({ id: maskSecretsInText(actionId), source: 'reference', preview: `createServerReference(${actionId.slice(0, 48)})` })
-          }
-        }
-
-        // DOM sinks: addEventListener('message', fn), postMessage, eval, document.write, window.open
-        if (last === 'addEventListener' && resolveStringValue(args[0], stringConsts) === 'message') {
-          astDomSinks.push('message-listener')
-          const missingOrigin = args[1] ? !subtreeHasOriginCheck(args[1]) : false
-          if (missingOrigin) astDomSinks.push('message-listener-missing-origin')
-          domSinkDetails.push({ kind: 'message-listener', line: getLine(), missingOriginCheck: missingOrigin })
-        }
-        if (last === 'postMessage') {
-          astDomSinks.push('postMessage')
-          domSinkDetails.push({ kind: 'postMessage', line: getLine() })
-        }
-        if (joined === 'eval' || joined === 'document.write' || joined === 'document.writeln' || joined === 'window.open') {
-          astDomSinks.push(joined)
-          domSinkDetails.push({ kind: joined, line: getLine() })
-        }
-      }
-
-      // 4. Tagged templates: gql`...` / graphql`...`
-      if (node.type === 'TaggedTemplateExpression') {
-        const tagParts = getCalleeParts(node.tag)
-        const tagName = tagParts[tagParts.length - 1] ?? ''
-        if (/^(?:gql|graphql)$/i.test(tagName) && isAstNode(node.quasi) && Array.isArray(node.quasi.quasis)) {
-          const text = (node.quasi.quasis as AstNode[])
-            .map(q => (typeof q.raw === 'string' ? q.raw : isAstNode(q.value) && typeof q.value.raw === 'string' ? q.value.raw : ''))
-            .join(' ')
-          const doc = parseGraphqlDocText(text)
-          if (doc) graphqlDocs.push(doc)
-        }
-      }
-
-      // 5. Assignments: *.innerHTML = ..., *.outerHTML = ..., *.onmessage = fn, document.domain = ...
-      if (node.type === 'AssignmentExpression' && isAstNode(node.left)) {
-        const leftParts = getCalleeParts(node.left)
-        const prop = leftParts[leftParts.length - 1] ?? ''
-        if (prop === 'innerHTML' || prop === 'outerHTML') {
-          astDomSinks.push(prop)
-          domSinkDetails.push({ kind: prop, line: getLine() })
-        } else if (prop === 'onmessage') {
-          astDomSinks.push('message-listener')
-          const missingOrigin = node.right ? !subtreeHasOriginCheck(node.right) : false
-          if (missingOrigin) astDomSinks.push('message-listener-missing-origin')
-          domSinkDetails.push({ kind: 'message-listener', line: getLine(), missingOriginCheck: missingOrigin })
-        } else if (leftParts.join('.') === 'document.domain') {
-          astDomSinks.push('document.domain')
-          domSinkDetails.push({ kind: 'document.domain', line: getLine() })
-        }
-      }
-
-      // 6. String/Template literals & feature flag identifiers
-      if (node.type === 'StringLiteral' || node.type === 'Literal') {
-        const val = typeof node.value === 'string' ? node.value : null
-        if (val) {
-          if (API_PATH_PREFIX_RE.test(val) && PATH_LIKE_RE.test(val)) {
-            astPaths.push(val)
-          }
-          if (/\b(?:query|mutation|subscription|fragment)\s+[A-Za-z0-9_]+\s*[({]/.test(val)) {
-            const doc = parseGraphqlDocText(val)
+        // 4. Tagged templates: gql`...` / graphql`...`
+        if (node.type === 'TaggedTemplateExpression') {
+          const tagParts = getCalleeParts(node.tag)
+          const tagName = tagParts[tagParts.length - 1] ?? ''
+          if (/^(?:gql|graphql)$/i.test(tagName) && isAstNode(node.quasi) && Array.isArray(node.quasi.quasis)) {
+            const text = (node.quasi.quasis as AstNode[])
+              .map(q => (typeof q.raw === 'string' ? q.raw : isAstNode(q.value) && typeof q.value.raw === 'string' ? q.value.raw : ''))
+              .join(' ')
+            const doc = parseGraphqlDocText(text)
             if (doc) graphqlDocs.push(doc)
           }
-          if (NEXT_ACTION_HEX_RE.test(val) && content.includes('Next-Action')) {
-            nextActions.push({ id: val, source: 'literal', preview: val.slice(0, 48) })
+        }
+
+        // 5. Assignments: *.innerHTML = ..., *.outerHTML = ..., *.onmessage = fn, document.domain = ...
+        if (node.type === 'AssignmentExpression' && isAstNode(node.left)) {
+          const leftParts = getCalleeParts(node.left)
+          const prop = leftParts[leftParts.length - 1] ?? ''
+          if (prop === 'innerHTML' || prop === 'outerHTML') {
+            astDomSinks.push(prop)
+            domSinkDetails.push({ kind: prop, line: getLine() })
+          } else if (prop === 'onmessage') {
+            astDomSinks.push('message-listener')
+            const missingOrigin = node.right ? !subtreeHasOriginCheck(node.right) : false
+            if (missingOrigin) astDomSinks.push('message-listener-missing-origin')
+            domSinkDetails.push({ kind: 'message-listener', line: getLine(), missingOriginCheck: missingOrigin })
+          } else if (leftParts.join('.') === 'document.domain') {
+            astDomSinks.push('document.domain')
+            domSinkDetails.push({ kind: 'document.domain', line: getLine() })
           }
         }
-      }
 
-      if (node.type === 'Identifier') {
-        const name = getPropName(node)
-        if (name && FEATURE_FLAG_IDENT_RE.test(name)) featureFlags.push(name)
-      }
-    })
+        // 6. String/Template literals & feature flag identifiers
+        if (node.type === 'StringLiteral' || node.type === 'Literal') {
+          const val = typeof node.value === 'string' ? node.value : null
+          if (val) {
+            if (API_PATH_PREFIX_RE.test(val) && PATH_LIKE_RE.test(val)) {
+              astPaths.push(val)
+            }
+            if (val.length <= 8192 && /\b(?:query|mutation|subscription|fragment)[ \t]+[A-Za-z0-9_]{1,64}[ \t]{0,16}[({]/.test(val)) {
+              const doc = parseGraphqlDocText(val)
+              if (doc) graphqlDocs.push(doc)
+            }
+            if (NEXT_ACTION_HEX_RE.test(val) && content.includes('Next-Action')) {
+              nextActions.push({ id: val, source: 'literal', preview: val.slice(0, 48) })
+            }
+          }
+        }
+
+        if (node.type === 'Identifier') {
+          const name = getPropName(node)
+          if (name && FEATURE_FLAG_IDENT_RE.test(name)) featureFlags.push(name)
+        }
+      })
+    } catch {
+      parserUsed = 'regex'
+    }
   }
 
-  // Hardened regex supplement (ensures resilience on malformed JS / HTML / inline scripts)
+  // Enforce 512 KB per-blob cap before regex scanning (`R2-H-23`).
+  const regexContent = content.length > MAX_JS_HARVEST_REGEX_BYTES
+    ? content.slice(0, MAX_JS_HARVEST_REGEX_BYTES)
+    : content
+
+  // Hardened linear regex supplement (ensures resilience on malformed JS / HTML / inline scripts)
   const regexApiPaths = [
-    ...[...content.matchAll(/["'`](\/(?:api|v[1-9]\d*|graphql|trpc|auth|oauth|sso|admin|internal|debug|upload|webhook|billing|account|user|session|_next\/data)[a-zA-Z0-9_./:${}-]{0,140})["'`]/g)].map(m => m[1]),
-    ...[...content.matchAll(/(?:fetch|axios\.(?:get|post|put|patch|delete)|url\s*:\s*)\(\s*["'`](\/[a-zA-Z0-9_./:${}?=&-]{1,160})["'`]/g)].map(m => m[1]),
+    ...[...regexContent.matchAll(/["'`](\/(?:api|v[1-9]\d*|graphql|trpc|auth|oauth|sso|admin|internal|debug|upload|webhook|billing|account|user|session|_next\/data)[a-zA-Z0-9_./:${}-]{0,140})["'`]/g)].map(m => m[1]),
+    ...[...regexContent.matchAll(/(?:fetch|axios\.(?:get|post|put|patch|delete)|url[ \t]{0,8}:[ \t]{0,8})\([ \t]{0,8}["'`](\/[a-zA-Z0-9_./:${}?=&-]{1,160})["'`]/g)].map(m => m[1]),
   ]
   const apiPaths = uniq([...astPaths, ...regexApiPaths], 200).map(maskSecretsInText)
   const adminPaths = uniq(
@@ -686,46 +904,48 @@ export function jsHarvest(content: string, sourceName = '', options?: JsHarvestO
   )
 
   const scriptChunks = uniq([
-    ...[...content.matchAll(/["'`](\/_next\/static\/[a-zA-Z0-9_./-]+\.(?:js|mjs|json))["'`]/g)].map(m => maskSecretsInText(m[1])),
-    ...[...content.matchAll(/src=["'](\/[^"']+\.(?:js|mjs)(?:\?[^"']*)?)["']/gi)].map(m => maskSecretsInText(m[1])),
+    ...[...regexContent.matchAll(/["'`](\/_next\/static\/[a-zA-Z0-9_./-]{1,200}\.(?:js|mjs|json))["'`]/g)].map(m => maskSecretsInText(m[1])),
+    ...[...regexContent.matchAll(/src=["'](\/[^"'\r\n]{1,200}\.(?:js|mjs)(?:\?[^"'\r\n]{0,120})?)["']/gi)].map(m => maskSecretsInText(m[1])),
   ], 120)
 
   const sourceMaps = uniq([
-    ...[...content.matchAll(/\/\/[#@]\s*sourceMappingURL=([^\s'"]+)/g)].map(m => m[1]),
+    ...[...regexContent.matchAll(/\/\/[#@][ \t]{0,16}sourceMappingURL=([^\s'"\r\n]{1,256})/g)].map(m => m[1]),
   ], 40)
 
   const externalUrls = uniq([
-    ...[...content.matchAll(/(?:https?|wss?):\/\/[a-zA-Z0-9.-]+(?::\d+)?(?:\/[a-zA-Z0-9_./?=&%+-]{0,120})?/g)].map(m => maskSecretsInText(m[0])),
+    ...[...regexContent.matchAll(/(?:https?|wss?):\/\/[a-zA-Z0-9.-]{1,253}(?::\d{1,5})?(?:\/[a-zA-Z0-9_./?=&%+-]{0,120})?/g)].map(m => maskSecretsInText(m[0])),
   ].filter(u => !/w3\.org|schema\.org|googleapis\.com\/css|fonts\.gstatic|mozilla\.org/.test(u)), 120)
 
   const regexDomSinks = [
-    ...(content.includes('postMessage') ? ['postMessage'] : []),
-    ...(content.includes("addEventListener('message'") || content.includes('addEventListener("message"') ? ['message-listener'] : []),
-    ...(content.includes('dangerouslySetInnerHTML') ? ['dangerouslySetInnerHTML'] : []),
-    ...(/\binnerHTML\b/.test(content) ? ['innerHTML'] : []),
-    ...(/\beval\s*\(/.test(content) ? ['eval'] : []),
-    ...(/\bdocument\.domain\b/.test(content) ? ['document.domain'] : []),
-    ...(/window\.open\s*\(/.test(content) ? ['window.open'] : []),
+    ...(regexContent.includes('postMessage') ? ['postMessage'] : []),
+    ...(regexContent.includes("addEventListener('message'") || regexContent.includes('addEventListener("message"') ? ['message-listener'] : []),
+    ...(regexContent.includes('dangerouslySetInnerHTML') ? ['dangerouslySetInnerHTML'] : []),
+    ...(/\binnerHTML\b/.test(regexContent) ? ['innerHTML'] : []),
+    ...(/\beval[ \t]{0,8}\(/.test(regexContent) ? ['eval'] : []),
+    ...(/\bdocument\.domain\b/.test(regexContent) ? ['document.domain'] : []),
+    ...(/window\.open[ \t]{0,8}\(/.test(regexContent) ? ['window.open'] : []),
   ]
   const domSinks = uniq([...astDomSinks, ...regexDomSinks], 30)
 
   if (nextActions.length === 0) {
-    for (const m of content.matchAll(/["']Next-Action["']\s*:\s*["']([a-f0-9]{16,64})["']/gi)) {
+    for (const m of regexContent.matchAll(/["']Next-Action["'][ \t]{0,16}:[ \t]{0,16}["']([a-f0-9]{16,64})["']/gi)) {
+      if (nextActions.length >= 40) break
       nextActions.push({ id: m[1], source: 'header', preview: `Next-Action: ${m[1].slice(0, 48)}` })
     }
   }
   if (graphqlDocs.length === 0) {
-    for (const m of content.matchAll(/\b(?:query|mutation|subscription|fragment)\s+([A-Za-z0-9_]{2,64})\b[^`"'{}]*\{[^}]{1,300}\}/g)) {
+    for (const m of regexContent.matchAll(/\b(?:query|mutation|subscription|fragment)[ \t]+([A-Za-z0-9_]{2,64})\b[^`"'{}]{0,120}\{[^}]{1,300}\}/g)) {
+      if (graphqlDocs.length >= 40) break
       const doc = parseGraphqlDocText(m[0])
       if (doc) graphqlDocs.push(doc)
     }
   }
 
-  const nextDataMatch = content.match(/<script[^>]+id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i)
+  const nextDataBody = extractNextDataScriptBody(regexContent)
   let nextMeta: Record<string, unknown> | undefined
-  if (nextDataMatch) {
+  if (nextDataBody !== null) {
     try {
-      const parsed = JSON.parse(nextDataMatch[1]) as Record<string, unknown>
+      const parsed = JSON.parse(nextDataBody) as Record<string, unknown>
       nextMeta = {
         page: parsed.page,
         buildId: parsed.buildId,
@@ -737,7 +957,7 @@ export function jsHarvest(content: string, sourceName = '', options?: JsHarvestO
     }
   }
 
-  const secretFindings = secretScan(content, sourceName)
+  const secretFindings = secretScan(regexContent, sourceName)
   const baseResult: Record<string, unknown> = {
     sourceName,
     bytes: content.length,
@@ -2460,21 +2680,24 @@ export function buildCallGraphFromFiles(
 // ============================================================================
 
 export function secretScan(content: string, sourceName = ''): { sourceName: string; matches: Array<{ kind: string; preview: string; index: number }> } {
+  const scanContent = content.length > MAX_JS_HARVEST_REGEX_BYTES
+    ? content.slice(0, MAX_JS_HARVEST_REGEX_BYTES)
+    : content
   const rules: Array<{ kind: string; regex: RegExp }> = [
     { kind: 'aws-access-key', regex: /\bAKIA[0-9A-Z]{16}\b/g },
-    { kind: 'stripe-live-key', regex: /\bsk_live_[0-9a-zA-Z]{16,}\b/g },
-    { kind: 'stripe-pub-key', regex: /\bpk_(?:live|test)_[0-9a-zA-Z]{16,}\b/g },
-    { kind: 'clerk-pub-key', regex: /\bpk_(?:live|test)_[A-Za-z0-9+/=]{20,}\b/g },
+    { kind: 'stripe-live-key', regex: /\bsk_live_[0-9a-zA-Z]{16,256}\b/g },
+    { kind: 'stripe-pub-key', regex: /\bpk_(?:live|test)_[0-9a-zA-Z]{16,256}\b/g },
+    { kind: 'clerk-pub-key', regex: /(?<![A-Za-z0-9+/=_])pk_(?:live|test)_[A-Za-z0-9+/=]{20,256}(?![A-Za-z0-9+/=])/g },
     { kind: 'supabase-url', regex: /https:\/\/[a-z0-9]{12,32}\.supabase\.co\b/g },
-    { kind: 'jwt-literal', regex: /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{8,}\b/g },
-    { kind: 'private-key', regex: /-----BEGIN [A-Z ]*PRIVATE KEY-----/g },
-    { kind: 'google-api-key', regex: /\bAIza[0-9A-Za-z_-]{35}\b/g },
-    { kind: 'slack-webhook', regex: /https:\/\/hooks\.slack\.com\/services\/[A-Z0-9/]+/g },
-    { kind: 'generic-secret-var', regex: /\b(?:SERVICE_ROLE_KEY|SUPABASE_SERVICE_ROLE|OPENAI_API_KEY|ANTHROPIC_API_KEY|DATABASE_URL|POSTGRES_URL|JWT_SECRET|NEXTAUTH_SECRET)\s*[:=]\s*["'`][^"'`]{6,120}["'`]/gi },
+    { kind: 'jwt-literal', regex: /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,1024}\.[A-Za-z0-9_-]{10,4096}\.[A-Za-z0-9_-]{8,1024}(?![A-Za-z0-9_-])/g },
+    { kind: 'private-key', regex: /-----BEGIN [A-Z ]{0,32}PRIVATE KEY-----/g },
+    { kind: 'google-api-key', regex: /(?<![A-Za-z0-9_-])AIza[0-9A-Za-z_-]{35}(?![A-Za-z0-9_-])/g },
+    { kind: 'slack-webhook', regex: /https:\/\/hooks\.slack\.com\/services\/[A-Z0-9/]{10,128}/g },
+    { kind: 'generic-secret-var', regex: /\b(?:SERVICE_ROLE_KEY|SUPABASE_SERVICE_ROLE|OPENAI_API_KEY|ANTHROPIC_API_KEY|DATABASE_URL|POSTGRES_URL|JWT_SECRET|NEXTAUTH_SECRET)[ \t]{0,16}[:=][ \t]{0,16}["'`][^"'`\r\n]{6,120}["'`]/gi },
   ]
   const matches: Array<{ kind: string; preview: string; index: number }> = []
   for (const rule of rules) {
-    for (const match of content.matchAll(rule.regex)) {
+    for (const match of scanContent.matchAll(rule.regex)) {
       if (matches.length >= 60) break
       const raw = match[0]
       const preview = raw.length > 16 && !rule.kind.endsWith('-url')
