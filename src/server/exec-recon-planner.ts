@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs'
+import { lstat, readdir, readFile } from 'node:fs/promises'
 import { basename, extname, isAbsolute, join, relative, resolve as resolvePath, sep } from 'node:path'
 import { and, asc, eq } from 'drizzle-orm'
 import {
@@ -183,13 +184,12 @@ import {
   isSharedPaasOrigin,
 } from './subdomain-discovery.ts'
 import type { Phase0GraphwireExtras, ProbePlanRegistry } from './probe-plan.ts'
-import {
-  extractProgramGraph,
-  type CodeDataflowSlice,
-  type CodeToRuntimeHypothesis,
-  type MonorepoService,
-  type ProgramGraph,
-  type ServiceOriginMapping,
+import type {
+  CodeDataflowSlice,
+  CodeToRuntimeHypothesis,
+  MonorepoService,
+  ProgramGraph,
+  ServiceOriginMapping,
 } from './program-graph.ts'
 import type { NamedSecret } from './redact.ts'
 import { responseReview } from './response-checks.ts'
@@ -205,6 +205,7 @@ import { coverageEntries, findings, messages, type ChainStepRetryableStatus } fr
 import { runVariantSweepForFinding } from './semantic-audit.ts'
 import type { StaticWorkspaceSnapshot } from './static-workspace-snapshot.ts'
 import type { Assignment, ChainStep, Fact, Run, Store } from './store.ts'
+import { extractProgramGraphInWorker } from './untrusted-compute-pool.ts'
 
 type Active = ExecActiveJob
 type Capture = ExecCapture
@@ -784,6 +785,8 @@ export function seedRecordToLedgerInput(
 export interface SeedCapabilityLedgerInvariantsOptions {
   mode?: SynthesizerMode
   graph?: ProgramGraph
+  /** Optional Phase-0 / Phase-A `StaticWorkspaceSnapshot` to reuse pre-extracted graph & sources without walking disk or re-parsing. */
+  staticSnapshot?: StaticWorkspaceSnapshot
   sourceFiles?: readonly SourceFileInput[]
   services?: readonly MonorepoService[]
   serviceOrigins?: readonly ServiceOriginMapping[]
@@ -799,6 +802,8 @@ export interface SeedCapabilityLedgerInvariantsOptions {
   promoteWave1Chains?: boolean
   /** Cap on Wave 1 `chain` steps seeded from invariant synthesis (default 6). */
   maxWave1ChainSteps?: number
+  /** Optional abort signal propagated to async file collection and worker-isolated `ProgramGraph` extraction. */
+  signal?: AbortSignal
 }
 
 export interface SeedCapabilityLedgerInvariantsResult {
@@ -870,42 +875,63 @@ function extractRouteRefsFromText(texts: readonly string[]): string[] {
 
 const INVARIANT_SCAN_EXT = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.py', '.go', '.java', '.rb'])
 const INVARIANT_SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'build', 'coverage', '.next', '__pycache__'])
+const INVARIANT_WALK_YIELD_EVERY = 8
 
-function collectBoundedRepoSourceFiles(
+function yieldEventLoopTurn(): Promise<void> {
+  return new Promise<void>(resolve => {
+    setImmediate(resolve)
+  })
+}
+
+async function collectBoundedRepoSourceFiles(
   reposDir: string,
   mountedRepos: readonly string[],
   maxFiles = 160,
-): { files: SourceFileInput[]; compose?: string } {
+  signal?: AbortSignal,
+): Promise<{ files: SourceFileInput[]; compose?: string }> {
   const files: SourceFileInput[] = []
   let compose: string | undefined
+  let opsSinceYield = 0
+  const maybeYield = async () => {
+    opsSinceYield += 1
+    if (opsSinceYield >= INVARIANT_WALK_YIELD_EVERY) {
+      opsSinceYield = 0
+      await yieldEventLoopTurn()
+    }
+  }
   for (const mountedRepo of mountedRepos) {
-    if (files.length >= maxFiles) break
+    if (signal?.aborted || files.length >= maxFiles) break
     const repoRel = mountedRepo.replace(/^\/repos\//, '').replace(/\/+$/, '')
     const repoRoot = repoRel ? join(reposDir, repoRel) : reposDir
-    if (!existsSync(repoRoot)) continue
+    let rootStat
+    try { rootStat = await lstat(repoRoot) } catch { continue }
+    if (!rootStat.isDirectory()) continue
     const stack = [repoRoot]
-    while (stack.length > 0 && files.length < maxFiles) {
+    while (stack.length > 0 && files.length < maxFiles && !signal?.aborted) {
       const dir = stack.pop()!
       let entries: string[]
-      try { entries = readdirSync(dir) } catch { continue }
+      try { entries = await readdir(dir) } catch { continue }
       entries.sort()
       for (const entry of entries) {
-        if (files.length >= maxFiles) break
+        if (signal?.aborted || files.length >= maxFiles) break
         if (INVARIANT_SKIP_DIRS.has(entry)) continue
         const full = join(dir, entry)
         let st
-        try { st = statSync(full) } catch { continue }
+        try { st = await lstat(full) } catch { continue }
+        await maybeYield()
+        if (signal?.aborted) break
+        if (st.isSymbolicLink()) continue
         if (st.isDirectory()) { stack.push(full); continue }
         if (!st.isFile() || st.size > 128 * 1024) continue
         const lower = entry.toLowerCase()
         if (!compose && (lower === 'docker-compose.yml' || lower === 'docker-compose.yaml' || lower === 'compose.yml' || lower === 'compose.yaml')) {
-          try { compose = readFileSync(full, 'utf8') } catch { /* ignore */ }
+          try { compose = await readFile(full, 'utf8') } catch { /* ignore */ }
           continue
         }
         if (!INVARIANT_SCAN_EXT.has(extname(lower))) continue
         try {
           const relPath = relative(repoRoot, full).split(sep).join('/')
-          files.push({ path: repoRel ? `${repoRel}/${relPath}` : relPath, content: readFileSync(full, 'utf8') })
+          files.push({ path: repoRel ? `${repoRel}/${relPath}` : relPath, content: await readFile(full, 'utf8') })
         } catch { /* ignore */ }
       }
     }
@@ -1173,6 +1199,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
   private readonly persistedStepCheckpoints = new Map<string, { checkpointCapId?: string; checkpointJson?: string }>()
   private readonly structuredStepTargets = new Map<string, StructuredStepTarget[]>()
   private readonly retryCountsByRun = new Map<string, Map<string, number>>()
+  private readonly invariantsSeedingInFlight = new Map<string, Promise<void>>()
   private get plannerEmptyRounds() { return this.runState.mapView('plannerEmptyRounds') }
   private get plannerDryRounds() { return this.runState.mapView('plannerDryRounds') }
   private get plannerCompletedAtLastRound() { return this.runState.mapView('plannerCompletedAtLastRound') }
@@ -1212,6 +1239,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       }
     }
     this.retryCountsByRun.delete(runId)
+    this.invariantsSeedingInFlight.delete(runId)
     if (this.ownRunState) {
       this.ownRunState.disposeRun(runId)
     } else if (state) {
@@ -1546,38 +1574,89 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
    * Run v8 Layer-2 General Invariant Synthesis (white-box mounted source OR grey-box/black-box
    * runtime parity) and idempotently seed `CapabilityLedger` with strictly quarantined
    * (`promotionStatus: 'capability_only'`) capability nodes.
+   *
+   * Async & host-event-loop-safe (`R3-H-12`): reuses a pre-extracted `ProgramGraph` /
+   * `StaticWorkspaceSnapshot` when supplied, otherwise reads bounded repo files asynchronously
+   * via `fs.promises` with periodic event-loop yields and offloads `ProgramGraph` extraction
+   * into `extractProgramGraphInWorker`.
    */
-  seedCapabilityLedgerInvariants(
+  async seedCapabilityLedgerInvariants(
     run: Run,
     options: SeedCapabilityLedgerInvariantsOptions = {},
-  ): SeedCapabilityLedgerInvariantsResult {
+  ): Promise<SeedCapabilityLedgerInvariantsResult> {
     const approvedOrigins = options.approvedOrigins ?? this.host.approvedOriginsSet(run)
-    const defaultOrigin = [...approvedOrigins][0] ?? 'unknown'
     const mount = this.host.projectReposMount(run.projectId)
     const reposDir = options.reposDir ?? mount.reposDir
     const mountedRepos = options.mountedRepos ?? mount.mountedRepos
 
+    const snap = options.staticSnapshot
     let sourceFiles: readonly SourceFileInput[] = options.sourceFiles ?? []
-    let compose = options.compose
-    if (!sourceFiles.length && reposDir && mountedRepos.length > 0) {
-      const collected = collectBoundedRepoSourceFiles(reposDir, mountedRepos)
+    let compose = options.compose ?? snap?.compose
+    const ingress = options.ingress ?? snap?.ingress
+    let graph = options.graph ?? snap?.programGraph
+
+    if (!sourceFiles.length && snap) {
+      const fromSnap: SourceFileInput[] = []
+      for (const [path, content] of snap.sourceByPath.entries()) {
+        if (fromSnap.length >= 160) break
+        if (!INVARIANT_SCAN_EXT.has(extname(path.toLowerCase()))) continue
+        if (content.length > 128 * 1024) continue
+        fromSnap.push({ path, content })
+      }
+      sourceFiles = fromSnap
+    }
+
+    if (!sourceFiles.length && !graph && reposDir && mountedRepos.length > 0 && options.mode !== 'grey-box' && options.mode !== 'black-box') {
+      const collected = await collectBoundedRepoSourceFiles(reposDir, mountedRepos, 160, options.signal)
       sourceFiles = collected.files
       compose = compose ?? collected.compose
     }
 
-    const hasWhiteBoxSource = Boolean(options.graph || sourceFiles.length > 0)
+    const hasWhiteBoxSource = Boolean(graph || sourceFiles.length > 0)
     const specs = options.specs ?? this.storage.listProjectSpecsFull(run.projectId)
     const hasGreyBoxContext = run.approvedPersonaIds.length > 0 || specs.length > 0
     const mode: SynthesizerMode = options.mode
       ?? (hasWhiteBoxSource ? 'white-box' : hasGreyBoxContext ? 'grey-box' : 'black-box')
 
-    let graph = options.graph
     if (mode === 'white-box' && !graph && sourceFiles.length > 0) {
-      graph = extractProgramGraph({ files: sourceFiles, repo: mountedRepos[0] ?? 'mounted-repo' })
+      graph = await extractProgramGraphInWorker(
+        { files: sourceFiles, repo: mountedRepos[0] ?? 'mounted-repo' },
+        { signal: options.signal },
+      )
     }
 
+    return this.finalizeCapabilityLedgerInvariants(run, {
+      ...options,
+      approvedOrigins,
+      specs,
+      mode,
+      graph,
+      sourceFiles,
+      compose,
+      ingress,
+    })
+  }
+
+  /**
+   * Pure in-memory / SQLite finalization for `seedCapabilityLedgerInvariants` (zero filesystem
+   * I/O, zero synchronous `ProgramGraph` extraction). Shared by async white-box seeding and the
+   * synchronous grey-box/black-box fast path in `ensureWave1InvariantChainSteps`.
+   */
+  private finalizeCapabilityLedgerInvariants(
+    run: Run,
+    input: SeedCapabilityLedgerInvariantsOptions & {
+      approvedOrigins: ReadonlySet<string>
+      specs: ReturnType<Store['listProjectSpecsFull']>
+      mode: SynthesizerMode
+      graph?: ProgramGraph
+      sourceFiles: readonly SourceFileInput[]
+    },
+  ): SeedCapabilityLedgerInvariantsResult {
+    const { approvedOrigins, specs, mode, graph, sourceFiles } = input
+    const defaultOrigin = [...approvedOrigins][0] ?? 'unknown'
+
     // Build grey-box / black-box runtime parity input from persisted endpoints, specs, and exchanges.
-    const runtimeInput: Omit<RuntimeDiscoveryInput, 'mode'> = options.runtime ?? this.collectRuntimeDiscoveryInput(run, approvedOrigins, specs)
+    const runtimeInput: Omit<RuntimeDiscoveryInput, 'mode'> = input.runtime ?? this.collectRuntimeDiscoveryInput(run, approvedOrigins, specs)
 
     let synthesis: SynthesizeInvariantsResult
     if (mode === 'white-box' && graph) {
@@ -1585,19 +1664,19 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         mode: 'white-box',
         graph,
         sourceFiles,
-        services: options.services,
-        serviceOrigins: options.serviceOrigins,
-        compose,
-        ingress: options.ingress,
+        services: input.services,
+        serviceOrigins: input.serviceOrigins,
+        compose: input.compose,
+        ingress: input.ingress,
         runtime: runtimeInput,
         totalRunBudgetUsd: run.budgetUsd,
-        maxHypotheses: options.maxHypotheses ?? 64,
+        maxHypotheses: input.maxHypotheses ?? 64,
       })
     } else {
       const parity = inferRuntimeInvariantHypotheses({
         mode: mode === 'black-box' ? 'black-box' : 'grey-box',
         ...runtimeInput,
-        maxHypotheses: options.maxHypotheses ?? 64,
+        maxHypotheses: input.maxHypotheses ?? 64,
       })
       synthesis = {
         mode: parity.mode,
@@ -1615,14 +1694,14 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     const capIdByHypothesisId = new Map<string, string>()
     let seededCount = 0
     for (const seed of seeds) {
-      const input = seedRecordToLedgerInput(seed, defaultOrigin)
-      capIdByHypothesisId.set(seed.metadata.hypothesisId, input.capId)
-      if (ledger.getCapability(input.capId)) {
-        capIds.push(input.capId)
+      const ledgerInput = seedRecordToLedgerInput(seed, defaultOrigin)
+      capIdByHypothesisId.set(seed.metadata.hypothesisId, ledgerInput.capId)
+      if (ledger.getCapability(ledgerInput.capId)) {
+        capIds.push(ledgerInput.capId)
         continue
       }
       try {
-        const added = ledger.addCapability(input)
+        const added = ledger.addCapability(ledgerInput)
         capIds.push(added.capId)
         seededCount += 1
       } catch {
@@ -1633,16 +1712,16 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     const seededIds = this.seededHypothesisIdsByRun.get(run.id) ?? new Set<string>()
     for (const h of synthesis.hypotheses) seededIds.add(h.id)
     this.seededHypothesisIdsByRun.set(run.id, seededIds)
-    if (!options.runtime) {
+    if (!input.runtime) {
       this.runtimeSynthesisWatermark.set(run.id, this.computeRuntimeSynthesisWatermark(run.id))
     }
 
-    const shouldPromote = options.promoteWave1Chains !== false && run.capabilityTier > 0
+    const shouldPromote = input.promoteWave1Chains !== false && run.capabilityTier > 0
     const wave1ChainStepIds = shouldPromote
       ? this.promoteInvariantHypothesesToWave1ChainSteps(run, synthesis, {
           approvedOrigins,
           capIdByHypothesisId,
-          maxSteps: options.maxWave1ChainSteps ?? 6,
+          maxSteps: input.maxWave1ChainSteps ?? 6,
         })
       : []
 
@@ -1675,6 +1754,41 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       wave1ChainStepsCreated: wave1ChainStepIds.length,
       wave1ChainStepIds,
     }
+  }
+
+  /**
+   * Kick off worker-isolated white-box invariant seeding asynchronously without blocking a
+   * synchronous dispatch tick (`driveInvestigation`). Deduped per `run.id`.
+   */
+  private scheduleAsyncInvariantSeeding(
+    run: Run,
+    options: {
+      approvedOrigins: ReadonlySet<string>
+      promoteWave1Chains?: boolean
+      postFloor?: boolean
+    },
+  ): void {
+    if (this.invariantsSeededRuns.has(run.id) || this.invariantsSeedingInFlight.has(run.id)) return
+    const runTask = async (signal?: AbortSignal) => {
+      try {
+        const freshRun = this.storage.run(run.id)
+        if (freshRun.status !== 'running' || signal?.aborted) return
+        await this.seedCapabilityLedgerInvariants(freshRun, {
+          approvedOrigins: options.approvedOrigins,
+          promoteWave1Chains: options.promoteWave1Chains ?? true,
+          signal,
+        })
+        if (options.postFloor) this.postFloorInvariantsSyncedRuns.add(run.id)
+      } catch {
+        // Additive Layer-2 synthesis must never crash background dispatch ticks.
+      } finally {
+        this.invariantsSeedingInFlight.delete(run.id)
+      }
+    }
+    const promise = this.host.spawnRunTask
+      ? this.host.spawnRunTask(run.id, 'invariants.seed', signal => runTask(signal)).promise.then(() => undefined, () => undefined)
+      : runTask()
+    this.invariantsSeedingInFlight.set(run.id, promise)
   }
 
   /**
@@ -1902,14 +2016,26 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     if (run.capabilityTier <= 0) return 0
     const sourceMounted = this.host.projectReposMount(run.projectId).mountedRepos.length > 0
     if (!this.invariantsSeededRuns.has(run.id)) {
-      const res = this.seedCapabilityLedgerInvariants(run, {
+      if (sourceMounted) {
+        // White-box mounted repo: never run synchronous disk walk or ProgramGraph extraction on the host event loop.
+        this.scheduleAsyncInvariantSeeding(run, {
+          approvedOrigins,
+          promoteWave1Chains: true,
+          postFloor: options.postFloor,
+        })
+        return 0
+      }
+      // Grey-box / black-box (no mounted repo): pure in-memory/SQLite runtime parity (zero fs, zero ProgramGraph).
+      const specs = this.storage.listProjectSpecsFull(run.projectId)
+      const hasGreyBoxContext = run.approvedPersonaIds.length > 0 || specs.length > 0
+      const res = this.finalizeCapabilityLedgerInvariants(run, {
         approvedOrigins,
+        specs,
+        mode: hasGreyBoxContext ? 'grey-box' : 'black-box',
+        sourceFiles: [],
         promoteWave1Chains: true,
       })
-      let compositeCount = 0
-      if (!sourceMounted) {
-        compositeCount = this.promoteRuntimeCompositeWave1Steps(run, approvedOrigins)
-      }
+      const compositeCount = this.promoteRuntimeCompositeWave1Steps(run, approvedOrigins)
       if (options.postFloor) this.postFloorInvariantsSyncedRuns.add(run.id)
       return res.wave1ChainStepsCreated + compositeCount
     }
@@ -2466,12 +2592,13 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       //     Seeds SQLite WAL CapabilityLedger with strictly quarantined `capability_only` hypotheses
       //     and promotes high-signal cross-surface / cross-service / lifecycle hypotheses into ready Wave-1 chain steps.
       try {
-        this.seedCapabilityLedgerInvariants(this.storage.run(freshRun.id), {
+        await this.seedCapabilityLedgerInvariants(this.storage.run(freshRun.id), {
           reposDir,
           mountedRepos,
           specs,
           approvedOrigins,
           promoteWave1Chains: freshRun.capabilityTier > 0 && profiles.length > 0,
+          signal: task.controller.signal,
         })
       } catch {
         // Additive Layer-2 synthesis must never block threat model progression
@@ -4803,7 +4930,10 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     // leads BEFORE generic black-box floor leads or BOLA auto-steps.
     if (!this.invariantsSeededRuns.has(updated.id)) {
       try {
-        this.seedCapabilityLedgerInvariants(updated, { approvedOrigins })
+        await this.seedCapabilityLedgerInvariants(updated, {
+          approvedOrigins,
+          signal: task.controller.signal,
+        })
         invalidateSteps()
         if (!sourceMounted && updated.capabilityTier > 0) {
           const addedComposites = this.promoteRuntimeCompositeWave1Steps(updated, approvedOrigins)
