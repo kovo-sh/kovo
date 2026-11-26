@@ -8,7 +8,7 @@
  *     spikes, container spawn failures/slow spawn latency, and explicit env/CLI override precedence.
  *  3. Fair 12-slot dispatch scheduling & zero duplicate assignment dispatch (pure + live Execution).
  *  4. SQLite WAL + busy_timeout >= 10_000ms rail + withBusyRetry + 12-writer concurrent stress.
- *  5. Broker loopback concurrency cap (12 in-flight on loopback, polite 2 in-flight on external).
+ *  5. Broker loopback concurrency cap (12 in-flight on loopback, polite 4 in-flight on external).
  *  6. LabRunner bounded memory/CPU/PIDs limits & zero-orphan container cleanup on failure/stop.
  */
 import assert from 'node:assert/strict'
@@ -775,10 +775,10 @@ test('StoreSession ensures WAL + busy_timeout >= 10s, retries SQLITE_BUSY, and s
 })
 
 // ============================================================================
-// 5. Broker Per-Origin Loopback Concurrency Rail (12 Loopback vs 2 External)
+// 5. Broker Per-Origin Loopback Concurrency Rail (12 Loopback vs 4 External)
 // ============================================================================
 
-test('RequestBroker allows 12 concurrent in-flight requests on loopback while capping external origins at 2', async () => {
+test('RequestBroker allows 12 concurrent in-flight requests on loopback while capping external origins at 4', async () => {
   assert.equal(isLoopbackOrigin('http://127.0.0.1:8080'), true)
   assert.equal(isLoopbackOrigin('http://localhost:3000'), true)
   assert.equal(isLoopbackOrigin('http://[::1]:8080'), true)
@@ -823,7 +823,7 @@ test('RequestBroker allows 12 concurrent in-flight requests on loopback while ca
   assert.equal(localResults.length, 12)
   assert.equal(localPeak, 12, `expected all 12 loopback requests in-flight concurrently, got peak=${localPeak}`)
 
-  // Verify external origin remains strictly capped at 2 concurrent in-flight
+  // Verify external origin remains strictly capped at EXTERNAL_ORIGIN_MAX_IN_FLIGHT (4) concurrent in-flight
   let extActive = 0
   let extPeak = 0
   const extTransport: Transport = async () => {
@@ -847,11 +847,11 @@ test('RequestBroker allows 12 concurrent in-flight requests on loopback while ca
     audit: () => undefined,
   }
   await Promise.all(
-    Array.from({ length: 6 }, (_, i) =>
+    Array.from({ length: 8 }, (_, i) =>
       extBroker.executeHttp({ origin: extOrigin, method: 'GET', pathAndQuery: `/ext/${i}` }, extGrant, AbortSignal.timeout(5_000)),
     ),
   )
-  assert.equal(extPeak, 2, `external origin must remain capped at 2 in-flight, got peak=${extPeak}`)
+  assert.equal(extPeak, EXTERNAL_ORIGIN_MAX_IN_FLIGHT, `external origin must remain capped at ${EXTERNAL_ORIGIN_MAX_IN_FLIGHT} in-flight, got peak=${extPeak}`)
 })
 
 // ============================================================================
