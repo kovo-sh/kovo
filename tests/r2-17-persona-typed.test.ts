@@ -10,6 +10,7 @@ import { DatabaseSync } from 'node:sqlite'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import ts from 'typescript'
+import { resolveGitState } from '../scripts/bench-ledger.ts'
 import {
   parseRealisticArgs,
   planCell,
@@ -849,7 +850,7 @@ test('R3-19: benchmark-realistic --opaque-labels flag generates opaque UI labels
     llm: 'deterministic-no-llm',
     seed: 42,
     recordedAt: '2026-11-26T18:00:00.000Z',
-    gitSha: 'ea0ce16',
+    gitSha: resolveGitState(REPO_ROOT).gitSha,
     dirty: false,
     benchmarkVersion: 'a'.repeat(64),
     effectiveConfigHash: cfgOpaque.effectiveConfigHash,
