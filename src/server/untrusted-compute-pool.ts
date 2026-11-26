@@ -10,14 +10,22 @@
  */
 import { fork, type ChildProcess } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
+import { lstatSync, readdirSync, readFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { performance } from 'node:perf_hooks'
 import { fileURLToPath } from 'node:url'
-import { Worker, type ResourceLimits } from 'node:worker_threads'
+import { isMainThread, parentPort, Worker, workerData, type ResourceLimits } from 'node:worker_threads'
 import {
   ComposeParseError,
   type ComposeParseOptions,
   type ParsedComposeDocument,
 } from './compose-parse.ts'
-import type { ProgramGraph } from './program-graph.ts'
+import type { SynthesizeInvariantsInput, SynthesizeInvariantsResult } from './invariant-synthesizer.ts'
+import type { StaticExtractedRoute, StaticServerActionHint } from './phase0-recon.ts'
+import type { MonorepoOriginInput, ProgramGraph, ServiceOriginMapping } from './program-graph.ts'
+import { resolveRunSafetyBudgets } from './run-safety-budgets.ts'
+import { compileSafeClaimRegex, MAX_CLAIM_REGEX_HAYSTACK } from './safe-regex.ts'
+import type { StaticWorkspaceSnapshot } from './static-workspace-snapshot.ts'
 
 export type UntrustedComputeIsolation = 'thread' | 'process'
 
@@ -30,6 +38,10 @@ export type UntrustedTaskKind =
   | 'extract_html'
   | 'extract_program_graph'
   | 'build_program_graph'
+  | 'search_repo'
+  | 'synthesize_invariants'
+  | 'map_services_to_origins'
+  | 'extract_static_framework_routes'
 
 export interface WorkerTaskRequest {
   id: string
@@ -127,6 +139,8 @@ export interface UntrustedComputePoolOptions {
   maxPayloadBytes?: number
   /** Optional custom worker script URL/path (defaults to `./parser-worker-entry.ts`). */
   workerEntry?: URL | string
+  /** Optional structured-clone `workerData` passed to worker_threads isolates. */
+  workerData?: unknown
   /**
    * Isolation backend:
    * - `'thread'`: bounded `worker_threads` V8 isolate (default for pure JS tasks & custom thread entries)
@@ -243,6 +257,7 @@ export class UntrustedComputePool {
   readonly maxTasksPerWorker: number
   readonly isolation: UntrustedComputeIsolation
   private readonly workerEntry: URL | string
+  private readonly workerData: unknown
   private readonly slots = new Set<PoolWorkerSlot>()
   private readonly idle: PoolWorkerSlot[] = []
   private readonly queue: PendingTask[] = []
@@ -261,6 +276,7 @@ export class UntrustedComputePool {
     this.maxTasksPerWorker = clampInt(options.maxTasksPerWorker, 100, 1, 10_000)
     this.isolation = options.isolation === 'process' ? 'process' : 'thread'
     this.workerEntry = options.workerEntry ?? new URL('./parser-worker-entry.ts', import.meta.url)
+    this.workerData = options.workerData
     this.resourceLimits = {
       maxOldGenerationSizeMb: clampInt(
         options.resourceLimits?.maxOldGenerationSizeMb,
@@ -420,6 +436,7 @@ export class UntrustedComputePool {
       execArgv: [],
       // Strip host process.env so untrusted worker tasks never have access to host secrets.
       env: {},
+      ...(this.workerData !== undefined ? { workerData: this.workerData } : {}),
     })
     const slot: PoolWorkerSlot = {
       isolation: 'thread',
@@ -689,12 +706,47 @@ export class UntrustedComputePool {
 
 let sharedPool: UntrustedComputePool | undefined
 let sharedProcessPool: UntrustedComputePool | undefined
+let sharedHostComputePool: UntrustedComputePool | undefined
+
+const HOST_COMPUTE_TASK_KINDS = new Set<string>([
+  'search_repo',
+  'synthesize_invariants',
+  'map_services_to_origins',
+  'extract_static_framework_routes',
+])
+
+const HOST_COMPUTE_WORKER_ROLE = 'kovo-host-compute'
+const DEFAULT_POST_GRAPH_TASK_TIMEOUT_MS = 10_000
 
 export function getSharedUntrustedComputePool(): UntrustedComputePool {
   if (!sharedPool || sharedPool.stats().closed) {
     sharedPool = new UntrustedComputePool({ isolation: 'thread' })
   }
   return sharedPool
+}
+
+/**
+ * Shared thread pool dedicated to off-host repo search & post-ProgramGraph repo-content scanners
+ * (`R4-H-15`, `R4-H-16`). Runs isolated worker threads backed by this module with hard wall-clock
+ * termination on timeout.
+ */
+function getSharedHostComputePool(): UntrustedComputePool {
+  if (!sharedHostComputePool || sharedHostComputePool.stats().closed) {
+    sharedHostComputePool = new UntrustedComputePool({
+      isolation: 'thread',
+      maxConcurrency: 4,
+      defaultTimeoutMs: DEFAULT_POST_GRAPH_TASK_TIMEOUT_MS,
+      maxPayloadBytes: MAX_UNTRUSTED_PAYLOAD_BYTES_CAP,
+      resourceLimits: {
+        maxOldGenerationSizeMb: 128,
+        maxYoungGenerationSizeMb: 32,
+        stackSizeMb: 4,
+      },
+      workerEntry: new URL('./untrusted-compute-pool.ts', import.meta.url),
+      workerData: { kovoWorkerRole: HOST_COMPUTE_WORKER_ROLE },
+    })
+  }
+  return sharedHostComputePool
 }
 
 /**
@@ -720,11 +772,14 @@ export async function closeSharedUntrustedProcessPool(): Promise<void> {
 export async function closeSharedUntrustedComputePool(): Promise<void> {
   const threadPool = sharedPool
   const procPool = sharedProcessPool
+  const hostComputePool = sharedHostComputePool
   sharedPool = undefined
   sharedProcessPool = undefined
+  sharedHostComputePool = undefined
   await Promise.allSettled([
     ...(threadPool ? [threadPool.close()] : []),
     ...(procPool ? [procPool.close()] : []),
+    ...(hostComputePool ? [hostComputePool.close()] : []),
   ])
 }
 
@@ -735,6 +790,9 @@ export function runUntrustedTask<TResult = unknown>(
 ): Promise<TResult> {
   if (kind === 'js_harvest') {
     return getSharedUntrustedProcessPool().run<TResult>(kind, payload, opts)
+  }
+  if (HOST_COMPUTE_TASK_KINDS.has(kind)) {
+    return getSharedHostComputePool().run<TResult>(kind, payload, opts)
   }
   return getSharedUntrustedComputePool().run<TResult>(kind, payload, opts)
 }
@@ -1072,4 +1130,463 @@ export function extractProgramGraphInWorker(
       maxPayloadBytes: opts.maxPayloadBytes ?? MAX_UNTRUSTED_PAYLOAD_BYTES_CAP,
     },
   )
+}
+
+// ===========================================================================
+// R4-H-15 & R4-H-16: Off-host repo search & post-ProgramGraph pipeline workers
+// ===========================================================================
+
+export type SearchRepoTruncationReason = 'max_matches' | 'max_files' | 'max_bytes' | 'deadline_exceeded'
+
+export interface SearchRepoWorkerRequest {
+  /** Canonical jailed target file or directory path resolved by the host. */
+  realTarget: string
+  /** Canonical POSIX path relative to repos root ('' when searching the root). */
+  relPosix: string
+  query: string
+  regex: boolean
+  caseSensitive: boolean
+  maxMatches: number
+  maxFiles?: number
+  maxFileBytes?: number
+  maxBytes?: number
+  maxLineChars?: number
+  deadlineMs?: number
+}
+
+export interface SearchRepoWorkerResult {
+  query: string
+  mode: 'literal' | 'regex'
+  pathPrefix: string
+  filesScanned: number
+  matchCount: number
+  truncated: boolean
+  truncationReason?: SearchRepoTruncationReason
+  timedOut?: boolean
+  deadlineMs: number
+  maxBytes: number
+  bytesScanned: number
+  elapsedMs: number
+  matches: Array<{ path: string; line: number; text: string }>
+}
+
+export interface StaticFrameworkRoutesWorkerResult {
+  routes: StaticExtractedRoute[]
+  frameworks: string[]
+  serverActions: StaticServerActionHint[]
+}
+
+const WORKER_REPO_SKIP_DIRS = new Set([
+  '.git', 'node_modules', '.ssh', '.gnupg', '.aws', '.kube', '.docker', '.azure', '.gcloud', '.terraform',
+])
+const WORKER_REPO_SENSITIVE_FILES = new Set([
+  'id_rsa', 'id_ed25519', 'id_ecdsa', 'id_dsa', '.netrc', '.npmrc', '.pypirc', '.pgpass', '.my.cnf', '.git-credentials',
+])
+const WORKER_REPO_SENSITIVE_EXT_RE = /\.(?:pem|key|p12|pfx|jks|keystore|kdbx|ppk)$/i
+const WORKER_REPO_SAFE_ENV_TEMPLATE_RE = /^\.env\.(?:example|sample|template|dist|defaults?)$/i
+const WORKER_REPO_SOURCE_EXT_RE = /\.(?:[cm]?[jt]sx?|py|go|rs|java|kt|rb|php|cs|c|cpp|h|hpp|swift|scala)$/i
+
+const DEFAULT_WORKER_SEARCH_FILES = 4_000
+const DEFAULT_WORKER_SEARCH_FILE_BYTES = 512 * 1024
+const DEFAULT_WORKER_SEARCH_LINE_CHARS = 240
+
+function isSensitiveWorkerRepoSegment(segment: string, isDir: boolean, parentSegments: readonly string[]): boolean {
+  const lower = segment.toLowerCase()
+  if (WORKER_REPO_SKIP_DIRS.has(lower)) return true
+  if (isDir) return false
+  if (WORKER_REPO_SENSITIVE_FILES.has(lower)) return true
+  if (WORKER_REPO_SENSITIVE_EXT_RE.test(lower)) return true
+  if (lower === '.env' || (lower.startsWith('.env.') && !WORKER_REPO_SAFE_ENV_TEMPLATE_RE.test(lower))) return true
+  if (parentSegments.some(p => p.toLowerCase() === 'credentials') && !WORKER_REPO_SOURCE_EXT_RE.test(lower)) return true
+  return false
+}
+
+function isWorkerBinaryBuffer(buf: Buffer): boolean {
+  const probeLen = Math.min(buf.length, 8_192)
+  for (let i = 0; i < probeLen; i += 1) {
+    if (buf[i] === 0) return true
+  }
+  return false
+}
+
+/**
+ * Single authoritative bounded repository scanner shared by the off-host `search_repo` worker
+ * (`R4-H-15`) and sync test-compat entrypoints. Enforces `searchRepoMaxBytes`, `searchRepoDeadlineMs`,
+ * skip-list hygiene, binary filtering, and `compileSafeClaimRegex`.
+ */
+export function executeSearchRepoScan(request: SearchRepoWorkerRequest): SearchRepoWorkerResult {
+  const startedAt = performance.now()
+  const query = typeof request.query === 'string' ? request.query : ''
+  if (!query || query.length > 256) {
+    throw new Error('search_repo query must be a non-empty string up to 256 characters.')
+  }
+  const budgets = resolveRunSafetyBudgets({
+    overrides: {
+      ...(request.deadlineMs !== undefined ? { searchRepoDeadlineMs: request.deadlineMs } : {}),
+      ...(request.maxBytes !== undefined ? { searchRepoMaxBytes: request.maxBytes } : {}),
+    },
+  })
+  const deadlineMs = budgets.searchRepoDeadlineMs
+  const maxBytes = budgets.searchRepoMaxBytes
+  const maxMatches = clampInt(request.maxMatches, 50, 1, 200)
+  const maxFiles = clampInt(request.maxFiles, DEFAULT_WORKER_SEARCH_FILES, 1, 16_000)
+  const maxFileBytes = clampInt(request.maxFileBytes, DEFAULT_WORKER_SEARCH_FILE_BYTES, 1024, 4 * 1024 * 1024)
+  const maxLineChars = clampInt(request.maxLineChars, DEFAULT_WORKER_SEARCH_LINE_CHARS, 32, 1024)
+  const useRegex = request.regex === true
+  const caseSensitive = request.caseSensitive === true
+
+  let regexMatcher: RegExp | null = null
+  const literalNeedle = caseSensitive ? query : query.toLowerCase()
+  if (useRegex) {
+    // Compile without `i`/`u` flags so V8's linear-time fallback engine engages (R3-H-11).
+    const compiled = compileSafeClaimRegex(query, { flags: '', maxLength: 256 })
+    if (!compiled.ok) {
+      throw new Error(`Unsafe or invalid search_repo regex rejected: ${compiled.reason} Use literal search (regex: false) or a simpler linear pattern.`)
+    }
+    regexMatcher = compiled.regex
+  }
+
+  const startStat = lstatSync(request.realTarget)
+  const matches: Array<{ path: string; line: number; text: string }> = []
+  let filesScanned = 0
+  let totalBytesScanned = 0
+  let truncated = false
+  let truncationReason: SearchRepoTruncationReason | undefined
+  let timedOut = false
+
+  const checkDeadline = (): boolean => {
+    if (performance.now() - startedAt >= deadlineMs) {
+      truncated = true
+      timedOut = true
+      truncationReason = 'deadline_exceeded'
+      return true
+    }
+    return false
+  }
+
+  const scanFile = (absPath: string, relPosix: string): void => {
+    if (truncated) return
+    if (checkDeadline()) return
+    if (matches.length >= maxMatches) {
+      truncated = true
+      truncationReason = 'max_matches'
+      return
+    }
+    if (filesScanned >= maxFiles) {
+      truncated = true
+      truncationReason = 'max_files'
+      return
+    }
+    if (totalBytesScanned >= maxBytes) {
+      truncated = true
+      truncationReason = 'max_bytes'
+      return
+    }
+    let st
+    try {
+      st = lstatSync(absPath)
+    } catch {
+      return
+    }
+    if (!st.isFile() || st.isSymbolicLink() || st.size === 0 || st.size > maxFileBytes) return
+    if (totalBytesScanned > 0 && totalBytesScanned + st.size > maxBytes) {
+      truncated = true
+      truncationReason = 'max_bytes'
+      return
+    }
+    let buf: Buffer
+    try {
+      buf = readFileSync(absPath)
+    } catch {
+      return
+    }
+    if (isWorkerBinaryBuffer(buf)) return
+    filesScanned += 1
+    totalBytesScanned += buf.length
+    const lines = buf.toString('utf8').split(/\r?\n/)
+    const checkMask = regexMatcher ? 3 : 31
+    for (let i = 0; i < lines.length; i += 1) {
+      if ((i & checkMask) === 0 && checkDeadline()) return
+      const line = lines[i]!
+      let matched = false
+      if (regexMatcher) {
+        const haystack = line.length > MAX_CLAIM_REGEX_HAYSTACK ? line.slice(0, MAX_CLAIM_REGEX_HAYSTACK) : line
+        matched = regexMatcher.test(haystack)
+      } else {
+        matched = (caseSensitive ? line : line.toLowerCase()).includes(literalNeedle)
+      }
+      if (!matched) continue
+      if (matches.length >= maxMatches) {
+        truncated = true
+        truncationReason = 'max_matches'
+        return
+      }
+      matches.push({
+        path: `/repos/${relPosix}`,
+        line: i + 1,
+        text: line.trimEnd().slice(0, maxLineChars),
+      })
+    }
+  }
+
+  if (startStat.isFile()) {
+    scanFile(request.realTarget, request.relPosix)
+  } else if (startStat.isDirectory()) {
+    const stack: Array<{ absDir: string; relPrefix: string; parents: string[] }> = [{
+      absDir: request.realTarget,
+      relPrefix: request.relPosix,
+      parents: request.relPosix ? request.relPosix.split('/') : [],
+    }]
+    while (stack.length > 0 && !truncated) {
+      if (checkDeadline()) break
+      const cur = stack.pop()!
+      let entries
+      try {
+        entries = readdirSync(cur.absDir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))
+      } catch {
+        continue
+      }
+      const subdirs: Array<{ absDir: string; relPrefix: string; parents: string[] }> = []
+      for (const entry of entries) {
+        if (truncated) break
+        if (entry.isSymbolicLink()) continue
+        const isDir = entry.isDirectory()
+        const isFile = entry.isFile()
+        if (!isDir && !isFile) continue
+        if (isSensitiveWorkerRepoSegment(entry.name, isDir, cur.parents)) continue
+        const childAbs = join(cur.absDir, entry.name)
+        const childRel = cur.relPrefix ? `${cur.relPrefix}/${entry.name}` : entry.name
+        if (isDir) {
+          subdirs.push({ absDir: childAbs, relPrefix: childRel, parents: [...cur.parents, entry.name] })
+        } else {
+          scanFile(childAbs, childRel)
+          if (truncated) break
+          if (matches.length >= maxMatches) {
+            truncated = true
+            truncationReason = 'max_matches'
+            break
+          }
+          if (filesScanned >= maxFiles) {
+            truncated = true
+            truncationReason = 'max_files'
+            break
+          }
+          if (totalBytesScanned >= maxBytes) {
+            truncated = true
+            truncationReason = 'max_bytes'
+            break
+          }
+        }
+      }
+      for (let i = subdirs.length - 1; i >= 0; i -= 1) {
+        stack.push(subdirs[i]!)
+      }
+    }
+  }
+
+  return {
+    query,
+    mode: useRegex ? 'regex' : 'literal',
+    pathPrefix: request.relPosix ? `/repos/${request.relPosix}` : '/repos',
+    filesScanned,
+    matchCount: matches.length,
+    truncated,
+    ...(truncationReason ? { truncationReason } : {}),
+    ...(timedOut ? { timedOut: true } : {}),
+    deadlineMs,
+    maxBytes,
+    bytesScanned: totalBytesScanned,
+    elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)),
+    matches,
+  }
+}
+
+/**
+ * Run host-jailed `search_repo` inside an isolated `UntrustedComputePool` worker thread (`R4-H-15`)
+ * with a hard wall-clock deadline (`searchRepoDeadlineMs`) enforced by terminating the worker
+ * thread on overrun. Never blocks the host event loop.
+ */
+export async function searchRepoInWorker(
+  request: SearchRepoWorkerRequest,
+  opts: UntrustedTaskOptions = {},
+): Promise<SearchRepoWorkerResult> {
+  const startedAt = performance.now()
+  const budgets = resolveRunSafetyBudgets({
+    overrides: {
+      ...(request.deadlineMs !== undefined ? { searchRepoDeadlineMs: request.deadlineMs } : {}),
+      ...(request.maxBytes !== undefined ? { searchRepoMaxBytes: request.maxBytes } : {}),
+    },
+  })
+  const deadlineMs = clampInt(opts.timeoutMs ?? request.deadlineMs, budgets.searchRepoDeadlineMs, 10, 15_000)
+  const maxBytes = budgets.searchRepoMaxBytes
+  try {
+    return await runUntrustedTask<SearchRepoWorkerResult>(
+      'search_repo',
+      {
+        ...request,
+        deadlineMs,
+        maxBytes,
+      },
+      {
+        timeoutMs: deadlineMs,
+        signal: opts.signal,
+        maxPayloadBytes: opts.maxPayloadBytes ?? DEFAULT_UNTRUSTED_MAX_PAYLOAD_BYTES,
+      },
+    )
+  } catch (err) {
+    if (err instanceof UntrustedComputeTimeoutError) {
+      return {
+        query: request.query,
+        mode: request.regex ? 'regex' : 'literal',
+        pathPrefix: request.relPosix ? `/repos/${request.relPosix}` : '/repos',
+        filesScanned: 0,
+        matchCount: 0,
+        truncated: true,
+        truncationReason: 'deadline_exceeded',
+        timedOut: true,
+        deadlineMs,
+        maxBytes,
+        bytesScanned: 0,
+        elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)),
+        matches: [],
+      }
+    }
+    throw err
+  }
+}
+
+/**
+ * Run `synthesizeInvariants` off the host event loop inside `UntrustedComputePool` with a hard
+ * wall-clock deadline (`R4-H-16`). Authoritative worker API for `exec-recon-planner.ts` (WS-10).
+ */
+export function synthesizeInvariantsInWorker(
+  input: SynthesizeInvariantsInput,
+  opts: UntrustedTaskOptions = {},
+): Promise<SynthesizeInvariantsResult> {
+  return runUntrustedTask<SynthesizeInvariantsResult>(
+    'synthesize_invariants',
+    input,
+    {
+      timeoutMs: opts.timeoutMs ?? DEFAULT_POST_GRAPH_TASK_TIMEOUT_MS,
+      signal: opts.signal,
+      maxPayloadBytes: opts.maxPayloadBytes ?? MAX_UNTRUSTED_PAYLOAD_BYTES_CAP,
+    },
+  )
+}
+
+/**
+ * Run `mapServicesToOrigins` (compose, k8s ingress, and Dockerfile `EXPOSE` scanning) off the
+ * host event loop inside `UntrustedComputePool` with a hard wall-clock deadline (`R4-H-16`).
+ */
+export function mapServicesToOriginsInWorker(
+  input: MonorepoOriginInput,
+  opts: UntrustedTaskOptions = {},
+): Promise<ServiceOriginMapping[]> {
+  return runUntrustedTask<ServiceOriginMapping[]>(
+    'map_services_to_origins',
+    input,
+    {
+      timeoutMs: opts.timeoutMs ?? DEFAULT_POST_GRAPH_TASK_TIMEOUT_MS,
+      signal: opts.signal,
+      maxPayloadBytes: opts.maxPayloadBytes ?? MAX_UNTRUSTED_PAYLOAD_BYTES_CAP,
+    },
+  )
+}
+
+/**
+ * Run `extractStaticFrameworkRoutes` off the host event loop inside `UntrustedComputePool` with a
+ * hard wall-clock deadline (`R4-H-16`).
+ */
+export function extractStaticFrameworkRoutesInWorker(
+  input: {
+    reposDir: string
+    staticSnapshot?: StaticWorkspaceSnapshot
+  },
+  opts: UntrustedTaskOptions = {},
+): Promise<StaticFrameworkRoutesWorkerResult> {
+  return runUntrustedTask<StaticFrameworkRoutesWorkerResult>(
+    'extract_static_framework_routes',
+    input,
+    {
+      timeoutMs: opts.timeoutMs ?? DEFAULT_POST_GRAPH_TASK_TIMEOUT_MS,
+      signal: opts.signal,
+      maxPayloadBytes: opts.maxPayloadBytes ?? MAX_UNTRUSTED_PAYLOAD_BYTES_CAP,
+    },
+  )
+}
+
+// Unified post-graph worker registry keeping all three off-host pipeline entrypoints wired in-module
+// while external callers (WS-10 `exec-recon-planner.ts` / `phase0-recon.ts`) migrate onto them.
+const POST_GRAPH_WORKER_ENTRYPOINTS = {
+  synthesize_invariants: synthesizeInvariantsInWorker,
+  map_services_to_origins: mapServicesToOriginsInWorker,
+  extract_static_framework_routes: extractStaticFrameworkRoutesInWorker,
+} as const
+
+async function executeHostComputeTask(kind: string, payload: unknown): Promise<unknown> {
+  switch (kind) {
+    case 'search_repo': {
+      const req = (payload ?? {}) as SearchRepoWorkerRequest
+      if (!req || typeof req.realTarget !== 'string' || typeof req.query !== 'string') {
+        throw new Error('search_repo worker task requires realTarget and query strings')
+      }
+      return executeSearchRepoScan(req)
+    }
+    case 'synthesize_invariants': {
+      const req = (payload ?? {}) as SynthesizeInvariantsInput
+      if (!req || typeof req.mode !== 'string') {
+        throw new Error('synthesize_invariants worker task requires a valid SynthesizeInvariantsInput')
+      }
+      const { synthesizeInvariants } = await import('./invariant-synthesizer.ts')
+      return synthesizeInvariants(req)
+    }
+    case 'map_services_to_origins': {
+      const req = (payload ?? {}) as MonorepoOriginInput
+      if (!req || !Array.isArray(req.services) || !Array.isArray(req.origins)) {
+        throw new Error('map_services_to_origins worker task requires services and origins arrays')
+      }
+      const { mapServicesToOrigins } = await import('./program-graph.ts')
+      return mapServicesToOrigins(req)
+    }
+    case 'extract_static_framework_routes': {
+      const req = (payload ?? {}) as { reposDir?: string; staticSnapshot?: StaticWorkspaceSnapshot }
+      const { extractStaticFrameworkRoutes } = await import('./phase0-recon.ts')
+      return extractStaticFrameworkRoutes(typeof req?.reposDir === 'string' ? req.reposDir : '', req?.staticSnapshot)
+    }
+    default:
+      throw new Error(`Unsupported host-compute worker task kind: ${String(kind)} (registered: ${Object.keys(POST_GRAPH_WORKER_ENTRYPOINTS).join(', ')})`)
+  }
+}
+
+function serializeHostComputeError(err: unknown): NonNullable<WorkerTaskResponse['error']> {
+  if (err instanceof Error) {
+    return { name: err.name || 'Error', message: err.message }
+  }
+  return { name: 'Error', message: String(err) }
+}
+
+if (
+  !isMainThread
+  && parentPort
+  && workerData
+  && typeof workerData === 'object'
+  && (workerData as { kovoWorkerRole?: unknown }).kovoWorkerRole === HOST_COMPUTE_WORKER_ROLE
+) {
+  const port = parentPort
+  port.on('message', (msg: WorkerTaskRequest) => {
+    void (async () => {
+      try {
+        const result = await executeHostComputeTask(msg.kind, msg.payload)
+        const response: WorkerTaskResponse = { id: msg.id, ok: true, result }
+        port.postMessage(response)
+      } catch (err) {
+        const response: WorkerTaskResponse = {
+          id: msg.id,
+          ok: false,
+          error: serializeHostComputeError(err),
+        }
+        port.postMessage(response)
+      }
+    })()
+  })
 }
