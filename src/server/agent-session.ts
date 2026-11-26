@@ -9,10 +9,9 @@ import {
   GenerationTask,
   Harness,
   hook,
-  LiveDoc,
   ToolTask,
 } from "@earendil-works/pi-durable"
-import type { ConversationView, LiveState, ToolRegistration, WatchHandle } from "@earendil-works/pi-durable"
+import type { ToolRegistration } from "@earendil-works/pi-durable"
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node"
 import { arr, bool, int, map, num, obj, oneOf, opt, str, unknown, unsafe } from "@earendil-works/pi-schema"
 import {
@@ -39,6 +38,7 @@ import type { BoardPostArgs, BoardReadArgs } from "./board-tools.ts"
 import type { BrokerMultipartPart } from "./broker.ts"
 import type { BrowserInteractiveAction, BrowserSessionStep } from "./scoped-browser.ts"
 import type { AgentTrace } from "./agent-trace.ts"
+import { ActiveClock, type DeadlineTimerHandle } from "./active-clock.ts"
 import { isProfileHealthy, resolveProfilePoolForRole } from "./model-settings.ts"
 import type { ResolvedModelProfile } from "./model-settings.ts"
 import {
@@ -2855,6 +2855,8 @@ export interface RunAgentSessionOptions {
   shouldSettle?: () => boolean
   /** Optional wall-clock budget for the session; settles at `max(wallClockMs - 15s, 80%)` and hard-rotates at `wallClockMs`. */
   wallClockMs?: number
+  /** Optional pause-aware clock for wall-clock settlement & rotation (auto-pauses on approval waits / run pause). */
+  activeClock?: ActiveClock
   /** Optional grace window when a proof call (`kovo_verify`) is actively running at `wallClockMs` (default 5s). */
   wallClockGraceMs?: number
   /** Called once when the hard per-assignment `wallClockMs` deadline triggers a bounded rotation. */
@@ -2994,7 +2996,10 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
   const scrubbers = createSessionScrubbers(options.secrets, staticKeySecrets)
   const { scrubForDisplay } = scrubbers
 
-  const sessionStartedAt = Date.now()
+  const ownedClock = !options.activeClock
+  const activeClock = options.activeClock ?? new ActiveClock()
+  const sessionClockBaseMs = activeClock.activeElapsedMs()
+  const sessionActiveElapsedMs = () => Math.max(0, activeClock.activeElapsedMs() - sessionClockBaseMs)
   const sessionController = new AbortController()
   const onParentAbort = () => sessionController.abort(options.signal.reason)
   options.signal.addEventListener('abort', onParentAbort, { once: true })
@@ -3003,8 +3008,8 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
   const effectiveWallClockMs = options.wallClockMs && Number.isFinite(options.wallClockMs) && options.wallClockMs > 0
     ? Math.max(1, Math.floor(options.wallClockMs))
     : undefined
-  const wallClockSettlementAt = effectiveWallClockMs !== undefined
-    ? sessionStartedAt + wallClockSettlementMs(effectiveWallClockMs)
+  const wallClockSettlementBudgetMs = effectiveWallClockMs !== undefined
+    ? wallClockSettlementMs(effectiveWallClockMs)
     : undefined
   const proofGraceMs = effectiveWallClockMs === undefined
     ? 0
@@ -3017,13 +3022,13 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
   let wallClockRotated = false
   let wallClockExpired = false
   let wallClockNudgeSent = false
-  let wallClockGraceStartedAt: number | undefined
-  let wallClockTimer: NodeJS.Timeout | undefined
-  let wallClockGraceTimer: NodeJS.Timeout | undefined
+  let wallClockGraceStartedAtMs: number | undefined
+  let wallClockTimer: DeadlineTimerHandle | undefined
+  let wallClockGraceTimer: DeadlineTimerHandle | undefined
   const activeProofCallIds = new Set<string>()
   const clearWallClockTimers = () => {
-    if (wallClockTimer) { clearTimeout(wallClockTimer); wallClockTimer = undefined }
-    if (wallClockGraceTimer) { clearTimeout(wallClockGraceTimer); wallClockGraceTimer = undefined }
+    if (wallClockTimer) { wallClockTimer.cancel(); wallClockTimer = undefined }
+    if (wallClockGraceTimer) { wallClockGraceTimer.cancel(); wallClockGraceTimer = undefined }
   }
 
   const providerOpts: ProviderOptions = {
@@ -3049,7 +3054,7 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
   const requireCompleteIntent = options.requireCompleteIntent ?? Boolean(handlers.complete_intent)
   const settlementTurn = Math.max(1, Math.floor(maxTurns * 0.85))
   const settlementNudgeTurn = settlementNudgeTurnFor(maxTurns)
-  const wallClockDeadline = wallClockSettlementAt
+  const wallClockDeadline = wallClockSettlementBudgetMs
 
   let turnsUsed = 0
   let nudgesUsed = 0
@@ -3060,8 +3065,10 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
     if (wallClockRotated || options.signal.aborted || effectiveWallClockMs === undefined) return
     wallClockRotated = true
     clearWallClockTimers()
-    const elapsedMs = Math.max(0, Date.now() - sessionStartedAt)
-    const graceUsedMs = wallClockGraceStartedAt !== undefined ? Math.max(0, Date.now() - wallClockGraceStartedAt) : 0
+    const elapsedMs = sessionActiveElapsedMs()
+    const graceUsedMs = wallClockGraceStartedAtMs !== undefined
+      ? Math.max(0, activeClock.activeElapsedMs() - wallClockGraceStartedAtMs)
+      : 0
     try {
       options.onWallClockRotate?.({ elapsedMs, wallClockMs: effectiveWallClockMs, turnsUsed, graceUsedMs })
     } catch { /* telemetry only */ }
@@ -3069,22 +3076,20 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
   }
 
   if (effectiveWallClockMs !== undefined) {
-    wallClockTimer = setTimeout(() => {
+    wallClockTimer = activeClock.createDeadlineTimer(effectiveWallClockMs, () => {
       wallClockTimer = undefined
       wallClockExpired = true
       if (options.signal.aborted || wallClockRotated) return
       if (activeProofCallIds.size > 0 && proofGraceMs > 0) {
-        wallClockGraceStartedAt = Date.now()
-        wallClockGraceTimer = setTimeout(() => {
+        wallClockGraceStartedAtMs = activeClock.activeElapsedMs()
+        wallClockGraceTimer = activeClock.createDeadlineTimer(proofGraceMs, () => {
           wallClockGraceTimer = undefined
           triggerWallClockRotation()
-        }, proofGraceMs)
-        wallClockGraceTimer.unref?.()
+        })
         return
       }
       triggerWallClockRotation()
-    }, effectiveWallClockMs)
-    wallClockTimer.unref?.()
+    })
   }
   /** Shared with the tool layer: route evidence, spec attempts and coded proof gaps. */
   const specTracker = new SpecSubmissionTracker()
@@ -3177,6 +3182,7 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
       settled,
       shouldSettle: options.shouldSettle,
       wallClockDeadline,
+      now: sessionActiveElapsedMs,
     })) {
       settled = true
       return true
@@ -3220,8 +3226,8 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
           role: 'user' as const, content: scrubForDisplay(content), timestamp: Date.now(),
         }))
         const settlingNow = isSettling()
-        const wallClockSettlingNow = effectiveWallClockMs !== undefined && wallClockSettlementAt !== undefined
-          && Date.now() >= wallClockSettlementAt && !wallClockNudgeSent
+        const wallClockSettlingNow = effectiveWallClockMs !== undefined && wallClockSettlementBudgetMs !== undefined
+          && sessionActiveElapsedMs() >= wallClockSettlementBudgetMs && !wallClockNudgeSent
         const willNudge = Boolean(handlers.complete_intent) && turnsUsed + 1 === settlementNudgeTurn
         const specDirective = specDirectiveForRun(Boolean(earlyExit) || settlingNow || wallClockSettlingNow || willNudge)
         if (earlyExit) {
@@ -3235,7 +3241,7 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
           extraMessages.push({
             role: 'user' as const,
             content: wallClockSettlementMessage({
-              elapsedMs: Math.max(0, Date.now() - sessionStartedAt),
+              elapsedMs: sessionActiveElapsedMs(),
               wallClockMs: effectiveWallClockMs,
               proofTools: registeredProofTools,
               ...(specDirective ? { specDirective } : {}),
@@ -3400,7 +3406,7 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
 
   const context = withAbortSignal(sessionController.signal, BACKGROUND_CONTEXT)
   const makeWallClockRotatedResult = (): AgentSessionResult => {
-    const elapsedMs = Math.max(0, Date.now() - sessionStartedAt)
+    const elapsedMs = sessionActiveElapsedMs()
     return finish({
       answer: completion
         ? completion.summary
@@ -3457,7 +3463,6 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
       progress: { partialIntervalMs: 250, persistWithinMs: 350 },
     },
   }, BACKGROUND_CONTEXT)
-  let activityWatch: WatchHandle<ConversationView> | undefined
 
   try {
     const agent = {
@@ -3471,26 +3476,6 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
     }
     const conversation = await harness.root(context, { agent })
     await conversation.configure(agent, context)
-
-    // Token-progress seam: the generation task commits a throttled partial (text/thinking/tool-call
-    // deltas) into `pi.live`; a growing partial is proof the provider stream is alive. The caller
-    // resets its no-token watchdog from this signal, so slow-but-streaming turns never abort.
-    if (options.onStreamActivity) {
-      try {
-        activityWatch = await conversation.watch(context)
-        let lastFingerprint = ''
-        activityWatch.start(async call => {
-          if (call.kind !== 'value') return
-          const live = call.value.docs[LiveDoc.definition.kind] as LiveState | undefined
-          const fingerprint = liveStreamFingerprint(live?.generation?.message)
-          if (!fingerprint || fingerprint === lastFingerprint) return
-          lastFingerprint = fingerprint
-          try { options.onStreamActivity?.() } catch { /* telemetry only */ }
-        })
-      } catch {
-        activityWatch = undefined
-      }
-    }
 
     const input = { type: 'input' as const, content: scrubForDisplay(options.prompt) }
     const submission = await conversation.submit({ ...input, requestId: options.requestId }, context)
@@ -3628,8 +3613,8 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
     throw err
   } finally {
     clearWallClockTimers()
+    if (ownedClock) activeClock.dispose()
     options.signal.removeEventListener('abort', onParentAbort)
-    await activityWatch?.stop().catch(() => undefined)
     const closePromise = harness.close(BACKGROUND_CONTEXT).catch(() => undefined)
     if (wallClockRotated) {
       let closeTimer: NodeJS.Timeout | undefined
@@ -3645,34 +3630,6 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
       await closePromise
     }
   }
-}
-
-/**
- * Fingerprint of a committed partial assistant message. Only token-bearing content counts (text,
- * thinking, tool-call arguments); usage-only or bookkeeping commits do not reset a stall watchdog.
- */
-function liveStreamFingerprint(message: unknown): string {
-  if (!message || typeof message !== 'object') return ''
-  const content = (message as { content?: unknown }).content
-  if (!Array.isArray(content)) return ''
-  let total = 0
-  const shape: string[] = []
-  for (const part of content) {
-    if (!part || typeof part !== 'object') continue
-    const block = part as Record<string, unknown>
-    if (typeof block.text === 'string') {
-      total += block.text.length
-      shape.push(`t${block.text.length}`)
-    } else if (typeof block.thinking === 'string') {
-      total += block.thinking.length
-      shape.push(`h${block.thinking.length}`)
-    } else if (block.arguments && typeof block.arguments === 'object') {
-      const size = JSON.stringify(block.arguments).length
-      total += size
-      shape.push(`a${size}`)
-    }
-  }
-  return total === 0 ? '' : `${content.length}|${total}|${shape.join(',')}`
 }
 
 function extractLastAssistantText(entries: readonly { model?: readonly { role: string; content?: unknown }[] }[]): string {

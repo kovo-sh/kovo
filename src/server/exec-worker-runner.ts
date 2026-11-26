@@ -7,6 +7,12 @@ import {
 } from '../domain.ts'
 import { declarativeReplaySpecSchema, replaySpecOrigins, type DeclarativeReplaySpec } from '../replay-spec.ts'
 import {
+  ActiveClock,
+  getRunClock,
+  registerAssignmentClock,
+  type DeadlineTimerHandle,
+} from './active-clock.ts'
+import {
   KOVO_VERIFY_TS_ONLY_ERROR,
   createBoardTools,
   filterHandlersForSpecialist,
@@ -638,18 +644,19 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
     } catch { /* pooling is best-effort */ }
 
     // Open ONE persistent air-gapped container for the entire intent.
-    // Arm a pre-session wall-clock guard so a stalled openSession/staging call can never hold a
-    // slot past budget.wallClockMs; disarmed once runAgentSession takes over the exact timer.
-    const startedAt = Date.now()
-    let preSessionTimer: NodeJS.Timeout | undefined = setTimeout(() => {
+    // Arm a pause-aware pre-session wall-clock guard backed by `ActiveClock` so a stalled
+    // openSession/staging call can never hold a slot past budget.wallClockMs, while human
+    // Tier-3 approval waits or run pauses freeze the clock cleanly.
+    const assignmentClock = new ActiveClock({ parent: getRunClock(run.id) })
+    const unregisterAssignmentClock = registerAssignmentClock(job.assignment.id, assignmentClock)
+    let preSessionTimer: DeadlineTimerHandle | undefined = assignmentClock.createDeadlineTimer(budget.wallClockMs, () => {
       preSessionTimer = undefined
       if (job.controller.signal.aborted) return
       this.host.wallClockRotatedAssignments.add(job.assignment.id)
       job.controller.abort(new Error(`Pre-session wall-clock deadline reached (${budget.wallClockMs}ms).`))
-    }, budget.wallClockMs)
-    preSessionTimer.unref?.()
+    })
     const clearPreSessionTimer = () => {
-      if (preSessionTimer) { clearTimeout(preSessionTimer); preSessionTimer = undefined }
+      if (preSessionTimer) { preSessionTimer.cancel(); preSessionTimer = undefined }
     }
     let session: Awaited<ReturnType<WorkerBackend['openSession']>>
     try {
@@ -660,6 +667,8 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
       )
     } catch (err) {
       clearPreSessionTimer()
+      unregisterAssignmentClock()
+      assignmentClock.dispose()
       throw err
     }
 
@@ -1732,7 +1741,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
       })
 
       clearPreSessionTimer()
-      const remainingWallClockMs = Math.max(1, budget.wallClockMs - Math.max(0, Date.now() - startedAt))
+      const remainingWallClockMs = Math.max(1, budget.wallClockMs - assignmentClock.activeElapsedMs())
       const sessionResult = await runAgentSession({
         directory: this.storage.directory,
         sessionId: job.assignment.sessionId,
@@ -1766,6 +1775,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
         signal: job.controller.signal,
         maxTurns: budget.maxTurns,
         wallClockMs: remainingWallClockMs,
+        activeClock: assignmentClock,
         ...(runTrace ? {
           trace: runTrace,
           traceContext: {
@@ -1777,7 +1787,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
         compaction: true,
         enableSettlement: true,
         requireCompleteIntent: true,
-        shouldSettle: () => (Date.now() - startedAt) >= effectiveSettlementMs,
+        shouldSettle: () => assignmentClock.activeElapsedMs() >= effectiveSettlementMs,
         handlers: scopedHandlers,
         secrets,
         beforeCall: () => {
@@ -1861,7 +1871,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
           : sessionResult.answer
       if (sessionResult.status === 'wall_clock_rotated') {
         this.host.wallClockRotationsByRun.set(run.id, (this.host.wallClockRotationsByRun.get(run.id) ?? 0) + 1)
-        const elapsedMs = sessionResult.elapsedMs ?? Math.max(0, Date.now() - startedAt)
+        const elapsedMs = sessionResult.elapsedMs ?? assignmentClock.activeElapsedMs()
         this.host.safeEvent(
           run.id,
           'worker.wall_clock_rotated',
@@ -1922,9 +1932,11 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
       }
     } finally {
       clearPreSessionTimer()
+      unregisterAssignmentClock()
       stallWatchdog.clear()
       generationStartedAt = undefined
-      const wallMs = Math.max(0, Date.now() - startedAt)
+      const wallMs = assignmentClock.activeElapsedMs()
+      assignmentClock.dispose()
       const walls = this.host.assignmentWallByRun.get(run.id) ?? []
       walls.push(wallMs)
       this.host.assignmentWallByRun.set(run.id, walls)

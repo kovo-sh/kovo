@@ -65,6 +65,11 @@ export interface StreamSanitizeOptions {
    * never misclassified as stalled.
    */
   onActivity?: () => void
+  /**
+   * Called in real time as each parsed upstream SSE data frame arrives (for incremental usage
+   * accounting even when a consumer aborts mid-stream before a terminal event).
+   */
+  onFrame?: (data: Record<string, unknown> | '[DONE]') => void
 }
 
 const replacement = '[redacted]'
@@ -346,6 +351,7 @@ export function sanitizeProviderStream(
     : (secretsOrOptions.secrets ?? [])
   const onFirstChunk = isSecretSource(secretsOrOptions) ? undefined : secretsOrOptions.onFirstChunk
   const onActivity = isSecretSource(secretsOrOptions) ? undefined : secretsOrOptions.onActivity
+  const onFrame = isSecretSource(secretsOrOptions) ? undefined : secretsOrOptions.onFrame
   const requestedLimit = isSecretSource(secretsOrOptions)
     ? (responseLimitArg ?? defaultStreamResponseLimit)
     : (secretsOrOptions.responseLimit ?? responseLimitArg ?? defaultStreamResponseLimit)
@@ -383,8 +389,13 @@ export function sanitizeProviderStream(
       throw new Error('The model returned data after the turn ended.')
     }
     frames.push(frame)
-    if (frame.data !== undefined && onActivity) {
-      try { onActivity() } catch { /* activity signal must never break the stream */ }
+    if (frame.data !== undefined) {
+      if (onFrame) {
+        try { onFrame(frame.data) } catch { /* frame observer must never break the stream */ }
+      }
+      if (onActivity) {
+        try { onActivity() } catch { /* activity signal must never break the stream */ }
+      }
     }
     if (frame.data === '[DONE]' || terminalEvents.has(String(frame.data?.type))) finished = true
     if (finished) emit(controller)

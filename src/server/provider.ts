@@ -31,6 +31,8 @@ export const defaultFirstEventTimeoutMs = 120_000
 export const defaultIdleTimeoutMs = 180_000
 export const defaultTotalTimeoutMs = 600_000
 export const defaultMaxCalls = 220
+export const defaultMaxTransportRetries = 2
+const defaultTransportRetryBaseMs = 350
 
 export type ProviderCall = {
   scenario: string
@@ -86,6 +88,10 @@ export type ProviderOptions = {
   record?: CallRecorder
   secrets?: SecretSource
   maxCalls?: number
+  /** Bounded transient 429/5xx transport retry cap (separate from logical `maxCalls` turn budget). */
+  maxTransportRetries?: number
+  /** Base exponential backoff delay in ms for transient transport retries (default 350ms). */
+  transportRetryBaseMs?: number
   maxRequestBytes?: number
   responseLimit?: number
   firstEventTimeoutMs?: number
@@ -129,98 +135,167 @@ export function estimateCostUsd(
   return (uncached * inRate + cached * cachedRate + outputTokens * outRate) / 1_000_000
 }
 
+class SseUsageAccumulator {
+  private rawInputTokens = 0
+  private cachedInputTokens = 0
+  private outputTokens = 0
+  private anthropicCacheRead = 0
+
+  feedData(data: Record<string, unknown> | '[DONE]' | undefined): void {
+    if (!data || data === '[DONE]') return
+    const responseUsage = (data.response as Record<string, unknown> | undefined)?.usage as Record<string, unknown> | undefined
+    const topUsage = data.usage as Record<string, unknown> | undefined
+    const msgUsage = (data.message as Record<string, unknown> | undefined)?.usage as Record<string, unknown> | undefined
+    const usage = responseUsage ?? topUsage ?? msgUsage
+    if (!usage) return
+    const inp = Number(usage.input_tokens ?? usage.prompt_tokens ?? 0)
+    const out = Number(usage.output_tokens ?? usage.completion_tokens ?? 0)
+    const inputDetails = usage.input_tokens_details as Record<string, unknown> | undefined
+    const promptDetails = usage.prompt_tokens_details as Record<string, unknown> | undefined
+    const openaiCached = Number(inputDetails?.cached_tokens ?? promptDetails?.cached_tokens ?? 0)
+    const msgCached = Number(usage.cache_read_input_tokens ?? 0)
+    if (Number.isFinite(inp) && inp > this.rawInputTokens) this.rawInputTokens = inp
+    if (Number.isFinite(out) && out > this.outputTokens) this.outputTokens = out
+    if (Number.isFinite(openaiCached) && openaiCached > this.cachedInputTokens) this.cachedInputTokens = openaiCached
+    if (Number.isFinite(msgCached) && msgCached > this.anthropicCacheRead) this.anthropicCacheRead = msgCached
+  }
+
+  feedSseText(sseText: string): void {
+    for (const line of sseText.split('\n')) {
+      if (!line.startsWith('data: ') || line === 'data: [DONE]') continue
+      try {
+        const data = JSON.parse(line.slice(6)) as Record<string, unknown>
+        this.feedData(data)
+      } catch {
+        // Ignore unparseable frames.
+      }
+    }
+  }
+
+  snapshot(protocol: 'responses' | 'messages' = 'responses'): {
+    inputTokens: number
+    cachedInputTokens: number
+    outputTokens: number
+  } {
+    if (protocol === 'messages' && this.anthropicCacheRead > 0) {
+      // Anthropic Messages reports `input_tokens` excluding `cache_read_input_tokens`.
+      return {
+        inputTokens: this.rawInputTokens + this.anthropicCacheRead,
+        cachedInputTokens: this.anthropicCacheRead,
+        outputTokens: this.outputTokens,
+      }
+    }
+    const effectiveCached = Math.min(this.rawInputTokens, Math.max(this.cachedInputTokens, this.anthropicCacheRead))
+    return { inputTokens: this.rawInputTokens, cachedInputTokens: effectiveCached, outputTokens: this.outputTokens }
+  }
+}
+
 export function extractUsageFromSse(
   sseText: string,
   protocol: 'responses' | 'messages' = 'responses',
 ): { inputTokens: number; cachedInputTokens: number; outputTokens: number } {
-  let rawInputTokens = 0
-  let cachedInputTokens = 0
-  let outputTokens = 0
-  let anthropicCacheRead = 0
-  for (const line of sseText.split('\n')) {
-    if (!line.startsWith('data: ') || line === 'data: [DONE]') continue
-    try {
-      const data = JSON.parse(line.slice(6)) as Record<string, unknown>
-      const responseUsage = (data.response as Record<string, unknown> | undefined)?.usage as Record<string, unknown> | undefined
-      const topUsage = data.usage as Record<string, unknown> | undefined
-      const msgUsage = (data.message as Record<string, unknown> | undefined)?.usage as Record<string, unknown> | undefined
-      const usage = responseUsage ?? topUsage ?? msgUsage
-      if (!usage) continue
-      const inp = Number(usage.input_tokens ?? usage.prompt_tokens ?? 0)
-      const out = Number(usage.output_tokens ?? usage.completion_tokens ?? 0)
-      const inputDetails = usage.input_tokens_details as Record<string, unknown> | undefined
-      const promptDetails = usage.prompt_tokens_details as Record<string, unknown> | undefined
-      const openaiCached = Number(inputDetails?.cached_tokens ?? promptDetails?.cached_tokens ?? 0)
-      const msgCached = Number(usage.cache_read_input_tokens ?? 0)
-      if (Number.isFinite(inp) && inp > rawInputTokens) rawInputTokens = inp
-      if (Number.isFinite(out) && out > outputTokens) outputTokens = out
-      if (Number.isFinite(openaiCached) && openaiCached > cachedInputTokens) cachedInputTokens = openaiCached
-      if (Number.isFinite(msgCached) && msgCached > anthropicCacheRead) anthropicCacheRead = msgCached
-    } catch {
-      // Ignore unparseable frames.
-    }
-  }
-  if (protocol === 'messages' && anthropicCacheRead > 0) {
-    // Anthropic Messages reports `input_tokens` excluding `cache_read_input_tokens`.
-    return {
-      inputTokens: rawInputTokens + anthropicCacheRead,
-      cachedInputTokens: anthropicCacheRead,
-      outputTokens,
-    }
-  }
-  const effectiveCached = Math.min(rawInputTokens, Math.max(cachedInputTokens, anthropicCacheRead))
-  return { inputTokens: rawInputTokens, cachedInputTokens: effectiveCached, outputTokens }
+  const acc = new SseUsageAccumulator()
+  acc.feedSseText(sseText)
+  return acc.snapshot(protocol)
 }
 
-async function readStreamWithIdleTimeout(
-  stream: ReadableStream<Uint8Array>,
-  idleTimeoutMs: number,
-  signal: AbortSignal,
-  registerActivityReset?: (reset: () => void) => void,
-): Promise<string> {
-  const reader = stream.getReader()
-  const decoder = new TextDecoder()
-  const parts: string[] = []
-  try {
-    for (;;) {
-      signal.throwIfAborted()
-      let timer: ReturnType<typeof setTimeout> | undefined
-      let rejectIdle: ((err: Error) => void) | undefined
-      const armTimer = () => {
-        if (timer) clearTimeout(timer)
-        timer = setTimeout(() => rejectIdle?.(new Error('The model stream timed out while waiting for data.')), idleTimeoutMs)
-      }
-      const idle = new Promise<never>((_, reject) => {
-        rejectIdle = reject
-        armTimer()
-      })
-      registerActivityReset?.(armTimer)
-      const onAbort = () => {
-        if (timer) clearTimeout(timer)
-        const reason = signal.reason
-        rejectIdle?.(
-          reason instanceof Error
-            ? reason
-            : new Error(typeof reason === 'string' && reason ? reason : 'The model stream was aborted.'),
-        )
-      }
-      signal.addEventListener('abort', onAbort, { once: true })
-      let next: ReadableStreamReadResult<Uint8Array>
-      try {
-        next = await Promise.race([reader.read(), idle])
-      } finally {
-        registerActivityReset?.(() => undefined)
-        if (timer) clearTimeout(timer)
-        signal.removeEventListener('abort', onAbort)
-      }
-      if (next.done) break
-      parts.push(decoder.decode(next.value, { stream: true }))
-    }
-    parts.push(decoder.decode())
-    return parts.join('')
-  } finally {
-    await reader.cancel().catch(() => undefined)
+function estimateValueChars(
+  value: unknown,
+  cache: WeakMap<object, number>,
+  cacheObjects: boolean,
+  depth = 0,
+): number {
+  if (typeof value === 'string') return value.length + 2
+  if (typeof value === 'number' || typeof value === 'boolean') return 8
+  if (value === null || value === undefined) return 4
+  if (typeof value !== 'object' || depth > 16) return 8
+
+  if (cacheObjects) {
+    const cached = cache.get(value)
+    if (cached !== undefined) return cached
   }
+
+  let total = 2
+  if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i++) {
+      total += estimateValueChars(value[i], cache, true, depth + 1) + 1
+    }
+  } else {
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      total += k.length + 4 + estimateValueChars(v, cache, true, depth + 1)
+    }
+  }
+  if (cacheObjects) {
+    cache.set(value, total)
+  }
+  return total
+}
+
+/**
+ * Incremental transcript token estimator backed by a per-session `WeakMap` cache.
+ * Avoids synchronous full-transcript serialization on every LLM turn:
+ * previously seen message & tool objects hit the cache in O(1), measuring only new turns.
+ */
+export function createTranscriptTokenEstimator(): {
+  estimate(transcript: unknown): number
+  readonly cacheHits: number
+  readonly cacheMisses: number
+} {
+  const cache = new WeakMap<object, number>()
+  let hits = 0
+  let misses = 0
+
+  const measureEntry = (entry: unknown): number => {
+    if (entry && typeof entry === 'object') {
+      const cached = cache.get(entry)
+      if (cached !== undefined) {
+        hits += 1
+        return cached
+      }
+      misses += 1
+      return estimateValueChars(entry, cache, true, 0)
+    }
+    return estimateValueChars(entry, cache, false, 0)
+  }
+
+  return {
+    get cacheHits() { return hits },
+    get cacheMisses() { return misses },
+    estimate(transcript: unknown): number {
+      if (!transcript || typeof transcript !== 'object') {
+        return Math.ceil(estimateValueChars(transcript, cache, false, 0) / 3.5)
+      }
+      const rec = transcript as Record<string, unknown>
+      let chars = 2
+      for (const [k, v] of Object.entries(rec)) {
+        chars += k.length + 4
+        if (Array.isArray(v)) {
+          chars += 2
+          for (let i = 0; i < v.length; i++) {
+            chars += measureEntry(v[i]) + 1
+          }
+        } else {
+          chars += estimateValueChars(v, cache, false, 1)
+        }
+      }
+      return Math.ceil(chars / 3.5)
+    },
+  }
+}
+
+export function estimateTranscriptTokens(transcript: unknown): number {
+  return createTranscriptTokenEstimator().estimate(transcript)
+}
+
+interface MakeFetchInternalOptions {
+  /** Charge logical turn budget (`callCounter.count++`) inside `makeFetch` (true for single `provider()`, false for `providerPool()`). */
+  chargeLogicalTurn?: boolean
+  /** Retry transient 429/5xx HTTP errors inside `makeFetch` without incrementing `callCounter` (true for single `provider()`). */
+  retryTransientInFetch?: boolean
+}
+
+function isTransientHttpStatus(status: number): boolean {
+  return status === 429 || (status >= 500 && status <= 599)
 }
 
 function makeFetch(
@@ -229,7 +304,10 @@ function makeFetch(
   options: ProviderOptions,
   callCounter: { count: number; maxCalls: number },
   profileId?: string,
+  internal: MakeFetchInternalOptions = {},
 ) {
+  const chargeLogicalTurn = internal.chargeLogicalTurn ?? true
+  const retryTransientInFetch = internal.retryTransientInFetch ?? false
   const endpoint = settings.protocol === 'responses'
     ? settings.endpoint + '/responses'
     : settings.endpoint.replace(/\/v1$/, '') + '/v1/messages'
@@ -241,12 +319,21 @@ function makeFetch(
   const idleTimeoutMs = options.idleTimeoutMs ?? defaultIdleTimeoutMs
   const totalTimeoutMs = options.totalTimeoutMs ?? defaultTotalTimeoutMs
   const responseLimit = options.responseLimit ?? defaultStreamResponseLimit
+  const maxTransportRetries = options.maxTransportRetries !== undefined
+    ? Math.max(0, Math.floor(options.maxTransportRetries))
+    : defaultMaxTransportRetries
+  const retryBaseMs = options.transportRetryBaseMs !== undefined && Number.isFinite(options.transportRetryBaseMs)
+    ? Math.max(0, Math.floor(options.transportRetryBaseMs))
+    : defaultTransportRetryBaseMs
   const getSecrets = (): readonly NamedSecret[] => resolveSecretSource(options.secrets)
 
   const send: typeof fetch = async (input, init) => {
     options.beforeCall?.()
-    if (++callCounter.count > callCounter.maxCalls) {
-      throw new BudgetExceededError('The model call budget for this operation was reached.')
+    if (chargeLogicalTurn) {
+      if (callCounter.count + 1 > callCounter.maxCalls) {
+        throw new BudgetExceededError('The model call budget for this operation was reached.')
+      }
+      callCounter.count += 1
     }
     const request = new Request(input, init)
     const actual = new URL(request.url)
@@ -282,146 +369,273 @@ function makeFetch(
     if (outboundRaw !== raw && Buffer.byteLength(outboundRaw) > maxRequestBytes) {
       throw new Error('The model request exceeded Kovo Hunter’s size limit.')
     }
-    const totalSignal = AbortSignal.any([
-      request.signal,
-      AbortSignal.timeout(totalTimeoutMs),
-      ...(options.signal ? [options.signal] : []),
-    ])
-    const firstEventController = new AbortController()
-    const firstEventTimeoutError = () => new Error('The model provider timed out before returning the first event.')
-    let firstEventCleared = false
-    let firstEventTimer: ReturnType<typeof setTimeout> | undefined
-    const clearFirstEventTimer = () => {
-      if (firstEventCleared) return
-      firstEventCleared = true
-      if (firstEventTimer) {
-        clearTimeout(firstEventTimer)
-        firstEventTimer = undefined
-      }
-    }
-    if (Number.isFinite(firstEventTimeoutMs) && firstEventTimeoutMs > 0) {
-      firstEventTimer = setTimeout(() => {
-        if (!firstEventCleared) {
-          firstEventController.abort(firstEventTimeoutError())
-        }
-      }, firstEventTimeoutMs)
-      firstEventTimer.unref?.()
-    }
-    const onTotalAbort = () => clearFirstEventTimer()
-    totalSignal.addEventListener('abort', onTotalAbort, { once: true })
-    // Enforce firstEventTimeoutMs ONLY until the first chunk/event arrives (disarmed via
-    // clearFirstEventTimer), so healthy multi-chunk streams are never aborted mid-body.
-    const fetchSignal = AbortSignal.any([totalSignal, firstEventController.signal])
+
     const targetUrl = beta ? endpoint + '?beta=true' : endpoint
     const allowLocalModel = isLocalModelEnvEnabled()
 
-    try {
-      const response = options.fetch
-        ? await options.fetch(targetUrl, {
-            method: 'POST',
-            headers,
-            body: outboundRaw,
-            redirect: 'error',
-            signal: fetchSignal,
-          })
-        : await EgressGateway.egressFetchStream(
-            targetUrl,
-            {
+    let transportRetry = 0
+    for (;;) {
+      const totalSignal = AbortSignal.any([
+        request.signal,
+        AbortSignal.timeout(totalTimeoutMs),
+        ...(options.signal ? [options.signal] : []),
+      ])
+      const firstEventController = new AbortController()
+      const streamAbortController = new AbortController()
+      const firstEventTimeoutError = () => new Error('The model provider timed out before returning the first event.')
+      let firstEventCleared = false
+      let firstEventTimer: ReturnType<typeof setTimeout> | undefined
+      let onFirstEventTimeout: ((err: Error) => void) | undefined
+      let onTotalAbortHook: (() => void) | undefined
+      const clearFirstEventTimer = () => {
+        if (firstEventCleared) return
+        firstEventCleared = true
+        if (firstEventTimer) {
+          clearTimeout(firstEventTimer)
+          firstEventTimer = undefined
+        }
+      }
+      if (Number.isFinite(firstEventTimeoutMs) && firstEventTimeoutMs > 0) {
+        firstEventTimer = setTimeout(() => {
+          if (!firstEventCleared) {
+            const err = firstEventTimeoutError()
+            onFirstEventTimeout?.(err)
+            firstEventController.abort(err)
+          }
+        }, firstEventTimeoutMs)
+        firstEventTimer.unref?.()
+      }
+      const onTotalAbort = () => {
+        clearFirstEventTimer()
+        onTotalAbortHook?.()
+      }
+      totalSignal.addEventListener('abort', onTotalAbort, { once: true })
+      // Enforce firstEventTimeoutMs ONLY until the first chunk/event arrives (disarmed via
+      // clearFirstEventTimer), so healthy multi-chunk streams are never aborted mid-body.
+      const fetchSignal = AbortSignal.any([totalSignal, firstEventController.signal, streamAbortController.signal])
+      let handoffToStream = false
+
+      try {
+        const response = options.fetch
+          ? await options.fetch(targetUrl, {
               method: 'POST',
               headers,
               body: outboundRaw,
               redirect: 'error',
               signal: fetchSignal,
-            },
-            {
-              allowLocalLab: false,
-              allowHttp: allowLocalModel,
-              allowedLoopbackOnlyHosts: allowLocalModel ? ['127.0.0.1', 'localhost'] : undefined,
-              timeoutMs: totalTimeoutMs,
-              maxResponseBytes: Math.max(responseLimit * 2, 4 * 1024 * 1024),
-              ...(options.resolveHost ? { resolveHost: options.resolveHost } : {}),
-            },
-          )
+            })
+          : await EgressGateway.egressFetchStream(
+              targetUrl,
+              {
+                method: 'POST',
+                headers,
+                body: outboundRaw,
+                redirect: 'error',
+                signal: fetchSignal,
+              },
+              {
+                allowLocalLab: false,
+                allowHttp: allowLocalModel,
+                allowedLoopbackOnlyHosts: allowLocalModel ? ['127.0.0.1', 'localhost'] : undefined,
+                timeoutMs: totalTimeoutMs,
+                maxResponseBytes: Math.max(responseLimit * 2, 4 * 1024 * 1024),
+                ...(options.resolveHost ? { resolveHost: options.resolveHost } : {}),
+              },
+            )
 
-      const contentType = response.headers.get('content-type') ?? 'application/json'
-      const recordResponse = options.record && ((body: string) => {
-        const recordSecrets = getSecrets()
-        options.record!({
-          scenario,
-          endpoint: redactProviderText(new URL(endpoint).pathname, settings.key, recordSecrets),
-          request: sanitizeProviderValue(scrubbedPayload, settings.key, undefined, recordSecrets) as Record<string, unknown>,
-          status: response.status,
-          contentType: redactProviderText(contentType, settings.key, recordSecrets),
-          body,
-        })
-      })
-
-      if (!response.ok) {
-        clearFirstEventTimer()
-        const errText = await response.text().catch(() => '')
-        const effectiveStatus = response.status === 429 && isQuotaBody(errText) ? 402 : response.status
-        const message = effectiveStatus === 401 || effectiveStatus === 403
-          ? 'The provider rejected the API key.'
-          : effectiveStatus === 402
-            ? 'The provider quota or credit balance was exhausted.'
-            : effectiveStatus === 404
-              ? 'The provider endpoint or model was not found.'
-              : effectiveStatus === 429
-                ? 'The provider rate limit was reached.'
-                : `The model provider returned HTTP ${effectiveStatus}.`
-        const error = JSON.stringify({ error: { message } })
-        recordResponse?.(error)
-        return new Response(error, { status: effectiveStatus, headers: { 'content-type': 'application/json' } })
-      }
-
-      if (!response.body || !contentType.toLowerCase().includes('text/event-stream')) {
-        clearFirstEventTimer()
-        await response.body?.cancel()
-        throw new Error('The provider did not return a streaming response.')
-      }
-
-      let resetIdleTimer: () => void = () => undefined
-      const sanitized = sanitizeProviderStream(response.body, settings.key, settings.protocol, {
-        secrets: getSecrets,
-        responseLimit,
-        onFirstChunk: clearFirstEventTimer,
-        onActivity: () => {
-          clearFirstEventTimer()
-          resetIdleTimer()
-          options.onStreamActivity?.()
-        },
-      })
-      const text = await readStreamWithIdleTimeout(sanitized, idleTimeoutMs, fetchSignal, reset => {
-        resetIdleTimer = reset
-      })
-      clearFirstEventTimer()
-      recordResponse?.(text)
-
-      if (options.onUsage) {
-        const usage = extractUsageFromSse(text, settings.protocol)
-        if (usage.inputTokens > 0 || usage.outputTokens > 0) {
-          options.onUsage({
-            ...usage,
-            costUsd: estimateCostUsd(settings, usage.inputTokens, usage.outputTokens, usage.cachedInputTokens),
-            profileId,
+        const contentType = response.headers.get('content-type') ?? 'application/json'
+        const recordResponse = options.record && ((body: string) => {
+          const recordSecrets = getSecrets()
+          options.record!({
+            scenario,
+            endpoint: redactProviderText(new URL(endpoint).pathname, settings.key, recordSecrets),
+            request: sanitizeProviderValue(scrubbedPayload, settings.key, undefined, recordSecrets) as Record<string, unknown>,
+            status: response.status,
+            contentType: redactProviderText(contentType, settings.key, recordSecrets),
+            body,
           })
+        })
+
+        if (!response.ok) {
+          clearFirstEventTimer()
+          const errText = await response.text().catch(() => '')
+          const effectiveStatus = response.status === 429 && isQuotaBody(errText) ? 402 : response.status
+          if (retryTransientInFetch && isTransientHttpStatus(effectiveStatus) && transportRetry < maxTransportRetries) {
+            transportRetry += 1
+            const waitMs = Math.min(4_000, retryBaseMs * (2 ** (transportRetry - 1)))
+            if (waitMs > 0) {
+              await delay(waitMs, undefined, { signal: totalSignal })
+            }
+            continue
+          }
+          const message = effectiveStatus === 401 || effectiveStatus === 403
+            ? 'The provider rejected the API key.'
+            : effectiveStatus === 402
+              ? 'The provider quota or credit balance was exhausted.'
+              : effectiveStatus === 404
+                ? 'The provider endpoint or model was not found.'
+                : effectiveStatus === 429
+                  ? 'The provider rate limit was reached.'
+                  : `The model provider returned HTTP ${effectiveStatus}.`
+          const error = JSON.stringify({ error: { message } })
+          recordResponse?.(error)
+          return new Response(error, { status: effectiveStatus, headers: { 'content-type': 'application/json' } })
+        }
+
+        if (!response.body || !contentType.toLowerCase().includes('text/event-stream')) {
+          clearFirstEventTimer()
+          await response.body?.cancel()
+          throw new Error('The provider did not return a streaming response.')
+        }
+
+        // Move O4: True pass-through TransformStream over sanitizeProviderStream.
+        // Enforces per-chunk idleTimeoutMs + firstEventTimeoutMs while streaming chunks directly
+        // to the consumer before EOF, and flushes usage + transcript idempotently in finalize()
+        // on normal EOF, timeout, error, or mid-stream consumer cancel/abort.
+        const usageAccumulator = new SseUsageAccumulator()
+        const recordedParts: string[] = []
+        const streamDecoder = new TextDecoder()
+        let idleTimer: ReturnType<typeof setTimeout> | undefined
+        let finalized = false
+        let errored = false
+        let transformController: TransformStreamDefaultController<Uint8Array> | undefined
+
+        const clearIdleTimer = () => {
+          if (idleTimer) {
+            clearTimeout(idleTimer)
+            idleTimer = undefined
+          }
+        }
+
+        const finalize = () => {
+          if (finalized) return
+          finalized = true
+          clearFirstEventTimer()
+          clearIdleTimer()
+          totalSignal.removeEventListener('abort', onTotalAbort)
+          if (options.record) {
+            const tail = streamDecoder.decode()
+            if (tail) recordedParts.push(tail)
+            if (recordedParts.length > 0) {
+              try { recordResponse?.(recordedParts.join('')) } catch { /* recording must never throw */ }
+            }
+          }
+          if (options.onUsage) {
+            const usage = usageAccumulator.snapshot(settings.protocol)
+            if (usage.inputTokens > 0 || usage.outputTokens > 0) {
+              try {
+                options.onUsage({
+                  ...usage,
+                  costUsd: estimateCostUsd(settings, usage.inputTokens, usage.outputTokens, usage.cachedInputTokens),
+                  profileId,
+                })
+              } catch { /* usage observer must never throw */ }
+            }
+          }
+        }
+
+        const failStream = (err: Error) => {
+          if (errored) return
+          errored = true
+          try { transformController?.error(err) } catch { /* stream already closed/errored */ }
+          finalize()
+        }
+
+        const armIdleTimer = () => {
+          clearIdleTimer()
+          if (finalized || errored || !Number.isFinite(idleTimeoutMs) || idleTimeoutMs <= 0) return
+          idleTimer = setTimeout(() => {
+            idleTimer = undefined
+            const err = new Error('The model stream timed out while waiting for data.')
+            failStream(err)
+            if (!streamAbortController.signal.aborted) {
+              streamAbortController.abort(err)
+            }
+          }, idleTimeoutMs)
+          idleTimer.unref?.()
+        }
+
+        onFirstEventTimeout = err => failStream(err)
+        onTotalAbortHook = () => {
+          const reason = totalSignal.reason
+          const err = reason instanceof Error
+            ? reason
+            : new Error(typeof reason === 'string' && reason ? reason : 'The model stream was aborted.')
+          failStream(err)
+        }
+
+        const sanitized = sanitizeProviderStream(response.body, settings.key, settings.protocol, {
+          secrets: getSecrets,
+          responseLimit,
+          onFirstChunk: () => {
+            clearFirstEventTimer()
+            armIdleTimer()
+          },
+          onFrame: data => {
+            usageAccumulator.feedData(data)
+          },
+          onActivity: () => {
+            clearFirstEventTimer()
+            armIdleTimer()
+            options.onStreamActivity?.()
+          },
+        })
+
+        const monitorTransformer: Transformer<Uint8Array, Uint8Array> & { cancel?: () => void } = {
+          start(controller) {
+            transformController = controller
+            if (totalSignal.aborted) {
+              onTotalAbortHook?.()
+              return
+            }
+            if (firstEventController.signal.aborted) {
+              failStream(firstEventTimeoutError())
+              return
+            }
+            armIdleTimer()
+          },
+          transform(chunk, controller) {
+            armIdleTimer()
+            if (options.record) {
+              const decoded = streamDecoder.decode(chunk, { stream: true })
+              if (decoded) recordedParts.push(decoded)
+            }
+            controller.enqueue(chunk)
+          },
+          flush() {
+            finalize()
+          },
+          cancel() {
+            finalize()
+            if (!streamAbortController.signal.aborted) {
+              streamAbortController.abort(new Error('The model stream consumer canceled.'))
+            }
+          },
+        }
+        const monitor = new TransformStream<Uint8Array, Uint8Array>(monitorTransformer as Transformer<Uint8Array, Uint8Array>)
+
+        handoffToStream = true
+        void sanitized.pipeTo(monitor.writable)
+          .catch(() => undefined)
+          .finally(() => finalize())
+
+        return new Response(monitor.readable, {
+          status: response.status,
+          headers: { 'content-type': 'text/event-stream' },
+        })
+      } catch (error) {
+        if (firstEventController.signal.aborted && !totalSignal.aborted) {
+          throw firstEventController.signal.reason instanceof Error
+            ? firstEventController.signal.reason
+            : firstEventTimeoutError()
+        }
+        throw error
+      } finally {
+        if (!handoffToStream) {
+          clearFirstEventTimer()
+          totalSignal.removeEventListener('abort', onTotalAbort)
         }
       }
-
-      return new Response(text, {
-        status: response.status,
-        headers: { 'content-type': 'text/event-stream' },
-      })
-    } catch (error) {
-      if (firstEventController.signal.aborted && !totalSignal.aborted) {
-        throw firstEventController.signal.reason instanceof Error
-          ? firstEventController.signal.reason
-          : firstEventTimeoutError()
-      }
-      throw error
-    } finally {
-      clearFirstEventTimer()
-      totalSignal.removeEventListener('abort', onTotalAbort)
     }
   }
   return send
@@ -433,6 +647,7 @@ function buildSingleStreamImpl(
   options: ProviderOptions,
   callCounter: { count: number; maxCalls: number },
   profileId?: string,
+  fetchInternal: MakeFetchInternalOptions = {},
 ) {
   const api: Protocol = settings.protocol === 'responses' ? 'openai-responses' : 'anthropic-messages'
   const maxTokens = clampMaxTokens(settings.maxTokens)
@@ -458,7 +673,7 @@ function buildSingleStreamImpl(
       cacheWrite: 0,
     },
   }
-  const send = makeFetch(settings, scenario, options, callCounter, profileId)
+  const send = makeFetch(settings, scenario, options, callCounter, profileId, fetchInternal)
   const connection = scenario === 'connection'
   const chooseEvidenceTool = (transcript: { messages: { role: string }[] }) =>
     (scenario === 'worker-analysis' || scenario === 'response-analysis') && transcript.messages.at(-1)?.role === 'user'
@@ -526,7 +741,10 @@ export function provider(
     ? { signal: signalOrOptions, record }
     : (signalOrOptions ?? { record })
   const callCounter = { count: 0, maxCalls: options.maxCalls ?? defaultMaxCalls }
-  const { model, implementation } = buildSingleStreamImpl(settings, scenario, options, callCounter, settings.id)
+  const { model, implementation } = buildSingleStreamImpl(settings, scenario, options, callCounter, settings.id, {
+    chargeLogicalTurn: true,
+    retryTransientInFetch: true,
+  })
   const models = createModels({ identity: { attribution: null } })
   models.setProvider(createProvider<Api>({
     id: providerId,
@@ -621,18 +839,35 @@ export function providerPool(
       return base.length ? [...base, ...poolKeySecrets] : poolKeySecrets
     },
   }
-  const primaryBuilt = buildSingleStreamImpl(primary, scenario, poolOptions, callCounter, primary.id)
+  const primaryBuilt = buildSingleStreamImpl(primary, scenario, poolOptions, callCounter, primary.id, {
+    chargeLogicalTurn: false,
+    retryTransientInFetch: false,
+  })
+  const tokenEstimator = createTranscriptTokenEstimator()
+  const retryBaseMs = options.transportRetryBaseMs !== undefined && Number.isFinite(options.transportRetryBaseMs)
+    ? Math.max(0, Math.floor(options.transportRetryBaseMs))
+    : defaultTransportRetryBaseMs
 
   const wrapMethod = (method: 'stream' | 'streamSimple'): ProviderStreams['stream'] => {
     return (_selected, transcript, sOpts) => {
-      const estimatedTokens = Math.ceil(JSON.stringify(transcript).length / 3.5)
+      const estimatedTokens = tokenEstimator.estimate(transcript)
       const ordered = orderProfiles(sorted, estimatedTokens, options.roleAffinity)
 
       // Execute failover strictly inside the safe window (before yielding the first non-error event).
       const iter = (async function* () {
+        // Move O4: Charge logical turn budget ONCE per LLM turn (never per transient 429/5xx retry
+        // or failover hop), bounded separately by `maxTransportRetries`.
+        options.beforeCall?.()
+        if (callCounter.count + 1 > callCounter.maxCalls) {
+          throw new BudgetExceededError('The model call budget for this operation was reached.')
+        }
+        callCounter.count += 1
+
         let lastError: unknown
         let transientAttempts = 0
-        const maxTransientRetries = ordered.length === 1 ? 2 : 1
+        const maxTransportRetries = options.maxTransportRetries !== undefined
+          ? Math.max(0, Math.floor(options.maxTransportRetries))
+          : (ordered.length === 1 ? defaultMaxTransportRetries : 1)
 
         for (let idx = 0; idx < ordered.length; idx++) {
           const candidate = ordered[idx]
@@ -640,7 +875,10 @@ export function providerPool(
 
           let attempt = 0
           for (;;) {
-            const built = buildSingleStreamImpl(candidate, scenario, poolOptions, callCounter, candidate.id)
+            const built = buildSingleStreamImpl(candidate, scenario, poolOptions, callCounter, candidate.id, {
+              chargeLogicalTurn: false,
+              retryTransientInFetch: false,
+            })
             const candidateOpts = { ...sOpts, apiKey: candidate.key }
             const stream = built.implementation[method](built.model, transcript, candidateOpts)
             let emitted = false
@@ -656,7 +894,7 @@ export function providerPool(
                     options.onProfileFailure?.(candidate.id, msg, decision.hard)
                     lastError = new Error(msg)
                     failedOver = true
-                    if (!decision.hard && idx === ordered.length - 1 && transientAttempts < maxTransientRetries) {
+                    if (!decision.hard && idx === ordered.length - 1 && transientAttempts < maxTransportRetries) {
                       transientAttempts++
                       attempt++
                       retrySame = true
@@ -669,8 +907,8 @@ export function providerPool(
               }
 
               if (retrySame) {
-                const waitMs = Math.min(4_000, 350 * 2 ** (attempt - 1))
-                await delay(waitMs, undefined, { signal: options.signal })
+                const waitMs = Math.min(4_000, retryBaseMs * 2 ** (attempt - 1))
+                if (waitMs > 0) await delay(waitMs, undefined, { signal: options.signal })
                 continue
               }
               if (failedOver) break
@@ -682,11 +920,11 @@ export function providerPool(
                 if (decision.failover) {
                   options.onProfileFailure?.(candidate.id, msg, decision.hard)
                   lastError = new Error(msg)
-                  if (!decision.hard && idx === ordered.length - 1 && transientAttempts < maxTransientRetries) {
+                  if (!decision.hard && idx === ordered.length - 1 && transientAttempts < maxTransportRetries) {
                     transientAttempts++
                     attempt++
-                    const waitMs = Math.min(4_000, 350 * 2 ** (attempt - 1))
-                    await delay(waitMs, undefined, { signal: options.signal })
+                    const waitMs = Math.min(4_000, retryBaseMs * 2 ** (attempt - 1))
+                    if (waitMs > 0) await delay(waitMs, undefined, { signal: options.signal })
                     continue
                   }
                   break
@@ -701,11 +939,11 @@ export function providerPool(
               if (!decision.failover) throw error
               options.onProfileFailure?.(candidate.id, msg, decision.hard)
               lastError = error
-              if (!decision.hard && idx === ordered.length - 1 && transientAttempts < maxTransientRetries) {
+              if (!decision.hard && idx === ordered.length - 1 && transientAttempts < maxTransportRetries) {
                 transientAttempts++
                 attempt++
-                const waitMs = Math.min(4_000, 350 * 2 ** (attempt - 1))
-                await delay(waitMs, undefined, { signal: options.signal })
+                const waitMs = Math.min(4_000, retryBaseMs * 2 ** (attempt - 1))
+                if (waitMs > 0) await delay(waitMs, undefined, { signal: options.signal })
                 continue
               }
               break
@@ -770,6 +1008,7 @@ export async function testProvider(
   const { models, model } = provider(settings, 'connection', {
     record,
     maxCalls: 2,
+    maxTransportRetries: 0,
     firstEventTimeoutMs: 35_000,
     idleTimeoutMs: 35_000,
     totalTimeoutMs: 45_000,
