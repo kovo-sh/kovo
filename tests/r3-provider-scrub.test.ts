@@ -31,7 +31,7 @@ import {
   type ResolvedPersona,
 } from '../src/server/persona-vault.ts'
 import {
-  classifyFailoverError,
+  classifyProviderFailure,
   provider,
 } from '../src/server/provider.ts'
 import {
@@ -733,6 +733,6 @@ describe('R3-H-10: Payload integrity verification & local-mutation HTTP 400 diag
     assert.equal(res.stopReason, 'error')
     assert.match(res.errorMessage ?? '', /Local provider request mutation caused HTTP 400/i)
     assert.match(res.errorMessage ?? '', /input\[0\]\.role/)
-    assert.deepEqual(classifyFailoverError(res.errorMessage ?? ''), { failover: false, hard: false })
+    assert.equal(classifyProviderFailure(res.errorMessage ?? ''), null)
   })
 })

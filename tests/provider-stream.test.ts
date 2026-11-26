@@ -15,7 +15,7 @@ import {
   saveModelProfile,
 } from '../src/server/model-settings.ts'
 import {
-  classifyFailoverError,
+  classifyProviderFailure,
   estimateCostUsd,
   extractUsageFromSse,
   isQuotaBody,
@@ -265,11 +265,19 @@ test('classifies 429 quota exhaustion as 402 hard failure vs transient RPM rate 
   assert.equal(isQuotaBody('{"error":{"message":"Insufficient credits on account balance"}}'), true)
   assert.equal(isQuotaBody('{"error":{"message":"Requests per minute rate limit exceeded, retry after 2s"}}'), false)
 
-  assert.deepEqual(classifyFailoverError('The provider quota or credit balance was exhausted.'), { failover: true, hard: true })
-  assert.deepEqual(classifyFailoverError('The provider rejected the API key.'), { failover: true, hard: true })
-  assert.deepEqual(classifyFailoverError('The provider rate limit was reached.'), { failover: true, hard: false })
-  assert.deepEqual(classifyFailoverError('The model provider returned HTTP 503.'), { failover: true, hard: false })
-  assert.deepEqual(classifyFailoverError('The operation was aborted by user'), { failover: false, hard: false })
+  const quotaErr = classifyProviderFailure('The provider quota or credit balance was exhausted.')
+  assert.equal(quotaErr?.kind, 'quota')
+  assert.equal(quotaErr?.hard, true)
+  const authErr = classifyProviderFailure('The provider rejected the API key.')
+  assert.equal(authErr?.kind, 'auth')
+  assert.equal(authErr?.hard, true)
+  const rateLimitErr = classifyProviderFailure('The provider rate limit was reached.')
+  assert.equal(rateLimitErr?.kind, 'rate_limited')
+  assert.equal(rateLimitErr?.hard, false)
+  const serverErr = classifyProviderFailure('The model provider returned HTTP 503.')
+  assert.equal(serverErr?.kind, 'server')
+  assert.equal(serverErr?.hard, false)
+  assert.equal(classifyProviderFailure('The operation was aborted by user'), null)
 })
 
 test('multi-profile LLM failover pool handles 429->402 quota circuit breaking, context filtering, and safe-window failover', async t => {

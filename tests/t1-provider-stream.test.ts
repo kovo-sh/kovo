@@ -14,7 +14,7 @@ import { createServer } from 'node:http'
 import { test } from 'node:test'
 import { obj, str } from '@earendil-works/pi-schema'
 import {
-  classifyFailoverError,
+  classifyProviderFailure,
   provider,
 } from '../src/server/provider.ts'
 import type { UsageEvent } from '../src/server/provider.ts'
@@ -499,16 +499,15 @@ test('H-26: Active stream that stalls after chunk 1 is still aborted by idleTime
   assert.match(result.errorMessage ?? '', /timed out while waiting for data/i)
   assert.ok(elapsedMs >= 150 && elapsedMs < 1_500, `Expected idle abort near 180ms, took ${elapsedMs}ms`)
 
-  assert.deepEqual(
-    classifyFailoverError('The model provider timed out before returning the first event.'),
-    { failover: true, hard: false },
-  )
-  assert.deepEqual(
-    classifyFailoverError('The operation was aborted due to timeout'),
-    { failover: true, hard: false },
-  )
-  assert.deepEqual(
-    classifyFailoverError('The operation was aborted by user'),
-    { failover: false, hard: false },
-  )
+  const firstEventTimeout = classifyProviderFailure('The model provider timed out before returning the first event.')
+  assert.equal(firstEventTimeout?.kind, 'stall')
+  assert.equal(firstEventTimeout?.hard, false)
+  assert.equal(firstEventTimeout?.retryable, true)
+
+  const abortTimeout = classifyProviderFailure('The operation was aborted due to timeout')
+  assert.equal(abortTimeout?.kind, 'stall')
+  assert.equal(abortTimeout?.hard, false)
+  assert.equal(abortTimeout?.retryable, true)
+
+  assert.equal(classifyProviderFailure('The operation was aborted by user'), null)
 })

@@ -1807,14 +1807,6 @@ export function provider(
 
 let rrCounter = 0
 
-export function classifyFailoverError(message: string): { failover: boolean; hard: boolean } {
-  const classified = classifyProviderFailure(message)
-  if (!classified || classified.kind === 'context_overflow') {
-    return { failover: false, hard: false }
-  }
-  return { failover: true, hard: classified.hard }
-}
-
 function roleRank(profile: ResolvedModelProfile, preferredRole?: RoleAffinity): number {
   if (!preferredRole || preferredRole === 'any') return 0
   const aff = profile.roleAffinity ?? 'any'
