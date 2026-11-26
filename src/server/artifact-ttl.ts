@@ -20,20 +20,50 @@ export interface ArtifactTtlPolicy {
   tempFileTtlMs?: number
   /** Always preserve the newest N exchanges per run. Default 0. */
   keepLatestExchanges?: number
-  /** When true, skip evidence IDs referenced by confirmed findings or replay proof artifacts. */
+  /**
+   * When true (default), preserve EVERY exchange (row, FTS entry, blob) and evidence artifact
+   * referenced by findings, replay specs / proof receipts, retest runs, facts, or surfaced canaries.
+   * Pass `false` explicitly only for hard-wipe / ZDR sweeps.
+   */
   preserveConfirmedEvidence?: boolean
   /** Scope purge to a single run. */
   runId?: string
   /** Scope purge to a single tenant (projects/runs belonging to this tenant). */
   tenantId?: string
-  /** Skip runs whose status is `'running'` so live scans keep evidence. Default true. */
+  /**
+   * Skip all non-terminal runs (only prune strictly terminal runs: `complete`, `stopped`, `failed`)
+   * and any run listed in `activeRunIds`. Default true.
+   */
   skipActiveRuns?: boolean
+  /** Optional set of in-memory active run IDs (e.g. from `AppRuntime`) that must be skipped. */
+  activeRunIds?: ReadonlySet<string>
   /** Extra temporary directories to scan in addition to `<dataDir>/tmp`. */
   tempDirs?: string[]
   /** Actor recorded in the append-only tenant audit log. Default `'system'`. */
   actor?: string
   /** Injectable clock for deterministic tests. */
   now?: number
+}
+
+/**
+ * Strictly terminal run statuses eligible for TTL retention pruning (R3-H-16).
+ * Matches `RunStatus` terminal values in `src/domain.ts` (`'complete' | 'stopped' | 'failed'`)
+ * plus legacy spelling aliases (`'completed'`, `'cancelled'`, `'canceled'`).
+ * Non-terminal runs (`'running'`, `'waiting'`, `'paused'`, `'budget_paused'`, `'queued'`, etc.)
+ * are NEVER eligible when `skipActiveRuns` is enabled (the default).
+ */
+const TERMINAL_RUN_STATUSES: ReadonlySet<string> = new Set([
+  'complete',
+  'completed',
+  'stopped',
+  'failed',
+  'cancelled',
+  'canceled',
+])
+
+export function isTerminalRunStatus(status: string | null | undefined): boolean {
+  if (typeof status !== 'string') return false
+  return TERMINAL_RUN_STATUSES.has(status.trim().toLowerCase())
 }
 
 export interface ArtifactTtlPurgeResult {
@@ -87,40 +117,147 @@ function candidateArtifactPaths(directory: string, runId: string, evidenceId: st
   ]
 }
 
-function collectProtectedEvidenceIds(storage: Store, runId: string): Set<string> {
-  const protectedIds = new Set<string>()
-  let findingRows: Array<{ finding: string }> = []
-  try {
-    findingRows = storage.client.prepare(
-      "SELECT finding FROM findings WHERE run_id = ? AND status = 'confirmed' AND verification_class = 'runtime_confirmed'",
-    ).all(runId) as Array<{ finding: string }>
-  } catch {
-    findingRows = storage.client.prepare(
-      'SELECT finding FROM findings WHERE run_id = ?',
-    ).all(runId) as Array<{ finding: string }>
+function addNonEmptyStrings(out: Set<string>, values: unknown): void {
+  if (!Array.isArray(values)) return
+  for (const item of values) {
+    if (typeof item === 'string') {
+      const trimmed = item.trim()
+      if (trimmed.length > 0) out.add(trimmed)
+    }
   }
-  for (const row of findingRows) {
+}
+
+const EVIDENCE_ID_KEY_RE = /^(?:evidence_?ids?|artifact_?id|proof_?artifact_?id)$/i
+
+function collectEvidenceIdsFromJson(value: unknown, out: Set<string>, depth = 0): void {
+  if (depth > 10 || value == null || typeof value !== 'object') return
+  if (Array.isArray(value)) {
+    for (const item of value) collectEvidenceIdsFromJson(item, out, depth + 1)
+    return
+  }
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    if (entry == null) continue
+    if (EVIDENCE_ID_KEY_RE.test(key)) {
+      if (typeof entry === 'string' && entry.trim().length > 0) {
+        out.add(entry.trim())
+        continue
+      }
+      if (Array.isArray(entry)) {
+        addNonEmptyStrings(out, entry)
+        continue
+      }
+    }
+    if (typeof entry === 'object') {
+      collectEvidenceIdsFromJson(entry, out, depth + 1)
+    }
+  }
+}
+
+function parseJsonAndCollectEvidenceIds(raw: unknown, out: Set<string>, topLevelArray = false): void {
+  if (raw == null) return
+  let parsed: unknown = raw
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim()
+    if (!trimmed) return
     try {
-      const parsed = JSON.parse(row.finding) as { status?: string; evidenceIds?: unknown }
-      if (parsed.status === 'confirmed' && Array.isArray(parsed.evidenceIds)) {
-        for (const id of parsed.evidenceIds) {
-          if (typeof id === 'string') protectedIds.add(id)
+      parsed = JSON.parse(trimmed)
+    } catch {
+      return
+    }
+  }
+  if (topLevelArray && Array.isArray(parsed)) {
+    addNonEmptyStrings(out, parsed)
+    return
+  }
+  collectEvidenceIdsFromJson(parsed, out)
+}
+
+function collectProtectedEvidenceIds(
+  storage: Store,
+  runId: string,
+  protectedExchangeIds?: ReadonlySet<string>,
+): Set<string> {
+  const protectedIds = new Set<string>()
+
+  // 1. Findings (confirmed, static_verified, or any finding row citing evidenceIds).
+  try {
+    const findingRows = storage.client.prepare(
+      'SELECT finding FROM findings WHERE run_id = ?',
+    ).all(runId) as Array<{ finding: string | null }>
+    for (const row of findingRows) {
+      parseJsonAndCollectEvidenceIds(row.finding, protectedIds)
+    }
+  } catch {
+    // Table unavailable on minimal schema.
+  }
+
+  // 2. Replay specs (proof_artifact_id + nested artifact/evidence refs inside proof_receipt).
+  try {
+    const specRows = storage.client.prepare(
+      'SELECT proof_artifact_id, proof_receipt FROM replay_specs WHERE run_id = ?',
+    ).all(runId) as Array<{ proof_artifact_id: string | null; proof_receipt: string | null }>
+    for (const row of specRows) {
+      if (typeof row.proof_artifact_id === 'string' && row.proof_artifact_id.trim().length > 0) {
+        protectedIds.add(row.proof_artifact_id.trim())
+      }
+      parseJsonAndCollectEvidenceIds(row.proof_receipt, protectedIds)
+    }
+  } catch {
+    // Fallback for legacy schemas without proof_receipt column.
+    try {
+      const specRows = storage.client.prepare(
+        'SELECT proof_artifact_id FROM replay_specs WHERE run_id = ? AND proof_artifact_id IS NOT NULL',
+      ).all(runId) as Array<{ proof_artifact_id: string }>
+      for (const row of specRows) {
+        if (row.proof_artifact_id) protectedIds.add(row.proof_artifact_id)
+      }
+    } catch {
+      // Legacy schemas without proof_artifact_id.
+    }
+  }
+
+  // 3. Retest runs (cited evidence_ids, e.g. composite_patch_retest structured artifacts).
+  try {
+    const retestRows = storage.client.prepare(
+      'SELECT evidence_ids FROM retest_runs WHERE run_id = ?',
+    ).all(runId) as Array<{ evidence_ids: string | null }>
+    for (const row of retestRows) {
+      parseJsonAndCollectEvidenceIds(row.evidence_ids, protectedIds, true)
+    }
+  } catch {
+    // Table unavailable on minimal schema.
+  }
+
+  // 4. Facts (evidence_ids column + nested evidence/artifact refs in data JSON).
+  try {
+    const factRows = storage.client.prepare(
+      'SELECT evidence_ids, data FROM facts WHERE run_id = ?',
+    ).all(runId) as Array<{ evidence_ids: string | null; data: string | null }>
+    for (const row of factRows) {
+      parseJsonAndCollectEvidenceIds(row.evidence_ids, protectedIds, true)
+      parseJsonAndCollectEvidenceIds(row.data, protectedIds)
+    }
+  } catch {
+    // Table unavailable on minimal schema.
+  }
+
+  // 5. Blobs backing any protected broker exchange in this run.
+  const citedExchanges = protectedExchangeIds ?? storage.findingsRepo.listProtectedExchangeIdsForRun(runId)
+  if (citedExchanges.size > 0) {
+    try {
+      const exRows = storage.client.prepare(
+        'SELECT id, body_artifact_id FROM broker_exchanges WHERE run_id = ? AND body_artifact_id IS NOT NULL',
+      ).all(runId) as Array<{ id: string; body_artifact_id: string | null }>
+      for (const row of exRows) {
+        if (citedExchanges.has(row.id) && row.body_artifact_id) {
+          protectedIds.add(row.body_artifact_id)
         }
       }
     } catch {
-      // Ignore malformed legacy rows.
+      // Table unavailable on minimal schema.
     }
   }
-  try {
-    const specRows = storage.client.prepare(
-      'SELECT proof_artifact_id FROM replay_specs WHERE run_id = ? AND proof_artifact_id IS NOT NULL',
-    ).all(runId) as Array<{ proof_artifact_id: string }>
-    for (const row of specRows) {
-      if (row.proof_artifact_id) protectedIds.add(row.proof_artifact_id)
-    }
-  } catch {
-    // Legacy schemas without proof_artifact_id.
-  }
+
   return protectedIds
 }
 
@@ -210,7 +347,8 @@ export function purgeExpiredArtifacts(
 ): ArtifactTtlPurgeResult {
   storage.flushNow()
   const now = policy.now ?? Date.now()
-  const skipActive = policy.skipActiveRuns ?? true
+  const skipNonTerminal = policy.skipActiveRuns ?? true
+  const preserveEvidence = policy.preserveConfirmedEvidence ?? true
   const keepLatest = Math.max(0, Math.trunc(policy.keepLatestExchanges ?? 0))
 
   const result: ArtifactTtlPurgeResult = {
@@ -228,7 +366,13 @@ export function purgeExpiredArtifacts(
     symlinksSkipped: 0,
   }
 
-  // 1. Resolve candidate runs respecting optional runId, tenantId, and skipActiveRuns.
+  const isRunEligible = (row: { id: string; status: string }): boolean => {
+    if (!skipNonTerminal) return true
+    if (policy.activeRunIds?.has(row.id)) return false
+    return isTerminalRunStatus(row.status)
+  }
+
+  // 1. Resolve candidate runs respecting optional runId, tenantId, and strict terminal-run safety.
   let candidateRunIds: string[] = []
   if (policy.runId) {
     if (policy.tenantId !== undefined) {
@@ -237,32 +381,46 @@ export function purgeExpiredArtifacts(
     const row = storage.client.prepare('SELECT id, status FROM runs WHERE id = ?').get(policy.runId) as
       | { id: string; status: string }
       | undefined
-    if (row && (!skipActive || row.status !== 'running')) {
+    if (row && isRunEligible(row)) {
       candidateRunIds = [row.id]
     }
   } else if (policy.tenantId !== undefined) {
     const runs = storage.listRunsForTenant(policy.tenantId)
     candidateRunIds = runs
-      .filter(r => !skipActive || r.status !== 'running')
+      .filter(r => isRunEligible(r))
       .map(r => r.id)
   } else {
     const rows = storage.client.prepare('SELECT id, status FROM runs').all() as Array<{ id: string; status: string }>
     candidateRunIds = rows
-      .filter(r => !skipActive || r.status !== 'running')
+      .filter(r => isRunEligible(r))
       .map(r => r.id)
   }
 
   result.runsScanned = candidateRunIds.length
 
-  // 2. Purge expired broker exchanges (+ FTS + unreferenced blobs).
+  const protectedExchangesByRun = new Map<string, Set<string>>()
+  const getProtectedExchanges = (runId: string): Set<string> => {
+    let existing = protectedExchangesByRun.get(runId)
+    if (!existing) {
+      existing = storage.findingsRepo.listProtectedExchangeIdsForRun(runId)
+      protectedExchangesByRun.set(runId, existing)
+    }
+    return existing
+  }
+
+  // 2. Purge expired broker exchanges (+ FTS + unreferenced blobs), protecting every cited exchange.
   if (policy.exchangeTtlMs !== undefined && policy.exchangeTtlMs > 0) {
     for (const runId of candidateRunIds) {
+      const protectedExchangeIds = preserveEvidence ? getProtectedExchanges(runId) : undefined
       const pruned = storage.pruneExchanges({
         runId,
         olderThanMs: policy.exchangeTtlMs,
         keepLatest,
         now,
         emitEvent: false,
+        preserveProtectedExchanges: preserveEvidence,
+        preserveConfirmedEvidence: preserveEvidence,
+        ...(protectedExchangeIds ? { protectedExchangeIds } : {}),
       })
       result.exchangesDeleted += pruned.exchanges
       result.ftsRowsDeleted += pruned.ftsRows
@@ -280,8 +438,8 @@ export function purgeExpiredArtifacts(
     const deleteEvidence = storage.client.prepare('DELETE FROM evidence WHERE id = ?')
 
     for (const runId of candidateRunIds) {
-      const protectedIds = policy.preserveConfirmedEvidence
-        ? collectProtectedEvidenceIds(storage, runId)
+      const protectedIds = preserveEvidence
+        ? collectProtectedEvidenceIds(storage, runId, getProtectedExchanges(runId))
         : new Set<string>()
       const agedRows = selectAged.all(runId, cutoff) as Array<{ id: string }>
       const eligibleIds = agedRows.map(row => row.id).filter(id => !protectedIds.has(id))

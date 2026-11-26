@@ -13,7 +13,7 @@
  */
 import { lstatSync, readdirSync, rmdirSync, unlinkSync } from 'node:fs'
 import { join, resolve } from 'node:path'
-import { purgeExpiredArtifacts } from './artifact-ttl.ts'
+import { isTerminalRunStatus, purgeExpiredArtifacts } from './artifact-ttl.ts'
 import type { ArtifactTtlPolicy, ArtifactTtlPurgeResult } from './artifact-ttl.ts'
 import { isSafePathSegment, tenantBlobSegment } from './store-session.ts'
 import type { Store } from './store.ts'
@@ -23,14 +23,74 @@ export const DEFAULT_MAINTENANCE_INTERVAL_MS = 30 * 60_000
 export const DEFAULT_OPERATIONS_RETENTION_MS = 7 * 24 * 60 * 60_000
 export const DEFAULT_ORPHAN_GRACE_MS = 30 * 60_000
 export const DEFAULT_INCREMENTAL_VACUUM_PAGES = 200
+const DAY_MS = 24 * 60 * 60_000
+
+/**
+ * Safe default TTL policy (R3-H-16): automatic exchange, artifact, and temp-file TTL pruning is
+ * OFF (`0`) unless the operator explicitly configures retention via `StorageMaintenanceOptions.ttlPolicy`
+ * or environment variables (`KOVO_EXCHANGE_TTL_DAYS` / `KOVO_ARTIFACT_TTL_DAYS`).
+ * When retention IS explicitly enabled, cited exchanges/evidence and non-terminal runs stay protected.
+ */
 export const DEFAULT_MAINTENANCE_TTL_POLICY: ArtifactTtlPolicy = {
-  exchangeTtlMs: 14 * 24 * 60 * 60_000,
-  artifactTtlMs: 14 * 24 * 60 * 60_000,
-  tempFileTtlMs: 60 * 60_000,
+  exchangeTtlMs: 0,
+  artifactTtlMs: 0,
+  tempFileTtlMs: 0,
   keepLatestExchanges: 0,
   preserveConfirmedEvidence: true,
   skipActiveRuns: true,
   actor: 'storage-maintenance',
+}
+
+function parsePositiveDaysEnv(raw: string | undefined): number {
+  if (typeof raw !== 'string') return 0
+  const trimmed = raw.trim()
+  if (!trimmed) return 0
+  const days = Number(trimmed)
+  if (!Number.isFinite(days) || days <= 0) return 0
+  return Math.round(days * DAY_MS)
+}
+
+function hasPositiveTtl(policy: ArtifactTtlPolicy): boolean {
+  return (policy.exchangeTtlMs ?? 0) > 0
+    || (policy.artifactTtlMs ?? 0) > 0
+    || (policy.tempFileTtlMs ?? 0) > 0
+}
+
+/**
+ * Resolve the effective `ArtifactTtlPolicy` for `StorageMaintenanceController` and `AppRuntime`.
+ *
+ * R3-H-16 safety contract:
+ *  - Explicit `false` or `null` always disables TTL pruning.
+ *  - Explicit `ArtifactTtlPolicy` object is merged onto `DEFAULT_MAINTENANCE_TTL_POLICY` (where
+ *    every TTL defaults to `0` and `preserveConfirmedEvidence` / `skipActiveRuns` default to `true`).
+ *    If no positive TTL is configured, returns `false`.
+ *  - When omitted (`undefined`), checks `KOVO_EXCHANGE_TTL_DAYS` and `KOVO_ARTIFACT_TTL_DAYS`.
+ *    If neither is set to a positive number, returns `false` (TTL pruning OFF by default).
+ */
+export function resolveStorageMaintenancePolicy(
+  ttlPolicy?: ArtifactTtlPolicy | false | null,
+  env: NodeJS.ProcessEnv = process.env,
+): ArtifactTtlPolicy | false {
+  if (ttlPolicy === false || ttlPolicy === null) {
+    return false
+  }
+  if (ttlPolicy !== undefined) {
+    const merged: ArtifactTtlPolicy = {
+      ...DEFAULT_MAINTENANCE_TTL_POLICY,
+      ...ttlPolicy,
+    }
+    return hasPositiveTtl(merged) ? merged : false
+  }
+  const exchangeTtlMs = parsePositiveDaysEnv(env.KOVO_EXCHANGE_TTL_DAYS)
+  const artifactTtlMs = parsePositiveDaysEnv(env.KOVO_ARTIFACT_TTL_DAYS)
+  if (exchangeTtlMs <= 0 && artifactTtlMs <= 0) {
+    return false
+  }
+  return {
+    ...DEFAULT_MAINTENANCE_TTL_POLICY,
+    exchangeTtlMs,
+    artifactTtlMs,
+  }
 }
 
 export interface StorageMaintenanceOptions {
@@ -43,8 +103,14 @@ export interface StorageMaintenanceOptions {
   walCheckpointIntervalMs?: number
   /** Periodic full maintenance sweep interval in ms (`<= 0` disables timer). Default 30m. */
   maintenanceIntervalMs?: number
-  /** TTL policy passed to `purgeExpiredArtifacts`, or `false` to disable automatic TTL purge. */
-  ttlPolicy?: ArtifactTtlPolicy | false
+  /**
+   * Explicit TTL policy passed to `purgeExpiredArtifacts`, or `false`/`null` to disable.
+   * When omitted, TTL pruning stays OFF unless `KOVO_EXCHANGE_TTL_DAYS` or `KOVO_ARTIFACT_TTL_DAYS`
+   * is explicitly configured in `env` (default `process.env`).
+   */
+  ttlPolicy?: ArtifactTtlPolicy | false | null
+  /** Optional environment map used when resolving `KOVO_*_TTL_DAYS` (defaults to `process.env`). */
+  env?: NodeJS.ProcessEnv
   /** Operations table idempotency retention window in ms (`<= 0` disables). Default 7d. */
   operationsRetentionMs?: number
   /** Grace window protecting recently created/in-flight files from orphan sweeping. Default 30m. */
@@ -272,9 +338,7 @@ export class StorageMaintenanceController {
     this.getActiveRunIdsFn = options.getActiveRunIds
     this.walCheckpointIntervalMs = options.walCheckpointIntervalMs ?? DEFAULT_WAL_CHECKPOINT_INTERVAL_MS
     this.maintenanceIntervalMs = options.maintenanceIntervalMs ?? DEFAULT_MAINTENANCE_INTERVAL_MS
-    this.ttlPolicy = options.ttlPolicy === false
-      ? false
-      : { ...DEFAULT_MAINTENANCE_TTL_POLICY, ...(options.ttlPolicy ?? {}) }
+    this.ttlPolicy = resolveStorageMaintenancePolicy(options.ttlPolicy, options.env)
     this.operationsRetentionMs = options.operationsRetentionMs ?? DEFAULT_OPERATIONS_RETENTION_MS
     this.orphanGraceMs = Math.max(0, options.orphanGraceMs ?? DEFAULT_ORPHAN_GRACE_MS)
     this.incrementalVacuumPages = Math.max(0, Math.trunc(options.incrementalVacuumPages ?? DEFAULT_INCREMENTAL_VACUUM_PAGES))
@@ -329,6 +393,11 @@ export class StorageMaintenanceController {
 
   lastReport(): StorageMaintenanceReport | null {
     return this.latestReport
+  }
+
+  /** Return a defensive copy of the resolved TTL policy, or `false` when automatic TTL pruning is disabled. */
+  effectiveTtlPolicy(): ArtifactTtlPolicy | false {
+    return this.ttlPolicy === false ? false : { ...this.ttlPolicy }
   }
 
   /** Resolve active runs from both in-memory `AppRuntime` and SQLite `runs.status = 'running'`. */
@@ -430,9 +499,14 @@ export class StorageMaintenanceController {
     }
 
     // Snapshot authoritative DB references before inspecting the filesystem.
-    const liveRunIds = new Set<string>(
-      (this.store.client.prepare('SELECT id FROM runs').all() as Array<{ id: string }>).map(r => r.id),
-    )
+    const allRunRows = this.store.client.prepare('SELECT id, status FROM runs').all() as Array<{ id: string; status: string }>
+    const liveRunIds = new Set<string>(allRunRows.map(r => r.id))
+    const protectedRunIds = new Set<string>(activeRuns)
+    for (const row of allRunRows) {
+      if (row.id && !isTerminalRunStatus(row.status)) {
+        protectedRunIds.add(row.id)
+      }
+    }
     const liveTenantSegments = new Set<string>(['default'])
     try {
       for (const row of this.store.client.prepare('SELECT DISTINCT tenant_id AS t FROM projects').all() as Array<{ t: string }>) {
@@ -454,11 +528,11 @@ export class StorageMaintenanceController {
     } catch { /* legacy schema without board_members */ }
 
     const activeSessionIds = new Set<string>()
-    if (activeRuns.size > 0) {
-      const placeholders = [...activeRuns].map(() => '?').join(', ')
+    if (protectedRunIds.size > 0) {
+      const placeholders = [...protectedRunIds].map(() => '?').join(', ')
       for (const row of this.store.client.prepare(
         `SELECT DISTINCT session_id AS sid FROM assignments WHERE run_id IN (${placeholders})`,
-      ).all(...activeRuns) as Array<{ sid: string | null }>) {
+      ).all(...protectedRunIds) as Array<{ sid: string | null }>) {
         if (row.sid) activeSessionIds.add(row.sid)
       }
     }
@@ -489,15 +563,37 @@ export class StorageMaintenanceController {
         }
       } catch { /* optional table/column */ }
     }
+    for (const query of [
+      'SELECT finding AS raw FROM findings',
+      'SELECT evidence_ids AS raw FROM retest_runs',
+      'SELECT evidence_ids AS raw FROM facts',
+    ] as const) {
+      try {
+        for (const row of this.store.client.prepare(query).all() as Array<{ raw: string | null }>) {
+          if (!row.raw) continue
+          try {
+            const parsed = JSON.parse(row.raw) as unknown
+            const list = Array.isArray(parsed)
+              ? parsed
+              : (parsed && typeof parsed === 'object' && Array.isArray((parsed as { evidenceIds?: unknown }).evidenceIds))
+                ? (parsed as { evidenceIds: unknown[] }).evidenceIds
+                : []
+            for (const id of list) {
+              if (typeof id === 'string' && id.trim().length > 0) referencedArtifacts.add(id.trim())
+            }
+          } catch { /* ignore malformed legacy JSON */ }
+        }
+      } catch { /* optional table/column */ }
+    }
 
     // 1. Sweep stale orphaned files & dirs under <dataDir>/scratch (and any extra scratchDirs).
     const scratchRoots = new Set<string>([join(this.dataDir, 'scratch'), ...this.scratchDirs.map(dir => resolve(dir))])
-    const scratchProtected = new Set<string>([...activeRuns, ...activeSessionIds])
+    const scratchProtected = new Set<string>([...protectedRunIds, ...activeSessionIds])
     for (const root of scratchRoots) {
       const swept = sweepStaleTree(root, cutoffMs, {
         removeRootIfEmpty: false,
         protectedNames: scratchProtected,
-        activeRunIds: activeRuns,
+        activeRunIds: protectedRunIds,
       })
       report.scratchFilesDeleted += swept.filesDeleted
       report.scratchDirsRemoved += swept.dirsRemoved
@@ -510,7 +606,7 @@ export class StorageMaintenanceController {
     this.sweepArtifactsDir(
       join(this.dataDir, 'artifacts'),
       cutoffMs,
-      { activeRuns, liveRunIds, liveTenantSegments, referencedArtifacts, referencedBlobs },
+      { activeRuns: protectedRunIds, liveRunIds, liveTenantSegments, referencedArtifacts, referencedBlobs },
       report,
     )
 
@@ -518,7 +614,7 @@ export class StorageMaintenanceController {
     this.sweepAgentSessionsDir(
       join(this.dataDir, 'agent-sessions'),
       cutoffMs,
-      { activeRuns, liveRunIds, liveSessionIds },
+      { activeRuns: protectedRunIds, liveRunIds, liveSessionIds },
       report,
     )
 
@@ -798,7 +894,11 @@ export class StorageMaintenanceController {
     try {
       if (this.ttlPolicy !== false) {
         try {
-          ttl = purgeExpiredArtifacts(this.store, { ...this.ttlPolicy, now })
+          ttl = purgeExpiredArtifacts(this.store, {
+            ...this.ttlPolicy,
+            activeRunIds: this.activeRunIds(),
+            now,
+          })
         } catch (error) {
           errors.push(`ttl: ${error instanceof Error ? error.message : String(error)}`)
           this.onError?.('ttl', error)

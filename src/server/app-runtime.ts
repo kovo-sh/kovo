@@ -25,7 +25,7 @@ import { cancelOobDrainForRun } from './oob-drain.ts'
 import { OobRelay } from './oob-relay.ts'
 import { assertValidRunId, InvalidRunIdError, RunContext } from './run-context.ts'
 import type { RunContextOptions, RunDrainReport } from './run-context.ts'
-import { StorageMaintenanceController } from './storage-maintenance.ts'
+import { resolveStorageMaintenancePolicy, StorageMaintenanceController } from './storage-maintenance.ts'
 import type { StorageMaintenanceOptions } from './storage-maintenance.ts'
 import { dataDirectory, Store, store as legacyStore } from './store.ts'
 
@@ -188,12 +188,7 @@ export class AppRuntime {
   get maintenance(): StorageMaintenanceController {
     this.assertNotDisposed()
     if (!this.maintenanceInstance) {
-      this.maintenanceInstance = new StorageMaintenanceController({
-        ...this.maintenanceOptions,
-        store: this.store,
-        dataDir: this.dataDir,
-        getActiveRunIds: () => this.activeRunIds(),
-      })
+      this.maintenanceInstance = this.createMaintenanceController(this.store)
     }
     return this.maintenanceInstance
   }
@@ -219,15 +214,20 @@ export class AppRuntime {
     return true
   }
 
+  private createMaintenanceController(storeInstance: Store): StorageMaintenanceController {
+    return new StorageMaintenanceController({
+      ...this.maintenanceOptions,
+      ttlPolicy: resolveStorageMaintenancePolicy(this.maintenanceOptions.ttlPolicy, this.maintenanceOptions.env),
+      store: storeInstance,
+      dataDir: this.dataDir,
+      getActiveRunIds: () => this.activeRunIds(),
+    })
+  }
+
   private ensureMaintenanceStarted(): void {
     if (!this.maintenanceEnabled || this.disposed || !this.storeInstance) return
     if (!this.maintenanceInstance) {
-      this.maintenanceInstance = new StorageMaintenanceController({
-        ...this.maintenanceOptions,
-        store: this.storeInstance,
-        dataDir: this.dataDir,
-        getActiveRunIds: () => this.activeRunIds(),
-      })
+      this.maintenanceInstance = this.createMaintenanceController(this.storeInstance)
     }
     this.maintenanceInstance.start()
   }
