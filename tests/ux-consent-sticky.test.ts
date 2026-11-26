@@ -186,7 +186,7 @@ function build27Candidates() {
   prefixes.forEach((sub, idx) => {
     out.push({
       id: `cand-1p-${idx + 1}`,
-      origin: `https://${sub}.acme-saas.example`,
+      origin: idx === 0 ? 'https://acme-saas.example' : `https://${sub}.acme-saas.example`,
       source: idx < 3 ? 'Project seed' : 'phase0_subdomain_discovery',
       thirdParty: false,
     })
@@ -348,7 +348,7 @@ describe('Scope Review (consent.tsx) — Option 1 Sticky Action Bar & Compact He
       })
       await page.getByRole('heading', { name: 'Projects', level: 1 }).waitFor({ state: 'visible', timeout: 15_000 })
       await page.getByLabel('Project name').fill('Acme SaaS Sticky Scope')
-      await page.getByLabel('Sites').fill('https://app.acme-saas.example\nhttps://api.acme-saas.example\nhttps://auth.acme-saas.example')
+      await page.getByLabel('Sites').fill('https://acme-saas.example\nhttps://api.acme-saas.example\nhttps://auth.acme-saas.example')
       await page.getByRole('button', { name: 'Create project', exact: true }).click()
       await page.waitForURL(/\/projects\/[a-f0-9-]+/, { timeout: 15_000 })
       const projectMatch = /\/projects\/([a-f0-9-]+)/.exec(page.url())
@@ -368,7 +368,7 @@ describe('Scope Review (consent.tsx) — Option 1 Sticky Action Bar & Compact He
       // 3. Seed 27 realistic candidate hosts directly into the waiting review run & set 3 default seeds
       const candidates = build27Candidates()
       const defaultScope = [
-        'https://app.acme-saas.example',
+        'https://acme-saas.example',
         'https://api.acme-saas.example',
         'https://auth.acme-saas.example',
       ]

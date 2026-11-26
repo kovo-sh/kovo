@@ -63,9 +63,9 @@ import {
 } from './server/store.ts'
 import type { Store } from './server/store.ts'
 import {
-  isMultiTenantPublicSuffix,
+  autoAdmitAnchorForOrigin,
+  matchesAutoAdmitAnchor,
   rankScopeAssets,
-  registrableApex,
   runDiscoverySubdomainsForRun,
 } from './server/subdomain-discovery.ts'
 import type { RunDiscoverySubdomainsResult } from './server/subdomain-discovery.ts'
@@ -518,6 +518,13 @@ export interface ServerRankedScopeAsset {
   score: number
   apex: string | null
   sameApexAsSeed: boolean
+  /**
+   * True when this non-third-party candidate shares a registrable apex with a project seed
+   * (e.g., sibling tenant `tenant-b.vendor.example` or `admin.vendor.example` for seed
+   * `tenant-a.vendor.example`) but falls outside every seed's strict `autoAdmitAnchorForOrigin`
+   * anchor, so it is surfaced unchecked for explicit operator opt-in (R3-H-8).
+   */
+  sameApexOutsideAnchor: boolean
   depth: number
   noisy: boolean
 }
@@ -546,13 +553,15 @@ function extractHostnameServer(origin: string): string {
 
 export interface ScopeRankingDeps {
   rankScopeAssets: typeof rankScopeAssets
-  registrableApex: typeof registrableApex
-  isMultiTenantPublicSuffix: typeof isMultiTenantPublicSuffix
+  autoAdmitAnchorForOrigin: typeof autoAdmitAnchorForOrigin
+  matchesAutoAdmitAnchor: typeof matchesAutoAdmitAnchor
 }
 
 /**
  * Server-authoritative PSL-backed scope ranking (`src/server/subdomain-discovery.ts` +
  * `src/server/public-suffix.ts`) so the browser bundle never ships the 142 KB PSL dataset.
+ * Pre-selection is strictly anchored via `autoAdmitAnchorForOrigin` / `matchesAutoAdmitAnchor`
+ * (R3-H-8) so sibling tenants sharing an unlisted vendor's apex are surfaced unchecked.
  * Dependencies are injected by `runData`'s server handler so TanStack Start never bundles
  * server-only modules into the client chunk.
  */
@@ -581,34 +590,62 @@ export function computeServerScopeRanking(
   const isBulkDnsImport = (c: { source?: string; dnsSource?: unknown }): boolean =>
     Boolean(c.dnsSource) && !isDiscoveredSubdomainSourceServer(c.source)
 
+  // Compute strict auto-admit anchors across all project seeds so same-apex siblings
+  // outside every seed host anchor can be labeled clearly while remaining unchecked.
+  const allSeedHosts = new Set<string>()
+  const allSeedAnchors = new Set<string>()
+  const recordSeedAnchor = (origin: string) => {
+    const h = extractHostnameServer(origin)
+    if (h) allSeedHosts.add(h)
+    const anchor = deps.autoAdmitAnchorForOrigin(origin)
+    if (anchor) allSeedAnchors.add(anchor)
+  }
+  for (const seed of project.seeds) recordSeedAnchor(seed)
+  for (const origin of includeSubdomainOrigins) recordSeedAnchor(origin)
+  for (const c of run.candidates) {
+    if (!c.thirdParty && !isBulkDnsImport(c) && !isDiscoveredSubdomainSourceServer(c.source)) {
+      recordSeedAnchor(c.origin)
+    }
+  }
+  const matchesAnySeedAnchor = (origin: string): boolean => {
+    const h = extractHostnameServer(origin)
+    if (!h) return false
+    if (allSeedHosts.has(h)) return true
+    for (const anchor of allSeedAnchors) {
+      if (h === anchor || deps.matchesAutoAdmitAnchor(h, anchor)) return true
+    }
+    return false
+  }
+
   const computeFor = (
     effectiveRun: typeof run,
     projectDefaultScope: readonly string[],
     effectiveIncludeSubdomains: readonly string[],
   ): { ranked: ServerRankedScopeAsset[]; selectedIds: string[] } => {
     const seedOriginsForRank: string[] = []
-    const wildcardApexes = new Set<string>()
+    const autoAdmitAnchors = new Set<string>()
     for (const origin of effectiveIncludeSubdomains) {
       seedOriginsForRank.push(origin)
-      const apex = deps.registrableApex(origin)
-      if (apex) wildcardApexes.add(apex)
+      const anchor = deps.autoAdmitAnchorForOrigin(origin)
+      if (anchor) autoAdmitAnchors.add(anchor)
     }
     for (const c of effectiveRun.candidates) {
       if (c.includeSubdomains && !c.thirdParty) {
         seedOriginsForRank.push(c.origin)
-        const apex = deps.registrableApex(c.origin)
-        if (apex) wildcardApexes.add(apex)
+        const anchor = deps.autoAdmitAnchorForOrigin(c.origin)
+        if (anchor) autoAdmitAnchors.add(anchor)
       } else if (!c.thirdParty && !isBulkDnsImport(c) && !isDiscoveredSubdomainSourceServer(c.source)) {
         seedOriginsForRank.push(c.origin)
       }
     }
 
-    const rankedAll = deps.rankScopeAssets(effectiveRun.candidates, seedOriginsForRank).map(entry => ({
+    const rankedAll: ServerRankedScopeAsset[] = deps.rankScopeAssets(effectiveRun.candidates, seedOriginsForRank).map(entry => ({
       id: entry.asset.id,
       origin: entry.asset.origin,
       score: entry.score,
       apex: entry.apex,
       sameApexAsSeed: entry.sameApexAsSeed,
+      sameApexOutsideAnchor: !entry.asset.thirdParty && entry.sameApexAsSeed && !matchesAnySeedAnchor(entry.asset.origin),
       depth: entry.depth,
       noisy: entry.noisy,
     }))
@@ -617,14 +654,12 @@ export function computeServerScopeRanking(
       return { ranked: rankedAll, selectedIds: [...effectiveRun.approved] }
     }
 
-    const matchesWildcardParent = (origin: string): boolean => {
-      if (wildcardApexes.size === 0) return false
+    const matchesAnchoredParent = (origin: string): boolean => {
+      if (autoAdmitAnchors.size === 0) return false
       const h = extractHostnameServer(origin)
-      const apex = deps.registrableApex(origin)
-      if (apex && wildcardApexes.has(apex)) return true
-      if (deps.isMultiTenantPublicSuffix(h)) return false
-      for (const wApex of wildcardApexes) {
-        if (h === wApex || h.endsWith(`.${wApex}`)) return true
+      if (!h) return false
+      for (const anchor of autoAdmitAnchors) {
+        if (deps.matchesAutoAdmitAnchor(h, anchor)) return true
       }
       return false
     }
@@ -641,10 +676,10 @@ export function computeServerScopeRanking(
     if (projectDefaultScope.length > 0) {
       const saved = new Set(projectDefaultScope)
       const savedIds = effectiveRun.candidates.filter(a => saved.has(a.origin)).map(a => a.id)
-      if (wildcardApexes.size === 0) return { ranked: rankedAll, selectedIds: savedIds }
+      if (autoAdmitAnchors.size === 0) return { ranked: rankedAll, selectedIds: savedIds }
       const savedSet = new Set(savedIds)
       const extraSubs = effectiveRun.candidates.filter(
-        a => !savedSet.has(a.id) && !a.thirdParty && isDiscoveredSubdomainSourceServer(a.source) && matchesWildcardParent(a.origin),
+        a => !savedSet.has(a.id) && !a.thirdParty && isDiscoveredSubdomainSourceServer(a.source) && matchesAnchoredParent(a.origin),
       )
       const remaining = Math.max(0, cap - savedIds.length)
       if (remaining === 0 || extraSubs.length === 0) return { ranked: rankedAll, selectedIds: savedIds }
@@ -655,7 +690,7 @@ export function computeServerScopeRanking(
       if (a.thirdParty) return false
       if (isBulkDnsImport(a)) return false
       if (isDiscoveredSubdomainSourceServer(a.source)) {
-        if (wildcardApexes.size > 0) return matchesWildcardParent(a.origin)
+        if (autoAdmitAnchors.size > 0) return matchesAnchoredParent(a.origin)
         return false
       }
       return true
@@ -893,8 +928,8 @@ export const runData = createServerFn({ method: 'GET' })
     const db = store()
     const projected = buildBoundedRunProjection(db, data.runId, {
       rankScopeAssets,
-      registrableApex,
-      isMultiTenantPublicSuffix,
+      autoAdmitAnchorForOrigin,
+      matchesAutoAdmitAnchor,
       tables,
       and,
       desc,

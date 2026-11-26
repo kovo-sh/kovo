@@ -19,12 +19,16 @@ import { buildRunModel, isApprovalExpired } from '../src/components/run/model.ts
 import type { Approval, Detail, QueueItem, QueueSection, RunEvent } from '../src/components/run/model.ts'
 import * as tables from '../src/server/schema.ts'
 import { Store } from '../src/server/store.ts'
-import { isMultiTenantPublicSuffix, rankScopeAssets, registrableApex } from '../src/server/subdomain-discovery.ts'
+import {
+  autoAdmitAnchorForOrigin,
+  matchesAutoAdmitAnchor,
+  rankScopeAssets,
+} from '../src/server/subdomain-discovery.ts'
 
 const SERVER_PROJECTION_DEPS = {
   rankScopeAssets,
-  registrableApex,
-  isMultiTenantPublicSuffix,
+  autoAdmitAnchorForOrigin,
+  matchesAutoAdmitAnchor,
   tables,
   and,
   desc,
@@ -544,7 +548,7 @@ test('U4: server computes authoritative PSL scope ranking and consent.tsx no lon
 
   // Server-authoritative PSL ranking handles .co.uk, shared PaaS isolation, and Top-30 sprawl suppression
   const ukCandidates = [
-    { id: 'seed-uk', origin: 'https://app.acme.co.uk', source: 'Project seed', thirdParty: false, includeSubdomains: true },
+    { id: 'seed-uk', origin: 'https://acme.co.uk', source: 'Project seed', thirdParty: false, includeSubdomains: true },
     { id: 'api-uk', origin: 'https://api.acme.co.uk', source: 'subdomain_discovery', thirdParty: false, dnsSource: { zone: 'acme.co.uk' } },
     { id: 'evil-uk', origin: 'https://evil.co.uk', source: 'subdomain_discovery', thirdParty: false, dnsSource: { zone: 'co.uk' } },
     { id: 'third-party', origin: 'https://docs.acme.co.uk', source: 'subdomain_discovery', thirdParty: true, dnsSource: { externalAliases: ['hosting.gitbook.io'] } },
@@ -559,8 +563,8 @@ test('U4: server computes authoritative PSL scope ranking and consent.tsx no lon
 
   const ukRanking = computeServerScopeRanking(
     { scopeRevision: 0, approved: [], candidates: ukCandidates },
-    { seeds: ['https://app.acme.co.uk'], defaultScope: [] },
-    ['https://app.acme.co.uk'],
+    { seeds: ['https://acme.co.uk'], defaultScope: [] },
+    ['https://acme.co.uk'],
     SERVER_PROJECTION_DEPS,
   )
   assert.equal(ukRanking.recommendedScopeAssetIds.length, 30)
@@ -571,7 +575,7 @@ test('U4: server computes authoritative PSL scope ranking and consent.tsx no lon
   assert.equal(ukRanking.rankedAssets[0]?.id, 'seed-uk')
   assert.equal(ukRanking.rankedAssets[0]?.apex, 'acme.co.uk')
 
-  // Shared PaaS tenant isolation on server ranking
+  // Shared PaaS tenant isolation on server ranking (R2-H-5 / R3-H-8: PaaS refuses auto-admit anchor)
   const paasRanking = computeServerScopeRanking(
     {
       scopeRevision: 0,
@@ -586,7 +590,7 @@ test('U4: server computes authoritative PSL scope ranking and consent.tsx no lon
     ['https://my-app.vercel.app'],
     SERVER_PROJECTION_DEPS,
   )
-  assert.deepEqual(paasRanking.recommendedScopeAssetIds, ['seed-paas', 'own-sub'])
+  assert.deepEqual(paasRanking.recommendedScopeAssetIds, ['seed-paas'])
 
   // If production build assets exist, verify NO client asset leaks public-suffix-list.ts and runs._runId dropped 142 KB PSL
   const assetsDir = join(REPO_ROOT, 'build', 'client', 'assets')
