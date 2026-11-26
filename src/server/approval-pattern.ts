@@ -2,6 +2,7 @@
  * Canonicalizes and matches operator-approved endpoint path patterns through the shared scope
  * path primitive, keeping admission, leases, denylists, and approvals on one interpretation.
  */
+import { createHash } from 'node:crypto'
 import type { ApprovedEndpointPattern } from '../domain.ts'
 import { canonicalPathAndQuery } from './scope-policy.ts'
 
@@ -37,6 +38,46 @@ export function normalizeOriginKey(origin: string): string {
   } catch {
     return origin.trim().toLowerCase().replace(/\/+$/, '')
   }
+}
+
+/**
+ * Canonicalize request headers into a deterministically ordered, lowercased record for approval
+ * fingerprinting and batch target grouping (`H-4`).
+ */
+export function canonicalizeApprovalHeaders(
+  headers?: Record<string, string | string[] | undefined>,
+): Record<string, string> {
+  if (!headers) return {}
+  const entries: Array<[string, string]> = []
+  for (const [rawKey, rawValue] of Object.entries(headers)) {
+    if (rawValue === undefined) continue
+    const key = rawKey.trim().toLowerCase()
+    if (!key) continue
+    const value = Array.isArray(rawValue)
+      ? rawValue.map(v => v.trim()).join(', ')
+      : String(rawValue).trim()
+    entries.push([key, value])
+  }
+  entries.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+  const out: Record<string, string> = {}
+  for (const [k, v] of entries) {
+    out[k] = k in out ? `${out[k]}, ${v}` : v
+  }
+  return out
+}
+
+/**
+ * Stable SHA-256 digest of canonicalized request headers (`H-4`). Returns `null` when no headers
+ * are present so headerless requests have a distinct, explicit digest state.
+ */
+export function computeApprovalHeadersDigest(
+  headers?: Record<string, string | string[] | undefined>,
+): string | null {
+  const canonical = canonicalizeApprovalHeaders(headers)
+  const keys = Object.keys(canonical)
+  if (keys.length === 0) return null
+  const pairs = keys.map(k => [k, canonical[k]])
+  return `hdr:${createHash('sha256').update(JSON.stringify(pairs), 'utf8').digest('hex')}`
 }
 
 export function normalizeApprovalPathPattern(pathAndQuery: string): string {

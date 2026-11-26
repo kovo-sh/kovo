@@ -11,13 +11,16 @@
  *      `sandboxWriteAllowlist` / durable lease matching (including H-4 per-target batch validation);
  *   d. Request budget & rate-limit admission hooks.
  */
+import { createHash } from 'node:crypto'
 import type { ApprovalPolicy, ApprovedEndpointPattern, CapabilityTier } from '../domain.ts'
 import { containsDestructivePayload, containsWebshellSignature } from '../replay-spec.ts'
 import type { AuthMutation } from '../replay-spec.ts'
-import { computeStateChangeBodyHash, isLocalLabAutoApprovalOrigin } from './approval-judge.ts'
+import { computeStateChangeBodyHash, detectMultipartRequest, isLocalLabAutoApprovalOrigin } from './approval-judge.ts'
 import type { MultipartBodyPart, StateChangeApprovalContext } from './approval-judge.ts'
+import { computeApprovalHeadersDigest, normalizeOriginKey } from './approval-pattern.ts'
 import {
   canonicalPathAndQuery,
+  detectMethodOverride,
   evaluateScopeRequest,
   hasUnsafeAdmissionPath,
   isReadOnlyHttpMethod,
@@ -25,6 +28,7 @@ import {
   isVerifiedReadOnlyGraphqlQuery,
   normalizeScopeOrigin,
   originRoleFor,
+  requestCarriesTenantTag,
 } from './scope-policy.ts'
 import type { EnvironmentMode, ScopeHook, ScopePolicy, ScopeSurface } from './scope-policy.ts'
 
@@ -103,6 +107,12 @@ export type RequestMutationKind =
 
 export interface RequestMutationClassification {
   kind: RequestMutationKind
+  /** R2-H-1: Effective HTTP verb including method-override headers and `_method` carriers. */
+  effectiveMethod: string
+  /** R2-H-1: True when any method-override header or `_method` query/form/JSON field is present. */
+  hasMethodOverride: boolean
+  /** R2-H-1: Override carrier names when `hasMethodOverride` is true. */
+  methodOverrideCarriers?: string[]
   isReadOnly: boolean
   isVerifiedGraphqlRead: boolean
   isStateChanging: boolean
@@ -122,6 +132,8 @@ export interface AdmissionGrant {
   allowLocalLab?: boolean
   sandboxWriteAllowlist?: readonly ApprovedEndpointPattern[]
   allowedPorts?: readonly number[]
+  /** H-3: Host-confirmed GraphQL endpoints for read-only GraphQL exceptions. */
+  confirmedGraphqlEndpoints?: readonly string[]
   canRead: (origin: string) => boolean
   scopePolicy?: ScopePolicy
   approvalPolicy?: ApprovalPolicy
@@ -164,6 +176,8 @@ export interface AdmissionRequest {
   normalizedHeaders?: Record<string, string>
   /** Optional semantic or numeric tier override for standalone evaluation. */
   tierOverride?: CapabilityTier | AdmissionTier
+  /** H-3: Optional per-request confirmed GraphQL endpoints list. */
+  confirmedGraphqlEndpoints?: readonly string[]
   runId?: string
   assignmentId?: string
 }
@@ -197,6 +211,8 @@ export interface BatchAdmissionDecision {
   capabilityTier: CapabilityTier
   decisions: AdmissionDecision[]
   failedIndex: number | null
+  /** H-4: SHA-256 digest binding the batch admission decision to ALL targets (never target[0] alone). */
+  targetsHash?: string
 }
 
 export interface AdmissionBudgetContext {
@@ -741,25 +757,47 @@ function isGraphqlPathCandidate(pathAndQuery: string): boolean {
 }
 
 export function classifyRequestMutation(input: {
+  origin?: string
   method: string
   pathAndQuery: string
   body?: string | null
   headers?: Record<string, string>
   multipartParts?: readonly MultipartBodyPart[]
+  confirmedGraphqlEndpoints?: readonly string[]
 }): RequestMutationClassification {
   const method = (input.method || 'GET').toUpperCase()
+  const override = detectMethodOverride({
+    method,
+    pathAndQuery: input.pathAndQuery,
+    headers: input.headers,
+    body: input.body ?? null,
+  })
+  const effectiveMethod = override.effectiveMethod
   const hasMultipartParts = Array.isArray(input.multipartParts) && input.multipartParts.length > 0
   const contentType = headerLookup(input.headers, 'content-type')
   const contentEncoding = headerLookup(input.headers, 'content-encoding').trim()
   const hasMultipartContentType = /^\s*multipart\//i.test(contentType)
   const hasMultipart = hasMultipartParts || hasMultipartContentType
   const hasCompressedBody = contentEncoding !== '' && !/^identity$/i.test(contentEncoding)
-  const isReadOnlyHttp = !hasMultipart && isReadOnlyHttpMethod(method, input.body ?? null)
-  const isStructuralMutation = method === 'DELETE' || hasMultipart || hasCompressedBody
+  const isReadOnlyHttp = !hasMultipart && !override.hasOverride && isReadOnlyHttpMethod(effectiveMethod, input.body ?? null)
+  // R2-H-1: Treat override carriers (and effective DELETE verbs) as structural mutations so
+  // auto_review DELETE gates can never be bypassed via method overrides.
+  const isStructuralMutation =
+    method === 'DELETE' ||
+    effectiveMethod === 'DELETE' ||
+    override.hasOverride ||
+    hasMultipart ||
+    hasCompressedBody
+  const overrideMeta = {
+    effectiveMethod,
+    hasMethodOverride: override.hasOverride,
+    ...(override.carriers.length > 0 ? { methodOverrideCarriers: override.carriers } : {}),
+  }
 
   if (isReadOnlyHttp) {
     return {
       kind: 'read_only_http',
+      ...overrideMeta,
       isReadOnly: true,
       isVerifiedGraphqlRead: false,
       isStateChanging: false,
@@ -773,6 +811,7 @@ export function classifyRequestMutation(input: {
   if (hasMultipart) {
     return {
       kind: 'multipart_upload',
+      ...overrideMeta,
       isReadOnly: false,
       isVerifiedGraphqlRead: false,
       isStateChanging: true,
@@ -786,6 +825,7 @@ export function classifyRequestMutation(input: {
   if (hasCompressedBody) {
     return {
       kind: 'compressed_mutation',
+      ...overrideMeta,
       isReadOnly: false,
       isVerifiedGraphqlRead: false,
       isStateChanging: true,
@@ -796,9 +836,20 @@ export function classifyRequestMutation(input: {
     }
   }
 
-  if (method === 'POST' && isVerifiedReadOnlyGraphqlQuery(input.pathAndQuery, input.body ?? null, input.headers)) {
+  if (
+    !override.hasOverride &&
+    method === 'POST' &&
+    isVerifiedReadOnlyGraphqlQuery(input.pathAndQuery, input.body ?? null, input.headers, {
+      ...(input.confirmedGraphqlEndpoints !== undefined
+        ? { confirmedEndpoints: input.confirmedGraphqlEndpoints }
+        : {}),
+      ...(input.origin ? { origin: input.origin } : {}),
+      method: effectiveMethod,
+    })
+  ) {
     return {
       kind: 'graphql_readonly_query',
+      ...overrideMeta,
       isReadOnly: false,
       isVerifiedGraphqlRead: true,
       isStateChanging: false,
@@ -812,6 +863,7 @@ export function classifyRequestMutation(input: {
   if (method === 'POST' && isGraphqlPathCandidate(input.pathAndQuery)) {
     return {
       kind: 'graphql_mutation_or_unverified',
+      ...overrideMeta,
       isReadOnly: false,
       isVerifiedGraphqlRead: false,
       isStateChanging: true,
@@ -835,6 +887,7 @@ export function classifyRequestMutation(input: {
           : 'jsonrpc_read_method'
     return {
       kind,
+      ...overrideMeta,
       isReadOnly: false,
       isVerifiedGraphqlRead: false,
       isStateChanging: true,
@@ -848,6 +901,7 @@ export function classifyRequestMutation(input: {
 
   return {
     kind: 'http_mutation',
+    ...overrideMeta,
     isReadOnly: false,
     isVerifiedGraphqlRead: false,
     isStateChanging: true,
@@ -1448,12 +1502,18 @@ export class RequestAdmissionEngine {
 
     // 7. Strict Method + GraphQL + JSON-RPC mutation classification
     const decisionHeaders = { ...normalizedHeaders }
+    const confirmedGraphqlEndpoints =
+      request.confirmedGraphqlEndpoints ??
+      grant.confirmedGraphqlEndpoints ??
+      effectiveScopePolicy?.confirmedGraphqlEndpoints
     const classification = classifyRequestMutation({
+      origin: initialOrigin,
       method: normalizedMethod,
       pathAndQuery: canonical,
       body: request.body ?? null,
       headers: normalizedHeaders,
       multipartParts: request.multipartParts,
+      ...(confirmedGraphqlEndpoints !== undefined ? { confirmedGraphqlEndpoints } : {}),
     })
 
     // 8. Budget / rate-limit admission hooks (before consuming any single-use approval grants)
@@ -1479,12 +1539,15 @@ export class RequestAdmissionEngine {
         : 'grant_scope'
 
     if (effectiveScopePolicy) {
+      const derivedStaging = effectiveScopePolicy.mode === 'staging_isolated' && !approvalMeta.explicitEnvironmentMode
       const scopeDecision = evaluateScopeRequest(effectiveScopePolicy, {
         origin: initialOrigin,
         method: normalizedMethod,
         pathAndQuery: canonical,
         body: request.body ?? null,
         headers: normalizedHeaders,
+        ...(confirmedGraphqlEndpoints !== undefined ? { confirmedGraphqlEndpoints } : {}),
+        ...(derivedStaging ? { derivedEnvironmentMode: true } : {}),
         redirectHop: request.redirectHop,
         hook: request.scopeHook ?? null,
         surface: request.surface ?? (kind === 'browser' ? 'browser' : 'broker'),
@@ -1493,10 +1556,12 @@ export class RequestAdmissionEngine {
       const checkLease = (): boolean =>
         !request.isRaceBurst &&
         !classification.hasCompressedBody &&
-        grant.approvalLeases?.(initialOrigin, normalizedMethod, canonical) === true
+        !classification.hasMethodOverride &&
+        grant.approvalLeases?.(initialOrigin, classification.effectiveMethod, canonical) === true
 
       const sandboxPostAllowed =
         !classification.hasMultipart &&
+        !classification.hasMethodOverride &&
         normalizedMethod === 'POST' &&
         capabilityTier === 2 &&
         grant.sandboxWriteAllowlist !== undefined &&
@@ -1528,9 +1593,26 @@ export class RequestAdmissionEngine {
             approvedRule = 'approval_lease'
           }
         } else {
-          // auto_review: durable leases and safe tagged writes auto-approve; DELETE / multipart /
-          // compressed / race-burst requests still flow through exact approval / HITL.
-          if (!classification.isStructuralMutation && !request.isRaceBurst) {
+          // auto_review on derived staging_isolated (`R2-H-1`):
+          //  - Structural mutations (DELETE, method-override carriers, multipart, compressed) and
+          //    race bursts ALWAYS flow through exact approval / HITL.
+          //  - Host-injected run tag headers (`x-kovo-tenant-tag`) NEVER serve as standalone
+          //    isolation proof: require an explicit hook or target-visible tenant tag in path/body.
+          const hasNonHostInjectedTag =
+            request.scopeHook === 'setup' ||
+            request.scopeHook === 'cleanup' ||
+            requestCarriesTenantTag(
+              {
+                origin: initialOrigin,
+                method: normalizedMethod,
+                pathAndQuery: canonical,
+                body: request.body ?? null,
+                headers: normalizedHeaders,
+              },
+              effectiveScopePolicy.tenantTag,
+              { ignoreHostInjectedHeaders: true },
+            )
+          if (!classification.isStructuralMutation && !request.isRaceBurst && hasNonHostInjectedTag) {
             contractApproved = true
             approvedReasonCode = 'allowed_environment_contract'
             approvedRule = 'approval_policy:auto_review'
@@ -1594,6 +1676,7 @@ export class RequestAdmissionEngine {
     if (!contractApproved && (!classification.isReadOnly || classification.hasMultipart)) {
       const sandboxPostAllowed =
         !classification.hasMultipart &&
+        !classification.hasMethodOverride &&
         normalizedMethod === 'POST' &&
         capabilityTier === 2 &&
         (grant.sandboxWriteAllowlist !== undefined
@@ -1611,17 +1694,28 @@ export class RequestAdmissionEngine {
             classification.hasMultipart ? 'tier:multipart_requires_autonomous' : 'tier:mutation_requires_autonomous',
             classification.hasMultipart
               ? 'Multipart uploads require Tier 3 (approval-gated state validation).'
-              : `Method ${normalizedMethod} requires Tier 3 (approval-gated state validation).`,
+              : `Method ${classification.effectiveMethod} requires Tier 3 (approval-gated state validation).`,
             { normalizedOrigin: initialOrigin, normalizedPath, localLab, parsedUrl: url, classification },
           )
         }
+        const multipartKind = detectMultipartRequest({
+          headers: decisionHeaders,
+          hasMultipart: classification.hasMultipart,
+          bodyPreview: hasMultipartParts ? null : (request.body ?? null),
+        })
         const approvalContext: StateChangeApprovalContext = {
           personaHandle: request.personaHandle ?? null,
           body: hasMultipartParts ? null : (request.body ?? null),
           bodyHash: computeStateChangeBodyHash(request.body, request.multipartParts),
+          headers: decisionHeaders,
+          headersDigest: computeApprovalHeadersDigest(decisionHeaders),
           hasMultipart: classification.hasMultipart,
+          multipartKind,
           isRaceBurst: request.isRaceBurst === true,
           hasCompressedBody: classification.hasCompressedBody,
+          hasMethodOverride: classification.hasMethodOverride,
+          effectiveMethod: classification.effectiveMethod,
+          ...(request.assignmentId ? { assignmentId: request.assignmentId } : {}),
         }
         if (evaluateConsuming) {
           const approved = grant.isStateChangeApproved
@@ -1633,8 +1727,8 @@ export class RequestAdmissionEngine {
               'approval_required',
               request.redirectHop ? 'tier3_redirect_approval_required' : 'tier3_approval_required',
               request.redirectHop
-                ? `Approval required for state-changing redirect ${normalizedMethod} ${canonical}.`
-                : `Tier 3 operator approval required for ${normalizedMethod} ${initialOrigin}${canonical}`,
+                ? `Approval required for state-changing redirect ${classification.effectiveMethod} ${canonical}.`
+                : `Tier 3 operator approval required for ${classification.effectiveMethod} ${initialOrigin}${canonical}`,
               { normalizedOrigin: initialOrigin, normalizedPath, localLab, parsedUrl: url, classification, approvalContext },
             )
           }
@@ -1719,8 +1813,10 @@ export class RequestAdmissionEngine {
     }
 
     // Phase 1: static non-consuming pre-flight across ALL items in the batch.
+    const preflightDecisions: AdmissionDecision[] = []
     for (let i = 0; i < requests.length; i += 1) {
       const pre = this.admit({ ...requests[i]!, isRaceBurst: isRace }, grant, { evaluateConsumingHooks: false })
+      preflightDecisions.push(pre)
       if (!pre.allowed) {
         return {
           outcome: pre.outcome,
@@ -1735,6 +1831,29 @@ export class RequestAdmissionEngine {
         }
       }
     }
+
+    const targetsHash = `batch-admit-v1:${createHash('sha256')
+      .update(
+        JSON.stringify(
+          preflightDecisions.map((pre, idx) => {
+            const req = requests[idx]!
+            return [
+              normalizeOriginKey(pre.normalizedOrigin ?? req.origin),
+              pre.normalizedMethod,
+              pre.classification?.effectiveMethod ?? pre.normalizedMethod,
+              pre.normalizedPath,
+              req.personaHandle ?? '',
+              computeStateChangeBodyHash(req.body ?? null, req.multipartParts) ?? '',
+              computeApprovalHeadersDigest(pre.normalizedHeaders ?? req.headers) ?? '',
+              Boolean(pre.classification?.hasMultipart),
+              Boolean(pre.classification?.hasCompressedBody),
+              Boolean(pre.classification?.hasMethodOverride),
+            ]
+          }),
+        ),
+        'utf8',
+      )
+      .digest('hex')}`
 
     // Phase 2: per-target consuming evaluation (H-4: every target evaluated individually).
     const decisions: AdmissionDecision[] = []
@@ -1755,6 +1874,7 @@ export class RequestAdmissionEngine {
           capabilityTier: dec.capabilityTier,
           decisions,
           failedIndex: i,
+          targetsHash,
         }
       }
     }
@@ -1769,6 +1889,7 @@ export class RequestAdmissionEngine {
       capabilityTier,
       decisions,
       failedIndex: null,
+      targetsHash,
     }
   }
 

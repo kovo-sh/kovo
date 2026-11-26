@@ -29,9 +29,12 @@ import type { ClientHttp2Session } from 'node:http2'
 import { connect as netConnect } from 'node:net'
 import type { AddressInfo, Socket as NetSocket } from 'node:net'
 import { connect as tlsConnect, TLSSocket } from 'node:tls'
+import { pipeline } from 'node:stream'
 import type { Duplex } from 'node:stream'
 import { createBrotliDecompress, createGunzip, createInflate } from 'node:zlib'
 import ipaddr from 'ipaddr.js'
+import { globalKillSwitch, KillSwitchTrippedError } from './kill-switch.ts'
+import type { GlobalKillSwitch } from './kill-switch.ts'
 import { isIpLiteralHost, normalizeHostname } from './public-suffix.ts'
 import { evaluateBrowserScopeRequest } from './scope-policy.ts'
 import type { ScopePolicy } from './scope-policy.ts'
@@ -55,6 +58,7 @@ export type EgressDenyCode =
   | 'response_too_large'
   | 'proxy_connect_denied'
   | 'proxy_auth_required'
+  | 'kill_switch_active'
 
 export class EgressDeniedError extends Error {
   readonly code: EgressDenyCode
@@ -122,6 +126,10 @@ export interface EgressPolicy {
   onDenied?: (event: { url: string; origin: string; code: EgressDenyCode; reason: string }) => void
   /** Optional audit callback invoked before dialing a validated pinned address. */
   onAllow?: (event: { url: string; origin: string; pinnedAddress: string }) => void
+  /** H-2: Tenant namespace for per-tenant kill-switch checks (`null`/`undefined` checks global switch). */
+  tenantId?: string | null
+  /** H-2: Optional kill-switch instance (defaults to process-wide `globalKillSwitch`). */
+  killSwitch?: GlobalKillSwitch
 }
 
 export interface EgressRawHttp1Options<TTls = unknown> {
@@ -132,6 +140,10 @@ export interface EgressRawHttp1Options<TTls = unknown> {
   readBody?: boolean
   rejectUnauthorized?: boolean
   signal?: AbortSignal
+  /** H-2: Tenant namespace for per-tenant kill-switch checks (`null`/`undefined` checks global switch). */
+  tenantId?: string | null
+  /** H-2: Optional kill-switch instance (defaults to process-wide `globalKillSwitch`). */
+  killSwitch?: GlobalKillSwitch
   /** Optional hook to extract TLS metadata from the underlying `TLSSocket` before the stream ends. */
   extractTls?: (socket: TLSSocket, hostname: string) => TTls
 }
@@ -601,6 +613,56 @@ function isRedirectStatus(status: number): boolean {
   return status === 301 || status === 302 || status === 303 || status === 307 || status === 308
 }
 
+function resolveEgressKillSwitch(
+  policy?: { killSwitch?: GlobalKillSwitch; tenantId?: string | null },
+): { ks: GlobalKillSwitch; tenantId: string | null } {
+  return {
+    ks: policy?.killSwitch ?? globalKillSwitch,
+    tenantId: policy?.tenantId ?? null,
+  }
+}
+
+function bindEgressKillSwitchSignal(
+  ks: GlobalKillSwitch,
+  signal: AbortSignal | null | undefined,
+  tenantId: string | null,
+): { signal: AbortSignal; release: () => void } {
+  return ks.bindSignal(signal ?? new AbortController().signal, tenantId)
+}
+
+function createResponseDecompressor(
+  rawEncoding: string | string[] | undefined,
+): { decoder: Duplex; encoding: string } | null {
+  const encoding = (Array.isArray(rawEncoding) ? rawEncoding.join(', ') : (rawEncoding ?? '')).toLowerCase().trim()
+  if (encoding === 'gzip' || encoding === 'x-gzip') return { decoder: createGunzip(), encoding }
+  if (encoding === 'deflate') return { decoder: createInflate(), encoding }
+  if (encoding === 'br') return { decoder: createBrotliDecompress(), encoding }
+  return null
+}
+
+/**
+ * Strip RFC 9110/9113 hop-by-hop headers (plus any header names listed in `Connection` and
+ * `:pseudo-headers` / `host`) before sending an HTTP/2 request (`C-1`).
+ */
+function stripHttp2HopByHopHeaders(headers: Record<string, string> | undefined): Record<string, string> {
+  const connectionListed = new Set<string>()
+  for (const [k, v] of Object.entries(headers ?? {})) {
+    if (k.toLowerCase() !== 'connection') continue
+    for (const token of v.split(',')) {
+      const name = token.trim().toLowerCase()
+      if (name) connectionListed.add(name)
+    }
+  }
+  const out: Record<string, string> = {}
+  for (const [k, v] of Object.entries(headers ?? {})) {
+    if (k.trimStart().startsWith(':')) continue
+    const lower = k.toLowerCase()
+    if (lower === 'host' || HOP_BY_HOP_HEADERS.has(lower) || connectionListed.has(lower)) continue
+    out[lower] = v
+  }
+  return out
+}
+
 // ---------------------------------------------------------------------------
 // 1. Canonical HTTP/1.1 Outbound Dialer (`egressFetch`)
 // ---------------------------------------------------------------------------
@@ -677,6 +739,12 @@ async function dialSinglePinnedHttp1(params: {
         }))
       })
       res.on('error', err => finish(err))
+      res.once('aborted', () => finish(new Error('Egress HTTP/1.1 response aborted mid-body.')))
+      res.once('close', () => {
+        if (!settled && !res.complete) {
+          finish(new Error('Egress HTTP/1.1 response closed prematurely mid-body.'))
+        }
+      })
     })
 
     req.setTimeout(timeoutMs, () => {
@@ -713,6 +781,8 @@ export async function egressFetch(
   policy: EgressPolicy = {},
 ): Promise<Response> {
   warnIfEnvProxyEnabled()
+  const { ks, tenantId } = resolveEgressKillSwitch(policy)
+  ks.assertAllowed(tenantId)
 
   const timeoutMs = Math.max(250, policy.timeoutMs ?? DEFAULT_TIMEOUT_MS)
   const maxResponseBytes = Math.max(1024, policy.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES)
@@ -724,91 +794,103 @@ export async function egressFetch(
   let method = (init.method ?? 'GET').toUpperCase()
   let headers = headersToRecord(init.headers)
   let body = await normalizeRequestBody(init.body)
-  const signal = init.signal ?? undefined
+  const ksBound = bindEgressKillSwitchSignal(ks, init.signal, tenantId)
 
-  for (let hop = 0; ; hop += 1) {
-    // Only the initial hop may use caller-supplied `pinnedAddresses`; redirect hops MUST resolve fresh.
-    const hopPolicy: EgressPolicy = hop === 0
-      ? policy
-      : { ...policy, pinnedAddresses: undefined }
-    const validated = await resolveAndValidateHost(currentUrl, hopPolicy, method)
-    policy.onAllow?.({
-      url: validated.url.href,
-      origin: validated.url.origin,
-      pinnedAddress: validated.addresses[0]!.address,
-    })
+  try {
+    for (let hop = 0; ; hop += 1) {
+      ks.assertAllowed(tenantId)
+      // Only the initial hop may use caller-supplied `pinnedAddresses`; redirect hops MUST resolve fresh.
+      const hopPolicy: EgressPolicy = hop === 0
+        ? policy
+        : { ...policy, pinnedAddresses: undefined }
+      const validated = await resolveAndValidateHost(currentUrl, hopPolicy, method)
+      ks.assertAllowed(tenantId)
+      policy.onAllow?.({
+        url: validated.url.href,
+        origin: validated.url.origin,
+        pinnedAddress: validated.addresses[0]!.address,
+      })
 
-    const response = await dialSinglePinnedHttp1({
-      url: validated.url,
-      hostname: validated.hostname,
-      addresses: validated.addresses,
-      method,
-      headers,
-      body,
-      timeoutMs,
-      maxResponseBytes,
-      rejectUnauthorized,
-      signal,
-    })
+      const response = await dialSinglePinnedHttp1({
+        url: validated.url,
+        hostname: validated.hostname,
+        addresses: validated.addresses,
+        method,
+        headers,
+        body,
+        timeoutMs,
+        maxResponseBytes,
+        rejectUnauthorized,
+        signal: ksBound.signal,
+      })
 
-    if (!followRedirects || !isRedirectStatus(response.status)) {
-      return response
-    }
-
-    const location = response.headers.get('location')
-    if (!location) return response
-
-    if (hop >= maxRedirects) {
-      denyWithAudit(
-        policy,
-        validated.url.href,
-        validated.url.origin,
-        'redirect_limit',
-        `Egress request exceeded maximum redirect hops (${maxRedirects}).`,
-      )
-    }
-
-    let nextUrl: URL
-    try {
-      nextUrl = new URL(location, validated.url)
-    } catch {
-      denyWithAudit(
-        policy,
-        validated.url.href,
-        validated.url.origin,
-        'redirect_blocked',
-        'Egress redirect contained a malformed Location header.',
-      )
-    }
-
-    if (nextUrl.origin !== validated.url.origin) {
-      const stripped: Record<string, string> = {}
-      for (const [k, v] of Object.entries(headers)) {
-        const lower = k.toLowerCase()
-        if (CROSS_ORIGIN_STRIP_HEADERS.has(lower) || lower === 'host') continue
-        stripped[k] = v
+      if (!followRedirects || !isRedirectStatus(response.status)) {
+        return response
       }
-      headers = stripped
-    } else {
-      // Drop stale Host header so the next hop computes it cleanly.
-      const nextHeaders: Record<string, string> = {}
-      for (const [k, v] of Object.entries(headers)) {
-        if (k.toLowerCase() === 'host') continue
-        nextHeaders[k] = v
-      }
-      headers = nextHeaders
-    }
 
-    if (response.status === 303 || ((response.status === 301 || response.status === 302) && method === 'POST')) {
-      method = 'GET'
-      body = undefined
-      for (const key of Object.keys(headers)) {
-        const lower = key.toLowerCase()
-        if (lower === 'content-length' || lower === 'content-type') delete headers[key]
-      }
-    }
+      const location = response.headers.get('location')
+      if (!location) return response
 
-    currentUrl = nextUrl.toString()
+      if (hop >= maxRedirects) {
+        denyWithAudit(
+          policy,
+          validated.url.href,
+          validated.url.origin,
+          'redirect_limit',
+          `Egress request exceeded maximum redirect hops (${maxRedirects}).`,
+        )
+      }
+
+      let nextUrl: URL
+      try {
+        nextUrl = new URL(location, validated.url)
+      } catch {
+        denyWithAudit(
+          policy,
+          validated.url.href,
+          validated.url.origin,
+          'redirect_blocked',
+          'Egress redirect contained a malformed Location header.',
+        )
+      }
+
+      if (nextUrl.origin !== validated.url.origin) {
+        const stripped: Record<string, string> = {}
+        for (const [k, v] of Object.entries(headers)) {
+          const lower = k.toLowerCase()
+          if (CROSS_ORIGIN_STRIP_HEADERS.has(lower) || lower === 'host') continue
+          stripped[k] = v
+        }
+        headers = stripped
+      } else {
+        // Drop stale Host header so the next hop computes it cleanly.
+        const nextHeaders: Record<string, string> = {}
+        for (const [k, v] of Object.entries(headers)) {
+          if (k.toLowerCase() === 'host') continue
+          nextHeaders[k] = v
+        }
+        headers = nextHeaders
+      }
+
+      if (response.status === 303 || ((response.status === 301 || response.status === 302) && method === 'POST')) {
+        method = 'GET'
+        body = undefined
+        for (const key of Object.keys(headers)) {
+          const lower = key.toLowerCase()
+          if (lower === 'content-length' || lower === 'content-type') delete headers[key]
+        }
+      }
+
+      currentUrl = nextUrl.toString()
+    }
+  } catch (err) {
+    if (ksBound.signal.aborted && ksBound.signal.reason instanceof KillSwitchTrippedError) {
+      throw ksBound.signal.reason
+    }
+    if (ks.isActive(tenantId)) ks.assertAllowed(tenantId)
+    throw err
+  } finally {
+    ksBound.release()
   }
 }
 
@@ -824,6 +906,8 @@ export async function egressFetchStream(
   policy: EgressPolicy = {},
 ): Promise<Response> {
   warnIfEnvProxyEnabled()
+  const { ks, tenantId } = resolveEgressKillSwitch(policy)
+  ks.assertAllowed(tenantId)
 
   const timeoutMs = Math.max(250, policy.timeoutMs ?? DEFAULT_TIMEOUT_MS)
   const maxResponseBytes = Math.max(1024, policy.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES)
@@ -831,9 +915,17 @@ export async function egressFetchStream(
   const method = (init.method ?? 'GET').toUpperCase()
   const headers = headersToRecord(init.headers)
   const body = await normalizeRequestBody(init.body)
-  const signal = init.signal ?? undefined
+  const ksBound = bindEgressKillSwitchSignal(ks, init.signal, tenantId)
+  const signal = ksBound.signal
 
-  const validated = await resolveAndValidateHost(urlInput, policy, method)
+  let validated: { url: URL; hostname: string; addresses: PinnedAddress[] }
+  try {
+    validated = await resolveAndValidateHost(urlInput, policy, method)
+    ks.assertAllowed(tenantId)
+  } catch (err) {
+    ksBound.release()
+    throw err
+  }
   const pinned = validated.addresses[0]!
   policy.onAllow?.({
     url: validated.url.href,
@@ -856,7 +948,8 @@ export async function egressFetchStream(
       if (headersSettled) return
       headersSettled = true
       if (err) {
-        signal?.removeEventListener('abort', onAbort)
+        signal.removeEventListener('abort', onAbort)
+        ksBound.release()
         reject(err)
       } else {
         resolve(value!)
@@ -896,26 +989,9 @@ export async function egressFetchStream(
         return
       }
 
-      const rawEncoding = res.headers['content-encoding']
-      const encoding = (Array.isArray(rawEncoding) ? rawEncoding.join(', ') : (rawEncoding ?? '')).toLowerCase().trim()
-      let source: NodeJS.ReadableStream = res
-      let decompressed = false
-      if (encoding === 'gzip' || encoding === 'x-gzip') {
-        const gunzip = createGunzip()
-        res.pipe(gunzip)
-        source = gunzip
-        decompressed = true
-      } else if (encoding === 'deflate') {
-        const inflate = createInflate()
-        res.pipe(inflate)
-        source = inflate
-        decompressed = true
-      } else if (encoding === 'br') {
-        const brotli = createBrotliDecompress()
-        res.pipe(brotli)
-        source = brotli
-        decompressed = true
-      }
+      const decomp = createResponseDecompressor(res.headers['content-encoding'])
+      const decompressed = decomp !== null
+      const source: NodeJS.ReadableStream = decomp ? decomp.decoder : res
 
       const respHeaders = responseHeadersFromNode(res.headers)
       if (decompressed) {
@@ -924,7 +1000,8 @@ export async function egressFetchStream(
       }
 
       if (status === 204 || status === 304) {
-        signal?.removeEventListener('abort', onAbort)
+        signal.removeEventListener('abort', onAbort)
+        ksBound.release()
         res.resume()
         finishHeaders(null, new Response(null, { status, statusText: res.statusMessage ?? '', headers: respHeaders }))
         return
@@ -935,41 +1012,50 @@ export async function egressFetchStream(
       const readable = new ReadableStream<Uint8Array>({
         start(controller) {
           const cleanup = () => {
-            signal?.removeEventListener('abort', onStreamAbort)
+            signal.removeEventListener('abort', onStreamAbort)
+            ksBound.release()
           }
-          const onStreamAbort = () => {
+          const failStream = (err: unknown) => {
             if (streamClosed) return
             streamClosed = true
-            const reason = signal?.reason instanceof Error ? signal.reason : new Error('Egress stream aborted.')
-            req.destroy(reason)
-            try { controller.error(reason) } catch { /* ignore */ }
+            decomp?.decoder.destroy()
+            req.destroy()
+            try { controller.error(err) } catch { /* ignore */ }
             cleanup()
           }
-          if (signal?.aborted) {
+          const onStreamAbort = () => {
+            const reason = signal.reason instanceof Error ? signal.reason : new Error('Egress stream aborted.')
+            failStream(reason)
+          }
+          if (signal.aborted) {
             onStreamAbort()
             return
           }
-          signal?.removeEventListener('abort', onAbort)
-          signal?.addEventListener('abort', onStreamAbort, { once: true })
+          signal.removeEventListener('abort', onAbort)
+          signal.addEventListener('abort', onStreamAbort, { once: true })
+
+          if (decomp) {
+            pipeline(res, decomp.decoder, err => {
+              if (err && !streamClosed) failStream(err)
+            })
+          }
 
           source.on('data', (chunk: Buffer) => {
             if (streamClosed) return
             totalBytes += chunk.byteLength
             if (totalBytes > maxResponseBytes) {
-              streamClosed = true
               const err = new EgressDeniedError(
                 'response_too_large',
                 `Egress streaming response exceeded the ${maxResponseBytes}-byte size limit.`,
               )
-              req.destroy(err)
-              try { controller.error(err) } catch { /* ignore */ }
-              cleanup()
+              failStream(err)
               return
             }
             try {
               controller.enqueue(new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength))
             } catch {
               streamClosed = true
+              decomp?.decoder.destroy()
               req.destroy()
               cleanup()
             }
@@ -980,25 +1066,23 @@ export async function egressFetchStream(
             try { controller.close() } catch { /* ignore */ }
             cleanup()
           })
-          source.once('error', err => {
-            if (streamClosed) return
-            streamClosed = true
-            try { controller.error(err) } catch { /* ignore */ }
-            cleanup()
+          source.once('error', err => failStream(err))
+          res.once('aborted', () => failStream(new Error('Egress streaming response aborted mid-body.')))
+          res.once('close', () => {
+            if (!streamClosed && !res.complete) {
+              failStream(new Error('Egress streaming response closed prematurely mid-body.'))
+            }
           })
           if (source !== res) {
-            res.once('error', err => {
-              if (streamClosed) return
-              streamClosed = true
-              try { controller.error(err) } catch { /* ignore */ }
-              cleanup()
-            })
+            res.once('error', err => failStream(err))
           }
         },
         cancel() {
           streamClosed = true
-          signal?.removeEventListener('abort', onAbort)
+          signal.removeEventListener('abort', onAbort)
+          decomp?.decoder.destroy()
           req.destroy()
+          ksBound.release()
         },
       })
 
@@ -1017,15 +1101,15 @@ export async function egressFetchStream(
     req.on('error', err => finishHeaders(err))
 
     const onAbort = () => {
-      const reason = signal?.reason instanceof Error ? signal.reason : new Error('Egress streaming request aborted.')
+      const reason = signal.reason instanceof Error ? signal.reason : new Error('Egress streaming request aborted.')
       req.destroy(reason)
       finishHeaders(reason)
     }
-    if (signal?.aborted) {
+    if (signal.aborted) {
       onAbort()
       return
     }
-    signal?.addEventListener('abort', onAbort, { once: true })
+    signal.addEventListener('abort', onAbort, { once: true })
 
     if (body) req.write(body)
     req.end()
@@ -1036,8 +1120,9 @@ export async function egressFetchStream(
  * Canonical pinned-IP HTTP/1.1 raw transport hook for `RequestBroker` (`defaultTransport`).
  *
  * Preserves exact caller header ordering, optional body skipping (`readBody: false` / `HEAD`),
- * transparent gzip/deflate/br decompression, bounded truncation at `maxBodyBytes`, TLS socket
- * metadata inspection, and defense-in-depth cloud-metadata/link-local refusal.
+ * transparent gzip/deflate/br decompression via `stream.pipeline` (R2-H-19: truncated compressed
+ * bodies always settle cleanly), bounded truncation at `maxBodyBytes`, TLS socket metadata
+ * inspection, global/tenant kill-switch enforcement (H-2), and cloud-metadata/link-local refusal.
  */
 export async function egressRawHttp1<TTls = unknown>(
   url: URL,
@@ -1045,6 +1130,8 @@ export async function egressRawHttp1<TTls = unknown>(
   options: EgressRawHttp1Options<TTls> = {},
 ): Promise<EgressRawHttp1Response<TTls>> {
   warnIfEnvProxyEnabled()
+  const { ks, tenantId } = resolveEgressKillSwitch(options)
+  ks.assertAllowed(tenantId)
 
   const pinnedIp = stripBracketsAndZone(address.address)
   if (!pinnedIp || isMetadataOrLinkLocalAddress(pinnedIp)) {
@@ -1054,124 +1141,175 @@ export async function egressRawHttp1<TTls = unknown>(
     )
   }
 
-  return await new Promise<EgressRawHttp1Response<TTls>>((resolve, reject) => {
-    const isHttps = url.protocol === 'https:'
-    const port = url.port ? Number(url.port) : (isHttps ? 443 : 80)
-    const method = options.method ?? 'GET'
-    const readBody = options.readBody ?? false
-    const cap = Math.max(1, options.maxBodyBytes ?? DEFAULT_MAX_RESPONSE_BYTES)
-    const headers: Record<string, string> = { ...(options.headers ?? {}) }
-    if (!Object.keys(headers).some(k => k.toLowerCase() === 'host')) {
-      headers.Host = url.host
-    }
-    const hostname = stripBracketsAndZone(url.hostname)
+  const ksBound = bindEgressKillSwitchSignal(ks, options.signal, tenantId)
+  const signal = ksBound.signal
 
-    const onResponse = (res: IncomingMessage) => {
-      const tls = options.extractTls && res.socket instanceof TLSSocket
-        ? options.extractTls(res.socket, hostname)
-        : undefined
-      if (!readBody || method === 'HEAD') {
-        resolve({ status: res.statusCode ?? 0, headers: res.headers, body: '', bodyBytes: 0, bodyTruncated: false, tls })
-        res.destroy()
-        return
+  try {
+    return await new Promise<EgressRawHttp1Response<TTls>>((resolve, reject) => {
+      const isHttps = url.protocol === 'https:'
+      const port = url.port ? Number(url.port) : (isHttps ? 443 : 80)
+      const method = options.method ?? 'GET'
+      const readBody = options.readBody ?? false
+      const cap = Math.max(1, options.maxBodyBytes ?? DEFAULT_MAX_RESPONSE_BYTES)
+      const headers: Record<string, string> = { ...(options.headers ?? {}) }
+      if (!Object.keys(headers).some(k => k.toLowerCase() === 'host')) {
+        headers.Host = url.host
       }
+      const hostname = stripBracketsAndZone(url.hostname)
 
-      const rawEncoding = res.headers['content-encoding']
-      const encoding = (Array.isArray(rawEncoding) ? rawEncoding.join(', ') : (rawEncoding ?? '')).toLowerCase().trim()
-      let stream: NodeJS.ReadableStream = res
-      let decompressed = false
-      if (encoding === 'gzip' || encoding === 'x-gzip') {
-        const gunzip = createGunzip()
-        res.pipe(gunzip)
-        stream = gunzip
-        decompressed = true
-      } else if (encoding === 'deflate') {
-        const inflate = createInflate()
-        res.pipe(inflate)
-        stream = inflate
-        decompressed = true
-      } else if (encoding === 'br') {
-        const brotli = createBrotliDecompress()
-        res.pipe(brotli)
-        stream = brotli
-        decompressed = true
-      }
-
-      const chunks: Buffer[] = []
-      let total = 0
-      let truncated = false
       let finished = false
-      const done = () => {
+      let activeDecoder: Duplex | null = null
+      let activeRes: IncomingMessage | null = null
+
+      const cleanupListeners = () => {
+        signal.removeEventListener('abort', onAbort)
+      }
+
+      const fail = (err: unknown) => {
         if (finished) return
         finished = true
-        const responseHeaders: IncomingHttpHeaders = { ...res.headers }
-        if (decompressed) {
-          delete responseHeaders['content-encoding']
-          delete responseHeaders['content-length']
+        cleanupListeners()
+        try { activeDecoder?.destroy() } catch { /* ignore */ }
+        try { activeRes?.destroy() } catch { /* ignore */ }
+        try { req.destroy() } catch { /* ignore */ }
+        reject(err)
+      }
+
+      const onResponse = (res: IncomingMessage) => {
+        activeRes = res
+        const tls = options.extractTls && res.socket instanceof TLSSocket
+          ? options.extractTls(res.socket, hostname)
+          : undefined
+        if (!readBody || method === 'HEAD') {
+          if (!finished) {
+            finished = true
+            cleanupListeners()
+            resolve({ status: res.statusCode ?? 0, headers: res.headers, body: '', bodyBytes: 0, bodyTruncated: false, tls })
+          }
+          res.destroy()
+          return
         }
-        resolve({
-          status: res.statusCode ?? 0,
-          headers: responseHeaders,
-          body: Buffer.concat(chunks).toString('utf8'),
-          bodyBytes: total,
-          bodyTruncated: truncated,
-          tls,
+
+        const decomp = createResponseDecompressor(res.headers['content-encoding'])
+        const decompressed = decomp !== null
+        activeDecoder = decomp?.decoder ?? null
+        const stream: NodeJS.ReadableStream = decomp ? decomp.decoder : res
+
+        const chunks: Buffer[] = []
+        let total = 0
+        let truncated = false
+
+        const done = () => {
+          if (finished) return
+          finished = true
+          cleanupListeners()
+          const responseHeaders: IncomingHttpHeaders = { ...res.headers }
+          if (decompressed) {
+            delete responseHeaders['content-encoding']
+            delete responseHeaders['content-length']
+          }
+          resolve({
+            status: res.statusCode ?? 0,
+            headers: responseHeaders,
+            body: Buffer.concat(chunks).toString('utf8'),
+            bodyBytes: total,
+            bodyTruncated: truncated,
+            tls,
+          })
+        }
+
+        if (decomp) {
+          // R2-H-19: `stream.pipeline` guarantees premature EOF / FIN mid-body propagates
+          // into the zlib decoder and settles the promise instead of hanging forever.
+          pipeline(res, decomp.decoder, err => {
+            if (finished) return
+            if (err) {
+              if (truncated) done()
+              else fail(err)
+            }
+          })
+        }
+
+        stream.on('data', (chunk: Buffer) => {
+          if (finished) return
+          if (total + chunk.length > cap) {
+            const remaining = cap - total
+            if (remaining > 0) chunks.push(chunk.subarray(0, remaining))
+            total = cap
+            truncated = true
+            try { decomp?.decoder.destroy() } catch { /* ignore */ }
+            res.destroy()
+            done()
+            return
+          }
+          chunks.push(chunk)
+          total += chunk.length
+        })
+        stream.once('end', done)
+        stream.once('error', err => {
+          if (finished) return
+          if (truncated) done()
+          else fail(err)
+        })
+        res.once('aborted', () => {
+          if (finished) return
+          if (truncated) done()
+          else fail(new Error('HTTP/1.1 response aborted mid-body.'))
+        })
+        res.once('close', () => {
+          if (finished) return
+          if (truncated) done()
+          else if (!res.complete) fail(new Error('HTTP/1.1 response closed prematurely mid-body.'))
         })
       }
 
-      stream.on('data', (chunk: Buffer) => {
-        if (finished) return
-        if (total + chunk.length > cap) {
-          const remaining = cap - total
-          if (remaining > 0) chunks.push(chunk.subarray(0, remaining))
-          total = cap
-          truncated = true
-          res.destroy()
-          done()
-          return
-        }
-        chunks.push(chunk)
-        total += chunk.length
-      })
-      stream.once('end', done)
-      stream.once('close', done)
-      stream.once('error', err => {
-        if (!finished) {
-          if (truncated) done()
-          else reject(err)
-        }
-      })
+      const family = address.family === 4 || address.family === 6 ? address.family : undefined
+      const req = isHttps
+        ? httpsRequest({
+            hostname: pinnedIp,
+            ...(family ? { family } : {}),
+            servername: !isIpLiteralHost(hostname) ? hostname : undefined,
+            port,
+            path: url.pathname + url.search,
+            method,
+            agent: false,
+            rejectUnauthorized: options.rejectUnauthorized ?? true,
+            signal,
+            headers,
+          }, onResponse)
+        : httpRequest({
+            hostname: pinnedIp,
+            ...(family ? { family } : {}),
+            port,
+            path: url.pathname + url.search,
+            method,
+            agent: false,
+            signal,
+            headers,
+          }, onResponse)
+
+      const onAbort = () => {
+        fail(signal.reason ?? new Error('HTTP/1.1 egress request aborted.'))
+      }
+      if (signal.aborted) {
+        onAbort()
+        return
+      }
+      signal.addEventListener('abort', onAbort, { once: true })
+
+      req.once('error', err => fail(err))
+      if (options.body !== undefined) req.write(options.body)
+      req.end()
+    })
+  } catch (err) {
+    if (ksBound.signal.aborted && ksBound.signal.reason instanceof KillSwitchTrippedError) {
+      throw ksBound.signal.reason
     }
-
-    const family = address.family === 4 || address.family === 6 ? address.family : undefined
-    const req = isHttps
-      ? httpsRequest({
-          hostname: pinnedIp,
-          ...(family ? { family } : {}),
-          servername: !isIpLiteralHost(hostname) ? hostname : undefined,
-          port,
-          path: url.pathname + url.search,
-          method,
-          agent: false,
-          rejectUnauthorized: options.rejectUnauthorized ?? true,
-          signal: options.signal,
-          headers,
-        }, onResponse)
-      : httpRequest({
-          hostname: pinnedIp,
-          ...(family ? { family } : {}),
-          port,
-          path: url.pathname + url.search,
-          method,
-          agent: false,
-          signal: options.signal,
-          headers,
-        }, onResponse)
-
-    req.once('error', reject)
-    if (options.body !== undefined) req.write(options.body)
-    req.end()
-  })
+    if (ks.isActive(tenantId)) ks.assertAllowed(tenantId)
+    throw err
+  } finally {
+    ksBound.release()
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1179,9 +1317,10 @@ export async function egressRawHttp1<TTls = unknown>(
 // ---------------------------------------------------------------------------
 
 /**
- * Pinned-IP HTTP/2 request helper (ready for `verify-rpc.ts` / `broker.ts` adoption).
- * Resolves DNS once, validates all IPs, and dials the pinned IP directly via `createConnection`
- * with TLS SNI (`servername`) and `:authority` preserved.
+ * Pinned-IP HTTP/2 request helper (used by `RequestBroker.executeHttp2Exchange`).
+ * Resolves DNS once, validates all IPs, enforces global/tenant kill-switch (`H-2`), strips
+ * hop-by-hop headers (`C-1`), decompresses via `stream.pipeline` (`R2-H-19`), and dials the
+ * pinned IP directly via `createConnection` with TLS SNI (`servername`) and `:authority` preserved.
  */
 export async function egressHttp2(
   urlInput: string | URL,
@@ -1189,9 +1328,12 @@ export async function egressHttp2(
   policy: EgressPolicy = {},
 ): Promise<EgressHttp2Response> {
   warnIfEnvProxyEnabled()
+  const { ks, tenantId } = resolveEgressKillSwitch(policy)
+  ks.assertAllowed(tenantId)
 
   const method = (init.method ?? 'GET').toUpperCase()
   const validated = await resolveAndValidateHost(urlInput, policy, method)
+  ks.assertAllowed(tenantId)
   const pinned = validated.addresses.find(a => a.family === 4) ?? validated.addresses[0]!
   policy.onAllow?.({
     url: validated.url.href,
@@ -1205,11 +1347,8 @@ export async function egressHttp2(
   const isHttps = validated.url.protocol === 'https:'
   const port = validated.url.port ? Number(validated.url.port) : (isHttps ? 443 : 80)
 
-  const reqHeaders: Record<string, string> = {}
-  for (const [k, v] of Object.entries(init.headers ?? {})) {
-    if (k.trimStart().startsWith(':')) continue
-    reqHeaders[k.toLowerCase()] = v
-  }
+  // C-1: Strip pseudo-headers, `host`, and all RFC 9110/9113 hop-by-hop headers cleanly.
+  const reqHeaders = stripHttp2HopByHopHeaders(init.headers)
   const bodyBuf = init.body === undefined || init.body === null
     ? undefined
     : typeof init.body === 'string'
@@ -1221,6 +1360,8 @@ export async function egressHttp2(
     reqHeaders['content-length'] = String(bodyBuf.byteLength)
   }
 
+  const ksBound = bindEgressKillSwitchSignal(ks, init.signal, tenantId)
+  const signal = ksBound.signal
   const started = Date.now()
   let activeSocket: Duplex | undefined
   const client: ClientHttp2Session = http2Connect(validated.url.origin, {
@@ -1246,11 +1387,13 @@ export async function egressHttp2(
   })
 
   try {
-    init.signal?.throwIfAborted()
+    signal.throwIfAborted()
     return await new Promise<EgressHttp2Response>((resolve, reject) => {
       let settled = false
+      let activeDecoder: Duplex | null = null
       const timer = setTimeout(() => {
         const err = new Error(`HTTP/2 egress request timed out after ${timeoutMs}ms.`)
+        activeDecoder?.destroy()
         client.destroy(err)
         activeSocket?.destroy()
         finish(err)
@@ -1261,27 +1404,40 @@ export async function egressHttp2(
         if (settled) return
         settled = true
         clearTimeout(timer)
-        init.signal?.removeEventListener('abort', onAbort)
-        if (err) reject(err)
-        else resolve(result!)
+        signal.removeEventListener('abort', onAbort)
+        if (err) {
+          try { activeDecoder?.destroy() } catch { /* ignore */ }
+          reject(err)
+        } else {
+          resolve(result!)
+        }
       }
 
       const onAbort = () => {
-        const reason = init.signal?.reason instanceof Error ? init.signal.reason : new Error('HTTP/2 egress request aborted.')
+        const reason = signal.reason instanceof Error ? signal.reason : new Error('HTTP/2 egress request aborted.')
+        activeDecoder?.destroy()
         client.destroy(reason)
         activeSocket?.destroy()
         finish(reason)
       }
-      init.signal?.addEventListener('abort', onAbort, { once: true })
+      signal.addEventListener('abort', onAbort, { once: true })
       client.once('error', err => finish(err))
 
-      const stream = client.request({
-        ...reqHeaders,
-        ':method': method,
-        ':path': `${validated.url.pathname}${validated.url.search}`,
-        ':authority': validated.url.host,
-        ':scheme': isHttps ? 'https' : 'http',
-      })
+      let stream: ReturnType<ClientHttp2Session['request']>
+      try {
+        stream = client.request({
+          ...reqHeaders,
+          ':method': method,
+          ':path': `${validated.url.pathname}${validated.url.search}`,
+          ':authority': validated.url.host,
+          ':scheme': isHttps ? 'https' : 'http',
+        })
+      } catch (err) {
+        client.destroy()
+        activeSocket?.destroy()
+        finish(err)
+        return
+      }
 
       let status = 0
       const rawHeaders: Record<string, string> = {}
@@ -1301,6 +1457,7 @@ export async function egressHttp2(
           captured += chunk.length
           if (captured > maxResponseBytes) {
             truncated = true
+            activeDecoder?.destroy()
             stream.close(http2Constants.NGHTTP2_CANCEL)
             finish(new EgressDeniedError(
               'response_too_large',
@@ -1337,13 +1494,9 @@ export async function egressHttp2(
           if (k.startsWith(':') || v === undefined) continue
           rawHeaders[k.toLowerCase()] = Array.isArray(v) ? v.join(', ') : String(v)
         }
-        const encoding = (rawHeaders['content-encoding'] ?? '').toLowerCase().trim()
-        if (encoding === 'gzip' || encoding === 'x-gzip' || encoding === 'deflate' || encoding === 'br') {
-          const decoder = encoding === 'br'
-            ? createBrotliDecompress()
-            : encoding === 'deflate'
-              ? createInflate()
-              : createGunzip()
+        const decomp = createResponseDecompressor(rawHeaders['content-encoding'])
+        if (decomp) {
+          activeDecoder = decomp.decoder
           decompressed = true
           // Also enforce raw compressed byte cap to prevent decompression-bomb DoS.
           stream.on('data', (rawChunk: Buffer) => {
@@ -1351,23 +1504,43 @@ export async function egressHttp2(
             if (rawCaptured > maxResponseBytes) {
               truncated = true
               stream.close(http2Constants.NGHTTP2_CANCEL)
-              decoder.destroy()
+              decomp.decoder.destroy()
               finish(new EgressDeniedError(
                 'response_too_large',
                 `HTTP/2 egress response exceeded the ${maxResponseBytes}-byte limit.`,
               ))
             }
           })
-          stream.pipe(decoder)
-          bodyStream = decoder
+          pipeline(stream, decomp.decoder, err => {
+            if (settled) return
+            if (err) finish(err)
+          })
+          bodyStream = decomp.decoder
         }
         attachBodyListeners(bodyStream)
       })
       stream.once('error', err => finish(err))
+      stream.once('aborted', () => finish(new Error('HTTP/2 stream aborted mid-body.')))
+      stream.once('close', () => {
+        if (!settled && !stream.readableEnded) {
+          finish(new Error('HTTP/2 stream closed prematurely mid-body.'))
+        }
+      })
       stream.end(bodyBuf)
     })
+  } catch (err) {
+    if (ksBound.signal.aborted && ksBound.signal.reason instanceof KillSwitchTrippedError) {
+      throw ksBound.signal.reason
+    }
+    if (ks.isActive(tenantId)) ks.assertAllowed(tenantId)
+    throw err
   } finally {
+    ksBound.release()
     try { client.close() } catch { /* ignore */ }
+    try {
+      if (!client.destroyed) client.destroy()
+    } catch { /* ignore */ }
+    try { activeSocket?.destroy() } catch { /* ignore */ }
   }
 }
 
@@ -1514,6 +1687,8 @@ function resolveDynamicLoopbackPolicy(state: LoopbackProxyPolicy): {
       ...(state.resolveHost ? { resolveHost: state.resolveHost } : {}),
       ...(state.onDenied ? { onDenied: state.onDenied } : {}),
       ...(state.onAllow ? { onAllow: state.onAllow } : {}),
+      ...(state.tenantId !== undefined ? { tenantId: state.tenantId } : {}),
+      ...(state.killSwitch ? { killSwitch: state.killSwitch } : {}),
     },
     ...(scopePolicy ? { scopePolicy } : {}),
   }
@@ -1595,6 +1770,19 @@ export async function createLoopbackProxy(initialPolicy: LoopbackProxyPolicy = {
 
       const method = (req.method ?? 'GET').toUpperCase()
       const { egress: policy, scopePolicy } = resolveDynamicLoopbackPolicy(state)
+
+      const { ks, tenantId } = resolveEgressKillSwitch(policy)
+      if (ks.isActive(tenantId)) {
+        const ksReason = `Kill switch active for ${tenantId ? `tenant "${tenantId}"` : 'global'} scope.`
+        policy.onDenied?.({
+          url: targetUrl.href,
+          origin: targetUrl.origin,
+          code: 'kill_switch_active',
+          reason: ksReason,
+        })
+        writeProxyErrorResponse(res, 403, 'kill_switch_active', ksReason)
+        return
+      }
 
       if (scopePolicy) {
         const decision = evaluateBrowserScopeRequest(scopePolicy, {
@@ -1803,6 +1991,18 @@ export async function createLoopbackProxy(initialPolicy: LoopbackProxyPolicy = {
       const candidateOrigin = parsed.port === 443
         ? `https://${parsed.hostname.includes(':') ? `[${parsed.hostname}]` : parsed.hostname}`
         : `https://${parsed.hostHeader}`
+
+      const { ks, tenantId } = resolveEgressKillSwitch(policy)
+      if (ks.isActive(tenantId)) {
+        policy.onDenied?.({
+          url: candidateOrigin,
+          origin: candidateOrigin,
+          code: 'kill_switch_active',
+          reason: `Kill switch active for ${tenantId ? `tenant "${tenantId}"` : 'global'} scope.`,
+        })
+        writeConnectError(clientSocket, 403, 'Forbidden', 'kill_switch_active')
+        return
+      }
 
       if (state.allowConnectPort) {
         if (!state.allowConnectPort(parsed.port, parsed.hostname)) {
