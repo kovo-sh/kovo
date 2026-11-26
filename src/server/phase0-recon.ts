@@ -164,6 +164,8 @@ export interface Phase0ReconResult {
   staticSnapshot?: StaticWorkspaceSnapshot
   /** Origins short-circuited early due to consecutive transport timeouts/errors or 520–526 responses. */
   skippedDeadHosts?: Array<{ origin: string; reason: string; requestsUsed: number }>
+  /** Origins short-circuited early due to uniform edge-protection walls across initial probes. */
+  edgeProtectedOrigins?: EdgeProtectedOriginRecord[]
   /** Structured SPA routes harvested from JS bundles and browser state-graph crawl for InvariantSynthesizer. */
   runtimeSpaRoutes?: RuntimeSpaRoute[]
   /** Structured GraphQL catalogs harvested from introspection, SDL specs, and JS bundles. */
@@ -174,6 +176,30 @@ export interface Phase0ReconResult {
   truncations?: Phase0TruncationRecord[]
 }
 
+export type EdgeProtectionVendor = 'vercel_deployment_protection' | 'cloudflare_access' | 'edge_auth_wall'
+
+export interface EdgeProtectedOriginRecord {
+  origin: string
+  vendor: EdgeProtectionVendor
+  reason: string
+  status: number
+  probesObserved: number
+  requestsUsed: number
+  evidence: string[]
+}
+
+export interface StaticServerActionHint {
+  actionName: string
+  framework: 'nextjs'
+  /** Inferred importing or sibling Next.js App Router page route (invoked via POST <page> + Next-Action header). */
+  pageRoute?: string
+  headerHint: 'Next-Action'
+  authRequirement: string | null
+  ownershipGuard: string | null
+  sinkKinds: string[]
+  codeLocation: CodeLocation
+}
+
 export interface RepoStaticExtractionSummary {
   astRoutes: number
   regexFallbackRoutes: number
@@ -182,6 +208,8 @@ export interface RepoStaticExtractionSummary {
   /** Count of multi-origin AST routes left explicitly unmapped instead of misattributing to origins[0]. */
   unmappedRoutes?: number
   frameworks: string[]
+  /** Next.js `"use server"` functions recorded as metadata/hints (invoked via page route + `Next-Action` header, never synthetic `/_actions/*` routes). */
+  serverActions?: StaticServerActionHint[]
   /** Service -> origin resolution reused for AST route attribution. */
   originMappings: ServiceOriginMapping[]
   /** `METHOD pathTemplate` -> origin provenance for AST routes (multi-origin targets). */
@@ -475,6 +503,7 @@ export function extractStaticFrameworkRoutes(
 ): {
   routes: StaticExtractedRoute[]
   frameworks: string[]
+  serverActions: StaticServerActionHint[]
 } {
   const sourceEntries: Array<{ rel: string; code: string }> = []
   if (staticSnapshot) {
@@ -484,13 +513,13 @@ export function extractStaticFrameworkRoutes(
       sourceEntries.push({ rel, code })
     }
   } else {
-    if (!reposDir || !existsSync(reposDir)) return { routes: [], frameworks: [] }
+    if (!reposDir || !existsSync(reposDir)) return { routes: [], frameworks: [], serverActions: [] }
     const files = walkRepoFiles(reposDir)
     let rootReal: string
     try {
       rootReal = realpathSync(reposDir)
     } catch {
-      return { routes: [], frameworks: [] }
+      return { routes: [], frameworks: [], serverActions: [] }
     }
     for (const fullPath of files) {
       const code = readRepoRegularFile(fullPath)
@@ -499,8 +528,36 @@ export function extractStaticFrameworkRoutes(
     }
   }
   const routes: StaticExtractedRoute[] = []
+  const serverActions: StaticServerActionHint[] = []
   const frameworks = new Set<string>()
   const seen = new Set<string>()
+  const seenServerActions = new Set<string>()
+
+  // Index Next.js App Router pages so "use server" functions can link to their importing page route
+  // without minting fake POST /_actions/<fn> HTTP endpoints.
+  const nextAppPages: Array<{ rel: string; pageRoute: string; code: string }> = []
+  for (const entry of sourceEntries) {
+    const pageMatch = /(?:^|\/)(?:src\/)?app((?:\/[^?#]*)?)\/page\.(?:ts|tsx|js|jsx|mjs)$/i.exec(entry.rel)
+    if (!pageMatch) continue
+    const rawPageRoute = (pageMatch[1] || '/').replace(/\/\([^)]+\)/g, '') || '/'
+    nextAppPages.push({ rel: entry.rel, pageRoute: normalizeRouteTemplate(rawPageRoute), code: entry.code })
+  }
+  const inferServerActionPageRoute = (actionRel: string, actionName: string): string | undefined => {
+    const fileStem = (actionRel.split('/').pop() ?? '').replace(/\.(?:ts|tsx|js|jsx|mjs|cjs)$/i, '')
+    const repoPrefix = actionRel.split('/').slice(0, 2).join('/')
+    const importedPage = nextAppPages.find(p =>
+      (p.rel.startsWith(`${repoPrefix}/`) || actionRel.split('/')[0] === p.rel.split('/')[0])
+      && p.code.includes(actionName)
+      && (!fileStem || p.code.includes(fileStem)),
+    )
+    if (importedPage) return importedPage.pageRoute
+    const appDirMatch = /(?:^|\/)(?:src\/)?app((?:\/[^?#]*)?)\/[^/]+\.(?:ts|tsx|js|jsx|mjs)$/i.exec(actionRel)
+    if (appDirMatch) {
+      const rawRoute = (appDirMatch[1] || '/').replace(/\/\([^)]+\)/g, '') || '/'
+      return normalizeRouteTemplate(rawRoute)
+    }
+    return undefined
+  }
 
   const pushRoute = (r: StaticExtractedRoute) => {
     const key = `${r.method.toUpperCase()} ${r.pathTemplate}`
@@ -550,19 +607,25 @@ export function extractStaticFrameworkRoutes(
       })
     }
 
-    // 1c. Next.js "use server" Server Actions
+    // 1c. Next.js "use server" Server Actions: NOT served at POST /_actions/<fn> (they invoke the
+    // importing page route with a `Next-Action: <hash>` header). Record cleanly as metadata hints
+    // instead of minting synthetic /_actions/* HTTP routes that only produce 404 probe spam.
     if (/['"]use server['"]/.test(code)) {
       for (const m of code.matchAll(/export\s+(?:async\s+)?function\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(/g)) {
+        const actionName = m[1]
+        const actionKey = `${rel}:${actionName}`
+        if (seenServerActions.has(actionKey)) continue
+        seenServerActions.add(actionKey)
         const line = lineNumberAt(code, m.index ?? 0)
-        const pathTemplate = `/_actions/${m[1]}`
-        pushRoute({
-          method: 'POST',
-          pathTemplate,
+        const pageRoute = inferServerActionPageRoute(rel, actionName)
+        frameworks.add('nextjs')
+        serverActions.push({
+          actionName,
           framework: 'nextjs',
+          ...(pageRoute ? { pageRoute } : {}),
+          headerHint: 'Next-Action',
           ...meta,
           sinkKinds: [...new Set([...meta.sinkKinds, 'server_action'])],
-          riskScore: scoreEndpointRisk('POST', pathTemplate, ['server_action', ...meta.sinkKinds], meta.authRequirement),
-          params: [],
           codeLocation: { repo: repoName, file: rel, startLine: line, endLine: line + 5 },
         })
       }
@@ -767,7 +830,7 @@ export function extractStaticFrameworkRoutes(
     }
   }
 
-  return { routes, frameworks: [...frameworks] }
+  return { routes, frameworks: [...frameworks], serverActions }
 }
 
 // ============================================================================
@@ -1193,17 +1256,163 @@ function finalizeRepoProgramGraphExtraction(
       routeId: route.id,
     })
   }
+  const baseHypotheses = deriveCodeToRuntimeHypotheses(graph, {
+    ...(recentDiffSignals?.length ? { recentDiffSignals } : {}),
+  })
+  const hypotheses: CodeToRuntimeHypothesis[] = [...baseHypotheses]
+  // When mounted repos have extracted AST routes that did not trigger the narrow intra-file sink
+  // rules in `deriveCodeToRuntimeHypotheses` (common in multi-repo workspaces with external SDK
+  // sinks or Next.js/Express route handlers), seed grounded route-bound hypotheses for unguarded
+  // sink-bearing or high-risk routes so `phase0.code_slices` attaches real bounded slices.
+  if (graph.routes.length > 0 && hypotheses.length === 0) {
+    const coveredRouteIds = new Set(hypotheses.map(h => h.routeId).filter((id): id is string => Boolean(id)))
+    const graphRouteById = new Map(graph.routes.map(r => [r.id, r]))
+    const rankedRoutes = [...routes]
+      .filter(r => r.routeId && graphRouteById.has(r.routeId) && !coveredRouteIds.has(r.routeId))
+      .sort((a, b) =>
+        (b.sinkKinds.length > 0 ? 1 : 0) - (a.sinkKinds.length > 0 ? 1 : 0)
+        || (a.authClass === 'unguarded' ? 0 : 1) - (b.authClass === 'unguarded' ? 0 : 1)
+        || b.riskScore - a.riskScore
+        || a.pathTemplate.localeCompare(b.pathTemplate),
+      )
+      .slice(0, 24)
+    for (const r of rankedRoutes) {
+      const gr = graphRouteById.get(r.routeId!)!
+      const primarySink = r.sinkKinds[0]
+      const mappedSink = primarySink === 'db_query' ? 'db_query' as const
+        : primarySink === 'command_exec' ? 'command' as const
+        : primarySink === 'outbound_fetch' ? 'outbound_fetch' as const
+        : primarySink === 'file_io' ? 'file' as const
+        : primarySink === 'redirect' ? 'redirect' as const
+        : undefined
+      hypotheses.push({
+        id: `hyp:route:${gr.id}`,
+        kind: 'unauthenticated_sink',
+        severity: mappedSink === 'db_query' || mappedSink === 'command' ? 'high' : 'medium',
+        confidence: mappedSink ? 0.62 : 0.52,
+        framework: gr.framework,
+        method: gr.method,
+        path: gr.path,
+        file: gr.file,
+        line: gr.line,
+        ...(mappedSink ? { sinkKind: mappedSink } : {}),
+        routeId: gr.id,
+        rationale: mappedSink
+          ? `Mounted route ${gr.method} ${gr.path} (${gr.file}:${gr.line}) contains ${mappedSink} sink evidence (${r.authClass ?? 'unguarded'}).`
+          : `Mounted route ${gr.method} ${gr.path} (${gr.file}:${gr.line}) extracted from workspace Program Graph (${r.authClass ?? 'unguarded'}).`,
+        evidence: [
+          `repo=${r.codeLocation.repo}`,
+          `guards=[${gr.guards.join(', ')}]`,
+          ...(r.sinkKinds.length ? [`sinks=[${r.sinkKinds.join(', ')}]`] : []),
+        ],
+        probeClass: mappedSink === 'outbound_fetch' ? 'ssrf'
+          : mappedSink === 'db_query' || mappedSink === 'command' ? 'injection'
+          : r.authClass === 'unguarded' ? 'auth_bypass' : 'bola_bfla',
+      })
+    }
+  }
   return {
     graph,
     routes,
     frameworks: [...new Set(graph.routes.map(route => route.framework))],
-    hypotheses: deriveCodeToRuntimeHypotheses(graph, {
-      ...(recentDiffSignals?.length ? { recentDiffSignals } : {}),
-    }),
+    hypotheses,
     originMappings,
     routeOrigins,
     warnings: [...graph.warnings],
     truncations: [...inputs.truncations],
+  }
+}
+
+const MULTI_REPO_GRAPH_WORKER_TIMEOUT_MS = 25_000
+
+/** Partition source files by mounted repo prefix (supports both `owner/repo/...` and top-level `<repo>/...`). */
+function partitionSourceFilesByRepo(
+  sourceFiles: ReadonlyArray<{ path: string; content: string }>,
+  mountedRepos: readonly string[],
+): Array<{ repo: string; files: Array<{ path: string; content: string }> }> {
+  const sortedMounted = [...mountedRepos].filter(Boolean).sort((a, b) => b.length - a.length)
+  const buckets = new Map<string, Array<{ path: string; content: string }>>()
+  for (const file of sourceFiles) {
+    const owner = sortedMounted.find(m => file.path === m || file.path.startsWith(`${m}/`))
+      ?? file.path.split('/')[0]
+      ?? 'repo'
+    const list = buckets.get(owner)
+    if (list) list.push(file)
+    else buckets.set(owner, [file])
+  }
+  return [...buckets.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([repo, files]) => ({ repo, files }))
+}
+
+/** Merge multiple per-repo ProgramGraphs deterministically without losing routes, nodes, edges, or code hints. */
+function mergeProgramGraphs(graphs: readonly ProgramGraph[], repoLabel?: string): ProgramGraph {
+  const frameworks = new Set<ProgramGraph['frameworks'][number]>()
+  const routes: ProgramGraph['routes'] = []
+  const routeSeen = new Set<string>()
+  const nodes: ProgramGraph['nodes'] = []
+  const nodeSeen = new Set<string>()
+  const edges: ProgramGraph['edges'] = []
+  const edgeSeen = new Set<string>()
+  const globalMiddleware = new Set<string>()
+  const warnings: string[] = []
+  const warningSeen = new Set<string>()
+  const codeHints: NonNullable<ProgramGraph['codeHints']> = {}
+  const staticLeads: NonNullable<ProgramGraph['staticLeads']> = []
+  const leadSeen = new Set<string>()
+  let filesScanned = 0
+
+  for (const g of graphs) {
+    filesScanned += g.filesScanned
+    for (const fw of g.frameworks) frameworks.add(fw)
+    for (const r of g.routes) {
+      if (routeSeen.has(r.id)) continue
+      routeSeen.add(r.id)
+      routes.push(r)
+    }
+    for (const n of g.nodes) {
+      if (nodeSeen.has(n.id)) continue
+      nodeSeen.add(n.id)
+      nodes.push(n)
+    }
+    for (const e of g.edges) {
+      const ek = `${e.fromId}|${e.toId}|${e.kind ?? ''}|${e.file}:${e.line}`
+      if (edgeSeen.has(ek)) continue
+      edgeSeen.add(ek)
+      edges.push(e)
+    }
+    for (const mw of g.globalMiddleware) globalMiddleware.add(mw)
+    for (const w of g.warnings) {
+      if (warningSeen.has(w)) continue
+      warningSeen.add(w)
+      warnings.push(w)
+    }
+    if (g.codeHints) {
+      for (const [k, hints] of Object.entries(g.codeHints)) {
+        const list = codeHints[k] ?? []
+        for (const h of hints) list.push(h)
+        codeHints[k] = list
+      }
+    }
+    for (const lead of g.staticLeads ?? []) {
+      const lk = `${lead.id}|${lead.kind}|${lead.file}:${lead.line}|${lead.note}`
+      if (leadSeen.has(lk)) continue
+      leadSeen.add(lk)
+      staticLeads.push(lead)
+    }
+  }
+
+  return {
+    ...(repoLabel ? { repo: repoLabel } : {}),
+    filesScanned,
+    frameworks: [...frameworks],
+    routes,
+    nodes,
+    edges,
+    globalMiddleware: [...globalMiddleware],
+    warnings,
+    ...(Object.keys(codeHints).length > 0 ? { codeHints } : {}),
+    ...(staticLeads.length > 0 ? { staticLeads } : {}),
   }
 }
 
@@ -1230,6 +1439,8 @@ export function extractRepoProgramGraph(input: {
 /**
  * Worker-isolated async variant of `extractRepoProgramGraph` offloading untrusted source
  * scanning into `UntrustedComputePool` so large/hostile repos cannot stall the event loop.
+ * Uses a generous bounded worker timeout and falls back to per-repo partitioning if a giant
+ * multi-repo workspace overflows a single worker isolate so `phase0.code_slices` stays populated.
  */
 export async function extractRepoProgramGraphInWorker(input: {
   reposDir?: string
@@ -1241,11 +1452,59 @@ export async function extractRepoProgramGraphInWorker(input: {
 }): Promise<RepoProgramGraphExtraction | null> {
   const prepared = collectGraphExtractionInputs(input)
   if (!prepared) return null
-  const graph = prepared.precomputedGraph
-    ?? await extractProgramGraphInWorker(
-      { files: prepared.inputs.sourceFiles, repo: prepared.inputs.mountedRepos.join(',') || undefined },
-      { signal: input.signal },
-    )
+  const usePrecomputed = prepared.precomputedGraph
+    && (prepared.precomputedGraph.routes.length > 0 || prepared.inputs.sourceFiles.length === 0)
+  let graph: ProgramGraph
+  if (usePrecomputed) {
+    graph = prepared.precomputedGraph!
+  } else {
+    const repoLabel = prepared.inputs.mountedRepos.join(',') || undefined
+    let combined: ProgramGraph | null = null
+    let combinedError: string | null = null
+    try {
+      combined = await extractProgramGraphInWorker(
+        { files: prepared.inputs.sourceFiles, repo: repoLabel },
+        { timeoutMs: MULTI_REPO_GRAPH_WORKER_TIMEOUT_MS, signal: input.signal },
+      )
+    } catch (err) {
+      if (input.signal?.aborted || err instanceof UntrustedComputeAbortedError) throw err
+      combinedError = err instanceof Error ? err.message : String(err)
+    }
+    const buckets = partitionSourceFilesByRepo(prepared.inputs.sourceFiles, prepared.inputs.mountedRepos)
+    if (combined && (combined.routes.length > 0 || buckets.length <= 1)) {
+      graph = combined
+    } else if (buckets.length > 1) {
+      const parts: ProgramGraph[] = []
+      const bucketWarnings: string[] = combinedError ? [`Combined ProgramGraph worker failed (${combinedError}); partitioned across ${buckets.length} repos.`] : []
+      await runBoundedPool(
+        buckets,
+        2,
+        async bucket => {
+          if (input.signal?.aborted) return
+          try {
+            const part = await extractProgramGraphInWorker(
+              { files: bucket.files, repo: bucket.repo },
+              { timeoutMs: MULTI_REPO_GRAPH_WORKER_TIMEOUT_MS, signal: input.signal },
+            )
+            parts.push(part)
+          } catch (err) {
+            if (input.signal?.aborted || err instanceof UntrustedComputeAbortedError) throw err
+            const msg = err instanceof Error ? err.message : String(err)
+            bucketWarnings.push(`ProgramGraph worker skipped repo "${bucket.repo}": ${msg}`)
+          }
+        },
+        () => Boolean(input.signal?.aborted),
+      )
+      graph = mergeProgramGraphs(parts, repoLabel)
+      if (bucketWarnings.length > 0) {
+        graph = { ...graph, warnings: [...graph.warnings, ...bucketWarnings] }
+      }
+    } else if (combined) {
+      graph = combined
+    } else {
+      throw new Error(combinedError ?? 'ProgramGraph worker extraction failed')
+    }
+  }
   return finalizeRepoProgramGraphExtraction(prepared.inputs, graph, input.origins, input.recentDiffSignals)
 }
 
@@ -3816,7 +4075,110 @@ const PHASE0_ORIGIN_CONCURRENCY = 6
 const PHASE0_BROWSER_CONCURRENCY = 3
 const PHASE0_INNER_CONCURRENCY = 3
 const PHASE0_DEAD_HOST_THRESHOLD = 3
+const PHASE0_EDGE_WALL_THRESHOLD = 3
 const PHASE0_ORIGIN_DOWN_STATUSES = new Set([520, 521, 522, 523, 524, 525, 526])
+
+const VERCEL_WALL_BODY_RE = /vercel\s+(?:authentication|deployment\s+protection|sso)|_vercel_sso_nonce|authentication\s+required[\s\S]{0,240}vercel|vercel\.com\/sso/i
+const VERCEL_WALL_LOCATION_RE = /(?:vercel\.com\/sso|\/_vercel\/sso)/i
+const CF_ACCESS_HOST_RE = /\.cloudflareaccess\.com(?:\/|$)/i
+const CF_ACCESS_PATH_RE = /\/cdn-cgi\/access\/login/i
+const CF_ACCESS_BODY_RE = /cloudflare\s+access|cdn-cgi\/access\/login|cf_authorization|access\s+denied[\s\S]{0,160}cloudflare/i
+
+/**
+ * Pure fingerprint for uniform edge-protection authentication walls (Vercel Deployment Protection,
+ * Cloudflare Access, Cloud IAP / edge auth proxies). Used by Phase 0 to quarantine edge-walled
+ * origins once `>= 3` distinct initial paths return only edge-wall responses with 0 non-wall hits.
+ */
+function classifyEdgeProtectionWallResponse(
+  ex: Pick<BrokerExchangeResult, 'status' | 'respHeaders' | 'body' | 'mediaType' | 'finalOrigin' | 'finalPathAndQuery' | 'redirectOrigins' | 'redirectPaths'>,
+): { vendor: EdgeProtectionVendor; reason: string; evidence: string[] } | null {
+  const headers: Record<string, string> = {}
+  for (const [k, v] of Object.entries(ex.respHeaders ?? {})) {
+    if (typeof v === 'string') headers[k.toLowerCase()] = v
+  }
+  const server = headers['server'] ?? ''
+  const location = headers['location'] ?? ''
+  const setCookie = headers['set-cookie'] ?? ''
+  const wwwAuth = headers['www-authenticate'] ?? ''
+  const bodyHead = (ex.body ?? '').slice(0, 4096)
+  const isRedirect = ex.status === 301 || ex.status === 302 || ex.status === 303 || ex.status === 307 || ex.status === 308
+  const redirectOrigins = Array.isArray(ex.redirectOrigins) ? ex.redirectOrigins : []
+  const redirectPaths = Array.isArray(ex.redirectPaths) ? ex.redirectPaths : []
+
+  // 1. Cloudflare Access (403 CF Access wall or 3xx/followed redirect to *.cloudflareaccess.com or /cdn-cgi/access/login)
+  const hitCfAccessRedirect =
+    CF_ACCESS_HOST_RE.test(location)
+    || CF_ACCESS_PATH_RE.test(location)
+    || (ex.finalOrigin ? CF_ACCESS_HOST_RE.test(ex.finalOrigin) : false)
+    || (ex.finalPathAndQuery ? CF_ACCESS_PATH_RE.test(ex.finalPathAndQuery) : false)
+    || redirectOrigins.some(ro => CF_ACCESS_HOST_RE.test(ro))
+    || redirectPaths.some(rp => CF_ACCESS_HOST_RE.test(rp) || CF_ACCESS_PATH_RE.test(rp))
+  if (hitCfAccessRedirect) {
+    return {
+      vendor: 'cloudflare_access',
+      reason: `cloudflare_access_redirect_http_${ex.status}`,
+      evidence: [
+        `status=${ex.status}`,
+        ...(location ? [`location=${location.slice(0, 120)}`] : []),
+        ...(ex.finalOrigin && CF_ACCESS_HOST_RE.test(ex.finalOrigin) ? [`final_origin=${ex.finalOrigin}`] : []),
+      ],
+    }
+  }
+  if (ex.status === 403 && (Boolean(headers['cf-ray']) || /cloudflare/i.test(server)) && CF_ACCESS_BODY_RE.test(bodyHead)) {
+    return {
+      vendor: 'cloudflare_access',
+      reason: 'cloudflare_access_403',
+      evidence: [
+        'status=403',
+        ...(headers['cf-ray'] ? [`cf-ray=${headers['cf-ray'].slice(0, 48)}`] : []),
+        ...(server ? [`server=${server.slice(0, 48)}`] : []),
+      ],
+    }
+  }
+
+  // 2. Vercel Deployment Protection (401/403 with x-vercel-id / Vercel SSO cookie / auth wall HTML)
+  const hasVercelHeader = Boolean(headers['x-vercel-id'] || headers['x-vercel-error'] || headers['x-vercel-mitigated']) || /vercel/i.test(server)
+  const hasVercelWallSignal =
+    /_vercel_sso_nonce/i.test(setCookie)
+    || /vercel/i.test(wwwAuth)
+    || VERCEL_WALL_LOCATION_RE.test(location)
+    || VERCEL_WALL_BODY_RE.test(bodyHead)
+  if ((ex.status === 401 || ex.status === 403) && (hasVercelWallSignal || (ex.status === 401 && hasVercelHeader && !/json/i.test(ex.mediaType ?? headers['content-type'] ?? '')))) {
+    return {
+      vendor: 'vercel_deployment_protection',
+      reason: `vercel_deployment_protection_${ex.status}`,
+      evidence: [
+        `status=${ex.status}`,
+        ...(headers['x-vercel-id'] ? [`x-vercel-id=${headers['x-vercel-id'].slice(0, 48)}`] : []),
+        ...(/_vercel_sso_nonce/i.test(setCookie) ? ['cookie=_vercel_sso_nonce'] : []),
+        ...(VERCEL_WALL_BODY_RE.test(bodyHead) ? ['body=vercel_auth_wall'] : []),
+      ],
+    }
+  }
+  if (isRedirect && hasVercelHeader && VERCEL_WALL_LOCATION_RE.test(location)) {
+    return {
+      vendor: 'vercel_deployment_protection',
+      reason: `vercel_sso_redirect_${ex.status}`,
+      evidence: [`status=${ex.status}`, `location=${location.slice(0, 120)}`],
+    }
+  }
+
+  // 3. Generic edge auth proxy walls (Google Cloud IAP / AWS WAF edge block)
+  if ((ex.status === 401 || ex.status === 403) && (Boolean(headers['x-goog-iap-generated-response']) || Boolean(headers['x-amzn-waf-action']) || Boolean(headers['x-edge-auth']))) {
+    return {
+      vendor: 'edge_auth_wall',
+      reason: `edge_auth_wall_${ex.status}`,
+      evidence: [
+        `status=${ex.status}`,
+        ...(headers['x-goog-iap-generated-response'] ? ['header=x-goog-iap-generated-response'] : []),
+        ...(headers['x-amzn-waf-action'] ? [`x-amzn-waf-action=${headers['x-amzn-waf-action'].slice(0, 48)}`] : []),
+        ...(headers['x-edge-auth'] ? [`x-edge-auth=${headers['x-edge-auth'].slice(0, 48)}`] : []),
+      ],
+    }
+  }
+
+  return null
+}
 
 function resolvePhase0OriginConcurrency(envValue = process.env.KOVO_PHASE0_ORIGIN_CONCURRENCY): number {
   const parsed = Number.parseInt((envValue ?? '').trim(), 10)
@@ -4057,6 +4419,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
   // Per-phase paged-read metrics for the discovery planning reads (nav, GraphQL, sibling derivation).
   const readPagedMetrics: PagedReadMetric[] = []
   const skippedDeadHosts: Array<{ origin: string; reason: string; requestsUsed: number }> = []
+  const edgeProtectedOrigins: EdgeProtectedOriginRecord[] = []
   let skippedBrowserNonHtml = 0
 
   // Build or reuse ONE StaticWorkspaceSnapshot per Phase 0 run so manifests, regex fallback routes,
@@ -4064,7 +4427,11 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
   let staticSnapshot: StaticWorkspaceSnapshot | undefined = params.staticSnapshot
   if (!staticSnapshot && params.reposDir && existsSync(params.reposDir)) {
     try {
-      staticSnapshot = await getOrBuildStaticWorkspaceSnapshotInWorker(params.reposDir, undefined, { signal })
+      staticSnapshot = await getOrBuildStaticWorkspaceSnapshotInWorker(params.reposDir, undefined, {
+        maxFiles: 10_000,
+        workerTimeoutMs: MULTI_REPO_GRAPH_WORKER_TIMEOUT_MS,
+        signal,
+      })
     } catch (err) {
       if (signal.aborted || err instanceof UntrustedComputeAbortedError) throw err
       staticSnapshot = undefined
@@ -4236,6 +4603,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       duplicateRoutes: merged.duplicates,
       ...(unmappedRoutes > 0 ? { unmappedRoutes } : {}),
       frameworks: [...new Set([...(graphExtraction?.frameworks ?? []), ...regexExtracted.frameworks])],
+      ...(regexExtracted.serverActions.length > 0 ? { serverActions: regexExtracted.serverActions } : {}),
       originMappings: graphExtraction?.originMappings ?? [],
       routeOrigins: graphExtraction?.routeOrigins ?? {},
       warnings: extractionWarnings,
@@ -4311,6 +4679,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         mergedRoutes: repoStaticExtraction.mergedRoutes,
         duplicateRoutes: repoStaticExtraction.duplicateRoutes,
         hypotheses: codeToRuntimeHypotheses.length,
+        ...(regexExtracted.serverActions.length > 0 ? { serverActionsCount: regexExtracted.serverActions.length } : {}),
         origins: repoStaticExtraction.originMappings,
         warnings: repoStaticExtraction.warnings.slice(0, 8),
       })
@@ -4484,6 +4853,10 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     let healthyResponses = 0
     let htmlResponsesObserved = 0
     let deadHostReason: string | null = null
+    const edgeWallDistinctPaths = new Set<string>()
+    let edgeWallMatch: { vendor: EdgeProtectionVendor; reason: string; status: number; evidence: string[] } | null = null
+    let nonEdgeWallResponses = 0
+    let edgeProtectedRecord: EdgeProtectedOriginRecord | null = null
     let originNavigationRequests = 0
     const probedPaths = new Set<string>()
     const jsQueue: string[] = []
@@ -4747,10 +5120,30 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
           timeoutMs: requestTimeoutMs,
         }, grant, signal)
         if (persona) authRequests += 1
+        const edgeWall = classifyEdgeProtectionWallResponse(ex)
+        if (edgeWall && nonEdgeWallResponses === 0) {
+          const bareProbePath = (pathAndQuery.split('?')[0] || '/').replace(/\/+$/, '') || '/'
+          edgeWallDistinctPaths.add(bareProbePath)
+          edgeWallMatch ??= { ...edgeWall, status: ex.status }
+          if (edgeWallDistinctPaths.size >= PHASE0_EDGE_WALL_THRESHOLD) {
+            originHalted = true
+            edgeProtectedRecord ??= {
+              origin,
+              vendor: edgeWallMatch.vendor,
+              reason: edgeWallMatch.reason,
+              status: edgeWallMatch.status,
+              probesObserved: edgeWallDistinctPaths.size,
+              requestsUsed: originUsed,
+              evidence: edgeWallMatch.evidence,
+            }
+          }
+        } else if (!edgeWall) {
+          nonEdgeWallResponses += 1
+        }
         if (ex.status < 500) {
           healthyResponses += 1
           consecutiveDeadResponses = 0
-          if (isHtmlLikeResponse(ex.status, ex.mediaType, ex.body)) {
+          if (!edgeWall && isHtmlLikeResponse(ex.status, ex.mediaType, ex.body)) {
             htmlResponsesObserved += 1
           }
         } else if (PHASE0_ORIGIN_DOWN_STATUSES.has(ex.status)) {
@@ -4897,7 +5290,30 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     const seedBudget = Math.max(1, perOriginCap - jsReserve)
 
     const shortCircuitIfDeadHost = (): boolean => {
-      if (!originHalted || !deadHostReason) return false
+      if (!originHalted) return false
+      if (edgeProtectedRecord) {
+        const record: EdgeProtectedOriginRecord = { ...edgeProtectedRecord, requestsUsed: originUsed }
+        edgeProtectedOrigins.push(record)
+        storage.event(
+          runId,
+          'phase0.edge_protected',
+          `Origin ${origin} returned uniform edge-protection wall (${record.vendor}; HTTP ${record.status} across ${record.probesObserved} distinct paths); quarantined.`,
+          { ...record },
+        )
+        hostsDone += 1
+        emitPhase0Stage(
+          'host_fingerprint',
+          `Quarantined edge-protected host ${origin} (${record.vendor}; ${originUsed} reqs) (${hostsDone}/${hostsTotal}).`,
+          {
+            origin,
+            hostsDone,
+            hostsTotal,
+            force: true,
+          },
+        )
+        return true
+      }
+      if (!deadHostReason) return false
       skippedDeadHosts.push({ origin, reason: deadHostReason, requestsUsed: originUsed })
       hostsDone += 1
       emitPhase0Stage(
@@ -5012,7 +5428,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
             if (rootEx && rootEx.status < 400) break
           }
         }
-        if (rootEx) {
+        if (rootEx && !(edgeWallMatch && nonEdgeWallResponses === 0)) {
           await processRootSurface(rootEx.status, rootEx.mediaType, rootEx.respHeaders, rootEx.body, false)
         }
       }
@@ -5026,7 +5442,9 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       const cal: SoftNotFoundCalibration = { statuses: [], mediaTypes: [], lengths: [], signatures: [] }
       const probeCount = Math.min(3, Math.max(1, perOriginCap - originUsed - 1))
       const calPaths = buildSoft404ProbePaths(probeCount)
-      const calConcurrency = healthyResponses > 0 ? Math.min(PHASE0_INNER_CONCURRENCY, calPaths.length) : 1
+      const calConcurrency = (healthyResponses > 0 && !(edgeWallMatch && nonEdgeWallResponses === 0))
+        ? Math.min(PHASE0_INNER_CONCURRENCY, calPaths.length)
+        : 1
       await runBoundedPool(
         calPaths,
         calConcurrency,
@@ -6467,6 +6885,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     stoppedReason,
     readPaged: readPagedMetrics,
     ...(skippedDeadHosts.length > 0 ? { skippedDeadHosts } : {}),
+    ...(edgeProtectedOrigins.length > 0 ? { edgeProtectedOrigins } : {}),
     ...(skippedBrowserNonHtml > 0 ? { skippedBrowserNonHtml } : {}),
     ...(truncations.length > 0 ? { truncations } : {}),
   })
@@ -6506,6 +6925,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     ...(runtimeGraphqlCatalogs.length > 0 ? { runtimeGraphqlCatalogs } : {}),
     ...(runtimeOpenApiOperations.length > 0 ? { runtimeOpenApiOperations } : {}),
     ...(skippedDeadHosts.length > 0 ? { skippedDeadHosts } : {}),
+    ...(edgeProtectedOrigins.length > 0 ? { edgeProtectedOrigins } : {}),
     ...(truncations.length > 0 ? { truncations } : {}),
   }
 }
