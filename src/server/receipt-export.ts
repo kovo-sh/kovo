@@ -13,7 +13,7 @@ import { createHash, createHmac, createPrivateKey, createPublicKey, generateKeyP
 import type { KeyLike, KeyObject } from 'node:crypto'
 import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { and, desc, eq } from 'drizzle-orm'
+import { and, desc, eq, sql } from 'drizzle-orm'
 import { normalizeCurlHttpMethod, quotePosixShellArg } from '../components/curl-parser.ts'
 import { projectRunFindings } from '../findings-view.ts'
 import type { CanonicalSeverity, FindingBackingKind, FindingDisposition, FindingsViewInputRow } from '../findings-view.ts'
@@ -733,8 +733,12 @@ function parseCompositeRetestObject(raw: unknown): {
   patchBrokeHopId: string | null
   compositeVerdict: CompositePatchRetestVerdict | null
   hasStructured: boolean
+  retestRunId: string | null
+  patchId: string | null
 } {
-  if (!raw || typeof raw !== 'object') return { patchBrokeHopId: null, compositeVerdict: null, hasStructured: false }
+  if (!raw || typeof raw !== 'object') {
+    return { patchBrokeHopId: null, compositeVerdict: null, hasStructured: false, retestRunId: null, patchId: null }
+  }
   const rec = raw as Record<string, unknown>
   const nested = rec.compositeRetest && typeof rec.compositeRetest === 'object'
     ? rec.compositeRetest as Record<string, unknown>
@@ -743,10 +747,35 @@ function parseCompositeRetestObject(raw: unknown): {
   const compositeVerdict = isValidCompositeVerdict(rawVerdict) ? rawVerdict : null
   const rawHop = rec.patchBrokeHopId !== undefined ? rec.patchBrokeHopId : nested?.patchBrokeHopId
   const patchBrokeHopId = typeof rawHop === 'string' && rawHop.trim() ? rawHop.trim() : null
+  const rawRetestRunId = rec.retestRunId ?? nested?.retestRunId
+  const retestRunId = typeof rawRetestRunId === 'string' && rawRetestRunId.trim() ? rawRetestRunId.trim() : null
+  const rawPatchId = rec.patchId ?? nested?.patchId
+  const patchId = typeof rawPatchId === 'string' && rawPatchId.trim() ? rawPatchId.trim() : null
   const hasStructured = compositeVerdict !== null
     || rawHop !== undefined
     || nested !== null
-  return { patchBrokeHopId, compositeVerdict, hasStructured }
+  return { patchBrokeHopId, compositeVerdict, hasStructured, retestRunId, patchId }
+}
+
+export function loadRetestCompositeArtifacts(
+  storage: Store,
+  runId: string,
+  retestRows: ReadonlyArray<typeof retestRuns.$inferSelect>,
+): Map<string, Record<string, unknown>> {
+  const retestArtifactsById = new Map<string, Record<string, unknown>>()
+  for (const rt of retestRows) {
+    for (const evId of rt.evidenceIds ?? []) {
+      if (retestArtifactsById.has(evId)) continue
+      try {
+        const art = storage.artifact(runId, evId)
+        const parsed = JSON.parse(art.content) as unknown
+        if (parsed && typeof parsed === 'object' && (parsed as Record<string, unknown>).kind === 'composite_patch_retest') {
+          retestArtifactsById.set(evId, parsed as Record<string, unknown>)
+        }
+      } catch { /* non-JSON or missing artifact */ }
+    }
+  }
+  return retestArtifactsById
 }
 
 function resolveStructuredCompositeRetestMeta(
@@ -754,10 +783,12 @@ function resolveStructuredCompositeRetestMeta(
   latestRetest: typeof retestRuns.$inferSelect | undefined,
   retestArtifactsById?: ReadonlyMap<string, Record<string, unknown>>,
 ): StructuredCompositeRetestMeta {
-  // 1) Prefer structured fields directly on the retest record (or its linked structured artifact).
+  // R4-H-10: Authoritative finding-level `retest_runs` (newest by `createdAt`) ALWAYS outranks
+  // stale `replay_specs.proof_receipt` metadata. Never let a stale spec-level verdict override a
+  // newer authoritative finding retest (e.g., an unstructured "reproduced" Verify Fix run).
   const fromRetestRow = parseCompositeRetestObject(latestRetest)
-  let fromArtifact: { patchBrokeHopId: string | null; compositeVerdict: CompositePatchRetestVerdict | null; hasStructured: boolean } = {
-    patchBrokeHopId: null, compositeVerdict: null, hasStructured: false,
+  let fromArtifact: ReturnType<typeof parseCompositeRetestObject> = {
+    patchBrokeHopId: null, compositeVerdict: null, hasStructured: false, retestRunId: null, patchId: null,
   }
   if (!fromRetestRow.hasStructured && latestRetest && retestArtifactsById) {
     for (const evId of latestRetest.evidenceIds ?? []) {
@@ -771,13 +802,27 @@ function resolveStructuredCompositeRetestMeta(
       }
     }
   }
-  const fromSpecProof = parseCompositeRetestObject(specProofObj)
 
-  const primary = fromRetestRow.hasStructured
-    ? fromRetestRow
-    : fromArtifact.hasStructured
-      ? fromArtifact
-      : fromSpecProof
+  const fromSpecProof = parseCompositeRetestObject(specProofObj)
+  const specMatchesLatestRetest = Boolean(
+    latestRetest
+    && fromSpecProof.hasStructured
+    && !fromSpecProof.patchId
+    && fromSpecProof.retestRunId === latestRetest.id
+    && (!fromSpecProof.compositeVerdict || mapCompositeVerdictToRetestVerdict(fromSpecProof.compositeVerdict) === latestRetest.verdict),
+  )
+
+  const primary = latestRetest
+    ? (fromRetestRow.hasStructured
+        ? fromRetestRow
+        : fromArtifact.hasStructured
+          ? fromArtifact
+          : specMatchesLatestRetest
+            ? fromSpecProof
+            : { patchBrokeHopId: null, compositeVerdict: null, hasStructured: false, retestRunId: null, patchId: null })
+    : (!fromSpecProof.patchId
+        ? fromSpecProof
+        : { patchBrokeHopId: null, compositeVerdict: null, hasStructured: false, retestRunId: null, patchId: null })
 
   const compositeVerdict = primary.compositeVerdict
   const patchRetestVerdict: 'reproduced' | 'fixed' | 'inconclusive' | null = compositeVerdict
@@ -807,8 +852,9 @@ function resolveStructuredCompositeRetestMeta(
 
 /**
  * Extract persisted `CompositeProofReceipt` records from `replaySpecs` and matching `retestRuns`
- * using structured `patchBrokeHopId` and `compositeVerdict` metadata (falling back cleanly only
- * for legacy pre-Q8 records that lack structured fields).
+ * using structured `patchBrokeHopId` and `compositeVerdict` metadata (selecting the newest
+ * authoritative finding-level retest by `createdAt` and falling back cleanly only for legacy
+ * pre-Q8 records that lack structured fields).
  */
 export function extractStoreCompositeReceipts(
   specRows: ReadonlyArray<typeof replaySpecs.$inferSelect>,
@@ -821,6 +867,11 @@ export function extractStoreCompositeReceipts(
     const arr = retestsByFinding.get(rt.findingId) ?? []
     arr.push(rt)
     retestsByFinding.set(rt.findingId, arr)
+  }
+  for (const arr of retestsByFinding.values()) {
+    if (arr.length > 1) {
+      arr.sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0))
+    }
   }
 
   const extracted: CompositeReceiptExportInput[] = []
@@ -899,7 +950,7 @@ export function exportRunReceiptBundle(
   const exchangeRows = storage.db.select().from(brokerExchanges).where(eq(brokerExchanges.runId, run.id)).all()
   const retestRows = storage.db.select().from(retestRuns)
     .where(eq(retestRuns.runId, run.id))
-    .orderBy(desc(retestRuns.createdAt))
+    .orderBy(desc(retestRuns.createdAt), desc(sql`rowid`))
     .all()
 
   const specsById = new Map(specRows.map(s => [s.id, s]))
@@ -912,19 +963,7 @@ export function exportRunReceiptBundle(
     retestsByFinding.set(rt.findingId, arr)
   }
 
-  const retestArtifactsById = new Map<string, Record<string, unknown>>()
-  for (const rt of retestRows) {
-    for (const evId of rt.evidenceIds ?? []) {
-      if (retestArtifactsById.has(evId)) continue
-      try {
-        const art = storage.artifact(run.id, evId)
-        const parsed = JSON.parse(art.content) as unknown
-        if (parsed && typeof parsed === 'object' && (parsed as Record<string, unknown>).kind === 'composite_patch_retest') {
-          retestArtifactsById.set(evId, parsed as Record<string, unknown>)
-        }
-      } catch { /* non-JSON or missing artifact */ }
-    }
-  }
+  const retestArtifactsById = loadRetestCompositeArtifacts(storage, run.id, retestRows)
 
   const approvedSet = new Set(run.approved)
   const approvedOrigins = run.candidates.filter(c => approvedSet.has(c.id)).map(c => c.origin)

@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { and, desc, eq } from 'drizzle-orm'
+import { and, desc, eq, sql } from 'drizzle-orm'
 import { id as evidenceId } from '../domain.ts'
 import type { EvidenceSummary, Finding, ReportBody } from '../domain.ts'
 import { projectRunFindings } from '../findings-view.ts'
@@ -33,6 +33,7 @@ import {
   exportRunReceiptBundle,
   extractStoreCompositeReceipts,
   isPortableCompositeReceiptRecord,
+  loadRetestCompositeArtifacts,
   verifyProofReceiptBundle,
 } from './receipt-export.ts'
 import type {
@@ -187,6 +188,11 @@ export function formatCompositeChainMarkdown(
       const verdictText = record.patchRetestVerdict ? ` (${record.patchRetestVerdict})` : ''
       lines.push(
         `- **Patch retest** Chain broken at ${codeSpan(record.patchBrokeHopId, secrets, zdr)} (\`patchBrokeHopId\`: ${codeSpan(record.patchBrokeHopId, secrets, zdr)})${verdictText}`,
+      )
+    } else if (record.patchRetestVerdict) {
+      const compText = record.compositeVerdict ? ` (${codeSpan(record.compositeVerdict, secrets, zdr)})` : ''
+      lines.push(
+        `- **Patch retest** ${inline(record.patchRetestVerdict, secrets)}${compText}`,
       )
     }
     lines.push(
@@ -427,7 +433,7 @@ export function exportReportMarkdown(
     storage.db.select().from(brokerExchanges).where(eq(brokerExchanges.runId, run.id)).all().map(e => [e.id, e]),
   )
   const runRetests = storage.db.select().from(retestRuns)
-    .where(eq(retestRuns.runId, run.id)).orderBy(desc(retestRuns.createdAt)).all()
+    .where(eq(retestRuns.runId, run.id)).orderBy(desc(retestRuns.createdAt), desc(sql`rowid`)).all()
   const retestsByFinding = new Map<string, typeof runRetests>()
   for (const r of runRetests) {
     const arr = retestsByFinding.get(r.findingId) ?? []
@@ -810,7 +816,8 @@ export function exportReportMarkdown(
 
   const findingsMetaById = new Map(findings.map(f => [f.id, { title: f.title, severity: f.severity, cwe: f.cwe ?? null }]))
   const activeFindingIds = new Set(findings.map(f => f.id))
-  const storeCompositeInputs = extractStoreCompositeReceipts([...runSpecs.values()], runRetests, findingsMetaById)
+  const retestArtifactsById = loadRetestCompositeArtifacts(storage, run.id, runRetests)
+  const storeCompositeInputs = extractStoreCompositeReceipts([...runSpecs.values()], runRetests, findingsMetaById, retestArtifactsById)
     .filter(item => !item.findingId || activeFindingIds.has(item.findingId))
   const compositeByChain = new Map<string, PortableCompositeReceiptRecord>()
   const addCompositeIfInScope = (item: CompositeChainMarkdownInput) => {
