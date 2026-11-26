@@ -3620,6 +3620,80 @@ function verifierFeedbackFrom(summary: unknown): unknown {
   return undefined
 }
 
+export interface AgentSessionHandle {
+  /** Live accumulated wall-clock time (ms) spent waiting on provider HTTP retries, 429/5xx backoff, and stalled stream timeouts. */
+  getProviderStallWaitMs(): number
+}
+
+/**
+ * Tracks wall-clock time spent waiting on provider HTTP retries, 429/5xx backoff, and stalled
+ * stream timeouts, strictly separated from active model generation and tool execution time.
+ */
+export class ProviderStallWaitTracker {
+  private readonly now: () => number
+  private accumulatedWaitMs = 0
+  private attemptStartedAtMs: number | null = null
+  private lastActivityAtMs: number | null = null
+  private stallWaitStartedAtMs: number | null = null
+
+  constructor(now: () => number = Date.now) {
+    this.now = now
+  }
+
+  /** Called when a provider HTTP attempt begins (`beforeCall`). */
+  onCallStart(): void {
+    const t = this.now()
+    if (this.stallWaitStartedAtMs !== null) {
+      this.accumulatedWaitMs += Math.max(0, t - this.stallWaitStartedAtMs)
+      this.stallWaitStartedAtMs = null
+    }
+    this.attemptStartedAtMs = t
+    this.lastActivityAtMs = t
+  }
+
+  /**
+   * Called on transient provider retry / 429 / 5xx backoff (`retried`) or stream stall timeout
+   * (`stalled`). Anchors the wait window at `lastActivityAtMs` (for mid-stream stalls) or
+   * `attemptStartedAtMs` (for failed HTTP retry attempts) without double-counting active streaming.
+   */
+  onRetryOrStall(kind: 'retried' | 'stalled'): void {
+    const t = this.now()
+    if (this.stallWaitStartedAtMs === null) {
+      const anchor = kind === 'stalled'
+        ? (this.lastActivityAtMs ?? this.attemptStartedAtMs ?? t)
+        : (this.attemptStartedAtMs ?? this.lastActivityAtMs ?? t)
+      this.stallWaitStartedAtMs = Math.min(t, anchor)
+    }
+  }
+
+  /** Called when an upstream SSE token/frame arrives (`onStreamActivity`). */
+  onStreamActivity(): void {
+    const t = this.now()
+    if (this.stallWaitStartedAtMs !== null) {
+      this.accumulatedWaitMs += Math.max(0, t - this.stallWaitStartedAtMs)
+      this.stallWaitStartedAtMs = null
+    }
+    this.lastActivityAtMs = t
+  }
+
+  /** Called when a provider attempt/turn finishes (`ok` / `error` / `aborted` / `afterResponse`). */
+  onCallEnd(): void {
+    const t = this.now()
+    if (this.stallWaitStartedAtMs !== null) {
+      this.accumulatedWaitMs += Math.max(0, t - this.stallWaitStartedAtMs)
+      this.stallWaitStartedAtMs = null
+    }
+    this.attemptStartedAtMs = null
+    this.lastActivityAtMs = null
+  }
+
+  /** Live accumulated provider stall/retry wait time in ms (includes any in-progress backoff). */
+  getProviderStallWaitMs(): number {
+    if (this.stallWaitStartedAtMs === null) return this.accumulatedWaitMs
+    return this.accumulatedWaitMs + Math.max(0, this.now() - this.stallWaitStartedAtMs)
+  }
+}
+
 export interface RunAgentSessionOptions {
   directory: string
   sessionId: string
@@ -3650,8 +3724,29 @@ export interface RunAgentSessionOptions {
   activeClock?: ActiveClock
   /** Optional grace window when a proof call (`kovo_verify`) is actively running at `wallClockMs` (default 5s). */
   wallClockGraceMs?: number
+  /** Finite ceiling on provider-stall/retry wait time deductible from `wallClockMs` (defaults to `wallClockMs` so hard cap <= 2x base). */
+  wallClockMaxStallCreditMs?: number
+  /** Optional explicit finite hard wall-clock ceiling (ms) that neither stall credit nor verify grace may exceed. */
+  wallClockHardCeilingMs?: number
+  /** Called immediately once session state is initialized with a live handle (e.g. `getProviderStallWaitMs()`). */
+  onSessionReady?: (session: AgentSessionHandle) => void
+  /** Called whenever provider retry backoff or a stalled stream timeout contributes to `providerStallWaitMs`. */
+  onProviderStallWait?: (info: { providerStallWaitMs: number; kind: 'retried' | 'stalled' }) => void
+  /** Optional provider transport retry/timeout overrides (primarily for deterministic testing). */
+  providerMaxTransportRetries?: number
+  providerTransportRetryBaseMs?: number
+  providerFirstEventTimeoutMs?: number
+  providerIdleTimeoutMs?: number
   /** Called once when the hard per-assignment `wallClockMs` deadline triggers a bounded rotation. */
-  onWallClockRotate?: (info: { elapsedMs: number; wallClockMs: number; turnsUsed: number; graceUsedMs: number }) => void
+  onWallClockRotate?: (info: {
+    elapsedMs: number
+    effectiveElapsedMs: number
+    wallClockMs: number
+    turnsUsed: number
+    graceUsedMs: number
+    providerStallWaitMs: number
+    verifyGraceApplied: boolean
+  }) => void
   /** Optional telemetry callback when `kovo_verify` tool-arg aliases (`code`/`source`) are used. */
   onVerifyAliasUsed?: (aliases: readonly KovoVerifyAliasKey[]) => void
   /** Require complete_intent before finishing (with up to 2 empty-turn nudges; default: true when complete_intent handler is present). */
@@ -3727,6 +3822,8 @@ export interface AgentSessionResult {
   wallClockRotated?: boolean
   /** Elapsed wall-clock duration when rotated cleanly. */
   elapsedMs?: number
+  /** Accumulated time (ms) spent waiting on provider HTTP retries, 429/5xx backoff, and stalled stream timeouts. */
+  providerStallWaitMs?: number
   /** complete_intent rejections for a leaning conclusion without spec or coded proof gap. */
   specSubmissionRequired?: number
   /** Final spec-submission ledger (route evidence / spec attempts / coded gaps). */
@@ -3796,7 +3893,7 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
 
   const ownedClock = !options.activeClock
   const activeClock = options.activeClock ?? new ActiveClock()
-  const sessionClockBaseMs = activeClock.activeElapsedMs()
+  let sessionClockBaseMs = activeClock.activeElapsedMs()
   const sessionActiveElapsedMs = () => Math.max(0, activeClock.activeElapsedMs() - sessionClockBaseMs)
   const sessionController = new AbortController()
   const onParentAbort = () => sessionController.abort(options.signal.reason)
@@ -3825,6 +3922,29 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
       : effectiveWallClockMs >= 20_000
         ? WALL_CLOCK_PROOF_GRACE_MS
         : Math.min(WALL_CLOCK_PROOF_GRACE_MS, Math.max(25, Math.floor(effectiveWallClockMs * 0.25)))
+  const maxStallCreditMs = effectiveWallClockMs === undefined
+    ? 0
+    : options.wallClockMaxStallCreditMs !== undefined
+      ? (Number.isFinite(options.wallClockMaxStallCreditMs) && options.wallClockMaxStallCreditMs > 0
+          ? Math.min(effectiveWallClockMs, Math.floor(options.wallClockMaxStallCreditMs))
+          : 0)
+      : effectiveWallClockMs
+  const hardWallClockCeilingMs = effectiveWallClockMs === undefined
+    ? undefined
+    : options.wallClockHardCeilingMs !== undefined && Number.isFinite(options.wallClockHardCeilingMs) && options.wallClockHardCeilingMs > 0
+      ? Math.max(1, Math.min(effectiveWallClockMs + maxStallCreditMs, Math.floor(options.wallClockHardCeilingMs)))
+      : effectiveWallClockMs + maxStallCreditMs
+
+  const providerStallTracker = new ProviderStallWaitTracker(() => activeClock.activeElapsedMs())
+  const getProviderStallWaitMs = () => providerStallTracker.getProviderStallWaitMs()
+  const sessionEffectiveElapsedMs = () => {
+    const activeMs = sessionActiveElapsedMs()
+    const creditedStallMs = Math.min(getProviderStallWaitMs(), maxStallCreditMs)
+    return Math.max(0, activeMs - creditedStallMs)
+  }
+  try {
+    options.onSessionReady?.({ getProviderStallWaitMs })
+  } catch { /* observer must never break session startup */ }
 
   let wallClockRotated = false
   let wallClockExpired = false
@@ -3843,13 +3963,48 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
     record: options.record,
     secrets: resolveLiveSecrets,
     maxCalls: Math.max(defaultMaxCalls, maxTurns + 40),
+    ...(options.providerMaxTransportRetries !== undefined ? { maxTransportRetries: options.providerMaxTransportRetries } : {}),
+    ...(options.providerTransportRetryBaseMs !== undefined ? { transportRetryBaseMs: options.providerTransportRetryBaseMs } : {}),
+    ...(options.providerFirstEventTimeoutMs !== undefined ? { firstEventTimeoutMs: options.providerFirstEventTimeoutMs } : {}),
+    ...(options.providerIdleTimeoutMs !== undefined ? { idleTimeoutMs: options.providerIdleTimeoutMs } : {}),
     thinkingLevel: effectiveThinking,
     roleAffinity: effectiveRole,
-    beforeCall: options.beforeCall,
+    beforeCall: () => {
+      options.beforeCall?.()
+      providerStallTracker.onCallStart()
+    },
     onUsage: options.onUsage,
-    onStreamActivity: options.onStreamActivity,
+    onTelemetry: event => {
+      if (event.outcome === 'retried' || event.retried) {
+        providerStallTracker.onRetryOrStall('retried')
+        try {
+          options.onProviderStallWait?.({ providerStallWaitMs: getProviderStallWaitMs(), kind: 'retried' })
+        } catch { /* telemetry only */ }
+      } else if (event.outcome === 'stalled' || event.stalled) {
+        providerStallTracker.onRetryOrStall('stalled')
+        try {
+          options.onProviderStallWait?.({ providerStallWaitMs: getProviderStallWaitMs(), kind: 'stalled' })
+        } catch { /* telemetry only */ }
+      } else if (
+        event.outcome === 'ok'
+        || event.outcome === 'truncated'
+        || event.outcome === 'error'
+        || event.outcome === 'aborted'
+      ) {
+        providerStallTracker.onCallEnd()
+      }
+    },
+    onStreamActivity: () => {
+      providerStallTracker.onStreamActivity()
+      options.onStreamActivity?.()
+    },
     onProfileSuccess: options.onProfileSuccess,
-    onProfileFailure: options.onProfileFailure,
+    onProfileFailure: (profileId, err, hard) => {
+      if (!hard) {
+        providerStallTracker.onRetryOrStall('retried')
+      }
+      options.onProfileFailure?.(profileId, err, hard)
+    },
   }
 
   const { models, model } = profiles
@@ -3875,20 +4030,41 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
     wallClockRotated = true
     clearWallClockTimers()
     const elapsedMs = sessionActiveElapsedMs()
+    const providerStallWaitMs = getProviderStallWaitMs()
+    const effectiveElapsedMs = sessionEffectiveElapsedMs()
     const graceUsedMs = wallClockGraceStartedAtMs !== undefined
       ? Math.max(0, activeClock.activeElapsedMs() - wallClockGraceStartedAtMs)
       : 0
+    const verifyGraceApplied = wallClockGraceStartedAtMs !== undefined || graceUsedMs > 0
     try {
-      options.onWallClockRotate?.({ elapsedMs, wallClockMs: effectiveWallClockMs, turnsUsed, graceUsedMs })
+      options.onWallClockRotate?.({
+        elapsedMs,
+        effectiveElapsedMs,
+        wallClockMs: effectiveWallClockMs,
+        turnsUsed,
+        graceUsedMs,
+        providerStallWaitMs,
+        verifyGraceApplied,
+      })
     } catch { /* telemetry only */ }
     sessionController.abort(new Error(`Assignment wall-clock deadline reached (${elapsedMs}ms / ${effectiveWallClockMs}ms).`))
   }
 
-  if (effectiveWallClockMs !== undefined) {
-    wallClockTimer = activeClock.createDeadlineTimer(effectiveWallClockMs, () => {
+  const armSessionWallClockTimer = (delayMs: number) => {
+    if (wallClockTimer) { wallClockTimer.cancel(); wallClockTimer = undefined }
+    if (effectiveWallClockMs === undefined || hardWallClockCeilingMs === undefined) return
+    wallClockTimer = activeClock.createDeadlineTimer(Math.max(1, Math.floor(delayMs)), () => {
       wallClockTimer = undefined
-      wallClockExpired = true
       if (options.signal.aborted || wallClockRotated) return
+      const activeMs = sessionActiveElapsedMs()
+      const effectiveMs = sessionEffectiveElapsedMs()
+      const remainingSoftMs = effectiveWallClockMs - effectiveMs
+      const remainingHardMs = hardWallClockCeilingMs - activeMs
+      if (remainingSoftMs > 0 && remainingHardMs > 0) {
+        armSessionWallClockTimer(Math.min(remainingSoftMs, remainingHardMs))
+        return
+      }
+      wallClockExpired = true
       if (activeProofCallIds.size > 0 && proofGraceMs > 0) {
         wallClockGraceStartedAtMs = activeClock.activeElapsedMs()
         wallClockGraceTimer = activeClock.createDeadlineTimer(proofGraceMs, () => {
@@ -3922,11 +4098,17 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
   }
   /** Attach the route-scoped proof stat to a session result and emit the funnel event once. */
   const finish = (result: AgentSessionResult): AgentSessionResult => {
+    providerStallTracker.onCallEnd()
     const stats = specTracker.proofObligationStats()
     try { options.onProofObligation?.({ type: 'agent.proof_obligation', ...stats }) } catch { /* telemetry only */ }
     const gapValidation = specTracker.gapValidationStats()
     try { options.onGapValidation?.({ type: 'agent.gap_validation', ...gapValidation }) } catch { /* telemetry only */ }
-    return { ...result, proofObligation: stats, gapValidation }
+    return {
+      ...result,
+      providerStallWaitMs: getProviderStallWaitMs(),
+      proofObligation: stats,
+      gapValidation,
+    }
   }
   /**
    * Evidence-gated early exit, evaluated after every assistant turn. Distinct from the 85% banner:
@@ -3991,7 +4173,7 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
       settled,
       shouldSettle: options.shouldSettle,
       wallClockDeadline,
-      now: sessionActiveElapsedMs,
+      now: sessionEffectiveElapsedMs,
     })) {
       settled = true
       return true
@@ -4045,7 +4227,7 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
         }))
         const settlingNow = isSettling()
         const wallClockSettlingNow = effectiveWallClockMs !== undefined && wallClockSettlementBudgetMs !== undefined
-          && sessionActiveElapsedMs() >= wallClockSettlementBudgetMs && !wallClockNudgeSent
+          && sessionEffectiveElapsedMs() >= wallClockSettlementBudgetMs && !wallClockNudgeSent
         const willNudge = Boolean(handlers.complete_intent) && turnsUsed + 1 === settlementNudgeTurn
         const specDirective = specDirectiveForRun(Boolean(earlyExit) || settlingNow || wallClockSettlingNow || willNudge)
         if (earlyExit) {
@@ -4059,7 +4241,7 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
           extraMessages.push({
             role: 'user' as const,
             content: wallClockSettlementMessage({
-              elapsedMs: sessionActiveElapsedMs(),
+              elapsedMs: sessionEffectiveElapsedMs(),
               wallClockMs: displayWallClockMs ?? effectiveWallClockMs,
               proofTools: registeredProofTools,
               ...(specDirective ? { specDirective } : {}),
@@ -4088,6 +4270,7 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
         }
       },
       afterResponse(message) {
+        providerStallTracker.onCallEnd()
         turnsUsed += 1
         const pending = pendingTurnTrace
         pendingTurnTrace = undefined
@@ -4262,10 +4445,18 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
       void promise.catch(() => undefined)
       return { rotated: true }
     }
+    if (options.signal.aborted) {
+      void promise.catch(() => undefined)
+      throw options.signal.reason ?? new Error('Aborted')
+    }
     let onAbort: (() => void) | undefined
-    const abortRace = new Promise<{ rotated: true }>(resolve => {
+    const abortRace = new Promise<{ rotated: true }>((resolve, reject) => {
       onAbort = () => {
-        if (wallClockRotated && !options.signal.aborted) resolve({ rotated: true })
+        if (wallClockRotated && !options.signal.aborted) {
+          resolve({ rotated: true })
+        } else if (options.signal.aborted) {
+          reject(options.signal.reason ?? new Error('Aborted'))
+        }
       }
       sessionController.signal.addEventListener('abort', onAbort, { once: true })
     })
@@ -4277,7 +4468,7 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
       throw err
     } finally {
       if (onAbort) sessionController.signal.removeEventListener('abort', onAbort)
-      if (wallClockRotated) void wrapped.catch(() => undefined)
+      if (wallClockRotated || sessionController.signal.aborted) void wrapped.catch(() => undefined)
     }
   }
   const harness = await Harness.open(await openNodeSqliteStorage(sessionPath), {
@@ -4310,6 +4501,14 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
     }
     const conversation = await harness.root(context, { agent })
     await conversation.configure(agent, context)
+
+    // Arm the session wall-clock timer after SQLite/Harness startup completes so local DB open
+    // jitter under heavy concurrency never consumes the worker's active investigation budget.
+    options.signal.throwIfAborted()
+    sessionClockBaseMs = activeClock.activeElapsedMs()
+    if (effectiveWallClockMs !== undefined) {
+      armSessionWallClockTimer(effectiveWallClockMs)
+    }
 
     const input = { type: 'input' as const, content: scrubForDisplay(options.prompt) }
     const submission = await conversation.submit({ ...input, requestId: options.requestId }, context)
@@ -4450,7 +4649,7 @@ export async function runAgentSession(options: RunAgentSessionOptions): Promise<
     if (ownedClock) activeClock.dispose()
     options.signal.removeEventListener('abort', onParentAbort)
     const closePromise = harness.close(BACKGROUND_CONTEXT).catch(() => undefined)
-    if (wallClockRotated) {
+    if (wallClockRotated || sessionController.signal.aborted) {
       let closeTimer: NodeJS.Timeout | undefined
       await Promise.race([
         closePromise,
