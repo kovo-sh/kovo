@@ -1014,6 +1014,7 @@ export function assertObjectPrototypeIntegrity(): void {
  */
 export function hardenHostProcess(options?: {
   requireFlags?: boolean
+  requireLinearRegexp?: boolean
   sealPrototype?: boolean
   quiet?: boolean
 }): HostHardeningStatus {
@@ -1044,20 +1045,29 @@ export function hardenHostProcess(options?: {
   }
 
   const warnings: string[] = []
+  let linearFailureMessage: string | null = null
   if (!disableProtoDelete) {
     warnings.push(`Node started without --disable-proto=delete (recommended: node ${RECOMMENDED_HARDENING_FLAGS} scripts/serve.ts)`)
   }
   if (!linearRegexpFallback) {
-    warnings.push(
-      linearFlagPresent
-        ? `Linear regexp fallback self-check exceeded 50 ms (${regexpSelfCheckMs} ms).`
-        : `Node started without --enable-experimental-regexp-engine-on-excessive-backtracks (recommended: node ${RECOMMENDED_HARDENING_FLAGS} scripts/serve.ts)`,
-    )
+    linearFailureMessage = linearFlagPresent
+      ? `Linear regexp fallback self-check exceeded 50 ms (${regexpSelfCheckMs} ms).`
+      : `Node requires --enable-experimental-regexp-engine-on-excessive-backtracks to prevent regex backtracking stalls. Launch via "npm start" or: node ${RECOMMENDED_HARDENING_FLAGS} scripts/serve.ts`
+    warnings.push(linearFailureMessage)
   }
 
   const requireFlags = options?.requireFlags ?? process.env.KOVO_REQUIRE_HARDENED_NODE === '1'
+  const allowUnhardenedForTest = process.env.KOVO_ALLOW_UNHARDENED_NODE_FOR_TEST === '1'
+  // R3-H-11 backstop: linear-regexp fallback is mandatory at startup unless an explicit test opt-out
+  // (`KOVO_ALLOW_UNHARDENED_NODE_FOR_TEST=1`) or `requireFlags: false` / `requireLinearRegexp: false` is set.
+  const requireLinearRegexp = options?.requireLinearRegexp
+    ?? (requireFlags ? true : (options?.requireFlags === false ? false : !allowUnhardenedForTest))
+
   if (requireFlags && warnings.length > 0) {
     throw new Error(`Host process hardening check failed: ${warnings.join(' | ')}`)
+  }
+  if (requireLinearRegexp && linearFailureMessage) {
+    throw new Error(`Host process hardening check failed: ${linearFailureMessage}`)
   }
   if (!options?.quiet) {
     for (const w of warnings) console.warn(`[kovo:hardening] ${w}`)
@@ -1073,8 +1083,104 @@ export function hardenHostProcess(options?: {
   }
 }
 
+const UNRECOVERABLE_ERROR_CODES = new Set([
+  'ERR_OUT_OF_MEMORY',
+  'ERR_WORKER_OUT_OF_MEMORY',
+  'ENOMEM',
+  'ERR_INTERNAL_ASSERTION',
+])
+
+const UNCAUGHT_STORM_WINDOW_MS = 10_000
+const UNCAUGHT_STORM_LIMIT = 5
+
+export function isUnrecoverableHostError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false
+  const code = (err as { code?: unknown }).code
+  if (typeof code === 'string' && UNRECOVERABLE_ERROR_CODES.has(code)) return true
+  const name = (err as { name?: unknown }).name
+  if (name === 'RangeError' && typeof (err as { message?: unknown }).message === 'string') {
+    if (/allocation failed|out of memory/i.test((err as { message: string }).message)) return true
+  }
+  return false
+}
+
+export interface HostUncaughtGuardOptions {
+  /** Invoked when a fatal/unrecoverable error or uncaught exception storm occurs. */
+  onFatal?: (err: unknown, origin: NodeJS.UncaughtExceptionOrigin, reason: string) => void
+  /** Structured log sink (defaults to `console.error`). */
+  logError?: (line: string) => void
+  /** Optional clock override for storm-window testing. */
+  now?: () => number
+  /** Maximum uncaught exceptions permitted within `stormWindowMs` before tripping fatal shutdown. */
+  stormLimit?: number
+  /** Sliding window for uncaught exception storm detection (ms). */
+  stormWindowMs?: number
+}
+
+/**
+ * R3-C-1 defense-in-depth process-level `uncaughtException` guard:
+ * Logs structured JSON diagnostics rather than letting an isolated socket/parser exception crash
+ * all concurrent runs and take the UI offline, while still failing fast cleanly on truly
+ * unrecoverable runtime faults (OOM, internal assertion) or an uncaught-exception storm.
+ */
+export function installHostUncaughtExceptionGuard(options: HostUncaughtGuardOptions = {}): () => void {
+  const logError = options.logError ?? (line => console.error(line))
+  const now = options.now ?? Date.now
+  const stormLimit = Math.max(1, options.stormLimit ?? UNCAUGHT_STORM_LIMIT)
+  const stormWindowMs = Math.max(100, options.stormWindowMs ?? UNCAUGHT_STORM_WINDOW_MS)
+  const recentTimestamps: number[] = []
+  let fatalTriggered = false
+
+  const listener = (err: Error, origin: NodeJS.UncaughtExceptionOrigin) => {
+    const ts = now()
+    recentTimestamps.push(ts)
+    while (recentTimestamps.length > 0 && ts - recentTimestamps[0]! > stormWindowMs) {
+      recentTimestamps.shift()
+    }
+    const unrecoverable = isUnrecoverableHostError(err)
+    const storm = recentTimestamps.length >= stormLimit
+    const fatal = unrecoverable || storm
+    const reason = unrecoverable
+      ? 'unrecoverable_runtime_error'
+      : (storm ? `uncaught_exception_storm(${recentTimestamps.length}/${stormWindowMs}ms)` : 'isolated_uncaught_exception')
+
+    try {
+      logError(JSON.stringify({
+        level: 'error',
+        event: 'host.uncaught_exception',
+        origin,
+        fatal,
+        reason,
+        name: err instanceof Error ? err.name : typeof err,
+        code: typeof (err as NodeJS.ErrnoException | undefined)?.code === 'string'
+          ? (err as NodeJS.ErrnoException).code
+          : null,
+        message: (err instanceof Error ? err.message : String(err)).slice(0, 512),
+        stack: err instanceof Error && err.stack ? err.stack.split('\n').slice(0, 8).join('\n') : undefined,
+        timestamp: new Date(ts).toISOString(),
+      }))
+    } catch {
+      // Never re-throw from the uncaughtException logger.
+    }
+
+    if (fatal && !fatalTriggered) {
+      fatalTriggered = true
+      try {
+        options.onFatal?.(err, origin, reason)
+      } catch {
+        process.exitCode = 1
+      }
+    }
+  }
+
+  process.on('uncaughtException', listener)
+  return () => {
+    process.off('uncaughtException', listener)
+  }
+}
+
 async function main() {
-  assertObjectPrototypeIntegrity()
+  hardenHostProcess()
   const directory = resolve(process.env.KOVO_DATA_DIR ?? '.kovo')
   const port = Number(process.env.PORT ?? 8000)
   const hostPort = parseOptionalPort(process.env.KOVO_PORT)
@@ -1090,7 +1196,6 @@ async function main() {
     initialize: (options?: { dataDir?: string; killSwitchFilePath?: string }) => AppRuntime | void
   }
 
-  hardenHostProcess()
   initialize({ dataDir: directory, killSwitchFilePath })
 
   const sharedStore = store()
@@ -1110,16 +1215,22 @@ async function main() {
   })
 
   let shuttingDown = false
-  const shutdown = () => {
+  const shutdown = (exitCode = 0) => {
     if (shuttingDown) return
     shuttingDown = true
+    process.exitCode = exitCode
+    const forceTimer = setTimeout(() => process.exit(exitCode), 5_000)
+    forceTimer.unref?.()
     local.server.closeAllConnections?.()
     local.server.close(() => {
-      void runtime.dispose().finally(() => process.exit(0))
+      void runtime.dispose().finally(() => process.exit(exitCode))
     })
   }
-  process.once('SIGTERM', shutdown)
-  process.once('SIGINT', shutdown)
+  installHostUncaughtExceptionGuard({
+    onFatal: () => shutdown(1),
+  })
+  process.once('SIGTERM', () => shutdown(0))
+  process.once('SIGINT', () => shutdown(0))
 
   const externalPort = hostPort ?? port
   const origin = process.env.KOVO_PUBLIC_ORIGIN || `http://127.0.0.1:${externalPort}`

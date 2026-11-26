@@ -583,15 +583,80 @@ function headersToRecord(initHeaders?: HeadersInit): Record<string, string> {
   return record
 }
 
-function responseHeadersFromNode(raw: IncomingHttpHeaders): Headers {
-  const headers = new Headers()
-  for (const [key, value] of Object.entries(raw)) {
-    if (value === undefined) continue
-    if (Array.isArray(value)) {
-      for (const entry of value) headers.append(key, entry)
+const RESERVED_PROTO_HEADER_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
+
+const SINGLE_VALUE_HTTP_HEADERS = new Set([
+  'age',
+  'authorization',
+  'content-length',
+  'content-type',
+  'etag',
+  'expires',
+  'from',
+  'host',
+  'if-modified-since',
+  'if-unmodified-since',
+  'last-modified',
+  'location',
+  'max-forwards',
+  'proxy-authorization',
+  'referer',
+  'retry-after',
+  'server',
+  'user-agent',
+])
+
+export function isReservedProtoHeaderKey(name: string): boolean {
+  return RESERVED_PROTO_HEADER_KEYS.has(name.toLowerCase())
+}
+
+/**
+ * R3-C-1: Parse Node's flat `IncomingMessage.rawHeaders` array directly into a null-prototype
+ * `IncomingHttpHeaders` map, skipping reserved prototype accessor keys (`__proto__`, `constructor`,
+ * `prototype`). Never touches Node's lazy `IncomingMessage.headers` getter, which assigns onto a
+ * plain object and throws `ERR_PROTO_ACCESS` when an upstream sends a reserved header name.
+ */
+export function parseRawHeadersNullProto(rawHeaders: readonly string[] | undefined): IncomingHttpHeaders {
+  const out = Object.create(null) as IncomingHttpHeaders
+  if (!Array.isArray(rawHeaders)) return out
+  for (let i = 0; i + 1 < rawHeaders.length; i += 2) {
+    const lower = String(rawHeaders[i]).toLowerCase()
+    if (!lower || RESERVED_PROTO_HEADER_KEYS.has(lower)) continue
+    const value = String(rawHeaders[i + 1])
+    if (lower === 'set-cookie') {
+      const existing = out['set-cookie']
+      if (Array.isArray(existing)) existing.push(value)
+      else out['set-cookie'] = [value]
+    } else if (lower === 'cookie') {
+      out.cookie = out.cookie !== undefined ? `${out.cookie}; ${value}` : value
+    } else if (SINGLE_VALUE_HTTP_HEADERS.has(lower)) {
+      if (out[lower] === undefined) out[lower] = value
     } else {
-      headers.set(key, value)
+      const existing = out[lower]
+      out[lower] = existing === undefined ? value : `${existing}, ${value}`
     }
+  }
+  return out
+}
+
+export function cloneNullProtoHeaders(headers: IncomingHttpHeaders): IncomingHttpHeaders {
+  const out = Object.create(null) as IncomingHttpHeaders
+  for (const [key, value] of Object.entries(headers)) {
+    if (value === undefined) continue
+    if (RESERVED_PROTO_HEADER_KEYS.has(key.toLowerCase())) continue
+    out[key] = Array.isArray(value) ? [...value] : value
+  }
+  return out
+}
+
+export function responseHeadersFromRawHeaders(rawHeaders: readonly string[] | undefined): Headers {
+  const headers = new Headers()
+  if (!Array.isArray(rawHeaders)) return headers
+  for (let i = 0; i + 1 < rawHeaders.length; i += 2) {
+    const name = String(rawHeaders[i])
+    const lower = name.toLowerCase()
+    if (!lower || RESERVED_PROTO_HEADER_KEYS.has(lower)) continue
+    headers.append(name, String(rawHeaders[i + 1]))
   }
   return headers
 }
@@ -714,37 +779,52 @@ async function dialSinglePinnedHttp1(params: {
           }
         : {}),
     }, res => {
-      const chunks: Buffer[] = []
-      let total = 0
-      res.on('data', (chunk: Buffer) => {
-        total += chunk.byteLength
-        if (total > maxResponseBytes) {
-          const err = new EgressDeniedError(
-            'response_too_large',
-            `Egress response exceeded the ${maxResponseBytes}-byte size limit.`,
-          )
-          req.destroy(err)
-          finish(err)
-          return
-        }
-        chunks.push(chunk)
-      })
-      res.on('end', () => {
-        const status = res.statusCode ?? 0
-        const responseBody = status === 204 || status === 304 ? null : Buffer.concat(chunks)
-        finish(null, new Response(responseBody, {
-          status,
-          statusText: res.statusMessage ?? '',
-          headers: responseHeadersFromNode(res.headers),
-        }))
-      })
-      res.on('error', err => finish(err))
-      res.once('aborted', () => finish(new Error('Egress HTTP/1.1 response aborted mid-body.')))
-      res.once('close', () => {
-        if (!settled && !res.complete) {
-          finish(new Error('Egress HTTP/1.1 response closed prematurely mid-body.'))
-        }
-      })
+      try {
+        const chunks: Buffer[] = []
+        let total = 0
+        res.on('data', (chunk: Buffer) => {
+          try {
+            total += chunk.byteLength
+            if (total > maxResponseBytes) {
+              const err = new EgressDeniedError(
+                'response_too_large',
+                `Egress response exceeded the ${maxResponseBytes}-byte size limit.`,
+              )
+              req.destroy(err)
+              finish(err)
+              return
+            }
+            chunks.push(chunk)
+          } catch (err) {
+            req.destroy()
+            finish(err)
+          }
+        })
+        res.on('end', () => {
+          try {
+            const status = res.statusCode ?? 0
+            const responseBody = status === 204 || status === 304 ? null : Buffer.concat(chunks)
+            finish(null, new Response(responseBody, {
+              status,
+              statusText: res.statusMessage ?? '',
+              headers: responseHeadersFromRawHeaders(res.rawHeaders),
+            }))
+          } catch (err) {
+            req.destroy()
+            finish(err)
+          }
+        })
+        res.on('error', err => finish(err))
+        res.once('aborted', () => finish(new Error('Egress HTTP/1.1 response aborted mid-body.')))
+        res.once('close', () => {
+          if (!settled && !res.complete) {
+            finish(new Error('Egress HTTP/1.1 response closed prematurely mid-body.'))
+          }
+        })
+      } catch (err) {
+        req.destroy()
+        finish(err)
+      }
     })
 
     req.setTimeout(timeoutMs, () => {
@@ -972,125 +1052,139 @@ export async function egressFetchStream(
           }
         : {}),
     }, res => {
-      const status = res.statusCode ?? 0
-      if (init.redirect === 'error' && isRedirectStatus(status)) {
-        const err = new EgressDeniedError(
-          'redirect_blocked',
-          `Egress streaming request refused HTTP ${status} redirect.`,
-        )
-        policy.onDenied?.({
-          url: validated.url.href,
-          origin: validated.url.origin,
-          code: 'redirect_blocked',
-          reason: err.message,
-        })
-        req.destroy(err)
-        finishHeaders(err)
-        return
-      }
+      try {
+        const status = res.statusCode ?? 0
+        if (init.redirect === 'error' && isRedirectStatus(status)) {
+          const err = new EgressDeniedError(
+            'redirect_blocked',
+            `Egress streaming request refused HTTP ${status} redirect.`,
+          )
+          policy.onDenied?.({
+            url: validated.url.href,
+            origin: validated.url.origin,
+            code: 'redirect_blocked',
+            reason: err.message,
+          })
+          req.destroy(err)
+          finishHeaders(err)
+          return
+        }
 
-      const decomp = createResponseDecompressor(res.headers['content-encoding'])
-      const decompressed = decomp !== null
-      const source: NodeJS.ReadableStream = decomp ? decomp.decoder : res
+        const parsedHeaders = parseRawHeadersNullProto(res.rawHeaders)
+        const decomp = createResponseDecompressor(parsedHeaders['content-encoding'])
+        const decompressed = decomp !== null
+        const source: NodeJS.ReadableStream = decomp ? decomp.decoder : res
 
-      const respHeaders = responseHeadersFromNode(res.headers)
-      if (decompressed) {
-        respHeaders.delete('content-encoding')
-        respHeaders.delete('content-length')
-      }
+        const respHeaders = responseHeadersFromRawHeaders(res.rawHeaders)
+        if (decompressed) {
+          respHeaders.delete('content-encoding')
+          respHeaders.delete('content-length')
+        }
 
-      if (status === 204 || status === 304) {
-        signal.removeEventListener('abort', onAbort)
-        ksBound.release()
-        res.resume()
-        finishHeaders(null, new Response(null, { status, statusText: res.statusMessage ?? '', headers: respHeaders }))
-        return
-      }
-
-      let streamClosed = false
-      let totalBytes = 0
-      const readable = new ReadableStream<Uint8Array>({
-        start(controller) {
-          const cleanup = () => {
-            signal.removeEventListener('abort', onStreamAbort)
-            ksBound.release()
-          }
-          const failStream = (err: unknown) => {
-            if (streamClosed) return
-            streamClosed = true
-            decomp?.decoder.destroy()
-            req.destroy()
-            try { controller.error(err) } catch { /* ignore */ }
-            cleanup()
-          }
-          const onStreamAbort = () => {
-            const reason = signal.reason instanceof Error ? signal.reason : new Error('Egress stream aborted.')
-            failStream(reason)
-          }
-          if (signal.aborted) {
-            onStreamAbort()
-            return
-          }
+        if (status === 204 || status === 304) {
           signal.removeEventListener('abort', onAbort)
-          signal.addEventListener('abort', onStreamAbort, { once: true })
+          ksBound.release()
+          res.resume()
+          finishHeaders(null, new Response(null, { status, statusText: res.statusMessage ?? '', headers: respHeaders }))
+          return
+        }
 
-          if (decomp) {
-            pipeline(res, decomp.decoder, err => {
-              if (err && !streamClosed) failStream(err)
-            })
-          }
-
-          source.on('data', (chunk: Buffer) => {
-            if (streamClosed) return
-            totalBytes += chunk.byteLength
-            if (totalBytes > maxResponseBytes) {
-              const err = new EgressDeniedError(
-                'response_too_large',
-                `Egress streaming response exceeded the ${maxResponseBytes}-byte size limit.`,
-              )
-              failStream(err)
-              return
+        let streamClosed = false
+        let totalBytes = 0
+        const readable = new ReadableStream<Uint8Array>({
+          start(controller) {
+            const cleanup = () => {
+              signal.removeEventListener('abort', onStreamAbort)
+              ksBound.release()
             }
-            try {
-              controller.enqueue(new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength))
-            } catch {
+            const failStream = (err: unknown) => {
+              if (streamClosed) return
               streamClosed = true
               decomp?.decoder.destroy()
               req.destroy()
+              try { controller.error(err) } catch { /* ignore */ }
               cleanup()
             }
-          })
-          source.once('end', () => {
-            if (streamClosed) return
-            streamClosed = true
-            try { controller.close() } catch { /* ignore */ }
-            cleanup()
-          })
-          source.once('error', err => failStream(err))
-          res.once('aborted', () => failStream(new Error('Egress streaming response aborted mid-body.')))
-          res.once('close', () => {
-            if (!streamClosed && !res.complete) {
-              failStream(new Error('Egress streaming response closed prematurely mid-body.'))
+            const onStreamAbort = () => {
+              const reason = signal.reason instanceof Error ? signal.reason : new Error('Egress stream aborted.')
+              failStream(reason)
             }
-          })
-          if (source !== res) {
-            res.once('error', err => failStream(err))
-          }
-        },
-        cancel() {
-          streamClosed = true
-          signal.removeEventListener('abort', onAbort)
-          decomp?.decoder.destroy()
-          req.destroy()
-          ksBound.release()
-        },
-      })
+            if (signal.aborted) {
+              onStreamAbort()
+              return
+            }
+            signal.removeEventListener('abort', onAbort)
+            signal.addEventListener('abort', onStreamAbort, { once: true })
 
-      finishHeaders(null, new Response(readable, {
-        status,
-        statusText: res.statusMessage ?? '',
-        headers: respHeaders,
-      }))
+            if (decomp) {
+              pipeline(res, decomp.decoder, err => {
+                if (err && !streamClosed) failStream(err)
+              })
+            }
+
+            source.on('data', (chunk: Buffer) => {
+              try {
+                if (streamClosed) return
+                totalBytes += chunk.byteLength
+                if (totalBytes > maxResponseBytes) {
+                  const err = new EgressDeniedError(
+                    'response_too_large',
+                    `Egress streaming response exceeded the ${maxResponseBytes}-byte size limit.`,
+                  )
+                  failStream(err)
+                  return
+                }
+                try {
+                  controller.enqueue(new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength))
+                } catch {
+                  streamClosed = true
+                  decomp?.decoder.destroy()
+                  req.destroy()
+                  cleanup()
+                }
+              } catch (err) {
+                failStream(err)
+              }
+            })
+            source.once('end', () => {
+              try {
+                if (streamClosed) return
+                streamClosed = true
+                try { controller.close() } catch { /* ignore */ }
+                cleanup()
+              } catch (err) {
+                failStream(err)
+              }
+            })
+            source.once('error', err => failStream(err))
+            res.once('aborted', () => failStream(new Error('Egress streaming response aborted mid-body.')))
+            res.once('close', () => {
+              if (!streamClosed && !res.complete) {
+                failStream(new Error('Egress streaming response closed prematurely mid-body.'))
+              }
+            })
+            if (source !== res) {
+              res.once('error', err => failStream(err))
+            }
+          },
+          cancel() {
+            streamClosed = true
+            signal.removeEventListener('abort', onAbort)
+            decomp?.decoder.destroy()
+            req.destroy()
+            ksBound.release()
+          },
+        })
+
+        finishHeaders(null, new Response(readable, {
+          status,
+          statusText: res.statusMessage ?? '',
+          headers: respHeaders,
+        }))
+      } catch (err) {
+        req.destroy()
+        finishHeaders(err)
+      }
     })
 
     req.setTimeout(timeoutMs, () => {
@@ -1176,91 +1270,104 @@ export async function egressRawHttp1<TTls = unknown>(
       }
 
       const onResponse = (res: IncomingMessage) => {
-        activeRes = res
-        const tls = options.extractTls && res.socket instanceof TLSSocket
-          ? options.extractTls(res.socket, hostname)
-          : undefined
-        if (!readBody || method === 'HEAD') {
-          if (!finished) {
-            finished = true
-            cleanupListeners()
-            resolve({ status: res.statusCode ?? 0, headers: res.headers, body: '', bodyBytes: 0, bodyTruncated: false, tls })
-          }
-          res.destroy()
-          return
-        }
-
-        const decomp = createResponseDecompressor(res.headers['content-encoding'])
-        const decompressed = decomp !== null
-        activeDecoder = decomp?.decoder ?? null
-        const stream: NodeJS.ReadableStream = decomp ? decomp.decoder : res
-
-        const chunks: Buffer[] = []
-        let total = 0
-        let truncated = false
-
-        const done = () => {
-          if (finished) return
-          finished = true
-          cleanupListeners()
-          const responseHeaders: IncomingHttpHeaders = { ...res.headers }
-          if (decompressed) {
-            delete responseHeaders['content-encoding']
-            delete responseHeaders['content-length']
-          }
-          resolve({
-            status: res.statusCode ?? 0,
-            headers: responseHeaders,
-            body: Buffer.concat(chunks).toString('utf8'),
-            bodyBytes: total,
-            bodyTruncated: truncated,
-            tls,
-          })
-        }
-
-        if (decomp) {
-          // R2-H-19: `stream.pipeline` guarantees premature EOF / FIN mid-body propagates
-          // into the zlib decoder and settles the promise instead of hanging forever.
-          pipeline(res, decomp.decoder, err => {
-            if (finished) return
-            if (err) {
-              if (truncated) done()
-              else fail(err)
+        try {
+          activeRes = res
+          const tls = options.extractTls && res.socket instanceof TLSSocket
+            ? options.extractTls(res.socket, hostname)
+            : undefined
+          const parsedHeaders = parseRawHeadersNullProto(res.rawHeaders)
+          if (!readBody || method === 'HEAD') {
+            if (!finished) {
+              finished = true
+              cleanupListeners()
+              resolve({ status: res.statusCode ?? 0, headers: parsedHeaders, body: '', bodyBytes: 0, bodyTruncated: false, tls })
             }
-          })
-        }
-
-        stream.on('data', (chunk: Buffer) => {
-          if (finished) return
-          if (total + chunk.length > cap) {
-            const remaining = cap - total
-            if (remaining > 0) chunks.push(chunk.subarray(0, remaining))
-            total = cap
-            truncated = true
-            try { decomp?.decoder.destroy() } catch { /* ignore */ }
             res.destroy()
-            done()
             return
           }
-          chunks.push(chunk)
-          total += chunk.length
-        })
-        stream.once('end', done)
-        stream.once('error', err => {
-          if (finished) return
-          if (truncated) done()
-          else fail(err)
-        })
-        res.once('aborted', () => {
-          if (finished) return
-          if (truncated) done()
-          else fail(new Error('HTTP/1.1 response aborted mid-body.'))
-        })
-        res.once('close', () => {
-          if (finished) return
-          if (truncated) done()
-          else if (!res.complete) fail(new Error('HTTP/1.1 response closed prematurely mid-body.'))
-        })
+
+          const decomp = createResponseDecompressor(parsedHeaders['content-encoding'])
+          const decompressed = decomp !== null
+          activeDecoder = decomp?.decoder ?? null
+          const stream: NodeJS.ReadableStream = decomp ? decomp.decoder : res
+
+          const chunks: Buffer[] = []
+          let total = 0
+          let truncated = false
+
+          const done = () => {
+            try {
+              if (finished) return
+              finished = true
+              cleanupListeners()
+              const responseHeaders = cloneNullProtoHeaders(parsedHeaders)
+              if (decompressed) {
+                delete responseHeaders['content-encoding']
+                delete responseHeaders['content-length']
+              }
+              resolve({
+                status: res.statusCode ?? 0,
+                headers: responseHeaders,
+                body: Buffer.concat(chunks).toString('utf8'),
+                bodyBytes: total,
+                bodyTruncated: truncated,
+                tls,
+              })
+            } catch (err) {
+              fail(err)
+            }
+          }
+
+          if (decomp) {
+            // R2-H-19: `stream.pipeline` guarantees premature EOF / FIN mid-body propagates
+            // into the zlib decoder and settles the promise instead of hanging forever.
+            pipeline(res, decomp.decoder, err => {
+              if (finished) return
+              if (err) {
+                if (truncated) done()
+                else fail(err)
+              }
+            })
+          }
+
+          stream.on('data', (chunk: Buffer) => {
+            try {
+              if (finished) return
+              if (total + chunk.length > cap) {
+                const remaining = cap - total
+                if (remaining > 0) chunks.push(chunk.subarray(0, remaining))
+                total = cap
+                truncated = true
+                try { decomp?.decoder.destroy() } catch { /* ignore */ }
+                res.destroy()
+                done()
+                return
+              }
+              chunks.push(chunk)
+              total += chunk.length
+            } catch (err) {
+              fail(err)
+            }
+          })
+          stream.once('end', done)
+          stream.once('error', err => {
+            if (finished) return
+            if (truncated) done()
+            else fail(err)
+          })
+          res.once('aborted', () => {
+            if (finished) return
+            if (truncated) done()
+            else fail(new Error('HTTP/1.1 response aborted mid-body.'))
+          })
+          res.once('close', () => {
+            if (finished) return
+            if (truncated) done()
+            else if (!res.complete) fail(new Error('HTTP/1.1 response closed prematurely mid-body.'))
+          })
+        } catch (err) {
+          fail(err)
+        }
       }
 
       const family = address.family === 4 || address.family === 6 ? address.family : undefined
@@ -1440,7 +1547,7 @@ export async function egressHttp2(
       }
 
       let status = 0
-      const rawHeaders: Record<string, string> = {}
+      const rawHeaders = Object.create(null) as Record<string, string>
       const chunks: Buffer[] = []
       let rawCaptured = 0
       let captured = 0
@@ -1453,71 +1560,92 @@ export async function egressHttp2(
         if (bodyListenersAttached) return
         bodyListenersAttached = true
         targetStream.on('data', (chunk: Buffer) => {
-          if (settled) return
-          captured += chunk.length
-          if (captured > maxResponseBytes) {
-            truncated = true
-            activeDecoder?.destroy()
-            stream.close(http2Constants.NGHTTP2_CANCEL)
-            finish(new EgressDeniedError(
-              'response_too_large',
-              `HTTP/2 egress response exceeded the ${maxResponseBytes}-byte limit.`,
-            ))
-            return
-          }
-          chunks.push(chunk)
-        })
-        targetStream.once('error', err => finish(err))
-        targetStream.once('end', () => {
-          const body = Buffer.concat(chunks).toString('utf8')
-          const outHeaders = { ...rawHeaders }
-          if (decompressed) {
-            delete outHeaders['content-encoding']
-            delete outHeaders['content-length']
-          }
-          finish(null, {
-            status,
-            headers: outHeaders,
-            rawHeaders,
-            body,
-            bodyBytes: captured,
-            bodyTruncated: truncated,
-            pinnedAddress: pinned.address,
-            durationMs: Date.now() - started,
-          })
-        })
-      }
-
-      stream.on('response', value => {
-        status = Number(value[':status'] ?? 0)
-        for (const [k, v] of Object.entries(value)) {
-          if (k.startsWith(':') || v === undefined) continue
-          rawHeaders[k.toLowerCase()] = Array.isArray(v) ? v.join(', ') : String(v)
-        }
-        const decomp = createResponseDecompressor(rawHeaders['content-encoding'])
-        if (decomp) {
-          activeDecoder = decomp.decoder
-          decompressed = true
-          // Also enforce raw compressed byte cap to prevent decompression-bomb DoS.
-          stream.on('data', (rawChunk: Buffer) => {
-            rawCaptured += rawChunk.length
-            if (rawCaptured > maxResponseBytes) {
+          try {
+            if (settled) return
+            captured += chunk.length
+            if (captured > maxResponseBytes) {
               truncated = true
+              activeDecoder?.destroy()
               stream.close(http2Constants.NGHTTP2_CANCEL)
-              decomp.decoder.destroy()
               finish(new EgressDeniedError(
                 'response_too_large',
                 `HTTP/2 egress response exceeded the ${maxResponseBytes}-byte limit.`,
               ))
+              return
             }
-          })
-          pipeline(stream, decomp.decoder, err => {
-            if (settled) return
-            if (err) finish(err)
-          })
-          bodyStream = decomp.decoder
+            chunks.push(chunk)
+          } catch (err) {
+            finish(err)
+          }
+        })
+        targetStream.once('error', err => finish(err))
+        targetStream.once('end', () => {
+          try {
+            const body = Buffer.concat(chunks).toString('utf8')
+            const outHeaders = Object.create(null) as Record<string, string>
+            for (const [k, v] of Object.entries(rawHeaders)) {
+              if (!RESERVED_PROTO_HEADER_KEYS.has(k.toLowerCase())) outHeaders[k] = v
+            }
+            if (decompressed) {
+              delete outHeaders['content-encoding']
+              delete outHeaders['content-length']
+            }
+            finish(null, {
+              status,
+              headers: outHeaders,
+              rawHeaders,
+              body,
+              bodyBytes: captured,
+              bodyTruncated: truncated,
+              pinnedAddress: pinned.address,
+              durationMs: Date.now() - started,
+            })
+          } catch (err) {
+            finish(err)
+          }
+        })
+      }
+
+      stream.on('response', value => {
+        try {
+          status = Number(value[':status'] ?? 0)
+          for (const [k, v] of Object.entries(value)) {
+            if (k.startsWith(':') || v === undefined) continue
+            const lower = k.toLowerCase()
+            if (RESERVED_PROTO_HEADER_KEYS.has(lower)) continue
+            rawHeaders[lower] = Array.isArray(v) ? v.join(', ') : String(v)
+          }
+          const decomp = createResponseDecompressor(rawHeaders['content-encoding'])
+          if (decomp) {
+            activeDecoder = decomp.decoder
+            decompressed = true
+            // Also enforce raw compressed byte cap to prevent decompression-bomb DoS.
+            stream.on('data', (rawChunk: Buffer) => {
+              try {
+                rawCaptured += rawChunk.length
+                if (rawCaptured > maxResponseBytes) {
+                  truncated = true
+                  stream.close(http2Constants.NGHTTP2_CANCEL)
+                  decomp.decoder.destroy()
+                  finish(new EgressDeniedError(
+                    'response_too_large',
+                    `HTTP/2 egress response exceeded the ${maxResponseBytes}-byte limit.`,
+                  ))
+                }
+              } catch (err) {
+                finish(err)
+              }
+            })
+            pipeline(stream, decomp.decoder, err => {
+              if (settled) return
+              if (err) finish(err)
+            })
+            bodyStream = decomp.decoder
+          }
+          attachBodyListeners(bodyStream)
+        } catch (err) {
+          finish(err)
         }
-        attachBodyListeners(bodyStream)
       })
       stream.once('error', err => finish(err))
       stream.once('aborted', () => finish(new Error('HTTP/2 stream aborted mid-body.')))
@@ -1713,7 +1841,8 @@ export async function createLoopbackProxy(initialPolicy: LoopbackProxyPolicy = {
   }
 
   const authenticate = (req: IncomingMessage): LoopbackProxyPolicy | null => {
-    const parsed = parseBasicProxyAuthorization(req.headers['proxy-authorization'])
+    const reqHeaders = parseRawHeadersNullProto(req.rawHeaders)
+    const parsed = parseBasicProxyAuthorization(reqHeaders['proxy-authorization'])
     if (!parsed) return null
     if (
       constantTimeStringEqual(parsed.username, defaultAuth.credentials.username) &&
@@ -1822,11 +1951,11 @@ export async function createLoopbackProxy(initialPolicy: LoopbackProxyPolicy = {
         pinnedAddress: pinned.address,
       })
 
-      let forwardHeaders: Record<string, string> = {}
-      for (const [k, v] of Object.entries(req.headers)) {
+      let forwardHeaders = Object.create(null) as Record<string, string>
+      for (const [k, v] of Object.entries(parseRawHeadersNullProto(req.rawHeaders))) {
         if (v === undefined) continue
         const lower = k.toLowerCase()
-        if (HOP_BY_HOP_HEADERS.has(lower)) continue
+        if (HOP_BY_HOP_HEADERS.has(lower) || RESERVED_PROTO_HEADER_KEYS.has(lower)) continue
         forwardHeaders[lower] = Array.isArray(v) ? v.join(', ') : v
       }
       forwardHeaders.host = validated.url.host
@@ -1853,92 +1982,114 @@ export async function createLoopbackProxy(initialPolicy: LoopbackProxyPolicy = {
             }
           : {}),
       }, upRes => {
-        const rawContentLen = upRes.headers['content-length']
-        const declaredLen = typeof rawContentLen === 'string' && /^\d+$/.test(rawContentLen.trim())
-          ? Number(rawContentLen.trim())
-          : NaN
-        if (Number.isFinite(declaredLen) && declaredLen > maxResponseBytes) {
-          policy.onDenied?.({
-            url: validated.url.href,
-            origin: validated.url.origin,
-            code: 'response_too_large',
-            reason: `Proxied response declared Content-Length ${declaredLen} exceeding ${maxResponseBytes}-byte limit.`,
-          })
-          upRes.destroy()
-          writeProxyErrorResponse(
-            res,
-            502,
-            'response_too_large',
-            `Proxied response exceeded the ${maxResponseBytes}-byte limit.`,
-          )
-          return
-        }
-
-        let respHeaders: IncomingHttpHeaders = { ...upRes.headers }
-        for (const h of HOP_BY_HOP_HEADERS) delete respHeaders[h]
-        if (state.transformResponseHeaders) {
-          respHeaders = state.transformResponseHeaders(validated.url, respHeaders)
-        }
-
-        let headersFlushed = false
-        let totalReceived = 0
         let abortedLarge = false
-
-        const flushHeaders = () => {
-          if (headersFlushed || res.headersSent) return
-          headersFlushed = true
-          res.writeHead(upRes.statusCode ?? 502, upRes.statusMessage, respHeaders)
+        const failUpstream = () => {
+          abortedLarge = true
+          try { upRes.destroy() } catch { /* ignore */ }
+          try { upstream.destroy() } catch { /* ignore */ }
+          if (!res.headersSent) {
+            writeProxyErrorResponse(res, 502, 'upstream_error', 'Upstream response failed.')
+          } else if (!res.destroyed) {
+            res.destroy()
+          }
         }
-
-        upRes.on('data', (chunk: Buffer) => {
-          if (abortedLarge) return
-          totalReceived += chunk.byteLength
-          if (totalReceived > maxResponseBytes) {
-            abortedLarge = true
+        try {
+          let respHeaders: IncomingHttpHeaders = parseRawHeadersNullProto(upRes.rawHeaders)
+          const rawContentLen = respHeaders['content-length']
+          const declaredLen = typeof rawContentLen === 'string' && /^\d+$/.test(rawContentLen.trim())
+            ? Number(rawContentLen.trim())
+            : NaN
+          if (Number.isFinite(declaredLen) && declaredLen > maxResponseBytes) {
             policy.onDenied?.({
               url: validated.url.href,
               origin: validated.url.origin,
               code: 'response_too_large',
-              reason: `Proxied response exceeded the ${maxResponseBytes}-byte limit.`,
+              reason: `Proxied response declared Content-Length ${declaredLen} exceeding ${maxResponseBytes}-byte limit.`,
             })
             upRes.destroy()
-            upstream.destroy()
+            writeProxyErrorResponse(
+              res,
+              502,
+              'response_too_large',
+              `Proxied response exceeded the ${maxResponseBytes}-byte limit.`,
+            )
+            return
+          }
+
+          for (const h of HOP_BY_HOP_HEADERS) delete respHeaders[h]
+          if (state.transformResponseHeaders) {
+            respHeaders = state.transformResponseHeaders(validated.url, respHeaders)
+          }
+
+          let headersFlushed = false
+          let totalReceived = 0
+
+          const flushHeaders = () => {
+            if (headersFlushed || res.headersSent) return
+            headersFlushed = true
+            res.writeHead(upRes.statusCode ?? 502, upRes.statusMessage, respHeaders)
+          }
+
+          upRes.on('data', (chunk: Buffer) => {
+            try {
+              if (abortedLarge) return
+              totalReceived += chunk.byteLength
+              if (totalReceived > maxResponseBytes) {
+                abortedLarge = true
+                policy.onDenied?.({
+                  url: validated.url.href,
+                  origin: validated.url.origin,
+                  code: 'response_too_large',
+                  reason: `Proxied response exceeded the ${maxResponseBytes}-byte limit.`,
+                })
+                upRes.destroy()
+                upstream.destroy()
+                if (!res.headersSent) {
+                  writeProxyErrorResponse(
+                    res,
+                    502,
+                    'response_too_large',
+                    `Proxied response exceeded the ${maxResponseBytes}-byte limit.`,
+                  )
+                } else {
+                  res.destroy()
+                }
+                return
+              }
+              flushHeaders()
+              if (!res.destroyed) {
+                const ok = res.write(chunk)
+                if (!ok) {
+                  upRes.pause()
+                  res.once('drain', () => {
+                    if (!abortedLarge && !upRes.destroyed) upRes.resume()
+                  })
+                }
+              }
+            } catch {
+              failUpstream()
+            }
+          })
+          upRes.once('end', () => {
+            try {
+              if (abortedLarge) return
+              flushHeaders()
+              if (!res.destroyed) res.end()
+            } catch {
+              failUpstream()
+            }
+          })
+          upRes.once('error', () => {
+            if (abortedLarge) return
             if (!res.headersSent) {
-              writeProxyErrorResponse(
-                res,
-                502,
-                'response_too_large',
-                `Proxied response exceeded the ${maxResponseBytes}-byte limit.`,
-              )
+              writeProxyErrorResponse(res, 502, 'upstream_error', 'Upstream response failed.')
             } else {
               res.destroy()
             }
-            return
-          }
-          flushHeaders()
-          if (!res.destroyed) {
-            const ok = res.write(chunk)
-            if (!ok) {
-              upRes.pause()
-              res.once('drain', () => {
-                if (!abortedLarge && !upRes.destroyed) upRes.resume()
-              })
-            }
-          }
-        })
-        upRes.once('end', () => {
-          if (abortedLarge) return
-          flushHeaders()
-          if (!res.destroyed) res.end()
-        })
-        upRes.once('error', () => {
-          if (abortedLarge) return
-          if (!res.headersSent) {
-            writeProxyErrorResponse(res, 502, 'upstream_error', 'Upstream response failed.')
-          } else {
-            res.destroy()
-          }
-        })
+          })
+        } catch {
+          failUpstream()
+        }
       })
 
       upstream.setTimeout(timeoutMs, () => {
