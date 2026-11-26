@@ -17,6 +17,7 @@ import {
   type ThreatModelSummary,
 } from '../domain.ts'
 import { suppliedResponseLabel } from '../report-summary.ts'
+import { isContinuableStepStatus } from '../step-status.ts'
 import { accessPolicyReviews } from './access-policy-checks.ts'
 import {
   agentTurn,
@@ -61,7 +62,6 @@ import { normalizeRouteTemplate } from './route-template.ts'
 import { meetsBaseline, type EvidenceReview } from './evidence-checks.ts'
 import {
   CHAIN_CONTINUATION_SKILL_PREFIX,
-  CONTINUABLE_CHAIN_STEP_STATUSES,
   DEFAULT_MAX_ORIGIN_SHARE,
   DET_LEAD_STEP_PRIORITY,
   DRY_ROUND_LIMIT,
@@ -2145,7 +2145,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     assignment: Pick<Assignment, 'id'>
     terminalStatus: ChainStepRetryableStatus
     targetOrigins: readonly string[]
-  }): { requeued: boolean; reason: string; retryStep?: ChainStep; retryKey?: string } {
+  }): { requeued: boolean; reason: string; retryStep?: ChainStep; retryKey?: string; repointedDependentIds?: string[] } {
     const { run, step, assignment, terminalStatus } = input
     if (!isRetryableChainStepStatus(terminalStatus)) {
       return { requeued: false, reason: 'not_retryable_status' }
@@ -2260,6 +2260,18 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       }),
     })
     const readyRetry = this.storage.updateChainStep(created.id, { status: 'ready' })
+    // R2-07: Re-point pending downstream dependents of the capped/nudged original step to the
+    // retry step (bounded inside the 1-retry cap and RunSafetyBudgets) so they wait on the retry
+    // instead of stranding on the terminal original.
+    const repointedDependentIds: string[] = []
+    for (const candidate of existingSteps) {
+      if (candidate.id === step.id || candidate.id === readyRetry.id) continue
+      if (candidate.status !== 'pending') continue
+      if (!candidate.dependsOnStepIds.includes(step.id)) continue
+      const nextDeps = [...new Set(candidate.dependsOnStepIds.map(sid => (sid === step.id ? readyRetry.id : sid)))]
+      this.storage.updateChainStep(candidate.id, { dependsOnStepIds: nextDeps })
+      repointedDependentIds.push(candidate.id)
+    }
     const targetsToBind: StructuredStepTarget[] = structuredTargets.length > 0
       ? structuredTargets
       : [{ origin: primaryOrigin || validOrigins[0]!, method: primaryMethod, route: primaryRoute, vulnClass: primaryClass }]
@@ -2279,9 +2291,10 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         maxRetries: MAX_RETRYABLE_STEP_RETRIES,
         dynamicBudget,
         effectiveStepCap,
+        repointedDependentIds,
       },
     )
-    return { requeued: true, reason: 'requeued', retryStep: readyRetry, retryKey }
+    return { requeued: true, reason: 'requeued', retryStep: readyRetry, retryKey, repointedDependentIds }
   }
 
   /** Return (or initialize) the run-scoped v8 FrontierWaveController bound to Store's CapabilityLedger. */
@@ -5621,7 +5634,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         const existingById = new Map(existing.map(s => [s.id, s]))
         const allParentsContinuable = depStepIds.every(sid => {
           const parent = existingById.get(sid)
-          return Boolean(parent && CONTINUABLE_CHAIN_STEP_STATUSES.has(parent.status))
+          return Boolean(parent && isContinuableStepStatus(parent.status))
         })
         if (allParentsContinuable) {
           this.storage.updateChainStep(createdStep.id, { status: 'ready' })

@@ -40,7 +40,9 @@ import {
 } from './broker.ts'
 import { cleanupStagedEntities } from './deterministic-engine.ts'
 import type { ExecBoardManager } from './exec-board.ts'
+import { isTerminalStepStatus, type ChainStepTerminalStatus } from '../step-status.ts'
 import {
+  classifyWorkerErrorToStepStatus,
   collectAllPages,
   dedupePromotableCodeAuditFacts,
   isPromotableCodeAuditFact,
@@ -2504,15 +2506,20 @@ export class RunTier3ApprovalCoordinator {
       const workerById = new Map(this.host.storage.workerList(run.id).map(w => [w.id, w]))
       let updatedAnyStep = false
       for (const step of this.host.storage.listChainSteps(run.id, run.goalRevision)) {
-        if (step.status !== 'running' || !step.assignedWorkerId) continue
+        if (isTerminalStepStatus(step.status) || step.status !== 'running' || !step.assignedWorkerId) continue
         if (this.host.active.has(step.assignedWorkerId) || this.activeWaiters.has(step.assignedWorkerId)) continue
         const assigned = workerById.get(step.assignedWorkerId)
         if (!assigned) continue
+        let reconciledStatus: ChainStepTerminalStatus | null = null
         if (assigned.status === 'complete') {
-          this.host.storage.updateChainStep(step.id, { status: 'complete', assignedWorkerId: assigned.id })
-          updatedAnyStep = true
-        } else if (assigned.status === 'failed' || assigned.status === 'canceled') {
-          this.host.storage.updateChainStep(step.id, { status: 'canceled', assignedWorkerId: assigned.id })
+          reconciledStatus = 'complete'
+        } else if (assigned.status === 'failed') {
+          reconciledStatus = classifyWorkerErrorToStepStatus(assigned.outcome)
+        } else if (assigned.status === 'canceled') {
+          reconciledStatus = 'canceled'
+        }
+        if (reconciledStatus && isTerminalStepStatus(reconciledStatus)) {
+          this.host.storage.updateChainStep(step.id, { status: reconciledStatus, assignedWorkerId: assigned.id })
           updatedAnyStep = true
         }
       }

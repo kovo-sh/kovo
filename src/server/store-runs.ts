@@ -54,6 +54,11 @@ import type {
   newRun,
 } from '../domain.ts'
 import {
+  stepBlocksDependent,
+  stepKillsDependents,
+  stepSatisfiesDependency,
+} from '../step-status.ts'
+import {
   buildProvenanceReport,
   collapseBaselineHeaderFindings,
   deduplicateChainFindings,
@@ -1354,24 +1359,35 @@ export class RunsRepository {
         this.session.db.select({ id: tables.facts.id, tainted: tables.facts.tainted }).from(tables.facts)
           .where(eq(tables.facts.runId, runId)).all().map(f => [f.id, f]),
       )
-      // Fixed-point propagation so transitive chains (A blocked/canceled/tainted -> B -> C)
-      // resolve in one pass and circuit-open steps (M-12) can never wedge driveInvestigation.
+      // Fixed-point propagation derived from STEP_STATUS so transitive chains resolve in one pass
+      // and zero pending steps stay stranded on terminal non-satisfying or missing dependencies.
       let changed = true
       while (changed) {
         changed = false
         for (const step of stepById.values()) {
           if (step.status !== 'pending') continue
-          const taintedDep = step.dependsOnStepIds.some(sid => {
+          const killedByStep = step.dependsOnStepIds.some(sid => {
             const s = stepById.get(sid)
-            return s && (s.status === 'tainted' || s.status === 'canceled' || s.status === 'blocked')
-          }) || step.dependsOnFactIds.some(fid => runFacts.get(fid)?.tainted)
-          if (taintedDep) {
+            return Boolean(s && stepKillsDependents(s.status))
+          })
+          const taintedFact = step.dependsOnFactIds.some(fid => runFacts.get(fid)?.tainted)
+          if (killedByStep || taintedFact) {
             this.updateChainStep(step.id, { status: 'tainted' })
             step.status = 'tainted'
             changed = true
             continue
           }
-          const ready = step.dependsOnStepIds.every(sid => stepById.get(sid)?.status === 'complete') &&
+          const blockedByStep = step.dependsOnStepIds.some(sid => {
+            const s = stepById.get(sid)
+            return !s || stepBlocksDependent(s.status)
+          })
+          if (blockedByStep) {
+            this.updateChainStep(step.id, { status: 'blocked' })
+            step.status = 'blocked'
+            changed = true
+            continue
+          }
+          const ready = step.dependsOnStepIds.every(sid => stepSatisfiesDependency(stepById.get(sid)?.status)) &&
             step.dependsOnFactIds.every(fid => {
               const f = runFacts.get(fid)
               return f && !f.tainted
