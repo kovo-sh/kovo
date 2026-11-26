@@ -12,6 +12,7 @@ import {
   resolveSafeVariantSweepLocation,
 } from '../src/server/exec-recon-planner.ts'
 import { Store } from '../src/server/store.ts'
+import { canonicalPathAndQuery, hasUnsafeAdmissionPath } from '../src/server/scope-policy.ts'
 import {
   applyDiscoveredSubdomainsToRun,
   autoAdmitAnchorForOrigin,
@@ -347,4 +348,26 @@ test('H-39 sibling: variant-sweep path resolver and sibling walker refuse sensit
     [{ repo: 'acme/demo', file: 'src/primary.ts', startLine: 1, endLine: 1 }],
   )
   assert.deepEqual(hits.map(h => h.file), ['src/sibling.ts'])
+})
+
+test('C1 path canonicalization: allows %2F in query parameters while rejecting unsafe pathname syntax and query control chars', () => {
+  const oauthQuery = '/authorize?client_id=app&redirect_uri=https%3A%2F%2Fapp.example%2Fcb&next=%2Fs%2F123'
+  assert.equal(hasUnsafeAdmissionPath(oauthQuery), false)
+  assert.equal(canonicalPathAndQuery(oauthQuery), oauthQuery)
+  assert.equal(hasUnsafeAdmissionPath('https://idp.example' + oauthQuery), false)
+  assert.equal(canonicalPathAndQuery('https://idp.example' + oauthQuery), oauthQuery)
+
+  for (const unsafe of [
+    '/api/../admin',
+    '/api/%2e%2e/admin',
+    '/api/%2fadmin',
+    '/api/%5cadmin',
+    '/api\\admin',
+    'https://idp.example/api/%2e%2e/admin?ok=1',
+    '/authorize?next=ok\r\nX-Injected: 1',
+    '/authorize?next=ok\0',
+  ]) {
+    assert.equal(hasUnsafeAdmissionPath(unsafe), true, `expected unsafe: ${unsafe}`)
+    assert.equal(canonicalPathAndQuery(unsafe), null, `expected null canonical: ${unsafe}`)
+  }
 })
