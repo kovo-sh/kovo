@@ -216,6 +216,23 @@ const VALID_REFERRER_POLICIES = [
   'same-origin', 'strict-origin', 'strict-origin-when-cross-origin', 'unsafe-url',
 ] as const
 
+const BASELINE_CAPTURE_CONCURRENCY = 6
+const BASELINE_CAPTURE_MIN_CONCURRENCY = 1
+const BASELINE_CAPTURE_MAX_CONCURRENCY = 12
+const BASELINE_CAPTURE_TIMEOUT_MS = 8_000
+
+/** Parse and clamp `KOVO_BASELINE_CAPTURE_CONCURRENCY` to `[1, 12]` (default `6`). */
+function resolveBaselineCaptureConcurrency(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.KOVO_BASELINE_CAPTURE_CONCURRENCY
+  if (raw === undefined || raw.trim() === '') return BASELINE_CAPTURE_CONCURRENCY
+  const parsed = Number(raw.trim())
+  if (!Number.isFinite(parsed)) return BASELINE_CAPTURE_CONCURRENCY
+  return Math.max(
+    BASELINE_CAPTURE_MIN_CONCURRENCY,
+    Math.min(BASELINE_CAPTURE_MAX_CONCURRENCY, Math.floor(parsed)),
+  )
+}
+
 function buildObservationFromHeaders(
   row: { origin: string; finalOrigin: string; status: number; mediaType: string },
   headersObj: Record<string, string>,
@@ -2361,6 +2378,258 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
   }
 
 
+  static readonly BASELINE_CAPTURE_CONCURRENCY = BASELINE_CAPTURE_CONCURRENCY
+  static readonly BASELINE_CAPTURE_MIN_CONCURRENCY = BASELINE_CAPTURE_MIN_CONCURRENCY
+  static readonly BASELINE_CAPTURE_MAX_CONCURRENCY = BASELINE_CAPTURE_MAX_CONCURRENCY
+  static readonly BASELINE_CAPTURE_TIMEOUT_MS = BASELINE_CAPTURE_TIMEOUT_MS
+  static resolveBaselineCaptureConcurrency = resolveBaselineCaptureConcurrency
+
+  async captureBaselineObservations(input: {
+    run: Run
+    approvedAssets: readonly Candidate[]
+    claimed: Assignment
+    job: Active
+    grant: Grant
+    secrets: readonly NamedSecret[]
+    phase0RootExchanges: ReadonlyMap<string, BrokerExchangeResult>
+    signal: AbortSignal
+    selectedChecks: readonly AssessmentCheckId[]
+    concurrency?: number
+    timeoutMs?: number
+  }): Promise<Record<string, unknown>[]> {
+    const {
+      run: freshRun,
+      approvedAssets,
+      claimed,
+      job,
+      grant,
+      secrets,
+      phase0RootExchanges,
+      signal,
+      selectedChecks,
+    } = input
+    const observations: Record<string, unknown>[] = []
+    if (approvedAssets.length === 0) return observations
+
+    const responseChecks = selectedChecks.filter(c => c !== 'access-policy') as ResponseCheckId[]
+    const configuredConcurrency = input.concurrency !== undefined && Number.isFinite(input.concurrency)
+      ? Math.max(BASELINE_CAPTURE_MIN_CONCURRENCY, Math.min(BASELINE_CAPTURE_MAX_CONCURRENCY, Math.floor(input.concurrency)))
+      : resolveBaselineCaptureConcurrency()
+    const concurrency = Math.max(1, Math.min(approvedAssets.length, configuredConcurrency))
+    const timeoutMs = input.timeoutMs !== undefined && Number.isFinite(input.timeoutMs) && input.timeoutMs > 0
+      ? Math.floor(input.timeoutMs)
+      : BASELINE_CAPTURE_TIMEOUT_MS
+
+    const selectPriorRootStmt = freshRun.sourceMode !== 'prepared' && freshRun.capabilityTier > 0
+      ? this.storage.client.prepare(
+          `SELECT id, origin, final_origin AS finalOrigin, status, media_type AS mediaType, resp_headers AS respHeadersJson
+           FROM broker_exchanges
+           WHERE run_id = ? AND origin = ? AND method = 'GET' AND path_and_query = '/'
+           ORDER BY created_at ASC LIMIT 1`,
+        )
+      : null
+
+    type PriorRootRow = {
+      id: string
+      origin: string
+      finalOrigin: string
+      status: number
+      mediaType: string
+      respHeadersJson: string
+    }
+    type BaselineCaptureSlot = {
+      asset: Candidate
+      hostWorker: Assignment
+      capture: Capture
+      fetchedExchange?: BrokerExchangeResult
+      observationEntry?: Record<string, unknown>
+      attachSavedExchangeId?: boolean
+    }
+
+    const buildObsEntry = (
+      origin: string,
+      row: { finalOrigin: string; status: number; mediaType: string },
+      headers: Record<string, string>,
+      exchangeId?: string,
+    ): Record<string, unknown> => ({
+      origin,
+      finalOrigin: row.finalOrigin,
+      status: row.status,
+      mediaType: row.mediaType,
+      server: headers['server'],
+      poweredBy: headers['x-powered-by'],
+      ...(exchangeId ? { exchangeId } : {}),
+    })
+
+    const results = new Array<BaselineCaptureSlot | undefined>(approvedAssets.length)
+    let nextCommitIdx = 0
+
+    const commitSlot = (slot: BaselineCaptureSlot) => {
+      this.storage.transaction(() => {
+        let savedExchangeId: string | undefined
+        if (slot.fetchedExchange) {
+          const savedEx = recordBrokerExchange(this.storage, freshRun, slot.hostWorker.id, slot.fetchedExchange, secrets)
+          savedExchangeId = savedEx.id
+        }
+        if (slot.observationEntry) {
+          observations.push(
+            slot.attachSavedExchangeId && savedExchangeId
+              ? { ...slot.observationEntry, exchangeId: savedExchangeId }
+              : slot.observationEntry,
+          )
+        }
+
+        const obsArtifact = this.storage.addArtifact(
+          freshRun, slot.hostWorker, 'observation',
+          freshRun.sourceMode === 'prepared' ? suppliedResponseLabel : 'Observed public response',
+          JSON.stringify(slot.capture, null, 2), 'capture:' + freshRun.scopeRevision, secrets,
+        )
+        const reviews = responseChecks.length ? responseReview(slot.capture.observation, slot.capture.note, responseChecks) : []
+        const inputs = [{ artifactId: obsArtifact.id, reviews }]
+
+        if (selectedChecks.includes('access-policy')) {
+          const snapshot = slot.asset.accessPolicy?.origin === slot.asset.origin ? slot.asset.accessPolicy : undefined
+          const apArtifact = this.storage.addArtifact(freshRun, slot.hostWorker, 'access-policy', 'Supplied access policy records',
+            JSON.stringify({ origin: slot.asset.origin, snapshot: snapshot ?? null }, null, 2), 'access-policy', secrets)
+          inputs.push({ artifactId: apArtifact.id, reviews: accessPolicyReviews(snapshot) })
+        }
+
+        for (const { artifactId, reviews: revs } of inputs) {
+          for (const rev of revs) {
+            if (rev.comparison && !meetsBaseline(rev.comparison)) {
+              const earlier = this.host.baselineFinding(freshRun, slot.asset, rev)
+              this.host.saveBaselineFinding(freshRun, slot.asset, rev, 'pending',
+                'The recorded value falls outside the expected policy. Verification is pending.', [artifactId], earlier?.id)
+            }
+          }
+        }
+        this.storage.updateWorker(slot.hostWorker.id, { status: 'complete', lease: null, outcome: slot.capture.note })
+      })
+    }
+
+    const flushCompletedInOrder = () => {
+      while (nextCommitIdx < results.length) {
+        const slot = results[nextCommitIdx]
+        if (!slot) break
+        results[nextCommitIdx] = undefined
+        nextCommitIdx += 1
+        commitSlot(slot)
+      }
+    }
+
+    let nextIndex = 0
+    const workers = Array.from({ length: concurrency }, async () => {
+      while (true) {
+        if (!this.host.authorize(job) || signal.aborted) return
+        const idx = nextIndex
+        if (idx >= approvedAssets.length) return
+        nextIndex += 1
+        const asset = approvedAssets[idx]!
+
+        const hostWorker = this.storage.makeWorker(freshRun, 'threat_model', asset,
+          `Baseline capture · ${new URL(asset.origin).hostname}`,
+          'Capture initial baseline response and access-policy evidence for deterministic checks.', {
+            sourceOrigins: [asset.origin],
+          })
+        this.storage.updateWorker(hostWorker.id, { status: 'running', lease: claimed.lease })
+
+        let capture: Capture
+        let fetchedExchange: BrokerExchangeResult | undefined
+        let observationEntry: Record<string, unknown> | undefined
+        let attachSavedExchangeId = false
+
+        if (freshRun.sourceMode === 'prepared' || freshRun.capabilityTier === 0) {
+          capture = asset.prepared
+            ? { observation: { ...asset.prepared, origin: asset.origin, finalOrigin: asset.origin, source: 'supplied observation' }, note: 'Supplied project evidence.' }
+            : { observation: null, note: 'No prepared observation was supplied.' }
+        } else {
+          try {
+            const cachedPhase0Root = phase0RootExchanges.get(asset.origin)
+            const priorRootRow = !cachedPhase0Root && selectPriorRootStmt
+              ? selectPriorRootStmt.get(freshRun.id, asset.origin) as PriorRootRow | undefined
+              : undefined
+
+            if (cachedPhase0Root) {
+              capture = { observation: cachedPhase0Root.observation, note: 'Recorded approved HTTPS root response.' }
+              observationEntry = buildObsEntry(asset.origin, cachedPhase0Root, cachedPhase0Root.respHeaders)
+            } else if (priorRootRow) {
+              let headersObj: Record<string, string> = {}
+              try { headersObj = JSON.parse(priorRootRow.respHeadersJson) as Record<string, string> } catch { /* ignore */ }
+              capture = { observation: buildObservationFromHeaders(priorRootRow, headersObj), note: 'Reused recorded approved HTTPS root response.' }
+              observationEntry = buildObsEntry(asset.origin, priorRootRow, headersObj, priorRootRow.id)
+            } else {
+              const hostController = new AbortController()
+              const onParentAbort = () => {
+                hostController.abort(signal.reason ?? new DOMException('Baseline capture aborted', 'AbortError'))
+              }
+              if (signal.aborted) {
+                onParentAbort()
+              } else {
+                signal.addEventListener('abort', onParentAbort, { once: true })
+              }
+              const hostTimer = setTimeout(() => {
+                hostController.abort(new DOMException(`Baseline capture timed out after ${timeoutMs}ms`, 'TimeoutError'))
+              }, timeoutMs)
+              hostTimer.unref?.()
+              try {
+                const abortPromise = new Promise<never>((_, reject) => {
+                  const rejectWithReason = () => {
+                    reject(hostController.signal.reason ?? new DOMException('Baseline capture aborted', 'AbortError'))
+                  }
+                  if (hostController.signal.aborted) {
+                    rejectWithReason()
+                    return
+                  }
+                  hostController.signal.addEventListener('abort', rejectWithReason, { once: true })
+                })
+                abortPromise.catch(() => undefined)
+                const fetchPromise = this.broker.executeHttp({
+                  origin: asset.origin, method: 'GET', pathAndQuery: '/', followRedirects: true, timeoutMs,
+                }, grant, hostController.signal)
+                fetchPromise.catch(() => undefined)
+                const ex = await Promise.race([fetchPromise, abortPromise])
+                fetchedExchange = ex
+                capture = { observation: ex.observation, note: 'Recorded approved HTTPS root response.' }
+                observationEntry = buildObsEntry(asset.origin, ex, ex.respHeaders)
+                attachSavedExchangeId = true
+              } finally {
+                clearTimeout(hostTimer)
+                signal.removeEventListener('abort', onParentAbort)
+              }
+            }
+          } catch (error) {
+            capture = {
+              observation: null,
+              note: error instanceof BrokerDenied || error instanceof BrokerCircuitOpen
+                ? error.message : 'The approved public response could not be read.',
+            }
+            observationEntry = { origin: asset.origin, error: capture.note }
+          }
+        }
+
+        results[idx] = {
+          asset,
+          hostWorker,
+          capture,
+          fetchedExchange,
+          observationEntry,
+          attachSavedExchangeId,
+        }
+        flushCompletedInOrder()
+      }
+    })
+
+    await Promise.all(workers)
+    // Flush any remaining started slots in deterministic approvedAssets order if an early abort left unstarted gaps
+    for (let i = nextCommitIdx; i < results.length; i += 1) {
+      const slot = results[i]
+      if (!slot) continue
+      results[i] = undefined
+      commitSlot(slot)
+    }
+    return observations
+  }
+
   async runThreatModel(run: Run, profiles: readonly ResolvedModelProfile[], task: CoordinatorTask) {
     const approvedAssets = run.candidates.filter(c => run.approved.includes(c.id))
     const approvedOrigins = new Set(approvedAssets.map(a => a.origin))
@@ -2604,107 +2873,20 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         // Additive Layer-2 synthesis must never block threat model progression
       }
 
-      // 2. Capture initial lightweight baseline observations for approved hosts
-      const observations: Record<string, unknown>[] = []
+      // 2. Capture initial lightweight baseline observations for approved hosts (bounded concurrent pool)
       const selectedChecks: readonly AssessmentCheckId[] = freshRun.reviewPlan?.status === 'ready'
         ? freshRun.reviewPlan.checks : responseCheckIds
-      const responseChecks = selectedChecks.filter(c => c !== 'access-policy') as ResponseCheckId[]
-
-      for (const asset of approvedAssets) {
-        if (!this.host.authorize(job)) break
-        const hostWorker = this.storage.makeWorker(freshRun, 'threat_model', asset,
-          `Baseline capture · ${new URL(asset.origin).hostname}`,
-          'Capture initial baseline response and access-policy evidence for deterministic checks.', {
-            sourceOrigins: [asset.origin],
-          })
-        this.storage.updateWorker(hostWorker.id, { status: 'running', lease: claimed.lease })
-
-        let capture: Capture
-        if (freshRun.sourceMode === 'prepared' || freshRun.capabilityTier === 0) {
-          capture = asset.prepared
-            ? { observation: { ...asset.prepared, origin: asset.origin, finalOrigin: asset.origin, source: 'supplied observation' }, note: 'Supplied project evidence.' }
-            : { observation: null, note: 'No prepared observation was supplied.' }
-        } else {
-          try {
-            const cachedPhase0Root = phase0RootExchanges.get(asset.origin)
-            const priorRootRow = !cachedPhase0Root
-              ? this.storage.client.prepare(
-                  `SELECT id, origin, final_origin AS finalOrigin, status, media_type AS mediaType, resp_headers AS respHeadersJson
-                   FROM broker_exchanges
-                   WHERE run_id = ? AND origin = ? AND method = 'GET' AND path_and_query = '/'
-                   ORDER BY created_at ASC LIMIT 1`,
-                ).get(freshRun.id, asset.origin) as {
-                  id: string
-                  origin: string
-                  finalOrigin: string
-                  status: number
-                  mediaType: string
-                  respHeadersJson: string
-                } | undefined
-              : undefined
-
-            const pushObs = (
-              row: { finalOrigin: string; status: number; mediaType: string },
-              headers: Record<string, string>,
-              exchangeId?: string,
-            ) => {
-              observations.push({
-                origin: asset.origin, finalOrigin: row.finalOrigin, status: row.status, mediaType: row.mediaType,
-                server: headers['server'], poweredBy: headers['x-powered-by'], ...(exchangeId ? { exchangeId } : {}),
-              })
-            }
-            if (cachedPhase0Root) {
-              capture = { observation: cachedPhase0Root.observation, note: 'Recorded approved HTTPS root response.' }
-              pushObs(cachedPhase0Root, cachedPhase0Root.respHeaders)
-            } else if (priorRootRow) {
-              let headersObj: Record<string, string> = {}
-              try { headersObj = JSON.parse(priorRootRow.respHeadersJson) as Record<string, string> } catch { /* ignore */ }
-              capture = { observation: buildObservationFromHeaders(priorRootRow, headersObj), note: 'Reused recorded approved HTTPS root response.' }
-              pushObs(priorRootRow, headersObj, priorRootRow.id)
-            } else {
-              const ex = await this.broker.executeHttp({
-                origin: asset.origin, method: 'GET', pathAndQuery: '/', followRedirects: true, timeoutMs: 12_000,
-              }, grant, task.controller.signal)
-              const savedEx = recordBrokerExchange(this.storage, freshRun, hostWorker.id, ex, secrets)
-              capture = { observation: ex.observation, note: 'Recorded approved HTTPS root response.' }
-              pushObs(ex, ex.respHeaders, savedEx.id)
-            }
-          } catch (error) {
-            capture = {
-              observation: null,
-              note: error instanceof BrokerDenied || error instanceof BrokerCircuitOpen
-                ? error.message : 'The approved public response could not be read.',
-            }
-            observations.push({ origin: asset.origin, error: capture.note })
-          }
-        }
-
-        const obsArtifact = this.storage.addArtifact(
-          freshRun, hostWorker, 'observation',
-          freshRun.sourceMode === 'prepared' ? suppliedResponseLabel : 'Observed public response',
-          JSON.stringify(capture, null, 2), 'capture:' + freshRun.scopeRevision, secrets,
-        )
-        const reviews = responseChecks.length ? responseReview(capture.observation, capture.note, responseChecks) : []
-        const inputs = [{ artifactId: obsArtifact.id, reviews }]
-
-        if (selectedChecks.includes('access-policy')) {
-          const snapshot = asset.accessPolicy?.origin === asset.origin ? asset.accessPolicy : undefined
-          const apArtifact = this.storage.addArtifact(freshRun, hostWorker, 'access-policy', 'Supplied access policy records',
-            JSON.stringify({ origin: asset.origin, snapshot: snapshot ?? null }, null, 2), 'access-policy', secrets)
-          inputs.push({ artifactId: apArtifact.id, reviews: accessPolicyReviews(snapshot) })
-        }
-
-        for (const { artifactId, reviews: revs } of inputs) {
-          for (const rev of revs) {
-            if (rev.comparison && !meetsBaseline(rev.comparison)) {
-              const earlier = this.host.baselineFinding(freshRun, asset, rev)
-              this.host.saveBaselineFinding(freshRun, asset, rev, 'pending',
-                'The recorded value falls outside the expected policy. Verification is pending.', [artifactId], earlier?.id)
-            }
-          }
-        }
-        this.storage.updateWorker(hostWorker.id, { status: 'complete', lease: null, outcome: capture.note })
-      }
+      const observations = await this.captureBaselineObservations({
+        run: freshRun,
+        approvedAssets,
+        claimed,
+        job,
+        grant,
+        secrets,
+        phase0RootExchanges,
+        signal: task.controller.signal,
+        selectedChecks,
+      })
 
       // 3. Build prioritized Threat Model via LLM (with deterministic fallback)
       const heuristicEntries = approvedAssets.map(classifyHostHeuristic)
