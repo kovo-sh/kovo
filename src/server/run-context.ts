@@ -133,6 +133,10 @@ export class RunContext {
     return this.disposed
   }
 
+  get isDraining(): boolean {
+    return this.disposePromise !== null
+  }
+
   get resourceCount(): number {
     return this.resources.size
   }

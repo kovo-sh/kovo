@@ -12,7 +12,7 @@
  *     `record_fact` calls from spoofing `det_lead` or `hop_checkpoint` control facts.
  *  4. Per-run budget/telemetry/code-audit helpers extracted from `execution.ts`.
  */
-import { eq } from 'drizzle-orm'
+import { and, eq } from 'drizzle-orm'
 import { defaultCodeAuditMaxTurns, wallClockSettlementMs } from './agent-session.ts'
 import {
   evaluateTier3Approval,
@@ -166,6 +166,8 @@ export interface SupervisedTask<T = void> {
   readonly controller: AbortController
   readonly signal: AbortSignal
   readonly promise: Promise<T | undefined>
+  /** `false` when rejected because the supervisor/actor is draining, disposed, or aborted. */
+  readonly started: boolean
   abort(reason?: unknown): void
 }
 
@@ -202,7 +204,12 @@ export class TaskSupervisor {
   }
 
   get isDraining(): boolean {
-    return this.draining || this.context.isDisposed
+    return this.draining || this.context.isDraining || this.context.isDisposed
+  }
+
+  /** Mark this supervisor as draining immediately so new spawns fail fast with `started: false`. */
+  markDraining(): void {
+    this.draining = true
   }
 
   /**
@@ -229,7 +236,7 @@ export class TaskSupervisor {
       }
     }
 
-    if (this.draining || this.context.isDisposed || runSignal.aborted) {
+    if (this.draining || this.context.isDisposed || this.context.isDraining || runSignal.aborted) {
       abortTask(runSignal.reason ?? new Error(`Run "${this.context.runId}" is stopping.`))
       return {
         id,
@@ -237,6 +244,7 @@ export class TaskSupervisor {
         controller,
         signal: controller.signal,
         promise: Promise.resolve(undefined),
+        started: false,
         abort: abortTask,
       }
     }
@@ -288,6 +296,7 @@ export class TaskSupervisor {
       controller,
       signal: controller.signal,
       promise: wrapped,
+      started: true,
       abort: abortTask,
     }
   }
@@ -297,7 +306,7 @@ export class TaskSupervisor {
    * Automatically cleared if the run stops, aborts, or disposes before firing.
    */
   scheduleTimer(label: string, delayMs: number, fn: () => void): () => void {
-    if (this.draining || this.context.isDisposed || this.context.isAborted) {
+    if (this.draining || this.context.isDisposed || this.context.isDraining || this.context.isAborted) {
       return () => {}
     }
     let released = false
@@ -306,7 +315,7 @@ export class TaskSupervisor {
       if (released) return
       released = true
       unregister()
-      if (this.draining || this.context.isDisposed || this.context.isAborted) return
+      if (this.draining || this.context.isDisposed || this.context.isDraining || this.context.isAborted) return
       fn()
     }, Math.max(0, Math.floor(delayMs)))
     timer.unref?.()
@@ -397,6 +406,7 @@ export class RunActor {
   private currentState: RunActorState
   private readonly history: RunActorTransitionRecord[] = []
   private readonly maxHistory: number
+  private draining = false
   private disposePromise: Promise<RunDrainReport> | null = null
 
   constructor(options: RunActorOptions) {
@@ -419,8 +429,20 @@ export class RunActor {
     return isTerminalRunActorState(this.currentState)
   }
 
+  get isDraining(): boolean {
+    return this.draining || this.disposePromise !== null || this.supervisor.isDraining || this.context.isDraining
+  }
+
+  /** True once the actor is draining, disposed, or its context has been aborted (R2-H-17). */
   get isDisposed(): boolean {
-    return this.context.isDisposed
+    return (
+      this.draining
+      || this.disposePromise !== null
+      || this.supervisor.isDraining
+      || this.context.isDisposed
+      || this.context.isDraining
+      || this.context.isAborted
+    )
   }
 
   get activeTaskCount(): number {
@@ -539,6 +561,8 @@ export class RunActor {
     if (this.disposePromise) {
       return this.disposePromise.then(report => ({ ...report, alreadyDisposed: true }))
     }
+    this.draining = true
+    this.supervisor.markDraining()
     this.disposePromise = this.performDrainAndDispose(options)
     return this.disposePromise
   }
@@ -1366,6 +1390,122 @@ export function pauseRunsForKillSwitch(
   } catch { /* store may be closed */ }
 }
 
+/** Bounded verification worker retry ceiling (`H-27`: 1 initial attempt + 1 retry). */
+export const MAX_VERIFICATION_WORKER_ATTEMPTS = 2
+
+/**
+ * Record a verification or retest worker failure (`H-27`):
+ *  - Verification workers retry up to `MAX_VERIFICATION_WORKER_ATTEMPTS` before marking `failed`.
+ *  - Exhausted verification workers durably mark pending findings `inconclusive`.
+ */
+export function recordVerificationOrRetestFailure(
+  storage: Store,
+  run: Run,
+  claimed: Assignment,
+  eventPrefix: 'worker' | 'retest',
+  failureLabel: string,
+  msg: string,
+): void {
+  const isVerification = eventPrefix === 'worker' && claimed.phase === 'verification'
+  const nextAttempt = (claimed.attempt ?? 0) + 1
+  storage.transaction(() => {
+    if (isVerification && nextAttempt < MAX_VERIFICATION_WORKER_ATTEMPTS) {
+      storage.updateWorker(claimed.id, {
+        status: 'queued',
+        attempt: nextAttempt,
+        outcome: `Attempt ${nextAttempt}/${MAX_VERIFICATION_WORKER_ATTEMPTS} failed (retrying): ${msg}`,
+        lease: null,
+        leaseExpiresAt: null,
+      })
+      storage.event(
+        run.id,
+        'worker.retrying',
+        `${failureLabel} (attempt ${nextAttempt}/${MAX_VERIFICATION_WORKER_ATTEMPTS}); requeuing: ${msg}`,
+        { assignmentId: claimed.id, attempt: nextAttempt, maxAttempts: MAX_VERIFICATION_WORKER_ATTEMPTS },
+      )
+      return
+    }
+    storage.updateWorker(claimed.id, {
+      status: 'failed',
+      attempt: nextAttempt,
+      outcome: msg,
+      lease: null,
+      leaseExpiresAt: null,
+    })
+    storage.event(run.id, `${eventPrefix}.failed`, `${failureLabel}: ${msg}`, {
+      assignmentId: claimed.id,
+      attempt: nextAttempt,
+    })
+    if (isVerification && claimed.stepId) {
+      const latestRun = storage.run(run.id)
+      const rows = storage.db.select().from(findings).where(and(
+        eq(findings.runId, run.id),
+        eq(findings.goalRevision, claimed.goalRevision),
+        eq(findings.replaySpecId, claimed.stepId),
+      )).all()
+      for (const row of rows) {
+        if (row.finding.status !== 'pending') continue
+        storage.updateProposedFinding(latestRun, row.id, {
+          replaySpecId: claimed.stepId,
+          verificationTier: null,
+          finding: {
+            status: 'inconclusive',
+            verificationTier: undefined,
+            reason: `Verification failed after ${nextAttempt} attempts: ${msg}`,
+            confidence: 'low',
+          },
+        })
+      }
+    }
+  }, { behavior: 'immediate' })
+}
+
+/** Roll back an investigation worker claim + step assignment when `RunActor.spawn()` rejects (`R2-H-17`). */
+export function rollbackRejectedInvestigationSpawn(
+  storage: Store,
+  runId: string,
+  stepId: string,
+  assignment: Pick<Assignment, 'id' | 'lease'>,
+): void {
+  try {
+    storage.transaction(() => {
+      const cur = storage.worker(assignment.id)
+      if (cur.status === 'running' && cur.lease === assignment.lease) {
+        storage.updateWorker(assignment.id, {
+          status: 'canceled',
+          lease: null,
+          leaseExpiresAt: null,
+          outcome: 'Run actor draining or aborted before worker start.',
+        })
+      }
+      const latestRun = storage.run(runId)
+      const curStep = storage.listChainSteps(latestRun.id, latestRun.goalRevision).find(s => s.id === stepId)
+      if (curStep && curStep.status === 'running' && curStep.assignedWorkerId === assignment.id) {
+        storage.updateChainStep(stepId, { status: 'ready', assignedWorkerId: null })
+      }
+    }, { behavior: 'immediate' })
+  } catch { /* store or run may already be gone */ }
+}
+
+/** Roll back a verification/retest worker claim when `RunActor.spawn()` rejects (`R2-H-17`). */
+export function rollbackRejectedWorkerSpawn(
+  storage: Store,
+  claimed: Pick<Assignment, 'id' | 'lease'>,
+): void {
+  try {
+    storage.transaction(() => {
+      const cur = storage.worker(claimed.id)
+      if (cur.status === 'running' && cur.lease === claimed.lease) {
+        storage.updateWorker(claimed.id, {
+          status: 'queued',
+          lease: null,
+          leaseExpiresAt: null,
+        })
+      }
+    }, { behavior: 'immediate' })
+  } catch { /* store or run may already be gone */ }
+}
+
 export interface TrackedActiveRunChecks {
   disposingRuns: Map<string, unknown>
   actors: Map<string, { activeTaskCount: number }>
@@ -1588,6 +1728,8 @@ export interface Tier3ApprovalCoordinatorHost {
 
 export class RunTier3ApprovalCoordinator {
   private readonly host: Tier3ApprovalCoordinatorHost
+  /** Assignments currently owned by a live in-memory `waitForHumanTier3Card` coroutine. */
+  private readonly activeWaiters = new Set<string>()
 
   constructor(host: Tier3ApprovalCoordinatorHost) {
     this.host = host
@@ -1969,106 +2111,148 @@ export class RunTier3ApprovalCoordinator {
       }
     }
     this.host.pendingTier3ApprovalKeys.add(approvalKey)
+    this.activeWaiters.add(job.assignment.id)
 
     let decision: 'approved' | 'denied' | 'canceled' | 'expired'
     let postedApprovalId: string | undefined
     try {
-      const req = this.host.storage.createApprovalRequest(run, job.assignment, {
-        origin: input.origin, method: input.method, pathAndQuery: input.pathAndQuery,
-        personaHandle: input.personaHandle ?? undefined, rationale: input.rationale,
-        requestPreview: input.requestPreview, riskLevel: input.riskLevel,
-        policyNote: input.policyNote, secrets: input.secrets,
-      })
-      postedApprovalId = req.id
-      this.host.postApprovalCard(run, job.assignment.id, {
-        approvalId: req.id,
-        origin: input.origin,
-        method: input.method,
-        pathAndQuery: input.pathAndQuery,
-        rationale: input.rationale,
-      }, input.secrets)
-
       try {
-        this.host.storage.parkWorkerForApproval(run, job.assignment.id)
-        this.host.active.delete(job.assignment.id)
-        this.host.scheduleWake()
-      } catch { /* an already-parked or terminal worker keeps its state */ }
+        const req = this.host.storage.createApprovalRequest(run, job.assignment, {
+          origin: input.origin, method: input.method, pathAndQuery: input.pathAndQuery,
+          personaHandle: input.personaHandle ?? undefined, rationale: input.rationale,
+          requestPreview: input.requestPreview, riskLevel: input.riskLevel,
+          policyNote: input.policyNote, secrets: input.secrets,
+        })
+        postedApprovalId = req.id
+        this.host.postApprovalCard(run, job.assignment.id, {
+          approvalId: req.id,
+          origin: input.origin,
+          method: input.method,
+          pathAndQuery: input.pathAndQuery,
+          rationale: input.rationale,
+        }, input.secrets)
 
-      decision = await new Promise<'approved' | 'denied' | 'canceled' | 'expired'>((resolveDecision, rejectDecision) => {
-        const checkCurrent = () => {
-          try {
-            const latest = this.host.storage.getApprovalRequest(run.id, req.id)
-            if (latest.status !== 'pending') {
+        try {
+          const parked = this.host.storage.parkWorkerForApproval(run, job.assignment.id)
+          if (parked) job.assignment = parked
+          this.host.active.delete(job.assignment.id)
+          this.host.scheduleWake()
+        } catch { /* an already-parked or terminal worker keeps its state */ }
+
+        decision = await new Promise<'approved' | 'denied' | 'canceled' | 'expired'>((resolveDecision, rejectDecision) => {
+          const checkCurrent = () => {
+            try {
+              const latest = this.host.storage.getApprovalRequest(run.id, req.id)
+              if (latest.status !== 'pending') {
+                cleanup()
+                resolveDecision(latest.status)
+                return true
+              }
+              if (Date.now() >= latest.expiresAt) {
+                this.host.storage.db.update(approvalRequests).set({ status: 'expired', decidedAt: Date.now() })
+                  .where(and(eq(approvalRequests.id, req.id), eq(approvalRequests.status, 'pending'))).run()
+                cleanup()
+                resolveDecision('expired')
+                return true
+              }
+            } catch (err) {
               cleanup()
-              resolveDecision(latest.status)
+              rejectDecision(err)
               return true
             }
-            if (Date.now() >= latest.expiresAt) {
-              this.host.storage.db.update(approvalRequests).set({ status: 'expired', decidedAt: Date.now() })
-                .where(eq(approvalRequests.id, req.id)).run()
-              cleanup()
-              resolveDecision('expired')
-              return true
-            }
-          } catch (err) {
-            cleanup()
-            rejectDecision(err)
-            return true
+            return false
           }
-          return false
-        }
 
-        const unsub = this.host.storage.onRunEvent(run.id, () => { checkCurrent() })
-        const timer = setInterval(() => { checkCurrent() }, 1_000)
-        timer.unref?.()
-        const unregisterTimer = this.host.registerTimer
-          ? this.host.registerTimer(run.id, 'tier3-approval-poll', timer)
-          : () => {}
-        const onAbort = () => {
-          cleanup()
-          rejectDecision(signal.reason instanceof Error ? signal.reason : new Error('Aborted while waiting for approval.'))
+          const unsub = this.host.storage.onRunEvent(run.id, () => { checkCurrent() })
+          const timer = setInterval(() => { checkCurrent() }, 1_000)
+          timer.unref?.()
+          const unregisterTimer = this.host.registerTimer
+            ? this.host.registerTimer(run.id, 'tier3-approval-poll', timer)
+            : () => {}
+          const onAbort = () => {
+            cleanup()
+            rejectDecision(signal.reason instanceof Error ? signal.reason : new Error('Aborted while waiting for approval.'))
+          }
+          const cleanup = () => {
+            unsub()
+            unregisterTimer()
+            clearInterval(timer)
+            signal.removeEventListener('abort', onAbort)
+          }
+          signal.addEventListener('abort', onAbort, { once: true })
+          if (signal.aborted) {
+            onAbort()
+            return
+          }
+          checkCurrent()
+        })
+      } catch (err) {
+        // R2-H-18 / H-28b: On waiter abort (e.g., session wall-clock rotation, stop, kill switch),
+        // cancel the still-pending approval card and unpark/terminate the worker so it can never wedge.
+        if (postedApprovalId) {
+          try {
+            this.host.storage.db.update(approvalRequests)
+              .set({ status: 'canceled', decidedAt: Date.now() })
+              .where(and(eq(approvalRequests.id, postedApprovalId), eq(approvalRequests.status, 'pending')))
+              .run()
+          } catch { /* approval row or store may already be gone */ }
+          try {
+            this.host.postApprovalResolution(run, job.assignment.id, {
+              approvalId: postedApprovalId,
+              decision: 'canceled',
+              origin: input.origin,
+              method: input.method,
+              pathAndQuery: input.pathAndQuery,
+            })
+          } catch { /* best-effort board resolution */ }
         }
-        const cleanup = () => {
-          unsub()
-          unregisterTimer()
-          clearInterval(timer)
-          signal.removeEventListener('abort', onAbort)
-        }
-        signal.addEventListener('abort', onAbort, { once: true })
-        if (signal.aborted) {
-          onAbort()
-          return
-        }
-        checkCurrent()
-      })
-    } finally {
-      this.host.pendingTier3ApprovalKeys.delete(approvalKey)
-    }
-
-    if (postedApprovalId) {
-      this.host.postApprovalResolution(run, job.assignment.id, {
-        approvalId: postedApprovalId,
-        decision,
-        origin: input.origin,
-        method: input.method,
-        pathAndQuery: input.pathAndQuery,
-      })
-    }
-    if (decision === 'approved') {
-      try {
-        const resumed = this.host.storage.resumeParkedWorker(this.host.storage.run(run.id), job.assignment.id)
-        job.assignment = resumed
-        this.host.active.set(resumed.id, job)
-        this.host.scheduleWake()
-      } catch {
-        if (this.host.authorize(job)) {
-          try { this.host.storage.updateWorker(job.assignment.id, { status: 'running', approvalParkedAt: null }) } catch { /* ignore */ }
-        }
+        this.terminateApprovalBlockedAssignment(run.id, job.assignment.id, 'canceled')
+        throw err
+      } finally {
+        this.host.pendingTier3ApprovalKeys.delete(approvalKey)
       }
-      return { approved: true, approvalId: postedApprovalId }
+
+      if (postedApprovalId) {
+        this.host.postApprovalResolution(run, job.assignment.id, {
+          approvalId: postedApprovalId,
+          decision,
+          origin: input.origin,
+          method: input.method,
+          pathAndQuery: input.pathAndQuery,
+        })
+      }
+      if (decision === 'approved') {
+        if (signal.aborted || job.controller.signal.aborted) {
+          this.terminateApprovalBlockedAssignment(run.id, job.assignment.id, 'canceled')
+          return { approved: false, deniedReason: 'Session aborted before approval could resume worker.' }
+        }
+        let currentWorker: Assignment | undefined
+        try {
+          currentWorker = this.host.storage.worker(job.assignment.id)
+        } catch {
+          currentWorker = undefined
+        }
+        if (!currentWorker || ['complete', 'failed', 'canceled'].includes(currentWorker.status)) {
+          this.host.active.delete(job.assignment.id)
+          return { approved: false, deniedReason: 'Assignment already terminated before approval.' }
+        }
+        try {
+          const resumed = this.host.storage.resumeParkedWorker(this.host.storage.run(run.id), job.assignment.id)
+          job.assignment = resumed
+          this.host.active.set(resumed.id, job)
+          this.host.scheduleWake()
+        } catch {
+          if (this.host.authorize(job)) {
+            try { this.host.storage.updateWorker(job.assignment.id, { status: 'running', approvalParkedAt: null }) } catch { /* ignore */ }
+          }
+        }
+        return { approved: true, approvalId: postedApprovalId }
+      }
+      this.terminateApprovalBlockedAssignment(run.id, job.assignment.id, decision)
+      return { approved: false }
+    } finally {
+      this.activeWaiters.delete(job.assignment.id)
     }
-    this.terminateApprovalBlockedAssignment(run.id, job.assignment.id, decision)
-    return { approved: false }
   }
 
   terminateApprovalBlockedAssignment(
@@ -2092,12 +2276,39 @@ export class RunTier3ApprovalCoordinator {
           const latestRun = this.host.storage.run(runId)
           const step = this.host.storage.listChainSteps(latestRun.id, latestRun.goalRevision)
             .find(s => s.id === current.stepId)
-          if (step && ['pending', 'ready', 'running'].includes(step.status)) {
+          // H-28e ownership guard: never overwrite a step reassigned to a replacement worker.
+          const ownsStep = step
+            ? (step.status === 'running'
+                ? step.assignedWorkerId === assignmentId
+                : (!step.assignedWorkerId || step.assignedWorkerId === assignmentId))
+            : false
+          if (step && ownsStep && ['pending', 'ready', 'running'].includes(step.status)) {
             this.host.storage.updateChainStep(step.id, {
               status: 'canceled',
               assignedWorkerId: assignmentId,
             })
             this.host.storage.refreshReadyChainSteps(latestRun.id, latestRun.goalRevision)
+          }
+        } else if (current.phase === 'verification' && current.stepId) {
+          // H-28d: durably mark pending verification findings inconclusive when approval is denied/expired/canceled.
+          const latestRun = this.host.storage.run(runId)
+          const rows = this.host.storage.db.select().from(findings).where(and(
+            eq(findings.runId, runId),
+            eq(findings.goalRevision, current.goalRevision),
+            eq(findings.replaySpecId, current.stepId),
+          )).all()
+          for (const row of rows) {
+            if (row.finding.status !== 'pending') continue
+            this.host.storage.updateProposedFinding(latestRun, row.id, {
+              replaySpecId: current.stepId,
+              verificationTier: null,
+              finding: {
+                status: 'inconclusive',
+                verificationTier: undefined,
+                reason: `Tier 3 approval ${decision}.`,
+                confidence: 'low',
+              },
+            })
           }
         }
       }, { behavior: 'immediate' })
@@ -2106,22 +2317,67 @@ export class RunTier3ApprovalCoordinator {
     this.host.scheduleWake()
   }
 
+  private reconcileApprovedOrOrphanedWaiter(runId: string, worker: Assignment, reason: string): void {
+    try {
+      this.host.storage.transaction(() => {
+        const current = this.host.storage.worker(worker.id)
+        if (current.status !== 'waiting_approval') return
+        if (current.phase === 'verification' || current.phase === 'retest') {
+          this.host.storage.updateWorker(current.id, {
+            status: 'queued',
+            approvalParkedAt: null,
+            lease: null,
+            leaseExpiresAt: null,
+            outcome: null,
+          })
+          return
+        }
+        this.host.storage.updateWorker(current.id, {
+          status: 'canceled',
+          approvalParkedAt: null,
+          lease: null,
+          leaseExpiresAt: null,
+          outcome: `Reconciled parked worker (${reason}).`,
+        })
+        if (current.phase === 'investigation' && current.stepId) {
+          const latestRun = this.host.storage.run(runId)
+          const step = this.host.storage.listChainSteps(latestRun.id, latestRun.goalRevision)
+            .find(s => s.id === current.stepId)
+          if (step && step.status === 'running' && step.assignedWorkerId === current.id) {
+            this.host.storage.updateChainStep(step.id, {
+              status: 'ready',
+              assignedWorkerId: null,
+            })
+            this.host.storage.refreshReadyChainSteps(latestRun.id, latestRun.goalRevision)
+          }
+        }
+      }, { behavior: 'immediate' })
+    } catch { /* worker or run may already be terminal or removed */ }
+    this.host.active.delete(worker.id)
+    this.host.scheduleWake()
+  }
+
   reconcileSettledApprovalWorkers(run: Run): void {
     const now = Date.now()
     const workers = this.host.storage.workerList(run.id)
-    const waitingWorkers = workers.filter(w => w.status === 'waiting_approval' && !this.host.active.has(w.id))
+    const waitingWorkers = workers.filter(
+      w => w.status === 'waiting_approval' && !this.host.active.has(w.id) && !this.activeWaiters.has(w.id),
+    )
     if (waitingWorkers.length > 0) {
       const requests = this.host.storage.listApprovalRequests(run.id)
       for (const worker of waitingWorkers) {
         const forWorker = requests.filter(r => r.assignmentId === worker.id)
-        if (!forWorker.length) continue
+        if (!forWorker.length) {
+          this.reconcileApprovedOrOrphanedWaiter(run.id, worker, 'no approval request')
+          continue
+        }
         let hasLivePending = false
         for (const req of forWorker) {
           if (req.status !== 'pending') continue
           if (now >= req.expiresAt) {
             try {
               this.host.storage.db.update(approvalRequests).set({ status: 'expired', decidedAt: now })
-                .where(eq(approvalRequests.id, req.id)).run()
+                .where(and(eq(approvalRequests.id, req.id), eq(approvalRequests.status, 'pending'))).run()
               req.status = 'expired'
               req.decidedAt = now
             } catch { /* ignore */ }
@@ -2131,7 +2387,11 @@ export class RunTier3ApprovalCoordinator {
         }
         if (hasLivePending) continue
         const latest = [...forWorker].sort((a, b) => (b.decidedAt ?? b.createdAt) - (a.decidedAt ?? a.createdAt))[0]
-        if (latest && (latest.status === 'denied' || latest.status === 'expired' || latest.status === 'canceled')) {
+        if (!latest) continue
+        if (latest.status === 'approved') {
+          // R2-H-18 / H-28c: approved request with no active waiter must requeue/reset so runs never wedge.
+          this.reconcileApprovedOrOrphanedWaiter(run.id, worker, 'approved without active waiter')
+        } else if (latest.status === 'denied' || latest.status === 'expired' || latest.status === 'canceled') {
           this.terminateApprovalBlockedAssignment(run.id, worker.id, latest.status)
         }
       }
@@ -2139,16 +2399,22 @@ export class RunTier3ApprovalCoordinator {
 
     if (run.phase === 'investigation') {
       const workerById = new Map(this.host.storage.workerList(run.id).map(w => [w.id, w]))
+      let updatedAnyStep = false
       for (const step of this.host.storage.listChainSteps(run.id, run.goalRevision)) {
         if (step.status !== 'running' || !step.assignedWorkerId) continue
-        if (this.host.active.has(step.assignedWorkerId)) continue
+        if (this.host.active.has(step.assignedWorkerId) || this.activeWaiters.has(step.assignedWorkerId)) continue
         const assigned = workerById.get(step.assignedWorkerId)
         if (!assigned) continue
         if (assigned.status === 'complete') {
           this.host.storage.updateChainStep(step.id, { status: 'complete', assignedWorkerId: assigned.id })
+          updatedAnyStep = true
         } else if (assigned.status === 'failed' || assigned.status === 'canceled') {
           this.host.storage.updateChainStep(step.id, { status: 'canceled', assignedWorkerId: assigned.id })
+          updatedAnyStep = true
         }
+      }
+      if (updatedAnyStep) {
+        try { this.host.storage.refreshReadyChainSteps(run.id, run.goalRevision) } catch { /* ignore */ }
       }
     }
   }
