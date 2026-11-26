@@ -57,7 +57,7 @@ import {
   type RuntimeSpaRoute,
 } from './invariant-synthesizer.ts'
 import type { EndpointRow, Store } from './store.ts'
-import { parseGraphqlIntrospection, parseGraphqlSdl, probeSurface, runSafeTemplates } from './surface-engine.ts'
+import { parseGraphqlIntrospection, parseGraphqlSdl, probeSurface, runSafeTemplates, surfaceProbeTimeoutMs } from './surface-engine.ts'
 
 export interface Phase0ReconParams {
   storage: Store
@@ -85,6 +85,10 @@ export interface Phase0ReconParams {
   maxCodeSlices?: number
   /** Optional Phase A StaticWorkspaceSnapshot (reused across manifest, route, and graph extraction). */
   staticSnapshot?: StaticWorkspaceSnapshot
+  /** Optional explicit per-origin request cap override (bypasses adaptive multi-host scaling). */
+  perOriginCap?: number
+  /** Optional per-request HTTP timeout in ms for Phase-0 recon probes (default 8_000). */
+  requestTimeoutMs?: number
 }
 
 export interface Phase0TruncationRecord {
@@ -158,6 +162,8 @@ export interface Phase0ReconResult {
   siblingDerivationSuppressed?: 'declared_surface'
   /** Cached Phase A StaticWorkspaceSnapshot built or reused during Phase 0. */
   staticSnapshot?: StaticWorkspaceSnapshot
+  /** Origins short-circuited early due to consecutive transport timeouts/errors or 520–526 responses. */
+  skippedDeadHosts?: Array<{ origin: string; reason: string; requestsUsed: number }>
   /** Structured SPA routes harvested from JS bundles and browser state-graph crawl for InvariantSynthesizer. */
   runtimeSpaRoutes?: RuntimeSpaRoute[]
   /** Structured GraphQL catalogs harvested from introspection, SDL specs, and JS bundles. */
@@ -3806,14 +3812,132 @@ export async function ingestDeclaredApiSurfaceAsync(input: {
   return ingestDeclaredApiSurfaceWithDocs(input, preParsedDocs)
 }
 
+const PHASE0_ORIGIN_CONCURRENCY = 6
+const PHASE0_BROWSER_CONCURRENCY = 3
+const PHASE0_INNER_CONCURRENCY = 3
+const PHASE0_DEAD_HOST_THRESHOLD = 3
+const PHASE0_ORIGIN_DOWN_STATUSES = new Set([520, 521, 522, 523, 524, 525, 526])
+
+function resolvePhase0OriginConcurrency(envValue = process.env.KOVO_PHASE0_ORIGIN_CONCURRENCY): number {
+  const parsed = Number.parseInt((envValue ?? '').trim(), 10)
+  if (Number.isFinite(parsed) && parsed > 0) return Math.max(1, Math.min(parsed, 12))
+  return PHASE0_ORIGIN_CONCURRENCY
+}
+
+function resolvePhase0BrowserConcurrency(envValue = process.env.KOVO_PHASE0_BROWSER_CONCURRENCY): number {
+  const parsed = Number.parseInt((envValue ?? '').trim(), 10)
+  if (Number.isFinite(parsed) && parsed > 0) return Math.max(1, Math.min(parsed, 4))
+  return PHASE0_BROWSER_CONCURRENCY
+}
+
+export interface AdaptivePhase0CapInput {
+  hostCount: number
+  runBudget?: number
+  explicitCap?: number
+}
+
+/**
+ * Adaptive per-origin request cap for multi-host Phase-0 recon:
+ * - 1–5 hosts: full depth (150 at default 1,000 budget, up to 250 when runBudget is large)
+ * - 6–15 hosts: smooth taper from 120 down to 100 reqs/origin
+ * - 16+ hosts: smooth taper from 80 down to 65 reqs/origin
+ * Always honors an explicit positive caller override when provided.
+ */
+export function computeAdaptivePhase0PerOriginCap(input: AdaptivePhase0CapInput): number {
+  if (typeof input.explicitCap === 'number' && Number.isFinite(input.explicitCap) && input.explicitCap > 0) {
+    return Math.max(1, Math.floor(input.explicitCap))
+  }
+  const budget = typeof input.runBudget === 'number' && Number.isFinite(input.runBudget) && input.runBudget > 0
+    ? input.runBudget
+    : 1000
+  const hosts = Math.max(1, Math.floor(Number.isFinite(input.hostCount) ? input.hostCount : 1))
+  const baseCap = Math.max(1, Math.min(Math.floor(budget * 0.15), 250))
+  if (hosts <= 5) return baseCap
+  if (hosts <= 15) {
+    const ceiling = Math.round(120 - ((hosts - 6) / 9) * 20)
+    return Math.max(1, Math.min(baseCap, ceiling))
+  }
+  const ceiling = Math.round(80 - Math.min(1, (hosts - 16) / 24) * 15)
+  return Math.max(1, Math.min(baseCap, ceiling))
+}
+
+function isHtmlLikeResponse(status: number, mediaType: string, body: string): boolean {
+  if (status >= 400) return false
+  if (/html|xhtml/i.test(mediaType)) return true
+  const head = body.slice(0, 1024)
+  return /<!doctype\s+html\b|<html\b|<head\b|<body\b|<script\b|<form\b/i.test(head)
+}
+
+async function runBoundedPool<T>(
+  items: readonly T[],
+  concurrency: number,
+  worker: (item: T, index: number) => Promise<void>,
+  shouldStop?: () => boolean,
+): Promise<void> {
+  if (items.length === 0) return
+  const lanes = Math.max(1, Math.min(Math.floor(concurrency), items.length))
+  let cursor = 0
+  const runLane = async (): Promise<void> => {
+    while (true) {
+      if (shouldStop?.()) return
+      const idx = cursor
+      cursor += 1
+      if (idx >= items.length) return
+      await worker(items[idx]!, idx)
+    }
+  }
+  await Promise.all(Array.from({ length: lanes }, () => runLane()))
+}
+
+function createPhase0Semaphore(limit: number) {
+  const max = Math.max(1, Math.floor(limit))
+  let active = 0
+  const waiters: Array<() => void> = []
+  return {
+    async withPermit<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+      if (signal?.aborted) throw new Error('aborted')
+      if (active >= max) {
+        await new Promise<void>((resolve, reject) => {
+          const wake = () => {
+            signal?.removeEventListener('abort', onAbort)
+            resolve()
+          }
+          const onAbort = () => {
+            const idx = waiters.indexOf(wake)
+            if (idx >= 0) waiters.splice(idx, 1)
+            reject(new Error('aborted'))
+          }
+          signal?.addEventListener('abort', onAbort, { once: true })
+          waiters.push(wake)
+        })
+      }
+      active += 1
+      try {
+        return await fn()
+      } finally {
+        active -= 1
+        const next = waiters.shift()
+        if (next) next()
+      }
+    },
+  }
+}
+
 /**
  * Zero-LLM Phase-0 deterministic surface mapper (SPEC-v4 §4.3A).
- * Strictly enforces per-origin request budget `min(floor(15% * budgetRequests), 250)`,
+ * Enforces adaptive per-origin request budget (`computeAdaptivePhase0PerOriginCap`),
  * skips live HTTP at Tier 0, runs 11-framework static route extraction, harvests JS/OpenAPI/GraphQL,
  * synthesizes deduplicated dynamic wordlists, and populates SQLite `endpoints` + `endpoint_params`.
  */
 export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0ReconResult> {
   const { storage, runId, scopeRevision, tier, broker, grant, signal } = params
+  const normalizedOrigins: string[] = []
+  for (const raw of params.origins) {
+    try {
+      const o = new URL(raw).origin
+      if (!normalizedOrigins.includes(o)) normalizedOrigins.push(o)
+    } catch { /* skip malformed */ }
+  }
   const runBudget = (() => {
     if (typeof params.budgetRequests === 'number' && Number.isFinite(params.budgetRequests) && params.budgetRequests > 0) {
       return params.budgetRequests
@@ -3825,10 +3949,19 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       return 1000
     }
   })()
-  const perOriginCap = Math.max(1, Math.min(Math.floor(runBudget * 0.15), 250))
+  const perOriginCap = computeAdaptivePhase0PerOriginCap({
+    hostCount: Math.max(1, normalizedOrigins.length),
+    runBudget,
+    ...(params.perOriginCap !== undefined ? { explicitCap: params.perOriginCap } : {}),
+  })
   // Navigation gets a small overflow lane, but only when the cap is large enough that 16 extra
   // requests cannot violate a deliberately tight budget.
   const navOverflow = perOriginCap >= 40 ? 16 : 0
+  const requestTimeoutMs = typeof params.requestTimeoutMs === 'number'
+    && Number.isFinite(params.requestTimeoutMs)
+    && params.requestTimeoutMs > 0
+    ? Math.max(250, Math.min(Math.floor(params.requestTimeoutMs), 30_000))
+    : 8_000
 
   let requestsUsed = 0
   let endpointsDiscovered = 0
@@ -3923,14 +4056,8 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
   }
   // Per-phase paged-read metrics for the discovery planning reads (nav, GraphQL, sibling derivation).
   const readPagedMetrics: PagedReadMetric[] = []
-
-  const normalizedOrigins: string[] = []
-  for (const raw of params.origins) {
-    try {
-      const o = new URL(raw).origin
-      if (!normalizedOrigins.includes(o)) normalizedOrigins.push(o)
-    } catch { /* skip malformed */ }
-  }
+  const skippedDeadHosts: Array<{ origin: string; reason: string; requestsUsed: number }> = []
+  let skippedBrowserNonHtml = 0
 
   // Build or reuse ONE StaticWorkspaceSnapshot per Phase 0 run so manifests, regex fallback routes,
   // and ProgramGraph extraction all read from memory without redundant repo filesystem walks.
@@ -3957,17 +4084,33 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     | 'auth_privileged'
     | 'param_discovery'
 
-  let lastStageName: Phase0StageId | '' = ''
+  const stageRank: Record<Phase0StageId, number> = {
+    static_ast: 0,
+    host_fingerprint: 1,
+    crawl_state_graph: 2,
+    api_templates: 3,
+    auth_privileged: 4,
+    param_discovery: 5,
+  }
+  let maxStageRankSeen = -1
   let lastStageEmitAt = 0
   const emitPhase0Stage = (
     stage: Phase0StageId,
     label: string,
-    opts?: { origin?: string; hostsDone?: number; hostsTotal?: number; force?: boolean },
+    opts?: {
+      origin?: string
+      hostsDone?: number
+      hostsTotal?: number
+      force?: boolean
+      skippedDeadHost?: boolean
+      deadHostReason?: string
+    },
   ) => {
     const now = Date.now()
-    const stageChanged = stage !== lastStageName
-    if (!opts?.force && !stageChanged && now - lastStageEmitAt < 1000) return
-    lastStageName = stage
+    const rank = stageRank[stage]
+    const stageAdvanced = rank > maxStageRankSeen
+    if (!opts?.force && !stageAdvanced && now - lastStageEmitAt < 1000) return
+    if (stageAdvanced) maxStageRankSeen = rank
     lastStageEmitAt = now
     const frameworks = [...frameworksDetected].slice(0, 12)
     storage.event(runId, 'phase0.stage', label, {
@@ -3976,6 +4119,8 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       ...(opts?.origin ? { origin: opts.origin } : {}),
       ...(opts?.hostsDone !== undefined ? { hostsDone: opts.hostsDone } : {}),
       ...(opts?.hostsTotal !== undefined ? { hostsTotal: opts.hostsTotal } : {}),
+      ...(opts?.skippedDeadHost ? { skippedDeadHost: true } : {}),
+      ...(opts?.deadHostReason ? { deadHostReason: opts.deadHostReason } : {}),
       endpointsDiscovered,
       paramsDiscovered,
       requestsUsed,
@@ -4303,31 +4448,43 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     }
   }
 
-  // 2. Live Black-Box / Grey-Box Pass (100% through RequestBroker)
+  // 2. Live Black-Box / Grey-Box Pass (100% through RequestBroker, bounded multi-host pool)
   const hostsTotal = normalizedOrigins.length
-  for (let originIndex = 0; originIndex < normalizedOrigins.length; originIndex += 1) {
-    const origin = normalizedOrigins[originIndex]!
+  const originConcurrency = resolvePhase0OriginConcurrency()
+  const browserConcurrency = resolvePhase0BrowserConcurrency()
+  const browserSemaphore = createPhase0Semaphore(browserConcurrency)
+  let hostsDone = 0
+  let hostsStarted = 0
+
+  await runBoundedPool(normalizedOrigins, originConcurrency, async (origin, originIndex) => {
     if (signal.aborted) {
       stoppedReason = 'aborted'
-      break
+      return
     }
     if (!grant.canRead(origin)) {
       stoppedReason = 'scope_revoked'
-      continue
+      hostsDone += 1
+      return
     }
 
+    hostsStarted += 1
     emitPhase0Stage(
       'host_fingerprint',
-      `Fingerprinting ${origin} (${originIndex + 1}/${hostsTotal}).`,
+      `Fingerprinting ${origin} (${hostsStarted}/${hostsTotal}).`,
       {
         origin,
-        hostsDone: originIndex,
+        hostsDone,
         hostsTotal,
-        force: originIndex === 0 || originIndex === hostsTotal - 1,
+        force: hostsStarted === 1,
       },
     )
 
     let originUsed = 0
+    let consecutiveDeadResponses = 0
+    let healthyResponses = 0
+    let htmlResponsesObserved = 0
+    let deadHostReason: string | null = null
+    let originNavigationRequests = 0
     const probedPaths = new Set<string>()
     const jsQueue: string[] = []
     const jsPageByScript = new Map<string, string>()
@@ -4587,9 +4744,22 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
           followRedirects: opts?.followRedirects ?? (method === 'GET'),
           runId,
           assignmentId: params.assignmentId,
-          timeoutMs: 8_000,
+          timeoutMs: requestTimeoutMs,
         }, grant, signal)
         if (persona) authRequests += 1
+        if (ex.status < 500) {
+          healthyResponses += 1
+          consecutiveDeadResponses = 0
+          if (isHtmlLikeResponse(ex.status, ex.mediaType, ex.body)) {
+            htmlResponsesObserved += 1
+          }
+        } else if (PHASE0_ORIGIN_DOWN_STATUSES.has(ex.status)) {
+          consecutiveDeadResponses += 1
+          if (healthyResponses === 0 && consecutiveDeadResponses >= PHASE0_DEAD_HOST_THRESHOLD) {
+            originHalted = true
+            deadHostReason ??= `origin_down_http_${ex.status}`
+          }
+        }
         noteDiscoveryResponse(ex)
         params.onExchange?.(ex)
         // Cross-persona object-ID harvesting runs for Phase-0 HTTP (authenticated and unauth alike).
@@ -4603,7 +4773,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       } catch (err) {
         if (err instanceof BrokerCircuitOpen) {
           originHalted = true
-          stoppedReason = 'circuit_open'
+          if (!stoppedReason) stoppedReason = 'circuit_open'
           return null
         }
         if (err instanceof BrokerDenied) {
@@ -4626,6 +4796,14 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
             return safeGet(pathAndQuery, { ...opts, anonymous: true })
           }
           return null
+        }
+        if (!signal.aborted) {
+          consecutiveDeadResponses += 1
+          if (healthyResponses === 0 && consecutiveDeadResponses >= PHASE0_DEAD_HOST_THRESHOLD) {
+            originHalted = true
+            const errMsg = err instanceof Error ? err.message : String(err)
+            deadHostReason ??= /timeout|abort/i.test(errMsg) ? 'transport_timeout' : 'transport_error'
+          }
         }
         return null
       }
@@ -4717,262 +4895,299 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     // harvesting, otherwise a long seed list can starve the bundles that carry XHR/route evidence.
     const jsReserve = perOriginCap > 4 ? Math.min(4, Math.floor(perOriginCap / 3)) : 0
     const seedBudget = Math.max(1, perOriginCap - jsReserve)
-    let seedFetches = 0
 
-    // 2a-cal. Per-origin soft-404 / SPA catch-all calibration with several unmatched paths at
-    // different depths (root-only calibration misses nested API catch-alls).
-    if (!originHalted && !signal.aborted && originUsed + 1 < perOriginCap) {
-      const cal: SoftNotFoundCalibration = { statuses: [], mediaTypes: [], lengths: [], signatures: [] }
-      const probeCount = Math.min(3, Math.max(1, perOriginCap - originUsed - 1))
-      for (const probePath of buildSoft404ProbePaths(probeCount)) {
-        if (originHalted || signal.aborted || originUsed >= perOriginCap) break
-        const ex = await safeGet(probePath)
-        if (!ex) continue
-        cal.statuses.push(ex.status)
-        cal.mediaTypes.push(ex.mediaType)
-        cal.lengths.push(ex.body.length)
-        cal.signatures.push(bodyStructuralSignature(ex.body))
-      }
-      if (cal.statuses.length > 0) softCalibration = cal
+    const shortCircuitIfDeadHost = (): boolean => {
+      if (!originHalted || !deadHostReason) return false
+      skippedDeadHosts.push({ origin, reason: deadHostReason, requestsUsed: originUsed })
+      hostsDone += 1
+      emitPhase0Stage(
+        'host_fingerprint',
+        `Skipped dead/unreachable host ${origin} (${deadHostReason}; ${originUsed} reqs) (${hostsDone}/${hostsTotal}).`,
+        {
+          origin,
+          hostsDone,
+          hostsTotal,
+          force: true,
+          skippedDeadHost: true,
+          deadHostReason,
+        },
+      )
+      return true
     }
 
-    for (const seedPath of PHASE0_SEED_PATHS) {
-      if (seedFetches >= seedBudget) break
-      seedFetches += 1
-      if (originHalted || originUsed >= perOriginCap || signal.aborted) break
-      if (seedPath === '/') {
+    const processRootSurface = async (status: number, mediaType: string, respHeaders: Record<string, string>, body: string, fromRecovery: boolean): Promise<void> => {
+      if (status < 500) {
+        if (fromRecovery) {
+          healthyResponses += 1
+          consecutiveDeadResponses = 0
+        }
+        if (fromRecovery && isHtmlLikeResponse(status, mediaType, body)) {
+          htmlResponsesObserved += 1
+        }
+      }
+      for (const t of mergeTechTags(techTagsFromResponse(respHeaders, body))) techFingerprint.add(t)
+      if (status < 400) {
+        recordEndpoint('GET', '/', 'surface_probe')
+        if (fromRecovery) {
+          tagVisibility('GET', '/', 'anonymous')
+          if (discoveryPersona) tagVisibility('GET', '/', discoveryPersona)
+        } else {
+          tagVisibility('GET', '/', discoveryPersona ?? 'anonymous')
+        }
+      }
+      const html = await safeExtractHtmlInWorker(body, origin, signal)
+      for (const s of html.scripts) {
+        queueJsChunk(s, '/')
+        jsPageByScript.set(s, '/')
+      }
+      for (const asset of extractAssetReferences(body)) {
+        if (/\.json(?:$|[?#])/i.test(asset)) queueJsonDoc(asset)
+        else queueJsChunk(asset, '/')
+      }
+      if (html.links.length > 160) noteTruncation('html_links', 160, html.links.length, origin)
+      for (const l of html.links.slice(0, 160)) {
+        dynamicPaths.add(normalizeRouteTemplate(l))
+        if (discoveredCandidatePaths.length < MAX_CANDIDATE_PATHS) discoveredCandidatePaths.push(l)
+        else candidatePathsObserved += 1
+        if (/\.json(?:\?|$)/i.test(l)) queueJsonDoc(l)
+        else navSeeds.push({ path: l, depth: 0 })
+      }
+      for (const form of html.forms) {
+        const ep = recordEndpoint(form.method, form.action, 'surface_probe')
+        for (const inp of form.inputs) {
+          if (!isUsefulParamName(inp)) continue
+          storage.upsertEndpointParam({
+            runId,
+            endpointId: ep.id,
+            name: inp,
+            location: form.method === 'GET' ? 'query' : 'form',
+            isCsrf: CSRF_PARAM_RE.test(inp),
+            isObjectId: OBJECT_ID_PARAM_RE.test(inp),
+            source: 'observed:form_field',
+          })
+          dynamicParams.add(inp)
+          paramsDiscovered += 1
+        }
+      }
+    }
+
+    // 2a-root. Fetch or recover site root `GET /` first so dead/525 hosts are detected alongside
+    // soft-404 calibration in <= 3 requests before spending seed, JS, template, or browser budget.
+    if (!originHalted && originUsed < perOriginCap && !signal.aborted && seedBudget >= 1) {
+      let recoveredRoot = false
+      try {
         // On crash recovery, reuse any already-recorded GET / for this (runId, origin) so the
         // baseline is never duplicated across SIGKILL + resume. Scope revisions can advance while
         // paused, so the revision is intentionally not part of the reuse key; the live grant still
         // gates whether the origin may be read.
-        try {
-          const prior = storage.client.prepare(
-            `SELECT status, media_type AS mediaType, resp_headers AS respHeadersJson, body_preview AS bodyPreview
-             FROM broker_exchanges
-             WHERE run_id = ? AND origin = ? AND method = 'GET' AND path_and_query = '/'
-             ORDER BY created_at ASC LIMIT 1`,
-          ).get(runId, origin) as {
-            status: number
-            mediaType: string
-            respHeadersJson: string
-            bodyPreview: string
-          } | undefined
-          if (prior) {
-            // Match safeGet's dedupe key (`METHOD persona path`) so the navigation pass does not
-            // re-fetch the recovered baseline route on resume. Keep the legacy key too.
-            probedPaths.add(`GET ${discoveryPersona ?? ''} /`)
-            probedPaths.add('GET /')
-            let headersObj: Record<string, string> = {}
-            try { headersObj = JSON.parse(prior.respHeadersJson) as Record<string, string> } catch { /* ignore */ }
-            for (const t of mergeTechTags(techTagsFromResponse(headersObj, prior.bodyPreview ?? ''))) techFingerprint.add(t)
-            if (prior.status < 400) {
-              recordEndpoint('GET', '/', 'surface_probe')
-              tagVisibility('GET', '/', 'anonymous')
-              if (discoveryPersona) tagVisibility('GET', '/', discoveryPersona)
-            }
-            const html = await safeExtractHtmlInWorker(prior.bodyPreview ?? '', origin, signal)
-            for (const s of html.scripts) {
-              queueJsChunk(s, '/')
-              jsPageByScript.set(s, '/')
-            }
-            for (const asset of extractAssetReferences(prior.bodyPreview ?? '')) {
-              if (/\.json(?:$|[?#])/i.test(asset)) queueJsonDoc(asset)
-              else queueJsChunk(asset, '/')
-            }
-            if (html.links.length > 160) noteTruncation('html_links', 160, html.links.length, origin)
-            for (const l of html.links.slice(0, 160)) {
-              dynamicPaths.add(normalizeRouteTemplate(l))
-              if (discoveredCandidatePaths.length < MAX_CANDIDATE_PATHS) discoveredCandidatePaths.push(l)
-              else candidatePathsObserved += 1
-              if (/\.json(?:\?|$)/i.test(l)) queueJsonDoc(l)
-              else navSeeds.push({ path: l, depth: 0 })
-            }
-            for (const form of html.forms) {
-              const ep = recordEndpoint(form.method, form.action, 'surface_probe')
-              for (const inp of form.inputs) {
-                if (!isUsefulParamName(inp)) continue
-                storage.upsertEndpointParam({
-                  runId,
-                  endpointId: ep.id,
-                  name: inp,
-                  location: form.method === 'GET' ? 'query' : 'form',
-                  isCsrf: CSRF_PARAM_RE.test(inp),
-                  isObjectId: OBJECT_ID_PARAM_RE.test(inp),
-                  source: 'observed:form_field',
-                })
-                dynamicParams.add(inp)
-                paramsDiscovered += 1
-              }
-            }
-            continue
-          }
-        } catch { /* fall through to live GET / */ }
-      }
-      let ex = await safeGet(seedPath)
-      // Config/route-map artifacts are often behind auth; retry with every approved persona (not
-      // just the first) so role-scoped tables are visible to the persona union.
-      if (ex && (ex.status === 401 || ex.status === 403) && params.personas?.length) {
-        for (const handle of params.personas) {
-          if (!personaForOrigin(handle)) continue
-          if (originHalted || originUsed >= perOriginCap) break
-          ex = await safeGet(seedPath, { persona: handle })
-          if (ex && ex.status < 400) break
+        const prior = storage.client.prepare(
+          `SELECT status, media_type AS mediaType, resp_headers AS respHeadersJson, body_preview AS bodyPreview
+           FROM broker_exchanges
+           WHERE run_id = ? AND origin = ? AND method = 'GET' AND path_and_query = '/'
+           ORDER BY created_at ASC LIMIT 1`,
+        ).get(runId, origin) as {
+          status: number
+          mediaType: string
+          respHeadersJson: string
+          bodyPreview: string
+        } | undefined
+        if (prior) {
+          // Match safeGet's dedupe key (`METHOD persona path`) so the navigation pass does not
+          // re-fetch the recovered baseline route on resume. Keep the legacy key too.
+          probedPaths.add(`GET ${discoveryPersona ?? ''} /`)
+          probedPaths.add('GET /')
+          let headersObj: Record<string, string> = {}
+          try { headersObj = JSON.parse(prior.respHeadersJson) as Record<string, string> } catch { /* ignore */ }
+          await processRootSurface(prior.status, prior.mediaType ?? '', headersObj, prior.bodyPreview ?? '', true)
+          recoveredRoot = true
         }
-      }
-      if (!ex) continue
-
-      if (seedPath === '/') {
-        for (const t of mergeTechTags(techTagsFromResponse(ex.respHeaders, ex.body))) techFingerprint.add(t)
-        if (ex.status < 400) {
-          recordEndpoint('GET', '/', 'surface_probe')
-          tagVisibility('GET', '/', discoveryPersona ?? 'anonymous')
-        }
-        const html = await safeExtractHtmlInWorker(ex.body, origin, signal)
-        for (const s of html.scripts) {
-          queueJsChunk(s, '/')
-          jsPageByScript.set(s, '/')
-        }
-        for (const asset of extractAssetReferences(ex.body)) {
-          if (/\.json(?:$|[?#])/i.test(asset)) queueJsonDoc(asset)
-          else queueJsChunk(asset, '/')
-        }
-        if (html.links.length > 160) noteTruncation('html_links', 160, html.links.length, origin)
-        for (const l of html.links.slice(0, 160)) {
-          dynamicPaths.add(normalizeRouteTemplate(l))
-          if (discoveredCandidatePaths.length < MAX_CANDIDATE_PATHS) discoveredCandidatePaths.push(l)
-          else candidatePathsObserved += 1
-          if (/\.json(?:\?|$)/i.test(l)) queueJsonDoc(l)
-          else navSeeds.push({ path: l, depth: 0 })
-        }
-        for (const form of html.forms) {
-          const ep = recordEndpoint(form.method, form.action, 'surface_probe')
-          for (const inp of form.inputs) {
-            if (!isUsefulParamName(inp)) continue
-            storage.upsertEndpointParam({
-              runId,
-              endpointId: ep.id,
-              name: inp,
-              location: form.method === 'GET' ? 'query' : 'form',
-              isCsrf: CSRF_PARAM_RE.test(inp),
-              isObjectId: OBJECT_ID_PARAM_RE.test(inp),
-              source: 'observed:form_field',
-            })
-            dynamicParams.add(inp)
-            paramsDiscovered += 1
+      } catch { /* fall through to live GET / */ }
+      if (!recoveredRoot) {
+        let rootEx = await safeGet('/')
+        if (rootEx && (rootEx.status === 401 || rootEx.status === 403) && params.personas?.length) {
+          for (const handle of params.personas) {
+            if (!personaForOrigin(handle)) continue
+            if (originHalted || originUsed >= perOriginCap) break
+            rootEx = await safeGet('/', { persona: handle })
+            if (rootEx && rootEx.status < 400) break
           }
         }
-      } else if (seedPath === '/robots.txt' && ex.status < 400) {
-        for (const m of ex.body.matchAll(/^(?:Allow|Disallow)\s*:\s*(\/\S+)/gim)) {
-          const clean = sanitizePathCandidate(m[1].replace(/\*+$/, ''), origin)
-          if (clean) {
-            dynamicPaths.add(normalizeRouteTemplate(clean))
-            if (discoveredCandidatePaths.length < 40) discoveredCandidatePaths.push(clean)
-          }
-        }
-      } else if (seedPath === '/sitemap.xml' && ex.status < 400) {
-        for (const m of ex.body.matchAll(/<loc>\s*([^<\s]+)\s*<\/loc>/gi)) {
-          const clean = sanitizePathCandidate(m[1], origin)
-          if (clean) {
-            dynamicPaths.add(normalizeRouteTemplate(clean))
-            if (discoveredCandidatePaths.length < 40) discoveredCandidatePaths.push(clean)
-          }
-        }
-      } else if (seedPath === '/.well-known/openid-configuration' && ex.status < 400) {
-        recordEndpoint('GET', seedPath, 'surface_probe', { riskScore: 65 })
-        try {
-          const oidc = JSON.parse(ex.body) as Record<string, unknown>
-          for (const k of ['authorization_endpoint', 'token_endpoint', 'userinfo_endpoint', 'jwks_uri', 'registration_endpoint']) {
-            if (typeof oidc[k] === 'string') {
-              const clean = sanitizePathCandidate(oidc[k] as string, origin)
-              if (clean) recordEndpoint('GET', clean, 'surface_probe', { riskScore: 80 })
-            }
-          }
-        } catch { /* ignore invalid JSON */ }
-      } else if (/(?:openapi|swagger|api-docs)/i.test(seedPath) && ex.status < 400 && !softNotFoundResponse(ex)) {
-        const specDoc = await safeParseJsonOrYamlInWorker(ex.body, signal)
-        const parsed = parseOpenApiDoc(ex.body, origin, storage, runId, scopeRevision, dynamicPaths, dynamicParams, { parsedDoc: specDoc })
-        endpointsDiscovered += parsed.endpoints
-        paramsDiscovered += parsed.params
-        for (const op of parsed.operations) {
-          mergeRuntimeOpenApiOp({
-            method: op.method,
-            path: op.pathTemplate,
-            serviceOrigin: origin,
-            ...(op.operationId ? { operationId: op.operationId } : {}),
-            ...(op.security !== undefined ? { security: op.security } : {}),
-            ...(op.authRequirement !== undefined ? { authRequirement: op.authRequirement } : {}),
-            ...(op.parameters ? { parameters: op.parameters } : {}),
-            ...(op.requestBodyKeys ? { requestBodyKeys: op.requestBodyKeys } : {}),
-            ...(op.tags ? { tags: op.tags } : {}),
-          })
-        }
-        if (parsed.endpoints > 0) {
-          if (specDoc && typeof specDoc === 'object') {
-            for (const entry of harvestRouteMapDocument(specDoc).slice(0, 120)) {
-              queueDiscoveredRoute(entry.method, entry.path)
-            }
-          }
-        }
-        if (parsed.endpoints === 0) {
-          // Swagger-less API index documents are handled by the structural route-map expander.
-          const expanded = parseRouteMapDoc(ex.body, origin, storage, runId, scopeRevision, dynamicPaths, dynamicParams, { bindings: configBindings, parsedDoc: specDoc })
-          endpointsDiscovered += expanded.endpoints
-          paramsDiscovered += expanded.params
-          routeMapEndpoints += expanded.endpoints
-        }
-      } else if ((seedPath === '/graphql' || seedPath === '/api/graphql') && ex.status < 400) {
-        const gqlPath = seedPath.startsWith('/api/') ? seedPath : '/graphql'
-        recordEndpoint('POST', gqlPath, 'graphql', { framework: 'graphql', riskScore: 85 })
-        techFingerprint.add('graphql')
-      } else if (ex.status >= 200 && ex.status < 300) {
-        if (softNotFoundResponse(ex)) {
-          soft404Rejected += 1
-          continue
-        }
-        recordEndpoint('GET', seedPath, 'surface_probe')
-        // Any served JSON/YAML document may be a route map or config with an endpoint table.
-        if (/json|yaml/i.test(ex.mediaType) || /^\s*[{[]/.test(ex.body)) {
-          try {
-            const doc = await safeParseJsonOrYamlInWorker(ex.body, signal)
-            const parsed = parseRouteMapDoc(ex.body, origin, storage, runId, scopeRevision, dynamicPaths, dynamicParams, { bindings: configBindings, parsedDoc: doc })
-            endpointsDiscovered += parsed.endpoints
-            paramsDiscovered += parsed.params
-            routeMapEndpoints += parsed.endpoints
-            if (doc && typeof doc === 'object') {
-              for (const link of extractJsonLinkTargets(ex.body, origin)) navSeeds.push({ path: link, depth: 0 })
-              const entries = harvestRouteMapDocument(doc).slice(0, 120)
-              const docGetPaths = new Set(entries.filter(entry => entry.method === 'GET').map(entry => normalizeDiscoveryTemplate(entry.path)))
-              for (const entry of entries) {
-                const tmpl = normalizeDiscoveryTemplate(entry.path)
-                if (entry.method !== 'GET' && entry.method !== 'HEAD' && !docGetPaths.has(tmpl)) writeOnlyPaths.add(tmpl)
-                else if (entry.method === 'GET') {
-                  queueDiscoveredRoute(entry.method, entry.path)
-                  if (!/:/.test(entry.path)) navSeeds.push({ path: entry.path, depth: 0 })
-                }
-              }
-            }
-          } catch { /* not a route map */ }
+        if (rootEx) {
+          await processRootSurface(rootEx.status, rootEx.mediaType, rootEx.respHeaders, rootEx.body, false)
         }
       }
     }
 
-    // 2b. Fetch same-origin JS chunks. The queue is drained breadth-first (imports, manifests,
-    // webpack/Vite chunk maps) within a scaled 96-bundle budget; seed probes reserved jsReserve.
+    // 2a-cal. Per-origin soft-404 / SPA catch-all calibration with several unmatched paths at
+    // different depths (root-only calibration misses nested API catch-alls). When the root already
+    // answered healthily, run calibration probes concurrently; when root failed/timed out/525'd,
+    // probe sequentially so dead hosts halt at exactly PHASE0_DEAD_HOST_THRESHOLD (3) requests.
+    if (!originHalted && !signal.aborted && originUsed + 1 < perOriginCap) {
+      const cal: SoftNotFoundCalibration = { statuses: [], mediaTypes: [], lengths: [], signatures: [] }
+      const probeCount = Math.min(3, Math.max(1, perOriginCap - originUsed - 1))
+      const calPaths = buildSoft404ProbePaths(probeCount)
+      const calConcurrency = healthyResponses > 0 ? Math.min(PHASE0_INNER_CONCURRENCY, calPaths.length) : 1
+      await runBoundedPool(
+        calPaths,
+        calConcurrency,
+        async probePath => {
+          if (originHalted || signal.aborted || originUsed >= perOriginCap) return
+          const ex = await safeGet(probePath)
+          if (!ex) return
+          cal.statuses.push(ex.status)
+          cal.mediaTypes.push(ex.mediaType)
+          cal.lengths.push(ex.body.length)
+          cal.signatures.push(bodyStructuralSignature(ex.body))
+        },
+        () => originHalted || signal.aborted || originUsed >= perOriginCap,
+      )
+      if (cal.statuses.length > 0) softCalibration = cal
+    }
+
+    if (shortCircuitIfDeadHost()) return
+
+    // 2a-seeds. Probe remaining read-only seed paths in a bounded inner pool.
+    const remainingSeeds = PHASE0_SEED_PATHS.slice(1, Math.max(1, seedBudget))
+    const seedPoolConcurrency = healthyResponses > 0 ? PHASE0_INNER_CONCURRENCY : 1
+    await runBoundedPool(
+      remainingSeeds,
+      seedPoolConcurrency,
+      async seedPath => {
+        if (originHalted || originUsed >= perOriginCap || signal.aborted) return
+        let ex = await safeGet(seedPath)
+        // Config/route-map artifacts are often behind auth; retry with every approved persona (not
+        // just the first) so role-scoped tables are visible to the persona union.
+        if (ex && (ex.status === 401 || ex.status === 403) && params.personas?.length) {
+          for (const handle of params.personas) {
+            if (!personaForOrigin(handle)) continue
+            if (originHalted || originUsed >= perOriginCap) break
+            ex = await safeGet(seedPath, { persona: handle })
+            if (ex && ex.status < 400) break
+          }
+        }
+        if (!ex) return
+
+        if (seedPath === '/robots.txt' && ex.status < 400) {
+          for (const m of ex.body.matchAll(/^(?:Allow|Disallow)\s*:\s*(\/\S+)/gim)) {
+            const clean = sanitizePathCandidate(m[1].replace(/\*+$/, ''), origin)
+            if (clean) {
+              dynamicPaths.add(normalizeRouteTemplate(clean))
+              if (discoveredCandidatePaths.length < 40) discoveredCandidatePaths.push(clean)
+            }
+          }
+        } else if (seedPath === '/sitemap.xml' && ex.status < 400) {
+          for (const m of ex.body.matchAll(/<loc>\s*([^<\s]+)\s*<\/loc>/gi)) {
+            const clean = sanitizePathCandidate(m[1], origin)
+            if (clean) {
+              dynamicPaths.add(normalizeRouteTemplate(clean))
+              if (discoveredCandidatePaths.length < 40) discoveredCandidatePaths.push(clean)
+            }
+          }
+        } else if (seedPath === '/.well-known/openid-configuration' && ex.status < 400) {
+          recordEndpoint('GET', seedPath, 'surface_probe', { riskScore: 65 })
+          try {
+            const oidc = JSON.parse(ex.body) as Record<string, unknown>
+            for (const k of ['authorization_endpoint', 'token_endpoint', 'userinfo_endpoint', 'jwks_uri', 'registration_endpoint']) {
+              if (typeof oidc[k] === 'string') {
+                const clean = sanitizePathCandidate(oidc[k] as string, origin)
+                if (clean) recordEndpoint('GET', clean, 'surface_probe', { riskScore: 80 })
+              }
+            }
+          } catch { /* ignore invalid JSON */ }
+        } else if (/(?:openapi|swagger|api-docs)/i.test(seedPath) && ex.status < 400 && !softNotFoundResponse(ex)) {
+          const specDoc = await safeParseJsonOrYamlInWorker(ex.body, signal)
+          const parsed = parseOpenApiDoc(ex.body, origin, storage, runId, scopeRevision, dynamicPaths, dynamicParams, { parsedDoc: specDoc })
+          endpointsDiscovered += parsed.endpoints
+          paramsDiscovered += parsed.params
+          for (const op of parsed.operations) {
+            mergeRuntimeOpenApiOp({
+              method: op.method,
+              path: op.pathTemplate,
+              serviceOrigin: origin,
+              ...(op.operationId ? { operationId: op.operationId } : {}),
+              ...(op.security !== undefined ? { security: op.security } : {}),
+              ...(op.authRequirement !== undefined ? { authRequirement: op.authRequirement } : {}),
+              ...(op.parameters ? { parameters: op.parameters } : {}),
+              ...(op.requestBodyKeys ? { requestBodyKeys: op.requestBodyKeys } : {}),
+              ...(op.tags ? { tags: op.tags } : {}),
+            })
+          }
+          if (parsed.endpoints > 0) {
+            if (specDoc && typeof specDoc === 'object') {
+              for (const entry of harvestRouteMapDocument(specDoc).slice(0, 120)) {
+                queueDiscoveredRoute(entry.method, entry.path)
+              }
+            }
+          }
+          if (parsed.endpoints === 0) {
+            // Swagger-less API index documents are handled by the structural route-map expander.
+            const expanded = parseRouteMapDoc(ex.body, origin, storage, runId, scopeRevision, dynamicPaths, dynamicParams, { bindings: configBindings, parsedDoc: specDoc })
+            endpointsDiscovered += expanded.endpoints
+            paramsDiscovered += expanded.params
+            routeMapEndpoints += expanded.endpoints
+          }
+        } else if ((seedPath === '/graphql' || seedPath === '/api/graphql') && ex.status < 400) {
+          const gqlPath = seedPath.startsWith('/api/') ? seedPath : '/graphql'
+          recordEndpoint('POST', gqlPath, 'graphql', { framework: 'graphql', riskScore: 85 })
+          techFingerprint.add('graphql')
+        } else if (ex.status >= 200 && ex.status < 300) {
+          if (softNotFoundResponse(ex)) {
+            soft404Rejected += 1
+            return
+          }
+          recordEndpoint('GET', seedPath, 'surface_probe')
+          // Any served JSON/YAML document may be a route map or config with an endpoint table.
+          if (/json|yaml/i.test(ex.mediaType) || /^\s*[{[]/.test(ex.body)) {
+            try {
+              const doc = await safeParseJsonOrYamlInWorker(ex.body, signal)
+              const parsed = parseRouteMapDoc(ex.body, origin, storage, runId, scopeRevision, dynamicPaths, dynamicParams, { bindings: configBindings, parsedDoc: doc })
+              endpointsDiscovered += parsed.endpoints
+              paramsDiscovered += parsed.params
+              routeMapEndpoints += parsed.endpoints
+              if (doc && typeof doc === 'object') {
+                for (const link of extractJsonLinkTargets(ex.body, origin)) navSeeds.push({ path: link, depth: 0 })
+                const entries = harvestRouteMapDocument(doc).slice(0, 120)
+                const docGetPaths = new Set(entries.filter(entry => entry.method === 'GET').map(entry => normalizeDiscoveryTemplate(entry.path)))
+                for (const entry of entries) {
+                  const tmpl = normalizeDiscoveryTemplate(entry.path)
+                  if (entry.method !== 'GET' && entry.method !== 'HEAD' && !docGetPaths.has(tmpl)) writeOnlyPaths.add(tmpl)
+                  else if (entry.method === 'GET') {
+                    queueDiscoveredRoute(entry.method, entry.path)
+                    if (!/:/.test(entry.path)) navSeeds.push({ path: entry.path, depth: 0 })
+                  }
+                }
+              }
+            } catch { /* not a route map */ }
+          }
+        }
+      },
+      () => originHalted || originUsed >= perOriginCap || signal.aborted,
+    )
+
+    if (shortCircuitIfDeadHost()) return
+
+    // 2b. Fetch same-origin JS chunks in a bounded concurrent BFS pool. The queue is drained
+    // breadth-first (imports, manifests, webpack/Vite chunk maps) within a scaled 96-bundle budget;
+    // seed probes reserved jsReserve.
     const maxJsChunks = Math.min(MAX_JS_CHUNKS_FETCH, Math.max(0, perOriginCap - originUsed))
     if (!originHalted && !signal.aborted && jsQueue.length > 0 && maxJsChunks > 0) {
       emitPhase0Stage(
         'crawl_state_graph',
         `Harvesting client bundles & routes on ${origin} (${originIndex + 1}/${hostsTotal}).`,
-        { origin, hostsDone: originIndex, hostsTotal },
+        { origin, hostsDone, hostsTotal },
       )
     }
     let jsFetched = 0
-    for (let jsIndex = 0; jsIndex < jsQueue.length && jsFetched < maxJsChunks; jsIndex += 1) {
-      const jsPath = jsQueue[jsIndex]
-      if (!jsPath) continue
-      if (originHalted || originUsed >= perOriginCap || signal.aborted) break
+    let jsCursor = 0
+    let jsInFlight = 0
+    const jsWaiters: Array<() => void> = []
+    const wakeJsWaiters = () => {
+      while (jsWaiters.length > 0) jsWaiters.shift()?.()
+    }
+    const processJsChunk = async (jsPath: string): Promise<void> => {
+      if (originHalted || originUsed >= perOriginCap || signal.aborted || jsFetched >= maxJsChunks) return
       const ex = await safeGet(jsPath)
-      if (!ex || ex.status >= 400 || !ex.body) continue
+      if (!ex || ex.status >= 400 || !ex.body) return
       jsFetched += 1
 
       const harvested = await safeJsHarvestInWorker(ex.body, `${origin}${jsPath}`, undefined, signal) as {
@@ -5127,90 +5342,123 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         }
       }
     }
+    if (!originHalted && !signal.aborted && jsQueue.length > 0 && maxJsChunks > 0) {
+      const jsLanes = Math.min(PHASE0_INNER_CONCURRENCY, Math.max(1, maxJsChunks))
+      const runJsLane = async (): Promise<void> => {
+        while (true) {
+          if (originHalted || originUsed >= perOriginCap || signal.aborted || jsFetched >= maxJsChunks) return
+          if (jsCursor >= jsQueue.length) {
+            if (jsInFlight === 0) return
+            await new Promise<void>(resolve => jsWaiters.push(resolve))
+            continue
+          }
+          const idx = jsCursor
+          jsCursor += 1
+          const jsPath = jsQueue[idx]
+          if (!jsPath) continue
+          jsInFlight += 1
+          try {
+            await processJsChunk(jsPath)
+          } finally {
+            jsInFlight -= 1
+            wakeJsWaiters()
+          }
+        }
+      }
+      await Promise.all(Array.from({ length: jsLanes }, () => runJsLane()))
+    }
 
     // 2b-bis. Fetch same-origin JSON/YAML route-map & config artifacts referenced by the SPA
-    // (runtime config, API index, Vite/webpack manifests). This is the only way config tables that
-    // are referenced solely from JS become visible before probes run.
+    // (runtime config, API index, Vite/webpack manifests) in a bounded inner pool.
     const uniqueJsonDocs = [...new Set(jsonDocCandidates)]
     if (uniqueJsonDocs.length > 16) noteTruncation('json_doc_fetches', 16, uniqueJsonDocs.length, origin)
-    for (const docPath of uniqueJsonDocs.slice(0, 16)) {
-      if (originHalted || originUsed >= perOriginCap - 4 || signal.aborted) break
-      const ex = await safeGet(docPath)
-      if (!ex || ex.status >= 400 || !ex.body) continue
-      if (softNotFoundResponse(ex)) { soft404Rejected += 1; continue }
-      const isStructured = /json|yaml/i.test(ex.mediaType) || /^\s*[{[]/.test(ex.body)
-      if (!isStructured) {
-        // A manifest-like JS body: follow the chunk references it lists.
-        for (const asset of extractAssetReferences(ex.body)) queueJsChunk(asset, docPath)
-        continue
-      }
-      const doc = await safeParseJsonOrYamlInWorker(ex.body, signal)
-      const expanded = parseRouteMapDoc(ex.body, origin, storage, runId, scopeRevision, dynamicPaths, dynamicParams, { bindings: configBindings, parsedDoc: doc })
-      endpointsDiscovered += expanded.endpoints
-      paramsDiscovered += expanded.params
-      routeMapEndpoints += expanded.endpoints
-      if (doc && typeof doc === 'object') {
-        // Declared-surface hydration: an OIDC discovery document and a CDN asset manifest both
-        // name routes the origin actually serves. Absolute discovery URLs are accepted only when
-        // they stay on the document's own origin; manifest entries resolve against the document.
-        const docOrigin = (() => { try { return new URL(origin).origin } catch { return origin } })()
-        const recordDeclared = (method: string, pathname: string): void => {
-          if (!pathname.startsWith('/') || pathname.startsWith('//') || /[:{}\s]/.test(pathname)) return
-          recordEndpoint(method, pathname, 'spa_crawl', { authRequirement: 'none' })
-          queueDiscoveredRoute(method, pathname)
+    await runBoundedPool(
+      uniqueJsonDocs.slice(0, 16),
+      PHASE0_INNER_CONCURRENCY,
+      async docPath => {
+        if (originHalted || originUsed >= perOriginCap - 4 || signal.aborted) return
+        const ex = await safeGet(docPath)
+        if (!ex || ex.status >= 400 || !ex.body) return
+        if (softNotFoundResponse(ex)) { soft404Rejected += 1; return }
+        const isStructured = /json|yaml/i.test(ex.mediaType) || /^\s*[{[]/.test(ex.body)
+        if (!isStructured) {
+          // A manifest-like JS body: follow the chunk references it lists.
+          for (const asset of extractAssetReferences(ex.body)) queueJsChunk(asset, docPath)
+          return
         }
-        for (const key of ['authorization_endpoint', 'token_endpoint', 'jwks_uri', 'userinfo_endpoint', 'end_session_endpoint', 'introspection_endpoint', 'revocation_endpoint', 'registration_endpoint']) {
-          const value = (doc as Record<string, unknown>)[key]
-          if (typeof value !== 'string') continue
-          try {
-            const parsed = new URL(value, docOrigin)
-            if (parsed.origin !== docOrigin) continue
-            recordDeclared(/token|introspection|revocation|registration/.test(key) ? 'POST' : 'GET', parsed.pathname)
-          } catch { /* malformed declaration */ }
-        }
-        for (const key of ['chunks', 'files', 'assets', 'scripts', 'entrypoints']) {
-          const list = (doc as Record<string, unknown>)[key]
-          if (!Array.isArray(list)) continue
-          for (const item of list.slice(0, 64)) {
-            const raw = typeof item === 'string'
-              ? item
-              : item && typeof item === 'object'
-                ? ((item as Record<string, unknown>).file ?? (item as Record<string, unknown>).src ?? (item as Record<string, unknown>).path)
-                : null
-            if (typeof raw !== 'string' || !raw.trim()) continue
-            const clean = (raw.startsWith('/') ? raw : `/${raw.replace(/^\.?\//, '')}`).split('?')[0] ?? ''
-            if (!clean || clean.startsWith('//') || !/^\/[A-Za-z0-9._~!$&'()*+,;=:@%/-]{1,512}$/.test(clean)) continue
-            recordEndpoint('GET', clean, 'spa_crawl')
-            if (/\.(?:js|mjs)$/i.test(clean)) queueJsChunk(clean, docPath)
+        const doc = await safeParseJsonOrYamlInWorker(ex.body, signal)
+        const expanded = parseRouteMapDoc(ex.body, origin, storage, runId, scopeRevision, dynamicPaths, dynamicParams, { bindings: configBindings, parsedDoc: doc })
+        endpointsDiscovered += expanded.endpoints
+        paramsDiscovered += expanded.params
+        routeMapEndpoints += expanded.endpoints
+        if (doc && typeof doc === 'object') {
+          // Declared-surface hydration: an OIDC discovery document and a CDN asset manifest both
+          // name routes the origin actually serves. Absolute discovery URLs are accepted only when
+          // they stay on the document's own origin; manifest entries resolve against the document.
+          const docOrigin = (() => { try { return new URL(origin).origin } catch { return origin } })()
+          const recordDeclared = (method: string, pathname: string): void => {
+            if (!pathname.startsWith('/') || pathname.startsWith('//') || /[:{}\s]/.test(pathname)) return
+            recordEndpoint(method, pathname, 'spa_crawl', { authRequirement: 'none' })
+            queueDiscoveredRoute(method, pathname)
+          }
+          for (const key of ['authorization_endpoint', 'token_endpoint', 'jwks_uri', 'userinfo_endpoint', 'end_session_endpoint', 'introspection_endpoint', 'revocation_endpoint', 'registration_endpoint']) {
+            const value = (doc as Record<string, unknown>)[key]
+            if (typeof value !== 'string') continue
+            try {
+              const parsed = new URL(value, docOrigin)
+              if (parsed.origin !== docOrigin) continue
+              recordDeclared(/token|introspection|revocation|registration/.test(key) ? 'POST' : 'GET', parsed.pathname)
+            } catch { /* malformed declaration */ }
+          }
+          for (const key of ['chunks', 'files', 'assets', 'scripts', 'entrypoints']) {
+            const list = (doc as Record<string, unknown>)[key]
+            if (!Array.isArray(list)) continue
+            for (const item of list.slice(0, 64)) {
+              const raw = typeof item === 'string'
+                ? item
+                : item && typeof item === 'object'
+                  ? ((item as Record<string, unknown>).file ?? (item as Record<string, unknown>).src ?? (item as Record<string, unknown>).path)
+                  : null
+              if (typeof raw !== 'string' || !raw.trim()) continue
+              const clean = (raw.startsWith('/') ? raw : `/${raw.replace(/^\.?\//, '')}`).split('?')[0] ?? ''
+              if (!clean || clean.startsWith('//') || !/^\/[A-Za-z0-9._~!$&'()*+,;=:@%/-]{1,512}$/.test(clean)) continue
+              recordEndpoint('GET', clean, 'spa_crawl')
+              if (/\.(?:js|mjs)$/i.test(clean)) queueJsChunk(clean, docPath)
+            }
+          }
+          for (const link of extractJsonLinkTargets(ex.body, origin)) navSeeds.push({ path: link, depth: 0 })
+          const entries = harvestRouteMapDocument(doc).slice(0, 120)
+          const docGetPaths = new Set(entries.filter(entry => entry.method === 'GET').map(entry => normalizeDiscoveryTemplate(entry.path)))
+          for (const entry of entries) {
+            const tmpl = normalizeDiscoveryTemplate(entry.path)
+            if (entry.method !== 'GET' && entry.method !== 'HEAD' && !docGetPaths.has(tmpl)) writeOnlyPaths.add(tmpl)
+            else if (entry.method === 'GET') {
+              queueDiscoveredRoute(entry.method, entry.path)
+              if (!/:/.test(entry.path)) navSeeds.push({ path: entry.path, depth: 0 })
+            }
           }
         }
-        for (const link of extractJsonLinkTargets(ex.body, origin)) navSeeds.push({ path: link, depth: 0 })
-        const entries = harvestRouteMapDocument(doc).slice(0, 120)
-        const docGetPaths = new Set(entries.filter(entry => entry.method === 'GET').map(entry => normalizeDiscoveryTemplate(entry.path)))
-        for (const entry of entries) {
-          const tmpl = normalizeDiscoveryTemplate(entry.path)
-          if (entry.method !== 'GET' && entry.method !== 'HEAD' && !docGetPaths.has(tmpl)) writeOnlyPaths.add(tmpl)
-          else if (entry.method === 'GET') {
-            queueDiscoveredRoute(entry.method, entry.path)
-            if (!/:/.test(entry.path)) navSeeds.push({ path: entry.path, depth: 0 })
-          }
+        for (const asset of extractAssetReferences(ex.body)) {
+          if (/\.json(?:$|[?#])/i.test(asset)) queueJsonDoc(asset)
+          else queueJsChunk(asset, docPath)
         }
-      }
-      for (const asset of extractAssetReferences(ex.body)) {
-        if (/\.json(?:$|[?#])/i.test(asset)) queueJsonDoc(asset)
-        else queueJsChunk(asset, docPath)
-      }
-    }
+      },
+      () => originHalted || originUsed >= perOriginCap - 4 || signal.aborted,
+    )
 
     // 2c. Tech-matched safe templates (strictly bounded by remaining per-origin budget). Generic
     // exposure templates run even when no fingerprint matched, so they must not be gated on a
-    // non-empty tag set.
-    const remainingForTemplates = perOriginCap - originUsed
+    // non-empty tag set. Reserve a small slice for Playwright when a browser is attached to an HTML
+    // origin so template probing cannot starve SPA state-graph discovery under adaptive caps.
+    const browserReserve = params.browser && htmlResponsesObserved > 0 && perOriginCap >= 24
+      ? Math.min(6, Math.floor(perOriginCap * 0.15))
+      : 0
+    const remainingForTemplates = perOriginCap - originUsed - browserReserve
     if (!originHalted && !signal.aborted && remainingForTemplates >= 4 && grant.canRead(origin)) {
       emitPhase0Stage(
         'api_templates',
         `Probing API templates & methods on ${origin} (${originIndex + 1}/${hostsTotal}).`,
-        { origin, hostsDone: originIndex, hostsTotal },
+        { origin, hostsDone, hostsTotal },
       )
       const templateBudget = Math.min(20, remainingForTemplates)
       const templateApiPaths = new Set<string>()
@@ -5233,6 +5481,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
           },
           maxTemplates: Math.max(1, Math.floor(templateBudget / 2)),
           maxRequests: templateBudget,
+          timeoutMs: Math.min(surfaceProbeTimeoutMs, requestTimeoutMs),
           ...(discoveryPersona ? { persona: discoveryPersona } : {}),
           runId,
           assignmentId: params.assignmentId,
@@ -5241,6 +5490,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
             stagedTemplateExchanges += 1
             originUsed += 1
             requestsUsed += 1
+            if (isHtmlLikeResponse(ex.status, ex.mediaType, ex.body)) htmlResponsesObserved += 1
             noteDiscoveryResponse(ex)
             return params.onExchange?.(ex)
           },
@@ -5254,7 +5504,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       } catch (err) {
         if (err instanceof BrokerCircuitOpen) {
           originHalted = true
-          stoppedReason = 'circuit_open'
+          if (!stoppedReason) stoppedReason = 'circuit_open'
         }
       }
     }
@@ -5308,6 +5558,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     // 2d. Bounded probe of discovered route candidates (links, route maps, JS-AST/OpenAPI paths).
     // Strictly within perOriginCap; template routes are probed later with concrete ids.
     const siblingSeen = new Set<string>()
+    const siblingPending = new Set<string>()
     const detailMethodsSeen = new Set<string>()
     for (const ep of readPaged('detail_methods')) {
       const template = ep.pathTemplate.split('?')[0] || '/'
@@ -5324,54 +5575,60 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       const segments = bare.split('/').filter(Boolean)
       if (segments.length === 0 || segments.length > 5) return 0
       const template = `${bare}/:id`
-      // Methods the target advertises for the object route (OPTIONS is a safe, read-only request).
-      let allowed = new Set<string>(['GET'])
-      if (sampleId && siblingOptionsProbes < 6 && originUsed < perOriginCap - 2 && !originHalted && !signal.aborted) {
-        siblingOptionsProbes += 1
-        try {
-          const optionsEx = await broker.executeHttp({
-            origin,
-            method: 'OPTIONS',
-            pathAndQuery: `${bare}/${encodeURIComponent(sampleId)}`,
-            ...(discoveryPersona ? { persona: discoveryPersona } : {}),
-            followRedirects: false,
-            timeoutMs: 6_000,
+      if (siblingSeen.has(template) || siblingPending.has(template)) return 0
+      siblingPending.add(template)
+      try {
+        // Methods the target advertises for the object route (OPTIONS is a safe, read-only request).
+        let allowed = new Set<string>(['GET'])
+        if (sampleId && siblingOptionsProbes < 6 && originUsed < perOriginCap - 2 && !originHalted && !signal.aborted) {
+          siblingOptionsProbes += 1
+          try {
+            const optionsEx = await broker.executeHttp({
+              origin,
+              method: 'OPTIONS',
+              pathAndQuery: `${bare}/${encodeURIComponent(sampleId)}`,
+              ...(discoveryPersona ? { persona: discoveryPersona } : {}),
+              followRedirects: false,
+              timeoutMs: Math.min(6_000, requestTimeoutMs),
+              runId,
+              assignmentId: params.assignmentId,
+            }, grant, signal)
+            originUsed += 1
+            requestsUsed += 1
+            params.onExchange?.(optionsEx)
+            const advertised = harvestAllowMethods(optionsEx.respHeaders)
+            if (advertised.length > 0) {
+              allowed = new Set(['GET', ...advertised])
+              methodHints += advertised.length
+            }
+          } catch { /* OPTIONS is optional; fall back to the safe GET sibling */ }
+        }
+        if (siblingSeen.has(template) || siblingSeen.size >= 8) return 0
+        siblingSeen.add(template)
+        let added = 0
+        for (const method of ['GET', 'PATCH', 'DELETE'] as const) {
+          if (!allowed.has(method)) continue
+          if (detailMethodsSeen.has(`${bare}|${method}`)) continue
+          const ep = recordEndpoint(method, template, 'surface_probe', { riskScore: scoreEndpointRisk(method, template) })
+          storage.upsertEndpointParam({
             runId,
-            assignmentId: params.assignmentId,
-          }, grant, signal)
-          originUsed += 1
-          requestsUsed += 1
-          params.onExchange?.(optionsEx)
-          const advertised = harvestAllowMethods(optionsEx.respHeaders)
-          if (advertised.length > 0) {
-            allowed = new Set(['GET', ...advertised])
-            methodHints += advertised.length
-          }
-        } catch { /* OPTIONS is optional; fall back to the safe GET sibling */ }
+            endpointId: ep.id,
+            name: 'id',
+            location: 'path',
+            isObjectId: true,
+            isCsrf: false,
+            source: 'phase0_sibling',
+          })
+          dynamicParams.add('id')
+          detailMethodsSeen.add(`${bare}|${method}`)
+          siblingEndpoints += 1
+          paramsDiscovered += 1
+          added += 1
+        }
+        return added
+      } finally {
+        siblingPending.delete(template)
       }
-      if (siblingSeen.has(template)) return 0
-      siblingSeen.add(template)
-      let added = 0
-      for (const method of ['GET', 'PATCH', 'DELETE'] as const) {
-        if (!allowed.has(method)) continue
-        if (detailMethodsSeen.has(`${bare}|${method}`)) continue
-        const ep = recordEndpoint(method, template, 'surface_probe', { riskScore: scoreEndpointRisk(method, template) })
-        storage.upsertEndpointParam({
-          runId,
-          endpointId: ep.id,
-          name: 'id',
-          location: 'path',
-          isObjectId: true,
-          isCsrf: false,
-          source: 'phase0_sibling',
-        })
-        dynamicParams.add('id')
-        detailMethodsSeen.add(`${bare}|${method}`)
-        siblingEndpoints += 1
-        paramsDiscovered += 1
-        added += 1
-      }
-      return added
     }
     /** A Location header that points below the requested path implies a created resource sibling. */
     const recordLocationSibling = async (requestPath: string, ex: BrokerExchangeResult): Promise<void> => {
@@ -5474,18 +5731,22 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     const navSeedPaths = new Set(navSeeds.slice(0, 96).map(seed => seed.path))
     const uniqueCandidates = [...new Set(discoveredCandidatePaths)]
     if (uniqueCandidates.length > 64) noteTruncation('discovered_candidate_probes', 64, uniqueCandidates.length, origin)
-    for (const candidate of uniqueCandidates.slice(0, 64)) {
-      if (originHalted || originUsed >= perOriginCap || signal.aborted) break
-      // Route-map/HTML candidates are also navigation seeds; let the navigation pass probe them so
-      // observed listing fields still seed sibling write endpoints.
-      if (navSeedPaths.has(candidate)) continue
-      await probeDiscovered(candidate)
-    }
-    for (const parent of parentProbes) {
-      if (originHalted || originUsed >= perOriginCap || signal.aborted) break
-      if (navSeedPaths.has(parent)) continue
-      await probeDiscovered(parent)
-    }
+    // Route-map/HTML candidates are also navigation seeds; let the navigation pass probe them so
+    // observed listing fields still seed sibling write endpoints.
+    const candidateTargets = uniqueCandidates.slice(0, 64).filter(candidate => !navSeedPaths.has(candidate))
+    await runBoundedPool(
+      candidateTargets,
+      PHASE0_INNER_CONCURRENCY,
+      async candidate => { await probeDiscovered(candidate) },
+      () => originHalted || originUsed >= perOriginCap || signal.aborted,
+    )
+    const parentTargets = parentProbes.filter(parent => !navSeedPaths.has(parent))
+    await runBoundedPool(
+      parentTargets,
+      PHASE0_INNER_CONCURRENCY,
+      async parent => { await probeDiscovered(parent) },
+      () => originHalted || originUsed >= perOriginCap || signal.aborted,
+    )
 
     // 2d-bis. Authenticated JSON navigation: follow HATEOAS links found in API responses and infer
     // collection->detail reads from ids observed in authenticated listings. Read-only, depth <= 2,
@@ -5525,7 +5786,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         attached += 1
       }
     }
-    for (let navIndex = 0; navIndex < navQueue.length && navigationRequests < navCap; navIndex += 1) {
+    for (let navIndex = 0; navIndex < navQueue.length && originNavigationRequests < navCap; navIndex += 1) {
       if (originHalted || originUsed >= navOriginCap || signal.aborted) break
       const item = navQueue[navIndex]
       if (!item) continue
@@ -5536,6 +5797,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       navVisited.add(clean)
       const ex = await safeGet(clean, { exceedCap: true })
       if (!ex) continue
+      originNavigationRequests += 1
       navigationRequests += 1
       if (softNotFoundResponse(ex)) { soft404Rejected += 1; continue }
       const isJson = /json/i.test(ex.mediaType) || /^\s*[{[]/.test(ex.body)
@@ -5743,55 +6005,70 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       }
     }
 
-    // 2e. Optional browser SPA crawl when caller supplies ScopedBrowser and budget remains
+    // 2e. Optional browser SPA crawl when caller supplies ScopedBrowser, origin served HTML, and
+    // budget remains. Bounded across live origins by `browserSemaphore` (`PHASE0_BROWSER_CONCURRENCY`)
+    // and skipped automatically on dead/525/JSON-only/static origins with 0 HTML pages.
     const remainingForCrawl = perOriginCap - originUsed
     if (params.browser && !originHalted && !signal.aborted && remainingForCrawl >= 2 && grant.canRead(origin)) {
-      emitPhase0Stage(
-        'crawl_state_graph',
-        `Crawling SPA state graph on ${origin} (${originIndex + 1}/${hostsTotal}).`,
-        { origin, hostsDone: originIndex, hostsTotal },
-      )
-      let browserExchanges = 0
-      const crawlRes = await crawlStateGraph({
-        storage,
-        runId,
-        scopeRevision,
-        origin,
-        personas: params.personas,
-        maxPages: Math.min(10, Math.max(1, Math.floor(remainingForCrawl / 2))),
-        maxDepth: 3,
-        budgetRemaining: remainingForCrawl,
-        browser: params.browser,
-        grant,
-        signal,
-        assignmentId: params.assignmentId,
-        ...(params.assetOrigins ? { assetOrigins: params.assetOrigins } : {}),
-        ...(params.interactiveTraversal !== undefined ? { interactiveTraversal: params.interactiveTraversal } : {}),
-        ...(params.readOnlyMode !== undefined ? { readOnlyMode: params.readOnlyMode } : {}),
-        onExchange: ex => {
-          browserExchanges += 1
-          originUsed += 1
-          requestsUsed += 1
-          noteDiscoveryResponse(ex)
-          return params.onExchange?.(ex)
-        },
-      })
-      endpointsDiscovered += crawlRes.endpointsDiscovered
-      paramsDiscovered += crawlRes.paramsDiscovered
-      routeMapEndpoints += crawlRes.routeMapEndpoints ?? 0
-      for (const [key, personas] of Object.entries(crawlRes.visibleToPersonas ?? {})) {
-        const set = phase0Visibility.get(key) ?? new Set<string>()
-        for (const handle of personas) set.add(handle)
-        phase0Visibility.set(key, set)
+      if (htmlResponsesObserved === 0) {
+        skippedBrowserNonHtml += 1
+      } else {
+        try {
+          await browserSemaphore.withPermit(async () => {
+            if (originHalted || signal.aborted || !grant.canRead(origin)) return
+            const crawlBudget = Math.max(0, perOriginCap - originUsed)
+            if (crawlBudget < 2) return
+            emitPhase0Stage(
+              'crawl_state_graph',
+              `Crawling SPA state graph on ${origin} (${originIndex + 1}/${hostsTotal}).`,
+              { origin, hostsDone, hostsTotal },
+            )
+            let browserExchanges = 0
+            const crawlRes = await crawlStateGraph({
+              storage,
+              runId,
+              scopeRevision,
+              origin,
+              personas: params.personas,
+              maxPages: Math.min(10, Math.max(1, Math.floor(crawlBudget / 2))),
+              maxDepth: 3,
+              budgetRemaining: crawlBudget,
+              browser: params.browser!,
+              grant,
+              signal,
+              assignmentId: params.assignmentId,
+              ...(params.assetOrigins ? { assetOrigins: params.assetOrigins } : {}),
+              ...(params.interactiveTraversal !== undefined ? { interactiveTraversal: params.interactiveTraversal } : {}),
+              ...(params.readOnlyMode !== undefined ? { readOnlyMode: params.readOnlyMode } : {}),
+              onExchange: ex => {
+                browserExchanges += 1
+                originUsed += 1
+                requestsUsed += 1
+                noteDiscoveryResponse(ex)
+                return params.onExchange?.(ex)
+              },
+            })
+            endpointsDiscovered += crawlRes.endpointsDiscovered
+            paramsDiscovered += crawlRes.paramsDiscovered
+            routeMapEndpoints += crawlRes.routeMapEndpoints ?? 0
+            for (const [key, personas] of Object.entries(crawlRes.visibleToPersonas ?? {})) {
+              const set = phase0Visibility.get(key) ?? new Set<string>()
+              for (const handle of personas) set.add(handle)
+              phase0Visibility.set(key, set)
+            }
+            for (const spaRoute of crawlRes.spaRoutes ?? []) {
+              mergeRuntimeSpaRoute(spaRoute)
+            }
+            // Browser traffic is accounted per accepted exchange above; page visits that produced no
+            // recorded exchange still consumed a broker call.
+            const unaccountedPages = Math.max(0, crawlRes.pagesVisited - browserExchanges)
+            originUsed += unaccountedPages
+            requestsUsed += unaccountedPages
+          }, signal)
+        } catch {
+          if (signal.aborted) stoppedReason = 'aborted'
+        }
       }
-      for (const spaRoute of crawlRes.spaRoutes ?? []) {
-        mergeRuntimeSpaRoute(spaRoute)
-      }
-      // Browser traffic is accounted per accepted exchange above; page visits that produced no
-      // recorded exchange still consumed a broker call.
-      const unaccountedPages = Math.max(0, crawlRes.pagesVisited - browserExchanges)
-      originUsed += unaccountedPages
-      requestsUsed += unaccountedPages
     }
     // 2f. Infer producer-consumer api_dependencies edges from discovered collection -> item endpoints
     try {
@@ -5971,11 +6248,6 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
 
     // 2g. Persona-union visibility: persist `visibleToPersonas` on discovered endpoints and surface
     // admin/privileged routes immediately instead of waiting for a later probe pass.
-    emitPhase0Stage(
-      'auth_privileged',
-      `Analyzing auth & privileged surface on ${origin} (${originIndex + 1}/${hostsTotal}).`,
-      { origin, hostsDone: originIndex + 1, hostsTotal },
-    )
     // One paged snapshot instead of a full-store read per visibility key.
     const endpointsByRouteKey = new Map<string, EndpointRow>()
     for (const ep of readPaged('persona_visibility')) {
@@ -6024,7 +6296,17 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     noteTruncation('js_request_params', MAX_JS_REQ_PARAMS_PER_CHUNK, jsReqParamsObserved, origin)
     noteTruncation('js_route_table', MAX_JS_ROUTE_TABLE_PER_CHUNK, jsRouteTableObserved, origin)
     noteTruncation('trpc_procedures', MAX_TRPC_PROCS_PER_CHUNK, trpcProcsObserved, origin)
-  }
+
+    hostsDone += 1
+    emitPhase0Stage(
+      'auth_privileged',
+      `Analyzing auth & privileged surface on ${origin} (${hostsDone}/${hostsTotal}).`,
+      { origin, hostsDone, hostsTotal, force: hostsDone === hostsTotal },
+    )
+  }, () => signal.aborted)
+
+  if (signal.aborted) stoppedReason = 'aborted'
+  readPagedMetrics.sort((a, b) => a.origin.localeCompare(b.origin) || a.phase.localeCompare(b.phase))
 
   // Paged-read accounting: every phase reads to completion, so `truncated` is always false. A
   // non-zero `used` shortfall is a planning filter, never a dropped page.
@@ -6184,6 +6466,8 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     soft404Rejected,
     stoppedReason,
     readPaged: readPagedMetrics,
+    ...(skippedDeadHosts.length > 0 ? { skippedDeadHosts } : {}),
+    ...(skippedBrowserNonHtml > 0 ? { skippedBrowserNonHtml } : {}),
     ...(truncations.length > 0 ? { truncations } : {}),
   })
   storage.updateRunPhase0Completed(runId, Date.now())
@@ -6221,6 +6505,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     ...(runtimeSpaRoutes.length > 0 ? { runtimeSpaRoutes } : {}),
     ...(runtimeGraphqlCatalogs.length > 0 ? { runtimeGraphqlCatalogs } : {}),
     ...(runtimeOpenApiOperations.length > 0 ? { runtimeOpenApiOperations } : {}),
+    ...(skippedDeadHosts.length > 0 ? { skippedDeadHosts } : {}),
     ...(truncations.length > 0 ? { truncations } : {}),
   }
 }
