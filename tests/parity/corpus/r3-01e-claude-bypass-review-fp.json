@@ -1,0 +1,79 @@
+{
+  "id": "r3-01e-claude-bypass-review-fp",
+  "side": "fp",
+  "archetype": "auth-bypass-header-drifted-5xx",
+  "source": "independent_review",
+  "description": "Independent review FP: CWE-287 middleware auth-bypass check where the unauthenticated control is denied with HTTP 401 but the forged middleware-header probe hits a drifted/unhealthy upstream and returns HTTP 503. The boundary gate is unsatisfied, yet buildReplayReceipt now builds the auth_bypass receipt. Nothing may confirm, and retest must not treat the 5xx probe as a clean fix (no fixed verdict from a drifted probe).",
+  "covers": {
+    "files": [
+      "src/server/proof-receipt.ts",
+      "src/server/floor-recipe-engine.ts"
+    ],
+    "classes": [
+      "auth_bypass"
+    ]
+  },
+  "canonicalLabel": {
+    "cwe": "CWE-287",
+    "category": "auth-bypass",
+    "title": "Middleware authentication bypass probe met a drifted upstream (HTTP 503)",
+    "impact": "Bare request is denied with 401; the header-spoofed probe returns a 503 from an unhealthy upstream, which is neither a bypass nor a verified fix.",
+    "claimedImpact": "other",
+    "claimedBoundary": "auth",
+    "vulnClass": "auth_bypass"
+  },
+  "freeTextLabel": {
+    "title": "Header-spoofed middleware auth probe returns 503 from drifted upstream"
+  },
+  "paths": {
+    "replay": true,
+    "floorReceipt": true,
+    "evaluateClaims": true,
+    "composite": false,
+    "floorInjectionRecipe": false,
+    "proofReceipt": true
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [],
+  "exchanges": [
+    {
+      "id": "ctl",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/admin/audit-log",
+      "persona": null,
+      "status": 401,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"error\":\"authentication_required\"}"
+    },
+    {
+      "id": "prb",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/admin/audit-log",
+      "persona": null,
+      "requestHeaders": { "x-middleware-subrequest": "middleware:middleware:middleware:middleware:middleware" },
+      "status": 503,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"error\":\"upstream_unavailable\"}"
+    }
+  ],
+  "replaySpec": {
+    "assertionsJq": "{ controlPassed: (.steps.ctl.status == 401), confirmed: (.steps.ctl.status == 401 and .steps.prb.status == 200), observed: (\"control=\" + (.steps.ctl.status | tostring) + \", probe=\" + (.steps.prb.status | tostring)), expected: \"401\" }"
+  },
+  "proofReceipt": {
+    "vulnClass": "auth_bypass",
+    "targetMethod": "GET",
+    "targetPathAndQuery": "/api/admin/audit-log",
+    "claimedDelta": "Probe returned 503 from a drifted upstream while control returned 401; no 2xx bypass exists, so this must never confirm and must not be reported as fixed."
+  },
+  "claims": [
+    { "kind": "boundary", "boundaryClass": "auth", "controlExchangeId": "ctl", "probeExchangeId": "prb" }
+  ]
+}

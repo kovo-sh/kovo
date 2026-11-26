@@ -80,6 +80,8 @@ export interface RetestProbeArmsInput {
   missingProbeReason?: string
   allowRedirect?: boolean
   requireDefinitiveDenial?: boolean
+  /** True for auth-boundary / CWE-287 retests where HTTP 404 indicates route drift rather than auth enforcement. */
+  disallowNotFoundDenial?: boolean
   deterministicProofPassed?: boolean
   proofFailureReason?: string | null
 }
@@ -321,10 +323,11 @@ export function assessRetestHealth(
     }
   }
   if (probeArms.requireDefinitiveDenial) {
+    const allow404 = !probeArms.disallowNotFoundDenial
     for (const step of probeArms.arms) {
       const definitivelyDenied = step.authenticated
-        ? (step.status === 403 || step.status === 404)
-        : (step.status === 401 || step.status === 403 || step.status === 404)
+        ? (step.status === 403 || (allow404 && step.status === 404))
+        : (step.status === 401 || step.status === 403 || (allow404 && step.status === 404))
       if (!definitivelyDenied) {
         return {
           healthy: false,
@@ -521,6 +524,7 @@ export function classifyRetestHealth(execution: FloorRecipeExecution): RetestHea
 }
 
 const ACCESS_READ_CLASS_RE = /\b(?:bola|idor|bfla|authz|authorization|access|disclosure|cross[_-]?tenant[_-]?read)\b/i
+const AUTH_BOUNDARY_CLASS_RE = /\b(?:auth[_-]?bypass|cwe-287|cwe-306)\b/i
 
 function isReadOnlyMethod(method: string | undefined): boolean {
   const m = (method ?? 'GET').toUpperCase()
@@ -601,7 +605,10 @@ export function assessDeclarativeRetestHealth(
     else if (role === 'probe') probeArmsList.push(arm)
   }
 
+  const boundaryGate = replay.evidencePayload.boundaryGate as { required?: boolean; boundaryClass?: string } | undefined
   const labelText = [specRec.category, specRec.cwe, specRec.title].filter(x => typeof x === 'string').join(' ')
+  const isAuthBoundary = (boundaryGate?.required === true && boundaryGate.boundaryClass === 'auth')
+    || AUTH_BOUNDARY_CLASS_RE.test(labelText)
   const isAccessRead = ACCESS_READ_CLASS_RE.test(labelText)
     && probeArmsList.length > 0
     && probeArmsList.every(arm => isReadOnlyMethod(arm.method))
@@ -620,7 +627,8 @@ export function assessDeclarativeRetestHealth(
       requireProbeArm: specKind === 'http_chain' || probeArmsList.length > 0,
       missingProbeReason: 'Declarative retest executed no probe arm.',
       allowRedirect: /redirect/i.test(labelText),
-      requireDefinitiveDenial: isAccessRead,
+      requireDefinitiveDenial: isAccessRead || (isAuthBoundary && probeArmsList.length > 0),
+      disallowNotFoundDenial: isAuthBoundary,
       ...(opts?.deterministicProofPassed !== undefined ? { deterministicProofPassed: opts.deterministicProofPassed } : {}),
       ...(opts?.proofFailureReason !== undefined ? { proofFailureReason: opts.proofFailureReason } : {}),
     },
@@ -687,6 +695,7 @@ export function buildAgentScriptRetestInputs(input: {
     && !sessionDrifted
     && input.verdictReason !== 'claim_not_reproduced'
 
+  const isAuthBoundary = Boolean(input.vulnClass && AUTH_BOUNDARY_CLASS_RE.test(input.vulnClass))
   const isAccessRead = Boolean(input.vulnClass && ACCESS_READ_CLASS_RE.test(input.vulnClass))
     && probeArmsList.length > 0
     && probeArmsList.every(arm => isReadOnlyMethod(arm.method))
@@ -703,7 +712,8 @@ export function buildAgentScriptRetestInputs(input: {
       requireProbeArm: true,
       missingProbeReason: 'Agent-script retest executed no probe arm.',
       allowRedirect: Boolean(input.vulnClass && /redirect/i.test(input.vulnClass)),
-      requireDefinitiveDenial: isAccessRead,
+      requireDefinitiveDenial: isAccessRead || (isAuthBoundary && probeArmsList.length > 0),
+      disallowNotFoundDenial: isAuthBoundary,
     },
     session: {
       confirmed: input.confirmed,
