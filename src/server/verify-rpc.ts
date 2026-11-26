@@ -30,7 +30,7 @@ import { join, resolve } from 'node:path'
 import { BrokerApprovalRequired, BrokerDenied } from './broker.ts'
 import type { BrokerExchangeResult, BrokerHttpRequest, Grant, RequestBroker, WireCredentialProvenance } from './broker.ts'
 import { EgressDeniedError } from './egress-gateway.ts'
-import { buildPersonaHeader, personaSecrets } from './persona-vault.ts'
+import { buildPersonaHeader, buildPersonaSecretNeedles } from './persona-vault.ts'
 import type { ResolvedPersona } from './persona-vault.ts'
 import { redact, type NamedSecret } from './redact.ts'
 import {
@@ -353,11 +353,9 @@ export class VerifyRpcServer {
     const getKernelSecrets = (): NamedSecret[] => {
       const out: NamedSecret[] = []
       if (this.options.grant.personas) {
-        for (const persona of this.options.grant.personas.values()) {
-          const vals = [persona.secret, persona.session?.value, ...(persona.secretHistory ?? []), ...(persona.session?.scrubTokens ?? [])]
-          for (const v of vals) if (typeof v === 'string' && v.length >= 4) out.push({ value: v, placeholder: `[redacted:${persona.handle}]` })
-        }
-        out.push(...personaSecrets(this.options.grant.personas))
+        out.push(...buildPersonaSecretNeedles(this.options.grant.personas, {
+          placeholderFor: persona => `[redacted:${persona.handle}]`,
+        }))
       }
       if (this.options.grant.secrets) out.push(...this.options.grant.secrets)
       if (typeof this.options.broker.getRegisteredSecrets === 'function') out.push(...this.options.broker.getRegisteredSecrets())
