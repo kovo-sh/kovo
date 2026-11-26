@@ -19,6 +19,11 @@ import {
 import type { SecretSource } from './provider-stream.ts'
 import { redact } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
+import {
+  recordProviderUsageTelemetry,
+  type ProviderUsageTelemetryInput,
+  type ProviderUsageTelemetryOutcome,
+} from './token-telemetry.ts'
 
 export type { SecretSource }
 
@@ -356,11 +361,14 @@ export type UsageEvent = {
   inputTokens: number
   cachedInputTokens?: number
   outputTokens: number
+  reasoningTokens?: number
   costUsd: number
   profileId?: string
 }
 
 export type UsageCallback = (usage: UsageEvent) => void
+
+export type TelemetryCallback = (event: ProviderUsageTelemetryInput) => void
 
 export class QuotaExhaustedError extends Error {
   readonly status = 402
@@ -408,6 +416,10 @@ export type ProviderOptions = {
   roleAffinity?: RoleAffinity
   beforeCall?: () => void
   onUsage?: UsageCallback
+  /** Optional run ID for structured per-run token, cost, cache, stall, and truncation telemetry. */
+  runId?: string
+  /** Optional direct telemetry sink for provider usage, retry, stall, and truncation events. */
+  onTelemetry?: TelemetryCallback
   /** Called in real time on each upstream SSE data frame (resets no-token stall watchdogs). */
   onStreamActivity?: () => void
   onProfileSuccess?: (profileId: string) => void
@@ -447,6 +459,7 @@ class SseUsageAccumulator {
   private cachedInputTokens = 0
   private outputTokens = 0
   private anthropicCacheRead = 0
+  private reasoningTokens = 0
 
   feedData(data: Record<string, unknown> | '[DONE]' | undefined): void {
     if (!data || data === '[DONE]') return
@@ -459,12 +472,22 @@ class SseUsageAccumulator {
     const out = Number(usage.output_tokens ?? usage.completion_tokens ?? 0)
     const inputDetails = usage.input_tokens_details as Record<string, unknown> | undefined
     const promptDetails = usage.prompt_tokens_details as Record<string, unknown> | undefined
+    const outputDetails = usage.output_tokens_details as Record<string, unknown> | undefined
+    const completionDetails = usage.completion_tokens_details as Record<string, unknown> | undefined
     const openaiCached = Number(inputDetails?.cached_tokens ?? promptDetails?.cached_tokens ?? 0)
     const msgCached = Number(usage.cache_read_input_tokens ?? 0)
+    const reasoning = Number(
+      outputDetails?.reasoning_tokens
+      ?? completionDetails?.reasoning_tokens
+      ?? usage.reasoning_tokens
+      ?? usage.thinking_tokens
+      ?? 0,
+    )
     if (Number.isFinite(inp) && inp > this.rawInputTokens) this.rawInputTokens = inp
     if (Number.isFinite(out) && out > this.outputTokens) this.outputTokens = out
     if (Number.isFinite(openaiCached) && openaiCached > this.cachedInputTokens) this.cachedInputTokens = openaiCached
     if (Number.isFinite(msgCached) && msgCached > this.anthropicCacheRead) this.anthropicCacheRead = msgCached
+    if (Number.isFinite(reasoning) && reasoning > this.reasoningTokens) this.reasoningTokens = reasoning
   }
 
   feedSseText(sseText: string): void {
@@ -477,6 +500,10 @@ class SseUsageAccumulator {
         // Ignore unparseable frames.
       }
     }
+  }
+
+  reasoningSnapshot(): number {
+    return this.reasoningTokens
   }
 
   snapshot(protocol: 'responses' | 'messages' = 'responses'): {
@@ -601,6 +628,35 @@ interface MakeFetchInternalOptions {
   retryTransientInFetch?: boolean
   /** Optional per-call tracker that captures raw tool-call JSON parse errors before stream redaction. */
   argTracker?: SseToolCallArgTracker
+  /** Optional per-attempt marker set when `makeFetch` emits telemetry for this HTTP attempt. */
+  attemptTelemetryState?: { recorded: boolean }
+}
+
+const STALL_ERROR_RE = /stall|timed?\s*out|no token/i
+
+function isStallAbortReason(reason: unknown): boolean {
+  if (reason instanceof Error) return STALL_ERROR_RE.test(reason.message)
+  return typeof reason === 'string' && STALL_ERROR_RE.test(reason)
+}
+
+function createTelemetryEmitter(options: Pick<ProviderOptions, 'runId' | 'onTelemetry'>) {
+  const normalizedRunId = typeof options.runId === 'string' ? options.runId.trim() : ''
+  const hasRunId = normalizedRunId.length > 0
+  const onTelemetry = options.onTelemetry
+  if (!hasRunId && !onTelemetry) return undefined
+  const effectiveRunId = hasRunId ? normalizedRunId : '__unscoped__'
+  return (event: Omit<ProviderUsageTelemetryInput, 'runId'>) => {
+    const payload: ProviderUsageTelemetryInput = {
+      runId: effectiveRunId,
+      ...event,
+    }
+    if (hasRunId) {
+      try { recordProviderUsageTelemetry(payload) } catch { /* telemetry must never throw */ }
+    }
+    if (onTelemetry) {
+      try { onTelemetry(payload) } catch { /* telemetry observer must never throw */ }
+    }
+  }
 }
 
 function isTransientHttpStatus(status: number): boolean {
@@ -617,6 +673,7 @@ function makeFetch(
 ) {
   const chargeLogicalTurn = internal.chargeLogicalTurn ?? true
   const retryTransientInFetch = internal.retryTransientInFetch ?? false
+  const emitTelemetry = createTelemetryEmitter(options)
   const endpoint = settings.protocol === 'responses'
     ? settings.endpoint + '/responses'
     : settings.endpoint.replace(/\/v1$/, '') + '/v1/messages'
@@ -685,6 +742,7 @@ function makeFetch(
     let transportRetry = 0
     for (;;) {
       internal.argTracker?.reset()
+      if (internal.attemptTelemetryState) internal.attemptTelemetryState.recorded = false
       const totalSignal = AbortSignal.any([
         request.signal,
         AbortSignal.timeout(totalTimeoutMs),
@@ -772,11 +830,19 @@ function makeFetch(
           const effectiveStatus = response.status === 429 && isQuotaBody(errText) ? 402 : response.status
           if (retryTransientInFetch && isTransientHttpStatus(effectiveStatus) && transportRetry < maxTransportRetries) {
             transportRetry += 1
+            if (emitTelemetry) {
+              emitTelemetry({ outcome: 'retried', retried: true, costUsd: 0 })
+              if (internal.attemptTelemetryState) internal.attemptTelemetryState.recorded = true
+            }
             const waitMs = Math.min(4_000, retryBaseMs * (2 ** (transportRetry - 1)))
             if (waitMs > 0) {
               await delay(waitMs, undefined, { signal: totalSignal })
             }
             continue
+          }
+          if (emitTelemetry && retryTransientInFetch) {
+            emitTelemetry({ outcome: 'error', costUsd: 0 })
+            if (internal.attemptTelemetryState) internal.attemptTelemetryState.recorded = true
           }
           const message = effectiveStatus === 401 || effectiveStatus === 403
             ? 'The provider rejected the API key.'
@@ -808,6 +874,9 @@ function makeFetch(
         let idleTimer: ReturnType<typeof setTimeout> | undefined
         let finalized = false
         let errored = false
+        let stalled = false
+        let streamAborted = false
+        let sawErrorFrame = false
         let transformController: TransformStreamDefaultController<Uint8Array> | undefined
 
         const clearIdleTimer = () => {
@@ -830,16 +899,50 @@ function makeFetch(
               try { recordResponse?.(recordedParts.join('')) } catch { /* recording must never throw */ }
             }
           }
-          if (options.onUsage) {
+          if (options.onUsage || emitTelemetry) {
             const usage = usageAccumulator.snapshot(settings.protocol)
-            if (usage.inputTokens > 0 || usage.outputTokens > 0) {
+            const reasoningTokens = usageAccumulator.reasoningSnapshot()
+            const hasUsage = usage.inputTokens > 0 || usage.outputTokens > 0
+            const costUsd = hasUsage || reasoningTokens > 0
+              ? estimateCostUsd(settings, usage.inputTokens, usage.outputTokens, usage.cachedInputTokens)
+              : 0
+            if (options.onUsage && hasUsage) {
               try {
                 options.onUsage({
                   ...usage,
-                  costUsd: estimateCostUsd(settings, usage.inputTokens, usage.outputTokens, usage.cachedInputTokens),
+                  ...(reasoningTokens > 0 ? { reasoningTokens } : {}),
+                  costUsd,
                   profileId,
                 })
               } catch { /* usage observer must never throw */ }
+            }
+            if (emitTelemetry) {
+              const truncatedToolCalls = internal.argTracker ? internal.argTracker.allDiagnostics().length : 0
+              const isStalled = stalled
+              const isAborted = !isStalled && streamAborted
+              const isErrored = errored || (sawErrorFrame && retryTransientInFetch)
+              if (hasUsage || reasoningTokens > 0 || isStalled || truncatedToolCalls > 0 || isAborted || isErrored) {
+                const outcome: ProviderUsageTelemetryOutcome = isStalled
+                  ? 'stalled'
+                  : truncatedToolCalls > 0
+                    ? 'truncated'
+                    : isAborted
+                      ? 'aborted'
+                      : isErrored
+                        ? 'error'
+                        : 'ok'
+                emitTelemetry({
+                  inputTokens: usage.inputTokens,
+                  cachedInputTokens: usage.cachedInputTokens,
+                  outputTokens: usage.outputTokens,
+                  reasoningTokens,
+                  costUsd,
+                  outcome,
+                  stalled: isStalled,
+                  truncatedToolCalls,
+                })
+                if (internal.attemptTelemetryState) internal.attemptTelemetryState.recorded = true
+              }
             }
           }
         }
@@ -857,6 +960,7 @@ function makeFetch(
           idleTimer = setTimeout(() => {
             idleTimer = undefined
             const err = new Error('The model stream timed out while waiting for data.')
+            stalled = true
             failStream(err)
             if (!streamAbortController.signal.aborted) {
               streamAbortController.abort(err)
@@ -865,12 +969,20 @@ function makeFetch(
           idleTimer.unref?.()
         }
 
-        onFirstEventTimeout = err => failStream(err)
+        onFirstEventTimeout = err => {
+          stalled = true
+          failStream(err)
+        }
         onTotalAbortHook = () => {
           const reason = totalSignal.reason
           const err = reason instanceof Error
             ? reason
             : new Error(typeof reason === 'string' && reason ? reason : 'The model stream was aborted.')
+          if (isStallAbortReason(reason ?? err)) {
+            stalled = true
+          } else {
+            streamAborted = true
+          }
           failStream(err)
         }
 
@@ -884,6 +996,10 @@ function makeFetch(
           onFrame: data => {
             usageAccumulator.feedData(data)
             internal.argTracker?.feedData(data)
+            if (emitTelemetry && data && data !== '[DONE]') {
+              const t = data.type
+              if (t === 'error' || t === 'response.failed') sawErrorFrame = true
+            }
           },
           onActivity: () => {
             clearFirstEventTimer()
@@ -900,6 +1016,7 @@ function makeFetch(
               return
             }
             if (firstEventController.signal.aborted) {
+              stalled = true
               failStream(firstEventTimeoutError())
               return
             }
@@ -917,6 +1034,7 @@ function makeFetch(
             finalize()
           },
           cancel() {
+            streamAborted = true
             finalize()
             if (!streamAbortController.signal.aborted) {
               streamAbortController.abort(new Error('The model stream consumer canceled.'))
@@ -927,7 +1045,7 @@ function makeFetch(
 
         handoffToStream = true
         void sanitized.pipeTo(monitor.writable)
-          .catch(() => undefined)
+          .catch(() => { errored = true })
           .finally(() => finalize())
 
         return new Response(monitor.readable, {
@@ -936,9 +1054,26 @@ function makeFetch(
         })
       } catch (error) {
         if (firstEventController.signal.aborted && !totalSignal.aborted) {
+          if (emitTelemetry) {
+            emitTelemetry({ outcome: 'stalled', stalled: true, costUsd: 0 })
+            if (internal.attemptTelemetryState) internal.attemptTelemetryState.recorded = true
+          }
           throw firstEventController.signal.reason instanceof Error
             ? firstEventController.signal.reason
             : firstEventTimeoutError()
+        }
+        if (emitTelemetry) {
+          const isStall = isStallAbortReason(totalSignal.aborted ? totalSignal.reason : error)
+          if (isStall) {
+            emitTelemetry({ outcome: 'stalled', stalled: true, costUsd: 0 })
+            if (internal.attemptTelemetryState) internal.attemptTelemetryState.recorded = true
+          } else if (totalSignal.aborted) {
+            emitTelemetry({ outcome: 'aborted', costUsd: 0 })
+            if (internal.attemptTelemetryState) internal.attemptTelemetryState.recorded = true
+          } else if (retryTransientInFetch) {
+            emitTelemetry({ outcome: 'error', costUsd: 0 })
+            if (internal.attemptTelemetryState) internal.attemptTelemetryState.recorded = true
+          }
         }
         throw error
       } finally {
@@ -1266,9 +1401,28 @@ export function providerPool(
     retryTransientInFetch: false,
   })
   const tokenEstimator = createTranscriptTokenEstimator()
+  const emitTelemetry = createTelemetryEmitter(poolOptions)
   const retryBaseMs = options.transportRetryBaseMs !== undefined && Number.isFinite(options.transportRetryBaseMs)
     ? Math.max(0, Math.floor(options.transportRetryBaseMs))
     : defaultTransportRetryBaseMs
+
+  const recordPoolAttemptFailure = (
+    attemptState: { recorded: boolean } | undefined,
+    willRetryOrFailover: boolean,
+  ) => {
+    if (!emitTelemetry) return
+    if (willRetryOrFailover) {
+      emitTelemetry({
+        outcome: 'retried',
+        retried: true,
+        costUsd: 0,
+        countCall: !(attemptState?.recorded),
+      })
+    } else if (!attemptState?.recorded) {
+      emitTelemetry({ outcome: 'error', costUsd: 0 })
+    }
+    if (attemptState) attemptState.recorded = true
+  }
 
   const wrapMethod = (method: 'stream' | 'streamSimple'): ProviderStreams['stream'] => {
     return (_selected, transcript, sOpts) => {
@@ -1297,9 +1451,11 @@ export function providerPool(
 
           let attempt = 0
           for (;;) {
+            const attemptTelemetryState = emitTelemetry ? { recorded: false } : undefined
             const built = buildSingleStreamImpl(candidate, scenario, poolOptions, callCounter, candidate.id, {
               chargeLogicalTurn: false,
               retryTransientInFetch: false,
+              ...(attemptTelemetryState ? { attemptTelemetryState } : {}),
             })
             const candidateOpts = { ...sOpts, apiKey: candidate.key }
             const stream = built.implementation[method](built.model, transcript, candidateOpts)
@@ -1321,6 +1477,7 @@ export function providerPool(
                       attempt++
                       retrySame = true
                     }
+                    recordPoolAttemptFailure(attemptTelemetryState, retrySame || idx + 1 < ordered.length)
                     break
                   }
                 }
@@ -1342,7 +1499,9 @@ export function providerPool(
                 if (decision.failover) {
                   options.onProfileFailure?.(candidate.id, msg, decision.hard)
                   lastError = new Error(msg)
-                  if (!decision.hard && idx === ordered.length - 1 && transientAttempts < maxTransportRetries) {
+                  const willRetrySame = !decision.hard && idx === ordered.length - 1 && transientAttempts < maxTransportRetries
+                  recordPoolAttemptFailure(attemptTelemetryState, willRetrySame || idx + 1 < ordered.length)
+                  if (willRetrySame) {
                     transientAttempts++
                     attempt++
                     const waitMs = Math.min(4_000, retryBaseMs * 2 ** (attempt - 1))
@@ -1352,16 +1511,25 @@ export function providerPool(
                   break
                 }
               }
-              if (res.stopReason !== 'error') options.onProfileSuccess?.(candidate.id)
+              if (res.stopReason === 'error') {
+                recordPoolAttemptFailure(attemptTelemetryState, false)
+              } else {
+                options.onProfileSuccess?.(candidate.id)
+              }
               return res
             } catch (error) {
               if (emitted) throw error
               const msg = error instanceof Error ? error.message : String(error)
               const decision = classifyFailoverError(msg)
-              if (!decision.failover) throw error
+              if (!decision.failover) {
+                recordPoolAttemptFailure(attemptTelemetryState, false)
+                throw error
+              }
               options.onProfileFailure?.(candidate.id, msg, decision.hard)
               lastError = error
-              if (!decision.hard && idx === ordered.length - 1 && transientAttempts < maxTransportRetries) {
+              const willRetrySame = !decision.hard && idx === ordered.length - 1 && transientAttempts < maxTransportRetries
+              recordPoolAttemptFailure(attemptTelemetryState, willRetrySame || idx + 1 < ordered.length)
+              if (willRetrySame) {
                 transientAttempts++
                 attempt++
                 const waitMs = Math.min(4_000, retryBaseMs * 2 ** (attempt - 1))
