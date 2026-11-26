@@ -1,5 +1,7 @@
 // Status and severity glyphs. Shape always doubles colour (colour-blind safe).
 import type { ReactNode } from 'react'
+import { assertNever } from '../../server/run-status.ts'
+import { getStepStatusMeta, STEP_STATUS, type ChainStepStatus } from '../../step-status.ts'
 import { RISKL, SEV_COL } from './meta.ts'
 import type { CoverageStatus, RiskTier } from './meta.ts'
 import { cn, covTileClass } from './tw.ts'
@@ -23,54 +25,94 @@ export function SevGlyph({ sev }: { sev: string | null | undefined }) {
   </svg>
 }
 
-function Ring({ stroke, dash, children }: { stroke: string; dash?: boolean; children?: ReactNode }) {
-  return <svg className="block flex-none" viewBox="0 0 14 14" width="14" height="14" aria-hidden="true">
+function Ring({ stroke, dash, glyph, children }: { stroke: string; dash?: boolean; glyph?: string; children?: ReactNode }) {
+  return <svg className="block flex-none" viewBox="0 0 14 14" width="14" height="14" aria-hidden="true" data-status-glyph={glyph}>
     <circle cx="7" cy="7" r="5.75" fill="none" stroke={stroke} strokeWidth="1.4" strokeDasharray={dash ? '2.1 1.9' : undefined} />
     {children}
   </svg>
 }
 
+function Solid({ fill, glyph, children }: { fill: string; glyph?: string; children: ReactNode }) {
+  return <svg className="block flex-none" viewBox="0 0 14 14" width="14" height="14" aria-hidden="true" data-status-glyph={glyph}>
+    <circle cx="7" cy="7" r="6.5" fill={fill} />
+    {children}
+  </svg>
+}
+
+const SLASH = <path d="M4.9 9.1l4.2-4.2" stroke="var(--fg-3)" strokeWidth="1.4" strokeLinecap="round" />
+const CHECK = <path d="M4.4 7.2 6.2 9 9.7 5.3" fill="none" stroke="var(--panel)" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+const CROSS = <path d="M5 5l4 4M9 5 5 9" stroke="#fff" strokeWidth="1.5" strokeLinecap="round" />
+
+/**
+ * Exhaustive renderer for every `ChainStepStatus` driven by `STEP_STATUS[status].glyph`.
+ * Adding a new status to `STEP_STATUS` forces a compile-time & `check-exhaustive` update here.
+ */
+function renderStepStatusGlyph(status: ChainStepStatus): ReactNode {
+  const glyph = STEP_STATUS[status].glyph
+  switch (status) {
+    case 'pending':
+    case 'ready':
+      return <Ring stroke="var(--fg-2)" glyph={glyph}><path d="M7 3.5A3.5 3.5 0 0 1 7 10.5Z" fill="var(--fg-2)" /></Ring>
+    case 'running':
+      return <Ring stroke="var(--accent)" glyph={glyph}><path d="M7 3.5A3.5 3.5 0 0 1 10.5 7H7Z" fill="var(--accent)" /></Ring>
+    case 'complete':
+      return <Solid fill="var(--fg-4)" glyph={glyph}>{CHECK}</Solid>
+    case 'canceled':
+      return <Ring stroke="var(--fg-4)" glyph={glyph}>{SLASH}</Ring>
+    case 'blocked':
+    case 'tainted':
+      return <Solid fill="var(--bad)" glyph={glyph}>{CROSS}</Solid>
+    case 'infra_failed':
+      return <Solid fill="var(--bad)" glyph={glyph}><path d="M7.6 3.5 4.8 7.3h2.1L6.4 10.5 9.2 6.7H7.1l.5-3.2Z" fill="#fff" /></Solid>
+    case 'model_failure':
+      return <Solid fill="var(--bad)" glyph={glyph}><path d="M7 4v3.4M7 9.6v.01" stroke="#fff" strokeWidth="1.6" strokeLinecap="round" /></Solid>
+    case 'turn_capped':
+      return <Ring stroke="var(--warn)" glyph={glyph}><path d="M4.5 5h5M7 5v4.5" stroke="var(--warn)" strokeWidth="1.45" strokeLinecap="round" /></Ring>
+    case 'nudged_out':
+      return <Ring stroke="var(--warn)" dash glyph={glyph}><path d="M5.25 4.8 8.5 7 5.25 9.2" fill="none" stroke="var(--warn)" strokeWidth="1.45" strokeLinecap="round" strokeLinejoin="round" /></Ring>
+    case 'rotated_partial':
+      return <Ring stroke="var(--warn)" dash glyph={glyph}><path d="M7 3.8A3.2 3.2 0 1 1 3.8 7" fill="none" stroke="var(--warn)" strokeWidth="1.45" strokeLinecap="round" /></Ring>
+    default:
+      return assertNever(status, 'Unhandled ChainStepStatus glyph')
+  }
+}
+
 /**
  * Status glyph for findings, workers, runs, steps, coverage and approvals.
- * "confirmed" is a quiet outlined check: accent colour means selection/focus only.
+ * Step statuses derive exhaustively from `STEP_STATUS`; "confirmed" is a quiet outlined check.
  */
 export function StatusGlyph({ status }: { status: string | null | undefined }) {
+  const stepMeta = getStepStatusMeta(status)
+  if (stepMeta) {
+    return renderStepStatusGlyph(status as ChainStepStatus)
+  }
   switch (status) {
     case 'confirmed': case 'verified': case 'approved':
-      return <Ring stroke="var(--fg-3)"><path d="M4.6 7.1 6.3 8.8 9.5 5.4" fill="none" stroke="var(--fg-2)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" /></Ring>
+      return <Ring stroke="var(--fg-3)" glyph={status}><path d="M4.6 7.1 6.3 8.8 9.5 5.4" fill="none" stroke="var(--fg-2)" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" /></Ring>
     case 'static_verified':
-      return <Ring stroke="var(--fg-3)" dash><path d="M5.4 5.2 3.8 7l1.6 1.8M8.6 5.2 10.2 7 8.6 8.8" fill="none" stroke="var(--fg-2)" strokeWidth="1.35" strokeLinecap="round" strokeLinejoin="round" /></Ring>
+      return <Ring stroke="var(--fg-3)" dash glyph={status}><path d="M5.4 5.2 3.8 7l1.6 1.8M8.6 5.2 10.2 7 8.6 8.8" fill="none" stroke="var(--fg-2)" strokeWidth="1.35" strokeLinecap="round" strokeLinejoin="round" /></Ring>
     case 'reported':
-      return <Ring stroke="var(--fg-3)"><path d="M7 4.25 9.75 7 7 9.75 4.25 7Z" fill="var(--fg-2)" /></Ring>
-    case 'complete': case 'no_issue_found':
-      return <svg className="block flex-none" viewBox="0 0 14 14" width="14" height="14" aria-hidden="true">
-        <circle cx="7" cy="7" r="6.5" fill="var(--fg-4)" />
-        <path d="M4.4 7.2 6.2 9 9.7 5.3" fill="none" stroke="var(--panel)" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
-      </svg>
-    case 'pending': case 'proposed': case 'ready': case 'queued': case 'needs_follow_up': {
+      return <Ring stroke="var(--fg-3)" glyph={status}><path d="M7 4.25 9.75 7 7 9.75 4.25 7Z" fill="var(--fg-2)" /></Ring>
+    case 'no_issue_found':
+      return <Solid fill="var(--fg-4)" glyph={status}>{CHECK}</Solid>
+    case 'proposed': case 'queued': case 'needs_follow_up': {
       const c = status === 'needs_follow_up' ? 'var(--warn)' : 'var(--fg-2)'
-      return <Ring stroke={c}><path d="M7 3.5A3.5 3.5 0 0 1 7 10.5Z" fill={c} /></Ring>
+      return <Ring stroke={c} glyph={status}><path d="M7 3.5A3.5 3.5 0 0 1 7 10.5Z" fill={c} /></Ring>
     }
-    case 'running': case 'active':
-      return <Ring stroke="var(--accent)"><path d="M7 3.5A3.5 3.5 0 0 1 10.5 7H7Z" fill="var(--accent)" /></Ring>
+    case 'active':
+      return <Ring stroke="var(--accent)" glyph={status}><path d="M7 3.5A3.5 3.5 0 0 1 10.5 7H7Z" fill="var(--accent)" /></Ring>
     case 'inconclusive':
-      return <Ring stroke="var(--fg-3)" dash><path d="M7 7h.01" stroke="var(--fg-3)" strokeWidth="2" strokeLinecap="round" /></Ring>
-    case 'dismissed': case 'canceled': case 'ruled_out': case 'stopped': case 'expired':
-      return <svg className="block flex-none" viewBox="0 0 14 14" width="14" height="14" aria-hidden="true">
-        <circle cx="7" cy="7" r="5.75" fill="none" stroke="var(--fg-4)" strokeWidth="1.4" />
-        <path d="M4.9 9.1l4.2-4.2" stroke="var(--fg-3)" strokeWidth="1.4" strokeLinecap="round" />
-      </svg>
+      return <Ring stroke="var(--fg-3)" dash glyph={status}><path d="M7 7h.01" stroke="var(--fg-3)" strokeWidth="2" strokeLinecap="round" /></Ring>
+    case 'dismissed': case 'ruled_out': case 'stopped': case 'expired':
+      return <Ring stroke="var(--fg-4)" glyph={status}>{SLASH}</Ring>
     case 'not_applicable':
-      return <Ring stroke="var(--fg-4)" dash><path d="M4.75 7h4.5" stroke="var(--fg-4)" strokeWidth="1.4" strokeLinecap="round" /></Ring>
-    case 'failed': case 'tainted': case 'denied': case 'blocked':
-      return <svg className="block flex-none" viewBox="0 0 14 14" width="14" height="14" aria-hidden="true">
-        <circle cx="7" cy="7" r="6.5" fill="var(--bad)" />
-        <path d="M5 5l4 4M9 5 5 9" stroke="#fff" strokeWidth="1.5" strokeLinecap="round" />
-      </svg>
+      return <Ring stroke="var(--fg-4)" dash glyph={status}><path d="M4.75 7h4.5" stroke="var(--fg-4)" strokeWidth="1.4" strokeLinecap="round" /></Ring>
+    case 'failed': case 'denied':
+      return <Solid fill="var(--bad)" glyph={status}>{CROSS}</Solid>
     case 'paused': case 'budget_paused': case 'waiting_approval':
-      return <Ring stroke="var(--warn)"><path d="M5.75 5v4M8.25 5v4" stroke="var(--warn)" strokeWidth="1.4" strokeLinecap="round" /></Ring>
+      return <Ring stroke="var(--warn)" glyph={status}><path d="M5.75 5v4M8.25 5v4" stroke="var(--warn)" strokeWidth="1.4" strokeLinecap="round" /></Ring>
     case 'waiting': case 'consent':
-      return <Ring stroke="var(--fg-2)"><path d="M7 4.5V7l1.75 1" fill="none" stroke="var(--fg-2)" strokeWidth="1.4" strokeLinecap="round" /></Ring>
+      return <Ring stroke="var(--fg-2)" glyph={status}><path d="M7 4.5V7l1.75 1" fill="none" stroke="var(--fg-2)" strokeWidth="1.4" strokeLinecap="round" /></Ring>
     default:
       return <Ring stroke="var(--fg-3)" />
   }

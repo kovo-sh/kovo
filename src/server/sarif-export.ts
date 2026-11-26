@@ -3,7 +3,7 @@ import { and, desc, eq } from 'drizzle-orm'
 import type { Finding, OwaspCategory } from '../domain.ts'
 import { normalizeFindingSeverity, projectRunFindings } from '../findings-view.ts'
 import type { OperatorTriageOverlay } from '../findings-view.ts'
-import { deduplicateChainFindings, owaspCategoryTitles } from '../report-summary.ts'
+import { owaspCategoryTitles } from '../report-summary.ts'
 import { computeFindingFingerprint } from './dedupe.ts'
 import type { CompositeProofReceipt } from './composite-receipt.ts'
 import { FindingCodec } from './finding-codec.ts'
@@ -548,39 +548,26 @@ export function buildSarifLog(input: SarifBuildInput): SarifLog {
 
   const results: SarifResult[] = []
 
-  // Single canonical findings projection shared across headline, report, Markdown, SARIF & receipts.
+  // Single terminal findings projection shared across headline, report, Markdown, SARIF & receipts.
   const view = projectRunFindings(input.findings, {
     approvedOrigins: approved,
     ...(input.provenanceAllowedOrigins ? { provenanceAllowedOrigins: input.provenanceAllowedOrigins } : {}),
     ...(input.taintedFactIds ? { taintedFactIds: input.taintedFactIds } : {}),
   })
   const supersededExcludedCount = view.counts.byExclusion.superseded ?? 0
-  const itemById = new Map(view.items.map(it => [it.finding.id, it]))
-
-  const activeDeduped = deduplicateChainFindings(
-    view.reportable.map(it => it.finding) as unknown as Finding[],
-  ) as unknown as SarifFindingInput[]
-  const suppressedReportable = view.suppressed.filter(it =>
-    it.finding.status === 'confirmed'
-    || it.finding.status === 'static_verified'
-    || it.finding.verificationTier === 'static_verified',
-  )
-  const suppressedDeduped = deduplicateChainFindings(
-    suppressedReportable.map(it => it.finding) as unknown as Finding[],
-  ) as unknown as SarifFindingInput[]
 
   let confirmedCount = 0
   let staticAdvisoryCount = 0
   let suppressedCount = 0
 
-  const emitEntries: Array<{ finding: SarifFindingInput; suppressed: boolean }> = [
-    ...activeDeduped.map(finding => ({ finding, suppressed: false })),
-    ...suppressedDeduped.map(finding => ({ finding, suppressed: true })),
+  const emitEntries = [
+    ...view.reportable.map(projected => ({ projected, suppressed: false })),
+    ...view.suppressedReportable.map(projected => ({ projected, suppressed: true })),
   ]
 
-  for (const { finding, suppressed } of emitEntries) {
-    const projected = itemById.get(finding.id)
-    const isStaticVerified = finding.status === 'static_verified' || finding.verificationTier === 'static_verified'
+  for (const { projected, suppressed } of emitEntries) {
+    const finding = projected.finding
+    const isStaticVerified = projected.preSuppressionDisposition === 'advisory'
     if (suppressed) {
       suppressedCount += 1
     } else if (isStaticVerified) {
@@ -589,10 +576,10 @@ export function buildSarifLog(input: SarifBuildInput): SarifLog {
       confirmedCount += 1
     }
 
-    const effectiveSeverity = projected?.effectiveSeverity ?? normalizeFindingSeverity(finding.severity)
+    const effectiveSeverity = projected.effectiveSeverity
     const machineSeverity = normalizeFindingSeverity(finding.severity)
-    const backingKind = projected?.backingKind ?? (isStaticVerified ? 'static_only' : 'unbacked')
-    const disposition = projected?.disposition ?? (suppressed ? 'suppressed' : isStaticVerified ? 'advisory' : 'confirmed')
+    const backingKind = projected.backingKind
+    const disposition = projected.disposition
     const ruleMeta = canonicalRuleId(finding)
     const level = severityToSarifLevel(effectiveSeverity)
     const secScore = SEVERITY_TO_SCORE[effectiveSeverity] ?? '5.5'

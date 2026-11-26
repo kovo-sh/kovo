@@ -37,9 +37,13 @@ import { categoryToOwaspCoverageCategory } from '../src/server/coverage-category
 import { baseFields, type Severity } from '../src/server/deterministic-specs.ts'
 import {
   IMMUTABLE_CONFIRMED_FINDING_FIELDS,
+  agentProofAttribution,
   bindConfirmedFindingIdentity,
   cweFamilyForReceiptClass,
   deriveSeverityBandForClass,
+  isCweConsistentWithReceiptClass,
+  isSensitiveRepoEntry as execVerifyIsSensitiveRepoEntry,
+  isSensitiveRepoRelativePath as execVerifyIsSensitiveRepoRelativePath,
 } from '../src/server/exec-verify.ts'
 import { CWE_TO_RECEIPT_CLASS, SEVERITY_BY_CLASS, receiptVulnClassFor } from '../src/server/floor-recipe-engine.ts'
 import {
@@ -53,34 +57,35 @@ import {
   type ImpactStep,
   type InjectionFamily,
 } from '../src/server/oracle-invariants.ts'
+import {
+  isSensitiveRepoEntry as safetyIsSensitiveRepoEntry,
+  isSensitiveRepoRelativePath as safetyIsSensitiveRepoRelativePath,
+} from '../src/server/safety-primitives.ts'
+import { REGISTERED_V8_ORACLE_FAMILIES } from '../src/server/terminal-oracle-registry.ts'
 import { inferInjectionFamily } from '../src/server/verify-claims.ts'
+import {
+  CANONICAL_CLASS_TO_OWASP,
+  DEDUPE_FAMILY_EXCEPTIONS,
+  UNCLASSIFIED_TAXONOMY_KEY,
+  VULN_TAXONOMY,
+  cweFamiliesIntersect,
+  lookupVulnTaxonomy,
+} from '../src/vuln-taxonomy.ts'
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 
 /**
- * Baselined cross-table taxonomy disagreements as of R2-15 (`cq-12a`).
- * This set is a **shrinking ratchet**: entries may be removed as `cq-10` aligns tables,
- * never added without an explicit architectural decision.
+ * Baselined cross-table taxonomy disagreements (shrunk from 41 -> 14 in R3-11).
+ * All 12 `owasp-vs-exec-verify` disagreements and 15 `exec-verify-missing` disagreements were
+ * eliminated by unifying `exec-verify.ts` and `coverage-category.ts` on `src/vuln-taxonomy.ts`.
+ * Generic `injection` intentionally keeps a tight `['CWE-74']` family (F1 drift-gate invariant);
+ * the remaining 14 entries live in `floor-recipe-engine.ts` / `oracle-invariants.ts` (scheduled
+ * for R3-13 registry unification). Entries may only be removed, never added.
  */
 const KNOWN_TAXONOMY_DISAGREEMENTS: ReadonlySet<string> = new Set([
   'exec-verify-missing:CWE-1021:in:bola',
-  'exec-verify-missing:CWE-1220:in:bola',
-  'exec-verify-missing:CWE-1284:in:business_logic',
-  'exec-verify-missing:CWE-269:in:bfla',
-  'exec-verify-missing:CWE-288:in:auth_bypass',
-  'exec-verify-missing:CWE-290:in:auth_bypass',
-  'exec-verify-missing:CWE-307:in:auth_bypass',
-  'exec-verify-missing:CWE-345:in:webhook_forgery',
   'exec-verify-missing:CWE-362:in:bola',
-  'exec-verify-missing:CWE-472:in:business_logic',
-  'exec-verify-missing:CWE-522:in:info_disclosure',
-  'exec-verify-missing:CWE-532:in:info_disclosure',
   'exec-verify-missing:CWE-564:in:injection',
-  'exec-verify-missing:CWE-566:in:bola',
-  'exec-verify-missing:CWE-798:in:auth_bypass',
-  'exec-verify-missing:CWE-80:in:xss_stored',
-  'exec-verify-missing:CWE-83:in:xss_stored',
-  'exec-verify-missing:CWE-841:in:business_logic',
   'exec-verify-missing:CWE-89:in:injection',
   'exec-verify-missing:CWE-943:in:injection',
   'grader-vs-receipt:CWE-284:bfla!=bola',
@@ -92,18 +97,6 @@ const KNOWN_TAXONOMY_DISAGREEMENTS: ReadonlySet<string> = new Set([
   'impact-cwes-missing:CWE-284:in:bola',
   'impact-cwes-missing:CWE-362:in:bola',
   'impact-cwes-missing:CWE-566:in:bola',
-  'owasp-vs-exec-verify:cross_tenant_read:broken-access-control!=misconfig-exposure',
-  'owasp-vs-exec-verify:cross_tenant_write:broken-access-control!=misconfig-exposure',
-  'owasp-vs-exec-verify:csrf:cors-client-side!=auth-identity',
-  'owasp-vs-exec-verify:dom_xss:cors-client-side!=injection-input',
-  'owasp-vs-exec-verify:price_tampering:business-logic-race!=misconfig-exposure',
-  'owasp-vs-exec-verify:url_redirect:ssrf-redirects!=misconfig-exposure',
-  'owasp-vs-exec-verify:webhook_forgery:auth-identity!=ssrf-redirects',
-  'owasp-vs-exec-verify:workflow_bypass:business-logic-race!=misconfig-exposure',
-  'owasp-vs-exec-verify:xss:cors-client-side!=injection-input',
-  'owasp-vs-exec-verify:xss_reflected:cors-client-side!=injection-input',
-  'owasp-vs-exec-verify:xss_stored:cors-client-side!=injection-input',
-  'owasp-vs-exec-verify:xxe:injection-input!=ssrf-redirects',
 ])
 
 const IMPACT_CLASS_TO_RECEIPT_CLASS: Readonly<Record<string, string>> = {
@@ -722,4 +715,251 @@ test('R2-15 severity derivation + IMMUTABLE_CONFIRMED_FINDING_FIELDS includes se
   assert.equal(bound.severity, 'medium', 'bindConfirmedFindingIdentity must derive medium severity for open_redirect')
   assert.equal(bound.cwe, 'CWE-601')
   assert.equal(SEVERITY_BY_CLASS.open_redirect, 'medium')
+})
+
+test('R3-11: live mislabels eliminated (cross_tenant_read/write, injection CWE-89/943, xss/xxe/csrf/webhook_forgery OWASP parity)', () => {
+  // 1. cross_tenant_read & cross_tenant_write map to broken-access-control / CWE-639 (NEVER CWE-200).
+  for (const cls of ['cross_tenant_read', 'cross_tenant_write']) {
+    const fam = cweFamilyForReceiptClass(cls)
+    assert.equal(fam.cwe, 'CWE-639', `${cls} must map to CWE-639`)
+    assert.ok(fam.family.includes('CWE-639') && fam.family.includes('CWE-284'), `${cls} family must include CWE-639 and CWE-284`)
+    assert.equal(fam.category, 'broken-access-control', `${cls} must map to broken-access-control`)
+    assert.equal(fam.unclassified, false)
+    assert.equal(agentProofAttribution(cls).cwe, 'CWE-639')
+    assert.equal(agentProofAttribution(cls).category, 'broken-access-control')
+    assert.equal(categoryToOwaspCoverageCategory(cls), fam.category)
+  }
+
+  // 2. url_redirect, price_tampering, workflow_bypass map cleanly (never CWE-200).
+  assert.equal(cweFamilyForReceiptClass('url_redirect').cwe, 'CWE-601')
+  assert.equal(cweFamilyForReceiptClass('url_redirect').category, 'ssrf-redirects')
+  assert.equal(cweFamilyForReceiptClass('price_tampering').cwe, 'CWE-472')
+  assert.equal(cweFamilyForReceiptClass('price_tampering').category, 'business-logic-race')
+  assert.equal(cweFamilyForReceiptClass('workflow_bypass').cwe, 'CWE-840')
+  assert.equal(cweFamilyForReceiptClass('workflow_bypass').category, 'business-logic-race')
+
+  // 3. Injection drift-gate invariant (F1): specific receipts accept their CWE + generic CWE-74
+  //    one-directionally, while generic `injection` stays tight (['CWE-74']) so re-verifying a
+  //    confirmed CWE-89/CWE-78/CWE-1336/CWE-943 finding under generic `injection` reports drift.
+  const sqliFam = cweFamilyForReceiptClass('sqli')
+  assert.ok(sqliFam.family.includes('CWE-89') && sqliFam.family.includes('CWE-564') && sqliFam.family.includes('CWE-74'))
+  const nosqliFam = cweFamilyForReceiptClass('nosqli')
+  assert.ok(nosqliFam.family.includes('CWE-943') && nosqliFam.family.includes('CWE-74'))
+  assert.equal(nosqliFam.family.includes('CWE-89'), false, 'nosqli family must not accept SQLi CWE-89')
+  const inj = cweFamilyForReceiptClass('injection')
+  assert.deepEqual(inj.family, ['CWE-74'], 'generic injection family must stay tight (CWE-74 only)')
+  assert.equal(inj.category, 'injection-input')
+  assert.equal(isCweConsistentWithReceiptClass('CWE-89', 'injection'), false, 'CWE-89 under generic injection receipt must report drift')
+  assert.equal(isCweConsistentWithReceiptClass('CWE-78', 'injection'), false, 'CWE-78 under generic injection receipt must report drift')
+  assert.equal(isCweConsistentWithReceiptClass('CWE-1336', 'injection'), false, 'CWE-1336 under generic injection receipt must report drift')
+  assert.equal(isCweConsistentWithReceiptClass('CWE-943', 'injection'), false, 'CWE-943 under generic injection receipt must report drift')
+  assert.equal(isCweConsistentWithReceiptClass('CWE-74', 'injection'), true)
+  assert.equal(isCweConsistentWithReceiptClass('CWE-74', 'sqli'), true, 'specific sqli receipt may confirm generic CWE-74 one-directionally')
+  assert.equal(isCweConsistentWithReceiptClass('CWE-89', 'sqli'), true)
+  assert.equal(isCweConsistentWithReceiptClass('CWE-943', 'nosqli'), true)
+
+  // 4. XSS, XXE, CSRF, and webhook_forgery OWASP cells match across exec-verify and coverage-category.
+  for (const [cls, expectedOwasp, expectedCwe] of [
+    ['xss', 'cors-client-side', 'CWE-79'],
+    ['xss_reflected', 'cors-client-side', 'CWE-79'],
+    ['xss_stored', 'cors-client-side', 'CWE-79'],
+    ['dom_xss', 'cors-client-side', 'CWE-79'],
+    ['xxe', 'injection-input', 'CWE-611'],
+    ['blind_xxe', 'injection-input', 'CWE-611'],
+    ['csrf', 'cors-client-side', 'CWE-352'],
+    ['webhook_forgery', 'auth-identity', 'CWE-345'],
+  ] as const) {
+    assert.equal(cweFamilyForReceiptClass(cls).category, expectedOwasp, `exec-verify ${cls} OWASP mismatch`)
+    assert.equal(cweFamilyForReceiptClass(cls).cwe, expectedCwe, `exec-verify ${cls} CWE mismatch`)
+    assert.equal(agentProofAttribution(cls).category, expectedOwasp, `attribution ${cls} OWASP mismatch`)
+    assert.equal(categoryToOwaspCoverageCategory(cls), expectedOwasp, `coverage-category ${cls} OWASP mismatch`)
+  }
+})
+
+test('R3-11: every known receipt class resolves without CWE-200 fallthrough and unknown classes stay visible as unclassified', () => {
+  const GENUINE_DISCLOSURE_CLASSES = new Set([
+    'disclosure',
+    'info_disclosure',
+    'information_disclosure',
+    'sensitive_data_exposure',
+    'secret_disclosure',
+    'secret_disclosed',
+    'secret_leak',
+    'data_exposure',
+    'pii_exposure',
+  ])
+
+  const ALL_RECEIPT_CLASSES = [
+    ...new Set([
+      ...Object.values(CWE_TO_RECEIPT_CLASS),
+      ...Object.keys(SEVERITY_BY_CLASS),
+      ...REGISTERED_V8_ORACLE_FAMILIES,
+      // Single-hop receiptRuleFor classes from src/server/proof-receipt.ts
+      'ssrf', 'xxe', 'blind_ssrf', 'blind_xxe', 'oob', 'webhook_forgery',
+      'blind_sqli', 'sqli_time', 'sql_time', 'timing',
+      'sqli', 'sql_boolean', 'sql_boolean_diff', 'boolean_sqli', 'boolean_differential',
+      'sqli_status', 'sql_status', 'sql_status_diff', 'status_sqli', 'status_boolean',
+      'open_redirect', 'redirect', 'url_redirect', 'unvalidated_redirect',
+      'race', 'race_double_spend', 'race_condition', 'race_burst', 'double_spend',
+      'oversell', 'inventory_oversell', 'conserved_balance', 'toctou',
+      'auth_bypass', 'jwt_forgery', 'broken_auth', 'auth_protocol', 'token_forgery', 'authentication_bypass',
+      'signed_url_mint', 'presigned_url_mint', 'signed_url_traversal', 'storage_signed_url',
+      'gcs_signed_url', 's3_presigned_url', 'azure_sas_mint',
+      'bola', 'idor', 'authorization', 'broken-access-control', 'access_control',
+      'cross_tenant', 'cross_tenant_read', 'cross_tenant_write',
+      'bfla', 'privilege_escalation', 'mass_assignment', 'csrf',
+      'business_logic', 'invariant_violation', 'workflow_skip', 'workflow_bypass', 'price_tampering',
+      'xss', 'xss_stored', 'xss_reflected', 'dom_xss', 'markup', 'html_injection',
+      'disclosure', 'info_disclosure', 'secret_disclosed', 'secret_disclosure',
+      'injection', 'injection-input', 'injection_input', 'sqli_error',
+      'nosqli', 'nosql_injection', 'ssti', 'template_injection',
+      'command_injection', 'cmdi', 'path_traversal', 'directory_traversal', 'lfi',
+      'browser_xss', 'browser_dom', 'postmessage',
+    ]),
+  ].sort()
+
+  for (const cls of ALL_RECEIPT_CLASSES) {
+    const fam = cweFamilyForReceiptClass(cls)
+    const attr = agentProofAttribution(cls)
+    assert.equal(fam.unclassified, false, `known receipt class "${cls}" must not be unclassified`)
+    assert.equal(attr.unclassified, false, `known attribution class "${cls}" must not be unclassified`)
+    assert.equal(fam.cwe, attr.cwe, `cweFamilyForReceiptClass and agentProofAttribution must agree on CWE for "${cls}"`)
+    assert.equal(fam.category, attr.category, `cweFamilyForReceiptClass and agentProofAttribution must agree on category for "${cls}"`)
+    assert.equal(
+      categoryToOwaspCoverageCategory(cls),
+      fam.category,
+      `coverage-category and exec-verify must agree on OWASP cell for "${cls}"`,
+    )
+    if (!GENUINE_DISCLOSURE_CLASSES.has(cls)) {
+      assert.notEqual(fam.cwe, 'CWE-200', `non-disclosure receipt class "${cls}" must NEVER fall through to CWE-200`)
+      assert.notEqual(attr.cwe, 'CWE-200', `non-disclosure attribution "${cls}" must NEVER fall through to CWE-200`)
+    }
+  }
+
+  // Unknown receipt class maps explicitly to 'unclassified' (NEVER CWE-200 / misconfig-exposure).
+  const unknownFam = cweFamilyForReceiptClass('novel_unmapped_receipt_class')
+  assert.equal(unknownFam.cwe, UNCLASSIFIED_TAXONOMY_KEY)
+  assert.equal(unknownFam.category, UNCLASSIFIED_TAXONOMY_KEY)
+  assert.deepEqual(unknownFam.family, [])
+  assert.equal(unknownFam.unclassified, true)
+
+  const unknownAttr = agentProofAttribution('novel_unmapped_receipt_class')
+  assert.equal(unknownAttr.cwe, UNCLASSIFIED_TAXONOMY_KEY)
+  assert.equal(unknownAttr.category, UNCLASSIFIED_TAXONOMY_KEY)
+  assert.equal(unknownAttr.unclassified, true)
+  assert.equal(lookupVulnTaxonomy('novel_unmapped_receipt_class'), null)
+
+  // bindConfirmedFindingIdentity keeps unclassified findings visible (never drops or defaults to CWE-200).
+  const unknownFinding: Finding = {
+    id: 'f-unknown-class-1',
+    origin: 'https://app.example.test',
+    title: 'Novel boundary finding',
+    status: 'pending',
+    severity: 'high',
+    reason: 'Confirmed by receipt.',
+    remediation: 'Review transcript.',
+    evidenceIds: [],
+    scopeRevision: 1,
+    category: 'misconfig-exposure',
+    cwe: 'CWE-200',
+  }
+  const unknownSpec = {
+    ...baseFields(
+      'https://app.example.test',
+      'Novel boundary finding',
+      'CWE-200',
+      'misconfig-exposure',
+      'high',
+      '{ controlPassed: true, confirmed: true }',
+    ),
+    kind: 'http_chain' as const,
+    steps: [
+      {
+        id: 'p1',
+        role: 'probe' as const,
+        description: 'probe',
+        request: { origin: 'https://app.example.test', method: 'GET', pathAndQuery: '/api/novel' },
+      },
+    ],
+  } as unknown as DeclarativeReplaySpec
+  const boundUnknown = bindConfirmedFindingIdentity(
+    unknownFinding,
+    unknownSpec,
+    {
+      verdict: 'confirmed',
+      outcome: { controlPassed: true, confirmed: true, observed: 'diff', expected: 'blocked', reason: 'confirmed' },
+      exchanges: [],
+      exchangeIds: [],
+      evidencePayload: {},
+      evidenceSha256: '1'.repeat(64),
+      receipt: {
+        mode: 'strict',
+        receipt: {
+          vulnClass: 'novel_unmapped_receipt_class',
+          target: { origin: 'https://app.example.test', method: 'GET', pathAndQuery: '/api/novel' },
+          exchangeIds: ['ex-1'],
+          oobEventIds: [],
+          browserTraceIds: [],
+          claimedDelta: 'unmapped receipt class',
+        },
+        verification: {
+          confirmed: true,
+          vulnClass: 'novel_unmapped_receipt_class',
+          rule: 'impact',
+          reason: 'verified',
+          observed: 'diff',
+          expected: 'blocked',
+        },
+      },
+    } as unknown as Parameters<typeof bindConfirmedFindingIdentity>[2],
+  )
+  assert.equal(boundUnknown.cwe, UNCLASSIFIED_TAXONOMY_KEY)
+  assert.equal(boundUnknown.category, UNCLASSIFIED_TAXONOMY_KEY)
+  assert.equal(boundUnknown.title, 'Novel boundary finding')
+})
+
+test('R3-11: src/vuln-taxonomy.ts is browser-safe, shared by coverage-category, and exec-verify delegates safety primitives', () => {
+  assert.ok(VULN_TAXONOMY.length >= 20)
+  assert.equal(CANONICAL_CLASS_TO_OWASP['xss'], 'cors-client-side')
+  assert.equal(CANONICAL_CLASS_TO_OWASP['xxe'], 'injection-input')
+  assert.equal(CANONICAL_CLASS_TO_OWASP['cross-tenant-read'], 'broken-access-control')
+
+  const taxonomyImportLines = readFileSync(join(REPO_ROOT, 'src', 'vuln-taxonomy.ts'), 'utf8')
+    .split('\n')
+    .filter(line => line.trim().startsWith('import '))
+    .join('\n')
+  assert.equal(taxonomyImportLines.includes("'node:") || taxonomyImportLines.includes('"node:'), false, 'src/vuln-taxonomy.ts must not import node:* builtins')
+  assert.equal(taxonomyImportLines.includes('server/'), false, 'src/vuln-taxonomy.ts must not import src/server/*')
+
+  // Safety-primitive consolidation in exec-verify.ts (R3-11 retires final R3-10 clone debt).
+  assert.strictEqual(execVerifyIsSensitiveRepoEntry, safetyIsSensitiveRepoEntry)
+  assert.strictEqual(execVerifyIsSensitiveRepoRelativePath, safetyIsSensitiveRepoRelativePath)
+
+  // R3-11 F2 single-source conformance guard: every VULN_TAXONOMY entry's canonicalCwe MUST
+  // dedupe-intersect every member of its cweFamily, except explicitly documented exceptions.
+  const exceptionSet = new Set(DEDUPE_FAMILY_EXCEPTIONS.map(ex => `${ex.entryId}::${ex.cwe}`))
+  for (const entry of VULN_TAXONOMY) {
+    for (const memberCwe of entry.cweFamily) {
+      const key = `${entry.id}::${memberCwe}`
+      if (exceptionSet.has(key)) {
+        assert.equal(
+          cweFamiliesIntersect(entry.canonicalCwe, memberCwe),
+          false,
+          `documented dedupe veto exception ${key} should remain disjoint`,
+        )
+        continue
+      }
+      assert.equal(
+        cweFamiliesIntersect(entry.canonicalCwe, memberCwe),
+        true,
+        `VULN_TAXONOMY ${entry.id}: canonicalCwe ${entry.canonicalCwe} must dedupe-intersect cweFamily member ${memberCwe}`,
+      )
+    }
+  }
+
+  // R3-11 N2: overly broad non-kernel aliases must not bind to specific CWEs in VULN_TAXONOMY.
+  for (const broad of ['cache', 'auth', 'authn', 'authentication', 'session', 'replay_attack', 'rate_limit_bypass', 'webhook']) {
+    assert.equal(lookupVulnTaxonomy(broad), null, `overly broad alias "${broad}" must not map in VULN_TAXONOMY`)
+    assert.equal(cweFamilyForReceiptClass(broad).unclassified, true, `broad alias "${broad}" must remain unclassified`)
+  }
 })

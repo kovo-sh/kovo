@@ -1,0 +1,130 @@
+{
+  "id": "r3-19-claude-bypass-review-fp",
+  "side": "fp",
+  "source": "independent_review",
+  "archetype": "r3-19-typed-tenant-vs-conflicting-label-read",
+  "description": "R3-19 independent-review FP: same-tenant document read where the probe persona's typed tenant is 'tenant-a' but its UI-style label embeds a conflicting parenthetical tenant ('tenant-b'). Typed host-resolved tenant/privilege must take precedence over label-derived tenant (no mixed-source tenant leak), so the read stays same-tenant and a cross-tenant BOLA claim must fail closed on every path.",
+  "covers": {
+    "files": [
+      "src/server/verify-rpc.ts",
+      "src/server/verify-claims.ts",
+      "src/server/v8-oracle-hydrate.ts",
+      "src/server/host-fact-log.ts",
+      "src/server/composite-receipt.ts",
+      "src/server/floor-recipe-engine.ts"
+    ],
+    "classes": ["bola", "idor", "authorization", "dual_tenant_abac"]
+  },
+  "canonicalLabel": {
+    "cwe": "CWE-639",
+    "category": "bola",
+    "title": "Same-tenant document read where persona label embeds a conflicting tenant but typed tenant metadata is authoritative",
+    "impact": "Viewer typed to tenant-a reads a tenant-a document; label text naming tenant-b must not convert this into a cross-tenant disclosure.",
+    "claimedImpact": "authorization",
+    "claimedBoundary": "access",
+    "vulnClass": "bola"
+  },
+  "freeTextLabel": {
+    "title": "Cross-tenant document access by tenant-b persona (label-derived tenant) on tenant-a document"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": true,
+    "evaluateClaims": true,
+    "composite": true,
+    "floorInjectionRecipe": false,
+    "proofReceipt": true
+  },
+  "expected": { "confirmed": false },
+  "personas": [
+    {
+      "handle": "acct_alpha",
+      "roleLabel": "Account Alpha (tenant-a)",
+      "role": "owner",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-r319-rev-alpha-token"
+    },
+    {
+      "handle": "acct_beta",
+      "roleLabel": "Account Beta (tenant-b)",
+      "role": "viewer",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-r319-rev-beta-token"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "ctl_owner",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/docs/doc_a1",
+      "persona": "acct_alpha",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"id\":\"doc_a1\",\"tenant_id\":\"tenant-a\",\"title\":\"Acme Shared Handbook\",\"status\":\"open\"}"
+    },
+    {
+      "id": "ctl_anon",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/docs/doc_a1",
+      "persona": null,
+      "status": 401,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"error\":\"authentication_required\"}"
+    },
+    {
+      "id": "prb_viewer",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/docs/doc_a1",
+      "persona": "acct_beta",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"id\":\"doc_a1\",\"tenant_id\":\"tenant-a\",\"title\":\"Acme Shared Handbook\",\"status\":\"open\"}"
+    }
+  ],
+  "replaySpec": {
+    "assertionsJq": "{ controlPassed: (.steps.ctl_owner.status == 200 and .steps.ctl_anon.status == 401), confirmed: (.steps.prb_viewer.status == 200 and .steps.prb_viewer.json.id == \"doc_a1\"), observed: \"acct_beta read same-tenant doc\", expected: \"403\" }"
+  },
+  "proofReceipt": {
+    "vulnClass": "bola",
+    "targetMethod": "GET",
+    "targetPathAndQuery": "/api/docs/doc_a1",
+    "claimedDelta": "Typed-tenant same-tenant read with a conflicting label tenant must not confirm as cross-tenant BOLA."
+  },
+  "claims": [
+    {
+      "kind": "impact",
+      "impactClass": "authorization",
+      "probeExchangeId": "prb_viewer",
+      "controlExchangeIds": ["ctl_owner", "ctl_anon"]
+    }
+  ],
+  "bareClaims": [
+    { "kind": "status", "exchangeId": "ctl_owner", "expected": 200 },
+    { "kind": "status", "exchangeId": "ctl_anon", "expected": 401 },
+    { "kind": "status", "exchangeId": "prb_viewer", "expected": 200 },
+    { "kind": "body_contains", "exchangeId": "prb_viewer", "text": "doc_a1" }
+  ],
+  "composite": {
+    "chainId": "r3-19-claude-bypass-review",
+    "terminalVulnClass": "bola",
+    "oracleFamily": "dual_tenant_abac",
+    "claimedDelta": "Same-tenant read by typed tenant-a viewer with conflicting label tenant must fail closed in composite verification.",
+    "singleHop": true,
+    "attackerPersonas": ["acct_beta"],
+    "preChainControlIds": ["ctl_owner", "ctl_anon"],
+    "terminalExchangeId": "prb_viewer"
+  }
+}

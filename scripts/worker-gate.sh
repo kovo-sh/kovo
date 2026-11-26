@@ -51,6 +51,7 @@ run "function growth & file size baseline ratchet" node scripts/check-function-g
 run "test-shape source-text regex ratchet" node scripts/check-test-shape.ts
 run "security-optional & test-seam boundary ratchet" node scripts/check-security-optional.ts
 run "empty-catch lifecycle settlement ratchet" node scripts/check-empty-catch.ts
+run "exhaustive union switch lint" node scripts/check-exhaustive.ts
 CONTRACT_BASE="${KOVO_CONTRACT_BASE:-}"
 if [[ -n "$CONTRACT_BASE" ]]; then
   run "contract-change trailer lint" node scripts/check-contract-change.ts --base "$CONTRACT_BASE"

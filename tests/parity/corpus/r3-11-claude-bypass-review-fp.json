@@ -1,0 +1,123 @@
+{
+  "id": "r3-11-claude-bypass-review-fp",
+  "side": "fp",
+  "source": "independent_review",
+  "archetype": "r3-11-cross-tenant-read-same-tenant-mislabel",
+  "description": "R3-11 independent review FP: member_b of tenant-b reads a record owned by its OWN tenant (tenant-b), but the receipt is mislabeled with the cross_tenant_read class and a status-only claim. Taxonomy alias resolution to CWE-639 / broken-access-control must never be sufficient for confirmation; the same-tenant read is entitled access with no authorization boundary crossed.",
+  "covers": {
+    "files": [
+      "src/server/exec-verify.ts"
+    ],
+    "classes": [
+      "cross_tenant_read",
+      "bola",
+      "authorization"
+    ]
+  },
+  "canonicalLabel": {
+    "cwe": "CWE-639",
+    "category": "broken-access-control",
+    "title": "Claimed cross-tenant read that is a same-tenant entitled read",
+    "impact": "None: member of tenant-b read a tenant-b record it is entitled to read.",
+    "claimedImpact": "authorization",
+    "claimedBoundary": "access",
+    "vulnClass": "cross_tenant_read"
+  },
+  "freeTextLabel": {
+    "title": "Cross-tenant unauthorized read of billing record (mislabeled same-tenant read)"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": true,
+    "evaluateClaims": true,
+    "composite": false,
+    "floorInjectionRecipe": false,
+    "proofReceipt": true
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [
+    {
+      "handle": "owner_b",
+      "roleLabel": "owner (tenant-b)",
+      "role": "owner",
+      "tenant": "tenant-b",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-r311-bypass-owner-b"
+    },
+    {
+      "handle": "member_b",
+      "roleLabel": "member (tenant-b)",
+      "role": "member",
+      "tenant": "tenant-b",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-r311-bypass-member-b"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "entitled",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/records/rec_tenant_b_7",
+      "persona": "owner_b",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"id\":\"rec_tenant_b_7\",\"owner_id\":\"owner_b\",\"tenant_id\":\"tenant-b\",\"email\":\"finance@tenant-b.example\",\"balance_cents\":4200}"
+    },
+    {
+      "id": "prb",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/records/rec_tenant_b_7",
+      "persona": "member_b",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"id\":\"rec_tenant_b_7\",\"owner_id\":\"owner_b\",\"tenant_id\":\"tenant-b\",\"email\":\"finance@tenant-b.example\",\"balance_cents\":4200}"
+    }
+  ],
+  "replaySpec": {
+    "resourceTenant": "tenant-b",
+    "assertionsJq": "{ controlPassed: (.steps.entitled.status == 200), confirmed: (.steps.prb.status == 200 and .steps.prb.json.email == .steps.entitled.json.email and .steps.prb.json.tenant_id == \"tenant-b\"), observed: .steps.prb.json.email, expected: \"403\" }"
+  },
+  "proofReceipt": {
+    "vulnClass": "cross_tenant_read",
+    "targetMethod": "GET",
+    "targetPathAndQuery": "/api/records/rec_tenant_b_7",
+    "claimedDelta": "Member read a billing record under receipt class cross_tenant_read (same-tenant, entitled)."
+  },
+  "claims": [
+    {
+      "kind": "impact",
+      "impactClass": "authorization",
+      "probeExchangeId": "prb",
+      "controlExchangeIds": [
+        "entitled"
+      ],
+      "resourceTenant": "tenant-b"
+    }
+  ],
+  "bareClaims": [
+    {
+      "kind": "status",
+      "exchangeId": "entitled",
+      "expected": 200
+    },
+    {
+      "kind": "status",
+      "exchangeId": "prb",
+      "expected": 200
+    }
+  ]
+}

@@ -28,14 +28,9 @@ import type {
   VerificationTier,
 } from '../domain.ts'
 import type { DeclarativeReplaySpec } from '../replay-spec.ts'
-import {
-  chainFindingDedupKey,
-  mergeChainFindings,
-} from '../report-summary.ts'
-import type {
-  FindingProvenance,
-  FindingVerificationClass,
-} from '../report-summary.ts'
+import { chainFindingDedupKey, mergeChainFindings } from '../report-summary.ts'
+import type { FindingProvenance, FindingVerificationClass } from '../report-summary.ts'
+import { isTerminalRunStatus } from './run-status.ts'
 import {
   RECORD_COVERAGE_CONTRACT,
   appendCoverageEvidenceMetadata,
@@ -644,14 +639,14 @@ export class FindingsRepository {
            AND COALESCE(NULLIF(r.tenant_id, 'default'), p.tenant_id, 'default') = ?`,
       ).all(this.session.workspace.id, this.session.tenantId) as Array<{ id: string; status: string }>
       runIds = rows
-        .filter(row => !(options.skipActiveRuns ?? true) || row.status !== 'running')
+        .filter(row => !(options.skipActiveRuns ?? true) || isTerminalRunStatus(row.status))
         .map(row => row.id)
     } else {
       const rows = this.session.client.prepare(
         'SELECT id, status FROM runs WHERE workspace_id = ?',
       ).all(this.session.workspace.id) as Array<{ id: string; status: string }>
       runIds = rows
-        .filter(row => !(options.skipActiveRuns ?? true) || row.status !== 'running')
+        .filter(row => !(options.skipActiveRuns ?? true) || isTerminalRunStatus(row.status))
         .map(row => row.id)
     }
     for (const runId of runIds) {

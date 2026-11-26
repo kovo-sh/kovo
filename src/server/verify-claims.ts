@@ -11,9 +11,9 @@ import {
   ACTIVE_MARKUP_RE, assessBoundary, assessImpactEvidence, assessMarkupImpact, assessMfaBypass,
   assessReadDisclosure, assessStatusOnlyDivergence, classifyImpactDescriptor, flattenJson,
   hasForeignTenantOrOwnerDisclosure, injectionFamilyFromTyped, isMutatingMethod, isReadMethod,
-  matchStrippedInjectionFingerprint, normalizeRole, parseRoleLabel,
+  matchStrippedInjectionFingerprint, resolvePersonaIdentity,
 } from './oracle-invariants.ts'
-import type { AmbientAuth, BoundaryClass, ImpactClass, ImpactStep, InjectionFamily, InjectionFamilyScope, ActorIdentity } from './oracle-invariants.ts'
+import type { AmbientAuth, BoundaryClass, ImpactClass, ImpactStep, InjectionFamily, InjectionFamilyScope, ActorIdentity, RoleName } from './oracle-invariants.ts'
 import { isJobOrHandleStub } from './v8-oracle-families.ts'
 import { deriveRecordAuthMeta, resolveCanonicalArm, stepHasRedactedRequestPlane, type HostFactLog } from './host-fact-log.ts'
 import { defaultHostMintedOracle, normalizeRequestCarrier, verifyHostExpressionProbe, verifySignedUrlMintPair, type HostMintedExpressionChallenge, type HostStampedBooleanPair } from './proof-receipt.ts'
@@ -58,8 +58,10 @@ export interface VerifyTranscriptRequest {
   bodySha256: string
   personaHandle?: string | null
   sessionRole?: string | null
-  /** Host-resolved persona role label (e.g. "owner (acme)"); signed, never script-supplied. */
+  /** Host-resolved persona label, tenant, and privilege (from ResolvedPersona); signed, never script-supplied. */
   actorRoleLabel?: string | null
+  actorTenant?: string | null
+  actorPrivilege?: RoleName | null
   /** Host-stamped derived capability handle injected into this request. */
   consumedCapabilityId?: string | null
   /** Host-stamped source capability handle from which a cryptographic artifact in this request was derived. */
@@ -955,11 +957,9 @@ function toTranscriptStep(store: TranscriptStore, id: string, arm: ImpactStep['a
   const record = store.get(id)
   if (!record) return null
   const body = store.body(id), json = parseJsonBody(body), handle = record.request?.personaHandle ?? null
-  // H-13: Strictly host-derived role, tenant, auth, SameSite, and request body; drop all script-declared fallbacks.
-  const signedLabel = record.request?.actorRoleLabel ?? null
-  const role = (signedLabel !== null ? normalizeRole(signedLabel) : null) ?? normalizeRole(handle) ?? null
-  const tenant = (signedLabel !== null ? parseRoleLabel(signedLabel).tenant : null) ?? parseRoleLabel(handle).tenant ?? null
-  const authMeta = deriveRecordAuthMeta(record)
+  // H-13 / R3-19: Strictly host-derived role, tenant, auth, SameSite, and request body via resolvePersonaIdentity.
+  const req = record.request, idn = resolvePersonaIdentity({ roleLabel: req?.actorRoleLabel ?? null, tenantRef: req?.actorTenant ?? null, privilege: req?.actorPrivilege ?? null, handle }), hIdn = handle && ((idn.role === null && req?.actorPrivilege === undefined) || (idn.tenant === null && req?.actorTenant === undefined)) ? resolvePersonaIdentity({ roleLabel: handle, handle }) : null
+  const role = idn.role ?? (req?.actorPrivilege === undefined ? hIdn?.role ?? null : null), tenant = idn.tenant ?? (req?.actorTenant === undefined ? hIdn?.tenant ?? null : null), authMeta = deriveRecordAuthMeta(record)
   const hostAuth = authMeta.ambientAuth
   const hostSameSite = authMeta.sameSite ?? (hostAuth === 'cookie' && !authMeta.placement.mixed ? (opts?.defaultSameSite ?? null) : null)
   const hostRawReq = store.requestBody(id)

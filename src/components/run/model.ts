@@ -3,6 +3,7 @@
 // re-deriving. Everything is real data; no links are invented.
 import type { RunDetail } from '../run-state.ts'
 import { projectRunFindings } from '../../findings-view.ts'
+import { isTerminalRunStatus } from '../../server/run-status.ts'
 import { capF, firstSentence, host, sharedApex, words } from './format.ts'
 import { COV_L, covCat, FSTAT_ORDER, PHASE_ORDER, SEV, SEV_ORDER } from './meta.ts'
 import type { RiskTier, Severity } from './meta.ts'
@@ -89,7 +90,7 @@ export function buildVerdict(d: Detail, findings: readonly FindingRow[], interru
   let hed: string
   let dek: string | null = null
   let worst: FindingRow | null = null
-  const live = r.status !== 'complete' && r.status !== 'stopped' && r.status !== 'failed'
+  const live = !isTerminalRunStatus(d.activity?.lifecycle ?? r.status)
   const wp = (k: number, s: string, p = s + 's') => capF(words(k)) + ' ' + (k === 1 ? s : p)
   if (r.status === 'waiting') {
     hed = 'Awaiting your consent to begin. Nothing has been sent.'
@@ -198,7 +199,7 @@ function buildQueue(d: Detail, _findings: readonly FindingRow[], risk: Map<strin
     ;(a.status === 'pending' && !isApprovalExpired(a, now) ? base.decide : base.done).push(it)
   }
   // Follow-ups send a real `inject_hint` command only while the run can still plan.
-  const canScheduleFollowUp = run.phase !== 'complete' && !['complete', 'stopped', 'failed'].includes(run.status)
+  const canScheduleFollowUp = run.phase !== 'complete' && !isTerminalRunStatus(d.activity?.lifecycle ?? run.status)
   if (canScheduleFollowUp) {
     for (const x of d.coverageEntries.filter(c => c.status === 'needs_follow_up')) {
       base.follow.push({ key: 'cv:' + x.id, kind: 'follow', cov: x, title: firstSentence(x.summary), origins: [x.origin], t: x.updatedAt || run.createdAt, risk: riskRank(x.origin) })
@@ -486,7 +487,7 @@ export function buildRunModel(d: Detail, now = Date.now()): RunModel {
   const coordinatorMessages = d.messages.filter(m => m.threadId === d.run.coordinatorId || m.role === 'operator' || m.role === 'kovo')
   const workerMessages = d.messages.filter(m => m.role === 'worker')
   const needsModel = !d.hasModel && d.run.approved.length > 0 && ['threat_model', 'investigation', 'verification'].includes(d.run.phase)
-    && d.run.status !== 'complete' && d.run.status !== 'stopped'
+    && !isTerminalRunStatus(d.activity?.lifecycle ?? d.run.status)
 
   return {
     detail: d, run: d.run, base: d.run.createdAt, end,

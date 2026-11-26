@@ -130,10 +130,7 @@
     "src/server/run-snapshot.ts::snapshotFileModes",
     "src/server/run-status.ts::CANONICAL_RESUMABLE_NON_TERMINAL_RUN_STATUSES",
     "src/server/run-status.ts::RUN_STATUS_CLASSIFICATION",
-    "src/server/run-status.ts::classifyRunStatus",
     "src/server/run-status.ts::isActivelyExecutingRunStatus",
-    "src/server/run-status.ts::isCanonicalRunStatus",
-    "src/server/run-status.ts::isNonTerminalRunStatus",
     "src/server/run-status.ts::isResumableNonTerminalRunStatus",
     "src/server/scope-policy.ts::isBenignInfrastructureOrigin",
     "src/server/scope-policy.ts::resolveEffectiveHttpMethod",
@@ -174,25 +171,7 @@
       "expires": "2026-12-10"
     },
     {
-      "key": "src/server/run-status.ts::classifyRunStatus",
-      "owner": "r2-03-merge-gate",
-      "ticket": "R2-03-PREEXISTING-RUN-STATUS",
-      "expires": "2026-12-10"
-    },
-    {
       "key": "src/server/run-status.ts::isActivelyExecutingRunStatus",
-      "owner": "r2-03-merge-gate",
-      "ticket": "R2-03-PREEXISTING-RUN-STATUS",
-      "expires": "2026-12-10"
-    },
-    {
-      "key": "src/server/run-status.ts::isCanonicalRunStatus",
-      "owner": "r2-03-merge-gate",
-      "ticket": "R2-03-PREEXISTING-RUN-STATUS",
-      "expires": "2026-12-10"
-    },
-    {
-      "key": "src/server/run-status.ts::isNonTerminalRunStatus",
       "owner": "r2-03-merge-gate",
       "ticket": "R2-03-PREEXISTING-RUN-STATUS",
       "expires": "2026-12-10"

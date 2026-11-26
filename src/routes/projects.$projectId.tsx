@@ -1,6 +1,7 @@
 import { createFileRoute, Link, useLocation, useNavigate, useRouter } from '@tanstack/react-router'
 import { useEffect, useMemo, useState } from 'react'
 import { projectData, removeProject, removeProjectAsset, testPersonaAuthAction } from '../actions.ts'
+import { isRunDeleteBlocked } from '../server/run-status.ts'
 import { Icon } from '../components/run/icons.tsx'
 import { ProjectEditModal } from '../components/project/ProjectEditModal.tsx'
 import { ProjectGuardrailsTab } from '../components/project/ProjectGuardrailsTab.tsx'
@@ -101,7 +102,7 @@ function ProjectPageContent({ data }: { data: ProjectLoaderData }) {
     })
   }, [search.syncError, search.tab, search.newRun, project.id, navigate])
 
-  const activeRunsCount = runs.filter(r => r.isActive || r.status === 'running').length
+  const activeRunsCount = runs.filter(r => (r.activity ? isRunDeleteBlocked(r.activity) : r.isActive)).length
   const totalFindings = runs.reduce((sum, r) => sum + r.findingCount, 0)
   const totalConfirmed = runs.reduce((sum, r) => sum + r.confirmedCount, 0)
 

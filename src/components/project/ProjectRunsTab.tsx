@@ -4,6 +4,8 @@ import { createRun, removeRun } from '../../actions.ts'
 import { getRunRerunPresetAction, listProjectRunLabelsAction } from '../../actions-run-controls.ts'
 import type { ApprovalPolicy, CapabilityTier } from '../../domain.ts'
 import { cn } from '../../lib/cn.ts'
+import { assertNever, isRunDeleteBlocked, isRunInProgress } from '../../server/run-status.ts'
+import type { RunActivity } from '../../server/run-status.ts'
 import { fmtDur } from '../run/format.ts'
 import { StatusGlyph } from '../run/glyphs.tsx'
 import { Icon } from '../run/icons.tsx'
@@ -38,24 +40,23 @@ export const RUN_STATUS_FILTERS: readonly { id: RunStatusFilter; label: string }
 export type ProjectRunSummary = ProjectLoaderData['runs'][number]
 
 export function matchesRunStatusFilter(
-  run: Pick<ProjectRunSummary, 'status' | 'isActive'>,
+  run: Pick<ProjectRunSummary, 'status' | 'isActive'> & { activity?: RunActivity },
   filter: RunStatusFilter,
 ): boolean {
+  const lifecycle = run.activity?.lifecycle ?? run.status
   switch (filter) {
     case 'all':
       return true
     case 'running':
-      return Boolean(run.isActive)
-        || run.status === 'running'
-        || run.status === 'waiting'
-        || run.status === 'paused'
-        || run.status === 'budget_paused'
+      return Boolean(run.isActive) || isRunInProgress(run.activity ?? lifecycle)
     case 'completed':
-      return run.status === 'complete'
+      return lifecycle === 'complete'
     case 'stopped':
-      return run.status === 'stopped'
+      return lifecycle === 'stopped'
     case 'failed':
-      return run.status === 'failed'
+      return lifecycle === 'failed'
+    default:
+      return assertNever(filter, 'Unhandled RunStatusFilter')
   }
 }
 
@@ -213,11 +214,13 @@ export function ProjectRunsTab({ data, onNewRun }: Props) {
 
   async function confirmDeleteRun() {
     if (!runToDelete || deletingRun) return
-    const isActive = Boolean(runToDelete.isActive || runToDelete.status === 'running')
+    const needsStop = runToDelete.activity
+      ? isRunDeleteBlocked(runToDelete.activity)
+      : Boolean(runToDelete.isActive)
     setDeletingRun(true)
     setDeleteError('')
     try {
-      await removeRun({ data: { runId: runToDelete.id, stopActive: isActive } })
+      await removeRun({ data: { runId: runToDelete.id, stopActive: needsStop } })
       setRunToDelete(null)
       await router.invalidate()
     } catch (err) {
@@ -227,7 +230,12 @@ export function ProjectRunsTab({ data, onNewRun }: Props) {
     }
   }
 
-  const isRunToDeleteActive = Boolean(runToDelete && (runToDelete.isActive || runToDelete.status === 'running'))
+  const isRunToDeleteActive = Boolean(
+    runToDelete && (runToDelete.activity ? isRunDeleteBlocked(runToDelete.activity) : runToDelete.isActive),
+  )
+  const isRunToDeleteParkedOnly = Boolean(
+    runToDelete?.activity && !runToDelete.activity.hasLiveWork && runToDelete.activity.hasParkedApprovals,
+  )
   const hasFilters = statusFilter !== 'all' || query.trim().length > 0
 
   return (
@@ -334,7 +342,7 @@ export function ProjectRunsTab({ data, onNewRun }: Props) {
         <div className="mt-3 border-t border-line">
           {filteredRuns.map(run => {
             const modeBadge = scanModeBadgeInfo(run)
-            const active = Boolean(run.isActive || run.status === 'running')
+            const active = Boolean(run.activity ? run.activity.hasLiveWork : run.isActive)
             const durationLabel = active ? fmtDur(Math.max(0, now - run.createdAt)) : null
             const runTitle = displayRunLabel(run)
 
@@ -492,7 +500,9 @@ export function ProjectRunsTab({ data, onNewRun }: Props) {
                   >
                     <Icon name="alert" size={14} className="mt-0.5 flex-none text-warn" />
                     <span>
-                      This run is currently running. Confirming will stop active workers and clean up containers before deleting.
+                      {isRunToDeleteParkedOnly
+                        ? 'This paused run has parked approval requests awaiting decision. Confirming will cancel parked approvals before deleting.'
+                        : 'This run is currently running. Confirming will stop active workers and clean up containers before deleting.'}
                     </span>
                   </div>
                 )}

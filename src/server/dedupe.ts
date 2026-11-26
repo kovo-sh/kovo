@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import type { Finding } from '../domain.ts'
+import { UNCLASSIFIED_TAXONOMY_KEY, cweFamiliesConflict } from '../vuln-taxonomy.ts'
 import {
   ORIGIN_WIDE_CWE_KEYS,
   computeFindingFingerprint,
@@ -121,6 +122,7 @@ export type SameFindingPredicateReason =
   | 'origin_wide_cwe'
   | 'same_surface'
   | 'origin_mismatch'
+  | 'cwe_family_conflict'
   | 'endpoint_mismatch'
   | 'method_conflict'
   | 'param_conflict'
@@ -628,6 +630,30 @@ function evaluateSameFindingPredicate(
     }
   }
 
+  // R3-11 CWE-family veto:
+  //  - Keep 'unclassified' findings visible and separate from classified findings on the same surface.
+  //  - When BOTH findings carry taxonomy-known CWEs from strictly disjoint derived families (e.g.,
+  //    SQLi CWE-89 vs CMDi CWE-78 / SSTI CWE-1336 / NoSQLi CWE-943 / XXE CWE-611 sharing
+  //    `injection-input`, or BOLA CWE-639 vs Mass Assignment CWE-915), never collapse them.
+  //  - Unlisted CWEs (e.g. generic CWE-20) are not treated as conflicting singletons.
+  if (
+    (candCwe === UNCLASSIFIED_TAXONOMY_KEY || exCwe === UNCLASSIFIED_TAXONOMY_KEY)
+    && candCwe !== exCwe
+  ) {
+    return {
+      allowed: false,
+      reason: 'cwe_family_conflict',
+      detail: `unclassified finding cannot merge with classified CWE (${candCwe} vs ${exCwe})`,
+    }
+  }
+  if (cweFamiliesConflict(candCwe, exCwe)) {
+    return {
+      allowed: false,
+      reason: 'cwe_family_conflict',
+      detail: `CWE family conflict (${candCwe} vs ${exCwe})`,
+    }
+  }
+
   const candEndpoint = normalizeEndpointTemplate(candidate.endpoint)
   const exEndpoint = normalizeEndpointTemplate(existing.endpoint)
   if (candEndpoint !== exEndpoint) {
@@ -832,6 +858,7 @@ export async function judgeSemanticDuplicate(
     '- Mark isDuplicate=true ONLY if fixing one existing finding fixes the candidate (same root cause, same component/middleware/handler).',
     '- Different endpoints with distinct authorization/injection bugs are NOT duplicates, even if they share a CWE.',
     '- Findings that mutate a different parameter, header, GraphQL operation or RPC procedure on the same endpoint are NOT duplicates.',
+    '- Findings with distinct vulnerability classes / CWE families (e.g., SQLi vs command injection vs SSTI vs XXE, or BOLA vs mass assignment) on the same endpoint and parameter are NOT duplicates.',
     '- Findings that resolve to a different verified handler/service path behind a reverse proxy are NOT duplicates.',
     '- Near-identical origin-level misconfigurations (e.g., two CORS reflections on the same host, one Low and one Medium with credentials) ARE duplicates, and shouldUpgrade=true if the candidate proves higher severity/impact.',
     '- If isDuplicate=false, duplicateOfId MUST be null and shouldUpgrade MUST be false.',

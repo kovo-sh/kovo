@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react'
 import { createRun, removeRun } from '../../actions.ts'
 import { getRunRerunPresetAction, listProjectRunLabelsAction } from '../../actions-run-controls.ts'
 import { cn } from '../../lib/cn.ts'
+import { isRunDeleteBlocked, isRunInProgress } from '../../server/run-status.ts'
 import { Icon } from '../run/icons.tsx'
 import { runStatusLabel } from '../run/meta.ts'
 import { capabilityTierMeta, formatUsd, phaseNames } from '../run-state.ts'
@@ -235,9 +236,7 @@ export function ProjectOverviewTab({ data, onSelectTab }: Props) {
   }
   const latestRun = runs[0]
   const completedRuns = runs.filter(r => r.status === 'complete').length
-  const activeRuns = runs.filter(
-    r => r.status === 'running' || r.status === 'waiting' || r.status === 'paused' || r.status === 'budget_paused',
-  ).length
+  const activeRuns = runs.filter(r => isRunInProgress(r.activity ?? r.status)).length
   const wildcardCount = assets.filter(a => a.includeSubdomains && !a.thirdParty).length
   const thirdPartyCount = assets.filter(a => a.thirdParty).length
   const allowlistCount = (project.sandboxWriteAllowlist ?? []).length
@@ -278,11 +277,13 @@ export function ProjectOverviewTab({ data, onSelectTab }: Props) {
 
   async function confirmDeleteRun() {
     if (!runToDelete || deletingRun) return
-    const isActive = Boolean(runToDelete.isActive || runToDelete.status === 'running')
+    const needsStop = runToDelete.activity
+      ? isRunDeleteBlocked(runToDelete.activity)
+      : Boolean(runToDelete.isActive)
     setDeletingRun(true)
     setDeleteError('')
     try {
-      await removeRun({ data: { runId: runToDelete.id, stopActive: isActive } })
+      await removeRun({ data: { runId: runToDelete.id, stopActive: needsStop } })
       setRunToDelete(null)
       await router.invalidate()
     } catch (err) {
@@ -292,7 +293,12 @@ export function ProjectOverviewTab({ data, onSelectTab }: Props) {
     }
   }
 
-  const isRunToDeleteActive = Boolean(runToDelete && (runToDelete.isActive || runToDelete.status === 'running'))
+  const isRunToDeleteActive = Boolean(
+    runToDelete && (runToDelete.activity ? isRunDeleteBlocked(runToDelete.activity) : runToDelete.isActive),
+  )
+  const isRunToDeleteParkedOnly = Boolean(
+    runToDelete?.activity && !runToDelete.activity.hasLiveWork && runToDelete.activity.hasParkedApprovals,
+  )
 
   return (
     <>
@@ -566,7 +572,9 @@ export function ProjectOverviewTab({ data, onSelectTab }: Props) {
                   >
                     <Icon name="alert" size={14} className="mt-0.5 flex-none text-warn" />
                     <span>
-                      This run is currently running. Confirming will stop active workers and clean up containers before deleting.
+                      {isRunToDeleteParkedOnly
+                        ? 'This paused run has parked approval requests awaiting decision. Confirming will cancel parked approvals before deleting.'
+                        : 'This run is currently running. Confirming will stop active workers and clean up containers before deleting.'}
                     </span>
                   </div>
                 )}

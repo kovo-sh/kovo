@@ -63,34 +63,27 @@ import type {
 } from '../domain.ts'
 import {
   isTerminalStepStatus,
+  stepKillsDependents,
+  stepSatisfiesDependency,
   type ChainStepStatus,
-  type ChainStepTerminalStatus,
 } from '../step-status.ts'
+import {
+  deriveRunActivity,
+  isTerminalRunStatus,
+  summarizeReportChainSteps,
+  type RunActivity,
+} from './run-status.ts'
 
-/**
- * Compile-time exhaustive parent-step dependency disposition (`R4-H-13`).
- * Adding any new terminal status to `STEP_STATUS` forces an explicit classification here so
- * `addChainStep` and `refreshReadyChainSteps` can never strand a pending dependent.
- */
 type TerminalParentDisposition = 'satisfies' | 'kills' | 'blocks'
-const TERMINAL_PARENT_DISPOSITION: Readonly<Record<ChainStepTerminalStatus, TerminalParentDisposition>> = {
-  complete: 'satisfies',
-  blocked: 'kills',
-  tainted: 'kills',
-  canceled: 'kills',
-  infra_failed: 'kills',
-  model_failure: 'kills',
-  turn_capped: 'blocks',
-  nudged_out: 'blocks',
-  rotated_partial: 'blocks',
-}
 const ORIGIN_QUARANTINE_SKILL_PREFIX_STORE = 'kovo:origin_quarantined:'
 const ORIGIN_QUARANTINE_DEPENDENT_SKILL_TAG = 'kovo:quarantine_dependent_tainted'
 
+/** Derived directly from `STEP_STATUS` partitions so new terminal statuses never drift. */
 function classifyParentStepStatus(status: ChainStepStatus | undefined): 'missing' | 'active' | TerminalParentDisposition {
   if (!status) return 'missing'
   if (!isTerminalStepStatus(status)) return 'active'
-  return TERMINAL_PARENT_DISPOSITION[status]
+  if (stepSatisfiesDependency(status)) return 'satisfies'
+  return stepKillsDependents(status) ? 'kills' : 'blocks'
 }
 
 function isOriginQuarantinedBlockedParent(parent: { status: ChainStepStatus; skills: readonly string[] } | undefined): boolean {
@@ -198,7 +191,6 @@ function deriveDefaultEnvironmentMode(
   return defaultEnvironmentMode(projectEnvironment)
 }
 
-const TERMINAL_RUN_STATUSES = new Set<Run['status']>(['complete', 'stopped', 'failed'])
 const NON_TERMINAL_ASSIGNMENT_STATUSES = ['running', 'queued', 'paused', 'waiting_approval'] as const
 
 function terminalAssignmentOutcome(status: Run['status']): string {
@@ -555,7 +547,7 @@ export class RunsRepository {
       const runRows = this.session.db.select({ id: tables.runs.id, status: tables.runs.status }).from(tables.runs)
         .where(and(
           eq(tables.runs.workspaceId, this.session.workspace.id),
-          inArray(tables.runs.status, ['running', 'paused']),
+          inArray(tables.runs.status, ['running', 'paused', 'budget_paused']),
         )).all()
       const runIds = runRows.map(row => row.id)
       const interrupted = runRows.filter(row => row.status === 'running')
@@ -1156,28 +1148,38 @@ export class RunsRepository {
     }
   }
 
-  /** True when the run itself is in `running` status or still owns running workers/lab containers. */
-  isRunActive(runId: string): boolean {
+  /** Canonical derived RunActivity for a run (separates live work from parked approvals). */
+  runActivity(runId: string): RunActivity {
     const run = this.session.db.select({ id: tables.runs.id, status: tables.runs.status })
       .from(tables.runs)
       .where(and(eq(tables.runs.id, runId), eq(tables.runs.workspaceId, this.session.workspace.id)))
       .get()
-    if (!run) return false
+    if (!run) return deriveRunActivity({ status: 'stopped' })
     if (this.session.tenantId) {
       const owner = this.session.effectiveRunTenant(runId) ?? 'default'
-      if (owner !== this.session.tenantId) {
-        throw new TenantIsolationError(this.session.tenantId, owner, runId)
-      }
+      if (owner !== this.session.tenantId) throw new TenantIsolationError(this.session.tenantId, owner, runId)
     }
-    if (run.status === 'running') return true
-    const activeAssignments = this.session.client.prepare(
-      `SELECT count(*) AS c FROM assignments WHERE run_id = ? AND status IN ('running', 'waiting_approval')`,
-    ).get(runId) as { c?: number } | undefined
-    if (Number(activeAssignments?.c ?? 0) > 0) return true
-    const activeContainers = this.session.client.prepare(
-      `SELECT count(*) AS c FROM lab_containers WHERE run_id = ? AND status = 'running'`,
-    ).get(runId) as { c?: number } | undefined
-    return Number(activeContainers?.c ?? 0) > 0
+    const row = this.session.client.prepare(`
+      SELECT
+        (SELECT count(*) FROM assignments WHERE run_id = ? AND status = 'running') AS runningAssignments,
+        (SELECT count(*) FROM assignments WHERE run_id = ? AND status = 'waiting_approval') AS parkedApprovals,
+        (SELECT count(*) FROM approval_requests WHERE run_id = ? AND status = 'pending') AS pendingApprovals,
+        (SELECT count(*) FROM lab_containers WHERE run_id = ? AND status = 'running') AS runningLabContainers
+    `).get(runId, runId, runId, runId) as {
+      runningAssignments?: number; parkedApprovals?: number; pendingApprovals?: number; runningLabContainers?: number
+    } | undefined
+    return deriveRunActivity({
+      status: run.status,
+      runningAssignments: Number(row?.runningAssignments ?? 0),
+      parkedApprovalAssignments: Number(row?.parkedApprovals ?? 0),
+      pendingApprovals: Number(row?.pendingApprovals ?? 0),
+      runningLabContainers: Number(row?.runningLabContainers ?? 0),
+    })
+  }
+
+  /** True when the run has actively executing work (excludes parked approvals on paused runs). */
+  isRunActive(runId: string): boolean {
+    return this.runActivity(runId).hasLiveWork
   }
 
   /** Return all run IDs belonging to a project that are currently active. */
@@ -1224,17 +1226,12 @@ export class RunsRepository {
     // A caller that just recorded an exchange must see it in the detail view.
     this.session.flushNow()
     const run = this.run(runId)
-    const pageFor = (specific?: PaginationOptions): PaginationOptions => ({
-      limit: specific?.limit ?? options?.limit,
-      offset: specific?.offset ?? options?.offset,
-    })
-    const isPaged = (page: PaginationOptions) => page.limit !== undefined || page.offset !== undefined
-    const evidencePage = pageFor(options?.evidence)
-    const factsPage = pageFor(options?.facts)
-    const exchangePage = pageFor(options?.exchanges)
-    const endpointPage = pageFor(options?.endpoints)
-    const messagePage = pageFor(options?.messages)
-    const boardPage = pageFor(options?.boardMessages)
+    const pageFor = (s?: PaginationOptions): PaginationOptions => ({ limit: s?.limit ?? options?.limit, offset: s?.offset ?? options?.offset })
+    const isPaged = (p: PaginationOptions) => p.limit !== undefined || p.offset !== undefined
+    const [evidencePage, factsPage, exchangePage, endpointPage, messagePage, boardPage] = [
+      pageFor(options?.evidence), pageFor(options?.facts), pageFor(options?.exchanges),
+      pageFor(options?.endpoints), pageFor(options?.messages), pageFor(options?.boardMessages),
+    ]
 
     const streamHead = this.session.db.select({ id: tables.events.id }).from(tables.events)
       .where(eq(tables.events.runId, run.id)).orderBy(desc(tables.events.id)).limit(1).get()
@@ -1256,7 +1253,7 @@ export class RunsRepository {
 
     const graphEdges = this.findings.listGraphEdges(runId)
     const digests = this.listDigests(runId, false)
-    const runTerminal = TERMINAL_RUN_STATUSES.has(run.status) || run.phase === 'complete'
+    const runTerminal = isTerminalRunStatus(run.status) || run.phase === 'complete'
     const rawAssignments = this.workerList(runId)
     const assignments = runTerminal
       ? rawAssignments.map(a => (
@@ -1386,6 +1383,7 @@ export class RunsRepository {
 
     return {
       run,
+      activity: this.runActivity(runId),
       project: this.projects.project(run.projectId),
       personas: this.session.listProjectPersonas(run.projectId),
       specs: this.projects.listProjectSpecs(run.projectId),
@@ -2081,7 +2079,7 @@ export class RunsRepository {
   ): ApprovalLeaseRow {
     return this.session.transaction(() => {
       const currentRun = this.run(run.id)
-      if (TERMINAL_RUN_STATUSES.has(currentRun.status)) {
+      if (isTerminalRunStatus(currentRun.status)) {
         throw new Error('Cannot extend an approval lease after a run has ended.')
       }
       const existing = this.session.db.select().from(tables.approvalLeases).where(and(
@@ -4009,14 +4007,14 @@ export class RunsRepository {
     const reportProvenance = buildProvenanceReport(finalFindings as (Finding & FindingProvenanceFields)[])
 
     const currentSteps = snapshot.chainSteps.filter(s => s.goalRevision === run.goalRevision)
-    const chainStepsCompleted = currentSteps.filter(s => s.status === 'complete').length
-    const chainStepsUntested = currentSteps.filter(s => ['pending', 'ready', 'running', 'blocked'].includes(s.status)).length
-    const taintedSteps = currentSteps.filter(s => s.status === 'tainted')
+    const stepMetrics = summarizeReportChainSteps(currentSteps)
+    const chainStepsCompleted = stepMetrics.completed
+    const chainStepsUntested = stepMetrics.untested
     if (chainStepsUntested > 0) {
       gaps.push(`${chainStepsUntested} planned investigation ${chainStepsUntested === 1 ? 'step remained' : 'steps remained'} untested when this report was saved.`)
     }
-    if (taintedSteps.length > 0) {
-      gaps.push(`${taintedSteps.length} chain ${taintedSteps.length === 1 ? 'step was' : 'steps were'} omitted due to mid-run scope revocation.`)
+    if (stepMetrics.tainted > 0) {
+      gaps.push(`${stepMetrics.tainted} chain ${stepMetrics.tainted === 1 ? 'step was' : 'steps were'} omitted due to mid-run scope revocation.`)
     }
     if (!scope.length) gaps.push('No approved hosts in this report.')
 
@@ -4322,7 +4320,7 @@ export class RunsRepository {
           this.session.event(run.id, 'run.paused', 'Run paused.')
           break
         case 'stop':
-          if (['complete', 'stopped'].includes(run.status)) throw new Error('This run has already ended.')
+          if (isTerminalRunStatus(run.status)) throw new Error('This run has already ended.')
           this.setStatus(run, 'stopped')
           this.writeReport(this.run(run.id), true)
           break

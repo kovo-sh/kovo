@@ -177,7 +177,7 @@ test('C: projectDetail computes isActive accurately for running runs, waiting_ap
 
   store.client.prepare(`UPDATE runs SET status = 'complete' WHERE id = ?`).run(idleRun.id)
   store.client.prepare(`UPDATE runs SET status = 'running', phase = 'investigation' WHERE id = ?`).run(runningRun.id)
-  store.client.prepare(`UPDATE runs SET status = 'waiting_approval', phase = 'investigation' WHERE id = ?`).run(approvalWorkerRun.id)
+  store.client.prepare(`UPDATE runs SET status = 'paused', phase = 'investigation' WHERE id = ?`).run(approvalWorkerRun.id)
   store.db.insert(tables.assignments).values({
     id: randomUUID(),
     runId: approvalWorkerRun.id,
@@ -207,7 +207,10 @@ test('C: projectDetail computes isActive accurately for running runs, waiting_ap
   const byId = new Map(detail.runs.map(r => [r.id, r]))
   assert.equal(byId.get(idleRun.id)?.isActive, false)
   assert.equal(byId.get(runningRun.id)?.isActive, true)
-  assert.equal(byId.get(approvalWorkerRun.id)?.isActive, true)
+  // R3-18: parked waiting_approval on paused run is NOT live work, but surfaces via hasParkedApprovals & blockingReasons.
+  assert.equal(byId.get(approvalWorkerRun.id)?.isActive, false)
+  assert.equal(byId.get(approvalWorkerRun.id)?.activity.hasParkedApprovals, true)
+  assert.ok(byId.get(approvalWorkerRun.id)?.activity.blockingReasons.some(b => b.code === 'parked_approvals'))
   assert.equal(byId.get(labContainerRun.id)?.isActive, true)
 }))
 
@@ -368,10 +371,10 @@ test('B4/C: Settings sidebar rename, GitHub UI consolidation to /settings, liveG
   assert.doesNotMatch(createGhSrc, /\bsaveGithubToken\b/)
   assert.match(createGhSrc, /to="\/settings"/)
 
-  // C: project.id keying, deleted persona ID filtering, activeRunsCount uses isActive, syncError banner
+  // C: project.id keying, deleted persona ID filtering, activeRunsCount uses derived RunActivity, syncError banner
   assert.match(projRouteSrc, /<ProjectPageContent\s+key=\{data\.project\.id\}/)
   assert.match(projRouteSrc, /validPersonaIds\.has\(pid\)/)
-  assert.match(projRouteSrc, /r\.isActive\s*\|\|\s*r\.status === 'running'/)
+  assert.match(projRouteSrc, /isRunDeleteBlocked\(r\.activity\)/)
   assert.match(projRouteSrc, /syncErrorBanner/)
   assert.match(projRouteSrc, /Initial GitHub repository sync failed/)
 

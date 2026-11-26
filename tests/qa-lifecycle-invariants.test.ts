@@ -55,9 +55,11 @@ import {
   RUN_STATUSES,
   RUN_STATUS_CLASSIFICATION,
   TERMINAL_RUN_STATUSES,
+  WORKER_STATUSES,
   classifyRunStatus,
   isActivelyExecutingRunStatus,
   isCanonicalRunStatus,
+  isCanonicalWorkerStatus,
   isNonTerminalRunStatus,
   isResumableNonTerminalRunStatus,
   isTerminalRunStatus,
@@ -68,6 +70,8 @@ import { Store } from '../src/server/store.ts'
 
 const REPO_ROOT = resolve(import.meta.dirname, '..')
 const SERVER_DIR = join(REPO_ROOT, 'src', 'server')
+const COMPONENTS_DIR = join(REPO_ROOT, 'src', 'components')
+const ROUTES_DIR = join(REPO_ROOT, 'src', 'routes')
 const TEST_ORIGIN = 'https://lifecycle-qa.example.test'
 
 // ---------------------------------------------------------------------------
@@ -84,19 +88,19 @@ function makeTempStore(t: TestContext, prefix = 'kovo-qa-lifecycle-'): { dir: st
   return { dir, store }
 }
 
-function parseDomainRunStatuses(): string[] {
+function parseDomainStringUnion(typeName: string): string[] {
   const domainPath = join(REPO_ROOT, 'src', 'domain.ts')
   const sourceText = readFileSync(domainPath, 'utf8')
   const sf = ts.createSourceFile(domainPath, sourceText, ts.ScriptTarget.Latest, true)
   const found: string[] = []
 
   function visit(node: ts.Node): void {
-    if (ts.isTypeAliasDeclaration(node) && node.name.text === 'RunStatus') {
+    if (ts.isTypeAliasDeclaration(node) && node.name.text === typeName) {
       if (ts.isUnionTypeNode(node.type)) {
         for (const member of node.type.types) {
           assert.ok(
             ts.isLiteralTypeNode(member) && ts.isStringLiteral(member.literal),
-            `Expected string literal union member in RunStatus, got: ${member.getText(sf)}`,
+            `Expected string literal union member in ${typeName}, got: ${member.getText(sf)}`,
           )
           found.push(member.literal.text)
         }
@@ -106,8 +110,16 @@ function parseDomainRunStatuses(): string[] {
   }
   visit(sf)
 
-  assert.ok(found.length > 0, 'Failed to locate `export type RunStatus` in src/domain.ts')
+  assert.ok(found.length > 0, `Failed to locate \`export type ${typeName}\` in src/domain.ts`)
   return found
+}
+
+function parseDomainRunStatuses(): string[] {
+  return parseDomainStringUnion('RunStatus')
+}
+
+function parseDomainWorkerStatuses(): string[] {
+  return parseDomainStringUnion('WorkerStatus')
 }
 
 function listTsFilesRecursive(dir: string): string[] {
@@ -116,7 +128,7 @@ function listTsFilesRecursive(dir: string): string[] {
     const full = join(dir, entry.name)
     if (entry.isDirectory()) {
       out.push(...listTsFilesRecursive(full))
-    } else if (entry.name.endsWith('.ts')) {
+    } else if (entry.name.endsWith('.ts') || entry.name.endsWith('.tsx')) {
       out.push(full)
     }
   }
@@ -491,36 +503,53 @@ describe('Matrix 1: RunStatus canonical partition & artifact-ttl / storage-maint
 })
 
 // ---------------------------------------------------------------------------
-// MATRIX 2 — Static AST Drift Audit Across `src/server/**/*.ts`
+// MATRIX 2 — Static AST Drift Audit Across `src/server`, `src/components`, `src/routes`
 // ---------------------------------------------------------------------------
 
-describe('Matrix 2: Static AST drift audit across src/server/**/*.ts', () => {
-  const RUN_IDENTIFIER_RE = /^(?:run|currentRun|freshRun|latestRun|afterFloor|existingRun|updatedRun|targetRun|hydratedRun)$/
+describe('Matrix 2: Static AST drift audit across src/server, src/components, and src/routes', () => {
+  const RUN_IDENTIFIER_RE = /^(?:run|currentRun|freshRun|latestRun|afterFloor|existingRun|updatedRun|targetRun|hydratedRun|detail\.run|d\.run|m\.run|runToDelete)$/
+  const WORKER_IDENTIFIER_RE = /^(?:worker|assignment|activeWorker|targetWorker|existingWorker|updatedWorker)$/
+  const INVALID_WORKER_OR_APPROVAL_LITERALS = new Set<string>(['waiting', 'stopped', 'completed', 'cancelled'])
 
   /**
-   * Tightly scoped ratchet allowlist for known pre-existing drift sites outside Move 2's file lease.
-   * Any NEW drift introduced anywhere in `src/server/` fails this test immediately.
-   * When these pre-existing sites are fixed to use `src/server/run-status.ts`, this test stays green.
+   * R3-18: Pre-existing drift ratchet allowlist is permanently EMPTY.
+   * Any drift introduced anywhere in `src/server/`, `src/components/`, or `src/routes/` fails immediately.
    */
-  const KNOWN_PREEXISTING_DRIFT_RATCHET = new Set<string>([
-    // Partial terminal checks omitting 'failed':
-    'src/server/store-runs.ts:partial_terminal_list:complete,stopped',
-    'src/server/store.ts:partial_terminal_list:complete,stopped',
-    // Crash recovery query omitting 'budget_paused':
-    'src/server/store-runs.ts:partial_recovery_list:running,paused',
-    // FindingsRepository.prune() skipActiveRuns checks `row.status !== 'running'` instead of `isTerminalRunStatus`:
-    'src/server/store-findings.ts:prune_skip_active_only_running',
-  ])
+  const KNOWN_PREEXISTING_DRIFT_RATCHET = new Set<string>([])
 
   const LEGACY_ALIAS_REGISTRY_FILES = new Set<string>([
     'src/server/run-status.ts',
     'src/server/artifact-ttl.ts',
   ])
 
-  test('no invalid RunStatus string comparisons (e.g. completed/cancelled) or unallowlisted status-list drift in src/server', () => {
+  test('WORKER_STATUSES matches src/domain.ts WorkerStatus union 1:1', () => {
+    const domainWorkerStatuses = parseDomainWorkerStatuses()
+    assert.deepEqual(
+      [...WORKER_STATUSES].sort(),
+      [...domainWorkerStatuses].sort(),
+      'src/server/run-status.ts WORKER_STATUSES must match src/domain.ts WorkerStatus union 1:1',
+    )
+    for (const status of domainWorkerStatuses) {
+      assert.equal(isCanonicalWorkerStatus(status), true)
+    }
+    assert.equal(isCanonicalWorkerStatus('waiting'), false)
+    assert.equal(isCanonicalWorkerStatus('stopped'), false)
+  })
+
+  test('no invalid RunStatus/WorkerStatus comparisons or status-list drift in src/server, src/components, or src/routes (empty allowlist)', () => {
+    assert.equal(
+      KNOWN_PREEXISTING_DRIFT_RATCHET.size,
+      0,
+      'R3-18 invariant: KNOWN_PREEXISTING_DRIFT_RATCHET allowlist must remain empty',
+    )
     const validRunStatuses = new Set(parseDomainRunStatuses())
-    const files = listTsFilesRecursive(SERVER_DIR)
-    assert.ok(files.length > 10, 'Expected to scan src/server/**/*.ts files')
+    const validWorkerStatuses = new Set(parseDomainWorkerStatuses())
+    const files = [
+      ...listTsFilesRecursive(SERVER_DIR),
+      ...listTsFilesRecursive(COMPONENTS_DIR),
+      ...listTsFilesRecursive(ROUTES_DIR),
+    ]
+    assert.ok(files.length > 20, 'Expected to scan src/server, src/components, and src/routes files')
 
     const violations: string[] = []
     const observedRatchetHits: string[] = []
@@ -533,7 +562,7 @@ describe('Matrix 2: Static AST drift audit across src/server/**/*.ts', () => {
       const lineOf = (node: ts.Node) => sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1
 
       function visit(node: ts.Node): void {
-        // 1. Binary comparison on a run object: `run.status === '...'` / `run.status !== '...'`
+        // 1. Binary comparison on a run or worker object: `run.status === '...'` / `a.status === '...'`
         if (ts.isBinaryExpression(node)) {
           const op = node.operatorToken.kind
           if (
@@ -544,12 +573,16 @@ describe('Matrix 2: Static AST drift audit across src/server/**/*.ts', () => {
           ) {
             let access: ts.PropertyAccessExpression | null = null
             let lit: ts.StringLiteral | null = null
-            if (ts.isPropertyAccessExpression(node.left) && node.left.name.text === 'status' && ts.isStringLiteral(node.right)) {
-              access = node.left
-              lit = node.right
-            } else if (ts.isPropertyAccessExpression(node.right) && node.right.name.text === 'status' && ts.isStringLiteral(node.left)) {
-              access = node.right
-              lit = node.left
+            const unwrapCast = (expr: ts.Expression): ts.Expression =>
+              ts.isAsExpression(expr) || ts.isParenthesizedExpression(expr) ? unwrapCast(expr.expression) : expr
+            const left = unwrapCast(node.left)
+            const right = unwrapCast(node.right)
+            if (ts.isPropertyAccessExpression(left) && left.name.text === 'status' && ts.isStringLiteral(right)) {
+              access = left
+              lit = right
+            } else if (ts.isPropertyAccessExpression(right) && right.name.text === 'status' && ts.isStringLiteral(left)) {
+              access = right
+              lit = left
             }
             if (access && lit) {
               const base = access.expression.getText(sf)
@@ -557,6 +590,16 @@ describe('Matrix 2: Static AST drift audit across src/server/**/*.ts', () => {
               if (RUN_IDENTIFIER_RE.test(base) && !validRunStatuses.has(val)) {
                 violations.push(
                   `${relPath}:${lineOf(node)} compares run status against invalid literal "${val}": ${node.getText(sf)}`,
+                )
+              }
+              if (WORKER_IDENTIFIER_RE.test(base) && !validWorkerStatuses.has(val)) {
+                violations.push(
+                  `${relPath}:${lineOf(node)} compares worker status against invalid literal "${val}": ${node.getText(sf)}`,
+                )
+              }
+              if (base === 'a' && INVALID_WORKER_OR_APPROVAL_LITERALS.has(val)) {
+                violations.push(
+                  `${relPath}:${lineOf(node)} compares assignment/approval status against invalid literal "${val}": ${node.getText(sf)}`,
                 )
               }
             }
@@ -583,6 +626,15 @@ describe('Matrix 2: Static AST drift audit across src/server/**/*.ts', () => {
                 }
               }
             }
+            if (WORKER_IDENTIFIER_RE.test(base)) {
+              for (const v of vals) {
+                if (!validWorkerStatuses.has(v)) {
+                  violations.push(
+                    `${relPath}:${lineOf(node)} checks worker status against invalid literal "${v}" in list: ${node.getText(sf)}`,
+                  )
+                }
+              }
+            }
             if (
               (RUN_IDENTIFIER_RE.test(base) || base === 'current') &&
               vals.includes('complete') &&
@@ -597,6 +649,18 @@ describe('Matrix 2: Static AST drift audit across src/server/**/*.ts', () => {
                   `${relPath}:${lineOf(node)} partial terminal run-status list missing "failed": ${node.getText(sf)}`,
                 )
               }
+            }
+            if (
+              relPath !== 'src/step-status.ts' &&
+              relPath !== 'src/server/run-status.ts' &&
+              vals.includes('pending') &&
+              vals.includes('ready') &&
+              vals.includes('running') &&
+              vals.includes('blocked')
+            ) {
+              violations.push(
+                `${relPath}:${lineOf(node)} hardcoded step-status list bypasses STEP_STATUS: ${node.getText(sf)}`,
+              )
             }
           }
         }

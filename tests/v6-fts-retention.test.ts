@@ -298,6 +298,8 @@ test('v6 pruneExchanges refuses an unbounded delete without a keepLatest floor',
 test('v6 store.prune applies per-run retentionDays and emits aggregated counts', t => {
   const { store, projectId, runId, workerId } = makeStore(t, 'retention')
   const second = createRun(store, projectId, 'Second retained run.')
+  store.updateRun(runId, { status: 'complete' })
+  store.updateRun(second.runId, { status: 'complete' })
   const oldA = store.recordExchange(exchangeInput(runId, workerId, '{"run":"a","age":"old"}'))
   const newA = store.recordExchange(exchangeInput(runId, workerId, '{"run":"a","age":"new"}'))
   const oldB = store.recordExchange(exchangeInput(second.runId, second.workerId, '{"run":"b","age":"old"}'))
@@ -332,6 +334,7 @@ test('v6 store.prune applies per-run retentionDays and emits aggregated counts',
 test('v6 store.prune skips actively running runs unless asked to include them', t => {
   const { store, projectId, runId, workerId } = makeStore(t, 'active')
   const idle = createRun(store, projectId, 'Idle run.')
+  store.updateRun(idle.runId, { status: 'complete' })
   const active = store.recordExchange(exchangeInput(runId, workerId, '{"active":true}'))
   const idleOld = store.recordExchange(exchangeInput(idle.runId, idle.workerId, '{"idle":true}'))
   backdate(store, [active.id, idleOld.id], Date.now() - 20 * 24 * HOUR_MS)

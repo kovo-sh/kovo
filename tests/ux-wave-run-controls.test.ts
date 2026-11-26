@@ -413,7 +413,7 @@ test('Header and Consent/ScopeOverlay structural invariants hold cleanly', () =>
   const headerSrc = readFileSync(join(REPO_ROOT, 'src/components/run/header.tsx'), 'utf8')
   assert.doesNotMatch(headerSrc, /startRunLabAction|stopRunLabAction|checkRunLabHealthAction/, 'duplicate Local Lab actions must be removed from header')
   assert.doesNotMatch(headerSrc, /approve_all_pending/, 'redundant Approve all pending item removed from header menu')
-  assert.match(headerSrc, /hasActiveWorkers/)
+  assert.match(headerSrc, /activity\.hasLiveWork/)
   assert.match(headerSrc, /hasRunningLab/)
   assert.match(headerSrc, /Stop lab & delete run/)
 

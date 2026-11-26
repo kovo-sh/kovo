@@ -1,4 +1,5 @@
 import { redact, SENSITIVE_HTTP_HEADER_RE } from './redact.ts'
+import { isStuckTerminalAssignmentStatus, isTerminalRunStatus } from './run-status.ts'
 
 export const QA_ANOMALIES_MAX_ENTRIES = 200
 
@@ -75,9 +76,6 @@ const MAX_DETAIL_STRING_LEN = 240
 const MAX_DETAIL_DEPTH = 4
 const MAX_DETAIL_KEYS = 24
 const MAX_DETAIL_ARRAY_LEN = 16
-
-const TERMINAL_RUN_STATUSES: ReadonlySet<string> = new Set(['complete', 'stopped', 'failed'])
-const STUCK_ASSIGNMENT_STATUSES: ReadonlySet<string> = new Set(['running', 'queued'])
 
 /**
  * Keys whose values may hold cookies, auth headers, tokens, secrets, or raw HTTP bodies.
@@ -365,7 +363,7 @@ export function inspectRunPostCompletionAnomalies(
 
   const normalizedRunStatus = String(run.status ?? '').toLowerCase()
   const isTerminal =
-    TERMINAL_RUN_STATUSES.has(normalizedRunStatus) ||
+    isTerminalRunStatus(normalizedRunStatus) ||
     String(run.phase ?? '').toLowerCase() === 'complete'
   if (!isTerminal) {
     return []
@@ -375,7 +373,7 @@ export function inspectRunPostCompletionAnomalies(
   const routeOrOrigin = resolveRunRouteOrOrigin(run, assignments, findings)
 
   // 1. Stuck `running` / `queued` assignments on a terminal run.
-  const orphaned = assignments.filter(a => STUCK_ASSIGNMENT_STATUSES.has(String(a.status ?? '').toLowerCase()))
+  const orphaned = assignments.filter(a => isStuckTerminalAssignmentStatus(a.status))
   if (orphaned.length > 0) {
     const runningCount = orphaned.filter(a => String(a.status).toLowerCase() === 'running').length
     const queuedCount = orphaned.filter(a => String(a.status).toLowerCase() === 'queued').length

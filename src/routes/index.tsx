@@ -247,7 +247,7 @@ function CreateProjectSheet({
 
 function formatRunPhase(status: string, phase: string): string {
   if (status === 'complete') return 'Complete'
-  if (status === 'failed' || status === 'paused' || status === 'budget_paused' || status === 'waiting_approval') {
+  if (status === 'failed' || status === 'paused' || status === 'budget_paused') {
     return runStatusLabel(status)
   }
   return PHASE_LABEL[phase] ?? runStatusLabel(status)

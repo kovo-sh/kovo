@@ -19,6 +19,7 @@ import {
   type VerificationTier,
 } from '../domain.ts'
 import { declarativeReplaySpecSchema, replaySpecOrigins, type AgentScriptProofEnvelope, type DeclarativeReplaySpec } from '../replay-spec.ts'
+import { attributionFromTaxonomy, cweFamilyFromTaxonomy, type TaxonomyCategory } from '../vuln-taxonomy.ts'
 import { accessPolicyReviews } from './access-policy-checks.ts'
 import { BrokerDenied, type BrokerExchangeResult, type Grant, type RequestBroker } from './broker.ts'
 import type { CanaryBroker } from './canary-broker.ts'
@@ -92,7 +93,10 @@ import {
   verifyReplaySpecInline,
 } from './replay-verifier.ts'
 import { responseReview } from './response-checks.ts'
+import { isSensitiveRepoEntry, isSensitiveRepoRelativePath } from './safety-primitives.ts'
 import { canaries, findings, type ReplayProofReceiptRow } from './schema.ts'
+
+export { isSensitiveRepoEntry, isSensitiveRepoRelativePath }
 import {
   assessmentAssignments,
   InvariantError,
@@ -279,78 +283,18 @@ export function extractSpecEndpointAndMethod(
 }
 
 /**
- * R2-H-14 / H-18: Canonical CWE + accepted CWE family for a verified ProofReceipt `vulnClass`.
- * Confirmed finding CWE/category must bind to the verified receipt class rather than arbitrary
- * model-declared `spec.cwe`.
+ * R2-H-14 / H-18 / R3-11: Canonical CWE + accepted CWE family for a verified ProofReceipt
+ * `vulnClass`, derived directly from `src/vuln-taxonomy.ts`. Confirmed finding CWE/category must
+ * bind to the verified receipt class rather than arbitrary model-declared `spec.cwe`; unknown
+ * receipt classes map visibly to `'unclassified'` instead of silently falling through to `CWE-200`.
  */
 export function cweFamilyForReceiptClass(vulnClass: string): {
   cwe: string
   family: readonly string[]
-  category: OwaspCategory
+  category: TaxonomyCategory
+  unclassified: boolean
 } {
-  const key = vulnClass.trim().toLowerCase()
-  const attr = agentProofAttribution(key)
-  if (/^(?:sqli|sqli_error|sql_boolean|sql_boolean_diff|blind_sqli|sqli_status|sqli_time)$/.test(key)) {
-    return { cwe: 'CWE-89', family: ['CWE-89'], category: 'injection-input' }
-  }
-  if (/^(?:nosqli|nosql_injection)$/.test(key)) {
-    return { cwe: attr.cwe, family: ['CWE-943', 'CWE-74', 'CWE-89'], category: 'injection-input' }
-  }
-  if (/^(?:ssti|template_injection)$/.test(key)) {
-    return { cwe: 'CWE-1336', family: ['CWE-1336', 'CWE-94', 'CWE-74'], category: 'injection-input' }
-  }
-  if (/^(?:command_injection|cmdi|rce)$/.test(key)) {
-    return { cwe: 'CWE-78', family: ['CWE-78', 'CWE-77', 'CWE-94'], category: 'injection-input' }
-  }
-  if (/^(?:path_traversal|directory_traversal|lfi)$/.test(key)) {
-    return { cwe: 'CWE-22', family: ['CWE-22', 'CWE-23', 'CWE-73'], category: 'injection-input' }
-  }
-  if (/^(?:xss|xss_stored|xss_reflected|markup|html_injection|dom_xss)$/.test(key)) {
-    return { cwe: 'CWE-79', family: ['CWE-79'], category: 'injection-input' }
-  }
-  if (/^(?:xxe|blind_xxe)$/.test(key)) {
-    return { cwe: 'CWE-611', family: ['CWE-611'], category: 'ssrf-redirects' }
-  }
-  if (/^(?:ssrf|blind_ssrf|oob|webhook_forgery|cross_surface_pivot)$/.test(key)) {
-    return { cwe: 'CWE-918', family: ['CWE-918'], category: 'ssrf-redirects' }
-  }
-  if (/^(?:open_redirect|redirect)$/.test(key)) {
-    return { cwe: 'CWE-601', family: ['CWE-601'], category: 'ssrf-redirects' }
-  }
-  if (/^(?:bol[ai]|idor|cross_tenant|authorization|access_control|broken-access-control|dual_tenant_abac)$/.test(key)) {
-    return { cwe: 'CWE-639', family: ['CWE-639', 'CWE-284', 'CWE-285', 'CWE-862', 'CWE-863'], category: 'broken-access-control' }
-  }
-  if (/^(?:bfla|privilege_escalation)$/.test(key)) {
-    return { cwe: 'CWE-285', family: ['CWE-285', 'CWE-862', 'CWE-863', 'CWE-639', 'CWE-284'], category: 'broken-access-control' }
-  }
-  if (/^mass_assignment$/.test(key)) {
-    return { cwe: 'CWE-915', family: ['CWE-915', 'CWE-285', 'CWE-863'], category: 'broken-access-control' }
-  }
-  if (/^csrf$/.test(key)) {
-    return { cwe: 'CWE-352', family: ['CWE-352'], category: 'auth-identity' }
-  }
-  if (/^(?:jwt_forgery|token_forgery|cryptographic_scope_replay)$/.test(key)) {
-    return { cwe: 'CWE-347', family: ['CWE-347', 'CWE-287', 'CWE-345'], category: 'auth-identity' }
-  }
-  if (/^(?:auth_bypass|broken_auth|auth_protocol|authentication_bypass)$/.test(key)) {
-    return { cwe: 'CWE-287', family: ['CWE-287', 'CWE-306', 'CWE-347', 'CWE-345', 'CWE-613', 'CWE-384'], category: 'auth-identity' }
-  }
-  if (/^(?:temporal_revocation|session_revocation|session_fixation)$/.test(key)) {
-    return { cwe: 'CWE-613', family: ['CWE-613', 'CWE-384', 'CWE-287'], category: 'auth-identity' }
-  }
-  if (/^(?:race|race_double_spend|race_condition|race_burst|double_spend|oversell|inventory_oversell|conserved_balance|toctou)$/.test(key)) {
-    return { cwe: 'CWE-362', family: ['CWE-362', 'CWE-367', 'CWE-840'], category: 'business-logic-race' }
-  }
-  if (/^(?:business_logic|invariant_violation|workflow_skip|economic_conservation)$/.test(key)) {
-    return { cwe: 'CWE-840', family: ['CWE-840', 'CWE-362', 'CWE-367'], category: 'business-logic-race' }
-  }
-  if (/^(?:parser_cache_differential|cache_poisoning|cache_deception|request_smuggling)$/.test(key)) {
-    return { cwe: 'CWE-444', family: ['CWE-444', 'CWE-436', 'CWE-525'], category: 'misconfig-exposure' }
-  }
-  if (/^(?:disclosure|info_disclosure|sensitive_data_exposure)$/.test(key)) {
-    return { cwe: 'CWE-200', family: ['CWE-200', 'CWE-209', 'CWE-359'], category: 'misconfig-exposure' }
-  }
-  return { cwe: attr.cwe, family: [attr.cwe], category: attr.category }
+  return cweFamilyFromTaxonomy(vulnClass)
 }
 
 /** Check whether a finding CWE belongs to the accepted CWE family of a verified receipt class. */
@@ -469,19 +413,26 @@ export function bindConfirmedFindingIdentity(
   let boundCwe: string | undefined
   let boundCategory: Finding['category']
   if (receiptFamily) {
-    const specMatchesReceiptFamily = Boolean(specCwe && receiptFamily.family.includes(specCwe))
-    const evidenceMatchesReceiptFamily = Boolean(
-      evidenceAligned?.cwe && receiptFamily.family.includes(normalizeCwe(evidenceAligned.cwe)),
-    )
-    if (evidenceMatchesReceiptFamily && evidenceAligned) {
-      boundCwe = normalizeCwe(evidenceAligned.cwe)
-      boundCategory = evidenceAligned.category
-    } else if (specMatchesReceiptFamily && specCwe) {
-      boundCwe = specCwe
-      boundCategory = spec.category ?? receiptFamily.category
-    } else {
+    if (receiptFamily.unclassified) {
+      // R3-11: Unknown receipt classes stay visible as 'unclassified' rather than silently
+      // falling through to CWE-200 / misconfig-exposure or dropping the confirmed finding.
       boundCwe = receiptFamily.cwe
       boundCategory = receiptFamily.category
+    } else {
+      const specMatchesReceiptFamily = Boolean(specCwe && receiptFamily.family.includes(specCwe))
+      const evidenceMatchesReceiptFamily = Boolean(
+        evidenceAligned?.cwe && receiptFamily.family.includes(normalizeCwe(evidenceAligned.cwe)),
+      )
+      if (evidenceMatchesReceiptFamily && evidenceAligned) {
+        boundCwe = normalizeCwe(evidenceAligned.cwe)
+        boundCategory = evidenceAligned.category
+      } else if (specMatchesReceiptFamily && specCwe) {
+        boundCwe = specCwe
+        boundCategory = spec.category ?? receiptFamily.category
+      } else {
+        boundCwe = receiptFamily.cwe
+        boundCategory = receiptFamily.category
+      }
     }
   } else {
     boundCwe = evidenceAligned?.cwe
@@ -1240,222 +1191,19 @@ export function isFindingClassSupersessionCompatible(
 }
 
 /**
- * Confirmation attribution for an agent script proof: reporting vocabulary for a class whose
- * confirmation came from the script's receipt. Only labels/CWE/copy — never a verification input.
+ * Confirmation attribution for an agent script proof: reporting vocabulary derived directly from
+ * `src/vuln-taxonomy.ts` (`R3-11`). Only labels/CWE/copy — never a verification input. Unknown
+ * classes map visibly to `'unclassified'` instead of silently reporting `CWE-200`.
  */
 export function agentProofAttribution(vulnClass: string): {
   label: string
   cwe: string
-  category: OwaspCategory
+  category: TaxonomyCategory
+  unclassified: boolean
   impact: string
   remediation: string
 } {
-  const key = vulnClass.toLowerCase()
-  if (/^(?:bol[ai]|idor|cross_tenant|authorization|access_control|broken-access-control)$/.test(key)) {
-    return {
-      label: 'broken object-level authorization',
-      cwe: 'CWE-639',
-      category: 'broken-access-control',
-      impact: 'An authenticated actor read or changed a resource owned by another tenant or user.',
-      remediation: 'Enforce an object-level authorization check on every request that names a resource id.',
-    }
-  }
-  if (/^(?:jwt_forgery|token_forgery)$/.test(key)) {
-    return {
-      label: 'JWT / token forgery authentication bypass',
-      cwe: 'CWE-347',
-      category: 'auth-identity',
-      impact: 'A forged or improperly verified authentication token bypassed authentication on a protected route.',
-      remediation: 'Verify token signatures strictly against an explicit algorithm allowlist and server-controlled key material; reject alg=none and untrusted headers.',
-    }
-  }
-  if (/^(?:auth_bypass|broken_auth|auth_protocol|authentication_bypass)$/.test(key)) {
-    return {
-      label: 'authentication bypass',
-      cwe: 'CWE-287',
-      category: 'auth-identity',
-      impact: 'A crafted authentication header, token, or bypass parameter granted access to a route that denies unauthenticated callers.',
-      remediation: 'Enforce server-side session/token verification uniformly and never trust client-supplied identity or bypass headers.',
-    }
-  }
-  if (/^(?:bfla|privilege_escalation)$/.test(key)) {
-    return {
-      label: 'broken function-level authorization',
-      cwe: 'CWE-285',
-      category: 'broken-access-control',
-      impact: 'A lower-privileged actor invoked a privileged function that should be role-gated.',
-      remediation: 'Gate the function server-side on the caller role, not on client-side visibility.',
-    }
-  }
-  if (/^mass_assignment$/.test(key)) {
-    return {
-      label: 'mass assignment',
-      cwe: 'CWE-915',
-      category: 'broken-access-control',
-      impact: 'An over-posted field persisted a value the actor was not allowed to set.',
-      remediation: 'Allowlist assignable fields and bind them explicitly server-side.',
-    }
-  }
-  if (/^csrf$/.test(key)) {
-    return {
-      label: 'cross-site request forgery',
-      cwe: 'CWE-352',
-      category: 'auth-identity',
-      impact: 'A cross-site request performed a state change as the victim without a valid intent token.',
-      remediation: 'Require a per-session anti-CSRF token (or SameSite=Lax cookies) on state-changing routes.',
-    }
-  }
-  if (/^(?:ssti|template_injection)$/.test(key)) {
-    return {
-      label: 'server-side template injection',
-      cwe: 'CWE-1336',
-      category: 'injection-input',
-      impact: 'Untrusted input was evaluated by a server-side template engine.',
-      remediation: 'Pass user input as template data rather than compiling it as template source; use a logic-less or sandboxed template context.',
-    }
-  }
-  if (/^(?:sqli|sqli_error|sql_boolean|sql_boolean_diff|blind_sqli|sqli_status|sqli_time)$/.test(key)) {
-    return {
-      label: 'SQL injection',
-      cwe: 'CWE-89',
-      category: 'injection-input',
-      impact: 'Injected input changed the SQL query structure or timing of the server-side operation.',
-      remediation: 'Use parameterized queries / prepared statements; never concatenate input into SQL.',
-    }
-  }
-  if (/^(?:command_injection|cmdi)$/.test(key)) {
-    return {
-      label: 'command injection',
-      cwe: 'CWE-78',
-      category: 'injection-input',
-      impact: 'Injected input altered a server-side OS command execution.',
-      remediation: 'Pass arguments as an argv array without a shell and strictly allowlist dynamic parameters.',
-    }
-  }
-  if (/^(?:path_traversal|directory_traversal)$/.test(key)) {
-    return {
-      label: 'path traversal',
-      cwe: 'CWE-22',
-      category: 'injection-input',
-      impact: 'Path input escaped the intended base directory on the server.',
-      remediation: 'Resolve canonical paths and verify they remain inside the allowed root directory.',
-    }
-  }
-  if (/^(?:injection|nosqli|nosql_injection)$/.test(key)) {
-    return {
-      label: 'injection',
-      cwe: 'CWE-74',
-      category: 'injection-input',
-      impact: 'Injected input changed the query/command structure or timing of the server-side operation.',
-      remediation: 'Use parameterized queries and context-appropriate encoding; never concatenate input into a command.',
-    }
-  }
-  if (/^(?:xss|xss_stored|xss_reflected|markup|html_injection)$/.test(key)) {
-    return {
-      label: 'cross-site scripting',
-      cwe: 'CWE-79',
-      category: 'injection-input',
-      impact: 'Actor-supplied markup was stored or reflected and executed in another user’s browser context.',
-      remediation: 'Encode output for the HTML context and apply a restrictive Content-Security-Policy.',
-    }
-  }
-  if (/^(?:xxe|blind_xxe)$/.test(key)) {
-    return {
-      label: 'XML external entity injection',
-      cwe: 'CWE-611',
-      category: 'ssrf-redirects',
-      impact: 'The XML parser resolved an attacker-supplied external entity or out-of-band canary.',
-      remediation: 'Disable external entities and DTD processing in the XML parser.',
-    }
-  }
-  if (/^(?:ssrf|blind_ssrf|oob|webhook_forgery)$/.test(key)) {
-    return {
-      label: 'server-side request forgery',
-      cwe: 'CWE-918',
-      category: 'ssrf-redirects',
-      impact: 'The target fetched an attacker-supplied destination or out-of-band canary.',
-      remediation: 'Allowlist outbound destinations and disable external entity resolution for XML parsers.',
-    }
-  }
-  if (/^(?:open_redirect|redirect)$/.test(key)) {
-    return {
-      label: 'open redirect',
-      cwe: 'CWE-601',
-      category: 'ssrf-redirects',
-      impact: 'An attacker-controlled redirect target sent users to an untrusted external origin.',
-      remediation: 'Restrict redirect targets to relative paths or an explicit allowlist of trusted origins.',
-    }
-  }
-  if (/^(?:race|race_double_spend|race_condition|race_burst|double_spend|oversell|inventory_oversell|conserved_balance|toctou)$/.test(key)) {
-    return {
-      label: 'race condition',
-      cwe: 'CWE-362',
-      category: 'business-logic-race',
-      impact: 'A synchronized burst of the same request produced divergent outcomes (over-spend or duplicate effect).',
-      remediation: 'Serialize the state transition (unique constraint, lock, or idempotency key).',
-    }
-  }
-  if (/^(?:business_logic|invariant_violation|workflow_skip|economic_conservation)$/.test(key)) {
-    return {
-      label: 'business-logic invariant violation',
-      cwe: 'CWE-840',
-      category: 'business-logic-race',
-      impact: 'A workflow or conservation invariant was violated by a multi-step sequence.',
-      remediation: 'Enforce the invariant server-side atomically and re-validate workflow state on every transition.',
-    }
-  }
-  if (/^dual_tenant_abac$/.test(key)) {
-    return {
-      label: 'cross-tenant ABAC authorization bypass',
-      cwe: 'CWE-639',
-      category: 'broken-access-control',
-      impact: 'An actor crossed a multi-tenant or role-matrix authorization boundary via a chained sequence.',
-      remediation: 'Enforce tenant and object-level authorization invariants uniformly on every read, batch, and mutation path.',
-    }
-  }
-  if (/^temporal_revocation$/.test(key)) {
-    return {
-      label: 'stale or revoked credential acceptance',
-      cwe: 'CWE-613',
-      category: 'auth-identity',
-      impact: 'A revoked or demoted credential remained honored on a secondary surface after primary revocation.',
-      remediation: 'Propagate session/token revocation synchronously across every primary, streaming, and async surface.',
-    }
-  }
-  if (/^cryptographic_scope_replay$/.test(key)) {
-    return {
-      label: 'cryptographic scope replay / signature forgery',
-      cwe: 'CWE-347',
-      category: 'auth-identity',
-      impact: 'A signed token or webhook signature was forged or replayed across tenant or scope boundaries.',
-      remediation: 'Keep signing material strictly private and bind signatures to tenant, audience, and action scope.',
-    }
-  }
-  if (/^parser_cache_differential$/.test(key)) {
-    return {
-      label: 'parser / cache differential boundary bypass',
-      cwe: 'CWE-444',
-      category: 'misconfig-exposure',
-      impact: 'A parser or cache key differential between surfaces bypassed access or tenant isolation.',
-      remediation: 'Normalize parsing across layers and key shared caches by tenant and authenticated identity.',
-    }
-  }
-  if (/^cross_surface_pivot$/.test(key)) {
-    return {
-      label: 'cross-surface multi-hop privilege pivot',
-      cwe: 'CWE-918',
-      category: 'ssrf-redirects',
-      impact: 'An attacker-origin chain pivoted across application surfaces to reach a protected internal or privileged action.',
-      remediation: 'Enforce strict authentication, allowlists, and provenance checks at every cross-service and async boundary.',
-    }
-  }
-  return {
-    label: 'information disclosure',
-    cwe: 'CWE-200',
-    category: 'misconfig-exposure',
-    impact: 'The response exposed data the requesting actor was not entitled to read.',
-    remediation: 'Filter responses server-side to the fields the caller is authorized to see.',
-  }
+  return attributionFromTaxonomy(vulnClass)
 }
 
 
@@ -2005,68 +1753,6 @@ export function syncVerifyArtifactsToLedger(input: {
     newCapabilityCount,
     newEdgeCount,
   }
-}
-
-const SENSITIVE_REPO_DOT_DIRS = new Set(['.ssh', '.aws', '.gnupg', '.kube', '.docker'])
-const SENSITIVE_REPO_EXACT_FILES = new Set([
-  '.git-credentials',
-  '.netrc',
-  '.npmrc',
-  '.pypirc',
-  '.htpasswd',
-  'id_rsa',
-  'id_ed25519',
-  'id_ecdsa',
-  'id_dsa',
-  'github-app.json',
-  'credentials.json',
-  'service-account.json',
-  'vault.json',
-  'vault.key',
-  'token.txt',
-  'secrets.json',
-])
-const SENSITIVE_REPO_EXT_RE = /\.(?:pat|salt|pem|key|p12|pfx|jks|keystore|kdbx|token)$/i
-const SAFE_REPO_ENV_TEMPLATE_RE = /^\.env\.(?:example|sample|template|dist|schema)$/i
-const REPO_SOURCE_CODE_EXT_RE = /\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs|py|go|rs|java|kt|rb|php|cs|c|h|cc|cpp|hpp|swift|scala|sql|graphql|gql|md|html|css|scss|vue|svelte)$/i
-const REPO_GIT_CREDENTIAL_FILE_RE = /(?:^|\/)\.git\/(?:config|credentials|fetch_head)$/i
-
-/**
- * H-39: Sensitive repository entry policy matching worker repo-staging exclusions so host-side
- * `scriptPath` reads cannot leak worker-excluded secrets (`.env*`, `.ssh/*`, `.git/config`, keys).
- */
-export function isSensitiveRepoEntry(relPosixPath: string, entryName: string, isDir: boolean): boolean {
-  const relLower = relPosixPath.toLowerCase()
-  const nameLower = entryName.toLowerCase()
-  if (isDir) {
-    if (SENSITIVE_REPO_DOT_DIRS.has(nameLower)) return true
-    if (relLower === '.git/hooks' || relLower.endsWith('/.git/hooks')) return true
-    return false
-  }
-  if (REPO_GIT_CREDENTIAL_FILE_RE.test(relLower)) return true
-  if (SENSITIVE_REPO_EXACT_FILES.has(nameLower)) return true
-  if (SENSITIVE_REPO_EXT_RE.test(nameLower)) return true
-  if (nameLower === '.env' || (nameLower.startsWith('.env.') && !SAFE_REPO_ENV_TEMPLATE_RE.test(nameLower))) {
-    return true
-  }
-  const parentSegments = relLower.split('/').slice(0, -1)
-  if (parentSegments.includes('credentials') && !REPO_SOURCE_CODE_EXT_RE.test(nameLower)) {
-    return true
-  }
-  return false
-}
-
-export function isSensitiveRepoRelativePath(relPosixPath: string): boolean {
-  const normalized = relPosixPath.replace(/\\/g, '/').replace(/^\/+/, '').replace(/\/+$/, '')
-  if (!normalized) return true
-  const segments = normalized.split('/').filter(Boolean)
-  if (segments.length === 0) return true
-  for (let i = 0; i < segments.length - 1; i += 1) {
-    const prefix = segments.slice(0, i + 1).join('/')
-    if (isSensitiveRepoEntry(prefix, segments[i]!, true)) return true
-  }
-  const leaf = segments[segments.length - 1]!
-  return isSensitiveRepoEntry(segments.join('/'), leaf, false)
 }
 
 /** H-20: Run-scoped request-side carrier recorded for late async OOB callback promotion. */
@@ -3322,7 +3008,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
     candidate: {
       origin: string
       cwe: string
-      category: OwaspCategory
+      category: TaxonomyCategory
       normalizedEndpoint: string | null
       method: string | null
       terminalOracleFamily: string | null
@@ -3368,7 +3054,7 @@ export class ExecVerifier extends ExecServiceModule<ExecVerifyHost> {
   agentProofAttributionSpec(input: {
     origin: string
     title: string
-    attribution: ReturnType<typeof agentProofAttribution>
+    attribution: Omit<ReturnType<typeof agentProofAttribution>, 'unclassified'> & { unclassified?: boolean }
     severity: Finding['severity']
     envelope: AgentScriptProofEnvelope
     proof: AgentScriptProofResult

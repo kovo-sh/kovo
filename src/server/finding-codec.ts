@@ -67,12 +67,28 @@ export const PROMOTED_FINDING_COLUMNS = [
 ] as const
 
 /**
- * Single authoritative SQL predicate for runtime-confirmed findings.
+ * Single authoritative SQL predicate for machine-confirmed runtime findings (scorer-independent).
  * Excludes static advisories (`static_verified`), pending/inconclusive/dismissed items, and
  * superseded duplicates. Reads only indexed relational columns (zero `json_extract`).
  */
-export const CONFIRMED_FINDING_PREDICATE_SQL =
-  "verification_class = 'runtime_confirmed' AND status = 'confirmed' AND superseded_by_finding_id IS NULL"
+export function confirmedFindingPredicateSql(alias?: string): string {
+  const p = alias ? `${alias}.` : ''
+  return `${p}verification_class = 'runtime_confirmed' AND ${p}status = 'confirmed' AND ${p}superseded_by_finding_id IS NULL`
+}
+
+export const CONFIRMED_FINDING_PREDICATE_SQL = confirmedFindingPredicateSql()
+
+/**
+ * Single authoritative triage-aware SQL twin of `projectRunFindings(...).counts.confirmed` (`R3-18`).
+ * Used by operator surfaces (`workspaceSummary`, `projectDetail`) so confirmed counts match
+ * `src/findings-view.ts` exactly, excluding `false_positive` and `accepted_risk` triaged rows.
+ */
+export function operatorConfirmedFindingPredicateSql(alias?: string): string {
+  const p = alias ? `${alias}.` : ''
+  return `${confirmedFindingPredicateSql(alias)} AND (${p}triage_status IS NULL OR ${p}triage_status NOT IN ('false_positive', 'accepted_risk'))`
+}
+
+export const OPERATOR_CONFIRMED_FINDING_PREDICATE_SQL = operatorConfirmedFindingPredicateSql()
 
 const findingStatusSet = new Set<string>(findingStatuses)
 const operatorTriageStatusSet = new Set<string>(operatorTriageStatuses)
@@ -643,8 +659,9 @@ export const FindingCodec = {
   },
 
   /**
-   * Indexed rollup of `(findingCount, confirmedCount)` per run ID using only promoted relational
-   * columns (`verification_class`, `status`, `superseded_by_finding_id`). Zero `json_extract`.
+   * Indexed triage-aware rollup of `(findingCount, confirmedCount)` per run ID using only promoted
+   * relational columns (`verification_class`, `status`, `superseded_by_finding_id`, `triage_status`).
+   * Matches `projectRunFindings(...).counts.confirmed` on operator surfaces. Zero `json_extract`.
    */
   rollupCountsByRunIds(
     client: DatabaseSync,
@@ -661,7 +678,7 @@ export const FindingCodec = {
       SELECT
         run_id AS runId,
         count(*) AS findingCount,
-        sum(CASE WHEN ${CONFIRMED_FINDING_PREDICATE_SQL} THEN 1 ELSE 0 END) AS confirmedCount
+        sum(CASE WHEN ${OPERATOR_CONFIRMED_FINDING_PREDICATE_SQL} THEN 1 ELSE 0 END) AS confirmedCount
       FROM findings
       WHERE run_id IN (${placeholders})
         AND superseded_by_finding_id IS NULL
@@ -677,12 +694,22 @@ export const FindingCodec = {
     return out
   },
 
-  /** Indexed count of runtime-confirmed, non-superseded findings for a single run. */
+  /** Indexed count of runtime-confirmed, non-superseded findings for a single run (machine/scorer truth). */
   countConfirmedForRun(client: DatabaseSync, runId: string): number {
     const row = client.prepare(`
       SELECT count(*) AS c
       FROM findings
       WHERE run_id = ? AND ${CONFIRMED_FINDING_PREDICATE_SQL}
+    `).get(runId) as { c?: number } | undefined
+    return Number(row?.c ?? 0)
+  },
+
+  /** Indexed triage-aware count of operator-confirmed findings matching `projectRunFindings().counts.confirmed`. */
+  countOperatorConfirmedForRun(client: DatabaseSync, runId: string): number {
+    const row = client.prepare(`
+      SELECT count(*) AS c
+      FROM findings
+      WHERE run_id = ? AND ${OPERATOR_CONFIRMED_FINDING_PREDICATE_SQL}
     `).get(runId) as { c?: number } | undefined
     return Number(row?.c ?? 0)
   },

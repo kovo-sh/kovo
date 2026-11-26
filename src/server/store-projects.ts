@@ -22,8 +22,10 @@ import type {
   projectAsset,
 } from '../domain.ts'
 import { parseDnsInventory } from '../passive-dns.ts'
+import { operatorConfirmedFindingPredicateSql } from './finding-codec.ts'
 import { deletePersonaCredentialFiles } from './persona-vault.ts'
 import { redact } from './redact.ts'
+import { deriveRunActivity } from './run-status.ts'
 import * as tables from './schema.ts'
 import {
   TenantIsolationError,
@@ -123,12 +125,12 @@ export class ProjectsRepository {
         `).all(workspaceId) as { projectId: string; hostCount: number }[])
     const hostCounts = new Map(hostCountRows.map(r => [r.projectId, Number(r.hostCount)]))
 
+    const opConfirmedSql = operatorConfirmedFindingPredicateSql('f')
     const latestRunRows = tenantId
       ? (this.session.client.prepare(`
           select r.id as id, r.project_id as projectId, r.goal as goal, r.status as status, r.phase as phase,
             r.created_at as startedAt,
-            (select count(*) from findings f where f.run_id = r.id and f.superseded_by_finding_id is null
-              and json_extract(f.finding, '$.status') in ('confirmed', 'verified', 'static_verified')) as confirmedCount,
+            (select count(*) from findings f where f.run_id = r.id and ${opConfirmedSql}) as confirmedCount,
             (select count(*) from findings f where f.run_id = r.id and f.superseded_by_finding_id is null) as findingCount
           from runs r
           join projects p on p.id = r.project_id
@@ -145,8 +147,7 @@ export class ProjectsRepository {
       : (this.session.client.prepare(`
           select r.id as id, r.project_id as projectId, r.goal as goal, r.status as status, r.phase as phase,
             r.created_at as startedAt,
-            (select count(*) from findings f where f.run_id = r.id and f.superseded_by_finding_id is null
-              and json_extract(f.finding, '$.status') in ('confirmed', 'verified', 'static_verified')) as confirmedCount,
+            (select count(*) from findings f where f.run_id = r.id and ${opConfirmedSql}) as confirmedCount,
             (select count(*) from findings f where f.run_id = r.id and f.superseded_by_finding_id is null) as findingCount
           from runs r
           where r.workspace_id = ?
@@ -171,8 +172,7 @@ export class ProjectsRepository {
       ? (this.session.client.prepare(`
           select r.id as id, r.project_id as projectId, p.name as projectName, r.goal as goal,
             r.status as status, r.phase as phase, r.created_at as startedAt,
-            (select count(*) from findings f where f.run_id = r.id and f.superseded_by_finding_id is null
-              and json_extract(f.finding, '$.status') in ('confirmed', 'verified', 'static_verified')) as confirmedCount,
+            (select count(*) from findings f where f.run_id = r.id and ${opConfirmedSql}) as confirmedCount,
             (select count(*) from findings f where f.run_id = r.id and f.superseded_by_finding_id is null) as findings
           from runs r
           join projects p on p.id = r.project_id
@@ -184,8 +184,7 @@ export class ProjectsRepository {
       : (this.session.client.prepare(`
           select r.id as id, r.project_id as projectId, p.name as projectName, r.goal as goal,
             r.status as status, r.phase as phase, r.created_at as startedAt,
-            (select count(*) from findings f where f.run_id = r.id and f.superseded_by_finding_id is null
-              and json_extract(f.finding, '$.status') in ('confirmed', 'verified', 'static_verified')) as confirmedCount,
+            (select count(*) from findings f where f.run_id = r.id and ${opConfirmedSql}) as confirmedCount,
             (select count(*) from findings f where f.run_id = r.id and f.superseded_by_finding_id is null) as findings
           from runs r
           join projects p on p.id = r.project_id
@@ -304,12 +303,14 @@ export class ProjectsRepository {
       turnsUsed: tables.runs.turnsUsed,
       createdAt: tables.runs.createdAt,
     }).from(tables.runs).where(eq(tables.runs.projectId, projectId)).orderBy(desc(tables.runs.createdAt)).all()
+    const opConfirmedSql = operatorConfirmedFindingPredicateSql('f')
     const findingCountRows = this.session.client.prepare(`
       SELECT r.id AS runId,
         (SELECT count(*) FROM findings f WHERE f.run_id = r.id AND f.superseded_by_finding_id IS NULL) AS findingCount,
-        (SELECT count(*) FROM findings f WHERE f.run_id = r.id AND f.superseded_by_finding_id IS NULL
-          AND json_extract(f.finding, '$.status') IN ('confirmed', 'verified', 'static_verified')) AS confirmedCount,
-        (SELECT count(*) FROM assignments a WHERE a.run_id = r.id AND a.status IN ('running', 'waiting_approval')) AS activeAssignments,
+        (SELECT count(*) FROM findings f WHERE f.run_id = r.id AND ${opConfirmedSql}) AS confirmedCount,
+        (SELECT count(*) FROM assignments a WHERE a.run_id = r.id AND a.status = 'running') AS runningAssignments,
+        (SELECT count(*) FROM assignments a WHERE a.run_id = r.id AND a.status = 'waiting_approval') AS parkedApprovals,
+        (SELECT count(*) FROM approval_requests ar WHERE ar.run_id = r.id AND ar.status = 'pending') AS pendingApprovals,
         (SELECT count(*) FROM lab_containers lc WHERE lc.run_id = r.id AND lc.status = 'running') AS activeLabContainers
       FROM runs r
       WHERE r.project_id = ? AND r.workspace_id = ?
@@ -317,13 +318,17 @@ export class ProjectsRepository {
       runId: string
       findingCount: number
       confirmedCount: number
-      activeAssignments: number
+      runningAssignments: number
+      parkedApprovals: number
+      pendingApprovals: number
       activeLabContainers: number
     }[]
     const findingCounts = new Map(findingCountRows.map(r => [r.runId, {
       findingCount: Number(r.findingCount),
       confirmedCount: Number(r.confirmedCount),
-      activeAssignments: Number(r.activeAssignments),
+      runningAssignments: Number(r.runningAssignments),
+      parkedApprovals: Number(r.parkedApprovals),
+      pendingApprovals: Number(r.pendingApprovals),
       activeLabContainers: Number(r.activeLabContainers),
     }]))
     return {
@@ -333,11 +338,19 @@ export class ProjectsRepository {
       specs: this.listProjectSpecs(projectId),
       runs: runRows.map(r => {
         const counts = findingCounts.get(r.id)
+        const activity = deriveRunActivity({
+          status: r.status,
+          runningAssignments: counts?.runningAssignments ?? 0,
+          parkedApprovalAssignments: counts?.parkedApprovals ?? 0,
+          pendingApprovals: counts?.pendingApprovals ?? 0,
+          runningLabContainers: counts?.activeLabContainers ?? 0,
+        })
         return {
           ...r,
           findingCount: counts?.findingCount ?? 0,
           confirmedCount: counts?.confirmedCount ?? 0,
-          isActive: r.status === 'running' || (counts?.activeAssignments ?? 0) > 0 || (counts?.activeLabContainers ?? 0) > 0,
+          activity,
+          isActive: activity.hasLiveWork,
         }
       }),
     }

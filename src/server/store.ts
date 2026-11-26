@@ -23,6 +23,7 @@ import { validateCitingColumnsAgainstTables } from './evidence-citations.ts'
 import { FindingCodec } from './finding-codec.ts'
 import { cancelOobDrainForRun, isDeletedRunRaceError, isOobDrainActive } from './oob-drain.ts'
 import { listProjectPersonas } from './persona-vault.ts'
+import { deriveRunActivity, isRunDeleteBlocked, isTerminalRunStatus, type RunActivity } from './run-status.ts'
 import * as tables from './schema.ts'
 import { FindingsRepository } from './store-findings.ts'
 import { ProjectsRepository } from './store-projects.ts'
@@ -1871,6 +1872,7 @@ export class Store {
   taintBoardMessagesForRevokedOrigins(...args: Parameters<RunsRepository['taintBoardMessagesForRevokedOrigins']>) { return this.runsRepo.taintBoardMessagesForRevokedOrigins(...args) }
   eventsAfter(...args: Parameters<RunsRepository['eventsAfter']>) { return this.runsRepo.eventsAfter(...args) }
   runShellSummary(...args: Parameters<RunsRepository['runShellSummary']>) { return this.runsRepo.runShellSummary(...args) }
+  runActivity(...args: Parameters<RunsRepository['runActivity']>) { return this.runsRepo.runActivity(...args) }
   isRunActive(...args: Parameters<RunsRepository['isRunActive']>) { return this.runsRepo.isRunActive(...args) }
   listActiveRunIdsForProject(...args: Parameters<RunsRepository['listActiveRunIdsForProject']>) { return this.runsRepo.listActiveRunIdsForProject(...args) }
   deleteRun(...args: Parameters<RunsRepository['deleteRun']>) {
@@ -2209,18 +2211,21 @@ export interface DeleteLabControl {
   stopLabTarget: (runId: string) => Promise<unknown>
 }
 
-function isRunActiveForDelete(
-  db: Store,
-  exec: DeleteExecutionControl,
-  labRunner: DeleteLabControl,
-  runId: string,
-): boolean {
-  return db.isRunActive(runId)
-    || isOobDrainActive(runId)
-    || Boolean(exec.isRunTrackedActive?.(runId))
-    || Boolean(exec.getLabTargetHandle(runId))
-    || Boolean(labRunner.getTarget(runId))
+function getRunDeleteActivity(db: Store, exec: DeleteExecutionControl, labRunner: DeleteLabControl, runId: string): RunActivity {
+  const base = db.runActivity(runId)
+  const countOf = (code: string) => base.blockingReasons.find(r => r.code === code)?.count ?? 0
+  return deriveRunActivity({
+    status: base.lifecycle,
+    runningAssignments: countOf('live_workers'),
+    parkedApprovalAssignments: base.hasParkedApprovals ? Math.max(1, countOf('parked_approvals')) : 0,
+    runningLabContainers: Math.max(countOf('running_lab_container'), exec.getLabTargetHandle(runId) || labRunner.getTarget(runId) ? 1 : 0),
+    oobDrainActive: isOobDrainActive(runId),
+    trackedActiveTasks: Boolean(exec.isRunTrackedActive?.(runId)),
+  })
 }
+
+const isRunActiveForDelete = (db: Store, exec: DeleteExecutionControl, labRunner: DeleteLabControl, runId: string) =>
+  getRunDeleteActivity(db, exec, labRunner, runId).hasLiveWork
 
 async function stopRunsBeforeDelete(
   db: Store,
@@ -2234,7 +2239,7 @@ async function stopRunsBeforeDelete(
     cancelOobDrainForRun(runId)
     try {
       const current = db.run(runId)
-      if (!['complete', 'stopped'].includes(current.status)) {
+      if (!isTerminalRunStatus(current.status)) {
         db.command({ requestId: randomUUID(), runId, action: 'stop' })
       }
     } catch (error) {
@@ -2275,29 +2280,22 @@ async function stopRunsBeforeDelete(
 }
 
 export async function deleteRunWithActiveGuard(
-  db: Store,
-  exec: DeleteExecutionControl,
-  labRunner: DeleteLabControl,
+  db: Store, exec: DeleteExecutionControl, labRunner: DeleteLabControl,
   input: { runId: string; stopActive?: boolean; waitTimeoutMs?: number },
 ): Promise<{ deleted: boolean; projectId: string; runId: string }> {
-  const isActive = isRunActiveForDelete(db, exec, labRunner, input.runId)
-  if (isActive && !input.stopActive) {
-    throw new Error('This run is currently active. Stop the run first (or choose Stop & Delete) before deleting it.')
+  const activity = getRunDeleteActivity(db, exec, labRunner, input.runId)
+  const needsStop = isRunDeleteBlocked(activity)
+  if (needsStop && !input.stopActive) {
+    throw new Error(activity.hasLiveWork
+      ? 'This run is currently active. Stop the run first (or choose Stop & Delete) before deleting it.'
+      : 'This run has parked approval requests awaiting decision. Confirm Stop & Delete before deleting it.')
   }
-  if (isActive && input.stopActive) {
+  if (needsStop && input.stopActive) {
     await stopRunsBeforeDelete(db, exec, labRunner, [input.runId], input.waitTimeoutMs)
   } else {
     cancelOobDrainForRun(input.runId)
-    if (exec.disposeRun) {
-      const report = await exec.disposeRun(input.runId, {
-        terminalState: 'canceled',
-        reason: 'run deleted',
-        timeoutMs: input.waitTimeoutMs ?? 2_500,
-      })
-      if (report && (report.tasksTimedOut ?? 0) > 0) {
-        throw new RunDeleteBusyError([input.runId])
-      }
-    }
+    const report = await exec.disposeRun?.(input.runId, { terminalState: 'canceled', reason: 'run deleted', timeoutMs: input.waitTimeoutMs ?? 2_500 })
+    if (report && (report.tasksTimedOut ?? 0) > 0) throw new RunDeleteBusyError([input.runId])
     await labRunner.stopLabTarget(input.runId).catch(() => undefined)
   }
   const result = db.deleteRun(input.runId)
@@ -2306,42 +2304,24 @@ export async function deleteRunWithActiveGuard(
 }
 
 export async function deleteProjectWithActiveGuard(
-  db: Store,
-  exec: DeleteExecutionControl,
-  labRunner: DeleteLabControl,
+  db: Store, exec: DeleteExecutionControl, labRunner: DeleteLabControl,
   input: { projectId: string; stopActive?: boolean; waitTimeoutMs?: number },
 ): Promise<{ deleted: boolean; projectId: string; deletedRuns: number }> {
   let detail: ReturnType<Store['projectDetail']> | null = null
-  try {
-    detail = db.projectDetail(input.projectId)
-  } catch {
-    return { deleted: false, projectId: input.projectId, deletedRuns: 0 }
-  }
+  try { detail = db.projectDetail(input.projectId) } catch { return { deleted: false, projectId: input.projectId, deletedRuns: 0 } }
   const allRunIds = detail.runs.map(r => r.id)
-  const activeRunIds = allRunIds.filter(runId => isRunActiveForDelete(db, exec, labRunner, runId))
-  if (activeRunIds.length > 0 && !input.stopActive) {
+  const blockedRunIds = allRunIds.filter(runId => isRunDeleteBlocked(getRunDeleteActivity(db, exec, labRunner, runId)))
+  if (blockedRunIds.length > 0 && !input.stopActive) {
     throw new Error(
-      `This project has ${activeRunIds.length} active ${activeRunIds.length === 1 ? 'run' : 'runs'}. Stop active runs first (or choose Stop & Delete) before deleting the project.`,
+      `This project has ${blockedRunIds.length} active ${blockedRunIds.length === 1 ? 'run' : 'runs'} or parked approvals. Stop active runs first (or choose Stop & Delete) before deleting the project.`,
     )
   }
-  if (activeRunIds.length > 0 && input.stopActive) {
-    await stopRunsBeforeDelete(db, exec, labRunner, activeRunIds, input.waitTimeoutMs)
-  }
-  const remainingRunIds = activeRunIds.length > 0 && input.stopActive
-    ? allRunIds.filter(runId => !activeRunIds.includes(runId))
-    : allRunIds
+  if (blockedRunIds.length > 0 && input.stopActive) await stopRunsBeforeDelete(db, exec, labRunner, blockedRunIds, input.waitTimeoutMs)
+  const remainingRunIds = blockedRunIds.length > 0 && input.stopActive ? allRunIds.filter(id => !blockedRunIds.includes(id)) : allRunIds
   for (const runId of remainingRunIds) {
     cancelOobDrainForRun(runId)
-    if (exec.disposeRun) {
-      const report = await exec.disposeRun(runId, {
-        terminalState: 'canceled',
-        reason: 'project deleted',
-        timeoutMs: input.waitTimeoutMs ?? 2_500,
-      })
-      if (report && (report.tasksTimedOut ?? 0) > 0) {
-        throw new RunDeleteBusyError([runId])
-      }
-    }
+    const report = await exec.disposeRun?.(runId, { terminalState: 'canceled', reason: 'project deleted', timeoutMs: input.waitTimeoutMs ?? 2_500 })
+    if (report && (report.tasksTimedOut ?? 0) > 0) throw new RunDeleteBusyError([runId])
     await labRunner.stopLabTarget(runId).catch(() => undefined)
   }
   const result = db.deleteProject(input.projectId)
