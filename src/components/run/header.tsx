@@ -496,15 +496,19 @@ function LeasesList({ onError }: { onError: (msg: string) => void }) {
   return <div className="flex flex-col gap-1.5" data-testid="approval-leases-list">
     {activeLeases.map(lease => {
       const hostLease = isHostNonDestructiveLease(lease)
-      const prefixLease = !hostLease && isPrefixApprovalPattern(lease.routePattern)
+      const prefixLease = !hostLease && lease.leaseScope === 'prefix'
+      const useLabel = lease.maxUses != null ? `${lease.uses}/${lease.maxUses} uses` : plural(lease.uses, 'use')
+      const personaLabel = lease.crossPersona
+        ? 'Cross-persona'
+        : lease.personaHandle ? `@${lease.personaHandle}` : null
       const meta = [
         hostLease ? 'Host (POST/PUT/PATCH · no DELETE/high-risk)' : prefixLease ? 'Prefix lease' : null,
         lease.expiresAt ? `Expires ${fmtTime(lease.expiresAt)}` : 'No expiry',
-        plural(lease.uses, 'use'),
-        lease.personaHandle ? `@${lease.personaHandle}` : null,
+        useLabel,
+        personaLabel,
       ].filter(Boolean).join(' · ')
       return (
-        <div key={lease.id} className={rowCls} data-lease-scope={hostLease ? 'host_nondestructive' : prefixLease ? 'prefix' : 'route'}>
+        <div key={lease.id} className={rowCls} data-lease-scope={lease.leaseScope ?? (hostLease ? 'host_nondestructive' : prefixLease ? 'prefix' : 'route')}>
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-1.5 font-mono text-[11.5px] text-fg">
               {hostLease

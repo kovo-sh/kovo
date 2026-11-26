@@ -8,12 +8,15 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalS
 import type { ReactNode } from 'react'
 import {
   approvalRouteDedupeKey,
+  DEFAULT_APPROVAL_LEASE_TTL_MS,
+  defaultMaxUsesForLeaseScope,
   defaultPrimaryApprovalScope,
   eligibleApprovalPrefixPattern,
   isHostNonDestructiveEligibleCard,
   normalizeClientApprovalPath,
 } from '../../../domain.ts'
-import type { ApprovalScope } from '../../../domain.ts'
+import type { ApprovalBlastRadiusPreview, ApprovalScope } from '../../../domain.ts'
+import { previewApprovalBlastRadiusAction } from '../../../actions-run-controls.ts'
 import { capabilityTierMeta } from '../../run-state.ts'
 import { useRun, useRunModel } from '../data.tsx'
 import { ACTIONS, actionsFor, approvalCommand, useDecisions } from '../decisions.tsx'
@@ -88,17 +91,7 @@ export function dedupePendingQueueItems(items: readonly QueueItem[]): DedupedQue
   return groups
 }
 
-function normalizeOriginSimple(origin: string): string {
-  return origin.trim().toLowerCase().replace(/\/+$/, '')
-}
-
-function matchesClientPrefixPattern(pathAndQuery: string, prefixPattern: string): boolean {
-  if (!prefixPattern.endsWith('/**') || prefixPattern === '/**') return false
-  const normalized = normalizeClientApprovalPath(pathAndQuery)
-  if (!normalized || normalized.includes('%2a')) return false
-  const base = prefixPattern.slice(0, -3)
-  return normalized === base || normalized.startsWith(`${base}/`)
-}
+const normOrg = (o: string) => o.trim().toLowerCase().replace(/\/+$/, '')
 
 /**
  * Compute IDs of OTHER currently pending approvals that will ALSO be resolved by executing
@@ -110,71 +103,40 @@ export function matchingPendingApprovalIds(
   scope: ApprovalScope,
 ): string[] {
   if (scope === 'once') return []
-  const originKey = normalizeOriginSimple(ap.origin)
-  const methodUpper = ap.method.trim().toUpperCase()
-  if (scope === 'route') {
-    const routeKey = approvalRouteDedupeKey(ap)
-    return activePending
-      .filter(other => other.id !== ap.id && approvalRouteDedupeKey(other) === routeKey)
-      .map(other => other.id)
-  }
-  if (scope === 'prefix') {
-    const prefixPattern = eligibleApprovalPrefixPattern(ap)
-    if (!prefixPattern) return []
-    return activePending
-      .filter(other =>
-        other.id !== ap.id &&
-        other.riskLevel !== 'high' &&
-        normalizeOriginSimple(other.origin) === originKey &&
-        other.method.trim().toUpperCase() === methodUpper &&
-        matchesClientPrefixPattern(other.pathAndQuery, prefixPattern),
-      )
-      .map(other => other.id)
-  }
-  if (!isHostNonDestructiveEligibleCard(ap)) return []
-  return activePending
-    .filter(other =>
-      other.id !== ap.id &&
-      normalizeOriginSimple(other.origin) === originKey &&
-      isHostNonDestructiveEligibleCard(other),
-    )
-    .map(other => other.id)
+  const orig = normOrg(ap.origin)
+  const meth = ap.method.trim().toUpperCase()
+  const key = scope === 'route' ? approvalRouteDedupeKey(ap) : ''
+  const pref = scope === 'prefix' ? eligibleApprovalPrefixPattern(ap) : null
+  const base = pref ? pref.slice(0, -3) : ''
+  if (scope === 'prefix' && !pref) return []
+  if (scope === 'host_nondestructive' && !isHostNonDestructiveEligibleCard(ap)) return []
+  return activePending.filter(o => {
+    if (o.id === ap.id) return false
+    if (scope === 'route') return approvalRouteDedupeKey(o) === key
+    if (normOrg(o.origin) !== orig) return false
+    if (scope === 'host_nondestructive') return isHostNonDestructiveEligibleCard(o)
+    if (o.riskLevel === 'high' || o.method.trim().toUpperCase() !== meth) return false
+    const n = normalizeClientApprovalPath(o.pathAndQuery)
+    return Boolean(n) && !n.includes('%2a') && (n === base || n.startsWith(`${base}/`))
+  }).map(o => o.id)
 }
 
-/** Concise 1-line blast-radius summary displayed above the scoped approval buttons. */
 export function formatApprovalBlastRadius(opts: {
-  ap: Pick<Approval, 'origin' | 'method' | 'pathAndQuery'>
+  ap: Pick<Approval, 'origin' | 'method' | 'pathAndQuery' | 'personaHandle'>
   scope: ApprovalScope
   routePattern: string
   prefixPattern: string | null
   extraResolvedCount: number
+  serverPreview?: ApprovalBlastRadiusPreview | null
 }): string {
-  const method = opts.ap.method.trim().toUpperCase()
-  const totalResolved = opts.extraResolvedCount + 1
-  if (opts.scope === 'once') {
-    return [`Approve once: ${method} ${opts.routePattern}`, 'single request only (no lease)'].filter(Boolean).join(' · ')
-  }
-  if (opts.scope === 'route') {
-    return [
-      `Approve route: ${method} ${opts.routePattern}`,
-      opts.extraResolvedCount > 0
-        ? `also resolves ${plural(totalResolved, 'pending card')}`
-        : 'reuses lease on this route',
-    ].filter(Boolean).join(' · ')
-  }
-  if (opts.scope === 'prefix') {
-    const target = opts.prefixPattern || opts.routePattern
-    return [
-      `Approve prefix: ${method} ${target}`,
-      opts.extraResolvedCount > 0
-        ? `also resolves ${plural(totalResolved, 'pending card')}`
-        : 'future non-high-risk probes under prefix',
-    ].filter(Boolean).join(' · ')
-  }
-  return [
-    `Approve host: POST/PUT/PATCH on ${host(opts.ap.origin)} (no DELETE or high-risk)`,
-    opts.extraResolvedCount > 0 ? `also resolves ${plural(totalResolved, 'pending card')}` : null,
-  ].filter(Boolean).join(' · ')
+  const m = opts.ap.method.trim().toUpperCase()
+  const total = opts.serverPreview ? Math.max(1, opts.serverPreview.pendingApprovalCount) : opts.extraResolvedCount + 1
+  const extra = total - 1
+  if (opts.scope === 'once') return `Approve once: ${m} ${opts.routePattern} · single request only (no lease)`
+  const tail = extra > 0 ? `also resolves ${plural(total, 'pending card')}` : null
+  if (opts.scope === 'route') return `Approve route: ${m} ${opts.routePattern} · ${tail ?? 'reuses lease on this route'}`
+  if (opts.scope === 'prefix') return `Approve prefix: ${m} ${opts.prefixPattern || opts.routePattern} · ${tail ?? 'future non-high-risk probes under prefix'}`
+  return [`Approve host: POST/PUT/PATCH on ${host(opts.ap.origin)} (no DELETE or high-risk)`, tail].filter(Boolean).join(' · ')
 }
 
 function openKeys(q: DecisionsApi) {
@@ -183,10 +145,20 @@ function openKeys(q: DecisionsApi) {
 }
 
 /** Real command for a decision. */
-function commandFor(it: QueueItem, act: DecisionAct, model: RunModel, scope?: ApprovalScope): Command | undefined {
+function commandFor(
+  it: QueueItem,
+  act: DecisionAct,
+  model: RunModel,
+  scope?: ApprovalScope,
+  crossPersona?: boolean,
+): Command | undefined {
   if (it.kind === 'approval' && (act === 'approve' || act === 'deny')) {
     const resolvedScope = act === 'approve' ? (scope ?? defaultPrimaryApprovalScope(it.ap)) : scope
-    return approvalCommand(it.ap.id, act, resolvedScope)
+    const base = approvalCommand(it.ap.id, act, resolvedScope)
+    if (act === 'approve' && crossPersona && resolvedScope && resolvedScope !== 'once' && base.action === 'decide_approval') {
+      return { ...base, crossPersona: true }
+    }
+    return base
   }
   if (it.kind === 'follow' && act === 'queue' && followIsLive(model)) {
     const x = it.cov
@@ -203,29 +175,27 @@ function commandFor(it: QueueItem, act: DecisionAct, model: RunModel, scope?: Ap
 export const followIsLive = (m: RunModel) => m.run.phase !== 'complete' && !['complete', 'stopped', 'failed'].includes(m.run.status)
 
 function decisionMessage(it: QueueItem, act: DecisionAct, scope?: ApprovalScope, extraCount = 0): string {
-  const A = ACTIONS[act]
-  if (it.kind === 'approval') {
-    const target = `${it.ap.method} ${host(it.ap.origin)}${it.ap.pathAndQuery}`
-    const extraSuffix = extraCount > 0 ? ` (+${extraCount} pending)` : ''
-    if (act === 'deny') return `Denied ${target}${extraSuffix}`
-    const resolvedScope = scope ?? defaultPrimaryApprovalScope(it.ap)
-    if (resolvedScope === 'once') return `Approved once: ${target}`
-    if (resolvedScope === 'prefix') {
-      const prefix = eligibleApprovalPrefixPattern(it.ap)
-      return `Approved prefix ${it.ap.method} ${host(it.ap.origin)}${prefix ?? it.ap.pathAndQuery}${extraSuffix}`
-    }
-    if (resolvedScope === 'host_nondestructive') {
-      return `Approved host (non-destructive) on ${host(it.ap.origin)}${extraSuffix}`
-    }
-    return `Approved route: ${target}${extraSuffix}`
-  }
-  return A.label
+  if (it.kind !== 'approval') return ACTIONS[act].label
+  const h = host(it.ap.origin)
+  const target = `${it.ap.method} ${h}${it.ap.pathAndQuery}`
+  const extra = extraCount > 0 ? ` (+${extraCount} pending)` : ''
+  if (act === 'deny') return `Denied ${target}${extra}`
+  const s = scope ?? defaultPrimaryApprovalScope(it.ap)
+  if (s === 'once') return `Approved once: ${target}`
+  if (s === 'prefix') return `Approved prefix ${it.ap.method} ${h}${eligibleApprovalPrefixPattern(it.ap) ?? it.ap.pathAndQuery}${extra}`
+  if (s === 'host_nondestructive') return `Approved host (non-destructive) on ${h}${extra}`
+  return `Approved route: ${target}${extra}`
 }
 
 interface ActDeps { q: DecisionsApi; nav: NavApi; model: RunModel }
 
 /** decide → advance immediately. Returns false when the action does not apply. */
-function runDecision(deps: ActDeps, key: string, act: DecisionAct, opts: { scope?: ApprovalScope; alsoKeys?: readonly string[] } = {}) {
+function runDecision(
+  deps: ActDeps,
+  key: string,
+  act: DecisionAct,
+  opts: { scope?: ApprovalScope; alsoKeys?: readonly string[]; crossPersona?: boolean } = {},
+) {
   const { q, nav, model } = deps
   const it = model.queueItem.get(key)
   if (!it) return false
@@ -234,12 +204,15 @@ function runDecision(deps: ActDeps, key: string, act: DecisionAct, opts: { scope
   const resolvedScope: ApprovalScope | undefined = it.kind === 'approval'
     ? (act === 'approve' ? (opts.scope ?? defaultPrimaryApprovalScope(it.ap)) : opts.scope)
     : undefined
-  const command = commandFor(it, act, model, resolvedScope)
+  const command = commandFor(it, act, model, resolvedScope, opts.crossPersona)
   if (!command) return false
 
   let alsoKeys: string[] = [...(opts.alsoKeys ?? [])]
   if (it.kind === 'approval' && resolvedScope && alsoKeys.length === 0) {
-    alsoKeys = matchingPendingApprovalIds(it.ap, q.activePendingApprovals, resolvedScope).map(id => 'ap:' + id)
+    const pendingPool = opts.crossPersona
+      ? q.activePendingApprovals
+      : q.activePendingApprovals.filter(other => (other.personaHandle?.trim() || null) === (it.ap.personaHandle?.trim() || null))
+    alsoKeys = matchingPendingApprovalIds(it.ap, pendingPool, resolvedScope).map(id => 'ap:' + id)
   }
   const affectedSet = new Set([key, ...alsoKeys])
   const order = visibleOrder.length ? visibleOrder : openKeys(q)
@@ -265,7 +238,8 @@ function useDecide() {
   const model = useRunModel()
   const deps = useRef<ActDeps>({ q, nav, model })
   deps.current = { q, nav, model }
-  return (key: string, act: DecisionAct, opts?: { scope?: ApprovalScope; alsoKeys?: readonly string[] }) => runDecision(deps.current, key, act, opts)
+  return (key: string, act: DecisionAct, opts?: { scope?: ApprovalScope; alsoKeys?: readonly string[]; crossPersona?: boolean }) =>
+    runDecision(deps.current, key, act, opts)
 }
 
 /** Ask the coordinator about an item: chat in the pane with a context chip ("Back to item"). */
@@ -335,7 +309,7 @@ function useEnterFlash(ref: React.RefObject<HTMLDivElement | null>, entering: bo
 }
 
 export function QueueView() {
-  const { send, pending } = useRun()
+  const { pending, now } = useRun()
   const model = useRunModel()
   const q = useDecisions()
   const nav = useNav()
@@ -343,15 +317,7 @@ export function QueueView() {
   const decide = useDecide()
   const ask = useAsk()
   const [collapsed, setCollapsed] = useViewState<Partial<Record<QueueSection, boolean>>>('queue.collapsed', {})
-  const [now, setNow] = useState(() => Date.now())
   const listRef = useRef<HTMLDivElement>(null)
-  const hasPendingApprovals = model.detail.approvals.some(a => a.status === 'pending')
-  useEffect(() => {
-    if (!hasPendingApprovals) return
-    setNow(Date.now())
-    const id = window.setInterval(() => setNow(Date.now()), 15_000)
-    return () => window.clearInterval(id)
-  }, [hasPendingApprovals])
 
   const isCol = (k: QueueSection) => collapsed[k] ?? k === 'done'
   const dedupedDecide = useMemo(() => dedupePendingQueueItems(q.sections.decide), [q.sections.decide])
@@ -499,6 +465,9 @@ function QMeta({ it, model, now }: { it: QueueItem; model: RunModel; now: number
   ]
 }
 
+const ROW_CLS = 'h-10 cursor-pointer [contain-intrinsic-size:auto_40px]'
+const META_CLS = 'flex flex-none items-center gap-2 whitespace-nowrap text-[12px] text-fg-subtle'
+
 function QRow({ it, sec, cur, count = 1, motion: m, now, onSelect, onAct, onAsk }: {
   it: QueueItem
   sec: QueueSection
@@ -516,7 +485,6 @@ function QRow({ it, sec, cur, count = 1, motion: m, now, onSelect, onAct, onAsk 
   const leaving = stamping && m.phase === 'leave'
   const A = stamping && m.act ? ACTIONS[m.act] : null
   useEnterFlash(ref, m.enter === it.key)
-  // Collapse our own height so the reflow that follows lands on the same layout.
   useLayoutEffect(() => {
     const el = ref.current
     if (!el || !leaving) return
@@ -532,7 +500,8 @@ function QRow({ it, sec, cur, count = 1, motion: m, now, onSelect, onAct, onAsk 
     ref={ref}
     className={cn(
       RW.row,
-      'group/row h-10 cursor-pointer [contain-intrinsic-size:auto_40px]',
+      'group/row',
+      ROW_CLS,
       'data-[leaving]:overflow-hidden data-[leaving]:border-b-transparent data-[leaving]:opacity-0 data-[leaving]:[transition:height_var(--d3)_var(--ease),opacity_var(--d2)_var(--ease),border-color_var(--d2)]',
       cur && RW.rowCur,
     )}
@@ -546,26 +515,21 @@ function QRow({ it, sec, cur, count = 1, motion: m, now, onSelect, onAct, onAsk 
       {count > 1 && (
         <span
           className="inline-flex h-[18px] flex-none items-center rounded-[10px] bg-warn-soft px-1.5 text-[11px] font-semibold leading-none tabular-nums text-warn shadow-[inset_0_0_0_1px_var(--warn-line)]"
-          title={`${count} pending approval cards for this exact normalized route`}
+          title={`${count} pending approval cards for this route`}
           data-testid="queue-dedupe-badge"
         >
           ×{count}
         </span>
       )}
     </span>
-    <span className={cn(
-      'flex flex-none items-center gap-2 whitespace-nowrap text-[12px] text-fg-subtle transition-opacity duration-[var(--d1)] group-hover/row:opacity-0',
-      (cur || stamping) && 'opacity-0',
-    )}>
+    <span className={cn(META_CLS, 'transition-opacity duration-[var(--d1)] group-hover/row:opacity-0', (cur || stamping) && 'opacity-0')}>
       {meta.map((x, i) => <span key={i} className="inline-flex items-center gap-2">{i > 0 && <span className="text-fg-faint">·</span>}{x}</span>)}
     </span>
     {sec !== 'done' && <span className={cn(
-      'pointer-events-none absolute right-3 top-1/2 flex -translate-y-1/2 translate-x-1 gap-1 pl-6 opacity-0 transition-[opacity,transform] duration-[var(--d1)] ease-kovo',
-      cur
-        ? 'bg-gradient-to-r from-transparent via-[var(--row-s)] to-[var(--row-s)]'
-        : 'bg-gradient-to-r from-transparent via-[var(--row-h)] to-[var(--row-h)]',
+      'pointer-events-none absolute right-3 top-1/2 flex -translate-y-1/2 translate-x-1 gap-1 bg-gradient-to-r from-transparent pl-6 opacity-0 transition-[opacity,transform] duration-[var(--d1)] ease-kovo',
+      cur ? 'via-[var(--row-s)] to-[var(--row-s)]' : 'via-[var(--row-h)] to-[var(--row-h)]',
       stamping
-        ? 'pointer-events-none opacity-0!'
+        ? 'opacity-0!'
         : cur
           ? 'pointer-events-auto translate-x-0 opacity-100'
           : 'group-hover/row:pointer-events-auto group-hover/row:translate-x-0 group-hover/row:opacity-100',
@@ -573,10 +537,7 @@ function QRow({ it, sec, cur, count = 1, motion: m, now, onSelect, onAct, onAsk 
       {acts.map(([a, l, k, p]) => <button
         key={a}
         type="button"
-        className={cn(
-          runBtn({ variant: p ? 'ink' : 'default', size: 'sm' }),
-          !p && 'text-fg-muted hover:text-fg',
-        )}
+        className={cn(runBtn({ variant: p ? 'ink' : 'default', size: 'sm' }), !p && 'text-fg-muted hover:text-fg')}
         title={`${l} (${k.toUpperCase()})`}
         onClick={e => { e.stopPropagation(); onAct(a) }}
       >
@@ -592,10 +553,7 @@ function QRow({ it, sec, cur, count = 1, motion: m, now, onSelect, onAct, onAsk 
         <Icon name="chat" />
       </button>
     </span>}
-    {A && <span className={cn(
-      runStamp({ tone: A.tone }),
-      'absolute right-4 top-1/2 z-[2] h-6 -translate-y-1/2 transition-[opacity,transform] duration-[var(--d2)] ease-spring',
-    )}>
+    {A && <span className={cn(runStamp({ tone: A.tone }), 'absolute right-4 top-1/2 z-[2] h-6 -translate-y-1/2 transition-[opacity,transform] duration-[var(--d2)] ease-spring')}>
       <Icon name={A.icon} />{A.label}
     </span>}
   </div>
@@ -609,31 +567,20 @@ function DoneRow({ it, cur, entering, now, onSelect }: { it: QueueItem; cur: boo
   let right: ReactNode = null
   if (dec) {
     const A = ACTIONS[dec.act]
-    right = <span className={cn(runDec({ tone: A.tone === 'no' ? 'default' : A.tone }), '[&_svg]:size-[13px]')}>
-      <Icon name={A.icon} />{A.label}
-    </span>
+    right = <span className={cn(runDec({ tone: A.tone === 'no' ? 'default' : A.tone }), '[&_svg]:size-[13px]')}><Icon name={A.icon} />{A.label}</span>
   } else if (it.kind === 'finding') right = <VState status={it.status} />
   else if (it.kind === 'approval') {
     const expired = isApprovalExpired(it.ap, now)
     const status = expired ? 'expired' : it.ap.status
-    right = <span className={cn(runDec(), '[&_svg]:size-[13px]')}>
-      <StatusGlyph status={status} />{cap(status)}{!expired && it.ap.decidedBy ? ' · ' + it.ap.decidedBy : ''}
-    </span>
+    right = <span className={cn(runDec(), '[&_svg]:size-[13px]')}><StatusGlyph status={status} />{cap(status)}{!expired && it.ap.decidedBy ? ' · ' + it.ap.decidedBy : ''}</span>
   }
-  return <div
-    ref={ref}
-    className={cn(RW.row, 'h-10 cursor-pointer [contain-intrinsic-size:auto_40px]', cur && RW.rowCur)}
-    data-id={it.key}
-    onClick={onSelect}
-    aria-selected={cur}
-  >
+  return <div ref={ref} className={cn(RW.row, ROW_CLS, cur && RW.rowCur)} data-id={it.key} onClick={onSelect} aria-selected={cur}>
     <QGlyph it={it} />
     <span className="flex min-w-0 flex-1 items-center gap-2"><QTitle it={it} done /></span>
-    <span className="flex flex-none items-center gap-2 whitespace-nowrap text-[12px] text-fg-subtle">{right}</span>
+    <span className={META_CLS}>{right}</span>
   </div>
 }
 
-/** Done: your decisions first, then the approval audit log. */
 function DoneRows({ items, selKey, now }: { items: QueueItem[]; selKey: string | null; now: number }) {
   const q = useDecisions()
   const nav = useNav()
@@ -641,8 +588,9 @@ function DoneRows({ items, selKey, now }: { items: QueueItem[]; selKey: string |
   const auto = (it: QueueItem) => it.kind === 'approval' && !q.get(it.key) && (it.ap.decidedBy ?? '').startsWith('auto')
   const main = items.filter(it => !auto(it))
   const log = items.filter(auto)
+  const render = (it: QueueItem) => <DoneRow key={it.key} it={it} cur={it.key === selKey} entering={m.enter === it.key} now={now} onSelect={() => nav.select({ kind: 'queue', id: it.key })} />
   return <>
-    {main.map(it => <DoneRow key={it.key} it={it} cur={it.key === selKey} entering={m.enter === it.key} now={now} onSelect={() => nav.select({ kind: 'queue', id: it.key })} />)}
+    {main.map(render)}
     {log.length > 0 && <>
       <div className="flex h-[30px] items-center gap-2 border-b border-line bg-[color-mix(in_srgb,var(--sunk)_55%,transparent)] pl-11 pr-[18px] text-[12px] font-medium text-fg-muted">
         <Icon name="shield" className="text-fg-subtle" />
@@ -650,7 +598,7 @@ function DoneRows({ items, selKey, now }: { items: QueueItem[]; selKey: string |
         <span className="font-normal tabular-nums text-fg-subtle">{log.length}</span>
         <span className="truncate font-normal text-fg-subtle">Audit log of active test requests the policy approved automatically</span>
       </div>
-      {log.map(it => <DoneRow key={it.key} it={it} cur={it.key === selKey} entering={m.enter === it.key} now={now} onSelect={() => nav.select({ kind: 'queue', id: it.key })} />)}
+      {log.map(render)}
     </>}
   </>
 }
@@ -658,25 +606,34 @@ function DoneRows({ items, selKey, now }: { items: QueueItem[]; selKey: string |
 // ---------------------------------------------------------------- inspector
 
 function QueueInspector({ sel }: InspectorProps) {
+  const { now } = useRun()
   const model = useRunModel()
   const q = useDecisions()
   const nav = useNav()
   const m = useMotion()
   const decide = useDecide()
   const ask = useAsk()
-  const [now, setNow] = useState(() => Date.now())
   const [previewScope, setPreviewScope] = useState<ApprovalScope | null>(null)
+  const [crossPersona, setCrossPersona] = useState(false)
+  const [serverPreviews, setServerPreviews] = useState<Record<ApprovalScope, ApprovalBlastRadiusPreview> | null>(null)
   const it = model.queueItem.get(sel.id)
-  const isPendingApproval = it?.kind === 'approval' && it.ap.status === 'pending'
+  const pendingApprovalId = it?.kind === 'approval' && it.ap.status === 'pending' ? it.ap.id : null
   useEffect(() => {
     setPreviewScope(null)
+    setCrossPersona(false)
+    setServerPreviews(null)
   }, [sel.id])
   useEffect(() => {
-    if (!isPendingApproval) return
-    setNow(Date.now())
-    const id = window.setInterval(() => setNow(Date.now()), 15_000)
-    return () => window.clearInterval(id)
-  }, [isPendingApproval])
+    if (!pendingApprovalId) return
+    let active = true
+    void previewApprovalBlastRadiusAction({
+      data: { runId: model.run.id, approvalId: pendingApprovalId, crossPersona },
+    }).then(
+      res => { if (active) setServerPreviews(res) },
+      () => { if (active) setServerPreviews(null) },
+    )
+    return () => { active = false }
+  }, [model.run.id, pendingApprovalId, crossPersona, q.activePendingApprovals.length])
   if (!it) {
     return <>
       <PaneHeader title="Queue" />
@@ -698,19 +655,15 @@ function QueueInspector({ sel }: InspectorProps) {
   const stamped = m.key === it.key && m.phase !== 'idle' && m.act ? ACTIONS[m.act] : null
   const acts = sec !== 'done' ? (it.kind === 'consent' ? [['scope', 'Review scope', 'a', true] as const] : actionsFor(it, now)) : []
   const icon = (a: DecisionAct): IconName => a === 'deny' ? 'x' : a === 'queue' ? 'follow' : 'check'
-  const bannerCls = 'mb-3 flex items-center gap-2 rounded-[7px] bg-sunk px-2.5 py-2 text-[12px] text-fg-muted shadow-[inset_0_0_0_1px_var(--line)]'
-  let banner: ReactNode = null
-  if (dec) {
-    banner = <div className={bannerCls}><Icon name={ACTIONS[dec.act].icon} />
-      <span>{ACTIONS[dec.act].label} by you · {fmtTimeS(dec.at)}{dec.state === 'sent' ? ' · sent to Kovo Hunter' : ''}</span>
-    </div>
-  } else if (expiredApproval) {
-    banner = <div className={bannerCls}><StatusGlyph status="expired" /><span>Expired · this approval window closed at {fmtTimeS(it.ap.expiresAt)}.</span></div>
-  } else if (sec === 'done' && it.kind === 'approval') {
-    banner = <div className={bannerCls}><StatusGlyph status={it.ap.status} /><span>{cap(it.ap.status)}{it.ap.decidedBy ? ' by ' + it.ap.decidedBy : ''}{it.ap.decidedAt ? ' · ' + fmtTimeS(it.ap.decidedAt) : ''}.</span></div>
-  }
+  const bannerBody: ReactNode = dec
+    ? <><Icon name={ACTIONS[dec.act].icon} /><span>{ACTIONS[dec.act].label} by you · {fmtTimeS(dec.at)}{dec.state === 'sent' ? ' · sent to Kovo Hunter' : ''}</span></>
+    : expiredApproval
+      ? <><StatusGlyph status="expired" /><span>Expired · this approval window closed at {fmtTimeS(it.ap.expiresAt)}.</span></>
+      : sec === 'done' && it.kind === 'approval'
+        ? <><StatusGlyph status={it.ap.status} /><span>{cap(it.ap.status)}{it.ap.decidedBy ? ' by ' + it.ap.decidedBy : ''}{it.ap.decidedAt ? ' · ' + fmtTimeS(it.ap.decidedAt) : ''}.</span></>
+        : null
+  const banner = bannerBody && <div className="mb-3 flex items-center gap-2 rounded-[7px] bg-sunk px-2.5 py-2 text-[12px] text-fg-muted shadow-[inset_0_0_0_1px_var(--line)]">{bannerBody}</div>
 
-  // Scoped approval controls & 1-line blast-radius preview for active pending approvals.
   const activeApproval = it.kind === 'approval' && sec !== 'done' && !expiredApproval ? it.ap : null
   const primaryScope = activeApproval ? defaultPrimaryApprovalScope(activeApproval) : 'route'
   const routePattern = activeApproval ? normalizeClientApprovalPath(activeApproval.pathAndQuery) : ''
@@ -718,25 +671,32 @@ function QueueInspector({ sel }: InspectorProps) {
   const hostEligible = activeApproval ? isHostNonDestructiveEligibleCard(activeApproval) : false
   const routeSiblings = activeApproval ? matchingPendingApprovalIds(activeApproval, q.activePendingApprovals, 'route') : []
   const effectivePreviewScope: ApprovalScope = previewScope ?? primaryScope
-  const extraForPreview = activeApproval
-    ? matchingPendingApprovalIds(activeApproval, q.activePendingApprovals, effectivePreviewScope).length
-    : 0
+  const pendingPool = activeApproval
+    ? (crossPersona ? q.activePendingApprovals : q.activePendingApprovals.filter(o => (o.personaHandle?.trim() || null) === (activeApproval.personaHandle?.trim() || null)))
+    : []
+  const activeServerPreview = serverPreviews?.[effectivePreviewScope] ?? null
   const blastRadiusText = activeApproval
     ? formatApprovalBlastRadius({
         ap: activeApproval,
         scope: effectivePreviewScope,
         routePattern,
         prefixPattern,
-        extraResolvedCount: extraForPreview,
+        extraResolvedCount: matchingPendingApprovalIds(activeApproval, pendingPool, effectivePreviewScope).length,
+        serverPreview: activeServerPreview,
       })
     : null
+  const leaseBoundsText = activeApproval && effectivePreviewScope !== 'once'
+    ? [
+        `${Math.max(1, Math.round((activeServerPreview?.defaultTtlMs ?? DEFAULT_APPROVAL_LEASE_TTL_MS) / 60_000))}m`,
+        `max ${activeServerPreview?.defaultMaxUses ?? defaultMaxUsesForLeaseScope(effectivePreviewScope)} uses`,
+        activeApproval.personaHandle ? (crossPersona ? 'all personas' : `@${activeApproval.personaHandle}`) : null,
+        activeServerPreview?.matchingRouteCount ? `${plural(activeServerPreview.matchingRouteCount, 'route')} in inventory` : null,
+      ].filter(Boolean).join(' · ')
+    : null
+  const blastRadiusTitle = activeServerPreview?.sampleRoutes.length && effectivePreviewScope !== 'once'
+    ? `${blastRadiusText ?? ''}\nInventory: ${activeServerPreview.sampleRoutes.join(', ')}`
+    : blastRadiusText ?? undefined
 
-  const scopeHover = (s: ApprovalScope) => ({
-    onMouseEnter: () => setPreviewScope(s),
-    onMouseLeave: () => setPreviewScope(null),
-    onFocus: () => setPreviewScope(s),
-    onBlur: () => setPreviewScope(null),
-  })
   const scopeBtn = (s: ApprovalScope, label: ReactNode, opts: { primary?: boolean; testId: string; title?: string; cls?: string }) => (
     <button
       key={s}
@@ -744,10 +704,30 @@ function QueueInspector({ sel }: InspectorProps) {
       className={cn(runBtn(opts.primary ? { variant: 'ink' } : { variant: 'default', size: 'sm' }), opts.cls)}
       data-testid={opts.testId}
       title={opts.title}
-      {...scopeHover(s)}
-      onClick={() => decide(it.key, 'approve', { scope: s })}
+      onMouseEnter={() => setPreviewScope(s)}
+      onMouseLeave={() => setPreviewScope(null)}
+      onFocus={() => setPreviewScope(s)}
+      onBlur={() => setPreviewScope(null)}
+      onClick={() => decide(it.key, 'approve', { scope: s, ...(s !== 'once' && crossPersona ? { crossPersona: true } : {}) })}
     >
       {opts.primary && <Icon name="check" />}{label}{opts.primary && <Kbd inverted className="ml-0.5">A</Kbd>}
+    </button>
+  )
+
+  const stampOverlay = stamped && (
+    <span className={cn(runStamp({ tone: stamped.tone }), 'pointer-events-none absolute inset-x-3 inset-y-2.5 flex items-center gap-2 rounded-control px-3 text-[12.5px] font-semibold')}>
+      <Icon name={stamped.icon} />{stamped.label} <span className="font-normal opacity-70">· next item</span>
+    </span>
+  )
+  const askBtn = (opts: { compact?: boolean; label?: boolean }) => (
+    <button
+      type="button"
+      className={cn(runBtn(opts.compact ? { variant: 'ghost', size: 'iconSm' } : { variant: 'ghost' }), opts.compact && 'ml-auto')}
+      title="Ask the coordinator about this item (C)"
+      aria-label="Ask the coordinator"
+      onClick={() => ask(it.key)}
+    >
+      <Icon name="chat" />{opts.label && <>Ask<Kbd className="ml-0.5">C</Kbd></>}
     </button>
   )
 
@@ -766,22 +746,28 @@ function QueueInspector({ sel }: InspectorProps) {
               : <ReadConsent />}
       </div></PaneBody>
       {activeApproval ? (
-        <div
-          className="relative flex flex-none flex-col gap-2 border-t border-line bg-panel px-3 py-2.5"
-          data-testid="approval-action-bar"
-        >
+        <div className="relative flex flex-none flex-col gap-1.5 border-t border-line bg-panel px-3 py-2.5" data-testid="approval-action-bar">
           {blastRadiusText && (() => {
             const sep = blastRadiusText.lastIndexOf(' · ')
             const lead = sep >= 0 ? blastRadiusText.slice(0, sep) : blastRadiusText
             const tail = sep >= 0 ? blastRadiusText.slice(sep + 3) : ''
             return (
-              <div
-                className="flex min-w-0 items-center gap-1.5 text-[11.5px] leading-[16px] text-fg-subtle"
-                title={blastRadiusText}
-                data-testid="approval-blast-radius"
-              >
-                <span className="min-w-0 truncate">{lead}</span>
-                {tail && <span className="flex-none whitespace-nowrap font-medium text-fg-muted">· {tail}</span>}
+              <div className="flex flex-col gap-0.5">
+                <div className="flex min-w-0 items-center gap-1.5 text-[11.5px] leading-[16px] text-fg-subtle" title={blastRadiusTitle} data-testid="approval-blast-radius">
+                  <span className="min-w-0 truncate">{lead}</span>
+                  {tail && <span className="flex-none whitespace-nowrap font-medium text-fg-muted">· {tail}</span>}
+                </div>
+                {leaseBoundsText && (
+                  <div className="flex min-w-0 items-center justify-between gap-2 text-[11px] leading-[15px] text-fg-subtle" data-testid="approval-lease-bounds">
+                    <span className="min-w-0 truncate" title={blastRadiusTitle}>{leaseBoundsText}</span>
+                    {activeApproval.personaHandle && (
+                      <label className="flex flex-none cursor-pointer items-center gap-1 whitespace-nowrap text-fg-muted" title="Opt in to cross-persona lease reuse (BOLA/IDOR)" data-testid="approval-cross-persona-toggle">
+                        <input type="checkbox" className="h-3 w-3 accent-accent" checked={crossPersona} onChange={e => setCrossPersona(e.target.checked)} />
+                        <span>All personas</span>
+                      </label>
+                    )}
+                  </div>
+                )}
               </div>
             )
           })()}
@@ -789,22 +775,22 @@ function QueueInspector({ sel }: InspectorProps) {
             {primaryScope === 'route' ? (
               <>
                 {scopeBtn('route', 'Approve route', { primary: true, testId: 'approval-btn-route' })}
-                {scopeBtn('once', 'Once', { testId: 'approval-btn-once', title: 'Approve only this single request (no durable lease)' })}
+                {scopeBtn('once', 'Once', { testId: 'approval-btn-once', title: 'Single request only (no lease)' })}
               </>
             ) : (
               <>
                 {scopeBtn('once', 'Approve once', { primary: true, testId: 'approval-btn-once' })}
-                {scopeBtn('route', 'Route', { testId: 'approval-btn-route', title: `Approve this exact route (${activeApproval.method} ${routePattern})` })}
+                {scopeBtn('route', 'Route', { testId: 'approval-btn-route', title: `Exact route (${activeApproval.method} ${routePattern})` })}
               </>
             )}
             {prefixPattern && scopeBtn('prefix', <span className="truncate">Prefix ({prefixPattern})</span>, {
               testId: 'approval-btn-prefix',
-              title: `Approve prefix ${activeApproval.method} ${prefixPattern} (non-high-risk probes)`,
+              title: `Prefix ${activeApproval.method} ${prefixPattern}`,
               cls: 'max-w-[190px]',
             })}
             {hostEligible && scopeBtn('host_nondestructive', 'Host', {
               testId: 'approval-btn-host',
-              title: `Approve POST/PUT/PATCH on ${host(activeApproval.origin)} (no DELETE or high-risk)`,
+              title: `POST/PUT/PATCH on ${host(activeApproval.origin)} (no DELETE/high-risk)`,
             })}
             <button
               type="button"
@@ -814,51 +800,20 @@ function QueueInspector({ sel }: InspectorProps) {
             >
               <Icon name="x" />Deny<Kbd className="ml-0.5">D</Kbd>
             </button>
-            <button
-              type="button"
-              className={cn(runBtn({ variant: 'ghost', size: 'iconSm' }), 'ml-auto')}
-              title="Ask the coordinator about this item (C)"
-              aria-label="Ask the coordinator"
-              onClick={() => ask(it.key)}
-            >
-              <Icon name="chat" />
-            </button>
+            {askBtn({ compact: true })}
           </div>
-          {stamped && <span className={cn(
-            runStamp({ tone: stamped.tone }),
-            'pointer-events-none absolute inset-x-3 inset-y-2.5 flex items-center gap-2 rounded-control px-3 text-[12.5px] font-semibold',
-          )}>
-            <Icon name={stamped.icon} />{stamped.label} <span className="font-normal opacity-70">· next item</span>
-          </span>}
+          {stampOverlay}
         </div>
       ) : (
         <div className="relative flex min-h-12 flex-none items-center gap-1.5 border-t border-line bg-panel px-3 py-2.5">
           <div className={cn('flex min-w-0 flex-1 items-center gap-1.5 transition-opacity duration-[var(--d1)]', stamped && 'pointer-events-none opacity-0')}>
-            {acts.map(([a, l, k, p]) => <button
-              key={a}
-              type="button"
-              className={runBtn({ variant: p ? 'ink' : 'default' })}
-              onClick={() => decide(it.key, a)}
-            >
+            {acts.map(([a, l, k, p]) => <button key={a} type="button" className={runBtn({ variant: p ? 'ink' : 'default' })} onClick={() => decide(it.key, a)}>
               <Icon name={icon(a)} />{l}<Kbd inverted={p} className="ml-0.5">{k.toUpperCase()}</Kbd>
             </button>)}
-            {acts.length <= 2 && <button
-              type="button"
-              className={runBtn({ variant: 'ghost' })}
-              title="Ask the coordinator about this item (C)"
-              aria-label="Ask the coordinator"
-              onClick={() => ask(it.key)}
-            >
-              <Icon name="chat" />{sec === 'done' || it.kind === 'approval' ? null : <>Ask<Kbd className="ml-0.5">C</Kbd></>}
-            </button>}
+            {acts.length <= 2 && askBtn({ label: sec !== 'done' && it.kind !== 'approval' })}
             <span className="flex-1" />
           </div>
-          {stamped && <span className={cn(
-            runStamp({ tone: stamped.tone }),
-            'pointer-events-none absolute inset-x-3 inset-y-2.5 flex items-center gap-2 rounded-control px-3 text-[12.5px] font-semibold',
-          )}>
-            <Icon name={stamped.icon} />{stamped.label} <span className="font-normal opacity-70">· next item</span>
-          </span>}
+          {stampOverlay}
         </div>
       )}
     </div>

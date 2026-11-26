@@ -1364,9 +1364,9 @@ export class Execution {
       // Explicit operator leases authorize otherwise-refused routes for long-lived engagements.
       // Ephemeral local labs keep the exact single-use fingerprint ledger authoritative, so a
       // consumed instance can never be replayed.
-      approvalLeases: (origin, method, pathAndQuery) => {
+      approvalLeases: (origin, method, pathAndQuery, personaHandle) => {
         if (project.environment === 'local-lab') return false
-        return this.storage.approvalLeaseAuthorizer(run.id)(origin, method, pathAndQuery)
+        return this.storage.approvalLeaseAuthorizer(run.id)(origin, method, pathAndQuery, personaHandle)
       },
       mintCanary: (purpose, origin) => {
         const minted = this.canaryBroker.mintCanary(run.id, purpose, origin, {

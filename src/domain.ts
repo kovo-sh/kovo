@@ -34,6 +34,39 @@ export type ApprovalPolicy = typeof approvalPolicies[number]
 export const approvalScopes = ['once', 'route', 'prefix', 'host_nondestructive'] as const
 export type ApprovalScope = typeof approvalScopes[number]
 
+export const approvalLeaseScopes = ['route', 'prefix', 'host_nondestructive'] as const
+export type ApprovalLeaseScope = typeof approvalLeaseScopes[number]
+
+export const DEFAULT_APPROVAL_LEASE_TTL_MS = 30 * 60_000
+export const MIN_APPROVAL_LEASE_TTL_MS = 60_000
+export const MAX_APPROVAL_LEASE_TTL_MS = 24 * 60 * 60_000
+export const DEFAULT_ROUTE_LEASE_MAX_USES = 25
+export const DEFAULT_PREFIX_LEASE_MAX_USES = 50
+export const DEFAULT_HOST_LEASE_MAX_USES = 50
+export const MAX_APPROVAL_LEASE_USES = 500
+
+export function defaultMaxUsesForLeaseScope(scope: ApprovalLeaseScope): number {
+  if (scope === 'route') return DEFAULT_ROUTE_LEASE_MAX_USES
+  if (scope === 'prefix') return DEFAULT_PREFIX_LEASE_MAX_USES
+  return DEFAULT_HOST_LEASE_MAX_USES
+}
+
+export interface ApprovalBlastRadiusPreview {
+  scope: ApprovalScope
+  origin: string
+  method: string
+  pattern: string
+  eligible: boolean
+  ineligibleReason?: string | null
+  matchingRouteCount: number
+  sampleRoutes: string[]
+  pendingApprovalCount: number
+  defaultTtlMs: number | null
+  defaultMaxUses: number | null
+  personaHandle: string | null
+  personaBoundByDefault: boolean
+}
+
 export const NON_DESTRUCTIVE_MUTATION_METHODS = new Set(['POST', 'PUT', 'PATCH'])
 export const HOST_NONDESTRUCTIVE_LEASE_METHOD = 'NON_DESTRUCTIVE'
 export const HOST_NONDESTRUCTIVE_LEASE_PATTERN = 'host:non_destructive'
@@ -42,7 +75,10 @@ export function isNonDestructiveMutationMethod(method: string): boolean {
   return NON_DESTRUCTIVE_MUTATION_METHODS.has(method.trim().toUpperCase())
 }
 
-export function isHostNonDestructiveLease(lease: { method: string; routePattern: string }): boolean {
+export function isHostNonDestructiveLease(
+  lease: { leaseScope?: ApprovalLeaseScope | null; method: string; routePattern: string },
+): boolean {
+  if (lease.leaseScope) return lease.leaseScope === 'host_nondestructive'
   return (
     lease.method.trim().toUpperCase() === HOST_NONDESTRUCTIVE_LEASE_METHOD &&
     lease.routePattern.trim() === HOST_NONDESTRUCTIVE_LEASE_PATTERN
@@ -841,6 +877,9 @@ export const runCommand = z.discriminatedUnion('action', [
     approvalId: id,
     decision: z.enum(['approved', 'denied']),
     scope: z.enum(approvalScopes).optional(),
+    expiresInMs: z.number().int().min(MIN_APPROVAL_LEASE_TTL_MS).max(MAX_APPROVAL_LEASE_TTL_MS).optional(),
+    maxUses: z.number().int().min(1).max(MAX_APPROVAL_LEASE_USES).optional(),
+    crossPersona: z.boolean().optional(),
   }),
   commandBase.extend({ action: z.literal('set_approval_policy'), approvalPolicy: z.enum(approvalPolicies) }),
   commandBase.extend({ action: z.literal('approve_similar_endpoint'), approvalId: id }),

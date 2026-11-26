@@ -381,7 +381,7 @@ export type Grant = {
    * Durable, route-scoped operator lease (Run approval_leases). A match authorizes the normalized
    * route across probe iterations and replays; it never widens origin scope.
    */
-  approvalLeases?: (origin: string, method: string, pathAndQuery: string) => boolean
+  approvalLeases?: (origin: string, method: string, pathAndQuery: string, personaHandle?: string | null) => boolean
   /**
    * @deprecated Never consulted for authorization. Tier-3 state changes are always authorized by
    * `isStateChangeApproved`; a path-substring "idempotent POST" predicate must not skip approvals.

@@ -17,13 +17,17 @@ import {
   boardSystemHandles,
   canReviewScope,
   canonicalBoardHandles,
+  DEFAULT_APPROVAL_LEASE_TTL_MS,
   defaultBudgetRequests,
   defaultBudgetUsd,
   defaultLabBudgetRequests,
   defaultMaxRpsPerOrigin,
+  defaultMaxUsesForLeaseScope,
   defaultPublicBudgetRequests,
   defaultWorkerConcurrency,
   defaultWorkerMaxTurns,
+  MAX_APPROVAL_LEASE_TTL_MS,
+  MAX_APPROVAL_LEASE_USES,
   maxBoardBodyLength,
   normalizeBoardHandle,
   parseBoardMentions,
@@ -31,6 +35,8 @@ import {
   workerHistory,
 } from '../domain.ts'
 import type {
+  ApprovalBlastRadiusPreview,
+  ApprovalLeaseScope,
   ApprovalPolicy,
   ApprovalScope,
   ApprovedEndpointPattern,
@@ -1605,26 +1611,29 @@ export class RunsRepository {
   }
 
   /**
-   * Grant (or refresh) a durable approval lease (`route`, `prefix`, or `host_nondestructive`).
+   * Grant (or refresh) a bounded durable approval lease (`route`, `prefix`, or `host_nondestructive`).
    * Unlike the single-use 60 s exact-fingerprint grant, a lease authorizes subsequent probe
-   * iterations and replays until revoked, expired, or the run's scope revision changes.
+   * iterations and replays until revoked, expired (finite TTL), exhausted (`maxUses`), or the run's
+   * scope revision changes. Leases bind to `personaHandle` by default unless `crossPersona: true`.
    */
   grantApprovalLease(run: Run, input: {
     origin: string
     method: string
     pathAndQuery: string
     source?: ApprovalPathPatternSource
-    leaseScope?: 'route' | 'prefix' | 'host_nondestructive'
+    leaseScope?: ApprovalLeaseScope
     personaHandle?: string | null
+    crossPersona?: boolean
     sourceApprovalId?: string | null
     createdBy?: string
-    expiresInMs?: number | null
+    expiresInMs?: number
+    maxUses?: number
   }): ApprovalLeaseRow {
     const origin = normalizeScopeOrigin(input.origin)
     if (!origin) throw new Error('Approval lease origin is malformed.')
     let method: string
     let routePattern: string
-    let resolvedScope: 'route' | 'prefix' | 'host_nondestructive'
+    let resolvedScope: ApprovalLeaseScope
     if (input.leaseScope === 'host_nondestructive') {
       method = HOST_NONDESTRUCTIVE_LEASE_METHOD
       routePattern = HOST_NONDESTRUCTIVE_LEASE_PATTERN
@@ -1638,12 +1647,36 @@ export class RunsRepository {
       if (routePattern === '/**') {
         throw new Error('Bare /** wildcard approval leases are forbidden.')
       }
-      if (input.leaseScope === 'prefix' && !isPrefixApprovalPattern(routePattern)) {
-        throw new Error('Prefix approval leases require a concrete non-empty prefix segment.')
+      if (input.leaseScope === 'prefix') {
+        if (!isPrefixApprovalPattern(routePattern)) {
+          throw new Error('Prefix approval leases require a concrete non-empty prefix segment.')
+        }
+        resolvedScope = 'prefix'
+      } else {
+        // Never infer 'prefix' from pattern shape (R2-09): callers must pass leaseScope='prefix'.
+        resolvedScope = 'route'
       }
-      resolvedScope = input.leaseScope ?? (isPrefixApprovalPattern(routePattern) ? 'prefix' : 'route')
     }
+    const rawTtl = input.expiresInMs === undefined ? DEFAULT_APPROVAL_LEASE_TTL_MS : input.expiresInMs
+    if (typeof rawTtl !== 'number' || !Number.isFinite(rawTtl)) {
+      throw new Error('Approval lease requires a finite expiresInMs TTL.')
+    }
+    if (rawTtl > MAX_APPROVAL_LEASE_TTL_MS) {
+      throw new Error(`Approval lease TTL cannot exceed ${Math.round(MAX_APPROVAL_LEASE_TTL_MS / 60_000)} minutes.`)
+    }
+    const rawMaxUses = input.maxUses === undefined ? defaultMaxUsesForLeaseScope(resolvedScope) : input.maxUses
+    if (
+      typeof rawMaxUses !== 'number' ||
+      !Number.isInteger(rawMaxUses) ||
+      rawMaxUses < 1 ||
+      rawMaxUses > MAX_APPROVAL_LEASE_USES
+    ) {
+      throw new Error(`Approval lease maxUses must be an integer between 1 and ${MAX_APPROVAL_LEASE_USES}.`)
+    }
+    const personaHandle = input.personaHandle?.trim() || null
+    const crossPersona = Boolean(input.crossPersona)
     const now = Date.now()
+    const expiresAt = now + Math.trunc(rawTtl)
     const row = this.session.db.insert(tables.approvalLeases).values({
       id: randomUUID(),
       runId: run.id,
@@ -1651,14 +1684,17 @@ export class RunsRepository {
       origin,
       method,
       routePattern,
-      personaHandle: input.personaHandle ?? null,
+      leaseScope: resolvedScope,
+      personaHandle,
+      crossPersona,
       status: 'active',
       sourceApprovalId: input.sourceApprovalId ?? null,
       createdBy: input.createdBy ?? 'operator',
       createdAt: now,
       updatedAt: now,
-      expiresAt: input.expiresInMs === null || input.expiresInMs === undefined ? null : now + input.expiresInMs,
+      expiresAt,
       uses: 0,
+      maxUses: rawMaxUses,
       lastUsedAt: null,
     }).onConflictDoUpdate({
       target: [
@@ -1666,11 +1702,15 @@ export class RunsRepository {
         tables.approvalLeases.routePattern, tables.approvalLeases.scopeRevision,
       ],
       set: {
+        leaseScope: resolvedScope,
         status: 'active',
         updatedAt: now,
-        personaHandle: input.personaHandle ?? null,
+        personaHandle,
+        crossPersona,
         sourceApprovalId: input.sourceApprovalId ?? null,
-        expiresAt: input.expiresInMs == null ? null : now + input.expiresInMs,
+        expiresAt,
+        maxUses: rawMaxUses,
+        uses: 0,
       },
     }).returning().get()
     const leaseLabel = resolvedScope === 'host_nondestructive'
@@ -1679,7 +1719,16 @@ export class RunsRepository {
         ? `Durable prefix lease for ${method} ${origin}${routePattern}`
         : `Durable route lease for ${method} ${origin}${routePattern}`
     this.session.event(run.id, 'approval.lease_granted', `${leaseLabel}.`, {
-      leaseId: row.id, origin, method, routePattern, leaseScope: resolvedScope, sourceApprovalId: row.sourceApprovalId,
+      leaseId: row.id,
+      origin,
+      method,
+      routePattern,
+      leaseScope: resolvedScope,
+      personaHandle,
+      crossPersona,
+      expiresAt,
+      maxUses: rawMaxUses,
+      sourceApprovalId: row.sourceApprovalId,
     })
     return row
   }
@@ -1722,14 +1771,23 @@ export class RunsRepository {
   }
 
   /**
-   * Broker-side lease check. Evaluates active, unexpired leases in the run's current scope revision
-   * in strict specificity order:
-   *   1. Exact / normalized route lease (R3-H-9 worker-glob isolation preserved)
-   *   2. Operator-explicit prefix lease (`/<prefix>/**`, never bare `/**`)
-   *   3. Origin-scoped non-destructive host lease (`POST`/`PUT`/`PATCH` only — NEVER `DELETE`,
-   *      NEVER worker-glob paths, NEVER high-risk or external-mutation paths)
+   * Broker-side lease check. Evaluates active, unexpired, non-exhausted leases in the run's current
+   * scope revision in strict specificity order using the typed `leaseScope` column (never inferring
+   * prefix wildcards from `routePattern` shape):
+   *   1. `leaseScope === 'route'`: exact / normalized route lease (R3-H-9 worker-glob isolation)
+   *   2. `leaseScope === 'prefix'`: operator-explicit prefix lease (`/<prefix>/**`, never bare `/**`)
+   *   3. `leaseScope === 'host_nondestructive'`: origin-scoped non-destructive host lease
+   *      (`POST`/`PUT`/`PATCH` only — NEVER `DELETE`, NEVER worker-glob paths, NEVER high-risk paths)
+   *
+   * Leases bind to `personaHandle` by default unless the operator opted into `crossPersona: true`.
    */
-  leaseAuthorizes(runId: string, origin: string, method: string, pathAndQuery: string): boolean {
+  leaseAuthorizes(
+    runId: string,
+    origin: string,
+    method: string,
+    pathAndQuery: string,
+    personaHandle?: string | null,
+  ): boolean {
     const normalized = normalizeScopeOrigin(origin)
     if (!normalized) return false
     const upperMethod = method.trim().toUpperCase()
@@ -1745,6 +1803,13 @@ export class RunsRepository {
         ? [normalizedPattern]
         : [normalizedPattern, legacyRoutePattern],
     )
+    const targetPersona = personaHandle?.trim() || null
+    const matchesPersona = (row: ApprovalLeaseRow): boolean => {
+      if (row.crossPersona) return true
+      const leasePersona = row.personaHandle?.trim() || null
+      return leasePersona === targetPersona
+    }
+
     return this.session.transaction(() => {
       let run: Run
       try {
@@ -1763,7 +1828,9 @@ export class RunsRepository {
       const now = Date.now()
       const activeRows: ApprovalLeaseRow[] = []
       for (const row of rows) {
-        if (row.expiresAt !== null && row.expiresAt <= now) {
+        const expiredByTime = row.expiresAt === null || row.expiresAt <= now
+        const exhaustedByUses = row.maxUses === null || row.maxUses <= 0 || row.uses >= row.maxUses
+        if (expiredByTime || exhaustedByUses) {
           this.session.db.update(tables.approvalLeases).set({ status: 'expired', updatedAt: now })
             .where(eq(tables.approvalLeases.id, row.id)).run()
           continue
@@ -1772,15 +1839,20 @@ export class RunsRepository {
       }
       if (!activeRows.length) return false
 
-      // 1. Exact / normalized route match
+      // 1. Typed 'route' scope: exact / normalized route match only (never widens legacy '/**' rows).
       let matched = activeRows.find(row =>
-        row.method === upperMethod && routePatternSet.has(row.routePattern),
+        row.leaseScope === 'route' &&
+        row.method === upperMethod &&
+        routePatternSet.has(row.routePattern) &&
+        matchesPersona(row),
       )
 
-      // 2. Explicit operator prefix match (`/<prefix>/**`, bare `/**` rejected)
+      // 2. Typed 'prefix' scope: explicit operator prefix match (`/<prefix>/**`, bare `/**` rejected).
       if (!matched && !hasGlob) {
         for (const row of activeRows) {
-          if (row.method !== upperMethod || !isPrefixApprovalPattern(row.routePattern)) continue
+          if (row.leaseScope !== 'prefix') continue
+          if (row.method !== upperMethod || !matchesPersona(row)) continue
+          if (!isPrefixApprovalPattern(row.routePattern)) continue
           const hit = matchesApprovedEndpointPattern(
             { origin: normalized, method: upperMethod, pathAndQuery },
             [{ origin: row.origin, method: row.method, pathPattern: row.routePattern, source: 'operator_explicit' }],
@@ -1792,32 +1864,247 @@ export class RunsRepository {
         }
       }
 
-      // 3. Origin-scoped non-destructive host lease (POST/PUT/PATCH only; never DELETE or high-risk paths)
+      // 3. Typed 'host_nondestructive' scope: POST/PUT/PATCH only; never DELETE or high-risk paths.
       if (
         !matched &&
         !hasGlob &&
         isNonDestructiveMutationMethod(upperMethod) &&
         !isHighRiskOrExternalMutationPath(pathAndQuery)
       ) {
-        matched = activeRows.find(row => isHostNonDestructiveLease(row))
+        matched = activeRows.find(row =>
+          row.leaseScope === 'host_nondestructive' &&
+          matchesPersona(row),
+        )
       }
 
       if (!matched) return false
-      this.session.db.update(tables.approvalLeases).set({
+      const exhaustedAfterUse = matched.maxUses !== null && matched.uses + 1 >= matched.maxUses
+      const updated = this.session.db.update(tables.approvalLeases).set({
         uses: sql`${tables.approvalLeases.uses} + 1`,
         lastUsedAt: now,
         updatedAt: now,
+        ...(exhaustedAfterUse ? { status: 'expired' as const } : {}),
       }).where(and(
         eq(tables.approvalLeases.id, matched.id),
         eq(tables.approvalLeases.status, 'active'),
-      )).run()
-      return true
+        sql`${tables.approvalLeases.expiresAt} IS NOT NULL AND ${tables.approvalLeases.expiresAt} > ${now}`,
+        sql`${tables.approvalLeases.maxUses} IS NOT NULL AND ${tables.approvalLeases.uses} < ${tables.approvalLeases.maxUses}`,
+      )).returning({ id: tables.approvalLeases.id }).get()
+      return Boolean(updated)
     }, { behavior: 'immediate' })
   }
 
   /** Ready-to-wire broker grant hook: `approvalLeases: storage.approvalLeaseAuthorizer(runId)`. */
-  approvalLeaseAuthorizer(runId: string): (origin: string, method: string, pathAndQuery: string) => boolean {
-    return (origin, method, pathAndQuery) => this.leaseAuthorizes(runId, origin, method, pathAndQuery)
+  approvalLeaseAuthorizer(
+    runId: string,
+  ): (origin: string, method: string, pathAndQuery: string, personaHandle?: string | null) => boolean {
+    return (origin, method, pathAndQuery, personaHandle) =>
+      this.leaseAuthorizes(runId, origin, method, pathAndQuery, personaHandle)
+  }
+
+  /**
+   * Compute server-side blast-radius previews across all 4 approval scopes (`once`, `route`,
+   * `prefix`, `host_nondestructive`) against the run's real discovered endpoint inventory and
+   * active pending approval queue (R2-09).
+   */
+  previewApprovalBlastRadius(
+    runId: string,
+    approvalId: string,
+    options: { crossPersona?: boolean } = {},
+  ): Record<ApprovalScope, ApprovalBlastRadiusPreview> {
+    const run = this.run(runId)
+    const ap = this.getApprovalRequest(runId, approvalId)
+    const now = Date.now()
+    const normalizedOrigin = normalizeScopeOrigin(ap.origin) ?? ap.origin.trim()
+    const upperMethod = ap.method.trim().toUpperCase()
+    const routePattern = normalizeApprovalPathPattern(ap.pathAndQuery, { source: 'card_path' })
+    const hasGlob = hasApprovalPathGlobMetacharacters(ap.pathAndQuery)
+    const prefixPattern =
+      upperMethod !== 'DELETE' && ap.riskLevel !== 'high' && !hasGlob
+        ? deriveOperatorPrefixPattern(ap.pathAndQuery)
+        : null
+    const hostEligible =
+      ap.riskLevel !== 'high' &&
+      isNonDestructiveMutationMethod(upperMethod) &&
+      !hasGlob &&
+      !isHighRiskOrExternalMutationPath(ap.pathAndQuery)
+    const cardPersona = ap.personaHandle?.trim() || null
+    const crossPersona = Boolean(options.crossPersona)
+    const pendingPersonaMatches = (other: ApprovalRequest): boolean =>
+      crossPersona || (other.personaHandle?.trim() || null) === cardPersona
+
+    const inventoryRows = this.session.db.select({
+      origin: tables.endpoints.origin,
+      method: tables.endpoints.method,
+      pathTemplate: tables.endpoints.pathTemplate,
+    }).from(tables.endpoints).where(eq(tables.endpoints.runId, runId)).all()
+      .filter(ep => (normalizeScopeOrigin(ep.origin) ?? ep.origin.trim()) === normalizedOrigin)
+
+    const otherPending = this.listApprovalRequests(runId, 'pending').filter(req =>
+      req.id !== ap.id &&
+      req.scopeRevision === run.scopeRevision &&
+      req.expiresAt > now &&
+      (normalizeScopeOrigin(req.origin) ?? req.origin.trim()) === normalizedOrigin &&
+      pendingPersonaMatches(req),
+    )
+
+    const SAMPLE_LIMIT = 5
+    const formatRoute = (m: string, p: string) => `${m.trim().toUpperCase()} ${p}`
+
+    // Route scope matches
+    const routeMatches: string[] = []
+    const routeSeen = new Set<string>()
+    for (const ep of inventoryRows) {
+      const epMethod = ep.method.trim().toUpperCase()
+      if (epMethod !== upperMethod) continue
+      const epNorm = normalizeApprovalPathPattern(ep.pathTemplate, { source: 'operator_explicit' })
+      const hit =
+        (routePattern !== '' && epNorm === routePattern) ||
+        Boolean(matchesApprovedEndpointPattern(
+          { origin: ep.origin, method: epMethod, pathAndQuery: ep.pathTemplate },
+          [{ origin: ap.origin, method: upperMethod, pathPattern: routePattern, source: 'card_path' }],
+        ))
+      if (!hit) continue
+      const label = formatRoute(epMethod, ep.pathTemplate)
+      if (!routeSeen.has(label)) {
+        routeSeen.add(label)
+        routeMatches.push(label)
+      }
+    }
+    const routePendingExtra = otherPending.filter(req =>
+      req.method.trim().toUpperCase() === upperMethod &&
+      normalizeApprovalPathPattern(req.pathAndQuery, { source: 'card_path' }) === routePattern,
+    ).length
+
+    // Prefix scope matches
+    const prefixMatches: string[] = []
+    let prefixPendingExtra = 0
+    if (prefixPattern && isPrefixApprovalPattern(prefixPattern)) {
+      const prefixBase = prefixPattern.slice(0, -3)
+      const prefixSeen = new Set<string>()
+      for (const ep of inventoryRows) {
+        const epMethod = ep.method.trim().toUpperCase()
+        if (epMethod !== upperMethod) continue
+        if (hasApprovalPathGlobMetacharacters(ep.pathTemplate)) continue
+        const epNorm = normalizeApprovalPathPattern(ep.pathTemplate, { source: 'operator_explicit' })
+        const hit =
+          (epNorm !== '' && (epNorm === prefixBase || epNorm.startsWith(`${prefixBase}/`))) ||
+          Boolean(matchesApprovedEndpointPattern(
+            { origin: ep.origin, method: epMethod, pathAndQuery: ep.pathTemplate },
+            [{ origin: ap.origin, method: upperMethod, pathPattern: prefixPattern, source: 'operator_explicit' }],
+          ))
+        if (!hit) continue
+        const label = formatRoute(epMethod, ep.pathTemplate)
+        if (!prefixSeen.has(label)) {
+          prefixSeen.add(label)
+          prefixMatches.push(label)
+        }
+      }
+      prefixPendingExtra = otherPending.filter(req =>
+        req.method.trim().toUpperCase() === upperMethod &&
+        req.riskLevel !== 'high' &&
+        !hasApprovalPathGlobMetacharacters(req.pathAndQuery) &&
+        Boolean(matchesApprovedEndpointPattern(
+          { origin: req.origin, method: req.method, pathAndQuery: req.pathAndQuery },
+          [{ origin: ap.origin, method: upperMethod, pathPattern: prefixPattern, source: 'operator_explicit' }],
+        )),
+      ).length
+    }
+
+    // Host non-destructive scope matches
+    const hostMatches: string[] = []
+    let hostPendingExtra = 0
+    if (hostEligible) {
+      const hostSeen = new Set<string>()
+      for (const ep of inventoryRows) {
+        const epMethod = ep.method.trim().toUpperCase()
+        if (!isNonDestructiveMutationMethod(epMethod)) continue
+        if (hasApprovalPathGlobMetacharacters(ep.pathTemplate)) continue
+        if (isHighRiskOrExternalMutationPath(ep.pathTemplate)) continue
+        const label = formatRoute(epMethod, ep.pathTemplate)
+        if (!hostSeen.has(label)) {
+          hostSeen.add(label)
+          hostMatches.push(label)
+        }
+      }
+      hostPendingExtra = otherPending.filter(req =>
+        isNonDestructiveMutationMethod(req.method) &&
+        req.riskLevel !== 'high' &&
+        !hasApprovalPathGlobMetacharacters(req.pathAndQuery) &&
+        !isHighRiskOrExternalMutationPath(req.pathAndQuery),
+      ).length
+    }
+
+    return {
+      once: {
+        scope: 'once',
+        origin: normalizedOrigin,
+        method: upperMethod,
+        pattern: routePattern || ap.pathAndQuery,
+        eligible: true,
+        matchingRouteCount: 1,
+        sampleRoutes: [formatRoute(upperMethod, routePattern || ap.pathAndQuery)],
+        pendingApprovalCount: 1,
+        defaultTtlMs: null,
+        defaultMaxUses: null,
+        personaHandle: cardPersona,
+        personaBoundByDefault: cardPersona !== null,
+      },
+      route: {
+        scope: 'route',
+        origin: normalizedOrigin,
+        method: upperMethod,
+        pattern: routePattern || ap.pathAndQuery,
+        eligible: Boolean(routePattern && routePattern !== '/**'),
+        matchingRouteCount: routeMatches.length,
+        sampleRoutes: routeMatches.slice(0, SAMPLE_LIMIT),
+        pendingApprovalCount: 1 + routePendingExtra,
+        defaultTtlMs: DEFAULT_APPROVAL_LEASE_TTL_MS,
+        defaultMaxUses: defaultMaxUsesForLeaseScope('route'),
+        personaHandle: cardPersona,
+        personaBoundByDefault: cardPersona !== null,
+      },
+      prefix: {
+        scope: 'prefix',
+        origin: normalizedOrigin,
+        method: upperMethod,
+        pattern: prefixPattern ?? '',
+        eligible: Boolean(prefixPattern),
+        ineligibleReason: prefixPattern
+          ? null
+          : upperMethod === 'DELETE'
+            ? 'Prefix leases cannot cover DELETE requests.'
+            : ap.riskLevel === 'high'
+              ? 'Prefix leases cannot cover high-risk requests.'
+              : 'Prefix leases require a concrete non-empty prefix without glob metacharacters.',
+        matchingRouteCount: prefixMatches.length,
+        sampleRoutes: prefixMatches.slice(0, SAMPLE_LIMIT),
+        pendingApprovalCount: prefixPattern ? 1 + prefixPendingExtra : 0,
+        defaultTtlMs: DEFAULT_APPROVAL_LEASE_TTL_MS,
+        defaultMaxUses: defaultMaxUsesForLeaseScope('prefix'),
+        personaHandle: cardPersona,
+        personaBoundByDefault: cardPersona !== null,
+      },
+      host_nondestructive: {
+        scope: 'host_nondestructive',
+        origin: normalizedOrigin,
+        method: HOST_NONDESTRUCTIVE_LEASE_METHOD,
+        pattern: HOST_NONDESTRUCTIVE_LEASE_PATTERN,
+        eligible: hostEligible,
+        ineligibleReason: hostEligible
+          ? null
+          : !isNonDestructiveMutationMethod(upperMethod)
+            ? 'Host non-destructive leases only apply to POST, PUT, and PATCH requests.'
+            : 'Host non-destructive leases exclude high-risk, external-mutation, and glob routes.',
+        matchingRouteCount: hostMatches.length,
+        sampleRoutes: hostMatches.slice(0, SAMPLE_LIMIT),
+        pendingApprovalCount: hostEligible ? 1 + hostPendingExtra : 0,
+        defaultTtlMs: DEFAULT_APPROVAL_LEASE_TTL_MS,
+        defaultMaxUses: defaultMaxUsesForLeaseScope('host_nondestructive'),
+        personaHandle: cardPersona,
+        personaBoundByDefault: cardPersona !== null,
+      },
+    }
   }
 
   /**
@@ -1879,10 +2166,15 @@ export class RunsRepository {
       mode: 'route' | 'prefix'
       prefixPattern?: string
       allowAlreadyApproved?: boolean
+      expiresInMs?: number
+      maxUses?: number
+      crossPersona?: boolean
       now: number
     },
   ): ApprovalRequest {
     const { mode, now } = opts
+    const crossPersona = Boolean(opts.crossPersona)
+    const existingPersona = existing.personaHandle?.trim() || null
     let updated = existing
     if (existing.status === 'pending') {
       if (existing.scopeRevision !== currentRun.scopeRevision) {
@@ -1931,9 +2223,11 @@ export class RunsRepository {
 
     // Bulk-approve currently pending cards matching this newly approved route or prefix pattern.
     // Prefix scope strictly skips `high`-risk cards and any worker-glob cards.
+    // Persona-bound leases only bulk-approve cards from the same persona unless `crossPersona: true`.
     let matchedPendingCount = 0
     for (const req of this.listApprovalRequests(currentRun.id, 'pending')) {
       if (req.id === existing.id || req.scopeRevision !== currentRun.scopeRevision) continue
+      if (!crossPersona && (req.personaHandle?.trim() || null) !== existingPersona) continue
       if (mode === 'prefix' && (req.riskLevel === 'high' || hasApprovalPathGlobMetacharacters(req.pathAndQuery))) {
         continue
       }
@@ -1945,7 +2239,7 @@ export class RunsRepository {
           status: 'approved',
           decidedBy: 'auto-review:rule',
           decidedAt: now,
-          riskLevel: req.riskLevel === 'high' ? 'high' : 'low',
+          riskLevel: req.riskLevel ?? existing.riskLevel ?? 'medium',
           policyNote: `Auto-approved via operator-approved ${mode} pattern ${newPattern.method} ${newPattern.pathPattern}.`,
         }).where(eq(tables.approvalRequests.id, req.id)).run()
         matchedPendingCount += 1
@@ -1959,6 +2253,7 @@ export class RunsRepository {
       method: newPattern.method,
       pathPattern: newPattern.pathPattern,
       matchedPendingCount,
+      crossPersona,
       ...(globInspection.hasGlobMetacharacters
         ? { containsGlobMetacharacters: true, globSegments: globInspection.globSegments }
         : {}),
@@ -1970,8 +2265,11 @@ export class RunsRepository {
       source: mode === 'prefix' ? 'operator_explicit' : 'card_path',
       leaseScope: mode,
       personaHandle: existing.personaHandle,
+      crossPersona,
       sourceApprovalId: existing.id,
       createdBy: 'operator',
+      ...(opts.expiresInMs !== undefined ? { expiresInMs: opts.expiresInMs } : {}),
+      ...(opts.maxUses !== undefined ? { maxUses: opts.maxUses } : {}),
     })
     this.session.message(currentRun.id, currentRun.coordinatorId, 'kovo',
       `Approved ${existing.method} ${existing.origin}${existing.pathAndQuery} and future probes matching ${newPattern.method} ${newPattern.pathPattern}.`)
@@ -1983,6 +2281,7 @@ export class RunsRepository {
     approvalId: string,
     decision: 'approved' | 'denied',
     scope?: ApprovalScope,
+    leaseOptions?: { expiresInMs?: number; maxUses?: number; crossPersona?: boolean },
   ): ApprovalRequest {
     return this.session.transaction(() => {
       const currentRun = this.run(run.id)
@@ -2052,7 +2351,13 @@ export class RunsRepository {
 
       // Explicit `route` scope: route lease + approvedEndpointPatterns + bulk resolve matching pending cards.
       if (scope === 'route') {
-        const updated = this.applyRouteOrPrefixApproval(currentRun, existing, { mode: 'route', now })
+        const updated = this.applyRouteOrPrefixApproval(currentRun, existing, {
+          mode: 'route',
+          now,
+          expiresInMs: leaseOptions?.expiresInMs,
+          maxUses: leaseOptions?.maxUses,
+          crossPersona: leaseOptions?.crossPersona,
+        })
         this.session.event(currentRun.id, 'approval.decided', `Tier 3 request approved (route) for ${updated.method} ${updated.origin}.`, {
           approvalId: updated.id, assignmentId: updated.assignmentId, decision: 'approved', decidedBy: 'operator', scope: 'route',
         })
@@ -2074,7 +2379,14 @@ export class RunsRepository {
         if (!prefixPattern || !isPrefixApprovalPattern(prefixPattern)) {
           throw new Error('Prefix approvals require a concrete non-empty prefix segment (bare /** is forbidden).')
         }
-        const updated = this.applyRouteOrPrefixApproval(currentRun, existing, { mode: 'prefix', prefixPattern, now })
+        const updated = this.applyRouteOrPrefixApproval(currentRun, existing, {
+          mode: 'prefix',
+          prefixPattern,
+          now,
+          expiresInMs: leaseOptions?.expiresInMs,
+          maxUses: leaseOptions?.maxUses,
+          crossPersona: leaseOptions?.crossPersona,
+        })
         this.session.event(currentRun.id, 'approval.decided', `Tier 3 request approved (prefix ${prefixPattern}) for ${updated.method} ${updated.origin}.`, {
           approvalId: updated.id, assignmentId: updated.assignmentId, decision: 'approved', decidedBy: 'operator', scope: 'prefix', pathPattern: prefixPattern,
         })
@@ -2092,6 +2404,8 @@ export class RunsRepository {
         if (hasApprovalPathGlobMetacharacters(existing.pathAndQuery) || isHighRiskOrExternalMutationPath(existing.pathAndQuery)) {
           throw new Error('Host non-destructive approvals cannot be granted for high-risk, external-mutation, or glob paths.')
         }
+        const crossPersona = Boolean(leaseOptions?.crossPersona)
+        const existingPersona = existing.personaHandle?.trim() || null
         const hostNote = `Approved by operator with host (non-destructive) lease on ${existing.origin}.`
         const updated = this.session.db.update(tables.approvalRequests).set({
           status: 'approved',
@@ -2105,6 +2419,7 @@ export class RunsRepository {
         for (const req of this.listApprovalRequests(currentRun.id, 'pending')) {
           if (req.id === approvalId || req.scopeRevision !== currentRun.scopeRevision) continue
           if ((normalizeScopeOrigin(req.origin) ?? req.origin.trim()) !== normalizedOrigin) continue
+          if (!crossPersona && (req.personaHandle?.trim() || null) !== existingPersona) continue
           if (!isNonDestructiveMutationMethod(req.method)) continue
           if (req.riskLevel === 'high') continue
           if (hasApprovalPathGlobMetacharacters(req.pathAndQuery)) continue
@@ -2113,7 +2428,7 @@ export class RunsRepository {
             status: 'approved',
             decidedBy: 'auto-review:rule',
             decidedAt: now,
-            riskLevel: 'low',
+            riskLevel: req.riskLevel ?? existing.riskLevel ?? 'medium',
             policyNote: `Auto-approved via operator host (non-destructive) lease on ${normalizedOrigin}.`,
           }).where(eq(tables.approvalRequests.id, req.id)).run()
           matchedPendingCount += 1
@@ -2124,9 +2439,12 @@ export class RunsRepository {
           method: HOST_NONDESTRUCTIVE_LEASE_METHOD,
           pathAndQuery: HOST_NONDESTRUCTIVE_LEASE_PATTERN,
           leaseScope: 'host_nondestructive',
-          personaHandle: null,
+          personaHandle: existing.personaHandle ?? null,
+          crossPersona,
           sourceApprovalId: existing.id,
           createdBy: 'operator',
+          ...(leaseOptions?.expiresInMs !== undefined ? { expiresInMs: leaseOptions.expiresInMs } : {}),
+          ...(leaseOptions?.maxUses !== undefined ? { maxUses: leaseOptions.maxUses } : {}),
         })
         this.session.event(currentRun.id, 'approval.decided', `Tier 3 host (non-destructive) approval granted for ${normalizedOrigin}.`, {
           approvalId: updated.id,
@@ -2135,6 +2453,7 @@ export class RunsRepository {
           decidedBy: 'operator',
           scope: 'host_nondestructive',
           leaseId: lease.id,
+          crossPersona,
           matchedPendingCount,
         })
         this.session.message(currentRun.id, currentRun.coordinatorId, 'kovo',
@@ -2155,9 +2474,13 @@ export class RunsRepository {
         origin: updated.origin,
         method: updated.method,
         pathAndQuery: updated.pathAndQuery,
+        leaseScope: 'route',
         personaHandle: updated.personaHandle,
+        crossPersona: Boolean(leaseOptions?.crossPersona),
         sourceApprovalId: updated.id,
         createdBy: 'operator',
+        ...(leaseOptions?.expiresInMs !== undefined ? { expiresInMs: leaseOptions.expiresInMs } : {}),
+        ...(leaseOptions?.maxUses !== undefined ? { maxUses: leaseOptions.maxUses } : {}),
       })
       this.session.message(currentRun.id, currentRun.coordinatorId, 'kovo',
         `Tier 3 request approved: ${updated.method} ${updated.origin}${updated.pathAndQuery}`)
@@ -3374,7 +3697,11 @@ export class RunsRepository {
           break
         }
         case 'decide_approval':
-          this.decideApproval(run, input.approvalId, input.decision, input.scope)
+          this.decideApproval(run, input.approvalId, input.decision, input.scope, {
+            expiresInMs: input.expiresInMs,
+            maxUses: input.maxUses,
+            crossPersona: input.crossPersona,
+          })
           break
         case 'set_approval_policy':
           this.setApprovalPolicy(run, input.approvalPolicy)

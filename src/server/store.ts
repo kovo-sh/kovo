@@ -4,6 +4,13 @@ import { mkdirSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { drizzle } from 'drizzle-orm/node-sqlite'
+import {
+  DEFAULT_APPROVAL_LEASE_TTL_MS,
+  DEFAULT_HOST_LEASE_MAX_USES,
+  DEFAULT_ROUTE_LEASE_MAX_USES,
+  HOST_NONDESTRUCTIVE_LEASE_METHOD,
+  HOST_NONDESTRUCTIVE_LEASE_PATTERN,
+} from '../domain.ts'
 import { purgeExpiredArtifacts } from './artifact-ttl.ts'
 import type { ArtifactTtlPolicy, ArtifactTtlPurgeResult } from './artifact-ttl.ts'
 import {
@@ -1041,7 +1048,9 @@ const STORE_MIGRATIONS: readonly MigrationStep[] = [
           origin TEXT NOT NULL,
           method TEXT NOT NULL,
           route_pattern TEXT NOT NULL,
+          lease_scope TEXT NOT NULL DEFAULT 'route' CHECK (lease_scope IN ('route', 'prefix', 'host_nondestructive')),
           persona_handle TEXT,
+          cross_persona INTEGER NOT NULL DEFAULT 0,
           status TEXT NOT NULL,
           source_approval_id TEXT,
           created_by TEXT NOT NULL,
@@ -1049,6 +1058,7 @@ const STORE_MIGRATIONS: readonly MigrationStep[] = [
           updated_at INTEGER NOT NULL,
           expires_at INTEGER,
           uses INTEGER NOT NULL DEFAULT 0,
+          max_uses INTEGER,
           last_used_at INTEGER
         );
         CREATE UNIQUE INDEX IF NOT EXISTS approval_leases_route
@@ -1250,6 +1260,45 @@ const STORE_MIGRATIONS: readonly MigrationStep[] = [
         installPromotedFindingSyncTriggers(ctx)
       }
       installConfirmationGuards(ctx)
+    },
+  },
+  {
+    version: 11,
+    name: 'v11_bounded_approval_leases',
+    up(ctx) {
+      if (!ctx.tableExists('approval_leases')) return
+      ctx.ensureColumn(
+        'approval_leases',
+        'lease_scope',
+        "TEXT NOT NULL DEFAULT 'route' CHECK (lease_scope IN ('route', 'prefix', 'host_nondestructive'))",
+      )
+      ctx.ensureColumn('approval_leases', 'max_uses', 'INTEGER')
+      ctx.ensureColumn('approval_leases', 'cross_persona', 'INTEGER NOT NULL DEFAULT 0')
+
+      // Conservative backfill (R2-09):
+      // Only explicit host non-destructive sentinel rows map to 'host_nondestructive'.
+      // Pre-migration rows — including legacy '/x/**'-shaped route_pattern rows — stay
+      // conservatively typed as 'route' (NEVER widened into 'prefix').
+      ctx.client.prepare(`
+        UPDATE approval_leases
+        SET lease_scope = 'host_nondestructive'
+        WHERE lease_scope = 'route' AND upper(trim(method)) = ? AND trim(route_pattern) = ?
+      `).run(HOST_NONDESTRUCTIVE_LEASE_METHOD, HOST_NONDESTRUCTIVE_LEASE_PATTERN)
+
+      // Backfill finite bounds onto any legacy leases missing expires_at or max_uses.
+      ctx.client.prepare(`
+        UPDATE approval_leases
+        SET expires_at = created_at + ?
+        WHERE expires_at IS NULL AND status = 'active'
+      `).run(DEFAULT_APPROVAL_LEASE_TTL_MS)
+      ctx.client.prepare(`
+        UPDATE approval_leases
+        SET max_uses = CASE
+          WHEN lease_scope = 'route' THEN ?
+          ELSE ?
+        END
+        WHERE max_uses IS NULL
+      `).run(DEFAULT_ROUTE_LEASE_MAX_USES, DEFAULT_HOST_LEASE_MAX_USES)
     },
   },
 ]
