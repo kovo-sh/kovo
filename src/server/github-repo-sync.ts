@@ -7,13 +7,14 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  readlinkSync,
   realpathSync,
   renameSync,
   rmSync,
   rmdirSync,
   writeFileSync,
 } from 'node:fs'
-import { join, relative, resolve, sep } from 'node:path'
+import { dirname, join, relative, resolve, sep } from 'node:path'
 import { DEFAULT_GITHUB_API_BASE_URL, resolveFreshGithubCredential } from './github-auth.ts'
 import { mineSecurityRelevantCommitDiffs, type CommitDiffSignal } from './program-graph.ts'
 import { redact } from './redact.ts'
@@ -76,12 +77,26 @@ export interface GithubSyncOptions {
   maxFileBytes?: number
   maxRepoBytes?: number
   cloneTimeoutMs?: number
-  /** Bounded clone history depth (default 100). `.git` is preserved unless explicitly stripped. */
+  /** Bounded clone history depth (default 1 for shallow clone). `.git` is preserved unless explicitly stripped. */
   historyDepth?: number
   /** Mine security-relevant diffs, then remove `.git` from the mounted checkout. */
   stripGitMetadata?: boolean
   /** Maximum commits inspected for diffs during sync (default 20). */
   maxCommitDiffs?: number
+  /** Maximum on-disk size in bytes allowed for a single cloned repository (default 256 MiB). */
+  maxRepoDiskBytes?: number
+  /** Maximum combined on-disk size in bytes allowed across all mounted repos for one project (default 1 GiB). */
+  maxProjectDiskBytes?: number
+  /** Explicitly allow or disallow `file://` git origins (disabled in production; allowed in test runtime unless false). */
+  allowLocalFileProtocol?: boolean
+  /** Whether to query GitHub `/repos/<owner>/<repo>` size metadata prior to cloning when using HTTP(S) origins. */
+  preflightSizeCheck?: boolean
+  /** Active-run guard invoked inside the per-repo lock before mutating or swapping checkouts. */
+  assertNoActiveRuns?: (repoFullName: string) => void | Promise<void>
+  /** When true on multi-repo batches, isolate individual repo failures instead of aborting remaining repos. */
+  continueOnError?: boolean
+  /** Optional callback invoked for each per-repo error when `continueOnError` is true. */
+  onRepoError?: (repoFullName: string, error: Error) => void
 }
 
 export interface RepoCommitDiffMining {
@@ -91,6 +106,48 @@ export interface RepoCommitDiffMining {
   commitDiffs: CommitDiffSignal[]
 }
 
+export const DEFAULT_CLONE_DEPTH = 1
+export const DEFAULT_MAX_REPO_DISK_BYTES = 256 * 1024 * 1024
+export const DEFAULT_MAX_PROJECT_DISK_BYTES = 1024 * 1024 * 1024
+
+export class RepoWorkspaceBusyError extends Error {
+  readonly code: 'REPO_ACTIVE_RUN_LOCKED' | 'REPO_SYNC_IN_PROGRESS'
+  readonly status = 409
+  readonly activeRunIds: string[]
+
+  constructor(
+    code: 'REPO_ACTIVE_RUN_LOCKED' | 'REPO_SYNC_IN_PROGRESS',
+    message: string,
+    activeRunIds: readonly string[] = [],
+  ) {
+    super(message)
+    this.name = 'RepoWorkspaceBusyError'
+    this.code = code
+    this.activeRunIds = [...activeRunIds]
+  }
+}
+
+export class RepoDiskQuotaExceededError extends Error {
+  readonly code = 'REPO_DISK_QUOTA_EXCEEDED'
+  readonly status = 413
+  readonly scope: 'repo' | 'project'
+  readonly repoFullName: string
+  readonly actualBytes: number
+  readonly quotaBytes: number
+
+  constructor(scope: 'repo' | 'project', repoFullName: string, actualBytes: number, quotaBytes: number) {
+    const scopeLabel = scope === 'repo' ? `Repository "${repoFullName}"` : `Project repositories including "${repoFullName}"`
+    super(
+      `${scopeLabel} exceeded the ${scope} disk quota (${actualBytes} bytes > ${quotaBytes} bytes limit).`,
+    )
+    this.name = 'RepoDiskQuotaExceededError'
+    this.scope = scope
+    this.repoFullName = repoFullName
+    this.actualBytes = actualBytes
+    this.quotaBytes = quotaBytes
+  }
+}
+
 const repoFullNamePattern = /^[a-zA-Z0-9_.-]{1,100}\/[a-zA-Z0-9_.-]{1,100}$/
 const safeSegmentPattern = /^[a-zA-Z0-9_.-]{1,128}$/
 const defaultMaxFilesPerRepo = 40
@@ -98,8 +155,231 @@ const defaultMaxFileBytes = 512 * 1024
 const defaultMaxRepoBytes = 2 * 1024 * 1024
 const defaultMaxLockfileBytes = 8 * 1024 * 1024
 const defaultCloneTimeoutMs = 120_000
-const defaultHistoryDepth = 100
+const defaultHistoryDepth = DEFAULT_CLONE_DEPTH
 const defaultMaxCommitDiffs = 20
+
+const repoLockTails = new Map<string, Promise<void>>()
+const activeRepoLockKeys = new Set<string>()
+const activeStagingDirs = new Set<string>()
+
+function isTestRuntime(): boolean {
+  if (typeof process === 'undefined') return false
+  return Boolean(process.env.NODE_TEST_CONTEXT)
+    || process.env.NODE_ENV === 'test'
+    || (Array.isArray(process.execArgv) && process.execArgv.includes('--test'))
+}
+
+function parsePositiveEnvBytes(name: string): number | undefined {
+  if (typeof process === 'undefined' || !process.env) return undefined
+  const raw = process.env[name]?.trim()
+  if (!raw) return undefined
+  const parsed = Number(raw)
+  if (!Number.isFinite(parsed) || parsed <= 0) return undefined
+  return Math.floor(parsed)
+}
+
+function repoLockKey(targetRootDir: string, fullName: string): string {
+  return `${resolve(targetRootDir)}::${fullName.toLowerCase()}`
+}
+
+export function isRepoOperationLocked(targetRootDir: string, repoSlug: string): boolean {
+  const { fullName } = parseRepoFullName(repoSlug)
+  return activeRepoLockKeys.has(repoLockKey(targetRootDir, fullName))
+}
+
+/**
+ * Serialize concurrent clone/resync/unlink operations for the same `(cloneRoot, owner/repo)` key.
+ * Waiters observe `options.signal` while queued without breaking serialization for subsequent callers.
+ */
+export async function withRepoOperationLock<T>(
+  targetRootDir: string,
+  repoSlug: string,
+  fn: () => Promise<T> | T,
+  options: { signal?: AbortSignal } = {},
+): Promise<T> {
+  options.signal?.throwIfAborted()
+  const { fullName } = parseRepoFullName(repoSlug)
+  const key = repoLockKey(targetRootDir, fullName)
+  const previous = repoLockTails.get(key)
+
+  let release!: () => void
+  const current = new Promise<void>(resolvePromise => {
+    release = resolvePromise
+  })
+  const tail = (previous ?? Promise.resolve()).then(() => current)
+  repoLockTails.set(key, tail)
+
+  const waitForTurn = async (): Promise<void> => {
+    if (!previous) return
+    const signal = options.signal
+    if (!signal) {
+      await previous
+      return
+    }
+    if (signal.aborted) {
+      throw signal.reason ?? new DOMException('The operation was aborted.', 'AbortError')
+    }
+    await new Promise<void>((resolveWait, rejectWait) => {
+      const onAbort = () => {
+        rejectWait(signal.reason ?? new DOMException('The operation was aborted.', 'AbortError'))
+      }
+      signal.addEventListener('abort', onAbort, { once: true })
+      previous.then(
+        () => {
+          signal.removeEventListener('abort', onAbort)
+          resolveWait()
+        },
+        () => {
+          signal.removeEventListener('abort', onAbort)
+          resolveWait()
+        },
+      )
+    })
+  }
+
+  let acquired = false
+  try {
+    await waitForTurn()
+    options.signal?.throwIfAborted()
+    acquired = true
+    activeRepoLockKeys.add(key)
+    return await fn()
+  } finally {
+    if (acquired) {
+      activeRepoLockKeys.delete(key)
+    }
+    release()
+    if (repoLockTails.get(key) === tail) {
+      repoLockTails.delete(key)
+    }
+  }
+}
+
+export interface OrphanCleanupResult {
+  removed: string[]
+  warnings: string[]
+}
+
+/**
+ * Deterministically remove orphaned `.tmp-*` and `.old-*` checkout directories left behind
+ * by interrupted clones/swaps under `repos/<projectId>/`, skipping any paths actively in flight.
+ */
+export function cleanupOrphanedRepoDirs(
+  reposDir: string,
+  options: { skipPaths?: ReadonlySet<string> } = {},
+): OrphanCleanupResult {
+  const removed: string[] = []
+  const warnings: string[] = []
+  if (!reposDir || /[\0,\r\n]/.test(reposDir) || !existsSync(reposDir)) {
+    return { removed, warnings }
+  }
+  let rootStat
+  try {
+    rootStat = lstatSync(reposDir)
+  } catch {
+    return { removed, warnings }
+  }
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
+    return { removed, warnings }
+  }
+  const resolvedRoot = realpathSync(reposDir)
+
+  const shouldSkip = (entryPath: string): boolean => {
+    const resolved = resolve(entryPath)
+    return activeStagingDirs.has(resolved) || Boolean(options.skipPaths?.has(resolved))
+  }
+
+  const removeIfOrphan = (entryPath: string, name: string): boolean => {
+    if (!name.startsWith('.tmp-') && !name.startsWith('.old-')) return false
+    if (shouldSkip(entryPath)) return false
+    if (!resolve(entryPath).startsWith(resolvedRoot + sep)) return false
+    try {
+      const st = lstatSync(entryPath)
+      if (st.isSymbolicLink()) {
+        rmSync(entryPath, { force: true })
+      } else {
+        rmSync(entryPath, { recursive: true, force: true })
+      }
+      removed.push(relative(resolvedRoot, entryPath).split(sep).join('/'))
+      return true
+    } catch (err) {
+      warnings.push(`Failed to clean orphaned checkout "${name}": ${err instanceof Error ? err.message : String(err)}`)
+      return false
+    }
+  }
+
+  let topEntries
+  try {
+    topEntries = readdirSync(resolvedRoot, { withFileTypes: true })
+  } catch {
+    return { removed, warnings }
+  }
+
+  for (const topEntry of topEntries) {
+    const topPath = join(resolvedRoot, topEntry.name)
+    if (removeIfOrphan(topPath, topEntry.name)) continue
+    if (topEntry.name.startsWith('.') || !safeSegmentPattern.test(topEntry.name)) continue
+    let topStat
+    try {
+      topStat = lstatSync(topPath)
+    } catch {
+      continue
+    }
+    if (!topStat.isDirectory() || topStat.isSymbolicLink()) continue
+
+    let ownerEntries
+    try {
+      ownerEntries = readdirSync(topPath, { withFileTypes: true })
+    } catch {
+      continue
+    }
+    let removedInOwner = false
+    for (const child of ownerEntries) {
+      const childPath = join(topPath, child.name)
+      if (removeIfOrphan(childPath, child.name)) {
+        removedInOwner = true
+      }
+    }
+    if (removedInOwner) {
+      try {
+        if (readdirSync(topPath).length === 0) {
+          rmdirSync(topPath)
+        }
+      } catch {
+        // Best-effort cleanup of empty owner dir.
+      }
+    }
+  }
+
+  return { removed: removed.sort(), warnings }
+}
+
+export function buildHardenedGitCloneArgs(input: {
+  repoUrl: string
+  stagingDir: string
+  depth?: number
+  allowLocalFileProtocol?: boolean
+}): string[] {
+  const depth = Math.max(1, Math.min(Math.floor(input.depth ?? DEFAULT_CLONE_DEPTH), 100))
+  const fileProtocolPolicy = input.allowLocalFileProtocol ? 'user' : 'never'
+  return [
+    '-c', 'core.hooksPath=/dev/null',
+    '-c', 'core.fsmonitor=false',
+    '-c', 'core.symlinks=false',
+    '-c', `protocol.file.allow=${fileProtocolPolicy}`,
+    '-c', 'protocol.ext.allow=never',
+    '-c', 'submodule.recurse=false',
+    '-c', 'fetch.recurseSubmodules=false',
+    'clone',
+    '--depth', String(depth),
+    '--single-branch',
+    '--no-tags',
+    '--no-recurse-submodules',
+    '--',
+    input.repoUrl,
+    input.stagingDir,
+  ]
+}
 
 const skippedDirNames = new Set([
   '.git',
@@ -215,6 +495,27 @@ function measureDirectoryBytes(dirPath: string, depth = 0): number {
   return total
 }
 
+export interface UnlinkMountedRepoOptions {
+  activeRunIds?: readonly string[]
+  assertNoActiveRuns?: () => void
+}
+
+export function measureProjectDiskBytes(
+  reposDir: string,
+  options: { excludeRepo?: string } = {},
+): number {
+  const excluded = options.excludeRepo ? parseRepoFullName(options.excludeRepo).fullName.toLowerCase() : null
+  const mounted = listMountedRepos(reposDir)
+  let total = 0
+  for (const mountPath of mounted) {
+    const fullName = mountPath.slice('/repos/'.length)
+    if (excluded && fullName.toLowerCase() === excluded) continue
+    const { owner, repo } = parseRepoFullName(fullName)
+    total += measureDirectoryBytes(join(reposDir, owner, repo))
+  }
+  return total
+}
+
 function readRepoGitHeadInfo(repoDir: string): { branch: string | null; commitSha: string | null } {
   const gitPath = join(repoDir, '.git')
   if (!existsSync(gitPath)) return { branch: null, commitSha: null }
@@ -223,7 +524,15 @@ function readRepoGitHeadInfo(repoDir: string): { branch: string | null; commitSh
   } catch {
     return { branch: null, commitSha: null }
   }
-  const baseArgs = ['-C', repoDir, '-c', 'safe.directory=*', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null']
+  const baseArgs = [
+    '-C', repoDir,
+    '-c', 'safe.directory=*',
+    '-c', 'core.fsmonitor=false',
+    '-c', 'core.hooksPath=/dev/null',
+    '-c', 'core.symlinks=false',
+    '-c', 'protocol.file.allow=never',
+    '-c', 'protocol.ext.allow=never',
+  ]
   let branch: string | null = null
   let commitSha: string | null = null
   try {
@@ -278,17 +587,23 @@ export function listProjectMountedRepos(dataDir: string, projectId: string): Pro
   return out
 }
 
-/**
- * Unlink (delete) a single mounted repository checkout under `repos/<projectId>/<owner>/<repo>`.
- * Strictly enforces path containment so traversal segments or symlinks cannot escape `repos/<projectId>/`.
- */
-export function unlinkProjectMountedRepo(
+function unlinkProjectMountedRepoUnlocked(
   dataDir: string,
   projectId: string,
   repoSlug: string,
+  options: UnlinkMountedRepoOptions = {},
 ): UnlinkMountedRepoResult {
   const reposDir = projectReposDir(dataDir, projectId)
   const { fullName, owner, repo } = parseRepoFullName(repoSlug)
+
+  if (options.activeRunIds && options.activeRunIds.length > 0) {
+    throw new RepoWorkspaceBusyError(
+      'REPO_ACTIVE_RUN_LOCKED',
+      `Cannot unlink repository "${fullName}" while project has ${options.activeRunIds.length} active ${options.activeRunIds.length === 1 ? 'run' : 'runs'} (${options.activeRunIds.join(', ')}). Stop active runs first so live worker bind mounts are not corrupted.`,
+      options.activeRunIds,
+    )
+  }
+  options.assertNoActiveRuns?.()
 
   if (!existsSync(reposDir)) {
     return { unlinked: false, fullName }
@@ -344,14 +659,62 @@ export function unlinkProjectMountedRepo(
   }
 
   rmSync(targetDir, { recursive: true, force: true })
+  // Also sweep any orphaned staging/backup directories left for this repo.
   try {
+    for (const entry of readdirSync(ownerDir, { withFileTypes: true })) {
+      if (entry.name.startsWith(`.tmp-${repo}-`) || entry.name.startsWith(`.old-${repo}-`)) {
+        const orphanPath = join(ownerDir, entry.name)
+        if (!activeStagingDirs.has(resolve(orphanPath))) {
+          rmSync(orphanPath, { recursive: true, force: true })
+        }
+      }
+    }
     if (readdirSync(ownerDir).length === 0) {
       rmdirSync(ownerDir)
     }
   } catch {
-    // Best-effort cleanup of empty owner directory.
+    // Best-effort cleanup of orphaned staging dirs and empty owner directory.
   }
   return { unlinked: true, fullName }
+}
+
+/**
+ * Unlink (delete) a single mounted repository checkout under `repos/<projectId>/<owner>/<repo>`.
+ * Strictly enforces path containment, rejects unlink while a sync holds the repo lock or an active run is bound.
+ */
+export function unlinkProjectMountedRepo(
+  dataDir: string,
+  projectId: string,
+  repoSlug: string,
+  options: UnlinkMountedRepoOptions = {},
+): UnlinkMountedRepoResult {
+  const reposDir = projectReposDir(dataDir, projectId)
+  const { fullName } = parseRepoFullName(repoSlug)
+  if (isRepoOperationLocked(reposDir, fullName)) {
+    throw new RepoWorkspaceBusyError(
+      'REPO_SYNC_IN_PROGRESS',
+      `Repository "${fullName}" currently has a sync or unlink operation in progress. Wait for it to finish and try again.`,
+    )
+  }
+  return unlinkProjectMountedRepoUnlocked(dataDir, projectId, repoSlug, options)
+}
+
+/**
+ * Async locked variant of `unlinkProjectMountedRepo` that serializes cleanly against concurrent clones/resyncs.
+ */
+export async function unlinkProjectMountedRepoLocked(
+  dataDir: string,
+  projectId: string,
+  repoSlug: string,
+  options: UnlinkMountedRepoOptions & { signal?: AbortSignal } = {},
+): Promise<UnlinkMountedRepoResult> {
+  const reposDir = projectReposDir(dataDir, projectId)
+  return await withRepoOperationLock(
+    reposDir,
+    repoSlug,
+    () => unlinkProjectMountedRepoUnlocked(dataDir, projectId, repoSlug, options),
+    { signal: options.signal },
+  )
 }
 
 function parseRepoFullName(rawName: string): { fullName: string; owner: string; repo: string } {
@@ -841,6 +1204,141 @@ function sanitizeGitMetadata(gitDir: string): void {
   } catch { /* best-effort */ }
 }
 
+function isSymlinkEscapingRoot(fullPath: string, resolvedRoot: string): boolean {
+  try {
+    const rawTarget = readlinkSync(fullPath)
+    const logicalTarget = resolve(dirname(fullPath), rawTarget)
+    if (!(logicalTarget === resolvedRoot || logicalTarget.startsWith(resolvedRoot + sep))) {
+      return true
+    }
+  } catch {
+    return true
+  }
+  try {
+    const realTarget = realpathSync(fullPath)
+    return !(realTarget === resolvedRoot || realTarget.startsWith(resolvedRoot + sep))
+  } catch {
+    // Dangling symlink: logicalTarget already checked above; reject dangling relative escapes
+    // and treat any unreadable/broken target conservatively as escaping if outside root.
+    return false
+  }
+}
+
+/**
+ * Inspect an entire cloned repository tree (including `.git` and dependency dirs):
+ * - Unconditionally strips all OS symlinks so read-only mounts and patch tooling never traverse links.
+ * - Also inspects git-tracked symlink blobs (index mode 120000 written as text files under `core.symlinks=false`).
+ * - When `rejectEscaping` is true (default), throws if any OS or git-tracked symlink targets outside `rootDir`.
+ */
+export function verifyAndStripRepoSymlinks(
+  rootDir: string,
+  options: { rejectEscaping?: boolean } = {},
+): { removedSymlinks: string[]; escapingSymlinks: string[] } {
+  const resolvedRoot = realpathSync(rootDir)
+  const removedSymlinks: string[] = []
+  const escapingSymlinks: string[] = []
+  const escapingSet = new Set<string>()
+
+  const recordEscaping = (relPath: string) => {
+    if (!escapingSet.has(relPath)) {
+      escapingSet.add(relPath)
+      escapingSymlinks.push(relPath)
+    }
+  }
+
+  const visit = (currentDir: string, depth: number) => {
+    if (depth > 64) return
+    let entries
+    try {
+      entries = readdirSync(currentDir, { withFileTypes: true })
+    } catch {
+      return
+    }
+    entries.sort((a, b) => a.name.localeCompare(b.name))
+    for (const entry of entries) {
+      const fullPath = join(currentDir, entry.name)
+      let st
+      try {
+        st = lstatSync(fullPath)
+      } catch {
+        continue
+      }
+      if (st.isSymbolicLink()) {
+        const relPath = relative(resolvedRoot, fullPath).split(sep).join('/')
+        const escaped = isSymlinkEscapingRoot(fullPath, resolvedRoot)
+        rmSync(fullPath, { force: true })
+        removedSymlinks.push(relPath)
+        if (escaped) recordEscaping(relPath)
+        continue
+      }
+      if (st.isDirectory()) {
+        visit(fullPath, depth + 1)
+      }
+    }
+  }
+
+  visit(resolvedRoot, 0)
+
+  // Check git index for mode-120000 symlink entries (materialized as plain text under core.symlinks=false).
+  const gitDir = join(resolvedRoot, '.git')
+  if (existsSync(gitDir)) {
+    try {
+      if (!lstatSync(gitDir).isSymbolicLink()) {
+        const lsOut = execFileSync(
+          'git',
+          [
+            '-C', resolvedRoot,
+            '-c', 'safe.directory=*',
+            '-c', 'core.fsmonitor=false',
+            '-c', 'core.hooksPath=/dev/null',
+            '-c', 'core.symlinks=false',
+            '-c', 'protocol.file.allow=never',
+            '-c', 'protocol.ext.allow=never',
+            'ls-files', '-s', '-z',
+          ],
+          { encoding: 'utf8', timeout: 5_000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] },
+        )
+        for (const rec of lsOut.split('\0')) {
+          if (!rec.startsWith('120000 ')) continue
+          const tabIdx = rec.indexOf('\t')
+          if (tabIdx < 0) continue
+          const relPath = rec.slice(tabIdx + 1)
+          if (!relPath || relPath.includes('\0')) continue
+          const entryFullPath = resolve(resolvedRoot, relPath)
+          if (!entryFullPath.startsWith(resolvedRoot + sep)) {
+            recordEscaping(relPath)
+            continue
+          }
+          try {
+            const st = lstatSync(entryFullPath)
+            if (st.isFile() && st.size <= 4096) {
+              const targetSpec = readFileSync(entryFullPath, 'utf8').trim()
+              const logicalTarget = resolve(dirname(entryFullPath), targetSpec)
+              if (!(logicalTarget === resolvedRoot || logicalTarget.startsWith(resolvedRoot + sep))) {
+                rmSync(entryFullPath, { force: true })
+                removedSymlinks.push(relPath)
+                recordEscaping(relPath)
+              }
+            }
+          } catch {
+            // Best-effort inspect of mode-120000 file.
+          }
+        }
+      }
+    } catch {
+      // Non-git or unreadable index; OS symlink scan above still enforced.
+    }
+  }
+
+  if (options.rejectEscaping !== false && escapingSymlinks.length > 0) {
+    throw new Error(
+      `Rejected repository containing symlink escaping checkout root: ${escapingSymlinks.slice(0, 5).join(', ')}`,
+    )
+  }
+
+  return { removedSymlinks, escapingSymlinks }
+}
+
 function walkClonedRepo(
   rootDir: string,
   secrets: readonly NamedSecret[],
@@ -873,19 +1371,13 @@ function walkClonedRepo(
       const fullPath = join(currentDir, entry.name)
       const lstat = lstatSync(fullPath)
 
-      // Never allow symlinks escaping the clone root; strip all symlinks for safety.
+      // Strip ALL symlinks unconditionally so mounts and patch tooling never traverse links.
       if (lstat.isSymbolicLink()) {
-        let escaped = true
-        try {
-          const target = realpathSync(fullPath)
-          escaped = !(target === resolvedRoot || target.startsWith(resolvedRoot + sep))
-        } catch {
-          escaped = true
-        }
-        if (escaped) {
-          rmSync(fullPath, { force: true })
-          warnings.push(`Removed out-of-tree symlink: ${relative(rootDir, fullPath).split(sep).join('/')}`)
-        }
+        const escaped = isSymlinkEscapingRoot(fullPath, resolvedRoot)
+        rmSync(fullPath, { force: true })
+        warnings.push(
+          `${escaped ? 'Removed out-of-tree symlink' : 'Removed in-tree symlink'}: ${relative(rootDir, fullPath).split(sep).join('/')}`,
+        )
         continue
       }
 
@@ -980,7 +1472,15 @@ export function readRepoCommitDiffs(
   if (!existsSync(gitDir)) return { available: false, reason: 'No .git directory in mounted repository.', commitsScanned: 0, commitDiffs: [] }
   const maxCommits = Math.max(1, Math.min(options.maxCommits ?? defaultMaxCommitDiffs, 200))
   const maxDiffBytes = Math.max(16_384, Math.min(options.maxDiffBytes ?? 262_144, 1024 * 1024))
-  const baseArgs = ['-C', repoDir, '-c', 'safe.directory=*', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null']
+  const baseArgs = [
+    '-C', repoDir,
+    '-c', 'safe.directory=*',
+    '-c', 'core.fsmonitor=false',
+    '-c', 'core.hooksPath=/dev/null',
+    '-c', 'core.symlinks=false',
+    '-c', 'protocol.file.allow=never',
+    '-c', 'protocol.ext.allow=never',
+  ]
   try {
     execFileSync('git', [...baseArgs, 'rev-parse', '--git-dir'], { encoding: 'utf8', timeout: 5_000, stdio: ['ignore', 'pipe', 'ignore'] })
   } catch {
@@ -1005,7 +1505,7 @@ export function readRepoCommitDiffs(
   }
   for (const commit of commits) {
     try {
-      commit.diff = execFileSync('git', [...baseArgs, 'show', '--unified=3', '--no-color', '--format=', commit.sha], {
+      commit.diff = execFileSync('git', [...baseArgs, 'show', '--no-ext-diff', '--unified=3', '--no-color', '--format=', commit.sha], {
         encoding: 'utf8', timeout: 8_000, maxBuffer: maxDiffBytes + 1024, stdio: ['ignore', 'pipe', 'ignore'],
       }).slice(0, maxDiffBytes)
     } catch { commit.diff = '' }
@@ -1014,6 +1514,48 @@ export function readRepoCommitDiffs(
     available: true,
     commitsScanned: commits.length,
     commitDiffs: mineSecurityRelevantCommitDiffs(commits, { maxSignals: 100, maxLinesPerFile: 12 }),
+  }
+}
+
+async function checkGithubPreflightRepoSize(input: {
+  fullName: string
+  pat: string
+  apiBase: string
+  fetchFn: typeof fetch
+  maxRepoDiskBytes: number
+  signal?: AbortSignal
+}): Promise<void> {
+  const reqSignal = input.signal
+    ? AbortSignal.any([input.signal, AbortSignal.timeout(10_000)])
+    : AbortSignal.timeout(10_000)
+  let res: Response
+  try {
+    res = await input.fetchFn(`${input.apiBase}/repos/${input.fullName}`, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${input.pat}`,
+        Accept: 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+        'User-Agent': 'KovoHunter/2 read-only repo connector',
+      },
+      signal: reqSignal,
+    })
+  } catch (err) {
+    if (input.signal?.aborted) throw err
+    return
+  }
+  if (!res.ok) return
+  let meta: { size?: unknown }
+  try {
+    meta = await res.json() as { size?: unknown }
+  } catch {
+    return
+  }
+  if (typeof meta.size === 'number' && Number.isFinite(meta.size) && meta.size > 0) {
+    const estimatedBytes = Math.round(meta.size * 1024)
+    if (estimatedBytes > input.maxRepoDiskBytes) {
+      throw new RepoDiskQuotaExceededError('repo', input.fullName, estimatedBytes, input.maxRepoDiskBytes)
+    }
   }
 }
 
@@ -1028,169 +1570,377 @@ export async function cloneGithubRepos(
     throw new Error('Invalid repository clone root directory.')
   }
 
-  const cred = await resolveFreshGithubCredential({
-    dataDir: options.dataDir,
-    patPath: options.patPath,
-    githubBaseUrl: options.githubBaseUrl,
-    fetchImpl: options.fetchImpl,
-    signal,
-  })
-  const pat = cred.accessToken
-  const basicAuth = Buffer.from(`x-access-token:${pat}`, 'utf8').toString('base64')
-  const secrets: NamedSecret[] = [
-    { value: pat, placeholder: '[redacted]' },
-    { value: basicAuth, placeholder: '[redacted]' },
-    ...(cred.refreshToken ? [{ value: cred.refreshToken, placeholder: '[redacted]' }] : []),
-  ]
   const gitBase = (options.gitBaseUrl ?? 'https://github.com').replace(/\/+$/, '')
   const gitBaseUrl = new URL(gitBase)
   if (!['https:', 'http:', 'file:'].includes(gitBaseUrl.protocol)) {
     throw new Error(`Unsupported Git base protocol: ${gitBaseUrl.protocol}`)
   }
+  const allowLocalFileProtocol = gitBaseUrl.protocol === 'file:'
+    && (options.allowLocalFileProtocol === true || (options.allowLocalFileProtocol !== false && isTestRuntime()))
+  if (gitBaseUrl.protocol === 'file:' && !allowLocalFileProtocol) {
+    throw new Error('Git file:// protocol is disabled outside explicit test mode.')
+  }
+
   const maxFileBytes = Math.max(1024, Math.min(options.maxFileBytes ?? defaultMaxFileBytes, 2 * 1024 * 1024))
   const cloneTimeoutMs = Math.max(5_000, Math.min(options.cloneTimeoutMs ?? defaultCloneTimeoutMs, 600_000))
-  const historyDepth = Math.max(1, Math.min(Math.floor(options.historyDepth ?? defaultHistoryDepth), 1000))
+  const historyDepth = Math.max(1, Math.min(Math.floor(options.historyDepth ?? defaultHistoryDepth), 100))
   const stripGitMetadata = options.stripGitMetadata === true
   const maxCommitDiffs = Math.max(0, Math.min(Math.floor(options.maxCommitDiffs ?? defaultMaxCommitDiffs), 200))
+  const maxRepoDiskBytes = Math.max(
+    1024,
+    Math.floor(options.maxRepoDiskBytes ?? parsePositiveEnvBytes('KOVO_MAX_REPO_DISK_BYTES') ?? DEFAULT_MAX_REPO_DISK_BYTES),
+  )
+  const maxProjectDiskBytes = Math.max(
+    1024,
+    Math.floor(options.maxProjectDiskBytes ?? parsePositiveEnvBytes('KOVO_MAX_PROJECT_DISK_BYTES') ?? DEFAULT_MAX_PROJECT_DISK_BYTES),
+  )
 
   mkdirSync(targetRootDir, { recursive: true, mode: 0o755 })
   chmodSync(targetRootDir, 0o755)
   const resolvedRoot = realpathSync(targetRootDir)
 
-  const gitEnv: NodeJS.ProcessEnv = {
-    PATH: process.env.PATH,
-    HOME: process.env.HOME,
-    GIT_TERMINAL_PROMPT: '0',
-    GIT_ASKPASS: 'echo',
-    GIT_CONFIG_NOSYSTEM: '1',
-    GIT_CONFIG_GLOBAL: '/dev/null',
-  }
-  if (gitBaseUrl.protocol === 'https:' || gitBaseUrl.protocol === 'http:') {
-    gitEnv.GIT_CONFIG_COUNT = '2'
-    gitEnv.GIT_CONFIG_KEY_0 = `http.${gitBaseUrl.origin}/.extraHeader`
-    gitEnv.GIT_CONFIG_VALUE_0 = `Authorization: Basic ${basicAuth}`
-    gitEnv.GIT_CONFIG_KEY_1 = 'core.symlinks'
-    gitEnv.GIT_CONFIG_VALUE_1 = 'false'
-  } else {
-    gitEnv.GIT_CONFIG_COUNT = '1'
-    gitEnv.GIT_CONFIG_KEY_0 = 'core.symlinks'
-    gitEnv.GIT_CONFIG_VALUE_0 = 'false'
-  }
+  // Sweep orphaned `.tmp-*` / `.old-*` directories left behind by crashed syncs.
+  cleanupOrphanedRepoDirs(resolvedRoot)
+
+  const shouldPreflightSize =
+    gitBaseUrl.protocol !== 'file:'
+    && options.preflightSizeCheck !== false
+    && (Boolean(options.apiBaseUrl) || gitBaseUrl.hostname === 'github.com')
+  const apiBase = (options.apiBaseUrl ?? DEFAULT_GITHUB_API_BASE_URL).replace(/\/+$/, '')
+  const fetchFn = options.fetchImpl ?? fetch
 
   const results: SyncedGithubRepo[] = []
+  let firstError: unknown = null
 
   for (const rawName of repoFullNames) {
     signal?.throwIfAborted()
     const { fullName, owner, repo } = parseRepoFullName(rawName)
-    const ownerDir = join(resolvedRoot, owner)
-    const finalDir = join(ownerDir, repo)
-    if (!resolve(finalDir).startsWith(resolvedRoot + sep)) {
-      throw new Error(`Resolved clone path escapes root directory: ${fullName}`)
+
+    const runSingleRepo = async (): Promise<SyncedGithubRepo> => {
+      return await withRepoOperationLock(
+        resolvedRoot,
+        fullName,
+        async () => {
+          signal?.throwIfAborted()
+          await options.assertNoActiveRuns?.(fullName)
+
+          // Resolve fresh credentials per repo so long multi-repo batches pick up rotated tokens.
+          const cred = await resolveFreshGithubCredential({
+            dataDir: options.dataDir,
+            patPath: options.patPath,
+            githubBaseUrl: options.githubBaseUrl,
+            fetchImpl: options.fetchImpl,
+            signal,
+          })
+          const pat = cred.accessToken
+          const basicAuth = Buffer.from(`x-access-token:${pat}`, 'utf8').toString('base64')
+          const secrets: NamedSecret[] = [
+            { value: pat, placeholder: '[redacted]' },
+            { value: basicAuth, placeholder: '[redacted]' },
+            ...(cred.refreshToken ? [{ value: cred.refreshToken, placeholder: '[redacted]' }] : []),
+          ]
+
+          if (shouldPreflightSize) {
+            await checkGithubPreflightRepoSize({
+              fullName,
+              pat,
+              apiBase,
+              fetchFn,
+              maxRepoDiskBytes,
+              signal,
+            })
+          }
+
+          const gitEnv: NodeJS.ProcessEnv = {
+            PATH: process.env.PATH,
+            HOME: process.env.HOME,
+            GIT_TERMINAL_PROMPT: '0',
+            GIT_ASKPASS: 'echo',
+            GIT_CONFIG_NOSYSTEM: '1',
+            GIT_CONFIG_GLOBAL: '/dev/null',
+          }
+          if (gitBaseUrl.protocol === 'https:' || gitBaseUrl.protocol === 'http:') {
+            gitEnv.GIT_CONFIG_COUNT = '2'
+            gitEnv.GIT_CONFIG_KEY_0 = `http.${gitBaseUrl.origin}/.extraHeader`
+            gitEnv.GIT_CONFIG_VALUE_0 = `Authorization: Basic ${basicAuth}`
+            gitEnv.GIT_CONFIG_KEY_1 = 'core.symlinks'
+            gitEnv.GIT_CONFIG_VALUE_1 = 'false'
+          } else {
+            gitEnv.GIT_CONFIG_COUNT = '1'
+            gitEnv.GIT_CONFIG_KEY_0 = 'core.symlinks'
+            gitEnv.GIT_CONFIG_VALUE_0 = 'false'
+          }
+
+          const ownerDir = join(resolvedRoot, owner)
+          const finalDir = join(ownerDir, repo)
+          if (!resolve(finalDir).startsWith(resolvedRoot + sep)) {
+            throw new Error(`Resolved clone path escapes root directory: ${fullName}`)
+          }
+
+          mkdirSync(ownerDir, { recursive: true, mode: 0o755 })
+          chmodSync(ownerDir, 0o755)
+
+          const stagingDir = join(ownerDir, `.tmp-${repo}-${randomUUID()}`)
+          const backupDir = join(ownerDir, `.old-${repo}-${randomUUID()}`)
+          const resolvedStaging = resolve(stagingDir)
+          const resolvedBackup = resolve(backupDir)
+          activeStagingDirs.add(resolvedStaging)
+          activeStagingDirs.add(resolvedBackup)
+
+          const repoUrl = `${gitBase}/${owner}/${repo}.git`
+          const warnings: string[] = []
+
+          try {
+            const cloneArgs = buildHardenedGitCloneArgs({
+              repoUrl,
+              stagingDir,
+              depth: historyDepth,
+              allowLocalFileProtocol,
+            })
+            await runGit(cloneArgs, gitEnv, secrets, signal, cloneTimeoutMs)
+
+            let defaultBranch = 'main'
+            let commitSha: string | undefined
+            const revParsePrefix = [
+              '-C', stagingDir,
+              '-c', 'core.hooksPath=/dev/null',
+              '-c', 'core.fsmonitor=false',
+              '-c', 'core.symlinks=false',
+              '-c', 'protocol.file.allow=never',
+              '-c', 'protocol.ext.allow=never',
+            ]
+            try {
+              const br = await runGit([...revParsePrefix, 'rev-parse', '--abbrev-ref', 'HEAD'], gitEnv, secrets, signal, 10_000)
+              if (br.stdout.trim() && br.stdout.trim() !== 'HEAD') defaultBranch = br.stdout.trim()
+            } catch { /* fallback to main */ }
+            try {
+              const sha = await runGit([...revParsePrefix, 'rev-parse', '--short', 'HEAD'], gitEnv, secrets, signal, 10_000)
+              if (sha.stdout.trim()) commitSha = sha.stdout.trim()
+            } catch { /* optional */ }
+
+            // Sanitize retained git metadata (strip credentials, symlinks, executable hooks).
+            sanitizeGitMetadata(join(stagingDir, '.git'))
+
+            // Reject any OS or git-tracked symlink escaping the checkout root, and strip all symlinks.
+            const symlinkCheck = verifyAndStripRepoSymlinks(stagingDir, { rejectEscaping: true })
+            for (const removedLink of symlinkCheck.removedSymlinks) {
+              warnings.push(`Removed symlink: ${removedLink}`)
+            }
+
+            // Walk full tree: enforce permissions for uid 10001:10001 and extract dependencies/schemas.
+            const walked = walkClonedRepo(stagingDir, secrets, maxFileBytes, warnings)
+
+            // Mine security-relevant diffs from the bounded history before any optional cleanup.
+            const mined = maxCommitDiffs > 0
+              ? readRepoCommitDiffs(stagingDir, { maxCommits: maxCommitDiffs })
+              : { available: false, commitsScanned: 0, commitDiffs: [] as CommitDiffSignal[] }
+            if (stripGitMetadata) {
+              rmSync(join(stagingDir, '.git'), { recursive: true, force: true })
+            }
+
+            // Enforce per-repo and per-project on-disk quotas before swapping into finalDir.
+            const stagedBytes = measureDirectoryBytes(stagingDir)
+            if (stagedBytes > maxRepoDiskBytes) {
+              throw new RepoDiskQuotaExceededError('repo', fullName, stagedBytes, maxRepoDiskBytes)
+            }
+            const existingOtherBytes = measureProjectDiskBytes(resolvedRoot, { excludeRepo: fullName })
+            if (existingOtherBytes + stagedBytes > maxProjectDiskBytes) {
+              throw new RepoDiskQuotaExceededError('project', fullName, existingOtherBytes + stagedBytes, maxProjectDiskBytes)
+            }
+
+            // Re-check active-run guard right before mutating the live bind-mount directory.
+            await options.assertNoActiveRuns?.(fullName)
+
+            // Atomically swap staged directory into final destination
+            let movedOld = false
+            try {
+              if (existsSync(finalDir)) {
+                renameSync(finalDir, backupDir)
+                movedOld = true
+              }
+              renameSync(stagingDir, finalDir)
+              if (movedOld) {
+                rmSync(backupDir, { recursive: true, force: true })
+              }
+            } catch (swapErr) {
+              if (movedOld && !existsSync(finalDir) && existsSync(backupDir)) {
+                try { renameSync(backupDir, finalDir) } catch { /* ignore */ }
+              }
+              throw swapErr
+            }
+
+            const mountPath = `/repos/${owner}/${repo}`
+            const specs = buildClonedRepoSpecs({
+              fullName,
+              defaultBranch,
+              commitSha,
+              mountPath,
+              treeCount: walked.treeCount,
+              topLevelDirs: walked.topLevelDirs,
+              topLevelFiles: walked.topLevelFiles,
+              manifestPaths: walked.manifestPaths,
+              schemaFiles: walked.schemaFiles,
+              dependencies: walked.dependencies,
+            })
+
+            return {
+              fullName,
+              defaultBranch,
+              private: true,
+              description: null,
+              language: null,
+              treeCount: walked.treeCount,
+              files: walked.files,
+              dependencies: walked.dependencies,
+              specs,
+              warnings,
+              mountPath,
+              localPath: finalDir,
+              commitSha,
+              topLevelDirs: walked.topLevelDirs,
+              gitHistory: {
+                depth: historyDepth,
+                commitsScanned: mined.commitsScanned,
+                commitDiffs: mined.commitDiffs,
+                metadataPreserved: !stripGitMetadata,
+              },
+            }
+          } finally {
+            try { rmSync(stagingDir, { recursive: true, force: true }) } catch { /* best-effort */ }
+            try { rmSync(backupDir, { recursive: true, force: true }) } catch { /* best-effort */ }
+            activeStagingDirs.delete(resolvedStaging)
+            activeStagingDirs.delete(resolvedBackup)
+          }
+        },
+        { signal },
+      )
     }
 
-    mkdirSync(ownerDir, { recursive: true, mode: 0o755 })
-    chmodSync(ownerDir, 0o755)
-
-    const stagingDir = join(ownerDir, `.tmp-${repo}-${randomUUID()}`)
-    const backupDir = join(ownerDir, `.old-${repo}-${randomUUID()}`)
-    const repoUrl = `${gitBase}/${owner}/${repo}.git`
-    const warnings: string[] = []
-
     try {
-      await runGit(
-        ['clone', '--depth', String(historyDepth), '--single-branch', '--no-tags', '--', repoUrl, stagingDir],
-        gitEnv,
-        secrets,
-        signal,
-        cloneTimeoutMs,
-      )
-
-      let defaultBranch = 'main'
-      let commitSha: string | undefined
-      try {
-        const br = await runGit(['-C', stagingDir, 'rev-parse', '--abbrev-ref', 'HEAD'], gitEnv, secrets, signal, 10_000)
-        if (br.stdout.trim() && br.stdout.trim() !== 'HEAD') defaultBranch = br.stdout.trim()
-      } catch { /* fallback to main */ }
-      try {
-        const sha = await runGit(['-C', stagingDir, 'rev-parse', '--short', 'HEAD'], gitEnv, secrets, signal, 10_000)
-        if (sha.stdout.trim()) commitSha = sha.stdout.trim()
-      } catch { /* optional */ }
-
-      // Sanitize retained git metadata (strip credentials, symlinks, executable hooks).
-      sanitizeGitMetadata(join(stagingDir, '.git'))
-
-      // Walk full tree: strip escaping symlinks, set a+rX permissions for uid 10001:10001, extract all dependencies
-      const walked = walkClonedRepo(stagingDir, secrets, maxFileBytes, warnings)
-
-      // Mine security-relevant diffs from the bounded history before any optional cleanup.
-      const mined = maxCommitDiffs > 0
-        ? readRepoCommitDiffs(stagingDir, { maxCommits: maxCommitDiffs })
-        : { available: false, commitsScanned: 0, commitDiffs: [] as CommitDiffSignal[] }
-      if (stripGitMetadata) {
-        rmSync(join(stagingDir, '.git'), { recursive: true, force: true })
+      results.push(await runSingleRepo())
+    } catch (err) {
+      if (!options.continueOnError || repoFullNames.length <= 1) {
+        throw err
       }
-
-      // Atomically swap staged directory into final destination
-      let movedOld = false
-      try {
-        if (existsSync(finalDir)) {
-          renameSync(finalDir, backupDir)
-          movedOld = true
-        }
-        renameSync(stagingDir, finalDir)
-        if (movedOld) {
-          rmSync(backupDir, { recursive: true, force: true })
-        }
-      } catch (swapErr) {
-        if (movedOld && !existsSync(finalDir) && existsSync(backupDir)) {
-          try { renameSync(backupDir, finalDir) } catch { /* ignore */ }
-        }
-        throw swapErr
-      }
-
-      const mountPath = `/repos/${owner}/${repo}`
-      const specs = buildClonedRepoSpecs({
-        fullName,
-        defaultBranch,
-        commitSha,
-        mountPath,
-        treeCount: walked.treeCount,
-        topLevelDirs: walked.topLevelDirs,
-        topLevelFiles: walked.topLevelFiles,
-        manifestPaths: walked.manifestPaths,
-        schemaFiles: walked.schemaFiles,
-        dependencies: walked.dependencies,
-      })
-
-      results.push({
-        fullName,
-        defaultBranch,
-        private: true,
-        description: null,
-        language: null,
-        treeCount: walked.treeCount,
-        files: walked.files,
-        dependencies: walked.dependencies,
-        specs,
-        warnings,
-        mountPath,
-        localPath: finalDir,
-        commitSha,
-        topLevelDirs: walked.topLevelDirs,
-        gitHistory: {
-          depth: historyDepth,
-          commitsScanned: mined.commitsScanned,
-          commitDiffs: mined.commitDiffs,
-          metadataPreserved: !stripGitMetadata,
-        },
-      })
-    } finally {
-      rmSync(stagingDir, { recursive: true, force: true })
-      rmSync(backupDir, { recursive: true, force: true })
+      if (!firstError) firstError = err
+      options.onRepoError?.(fullName, err instanceof Error ? err : new Error(String(err)))
     }
   }
 
+  if (results.length === 0 && firstError) {
+    throw firstError
+  }
+
   return results
+}
+
+export interface RepoWorkspaceManagerOptions {
+  maxRepoDiskBytes?: number
+  maxProjectDiskBytes?: number
+  shallowDepth?: number
+  activeRunChecker?: (projectId: string) => readonly string[] | Promise<readonly string[]>
+}
+
+/**
+ * Coordinates repository workspace lifecycle under `repos/<projectId>/<owner>/<repo>`:
+ * per-repo operation locks, active-run mount protection, orphan `.tmp-*`/`.old-*` GC,
+ * shallow hardened clones, and per-repo / per-project disk quotas.
+ */
+export class RepoWorkspaceManager {
+  readonly maxRepoDiskBytes: number
+  readonly maxProjectDiskBytes: number
+  readonly shallowDepth: number
+  private readonly activeRunChecker?: (projectId: string) => readonly string[] | Promise<readonly string[]>
+
+  constructor(options: RepoWorkspaceManagerOptions = {}) {
+    this.maxRepoDiskBytes = options.maxRepoDiskBytes ?? DEFAULT_MAX_REPO_DISK_BYTES
+    this.maxProjectDiskBytes = options.maxProjectDiskBytes ?? DEFAULT_MAX_PROJECT_DISK_BYTES
+    this.shallowDepth = Math.max(1, Math.min(Math.floor(options.shallowDepth ?? DEFAULT_CLONE_DEPTH), 100))
+    this.activeRunChecker = options.activeRunChecker
+  }
+
+  async withLock<T>(
+    dataDir: string,
+    projectId: string,
+    repoSlug: string,
+    fn: () => Promise<T> | T,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    return await withRepoOperationLock(projectReposDir(dataDir, projectId), repoSlug, fn, { signal })
+  }
+
+  async assertNoActiveRuns(projectId: string, action: 're-sync' | 'unlink', repoSlug: string): Promise<void> {
+    if (!this.activeRunChecker) return
+    const activeRunIds = [...(await this.activeRunChecker(projectId))]
+    if (activeRunIds.length > 0) {
+      throw new RepoWorkspaceBusyError(
+        'REPO_ACTIVE_RUN_LOCKED',
+        `Cannot ${action} repository "${repoSlug}" while project has ${activeRunIds.length} active ${activeRunIds.length === 1 ? 'run' : 'runs'} (${activeRunIds.join(', ')}). Stop active runs first so live worker bind mounts are not corrupted.`,
+        activeRunIds,
+      )
+    }
+  }
+
+  cleanupOrphans(dataDir: string, projectId: string): OrphanCleanupResult {
+    return cleanupOrphanedRepoDirs(projectReposDir(dataDir, projectId))
+  }
+
+  listRepos(dataDir: string, projectId: string): ProjectMountedRepo[] {
+    return listProjectMountedRepos(dataDir, projectId)
+  }
+
+  measureProjectBytes(dataDir: string, projectId: string): number {
+    return measureProjectDiskBytes(projectReposDir(dataDir, projectId))
+  }
+
+  async syncRepos(
+    dataDir: string,
+    projectId: string,
+    repoFullNames: readonly string[],
+    signal?: AbortSignal,
+    options: GithubSyncOptions = {},
+  ): Promise<SyncedGithubRepo[]> {
+    const cloneDir = projectReposDir(dataDir, projectId)
+    return await cloneGithubRepos(repoFullNames, cloneDir, signal, {
+      dataDir,
+      historyDepth: this.shallowDepth,
+      maxRepoDiskBytes: this.maxRepoDiskBytes,
+      maxProjectDiskBytes: this.maxProjectDiskBytes,
+      ...options,
+      assertNoActiveRuns: async repoFullName => {
+        await this.assertNoActiveRuns(projectId, 're-sync', repoFullName)
+        await options.assertNoActiveRuns?.(repoFullName)
+      },
+    })
+  }
+
+  async unlinkRepo(
+    dataDir: string,
+    projectId: string,
+    repoSlug: string,
+    options: UnlinkMountedRepoOptions & { signal?: AbortSignal } = {},
+  ): Promise<UnlinkMountedRepoResult> {
+    const { fullName } = parseRepoFullName(repoSlug)
+    return await this.withLock(
+      dataDir,
+      projectId,
+      fullName,
+      async () => {
+        await this.assertNoActiveRuns(projectId, 'unlink', fullName)
+        return unlinkProjectMountedRepoUnlocked(dataDir, projectId, fullName, options)
+      },
+      options.signal,
+    )
+  }
+}
+
+let sharedRepoWorkspaceManager: RepoWorkspaceManager | null = null
+
+export function getSharedRepoWorkspaceManager(): RepoWorkspaceManager {
+  if (!sharedRepoWorkspaceManager) {
+    sharedRepoWorkspaceManager = new RepoWorkspaceManager()
+  }
+  return sharedRepoWorkspaceManager
 }
 
 export async function syncGithubRepos(
@@ -1203,46 +1953,46 @@ export async function syncGithubRepos(
   }
 
   signal?.throwIfAborted()
-  const cred = await resolveFreshGithubCredential({
-    dataDir: options.dataDir,
-    patPath: options.patPath,
-    githubBaseUrl: options.githubBaseUrl,
-    fetchImpl: options.fetchImpl,
-    signal,
-  })
-  const pat = cred.accessToken
-  const secrets: NamedSecret[] = [
-    { value: pat, placeholder: '[redacted]' },
-    ...(cred.refreshToken ? [{ value: cred.refreshToken, placeholder: '[redacted]' }] : []),
-  ]
   const apiBase = (options.apiBaseUrl ?? DEFAULT_GITHUB_API_BASE_URL).replace(/\/+$/, '')
   const fetchFn = options.fetchImpl ?? fetch
   const maxFilesPerRepo = Math.max(1, Math.min(options.maxFilesPerRepo ?? defaultMaxFilesPerRepo, 80))
   const maxFileBytes = Math.max(1024, Math.min(options.maxFileBytes ?? defaultMaxFileBytes, 2 * 1024 * 1024))
   const maxRepoBytes = Math.max(4096, Math.min(options.maxRepoBytes ?? defaultMaxRepoBytes, 8 * 1024 * 1024))
 
-  const headers: Record<string, string> = {
-    Authorization: `Bearer ${pat}`,
-    Accept: 'application/vnd.github+json',
-    'X-GitHub-Api-Version': '2022-11-28',
-    'User-Agent': 'KovoHunter/2 read-only repo connector',
-  }
-
-  const githubGetJson = async <T>(path: string): Promise<T> => {
-    const reqSignal = signal ? AbortSignal.any([signal, AbortSignal.timeout(20_000)]) : AbortSignal.timeout(20_000)
-    const res = await fetchFn(`${apiBase}${path}`, { method: 'GET', headers, signal: reqSignal })
-    if (!res.ok) {
-      const body = redact(await res.text().catch(() => ''), secrets).slice(0, 240)
-      throw new Error(`GitHub API GET ${path} failed (${res.status}): ${body}`)
-    }
-    return await res.json() as T
-  }
-
   const results: SyncedGithubRepo[] = []
 
   for (const rawName of repoFullNames) {
     signal?.throwIfAborted()
     const { fullName } = parseRepoFullName(rawName)
+
+    const cred = await resolveFreshGithubCredential({
+      dataDir: options.dataDir,
+      patPath: options.patPath,
+      githubBaseUrl: options.githubBaseUrl,
+      fetchImpl: options.fetchImpl,
+      signal,
+    })
+    const pat = cred.accessToken
+    const secrets: NamedSecret[] = [
+      { value: pat, placeholder: '[redacted]' },
+      ...(cred.refreshToken ? [{ value: cred.refreshToken, placeholder: '[redacted]' }] : []),
+    ]
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${pat}`,
+      Accept: 'application/vnd.github+json',
+      'X-GitHub-Api-Version': '2022-11-28',
+      'User-Agent': 'KovoHunter/2 read-only repo connector',
+    }
+
+    const githubGetJson = async <T>(path: string): Promise<T> => {
+      const reqSignal = signal ? AbortSignal.any([signal, AbortSignal.timeout(20_000)]) : AbortSignal.timeout(20_000)
+      const res = await fetchFn(`${apiBase}${path}`, { method: 'GET', headers, signal: reqSignal })
+      if (!res.ok) {
+        const body = redact(await res.text().catch(() => ''), secrets).slice(0, 240)
+        throw new Error(`GitHub API GET ${path} failed (${res.status}): ${body}`)
+      }
+      return await res.json() as T
+    }
 
     const warnings: string[] = []
     const repoMeta = await githubGetJson<{

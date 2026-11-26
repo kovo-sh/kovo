@@ -17,6 +17,23 @@ import { dirname, join, resolve } from 'node:path'
 import { redact } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
 
+export function getDefaultGithubPatPath(): string {
+  if (typeof process === 'undefined' || !process.versions?.node) return ''
+  try {
+    const override = process.env.KOVO_GITHUB_FIXTURE_PAT_PATH?.trim()
+    if (override) return override
+    return join(homedir(), '.config', 'kovo-fixtures', 'github.pat')
+  } catch {
+    return ''
+  }
+}
+
+export function isLegacyFixtureGithubPatFallbackEnabled(): boolean {
+  if (typeof process === 'undefined' || !process.env) return false
+  const raw = process.env.KOVO_ALLOW_FIXTURE_GITHUB_PAT?.trim().toLowerCase()
+  return raw === '1' || raw === 'true'
+}
+
 export const DEFAULT_GITHUB_PAT_PATH =
   typeof process !== 'undefined' && Boolean(process.versions?.node)
     ? join(homedir(), '.config', 'kovo-fixtures', 'github.pat')
@@ -309,16 +326,37 @@ export function resolveGithubClientId(
 /**
  * Resolve the active GitHub PAT path: prefers `<dataDir>/credentials/github.pat` when present,
  * falling back to `DEFAULT_GITHUB_PAT_PATH` only when the vault file is absent.
+ * Note: production credential readers gate legacy fixture fallback behind `KOVO_ALLOW_FIXTURE_GITHUB_PAT=1`.
  */
 export function resolveGithubPatPath(dataDir?: string): string {
   if (dataDir) {
     const vaultPath = vaultGithubPatPath(dataDir)
     if (existsSync(vaultPath)) return vaultPath
   }
-  return DEFAULT_GITHUB_PAT_PATH
+  return getDefaultGithubPatPath()
 }
 
-export function readGithubVaultCredential(patPath = DEFAULT_GITHUB_PAT_PATH): StoredGithubVaultCredential {
+function resolveActiveGithubCredentialPath(options: { dataDir?: string; patPath?: string }): string {
+  if (options.patPath) {
+    return options.patPath
+  }
+  if (options.dataDir) {
+    const vaultPath = vaultGithubPatPath(options.dataDir)
+    if (existsSync(vaultPath)) return vaultPath
+    if (isLegacyFixtureGithubPatFallbackEnabled()) {
+      const fixturePath = getDefaultGithubPatPath()
+      if (fixturePath) return fixturePath
+    }
+    throw new Error('GitHub is not connected for this workspace. Connect GitHub or save a PAT in Project Sources.')
+  }
+  if (isLegacyFixtureGithubPatFallbackEnabled()) {
+    const fixturePath = getDefaultGithubPatPath()
+    if (fixturePath) return fixturePath
+  }
+  throw new Error('GitHub credential path or workspace data directory is required.')
+}
+
+export function readGithubVaultCredential(patPath = getDefaultGithubPatPath()): StoredGithubVaultCredential {
   const raw = readOwnerOnlyFile(patPath, 'GitHub PAT file')
   if (raw.startsWith('{')) {
     let parsed: Record<string, unknown>
@@ -366,7 +404,7 @@ export function readGithubVaultCredential(patPath = DEFAULT_GITHUB_PAT_PATH): St
   }
 }
 
-function readGithubPat(patPath = DEFAULT_GITHUB_PAT_PATH): string {
+function readGithubPat(patPath = getDefaultGithubPatPath()): string {
   return readGithubVaultCredential(patPath).accessToken
 }
 
@@ -442,10 +480,11 @@ export function clearGithubPat(dataDir: string): { cleared: boolean; status: Git
 }
 
 export function getGithubPatStatus(dataDir?: string, explicitPatPath?: string): GithubPatStatus {
+  const fixturePath = getDefaultGithubPatPath()
   if (explicitPatPath) {
     try {
       const pat = readGithubPat(explicitPatPath)
-      const source: GithubPatSource = resolve(explicitPatPath) === resolve(DEFAULT_GITHUB_PAT_PATH) ? 'fixture' : 'vault'
+      const source: GithubPatSource = fixturePath && resolve(explicitPatPath) === resolve(fixturePath) ? 'fixture' : 'vault'
       return { configured: true, source, tokenKind: classifyGithubPatKind(pat) }
     } catch {
       return { configured: false, source: null, tokenKind: null }
@@ -462,8 +501,11 @@ export function getGithubPatStatus(dataDir?: string, explicitPatPath?: string): 
       }
     }
   }
+  if (!isLegacyFixtureGithubPatFallbackEnabled() || !fixturePath) {
+    return { configured: false, source: null, tokenKind: null }
+  }
   try {
-    const pat = readGithubPat(DEFAULT_GITHUB_PAT_PATH)
+    const pat = readGithubPat(fixturePath)
     return { configured: true, source: 'fixture', tokenKind: classifyGithubPatKind(pat) }
   } catch {
     return { configured: false, source: null, tokenKind: null }
@@ -524,9 +566,10 @@ export function getGithubAuthStatus(
     }
   }
 
+  const fixturePath = getDefaultGithubPatPath()
   if (explicitPatPath) {
     try {
-      const source: GithubPatSource = resolve(explicitPatPath) === resolve(DEFAULT_GITHUB_PAT_PATH) ? 'fixture' : 'vault'
+      const source: GithubPatSource = fixturePath && resolve(explicitPatPath) === resolve(fixturePath) ? 'fixture' : 'vault'
       return readStatusFromPath(explicitPatPath, source)
     } catch {
       return baseUnconfigured
@@ -542,8 +585,11 @@ export function getGithubAuthStatus(
       }
     }
   }
+  if (!isLegacyFixtureGithubPatFallbackEnabled() || !fixturePath) {
+    return baseUnconfigured
+  }
   try {
-    return readStatusFromPath(DEFAULT_GITHUB_PAT_PATH, 'fixture')
+    return readStatusFromPath(fixturePath, 'fixture')
   } catch {
     return baseUnconfigured
   }
@@ -584,6 +630,29 @@ function prunePendingDeviceFlows(nowMs = Date.now()): void {
   }
 }
 
+function raceWithAbortSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise
+  if (signal.aborted) {
+    return Promise.reject(signal.reason ?? new DOMException('The operation was aborted.', 'AbortError'))
+  }
+  return new Promise<T>((resolvePromise, rejectPromise) => {
+    const onAbort = () => {
+      rejectPromise(signal.reason ?? new DOMException('The operation was aborted.', 'AbortError'))
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+    promise.then(
+      value => {
+        signal.removeEventListener('abort', onAbort)
+        resolvePromise(value)
+      },
+      err => {
+        signal.removeEventListener('abort', onAbort)
+        rejectPromise(err)
+      },
+    )
+  })
+}
+
 export async function resolveFreshGithubCredential(options: {
   dataDir?: string
   patPath?: string
@@ -591,119 +660,141 @@ export async function resolveFreshGithubCredential(options: {
   fetchImpl?: typeof fetch
   signal?: AbortSignal
 } = {}): Promise<StoredGithubVaultCredential> {
-  const effectivePath = options.patPath ?? resolveGithubPatPath(options.dataDir)
+  options.signal?.throwIfAborted()
+  const effectivePath = resolveActiveGithubCredentialPath(options)
   const cred = readGithubVaultCredential(effectivePath)
-  if (!cred.expiresAt || !cred.refreshToken) {
+  if (!cred.expiresAt) {
     return cred
   }
   const expiresAtMs = Date.parse(cred.expiresAt)
-  if (!Number.isFinite(expiresAtMs) || expiresAtMs - Date.now() > GITHUB_REFRESH_LEEWAY_MS) {
+  if (!Number.isFinite(expiresAtMs)) {
+    return cred
+  }
+  const remainingMs = expiresAtMs - Date.now()
+  if (remainingMs > GITHUB_REFRESH_LEEWAY_MS) {
+    return cred
+  }
+  if (!cred.refreshToken) {
+    if (remainingMs <= 0) {
+      throw new Error('GitHub access token has expired and cannot be refreshed automatically. Please sign in with GitHub again.')
+    }
     return cred
   }
 
   const clientId = cred.clientId ?? resolveGithubClientId(options.dataDir).clientId
   if (!clientId) {
+    if (remainingMs <= 0) {
+      throw new Error('GitHub access token has expired and no GitHub App Client ID is available to refresh it. Please sign in with GitHub again.')
+    }
     return cred
   }
 
-  const existing = inFlightTokenRefreshes.get(effectivePath)
-  if (existing) return existing
-
-  const refreshPromise = (async (): Promise<StoredGithubVaultCredential> => {
-    const nowMs = Date.now()
-    if (cred.refreshTokenExpiresAt) {
-      const refreshExpMs = Date.parse(cred.refreshTokenExpiresAt)
-      if (Number.isFinite(refreshExpMs) && refreshExpMs <= nowMs) {
-        throw new Error('GitHub session refresh token expired. Please sign in with GitHub again.')
+  const refreshKey = resolve(effectivePath)
+  let sharedRefresh = inFlightTokenRefreshes.get(refreshKey)
+  if (!sharedRefresh) {
+    const createdRefresh = (async (): Promise<StoredGithubVaultCredential> => {
+      const nowMs = Date.now()
+      if (cred.refreshTokenExpiresAt) {
+        const refreshExpMs = Date.parse(cred.refreshTokenExpiresAt)
+        if (Number.isFinite(refreshExpMs) && refreshExpMs <= nowMs) {
+          throw new Error('GitHub session refresh token expired. Please sign in with GitHub again.')
+        }
       }
-    }
 
-    const secrets: NamedSecret[] = [
-      { value: cred.accessToken, placeholder: '[redacted]' },
-      { value: cred.refreshToken!, placeholder: '[redacted]' },
-    ]
-    const githubBase = (options.githubBaseUrl ?? DEFAULT_GITHUB_BASE_URL).replace(/\/+$/, '')
-    const fetchFn = options.fetchImpl ?? fetch
-    const reqSignal = options.signal
-      ? AbortSignal.any([options.signal, AbortSignal.timeout(20_000)])
-      : AbortSignal.timeout(20_000)
+      const secrets: NamedSecret[] = [
+        { value: cred.accessToken, placeholder: '[redacted]' },
+        { value: cred.refreshToken!, placeholder: '[redacted]' },
+      ]
+      const githubBase = (options.githubBaseUrl ?? DEFAULT_GITHUB_BASE_URL).replace(/\/+$/, '')
+      const fetchFn = options.fetchImpl ?? fetch
 
-    const res = await fetchFn(`${githubBase}/login/oauth/access_token`, {
-      method: 'POST',
-      headers: {
-        Accept: 'application/json',
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'User-Agent': 'KovoHunter/2 read-only repo connector',
-      },
-      body: new URLSearchParams({
-        client_id: clientId,
-        grant_type: 'refresh_token',
-        refresh_token: cred.refreshToken!,
-      }).toString(),
-      signal: reqSignal,
-    })
+      // Isolate the shared single-flight refresh fetch from any individual caller's AbortSignal
+      // so one cancelled request cannot abort-poison an in-flight refresh for concurrent callers.
+      const res = await fetchFn(`${githubBase}/login/oauth/access_token`, {
+        method: 'POST',
+        headers: {
+          Accept: 'application/json',
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'User-Agent': 'KovoHunter/2 read-only repo connector',
+        },
+        body: new URLSearchParams({
+          client_id: clientId,
+          grant_type: 'refresh_token',
+          refresh_token: cred.refreshToken!,
+        }).toString(),
+        signal: AbortSignal.timeout(20_000),
+      })
 
-    const rawText = await res.text().catch(() => '')
-    let parsed: Record<string, unknown> = {}
-    try {
-      parsed = rawText ? JSON.parse(rawText) as Record<string, unknown> : {}
-    } catch {
-      parsed = {}
-    }
+      const rawText = await res.text().catch(() => '')
+      let parsed: Record<string, unknown> = {}
+      try {
+        parsed = rawText ? JSON.parse(rawText) as Record<string, unknown> : {}
+      } catch {
+        parsed = {}
+      }
 
-    if (typeof parsed.access_token === 'string') {
-      secrets.push({ value: parsed.access_token, placeholder: '[redacted]' })
-    }
-    if (typeof parsed.refresh_token === 'string') {
-      secrets.push({ value: parsed.refresh_token, placeholder: '[redacted]' })
-    }
+      if (typeof parsed.access_token === 'string') {
+        secrets.push({ value: parsed.access_token, placeholder: '[redacted]' })
+      }
+      if (typeof parsed.refresh_token === 'string') {
+        secrets.push({ value: parsed.refresh_token, placeholder: '[redacted]' })
+      }
 
-    if (!res.ok || typeof parsed.error === 'string') {
-      const detail = redact(
-        String(parsed.error_description || parsed.error || rawText || `HTTP ${res.status}`),
-        secrets,
-      ).slice(0, 240)
-      throw new Error(`GitHub token refresh failed (${res.status}): ${detail}. Please sign in with GitHub again.`)
-    }
+      if (!res.ok || typeof parsed.error === 'string') {
+        const detail = redact(
+          String(parsed.error_description || parsed.error || rawText || `HTTP ${res.status}`),
+          secrets,
+        ).slice(0, 240)
+        throw new Error(`GitHub token refresh failed (${res.status}): ${detail}. Please sign in with GitHub again.`)
+      }
 
-    if (typeof parsed.access_token !== 'string' || parsed.access_token.trim().length < 10) {
-      throw new Error('GitHub token refresh response did not include a valid access token.')
-    }
+      if (typeof parsed.access_token !== 'string' || parsed.access_token.trim().length < 10) {
+        throw new Error('GitHub token refresh response did not include a valid access token.')
+      }
 
-    const refreshedNowMs = Date.now()
-    const newAccessToken = validateTokenString(parsed.access_token, 'GitHub access token')
-    const newRefreshToken = typeof parsed.refresh_token === 'string' && parsed.refresh_token.trim()
-      ? validateTokenString(parsed.refresh_token, 'GitHub refresh token')
-      : cred.refreshToken
-    const newExpiresAt = typeof parsed.expires_in === 'number' && Number.isFinite(parsed.expires_in) && parsed.expires_in > 0
-      ? new Date(refreshedNowMs + parsed.expires_in * 1000).toISOString()
-      : cred.expiresAt
-    const newRefreshExpiresAt = typeof parsed.refresh_token_expires_in === 'number'
-      && Number.isFinite(parsed.refresh_token_expires_in)
-      && parsed.refresh_token_expires_in > 0
-      ? new Date(refreshedNowMs + parsed.refresh_token_expires_in * 1000).toISOString()
-      : cred.refreshTokenExpiresAt
+      const refreshedNowMs = Date.now()
+      const newAccessToken = validateTokenString(parsed.access_token, 'GitHub access token')
+      const newRefreshToken = typeof parsed.refresh_token === 'string' && parsed.refresh_token.trim()
+        ? validateTokenString(parsed.refresh_token, 'GitHub refresh token')
+        : cred.refreshToken
+      const newExpiresAt = typeof parsed.expires_in === 'number' && Number.isFinite(parsed.expires_in) && parsed.expires_in > 0
+        ? new Date(refreshedNowMs + parsed.expires_in * 1000).toISOString()
+        : cred.expiresAt
+      const newRefreshExpiresAt = typeof parsed.refresh_token_expires_in === 'number'
+        && Number.isFinite(parsed.refresh_token_expires_in)
+        && parsed.refresh_token_expires_in > 0
+        ? new Date(refreshedNowMs + parsed.refresh_token_expires_in * 1000).toISOString()
+        : cred.refreshTokenExpiresAt
 
-    const updated: StoredGithubVaultCredential = {
-      accessToken: newAccessToken,
-      ...(newRefreshToken ? { refreshToken: newRefreshToken } : {}),
-      ...(newExpiresAt ? { expiresAt: newExpiresAt } : {}),
-      ...(newRefreshExpiresAt ? { refreshTokenExpiresAt: newRefreshExpiresAt } : {}),
-      clientId,
-      ...(cred.login ? { login: cred.login } : {}),
-      authKind: cred.authKind,
-    }
+      const updated: StoredGithubVaultCredential = {
+        accessToken: newAccessToken,
+        ...(newRefreshToken ? { refreshToken: newRefreshToken } : {}),
+        ...(newExpiresAt ? { expiresAt: newExpiresAt } : {}),
+        ...(newRefreshExpiresAt ? { refreshTokenExpiresAt: newRefreshExpiresAt } : {}),
+        clientId,
+        ...(cred.login ? { login: cred.login } : {}),
+        authKind: cred.authKind,
+      }
 
-    writeAtomic0600(effectivePath, `${JSON.stringify(updated, null, 2)}\n`)
-    return updated
-  })()
+      clearObservedGithubInstallations(effectivePath)
+      writeAtomic0600(effectivePath, `${JSON.stringify(updated, null, 2)}\n`)
+      return updated
+    })()
 
-  inFlightTokenRefreshes.set(effectivePath, refreshPromise)
-  try {
-    return await refreshPromise
-  } finally {
-    inFlightTokenRefreshes.delete(effectivePath)
+    inFlightTokenRefreshes.set(refreshKey, createdRefresh)
+    // Detach cleanup and guard against unhandled rejections if all callers abort before settlement.
+    createdRefresh
+      .finally(() => {
+        if (inFlightTokenRefreshes.get(refreshKey) === createdRefresh) {
+          inFlightTokenRefreshes.delete(refreshKey)
+        }
+      })
+      .catch(() => undefined)
+
+    sharedRefresh = createdRefresh
   }
+
+  return await raceWithAbortSignal(sharedRefresh, options.signal)
 }
 
 export async function startGithubDeviceFlow(
@@ -1021,7 +1112,7 @@ export async function listAccessibleGithubRepos(
   options: ListAccessibleGithubReposOptions = {},
 ): Promise<ListAccessibleGithubReposResult> {
   options.signal?.throwIfAborted()
-  const effectivePath = options.patPath ?? resolveGithubPatPath(options.dataDir)
+  const effectivePath = resolveActiveGithubCredentialPath(options)
   const cred = await resolveFreshGithubCredential({
     dataDir: options.dataDir,
     patPath: options.patPath,
