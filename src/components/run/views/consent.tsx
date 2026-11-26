@@ -29,9 +29,9 @@ const LARGE_HOST_FILTER_THRESHOLD = 8
 type ScanModeKey = 'passive' | 'supervised' | 'autonomous'
 
 const SCAN_MODE_OPTIONS: readonly { key: ScanModeKey; label: string; summary: string }[] = [
-  { key: 'passive', label: 'Passive', summary: 'Read-only checks (plus bound test accounts); never mutates state.' },
-  { key: 'supervised', label: 'Supervised', summary: 'Safe active checks automatically; pauses for approval before risky writes.' },
-  { key: 'autonomous', label: 'Autonomous', summary: 'All in-scope active probes automatically with hard safety guardrails enforced.' },
+  { key: 'passive', label: 'Passive Scan', summary: 'Read-only checks (plus bound test accounts); never mutates state.' },
+  { key: 'supervised', label: 'Supervised Scan', summary: 'Safe active checks automatically; pauses for approval before risky writes.' },
+  { key: 'autonomous', label: 'Autonomous Scan', summary: 'All in-scope active probes automatically with hard safety guardrails enforced.' },
 ]
 
 function draftScanMode(d: { capabilityTier: CapabilityTier; approvalPolicy: ApprovalPolicy }): ScanModeKey {
@@ -388,13 +388,6 @@ function ScopeCard({
       ? approvalPolicyMeta[draft.approvalPolicy === 'strict' ? 'strict' : 'auto_review'].summary
       : approvalPolicyMeta.yolo.summary
 
-  const compactPillClass = (active: boolean) => cn(
-    'cursor-pointer rounded-[5px] border-0 px-2 py-[2px] font-sans text-[12px] font-medium transition-colors duration-[var(--d1)]',
-    active
-      ? 'bg-panel text-fg shadow-hairline'
-      : 'bg-transparent text-fg-subtle hover:text-fg',
-  )
-
   return <div className={inDialog ? 'overflow-hidden bg-panel' : RW.sheet}>
     {/* Sheet header */}
     <div className={RW.sheetH}>
@@ -421,20 +414,19 @@ function ScopeCard({
       <div className="border-r border-line px-4 py-2.5">
         <div className="mb-1 text-[11.5px] text-fg-subtle">Scan mode</div>
         {canEditConfig
-          ? <div className="inline-flex items-center gap-0.5 rounded-[7px] bg-sunk p-0.5" role="group" aria-label="Scan mode">
+          ? <select
+              className="h-[22px] max-w-full cursor-pointer rounded-[5px] border-0 bg-sunk px-1.5 font-sans text-[12px] font-medium text-fg shadow-hairline outline-none"
+              value={scanMode}
+              onChange={e => setScanMode(e.target.value as ScanModeKey)}
+              aria-label="Scan mode"
+              title={modeSummary}
+            >
               {SCAN_MODE_OPTIONS.map(opt => (
-                <button
-                  key={opt.key}
-                  type="button"
-                  title={opt.summary}
-                  aria-pressed={scanMode === opt.key}
-                  className={compactPillClass(scanMode === opt.key)}
-                  onClick={() => setScanMode(opt.key)}
-                >
+                <option key={opt.key} value={opt.key} title={opt.summary}>
                   {opt.label}
-                </button>
+                </option>
               ))}
-            </div>
+            </select>
           : <div className="font-medium text-fg" title={modeSummary}>
               {SCAN_MODE_OPTIONS.find(o => o.key === scanMode)?.label ?? capabilityTierMeta[draft.capabilityTier].name}
             </div>}
@@ -666,13 +658,15 @@ const STEPS: [string, string][] = [
 
 /** Overview for a waiting run: "Nothing has been sent yet." */
 export function ConsentView() {
-  const { detail } = useRun()
+  const { detail, send } = useRun()
   const q = useDecisions()
+  const toast = useToast()
   const r = detail.run
   const rpsMax = detail.project.environment === 'local-lab' ? maxRpsPerOriginCeiling : PUBLIC_MAX_RPS_CAP
   const { discovery, hosts, defaults } = useScopeModel()
   // Default directly into editable scope review on `phase === 'review'` (no extra click required).
   const [editing, setEditing] = useState(!discovery)
+  const [approving, setApproving] = useState(false)
   const [userTouchedHosts, setUserTouchedHosts] = useState(false)
   const runSyncKey = `${r.id}:${r.phase}:${r.scopeRevision}`
   const [syncedRunKey, setSyncedRunKey] = useState(runSyncKey)
@@ -701,28 +695,30 @@ export function ConsentView() {
   const nw = (r.goal || '').split(/\s+/).filter(Boolean).length
   const count = discovery ? hosts.length : draft.assetIds.length
   const overLimit = draft.assetIds.length > maxScopeHosts
-  const canApprove = q.canAct(ck, 'scope') && (discovery || (count > 0 && !overLimit))
+  const canApprove = !approving && q.canAct(ck, 'scope') && (discovery || (count > 0 && !overLimit))
   const footerNote = overLimit
     ? `Choose up to ${maxScopeHosts} hosts.`
     : !discovery && count === 0
       ? 'Select at least one host to start the assessment.'
-      : draft.capabilityTier === 3
-        ? draft.approvalPolicy === 'yolo'
-          ? 'Active checks run autonomously in scope; hard safety guardrails stay enforced.'
-          : draft.approvalPolicy === 'strict'
-            ? 'Every state-changing request will pause for your explicit approval.'
-            : 'Safe checks auto-approve; deletes, uploads, and execution proofs ask first.'
-        : `Approving authorizes a scoped defensive assessment (${capabilityTierMeta[draft.capabilityTier].short}).`
+      : null
 
-  const approve = () => {
+  const approve = async () => {
     if (!canApprove) return
     const command: Command = discovery ? { action: 'discover', consent: true } : scopeCommand(r, draft)
-    q.decide(ck, 'scope', {
-      command,
-      message: discovery ? `Discovery approved for ${plural(hosts.length, 'host')}` : `Scope approved for ${plural(count, 'host')} (${capabilityTierMeta[draft.capabilityTier].short})`,
-    })
+    const message = discovery
+      ? `Discovery approved for ${plural(hosts.length, 'host')}`
+      : `Scope approved for ${plural(count, 'host')} (${capabilityTierMeta[draft.capabilityTier].short})`
+    setApproving(true)
+    try {
+      await send(command)
+      toast.show(message, { icon: 'check' })
+    } catch (failure) {
+      toast.show(failure instanceof Error ? failure.message : 'Could not approve scope.', { icon: 'alert', tone: 'error' })
+    } finally {
+      setApproving(false)
+    }
   }
-  useShortcuts([{ key: 'a', run: () => { if (!canApprove) return false; approve() } }])
+  useShortcuts([{ key: 'a', run: () => { if (!canApprove) return false; void approve() } }])
 
   const eyebrow = scoped
     ? decision!.state === 'sent' ? 'Approved · the coordinator is starting' : 'Approved · sends when the undo window closes'
@@ -758,8 +754,8 @@ export function ConsentView() {
               ? decision!.state !== 'sent' && <button type="button" className={runBtn()} onClick={() => q.reopen(ck)}><Icon name="undo" />Undo</button>
               : <>
                 {!discovery && <button type="button" className={runBtn({ variant: 'ghost' })} onClick={() => { if (editing) { setUserTouchedHosts(false); setDraftState(initialDraft(r, defaults, rpsMax)) } else { setEditing(true) } }}>{editing ? 'Reset' : 'Edit scope'}</button>}
-                <button type="button" className={runBtn({ variant: 'primary' })} disabled={!canApprove} onClick={approve}>
-                  Approve &amp; start<Kbd inverted className="ml-0.5">A</Kbd>
+                <button type="button" className={runBtn({ variant: 'primary' })} disabled={!canApprove} onClick={() => void approve()}>
+                  {approving ? 'Starting…' : <>Approve &amp; start<Kbd inverted className="ml-0.5">A</Kbd></>}
                 </button>
               </>}
           </div>
