@@ -9,7 +9,7 @@ import { readFileSync, writeFileSync } from 'node:fs'
 import { request as httpRequest } from 'node:http'
 import { dirname, join } from 'node:path'
 
-export type ClaimKind = 'status' | 'header' | 'body_contains' | 'jsonpath' | 'css' | 'dom_sentinel' | 'oob' | 'timing' | 'composite_receipt'
+export type ClaimKind = 'status' | 'header' | 'body_contains' | 'jsonpath' | 'css' | 'dom_sentinel' | 'oob' | 'timing' | 'composite_receipt' | 'host_evaluated_expression'
 export interface StatusClaim { kind: 'status'; exchangeId: string; expected: number | number[]; message?: string }
 export interface HeaderClaim { kind: 'header'; exchangeId: string; name: string; equals?: string; matches?: string; absent?: boolean; message?: string }
 export interface BodyClaim { kind: 'body_contains'; exchangeId: string; text: string; absent?: boolean; vulnClass?: string; controlRequestBody?: unknown; probeRequestBody?: unknown; message?: string }
@@ -42,9 +42,10 @@ export interface CompositeReceiptClaim {
   exchangeIds: string[]; terminalExchangeId?: string; replayMode?: 'fresh_clean_replay' | 'one_shot_transcript'; hopCount?: number
   compositeReceipt?: Record<string, unknown>; rejectedBy?: string | null; missingEvidence?: string[]; reason?: string; message?: string
 }
+export interface HostEvaluatedExpressionClaim { kind: 'host_evaluated_expression'; vulnClass?: string; controlIds: string[]; probeIds: string[]; hostMintedChallengeIds: string[]; message?: string }
 export type VerifyClaim =
   | StatusClaim | HeaderClaim | BodyClaim | JsonPathClaim | CssClaim | SentinelsClaim
-  | OobClaim | TimingClaim | StructuralDiffClaim | RaceClaim | ImpactClaim | BoundaryClaim | CompositeReceiptClaim
+  | OobClaim | TimingClaim | StructuralDiffClaim | RaceClaim | ImpactClaim | BoundaryClaim | CompositeReceiptClaim | HostEvaluatedExpressionClaim
 export type ProofRole =
   | 'setup' | 'control' | 'probe' | 'cleanup' | 'control_denied' | 'variant_crossed'
   | 'before_get' | 'mutation' | 'after_get' | 'oob_mint' | 'oob_injection' | 'oob_wait' | 'pending_oob' | 'race'
@@ -479,7 +480,7 @@ export class VerifyContext {
   readonly nonce: string; readonly runId: string; readonly targetOrigins: string[]; readonly targetOrigin: string; readonly sdkVersion: string
   readonly claims: VerifyClaim[] = []; readonly expect: Expectations; readonly assert: Expectations
   private readonly defaultOrigin: string | undefined; private readonly transport: RpcTransport
-  private _lastRpcOp: string | null = null; private _lastFailedCompositeClaim: CompositeReceiptClaim | null = null
+  private _lastRpcOp: string | null = null; private _lastFailedClaims: VerifyClaim[] = []
   private readonly _hopStack: HopRecorder[] = []; private readonly _capOrigins = new Map<string, string>()
 
   constructor() {
@@ -637,15 +638,18 @@ export class VerifyContext {
   }
   awaitAsync(input: AsyncAwaitInput | Record<string, unknown>): Promise<AsyncAwaitResult> { return this.await_async(input) }
 
+  private recordProofClaims(ok: boolean, claims: readonly VerifyClaim[]): void {
+    if (claims.length) { if (ok) { this._lastFailedClaims = []; this.claims.push(...claims) } else { this._lastFailedClaims = [...claims] } }
+  }
   async prove_composite(receipt: CompositeProofReceiptInput): Promise<CompositeVerificationResult> {
     const res = await this.callRpc('composite.verify', normalizeCompositeReceipt(receipt, this.defaultOrigin), 30_000) as CompositeVerificationResult
     const confirmed = res.confirmed === true || res.ok === true || res.verified === true
-    if (res.claim) { if (confirmed) { this._lastFailedCompositeClaim = null; this.claims.push(res.claim) } else { this._lastFailedCompositeClaim = res.claim } }
+    if (res.claim) this.recordProofClaims(confirmed, [res.claim])
     return { ...res, confirmed, ok: confirmed, verified: confirmed }
   }
   proveComposite(receipt: CompositeProofReceiptInput): Promise<CompositeVerificationResult> { return this.prove_composite(receipt) }
 
-  effectiveClaims(): VerifyClaim[] { return this.claims.length > 0 ? [...this.claims] : this._lastFailedCompositeClaim ? [this._lastFailedCompositeClaim] : [] }
+  effectiveClaims(): VerifyClaim[] { return this.claims.length > 0 ? [...this.claims] : [...this._lastFailedClaims] }
 
   async browser(input: HttpTarget, options: { as?: string; waitForSelector?: string; timeoutMs?: number } = {}): Promise<BrowserExchange> {
     const target = splitTarget(input, this.defaultOrigin)
@@ -662,12 +666,11 @@ export class VerifyContext {
 
   // -- authoritative host-backed proof helpers (`prove.*`) ----------------
 
-  private async callProof<T extends { claim?: VerifyClaim; claims?: VerifyClaim[] }>(op: string, input: unknown, errMsg: string, timeoutMs: number, hydrateKeys?: readonly string[]): Promise<T> {
+  private async callProof<T extends { ok?: boolean; confirmed?: boolean; claim?: VerifyClaim; claims?: VerifyClaim[] }>(op: string, input: unknown, errMsg: string, timeoutMs: number, hydrateKeys?: readonly string[]): Promise<T> {
     if (!input || typeof input !== 'object') throw new Error(errMsg)
     const raw = await this.callRpc(op, input as Record<string, unknown>, timeoutMs) as Record<string, unknown>
     const res = (hydrateKeys ? hydrateFields(raw, hydrateKeys) : raw) as unknown as T
-    if (Array.isArray(res.claims)) this.claims.push(...res.claims)
-    else if (res.claim) this.claims.push(res.claim)
+    this.recordProofClaims(res.ok !== false && res.confirmed !== false, Array.isArray(res.claims) ? res.claims : res.claim ? [res.claim] : [])
     return res
   }
 
@@ -677,16 +680,16 @@ export class VerifyContext {
 
   async prove_persisted_mutation(input: PersistedMutationInput | Record<string, unknown>): Promise<PersistedMutationProof> {
     if (!input || typeof input !== 'object') throw new Error('prove_persisted_mutation requires { readRoute, mutation, fieldPath, expectDelta }.')
-    const raw = input as Record<string, unknown>, expectFn = typeof raw.expectDelta === 'function' ? raw.expectDelta : null
-    const payload: Record<string, unknown> = { ...raw }
+    const raw = input as Record<string, unknown>, expectFn = typeof raw.expectDelta === 'function' ? raw.expectDelta : null, payload: Record<string, unknown> = { ...raw }
     if (payload.mutation === undefined && payload.write === undefined) { const m = raw.mutate ?? raw.mutationRoute ?? raw.writeRoute ?? raw.mutationTarget; if (m !== undefined) payload.mutation = m }
     if (payload.readRoute === undefined && payload.read_route === undefined) { const rr = raw.read ?? raw.beforeRoute ?? raw.readTarget ?? (payload.mutation !== undefined || payload.write !== undefined ? raw.route : undefined); if (rr !== undefined) payload.readRoute = rr }
     if (expectFn) { delete payload.expectDelta; payload.hasCustomExpectFn = true }
     const res = hydrateFields(await this.callRpc('prove.persistedMutation', payload, 70_000) as Record<string, unknown>, ['before', 'mutation', 'after']) as unknown as PersistedMutationProof
     if (expectFn && !Boolean(expectFn(res.delta.before, res.delta.after, res.delta))) {
+      if (res.claim) this.recordProofClaims(false, [res.claim])
       return { ...res, ok: false, confirmed: false, expectationMatched: false, rejectedBy: res.rejectedBy ?? 'impact', missingEvidence: [...new Set([...res.missingEvidence, 'expected_delta'])] }
     }
-    if (res.claim) this.claims.push(res.claim)
+    if (res.claim) this.recordProofClaims(res.ok !== false && res.confirmed !== false, [res.claim])
     return res
   }
 
@@ -705,18 +708,15 @@ export class VerifyContext {
       let injection: HttpExchange | null = null, injectionError: string | null = null
       try { injection = (await injectFn(started.handle)) ?? null } catch (err) { injectionError = err instanceof Error ? err.message : 'OOB injection failed.' }
       res = await this.callRpc('prove.oob', { phase: 'finish', handle: started.handle, subscription: started.subscription, ...(injection ? { injection } : {}), ...(injectionError ? { injectionError } : {}), ...(raw.immediateMs !== undefined ? { immediateMs: Number(raw.immediateMs) } : {}), timeoutMs, ...(raw.message ? { message: raw.message } : {}) }, timeoutMs + 15_000) as OobCallbackProof
-    } else {
-      res = await this.callRpc('prove.oob', raw, timeoutMs + 20_000) as OobCallbackProof
-    }
-    if (res.claim) this.claims.push(res.claim)
+    } else { res = await this.callRpc('prove.oob', raw, timeoutMs + 20_000) as OobCallbackProof }
+    if (res.claim) this.recordProofClaims(res.ok !== false && res.confirmed !== false, [res.claim])
     return res
   }
 
   async prove_race_burst(input: RaceBurstInput | Record<string, unknown>): Promise<RaceBurstProof> {
-    const raw = (input && typeof input === 'object' ? input : {}) as Record<string, unknown>
-    const reqCount = Array.isArray(raw.requests) ? raw.requests.length : 0
+    const raw = (input && typeof input === 'object' ? input : {}) as Record<string, unknown>, reqCount = Array.isArray(raw.requests) ? raw.requests.length : 0
     const res = hydrateFields(await this.callRpc('prove.race', raw, Math.max(40_000, Math.min(80_000, 25_000 + reqCount * 2_000))) as Record<string, unknown>, ['baseline', 'post', 'serial', 'serialPost']) as unknown as RaceBurstProof
-    if (res.claim && Array.isArray(res.claim.exchangeIds) && res.claim.exchangeIds.length >= 2) this.claims.push(res.claim)
+    if (res.claim && Array.isArray(res.claim.exchangeIds) && res.claim.exchangeIds.length >= 2) this.recordProofClaims(res.ok !== false && res.confirmed !== false, [res.claim])
     const hop = this.activeHop()
     if (hop) {
       for (const id of res.claim?.exchangeIds ?? res.exchanges?.map(e => e.exchangeId) ?? []) hop.onExchange(id)

@@ -23,7 +23,8 @@ import {
 } from './oracle-invariants.ts'
 import type { AmbientAuth, BoundaryClass, ImpactClass, ImpactStep, ActorIdentity } from './oracle-invariants.ts'
 import { isJobOrHandleStub } from './v8-oracle-families.ts'
-import { deriveAmbientAuthFromHeaders, type HostFactLog } from './host-fact-log.ts'
+import { deriveAmbientAuthFromHeaders, resolveCanonicalArm, type HostFactLog } from './host-fact-log.ts'
+import { defaultHostMintedOracle } from './proof-receipt.ts'
 import { compileSafeClaimRegex, MAX_CLAIM_REGEX_HAYSTACK } from './safe-regex.ts'
 export { compileSafeClaimRegex } from './safe-regex.ts'
 
@@ -462,6 +463,7 @@ export type VerifyClaim =
       reason?: string
       message?: string
     }
+  | { kind: 'host_evaluated_expression'; vulnClass?: string; controlIds: string[]; probeIds: string[]; hostMintedChallengeIds: string[]; message?: string }
 
 export interface VerifyScriptResult {
   sdk?: string
@@ -682,10 +684,11 @@ function isClaim(value: unknown): value is VerifyClaim {
         typeof rec.preChallengeExchangeId === 'string' &&
         typeof rec.postChallengeExchangeId === 'string'
     case 'composite_receipt':
-      return typeof rec.chainId === 'string' &&
-        typeof rec.terminalVulnClass === 'string' &&
-        Array.isArray(rec.exchangeIds) &&
-        rec.exchangeIds.every(v => typeof v === 'string')
+      return typeof rec.chainId === 'string' && typeof rec.terminalVulnClass === 'string' && Array.isArray(rec.exchangeIds) && rec.exchangeIds.every(v => typeof v === 'string')
+    case 'host_evaluated_expression':
+      return Array.isArray(rec.controlIds) && rec.controlIds.length > 0 && rec.controlIds.every(v => typeof v === 'string') &&
+        Array.isArray(rec.probeIds) && rec.probeIds.length > 0 && rec.probeIds.every(v => typeof v === 'string') &&
+        Array.isArray(rec.hostMintedChallengeIds) && rec.hostMintedChallengeIds.length > 0 && rec.hostMintedChallengeIds.every(v => typeof v === 'string')
 
     default:
       return false
@@ -1181,8 +1184,7 @@ function claimedSteps(
   const steps: ImpactStep[] = []
   for (const id of claimedExchangeIds(claims)) {
     if (context.allowedExchangeIds && !context.allowedExchangeIds.has(id)) continue
-    const role = store.get(id)?.request?.sessionRole
-    const arm: ImpactStep['arm'] = role === 'probe' || role === 'control' || role === 'setup' || role === 'cleanup' ? role : 'setup'
+    const arm = resolveCanonicalArm(store.get(id)?.request?.sessionRole)
     const step = toTranscriptStep(store, id, arm, { factLog: context.factLog })
     if (step) steps.push(step)
   }
@@ -1205,6 +1207,7 @@ function claimedExchangeIds(claims: readonly VerifyClaim[]): string[] {
   for (const claim of claims) {
     if (claim.kind === 'timing' || claim.kind === 'impact') continue
     if (claim.kind === 'structural_diff') { for (const id of [...claim.controlIds, ...claim.variantIds]) ids.add(id); continue }
+    if (claim.kind === 'host_evaluated_expression') { for (const id of [...claim.controlIds, ...claim.probeIds]) ids.add(id); continue }
     if (claim.kind === 'race' || claim.kind === 'composite_receipt') { for (const id of claim.exchangeIds) ids.add(id); continue }
     if (claim.kind === 'boundary') { ids.add(claim.controlExchangeId); ids.add(claim.probeExchangeId); continue }
     if (claim.kind === 'mfa') {
@@ -1584,6 +1587,22 @@ export function evaluateClaim(
         },
       }
     }
+    case 'host_evaluated_expression': {
+      const verifiedChs = claim.hostMintedChallengeIds.map(id => defaultHostMintedOracle.verifyExpressionChallenge(defaultHostMintedOracle.getExpressionChallenge(id)))
+      if (verifiedChs.length === 0 || verifiedChs.some(c => !c)) return { claim, passed: false, detail: 'host_evaluated_expression references an unknown or unverified host-minted challenge.', observed: { rejectedBy: 'host_evaluated_expression' } }
+      const chs = verifiedChs as NonNullable<(typeof verifiedChs)[number]>[]
+      const ctlRecs = claim.controlIds.map(requireRecord), prbRecs = claim.probeIds.map(requireRecord)
+      if (ctlRecs.some(r => !r?.response) || prbRecs.some(r => !r?.response)) return { claim, passed: false, detail: 'host_evaluated_expression references an unknown or failed control/probe exchange.', observed: { rejectedBy: 'host_evaluated_expression' } }
+      const ok2xx = (r: VerifyTranscriptRecord | null) => { const s = recordStatus(r ?? undefined); return s !== null && s >= 200 && s < 300 }
+      const ctlBodies = claim.controlIds.map(id => store.body(id) ?? ''), prbBodies = claim.probeIds.map(id => store.body(id) ?? '')
+      const outputs = chs.map(c => c.expectedOutput), varying = outputs.length < 2 || new Set(outputs).size === outputs.length
+      const matched = chs.length === prbBodies.length && chs.every((ch, i) => {
+        const pb = prbBodies[i]!, reqText = `${prbRecs[i]?.request?.pathAndQuery ?? ''}\n${store.requestBody(claim.probeIds[i]!) ?? ''}`
+        return pb.includes(ch.expectedOutput) && outputs.every((o, j) => j === i || !pb.includes(o)) && !ctlBodies.some(cb => cb.includes(ch.expectedOutput)) && !reqText.includes(ch.expectedOutput)
+      })
+      const passed = ctlRecs.every(ok2xx) && prbRecs.every(ok2xx) && varying && matched
+      return { claim, passed, detail: passed ? `Host-minted ${chs[0]!.family} expression evaluation verified across ${chs.length} challenge(s).` : 'Host-minted evaluated-expression verification failed (missing 2xx, non-varying operands, control leakage, reflection, or absent computed output).', observed: { passed, family: chs[0]!.family, challengeCount: chs.length, vulnClass: claim.vulnClass ?? null } }
+    }
     default:
       return { claim, passed: false, detail: 'Unsupported claim.' }
   }
@@ -1692,6 +1711,7 @@ export function describeMissingEvidence(check: VerifyClaimCheck): string[] {
       }
       break
     }
+    case 'host_evaluated_expression': missing.add('host_minted_expression_oracle'); break
     case 'status':
     case 'header':
     case 'body_contains':
@@ -1712,8 +1732,7 @@ function transcriptStatusSteps(store: TranscriptStore, factLog?: HostFactLog): I
   const out: ImpactStep[] = []
   for (const record of store.list()) {
     if (!record.request || (record.op !== 'http' && record.op !== 'http2')) continue
-    const role = record.request.sessionRole
-    const arm: ImpactStep['arm'] = role === 'probe' || role === 'control' ? role : 'setup'
+    const arm = resolveCanonicalArm(record.request.sessionRole)
     const step = toTranscriptStep(store, record.exchangeId, arm, { factLog })
     if (step) out.push(step)
   }
@@ -1739,6 +1758,8 @@ function claimEvidenceText(store: TranscriptStore, check: VerifyClaimCheck): str
     ids.push(claim.enrolledExchangeId, claim.preChallengeExchangeId, claim.postChallengeExchangeId)
   } else if (claim.kind === 'composite_receipt') {
     ids.push(...claim.exchangeIds)
+  } else if (claim.kind === 'host_evaluated_expression') {
+    ids.push(...claim.controlIds, ...claim.probeIds)
   }
   return ids.map(id => store.body(id) ?? '').join('\n').slice(0, 64 * 1024)
 }
@@ -1760,6 +1781,7 @@ function hasStatusIndependentEvidence(check: VerifyClaimCheck): boolean {
     case 'mfa':
     case 'dom_sentinel':
     case 'composite_receipt':
+    case 'host_evaluated_expression':
       return true
     default:
       return false
@@ -1790,6 +1812,7 @@ export function evaluateClaims(
   const injectionEvidencePassed = checks.some(check =>
     check.passed && (
       check.claim.kind === 'impact' && check.claim.impactClass === 'injection' ||
+      check.claim.kind === 'host_evaluated_expression' ||
       check.claim.kind === 'structural_diff' ||
       check.claim.kind === 'timing' ||
       check.claim.kind === 'oob' ||
@@ -1842,7 +1865,7 @@ export function evaluateClaims(
   }
   // Standalone intermediate-stub gate: reject non-composite proofs whose succeeding probes only
   // create or poll a draft/queued/pending object or handle stub with no terminal security impact.
-  const hasTerminalOracle = checks.some(c => c.passed && ['composite_receipt', 'oob', 'dom_sentinel', 'timing', 'mfa', 'race', 'impact', 'boundary'].includes(c.claim.kind))
+  const hasTerminalOracle = checks.some(c => c.passed && ['composite_receipt', 'host_evaluated_expression', 'oob', 'dom_sentinel', 'timing', 'mfa', 'race', 'impact', 'boundary'].includes(c.claim.kind))
   const hasEvaluatedOrFp = checks.some(p => {
     if (!p.passed) return false
     if (matchInjectionFingerprint(claimEvidenceText(store, p)) !== null) return true
@@ -2225,6 +2248,10 @@ export function causalFingerprints(
           modeBVerified,
         },
       }
+    }
+    if (claim.kind === 'host_evaluated_expression') {
+      const probe = store.get(claim.probeIds[0]!), obs = asRecord(check.observed)
+      return { kind: claim.kind, method: probe?.request?.method ?? '', path: pathFingerprint(probe?.request?.pathAndQuery), status: probe?.response?.status != null ? Number(probe.response.status) : null, expectation: { vulnClass: claim.vulnClass ?? null, challenges: claim.hostMintedChallengeIds.length }, observed: { passed: Boolean(check.passed), family: typeof obs?.family === 'string' ? obs.family : null } }
     }
     const record = store.get(claim.exchangeId)
     const expectation = (() => {

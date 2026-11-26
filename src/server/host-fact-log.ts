@@ -629,6 +629,32 @@ export function parseBodyFromCarrierText(
   return bodyFrom(carrierText)
 }
 
+/**
+ * Canonical `ImpactStep['arm']` derivation shared across `HostFactLog`, `verify-claims.ts`,
+ * and `verify-rpc.ts`: preserves explicit arms and recognized session roles, defaulting
+ * unlabeled HTTP exchanges (`sessionRole == null`) consistently to `'probe'`.
+ */
+export function resolveCanonicalArm(
+  sessionRole: string | null | undefined,
+  explicitArm?: ImpactStep['arm'],
+): ImpactStep['arm'] {
+  if (explicitArm) return explicitArm
+  if (sessionRole === 'control' || sessionRole === 'probe' || sessionRole === 'setup' || sessionRole === 'cleanup') {
+    return sessionRole
+  }
+  return 'probe'
+}
+
+export interface HostExchangeCapabilityFlow {
+  readonly exchangeId: string
+  readonly seq: number
+  readonly arm: ImpactStep['arm']
+  readonly timestampMs: number | undefined
+  readonly emitted: readonly string[]
+  readonly consumed: readonly string[]
+  readonly cryptoAttestations: readonly HostCryptoAttestation[]
+}
+
 export class HostFactLog {
   private readonly exchanges = new Map<string, HostExchangeFact>()
   private readonly signedEntries = new Map<string, HostTranscriptEntry>()
@@ -820,6 +846,41 @@ export class HostFactLog {
     return this.exchanges.get(id)
   }
 
+  /** Host-authoritative capability emission/consumption summary for Auto-DAG causal inference. */
+  getExchangeCapabilityFlow(id: string): HostExchangeCapabilityFlow | undefined {
+    const fact = this.exchanges.get(id)
+    if (!fact) return undefined
+    const emitted: string[] = []
+    const emittedSeen = new Set<string>()
+    for (const c of fact.emittedCapabilities ?? []) {
+      if (c && !emittedSeen.has(c)) { emittedSeen.add(c); emitted.push(c) }
+    }
+    for (const att of fact.cryptoAttestations ?? []) {
+      if (att.derivedCapabilityId && !emittedSeen.has(att.derivedCapabilityId)) {
+        emittedSeen.add(att.derivedCapabilityId)
+        emitted.push(att.derivedCapabilityId)
+      }
+    }
+    const consumed: string[] = []
+    const consumedSeen = new Set<string>()
+    for (const c of [
+      ...(fact.consumedCapabilities ?? []),
+      ...(fact.consumedCapabilityId ? [fact.consumedCapabilityId] : []),
+      ...(fact.actor?.startsWith('cap:') ? [fact.actor] : []),
+    ]) {
+      if (c && !consumedSeen.has(c)) { consumedSeen.add(c); consumed.push(c) }
+    }
+    return Object.freeze({
+      exchangeId: fact.exchangeId,
+      seq: fact.seq,
+      arm: resolveCanonicalArm(fact.sessionRole, fact.arm),
+      timestampMs: fact.timestampMs,
+      emitted: Object.freeze(emitted),
+      consumed: Object.freeze(consumed),
+      cryptoAttestations: fact.cryptoAttestations ?? Object.freeze([]),
+    })
+  }
+
   getOobEvent(id: string): Readonly<HostOobCallbackFact> | undefined {
     return this.oobEvents.get(id)
   }
@@ -949,11 +1010,7 @@ export class HostFactLog {
   ): ImpactStep | undefined {
     const fact = this.exchanges.get(exchangeId)
     if (!fact) return undefined
-    const arm: ImpactStep['arm'] = overrides?.arm
-      ?? fact.arm
-      ?? (fact.sessionRole === 'control' || fact.sessionRole === 'probe' || fact.sessionRole === 'setup' || fact.sessionRole === 'cleanup'
-        ? fact.sessionRole
-        : 'setup')
+    const arm: ImpactStep['arm'] = resolveCanonicalArm(fact.sessionRole, overrides?.arm ?? fact.arm)
     const json = safeJsonParse(fact.rawResponseBody)
     const requestJson = fact.rawRequestBody !== null
       ? (safeJsonParse(fact.rawRequestBody) ?? fact.rawRequestBody)

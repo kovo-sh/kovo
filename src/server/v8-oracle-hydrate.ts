@@ -89,7 +89,8 @@ const roleOfEntry = (e: HydratableEntry): string | null =>
 
 const PRIV_HANDLE_RE = /^(?:admin|owner|super_?admin|org_?admin|tenant_?admin|root|system|manager|operator|staff|superuser)(?:[_-]|$)|(?:^|[_-])(?:super_?admin|org_?admin|tenant_?admin|owner|root)$/i
 const PRIV_ROLE_WORD_RE = /(?:^|[^a-z])(owner|superadmin|super|admin|administrator|manager|staff|operator|root|superuser)(?:$|[^a-z])/i
-const LOW_PRIV_ROLE_SET = new Set(['viewer', 'member', 'guest', 'user', 'editor', 'customer', 'anon', 'anonymous', 'unauthenticated', 'revoked', 'demoted', 'readonly', 'basic', 'standard', 'contractor', 'external'])
+const GLOBAL_PRIV_LABEL_RE = /(?:^|[\s,:;_@(-])(?:super[\s_-]?admin|platform[\s_-]?admin|sys[\s_-]?admin|global[\s_-]?admin|root|superuser|owner)(?:$|[\s,:;_@)-])/i
+const LOW_PRIV_ROLE_SET = new Set(['viewer', 'member', 'guest', 'user', 'editor', 'customer', 'anon', 'anonymous', 'unauthenticated', 'revoked', 'demoted', 'readonly', 'basic', 'standard', 'contractor', 'external', 'analyst', 'billing', 'support', 'developer', 'contributor', 'requester', 'reporter', 'subscriber', 'client', 'partner', 'tenant'])
 const MIN_TOKEN_LEN = 3
 const SIG_HEADER_NAMES = new Set(['x-sig', 'x-signature', 'x-hmac-signature', 'x-hub-signature-256', 'x-webhook-signature', 'x-kovo-derivation'])
 const SURFACE_SET = new Set(['http', 'graphql', 'ws', 'sse', 'browser', 'webhook', 'async_job', 'idp', 'cdn', 'storage'])
@@ -141,8 +142,8 @@ export function isPrivilegedActorOrRole(
   if (rawRoleCls === 'owner' || rawRoleCls === 'unknown') return true
   const memberships = actorRoleLabel ? parseRoleMemberships(actorRoleLabel) : []
   if (memberships.some(m => m.role === 'owner')) return true
-  // Check raw actorRoleLabel segments for underscore-joined or unrecognized privileged role tokens.
   const labelHead = actorRoleLabel ? actorRoleLabel.replace(/\[[^\]]*\]/g, ' ').trim() : ''
+  if (labelHead && GLOBAL_PRIV_LABEL_RE.test(labelHead)) return true
   if (labelHead && memberships.length === 0) {
     const labelCls = parseExtendedRole(labelHead)
     if (labelCls === 'owner' || labelCls === 'admin' || labelCls === 'unknown') return true
