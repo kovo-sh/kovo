@@ -62,9 +62,11 @@ import {
   CHAIN_CONTINUATION_SKILL_PREFIX,
   DET_LEAD_STEP_PRIORITY,
   DRY_ROUND_LIMIT,
+  FrontierDispatcher,
   FrontierWaveController,
   MAX_CHAIN_CONTINUATIONS,
   MAX_GENERIC_WAVE1_CHAIN_CONTINUATIONS,
+  RunOrchestrationStateStore,
   TIER_A_MAX_SEEDED_STEPS,
   TIER_A_STEP_PRIORITY,
   WHITEBOX_BLACKBOX_CAP_PRIORITY,
@@ -106,6 +108,7 @@ import {
   readChainHopsFromFacts,
   reinvestigationKey,
   selectUncoveredHighRiskEndpoints,
+  shouldInvokeLlmPlanner,
   stripJsonFences,
   synthesizeRuntimeCompositeWave1Steps,
   templatesMentionedInText,
@@ -676,6 +679,8 @@ export function isRouteConfirmed(
 }
 
 export interface ExecReconPlannerHost extends ExecCoreServices {
+  /** Shared unified per-run orchestration state store (Move O5). */
+  runState?: RunOrchestrationStateStore
   labRunner: LabRunner
   maxDurationMs: number
   active: Map<string, Active>
@@ -1153,76 +1158,74 @@ function parseHopCheckpointJson(raw: unknown): HopCheckpointBrief | null {
 }
 
 export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
-  private readonly plannerEmptyRounds = new Map<string, number>()
-  private readonly plannerDryRounds = new Map<string, number>()
-  private readonly plannerCompletedAtLastRound = new Map<string, number>()
-  private readonly plannerEvidenceFrontier = new Map<string, { confirmed: number; primitives: number }>()
-  private readonly frontierControllers = new Map<string, FrontierWaveController>()
+  private readonly ownRunState?: RunOrchestrationStateStore
+  private get runState(): RunOrchestrationStateStore {
+    return this.host.runState ?? (this.ownRunState ?? new RunOrchestrationStateStore())
+  }
   private readonly persistedStepCheckpoints = new Map<string, { checkpointCapId?: string; checkpointJson?: string }>()
-  private readonly invariantsSeededRuns = new Set<string>()
-  private readonly wave1InvariantChainsPromoted = new Set<string>()
-  private readonly seededHypothesisIdsByRun = new Map<string, Set<string>>()
-  private readonly runtimeSynthesisWatermark = new Map<string, string>()
-  private readonly postFloorInvariantsSyncedRuns = new Set<string>()
-  private readonly runtimeCompositeSeededRuns = new Set<string>()
-  private readonly emittedSealedHandleSets = new Map<string, Set<string>>()
-  private readonly plannerSeenCausalEdges = new Map<string, Set<string>>()
-  private readonly detLeadStepKeys = new Set<string>()
-  private readonly detLeadGateRejected = new Set<string>()
-  private readonly cappedLeadReported = new Set<string>()
-  private readonly tierAStepKeys = new Set<string>()
-  private readonly stepIdsByRun = new Map<string, Set<string>>()
-  private readonly runLifecycleUnsubs = new Map<string, () => void>()
+  private get plannerEmptyRounds() { return this.runState.mapView('plannerEmptyRounds') }
+  private get plannerDryRounds() { return this.runState.mapView('plannerDryRounds') }
+  private get plannerCompletedAtLastRound() { return this.runState.mapView('plannerCompletedAtLastRound') }
+  private get plannerEvidenceFrontier() { return this.runState.mapView('plannerEvidenceFrontier') }
+  private get frontierControllers() { return this.runState.mapView('frontierController') }
+  private get invariantsSeededRuns() { return this.runState.setView('invariantsSeeded') }
+  private get wave1InvariantChainsPromoted() { return this.runState.setView('wave1InvariantChainsPromoted') }
+  private get seededHypothesisIdsByRun() { return this.runState.mapView('seededHypothesisIds') }
+  private get runtimeSynthesisWatermark() { return this.runState.mapView('runtimeSynthesisWatermark') }
+  private get postFloorInvariantsSyncedRuns() { return this.runState.setView('postFloorInvariantsSynced') }
+  private get runtimeCompositeSeededRuns() { return this.runState.setView('runtimeCompositeSeeded') }
+  private get emittedSealedHandleSets() { return this.runState.prefixedMapView<Set<string>, 'emittedSealedHandleSets'>('emittedSealedHandleSets', ':') }
+  private get plannerSeenCausalEdges() { return this.runState.mapView('plannerSeenCausalEdges') }
+  private get detLeadStepKeys() { return this.runState.prefixedSetView('detLeadStepKeys', '\0') }
+  private get detLeadGateRejected() { return this.runState.prefixedSetView('detLeadGateRejected', '\0') }
+  private get cappedLeadReported() { return this.runState.prefixedSetView('cappedLeadReported', '\0') }
+  private get tierAStepKeys() { return this.runState.prefixedSetView('tierAStepKeys', '\0') }
+  private get stepIdsByRun() { return this.runState.mapView('stepIds') }
+  private get runLifecycleUnsubs() { return this.runState.mapView('runLifecycleUnsub') }
   private get labRunner() { return this.host.labRunner }
 
+  constructor(host: ExecReconPlannerHost) {
+    super(host)
+    if (!host.runState) this.ownRunState = new RunOrchestrationStateStore()
+  }
+
   /**
-   * Evict all per-run in-memory Maps/Sets for `runId` when a run reaches a terminal state
-   * (completed/failed/canceled/stopped) so long-lived servers do not leak unbounded per-run state.
+   * Single-call eviction of all per-run planner state for `runId` (reclaims step checkpoints
+   * and unsubscribes lifecycle hooks atomically via `RunOrchestrationStateStore`).
    */
   clearRunState(runId: string): void {
-    this.plannerEmptyRounds.delete(runId)
-    this.plannerDryRounds.delete(runId)
-    this.plannerCompletedAtLastRound.delete(runId)
-    this.plannerEvidenceFrontier.delete(runId)
-    this.frontierControllers.delete(runId)
-    this.invariantsSeededRuns.delete(runId)
-    this.wave1InvariantChainsPromoted.delete(runId)
-    this.seededHypothesisIdsByRun.delete(runId)
-    this.runtimeSynthesisWatermark.delete(runId)
-    this.postFloorInvariantsSyncedRuns.delete(runId)
-    this.runtimeCompositeSeededRuns.delete(runId)
-    this.plannerSeenCausalEdges.delete(runId)
-
-    const stepIds = this.stepIdsByRun.get(runId)
-    if (stepIds) {
-      for (const stepId of stepIds) {
-        this.persistedStepCheckpoints.delete(stepId)
+    const state = this.runState.get(runId)
+    if (state?.stepIds) {
+      for (const stepId of state.stepIds) this.persistedStepCheckpoints.delete(stepId)
+    }
+    if (this.ownRunState) {
+      this.ownRunState.disposeRun(runId)
+    } else if (state) {
+      // Clear planner-owned fields while letting Execution's disposeRun own full record deletion.
+      if (state.runLifecycleUnsub) {
+        try { state.runLifecycleUnsub() } catch { /* ignore */ }
+        state.runLifecycleUnsub = undefined
       }
-      this.stepIdsByRun.delete(runId)
-    }
-
-    const colonPrefix = `${runId}:`
-    for (const key of this.emittedSealedHandleSets.keys()) {
-      if (key.startsWith(colonPrefix)) this.emittedSealedHandleSets.delete(key)
-    }
-    const nulPrefix = `${runId}\0`
-    for (const key of this.detLeadStepKeys) {
-      if (key.startsWith(nulPrefix)) this.detLeadStepKeys.delete(key)
-    }
-    for (const key of this.tierAStepKeys) {
-      if (key.startsWith(nulPrefix)) this.tierAStepKeys.delete(key)
-    }
-    for (const key of this.detLeadGateRejected) {
-      if (key.startsWith(nulPrefix)) this.detLeadGateRejected.delete(key)
-    }
-    for (const key of this.cappedLeadReported) {
-      if (key.startsWith(nulPrefix)) this.cappedLeadReported.delete(key)
-    }
-
-    const unsub = this.runLifecycleUnsubs.get(runId)
-    if (unsub) {
-      this.runLifecycleUnsubs.delete(runId)
-      try { unsub() } catch { /* ignore */ }
+      state.plannerEmptyRounds = undefined
+      state.plannerDryRounds = undefined
+      state.plannerCompletedAtLastRound = undefined
+      state.plannerEvidenceFrontier = undefined
+      state.frontierController = undefined
+      state.frontierDispatcher?.clearStepMeta()
+      state.frontierDispatcher = undefined
+      state.invariantsSeeded = false
+      state.wave1InvariantChainsPromoted = false
+      state.seededHypothesisIds = undefined
+      state.runtimeSynthesisWatermark = undefined
+      state.postFloorInvariantsSynced = false
+      state.runtimeCompositeSeeded = false
+      state.plannerSeenCausalEdges = undefined
+      state.stepIds = undefined
+      state.emittedSealedHandleSets.clear()
+      state.detLeadStepKeys.clear()
+      state.detLeadGateRejected.clear()
+      state.cappedLeadReported.clear()
+      state.tierAStepKeys.clear()
     }
   }
 
@@ -1250,17 +1253,27 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
   /** Return (or initialize) the run-scoped v8 FrontierWaveController bound to Store's CapabilityLedger. */
   frontierControllerFor(runId: string, options: Omit<FrontierWaveControllerOptions, 'ledger'> = {}): FrontierWaveController {
     this.trackRunLifecycle(runId)
-    let controller = this.frontierControllers.get(runId)
-    if (!controller) {
-      controller = new FrontierWaveController({
+    const state = this.runState.ensure(runId)
+    if (!state.frontierController) {
+      state.frontierController = new FrontierWaveController({
         ...options,
         ledger: this.storage.capabilityLedger(runId),
       })
-      this.frontierControllers.set(runId, controller)
     } else {
-      controller.syncNegativeEdgesFromLedger()
+      state.frontierController.syncNegativeEdgesFromLedger()
     }
-    return controller
+    return state.frontierController
+  }
+
+  /** Return (or initialize) the run-scoped unified `FrontierDispatcher` bound to `FrontierWaveController`. */
+  frontierDispatcherFor(runId: string): FrontierDispatcher {
+    const state = this.runState.ensure(runId)
+    if (!state.frontierDispatcher) {
+      state.frontierDispatcher = new FrontierDispatcher({
+        controller: this.frontierControllerFor(runId),
+      })
+    }
+    return state.frontierDispatcher
   }
 
   /**
@@ -3435,29 +3448,44 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
   }
 
 
-  /** Untruncated, paginated data access for the coordinator (never a fixed snapshot). */
-  coordinatorDeps(run: Run): CoordinatorDeps {
-    const endpoints = (): CoordinatorEndpoint[] => this.pageAll((offset, limit) =>
-      this.storage.listEndpoints(run.id, { limit, offset }))
+  private listCoordinatorFindings(runId: string): ReturnType<CoordinatorDeps['listFindings']> {
+    return this.storage.db.select().from(findings).where(eq(findings.runId, runId)).all()
+      .map(row => ({
+        id: row.id, origin: row.finding.origin, title: row.finding.title, status: row.finding.status,
+        severity: row.finding.severity, ...(row.finding.reason ? { reason: row.finding.reason } : {}),
+        ...(row.finding.category ? { category: row.finding.category } : {}),
+        ...(row.finding.cwe ? { cwe: row.finding.cwe } : {}),
+        ...(row.finding.confidence ? { confidence: row.finding.confidence } : {}),
+        ...(row.finding.verification ? { verification: row.finding.verification } : {}),
+        ...(row.finding.runtimeProofGap ? { runtimeProofGap: row.finding.runtimeProofGap } : {}),
+        ...(row.finding.findingKind ? { findingKind: row.finding.findingKind } : {}),
+        evidenceIds: row.finding.evidenceIds ?? [], chainFactIds: row.finding.chainFactIds ?? [],
+        exchangeIds: row.finding.exchangeIds ?? [],
+      }))
+  }
+
+  /** Untruncated, paginated data access for the coordinator (optionally backed by a single-round snapshot cache). */
+  coordinatorDeps(
+    run: Run,
+    roundSnapshot?: {
+      getEndpoints: () => CoordinatorEndpoint[]
+      getFacts: () => Fact[]
+      getFindings: () => ReturnType<CoordinatorDeps['listFindings']>
+      getApiDependencies: () => CoordinatorApiDependency[]
+    },
+  ): CoordinatorDeps {
+    const endpoints = (): CoordinatorEndpoint[] => roundSnapshot
+      ? roundSnapshot.getEndpoints()
+      : this.pageAll((offset, limit) => this.storage.listEndpoints(run.id, { limit, offset }))
     return {
       listEndpoints: endpoints,
-      listFacts: () => this.pageAll((offset, limit) =>
-        this.storage.listFacts(run.id, { includeTainted: false, limit, offset })),
-      listApiDependencies: () => this.collectCoordinatorApiDependencies(run),
-      listFindings: () => this.storage.db.select().from(findings).where(eq(findings.runId, run.id)).all()
-        .map(row => ({
-          id: row.id, origin: row.finding.origin, title: row.finding.title, status: row.finding.status,
-          severity: row.finding.severity, ...(row.finding.reason ? { reason: row.finding.reason } : {}),
-          ...(row.finding.category ? { category: row.finding.category } : {}),
-          ...(row.finding.cwe ? { cwe: row.finding.cwe } : {}),
-          ...(row.finding.confidence ? { confidence: row.finding.confidence } : {}),
-          ...(row.finding.verification ? { verification: row.finding.verification } : {}),
-          ...(row.finding.runtimeProofGap ? { runtimeProofGap: row.finding.runtimeProofGap } : {}),
-          ...(row.finding.findingKind ? { findingKind: row.finding.findingKind } : {}),
-          evidenceIds: row.finding.evidenceIds ?? [], chainFactIds: row.finding.chainFactIds ?? [],
-          exchangeIds: row.finding.exchangeIds ?? [],
-        }))
-      ,
+      listFacts: () => roundSnapshot
+        ? roundSnapshot.getFacts()
+        : this.pageAll((offset, limit) => this.storage.listFacts(run.id, { includeTainted: false, limit, offset })),
+      listApiDependencies: () => roundSnapshot
+        ? roundSnapshot.getApiDependencies()
+        : this.collectCoordinatorApiDependencies(run),
+      listFindings: () => roundSnapshot ? roundSnapshot.getFindings() : this.listCoordinatorFindings(run.id),
       programGraph: () => this.coordinatorProgramGraph(endpoints()),
       // No persisted commit-signal table in v6; git hotspots remain empty rather than fabricated.
       commitSignals: () => [],
@@ -4127,17 +4155,30 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
    * into `CapabilityLedger`, plan depth 1..6 causal frontier hypotheses via `FrontierScheduler`,
    * and dispatch each with typed hop inputs + <= 2 KB hop-checkpoint briefs + parent evidence.
    */
-  dispatchChainRound(run: Run, coordinator: GraphCoordinator, budget: number, factIds: ReadonlySet<string>, funnel?: DispatchFunnelCounts): number {
-    const existing = this.storage.listChainSteps(run.id, run.goalRevision)
+  dispatchChainRound(
+    run: Run,
+    coordinator: GraphCoordinator,
+    budget: number,
+    factIds: ReadonlySet<string>,
+    funnel?: DispatchFunnelCounts,
+    snapshot?: {
+      existingSteps?: readonly ChainStep[]
+      existingFacts?: readonly Fact[]
+      apiDependencies?: readonly CoordinatorApiDependency[]
+      sourceMounted?: boolean
+      hops?: readonly ChainHop[]
+    },
+  ): number {
+    const existing = snapshot?.existingSteps ?? this.storage.listChainSteps(run.id, run.goalRevision)
     const remaining = Math.max(0, budget - existing.length)
     if (remaining <= 0) return 0
     const roundNo = Math.max(1, run.roundNo || 1)
-    const hops = coordinator.extractChainHops(roundNo)
+    const hops = snapshot?.hops ?? coordinator.extractChainHops(roundNo)
     const ledger = this.storage.capabilityLedger(run.id)
     const controller = this.frontierControllerFor(run.id)
     this.syncChainHopsToLedger(ledger, hops)
-    const sourceMounted = this.host.projectReposMount(run.projectId).mountedRepos.length > 0
-    const apiDependencies = this.collectCoordinatorApiDependencies(run)
+    const sourceMounted = snapshot?.sourceMounted ?? (this.host.projectReposMount(run.projectId).mountedRepos.length > 0)
+    const apiDependencies = snapshot?.apiDependencies ?? this.collectCoordinatorApiDependencies(run)
     const hypotheses = coordinator.planChainRound({
       hops,
       apiDependencies,
@@ -4149,7 +4190,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       waveNo: roundNo,
     })
     if (!hypotheses.length) return 0
-    const existingFacts = this.pageAll((offset, limit) =>
+    const existingFacts = snapshot?.existingFacts ?? this.pageAll((offset, limit) =>
       this.storage.listFacts(run.id, { includeTainted: false, limit, offset }))
     const hopFactById = this.persistChainHopFacts(run, hops, existingFacts)
     const liveFactIds = new Set<string>([...factIds, ...hopFactById.values()])
@@ -4199,15 +4240,33 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     const approvedOrigins = this.host.approvedOriginsSet(updated)
     const sourceMounted = this.host.projectReposMount(updated.projectId).mountedRepos.length > 0
 
+    // Single-snapshot per-round read cache eliminating 6+ redundant full-table DB scans per round.
+    let cachedFacts: Fact[] | null = null
+    let cachedSteps: ChainStep[] | null = null
+    let cachedEndpoints: CoordinatorEndpoint[] | null = null
+    let cachedFindings: ReturnType<CoordinatorDeps['listFindings']> | null = null
+    let cachedApiDeps: CoordinatorApiDependency[] | null = null
+    const getUntaintedFacts = (): Fact[] => (cachedFacts ??= this.pageAll((offset, limit) =>
+      this.storage.listFacts(fresh.id, { includeTainted: false, limit, offset })))
+    const getChainSteps = (): ChainStep[] => (cachedSteps ??= this.storage.listChainSteps(fresh.id, updated.goalRevision))
+    const getEndpoints = (): CoordinatorEndpoint[] => (cachedEndpoints ??= this.pageAll((offset, limit) =>
+      this.storage.listEndpoints(fresh.id, { limit, offset })))
+    const getFindings = (): ReturnType<CoordinatorDeps['listFindings']> => (cachedFindings ??= this.listCoordinatorFindings(fresh.id))
+    const getApiDeps = (): CoordinatorApiDependency[] => (cachedApiDeps ??= this.collectCoordinatorApiDependencies(updated))
+    const invalidateSteps = () => { cachedSteps = null }
+    const invalidateFacts = () => { cachedFacts = null }
+
     // v7 M2 white-box-first default: when source repos are mounted, seed Tier-A AST/RBAC/dataflow
     // leads BEFORE generic black-box floor leads or BOLA auto-steps.
     if (!this.invariantsSeededRuns.has(updated.id)) {
       try {
         this.seedCapabilityLedgerInvariants(updated, { approvedOrigins })
+        invalidateSteps()
         if (!sourceMounted && updated.capabilityTier > 0) {
           const addedComposites = this.promoteRuntimeCompositeWave1Steps(updated, approvedOrigins)
           funnel.planned += addedComposites
           funnel.enqueued += addedComposites
+          if (addedComposites > 0) invalidateSteps()
         }
       } catch { /* additive Layer-2 synthesis */ }
     } else {
@@ -4215,12 +4274,14 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         const postSync = this.syncPostFloorRuntimeInvariants(updated, approvedOrigins, { sourceMounted })
         funnel.planned += postSync.wave1StepsCreated
         funnel.enqueued += postSync.wave1StepsCreated
+        if (postSync.wave1StepsCreated > 0) invalidateSteps()
       } catch { /* incremental post-floor synthesis is additive */ }
     }
     let tierAPlannerSteps = 0
     if (sourceMounted) {
       try {
         tierAPlannerSteps = this.queueTierALeadSteps(updated, approvedOrigins, dynamicStepBudget, { sourceMounted: true })
+        if (tierAPlannerSteps > 0) invalidateSteps()
       } catch { /* white-box seeding is additive */ }
       funnel.planned += tierAPlannerSteps
       funnel.enqueued += tierAPlannerSteps
@@ -4231,17 +4292,24 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     let detLeadSteps = 0
     try {
       detLeadSteps = this.queueDetLeadUpgradeSteps(fresh, approvedOrigins, dynamicStepBudget)
+      if (detLeadSteps > 0) invalidateSteps()
     } catch { /* lead queueing is additive */ }
     funnel.planned += detLeadSteps
     funnel.enqueued += detLeadSteps
 
-    const factIds = new Set(this.pageAll((offset, limit) =>
-      this.storage.listFacts(fresh.id, { includeTainted: false, limit, offset })).map(fact => fact.id))
-    const remainingBudget = Math.max(0, dynamicStepBudget - this.storage.listChainSteps(fresh.id, updated.goalRevision).length)
+    const initialFacts = getUntaintedFacts()
+    const factIds = new Set(initialFacts.map(fact => fact.id))
+    const stepsBeforeChain = getChainSteps()
+    const remainingBudget = Math.max(0, dynamicStepBudget - stepsBeforeChain.length)
     const maxConcForPlan = Math.max(1, Math.min(maxWorkerConcurrency, updated.workerConcurrency || defaultWorkerConcurrency))
     const waveBufferTarget = Math.max(12, maxConcForPlan * 2)
     const coordinator = createGraphCoordinator({
-      deps: this.coordinatorDeps(updated),
+      deps: this.coordinatorDeps(updated, {
+        getEndpoints,
+        getFacts: getUntaintedFacts,
+        getFindings,
+        getApiDependencies: getApiDeps,
+      }),
       approvedOrigins: [...approvedOrigins],
       budgetUsd: Math.max(0, Number((updated.budgetUsd - updated.spentUsd).toFixed(4))),
       maxDispatchSteps: plannerWaveDispatchCap(maxConcForPlan, remainingBudget),
@@ -4251,15 +4319,27 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     // yielded >= 2 composable typed ChainHop artifacts. Deterministic hypotheses dispatch *before*
     // the LLM turn so a planner failure can never leave an empty window.
     let chainSteps = 0
-    const greyBoxApiDeps = !sourceMounted ? this.collectCoordinatorApiDependencies(updated) : []
-    if (roundNo >= 2 || coordinator.extractChainHops(roundNo).length >= 2 || (!sourceMounted && (greyBoxApiDeps.length >= 1 || approvedOrigins.size >= 2))) {
-      try { chainSteps = this.dispatchChainRound(updated, coordinator, dynamicStepBudget, factIds, funnel) } catch { /* additive */ }
+    const greyBoxApiDeps = !sourceMounted ? getApiDeps() : []
+    const extractedHops = coordinator.extractChainHops(roundNo)
+    if (roundNo >= 2 || extractedHops.length >= 2 || (!sourceMounted && (greyBoxApiDeps.length >= 1 || approvedOrigins.size >= 2))) {
+      try {
+        chainSteps = this.dispatchChainRound(updated, coordinator, dynamicStepBudget, factIds, funnel, {
+          existingSteps: stepsBeforeChain,
+          existingFacts: initialFacts,
+          apiDependencies: !sourceMounted ? greyBoxApiDeps : getApiDeps(),
+          sourceMounted,
+          hops: extractedHops,
+        })
+        if (chainSteps > 0) {
+          invalidateSteps()
+          invalidateFacts()
+        }
+      } catch { /* additive */ }
     }
 
-    const allSteps = this.storage.listChainSteps(fresh.id, updated.goalRevision)
-    const allUntaintedFacts = this.pageAll((offset, limit) =>
-      this.storage.listFacts(fresh.id, { includeTainted: false, limit, offset }))
-      .filter(fact => approvedOrigins.has(fact.origin))
+    const allSteps = getChainSteps()
+    const allUntaintedFacts = getUntaintedFacts().filter(fact => approvedOrigins.has(fact.origin))
+    for (const fact of allUntaintedFacts) factIds.add(fact.id)
     const detLeadFactIds = new Set(allUntaintedFacts
       .filter(fact => isTrustedHostControlFact(fact, 'det_lead'))
       .map(fact => fact.id))
@@ -4325,6 +4405,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         bolaAutoSteps += 1
         perOriginSteps.set(origin, (perOriginSteps.get(origin) ?? 0) + 1)
       }
+      if (bolaAutoSteps > 0) invalidateSteps()
     }
 
     // Auto-enqueue verification for each new cross-persona or active-HTML second-order surface,
@@ -4338,6 +4419,73 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       Math.max(0, dynamicStepBudget - allSteps.length - bolaAutoSteps),
       funnel,
     )
+    if (secondOrderAutoSteps > 0) invalidateSteps()
+
+    // Move O3: Gate redundant 10-turn LLM planner storms when the dispatch queue is already
+    // saturated and no high-signal milestone occurred (cheap deterministic synthesis above already ran).
+    const stepsPreLlm = getChainSteps()
+    const readyPreLlm = dispatchableReadySteps(stepsPreLlm, factIds).length
+    const activePreLlm = [...this.host.active.values()].filter(job =>
+      job.assignment.runId === run.id && job.assignment.phase === 'investigation').length
+    const prevFrontier = this.plannerEvidenceFrontier.get(run.id)
+    const confirmedNow = coordinator.queryFindings({ status: 'confirmed', limit: 1 }).total
+    const newConfirmedForGate = prevFrontier ? Math.max(0, confirmedNow - prevFrontier.confirmed) : 0
+    const seenEdgesPreGate = this.plannerSeenCausalEdges.get(run.id)
+    const ledgerPreGate = this.storage.capabilityLedger(run.id)
+    const newCrossOriginCaps = ledgerPreGate.listCausalEdges().filter(edge => {
+      if (seenEdgesPreGate?.has(edge.edgeId)) return false
+      const post = edge.postconditionCapId ? ledgerPreGate.getCapability(edge.postconditionCapId) : null
+      return Boolean(post && post.serviceOrigin && edge.actorContext.serviceOrigin && post.serviceOrigin !== edge.actorContext.serviceOrigin)
+    }).length
+    const openProofGapsPreLlm = this.storage.listOpenProofGaps(fresh.id, updated.goalRevision)
+      .filter(gap => approvedOrigins.has(gap.origin)).length
+    const llmGate = shouldInvokeLlmPlanner({
+      roundNo,
+      readyStepCount: readyPreLlm,
+      activeWorkerCount: activePreLlm,
+      waveBufferTarget,
+      newConfirmedFindings: newConfirmedForGate,
+      newCrossOriginCapabilities: newCrossOriginCaps,
+      openProofGaps: openProofGapsPreLlm,
+      queueEmptyOrDraining: readyPreLlm === 0 && activePreLlm === 0,
+    })
+    if (!llmGate.invokeLlm) {
+      const deterministicAdded = tierAPlannerSteps + detLeadSteps + chainSteps + bolaAutoSteps + secondOrderAutoSteps
+      const dispatchedTotal = stepsPreLlm.filter(step => step.assignedWorkerId !== null).length
+      funnel.dispatched = dispatchedTotal
+      funnel.dispatchedThisRound = Math.max(0, dispatchedTotal - (this.host.dispatchFunnels.get(run.id)?.dispatched ?? 0))
+      funnel.remainingReady = readyPreLlm
+      funnel.stopReason = 'running'
+      this.host.recordDispatchFunnel(run.id, funnel)
+      try {
+        this.storage.event(
+          run.id,
+          'planner.llm_gated',
+          `Deferred LLM planner round ${roundNo} (${llmGate.reason}): ${readyPreLlm} ready step(s) >= buffer ${waveBufferTarget}; deterministic synthesis added ${deterministicAdded} step(s).`,
+          {
+            roundNo,
+            reason: llmGate.reason,
+            readyStepCount: readyPreLlm,
+            activeWorkerCount: activePreLlm,
+            waveBufferTarget,
+            deterministicAdded,
+          },
+        )
+      } catch { /* telemetry is best-effort */ }
+      this.host.tracePlannerDecision(run.id, {
+        roundIdx: roundNo,
+        factsCount: allUntaintedFacts.length,
+        detLeadsCount: detLeadFactIds.size,
+        alreadyConfirmedCount: confirmedForPlanner.length,
+        spawnedSteps: deterministicAdded,
+        k6DryStreak: 0,
+        dynamicStepBudget,
+        durationMs: Math.max(0, Date.now() - plannerStartedAt),
+        costUsd: 0,
+        summary: `llm_gated:${llmGate.reason} (ready=${readyPreLlm}/${waveBufferTarget})`,
+      })
+      return
+    }
 
     // Tool-equipped coordinator session: paginated read tools, explicit dispatch, no snapshot.
     let toolDispatched = 0
@@ -4348,6 +4496,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
           const counts = this.persistDispatchPlan(this.storage.run(fresh.id), plan, factIds, detLeadFactIds)
           addFunnelCounts(funnel, counts)
           toolDispatched += counts.enqueued
+          if (counts.enqueued > 0) invalidateSteps()
         } catch { /* additive */ }
       },
     })
@@ -4355,8 +4504,8 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     // v7 precision guard: remember the evidence frontier across rounds. A round that adds no
     // runtime_confirmed finding and no chain primitive is dry; two consecutive dry rounds after the
     // high-priority queue drains end the planner.
-    const evidenceFrontier = this.plannerEvidenceFrontier.get(run.id) ?? {
-      confirmed: coordinator.queryFindings({ status: 'confirmed', limit: 1 }).total,
+    const evidenceFrontier = prevFrontier ?? {
+      confirmed: confirmedNow,
       primitives: coordinator.deriveChainPrimitives().length,
     }
     const prompt = coordinatorPlannerPrompt({
@@ -4370,13 +4519,11 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       },
       dynamicStepBudget,
       pendingOob,
-      chainSteps: this.storage.listChainSteps(fresh.id, updated.goalRevision)
-        .map(step => ({ id: step.id, title: step.title, status: step.status })),
+      chainSteps: stepsPreLlm.map(step => ({ id: step.id, title: step.title, status: step.status })),
       alreadyConfirmed: confirmedForPlanner.slice(0, 30),
       personas: personas.map(persona => ({ handle: persona.handle, roleLabel: persona.roleLabel })),
       mountedRepos: this.host.projectReposMount(updated.projectId).mountedRepos,
-      openProofGaps: this.storage.listOpenProofGaps(fresh.id, updated.goalRevision)
-        .filter(gap => approvedOrigins.has(gap.origin)).length,
+      openProofGaps: openProofGapsPreLlm,
     })
     const answer = await agentTurn({
       directory: this.storage.directory,
@@ -4392,6 +4539,10 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       ...llmRunHooks(this.storage, run.id),
     })
     if (!this.host.currentCoordinator(run.id, task)) return
+    // Invalidate cached findings/facts/steps after the async LLM session in case workers updated the DB.
+    cachedFacts = null
+    cachedSteps = null
+    cachedFindings = null
 
     let parsedPlanner: ReturnType<typeof plannerResponseSchema.safeParse> | null = null
     try { parsedPlanner = plannerResponseSchema.safeParse(JSON.parse(stripJsonFences(answer))) } catch { parsedPlanner = null }

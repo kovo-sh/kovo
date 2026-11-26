@@ -19,17 +19,22 @@ import {
   type PersonaResourceQueueItem,
   type WorkerToolHandlers,
 } from './agent-session.ts'
+import type { AgentTrace } from './agent-trace.ts'
+import type { Grant } from './broker.ts'
 import {
   CapabilityLedger,
   type NegativeEdge as LedgerNegativeEdge,
   type NegativeEdgeReason as LedgerNegativeEdgeReason,
 } from './capability-ledger.ts'
 import { normalizeEndpointTemplate } from './dedupe.ts'
+import type { DerivedCapabilityVault } from './derived-custody.ts'
 import { hasDynamicIdSegment, identifierFormsForRoute, intentFamily } from './deterministic-engine.ts'
+import type { ExecCoordinatorTask } from './exec-exchange.ts'
 import {
   FrontierScheduler,
   MAX_CHECKPOINT_BRIEF_BYTES,
   buildHopCheckpointBrief,
+  computeBranchEvi,
   computeNegativeEdgeKey,
   type AttemptUpdateResult,
   type DiscoverySurfaceCandidate,
@@ -49,14 +54,19 @@ import {
   decideNext,
   extractChainHops,
   formatChainHopsBrief,
+  planCompositeWorkflows,
   type ChainHop,
   type ChainHypothesis,
+  type CompositeWorkflowNode,
+  type CompositeWorkflowRole,
   type CoordinatorFact,
   type DispatchPlan,
   type DispatchStepInput,
   type GraphCoordinator,
+  type PlannedCompositeWorkflow,
   type SchedulerDecision,
 } from './graph-coordinator.ts'
+import type { LabTargetHandle } from './lab-runner.ts'
 import { selectRankedProbeTargets, type Phase0ProbePlanSummary } from './probe-plan.ts'
 import { findings } from './schema.ts'
 import { dedupeCodeAuditSuspects } from './semantic-audit.ts'
@@ -434,6 +444,67 @@ export function plannerWaveDispatchCap(workerConcurrency: number, remainingBudge
   return Math.max(0, Math.min(Math.max(12, conc * 2), remainingBudget))
 }
 
+export type LlmPlannerGateReason =
+  | 'milestone_forced'
+  | 'queue_draining'
+  | 'milestone_confirmed_finding'
+  | 'milestone_cross_origin_capability'
+  | 'milestone_open_proof_gap'
+  | 'round_one_bootstrap'
+  | 'queue_below_buffer'
+  | 'queue_saturated_deferred'
+
+export interface LlmPlannerGateInput {
+  roundNo: number
+  readyStepCount: number
+  activeWorkerCount: number
+  waveBufferTarget: number
+  /** Confirmed findings added since the previous planner round. */
+  newConfirmedFindings?: number
+  /** Newly sealed cross-origin / causal capabilities since the previous planner round. */
+  newCrossOriginCapabilities?: number
+  /** Unresolved proof gaps requiring coordinator attention. */
+  openProofGaps?: number
+  /** True when queue is drained or pre-stop review is required. */
+  queueEmptyOrDraining?: boolean
+  /** Explicit high-signal milestone override. */
+  forceMilestone?: boolean
+}
+
+export interface LlmPlannerGateDecision {
+  invokeLlm: boolean
+  reason: LlmPlannerGateReason
+}
+
+/**
+ * Pure gate preventing redundant 10-turn LLM planner storms when the dispatch queue is already
+ * saturated (`readyStepCount >= waveBufferTarget`). Cheap deterministic synthesis (Tier-A,
+ * det-leads, `dispatchChainRound`, BOLA matrix, second-order surfaces) still runs immediately;
+ * the LLM session runs only when queue depth drops below buffer or a high-signal milestone fires.
+ */
+export function shouldInvokeLlmPlanner(input: LlmPlannerGateInput): LlmPlannerGateDecision {
+  const ready = Math.max(0, Math.floor(input.readyStepCount))
+  const active = Math.max(0, Math.floor(input.activeWorkerCount))
+  const target = Math.max(1, Math.floor(input.waveBufferTarget))
+  if (input.forceMilestone === true) return { invokeLlm: true, reason: 'milestone_forced' }
+  if (input.queueEmptyOrDraining === true || (ready === 0 && active === 0)) {
+    return { invokeLlm: true, reason: 'queue_draining' }
+  }
+  if ((input.newConfirmedFindings ?? 0) > 0) {
+    return { invokeLlm: true, reason: 'milestone_confirmed_finding' }
+  }
+  if ((input.newCrossOriginCapabilities ?? 0) > 0) {
+    return { invokeLlm: true, reason: 'milestone_cross_origin_capability' }
+  }
+  if (ready < target) {
+    return { invokeLlm: true, reason: input.roundNo <= 1 ? 'round_one_bootstrap' : 'queue_below_buffer' }
+  }
+  if ((input.openProofGaps ?? 0) > 0 && ready < target * 2) {
+    return { invokeLlm: true, reason: 'milestone_open_proof_gap' }
+  }
+  return { invokeLlm: false, reason: 'queue_saturated_deferred' }
+}
+
 /**
  * Serialize a typed `ChainHop` artifact into a store `fact` payload for cross-round persistence.
  * Strictly non-secret: token references stay opaque handles (`secret:<factId>` / `jwt:<factId>`).
@@ -532,13 +603,16 @@ export function formatHopCheckpointForAssignment(
   return { brief: clone, json, bytes }
 }
 
-/** Map chained hypotheses onto validated dispatch inputs with typed `ChainHop` + v8 checkpoint briefs. */
+/** Map chained hypotheses onto validated dispatch inputs with typed `ChainHop`, EVI & v8 checkpoint briefs. */
 export function chainHypothesisDispatchSteps(hypotheses: readonly ChainHypothesis[]): DispatchStepInput[] {
   return hypotheses.map(hypothesis => {
+    const eviTag = typeof hypothesis.evi === 'number' && Number.isFinite(hypothesis.evi) && hypothesis.evi > 0
+      ? `[lane=chain] [evi=${hypothesis.evi.toFixed(2)}] `
+      : '[lane=chain] '
     const hopBlock = hypothesis.chainHops?.length
       ? ` [chain_hops=${formatChainHopsBrief(hypothesis.chainHops, 420)}]`
       : ''
-    const baseText = `${hypothesis.title} — ${hypothesis.rationale}`
+    const baseText = `${eviTag}${hypothesis.title} — ${hypothesis.rationale}`
     const maxBase = Math.max(200, 1200 - hopBlock.length)
     const checkpoint = hypothesis.hops >= 2 && hypothesis.checkpointBrief
       ? formatHopCheckpointForAssignment(hypothesis.checkpointBrief, MAX_CHECKPOINT_BRIEF_BYTES)
@@ -1626,6 +1700,14 @@ export class PhaseBConcurrencyController {
   }
 }
 
+export type StepOriginSource =
+  | 'whitebox_code_audit'
+  | 'whitebox_tier_a'
+  | 'runtime_chain'
+  | 'det_lead'
+  | 'planner'
+  | 'boundary_stub'
+
 export interface DispatchLaneStep {
   id: string
   seq: number
@@ -1639,6 +1721,24 @@ export interface DispatchLaneStep {
   sourceOrigins?: readonly string[]
   /** Multi-trial sibling index (`0` or omitted = primary hypothesis; `> 0` = unstarted duplicate). */
   trialIndex?: number | null
+  /** Optional typed routing metadata (avoids free-text regex classification when stamped at creation). */
+  lane?: DispatchLane
+  evi?: number
+  originSource?: StepOriginSource
+  hopDepth?: number
+  budgetClass?: AssignmentBudgetClass
+}
+
+export interface TypedStepDispatchMeta {
+  lane: DispatchLane
+  evi: number
+  originSource: StepOriginSource
+  hopDepth: number
+  budgetClass: AssignmentBudgetClass
+  whiteBox: boolean
+  multiHop: boolean
+  genericWave1Stub: boolean
+  sealedCapability: boolean
 }
 
 export interface RoundRobinDispatchOptions {
@@ -1667,13 +1767,28 @@ export interface RoundRobinDispatchOptions {
   chainReservedSlots?: number
   /** Multi-hop chain assignments already in flight; subtracted from the chain reservation. */
   activeChainCount?: number
+  /** Optional EVI scores keyed by step ID (wired from `FrontierWaveController` / `planChainRound`). */
+  eviByStepId?: ReadonlyMap<string, number>
+  /** Optional active `FrontierWaveController` supplying live EVI beam scores & wave ranking. */
+  frontierController?: FrontierWaveController | null
+  /** Optional pre-registered typed step metadata keyed by step ID. */
+  stepMetaById?: ReadonlyMap<string, Partial<TypedStepDispatchMeta>>
 }
+
+export type FrontierDispatchOptions = RoundRobinDispatchOptions
 
 export interface RoundRobinDispatchPlan<T extends DispatchLaneStep> {
   ordered: T[]
   selectedByLane: Record<DispatchLane, number>
   leadCapRemaining: number
   deferredLeads: number
+}
+
+export interface FrontierDispatchPlan<T extends DispatchLaneStep> extends RoundRobinDispatchPlan<T> {
+  whiteBoxSelected: number
+  runtimeChainReserved: number
+  eviRankedCount: number
+  waveSelection?: WaveSelectionResult | null
 }
 
 /** Identify white-box AST/RBAC/dataflow/source-audit steps so mounted-source runs prioritize them first. */
@@ -1903,11 +2018,21 @@ export function isMultiHopChainStep(
   return matchesMultiHopStepSignal(step)
 }
 
-/** Map a step onto the round-robin lane it competes in. */
+const TYPED_LANE_TAG_RE = /\[lane=(lead|route|workflow|business_logic|race|chain|other)\]/i
+const TYPED_EVI_TAG_RE = /\[evi=([0-9]+(?:\.[0-9]+)?)\]/i
+const TYPED_CAP_TAG_RE = /\[cap=([^\]]+)\]/i
+const VALID_DISPATCH_LANES: ReadonlySet<string> = new Set(['lead', 'route', 'workflow', 'business_logic', 'race', 'chain', 'other'])
+
+/** Map a step onto its dispatch lane: prefers typed `step.lane` and `[lane=...]` tags before regex fallback. */
 export function classifyDispatchLane(
   step: DispatchLaneStep,
   hostTiers?: Record<string, HostTier>,
 ): DispatchLane {
+  if (step.lane && VALID_DISPATCH_LANES.has(step.lane)) return step.lane
+  if (step.originSource === 'det_lead') return 'lead'
+  if (step.originSource === 'runtime_chain') return 'chain'
+  const taggedLane = TYPED_LANE_TAG_RE.exec(step.hypothesis ?? '')?.[1]?.toLowerCase()
+  if (taggedLane && VALID_DISPATCH_LANES.has(taggedLane)) return taggedLane as DispatchLane
   if (isDetLeadDispatchStep(step)) return 'lead'
   const text = `${step.title} ${step.hypothesis ?? ''} ${step.category ?? ''} ${(step.skills ?? []).join(' ')}`.toLowerCase()
   if (isMultiHopChainStep(step) || /\bchain\b|second[\s_-]?order|cross[\s_-]?host|cross[\s_-]?origin|escalat/.test(text)) return 'chain'
@@ -1918,6 +2043,78 @@ export function classifyDispatchLane(
   if (hostTiers && origins.length > 0 &&
     origins.every(origin => (hostTiers[origin] ?? classifyHostTier(origin)) === 'low_value_static')) return 'other'
   return 'route'
+}
+
+/** Resolve typed dispatch metadata for a step (stamped fields + FrontierWaveController EVI first). */
+export function resolveStepDispatchMeta(
+  step: DispatchLaneStep,
+  options: Pick<FrontierDispatchOptions, 'hostTiers' | 'tierALeadIds' | 'whiteBoxStepIds' | 'eviByStepId' | 'stepMetaById'> = {},
+  branchEviByCapOrEndpoint?: ReadonlyMap<string, number>,
+): TypedStepDispatchMeta {
+  const registered = options.stepMetaById?.get(step.id)
+  const lane = registered?.lane ?? classifyDispatchLane(step, options.hostTiers)
+  const whiteBox = registered?.whiteBox
+    ?? (step.originSource === 'whitebox_code_audit'
+      || step.originSource === 'whitebox_tier_a'
+      || Boolean(options.tierALeadIds?.has(step.id))
+      || Boolean(options.whiteBoxStepIds?.has(step.id))
+      || isWhiteBoxStep(step))
+  const hopDepth = registered?.hopDepth ?? step.hopDepth ?? extractContinuationDepth(step)
+  const multiHop = registered?.multiHop ?? (lane === 'chain' && (step.originSource === 'runtime_chain' || hopDepth >= 2 || isMultiHopChainStep(step)))
+  const genericWave1Stub = registered?.genericWave1Stub ?? (step.originSource === 'boundary_stub' || (!step.originSource && isGenericWave1BoundaryChainStep(step)))
+  const sealedCapability = registered?.sealedCapability ?? hasSealedHopCapability(step)
+  const originSource: StepOriginSource = registered?.originSource ?? step.originSource ?? (
+    options.tierALeadIds?.has(step.id)
+      ? 'whitebox_tier_a'
+      : whiteBox
+        ? 'whitebox_code_audit'
+        : isDetLeadDispatchStep(step)
+          ? 'det_lead'
+          : genericWave1Stub
+            ? 'boundary_stub'
+            : hasRuntimeBackedChainEvidence(step)
+              ? 'runtime_chain'
+              : 'planner'
+  )
+
+  let evi = 0
+  if (typeof registered?.evi === 'number' && Number.isFinite(registered.evi) && registered.evi > 0) {
+    evi = registered.evi
+  } else if (typeof step.evi === 'number' && Number.isFinite(step.evi) && step.evi > 0) {
+    evi = step.evi
+  } else if (options.eviByStepId?.has(step.id)) {
+    evi = Math.max(0, options.eviByStepId.get(step.id) ?? 0)
+  } else {
+    const tagMatch = TYPED_EVI_TAG_RE.exec(step.hypothesis ?? '')
+    if (tagMatch?.[1]) {
+      const parsed = Number(tagMatch[1])
+      if (Number.isFinite(parsed) && parsed > 0) evi = parsed
+    }
+    if (evi === 0 && branchEviByCapOrEndpoint && branchEviByCapOrEndpoint.size > 0) {
+      const capMatch = TYPED_CAP_TAG_RE.exec(step.hypothesis ?? '')?.[1]
+      if (capMatch && branchEviByCapOrEndpoint.has(capMatch)) {
+        evi = branchEviByCapOrEndpoint.get(capMatch)!
+      } else {
+        for (const [key, score] of branchEviByCapOrEndpoint.entries()) {
+          if (key.length >= 4 && ((step.hypothesis ?? '').includes(key) || step.title.includes(key))) {
+            evi = Math.max(evi, score)
+          }
+        }
+      }
+    }
+  }
+
+  const budgetClass = registered?.budgetClass ?? step.budgetClass ?? classifyAssignmentBudgetClass({
+    title: step.title,
+    hypothesis: step.hypothesis,
+    category: step.category,
+    skills: step.skills,
+    dependsOnFactIds: step.dependsOnFactIds,
+    dependsOnStepIds: step.dependsOnStepIds,
+    multiHopChain: multiHop,
+  })
+
+  return { lane, evi, originSource, hopDepth, budgetClass, whiteBox, multiHop, genericWave1Stub, sealedCapability }
 }
 
 function dispatchTierRank(step: DispatchLaneStep, hostTiers?: Record<string, HostTier>): number {
@@ -1932,56 +2129,95 @@ function isTrialDuplicateStep(step: Pick<DispatchLaneStep, 'trialIndex'>): boole
   return typeof step.trialIndex === 'number' && step.trialIndex > 0
 }
 
-function compareDispatchSteps(a: DispatchLaneStep, b: DispatchLaneStep, hostTiers?: Record<string, HostTier>): number {
+function compareDispatchSteps(
+  a: DispatchLaneStep,
+  b: DispatchLaneStep,
+  hostTiers?: Record<string, HostTier>,
+  metaById?: ReadonlyMap<string, TypedStepDispatchMeta>,
+): number {
   const trialDup = Number(isTrialDuplicateStep(a)) - Number(isTrialDuplicateStep(b))
   if (trialDup !== 0) return trialDup
   const tier = dispatchTierRank(a, hostTiers) - dispatchTierRank(b, hostTiers)
   if (tier !== 0) return tier
+  const eviA = metaById?.get(a.id)?.evi ?? 0
+  const eviB = metaById?.get(b.id)?.evi ?? 0
+  if (Math.abs(eviB - eviA) > 1e-6) return eviB - eviA
   if (a.priority !== b.priority) return b.priority - a.priority
   if (a.seq !== b.seq) return a.seq - b.seq
   return a.id < b.id ? -1 : a.id > b.id ? 1 : 0
 }
 
 /**
- * Fill `slots` deterministically: up to the lead cap first, then one step per lane per round so a
- * lead backlog or a single large route lane can never starve the semantic classes. Leads past the
- * cap only run when no non-lead ready step remains. Unstarted trial duplicates (`trialIndex > 0`)
- * are demoted strictly behind every distinct primary ready step across all lanes and only fill
- * remaining surplus capacity.
+ * Unified Typed Frontier Dispatcher (Move O3): collapses `FrontierWaveController` EVI wave scoring
+ * and multi-lane round-robin dispatch into one deterministic selector.
+ *
+ * Ordering guarantees:
+ *  1. Typed routing metadata (`lane`, `evi`, `originSource`, `hopDepth`) is respected before regexes.
+ *  2. White-box source-confirmed steps take priority when `sourceMounted === true` (never throttled
+ *     by `DET_LEAD_CONCURRENT_CAP`), while reserving 1 slot for a ready high-signal runtime/grey-box
+ *     chain whenever white-box backlogs would otherwise saturate all `>= 2` slots.
+ *  3. Within `chain` and across lanes, live EVI scores from `FrontierWaveController` rank high-value
+ *     branches ahead of lower-EVI branches while preserving fair depth-0 / continuation interleaving.
+ *  4. Dedicated chain frontier slots, lead concurrent cap, round-robin semantic lanes, and surplus-only
+ *     trial duplicates stay strictly enforced.
  */
-export function planRoundRobinDispatch<T extends DispatchLaneStep>(
+export function dispatchFrontierWave<T extends DispatchLaneStep>(
   steps: readonly T[],
   slots: number,
-  options: RoundRobinDispatchOptions = {},
-): RoundRobinDispatchPlan<T> {
+  options: FrontierDispatchOptions = {},
+): FrontierDispatchPlan<T> {
   const capacity = Math.max(0, Math.floor(slots))
   const selectedByLane: Record<DispatchLane, number> = {
     lead: 0, route: 0, workflow: 0, business_logic: 0, race: 0, chain: 0, other: 0,
   }
+  const branchEviIndex = new Map<string, number>()
+  let waveSelection: WaveSelectionResult | null = null
+  if (options.frontierController && capacity > 0) {
+    waveSelection = options.frontierController.selectNextWave(capacity)
+    const indexEvi = (key: string, score: number) => {
+      if (key) branchEviIndex.set(key, Math.max(branchEviIndex.get(key) ?? 0, score))
+    }
+    for (const item of waveSelection.assignments) {
+      const score = Math.max(0, item.evi)
+      indexEvi(item.branchKey, score)
+      indexEvi(item.targetSurfaceKey, score)
+      for (const capId of item.preconditionCapIds) indexEvi(capId, score)
+      const branch = options.frontierController.scheduler.getBranch(item.branchKey)
+      if (branch) {
+        const branchScore = Math.max(score, computeBranchEvi(branch))
+        indexEvi(branch.branchKey, branchScore)
+        indexEvi(branch.nextTarget.endpoint, branchScore)
+        for (const hop of branch.verifiedHops) indexEvi(hop.capabilityId, branchScore)
+      }
+    }
+  }
+
   const lanes = new Map<DispatchLane, T[]>()
   for (const lane of ['lead', ...DISPATCH_LANE_ORDER] as DispatchLane[]) lanes.set(lane, [])
   const duplicateTrials: Array<{ lane: DispatchLane; step: T }> = []
+  const metaById = new Map<string, TypedStepDispatchMeta>()
   const seenStepIds = new Set<string>()
+  let eviRankedCount = 0
+
   for (const step of steps) {
     if (seenStepIds.has(step.id)) continue
     seenStepIds.add(step.id)
-    const lane = classifyDispatchLane(step, options.hostTiers)
-    if (isTrialDuplicateStep(step)) duplicateTrials.push({ lane, step })
-    else lanes.get(lane)!.push(step)
+    const meta = resolveStepDispatchMeta(step, options, branchEviIndex)
+    metaById.set(step.id, meta)
+    if (meta.evi > 0) eviRankedCount += 1
+    if (isTrialDuplicateStep(step)) duplicateTrials.push({ lane: meta.lane, step })
+    else lanes.get(meta.lane)!.push(step)
   }
-  for (const lane of lanes.values()) lane.sort((a, b) => compareDispatchSteps(a, b, options.hostTiers))
-  // Fair multi-hop frontier interleaving within the chain lane:
-  // 0: unstarted (depth 0) source-audit / planner-synthesized multi-hop chains,
-  // 1: depth-1 continuations carrying a sealed cap:hop_* capability handle,
-  // 2: remaining unstarted (depth 0) Wave-1 boundary chains,
-  // 3: depth-1 continuations without a sealed capability handle,
-  // 4: depth >= 2 continuations (never preempt unstarted source/planner or Wave-1 chains).
+
+  for (const lane of lanes.values()) {
+    lane.sort((a, b) => compareDispatchSteps(a, b, options.hostTiers, metaById))
+  }
   lanes.get('chain')!.sort((a, b) =>
     chainLaneDispatchRank(a) - chainLaneDispatchRank(b)
-    || Number(isGenericWave1BoundaryChainStep(a)) - Number(isGenericWave1BoundaryChainStep(b))
-    || compareDispatchSteps(a, b, options.hostTiers),
+    || Number(metaById.get(a.id)?.genericWave1Stub ?? false) - Number(metaById.get(b.id)?.genericWave1Stub ?? false)
+    || compareDispatchSteps(a, b, options.hostTiers, metaById),
   )
-  duplicateTrials.sort((a, b) => compareDispatchSteps(a.step, b.step, options.hostTiers))
+  duplicateTrials.sort((a, b) => compareDispatchSteps(a.step, b.step, options.hostTiers, metaById))
 
   const leadCap = Math.max(
     0,
@@ -1993,19 +2229,15 @@ export function planRoundRobinDispatch<T extends DispatchLaneStep>(
   const whiteBoxStepIds = options.whiteBoxStepIds
   const whiteBoxFirst = options.sourceMounted === true || Boolean(whiteBoxStepIds?.size)
 
-  // v7 M2 white-box-first default: when repository source is mounted, pull every white-box
-  // AST/RBAC/dataflow/source-audit step across all lanes strictly ahead of generic black-box steps
-  // (never throttled by DET_LEAD_CONCURRENT_CAP).
   let tierASelected = 0
+  let whiteBoxSelected = 0
+  let runtimeChainReserved = 0
+
   if (whiteBoxFirst) {
-    const isPrioritizedWhiteBox = (step: T): boolean =>
-      Boolean(tierALeadIds?.has(step.id))
-      || Boolean(whiteBoxStepIds?.has(step.id))
-      || isWhiteBoxStep(step)
     const whiteBoxCandidates: Array<{ lane: DispatchLane; step: T }> = []
     for (const [lane, queue] of lanes.entries()) {
       for (let idx = 0; idx < queue.length;) {
-        if (!isPrioritizedWhiteBox(queue[idx]!)) { idx += 1; continue }
+        if (!metaById.get(queue[idx]!.id)?.whiteBox) { idx += 1; continue }
         whiteBoxCandidates.push({ lane, step: queue.splice(idx, 1)[0]! })
       }
     }
@@ -2014,25 +2246,57 @@ export function planRoundRobinDispatch<T extends DispatchLaneStep>(
       || (a.lane === 'chain' && b.lane === 'chain'
         ? chainLaneDispatchRank(a.step) - chainLaneDispatchRank(b.step)
         : 0)
-      || compareDispatchSteps(a.step, b.step, options.hostTiers),
+      || compareDispatchSteps(a.step, b.step, options.hostTiers, metaById),
     )
+
+    // Anti-starvation: when white-box steps alone would fill every slot (capacity >= 2), reserve
+    // 1 slot for a ready high-signal non-white-box runtime/grey-box chain if none is active yet.
+    const chainQueueNow = lanes.get('chain')!
+    const hasHighSignalRuntimeChain = chainQueueNow.some(step => {
+      const m = metaById.get(step.id)
+      return Boolean(
+        m && !m.whiteBox && !m.genericWave1Stub && m.multiHop
+        && (m.originSource === 'runtime_chain' || m.evi > 0 || hasRuntimeBackedChainEvidence(step)),
+      )
+    })
+    const reserveSlotForRuntimeChain = capacity >= 2
+      && whiteBoxCandidates.length >= capacity
+      && hasHighSignalRuntimeChain
+      && Math.max(0, Math.floor(options.activeChainCount ?? 0)) === 0
+      && options.chainReservedSlots !== 0
+      ? 1
+      : 0
+    const whiteBoxSlotCap = Math.max(0, capacity - reserveSlotForRuntimeChain)
+
     const remainingWhiteBox: Array<{ lane: DispatchLane; step: T }> = []
     for (const entry of whiteBoxCandidates) {
-      if (ordered.length < capacity) {
+      if (ordered.length < whiteBoxSlotCap) {
         ordered.push(entry.step)
         selectedByLane[entry.lane] += 1
+        whiteBoxSelected += 1
         if (entry.lane === 'lead') tierASelected += 1
       } else {
         remainingWhiteBox.push(entry)
       }
     }
-    // Put any overflow white-box steps back at the front of their lanes so deferredLeads stays accurate.
     for (const entry of remainingWhiteBox.reverse()) {
       lanes.get(entry.lane)!.unshift(entry.step)
     }
+    if (reserveSlotForRuntimeChain > 0 && ordered.length < capacity) {
+      const rtIdx = chainQueueNow.findIndex(step => {
+        const m = metaById.get(step.id)
+        return Boolean(
+          m && !m.whiteBox && !m.genericWave1Stub && m.multiHop
+          && (m.originSource === 'runtime_chain' || m.evi > 0 || hasRuntimeBackedChainEvidence(step)),
+        )
+      })
+      if (rtIdx >= 0) {
+        ordered.push(chainQueueNow.splice(rtIdx, 1)[0]!)
+        selectedByLane.chain += 1
+        runtimeChainReserved += 1
+      }
+    }
   } else if (tierALeadIds?.size) {
-    // Tier-A first: every Tier-A slice must reach a slot in Round 1, independent of the generic
-    // concurrent-lead cap (it is still bounded by the worker capacity).
     for (let idx = 0; idx < leadQueue.length && ordered.length < capacity;) {
       if (!tierALeadIds.has(leadQueue[idx]!.id)) { idx += 1; continue }
       ordered.push(leadQueue.splice(idx, 1)[0]!)
@@ -2040,10 +2304,11 @@ export function planRoundRobinDispatch<T extends DispatchLaneStep>(
       tierASelected += 1
     }
   }
+
   // Dedicated frontier slots for ready multi-hop / depth >= 2 chain steps so synthesized chains
   // never starve behind generic det_lead or single-route BOLA sweeps.
   const chainQueue = lanes.get('chain')!
-  const readyMultiHopCount = chainQueue.filter(step => isMultiHopChainStep(step)).length
+  const readyMultiHopCount = chainQueue.filter(step => metaById.get(step.id)?.multiHop).length
   const nonChainPrimaryCount = leadQueue.length +
     DISPATCH_LANE_ORDER.filter(lane => lane !== 'chain').reduce((sum, lane) => sum + lanes.get(lane)!.length, 0)
   const defaultChainReserve = readyMultiHopCount > 0
@@ -2055,10 +2320,13 @@ export function planRoundRobinDispatch<T extends DispatchLaneStep>(
   const maxChainReserve = nonChainPrimaryCount > 0 && capacity >= 2
     ? Math.min(rawChainReserve, capacity - 1)
     : rawChainReserve
-  const chainReserveRemaining = Math.max(0, maxChainReserve - Math.max(0, Math.floor(options.activeChainCount ?? 0)))
+  const chainReserveRemaining = Math.max(
+    0,
+    maxChainReserve - Math.max(0, Math.floor(options.activeChainCount ?? 0)) - runtimeChainReserved,
+  )
   let chainReservedSelected = 0
   for (let idx = 0; idx < chainQueue.length && ordered.length < capacity && chainReservedSelected < chainReserveRemaining;) {
-    if (!isMultiHopChainStep(chainQueue[idx]!)) { idx += 1; continue }
+    if (!metaById.get(chainQueue[idx]!.id)?.multiHop) { idx += 1; continue }
     ordered.push(chainQueue.splice(idx, 1)[0]!)
     selectedByLane.chain += 1
     chainReservedSelected += 1
@@ -2101,7 +2369,64 @@ export function planRoundRobinDispatch<T extends DispatchLaneStep>(
     selectedByLane,
     leadCapRemaining: Math.max(0, leadCap - selectedByLane.lead),
     deferredLeads: leadQueue.length,
+    whiteBoxSelected,
+    runtimeChainReserved,
+    eviRankedCount,
+    waveSelection,
   }
+}
+
+/**
+ * Stateful unified Frontier Dispatcher combining a run's `FrontierWaveController` (EVI beam &
+ * negative-edge pruning) with typed step routing metadata and multi-lane dispatch.
+ */
+export class FrontierDispatcher {
+  readonly controller: FrontierWaveController | null
+  private readonly stepMeta = new Map<string, Partial<TypedStepDispatchMeta>>()
+
+  constructor(options: { controller?: FrontierWaveController | null } = {}) {
+    this.controller = options.controller ?? null
+  }
+
+  registerStepMeta(stepId: string, meta: Partial<TypedStepDispatchMeta>): void {
+    this.stepMeta.set(stepId, { ...(this.stepMeta.get(stepId) ?? {}), ...meta })
+  }
+
+  getStepMeta(stepId: string): Partial<TypedStepDispatchMeta> | undefined {
+    return this.stepMeta.get(stepId)
+  }
+
+  clearStepMeta(stepId?: string): void {
+    if (stepId) this.stepMeta.delete(stepId)
+    else this.stepMeta.clear()
+  }
+
+  selectNextWave(waveCapacity: number, quotaOverride?: WaveQuotaConfig): WaveSelectionResult | null {
+    return this.controller ? this.controller.selectNextWave(waveCapacity, quotaOverride) : null
+  }
+
+  dispatch<T extends DispatchLaneStep>(
+    steps: readonly T[],
+    slots: number,
+    options: FrontierDispatchOptions = {},
+  ): FrontierDispatchPlan<T> {
+    return dispatchFrontierWave(steps, slots, {
+      ...options,
+      frontierController: options.frontierController ?? this.controller,
+      stepMetaById: options.stepMetaById ?? this.stepMeta,
+    })
+  }
+}
+
+/**
+ * Backwards-compatible entry point delegating directly to the unified `dispatchFrontierWave`.
+ */
+export function planRoundRobinDispatch<T extends DispatchLaneStep>(
+  steps: readonly T[],
+  slots: number,
+  options: RoundRobinDispatchOptions = {},
+): RoundRobinDispatchPlan<T> {
+  return dispatchFrontierWave(steps, slots, options)
 }
 
 export interface HighRiskEndpointCandidate {
@@ -2615,46 +2940,36 @@ export function singleStepWallClockMs(env: NodeJS.ProcessEnv = process.env): num
   return Math.max(30_000, Math.min(120_000, Math.round(raw)))
 }
 
-/**
- * Resolve per-worker wall-clock budget:
- *  - Multi-hop `chain` / continuation steps scale proportionally (`30%` of `runDurationMs`,
- *    clamped to `180s..300s`; default `240s` when `runDurationMs` is unset) so 3–6 hop chains
- *    have enough runway to finish Hops 3–5 and call `ctx.prove_composite(...)`.
- *  - Single-route non-chain steps retain the fast `120s` rotation window so sweeps turn over
- *    quickly and never starve the multi-hop frontier.
- */
-export function resolveWorkerWallClockMs(
-  step: Pick<DispatchLaneStep, 'title' | 'hypothesis' | 'category' | 'skills' | 'dependsOnStepIds' | 'dependsOnFactIds'>,
-  runDurationMs?: number,
-  options: { singleStepWallClockMs?: number } = {},
-): number {
-  if (isMultiHopChainStep(step)) {
-    if (typeof runDurationMs === 'number' && Number.isFinite(runDurationMs) && runDurationMs > 0) {
-      return Math.min(
-        MULTI_HOP_CHAIN_MAX_WALL_CLOCK_MS,
-        Math.max(MULTI_HOP_CHAIN_MIN_WALL_CLOCK_MS, Math.floor(runDurationMs * MULTI_HOP_CHAIN_WALL_CLOCK_SHARE)),
-      )
-    }
-    return MULTI_HOP_CHAIN_DEFAULT_WALL_CLOCK_MS
-  }
-  return Math.max(
-    30_000,
-    Math.min(SINGLE_STEP_ASSIGNMENT_WALL_CLOCK_MS, Math.round(options.singleStepWallClockMs ?? SINGLE_STEP_ASSIGNMENT_WALL_CLOCK_MS)),
-  )
+export type AssignmentBudgetClass = 'single_step' | 'multi_step' | 'multi_hop_chain'
+
+export interface AssignmentStepDescriptor {
+  title?: string
+  hypothesis?: string | null
+  category?: string | null
+  skills?: readonly string[]
+  /** Endpoint templates the step names (see `stepMentionedRoutes`). */
+  routes?: readonly string[]
+  /** Upstream evidence the step cites (`dependsOnFactIds`; the chain signal). */
+  parentEvidenceIds?: readonly string[]
+  dependsOnFactIds?: readonly string[]
+  dependsOnStepIds?: readonly string[]
+  /** Explicit pre-stamped budget class (bypasses heuristic classification when provided). */
+  budgetClass?: AssignmentBudgetClass
+  /** Explicit multi-step override (race / cross-persona / BOLA). */
+  multiStep?: boolean
+  /** Explicit multi-hop chain override. */
+  multiHopChain?: boolean
 }
 
-/**
- * Resolve when the worker settlement nudge fires:
- *  - Multi-hop `chain` steps settle at `max(wallMs - 25s, wallMs * 0.82)` so the worker keeps a
- *    full final turn to emit `ctx.prove_composite(...)`.
- *  - Non-chain steps keep the standard `max(wallMs - 15s, wallMs * 0.80)` schedule.
- */
-export function resolveWorkerSettlementMs(wallClockMs: number, isMultiHop: boolean): number {
-  const wall = Math.max(1, Math.floor(wallClockMs))
-  if (isMultiHop) {
-    return Math.max(1, Math.min(wall, Math.max(wall - MULTI_HOP_CHAIN_SETTLEMENT_BUFFER_MS, Math.floor(wall * MULTI_HOP_CHAIN_SETTLEMENT_SHARE))))
-  }
-  return Math.max(1, Math.min(wall, Math.max(wall - 15_000, Math.floor(wall * 0.8))))
+export interface AssignmentRunPolicy {
+  baseMaxTurns: number
+  baseWallClockMs: number
+  /** Overall run wall-clock duration in ms (scales multi-hop chain budgets proportionally). */
+  runDurationMs?: number
+  /** Single-step wall cap (default {@link SINGLE_STEP_ASSIGNMENT_WALL_CLOCK_MS}). */
+  singleStepWallClockMs?: number
+  /** Explicit run-level wall-clock override (e.g. deterministic rotation tests). */
+  wallClockOverrideMs?: number
 }
 
 export interface AssignmentBudgetInput {
@@ -2676,59 +2991,177 @@ export interface AssignmentBudgetInput {
 
 export interface AssignmentBudget {
   kind: 'single_step' | 'chain'
+  budgetClass?: AssignmentBudgetClass
   maxTurns: number
   wallClockMs: number
-  /** Optional wall-clock settlement threshold in ms (multi-hop uses `max(wall - 25s, wall * 0.82)`). */
+  /** Wall-clock settlement threshold in ms (multi-hop uses `max(wall - 25s, wall * 0.82)`). */
   wallClockSettlementMs?: number
   /** Turn at which the hard settlement nudge fires (N-2). */
   settlementTurn: number
 }
 
 /**
- * Tight budget for a standalone step, long budget for a chain that cites upstream evidence or a
- * multi-step/race assignment. A step that names many routes but cites no evidence is still a
- * standalone assignment: breadth is not depth, and a wall-capped slot is more valuable than a
- * wide, unanchored probe sweep. Race/cross-persona matrices are not breadth — they need 20–30
- * turns to reach the over-count/denied-control step, so they keep the long wall cap too.
+ * Resolve when the worker settlement nudge fires:
+ *  - Multi-hop `chain` steps settle at `max(wallMs - 25s, wallMs * 0.82)` so the worker keeps a
+ *    full final turn to emit `ctx.prove_composite(...)`.
+ *  - Non-chain steps keep the standard `max(wallMs - 15s, wallMs * 0.80)` schedule.
  */
-export function planAssignmentBudget(input: AssignmentBudgetInput): AssignmentBudget {
-  const multiHopChain = input.multiHopChain === true
-  const chain = multiHopChain || input.parentEvidenceIds.length > 0 || input.dependsOnStepIds.length > 0
-  const multiStep = input.multiStep === true
-  const baseTurns = Math.max(4, Math.floor(input.baseMaxTurns))
-  const baseWall = Math.max(20_000, Math.round(input.baseWallClockMs))
-  if (multiHopChain) {
+export function resolveWorkerSettlementMs(wallClockMs: number, isMultiHop: boolean): number {
+  const wall = Math.max(1, Math.floor(wallClockMs))
+  if (isMultiHop) {
+    return Math.max(1, Math.min(wall, Math.max(wall - MULTI_HOP_CHAIN_SETTLEMENT_BUFFER_MS, Math.floor(wall * MULTI_HOP_CHAIN_SETTLEMENT_SHARE))))
+  }
+  return Math.max(1, Math.min(wall, Math.max(wall - 15_000, Math.floor(wall * 0.8))))
+}
+
+/** Classify a step descriptor into its canonical budget tier (`single_step` | `multi_step` | `multi_hop_chain`). */
+export function classifyAssignmentBudgetClass(step: AssignmentStepDescriptor): AssignmentBudgetClass {
+  if (step.budgetClass) return step.budgetClass
+  const parentFactIds = step.parentEvidenceIds ?? step.dependsOnFactIds ?? []
+  const depStepIds = step.dependsOnStepIds ?? []
+  const isMultiHop = step.multiHopChain === true
+    || (step.multiHopChain !== false && isMultiHopChainStep({
+      title: step.title ?? '',
+      hypothesis: step.hypothesis,
+      category: step.category,
+      skills: step.skills,
+      dependsOnFactIds: parentFactIds,
+      dependsOnStepIds: depStepIds,
+    }))
+  if (isMultiHop) return 'multi_hop_chain'
+  const isMultiStep = step.multiStep === true
+    || parentFactIds.length > 0
+    || depStepIds.length > 0
+    || (step.multiStep !== false && isMultiStepAssignment({
+      title: step.title,
+      hypothesis: step.hypothesis,
+      category: step.category,
+      skills: step.skills,
+    }))
+  return isMultiStep ? 'multi_step' : 'single_step'
+}
+
+/**
+ * Single pure authoritative budget resolver (Move O5): replaces competing `planAssignmentBudget`
+ * and `resolveWorkerWallClockMs` calculators so `multiStep` race/BOLA/cross-persona assignments
+ * keep their intended 120–180s budgets instead of being silently clamped down to single-step caps.
+ */
+export function resolveAssignmentBudget(
+  stepDescriptor: AssignmentStepDescriptor,
+  runPolicy: AssignmentRunPolicy,
+): AssignmentBudget & { budgetClass: AssignmentBudgetClass } {
+  const budgetClass = classifyAssignmentBudgetClass(stepDescriptor)
+  const baseTurns = Math.max(4, Math.floor(runPolicy.baseMaxTurns))
+  const baseWall = Math.max(20_000, Math.round(runPolicy.baseWallClockMs))
+  const overrideWall = typeof runPolicy.wallClockOverrideMs === 'number'
+    && Number.isFinite(runPolicy.wallClockOverrideMs)
+    && runPolicy.wallClockOverrideMs > 0
+    ? Math.max(1, Math.floor(runPolicy.wallClockOverrideMs))
+    : undefined
+
+  if (budgetClass === 'multi_hop_chain') {
     const maxTurns = Math.max(20, Math.min(34, baseTurns))
-    const wallClockMs = resolveWorkerWallClockMs(
-      { title: '', skills: ['multihop-chains'], dependsOnStepIds: [] },
-      input.runDurationMs,
-    )
+    const computedWall = typeof runPolicy.runDurationMs === 'number'
+      && Number.isFinite(runPolicy.runDurationMs)
+      && runPolicy.runDurationMs > 0
+      ? Math.min(
+          MULTI_HOP_CHAIN_MAX_WALL_CLOCK_MS,
+          Math.max(MULTI_HOP_CHAIN_MIN_WALL_CLOCK_MS, Math.floor(runPolicy.runDurationMs * MULTI_HOP_CHAIN_WALL_CLOCK_SHARE)),
+        )
+      : MULTI_HOP_CHAIN_DEFAULT_WALL_CLOCK_MS
+    const wallClockMs = overrideWall ?? computedWall
     return {
       kind: 'chain',
+      budgetClass,
       maxTurns,
       wallClockMs,
       wallClockSettlementMs: resolveWorkerSettlementMs(wallClockMs, true),
       settlementTurn: Math.max(1, maxTurns - 2),
     }
   }
-  if (chain || multiStep) {
-    const maxTurns = chain
+
+  if (budgetClass === 'multi_step') {
+    const parentFactIds = stepDescriptor.parentEvidenceIds ?? stepDescriptor.dependsOnFactIds ?? []
+    const depStepIds = stepDescriptor.dependsOnStepIds ?? []
+    const citesUpstream = parentFactIds.length > 0 || depStepIds.length > 0
+    const maxTurns = citesUpstream
       ? Math.max(20, Math.min(34, baseTurns))
       : Math.max(MULTI_STEP_ASSIGNMENT_MIN_TURNS, Math.min(MULTI_STEP_ASSIGNMENT_MAX_TURNS, baseTurns))
+    const computedWall = Math.min(CHAIN_ASSIGNMENT_MAX_WALL_CLOCK_MS, Math.max(CHAIN_ASSIGNMENT_MIN_WALL_CLOCK_MS, baseWall))
+    const wallClockMs = overrideWall ?? computedWall
     return {
       kind: 'chain',
+      budgetClass,
       maxTurns,
-      wallClockMs: Math.min(CHAIN_ASSIGNMENT_MAX_WALL_CLOCK_MS, Math.max(CHAIN_ASSIGNMENT_MIN_WALL_CLOCK_MS, baseWall)),
+      wallClockMs,
+      wallClockSettlementMs: resolveWorkerSettlementMs(wallClockMs, false),
       settlementTurn: Math.max(1, maxTurns - 2),
     }
   }
+
   const maxTurns = Math.max(8, Math.min(SINGLE_STEP_ASSIGNMENT_MAX_TURNS, baseTurns))
+  const singleCap = Math.max(
+    30_000,
+    Math.min(SINGLE_STEP_ASSIGNMENT_WALL_CLOCK_MS, Math.round(runPolicy.singleStepWallClockMs ?? SINGLE_STEP_ASSIGNMENT_WALL_CLOCK_MS)),
+  )
+  const wallClockMs = overrideWall ?? Math.max(30_000, Math.min(singleCap, baseWall))
   return {
     kind: 'single_step',
+    budgetClass,
     maxTurns,
-    wallClockMs: Math.max(30_000, Math.min(input.singleStepWallClockMs ?? SINGLE_STEP_ASSIGNMENT_WALL_CLOCK_MS, baseWall)),
+    wallClockMs,
+    wallClockSettlementMs: resolveWorkerSettlementMs(wallClockMs, false),
     settlementTurn: Math.max(1, maxTurns - 2),
   }
+}
+
+/** Backwards-compatible wrapper over {@link resolveAssignmentBudget}. */
+export function resolveWorkerWallClockMs(
+  step: Pick<DispatchLaneStep, 'title' | 'hypothesis' | 'category' | 'skills' | 'dependsOnStepIds' | 'dependsOnFactIds'>,
+  runDurationMs?: number,
+  options: { singleStepWallClockMs?: number } = {},
+): number {
+  const singleCap = Math.max(
+    30_000,
+    Math.min(SINGLE_STEP_ASSIGNMENT_WALL_CLOCK_MS, Math.round(options.singleStepWallClockMs ?? SINGLE_STEP_ASSIGNMENT_WALL_CLOCK_MS)),
+  )
+  return resolveAssignmentBudget(
+    {
+      title: step.title,
+      hypothesis: step.hypothesis,
+      category: step.category,
+      skills: step.skills,
+      dependsOnFactIds: step.dependsOnFactIds,
+      dependsOnStepIds: step.dependsOnStepIds,
+      multiHopChain: isMultiHopChainStep(step),
+      multiStep: false,
+    },
+    {
+      baseMaxTurns: SINGLE_STEP_ASSIGNMENT_MAX_TURNS,
+      baseWallClockMs: singleCap,
+      runDurationMs,
+      singleStepWallClockMs: singleCap,
+    },
+  ).wallClockMs
+}
+
+/** Backwards-compatible wrapper over {@link resolveAssignmentBudget}. */
+export function planAssignmentBudget(input: AssignmentBudgetInput): AssignmentBudget {
+  return resolveAssignmentBudget(
+    {
+      routes: input.routes,
+      parentEvidenceIds: input.parentEvidenceIds,
+      dependsOnStepIds: input.dependsOnStepIds,
+      multiStep: input.multiStep === true,
+      multiHopChain: input.multiHopChain === true,
+    },
+    {
+      baseMaxTurns: input.baseMaxTurns,
+      baseWallClockMs: input.baseWallClockMs,
+      runDurationMs: input.runDurationMs,
+      singleStepWallClockMs: input.singleStepWallClockMs,
+    },
+  )
 }
 
 /** Nearest-rank percentile (0 for an empty sample). */
@@ -3101,27 +3534,16 @@ function inferSinkKindFromFactText(text: string): string {
   return 'api_route'
 }
 
-type CodeAuditChainRole =
-  | 'outbound_fetch'
-  | 'signing_webhook'
-  | 'info_disclosure'
-  | 'auth_session'
-  | 'privileged_mutation'
-  | 'async_worker'
-  | 'cache_permission'
-  | 'request_parsing'
-  | 'concurrent_settlement'
+type CodeAuditChainRole = CompositeWorkflowRole
 
-interface NormalizedCodeAuditSuspect {
+interface NormalizedCodeAuditSuspect extends CompositeWorkflowNode {
   fact: Fact
   asset: Run['candidates'][number]
   explicitSuspect: boolean
   routeOrAction: string
   endpointHint: string
   fileLoc: string
-  serviceScope: string
   hypothesisBody: string
-  sinkKind: string
   authCheck: string
   ownershipCheck: string
   explicitCategory: string
@@ -3129,7 +3551,6 @@ interface NormalizedCodeAuditSuspect {
   isCrown: boolean
   missingAuthOrOwner: boolean
   host: string
-  roles: ReadonlySet<CodeAuditChainRole>
 }
 
 const COMPOSITE_CODE_AUDIT_TITLE_PREFIX = 'Source audit composite chain ·'
@@ -3268,221 +3689,34 @@ function formatCrossServiceSiblingLeadsBlock(siblings: readonly NormalizedCodeAu
   return parts.length ? `${prefix}${parts.join(' | ')}` : ''
 }
 
-interface SynthesizedCompositeSpec {
-  key: string
-  title: string
-  category: string
-  hops: NormalizedCodeAuditSuspect[]
-  priority: number
-}
-
-function synthesizeCompositeCodeAuditChains(
-  candidates: readonly NormalizedCodeAuditSuspect[],
-  maxComposites: number,
-): SynthesizedCompositeSpec[] {
-  if (candidates.length < 2 || maxComposites <= 0) return []
-  const composites: SynthesizedCompositeSpec[] = []
-  const usedInPriorComposite = new Set<string>()
-  const emittedFactSets: ReadonlySet<string>[] = []
-
-  const pickCandidate = (
-    predicate: (c: NormalizedCodeAuditSuspect) => boolean,
-    excludeIds: ReadonlySet<string>,
-    anchor?: NormalizedCodeAuditSuspect,
-  ): NormalizedCodeAuditSuspect | undefined => {
-    const matching = candidates
-      .filter(c => !excludeIds.has(c.fact.id) && predicate(c))
-      .map((c, idx) => {
-        let score = 0
-        if (!usedInPriorComposite.has(c.fact.id)) score += 4
-        if (anchor && c.serviceScope !== anchor.serviceScope) score += 3
-        if (anchor && c.fileLoc && c.fileLoc !== anchor.fileLoc) score += 2
-        if (anchor && c.sinkKind !== anchor.sinkKind) score += 2
-        if (c.explicitSuspect) score += 1
-        return { c, score, idx }
-      })
-      .sort((a, b) => (b.score - a.score) || (a.idx - b.idx))
-    return matching[0]?.c
-  }
-
-  const recordComposite = (
-    key: string,
-    label: string,
-    category: string,
-    hops: NormalizedCodeAuditSuspect[],
-  ) => {
-    if (composites.length >= maxComposites || hops.length < 2) return
-    const hopIds = new Set(hops.map(h => h.fact.id))
-    // Skip duplicate or strict-subset composites whose facts are already covered by a richer chain.
-    if (emittedFactSets.some(prev => [...hopIds].every(id => prev.has(id)))) return
-    emittedFactSets.push(hopIds)
-    for (const h of hops) usedInPriorComposite.add(h.fact.id)
-    const host = hops[0]!.host
-    composites.push({
-      key,
-      title: `${COMPOSITE_CODE_AUDIT_TITLE_PREFIX} ${label} (${host})`,
-      category,
-      hops,
-      priority: Math.max(96, 98 - composites.length),
-    })
-  }
-
-  // Pattern 1: Outbound-Fetch / SSRF + Internal Signing / Webhook (+ optional privileged terminal)
-  {
-    const used = new Set<string>()
-    const entry = pickCandidate(c => c.roles.has('outbound_fetch'), used)
-    if (entry) {
-      used.add(entry.fact.id)
-      const pivot = pickCandidate(c => c.roles.has('signing_webhook'), used, entry)
-      if (pivot) {
-        used.add(pivot.fact.id)
-        const terminal = pickCandidate(c => c.roles.has('privileged_mutation'), used, pivot)
-          ?? pickCandidate(c => c.roles.has('auth_session'), used, pivot)
-        const hops = terminal ? [entry, pivot, terminal] : [entry, pivot]
-        recordComposite(
-          'outbound_signing_webhook',
-          terminal ? 'Outbound/SSRF -> Signing/Webhook -> Terminal Impact' : 'Outbound/SSRF -> Signing/Webhook Pivot',
-          terminal ? 'broken-access-control' : 'auth-identity',
-          hops,
-        )
-      }
-    }
-  }
-
-  // Pattern 2a: Info-Disclosure / Directory + Auth/Invite/Session (+ optional Privileged Mutation)
-  if (composites.length < maxComposites) {
-    const used = new Set<string>()
-    const leak = pickCandidate(c => c.roles.has('info_disclosure') && c.sinkKind !== 'auth_config', used)
-      ?? pickCandidate(c => c.roles.has('info_disclosure'), used)
-    if (leak) used.add(leak.fact.id)
-    const authPivot = pickCandidate(c => c.roles.has('auth_session') && c.sinkKind === 'auth_config', used, leak)
-      ?? pickCandidate(c => c.roles.has('auth_session'), used, leak)
-    if (leak && authPivot) {
-      used.add(authPivot.fact.id)
-      const terminal = pickCandidate(c => c.roles.has('privileged_mutation'), used, authPivot)
-      const hops = terminal ? [leak, authPivot, terminal] : [leak, authPivot]
-      const label = terminal
-        ? 'Disclosure -> Auth/Session -> Privileged Mutation'
-        : 'Disclosure -> Auth/Session Pivot'
-      recordComposite('disclosure_auth_mutation', label, 'broken-access-control', hops)
-    }
-  }
-
-  // Pattern 3: Cache/Permission + Async Export/Download (+ optional terminal readback/mutation)
-  if (composites.length < maxComposites) {
-    const used = new Set<string>()
-    const cachePrime = pickCandidate(c => c.roles.has('cache_permission'), used)
-    if (cachePrime) {
-      used.add(cachePrime.fact.id)
-      const asyncStage = pickCandidate(c => c.roles.has('async_worker'), used, cachePrime)
-      if (asyncStage) {
-        used.add(asyncStage.fact.id)
-        const terminal = pickCandidate(
-          c => (c.roles.has('privileged_mutation') || c.roles.has('info_disclosure')) && c.fact.id !== asyncStage.fact.id,
-          used,
-          asyncStage,
-        )
-        const hops = terminal ? [cachePrime, asyncStage, terminal] : [cachePrime, asyncStage]
-        recordComposite(
-          'cache_permission_async_export',
-          terminal
-            ? 'Cache/Permission -> Async Export/Download -> Terminal Readback'
-            : 'Cache/Permission -> Async Export/Download Pivot',
-          'broken-access-control',
-          hops,
-        )
-      }
-    }
-  }
-
-  // Pattern 4: Request-Parsing + Concurrent Settlement (+ optional terminal conservation/mutation)
-  if (composites.length < maxComposites) {
-    const used = new Set<string>()
-    const parserStage = pickCandidate(c => c.roles.has('request_parsing'), used)
-    if (parserStage) {
-      used.add(parserStage.fact.id)
-      const concurrentStage = pickCandidate(c => c.roles.has('concurrent_settlement'), used, parserStage)
-      if (concurrentStage) {
-        used.add(concurrentStage.fact.id)
-        const terminal = pickCandidate(
-          c => (c.roles.has('privileged_mutation') || c.roles.has('async_worker')) && c.fact.id !== concurrentStage.fact.id,
-          used,
-          concurrentStage,
-        )
-        const hops = terminal ? [parserStage, concurrentStage, terminal] : [parserStage, concurrentStage]
-        recordComposite(
-          'request_parsing_concurrent_settlement',
-          terminal
-            ? 'Request-Parsing -> Concurrent Settlement -> Terminal Conservation'
-            : 'Request-Parsing -> Concurrent Settlement Pivot',
-          'business-logic',
-          hops,
-        )
-      }
-    }
-  }
-
-  // Pattern 2b (2-hop fallback): Info-Disclosure or Auth/Session -> Privileged Mutation
-  if (composites.length < maxComposites) {
-    const used = new Set<string>()
-    const leak = pickCandidate(c => c.roles.has('info_disclosure') && c.sinkKind !== 'auth_config', used)
-      ?? pickCandidate(c => c.roles.has('info_disclosure'), used)
-    if (leak) used.add(leak.fact.id)
-    const authPivot = !leak
-      ? (pickCandidate(c => c.roles.has('auth_session') && c.sinkKind === 'auth_config', used)
-        ?? pickCandidate(c => c.roles.has('auth_session'), used))
-      : undefined
-    if (authPivot) used.add(authPivot.fact.id)
-    const terminal = pickCandidate(c => c.roles.has('privileged_mutation'), used, authPivot ?? leak)
-    const hops = [leak, authPivot, terminal].filter((h): h is NormalizedCodeAuditSuspect => Boolean(h))
-    const distinctScopes = new Set(hops.map(h => h.serviceScope)).size
-    const distinctSinks = new Set(hops.map(h => h.sinkKind)).size
-    const hasCrossBoundaryDiversity = Boolean(leak && terminal) || distinctScopes >= 2 || distinctSinks >= 2
-    if (hops.length >= 2 && hasCrossBoundaryDiversity) {
-      const label = leak && terminal
-        ? 'Disclosure -> Privileged Cross-Tenant Pivot'
-        : 'Auth/Session -> Privileged Mutation Pivot'
-      recordComposite('disclosure_or_auth_mutation', label, 'broken-access-control', hops)
-    }
-  }
-
-  // Pattern 5 (Fallback): General cross-service multi-sink pivot when >=2 distinct services & sinks coexist
-  if (composites.length < maxComposites) {
-    const distinctServices = new Set(candidates.map(c => c.serviceScope))
-    const distinctSinks = new Set(candidates.map(c => c.sinkKind))
-    if (distinctServices.size >= 2 && distinctSinks.size >= 2) {
-      const used = new Set<string>()
-      const first = pickCandidate(
-        c => c.roles.has('outbound_fetch') || c.roles.has('info_disclosure') || c.roles.has('async_worker'),
-        used,
-      ) ?? pickCandidate(() => true, used)
-      if (first) {
-        used.add(first.fact.id)
-        const second = pickCandidate(
-          c => c.serviceScope !== first.serviceScope && c.sinkKind !== first.sinkKind,
-          used,
-          first,
-        )
-        if (second) {
-          used.add(second.fact.id)
-          const third = pickCandidate(
-            c => c.roles.has('privileged_mutation') && c.serviceScope !== second.serviceScope,
-            used,
-            second,
-          )
-          const hops = third ? [first, second, third] : [first, second]
-          recordComposite(
-            'cross_service_multi_sink',
-            `Cross-Service ${first.sinkKind} -> ${second.sinkKind}${third ? ` -> ${third.sinkKind}` : ''} Pivot`,
-            'broken-access-control',
-            hops,
-          )
-        }
-      }
-    }
-  }
-
-  return composites
+/** Shared composite workflow hypothesis builder for white-box & grey-box causal composites. */
+function buildCompositeWorkflowHypothesis(input: {
+  hops: readonly { endpoint: string; loc: string; cue: string; roles: ReadonlySet<CompositeWorkflowRole> }[]
+  tags?: readonly string[]
+  siblingBlock?: string
+}): { hopSequence: string; hypothesis: string } {
+  const hopEntries = input.hops.map((h, idx) =>
+    `Hop ${idx + 1} / Stage ${idx + 1} (${h.endpoint}, ${h.loc}): ${h.cue}`,
+  )
+  const compRoles = new Set(input.hops.flatMap(h => [...h.roles]))
+  const helperHint = compRoles.has('concurrent_settlement')
+    ? 'ctx.prove_race_burst + ctx.seal_capability'
+    : compRoles.has('signing_webhook')
+      ? 'ctx.seal_capability + ctx.hmac_sign/ctx.jwt_sign'
+      : compRoles.has('async_worker') || compRoles.has('cache_permission')
+        ? 'ctx.seal_capability + ctx.await_async'
+        : 'ctx.seal_capability + ctx.hmac_sign/ctx.jwt_sign/ctx.await_async'
+  const intermediatePivotStage = input.hops.length === 2 ? [`Stage 3 (pivot via ${helperHint})`] : []
+  const terminalStage = 'Terminal Verification (denied control BEFORE Stage 1 -> final readback/state change -> ctx.prove_composite)'
+  const hopSequence = [...hopEntries, ...intermediatePivotStage, terminalStage].join(' -> ')
+  const stageCount = Math.min(5, Math.max(3, input.hops.length + (input.hops.length === 2 ? 2 : 1)))
+  const tagPrefix = [`[chain_hops=${stageCount}]`, '[lane=chain]', ...(input.tags ?? [])].join(' ')
+  const parts = [
+    `${tagPrefix} Composite workflow (${stageCount} stages): ${hopSequence}.`,
+    'Verify ALL stages in ONE kovo_verify script from ONE low-priv persona (never use a target-tenant persona on the probe arm): run clean denied control BEFORE Stage 1, seal via ctx.seal_capability, use ctx.hmac_sign/ctx.jwt_sign/ctx.await_async/ctx.prove_race_burst, and confirm via ctx.prove_composite (fresh_clean_replay) — never stop at an intermediate info-disclosure, job creation, cache prime, or token/link stub.',
+  ]
+  if (input.siblingBlock) parts.push(input.siblingBlock)
+  return { hopSequence, hypothesis: parts.join(' ') }
 }
 
 export function convertCodeAuditSuspectsToChainSteps(
@@ -3543,6 +3777,11 @@ export function convertCodeAuditSuspectsToChainSteps(
     })
 
     normalized.push({
+      id: fact.id,
+      origin: fact.origin,
+      endpoint: endpointHint || routeOrAction || compactSuspectCue(fact.summary, 36),
+      summary: fact.summary,
+      factId: fact.id,
       fact,
       asset,
       explicitSuspect,
@@ -3563,74 +3802,52 @@ export function convertCodeAuditSuspectsToChainSteps(
     })
   }
 
-  // 1. When promoting multi-hop Wave-1 chains, synthesize up to 2 composite multi-service steps
-  //    from complementary sink categories so Turn-1 workers execute end-to-end 3-5 hop chains.
+  // 1. Delegate multi-service composite synthesis + CapabilityLedger seeding to graph-coordinator.ts.
   if (promoteMultiHop && normalized.length >= 2 && maxSteps > 0) {
-    const compositeBudget = Math.min(MAX_SYNTHESIZED_CODE_AUDIT_COMPOSITE_STEPS, maxSteps)
-    const composites = synthesizeCompositeCodeAuditChains(normalized, compositeBudget)
+    const composites: PlannedCompositeWorkflow<NormalizedCodeAuditSuspect>[] = planCompositeWorkflows(normalized, {
+      maxComposites: Math.min(MAX_SYNTHESIZED_CODE_AUDIT_COMPOSITE_STEPS, maxSteps),
+      mode: 'whitebox',
+      ledger: storage.capabilityLedger(run.id),
+    })
     for (const comp of composites) {
-      if (created.length >= maxSteps) break
-      if (totalSteps >= hardChainStepsCeiling) break
-      if (existingTitles.has(comp.title.toLowerCase())) continue
+      if (created.length >= maxSteps || totalSteps >= hardChainStepsCeiling) break
+      const title = `${COMPOSITE_CODE_AUDIT_TITLE_PREFIX} ${comp.label} (${comp.hops[0]!.host})`
+      if (existingTitles.has(title.toLowerCase())) continue
 
       const hopFactIds = comp.hops.map(h => h.fact.id)
-      const hopIdSet = new Set(hopFactIds)
       const remainingSiblings = selectCrossServiceSiblingLeads(
         comp.hops[comp.hops.length - 1]!,
         normalized,
-        hopIdSet,
+        new Set(hopFactIds),
         Math.max(0, MAX_CODE_AUDIT_SIBLING_LEADS - Math.max(0, hopFactIds.length - 1)),
       )
-      const siblingBlock = formatCrossServiceSiblingLeadsBlock(remainingSiblings)
-      const hopEntries = comp.hops.map((h, idx) => {
-        const target = h.endpointHint || h.routeOrAction || compactSuspectCue(h.fact.summary, 36)
-        const loc = h.fileLoc || h.host
-        return `Hop ${idx + 1} / Stage ${idx + 1} (${target}, ${loc}): ${compactSuspectCue(h.hypothesisBody, 48)}`
+      const { hopSequence, hypothesis } = buildCompositeWorkflowHypothesis({
+        hops: comp.hops.map(h => ({
+          endpoint: h.endpoint,
+          loc: h.fileLoc || h.host,
+          cue: compactSuspectCue(h.hypothesisBody, 48),
+          roles: h.roles,
+        })),
+        siblingBlock: formatCrossServiceSiblingLeadsBlock(remainingSiblings),
       })
-      const compRoles = new Set(comp.hops.flatMap(h => [...h.roles]))
-      const helperHint = compRoles.has('concurrent_settlement')
-        ? 'ctx.prove_race_burst + ctx.seal_capability'
-        : compRoles.has('signing_webhook')
-          ? 'ctx.seal_capability + ctx.hmac_sign/ctx.jwt_sign'
-          : compRoles.has('async_worker') || compRoles.has('cache_permission')
-            ? 'ctx.seal_capability + ctx.await_async'
-            : 'ctx.seal_capability + ctx.hmac_sign/ctx.jwt_sign/ctx.await_async'
-      const intermediatePivotStage = comp.hops.length === 2
-        ? [`Stage 3 (pivot via ${helperHint})`]
-        : []
-      const terminalStage = 'Terminal Verification (denied control BEFORE Stage 1 -> final readback/state change -> ctx.prove_composite)'
-      const hopSequence = [...hopEntries, ...intermediatePivotStage, terminalStage].join(' -> ')
-      const stageCount = Math.min(5, Math.max(3, comp.hops.length + (comp.hops.length === 2 ? 2 : 1)))
       const dependsOnFactIds = [
         ...new Set([...hopFactIds, ...remainingSiblings.map(s => s.fact.id)]),
       ].slice(0, MAX_CODE_AUDIT_SIBLING_LEADS + 1)
       const sourceOrigins = [...new Set(comp.hops.map(h => h.fact.origin))]
       const targetAssetIds = [...new Set(comp.hops.map(h => h.asset.id))]
-      const skills = [
-        ...new Set([
-          'source-first-audit',
-          'multihop-chains',
-          'chain-primitives',
-          ...comp.hops.flatMap(h => h.mappedSkills),
-        ]),
-      ]
+      const skills = [...new Set(['source-first-audit', 'multihop-chains', 'chain-primitives', ...comp.hops.flatMap(h => h.mappedSkills)])]
       const specialistProfile = routeStepToSpecialist({
-        title: comp.title,
+        title,
         hypothesis: hopSequence,
         category: comp.category,
         skills,
         endpoint: comp.hops[0]!.endpointHint,
         sinkKind: comp.hops[0]!.sinkKind,
       })
-      const hypothesisParts = [
-        `[chain_hops=${stageCount}] Composite workflow (${stageCount} stages): ${hopSequence}.`,
-        'Verify ALL stages in ONE kovo_verify script from ONE low-priv persona (never use a target-tenant persona on the probe arm): run clean denied control BEFORE Stage 1, seal via ctx.seal_capability, use ctx.hmac_sign/ctx.jwt_sign/ctx.await_async/ctx.prove_race_burst, and confirm via ctx.prove_composite (fresh_clean_replay) — never stop at an intermediate info-disclosure, job creation, cache prime, or token/link stub.',
-      ]
-      if (siblingBlock) hypothesisParts.push(siblingBlock)
 
       const step = storage.addChainStep(run, {
-        title: comp.title,
-        hypothesis: hypothesisParts.join(' '),
+        title,
+        hypothesis,
         category: comp.category,
         priority: comp.priority,
         targetAssetIds,
@@ -3639,7 +3856,7 @@ export function convertCodeAuditSuspectsToChainSteps(
         sourceOrigins,
         specialistProfile,
       })
-      existingTitles.add(comp.title.toLowerCase())
+      existingTitles.add(title.toLowerCase())
       created.push(step)
       totalSteps += 1
     }
@@ -3730,20 +3947,12 @@ export interface SynthesizeRuntimeCompositeWave1Options {
   maxSteps?: number
 }
 
-interface NormalizedRuntimeHopCandidate {
+interface NormalizedRuntimeHopCandidate extends CompositeWorkflowNode {
   key: string
-  origin: string
   host: string
   asset: Run['candidates'][number]
-  serviceScope: string
-  endpoint: string
-  sinkKind: string
   cue: string
   mappedSkills: string[]
-  roles: ReadonlySet<CodeAuditChainRole>
-  factId?: string
-  resourceKey?: string
-  isApiDep?: boolean
   isCrown: boolean
   priorityScore: number
 }
@@ -3815,6 +4024,7 @@ export function synthesizeRuntimeCompositeWave1Steps(
     const mapped = sinkCategoryAndSkills(sinkKind)
     const isCrown = (options.hostTiers?.[input.origin] ?? classifyHostTier(input.origin)) === 'crown_jewel'
     candidates.push({
+      id: key,
       key,
       origin: input.origin,
       host,
@@ -3822,6 +4032,7 @@ export function synthesizeRuntimeCompositeWave1Steps(
       serviceScope: inferServiceScopeFromSuspect('', endpoint, input.origin),
       endpoint,
       sinkKind,
+      summary: compactSuspectCue(input.cue, 76),
       cue: compactSuspectCue(input.cue, 76),
       mappedSkills: mapped.skills,
       roles,
@@ -3975,138 +4186,12 @@ export function synthesizeRuntimeCompositeWave1Steps(
 
   if (candidates.length < 2) return []
 
-  const composites: Array<{ label: string; category: string; hops: NormalizedRuntimeHopCandidate[]; resourceKey?: string; priority: number }> = []
-  const usedInPrior = new Set<string>()
-  const emittedKeySets: ReadonlySet<string>[] = []
-
-  const pick = (
-    predicate: (c: NormalizedRuntimeHopCandidate) => boolean,
-    exclude: ReadonlySet<string>,
-    anchor?: NormalizedRuntimeHopCandidate,
-  ): NormalizedRuntimeHopCandidate | undefined => {
-    const scored = candidates
-      .filter(c => !exclude.has(c.key) && predicate(c))
-      .map((c, idx) => {
-        let score = c.priorityScore
-        if (!usedInPrior.has(c.key)) score += 20
-        if (anchor && c.origin !== anchor.origin) score += 28
-        if (anchor && c.serviceScope !== anchor.serviceScope) score += 10
-        if (anchor && c.sinkKind !== anchor.sinkKind) score += 8
-        return { c, score, idx }
-      })
-      .sort((a, b) => (b.score - a.score) || (a.idx - b.idx))
-    return scored[0]?.c
-  }
-
-  const recordRuntimeComposite = (
-    label: string,
-    category: string,
-    hops: NormalizedRuntimeHopCandidate[],
-    resourceKey?: string,
-  ): void => {
-    if (composites.length >= maxSteps || hops.length < 2) return
-    const keySet = new Set(hops.map(h => h.key))
-    if (emittedKeySets.some(prev => [...keySet].every(k => prev.has(k)))) return
-    emittedKeySets.push(keySet)
-    for (const h of hops) usedInPrior.add(h.key)
-    composites.push({
-      label,
-      category,
-      hops,
-      ...(resourceKey ? { resourceKey } : {}),
-      priority: Math.max(96, 98 - composites.length),
-    })
-  }
-
-  // Pattern A: Outbound/SSRF/Proxy -> Signing/Webhook -> Privileged Mutation / Auth Session
-  {
-    const used = new Set<string>()
-    const entry = pick(c => c.roles.has('outbound_fetch'), used)
-    if (entry) {
-      used.add(entry.key)
-      const pivot = pick(c => c.roles.has('signing_webhook'), used, entry)
-      if (pivot) {
-        used.add(pivot.key)
-        const terminal = pick(c => c.roles.has('privileged_mutation') || c.roles.has('auth_session'), used, pivot)
-        const hops = terminal ? [entry, pivot, terminal] : [entry, pivot]
-        recordRuntimeComposite(
-          terminal ? 'Outbound/SSRF -> Signing/Webhook -> Terminal Impact' : 'Outbound/SSRF -> Signing/Webhook Pivot',
-          terminal ? 'broken-access-control' : 'auth-identity',
-          hops,
-        )
-      }
-    }
-  }
-
-  // Pattern B: Disclosure / Producer -> Auth/Session/IdP -> Privileged Mutation
-  if (composites.length < maxSteps) {
-    const used = new Set<string>()
-    const entry = pick(c => c.roles.has('info_disclosure') && c.sinkKind !== 'auth_config', used)
-      ?? pick(c => c.roles.has('info_disclosure') || Boolean(c.isApiDep), used)
-    if (entry) {
-      used.add(entry.key)
-      const authPivot = pick(c => c.roles.has('auth_session'), used, entry)
-      if (authPivot) {
-        used.add(authPivot.key)
-        const terminal = pick(c => c.roles.has('privileged_mutation') || c.roles.has('async_worker'), used, authPivot)
-        const hops = terminal ? [entry, authPivot, terminal] : [entry, authPivot]
-        recordRuntimeComposite(
-          terminal ? 'Disclosure -> Auth/Session -> Privileged Mutation' : 'Disclosure -> Auth/Session Pivot',
-          'broken-access-control',
-          hops,
-        )
-      }
-    }
-  }
-
-  // Pattern C: Cache/Permission or API Dependency Producer -> Async Export / Privileged Mutation
-  if (composites.length < maxSteps && depPairs.length > 0) {
-    const rankedDep = [...depPairs].sort((a, b) =>
-      Number(b.prod.origin !== b.cons.origin) - Number(a.prod.origin !== a.cons.origin)
-      || (b.prod.priorityScore + b.cons.priorityScore) - (a.prod.priorityScore + a.cons.priorityScore),
-    )[0]!
-    const used = new Set<string>([rankedDep.prod.key, rankedDep.cons.key])
-    const terminal = pick(
-      c => (c.origin !== rankedDep.cons.origin || c.roles.has('privileged_mutation') || c.roles.has('async_worker')),
-      used,
-      rankedDep.cons,
-    )
-    const hops = terminal ? [rankedDep.prod, rankedDep.cons, terminal] : [rankedDep.prod, rankedDep.cons]
-    recordRuntimeComposite(
-      `Producer -> Consumer (${rankedDep.resourceKey})${terminal ? ' -> Cross-Boundary Pivot' : ''}`,
-      'broken-access-control',
-      hops,
-      rankedDep.resourceKey,
-    )
-  }
-
-  // Pattern D (Cross-origin runtime fallback): >= 2 distinct approved origins with complementary roles/surfaces
-  if (composites.length < maxSteps) {
-    const distinctOrigins = [...new Set(candidates.map(c => c.origin))]
-    if (distinctOrigins.length >= 2) {
-      const used = new Set<string>()
-      const first = pick(
-        c => c.roles.has('auth_session') || c.roles.has('info_disclosure') || c.roles.has('outbound_fetch') || c.roles.size > 0,
-        used,
-      ) ?? pick(() => true, used)
-      if (first) {
-        used.add(first.key)
-        const second = pick(c => c.origin !== first.origin && (c.roles.size > 0 || c.sinkKind !== first.sinkKind), used, first)
-          ?? pick(c => c.origin !== first.origin, used, first)
-        if (second) {
-          used.add(second.key)
-          const third = pick(c => c.origin !== first.origin && c.origin !== second.origin, used, second)
-            ?? pick(c => c.roles.has('privileged_mutation') || c.roles.has('async_worker'), used, second)
-          const hops = third ? [first, second, third] : [first, second]
-          recordRuntimeComposite(
-            `Cross-Origin ${first.sinkKind} -> ${second.sinkKind}${third ? ` -> ${third.sinkKind}` : ''} Workflow`,
-            'broken-access-control',
-            hops,
-          )
-        }
-      }
-    }
-  }
+  const composites = planCompositeWorkflows(candidates, {
+    maxComposites: maxSteps,
+    mode: 'runtime',
+    depPairs,
+    ledger: storage.capabilityLedger(run.id),
+  })
 
   const created: ChainStep[] = []
   for (const comp of composites) {
@@ -4119,32 +4204,20 @@ export function synthesizeRuntimeCompositeWave1Steps(
     const title = `${COMPOSITE_RUNTIME_TITLE_PREFIX} ${comp.label} (${hostSuffix})`.slice(0, 180)
     if (existingTitles.has(title.toLowerCase())) continue
 
-    const hopEntries = comp.hops.map((h, idx) =>
-      `Hop ${idx + 1} / Stage ${idx + 1} (${h.endpoint}, ${h.origin}): ${compactSuspectCue(h.cue, 54)}`,
-    )
-    const compRoles = new Set(comp.hops.flatMap(h => [...h.roles]))
-    const helperHint = compRoles.has('concurrent_settlement')
-      ? 'ctx.prove_race_burst + ctx.seal_capability'
-      : compRoles.has('signing_webhook')
-        ? 'ctx.seal_capability + ctx.hmac_sign/ctx.jwt_sign'
-        : compRoles.has('async_worker') || compRoles.has('cache_permission')
-          ? 'ctx.seal_capability + ctx.await_async'
-          : 'ctx.seal_capability + ctx.hmac_sign/ctx.jwt_sign/ctx.await_async'
-    const intermediatePivotStage = comp.hops.length === 2
-      ? [`Stage 3 (pivot via ${helperHint})`]
-      : []
-    const terminalStage = 'Terminal Verification (denied control BEFORE Stage 1 -> final readback/state change -> ctx.prove_composite)'
-    const hopSequence = [...hopEntries, ...intermediatePivotStage, terminalStage].join(' -> ')
-    const stageCount = Math.min(5, Math.max(3, comp.hops.length + (comp.hops.length === 2 ? 2 : 1)))
     const isCrossOrigin = sourceOrigins.length >= 2
     const hasDep = Boolean(comp.resourceKey || comp.hops.some(h => h.isApiDep))
-    const tags: string[] = [`[chain_hops=${stageCount}]`, '[lane=chain]']
-    if (comp.resourceKey) tags.push(`api_dependency:${comp.resourceKey}`)
-    if (isCrossOrigin) tags.push(`cross_origin_edge:${sourceOrigins[0]}->${sourceOrigins[1]}`)
-    const hypothesis = [
-      `${tags.join(' ')} Composite workflow (${stageCount} stages): ${hopSequence}.`,
-      'Verify ALL stages in ONE kovo_verify script from ONE low-priv persona (never use a target-tenant persona on the probe arm): run clean denied control BEFORE Stage 1, seal via ctx.seal_capability, use ctx.hmac_sign/ctx.jwt_sign/ctx.await_async/ctx.prove_race_burst, and confirm via ctx.prove_composite (fresh_clean_replay) — never stop at an intermediate info-disclosure, job creation, cache prime, or token/link stub.',
-    ].join(' ')
+    const extraTags: string[] = []
+    if (comp.resourceKey) extraTags.push(`api_dependency:${comp.resourceKey}`)
+    if (isCrossOrigin) extraTags.push(`cross_origin_edge:${sourceOrigins[0]}->${sourceOrigins[1]}`)
+    const { hopSequence, hypothesis } = buildCompositeWorkflowHypothesis({
+      hops: comp.hops.map(h => ({
+        endpoint: h.endpoint,
+        loc: h.origin,
+        cue: compactSuspectCue(h.cue, 54),
+        roles: h.roles,
+      })),
+      tags: extraTags,
+    })
 
     const skills = [
       ...new Set([
@@ -4375,4 +4448,369 @@ const DET_LEAD_SKILL_MAP: Record<string, string> = {
 export function detLeadSkills(probeClass: string): string[] {
   const primary = DET_LEAD_SKILL_MAP[probeClass]
   return primary ? [primary, 'false-positive-elimination'] : ['false-positive-elimination']
+}
+
+// ============================================================================
+// Unified per-run orchestration state (Move O5: replaces 40+ parallel Maps/Sets)
+// ============================================================================
+
+export interface RunPlannerErrorState {
+  goalRevision: number
+  consecutiveErrors: number
+  backoffUntil: number
+  breakerTripped: boolean
+}
+
+export interface RunAgenticLaneJob {
+  controller: AbortController
+  promise: Promise<void>
+  key: string
+  assignmentId: string
+  allowThreatModelPhase?: boolean
+}
+
+export interface RunProofObligationCounts {
+  probedRoutes: number
+  coveredRoutes: number
+  gapRoutes: number
+  demandedRoutes: number
+  dischargedByGap: number
+}
+
+export interface RunGapValidationCounts {
+  accepted: number
+  rejected: number
+  byCode: Record<string, { accepted: number; rejected: number }>
+}
+
+export interface RunOobDrainSummary {
+  oobDrainMs: number
+  promotedLate: number
+  remaining: number
+}
+
+/**
+ * Single cohesive per-run orchestration record (Move O5) consolidating planner, lane, auth, lab,
+ * telemetry, staging, and frontier bookkeeping so run disposal reclaims every field atomically.
+ */
+export interface RunOrchestrationState {
+  readonly runId: string
+  // Coordinator & planner lifecycle
+  coordinatorTask?: ExecCoordinatorTask
+  threatModelingTask?: ExecCoordinatorTask
+  plannerTask?: ExecCoordinatorTask
+  plannerTimerCancel?: () => void
+  plannerDirty: boolean
+  plannerDoneRound?: number
+  plannerErrorState?: RunPlannerErrorState
+  dryStreakObserved?: number
+  dispatchFunnel?: DispatchFunnelCounts
+  strandedReadyEvents?: number
+  reinvestigationGuard?: ReinvestigationGuard
+  plannerEmptyRounds?: number
+  plannerDryRounds?: number
+  plannerCompletedAtLastRound?: number
+  plannerEvidenceFrontier?: { confirmed: number; primitives: number }
+  frontierController?: FrontierWaveController
+  frontierDispatcher?: FrontierDispatcher
+  invariantsSeeded: boolean
+  wave1InvariantChainsPromoted: boolean
+  seededHypothesisIds?: Set<string>
+  runtimeSynthesisWatermark?: string
+  postFloorInvariantsSynced: boolean
+  runtimeCompositeSeeded: boolean
+  plannerSeenCausalEdges?: Set<string>
+  stepIds?: Set<string>
+  runLifecycleUnsub?: () => void
+  // Auth / lab / floor / vault / trace
+  recordedPersonaResources?: Set<string>
+  runAuthStarted?: string
+  runAuthInFlight?: AbortController
+  startedLabRun: boolean
+  startedLabHandle?: LabTargetHandle
+  agenticLaneJob?: RunAgenticLaneJob
+  agenticLaneStopping: boolean
+  verificationDraining: boolean
+  laneStartedAt?: number
+  laneWallMs?: number
+  agenticFloorDispatchedAt?: number
+  agenticFloorStartedAt?: number
+  agenticFloorFinishedAt?: number
+  phaseBController?: PhaseBConcurrencyController
+  runTrace?: AgentTrace
+  capabilityVault?: DerivedCapabilityVault
+  detLeadConsumedIds?: Set<string>
+  // Phase-B throughput & stall telemetry
+  assignmentWalls?: number[]
+  completedAssignmentWalls?: number[]
+  turnLatencies?: number[]
+  earlyExitTurnsSaved?: number
+  proofObligation?: RunProofObligationCounts
+  gapValidation?: RunGapValidationCounts
+  providerStallTurns?: number
+  providerStallRetries?: number
+  providerStallTimeouts?: number
+  providerStallWallSaved?: number
+  wallClockRotations?: number
+  warmSecretEpoch?: string
+  warmPoolPolicyRotations?: number
+  // Staging isolation
+  stagingTaggedMutations?: number
+  stagingUntaggedSkipped?: number
+  stagingCleaned?: number
+  stagingCreatedEntities?: Set<string>
+  stagingGrant?: Grant
+  // Sub-keyed run-scoped sets/maps (reclaimed in O(1) on disposeRun)
+  prePhase0SeededSteps: Map<string, boolean>
+  programGraphLeadsSeeded: Set<string>
+  circuitNotified: Set<string>
+  deterministicInFlight: Set<string>
+  deterministicCompleted: Set<string>
+  agenticLaneCompleted: Set<string>
+  emittedSealedHandleSets: Map<string, Set<string>>
+  detLeadStepKeys: Set<string>
+  detLeadGateRejected: Set<string>
+  cappedLeadReported: Set<string>
+  tierAStepKeys: Set<string>
+}
+
+export function createRunOrchestrationState(runId: string): RunOrchestrationState {
+  return {
+    runId,
+    plannerDirty: false,
+    invariantsSeeded: false,
+    wave1InvariantChainsPromoted: false,
+    postFloorInvariantsSynced: false,
+    runtimeCompositeSeeded: false,
+    startedLabRun: false,
+    agenticLaneStopping: false,
+    verificationDraining: false,
+    prePhase0SeededSteps: new Map(),
+    programGraphLeadsSeeded: new Set(),
+    circuitNotified: new Set(),
+    deterministicInFlight: new Set(),
+    deterministicCompleted: new Set(),
+    agenticLaneCompleted: new Set(),
+    emittedSealedHandleSets: new Map(),
+    detLeadStepKeys: new Set(),
+    detLeadGateRejected: new Set(),
+    cappedLeadReported: new Set(),
+    tierAStepKeys: new Set(),
+  }
+}
+
+type RunBooleanField = NonNullable<{
+  [K in keyof RunOrchestrationState]-?: RunOrchestrationState[K] extends boolean ? K : never
+}[keyof RunOrchestrationState]>
+
+type RunOptionalField = NonNullable<{
+  [K in keyof RunOrchestrationState]-?: undefined extends RunOrchestrationState[K] ? K : never
+}[keyof RunOrchestrationState]>
+
+type RunSubMapField<V> = NonNullable<{
+  [K in keyof RunOrchestrationState]-?: RunOrchestrationState[K] extends Map<string, V> ? K : never
+}[keyof RunOrchestrationState]>
+
+type RunSubSetField = NonNullable<{
+  [K in keyof RunOrchestrationState]-?: RunOrchestrationState[K] extends Set<string> ? K : never
+}[keyof RunOrchestrationState]>
+
+function extractPrefixedRunId(key: string, delimiter: ':' | '\0'): string {
+  const idx = key.indexOf(delimiter)
+  return idx > 0 ? key.slice(0, idx) : key
+}
+
+export interface DisposeRunStateHooks {
+  onStepIds?: (stepIds: ReadonlySet<string>) => void
+  onDetLeadConsumedIds?: (factIds: ReadonlySet<string>) => void
+}
+
+function makeBackedMap<V>(ops: {
+  entries: () => Generator<[string, V], void, unknown>
+  get: (key: string) => V | undefined
+  has: (key: string) => boolean
+  set: (key: string, value: V) => void
+  delete: (key: string) => boolean
+  clear: () => void
+  size: () => number
+}): Map<string, V> {
+  const entries = () => ops.entries() as unknown as MapIterator<[string, V]>
+  const view: Map<string, V> = {
+    get size() { return ops.size() },
+    get: ops.get,
+    has: ops.has,
+    set(key, value) { ops.set(key, value); return view },
+    delete: ops.delete,
+    clear: ops.clear,
+    forEach(cb, thisArg) { for (const [k, v] of ops.entries()) cb.call(thisArg, v, k, view) },
+    entries,
+    *keys(): MapIterator<string> { for (const [k] of ops.entries()) yield k },
+    *values(): MapIterator<V> { for (const [, v] of ops.entries()) yield v },
+    [Symbol.iterator]: entries,
+    [Symbol.toStringTag]: 'Map',
+  }
+  return view
+}
+
+function makeBackedSet(ops: {
+  values: () => Generator<string, void, unknown>
+  has: (key: string) => boolean
+  add: (key: string) => void
+  delete: (key: string) => boolean
+  clear: () => void
+  size: () => number
+}): Set<string> {
+  const values = () => ops.values() as unknown as SetIterator<string>
+  const view = {
+    get size() { return ops.size() },
+    has: ops.has,
+    add(key: string) { ops.add(key); return view },
+    delete: ops.delete,
+    clear: ops.clear,
+    forEach(cb: (v: string, v2: string, s: Set<string>) => void, thisArg?: unknown) {
+      for (const v of ops.values()) cb.call(thisArg, v, v, view as unknown as Set<string>)
+    },
+    *entries(): SetIterator<[string, string]> { for (const v of ops.values()) yield [v, v] },
+    keys: values,
+    values,
+    [Symbol.iterator]: values,
+    [Symbol.toStringTag]: 'Set',
+  } as unknown as Set<string>
+  return view
+}
+
+/**
+ * Cohesive per-run state store backing `Execution` and `ExecReconPlanner`.
+ * Exposes live `Map`/`Set` projection views for legacy external adapters while guaranteeing that
+ * a single `disposeRun(runId)` call cancels timers/controllers and reclaims every field atomically.
+ */
+export class RunOrchestrationStateStore {
+  private readonly byRun = new Map<string, RunOrchestrationState>()
+
+  get size(): number { return this.byRun.size }
+  has(runId: string): boolean { return this.byRun.has(runId) }
+  get(runId: string): RunOrchestrationState | undefined { return this.byRun.get(runId) }
+  runIds(): string[] { return [...this.byRun.keys()] }
+
+  ensure(runId: string): RunOrchestrationState {
+    let state = this.byRun.get(runId)
+    if (!state) {
+      state = createRunOrchestrationState(runId)
+      this.byRun.set(runId, state)
+    }
+    return state
+  }
+
+  /** Single-call atomic cleanup of all per-run orchestration state, timers, and abort controllers. */
+  disposeRun(runId: string, hooks?: DisposeRunStateHooks): boolean {
+    const state = this.byRun.get(runId)
+    if (!state) return false
+    try { state.plannerTimerCancel?.() } catch { /* ignore */ }
+    try { state.runAuthInFlight?.abort() } catch { /* ignore */ }
+    try { state.agenticLaneJob?.controller.abort(new Error('run disposed')) } catch { /* ignore */ }
+    try { state.runLifecycleUnsub?.() } catch { /* ignore */ }
+    if (state.stepIds && hooks?.onStepIds) hooks.onStepIds(state.stepIds)
+    if (state.detLeadConsumedIds && hooks?.onDetLeadConsumedIds) hooks.onDetLeadConsumedIds(state.detLeadConsumedIds)
+    state.frontierDispatcher?.clearStepMeta()
+    this.byRun.delete(runId)
+    return true
+  }
+
+  clear(hooks?: DisposeRunStateHooks): void {
+    for (const runId of [...this.byRun.keys()]) this.disposeRun(runId, hooks)
+  }
+
+  /** Live `Map<runId, V>` projection over an optional field of `RunOrchestrationState`. */
+  mapView<K extends RunOptionalField>(field: K): Map<string, NonNullable<RunOrchestrationState[K]>> {
+    type V = NonNullable<RunOrchestrationState[K]>
+    const byRun = this.byRun
+    return makeBackedMap<V>({
+      *entries() {
+        for (const [runId, state] of byRun.entries()) {
+          const val = state[field]
+          if (val !== undefined) yield [runId, val as V]
+        }
+      },
+      size() {
+        let n = 0
+        for (const state of byRun.values()) if (state[field] !== undefined) n += 1
+        return n
+      },
+      get: runId => byRun.get(runId)?.[field] as V | undefined,
+      has: runId => byRun.get(runId)?.[field] !== undefined,
+      set: (runId, value) => { (this.ensure(runId) as unknown as Record<string, unknown>)[field] = value },
+      delete: runId => {
+        const state = byRun.get(runId)
+        if (!state || state[field] === undefined) return false
+        ;(state as unknown as Record<string, unknown>)[field] = undefined
+        return true
+      },
+      clear: () => {
+        for (const state of byRun.values()) (state as unknown as Record<string, unknown>)[field] = undefined
+      },
+    })
+  }
+
+  /** Live `Set<runId>` projection over a boolean flag of `RunOrchestrationState`. */
+  setView(field: RunBooleanField): Set<string> {
+    const byRun = this.byRun
+    return makeBackedSet({
+      *values() { for (const [runId, state] of byRun.entries()) if (state[field]) yield runId },
+      size() {
+        let n = 0
+        for (const state of byRun.values()) if (state[field]) n += 1
+        return n
+      },
+      has: runId => Boolean(byRun.get(runId)?.[field]),
+      add: runId => { this.ensure(runId)[field] = true },
+      delete: runId => {
+        const state = byRun.get(runId)
+        if (!state || !state[field]) return false
+        state[field] = false
+        return true
+      },
+      clear: () => { for (const state of byRun.values()) state[field] = false },
+    })
+  }
+
+  /** Live `Map<prefixedKey, V>` projection where keys carry `${runId}${delimiter}...`. */
+  prefixedMapView<V, K extends RunSubMapField<V>>(field: K, delimiter: ':' | '\0'): Map<string, V> {
+    const byRun = this.byRun
+    const sub = (key: string) => byRun.get(extractPrefixedRunId(key, delimiter))?.[field] as Map<string, V> | undefined
+    return makeBackedMap<V>({
+      *entries() {
+        for (const state of byRun.values()) yield* (state[field] as Map<string, V>).entries()
+      },
+      size() {
+        let n = 0
+        for (const state of byRun.values()) n += (state[field] as Map<string, V>).size
+        return n
+      },
+      get: key => sub(key)?.get(key),
+      has: key => Boolean(sub(key)?.has(key)),
+      set: (key, value) => { (this.ensure(extractPrefixedRunId(key, delimiter))[field] as Map<string, V>).set(key, value) },
+      delete: key => Boolean(sub(key)?.delete(key)),
+      clear: () => { for (const state of byRun.values()) (state[field] as Map<string, V>).clear() },
+    })
+  }
+
+  /** Live `Set<prefixedKey>` projection where keys carry `${runId}${delimiter}...`. */
+  prefixedSetView(field: RunSubSetField, delimiter: ':' | '\0'): Set<string> {
+    const byRun = this.byRun
+    const sub = (key: string) => byRun.get(extractPrefixedRunId(key, delimiter))?.[field] as Set<string> | undefined
+    return makeBackedSet({
+      *values() {
+        for (const state of byRun.values()) yield* (state[field] as Set<string>).values()
+      },
+      size() {
+        let n = 0
+        for (const state of byRun.values()) n += (state[field] as Set<string>).size
+        return n
+      },
+      has: key => Boolean(sub(key)?.has(key)),
+      add: key => { (this.ensure(extractPrefixedRunId(key, delimiter))[field] as Set<string>).add(key) },
+      delete: key => Boolean(sub(key)?.delete(key)),
+      clear: () => { for (const state of byRun.values()) (state[field] as Set<string>).clear() },
+    })
+  }
 }

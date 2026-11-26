@@ -14,6 +14,7 @@
 import {
   ALWAYS_QUARANTINED_KINDS,
   CapabilityLedger,
+  computeArtifactDigest,
   type CapabilityKind,
   type CapabilityNode,
   type CapabilitySurface,
@@ -870,6 +871,34 @@ export function deriveChainPrimitives(input: DeriveChainPrimitivesInput): ChainP
       const handle = str(data.workflowHandle) ?? str(data.stateHandle) ?? resourceId ?? endpoint ?? fact.id
       out.push({ ...base, kind: 'workflow_state_handle', value: `workflow:${truncate(handle, 64)}`, detail: `Workflow state handle ${truncate(handle, 48)}${str(data.stateAfter) ? ` (state=${str(data.stateAfter)})` : ''}${endpoint ? ` at ${endpoint}` : ''}.` })
     }
+    if (fact.kind === 'code_audit_suspect' || subkind === 'code_audit_suspect') {
+      const routeOrAction = str(data.routeOrAction) ?? endpoint
+      const parsedRoute = parseRouteTarget(routeOrAction)
+      const suspectEndpoint = parsedRoute.endpoint ?? endpoint
+      const suspectMethod = parsedRoute.method ?? method
+      const sinkKind = (str(data.sinkKind) ?? '').toLowerCase()
+      const suspectText = `${sinkKind} ${fact.summary} ${str(data.hypothesis) ?? ''} ${routeOrAction ?? ''}`.toLowerCase()
+      const suspectKind: ChainPrimitiveKind =
+        sinkKind === 'outbound_fetch' || sinkKind === 'redirect' || /\b(?:ssrf|outbound[- ]?fetch|redirect|proxy|render)\b/.test(suspectText)
+          ? 'ssrf_internal_reach'
+          : sinkKind === 'webhook' || /\b(?:webhook|hmac|signing[- ]?(?:key|secret|salt)|jwt|jwks)\b/.test(suspectText)
+            ? 'leaked_token'
+            : sinkKind === 'auth_config' || /\b(?:invite|session|oauth|oidc|impersonat|role[- ]?grant|x-forwarded)\b/.test(suspectText)
+              ? 'role_transition'
+              : /\b(?:export|async|job|queue|settlement|approve|transfer|payout|cache|race|concurren)\b/.test(suspectText)
+                ? 'workflow_state_handle'
+                : /\b(?:admin|privileged|bfla|missing\s+authz?)\b/.test(suspectText)
+                  ? 'admin_route'
+                  : 'discovered_id'
+      out.push({
+        ...base,
+        ...(suspectEndpoint ? { endpoint: suspectEndpoint } : {}),
+        ...(suspectMethod ? { method: suspectMethod } : {}),
+        kind: suspectKind,
+        value: `suspect:${fact.id}`,
+        detail: truncate(`Code-audit suspect (${sinkKind || 'sink'}${suspectEndpoint ? ` ${suspectEndpoint}` : ''}): ${fact.summary}`, 160),
+      })
+    }
   }
 
   for (const finding of input.findings ?? []) {
@@ -1704,6 +1733,363 @@ function resolveDependencySide(
     ...(matched?.id ? { endpointId: matched.id } : {}),
     ...(matched?.sinkKinds ? { sinkKinds: matched.sinkKinds } : {}),
   }
+}
+
+// ---------------------------------------------------------------------------
+// Unified Causal Composite Planner (shared by white-box suspects & grey-box runtime nodes)
+// ---------------------------------------------------------------------------
+
+export type CompositeWorkflowRole =
+  | 'outbound_fetch'
+  | 'signing_webhook'
+  | 'info_disclosure'
+  | 'auth_session'
+  | 'privileged_mutation'
+  | 'async_worker'
+  | 'cache_permission'
+  | 'request_parsing'
+  | 'concurrent_settlement'
+
+export interface CompositeWorkflowNode {
+  id: string
+  origin: string
+  serviceScope: string
+  endpoint: string
+  sinkKind: string
+  summary: string
+  roles: ReadonlySet<CompositeWorkflowRole>
+  fileLoc?: string
+  factId?: string
+  resourceKey?: string
+  explicitSuspect?: boolean
+  isApiDep?: boolean
+  priorityScore?: number
+}
+
+export interface PlannedCompositeWorkflow<T extends CompositeWorkflowNode = CompositeWorkflowNode> {
+  key: string
+  label: string
+  category: string
+  hops: T[]
+  resourceKey?: string
+  priority: number
+}
+
+interface CompositeWorkflowRule<T extends CompositeWorkflowNode> {
+  key: string
+  entry: (c: T) => boolean
+  entryFallback?: (c: T) => boolean
+  pivot: (c: T) => boolean
+  pivotFallback?: (c: T) => boolean
+  terminal?: (c: T, pivot: T) => boolean
+  terminalFallback?: (c: T, pivot: T) => boolean
+  label: (hasTerminal: boolean) => string
+  category: (hasTerminal: boolean) => string
+  requireDiversity?: boolean
+}
+
+function compositeRoleToCapabilityKind(roles: ReadonlySet<CompositeWorkflowRole>): CapabilityKind {
+  if (roles.has('outbound_fetch')) return 'internal_reach_handle'
+  if (roles.has('signing_webhook')) return 'signing_material'
+  if (roles.has('auth_session')) return 'identity_session'
+  if (roles.has('cache_permission') || roles.has('request_parsing')) return 'parser_or_cache_primitive'
+  if (roles.has('async_worker') || roles.has('privileged_mutation')) return 'write_sink_handle'
+  return 'state_handle'
+}
+
+function compositeRoleToSurface(roles: ReadonlySet<CompositeWorkflowRole>, endpoint: string): CapabilitySurface {
+  if (roles.has('signing_webhook')) return 'webhook'
+  if (roles.has('async_worker')) return 'async_job'
+  if (roles.has('cache_permission')) return 'cdn'
+  return inferSurfaceFromEndpoint(endpoint, 'discovered_id')
+}
+
+/**
+ * Seed normalized code-audit suspects and runtime API-dependency nodes into `CapabilityLedger`
+ * as strictly quarantined (`capability_only`) capability nodes + causal edges so `planChainRound`
+ * composes white-box and runtime edges in a single causal DAG.
+ */
+export function seedCompositeNodesToLedger(
+  ledger: CapabilityLedger | null | undefined,
+  nodes: readonly CompositeWorkflowNode[],
+  depPairs: readonly { prod: CompositeWorkflowNode; cons: CompositeWorkflowNode; resourceKey: string }[] = [],
+): number {
+  if (!ledger || nodes.length === 0) return 0
+  let seeded = 0
+  const capIdByNodeId = new Map<string, string>()
+  for (const node of nodes.slice(0, 48)) {
+    const capKind = compositeRoleToCapabilityKind(node.roles)
+    const surface = compositeRoleToSurface(node.roles, node.endpoint)
+    const capId = `cap:hop_comp_${sanitizeUnitToken(node.id)}:${sanitizeUnitToken(capKind)}`
+    capIdByNodeId.set(node.id, capId)
+    if (ledger.getCapability(capId)) continue
+    try {
+      const parsed = parseRouteTarget(node.endpoint)
+      ledger.addCapability({
+        capId,
+        kind: capKind,
+        surface,
+        serviceOrigin: node.origin,
+        tenantScope: 'unscoped_hypothesis',
+        actorPersona: 'attacker',
+        provenance: node.explicitSuspect ? 'static_analysis' : 'runtime_discovery',
+        promotionStatus: 'capability_only',
+        terminalImpactOracleVerified: false,
+        artifactDigest: computeArtifactDigest(`${capId}|${node.origin}|${node.endpoint}|${node.sinkKind}`),
+        artifactSummary: truncate(node.summary, 160),
+        metadata: {
+          ...(node.factId ? { factId: node.factId } : {}),
+          ...(parsed.endpoint ? { endpoint: parsed.endpoint } : {}),
+          ...(parsed.method ? { method: parsed.method } : {}),
+          targetRoute: node.endpoint,
+          sinkKind: node.sinkKind,
+          serviceScope: node.serviceScope,
+          roles: [...node.roles],
+        },
+      })
+      seeded += 1
+    } catch { /* fail-closed ledger validation */ }
+  }
+  const nowMs = Date.now()
+  for (const pair of depPairs.slice(0, 32)) {
+    const prodCapId = capIdByNodeId.get(pair.prod.id)
+    const consCapId = capIdByNodeId.get(pair.cons.id)
+    if (!prodCapId || !consCapId || prodCapId === consCapId) continue
+    try {
+      ledger.addCausalEdge({
+        edgeId: `edge:dep:${sanitizeUnitToken(pair.prod.id)}:${sanitizeUnitToken(pair.cons.id)}`,
+        preconditionCapIds: [prodCapId],
+        postconditionCapId: consCapId,
+        edgeBindingKind: 'value_binding',
+        hopReceiptId: `hop:dep:${sanitizeUnitToken(pair.resourceKey)}`,
+        actorContext: { persona: 'attacker', serviceOrigin: pair.cons.origin },
+        sourceTimestampMs: nowMs,
+        targetTimestampMs: nowMs,
+        metadata: { resourceKey: pair.resourceKey },
+      })
+    } catch { /* ignore duplicate or already-recorded edge */ }
+  }
+  return seeded
+}
+
+/**
+ * Unified table-driven causal composite planner shared by white-box code-audit suspect promotion
+ * and grey-box runtime composite promotion (replaces duplicated 5-pattern matchers).
+ */
+export function planCompositeWorkflows<T extends CompositeWorkflowNode>(
+  candidates: readonly T[],
+  options: {
+    maxComposites: number
+    mode: 'whitebox' | 'runtime'
+    depPairs?: readonly { prod: T; cons: T; resourceKey: string }[]
+    ledger?: CapabilityLedger | null
+  },
+): PlannedCompositeWorkflow<T>[] {
+  const maxComposites = Math.max(0, Math.floor(options.maxComposites))
+  if (candidates.length < 2 || maxComposites <= 0) return []
+  seedCompositeNodesToLedger(options.ledger, candidates, options.depPairs)
+
+  const composites: PlannedCompositeWorkflow<T>[] = []
+  const usedInPrior = new Set<string>()
+  const emittedIdSets: ReadonlySet<string>[] = []
+
+  const pick = (
+    predicate: (c: T) => boolean,
+    excludeIds: ReadonlySet<string>,
+    anchor?: T,
+  ): T | undefined => {
+    let best: { c: T; score: number; idx: number } | undefined
+    for (let idx = 0; idx < candidates.length; idx += 1) {
+      const c = candidates[idx]!
+      if (excludeIds.has(c.id) || !predicate(c)) continue
+      let score = options.mode === 'runtime' ? (c.priorityScore ?? 50) : 0
+      if (!usedInPrior.has(c.id)) score += options.mode === 'runtime' ? 20 : 4
+      if (anchor) {
+        if (options.mode === 'runtime' && c.origin !== anchor.origin) score += 28
+        if (c.serviceScope !== anchor.serviceScope) score += options.mode === 'runtime' ? 10 : 3
+        if (c.fileLoc && anchor.fileLoc && c.fileLoc !== anchor.fileLoc) score += 2
+        if (c.sinkKind !== anchor.sinkKind) score += options.mode === 'runtime' ? 8 : 2
+      }
+      if (c.explicitSuspect) score += 1
+      if (!best || score > best.score || (score === best.score && idx < best.idx)) {
+        best = { c, score, idx }
+      }
+    }
+    return best?.c
+  }
+
+  const record = (
+    key: string,
+    label: string,
+    category: string,
+    hops: T[],
+    resourceKey?: string,
+  ): void => {
+    if (composites.length >= maxComposites || hops.length < 2) return
+    const idSet = new Set(hops.map(h => h.id))
+    if (emittedIdSets.some(prev => [...idSet].every(id => prev.has(id)))) return
+    emittedIdSets.push(idSet)
+    for (const h of hops) usedInPrior.add(h.id)
+    composites.push({
+      key,
+      label,
+      category,
+      hops,
+      ...(resourceKey ? { resourceKey } : {}),
+      priority: Math.max(96, 98 - composites.length),
+    })
+  }
+
+  const rules: CompositeWorkflowRule<T>[] = [
+    {
+      key: 'outbound_signing_webhook',
+      entry: c => c.roles.has('outbound_fetch'),
+      pivot: c => c.roles.has('signing_webhook'),
+      terminal: c => c.roles.has('privileged_mutation'),
+      terminalFallback: c => c.roles.has('auth_session'),
+      label: t => t ? 'Outbound/SSRF -> Signing/Webhook -> Terminal Impact' : 'Outbound/SSRF -> Signing/Webhook Pivot',
+      category: t => t ? 'broken-access-control' : 'auth-identity',
+    },
+    {
+      key: 'disclosure_auth_mutation',
+      entry: c => c.roles.has('info_disclosure') && c.sinkKind !== 'auth_config',
+      entryFallback: c => c.roles.has('info_disclosure') || (options.mode === 'runtime' && Boolean(c.isApiDep)),
+      pivot: c => c.roles.has('auth_session') && (options.mode === 'whitebox' ? c.sinkKind === 'auth_config' : true),
+      pivotFallback: c => c.roles.has('auth_session'),
+      terminal: c => c.roles.has('privileged_mutation') || (options.mode === 'runtime' && c.roles.has('async_worker')),
+      label: t => t ? 'Disclosure -> Auth/Session -> Privileged Mutation' : 'Disclosure -> Auth/Session Pivot',
+      category: () => 'broken-access-control',
+    },
+    ...(options.mode === 'whitebox'
+      ? [
+          {
+            key: 'cache_permission_async_export',
+            entry: (c: T) => c.roles.has('cache_permission'),
+            pivot: (c: T) => c.roles.has('async_worker'),
+            terminal: (c: T, p: T) => (c.roles.has('privileged_mutation') || c.roles.has('info_disclosure')) && c.id !== p.id,
+            label: (t: boolean) => t
+              ? 'Cache/Permission -> Async Export/Download -> Terminal Readback'
+              : 'Cache/Permission -> Async Export/Download Pivot',
+            category: () => 'broken-access-control',
+          },
+          {
+            key: 'request_parsing_concurrent_settlement',
+            entry: (c: T) => c.roles.has('request_parsing'),
+            pivot: (c: T) => c.roles.has('concurrent_settlement'),
+            terminal: (c: T, p: T) => (c.roles.has('privileged_mutation') || c.roles.has('async_worker')) && c.id !== p.id,
+            label: (t: boolean) => t
+              ? 'Request-Parsing -> Concurrent Settlement -> Terminal Conservation'
+              : 'Request-Parsing -> Concurrent Settlement Pivot',
+            category: () => 'business-logic',
+          },
+        ]
+      : []),
+  ]
+
+  for (const rule of rules) {
+    if (composites.length >= maxComposites) break
+    const used = new Set<string>()
+    const entry = pick(rule.entry, used) ?? (rule.entryFallback ? pick(rule.entryFallback, used) : undefined)
+    if (!entry) continue
+    used.add(entry.id)
+    const pivot = pick(rule.pivot, used, entry) ?? (rule.pivotFallback ? pick(rule.pivotFallback, used, entry) : undefined)
+    if (!pivot) continue
+    used.add(pivot.id)
+    const terminal = rule.terminal
+      ? (pick(c => rule.terminal!(c, pivot), used, pivot)
+        ?? (rule.terminalFallback ? pick(c => rule.terminalFallback!(c, pivot), used, pivot) : undefined))
+      : undefined
+    const hops = terminal ? [entry, pivot, terminal] : [entry, pivot]
+    record(rule.key, rule.label(Boolean(terminal)), rule.category(Boolean(terminal)), hops)
+  }
+
+  // Runtime producer -> consumer API dependency composite
+  if (options.mode === 'runtime' && composites.length < maxComposites && (options.depPairs?.length ?? 0) > 0) {
+    const rankedDep = [...options.depPairs!].sort((a, b) =>
+      Number(b.prod.origin !== b.cons.origin) - Number(a.prod.origin !== a.cons.origin)
+      || ((b.prod.priorityScore ?? 50) + (b.cons.priorityScore ?? 50))
+        - ((a.prod.priorityScore ?? 50) + (a.cons.priorityScore ?? 50)),
+    )[0]!
+    const used = new Set<string>([rankedDep.prod.id, rankedDep.cons.id])
+    const terminal = pick(
+      c => c.origin !== rankedDep.cons.origin || c.roles.has('privileged_mutation') || c.roles.has('async_worker'),
+      used,
+      rankedDep.cons,
+    )
+    const hops = terminal ? [rankedDep.prod, rankedDep.cons, terminal] : [rankedDep.prod, rankedDep.cons]
+    record(
+      'runtime_api_dependency',
+      `Producer -> Consumer (${rankedDep.resourceKey})${terminal ? ' -> Cross-Boundary Pivot' : ''}`,
+      'broken-access-control',
+      hops,
+      rankedDep.resourceKey,
+    )
+  }
+
+  // White-box 2-hop Disclosure/Auth -> Privileged Mutation fallback
+  if (options.mode === 'whitebox' && composites.length < maxComposites) {
+    const used = new Set<string>()
+    const leak = pick(c => c.roles.has('info_disclosure') && c.sinkKind !== 'auth_config', used)
+      ?? pick(c => c.roles.has('info_disclosure'), used)
+    if (leak) used.add(leak.id)
+    const authPivot = !leak
+      ? (pick(c => c.roles.has('auth_session') && c.sinkKind === 'auth_config', used)
+        ?? pick(c => c.roles.has('auth_session'), used))
+      : undefined
+    if (authPivot) used.add(authPivot.id)
+    const terminal = pick(c => c.roles.has('privileged_mutation'), used, authPivot ?? leak)
+    const hops = [leak, authPivot, terminal].filter((h): h is T => Boolean(h))
+    const hasCrossBoundaryDiversity = Boolean(leak && terminal)
+      || new Set(hops.map(h => h.serviceScope)).size >= 2
+      || new Set(hops.map(h => h.sinkKind)).size >= 2
+    if (hops.length >= 2 && hasCrossBoundaryDiversity) {
+      record(
+        'disclosure_or_auth_mutation',
+        leak && terminal ? 'Disclosure -> Privileged Cross-Tenant Pivot' : 'Auth/Session -> Privileged Mutation Pivot',
+        'broken-access-control',
+        hops,
+      )
+    }
+  }
+
+  // General cross-service (whitebox) or cross-origin (runtime) multi-sink fallback
+  if (composites.length < maxComposites) {
+    const crossReady = options.mode === 'runtime'
+      ? new Set(candidates.map(c => c.origin)).size >= 2
+      : new Set(candidates.map(c => c.serviceScope)).size >= 2 && new Set(candidates.map(c => c.sinkKind)).size >= 2
+    if (crossReady) {
+      const used = new Set<string>()
+      const first = pick(
+        c => c.roles.has('outbound_fetch') || c.roles.has('info_disclosure') || c.roles.has('auth_session') || c.roles.has('async_worker') || c.roles.size > 0,
+        used,
+      ) ?? pick(() => true, used)
+      if (first) {
+        used.add(first.id)
+        const second = options.mode === 'runtime'
+          ? (pick(c => c.origin !== first.origin && (c.roles.size > 0 || c.sinkKind !== first.sinkKind), used, first)
+            ?? pick(c => c.origin !== first.origin, used, first))
+          : pick(c => c.serviceScope !== first.serviceScope && c.sinkKind !== first.sinkKind, used, first)
+        if (second) {
+          used.add(second.id)
+          const third = options.mode === 'runtime'
+            ? (pick(c => c.origin !== first.origin && c.origin !== second.origin, used, second)
+              ?? pick(c => c.roles.has('privileged_mutation') || c.roles.has('async_worker'), used, second))
+            : pick(c => c.roles.has('privileged_mutation') && c.serviceScope !== second.serviceScope, used, second)
+          const hops = third ? [first, second, third] : [first, second]
+          const prefix = options.mode === 'runtime' ? 'Cross-Origin' : 'Cross-Service'
+          const suffix = options.mode === 'runtime' ? 'Workflow' : 'Pivot'
+          record(
+            options.mode === 'runtime' ? 'cross_origin_runtime_workflow' : 'cross_service_multi_sink',
+            `${prefix} ${first.sinkKind} -> ${second.sinkKind}${third ? ` -> ${third.sinkKind}` : ''} ${suffix}`,
+            'broken-access-control',
+            hops,
+          )
+        }
+      }
+    }
+  }
+
+  return composites
 }
 
 /**
