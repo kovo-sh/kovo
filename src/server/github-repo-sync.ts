@@ -10,6 +10,7 @@ import {
   realpathSync,
   renameSync,
   rmSync,
+  rmdirSync,
   writeFileSync,
 } from 'node:fs'
 import { join, relative, resolve, sep } from 'node:path'
@@ -171,6 +172,186 @@ export function listMountedRepos(reposDir: string): string[] {
     }
   }
   return mounted.sort()
+}
+
+export interface ProjectMountedRepo {
+  fullName: string
+  mountPath: string
+  branch: string | null
+  commitSha: string | null
+  sizeBytes: number
+  updatedAt: number
+}
+
+export interface UnlinkMountedRepoResult {
+  unlinked: boolean
+  fullName: string
+}
+
+function measureDirectoryBytes(dirPath: string, depth = 0): number {
+  if (depth > 32) return 0
+  let entries
+  try {
+    entries = readdirSync(dirPath, { withFileTypes: true })
+  } catch {
+    return 0
+  }
+  let total = 0
+  for (const entry of entries) {
+    const fullPath = join(dirPath, entry.name)
+    let st
+    try {
+      st = lstatSync(fullPath)
+    } catch {
+      continue
+    }
+    if (st.isSymbolicLink()) continue
+    if (st.isFile()) {
+      total += st.size
+    } else if (st.isDirectory()) {
+      total += measureDirectoryBytes(fullPath, depth + 1)
+    }
+  }
+  return total
+}
+
+function readRepoGitHeadInfo(repoDir: string): { branch: string | null; commitSha: string | null } {
+  const gitPath = join(repoDir, '.git')
+  if (!existsSync(gitPath)) return { branch: null, commitSha: null }
+  try {
+    if (lstatSync(gitPath).isSymbolicLink()) return { branch: null, commitSha: null }
+  } catch {
+    return { branch: null, commitSha: null }
+  }
+  const baseArgs = ['-C', repoDir, '-c', 'safe.directory=*', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null']
+  let branch: string | null = null
+  let commitSha: string | null = null
+  try {
+    const rawBranch = execFileSync('git', [...baseArgs, 'rev-parse', '--abbrev-ref', 'HEAD'], {
+      encoding: 'utf8',
+      timeout: 3_000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim()
+    if (rawBranch && rawBranch !== 'HEAD') branch = rawBranch
+  } catch {
+    // Best-effort git branch read.
+  }
+  try {
+    const rawSha = execFileSync('git', [...baseArgs, 'rev-parse', '--short', 'HEAD'], {
+      encoding: 'utf8',
+      timeout: 3_000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim()
+    if (rawSha) commitSha = rawSha
+  } catch {
+    // Best-effort git SHA read.
+  }
+  return { branch, commitSha }
+}
+
+/** List mounted repositories for a project with git metadata, byte size, and mtime. */
+export function listProjectMountedRepos(dataDir: string, projectId: string): ProjectMountedRepo[] {
+  const reposDir = projectReposDir(dataDir, projectId)
+  const mounted = listMountedRepos(reposDir)
+  const out: ProjectMountedRepo[] = []
+  for (const mountPath of mounted) {
+    const fullName = mountPath.slice('/repos/'.length)
+    const { owner, repo } = parseRepoFullName(fullName)
+    const repoDir = join(reposDir, owner, repo)
+    let updatedAt = 0
+    try {
+      updatedAt = Math.round(lstatSync(repoDir).mtimeMs)
+    } catch {
+      continue
+    }
+    const { branch, commitSha } = readRepoGitHeadInfo(repoDir)
+    const sizeBytes = measureDirectoryBytes(repoDir)
+    out.push({
+      fullName,
+      mountPath,
+      branch,
+      commitSha,
+      sizeBytes,
+      updatedAt,
+    })
+  }
+  return out
+}
+
+/**
+ * Unlink (delete) a single mounted repository checkout under `repos/<projectId>/<owner>/<repo>`.
+ * Strictly enforces path containment so traversal segments or symlinks cannot escape `repos/<projectId>/`.
+ */
+export function unlinkProjectMountedRepo(
+  dataDir: string,
+  projectId: string,
+  repoSlug: string,
+): UnlinkMountedRepoResult {
+  const reposDir = projectReposDir(dataDir, projectId)
+  const { fullName, owner, repo } = parseRepoFullName(repoSlug)
+
+  if (!existsSync(reposDir)) {
+    return { unlinked: false, fullName }
+  }
+  const rootStat = lstatSync(reposDir)
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
+    throw new Error('Invalid project repository root directory.')
+  }
+  const resolvedRoot = realpathSync(reposDir)
+  const ownerDir = join(resolvedRoot, owner)
+  const targetDir = join(ownerDir, repo)
+
+  if (
+    !resolve(ownerDir).startsWith(resolvedRoot + sep) ||
+    !resolve(targetDir).startsWith(resolvedRoot + sep) ||
+    relative(resolvedRoot, targetDir) !== join(owner, repo)
+  ) {
+    throw new Error(`Repository path escapes project root: "${repoSlug}".`)
+  }
+
+  let ownerStat
+  try {
+    ownerStat = lstatSync(ownerDir)
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      return { unlinked: false, fullName }
+    }
+    throw err
+  }
+  if (ownerStat.isSymbolicLink() || !ownerStat.isDirectory()) {
+    throw new Error(`Refusing to unlink inside invalid owner path: "${owner}".`)
+  }
+  const realOwner = realpathSync(ownerDir)
+  if (!realOwner.startsWith(resolvedRoot + sep)) {
+    throw new Error(`Repository owner path escapes project root: "${owner}".`)
+  }
+
+  let targetStat
+  try {
+    targetStat = lstatSync(targetDir)
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      return { unlinked: false, fullName }
+    }
+    throw err
+  }
+  if (targetStat.isSymbolicLink() || !targetStat.isDirectory()) {
+    throw new Error(`Refusing to unlink non-directory or symlinked repository path: "${fullName}".`)
+  }
+  const realTarget = realpathSync(targetDir)
+  if (!realTarget.startsWith(resolvedRoot + sep) || relative(resolvedRoot, realTarget) !== join(owner, repo)) {
+    throw new Error(`Resolved repository path escapes project root: "${fullName}".`)
+  }
+
+  rmSync(targetDir, { recursive: true, force: true })
+  try {
+    if (readdirSync(ownerDir).length === 0) {
+      rmdirSync(ownerDir)
+    }
+  } catch {
+    // Best-effort cleanup of empty owner directory.
+  }
+  return { unlinked: true, fullName }
 }
 
 function parseRepoFullName(rawName: string): { fullName: string; owner: string; repo: string } {

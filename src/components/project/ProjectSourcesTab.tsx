@@ -1,17 +1,35 @@
 import { Link } from '@tanstack/react-router'
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   importSpec,
   listGithubRepositories,
   removeProjectSpec,
   syncGithubRepositories,
 } from '../../actions.ts'
+import {
+  listProjectReposAction,
+  readProjectSpecContentAction,
+  resyncProjectRepoAction,
+  unlinkProjectRepoAction,
+  updateProjectSpecAction,
+} from '../../actions-sources.ts'
 import { maxSpecBytes } from '../../domain.ts'
 import { cn } from '../../lib/cn.ts'
+import type { ProjectMountedRepo } from '../../server/github-repo-sync.ts'
 import { formatHumanTime, FormError, useAction } from '../common.tsx'
+import { Icon } from '../run/icons.tsx'
 import { Badge } from '../ui/badge.tsx'
 import { Button, buttonVariants } from '../ui/button.tsx'
 import { Card, CardBody, CardFooter, CardHeader } from '../ui/card.tsx'
+import {
+  Dialog,
+  DialogBody,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '../ui/dialog.tsx'
 import { Disclosure, DisclosureContent, DisclosureTrigger } from '../ui/disclosure.tsx'
 import { EmptyState } from '../ui/empty-state.tsx'
 import { Input, NativeSelect, Textarea } from '../ui/input.tsx'
@@ -23,6 +41,8 @@ import { safeHost } from './types.ts'
 interface Props {
   data: ProjectLoaderData
 }
+
+type SpecKind = ProjectLoaderData['specs'][number]['kind']
 
 function SourcesEmptyIllustration() {
   return (
@@ -70,12 +90,63 @@ export function ProjectSourcesTab({ data }: Props) {
   const [manualUploadOpen, setManualUploadOpen] = useState(false)
   const manualUploadRef = useRef<HTMLDivElement | null>(null)
 
+  const [linkedRepos, setLinkedRepos] = useState<ProjectMountedRepo[]>([])
+  const [reposLoadingMounted, setReposLoadingMounted] = useState(true)
+  const [reposLoadError, setReposLoadError] = useState('')
+  const [resyncingRepoSlug, setResyncingRepoSlug] = useState<string | null>(null)
+  const [repoToUnlink, setRepoToUnlink] = useState<ProjectMountedRepo | null>(null)
+
+  const [editingSpec, setEditingSpec] = useState<ProjectLoaderData['specs'][number] | null>(null)
+  const [specModalLoading, setSpecModalLoading] = useState(false)
+  const [specModalLoadError, setSpecModalLoadError] = useState('')
+  const [editSpecName, setEditSpecName] = useState('')
+  const [editSpecKind, setEditSpecKind] = useState<SpecKind>('openapi')
+  const [editSpecOrigin, setEditSpecOrigin] = useState('')
+  const [editSpecContent, setEditSpecContent] = useState('')
+  const specLoadSeqRef = useRef(0)
+
   const githubAction = useAction()
+  const repoAction = useAction()
   const specAction = useAction()
+  const specEditAction = useAction()
 
   useEffect(() => {
     setLiveGithubStatus(githubPatStatus)
   }, [githubPatStatus])
+
+  const refreshLinkedRepos = useCallback(async (showSpinner = false) => {
+    if (showSpinner) setReposLoadingMounted(true)
+    setReposLoadError('')
+    try {
+      const repos = await listProjectReposAction({ data: { projectId: project.id } })
+      setLinkedRepos(repos)
+    } catch (err) {
+      setReposLoadError(err instanceof Error ? err.message : 'Failed to load linked repositories.')
+    } finally {
+      setReposLoadingMounted(false)
+    }
+  }, [project.id])
+
+  useEffect(() => {
+    let cancelled = false
+    setReposLoadingMounted(true)
+    setReposLoadError('')
+    listProjectReposAction({ data: { projectId: project.id } })
+      .then(repos => {
+        if (!cancelled) setLinkedRepos(repos)
+      })
+      .catch(err => {
+        if (!cancelled) {
+          setReposLoadError(err instanceof Error ? err.message : 'Failed to load linked repositories.')
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setReposLoadingMounted(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [project.id])
 
   function openManualUpload() {
     setManualUploadOpen(true)
@@ -104,6 +175,42 @@ export function ProjectSourcesTab({ data }: Props) {
     if (!reposLoaded) loadGithubRepos()
   }
 
+  async function loadSpecIntoModal(spec: ProjectLoaderData['specs'][number]) {
+    const seq = ++specLoadSeqRef.current
+    setEditingSpec(spec)
+    setSpecModalLoading(true)
+    setSpecModalLoadError('')
+    setEditSpecName(spec.name)
+    setEditSpecKind(spec.kind)
+    setEditSpecOrigin(spec.origin ?? '')
+    setEditSpecContent('')
+    try {
+      const full = await readProjectSpecContentAction({
+        data: { projectId: project.id, specId: spec.id },
+      })
+      if (specLoadSeqRef.current !== seq) return
+      setEditSpecName(full.name)
+      setEditSpecKind(full.kind)
+      setEditSpecOrigin(full.origin ?? '')
+      setEditSpecContent(full.content)
+    } catch (err) {
+      if (specLoadSeqRef.current !== seq) return
+      setSpecModalLoadError(err instanceof Error ? err.message : 'Failed to load spec content.')
+    } finally {
+      if (specLoadSeqRef.current === seq) {
+        setSpecModalLoading(false)
+      }
+    }
+  }
+
+  function closeSpecModal() {
+    if (specEditAction.pending) return
+    specLoadSeqRef.current += 1
+    setEditingSpec(null)
+    setSpecModalLoading(false)
+    setSpecModalLoadError('')
+  }
+
   async function onSpecFileSelected(file: File | undefined) {
     if (!file) return
     if (file.size > maxSpecBytes) {
@@ -118,9 +225,12 @@ export function ProjectSourcesTab({ data }: Props) {
   const maxSyncBatch = 20
   const showBroadNote = discoveredRepos.length > 10 || liveGithubStatus.tokenKind === 'classic'
   const showRepoSheet = liveGithubStatus.configured && repoPickerOpen
+  const showLinkedReposCard = linkedRepos.length > 0 || reposLoadingMounted || Boolean(reposLoadError) || specs.length > 0
   // Keep strictly ONE primary CTA visible at a time across header, active sheet, and empty state.
-  const emptyOwnsPrimary = specs.length === 0 && liveGithubStatus.configured && !showRepoSheet
-  const headerShowDiscoverBtn = specs.length > 0 || showRepoSheet
+  const emptyOwnsPrimary = specs.length === 0 && linkedRepos.length === 0 && liveGithubStatus.configured && !showRepoSheet
+  const headerShowDiscoverBtn = specs.length > 0 || linkedRepos.length > 0 || showRepoSheet
+  const editSpecByteCount = new TextEncoder().encode(editSpecContent).length
+  const editSpecTooLarge = editSpecByteCount > maxSpecBytes
 
   return (
     <section aria-label="Source repositories">
@@ -312,8 +422,9 @@ export function ProjectSourcesTab({ data }: Props) {
                 setGithubNotice('')
                 void githubAction.submit(
                   () => syncGithubRepositories({ data: { projectId: project.id, repos: selectedRepos } }),
-                  result => {
+                  async result => {
                     setRepoPickerOpen(false)
+                    await refreshLinkedRepos()
                     const warnText = result.warnings.length ? ` Warnings: ${result.warnings.join('; ')}` : ''
                     setGithubNotice(`Synced ${result.repos.length} ${result.repos.length === 1 ? 'repo' : 'repos'}: ${result.specsImported} specs imported, ${result.dependenciesExtracted} dependencies extracted.${warnText}`)
                   },
@@ -323,6 +434,124 @@ export function ProjectSourcesTab({ data }: Props) {
               {githubAction.pending ? 'Syncing…' : `Sync selected (${selectedRepos.length})`}
             </Button>
           </CardFooter>
+        </Card>
+      )}
+
+      {showLinkedReposCard && (
+        <Card className="mb-4 overflow-hidden border-line">
+          <CardHeader className="items-center py-2.5">
+            <div className="flex items-center gap-2">
+              <span className="text-[13px] font-semibold text-fg">
+                Linked repositories{' '}
+                <span className="font-normal tabular-nums text-fg-subtle">({linkedRepos.length})</span>
+              </span>
+              <Badge variant="neutral" className="bg-sunk">Read-only checkout</Badge>
+            </div>
+            <Button
+              type="button"
+              variant="ghost"
+              disabled={reposLoadingMounted || repoAction.pending}
+              onClick={() => void refreshLinkedRepos(true)}
+            >
+              <Icon name="replay" size={12} />
+              Refresh
+            </Button>
+          </CardHeader>
+          <CardBody className="p-0">
+            {reposLoadingMounted ? (
+              <div className="px-4 py-3 text-[12.5px] text-fg-subtle">Loading linked repositories…</div>
+            ) : reposLoadError ? (
+              <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-3 text-[12.5px]">
+                <span role="alert" className="text-danger">{reposLoadError}</span>
+                <Button type="button" variant="outline" onClick={() => void refreshLinkedRepos(true)}>
+                  Retry
+                </Button>
+              </div>
+            ) : linkedRepos.length === 0 ? (
+              <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-3 text-[12.5px] text-fg-subtle">
+                <span>No repositories synced to this project yet.</span>
+                {liveGithubStatus.configured && (
+                  <Button type="button" variant="outline" onClick={openRepoPicker}>
+                    Discover repositories
+                  </Button>
+                )}
+              </div>
+            ) : (
+              <div>
+                {linkedRepos.map(repo => {
+                  const updated = formatHumanTime(repo.updatedAt)
+                  const isResyncing = repoAction.pending && resyncingRepoSlug === repo.fullName
+                  return (
+                    <div
+                      key={repo.fullName}
+                      className="flex min-h-[48px] flex-wrap items-center justify-between gap-3 border-b border-line px-4 py-2.5 last:border-b-0 transition-colors hover:bg-hover"
+                    >
+                      <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+                        <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+                          <strong className="font-mono text-[12px] font-semibold text-fg">{repo.fullName}</strong>
+                          {repo.branch && (
+                            <Badge variant="neutral" className="bg-sunk">{repo.branch}</Badge>
+                          )}
+                          {repo.commitSha && (
+                            <Badge variant="neutral" className="bg-sunk font-mono">{repo.commitSha}</Badge>
+                          )}
+                        </div>
+                        <div className="text-[12px] tabular-nums text-fg-subtle">
+                          {Math.max(1, Math.round(repo.sizeBytes / 1024))} KiB
+                          {updated.label && (
+                            <>
+                              {' · '}
+                              <span title={updated.full}>Updated {updated.label}</span>
+                            </>
+                          )}
+                        </div>
+                      </div>
+                      <div className="flex flex-none items-center gap-2">
+                        <Button
+                          type="button"
+                          variant="outline"
+                          disabled={repoAction.pending || !liveGithubStatus.configured}
+                          title={!liveGithubStatus.configured ? 'Connect GitHub in Settings to re-sync' : undefined}
+                          onClick={() => {
+                            setGithubNotice('')
+                            setResyncingRepoSlug(repo.fullName)
+                            void repoAction.submit(
+                              () => resyncProjectRepoAction({ data: { projectId: project.id, repoSlug: repo.fullName } }),
+                              async result => {
+                                setResyncingRepoSlug(null)
+                                await refreshLinkedRepos()
+                                const warnText = result.warnings.length ? ` Warnings: ${result.warnings.join('; ')}` : ''
+                                setGithubNotice(
+                                  `Re-synced ${result.fullName}: ${result.specsImported} specs updated, ${result.dependenciesCount} dependencies extracted.${warnText}`,
+                                )
+                              },
+                            ).finally(() => setResyncingRepoSlug(null))
+                          }}
+                        >
+                          <Icon name="replay" size={12} />
+                          {isResyncing ? 'Re-syncing…' : 'Re-sync'}
+                        </Button>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          className="data-[slot=button]:text-danger data-[slot=button]:hover:bg-danger-soft data-[slot=button]:hover:text-danger"
+                          disabled={repoAction.pending}
+                          onClick={() => setRepoToUnlink(repo)}
+                        >
+                          Unlink
+                        </Button>
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+            {repoAction.error && !repoToUnlink && (
+              <div className="border-t border-line px-4 py-2.5">
+                <FormError error={repoAction.error} />
+              </div>
+            )}
+          </CardBody>
         </Card>
       )}
 
@@ -360,6 +589,15 @@ export function ProjectSourcesTab({ data }: Props) {
                 <div className="flex flex-none items-center gap-2">
                   <Button
                     type="button"
+                    variant="outline"
+                    disabled={specAction.pending || specEditAction.pending}
+                    onClick={() => void loadSpecIntoModal(spec)}
+                  >
+                    <Icon name="edit" size={12} />
+                    View / Edit
+                  </Button>
+                  <Button
+                    type="button"
                     variant="ghost"
                     className="data-[slot=button]:text-danger data-[slot=button]:hover:bg-danger-soft data-[slot=button]:hover:text-danger"
                     disabled={specAction.pending}
@@ -378,7 +616,7 @@ export function ProjectSourcesTab({ data }: Props) {
             )
           })}
         </div>
-      ) : (
+      ) : linkedRepos.length === 0 && !reposLoadingMounted && !reposLoadError ? (
         <div className="mt-3.5 rounded-card border border-line bg-sunk">
           <EmptyState
             icon={<SourcesEmptyIllustration />}
@@ -408,6 +646,10 @@ export function ProjectSourcesTab({ data }: Props) {
             }
           />
         </div>
+      ) : (
+        <p className="m-0 rounded-card border border-line bg-sunk px-4 py-3 text-[12.5px] text-fg-subtle">
+          No snapshots or specs recorded yet. Re-sync a linked repository or upload a schema manually below.
+        </p>
       )}
 
       <div ref={manualUploadRef}>
@@ -518,6 +760,249 @@ export function ProjectSourcesTab({ data }: Props) {
           </DisclosureContent>
         </Disclosure>
       </div>
+
+      <Dialog
+        open={Boolean(repoToUnlink)}
+        closeOnEscape={!repoAction.pending}
+        onOpenChange={nextOpen => {
+          if (!nextOpen && !repoAction.pending) setRepoToUnlink(null)
+        }}
+      >
+        <DialogContent
+          role="alertdialog"
+          className="flex max-h-[calc(100vh-56px)] max-w-[440px] flex-col overflow-hidden p-0"
+        >
+          {repoToUnlink && (
+            <>
+              <DialogHeader className="flex-row items-center justify-between gap-2.5 border-b border-line bg-raise px-4 py-2.5">
+                <DialogTitle className="inline-flex items-center gap-2 text-[13px] font-semibold text-fg">
+                  <Icon name="trash" size={15} className="text-danger" />
+                  <span>Unlink repository</span>
+                </DialogTitle>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  className="size-[26px]"
+                  disabled={repoAction.pending}
+                  onClick={() => setRepoToUnlink(null)}
+                  aria-label="Close"
+                >
+                  <Icon name="close" size={14} />
+                </Button>
+              </DialogHeader>
+              <DialogBody className="flex min-h-0 flex-1 flex-col gap-3.5 overflow-y-auto p-4">
+                <DialogDescription className="text-[12.5px] leading-5 text-fg-muted">
+                  Remove the local checkout of{' '}
+                  <strong className="font-mono font-semibold text-fg">{repoToUnlink.fullName}</strong> from this project.
+                  Imported snapshots &amp; specs remain until deleted separately, and you can re-sync the repository anytime.
+                </DialogDescription>
+                <div className="flex flex-wrap items-center gap-1.5 rounded-lg border border-line bg-sunk px-3 py-2.5 tabular-nums">
+                  {repoToUnlink.branch && (
+                    <Badge variant="neutral" className="bg-panel">{repoToUnlink.branch}</Badge>
+                  )}
+                  {repoToUnlink.commitSha && (
+                    <Badge variant="neutral" className="bg-panel font-mono">{repoToUnlink.commitSha}</Badge>
+                  )}
+                  <Badge variant="neutral" className="bg-panel">
+                    {Math.max(1, Math.round(repoToUnlink.sizeBytes / 1024))} KiB
+                  </Badge>
+                </div>
+                {repoAction.error && (
+                  <p className="m-0 text-[12px] text-danger" role="alert">
+                    {repoAction.error}
+                  </p>
+                )}
+              </DialogBody>
+              <DialogFooter>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  disabled={repoAction.pending}
+                  onClick={() => setRepoToUnlink(null)}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  type="button"
+                  variant="default"
+                  className="data-[slot=button]:bg-danger data-[slot=button]:text-white data-[slot=button]:hover:bg-danger hover:brightness-[1.08]"
+                  disabled={repoAction.pending}
+                  onClick={() => {
+                    const target = repoToUnlink
+                    setGithubNotice('')
+                    void repoAction.submit(
+                      () => unlinkProjectRepoAction({ data: { projectId: project.id, repoSlug: target.fullName } }),
+                      async () => {
+                        setRepoToUnlink(null)
+                        await refreshLinkedRepos()
+                        setGithubNotice(`Unlinked repository "${target.fullName}".`)
+                      },
+                    )
+                  }}
+                >
+                  <Icon name="trash" size={13} />
+                  {repoAction.pending ? 'Unlinking…' : 'Unlink repository'}
+                </Button>
+              </DialogFooter>
+            </>
+          )}
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={Boolean(editingSpec)}
+        closeOnEscape={!specEditAction.pending}
+        onOpenChange={nextOpen => {
+          if (!nextOpen) closeSpecModal()
+        }}
+      >
+        <DialogContent className="flex max-h-[calc(100vh-48px)] max-w-[760px] flex-col overflow-hidden p-0">
+          {editingSpec && (
+            <form
+              className="flex min-h-0 flex-1 flex-col"
+              onSubmit={event => {
+                event.preventDefault()
+                if (specModalLoading || specModalLoadError || editSpecTooLarge) return
+                const target = editingSpec
+                void specEditAction.submit(
+                  () => updateProjectSpecAction({
+                    data: {
+                      requestId: crypto.randomUUID(),
+                      projectId: project.id,
+                      specId: target.id,
+                      name: editSpecName.trim(),
+                      kind: editSpecKind,
+                      origin: editSpecOrigin.trim() || null,
+                      content: editSpecContent,
+                    },
+                  }),
+                  saved => {
+                    closeSpecModal()
+                    setSpecNotice(`Updated spec "${saved.name}" (${saved.kind}).`)
+                  },
+                )
+              }}
+            >
+              <DialogHeader className="flex-row items-center justify-between gap-2.5 border-b border-line bg-raise px-4 py-2.5">
+                <DialogTitle className="inline-flex items-center gap-2 text-[13px] font-semibold text-fg">
+                  <Icon name="edit" size={14} className="text-accent" />
+                  <span>View / Edit spec</span>
+                </DialogTitle>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  className="size-[26px]"
+                  disabled={specEditAction.pending}
+                  onClick={closeSpecModal}
+                  aria-label="Close"
+                >
+                  <Icon name="close" size={14} />
+                </Button>
+              </DialogHeader>
+              <DialogBody className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-4">
+                {specModalLoading ? (
+                  <p className="m-0 py-6 text-center text-[12.5px] text-fg-subtle">Loading spec content…</p>
+                ) : specModalLoadError ? (
+                  <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-line bg-sunk px-3 py-2.5">
+                    <span role="alert" className="text-[12.5px] text-danger">{specModalLoadError}</span>
+                    <Button type="button" variant="outline" onClick={() => void loadSpecIntoModal(editingSpec)}>
+                      Retry
+                    </Button>
+                  </div>
+                ) : (
+                  <>
+                    <div className="grid grid-cols-1 items-start gap-2.5 sm:grid-cols-2">
+                      <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
+                        Name
+                        <Input
+                          className="w-full"
+                          name="name"
+                          required
+                          maxLength={160}
+                          value={editSpecName}
+                          onChange={e => setEditSpecName(e.target.value)}
+                        />
+                      </label>
+                      <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
+                        Kind
+                        <NativeSelect
+                          className="w-full"
+                          name="kind"
+                          value={editSpecKind}
+                          onChange={e => setEditSpecKind(e.target.value as SpecKind)}
+                        >
+                          <option value="openapi">OpenAPI / Swagger</option>
+                          <option value="graphql">GraphQL schema</option>
+                          <option value="routes">Route map / Server handlers</option>
+                          <option value="notes">Lockfile / Dependencies / Notes</option>
+                        </NativeSelect>
+                      </label>
+                    </div>
+                    <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
+                      Target origin (optional)
+                      <Input
+                        className="w-full"
+                        name="origin"
+                        value={editSpecOrigin}
+                        onChange={e => setEditSpecOrigin(e.target.value)}
+                        placeholder={project.seeds[0] ?? 'https://api.example.com'}
+                      />
+                    </label>
+                    <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
+                      <span className="flex items-center justify-between gap-2">
+                        <span>Content</span>
+                        <span className="font-normal tabular-nums text-fg-subtle">
+                          {Math.max(1, Math.round(editSpecByteCount / 1024))} KiB
+                        </span>
+                      </span>
+                      <Textarea
+                        className="w-full font-mono text-[12px]"
+                        name="content"
+                        rows={14}
+                        required
+                        value={editSpecContent}
+                        onChange={e => setEditSpecContent(e.target.value)}
+                      />
+                    </label>
+                    {editSpecTooLarge && (
+                      <p role="alert" className="m-0 text-[12px] text-danger">
+                        Spec content exceeds the {Math.round(maxSpecBytes / (1024 * 1024))} MiB limit.
+                      </p>
+                    )}
+                    <FormError error={specEditAction.error} />
+                  </>
+                )}
+              </DialogBody>
+              <DialogFooter>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  disabled={specEditAction.pending}
+                  onClick={closeSpecModal}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  type="submit"
+                  variant="default"
+                  disabled={
+                    specModalLoading
+                    || Boolean(specModalLoadError)
+                    || specEditAction.pending
+                    || !editSpecName.trim()
+                    || !editSpecContent.trim()
+                    || editSpecTooLarge
+                  }
+                >
+                  {specEditAction.pending ? 'Saving…' : 'Save changes'}
+                </Button>
+              </DialogFooter>
+            </form>
+          )}
+        </DialogContent>
+      </Dialog>
     </section>
   )
 }
