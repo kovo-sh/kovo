@@ -12,6 +12,11 @@
  */
 import type { FloorRecipeExecution } from './floor-recipes.ts'
 import type { ScriptProofExchange } from './proof-receipt.ts'
+import {
+  isCompositeRejectedOracleCode,
+  isTypedOracleRemediationCode,
+  isUnbuildableReceiptOracleCode,
+} from './retry-governor.ts'
 
 export type RetestFailureReason =
   | 'claim_not_reproduced'
@@ -357,6 +362,34 @@ export function assessRetestHealth(
  *   5. No `oracle_disagreement` occurred (all recipe preconditions passed yet the receipt gate
  *      rejected for a non-remediation reason).
  */
+function extractTypedOracleFailureCode(execution: FloorRecipeExecution): {
+  rule: string
+  reason: string
+  failureCode: string | null
+  compositeFailedStage: string | null
+} {
+  const ver = execution.result.verification as unknown as {
+    rule: string
+    reason: string
+    failureCode?: unknown
+    evidence?: Record<string, unknown>
+  }
+  const failRec = execution.failure as unknown as { failureCode?: unknown } | undefined
+  const failureCode = typeof ver.failureCode === 'string'
+    ? ver.failureCode
+    : typeof ver.evidence?.failureCode === 'string'
+      ? ver.evidence.failureCode
+      : typeof failRec?.failureCode === 'string'
+        ? failRec.failureCode
+        : null
+  const compositeFailedStage = typeof ver.evidence?.failedStage === 'string'
+    ? ver.evidence.failedStage
+    : isCompositeRejectedOracleCode(failureCode)
+      ? 'composite_receipt'
+      : null
+  return { rule: ver.rule, reason: ver.reason, failureCode, compositeFailedStage }
+}
+
 export function classifyRetestHealth(execution: FloorRecipeExecution): RetestHealthAssessment {
   if (execution.result.confirmed) {
     return { healthy: true, code: 'healthy', failureReason: 'claim_not_reproduced', reason: null }
@@ -365,11 +398,13 @@ export function classifyRetestHealth(execution: FloorRecipeExecution): RetestHea
   const recipeId = execution.result.recipeId as string
   const missingRoles = failure?.missingRoles ?? []
   const reqFailures = failure?.requireFailures ?? []
+  const oracleMeta = extractTypedOracleFailureCode(execution)
 
   if (failure?.code === 'recipe_error') {
     const isUnbuildable = !execution.receipt
       || (recipeId !== 'browser_sink' && (execution.receipt.exchangeIds?.length ?? 0) === 0 && execution.result.steps.length > 0)
-      || /receipt.*(?:could not|unbuildable|missing)/i.test(failure.message)
+      || missingRoles.includes('verified_proof_receipt')
+      || isUnbuildableReceiptOracleCode(oracleMeta.failureCode)
     if (isUnbuildable) {
       return assessRetestHealth({ controlArms: [] }, { arms: [] }, {
         receiptUnbuildable: true,
@@ -485,39 +520,25 @@ export function classifyRetestHealth(execution: FloorRecipeExecution): RetestHea
   )
   if (!baseHealth.healthy) return baseHealth
 
-  // Oracle-disagreement guard: when every recipe precondition passed yet `verifyReceipt` rejected,
-  // allow `fixed` ONLY for explicit remediation-observed verification reasons.
+  // Oracle-disagreement guard (R3-14): switch strictly on typed oracle `failureCode` (zero
+  // regexes over English `verification.reason` prose). Unknown or missing codes fail closed.
   if (failure?.code === 'receipt_rejected') {
-    const reason = execution.result.verification.reason
-    const rule = execution.result.verification.rule
-    if (/composite.*stage|failedStage|edge_binding|dag_topology|attacker_provenance|transcript_integrity/i.test(reason)) {
+    if (oracleMeta.compositeFailedStage) {
       return assessRetestHealth({ controlArms }, { arms: probeArmsList }, {
-        compositeRejectedStage: 'composite_receipt',
-        failureDetail: `Composite stage rejected on ${recipeId} retest: ${reason}`,
+        compositeRejectedStage: oracleMeta.compositeFailedStage,
+        failureDetail: `Composite stage rejected on ${recipeId} retest: ${oracleMeta.reason}`,
       })
     }
-    if (recipeId === 'boolean_or_timing') {
-      if (rule === 'boolean' && /no structural response change|identical after token stripping|only difference was the injected predicate|rotating nonce/i.test(reason)) {
-        return { healthy: true, code: 'healthy', failureReason: 'claim_not_reproduced', reason: null }
-      }
-      if (rule === 'timing' && /not distinguishable|stable separation|separation|delay/i.test(reason) && !/wall-clock duration|control and a probe/i.test(reason)) {
-        return { healthy: true, code: 'healthy', failureReason: 'claim_not_reproduced', reason: null }
-      }
-      return { healthy: false, code: 'oracle_disagreement', failureReason: 'probe_unhealthy', reason: `Oracle disagreement on boolean_or_timing retest: ${reason}` }
+    if (isUnbuildableReceiptOracleCode(oracleMeta.failureCode)) {
+      return assessRetestHealth({ controlArms }, { arms: probeArmsList }, {
+        receiptUnbuildable: true,
+        failureDetail: oracleMeta.reason,
+      })
     }
-    if (recipeId === 'persisted_mutation') {
-      if (/identical to the baseline|no persisted|state echo|idempotent|not a protected field|not impact/i.test(reason)) {
-        return { healthy: true, code: 'healthy', failureReason: 'claim_not_reproduced', reason: null }
-      }
-      return { healthy: false, code: 'oracle_disagreement', failureReason: 'probe_unhealthy', reason: `Oracle disagreement on persisted_mutation retest: ${reason}` }
+    if (isTypedOracleRemediationCode(recipeId, oracleMeta.rule, oracleMeta.failureCode)) {
+      return { healthy: true, code: 'healthy', failureReason: 'claim_not_reproduced', reason: null }
     }
-    if (recipeId === 'conserved_balance') {
-      if (/conserved|conservation|no oversell|within balance|no under-debit/i.test(reason) && !/readback|serial control|concurrent mutation/i.test(reason)) {
-        return { healthy: true, code: 'healthy', failureReason: 'claim_not_reproduced', reason: null }
-      }
-      return { healthy: false, code: 'oracle_disagreement', failureReason: 'probe_unhealthy', reason: `Oracle disagreement on conserved_balance retest: ${reason}` }
-    }
-    return { healthy: false, code: 'oracle_disagreement', failureReason: 'probe_unhealthy', reason: `Oracle disagreement on ${recipeId} retest: ${reason}` }
+    return { healthy: false, code: 'oracle_disagreement', failureReason: 'probe_unhealthy', reason: `Oracle disagreement on ${recipeId} retest: ${oracleMeta.reason}` }
   }
 
   return baseHealth
@@ -682,6 +703,7 @@ export function buildAgentScriptRetestInputs(input: {
   const executionBroken = input.attempts.some(att => att.exitCode !== 0)
 
   const receiptUnbuildable = input.verdictReason === 'receipt_unbuildable'
+    || input.verdictReason === 'claims_missing'
   const compositeRejectedStage = input.verdictReason === 'composite_stage_rejected'
     ? (input.compositeRejectedStage ?? 'unknown')
     : input.compositeRejectedStage ?? null
@@ -689,10 +711,14 @@ export function buildAgentScriptRetestInputs(input: {
     || input.verdictReason === 'nonce_mismatch'
     || input.verdictReason === 'nonce_reuse'
     || sessionIntegrityBroken
+  const typedProbeUnhealthy = input.verdictReason === 'probe_unhealthy'
+  const typedBaselineUnhealthy = input.verdictReason === 'baseline_unhealthy'
 
   const nonRemediationReason = !receiptUnbuildable
     && !compositeRejectedStage
     && !sessionDrifted
+    && !typedProbeUnhealthy
+    && !typedBaselineUnhealthy
     && input.verdictReason !== 'claim_not_reproduced'
 
   const isAuthBoundary = Boolean(input.vulnClass && AUTH_BOUNDARY_CLASS_RE.test(input.vulnClass))
@@ -723,9 +749,11 @@ export function buildAgentScriptRetestInputs(input: {
           ? 'composite_stage_rejected'
           : sessionDrifted
             ? 'session_drifted'
-            : nonRemediationReason
-              ? 'baseline_unhealthy'
-              : 'claim_not_reproduced',
+            : typedProbeUnhealthy
+              ? 'probe_unhealthy'
+              : (typedBaselineUnhealthy || nonRemediationReason)
+                ? 'baseline_unhealthy'
+                : 'claim_not_reproduced',
       failureDetail: input.verdictDetail ?? null,
       receiptUnbuildable,
       compositeRejectedStage,
@@ -734,4 +762,42 @@ export function buildAgentScriptRetestInputs(input: {
       harnessCode: 'recipe_error',
     },
   }
+}
+
+/**
+ * R3-14 fail-closed classifier for non-confirming `agent-script-proof` oracle failures.
+ *
+ * Emits `'claim_not_reproduced'` ONLY when composite/session/receipt checks pass AND
+ * canonical `assessRetestHealth(...)` confirms healthy control + definitive probe execution.
+ * Any unrecognized, incomplete, or unhealthy failure defaults to a typed inconclusive reason
+ * (`'receipt_unbuildable'`, `'session_drifted'`, `'composite_stage_rejected'`, `'baseline_unhealthy'`,
+ * or `'probe_unhealthy'`) — NEVER fail-open `'claim_not_reproduced'`.
+ */
+export function classifyAgentScriptOracleFailure(input: {
+  hasCompositeFailure: boolean
+  drifted: boolean
+  hasCaptureWithClaims: boolean
+  receiptBuilt: boolean
+  verdictDetail?: string | null
+  attempts: readonly { exitCode: number; signaturesValid: boolean; nonceMismatch: boolean; oraclePassed: boolean }[]
+  exchanges: readonly ScriptProofExchange[]
+  vulnClass?: string | null
+}): RetestFailureReason {
+  if (input.hasCompositeFailure) return 'composite_stage_rejected'
+  if (input.drifted) return 'session_drifted'
+  if (!input.hasCaptureWithClaims || !input.receiptBuilt) return 'receipt_unbuildable'
+  const candidateInputs = buildAgentScriptRetestInputs({
+    confirmed: false,
+    verdictReason: 'claim_not_reproduced',
+    verdictDetail: input.verdictDetail ?? null,
+    attempts: input.attempts,
+    exchanges: input.exchanges,
+    vulnClass: input.vulnClass ?? null,
+  })
+  const assessment = assessRetestHealth(
+    candidateInputs.baseline,
+    candidateInputs.probeArms,
+    candidateInputs.session,
+  )
+  return assessment.healthy ? 'claim_not_reproduced' : assessment.failureReason
 }

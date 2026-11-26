@@ -11,8 +11,14 @@ import {
   isDefaultFlashModel,
   resolveProfilePricing,
 } from './provider-runtime-policy.ts'
-import { testProvider } from './provider.ts'
+import { classifyProviderFailure, testProvider } from './provider.ts'
 import { redact } from './redact.ts'
+import {
+  consumeLatestProviderFailureForProfile,
+  isProviderFailureCode,
+  type PersistedProviderFailureMeta,
+  type ProviderFailureCode,
+} from './retry-governor.ts'
 import { modelProfiles } from './schema.ts'
 import type { Store } from './store.ts'
 import { store } from './store.ts'
@@ -22,11 +28,89 @@ export interface ResolvedModelProfile extends ProviderSettings {
   healthState: 'closed' | 'open' | 'half_open'
   cooldownUntil: number | null
   lastError: string | null
+  failureKind?: ProviderFailureCode | null
+  failureHard?: boolean | null
+  failureStatus?: number | null
 }
 
 let lastTest: { digest: string; expires: number } | undefined
 let latestTestAttempt = 0
 const transientFailures = new Map<string, number>()
+const PROFILE_FAILURE_META_FILENAME = '.model-profile-failures.json'
+const profileFailureCache = new Map<string, Record<string, PersistedProviderFailureMeta>>()
+
+function profileFailureCacheKey(storage: Store): string {
+  return `${storage.directory}\0${storage.workspace.id}`
+}
+
+function profileFailureMetaPath(storage: Store): string {
+  return join(storage.directory, PROFILE_FAILURE_META_FILENAME)
+}
+
+function readWorkspaceProfileFailureMap(storage: Store): Record<string, PersistedProviderFailureMeta> {
+  const cacheKey = profileFailureCacheKey(storage)
+  const filePath = profileFailureMetaPath(storage)
+  if (existsSync(filePath)) {
+    try {
+      const parsed = JSON.parse(readFileSync(filePath, 'utf8')) as Record<string, Record<string, unknown>>
+      const wsMap = parsed?.[storage.workspace.id]
+      if (wsMap && typeof wsMap === 'object' && !Array.isArray(wsMap)) {
+        const clean: Record<string, PersistedProviderFailureMeta> = {}
+        for (const [id, raw] of Object.entries(wsMap)) {
+          if (!raw || typeof raw !== 'object') continue
+          const rec = raw as { kind?: unknown; hard?: unknown; status?: unknown; recordedAt?: unknown }
+          if (!isProviderFailureCode(rec.kind)) continue
+          clean[id] = {
+            kind: rec.kind,
+            hard: Boolean(rec.hard),
+            status: typeof rec.status === 'number' && Number.isFinite(rec.status) ? rec.status : null,
+            recordedAt: typeof rec.recordedAt === 'number' && Number.isFinite(rec.recordedAt) ? rec.recordedAt : 0,
+          }
+        }
+        profileFailureCache.set(cacheKey, clean)
+        return clean
+      }
+    } catch {
+      return profileFailureCache.get(cacheKey) ?? {}
+    }
+  }
+  return profileFailureCache.get(cacheKey) ?? {}
+}
+
+function persistWorkspaceProfileFailureMeta(
+  storage: Store,
+  profileId: string,
+  meta: PersistedProviderFailureMeta | null,
+): void {
+  const cacheKey = profileFailureCacheKey(storage)
+  const current = { ...readWorkspaceProfileFailureMap(storage) }
+  if (meta) current[profileId] = meta
+  else delete current[profileId]
+  profileFailureCache.set(cacheKey, current)
+  if (!storage.directory || !existsSync(storage.directory)) return
+  const filePath = profileFailureMetaPath(storage)
+  let rootDoc: Record<string, Record<string, PersistedProviderFailureMeta>> = {}
+  if (existsSync(filePath)) {
+    try {
+      const existing = JSON.parse(readFileSync(filePath, 'utf8')) as unknown
+      if (existing && typeof existing === 'object' && !Array.isArray(existing)) {
+        rootDoc = existing as Record<string, Record<string, PersistedProviderFailureMeta>>
+      }
+    } catch {
+      rootDoc = {}
+    }
+  }
+  rootDoc[storage.workspace.id] = current
+  const tmpPath = `${filePath}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`
+  try {
+    writeFileSync(tmpPath, JSON.stringify(rootDoc), { mode: 0o600 })
+    renameSync(tmpPath, filePath)
+  } catch {
+    if (existsSync(tmpPath)) {
+      try { unlinkSync(tmpPath) } catch { /* ignore temp cleanup failure */ }
+    }
+  }
+}
 
 const hash = (settings: Pick<ProviderSettings, 'endpoint' | 'model' | 'protocol' | 'key'>) =>
   createHash('sha256').update(JSON.stringify({
@@ -436,6 +520,7 @@ export function inspectModelProfileLoad(storage: Store = store()): ModelProfileL
       }
     }
   }
+  const persistedFailures = readWorkspaceProfileFailureMap(storage)
   const resolved: ResolvedModelProfile[] = []
   const errors: string[] = []
   for (const row of rows) {
@@ -505,6 +590,7 @@ export function inspectModelProfileLoad(storage: Store = store()): ModelProfileL
         cachedInputCostPerMtok: row.cachedInputCostPerMtok,
         outputCostPerMtok: row.outputCostPerMtok,
       })
+      const persistedFailure = row.lastError ? (persistedFailures[row.id] ?? null) : null
       resolved.push({
         id: row.id,
         name: row.name,
@@ -524,6 +610,9 @@ export function inspectModelProfileLoad(storage: Store = store()): ModelProfileL
         healthState,
         cooldownUntil,
         lastError: row.lastError,
+        failureKind: persistedFailure?.kind ?? null,
+        failureHard: persistedFailure?.hard ?? null,
+        failureStatus: persistedFailure?.status ?? null,
       })
     } catch (err) {
       // Skip unreadable or improperly permissioned credentials.
@@ -584,6 +673,7 @@ export function resolveProfilePoolForRole(
 
 export function recordProfileSuccess(profileId: string, storage: Store = store()): void {
   transientFailures.delete(profileId)
+  persistWorkspaceProfileFailureMeta(storage, profileId, null)
   storage.db.update(modelProfiles).set({
     healthState: 'closed',
     cooldownUntil: null,
@@ -596,10 +686,28 @@ export function recordProfileFailure(
   err: string | Error,
   hard: boolean,
   storage: Store = store(),
+  meta?: { failureKind?: ProviderFailureCode | null; status?: number | null },
 ): void {
   const rawMessage = err instanceof Error ? err.message : String(err)
   const safeError = redact(rawMessage).slice(0, 300)
   const now = Date.now()
+  const handedOff = consumeLatestProviderFailureForProfile(profileId, now)
+  const errKind = typeof err === 'object' && err !== null && 'kind' in err
+    ? (err as { kind?: unknown; status?: unknown })
+    : null
+  const classifiedAtOrigin = !meta?.failureKind && !(errKind && isProviderFailureCode(errKind.kind)) && !handedOff
+    ? classifyProviderFailure(err, { profileId })
+    : null
+  const resolvedKind: ProviderFailureCode | null = isProviderFailureCode(meta?.failureKind)
+    ? meta.failureKind
+    : errKind && isProviderFailureCode(errKind.kind)
+      ? errKind.kind
+      : handedOff?.kind ?? classifiedAtOrigin?.kind ?? null
+  const resolvedStatus: number | null = typeof meta?.status === 'number'
+    ? meta.status
+    : typeof errKind?.status === 'number'
+      ? errKind.status
+      : handedOff?.status ?? classifiedAtOrigin?.status ?? null
   let healthState: 'open' | 'half_open'
   let cooldownUntil: number
 
@@ -619,6 +727,11 @@ export function recordProfileFailure(
     }
   }
 
+  persistWorkspaceProfileFailureMeta(
+    storage,
+    profileId,
+    resolvedKind ? { kind: resolvedKind, hard, status: resolvedStatus, recordedAt: now } : null,
+  )
   storage.db.update(modelProfiles).set({
     healthState,
     cooldownUntil,
@@ -889,6 +1002,7 @@ export async function saveModelProfile(
       }).run()
     }
     transientFailures.delete(profileId)
+    persistWorkspaceProfileFailureMeta(storage, profileId, null)
   } catch {
     if (newCredentialPath) {
       try { unlinkSync(newCredentialPath) } catch { /* ignore */ }

@@ -1,0 +1,98 @@
+{
+  "id": "r3-14-agent-script-fail-closed-retest",
+  "side": "retest",
+  "archetype": "retest-agent-script-fail-closed",
+  "description": "R3-14 fail-closed retest: when an agent-script retest produces zero claims (unclassified oracle failure) or an unbuildable receipt even with 200/403 HTTP exchanges, agent-script-proof and retest-health MUST fail closed to inconclusive (receipt_unbuildable) and NEVER default to claim_not_reproduced/fixed.",
+  "covers": {
+    "files": [
+      "src/server/agent-script-proof.ts",
+      "src/server/retest-health.ts"
+    ],
+    "classes": [
+      "bola",
+      "retest"
+    ]
+  },
+  "canonicalLabel": {
+    "cwe": "CWE-0",
+    "category": "other",
+    "title": "Unclassified non-reproduction without buildable receipt",
+    "impact": "Retest script emitted no verifiable claim receipt.",
+    "claimedImpact": "other",
+    "claimedBoundary": "access",
+    "vulnClass": "other"
+  },
+  "freeTextLabel": {
+    "title": "Agent-script fail-closed default on unclassified oracle failure"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": false,
+    "evaluateClaims": false,
+    "composite": false,
+    "floorInjectionRecipe": false,
+    "retest": true
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "retest": {
+    "scenario": "unbuildable_receipt",
+    "expectedVerdict": "inconclusive",
+    "expectedFailureReason": "receipt_unbuildable"
+  },
+  "personas": [
+    {
+      "handle": "owner_a",
+      "roleLabel": "owner (tenant-a)",
+      "role": "owner",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-r314-owner-a-token"
+    },
+    {
+      "handle": "member_b",
+      "roleLabel": "member (tenant-b)",
+      "role": "member",
+      "tenant": "tenant-b",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-r314-member-b-token"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "ctl",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/invoices/inv_r314_1",
+      "persona": "owner_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"id\":\"inv_r314_1\",\"owner_id\":\"owner_a\",\"tenant_id\":\"tenant-a\"}"
+    },
+    {
+      "id": "prb",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/invoices/inv_r314_1",
+      "persona": "member_b",
+      "status": 403,
+      "mediaType": "application/json",
+      "responseHeaders": {
+        "content-type": "application/json"
+      },
+      "body": "{\"error\":\"forbidden\"}"
+    }
+  ],
+  "replaySpec": {
+    "assertionsJq": "{ controlPassed: (.steps.ctl.status == 200), confirmed: false, observed: \"unclassified\", expected: \"403\" }"
+  },
+  "claims": []
+}
