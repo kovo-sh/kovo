@@ -1,0 +1,73 @@
+{
+  "id": "sqli-fingerprint-tp",
+  "side": "tp",
+  "archetype": "sqli-engine-fingerprint",
+  "description": "Benign control returns 200 JSON while malformed quote probe produces genuine database dialect syntax error absent from request and control.",
+  "canonicalLabel": {
+    "cwe": "CWE-89",
+    "category": "sqli",
+    "title": "SQL injection error oracle in search query",
+    "impact": "Database parser error confirms query string interpolation.",
+    "claimedImpact": "injection",
+    "claimedBoundary": "other",
+    "vulnClass": "sqli_error",
+    "injectionFamily": "sqli"
+  },
+  "freeTextLabel": {
+    "title": "Database query syntax error in search parameter"
+  },
+  "paths": {
+    "replay": true,
+    "floorReceipt": true,
+    "evaluateClaims": true,
+    "composite": false,
+    "floorInjectionRecipe": true
+  },
+  "expected": {
+    "confirmed": true
+  },
+  "personas": [],
+  "exchanges": [
+    {
+      "id": "ctl",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/search?q=books",
+      "persona": null,
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"items\":[{\"id\":1,\"title\":\"Books\"}]}"
+    },
+    {
+      "id": "prb",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/search?q=books%27",
+      "persona": null,
+      "status": 500,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"error\":\"SQLITE_ERROR: near \\\"books\\\": syntax error\"}"
+    }
+  ],
+  "replaySpec": {
+    "assertionsJq": "{ controlPassed: (.steps.ctl.status == 200), confirmed: (.steps.ctl.status == 200 and .steps.prb.status == 500 and (.steps.prb.body | contains(\"SQLITE_ERROR\"))), observed: .steps.prb.body, expected: \"200\" }"
+  },
+  "injectionRecipe": {
+    "param": "q",
+    "controlValue": "books",
+    "payload": "books'",
+    "family": "sqli"
+  },
+  "claims": [
+    { "kind": "impact", "impactClass": "injection", "probeExchangeId": "prb", "controlExchangeIds": ["ctl"] }
+  ],
+  "bareClaims": [
+    { "kind": "status", "exchangeId": "ctl", "expected": 200 },
+    { "kind": "status", "exchangeId": "prb", "expected": 500 },
+    { "kind": "body_contains", "exchangeId": "prb", "text": "SQLITE_ERROR" }
+  ]
+}

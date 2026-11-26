@@ -51,7 +51,7 @@
  * single source of truth for the guard.
  */
 import { createHash } from 'node:crypto'
-import { matchInjectionFingerprint } from './oracle-invariants.ts'
+import { matchStrippedInjectionFingerprint } from './oracle-invariants.ts'
 import type { AmbientAuth, ImpactStep, InjectionFamily, RoleName } from './oracle-invariants.ts'
 import type { BrokerExchangeResult, BrokerHttpRequest, Grant, RequestBroker } from './broker.ts'
 import { buildProofReceipt, verifyReceipt } from './proof-receipt.ts'
@@ -635,6 +635,7 @@ class RecipeContext implements FloorRecipeContext {
           ? { body: JSON.stringify(exchange.json) }
           : {}),
       ...(spec.jsonBody !== undefined ? { requestJson: spec.jsonBody } : {}),
+      ...(spec.textBody !== undefined ? { requestBody: spec.textBody } : {}),
       ...(spec.headers ? { requestHeaders: spec.headers } : {}),
       ...(exchange.responseHeaders ? { responseHeaders: exchange.responseHeaders } : {}),
       ...(exchange.secretMatches?.length ? { secretMatches: exchange.secretMatches.slice(0, 16) } : {}),
@@ -1607,17 +1608,20 @@ const injectionFingerprint = defineRecipe<InjectionFingerprintArgs>('injection_f
     ...(probeArm?.jsonBody ? { jsonBody: probeArm.jsonBody } : {}),
     ...(args.headers ? { headers: args.headers } : {}),
   })
-  const textOf = (step: FloorRecipeStep): string => {
-    const exchange = step.exchange
-    const parts = [exchange.body ?? '']
-    if (exchange.json !== undefined) parts.push(JSON.stringify(exchange.json))
-    if (exchange.carrierText) parts.push(exchange.carrierText)
-    return parts.join('\n')
-  }
-  const fingerprint = matchInjectionFingerprint(textOf(probe), args.family)
-  ctx.require(fingerprint !== null, 'injection_probe', 'The probe response carried no engine/parser error fingerprint; a status change alone is not injection.', 'probe')
+  const boundFamily: InjectionFamily | undefined = args.family ?? (() => {
+    const vc = args.vulnClass.trim().toLowerCase()
+    if (/sqli|sql_injection/.test(vc)) return 'sqli'
+    if (/nosql/.test(vc)) return 'nosqli'
+    if (/cmdi|command_injection/.test(vc)) return 'cmdi'
+    if (/ssti|template/.test(vc)) return 'ssti'
+    if (/xxe/.test(vc)) return 'xxe'
+    if (/traversal|lfi|path_traversal/.test(vc)) return 'traversal'
+    return undefined
+  })()
+  const fingerprint = matchStrippedInjectionFingerprint(probe.step, boundFamily)
+  ctx.require(fingerprint !== null, 'injection_probe', 'The probe response carried no non-echoed engine/parser error fingerprint; a status change or reflected payload alone is not injection.', 'probe')
   ctx.require(
-    fingerprint === null || !matchInjectionFingerprint(textOf(control), fingerprint.family),
+    fingerprint === null || !matchStrippedInjectionFingerprint(control.step, fingerprint.family),
     'benign_control',
     'The benign control produced the same engine error, so the fingerprint is infrastructure noise, not injection.',
     'control',

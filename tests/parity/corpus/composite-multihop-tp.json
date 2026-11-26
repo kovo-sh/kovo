@@ -1,0 +1,94 @@
+{
+  "id": "composite-multihop-tp",
+  "side": "tp",
+  "archetype": "composite-multihop-cross-tenant",
+  "description": "Two-hop composite chain: Hop 1 mints a cross-tenant export artifact handle and Hop 2 consumes it to download substantive victim tenant billing data.",
+  "canonicalLabel": {
+    "cwe": "CWE-639",
+    "category": "bola",
+    "title": "Multi-hop cross-tenant export artifact disclosure",
+    "impact": "Chained export token grants unauthorized access to victim tenant payroll ledger.",
+    "claimedImpact": "authorization",
+    "claimedBoundary": "access",
+    "vulnClass": "bola"
+  },
+  "freeTextLabel": {
+    "title": "Two-hop cross-tenant unauthorized artifact disclosure"
+  },
+  "paths": {
+    "replay": false,
+    "floorReceipt": false,
+    "evaluateClaims": true,
+    "composite": true,
+    "floorInjectionRecipe": false
+  },
+  "expected": {
+    "confirmed": true
+  },
+  "personas": [
+    {
+      "handle": "member_a",
+      "roleLabel": "member (tenant-a)",
+      "role": "member",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-member-a-token"
+    },
+    {
+      "handle": "viewer_a",
+      "roleLabel": "viewer (tenant-a)",
+      "role": "viewer",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-viewer-a-token"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "hop1_ex",
+      "arm": "setup",
+      "role": "setup",
+      "method": "POST",
+      "pathAndQuery": "/v1/exports/request",
+      "persona": "member_a",
+      "requestJson": { "tenant": "tenant-b", "scope": "ledger" },
+      "status": 201,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"jobId\":\"job_77\",\"downloadToken\":\"tok_exp_9f8e7d6c5b4a\"}"
+    },
+    {
+      "id": "hop2_ctl",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/v1/exports/download?token=invalid_tok",
+      "persona": "viewer_a",
+      "status": 403,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"error\":\"forbidden\"}"
+    },
+    {
+      "id": "hop2_prb",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/v1/exports/download?token=tok_exp_9f8e7d6c5b4a",
+      "persona": "member_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"tenant_id\":\"tenant-b\",\"owner_id\":\"owner_b\",\"email\":\"payroll@tenant-b.example\",\"ledger_balance\":945000}"
+    }
+  ],
+  "composite": {
+    "chainId": "PARITY-COMP-TP-1",
+    "terminalVulnClass": "bola",
+    "oracleFamily": "dual_tenant_abac",
+    "capabilityToken": "tok_exp_9f8e7d6c5b4a",
+    "claimedDelta": "Cross-tenant export handle minted in hop 1 unlocked victim tenant-b ledger payload in hop 2."
+  }
+}

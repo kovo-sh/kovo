@@ -1,0 +1,100 @@
+{
+  "id": "job-handle-stub-fp",
+  "side": "fp",
+  "archetype": "job-handle-stub",
+  "description": "Queued async export 202 job stub and handle poll without downloading substantive cross-tenant data.",
+  "canonicalLabel": {
+    "cwe": "CWE-639",
+    "category": "bola",
+    "title": "Cross-tenant export job initiation BOLA",
+    "impact": "Initiates queued export handle for another tenant.",
+    "claimedImpact": "authorization",
+    "claimedBoundary": "access",
+    "vulnClass": "bola"
+  },
+  "freeTextLabel": {
+    "title": "Cross-tenant unauthorized access to export queue handle"
+  },
+  "paths": {
+    "replay": true,
+    "floorReceipt": true,
+    "evaluateClaims": true,
+    "composite": false,
+    "floorInjectionRecipe": false
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [
+    {
+      "handle": "viewer_a",
+      "roleLabel": "viewer (tenant-a)",
+      "role": "viewer",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-viewer-a-token"
+    },
+    {
+      "handle": "member_a",
+      "roleLabel": "member (tenant-a)",
+      "role": "member",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-member-a-token"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "ctl",
+      "arm": "control",
+      "role": "control",
+      "method": "POST",
+      "pathAndQuery": "/v1/orgs/tenant-b/exports",
+      "persona": "viewer_a",
+      "requestJson": { "format": "csv" },
+      "status": 403,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"error\":\"forbidden\"}"
+    },
+    {
+      "id": "prb",
+      "arm": "probe",
+      "role": "probe",
+      "method": "POST",
+      "pathAndQuery": "/v1/orgs/tenant-b/exports",
+      "persona": "member_a",
+      "requestJson": { "format": "csv" },
+      "status": 202,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"jobId\":\"job_99\",\"status\":\"queued\",\"tenant\":\"tenant-b\"}"
+    },
+    {
+      "id": "poll",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/v1/exports/job_99",
+      "persona": "member_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"job\":{\"id\":\"job_99\",\"status\":\"ready\",\"artifactKey\":\"tenant-b/data.csv\"}}"
+    }
+  ],
+  "replaySpec": {
+    "resourceTenant": "tenant-b",
+    "assertionsJq": "{ controlPassed: (.steps.ctl.status == 403), confirmed: (.steps.prb.status == 202 and .steps.poll.json.job.status == \"ready\"), observed: .steps.prb.json.jobId, expected: \"403\" }"
+  },
+  "claims": [
+    { "kind": "boundary", "boundaryClass": "access", "controlExchangeId": "ctl", "probeExchangeId": "prb", "expectControlDenied": true }
+  ],
+  "bareClaims": [
+    { "kind": "status", "exchangeId": "ctl", "expected": 403 },
+    { "kind": "status", "exchangeId": "prb", "expected": 202 },
+    { "kind": "status", "exchangeId": "poll", "expected": 200 }
+  ]
+}

@@ -1,0 +1,76 @@
+{
+  "id": "anon-control-authz-fp",
+  "side": "fp",
+  "archetype": "anon-control-authz",
+  "description": "Anonymous 401 control paired with authenticated member reading own tenant record; proves login gate, not authz crossing.",
+  "canonicalLabel": {
+    "cwe": "CWE-639",
+    "category": "bola",
+    "title": "Cross-tenant BOLA read on invoice",
+    "impact": "Reads invoice record across authorization boundary.",
+    "claimedImpact": "authorization",
+    "claimedBoundary": "access",
+    "vulnClass": "bola"
+  },
+  "freeTextLabel": {
+    "title": "Unauthorized cross-tenant invoice access on member endpoint"
+  },
+  "paths": {
+    "replay": true,
+    "floorReceipt": true,
+    "evaluateClaims": true,
+    "composite": false,
+    "floorInjectionRecipe": false
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [
+    {
+      "handle": "member_a",
+      "roleLabel": "member (tenant-a)",
+      "role": "member",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-member-a-token"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "ctl",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/invoices/inv_101",
+      "persona": null,
+      "status": 401,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"error\":\"unauthorized\"}"
+    },
+    {
+      "id": "prb",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/invoices/inv_101",
+      "persona": "member_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"id\":\"inv_101\",\"owner_id\":\"member_a\",\"tenant_id\":\"tenant-a\",\"total\":4200}"
+    }
+  ],
+  "replaySpec": {
+    "assertionsJq": "{ controlPassed: (.steps.ctl.status == 401), confirmed: (.steps.ctl.status == 401 and .steps.prb.status == 200 and .steps.prb.json.id == \"inv_101\"), observed: \"member_a read invoice\", expected: \"403\" }"
+  },
+  "claims": [
+    { "kind": "boundary", "boundaryClass": "access", "controlExchangeId": "ctl", "probeExchangeId": "prb", "expectControlDenied": true }
+  ],
+  "bareClaims": [
+    { "kind": "status", "exchangeId": "ctl", "expected": 401 },
+    { "kind": "status", "exchangeId": "prb", "expected": 200 },
+    { "kind": "body_contains", "exchangeId": "prb", "text": "inv_101" }
+  ]
+}

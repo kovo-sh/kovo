@@ -1,0 +1,74 @@
+{
+  "id": "error-status-only-injection-fp",
+  "side": "fp",
+  "archetype": "error-status-only-injection",
+  "description": "Benign 200 control vs bare 500 error probe without any engine or parser fingerprint.",
+  "canonicalLabel": {
+    "cwe": "CWE-89",
+    "category": "sqli",
+    "title": "SQL injection in report filter parameter",
+    "impact": "Malformed query filter triggers server error.",
+    "claimedImpact": "injection",
+    "claimedBoundary": "other",
+    "vulnClass": "sqli",
+    "injectionFamily": "sqli"
+  },
+  "freeTextLabel": {
+    "title": "SQL injection error divergence on filter endpoint"
+  },
+  "paths": {
+    "replay": true,
+    "floorReceipt": true,
+    "evaluateClaims": true,
+    "composite": false,
+    "floorInjectionRecipe": true
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [],
+  "exchanges": [
+    {
+      "id": "ctl",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/reports?filter=recent",
+      "persona": null,
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"items\":[{\"id\":1,\"label\":\"recent\"}]}"
+    },
+    {
+      "id": "prb",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/reports?filter=recent%27",
+      "persona": null,
+      "status": 500,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"error\":\"Internal Server Error\",\"code\":\"ERR_UNHANDLED\"}"
+    }
+  ],
+  "replaySpec": {
+    "assertionsJq": "{ controlPassed: (.steps.ctl.status == 200), confirmed: (.steps.ctl.status == 200 and .steps.prb.status == 500), observed: \"HTTP 500\", expected: \"HTTP 200\" }"
+  },
+  "injectionRecipe": {
+    "param": "filter",
+    "controlValue": "recent",
+    "payload": "recent'",
+    "family": "sqli"
+  },
+  "claims": [
+    { "kind": "status", "exchangeId": "ctl", "expected": 200 },
+    { "kind": "status", "exchangeId": "prb", "expected": 500 },
+    { "kind": "body_contains", "exchangeId": "prb", "text": "Internal Server Error" }
+  ],
+  "bareClaims": [
+    { "kind": "status", "exchangeId": "ctl", "expected": 200 },
+    { "kind": "status", "exchangeId": "prb", "expected": 500 }
+  ]
+}
