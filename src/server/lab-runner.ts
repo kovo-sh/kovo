@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
+import type { ParsedComposeDocument } from './compose-parse.ts'
 import {
   chmodSync,
   closeSync,
@@ -804,25 +805,29 @@ export class LabRunner {
     const containerUser = resolveLabContainerUser(this.env)
 
     // Strict pre-launch validation BEFORE touching Docker or creating any networks/containers!
-    let composeYaml: string | undefined
+    const safeComposeEnv = this.env !== process.env ? this.env : {}
+    let composeDocument: ParsedComposeDocument | undefined
     if (labConfig.dockerComposeFile?.trim()) {
       const composePath = safeResolveUnderRoot(params.repoDir, labConfig.dockerComposeFile.trim())
       if (!existsSync(composePath)) {
         throw new Error(`Docker Compose file not found: ${labConfig.dockerComposeFile}`)
       }
-      composeYaml = readFileSync(composePath, 'utf8')
+      const composeYaml = readFileSync(composePath, 'utf8')
       // Isolate untrusted compose YAML parsing inside bounded worker_threads pool (H-38).
-      await parseComposeInWorker(composeYaml, { env: this.env, signal: params.signal })
+      composeDocument = await parseComposeInWorker(composeYaml, { env: safeComposeEnv, signal: params.signal })
     }
     const { primaryService, sidecarServices } = resolveLabStackServices({
       labConfig,
-      composeYaml,
-      env: this.env,
+      composeDocument,
+      env: safeComposeEnv,
     })
 
     if (this.supervisor.hasActiveRun(params.runId)) {
       await this.stopLabTarget(params.runId)
     }
+
+    // Guard against concurrent recoverAll() reaping containers while this run is mid-boot (H4).
+    this.supervisor.markBooting(params.runId)
 
     const internalPort = primaryService.internalPort ?? labConfig.internalPort ?? 8080
     const healthPath = primaryService.healthPath
@@ -1007,6 +1012,8 @@ export class LabRunner {
       if (ephemeralTelemetryDir && telemetryDir) safeRemoveLabTempDir(telemetryDir)
       removeLabRunRecord(this.stateDir, params.runId)
       throw err
+    } finally {
+      this.supervisor.clearBooting(params.runId)
     }
   }
 
@@ -1147,8 +1154,19 @@ export class LabRunner {
     return this.supervisor.recover(runId, storage)
   }
 
-  recoverAll(storage?: LabContainerStore): Promise<LabRecoveryResult[]> {
-    return this.supervisor.recoverAll(storage)
+  recoverAll(
+    storage?: LabContainerStore,
+    options?: { includeLiveOwners?: boolean; persistedContainers?: ReadonlyArray<PersistedLabContainerRef> },
+  ): Promise<LabRecoveryResult[]> {
+    return this.supervisor.recoverAll(storage, options)
+  }
+
+  /** Clean idempotent startup hook for server boot: reaps orphaned containers before resuming runs. */
+  recoverOnStartup(
+    storage?: LabContainerStore,
+    options?: { includeLiveOwners?: boolean; persistedContainers?: ReadonlyArray<PersistedLabContainerRef> },
+  ): Promise<LabRecoveryResult[]> {
+    return this.supervisor.ensureStartupRecovery(storage, options)
   }
 
   reapSyncAll(): void {

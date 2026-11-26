@@ -15,11 +15,15 @@ import {
   type ComposeParseOptions,
   type ParsedComposeDocument,
 } from './compose-parse.ts'
+import type { ProgramGraph } from './program-graph.ts'
 
 export type UntrustedTaskKind =
   | 'parse_compose'
   | 'parse_compose_env'
   | 'parse_json'
+  | 'parse_json_or_yaml'
+  | 'js_harvest'
+  | 'extract_html'
   | 'extract_program_graph'
   | 'build_program_graph'
 
@@ -53,6 +57,20 @@ export const DEFAULT_WORKER_RESOURCE_LIMITS: Readonly<Required<Pick<
 export const DEFAULT_UNTRUSTED_TASK_TIMEOUT_MS = 5_000
 export const DEFAULT_UNTRUSTED_MAX_CONCURRENCY = 2
 export const DEFAULT_UNTRUSTED_MAX_QUEUE_SIZE = 64
+export const DEFAULT_UNTRUSTED_MAX_PAYLOAD_BYTES = 4 * 1024 * 1024
+export const MAX_UNTRUSTED_PAYLOAD_BYTES_CAP = 32 * 1024 * 1024
+
+export class UntrustedComputePayloadTooLargeError extends Error {
+  readonly actualBytes: number
+  readonly maxBytes: number
+
+  constructor(actualBytes: number, maxBytes: number) {
+    super(`Untrusted compute payload exceeds maximum size (${actualBytes} > ${maxBytes} bytes).`)
+    this.name = 'UntrustedComputePayloadTooLargeError'
+    this.actualBytes = actualBytes
+    this.maxBytes = maxBytes
+  }
+}
 
 export class UntrustedComputeTimeoutError extends Error {
   readonly timeoutMs: number
@@ -101,6 +119,8 @@ export interface UntrustedComputePoolOptions {
   resourceLimits?: ResourceLimits
   /** Recycle a worker after this many completed tasks (defaults to 100). */
   maxTasksPerWorker?: number
+  /** Maximum serialized payload size accepted per task in bytes (defaults to 4 MiB). */
+  maxPayloadBytes?: number
   /** Optional custom worker script URL/path (defaults to `./parser-worker-entry.ts`). */
   workerEntry?: URL | string
 }
@@ -108,6 +128,7 @@ export interface UntrustedComputePoolOptions {
 export interface UntrustedTaskOptions {
   timeoutMs?: number
   signal?: AbortSignal
+  maxPayloadBytes?: number
 }
 
 export interface ParseComposeInWorkerOptions extends ComposeParseOptions, UntrustedTaskOptions {}
@@ -135,6 +156,61 @@ function clampInt(value: number | undefined, fallback: number, min: number, max:
   return Math.max(min, Math.min(max, Math.floor(value)))
 }
 
+/**
+ * Bounded iterative byte-size estimator for structured-clone payloads. Short-circuits as soon as
+ * `limit` is exceeded so adversarial payloads cannot stall or OOM the host before worker dispatch.
+ */
+function estimateBoundedPayloadBytes(value: unknown, limit: number): number {
+  const seen = new Set<object>()
+  const stack: unknown[] = [value]
+  let total = 0
+  let visited = 0
+  const MAX_NODES = 200_000
+
+  while (stack.length > 0) {
+    const item = stack.pop()
+    visited += 1
+    if (visited > MAX_NODES) return limit + 1
+    if (item === null || item === undefined) {
+      total += 4
+    } else if (typeof item === 'string') {
+      total += Buffer.byteLength(item, 'utf8')
+    } else if (typeof item === 'number' || typeof item === 'boolean') {
+      total += 8
+    } else if (typeof item === 'bigint' || typeof item === 'symbol') {
+      total += 16
+    } else if (Buffer.isBuffer(item) || ArrayBuffer.isView(item)) {
+      total += item.byteLength
+    } else if (item instanceof ArrayBuffer) {
+      total += item.byteLength
+    } else if (typeof item === 'object') {
+      if (seen.has(item)) continue
+      seen.add(item)
+      if (Array.isArray(item)) {
+        total += 16
+        for (let i = item.length - 1; i >= 0; i -= 1) stack.push(item[i])
+      } else if (item instanceof Map) {
+        total += 16
+        for (const [k, v] of item.entries()) {
+          stack.push(v)
+          stack.push(k)
+        }
+      } else if (item instanceof Set) {
+        total += 16
+        for (const v of item.values()) stack.push(v)
+      } else {
+        total += 16
+        for (const [k, v] of Object.entries(item)) {
+          total += Buffer.byteLength(k, 'utf8')
+          stack.push(v)
+        }
+      }
+    }
+    if (total > limit) return total
+  }
+  return total
+}
+
 function reconstructWorkerError(errInfo: NonNullable<WorkerTaskResponse['error']>): Error {
   if (errInfo.name === 'ComposeParseError') {
     // `ComposeParseError` constructor prefixes "Compose parse error ...: "; strip prefix if already formatted.
@@ -150,6 +226,7 @@ export class UntrustedComputePool {
   readonly maxConcurrency: number
   readonly maxQueueSize: number
   readonly defaultTimeoutMs: number
+  readonly maxPayloadBytes: number
   readonly resourceLimits: ResourceLimits
   readonly maxTasksPerWorker: number
   private readonly workerEntry: URL | string
@@ -162,6 +239,12 @@ export class UntrustedComputePool {
     this.maxConcurrency = clampInt(options.maxConcurrency, DEFAULT_UNTRUSTED_MAX_CONCURRENCY, 1, 16)
     this.maxQueueSize = clampInt(options.maxQueueSize, DEFAULT_UNTRUSTED_MAX_QUEUE_SIZE, 1, 1024)
     this.defaultTimeoutMs = clampInt(options.defaultTimeoutMs, DEFAULT_UNTRUSTED_TASK_TIMEOUT_MS, 10, 120_000)
+    this.maxPayloadBytes = clampInt(
+      options.maxPayloadBytes,
+      DEFAULT_UNTRUSTED_MAX_PAYLOAD_BYTES,
+      1024,
+      MAX_UNTRUSTED_PAYLOAD_BYTES_CAP,
+    )
     this.maxTasksPerWorker = clampInt(options.maxTasksPerWorker, 100, 1, 10_000)
     this.workerEntry = options.workerEntry ?? new URL('./parser-worker-entry.ts', import.meta.url)
     this.resourceLimits = {
@@ -225,6 +308,17 @@ export class UntrustedComputePool {
       return Promise.reject(new UntrustedComputeAbortedError())
     }
 
+    const maxPayloadBytes = clampInt(
+      opts.maxPayloadBytes,
+      this.maxPayloadBytes,
+      1024,
+      MAX_UNTRUSTED_PAYLOAD_BYTES_CAP,
+    )
+    const payloadBytes = estimateBoundedPayloadBytes(payload, maxPayloadBytes)
+    if (payloadBytes > maxPayloadBytes) {
+      return Promise.reject(new UntrustedComputePayloadTooLargeError(payloadBytes, maxPayloadBytes))
+    }
+
     const timeoutMs = clampInt(opts.timeoutMs, this.defaultTimeoutMs, 10, 120_000)
     return new Promise<TResult>((resolve, reject) => {
       const task: PendingTask = {
@@ -277,6 +371,8 @@ export class UntrustedComputePool {
     const worker = new Worker(this.workerEntry, {
       resourceLimits: this.resourceLimits,
       execArgv: [],
+      // Strip host process.env so untrusted worker tasks never have access to host secrets.
+      env: {},
     })
     const slot: PoolWorkerSlot = {
       worker,
@@ -463,12 +559,236 @@ export function getSharedUntrustedComputePool(): UntrustedComputePool {
   return sharedPool
 }
 
+export async function closeSharedUntrustedComputePool(): Promise<void> {
+  const pool = sharedPool
+  sharedPool = undefined
+  if (pool) {
+    await pool.close()
+  }
+}
+
 export function runUntrustedTask<TResult = unknown>(
   kind: UntrustedTaskKind | string,
   payload: unknown,
   opts?: UntrustedTaskOptions,
 ): Promise<TResult> {
   return getSharedUntrustedComputePool().run<TResult>(kind, payload, opts)
+}
+
+// ===========================================================================
+// Pure bounded parsers shared by host synchronous callers & worker isolates
+// ===========================================================================
+
+const POOL_STATIC_ASSET_RE = /\.(?:css|png|jpe?g|gif|svg|webp|ico|woff2?|ttf|eot|mp4|webm|mp3|zip|tar|gz|pdf)(?:\?|$)/i
+
+export function sanitizeSameOriginPath(raw: string, baseOrigin: string): string | null {
+  const trimmed = raw.trim()
+  if (!trimmed || trimmed.startsWith('javascript:') || trimmed.startsWith('mailto:') || trimmed.startsWith('data:') || trimmed.startsWith('#')) {
+    return null
+  }
+  try {
+    const expectedOrigin = new URL(baseOrigin).origin
+    const parsed = new URL(trimmed, baseOrigin)
+    if (parsed.origin !== expectedOrigin) return null
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null
+    if (/[\r\n\0\\]/.test(parsed.pathname + parsed.search)) return null
+    return parsed.pathname + parsed.search
+  } catch {
+    return null
+  }
+}
+
+export interface ExtractedHtmlSurface {
+  links: string[]
+  scripts: string[]
+  forms: Array<{ action: string; method: string; inputs: string[]; enctype: string }>
+  inputs: Array<{ name: string; id: string | null; type: string | null }>
+}
+
+export function extractHtmlLinksAndScripts(html: string, origin: string): ExtractedHtmlSurface {
+  const links = new Set<string>()
+  const scripts = new Set<string>()
+  const forms: Array<{ action: string; method: string; inputs: string[]; enctype: string }> = []
+  const inputs: Array<{ name: string; id: string | null; type: string | null }> = []
+  const seenInputs = new Set<string>()
+
+  for (const m of html.matchAll(/<a\b[^>]*\bhref\s*=\s*["']([^"']+)["']/gi)) {
+    const clean = sanitizeSameOriginPath(m[1] ?? '', origin)
+    if (clean && !POOL_STATIC_ASSET_RE.test(clean)) links.add(clean)
+  }
+  for (const m of html.matchAll(/<script\b[^>]*\bsrc\s*=\s*["']([^"']+)["']/gi)) {
+    const clean = sanitizeSameOriginPath(m[1] ?? '', origin)
+    if (clean) scripts.add(clean)
+  }
+  for (const m of html.matchAll(/<form\b([^>]*)>([\s\S]*?)<\/form>/gi)) {
+    const attrs = m[1] ?? ''
+    const inner = m[2] ?? ''
+    const actionMatch = /\baction\s*=\s*["']([^"']+)["']/i.exec(attrs)
+    const methodMatch = /\bmethod\s*=\s*["']([a-zA-Z]+)["']/i.exec(attrs)
+    const enctypeMatch = /\benctype\s*=\s*["']([^"']+)["']/i.exec(attrs)
+    const action = sanitizeSameOriginPath(actionMatch?.[1] ?? '/', origin) ?? '/'
+    const method = (methodMatch?.[1] ?? 'GET').toUpperCase()
+    const inputsInForm: string[] = []
+    for (const im of inner.matchAll(/<(?:input|select|textarea)\b[^>]*\bname\s*=\s*["']([^"']+)["']/gi)) {
+      if (im[1]) inputsInForm.push(im[1])
+    }
+    forms.push({ action, method, inputs: inputsInForm, enctype: (enctypeMatch?.[1] ?? 'application/x-www-form-urlencoded').toLowerCase() })
+  }
+  for (const tm of html.matchAll(/<(?:input|select|textarea)\b([^>]*)>/gi)) {
+    const attrs = tm[1] ?? ''
+    const nameMatch = /\bname\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i.exec(attrs)
+    const idMatch = /\bid\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i.exec(attrs)
+    const typeMatch = /\btype\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i.exec(attrs)
+    const name = (nameMatch?.[1] ?? nameMatch?.[2] ?? nameMatch?.[3] ?? idMatch?.[1] ?? idMatch?.[2] ?? idMatch?.[3] ?? '').trim()
+    if (!name) continue
+    const id = (idMatch?.[1] ?? idMatch?.[2] ?? idMatch?.[3] ?? null)
+    const type = (typeMatch?.[1] ?? typeMatch?.[2] ?? typeMatch?.[3] ?? null)
+    const key = `${name}|${id ?? ''}`
+    if (seenInputs.has(key)) continue
+    seenInputs.add(key)
+    inputs.push({ name, id: id ? id.trim() : null, type: type ? type.toLowerCase() : null })
+  }
+  return { links: [...links], scripts: [...scripts], forms, inputs }
+}
+
+function stripYamlComment(line: string): string {
+  let quote: string | null = null
+  for (let i = 0; i < line.length; i += 1) {
+    const ch = line[i]
+    if (quote) {
+      if (ch === quote && line[i - 1] !== '\\') quote = null
+      continue
+    }
+    if (ch === '"' || ch === "'") { quote = ch; continue }
+    if (ch === '#' && (i === 0 || /\s/.test(line[i - 1] ?? ''))) return line.slice(0, i)
+  }
+  return line
+}
+
+function splitYamlKeyValue(text: string): { key: string; rest: string } | null {
+  let quote: string | null = null
+  let depth = 0
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i]
+    if (quote) {
+      if (ch === quote && text[i - 1] !== '\\') quote = null
+      continue
+    }
+    if (ch === '"' || ch === "'") { quote = ch; continue }
+    if (ch === '{' || ch === '[') depth += 1
+    else if (ch === '}' || ch === ']') depth -= 1
+    else if (ch === ':' && depth === 0 && (i + 1 >= text.length || /\s/.test(text[i + 1] ?? ''))) {
+      const rawKey = text.slice(0, i).trim()
+      const key = rawKey.replace(/^['"]|['"]$/g, '')
+      if (!key) return null
+      return { key, rest: text.slice(i + 1).trim() }
+    }
+  }
+  return null
+}
+
+function parseYamlScalar(raw: string): unknown {
+  const text = raw.trim()
+  if (!text) return null
+  if ((text.startsWith('"') && text.endsWith('"')) || (text.startsWith("'") && text.endsWith("'"))) {
+    return text.slice(1, -1)
+  }
+  if (/^(?:true|false)$/i.test(text)) return text.toLowerCase() === 'true'
+  if (/^(?:null|~)$/i.test(text)) return null
+  if (/^-?\d+(?:\.\d+)?$/.test(text)) return Number(text)
+  if ((text.startsWith('{') && text.endsWith('}')) || (text.startsWith('[') && text.endsWith(']'))) {
+    try { return JSON.parse(text) } catch { return text }
+  }
+  return text
+}
+
+/** Bounded YAML parser for mapping/sequence documents (OpenAPI, route maps). Not a full YAML engine. */
+export function parseYamlLikeDocument(text: string): unknown {
+  interface Line { indent: number; text: string; raw: string }
+  const lines: Line[] = []
+  for (const rawLine of text.replace(/\r\n?/g, '\n').split('\n')) {
+    if (lines.length > 6000) break
+    const stripped = stripYamlComment(rawLine)
+    const body = stripped.trimEnd()
+    const trimmed = body.trim()
+    if (!trimmed || trimmed === '---' || trimmed === '...') continue
+    const indent = body.length - body.trimStart().length
+    lines.push({ indent, text: trimmed, raw: body })
+  }
+  if (lines.length === 0) return null
+  let index = 0
+  const blockScalar = (indent: number): string => {
+    const parts: string[] = []
+    while (index < lines.length && lines[index]!.indent > indent) {
+      parts.push(lines[index]!.text)
+      index += 1
+    }
+    return parts.join('\n')
+  }
+  const parseNode = (indent: number): unknown => {
+    const first = lines[index]
+    if (!first) return null
+    return first.text === '-' || first.text.startsWith('- ') ? parseSequence(indent) : parseMapping(indent)
+  }
+  const parseSequence = (indent: number): unknown[] => {
+    const out: unknown[] = []
+    while (index < lines.length) {
+      const line = lines[index]!
+      if (line.indent < indent) break
+      if (line.indent > indent) { index += 1; continue }
+      if (!(line.text === '-' || line.text.startsWith('- '))) break
+      const afterDash = line.text.slice(1)
+      if (!afterDash.trim()) {
+        index += 1
+        const next = lines[index]
+        out.push(next && next.indent > indent ? parseNode(next.indent) : null)
+        continue
+      }
+      if (splitYamlKeyValue(afterDash.trim())) {
+        const dashes = /^(\s*)-(\s*)/.exec(line.raw)
+        const childIndent = (dashes?.[1]?.length ?? indent) + 1 + (dashes?.[2]?.length ?? 1)
+        lines[index] = { indent: childIndent, text: afterDash.trim(), raw: ' '.repeat(childIndent) + afterDash.trim() }
+        out.push(parseMapping(childIndent))
+        continue
+      }
+      out.push(parseYamlScalar(afterDash))
+      index += 1
+    }
+    return out
+  }
+  const parseMapping = (indent: number): Record<string, unknown> => {
+    const out: Record<string, unknown> = {}
+    while (index < lines.length) {
+      const line = lines[index]!
+      if (line.indent < indent) break
+      if (line.indent > indent) { index += 1; continue }
+      if (line.text === '-' || line.text.startsWith('- ')) break
+      const kv = splitYamlKeyValue(line.text)
+      if (!kv) { index += 1; continue }
+      index += 1
+      if (kv.rest) {
+        if (/^[|>][+-]?$/.test(kv.rest)) { out[kv.key] = blockScalar(indent); continue }
+        out[kv.key] = parseYamlScalar(kv.rest)
+        continue
+      }
+      const next = lines[index]
+      out[kv.key] = next && next.indent > indent ? parseNode(next.indent) : null
+    }
+    return out
+  }
+  return parseNode(lines[0]!.indent)
+}
+
+/** Parse a JSON or YAML document body into an object (null when neither parses). */
+export function parseJsonOrYaml(rawBody: string): unknown {
+  const text = rawBody.replace(/^\uFEFF/, '').trim()
+  if (!text) return null
+  if (text.startsWith('{') || text.startsWith('[')) {
+    try { return JSON.parse(text) as unknown } catch { /* fall through to YAML */ }
+  }
+  const parsed = parseYamlLikeDocument(text)
+  if (parsed !== null && typeof parsed === 'object') return parsed
+  try { return JSON.parse(text) as unknown } catch { return null }
 }
 
 /**
@@ -500,6 +820,89 @@ export function parseComposeInWorker(
     {
       timeoutMs: opts.timeoutMs,
       signal: opts.signal,
+      ...(opts.maxBytes !== undefined ? { maxPayloadBytes: opts.maxBytes + 4096 } : {}),
+    },
+  )
+}
+
+/** Parse untrusted JSON or YAML-like text (OpenAPI / route-map) inside the bounded worker pool. */
+export function parseJsonOrYamlInWorker(
+  rawBody: string,
+  opts: UntrustedTaskOptions & { maxBytes?: number } = {},
+): Promise<unknown> {
+  return runUntrustedTask<unknown>(
+    'parse_json_or_yaml',
+    {
+      text: rawBody,
+      ...(opts.maxBytes !== undefined ? { maxBytes: opts.maxBytes } : {}),
+    },
+    {
+      timeoutMs: opts.timeoutMs,
+      signal: opts.signal,
+      maxPayloadBytes: opts.maxPayloadBytes ?? DEFAULT_UNTRUSTED_MAX_PAYLOAD_BYTES,
+    },
+  )
+}
+
+/** Run `jsHarvest` on untrusted JS bundle / source-map content inside the bounded worker pool. */
+export function jsHarvestInWorker(
+  content: string,
+  sourceName = '',
+  options?: Record<string, unknown>,
+  taskOpts: UntrustedTaskOptions = {},
+): Promise<Record<string, unknown>> {
+  return runUntrustedTask<Record<string, unknown>>(
+    'js_harvest',
+    {
+      content,
+      sourceName,
+      ...(options ? { options } : {}),
+    },
+    {
+      timeoutMs: taskOpts.timeoutMs,
+      signal: taskOpts.signal,
+      maxPayloadBytes: taskOpts.maxPayloadBytes ?? DEFAULT_UNTRUSTED_MAX_PAYLOAD_BYTES,
+    },
+  )
+}
+
+/** Extract links, scripts, forms, and inputs from untrusted HTML inside the bounded worker pool. */
+export function extractHtmlLinksAndScriptsInWorker(
+  html: string,
+  origin: string,
+  opts: UntrustedTaskOptions & { maxBytes?: number } = {},
+): Promise<ExtractedHtmlSurface> {
+  return runUntrustedTask<ExtractedHtmlSurface>(
+    'extract_html',
+    {
+      html,
+      origin,
+      ...(opts.maxBytes !== undefined ? { maxBytes: opts.maxBytes } : {}),
+    },
+    {
+      timeoutMs: opts.timeoutMs,
+      signal: opts.signal,
+      maxPayloadBytes: opts.maxPayloadBytes ?? DEFAULT_UNTRUSTED_MAX_PAYLOAD_BYTES,
+    },
+  )
+}
+
+/** Build a cross-framework `ProgramGraph` from untrusted repository source files inside the bounded worker pool. */
+export function extractProgramGraphInWorker(
+  input: {
+    files?: ReadonlyArray<{ path: string; content: string }>
+    repo?: string
+    maxFileBytes?: number
+  },
+  opts: UntrustedTaskOptions = {},
+): Promise<ProgramGraph> {
+  return runUntrustedTask<ProgramGraph>(
+    'extract_program_graph',
+    input,
+    {
+      timeoutMs: opts.timeoutMs,
+      signal: opts.signal,
+      maxPayloadBytes: opts.maxPayloadBytes ?? MAX_UNTRUSTED_PAYLOAD_BYTES_CAP,
     },
   )
 }

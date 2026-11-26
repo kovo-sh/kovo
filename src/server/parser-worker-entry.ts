@@ -12,12 +12,17 @@ import {
   type ComposeParseOptions,
 } from './compose-parse.ts'
 import type { StaticWorkspaceSnapshot } from './static-workspace-snapshot.ts'
-import type {
-  WorkerTaskRequest,
-  WorkerTaskResponse,
+import {
+  extractHtmlLinksAndScripts,
+  parseJsonOrYaml,
+  type WorkerTaskRequest,
+  type WorkerTaskResponse,
 } from './untrusted-compute-pool.ts'
 
 const MAX_JSON_BYTES = 2 * 1024 * 1024
+const MAX_HTML_BYTES = 2 * 1024 * 1024
+const MAX_JS_BYTES = 2 * 1024 * 1024
+const MAX_PROGRAM_GRAPH_BYTES = 24 * 1024 * 1024
 
 interface ParseComposePayload {
   yamlText: string
@@ -30,6 +35,18 @@ interface ParseComposeEnvPayload {
 
 interface ParseJsonPayload {
   text: string
+  maxBytes?: number
+}
+
+interface JsHarvestPayload {
+  content: string
+  sourceName?: string
+  options?: Record<string, unknown>
+}
+
+interface ExtractHtmlPayload {
+  html: string
+  origin: string
   maxBytes?: number
 }
 
@@ -74,11 +91,60 @@ async function executeTask(kind: string, payload: unknown): Promise<unknown> {
       }
       return JSON.parse(req.text) as unknown
     }
+    case 'parse_json_or_yaml': {
+      const req = (payload ?? {}) as ParseJsonPayload
+      if (typeof req.text !== 'string') {
+        throw new Error('Document input text must be a string')
+      }
+      const maxBytes = typeof req.maxBytes === 'number' && Number.isFinite(req.maxBytes) && req.maxBytes > 0
+        ? Math.min(req.maxBytes, MAX_JSON_BYTES)
+        : MAX_JSON_BYTES
+      if (Buffer.byteLength(req.text, 'utf8') > maxBytes) {
+        throw new Error(`Document input exceeds maximum size of ${maxBytes} bytes`)
+      }
+      return parseJsonOrYaml(req.text)
+    }
+    case 'js_harvest': {
+      const req = (payload ?? {}) as JsHarvestPayload
+      if (typeof req.content !== 'string') {
+        throw new Error('js_harvest content must be a string')
+      }
+      if (Buffer.byteLength(req.content, 'utf8') > MAX_JS_BYTES) {
+        throw new Error(`JS input exceeds maximum size of ${MAX_JS_BYTES} bytes`)
+      }
+      const { jsHarvest } = await import('../../worker/analyzers.ts')
+      return jsHarvest(req.content, typeof req.sourceName === 'string' ? req.sourceName : '', req.options)
+    }
+    case 'extract_html': {
+      const req = (payload ?? {}) as ExtractHtmlPayload
+      if (typeof req.html !== 'string' || typeof req.origin !== 'string') {
+        throw new Error('extract_html requires html and origin strings')
+      }
+      const maxBytes = typeof req.maxBytes === 'number' && Number.isFinite(req.maxBytes) && req.maxBytes > 0
+        ? Math.min(req.maxBytes, MAX_HTML_BYTES)
+        : MAX_HTML_BYTES
+      if (Buffer.byteLength(req.html, 'utf8') > maxBytes) {
+        throw new Error(`HTML input exceeds maximum size of ${maxBytes} bytes`)
+      }
+      return extractHtmlLinksAndScripts(req.html, req.origin)
+    }
     case 'extract_program_graph':
     case 'build_program_graph': {
       const req = (payload ?? {}) as ExtractProgramGraphPayload
       if (!req || (!Array.isArray(req.files) && !req.staticSnapshot)) {
         throw new Error('extract_program_graph requires files or staticSnapshot')
+      }
+      if (Array.isArray(req.files)) {
+        let totalBytes = 0
+        for (const file of req.files) {
+          if (!file || typeof file.path !== 'string' || typeof file.content !== 'string') {
+            throw new Error('extract_program_graph files entries must have string path and content')
+          }
+          totalBytes += Buffer.byteLength(file.content, 'utf8')
+          if (totalBytes > MAX_PROGRAM_GRAPH_BYTES) {
+            throw new Error(`extract_program_graph input exceeds maximum size of ${MAX_PROGRAM_GRAPH_BYTES} bytes`)
+          }
+        }
       }
       const { extractProgramGraph } = await import('./program-graph.ts')
       return extractProgramGraph(req)

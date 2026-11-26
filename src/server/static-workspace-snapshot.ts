@@ -19,6 +19,7 @@ import {
 } from 'node:fs'
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { extractProgramGraph, type ProgramGraph } from './program-graph.ts'
+import { extractProgramGraphInWorker } from './untrusted-compute-pool.ts'
 
 // ============================================================================
 // Bounds & Exclusion Rules
@@ -173,6 +174,10 @@ export interface BuildStaticWorkspaceSnapshotOptions {
   repo?: string
   /** Optional explicit mounted repo list (skips inferring from walk depth). */
   mountedRepos?: readonly string[]
+  /** Optional timeout for worker-isolated ProgramGraph extraction. */
+  workerTimeoutMs?: number
+  /** Optional cancellation signal for worker-isolated ProgramGraph extraction. */
+  signal?: AbortSignal
 }
 
 // ============================================================================
@@ -276,14 +281,26 @@ function shouldReadIntoSourceCache(name: string, ext: string): boolean {
 // Snapshot Builder & Accessors
 // ============================================================================
 
-/**
- * Perform ONE bounded, permission-safe walk of `reposDir`, cache bounded UTF-8 text
- * sources (excluding secrets & binaries), and build `ProgramGraph` once.
- */
-export function buildStaticWorkspaceSnapshot(
+interface CollectedSnapshotInputs {
+  empty?: StaticWorkspaceSnapshot
+  rootReal?: string
+  files?: readonly string[]
+  sourceByPath?: ReadonlyMap<string, string>
+  graphSourceFiles?: Array<{ path: string; content: string }>
+  mountedRepos?: readonly string[]
+  manifests?: readonly StaticWorkspaceManifest[]
+  dockerfiles?: readonly StaticWorkspaceFileContent[]
+  compose?: string
+  ingress?: string
+  createdAtMs?: number
+  walkStats?: StaticWorkspaceWalkStats
+  repoLabel?: string
+}
+
+function collectWorkspaceSnapshotInputs(
   reposDir: string,
   options: BuildStaticWorkspaceSnapshotOptions = {},
-): StaticWorkspaceSnapshot {
+): CollectedSnapshotInputs {
   const createdAtMs = Date.now()
   const maxFiles = Math.max(1, Math.min(options.maxFiles ?? DEFAULT_SNAPSHOT_MAX_FILES, 20_000))
   const maxFileBytes = Math.max(1024, Math.min(options.maxFileBytes ?? DEFAULT_SNAPSHOT_MAX_FILE_BYTES, 4 * 1024 * 1024))
@@ -306,16 +323,16 @@ export function buildStaticWorkspaceSnapshot(
   }
 
   if (!reposDir || /[\0\r\n]/.test(reposDir) || !existsSync(reposDir)) {
-    return emptySnapshot('')
+    return { empty: emptySnapshot('') }
   }
 
   let rootReal: string
   try {
     rootReal = realpathSync(reposDir)
     const rootSt = lstatSync(rootReal)
-    if (!rootSt.isDirectory()) return emptySnapshot(rootReal)
+    if (!rootSt.isDirectory()) return { empty: emptySnapshot(rootReal) }
   } catch {
-    return emptySnapshot('')
+    return { empty: emptySnapshot('') }
   }
 
   const files: string[] = []
@@ -439,14 +456,12 @@ export function buildStaticWorkspaceSnapshot(
     : [...inferredMountedRepos].sort()
 
   const repoLabel = options.repo ?? (mountedRepos.join(',') || undefined)
-  const programGraph = extractProgramGraph({ files: graphSourceFiles, repo: repoLabel })
 
-  return Object.freeze({
-    reposDir,
+  return {
     rootReal,
     files: Object.freeze(files),
     sourceByPath: createImmutableMap(sourceEntries),
-    programGraph,
+    graphSourceFiles,
     mountedRepos: Object.freeze(mountedRepos),
     manifests: Object.freeze(manifests),
     dockerfiles: Object.freeze(dockerfiles),
@@ -458,7 +473,75 @@ export function buildStaticWorkspaceSnapshot(
       filesScanned,
       bytesRead,
     }),
+    repoLabel,
+  }
+}
+
+function freezeSnapshot(reposDir: string, collected: CollectedSnapshotInputs, programGraph: ProgramGraph): StaticWorkspaceSnapshot {
+  return Object.freeze({
+    reposDir,
+    rootReal: collected.rootReal!,
+    files: collected.files!,
+    sourceByPath: collected.sourceByPath!,
+    programGraph,
+    mountedRepos: collected.mountedRepos!,
+    manifests: collected.manifests!,
+    dockerfiles: collected.dockerfiles!,
+    ...(collected.compose !== undefined ? { compose: collected.compose } : {}),
+    ...(collected.ingress !== undefined ? { ingress: collected.ingress } : {}),
+    createdAtMs: collected.createdAtMs!,
+    walkStats: collected.walkStats!,
   })
+}
+
+function matchesExistingSnapshot(reposDir: string, existing?: StaticWorkspaceSnapshot | null): existing is StaticWorkspaceSnapshot {
+  if (!existing) return false
+  if (existing.reposDir === reposDir) return true
+  if (reposDir && existing.rootReal) {
+    if (resolve(reposDir) === existing.rootReal || resolve(reposDir) === resolve(existing.reposDir)) {
+      return true
+    }
+    try {
+      if (realpathSync(reposDir) === existing.rootReal) return true
+    } catch {
+      // Directory may have been removed or unresolvable; fall through to rebuild if needed.
+    }
+  }
+  return false
+}
+
+/**
+ * Perform ONE bounded, permission-safe walk of `reposDir`, cache bounded UTF-8 text
+ * sources (excluding secrets & binaries), and build `ProgramGraph` once.
+ */
+export function buildStaticWorkspaceSnapshot(
+  reposDir: string,
+  options: BuildStaticWorkspaceSnapshotOptions = {},
+): StaticWorkspaceSnapshot {
+  const collected = collectWorkspaceSnapshotInputs(reposDir, options)
+  if (collected.empty) return collected.empty
+  const programGraph = extractProgramGraph({ files: collected.graphSourceFiles, repo: collected.repoLabel })
+  return freezeSnapshot(reposDir, collected, programGraph)
+}
+
+/**
+ * Async variant of `buildStaticWorkspaceSnapshot` that offloads `extractProgramGraph`
+ * onto `UntrustedComputePool` so untrusted source parsing never stalls the main event loop.
+ */
+export async function buildStaticWorkspaceSnapshotInWorker(
+  reposDir: string,
+  options: BuildStaticWorkspaceSnapshotOptions = {},
+): Promise<StaticWorkspaceSnapshot> {
+  const collected = collectWorkspaceSnapshotInputs(reposDir, options)
+  if (collected.empty) return collected.empty
+  const files = collected.graphSourceFiles ?? []
+  const programGraph = files.length === 0
+    ? extractProgramGraph({ files: [], repo: collected.repoLabel })
+    : await extractProgramGraphInWorker(
+        { files, repo: collected.repoLabel },
+        { timeoutMs: options.workerTimeoutMs, signal: options.signal },
+      )
+  return freezeSnapshot(reposDir, collected, programGraph)
 }
 
 /**
@@ -470,20 +553,21 @@ export function getOrBuildStaticWorkspaceSnapshot(
   existing?: StaticWorkspaceSnapshot | null,
   options?: BuildStaticWorkspaceSnapshotOptions,
 ): StaticWorkspaceSnapshot {
-  if (existing) {
-    if (existing.reposDir === reposDir) return existing
-    if (reposDir && existing.rootReal) {
-      if (resolve(reposDir) === existing.rootReal || resolve(reposDir) === resolve(existing.reposDir)) {
-        return existing
-      }
-      try {
-        if (realpathSync(reposDir) === existing.rootReal) return existing
-      } catch {
-        // Directory may have been removed or unresolvable; fall through to rebuild if needed.
-      }
-    }
-  }
+  if (matchesExistingSnapshot(reposDir, existing)) return existing
   return buildStaticWorkspaceSnapshot(reposDir, options)
+}
+
+/**
+ * Async variant of `getOrBuildStaticWorkspaceSnapshot` offloading `ProgramGraph` extraction
+ * onto `UntrustedComputePool`.
+ */
+export async function getOrBuildStaticWorkspaceSnapshotInWorker(
+  reposDir: string,
+  existing?: StaticWorkspaceSnapshot | null,
+  options?: BuildStaticWorkspaceSnapshotOptions,
+): Promise<StaticWorkspaceSnapshot> {
+  if (matchesExistingSnapshot(reposDir, existing)) return existing
+  return buildStaticWorkspaceSnapshotInWorker(reposDir, options)
 }
 
 /**

@@ -1,7 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { closeSync, constants as fsConstants, existsSync, lstatSync, openSync, readdirSync, readFileSync, realpathSync } from 'node:fs'
 import { extname, isAbsolute, join, relative, sep } from 'node:path'
-import { jsHarvest } from '../../worker/analyzers.ts'
 import type { CapabilityTier, CodeLocation, EndpointSource, ParamLocation } from '../domain.ts'
 import { mergeTechTags, techTagsFromManifests, techTagsFromResponse } from '../templates/tech-tags.ts'
 import type { ManifestFile } from '../templates/tech-tags.ts'
@@ -31,10 +30,25 @@ import { buildSoft404ProbePaths } from './scoped-browser.ts'
 import type { ScopedBrowser } from './scoped-browser.ts'
 import {
   getOrBuildStaticWorkspaceSnapshot,
+  getOrBuildStaticWorkspaceSnapshotInWorker,
   SNAPSHOT_STATIC_ROUTE_EXTS,
   snapshotSourceFiles,
   type StaticWorkspaceSnapshot,
 } from './static-workspace-snapshot.ts'
+import {
+  extractHtmlLinksAndScripts,
+  extractHtmlLinksAndScriptsInWorker,
+  extractProgramGraphInWorker,
+  jsHarvestInWorker,
+  parseJsonOrYaml,
+  parseJsonOrYamlInWorker,
+  parseYamlLikeDocument,
+  sanitizeSameOriginPath,
+  UntrustedComputeAbortedError,
+  type ExtractedHtmlSurface,
+} from './untrusted-compute-pool.ts'
+
+export { extractHtmlLinksAndScripts, parseJsonOrYaml, parseYamlLikeDocument }
 import {
   classifySurface,
   type RuntimeGraphqlCatalog,
@@ -279,20 +293,7 @@ const PHASE0_SEED_PATHS: readonly string[] = [
 ]
 
 function sanitizePathCandidate(raw: string, baseOrigin: string): string | null {
-  const trimmed = raw.trim()
-  if (!trimmed || trimmed.startsWith('javascript:') || trimmed.startsWith('mailto:') || trimmed.startsWith('data:') || trimmed.startsWith('#')) {
-    return null
-  }
-  try {
-    const expectedOrigin = new URL(baseOrigin).origin
-    const parsed = new URL(trimmed, baseOrigin)
-    if (parsed.origin !== expectedOrigin) return null
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null
-    if (/[\r\n\0\\]/.test(parsed.pathname + parsed.search)) return null
-    return parsed.pathname + parsed.search
-  } catch {
-    return null
-  }
+  return sanitizeSameOriginPath(raw, baseOrigin)
 }
 
 function normalizeRouteTemplate(rawPath: string): string {
@@ -981,49 +982,48 @@ export interface RepoProgramGraphExtraction {
   warnings: string[]
 }
 
-/**
- * AST-primary route extraction for a mounted/synced repo. Returns `null` when no repository
- * source is present so callers fall back to the regex scanner unchanged.
- */
-export function extractRepoProgramGraph(input: {
+function collectGraphExtractionInputs(input: {
   reposDir?: string
-  origins: readonly string[]
   maxFiles?: number
-  /** Security-relevant commit signals (from the graph producer) folded into hypotheses. */
-  recentDiffSignals?: readonly CommitDiffSignal[]
-  /** Optional Phase A StaticWorkspaceSnapshot (reuses cached files + ProgramGraph without walking disk). */
   staticSnapshot?: StaticWorkspaceSnapshot
-}): RepoProgramGraphExtraction | null {
-  let inputs: RepoGraphInputs | null
-  let graph: ProgramGraph
+}): { inputs: RepoGraphInputs; precomputedGraph?: ProgramGraph } | null {
   if (input.staticSnapshot) {
     const snap = input.staticSnapshot
     const sourceFiles = snapshotSourceFiles(snap)
     const dockerfiles = snap.dockerfiles.map(d => ({ path: d.path, content: d.content }))
     if (sourceFiles.length === 0 && dockerfiles.length === 0) return null
-    inputs = {
-      sourceFiles,
-      dockerfiles,
-      manifests: snap.manifests
-        .filter(m => m.name.toLowerCase() === 'package.json' || m.name.toLowerCase().endsWith('/package.json'))
-        .slice(0, 80)
-        .map(m => ({ path: m.name, content: m.content })),
-      ...(snap.compose !== undefined ? { compose: snap.compose } : {}),
-      ...(snap.ingress !== undefined ? { ingress: snap.ingress } : {}),
-      mountedRepos: [...snap.mountedRepos],
+    return {
+      inputs: {
+        sourceFiles,
+        dockerfiles,
+        manifests: snap.manifests
+          .filter(m => m.name.toLowerCase() === 'package.json' || m.name.toLowerCase().endsWith('/package.json'))
+          .slice(0, 80)
+          .map(m => ({ path: m.name, content: m.content })),
+        ...(snap.compose !== undefined ? { compose: snap.compose } : {}),
+        ...(snap.ingress !== undefined ? { ingress: snap.ingress } : {}),
+        mountedRepos: [...snap.mountedRepos],
+      },
+      precomputedGraph: snap.programGraph,
     }
-    graph = snap.programGraph
-  } else {
-    if (!input.reposDir) return null
-    inputs = collectRepoGraphInputs(input.reposDir, input.maxFiles)
-    if (!inputs) return null
-    graph = extractProgramGraph({ files: inputs.sourceFiles, repo: inputs.mountedRepos.join(',') || undefined })
   }
+  if (!input.reposDir) return null
+  const inputs = collectRepoGraphInputs(input.reposDir, input.maxFiles)
+  if (!inputs) return null
+  return { inputs }
+}
+
+function finalizeRepoProgramGraphExtraction(
+  inputs: RepoGraphInputs,
+  graph: ProgramGraph,
+  origins: readonly string[],
+  recentDiffSignals?: readonly CommitDiffSignal[],
+): RepoProgramGraphExtraction {
   const services = discoverGraphServices(inputs)
   const originMappings = services.length
     ? mapServicesToOrigins({
         services,
-        origins: input.origins,
+        origins,
         ...(inputs.compose ? { compose: inputs.compose } : {}),
         ...(inputs.ingress ? { ingress: inputs.ingress } : {}),
         dockerfiles: inputs.dockerfiles,
@@ -1043,7 +1043,7 @@ export function extractRepoProgramGraph(input: {
     const ownershipGuard = tenantGuards.length ? tenantGuards.join(',') : null
     const fileCode = filesByPath.get(route.file) ?? ''
     const sinkMeta = detectSinksAndGuards(fileCode)
-    const resolved = resolveRouteOrigin(route.file, originMappings, input.origins)
+    const resolved = resolveRouteOrigin(route.file, originMappings, origins)
     const key = `${route.method.toUpperCase()} ${pathTemplate}`
     if (!routeOrigins[key] || routeOrigins[key]!.confidence === 'fallback') routeOrigins[key] = resolved
     routes.push({
@@ -1077,12 +1077,54 @@ export function extractRepoProgramGraph(input: {
     routes,
     frameworks: [...new Set(graph.routes.map(route => route.framework))],
     hypotheses: deriveCodeToRuntimeHypotheses(graph, {
-      ...(input.recentDiffSignals?.length ? { recentDiffSignals: input.recentDiffSignals } : {}),
+      ...(recentDiffSignals?.length ? { recentDiffSignals } : {}),
     }),
     originMappings,
     routeOrigins,
     warnings: [...graph.warnings],
   }
+}
+
+/**
+ * AST-primary route extraction for a mounted/synced repo. Returns `null` when no repository
+ * source is present so callers fall back to the regex scanner unchanged.
+ */
+export function extractRepoProgramGraph(input: {
+  reposDir?: string
+  origins: readonly string[]
+  maxFiles?: number
+  /** Security-relevant commit signals (from the graph producer) folded into hypotheses. */
+  recentDiffSignals?: readonly CommitDiffSignal[]
+  /** Optional Phase A StaticWorkspaceSnapshot (reuses cached files + ProgramGraph without walking disk). */
+  staticSnapshot?: StaticWorkspaceSnapshot
+}): RepoProgramGraphExtraction | null {
+  const prepared = collectGraphExtractionInputs(input)
+  if (!prepared) return null
+  const graph = prepared.precomputedGraph
+    ?? extractProgramGraph({ files: prepared.inputs.sourceFiles, repo: prepared.inputs.mountedRepos.join(',') || undefined })
+  return finalizeRepoProgramGraphExtraction(prepared.inputs, graph, input.origins, input.recentDiffSignals)
+}
+
+/**
+ * Worker-isolated async variant of `extractRepoProgramGraph` offloading untrusted source
+ * scanning into `UntrustedComputePool` so large/hostile repos cannot stall the event loop.
+ */
+export async function extractRepoProgramGraphInWorker(input: {
+  reposDir?: string
+  origins: readonly string[]
+  maxFiles?: number
+  recentDiffSignals?: readonly CommitDiffSignal[]
+  staticSnapshot?: StaticWorkspaceSnapshot
+  signal?: AbortSignal
+}): Promise<RepoProgramGraphExtraction | null> {
+  const prepared = collectGraphExtractionInputs(input)
+  if (!prepared) return null
+  const graph = prepared.precomputedGraph
+    ?? await extractProgramGraphInWorker(
+      { files: prepared.inputs.sourceFiles, repo: prepared.inputs.mountedRepos.join(',') || undefined },
+      { signal: input.signal },
+    )
+  return finalizeRepoProgramGraphExtraction(prepared.inputs, graph, input.origins, input.recentDiffSignals)
 }
 
 /**
@@ -1467,59 +1509,6 @@ export function readRepoManifests(
     }
   }
   return out
-}
-
-export function extractHtmlLinksAndScripts(html: string, origin: string): {
-  links: string[]
-  scripts: string[]
-  forms: Array<{ action: string; method: string; inputs: string[]; enctype: string }>
-  inputs: Array<{ name: string; id: string | null; type: string | null }>
-} {
-  const links = new Set<string>()
-  const scripts = new Set<string>()
-  const forms: Array<{ action: string; method: string; inputs: string[]; enctype: string }> = []
-  const inputs: Array<{ name: string; id: string | null; type: string | null }> = []
-  const seenInputs = new Set<string>()
-
-  for (const m of html.matchAll(/<a\b[^>]*\bhref\s*=\s*["']([^"']+)["']/gi)) {
-    const clean = sanitizePathCandidate(m[1], origin)
-    if (clean && !STATIC_ASSET_RE.test(clean)) links.add(clean)
-  }
-  for (const m of html.matchAll(/<script\b[^>]*\bsrc\s*=\s*["']([^"']+)["']/gi)) {
-    const clean = sanitizePathCandidate(m[1], origin)
-    if (clean) scripts.add(clean)
-  }
-  for (const m of html.matchAll(/<form\b([^>]*)>([\s\S]*?)<\/form>/gi)) {
-    const attrs = m[1]
-    const inner = m[2]
-    const actionMatch = /\baction\s*=\s*["']([^"']+)["']/i.exec(attrs)
-    const methodMatch = /\bmethod\s*=\s*["']([a-zA-Z]+)["']/i.exec(attrs)
-    const enctypeMatch = /\benctype\s*=\s*["']([^"']+)["']/i.exec(attrs)
-    const action = sanitizePathCandidate(actionMatch?.[1] ?? '/', origin) ?? '/'
-    const method = (methodMatch?.[1] ?? 'GET').toUpperCase()
-    const inputsInForm: string[] = []
-    for (const im of inner.matchAll(/<(?:input|select|textarea)\b[^>]*\bname\s*=\s*["']([^"']+)["']/gi)) {
-      if (im[1]) inputsInForm.push(im[1])
-    }
-    forms.push({ action, method, inputs: inputsInForm, enctype: (enctypeMatch?.[1] ?? 'application/x-www-form-urlencoded').toLowerCase() })
-  }
-  // Standalone controls outside a <form> (common in SPA/wizard pages). Both name and id are
-  // recorded because scripted pages frequently drive inputs by id.
-  for (const tm of html.matchAll(/<(?:input|select|textarea)\b([^>]*)>/gi)) {
-    const attrs = tm[1]
-    const nameMatch = /\bname\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i.exec(attrs)
-    const idMatch = /\bid\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i.exec(attrs)
-    const typeMatch = /\btype\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i.exec(attrs)
-    const name = (nameMatch?.[1] ?? nameMatch?.[2] ?? nameMatch?.[3] ?? idMatch?.[1] ?? idMatch?.[2] ?? idMatch?.[3] ?? '').trim()
-    if (!name) continue
-    const id = (idMatch?.[1] ?? idMatch?.[2] ?? idMatch?.[3] ?? null)
-    const type = (typeMatch?.[1] ?? typeMatch?.[2] ?? typeMatch?.[3] ?? null)
-    const key = `${name}|${id ?? ''}`
-    if (seenInputs.has(key)) continue
-    seenInputs.add(key)
-    inputs.push({ name, id: id ? id.trim() : null, type: type ? type.toLowerCase() : null })
-  }
-  return { links: [...links], scripts: [...scripts], forms, inputs }
 }
 
 /** Pull XML element names out of an error/echo response (e.g. "expected &lt;lookup&gt;&lt;name&gt;"). */
@@ -2063,151 +2052,6 @@ export function inferXhrRequestShape(input: {
 }
 
 const HTTP_METHOD_SET = new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'])
-
-// ---------------------------------------------------------------------------------------------
-// YAML subset parser (OpenAPI/route-map documents; JSON remains the fast path)
-// ---------------------------------------------------------------------------------------------
-
-function stripYamlComment(line: string): string {
-  let quote: string | null = null
-  for (let i = 0; i < line.length; i += 1) {
-    const ch = line[i]
-    if (quote) {
-      if (ch === quote && line[i - 1] !== '\\') quote = null
-      continue
-    }
-    if (ch === '"' || ch === "'") { quote = ch; continue }
-    if (ch === '#' && (i === 0 || /\s/.test(line[i - 1] ?? ''))) return line.slice(0, i)
-  }
-  return line
-}
-
-function splitYamlKeyValue(text: string): { key: string; rest: string } | null {
-  let quote: string | null = null
-  let depth = 0
-  for (let i = 0; i < text.length; i += 1) {
-    const ch = text[i]
-    if (quote) {
-      if (ch === quote && text[i - 1] !== '\\') quote = null
-      continue
-    }
-    if (ch === '"' || ch === "'") { quote = ch; continue }
-    if (ch === '{' || ch === '[') depth += 1
-    else if (ch === '}' || ch === ']') depth -= 1
-    else if (ch === ':' && depth === 0 && (i + 1 >= text.length || /\s/.test(text[i + 1] ?? ''))) {
-      const rawKey = text.slice(0, i).trim()
-      const key = rawKey.replace(/^['"]|['"]$/g, '')
-      if (!key) return null
-      return { key, rest: text.slice(i + 1).trim() }
-    }
-  }
-  return null
-}
-
-function parseYamlScalar(raw: string): unknown {
-  const text = raw.trim()
-  if (!text) return null
-  if ((text.startsWith('"') && text.endsWith('"')) || (text.startsWith("'") && text.endsWith("'"))) {
-    return text.slice(1, -1)
-  }
-  if (/^(?:true|false)$/i.test(text)) return text.toLowerCase() === 'true'
-  if (/^(?:null|~)$/i.test(text)) return null
-  if (/^-?\d+(?:\.\d+)?$/.test(text)) return Number(text)
-  if ((text.startsWith('{') && text.endsWith('}')) || (text.startsWith('[') && text.endsWith(']'))) {
-    try { return JSON.parse(text) } catch { return text }
-  }
-  return text
-}
-
-/** Bounded YAML parser for mapping/sequence documents (OpenAPI, route maps). Not a full YAML engine. */
-export function parseYamlLikeDocument(text: string): unknown {
-  interface Line { indent: number; text: string; raw: string }
-  const lines: Line[] = []
-  for (const rawLine of text.replace(/\r\n?/g, '\n').split('\n')) {
-    if (lines.length > 6000) break
-    const stripped = stripYamlComment(rawLine)
-    const body = stripped.trimEnd()
-    const trimmed = body.trim()
-    if (!trimmed || trimmed === '---' || trimmed === '...') continue
-    const indent = body.length - body.trimStart().length
-    lines.push({ indent, text: trimmed, raw: body })
-  }
-  if (lines.length === 0) return null
-  let index = 0
-  const blockScalar = (indent: number): string => {
-    const parts: string[] = []
-    while (index < lines.length && lines[index]!.indent > indent) {
-      parts.push(lines[index]!.text)
-      index += 1
-    }
-    return parts.join('\n')
-  }
-  const parseNode = (indent: number): unknown => {
-    const first = lines[index]
-    if (!first) return null
-    return first.text === '-' || first.text.startsWith('- ') ? parseSequence(indent) : parseMapping(indent)
-  }
-  const parseSequence = (indent: number): unknown[] => {
-    const out: unknown[] = []
-    while (index < lines.length) {
-      const line = lines[index]!
-      if (line.indent < indent) break
-      if (line.indent > indent) { index += 1; continue }
-      if (!(line.text === '-' || line.text.startsWith('- '))) break
-      const afterDash = line.text.slice(1)
-      if (!afterDash.trim()) {
-        index += 1
-        const next = lines[index]
-        out.push(next && next.indent > indent ? parseNode(next.indent) : null)
-        continue
-      }
-      if (splitYamlKeyValue(afterDash.trim())) {
-        // `- key: value` starts a mapping item; re-align the remainder and parse it as a map.
-        const dashes = /^(\s*)-(\s*)/.exec(line.raw)
-        const childIndent = (dashes?.[1]?.length ?? indent) + 1 + (dashes?.[2]?.length ?? 1)
-        lines[index] = { indent: childIndent, text: afterDash.trim(), raw: ' '.repeat(childIndent) + afterDash.trim() }
-        out.push(parseMapping(childIndent))
-        continue
-      }
-      out.push(parseYamlScalar(afterDash))
-      index += 1
-    }
-    return out
-  }
-  const parseMapping = (indent: number): Record<string, unknown> => {
-    const out: Record<string, unknown> = {}
-    while (index < lines.length) {
-      const line = lines[index]!
-      if (line.indent < indent) break
-      if (line.indent > indent) { index += 1; continue }
-      if (line.text === '-' || line.text.startsWith('- ')) break
-      const kv = splitYamlKeyValue(line.text)
-      if (!kv) { index += 1; continue }
-      index += 1
-      if (kv.rest) {
-        if (/^[|>][+-]?$/.test(kv.rest)) { out[kv.key] = blockScalar(indent); continue }
-        out[kv.key] = parseYamlScalar(kv.rest)
-        continue
-      }
-      const next = lines[index]
-      out[kv.key] = next && next.indent > indent ? parseNode(next.indent) : null
-    }
-    return out
-  }
-  return parseNode(lines[0]!.indent)
-}
-
-/** Parse a JSON or YAML document body into an object (null when neither parses). */
-export function parseJsonOrYaml(rawBody: string): unknown {
-  const text = rawBody.replace(/^\uFEFF/, '').trim()
-  if (!text) return null
-  if (text.startsWith('{') || text.startsWith('[')) {
-    try { return JSON.parse(text) as unknown } catch { /* fall through to YAML */ }
-  }
-  const parsed = parseYamlLikeDocument(text)
-  if (parsed !== null && typeof parsed === 'object') return parsed
-  try { return JSON.parse(text) as unknown } catch { return null }
-}
 
 // ---------------------------------------------------------------------------------------------
 // Soft-404 / SPA catch-all calibration
@@ -2757,6 +2601,8 @@ export interface RouteMapParseOptions {
   bindings?: ReadonlyMap<string, readonly RouteMapParamBinding[]>
   /** Override the discovery template normalizer (defaults to normalizeDiscoveryTemplate). */
   normalizeTemplate?: (path: string) => string
+  /** Optional pre-parsed document produced inside `UntrustedComputePool`. */
+  parsedDoc?: unknown
 }
 
 /** Persist endpoints/params harvested from a served route-map/config document. */
@@ -2770,7 +2616,7 @@ export function parseRouteMapDoc(
   dynamicParams: Set<string>,
   options?: RouteMapParseOptions,
 ): { endpoints: number; params: number } {
-  const doc = parseJsonOrYaml(rawBody)
+  const doc = options && 'parsedDoc' in options ? options.parsedDoc : parseJsonOrYaml(rawBody)
   if (doc === null || typeof doc !== 'object') return { endpoints: 0, params: 0 }
   const root = doc as Record<string, unknown>
   if (typeof root.openapi === 'string' || typeof root.swagger === 'string') return { endpoints: 0, params: 0 }
@@ -3140,8 +2986,9 @@ export function parseOpenApiDoc(
   scopeRevision: number,
   dynamicPaths: Set<string>,
   dynamicParams: Set<string>,
+  options?: { parsedDoc?: unknown },
 ): { endpoints: number; params: number; operations: ParsedOpenApiOperation[] } {
-  const parsed = parseJsonOrYaml(rawBody)
+  const parsed = options && 'parsedDoc' in options ? options.parsedDoc : parseJsonOrYaml(rawBody)
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { endpoints: 0, params: 0, operations: [] }
   const doc = parsed as Record<string, unknown>
   const pathsObj = doc.paths
@@ -3548,14 +3395,49 @@ export type DeclaredSurfaceSummary = {
  * PATCH and body-only POST routes — without requiring an id segment or a known body field.
  * Deduped by (origin, METHOD, pathTemplate). No network request is made here.
  */
-export function ingestDeclaredApiSurface(input: {
-  storage: Store
-  runId: string
-  scopeRevision: number
-  origin: string
-  dynamicPaths?: Set<string>
-  dynamicParams?: Set<string>
-}): DeclaredSurfaceSummary {
+async function safeParseJsonOrYamlInWorker(rawBody: string, signal?: AbortSignal): Promise<unknown> {
+  try {
+    return await parseJsonOrYamlInWorker(rawBody, { signal })
+  } catch (err) {
+    if (signal?.aborted || err instanceof UntrustedComputeAbortedError) throw err
+    return null
+  }
+}
+
+async function safeExtractHtmlInWorker(html: string, origin: string, signal?: AbortSignal): Promise<ExtractedHtmlSurface> {
+  try {
+    return await extractHtmlLinksAndScriptsInWorker(html, origin, { signal })
+  } catch (err) {
+    if (signal?.aborted || err instanceof UntrustedComputeAbortedError) throw err
+    return { links: [], scripts: [], forms: [], inputs: [] }
+  }
+}
+
+async function safeJsHarvestInWorker(
+  content: string,
+  sourceName: string,
+  options?: Record<string, unknown>,
+  signal?: AbortSignal,
+): Promise<Record<string, unknown>> {
+  try {
+    return await jsHarvestInWorker(content, sourceName, options, { signal })
+  } catch (err) {
+    if (signal?.aborted || err instanceof UntrustedComputeAbortedError) throw err
+    return {}
+  }
+}
+
+function ingestDeclaredApiSurfaceWithDocs(
+  input: {
+    storage: Store
+    runId: string
+    scopeRevision: number
+    origin: string
+    dynamicPaths?: Set<string>
+    dynamicParams?: Set<string>
+  },
+  preParsedDocs?: ReadonlyMap<number, unknown>,
+): DeclaredSurfaceSummary {
   const result: DeclaredSurfaceSummary = {
     specs: 0, endpoints: 0, params: 0, methods: {},
     declaredOpsSeen: 0, declaredOpsMatched: 0, declaredTolerantCapped: 0,
@@ -3622,7 +3504,11 @@ export function ingestDeclaredApiSurface(input: {
       || /^\s*openapi\s*:/m.test(head)
     if (!looksOpenApi) continue
     result.specs += 1
-    const parsed = parseOpenApiDoc(spec.content, origin, storage, runId, scopeRevision, dynamicPaths, dynamicParams)
+    const parsed = preParsedDocs && preParsedDocs.has(specIndex)
+      ? parseOpenApiDoc(spec.content, origin, storage, runId, scopeRevision, dynamicPaths, dynamicParams, {
+          parsedDoc: preParsedDocs.get(specIndex),
+        })
+      : parseOpenApiDoc(spec.content, origin, storage, runId, scopeRevision, dynamicPaths, dynamicParams)
     result.params += parsed.params
     if (parsed.endpoints > 0) {
       // Lossless path: no operation cap. Enumerate exactly what the parser persisted.
@@ -3702,6 +3588,56 @@ export function ingestDeclaredApiSurface(input: {
     } catch { /* metrics only */ }
   }
   return result
+}
+
+/**
+ * Offline ingestion of the grey-box API reference (OpenAPI/Swagger) that the harness imported for
+ * this project. Every declared operation is kept with its declared method — including DELETE,
+ * PATCH and body-only POST routes — without requiring an id segment or a known body field.
+ * Deduped by (origin, METHOD, pathTemplate). No network request is made here.
+ */
+export function ingestDeclaredApiSurface(input: {
+  storage: Store
+  runId: string
+  scopeRevision: number
+  origin: string
+  dynamicPaths?: Set<string>
+  dynamicParams?: Set<string>
+}): DeclaredSurfaceSummary {
+  return ingestDeclaredApiSurfaceWithDocs(input)
+}
+
+/** Worker-isolated async variant of `ingestDeclaredApiSurface` parsing OpenAPI docs inside `UntrustedComputePool`. */
+export async function ingestDeclaredApiSurfaceAsync(input: {
+  storage: Store
+  runId: string
+  scopeRevision: number
+  origin: string
+  dynamicPaths?: Set<string>
+  dynamicParams?: Set<string>
+  signal?: AbortSignal
+}): Promise<DeclaredSurfaceSummary> {
+  const preParsedDocs = new Map<number, unknown>()
+  try {
+    const run = input.storage.run(input.runId)
+    const wanted = (() => { try { return new URL(input.origin).origin } catch { return input.origin } })()
+    const specs = input.storage.listProjectSpecsFull(run.projectId).filter(spec => {
+      if (!spec.origin) return true
+      try { return new URL(spec.origin).origin === wanted } catch { return false }
+    })
+    for (const [specIndex, spec] of specs.slice(0, 6).entries()) {
+      if (spec.kind === 'graphql') continue
+      const head = spec.content.slice(0, 400)
+      const looksOpenApi = /openapi|swagger/i.test(spec.kind)
+        || /"(?:openapi|swagger)"\s*:/.test(head)
+        || /^\s*openapi\s*:/m.test(head)
+      if (!looksOpenApi) continue
+      preParsedDocs.set(specIndex, await safeParseJsonOrYamlInWorker(spec.content, input.signal))
+    }
+  } catch (err) {
+    if (input.signal?.aborted || err instanceof UntrustedComputeAbortedError) throw err
+  }
+  return ingestDeclaredApiSurfaceWithDocs(input, preParsedDocs)
 }
 
 /**
@@ -3833,7 +3769,9 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
   // Build or reuse ONE StaticWorkspaceSnapshot per Phase 0 run so manifests, regex fallback routes,
   // and ProgramGraph extraction all read from memory without redundant repo filesystem walks.
   const staticSnapshot = params.staticSnapshot
-    ?? (params.reposDir && existsSync(params.reposDir) ? getOrBuildStaticWorkspaceSnapshot(params.reposDir) : undefined)
+    ?? (params.reposDir && existsSync(params.reposDir)
+      ? await getOrBuildStaticWorkspaceSnapshotInWorker(params.reposDir, undefined, { signal })
+      : undefined)
 
   // Repo dependency manifests contribute tech tags even when live responses are uninformative
   // (or when Tier 0 sends no requests at all).
@@ -3854,12 +3792,14 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     const regexExtracted = extractStaticFrameworkRoutes(params.reposDir ?? '', staticSnapshot)
     let graphExtraction: RepoProgramGraphExtraction | null = null
     try {
-      graphExtraction = extractRepoProgramGraph({
+      graphExtraction = await extractRepoProgramGraphInWorker({
         reposDir: params.reposDir,
         origins: normalizedOrigins,
         ...(staticSnapshot ? { staticSnapshot } : {}),
+        signal,
       })
-    } catch {
+    } catch (err) {
+      if (signal.aborted || err instanceof UntrustedComputeAbortedError) throw err
       graphExtraction = null
     }
     const merged = mergeStaticRouteExtractions({
@@ -4028,7 +3968,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       }
     } catch { /* no project specs */ }
     for (const origin of declaredOrigins) {
-      const part = ingestDeclaredApiSurface({ storage, runId, scopeRevision, origin, dynamicPaths, dynamicParams })
+      const part = await ingestDeclaredApiSurfaceAsync({ storage, runId, scopeRevision, origin, dynamicPaths, dynamicParams, signal })
       total.specs += part.specs
       total.endpoints += part.endpoints
       total.params += part.params
@@ -4437,7 +4377,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
               tagVisibility('GET', '/', 'anonymous')
               if (discoveryPersona) tagVisibility('GET', '/', discoveryPersona)
             }
-            const html = extractHtmlLinksAndScripts(prior.bodyPreview ?? '', origin)
+            const html = await safeExtractHtmlInWorker(prior.bodyPreview ?? '', origin, signal)
             for (const s of html.scripts) {
               queueJsChunk(s, '/')
               jsPageByScript.set(s, '/')
@@ -4492,7 +4432,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
           recordEndpoint('GET', '/', 'surface_probe')
           tagVisibility('GET', '/', discoveryPersona ?? 'anonymous')
         }
-        const html = extractHtmlLinksAndScripts(ex.body, origin)
+        const html = await safeExtractHtmlInWorker(ex.body, origin, signal)
         for (const s of html.scripts) {
           queueJsChunk(s, '/')
           jsPageByScript.set(s, '/')
@@ -4552,7 +4492,8 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
           }
         } catch { /* ignore invalid JSON */ }
       } else if (/(?:openapi|swagger|api-docs)/i.test(seedPath) && ex.status < 400 && !softNotFoundResponse(ex)) {
-        const parsed = parseOpenApiDoc(ex.body, origin, storage, runId, scopeRevision, dynamicPaths, dynamicParams)
+        const specDoc = await safeParseJsonOrYamlInWorker(ex.body, signal)
+        const parsed = parseOpenApiDoc(ex.body, origin, storage, runId, scopeRevision, dynamicPaths, dynamicParams, { parsedDoc: specDoc })
         endpointsDiscovered += parsed.endpoints
         paramsDiscovered += parsed.params
         for (const op of parsed.operations) {
@@ -4569,7 +4510,6 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
           })
         }
         if (parsed.endpoints > 0) {
-          const specDoc = parseJsonOrYaml(ex.body)
           if (specDoc && typeof specDoc === 'object') {
             for (const entry of harvestRouteMapDocument(specDoc).slice(0, 120)) {
               queueDiscoveredRoute(entry.method, entry.path)
@@ -4578,7 +4518,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         }
         if (parsed.endpoints === 0) {
           // Swagger-less API index documents are handled by the structural route-map expander.
-          const expanded = parseRouteMapDoc(ex.body, origin, storage, runId, scopeRevision, dynamicPaths, dynamicParams, { bindings: configBindings })
+          const expanded = parseRouteMapDoc(ex.body, origin, storage, runId, scopeRevision, dynamicPaths, dynamicParams, { bindings: configBindings, parsedDoc: specDoc })
           endpointsDiscovered += expanded.endpoints
           paramsDiscovered += expanded.params
           routeMapEndpoints += expanded.endpoints
@@ -4596,8 +4536,8 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         // Any served JSON/YAML document may be a route map or config with an endpoint table.
         if (/json|yaml/i.test(ex.mediaType) || /^\s*[{[]/.test(ex.body)) {
           try {
-            const doc = parseJsonOrYaml(ex.body)
-            const parsed = parseRouteMapDoc(ex.body, origin, storage, runId, scopeRevision, dynamicPaths, dynamicParams, { bindings: configBindings })
+            const doc = await safeParseJsonOrYamlInWorker(ex.body, signal)
+            const parsed = parseRouteMapDoc(ex.body, origin, storage, runId, scopeRevision, dynamicPaths, dynamicParams, { bindings: configBindings, parsedDoc: doc })
             endpointsDiscovered += parsed.endpoints
             paramsDiscovered += parsed.params
             routeMapEndpoints += parsed.endpoints
@@ -4631,7 +4571,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       if (!ex || ex.status >= 400 || !ex.body) continue
       jsFetched += 1
 
-      const harvested = jsHarvest(ex.body, `${origin}${jsPath}`) as {
+      const harvested = await safeJsHarvestInWorker(ex.body, `${origin}${jsPath}`, undefined, signal) as {
         apiPaths?: string[]
         adminPaths?: string[]
         routes?: Array<{ path?: string }>
@@ -4764,7 +4704,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         if (mapPath && mapPath.endsWith('.map')) {
           const mapEx = await safeGet(mapPath)
           if (mapEx && mapEx.status < 400 && mapEx.body) {
-            const mapHarvest = jsHarvest(mapEx.body, `${origin}${mapPath}`, { sourceMapContent: mapEx.body }) as {
+            const mapHarvest = await safeJsHarvestInWorker(mapEx.body, `${origin}${mapPath}`, { sourceMapContent: mapEx.body }, signal) as {
               apiPaths?: string[]
               httpCalls?: Array<{ url?: string; method?: string; bodyKeys?: string[] }>
             }
@@ -4791,11 +4731,11 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         for (const asset of extractAssetReferences(ex.body)) queueJsChunk(asset, docPath)
         continue
       }
-      const expanded = parseRouteMapDoc(ex.body, origin, storage, runId, scopeRevision, dynamicPaths, dynamicParams, { bindings: configBindings })
+      const doc = await safeParseJsonOrYamlInWorker(ex.body, signal)
+      const expanded = parseRouteMapDoc(ex.body, origin, storage, runId, scopeRevision, dynamicPaths, dynamicParams, { bindings: configBindings, parsedDoc: doc })
       endpointsDiscovered += expanded.endpoints
       paramsDiscovered += expanded.params
       routeMapEndpoints += expanded.endpoints
-      const doc = parseJsonOrYaml(ex.body)
       if (doc && typeof doc === 'object') {
         // Declared-surface hydration: an OIDC discovery document and a CDN asset manifest both
         // name routes the origin actually serves. Absolute discovery URLs are accepted only when
@@ -5086,7 +5026,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         }
       }
       if (/<html\b|<input\b|<form\b/i.test(ex.body)) {
-        const parsed = extractHtmlLinksAndScripts(ex.body, origin)
+        const parsed = await safeExtractHtmlInWorker(ex.body, origin, signal)
         for (const inp of parsed.inputs.slice(0, 8)) {
           if (inp.type && /^(?:hidden|submit|button|reset|checkbox|radio|file|image)$/i.test(inp.type)) continue
           if (!isUsefulParamName(inp.name)) continue
@@ -5362,7 +5302,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         tagVisibility('GET', '/', handle)
         if (ex.status >= 400) continue
         for (const t of mergeTechTags(techTagsFromResponse(ex.respHeaders, ex.body))) techFingerprint.add(t)
-        const html = extractHtmlLinksAndScripts(ex.body, origin)
+        const html = await safeExtractHtmlInWorker(ex.body, origin, signal)
         for (const s of html.scripts) {
           queueJsChunk(s, '/')
           jsPageByScript.set(s, '/')
@@ -6159,7 +6099,7 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
       }
       // Also parse raw domSnippet forms in case hidden inputs weren't captured
       if (visit.domSnippet && /<form\b/i.test(visit.domSnippet)) {
-        const parsedHtml = extractHtmlLinksAndScripts(visit.domSnippet, normalizedOrigin)
+        const parsedHtml = await safeExtractHtmlInWorker(visit.domSnippet, normalizedOrigin, signal)
         for (const f of parsedHtml.forms) {
           recordFormAndParams(f.action, f.method, f.inputs, who)
         }
@@ -6184,10 +6124,11 @@ export async function crawlStateGraph(params: CrawlStateGraphParams): Promise<Cr
           if (!parsedXhrDocuments.has(docKey) &&
               (/json|yaml/i.test(req.mediaType ?? '') || /^\s*[{[]/.test(bodyPreview.slice(0, 64)))) {
             parsedXhrDocuments.add(docKey)
-            const doc = parseJsonOrYaml(bodyPreview)
+            const doc = await safeParseJsonOrYamlInWorker(bodyPreview, signal)
             if (doc && typeof doc === 'object') {
               const expanded = parseRouteMapDoc(
                 bodyPreview, normalizedOrigin, storage, runId, scopeRevision, crawlDynamicPaths, crawlDynamicParams,
+                { parsedDoc: doc },
               )
               endpointsDiscovered += expanded.endpoints
               paramsDiscovered += expanded.params

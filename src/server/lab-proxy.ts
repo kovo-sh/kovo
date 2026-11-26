@@ -18,7 +18,7 @@ import { tmpdir } from 'node:os'
 import { basename, isAbsolute, join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { parseComposeDocument } from './compose-parse.ts'
-import type { ComposeHealthcheckSpec, ComposeServiceSource } from './compose-parse.ts'
+import type { ComposeHealthcheckSpec, ComposeServiceSource, ParsedComposeDocument } from './compose-parse.ts'
 
 export interface LabServiceHealthcheck {
   test?: string | string[]
@@ -439,21 +439,31 @@ function validateComposeServiceSource(source: ComposeServiceSource): LabServiceS
 }
 
 /**
+ * Validate and sanitize an already-parsed Compose document (e.g. returned by `parseComposeInWorker`).
+ * Never touches raw YAML or `process.env` on the main event loop.
+ */
+export function sanitizeParsedComposeDocument(document: ParsedComposeDocument): LabServiceSpec[] {
+  if (document.services.length > MAX_LAB_CONTAINERS) {
+    throw new Error(`Lab stack exceeds maximum limit of ${MAX_LAB_CONTAINERS} containers per run (got ${document.services.length}).`)
+  }
+  return document.services.map(validateComposeServiceSource)
+}
+
+/**
  * Parse and sanitize a Docker Compose document. Replaces the v5 indentation-regex parser with the
  * bounded YAML parser in `compose-parse.ts`; every security decision stays in this module.
+ * Never defaults to or forwards host `process.env` into `${VAR}` interpolation.
  */
 export function parseAndSanitizeComposeYaml(
   yamlText: string,
   options: { env?: Record<string, string | undefined>; maxServices?: number } = {},
 ): LabServiceSpec[] {
+  const safeEnv = options.env && options.env !== process.env ? options.env : {}
   const document = parseComposeDocument(yamlText, {
-    env: options.env ?? (process.env as Record<string, string | undefined>),
+    env: safeEnv,
     maxServices: options.maxServices ?? MAX_LAB_CONTAINERS,
   })
-  if (document.services.length > MAX_LAB_CONTAINERS) {
-    throw new Error(`Lab stack exceeds maximum limit of ${MAX_LAB_CONTAINERS} containers per run (got ${document.services.length}).`)
-  }
-  return document.services.map(validateComposeServiceSource)
+  return sanitizeParsedComposeDocument(document)
 }
 
 export function choosePrimaryService(services: readonly LabServiceSpec[], labConfig: LabConfig): LabServiceSpec {
@@ -1144,14 +1154,18 @@ export function safeRemoveLabTempDir(
 export function resolveLabStackServices(params: {
   labConfig: LabConfig
   composeYaml?: string
-  env: NodeJS.ProcessEnv
+  composeDocument?: ParsedComposeDocument
+  env?: NodeJS.ProcessEnv
 }): { services: LabServiceSpec[]; primaryService: LabServiceSpec; sidecarServices: LabServiceSpec[] } {
-  const { labConfig, composeYaml, env } = params
+  const { labConfig, composeYaml, composeDocument, env } = params
   validateEnvMap(labConfig.env, 'labConfig.env')
 
-  const composeServices = composeYaml !== undefined
-    ? parseAndSanitizeComposeYaml(composeYaml, { env })
-    : undefined
+  const safeEnv = env && env !== process.env ? env : {}
+  const composeServices = composeDocument !== undefined
+    ? sanitizeParsedComposeDocument(composeDocument)
+    : composeYaml !== undefined
+      ? parseAndSanitizeComposeYaml(composeYaml, { env: safeEnv })
+      : undefined
 
   let explicitServices: LabServiceSpec[] | undefined
   if (Array.isArray(labConfig.services) && labConfig.services.length > 0) {
