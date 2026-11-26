@@ -17,7 +17,9 @@ import type { AuthMutation } from '../replay-spec.ts'
 import { computeStateChangeBodyHash, isLocalLabAutoApprovalOrigin } from './approval-judge.ts'
 import type { MultipartBodyPart, StateChangeApprovalContext } from './approval-judge.ts'
 import {
+  canonicalPathAndQuery,
   evaluateScopeRequest,
+  hasUnsafeAdmissionPath,
   isReadOnlyHttpMethod,
   isRouteDenylisted,
   isVerifiedReadOnlyGraphqlQuery,
@@ -29,6 +31,9 @@ import type { EnvironmentMode, ScopeHook, ScopePolicy, ScopeSurface } from './sc
 export const MAX_ADMISSION_PATH_LENGTH = 8192
 const MAX_JSONRPC_CLASSIFICATION_CHARS = 64 * 1024
 const MAX_JSON_NESTING_DEPTH = 32
+
+/** Internal redirect callback used by the broker to enforce the current effective scope policy. */
+export type AdmissionScopeHopValidator = (url: URL, redirectHop: boolean) => AdmissionDecision
 
 export const FORBIDDEN_CALLER_HEADERS =
   /^(?:authorization|proxy-authorization|cookie|host|content-length|transfer-encoding|x-kovo-trace-id)$/i
@@ -154,6 +159,9 @@ export interface AdmissionRequest {
   /** WebSocket-specific outbound inputs checked against the destructive denylist. */
   wsSendMessages?: readonly string[]
   wsOriginHeader?: string
+  wsSubprotocols?: readonly string[]
+  /** Canonical lower-case header map produced once by admission validation. */
+  normalizedHeaders?: Record<string, string>
   /** Optional semantic or numeric tier override for standalone evaluation. */
   tierOverride?: CapabilityTier | AdmissionTier
   runId?: string
@@ -174,6 +182,7 @@ export interface AdmissionDecision {
   localLab?: boolean
   parsedUrl?: URL
   classification?: RequestMutationClassification
+  normalizedHeaders?: Record<string, string>
   approvalContext?: StateChangeApprovalContext
   retryAfterMs?: number
 }
@@ -221,6 +230,7 @@ export interface RequestAdmissionEngineOptions {
   rateLimitCheck?: (ctx: AdmissionRateLimitContext) => AdmissionHookResult
   killSwitchCheck?: (tenantId: string | null) => { active: boolean; reason?: string }
   explicitDenylist?: AdmissionExplicitDenylist
+  scopeHopValidator?: AdmissionScopeHopValidator
   env?: NodeJS.ProcessEnv
 }
 
@@ -300,7 +310,7 @@ export function isSafeAdmissionUrl(
   if (!localLab && !isPortAllowed(url.port, url.protocol, allowedPorts, env)) return false
   if (!allowQuery && !localLab && url.search) return false
   const full = url.pathname + url.search
-  return full.length <= MAX_ADMISSION_PATH_LENGTH && !url.pathname.startsWith('//') && !/[\r\n\0]/.test(full)
+  return canonicalPathAndQuery(full) !== null && !url.pathname.startsWith('//')
 }
 
 export function isOriginInGrantScope(
@@ -359,26 +369,48 @@ export function isSelfMintedBearer(name: string, value: string): boolean {
   }
 }
 
+const HTTP_TOKEN_RE = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/
+const WS_SUBPROTOCOL_RE = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/
+
+/** RFC 7230 token validation shared by caller headers and WebSocket subprotocol offers. */
+export function isValidHttpToken(value: string): boolean {
+  return value.length > 0 && HTTP_TOKEN_RE.test(value)
+}
+
+export function isValidWebsocketSubprotocol(value: string): boolean {
+  return value.length > 0 && WS_SUBPROTOCOL_RE.test(value) && !/[\x00-\x20\x7f]/.test(value)
+}
+
 export function validateCallerHeaders(
   headers: Record<string, string> | undefined,
   options: { allowSelfMintedBearer?: boolean; stripPseudoHeaders?: boolean } = {},
-): { ok: true } | { ok: false; reasonCode: 'forbidden_header' | 'invalid_header'; reason: string } {
+): { ok: true; headers: Record<string, string> } | { ok: false; reasonCode: 'forbidden_header' | 'invalid_header'; reason: string } {
   const allowSelfMinted = options.allowSelfMintedBearer ?? true
   const stripPseudo = options.stripPseudoHeaders ?? false
+  const normalized: Record<string, string> = {}
   for (const [k, v] of Object.entries(headers ?? {})) {
     if (stripPseudo && k.trimStart().startsWith(':')) continue
-    if (FORBIDDEN_CALLER_HEADERS.test(k) && !(allowSelfMinted && isSelfMintedBearer(k, v))) {
+    if (!isValidHttpToken(k) || /[\r\n\0]/.test(v)) {
+      return { ok: false, reasonCode: 'invalid_header', reason: 'Invalid request header.' }
+    }
+    const canonicalName = k.toLowerCase()
+    if (Object.prototype.hasOwnProperty.call(normalized, canonicalName)) {
+      return {
+        ok: false,
+        reasonCode: 'invalid_header',
+        reason: `Duplicate case-insensitive request header "${canonicalName}".`,
+      }
+    }
+    if (FORBIDDEN_CALLER_HEADERS.test(canonicalName) && !(allowSelfMinted && isSelfMintedBearer(canonicalName, v))) {
       return {
         ok: false,
         reasonCode: 'forbidden_header',
         reason: `Header "${k}" cannot be set directly; reference an approved persona handle instead.`,
       }
     }
-    if (/[\r\n\0]/.test(k) || /[\r\n\0]/.test(v)) {
-      return { ok: false, reasonCode: 'invalid_header', reason: 'Invalid request header.' }
-    }
+    normalized[canonicalName] = v
   }
-  return { ok: true }
+  return { ok: true, headers: normalized }
 }
 
 export function hasDestructiveContent(text: string): boolean {
@@ -699,12 +731,7 @@ export function inspectJsonRpcPayload(
 }
 
 function headerLookup(headers: Record<string, string> | undefined, name: string): string {
-  if (!headers) return ''
-  const lower = name.toLowerCase()
-  for (const [k, v] of Object.entries(headers)) {
-    if (k.toLowerCase() === lower) return v
-  }
-  return ''
+  return headers?.[name.toLowerCase()] ?? ''
 }
 
 function isGraphqlPathCandidate(pathAndQuery: string): boolean {
@@ -994,7 +1021,6 @@ export class RequestAdmissionEngine {
     const effectiveTier = capabilityTierToAdmissionTier(capabilityTier)
     const localLab = isLocalLabEnabled(grant, this.env())
     const normalizedOrigin = url.origin
-    const normalizedPath = `${url.pathname}${url.search}`
     const fail = (reasonCode: AdmissionReasonCode, matchedRule: string, reason: string): AdmissionDecision => ({
       outcome: 'deny',
       allowed: false,
@@ -1008,7 +1034,20 @@ export class RequestAdmissionEngine {
       normalizedPath,
       localLab,
       parsedUrl: url,
+      normalizedHeaders: {},
     })
+
+    const normalizedPath = `${url.pathname}${url.search}`
+    const canonical = canonicalPathAndQuery(normalizedPath)
+    if (canonical === null || hasUnsafeAdmissionPath(normalizedPath)) {
+      return fail('malformed_path', 'path_syntax', 'Redirect path is not canonical or contains ambiguous path syntax.')
+    }
+    if (!isSafeAdmissionUrl(url, options.allowQuery ?? true, localLab, grant.allowedPorts, this.env())) {
+      return fail('out_of_scope', 'grant_scope', 'Destination is outside the current assignment scope.')
+    }
+    if (this.checkExplicitDenylist(normalizedOrigin, canonical)) {
+      return fail('explicit_denylist', 'explicit_denylist', 'Redirect destination matches an explicit denylist.')
+    }
 
     if (options.redirectHop && localLab && !isLocalLabAutoApprovalOrigin(normalizedOrigin)) {
       return fail(
@@ -1030,11 +1069,39 @@ export class RequestAdmissionEngine {
         'Passive root discovery is only permitted for target origins.',
       )
     }
-    const denied = this.checkExplicitDenylist(normalizedOrigin, normalizedPath)
-    if (denied) return fail('explicit_denylist', denied.matchedRule, denied.reason)
-    if (!isSafeAdmissionUrl(url, options.allowQuery ?? true, localLab, grant.allowedPorts, this.env()) ||
-        !isOriginInGrantScope(grant, normalizedOrigin, effectiveScopePolicy)) {
+    if (effectiveScopePolicy) {
+      const scopeDecision = evaluateScopeRequest(effectiveScopePolicy, {
+        origin: normalizedOrigin,
+        method: 'GET',
+        pathAndQuery: canonical,
+        redirectHop: options.redirectHop,
+        surface: 'broker',
+      })
+      if (!scopeDecision.allowed) {
+        const code: AdmissionReasonCode =
+          scopeDecision.code === 'out_of_scope' ? 'out_of_scope'
+            : scopeDecision.code === 'auth_origin_active_probe' ? 'auth_origin_active_probe'
+            : scopeDecision.code === 'asset_origin_active_probe' ? 'asset_origin_active_probe'
+            : scopeDecision.code === 'invalid_path' ? 'malformed_path'
+            : scopeDecision.code === 'staging_denylist' ? 'staging_denylist'
+            : 'out_of_scope'
+        return fail(code, `scope_policy:${scopeDecision.code}`, scopeDecision.reason)
+      }
+      if (isRouteDenylisted(effectiveScopePolicy, canonical)) {
+        return fail('staging_denylist', 'scope_policy:staging_denylist',
+          'Redirect destination is on the staging denylist.')
+      }
+    }
+    if (!isOriginInGrantScope(grant, normalizedOrigin, effectiveScopePolicy)) {
       return fail('out_of_scope', 'grant_scope', 'Destination is outside the current assignment scope.')
+    }
+    if (this.options.scopeHopValidator) {
+      const validated = this.options.scopeHopValidator(url, options.redirectHop === true)
+      if (!validated.allowed) return validated
+    }
+    if (hasDestructiveContent(canonical)) {
+      return fail('destructive_payload', 'denylist:destructive_payload',
+        'Redirect destination is blocked by Kovo Hunter destructive-payload denylist.')
     }
     return {
       outcome: 'allow',
@@ -1049,6 +1116,7 @@ export class RequestAdmissionEngine {
       normalizedPath,
       localLab,
       parsedUrl: url,
+      normalizedHeaders: {},
     }
   }
 
@@ -1090,6 +1158,7 @@ export class RequestAdmissionEngine {
       normalizedMethod,
       normalizedOrigin: extra.normalizedOrigin ?? null,
       normalizedPath: extra.normalizedPath ?? rawPath,
+      normalizedHeaders: extra.normalizedHeaders,
       ...extra,
     })
 
@@ -1182,12 +1251,22 @@ export class RequestAdmissionEngine {
       const hop = this.admitScopeHop(url, grant, { allowQuery: request.allowQuery ?? false, requireTargetRole: true })
       if (!hop.allowed) return hop
       return build('allow', 'allowed_read_only', 'public_root', 'Passive root discovery permitted within scope.',
-        { normalizedOrigin: initialOrigin, normalizedPath, localLab, parsedUrl: url })
+        { normalizedOrigin: initialOrigin, normalizedPath, localLab, parsedUrl: url, normalizedHeaders: hop.normalizedHeaders })
     }
 
     // 4. Path & URL safety + origin scope + explicit denylist
+    const rawIsAbsolute = /^[a-z][a-z0-9+.-]*:\/\//i.test(rawPath)
+    if (hasUnsafeAdmissionPath(rawPath)) {
+      return build(
+        'deny',
+        'malformed_path',
+        'path_syntax',
+        'Request path contains ambiguous dot-segment, separator, or control syntax.',
+        { normalizedOrigin: initialOrigin, normalizedPath: rawPath, localLab },
+      )
+    }
     if (
-      !rawPath.startsWith('/') ||
+      (!rawIsAbsolute && !rawPath.startsWith('/')) ||
       rawPath.startsWith('//') ||
       rawPath.length > MAX_ADMISSION_PATH_LENGTH ||
       /[\r\n\0]/.test(rawPath)
@@ -1202,8 +1281,13 @@ export class RequestAdmissionEngine {
         { normalizedOrigin: initialOrigin, normalizedPath: rawPath, localLab },
       )
     }
+    const canonical = canonicalPathAndQuery(`${url.pathname}${url.search}`)
     if (url.origin !== initialOrigin) {
       return build('deny', 'origin_escape', 'origin_boundary', 'Request path escaped the requested origin.',
+        { normalizedOrigin: initialOrigin, normalizedPath, localLab, parsedUrl: url })
+    }
+    if (canonical === null || hasUnsafeAdmissionPath(canonical) || canonical !== `${url.pathname}${url.search}`) {
+      return build('deny', 'malformed_path', 'path_syntax', 'Request path could not be canonicalized safely.',
         { normalizedOrigin: initialOrigin, normalizedPath, localLab, parsedUrl: url })
     }
 
@@ -1252,60 +1336,72 @@ export class RequestAdmissionEngine {
         { normalizedOrigin: initialOrigin, normalizedPath, localLab, parsedUrl: url })
     }
 
-    const explicitDenied = this.checkExplicitDenylist(initialOrigin, rawPath)
+    const explicitDenied = this.checkExplicitDenylist(initialOrigin, canonical)
     if (explicitDenied) {
       return build('deny', 'explicit_denylist', explicitDenied.matchedRule, explicitDenied.reason,
         { normalizedOrigin: initialOrigin, normalizedPath, localLab, parsedUrl: url })
     }
 
-    // 5. Destructive payload & webshell denylist
-    const serializedHeaders = Object.entries(request.headers ?? {}).map(([k, v]) => `${k}: ${v}`).join('\n')
+    // 5. Validate and canonicalize caller headers once. Every later check uses this map.
+    let normalizedHeaders = request.normalizedHeaders ?? {}
+    if (request.checkCallerHeaders !== false) {
+      const hdrCheck = validateCallerHeaders(request.headers, {
+        allowSelfMintedBearer: kind !== 'websocket',
+        stripPseudoHeaders: request.stripPseudoHeaders ?? kind === 'http2',
+      })
+      if (!hdrCheck.ok) {
+        return build('deny', hdrCheck.reasonCode, `header:${hdrCheck.reasonCode}`,
+          kind === 'websocket' && hdrCheck.reasonCode === 'invalid_header' ? 'Invalid WebSocket request header.' : hdrCheck.reason,
+          { normalizedOrigin: initialOrigin, normalizedPath, localLab, parsedUrl: url })
+      }
+      normalizedHeaders = hdrCheck.headers
+    }
+    const serializedHeaders = Object.entries(normalizedHeaders).map(([k, v]) => `${k}: ${v}`).join('\n')
+    const wsSubprotocols = request.wsSubprotocols ?? []
     if (kind === 'websocket') {
-      const wsText = [rawPath, request.wsOriginHeader ?? '', serializedHeaders, ...(request.wsSendMessages ?? [])].join('\n')
+      if (wsSubprotocols.some(protocol => !isValidWebsocketSubprotocol(protocol))) {
+        return build('deny', 'invalid_header', 'header:invalid_websocket_subprotocol',
+          'WebSocket subprotocols must be non-empty RFC token values without control characters.',
+          { normalizedOrigin: initialOrigin, normalizedPath, localLab, parsedUrl: url, normalizedHeaders })
+      }
+      const wsMessages = [...(request.wsSendMessages ?? []), ...wsSubprotocols]
+      const wsText = [canonical, request.wsOriginHeader ?? '', serializedHeaders, ...wsMessages].join('\n')
       if (hasDestructiveContent(wsText)) {
         return build('deny', 'destructive_payload', 'denylist:destructive_payload',
           'WebSocket probe blocked by Kovo Hunter destructive-payload denylist.',
-          { normalizedOrigin: initialOrigin, normalizedPath, localLab, parsedUrl: url })
+          { normalizedOrigin: initialOrigin, normalizedPath, localLab, parsedUrl: url, normalizedHeaders })
       }
       if (request.personaHandle && capabilityTier < 2) {
         return build('deny', 'tier_insufficient', 'tier:persona_requires_supervised',
           'Persona-authenticated WebSocket probes require Tier 2 or higher.',
-          { normalizedOrigin: initialOrigin, normalizedPath, localLab, parsedUrl: url })
+          { normalizedOrigin: initialOrigin, normalizedPath, localLab, parsedUrl: url, normalizedHeaders })
       }
-      if (request.checkCallerHeaders !== false) {
-        const hdrCheck = validateCallerHeaders(request.headers, { allowSelfMintedBearer: false })
-        if (!hdrCheck.ok) {
-          return build('deny', hdrCheck.reasonCode, `header:${hdrCheck.reasonCode}`,
-            hdrCheck.reasonCode === 'invalid_header' ? 'Invalid WebSocket request header.' : hdrCheck.reason,
-            { normalizedOrigin: initialOrigin, normalizedPath, localLab, parsedUrl: url })
-        }
-      }
-      const hookDenial = this.evaluateBudgetAndRateHooks(request, grant, initialOrigin, normalizedMethod, rawPath, effectiveTier, capabilityTier, kind, internalOptions.budgetWeight ?? 1)
-      if (hookDenial) return hookDenial
+      const hookDenial = this.evaluateBudgetAndRateHooks(request, grant, initialOrigin, normalizedMethod, canonical, effectiveTier, capabilityTier, kind, internalOptions.budgetWeight ?? 1)
+      if (hookDenial) return { ...hookDenial, normalizedHeaders, localLab, parsedUrl: url }
       return build('allow', 'allowed', 'websocket_scope', 'WebSocket probe permitted within scope.',
-        { normalizedOrigin: initialOrigin, normalizedPath, localLab, parsedUrl: url })
+        { normalizedOrigin: initialOrigin, normalizedPath, localLab, parsedUrl: url, normalizedHeaders })
     }
 
     if (
-      hasDestructiveContent(rawPath) ||
+      hasDestructiveContent(canonical) ||
       hasDestructiveContent(serializedHeaders) ||
       (request.body !== undefined && hasDestructiveContent(request.body))
     ) {
       return build('deny', 'destructive_payload', 'denylist:destructive_payload',
         'Request blocked by Kovo Hunter destructive-payload denylist.',
-        { normalizedOrigin: initialOrigin, normalizedPath, localLab, parsedUrl: url })
+        { normalizedOrigin: initialOrigin, normalizedPath, localLab, parsedUrl: url, normalizedHeaders })
     }
     if (request.authMutation?.kind === 'kid_inject' && hasDestructiveContent(request.authMutation.value)) {
       return build('deny', 'destructive_payload', 'denylist:auth_mutation_kid',
         'authMutation kid_inject blocked by Kovo Hunter destructive-payload denylist.',
-        { normalizedOrigin: initialOrigin, normalizedPath, localLab, parsedUrl: url })
+        { normalizedOrigin: initialOrigin, normalizedPath, localLab, parsedUrl: url, normalizedHeaders })
     }
     if (request.authMutation?.kind === 'jku_x5u_canary') {
       const candidateUrl = request.authMutation.url ?? request.authMutation.value
       if (candidateUrl && (hasDestructiveContent(candidateUrl) || /[\r\n\0]/.test(candidateUrl))) {
         return build('deny', 'destructive_payload', 'denylist:auth_mutation_jku',
           'authMutation jku_x5u_canary blocked by Kovo Hunter destructive-payload denylist.',
-          { normalizedOrigin: initialOrigin, normalizedPath, localLab, parsedUrl: url })
+          { normalizedOrigin: initialOrigin, normalizedPath, localLab, parsedUrl: url, normalizedHeaders })
       }
     }
 
@@ -1313,7 +1409,7 @@ export class RequestAdmissionEngine {
     if (hasMultipartParts && request.body !== undefined) {
       return build('deny', 'conflicting_body_multipart', 'request:body_multipart_exclusive',
         'Specify either body or multipartParts, not both.',
-        { normalizedOrigin: initialOrigin, normalizedPath, localLab, parsedUrl: url })
+        { normalizedOrigin: initialOrigin, normalizedPath, localLab, parsedUrl: url, normalizedHeaders })
     }
     if (hasMultipartParts) {
       for (const part of request.multipartParts!) {
@@ -1321,12 +1417,12 @@ export class RequestAdmissionEngine {
         if (hasDestructiveContent(serialized)) {
           return build('deny', 'destructive_payload', 'denylist:multipart_destructive',
             'Multipart upload blocked by Kovo Hunter destructive-payload denylist.',
-            { normalizedOrigin: initialOrigin, normalizedPath, localLab, parsedUrl: url })
+            { normalizedOrigin: initialOrigin, normalizedPath, localLab, parsedUrl: url, normalizedHeaders })
         }
         if (containsWebshellSignature(serialized)) {
           return build('deny', 'webshell_signature', 'denylist:multipart_webshell',
             'Multipart upload blocked by Kovo Hunter webshell signature filter.',
-            { normalizedOrigin: initialOrigin, normalizedPath, localLab, parsedUrl: url })
+            { normalizedOrigin: initialOrigin, normalizedPath, localLab, parsedUrl: url, normalizedHeaders })
         }
       }
     }
@@ -1351,20 +1447,21 @@ export class RequestAdmissionEngine {
     }
 
     // 7. Strict Method + GraphQL + JSON-RPC mutation classification
+    const decisionHeaders = { ...normalizedHeaders }
     const classification = classifyRequestMutation({
       method: normalizedMethod,
-      pathAndQuery: rawPath,
+      pathAndQuery: canonical,
       body: request.body ?? null,
-      headers: request.headers,
+      headers: normalizedHeaders,
       multipartParts: request.multipartParts,
     })
 
     // 8. Budget / rate-limit admission hooks (before consuming any single-use approval grants)
     if (internalOptions.evaluateConsumingHooks !== false) {
       const hookDenial = this.evaluateBudgetAndRateHooks(
-        request, grant, initialOrigin, normalizedMethod, rawPath, effectiveTier, capabilityTier, kind, internalOptions.budgetWeight ?? 1,
+        request, grant, initialOrigin, normalizedMethod, canonical, effectiveTier, capabilityTier, kind, internalOptions.budgetWeight ?? 1,
       )
-      if (hookDenial) return { ...hookDenial, classification, localLab, parsedUrl: url }
+      if (hookDenial) return { ...hookDenial, classification, normalizedHeaders: decisionHeaders, localLab, parsedUrl: url }
     }
 
     // 9. ScopePolicy + Tier + Approval Policy + Leases + SandboxWriteAllowlist + Exact Grant
@@ -1385,9 +1482,9 @@ export class RequestAdmissionEngine {
       const scopeDecision = evaluateScopeRequest(effectiveScopePolicy, {
         origin: initialOrigin,
         method: normalizedMethod,
-        pathAndQuery: rawPath,
+        pathAndQuery: canonical,
         body: request.body ?? null,
-        headers: request.headers,
+        headers: normalizedHeaders,
         redirectHop: request.redirectHop,
         hook: request.scopeHook ?? null,
         surface: request.surface ?? (kind === 'browser' ? 'browser' : 'broker'),
@@ -1396,14 +1493,14 @@ export class RequestAdmissionEngine {
       const checkLease = (): boolean =>
         !request.isRaceBurst &&
         !classification.hasCompressedBody &&
-        grant.approvalLeases?.(initialOrigin, normalizedMethod, rawPath) === true
+        grant.approvalLeases?.(initialOrigin, normalizedMethod, canonical) === true
 
       const sandboxPostAllowed =
         !classification.hasMultipart &&
         normalizedMethod === 'POST' &&
         capabilityTier === 2 &&
         grant.sandboxWriteAllowlist !== undefined &&
-        matchesSandboxWriteAllowlist(initialOrigin, url.pathname, rawPath, grant.sandboxWriteAllowlist)
+        matchesSandboxWriteAllowlist(initialOrigin, url.pathname, canonical, grant.sandboxWriteAllowlist)
 
       if (scopeDecision.allowed) {
         if (classification.isReadOnly || classification.isVerifiedGraphqlRead) {
@@ -1447,6 +1544,7 @@ export class RequestAdmissionEngine {
         const leaseEligible =
           contractApplies &&
           scopeDecision.code !== 'out_of_scope' &&
+          scopeDecision.code !== 'invalid_path' &&
           scopeDecision.code !== 'auth_origin_active_probe' &&
           scopeDecision.code !== 'asset_origin_active_probe'
         const leased = leaseEligible && evaluateConsuming && checkLease()
@@ -1479,6 +1577,7 @@ export class RequestAdmissionEngine {
             : scopeDecision.code === 'readonly_environment' ? 'readonly_environment'
             : scopeDecision.code === 'staging_denylist' ? 'staging_denylist'
             : scopeDecision.code === 'staging_untagged_mutation' ? 'staging_untagged_mutation'
+            : scopeDecision.code === 'invalid_path' ? 'malformed_path'
             : 'out_of_scope'
           return build('deny', mappedCode, `scope_policy:${scopeDecision.code}`, scopeDecision.reason,
             { normalizedOrigin: initialOrigin, normalizedPath, localLab, parsedUrl: url, classification })
@@ -1498,7 +1597,7 @@ export class RequestAdmissionEngine {
         normalizedMethod === 'POST' &&
         capabilityTier === 2 &&
         (grant.sandboxWriteAllowlist !== undefined
-          ? matchesSandboxWriteAllowlist(initialOrigin, url.pathname, rawPath, grant.sandboxWriteAllowlist)
+          ? matchesSandboxWriteAllowlist(initialOrigin, url.pathname, canonical, grant.sandboxWriteAllowlist)
           : localLab)
 
       if (sandboxPostAllowed) {
@@ -1526,7 +1625,7 @@ export class RequestAdmissionEngine {
         }
         if (evaluateConsuming) {
           const approved = grant.isStateChangeApproved
-            ? grant.isStateChangeApproved(initialOrigin, normalizedMethod, rawPath, approvalContext)
+            ? grant.isStateChangeApproved(initialOrigin, normalizedMethod, canonical, approvalContext)
             : localLab
           if (!approved) {
             return build(
@@ -1534,8 +1633,8 @@ export class RequestAdmissionEngine {
               'approval_required',
               request.redirectHop ? 'tier3_redirect_approval_required' : 'tier3_approval_required',
               request.redirectHop
-                ? `Approval required for state-changing redirect ${normalizedMethod} ${rawPath}.`
-                : `Tier 3 operator approval required for ${normalizedMethod} ${initialOrigin}${rawPath}`,
+                ? `Approval required for state-changing redirect ${normalizedMethod} ${canonical}.`
+                : `Tier 3 operator approval required for ${normalizedMethod} ${initialOrigin}${canonical}`,
               { normalizedOrigin: initialOrigin, normalizedPath, localLab, parsedUrl: url, classification, approvalContext },
             )
           }
@@ -1545,24 +1644,13 @@ export class RequestAdmissionEngine {
       }
     }
 
-    // 10. Caller header validation (forbidden credentials / control characters)
-    if (request.checkCallerHeaders !== false) {
-      const hdrCheck = validateCallerHeaders(request.headers, {
-        allowSelfMintedBearer: true,
-        stripPseudoHeaders: request.stripPseudoHeaders ?? kind === 'http2',
-      })
-      if (!hdrCheck.ok) {
-        return build('deny', hdrCheck.reasonCode, `header:${hdrCheck.reasonCode}`, hdrCheck.reason,
-          { normalizedOrigin: initialOrigin, normalizedPath, localLab, parsedUrl: url, classification })
-      }
-    }
-
     return build('allow', approvedReasonCode, approvedRule, 'Request admitted.', {
       normalizedOrigin: initialOrigin,
       normalizedPath,
       localLab,
       parsedUrl: url,
       classification,
+      normalizedHeaders: decisionHeaders,
     })
   }
 

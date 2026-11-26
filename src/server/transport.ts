@@ -28,7 +28,10 @@ import { connect as tlsConnect, TLSSocket } from 'node:tls'
 import type { DetailedPeerCertificate, ConnectionOptions as TlsConnectionOptions } from 'node:tls'
 import type { Duplex } from 'node:stream'
 import { createBrotliDecompress, createGunzip, createInflate } from 'node:zlib'
+import ipaddr from 'ipaddr.js'
 import type { PublicAddress, RawHttpResponse, TlsMetadata, Transport } from './broker.ts'
+import { isMetadataOrLinkLocalAddress } from './egress-gateway.ts'
+import { isValidHttpToken, isValidWebsocketSubprotocol } from './request-admission.ts'
 
 // ---------------------------------------------------------------------------
 // Configuration (all fail-closed)
@@ -78,9 +81,24 @@ export type TransportConfig = {
 const forbiddenProfileHeaders = /^(?:host|connection|keep-alive|transfer-encoding|upgrade|proxy-connection|proxy-authorization|content-length)$/i
 const crlf = /[\r\n\0]/
 
+function canonicalizeUniqueHeaders(headers: Record<string, string>, source: string): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const [name, value] of Object.entries(headers)) {
+    if (!isValidHttpToken(name) || crlf.test(value)) {
+      throw new TransportConfigError(`${source} contains an invalid header name or value`)
+    }
+    const lower = name.toLowerCase()
+    if (Object.prototype.hasOwnProperty.call(out, lower)) {
+      throw new TransportConfigError(`${source} contains duplicate case-insensitive header ${lower}`)
+    }
+    out[lower] = value
+  }
+  return out
+}
+
 function assertHeaderValue(name: string, value: string): void {
-  if (crlf.test(name) || crlf.test(value)) {
-    throw new TransportConfigError(`header profile entry ${JSON.stringify(name)} contains CR/LF/NUL`)
+  if (!isValidHttpToken(name) || crlf.test(value)) {
+    throw new TransportConfigError(`header profile entry ${JSON.stringify(name)} contains invalid syntax`)
   }
   if (forbiddenProfileHeaders.test(name)) {
     throw new TransportConfigError(`header profile may not set transport-managed header ${name}`)
@@ -117,6 +135,7 @@ function normalizeHeaderProfile(value: unknown, source: string): HeaderProfile {
   }
   const record = value as Record<string, unknown>
   const profile: HeaderProfile = { headers: {} }
+  let headerDisplayNames: Record<string, string> | undefined
   if (record.userAgent !== undefined) {
     if (typeof record.userAgent !== 'string' || record.userAgent.trim() === '') {
       throw new TransportConfigError(`${source}.userAgent must be a non-empty string`)
@@ -132,6 +151,7 @@ function normalizeHeaderProfile(value: unknown, source: string): HeaderProfile {
     if (typeof raw !== 'string') throw new TransportConfigError(`${source}.headers.${name} must be a string`)
     assertHeaderValue(name, raw)
     profile.headers[name] = raw
+    ;(headerDisplayNames ??= {})[name.toLowerCase()] = name
   }
   // Flat profile files are also accepted (e.g. { "userAgent": "...", "Accept-Language": "en" }).
   for (const [name, raw] of Object.entries(record)) {
@@ -139,6 +159,11 @@ function normalizeHeaderProfile(value: unknown, source: string): HeaderProfile {
     if (typeof raw !== 'string') throw new TransportConfigError(`${source}.${name} must be a string`)
     assertHeaderValue(name, raw)
     profile.headers[name] = raw
+    ;(headerDisplayNames ??= {})[name.toLowerCase()] = name
+  }
+  const canonical = canonicalizeUniqueHeaders(profile.headers, source)
+  if (headerDisplayNames) {
+    for (const [lower, display] of Object.entries(headerDisplayNames)) profile.headers[display] = canonical[lower]!
   }
   return profile
 }
@@ -154,14 +179,42 @@ function normalizeProxy(raw: string): EgressProxy {
     throw new TransportConfigError(`KOVO_EGRESS_PROXY scheme ${url.protocol} is unsupported (http/https/socks5/socks5h only)`)
   }
   if (!url.hostname) throw new TransportConfigError('KOVO_EGRESS_PROXY is missing a host')
+  if ((url.pathname !== '/' && url.pathname !== '') || url.search || url.hash) {
+    throw new TransportConfigError('KOVO_EGRESS_PROXY must not contain a path, query, or fragment')
+  }
+  const rawHostname = url.hostname.replace(/^\[|\]$/g, '')
+  let proxyHost: string
+  if (ipaddr.isValid(rawHostname)) {
+    const parsed = ipaddr.process(rawHostname)
+    if (isMetadataOrLinkLocalAddress(parsed.toString()) || parsed.range() === 'unspecified') {
+      throw new TransportConfigError('KOVO_EGRESS_PROXY host is a metadata, link-local, or unspecified address')
+    }
+    proxyHost = parsed.toNormalizedString()
+  } else {
+    if (rawHostname.includes(':') || !/^[a-z0-9.-]+$/i.test(rawHostname) || rawHostname.includes('..')) {
+      throw new TransportConfigError('KOVO_EGRESS_PROXY host is invalid')
+    }
+    const hostname = rawHostname.toLowerCase().replace(/\.+$/, '')
+    if (!hostname || hostname === 'localhost' || hostname.endsWith('.localhost') || hostname.endsWith('.local') ||
+        hostname === 'metadata.google.internal' || hostname.endsWith('.internal')) {
+      throw new TransportConfigError('KOVO_EGRESS_PROXY host is a local or metadata-only destination')
+    }
+    proxyHost = hostname
+  }
   const port = url.port ? Number(url.port) : (url.protocol === 'https:' ? 443 : url.protocol === 'http:' ? 80 : 1080)
   if (!Number.isInteger(port) || port <= 0 || port > 65_535) {
     throw new TransportConfigError('KOVO_EGRESS_PROXY has an invalid port')
   }
-  const proxy: EgressProxy = { protocol: url.protocol as EgressProxy['protocol'], host: url.hostname, port }
+  const proxy: EgressProxy = { protocol: url.protocol as EgressProxy['protocol'], host: proxyHost, port }
   if (url.username || url.password) {
-    const username = decodeURIComponent(url.username)
-    const password = decodeURIComponent(url.password)
+    let username: string
+    let password: string
+    try {
+      username = decodeURIComponent(url.username)
+      password = decodeURIComponent(url.password)
+    } catch {
+      throw new TransportConfigError('KOVO_EGRESS_PROXY credentials are not valid percent-encoding')
+    }
     if (crlf.test(username) || crlf.test(password)) {
       throw new TransportConfigError('KOVO_EGRESS_PROXY credentials contain CR/LF/NUL')
     }
@@ -470,16 +523,17 @@ class SocketReader {
     return new Promise<void>((resolve, reject) => {
       const cleanup = () => {
         signal.removeEventListener('abort', onAbort)
-        this.pending = undefined
+        if (this.pending === wake) this.pending = undefined
+      }
+      const wake = () => {
+        cleanup()
+        resolve()
       }
       const onAbort = () => {
         cleanup()
         reject(signal.reason ?? new Error('aborted'))
       }
-      this.pending = () => {
-        cleanup()
-        resolve()
-      }
+      this.pending = wake
       signal.addEventListener('abort', onAbort, { once: true })
     })
   }
@@ -539,10 +593,11 @@ async function socks5Tunnel(
   } else {
     const literal = target.address ?? target.host
     if (literal.includes(':')) {
-      const parts = literal.split(':').map(p => Number.parseInt(p || '0', 16))
-      if (parts.length !== 8 || parts.some(n => !Number.isFinite(n))) throw new Error('invalid IPv6 address')
-      addressBytes = Buffer.alloc(16)
-      parts.forEach((part, i) => addressBytes.writeUInt16BE(part, i * 2))
+      const bare = literal.replace(/^\[|\]$/g, '').split('%', 1)[0]!
+      if (!ipaddr.isValid(bare)) throw new Error('invalid IPv6 address')
+      const parsed = ipaddr.parse(bare)
+      if (parsed.kind() !== 'ipv6') throw new Error('invalid IPv6 address')
+      addressBytes = Buffer.from(parsed.toByteArray())
       atyp = 0x04
     } else {
       const parts = literal.split('.').map(p => Number(p))
@@ -633,7 +688,7 @@ async function openStream(
 
   if (proxy && (proxy.protocol === 'socks5:' || proxy.protocol === 'socks5h:')) {
     base = await connectTcp(proxy.host, proxy.port, signal)
-    base = await socks5Tunnel(base, { host: url.hostname, port, address: address.address }, proxy, signal)
+    base = await socks5Tunnel(base, { host: url.hostname.replace(/^\[|\]$/g, ''), port, address: address.address }, proxy, signal)
   } else if (proxy && proxy.protocol === 'http:' && isHttps) {
     base = await connectTcp(proxy.host, proxy.port, signal)
     base = await httpProxyTunnel(base, { host: url.hostname, port }, proxy, signal)
@@ -723,11 +778,11 @@ function h2Headers(url: URL, method: string, headers: Record<string, string>): R
     ':authority': url.host,
     ':path': `${url.pathname}${url.search}`,
   }
-  for (const [k, v] of Object.entries(headers)) {
-    if (k.startsWith(':')) continue
-    if (hopByHopHeaders.has(k.toLowerCase())) continue
+  const normalized = canonicalizeUniqueHeaders(headers, 'HTTP/2 headers')
+  for (const [k, v] of Object.entries(normalized)) {
+    if (k.startsWith(':') || hopByHopHeaders.has(k)) continue
     // Connection-specific header lists are illegal on HTTP/2.
-    out[k.toLowerCase()] = v
+    out[k] = v
   }
   return out
 }
@@ -830,8 +885,8 @@ export function createHttpTransport(config: TransportConfig, fallback: Transport
   const maxSessions = Math.max(1, Math.min(config.http2MaxSessions ?? 8, 64))
 
   const profileAgent = (headers: Record<string, string>) => {
-    const merged: Record<string, string> = { ...headers }
-    if (config.headerProfile?.userAgent) merged['User-Agent'] = config.headerProfile.userAgent
+    const merged = canonicalizeUniqueHeaders(headers, 'HTTP headers')
+    if (config.headerProfile?.userAgent) merged['user-agent'] = config.headerProfile.userAgent
     for (const [k, v] of Object.entries(config.headerProfile?.headers ?? {})) {
       // Only fill gaps unless the profile explicitly overrides the caller's authorized header.
       if (merged[k] === undefined) merged[k] = v
@@ -936,17 +991,17 @@ export function createHttpTransport(config: TransportConfig, fallback: Transport
   ): Promise<RawHttpResponse> => {
     const methodName = (options.method ?? 'GET').toUpperCase()
     const session = await getSession(url, address, signal, options.rejectUnauthorized ?? true)
-    const headers: Record<string, string> = { ...(options.headers ?? {}) }
-    if (config.headerProfile?.userAgent && headers['User-Agent'] === undefined) {
-      headers['User-Agent'] = config.headerProfile.userAgent
+    const headers = canonicalizeUniqueHeaders({ ...(options.headers ?? {}) }, 'HTTP/2 headers')
+    if (config.headerProfile?.userAgent && headers['user-agent'] === undefined) {
+      headers['user-agent'] = config.headerProfile.userAgent
     }
     for (const [name, value] of Object.entries(config.headerProfile?.headers ?? {})) {
       if (headers[name] === undefined) headers[name] = value
     }
-    if (headers['User-Agent'] === undefined) headers['User-Agent'] = defaultUserAgent
-    if (headers.Accept === undefined) headers.Accept = 'text/html, application/json;q=0.9, */*;q=0.1'
-    if (headers['Accept-Encoding'] === undefined) headers['Accept-Encoding'] = 'gzip, deflate, br'
-    if (options.body !== undefined && headers['Content-Type'] === undefined) headers['Content-Type'] = 'application/json'
+    if (headers['user-agent'] === undefined) headers['user-agent'] = defaultUserAgent
+    if (headers.accept === undefined) headers.accept = 'text/html, application/json;q=0.9, */*;q=0.1'
+    if (headers['accept-encoding'] === undefined) headers['accept-encoding'] = 'gzip, deflate, br'
+    if (options.body !== undefined && headers['content-type'] === undefined) headers['content-type'] = 'application/json'
 
     const requestHeaders = h2Headers(url, methodName, headers)
 
@@ -1024,12 +1079,12 @@ export function createHttpTransport(config: TransportConfig, fallback: Transport
     const port = url.port ? Number(url.port) : (isHttps ? 443 : 80)
     const methodName = (options.method ?? 'GET').toUpperCase()
     const headers = profileAgent({ ...(options.headers ?? {}) })
-    if (headers['User-Agent'] === undefined) headers['User-Agent'] = defaultUserAgent
-    if (headers.Accept === undefined) headers.Accept = 'text/html, application/json;q=0.9, */*;q=0.1'
-    if (headers['Accept-Encoding'] === undefined) headers['Accept-Encoding'] = 'gzip, deflate, br'
+    if (headers['user-agent'] === undefined) headers['user-agent'] = defaultUserAgent
+    if (headers.accept === undefined) headers.accept = 'text/html, application/json;q=0.9, */*;q=0.1'
+    if (headers['accept-encoding'] === undefined) headers['accept-encoding'] = 'gzip, deflate, br'
     if (options.body !== undefined) {
-      if (headers['Content-Type'] === undefined) headers['Content-Type'] = 'application/json'
-      headers['Content-Length'] = String(Buffer.byteLength(options.body))
+      if (headers['content-type'] === undefined) headers['content-type'] = 'application/json'
+      headers['content-length'] = String(Buffer.byteLength(options.body))
     }
 
     let socket: NetSocket | undefined
@@ -1042,29 +1097,29 @@ export function createHttpTransport(config: TransportConfig, fallback: Transport
       // CONNECT tunnel (HTTP proxy) or SOCKS5 tunnel, then TLS inside it.
       const raw = await connectTcp(proxy.host, proxy.port, signal)
       socket = proxy.protocol === 'socks5:' || proxy.protocol === 'socks5h:'
-        ? await socks5Tunnel(raw, { host: url.hostname, port, address: address.address }, proxy, signal)
+        ? await socks5Tunnel(raw, { host: url.hostname.replace(/^\[|\]$/g, ''), port, address: address.address }, proxy, signal)
         : await httpProxyTunnel(raw, { host: url.hostname, port }, proxy, signal)
       const tlsSocket = tlsConnect(tlsOptions(url, options.rejectUnauthorized ?? true, config.mtls, socket))
       await waitForTls(tlsSocket, signal)
       socket = tlsSocket
       requestHost = url.hostname
       requestPort = port
-      headers.Host = url.host
+      headers.host = url.host
     } else if (proxy.protocol === 'http:') {
       // Plain HTTP through an HTTP proxy: absolute-form request line.
       requestPath = url.href
-      headers.Host = url.host
-      if (proxy.authorization) extraHeaders['Proxy-Authorization'] = proxy.authorization
+      headers.host = url.host
+      if (proxy.authorization) extraHeaders['proxy-authorization'] = proxy.authorization
     } else if (proxy.protocol === 'https:') {
       // Fail closed: an HTTPS proxy needs a CONNECT tunnel, which we only implement for TLS
       // targets. Silently sending plaintext to the proxy would leak the request outside it.
       throw new TransportConfigError('HTTPS egress proxy requires an https:// target')
     } else {
       const raw = await connectTcp(proxy.host, proxy.port, signal)
-      socket = await socks5Tunnel(raw, { host: url.hostname, port, address: address.address }, proxy, signal)
+      socket = await socks5Tunnel(raw, { host: url.hostname.replace(/^\[|\]$/g, ''), port, address: address.address }, proxy, signal)
       requestHost = address.address
       requestPort = port
-      headers.Host = url.host
+      headers.host = url.host
     }
 
     const useTls = socket instanceof TLSSocket
@@ -1287,41 +1342,56 @@ export class WebSocketSession {
   }
 
   static async connect(url: URL, address: PublicAddress, options: WsSessionOptions = {}): Promise<WebSocketSession> {
+    const subprotocols = options.subprotocols ?? []
+    if (subprotocols.some(protocol => !isValidWebsocketSubprotocol(protocol))) {
+      throw new TransportConfigError('WebSocket subprotocols must be non-empty RFC token values without control characters')
+    }
     const isSecure = url.protocol === 'https:'
     const port = url.port ? Number(url.port) : (isSecure ? 443 : 80)
     const key = randomBytes(16).toString('base64')
     const expectedAccept = createHash('sha1').update(key + wsGuid).digest('base64')
-    const socket = isSecure
-      ? tlsConnect({
-          host: address.address,
-          port,
-          servername: url.hostname,
-          rejectUnauthorized: options.rejectUnauthorized ?? true,
-        })
-      : netConnect({ host: address.address, port })
-
-    await new Promise<void>((resolve, reject) => {
-      const event = isSecure ? 'secureConnect' : 'connect'
-      socket.once(event, () => resolve())
-      socket.once('error', reject)
-    })
-
-    const headers: Record<string, string> = {
-      Host: url.host,
-      Upgrade: 'websocket',
-      Connection: 'Upgrade',
-      'Sec-WebSocket-Key': key,
-      'Sec-WebSocket-Version': '13',
-      'User-Agent': options.userAgent ?? 'KovoHunter/3 defensive websocket probe',
+    let socket: NetSocket | TLSSocket
+    if (isSecure) {
+      socket = tlsConnect({
+        host: address.address,
+        port,
+        servername: url.hostname,
+        rejectUnauthorized: options.rejectUnauthorized ?? true,
+      })
+    } else {
+      socket = netConnect({ host: address.address, port })
     }
-    if (options.subprotocols?.length) headers['Sec-WebSocket-Protocol'] = options.subprotocols.join(', ')
-    for (const [k, v] of Object.entries(options.headers ?? {})) {
-      if (/^(?:host|upgrade|connection|sec-websocket-key|sec-websocket-version|sec-websocket-protocol)$/i.test(k)) continue
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const event = isSecure ? 'secureConnect' : 'connect'
+        socket.once(event, () => resolve())
+        socket.once('error', reject)
+      })
+    } catch (err) {
+      socket.destroy()
+      throw err
+    }
+
+    const headers = canonicalizeUniqueHeaders({
+      host: url.host,
+      upgrade: 'websocket',
+      connection: 'Upgrade',
+      'sec-websocket-key': key,
+      'sec-websocket-version': '13',
+      'user-agent': options.userAgent ?? 'KovoHunter/3 defensive websocket probe',
+    }, 'WebSocket headers')
+    if (subprotocols.length) headers['sec-websocket-protocol'] = subprotocols.join(', ')
+    const callerHeaders = canonicalizeUniqueHeaders(options.headers ?? {}, 'WebSocket headers')
+    for (const [k, v] of Object.entries(callerHeaders)) {
+      if (/^(?:host|upgrade|connection|sec-websocket-key|sec-websocket-version|sec-websocket-protocol)$/.test(k)) continue
       headers[k] = v
     }
-    if (options.cookie && !Object.keys(headers).some(k => k.toLowerCase() === 'cookie')) {
-      headers.Cookie = options.cookie
+    if (options.cookie && headers.cookie === undefined) {
+      if (crlf.test(options.cookie)) throw new TransportConfigError('WebSocket cookie contains CR/LF/NUL')
+      headers.cookie = options.cookie
     }
+    if (crlf.test(options.userAgent ?? '')) throw new TransportConfigError('WebSocket user agent contains CR/LF/NUL')
     const requestLines = [
       `GET ${url.pathname}${url.search} HTTP/1.1`,
       ...Object.entries(headers).map(([k, v]) => `${k}: ${v}`),
@@ -1332,7 +1402,13 @@ export class WebSocketSession {
 
     const reader = new SocketReader(socket)
     const deadline = AbortSignal.timeout(options.timeoutMs ?? 10_000)
-    const head = await reader.readUntil('\r\n\r\n', 64 * 1024, deadline)
+    let head: string
+    try {
+      head = await reader.readUntil('\r\n\r\n', 64 * 1024, deadline)
+    } catch (err) {
+      socket.destroy()
+      throw err
+    }
     const lines = head.split('\r\n').filter(Boolean)
     const statusMatch = /^HTTP\/1\.[01]\s+(\d{3})/.exec(lines[0] ?? '')
     const status = statusMatch ? Number(statusMatch[1]) : 0

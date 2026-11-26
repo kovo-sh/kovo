@@ -60,6 +60,7 @@ export interface ScopeRequest {
 export type ScopeDecisionCode =
   | 'allowed'
   | 'out_of_scope'
+  | 'invalid_path'
   | 'auth_origin_active_probe'
   | 'asset_origin_active_probe'
   | 'readonly_environment'
@@ -93,6 +94,44 @@ const routeNumericSegment = /^\d+$/
 const routeLongHexSegment = /^[0-9a-f]{16,}$/i
 const routePrefixedIdSegment = /^[a-z]{2,10}_[a-zA-Z0-9]{8,}$/
 const routeOpaqueSegment = /^(?=.*\d)(?=.*[a-zA-Z])[a-zA-Z0-9_-]{14,}$/
+const ABSOLUTE_URL_RE = /^[a-z][a-z0-9+.-]*:\/\//i
+const UNSAFE_PATH_RE = /(?:\.\.|\\|%(?:2e|2f|5c))/i
+const INVALID_PATH_CHARS_RE = /[\r\n\0]/
+
+/**
+ * Reject path spellings whose URL-parser and downstream/router interpretations may differ.
+ * This deliberately rejects rather than decodes: an encoded separator or dot segment is not a
+ * canonical request path, even when a particular parser happens to normalize it today.
+ */
+export function hasUnsafeAdmissionPath(pathAndQuery: string): boolean {
+  return UNSAFE_PATH_RE.test(pathAndQuery) || INVALID_PATH_CHARS_RE.test(pathAndQuery)
+}
+
+/** Canonical path + query view. All scope/approval/denylist consumers must use this form. */
+export function canonicalPathAndQuery(pathAndQuery: string): string | null {
+  const raw = (pathAndQuery || '/').trim()
+  if (raw.length > 8192 || hasUnsafeAdmissionPath(raw)) return null
+  let pathname: string
+  let search: string
+  if (ABSOLUTE_URL_RE.test(raw)) {
+    try {
+      const parsed = new URL(raw)
+      pathname = parsed.pathname
+      search = parsed.search
+    } catch {
+      return null
+    }
+  } else {
+    if (!raw.startsWith('/') || raw.startsWith('//')) return null
+    const q = raw.indexOf('?')
+    const h = raw.indexOf('#')
+    const end = q >= 0 ? q : h
+    pathname = end >= 0 ? raw.slice(0, end) : raw
+    search = q >= 0 && (h < 0 || q < h) ? raw.slice(q, h >= 0 ? h : undefined) : ''
+  }
+  if (!pathname || !pathname.startsWith('/') || hasUnsafeAdmissionPath(pathname) || INVALID_PATH_CHARS_RE.test(search)) return null
+  return `${pathname}${search}`
+}
 
 /**
  * Stable route key: identifier-shaped segments collapse to `*`, literals are lowercased and the
@@ -100,20 +139,9 @@ const routeOpaqueSegment = /^(?=.*\d)(?=.*[a-zA-Z])[a-zA-Z0-9_-]{14,}$/
  * so "same route" means the same thing everywhere.
  */
 export function routePatternForPath(pathAndQuery: string): string {
-  let pathname = (pathAndQuery || '/').trim()
-  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(pathname)) {
-    try {
-      pathname = new URL(pathname).pathname || '/'
-    } catch {
-      // Keep the raw string.
-    }
-  }
-  const q = pathname.indexOf('?')
-  if (q >= 0) pathname = pathname.slice(0, q)
-  const h = pathname.indexOf('#')
-  if (h >= 0) pathname = pathname.slice(0, h)
-  if (!pathname.startsWith('/')) pathname = '/' + pathname
-  pathname = pathname.replace(/\/{2,}/g, '/')
+  const canonical = canonicalPathAndQuery(pathAndQuery)
+  if (canonical === null) return ''
+  const pathname = canonical.split('?', 1)[0]!
   const segments = pathname.split('/').map((segment, index) => {
     if (index === 0 || segment === '') return segment
     if (segment === '*' || segment === '**') return segment
@@ -192,21 +220,9 @@ const graphqlEnvelopeKeys = new Set(['query', 'operationName', 'variables', 'ext
  * terminates at a GraphQL route segment such as `/graphql` or `/api/v1/graphql`.
  */
 function isGraphqlEndpointPath(pathAndQuery: string): boolean {
-  let pathname = (pathAndQuery || '').trim()
-  if (!pathname) return false
-  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(pathname)) {
-    try {
-      pathname = new URL(pathname).pathname || '/'
-    } catch {
-      return false
-    }
-  }
-  const q = pathname.indexOf('?')
-  if (q >= 0) pathname = pathname.slice(0, q)
-  const h = pathname.indexOf('#')
-  if (h >= 0) pathname = pathname.slice(0, h)
-  if (pathname.includes('\\') || /%(?:2e|2f|5c)/i.test(pathname)) return false
-  if (!pathname.startsWith('/')) pathname = '/' + pathname
+  const canonical = canonicalPathAndQuery(pathAndQuery)
+  if (canonical === null) return false
+  const pathname = canonical.split('?', 1)[0]!
   const segments = pathname.split('/').filter(Boolean)
   if (segments.length === 0) return false
   if (segments.some(seg => seg === '.' || seg === '..')) return false
@@ -812,7 +828,8 @@ export function isAuthTokenExchangeRequest(
   method: string,
   headers?: Record<string, string | string[] | undefined>,
 ): boolean {
-  if (!authTokenPath.test(pathAndQuery)) return false
+  const canonical = canonicalPathAndQuery(pathAndQuery)
+  if (canonical === null || !authTokenPath.test(canonical)) return false
   const upper = method.toUpperCase()
   if (upper === 'GET' || upper === 'HEAD') return true
   if (upper !== 'POST') return false
@@ -821,13 +838,18 @@ export function isAuthTokenExchangeRequest(
 }
 
 export function isRouteDenylisted(policy: ScopePolicy, pathAndQuery: string): boolean {
+  const canonical = canonicalPathAndQuery(pathAndQuery)
+  // Ambiguous paths never inherit a safe route's denylist classification.
+  if (canonical === null) return true
   const entries = policy.routeDenylist ?? []
   if (!entries.length) return false
-  const requestPath = routePatternForPath(pathAndQuery)
+  const requestPath = routePatternForPath(canonical)
+  if (!requestPath) return true
   for (const entry of entries) {
     const raw = (entry ?? '').trim()
     if (!raw) continue
     const pattern = routePatternForPath(raw.replace(/\*+$/, '') || '/')
+    if (!pattern) continue
     const base = pattern !== '/' && pattern.endsWith('/') ? pattern.slice(0, -1) : pattern
     if (requestPath === base) return true
     if (base !== '/' && requestPath.startsWith(`${base}/`)) return true
@@ -872,14 +894,19 @@ export function evaluateScopeRequest(policy: ScopePolicy, request: ScopeRequest)
   if (!role) {
     return deny('out_of_scope', null, `Origin ${request.origin} is outside the approved scope.`)
   }
+  const canonical = canonicalPathAndQuery(request.pathAndQuery)
   const method = (request.method || 'GET').toUpperCase()
   const readOnly = isReadOnlyHttpMethod(method, request.body)
   const surface: ScopeSurface = request.surface ?? 'broker'
   const origin = normalizeScopeOrigin(request.origin) ?? request.origin
 
   if (role === 'auth') {
-    if (request.redirectHop && readOnly) return allow('auth', `IdP redirect transit to ${origin}.`)
-    if (isAuthTokenExchangeRequest(request.pathAndQuery, method, request.headers)) {
+    if (request.redirectHop && readOnly) {
+      return canonical === null
+        ? deny('invalid_path', role, 'Request path is not canonical or contains ambiguous path syntax.')
+        : allow('auth', `IdP redirect transit to ${origin}.`)
+    }
+    if (canonical !== null && isAuthTokenExchangeRequest(canonical, method, request.headers)) {
       return allow('auth', `SSO token exchange with ${origin}.`)
     }
     return deny(
@@ -890,9 +917,15 @@ export function evaluateScopeRequest(policy: ScopePolicy, request: ScopeRequest)
   }
 
   if (role === 'asset') {
-    if (request.redirectHop && readOnly) return allow('asset', `Asset redirect transit to ${origin}.`)
+    if (request.redirectHop && readOnly) {
+      return canonical === null
+        ? deny('invalid_path', role, 'Request path is not canonical or contains ambiguous path syntax.')
+        : allow('asset', `Asset redirect transit to ${origin}.`)
+    }
     if (surface === 'browser' && (method === 'GET' || method === 'HEAD')) {
-      return allow('asset', `Passive asset hydration from ${origin}.`)
+      return canonical === null
+        ? deny('invalid_path', role, 'Request path is not canonical or contains ambiguous path syntax.')
+        : allow('asset', `Passive asset hydration from ${origin}.`)
     }
     return deny(
       'asset_origin_active_probe',
@@ -901,11 +934,12 @@ export function evaluateScopeRequest(policy: ScopePolicy, request: ScopeRequest)
     )
   }
 
-  // Target origin.
+  // Target origin. Ambiguous paths keep their normal read-only/mutation classification here;
+  // canonical rejection happens at the admission boundary and on every redirect hop.
   if (policy.mode === 'ephemeral_lab') return allow('target')
 
   if (readOnly) return allow('target')
-  if (method === 'POST' && isVerifiedReadOnlyGraphqlQuery(request.pathAndQuery, request.body, request.headers)) {
+  if (canonical !== null && method === 'POST' && isVerifiedReadOnlyGraphqlQuery(canonical, request.body, request.headers)) {
     return allow('target', 'Verified read-only GraphQL query.')
   }
 
@@ -918,17 +952,17 @@ export function evaluateScopeRequest(policy: ScopePolicy, request: ScopeRequest)
   }
 
   // staging_isolated
-  if (isRouteDenylisted(policy, request.pathAndQuery)) {
+  if (canonical !== null && isRouteDenylisted(policy, canonical)) {
     return deny(
       'staging_denylist',
       'target',
-      `Route ${request.pathAndQuery} is on the staging denylist and cannot be mutated.`,
+      `Route ${canonical} is on the staging denylist and cannot be mutated.`,
     )
   }
   if (request.hook === 'setup' || request.hook === 'cleanup') {
     return allow('target', `Explicit ${request.hook} hook context.`)
   }
-  if (requestCarriesTenantTag(request, policy.tenantTag)) {
+  if (canonical !== null && requestCarriesTenantTag({ ...request, pathAndQuery: canonical }, policy.tenantTag)) {
     return allow('target', 'Mutation targets a run-tagged synthetic test tenant.')
   }
   return deny(

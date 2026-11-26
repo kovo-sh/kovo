@@ -1,9 +1,9 @@
 /**
- * Pure leaf module for normalizing and matching operator-approved endpoint path patterns.
- * Zero `src/server/*` dependencies so `store-runs.ts` and `approval-judge.ts` can both consume
- * it without creating a runtime import cycle through `model-settings.ts` -> `store.ts`.
+ * Canonicalizes and matches operator-approved endpoint path patterns through the shared scope
+ * path primitive, keeping admission, leases, denylists, and approvals on one interpretation.
  */
 import type { ApprovedEndpointPattern } from '../domain.ts'
+import { canonicalPathAndQuery } from './scope-policy.ts'
 
 const UUID_SEGMENT = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const MONGO_ID_SEGMENT = /^[0-9a-f]{24}$/i
@@ -40,19 +40,9 @@ export function normalizeOriginKey(origin: string): string {
 }
 
 export function normalizeApprovalPathPattern(pathAndQuery: string): string {
-  let pathname = (pathAndQuery || '/').trim()
-  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(pathname)) {
-    try {
-      pathname = new URL(pathname).pathname || '/'
-    } catch {
-      // Keep raw string
-    }
-  }
-  const qIdx = pathname.indexOf('?')
-  if (qIdx >= 0) pathname = pathname.slice(0, qIdx)
-  const hIdx = pathname.indexOf('#')
-  if (hIdx >= 0) pathname = pathname.slice(0, hIdx)
-  if (!pathname.startsWith('/')) pathname = '/' + pathname
+  const canonical = canonicalPathAndQuery(pathAndQuery)
+  if (canonical === null) return ''
+  let pathname = canonical.split('?', 1)[0]!
   pathname = pathname.replace(/\/{2,}/g, '/')
   if (pathname.length > 1 && pathname.endsWith('/')) {
     pathname = pathname.slice(0, -1)
@@ -82,6 +72,7 @@ interface ApprovalPathSegment {
 
 function parseApprovalPathSegments(pathAndQuery: string): ApprovalPathSegment[] {
   const normalized = normalizeApprovalPathPattern(pathAndQuery)
+  if (!normalized) return []
   return normalized
     .split('/')
     .filter(Boolean)
