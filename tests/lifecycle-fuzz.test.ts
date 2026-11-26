@@ -22,6 +22,7 @@ import {
   emitRunLivenessViolations,
   IllegalLifecycleTransitionError,
   LIFECYCLE_TRANSITION_TABLES,
+  type RunLivenessSnapshot,
   validateLifecycleTransition,
 } from '../src/server/lifecycle.ts'
 import { clearQaAnomalies, listQaAnomalies } from '../src/server/qa-anomalies.ts'
@@ -538,12 +539,9 @@ describe('R3-20.5: seeded lifecycle fuzz (500 sequences, 0 invariant violations)
   test('500 seeded multi-step lifecycle sequences maintain liveness and terminal closure with 0 violations', t => {
     const t0 = Date.now()
     const { store } = makeTempStore(t, 'kovo-r3-20-fuzz-')
-    const project = store.createProject(newProject.parse({
-      requestId: randomUUID(),
-      name: 'Fuzz Project',
-      environment: 'public',
-      seeds: [ORIGIN],
-    }))
+    const { runId, run: templateRun, asset } = setupApprovedRun(store, 'Fuzz Project')
+    const templateCandidatesJson = JSON.stringify(templateRun.candidates)
+    const templateApprovedJson = JSON.stringify(templateRun.approved)
 
     const rng = createMulberry32(0x52333230) // deterministic seed ('R320')
     const SEQUENCES = 500
@@ -552,57 +550,69 @@ describe('R3-20.5: seeded lifecycle fuzz (500 sequences, 0 invariant violations)
     const sampleViolations: string[] = []
 
     const pick = <T>(arr: readonly T[]): T => arr[Math.floor(rng() * arr.length)]!
-    const { run: templateRun } = setupApprovedRun(store, 'Fuzz Template')
-    const templateCandidates = templateRun.candidates
-    const templateApproved = templateRun.approved
-    const asset = templateCandidates[0]!
 
-    // Run 500 seeded sequences across a compact pool of SQLite runs so total wall time stays <2.5s
-    // while exercising every state transition, co-transition, recovery, and terminal-closure edge.
-    const RUN_POOL = 50
-    const poolRunIds: string[] = []
-    for (let i = 0; i < RUN_POOL; i += 1) {
-      const { id } = store.createRun(newRun.parse({
-        requestId: randomUUID(),
-        projectId: project.id,
-        goal: `Fuzz pool run #${i}`,
-        sourceMode: 'public',
-        capabilityTier: 2,
-        budgetUsd: 10,
-        budgetRequests: 200,
-      }))
-      poolRunIds.push(id)
-    }
+    // Reuse a single approved run cleanly reset between sequences so Store.recover() scans 1 run
+    // (not 50 stale pool runs) and history tables never grow O(N^2) across 500 sequences.
+    const delLeases = store.client.prepare('DELETE FROM approval_leases WHERE run_id = ?')
+    const delReqs = store.client.prepare('DELETE FROM approval_requests WHERE run_id = ?')
+    const delSteps = store.client.prepare('DELETE FROM chain_steps WHERE run_id = ?')
+    const delAssg = store.client.prepare('DELETE FROM assignments WHERE run_id = ?')
+    const delEvents = store.client.prepare('DELETE FROM events WHERE run_id = ?')
+    const delMessages = store.client.prepare('DELETE FROM messages WHERE run_id = ?')
+    const delReports = store.client.prepare('DELETE FROM reports WHERE run_id = ?')
+    const delOperations = store.client.prepare('DELETE FROM operations')
+    const resetBoard = store.client.prepare(
+      "UPDATE board_members SET state = 'waiting', active_assignment_id = NULL WHERE run_id = ?",
+    )
+    const resetRun = store.client.prepare(
+      "UPDATE runs SET phase = 'investigation', status = 'running', scope_revision = 1, budget_usd = 10, spent_usd = 0, spent_requests = 0, candidates = ?, approved = ? WHERE id = ?",
+    )
+
+    // Pre-prepared read-only snapshot statements over the exact authoritative SQLite tables
+    // checked by checkRunLiveness(), avoiding per-op Drizzle query compilation and JSON parsing.
+    type RunSnapRow = RunLivenessSnapshot['run'] & { budgetUsd: number; spentUsd: number }
+    const readRunSnap = store.client.prepare(
+      'SELECT id, status, phase, goal_revision AS goalRevision, budget_usd AS budgetUsd, spent_usd AS spentUsd FROM runs WHERE id = ?',
+    )
+    const readAssignmentsSnap = store.client.prepare(
+      'SELECT id, phase, status, lease_expires_at AS leaseExpiresAt, approval_parked_at AS approvalParkedAt FROM assignments WHERE run_id = ?',
+    )
+    const readStepsSnap = store.client.prepare(
+      'SELECT id, goal_revision AS goalRevision, status, assigned_worker_id AS assignedWorkerId FROM chain_steps WHERE run_id = ? AND goal_revision = ?',
+    )
+    const readBoardSnap = store.client.prepare(
+      'SELECT id, handle, state, active_assignment_id AS activeAssignmentId FROM board_members WHERE run_id = ?',
+    )
+    const readApprovalsSnap = store.client.prepare(
+      'SELECT id, status FROM approval_requests WHERE run_id = ?',
+    )
+    const readLeasesSnap = store.client.prepare(
+      'SELECT id, status FROM approval_leases WHERE run_id = ?',
+    )
 
     for (let seq = 0; seq < SEQUENCES; seq += 1) {
-      const runId = poolRunIds[seq % RUN_POOL]!
       // Reset run cleanly for a fresh seeded sequence
       store.transaction(() => {
-        store.client.prepare('DELETE FROM approval_leases WHERE run_id = ?').run(runId)
-        store.client.prepare('DELETE FROM approval_requests WHERE run_id = ?').run(runId)
-        store.client.prepare('DELETE FROM chain_steps WHERE run_id = ?').run(runId)
-        store.client.prepare('DELETE FROM assignments WHERE run_id = ?').run(runId)
-        store.client.prepare("UPDATE board_members SET state = 'waiting', active_assignment_id = NULL WHERE run_id = ?").run(runId)
-        store.updateRun(runId, {
-          phase: 'investigation',
-          status: 'running',
-          scopeRevision: 1,
-          budgetUsd: 10,
-          spentUsd: 0,
-          spentRequests: 0,
-          candidates: templateCandidates,
-          approved: templateApproved,
-        })
+        delLeases.run(runId)
+        delReqs.run(runId)
+        delSteps.run(runId)
+        delAssg.run(runId)
+        delEvents.run(runId)
+        delMessages.run(runId)
+        delReports.run(runId)
+        delOperations.run()
+        resetBoard.run(runId)
+        resetRun.run(templateCandidatesJson, templateApprovedJson, runId)
       }, { behavior: 'immediate' })
 
       const stepsCount = 4 + Math.floor(rng() * 5) // 4..8 operations per sequence
       const liveHandles = new Set<string>()
       const createdStepIds: string[] = []
       const createdApprovalIds: string[] = []
+      let currentSnap = readRunSnap.get(runId) as unknown as RunSnapRow
 
       for (let op = 0; op < stepsCount; op += 1) {
         totalOps += 1
-        const current = store.run(runId)
         const action = pick([
           'spawn_step',
           'pause',
@@ -619,115 +629,126 @@ describe('R3-20.5: seeded lifecycle fuzz (500 sequences, 0 invariant violations)
 
         switch (action) {
           case 'spawn_step': {
-            if (current.status !== 'running') break
-            const step = store.addChainStep(current, {
-              title: `Fuzz step ${seq}-${op}`,
-              hypothesis: 'Verify invariants',
-              targetAssetIds: [asset.id],
-              skills: ['bola'],
-              dependsOnFactIds: [],
-              dependsOnStepIds: [],
-              sourceOrigins: [ORIGIN],
-            })
-            createdStepIds.push(step.id)
-            const w = store.makeWorker(current, 'investigation', asset, `w-${seq}-${op}`, 'Run fuzz step', { stepId: step.id })
-            store.updateWorker(w.id, { status: 'running', lease: randomUUID(), leaseExpiresAt: Date.now() + 60_000 })
-            store.updateChainStep(step.id, { status: 'running', assignedWorkerId: w.id })
-            store.updateBoardMemberState(runId, 'coordinator', { state: 'working', activeAssignmentId: w.id })
-            liveHandles.add(w.id)
+            if (currentSnap.status !== 'running') break
+            store.transaction(() => {
+              const current = store.run(runId)
+              const step = store.addChainStep(current, {
+                title: `Fuzz step ${seq}-${op}`,
+                hypothesis: 'Verify invariants',
+                targetAssetIds: [asset.id],
+                skills: ['bola'],
+                dependsOnFactIds: [],
+                dependsOnStepIds: [],
+                sourceOrigins: [ORIGIN],
+              })
+              createdStepIds.push(step.id)
+              const w = store.makeWorker(current, 'investigation', asset, `w-${seq}-${op}`, 'Run fuzz step', { stepId: step.id })
+              store.updateWorker(w.id, { status: 'running', lease: randomUUID(), leaseExpiresAt: Date.now() + 60_000 })
+              store.updateChainStep(step.id, { status: 'running', assignedWorkerId: w.id })
+              store.updateBoardMemberState(runId, 'coordinator', { state: 'working', activeAssignmentId: w.id })
+              liveHandles.add(w.id)
+            }, { behavior: 'immediate' })
             break
           }
           case 'pause': {
-            if (current.status === 'running') {
+            if (currentSnap.status === 'running') {
               store.command(runCommand.parse({ requestId: randomUUID(), runId, action: 'pause' }))
               liveHandles.clear()
             }
             break
           }
           case 'budget_pause': {
-            if (current.status === 'running') {
-              store.recordLlmSpend(runId, { usd: current.budgetUsd + 1, tokens: 100, turns: 1 })
+            if (currentSnap.status === 'running') {
+              store.recordLlmSpend(runId, { usd: currentSnap.budgetUsd + 1, tokens: 100, turns: 1 })
               store.checkBudgetExceeded(runId)
               liveHandles.clear()
             }
             break
           }
           case 'resume': {
-            if (isTerminalRunStatus(current.status)) {
+            if (isTerminalRunStatus(currentSnap.status)) {
               assert.throws(() => store.command(runCommand.parse({ requestId: randomUUID(), runId, action: 'resume' })))
-            } else if (current.status === 'paused') {
+            } else if (currentSnap.status === 'paused') {
               store.command(runCommand.parse({ requestId: randomUUID(), runId, action: 'resume' }))
             }
             break
           }
           case 'raise_budget': {
-            if (current.status === 'budget_paused') {
+            if (currentSnap.status === 'budget_paused') {
               store.command(runCommand.parse({
                 requestId: randomUUID(),
                 runId,
                 action: 'raise_budget',
-                budgetUsd: current.spentUsd + 15,
+                budgetUsd: currentSnap.spentUsd + 15,
                 resume: true,
               }))
             }
             break
           }
           case 'approval': {
-            if (current.status === 'running') {
-              const workers = store.workerList(runId).filter(w => w.status === 'running')
-              const target = workers[0]
-              if (target) {
-                const req = store.createApprovalRequest(current, target, {
-                  origin: ORIGIN,
-                  method: 'POST',
-                  pathAndQuery: `/api/fuzz/${seq}/${op}`,
-                  rationale: 'Fuzz state change',
-                  requestPreview: '{}',
-                  expiresInMs: 60_000,
-                })
-                createdApprovalIds.push(req.id)
+            if (currentSnap.status === 'running') {
+              const hasRunningWorker = (readAssignmentsSnap.all(runId) as unknown as RunLivenessSnapshot['assignments'])
+                .some(w => w.status === 'running')
+              if (hasRunningWorker) {
+                const target = store.workerList(runId).find(w => w.status === 'running')
+                if (target) {
+                  const req = store.createApprovalRequest(store.run(runId), target, {
+                    origin: ORIGIN,
+                    method: 'POST',
+                    pathAndQuery: `/api/fuzz/${seq}/${op}`,
+                    rationale: 'Fuzz state change',
+                    requestPreview: '{}',
+                    expiresInMs: 60_000,
+                  })
+                  createdApprovalIds.push(req.id)
+                }
               }
-            } else if (createdApprovalIds.length > 0 && !isTerminalRunStatus(current.status)) {
+            } else if (createdApprovalIds.length > 0 && !isTerminalRunStatus(currentSnap.status)) {
               const id = createdApprovalIds[createdApprovalIds.length - 1]!
-              const req = store.listApprovalRequests(runId).find(r => r.id === id)
+              const req = (readApprovalsSnap.all(runId) as unknown as NonNullable<RunLivenessSnapshot['approvalRequests']>)
+                .find(r => r.id === id)
               if (req && req.status === 'pending') {
-                store.decideApproval(current, id, rng() < 0.5 ? 'approved' : 'denied', 'once')
+                store.decideApproval(store.run(runId), id, rng() < 0.5 ? 'approved' : 'denied', 'once')
               }
             }
             break
           }
           case 'complete_step': {
-            if (current.status !== 'running') break
-            const runningStep = store.listChainSteps(runId, current.goalRevision).find(s => s.status === 'running')
+            if (currentSnap.status !== 'running') break
+            const runningStep = (readStepsSnap.all(runId, currentSnap.goalRevision) as unknown as RunLivenessSnapshot['chainSteps'])
+              .find(s => s.status === 'running')
             if (runningStep && runningStep.assignedWorkerId) {
-              store.updateChainStep(runningStep.id, { status: 'complete', assignedWorkerId: runningStep.assignedWorkerId })
-              store.updateWorker(runningStep.assignedWorkerId, { status: 'complete', lease: null, leaseExpiresAt: null })
-              liveHandles.delete(runningStep.assignedWorkerId)
-              const coord = store.boardMember(runId, 'coordinator')
-              if (coord?.activeAssignmentId === runningStep.assignedWorkerId) {
-                store.updateBoardMemberState(runId, 'coordinator', { state: 'waiting', activeAssignmentId: null })
-              }
+              store.transaction(() => {
+                store.updateChainStep(runningStep.id, { status: 'complete', assignedWorkerId: runningStep.assignedWorkerId })
+                store.updateWorker(runningStep.assignedWorkerId!, { status: 'complete', lease: null, leaseExpiresAt: null })
+                liveHandles.delete(runningStep.assignedWorkerId!)
+                const coord = (readBoardSnap.all(runId) as unknown as NonNullable<RunLivenessSnapshot['boardMembers']>)
+                  .find(m => m.handle === 'coordinator')
+                if (coord?.activeAssignmentId === runningStep.assignedWorkerId) {
+                  store.updateBoardMemberState(runId, 'coordinator', { state: 'waiting', activeAssignmentId: null })
+                }
+              }, { behavior: 'immediate' })
             }
             break
           }
           case 'stop': {
-            if (!isTerminalRunStatus(current.status)) {
+            if (!isTerminalRunStatus(currentSnap.status)) {
               store.command(runCommand.parse({ requestId: randomUUID(), runId, action: 'stop' }))
               liveHandles.clear()
             }
             break
           }
           case 'fail': {
-            if (!isTerminalRunStatus(current.status)) {
-              store.setStatus(current, 'failed')
+            if (!isTerminalRunStatus(currentSnap.status)) {
+              store.setStatus(store.run(runId), 'failed')
               liveHandles.clear()
             }
             break
           }
           case 'complete': {
-            if (!isTerminalRunStatus(current.status)) {
-              store.updateRun(runId, { phase: 'complete' })
-              store.setStatus(store.run(runId), 'complete')
+            if (!isTerminalRunStatus(currentSnap.status)) {
+              const updated = store.updateRun(runId, { phase: 'complete' })
+              store.setStatus(updated, 'complete')
               liveHandles.clear()
             }
             break
@@ -739,14 +760,15 @@ describe('R3-20.5: seeded lifecycle fuzz (500 sequences, 0 invariant violations)
           }
         }
 
-        const after = store.run(runId)
+        const after = readRunSnap.get(runId) as unknown as RunSnapRow
+        currentSnap = after
         const violations = checkRunLiveness({
           run: after,
-          assignments: store.workerList(runId),
-          chainSteps: store.listChainSteps(runId, after.goalRevision),
-          boardMembers: store.listBoardMembers(runId),
-          approvalRequests: store.listApprovalRequests(runId),
-          approvalLeases: store.listApprovalLeases(runId),
+          assignments: readAssignmentsSnap.all(runId) as unknown as RunLivenessSnapshot['assignments'],
+          chainSteps: readStepsSnap.all(runId, after.goalRevision) as unknown as RunLivenessSnapshot['chainSteps'],
+          boardMembers: readBoardSnap.all(runId) as unknown as NonNullable<RunLivenessSnapshot['boardMembers']>,
+          approvalRequests: readApprovalsSnap.all(runId) as unknown as NonNullable<RunLivenessSnapshot['approvalRequests']>,
+          approvalLeases: readLeasesSnap.all(runId) as unknown as NonNullable<RunLivenessSnapshot['approvalLeases']>,
           activeAssignmentIds: liveHandles,
         })
         if (violations.length > 0) {
