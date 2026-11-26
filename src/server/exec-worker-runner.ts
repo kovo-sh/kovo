@@ -58,8 +58,12 @@ import {
   PROVIDER_STALL_TURN_MS,
   ProviderNoTokenWatchdog,
   buildBolaTestQueue,
+  classifyWorkerErrorToStepStatus,
+  collectAllPages,
   extractAssignedTargetRoutes,
   isMultiHopChainStep,
+  isRetryableChainStepStatus,
+  mapSessionStatusToStepStatus,
   percentile,
   providerStallAbortMs,
   resolveWorkerSettlementMs,
@@ -95,7 +99,7 @@ import { resolveProfileNoTokenWatchdogMs } from './provider-stream.ts'
 import { BudgetExceededError } from './provider.ts'
 import { redact, type NamedSecret } from './redact.ts'
 import { sanitizeWorkerFactData } from './run-actor.ts'
-import { brokerExchanges } from './schema.ts'
+import { brokerExchanges, type ChainStepTerminalStatus } from './schema.ts'
 import type {
   Assignment,
   BoardMessageRow,
@@ -641,6 +645,54 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
     })
   }
 
+  private noteLifecycleWarning(
+    runId: string,
+    hook: string,
+    error: unknown,
+    extra: Record<string, unknown> = {},
+  ): void {
+    const reason = redact(error instanceof Error ? error.message : String(error)).slice(0, 240)
+    this.host.safeEvent(
+      runId,
+      'worker.lifecycle_warning',
+      `Worker lifecycle hook "${hook}" failed: ${reason}`,
+      { hook, error: reason, ...extra },
+    )
+  }
+
+  private emitStepTerminalEvent(
+    runId: string,
+    input: {
+      assignmentId: string
+      step: ChainStep
+      stepStatus: ChainStepTerminalStatus
+      sessionStatus?: string
+      confirmed: boolean
+      gapCoded: boolean
+      origins?: readonly string[]
+      reason?: string
+    },
+  ): void {
+    const targets = this.host.reconPlanner.getStructuredStepTargets(input.step)
+    this.host.safeEvent(
+      runId,
+      'worker.step_terminal',
+      `Chain step "${input.step.title}" terminated with status=${input.stepStatus} (confirmed=${input.confirmed}, gapCoded=${input.gapCoded}).`,
+      {
+        assignmentId: input.assignmentId,
+        stepId: input.step.id,
+        stepStatus: input.stepStatus,
+        ...(input.sessionStatus ? { sessionStatus: input.sessionStatus } : {}),
+        confirmed: input.confirmed,
+        gapCoded: input.gapCoded,
+        category: input.step.category,
+        origins: [...(input.origins ?? input.step.sourceOrigins)],
+        targets,
+        ...(input.reason ? { reason: input.reason } : {}),
+      },
+    )
+  }
+
   handleInvestigationWorkerError(
     run: Run,
     job: Active,
@@ -683,10 +735,18 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
           lease: null,
           leaseExpiresAt: null,
         })
-        this.storage.updateChainStep(step.id, { status: 'complete', assignedWorkerId: assignment.id })
+        this.storage.updateChainStep(step.id, { status: 'model_failure', assignedWorkerId: assignment.id })
         this.storage.event(run.id, 'worker.stall_failed', `${step.title} provider stream stalled twice; assignment closed without consuming the wall cap.`, {
-          assignmentId: assignment.id, stepId: step.id,
+          assignmentId: assignment.id, stepId: step.id, stepStatus: 'model_failure',
         })
+      })
+      this.emitStepTerminalEvent(run.id, {
+        assignmentId: assignment.id,
+        step,
+        stepStatus: 'model_failure',
+        confirmed: false,
+        gapCoded: false,
+        reason: 'provider_stream_stalled_after_retry',
       })
       return
     }
@@ -700,22 +760,42 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
           lease: null,
           leaseExpiresAt: null,
         })
-        this.storage.updateChainStep(step.id, { status: 'complete', assignedWorkerId: assignment.id })
+        this.storage.updateChainStep(step.id, { status: 'rotated_partial', assignedWorkerId: assignment.id })
         this.storage.event(run.id, 'worker.wall_clock_rotated', `${step.title} rotated at wall-clock budget (${budget.wallClockMs}ms); slot released.`, {
-          assignmentId: assignment.id, stepId: step.id, specialistProfile: resolvedSpecialistId,
+          assignmentId: assignment.id, stepId: step.id, stepStatus: 'rotated_partial', specialistProfile: resolvedSpecialistId,
           wallClockMs: budget.wallClockMs, boundedRotation: true, preSession: true,
         })
+      })
+      this.emitStepTerminalEvent(run.id, {
+        assignmentId: assignment.id,
+        step,
+        stepStatus: 'rotated_partial',
+        sessionStatus: 'wall_clock_rotated',
+        confirmed: false,
+        gapCoded: false,
+        reason: 'pre_session_wall_clock_rotated',
       })
       return
     }
     if (!this.host.authorize(job) || job.controller.signal.aborted) return
     const msg = redact(error instanceof Error ? error.message : String(error)).slice(0, 400)
+    const stepStatus = classifyWorkerErrorToStepStatus(error)
     this.storage.transaction(() => {
       this.storage.updateWorker(assignment.id, {
         status: 'failed', outcome: msg, lease: null, leaseExpiresAt: null, attempt: assignment.attempt + 1,
       })
-      this.storage.updateChainStep(step.id, { status: 'complete', assignedWorkerId: assignment.id })
-      this.storage.event(run.id, 'worker.failed', `${step.title} failed: ${msg}`, { assignmentId: assignment.id, stepId: step.id })
+      this.storage.updateChainStep(step.id, { status: stepStatus, assignedWorkerId: assignment.id })
+      this.storage.event(run.id, 'worker.failed', `${step.title} failed: ${msg}`, {
+        assignmentId: assignment.id, stepId: step.id, stepStatus,
+      })
+    })
+    this.emitStepTerminalEvent(run.id, {
+      assignmentId: assignment.id,
+      step,
+      stepStatus,
+      confirmed: false,
+      gapCoded: false,
+      reason: msg,
     })
   }
 
@@ -755,7 +835,9 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
         warmPoolPolicy,
         reposDir ? { reposDir } : undefined,
       )
-    } catch { /* pooling is best-effort */ }
+    } catch (err) {
+      this.noteLifecycleWarning(run.id, 'setWarmPoolPolicy', err, { assignmentId: job.assignment.id, stepId: step.id })
+    }
 
     // Open ONE persistent air-gapped container for the entire intent.
     // Arm a pause-aware pre-session wall-clock guard backed by `ActiveClock` so a stalled
@@ -843,26 +925,33 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
     )
     const sessionSealedCapHandles: string[] = []
     let confirmedDuringAssignment = false
+    let gapCodedDuringAssignment = false
     let inFlightProofCalls = 0
     let onProofCallEnter: (() => void) | undefined
     let onProofCallExit: (() => void) | undefined
     const trackProofCall = async <T>(fn: () => Promise<T>): Promise<T> => {
       inFlightProofCalls += 1
-      try { onProofCallEnter?.() } catch { /* advisory */ }
+      try { onProofCallEnter?.() } catch (err) {
+        this.noteLifecycleWarning(run.id, 'onProofCallEnter', err, { assignmentId: job.assignment.id, stepId: step.id })
+      }
       try {
         return await fn()
       } finally {
         inFlightProofCalls = Math.max(0, inFlightProofCalls - 1)
-        try { onProofCallExit?.() } catch { /* advisory */ }
+        try { onProofCallExit?.() } catch (err) {
+          this.noteLifecycleWarning(run.id, 'onProofCallExit', err, { assignmentId: job.assignment.id, stepId: step.id })
+        }
       }
     }
 
     try {
       const stagedSpecs = await this.host.stageProjectSpecs(run.projectId, session, job.controller.signal)
 
-      const parentFacts = step.dependsOnFactIds.length
-        ? this.storage.listFacts(run.id, { includeTainted: false, limit: 200 })
-            .filter(f => step.dependsOnFactIds.includes(f.id) && permittedAtAdmission.has(f.origin))
+      const neededParentFactIds = new Set(step.dependsOnFactIds)
+      const parentFacts = neededParentFactIds.size > 0
+        ? collectAllPages((offset, limit) =>
+            this.storage.listFacts(run.id, { includeTainted: false, limit, offset }))
+            .filter(f => neededParentFactIds.has(f.id) && permittedAtAdmission.has(f.origin))
         : []
       if (parentFacts.length) {
         await session.stage('parent-facts.json', JSON.stringify(parentFacts, null, 2), job.controller.signal).catch(() => undefined)
@@ -923,7 +1012,11 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
         handle: boardHandle,
         redact: (text: string) => redact(text, currentSecrets()),
         onWakeup: (target, message) => {
-          try { this.host.board.wakeBoardMember(this.storage.run(run.id), target, message) } catch { /* advisory */ }
+          try {
+            this.host.board.wakeBoardMember(this.storage.run(run.id), target, message)
+          } catch (err) {
+            this.noteLifecycleWarning(run.id, 'board.wakeBoardMember', err, { assignmentId: job.assignment.id, target })
+          }
         },
       })
 
@@ -1393,7 +1486,9 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
                 boardTools.noteEvidence()
                 this.host.schedulePlanner(curRun.id)
               }
-            } catch { /* best-effort fact capture */ }
+            } catch (err) {
+              this.noteLifecycleWarning(run.id, 'propose_chain_finding.static_suspect_fact', err, { assignmentId: job.assignment.id, stepId: step.id })
+            }
             const factNote = recordedFactId ? ` Recorded static observation as code_audit_suspect fact ${recordedFactId}.` : ''
             throw new Error(`${STATIC_AST_LIVE_TARGET_REJECT_MESSAGE}${factNote}`)
           }
@@ -1401,8 +1496,11 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
             ?? (isStaticAst ? curRun.candidates.find(c => curRun.approved.includes(c.id)) : undefined)
           if (!asset) throw new BrokerDenied(`Primary finding origin ${parsed.origin} is not in approved scope.`)
 
-          const validFactIds = chainFactIds.filter(fid =>
-            this.storage.listFacts(curRun.id, { includeTainted: false, limit: 500 }).some(f => f.id === fid))
+          const knownFactIds = new Set(
+            collectAllPages((offset, limit) =>
+              this.storage.listFacts(curRun.id, { includeTainted: false, limit, offset })).map(f => f.id),
+          )
+          const validFactIds = chainFactIds.filter(fid => knownFactIds.has(fid))
           const sourceOrigins = new Set<string>(
             isStaticAst
               ? [...specOrigins.filter(o => currentApproved.has(o))]
@@ -2228,6 +2326,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
             )
           },
           onGapValidation: (info: GapValidationEvent) => {
+            if (info.accepted > 0) gapCodedDuringAssignment = true
             const prev = this.host.gapValidationByRun.get(run.id) ?? { accepted: 0, rejected: 0, byCode: {} }
             const byCode: Record<string, { accepted: number; rejected: number }> = { ...prev.byCode }
             for (const [code, counts] of Object.entries(info.byCode)) {
@@ -2302,17 +2401,45 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
           },
         )
       }
+      const stepStatus = mapSessionStatusToStepStatus(sessionResult.status)
       this.storage.transaction(() => {
         this.completeWorker(job.assignment, latestRun, outcomeText, [], undefined, currentSecrets())
-        this.storage.updateChainStep(step.id, { status: 'complete', assignedWorkerId: job.assignment.id })
+        this.storage.updateChainStep(step.id, { status: stepStatus, assignedWorkerId: job.assignment.id })
       }, { behavior: 'immediate' })
+      this.emitStepTerminalEvent(run.id, {
+        assignmentId: job.assignment.id,
+        step,
+        stepStatus,
+        sessionStatus: sessionResult.status,
+        confirmed: confirmedDuringAssignment,
+        gapCoded: gapCodedDuringAssignment,
+        origins: targetOrigins,
+      })
+      if (!confirmedDuringAssignment && !gapCodedDuringAssignment && isRetryableChainStepStatus(stepStatus)) {
+        try {
+          this.host.reconPlanner.maybeRequeueRetryableStep({
+            run: latestRun,
+            step: { ...step, status: stepStatus, assignedWorkerId: job.assignment.id },
+            assignment: job.assignment,
+            terminalStatus: stepStatus,
+            targetOrigins,
+          })
+        } catch (err) {
+          this.noteLifecycleWarning(run.id, 'maybeRequeueRetryableStep', err, {
+            assignmentId: job.assignment.id,
+            stepId: step.id,
+            stepStatus,
+          })
+        }
+      }
       const isWallClockRotated = sessionResult.status === 'wall_clock_rotated'
       const isNonConfirmedSealedExit = !confirmedDuringAssignment
         && sessionSealedCapHandles.length > 0
         && (sessionResult.status === 'completed' || sessionResult.status === 'turn_limit' || sessionResult.status === 'nudged_out')
       if (!confirmedDuringAssignment && ((isWallClockRotated && isMultiHopChainStep(step)) || isNonConfirmedSealedExit)) {
         try {
-          const recordedFacts = this.storage.listFacts(run.id, { includeTainted: false, limit: 500 })
+          const recordedFacts = collectAllPages((offset, limit) =>
+            this.storage.listFacts(run.id, { includeTainted: false, limit, offset }))
             .filter(f => f.assignmentId === job.assignment.id)
           const recordedExchanges = this.storage.db
             .select({
@@ -2332,7 +2459,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
           const sealedCapHandles = [...new Set([...sessionSealedCapHandles, ...newLedgerHandles])]
           this.host.reconPlanner.enqueueHopContinuationOnRotation({
             run: latestRun,
-            step,
+            step: { ...step, status: stepStatus, assignedWorkerId: job.assignment.id },
             assignment: job.assignment,
             targetOrigins,
             confirmed: confirmedDuringAssignment,
@@ -2343,7 +2470,13 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
             trigger: isWallClockRotated ? 'wall_clock_rotated' : 'sealed_handle_exit',
             allowNonChainWithSealedCap: isNonConfirmedSealedExit,
           })
-        } catch { /* continuation checkpointing is best-effort and must never fail worker completion */ }
+        } catch (err) {
+          this.noteLifecycleWarning(run.id, 'enqueueHopContinuationOnRotation', err, {
+            assignmentId: job.assignment.id,
+            stepId: step.id,
+            stepStatus,
+          })
+        }
       }
     } finally {
       clearPreSessionTimer()

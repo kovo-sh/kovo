@@ -147,6 +147,27 @@ export const threatModels = sqliteTable('threat_models', {
   createdAt: integer('created_at').notNull(),
 }, table => [index('threat_models_run').on(table.runId)])
 
+export const chainStepActiveStatuses = ['pending', 'ready', 'running'] as const
+export const chainStepRetryableStatuses = ['turn_capped', 'nudged_out'] as const
+export const chainStepTerminalStatuses = [
+  'complete',
+  'blocked',
+  'tainted',
+  'canceled',
+  'infra_failed',
+  'turn_capped',
+  'nudged_out',
+  'rotated_partial',
+  'model_failure',
+] as const
+export const chainStepStatuses = [
+  ...chainStepActiveStatuses,
+  ...chainStepTerminalStatuses,
+] as const
+export type ChainStepStatus = typeof chainStepStatuses[number]
+export type ChainStepTerminalStatus = typeof chainStepTerminalStatuses[number]
+export type ChainStepRetryableStatus = typeof chainStepRetryableStatuses[number]
+
 export const chainSteps = sqliteTable('chain_steps', {
   id: text('id').primaryKey().notNull(),
   runId: text('run_id').notNull().references(() => runs.id, { onDelete: 'cascade' }),
@@ -161,7 +182,7 @@ export const chainSteps = sqliteTable('chain_steps', {
   skills: text('skills', { mode: 'json' }).$type<string[]>().notNull(),
   dependsOnFactIds: text('depends_on_fact_ids', { mode: 'json' }).$type<string[]>().notNull(),
   dependsOnStepIds: text('depends_on_step_ids', { mode: 'json' }).$type<string[]>().notNull(),
-  status: text('status').$type<'pending' | 'ready' | 'running' | 'complete' | 'blocked' | 'tainted' | 'canceled'>().notNull(),
+  status: text('status').$type<ChainStepStatus>().notNull(),
   assignedWorkerId: text('assigned_worker_id'),
   specialistProfile: text('specialist_profile').$type<SpecialistProfile | null>(),
   trialGroupId: text('trial_group_id'),

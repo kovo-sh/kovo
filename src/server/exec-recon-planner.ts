@@ -60,12 +60,14 @@ import { normalizeRouteTemplate } from './route-template.ts'
 import { meetsBaseline, type EvidenceReview } from './evidence-checks.ts'
 import {
   CHAIN_CONTINUATION_SKILL_PREFIX,
+  CONTINUABLE_CHAIN_STEP_STATUSES,
   DET_LEAD_STEP_PRIORITY,
   DRY_ROUND_LIMIT,
   FrontierDispatcher,
   FrontierWaveController,
   MAX_CHAIN_CONTINUATIONS,
   MAX_GENERIC_WAVE1_CHAIN_CONTINUATIONS,
+  MAX_RETRYABLE_STEP_RETRIES,
   RunOrchestrationStateStore,
   TIER_A_MAX_SEEDED_STEPS,
   TIER_A_STEP_PRIORITY,
@@ -99,6 +101,7 @@ import {
   hostTierOrder,
   isDetLeadDispatchStep,
   isMultiHopChainStep,
+  isRetryableChainStepStatus,
   nextPlannerDryRounds,
   passOneCoverage,
   permanentlyBlockedStepIds,
@@ -110,6 +113,8 @@ import {
   selectUncoveredHighRiskEndpoints,
   shouldInvokeLlmPlanner,
   stripJsonFences,
+  structuredCoverageKey,
+  structuredCoverageRouteMethodKey,
   synthesizeRuntimeCompositeWave1Steps,
   templatesMentionedInText,
   threatModelResponseSchema,
@@ -119,6 +124,7 @@ import {
   type FrontierWaveControllerOptions,
   type ReinvestigationGuard,
   type RuntimeCompositeApiDependencyInput,
+  type StructuredStepTarget,
 } from './exec-dispatch.ts'
 import {
   ExecServiceModule,
@@ -194,7 +200,8 @@ import {
   type SpawnTaskOptions,
   type SupervisedTask,
 } from './run-actor.ts'
-import { findings, messages } from './schema.ts'
+import { resolveRunSafetyBudgets } from './run-safety-budgets.ts'
+import { coverageEntries, findings, messages, type ChainStepRetryableStatus } from './schema.ts'
 import { runVariantSweepForFinding } from './semantic-audit.ts'
 import type { StaticWorkspaceSnapshot } from './static-workspace-snapshot.ts'
 import type { Assignment, ChainStep, Fact, Run, Store } from './store.ts'
@@ -524,6 +531,7 @@ export interface PlannedStepDedupeCandidate {
   dependsOnStepIds?: readonly string[]
   checkpointCapId?: string | null
   trialIndex?: number
+  structuredTargets?: readonly StructuredStepTarget[]
 }
 
 const IN_FLIGHT_STEP_STATUSES = new Set<ChainStep['status']>(['pending', 'ready', 'running'])
@@ -1163,6 +1171,8 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     return this.host.runState ?? (this.ownRunState ?? new RunOrchestrationStateStore())
   }
   private readonly persistedStepCheckpoints = new Map<string, { checkpointCapId?: string; checkpointJson?: string }>()
+  private readonly structuredStepTargets = new Map<string, StructuredStepTarget[]>()
+  private readonly retryCountsByRun = new Map<string, Map<string, number>>()
   private get plannerEmptyRounds() { return this.runState.mapView('plannerEmptyRounds') }
   private get plannerDryRounds() { return this.runState.mapView('plannerDryRounds') }
   private get plannerCompletedAtLastRound() { return this.runState.mapView('plannerCompletedAtLastRound') }
@@ -1196,8 +1206,12 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
   clearRunState(runId: string): void {
     const state = this.runState.get(runId)
     if (state?.stepIds) {
-      for (const stepId of state.stepIds) this.persistedStepCheckpoints.delete(stepId)
+      for (const stepId of state.stepIds) {
+        this.persistedStepCheckpoints.delete(stepId)
+        this.structuredStepTargets.delete(stepId)
+      }
     }
+    this.retryCountsByRun.delete(runId)
     if (this.ownRunState) {
       this.ownRunState.disposeRun(runId)
     } else if (state) {
@@ -1248,6 +1262,258 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       }
     })
     this.runLifecycleUnsubs.set(runId, unsub)
+  }
+
+  /** Emit structured warning telemetry for non-fatal planner lifecycle failures (never silent catch). */
+  private noteLifecycleWarning(
+    runId: string,
+    hook: string,
+    error: unknown,
+    extra: Record<string, unknown> = {},
+  ): void {
+    const reason = (error instanceof Error ? error.message : String(error)).slice(0, 240)
+    try {
+      this.storage.event(
+        runId,
+        'planner.lifecycle_warning',
+        `Planner lifecycle hook "${hook}" failed: ${reason}`,
+        { hook, error: reason, ...extra },
+      )
+    } catch { /* run may already be deleted */ }
+  }
+
+  /**
+   * Bind structured `(origin, METHOD, route, class)` target(s) to a chain step at creation time
+   * so coverage, confirmed-exclusion, and bounded-retry accounting never depend on prose parsing.
+   */
+  registerStepTargets(
+    runId: string,
+    stepId: string,
+    targets: readonly StructuredStepTarget[],
+  ): void {
+    const deduped: StructuredStepTarget[] = []
+    const seen = new Set<string>()
+    for (const raw of targets) {
+      const origin = (raw.origin ?? '').trim()
+      const method = (raw.method ?? 'ANY').trim().toUpperCase() || 'ANY'
+      const rawRoute = (raw.route ?? '').trim().replace(/^[A-Za-z]+\s+/, '')
+      const route = normalizeConfirmedRouteTemplate(rawRoute)
+      const vulnClass = (raw.vulnClass ?? '').trim() || 'unknown'
+      if (!origin || !route) continue
+      const target: StructuredStepTarget = { origin, method, route, vulnClass }
+      const key = structuredCoverageKey(target)
+      if (seen.has(key)) continue
+      seen.add(key)
+      deduped.push(target)
+    }
+    if (!deduped.length) return
+    this.trackRunLifecycle(runId)
+    this.structuredStepTargets.set(stepId, deduped)
+    const stepIds = this.stepIdsByRun.get(runId) ?? new Set<string>()
+    stepIds.add(stepId)
+    this.stepIdsByRun.set(runId, stepIds)
+  }
+
+  /**
+   * Read structured `(origin, METHOD, route, class)` bindings for a step: prefers bindings stamped
+   * at step creation, falling back ONLY to structured parent fact metadata (`det_lead`,
+   * `hop_checkpoint`, `chain_hop`) — never prose-parsing title/hypothesis text.
+   */
+  getStructuredStepTargets(
+    step: Pick<ChainStep, 'id' | 'runId' | 'category' | 'sourceOrigins' | 'dependsOnFactIds'>,
+  ): StructuredStepTarget[] {
+    const registered = this.structuredStepTargets.get(step.id)
+    if (registered && registered.length > 0) return registered
+    if (!step.dependsOnFactIds?.length) return []
+    const needed = new Set(step.dependsOnFactIds)
+    const facts = this.pageAll((offset, limit) =>
+      this.storage.listFacts(step.runId, { includeTainted: false, limit, offset }))
+      .filter(f => needed.has(f.id))
+    const derived: StructuredStepTarget[] = []
+    const seen = new Set<string>()
+    for (const fact of facts) {
+      const data = fact.data
+      const origin = (fact.origin || step.sourceOrigins[0] || '').trim()
+      if (!origin) continue
+      const endpoint = typeof data?.endpoint === 'string'
+        ? data.endpoint
+        : typeof data?.surfacedEndpoint === 'string'
+          ? data.surfacedEndpoint
+          : typeof (data?.checkpointBrief as { nextGoal?: { endpoint?: unknown } } | undefined)?.nextGoal?.endpoint === 'string'
+            ? String((data?.checkpointBrief as { nextGoal?: { endpoint?: unknown } }).nextGoal!.endpoint)
+            : ''
+      if (!endpoint || !endpoint.startsWith('/')) continue
+      const method = typeof data?.method === 'string'
+        ? data.method.toUpperCase()
+        : typeof (data?.checkpointBrief as { nextGoal?: { method?: unknown } } | undefined)?.nextGoal?.method === 'string'
+          ? String((data?.checkpointBrief as { nextGoal?: { method?: unknown } }).nextGoal!.method).toUpperCase()
+          : 'ANY'
+      const vulnClass = typeof data?.probeClass === 'string' && data.probeClass.trim()
+        ? data.probeClass.trim()
+        : (step.category || 'unknown')
+      const target: StructuredStepTarget = {
+        origin,
+        method,
+        route: normalizeConfirmedRouteTemplate(endpoint),
+        vulnClass,
+      }
+      const key = structuredCoverageKey(target)
+      if (!seen.has(key)) {
+        seen.add(key)
+        derived.push(target)
+      }
+    }
+    return derived
+  }
+
+  /**
+   * Strictly bounded single-retry requeue (max 1 retry per `reinvestigationKey`) for retryable
+   * terminal step statuses (`turn_capped`, `nudged_out`). Strictly charged against
+   * `dynamicStepBudget`, wall-clock, USD/request budget, and `RunSafetyBudgets`.
+   */
+  maybeRequeueRetryableStep(input: {
+    run: Run
+    step: ChainStep
+    assignment: Pick<Assignment, 'id'>
+    terminalStatus: ChainStepRetryableStatus
+    targetOrigins: readonly string[]
+  }): { requeued: boolean; reason: string; retryStep?: ChainStep; retryKey?: string } {
+    const { run, step, assignment, terminalStatus } = input
+    if (!isRetryableChainStepStatus(terminalStatus)) {
+      return { requeued: false, reason: 'not_retryable_status' }
+    }
+    if ((step.trialIndex ?? 0) > 0 || step.skills.includes('cq5:retry:1')) {
+      return { requeued: false, reason: 'already_retry_step' }
+    }
+    const structuredTargets = this.getStructuredStepTargets(step)
+    const primaryTarget = structuredTargets[0]
+    const primaryOrigin = primaryTarget?.origin ?? input.targetOrigins[0] ?? step.sourceOrigins[0] ?? ''
+    const primaryRoute = primaryTarget?.route ?? '/'
+    const primaryMethod = primaryTarget?.method ?? 'ANY'
+    const primaryClass = primaryTarget?.vulnClass ?? step.category ?? 'unknown'
+    const retryKey = reinvestigationKey(`${primaryMethod} ${primaryRoute}`, primaryClass)
+
+    let runRetryMap = this.retryCountsByRun.get(run.id)
+    if (!runRetryMap) {
+      runRetryMap = new Map<string, number>()
+      this.retryCountsByRun.set(run.id, runRetryMap)
+    }
+    const priorRetries = runRetryMap.get(retryKey) ?? 0
+    const existingSteps = this.storage.listChainSteps(run.id, run.goalRevision)
+    const alreadyRetriedPersisted = existingSteps.some(s =>
+      s.skills.includes('cq5:retry:1')
+      && (s.dependsOnStepIds.includes(step.id)
+        || this.getStructuredStepTargets(s).some(t => reinvestigationKey(`${t.method} ${t.route}`, t.vulnClass) === retryKey)),
+    )
+    if (priorRetries >= MAX_RETRYABLE_STEP_RETRIES || alreadyRetriedPersisted) {
+      this.storage.event(
+        run.id,
+        'worker.retryable_step_not_requeued',
+        `Retryable step "${step.title}" (${terminalStatus}) not requeued: max 1 retry per key already reached.`,
+        { stepId: step.id, assignmentId: assignment.id, terminalStatus, retryKey, reason: 'retry_cap_reached' },
+      )
+      return { requeued: false, reason: 'retry_cap_reached', retryKey }
+    }
+
+    const currentRun = this.storage.run(run.id)
+    if (currentRun.status !== 'running' || currentRun.phase !== 'investigation') {
+      return { requeued: false, reason: 'run_not_investigating', retryKey }
+    }
+    if (this.storage.checkBudgetExceeded(currentRun.id)) {
+      return { requeued: false, reason: 'budget_exhausted', retryKey }
+    }
+    if (currentRun.budgetRequests > 0 && currentRun.budgetRequests - currentRun.spentRequests <= 0) {
+      return { requeued: false, reason: 'request_budget_exhausted', retryKey }
+    }
+    if (this.host.maxDurationMs > 0 && currentRun.createdAt + this.host.maxDurationMs <= Date.now()) {
+      return { requeued: false, reason: 'wall_clock_exhausted', retryKey }
+    }
+    const dynamicBudget = Math.min(
+      hardChainStepsCeiling,
+      currentRun.dynamicStepBudget ?? computeDynamicStepBudget(this.storage, currentRun.id),
+    )
+    const safetyBudgets = resolveRunSafetyBudgets({ maxAssignments: dynamicBudget })
+    const effectiveStepCap = Math.min(dynamicBudget, safetyBudgets.maxCompositeVerifiesPerRun)
+    if (existingSteps.length >= effectiveStepCap) {
+      this.storage.event(
+        run.id,
+        'worker.retryable_step_not_requeued',
+        `Retryable step "${step.title}" (${terminalStatus}) not requeued: step budget exhausted (${existingSteps.length}/${effectiveStepCap}).`,
+        { stepId: step.id, assignmentId: assignment.id, terminalStatus, retryKey, reason: 'step_budget_exhausted', existingSteps: existingSteps.length, effectiveStepCap },
+      )
+      return { requeued: false, reason: 'step_budget_exhausted', retryKey }
+    }
+
+    const approvedOrigins = this.host.approvedOriginsSet(currentRun)
+    const validOrigins = [...new Set([...input.targetOrigins, ...step.sourceOrigins])].filter(o => approvedOrigins.has(o))
+    const assetIds = currentRun.candidates
+      .filter(c => validOrigins.includes(c.origin) && currentRun.approved.includes(c.id))
+      .map(c => c.id)
+    if (!validOrigins.length || !assetIds.length) {
+      return { requeued: false, reason: 'no_approved_asset', retryKey }
+    }
+
+    if (isMultiHopChainStep(step)) {
+      const controller = this.frontierControllerFor(currentRun.id)
+      const admission = controller.admitStepBranch({
+        branchKey: `retry:${step.id.slice(0, 12)}`,
+        parentBranchKey: `step:${step.id.slice(0, 12)}`,
+        depth: Math.max(1, extractContinuationDepth(step) + 1),
+        origin: primaryOrigin || validOrigins[0]!,
+        endpoint: primaryRoute,
+        method: primaryMethod,
+        hypothesisClass: primaryClass,
+        goalSummary: `Bounded retry (${terminalStatus}) for ${step.title}`,
+        waveNo: Math.max(1, currentRun.roundNo || 1),
+      })
+      if (!admission.admitted) {
+        return { requeued: false, reason: 'frontier_pruned', retryKey }
+      }
+    }
+
+    const retryTitle = `${step.title.replace(/\s*\[retry #1\]\s*$/i, '').slice(0, 175)} [retry #1]`
+    const retryHypothesis = `[retry_of=${step.id}] [prior_status=${terminalStatus}] Single bounded retry after ${terminalStatus}: complete verification with kovo_verify or record a coded proofGapReason. ${step.hypothesis}`.slice(0, 1200)
+    const retrySkills = [...new Set([...step.skills, 'cq5:retry:1'])]
+    const created = this.storage.addChainStep(currentRun, {
+      title: retryTitle,
+      hypothesis: retryHypothesis,
+      category: step.category,
+      priority: Math.max(40, Math.min(95, step.priority)),
+      targetAssetIds: assetIds,
+      skills: retrySkills,
+      dependsOnFactIds: step.dependsOnFactIds,
+      dependsOnStepIds: [step.id],
+      sourceOrigins: validOrigins,
+      specialistProfile: step.specialistProfile ?? routeStepToSpecialist({
+        title: retryTitle,
+        hypothesis: retryHypothesis,
+        category: step.category,
+        skills: retrySkills,
+      }),
+    })
+    const readyRetry = this.storage.updateChainStep(created.id, { status: 'ready' })
+    const targetsToBind: StructuredStepTarget[] = structuredTargets.length > 0
+      ? structuredTargets
+      : [{ origin: primaryOrigin || validOrigins[0]!, method: primaryMethod, route: primaryRoute, vulnClass: primaryClass }]
+    this.registerStepTargets(currentRun.id, created.id, targetsToBind)
+    runRetryMap.set(retryKey, priorRetries + 1)
+    this.storage.event(
+      currentRun.id,
+      'worker.retryable_step_requeued',
+      `Requeued retryable step "${step.title}" (${terminalStatus}) once as step #${readyRetry.seq}.`,
+      {
+        priorStepId: step.id,
+        retryStepId: readyRetry.id,
+        assignmentId: assignment.id,
+        terminalStatus,
+        retryKey,
+        retryCount: priorRetries + 1,
+        maxRetries: MAX_RETRYABLE_STEP_RETRIES,
+        dynamicBudget,
+        effectiveStepCap,
+      },
+    )
+    return { requeued: true, reason: 'requeued', retryStep: readyRetry, retryKey }
   }
 
   /** Return (or initialize) the run-scoped v8 FrontierWaveController bound to Store's CapabilityLedger. */
@@ -1548,6 +1814,35 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
 
       const category = invariantHypothesisCategory(hyp)
       const skills = invariantHypothesisSkills(hyp)
+      const primaryRouteRef = uniqueRoutes[0] ?? '/'
+      const primaryRouteParts = primaryRouteRef.trim().split(/\s+/)
+      const primaryMethod = primaryRouteParts.length >= 2 ? primaryRouteParts[0]!.toUpperCase() : 'ANY'
+      const primaryPath = primaryRouteParts.length >= 2 ? primaryRouteParts.slice(1).join(' ') : primaryRouteRef
+      const frontierController = this.frontierControllerFor(run.id)
+      const branchAdmission = frontierController.admitStepBranch({
+        branchKey: `wave1:inv:${hyp.id}`.slice(0, 120),
+        depth: hopDepth,
+        origin: targetOrigins[0] ?? 'unknown',
+        endpoint: primaryPath,
+        method: primaryMethod,
+        hypothesisClass: category,
+        goalSummary: title,
+        capabilityId: capId,
+        waveNo: Math.max(1, run.roundNo || 1),
+      })
+      if (!branchAdmission.admitted) {
+        try {
+          this.storage.event(
+            run.id,
+            'frontier.branch_suppressed',
+            `FrontierWaveController suppressed Wave-1 invariant branch "${title}" (dead-end negative edge).`,
+            { branchKey: branchAdmission.branchKey, hypothesisId: hyp.id, category },
+          )
+        } catch (err) {
+          this.noteLifecycleWarning(run.id, 'wave1.branch_suppressed_event', err, { hypothesisId: hyp.id })
+        }
+        continue
+      }
       const created = this.storage.addChainStep(run, {
         title,
         hypothesis,
@@ -1560,6 +1855,15 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         sourceOrigins: targetOrigins,
         specialistProfile: routeStepToSpecialist({ title, hypothesis, category, skills }),
       })
+      const targetsToRegister: StructuredStepTarget[] = uniqueRoutes.length > 0
+        ? uniqueRoutes.flatMap(ref => {
+            const parts = ref.trim().split(/\s+/)
+            const method = parts.length >= 2 ? parts[0]!.toUpperCase() : 'ANY'
+            const route = parts.length >= 2 ? parts.slice(1).join(' ') : ref
+            return targetOrigins.map(origin => ({ origin, method, route, vulnClass: category }))
+          })
+        : targetOrigins.map(origin => ({ origin, method: 'ANY', route: '/', vulnClass: category }))
+      this.registerStepTargets(run.id, created.id, targetsToRegister)
       createdIds.push(created.id)
       existingHypIds.add(hyp.id)
       existingTitles.add(title.toLowerCase())
@@ -1698,6 +2002,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       ...(d.consumerOrigin ? { consumerOrigin: d.consumerOrigin } : {}),
       ...(d.personaHandle !== undefined ? { personaHandle: d.personaHandle } : {}),
     }))
+    const frontierController = this.frontierControllerFor(run.id)
     const created = synthesizeRuntimeCompositeWave1Steps(this.storage, run, {
       sourceMounted: false,
       facts: resolvedBundle.facts,
@@ -1705,7 +2010,21 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       apiDependencies,
       specs: resolvedBundle.specs,
       hostTiers,
+      frontierController,
     })
+    for (const step of created) {
+      const origin = step.sourceOrigins[0] ?? [...approvedOrigins][0] ?? ''
+      const depEndpoint = resolvedBundle.endpoints.find(ep =>
+        step.sourceOrigins.includes(ep.origin) && step.hypothesis.includes(ep.pathTemplate))
+      if (origin) {
+        this.registerStepTargets(run.id, step.id, [{
+          origin: depEndpoint?.origin ?? origin,
+          method: depEndpoint?.method?.toUpperCase() ?? 'ANY',
+          route: depEndpoint?.pathTemplate ?? '/',
+          vulnClass: step.category,
+        }])
+      }
+    }
     this.runtimeCompositeSeededRuns.add(run.id)
     return created.length
   }
@@ -2771,13 +3090,66 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
   }
 
 
-  /** Endpoint templates a step explicitly names (normalized). Never used for eligibility. */
-  stepMentionedRoutes(step: Pick<ChainStep, 'title' | 'hypothesis'>): string[] {
+  /** Legacy helper retained for `execution.ts` compatibility; prefers structured step targets. */
+  stepMentionedRoutes(step: Pick<ChainStep, 'title' | 'hypothesis'> & { id?: string }): string[] {
+    if (step.id) {
+      const structured = this.structuredStepTargets.get(step.id)
+      if (structured && structured.length > 0) {
+        return [...new Set(structured.map(t => normalizeConfirmedRouteTemplate(t.route)).filter(Boolean))]
+      }
+    }
     return [...new Set(templatesMentionedInText(`${step.title} ${step.hypothesis}`).map(normalizeConfirmedRouteTemplate))]
   }
 
+  /** Assignments in `runId` that achieved a proved finding or a coded proof-gap / settled coverage verdict. */
+  private provedOrGapCodedAssignmentIds(runId: string): Set<string> {
+    const covered = new Set<string>()
+    try {
+      const confirmedFindingIds = new Set(
+        this.storage.db.select({ id: findings.id, finding: findings.finding })
+          .from(findings)
+          .where(eq(findings.runId, runId))
+          .all()
+          .filter(row => row.finding.status === 'confirmed')
+          .map(row => row.id),
+      )
+      if (confirmedFindingIds.size > 0) {
+        for (const spec of this.storage.listReplaySpecs(runId)) {
+          if (confirmedFindingIds.has(spec.findingId) && spec.assignmentId) {
+            covered.add(spec.assignmentId)
+          }
+        }
+      }
+    } catch (err) {
+      this.noteLifecycleWarning(runId, 'provedOrGapCodedAssignmentIds.findings', err)
+    }
+    try {
+      const rows = this.storage.db.select({
+        assignmentId: coverageEntries.assignmentId,
+        status: coverageEntries.status,
+        proofGapReason: coverageEntries.proofGapReason,
+      })
+        .from(coverageEntries)
+        .where(eq(coverageEntries.runId, runId))
+        .all()
+      for (const row of rows) {
+        if (!row.assignmentId) continue
+        const hasCodedGap = typeof row.proofGapReason === 'string' && row.proofGapReason.trim().length > 0
+        const settledVerdict = row.status === 'reported'
+          || row.status === 'ruled_out'
+          || row.status === 'not_applicable'
+          || row.status === 'no_issue_found'
+        if (hasCodedGap || settledVerdict) covered.add(row.assignmentId)
+      }
+    } catch (err) {
+      this.noteLifecycleWarning(runId, 'provedOrGapCodedAssignmentIds.coverage', err)
+    }
+    return covered
+  }
 
-  /** Pass-1 coverage view used by the dry-round stop guard and the stop-time telemetry. */
+  /** Pass-1 coverage view used by the dry-round stop guard and the stop-time telemetry.
+   *  Counts ONLY `proved` / `gap_coded` completions as covered and keys strictly on structured
+   *  `(origin, METHOD, route, class)` targets bound at step creation (never prose parsing). */
   passOneCoverageFor(run: Pick<Run, 'id'>, steps: readonly ChainStep[]): {
     uncoveredTierAEndpoints: string[]
     uninvestigatedFirstPassClasses: string[]
@@ -2788,16 +3160,24 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       const endpoint = typeof fact.data?.endpoint === 'string' ? fact.data.endpoint : ''
       return `${method} ${endpoint}`
     }).filter(endpoint => endpoint.length > 0))].sort()
+    const coveredAssignments = this.provedOrGapCodedAssignmentIds(run.id)
     const coverage = passOneCoverage({
       tierAEndpoints,
       steps: steps.map(step => {
-        const routes = this.stepMentionedRoutes(step)
+        const structuredTargets = this.getStructuredStepTargets(step)
+        const routes = [...new Set(structuredTargets.map(t => normalizeConfirmedRouteTemplate(t.route)).filter(Boolean))]
+        const keys = structuredTargets.map(structuredCoverageKey)
+        const isCovered = step.status === 'complete'
+          && step.assignedWorkerId !== null
+          && coveredAssignments.has(step.assignedWorkerId)
         return {
           id: step.id,
           dispatchable: step.status === 'ready' || step.status === 'pending',
           dispatched: step.assignedWorkerId !== null || step.status === 'complete' || step.status === 'running',
+          covered: isCovered,
+          structuredTargets,
           routes,
-          keys: routes.map(route => reinvestigationKey(route, step.category)),
+          keys,
         }
       }),
     })
@@ -2809,6 +3189,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
    * Planner coverage assertion: before a dry/coordinator stop can terminate Phase B, ensure
    * discovered high-risk unconfirmed endpoints (`riskScore >= 60`) have at least one first-pass
    * investigation step queued (bounded to `min(6, remainingBudget)`).
+   * Keys confirmed-exclusion & coverage strictly on structured `(origin, METHOD, route, class)`.
    */
   queueHighRiskCoverageSteps(
     run: Run,
@@ -2830,24 +3211,65 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       testedClasses?: string[] | null
     }> = []
     try {
-      endpoints = this.storage.listEndpoints(run.id, { orderBy: 'risk', limit: 80 })
-    } catch {
+      endpoints = this.pageAll((offset, limit) =>
+        this.storage.listEndpoints(run.id, { orderBy: 'risk', limit, offset }))
+    } catch (err) {
+      this.noteLifecycleWarning(run.id, 'queueHighRiskCoverageSteps.listEndpoints', err)
       return { seeded: 0, endpoints: [] }
     }
-    const confirmedRefs = this.alreadyConfirmedRefs(run, 100)
-    const confirmedSets = buildConfirmedRouteSets(confirmedRefs)
-    const unconfirmedEndpoints = endpoints.filter(ep =>
-      !isRouteConfirmed({ method: ep.method, path: ep.pathTemplate }, confirmedSets) &&
-      !confirmedSets.paths.has(normalizeConfirmedRouteTemplate(ep.pathTemplate)))
-    const coveredRoutes = new Set<string>()
-    for (const step of existingSteps) {
-      for (const route of this.stepMentionedRoutes(step)) coveredRoutes.add(route)
+    const targetCategory = 'broken-access-control'
+    const confirmedRefs = this.alreadyConfirmedRefs(run, 200)
+    const confirmedStructuredKeys = new Set<string>()
+    const confirmedLegacyAnyMethodKeys = new Set<string>()
+    for (const ref of confirmedRefs) {
+      const origin = (ref.origin ?? '').trim()
+      const method = (ref.method ?? 'ANY').trim().toUpperCase() || 'ANY'
+      const normPath = normalizeConfirmedRouteTemplate(ref.path)
+      const refClass = (ref.probeClass ?? '').trim()
+      if (!normPath) continue
+      if (origin && refClass) {
+        confirmedStructuredKeys.add(structuredCoverageKey({ origin, method, route: normPath, vulnClass: refClass }))
+        if (method === 'ANY') {
+          confirmedLegacyAnyMethodKeys.add(structuredCoverageKey({ origin, method: 'ANY', route: normPath, vulnClass: refClass }))
+        }
+      }
     }
+    const isEndpointConfirmedForClass = (ep: { origin: string; method: string; pathTemplate: string }): boolean => {
+      const normPath = normalizeConfirmedRouteTemplate(ep.pathTemplate)
+      const method = (ep.method || 'GET').toUpperCase()
+      const exactKey = structuredCoverageKey({ origin: ep.origin, method, route: normPath, vulnClass: targetCategory })
+      const anyMethodKey = structuredCoverageKey({ origin: ep.origin, method: 'ANY', route: normPath, vulnClass: targetCategory })
+      return confirmedStructuredKeys.has(exactKey) || confirmedLegacyAnyMethodKeys.has(anyMethodKey)
+    }
+    const unconfirmedEndpoints = endpoints.filter(ep => !isEndpointConfirmedForClass(ep))
+    const coveredAssignments = this.provedOrGapCodedAssignmentIds(run.id)
+    const coveredStructuredKeys = new Set<string>()
+    const coveredRouteMethodKeys = new Set<string>()
+    for (const step of existingSteps) {
+      const inFlight = IN_FLIGHT_STEP_STATUSES.has(step.status)
+      const provedOrGapCoded = step.status === 'complete'
+        && step.assignedWorkerId !== null
+        && coveredAssignments.has(step.assignedWorkerId)
+      if (!inFlight && !provedOrGapCoded) continue
+      for (const target of this.getStructuredStepTargets(step)) {
+        coveredStructuredKeys.add(structuredCoverageKey(target))
+        if (target.method === 'ANY') {
+          coveredRouteMethodKeys.add(`${target.origin}\u0000ANY\u0000${normalizeConfirmedRouteTemplate(target.route)}\u0000${confirmedCategoryFamily(target.vulnClass)}`)
+        }
+      }
+    }
+    const uncoveredEndpoints = unconfirmedEndpoints.filter(ep => {
+      const method = (ep.method || 'GET').toUpperCase()
+      const normPath = normalizeConfirmedRouteTemplate(ep.pathTemplate)
+      const exactKey = structuredCoverageKey({ origin: ep.origin, method, route: normPath, vulnClass: targetCategory })
+      const anyMethodKey = `${ep.origin}\u0000ANY\u0000${normPath}\u0000${confirmedCategoryFamily(targetCategory)}`
+      return !coveredStructuredKeys.has(exactKey) && !coveredRouteMethodKeys.has(anyMethodKey)
+    })
     const candidates = selectUncoveredHighRiskEndpoints({
-      endpoints: unconfirmedEndpoints,
+      endpoints: uncoveredEndpoints,
       approvedOrigins,
-      confirmedPaths: confirmedSets.paths,
-      coveredRoutes,
+      confirmedPaths: new Set<string>(),
+      coveredRoutes: new Set<string>(),
       minRisk: 60,
       limit: cap,
       sourceMounted: this.host.projectReposMount(run.projectId).mountedRepos.length > 0,
@@ -2859,12 +3281,18 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       const method = (ep.method || 'GET').toUpperCase()
       const title = `High-risk route coverage · ${method} ${ep.pathTemplate}`
       const hypothesis = `Discovered high-risk endpoint ${method} ${ep.pathTemplate} on ${ep.origin} (risk ${ep.riskScore}, coverage ${ep.coveragePct ?? 0}%) has no first-pass investigation yet. Probe authorization boundaries, state invariants, and input validation with control vs. variant evidence; submit a verified proof or coded record_coverage gap.`
-      const category = 'broken-access-control'
-      this.storage.addChainStep(run, {
+      const category = targetCategory
+      const created = this.storage.addChainStep(run, {
         title, hypothesis, category, priority: 70, targetAssetIds: [asset.id],
         skills: ['false-positive-elimination'], dependsOnFactIds: [], sourceOrigins: [ep.origin],
         specialistProfile: routeStepToSpecialist({ title, hypothesis, category, skills: [] }),
       })
+      this.registerStepTargets(run.id, created.id, [{
+        origin: ep.origin,
+        method,
+        route: ep.pathTemplate,
+        vulnClass: category,
+      }])
       seededEndpoints.push(`${method} ${ep.pathTemplate}`)
     }
     return { seeded: seededEndpoints.length, endpoints: seededEndpoints }
@@ -2895,7 +3323,12 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       skill.startsWith(CHAIN_CONTINUATION_SKILL_PREFIX))
     if (hasDepSteps || hasCheckpointCap || hasContinuationSkill) return null
 
-    const routes = this.stepMentionedRoutes(candidate).filter(route => route && route !== '/')
+    const structuredRoutes = (candidate.structuredTargets ?? [])
+      .map(t => normalizeConfirmedRouteTemplate(t.route))
+      .filter(route => route && route !== '/')
+    const routes = structuredRoutes.length > 0
+      ? [...new Set(structuredRoutes)]
+      : this.stepMentionedRoutes(candidate).filter(route => route && route !== '/')
     if (!routes.length) return null
 
     const origins = [...new Set(
@@ -3029,6 +3462,12 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       specialistProfile: routeStepToSpecialist({ title, hypothesis, category: input.category, skills }),
     })
     this.storage.updateChainStep(createdStep.id, { status: 'ready' })
+    this.registerStepTargets(run.id, createdStep.id, [{
+      origin: fact.origin,
+      method: input.method,
+      route: input.endpoint,
+      vulnClass: input.category,
+    }])
     const runScopedDedupeKey = `${run.id}\0${input.dedupeKey}`
     this.detLeadStepKeys.add(runScopedDedupeKey)
     if (input.isTierA) {
@@ -3585,12 +4024,75 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
               sourceOrigins: step.origins,
             })
             finalFactIds.push(cpFact.id)
-          } catch { /* non-fatal: checkpoint_cap skill tag + ledger still persist */ }
+          } catch (err) {
+            this.noteLifecycleWarning(run.id, 'persistDispatchPlan.hop_checkpoint_fact', err, { checkpointCapId })
+          }
         }
       }
       const resolvedPriority = options.preservePriority
         ? step.priority
         : tierABound ? TIER_A_STEP_PRIORITY : leadBound ? Math.min(step.priority, DET_LEAD_STEP_PRIORITY) : step.priority
+      const structuredTargets: StructuredStepTarget[] = []
+      const nextGoal = parsedBrief?.brief.nextGoal
+      if (nextGoal?.endpoint) {
+        structuredTargets.push({
+          origin: nextGoal.service || step.origins[0] || '',
+          method: nextGoal.method || 'ANY',
+          route: nextGoal.endpoint,
+          vulnClass: nextGoal.hypothesisClass || category,
+        })
+      }
+      for (const hop of step.chainHops ?? []) {
+        if (hop.endpoint) {
+          structuredTargets.push({
+            origin: hop.origin || step.origins[0] || '',
+            method: 'ANY',
+            route: hop.endpoint,
+            vulnClass: category,
+          })
+        }
+      }
+      if (!structuredTargets.length) {
+        const inferredRoutes = templatesMentionedInText(`${title} ${step.hypothesis}`)
+        for (const origin of step.origins) {
+          for (const route of inferredRoutes.length ? inferredRoutes : ['/']) {
+            structuredTargets.push({ origin, method: 'ANY', route, vulnClass: category })
+          }
+        }
+      }
+      const shouldAdmitFrontier = Boolean(checkpointCapId || parsedBrief || depStepIds.length > 0 || step.chainHops?.length)
+      if (shouldAdmitFrontier) {
+        const frontierController = this.frontierControllerFor(run.id)
+        const primaryTarget = structuredTargets[0]
+        const branchDepth = parsedBrief?.brief.depth
+          ?? Math.max(1, (step.chainHops?.length ?? 0) + (depStepIds.length > 0 ? 1 : 0))
+        const branchAdmission = frontierController.admitStepBranch({
+          branchKey: parsedBrief?.brief.branchKey ?? `dispatch:${step.id ?? key.slice(0, 48)}`,
+          depth: branchDepth,
+          origin: primaryTarget?.origin || step.origins[0] || 'unknown',
+          endpoint: primaryTarget?.route || '/',
+          method: primaryTarget?.method || 'ANY',
+          hypothesisClass: primaryTarget?.vulnClass || category,
+          goalSummary: title,
+          ...(checkpointCapId ? { capabilityId: checkpointCapId } : {}),
+          ...(parsedBrief?.brief.capabilityHandles?.length ? { preconditionCapIds: parsedBrief.brief.capabilityHandles } : {}),
+          waveNo: Math.max(1, run.roundNo || 1),
+        })
+        if (!branchAdmission.admitted) {
+          counts.filteredDedupe += 1
+          try {
+            this.storage.event(
+              run.id,
+              'frontier.branch_suppressed',
+              `FrontierWaveController suppressed dispatch branch "${title}" (dead-end negative edge).`,
+              { branchKey: branchAdmission.branchKey, category },
+            )
+          } catch (err) {
+            this.noteLifecycleWarning(run.id, 'persistDispatchPlan.branch_suppressed', err)
+          }
+          continue
+        }
+      }
       const createdStep = this.storage.addChainStep(run, {
         title: title.slice(0, 200),
         hypothesis: step.hypothesis,
@@ -3603,6 +4105,17 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         sourceOrigins: step.origins,
         specialistProfile: routeStepToSpecialist({ title, hypothesis: step.hypothesis, category, skills: step.skills }),
       })
+      if (depStepIds.length > 0 && createdStep.status === 'pending') {
+        const existingById = new Map(existing.map(s => [s.id, s]))
+        const allParentsContinuable = depStepIds.every(sid => {
+          const parent = existingById.get(sid)
+          return Boolean(parent && CONTINUABLE_CHAIN_STEP_STATUSES.has(parent.status))
+        })
+        if (allParentsContinuable) {
+          this.storage.updateChainStep(createdStep.id, { status: 'ready' })
+        }
+      }
+      this.registerStepTargets(run.id, createdStep.id, structuredTargets)
       if (checkpointCapId || checkpointJson) {
         this.trackRunLifecycle(run.id)
         this.persistedStepCheckpoints.set(createdStep.id, {
@@ -3874,14 +4387,30 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       `${CHAIN_CONTINUATION_SKILL_PREFIX}${nextDepth}`,
     ])]
 
-    const parentFactIds = [...new Set([
+    const allLiveFacts = this.pageAll((offset, limit) =>
+      this.storage.listFacts(run.id, { includeTainted: false, limit, offset }))
+    const liveFactById = new Map(allLiveFacts.map(f => [f.id, f]))
+    const liveFactIds = new Set(liveFactById.keys())
+    // Lossless hop-continuation fact handoff: retain EVERY inherited capability/checkpoint/hop
+    // parent fact first so multi-hop capability context is never truncated by a fixed slice.
+    const isPriorityContinuationFact = (factId: string): boolean => {
+      const f = liveFactById.get(factId)
+      const subkind = typeof f?.data?.subkind === 'string' ? f.data.subkind : ''
+      const kind = typeof f?.data?.kind === 'string' ? f.data.kind : ''
+      return subkind === 'hop_checkpoint'
+        || subkind === 'chain_hop'
+        || kind === 'chain_hop'
+        || kind === 'det_lead'
+        || typeof f?.data?.capId === 'string'
+        || typeof f?.data?.checkpointCapId === 'string'
+    }
+    const mergedFactCandidates = [...new Set([
       ...step.dependsOnFactIds,
       ...input.recordedFacts.map(f => f.id),
-    ])].slice(0, 12)
-    const liveFactIds = new Set(
-      this.pageAll((offset, limit) =>
-        this.storage.listFacts(run.id, { includeTainted: false, limit, offset })).map(f => f.id),
-    )
+    ])].filter(id => liveFactIds.has(id))
+    const priorityFactIds = mergedFactCandidates.filter(isPriorityContinuationFact)
+    const remainingFactIds = mergedFactCandidates.filter(id => !isPriorityContinuationFact(id))
+    const parentFactIds = [...priorityFactIds, ...remainingFactIds.slice(0, Math.max(12, 32 - priorityFactIds.length))]
 
     const beforeIds = new Set(existingSteps.map(s => s.id))
     const stepBudgetUsd = Math.max(0.05, Number(Math.max(0, run.budgetUsd - run.spentUsd).toFixed(4)))
@@ -3994,7 +4523,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         funnel.filteredAlreadyConfirmed += 1
         continue
       }
-      this.storage.addChainStep(run, {
+      const created = this.storage.addChainStep(run, {
         title: `Second-order canary verification · ${marker} → ${new URL(surfacedOrigin).hostname}${surfacedEndpoint.slice(0, 40)}`,
         hypothesis: `Second-order canary ${marker} planted via ${String(fact.data?.injectedEndpoint ?? '/')} (param ${String(fact.data?.injectedParam ?? 'input')}, persona ${String(fact.data?.injectedPersona ?? 'anonymous')}) resurfaced on ${surfacedOrigin}${surfacedEndpoint} as persona ${String(fact.data?.surfacedPersona ?? 'anonymous')} with media type ${surfacedMediaType || 'unknown'}${crossPersona ? ' (cross-persona)' : ''}${activeHtml ? ' (active HTML render)' : ''}. Re-read the surfaced endpoint with a control persona, prove the injected marker is persisted and rendered to a different principal, then submit a ${activeHtml ? 'browser_chain' : 'http_chain'} DeclarativeReplaySpec whose probe step renders the marker verbatim and whose control step does not.`,
         category: crossPersona ? 'broken-access-control' : 'cors-client-side',
@@ -4007,6 +4536,12 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         sourceOrigins: [...new Set([surfacedOrigin, fact.origin])].filter(origin => approvedOrigins.has(origin)),
         specialistProfile: crossPersona ? 'bola-bfla-specialist' : 'client-browser-dom-specialist',
       })
+      this.registerStepTargets(run.id, created.id, [{
+        origin: surfacedOrigin,
+        method: 'GET',
+        route: surfacedEndpoint,
+        vulnClass: crossPersona ? 'broken-access-control' : 'cors-client-side',
+      }])
       funnel.planned += 1
       funnel.enqueued += 1
       secondOrderAutoSteps += 1
@@ -4103,6 +4638,14 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         targetAssetIds: assetIds, skills: step.skills, dependsOnFactIds: parentFactIds,
         dependsOnStepIds: parentStepIds, sourceOrigins: validOrigins, specialistProfile,
       })
+      const plannedTargets: StructuredStepTarget[] = (guardRoutes.length ? guardRoutes : ['/'])
+        .flatMap(route => validOrigins.map(origin => ({
+          origin,
+          method: 'ANY',
+          route,
+          vulnClass: step.category,
+        })))
+      this.registerStepTargets(currentRun.id, created.id, plannedTargets)
       liveStepIds.add(created.id)
       addStepTuplesToInFlightSet(inFlightTuples, {
         title: step.title,
@@ -4268,21 +4811,21 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
           funnel.enqueued += addedComposites
           if (addedComposites > 0) invalidateSteps()
         }
-      } catch { /* additive Layer-2 synthesis */ }
+      } catch (err) { this.noteLifecycleWarning(updated.id, 'runChainPlanner.seedInvariants', err) }
     } else {
       try {
         const postSync = this.syncPostFloorRuntimeInvariants(updated, approvedOrigins, { sourceMounted })
         funnel.planned += postSync.wave1StepsCreated
         funnel.enqueued += postSync.wave1StepsCreated
         if (postSync.wave1StepsCreated > 0) invalidateSteps()
-      } catch { /* incremental post-floor synthesis is additive */ }
+      } catch (err) { this.noteLifecycleWarning(updated.id, 'runChainPlanner.syncPostFloorRuntimeInvariants', err) }
     }
     let tierAPlannerSteps = 0
     if (sourceMounted) {
       try {
         tierAPlannerSteps = this.queueTierALeadSteps(updated, approvedOrigins, dynamicStepBudget, { sourceMounted: true })
         if (tierAPlannerSteps > 0) invalidateSteps()
-      } catch { /* white-box seeding is additive */ }
+      } catch (err) { this.noteLifecycleWarning(updated.id, 'runChainPlanner.queueTierALeadSteps', err) }
       funnel.planned += tierAPlannerSteps
       funnel.enqueued += tierAPlannerSteps
     }
@@ -4293,7 +4836,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     try {
       detLeadSteps = this.queueDetLeadUpgradeSteps(fresh, approvedOrigins, dynamicStepBudget)
       if (detLeadSteps > 0) invalidateSteps()
-    } catch { /* lead queueing is additive */ }
+    } catch (err) { this.noteLifecycleWarning(fresh.id, 'runChainPlanner.queueDetLeadUpgradeSteps', err) }
     funnel.planned += detLeadSteps
     funnel.enqueued += detLeadSteps
 
@@ -4389,7 +4932,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
         const readGuidance = hasGetVariant
           ? 'Verify tenant isolation with GET first via kovo_verify(prove_access_boundary); use benign PUT/PATCH field deltas via kovo_verify(prove_persisted_mutation) only where reversible; DELETE stays Tier 3/local-lab.'
           : 'GET read on this route template is ALREADY floor-confirmed — do NOT re-submit a read-only GET proof. Test only the unconfirmed write/mutation variants above with kovo_verify(prove_persisted_mutation) using reversible benign field deltas; DELETE stays Tier 3/local-lab.'
-        this.storage.addChainStep(updated, {
+        const createdBolaStep = this.storage.addChainStep(updated, {
           title: `Cross-persona BOLA/IDOR matrix · ${new URL(origin).hostname} · resource:${resourceKey}`,
           hypothesis: `Replay ${itemsForOrigin.length} ${resourceKey} resource(s) owned by ${itemsForOrigin[0].ownerPersona} (e.g. ${itemsForOrigin.map(item => `${item.endpoint} [${item.resourceId}]`).join(', ')}) as ${itemsForOrigin[0].testAsPersonas?.join(', ') ?? 'alternate persona & anonymous'} using bounded consumer item variants: ${variants.join(', ')}. ${readGuidance}`,
           category: 'broken-access-control',
@@ -4400,6 +4943,15 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
           sourceOrigins: [origin],
           specialistProfile: 'bola-bfla-specialist',
         })
+        const bolaTargets: StructuredStepTarget[] = itemsForOrigin.flatMap(item =>
+          item.variants.map(v => ({
+            origin,
+            method: v.method.toUpperCase(),
+            route: v.endpoint,
+            vulnClass: 'broken-access-control',
+          })),
+        )
+        this.registerStepTargets(updated.id, createdBolaStep.id, bolaTargets)
         funnel.planned += 1
         funnel.enqueued += 1
         bolaAutoSteps += 1
@@ -4545,7 +5097,42 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
     cachedFindings = null
 
     let parsedPlanner: ReturnType<typeof plannerResponseSchema.safeParse> | null = null
-    try { parsedPlanner = plannerResponseSchema.safeParse(JSON.parse(stripJsonFences(answer))) } catch { parsedPlanner = null }
+    let plannerParseError: { stage: 'json' | 'schema'; message: string } | null = null
+    try {
+      const parsedJson: unknown = JSON.parse(stripJsonFences(answer))
+      parsedPlanner = plannerResponseSchema.safeParse(parsedJson)
+      if (!parsedPlanner.success) {
+        plannerParseError = {
+          stage: 'schema',
+          message: parsedPlanner.error.issues.slice(0, 4).map(i => `${i.path.join('.') || '<root>'}: ${i.message}`).join('; '),
+        }
+      }
+    } catch (err) {
+      parsedPlanner = null
+      plannerParseError = {
+        stage: 'json',
+        message: err instanceof Error ? err.message.slice(0, 240) : String(err).slice(0, 240),
+      }
+    }
+    if (plannerParseError) {
+      try {
+        this.storage.event(
+          run.id,
+          'planner_parse_failed',
+          `Planner response failed ${plannerParseError.stage} parsing on round ${roundNo}: ${plannerParseError.message}`,
+          {
+            roundNo,
+            stage: plannerParseError.stage,
+            error: plannerParseError.message,
+            rawLength: answer.length,
+            rawPreview: compactText(answer.replace(/\s+/g, ' ').trim(), 160),
+            degradation: true,
+          },
+        )
+      } catch (err) {
+        this.noteLifecycleWarning(run.id, 'planner_parse_failed.event', err, { roundNo })
+      }
+    }
     const currentRun = this.storage.run(run.id)
     const currentApproved = this.host.approvedOriginsSet(currentRun)
     const existingSteps = this.storage.listChainSteps(run.id, currentRun.goalRevision)
@@ -4631,20 +5218,24 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       })
     }
     const latestForProgress = this.storage.run(run.id)
-    const frontierDecision = newHopEvents.length > 0
-      ? frontierController.evaluateWaveProgress({
-          completedAssignments: Math.max(0, completedInvestigations - previousCompletedInvestigations),
-          verifiedHopReceipts: newHopEvents,
-          pendingAsyncOrOob: coordinator.queryFindings({ status: 'pending_oob', limit: 1 }).total,
-          budgetUsdSpent: latestForProgress.spentUsd,
-          budgetUsdLimit: latestForProgress.budgetUsd,
-          elapsedMs: Math.max(0, Date.now() - latestForProgress.createdAt),
-          maxDurationMs: this.host.maxDurationMs,
-          requestsSpent: latestForProgress.spentRequests,
-          agentRequestBudget: latestForProgress.budgetRequests,
-        })
-      : null
-    const verifiedHopReachExpansions = frontierDecision?.reachDelta.newHopReceiptIds.length ?? 0
+    const completedSinceLastRound = Math.max(0, completedInvestigations - previousCompletedInvestigations)
+    const confirmedCompositeReceipts = this.storage.listReplaySpecs(run.id)
+      .filter(spec => spec.proofVerdict === 'confirmed' && Boolean((spec.proofReceipt as Record<string, unknown> | null)?.compositeVerification))
+      .map(spec => spec.id)
+    const frontierDecision = frontierController.evaluateWaveProgress({
+      completedAssignments: completedSinceLastRound,
+      confirmedCompositeReceipts,
+      verifiedHopReceipts: newHopEvents,
+      pendingAsyncOrOob: coordinator.queryFindings({ status: 'pending_oob', limit: 1 }).total,
+      budgetUsdSpent: latestForProgress.spentUsd,
+      budgetUsdLimit: latestForProgress.budgetUsd,
+      elapsedMs: Math.max(0, Date.now() - latestForProgress.createdAt),
+      maxDurationMs: this.host.maxDurationMs,
+      requestsSpent: latestForProgress.spentRequests,
+      agentRequestBudget: latestForProgress.budgetRequests,
+      coverageSettledCount: this.provedOrGapCodedAssignmentIds(run.id).size,
+    })
+    const verifiedHopReachExpansions = frontierDecision.reachDelta.newHopReceiptIds.length
 
     const dryRounds = nextPlannerDryRounds({
       roundNo,
@@ -4688,6 +5279,7 @@ export class ExecReconPlanner extends ExecServiceModule<ExecReconPlannerHost> {
       consecutiveDryRounds: dryRounds,
       verifiedHopReachExpansions,
       frontierDecision,
+      completedSinceLastRound,
     })
 
     // v7 coverage guard: a dry/coordinator stop must not abandon planned, dispatchable work while a
