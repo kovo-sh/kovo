@@ -1,0 +1,140 @@
+{
+  "id": "r3-12-accumulator-anon401-fp",
+  "side": "fp",
+  "archetype": "r3-12-same-tenant-anon401-owner200",
+  "description": "R3-12 FP: honest tenant-scoped object route where owner_a (tenant-a) gets 200, anon gets 401 login wall, owner_b (tenant-b) gets 403, and same-tenant viewer_a (tenant-a) gets 200 must never confirm bola/idor/bfla/cross_tenant_read/disclosure.",
+  "covers": {
+    "files": [
+      "src/server/oracle-invariants.ts",
+      "src/server/proof-receipt.ts"
+    ],
+    "classes": [
+      "business_logic",
+      "bola",
+      "idor",
+      "bfla",
+      "authorization",
+      "cross_tenant_read"
+    ]
+  },
+  "canonicalLabel": {
+    "cwe": "CWE-639",
+    "category": "bola",
+    "title": "Same-tenant org-shared document read with anonymous 401 login wall and owner 200 control",
+    "impact": "Authenticated same-tenant viewer reads shared tenant document while unauthenticated caller receives 401 and foreign tenant receives 403.",
+    "claimedImpact": "authorization",
+    "claimedBoundary": "access",
+    "vulnClass": "bola"
+  },
+  "freeTextLabel": {
+    "title": "Unauthorized object access claim pairing anonymous 401 control with same-tenant member read"
+  },
+  "paths": {
+    "replay": true,
+    "floorReceipt": true,
+    "evaluateClaims": true,
+    "composite": false,
+    "floorInjectionRecipe": false,
+    "proofReceipt": true
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [
+    {
+      "handle": "owner_a",
+      "roleLabel": "owner (tenant-a)",
+      "role": "owner",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-r312-owner-a-token"
+    },
+    {
+      "handle": "owner_b",
+      "roleLabel": "owner (tenant-b)",
+      "role": "owner",
+      "tenant": "tenant-b",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-r312-owner-b-token"
+    },
+    {
+      "handle": "viewer_a",
+      "roleLabel": "viewer (tenant-a)",
+      "role": "viewer",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-r312-viewer-a-token"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "ctl_owner",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/docs/doc_a1",
+      "persona": "owner_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"id\":\"doc_a1\",\"tenant_id\":\"tenant-a\",\"owner\":\"owner_a\",\"title\":\"Acme Quarterly Ledger\",\"status\":\"open\"}"
+    },
+    {
+      "id": "ctl_anon",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/docs/doc_a1",
+      "persona": null,
+      "status": 401,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"error\":\"authentication_required\"}"
+    },
+    {
+      "id": "prb_foreign",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/docs/doc_a1",
+      "persona": "owner_b",
+      "status": 403,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"error\":\"forbidden_cross_tenant_access\"}"
+    },
+    {
+      "id": "prb_viewer",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/docs/doc_a1",
+      "persona": "viewer_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"id\":\"doc_a1\",\"tenant_id\":\"tenant-a\",\"owner\":\"owner_a\",\"title\":\"Acme Quarterly Ledger\",\"status\":\"open\"}"
+    }
+  ],
+  "replaySpec": {
+    "assertionsJq": "{ controlPassed: (.steps.ctl_owner.status == 200 and .steps.ctl_anon.status == 401), confirmed: (.steps.prb_viewer.status == 200 and .steps.prb_viewer.json.id == \"doc_a1\"), observed: \"viewer_a read same-tenant doc\", expected: \"403\" }"
+  },
+  "proofReceipt": {
+    "vulnClass": "bola",
+    "targetMethod": "GET",
+    "targetPathAndQuery": "/api/docs/doc_a1",
+    "claimedDelta": "Anonymous 401 login wall plus owner 200 control must not confirm same-tenant viewer read as BOLA/IDOR."
+  },
+  "claims": [
+    { "kind": "impact", "impactClass": "authorization", "probeExchangeId": "prb_viewer", "controlExchangeIds": ["ctl_owner", "ctl_anon"] }
+  ],
+  "bareClaims": [
+    { "kind": "status", "exchangeId": "ctl_owner", "expected": 200 },
+    { "kind": "status", "exchangeId": "ctl_anon", "expected": 401 },
+    { "kind": "status", "exchangeId": "prb_viewer", "expected": 200 },
+    { "kind": "body_contains", "exchangeId": "prb_viewer", "text": "doc_a1" }
+  ]
+}

@@ -34,6 +34,7 @@ import {
   hasForeignTenantOrOwnerDisclosure,
   isObjectScopedRequest,
   knownOracleEvent,
+  routeFamily,
   stepMutatesState,
   verifyBooleanTriangleBinding,
 } from './oracle-invariants.ts'
@@ -1542,37 +1543,89 @@ export function verifyReceipt(
       }
     }
   }
-  // Defense-in-depth anon-control authz guard: when every denied control is unauthenticated and
-  // there is no cross-tenant control read, an authenticated probe must prove foreign-tenant or
-  // foreign-owner data disclosure rather than merely proving the route enforces login.
-  if (impactClass === 'authorization' || impactClass === 'bfla') {
+  // Defense-in-depth anon-control authz guard: when every denied control is unauthenticated (or
+  // strictly cross-tenant isolation) and there is no verified cross-tenant or role-differential
+  // boundary, an authenticated probe must prove foreign-tenant or foreign-owner data disclosure
+  // rather than merely proving the route enforces login alongside an authenticated 200 control.
+  if (impactClass === 'authorization' || impactClass === 'bfla' || impactClass === 'disclosure') {
     const stepHasAuth = (s: ImpactStep): boolean =>
       Boolean(s.actor.handle) ||
+      Boolean(s.actor.tenant) ||
       ['cookie', 'bearer', 'header'].includes(s.actor.auth) ||
+      Boolean(headerValue(s.requestHeaders, 'authorization') || headerValue(s.requestHeaders, 'cookie'))
+    // A denied control qualifies as an authenticated peer denial only when it carries actual
+    // principal identity or credential headers (never an anonymous control with a default `auth`
+    // enum) AND targets the same route family as the probe.
+    const controlHasIdentityAuth = (s: ImpactStep): boolean =>
+      Boolean(s.actor.handle) ||
+      Boolean(s.actor.tenant) ||
       Boolean(headerValue(s.requestHeaders, 'authorization') || headerValue(s.requestHeaders, 'cookie'))
     const deniedCtrls = steps.filter(s => s.arm === 'control' && (s.status === 401 || s.status === 403))
     const okAuthProbes = steps.filter(s => s.arm === 'probe' && is2xxStatus(s.status) && stepHasAuth(s))
-    const hasAuthCtrl = steps.some(s => s.arm === 'control' && stepHasAuth(s))
-    if (deniedCtrls.length > 0 && !hasAuthCtrl && okAuthProbes.length > 0) {
+    // Require an authenticated DENIED peer control on a compatible route (same tenant or
+    // untenant-scoped) — never an unauthenticated 401 login wall paired with an authenticated 200
+    // control, never a cross-tenant 403 isolation control, and never an unrelated route denial.
+    const hasAuthDeniedCtrl = deniedCtrls.some(c =>
+      controlHasIdentityAuth(c) &&
+      okAuthProbes.some(p => {
+        const ct = c.actor.tenant?.toLowerCase() ?? null
+        const pt = p.actor.tenant?.toLowerCase() ?? null
+        const tenantCompatible = !ct || !pt || ct === pt
+        if (!tenantCompatible) return false
+        const cf = routeFamily(c.route ?? c.pathAndQuery ?? '')
+        const pf = routeFamily(p.route ?? p.pathAndQuery ?? '')
+        return cf !== '' && pf !== '' && (cf === pf || cf.startsWith(`${pf}/`) || pf.startsWith(`${cf}/`))
+      }))
+    const authEvidence = assessment.evidence as {
+      crossTenant?: boolean
+      roleDifferential?: boolean
+      credentialPatternMatched?: boolean
+    } | undefined
+    const hasCredentialPatternDisclosure = Boolean(
+      impactClass === 'disclosure' &&
+      receipt.proofPatterns &&
+      receipt.proofPatterns.length > 0 &&
+      authEvidence?.credentialPatternMatched === true,
+    )
+    const hasVerifiedBoundaryDiff =
+      authEvidence?.crossTenant === true ||
+      authEvidence?.roleDifferential === true ||
+      hasCredentialPatternDisclosure
+    if (deniedCtrls.length > 0 && !hasAuthDeniedCtrl && !hasVerifiedBoundaryDiff && okAuthProbes.length > 0) {
       const hasForeign = okAuthProbes.some(p => {
         if (stepMutatesState(p)) return false
         if (hasForeignTenantOrOwnerDisclosure(steps, p, receipt.resourceTenant ?? null)) return true
         const obj = parseStepJson(p)
         if (!obj || typeof obj !== 'object') return false
         const pt = p.actor.tenant?.toLowerCase() ?? null, ph = p.actor.handle?.toLowerCase() ?? null
-        const visit = (v: unknown, d: number): boolean => {
-          if (d > 3 || !v || typeof v !== 'object') return false
-          if (Array.isArray(v)) return v.some(x => visit(x, d + 1))
+        let foundForeignTenant = false
+        let foundOwnTenant = false
+        let foundForeignOwner = false
+        const visit = (v: unknown, d: number): void => {
+          if (d > 3 || !v || typeof v !== 'object' || foundForeignTenant) return
+          if (Array.isArray(v)) {
+            for (const x of v) visit(x, d + 1)
+            return
+          }
           for (const [k, x] of Object.entries(v as Record<string, unknown>)) {
             if (typeof x === 'string' && x.trim()) {
               const lk = k.toLowerCase(), lv = x.trim().toLowerCase()
-              if (/^(?:tenant|org|organization|workspace)(?:_?id|slug)?$/.test(lk) && pt && lv !== pt) return true
-              if (/^(?:owner|user)(?:_?id)?$/.test(lk) && ph && lv !== ph) return true
-            } else if (x && typeof x === 'object' && visit(x, d + 1)) return true
+              if (/^(?:tenant|org|organization|workspace)(?:_?id|slug)?$/.test(lk) && pt) {
+                if (lv !== pt) foundForeignTenant = true
+                else foundOwnTenant = true
+              }
+              if (/^(?:owner|user)(?:_?id)?$/.test(lk) && ph && lv !== ph) {
+                foundForeignOwner = true
+              }
+            } else if (x && typeof x === 'object') {
+              visit(x, d + 1)
+            }
           }
-          return false
         }
-        return visit(obj, 0)
+        visit(obj, 0)
+        // A same-tenant org-shared record (`tenant_id === probe.tenant`) carrying a peer's `owner`
+        // field is not foreign-owner disclosure without an authenticated boundary denial.
+        return foundForeignTenant || (!foundOwnTenant && !pt && foundForeignOwner)
       })
       if (!hasForeign) {
         return reject(
