@@ -80,3 +80,14 @@ Before writing a fix for any bug, benchmark drop, or audit finding, classify the
    - Never echo concrete SQL/XSS/XXE/SSTI/command test strings into sub-agent prompts, tool outputs, or final responses; refer to them by probe class and anomaly type (e.g., `sqli_boolean`, `xxe_canary`, `ssti_math`).
 4. **Isolate unavoidable inspection in single-purpose sub-agents:**
    - If a specific probe/verifier implementation slice must be inspected closely, do it in a small single-file sub-agent and return only a concise structural summary (file, line numbers, logic defect) to the main session so a false-positive filter hit never disrupts the main thread.
+
+## UI visual & geometry QA gate
+
+1. **Mandatory Playwright screenshots + visual inspection:** Any change to `src/components/**` or CSS (`src/app.css`, Tailwind styles) must build (`npm run build`), capture Playwright screenshots at **1280×720** and **1440×900** (both light and dark mode for modals/cards) into the conversation `scratch/` directory, and visually inspect them with `read_file` before handoff.
+2. **Mandatory DOM geometry & stability invariants:** Add or update Playwright assertions in `tests/e2e-ui-journeys.test.ts` (or a feature-specific Playwright test) verifying:
+   - zero horizontal overflow (`scrollWidth <= clientWidth`) on modals, dialogs, drawers, and primary containers;
+   - primary CTA visible inside the viewport above the fold at `1280×720` without scrolling;
+   - zero overlapping sibling controls or clipped text (`scrollHeight <= clientHeight + 2` on cards/buttons);
+   - controlled input stability across SSE/polling ticks (background updates must never clobber focused/in-progress user input).
+3. **`src/app.css` bare-element guard:** Never rely on bare `button` defaults in `src/app.css` (`height: 26px; white-space: nowrap; box-shadow`) for multi-line, card, or radio buttons — explicitly apply `h-auto whitespace-normal shadow-none` (or scope rules to classes).
+4. **No raw `null`/`undefined` interpolation:** Never concatenate nullable strings/values directly into user-visible copy (build arrays and `.filter(Boolean)`).
