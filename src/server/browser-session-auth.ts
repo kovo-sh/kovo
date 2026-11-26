@@ -55,7 +55,14 @@ export type {
   PlaywrightStorageOrigin,
   PlaywrightStorageState,
 }
-import { isIpLiteralHost, normalizeHostname } from './public-suffix.ts'
+import { isIpLiteralHost, isPublicSuffixHost, normalizeHostname } from './public-suffix.ts'
+import {
+  canonicalPathAndQuery,
+  isRouteDenylisted,
+  normalizeScopeOrigin,
+  originRoleFor,
+} from './scope-policy.ts'
+import type { ScopePolicy } from './scope-policy.ts'
 
 // ---------------------------------------------------------------------------
 // Constants & Types
@@ -82,6 +89,28 @@ const WEBRTC_GUARD_SCRIPT = `(() => {
     try { Object.defineProperty(window, name, { configurable: false, writable: false, value: deny }); } catch {}
   }
 })();`
+
+const SOCKET_DENY_SCRIPT = `(() => {
+  const deny = function () { throw new Error('WebSocket/WebTransport/WebRTC disabled inside Kovo Hunter browser sessions.'); };
+  for (const name of ['WebSocket', 'WebTransport', 'RTCPeerConnection', 'webkitRTCPeerConnection', 'RTCDataChannel']) {
+    try { Object.defineProperty(window, name, { configurable: false, writable: false, value: deny }); } catch {}
+  }
+})();`
+
+export interface BrowserSessionChromiumLaunchOptions {
+  readonly headless: true
+  readonly chromiumSandbox: boolean
+  readonly args: string[]
+}
+
+export class BrowserSessionRefreshBlockedError extends Error {
+  readonly code = 'VERIFY_PATH_MODIFIED' as const
+
+  constructor(message: string) {
+    super(message)
+    this.name = 'BrowserSessionRefreshBlockedError'
+  }
+}
 
 export interface ScreencastFrame {
   /** Base64-encoded JPEG image frame. */
@@ -137,10 +166,24 @@ export interface PlaywrightPageLike {
   close(): Promise<void>
 }
 
+export interface PlaywrightRouteLike {
+  request(): { url(): string; method(): string; headers(): Record<string, string> }
+  continue(overrides?: { headers?: Record<string, string> }): Promise<void>
+  abort(errorCode?: string): Promise<void>
+}
+
+export interface PlaywrightWebSocketRouteLike {
+  url(): string
+  close(options?: { code?: number; reason?: string }): Promise<void> | void
+  connectToServer?(): Promise<void> | void
+}
+
 export interface PlaywrightContextLike {
   newPage(): Promise<PlaywrightPageLike>
   newCDPSession?(page: PlaywrightPageLike): Promise<PlaywrightCdpSessionLike>
   addInitScript?(script: string): Promise<void>
+  route?(pattern: string, handler: (route: PlaywrightRouteLike) => Promise<void> | void): Promise<void>
+  routeWebSocket?(pattern: string, handler: (ws: PlaywrightWebSocketRouteLike) => Promise<void> | void): Promise<void>
   storageState(): Promise<PlaywrightStorageState>
   close(): Promise<void>
 }
@@ -156,6 +199,10 @@ export interface StartInteractiveCaptureOptions {
   allowLocalLab?: boolean
   /** Optional additional allowlisted origins for observing target auth headers. */
   allowedOrigins?: readonly string[]
+  /** Explicit, operator-approved IdP origins permitted during login capture. */
+  idpOrigins?: readonly string[]
+  /** Optional project ScopePolicy enforced on capture egress. */
+  scopePolicy?: ScopePolicy
   /** Max capture session lifetime in ms (default & hard cap: 5 minutes). */
   ttlMs?: number
   viewport?: { width: number; height: number }
@@ -163,7 +210,7 @@ export interface StartInteractiveCaptureOptions {
   /** Optional callback invoked when the capture transitions to expired/canceled/completed. */
   onClosed?: (id: string, state: CaptureSessionState) => void
   /** Injectable browser launcher / DNS resolver for deterministic testing. */
-  launchBrowser?: (opts: { args: string[] }) => Promise<PlaywrightBrowserLike>
+  launchBrowser?: (opts: BrowserSessionChromiumLaunchOptions) => Promise<PlaywrightBrowserLike>
   resolveHost?: (hostname: string) => Promise<string[]>
 }
 
@@ -191,6 +238,19 @@ export interface RefreshBrowserSessionOptions {
   targetOrigin: string
   /** Allowlisted origins for scoping extracted cookies/headers/storage (defaults to [targetOrigin]). */
   originAllowlist?: readonly string[]
+  /** Explicit, operator-approved IdP origins (from login/IdP config — NEVER "any public HTTPS"). */
+  idpOrigins?: readonly string[]
+  /** Optional project ScopePolicy enforced on refresher proxy & browser routes. */
+  scopePolicy?: ScopePolicy
+  /**
+   * Opt-in to preserve third-party cookies outside allowed persona + IdP origins when seeding
+   * the refresher context (default `false`: third-party cookies are stripped fail-closed).
+   */
+  allowThirdPartyCookies?: boolean
+  /** Paths or URLs known to have been modified by the active run; refresh refuses if `verifyPath` matches. */
+  modifiedPaths?: readonly string[] | ReadonlySet<string>
+  /** Explicit flag indicating `verifyPath` was modified by the active run; refuses automated refresh. */
+  verifyPathModifiedByRun?: boolean
   /** Optional path on targetOrigin to visit so client JS SDK refreshes tokens (default '/'). */
   verifyPath?: string
   allowLocalLab?: boolean
@@ -204,7 +264,7 @@ export interface RefreshBrowserSessionOptions {
   persistBundlePath?: string
   signal?: AbortSignal
   /** Injectable browser launcher / DNS resolver for deterministic testing. */
-  launchBrowser?: (opts: { args: string[] }) => Promise<PlaywrightBrowserLike>
+  launchBrowser?: (opts: BrowserSessionChromiumLaunchOptions) => Promise<PlaywrightBrowserLike>
   resolveHost?: (hostname: string) => Promise<string[]>
 }
 
@@ -279,7 +339,14 @@ function normalizeVerifyPath(raw?: string): string {
   return trimmed.slice(0, 512)
 }
 
-export function browserSessionChromiumArgs(): string[] {
+export function isInsecureNoSandboxEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.KOVO_INSECURE_NO_SANDBOX === '1'
+}
+
+export function browserSessionChromiumArgs(
+  options: { insecureNoSandbox?: boolean; env?: NodeJS.ProcessEnv } = {},
+): string[] {
+  const insecureNoSandbox = options.insecureNoSandbox ?? isInsecureNoSandboxEnabled(options.env)
   const args = [
     '--disable-dev-shm-usage',
     '--disable-background-networking',
@@ -292,85 +359,450 @@ export function browserSessionChromiumArgs(): string[] {
     '--disable-quic',
     '--disable-features=WebTransport',
   ]
-  if (process.env.KOVO_INSECURE_NO_SANDBOX === '1') {
+  if (insecureNoSandbox) {
     args.push('--no-sandbox')
   }
   return args
 }
 
-async function launchDefaultBrowserSessionChromium(opts: { args: string[] }): Promise<PlaywrightBrowserLike> {
+/**
+ * Build Playwright `chromium.launch(...)` options for browser-session capture and refresh.
+ * R3-H-6: Explicitly passes `chromiumSandbox: true` by default (playwright-core otherwise
+ * injects `--no-sandbox` whenever `chromiumSandbox !== true`). Only disables the sandbox when
+ * `KOVO_INSECURE_NO_SANDBOX === '1'` (or explicit `insecureNoSandbox: true` in tests).
+ */
+export function buildBrowserSessionChromiumLaunchOptions(
+  options: { insecureNoSandbox?: boolean; env?: NodeJS.ProcessEnv } = {},
+): BrowserSessionChromiumLaunchOptions {
+  const insecureNoSandbox = options.insecureNoSandbox ?? isInsecureNoSandboxEnabled(options.env)
+  return {
+    headless: true,
+    chromiumSandbox: !insecureNoSandbox,
+    args: browserSessionChromiumArgs({ insecureNoSandbox }),
+  }
+}
+
+export function formatChromiumSandboxLaunchError(err: unknown): Error {
+  const detail = err instanceof Error ? err.message : String(err)
+  return new Error(
+    `Sandboxed Chromium failed to launch (chromiumSandbox: true). Refusing to fall back to --no-sandbox. `
+    + `Enable unprivileged user namespaces or configure a Chromium seccomp profile on this host/container, `
+    + `or explicitly opt out only in isolated environments with KOVO_INSECURE_NO_SANDBOX=1. `
+    + `Underlying error: ${detail}`,
+  )
+}
+
+async function resolvePlaywrightChromium(): Promise<{
+  launch: (o: BrowserSessionChromiumLaunchOptions) => Promise<PlaywrightBrowserLike>
+}> {
   try {
     const coreName = 'playwright-core'
     const coreMod = await import(/* @vite-ignore */ coreName) as {
-      chromium?: { launch: (o: Record<string, unknown>) => Promise<PlaywrightBrowserLike> }
+      chromium?: { launch: (o: BrowserSessionChromiumLaunchOptions) => Promise<PlaywrightBrowserLike> }
     }
-    if (coreMod.chromium) {
-      return await coreMod.chromium.launch({ headless: true, args: opts.args })
-    }
+    if (coreMod.chromium) return coreMod.chromium
   } catch {
-    // Fallback to @playwright/test
+    // Fallback to @playwright/test when playwright-core cannot be imported directly.
   }
   const pw = await import('@playwright/test')
-  return await pw.chromium.launch({ headless: true, args: opts.args }) as unknown as PlaywrightBrowserLike
+  return pw.chromium as unknown as {
+    launch: (o: BrowserSessionChromiumLaunchOptions) => Promise<PlaywrightBrowserLike>
+  }
+}
+
+async function launchDefaultBrowserSessionChromium(
+  opts: BrowserSessionChromiumLaunchOptions,
+): Promise<PlaywrightBrowserLike> {
+  if (!opts.chromiumSandbox) {
+    console.warn('WARNING: Chromium sandbox disabled (KOVO_INSECURE_NO_SANDBOX=1). Browser session isolation is reduced.')
+  }
+  const chromium = await resolvePlaywrightChromium()
+  const launchOpts: BrowserSessionChromiumLaunchOptions = {
+    headless: true,
+    chromiumSandbox: opts.chromiumSandbox,
+    args: opts.args,
+  }
+  try {
+    return await chromium.launch(launchOpts)
+  } catch (err) {
+    if (launchOpts.chromiumSandbox) {
+      throw formatChromiumSandboxLaunchError(err)
+    }
+    throw err
+  }
+}
+
+export interface BrowserSessionEgressPolicy {
+  readonly targetOrigin: string
+  /** Target + persona.originAllowlist origins (intersected with ScopePolicy when provided). */
+  readonly personaOrigins: ReadonlySet<string>
+  /** Explicit, operator-approved IdP origins (from explicit IdP config and/or ScopePolicy.authOrigins). */
+  readonly idpOrigins: ReadonlySet<string>
+  /** Union of `personaOrigins` and `idpOrigins` — the ONLY origins permitted by the proxy. */
+  readonly allowedOrigins: ReadonlySet<string>
+  readonly allowLocalLab: boolean
+  /** Effective ScopePolicy (with approved `idpOrigins` merged into `authOrigins`) when provided. */
+  readonly scopePolicy?: ScopePolicy
+}
+
+function validateAndNormalizeOriginEntry(
+  raw: string,
+  allowLocalLab: boolean,
+  label: string,
+  strict: boolean,
+): string | null {
+  let parsed: URL
+  try {
+    parsed = new URL(raw.trim())
+  } catch {
+    if (strict) throw new Error(`${label} entry "${raw}" must be a valid HTTP(S) origin.`)
+    return null
+  }
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+    if (strict) throw new Error(`${label} entry "${raw}" must use http:// or https://.`)
+    return null
+  }
+  if (parsed.username || parsed.password) {
+    if (strict) throw new Error(`${label} entry "${raw}" must not contain embedded credentials.`)
+    return null
+  }
+  if (parsed.protocol === 'http:' && !allowLocalLab) {
+    if (strict) throw new Error(`Plaintext HTTP ${label} entry "${raw}" is blocked for public projects.`)
+    return null
+  }
+  try {
+    assertAllowedBrowserHost(parsed.hostname, allowLocalLab, label)
+  } catch (err) {
+    if (strict) throw err
+    return null
+  }
+  return normalizeScopeOrigin(parsed.origin)
 }
 
 /**
- * Create an SSRF-enforcing `EgressGateway.createLoopbackProxy` for universal browser sessions.
- *
- * Unlike strict single-origin form login, interactive login & generic SPA token refresh must allow
- * public HTTPS IdP/CDN hops (Clerk, Auth0, Google, GitHub, Okta, Supabase, Firebase, etc.) while
- * ALWAYS refusing cloud metadata / link-local IPs and refusing private/loopback/HTTP unless
- * `allowLocalLab` (or an explicitly allowlisted loopback origin) permits it.
+ * R3-H-3: Resolve the strict egress policy for browser-session capture/refresh.
+ * Egress is strictly scoped to:
+ *   1. `persona.originAllowlist` (plus `targetOrigin`, intersected with `scopePolicy` when provided), AND
+ *   2. Explicit, operator-approved IdP origins (`idpOrigins` + `scopePolicy.authOrigins`).
+ * Arbitrary public HTTPS origins are NEVER permitted.
  */
-async function createBrowserSessionProxy(params: {
+export function resolveBrowserSessionEgressPolicy(params: {
   targetUrl: URL
   allowLocalLab: boolean
   allowedOrigins?: readonly string[]
+  idpOrigins?: readonly string[]
+  scopePolicy?: ScopePolicy
+}): BrowserSessionEgressPolicy {
+  const { targetUrl, allowLocalLab, allowedOrigins, idpOrigins, scopePolicy } = params
+  const targetOrigin = normalizeScopeOrigin(targetUrl.origin)
+  if (!targetOrigin) {
+    throw new Error('targetOrigin must be a valid HTTP(S) origin.')
+  }
+
+  const approvedIdpSet = new Set<string>()
+  for (const entry of idpOrigins ?? []) {
+    const normalized = validateAndNormalizeOriginEntry(entry, allowLocalLab, 'idpOrigins', true)
+    if (normalized) approvedIdpSet.add(normalized)
+  }
+  for (const entry of scopePolicy?.authOrigins ?? []) {
+    const normalized = validateAndNormalizeOriginEntry(entry, allowLocalLab, 'scopePolicy.authOrigins', false)
+    if (normalized) approvedIdpSet.add(normalized)
+  }
+
+  const effectiveScopePolicy: ScopePolicy | undefined = scopePolicy
+    ? {
+        ...scopePolicy,
+        authOrigins: [...new Set([...(scopePolicy.authOrigins ?? []), ...approvedIdpSet])],
+      }
+    : undefined
+
+  if (effectiveScopePolicy && originRoleFor(effectiveScopePolicy, targetOrigin) === null) {
+    throw new Error(`targetOrigin "${targetOrigin}" is outside the project ScopePolicy.`)
+  }
+
+  const personaSet = new Set<string>([targetOrigin])
+  for (const entry of allowedOrigins ?? []) {
+    const normalized = validateAndNormalizeOriginEntry(entry, allowLocalLab, 'originAllowlist', false)
+    if (!normalized) continue
+    if (effectiveScopePolicy && originRoleFor(effectiveScopePolicy, normalized) === null) continue
+    personaSet.add(normalized)
+  }
+
+  const unionSet = new Set<string>([...personaSet, ...approvedIdpSet])
+  return {
+    targetOrigin,
+    personaOrigins: personaSet,
+    idpOrigins: approvedIdpSet,
+    allowedOrigins: unionSet,
+    allowLocalLab,
+    ...(effectiveScopePolicy ? { scopePolicy: effectiveScopePolicy } : {}),
+  }
+}
+
+/**
+ * R3-H-3: Fail-closed origin predicate for the browser-session loopback proxy and browser routes.
+ * Permits ONLY origins in `policy.allowedOrigins` (persona allowlist + explicit approved IdP origins),
+ * enforcing scheme, `allowLocalLab`, and optional `ScopePolicy` constraints.
+ */
+export function evaluateBrowserSessionProxyOrigin(
+  policy: BrowserSessionEgressPolicy,
+  origin: string,
+  method: string,
+  url: URL,
+): { allowed: true } | { allowed: false; reason: string } {
+  if (url.protocol !== 'https:' && url.protocol !== 'http:') {
+    return { allowed: false, reason: `Browser session proxy refused unsupported scheme "${url.protocol}" for "${origin}".` }
+  }
+  if (url.protocol === 'http:' && !policy.allowLocalLab) {
+    return { allowed: false, reason: `Browser session proxy refused plaintext HTTP origin "${origin}".` }
+  }
+  const normalized = normalizeScopeOrigin(origin) ?? normalizeScopeOrigin(url.origin)
+  if (!normalized || !policy.allowedOrigins.has(normalized)) {
+    return {
+      allowed: false,
+      reason: `Browser session proxy refused out-of-scope origin "${normalized ?? origin}" (not in persona allowlist or approved IdP origins).`,
+    }
+  }
+  if (policy.scopePolicy) {
+    const role = originRoleFor(policy.scopePolicy, normalized)
+    if (!role) {
+      return {
+        allowed: false,
+        reason: `Browser session proxy refused origin "${normalized}" outside project ScopePolicy.`,
+      }
+    }
+    const upperMethod = (method || 'GET').toUpperCase()
+    if (upperMethod !== 'CONNECT' && role === 'target') {
+      const pathAndQuery = `${url.pathname}${url.search}`
+      if (isRouteDenylisted(policy.scopePolicy, pathAndQuery)) {
+        return {
+          allowed: false,
+          reason: `Browser session proxy refused denylisted route "${pathAndQuery}" on "${normalized}".`,
+        }
+      }
+    }
+  }
+  return { allowed: true }
+}
+
+/**
+ * Create an SSRF- and scope-enforcing `EgressGateway.createLoopbackProxy` for browser sessions.
+ *
+ * R3-H-3: Strictly limits egress to `persona.originAllowlist` (intersected with `scopePolicy` when
+ * provided) plus explicit, operator-approved `idpOrigins`. Denies every other origin fail-closed.
+ */
+export async function createBrowserSessionProxy(params: {
+  targetUrl: URL
+  allowLocalLab: boolean
+  allowedOrigins?: readonly string[]
+  idpOrigins?: readonly string[]
+  scopePolicy?: ScopePolicy
+  egressPolicy?: BrowserSessionEgressPolicy
   resolveHost?: (hostname: string) => Promise<string[]>
   timeoutMs?: number
 }): Promise<EgressLoopbackProxy> {
-  const { targetUrl, allowLocalLab, allowedOrigins, resolveHost, timeoutMs } = params
-  const loopbackHosts = new Set<string>()
-  const allowedPorts = new Set<number>([443])
+  const { resolveHost, timeoutMs } = params
+  const egressPolicy = params.egressPolicy ?? resolveBrowserSessionEgressPolicy(params)
+  const { allowLocalLab } = egressPolicy
 
-  const registerOrigin = (raw: string) => {
+  const allowedConnectTargets = new Set<string>()
+  for (const origin of egressPolicy.allowedOrigins) {
     try {
-      const parsed = new URL(raw)
-      const norm = normalizeHostname(parsed.hostname)
-      if (allowLocalLab && norm && isLoopbackLiteral(norm)) loopbackHosts.add(norm)
+      const parsed = new URL(origin)
+      const normHost = normalizeHostname(parsed.hostname)
       const port = parsed.port ? Number(parsed.port) : (parsed.protocol === 'https:' ? 443 : 80)
-      if (Number.isInteger(port) && port >= 1 && port <= 65_535) {
-        if (allowLocalLab || (parsed.protocol === 'https:' && port === 443)) {
-          allowedPorts.add(port)
-        }
+      if (normHost && Number.isInteger(port) && port >= 1 && port <= 65_535) {
+        allowedConnectTargets.add(`${normHost}:${port}`)
       }
     } catch {
       // Ignore malformed origin entries.
     }
   }
 
-  registerOrigin(targetUrl.origin)
-  for (const entry of allowedOrigins ?? []) registerOrigin(entry)
-
   return await EgressGateway.createLoopbackProxy({
     allowLocalLab,
     allowHttp: allowLocalLab ? true : undefined,
-    allowConnectPort: port => allowLocalLab || allowedPorts.has(port),
-    allowOrigin: (origin, method, url) => {
-      // Allow public HTTPS (and local-lab HTTP only when allowLocalLab is enabled). EgressGateway's
-      // resolveAndValidateHost independently blocks metadata/link-local/private/loopback IPs.
-      if (url.protocol === 'https:') return true
-      if (url.protocol === 'http:') {
-        if (allowLocalLab) return true
-        return { allowed: false, reason: `Browser session proxy refused plaintext HTTP origin "${origin}".` }
-      }
-      if (method === 'CONNECT') return true
-      return { allowed: false, reason: `Browser session proxy refused unsupported scheme for "${origin}".` }
+    allowedOrigins: [...egressPolicy.allowedOrigins],
+    ...(egressPolicy.scopePolicy ? { scopePolicy: egressPolicy.scopePolicy } : {}),
+    allowConnectPort: (port, hostname) => {
+      if (!Number.isInteger(port) || port < 1 || port > 65_535) return false
+      const normHost = normalizeHostname(hostname)
+      if (!normHost) return false
+      return allowedConnectTargets.has(`${normHost}:${port}`)
     },
+    allowOrigin: (origin, method, url) => evaluateBrowserSessionProxyOrigin(egressPolicy, origin, method, url),
     ...(resolveHost ? { resolveHost } : {}),
     timeoutMs: timeoutMs ?? DEFAULT_REFRESH_TIMEOUT_MS,
     maxResponseBytes: 8 * 1024 * 1024,
   })
+}
+
+/**
+ * Determine whether a cookie's `domain` applies to at least one origin in `allowedOrigins`.
+ * Rejects public suffixes (e.g. `.com`, `.co.uk`, `.github.io`) so broad cookies can never match.
+ */
+export function cookieMatchesAllowedOrigins(
+  cookieDomain: string,
+  allowedOrigins: ReadonlySet<string>,
+): boolean {
+  const cleanCookie = normalizeHostname(cookieDomain.replace(/^\.+/, ''))
+  if (!cleanCookie) return false
+  if (!isIpLiteralHost(cleanCookie) && isPublicSuffixHost(cleanCookie)) return false
+  for (const origin of allowedOrigins) {
+    let originHost: string
+    try {
+      originHost = normalizeHostname(new URL(origin).hostname)
+    } catch {
+      continue
+    }
+    if (!originHost) continue
+    if (isIpLiteralHost(originHost) || isIpLiteralHost(cleanCookie)) {
+      if (originHost === cleanCookie) return true
+    } else if (originHost === cleanCookie || originHost.endsWith(`.${cleanCookie}`)) {
+      return true
+    }
+  }
+  return false
+}
+
+/**
+ * R3-H-3: Strip third-party cookies (and out-of-scope localStorage origins) from `storageState`
+ * before seeding a refresher browser context, unless `allowThirdPartyCookies: true` is opted in.
+ */
+export function filterStorageStateForRefresh(
+  storageState: PlaywrightStorageState,
+  options: {
+    allowedOrigins: ReadonlySet<string>
+    allowThirdPartyCookies?: boolean
+  },
+): {
+  storageState: PlaywrightStorageState
+  droppedCookiesCount: number
+  droppedOriginsCount: number
+} {
+  const { allowedOrigins, allowThirdPartyCookies = false } = options
+  const keptCookies = allowThirdPartyCookies
+    ? [...storageState.cookies]
+    : storageState.cookies.filter(c => cookieMatchesAllowedOrigins(c.domain, allowedOrigins))
+  const keptOrigins = storageState.origins.filter(entry => {
+    const normalized = normalizeScopeOrigin(entry.origin)
+    return Boolean(normalized && allowedOrigins.has(normalized))
+  })
+  return {
+    storageState: {
+      cookies: keptCookies,
+      origins: keptOrigins,
+    },
+    droppedCookiesCount: storageState.cookies.length - keptCookies.length,
+    droppedOriginsCount: storageState.origins.length - keptOrigins.length,
+  }
+}
+
+function normalizePathnameForMatch(pathname: string): string {
+  const trimmed = pathname.trim()
+  if (!trimmed || trimmed === '/') return '/'
+  return trimmed.endsWith('/') ? trimmed.slice(0, -1) : trimmed
+}
+
+/**
+ * R3-H-3: Check whether `verifyPath` on `targetOrigin` matches any path or URL known to have
+ * been modified by the active run (preventing automated JS refresh on stored-XSS / mutated routes).
+ */
+export function isVerifyPathModifiedByRun(
+  verifyPath: string,
+  targetOrigin: string,
+  modifiedPaths?: readonly string[] | ReadonlySet<string>,
+): boolean {
+  if (!modifiedPaths) return false
+  const entries = Array.isArray(modifiedPaths) ? modifiedPaths : [...modifiedPaths]
+  if (entries.length === 0) return false
+  const canonicalVerify = canonicalPathAndQuery(verifyPath) ?? verifyPath
+  const verifyPathname = normalizePathnameForMatch(canonicalVerify.split('?', 1)[0] ?? '/')
+  const normalizedTargetOrigin = normalizeScopeOrigin(targetOrigin)
+
+  for (const rawEntry of entries) {
+    if (typeof rawEntry !== 'string') continue
+    const trimmed = rawEntry.trim()
+    if (!trimmed) continue
+    let candidatePath = trimmed
+    if (/^https?:\/\//i.test(trimmed)) {
+      try {
+        const parsed = new URL(trimmed)
+        const entryOrigin = normalizeScopeOrigin(parsed.origin)
+        if (!entryOrigin || !normalizedTargetOrigin || entryOrigin !== normalizedTargetOrigin) continue
+        candidatePath = `${parsed.pathname}${parsed.search}`
+      } catch {
+        continue
+      }
+    }
+    if (candidatePath.endsWith('/*') || candidatePath.endsWith('/**')) {
+      const prefix = normalizePathnameForMatch(candidatePath.replace(/\/\*+$/, ''))
+      if (prefix === '/' || verifyPathname === prefix || verifyPathname.startsWith(`${prefix}/`)) {
+        return true
+      }
+      continue
+    }
+    const canonicalEntry = canonicalPathAndQuery(candidatePath) ?? candidatePath
+    if (canonicalEntry === canonicalVerify) return true
+    const entryPathname = normalizePathnameForMatch(canonicalEntry.split('?', 1)[0] ?? '/')
+    if (entryPathname === verifyPathname) return true
+  }
+  return false
+}
+
+async function installBrowserSessionContextGuards(
+  context: PlaywrightContextLike,
+  egressPolicy: BrowserSessionEgressPolicy,
+): Promise<void> {
+  await context.addInitScript?.(WEBRTC_GUARD_SCRIPT)
+  if (typeof context.route === 'function') {
+    await context.route('**/*', async route => {
+      const req = route.request()
+      const rawUrl = req.url()
+      if (rawUrl.startsWith('about:')) {
+        await route.continue()
+        return
+      }
+      let parsed: URL
+      try {
+        parsed = new URL(rawUrl)
+      } catch {
+        await route.abort('blockedbyclient')
+        return
+      }
+      const verdict = evaluateBrowserSessionProxyOrigin(egressPolicy, parsed.origin, req.method(), parsed)
+      if (!verdict.allowed) {
+        await route.abort('blockedbyclient')
+        return
+      }
+      await route.continue()
+    })
+  }
+  if (typeof context.routeWebSocket === 'function') {
+    await context.routeWebSocket('**/*', async ws => {
+      let parsed: URL
+      try {
+        parsed = new URL(ws.url())
+      } catch {
+        await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter browser session scope.' })
+        return
+      }
+      if (parsed.protocol !== 'wss:' && !(egressPolicy.allowLocalLab && parsed.protocol === 'ws:')) {
+        await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter browser session scope.' })
+        return
+      }
+      const httpEquiv = new URL(parsed.toString().replace(/^wss:/i, 'https:').replace(/^ws:/i, 'http:'))
+      const verdict = evaluateBrowserSessionProxyOrigin(egressPolicy, httpEquiv.origin, 'GET', httpEquiv)
+      if (!verdict.allowed || typeof ws.connectToServer !== 'function') {
+        await ws.close({ code: 1008, reason: 'Blocked by Kovo Hunter browser session scope.' })
+        return
+      }
+      await ws.connectToServer()
+    })
+  } else {
+    // Fail closed when Playwright lacks routeWebSocket: disable WebSocket constructors in-page.
+    await context.addInitScript?.(SOCKET_DENY_SCRIPT)
+  }
 }
 
 function createTargetRequestObserver(
@@ -478,10 +910,14 @@ export async function startInteractiveLoginCapture(
   const createdAt = Date.now()
   const expiresAt = createdAt + ttlMs
 
-  const observedOrigins = new Set<string>([targetUrl.origin])
-  for (const entry of options.allowedOrigins ?? []) {
-    try { observedOrigins.add(new URL(entry).origin) } catch { /* ignore */ }
-  }
+  const egressPolicy = resolveBrowserSessionEgressPolicy({
+    targetUrl,
+    allowLocalLab,
+    allowedOrigins: options.allowedOrigins,
+    idpOrigins: options.idpOrigins,
+    scopePolicy: options.scopePolicy,
+  })
+  const observedOrigins = new Set<string>(egressPolicy.personaOrigins)
   const { observedHeaders, onRequest } = createTargetRequestObserver(observedOrigins, targetUrl.origin)
 
   let proxy: EgressLoopbackProxy | undefined
@@ -495,18 +931,19 @@ export async function startInteractiveLoginCapture(
     proxy = await createBrowserSessionProxy({
       targetUrl,
       allowLocalLab,
-      allowedOrigins: options.allowedOrigins,
+      egressPolicy,
       resolveHost: options.resolveHost,
     })
-    browser = await launch({ args: browserSessionChromiumArgs() })
+    browser = await launch(buildBrowserSessionChromiumLaunchOptions())
     context = await browser.newContext({
       viewport,
       ignoreHTTPSErrors: false,
       javaScriptEnabled: true,
       bypassCSP: false,
+      serviceWorkers: 'block',
       proxy: proxy.proxyConfig,
     })
-    await context.addInitScript?.(WEBRTC_GUARD_SCRIPT)
+    await installBrowserSessionContextGuards(context, egressPolicy)
     page = await context.newPage()
     page.on?.('request', onRequest)
   } catch (err) {
@@ -717,6 +1154,10 @@ export async function startInteractiveLoginCapture(
         throw new Error('Plaintext HTTP navigation is blocked outside local-lab mode.')
       }
       assertAllowedBrowserHost(parsed.hostname, allowLocalLab, 'Navigation URL')
+      const verdict = evaluateBrowserSessionProxyOrigin(egressPolicy, parsed.origin, 'GET', parsed)
+      if (!verdict.allowed) {
+        throw new Error(verdict.reason)
+      }
       await page!.goto(parsed.toString(), { waitUntil: 'domcontentloaded', timeout: 15_000 })
       lastKnownUrl = page!.url() || parsed.toString()
       emit({ type: 'url', url: lastKnownUrl })
@@ -1154,6 +1595,12 @@ export async function refreshBrowserSession(
   const allowLocalLab = Boolean(options.allowLocalLab)
   const targetUrl = normalizeTargetOrigin(options.targetOrigin, allowLocalLab)
   const verifyPath = normalizeVerifyPath(options.verifyPath)
+  if (options.verifyPathModifiedByRun || isVerifyPathModifiedByRun(verifyPath, targetUrl.origin, options.modifiedPaths)) {
+    throw new BrowserSessionRefreshBlockedError(
+      `Refusing automated browser session refresh on "${verifyPath}": path was modified by the active run.`,
+    )
+  }
+
   const visitUrl = `${targetUrl.origin}${verifyPath}`
   const settleMs = Math.max(200, Math.min(10_000, Math.floor(options.settleMs ?? DEFAULT_REFRESH_SETTLE_MS)))
   const timeoutMs = Math.max(2_000, Math.min(60_000, Math.floor(options.timeoutMs ?? DEFAULT_REFRESH_TIMEOUT_MS)))
@@ -1161,8 +1608,21 @@ export async function refreshBrowserSession(
     ? [...new Set(options.originAllowlist)]
     : [targetUrl.origin]
 
+  const egressPolicy = resolveBrowserSessionEgressPolicy({
+    targetUrl,
+    allowLocalLab,
+    allowedOrigins: originAllowlist,
+    idpOrigins: options.idpOrigins,
+    scopePolicy: options.scopePolicy,
+  })
   const inputStorageState = normalizePlaywrightStorageState(options.storageState)
-  const observedOrigins = new Set<string>([targetUrl.origin, ...originAllowlist])
+  const { storageState: filteredInputStorageState } = filterStorageStateForRefresh(inputStorageState, {
+    allowedOrigins: egressPolicy.allowedOrigins,
+    allowThirdPartyCookies: options.allowThirdPartyCookies,
+  })
+  // H-8 credential isolation: observe and extract target auth headers strictly on persona origins
+  // (never on external IdP origins).
+  const observedOrigins = new Set<string>(egressPolicy.personaOrigins)
   const { observedHeaders, onRequest } = createTargetRequestObserver(observedOrigins, targetUrl.origin)
 
   let proxy: EgressLoopbackProxy | undefined
@@ -1183,19 +1643,20 @@ export async function refreshBrowserSession(
     proxy = await createBrowserSessionProxy({
       targetUrl,
       allowLocalLab,
-      allowedOrigins: originAllowlist,
+      egressPolicy,
       resolveHost: options.resolveHost,
       timeoutMs,
     })
-    browser = await launch({ args: browserSessionChromiumArgs() })
+    browser = await launch(buildBrowserSessionChromiumLaunchOptions())
     context = await browser.newContext({
-      storageState: inputStorageState,
+      storageState: filteredInputStorageState,
       ignoreHTTPSErrors: false,
       javaScriptEnabled: true,
       bypassCSP: false,
+      serviceWorkers: 'block',
       proxy: proxy.proxyConfig,
     })
-    await context.addInitScript?.(WEBRTC_GUARD_SCRIPT)
+    await installBrowserSessionContextGuards(context, egressPolicy)
     page = await context.newPage()
     page.on?.('request', onRequest)
 
@@ -1210,7 +1671,11 @@ export async function refreshBrowserSession(
     if (options.signal?.aborted) throw new Error('Browser session refresh aborted.')
 
     const rawFreshState = await context.storageState()
-    const freshStorageState = normalizePlaywrightStorageState(rawFreshState)
+    const normalizedFreshState = normalizePlaywrightStorageState(rawFreshState)
+    const { storageState: freshStorageState } = filterStorageStateForRefresh(normalizedFreshState, {
+      allowedOrigins: egressPolicy.allowedOrigins,
+      allowThirdPartyCookies: options.allowThirdPartyCookies,
+    })
 
     // Merge newly observed headers over prior headers (fresh wins).
     const mergedHeaders: Record<string, string> = {
@@ -1238,7 +1703,7 @@ export async function refreshBrowserSession(
 
     // Collect old + new cookie values for scrubbing after rotation.
     const priorSecrets = inputStorageState.cookies.map(c => c.value).filter(v => v.length >= 4)
-    const session = buildSessionFromBrowserBundle(updatedBundle, originAllowlist, priorSecrets)
+    const session = buildSessionFromBrowserBundle(updatedBundle, [...egressPolicy.personaOrigins], priorSecrets)
 
     if (options.persistBundlePath) {
       writeBrowserSessionCredentialFile(options.persistBundlePath, updatedBundle)
