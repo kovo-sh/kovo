@@ -2193,7 +2193,7 @@ export class VerifyRpcServer {
   /** Host-side verification of a CompositeProofReceipt against this session's signed transcript & capability vault. */
   verifyComposite(rawReceipt: unknown, options?: Omit<CompositeVerifyOptions, 'signingKey'>): CompositeReceiptVerification {
     const factLog = HostFactLog.fromTranscript(this.buildHostSignedTranscript())
-    const personaRoleLabels = this.options.grant.personas?.size
+    const personaRoleLabels = this.options.grant?.personas?.size
       ? Object.fromEntries([...this.options.grant.personas.entries()].filter(([, p]) => Boolean(p.roleLabel)).map(([h, p]) => [h, p.roleLabel]))
       : undefined
     const res = defaultTerminalOracleRegistry.evaluate(

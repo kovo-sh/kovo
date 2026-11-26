@@ -1552,6 +1552,7 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
 
   let roleDifferential = false
   let escalationReason = ''
+  let prePersistence: PersistenceProof | null = null
   if (requiredRank !== null && probeRank !== null) {
     roleDifferential = probeRank < requiredRank
     escalationReason = roleDifferential
@@ -1572,6 +1573,28 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
       escalationReason = roleDifferential
         ? `probe role ${probe.actor.role} is below the denied control role ${sameTenantDenial?.actor.role}`
         : `probe role ${probe.actor.role} is not below the control role ${sameTenantDenial?.actor.role}`
+    }
+    // Host-derived self-promotion BFLA (R2-H-6): when worker-supplied requiredRole is absent,
+    // derive roleDifferential strictly from a host-recorded before/after GET readback diff showing
+    // a protected role field escalated strictly above both beforeRole and probeRank.
+    if (!roleDifferential && vertical && mutatingProbe && probeRank !== null) {
+      prePersistence = findPersistence(steps, mutatingProbe)
+      if (prePersistence.persisted && prePersistence.before?.json !== undefined && prePersistence.after?.json !== undefined && prePersistence.delta) {
+        const beforeFields = flattenJson(prePersistence.before.json)
+        const afterFields = flattenJson(prePersistence.after.json)
+        for (const field of prePersistence.delta.changed) {
+          if (!isProtectedField(field) || !/(?:^|_)roles?$/.test(normalizeFieldLeaf(field))) continue
+          const beforeRole = beforeFields.get(field)
+          const afterRole = afterFields.get(field)
+          const beforeRank = roleRank(beforeRole)
+          const afterRank = roleRank(afterRole)
+          if (beforeRank !== null && afterRank !== null && afterRank > beforeRank && afterRank > probeRank) {
+            roleDifferential = true
+            escalationReason = `host-recorded readback diff shows protected role field ${field} escalated from ${beforeRole} to ${afterRole} (above probe role ${probe.actor.role})`
+            break
+          }
+        }
+      }
     }
   }
   base.roleDifferential = roleDifferential
@@ -1605,7 +1628,7 @@ export function assessAuthorizationImpact(input: ImpactInput): AuthorizationAsse
         }
       }
     }
-    const persistence = findPersistence(steps, mutatingProbe)
+    const persistence = prePersistence ?? findPersistence(steps, mutatingProbe)
     base.persisted = persistence.persisted
     base.changedFields = persistence.delta ? [...persistence.delta.changed, ...persistence.delta.added, ...persistence.delta.removed] : []
     if (!persistence.persisted) {
@@ -5678,8 +5701,10 @@ export function classifyBoundaryClaim(parts: BoundaryDescriptor): BoundaryClass 
       if (/^(?:bola|bfla|idor|cross_tenant|cross_tenant_read|cross_tenant_write|authorization|access_control|privilege_escalation|graphql_bola)$/.test(vulnClass)) return 'access'
     }
     if (hasTypedCwe) {
+      if (AUTH_BOUNDARY_CWE_RE.test(cwe)) {
+        return MFA_CLAIM_RE.test(`${category} ${parts.title ?? ''}`) ? 'mfa' : 'auth'
+      }
       if (MFA_CLAIM_RE.test(category)) return 'mfa'
-      if (AUTH_BOUNDARY_CWE_RE.test(cwe)) return 'auth'
       if (ACCESS_BOUNDARY_CWE_RE.test(cwe)) return 'access'
     }
     return 'other'
