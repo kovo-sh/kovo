@@ -1,10 +1,11 @@
 import type { projectData } from '../../actions.ts'
 import type { PersonaLoginAdapter, PublicPersona } from '../../domain.ts'
 
-export type ProjectTabId = 'overview' | 'inventory' | 'personas' | 'sources' | 'guardrails'
+export type ProjectTabId = 'overview' | 'runs' | 'inventory' | 'personas' | 'sources' | 'guardrails'
 
 export const PROJECT_TABS: readonly { id: ProjectTabId; label: string }[] = [
-  { id: 'overview', label: 'Overview & Runs' },
+  { id: 'overview', label: 'Overview' },
+  { id: 'runs', label: 'Runs' },
   { id: 'inventory', label: 'Inventory' },
   { id: 'personas', label: 'Test Accounts' },
   { id: 'sources', label: 'Source & Specs' },

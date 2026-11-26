@@ -32,7 +32,7 @@ const railItemVariants = cva(
   {
     variants: {
       kind: {
-        nav: 'h-7',
+        nav: 'h-[30px] py-1',
         run: 'h-auto items-start py-1.5 font-normal',
       },
       active: {
@@ -285,10 +285,10 @@ export function AppShell({ data, children }: { data: ShellWorkspaceData; childre
         </button>
 
         <div className="flex-1 overflow-auto px-2 pb-2">
-          <div className="flex items-center justify-between px-2 pb-1 pt-1.5 text-[11.5px] font-medium tracking-[0.01em] text-fg-subtle">
+          <div className="flex items-center justify-between px-2 pb-1 pt-2.5 text-[11.5px] font-medium tracking-[0.01em] text-fg-subtle">
             <span>Workspace</span>
           </div>
-          <nav aria-label="Workspace">
+          <nav className="flex flex-col gap-px" aria-label="Workspace">
             <Link
               to="/"
               className={railItemVariants({ active: isProjectsActive })}
@@ -312,7 +312,7 @@ export function AppShell({ data, children }: { data: ShellWorkspaceData; childre
             </Link>
           </nav>
 
-          <div className="flex items-center justify-between px-2 pb-1 pt-3.5 text-[11.5px] font-medium tracking-[0.01em] text-fg-subtle">
+          <div className="flex items-center justify-between px-2 pb-1 pt-2.5 text-[11.5px] font-medium tracking-[0.01em] text-fg-subtle">
             <span>Recent runs</span>
             <span className="font-normal tabular-nums">{data.recentRuns.length || ''}</span>
           </div>
