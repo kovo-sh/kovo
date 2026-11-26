@@ -78,7 +78,13 @@ import {
 } from './exec-exchange.ts'
 import { DETERMINISTIC_PARAM_HINT_RE } from './exec-floor-lane.ts'
 import type { ExecReconPlanner } from './exec-recon-planner.ts'
-import { guardConfirmedFindingMutation, type ExecVerifier } from './exec-verify.ts'
+import {
+  STATIC_AST_LIVE_TARGET_REJECT_MESSAGE,
+  guardConfirmedFindingMutation,
+  isLiveRuntimeVerificationRun,
+  type ExecVerifier,
+  type InlineDeferredFindingCandidate,
+} from './exec-verify.ts'
 import { resolveProfilePoolForRole, type ResolvedModelProfile } from './model-settings.ts'
 import type { PersonaAuthManager, PersonaSessionClone } from './persona-auth.ts'
 import { crawlStateGraph } from './phase0-recon.ts'
@@ -839,9 +845,14 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
         const stagedPath = await session.stage(filename.replace('{id}', ev.id.slice(0, 8)), serialized, signal).catch(() => null)
         return { evidenceId: ev.id, stagedPath }
       }
-      const verifyInline = (spec: DeclarativeReplaySpec, findingId?: string, replaySpecId?: string) =>
+      const verifyInline = (
+        spec: DeclarativeReplaySpec,
+        findingId?: string,
+        replaySpecId?: string,
+        deferredCandidate?: InlineDeferredFindingCandidate,
+      ) =>
         this.host.executeInlineVerification({
-          job, grant, currentSecrets, reposDir, spec, findingId, replaySpecId, onExchangeObserved: trackPersonaResources,
+          job, grant, currentSecrets, reposDir, spec, findingId, replaySpecId, deferredCandidate, onExchangeObserved: trackPersonaResources,
         })
       const makeTrackedExchangeRecorder = (curRun: Run) =>
         createExchangeRecorder(this.storage, () => curRun, job.assignment.id, currentSecrets, {
@@ -1209,6 +1220,60 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
             throw new BrokerDenied('Replay spec references an origin outside current approved scope.')
           }
           const isStaticAst = parsed.kind === 'static_ast_proof'
+          const isLiveRuntimeRun = isLiveRuntimeVerificationRun(
+            curRun,
+            this.host.verifier.backendSupportsVerifyScript(),
+          )
+          if (isStaticAst && isLiveRuntimeRun) {
+            // On live-target runs with runtime verification available, static AST pattern matches
+            // cannot distinguish hardened/decoy controls from runtime-exploitable defects. Keep the
+            // observation strictly as a quarantined `code_audit_suspect` fact (never a findings or
+            // replay_specs row) and direct the worker to prove exploitability with `kovo_verify`.
+            const suspectOrigin = currentApproved.has(parsed.origin)
+              ? parsed.origin
+              : [...currentApproved][0] ?? parsed.origin
+            const locKey = `${parsed.repo}/${parsed.file}:${parsed.startLine}`
+            let recordedFactId: string | undefined
+            try {
+              const existingSuspect = this.storage
+                .listFacts(curRun.id, { includeTainted: false, kind: 'code_audit_suspect', limit: 200 })
+                .find(f =>
+                  f.data?.repo === parsed.repo
+                  && f.data?.file === parsed.file
+                  && f.data?.startLine === parsed.startLine
+                  && f.data?.demotedFrom === 'static_ast_proof',
+                )
+              if (existingSuspect) {
+                recordedFactId = existingSuspect.id
+              } else {
+                const fact = this.storage.addFact(curRun, job.assignment, {
+                  kind: 'code_audit_suspect',
+                  origin: suspectOrigin,
+                  summary: `[static_ast suspect] ${parsed.title} (${locKey}-${parsed.endLine})`.slice(0, 320),
+                  data: {
+                    subkind: 'code_audit_suspect',
+                    demotedFrom: 'static_ast_proof',
+                    repo: parsed.repo,
+                    file: parsed.file,
+                    startLine: parsed.startLine,
+                    endLine: parsed.endLine,
+                    cwe: parsed.cwe,
+                    category: parsed.category,
+                    engine: parsed.engine,
+                    ruleOrPattern: parsed.ruleOrPattern,
+                    ...(parsed.sourceToSinkTrace ? { sourceToSinkTrace: parsed.sourceToSinkTrace } : {}),
+                  },
+                  sourceOrigins: [...specOrigins.filter(o => currentApproved.has(o))],
+                  secrets: currentSecrets(),
+                })
+                recordedFactId = fact.id
+                boardTools.noteEvidence()
+                this.host.schedulePlanner(curRun.id)
+              }
+            } catch { /* best-effort fact capture */ }
+            const factNote = recordedFactId ? ` Recorded static observation as code_audit_suspect fact ${recordedFactId}.` : ''
+            throw new Error(`${STATIC_AST_LIVE_TARGET_REJECT_MESSAGE}${factNote}`)
+          }
           const asset = curRun.candidates.find(c => c.origin === parsed.origin && curRun.approved.includes(c.id))
             ?? (isStaticAst ? curRun.candidates.find(c => curRun.approved.includes(c.id)) : undefined)
           if (!asset) throw new BrokerDenied(`Primary finding origin ${parsed.origin} is not in approved scope.`)
@@ -1368,6 +1433,57 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
 
           const findingId = canonicalMatchedRow?.id ?? randomUUID()
           const verifyNow = args.verifyNow ?? true
+          const chainTags = step.skills.filter(skill => skill.startsWith('chain:')).map(skill => skill.slice('chain:'.length))
+
+          if (isLiveRuntimeRun && !canonicalMatchedRow) {
+            // Live-target verify-before-persist: never write an unverified `pending` / `inconclusive`
+            // row into `findings` before inline verification confirms runtime exploitability.
+            const deferredFinding = buildChainFindingBase(parsed, findingId, 'pending-inline', curRun.scopeRevision, {
+              status: 'pending',
+              confidence: 'medium',
+              verification: `Pending Zero-LLM ${parsed.kind} inline replay verification.${chainTags.length ? ` Chain primitives: ${chainTags.join(', ')}.` : ''}`,
+              fingerprintHash: dedupeDecision.fingerprintHash,
+              counterevidence: ext.counterevidence ?? null,
+              confidenceRationale: ext.confidenceRationale ?? null,
+              severityChangeConditions: ext.severityChangeConditions ?? null,
+              ...(codeLocations?.length ? { codeLocations } : {}),
+              chainFactIds: validFactIds,
+              exchangeIds: [...new Set(exchangeIds)],
+              evidenceIds: [],
+            })
+            const inline = await verifyInline(parsed, findingId, undefined, {
+              assetId: asset.id,
+              finding: deferredFinding,
+              sourceOrigins: [...sourceOrigins],
+              validFactIds,
+            })
+            if (inline.status === 'confirmed' && inline.findingId) {
+              confirmedDuringAssignment = true
+              boardTools.noteEvidence()
+              this.host.schedulePlanner(curRun.id)
+              return {
+                findingId: inline.findingId,
+                replaySpecId: inline.replaySpecId,
+                status: inline.status,
+                verificationTier: inline.verificationTier,
+                inlineVerifyFeedback: inline.feedback,
+                deduplicated: false,
+                upgraded: false,
+                note: `Inline Zero-LLM verification succeeded (${inline.status}).`,
+              }
+            }
+            return {
+              findingId: null,
+              replaySpecId: inline.replaySpecId,
+              status: inline.status,
+              persisted: false,
+              inlineVerifyFeedback: inline.feedback,
+              deduplicated: false,
+              upgraded: false,
+              note: `Inline Zero-LLM verification returned ${inline.status}; no unverified finding was persisted. Prove runtime exploitability via kovo_verify or repair the proof (${inline.feedback.retriesRemaining} retries remaining).`,
+            }
+          }
+
           const specRow = this.storage.createReplaySpec(
             curRun,
             job.assignment,
@@ -1381,7 +1497,6 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
             `Proposed replay spec · ${parsed.title}`,
             JSON.stringify({ replaySpecId: specRow.id, specSha256: specRow.specSha256, spec: parsed }, null, 2),
             undefined, currentSecrets())
-          const chainTags = step.skills.filter(skill => skill.startsWith('chain:')).map(skill => skill.slice('chain:'.length))
           const finding = buildChainFindingBase(parsed, findingId, specRow.id, curRun.scopeRevision, {
             status: 'pending',
             confidence: 'medium',
@@ -1471,8 +1586,15 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
             }
           }
 
+          const isLiveRuntimeRun = isLiveRuntimeVerificationRun(
+            curRun,
+            this.host.verifier.backendSupportsVerifyScript(),
+          )
           if (args.replaySpec) {
             const parsed = declarativeReplaySpecSchema.parse(stripUntrustedReplayEnvelopes(args.replaySpec))
+            if (parsed.kind === 'static_ast_proof' && isLiveRuntimeRun) {
+              throw new Error(STATIC_AST_LIVE_TARGET_REJECT_MESSAGE)
+            }
             const specOrigins = replaySpecOrigins(parsed)
             if (specOrigins.some(o => !currentApproved.has(o))) {
               throw new BrokerDenied('Updated replay spec references an origin outside current approved scope.')
@@ -1529,7 +1651,7 @@ export class ExecWorkerRunner extends ExecServiceModule<ExecWorkerHost> {
             },
           })
 
-          const shouldVerifyNow = Boolean(parsedUpdatedSpec && (args.verifyNow ?? true) && !isAlreadyVerified)
+          const shouldVerifyNow = Boolean(parsedUpdatedSpec && (isLiveRuntimeRun || (args.verifyNow ?? true)) && !isAlreadyVerified)
           if (shouldVerifyNow && parsedUpdatedSpec) {
             const inline = await verifyInline(parsedUpdatedSpec, existingRow.id, createdSpecRowId ?? nextReplaySpecId)
             if (inline.status === 'confirmed' || inline.status === 'static_verified') {
