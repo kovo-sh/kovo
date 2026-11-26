@@ -1,550 +1,1588 @@
 {
-  "maxQuarantined": 91,
+  "version": 2,
+  "maxQuarantinedCases": 198,
   "entries": [
     {
       "file": "tests/arch-a1-engine.test.ts",
-      "owner": "arch-triage",
-      "reason": "Pre-existing failure on main (1/3 failed): A1.3: runV8AgentScriptProof is collapsed into unified runAgentScriptProof (zero monkey-patch) and retestPersistedAgentSc",
+      "testName": "A1.3: runV8AgentScriptProof is collapsed into unified runAgentScriptProof (zero monkey-patch) and retestPersistedAgentScript handles v8 CompositeProofReceipt",
+      "assertionLocation": "tests/arch-a1-engine.test.ts:463:1",
+      "ownerStream": "arch-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/arch-b3-cascade.test.ts",
-      "owner": "arch-triage",
-      "reason": "Pre-existing failure on main (1/7 failed): schema authority: zero DDL drift across all 41 schema.ts tables, FKs, ON DELETE CASCADE, indexes, and append-only tenant",
-      "expires": "2026-12-26"
+      "testName": "schema authority: zero DDL drift across all 41 schema.ts tables, FKs, ON DELETE CASCADE, indexes, and append-only tenant_audit_log",
+      "assertionLocation": "tests/arch-b3-cascade.test.ts:526:1",
+      "ownerStream": "r2-12-schema-auth",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
     },
     {
       "file": "tests/arch-c1-verify-kernel.test.ts",
-      "owner": "arch-triage",
-      "reason": "Pre-existing failure on main (1/5 failed): C1.4: runAgentSession omits verify_replay_spec from LLM request tool definitions when kovo_verify is active",
+      "testName": "C1.1: agent-session.ts is decomposed below 4,000 LOC (and <= 4,200 LOC ceiling) with agent-prompts.ts owning prompt builders",
+      "assertionLocation": "tests/arch-c1-verify-kernel.test.ts:42:1",
+      "ownerStream": "triage-kernel-arch-c1-verify-kernel",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
+    },
+    {
+      "file": "tests/arch-c1-verify-kernel.test.ts",
+      "testName": "C1.4: runAgentSession omits verify_replay_spec from LLM request tool definitions when kovo_verify is active",
+      "assertionLocation": "tests/arch-c1-verify-kernel.test.ts:240:1",
+      "ownerStream": "triage-kernel-arch-c1-verify-kernel",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
+    },
+    {
+      "file": "tests/arch-c2-thin-sdk.test.ts",
+      "testName": "every prove_* helper verdict matches the host transcript oracle on vulnerable and hardened fixtures",
+      "assertionLocation": "tests/arch-c2-thin-sdk.test.ts:173:1",
+      "ownerStream": "arch-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/arch-c2-thin-sdk.test.ts",
-      "owner": "arch-triage",
-      "reason": "Pre-existing failure on main (2/4 failed): every prove_* helper verdict matches the host transcript oracle on vulnerable and hardened fixtures",
+      "testName": "TS SDK prove_access_boundary / prove_persisted_mutation / prove_boolean_or_timing_diff / prove_race_burst confirm through verifyScript()",
+      "assertionLocation": "tests/arch-c2-thin-sdk.test.ts:250:1",
+      "ownerStream": "arch-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/arch-c3-store-repos.test.ts",
-      "owner": "arch-triage",
-      "reason": "Pre-existing failure on main (1/4 failed): arch-c3 store export parity: store.ts preserves 100% of public runtime exports and identity",
+      "testName": "arch-c3 store export parity: store.ts preserves 100% of public runtime exports and identity",
+      "assertionLocation": "tests/arch-c3-store-repos.test.ts:80:1",
+      "ownerStream": "arch-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/arch-egress-sanitizer.test.ts",
-      "owner": "arch-triage",
-      "reason": "Pre-existing failure on main (1/5 failed): C-3: capability.seal rejects 1-char/short regex & value oracles, enforces per-exchange rate limit, and hides sha256/sha2",
+      "testName": "C-3: capability.seal rejects 1-char/short regex & value oracles, enforces per-exchange rate limit, and hides sha256/sha256Prefix",
+      "assertionLocation": "tests/arch-egress-sanitizer.test.ts:88:1",
+      "ownerStream": "arch-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/arch-p1-acyclic-store.test.ts",
-      "owner": "arch-triage",
-      "reason": "Pre-existing failure on main (1/4 failed): arch-p1 leaf module isolation: finding-fingerprint.ts and approval-pattern.ts have zero local runtime deps",
+      "testName": "arch-p1 leaf module isolation: finding-fingerprint.ts and approval-pattern.ts have zero local runtime deps",
+      "assertionLocation": "tests/arch-p1-acyclic-store.test.ts:151:1",
+      "ownerStream": "arch-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/audit-proof-a.test.ts",
-      "owner": "cq-4-parity-corpus",
-      "reason": "Pre-existing failure on main (2/13 failed): C-2: explicit oracleFamily requires oracleInput and dual_tenant_abac rejects one-hop and bare-401 chains",
+      "testName": "C-2: explicit oracleFamily requires oracleInput and dual_tenant_abac rejects one-hop and bare-401 chains",
+      "assertionLocation": "tests/audit-proof-a.test.ts:222:1",
+      "ownerStream": "cq-4-parity-corpus",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/audit-proof-a.test.ts",
+      "testName": "H-6: setup/cleanup capabilities cannot launders DAG provenance and async_job requires a real probe observation",
+      "assertionLocation": "tests/audit-proof-a.test.ts:465:1",
+      "ownerStream": "cq-4-parity-corpus",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/floor-regress.test.ts",
-      "owner": "cq-4-parity-corpus",
-      "reason": "Pre-existing failure on main (1/12 failed): floor: the discriminating baseline confirms on the concatenating twin via wired floor recipe",
+      "testName": "floor: the discriminating baseline confirms on the concatenating twin via wired floor recipe",
+      "assertionLocation": "tests/floor-regress.test.ts:398:1",
+      "ownerStream": "cq-4-parity-corpus",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/gb-planner-wiring.test.ts",
-      "owner": "cq-6-agent-contract",
-      "reason": "Pre-existing failure on main (1/4 failed): ExecWorkerRunner triggers hop-continuation on non-confirmed complete_intent and max_turns exits with sealed handles, and",
+      "testName": "ExecWorkerRunner triggers hop-continuation on non-confirmed complete_intent and max_turns exits with sealed handles, and dedup blocks identical handle-set loops",
+      "assertionLocation": "tests/gb-planner-wiring.test.ts:637:1",
+      "ownerStream": "cq-6-agent-contract",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/movea-retest-norm.test.ts",
-      "owner": "cq-4-parity-corpus",
-      "reason": "Pre-existing failure on main (1/8 failed): H-5: verifyReplaySpec and retestReplaySpec default-deny recipe and agentScript envelopes when envelopeTrust is omitted",
+      "testName": "H-5: verifyReplaySpec and retestReplaySpec default-deny recipe and agentScript envelopes when envelopeTrust is omitted",
+      "assertionLocation": "tests/movea-retest-norm.test.ts:399:1",
+      "ownerStream": "cq-4-parity-corpus",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/provider-stream.test.ts",
-      "owner": "sys-q1-worker-pool",
-      "reason": "Pre-existing failure on main (3/9 failed): keeps split responses API keys and persona secrets out of recorded turns and Pi Durable sessions",
+      "testName": "keeps split messages API keys and persona secrets out of recorded turns and Pi Durable sessions",
+      "assertionLocation": "tests/provider-stream.test.ts:176:3",
+      "ownerStream": "sys-q1-worker-pool",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
+    },
+    {
+      "file": "tests/provider-stream.test.ts",
+      "testName": "keeps split responses API keys and persona secrets out of recorded turns and Pi Durable sessions",
+      "assertionLocation": "tests/provider-stream.test.ts:176:3",
+      "ownerStream": "sys-q1-worker-pool",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
+    },
+    {
+      "file": "tests/provider-stream.test.ts",
+      "testName": "multi-profile LLM failover pool handles 429->402 quota circuit breaking, context filtering, and safe-window failover",
+      "assertionLocation": "tests/provider-stream.test.ts:275:1",
+      "ownerStream": "sys-q1-worker-pool",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
+    },
+    {
+      "file": "tests/specs-recall.test.ts",
+      "testName": "credential inventory: the unentitled full secret confirms against the masked control",
+      "assertionLocation": "tests/specs-recall.test.ts:407:1",
+      "ownerStream": "cq-4-parity-corpus",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/specs-recall.test.ts",
-      "owner": "cq-4-parity-corpus",
-      "reason": "Pre-existing failure on main (1/10 failed): credential inventory: the unentitled full secret confirms against the masked control",
+      "testName": "privileged delete: the reserved live victim is removed and the bogus delete stays a no-op",
+      "assertionLocation": "tests/specs-recall.test.ts:604:1",
+      "ownerStream": "cq-4-parity-corpus",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/t1-provider-stream.test.ts",
-      "owner": "sys-q1-worker-pool",
-      "reason": "Pre-existing failure on main (5/7 failed): H-25: End-to-end provider() round-trip delivers unmodified check_canary token and kovo_verify script to pi-ai",
+      "testName": "H-25: End-to-end provider() round-trip delivers unmodified check_canary token and kovo_verify script to pi-ai",
+      "assertionLocation": "tests/t1-provider-stream.test.ts:239:1",
+      "ownerStream": "sys-q1-worker-pool",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
+    },
+    {
+      "file": "tests/t1-provider-stream.test.ts",
+      "testName": "H-26: Active stream that stalls after chunk 1 is still aborted by idleTimeoutMs, and timeout errors classify as transient failover",
+      "assertionLocation": "tests/t1-provider-stream.test.ts:462:1",
+      "ownerStream": "sys-q1-worker-pool",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
+    },
+    {
+      "file": "tests/t1-provider-stream.test.ts",
+      "testName": "H-26: Server hanging before response headers aborts cleanly at firstEventTimeoutMs",
+      "assertionLocation": "tests/t1-provider-stream.test.ts:425:1",
+      "ownerStream": "sys-q1-worker-pool",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
+    },
+    {
+      "file": "tests/t1-provider-stream.test.ts",
+      "testName": "H-26: SSE server sending headers + ZERO bytes past firstEventTimeoutMs aborts cleanly",
+      "assertionLocation": "tests/t1-provider-stream.test.ts:386:1",
+      "ownerStream": "sys-q1-worker-pool",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
+    },
+    {
+      "file": "tests/t1-provider-stream.test.ts",
+      "testName": "H-26: SSE stream sending chunk 1 immediately and chunk 2 AFTER firstEventTimeoutMs completes cleanly",
+      "assertionLocation": "tests/t1-provider-stream.test.ts:305:1",
+      "ownerStream": "sys-q1-worker-pool",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
+    },
+    {
+      "file": "tests/t2-composite-hydrate.test.ts",
+      "testName": "C-4: hydrateV8OracleInput strips forged model operands/booleans and cannot spoof any v8 oracle family",
+      "assertionLocation": "tests/t2-composite-hydrate.test.ts:74:1",
+      "ownerStream": "cq-4-parity-corpus",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/t2-composite-hydrate.test.ts",
-      "owner": "cq-4-parity-corpus",
-      "reason": "Pre-existing failure on main (2/6 failed): C-4: hydrateV8OracleInput strips forged model operands/booleans and cannot spoof any v8 oracle family",
+      "testName": "H-11: I6 rejects pre-seeded admin/owner personas when attackerPersonas omitted and blocks control-arm capability smuggling",
+      "assertionLocation": "tests/t2-composite-hydrate.test.ts:404:1",
+      "ownerStream": "cq-4-parity-corpus",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/t2-composite-hydrate.test.ts",
+      "testName": "H-12: composite receipt without oracleFamily CANNOT confirm on a bare 2xx or a 404 for a nonexistent entity",
+      "assertionLocation": "tests/t2-composite-hydrate.test.ts:493:1",
+      "ownerStream": "cq-4-parity-corpus",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/t2-oracle-invariants.test.ts",
-      "owner": "cq-4-parity-corpus",
-      "reason": "Pre-existing failure on main (3/16 failed): C-6: host-recorded denial or entitled cross-tenant read supplies the boundary",
-      "expires": "2026-12-26"
+      "testName": "C-6: host-recorded denial or entitled cross-tenant read supplies the boundary",
+      "assertionLocation": "tests/t2-oracle-invariants.test.ts:70:1",
+      "ownerStream": "triage-kernel-t2-oracle-invariants",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
+    },
+    {
+      "file": "tests/t2-oracle-invariants.test.ts",
+      "testName": "C-7: arbitrary two-value and same-truth differences do not confirm",
+      "assertionLocation": "tests/t2-oracle-invariants.test.ts:133:1",
+      "ownerStream": "triage-kernel-t2-oracle-invariants",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
+    },
+    {
+      "file": "tests/t2-oracle-invariants.test.ts",
+      "testName": "C-7: opposite literal predicates with a stable structural delta confirm",
+      "assertionLocation": "tests/t2-oracle-invariants.test.ts:125:1",
+      "ownerStream": "triage-kernel-t2-oracle-invariants",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
+    },
+    {
+      "file": "tests/t2-oracle-invariants.test.ts",
+      "testName": "C-7: the third status arm must be the false predicate counterpart",
+      "assertionLocation": "tests/t2-oracle-invariants.test.ts:143:1",
+      "ownerStream": "triage-kernel-t2-oracle-invariants",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
     },
     {
       "file": "tests/t2-receipt-kernel.test.ts",
-      "owner": "cq-4-parity-corpus",
-      "reason": "Pre-existing failure on main (1/8 failed): H-5: replay-verifier rejects untrusted recipe/agentScript envelopes and enforces scope/Tier-0/carrier checks on static_a",
-      "expires": "2026-12-26"
+      "testName": "H-13: impact receipts ignore script-declared requestBody, ambient, SameSite, and oracleEvents and derive them strictly from host exchanges",
+      "assertionLocation": "tests/t2-receipt-kernel.test.ts:420:1",
+      "ownerStream": "triage-kernel-t2-receipt-kernel",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
+    },
+    {
+      "file": "tests/t2-receipt-kernel.test.ts",
+      "testName": "H-5: replay-verifier rejects untrusted recipe/agentScript envelopes and enforces scope/Tier-0/carrier checks on static_ast_proof",
+      "assertionLocation": "tests/t2-receipt-kernel.test.ts:228:1",
+      "ownerStream": "triage-kernel-t2-receipt-kernel",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
     },
     {
       "file": "tests/ux-session-refresh-a123.test.ts",
-      "owner": "ux-triage",
-      "reason": "Pre-existing failure on main (1/5 failed): A3: budgetRequests === 0 (Unlimited requests) does NOT trip tightControlBounds and keeps AIMD active",
-      "expires": "2026-12-26"
-    },
-    {
-      "file": "tests/ux-wave-exec-polish.test.ts",
-      "owner": "ux-triage",
-      "reason": "Pre-existing failure on main (1/3 failed): RequestBroker passes diagnostic meta on WebSocket and forbidden-header denials",
+      "testName": "A3: budgetRequests === 0 (Unlimited requests) does NOT trip tightControlBounds and keeps AIMD active",
+      "assertionLocation": "tests/ux-session-refresh-a123.test.ts:468:1",
+      "ownerStream": "ux-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/ux-wave-settings-auth.test.ts",
-      "owner": "ux-triage",
-      "reason": "Pre-existing failure on main (1/7 failed): A7: creating a second OpenRouter profile without id never overwrites or unlinks the first profile key, and Test clears o",
+      "testName": "A7: creating a second OpenRouter profile without id never overwrites or unlinks the first profile key, and Test clears open cooldown",
+      "assertionLocation": "tests/ux-wave-settings-auth.test.ts:95:1",
+      "ownerStream": "ux-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v3-protocol-browser.test.ts",
-      "owner": "v4-v5-triage",
-      "reason": "Pre-existing failure on main (3/4 failed): v3 WebSocket: probeWebsocket origin/scope/bounds/redaction & ws_chain replay confirmation/dismissal",
+      "testName": "v3 ReplayVerifier requireControlNonError: unexpected 404/503 yields inconclusive; explicit expectedStatus allows check",
+      "assertionLocation": "tests/v3-protocol-browser.test.ts:751:1",
+      "ownerStream": "v4-v5-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v3-protocol-browser.test.ts",
+      "testName": "v3 ScopedBrowser & browser_chain: 100% broker-proxied, out-of-scope abort, fill/click/wait_for_selector/dom_xss_sink_hook",
+      "assertionLocation": "tests/v3-protocol-browser.test.ts:556:1",
+      "ownerStream": "v4-v5-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v3-protocol-browser.test.ts",
+      "testName": "v3 WebSocket: probeWebsocket origin/scope/bounds/redaction & ws_chain replay confirmation/dismissal",
+      "assertionLocation": "tests/v3-protocol-browser.test.ts:124:1",
+      "ownerStream": "v4-v5-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v4-m2-broker-browser-probes.test.ts",
-      "owner": "v4-v5-triage",
-      "reason": "Pre-existing failure on main (2/9 failed): M2.1 session jar isolation: regex BVA, LRU caps, origin/path/secure scoping, setup->probe vs control isolation, vault pr",
+      "testName": "M2.1 session jar isolation: regex BVA, LRU caps, origin/path/secure scoping, setup->probe vs control isolation, vault precedence, and scope purge",
+      "assertionLocation": "tests/v4-m2-broker-browser-probes.test.ts:216:1",
+      "ownerStream": "v4-v5-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v4-m2-broker-browser-probes.test.ts",
+      "testName": "M2.7 & M2.8 universal encodings + expanded sqli_boolean + sql_time_diff (#14) non-overlap and public gate",
+      "assertionLocation": "tests/v4-m2-broker-browser-probes.test.ts:763:1",
+      "ownerStream": "v4-v5-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v4-m4-surface-orchestration.test.ts",
-      "owner": "v4-v5-triage",
-      "reason": "Pre-existing failure on main (2/10 failed): M4.8 computeMultiTrialFanout BVA and live Execution multi-trial early stopping cancels sibling & emits trial.early_stopp",
+      "testName": "M4.1 extractStaticFrameworkRoutes detects all 11 frameworks with params, sinks & guards",
+      "assertionLocation": "tests/v4-m4-surface-orchestration.test.ts:154:1",
+      "ownerStream": "v4-v5-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v4-m4-surface-orchestration.test.ts",
+      "testName": "M4.10 replay-verifier requireControlNonError under CWE-639 allows explicitly asserted probe 500, rejects unexpected control 500, and supports retest fixed transition",
+      "assertionLocation": "tests/v4-m4-surface-orchestration.test.ts:906:1",
+      "ownerStream": "v4-v5-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v4-m4-surface-orchestration.test.ts",
+      "testName": "M4.8 computeMultiTrialFanout BVA and live Execution multi-trial early stopping cancels sibling & emits trial.early_stopped",
+      "assertionLocation": "tests/v4-m4-surface-orchestration.test.ts:676:1",
+      "ownerStream": "v4-v5-triage",
+      "reason": "Pre-existing failure on main (testTimeoutFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v5-agentic-tools.test.ts",
-      "owner": "cq-6-agent-contract",
-      "reason": "Pre-existing failure on main (3/10 failed): trace is off by default and a throwing trace never breaks the run",
+      "testName": "the N-2 nudge is injected on turn N-2 and the 85% banner follows",
+      "assertionLocation": "tests/v5-agentic-tools.test.ts:375:1",
+      "ownerStream": "cq-6-agent-contract",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v5-agentic-tools.test.ts",
+      "testName": "trace is off by default and a throwing trace never breaks the run",
+      "assertionLocation": "tests/v5-agentic-tools.test.ts:241:1",
+      "ownerStream": "cq-6-agent-contract",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v5-agentic-tools.test.ts",
+      "testName": "trace records a turn and a redacted tool_result with verifier feedback and ids",
+      "assertionLocation": "tests/v5-agentic-tools.test.ts:287:1",
+      "ownerStream": "cq-6-agent-contract",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v5-board-store.test.ts",
-      "owner": "v4-v5-triage",
-      "reason": "Pre-existing failure on main (1/8 failed): v5 board schema auto-migrates a v4 database without losing rows and re-creates board tables",
+      "testName": "v5 board schema auto-migrates a v4 database without losing rows and re-creates board tables",
+      "assertionLocation": "tests/v5-board-store.test.ts:37:1",
+      "ownerStream": "v4-v5-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v5-m3-specs3.test.ts",
-      "owner": "v4-v5-triage",
-      "reason": "Pre-existing failure on main (4/19 failed): business logic: concurrent out-of-bounds seat allocation confirms via read-back",
+      "testName": "business logic: concurrent out-of-bounds seat allocation confirms via read-back",
+      "assertionLocation": "tests/v5-m3-specs3.test.ts:168:1",
+      "ownerStream": "v4-v5-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v5-m3-specs3.test.ts",
+      "testName": "info disclosure: viewer receives the tenant secret while the masked control does not",
+      "assertionLocation": "tests/v5-m3-specs3.test.ts:238:1",
+      "ownerStream": "v4-v5-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v5-m3-specs3.test.ts",
+      "testName": "race: setup mint + burst + restore proves double-spend and restores state",
+      "assertionLocation": "tests/v5-m3-specs3.test.ts:535:1",
+      "ownerStream": "v4-v5-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v5-m3-specs3.test.ts",
+      "testName": "workflow: form-encoded creator whose body returns the id is replayed through to the skipped state",
+      "assertionLocation": "tests/v5-m3-specs3.test.ts:364:1",
+      "ownerStream": "v4-v5-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v5-m5-board-execution.test.ts",
-      "owner": "v4-v5-triage",
-      "reason": "Pre-existing failure on main (4/9 failed): a dispatched chain step emits a @coordinator brief and keeps the warm member waiting",
+      "testName": "a dispatched chain step emits a @coordinator brief and keeps the warm member waiting",
+      "assertionLocation": "tests/v5-m5-board-execution.test.ts:56:1",
+      "ownerStream": "v4-v5-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v5-m5-board-execution.test.ts",
+      "testName": "deterministic posters are wired into dispatch, verification, circuit, approval, canary and turn-start hooks",
+      "assertionLocation": "tests/v5-m5-board-execution.test.ts:272:1",
+      "ownerStream": "v4-v5-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v5-m5-board-execution.test.ts",
+      "testName": "Tier-3 approval cards pause the member and the resolution resumes it",
+      "assertionLocation": "tests/v5-m5-board-execution.test.ts:212:1",
+      "ownerStream": "v4-v5-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v5-m5-board-execution.test.ts",
+      "testName": "warm retirement mirrors stop, turn ceilings and scope revocation",
+      "assertionLocation": "tests/v5-m5-board-execution.test.ts:243:1",
+      "ownerStream": "v4-v5-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v5-tier3-safety.test.ts",
-      "owner": "v4-v5-triage",
-      "reason": "Pre-existing failure on main (1/8 failed): execution Tier-3 gate: local-lab approval is origin-bound, strict-aware, and persisted",
+      "testName": "execution Tier-3 gate: local-lab approval is origin-bound, strict-aware, and persisted",
+      "assertionLocation": "tests/v5-tier3-safety.test.ts:341:1",
+      "ownerStream": "v4-v5-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v5-verifier-guards.test.ts",
-      "owner": "v4-v5-triage",
-      "reason": "Pre-existing failure on main (2/9 failed): guards: auth-bypass whose control is a login redirect still confirms via marker differential",
+      "testName": "guards: auth-bypass whose control is a login redirect still confirms via marker differential",
+      "assertionLocation": "tests/v5-verifier-guards.test.ts:260:1",
+      "ownerStream": "v4-v5-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v5-verifier-guards.test.ts",
+      "testName": "guards: field-bound same-actor deterministic pattern still confirms when the origin matches",
+      "assertionLocation": "tests/v5-verifier-guards.test.ts:316:1",
+      "ownerStream": "v4-v5-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v6-auth.test.ts",
-      "owner": "v6-triage",
-      "reason": "Pre-existing failure on main (0/0 failed): TIMEOUT (>60s)",
+      "testName": "OIDC login traverses only allowlisted authOrigins, captures HttpOnly cookies + storage, and accepts TOTP",
+      "assertionLocation": "tests/v6-auth.test.ts:395:1",
+      "ownerStream": "v6-triage",
+      "reason": "Pre-existing failure on main (testTimeoutFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v6-fluid.test.ts",
-      "owner": "v6-triage",
-      "reason": "Pre-existing failure on main (2/12 failed): read-only calls in one round run concurrently",
+      "testName": "network calls stay sequential within one round",
+      "assertionLocation": "tests/v6-fluid.test.ts:255:1",
+      "ownerStream": "v6-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v6-fluid.test.ts",
+      "testName": "read-only calls in one round run concurrently",
+      "assertionLocation": "tests/v6-fluid.test.ts:213:1",
+      "ownerStream": "v6-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v6-graph.test.ts",
-      "owner": "v6-triage",
-      "reason": "Pre-existing failure on main (1/9 failed): clones with bounded depth, keeps sanitized .git, and mines security-relevant commits",
+      "testName": "github connector: preserved history and diff mining > clones with bounded depth, keeps sanitized .git, and mines security-relevant commits",
+      "assertionLocation": "tests/v6-graph.test.ts:432:3",
+      "ownerStream": "v6-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v6-phaseb-latency.test.ts",
-      "owner": "v6-triage",
-      "reason": "Pre-existing failure on main (1/16 failed): warm pool: a container that is still running is removed, never parked",
+      "testName": "warm pool: a container that is still running is removed, never parked",
+      "assertionLocation": "tests/v6-phaseb-latency.test.ts:228:1",
+      "ownerStream": "v6-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v6-sdk-helpers.test.ts",
-      "owner": "v6-triage",
-      "reason": "Pre-existing failure on main (2/7 failed): proveBooleanOrTimingDiff strips rotating tokens and records both arms",
+      "testName": "proveBooleanOrTimingDiff strips rotating tokens and records both arms",
+      "assertionLocation": "tests/v6-sdk-helpers.test.ts:411:1",
+      "ownerStream": "v6-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v6-sdk-helpers.test.ts",
+      "testName": "proveRaceBurst reports h2 single-packet vs explicit HTTP/1.1 fallback",
+      "assertionLocation": "tests/v6-sdk-helpers.test.ts:538:1",
+      "ownerStream": "v6-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v6-verifier-harden.test.ts",
-      "owner": "v6-triage",
-      "reason": "Pre-existing failure on main (7/41 failed): boundary: a real MFA challenge with a pre/post access differential confirms",
+      "testName": "boundary: a real MFA challenge with a pre/post access differential confirms",
+      "assertionLocation": "tests/v6-verifier-harden.test.ts:608:1",
+      "ownerStream": "v6-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v6-verifier-harden.test.ts",
+      "testName": "parity: executable markup still backs a markup claim",
+      "assertionLocation": "tests/v6-verifier-harden.test.ts:1375:1",
+      "ownerStream": "v6-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v6-verifier-harden.test.ts",
+      "testName": "parity: kovo_verify dismisses the SameSite=Lax CSRF claim",
+      "assertionLocation": "tests/v6-verifier-harden.test.ts:1046:1",
+      "ownerStream": "v6-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v6-verifier-harden.test.ts",
+      "testName": "units: a self-service workflow transition is not business-logic impact (K=6 FP)",
+      "assertionLocation": "tests/v6-verifier-harden.test.ts:1254:1",
+      "ownerStream": "v6-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v6-verifier-harden.test.ts",
+      "testName": "units: anonymous public-route reads need owner-scoped or credential evidence (K=6 FP)",
+      "assertionLocation": "tests/v6-verifier-harden.test.ts:1306:1",
+      "ownerStream": "v6-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v6-verifier-harden.test.ts",
+      "testName": "units: impact classification and role hierarchy are mechanical",
+      "assertionLocation": "tests/v6-verifier-harden.test.ts:842:1",
+      "ownerStream": "v6-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v6-verifier-harden.test.ts",
+      "testName": "units: markup needs executable content (K=6 FP)",
+      "assertionLocation": "tests/v6-verifier-harden.test.ts:1291:1",
+      "ownerStream": "v6-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v7-agent-script-proofs.test.ts",
-      "owner": "v7-triage",
-      "reason": "Pre-existing failure on main (5/7 failed): v7 agent-script-proofs: buildAgentScriptReceipt + verifyReceipt pass on impact, boolean, and timing",
+      "testName": "v7 agent-script-proofs: buildAgentScriptReceipt + verifyReceipt pass on impact, boolean, and timing",
+      "assertionLocation": "tests/v7-agent-script-proofs.test.ts:494:1",
+      "ownerStream": "v7-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v7-agent-script-proofs.test.ts",
+      "testName": "v7 agent-script-proofs: mutating POST boundary claim without readback fails closed and refuses receiptless persistence",
+      "assertionLocation": "tests/v7-agent-script-proofs.test.ts:1094:1",
+      "ownerStream": "v7-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v7-agent-script-proofs.test.ts",
+      "testName": "v7 agent-script-proofs: retestReplaySpec runs persisted agent script (reproduced vs fixed vs inconclusive) and bypasses legacy assertionsJq",
+      "assertionLocation": "tests/v7-agent-script-proofs.test.ts:980:1",
+      "ownerStream": "v7-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v7-agent-script-proofs.test.ts",
+      "testName": "v7 agent-script-proofs: runAgentScriptProof + persistAgentScriptProof satisfy assertConfirmationEvidence and reject non-confirming verdicts",
+      "assertionLocation": "tests/v7-agent-script-proofs.test.ts:700:1",
+      "ownerStream": "v7-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v7-agent-script-proofs.test.ts",
+      "testName": "v7 agent-script-proofs: verifyReceipt fails closed on status-only, missing readback, and anon-401 control",
+      "assertionLocation": "tests/v7-agent-script-proofs.test.ts:594:1",
+      "ownerStream": "v7-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v7-agentic-lift-oracles.test.ts",
-      "owner": "v7-triage",
-      "reason": "Pre-existing failure on main (4/9 failed): Seam 1: auth_bypass & jwt_forgery ProofReceipts confirm valid bypasses and fail closed on normal login / status-only / p",
-      "expires": "2026-12-26"
+      "testName": "Seam 1 end-to-end: ctx.prove_access_boundary (TS) confirms forged-JWT auth bypass through verifyScript + ProofReceipt",
+      "assertionLocation": "tests/v7-agentic-lift-oracles.test.ts:378:1",
+      "ownerStream": "triage-kernel-v7-agentic-lift-oracles",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
+    },
+    {
+      "file": "tests/v7-agentic-lift-oracles.test.ts",
+      "testName": "Seam 1: auth_bypass & jwt_forgery ProofReceipts confirm valid bypasses and fail closed on normal login / status-only / public routes",
+      "assertionLocation": "tests/v7-agentic-lift-oracles.test.ts:157:1",
+      "ownerStream": "triage-kernel-v7-agentic-lift-oracles",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
+    },
+    {
+      "file": "tests/v7-agentic-lift-oracles.test.ts",
+      "testName": "Seam 2 end-to-end: ctx.prove_race_burst with readRoute emits conserved_balance ProofReceipt in TS (and fails closed when conserved)",
+      "assertionLocation": "tests/v7-agentic-lift-oracles.test.ts:476:1",
+      "ownerStream": "triage-kernel-v7-agentic-lift-oracles",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
+    },
+    {
+      "file": "tests/v7-agentic-lift-oracles.test.ts",
+      "testName": "Seam 2: single-use coupon over-credit race confirms with 4xx serial rejection control",
+      "assertionLocation": "tests/v7-agentic-lift-oracles.test.ts:613:1",
+      "ownerStream": "triage-kernel-v7-agentic-lift-oracles",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
+    },
+    {
+      "file": "tests/v7-agentic-lift-oracles.test.ts",
+      "testName": "Seam 3 end-to-end: POST & GET ctx.prove_injection_differential confirms evaluated SSTI/CMDi & SQL error fingerprints, and fails closed on reflection/bare-500",
+      "assertionLocation": "tests/v7-agentic-lift-oracles.test.ts:646:1",
+      "ownerStream": "triage-kernel-v7-agentic-lift-oracles",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
     },
     {
       "file": "tests/v7-conserved-balance-receipt.test.ts",
-      "owner": "v7-triage",
-      "reason": "Pre-existing failure on main (5/6 failed): conserved_balance confirms under-debit double-spend backed by exact serial debit control",
+      "testName": "buildAgentScriptReceipt builds and verifies a conserved_balance receipt from Layer-3 race claim",
+      "assertionLocation": "tests/v7-conserved-balance-receipt.test.ts:192:1",
+      "ownerStream": "triage-kernel-v7-conserved-balance-receipt",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
+    },
+    {
+      "file": "tests/v7-conserved-balance-receipt.test.ts",
+      "testName": "conserved_balance confirms cap/quota overshoot backed by 4xx serial rejection control",
+      "assertionLocation": "tests/v7-conserved-balance-receipt.test.ts:100:1",
+      "ownerStream": "triage-kernel-v7-conserved-balance-receipt",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
+    },
+    {
+      "file": "tests/v7-conserved-balance-receipt.test.ts",
+      "testName": "conserved_balance confirms negative balance / inventory oversell backed by 4xx serial rejection control",
+      "assertionLocation": "tests/v7-conserved-balance-receipt.test.ts:77:1",
+      "ownerStream": "triage-kernel-v7-conserved-balance-receipt",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
+    },
+    {
+      "file": "tests/v7-conserved-balance-receipt.test.ts",
+      "testName": "conserved_balance confirms under-debit double-spend backed by exact serial debit control",
+      "assertionLocation": "tests/v7-conserved-balance-receipt.test.ts:50:1",
+      "ownerStream": "triage-kernel-v7-conserved-balance-receipt",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
+    },
+    {
+      "file": "tests/v7-conserved-balance-receipt.test.ts",
+      "testName": "conserved_balance fails closed on missing control, missing readbacks, 5xx burst, status-only diff, conserved debit, and unverified IDs",
+      "assertionLocation": "tests/v7-conserved-balance-receipt.test.ts:122:1",
+      "ownerStream": "triage-kernel-v7-conserved-balance-receipt",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
+    },
+    {
+      "file": "tests/v7-cut3a.test.ts",
+      "testName": "recipe-wired sql_boolean_diff confirms a vulnerable paired differential through the broker",
+      "assertionLocation": "tests/v7-cut3a.test.ts:170:1",
+      "ownerStream": "v7-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v7-cut3a.test.ts",
-      "owner": "v7-triage",
-      "reason": "Pre-existing failure on main (2/5 failed): recipe-wired sql_boolean_diff confirms a vulnerable paired differential through the broker",
+      "testName": "recipe-wired sql_boolean_diff rejects the hardened fixture with a named missing role",
+      "assertionLocation": "tests/v7-cut3a.test.ts:216:1",
+      "ownerStream": "v7-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v7-cut3c-retire.test.ts",
-      "owner": "v7-triage",
-      "reason": "Pre-existing failure on main (2/3 failed): Cut 3c recipe wiring: redirect, browser_sink, and injection_fingerprint persist and retest cleanly through floor-recipe-",
+      "testName": "Cut 3c recipe wiring: redirect, browser_sink, and injection_fingerprint persist and retest cleanly through floor-recipe-engine",
+      "assertionLocation": "tests/v7-cut3c-retire.test.ts:28:1",
+      "ownerStream": "v7-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v7-cut3c-retire.test.ts",
+      "testName": "Cut 3c-2 floorRecipe precedence: sql_boolean_diff with a boolean_or_timing floorRecipe verifies cleanly through ProofReceipt",
+      "assertionLocation": "tests/v7-cut3c-retire.test.ts:306:1",
+      "ownerStream": "v7-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v7-cut3cd-recipes.test.ts",
-      "owner": "v7-triage",
-      "reason": "Pre-existing failure on main (4/31 failed): confirms an off-origin Location that no control reaches",
+      "testName": "cut3cd: browser session seam evidence channels > cites a DOM sink trace with the canary",
+      "assertionLocation": "tests/v7-cut3cd-recipes.test.ts:283:3",
+      "ownerStream": "v7-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v7-cut3cd-recipes.test.ts",
+      "testName": "cut3cd: conserved_balance recipe > confirms a double-spend where four acknowledgements debit the conserved value once",
+      "assertionLocation": "tests/v7-cut3cd-recipes.test.ts:460:3",
+      "ownerStream": "v7-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v7-cut3cd-recipes.test.ts",
+      "testName": "cut3cd: conserved_balance recipe > dismisses a correct service that debits every acknowledged request",
+      "assertionLocation": "tests/v7-cut3cd-recipes.test.ts:468:3",
+      "ownerStream": "v7-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v7-cut3cd-recipes.test.ts",
+      "testName": "cut3cd: redirect recipe > confirms an off-origin Location that no control reaches",
+      "assertionLocation": "tests/v7-cut3cd-recipes.test.ts:70:3",
+      "ownerStream": "v7-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v7-cut3e-retire.test.ts",
-      "owner": "v7-triage",
-      "reason": "Pre-existing failure on main (2/5 failed): Cut 3e: bare browser_chain is retired while browser_sink recipe envelope confirms via ProofReceipt",
+      "testName": "Cut 3e (#181 P0 regression): authenticated reflected XSS confirms through browser_sink, produces schema-valid recordSpec, retests, and fails closed when patched",
+      "assertionLocation": "tests/v7-cut3e-retire.test.ts:353:1",
+      "ownerStream": "v7-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v7-cut3e-retire.test.ts",
+      "testName": "Cut 3e: bare browser_chain is retired while browser_sink recipe envelope confirms via ProofReceipt",
+      "assertionLocation": "tests/v7-cut3e-retire.test.ts:56:1",
+      "ownerStream": "v7-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v7-cut3f-retire.test.ts",
-      "owner": "v7-triage",
-      "reason": "Pre-existing failure on main (1/7 failed): the assessment/receipt helpers live in the recipe engine while the VM stays thin",
+      "testName": "cut3f: replay-verifier is a thin module > the assessment/receipt helpers live in the recipe engine while the VM stays thin",
+      "assertionLocation": "tests/v7-cut3f-retire.test.ts:57:3",
+      "ownerStream": "v7-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v7-exec-prep.test.ts",
-      "owner": "v7-triage",
-      "reason": "Pre-existing failure on main (1/3 failed): provider resets idle timeout and forwards onStreamActivity during slow multi-chunk SSE streams",
+      "testName": "provider resets idle timeout and forwards onStreamActivity during slow multi-chunk SSE streams",
+      "assertionLocation": "tests/v7-exec-prep.test.ts:64:1",
+      "ownerStream": "v7-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v7-exec-throughput.test.ts",
-      "owner": "v7-triage",
-      "reason": "Pre-existing failure on main (2/8 failed): Execution wires onProofObligation, onGapValidation, and assignedTargetRoutes into run events and throughput metrics",
+      "testName": "Execution wires onProofObligation, onGapValidation, and assignedTargetRoutes into run events and throughput metrics",
+      "assertionLocation": "tests/v7-exec-throughput.test.ts:136:1",
+      "ownerStream": "v7-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v7-exec-throughput.test.ts",
+      "testName": "runChainPlanner buffers 2 waves on Round 1 and never increments dryRounds on Round 1 or 0-completion mid-wave Round 2",
+      "assertionLocation": "tests/v7-exec-throughput.test.ts:277:1",
+      "ownerStream": "v7-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v7-floor-recipes.test.ts",
-      "owner": "v7-triage",
-      "reason": "Pre-existing failure on main (8/21 failed): boolean_or_timing confirms a stable >3x timing separation and rejects a noisy one",
-      "expires": "2026-12-26"
+      "testName": "boolean_or_timing confirms a stable >3x timing separation and rejects a noisy one",
+      "assertionLocation": "tests/v7-floor-recipes.test.ts:210:1",
+      "ownerStream": "triage-kernel-v7-floor-recipes",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
+    },
+    {
+      "file": "tests/v7-floor-recipes.test.ts",
+      "testName": "boolean_or_timing confirms a stable paired boolean differential",
+      "assertionLocation": "tests/v7-floor-recipes.test.ts:253:1",
+      "ownerStream": "triage-kernel-v7-floor-recipes",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
+    },
+    {
+      "file": "tests/v7-floor-recipes.test.ts",
+      "testName": "boolean_or_timing names a missing host duration",
+      "assertionLocation": "tests/v7-floor-recipes.test.ts:313:1",
+      "ownerStream": "triage-kernel-v7-floor-recipes",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
+    },
+    {
+      "file": "tests/v7-floor-recipes.test.ts",
+      "testName": "boolean_or_timing rejects a request shape that differs beyond the predicate",
+      "assertionLocation": "tests/v7-floor-recipes.test.ts:304:1",
+      "ownerStream": "triage-kernel-v7-floor-recipes",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
+    },
+    {
+      "file": "tests/v7-floor-recipes.test.ts",
+      "testName": "boolean_or_timing rejects hardened, echo-only, nonce-only, unstable and 5xx evidence",
+      "assertionLocation": "tests/v7-floor-recipes.test.ts:261:1",
+      "ownerStream": "triage-kernel-v7-floor-recipes",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
+    },
+    {
+      "file": "tests/v7-floor-recipes.test.ts",
+      "testName": "race_burst confirms a repeated terminal transition with divergent outcomes",
+      "assertionLocation": "tests/v7-floor-recipes.test.ts:418:1",
+      "ownerStream": "triage-kernel-v7-floor-recipes",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
+    },
+    {
+      "file": "tests/v7-floor-recipes.test.ts",
+      "testName": "race_burst rejects a uniform burst even when the receipt oracle would pass",
+      "assertionLocation": "tests/v7-floor-recipes.test.ts:437:1",
+      "ownerStream": "triage-kernel-v7-floor-recipes",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
     },
     {
       "file": "tests/v7-proofreceipt.test.ts",
-      "owner": "v7-triage",
-      "reason": "Pre-existing failure on main (5/17 failed): M0 receipt: an OOB callback confirms only when a cited exchange carried the delivered token",
-      "expires": "2026-12-26"
+      "testName": "M0 receipt: an OOB callback confirms only when a cited exchange carried the delivered token",
+      "assertionLocation": "tests/v7-proofreceipt.test.ts:155:1",
+      "ownerStream": "triage-kernel-v7-proofreceipt",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
+    },
+    {
+      "file": "tests/v7-proofreceipt.test.ts",
+      "testName": "M0 receipt: boolean differential confirms a stable paired structural change",
+      "assertionLocation": "tests/v7-proofreceipt.test.ts:233:1",
+      "ownerStream": "triage-kernel-v7-proofreceipt",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
+    },
+    {
+      "file": "tests/v7-proofreceipt.test.ts",
+      "testName": "M0 receipt: boolean differential rejects one round, echo-only, nonce-only and 5xx",
+      "assertionLocation": "tests/v7-proofreceipt.test.ts:260:1",
+      "ownerStream": "triage-kernel-v7-proofreceipt",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
+    },
+    {
+      "file": "tests/v7-proofreceipt.test.ts",
+      "testName": "M0 receipt: mode env is off/shadow/strict and defaults to strict",
+      "assertionLocation": "tests/v7-proofreceipt.test.ts:331:1",
+      "ownerStream": "triage-kernel-v7-proofreceipt",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
+    },
+    {
+      "file": "tests/v7-proofreceipt.test.ts",
+      "testName": "M0 receipt: timing confirms only a stable >3x probe separation",
+      "assertionLocation": "tests/v7-proofreceipt.test.ts:199:1",
+      "ownerStream": "triage-kernel-v7-proofreceipt",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
+    },
+    {
+      "file": "tests/v7-proofreceipt.test.ts",
+      "testName": "M0: a late pending_oob callback for an SSRF canary becomes a runtime_confirmed finding",
+      "assertionLocation": "tests/v7-proofreceipt.test.ts:508:1",
+      "ownerStream": "triage-kernel-v7-proofreceipt",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
+    },
+    {
+      "file": "tests/v7-proofreceipt.test.ts",
+      "testName": "M0: verifyReplaySpec and retestReplaySpec confirm through the receipt on a real replay",
+      "assertionLocation": "tests/v7-proofreceipt.test.ts:420:1",
+      "ownerStream": "triage-kernel-v7-proofreceipt",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
     },
     {
       "file": "tests/v7-publicness-oracle.test.ts",
-      "owner": "v7-triage",
-      "reason": "Pre-existing failure on main (1/6 failed): positive: genuine private cross-tenant reads still confirm (owner_id, email, canary, principal-bound author)",
-      "expires": "2026-12-26"
+      "testName": "positive: genuine private cross-tenant reads still confirm (owner_id, email, canary, principal-bound author)",
+      "assertionLocation": "tests/v7-publicness-oracle.test.ts:96:1",
+      "ownerStream": "triage-kernel-v7-publicness-oracle",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
     },
     {
       "file": "tests/v7-retest-receipts.test.ts",
-      "owner": "v7-triage",
-      "reason": "Pre-existing failure on main (2/4 failed): v7 retest receipts: a recipe-confirmed spec persists its recipe envelope",
-      "expires": "2026-12-26"
+      "testName": "v7 retest receipts: a recipe-confirmed spec persists its recipe envelope",
+      "assertionLocation": "tests/v7-retest-receipts.test.ts:68:1",
+      "ownerStream": "triage-kernel-v7-retest-receipts",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
+    },
+    {
+      "file": "tests/v7-retest-receipts.test.ts",
+      "testName": "v7 retest receipts: retest re-runs the recipe and never consults the declarative assertion",
+      "assertionLocation": "tests/v7-retest-receipts.test.ts:99:1",
+      "ownerStream": "triage-kernel-v7-retest-receipts",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
     },
     {
       "file": "tests/v7-shopflow-fp.test.ts",
-      "owner": "v7-triage",
-      "reason": "Pre-existing failure on main (1/5 failed): legitimate workflow confirmation survives the tightened taxonomy",
+      "testName": "legitimate workflow confirmation survives the tightened taxonomy",
+      "assertionLocation": "tests/v7-shopflow-fp.test.ts:119:1",
+      "ownerStream": "v7-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v7-sqli-baseline.test.ts",
-      "owner": "v7-triage",
-      "reason": "Pre-existing failure on main (1/9 failed): sql-baseline: a wired recipe confirms on a catalog lacking the dev literal",
+      "testName": "sql-baseline: a wired recipe confirms on a catalog lacking the dev literal",
+      "assertionLocation": "tests/v7-sqli-baseline.test.ts:265:1",
+      "ownerStream": "v7-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v7-status-diff-guard.test.ts",
-      "owner": "v7-triage",
-      "reason": "Pre-existing failure on main (1/10 failed): status-diff guard: boolean, timing and OOB receipt paths are unchanged",
+      "testName": "status-diff guard: boolean, timing and OOB receipt paths are unchanged",
+      "assertionLocation": "tests/v7-status-diff-guard.test.ts:220:1",
+      "ownerStream": "v7-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v7-subdomain-discovery.test.ts",
-      "owner": "v7-triage",
-      "reason": "Pre-existing failure on main (1/6 failed): local-lab, localhost, IP literals, internal suffixes, HTTP, and non-standard ports skip with zero network calls",
+      "testName": "local-lab, localhost, IP literals, internal suffixes, HTTP, and non-standard ports skip with zero network calls",
+      "assertionLocation": "tests/v7-subdomain-discovery.test.ts:24:1",
+      "ownerStream": "v7-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v7-tier1-throughput.test.ts",
-      "owner": "v7-triage",
-      "reason": "Pre-existing failure on main (1/6 failed): all 7 specialist focusPrompts steer to kovo_verify and avoid retired legacy VM kinds",
+      "testName": "all 7 specialist focusPrompts steer to kovo_verify and avoid retired legacy VM kinds",
+      "assertionLocation": "tests/v7-tier1-throughput.test.ts:112:1",
+      "ownerStream": "v7-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v7-tier1-throughput.test.ts",
+      "testName": "resumed --resume-snapshot conversion counts preserved floor findings from snapshot DB without weakening drop gate",
+      "assertionLocation": "tests/v7-tier1-throughput.test.ts:200:1",
+      "ownerStream": "v7-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v8-chain-continuation.test.ts",
-      "owner": "v8-triage",
-      "reason": "Pre-existing failure on main (3/6 failed): Execution emits 270s wall-clock budget for multi-hop chain step vs 120s for single-route step on a 15m run",
+      "testName": "buildWorkspaceSourceDigest produces a <= 8 KB multi-service route/guard/sink map and injects it into Turn 1 of runSourceFirstCodeAudit",
+      "assertionLocation": "tests/v8-chain-continuation.test.ts:789:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-chain-continuation.test.ts",
+      "testName": "Execution emits 270s wall-clock budget for multi-hop chain step vs 120s for single-route step on a 15m run",
+      "assertionLocation": "tests/v8-chain-continuation.test.ts:295:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-chain-continuation.test.ts",
+      "testName": "Live Execution automatically enqueues and dispatches a hop-continuation step when a progressing multi-hop worker rotates, and skips stalled zero-progress chains",
+      "assertionLocation": "tests/v8-chain-continuation.test.ts:671:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v8-codeaudit-settle.test.ts",
-      "owner": "v8-triage",
-      "reason": "Pre-existing failure on main (1/4 failed): codeAuditPrompt and code-auditor instructions require incremental record_fact",
+      "testName": "codeAuditPrompt and code-auditor instructions require incremental record_fact",
+      "assertionLocation": "tests/v8-codeaudit-settle.test.ts:77:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v8-composite-fix.test.ts",
-      "owner": "v8-triage",
-      "reason": "Pre-existing failure on main (1/3 failed): composite.verify & v8-oracle-families REJECT benign cache-prime + export-job-creation stubs with terminal_impact_unprove",
+      "testName": "composite.verify & v8-oracle-families REJECT benign cache-prime + export-job-creation stubs with terminal_impact_unproven hint",
+      "assertionLocation": "tests/v8-composite-fix.test.ts:296:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v8-composite-receipt.test.ts",
-      "owner": "v8-triage",
-      "reason": "Pre-existing failure on main (1/12 failed): combined 5-hop signed DAG exercising all 4 edge bindings + custom terminal oracle + disconnected hop check",
+      "testName": "combined 5-hop signed DAG exercising all 4 edge bindings + custom terminal oracle + disconnected hop check",
+      "assertionLocation": "tests/v8-composite-receipt.test.ts:910:1",
+      "ownerStream": "triage-kernel-v8-composite-receipt",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
+    },
+    {
+      "file": "tests/v8-concurrency-12.test.ts",
+      "testName": "Live Execution dispatches 12 unique concurrent specialists on Wave 1 with zero duplicates and raises SQLite busy_timeout >= 10s",
+      "assertionLocation": "tests/v8-concurrency-12.test.ts:631:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v8-concurrency-12.test.ts",
-      "owner": "v8-triage",
-      "reason": "Pre-existing failure on main (1/11 failed): Live Execution dispatches 12 unique concurrent specialists on Wave 1 with zero duplicates and raises SQLite busy_timeout",
+      "testName": "Live Execution strictly caps at 4 when explicit workerConcurrencyOverride or run.workerConcurrency=4 is set, while omitted override ramps via AIMD",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing intermittent failure on main (failed in run 2 and isolated verification) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v8-d3-h3-fix.test.ts",
-      "owner": "v8-triage",
-      "reason": "Pre-existing failure on main (3/5 failed): nested { data: { export: { id, signedUrl, status } } } stub is REJECTED across ALL oracle paths including cross_surface_",
+      "testName": "assignment-brief surfaces exact 1-line ctx.hmac_sign/ctx.jwt_sign/ctx.await_async patterns and continueChainRule within 4 KB cap",
+      "assertionLocation": "tests/v8-d3-h3-fix.test.ts:327:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-d3-h3-fix.test.ts",
+      "testName": "composite.verify enforces exact terminal denied control, blocks unauth 401 / forged oracleInput / own-tenant-only, and confirms genuine foreign-tenant data download",
+      "assertionLocation": "tests/v8-d3-h3-fix.test.ts:233:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-d3-h3-fix.test.ts",
+      "testName": "nested { data: { export: { id, signedUrl, status } } } stub is REJECTED across ALL oracle paths including cross_surface_pivot, dual_tenant_abac, parser_cache_differential, and generic classes",
+      "assertionLocation": "tests/v8-d3-h3-fix.test.ts:115:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v8-dag-export.test.ts",
-      "owner": "v8-triage",
-      "reason": "Pre-existing failure on main (1/4 failed): v8 Stream D: formatCompositeChainMarkdown renders 4-hop DAG chain, bindings, Mode-A badge, patchBrokeHopId, and integrat",
+      "testName": "v8 Stream D: formatCompositeChainMarkdown renders 4-hop DAG chain, bindings, Mode-A badge, patchBrokeHopId, and integrates with exportReportMarkdown",
+      "assertionLocation": "tests/v8-dag-export.test.ts:499:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v8-exec-wire.test.ts",
-      "owner": "v8-triage",
-      "reason": "Pre-existing failure on main (2/5 failed): 1. Run-scoped DerivedCapabilityVault persists sealed handles across two VerifyRpcServer worker sessions without raw secr",
+      "testName": "1. Run-scoped DerivedCapabilityVault persists sealed handles across two VerifyRpcServer worker sessions without raw secret exposure",
+      "assertionLocation": "tests/v8-exec-wire.test.ts:269:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-exec-wire.test.ts",
+      "testName": "2. Verified CompositeProofReceipt persists cleanly to Store, satisfies audit-confirmation-consistency, benchmark-multihop & receipt-export, while intermediates stay capability_only",
+      "assertionLocation": "tests/v8-exec-wire.test.ts:486:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v8-fix-rpc-e2e-bugs.test.ts",
-      "owner": "v8-triage",
-      "reason": "Pre-existing failure on main (1/5 failed): Bug 3: redact(), redactJsonValue(), scanSecrets(), and live broker scrub camelCase secret keys while preserving valid JS",
+      "testName": "Bug 3: redact(), redactJsonValue(), scanSecrets(), and live broker scrub camelCase secret keys while preserving valid JSON and benign fields",
+      "assertionLocation": "tests/v8-fix-rpc-e2e-bugs.test.ts:464:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v8-oracle-families.test.ts",
-      "owner": "v8-triage",
-      "reason": "Pre-existing failure on main (1/17 failed): confirms 3-arm cross-tenant / cross-scope cryptographic replay",
-      "expires": "2026-12-26"
-    },
-    {
-      "file": "tests/v8-patch-retest.test.ts",
-      "owner": "v8-triage",
-      "reason": "Pre-existing failure on main (1/12 failed): 4-hop DAG on unpatched target -> still_vulnerable, executes strictly in topological order & remaps fresh IDs",
-      "expires": "2026-12-26"
+      "testName": "v8 oracle family 4: cryptographic_scope_replay > confirms 3-arm cross-tenant / cross-scope cryptographic replay",
+      "assertionLocation": "tests/v8-oracle-families.test.ts:562:3",
+      "ownerStream": "triage-kernel-v8-oracle-families",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
     },
     {
       "file": "tests/v8-phasea-fastpath.test.ts",
-      "owner": "v8-triage",
-      "reason": "Pre-existing failure on main (1/8 failed): runSourceFirstCodeAudit enforces proportional wall-clock cap (90s), turn cap (8), and semantic sub-timeout (35s)",
+      "testName": "runSourceFirstCodeAudit enforces proportional wall-clock cap (90s), turn cap (8), and semantic sub-timeout (35s)",
+      "assertionLocation": "tests/v8-phasea-fastpath.test.ts:399:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v8-phasea-overlap.test.ts",
-      "owner": "v8-triage",
-      "reason": "Pre-existing failure on main (3/6 failed): Phase A overlap: floor starts during threat_model while code_audit runs, blocks Phase B, and fires post-floor once on se",
+      "testName": "Phase A overlap executes real HTTP floor probes during threat_model without BrokerDenied and records accurate floorMs",
+      "assertionLocation": "tests/v8-phasea-overlap.test.ts:524:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (unhandledRejection) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-phasea-overlap.test.ts",
+      "testName": "Phase A overlap: floor starts during threat_model while code_audit runs, blocks Phase B, and fires post-floor once on settle",
+      "assertionLocation": "tests/v8-phasea-overlap.test.ts:203:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (unhandledRejection) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-phasea-overlap.test.ts",
+      "testName": "Phase A overlap: when floor finishes before code_audit, post-floor fires once upon entering investigation and Phase B runs immediately",
+      "assertionLocation": "tests/v8-phasea-overlap.test.ts:314:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (unhandledRejection) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v8-prop-rpc-e2e.test.ts",
-      "owner": "v8-triage",
-      "reason": "Pre-existing failure on main (3/10 failed): E2E Positive 1: dual_tenant_abac + state_transition_binding + value_binding (JSON redaction, Bearer dedup, derived cooki",
+      "testName": "E2E Negative (a): intermediate job/export & signed-URL stubs claiming terminal impact fail closed as terminal_impact_unproven",
+      "assertionLocation": "tests/v8-prop-rpc-e2e.test.ts:1057:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-prop-rpc-e2e.test.ts",
+      "testName": "E2E Positive 1: dual_tenant_abac + state_transition_binding + value_binding (JSON redaction, Bearer dedup, derived cookie, multi-port)",
+      "assertionLocation": "tests/v8-prop-rpc-e2e.test.ts:559:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-prop-rpc-e2e.test.ts",
+      "testName": "E2E Positive 2: economic_conservation + value_binding (late-seal 6-req race burst, path valueDigest, fresh per-run IDs, Run 1/Run 2 winner jitter, auto-hydration)",
+      "assertionLocation": "tests/v8-prop-rpc-e2e.test.ts:702:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v8-q25-chain-scheduling.test.ts",
-      "owner": "v8-triage",
-      "reason": "Pre-existing failure on main (1/7 failed): runSourceFirstCodeAudit promotes explicit suspects AND cross-cutting defect facts (up to 6) into Wave-1 multi-hop chain ",
+      "testName": "runSourceFirstCodeAudit promotes explicit suspects AND cross-cutting defect facts (up to 6) into Wave-1 multi-hop chain steps with top priority",
+      "assertionLocation": "tests/v8-q25-chain-scheduling.test.ts:711:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v8-q25-oracle-soundness.test.ts",
-      "owner": "v8-triage",
-      "reason": "Pre-existing failure on main (4/4 failed): cryptographic_scope_replay rejects missing denied control, missing endpoint, wrong-route control, stub, and own-tenant-o",
-      "expires": "2026-12-26"
+      "testName": "agent-prompts surfaces compact (<= 12 lines) Multi-Hop Cryptographic & Async Pivot Pattern within budgets and with zero contamination",
+      "assertionLocation": "tests/v8-q25-oracle-soundness.test.ts:444:1",
+      "ownerStream": "triage-kernel-v8-q25-oracle-soundness",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
+    },
+    {
+      "file": "tests/v8-q25-oracle-soundness.test.ts",
+      "testName": "cryptographic_scope_replay rejects missing denied control, missing endpoint, wrong-route control, stub, and own-tenant-only even with derived_crypto_binding",
+      "assertionLocation": "tests/v8-q25-oracle-soundness.test.ts:105:1",
+      "ownerStream": "triage-kernel-v8-q25-oracle-soundness",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
+    },
+    {
+      "file": "tests/v8-q25-oracle-soundness.test.ts",
+      "testName": "dispatchDefaultV8Oracle fails closed on missing evidence for all V8_ORACLE_FAMILIES and records terminalOracleFamily when confirmed",
+      "assertionLocation": "tests/v8-q25-oracle-soundness.test.ts:282:1",
+      "ownerStream": "triage-kernel-v8-q25-oracle-soundness",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
+    },
+    {
+      "file": "tests/v8-q25-oracle-soundness.test.ts",
+      "testName": "isJobOrHandleStub rejects signed-URL / presigned-download / export-job / token-handle envelopes and accepts real business payloads",
+      "assertionLocation": "tests/v8-q25-oracle-soundness.test.ts:397:1",
+      "ownerStream": "triage-kernel-v8-q25-oracle-soundness",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
     },
     {
       "file": "tests/v8-q26-multihop-synthesis.test.ts",
-      "owner": "v8-triage",
-      "reason": "Pre-existing failure on main (1/4 failed): Fix C: workerInvestigationPrompt, KOVO_VERIFY guidance, and multihop-chains.md enforce no-premature-filing, single-origi",
+      "testName": "Fix C: workerInvestigationPrompt, KOVO_VERIFY guidance, and multihop-chains.md enforce no-premature-filing, single-origin probe arm, and crypto/async recipe",
+      "assertionLocation": "tests/v8-q26-multihop-synthesis.test.ts:320:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v8-q26-provenance-soundness.test.ts",
-      "owner": "v8-triage",
-      "reason": "Pre-existing failure on main (2/5 failed): verifyAttackerProvenance allows anonymous + single-tenant, DAG-minted credentials, same-tenant peers, and target-tenant ",
+      "testName": "end-to-end: VerifyRpcServer rejects cross-tenant collusion and persists non-empty compositeVerification, terminalOracleFamily, terminalEndpoint, and terminalImpact.summary",
+      "assertionLocation": "tests/v8-q26-provenance-soundness.test.ts:499:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-q26-provenance-soundness.test.ts",
+      "testName": "verifyAttackerProvenance allows anonymous + single-tenant, DAG-minted credentials, same-tenant peers, and target-tenant control/readback arms",
+      "assertionLocation": "tests/v8-q26-provenance-soundness.test.ts:252:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v8-q27-fix-binding.test.ts",
-      "owner": "v8-triage",
-      "reason": "Pre-existing failure on main (1/2 failed): inline cap:... handles resolve across path, query, Authorization, Cookie, custom headers, and JSON body with full attest",
+      "testName": "inline cap:... handles resolve across path, query, Authorization, Cookie, custom headers, and JSON body with full attestation & redaction",
+      "assertionLocation": "tests/v8-q27-fix-binding.test.ts:158:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v8-q27-fix-sdk-ergo.test.ts",
-      "owner": "v8-triage",
-      "reason": "Pre-existing failure on main (1/2 failed): TS SDK hmac_sign, jwt_sign, and await_async support options objects, positional args, flat calls, and result aliases",
+      "testName": "TS SDK hmac_sign, jwt_sign, and await_async support options objects, positional args, flat calls, and result aliases",
+      "assertionLocation": "tests/v8-q27-fix-sdk-ergo.test.ts:147:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v8-q28-ablation-seal.test.ts",
-      "owner": "v8-triage",
-      "reason": "Pre-existing failure on main (2/5 failed): state_transition_binding STILL rejects mutated-entity ablation, session-wide dirty ablation, and wrong route family",
+      "testName": "capability.seal supports bare, dot, $., bracket array, root array, and quoted jsonPaths + lists top-level keys only on mismatch",
+      "assertionLocation": "tests/v8-q28-ablation-seal.test.ts:391:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-q28-ablation-seal.test.ts",
+      "testName": "state_transition_binding STILL rejects mutated-entity ablation, session-wide dirty ablation, and wrong route family",
+      "assertionLocation": "tests/v8-q28-ablation-seal.test.ts:306:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v8-q29-vault-autobind.test.ts",
-      "owner": "v8-triage",
-      "reason": "Pre-existing failure on main (2/5 failed): literal sealed order_id auto-binds on http.send, race (every burst exchange) and async.awaitResult; value_binding verifi",
+      "testName": "literal derived JWT and HMAC signature in headers attest derived_crypto_binding via the merged consumed list",
+      "assertionLocation": "tests/v8-q29-vault-autobind.test.ts:269:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-q29-vault-autobind.test.ts",
+      "testName": "literal sealed order_id auto-binds on http.send, race (every burst exchange) and async.awaitResult; value_binding verifies",
+      "assertionLocation": "tests/v8-q29-vault-autobind.test.ts:156:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v8-q30-workflow-push.test.ts",
-      "owner": "cq-6-agent-contract",
-      "reason": "Pre-existing failure on main (1/3 failed): Q30.1: prompts, tool guidance, and multihop-chains.md enforce single-script 3-5 stage workflows and clean-control orderi",
+      "testName": "Q30.1: prompts, tool guidance, and multihop-chains.md enforce single-script 3-5 stage workflows and clean-control ordering within strict budgets",
+      "assertionLocation": "tests/v8-q30-workflow-push.test.ts:65:1",
+      "ownerStream": "cq-6-agent-contract",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v8-q31-multihop-detect.test.ts",
-      "owner": "cq-6-agent-contract",
-      "reason": "Pre-existing failure on main (1/5 failed): Q31.4: multiHopDirectives unmistakably mandates ctx.seal_capability + ctx.prove_composite and includes compact signature",
+      "testName": "Q31.4: multiHopDirectives unmistakably mandates ctx.seal_capability + ctx.prove_composite and includes compact signature reminder",
+      "assertionLocation": "tests/v8-q31-multihop-detect.test.ts:301:1",
+      "ownerStream": "cq-6-agent-contract",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v8-q32-stub-telemetry.test.ts",
-      "owner": "v8-triage",
-      "reason": "Pre-existing failure on main (3/7 failed): ti.proofReceipt CANNOT bypass isJobOrHandleStub on async export creation + job-status poll",
+      "testName": "singleReceiptToComposite on a stub-only ProofReceipt fails closed with terminal_impact_unproven",
+      "assertionLocation": "tests/v8-q32-stub-telemetry.test.ts:207:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-q32-stub-telemetry.test.ts",
+      "testName": "ti.proofReceipt CANNOT bypass isJobOrHandleStub on async export creation + job-status poll",
+      "assertionLocation": "tests/v8-q32-stub-telemetry.test.ts:44:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-q32-stub-telemetry.test.ts",
+      "testName": "ti.proofReceipt PASSES when accompanied by a real non-stub postMutRb, delivered OOB sink, or custom verifyTerminalImpact",
+      "assertionLocation": "tests/v8-q32-stub-telemetry.test.ts:139:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-q32-stub-telemetry.test.ts",
+      "testName": "ti.proofReceipt rejects when stub probe is cited ONLY in ti.proofReceipt.exchangeIds (not termEx)",
+      "assertionLocation": "tests/v8-q32-stub-telemetry.test.ts:95:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v8-q33-auth-and-json.test.ts",
-      "owner": "v8-triage",
-      "reason": "Pre-existing failure on main (2/4 failed): derived session token injects Authorization: Bearer <rawToken> on wire across all 4 call patterns + cookie/override edge",
+      "testName": "capability.seal falls back to regex on non-JSON when both jsonPath and regex are provided, else throws scrubbed status/content-type/preview diagnostic",
+      "assertionLocation": "tests/v8-q33-auth-and-json.test.ts:352:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-q33-auth-and-json.test.ts",
+      "testName": "derived session token injects Authorization: Bearer <rawToken> on wire across all 4 call patterns + cookie/override edge cases",
+      "assertionLocation": "tests/v8-q33-auth-and-json.test.ts:186:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v8-q33-dag-and-econ-docs.test.ts",
-      "owner": "v8-triage",
-      "reason": "Pre-existing failure on main (2/4 failed): Q33.2: dag_topology connected-DAG rule forbids unused/orphan exploratory hops in hops[]",
+      "testName": "Q33.2: dag_topology connected-DAG rule forbids unused/orphan exploratory hops in hops[]",
+      "assertionLocation": "tests/v8-q33-dag-and-econ-docs.test.ts:165:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-q33-dag-and-econ-docs.test.ts",
+      "testName": "Q33.3: derived session token injection rule teaches kind=\"bearer_token\", target=\"bearer\"/Authorization header, and omitting as/persona",
+      "assertionLocation": "tests/v8-q33-dag-and-econ-docs.test.ts:197:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v8-q33-econ-and-state.test.ts",
-      "owner": "v8-triage",
-      "reason": "Pre-existing failure on main (4/7 failed): economic_conservation hydrates string exchange IDs, {id}/{exchangeId} stubs, and *ExchangeId aliases under signingKey",
+      "testName": "economic_conservation auto-hydrates omitted baseline/actions/finalReadback from transcript and fails closed when any is missing",
+      "assertionLocation": "tests/v8-q33-econ-and-state.test.ts:170:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-q33-econ-and-state.test.ts",
+      "testName": "economic_conservation hydrates string exchange IDs, {id}/{exchangeId} stubs, and *ExchangeId aliases under signingKey",
+      "assertionLocation": "tests/v8-q33-econ-and-state.test.ts:89:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-q33-econ-and-state.test.ts",
+      "testName": "host hydration works across dual_tenant_abac, temporal_revocation, cryptographic_scope_replay, parser_cache_differential, and cross_surface_pivot",
+      "assertionLocation": "tests/v8-q33-econ-and-state.test.ts:312:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-q33-econ-and-state.test.ts",
+      "testName": "hydration NEVER forges missing/tampered records or trusts client-spoofed stub fields",
+      "assertionLocation": "tests/v8-q33-econ-and-state.test.ts:257:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v8-q34-verify-binding.test.ts",
-      "owner": "v8-triage",
-      "reason": "Pre-existing failure on main (1/6 failed): VerifyRpcServer backfills late capability.seal onto subsequent 6-request race burst and verifies hmac_sign value_binding",
+      "testName": "VerifyRpcServer backfills late capability.seal onto subsequent 6-request race burst and verifies hmac_sign value_binding end-to-end",
+      "assertionLocation": "tests/v8-q34-verify-binding.test.ts:467:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v8-q35-cap-only-gate.test.ts",
-      "owner": "v8-triage",
-      "reason": "Pre-existing failure on main (3/5 failed): rejects standalone parser-differential draft creation via boundary, structural_diff, persisted_mutation, and raw claims",
+      "testName": "end-to-end VerifyRpcServer + VerifyContext rejects 201 draft parser-differential and surfaces endpoint",
+      "assertionLocation": "tests/v8-q35-cap-only-gate.test.ts:379:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-q35-cap-only-gate.test.ts",
+      "testName": "preserves legitimate single-hop BOLA read (even of a victim draft), BFLA finalized mutation, mass assignment, SQLi boolean diff, and SSTI evaluated diff",
+      "assertionLocation": "tests/v8-q35-cap-only-gate.test.ts:272:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-q35-cap-only-gate.test.ts",
+      "testName": "rejects standalone parser-differential draft creation via boundary, structural_diff, persisted_mutation, and raw claims",
+      "assertionLocation": "tests/v8-q35-cap-only-gate.test.ts:139:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v8-q36-soundness-fixes.test.ts",
-      "owner": "v8-triage",
-      "reason": "Pre-existing failure on main (1/5 failed): Bug 1: forged inline oracleInput record with valid hostSignature cannot spoof status/json/fields",
+      "testName": "Bug 1: forged inline oracleInput record with valid hostSignature cannot spoof status/json/fields",
+      "assertionLocation": "tests/v8-q36-soundness-fixes.test.ts:87:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-q36-soundness-fixes.test.ts",
+      "testName": "Bug 3: VerifyRpcServer scrubs handle()/handleBrowser() errors and generic secrets in chainId and headers",
+      "assertionLocation": "tests/v8-q36-soundness-fixes.test.ts:331:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v8-sdk-strict-camel.test.ts",
-      "owner": "v8-triage",
-      "reason": "Pre-existing failure on main (3/3 failed): kovo_verify.ts drops dead v6/v7 shims and all redundant snake_case option aliases",
+      "testName": "canonical strict camelCase options work end-to-end and legacy snake_case options fail closed",
+      "assertionLocation": "tests/v8-sdk-strict-camel.test.ts:118:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-sdk-strict-camel.test.ts",
+      "testName": "kovo_verify.ts drops dead v6/v7 shims and all redundant snake_case option aliases",
+      "assertionLocation": "tests/v8-sdk-strict-camel.test.ts:70:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-sdk-strict-camel.test.ts",
+      "testName": "multihop-chains.md and agent-prompts.ts align with canonical surface, budgets, and zero contamination",
+      "assertionLocation": "tests/v8-sdk-strict-camel.test.ts:240:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v8-seam2-docs-mock-exec.test.ts",
-      "owner": "v8-triage",
-      "reason": "Pre-existing failure on main (3/6 failed): Part A.1: DerivedSecretKind enum stays in exact 3-way parity across SDK, derived-custody.ts, and verify-rpc.ts",
+      "testName": "Part A.1: DerivedSecretKind enum stays in exact 3-way parity across SDK, derived-custody.ts, and verify-rpc.ts",
+      "assertionLocation": "tests/v8-seam2-docs-mock-exec.test.ts:291:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-seam2-docs-mock-exec.test.ts",
+      "testName": "Part B.2: Live Mock-LLM Execution wall-clock rotation creates <= 2 KB v8.hop_checkpoint.v1 payload and dispatches continuation pickup",
+      "assertionLocation": "tests/v8-seam2-docs-mock-exec.test.ts:852:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-seam2-docs-mock-exec.test.ts",
+      "testName": "Part B.3: Concurrent cross-worker kovo_verify confirmations on redacted vs concrete ID routes collapse to 1 finding with merged evidence and 0 conflicts",
+      "assertionLocation": "tests/v8-seam2-docs-mock-exec.test.ts:987:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v8-seam3-receipt-fuzz.test.ts",
-      "owner": "v8-triage",
-      "reason": "Pre-existing failure on main (4/14 failed): Baselines: all 4 causal edge kinds, all 6 V8_ORACLE_FAMILIES, and single-hop ProofReceipts PASS cleanly",
+      "testName": "Baselines: all 4 causal edge kinds, all 6 V8_ORACLE_FAMILIES, and single-hop ProofReceipts PASS cleanly",
+      "assertionLocation": "tests/v8-seam3-receipt-fuzz.test.ts:1030:1",
+      "ownerStream": "triage-kernel-v8-seam3-receipt-fuzz",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
+    },
+    {
+      "file": "tests/v8-seam3-receipt-fuzz.test.ts",
+      "testName": "M05: Replacing terminal response with intermediate job/export/signed-URL/draft/queued stub fails closed",
+      "assertionLocation": "tests/v8-seam3-receipt-fuzz.test.ts:1210:1",
+      "ownerStream": "triage-kernel-v8-seam3-receipt-fuzz",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
+    },
+    {
+      "file": "tests/v8-seam3-receipt-fuzz.test.ts",
+      "testName": "M12–M14: Tampered host signatures, TranscriptStore tamper, and Mode-B (one_shot_transcript) abuse fail closed",
+      "assertionLocation": "tests/v8-seam3-receipt-fuzz.test.ts:1475:1",
+      "ownerStream": "triage-kernel-v8-seam3-receipt-fuzz",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
+    },
+    {
+      "file": "tests/v8-seam3-receipt-fuzz.test.ts",
+      "testName": "M18 + Live RPC: Dirty post-mutation ablation rejected & zero raw secret leakage in RPC/redaction outputs",
+      "assertionLocation": "tests/v8-seam3-receipt-fuzz.test.ts:1854:1",
+      "ownerStream": "triage-kernel-v8-seam3-receipt-fuzz",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-10"
+    },
+    {
+      "file": "tests/v8-slot-rotation.test.ts",
+      "testName": "Execution rotates a stalled specialist at wallClockMs=150 in < 400ms and dispatches the queued next step immediately",
+      "assertionLocation": "tests/v8-slot-rotation.test.ts:556:1",
+      "ownerStream": "cq-6-agent-contract",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v8-slot-rotation.test.ts",
-      "owner": "cq-6-agent-contract",
-      "reason": "Pre-existing failure on main (3/7 failed): runAgentSession hard-aborts a stalled specialist at wallClockMs=150 within < 400ms",
+      "testName": "runAgentSession grants bounded grace for an actively running kovo_verify proof call before rotating",
+      "assertionLocation": "tests/v8-slot-rotation.test.ts:499:1",
+      "ownerStream": "cq-6-agent-contract",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-slot-rotation.test.ts",
+      "testName": "runAgentSession hard-aborts a stalled specialist at wallClockMs=150 within < 400ms",
+      "assertionLocation": "tests/v8-slot-rotation.test.ts:457:1",
+      "ownerStream": "cq-6-agent-contract",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
       "file": "tests/v8-wire-l1.test.ts",
-      "owner": "v8-triage",
-      "reason": "Pre-existing failure on main (4/5 failed): End-to-end loopback VerifyRpcServer: Hop 1 seal -> Hop 2 hmacSign + jwtSign -> Hop 3 capability inject -> composite.veri",
+      "testName": "async.awaitResult poll-convergence over loopback VerifyRpcServer verifies async_pivot_binding",
+      "assertionLocation": "tests/v8-wire-l1.test.ts:498:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     },
     {
-      "file": "tests/xben-readback.test.ts",
-      "owner": "cq-4-parity-corpus",
-      "reason": "Pre-existing failure on main (1/6 failed): parity: the xben-12 self-profile readback confirms the promoted role",
+      "file": "tests/v8-wire-l1.test.ts",
+      "testName": "End-to-end loopback VerifyRpcServer: Hop 1 seal -> Hop 2 hmacSign + jwtSign -> Hop 3 capability inject -> composite.verify with zero secret leakage",
+      "assertionLocation": "tests/v8-wire-l1.test.ts:248:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-wire-l1.test.ts",
+      "testName": "oracle-invariants.ts re-exports evaluateV8OracleFamily for all 6 v8 families",
+      "assertionLocation": "tests/v8-wire-l1.test.ts:665:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
+      "expires": "2026-12-26"
+    },
+    {
+      "file": "tests/v8-wire-l1.test.ts",
+      "testName": "proof-receipt.ts unified re-exports preserve 1-hop backward compatibility & zero TDZ",
+      "assertionLocation": "tests/v8-wire-l1.test.ts:600:1",
+      "ownerStream": "v8-triage",
+      "reason": "Pre-existing failure on main (testCodeFailure) — converted from v1 whole-file quarantine",
       "expires": "2026-12-26"
     }
   ]
