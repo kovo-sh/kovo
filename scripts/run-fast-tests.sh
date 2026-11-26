@@ -13,6 +13,7 @@
 #   bash scripts/run-fast-tests.sh
 #   bash scripts/run-fast-tests.sh --quarantine tests/QUARANTINE.json
 #   bash scripts/run-fast-tests.sh --suites-only --quarantine tests/QUARANTINE.json
+#   bash scripts/run-fast-tests.sh --suites-only --quarantine tests/QUARANTINE.json --shard 1/6
 #   bash scripts/run-fast-tests.sh --check-only --quarantine tests/QUARANTINE.json [--now YYYY-MM-DD]
 #   KOVO_FAST_TEST_JOBS=12 bash scripts/run-fast-tests.sh --suites-only --quarantine tests/QUARANTINE.json
 set -uo pipefail
@@ -28,6 +29,7 @@ TESTS_DIR="tests"
 JOBS_OVERRIDE=""
 JSON_OUT=0
 SKIP_GIT_CAP_CHECK=0
+SHARD_SPEC=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -37,12 +39,29 @@ while [[ $# -gt 0 ]]; do
     --now) NOW_DATE="${2:?--now requires YYYY-MM-DD}"; shift 2;;
     --tests-dir) TESTS_DIR="${2:?--tests-dir requires a directory}"; shift 2;;
     --jobs) JOBS_OVERRIDE="${2:?--jobs requires an integer}"; shift 2;;
+    --shard) SHARD_SPEC="${2:?--shard requires <k>/<N>}"; shift 2;;
+    --shard=*) SHARD_SPEC="${1#--shard=}"; shift;;
     --json) JSON_OUT=1; shift;;
     --skip-git-cap-check) SKIP_GIT_CAP_CHECK=1; shift;;
-    -h|--help) sed -n '2,20p' "$0"; exit 0;;
+    -h|--help) sed -n '2,21p' "$0"; exit 0;;
     *) echo "unknown option: $1" >&2; exit 2;;
   esac
 done
+
+SHARD_INDEX=""
+SHARD_TOTAL=""
+if [[ -n "$SHARD_SPEC" ]]; then
+  if [[ ! "$SHARD_SPEC" =~ ^([1-9][0-9]*)/([1-9][0-9]*)$ ]]; then
+    echo "FAIL: invalid --shard value '$SHARD_SPEC' (expected <k>/<N> with integers 1 <= k <= N)" >&2
+    exit 2
+  fi
+  SHARD_INDEX="${BASH_REMATCH[1]}"
+  SHARD_TOTAL="${BASH_REMATCH[2]}"
+  if (( SHARD_INDEX < 1 || SHARD_INDEX > SHARD_TOTAL )); then
+    echo "FAIL: invalid --shard value '$SHARD_SPEC' (require 1 <= k <= N)" >&2
+    exit 2
+  fi
+fi
 
 if [[ "$CHECK_ONLY" -eq 0 && ! -d node_modules ]]; then
   echo "FAIL: node_modules missing — run 'npm ci' (or symlink main checkout's node_modules) first." >&2
@@ -121,6 +140,8 @@ export FAST_TEST_NOW="$NOW_DATE"
 export FAST_TEST_DIR="$TESTS_DIR"
 export FAST_TEST_JSON="$JSON_OUT"
 export FAST_TEST_SKIP_GIT_CAP="$SKIP_GIT_CAP_CHECK"
+export FAST_TEST_SHARD_INDEX="$SHARD_INDEX"
+export FAST_TEST_SHARD_TOTAL="$SHARD_TOTAL"
 
 node --input-type=module <<'EOF'
 import { execFile, execFileSync } from 'node:child_process'
@@ -155,6 +176,18 @@ const quarantinePath = (process.env.FAST_TEST_QUARANTINE || '').trim()
 const todayStr = (process.env.FAST_TEST_NOW || '').trim() || new Date().toISOString().slice(0, 10)
 const jobs = Math.max(1, Number(process.env.FAST_TEST_JOBS) || 8)
 const skipGitCapCheck = process.env.FAST_TEST_SKIP_GIT_CAP === '1' || !isDefaultTestsDir
+const shardIndexRaw = (process.env.FAST_TEST_SHARD_INDEX || '').trim()
+const shardTotalRaw = (process.env.FAST_TEST_SHARD_TOTAL || '').trim()
+const shardActive = Boolean(shardIndexRaw || shardTotalRaw)
+const shardIndex = shardActive ? Number(shardIndexRaw) : 0
+const shardTotal = shardActive ? Number(shardTotalRaw) : 0
+if (
+  shardActive &&
+  (!Number.isInteger(shardIndex) || !Number.isInteger(shardTotal) || shardIndex < 1 || shardIndex > shardTotal)
+) {
+  console.error(`FAIL: invalid --shard '${shardIndexRaw}/${shardTotalRaw}' (expected integers 1 <= k <= N)`)
+  process.exit(2)
+}
 
 const excludedMap = new Map()
 for (const line of (process.env.EXCLUDED_JOINED || '').split(/\r?\n/)) {
@@ -443,6 +476,20 @@ if (errors.length > 0) {
   process.exit(1)
 }
 
+// Deterministically partition fast files across N shards when --shard <k>/<N> is set:
+// sort Playwright/UI suites (tests/ux-*.test.ts, tests/fix-*.test.ts) first, then alphabetical
+// for the rest, and assign round-robin (idx % N === k - 1) so heavy Playwright tests spread evenly.
+const PLAYWRIGHT_UI_RE = /^tests\/(?:ux|fix)-[^/]+\.test\.ts$/
+const selectedRunFiles = shardActive
+  ? [...runFiles]
+      .sort((a, b) => {
+        const pa = PLAYWRIGHT_UI_RE.test(a) ? 0 : 1
+        const pb = PLAYWRIGHT_UI_RE.test(b) ? 0 : 1
+        return pa !== pb ? pa - pb : a.localeCompare(b)
+      })
+      .filter((_, i) => i % shardTotal === shardIndex - 1)
+  : runFiles
+
 if (checkOnly) {
   if (jsonOut) {
     console.log(JSON.stringify({
@@ -450,6 +497,15 @@ if (checkOnly) {
       checkOnly: true,
       discovered: allDiscovered.length,
       fast: runFiles.length,
+      ...(shardActive
+        ? {
+            shard: `${shardIndex}/${shardTotal}`,
+            shardIndex,
+            shardTotal,
+            shardFast: selectedRunFiles.length,
+            shardFiles: selectedRunFiles,
+          }
+        : {}),
       excluded: skippedByExclude.length,
       quarantined: totalQuarantinedCases,
       quarantinedCases: totalQuarantinedCases,
@@ -465,8 +521,9 @@ if (checkOnly) {
     const qNote = quarantinePath
       ? `, ${totalQuarantinedCases}/${maxQuarantinedCases} quarantined cases across ${quarantinedFileCount} files (${kernelQuarantinedCases} kernel/critical, earliest expiry ${earliestExpiry || 'n/a'})`
       : ''
+    const shardNote = shardActive ? `, shard ${shardIndex}/${shardTotal}: ${selectedRunFiles.length} files` : ''
     console.log(
-      `Fast-test inventory PASS: ${allDiscovered.length} discovered (${runFiles.length} fast, ${skippedByExclude.length} excluded${qNote}, 0 orphans)`,
+      `Fast-test inventory PASS: ${allDiscovered.length} discovered (${runFiles.length} fast, ${skippedByExclude.length} excluded${qNote}${shardNote}, 0 orphans)`,
     )
   }
   process.exit(0)
@@ -474,7 +531,7 @@ if (checkOnly) {
 
 // Schedule heavier suites first (LPT heuristic) to eliminate tail stragglers across worker slots.
 const HEAVY_HINT_RE = /(?:v6-auth|v8-concurrency-12|v4-m4-surface-orchestration|ux-inventory-batch|ux-consent-sticky|ux-zero-persona-warn|ux-approval-scopes|ux-round0-stepper|r3-node-hardening|v8-seam2-docs-mock-exec|v8-phasea-overlap|ux-workflow-list|fix-project-tabs|v7-exec-throughput|gb-planner-wiring|realism-mono|product-paging|phase0-paging|contract-canary|oob-engine|crawl-paging|killswitch-nav|universal-browser-auth|bench-cred-dir|proto-pollute|probe-split|egress-admit|static-fp|fixture-timing|realistic-harness)/
-const orderedRunFiles = [...runFiles].sort((a, b) => {
+const orderedRunFiles = [...selectedRunFiles].sort((a, b) => {
   const ha = HEAVY_HINT_RE.test(a) ? 0 : 1
   const hb = HEAVY_HINT_RE.test(b) ? 0 : 1
   return ha !== hb ? ha - hb : a.localeCompare(b)
@@ -483,9 +540,10 @@ const orderedRunFiles = [...runFiles].sort((a, b) => {
 const qBanner = quarantinePath
   ? `, ${totalQuarantinedCases}/${maxQuarantinedCases} quarantined cases in ${quarantinedFileCount} files`
   : ''
+const shardBanner = shardActive ? `shard ${shardIndex}/${shardTotal}: ${selectedRunFiles.length}/` : ''
 if (!jsonOut) {
   console.log(
-    `Discovered ${allDiscovered.length} test files (${runFiles.length} fast zero-LLM, ${skippedByExclude.length} excluded${qBanner}, 0 orphans; concurrency=${jobs})`,
+    `Discovered ${allDiscovered.length} test files (${shardBanner}${runFiles.length} fast zero-LLM, ${skippedByExclude.length} excluded${qBanner}, 0 orphans; concurrency=${jobs})`,
   )
 }
 
