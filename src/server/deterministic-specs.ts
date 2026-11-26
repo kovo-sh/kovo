@@ -187,6 +187,160 @@ const is2xx = (stepId: string) => `(.steps.${stepId}.status >= 200 and .steps.${
 const nonTrivial = (stepId: string, minBytes = 3) =>
   `(((${is2xx(stepId)})) and (((.steps.${stepId}.body | length) > ${minBytes}) or (((.steps.${stepId}.json | type) == "object") and (((.steps.${stepId}.json | keys | length) >= 2)))))`
 
+interface FloorClassCopyTemplate {
+  impact: string
+  remediation: string
+}
+
+const FLOOR_COPY_BY_CLASS: Readonly<Record<string, FloorClassCopyTemplate>> = {
+  bola: {
+    impact: 'An authenticated actor can read or alter resources belonging to another user or tenant.',
+    remediation: 'Enforce server-side object-level ownership and tenant authorization checks on every request naming a resource identifier.',
+  },
+  bfla: {
+    impact: 'A lower-privileged actor can invoke a privileged administrative or role-gated function.',
+    remediation: 'Enforce explicit server-side role and capability checks on every privileged endpoint rather than relying on client-side controls.',
+  },
+  sqli: {
+    impact: 'Untrusted input alters server-side database query structure or evaluation.',
+    remediation: 'Use parameterized queries or prepared statements and strict input validation; never concatenate untrusted input into queries.',
+  },
+  xxe: {
+    impact: 'The XML parser resolves attacker-supplied external entities, enabling server-side file reads or out-of-band network callbacks.',
+    remediation: 'Disable external entity resolution and DTD processing in the XML parser configuration.',
+  },
+  ssrf: {
+    impact: 'The server issues outbound network requests to attacker-controlled destinations, exposing internal services or metadata endpoints.',
+    remediation: 'Validate and allowlist outbound destination hosts and schemes; block private, loopback, and link-local IP ranges after DNS resolution.',
+  },
+  path_traversal: {
+    impact: 'Attacker-supplied path input escapes the intended server root directory, allowing arbitrary file reads.',
+    remediation: 'Canonicalize file paths server-side and verify the resolved path remains strictly inside the permitted base directory.',
+  },
+  open_redirect: {
+    impact: 'Unvalidated redirect targets send users to attacker-controlled external origins.',
+    remediation: 'Restrict redirect destinations to relative paths or an explicit allowlist of trusted origins.',
+  },
+  mass_assignment: {
+    impact: 'Over-posted request fields persist privileged or protected attributes that the caller is not permitted to set.',
+    remediation: 'Explicitly allowlist client-assignable fields and bind protected attributes server-side from trusted session context.',
+  },
+  csrf: {
+    impact: 'A cross-site request can trigger state-changing actions using the victim’s ambient session credentials without an anti-CSRF token.',
+    remediation: 'Require a validated per-session anti-CSRF token on state-changing routes and enforce SameSite cookie attributes.',
+  },
+  info_disclosure: {
+    impact: 'Sensitive credentials, secrets, or audit records are exposed in responses returned to unentitled callers.',
+    remediation: 'Remove credentials and internal secrets from response payloads and audit logs, and enforce server-side field filtering.',
+  },
+  xss: {
+    impact: 'Untrusted input is rendered as executable script markup in a victim’s browser context.',
+    remediation: 'Apply context-appropriate output encoding, sanitize rich HTML safely, and enforce a strict Content-Security-Policy.',
+  },
+  ssti: {
+    impact: 'Untrusted input is evaluated as server-side template expressions, enabling server-side code execution.',
+    remediation: 'Pass user input strictly as template data rather than template source, and use a sandboxed or logic-less template engine.',
+  },
+  cmdi: {
+    impact: 'Untrusted input injects shell metacharacters into server-side operating system commands, enabling arbitrary command execution.',
+    remediation: 'Execute commands with explicit argv arrays without invoking a shell, and strictly allowlist dynamic arguments.',
+  },
+  business_logic: {
+    impact: 'Application workflow or state-machine invariants can be bypassed or replayed out of sequence.',
+    remediation: 'Enforce state-transition and business-rule invariants atomically server-side before committing state changes.',
+  },
+  price_tampering: {
+    impact: 'Client-supplied pricing or amount parameters override server-side authoritative totals during checkout or payment processing.',
+    remediation: 'Compute prices, discounts, and totals strictly server-side from authoritative catalog records and ignore client-supplied amounts.',
+  },
+  race_double_spend: {
+    impact: 'Concurrent requests race a non-atomic balance or quota check, allowing double-spend or duplicate state transitions.',
+    remediation: 'Serialize balance and quota transitions using database transactions, row locks, unique constraints, or idempotency keys.',
+  },
+  jwt: {
+    impact: 'Forged or unsigned authentication tokens bypass signature verification and grant authenticated session access.',
+    remediation: 'Verify token signatures against an explicit algorithm allowlist and server-managed keys; reject unsigned (alg=none) and unverified tokens.',
+  },
+  webhook: {
+    impact: 'Unsigned or forged webhook deliveries are accepted and processed without valid cryptographic signature verification.',
+    remediation: 'Verify webhook HMAC signatures in constant time against the raw request body using a server-managed secret before processing events.',
+  },
+}
+
+const DEFAULT_FLOOR_COPY: FloorClassCopyTemplate = {
+  impact: 'A deterministic verification differential confirmed exploitable server-side behavior on the target endpoint.',
+  remediation: 'Validate untrusted input and enforce strict server-side security controls on the affected endpoint.',
+}
+
+const FLOOR_COPY_BY_CWE: Readonly<Record<number, string>> = {
+  639: 'bola',
+  284: 'bola',
+  566: 'bola',
+  285: 'bfla',
+  269: 'bfla',
+  862: 'bfla',
+  863: 'bfla',
+  89: 'sqli',
+  564: 'sqli',
+  943: 'sqli',
+  611: 'xxe',
+  918: 'ssrf',
+  22: 'path_traversal',
+  23: 'path_traversal',
+  73: 'path_traversal',
+  601: 'open_redirect',
+  915: 'mass_assignment',
+  352: 'csrf',
+  200: 'info_disclosure',
+  359: 'info_disclosure',
+  522: 'info_disclosure',
+  532: 'info_disclosure',
+  79: 'xss',
+  80: 'xss',
+  83: 'xss',
+  1336: 'ssti',
+  94: 'ssti',
+  78: 'cmdi',
+  77: 'cmdi',
+  840: 'business_logic',
+  841: 'business_logic',
+  1284: 'business_logic',
+  472: 'price_tampering',
+  362: 'race_double_spend',
+  367: 'race_double_spend',
+  347: 'jwt',
+  287: 'jwt',
+  345: 'webhook',
+}
+
+function floorCopyTemplateFor(cwe: string, category: string): FloorClassCopyTemplate {
+  const cweMatch = /^CWE-(\d+)$/i.exec(cwe.trim())
+  if (cweMatch) {
+    const key = FLOOR_COPY_BY_CWE[Number(cweMatch[1])]
+    if (key && FLOOR_COPY_BY_CLASS[key]) return FLOOR_COPY_BY_CLASS[key]!
+  }
+  const normCat = category.trim().toLowerCase().replace(/[\s-]+/g, '_')
+  if (normCat === 'broken_access_control' || normCat === 'idor' || normCat === 'cross_tenant_read' || normCat === 'cross_tenant_write') {
+    return FLOOR_COPY_BY_CLASS.bola!
+  }
+  if (normCat === 'sensitive_data_exposure' || normCat === 'information_disclosure' || normCat === 'secret_disclosure') {
+    return FLOOR_COPY_BY_CLASS.info_disclosure!
+  }
+  if (normCat === 'xss_reflected' || normCat === 'xss_stored' || normCat === 'dom_xss') {
+    return FLOOR_COPY_BY_CLASS.xss!
+  }
+  if (normCat === 'workflow_bypass' || normCat === 'workflow_skip') {
+    return FLOOR_COPY_BY_CLASS.business_logic!
+  }
+  if (normCat === 'webhook_forgery') {
+    return FLOOR_COPY_BY_CLASS.webhook!
+  }
+  if (normCat === 'url_redirect') {
+    return FLOOR_COPY_BY_CLASS.open_redirect!
+  }
+  return FLOOR_COPY_BY_CLASS[normCat] ?? DEFAULT_FLOOR_COPY
+}
+
 export function baseFields(
   origin: string,
   title: string,
@@ -195,6 +349,7 @@ export function baseFields(
   severity: Severity,
   jq: string,
 ) {
+  const copy = floorCopyTemplateFor(cwe, category)
   return {
     version: 1 as const,
     origin,
@@ -203,8 +358,8 @@ export function baseFields(
     cwe,
     severity,
     severityRationale: 'Deterministic differential evidence was reproduced by the Zero-LLM verifier.',
-    impact: 'An attacker can read or alter data outside their authorization.',
-    remediation: 'Validate and parameterize input; enforce server-side authentication, ownership and role checks.',
+    impact: copy.impact,
+    remediation: copy.remediation,
     recheckInstructions: 'Replay the control and probe requests and compare the responses.',
     assertionsJq: jq,
   }
@@ -1042,7 +1197,7 @@ function synthRedirect(hyp: EngineHypothesis, result: DifferentialResult): Synth
     vulnClass: 'open_redirect',
     endpoint: hyp.endpoint.pathTemplate,
     spec: {
-      ...baseFields(hyp.endpoint.origin, 'Unvalidated redirect target (off-origin navigation)', 'CWE-601', 'open-redirect', 'low', jq),
+      ...baseFields(hyp.endpoint.origin, 'Unvalidated redirect target (off-origin navigation)', 'CWE-601', 'open-redirect', 'medium', jq),
       kind: 'http_chain',
       steps: [
         stepOf(hyp.endpoint.origin, 'c1', 'control', 'Benign relative return target', control, hyp.ownerPersona),
@@ -1400,9 +1555,6 @@ function synthSensitiveRead(hyp: EngineHypothesis, result: DifferentialResult): 
         'high',
         jq,
       ),
-      // This claim is credential exposure, not an access-control claim: keep the impact text out of
-      // the authorization classifier so the proof is judged by the credential evidence itself.
-      impact: 'An attacker can read sensitive credentials or audit records they are not entitled to see.',
       kind: 'http_chain',
       // The credential value shape the probe observed. The host re-tests it against the replayed
       // bodies (probe matches, no control matches); it is never accepted on the claim alone.

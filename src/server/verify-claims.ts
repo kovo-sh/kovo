@@ -10,10 +10,10 @@ import { intersectStructuralDeltas, normalizeStructuralTokens, structuralDiffNor
 import {
   ACTIVE_MARKUP_RE, assessBoundary, assessImpactEvidence, assessMarkupImpact, assessMfaBypass,
   assessReadDisclosure, assessStatusOnlyDivergence, classifyImpactDescriptor, flattenJson,
-  hasForeignTenantOrOwnerDisclosure, isMutatingMethod, isReadMethod,
+  hasForeignTenantOrOwnerDisclosure, injectionFamilyFromTyped, isMutatingMethod, isReadMethod,
   matchStrippedInjectionFingerprint, normalizeRole, parseRoleLabel,
 } from './oracle-invariants.ts'
-import type { AmbientAuth, BoundaryClass, ImpactClass, ImpactStep, InjectionFamily, ActorIdentity } from './oracle-invariants.ts'
+import type { AmbientAuth, BoundaryClass, ImpactClass, ImpactStep, InjectionFamily, InjectionFamilyScope, ActorIdentity } from './oracle-invariants.ts'
 import { isJobOrHandleStub } from './v8-oracle-families.ts'
 import { deriveRecordAuthMeta, resolveCanonicalArm, stepHasRedactedRequestPlane, type HostFactLog } from './host-fact-log.ts'
 import { defaultHostMintedOracle } from './proof-receipt.ts'
@@ -1742,22 +1742,28 @@ function transcriptStatusSteps(store: TranscriptStore, factLog?: HostFactLog): I
   return out
 }
 
-/** Infer injection construct family from context/claims for family-bound fingerprint checks. */
-function inferInjectionFamily(context: VerifyClaimContext, claims: readonly VerifyClaim[]): InjectionFamily | null {
+const PROSE_FAMILY_RE: ReadonlyArray<readonly [InjectionFamily, RegExp]> = [
+  ['sqli', /\bsqli?\b|sql[-_ ]?injection/i], ['nosqli', /\bnosql/i],
+  ['cmdi', /\b(?:cmdi|command[-_ ]?injection|os[-_ ]?command)\b/i],
+  ['ssti', /\b(?:ssti|template[-_ ]?injection)\b/i], ['xxe', /\bxxe\b/i],
+  ['traversal', /\b(?:traversal|path[-_ ]?traversal|lfi)\b/i],
+]
+
+/** Typed-first injection family; prose is fallback-only and conflicting untyped prose fails closed to `'ambiguous'`. */
+export function inferInjectionFamily(context: VerifyClaimContext, claims: readonly VerifyClaim[]): InjectionFamilyScope | null {
   if (context.injectionFamily) return context.injectionFamily
   const claimVc = claims.find((c): c is Extract<VerifyClaim, { vulnClass?: string }> => 'vulnClass' in c && typeof c.vulnClass === 'string')?.vulnClass ?? ''
-  const desc = `${context.cwe ?? ''} ${context.category ?? ''} ${context.title ?? ''} ${context.description ?? ''} ${claimVc}`
-  if (/\bCWE-(?:89|564)\b|\bsqli?\b|sql[-_ ]?injection/i.test(desc)) return 'sqli'
-  if (/\bCWE-943\b|\bnosql/i.test(desc)) return 'nosqli'
-  if (/\bCWE-(?:77|78)\b|\b(?:cmdi|command[-_ ]?injection|os[-_ ]?command)\b/i.test(desc)) return 'cmdi'
-  if (/\bCWE-(?:94|1336)\b|\b(?:ssti|template[-_ ]?injection)\b/i.test(desc)) return 'ssti'
-  if (/\bCWE-611\b|\bxxe\b/i.test(desc)) return 'xxe'
-  if (/\bCWE-22\b|\b(?:traversal|path[-_ ]?traversal|lfi)\b/i.test(desc)) return 'traversal'
-  return null
+  const typed = injectionFamilyFromTyped({ cwe: context.cwe, vulnClass: claimVc || null, category: context.category })
+  if (typed) return typed
+  if (/^CWE-[1-9]\d*$/i.test((context.cwe ?? '').trim())) return null
+  const prose = `${context.title ?? ''} ${context.description ?? ''}`
+  if (!prose.trim()) return null
+  const matched = PROSE_FAMILY_RE.filter(([, re]) => re.test(prose)).map(([f]) => f)
+  return matched.length === 0 ? null : matched.length === 1 ? matched[0]! : 'ambiguous'
 }
 
 /** Stripped, family-bound, control-absent injection fingerprint check matching oracle-invariants.ts. */
-function claimHasStrippedFingerprint(store: TranscriptStore, check: VerifyClaimCheck, factLog: HostFactLog | undefined, family: InjectionFamily | null, steps: readonly ImpactStep[]): boolean {
+function claimHasStrippedFingerprint(store: TranscriptStore, check: VerifyClaimCheck, factLog: HostFactLog | undefined, family: InjectionFamilyScope | null, steps: readonly ImpactStep[]): boolean {
   const c = check.claim
   const ids = c.kind === 'structural_diff' ? c.variantIds
     : c.kind === 'host_evaluated_expression' ? c.probeIds

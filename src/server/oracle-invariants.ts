@@ -575,44 +575,143 @@ const DISCLOSURE_CWE_RE = /^CWE-(?:200|359|522|532)$/i
  */
 export const ACTIVE_MARKUP_RE = /<script\b|<[a-z][^>]*\son\w+\s*=|(?:href|src)\s*=\s*["']?\s*javascript:/i
 
-/** Classify a claim once, from machine-readable descriptors (never from a request path guess). */
+const TYPED_CWE_RE = /^CWE-[1-9]\d*$/i
+
+function impactClassFromTypedVulnClass(vulnClass: string): ImpactClass | null {
+  switch (vulnClass) {
+    case 'csrf':
+      return 'csrf'
+    case 'mass_assignment':
+      return 'mass_assignment'
+    case 'xss':
+    case 'xss_stored':
+    case 'xss_reflected':
+    case 'dom_xss':
+    case 'markup':
+    case 'html_injection':
+      return 'markup'
+    case 'sqli':
+    case 'sqli_error':
+    case 'sql_boolean':
+    case 'sql_boolean_diff':
+    case 'blind_sqli':
+    case 'sqli_status':
+    case 'sqli_time':
+    case 'nosqli':
+    case 'nosql_injection':
+    case 'injection':
+      return 'injection'
+    case 'bfla':
+    case 'privilege_escalation':
+      return 'bfla'
+    case 'business_logic':
+    case 'workflow_bypass':
+    case 'workflow_skip':
+    case 'price_tampering':
+    case 'invariant_violation':
+    case 'economic_conservation':
+      return 'business_logic'
+    case 'bola':
+    case 'idor':
+    case 'cross_tenant':
+    case 'cross_tenant_read':
+    case 'cross_tenant_write':
+    case 'authorization':
+    case 'access_control':
+    case 'graphql_bola':
+      return 'authorization'
+    case 'info_disclosure':
+    case 'secret_disclosure':
+    case 'disclosure':
+    case 'sensitive_data_exposure':
+      return 'disclosure'
+    case 'xxe':
+    case 'blind_xxe':
+    case 'ssrf':
+    case 'blind_ssrf':
+    case 'path_traversal':
+    case 'directory_traversal':
+    case 'lfi':
+    case 'open_redirect':
+    case 'url_redirect':
+    case 'redirect':
+    case 'jwt':
+    case 'jwt_forgery':
+    case 'auth_bypass':
+    case 'webhook':
+    case 'webhook_forgery':
+    case 'cache_poisoning':
+    case 'cache_deception':
+      return 'other'
+    default:
+      return null
+  }
+}
+
+/**
+ * Classify a claim once, strictly typed-first (never from a request path guess).
+ * When a typed CWE (positive CWE-N) or typed `vulnClass` is present, free-text `title`, `impact`,
+ * and `description` are ignored so narrative boilerplate cannot relabel XXE/SSRF/traversal/JWT
+ * into `authorization` or `disclosure`.
+ */
 export function classifyImpactDescriptor(parts: {
   cwe?: string | null
+  vulnClass?: string | null
   category?: string | null
   title?: string | null
   impact?: string | null
   description?: string | null
 }): ImpactClass {
+  const cwe = (parts.cwe ?? '').trim()
+  const hasTypedCwe = TYPED_CWE_RE.test(cwe)
+  const vulnClass = (parts.vulnClass ?? '').trim().toLowerCase()
+  const hasTypedVulnClass = vulnClass.length > 0 && vulnClass !== 'other' && vulnClass !== 'unmatched_classless'
+  const category = (parts.category ?? '').trim()
+
+  if (hasTypedVulnClass || hasTypedCwe) {
+    if (hasTypedVulnClass) {
+      const fromVulnClass = impactClassFromTypedVulnClass(vulnClass)
+      if (fromVulnClass !== null) return fromVulnClass
+    }
+    if (hasTypedCwe) {
+      const upperCwe = cwe.toUpperCase()
+      if (upperCwe === 'CWE-352') return 'csrf'
+      if (upperCwe === 'CWE-915') return 'mass_assignment'
+      if (MARKUP_CWE_RE.test(cwe)) return 'markup'
+      if (INJECTION_CWE_RE.test(cwe)) return 'injection'
+      if (OPEN_REDIRECT_CWE_RE.test(cwe)) return 'other'
+      if (/^CWE-(?:269|285|862|863)$/i.test(cwe)) return 'bfla'
+      if (BUSINESS_LOGIC_CWE_RE.test(cwe)) return 'business_logic'
+      if (AUTHZ_CWE_RE.test(cwe)) return 'authorization'
+      if (DISCLOSURE_CWE_RE.test(cwe)) return 'disclosure'
+      // Generic input-validation / injection-family CWEs (e.g. CWE-20, CWE-78, CWE-1336) may carry
+      // the explicit machine-readable `injection-input` category; never consult free-text prose.
+      if (INJECTION_CATEGORY_RE.test(category)) return 'injection'
+    }
+    return 'other'
+  }
+
   const text = `${parts.title ?? ''} ${parts.impact ?? ''} ${parts.description ?? ''}`
-  if (CSRF_RE.test(text) || parts.cwe === 'CWE-352') return 'csrf'
-  if (MASS_ASSIGN_RE.test(text) || parts.cwe === 'CWE-915') return 'mass_assignment'
-  // A markup claim is executable-content-only; classification is by CWE or explicit scripting words.
-  if (MARKUP_CWE_RE.test(parts.cwe ?? '') || MARKUP_RE.test(text) ||
-      MARKUP_RE.test(parts.category ?? '')) return 'markup'
-  // Injection is classified from its own CWE family or SQL-specific category *before* the impact
+  if (CSRF_RE.test(text)) return 'csrf'
+  if (MASS_ASSIGN_RE.test(text)) return 'mass_assignment'
+  // A markup claim is executable-content-only; classification is by explicit scripting words.
+  if (MARKUP_RE.test(text) || MARKUP_RE.test(category)) return 'markup'
+  // Injection is classified from its SQL-specific category *before* the impact
   // narrative ("cross-store data disclosure") can rebrand it as information disclosure.
-  if (INJECTION_CWE_RE.test(parts.cwe ?? '') ||
-      INJECTION_CATEGORY_RE.test((parts.category ?? '').trim())) return 'injection'
+  if (INJECTION_CATEGORY_RE.test(category)) return 'injection'
   // Open redirect has its own redirect receipt rule and must never be rebranded as disclosure
   // when its narrative mentions exposure or phishing/token leak.
-  if (OPEN_REDIRECT_CWE_RE.test(parts.cwe ?? '') ||
-      OPEN_REDIRECT_CATEGORY_RE.test((parts.category ?? '').trim()) ||
-      /\bopen[- ]redirect\b/i.test(parts.title ?? '')) return 'other'
-  if (/\b(?:vertical|bfla|function[- ]level|privilege[- ]escalation)\b/i.test(text) ||
-      /^CWE-(?:269|285|862|863)$/i.test(parts.cwe ?? '')) return 'bfla'
+  if (OPEN_REDIRECT_CATEGORY_RE.test(category) || /\bopen[- ]redirect\b/i.test(parts.title ?? '')) return 'other'
+  if (/\b(?:vertical|bfla|function[- ]level|privilege[- ]escalation)\b/i.test(text)) return 'bfla'
   // Business-logic/workflow claims carry their own impact model (invariant, repeat transition,
   // protected-field delta); they must never fall through to the ungated 'other' bucket.
-  if (BUSINESS_LOGIC_CWE_RE.test(parts.cwe ?? '') || BUSINESS_LOGIC_RE.test(text) ||
-      BUSINESS_LOGIC_RE.test(parts.category ?? '')) return 'business_logic'
-  if (AUTHZ_CWE_RE.test(parts.cwe ?? '')) return 'authorization'
-  // Explicit disclosure metadata outranks generic authorization prose in the impact narrative
-  // (for example, "read or alter data outside their authorization" on a CWE-200 credential read).
-  if (DISCLOSURE_CWE_RE.test(parts.cwe ?? '') ||
-      /^(?:information[-_ ]disclosure|sensitive[-_ ]data[-_ ]exposure)$/i.test((parts.category ?? '').trim())) return 'disclosure'
-  if (AUTHZ_RE.test(parts.category ?? '') || AUTHZ_RE.test(text)) return 'authorization'
+  if (BUSINESS_LOGIC_RE.test(text) || BUSINESS_LOGIC_RE.test(category)) return 'business_logic'
+  // Explicit disclosure metadata outranks generic authorization prose in the impact narrative.
+  if (/^(?:information[-_ ]disclosure|sensitive[-_ ]data[-_ ]exposure)$/i.test(category)) return 'disclosure'
+  if (AUTHZ_RE.test(category) || AUTHZ_RE.test(text)) return 'authorization'
   // Disclosure has no role/tenant differential of its own; it needs an entitled control or a
   // secret-shaped value. Narrative-only disclosure words remain last so authz vocabulary wins.
-  if (DISCLOSURE_RE.test(text) || DISCLOSURE_RE.test(parts.category ?? '')) return 'disclosure'
+  if (DISCLOSURE_RE.test(text) || DISCLOSURE_RE.test(category)) return 'disclosure'
   return 'other'
 }
 
@@ -3611,15 +3710,87 @@ function fingerprintResponseText(step: ImpactStep): string {
   return stripRequestEchoes(step)
 }
 
+export type InjectionFamilyScope = InjectionFamily | 'ambiguous'
+
+const TYPED_CWE_TO_INJECTION_FAMILY: Readonly<Record<number, InjectionFamily>> = {
+  89: 'sqli',
+  564: 'sqli',
+  943: 'nosqli',
+  77: 'cmdi',
+  78: 'cmdi',
+  94: 'ssti',
+  1336: 'ssti',
+  611: 'xxe',
+  22: 'traversal',
+}
+
+const TYPED_CLASS_TO_INJECTION_FAMILY: Readonly<Record<string, InjectionFamily>> = {
+  sqli: 'sqli',
+  sqli_error: 'sqli',
+  sql_boolean: 'sqli',
+  sql_boolean_diff: 'sqli',
+  blind_sqli: 'sqli',
+  sqli_status: 'sqli',
+  sqli_time: 'sqli',
+  sql_injection: 'sqli',
+  nosqli: 'nosqli',
+  nosql_injection: 'nosqli',
+  cmdi: 'cmdi',
+  command_injection: 'cmdi',
+  os_command: 'cmdi',
+  rce: 'cmdi',
+  ssti: 'ssti',
+  template_injection: 'ssti',
+  xxe: 'xxe',
+  blind_xxe: 'xxe',
+  traversal: 'traversal',
+  path_traversal: 'traversal',
+  directory_traversal: 'traversal',
+  lfi: 'traversal',
+}
+
+/**
+ * Derive an injection family strictly from typed machine-readable descriptors (`vulnClass`, `cwe`,
+ * `category`) without consulting free-text prose. Returns `null` when no typed injection family
+ * applies.
+ */
+export function injectionFamilyFromTyped(parts: {
+  cwe?: string | null
+  vulnClass?: string | null
+  category?: string | null
+}): InjectionFamily | null {
+  const normClass = (parts.vulnClass ?? '').trim().toLowerCase().replace(/[\s-]+/g, '_')
+  if (normClass && Object.prototype.hasOwnProperty.call(TYPED_CLASS_TO_INJECTION_FAMILY, normClass)) {
+    return TYPED_CLASS_TO_INJECTION_FAMILY[normClass]!
+  }
+  const cweMatch = /^CWE-([1-9]\d*)$/i.exec((parts.cwe ?? '').trim())
+  if (cweMatch) {
+    const cweNum = Number(cweMatch[1])
+    if (Object.prototype.hasOwnProperty.call(TYPED_CWE_TO_INJECTION_FAMILY, cweNum)) {
+      return TYPED_CWE_TO_INJECTION_FAMILY[cweNum]!
+    }
+    return null
+  }
+  const normCat = (parts.category ?? '').trim().toLowerCase().replace(/[\s-]+/g, '_')
+  if (normCat && Object.prototype.hasOwnProperty.call(TYPED_CLASS_TO_INJECTION_FAMILY, normCat)) {
+    return TYPED_CLASS_TO_INJECTION_FAMILY[normCat]!
+  }
+  return null
+}
+
 /**
  * Match an injection fingerprint on `step`'s response AFTER echo-stripping and with a containment
  * rule so even truncated, upper-cased, entity-encoded, or backslash-escaped echoes of request
  * carriers never confirm (`H-16` / `R2-H-10`).
+ *
+ * Passing `'ambiguous'` fails closed (matches zero families) instead of widening to the any-family
+ * search path.
  */
 export function matchStrippedInjectionFingerprint(
   step: ImpactStep,
-  family?: InjectionFamily | null,
+  family?: InjectionFamilyScope | null,
 ): InjectionFingerprintMatch | null {
+  if (family === 'ambiguous') return null
   const stripped = stripRequestEchoes(step)
   if (!stripped) return null
   const normalizedRequestTokens = requestEchoTokens(step)
@@ -4369,7 +4540,7 @@ const IMPACT_CLASS_LABELS: Record<string, EvidenceClassLabel> = {
   injection: { vulnClass: 'sqli', cwe: 'CWE-89', category: 'injection' },
 }
 
-const IMPACT_CLASS_CWES: Record<string, number[]> = {
+export const IMPACT_CLASS_CWES: Record<string, number[]> = {
   bola: [639],
   mass_assignment: [915],
   csrf: [352],
@@ -4421,25 +4592,49 @@ export function knownOracleEvent(event: string): boolean {
  */
 const MFA_CLAIM_RE = /\b(?:2fa|mfa|two[- ]?factor|multi[- ]?factor|one[- ]?time[- ]?pass(?:word|code)?|otp|totp|authenticator|step[- ]?up)\b/i
 const AUTH_BOUNDARY_RE = /\b(?:authenticat(?:ion|or)[- ]?(?:bypass|confusion)|auth[- ]?bypass|login[- ]?bypass|session[- ]?fixation|token[- ]?forgery|jwt|sso|single[- ]?sign[- ]?on|oauth[- ]?confusion|confused[- ]?deputy|legacy[- ]?auth)\b/i
-const AUTH_BOUNDARY_CWE_RE = /^CWE-(?:287|288|290|294|302|303|305|306|346|384|522|620|798)$/i
+const AUTH_BOUNDARY_CWE_RE = /^CWE-(?:287|288|290|294|302|303|305|306|346|347|384|522|620|798)$/i
 const ACCESS_BOUNDARY_RE = /\b(?:bola|bfla|idor|broken[- ]access[- ]control|access[- ]control|authori[sz]ation|privilege[- ]escalation|tenant[- ]isolation|vertical[- ]access|cross[- ]tenant|insecure[- ]direct[- ]object)\b/i
 const ACCESS_BOUNDARY_CWE_RE = /^CWE-(?:269|284|285|566|639|862|863|1021|1220)$/i
 
 export interface BoundaryDescriptor {
   cwe?: string | null
+  vulnClass?: string | null
   category?: string | null
   title?: string | null
   impact?: string | null
 }
 
-/** Classify which boundary a claim must demonstrate. Auth outranks access (a bypass is a bypass). */
+/**
+ * Classify which boundary a claim must demonstrate. Auth outranks access (a bypass is a bypass).
+ * Typed-first: when a positive CWE or typed `vulnClass` is present, free-text `title` and `impact`
+ * are ignored so narrative prose cannot reclassify unrelated findings into an auth/access boundary.
+ */
 export function classifyBoundaryClaim(parts: BoundaryDescriptor): BoundaryClass {
-  // Titles and categories are the claim's label; generic impact boilerplate ("outside their
-  // authorization") must not turn an XXE/SSRF claim into an access-control claim.
-  const text = `${parts.title ?? ''} ${parts.category ?? ''}`
+  const cwe = (parts.cwe ?? '').trim()
+  const hasTypedCwe = TYPED_CWE_RE.test(cwe)
+  const vulnClass = (parts.vulnClass ?? '').trim().toLowerCase()
+  const hasTypedVulnClass = vulnClass.length > 0 && vulnClass !== 'other' && vulnClass !== 'unmatched_classless'
+  const category = (parts.category ?? '').trim()
+
+  if (hasTypedVulnClass || hasTypedCwe) {
+    if (hasTypedVulnClass) {
+      if (/^(?:mfa|2fa|mfa_bypass|otp_bypass|totp_bypass)$/.test(vulnClass)) return 'mfa'
+      if (/^(?:auth_bypass|broken_auth|auth_protocol|authentication_bypass|jwt|jwt_forgery|token_forgery|oauth|sso|session_fixation)$/.test(vulnClass)) return 'auth'
+      if (/^(?:bola|bfla|idor|cross_tenant|cross_tenant_read|cross_tenant_write|authorization|access_control|privilege_escalation|graphql_bola)$/.test(vulnClass)) return 'access'
+    }
+    if (hasTypedCwe) {
+      if (MFA_CLAIM_RE.test(category)) return 'mfa'
+      if (AUTH_BOUNDARY_CWE_RE.test(cwe)) return 'auth'
+      if (ACCESS_BOUNDARY_CWE_RE.test(cwe)) return 'access'
+    }
+    return 'other'
+  }
+
+  // No typed CWE or vulnClass: fall back to title + category (never generic impact boilerplate).
+  const text = `${parts.title ?? ''} ${category}`
   if (MFA_CLAIM_RE.test(text)) return 'mfa'
-  if (AUTH_BOUNDARY_RE.test(text) || AUTH_BOUNDARY_CWE_RE.test(parts.cwe ?? '')) return 'auth'
-  if (ACCESS_BOUNDARY_RE.test(text) || ACCESS_BOUNDARY_CWE_RE.test(parts.cwe ?? '')) return 'access'
+  if (AUTH_BOUNDARY_RE.test(text)) return 'auth'
+  if (ACCESS_BOUNDARY_RE.test(text)) return 'access'
   return 'other'
 }
 

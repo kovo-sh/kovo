@@ -72,6 +72,7 @@ import {
   normalizeEndpointTemplate,
   normalizeOrigin,
 } from './finding-fingerprint.ts'
+import { CWE_TO_RECEIPT_CLASS, SEVERITY_BY_CLASS } from './floor-recipe-engine.ts'
 import { alignClaimClass, parseRoleLabel } from './oracle-invariants.ts'
 import {
   buildOobReceipt,
@@ -220,6 +221,7 @@ export const IMMUTABLE_CONFIRMED_FINDING_FIELDS = [
   'origin',
   'title',
   'category',
+  'severity',
   'fingerprintHash',
   'endpoint',
 ] as const
@@ -361,10 +363,90 @@ export function isCweConsistentWithReceiptClass(
   return family.family.includes(normalized)
 }
 
+const SEVERITY_BY_EXTRA_CLASS: Readonly<Record<string, Finding['severity']>> = {
+  command_injection: 'critical',
+  cmdi: 'critical',
+  rce: 'critical',
+  race: 'critical',
+  race_condition: 'critical',
+  double_spend: 'critical',
+  auth_bypass: 'high',
+  jwt: 'high',
+  jwt_forgery: 'high',
+  token_forgery: 'high',
+  path_traversal: 'high',
+  directory_traversal: 'high',
+  lfi: 'high',
+  ssti: 'high',
+  template_injection: 'high',
+  nosqli: 'high',
+  nosql_injection: 'high',
+  redirect: 'medium',
+}
+
+const SEVERITY_BY_EXTRA_CWE: Readonly<Record<number, Finding['severity']>> = {
+  77: 'critical',
+  78: 'critical',
+  362: 'critical',
+  367: 'critical',
+  22: 'high',
+  23: 'high',
+  73: 'high',
+  94: 'high',
+  1336: 'high',
+}
+
+function lookupSeverityBand(rawKey: string | null | undefined): Finding['severity'] | null {
+  if (!rawKey) return null
+  const norm = rawKey.trim().toLowerCase().replace(/[\s-]+/g, '_')
+  if (!norm) return null
+  if (Object.prototype.hasOwnProperty.call(SEVERITY_BY_CLASS, norm)) {
+    return SEVERITY_BY_CLASS[norm]!
+  }
+  if (Object.prototype.hasOwnProperty.call(SEVERITY_BY_EXTRA_CLASS, norm)) {
+    return SEVERITY_BY_EXTRA_CLASS[norm]!
+  }
+  return null
+}
+
+/**
+ * Derive a deterministic default severity band from the verified receipt class, evidence class,
+ * normalized CWE, or category so confirmation severity never drifts by entry path (e.g.
+ * `open_redirect` always derives `medium` rather than fluctuating between `low` and `medium`).
+ */
+export function deriveSeverityBandForClass(input: {
+  receiptVulnClass?: string | null
+  evidenceClass?: string | null
+  cwe?: string | null
+  category?: string | null
+  fallback?: Finding['severity']
+}): Finding['severity'] {
+  const fromReceipt = lookupSeverityBand(input.receiptVulnClass)
+  if (fromReceipt) return fromReceipt
+  const fromEvidence = lookupSeverityBand(input.evidenceClass)
+  if (fromEvidence) return fromEvidence
+  const cweMatch = /^CWE-([1-9]\d*)$/i.exec((input.cwe ?? '').trim())
+  if (cweMatch) {
+    const cweNum = Number(cweMatch[1])
+    if (Object.prototype.hasOwnProperty.call(SEVERITY_BY_EXTRA_CWE, cweNum)) {
+      return SEVERITY_BY_EXTRA_CWE[cweNum]!
+    }
+    const receiptClass = Object.prototype.hasOwnProperty.call(CWE_TO_RECEIPT_CLASS, cweNum)
+      ? CWE_TO_RECEIPT_CLASS[cweNum]!
+      : null
+    const fromCweClass = lookupSeverityBand(receiptClass)
+    if (fromCweClass) return fromCweClass
+  }
+  const fromCategory = lookupSeverityBand(input.category)
+  if (fromCategory) return fromCategory
+  return input.fallback ?? 'high'
+}
+
 /**
  * H-18 / R2-H-14: Bind a confirmed/static_verified finding's identity (`cwe`, `category`, `origin`,
- * `title`, and `fingerprintHash` derived from endpoint/method) strictly to the confirming receipt
- * class and spec so a stale or mislabelled spec can never persist a mismatched CWE/origin/endpoint.
+ * `title`, `severity`, and `fingerprintHash` derived from endpoint/method) strictly to the
+ * confirming receipt class and spec so a stale or mislabelled spec can never persist a mismatched
+ * CWE/origin/endpoint or path-dependent severity.
  */
 export function bindConfirmedFindingIdentity(
   existingFinding: Finding,
@@ -408,6 +490,13 @@ export function bindConfirmedFindingIdentity(
       ?? spec.category
       ?? aligned.category
   }
+  const boundSeverity = deriveSeverityBandForClass({
+    receiptVulnClass: confirmedReceipt?.vulnClass ?? null,
+    evidenceClass,
+    cwe: boundCwe ?? null,
+    category: boundCategory ?? null,
+    fallback: aligned.severity,
+  })
   const boundTitle = redact(spec.title, secretsList).slice(0, 200) || aligned.title
   const { endpoint, method } = extractSpecEndpointAndMethod(spec, replay)
   const computedFp = endpoint
@@ -424,6 +513,7 @@ export function bindConfirmedFindingIdentity(
     origin: boundOrigin,
     cwe: boundCwe,
     category: boundCategory,
+    severity: boundSeverity,
     title: boundTitle,
     ...(computedFp ? { fingerprintHash: computedFp.hash } : {}),
   }
