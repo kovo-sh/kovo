@@ -1,0 +1,102 @@
+{
+  "id": "r3-13-oracle-spec-lateral-sqli-fp",
+  "side": "fp",
+  "archetype": "r3-13-benign-validation-lateral-cwe89",
+  "description": "R3-13 FP: benign strict-typed search endpoint returning 200 on numeric control and 400 JSON validation error on malformed input without engine error fingerprint or 3-arm boolean triangle must dismiss across all CWE-89 sibling oracle labels.",
+  "covers": {
+    "files": [
+      "src/server/oracle-spec.ts",
+      "src/server/terminal-oracle-registry.ts",
+      "src/server/proof-receipt.ts",
+      "src/server/v8-oracle-hydrate.ts",
+      "src/server/oracle-invariants.ts",
+      "src/server/verify-claims.ts"
+    ],
+    "classes": [
+      "sqli",
+      "sqli_status",
+      "sqli_error",
+      "boolean_differential",
+      "injection"
+    ]
+  },
+  "canonicalLabel": {
+    "cwe": "CWE-89",
+    "category": "injection-input",
+    "title": "Benign input validation 400 on /api/catalog/items must not confirm SQL injection under lateral CWE-89 relabeling",
+    "impact": "Input validator rejects non-numeric query parameter with HTTP 400 and generic schema message.",
+    "claimedImpact": "injection",
+    "claimedBoundary": "other",
+    "vulnClass": "sqli",
+    "injectionFamily": "sqli"
+  },
+  "freeTextLabel": {
+    "title": "Database query parameter validation failure on catalog filter endpoint"
+  },
+  "paths": {
+    "replay": true,
+    "floorReceipt": true,
+    "evaluateClaims": true,
+    "composite": false,
+    "floorInjectionRecipe": false,
+    "proofReceipt": true
+  },
+  "expected": {
+    "confirmed": false
+  },
+  "personas": [
+    {
+      "handle": "viewer_a",
+      "roleLabel": "viewer (tenant-a)",
+      "role": "viewer",
+      "tenant": "tenant-a",
+      "auth": "bearer",
+      "headerName": "authorization",
+      "headerValue": "Bearer parity-r313-viewer-a-token"
+    }
+  ],
+  "exchanges": [
+    {
+      "id": "ctl_valid",
+      "arm": "control",
+      "role": "control",
+      "method": "GET",
+      "pathAndQuery": "/api/catalog/items?page=1",
+      "persona": "viewer_a",
+      "status": 200,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"items\":[{\"id\":1,\"sku\":\"SKU-100\",\"name\":\"Ledger Binder\"}],\"page\":1}"
+    },
+    {
+      "id": "prb_invalid",
+      "arm": "probe",
+      "role": "probe",
+      "method": "GET",
+      "pathAndQuery": "/api/catalog/items?page=invalid_filter",
+      "persona": "viewer_a",
+      "status": 400,
+      "mediaType": "application/json",
+      "responseHeaders": { "content-type": "application/json" },
+      "body": "{\"error\":\"validation_failed\",\"field\":\"page\",\"message\":\"Expected positive integer.\"}"
+    }
+  ],
+  "replaySpec": {
+    "assertionsJq": "{ controlPassed: (.steps.ctl_valid.status == 200), confirmed: (.steps.prb_invalid.status == 400), observed: \"400 validation error\", expected: \"200\" }"
+  },
+  "proofReceipt": {
+    "vulnClass": "sqli",
+    "param": "page",
+    "targetMethod": "GET",
+    "targetPathAndQuery": "/api/catalog/items?page=invalid_filter",
+    "claimedDelta": "Status-only 200 vs 400 input validation error without boolean triangle or dialect fingerprint must dismiss under every CWE-89 sibling oracle."
+  },
+  "claims": [
+    { "kind": "impact", "impactClass": "injection", "probeExchangeId": "prb_invalid", "controlExchangeIds": ["ctl_valid"] }
+  ],
+  "bareClaims": [
+    { "kind": "status", "exchangeId": "ctl_valid", "expected": 200 },
+    { "kind": "status", "exchangeId": "prb_invalid", "expected": 400 },
+    { "kind": "body_contains", "exchangeId": "prb_invalid", "text": "validation_failed" }
+  ]
+}

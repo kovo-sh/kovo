@@ -20,6 +20,13 @@
 
 import { createHash } from 'node:crypto'
 import { compileSafeClaimRegex, MAX_CLAIM_REGEX_HAYSTACK, runUntrustedRegex } from './safe-regex.ts'
+import {
+  buildImpactClassCwes,
+  buildImpactClassLabels,
+  resolveBoundaryClassForCwe,
+  resolveBoundaryClassForLabel,
+  resolveDescriptorImpactClass,
+} from './oracle-spec.ts'
 
 export type ImpactClass = 'authorization' | 'bfla' | 'mass_assignment' | 'csrf' | 'business_logic' | 'markup' | 'disclosure' | 'injection' | 'other'
 /** Orthogonal boundary class: what kind of gate must be demonstrated for a claim. */
@@ -733,74 +740,7 @@ export const ACTIVE_MARKUP_RE = /<script\b|<[a-z][^>]*\son\w+\s*=|(?:href|src)\s
 const TYPED_CWE_RE = /^CWE-[1-9]\d*$/i
 
 function impactClassFromTypedVulnClass(vulnClass: string): ImpactClass | null {
-  switch (vulnClass) {
-    case 'csrf':
-      return 'csrf'
-    case 'mass_assignment':
-      return 'mass_assignment'
-    case 'xss':
-    case 'xss_stored':
-    case 'xss_reflected':
-    case 'dom_xss':
-    case 'markup':
-    case 'html_injection':
-      return 'markup'
-    case 'sqli':
-    case 'sqli_error':
-    case 'sql_boolean':
-    case 'sql_boolean_diff':
-    case 'blind_sqli':
-    case 'sqli_status':
-    case 'sqli_time':
-    case 'nosqli':
-    case 'nosql_injection':
-    case 'injection':
-      return 'injection'
-    case 'bfla':
-    case 'privilege_escalation':
-      return 'bfla'
-    case 'business_logic':
-    case 'workflow_bypass':
-    case 'workflow_skip':
-    case 'price_tampering':
-    case 'invariant_violation':
-    case 'economic_conservation':
-      return 'business_logic'
-    case 'bola':
-    case 'idor':
-    case 'cross_tenant':
-    case 'cross_tenant_read':
-    case 'cross_tenant_write':
-    case 'authorization':
-    case 'access_control':
-    case 'graphql_bola':
-      return 'authorization'
-    case 'info_disclosure':
-    case 'secret_disclosure':
-    case 'disclosure':
-    case 'sensitive_data_exposure':
-      return 'disclosure'
-    case 'xxe':
-    case 'blind_xxe':
-    case 'ssrf':
-    case 'blind_ssrf':
-    case 'path_traversal':
-    case 'directory_traversal':
-    case 'lfi':
-    case 'open_redirect':
-    case 'url_redirect':
-    case 'redirect':
-    case 'jwt':
-    case 'jwt_forgery':
-    case 'auth_bypass':
-    case 'webhook':
-    case 'webhook_forgery':
-    case 'cache_poisoning':
-    case 'cache_deception':
-      return 'other'
-    default:
-      return null
-  }
+  return resolveDescriptorImpactClass(vulnClass)
 }
 
 /**
@@ -6120,26 +6060,9 @@ export interface EvidenceClassLabel {
   category: string
 }
 
-const IMPACT_CLASS_LABELS: Record<string, EvidenceClassLabel> = {
-  // Cross-tenant evidence is object-level authorization regardless of the model's business framing.
-  bola: { vulnClass: 'bola', cwe: 'CWE-639', category: 'broken-access-control' },
-  mass_assignment: { vulnClass: 'mass_assignment', cwe: 'CWE-915', category: 'mass-assignment' },
-  csrf: { vulnClass: 'csrf', cwe: 'CWE-352', category: 'csrf' },
-  markup: { vulnClass: 'xss_stored', cwe: 'CWE-79', category: 'xss' },
-  disclosure: { vulnClass: 'info_disclosure', cwe: 'CWE-200', category: 'information-disclosure' },
-  business_logic: { vulnClass: 'business_logic', cwe: 'CWE-840', category: 'business-logic' },
-  injection: { vulnClass: 'sqli', cwe: 'CWE-89', category: 'injection' },
-}
+const IMPACT_CLASS_LABELS: Record<string, EvidenceClassLabel> = buildImpactClassLabels()
 
-export const IMPACT_CLASS_CWES: Record<string, number[]> = {
-  bola: [639],
-  mass_assignment: [915],
-  csrf: [352],
-  markup: [79, 80, 83],
-  disclosure: [200, 359, 522, 532],
-  business_logic: [840, 841, 472],
-  injection: [89, 564, 943],
-}
+export const IMPACT_CLASS_CWES: Record<string, number[]> = buildImpactClassCwes()
 
 /** Label for a verified impact class, or null when the class has no single canonical label. */
 export function evidenceClassLabel(impactClass: string | null | undefined): EvidenceClassLabel | null {
@@ -6183,9 +6106,7 @@ export function knownOracleEvent(event: string): boolean {
  */
 const MFA_CLAIM_RE = /\b(?:2fa|mfa|two[- ]?factor|multi[- ]?factor|one[- ]?time[- ]?pass(?:word|code)?|otp|totp|authenticator|step[- ]?up)\b/i
 const AUTH_BOUNDARY_RE = /\b(?:authenticat(?:ion|or)[- ]?(?:bypass|confusion)|auth[- ]?bypass|login[- ]?bypass|session[- ]?fixation|token[- ]?forgery|jwt|sso|single[- ]?sign[- ]?on|oauth[- ]?confusion|confused[- ]?deputy|legacy[- ]?auth)\b/i
-const AUTH_BOUNDARY_CWE_RE = /^CWE-(?:287|288|290|294|302|303|305|306|346|347|384|522|620|798)$/i
 const ACCESS_BOUNDARY_RE = /\b(?:bola|bfla|idor|broken[- ]access[- ]control|access[- ]control|authori[sz]ation|privilege[- ]escalation|tenant[- ]isolation|vertical[- ]access|cross[- ]tenant|insecure[- ]direct[- ]object)\b/i
-const ACCESS_BOUNDARY_CWE_RE = /^CWE-(?:269|284|285|566|639|862|863|1021|1220)$/i
 
 export interface BoundaryDescriptor {
   cwe?: string | null
@@ -6209,16 +6130,16 @@ export function classifyBoundaryClaim(parts: BoundaryDescriptor): BoundaryClass 
 
   if (hasTypedVulnClass || hasTypedCwe) {
     if (hasTypedVulnClass) {
-      if (/^(?:mfa|2fa|mfa_bypass|otp_bypass|totp_bypass)$/.test(vulnClass)) return 'mfa'
-      if (/^(?:auth_bypass|broken_auth|auth_protocol|authentication_bypass|jwt|jwt_forgery|token_forgery|oauth|sso|session_fixation)$/.test(vulnClass)) return 'auth'
-      if (/^(?:bola|bfla|idor|cross_tenant|cross_tenant_read|cross_tenant_write|authorization|access_control|privilege_escalation|graphql_bola)$/.test(vulnClass)) return 'access'
+      const fromLabel = resolveBoundaryClassForLabel(vulnClass)
+      if (fromLabel && fromLabel !== 'other') return fromLabel
     }
     if (hasTypedCwe) {
-      if (AUTH_BOUNDARY_CWE_RE.test(cwe)) {
+      const fromCwe = resolveBoundaryClassForCwe(cwe)
+      if (fromCwe === 'auth') {
         return MFA_CLAIM_RE.test(`${category} ${parts.title ?? ''}`) ? 'mfa' : 'auth'
       }
       if (MFA_CLAIM_RE.test(category)) return 'mfa'
-      if (ACCESS_BOUNDARY_CWE_RE.test(cwe)) return 'access'
+      if (fromCwe === 'access') return 'access'
     }
     return 'other'
   }

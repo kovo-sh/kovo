@@ -19,6 +19,7 @@ import { deriveRecordAuthMeta, resolveCanonicalArm, stepHasRedactedRequestPlane,
 import { defaultHostMintedOracle, normalizeRequestCarrier, verifyHostExpressionProbe, verifySignedUrlMintPair, type HostMintedExpressionChallenge, type HostStampedBooleanPair } from './proof-receipt.ts'
 import { compileSafeClaimRegex, MAX_CLAIM_REGEX_HAYSTACK } from './safe-regex.ts'
 export { compileSafeClaimRegex } from './safe-regex.ts'
+import { DEFAULT_ORACLE_SPEC_REGISTRY, evaluateRegisteredOracleClaim, isRegisteredImpactClass, isSignedUrlMintLabel, registerOracleClaimEvaluator, sealOracleClaimEvaluators } from './oracle-spec.ts'
 
 // ---------------------------------------------------------------------------
 // Constants shared with the container mount (worker-backend) and both SDKs.
@@ -668,13 +669,11 @@ function isClaim(value: unknown): value is VerifyClaim {
     case 'race':
       return Array.isArray(rec.exchangeIds) && rec.exchangeIds.length >= 2 &&
         rec.exchangeIds.every(v => typeof v === 'string')
-    case 'impact': {
-      const knownClasses = new Set(['authorization', 'bfla', 'mass_assignment', 'csrf', 'business_logic', 'markup', 'disclosure', 'injection'])
+    case 'impact':
       return typeof rec.probeExchangeId === 'string' &&
-        typeof rec.impactClass === 'string' && knownClasses.has(rec.impactClass) &&
+        typeof rec.impactClass === 'string' && isRegisteredImpactClass(rec.impactClass) &&
         (rec.controlExchangeIds === undefined || (Array.isArray(rec.controlExchangeIds) && rec.controlExchangeIds.every(v => typeof v === 'string'))) &&
         (rec.oracleEvents === undefined || (Array.isArray(rec.oracleEvents) && rec.oracleEvents.every(v => typeof v === 'string')))
-    }
     case 'boundary': {
       const knownClasses = new Set(['auth', 'access'])
       return typeof rec.controlExchangeId === 'string' &&
@@ -1248,42 +1247,241 @@ function implicitReadDisclosure(store: TranscriptStore, claims: readonly VerifyC
   return { satisfied: disclosure.satisfied, reason: disclosure.reason }
 }
 
+function requireAllowedRecord(
+  store: TranscriptStore,
+  context: VerifyClaimContext,
+  id: string,
+): VerifyTranscriptRecord | null {
+  if (context.allowedExchangeIds && !context.allowedExchangeIds.has(id)) return null
+  return store.get(id) ?? null
+}
+
+function evaluateDomSentinelClaim(
+  store: TranscriptStore,
+  claim: Extract<VerifyClaim, { kind: 'dom_sentinel' }>,
+  context: VerifyClaimContext,
+): VerifyClaimCheck {
+  const record = requireAllowedRecord(store, context, claim.exchangeId)
+  if (!record) return { claim, passed: false, detail: `Unknown exchange id ${claim.exchangeId}.` }
+  if ((claim.mode ?? 'executed') === 'executed') {
+    const executed = record.artifact?.executedSentinels ?? []
+    const passed = executed.includes(claim.sentinel)
+    return { claim, passed, detail: `execution sentinel ${passed ? 'observed' : 'not observed'}`, observed: { executed: executed.slice(0, 8) } }
+  }
+  const passed = (store.body(claim.exchangeId) ?? '').includes(claim.sentinel)
+  return { claim, passed, detail: `DOM sentinel ${passed ? 'present' : 'absent'}`, observed: { present: passed } }
+}
+
+function evaluateOobClaim(
+  store: TranscriptStore,
+  claim: Extract<VerifyClaim, { kind: 'oob' }>,
+  context: VerifyClaimContext,
+): VerifyClaimCheck {
+  const record = requireAllowedRecord(store, context, claim.exchangeId)
+  if (!record) return { claim, passed: false, detail: `Unknown exchange id ${claim.exchangeId}.` }
+  if (record.op !== 'oob' || !record.artifact?.token) return { claim, passed: false, detail: `Exchange ${claim.exchangeId} is not an OOB mint.` }
+  const expectHit = claim.expectHit ?? true
+  let liveHit: boolean | null = null
+  if (context.canary) { try { liveHit = context.canary.checkCanary(record.artifact.token).hit } catch { liveHit = null } }
+  const checkRecord = store.list().find(c => c.op === 'oob' && c.artifact?.token === record.artifact?.token && c.artifact?.hit === true)
+  const recordedHit = Boolean(record.artifact.hit) || Boolean(checkRecord)
+  const hit = liveHit === null ? recordedHit : recordedHit && liveHit
+  return { claim, passed: expectHit ? hit : !hit, detail: `OOB canary ${hit ? 'triggered' : 'did not trigger'}${liveHit === null ? ' (recorded)' : ' (re-checked)'}`, observed: { token: record.artifact.token, hit, liveHit } }
+}
+
+function evaluateTimingClaim(
+  store: TranscriptStore,
+  claim: Extract<VerifyClaim, { kind: 'timing' }>,
+  context: VerifyClaimContext,
+): VerifyClaimCheck {
+  const minPairs = Math.max(3, Math.min(claim.minPairs ?? 5, 7))
+  if (claim.controlIds.length < minPairs || claim.variantIds.length < minPairs) {
+    return { claim, passed: false, detail: `timing needs ${minPairs} interleaved pairs; got ${claim.controlIds.length}/${claim.variantIds.length}.` }
+  }
+  const controlRecords: VerifyTranscriptRecord[] = []
+  const variantRecords: VerifyTranscriptRecord[] = []
+  for (const id of claim.controlIds) {
+    const r = requireAllowedRecord(store, context, id)
+    if (!r?.response) return { claim, passed: false, detail: `Unknown or failed timing control exchange ${id}.` }
+    controlRecords.push(r)
+  }
+  for (const id of claim.variantIds) {
+    const r = requireAllowedRecord(store, context, id)
+    if (!r?.response) return { claim, passed: false, detail: `Unknown or failed timing variant exchange ${id}.` }
+    variantRecords.push(r)
+  }
+  const ordered = [...controlRecords.map(r => ({ seq: r.seq, g: 0 })), ...variantRecords.map(r => ({ seq: r.seq, g: 1 }))].sort((a, b) => a.seq - b.seq)
+  let run = 0, previous = -1
+  for (const item of ordered) {
+    if (item.g === previous) run += 1
+    else { run = 1; previous = item.g }
+    if (run > 2) return { claim, passed: false, detail: 'timing exchanges are not interleaved control/variant pairs.' }
+  }
+  const stats = mannWhitneyU(controlRecords.map(r => r.durationMs), variantRecords.map(r => r.durationMs))
+  const maxP = Math.min(Math.max(claim.maxPValue ?? 0.05, 0.001), 0.05)
+  const passed = stats.pValue <= maxP && stats.separation >= 3
+  return {
+    claim, passed,
+    detail: `Mann-Whitney p=${stats.pValue.toFixed(4)} separation=${stats.separation.toFixed(2)} (medians ${stats.medianControl.toFixed(1)}ms -> ${stats.medianVariant.toFixed(1)}ms)`,
+    observed: { pValue: Number(stats.pValue.toFixed(6)), separation: Number(stats.separation.toFixed(3)), medianControl: stats.medianControl, medianVariant: stats.medianVariant, madControl: stats.madControl, madVariant: stats.madVariant, pairs: controlRecords.length },
+  }
+}
+
+function evaluateStructuralDiffClaim(
+  store: TranscriptStore,
+  claim: Extract<VerifyClaim, { kind: 'structural_diff' }>,
+  context: VerifyClaimContext,
+): VerifyClaimCheck {
+  const minRounds = Math.max(2, Math.min(claim.minRounds ?? 3, 10))
+  if (claim.controlIds.length < minRounds || claim.variantIds.length < minRounds) {
+    return { claim, passed: false, detail: `structural_diff needs ${minRounds} control and ${minRounds} variant exchanges; got ${claim.controlIds.length}/${claim.variantIds.length}.` }
+  }
+  const bodyOf = (id: string): string | null => {
+    const rec = requireAllowedRecord(store, context, id)
+    return rec?.response ? (store.body(id) ?? '') : null
+  }
+  const controlBodies = claim.controlIds.map(bodyOf)
+  const variantBodies = claim.variantIds.map(bodyOf)
+  if (controlBodies.some(b => b === null)) return { claim, passed: false, detail: 'structural_diff references an unknown or failed control exchange.' }
+  if (variantBodies.some(b => b === null)) return { claim, passed: false, detail: 'structural_diff references an unknown or failed variant exchange.' }
+  const controls = controlBodies as string[], variants = variantBodies as string[]
+  const normControls = controls.map(normalizeStructuralTokens), normVariants = variants.map(normalizeStructuralTokens)
+  const unstableControl = normControls.some(b => !structuralDiffNormalized(normControls[0]!, b).normalizedEqual)
+  const unstableVariant = normVariants.some(b => !structuralDiffNormalized(normVariants[0]!, b).normalizedEqual)
+  if (unstableControl || unstableVariant) {
+    return { claim, passed: false, detail: `structural_diff needs a stable response within each arm after token stripping; ${unstableControl ? 'control' : 'variant'} arm drifted between rounds.`, observed: { stableControl: !unstableControl, stableVariant: !unstableVariant } }
+  }
+  const stableDelta = intersectStructuralDeltas(normControls.map((b, i) => structuralDiffNormalized(b, normVariants[i] ?? normVariants[0]!).changedTokens))
+  const cross = structuralDiffNormalized(normControls[0]!, normVariants[0]!)
+  const minDelta = Math.max(1, Math.min(claim.minDeltaTokens ?? 1, 32))
+  const distinct = !cross.normalizedEqual && stableDelta.length >= minDelta && cross.similarity < (claim.maxSimilarity ?? 1)
+  const diffObs = { stableDelta: stableDelta.slice(0, 16), similarity: Number(cross.similarity.toFixed(4)), rounds: controls.length, stableControl: !unstableControl, stableVariant: !unstableVariant }
+  if (distinct) {
+    const vStubs = claim.variantIds.map((id, i) => detectIntermediateStub(store.get(id), variants[i]))
+    const sdFamily = inferInjectionFamily(context, [claim])
+    if (vStubs.every(s => s.isStub) && claim.variantIds.every(id => { const s = toTranscriptStep(store, id, 'probe', { factLog: context.factLog }); return !s || matchStrippedInjectionFingerprint(s, sdFamily) === null }) &&
+        (vStubs.every(s => s.pureJobStub) || claim.controlIds.every(id => (recordStatus(store.get(id)) ?? 0) >= 400))) {
+      return stubRejection(claim, vStubs[0]?.state ?? 'draft', diffObs)
+    }
+  }
+  return {
+    claim, passed: distinct,
+    detail: distinct
+      ? `Structural differential: ${stableDelta.length} stable token(s) changed between arms (similarity ${cross.similarity.toFixed(3)}).`
+      : `No stable structural differential: ${stableDelta.length} stable changed token(s), similarity ${cross.similarity.toFixed(3)}; ${cross.normalizedEqual ? 'the arms are identical after token stripping' : 'the delta is not stable across rounds'}.`,
+    observed: diffObs,
+  }
+}
+
+function evaluateRaceClaim(
+  store: TranscriptStore,
+  claim: Extract<VerifyClaim, { kind: 'race' }>,
+  context: VerifyClaimContext,
+): VerifyClaimCheck {
+  const minDistinct = Math.max(2, Math.min(claim.minDistinctOutcomes ?? 2, claim.exchangeIds.length))
+  if (claim.exchangeIds.length < 2 || claim.exchangeIds.length > 10) return { claim, passed: false, detail: `race needs between 2 and 10 exchanges; got ${claim.exchangeIds.length}.` }
+  const records: VerifyTranscriptRecord[] = []
+  for (const id of claim.exchangeIds) {
+    const rec = requireAllowedRecord(store, context, id)
+    if (!rec?.response) return { claim, passed: false, detail: `Unknown or failed race exchange ${id}.` }
+    records.push(rec)
+  }
+  if (claim.mode === 'h2-single-packet' && records.some(r => r.op !== 'http2')) return { claim, passed: false, detail: 'race claims an HTTP/2 single-packet barrier but the transcript recorded an HTTP/1.1 fallback exchange.' }
+  if (claim.expectAllSuccess !== false && records.some(r => (r.response?.status ?? 0) < 200 || (r.response?.status ?? 0) >= 300)) {
+    return { claim, passed: false, detail: 'race burst expected every participant to succeed; at least one exchange was denied or errored, so no duplicate effect is attributable to the burst.', observed: { statuses: records.map(r => r.response?.status ?? null) } }
+  }
+  const distinctBodies = new Set(records.map(r => r.response?.bodySha256 ?? '')).size
+  const distinctStatuses = new Set(records.map(r => r.response?.status ?? 0)).size
+  const distinctOutcomes = Math.max(distinctBodies, distinctStatuses)
+  const passed = distinctOutcomes >= minDistinct
+  return {
+    claim, passed,
+    detail: passed ? `Race burst produced ${distinctOutcomes} distinct outcome(s) across ${records.length} synchronized exchanges (${claim.mode ?? 'mode-unspecified'}); a serialized/idempotent handler would return one outcome.` : `Race burst produced one idempotent outcome across ${records.length} synchronized exchanges; duplicate-effect evidence is missing.`,
+    observed: { distinctBodies, distinctStatuses, distinctOutcomes, statuses: records.map(r => r.response?.status ?? null), mode: claim.mode ?? null, ops: [...new Set(records.map(r => r.op))] },
+  }
+}
+
+function evaluateCompositeReceiptClaim(
+  store: TranscriptStore,
+  claim: Extract<VerifyClaim, { kind: 'composite_receipt' }>,
+  context: VerifyClaimContext,
+): VerifyClaimCheck {
+  const hostRec = claim.verificationId ? store.getCompositeVerification(claim.verificationId) : undefined
+  if (!hostRec) return { claim, passed: false, detail: 'composite_receipt claim must reference a host-verified composite.verify verificationId recorded in this session transcript.', observed: { confirmed: false, rejectedBy: 'composite_receipt', missingEvidence: ['host_composite_verification'] } }
+  if (hostRec.chainId !== claim.chainId || hostRec.terminalVulnClass !== claim.terminalVulnClass) return { claim, passed: false, detail: 'composite_receipt claim identity does not match the host-signed composite verification record.', observed: { confirmed: false, rejectedBy: 'composite_receipt', missingEvidence: ['composite_identity_match'] } }
+  if (!hostRec.confirmed) return { claim, passed: false, detail: `CompositeProofReceipt rejected at stage '${hostRec.failedStage ?? 'unknown'}': ${hostRec.reason}`, observed: { confirmed: false, chainId: hostRec.chainId, terminalVulnClass: hostRec.terminalVulnClass, hopCount: hostRec.hopCount, failedStage: hostRec.failedStage ?? null, rejectedBy: hostRec.rejectedBy ?? 'composite_receipt', missingEvidence: hostRec.missingEvidence, reason: hostRec.reason } }
+  for (const id of hostRec.exchangeIds) {
+    if (!requireAllowedRecord(store, context, id)) return { claim, passed: false, detail: `composite_receipt cites exchange ${id} outside this attempt transcript.`, observed: { confirmed: false, rejectedBy: 'composite_transcript_integrity', missingEvidence: ['attempt_transcript_exchange'] } }
+  }
+  if (isSignedUrlMintLabel(hostRec.terminalVulnClass)) {
+    const prbId = hostRec.terminalExchangeId ?? hostRec.exchangeIds[hostRec.exchangeIds.length - 1]
+    const ctlId = hostRec.exchangeIds.find(id => id !== prbId)
+    const toEx = (id: string | undefined) => {
+      if (!id) return null
+      const rec = store.get(id), fact = context.factLog?.getExchange(id)
+      return { exchangeId: id, origin: fact?.origin || rec?.request?.origin || '', method: (fact?.method || rec?.request?.method || 'GET').toUpperCase(), pathAndQuery: fact?.pathAndQuery || rec?.request?.pathAndQuery || '/', status: fact?.status ?? recordStatus(rec), actorHandle: fact?.actor ?? rec?.request?.personaHandle ?? null, requestHeaders: fact?.requestHeaders ?? rec?.request?.headers ?? null, requestBody: fact?.rawRequestBody ?? store.requestBody(id) ?? null, responseHeaders: fact?.responseHeaders ?? rec?.response?.headers ?? null, responseBody: fact?.rawResponseBody ?? store.body(id) ?? null, wireCredentialProvenance: fact?.wireCredentialProvenance ?? null }
+    }
+    const ctlEx = toEx(ctlId), prbEx = toEx(prbId)
+    const suCheck = ctlEx && prbEx ? verifySignedUrlMintPair({ control: ctlEx, probe: prbEx, controlSessionId: context.factLog?.getExchange(ctlId!)?.sessionId ?? null, probeSessionId: context.factLog?.getExchange(prbId!)?.sessionId ?? null }) : null
+    if (!suCheck || !suCheck.confirmed) return { claim, passed: false, detail: suCheck?.reason ?? 'signed_url_mint composite_receipt missing distinct control and probe exchanges.', observed: { confirmed: false, rejectedBy: suCheck?.rejectedBy ?? 'signed_url_mint', missingEvidence: suCheck?.missingEvidence ?? ['valid_signed_url_pair'] } }
+  }
+  return { claim, passed: true, detail: hostRec.reason, observed: { confirmed: true, chainId: hostRec.chainId, terminalVulnClass: hostRec.terminalVulnClass, replayMode: hostRec.replayMode, hopCount: hostRec.hopCount, verifiedEdgeCount: hostRec.verifiedEdgeCount } }
+}
+
+// Bind all oracle claim evaluators to their exact declaring OracleSpec IDs and seal the registry (`R3-13`).
+const CLAIM_EVALUATOR_BINDINGS = [
+  ['impact', evaluateImpactClaim], ['boundary', evaluateBoundaryClaim], ['mfa', evaluateMfaClaim],
+  ['dom_sentinel', evaluateDomSentinelClaim], ['oob', evaluateOobClaim], ['timing', evaluateTimingClaim],
+  ['structural_diff', evaluateStructuralDiffClaim], ['race', evaluateRaceClaim],
+  ['composite_receipt', evaluateCompositeReceiptClaim], ['host_evaluated_expression', evaluateClaim],
+] as const
+for (const [kind, fn] of CLAIM_EVALUATOR_BINDINGS) {
+  registerOracleClaimEvaluator(DEFAULT_ORACLE_SPEC_REGISTRY.list().filter(s => s.claimKinds.includes(kind)).map(s => s.id), kind, (s, c, ctx) => fn(s as TranscriptStore, c as never, ctx as VerifyClaimContext))
+}
+sealOracleClaimEvaluators()
+
 export function evaluateClaim(
   store: TranscriptStore,
   claim: VerifyClaim,
   context: VerifyClaimContext,
 ): VerifyClaimCheck {
-  const requireRecord = (id: string): VerifyTranscriptRecord | null => {
-    if (context.allowedExchangeIds && !context.allowedExchangeIds.has(id)) return null
-    return store.get(id) ?? null
+  if (claim.kind !== 'host_evaluated_expression') {
+    const registered = evaluateRegisteredOracleClaim<TranscriptStore, VerifyClaim, VerifyClaimContext, VerifyClaimCheck>(store, claim, context)
+    if (registered) return registered
   }
+  const requireRecord = (id: string): VerifyTranscriptRecord | null => requireAllowedRecord(store, context, id)
   switch (claim.kind) {
-    case 'impact':
-      return evaluateImpactClaim(store, claim, context)
-    case 'boundary':
-      return evaluateBoundaryClaim(store, claim, context)
-    case 'mfa':
-      return evaluateMfaClaim(store, claim, context)
+    case 'host_evaluated_expression': {
+      const verifiedChs = claim.hostMintedChallengeIds.map(id => defaultHostMintedOracle.verifyExpressionChallenge(defaultHostMintedOracle.getExpressionChallenge(id)))
+      if (verifiedChs.length === 0 || verifiedChs.some(c => !c)) return { claim, passed: false, detail: 'host_evaluated_expression references an unknown or unverified host-minted challenge.', observed: { rejectedBy: 'host_evaluated_expression' } }
+      const chs = verifiedChs as NonNullable<(typeof verifiedChs)[number]>[]
+      const ctlRecs = claim.controlIds.map(requireRecord), prbRecs = claim.probeIds.map(requireRecord)
+      if (ctlRecs.some(r => !r?.response) || prbRecs.some(r => !r?.response)) return { claim, passed: false, detail: 'host_evaluated_expression references an unknown or failed control/probe exchange.', observed: { rejectedBy: 'host_evaluated_expression' } }
+      if ([...claim.controlIds, ...claim.probeIds].some(id => { const s = toTranscriptStep(store, id, 'probe', { factLog: context.factLog }); return Boolean(s && stepHasRedactedRequestPlane(s)) })) return { claim, passed: false, detail: 'host_evaluated_expression rejected: kernel request plane contains a redacted placeholder ([redacted...]).', observed: { rejectedBy: 'redacted_request_plane' } }
+      const ok2xx = (r: VerifyTranscriptRecord | null) => { const s = recordStatus(r ?? undefined); return s !== null && s >= 200 && s < 300 }
+      const ctlBodies = claim.controlIds.map(id => store.body(id) ?? ''), prbBodies = claim.probeIds.map(id => store.body(id) ?? '')
+      const outputs = chs.map(c => c.expectedOutput), varying = outputs.length < 2 || new Set(outputs).size === outputs.length
+      const matched = chs.length === prbBodies.length && chs.every((ch, i) => {
+        const pid = claim.probeIds[i]!, fact = context.factLog?.getExchange(pid), prbRec = prbRecs[i]!
+        const check = verifyHostExpressionProbe({ probeRequest: { pathAndQuery: fact?.pathAndQuery ?? prbRec.request?.pathAndQuery, requestBody: fact?.rawRequestBody ?? store.requestBody(pid) ?? null, requestHeaders: fact?.requestHeaders ?? prbRec.request?.headers ?? null }, probeBody: prbBodies[i]!, probeStatus: recordStatus(prbRec), controlBodies: ctlBodies, stampedChallenge: fact?.hostExpressionChallenge ?? prbRec.hostExpressionChallenge, expectedChallengeId: ch.challengeId, vulnClass: claim.vulnClass })
+        return check.ok && outputs.every((o, j) => j === i || !prbBodies[i]!.includes(o))
+      })
+      const passed = ctlRecs.every(ok2xx) && prbRecs.every(ok2xx) && varying && matched
+      return { claim, passed, detail: passed ? `Host-minted ${chs[0]!.family} expression evaluation verified across ${chs.length} challenge(s).` : 'Host-minted evaluated-expression verification failed (missing per-exchange stamp, malformed escape, non-varying operands, control leakage, reflection, or absent computed output).', observed: { passed, family: chs[0]!.family, challengeCount: chs.length, vulnClass: claim.vulnClass ?? null } }
+    }
     case 'status': {
       const record = requireRecord(claim.exchangeId)
       if (!record) return { claim, passed: false, detail: `Unknown exchange id ${claim.exchangeId}; claims must reference recorded RPC exchanges.` }
       if (!record.response) return { claim, passed: false, detail: `Exchange ${claim.exchangeId} has no recorded response (${record.error ?? 'failed'}).` }
       const expected = Array.isArray(claim.expected) ? claim.expected : [claim.expected]
       const passed = expected.includes(record.response.status)
-      return {
-        claim,
-        passed,
-        detail: `status ${record.response.status} ${passed ? 'in' : 'not in'} [${expected.join(', ')}]`,
-        observed: { status: record.response.status, exchangeId: claim.exchangeId },
-      }
+      return { claim, passed, detail: `status ${record.response.status} ${passed ? 'in' : 'not in'} [${expected.join(', ')}]`, observed: { status: record.response.status, exchangeId: claim.exchangeId } }
     }
     case 'header': {
       const record = requireRecord(claim.exchangeId)
       if (!record) return { claim, passed: false, detail: `Unknown exchange id ${claim.exchangeId}.` }
       const value = observedHeader(record, claim.name)
-      if (claim.absent) {
-        return { claim, passed: value === undefined, detail: value === undefined ? `header ${claim.name} absent` : `header ${claim.name} unexpectedly present`, observed: { value: value ?? null } }
-      }
+      if (claim.absent) return { claim, passed: value === undefined, detail: value === undefined ? `header ${claim.name} absent` : `header ${claim.name} unexpectedly present`, observed: { value: value ?? null } }
       if (value === undefined) return { claim, passed: false, detail: `header ${claim.name} missing`, observed: { value: null } }
       if (claim.equals !== undefined) {
         const passed = value === claim.equals
@@ -1300,8 +1498,7 @@ export function evaluateClaim(
     case 'body_contains': {
       const record = requireRecord(claim.exchangeId)
       if (!record) return { claim, passed: false, detail: `Unknown exchange id ${claim.exchangeId}.` }
-      const body = store.body(claim.exchangeId) ?? ''
-      const present = body.includes(claim.text)
+      const present = (store.body(claim.exchangeId) ?? '').includes(claim.text)
       const passed = claim.absent ? !present : present
       return { claim, passed, detail: claim.absent ? (passed ? 'text absent' : 'text unexpectedly present') : (passed ? 'text present' : 'text absent') }
     }
@@ -1312,12 +1509,8 @@ export function evaluateClaim(
       if (body === undefined) return { claim, passed: false, detail: `Exchange ${claim.exchangeId} has no recorded body.` }
       let parsed: unknown
       try { parsed = JSON.parse(body) } catch { return { claim, passed: false, detail: 'Recorded response body is not JSON.' } }
-      const result = evaluateJsonPath(parsed, claim.path)
-      const observed = result.value
-      if (claim.exists !== undefined) {
-        const passed = claim.exists ? result.found : !result.found
-        return { claim, passed, detail: `${claim.path} ${result.found ? 'exists' : 'missing'}`, observed: { value: observed ?? null } }
-      }
+      const result = evaluateJsonPath(parsed, claim.path), observed = result.value
+      if (claim.exists !== undefined) return { claim, passed: claim.exists ? result.found : !result.found, detail: `${claim.path} ${result.found ? 'exists' : 'missing'}`, observed: { value: observed ?? null } }
       if (claim.equals !== undefined) {
         const passed = JSON.stringify(observed) === JSON.stringify(claim.equals)
         return { claim, passed, detail: `${claim.path} ${passed ? 'matches' : 'differs from'} expected value`, observed: { value: observed ?? null } }
@@ -1337,279 +1530,15 @@ export function evaluateClaim(
       if (html === undefined) return { claim, passed: false, detail: `Exchange ${claim.exchangeId} has no recorded DOM.` }
       const selector = parseSelector(claim.selector)
       if (!selector) return { claim, passed: false, detail: `Unsupported selector-lite syntax: ${claim.selector}` }
-      const matches = scanElements(html).filter(element => matchesSelector(element, selector))
-      if (claim.exists !== undefined) {
-        const passed = claim.exists ? matches.length > 0 : matches.length === 0
-        return { claim, passed, detail: `selector ${claim.selector} matched ${matches.length} element(s)`, observed: { count: matches.length } }
-      }
-      if (claim.count !== undefined) {
-        const passed = matches.length === claim.count
-        return { claim, passed, detail: `selector ${claim.selector} matched ${matches.length}, expected ${claim.count}`, observed: { count: matches.length } }
-      }
+      const matches = scanElements(html).filter(e => matchesSelector(e, selector))
+      if (claim.exists !== undefined) return { claim, passed: claim.exists ? matches.length > 0 : matches.length === 0, detail: `selector ${claim.selector} matched ${matches.length} element(s)`, observed: { count: matches.length } }
+      if (claim.count !== undefined) return { claim, passed: matches.length === claim.count, detail: `selector ${claim.selector} matched ${matches.length}, expected ${claim.count}`, observed: { count: matches.length } }
       if (claim.textContains !== undefined || claim.textEquals !== undefined) {
         const text = matches.map(m => m.text).join(' ')
         const passed = claim.textEquals !== undefined ? text === claim.textEquals : text.includes(claim.textContains ?? '')
         return { claim, passed, detail: `selector ${claim.selector} text ${passed ? 'matched' : 'did not match'}`, observed: { text: text.slice(0, 200) } }
       }
       return { claim, passed: matches.length > 0, detail: `selector ${claim.selector} matched ${matches.length} element(s)`, observed: { count: matches.length } }
-    }
-    case 'dom_sentinel': {
-      const record = requireRecord(claim.exchangeId)
-      if (!record) return { claim, passed: false, detail: `Unknown exchange id ${claim.exchangeId}.` }
-      const mode = claim.mode ?? 'executed'
-      if (mode === 'executed') {
-        const executed = record.artifact?.executedSentinels ?? []
-        const passed = executed.includes(claim.sentinel)
-        return { claim, passed, detail: `execution sentinel ${passed ? 'observed' : 'not observed'}`, observed: { executed: executed.slice(0, 8) } }
-      }
-      const html = store.body(claim.exchangeId) ?? ''
-      const passed = html.includes(claim.sentinel)
-      return { claim, passed, detail: `DOM sentinel ${passed ? 'present' : 'absent'}`, observed: { present: passed } }
-    }
-    case 'oob': {
-      const record = requireRecord(claim.exchangeId)
-      if (!record) return { claim, passed: false, detail: `Unknown exchange id ${claim.exchangeId}.` }
-      if (record.op !== 'oob' || !record.artifact?.token) {
-        return { claim, passed: false, detail: `Exchange ${claim.exchangeId} is not an OOB mint.` }
-      }
-      const expectHit = claim.expectHit ?? true
-      let liveHit: boolean | null = null
-      if (context.canary) {
-        try { liveHit = context.canary.checkCanary(record.artifact.token).hit } catch { liveHit = null }
-      }
-      // A signed `oob check` record for the same token is append-only evidence of the callback;
-      // the mint record itself is signed before any hit is known.
-      const checkRecord = store.list().find(candidate =>
-        candidate.op === 'oob' &&
-        candidate.artifact?.token === record.artifact?.token &&
-        candidate.artifact?.hit === true,
-      )
-      const recordedHit = Boolean(record.artifact.hit) || Boolean(checkRecord)
-      const hit = liveHit === null ? recordedHit : recordedHit && liveHit
-      const passed = expectHit ? hit : !hit
-      return {
-        claim,
-        passed,
-        detail: `OOB canary ${hit ? 'triggered' : 'did not trigger'}${liveHit === null ? ' (recorded)' : ' (re-checked)'}`,
-        observed: { token: record.artifact.token, hit, liveHit },
-      }
-    }
-    case 'timing': {
-      const minPairs = Math.max(3, Math.min(claim.minPairs ?? 5, 7))
-      const controlIds = claim.controlIds
-      const variantIds = claim.variantIds
-      if (controlIds.length < minPairs || variantIds.length < minPairs) {
-        return { claim, passed: false, detail: `timing needs ${minPairs} interleaved pairs; got ${controlIds.length}/${variantIds.length}.` }
-      }
-      const controlRecords: VerifyTranscriptRecord[] = []
-      const variantRecords: VerifyTranscriptRecord[] = []
-      for (const id of controlIds) {
-        const r = requireRecord(id)
-        if (!r?.response) return { claim, passed: false, detail: `Unknown or failed timing control exchange ${id}.` }
-        controlRecords.push(r)
-      }
-      for (const id of variantIds) {
-        const r = requireRecord(id)
-        if (!r?.response) return { claim, passed: false, detail: `Unknown or failed timing variant exchange ${id}.` }
-        variantRecords.push(r)
-      }
-      // Interleaving check: a stable slow endpoint cannot fake separation by batching all probes.
-      const ordered = [...controlRecords.map(r => ({ seq: r.seq, g: 0 })), ...variantRecords.map(r => ({ seq: r.seq, g: 1 }))]
-        .sort((a, b) => a.seq - b.seq)
-      let run = 0
-      let previous = -1
-      for (const item of ordered) {
-        if (item.g === previous) run += 1
-        else { run = 1; previous = item.g }
-        if (run > 2) return { claim, passed: false, detail: 'timing exchanges are not interleaved control/variant pairs.' }
-      }
-      const control = controlRecords.map(r => r.durationMs)
-      const variant = variantRecords.map(r => r.durationMs)
-      const stats = mannWhitneyU(control, variant)
-      const maxP = Math.min(Math.max(claim.maxPValue ?? 0.05, 0.001), 0.05)
-      const passed = stats.pValue <= maxP && stats.separation >= 3
-      return {
-        claim,
-        passed,
-        detail: `Mann-Whitney p=${stats.pValue.toFixed(4)} separation=${stats.separation.toFixed(2)} (medians ${stats.medianControl.toFixed(1)}ms -> ${stats.medianVariant.toFixed(1)}ms)`,
-        observed: {
-          pValue: Number(stats.pValue.toFixed(6)),
-          separation: Number(stats.separation.toFixed(3)),
-          medianControl: stats.medianControl,
-          medianVariant: stats.medianVariant,
-          madControl: stats.madControl,
-          madVariant: stats.madVariant,
-          pairs: control.length,
-        },
-      }
-    }
-    case 'structural_diff': {
-      const minRounds = Math.max(2, Math.min(claim.minRounds ?? 3, 10))
-      if (claim.controlIds.length < minRounds || claim.variantIds.length < minRounds) {
-        return { claim, passed: false, detail: `structural_diff needs ${minRounds} control and ${minRounds} variant exchanges; got ${claim.controlIds.length}/${claim.variantIds.length}.` }
-      }
-      const bodyOf = (id: string): string | null => {
-        if (context.allowedExchangeIds && !context.allowedExchangeIds.has(id)) return null
-        const record = requireRecord(id)
-        if (!record?.response) return null
-        return store.body(id) ?? ''
-      }
-      const controlBodies = claim.controlIds.map(bodyOf)
-      const variantBodies = claim.variantIds.map(bodyOf)
-      if (controlBodies.some(body => body === null)) return { claim, passed: false, detail: 'structural_diff references an unknown or failed control exchange.' }
-      if (variantBodies.some(body => body === null)) return { claim, passed: false, detail: 'structural_diff references an unknown or failed variant exchange.' }
-      const controls = controlBodies as string[]
-      const variants = variantBodies as string[]
-      // R2-H-29: Normalize each arm body once instead of renormalizing O(rounds) times per claim.
-      const normControls = controls.map(normalizeStructuralTokens)
-      const normVariants = variants.map(normalizeStructuralTokens)
-      const unstableControl = normControls.some(body => !structuralDiffNormalized(normControls[0]!, body).normalizedEqual)
-      const unstableVariant = normVariants.some(body => !structuralDiffNormalized(normVariants[0]!, body).normalizedEqual)
-      if (unstableControl || unstableVariant) {
-        return {
-          claim,
-          passed: false,
-          detail: `structural_diff needs a stable response within each arm after token stripping; ${unstableControl ? 'control' : 'variant'} arm drifted between rounds.`,
-          observed: { stableControl: !unstableControl, stableVariant: !unstableVariant },
-        }
-      }
-      const roundDeltas = normControls.map((body, index) => structuralDiffNormalized(body, normVariants[index] ?? normVariants[0]!).changedTokens)
-      const stableDelta = intersectStructuralDeltas(roundDeltas)
-      const cross = structuralDiffNormalized(normControls[0]!, normVariants[0]!)
-      const minDelta = Math.max(1, Math.min(claim.minDeltaTokens ?? 1, 32))
-      const maxSimilarity = claim.maxSimilarity ?? 1
-      const distinct = !cross.normalizedEqual && stableDelta.length >= minDelta && cross.similarity < maxSimilarity
-      const diffObs = { stableDelta: stableDelta.slice(0, 16), similarity: Number(cross.similarity.toFixed(4)), rounds: controls.length, stableControl: !unstableControl, stableVariant: !unstableVariant }
-      if (distinct) {
-        const vStubs = claim.variantIds.map((id, i) => detectIntermediateStub(store.get(id), variants[i]))
-        const sdFamily = inferInjectionFamily(context, [claim])
-        if (vStubs.every(s => s.isStub) && claim.variantIds.every(id => { const s = toTranscriptStep(store, id, 'probe', { factLog: context.factLog }); return !s || matchStrippedInjectionFingerprint(s, sdFamily) === null }) &&
-            (vStubs.every(s => s.pureJobStub) || claim.controlIds.every(id => (recordStatus(store.get(id)) ?? 0) >= 400))) {
-          return stubRejection(claim, vStubs[0]?.state ?? 'draft', diffObs)
-        }
-      }
-      // A changed token must be present in the same direction in every round: intersect alone can
-      // keep tokens that rotate between two unrelated arms, so require the first arm's delta.
-      return {
-        claim,
-        passed: distinct,
-        detail: distinct
-          ? `Structural differential: ${stableDelta.length} stable token(s) changed between arms (similarity ${cross.similarity.toFixed(3)}).`
-          : `No stable structural differential: ${stableDelta.length} stable changed token(s), similarity ${cross.similarity.toFixed(3)}; ${cross.normalizedEqual ? 'the arms are identical after token stripping' : 'the delta is not stable across rounds'}.`,
-        observed: diffObs,
-      }
-    }
-    case 'race': {
-      const minDistinct = Math.max(2, Math.min(claim.minDistinctOutcomes ?? 2, claim.exchangeIds.length))
-      if (claim.exchangeIds.length < 2 || claim.exchangeIds.length > 10) {
-        return { claim, passed: false, detail: `race needs between 2 and 10 exchanges; got ${claim.exchangeIds.length}.` }
-      }
-      const records: VerifyTranscriptRecord[] = []
-      for (const id of claim.exchangeIds) {
-        const record = requireRecord(id)
-        if (!record?.response) return { claim, passed: false, detail: `Unknown or failed race exchange ${id}.` }
-        records.push(record)
-      }
-      if (claim.mode === 'h2-single-packet' && records.some(record => record.op !== 'http2')) {
-        return { claim, passed: false, detail: 'race claims an HTTP/2 single-packet barrier but the transcript recorded an HTTP/1.1 fallback exchange.' }
-      }
-      if (claim.expectAllSuccess !== false && records.some(record => (record.response?.status ?? 0) < 200 || (record.response?.status ?? 0) >= 300)) {
-        return {
-          claim,
-          passed: false,
-          detail: 'race burst expected every participant to succeed; at least one exchange was denied or errored, so no duplicate effect is attributable to the burst.',
-          observed: { statuses: records.map(record => record.response?.status ?? null) },
-        }
-      }
-      const distinctBodies = new Set(records.map(record => record.response?.bodySha256 ?? '')).size
-      const distinctStatuses = new Set(records.map(record => record.response?.status ?? 0)).size
-      const distinctOutcomes = Math.max(distinctBodies, distinctStatuses)
-      const passed = distinctOutcomes >= minDistinct
-      return {
-        claim,
-        passed,
-        detail: passed
-          ? `Race burst produced ${distinctOutcomes} distinct outcome(s) across ${records.length} synchronized exchanges (${claim.mode ?? 'mode-unspecified'}); a serialized/idempotent handler would return one outcome.`
-          : `Race burst produced one idempotent outcome across ${records.length} synchronized exchanges; duplicate-effect evidence is missing.`,
-        observed: {
-          distinctBodies,
-          distinctStatuses,
-          distinctOutcomes,
-          statuses: records.map(record => record.response?.status ?? null),
-          mode: claim.mode ?? null,
-          ops: [...new Set(records.map(record => record.op))],
-        },
-      }
-    }
-    case 'composite_receipt': {
-      const hostRec = claim.verificationId ? store.getCompositeVerification(claim.verificationId) : undefined
-      if (!hostRec) {
-        return {
-          claim,
-          passed: false,
-          detail: 'composite_receipt claim must reference a host-verified composite.verify verificationId recorded in this session transcript.',
-          observed: { confirmed: false, rejectedBy: 'composite_receipt', missingEvidence: ['host_composite_verification'] },
-        }
-      }
-      if (hostRec.chainId !== claim.chainId || hostRec.terminalVulnClass !== claim.terminalVulnClass) {
-        return {
-          claim,
-          passed: false,
-          detail: 'composite_receipt claim identity does not match the host-signed composite verification record.',
-          observed: { confirmed: false, rejectedBy: 'composite_receipt', missingEvidence: ['composite_identity_match'] },
-        }
-      }
-      if (!hostRec.confirmed) {
-        return {
-          claim,
-          passed: false,
-          detail: `CompositeProofReceipt rejected at stage '${hostRec.failedStage ?? 'unknown'}': ${hostRec.reason}`,
-          observed: {
-            confirmed: false,
-            chainId: hostRec.chainId,
-            terminalVulnClass: hostRec.terminalVulnClass,
-            hopCount: hostRec.hopCount,
-            failedStage: hostRec.failedStage ?? null,
-            rejectedBy: hostRec.rejectedBy ?? 'composite_receipt',
-            missingEvidence: hostRec.missingEvidence,
-            reason: hostRec.reason,
-          },
-        }
-      }
-      for (const id of hostRec.exchangeIds) {
-        if (!requireRecord(id)) return { claim, passed: false, detail: `composite_receipt cites exchange ${id} outside this attempt transcript.`, observed: { confirmed: false, rejectedBy: 'composite_transcript_integrity', missingEvidence: ['attempt_transcript_exchange'] } }
-      }
-      if (/^(?:signed_url_mint|presigned_url_mint|signed_url_traversal|storage_signed_url|gcs_signed_url|s3_presigned_url|azure_sas_mint)$/i.test(hostRec.terminalVulnClass)) {
-        const prbId = hostRec.terminalExchangeId ?? hostRec.exchangeIds[hostRec.exchangeIds.length - 1]
-        const ctlId = hostRec.exchangeIds.find(id => id !== prbId)
-        const toEx = (id: string | undefined) => {
-          if (!id) return null
-          const rec = store.get(id), fact = context.factLog?.getExchange(id)
-          return { exchangeId: id, origin: fact?.origin || rec?.request?.origin || '', method: (fact?.method || rec?.request?.method || 'GET').toUpperCase(), pathAndQuery: fact?.pathAndQuery || rec?.request?.pathAndQuery || '/', status: fact?.status ?? recordStatus(rec), actorHandle: fact?.actor ?? rec?.request?.personaHandle ?? null, requestHeaders: fact?.requestHeaders ?? rec?.request?.headers ?? null, requestBody: fact?.rawRequestBody ?? store.requestBody(id) ?? null, responseHeaders: fact?.responseHeaders ?? rec?.response?.headers ?? null, responseBody: fact?.rawResponseBody ?? store.body(id) ?? null, wireCredentialProvenance: fact?.wireCredentialProvenance ?? null }
-        }
-        const ctlEx = toEx(ctlId), prbEx = toEx(prbId)
-        const suCheck = ctlEx && prbEx ? verifySignedUrlMintPair({ control: ctlEx, probe: prbEx, controlSessionId: context.factLog?.getExchange(ctlId!)?.sessionId ?? null, probeSessionId: context.factLog?.getExchange(prbId!)?.sessionId ?? null }) : null
-        if (!suCheck || !suCheck.confirmed) return { claim, passed: false, detail: suCheck?.reason ?? 'signed_url_mint composite_receipt missing distinct control and probe exchanges.', observed: { confirmed: false, rejectedBy: suCheck?.rejectedBy ?? 'signed_url_mint', missingEvidence: suCheck?.missingEvidence ?? ['valid_signed_url_pair'] } }
-      }
-      return { claim, passed: true, detail: hostRec.reason, observed: { confirmed: true, chainId: hostRec.chainId, terminalVulnClass: hostRec.terminalVulnClass, replayMode: hostRec.replayMode, hopCount: hostRec.hopCount, verifiedEdgeCount: hostRec.verifiedEdgeCount } }
-    }
-    case 'host_evaluated_expression': {
-      const verifiedChs = claim.hostMintedChallengeIds.map(id => defaultHostMintedOracle.verifyExpressionChallenge(defaultHostMintedOracle.getExpressionChallenge(id)))
-      if (verifiedChs.length === 0 || verifiedChs.some(c => !c)) return { claim, passed: false, detail: 'host_evaluated_expression references an unknown or unverified host-minted challenge.', observed: { rejectedBy: 'host_evaluated_expression' } }
-      const chs = verifiedChs as NonNullable<(typeof verifiedChs)[number]>[]
-      const ctlRecs = claim.controlIds.map(requireRecord), prbRecs = claim.probeIds.map(requireRecord)
-      if (ctlRecs.some(r => !r?.response) || prbRecs.some(r => !r?.response)) return { claim, passed: false, detail: 'host_evaluated_expression references an unknown or failed control/probe exchange.', observed: { rejectedBy: 'host_evaluated_expression' } }
-      if ([...claim.controlIds, ...claim.probeIds].some(id => { const s = toTranscriptStep(store, id, 'probe', { factLog: context.factLog }); return Boolean(s && stepHasRedactedRequestPlane(s)) })) return { claim, passed: false, detail: 'host_evaluated_expression rejected: kernel request plane contains a redacted placeholder ([redacted...]).', observed: { rejectedBy: 'redacted_request_plane' } }
-      const ok2xx = (r: VerifyTranscriptRecord | null) => { const s = recordStatus(r ?? undefined); return s !== null && s >= 200 && s < 300 }
-      const ctlBodies = claim.controlIds.map(id => store.body(id) ?? ''), prbBodies = claim.probeIds.map(id => store.body(id) ?? '')
-      const outputs = chs.map(c => c.expectedOutput), varying = outputs.length < 2 || new Set(outputs).size === outputs.length
-      const matched = chs.length === prbBodies.length && chs.every((ch, i) => {
-        const pid = claim.probeIds[i]!, fact = context.factLog?.getExchange(pid), prbRec = prbRecs[i]!
-        const check = verifyHostExpressionProbe({ probeRequest: { pathAndQuery: fact?.pathAndQuery ?? prbRec.request?.pathAndQuery, requestBody: fact?.rawRequestBody ?? store.requestBody(pid) ?? null, requestHeaders: fact?.requestHeaders ?? prbRec.request?.headers ?? null }, probeBody: prbBodies[i]!, probeStatus: recordStatus(prbRec), controlBodies: ctlBodies, stampedChallenge: fact?.hostExpressionChallenge ?? prbRec.hostExpressionChallenge, expectedChallengeId: ch.challengeId, vulnClass: claim.vulnClass })
-        return check.ok && outputs.every((o, j) => j === i || !prbBodies[i]!.includes(o))
-      })
-      const passed = ctlRecs.every(ok2xx) && prbRecs.every(ok2xx) && varying && matched
-      return { claim, passed, detail: passed ? `Host-minted ${chs[0]!.family} expression evaluation verified across ${chs.length} challenge(s).` : 'Host-minted evaluated-expression verification failed (missing per-exchange stamp, malformed escape, non-varying operands, control leakage, reflection, or absent computed output).', observed: { passed, family: chs[0]!.family, challengeCount: chs.length, vulnClass: claim.vulnClass ?? null } }
     }
     default:
       return { claim, passed: false, detail: 'Unsupported claim.' }

@@ -13,6 +13,11 @@ import { parseBodyFromCarrierText } from './host-fact-log.ts'
 import { ROLE_RANK, normalizeRole, parseRoleMemberships, resolvePersonaIdentity, stepReadsState, type RoleName } from './oracle-invariants.ts'
 import type { ProofReceipt } from './proof-receipt.ts'
 import { deriveRecordAuthzDimension, extractIssuedSignedUrl, extractTenantMarkers, findNonErrorBatchRecord, isJobOrHandleStub, type HostAuthzDimension, type HostSignedRecord, type V8OracleFamily } from './v8-oracle-families.ts'
+import {
+  buildTerminalClassContractMap,
+  resolveTerminalContractKind,
+  type OracleTerminalContractKind,
+} from './oracle-spec.ts'
 
 export interface HydratableEntry {
   exchangeId: string
@@ -1443,26 +1448,13 @@ export function selectStateTransitionPair<T extends HydratableEntry>(
 
 // --- Closed Terminal Class Contract & Exact Host-Provenance Matchers (R2-C-3, R2-H-6, R2-H-7/H-12) ---
 
-export type TerminalContractKind =
-  | 'v8_dual_tenant' | 'v8_temporal' | 'v8_economic' | 'v8_crypto' | 'v8_parser_cache' | 'v8_pivot'
-  | 'access_control' | 'auth_or_logic' | 'oob' | 'browser' | 'injection_or_redirect'
+export type TerminalContractKind = OracleTerminalContractKind
 
-const clsMap = (kind: TerminalContractKind, names: string): [string, TerminalContractKind][] =>
-  names.split(' ').map(n => [n, kind])
-
-export const TERMINAL_CLASS_CONTRACT: Readonly<Record<string, TerminalContractKind>> = Object.fromEntries([
-  ['dual_tenant_abac', 'v8_dual_tenant'], ['temporal_revocation', 'v8_temporal'], ['economic_conservation', 'v8_economic'],
-  ['cryptographic_scope_replay', 'v8_crypto'], ['parser_cache_differential', 'v8_parser_cache'], ['cross_surface_pivot', 'v8_pivot'],
-  ...clsMap('access_control', 'bola idor authorization broken_access_control broken-access-control access_control authz_bypass authorization_bypass authz_escalation bfla privilege_escalation cross_tenant cross_tenant_read cross_tenant_write cross_tenant_export cross_tenant_document_read cross_tenant_exfiltration cross_tenant_repo_theft cross_tenant_secret_read cross_tenant_partner_export cross_tenant_admin_takeover cross_tenant_chain cache_tenant_bleed disclosure info_disclosure information_disclosure secret_disclosed data_exposure mass_assignment csrf'),
-  ...clsMap('auth_or_logic', 'auth_bypass authentication_bypass jwt_forgery broken_auth auth_protocol token_forgery business_logic invariant_violation workflow_skip maker_checker_bypass self_approved_payout unapproved_prod_release unauthorized_prod_release forged_settlement ledger_overcredit stale_privilege_use internal_token_exfiltration delegated_billing_rebate split_refund_ledger_break race race_double_spend race_condition race_burst double_spend oversell inventory_oversell conserved_balance toctou'),
-  ...clsMap('oob', 'ssrf blind_ssrf xxe blind_xxe oob webhook_forgery'),
-  ...clsMap('browser', 'xss xss_stored xss_reflected markup html_injection dom_xss browser_xss postmessage'),
-  ...clsMap('injection_or_redirect', 'sqli sqli_error sqli_time sql_time blind_sqli sql_boolean sql_boolean_diff boolean_sqli boolean_differential sqli_status sql_status sql_status_diff status_sqli status_boolean nosqli nosql_injection ssti template_injection command_injection cmdi rce path_traversal directory_traversal injection injection-input injection_input open_redirect redirect url_redirect unvalidated_redirect'),
-])
+export const TERMINAL_CLASS_CONTRACT: Readonly<Record<string, TerminalContractKind>> = buildTerminalClassContractMap()
 
 export const resolveTerminalContract = (cls: string): TerminalContractKind | null => {
   const n = cls.trim().toLowerCase()
-  return TERMINAL_CLASS_CONTRACT[n] ?? (/^(?:browser_|dom_|postmessage)/i.test(n) ? 'browser' : null)
+  return TERMINAL_CLASS_CONTRACT[n] ?? resolveTerminalContractKind(n)
 }
 
 const SECRET_LEAF_KEY_RE = /secret|passw|token|auth|cookie|cred|private|api_?key|jwt|session|sig|hmac/i
