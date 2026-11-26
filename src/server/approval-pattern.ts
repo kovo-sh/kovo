@@ -20,9 +20,8 @@ const PLACEHOLDER_SEGMENT = /^(?::[A-Za-z0-9_]+|\{[A-Za-z0-9_]+\}|\[[A-Za-z0-9_]
  * never match a sibling verb or a literal path word: that is how an approval for
  * `POST /api/items/<id>` used to cover `POST /api/items/delete`.
  */
-function isIdLikeSegment(segment: string): boolean {
+function isConcreteIdSegment(segment: string): boolean {
   return (
-    PLACEHOLDER_SEGMENT.test(segment) ||
     UUID_SEGMENT.test(segment) ||
     MONGO_ID_SEGMENT.test(segment) ||
     NUMERIC_SEGMENT.test(segment) ||
@@ -30,6 +29,81 @@ function isIdLikeSegment(segment: string): boolean {
     PREFIXED_ID_SEGMENT.test(segment) ||
     OPAQUE_TOKEN_SEGMENT.test(segment)
   )
+}
+
+function isIdLikeSegment(segment: string): boolean {
+  return PLACEHOLDER_SEGMENT.test(segment) || isConcreteIdSegment(segment)
+}
+
+export type ApprovalPathPatternSource = 'card_path' | 'operator_explicit'
+
+export interface NormalizeApprovalPathOptions {
+  /**
+   * Provenance of the input path (SECURITY-REAUDIT 1.3 / R3-H-9):
+   * - `'card_path'` (default): worker-originated path from an approval card or target request.
+   *   Literal `*` and `**` segments are escaped to `%2a` / `%2a%2a` so they match ONLY the exact
+   *   literal path segment and never produce a wildcard or prefix glob. Concrete ID segments
+   *   (numeric, UUID, Mongo ID, etc.) still generalize to `*`.
+   * - `'operator_explicit'`: pattern explicitly authored by a human operator. Preserves `*`
+   *   (single ID-shaped segment wildcard), `:id`/`{id}`/`[id]` placeholders, and trailing `**`
+   *   (prefix wildcard, when accompanied by at least one fixed prefix segment).
+   */
+  source?: ApprovalPathPatternSource
+}
+
+export interface ApprovalPathGlobInspection {
+  /** True when any pathname segment contains a `*` glob metacharacter. */
+  hasGlobMetacharacters: boolean
+  /** True when any pathname segment is an exact `*` or `**` wildcard segment. */
+  hasWildcardSegment: boolean
+  /** True when any pathname segment is the `**` prefix-glob segment. */
+  hasPrefixGlobSegment: boolean
+  /** Offending pathname segments containing `*`, in path order. */
+  globSegments: string[]
+}
+
+const ORIGIN_PREFIX_RE = /^[a-z][a-z0-9+.-]*:\/\/[^/?#]*/i
+
+/**
+ * Inspect a worker-submitted request `pathAndQuery` for glob metacharacters (`*`, `**`) in its
+ * pathname segments so approval cards can be flagged before operator review (R3-H-9).
+ * Query strings and fragments are excluded because approval patterns operate on pathnames only.
+ */
+export function inspectApprovalPathGlobs(pathAndQuery: string): ApprovalPathGlobInspection {
+  const canonical = canonicalPathAndQuery(pathAndQuery)
+  let pathname: string
+  if (canonical !== null) {
+    pathname = canonical.split('?', 1)[0]!
+  } else {
+    const trimmed = (pathAndQuery || '').trim()
+    const withoutOrigin = ORIGIN_PREFIX_RE.test(trimmed) ? trimmed.replace(ORIGIN_PREFIX_RE, '') : trimmed
+    const q = withoutOrigin.indexOf('?')
+    const h = withoutOrigin.indexOf('#')
+    const cut = q >= 0 && h >= 0 ? Math.min(q, h) : q >= 0 ? q : h
+    pathname = cut >= 0 ? withoutOrigin.slice(0, cut) : withoutOrigin
+  }
+
+  const globSegments: string[] = []
+  let hasWildcardSegment = false
+  let hasPrefixGlobSegment = false
+  for (const seg of pathname.split('/')) {
+    if (!seg) continue
+    if (seg.includes('*')) {
+      globSegments.push(seg)
+      if (seg === '*' || seg === '**') hasWildcardSegment = true
+      if (seg === '**') hasPrefixGlobSegment = true
+    }
+  }
+  return {
+    hasGlobMetacharacters: globSegments.length > 0,
+    hasWildcardSegment,
+    hasPrefixGlobSegment,
+    globSegments,
+  }
+}
+
+export function hasApprovalPathGlobMetacharacters(pathAndQuery: string): boolean {
+  return inspectApprovalPathGlobs(pathAndQuery).hasGlobMetacharacters
 }
 
 export function normalizeOriginKey(origin: string): string {
@@ -80,7 +154,11 @@ export function computeApprovalHeadersDigest(
   return `hdr:${createHash('sha256').update(JSON.stringify(pairs), 'utf8').digest('hex')}`
 }
 
-export function normalizeApprovalPathPattern(pathAndQuery: string): string {
+export function normalizeApprovalPathPattern(
+  pathAndQuery: string,
+  options?: NormalizeApprovalPathOptions,
+): string {
+  const source: ApprovalPathPatternSource = options?.source ?? 'card_path'
   const canonical = canonicalPathAndQuery(pathAndQuery)
   if (canonical === null) return ''
   let pathname = canonical.split('?', 1)[0]!
@@ -92,8 +170,15 @@ export function normalizeApprovalPathPattern(pathAndQuery: string): string {
   const segments = pathname.split('/').map((seg, idx) => {
     if (idx === 0 && seg === '') return ''
     if (!seg) return ''
-    if (seg === '*' || seg === '**') return seg
-    if (isIdLikeSegment(seg)) return '*'
+    if (seg === '*' || seg === '**') {
+      if (source === 'operator_explicit') return seg
+      // Escape literal worker-submitted glob segments so they match only the exact literal segment
+      // and never become an ID wildcard or prefix glob (R3-H-9 / SECURITY-REAUDIT 1.3).
+      return seg === '**' ? '%2a%2a' : '%2a'
+    }
+    if (source === 'operator_explicit' ? isIdLikeSegment(seg) : isConcreteIdSegment(seg)) {
+      return '*'
+    }
     return seg.toLowerCase()
   })
 
@@ -104,15 +189,18 @@ export function normalizeApprovalPathPattern(pathAndQuery: string): string {
  * Normalized segment view used for pattern matching. `wildcard` is true only for `*` and for
  * segments that are genuinely identifier-shaped; literals must match exactly (case-insensitively).
  * `**` is reserved for an explicit operator-approved prefix pattern and is only honoured as the
- * final segment.
+ * final segment with at least one fixed prefix segment.
  */
 interface ApprovalPathSegment {
   value: string
   wildcard: boolean
 }
 
-function parseApprovalPathSegments(pathAndQuery: string): ApprovalPathSegment[] {
-  const normalized = normalizeApprovalPathPattern(pathAndQuery)
+function parseApprovalPathSegments(
+  pathAndQuery: string,
+  source: ApprovalPathPatternSource,
+): ApprovalPathSegment[] {
+  const normalized = normalizeApprovalPathPattern(pathAndQuery, { source })
   if (!normalized) return []
   return normalized
     .split('/')
@@ -126,24 +214,29 @@ function parseApprovalPathSegments(pathAndQuery: string): ApprovalPathSegment[] 
 
 export function matchesApprovedEndpointPattern(
   target: { origin: string; method: string; pathAndQuery: string },
-  patterns: readonly ApprovedEndpointPattern[] | undefined,
+  patterns: readonly (ApprovedEndpointPattern & { source?: ApprovalPathPatternSource })[] | undefined,
 ): ApprovedEndpointPattern | undefined {
   if (!patterns?.length) return undefined
   const targetOrigin = normalizeOriginKey(target.origin)
   const targetMethod = target.method.toUpperCase()
-  const targetSegs = parseApprovalPathSegments(target.pathAndQuery)
+  const targetNormalized = normalizeApprovalPathPattern(target.pathAndQuery, { source: 'card_path' })
+  if (!targetNormalized) return undefined
+  const targetSegs = parseApprovalPathSegments(target.pathAndQuery, 'card_path')
 
   for (const pattern of patterns) {
     if (normalizeOriginKey(pattern.origin) !== targetOrigin) continue
     if (pattern.method.toUpperCase() !== targetMethod) continue
-    const patSegs = parseApprovalPathSegments(pattern.pathPattern)
+    const patternSource: ApprovalPathPatternSource = pattern.source ?? 'operator_explicit'
+    const patSegs = parseApprovalPathSegments(pattern.pathPattern, patternSource)
     if (patSegs.length === 0) continue
 
     const prefixWildcard = patSegs[patSegs.length - 1]!.value === '**'
-    // `**` is an explicit operator-approved prefix pattern. It is only valid as the last segment
-    // and only when the operator actually wrote it; a trailing `*` never matches arbitrary depth.
+    // `**` is an explicit operator-approved prefix pattern. It is only valid as the last segment,
+    // only when explicitly operator-authored, and must carry at least one fixed prefix segment
+    // (`fixedLength >= 1`) so a bare `/**` can never become an origin-wide wildcard.
     if (patSegs.some((seg, i) => seg.value === '**' && i !== patSegs.length - 1)) continue
     const fixedLength = prefixWildcard ? patSegs.length - 1 : patSegs.length
+    if (prefixWildcard && fixedLength === 0) continue
     if (prefixWildcard ? targetSegs.length < fixedLength : targetSegs.length !== fixedLength) continue
 
     let matched = true

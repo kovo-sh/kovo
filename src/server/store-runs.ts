@@ -62,7 +62,12 @@ import type {
   FindingProvenanceFields,
   ReportProvenanceSurface,
 } from '../report-summary.ts'
-import { matchesApprovedEndpointPattern, normalizeApprovalPathPattern } from './approval-pattern.ts'
+import {
+  hasApprovalPathGlobMetacharacters,
+  inspectApprovalPathGlobs,
+  matchesApprovedEndpointPattern,
+  normalizeApprovalPathPattern,
+} from './approval-pattern.ts'
 import type { ApprovalDecidedBy, ApprovalRiskLevel } from './approval-judge.ts'
 import { redact, redactZdrJsonValue } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
@@ -1435,6 +1440,15 @@ export class RunsRepository {
     return this.session.transaction(() => {
       const currentRun = this.run(run.id)
       const now = Date.now()
+      const globInspection = inspectApprovalPathGlobs(input.pathAndQuery)
+      const globWarning = globInspection.hasGlobMetacharacters
+        ? 'Warning: worker-submitted path contains literal glob metacharacters (* / **); approval matches only this exact literal path, never a wildcard or prefix.'
+        : null
+      const basePolicyNote = input.policyNote ? redact(input.policyNote, secrets) : null
+      const policyNote = globWarning
+        ? (basePolicyNote ? `${basePolicyNote} ${globWarning}` : globWarning)
+        : basePolicyNote
+      const riskLevel = globInspection.hasGlobMetacharacters ? 'high' : (input.riskLevel ?? null)
       const row = this.session.db.insert(tables.approvalRequests).values({
         id: randomUUID(),
         runId: currentRun.id,
@@ -1449,8 +1463,8 @@ export class RunsRepository {
         status: 'pending',
         decidedBy: null,
         decidedAt: null,
-        policyNote: input.policyNote ? redact(input.policyNote, secrets) : null,
-        riskLevel: input.riskLevel ?? null,
+        policyNote,
+        riskLevel,
         expiresAt: now + (input.expiresInMs ?? 15 * 60_000),
         createdAt: now,
       }).returning().get()
@@ -1458,9 +1472,12 @@ export class RunsRepository {
       this.session.event(currentRun.id, 'approval.requested', `Tier 3 approval requested for ${row.method} ${row.origin}${row.pathAndQuery.slice(0, 80)}.`, {
         approvalId: row.id, assignmentId: assignment.id, origin: row.origin, method: row.method,
         riskLevel: row.riskLevel, policyNote: row.policyNote,
+        ...(globInspection.hasGlobMetacharacters
+          ? { containsGlobMetacharacters: true, globSegments: globInspection.globSegments }
+          : {}),
       })
       this.session.message(currentRun.id, currentRun.coordinatorId, 'kovo',
-        `Tier 3 approval required: ${row.method} ${row.origin}${row.pathAndQuery}\nRationale: ${row.rationale}`)
+        `Tier 3 approval required: ${row.method} ${row.origin}${row.pathAndQuery}${globWarning ? `\n${globWarning}` : ''}\nRationale: ${row.rationale}`)
       return row
     }, { behavior: 'immediate' })
   }
@@ -1557,7 +1574,8 @@ export class RunsRepository {
     if (!origin) throw new Error('Approval lease origin is malformed.')
     const method = input.method.trim().toUpperCase()
     if (!method) throw new Error('Approval lease method is required.')
-    const routePattern = normalizeApprovalPathPattern(input.pathAndQuery)
+    const routePattern = normalizeApprovalPathPattern(input.pathAndQuery, { source: 'card_path' })
+    if (!routePattern) throw new Error('Approval lease path is malformed.')
     const now = Date.now()
     const row = this.session.db.insert(tables.approvalLeases).values({
       id: randomUUID(),
@@ -1638,8 +1656,11 @@ export class RunsRepository {
   leaseAuthorizes(runId: string, origin: string, method: string, pathAndQuery: string): boolean {
     const normalized = normalizeScopeOrigin(origin)
     if (!normalized) return false
-    const normalizedPattern = normalizeApprovalPathPattern(pathAndQuery)
-    const legacyRoutePattern = routePatternForPath(pathAndQuery)
+    const normalizedPattern = normalizeApprovalPathPattern(pathAndQuery, { source: 'card_path' })
+    if (!normalizedPattern) return false
+    const legacyRoutePattern = hasApprovalPathGlobMetacharacters(pathAndQuery)
+      ? normalizedPattern
+      : routePatternForPath(pathAndQuery)
     const routePatterns = normalizedPattern === legacyRoutePattern
       ? [normalizedPattern]
       : [normalizedPattern, legacyRoutePattern]
@@ -1834,7 +1855,11 @@ export class RunsRepository {
         throw new Error(`Approval request is already ${existing.status}.`)
       }
 
-      const pathPattern = normalizeApprovalPathPattern(existing.pathAndQuery)
+      const globInspection = inspectApprovalPathGlobs(existing.pathAndQuery)
+      const pathPattern = normalizeApprovalPathPattern(existing.pathAndQuery, { source: 'card_path' })
+      if (!pathPattern) {
+        throw new Error('Cannot create an approved endpoint pattern from a malformed request path.')
+      }
       const newPattern: ApprovedEndpointPattern = {
         origin: existing.origin,
         method: existing.method.toUpperCase(),
@@ -1876,11 +1901,14 @@ export class RunsRepository {
         method: newPattern.method,
         pathPattern: newPattern.pathPattern,
         matchedPendingCount,
+        ...(globInspection.hasGlobMetacharacters
+          ? { containsGlobMetacharacters: true, globSegments: globInspection.globSegments }
+          : {}),
       })
       this.grantApprovalLease(currentRun, {
         origin: newPattern.origin,
         method: newPattern.method,
-        pathAndQuery: newPattern.pathPattern,
+        pathAndQuery: existing.pathAndQuery,
         personaHandle: existing.personaHandle,
         sourceApprovalId: existing.id,
         createdBy: 'operator',
