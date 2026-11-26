@@ -1009,9 +1009,13 @@ Several items will move the reported numbers. R2-01 makes the stricter Judge rai
 #### Execution log
 | Stream | Item | Status | Merge SHA | Gate result | Notes |
 |---|---|---|---|---|---|
-| `r2-01-fail-closed` | `R2-01` | DISPATCHED (Wave 1) | — | pending | P0 safety: Judge default, broker 5xx exemption, admission catch |
-| `r2-02-quarantine` | `R2-02` | DISPATCHED (Wave 1) | — | pending | Per-case v2 quarantine, `test-tiers.ts`, hermetic `runtime-profile.ts` |
-| `r2-04-retest-truth` | `R2-04` | DISPATCHED (Wave 1) | — | pending | Shared `retest-health.ts`, split `oracle_failed`, parity corpus cases |
-| `r2-07-step-status` | `R2-07` | DISPATCHED (Wave 1) | — | pending | Exhaustive `STEP_STATUS` table across store, dispatch, planner, actor, snapshot |
-| `r2-10-dedupe-veto` | `R2-10` | DISPATCHED (Wave 1) | — | pending | Deterministic `sameFindingPredicate` veto + `src/finding-keys.ts` |
+| `r2-01-fail-closed` | `R2-01` | **MERGED** | `18ddf5f` | **PASS** (`tsc` 0 err, 54/54 safety/transport/admission) | P0 safety: Judge default, broker 5xx exemption, admission catch |
+| `r2-02-quarantine` | `R2-02` | **MERGED** | `678eedf` | **PASS** (`tsc` 0 err, 19/19 gate/quarantine, 409 fast / 198 per-case / 0 whole-file) | Per-case v2 quarantine, `test-tiers.ts`, hermetic `runtime-profile.ts` |
+| `r2-04-retest-truth` | `R2-04` | **MERGED** | `7e45ad8` | **PASS** (`tsc` 0 err, 33/33 parity/retest) | Shared `retest-health.ts`, split `oracle_failed`, parity corpus cases |
+| `r2-07-step-status` | `R2-07` | **MERGED** | `e063607` | **PASS** (`tsc` 0 err, 46/46 step-status/cq-5/dispatch/actor) | Exhaustive `STEP_STATUS` table across store, dispatch, planner, actor, snapshot |
+| `r2-10-dedupe-veto` | `R2-10` | **MERGED** | `09f9eeb` | **PASS** (`tsc` 0 err, build `479.37 kB`, 78/78 dedupe/report) | Deterministic `sameFindingPredicate` veto + `src/finding-keys.ts` |
+| `r2-13-prov-circuit` | `R2-13` | DISPATCHED (Wave 2) | — | pending | Typed provider errors, `provider_paused` circuit, bounded 1-retry, Judge `fail_safe` |
+| `r2-08-restore-disp` | `R2-08` | DISPATCHED (Wave 2) | — | pending | `finally` recipe restore + broker cleanup allowance + `registerRunDisposer` + fail-closed async-poll |
+| `r2-09-lease-bounds` | `R2-09` | DISPATCHED (Wave 2) | — | pending | Required lease TTL/`maxUses`, persona binding, `v11` `lease_scope` conservative backfill, server blast radius |
+| `r2-03-merge-gate` | `R2-03` | DISPATCHED (Wave 2) | — | pending | Merged-tree `merge-stream.sh`, CI fast tier + ratchets, removal-only `check-unwired.ts`, widened `check-contract-change.ts` |
 
