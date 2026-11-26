@@ -1093,6 +1093,26 @@ export class ExecFloorLane extends ExecServiceModule<ExecFloorLaneHost> {
           },
         )
       }
+      const unprobedPersisted = this.persistUnprobedTailLeads({
+        run: this.storage.run(current.id),
+        assignment: claimed,
+        unprobedTail: report.unprobedTail,
+        secrets: currentSecrets(),
+      })
+      if (report.cappedOut.length > 0) {
+        this.storage.event(
+          current.id,
+          'deterministic_engine.capped_out',
+          `Deterministic engine capped/unprobed ${report.unprobedTail.length} hypothesis(es) across ${Object.keys(report.byClassUnprobed).length} class(es); persisted ${unprobedPersisted} det_lead fact(s).`,
+          {
+            stoppedReason: report.stoppedReason,
+            cappedOut: report.cappedOut,
+            byClassUnprobed: report.byClassUnprobed,
+            unprobedTailCount: report.unprobedTail.length,
+            unprobedPersisted,
+          },
+        )
+      }
       this.storage.event(
         current.id, 'deterministic_engine.summary',
         `Deterministic engine used ${report.requestsUsed} request(s), confirmed ${report.confirmed}, rejected ${report.rejectedSpecs}, leads ${report.leads}.`,
@@ -1102,6 +1122,10 @@ export class ExecFloorLane extends ExecServiceModule<ExecFloorLaneHost> {
           hypothesesRun: report.hypothesesRun, signals: report.signals, specsSubmitted: report.specsSubmitted,
           confirmed: report.confirmed, rejectedSpecs: report.rejectedSpecs, leads: report.leads,
           stoppedReason: report.stoppedReason, durationMs: report.durationMs, byClass,
+          byClassUnprobed: report.byClassUnprobed,
+          cappedOut: report.cappedOut,
+          unprobedTailCount: report.unprobedTail.length,
+          unprobedPersisted,
           stagingTaggedMutations: report.stagingTaggedMutations,
           stagingUntaggedSkipped: report.stagingUntaggedSkipped,
           stagingCleaned: report.stagingCleaned,
@@ -1275,6 +1299,73 @@ export class ExecFloorLane extends ExecServiceModule<ExecFloorLaneHost> {
     return saved.id
   }
 
+
+  /** Persist floor-capped / deadline-dropped unprobed tail hypotheses as `det_lead` facts. */
+  persistUnprobedTailLeads(input: {
+    run: Run
+    assignment: Assignment
+    unprobedTail: ReadonlyArray<{
+      origin: string
+      method: string
+      endpoint: string
+      intent: string
+      probeClass: string
+      param: string | null
+      risk: number
+      stage: string
+      reason: string
+    }>
+    secrets: readonly NamedSecret[]
+    maxFacts?: number
+  }): number {
+    const { run, assignment, unprobedTail, secrets } = input
+    const limit = Math.max(0, Math.floor(input.maxFacts ?? 24))
+    if (!unprobedTail.length || limit === 0) return 0
+    const seen = new Set<string>()
+    let persisted = 0
+    for (const item of unprobedTail) {
+      if (persisted >= limit) break
+      if (!this.host.permitted(run, item.origin)) continue
+      const key = `${item.origin}|${item.method.toUpperCase()}|${item.endpoint}|${item.probeClass}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      try {
+        this.storage.addFact(run, assignment, {
+          kind: 'note',
+          origin: item.origin,
+          summary: `Unprobed floor tail (${item.stage}, ${item.probeClass}) on ${item.method.toUpperCase()} ${item.endpoint}: ${item.reason}`,
+          data: {
+            subkind: 'deterministic_engine_unprobed_tail',
+            source: 'deterministic_engine',
+            kind: 'det_lead',
+            attribution: 'deterministic',
+            probeClass: item.probeClass,
+            intent: item.intent,
+            endpoint: item.endpoint,
+            method: item.method.toUpperCase(),
+            param: item.param,
+            risk: item.risk,
+            cappedOutStage: item.stage,
+            reason: item.reason,
+          },
+          exchangeIds: [],
+          sourceOrigins: [item.origin],
+          secrets,
+        })
+        persisted += 1
+      } catch (err) {
+        try {
+          this.storage.event(
+            run.id,
+            'deterministic_engine.tail_persist_warning',
+            `Failed to persist unprobed tail det_lead for ${item.method} ${item.endpoint}: ${err instanceof Error ? err.message.slice(0, 160) : String(err).slice(0, 160)}`,
+            { endpoint: item.endpoint, probeClass: item.probeClass, stage: item.stage },
+          )
+        } catch { /* run may have been deleted */ }
+      }
+    }
+    return persisted
+  }
 
   /** Persist an unproven deterministic observation as a det_lead fact (never as a finding). */
   persistDeterministicLead(input: {

@@ -288,6 +288,105 @@ export interface EngineClassStats {
   requests: number
 }
 
+export interface CappedOutRecord {
+  cap: number
+  stage: 'formation_quota' | 'intent_cap' | 'deadline' | 'budget' | 'aborted'
+  class: string
+  kept: number
+  dropped: number
+}
+
+export interface UnprobedHypothesisLead {
+  origin: string
+  method: string
+  endpoint: string
+  intent: string
+  probeClass: string
+  param: string | null
+  risk: number
+  stage: 'intent_cap' | 'deadline' | 'budget' | 'aborted'
+  reason: string
+}
+
+/**
+ * Canonical floor intent priority ordering.
+ * SQLi is deliberately last (`10`): error-based probes legitimately return 5xx and can trip the
+ * broker's defensive circuit, so every non-5xx class gets its pass first.
+ */
+export const FLOOR_INTENT_PRIORITY: Readonly<Record<string, number>> = {
+  authz: 100,
+  secret_disclosure: 98,
+  graphql: 95,
+  ssti: 94,
+  command_injection: 93,
+  workflow: 92,
+  xxe: 90,
+  ssrf: 88,
+  traversal: 85,
+  redirect: 75,
+  xss: 65,
+  mass_assignment: 60,
+  stored_xss: 55,
+  cache: 50,
+  csrf: 45,
+  webhook: 40,
+  auth_protocol: 35,
+  race: 30,
+  sqli: 10,
+}
+
+/**
+ * Single unified per-class floor quota table (replaces the drifting `baseQuotas` + `intentCaps`
+ * split). Both hypothesis formation and runtime probe execution derive their per-class limits
+ * from this one table so formed hypotheses never silently drop under a second lower cap.
+ */
+export const UNIFIED_FLOOR_CLASS_QUOTAS: Readonly<Record<string, number>> = {
+  authz: 26,
+  secret_disclosure: 5,
+  graphql: 2,
+  xxe: 5,
+  ssrf: 7,
+  traversal: 6,
+  redirect: 6,
+  xss: 6,
+  mass_assignment: 6,
+  csrf: 4,
+  cache: 2,
+  stored_xss: 2,
+  workflow: 3,
+  webhook: 2,
+  auth_protocol: 3,
+  ssti: 3,
+  command_injection: 3,
+  sqli: 10,
+  race: 8,
+}
+
+/** Breadth-first tightening caps applied only when remaining request budget cannot fund a deep pass. */
+export const BREADTH_FIRST_FLOOR_CLASS_CAPS: Readonly<Record<string, number>> = {
+  authz: 14,
+  secret_disclosure: 3,
+  sqli: 8,
+}
+
+/** Compute scaled per-class quotas from the single unified table. */
+export function computeFloorClassQuotas(input: {
+  maxRequests: number
+  maxHypotheses?: number
+  breadthFirst?: boolean
+}): { slots: number; scale: number; quotas: Record<string, number> } {
+  const baseMax = input.maxHypotheses ?? defaultEngineMaxHypotheses
+  const slots = Math.min(150, Math.max(baseMax, Math.floor(input.maxRequests / 11)))
+  const scale = Math.max(1, slots / baseMax)
+  const quotas: Record<string, number> = {}
+  for (const [intent, base] of Object.entries(UNIFIED_FLOOR_CLASS_QUOTAS)) {
+    const scaled = Math.max(base, Math.ceil(base * scale))
+    const bfCap = input.breadthFirst ? BREADTH_FIRST_FLOOR_CLASS_CAPS[intent] : undefined
+    quotas[intent] = bfCap !== undefined ? Math.min(scaled, bfCap) : scaled
+  }
+  return { slots, scale, quotas }
+}
+
 export interface DeterministicEngineReport {
   requestsUsed: number
   durationMs: number
@@ -304,6 +403,12 @@ export interface DeterministicEngineReport {
   leadsSuppressed: number
   stoppedReason: 'budget' | 'time' | 'aborted' | 'complete' | 'disabled'
   byClass: Record<string, EngineClassStats>
+  /** Per-class count of formed hypotheses that were not probed (intent cap, deadline, budget, abort). */
+  byClassUnprobed: Record<string, number>
+  /** Structured capped-out accounting records per (stage, class). */
+  cappedOut: CappedOutRecord[]
+  /** Structured unprobed tail hypotheses for `det_lead` persistence into Phase B. */
+  unprobedTail: UnprobedHypothesisLead[]
   confirmedPairs: Array<{ endpoint: string; vulnClass: string }>
   /** Normalized `<endpoint>|<family>` keys for every hypothesis the engine formed. */
   touchedPairs: string[]
@@ -2520,30 +2625,13 @@ export function enumerateHypotheses(
     }
   }
 
-  const intentPriority: Record<string, number> = {
-    // SQLi is deliberately last: error-based payloads legitimately return 5xx and can trip the
-    // broker's defensive circuit, which pauses the run. Every non-5xx class gets its pass first.
-    authz: 100, secret_disclosure: 98, graphql: 95, ssti: 94, command_injection: 93, workflow: 92,
-    xxe: 90, ssrf: 88, traversal: 85,
-    redirect: 75, xss: 65, mass_assignment: 60, stored_xss: 55, cache: 50, csrf: 45, sqli: 10,
-  }
-  // Quota selection, not a pure global slice: late classes (SQLi in particular) must not be
-  // starved when a richer surface forms more authz/xxe/ssrf hypotheses than the cap.
-  const baseQuotas: Record<string, number> = {
-    // Quotas reserve breadth: an authz-heavy surface must not starve the other classes when the
-    // global hypothesis cap is reached.
-    authz: 26, secret_disclosure: 5, graphql: 2, xxe: 5, ssrf: 7, traversal: 6, redirect: 6,
-    xss: 6, mass_assignment: 6, csrf: 4, cache: 2, stored_xss: 2, workflow: 3, webhook: 2,
-    auth_protocol: 2, ssti: 3, command_injection: 3, sqli: 10, race: 8,
-  }
-  const baseMax = options.maxHypotheses ?? defaultEngineMaxHypotheses
-  // A probe costs ~11 requests (control/probe variants + read-back). Spend the request budget
-  // instead of starving late classes behind a fixed hypothesis count.
-  const slots = Math.min(150, Math.max(baseMax, Math.floor((options.maxRequests ?? defaultEngineMaxRequests) / 11)))
-  const scale = Math.max(1, slots / baseMax)
-  const quotas: Record<string, number> = Object.fromEntries(
-    Object.entries(baseQuotas).map(([intent, quota]) => [intent, Math.max(quota, Math.ceil(quota * scale))]),
-  )
+  const intentPriority = FLOOR_INTENT_PRIORITY
+  // Quota selection from the single unified per-class table (`UNIFIED_FLOOR_CLASS_QUOTAS`),
+  // keeping SQLi last for 5xx breaker safety while reserving breadth across classes.
+  const { slots, quotas } = computeFloorClassQuotas({
+    maxRequests: options.maxRequests ?? defaultEngineMaxRequests,
+    maxHypotheses: options.maxHypotheses ?? defaultEngineMaxHypotheses,
+  })
   const max = slots
   const quotaFor = (intent: string): number => quotas[intent] ?? 4
   // Canonical order: intent priority, then risk, then key. Every part is a total order, so the
@@ -4846,6 +4934,9 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
     leadsSuppressed: 0,
     stoppedReason: 'complete',
     byClass: {},
+    byClassUnprobed: {},
+    cappedOut: [],
+    unprobedTail: [],
     confirmedPairs: [],
     touchedPairs: [],
     conventionalWordlist,
@@ -4965,33 +5056,57 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
   for (const hyp of gatedHypotheses) classStats(report, hyp.intent).hypotheses += 1
 
   const perProbeRequestFloor = 6
-  const probeSlots = Math.min(150, Math.max(defaultEngineMaxHypotheses, Math.floor(maxRequests / 11)))
-  const capScale = Math.max(1, probeSlots / defaultEngineMaxHypotheses)
-  const capFor = (value: number): number => Math.max(value, Math.ceil(value * capScale))
-  // Phase A runs the same deep per-class policy as `--no-llm`, so the agentic floor and the
-  // standalone floor probe the same hypotheses in the same order. Breadth caps are only used when
-  // the caller's remaining request budget cannot fund a deep pass (explicit `breadthFirst`).
+  // Phase A runs the same deep per-class policy as `--no-llm`, derived from the single unified
+  // `UNIFIED_FLOOR_CLASS_QUOTAS` table so formation and execution quotas never drift. Breadth caps
+  // apply only when the caller's remaining request budget cannot fund a deep pass (`breadthFirst`).
   const breadthFirst = input.breadthFirst === true || maxRequests < 600
-  const intentCaps: Record<string, number> = {
-    authz: breadthFirst ? Math.min(capFor(26), 14) : capFor(26),
-    secret_disclosure: breadthFirst ? Math.min(capFor(5), 3) : capFor(5),
-    sqli: breadthFirst ? Math.min(capFor(10), 8) : capFor(10),
-    traversal: capFor(6),
-    ssrf: capFor(6),
-    xxe: capFor(4),
-    redirect: capFor(6),
-    xss: capFor(6),
-    graphql: capFor(2),
-    mass_assignment: capFor(6),
-    csrf: capFor(4),
-    workflow: capFor(3),
-    race: capFor(6),
-    ssti: capFor(3),
-    command_injection: capFor(3),
-    webhook: capFor(2),
-    auth_protocol: capFor(3),
-  }
+  const { quotas: intentCaps } = computeFloorClassQuotas({
+    maxRequests,
+    maxHypotheses: input.maxHypotheses ?? defaultEngineMaxHypotheses,
+    breadthFirst,
+  })
   const intentUsed: Record<string, number> = {}
+  const cappedIntentDropped = new Map<string, { cap: number; kept: number; dropped: number }>()
+  const recordUnprobedHypothesis = (
+    hyp: EngineHypothesis,
+    stage: UnprobedHypothesisLead['stage'],
+    reason: string,
+  ): void => {
+    report.byClassUnprobed[hyp.intent] = (report.byClassUnprobed[hyp.intent] ?? 0) + 1
+    report.unprobedTail.push({
+      origin: hyp.endpoint.origin,
+      method: hyp.method.toUpperCase(),
+      endpoint: hyp.endpoint.pathTemplate,
+      intent: hyp.intent,
+      probeClass: hyp.probeClass,
+      param: hyp.param?.name ?? null,
+      risk: hyp.risk,
+      stage,
+      reason,
+    })
+  }
+  const recordRemainingTailOnStop = (
+    startIndex: number,
+    stage: 'deadline' | 'budget' | 'aborted',
+    cap: number,
+    reason: string,
+  ): void => {
+    const droppedByClass = new Map<string, number>()
+    for (let idx = startIndex; idx < probeQueue.length; idx += 1) {
+      const remainingHyp = probeQueue[idx]!
+      recordUnprobedHypothesis(remainingHyp, stage, reason)
+      droppedByClass.set(remainingHyp.intent, (droppedByClass.get(remainingHyp.intent) ?? 0) + 1)
+    }
+    for (const [cls, dropped] of [...droppedByClass.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+      report.cappedOut.push({
+        cap,
+        stage,
+        class: cls,
+        kept: intentUsed[cls] ?? 0,
+        dropped,
+      })
+    }
+  }
   // CSRF probes on sibling transitions of one resource family share the same session/cookie
   // boundary, so probing every verb spends the intent quota on one family. Keep one per collection
   // prefix and let the quota reach the other families; each hypothesis still probes its own route.
@@ -5029,13 +5144,35 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
   const timingFollowUpBudgetFloor = Math.max(300, Math.floor(maxRequests * 0.2))
   for (let queueIndex = 0; queueIndex < probeQueue.length; queueIndex += 1) {
     const hyp = probeQueue[queueIndex]!
-    if (input.signal.aborted) { report.stoppedReason = 'aborted'; break }
-    if (Date.now() - started >= hardDeadlineMs) { report.stoppedReason = 'time'; break }
-    if (budget.requestsUsed >= maxRequests) { report.stoppedReason = 'budget'; break }
+    if (input.signal.aborted) {
+      report.stoppedReason = 'aborted'
+      recordRemainingTailOnStop(queueIndex, 'aborted', maxRequests, 'signal aborted before floor probe ran')
+      break
+    }
+    if (Date.now() - started >= hardDeadlineMs) {
+      report.stoppedReason = 'time'
+      recordRemainingTailOnStop(queueIndex, 'deadline', hardDeadlineMs, `floor deadline (${hardDeadlineMs}ms) reached before probe ran`)
+      break
+    }
+    if (budget.requestsUsed >= maxRequests) {
+      report.stoppedReason = 'budget'
+      recordRemainingTailOnStop(queueIndex, 'budget', maxRequests, `floor request budget (${maxRequests}) exhausted before probe ran`)
+      break
+    }
     const remaining = maxRequests - budget.requestsUsed
-    if (remaining < perProbeRequestFloor) { report.stoppedReason = 'budget'; break }
+    if (remaining < perProbeRequestFloor) {
+      report.stoppedReason = 'budget'
+      recordRemainingTailOnStop(queueIndex, 'budget', maxRequests, `remaining floor requests (${remaining}) below per-probe floor (${perProbeRequestFloor})`)
+      break
+    }
     const cap = intentCaps[hyp.intent] ?? 6
-    if ((intentUsed[hyp.intent] ?? 0) >= cap) continue
+    if ((intentUsed[hyp.intent] ?? 0) >= cap) {
+      const prev = cappedIntentDropped.get(hyp.intent) ?? { cap, kept: intentUsed[hyp.intent] ?? 0, dropped: 0 }
+      prev.dropped += 1
+      cappedIntentDropped.set(hyp.intent, prev)
+      recordUnprobedHypothesis(hyp, 'intent_cap', `class ${hyp.intent} reached unified floor cap (${cap})`)
+      continue
+    }
     intentUsed[hyp.intent] = (intentUsed[hyp.intent] ?? 0) + 1
 
     const stats = classStats(report, hyp.intent)
@@ -5385,6 +5522,19 @@ export async function runDeterministicEngine(input: DeterministicEngineInput): P
           score: leadCandidateScore(hyp, evidence),
         })
       }
+    }
+  }
+
+  // Flush per-class intent-cap drops into `report.cappedOut` in deterministic class order.
+  for (const [cls, entry] of [...cappedIntentDropped.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+    if (entry.dropped > 0) {
+      report.cappedOut.push({
+        cap: entry.cap,
+        stage: 'intent_cap',
+        class: cls,
+        kept: entry.kept,
+        dropped: entry.dropped,
+      })
     }
   }
 

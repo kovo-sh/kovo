@@ -32,7 +32,9 @@ import { hasDynamicIdSegment, identifierFormsForRoute, intentFamily } from './de
 import type { ExecCoordinatorTask } from './exec-exchange.ts'
 import {
   FrontierScheduler,
+  MAX_CHAIN_DEPTH,
   MAX_CHECKPOINT_BRIEF_BYTES,
+  MIN_CHAIN_DEPTH,
   buildHopCheckpointBrief,
   computeBranchEvi,
   computeNegativeEdgeKey,
@@ -68,7 +70,14 @@ import {
 } from './graph-coordinator.ts'
 import type { LabTargetHandle } from './lab-runner.ts'
 import { selectRankedProbeTargets, type Phase0ProbePlanSummary } from './probe-plan.ts'
-import { findings } from './schema.ts'
+import {
+  chainStepRetryableStatuses,
+  chainStepTerminalStatuses,
+  findings,
+  type ChainStepRetryableStatus,
+  type ChainStepStatus,
+  type ChainStepTerminalStatus,
+} from './schema.ts'
 import { dedupeCodeAuditSuspects } from './semantic-audit.ts'
 import {
   isOpaqueResourceId,
@@ -362,6 +371,8 @@ export interface CoordinatorSchedulerState {
   verifiedHopReachExpansions?: number
   /** v8 M3: optional FrontierScheduler wave-progression evaluation for frontier-aware termination. */
   frontierDecision?: WaveProgressDecision | null
+  /** Count of investigation assignments that reached a terminal state since the previous planner round. */
+  completedSinceLastRound?: number
 }
 
 /**
@@ -396,7 +407,14 @@ export function coordinatorSchedulerDecision(state: CoordinatorSchedulerState): 
         ?? `Continuing: ${state.verifiedHopReachExpansions ?? 1} host-verified HopReceipt reach expansion(s) advanced the causal frontier.`,
     }
   }
-  if (state.frontierDecision?.decision === 'stop' && state.highPriorityQueueEmpty === true) {
+  const frontierStopEligible = state.frontierDecision?.decision === 'stop'
+    && state.highPriorityQueueEmpty === true
+    && (
+      state.frontierDecision.reason !== 'frontier_exhausted'
+      || (state.completedSinceLastRound ?? 1) > 0
+      || (state.consecutiveDryRounds ?? 0) > 0
+    )
+  if (frontierStopEligible && state.frontierDecision) {
     return {
       decision: 'stop',
       reason: 'diminishing_returns',
@@ -691,6 +709,76 @@ export class FrontierWaveController {
     return this.scheduler.admitBranches(branches)
   }
 
+  /**
+   * Single-authority admission helper for Wave-1, runtime chain, and hop-continuation steps:
+   * constructs a normalized `FrontierBranch`, syncs pruned negative edges from `CapabilityLedger`,
+   * and routes admission strictly through `this.admitBranch(...)`.
+   */
+  admitStepBranch(input: {
+    branchKey: string
+    parentBranchKey?: string | null
+    depth?: number
+    origin: string
+    endpoint: string
+    method?: string
+    surface?: FrontierBranch['nextTarget']['surface']
+    hypothesisClass: string
+    goalSummary: string
+    capabilityId?: string
+    preconditionCapIds?: readonly string[]
+    verifiedHops?: FrontierBranch['verifiedHops']
+    feasibilityProb?: number
+    terminalImpactWeight?: number
+    surfaceNovelty?: number
+    waveNo?: number
+  }): { admitted: boolean; branchKey: string } {
+    const cleanOrigin = (input.origin || 'unknown').trim() || 'unknown'
+    const cleanEndpoint = normalizeEndpointTemplate((input.endpoint || '/').trim() || '/')
+    const surface = input.surface ?? 'http'
+    const depth = Math.max(MIN_CHAIN_DEPTH, Math.min(MAX_CHAIN_DEPTH, Math.floor(input.depth ?? 1)))
+    const waveNo = Math.max(1, Math.floor(input.waveNo ?? 1))
+    const verifiedHops: FrontierBranch['verifiedHops'] = input.verifiedHops && input.verifiedHops.length > 0
+      ? input.verifiedHops
+      : (input.preconditionCapIds?.length
+          ? input.preconditionCapIds
+          : input.capabilityId ? [input.capabilityId] : []).map((capId, idx) => ({
+            hopIndex: idx + 1,
+            hopReceiptId: `seed:${capId}`,
+            capabilityId: capId,
+            kind: 'state_handle' as const,
+            surface,
+            serviceOrigin: cleanOrigin,
+            tenantScope: 'observed',
+            actorPersona: 'worker',
+            endpoint: cleanEndpoint,
+          }))
+    const branch: FrontierBranch = {
+      branchKey: input.branchKey,
+      ...(input.parentBranchKey ? { parentBranchKey: input.parentBranchKey } : {}),
+      depth,
+      verifiedHops,
+      nextTarget: {
+        targetSurfaceKey: `${cleanOrigin}|${surface}|${cleanEndpoint}`,
+        surface,
+        serviceOrigin: cleanOrigin,
+        endpoint: cleanEndpoint,
+        ...(input.method ? { method: input.method.toUpperCase() } : {}),
+        hypothesisClass: (input.hypothesisClass || 'unknown').trim() || 'unknown',
+        goalSummary: input.goalSummary.slice(0, 180),
+      },
+      feasibilityProb: Math.max(0.05, Math.min(1, input.feasibilityProb ?? 0.65)),
+      terminalImpactWeight: Math.max(0.1, Math.min(1, input.terminalImpactWeight ?? 0.75)),
+      surfaceNovelty: Math.max(0.05, Math.min(1, input.surfaceNovelty ?? 0.8)),
+      attemptsOnBranch: 0,
+      consecutiveFailedAttempts: 0,
+      lane: 'partial_chain',
+      createdWave: waveNo,
+      lastUpdatedWave: waveNo,
+    }
+    const admitted = this.admitBranch(branch)
+    return { admitted, branchKey: branch.branchKey }
+  }
+
   addDiscoverySurface(candidate: DiscoverySurfaceCandidate): void {
     this.scheduler.addDiscoverySurface(candidate)
   }
@@ -972,6 +1060,75 @@ export function normalizeDispatchStopReason(reason: string | null | undefined): 
   }
 }
 
+export const TERMINAL_CHAIN_STEP_STATUSES: ReadonlySet<ChainStepStatus> = new Set<ChainStepStatus>(chainStepTerminalStatuses)
+export const RETRYABLE_CHAIN_STEP_STATUSES: ReadonlySet<ChainStepStatus> = new Set<ChainStepStatus>(chainStepRetryableStatuses)
+export const CONTINUABLE_CHAIN_STEP_STATUSES: ReadonlySet<ChainStepStatus> = new Set<ChainStepStatus>([
+  'complete',
+  'rotated_partial',
+  'turn_capped',
+  'nudged_out',
+])
+export const MAX_RETRYABLE_STEP_RETRIES = 1
+
+export function isTerminalChainStepStatus(status: string): status is ChainStepTerminalStatus {
+  return TERMINAL_CHAIN_STEP_STATUSES.has(status as ChainStepStatus)
+}
+
+export function isRetryableChainStepStatus(status: string): status is ChainStepRetryableStatus {
+  return RETRYABLE_CHAIN_STEP_STATUSES.has(status as ChainStepStatus)
+}
+
+export type WorkerSessionExitStatus = 'completed' | 'turn_limit' | 'nudged_out' | 'wall_clock_rotated'
+
+/** Map an agent session's exit status to its exact typed terminal `chain_steps.status`. */
+export function mapSessionStatusToStepStatus(sessionStatus: WorkerSessionExitStatus): ChainStepTerminalStatus {
+  switch (sessionStatus) {
+    case 'completed':
+      return 'complete'
+    case 'turn_limit':
+      return 'turn_capped'
+    case 'nudged_out':
+      return 'nudged_out'
+    case 'wall_clock_rotated':
+      return 'rotated_partial'
+  }
+}
+
+const MODEL_FAILURE_ERROR_RE = /\b(?:model|provider|openrouter|anthropic|openai|rate[\s_-]?limit|429|502|503|504|context[\s_-]?length|token[\s_-]?limit|stream\s+stalled|invalid[\s_-]?json|llm)\b/i
+
+/** Classify an uncaught worker error into `model_failure` vs `infra_failed`. */
+export function classifyWorkerErrorToStepStatus(error: unknown): 'model_failure' | 'infra_failed' {
+  const msg = error instanceof Error ? `${error.name} ${error.message}` : String(error ?? '')
+  return MODEL_FAILURE_ERROR_RE.test(msg) ? 'model_failure' : 'infra_failed'
+}
+
+/** Structured `(origin, METHOD, route, class)` target bound at chain-step creation. */
+export interface StructuredStepTarget {
+  origin: string
+  method: string
+  route: string
+  vulnClass: string
+}
+
+/** Canonical `(origin, METHOD, normalizedRoute, classFamily)` coverage key. */
+export function structuredCoverageKey(target: StructuredStepTarget): string {
+  const origin = (target.origin ?? '').trim()
+  const method = (target.method ?? 'ANY').trim().toUpperCase() || 'ANY'
+  const rawRoute = (target.route ?? '').trim().replace(/^[A-Za-z]+\s+/, '')
+  const normalizedRoute = normalizeEndpointTemplate(rawRoute.split(/[?#]/, 1)[0] ?? rawRoute)
+  const family = confirmedCategoryFamily((target.vulnClass ?? '').trim() || 'unknown')
+  return `${origin}\u0000${method}\u0000${normalizedRoute}\u0000${family}`
+}
+
+/** Canonical `(origin, METHOD, normalizedRoute)` key for route-level lookups. */
+export function structuredCoverageRouteMethodKey(origin: string, method: string, route: string): string {
+  const cleanOrigin = (origin ?? '').trim()
+  const cleanMethod = (method ?? 'ANY').trim().toUpperCase() || 'ANY'
+  const rawRoute = (route ?? '').trim().replace(/^[A-Za-z]+\s+/, '')
+  const normalizedRoute = normalizeEndpointTemplate(rawRoute.split(/[?#]/, 1)[0] ?? rawRoute)
+  return `${cleanOrigin}\u0000${cleanMethod}\u0000${normalizedRoute}`
+}
+
 export interface DispatchFunnelStep {
   id: string
   status: string
@@ -981,9 +1138,9 @@ export interface DispatchFunnelStep {
 
 /**
  * Pending steps whose declared dependencies can never resolve: a step dependency that is missing,
- * canceled or tainted, or (when the fact set is supplied) a fact id that does not exist. These are
- * permanently stranded — `refreshReadyChainSteps` can never promote them — so the funnel reports
- * them as `filteredDep` instead of losing them silently.
+ * canceled, tainted, infra_failed, or model_failure, or (when the fact set is supplied) a fact id
+ * that does not exist. These are permanently stranded — `refreshReadyChainSteps` can never promote
+ * them — so the funnel reports them as `filteredDep` instead of losing them silently.
  */
 export function permanentlyBlockedStepIds(
   steps: readonly DispatchFunnelStep[],
@@ -995,7 +1152,12 @@ export function permanentlyBlockedStepIds(
     if (step.status !== 'pending') continue
     const deadStepDep = (step.dependsOnStepIds ?? []).some(id => {
       const dep = byId.get(id)
-      return !dep || dep.status === 'canceled' || dep.status === 'tainted'
+      return !dep
+        || dep.status === 'canceled'
+        || dep.status === 'tainted'
+        || dep.status === 'blocked'
+        || dep.status === 'infra_failed'
+        || dep.status === 'model_failure'
     })
     const missingFactDep = knownFactIds
       ? (step.dependsOnFactIds ?? []).some(id => !knownFactIds.has(id))
@@ -1005,13 +1167,18 @@ export function permanentlyBlockedStepIds(
   return blocked
 }
 
-/** Steps the scheduler could still dispatch: `ready`, plus `pending` with satisfiable deps. */
+/** Steps the scheduler could still dispatch: `ready`, plus `pending` with satisfiable deps.
+ *  All terminal statuses (`complete`, `infra_failed`, `turn_capped`, `nudged_out`,
+ *  `rotated_partial`, `model_failure`, `blocked`, `tainted`, `canceled`) are excluded. */
 export function dispatchableReadySteps<T extends DispatchFunnelStep>(
   steps: readonly T[],
   knownFactIds?: ReadonlySet<string>,
 ): T[] {
   const blocked = new Set(permanentlyBlockedStepIds(steps, knownFactIds))
-  return steps.filter(step => step.status === 'ready' || (step.status === 'pending' && !blocked.has(step.id)))
+  return steps.filter(step =>
+    !isTerminalChainStepStatus(step.status)
+    && (step.status === 'ready' || (step.status === 'pending' && !blocked.has(step.id))),
+  )
 }
 
 /**
@@ -1091,48 +1258,84 @@ export interface PassOneCoverageStep {
   id: string
   /** Ready/pending steps can still be dispatched this pass. */
   dispatchable: boolean
-  /** True once any assignment was created for the step. */
+  /** True once any assignment was created for the step (legacy fallback when `covered` is omitted). */
   dispatched: boolean
-  /** Normalized route templates the step names. */
+  /**
+   * Typed CQ-5 coverage flag: true ONLY for steps that reached a `proved` or `gap_coded`
+   * completion (never `infra_failed`, `turn_capped`, `nudged_out`, `rotated_partial`, `model_failure`,
+   * or merely assigned/running). When supplied, overrides `dispatched` for coverage accounting.
+   */
+  covered?: boolean
+  /** Structured `(origin, METHOD, route, class)` targets bound at step creation. */
+  structuredTargets?: readonly StructuredStepTarget[]
+  /** Normalized route templates the step names (or derived from `structuredTargets`). */
   routes: readonly string[]
-  /** `route|class` reinvestigation keys the step belongs to. */
+  /** `route|class` (or structured) coverage keys the step belongs to. */
   keys: readonly string[]
 }
 
 export interface PassOneCoverage {
-  /** Tier-A endpoints (`METHOD /path`) with no dispatched step. */
+  /** Tier-A endpoints (`METHOD /path`) with no covered step. */
   uncoveredTierAEndpoints: string[]
-  /** Distinct first-pass `route|class` keys with a dispatchable step but no dispatch yet. */
+  /** Distinct first-pass keys with a dispatchable step but no proved/gap_coded coverage yet. */
   uninvestigatedFirstPassClasses: string[]
 }
 
 /**
- * Pass-1 coverage: what remains genuinely first-pass at a would-be stop. A `route|class` key is
- * first-pass until one of its steps was dispatched; Tier-A endpoints count as covered only after a
- * dispatched step names them. Deterministic ordering (sorted) so the metric is stable.
+ * Pass-1 coverage: what remains genuinely first-pass at a would-be stop. When `step.covered` is
+ * supplied (the CQ-5 product contract), ONLY `proved` / `gap_coded` completions count as covered;
+ * capped/failed/rotated/nudged/in-flight steps stay uncovered so lost work is never misclassified
+ * as a clean negative. Deterministic ordering (sorted) so the metric is stable.
  */
 export function passOneCoverage(input: {
   tierAEndpoints: readonly string[]
   steps: readonly PassOneCoverageStep[]
 }): PassOneCoverage {
-  const attemptedKeys = new Set<string>()
-  const dispatchedRoutes = new Set<string>()
+  const coveredKeys = new Set<string>()
+  const coveredRoutes = new Set<string>()
+  const coveredMethodRoutes = new Set<string>()
   for (const step of input.steps) {
-    if (!step.dispatched) continue
-    for (const key of step.keys) attemptedKeys.add(key)
-    for (const route of step.routes) dispatchedRoutes.add(route)
+    const isCovered = step.covered !== undefined ? step.covered : step.dispatched
+    if (!isCovered) continue
+    for (const key of step.keys) coveredKeys.add(key)
+    for (const route of step.routes) coveredRoutes.add(route)
+    for (const target of step.structuredTargets ?? []) {
+      const method = (target.method || 'ANY').toUpperCase()
+      const normRoute = normalizeEndpointTemplate(target.route.split(/[?#]/, 1)[0] ?? target.route)
+      coveredKeys.add(structuredCoverageKey(target))
+      coveredKeys.add(reinvestigationKey(normRoute, target.vulnClass))
+      coveredRoutes.add(normRoute)
+      coveredMethodRoutes.add(`${method} ${normRoute}`)
+    }
   }
   const uncoveredTierAEndpoints = [...new Set(input.tierAEndpoints)]
     .filter(endpoint => {
-      const path = endpoint.split(' ').slice(1).join(' ')
-      return ![...dispatchedRoutes].some(route => route === path || route === endpoint)
+      const parts = endpoint.trim().split(/\s+/)
+      const method = parts.length >= 2 ? parts[0]!.toUpperCase() : ''
+      const rawPath = parts.length >= 2 ? parts.slice(1).join(' ') : endpoint.trim()
+      const normPath = normalizeEndpointTemplate(rawPath.split(/[?#]/, 1)[0] ?? rawPath)
+      if (method && coveredMethodRoutes.has(`${method} ${normPath}`)) return false
+      if (coveredMethodRoutes.has(`ANY ${normPath}`)) return false
+      return ![...coveredRoutes].some(route => {
+        const normRoute = normalizeEndpointTemplate(route.split(/[?#]/, 1)[0] ?? route)
+        return normRoute === normPath || route === endpoint
+      })
     })
     .sort()
   const firstPass = new Set<string>()
   for (const step of input.steps) {
-    if (!step.dispatchable || step.dispatched) continue
+    const isCovered = step.covered !== undefined ? step.covered : step.dispatched
+    if (!step.dispatchable || isCovered) continue
+    if (step.structuredTargets && step.structuredTargets.length > 0) {
+      for (const target of step.structuredTargets) {
+        const sKey = structuredCoverageKey(target)
+        const rKey = reinvestigationKey(target.route, target.vulnClass)
+        if (!coveredKeys.has(sKey) && !coveredKeys.has(rKey)) firstPass.add(sKey)
+      }
+      continue
+    }
     for (const key of step.keys) {
-      if (!attemptedKeys.has(key)) firstPass.add(key)
+      if (!coveredKeys.has(key)) firstPass.add(key)
     }
   }
   return {
@@ -3940,6 +4143,8 @@ export interface SynthesizeRuntimeCompositeWave1Options {
   specs?: ReadonlyArray<{ kind: string; origin?: string | null; content: string }>
   hostTiers?: Record<string, HostTier>
   maxSteps?: number
+  /** Single-authority FrontierWaveController through which Wave-1 composite branches are admitted. */
+  frontierController?: FrontierWaveController | null
 }
 
 interface NormalizedRuntimeHopCandidate extends CompositeWorkflowNode {
@@ -4236,6 +4441,24 @@ export function synthesizeRuntimeCompositeWave1Steps(
       endpoint: comp.hops[0]!.endpoint,
       sinkKind: comp.hops[0]!.sinkKind,
     })
+
+    const firstHop = comp.hops[0]!
+    if (options.frontierController) {
+      const firstEndpointParts = firstHop.endpoint.trim().split(/\s+/)
+      const firstMethod = firstEndpointParts.length >= 2 ? firstEndpointParts[0]! : 'GET'
+      const firstPath = firstEndpointParts.length >= 2 ? firstEndpointParts.slice(1).join(' ') : firstHop.endpoint
+      const admission = options.frontierController.admitStepBranch({
+        branchKey: `wave1:composite:${sourceOrigins[0] ?? 'unknown'}:${firstPath}:${comp.category}`.slice(0, 140),
+        depth: Math.max(1, Math.min(MAX_CHAIN_DEPTH, comp.hops.length)),
+        origin: firstHop.origin,
+        endpoint: firstPath,
+        method: firstMethod,
+        hypothesisClass: comp.category,
+        goalSummary: title,
+        waveNo: Math.max(1, run.roundNo || 1),
+      })
+      if (!admission.admitted) continue
+    }
 
     const step = storage.addChainStep(run, {
       title,
