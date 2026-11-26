@@ -479,7 +479,10 @@ test('dual_tenant_abac: multi-tenant admin-in-A / low-priv-in-B personas are all
   assert.equal(isPrivilegedActorOrRole('svc_root', 'member', 'platform superadmin, member (org_z)', 'org_z'), true, 'global privileged labels are forbidden')
   assert.equal(isPrivilegedActorOrRole('plain_member_b', 'member', 'member (org_b)', 'org_b'), false, 'ordinary low-privilege member stays allowed')
 
-  // (b) Grant-derived composite verify options: dual-tenant personas route to attackerPersonas.
+  // (b) Grant-derived composite verify options (R4-H-6): dual-tenant personas stay in
+  //     forbiddenShortcutPersonas by default and are tracked in dualTenantAbacPersonas +
+  //     personaRoleLabels so they are permitted ONLY under explicit dual_tenant_abac with a
+  //     host-bound non-admin target tenant.
   const mkPersona = (handle: string, roleLabel: string): ResolvedPersona => ({
     id: `persona-${handle}`, handle, roleLabel, originAllowlist: [ORIGIN], authKind: 'header',
     headerName: 'X-User', secret: `secret-${handle}-01`, canaryMarkers: [],
@@ -495,8 +498,10 @@ test('dual_tenant_abac: multi-tenant admin-in-A / low-priv-in-B personas are all
   }
   const options = buildCompositeVerifyOptionsFromGrant(grant)
   assert.ok(options, 'expected grant-derived composite verify options')
-  assert.deepEqual([...(options?.attackerPersonas ?? [])].sort(), ['member_ab', 'plain_member_b'])
-  assert.deepEqual([...(options?.forbiddenShortcutPersonas ?? [])].sort(), ['org_admin_a', 'owner_mix', 'svc_root'])
+  assert.deepEqual([...(options?.attackerPersonas ?? [])].sort(), ['plain_member_b'])
+  assert.deepEqual([...(options?.forbiddenShortcutPersonas ?? [])].sort(), ['member_ab', 'org_admin_a', 'owner_mix', 'svc_root'])
+  assert.deepEqual([...(options?.dualTenantAbacPersonas ?? [])].sort(), ['member_ab'])
+  assert.equal(options?.personaRoleLabels?.member_ab, 'admin (org_a), member (org_b)')
 
   // (c) Full composite verify: the dual-tenant persona attacks the VICTIM tenant (org_c) and confirms.
   const cap = 'cap:dual:hopper'
@@ -614,14 +619,14 @@ test('isDynamicResourceIdSegment and matchesNormalizedCtrlPath: canonical dynami
   assert.equal(matchesNormalizedCtrlPath('/api/v1/users/9f8e7d6c', '/api/v1/users/9f8e7d6c'), false, 'identical exact paths are handled by the exact-path branch, not the dynamic normalizer')
 })
 
-test('matchesCtrlTarget: denied controls on sibling dynamic resource IDs confirm; static-noun drift stays fail-closed', () => {
+test('matchesBoundTerminalControl (R4-H-5): unbound sibling dynamic-ID controls fail closed; exact-path and positive same-owner bindings confirm', () => {
   const cap = 'cap:dyn:export_url'
   const ctrlEntry = (id: string, path: string): HostTranscriptEntry => signedEntry(id, makeStep({
     id, arm: 'control', method: 'GET', status: 403, pathAndQuery: path,
     json: { error: 'forbidden' },
   }), { timestampMs: 900 })
 
-  const dynOkReceipt = (ctrlPath: string, ctrlId: string): { receipt: CompositeProofReceipt; transcript: HostSignedTranscript } => {
+  const dynReceipt = (ctrlPath: string, ctrlId: string, extraEntries: HostTranscriptEntry[] = []): { receipt: CompositeProofReceipt; transcript: HostSignedTranscript } => {
     const h1 = signedEntry('dyn-h1', makeStep({
       id: 'dyn-h1', arm: 'setup', method: 'GET', status: 200, pathAndQuery: '/api/v1/directory/items',
       json: { token: 'opaque-export-token-456' },
@@ -642,17 +647,34 @@ test('matchesCtrlTarget: denied controls on sibling dynamic resource IDs confirm
         preChainControlExchangeIds: [ctrlId],
         summary: 'Unauthorized cross-tenant export download using Hop 1 capability.',
       }),
-      transcript: { entries: [ctrlEntry(ctrlId, ctrlPath), h1, h2] },
+      transcript: { entries: [ctrlEntry(ctrlId, ctrlPath), h1, h2, ...extraEntries] },
     }
   }
 
-  // (a) Control denied on a sibling dynamic ID of the same route -> normalized match confirms.
-  const ok = dynOkReceipt('/api/v1/exports/0c9d8b7a/download', 'dyn-ctrl-sibling')
-  const okRes = verifyCompositeReceipt(ok.receipt, ok.transcript, { attackerPersonas: ['member_a'], signingKey: SIGNING_KEY })
-  assert.equal(okRes.confirmed, true, `sibling dynamic-ID control must confirm: ${okRes.reason}`)
+  // (a) R4-H-5: Unbound sibling dynamic ID of the same route shape (no same-object / same-owner binding) MUST fail closed.
+  const unboundSibling = dynReceipt('/api/v1/exports/0c9d8b7a/download', 'dyn-ctrl-sibling')
+  const unboundRes = verifyCompositeReceipt(unboundSibling.receipt, unboundSibling.transcript, { attackerPersonas: ['member_a'], signingKey: SIGNING_KEY })
+  assert.equal(unboundRes.confirmed, false, 'unbound sibling dynamic-ID control must reject fail-closed')
+  assert.equal(unboundRes.failedStage, 'terminal_impact')
+  assert.ok(unboundRes.missingEvidence?.includes('clean_denied_control_401_403_404'), `expected clean_denied_control evidence gap, got ${JSON.stringify(unboundRes.missingEvidence)}`)
 
-  // (b) Control on a different static route noun -> no clean denied control -> fail closed.
-  const drift = dynOkReceipt('/api/v1/shipments/0c9d8b7a/download', 'dyn-ctrl-drift')
+  // (b) Exact-path control on the same object confirms cleanly.
+  const exactObj = dynReceipt('/api/v1/exports/e77f0a21/download', 'dyn-ctrl-exact')
+  const exactRes = verifyCompositeReceipt(exactObj.receipt, exactObj.transcript, { attackerPersonas: ['member_a'], signingKey: SIGNING_KEY })
+  assert.equal(exactRes.confirmed, true, `exact-path control must confirm: ${exactRes.reason}`)
+
+  // (c) Sibling dynamic-ID control WITH a positive host-signed same-owner readback + explicit causal edge confirms cleanly.
+  const sameOwnerReadback = signedEntry('dyn-owner-rb', makeStep({
+    id: 'dyn-owner-rb', arm: 'control', method: 'GET', status: 200, pathAndQuery: '/api/v1/exports/0c9d8b7a/meta',
+    actor: { handle: 'admin_b', role: 'admin', tenant: 'org_b', auth: 'bearer', sameSite: null },
+    json: { exportId: '0c9d8b7a', tenantId: 'org_b', owner: 'org_b' },
+  }), { timestampMs: 850, actorPersona: 'admin_b', actorRoleLabel: 'admin (org_b)' })
+  const boundSibling = dynReceipt('/api/v1/exports/0c9d8b7a/download', 'dyn-ctrl-sibling-bound', [sameOwnerReadback])
+  const boundRes = verifyCompositeReceipt(boundSibling.receipt, boundSibling.transcript, { attackerPersonas: ['member_a'], signingKey: SIGNING_KEY })
+  assert.equal(boundRes.confirmed, true, `sibling dynamic-ID control with positive same-owner readback must confirm: ${boundRes.reason}`)
+
+  // (d) Control on a different static route noun -> no clean denied control -> fail closed.
+  const drift = dynReceipt('/api/v1/shipments/0c9d8b7a/download', 'dyn-ctrl-drift')
   const driftRes = verifyCompositeReceipt(drift.receipt, drift.transcript, { attackerPersonas: ['member_a'], signingKey: SIGNING_KEY })
   assert.equal(driftRes.confirmed, false)
   assert.equal(driftRes.failedStage, 'terminal_impact')

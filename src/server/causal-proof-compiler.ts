@@ -20,9 +20,9 @@ import type {
   HostTranscriptEntry,
 } from './composite-receipt.ts'
 import { HostFactLog, type HostExchangeFact } from './host-fact-log.ts'
-import { isReadMethod, routeFamily, stepReadsState } from './oracle-invariants.ts'
+import { isReadMethod, parseRoleMemberships, routeFamily, stepReadsState } from './oracle-invariants.ts'
 import { extractTenantMarkers, type V8OracleFamily } from './v8-oracle-families.ts'
-import { canonicalNonAuthQuery, cleanExactPath, entryMatchesEntity } from './v8-oracle-hydrate.ts'
+import { canonicalNonAuthQuery, cleanExactPath, entryMatchesEntity, isPrivilegedActorOrRole, type CapOriginIndex } from './v8-oracle-hydrate.ts'
 
 const CAP_HANDLE_RE = /^cap:[A-Za-z0-9._:-]{1,180}$/
 const SHA256_RE = /^[0-9a-f]{64}$/
@@ -202,8 +202,10 @@ function extractCsvOrKvTenantMarkers(body: string | undefined): Set<string> {
     const key = m[1]!.toLowerCase(), val = m[2]!.toLowerCase()
     if (TENANT_TEXT_KEY_RE.test(key) && !TENANT_HEADER_NOISE.has(val)) out.add(val)
   }
-  // 2. Tabular CSV header row (`id,tenant,amount\n1,org_b,500`).
+  // 2. Tabular CSV header row (`id,tenant,amount\n1,org_b,500`). Skip when Step 1 already parsed
+  //    2-column `key,value` rows (e.g. `tenant,acme\ncanary,...`) so column-0 keys aren't misread as tenants.
   const hdrCols = lines[0]!.split(',').map(c => c.trim().replace(/^"|"$/g, '').toLowerCase())
+  if (out.size > 0 && hdrCols.length === 2 && TENANT_TEXT_KEY_RE.test(hdrCols[0]!)) return out
   const tenantColIdxs = hdrCols.map((c, i) => (TENANT_TEXT_KEY_RE.test(c) ? i : -1)).filter(i => i >= 0)
   if (tenantColIdxs.length > 0 && lines.length >= 2) {
     for (const row of lines.slice(1, 64)) {
@@ -826,5 +828,324 @@ export function compileCausalChainFromTranscript(
     receipt: { ...receipt, causalEdges: [...baseEdges, ...inferredEdges] },
     inferredEdges,
     rewiredEdges,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// R4-C-5 Shared Cited-Records Collector & R4-H-6 Per-Exchange Tenant Privilege
+// ---------------------------------------------------------------------------
+
+export interface CitedProvenanceTarget {
+  exchangeId: string
+  label: string
+  /** True for attacker-origin issuance/action roles that MUST be checked even if labeled `arm='control'`. */
+  forceCheck: boolean
+}
+
+const ORACLE_ATTACKER_ACTION_KEYS = new Set([
+  'sourcevalidissuance', 'sourceissuanceexchangeid', 'issuanceexchangeid',
+  'replayedacceptance', 'replayedexchangeid', 'replayedacceptanceexchangeid',
+  'transferrecord', 'transferexchangeid',
+  'primeaction', 'primeactionexchangeid',
+  'bledaccess', 'bledaccessexchangeid',
+  'batchrequest', 'batchrequestexchangeid',
+  'actions', 'actionexchangeids', 'actionsexchangeids', 'actionexchangeid',
+  'differentialprobe', 'differentialprobeexchangeid',
+  'attackerprobe', 'attackerprobeexchangeid',
+  'secondarysuccess', 'secondarysuccessexchangeid',
+  'prerevocationbaseline', 'prerevocationbaselineexchangeid',
+  'record', 'exchangeid',
+])
+
+const ORACLE_READBACK_KEYS = new Set([
+  'posttransferreadback', 'posttransferreadbackexchangeid',
+  'postmutationreadback', 'postmutationreadbackexchangeid',
+  'postimpactreadback', 'postimpactreadbackexchangeid',
+  'baselinereadback', 'baselineexchangeid', 'baselinereadbackexchangeid',
+  'finalreadback', 'finalexchangeid', 'finalreadbackexchangeid',
+])
+
+const ORACLE_CONTROL_OR_VICTIM_KEYS = new Set([
+  'tamperedsignaturecontrol', 'tamperedcontrolexchangeid', 'tamperedsigdenialexchangeid',
+  'sourcecontroldenied', 'sourcecontrolexchangeid',
+  'baselinedeniedcontrol', 'baselinecontrolexchangeid',
+  'singleforeigncontroldenied', 'singleforeigncontrolexchangeid',
+  'revocationevent', 'revocationeventexchangeid',
+  'primarydeniedcheck', 'primarydeniedcheckexchangeid',
+  'cleancontrol', 'cleancontrolexchangeid',
+  'victimorprimerequest', 'victimprimeexchangeid',
+  'prechaincontroldenied', 'prechaincontrolexchangeid',
+  'ablationcontroldenied', 'ablationexchangeid',
+])
+
+/**
+ * R4-C-5: ONE shared cited-records collector across ALL receipt citations — hops, edges,
+ * embedded proofReceipts, readbacks, Mode-A failures, AND every exchange ID referenced inside
+ * `terminalImpact.oracleInput` / `options.v8OracleInput` — so uncited admin-issued exchanges
+ * named only in `oracleInput` can NEVER bypass `verifyAttackerProvenance`.
+ */
+export function collectCitedReceiptExchanges(
+  receipt: CompositeProofReceipt,
+  v8OracleInput: Record<string, unknown> | undefined,
+  entriesById: ReadonlyMap<string, HostTranscriptEntry>,
+): { allIds: Set<string>; extraProvenanceTargets: CitedProvenanceTarget[] } {
+  const allIds = new Set<string>()
+  const targetsById = new Map<string, CitedProvenanceTarget>()
+
+  const addTarget = (id: string, label: string, forceCheck: boolean): void => {
+    const trimmed = id.trim()
+    if (!trimmed) return
+    allIds.add(trimmed)
+    const prev = targetsById.get(trimmed)
+    if (!prev || (forceCheck && !prev.forceCheck)) {
+      targetsById.set(trimmed, { exchangeId: trimmed, label, forceCheck })
+    }
+  }
+
+  for (const h of receipt.hops) {
+    for (const id of h.exchangeIds) allIds.add(id)
+    for (const id of h.proofReceipt?.exchangeIds ?? []) addTarget(id, `hop "${h.hopId}" proofReceipt`, false)
+  }
+  for (const e of receipt.causalEdges) {
+    if (e.kind === 'value_binding') {
+      if (e.sourceExchangeId) allIds.add(e.sourceExchangeId)
+      if (e.targetExchangeId) allIds.add(e.targetExchangeId)
+    } else if (e.kind === 'state_transition_binding') {
+      for (const id of e.ablationExchangeIds) allIds.add(id)
+    }
+  }
+
+  const ti = receipt.terminalImpact
+  if (ti.terminalExchangeId) allIds.add(ti.terminalExchangeId)
+  for (const id of ti.preChainControlExchangeIds) allIds.add(id)
+  for (const id of ti.postChainReadbackExchangeIds) {
+    allIds.add(id)
+    const e = entriesById.get(id)
+    if (e && !stepReadsState(e.step)) addTarget(id, 'cited non-control exchange', false)
+  }
+  if (ti.modeAFailureExchangeId) addTarget(ti.modeAFailureExchangeId, 'cited non-control exchange', false)
+  for (const id of ti.proofReceipt?.exchangeIds ?? []) addTarget(id, 'cited non-control exchange', false)
+
+  const recordOracleRef = (keyName: string, rawId: string): void => {
+    const id = rawId.trim()
+    if (!id || !entriesById.has(id)) return
+    const entry = entriesById.get(id)!
+    const lk = keyName.toLowerCase()
+    if (ORACLE_ATTACKER_ACTION_KEYS.has(lk)) {
+      addTarget(id, `oracleInput "${keyName}"`, true)
+    } else if (ORACLE_READBACK_KEYS.has(lk)) {
+      allIds.add(id)
+      if (!stepReadsState(entry.step)) addTarget(id, `oracleInput "${keyName}"`, false)
+    } else if (ORACLE_CONTROL_OR_VICTIM_KEYS.has(lk)) {
+      allIds.add(id)
+      if (entry.step.arm !== 'control') addTarget(id, `oracleInput "${keyName}"`, false)
+    } else {
+      addTarget(id, `oracleInput "${keyName}"`, false)
+    }
+  }
+
+  const walkOracle = (node: unknown, keyName: string, depth: number): void => {
+    if (depth > 5 || node == null) return
+    if (typeof node === 'string') {
+      recordOracleRef(keyName, node)
+      return
+    }
+    if (Array.isArray(node)) {
+      for (const item of node.slice(0, 64)) walkOracle(item, keyName, depth + 1)
+      return
+    }
+    if (typeof node === 'object') {
+      const obj = node as Record<string, unknown>
+      const objId = typeof obj.exchangeId === 'string' ? obj.exchangeId.trim()
+        : typeof obj.id === 'string' ? obj.id.trim() : ''
+      if (objId && entriesById.has(objId) && keyName) {
+        recordOracleRef(keyName, objId)
+      }
+      for (const [k, v] of Object.entries(obj)) {
+        walkOracle(v, k, depth + 1)
+      }
+    }
+  }
+
+  if (ti.oracleInput) walkOracle(ti.oracleInput, '', 0)
+  if (v8OracleInput && v8OracleInput !== ti.oracleInput) walkOracle(v8OracleInput, '', 0)
+
+  return { allIds, extraProvenanceTargets: [...targetsById.values()] }
+}
+
+const ROUTE_TENANT_SEG_RE = /(?:^|\/)(?:tenants?|orgs?|organizations?|workspaces?|accounts?|merchants?)\/([a-z0-9][a-z0-9._-]{1,63})(?:\/|$)/gi
+const QUERY_TENANT_KEYS = new Set([
+  'tenant', 'tenantid', 'tenant_id', 'org', 'orgid', 'org_id',
+  'organization', 'organizationid', 'organization_id', 'workspace', 'workspaceid', 'workspace_id',
+])
+
+export interface PersonaPrivilegeProfile {
+  alwaysForbidden: boolean
+  isMixedDual: boolean
+  adminTenants: ReadonlySet<string>
+  lowPrivTenants: ReadonlySet<string>
+  allTenants: ReadonlySet<string>
+}
+
+/**
+ * R4-H-6: Classify a persona's privilege profile from handle, role, and full roleLabel.
+ * - `alwaysForbidden`: owner, superadmin, privileged handle, single-tenant admin, dual-admin, or unknown role.
+ * - `isMixedDual`: holds `admin` in >=1 tenant AND low-privilege (`member`/`viewer`) in >=1 distinct tenant.
+ */
+export function parsePersonaPrivilegeProfile(
+  actor: string | null,
+  role: string | null,
+  roleLabel?: string | null,
+): PersonaPrivilegeProfile {
+  const memberships = roleLabel ? parseRoleMemberships(roleLabel) : []
+  const adminTenants = new Set<string>(
+    memberships.filter(m => (m.role === 'admin' || m.role === 'owner') && m.tenant).map(m => m.tenant!.toLowerCase()),
+  )
+  const lowPrivTenants = new Set<string>(
+    memberships
+      .filter(m => (m.role === 'member' || m.role === 'viewer') && m.tenant && !adminTenants.has(m.tenant.toLowerCase()))
+      .map(m => m.tenant!.toLowerCase()),
+  )
+  const allTenants = new Set<string>([...adminTenants, ...lowPrivTenants])
+  const alwaysForbidden = isPrivilegedActorOrRole(actor, role, roleLabel)
+  const isMixedDual = !alwaysForbidden && adminTenants.size >= 1 && lowPrivTenants.size >= 1
+  return { alwaysForbidden, isMixedDual, adminTenants, lowPrivTenants, allTenants }
+}
+
+/** Extract host-attested tenant identifiers from a request route/path and query parameters. */
+function extractRouteTenantMarkers(
+  rawPathOrRoute: string | null | undefined,
+  knownTenants?: ReadonlySet<string>,
+): Set<string> {
+  const out = new Set<string>()
+  const raw = (rawPathOrRoute ?? '').trim()
+  if (!raw) return out
+  const [pathPart = '', queryPart = ''] = raw.split('?', 2)
+  const cleanPath = pathPart.split('#', 1)[0] ?? ''
+  ROUTE_TENANT_SEG_RE.lastIndex = 0
+  let m: RegExpExecArray | null
+  while ((m = ROUTE_TENANT_SEG_RE.exec(cleanPath)) !== null) {
+    let seg = m[1]!
+    try { seg = decodeURIComponent(seg) } catch { /* keep raw */ }
+    const norm = seg.trim().toLowerCase()
+    if (norm && !isDynamicResourceIdSegment(norm)) out.add(norm)
+    else if (norm && knownTenants?.has(norm)) out.add(norm)
+  }
+  if (knownTenants && knownTenants.size > 0) {
+    for (const rawSeg of cleanPath.split('/')) {
+      if (!rawSeg) continue
+      let seg = rawSeg
+      try { seg = decodeURIComponent(rawSeg) } catch { /* keep raw */ }
+      const norm = seg.trim().toLowerCase()
+      if (knownTenants.has(norm)) out.add(norm)
+    }
+  }
+  if (queryPart) {
+    for (const [k, v] of new URLSearchParams(queryPart.split('#', 1)[0]!).entries()) {
+      if (QUERY_TENANT_KEYS.has(k.trim().toLowerCase()) && v.trim()) {
+        out.add(v.trim().toLowerCase())
+      }
+    }
+  }
+  return out
+}
+
+export interface ExchangeTenantPrivilegeResult {
+  forbidden: boolean
+  reason?: string
+  resolvedTenant: string | null
+}
+
+/**
+ * R4-H-6: Resolve the acting tenant of an exec-arm exchange from host route, response markers,
+ * and persona/capability tenant map; forbid any mixed-role persona acting in an admin/owner
+ * tenant and fail closed whenever the acting tenant is ambiguous.
+ */
+export function evaluateExchangeTenantPrivilege(
+  entry: HostTranscriptEntry,
+  profile: PersonaPrivilegeProfile,
+  capIdx: CapOriginIndex,
+  opts: { isTermHop: boolean; isDualTenantAbac: boolean; allowDualAbacPrimeHop: boolean },
+): ExchangeTenantPrivilegeResult {
+  if (profile.alwaysForbidden) {
+    return { forbidden: true, reason: 'privileged persona/role is forbidden', resolvedTenant: null }
+  }
+  if (!profile.isMixedDual) {
+    return { forbidden: false, resolvedTenant: null }
+  }
+
+  const routeTenants = extractRouteTenantMarkers(entry.step.pathAndQuery ?? entry.step.route, profile.allTenants)
+  const jsonMarkers = extractTenantMarkers(entry.step.json, entry.step.body)
+  const textMarkers = entry.step.json === undefined ? extractCsvOrKvTenantMarkers(entry.step.body) : new Set<string>()
+  const respTenants = new Set<string>([...jsonMarkers, ...textMarkers])
+  const explicitTargetTenants = new Set<string>([...routeTenants, ...respTenants])
+
+  const capLoginTenants = new Set<string>()
+  const rawActor = entry.actorPersona !== undefined ? entry.actorPersona : (entry.step.actor.handle ?? null)
+  for (const c of [...(rawActor?.startsWith('cap:') ? [rawActor] : []), ...(entry.consumedCapabilities ?? [])]) {
+    const lt = capIdx.loginTenantOf(c)
+    if (lt) capLoginTenants.add(lt.trim().toLowerCase())
+  }
+  const actorDeclaredTenant = entry.step.actor.tenant?.trim().toLowerCase() || null
+
+  // 1. Any explicit route or response tenant matching an admin tenant -> FORBIDDEN (unless explicit dual_tenant_abac priming hop).
+  const adminHits = [...explicitTargetTenants].filter(t => profile.adminTenants.has(t))
+  if (adminHits.length > 0) {
+    if (!opts.isTermHop && opts.allowDualAbacPrimeHop) {
+      return { forbidden: false, resolvedTenant: adminHits[0]! }
+    }
+    return {
+      forbidden: true,
+      reason: `dual-membership persona holds admin/owner in acting tenant "${adminHits[0]}"`,
+      resolvedTenant: adminHits[0]!,
+    }
+  }
+
+  // 2. Resolve effective target tenant (response-attested markers beat attacker-supplied route/query
+  //    params once Check 1 confirmed neither touches an admin tenant); multiple conflicting tenants fail closed.
+  const effectiveTargetTenants = respTenants.size > 0 ? respTenants : routeTenants
+  if (effectiveTargetTenants.size > 1) {
+    return {
+      forbidden: true,
+      reason: `ambiguous acting tenant (${[...effectiveTargetTenants].sort().join(', ')}) for dual-membership persona`,
+      resolvedTenant: null,
+    }
+  }
+
+  // 3. Single unambiguous host-bound non-admin target tenant -> ALLOWED!
+  if (effectiveTargetTenants.size === 1) {
+    return { forbidden: false, resolvedTenant: [...effectiveTargetTenants][0]! }
+  }
+
+  // 4. Zero route/response tenants -> terminal hops and non-dual_tenant_abac hops ALWAYS fail closed (ambiguous).
+  if (opts.isTermHop || !opts.isDualTenantAbac) {
+    return {
+      forbidden: true,
+      reason: 'ambiguous acting tenant (no host-bound route or response tenant) for dual-membership persona',
+      resolvedTenant: null,
+    }
+  }
+
+  // Non-terminal hop of a dual_tenant_abac chain with no route/response tenant: check login/declared tenant.
+  const fallbackTenants = capLoginTenants.size > 0
+    ? [...capLoginTenants]
+    : (actorDeclaredTenant ? [actorDeclaredTenant] : [])
+  const fallbackAdminHit = fallbackTenants.find(t => profile.adminTenants.has(t))
+  if (fallbackAdminHit) {
+    if (opts.allowDualAbacPrimeHop) return { forbidden: false, resolvedTenant: fallbackAdminHit }
+    return {
+      forbidden: true,
+      reason: `dual-membership persona holds admin/owner in acting tenant "${fallbackAdminHit}"`,
+      resolvedTenant: fallbackAdminHit,
+    }
+  }
+  const lowHit = fallbackTenants.find(t => profile.lowPrivTenants.has(t))
+  if (fallbackTenants.length === 1 && lowHit) {
+    return { forbidden: false, resolvedTenant: lowHit }
+  }
+  return {
+    forbidden: true,
+    reason: 'ambiguous acting tenant for dual-membership persona',
+    resolvedTenant: null,
   }
 }
