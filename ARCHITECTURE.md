@@ -134,7 +134,7 @@ flowchart TD
   PB --> L3["Layer-3 kovo_verify<br/>Dual clean replay (verifyScript)"]
   L3 --> CF["Confirmation: verifyCompositeReceipt / verifyReceipt<br/>+ causalFingerprints"]
   CF --> DD["Dedupe + persist<br/>dedupe.ts, finding-fingerprint.ts, store-findings.ts"]
-  DD --> PV["Patch verification<br/>patch-workflow.ts retestCompositeChainPatch"]
+  DD --> PV["Patch verification<br/>patch-workflow.ts generateAndReviewPatch (composite chain retest pending Q8/Gate-6 wiring)"]
 ```
 
 **Phase 0: Recon.** `phase0-recon.ts` (5.8k LOC) crawls and extracts routes from static framework
@@ -145,7 +145,7 @@ patterns, JS request shapes, tRPC procedures, OpenAPI/GraphQL specs and manifest
 **Phase A: code-first + floor.** It runs before any agent dispatch, with its own wall-clock share
 (`PHASE_A_FLOOR_WALL_CLOCK_SHARE`, `SOURCE_AUDIT_WALL_CLOCK_SHARE`) and a split request budget
 (`resolvePhaseRequestBudgets`; Phase A can't borrow from Phase B).
-- `buildStaticWorkspaceSnapshot()` / `getOrBuildStaticWorkspaceSnapshot()` does one bounded,
+- `buildStaticWorkspaceSnapshot()` / `getOrBuildStaticWorkspaceSnapshotInWorker()` does one bounded,
   symlink-safe and secret-path-excluding walk, then builds `ProgramGraph` once and shares that
   immutable snapshot with `phase0-recon`, `program-graph`, `invariant-synthesizer` and `semantic-audit`.
   The model spends zero turns on enumerating files.
@@ -183,10 +183,12 @@ differ and each proof document echoes its own nonce. Failures return a **repair 
 *duplicate* suppression; that judge never confirms anything. The store refuses to persist a confirmed finding unless its
 own evidence confirms (`invariant.confirmation_evidence` gate + DB trigger, pinned by `worker-gate.sh`).
 
-**Patch verification.** `generateAndReviewPatch()` (author + reviewer + static AST post-check) and
-`retestCompositeChainPatch()` replay each hop against the patched lab (`LabRunner`,
-`applyUnifiedDiffToDirectory`) and record *which causal edge broke* (`CompositeBrokeCausalEdge`),
-sealed by `computeCompositeRetestProofDigest`.
+**Patch verification.** `generateAndReviewPatch()` (author + reviewer + static AST post-check,
+wired from `execution.ts`) replays patched findings against the local lab (`LabRunner`,
+`applyUnifiedDiffToDirectory`). Multi-hop composite chain patch retest (`retestCompositeChainPatch`,
+`CompositeBrokeCausalEdge`, `computeCompositeRetestProofDigest` in `patch-workflow.ts`) is
+implemented and unit-tested (`tests/v8-patch-retest.test.ts`), and is currently **pending production
+Gate-6 wiring** (tracked for Q8 — not yet invoked from `execution.ts`).
 
 ---
 
@@ -208,12 +210,12 @@ slices only (see `AGENTS.md`).
 | `src/server/exec-dispatch.ts` | 3596 | Scheduling policy, probe selection, frontier wave control | `FrontierWaveController`, `evaluateDispatchStop`, `planMultiTrialExpansion`, `coordinatorSchedulerDecision`, `selectProbeCandidates`, `resolvePhaseRequestBudgets`, `formatHopCheckpointForAssignment`, `chainHypothesisDispatchSteps` |
 | `src/server/exec-floor-lane.ts` | 1383 | Phase A deterministic floor lane | `ExecFloorLane`, `ExecFloorLaneHost` |
 | `src/server/exec-worker-runner.ts` | 1834 | One specialist assignment: container, tools, brokered transport | `ExecWorkerRunner`, `ExecWorkerHost`, `ExecBrokeredTransportContext` |
-| `src/server/exec-verify.ts` | 2769 | Bridges agent submissions to the proof kernel | `ExecVerifier`, `runV8AgentScriptProof`, `syncVerifyArtifactsToLedger`, `extractAgentProofTarget` |
+| `src/server/exec-verify.ts` | 2769 | Bridges agent submissions to the proof kernel | `ExecVerifier`, `runAgentScriptProof`, `syncVerifyArtifactsToLedger`, `extractAgentProofTarget` |
 | `src/server/exec-recon-planner.ts` | 3730 | Phase 0 → lane/step planning, hop-checkpoint parsing | — |
 | `src/server/frontier-scheduler.ts` | 725 | Pure beam/EVI/quotas/termination | `selectNextWaveAssignments`, `evaluateWaveProgress`, `DEAD_END_STRIKE_LIMIT` |
 | `src/server/graph-coordinator.ts` | 2087 | Coordinator query surface + chain primitives | `queryEndpoints`, `queryFindings`, `queryProgramGraph`, `ChainHop` |
 | `src/server/agent-session.ts` | 3766 | Host-side model loop + worker tool surface | `runAgentSession`, `buildWorkerTools`, `SpecSubmissionTracker`, `PARALLEL_READ_ONLY_TOOLS` |
-| `src/server/agent-prompts.ts` | 3075 | Turn/wall-clock budgets, settlement, proof-gap vocabulary | `resolveAgenticTurnBudget`, `wallClockSettlementMs`, `SPEC_PROOF_GAP_CODES`, `NEGATIVE_EDGE_PROOF_GAP_CODES` |
+| `src/server/agent-prompts.ts` | 3075 | Turn/wall-clock budgets, settlement, proof-gap vocabulary | `wallClockSettlementMs`, `SPEC_PROOF_GAP_CODES`, `NEGATIVE_EDGE_PROOF_GAP_CODES` |
 
 ```mermaid
 flowchart TD
@@ -299,7 +301,7 @@ rejection carries `failedStage`, `rejectedBy` and `missingEvidence`, which feed 
 
 | File | LOC | Role | Key symbols |
 |---|---:|---|---|
-| `src/server/broker.ts` | 4030 | The only path to the target. Scope, approval, circuit breakers, cookie jars, race bursts, WS | `RequestBroker.executeHttp`, `Grant`, `BrokerHttpRequest.onRawResponse`, `BrokerDenied`, `BrokerApprovalRequired`, `BrokerCircuitOpen`, `isPublicAddress` |
+| `src/server/broker.ts` | 4030 | The only path to the target. Scope, approval, circuit breakers, cookie jars, race bursts, WS | `RequestBroker.executeHttp`, `Grant`, `BrokerHttpRequest.onRawResponse`, `BrokerDenied`, `BrokerApprovalRequired`, `BrokerCircuitOpen`, `isLoopbackOrigin` |
 | `src/server/redact.ts` | 500 | Pure leaf: secret/PII/ZDR redaction | `redact`, `redactHeaders`, `redactJsonValue`, `scanSecrets`, `redactZdr` |
 | `src/server/worker-backend.ts` | 1837 | Docker lifecycle, warm pool, typed job schemas | `WorkerBackend`, `WorkerSession` (`exec`, `runScript`), `WarmWorkerPool`, `workerContainerCreateArgs`, `installLiveExitHooks` |
 | `src/server/lab-runner.ts` | 1726 | Local lab target lifecycle and patching | `LabRunner`, `assertLocalLabAllowed`, `applyUnifiedDiffToDirectory`, `bindLabSignalHooks` |

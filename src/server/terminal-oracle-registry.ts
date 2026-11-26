@@ -12,6 +12,7 @@
  *      and exchange ordering strictly from `HostFactLog` — never from untrusted worker claim scalars.
  */
 import {
+  registerDefaultCompositeOracleEvaluator,
   singleReceiptToComposite,
   verifyCompositeReceipt,
   verifyHostRecordSignature,
@@ -451,6 +452,7 @@ export class TerminalOracleRegistry {
         }
       }
       const composite = verifyCompositeReceipt(sanitized.receipt, hostTranscript, {
+        oracleEvaluator: this,
         ...(policyContext.compositeOptions ?? {}),
         ...(policyContext.signingKey ? { signingKey: policyContext.signingKey } : {}),
         ...(policyContext.attackerPersonas ? { attackerPersonas: policyContext.attackerPersonas } : {}),
@@ -542,6 +544,7 @@ export class TerminalOracleRegistry {
         ...(policyContext.benchmarkMode !== undefined ? { benchmarkMode: policyContext.benchmarkMode } : {}),
       })
       const compRes = verifyCompositeReceipt(wrapped, hostTranscript, {
+        oracleEvaluator: this,
         ...(policyContext.compositeOptions ?? {}),
         ...(policyContext.signingKey ? { signingKey: policyContext.signingKey } : {}),
         ...(policyContext.attackerPersonas ? { attackerPersonas: policyContext.attackerPersonas } : {}),
@@ -584,6 +587,7 @@ export class TerminalOracleRegistry {
 }
 
 export const defaultTerminalOracleRegistry = new TerminalOracleRegistry()
+registerDefaultCompositeOracleEvaluator(defaultTerminalOracleRegistry)
 
 export function evaluateTerminalOracle(
   factLog: HostFactLog,

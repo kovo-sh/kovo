@@ -25,10 +25,15 @@ import {
   MAX_PROVIDER_STALL_RETRIES,
   PROVIDER_STALL_NO_TOKEN_MS,
   ProviderNoTokenWatchdog,
-  resolveProviderStallNoTokenMs,
   secretGenerationFingerprint,
   shouldRetryStalledAssignment,
 } from '../src/server/execution.ts'
+import {
+  DEFAULT_NO_TOKEN_WATCHDOG_MS,
+  MEDIUM_THINKING_NO_TOKEN_WATCHDOG_MS,
+  REASONING_NO_TOKEN_WATCHDOG_MS,
+  resolveProfileNoTokenWatchdogMs,
+} from '../src/server/provider-stream.ts'
 import {
   LinuxWorkerBackend,
   MAX_WARM_POOL_CAPACITY,
@@ -96,10 +101,13 @@ function dockerStub() {
 
 test('no-token watchdog fires once after silence and never after a token reset', t => {
   t.mock.timers.enable({ apis: ['setTimeout'] })
-  assert.equal(PROVIDER_STALL_NO_TOKEN_MS, 28_000, 'product default is inside the 25–30 s window')
-  assert.equal(resolveProviderStallNoTokenMs({}), 28_000)
-  assert.equal(resolveProviderStallNoTokenMs({ KOVO_PROVIDER_NO_TOKEN_MS: '30000' }), 30_000)
-  assert.equal(resolveProviderStallNoTokenMs({ KOVO_PROVIDER_NO_TOKEN_MS: '1' }), 5_000, 'lower bound')
+  assert.equal(PROVIDER_STALL_NO_TOKEN_MS, DEFAULT_NO_TOKEN_WATCHDOG_MS, 'product default matches live provider-stream resolver')
+  assert.equal(DEFAULT_NO_TOKEN_WATCHDOG_MS, 28_000, 'product default is inside the 25–30 s window')
+  assert.equal(resolveProfileNoTokenWatchdogMs(undefined, {}), 28_000)
+  assert.equal(resolveProfileNoTokenWatchdogMs(undefined, { KOVO_PROVIDER_NO_TOKEN_MS: '30000' }), 30_000)
+  assert.equal(resolveProfileNoTokenWatchdogMs(undefined, { KOVO_PROVIDER_NO_TOKEN_MS: '1' }), 5_000, 'lower bound')
+  assert.equal(resolveProfileNoTokenWatchdogMs({ thinkingLevel: 'medium' }, {}), MEDIUM_THINKING_NO_TOKEN_WATCHDOG_MS)
+  assert.equal(resolveProfileNoTokenWatchdogMs({ thinkingLevel: 'high' }, {}), REASONING_NO_TOKEN_WATCHDOG_MS)
 
   const fired: Array<{ turn: number; thresholdMs: number }> = []
   const watchdog = new ProviderNoTokenWatchdog({

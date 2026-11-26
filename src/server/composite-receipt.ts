@@ -8,15 +8,9 @@ import { scopedAssetOrigin } from '../domain.ts'
 import { parseRoleLabel, routeFamily, stepReadsState } from './oracle-invariants.ts'
 import { augmentCompositeReceiptWithAutoDag, matchesNormalizedCtrlPath } from './composite-autodag.ts'
 import { HostFactLog } from './host-fact-log.ts'
-import { proofReceiptSchema, receiptIdSchema } from './proof-receipt.ts'
-import { defaultTerminalOracleRegistry } from './terminal-oracle-registry.ts'
-import { extractTenantMarkers, isJobOrHandleStub } from './v8-oracle-families.ts'
-import type { V8OracleFamily } from './v8-oracle-families.ts'
-import {
-  TERMINAL_CLASS_CONTRACT, buildCapOriginIndex, canonicalNonAuthQuery, cleanExactPath, entryCarriesRequestToken,
-  entryMatchesCorrelation, entryMatchesEntity, isPrivilegedActorOrRole, resolveTerminalContract,
-  sanitizeEmbeddedProofReceipt, selectStateTransitionPair, type CapOriginIndex, type TerminalContractKind,
-} from './v8-oracle-hydrate.ts'
+import { proofReceiptSchema, receiptIdSchema, verifyReceipt } from './proof-receipt.ts'
+import { evaluateV8OracleFamily, extractTenantMarkers, isJobOrHandleStub, type HostSignedRecord as V8OracleRecord, type V8OracleFamily, type V8OracleInputMap } from './v8-oracle-families.ts'
+import { TERMINAL_CLASS_CONTRACT, buildCapOriginIndex, canonicalNonAuthQuery, cleanExactPath, entryCarriesRequestToken, entryMatchesCorrelation, entryMatchesEntity, hydrateV8OracleInput, isHydratedStub, isPrivilegedActorOrRole, matchesHydratedRecord, resolveTerminalContract, sanitizeEmbeddedProofReceipt, selectStateTransitionPair, type CapOriginIndex, type EconomicAutoHydrateContext, type TerminalContractKind } from './v8-oracle-hydrate.ts'
 export { TERMINAL_CLASS_CONTRACT, type TerminalContractKind }
 import type { ProofReceipt, ReceiptBrowserTrace, ReceiptOobEvent, ReceiptTranscript, ReceiptTranscriptEntry, ReceiptVerification } from './proof-receipt.ts'
 
@@ -94,9 +88,10 @@ export interface HostBrowserTrace extends ReceiptBrowserTrace { timestampMs?: nu
 export interface HostAsyncPollRecord { id: string; triggerExchangeId?: string; tTriggerMs: number; tObservedMs: number; converged: boolean; correlationIds?: readonly string[]; emittedCapabilities?: readonly string[]; observedValueDigests?: readonly string[]; entityId?: string; hostSignature?: string }
 export interface HostSignedTranscript extends ReceiptTranscript { entries?: readonly HostTranscriptEntry[]; oobEvents?: readonly HostOobEvent[]; browserTraces?: readonly HostBrowserTrace[]; asyncPollRecords?: readonly HostAsyncPollRecord[] }
 export type HostSignableRecord = HostTranscriptEntry | HostOobEvent | HostBrowserTrace | HostAsyncPollRecord
+export interface CompositeOracleEvaluator { evaluate: (factLog: HostFactLog, pointerRef: { kind: 'v8_family'; family: V8OracleFamily; rawInput?: Record<string, unknown>; econCtx?: EconomicAutoHydrateContext } | { kind: 'single_hop'; receipt: ProofReceipt | unknown }, policyContext?: { signingKey?: string; strictHostDerivation?: boolean }) => { confirmed: boolean; reason: string; singleHop?: ReceiptVerification } }
 export interface CompositeVerifyOptions {
   attackerPersonas?: readonly string[]; forbiddenShortcutPersonas?: readonly string[]; benchmarkMode?: boolean; requireCleanSessionFlag?: boolean; signingKey?: string
-  v8OracleInput?: Record<string, unknown>; strictHostDerivation?: boolean; factLog?: HostFactLog
+  v8OracleInput?: Record<string, unknown>; strictHostDerivation?: boolean; factLog?: HostFactLog; oracleEvaluator?: CompositeOracleEvaluator
   verifyTerminalImpact?: (receipt: CompositeProofReceipt, transcript: HostSignedTranscript) => { confirmed: boolean; reason: string; family?: string; evidence?: Record<string, unknown> }
 }
 export interface VerifiedEdgeResult { edgeIndex: number; kind: CausalEdgeKind; fromHopId: string; toHopId: string; verified: boolean; reason: string; evidence?: Record<string, unknown> }
@@ -287,10 +282,7 @@ function matchOrderedPair(
   }
   return { ok: false, outOfOrder }
 }
-function verifyValueBinding(
-  base: EdgeBase, edge: Extract<CausalEdgeBinding, { kind: 'value_binding' }>,
-  fromHop: HopReceipt, toHop: HopReceipt, idx: IndexedTranscript,
-): VerifiedEdgeResult {
+function verifyValueBinding(base: EdgeBase, edge: Extract<CausalEdgeBinding, { kind: 'value_binding' }>, fromHop: HopReceipt, toHop: HopReceipt, idx: IndexedTranscript): VerifiedEdgeResult {
   const allOut = collectHopOutputs(fromHop, idx), sealRec = edge.sourceExchangeId && edge.capabilityHandle ? idx.entriesById.get(edge.sourceExchangeId) : undefined
   const directOut = edge.sourceExchangeId ? allOut.filter(o => o.sourceId === edge.sourceExchangeId) : allOut
   const outputs = directOut.length > 0 ? directOut : (sealRec?.evidenceRole === 'host_capability_op' && sealRec.emittedCapabilities?.includes(edge.capabilityHandle!)) ? allOut.filter(o => o.capabilities.has(edge.capabilityHandle!)) : directOut
@@ -315,10 +307,7 @@ function verifyValueBinding(
   return edgeOk(base, 'Host-signed value_binding verified with monotonic timestamps.', ev)
 }
 
-function verifyDerivedCryptoBinding(
-  base: EdgeBase, edge: Extract<CausalEdgeBinding, { kind: 'derived_crypto_binding' }>,
-  fromHop: HopReceipt, toHop: HopReceipt, idx: IndexedTranscript,
-): VerifiedEdgeResult {
+function verifyDerivedCryptoBinding(base: EdgeBase, edge: Extract<CausalEdgeBinding, { kind: 'derived_crypto_binding' }>, fromHop: HopReceipt, toHop: HopReceipt, idx: IndexedTranscript): VerifiedEdgeResult {
   const sources = collectHopOutputs(fromHop, idx).filter(o => o.capabilities.has(edge.sourceCapabilityId))
   if (sources.length === 0) return edgeFail(base, `sourceCapabilityId "${edge.sourceCapabilityId}" not emitted by "${fromHop.hopId}".`)
   let sawOutOfOrder = false
@@ -338,10 +327,7 @@ function verifyDerivedCryptoBinding(
   return edgeFail(base, sawOutOfOrder ? 'derived_crypto_binding violated monotonic ordering.' : `toHop "${toHop.hopId}" lacks Layer-1 derivedFromCapabilityId attestation.`)
 }
 
-function verifyStateTransitionBinding(
-  base: EdgeBase, edge: Extract<CausalEdgeBinding, { kind: 'state_transition_binding' }>,
-  fromHop: HopReceipt, toHop: HopReceipt, idx: IndexedTranscript, dagDerivedCaps: ReadonlySet<string>, capIdx: CapOriginIndex, termHopId: string,
-): VerifiedEdgeResult {
+function verifyStateTransitionBinding(base: EdgeBase, edge: Extract<CausalEdgeBinding, { kind: 'state_transition_binding' }>, fromHop: HopReceipt, toHop: HopReceipt, idx: IndexedTranscript, dagDerivedCaps: ReadonlySet<string>, capIdx: CapOriginIndex, termHopId: string): VerifiedEdgeResult {
   const hopEntries = (hop: HopReceipt) => hop.exchangeIds.map(id => idx.entriesById.get(id)!)
   const asExecEntries = (hop: HopReceipt) => hopEntries(hop).map(e => (hop.hopId !== termHopId && e.step.arm === 'setup') ? { ...e, step: { ...e.step, arm: 'probe' as const } } : e)
   const hopDiag = (hop: HopReceipt, side: string) => { const es = hopEntries(hop); return `[${side}Ok=0: exchanges=${es.length}, 2xx=${es.filter(e => is2xx(e.step.status)).length}, timestamped=${es.filter(e => isFiniteTs(e.timestampMs)).length}, entityMatch=${es.filter(e => entryMatchesEntity(e, edge.entityId)).length}]` }
@@ -381,10 +367,7 @@ function verifyStateTransitionBinding(
   return edgeOk(base, 'state_transition_binding verified with clean-session ablation control.', { entityId: edge.entityId, fromExchangeId: pair.from.exchangeId, toExchangeId: pair.to.exchangeId, ablationExchangeId: validAblation.exchangeId, ablationStatus: validAblation.step.status, ...(logicalFallback ? { bindingMode: 'logical_key_ablation' } : {}) })
 }
 
-function verifyAsyncPivotBinding(
-  base: EdgeBase, edge: Extract<CausalEdgeBinding, { kind: 'async_pivot_binding' }>,
-  fromHop: HopReceipt, toHop: HopReceipt, idx: IndexedTranscript, signingKey?: string, isTermTo = false,
-): VerifiedEdgeResult {
+function verifyAsyncPivotBinding(base: EdgeBase, edge: Extract<CausalEdgeBinding, { kind: 'async_pivot_binding' }>, fromHop: HopReceipt, toHop: HopReceipt, idx: IndexedTranscript, signingKey?: string, isTermTo = false): VerifiedEdgeResult {
   const triggers: number[] = []
   for (const id of fromHop.exchangeIds) {
     const e = idx.entriesById.get(id)!
@@ -535,6 +518,20 @@ function verifyReplayMode(receipt: CompositeProofReceipt, dag: DagTopology, idx:
 
 // --- Public Verifier & Single-Hop Bridge ------------------------------------
 type DefaultV8Ctx = { termEndpoint: string; termFam: string; hasOob: boolean; hasBrowser: boolean; hasBody: boolean; isStub: boolean; ownTenantOnly: boolean; hasForeignTenantData: boolean; hasVerifiedTermEdge: boolean }
+let defaultOracleEvaluator: CompositeOracleEvaluator | null = null
+export function registerDefaultCompositeOracleEvaluator(evaluator: CompositeOracleEvaluator | null): void { defaultOracleEvaluator = evaluator }
+const fallbackOracleEvaluator: CompositeOracleEvaluator = {
+  evaluate(factLog, ref, policy = {}) {
+    const tr = factLog.toHostSignedTranscript()
+    if (ref.kind === 'single_hop') { const p = proofReceiptSchema.safeParse(ref.receipt); if (!p.success) return { confirmed: false, reason: 'Receipt failed schema validation.' }; const v = verifyReceipt(p.data, tr, policy.signingKey ? { signingKey: policy.signingKey } : undefined); return { confirmed: v.confirmed, reason: v.reason, singleHop: v } }
+    const signed = new Map((tr.entries ?? []).map(e => [e.exchangeId, e])), entriesById = new Map([...signed].map(([id, e]) => { const raw = factLog.getExchange(id)?.rawRequestBody; return [id, e.step.requestJson === undefined && raw != null ? { ...e, step: { ...e.step, requestJson: raw } } : e] as const }))
+    const oobById = new Map((tr.oobEvents ?? []).map(o => [o.id, o])), tracesById = new Map((tr.browserTraces ?? []).map(t => [t.id, t])), pollsById = new Map((tr.asyncPollRecords ?? []).map(p => [p.id, p])), idx = { entriesById, oobById, tracesById }, fallbackSig = policy.signingKey ? '' : 'host-verified-sig'
+    const verifySignature = (rec: V8OracleRecord): boolean => { const e = entriesById.get(rec.id) ?? oobById.get(rec.id) ?? tracesById.get(rec.id) ?? pollsById.get(rec.id); if (!e) return false; const s = signed.get(rec.id) ?? e; return (!policy.signingKey || (s.hostSignature === rec.hostSignature && verifyHostRecordSignature(s, policy.signingKey))) && (pollsById.has(rec.id) || matchesHydratedRecord(rec, idx, fallbackSig)) }
+    const hydrated = hydrateV8OracleInput(ref.family, ref.rawInput ?? {}, idx, fallbackSig, ref.econCtx); if (ref.family === 'economic_conservation' && isHydratedStub(hydrated.finalReadback)) return { confirmed: false, reason: 'terminal_impact_unproven_intermediate_stub' }
+    const dec = evaluateV8OracleFamily(ref.family, { ...hydrated, verifySignature } as V8OracleInputMap[typeof ref.family]); return { confirmed: dec.required && dec.satisfied, reason: dec.reason }
+  },
+}
+const resolveOracleEvaluator = (options: CompositeVerifyOptions): CompositeOracleEvaluator => options.oracleEvaluator ?? defaultOracleEvaluator ?? fallbackOracleEvaluator
 
 function dispatchDefaultV8Oracle(
   receipt: CompositeProofReceipt, dag: DagTopology, idx: IndexedTranscript, factLog: HostFactLog, termEx: HostTranscriptEntry | undefined, options: CompositeVerifyOptions,
@@ -543,7 +540,7 @@ function dispatchDefaultV8Oracle(
   const ti = receipt.terminalImpact, normCls = receipt.terminalVulnClass.trim().toLowerCase()
   const family = ti.oracleFamily ?? (V8_ORACLE_FAMILY_SET.has(normCls) ? normCls as V8OracleFamily : null)
   if (!family) return null
-  const policy = { signingKey: options.signingKey, strictHostDerivation: true }
+  const policy = { signingKey: options.signingKey, strictHostDerivation: true }, evalOracle = resolveOracleEvaluator(options)
   const rejectFam = (reason: string, missingEvidence: string[], rejectedBy = `v8_oracle_${family}`) => ({ ok: false as const, reason, rejectedBy, missingEvidence })
   if (ti.oracleFamily && !ti.oracleInput) return rejectFam(`v8_oracle_failed (${family}): missing_v8_oracle_input — terminalImpact.oracleFamily requires terminalImpact.oracleInput.`, ['terminalImpact.oracleInput'])
   if (family === 'dual_tenant_abac' && receipt.hops.length < 2) return rejectFam('v8_oracle_failed (dual_tenant_abac): multi_hop_causal_chain_required', ['upstream_causal_hop_or_oracle_input'])
@@ -554,7 +551,7 @@ function dispatchDefaultV8Oracle(
   const econCtx = { preChainControlExchangeIds: ti.preChainControlExchangeIds, termHopExchangeIds: dag.hopsById.get(ti.terminalHopId)!.exchangeIds, postChainReadbackExchangeIds: ti.postChainReadbackExchangeIds, citedExchangeIds: receipt.hops.flatMap(h => h.exchangeIds) }
   const explicitInput = ti.oracleInput ?? options.v8OracleInput
   if (explicitInput) {
-    const res = defaultTerminalOracleRegistry.evaluate(factLog, { kind: 'v8_family', family, rawInput: explicitInput, econCtx }, policy)
+    const res = evalOracle.evaluate(factLog, { kind: 'v8_family', family, rawInput: explicitInput, econCtx }, policy)
     return res.confirmed ? { ok: true, family, explicit: true } : mapFail(res.reason)
   }
   if (family === 'cross_surface_pivot') {
@@ -575,7 +572,7 @@ function dispatchDefaultV8Oracle(
         ...(edge?.kind === 'derived_crypto_binding' ? { derivedFromCapabilityId: edge.sourceCapabilityId } : {}), ...(edge?.kind === 'state_transition_binding' && edge.ablationExchangeIds[0] ? { ablationControlDenied: edge.ablationExchangeIds[0] } : {}),
       }
     })
-    const res = defaultTerminalOracleRegistry.evaluate(factLog, { kind: 'v8_family', family: 'cross_surface_pivot', rawInput: { preChainControlDenied: terminalCtrl.exchangeId, hops, terminalImpact: { kind: postMutRb ? 'privileged_mutation' : 'privileged_read', ...(postMutRb ? { postImpactReadback: postMutRb.exchangeId } : {}) } } }, policy)
+    const res = evalOracle.evaluate(factLog, { kind: 'v8_family', family: 'cross_surface_pivot', rawInput: { preChainControlDenied: terminalCtrl.exchangeId, hops, terminalImpact: { kind: postMutRb ? 'privileged_mutation' : 'privileged_read', ...(postMutRb ? { postImpactReadback: postMutRb.exchangeId } : {}) } } }, policy)
     return res.confirmed ? { ok: true, family, explicit: false } : mapFail(res.reason)
   }
   if (ctx.isStub && !postMutRb) return mapFail('terminal_impact_unproven_intermediate_stub')
@@ -599,7 +596,7 @@ function verifyTerminalImpactGate(
   const evalEmbeddedProof = (pr: ProofReceipt, hop: HopReceipt, label: string) => {
     const hopEx = new Set(hop.exchangeIds), hopOob = new Set(hop.oobEventIds), hopTr = new Set(hop.browserTraceIds)
     if (pr.exchangeIds.some(id => !hopEx.has(id)) || pr.oobEventIds.some(id => !hopOob.has(id)) || pr.browserTraceIds.some(id => !hopTr.has(id))) return { ok: false as const, reason: `${label} cites exchange/OOB/trace ID outside hop "${hop.hopId}".`, rejectedBy: 'embedded_receipt_unbound' }
-    const clean = sanitizeEmbeddedProofReceipt(pr), shRes = defaultTerminalOracleRegistry.evaluate(factLog, { kind: 'single_hop', receipt: clean }, { signingKey: options.signingKey, strictHostDerivation: true })
+    const clean = sanitizeEmbeddedProofReceipt(pr), shRes = resolveOracleEvaluator(options).evaluate(factLog, { kind: 'single_hop', receipt: clean }, { signingKey: options.signingKey, strictHostDerivation: true })
     const ver = shRes.singleHop ?? { confirmed: shRes.confirmed, vulnClass: clean.vulnClass, rule: 'none' as const, reason: shRes.reason, observed: clean.claimedDelta, expected: 'host-custody verified terminal receipt' }
     return ver.confirmed ? { ok: true as const, ver } : { ok: false as const, reason: ver.reason, rejectedBy: 'embedded_receipt_rejected', ver }
   }
