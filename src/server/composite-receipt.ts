@@ -11,7 +11,12 @@ import { proofReceiptSchema, receiptIdSchema } from './proof-receipt.ts'
 import { defaultTerminalOracleRegistry } from './terminal-oracle-registry.ts'
 import { extractTenantMarkers, isJobOrHandleStub } from './v8-oracle-families.ts'
 import type { V8OracleFamily } from './v8-oracle-families.ts'
-import { buildCapOriginIndex, isPrivilegedActorOrRole, selectStateTransitionPair, type CapOriginIndex } from './v8-oracle-hydrate.ts'
+import {
+  TERMINAL_CLASS_CONTRACT, buildCapOriginIndex, canonicalNonAuthQuery, cleanExactPath, entryCarriesRequestToken,
+  entryMatchesCorrelation, entryMatchesEntity, isPrivilegedActorOrRole, resolveTerminalContract,
+  sanitizeEmbeddedProofReceipt, selectStateTransitionPair, type CapOriginIndex, type TerminalContractKind,
+} from './v8-oracle-hydrate.ts'
+export { TERMINAL_CLASS_CONTRACT, type TerminalContractKind }
 import type { ProofReceipt, ReceiptBrowserTrace, ReceiptOobEvent, ReceiptTranscript, ReceiptTranscriptEntry, ReceiptVerification } from './proof-receipt.ts'
 
 export const HOP_SURFACES = ['http', 'graphql', 'ws', 'sse', 'browser', 'webhook', 'async_job', 'idp', 'cdn', 'storage'] as const
@@ -110,8 +115,6 @@ const DENIED_CONTROL_STATUSES = new Set([401, 403, 404])
 const SHA256_RE = /^[0-9a-f]{64}$/
 const CROSS_TENANT_CLASS_RE =
   /^(?:dual_tenant_abac|parser_cache_differential)$|dual[_-]?tenant|cross[_-]?tenant|tenant[_-]?(?:isolation|bleed|leak|export)|abac|cache[_-]?(?:bleed|poison|deception|diff|bypass)|export[_-]?(?:bypass|leak|disclosure)|presign|cwe[-_]?(?:444|639)|\bidor\b|\bbola\b/i
-const STRICT_TERMINAL_CLASS_RE =
-  /^(?:dual_tenant_abac|parser_cache_differential|temporal_revocation|economic_conservation|cryptographic_scope_replay|cross_surface_pivot)$|dual[_-]?tenant|cross[_-]?tenant[_-]?(?:export|data|access|leak|bleed|disclosure|pivot)|tenant[_-]?(?:isolation|bleed|leak|export)|abac|cache[_-]?(?:bleed|poison|deception|diff|bypass)|parser[_-]?diff|smuggl|presign|export[_-]?(?:bypass|leak|disclosure)|broken[_-]?access|access[_-]?control|authz[_-]?bypass|authorization[_-]?bypass|info(?:rmation)?[_-]?disclosure|data[_-]?exposure|cwe[-_]?(?:200|269|284|285|345|436|444|522|639|668|862|863)|\bidor\b|\bbola\b/i
 const TERMINAL_IMPACT_UNPROVEN_HINT =
   "terminal_impact_unproven: obtaining a job/export handle, signed URL, or cache ack is an intermediate capability (seal with ctx.seal_capability), NOT terminal impact — fetch the target resource with the derived URL/handle to prove unauthorized foreign-tenant data exposure or privileged state mutation, or settle with record_coverage(status='ruled_out', proofGapReason='invariant_enforced_hardened') if blocked"
 const ANON_ACTOR_RE = /^(?:anon(?:ymous)?|unauth(?:enticated)?|guest)$/i
@@ -134,23 +137,19 @@ const actorOf = (e: HostTranscriptEntry): string | null => (e.actorPersona !== u
 const roleOf = (e: HostTranscriptEntry): string | null => (e.actorRoleLabel ? parseRoleLabel(e.actorRoleLabel).role : (e.step.actor.role ?? null))
 const probeTenantsOf = (e: HostTranscriptEntry, capIdx?: CapOriginIndex): string[] => { const out: string[] = [], a = actorOf(e), dt = (!a || ANON_ACTOR_RE.test(a) || a.startsWith('cap:')) ? null : ((e.step.actor.tenant ?? parseRoleLabel(e.actorRoleLabel ?? e.actorPersona ?? '').tenant ?? '').trim().toLowerCase() || null); if (dt) out.push(dt); if (capIdx) for (const c of [...(a?.startsWith('cap:') ? [a] : []), ...(e.consumedCapabilities ?? [])]) { const lt = capIdx.loginTenantOf(c); if (lt && !out.includes(lt)) out.push(lt) } return out }
 const probeTenantOf = (e: HostTranscriptEntry, capIdx?: CapOriginIndex): string | null => probeTenantsOf(e, capIdx)[0] ?? null
-function collectLeaves(value: unknown, out: Set<string>, depth = 0): void {
-  if (depth > 5 || out.size > 256 || value == null) return
-  if (typeof value === 'string') { const t = value.trim(); if (t.length > 0 && t.length <= 2048) out.add(t) }
-  else if (typeof value === 'number' || typeof value === 'boolean') out.add(String(value))
-  else if (Array.isArray(value)) for (const x of value) collectLeaves(x, out, depth + 1)
-  else if (typeof value === 'object') for (const x of Object.values(value as Record<string, unknown>)) collectLeaves(x, out, depth + 1)
+function collectLeaves(v: unknown, out: Set<string>, d = 0): void {
+  if (d > 5 || out.size > 256 || v == null) return
+  if (typeof v === 'string') { const t = v.trim(); if (t.length > 0 && t.length <= 2048) out.add(t) }
+  else if (typeof v === 'number' || typeof v === 'boolean') out.add(String(v))
+  else if (typeof v === 'object') for (const x of Array.isArray(v) ? v : Object.values(v as Record<string, unknown>)) collectLeaves(x, out, d + 1)
 }
 function collectHeaderTokens(headers: Record<string, string> | null | undefined, out: Set<string>): void {
-  if (!headers) return
-  for (const raw of Object.values(headers)) {
+  for (const raw of Object.values(headers ?? {})) {
     const t = raw.trim(); if (!t) continue; out.add(t)
-    const scheme = /^(?:Bearer|Basic|Token|ApiKey)\s+(.+)$/i.exec(t)
-    if (scheme?.[1]) out.add(scheme[1].trim())
+    const m = /^(?:Bearer|Basic|Token|ApiKey)\s+(.+)$/i.exec(t); if (m?.[1]) out.add(m[1].trim())
     if (t.includes('=')) for (const p of t.split(';')) { const eq = p.indexOf('='); if (eq > 0 && p.slice(eq + 1).trim()) out.add(p.slice(eq + 1).trim()) }
   }
 }
-
 function collectEntryDigests(entry: HostTranscriptEntry, side: 'response' | 'request'): Set<string> {
   const digests = new Set<string>(), leaves = new Set<string>()
   if (side === 'response') {
@@ -160,35 +159,13 @@ function collectEntryDigests(entry: HostTranscriptEntry, side: 'response' | 'req
     for (const d of entry.injectedRequestDigests ?? []) digests.add(d.toLowerCase())
     collectLeaves(entry.step.requestJson, leaves); collectHeaderTokens(entry.step.requestHeaders, leaves)
     const pq = entry.step.pathAndQuery ?? '', q = pq.indexOf('?')
-    for (const seg of (q >= 0 ? pq.slice(0, q) : pq).split('/')) if (seg) { leaves.add(seg); try { const d = decodeURIComponent(seg); if (d !== seg) leaves.add(d) } catch { /* ignore */ } }
+    for (const seg of (q >= 0 ? pq.slice(0, q) : pq).split('/')) if (seg) { leaves.add(seg); try { const d = decodeURIComponent(seg); if (d !== seg) leaves.add(d) } catch {} }
     if (q >= 0) for (const v of new URLSearchParams(pq.slice(q + 1)).values()) if (v) leaves.add(v)
   }
   for (const leaf of leaves) digests.add(sha256Hex(leaf))
   return digests
 }
-function entryLeaves(entry: HostTranscriptEntry, withHeaders: boolean): Set<string> {
-  const out = new Set<string>()
-  collectLeaves(entry.step.requestJson, out); collectLeaves(entry.step.json, out)
-  if (withHeaders) { collectHeaderTokens(entry.step.requestHeaders, out); collectHeaderTokens(entry.step.responseHeaders, out) }
-  return out
-}
-function entryMatchesEntity(entry: HostTranscriptEntry, entityId: string): boolean {
-  const eid = entityId.trim(), lid = eid.toLowerCase(), esc = eid.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), path = entry.step.pathAndQuery ?? entry.step.route ?? ''
-  if (!eid) return false; if (entry.entityId?.trim().toLowerCase() === lid || entry.correlationIds?.some(c => c.trim().toLowerCase() === lid) || (path && new RegExp(`(?:^|[/=?&])${esc}(?:$|[/&?#])`, 'i').test(path))) return true
-  for (const leaf of entryLeaves(entry, false)) if (leaf.toLowerCase() === lid) return true
-  return eid.length >= 4 && new RegExp(`(?:^|[^A-Za-z0-9_-])${esc}(?:$|[^A-Za-z0-9_-])`, 'i').test(entry.carrierText ?? '')
-}
-function entryMatchesCorrelation(entry: HostTranscriptEntry, correlationId: string): boolean {
-  const cid = correlationId.trim()
-  if (cid.length < 6) return false
-  if (entry.correlationIds?.includes(cid) || entry.entityId === cid) return true
-  const esc = cid.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  const re = new RegExp(`(?:^|[^A-Za-z0-9_-])${esc}(?:$|[^A-Za-z0-9_-])`)
-  return re.test(entry.carrierText ?? '') || [...entryLeaves(entry, true)].some(leaf => leaf === cid || re.test(leaf))
-}
-function serializeBodyText(entry: HostTranscriptEntry): string {
-  try { return typeof entry.step.body === 'string' && entry.step.body.length > 0 ? entry.step.body : entry.step.json !== undefined ? JSON.stringify(entry.step.json) : '' } catch { return '' }
-}
+const serializeBodyText = (e: HostTranscriptEntry): string => { try { return typeof e.step.body === 'string' && e.step.body.length > 0 ? e.step.body : e.step.json !== undefined ? JSON.stringify(e.step.json) : '' } catch { return '' } }
 
 // --- DAG Topology & Transcript Integrity ------------------------------------
 interface DagTopology { hopsById: Map<string, HopReceipt>; topoOrder: string[]; roots: string[]; incomingByHop: Map<string, Array<{ edgeIndex: number; edge: CausalEdgeBinding }>> }
@@ -196,34 +173,23 @@ interface IndexedTranscript { entriesById: Map<string, HostTranscriptEntry>; oob
 
 function validateDagTopology(receipt: CompositeProofReceipt): { ok: true; dag: DagTopology } | { ok: false; reason: string } {
   const hopsById = new Map<string, HopReceipt>()
-  for (const hop of receipt.hops) {
-    if (hopsById.has(hop.hopId)) return { ok: false, reason: `Duplicate hopId "${hop.hopId}".` }
-    hopsById.set(hop.hopId, hop)
-  }
+  for (const hop of receipt.hops) { if (hopsById.has(hop.hopId)) return { ok: false, reason: `Duplicate hopId "${hop.hopId}".` }; hopsById.set(hop.hopId, hop) }
   if (!hopsById.has(receipt.terminalImpact.terminalHopId)) return { ok: false, reason: `terminalHopId "${receipt.terminalImpact.terminalHopId}" not in hops.` }
   if (receipt.hops.length === 1 && receipt.causalEdges.length > 0) return { ok: false, reason: 'A 1-hop receipt cannot declare causalEdges.' }
-  const inDeg = new Map<string, number>(receipt.hops.map(h => [h.hopId, 0]))
-  const outAdj = new Map<string, string[]>(receipt.hops.map(h => [h.hopId, []]))
-  const revAdj = new Map<string, string[]>(receipt.hops.map(h => [h.hopId, []]))
-  const incomingByHop = new Map<string, Array<{ edgeIndex: number; edge: CausalEdgeBinding }>>(receipt.hops.map(h => [h.hopId, []]))
-  const seen = new Set<string>()
+  const inDeg = new Map(receipt.hops.map(h => [h.hopId, 0])), outAdj = new Map<string, string[]>(receipt.hops.map(h => [h.hopId, []])), revAdj = new Map<string, string[]>(receipt.hops.map(h => [h.hopId, []]))
+  const incomingByHop = new Map<string, Array<{ edgeIndex: number; edge: CausalEdgeBinding }>>(receipt.hops.map(h => [h.hopId, []])), seen = new Set<string>()
   for (let i = 0; i < receipt.causalEdges.length; i++) {
-    const e = receipt.causalEdges[i]!
+    const e = receipt.causalEdges[i]!, key = `${e.fromHopId}->${e.toHopId}:${e.kind}`
     if (!hopsById.has(e.fromHopId) || !hopsById.has(e.toHopId)) return { ok: false, reason: `Edge #${i} references unknown hop.` }
     if (e.fromHopId === e.toHopId) return { ok: false, reason: `Edge #${i} forms a self-loop on "${e.fromHopId}".` }
-    const key = `${e.fromHopId}->${e.toHopId}:${e.kind}`
     if (seen.has(key)) return { ok: false, reason: `Duplicate causal edge "${key}".` }
     seen.add(key); outAdj.get(e.fromHopId)!.push(e.toHopId); revAdj.get(e.toHopId)!.push(e.fromHopId)
     inDeg.set(e.toHopId, (inDeg.get(e.toHopId) ?? 0) + 1); incomingByHop.get(e.toHopId)!.push({ edgeIndex: i, edge: e })
   }
-  const roots = receipt.hops.filter(h => inDeg.get(h.hopId) === 0).map(h => h.hopId)
-  const queue = [...roots], rem = new Map(inDeg), topoOrder: string[] = []
-  while (queue.length > 0) {
-    const id = queue.shift()!; topoOrder.push(id)
-    for (const next of outAdj.get(id) ?? []) { const d = (rem.get(next) ?? 0) - 1; rem.set(next, d); if (d === 0) queue.push(next) }
-  }
+  const roots = receipt.hops.filter(h => inDeg.get(h.hopId) === 0).map(h => h.hopId), queue = [...roots], rem = new Map(inDeg), topoOrder: string[] = []
+  while (queue.length > 0) { const id = queue.shift()!; topoOrder.push(id); for (const next of outAdj.get(id) ?? []) { const d = (rem.get(next) ?? 0) - 1; rem.set(next, d); if (d === 0) queue.push(next) } }
   if (topoOrder.length !== receipt.hops.length) return { ok: false, reason: 'Causal DAG contains a cycle.' }
-  const reachesTerminal = new Set<string>([receipt.terminalImpact.terminalHopId]), rq = [receipt.terminalImpact.terminalHopId]
+  const reachesTerminal = new Set([receipt.terminalImpact.terminalHopId]), rq = [receipt.terminalImpact.terminalHopId]
   while (rq.length > 0) for (const prev of revAdj.get(rq.shift()!) ?? []) if (!reachesTerminal.has(prev)) { reachesTerminal.add(prev); rq.push(prev) }
   const orphan = receipt.hops.find(h => !reachesTerminal.has(h.hopId))
   return orphan ? { ok: false, reason: `Hop "${orphan.hopId}" does not reach terminalHopId.` } : { ok: true, dag: { hopsById, topoOrder, roots, incomingByHop } }
@@ -479,86 +445,80 @@ function verifyAsyncPivotBinding(
 function verifyAttackerProvenance(
   receipt: CompositeProofReceipt, dag: DagTopology, idx: IndexedTranscript, options: CompositeVerifyOptions, capIdx: CapOriginIndex,
 ): { ok: true; derivedCapabilities: string[]; attackerTenants: ReadonlySet<string> } | { ok: false; reason: string } {
-  const allowedSet = options.attackerPersonas?.length ? new Set(options.attackerPersonas) : null
-  const forbiddenSet = new Set(options.forbiddenShortcutPersonas ?? [])
+  const allowedSet = options.attackerPersonas?.length ? new Set(options.attackerPersonas) : null, forbiddenSet = new Set(options.forbiddenShortcutPersonas ?? [])
   const rootSet = new Set(dag.roots), dagCaps = new Set<string>(), probeTenants = new Set<string>()
-  const isForbidden = (a: string | null, r: string | null, rl?: string | null) =>
-    (a !== null && forbiddenSet.has(a)) || (allowedSet ? a !== null && !allowedSet.has(a) : isPrivilegedActorOrRole(a, r, rl))
+  const isForbidden = (a: string | null, r: string | null, rl?: string | null, tt?: string | null) =>
+    (a !== null && forbiddenSet.has(a)) || (allowedSet ? a !== null && !allowedSet.has(a) : isPrivilegedActorOrRole(a, r, rl, tt))
   const isAllowed = (a: string | null, r: string | null, rl?: string | null) =>
     !(a !== null && forbiddenSet.has(a)) && (allowedSet ? a !== null && allowedSet.has(a) : !isPrivilegedActorOrRole(a, r, rl))
-
+  const checkExternalCaps = (e: HostTranscriptEntry, label: string): string | null => {
+    const a = actorOf(e)
+    for (const c of [...(a?.startsWith('cap:') ? [a] : []), ...(e.consumedCapabilities ?? [])]) {
+      if (dagCaps.has(c)) continue
+      const em = capIdx.emitterActorOf(c)
+      if (em && isForbidden(em.actor, em.role, em.roleLabel)) return `Attacker-origin violation in ${label} ("${e.exchangeId}"): capability "${c}" originated from forbidden persona "${em.actor ?? em.role}".`
+      if (em && !em.isLogin && !em.actor && !em.role && !em.roleLabel && em.arm !== 'probe') return `Attacker-origin violation in ${label} ("${e.exchangeId}"): capability "${c}" has unattributed non-probe origin.`
+    }
+    return null
+  }
   for (const hopId of dag.topoOrder) {
-    const hop = dag.hopsById.get(hopId)!, isRoot = rootSet.has(hopId)
-    const nonControls = hop.exchangeIds.map(id => idx.entriesById.get(id)!).filter(e => e.step.arm !== 'control')
-    const probes = nonControls.filter(e => e.step.arm === 'probe')
-    if (isRoot && receipt.hops.length > 1 && probes.length === 0) return { ok: false, reason: `Root hop "${hopId}" requires an attacker-origin probe.` }
+    const hop = dag.hopsById.get(hopId)!, isRoot = rootSet.has(hopId), isTermHop = hopId === receipt.terminalImpact.terminalHopId
+    const nonControls = hop.exchangeIds.map(id => idx.entriesById.get(id)!).filter(e => e.step.arm !== 'control'), probes = nonControls.filter(e => e.step.arm === 'probe')
+    if (isRoot && (hop.exchangeIds.length > 0 || (hop.oobEventIds.length === 0 && hop.browserTraceIds.length === 0)) && probes.length === 0) return { ok: false, reason: `Root hop "${hopId}" requires an attacker-origin probe.` }
     for (const e of nonControls) {
-      const a = actorOf(e), r = roleOf(e), originCaps = [...(a?.startsWith('cap:') ? [a] : []), ...(e.consumedCapabilities ?? [])]
-      const badOrigin = originCaps.map(c => capIdx.nonProbeOriginActorOf(c)).find(la => la && isForbidden(la.actor, la.role, la.roleLabel))
-      if (isForbidden(a, r, e.actorRoleLabel) || badOrigin) return { ok: false, reason: `Attacker-origin violation in "${hopId}" ("${e.exchangeId}"): pre-seeded persona "${badOrigin ? (badOrigin.actor ?? badOrigin.role) : (a ?? r)}" is forbidden.` }
+      const a = actorOf(e), r = roleOf(e), usesDag = (e.consumedCapabilities ?? []).some(c => dagCaps.has(c)) || (e.cryptoAttestations ?? []).some(x => dagCaps.has(x.derivedFromCapabilityId))
+      const termMarkers = isTermHop && !usesDag ? extractTenantMarkers(e.step.json, e.step.body) : new Set<string>()
+      if (isForbidden(a, r, e.actorRoleLabel, termMarkers.size === 1 ? [...termMarkers][0]! : null)) return { ok: false, reason: `Attacker-origin violation in "${hopId}" ("${e.exchangeId}"): pre-seeded persona "${a ?? r}" is forbidden.` }
+      const capErr = checkExternalCaps(e, `"${hopId}"`); if (capErr) return { ok: false, reason: capErr }
       if (e.step.arm !== 'probe') continue
-      if (isRoot) {
-        if (allowedSet && !isAllowed(a, r, e.actorRoleLabel)) return { ok: false, reason: `Root hop "${hopId}" ("${e.exchangeId}") must start from an allowed attackerPersona.` }
-      } else {
-        const usesDag = (e.consumedCapabilities ?? []).some(c => dagCaps.has(c)) || (e.cryptoAttestations ?? []).some(x => dagCaps.has(x.derivedFromCapabilityId))
-        if (!(a !== null && isAllowed(a, r, e.actorRoleLabel)) && !usesDag) return { ok: false, reason: `Hop "${hopId}" ("${e.exchangeId}") lacks attacker persona or DAG-derived capability.` }
-      }
+      if (isRoot && allowedSet && !isAllowed(a, r, e.actorRoleLabel)) return { ok: false, reason: `Root hop "${hopId}" ("${e.exchangeId}") must start from an allowed attackerPersona.` }
+      if (!isRoot && !(a !== null && isAllowed(a, r, e.actorRoleLabel)) && !usesDag) return { ok: false, reason: `Hop "${hopId}" ("${e.exchangeId}") lacks attacker persona or DAG-derived capability.` }
       for (const pt of probeTenantsOf(e, capIdx)) probeTenants.add(pt)
     }
     recordHopCapabilities(hop, idx, dagCaps)
+  }
+  const extraIds = [...receipt.terminalImpact.postChainReadbackExchangeIds, ...(receipt.terminalImpact.modeAFailureExchangeId ? [receipt.terminalImpact.modeAFailureExchangeId] : []), ...(receipt.terminalImpact.proofReceipt?.exchangeIds ?? []), ...receipt.hops.flatMap(h => h.proofReceipt?.exchangeIds ?? [])]
+  for (const id of extraIds) {
+    const e = idx.entriesById.get(id); if (!e || e.step.arm === 'control') continue
+    const a = actorOf(e), r = roleOf(e)
+    if (isForbidden(a, r, e.actorRoleLabel)) return { ok: false, reason: `Attacker-origin violation on cited non-control exchange "${id}": pre-seeded persona "${a ?? r}" is forbidden.` }
+    const capErr = checkExternalCaps(e, 'cited non-control'); if (capErr) return { ok: false, reason: capErr }
   }
   if (probeTenants.size > 1) return { ok: false, reason: `Cross-tenant probe-arm persona mismatch: pre-seeded probe hops mixed distinct tenants (${[...probeTenants].sort().join(', ')}). All pre-seeded probe-arm hops must belong to a single starting tenant (or anonymous/DAG-minted credentials); use target-tenant personas only on control or readback arms.` }
   return { ok: true, derivedCapabilities: [...dagCaps], attackerTenants: probeTenants }
 }
 
-function verifyReplayMode(
-  receipt: CompositeProofReceipt, dag: DagTopology, idx: IndexedTranscript, options: CompositeVerifyOptions,
-): { ok: true } | { ok: false; reason: string } {
+function verifyReplayMode(receipt: CompositeProofReceipt, dag: DagTopology, idx: IndexedTranscript, options: CompositeVerifyOptions): { ok: true } | { ok: false; reason: string } {
   if (receipt.replayMode === 'fresh_clean_replay') {
     for (const hop of receipt.hops) for (const id of hop.exchangeIds) {
-      const e = idx.entriesById.get(id)!
-      if (e.step.arm !== 'probe') continue
+      const e = idx.entriesById.get(id)!; if (e.step.arm !== 'probe') continue
       if (e.cleanSession === false) return { ok: false, reason: `Mode A rejected exchange "${id}" marked cleanSession=false.` }
       if (options.requireCleanSessionFlag && e.cleanSession !== true) return { ok: false, reason: `Mode A requires cleanSession=true on "${id}".` }
     }
     return { ok: true }
   }
   if (receipt.benchmarkMode === true || options.benchmarkMode === true) return { ok: false, reason: 'Mode B (one_shot_transcript) is forbidden in benchmarkMode.' }
-  const ti = receipt.terminalImpact
-  if (!ti.modeAFailureExchangeId) return { ok: false, reason: 'Mode B requires terminalImpact.modeAFailureExchangeId.' }
-  const failEx = idx.entriesById.get(ti.modeAFailureExchangeId)!
+  const ti = receipt.terminalImpact; if (!ti.modeAFailureExchangeId) return { ok: false, reason: 'Mode B requires terminalImpact.modeAFailureExchangeId.' }
+  const failEx = idx.entriesById.get(ti.modeAFailureExchangeId)!, st = failEx.step.status
   if (failEx.replayAttempt !== 'mode_a' && failEx.cleanSession !== true) return { ok: false, reason: 'modeAFailureExchangeId was not a clean-session Mode-A replay.' }
-  const st = failEx.step.status
-  if (!(st === 409 || st === 410 || ((st === 400 || st === 422) && CONSUMED_STATE_RE.test(serializeBodyText(failEx))))) {
-    return { ok: false, reason: `Mode B rejected: Mode-A returned HTTP ${st ?? 'null'} (requires 409/410/consumed-token).` }
-  }
+  if (!(st === 409 || st === 410 || ((st === 400 || st === 422) && CONSUMED_STATE_RE.test(serializeBodyText(failEx))))) return { ok: false, reason: `Mode B rejected: Mode-A returned HTTP ${st ?? 'null'} (requires 409/410/consumed-token).` }
   if (ti.preChainControlExchangeIds.length === 0) return { ok: false, reason: 'Mode B requires a pre-chain denied control on the terminal target.' }
   if (ti.postChainReadbackExchangeIds.length === 0) return { ok: false, reason: 'Mode B requires a post-chain readback proving persisted impact.' }
-
-  const termHop = dag.hopsById.get(ti.terminalHopId)!
-  const probeTs = termHop.exchangeIds.map(id => idx.entriesById.get(id)!).filter(e => e.step.arm === 'probe' && isFiniteTs(e.timestampMs)).map(e => e.timestampMs!)
-  const refTs = probeTs.length > 0 ? Math.min(...probeTs) : null
-  const termFam = routeFamily(termHop.target.pathAndQuery ?? '')
-
+  const termHop = dag.hopsById.get(ti.terminalHopId)!, probeTs = termHop.exchangeIds.map(id => idx.entriesById.get(id)!).filter(e => e.step.arm === 'probe' && isFiniteTs(e.timestampMs)).map(e => e.timestampMs!)
+  const refTs = probeTs.length > 0 ? Math.min(...probeTs) : null, termFam = routeFamily(termHop.target.pathAndQuery ?? '')
   const hasPre = ti.preChainControlExchangeIds.some(id => {
     const e = idx.entriesById.get(id)!
-    if (e.step.arm !== 'control' || (e.step.status !== 401 && e.step.status !== 403) || !isFiniteTs(e.timestampMs)) return false
-    if (refTs !== null && e.timestampMs > refTs) return false
-    if (termFam && (e.step.route || e.step.pathAndQuery)) {
-      const cf = routeFamily(e.step.route ?? e.step.pathAndQuery ?? '')
-      if (cf && cf !== termFam && (!termHop.entityId || !entryMatchesEntity(e, termHop.entityId))) return false
-    }
-    return true
+    if (e.step.arm !== 'control' || (e.step.status !== 401 && e.step.status !== 403) || !isFiniteTs(e.timestampMs) || (refTs !== null && e.timestampMs > refTs)) return false
+    const cf = termFam && (e.step.route || e.step.pathAndQuery) ? routeFamily(e.step.route ?? e.step.pathAndQuery ?? '') : ''
+    return !cf || cf === termFam || Boolean(termHop.entityId && entryMatchesEntity(e, termHop.entityId))
   })
   if (!hasPre) return { ok: false, reason: 'Mode B requires a pre-chain 401/403 control on the terminal target.' }
-
   const preSet = new Set(ti.preChainControlExchangeIds)
   const hasRead = ti.postChainReadbackExchangeIds.some(id => {
     if (preSet.has(id)) return false
     const e = idx.entriesById.get(id)!
     if (!is2xx(e.step.status) || !isFiniteTs(e.timestampMs) || (refTs !== null && e.timestampMs < refTs)) return false
-    const isRead = stepReadsState(e.step) || e.step.arm === 'control' || e.step.evidenceRole === 'post_chain_readback'
-    return isRead && (e.step.json !== undefined || (typeof e.step.body === 'string' && e.step.body.trim().length > 0)) && !isJobOrHandleStub(e.step.json, e.step.body, e.step.status, e.step.method, e.step.route ?? e.step.pathAndQuery)
+    return (stepReadsState(e.step) || e.step.arm === 'control' || e.step.evidenceRole === 'post_chain_readback') && (e.step.json !== undefined || (typeof e.step.body === 'string' && e.step.body.trim().length > 0)) && !isJobOrHandleStub(e.step.json, e.step.body, e.step.status, e.step.method, e.step.route ?? e.step.pathAndQuery)
   })
   return hasRead ? { ok: true } : { ok: false, reason: 'Mode B requires a post-chain 2xx readback proving persisted impact.' }
 }
@@ -581,7 +541,7 @@ function dispatchDefaultV8Oracle(
   const mapFail = (reason: string) => (reason === 'terminal_impact_unproven_intermediate_stub' || reason === 'bled_access_own_tenant_only')
     ? rejectFam(TERMINAL_IMPACT_UNPROVEN_HINT, [TERMINAL_IMPACT_UNPROVEN_HINT], 'terminal_impact_unproven')
     : rejectFam(`v8_oracle_failed (${family}): ${reason}`, [reason])
-  const econCtx = { preChainControlExchangeIds: ti.preChainControlExchangeIds, termHopExchangeIds: dag.hopsById.get(ti.terminalHopId)!.exchangeIds, postChainReadbackExchangeIds: ti.postChainReadbackExchangeIds }
+  const econCtx = { preChainControlExchangeIds: ti.preChainControlExchangeIds, termHopExchangeIds: dag.hopsById.get(ti.terminalHopId)!.exchangeIds, postChainReadbackExchangeIds: ti.postChainReadbackExchangeIds, citedExchangeIds: receipt.hops.flatMap(h => h.exchangeIds) }
   const explicitInput = ti.oracleInput ?? options.v8OracleInput
   if (explicitInput) {
     const res = defaultTerminalOracleRegistry.evaluate(factLog, { kind: 'v8_family', family, rawInput: explicitInput, econCtx }, policy)
@@ -618,25 +578,39 @@ function dispatchDefaultV8Oracle(
 
 function verifyTerminalImpactGate(
   receipt: CompositeProofReceipt, dag: DagTopology, idx: IndexedTranscript, factLog: HostFactLog, verifiedEdges: VerifiedEdgeResult[],
-  hostTranscript: HostSignedTranscript, attackerTenants: ReadonlySet<string>, options: CompositeVerifyOptions,
+  hostTranscript: HostSignedTranscript, attackerTenants: ReadonlySet<string>, dagCaps: ReadonlySet<string>, options: CompositeVerifyOptions,
 ): { ok: true; terminalVerification?: ReceiptVerification; terminalOracleFamily?: V8OracleFamily | string; terminalEndpoint?: string } | { ok: false; reason: string; rejectedBy?: string; missingEvidence?: string[]; terminalVerification?: ReceiptVerification } {
   const ti = receipt.terminalImpact, effSummary = ti.summary !== undefined ? ti.summary : ti.claimedImpact
   if (effSummary.replace(/\s+/g, '').length < 12) return { ok: false, reason: 'terminal_impact_summary_missing: terminalImpact.summary must be a meaningful non-empty description (>= 12 non-whitespace chars).', rejectedBy: 'terminal_impact_summary_missing', missingEvidence: ['terminal_impact_summary_missing'] }
   const termHop = dag.hopsById.get(ti.terminalHopId)!
   if (ti.terminalExchangeId && !termHop.exchangeIds.includes(ti.terminalExchangeId)) return { ok: false, reason: `terminalExchangeId "${ti.terminalExchangeId}" does not belong to terminal hop "${termHop.hopId}".`, rejectedBy: 'terminal_exchange_invalid', missingEvidence: ['terminal_exchange_in_final_hop'] }
   const termEx = ti.terminalExchangeId ? idx.entriesById.get(ti.terminalExchangeId)! : [...termHop.exchangeIds].reverse().map(id => idx.entriesById.get(id)!).find(e => e.step.arm === 'probe' && is2xx(e.step.status))
-  const termEndpoint = (termEx?.step.route ?? termEx?.step.pathAndQuery ?? termHop.target.pathAndQuery ?? '').trim(), termFam = normRouteFam(termEndpoint, termEx?.entityId ?? termHop.entityId)
+  const termEndpoint = (termEx?.step.route ?? termEx?.step.pathAndQuery ?? termHop.target.pathAndQuery ?? '').trim(), termFam = normRouteFam(termEndpoint, termEx?.entityId), contract = resolveTerminalContract(receipt.terminalVulnClass)
+  const evalEmbeddedProof = (pr: ProofReceipt, hop: HopReceipt, label: string) => {
+    const hopEx = new Set(hop.exchangeIds), hopOob = new Set(hop.oobEventIds), hopTr = new Set(hop.browserTraceIds)
+    if (pr.exchangeIds.some(id => !hopEx.has(id)) || pr.oobEventIds.some(id => !hopOob.has(id)) || pr.browserTraceIds.some(id => !hopTr.has(id))) return { ok: false as const, reason: `${label} cites exchange/OOB/trace ID outside hop "${hop.hopId}".`, rejectedBy: 'embedded_receipt_unbound' }
+    const clean = sanitizeEmbeddedProofReceipt(pr), shRes = defaultTerminalOracleRegistry.evaluate(factLog, { kind: 'single_hop', receipt: clean }, { signingKey: options.signingKey, strictHostDerivation: true })
+    const ver = shRes.singleHop ?? { confirmed: shRes.confirmed, vulnClass: clean.vulnClass, rule: 'none' as const, reason: shRes.reason, observed: clean.claimedDelta, expected: 'host-custody verified terminal receipt' }
+    return ver.confirmed ? { ok: true as const, ver } : { ok: false as const, reason: ver.reason, rejectedBy: 'embedded_receipt_rejected', ver }
+  }
   let terminalVerification: ReceiptVerification | undefined
+  for (const h of receipt.hops) {
+    if (!h.proofReceipt || (h.hopId === termHop.hopId && ti.proofReceipt && h.proofReceipt === ti.proofReceipt)) continue
+    const hr = evalEmbeddedProof(h.proofReceipt, h, `hop "${h.hopId}" proofReceipt`)
+    if (!hr.ok) return { ok: false, reason: hr.reason, rejectedBy: hr.rejectedBy, ...(hr.ver ? { terminalVerification: hr.ver } : {}) }
+  }
   if (ti.proofReceipt) {
-    const shRes = defaultTerminalOracleRegistry.evaluate(factLog, { kind: 'single_hop', receipt: ti.proofReceipt }, { signingKey: options.signingKey, strictHostDerivation: true })
-    terminalVerification = shRes.singleHop ?? { confirmed: shRes.confirmed, vulnClass: ti.proofReceipt.vulnClass, rule: 'none', reason: shRes.reason, observed: ti.proofReceipt.claimedDelta, expected: 'host-custody verified terminal receipt' }
-    if (!terminalVerification.confirmed) return { ok: false, reason: terminalVerification.reason, terminalVerification }
+    const prContract = resolveTerminalContract(ti.proofReceipt.vulnClass)
+    if (!contract || !prContract || prContract !== contract) return { ok: false, reason: `terminal_proof_class_mismatch: proofReceipt.vulnClass "${ti.proofReceipt.vulnClass}" is incompatible with terminalVulnClass "${receipt.terminalVulnClass}".`, rejectedBy: 'terminal_proof_class_mismatch' }
+    const tr = evalEmbeddedProof(ti.proofReceipt, termHop, 'terminalImpact.proofReceipt'); terminalVerification = tr.ver
+    if (!tr.ok) return { ok: false, reason: tr.reason, rejectedBy: tr.rejectedBy, ...(terminalVerification ? { terminalVerification } : {}) }
   }
   if (options.verifyTerminalImpact) {
     const v = options.verifyTerminalImpact(receipt, hostTranscript); if (!v.confirmed) return { ok: false, reason: v.reason, terminalVerification }
     const normCls = receipt.terminalVulnClass.trim().toLowerCase(), fam = v.family ?? ti.oracleFamily ?? (V8_ORACLE_FAMILY_SET.has(normCls) ? normCls as V8OracleFamily : undefined)
     return { ok: true, terminalVerification, ...(fam ? { terminalOracleFamily: fam } : {}), ...(termEndpoint ? { terminalEndpoint: termEndpoint } : {}) }
   }
+  if (!contract) return { ok: false, reason: `terminal_class_unmapped: "${receipt.terminalVulnClass}" is not in TERMINAL_CLASS_CONTRACT.`, rejectedBy: 'terminal_class_unmapped', missingEvidence: ['mapped_terminal_vuln_class'], ...(terminalVerification ? { terminalVerification } : {}) }
   const failUnproven = (reason = TERMINAL_IMPACT_UNPROVEN_HINT, extra?: string[]) => ({ ok: false as const, reason, rejectedBy: 'terminal_impact_unproven', missingEvidence: extra ? [...extra, TERMINAL_IMPACT_UNPROVEN_HINT] : [TERMINAL_IMPACT_UNPROVEN_HINT], ...(terminalVerification ? { terminalVerification } : {}) })
   const hasEntryBody = (e: HostTranscriptEntry): boolean => e.step.json !== undefined || (typeof e.step.body === 'string' && e.step.body.trim().length > 0)
   const isStubEntry = (e: HostTranscriptEntry): boolean => hasEntryBody(e) && isJobOrHandleStub(e.step.json, e.step.body, e.step.status, e.step.method, e.step.route ?? e.step.pathAndQuery)
@@ -645,42 +619,56 @@ function verifyTerminalImpactGate(
   const postMutRb = (!termEx || !stepReadsState(termEx.step)) ? ti.postChainReadbackExchangeIds.map(id => idx.entriesById.get(id)).find((e): e is HostTranscriptEntry => {
     if (!e || (termEx && e.exchangeId === termEx.exchangeId)) return false
     const mono = !termEx || !isFiniteTs(termEx.timestampMs) || (isFiniteTs(e.timestampMs) && e.timestampMs >= termEx.timestampMs)
-    const isRead = stepReadsState(e.step) || e.step.arm === 'control' || e.step.evidenceRole === 'post_chain_readback'
-    return is2xx(e.step.status) && mono && isRead && hasEntryBody(e) && !isStubEntry(e) && (!isCrossTenantCls || !isOwnTenantOnly(e))
+    return is2xx(e.step.status) && mono && (stepReadsState(e.step) || e.step.arm === 'control' || e.step.evidenceRole === 'post_chain_readback') && hasEntryBody(e) && !isStubEntry(e) && (!isCrossTenantCls || !isOwnTenantOnly(e))
   }) : undefined
-  const hasOob = termHop.oobEventIds.some(id => idx.oobById.get(id)?.delivered === true) || Boolean(ti.proofReceipt?.oobEventIds.some(id => idx.oobById.get(id)?.delivered === true))
-  const hasBrowser = termHop.browserTraceIds.some(id => (idx.tracesById.get(id)?.sinks?.length ?? 0) > 0) || Boolean(ti.proofReceipt?.browserTraceIds.some(id => (idx.tracesById.get(id)?.sinks?.length ?? 0) > 0))
+  const termEdgeOf = (ch: string) => verifiedEdges.some(e => e.toHopId === termHop.hopId && e.kind === 'async_pivot_binding' && e.verified && receipt.causalEdges[e.edgeIndex]?.kind === 'async_pivot_binding' && (receipt.causalEdges[e.edgeIndex] as { channel: string }).channel === ch)
+  const hasOobEdge = termEdgeOf('oob_relay'), hasPollEdge = termEdgeOf('poll_convergence'), hasBrowserEdge = termEdgeOf('browser_trace')
+  const termProbes = termHop.exchangeIds.map(id => idx.entriesById.get(id)!).filter(e => e.step.arm === 'probe')
+  const hasBoundOob = contract === 'oob' && (hasOobEdge || termHop.oobEventIds.some(id => {
+    const oob = idx.oobById.get(id); if (!oob?.delivered || !isFiniteTs(oob.receivedAtMs)) return false
+    const toks = [oob.token, oob.canaryId, ...(oob.correlationIds ?? [])].filter((t): t is string => Boolean(t && t.trim().length >= 6))
+    return toks.length > 0 && termProbes.some(p => isFiniteTs(p.timestampMs) && p.timestampMs <= oob.receivedAtMs! && toks.some(t => entryCarriesRequestToken(p, t)))
+  }))
+  const hasBoundBrowser = (contract === 'browser' && termHop.browserTraceIds.some(id => (idx.tracesById.get(id)?.sinks?.length ?? 0) > 0)) || (contract === 'oob' && hasBrowserEdge)
   const hasBody = Boolean(termEx && hasEntryBody(termEx)), isStub = Boolean(termEx && isStubEntry(termEx)) || Boolean(ti.proofReceipt?.exchangeIds.some(id => { const e = idx.entriesById.get(id); return Boolean(e && e.step.arm !== 'control' && is2xx(e.step.status) && isStubEntry(e)) }))
-  if (ti.terminalExchangeId && (!termEx || termEx.step.arm === 'control' || !is2xx(termEx.step.status))) return failUnproven(`terminalExchangeId "${ti.terminalExchangeId}" is not a succeeding probe exchange.`)
+  if (ti.terminalExchangeId && (!termEx || termEx.step.arm !== 'probe' || !is2xx(termEx.step.status))) return failUnproven(`terminalExchangeId "${ti.terminalExchangeId}" is not a succeeding probe exchange.`)
   if (termEx && (termEx.evidenceRole === 'host_capability_op' || termEx.evidenceRole === 'host_crypto_op')) return failUnproven()
   const hasPostMutation = Boolean(postMutRb), termHopSet = new Set(termHop.exchangeIds), nonTermExSet = new Set(receipt.hops.filter(h => h.hopId !== termHop.hopId).flatMap(h => h.exchangeIds).filter(id => !termHopSet.has(id)))
-  const termActor = termEx ? actorOf(termEx) : null, termAuthd = Boolean(termActor && !ANON_ACTOR_RE.test(termActor))
+  const termActor = termEx ? actorOf(termEx) : null, termAuthd = Boolean(termActor && !ANON_ACTOR_RE.test(termActor)), normAct = (a: string | null) => (!a || ANON_ACTOR_RE.test(a.trim())) ? null : a.trim().toLowerCase()
+  const termUsesDagCap = Boolean(termEx && ((termEx.consumedCapabilities ?? []).some(c => dagCaps.has(c)) || (termEx.cryptoAttestations ?? []).some(x => dagCaps.has(x.derivedFromCapabilityId)) || (termActor && dagCaps.has(termActor))))
   const ctrlCandidates = [...ti.preChainControlExchangeIds, ...termHop.exchangeIds, ...receipt.causalEdges.flatMap(ed => ed.kind === 'state_transition_binding' && ed.toHopId === termHop.hopId ? ed.ablationExchangeIds : [])]
+  const matchesCtrlTarget = (c: HostTranscriptEntry, ref: HostTranscriptEntry): boolean => {
+    const cRaw = c.step.pathAndQuery ?? c.step.route ?? '', rRaw = ref.step.pathAndQuery ?? ref.step.route ?? '', hostEid = ref.entityId?.trim()
+    if (c.step.method.toUpperCase() !== ref.step.method.toUpperCase() || !cleanExactPath(cRaw) || cleanExactPath(cRaw) !== cleanExactPath(rRaw) || canonicalNonAuthQuery(cRaw) !== canonicalNonAuthQuery(rRaw)) return false
+    return !(hostEid && c.entityId?.trim() && c.entityId.trim().toLowerCase() !== hostEid.toLowerCase()) && (c.step.status !== 404 || !hostEid || entryMatchesEntity(c, hostEid))
+  }
   const terminalCtrl = ctrlCandidates.map(id => idx.entriesById.get(id)).find((c): c is HostTranscriptEntry => {
-    if (!c || (termEx && c.exchangeId === termEx.exchangeId) || nonTermExSet.has(c.exchangeId)) return false
-    if ((c.step.arm !== 'control' && c.replayAttempt !== 'ablation_control') || typeof c.step.status !== 'number' || !DENIED_CONTROL_STATUSES.has(c.step.status)) return false
-    const ca = actorOf(c); if (c.step.status === 401 && termAuthd && (!ca || ANON_ACTOR_RE.test(ca))) return false
-    const cf = normRouteFam(c.step.route ?? c.step.pathAndQuery, c.entityId ?? termEx?.entityId ?? termHop.entityId), eid = termEx?.entityId ?? termHop.entityId
-    return Boolean(termFam) && Boolean(cf) && cf === termFam && (c.step.status !== 404 || (eid ? entryMatchesEntity(c, eid) : (c.step.pathAndQuery ?? c.step.route ?? '').split('?', 1)[0] === termEndpoint.split('?', 1)[0]))
+    if (!c || (termEx && c.exchangeId === termEx.exchangeId) || nonTermExSet.has(c.exchangeId) || (c.step.arm !== 'control' && c.replayAttempt !== 'ablation_control') || typeof c.step.status !== 'number' || !DENIED_CONTROL_STATUSES.has(c.step.status)) return false
+    const ca = actorOf(c)
+    if ((c.step.status === 401 && termAuthd && (!ca || ANON_ACTOR_RE.test(ca))) || (!termUsesDagCap && termAuthd && normAct(ca) !== normAct(termActor))) return false
+    return Boolean((termEx && matchesCtrlTarget(c, termEx)) || (postMutRb && matchesCtrlTarget(c, postMutRb)))
   })
-  const hasCleanDeniedCtrl = Boolean(terminalCtrl), hasVerifiedTermEdge = verifiedEdges.some(e => e.toHopId === termHop.hopId && e.verified)
-  const hasNonJobAsyncEdge = verifiedEdges.some(e => e.toHopId === termHop.hopId && e.kind === 'async_pivot_binding' && e.verified && receipt.causalEdges[e.edgeIndex]?.kind === 'async_pivot_binding' && (receipt.causalEdges[e.edgeIndex] as { channel: string }).channel !== 'async_job')
-  const hasTermDerivedCrypto = verifiedEdges.some(e => e.toHopId === termHop.hopId && e.kind === 'derived_crypto_binding' && e.verified)
+  const hasCleanDeniedCtrl = Boolean(terminalCtrl), hasVerifiedTermEdge = verifiedEdges.some(e => e.toHopId === termHop.hopId && e.verified), hasTermDerivedCrypto = verifiedEdges.some(e => e.toHopId === termHop.hopId && e.kind === 'derived_crypto_binding' && e.verified)
   const termTenants = termEx ? extractTenantMarkers(termEx.step.json, termEx.step.body) : new Set<string>(), ownTenantOnly = Boolean(termEx && termTenants.size > 0 && attackerTenants.size > 0 && [...termTenants].every(t => attackerTenants.has(t))), hasForeignTenantData = Boolean(termEx && !isStub && hasBody && attackerTenants.size > 0 && [...termTenants].some(t => !attackerTenants.has(t)))
-  const v8Default = dispatchDefaultV8Oracle(receipt, dag, idx, factLog, termEx, options, terminalCtrl, postMutRb, { termEndpoint, termFam, hasOob, hasBrowser, hasBody, isStub, ownTenantOnly, hasForeignTenantData, hasVerifiedTermEdge })
+  const v8Default = dispatchDefaultV8Oracle(receipt, dag, idx, factLog, termEx, options, terminalCtrl, postMutRb, { termEndpoint, termFam, hasOob: hasBoundOob, hasBrowser: hasBoundBrowser, hasBody, isStub, ownTenantOnly, hasForeignTenantData, hasVerifiedTermEdge })
   if (v8Default && !v8Default.ok) return { ...v8Default, ...(terminalVerification ? { terminalVerification } : {}) }
-  if (!termEx && !hasOob && !hasBrowser && !hasNonJobAsyncEdge) return failUnproven(`Terminal hop "${termHop.hopId}" has no succeeding terminal evidence.`)
-  if (isStub && !hasPostMutation && !hasOob && !hasBrowser) return failUnproven()
-  const crossOrReplay = isCrossTenantCls || receipt.terminalVulnClass === 'cross_surface_pivot' || receipt.terminalVulnClass === 'cryptographic_scope_replay'
+  const okTerm = (fam?: V8OracleFamily | string) => ({ ok: true as const, ...(terminalVerification ? { terminalVerification } : {}), ...(fam ? { terminalOracleFamily: fam } : {}), ...(termEndpoint ? { terminalEndpoint: termEndpoint } : {}) })
+  if (contract === 'oob') return (hasBoundOob || hasPollEdge || hasBoundBrowser || Boolean(ti.proofReceipt && terminalVerification?.confirmed)) ? okTerm() : failUnproven(`Class "${receipt.terminalVulnClass}" requires a hop-bound OOB callback, converged poll, or verified proofReceipt.`)
+  if (contract === 'browser') return (hasBoundBrowser || Boolean(ti.proofReceipt && terminalVerification?.confirmed)) ? okTerm() : failUnproven(`Class "${receipt.terminalVulnClass}" requires a hop-bound browser sink trace or verified proofReceipt.`)
+  if (contract === 'injection_or_redirect') return (ti.proofReceipt && terminalVerification?.confirmed && !isStub) ? okTerm() : failUnproven(`Class "${receipt.terminalVulnClass}" requires a verified class-matched proofReceipt.`)
+  if (!termEx && !hasPostMutation) return failUnproven(`Terminal hop "${termHop.hopId}" has no succeeding terminal evidence.`)
+  if (isStub && !hasPostMutation) return failUnproven()
+  const crossOrReplay = isCrossTenantCls || contract === 'v8_pivot' || contract === 'v8_crypto'
   if (termEx && ownTenantOnly && !hasPostMutation && (crossOrReplay || !hasCleanDeniedCtrl)) return failUnproven()
-  const singleHopProofOk = Boolean(ti.proofReceipt && terminalVerification?.confirmed && receipt.hops.length === 1 && !v8Default && ti.proofReceipt.vulnClass.trim().toLowerCase() === receipt.terminalVulnClass.trim().toLowerCase())
-  const hasEconBaselineCtrl = Boolean(v8Default?.explicit && v8Default.family === 'economic_conservation'), isStrictCls = STRICT_TERMINAL_CLASS_RE.test(receipt.terminalVulnClass), hasDerivedTerminalProof = !isStrictCls && hasTermDerivedCrypto && (hasPostMutation || hasForeignTenantData), needsStrict = !singleHopProofOk && (isStrictCls || (!hasOob && !hasBrowser && !hasNonJobAsyncEdge))
-  if (needsStrict) {
-    if (!hasCleanDeniedCtrl && !hasEconBaselineCtrl && !hasDerivedTerminalProof && !hasOob && !hasBrowser) return failUnproven(`Missing clean denied control (401/403/404) on exact terminal target for ${receipt.terminalVulnClass}. ${TERMINAL_IMPACT_UNPROVEN_HINT}`, ['clean_denied_control_401_403_404'])
-    if (!hasOob && !hasBrowser && ((!termEx && !hasPostMutation) || !termEndpoint || !termFam)) return failUnproven(`Missing concrete terminal exchange or endpoint for ${receipt.terminalVulnClass}. ${TERMINAL_IMPACT_UNPROVEN_HINT}`, ['terminal_exchange_with_endpoint'])
+  if (contract === 'v8_economic') return (v8Default?.explicit && v8Default.family === 'economic_conservation') ? okTerm('economic_conservation') : failUnproven('economic_conservation requires verified host-derived conservation oracle input.')
+  const singleHopProofOk = Boolean(ti.proofReceipt && terminalVerification?.confirmed && receipt.hops.length === 1 && !v8Default)
+  const hasDerivedTerminalProof = contract === 'auth_or_logic' && hasTermDerivedCrypto && (hasPostMutation || hasForeignTenantData)
+  if (!singleHopProofOk) {
+    if (!hasCleanDeniedCtrl && !hasDerivedTerminalProof) return failUnproven(`Missing clean denied control (401/403/404) bound to terminal target for ${receipt.terminalVulnClass}. ${TERMINAL_IMPACT_UNPROVEN_HINT}`, ['clean_denied_control_401_403_404'])
+    if ((!termEx && !hasPostMutation) || !termEndpoint || !termFam) return failUnproven(`Missing concrete terminal exchange or endpoint for ${receipt.terminalVulnClass}. ${TERMINAL_IMPACT_UNPROVEN_HINT}`, ['terminal_exchange_with_endpoint'])
     if (termEx && !hasPostMutation && (!hasBody || isStub || (ownTenantOnly && crossOrReplay))) return failUnproven()
   }
-  return { ok: true, ...(terminalVerification ? { terminalVerification } : {}), ...(v8Default?.family ? { terminalOracleFamily: v8Default.family } : {}), ...(termEndpoint ? { terminalEndpoint: termEndpoint } : {}) }
+  return okTerm(v8Default?.family)
 }
 
 export function verifyCompositeReceipt(rawReceipt: unknown, hostTranscript: HostSignedTranscript, options: CompositeVerifyOptions = {}): CompositeReceiptVerification {
@@ -719,7 +707,7 @@ export function verifyCompositeReceipt(rawReceipt: unknown, hostTranscript: Host
   const replayRes = verifyReplayMode(receipt, dag, idx, options)
   if (!replayRes.ok) return fail('replay_mode', replayRes.reason, verifiedEdges)
   const factLog = options.factLog ?? HostFactLog.fromTranscript(hostTranscript)
-  const termRes = verifyTerminalImpactGate(receipt, dag, idx, factLog, verifiedEdges, hostTranscript, provRes.attackerTenants, options)
+  const termRes = verifyTerminalImpactGate(receipt, dag, idx, factLog, verifiedEdges, hostTranscript, provRes.attackerTenants, new Set(provRes.derivedCapabilities), options)
   if (!termRes.ok) return fail('terminal_impact', termRes.reason, verifiedEdges, termRes.terminalVerification, termRes.rejectedBy, termRes.missingEvidence)
   return {
     confirmed: true, chainId: receipt.chainId, terminalVulnClass: receipt.terminalVulnClass, replayMode: receipt.replayMode,
