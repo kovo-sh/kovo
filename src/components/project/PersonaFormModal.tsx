@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { registerPersona } from '../../actions.ts'
+import { registerPersona, updatePersona } from '../../actions.ts'
 import type { PersonaAuthKind, PersonaLoginAdapter, PublicPersona } from '../../domain.ts'
 import { FormError, useAction } from '../common.tsx'
 import { parseCurlOrHeader } from '../curl-parser.ts'
@@ -25,6 +25,7 @@ interface Props {
   onClose: () => void
   project: ProjectLoaderData['project']
   existingPersonas: readonly Pick<PublicPersona, 'handle' | 'roleLabel'>[]
+  editingPersona?: PublicPersona | null
   onCreated: (created: { id: string; handle: string }) => void
   submitLabel?: string
 }
@@ -82,6 +83,7 @@ export function PersonaFormModal({
   onClose,
   project,
   existingPersonas,
+  editingPersona = null,
   onCreated,
   submitLabel = 'Save test account',
 }: Props) {
@@ -100,12 +102,43 @@ export function PersonaFormModal({
 
   const isClerkClient = signInMethod === 'clerk_client'
   const effectiveAuthKind: PersonaAuthKind = isClerkClient ? 'login' : signInMethod
+  const editingIsClerkClient = Boolean(
+    editingPersona && editingPersona.authKind === 'login' && editingPersona.loginConfig?.adapter === 'clerk_client',
+  )
+  const keepingSameAuthKind = Boolean(
+    editingPersona && editingPersona.authKind === effectiveAuthKind && editingIsClerkClient === isClerkClient,
+  )
+  const secretRequired = !keepingSameAuthKind
 
   useEffect(() => {
     if (!open) return
+    if (editingPersona) {
+      const isClerkClientMethod = editingPersona.loginConfig?.adapter === 'clerk_client'
+      setRoleLabel(editingPersona.roleLabel)
+      setSignInMethod(isClerkClientMethod ? 'clerk_client' : editingPersona.authKind)
+      setLoginAdapter(editingPersona.loginConfig?.adapter ?? 'auto')
+      setLoginEmail(editingPersona.loginConfig?.email ?? '')
+      setLoginUrl(editingPersona.loginConfig?.loginUrl ?? '')
+      setHeaderName(editingPersona.headerName ?? '')
+      setOrigins(editingPersona.originAllowlist.join('\n'))
+      setSecret('')
+      setCurlPaste('')
+      setCurlNote('')
+      setAdvancedOpen(false)
+      return
+    }
     setRoleLabel(suggestNextAccountLabel(existingPersonas))
+    setHeaderName('')
+    setSignInMethod('login')
+    setLoginAdapter('auto')
+    setLoginEmail('')
+    setLoginUrl('')
     setOrigins(project.seeds.join('\n'))
-  }, [open, project.id, project.seeds, existingPersonas])
+    setSecret('')
+    setCurlPaste('')
+    setCurlNote('')
+    setAdvancedOpen(false)
+  }, [open, project.id, project.seeds, existingPersonas, editingPersona])
 
   function resetForm() {
     setRoleLabel(suggestNextAccountLabel(existingPersonas))
@@ -150,6 +183,30 @@ export function PersonaFormModal({
     }
     const headerNameRaw = headerName.trim()
     const loginUrlRaw = loginUrl.trim()
+    if (editingPersona) {
+      void personaAction.submit(() => updatePersona({ data: {
+        requestId: crypto.randomUUID(),
+        projectId: project.id,
+        personaId: editingPersona.id,
+        roleLabel: cleanLabel,
+        originAllowlist: allowlist,
+        authKind: effectiveAuthKind,
+        ...(effectiveAuthKind === 'header' && headerNameRaw ? { headerName: headerNameRaw } : {}),
+        ...(effectiveAuthKind === 'login' ? {
+          loginConfig: {
+            adapter: isClerkClient ? 'clerk_client' : loginAdapter,
+            ...(!isClerkClient ? { email: loginEmail.trim() } : {}),
+            ...(loginUrlRaw ? { loginUrl: loginUrlRaw } : {}),
+          },
+        } : {}),
+        ...(secret.trim() ? { secret } : {}),
+      } }), updated => {
+        resetForm()
+        onClose()
+        onCreated(updated)
+      })
+      return
+    }
     void personaAction.submit(() => registerPersona({ data: {
       requestId: crypto.randomUUID(),
       projectId: project.id,
@@ -185,7 +242,9 @@ export function PersonaFormModal({
       <DialogContent className="flex max-h-[calc(100vh-56px)] max-w-[680px] flex-col overflow-hidden p-0">
         <form className="flex min-h-0 flex-1 flex-col" onSubmit={handleSubmit}>
           <DialogHeader className="flex-row items-center justify-between gap-2.5 border-b border-line bg-raise px-4 py-2.5">
-            <DialogTitle className="text-[13px] font-semibold text-fg">Add test account</DialogTitle>
+            <DialogTitle className="text-[13px] font-semibold text-fg">
+              {editingPersona ? 'Edit test account' : 'Add test account'}
+            </DialogTitle>
             <Button
               type="button"
               variant="ghost"
@@ -211,9 +270,6 @@ export function PersonaFormModal({
                   value={roleLabel}
                   onChange={e => setRoleLabel(e.target.value)}
                 />
-                <small className="text-[11.5px] font-normal text-fg-subtle">
-                  Readable name for this test account (pre-filled automatically).
-                </small>
               </label>
               <label className="grid gap-1 text-[12px] font-medium text-fg-muted">
                 Sign-in method
@@ -269,12 +325,16 @@ export function PersonaFormModal({
                     className="w-full font-mono text-[12px]"
                     name="secret"
                     type="password"
-                    required
+                    required={secretRequired}
                     maxLength={4096}
                     autoComplete="off"
                     value={secret}
                     onChange={e => setSecret(e.target.value)}
-                    placeholder="Paste __client cookie value from DevTools (clerk.yourdomain.com)"
+                    placeholder={
+                      keepingSameAuthKind
+                        ? 'Leave blank to keep existing secret'
+                        : 'Paste __client cookie value from DevTools (clerk.yourdomain.com)'
+                    }
                   />
                   <small className="text-[11.5px] font-normal text-fg-subtle">
                     In your signed-in browser, open DevTools → Application → Cookies on <code className="font-mono">clerk.&lt;domain&gt;</code> or <code className="font-mono">*.clerk.accounts.dev</code> and copy <code className="font-mono">__client</code>. Accepts raw value, <code className="font-mono">__client=…</code>, or a full <code className="font-mono">Cookie:</code> header.
@@ -316,12 +376,12 @@ export function PersonaFormModal({
                     className="w-full"
                     name="secret"
                     type="password"
-                    required
+                    required={secretRequired}
                     maxLength={4096}
                     autoComplete="off"
                     value={secret}
                     onChange={e => setSecret(e.target.value)}
-                    placeholder="Encrypted on your machine"
+                    placeholder={keepingSameAuthKind ? 'Leave blank to keep existing secret' : 'Encrypted on your machine'}
                   />
                 </label>
               </div>
@@ -345,12 +405,12 @@ export function PersonaFormModal({
                     className="w-full"
                     name="secret"
                     type="password"
-                    required
+                    required={secretRequired}
                     maxLength={4096}
                     autoComplete="off"
                     value={secret}
                     onChange={e => setSecret(e.target.value)}
-                    placeholder="Never displayed back after saving"
+                    placeholder={keepingSameAuthKind ? 'Leave blank to keep existing secret' : 'Never displayed back after saving'}
                   />
                 </label>
               </div>
@@ -361,12 +421,12 @@ export function PersonaFormModal({
                   className="w-full"
                   name="secret"
                   type="password"
-                  required
+                  required={secretRequired}
                   maxLength={4096}
                   autoComplete="off"
                   value={secret}
                   onChange={e => setSecret(e.target.value)}
-                  placeholder="Never displayed back after saving"
+                  placeholder={keepingSameAuthKind ? 'Leave blank to keep existing secret' : 'Never displayed back after saving'}
                 />
               </label>
             )}
@@ -450,7 +510,7 @@ export function PersonaFormModal({
               Cancel
             </Button>
             <Button type="submit" variant="default" disabled={personaAction.pending}>
-              {personaAction.pending ? 'Saving…' : submitLabel}
+              {personaAction.pending ? 'Saving…' : editingPersona ? 'Save changes' : submitLabel}
             </Button>
           </DialogFooter>
         </form>

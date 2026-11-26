@@ -582,6 +582,27 @@ export const deletePersona = z.object({
   personaId: id,
 })
 
+export const updatePersona = z.object({
+  requestId: id,
+  projectId: id,
+  personaId: id,
+  roleLabel: shortText,
+  originAllowlist: z.array(scopedAssetOrigin).min(1).max(64),
+  authKind: z.enum(personaAuthKinds),
+  headerName: z.string().trim().regex(/^[A-Za-z0-9-]{1,64}$/).optional(),
+  loginConfig: personaLoginConfigSchema.optional(),
+  secret: z.string().max(4096).optional(),
+  canaryMarkers: z.array(shortText).max(16).optional(),
+}).superRefine((val, ctx) => {
+  if (val.authKind === 'login' && !val.loginConfig) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['loginConfig'],
+      message: 'Email and login configuration are required for Email + Password personas.',
+    })
+  }
+})
+
 const boardHandle = z.string().trim().min(2).max(25)
   .transform(value => value.replace(/^@+/, '').toLowerCase())
   .refine(value => boardHandlePattern.test(value), 'Use a lowercase handle such as coordinator or bola.')

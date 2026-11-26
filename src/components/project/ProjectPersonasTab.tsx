@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { removePersona } from '../../actions.ts'
 import type { PublicPersona } from '../../domain.ts'
 import { useAction } from '../common.tsx'
@@ -19,11 +19,51 @@ import { PersonaFormModal } from './PersonaFormModal.tsx'
 import type { PersonaTestState, ProjectLoaderData } from './types.ts'
 import { formatPersonaAuthBadge, safeHost } from './types.ts'
 
+/**
+ * Derive a concise 2–3 word status pill label from a persona auth error or warning message.
+ * Keeps the row badge compact while the full error text renders in the inline callout below.
+ */
+export function classifyPersonaTestError(message: string): string {
+  const text = message.trim()
+  if (!text) return 'Auth failed'
+  if (/mfa|second factor|two[- ]?factor|totp|needs_second_factor|multi[- ]?factor/i.test(text)) {
+    return 'MFA required'
+  }
+  if (/captcha|turnstile|anti[- ]?bot|verify you are human|bot_detected/i.test(text)) {
+    return 'CAPTCHA blocked'
+  }
+  if (/timed?\s*out|timeout|aborted/i.test(text) && !/authentication aborted/i.test(text)) {
+    return 'Timed out'
+  }
+  if (/blocked|forbidden|rate[- ]?limit|waf|\bhttp\s*403\b|\bhttp\s*429\b/i.test(text)) {
+    return 'Blocked'
+  }
+  if (/invalid|incorrect|wrong password|unauthorized|bad credentials|\bhttp\s*401\b/i.test(text)) {
+    return 'Invalid login'
+  }
+  if (/network|econn|enotfound|dns|fetch failed|unreachable|connection/i.test(text)) {
+    return 'Network error'
+  }
+  if (/\bhttp\s*5\d\d\b|server error/i.test(text)) {
+    return 'Server error'
+  }
+  return 'Auth failed'
+}
+
+/** Format the concise status chip label for a persona verification state. */
+export function formatPersonaTestStatusLabel(test: PersonaTestState): string {
+  if (test.status === 'error' || test.status === 'warn') {
+    return classifyPersonaTestError(test.message)
+  }
+  return test.message
+}
+
 interface Props {
   data: ProjectLoaderData
   personaTests: Record<string, PersonaTestState>
   onTestPersona: (persona: PublicPersona) => void
   onPersonaCreated: (created: { id: string; handle: string }) => void
+  onPersonaUpdated?: (updated: { id: string; handle: string }) => void
 }
 
 function CrossAccountEmptySvg() {
@@ -167,12 +207,55 @@ function CrossAccountEmptySvg() {
   )
 }
 
-export function ProjectPersonasTab({ data, personaTests, onTestPersona, onPersonaCreated }: Props) {
+export function ProjectPersonasTab({ data, personaTests, onTestPersona, onPersonaCreated, onPersonaUpdated }: Props) {
   const { project, personas } = data
   const [modalOpen, setModalOpen] = useState(false)
+  const [editingPersona, setEditingPersona] = useState<PublicPersona | null>(null)
   const [personaToDelete, setPersonaToDelete] = useState<PublicPersona | null>(null)
   const [notice, setNotice] = useState('')
+  const [dismissedErrorKeys, setDismissedErrorKeys] = useState<Record<string, string>>({})
+  const [copiedPersonaId, setCopiedPersonaId] = useState<string | null>(null)
+  const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const personaAction = useAction()
+
+  useEffect(() => () => {
+    if (copyTimerRef.current) clearTimeout(copyTimerRef.current)
+  }, [])
+
+  function openCreateModal() {
+    setEditingPersona(null)
+    setModalOpen(true)
+    setNotice('')
+  }
+
+  function openEditModal(persona: PublicPersona) {
+    setEditingPersona(persona)
+    setModalOpen(true)
+    setNotice('')
+  }
+
+  function handleRetryPersona(persona: PublicPersona) {
+    setDismissedErrorKeys(prev => {
+      if (!(persona.id in prev)) return prev
+      const next = { ...prev }
+      delete next[persona.id]
+      return next
+    })
+    onTestPersona(persona)
+  }
+
+  async function handleCopyError(personaId: string, message: string) {
+    try {
+      await navigator.clipboard?.writeText(message)
+      setCopiedPersonaId(personaId)
+      if (copyTimerRef.current) clearTimeout(copyTimerRef.current)
+      copyTimerRef.current = setTimeout(() => {
+        setCopiedPersonaId(prev => (prev === personaId ? null : prev))
+      }, 2000)
+    } catch {
+      // Clipboard API may be unavailable in non-secure contexts; ignore silently.
+    }
+  }
 
   return (
     <section aria-label="Test accounts">
@@ -190,10 +273,7 @@ export function ProjectPersonasTab({ data, personaTests, onTestPersona, onPerson
             <Button
               type="button"
               variant="default"
-              onClick={() => {
-                setModalOpen(true)
-                setNotice('')
-              }}
+              onClick={openCreateModal}
             >
               Add test account
             </Button>
@@ -221,45 +301,114 @@ export function ProjectPersonasTab({ data, personaTests, onTestPersona, onPerson
                 : test?.status === 'error'
                   ? 'danger'
                   : 'neutral'
+            const isFailure = test?.status === 'error' || test?.status === 'warn'
+            const showCallout = Boolean(isFailure && test && dismissedErrorKeys[persona.id] !== test.message)
+            const isCopied = copiedPersonaId === persona.id
             return (
-              <div
-                key={persona.id}
-                className="flex min-h-[44px] items-center justify-between gap-3 border-b border-line px-1 py-2 transition-colors hover:bg-hover"
-              >
-                <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-                  <div className="flex min-w-0 flex-wrap items-center gap-1.5 font-medium text-fg">
-                    <strong className="font-mono text-[12px] font-semibold">{persona.handle}</strong>
-                    <Badge variant="accent">{persona.roleLabel}</Badge>
-                    <Badge variant="neutral" className="bg-sunk">{formatPersonaAuthBadge(persona)}</Badge>
-                    {test && (
-                      <Badge variant={testVariant} className={testVariant === 'neutral' ? 'bg-sunk' : undefined}>
+              <div key={persona.id} className="border-b border-line">
+                <div className="flex min-h-[44px] items-center justify-between gap-3 px-1 py-2 transition-colors hover:bg-hover">
+                  <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+                    <div className="flex min-w-0 flex-wrap items-center gap-1.5 font-medium text-fg">
+                      <strong className="font-mono text-[12px] font-semibold">{persona.handle}</strong>
+                      <Badge variant="accent">{persona.roleLabel}</Badge>
+                      <Badge variant="neutral" className="bg-sunk">{formatPersonaAuthBadge(persona)}</Badge>
+                      {test && (
+                        <Badge
+                          variant={testVariant}
+                          className={testVariant === 'neutral' ? 'bg-sunk' : undefined}
+                          title={isFailure ? test.message : undefined}
+                        >
+                          {formatPersonaTestStatusLabel(test)}
+                        </Badge>
+                      )}
+                    </div>
+                    <div className="text-[12px] text-fg-subtle">
+                      Allowlist: {persona.originAllowlist.map(safeHost).join(', ')}
+                    </div>
+                  </div>
+                  <div className="flex flex-none items-center gap-2">
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      disabled={test?.status === 'testing'}
+                      onClick={() => handleRetryPersona(persona)}
+                    >
+                      {test?.status === 'testing' ? 'Verifying…' : test?.status === 'ok' ? 'Verify sign-in ✓' : 'Verify sign-in'}
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      disabled={personaAction.pending}
+                      onClick={() => openEditModal(persona)}
+                    >
+                      Edit
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      className="data-[slot=button]:text-danger data-[slot=button]:hover:bg-danger-soft data-[slot=button]:hover:text-danger"
+                      disabled={personaAction.pending}
+                      onClick={() => setPersonaToDelete(persona)}
+                    >
+                      Delete
+                    </Button>
+                  </div>
+                </div>
+                {showCallout && test && (
+                  <div
+                    role="alert"
+                    data-slot="persona-error-callout"
+                    className={`mb-2.5 flex flex-wrap items-start justify-between gap-2.5 rounded-[7px] border px-3 py-2 text-[12px] ${
+                      test.status === 'warn'
+                        ? 'border-warn-line bg-warn-soft text-fg'
+                        : 'border-danger/35 bg-danger-soft text-fg'
+                    }`}
+                  >
+                    <div className="flex min-w-0 flex-1 items-start gap-2">
+                      <Icon
+                        name="alert"
+                        size={14}
+                        className={`mt-0.5 flex-none ${test.status === 'warn' ? 'text-warn' : 'text-danger'}`}
+                      />
+                      <p className="m-0 min-w-0 flex-1 whitespace-normal break-words leading-relaxed text-fg">
                         {test.message}
-                      </Badge>
-                    )}
+                      </p>
+                    </div>
+                    <div className="flex flex-none items-center gap-1.5">
+                      <Button
+                        type="button"
+                        variant="outline"
+                        onClick={() => openEditModal(persona)}
+                      >
+                        Edit account
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        onClick={() => handleRetryPersona(persona)}
+                      >
+                        Retry
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        onClick={() => void handleCopyError(persona.id, test.message)}
+                      >
+                        {isCopied ? 'Copied' : 'Copy'}
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        className="size-[26px]"
+                        aria-label={`Dismiss error for ${persona.handle}`}
+                        onClick={() => setDismissedErrorKeys(prev => ({ ...prev, [persona.id]: test.message }))}
+                      >
+                        <Icon name="close" size={13} />
+                      </Button>
+                    </div>
                   </div>
-                  <div className="text-[12px] text-fg-subtle">
-                    Allowlist: {persona.originAllowlist.map(safeHost).join(', ')}
-                  </div>
-                </div>
-                <div className="flex flex-none items-center gap-2">
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    disabled={test?.status === 'testing'}
-                    onClick={() => onTestPersona(persona)}
-                  >
-                    {test?.status === 'testing' ? 'Verifying…' : test?.status === 'ok' ? 'Verify sign-in ✓' : 'Verify sign-in'}
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    className="data-[slot=button]:text-danger data-[slot=button]:hover:bg-danger-soft data-[slot=button]:hover:text-danger"
-                    disabled={personaAction.pending}
-                    onClick={() => setPersonaToDelete(persona)}
-                  >
-                    Delete
-                  </Button>
-                </div>
+                )}
               </div>
             )
           })}
@@ -275,10 +424,7 @@ export function ProjectPersonasTab({ data, personaTests, onTestPersona, onPerson
               <Button
                 type="button"
                 variant="default"
-                onClick={() => {
-                  setModalOpen(true)
-                  setNotice('')
-                }}
+                onClick={openCreateModal}
               >
                 Add test account
               </Button>
@@ -289,12 +435,26 @@ export function ProjectPersonasTab({ data, personaTests, onTestPersona, onPerson
 
       <PersonaFormModal
         open={modalOpen}
-        onClose={() => setModalOpen(false)}
+        onClose={() => {
+          setModalOpen(false)
+          setEditingPersona(null)
+        }}
         project={project}
         existingPersonas={personas}
-        onCreated={created => {
-          setNotice(`Saved test account "${created.handle}". Credentials stay encrypted on your machine.`)
-          onPersonaCreated(created)
+        editingPersona={editingPersona}
+        onCreated={result => {
+          const wasEditing = Boolean(editingPersona)
+          setNotice(
+            wasEditing
+              ? `Updated test account "${result.handle}". Credentials stay encrypted on your machine.`
+              : `Saved test account "${result.handle}". Credentials stay encrypted on your machine.`,
+          )
+          setEditingPersona(null)
+          if (wasEditing) {
+            onPersonaUpdated?.(result)
+          } else {
+            onPersonaCreated(result)
+          }
         }}
       />
 

@@ -18,6 +18,7 @@ import {
   projectAsset,
   providerSettings,
   runCommand,
+  updatePersona as updatePersonaSchema,
 } from './domain.ts'
 import { execution } from './server/execution.ts'
 import {
@@ -47,6 +48,7 @@ import {
   createProjectPersona,
   deleteProjectPersona,
   listProjectPersonas,
+  updateProjectPersona,
 } from './server/persona-vault.ts'
 import { exportReportMarkdown } from './server/report-export.ts'
 import { exportReportSarif } from './server/sarif-export.ts'
@@ -326,6 +328,9 @@ export const listPersonas = createServerFn({ method: 'GET' })
 
 export const registerPersona = createServerFn({ method: 'POST' }).validator(createPersona)
   .handler(({ data }) => createProjectPersona(store(), data))
+
+export const updatePersona = createServerFn({ method: 'POST' }).validator(updatePersonaSchema)
+  .handler(({ data }) => updateProjectPersona(store(), data))
 
 export const removePersona = createServerFn({ method: 'POST' }).validator(deletePersona)
   .handler(({ data }) => deleteProjectPersona(store(), data))
