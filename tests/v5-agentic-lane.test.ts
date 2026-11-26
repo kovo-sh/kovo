@@ -24,6 +24,11 @@ import type { Finding, InlineVerifyFeedback } from '../src/domain.ts'
 import { readTrace } from '../src/server/agent-trace.ts'
 import { verifierRepairFeedback, withVerifierRepairFeedback } from '../src/server/agent-session.ts'
 import {
+  CHAIN_ASSIGNMENT_MAX_WALL_CLOCK_MS,
+  SINGLE_STEP_ASSIGNMENT_WALL_CLOCK_MS,
+  resolveAssignmentBudget,
+} from '../src/server/exec-dispatch.ts'
+import {
   computeDynamicStepBudget,
   countConsecutiveDrySteps,
   diminishingReturnsDryThreshold,
@@ -54,7 +59,6 @@ type Internals = {
   traceLifecycle: (runId: string, kind: 'lane_start' | 'lane_end' | 'checkpoint' | 'verdict' | 'abort', payload?: Record<string, unknown>) => void
   tracePlannerDecision: (runId: string, payload: Record<string, unknown>) => void
   notifyCheckpoint: (runId: string, checkpoint: 'phase0' | 'deterministic-lane' | 'post-floor' | 'planner-round') => void
-  specialistWallClockMs: (maxTurns: number) => number
   alreadyConfirmedRefs: (run: Run, limit?: number) => Array<{ path: string; method?: string | null; cwe?: string | null }>
   detLeadSummaries: (run: Run) => Array<{ probeClass: string }>
   assignmentBriefForStep: (input: Record<string, unknown>) => string | undefined
@@ -378,8 +382,11 @@ test('occurred context builders: confirmed refs, leads and <=1.5 KB assignment b
   assert.ok(Buffer.byteLength(brief!, 'utf8') <= 1536)
   assert.ok(brief!.includes(origin))
 
-  assert.equal(internals(execution).specialistWallClockMs(9), 80_000)
-  assert.ok(internals(execution).specialistWallClockMs(30) <= 160_000)
+  const singleBudget = resolveAssignmentBudget({ budgetClass: 'single_step' }, { baseMaxTurns: 9 })
+  const multiBudget = resolveAssignmentBudget({ budgetClass: 'multi_step' }, { baseMaxTurns: 30 })
+  assert.ok(singleBudget.wallClockMs <= SINGLE_STEP_ASSIGNMENT_WALL_CLOCK_MS)
+  assert.ok(multiBudget.wallClockMs <= CHAIN_ASSIGNMENT_MAX_WALL_CLOCK_MS)
+  assert.ok(multiBudget.wallClockMs / multiBudget.maxTurns >= singleBudget.wallClockMs / singleBudget.maxTurns)
 })
 
 test('tracing is OFF by default and emits lifecycle/planner/checkpoint records when enabled', async (t) => {

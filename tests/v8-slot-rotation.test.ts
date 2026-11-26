@@ -43,6 +43,7 @@ import type { WorkerBackend, WorkerSession } from '../src/server/worker-backend.
 import { makeStore, setupApprovedRun, stopExecution, withEnv } from './v4-tier-helpers.ts'
 
 process.env.KOVO_ALLOW_LOCAL_LAB = '1'
+process.env.KOVO_ALLOW_LOCAL_MODEL = '1'
 
 const ORIGIN = 'https://target.example.invalid'
 
@@ -411,7 +412,7 @@ test('Execution scheduler.dispatch opens >= 3 concurrent slots (not slots=1) and
   })
 
   const engine = new Execution(storage, { backend: stubBackend(), deterministicSweep: false })
-  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1', KOVO_ALLOW_LOCAL_MODEL: '1' }, async () => {
     engine.start()
     engine.wake()
     const deadline = Date.now() + 4_000
@@ -627,7 +628,7 @@ test('Execution rotates a stalled specialist at wallClockMs=150 in < 400ms and d
   })
 
   const startedAt = Date.now()
-  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1' }, async () => {
+  await withEnv({ KOVO_ALLOW_LOCAL_LAB: '1', KOVO_ALLOW_LOCAL_MODEL: '1' }, async () => {
     engine.start()
     engine.wake()
     const deadline = Date.now() + 4_000
@@ -639,7 +640,7 @@ test('Execution rotates a stalled specialist at wallClockMs=150 in < 400ms and d
       const steps = storage.listChainSteps(runId, run.goalRevision)
       const s1 = steps.find(s => s.id === step1.id)
       const s2 = steps.find(s => s.id === step2.id)
-      if (s1?.status === 'complete' && s2?.status === 'complete') break
+      if (s1?.status === 'rotated_partial' && s2?.status === 'complete') break
       await new Promise(r => setTimeout(r, 15))
     }
     await stopExecution(engine as never)
@@ -654,7 +655,7 @@ test('Execution rotates a stalled specialist at wallClockMs=150 in < 400ms and d
   assert.ok(rotationLatencyMs < 400, `expected stalled worker slot release within < 400ms, took ${rotationLatencyMs}ms`)
 
   const finalSteps = storage.listChainSteps(runId, run.goalRevision)
-  assert.equal(finalSteps.find(s => s.id === step1.id)?.status, 'complete')
+  assert.equal(finalSteps.find(s => s.id === step1.id)?.status, 'rotated_partial')
   assert.equal(finalSteps.find(s => s.id === step2.id)?.status, 'complete', 'queued next step must dispatch and complete after rotation')
   assert.ok(step2DispatchedAt !== null, 'queued step 2 must have received LLM turns after step 1 rotated')
 

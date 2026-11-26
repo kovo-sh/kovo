@@ -141,7 +141,7 @@ test('resolveAssignmentBudget keeps full 120–180s wallClockMs for multiStep ra
   assert.ok(raceBudget.maxTurns >= MULTI_STEP_ASSIGNMENT_MIN_TURNS && raceBudget.maxTurns <= MULTI_STEP_ASSIGNMENT_MAX_TURNS)
   assert.equal(raceBudget.wallClockSettlementMs, resolveWorkerSettlementMs(160_000, false))
 
-  // Cross-persona BOLA matrix with 200s baseWallClockMs caps cleanly at 180s (CHAIN_ASSIGNMENT_MAX_WALL_CLOCK_MS).
+  // Cross-persona BOLA matrix with oversized baseWallClockMs caps cleanly at CHAIN_ASSIGNMENT_MAX_WALL_CLOCK_MS (240s).
   const bolaBudget = resolveAssignmentBudget(
     {
       title: 'Cross-persona BOLA/IDOR matrix · app.example · resource:invoiceId',
@@ -151,7 +151,7 @@ test('resolveAssignmentBudget keeps full 120–180s wallClockMs for multiStep ra
     },
     {
       baseMaxTurns: 28,
-      baseWallClockMs: 200_000,
+      baseWallClockMs: CHAIN_ASSIGNMENT_MAX_WALL_CLOCK_MS + 20_000,
       runDurationMs: 900_000,
       singleStepWallClockMs: 120_000,
     },

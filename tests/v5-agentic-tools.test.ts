@@ -16,7 +16,6 @@ import { randomUUID } from 'node:crypto'
 import type { AgentTrace } from '../src/server/agent-trace.ts'
 import { createAgentTrace, readTrace, SecretRegistry } from '../src/server/agent-trace.ts'
 import {
-  AGENTIC_SPECIALIST_MAX_TURNS,
   SPECIALIST_PROFILES,
   buildWorkerTools,
   capabilityBundlesFor,
@@ -144,13 +143,13 @@ test('failed verification surfaces bounded, repairable feedback while successes 
 // ============================================================================
 
 test('N-2 settlement nudge names typed proof tools and complete_intent', () => {
-  const nudge = settlementNudgeMessage({ turn: 7, maxTurns: AGENTIC_SPECIALIST_MAX_TURNS, proofTools: proofToolHandlerNames })
+  const nudge = settlementNudgeMessage({ turn: 7, maxTurns: 9, proofTools: proofToolHandlerNames })
   assert.match(nudge, /Turn 7\/9/)
   assert.match(nudge, /N-2/)
   for (const name of proofToolHandlerNames) assert.ok(nudge.includes(name), `${name} must be offered`)
   assert.match(nudge, /propose_chain_finding/)
   assert.match(nudge, /complete_intent/)
-  assert.equal(settlementNudgeTurnFor(AGENTIC_SPECIALIST_MAX_TURNS), 7)
+  assert.equal(settlementNudgeTurnFor(9), 7)
 })
 
 test('settlementDue honors the turn threshold, external trigger, and wall-clock deadline', () => {

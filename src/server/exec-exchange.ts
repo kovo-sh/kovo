@@ -236,6 +236,7 @@ export function findFindingRow(storage: Store, runId: string, findingId: string)
 
 export function llmRunHooks(storage: Store, runId: string) {
   return {
+    runId,
     onUsage: (u: { costUsd: number; inputTokens: number; outputTokens: number }) =>
       storage.recordLlmSpend(runId, { usd: u.costUsd, tokens: u.inputTokens + u.outputTokens }),
     onProfileSuccess: (id: string) => recordProfileSuccess(id, storage),

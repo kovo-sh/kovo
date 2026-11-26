@@ -3800,9 +3800,9 @@ export function isMultiStepAssignment(input: {
   const skillText = (input.skills ?? []).join(' ')
   return MULTI_STEP_ASSIGNMENT_RE.test(`${input.title ?? ''} ${input.category ?? ''} ${skillText}`)
 }
-/** Multi-step chains that cite parent evidence keep the long cap (bounded below). */
+/** Multi-step chains that cite parent evidence keep the long cap (bounded below; allows non-decreasing sec/turn up to 34 turns). */
 export const CHAIN_ASSIGNMENT_MIN_WALL_CLOCK_MS = 120_000
-export const CHAIN_ASSIGNMENT_MAX_WALL_CLOCK_MS = 180_000
+export const CHAIN_ASSIGNMENT_MAX_WALL_CLOCK_MS = 240_000
 /** Proportional wall-clock bounds for multi-hop `chain` / continuation workers (180s–300s). */
 export const MULTI_HOP_CHAIN_MIN_WALL_CLOCK_MS = 180_000
 export const MULTI_HOP_CHAIN_MAX_WALL_CLOCK_MS = 300_000
@@ -3946,7 +3946,8 @@ export interface AssignmentStepDescriptor {
 
 export interface AssignmentRunPolicy {
   baseMaxTurns: number
-  baseWallClockMs: number
+  /** Optional explicit wall-clock floor/hint (legacy callers/tests); live dispatch derives wall-clock directly from `maxTurns`. */
+  baseWallClockMs?: number
   /** Overall run wall-clock duration in ms (scales multi-hop chain budgets proportionally). */
   runDurationMs?: number
   /** Single-step wall cap (default {@link SINGLE_STEP_ASSIGNMENT_WALL_CLOCK_MS}). */
@@ -4020,9 +4021,9 @@ export function classifyAssignmentBudgetClass(step: AssignmentStepDescriptor): A
 }
 
 /**
- * Single pure authoritative budget resolver (Move O5): replaces competing `planAssignmentBudget`
- * and `resolveWorkerWallClockMs` calculators so `multiStep` race/BOLA/cross-persona assignments
- * keep their intended 120–180s budgets instead of being silently clamped down to single-step caps.
+ * Single pure authoritative budget resolver (Move O5 / R2-19): derives turn and wall-clock budgets
+ * inside one calculator bounded by `intentLeaseMs` and run budgets so seconds-per-turn is
+ * non-decreasing as `maxTurns` grows across `single_step`, `multi_step`, and `multi_hop_chain`.
  */
 export function resolveAssignmentBudget(
   stepDescriptor: AssignmentStepDescriptor,
@@ -4030,16 +4031,37 @@ export function resolveAssignmentBudget(
 ): AssignmentBudget & { budgetClass: AssignmentBudgetClass } {
   const budgetClass = classifyAssignmentBudgetClass(stepDescriptor)
   const baseTurns = Math.max(4, Math.floor(runPolicy.baseMaxTurns))
-  const baseWall = Math.max(20_000, Math.round(runPolicy.baseWallClockMs))
+  const explicitBaseWall = typeof runPolicy.baseWallClockMs === 'number'
+    && Number.isFinite(runPolicy.baseWallClockMs)
+    && runPolicy.baseWallClockMs > 0
+    ? Math.max(20_000, Math.round(runPolicy.baseWallClockMs))
+    : undefined
+  const leaseWallCeilingMs = Math.floor(intentLeaseMs * 0.85)
   const overrideWall = typeof runPolicy.wallClockOverrideMs === 'number'
     && Number.isFinite(runPolicy.wallClockOverrideMs)
     && runPolicy.wallClockOverrideMs > 0
-    ? Math.max(1, Math.floor(runPolicy.wallClockOverrideMs))
+    ? Math.max(1, Math.min(leaseWallCeilingMs, Math.floor(runPolicy.wallClockOverrideMs)))
     : undefined
+
+  const singleCap = Math.max(
+    30_000,
+    Math.min(
+      SINGLE_STEP_ASSIGNMENT_WALL_CLOCK_MS,
+      leaseWallCeilingMs,
+      Math.round(runPolicy.singleStepWallClockMs ?? SINGLE_STEP_ASSIGNMENT_WALL_CLOCK_MS),
+    ),
+  )
+  // Integer ms/turn floors guarantee `wallClockMs / maxTurns` never decreases as `maxTurns` grows
+  // across single_step (8..18) -> multi_step (20..34) -> multi_hop_chain (20..34).
+  const singleStepMinRateMs = Math.floor(singleCap / SINGLE_STEP_ASSIGNMENT_MAX_TURNS)
+  const multiStepMinRateMs = Math.max(
+    Math.ceil(singleCap / SINGLE_STEP_ASSIGNMENT_MAX_TURNS),
+    Math.ceil(CHAIN_ASSIGNMENT_MIN_WALL_CLOCK_MS / MULTI_STEP_ASSIGNMENT_MIN_TURNS),
+  )
 
   if (budgetClass === 'multi_hop_chain') {
     const maxTurns = Math.max(20, Math.min(34, baseTurns))
-    const computedWall = typeof runPolicy.runDurationMs === 'number'
+    const proportionalWall = typeof runPolicy.runDurationMs === 'number'
       && Number.isFinite(runPolicy.runDurationMs)
       && runPolicy.runDurationMs > 0
       ? Math.min(
@@ -4047,6 +4069,11 @@ export function resolveAssignmentBudget(
           Math.max(MULTI_HOP_CHAIN_MIN_WALL_CLOCK_MS, Math.floor(runPolicy.runDurationMs * MULTI_HOP_CHAIN_WALL_CLOCK_SHARE)),
         )
       : MULTI_HOP_CHAIN_DEFAULT_WALL_CLOCK_MS
+    const computedWall = Math.min(
+      leaseWallCeilingMs,
+      MULTI_HOP_CHAIN_MAX_WALL_CLOCK_MS,
+      Math.max(proportionalWall, maxTurns * multiStepMinRateMs),
+    )
     const wallClockMs = overrideWall ?? computedWall
     return {
       kind: 'chain',
@@ -4065,7 +4092,11 @@ export function resolveAssignmentBudget(
     const maxTurns = citesUpstream
       ? Math.max(20, Math.min(34, baseTurns))
       : Math.max(MULTI_STEP_ASSIGNMENT_MIN_TURNS, Math.min(MULTI_STEP_ASSIGNMENT_MAX_TURNS, baseTurns))
-    const computedWall = Math.min(CHAIN_ASSIGNMENT_MAX_WALL_CLOCK_MS, Math.max(CHAIN_ASSIGNMENT_MIN_WALL_CLOCK_MS, baseWall))
+    const turnDerivedWall = Math.max(CHAIN_ASSIGNMENT_MIN_WALL_CLOCK_MS, maxTurns * multiStepMinRateMs)
+    const desiredWall = explicitBaseWall !== undefined
+      ? Math.max(turnDerivedWall, explicitBaseWall)
+      : turnDerivedWall
+    const computedWall = Math.min(leaseWallCeilingMs, CHAIN_ASSIGNMENT_MAX_WALL_CLOCK_MS, desiredWall)
     const wallClockMs = overrideWall ?? computedWall
     return {
       kind: 'chain',
@@ -4078,11 +4109,13 @@ export function resolveAssignmentBudget(
   }
 
   const maxTurns = Math.max(8, Math.min(SINGLE_STEP_ASSIGNMENT_MAX_TURNS, baseTurns))
-  const singleCap = Math.max(
-    30_000,
-    Math.min(SINGLE_STEP_ASSIGNMENT_WALL_CLOCK_MS, Math.round(runPolicy.singleStepWallClockMs ?? SINGLE_STEP_ASSIGNMENT_WALL_CLOCK_MS)),
-  )
-  const wallClockMs = overrideWall ?? Math.max(30_000, Math.min(singleCap, baseWall))
+  const turnDerivedSingleWall = maxTurns >= SINGLE_STEP_ASSIGNMENT_MAX_TURNS
+    ? singleCap
+    : maxTurns * singleStepMinRateMs
+  const computedSingleWall = explicitBaseWall !== undefined
+    ? Math.min(singleCap, explicitBaseWall, turnDerivedSingleWall)
+    : turnDerivedSingleWall
+  const wallClockMs = overrideWall ?? Math.min(leaseWallCeilingMs, computedSingleWall)
   return {
     kind: 'single_step',
     budgetClass,

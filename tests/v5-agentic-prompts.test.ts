@@ -17,8 +17,6 @@ import {
   AGENTIC_DET_LEAD_LIMIT,
   AGENTIC_MAX_MAX_TURNS,
   AGENTIC_MIN_MAX_TURNS,
-  AGENTIC_SPECIALIST_MAX_TURNS,
-  AGENTIC_SPECIALIST_WALL_CLOCK_MS,
   AGENTIC_UPGRADE_MAX_TURNS,
   SPECIALIST_PROFILES,
   buildAgenticPromptContext,
@@ -29,6 +27,11 @@ import {
   settlementNudgeTurnFor,
   workerInvestigationPrompt,
 } from '../src/server/agent-session.ts'
+import {
+  SINGLE_STEP_ASSIGNMENT_MAX_TURNS,
+  SINGLE_STEP_ASSIGNMENT_WALL_CLOCK_MS,
+  resolveAssignmentBudget,
+} from '../src/server/exec-dispatch.ts'
 
 const origin = 'https://app.example.invalid'
 
@@ -223,7 +226,7 @@ test('specialist prompt: contract, read-only confirmed block, hard-surface block
     },
     origins: [origin],
     capabilityTier: 2,
-    maxTurns: AGENTIC_SPECIALIST_MAX_TURNS,
+    maxTurns: 9,
     parentFacts: detLeadFacts,
     alreadyConfirmed: [{ method: 'GET', path: '/api/invoices/:id', param: 'id', cwe: 'CWE-639' }],
     unconfirmedHardSurface: [{ method: 'POST', path: '/api/refund', category: 'business-logic', reason: 'workflow step skip' }],
@@ -252,14 +255,14 @@ test('specialist prompt: contract, read-only confirmed block, hard-surface block
   assert.equal(parsed.agenticContext.detLeadSummary?.items[0]?.probeClass, 'authz_matrix', 'highest-signal lead first')
   assert.equal(parsed.agenticContext.detLeadSummary?.items[0]?.endpoint, '/api/high')
   assert.equal(parsed.agenticContext.evidenceBrief, '{"mission":"det_lead_upgrade"}')
-  assert.equal(parsed.settlementNudgeAtTurn, AGENTIC_SPECIALIST_MAX_TURNS - 2)
+  assert.equal(parsed.settlementNudgeAtTurn, 7)
 
   const guidance = parsed.agenticContext.microTaskGuidance
   assert.match(guidance.batching ?? '', /request_http_batch/)
   assert.match(guidance.batching ?? '', /4-8/)
   assert.match(guidance.parallelReadOnly ?? '', /parallel|together/)
   assert.match(guidance.assignmentTarget ?? '', /1-3 linked routes/)
-  assert.match(guidance.turnBudget ?? '', new RegExp(`^${AGENTIC_SPECIALIST_MAX_TURNS} turns \\(settlement starts at turn ${AGENTIC_SPECIALIST_MAX_TURNS - 2}\\)`))
+  assert.match(guidance.turnBudget ?? '', /^9 turns \(settlement starts at turn 7\)/)
   assert.match(guidance.settlement ?? '', /N-2/)
 })
 
@@ -341,7 +344,7 @@ test('confirmed refs are derived read-only from replay-verified parent facts', (
     },
     origins: [origin],
     capabilityTier: 2,
-    maxTurns: AGENTIC_SPECIALIST_MAX_TURNS,
+    maxTurns: 9,
     parentFacts: [{
       id: 'confirmed-1', kind: 'note', origin, summary: 'replay verified',
       data: { subkind: 'deterministic_engine_confirmed', endpoint: '/api/invoices/:id', method: 'GET', param: 'id' },
@@ -384,7 +387,7 @@ test('specialist prompt advertises only its matching playbooks, not the whole ca
     },
     origins: [origin],
     capabilityTier: 2,
-    maxTurns: AGENTIC_SPECIALIST_MAX_TURNS,
+    maxTurns: 9,
   })
   const parsed = parse<{ availableSkills: string[] }>(prompt)
   assert.deepEqual(parsed.availableSkills, [...new Set(profile.skills)])
@@ -396,16 +399,17 @@ test('specialist prompt advertises only its matching playbooks, not the whole ca
 // 4. Turn / wall budgets
 // ============================================================================
 
-test('agentic turn budgets and N-2 settlement nudge are exposed as constants', () => {
-  assert.ok(AGENTIC_SPECIALIST_MAX_TURNS >= 8 && AGENTIC_SPECIALIST_MAX_TURNS <= 10)
+test('agentic turn budgets and N-2 settlement nudge are derived from resolveAssignmentBudget', () => {
+  const single = resolveAssignmentBudget({ budgetClass: 'single_step' }, { baseMaxTurns: SINGLE_STEP_ASSIGNMENT_MAX_TURNS })
+  assert.equal(single.maxTurns, SINGLE_STEP_ASSIGNMENT_MAX_TURNS)
+  assert.equal(single.wallClockMs, SINGLE_STEP_ASSIGNMENT_WALL_CLOCK_MS)
   assert.ok(AGENTIC_UPGRADE_MAX_TURNS >= 6 && AGENTIC_UPGRADE_MAX_TURNS <= 8)
-  assert.ok(AGENTIC_SPECIALIST_WALL_CLOCK_MS >= 75_000 && AGENTIC_SPECIALIST_WALL_CLOCK_MS <= 90_000)
   assert.ok(AGENTIC_MIN_MAX_TURNS <= AGENTIC_UPGRADE_MAX_TURNS)
-  assert.ok(AGENTIC_MAX_MAX_TURNS >= AGENTIC_SPECIALIST_MAX_TURNS)
+  assert.ok(AGENTIC_MAX_MAX_TURNS >= 9)
   assert.equal(resolveAgenticTurnBudget('det_lead_upgrade'), AGENTIC_UPGRADE_MAX_TURNS)
   assert.equal(resolveAgenticTurnBudget('chain_step_2'), AGENTIC_UPGRADE_MAX_TURNS)
-  assert.equal(resolveAgenticTurnBudget('class_scan'), AGENTIC_SPECIALIST_MAX_TURNS)
-  assert.equal(settlementNudgeTurnFor(AGENTIC_SPECIALIST_MAX_TURNS), AGENTIC_SPECIALIST_MAX_TURNS - 2)
+  assert.equal(resolveAgenticTurnBudget('class_scan'), 9)
+  assert.equal(settlementNudgeTurnFor(9), 7)
   assert.equal(settlementNudgeTurnFor(10), 8)
   assert.equal(settlementNudgeTurnFor(6), 4)
   assert.equal(settlementNudgeTurnFor(1), 1)
