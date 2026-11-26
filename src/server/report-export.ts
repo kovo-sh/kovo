@@ -45,6 +45,7 @@ import { redact, redactHeaders, redactZdr } from './redact.ts'
 import type { NamedSecret } from './redact.ts'
 import { isReportSource, projectReportEvidence } from './report-evidence.ts'
 import { brokerExchanges, coverageEntries, endpoints, events, facts, findings as findingsTable, replaySpecs, reports, retestRuns } from './schema.ts'
+import { updateReportBody } from './store-reports.ts'
 import type { Store } from './store.ts'
 
 type Attachment = {
@@ -394,7 +395,7 @@ export function snapshotReportCoverageGaps(
     operationalCoverageGaps: snapshot,
     openProofGaps: snapshottedOpenProofGaps,
   }
-  storage.db.update(reports).set({ body: updatedBody }).where(eq(reports.id, report.id)).run()
+  updateReportBody(storage.db, report.id, updatedBody)
   return snapshot
 }
 

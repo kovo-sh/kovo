@@ -75,7 +75,6 @@
     "src/server/exec-dispatch.ts::planAssignmentBudget",
     "src/server/exec-dispatch.ts::planRoundRobinDispatch",
     "src/server/exec-dispatch.ts::resolveDeterministicSweepMode",
-    "src/server/exec-dispatch.ts::resolveProviderStallNoTokenMs",
     "src/server/exec-dispatch.ts::resolveWorkerWallClockMs",
     "src/server/exec-dispatch.ts::secretGenerationFingerprint",
     "src/server/exec-dispatch.ts::structuredCoverageRouteMethodKey",

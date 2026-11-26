@@ -324,7 +324,7 @@ describe('cq-2 #2: ledger append, cross-version/config comparison refusal & tabl
     const cmp = compareLedgerRows(rows[0]!, rows[1]!)
     assert.equal(cmp.confirmedDelta, 3)
     assert.ok(Math.abs((cmp.recallDelta ?? 0) - 3 / 22) < 1e-9)
-    assert.ok(Math.abs(cmp.costDeltaUsd - 0.2) < 1e-9)
+    assert.ok(cmp.costDeltaUsd !== null && Math.abs(cmp.costDeltaUsd - 0.2) < 1e-9)
 
     // Mismatched benchmarkVersion -> refuse
     const diffVersion = makeLedgerRow({ benchmarkVersion: 'c'.repeat(64) })

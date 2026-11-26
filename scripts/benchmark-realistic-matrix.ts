@@ -195,7 +195,7 @@ function readScorecard(file: string): Partial<CellResult> | null {
       decoys: normalized.decoys,
       unmatchedFp: normalized.unmatchedFalsePositives,
       misclassifiedCount: normalized.misclassifiedCount,
-      costUsd: normalized.costUsd,
+      costUsd: normalized.costUsd ?? 0,
       funnel: funnel && typeof funnel === 'object' ? funnel : undefined,
     }
   } catch { return null }

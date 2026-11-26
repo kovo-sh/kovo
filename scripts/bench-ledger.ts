@@ -701,8 +701,9 @@ export interface LedgerRow {
   decoyFalsePositives: number
   unmatchedFalsePositives: number
   validUnplantedCount?: number
-  costUsd: number
-  /** Record-only cost efficiency (`costUsd / confirmed` when `confirmed > 0`, else `null`). Never gated. */
+  /** Observed spend in USD (`0` for legitimate `--no-llm` rows; `null` when agentic cost telemetry is absent). */
+  costUsd: number | null
+  /** Record-only cost efficiency (`costUsd / confirmed` when `costUsd` is present and `confirmed > 0`, else `null`). Never gated. */
   costPerConfirmed?: number | null
   /** Record-only wasted provider spend (stalls, retries, aborts, truncated calls). Never gated. */
   wastedUsd?: number | null
@@ -721,11 +722,12 @@ export interface LedgerRow {
 }
 
 /**
- * Compute record-only `costPerConfirmed` (`costUsd / confirmed` when `confirmed > 0`, else `null`).
+ * Compute record-only `costPerConfirmed` (`costUsd / confirmed` when `costUsd` is finite non-negative
+ * and `confirmed > 0`, else `null`). Absent cost telemetry (`null`/`undefined`) returns `null`, never `0`.
  * Record-only — never used as a pass/fail gate.
  */
-export function computeCostPerConfirmed(costUsd: number, confirmed: number): number | null {
-  if (!Number.isFinite(costUsd) || costUsd < 0) return null
+export function computeCostPerConfirmed(costUsd: number | null | undefined, confirmed: number): number | null {
+  if (costUsd === null || costUsd === undefined || !Number.isFinite(costUsd) || costUsd < 0) return null
   if (!Number.isFinite(confirmed) || confirmed <= 0) return null
   return costUsd / confirmed
 }
@@ -1079,7 +1081,7 @@ export interface LedgerComparison {
   rawPrecisionDelta: number | null
   strictPrecisionDelta: number | null
   fpDelta: number
-  costDeltaUsd: number
+  costDeltaUsd: number | null
   /** Record-only delta of `costPerConfirmed` (`b - a`), or `null` if unavailable. Never gated. */
   costPerConfirmedDelta?: number | null
   /** Record-only delta of `wastedUsd` (`b - a`), or `null` if unavailable. Never gated. */
@@ -1139,7 +1141,7 @@ export function compareLedgerRows(a: LedgerRow, b: LedgerRow): LedgerComparison 
         ? b.strictPrecision - a.strictPrecision
         : null,
     fpDelta: bFp - aFp,
-    costDeltaUsd: b.costUsd - a.costUsd,
+    costDeltaUsd: a.costUsd !== null && b.costUsd !== null ? b.costUsd - a.costUsd : null,
     costPerConfirmedDelta: aCpc !== null && bCpc !== null ? bCpc - aCpc : null,
     wastedUsdDelta: aWaste !== null && bWaste !== null ? bWaste - aWaste : null,
   }
