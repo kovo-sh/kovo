@@ -30,6 +30,7 @@ export interface HydratableEntry {
   carrierText?: string
   hostSignature?: string
   evidenceRole?: string
+  raceBatchId?: string | null
   step: {
     arm: string
     method: string
@@ -69,6 +70,7 @@ export interface HydratableTranscriptIndex {
   entriesById: ReadonlyMap<string, HydratableEntry>
   oobById?: ReadonlyMap<string, HydratableOobEvent>
   tracesById?: ReadonlyMap<string, HydratableBrowserTrace>
+  personaRoleLabels?: Readonly<Record<string, string>>
 }
 
 export interface EconomicAutoHydrateContext {
@@ -76,6 +78,7 @@ export interface EconomicAutoHydrateContext {
   termHopExchangeIds: readonly string[]
   postChainReadbackExchangeIds: readonly string[]
   citedExchangeIds?: readonly string[]
+  personaRoleLabels?: Readonly<Record<string, string>>
 }
 
 const sha256Hex = (value: string): string => createHash('sha256').update(value, 'utf8').digest('hex')
@@ -716,42 +719,52 @@ function extractIssuedSigDigest(entry: HydratableEntry | undefined): string | un
 
 const ANON_HANDLE_RE = /^(?:anon(?:ymous)?|unauth(?:enticated)?|guest)$/i
 
-function deriveDualActorFromTranscript(
-  idx: HydratableTranscriptIndex,
-  citedEntries: readonly (HydratableEntry | undefined)[],
-  rawActor: unknown,
-): { actorId: string; rolesByTenant: Record<string, RoleName> } | undefined {
-  const rawId = rawActor && typeof rawActor === 'object' && !Array.isArray(rawActor)
-    ? pickStr(rawActor as Record<string, unknown>, 'actorId', 128)
-    : undefined
-  const citedActors = citedEntries
-    .map(e => (e ? actorOfEntry(e)?.trim() ?? '' : ''))
-    .filter(a => Boolean(a) && !ANON_HANDLE_RE.test(a) && !a.startsWith('cap:'))
-  if (citedActors.length === 0) return undefined
-  let actorId: string | undefined
-  if (rawId) {
-    actorId = citedActors.find(a => a.toLowerCase() === rawId.toLowerCase())
-    if (!actorId) return undefined
-  } else {
-    actorId = citedActors[0]
+function extractRequestedActorId(rawInput: Record<string, unknown>): string | undefined {
+  for (const key of ['actor', 'actorIdentity', 'actorUserId', 'actorPersona', 'actorId', 'persona'] as const) {
+    const val = rawInput[key]
+    if (typeof val === 'string' && val.trim() && val.trim().length <= 128) return val.trim()
+    if (val && typeof val === 'object' && !Array.isArray(val)) {
+      const obj = val as Record<string, unknown>
+      for (const sub of ['actorId', 'persona', 'userId', 'actorUserId', 'handle', 'id'] as const) { const hit = pickStr(obj, sub, 128); if (hit) return hit }
+    }
   }
+  return undefined
+}
+
+function deriveDualActorFromTranscript(
+  idx: HydratableTranscriptIndex, citedEntries: readonly (HydratableEntry | undefined)[],
+  rawInput: Record<string, unknown>, econCtx?: EconomicAutoHydrateContext,
+): { actorId: string; rolesByTenant: Record<string, RoleName> } | undefined {
+  const rawId = extractRequestedActorId(rawInput), capIdx = buildCapOriginIndex(idx.entriesById.values(), ANON_HANDLE_RE)
+  const resolveEntryActor = (e: HydratableEntry | undefined): string => {
+    const a = e ? actorOfEntry(e)?.trim() ?? '' : ''
+    if (!a || ANON_HANDLE_RE.test(a)) return ''
+    return a.startsWith('cap:') ? (capIdx.emitterActorOf(a)?.actor?.trim() ?? capIdx.actorOf(a)?.trim() ?? '') : a
+  }
+  let citedActors = citedEntries.map(resolveEntryActor).filter(Boolean)
+  if (citedActors.length === 0 && econCtx) {
+    citedActors = [...econCtx.termHopExchangeIds, ...(econCtx.citedExchangeIds ?? []), ...econCtx.preChainControlExchangeIds]
+      .map(id => resolveEntryActor(idx.entriesById.get(id))).filter(Boolean)
+  }
+  const actorId = citedActors.length === 0 ? undefined : (rawId ? citedActors.find(a => a.toLowerCase() === rawId.toLowerCase()) : citedActors[0])
   if (!actorId) return undefined
-  const rolesByTenant: Record<string, RoleName> = {}
+  const rolesByTenant: Record<string, RoleName> = {}, actorLower = actorId.toLowerCase()
   const recordRole = (tenant: string | null | undefined, role: RoleName | null | undefined) => {
     const t = tenant?.trim().toLowerCase()
     if (!t || !role || FORBIDDEN_KEYS.has(t)) return
-    const prev = rolesByTenant[t]
-    if (!prev || ROLE_RANK[role] > ROLE_RANK[prev]) rolesByTenant[t] = role
+    const prev = rolesByTenant[t]; if (!prev || ROLE_RANK[role] > ROLE_RANK[prev]) rolesByTenant[t] = role
   }
-  const actorLower = actorId.toLowerCase()
+  const recordLabel = (label: string | null | undefined) => {
+    if (!label) return
+    for (const m of parseRoleMemberships(label)) recordRole(m.tenant, m.role)
+    const pl = parseRoleLabel(label); recordRole(pl.tenant, pl.role)
+  }
+  for (const reg of [idx.personaRoleLabels, econCtx?.personaRoleLabels]) {
+    if (reg) for (const [k, label] of Object.entries(reg)) if (k.trim().toLowerCase() === actorLower) recordLabel(label)
+  }
   for (const e of idx.entriesById.values()) {
-    const ea = actorOfEntry(e)?.trim().toLowerCase() ?? ''
-    if (ea !== actorLower) continue
-    if (e.actorRoleLabel) {
-      for (const m of parseRoleMemberships(e.actorRoleLabel)) recordRole(m.tenant, m.role)
-      const pl = parseRoleLabel(e.actorRoleLabel)
-      recordRole(pl.tenant, pl.role)
-    }
+    if (resolveEntryActor(e).toLowerCase() !== actorLower) continue
+    recordLabel(e.actorRoleLabel)
     recordRole(e.step.actor.tenant ?? parseRoleLabel(e.actorPersona ?? '').tenant, normalizeRole(roleOfEntry(e) ?? undefined))
   }
   return { actorId, rolesByTenant }
@@ -862,7 +875,7 @@ export function hydrateV8OracleInput(
       citedEntry('baselineDeniedControl'), citedEntry('primeAction'), citedEntry('bledAccess'),
       citedEntry('singleForeignControlDenied'), citedEntry('batchRequest'), citedEntry('postMutationReadback'),
     ]
-    const actor = deriveDualActorFromTranscript(idx, cited, rawInput.actor)
+    const actor = deriveDualActorFromTranscript(idx, cited, rawInput, econCtx)
     if (actor) out.actor = actor
     // Allowlist ONLY record selector IDs (with minimum length); tenant scope and role requirements are host-derived.
     for (const k of ['entityId', 'ownRecordId', 'foreignRecordId'] as const) {
@@ -1166,9 +1179,14 @@ export function hydrateV8OracleInput(
     )
     if (econCtx) {
       if (!hasExplicitActions) {
-        const actEntries = econCtx.termHopExchangeIds
-          .map(id => idx.entriesById.get(id))
-          .filter((e): e is HydratableEntry => Boolean(e && e.step.arm === 'probe' && !stepReadsState(e.step) && is2xx(e.step.status) && isPosTs(e.timestampMs)))
+        const isMutProbe = (e: HydratableEntry | undefined): e is HydratableEntry =>
+          Boolean(e && e.step.arm === 'probe' && !stepReadsState(e.step) && is2xx(e.step.status) && isPosTs(e.timestampMs))
+        let actEntries = econCtx.termHopExchangeIds.map(id => idx.entriesById.get(id)).filter(isMutProbe)
+        if (actEntries.length === 0 && econCtx.citedExchangeIds?.length) {
+          const allMut = econCtx.citedExchangeIds.map(id => idx.entriesById.get(id)).filter(isMutProbe)
+          const raceBatched = allMut.filter(e => Boolean(e.raceBatchId?.trim()))
+          actEntries = raceBatched.length > 0 ? raceBatched : allMut
+        }
         if (actEntries.length > 0) out.actions = actEntries.map(e => toOracleRecord(e, fallbackSig))
       }
       const validActs = Array.isArray(out.actions)
@@ -1179,25 +1197,16 @@ export function hydrateV8OracleInput(
       const maxActTs = validActs.length > 0 ? Math.max(...validActs.map(a => a.timestampMs)) : null
 
       if (!explicit.has('baselineReadback')) {
-        const base = econCtx.preChainControlExchangeIds
-          .map(id => idx.entriesById.get(id))
-          .find((e): e is HydratableEntry => {
-            if (!e || actionIdSet.has(e.exchangeId) || !is2xx(e.step.status) || !isPosTs(e.timestampMs)) return false
-            if (minActTs !== null && e.timestampMs > minActTs) return false
-            return stepReadsState(e.step)
-          })
+        const isBase = (e: HydratableEntry | undefined): e is HydratableEntry =>
+          Boolean(e && !actionIdSet.has(e.exchangeId) && is2xx(e.step.status) && isPosTs(e.timestampMs) && (minActTs === null || e.timestampMs <= minActTs) && stepReadsState(e.step))
+        const base = [...econCtx.preChainControlExchangeIds, ...(econCtx.citedExchangeIds ?? [])].map(id => idx.entriesById.get(id)).find(isBase)
         if (base) out.baselineReadback = toOracleRecord(base, fallbackSig)
       }
       if (!explicit.has('finalReadback')) {
         const baseId = out.baselineReadback && typeof out.baselineReadback === 'object' ? (out.baselineReadback as HostSignedRecord).id : null
-        const fin = econCtx.postChainReadbackExchangeIds
-          .map(id => idx.entriesById.get(id))
-          .find((e): e is HydratableEntry => {
-            if (!e || actionIdSet.has(e.exchangeId) || (baseId && e.exchangeId === baseId)) return false
-            if (!is2xx(e.step.status) || !isPosTs(e.timestampMs)) return false
-            if (maxActTs !== null && e.timestampMs < maxActTs) return false
-            return stepReadsState(e.step) && hasEntryBody(e) && !isJobOrHandleStub(e.step.json, e.step.body, e.step.status, e.step.method, e.step.route ?? e.step.pathAndQuery)
-          })
+        const isFin = (e: HydratableEntry | undefined): e is HydratableEntry =>
+          Boolean(e && !actionIdSet.has(e.exchangeId) && (!baseId || e.exchangeId !== baseId) && is2xx(e.step.status) && isPosTs(e.timestampMs) && (maxActTs === null || e.timestampMs >= maxActTs) && stepReadsState(e.step) && hasEntryBody(e) && !isJobOrHandleStub(e.step.json, e.step.body, e.step.status, e.step.method, e.step.route ?? e.step.pathAndQuery))
+        const fin = [...econCtx.postChainReadbackExchangeIds, ...[...econCtx.termHopExchangeIds].reverse()].map(id => idx.entriesById.get(id)).find(isFin)
         if (fin) out.finalReadback = toOracleRecord(fin, fallbackSig)
       }
     }

@@ -5,18 +5,84 @@
  * edges from the host-authoritative `HostFactLog` without weakening any downstream
  * `composite-receipt.ts` validation (chronology, provenance, replay mode, terminal impact).
  */
+import { createHash } from 'node:crypto'
 import type { CausalEdgeBinding, CompositeProofReceipt } from './composite-receipt.ts'
-import type { HostFactLog } from './host-fact-log.ts'
+import type { HostExchangeFact, HostFactLog } from './host-fact-log.ts'
 
 const CAP_HANDLE_RE = /^cap:[A-Za-z0-9._:-]{1,180}$/
 const SHA256_RE = /^[0-9a-f]{64}$/
 const MAX_COMPOSITE_EDGES = 28
+const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}(?:[T\s]\d{2}:\d{2}|$)/
+const SKIP_HDR_NAMES = new Set(['date', 'server', 'content-type', 'content-length', 'cache-control', 'vary', 'connection', 'keep-alive', 'accept', 'accept-encoding', 'accept-language', 'user-agent', 'host', 'origin', 'referer', 'pragma', 'expires', 'transfer-encoding', 'strict-transport-security', 'content-security-policy', 'x-powered-by', 'x-frame-options', 'x-content-type-options', 'access-control-allow-origin', 'access-control-allow-methods', 'access-control-allow-headers', 'access-control-allow-credentials'])
+const sha256Hex = (v: string): string => createHash('sha256').update(v, 'utf8').digest('hex')
 
 const isFiniteTs = (ts: unknown): ts is number =>
   typeof ts === 'number' && Number.isFinite(ts) && ts >= 0
 
 const isExecArm = (arm: string | undefined, isTerm: boolean): boolean =>
   arm === 'probe' || (!isTerm && arm === 'setup')
+
+function isHighEntropyBindingToken(raw: string): boolean {
+  const t = raw.trim()
+  if (t.length < 8 || t.length > 2048 || /\s/.test(t) || /\[redacted/i.test(t) || ISO_DATE_RE.test(t)) return false
+  if (t.startsWith('/') || /^https?:\/\//i.test(t)) {
+    const pathPart = (t.startsWith('/') ? t : t.replace(/^https?:\/\/[^/]*/i, '')).split(/[?#]/, 1)[0] ?? ''
+    if (!t.includes('?') && !pathPart.split('/').filter(Boolean).some(isDynamicResourceIdSegment)) return false
+  }
+  const counts = new Map<string, number>()
+  for (const ch of t) counts.set(ch, (counts.get(ch) ?? 0) + 1)
+  let h = 0
+  for (const c of counts.values()) { const p = c / t.length; h -= p * Math.log2(p) }
+  return (/\d/.test(t) && /[a-z]/i.test(t) && counts.size >= 4 && h >= 2.0) || (t.length >= 16 && counts.size >= 8 && h >= 3.0)
+}
+
+function collectJsonTokens(raw: string | null | undefined, out: Set<string>): void {
+  if (!raw?.trim()) return
+  let parsed: unknown
+  try { parsed = JSON.parse(raw) } catch { return }
+  const walk = (v: unknown, d: number): void => {
+    if (d > 5 || out.size > 256 || v == null) return
+    if (typeof v === 'string') { const t = v.trim(); if (t.length >= 8 && t.length <= 2048) out.add(t) }
+    else if (typeof v === 'object') for (const x of Array.isArray(v) ? v : Object.values(v as Record<string, unknown>)) walk(x, d + 1)
+  }
+  walk(parsed, 0)
+}
+
+function collectHdrTokens(headers: Readonly<Record<string, string>> | null | undefined, out: Set<string>): void {
+  for (const [k, raw] of Object.entries(headers ?? {})) {
+    if (SKIP_HDR_NAMES.has(k.toLowerCase())) continue
+    const t = raw.trim(); if (!t) continue; out.add(t)
+    const m = /^(?:Bearer|Basic|Token|ApiKey)\s+(.+)$/i.exec(t); if (m?.[1]) out.add(m[1].trim())
+    if (t.includes('=')) for (const p of t.split(';')) { const eq = p.indexOf('='); if (eq > 0 && p.slice(eq + 1).trim()) out.add(p.slice(eq + 1).trim()) }
+  }
+}
+
+function collectFactDigests(fact: Readonly<HostExchangeFact>, side: 'response' | 'request'): Set<string> {
+  const digests = new Set<string>(), tokens = new Set<string>(), exclude = new Set<string>()
+  for (const s of [fact.actor, fact.actorTenant, fact.origin]) if (s?.trim()) exclude.add(s.trim().toLowerCase())
+  const collectReqToks = (target: Set<string>): void => {
+    collectJsonTokens(fact.rawRequestBody, target); collectHdrTokens(fact.requestHeaders, target)
+    const pq = fact.pathAndQuery ?? '', q = pq.indexOf('?')
+    if (pq) { target.add(pq); if (fact.origin) target.add(`${fact.origin.trim().replace(/\/+$/, '')}${pq}`) }
+    for (const seg of (q >= 0 ? pq.slice(0, q) : pq).split('/')) if (seg) { target.add(seg); try { const d = decodeURIComponent(seg); if (d !== seg) target.add(d) } catch {} }
+    if (q >= 0) for (const v of new URLSearchParams(pq.slice(q + 1)).values()) if (v) target.add(v)
+  }
+  if (side === 'response') {
+    for (const d of [...(fact.observedResponseDigests ?? []), ...(fact.secretMatches ?? [])]) {
+      const ld = d.toLowerCase(); if (SHA256_RE.test(ld)) digests.add(ld)
+    }
+    if (fact.status != null && fact.status >= 200 && fact.status < 400) {
+      const ownReq = new Set<string>(); collectReqToks(ownReq)
+      collectJsonTokens(fact.rawResponseBody, tokens); collectHdrTokens(fact.responseHeaders, tokens)
+      for (const tok of tokens) if (!ownReq.has(tok) && !exclude.has(tok.toLowerCase()) && isHighEntropyBindingToken(tok)) digests.add(sha256Hex(tok))
+    }
+  } else {
+    for (const d of fact.injectedRequestDigests ?? []) { const ld = d.toLowerCase(); if (SHA256_RE.test(ld)) digests.add(ld) }
+    collectReqToks(tokens)
+    for (const tok of tokens) if (!exclude.has(tok.toLowerCase()) && isHighEntropyBindingToken(tok)) digests.add(sha256Hex(tok))
+  }
+  return digests
+}
 
 interface CanonicalCapEmission {
   hopId: string
@@ -28,16 +94,11 @@ interface CanonicalCapEmission {
 
 function canReach(adj: ReadonlyMap<string, readonly string[]>, start: string, goal: string): boolean {
   if (start === goal) return true
-  const visited = new Set<string>([start])
-  const queue = [start]
+  const visited = new Set<string>([start]), queue = [start]
   while (queue.length > 0) {
-    const cur = queue.shift()!
-    for (const next of adj.get(cur) ?? []) {
+    for (const next of adj.get(queue.shift()!) ?? []) {
       if (next === goal) return true
-      if (!visited.has(next)) {
-        visited.add(next)
-        queue.push(next)
-      }
+      if (!visited.has(next)) { visited.add(next); queue.push(next) }
     }
   }
   return false
@@ -104,14 +165,19 @@ export function augmentCompositeReceiptWithAutoDag(
   const ownerHopByOob = new Map<string, string>()
   const ownerHopByTrace = new Map<string, string>()
   const emissionsByCap = new Map<string, CanonicalCapEmission[]>()
+  const emissionsByDigest = new Map<string, CanonicalCapEmission[]>()
 
   const recordEmission = (cap: string, em: CanonicalCapEmission): void => {
     if (!CAP_HANDLE_RE.test(cap)) return
     let list = emissionsByCap.get(cap)
-    if (!list) {
-      list = []
-      emissionsByCap.set(cap, list)
-    }
+    if (!list) { list = []; emissionsByCap.set(cap, list) }
+    list.push(em)
+  }
+  const recordDigestEmission = (dig: string, em: CanonicalCapEmission): void => {
+    const ld = dig.toLowerCase()
+    if (!SHA256_RE.test(ld)) return
+    let list = emissionsByDigest.get(ld)
+    if (!list) { list = []; emissionsByDigest.set(ld, list) }
     list.push(em)
   }
 
@@ -122,69 +188,39 @@ export function augmentCompositeReceiptWithAutoDag(
       ownerHopByEx.set(exId, hop.hopId)
       const flow = factLog.getExchangeCapabilityFlow(exId)
       if (!flow || !isExecArm(flow.arm, isTerm) || !isFiniteTs(flow.timestampMs)) continue
-      for (const cap of flow.emitted) {
-        recordEmission(cap, {
-          hopId: hop.hopId,
-          sourceId: exId,
-          isExchange: true,
-          timestampMs: flow.timestampMs,
-          seq: flow.seq,
-        })
-      }
+      const emBase: CanonicalCapEmission = { hopId: hop.hopId, sourceId: exId, isExchange: true, timestampMs: flow.timestampMs, seq: flow.seq }
+      for (const cap of flow.emitted) recordEmission(cap, emBase)
+      const fact = factLog.getExchange(exId)
+      if (fact) for (const dig of collectFactDigests(fact, 'response')) recordDigestEmission(dig, emBase)
     }
     for (const oobId of hop.oobEventIds) {
       if (ownerHopByOob.has(oobId)) continue
       ownerHopByOob.set(oobId, hop.hopId)
       const oob = factLog.getOobEvent(oobId)
       if (!oob?.delivered || !isFiniteTs(oob.receivedAtMs)) continue
-      for (const cap of oob.emittedCapabilities ?? []) {
-        recordEmission(cap, {
-          hopId: hop.hopId,
-          sourceId: oobId,
-          isExchange: false,
-          timestampMs: oob.receivedAtMs,
-          seq: -1,
-        })
-      }
+      const emBase: CanonicalCapEmission = { hopId: hop.hopId, sourceId: oobId, isExchange: false, timestampMs: oob.receivedAtMs, seq: -1 }
+      for (const cap of oob.emittedCapabilities ?? []) recordEmission(cap, emBase)
+      for (const dig of oob.observedValueDigests ?? []) recordDigestEmission(dig, emBase)
+      if (oob.token && isHighEntropyBindingToken(oob.token)) recordDigestEmission(sha256Hex(oob.token), emBase)
     }
     for (const trId of hop.browserTraceIds) {
       if (ownerHopByTrace.has(trId)) continue
       ownerHopByTrace.set(trId, hop.hopId)
       const tr = factLog.getBrowserTrace(trId)
       if (!tr || !isFiniteTs(tr.timestampMs)) continue
-      for (const cap of tr.emittedCapabilities ?? []) {
-        recordEmission(cap, {
-          hopId: hop.hopId,
-          sourceId: trId,
-          isExchange: false,
-          timestampMs: tr.timestampMs,
-          seq: -1,
-        })
-      }
+      const emBase: CanonicalCapEmission = { hopId: hop.hopId, sourceId: trId, isExchange: false, timestampMs: tr.timestampMs, seq: -1 }
+      for (const cap of tr.emittedCapabilities ?? []) recordEmission(cap, emBase)
+      for (const dig of tr.observedValueDigests ?? []) recordDigestEmission(dig, emBase)
     }
   }
 
-  const pickEmitter = (
-    cap: string,
-    toHopId: string,
-    targetTs: number,
-    targetSeq: number,
-    maxEmitTs = targetTs,
-  ): CanonicalCapEmission | undefined => {
+  const pickEmitter = (cap: string, toHopId: string, targetTs: number, targetSeq: number, maxEmitTs = targetTs): CanonicalCapEmission | undefined => {
     const list = emissionsByCap.get(cap)
     if (!list?.length) return undefined
     const preferredHop = explicitProducerByCap.get(cap)
-    const eligible = list.filter(em =>
-      em.hopId !== toHopId
-      && em.timestampMs <= maxEmitTs
-      && (em.timestampMs < targetTs || (em.timestampMs === targetTs && em.seq < targetSeq)),
-    )
+    const eligible = list.filter(em => em.hopId !== toHopId && em.timestampMs <= maxEmitTs && (em.timestampMs < targetTs || (em.timestampMs === targetTs && em.seq < targetSeq)))
     if (eligible.length === 0) return undefined
-    if (preferredHop) {
-      const pref = eligible.find(em => em.hopId === preferredHop)
-      if (pref) return pref
-    }
-    return eligible[0]
+    return (preferredHop ? eligible.find(em => em.hopId === preferredHop) : undefined) ?? eligible[0]
   }
 
   const inferredEdges: CausalEdgeBinding[] = []
@@ -245,6 +281,32 @@ export function augmentCompositeReceiptWithAutoDag(
         }
         if (tryAppendEdge(edge)) {
           markBound(boundValueCapsByHop, hopB.hopId, cap)
+        }
+      }
+    }
+  }
+
+  // 3. Host-signed observedValueDigests -> chronological `value_binding` fallback when cap edges are missing
+  if (emissionsByDigest.size > 0) {
+    for (const hopB of receipt.hops) {
+      const isTermB = hopB.hopId === termHopId
+      for (const exId of hopB.exchangeIds) {
+        if (ownerHopByEx.get(exId) !== hopB.hopId) continue
+        const flow = factLog.getExchangeCapabilityFlow(exId), fact = factLog.getExchange(exId)
+        if (!flow || !fact || !isExecArm(flow.arm, isTermB) || !isFiniteTs(flow.timestampMs)) continue
+        for (const dig of collectFactDigests(fact, 'request')) {
+          const list = emissionsByDigest.get(dig)
+          if (!list?.length) continue
+          const eligible = list.filter(em =>
+            em.hopId !== hopB.hopId
+            && (em.timestampMs < flow.timestampMs! || (em.timestampMs === flow.timestampMs! && em.seq < flow.seq)),
+          )
+          const em = eligible.length > 0 ? eligible[eligible.length - 1] : undefined
+          if (!em || canReach(outAdj, em.hopId, hopB.hopId)) continue
+          tryAppendEdge({
+            kind: 'value_binding', fromHopId: em.hopId, toHopId: hopB.hopId, valueDigest: dig,
+            ...(em.isExchange ? { sourceExchangeId: em.sourceId } : {}), targetExchangeId: exId,
+          })
         }
       }
     }
