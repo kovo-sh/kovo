@@ -178,12 +178,43 @@ export interface CallGraphEdge {
   line: number
 }
 
+export interface SemanticAuditWarning {
+  stage:
+    | 'stage1_context'
+    | 'stage1_spec_llm'
+    | 'stage1_dynamic_rules'
+    | 'stage2_call_graph'
+    | 'stage3_git_miner'
+    | 'variant_sweep'
+    | 'pipeline'
+  repo?: string
+  analyzer?: string
+  message: string
+}
+
+const MAX_SEMANTIC_AUDIT_WARNINGS = 64
+
+function formatAuditError(err: unknown, secrets: readonly NamedSecret[] = []): string {
+  const raw = err instanceof Error ? err.message : String(err ?? 'unknown error')
+  return redact(raw.replace(/\s+/g, ' ').trim().slice(0, 240), secrets) || 'unknown error'
+}
+
+function pushAuditWarning(
+  warnings: SemanticAuditWarning[],
+  warning: SemanticAuditWarning,
+): void {
+  if (warnings.length >= MAX_SEMANTIC_AUDIT_WARNINGS) return
+  warnings.push(warning)
+}
+
 export interface CallGraphIndex {
   repo: string
   filesScanned: number
   nodes: CallGraphNode[]
   edges: CallGraphEdge[]
   analyzerSource: 'worker_analyzer' | 'offline_script_fallback'
+  /** Structured analyzer degradation warnings (replaces silent catch swallowing). */
+  warnings?: SemanticAuditWarning[]
 }
 
 export interface SinkBackwardPath {
@@ -302,6 +333,7 @@ export interface GitHistoryMiningResult {
   commitsScanned: number
   securityCommits: GitSecurityCommitSignal[]
   suspects: SemanticAuditSuspect[]
+  warnings?: SemanticAuditWarning[]
 }
 
 export interface VariantSweepQuery {
@@ -319,6 +351,7 @@ export interface VariantSweepResult {
   rejectedQueries: Array<{ id: string; reason: string }>
   rawMatches: SastFinding[]
   newSuspects: SemanticAuditSuspect[]
+  warnings?: SemanticAuditWarning[]
   durationMs: number
 }
 
@@ -371,6 +404,8 @@ export interface SemanticAuditPipelineResult {
   rankedSuspects: SemanticAuditSuspect[]
   persistedFactIds: string[]
   persistedEndpointIds: string[]
+  /** Structured warnings emitted when any stage/analyzer degraded instead of failing silently. */
+  warnings?: SemanticAuditWarning[]
   durationMs: number
 }
 
@@ -592,6 +627,7 @@ export interface RepoContextSummary {
   ormLibraries: string[]
   authLibraries: string[]
   snippets: Array<{ file: string; excerpt: string }>
+  warnings?: SemanticAuditWarning[]
 }
 
 export function createReasoningLlmCall(
@@ -756,8 +792,22 @@ process.stdout.write(JSON.stringify({ filesScanned: files.length, languages: [..
       ...detectRepoStackFromSnippets(snippets),
       snippets,
     }
-  } catch {
-    return { repo: cleanRepo, filesScanned: 0, languages: ['typescript'], frameworks: [], ormLibraries: [], authLibraries: [], snippets: [] }
+  } catch (err) {
+    return {
+      repo: cleanRepo,
+      filesScanned: 0,
+      languages: ['typescript'],
+      frameworks: [],
+      ormLibraries: [],
+      authLibraries: [],
+      snippets: [],
+      warnings: [{
+        stage: 'stage1_context',
+        repo: cleanRepo,
+        analyzer: 'collectRepoContextForSpec',
+        message: `Worker context scan failed: ${formatAuditError(err)}`,
+      }],
+    }
   }
 }
 
@@ -883,8 +933,10 @@ export async function extractProjectSecuritySpecAndRules(
   spec: ProjectSecuritySpec
   rules: ValidatedDynamicRule[]
   rejectedRules: Array<{ ruleId: string; reason: string }>
+  warnings?: SemanticAuditWarning[]
 }> {
   const context = await collectRepoContextForSpec(session, repo, ctx.signal, options.staticSnapshot ?? ctx.staticSnapshot)
+  const warnings: SemanticAuditWarning[] = [...(context.warnings ?? [])]
   const deterministic = inferProjectSecuritySpecDeterministic(context.repo, context)
   let spec = deterministic.spec
   const rawRuleCandidates: unknown[] = [...deterministic.candidateRules]
@@ -929,8 +981,14 @@ export async function extractProjectSecuritySpecAndRules(
       if (Array.isArray(parsedJson.dynamicRules)) {
         rawRuleCandidates.push(...parsedJson.dynamicRules)
       }
-    } catch {
-      // Deterministic baseline remains active on LLM failure/malformed JSON
+    } catch (err) {
+      // Deterministic baseline remains active on LLM failure/malformed JSON; record structured diagnostic.
+      pushAuditWarning(warnings, {
+        stage: 'stage1_spec_llm',
+        repo: context.repo,
+        analyzer: 'spec_llm',
+        message: `Stage-1 LLM spec/rule synthesis degraded to deterministic baseline: ${formatAuditError(err, ctx.secrets)}`,
+      })
     }
   }
 
@@ -952,7 +1010,7 @@ export async function extractProjectSecuritySpecAndRules(
     rules.push(res.value)
   }
 
-  return { spec, rules, rejectedRules }
+  return { spec, rules, rejectedRules, ...(warnings.length > 0 ? { warnings } : {}) }
 }
 
 export async function runValidatedDynamicRulesInWorker(
@@ -961,6 +1019,7 @@ export async function runValidatedDynamicRulesInWorker(
   rules: readonly ValidatedDynamicRule[],
   signal: AbortSignal,
   secrets: readonly NamedSecret[] = [],
+  warningsOut?: SemanticAuditWarning[],
 ): Promise<SastFinding[]> {
   if (rules.length === 0) return []
   const cleanRepo = normalizeRepoIdentifier(repo)
@@ -982,6 +1041,7 @@ const repoRoot = path.resolve('/repos', ${JSON.stringify(cleanRepo)});
 const rules = ${JSON.stringify(items)};
 const isOg = ${JSON.stringify(isOg)};
 const findings = [];
+const errors = [];
 const tmpFiles = [];
 try {
   if (isOg) { fs.mkdirSync('/tmp/.config', { recursive: true }); fs.mkdirSync('/tmp/.cache', { recursive: true }); }
@@ -1023,12 +1083,14 @@ try {
           });
         }
       }
-    } catch {}
+    } catch (err) {
+      if (errors.length < 16) errors.push({ ruleId: rule.id, message: String(err?.message || err || 'rule execution failed').slice(0, 200) });
+    }
   }
 } finally {
   for (const f of tmpFiles) { try { fs.unlinkSync(f); } catch {} }
 }
-process.stdout.write(JSON.stringify(findings));
+process.stdout.write(JSON.stringify({ findings, errors }));
 `
   }
 
@@ -1037,13 +1099,32 @@ process.stdout.write(JSON.stringify(findings));
     try {
       // Reuse the warm session; each engine runs independently (never short-circuited by grep).
       const res = await session.runScript({ runtime: 'node', code: buildScript(engine, engineRules), timeoutMs: 60_000 }, signal)
-      const raw = JSON.parse(res.stdout || '[]') as SastFinding[]
-      return (Array.isArray(raw) ? raw : []).map(f => ({
+      const parsed = JSON.parse(res.stdout || '[]') as SastFinding[] | { findings?: SastFinding[]; errors?: Array<{ ruleId?: string; message?: string }> }
+      const raw = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.findings) ? parsed.findings : [])
+      if (!Array.isArray(parsed) && Array.isArray(parsed?.errors) && warningsOut) {
+        for (const e of parsed.errors) {
+          pushAuditWarning(warningsOut, {
+            stage: 'stage1_dynamic_rules',
+            repo: cleanRepo,
+            analyzer: engine,
+            message: `Rule ${e.ruleId ?? 'unknown'} failed: ${formatAuditError(e.message, secrets)}`,
+          })
+        }
+      }
+      return raw.map(f => ({
         ...f,
         message: redact(f.message, secrets),
         maskedPreview: redact(f.maskedPreview, secrets),
       }))
-    } catch {
+    } catch (err) {
+      if (warningsOut) {
+        pushAuditWarning(warningsOut, {
+          stage: 'stage1_dynamic_rules',
+          repo: cleanRepo,
+          analyzer: engine,
+          message: `${engine} worker execution failed: ${formatAuditError(err, secrets)}`,
+        })
+      }
       return []
     }
   }
@@ -1289,11 +1370,19 @@ export async function buildRepoCallGraph(
 
   // Never silently bypass AST/worker call-graph analyzers when a worker session provides them.
   let workerGraph: CallGraphIndex | undefined
+  const warnings: SemanticAuditWarning[] = []
   if (session && typeof session.callGraph === 'function') {
     try {
       const res: CallGraphResult = await session.callGraph(req, signal)
       workerGraph = { repo: cleanRepo, filesScanned: res.filesScanned, nodes: res.nodes as CallGraphNode[], edges: res.edges, analyzerSource: 'worker_analyzer' }
-    } catch { /* fall through to analyze / ProgramGraph */ }
+    } catch (err) {
+      pushAuditWarning(warnings, {
+        stage: 'stage2_call_graph',
+        repo: cleanRepo,
+        analyzer: 'session.callGraph',
+        message: `Worker callGraph analyzer failed; falling back: ${formatAuditError(err)}`,
+      })
+    }
   }
   if (!workerGraph && session && typeof session.analyze === 'function') {
     try {
@@ -1307,11 +1396,22 @@ export async function buildRepoCallGraph(
           analyzerSource: 'worker_analyzer',
         }
       }
-    } catch { /* fall through to ProgramGraph */ }
+    } catch (err) {
+      pushAuditWarning(warnings, {
+        stage: 'stage2_call_graph',
+        repo: cleanRepo,
+        analyzer: 'session.analyze',
+        message: `Worker analyze('call-graph') failed; falling back to ProgramGraph: ${formatAuditError(err)}`,
+      })
+    }
   }
 
-  return combineCallGraphs(workerGraph, programCallGraph)
+  const combined = combineCallGraphs(workerGraph, programCallGraph)
     ?? { repo: cleanRepo, filesScanned: 0, nodes: [], edges: [], analyzerSource: 'offline_script_fallback' }
+  if (warnings.length > 0) {
+    return { ...combined, warnings: [...(combined.warnings ?? []), ...warnings] }
+  }
+  return combined
 }
 
 export function analyzeSinkBackwardPaths(
@@ -1542,10 +1642,14 @@ function programNodeToCallGraphNode(
       sanitizers = qual.sanitizers
     }
   }
+  const mappedKind: CallGraphNode['kind'] =
+    node.kind === 'service_endpoint' || node.kind === 'async_channel'
+      ? 'function'
+      : node.kind
   return {
     ...base,
     symbol: node.symbol,
-    kind: node.kind,
+    kind: mappedKind,
     ...(node.httpMethod ? { httpMethod: node.httpMethod } : {}),
     ...(node.routePath ? { routePath: node.routePath } : {}),
     ...(sinkKind ? { sinkKind } : {}),
@@ -1594,12 +1698,14 @@ export function combineCallGraphs(primary: CallGraphIndex | undefined, supplemen
   for (const node of [...supplement.nodes, ...primary.nodes]) nodes.set(node.id, node)
   const edges = new Map<string, CallGraphEdge>()
   for (const edge of [...supplement.edges, ...primary.edges]) edges.set(`${edge.fromId}|${edge.toId}|${edge.file}|${edge.line}`, edge)
+  const combinedWarnings = [...(primary.warnings ?? []), ...(supplement.warnings ?? [])]
   return {
     repo: primary.repo || supplement.repo,
     filesScanned: primary.filesScanned + supplement.filesScanned,
     nodes: [...nodes.values()],
     edges: [...edges.values()],
     analyzerSource: primary.nodes.length > 0 ? primary.analyzerSource : supplement.analyzerSource,
+    ...(combinedWarnings.length > 0 ? { warnings: combinedWarnings } : {}),
   }
 }
 
@@ -2036,29 +2142,55 @@ for (const block of logOut.split('===COMMIT===').slice(1)) {
   commits.push({ sha, committedAt, subject, touchedFiles });
 }
 // Inspect real unified diffs for removed guards/sanitizers (bounded to first 30 commits).
+const diffErrors = [];
 for (let i = 0; i < Math.min(commits.length, 30); i += 1) {
   try {
     commits[i].diff = execFileSync('git', [...baseArgs, 'show', '--unified=3', '--no-color', '--format=', commits[i].sha], {
       encoding: 'utf8', timeout: 8000, maxBuffer: 1024 * 1024,
     }).slice(0, 30000);
-  } catch { commits[i].diff = ''; }
+  } catch (err) {
+    commits[i].diff = '';
+    if (diffErrors.length < 8) diffErrors.push(String(commits[i].sha).slice(0, 12) + ': ' + String(err?.message || err || 'git show failed').slice(0, 140));
+  }
 }
-process.stdout.write(JSON.stringify({ available: true, commits }));
+process.stdout.write(JSON.stringify({ available: true, commits, diffErrors }));
 `
 
-  let parsed: { available?: boolean; reason?: string; commits?: Array<{ sha: string; committedAt?: string; subject: string; touchedFiles: string[]; diff?: string }> } = {}
+  const warnings: SemanticAuditWarning[] = []
+  let parsed: {
+    available?: boolean
+    reason?: string
+    commits?: Array<{ sha: string; committedAt?: string; subject: string; touchedFiles: string[]; diff?: string }>
+    diffErrors?: string[]
+  } = {}
   try {
     const res = await session.runScript({ runtime: 'node', code: script, timeoutMs: 20_000 }, ctx.signal)
     parsed = JSON.parse(res.stdout || '{}')
-  } catch {
+  } catch (err) {
+    const detail = formatAuditError(err, ctx.secrets)
+    pushAuditWarning(warnings, {
+      stage: 'stage3_git_miner',
+      repo: cleanRepo,
+      analyzer: 'git_history_miner',
+      message: `Git history worker invocation failed: ${detail}`,
+    })
     return {
       repo: cleanRepo,
       available: false,
-      reason: 'Git history worker invocation failed.',
+      reason: `Git history worker invocation failed: ${detail}`,
       commitsScanned: 0,
       securityCommits: [],
       suspects: [],
+      warnings,
     }
+  }
+  for (const diffErr of parsed.diffErrors ?? []) {
+    pushAuditWarning(warnings, {
+      stage: 'stage3_git_miner',
+      repo: cleanRepo,
+      analyzer: 'git_show',
+      message: `Commit diff skipped: ${formatAuditError(diffErr, ctx.secrets)}`,
+    })
   }
 
   if (!parsed.available) {
@@ -2142,6 +2274,7 @@ process.stdout.write(JSON.stringify({ available: true, commits }));
     commitsScanned: commits.length,
     securityCommits,
     suspects,
+    ...(warnings.length > 0 ? { warnings } : {}),
   }
 }
 
@@ -2151,9 +2284,10 @@ export async function generateVariantSweepQueries(
   codeLocation: CodeLocation,
   snippet: string,
   spec?: ProjectSecuritySpec,
-): Promise<{ queries: VariantSweepQuery[]; rejected: Array<{ id: string; reason: string }> }> {
+): Promise<{ queries: VariantSweepQuery[]; rejected: Array<{ id: string; reason: string }>; warnings?: SemanticAuditWarning[] }> {
   const candidates: DynamicRuleSpec[] = []
   const rejected: Array<{ id: string; reason: string }> = []
+  const warnings: SemanticAuditWarning[] = []
 
   // Deterministic structural sibling pattern extraction from the confirmed vulnerable snippet
   const callMatch = snippet.match(/\b([A-Za-z_$][A-Za-z0-9_$]*\s*\.\s*(?:query|execute|raw|\$queryRawUnsafe|\$executeRawUnsafe|unsafeExec|exec|execSync|fetch|redirect))\s*\(/)
@@ -2206,8 +2340,14 @@ export async function generateVariantSweepQueries(
       if (Array.isArray(parsed.rules)) {
         for (const r of parsed.rules.slice(0, 4)) candidates.push(r as DynamicRuleSpec)
       }
-    } catch {
-      // keep deterministic query
+    } catch (err) {
+      // keep deterministic query; record structured diagnostic warning
+      pushAuditWarning(warnings, {
+        stage: 'variant_sweep',
+        repo: codeLocation.repo,
+        analyzer: 'variant_sweep_llm',
+        message: `Variant sweep LLM synthesis degraded to deterministic query: ${formatAuditError(err, ctx.secrets)}`,
+      })
     }
   }
 
@@ -2226,7 +2366,7 @@ export async function generateVariantSweepQueries(
     })
   }
 
-  return { queries, rejected }
+  return { queries, rejected, ...(warnings.length > 0 ? { warnings } : {}) }
 }
 
 export async function runVariantSweepForFinding(
@@ -2261,6 +2401,7 @@ export async function runVariantSweepForFinding(
   const ownedSession = !ctx.session
   const session = ctx.session ?? await ctx.backend.openSession(ctx.assignment?.id ?? randomUUID(), ctx.signal, { reposDir: ctx.reposDir })
 
+  const warnings: SemanticAuditWarning[] = []
   try {
     // Read bounded snippet from StaticWorkspaceSnapshot when available, else inside --network none container
     let snippet = primaryLoc.snippet ?? ''
@@ -2289,20 +2430,38 @@ process.stdout.write(lines.slice(s, e).join('\\n').slice(0, 2000));
       try {
         const sr = await session.runScript({ runtime: 'node', code: readCode, timeoutMs: 10_000 }, ctx.signal)
         snippet = sr.stdout
-      } catch {
+      } catch (err) {
         snippet = ''
+        pushAuditWarning(warnings, {
+          stage: 'variant_sweep',
+          repo: cleanRepo,
+          analyzer: 'snippet_reader',
+          message: `Failed reading finding snippet for ${primaryLoc.file}:${primaryLoc.startLine}: ${formatAuditError(err, ctx.secrets)}`,
+        })
       }
     }
 
-    const { queries, rejected } = await generateVariantSweepQueries(ctx, finding, primaryLoc, snippet, params.spec)
-    const targetRepos = (params.mountedRepos?.length ? params.mountedRepos : ctx.mountedRepos)
-      .map(r => { try { return normalizeRepoIdentifier(r) } catch { return null } })
-      .filter((r): r is string => Boolean(r))
+    const { queries, rejected, warnings: queryWarnings } = await generateVariantSweepQueries(ctx, finding, primaryLoc, snippet, params.spec)
+    for (const w of queryWarnings ?? []) pushAuditWarning(warnings, w)
+    const rawTargetRepos = params.mountedRepos?.length ? params.mountedRepos : ctx.mountedRepos
+    const targetRepos: string[] = []
+    for (const r of rawTargetRepos) {
+      try {
+        targetRepos.push(normalizeRepoIdentifier(r))
+      } catch (err) {
+        pushAuditWarning(warnings, {
+          stage: 'variant_sweep',
+          repo: String(r).slice(0, 80),
+          analyzer: 'normalizeRepoIdentifier',
+          message: `Skipped invalid variant-sweep repository: ${formatAuditError(err, ctx.secrets)}`,
+        })
+      }
+    }
     const reposToScan = targetRepos.length ? targetRepos : [cleanRepo]
 
     const allMatches: SastFinding[] = []
     for (const rName of reposToScan) {
-      const hits = await runValidatedDynamicRulesInWorker(session, rName, queries.map(q => q.rule), ctx.signal, ctx.secrets)
+      const hits = await runValidatedDynamicRulesInWorker(session, rName, queries.map(q => q.rule), ctx.signal, ctx.secrets, warnings)
       allMatches.push(...hits)
     }
 
@@ -2356,6 +2515,7 @@ process.stdout.write(lines.slice(s, e).join('\\n').slice(0, 2000));
       rejectedQueries: rejected,
       rawMatches: siblingMatches,
       newSuspects,
+      ...(warnings.length > 0 ? { warnings } : {}),
       durationMs: Date.now() - startedAt,
     }
   } finally {
@@ -2530,6 +2690,7 @@ export async function runThreeStageSemanticAudit(
   const rejectedDynamicRules: Array<{ ruleId: string; reason: string }> = []
   const callGraphsByRepo: SemanticAuditPipelineResult['callGraphsByRepo'] = {}
   const gitMiningByRepo: Record<string, GitHistoryMiningResult> = {}
+  const warnings: SemanticAuditWarning[] = []
   let dynamicRulesCount = 0
   let backwardPathsEvaluated = 0
   const allSuspects: SemanticAuditSuspect[] = []
@@ -2539,7 +2700,13 @@ export async function runThreeStageSemanticAudit(
       let cleanRepo: string
       try {
         cleanRepo = normalizeRepoIdentifier(rawRepo)
-      } catch {
+      } catch (err) {
+        pushAuditWarning(warnings, {
+          stage: 'pipeline',
+          repo: String(rawRepo).slice(0, 80),
+          analyzer: 'normalizeRepoIdentifier',
+          message: `Skipped invalid repository identifier: ${formatAuditError(err, ctx.secrets)}`,
+        })
         continue
       }
 
@@ -2553,6 +2720,7 @@ export async function runThreeStageSemanticAudit(
       specsByRepo[cleanRepo] = stage1.spec
       dynamicRulesCount += stage1.rules.length
       rejectedDynamicRules.push(...stage1.rejectedRules)
+      for (const w of stage1.warnings ?? []) pushAuditWarning(warnings, w)
 
       const dynamicFindings = stage1.rules.length > 0
         ? await runValidatedDynamicRulesInWorker(
@@ -2561,6 +2729,7 @@ export async function runThreeStageSemanticAudit(
             stage1.rules,
             ctx.signal,
             ctx.secrets,
+            warnings,
           )
         : []
 
@@ -2573,6 +2742,7 @@ export async function runThreeStageSemanticAudit(
         staticSnapshot,
         effectiveProgramGraph,
       )
+      for (const w of graph.warnings ?? []) pushAuditWarning(warnings, w)
       callGraphsByRepo[cleanRepo] = {
         filesScanned: graph.filesScanned,
         nodes: graph.nodes.length,
@@ -2603,6 +2773,7 @@ export async function runThreeStageSemanticAudit(
           diffBase: options.gitDiffBase,
         })
         gitMiningByRepo[cleanRepo] = gitRes
+        for (const w of gitRes.warnings ?? []) pushAuditWarning(warnings, w)
         allSuspects.push(...gitRes.suspects)
       }
     }
@@ -2625,6 +2796,16 @@ export async function runThreeStageSemanticAudit(
       persistedFactIds = persisted.factIds
       persistedEndpointIds = persisted.endpointIds
     }
+    if (warnings.length > 0 && ctx.storage) {
+      try {
+        ctx.storage.event(
+          ctx.run.id,
+          'semantic_audit.warnings',
+          `Semantic audit emitted ${warnings.length} structured analyzer warning(s).`,
+          { warnings },
+        )
+      } catch { /* telemetry event is best-effort */ }
+    }
 
     return {
       specsByRepo,
@@ -2637,6 +2818,7 @@ export async function runThreeStageSemanticAudit(
       rankedSuspects,
       persistedFactIds,
       persistedEndpointIds,
+      ...(warnings.length > 0 ? { warnings } : {}),
       durationMs: Date.now() - startedAt,
     }
   } finally {

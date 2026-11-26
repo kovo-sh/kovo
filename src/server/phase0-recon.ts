@@ -87,6 +87,14 @@ export interface Phase0ReconParams {
   staticSnapshot?: StaticWorkspaceSnapshot
 }
 
+export interface Phase0TruncationRecord {
+  category: string
+  cap: number
+  observed: number
+  dropped: number
+  origin?: string
+}
+
 export interface Phase0ReconResult {
   requestsUsed: number
   perOriginCap: number
@@ -156,6 +164,8 @@ export interface Phase0ReconResult {
   runtimeGraphqlCatalogs?: RuntimeGraphqlCatalog[]
   /** Structured OpenAPI operations (preserving `security`, `operationId`, and auth hints) parsed in Phase 0. */
   runtimeOpenApiOperations?: RuntimeOpenApiOperation[]
+  /** Structured truncation telemetry whenever a finite Phase-0 discovery cap was reached. */
+  truncations?: Phase0TruncationRecord[]
 }
 
 export interface RepoStaticExtractionSummary {
@@ -163,12 +173,16 @@ export interface RepoStaticExtractionSummary {
   regexFallbackRoutes: number
   mergedRoutes: number
   duplicateRoutes: number
+  /** Count of multi-origin AST routes left explicitly unmapped instead of misattributing to origins[0]. */
+  unmappedRoutes?: number
   frameworks: string[]
   /** Service -> origin resolution reused for AST route attribution. */
   originMappings: ServiceOriginMapping[]
   /** `METHOD pathTemplate` -> origin provenance for AST routes (multi-origin targets). */
-  routeOrigins: Record<string, { origin: string; confidence: ServiceOriginMapping['confidence']; service?: string; evidence: string[] }>
+  routeOrigins: Record<string, { origin?: string; pathPrefix?: string; confidence: ServiceOriginMapping['confidence']; service?: string; evidence: string[] }>
   warnings: string[]
+  /** Truncation records from repo file/service discovery caps, if any were hit. */
+  truncations?: Phase0TruncationRecord[]
 }
 
 export interface CrawlStateGraphParams {
@@ -402,7 +416,7 @@ function readRepoRegularFile(path: string, maxBytes = 256 * 1024): string | null
   }
 }
 
-function walkRepoFiles(rootDir: string, maxFiles = 1500): string[] {
+function walkRepoFiles(rootDir: string, maxFiles = 10_000): string[] {
   const out: string[] = []
   let rootReal: string
   try {
@@ -760,21 +774,67 @@ const GRAPH_SOURCE_EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '
 const ADMIN_CHAIN_RE = /\b(?:admin\w*|isAdmin|requireAdmin\w*|superuser\w*|staff\w*|role\w*|rbac|permission\w*|privilege\w*|policy\w*|hasRole|hasAuthority)/i
 const TENANT_CHAIN_RE = /(?:tenant|organization|organisation|orgId|org_id|account|workspace|membership|ownership|ownerId|owner_id|scopeCheck|belongsTo)/i
 
+const MAX_REPO_GRAPH_FILES = 10_000
+const MAX_REPO_DOCKERFILES = 128
+const MAX_REPO_MANIFESTS = 256
+const MAX_REPO_COMPOSE_FILES = 64
+const MAX_REPO_INGRESS_FILES = 64
+const MAX_REPO_GRAPH_SERVICES = 128
+
 interface RepoGraphInputs {
   sourceFiles: Array<{ path: string; content: string }>
   dockerfiles: Array<{ path: string; content: string }>
   manifests: Array<{ path: string; content: string }>
   compose?: string
+  composeFiles: Array<{ path: string; content: string }>
   ingress?: string
+  ingressFiles: Array<{ path: string; content: string }>
   mountedRepos: string[]
+  truncations: Phase0TruncationRecord[]
 }
+
+function recordTruncationEntry(
+  list: Phase0TruncationRecord[],
+  category: string,
+  cap: number,
+  observed: number,
+  origin?: string,
+): void {
+  if (observed <= cap) return
+  const existing = list.find(entry => entry.category === category && entry.origin === origin)
+  if (existing) {
+    existing.observed = Math.max(existing.observed, observed)
+    existing.dropped = Math.max(0, existing.observed - existing.cap)
+    return
+  }
+  list.push({
+    category,
+    cap,
+    observed,
+    dropped: observed - cap,
+    ...(origin ? { origin } : {}),
+  })
+}
+
+const COMPOSE_BASENAME_RE = /^(?:docker-)?compose(?:[._-][^/]*)?\.ya?ml$/i
+const INGRESS_BASENAME_RE = /^ingress[^/]*\.ya?ml$/i
 
 /**
  * Bounded walk of the mounted `/repos` tree collecting Program Graph inputs. Symlinks are never
  * followed and file sizes are capped, so graph extraction can run on an untrusted mount.
+ * Collects ALL compose and ingress files with path-prefix retention and reports truncation telemetry
+ * whenever any finite DoS cap is reached.
  */
-function collectRepoGraphInputs(reposDir: string, maxFiles = 2500): RepoGraphInputs | null {
-  const inputs: RepoGraphInputs = { sourceFiles: [], dockerfiles: [], manifests: [], mountedRepos: [] }
+function collectRepoGraphInputs(reposDir: string, maxFiles = MAX_REPO_GRAPH_FILES): RepoGraphInputs | null {
+  const inputs: RepoGraphInputs = {
+    sourceFiles: [],
+    dockerfiles: [],
+    manifests: [],
+    composeFiles: [],
+    ingressFiles: [],
+    mountedRepos: [],
+    truncations: [],
+  }
   if (!reposDir || !existsSync(reposDir)) return null
   let rootReal: string
   try {
@@ -787,7 +847,12 @@ function collectRepoGraphInputs(reposDir: string, maxFiles = 2500): RepoGraphInp
     .filter(mounted => mounted && (existsSync(join(rootReal, mounted)) || !mounted.includes('/')))
   const stack: string[] = [rootReal]
   let visited = 0
-  while (stack.length > 0 && visited < maxFiles) {
+  let filesOverflowed = 0
+  let dockerfilesObserved = 0
+  let manifestsObserved = 0
+  let composeObserved = 0
+  let ingressObserved = 0
+  while (stack.length > 0) {
     const dir = stack.pop()!
     let entries: string[]
     try {
@@ -796,7 +861,6 @@ function collectRepoGraphInputs(reposDir: string, maxFiles = 2500): RepoGraphInp
       continue
     }
     for (const name of entries) {
-      if (visited >= maxFiles) break
       if (SKIP_DIRS.has(name) || name.startsWith('.git')) continue
       const full = join(dir, name)
       let st
@@ -807,31 +871,56 @@ function collectRepoGraphInputs(reposDir: string, maxFiles = 2500): RepoGraphInp
       }
       if (st.isSymbolicLink()) continue
       if (st.isDirectory()) {
-        if (isRealPathUnder(rootReal, full)) stack.push(full)
+        if (visited < maxFiles && isRealPathUnder(rootReal, full)) stack.push(full)
         continue
       }
       if (!st.isFile() || st.size > 256 * 1024) continue
+      if (visited >= maxFiles) {
+        filesOverflowed += 1
+        continue
+      }
       visited += 1
       const rel = relative(rootReal, full).split(sep).join('/')
       const base = name.toLowerCase()
       const ext = extname(name).toLowerCase()
-      const isCompose = /^(?:docker-)?compose(?:[._-][^/]*)?\.ya?ml$/i.test(name)
+      const isCompose = COMPOSE_BASENAME_RE.test(name)
       const isDockerfile = /^dockerfile(?:\.[^/]*)?$/i.test(name)
       const isManifest = base === 'package.json'
-      const looksIngress = /^ingress[^/]*\.ya?ml$/i.test(name)
-      if (!GRAPH_SOURCE_EXTENSIONS.has(ext) && !isCompose && !isDockerfile && !isManifest && !looksIngress) continue
+      const looksIngress = INGRESS_BASENAME_RE.test(name)
+      const isYaml = ext === '.yaml' || ext === '.yml'
+      if (!GRAPH_SOURCE_EXTENSIONS.has(ext) && !isCompose && !isDockerfile && !isManifest && !looksIngress && !isYaml) continue
       const content = readRepoRegularFile(full)
       if (content === null) continue
       if (GRAPH_SOURCE_EXTENSIONS.has(ext)) inputs.sourceFiles.push({ path: rel, content })
-      if (isDockerfile && inputs.dockerfiles.length < 40) inputs.dockerfiles.push({ path: rel, content })
-      if (isManifest && inputs.manifests.length < 80) inputs.manifests.push({ path: rel, content })
-      if (isCompose && inputs.compose === undefined) inputs.compose = content
-      if ((looksIngress || (!inputs.ingress && content.slice(0, 4000).includes('kind: Ingress'))) && inputs.ingress === undefined) {
-        inputs.ingress = content
+      if (isDockerfile) {
+        dockerfilesObserved += 1
+        if (inputs.dockerfiles.length < MAX_REPO_DOCKERFILES) inputs.dockerfiles.push({ path: rel, content })
+      }
+      if (isManifest) {
+        manifestsObserved += 1
+        if (inputs.manifests.length < MAX_REPO_MANIFESTS) inputs.manifests.push({ path: rel, content })
+      }
+      if (isCompose) {
+        composeObserved += 1
+        if (inputs.composeFiles.length < MAX_REPO_COMPOSE_FILES) inputs.composeFiles.push({ path: rel, content })
+        if (inputs.compose === undefined) inputs.compose = content
+      }
+      const hasIngressKind = isYaml && content.slice(0, 8000).includes('kind: Ingress')
+      if (looksIngress || hasIngressKind) {
+        ingressObserved += 1
+        if (inputs.ingressFiles.length < MAX_REPO_INGRESS_FILES) inputs.ingressFiles.push({ path: rel, content })
+        if (inputs.ingress === undefined) inputs.ingress = content
       }
     }
   }
-  return inputs.sourceFiles.length > 0 || inputs.dockerfiles.length > 0 ? inputs : null
+  if (filesOverflowed > 0) recordTruncationEntry(inputs.truncations, 'repo_graph_files', maxFiles, visited + filesOverflowed)
+  recordTruncationEntry(inputs.truncations, 'repo_dockerfiles', MAX_REPO_DOCKERFILES, dockerfilesObserved)
+  recordTruncationEntry(inputs.truncations, 'repo_manifests', MAX_REPO_MANIFESTS, manifestsObserved)
+  recordTruncationEntry(inputs.truncations, 'repo_compose_files', MAX_REPO_COMPOSE_FILES, composeObserved)
+  recordTruncationEntry(inputs.truncations, 'repo_ingress_files', MAX_REPO_INGRESS_FILES, ingressObserved)
+  return inputs.sourceFiles.length > 0 || inputs.dockerfiles.length > 0 || inputs.composeFiles.length > 0 || inputs.ingressFiles.length > 0
+    ? inputs
+    : null
 }
 
 function repoBasename(path: string): string {
@@ -840,7 +929,7 @@ function repoBasename(path: string): string {
 }
 
 /** Candidate monorepo service roots from mounted repos, Dockerfiles and top-level manifests. */
-function discoverGraphServices(inputs: RepoGraphInputs): MonorepoService[] {
+function discoverGraphServices(inputs: RepoGraphInputs, maxServices = MAX_REPO_GRAPH_SERVICES): MonorepoService[] {
   const services = new Map<string, MonorepoService>()
   const add = (root: string, name: string) => {
     const cleanRoot = root.replace(/\/$/, '')
@@ -863,7 +952,9 @@ function discoverGraphServices(inputs: RepoGraphInputs): MonorepoService[] {
     if (ownerRepoDepth === 0 || depth > ownerRepoDepth + 1) continue
     add(root, repoBasename(root) || 'app')
   }
-  return [...services.values()].slice(0, 32)
+  const all = [...services.values()]
+  recordTruncationEntry(inputs.truncations, 'repo_graph_services', maxServices, all.length)
+  return all.slice(0, maxServices)
 }
 
 function authClassFromGuards(guards: readonly string[]): StaticExtractedRoute['authClass'] {
@@ -901,7 +992,8 @@ function repoForRouteFile(file: string, mountedRepos: readonly string[]): string
 }
 
 interface RouteOriginResolution {
-  origin: string
+  origin?: string
+  pathPrefix?: string
   confidence: ServiceOriginMapping['confidence']
   service?: string
   evidence: string[]
@@ -909,8 +1001,8 @@ interface RouteOriginResolution {
 
 /**
  * Attribute a route file to a target origin. Monorepo service roots are matched longest-first;
- * `origins[0]` is only used as a documented fallback (recorded in provenance) when no service
- * root/ingress/port evidence matches.
+ * genuinely unmapped services on multi-origin targets are marked `unmapped` instead of silently
+ * misattributing their routes to `origins[0]`.
  */
 function resolveRouteOrigin(
   file: string,
@@ -918,33 +1010,43 @@ function resolveRouteOrigin(
   origins: readonly string[],
 ): RouteOriginResolution {
   const candidates = mappings
-    .filter(mapping => mapping.root && mapping.origin && (file === mapping.root || file.startsWith(`${mapping.root}/`)))
+    .filter(mapping => mapping.root && (file === mapping.root || file.startsWith(`${mapping.root}/`)))
     .sort((a, b) => (b.root?.length ?? 0) - (a.root?.length ?? 0))
-  const strong = candidates.find(mapping => mapping.confidence !== 'fallback' && mapping.confidence !== 'unmapped')
+  const strong = candidates.find(mapping => mapping.origin && mapping.confidence !== 'fallback' && mapping.confidence !== 'unmapped')
   if (strong && strong.origin) {
     return {
       origin: strong.origin,
+      ...(strong.pathPrefix ? { pathPrefix: strong.pathPrefix } : {}),
       confidence: strong.confidence,
       ...(strong.root ? { service: strong.service } : {}),
       evidence: strong.evidence.length ? strong.evidence : [`service root ${strong.root} matched ${file}`],
     }
   }
   if (origins.length === 1) {
-    return { origin: origins[0]!, confidence: 'exact', evidence: ['single approved origin for the run'] }
-  }
-  const fallback = candidates[0]
-  if (fallback && fallback.origin) {
+    const matchedUnmapped = candidates[0]
     return {
-      origin: fallback.origin,
-      confidence: fallback.confidence,
-      ...(fallback.root ? { service: fallback.service } : {}),
-      evidence: fallback.evidence.length ? fallback.evidence : [`service root ${fallback.root} matched ${file}`],
+      origin: origins[0]!,
+      ...(matchedUnmapped?.pathPrefix ? { pathPrefix: matchedUnmapped.pathPrefix } : {}),
+      confidence: 'exact',
+      ...(matchedUnmapped?.root ? { service: matchedUnmapped.service } : {}),
+      evidence: ['single approved origin for the run'],
+    }
+  }
+  const matched = candidates[0]
+  if (matched) {
+    return {
+      ...(matched.origin && matched.confidence !== 'unmapped' ? { origin: matched.origin } : {}),
+      ...(matched.pathPrefix ? { pathPrefix: matched.pathPrefix } : {}),
+      confidence: matched.origin ? matched.confidence : 'unmapped',
+      ...(matched.root ? { service: matched.service } : {}),
+      evidence: matched.evidence.length
+        ? matched.evidence
+        : [`service root ${matched.root} matched ${file} with no target origin mapping`],
     }
   }
   return {
-    origin: origins[0]!,
-    confidence: 'fallback',
-    evidence: ['no service root/ingress/port evidence; using origins[0] as documented fallback'],
+    confidence: 'unmapped',
+    evidence: ['no service root/ingress/port/compose evidence for multi-origin target; route left unmapped instead of misattributing to origins[0]'],
   }
 }
 
@@ -957,6 +1059,7 @@ export interface RepoProgramGraphExtraction {
   originMappings: ServiceOriginMapping[]
   routeOrigins: Record<string, RouteOriginResolution>
   warnings: string[]
+  truncations: Phase0TruncationRecord[]
 }
 
 function collectGraphExtractionInputs(input: {
@@ -968,18 +1071,49 @@ function collectGraphExtractionInputs(input: {
     const snap = input.staticSnapshot
     const sourceFiles = snapshotSourceFiles(snap)
     const dockerfiles = snap.dockerfiles.map(d => ({ path: d.path, content: d.content }))
-    if (sourceFiles.length === 0 && dockerfiles.length === 0) return null
+    const truncations: Phase0TruncationRecord[] = []
+    const composeFiles: Array<{ path: string; content: string }> = []
+    const ingressFiles: Array<{ path: string; content: string }> = []
+    let composeObserved = 0
+    let ingressObserved = 0
+    for (const [relPath, content] of snap.sourceByPath.entries()) {
+      const base = relPath.split('/').pop() ?? relPath
+      const ext = extname(base).toLowerCase()
+      const isYaml = ext === '.yaml' || ext === '.yml'
+      if (COMPOSE_BASENAME_RE.test(base)) {
+        composeObserved += 1
+        if (composeFiles.length < MAX_REPO_COMPOSE_FILES) composeFiles.push({ path: relPath, content })
+      }
+      if (INGRESS_BASENAME_RE.test(base) || (isYaml && content.slice(0, 8000).includes('kind: Ingress'))) {
+        ingressObserved += 1
+        if (ingressFiles.length < MAX_REPO_INGRESS_FILES) ingressFiles.push({ path: relPath, content })
+      }
+    }
+    if (composeFiles.length === 0 && snap.compose !== undefined) {
+      composeFiles.push({ path: 'docker-compose.yml', content: snap.compose })
+    }
+    if (ingressFiles.length === 0 && snap.ingress !== undefined) {
+      ingressFiles.push({ path: 'ingress.yaml', content: snap.ingress })
+    }
+    const pkgManifests = snap.manifests
+      .filter(m => m.name.toLowerCase() === 'package.json' || m.name.toLowerCase().endsWith('/package.json'))
+    recordTruncationEntry(truncations, 'repo_manifests', MAX_REPO_MANIFESTS, pkgManifests.length)
+    recordTruncationEntry(truncations, 'repo_compose_files', MAX_REPO_COMPOSE_FILES, composeObserved)
+    recordTruncationEntry(truncations, 'repo_ingress_files', MAX_REPO_INGRESS_FILES, ingressObserved)
+    if (sourceFiles.length === 0 && dockerfiles.length === 0 && composeFiles.length === 0 && ingressFiles.length === 0) return null
     return {
       inputs: {
         sourceFiles,
         dockerfiles,
-        manifests: snap.manifests
-          .filter(m => m.name.toLowerCase() === 'package.json' || m.name.toLowerCase().endsWith('/package.json'))
-          .slice(0, 80)
+        manifests: pkgManifests
+          .slice(0, MAX_REPO_MANIFESTS)
           .map(m => ({ path: m.name, content: m.content })),
         ...(snap.compose !== undefined ? { compose: snap.compose } : {}),
+        composeFiles,
         ...(snap.ingress !== undefined ? { ingress: snap.ingress } : {}),
+        ingressFiles,
         mountedRepos: [...snap.mountedRepos],
+        truncations,
       },
       precomputedGraph: snap.programGraph,
     }
@@ -1002,7 +1136,9 @@ function finalizeRepoProgramGraphExtraction(
         services,
         origins,
         ...(inputs.compose ? { compose: inputs.compose } : {}),
+        ...(inputs.composeFiles.length ? { composeFiles: inputs.composeFiles } : {}),
         ...(inputs.ingress ? { ingress: inputs.ingress } : {}),
+        ...(inputs.ingressFiles.length ? { ingressFiles: inputs.ingressFiles } : {}),
         dockerfiles: inputs.dockerfiles,
         manifests: inputs.manifests,
       })
@@ -1022,7 +1158,9 @@ function finalizeRepoProgramGraphExtraction(
     const sinkMeta = detectSinksAndGuards(fileCode)
     const resolved = resolveRouteOrigin(route.file, originMappings, origins)
     const key = `${route.method.toUpperCase()} ${pathTemplate}`
-    if (!routeOrigins[key] || routeOrigins[key]!.confidence === 'fallback') routeOrigins[key] = resolved
+    if (!routeOrigins[key] || routeOrigins[key]!.confidence === 'fallback' || routeOrigins[key]!.confidence === 'unmapped') {
+      routeOrigins[key] = resolved
+    }
     routes.push({
       method: route.method.toUpperCase(),
       pathTemplate,
@@ -1044,7 +1182,7 @@ function finalizeRepoProgramGraphExtraction(
       middleware: [...route.middleware],
       mountedFrom: [...route.mountedFrom],
       ...(resolved.service ? { service: resolved.service } : {}),
-      origin: resolved.origin,
+      ...(resolved.origin ? { origin: resolved.origin } : {}),
       originConfidence: resolved.confidence,
       routeId: route.id,
     })
@@ -1059,6 +1197,7 @@ function finalizeRepoProgramGraphExtraction(
     originMappings,
     routeOrigins,
     warnings: [...graph.warnings],
+    truncations: [...inputs.truncations],
   }
 }
 
@@ -1115,16 +1254,23 @@ export function mergeStaticRouteExtractions(input: {
 }): { routes: StaticExtractedRoute[]; duplicates: number } {
   const merged: StaticExtractedRoute[] = []
   const seen = new Set<string>()
+  const astFileRoutes = new Set<string>()
   let duplicates = 0
   const keyOf = (route: StaticExtractedRoute) =>
-    `${(route.origin ?? input.defaultOrigin).toLowerCase()}|${route.method.toUpperCase()}|${route.pathTemplate}`
+    `${(route.origin ?? (route.originConfidence === 'unmapped' ? 'unmapped' : input.defaultOrigin)).toLowerCase()}|${route.method.toUpperCase()}|${route.pathTemplate}`
+  const fileRouteKeyOf = (route: StaticExtractedRoute) =>
+    `${route.codeLocation.file}|${route.method.toUpperCase()}|${route.pathTemplate}`
   for (const route of input.astRoutes) {
     const key = keyOf(route)
+    astFileRoutes.add(fileRouteKeyOf(route))
     if (seen.has(key)) { duplicates += 1; continue }
     seen.add(key)
     merged.push(route)
   }
   for (const route of input.regexRoutes) {
+    // AST extraction is authoritative for the same (file, method, pathTemplate), including when
+    // AST resolved a specific target origin or intentionally marked a microservice route `unmapped`.
+    if (astFileRoutes.has(fileRouteKeyOf(route))) { duplicates += 1; continue }
     const key = keyOf(route)
     if (seen.has(key)) { duplicates += 1; continue }
     seen.add(key)
@@ -1436,7 +1582,7 @@ function isManifestBasename(name: string): boolean {
 /** Read dependency manifests from the mounted repo tree (bounded; never executes a package manager). */
 export function readRepoManifests(
   reposDir: string,
-  maxFiles = 60,
+  maxFiles = 200,
   staticSnapshot?: StaticWorkspaceSnapshot,
 ): ManifestFile[] {
   if (staticSnapshot) {
@@ -1602,7 +1748,7 @@ export function harvestJsRequestParams(rawCode: string): JsRequestSpec[] {
     const key = `${methodUpper} ${cleanPath}`
     if (seen.has(`${key}|${JSON.stringify(deduped)}`)) return
     seen.add(`${key}|${JSON.stringify(deduped)}`)
-    if (out.length < 40) out.push({ method: methodUpper, path: cleanPath, params: deduped.slice(0, 20) })
+    if (out.length < 160) out.push({ method: methodUpper, path: cleanPath, params: deduped.slice(0, 40) })
   }
 
   /**
@@ -3378,6 +3524,9 @@ export function listEndpointsPaged(
  * the references; `matched` counts those present in the store after ingestion. They must agree for
  * the lossless path — a gap means the ingestion view or the store dropped rows.
  */
+/** Generous DoS ceiling on stored project API specs per origin (replaces hard 6-spec drop). */
+const MAX_DECLARED_SPECS = 128
+
 export type DeclaredSurfaceSummary = {
   specs: number
   endpoints: number
@@ -3387,6 +3536,8 @@ export type DeclaredSurfaceSummary = {
   declaredOpsMatched: number
   /** Malformed references whose tolerant scan was truncated by the safety cap. */
   declaredTolerantCapped: number
+  /** Count of stored API specs dropped because `MAX_DECLARED_SPECS` was exceeded. */
+  specsTruncated?: number
   /** Parsed OpenAPI operations (preserving `security` & `operationId`) for runtime invariant synthesis. */
   openApiOperations?: RuntimeOpenApiOperation[]
   /** Parsed GraphQL SDL catalogs from project specs. */
@@ -3480,7 +3631,18 @@ function ingestDeclaredApiSurfaceWithDocs(
     result.methods[normalized] = (result.methods[normalized] ?? 0) + 1
   }
 
-  for (const [specIndex, spec] of specs.slice(0, 6).entries()) {
+  if (specs.length > MAX_DECLARED_SPECS) {
+    result.specsTruncated = specs.length - MAX_DECLARED_SPECS
+    try {
+      storage.event(
+        runId,
+        'phase0.truncation',
+        `Declared API specs capped at ${MAX_DECLARED_SPECS} of ${specs.length} for ${origin}.`,
+        { category: 'declared_specs', cap: MAX_DECLARED_SPECS, observed: specs.length, dropped: specs.length - MAX_DECLARED_SPECS, origin },
+      )
+    } catch { /* metrics only */ }
+  }
+  for (const [specIndex, spec] of specs.slice(0, MAX_DECLARED_SPECS).entries()) {
     const head = spec.content.slice(0, 400)
     if (spec.kind === 'graphql' || /\btype\s+(?:Query|Mutation|Subscription)\s*\{/.test(spec.content)) {
       try {
@@ -3629,7 +3791,7 @@ export async function ingestDeclaredApiSurfaceAsync(input: {
       if (!spec.origin) return true
       try { return new URL(spec.origin).origin === wanted } catch { return false }
     })
-    for (const [specIndex, spec] of specs.slice(0, 6).entries()) {
+    for (const [specIndex, spec] of specs.slice(0, MAX_DECLARED_SPECS).entries()) {
       if (spec.kind === 'graphql') continue
       const head = spec.content.slice(0, 400)
       const looksOpenApi = /openapi|swagger/i.test(spec.kind)
@@ -3782,9 +3944,14 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     }
   }
 
+  const truncations: Phase0TruncationRecord[] = []
+  const noteTruncation = (category: string, cap: number, observed: number, origin?: string) => {
+    recordTruncationEntry(truncations, category, cap, observed, origin)
+  }
+
   // Repo dependency manifests contribute tech tags even when live responses are uninformative
   // (or when Tier 0 sends no requests at all).
-  for (const tag of mergeTechTags(techTagsFromManifests(readRepoManifests(params.reposDir ?? '', 60, staticSnapshot)))) {
+  for (const tag of mergeTechTags(techTagsFromManifests(readRepoManifests(params.reposDir ?? '', 200, staticSnapshot)))) {
     techFingerprint.add(tag)
   }
 
@@ -3811,14 +3978,32 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       if (signal.aborted || err instanceof UntrustedComputeAbortedError) throw err
       graphExtraction = null
     }
+    const regexRoutesWithOrigins = normalizedOrigins.length > 1 && graphExtraction?.originMappings.length
+      ? regexExtracted.routes.map(route => {
+          if (route.origin || route.originConfidence) return route
+          const resolved = resolveRouteOrigin(route.codeLocation.file, graphExtraction.originMappings, normalizedOrigins)
+          return {
+            ...route,
+            ...(resolved.service ? { service: resolved.service } : {}),
+            ...(resolved.origin ? { origin: resolved.origin } : {}),
+            originConfidence: resolved.confidence,
+          }
+        })
+      : regexExtracted.routes
     const merged = mergeStaticRouteExtractions({
       astRoutes: graphExtraction?.routes ?? [],
-      regexRoutes: regexExtracted.routes,
+      regexRoutes: regexRoutesWithOrigins,
       defaultOrigin: primaryOrigin,
     })
     for (const fw of graphExtraction?.frameworks ?? []) frameworksDetected.add(fw)
     for (const fw of regexExtracted.frameworks) frameworksDetected.add(fw)
+    let unmappedRoutes = 0
     for (const route of merged.routes) {
+      // Never silently misattribute genuinely unmapped multi-origin microservice routes to origins[0].
+      if (normalizedOrigins.length > 1 && route.originConfidence === 'unmapped' && !route.origin) {
+        unmappedRoutes += 1
+        continue
+      }
       const origin = route.origin ?? primaryOrigin
       const ep = storage.upsertEndpoint({
         runId,
@@ -3851,15 +4036,26 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         paramsDiscovered += 1
       }
     }
+    for (const t of graphExtraction?.truncations ?? []) {
+      noteTruncation(t.category, t.cap, t.observed, t.origin)
+    }
+    const extractionWarnings = [
+      ...(graphExtraction?.warnings ?? []),
+      ...(unmappedRoutes > 0
+        ? [`Left ${unmappedRoutes} multi-origin AST route(s) unmapped instead of misattributing to ${primaryOrigin}.`]
+        : []),
+    ]
     repoStaticExtraction = {
       astRoutes: graphExtraction?.routes.length ?? 0,
       regexFallbackRoutes: regexExtracted.routes.length,
       mergedRoutes: merged.routes.length,
       duplicateRoutes: merged.duplicates,
+      ...(unmappedRoutes > 0 ? { unmappedRoutes } : {}),
       frameworks: [...new Set([...(graphExtraction?.frameworks ?? []), ...regexExtracted.frameworks])],
       originMappings: graphExtraction?.originMappings ?? [],
       routeOrigins: graphExtraction?.routeOrigins ?? {},
-      warnings: graphExtraction?.warnings ?? [],
+      warnings: extractionWarnings,
+      ...(graphExtraction?.truncations.length ? { truncations: [...graphExtraction.truncations] } : {}),
     }
     if (graphExtraction) {
       // Lossless store, ranked probe: every AST route is persisted above; this plan only
@@ -3985,6 +4181,10 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       total.declaredOpsSeen += part.declaredOpsSeen
       total.declaredOpsMatched += part.declaredOpsMatched
       total.declaredTolerantCapped += part.declaredTolerantCapped
+      if (part.specsTruncated) {
+        total.specsTruncated = (total.specsTruncated ?? 0) + part.specsTruncated
+        noteTruncation('declared_specs', MAX_DECLARED_SPECS, MAX_DECLARED_SPECS + part.specsTruncated, origin)
+      }
       for (const [method, count] of Object.entries(part.methods)) total.methods[method] = (total.methods[method] ?? 0) + count
       for (const op of part.openApiOperations ?? []) mergeRuntimeOpenApiOp(op)
       for (const cat of part.graphqlCatalogs ?? []) mergeRuntimeGraphqlCatalog(cat)
@@ -4018,11 +4218,17 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
 
   // Tier 0: zero live HTTP requests
   if (tier === 0) {
+    noteTruncation('dynamic_wordlist_paths', 500, dynamicPaths.size)
+    noteTruncation('dynamic_wordlist_params', 250, dynamicParams.size)
+    if (truncations.length > 0) {
+      storage.event(runId, 'phase0.truncation', `Phase-0 hit ${truncations.length} finite discovery cap(s).`, { truncations })
+    }
     storage.event(runId, 'phase0.discovery', 'Phase-0 discovery counts (static only).', {
       requestsUsed: 0,
       perOriginCap,
       endpointsDiscovered,
       paramsDiscovered,
+      ...(truncations.length > 0 ? { truncations } : {}),
     })
     storage.updateRunPhase0Completed(runId, Date.now())
     const staticVisibility: Record<string, string[]> = {}
@@ -4035,8 +4241,8 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       frameworksDetected: [...frameworksDetected],
       techFingerprint: [...techFingerprint],
       dynamicWordlist: {
-        paths: [...dynamicPaths].slice(0, 120),
-        params: [...dynamicParams].slice(0, 80),
+        paths: [...dynamicPaths].slice(0, 500),
+        params: [...dynamicParams].slice(0, 250),
       },
       stoppedReason: null,
       routeMapEndpoints,
@@ -4053,6 +4259,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       ...(siblingDerivationSuppressed ? { siblingDerivationSuppressed } : {}),
       visibleToPersonas: staticVisibility,
       ...(privilegedSurface.length > 0 ? { privilegedEndpoints: privilegedSurface } : {}),
+      ...(truncations.length > 0 ? { truncations } : {}),
     }
   }
 
@@ -4092,8 +4299,27 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     }
     let observedFieldAttachments = 0
     let originHalted = false
-    let personaRejected = false
+    const rejectedPersonas = new Set<string>()
     let softCalibration: SoftNotFoundCalibration | null = null
+    let protectedPathsObserved = 0
+    let jsonDocsObserved = 0
+    let candidatePathsObserved = 0
+    let templatesObserved = 0
+    let jsQueueObserved = 0
+    let jsRoutesObserved = 0
+    let jsReqParamsObserved = 0
+    let jsRouteTableObserved = 0
+    let trpcProcsObserved = 0
+    const MAX_PROTECTED_PATHS = 48
+    const MAX_JSON_DOCS = 24
+    const MAX_CANDIDATE_PATHS = 160
+    const MAX_DISCOVERED_TEMPLATES = 96
+    const MAX_JS_QUEUE = 128
+    const MAX_JS_CHUNKS_FETCH = 96
+    const MAX_JS_ROUTES_PER_CHUNK = 400
+    const MAX_JS_REQ_PARAMS_PER_CHUNK = 120
+    const MAX_JS_ROUTE_TABLE_PER_CHUNK = 120
+    const MAX_TRPC_PROCS_PER_CHUNK = 120
 
     // Surface-planning reads (nav targets, GraphQL, sibling derivation, dependency inference) must
     // see the whole stored surface. `storage.listEndpoints(runId, { origin })` pages at 500 rows by
@@ -4113,25 +4339,108 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       return rows
     }
 
+    const recordEndpoint = (
+      method: string,
+      rawPath: string,
+      source: EndpointSource,
+      extra?: { framework?: string | null; riskScore?: number; authRequirement?: string | null; targetOrigin?: string },
+    ) => {
+      const epOrigin = extra?.targetOrigin ?? origin
+      const pathTemplate = /(?:^|\/):[A-Za-z_][A-Za-z0-9_-]*/.test(rawPath)
+        ? normalizeDiscoveryTemplate(rawPath)
+        : normalizeRouteTemplate(rawPath)
+      const ep = storage.upsertEndpoint({
+        runId,
+        scopeRevision,
+        origin: epOrigin,
+        method: method.toUpperCase(),
+        pathTemplate,
+        source,
+        framework: extra?.framework ?? null,
+        authRequirement: extra?.authRequirement ?? null,
+        riskScore: extra?.riskScore ?? scoreEndpointRisk(method, pathTemplate),
+      })
+      endpointsDiscovered += 1
+      dynamicPaths.add(pathTemplate)
+      return ep
+    }
+
     const personaForOrigin = (handle: string | undefined): string | undefined => {
-      if (!handle || personaRejected) return undefined
+      if (!handle || rejectedPersonas.has(handle)) return undefined
       const persona = grant.personas?.get(handle)
       if (!persona) return undefined
       return persona.originAllowlist.includes(origin) ? handle : undefined
     }
+    const nextUsablePersona = (): string | undefined => {
+      for (const handle of params.personas ?? []) {
+        const candidate = personaForOrigin(handle)
+        if (candidate) return candidate
+      }
+      return undefined
+    }
+    const isPersonaWideAuthInvalidation = (message: string): boolean =>
+      /(?:unknown persona|persona\b[^.\n]{0,60}\b(?:not registered|revoked|invalid|not allowed for origin|not permitted for origin)|originAllowlist|session\b[^.\n]{0,60}\b(?:expired|revoked|invalidated|terminated|not found)|credential\b[^.\n]{0,60}\b(?:expired|revoked|invalidated|missing))/i.test(message)
     // All discovery fetches carry the approved owner session when one is available, so the SPA
     // shell, API listings, config documents and OpenAPI specs behind login are visible.
-    let discoveryPersona = personaForOrigin(params.personas?.find((handle): handle is string => Boolean(handle)))
+    let discoveryPersona = nextUsablePersona()
 
-    // Calibrated protected/API path hints for safe-template path variables (`{{discovered_*_path}}`).
+    const harvestRedirectHop = (hopOrigin: string, targetUrl: URL): void => {
+      if (hopOrigin !== origin && !grant.canRead(hopOrigin)) return
+      const targetPath = targetUrl.pathname || '/'
+      if (!targetPath.startsWith('/') || targetPath.startsWith('//')) return
+      if (/[\r\n\0]/.test(targetPath) || STATIC_ASSET_RE.test(targetPath)) return
+      const targetTmpl = normalizeDiscoveryTemplate(targetPath)
+      const queryNames = [...targetUrl.searchParams.keys()].filter(name => isSafeParamName(name))
+      if (hopOrigin === origin) {
+        const evidence = evidenceFor(targetTmpl)
+        for (const name of queryNames) {
+          evidence.redirectQuery.add(name)
+          dynamicParams.add(name)
+        }
+      } else {
+        for (const name of queryNames) dynamicParams.add(name)
+      }
+      if (targetPath !== '/' || queryNames.length > 0) {
+        const ep = recordEndpoint('GET', targetPath, 'surface_probe', { targetOrigin: hopOrigin })
+        for (const name of queryNames) {
+          storage.upsertEndpointParam({
+            runId,
+            endpointId: ep.id,
+            name,
+            location: 'query',
+            inferredType: 'string',
+            isCsrf: CSRF_PARAM_RE.test(name),
+            isObjectId: OBJECT_ID_PARAM_RE.test(name),
+            source: 'observed:redirect_query',
+          })
+          paramsDiscovered += 1
+        }
+      }
+    }
+
+    // Calibrated protected/API path hints for safe-template path variables (`{{discovered_*_path}}`)
+    // plus wire-observed redirect query harvesting across BOTH 3xx Location headers and followed
+    // `ex.redirectPaths` / `ex.redirectOrigins` hops.
     const noteDiscoveryResponse = (ex: BrokerExchangeResult): void => {
       const method = ex.method.toUpperCase()
       if (method !== 'GET' && method !== 'HEAD') return
       const bare = ex.pathAndQuery.split('?')[0] || '/'
       if (!bare.startsWith('/') || bare.startsWith('//')) return
       if (/[:{}[\]]/.test(bare) || /[\r\n\0]/.test(bare) || STATIC_ASSET_RE.test(bare)) return
-      if ([301, 302, 303, 307, 308, 401, 403].includes(ex.status) && protectedPaths.size < 12) {
-        protectedPaths.add(bare)
+      const is3xx = [301, 302, 303, 307, 308].includes(ex.status)
+      const redirectPaths = Array.isArray(ex.redirectPaths) ? ex.redirectPaths : []
+      const redirectOrigins = Array.isArray(ex.redirectOrigins) && ex.redirectOrigins.length > 0
+        ? ex.redirectOrigins
+        : [origin]
+      const finalBare = (ex.finalPathAndQuery ?? ex.pathAndQuery).split('?')[0] || '/'
+      const redirectedToDifferentPath = redirectPaths.length > 0
+        && ((ex.finalOrigin && ex.finalOrigin !== origin)
+          || (bare.replace(/\/+$/, '') || '/') !== (finalBare.replace(/\/+$/, '') || '/'))
+      if (is3xx || ex.status === 401 || ex.status === 403 || redirectedToDifferentPath) {
+        if (!protectedPaths.has(bare)) {
+          protectedPathsObserved += 1
+          if (protectedPaths.size < MAX_PROTECTED_PATHS) protectedPaths.add(bare)
+        }
       }
       // Parameter evidence the crawler already holds. Bounded and passive: no extra requests.
       if (ex.status >= 200 && ex.status < 300 && /json/i.test(ex.mediaType) && ex.body.length <= 262_144) {
@@ -4141,14 +4450,44 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
           for (const field of fields) evidence.fields.add(field)
         }
       }
-      if ([301, 302, 303, 307, 308].includes(ex.status)) {
+      // Harvest redirect targets & query params across all followed in-scope redirect hops
+      // (fixes dead 3xx harvesting when `safeGet` follows redirects to a final `200`).
+      const allSameOrigin = redirectOrigins.every(ro => ro === origin)
+      const allInScope = redirectOrigins.every(ro => ro === origin || grant.canRead(ro))
+      for (let i = 0; i < redirectPaths.length; i += 1) {
+        const hop = redirectPaths[i]
+        if (typeof hop !== 'string' || hop.length > 2048) continue
+        const isLastHop = i === redirectPaths.length - 1
+        try {
+          if (/^https?:\/\//i.test(hop)) {
+            const target = new URL(hop)
+            if (target.origin === origin || grant.canRead(target.origin)) {
+              harvestRedirectHop(target.origin, target)
+            }
+          } else if (allSameOrigin) {
+            const target = new URL(hop, origin)
+            harvestRedirectHop(origin, target)
+          } else if (isLastHop && ex.finalOrigin && (ex.finalOrigin === origin || grant.canRead(ex.finalOrigin))) {
+            const target = new URL(hop, ex.finalOrigin)
+            harvestRedirectHop(ex.finalOrigin, target)
+          } else if (allInScope) {
+            // Intermediate cross-origin hop within approved scope: attribute to the best matching
+            // in-scope redirect origin (preferring secondary origin if present, else final/initial).
+            const secondary = redirectOrigins.find(ro => ro !== origin && grant.canRead(ro))
+            const hopOrigin = secondary ?? (ex.finalOrigin && grant.canRead(ex.finalOrigin) ? ex.finalOrigin : origin)
+            const target = new URL(hop, hopOrigin)
+            harvestRedirectHop(hopOrigin, target)
+          }
+        } catch { /* malformed redirect hop */ }
+      }
+      // Also capture a final 3xx Location header (when followRedirects is false or hop cap hit).
+      if (is3xx) {
         const location = ex.respHeaders?.location ?? ex.respHeaders?.Location
         if (typeof location === 'string' && location.length <= 2048) {
           try {
-            const target = new URL(location, origin)
-            if (target.origin === origin && target.search) {
-              const evidence = evidenceFor(normalizeDiscoveryTemplate(target.pathname))
-              for (const name of target.searchParams.keys()) evidence.redirectQuery.add(name)
+            const target = new URL(location, ex.finalOrigin || origin)
+            if (target.origin === origin || grant.canRead(target.origin)) {
+              harvestRedirectHop(target.origin, target)
             }
           } catch { /* malformed Location */ }
         }
@@ -4220,42 +4559,23 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
             stoppedReason = 'scope_revoked'
             return null
           }
-          if (persona && /persona|session|credential/i.test(err.message)) {
-            // Persona session unusable for this origin: drop it for the rest of the pass and retry
-            // the same discovery request anonymously so recon never stalls on auth plumbing.
-            personaRejected = true
-            discoveryPersona = undefined
+          if (persona) {
+            // Only retire a persona for the origin on genuine persona-wide auth invalidation
+            // (revoked/expired/not-registered/disallowed-for-origin). On any single-request denial
+            // (e.g., route policy or single-endpoint session restriction), keep `discoveryPersona`
+            // intact for subsequent requests and fall back to anonymous ONLY for this request.
+            if (isPersonaWideAuthInvalidation(err.message)) {
+              rejectedPersonas.add(persona)
+              if (discoveryPersona === persona) {
+                discoveryPersona = nextUsablePersona()
+              }
+            }
             return safeGet(pathAndQuery, { ...opts, anonymous: true })
           }
           return null
         }
         return null
       }
-    }
-
-    const recordEndpoint = (
-      method: string,
-      rawPath: string,
-      source: EndpointSource,
-      extra?: { framework?: string | null; riskScore?: number; authRequirement?: string | null },
-    ) => {
-      const pathTemplate = /(?:^|\/):[A-Za-z_][A-Za-z0-9_-]*/.test(rawPath)
-        ? normalizeDiscoveryTemplate(rawPath)
-        : normalizeRouteTemplate(rawPath)
-      const ep = storage.upsertEndpoint({
-        runId,
-        scopeRevision,
-        origin,
-        method: method.toUpperCase(),
-        pathTemplate,
-        source,
-        framework: extra?.framework ?? null,
-        authRequirement: extra?.authRequirement ?? null,
-        riskScore: extra?.riskScore ?? scoreEndpointRisk(method, pathTemplate),
-      })
-      endpointsDiscovered += 1
-      dynamicPaths.add(pathTemplate)
-      return ep
     }
 
     /** Track which role personas can reach an endpoint (merged after all passes). */
@@ -4271,7 +4591,8 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
 
     const recordParams = (endpointId: string, paramList: readonly { name: string; location: ParamLocation }[], source: string): number => {
       let added = 0
-      for (const p of paramList.slice(0, 24)) {
+      if (paramList.length > 64) noteTruncation('endpoint_params_batch', 64, paramList.length, origin)
+      for (const p of paramList.slice(0, 64)) {
         if (!p.name || !isUsefulParamForLocation(p.name, p.location)) continue
         storage.upsertEndpointParam({
           runId,
@@ -4290,7 +4611,9 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     }
 
     const queueJsonDoc = (cleanPath: string) => {
-      if (jsonDocCandidates.length >= 8 || jsonDocCandidates.includes(cleanPath)) return
+      if (jsonDocCandidates.includes(cleanPath)) return
+      jsonDocsObserved += 1
+      if (jsonDocCandidates.length >= MAX_JSON_DOCS) return
       jsonDocCandidates.push(cleanPath)
     }
 
@@ -4307,24 +4630,31 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       if (!clean || STATIC_ASSET_RE.test(clean)) return
       if (/[:{}[\]]/.test(clean.split('?')[0] ?? '')) {
         const template = normalizeDiscoveryTemplate(clean)
-        if (discoveredTemplates.length < 24 && !discoveredTemplates.includes(template)) {
-          discoveredTemplates.push(template)
-          // The collection that produces ids for the detail route is worth probing on its own.
-          const base = template.replace(/\/:[A-Za-z_][A-Za-z0-9_-]*.*$/, '')
-          if (base && base !== template && !/[:{}[\]]/.test(base)) queueDiscoveredRoute('GET', base)
+        if (!discoveredTemplates.includes(template)) {
+          templatesObserved += 1
+          if (discoveredTemplates.length < MAX_DISCOVERED_TEMPLATES) {
+            discoveredTemplates.push(template)
+            // The collection that produces ids for the detail route is worth probing on its own.
+            const base = template.replace(/\/:[A-Za-z_][A-Za-z0-9_-]*.*$/, '')
+            if (base && base !== template && !/[:{}[\]]/.test(base)) queueDiscoveredRoute('GET', base)
+          }
         }
         return
       }
-      if (discoveredCandidatePaths.length >= 40 || discoveredCandidatePaths.includes(clean)) return
+      if (discoveredCandidatePaths.includes(clean)) return
+      candidatePathsObserved += 1
+      if (discoveredCandidatePaths.length >= MAX_CANDIDATE_PATHS) return
       discoveredCandidatePaths.push(clean)
     }
 
     const queueJsChunk = (specifier: string, fromPath = '/') => {
-      if (jsQueue.length >= 32) return
       const clean = sanitizePathCandidate(specifier, `${origin}${fromPath}`)
       if (!clean || STATIC_ASSET_RE.test(clean)) return
       if (!/\.(?:m?js|jsx|ts|tsx)(?:\?|$)/i.test(clean)) return
-      if (!jsQueue.includes(clean)) jsQueue.push(clean)
+      if (jsQueue.includes(clean)) return
+      jsQueueObserved += 1
+      if (jsQueue.length >= MAX_JS_QUEUE) return
+      jsQueue.push(clean)
     }
 
     const softNotFoundResponse = (ex: BrokerExchangeResult): boolean =>
@@ -4396,9 +4726,11 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
               if (/\.json(?:$|[?#])/i.test(asset)) queueJsonDoc(asset)
               else queueJsChunk(asset, '/')
             }
-            for (const l of html.links.slice(0, 60)) {
+            if (html.links.length > 160) noteTruncation('html_links', 160, html.links.length, origin)
+            for (const l of html.links.slice(0, 160)) {
               dynamicPaths.add(normalizeRouteTemplate(l))
-              if (discoveredCandidatePaths.length < 40) discoveredCandidatePaths.push(l)
+              if (discoveredCandidatePaths.length < MAX_CANDIDATE_PATHS) discoveredCandidatePaths.push(l)
+              else candidatePathsObserved += 1
               if (/\.json(?:\?|$)/i.test(l)) queueJsonDoc(l)
               else navSeeds.push({ path: l, depth: 0 })
             }
@@ -4451,9 +4783,11 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
           if (/\.json(?:$|[?#])/i.test(asset)) queueJsonDoc(asset)
           else queueJsChunk(asset, '/')
         }
-        for (const l of html.links.slice(0, 60)) {
+        if (html.links.length > 160) noteTruncation('html_links', 160, html.links.length, origin)
+        for (const l of html.links.slice(0, 160)) {
           dynamicPaths.add(normalizeRouteTemplate(l))
-          if (discoveredCandidatePaths.length < 40) discoveredCandidatePaths.push(l)
+          if (discoveredCandidatePaths.length < MAX_CANDIDATE_PATHS) discoveredCandidatePaths.push(l)
+          else candidatePathsObserved += 1
           if (/\.json(?:\?|$)/i.test(l)) queueJsonDoc(l)
           else navSeeds.push({ path: l, depth: 0 })
         }
@@ -4570,8 +4904,8 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     }
 
     // 2b. Fetch same-origin JS chunks. The queue is drained breadth-first (imports, manifests,
-    // webpack/Vite chunk maps) within a bounded 32-bundle budget; seed probes reserved jsReserve.
-    const maxJsChunks = Math.min(32, Math.max(0, perOriginCap - originUsed))
+    // webpack/Vite chunk maps) within a scaled 96-bundle budget; seed probes reserved jsReserve.
+    const maxJsChunks = Math.min(MAX_JS_CHUNKS_FETCH, Math.max(0, perOriginCap - originUsed))
     let jsFetched = 0
     for (let jsIndex = 0; jsIndex < jsQueue.length && jsFetched < maxJsChunks; jsIndex += 1) {
       const jsPath = jsQueue[jsIndex]
@@ -4593,7 +4927,6 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
 
       const seenJsRoutes = new Map<string, string>()
       const addJsEndpoint = (method: string, rawPath: string, bodyKeys: string[] = []): string | null => {
-        if (seenJsRoutes.size >= 120) return null
         const clean = sanitizePathCandidate(rawPath, origin)
         if (!clean || STATIC_ASSET_RE.test(clean)) return null
         const tmpl = /(?:^|\/):[A-Za-z_][A-Za-z0-9_-]*/.test(clean)
@@ -4604,12 +4937,14 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         // The same route is often referenced by several sources (harvested calls, regex literal scan,
         // OpenAPI-derived body keys). Merge parameters instead of dropping later evidence.
         if (existingId) return existingId
+        jsRoutesObserved += 1
+        if (seenJsRoutes.size >= MAX_JS_ROUTES_PER_CHUNK) return null
         const ep = recordEndpoint(method, tmpl, 'js_ast')
         seenJsRoutes.set(key, ep.id)
         if (method.toUpperCase() === 'GET' && (/\.json$/i.test(clean) || /(?:^|\/)(?:config|routes|route-map|manifest|endpoints|links|nav|menu|bootstrap)(?:\.|$)/i.test(clean))) {
           queueJsonDoc(clean)
         }
-        for (const bk of bodyKeys.slice(0, 20)) {
+        for (const bk of bodyKeys.slice(0, 48)) {
           const bkLocation: ParamLocation = method.toUpperCase() === 'GET' ? 'query' : 'json'
           if (!bk || !isUsefulParamForLocation(bk, bkLocation)) continue
           storage.upsertEndpointParam({
@@ -4639,7 +4974,9 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       }
       // Regex request-literal scan: fills in methods and body/XML parameter names even when the
       // bundle AST parser is unavailable (fetch/axios/XHR init object literals).
-      for (const spec of harvestJsRequestParams(ex.body).slice(0, 24)) {
+      const reqParamSpecs = harvestJsRequestParams(ex.body)
+      jsReqParamsObserved = Math.max(jsReqParamsObserved, reqParamSpecs.length)
+      for (const spec of reqParamSpecs.slice(0, MAX_JS_REQ_PARAMS_PER_CHUNK)) {
         const epId = addJsEndpoint(spec.method, spec.path)
         if (!epId) continue
         for (const p of spec.params) {
@@ -4658,7 +4995,9 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         }
       }
       // SPA router tables: path literals in router config are navigable endpoints even without hrefs.
-      for (const routePath of harvestJsRouteTable(ex.body).slice(0, 24)) {
+      const routeTablePaths = harvestJsRouteTable(ex.body)
+      jsRouteTableObserved = Math.max(jsRouteTableObserved, routeTablePaths.length)
+      for (const routePath of routeTablePaths.slice(0, MAX_JS_ROUTE_TABLE_PER_CHUNK)) {
         if (addJsEndpoint('GET', routePath)) jsRouterRoutes += 1
       }
       // Emit structured SPA route summaries (route -> API calls + client roles + lifecycle actions).
@@ -4666,7 +5005,9 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         mergeRuntimeSpaRoute(spaRoute)
       }
       // tRPC procedures: batched GET uses a query `input`, mutations POST a JSON `input`.
-      for (const proc of harvestTrpcProcedures(ex.body).slice(0, 24)) {
+      const trpcProcs = harvestTrpcProcedures(ex.body)
+      trpcProcsObserved = Math.max(trpcProcsObserved, trpcProcs.length)
+      for (const proc of trpcProcs.slice(0, MAX_TRPC_PROCS_PER_CHUNK)) {
         const trpcPath = `/trpc/${proc.router}.${proc.procedure}`
         const getId = addJsEndpoint('GET', trpcPath)
         if (getId) recordParams(getId, [{ name: 'input', location: 'query' }], 'inferred_bundle')
@@ -4730,7 +5071,9 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     // 2b-bis. Fetch same-origin JSON/YAML route-map & config artifacts referenced by the SPA
     // (runtime config, API index, Vite/webpack manifests). This is the only way config tables that
     // are referenced solely from JS become visible before probes run.
-    for (const docPath of [...new Set(jsonDocCandidates)].slice(0, 6)) {
+    const uniqueJsonDocs = [...new Set(jsonDocCandidates)]
+    if (uniqueJsonDocs.length > 16) noteTruncation('json_doc_fetches', 16, uniqueJsonDocs.length, origin)
+    for (const docPath of uniqueJsonDocs.slice(0, 16)) {
       if (originHalted || originUsed >= perOriginCap - 4 || signal.aborted) break
       const ex = await safeGet(docPath)
       if (!ex || ex.status >= 400 || !ex.body) continue
@@ -4810,7 +5153,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         const bare = rawPath.split('?')[0] || '/'
         if (!bare.startsWith('/') || /[:{}[\]]/.test(bare) || STATIC_ASSET_RE.test(bare)) return
         if (!/^\/(?:api|rest|graphql|trpc|v\d+)(?:\/|$)/i.test(bare)) return
-        if (templateApiPaths.size < 6) templateApiPaths.add(bare)
+        if (templateApiPaths.size < 24) templateApiPaths.add(bare)
       }
       for (const ep of readPaged('template_api_paths')) considerApiPath(ep.pathTemplate)
       for (const p of discoveredCandidatePaths) considerApiPath(p)
@@ -4820,8 +5163,8 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
           origin,
           techFingerprint: [...techFingerprint],
           discoveredPaths: {
-            protectedPaths: [...protectedPaths].slice(0, 6),
-            apiPaths: [...templateApiPaths].slice(0, 6),
+            protectedPaths: [...protectedPaths].slice(0, 24),
+            apiPaths: [...templateApiPaths].slice(0, 24),
           },
           maxTemplates: Math.max(1, Math.floor(templateBudget / 2)),
           maxRequests: templateBudget,
@@ -5063,8 +5406,10 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       }
     }
 
-    const navSeedPaths = new Set(navSeeds.slice(0, 32).map(seed => seed.path))
-    for (const candidate of [...new Set(discoveredCandidatePaths)].slice(0, 20)) {
+    const navSeedPaths = new Set(navSeeds.slice(0, 96).map(seed => seed.path))
+    const uniqueCandidates = [...new Set(discoveredCandidatePaths)]
+    if (uniqueCandidates.length > 64) noteTruncation('discovered_candidate_probes', 64, uniqueCandidates.length, origin)
+    for (const candidate of uniqueCandidates.slice(0, 64)) {
       if (originHalted || originUsed >= perOriginCap || signal.aborted) break
       // Route-map/HTML candidates are also navigation seeds; let the navigation pass probe them so
       // observed listing fields still seed sibling write endpoints.
@@ -5081,7 +5426,8 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     // collection->detail reads from ids observed in authenticated listings. Read-only, depth <= 2,
     // per-origin capped; only JSON/API responses become endpoints (SPA shell HTML is not recorded).
     const navVisited = new Set<string>()
-    const navQueue = navSeeds.slice(0, 32)
+    if (navSeeds.length > 96) noteTruncation('nav_seeds', 96, navSeeds.length, origin)
+    const navQueue = navSeeds.slice(0, 96)
     const navGetTemplates = [...new Set(readPaged('nav_targets',
       rows => rows.filter(ep => ep.method === 'GET' && ep.pathTemplate.split('/').filter(Boolean).length >= 2).length)
       .filter(ep => ep.method === 'GET' && ep.pathTemplate.split('/').filter(Boolean).length >= 2)
@@ -5490,8 +5836,10 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
 
       let attached = 0
       for (const candidate of candidates) {
-        if (checked && !verified.has(candidate.name)) continue // dead literal: do not queue it
         const provenance = paramProvenanceOfSource(candidate.source)
+        // Wire-observed redirect query parameters (`observed:redirect_query`) are always retained;
+        // sensitivity checking only prunes unverified inferred candidates.
+        if (checked && provenance !== 'observed' && !verified.has(candidate.name)) continue // dead literal: do not queue it
         const source = verified.has(candidate.name) && checked
           ? `${provenance}:sensitive`
           : candidate.source
@@ -5591,6 +5939,16 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
         }
       } catch { /* visibility tagging is best-effort */ }
     }
+    noteTruncation('protected_paths', MAX_PROTECTED_PATHS, protectedPathsObserved, origin)
+    noteTruncation('json_doc_candidates', MAX_JSON_DOCS, jsonDocsObserved, origin)
+    noteTruncation('discovered_candidate_paths', MAX_CANDIDATE_PATHS, candidatePathsObserved, origin)
+    noteTruncation('discovered_templates', MAX_DISCOVERED_TEMPLATES, templatesObserved, origin)
+    noteTruncation('js_chunk_queue', MAX_JS_QUEUE, jsQueueObserved, origin)
+    noteTruncation('js_chunk_fetches', maxJsChunks, jsQueue.length, origin)
+    noteTruncation('js_routes_per_chunk', MAX_JS_ROUTES_PER_CHUNK, jsRoutesObserved, origin)
+    noteTruncation('js_request_params', MAX_JS_REQ_PARAMS_PER_CHUNK, jsReqParamsObserved, origin)
+    noteTruncation('js_route_table', MAX_JS_ROUTE_TABLE_PER_CHUNK, jsRouteTableObserved, origin)
+    noteTruncation('trpc_procedures', MAX_TRPC_PROCS_PER_CHUNK, trpcProcsObserved, origin)
   }
 
   // Paged-read accounting: every phase reads to completion, so `truncated` is always false. A
@@ -5618,15 +5976,23 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
       { endpoints: paramDiscovery.endpoints, totals: paramDiscovery.totals, sensitivity: { ...paramSensitivity } })
   }
 
-  const runtimeSpaRoutes = [...runtimeSpaMap.values()].slice(0, 80)
+  const allRuntimeSpaRoutes = [...runtimeSpaMap.values()]
+  noteTruncation('runtime_spa_routes', 250, allRuntimeSpaRoutes.length)
+  const runtimeSpaRoutes = allRuntimeSpaRoutes.slice(0, 250)
   const runtimeGraphqlCatalogs: RuntimeGraphqlCatalog[] = [...runtimeGraphqlMap.values()]
     .filter(entry => entry.fields.size > 0)
-    .map(entry => ({
-      endpoint: entry.endpoint,
-      ...(entry.serviceOrigin ? { serviceOrigin: entry.serviceOrigin } : {}),
-      fields: [...entry.fields.values()].slice(0, 80),
-    }))
-  const runtimeOpenApiOperations = [...runtimeOpenApiMap.values()].slice(0, 200)
+    .map(entry => {
+      const allFields = [...entry.fields.values()]
+      noteTruncation('runtime_graphql_fields', 250, allFields.length, entry.serviceOrigin)
+      return {
+        endpoint: entry.endpoint,
+        ...(entry.serviceOrigin ? { serviceOrigin: entry.serviceOrigin } : {}),
+        fields: allFields.slice(0, 250),
+      }
+    })
+  const allRuntimeOpenApiOps = [...runtimeOpenApiMap.values()]
+  noteTruncation('runtime_openapi_operations', 1000, allRuntimeOpenApiOps.length)
+  const runtimeOpenApiOperations = allRuntimeOpenApiOps.slice(0, 1000)
 
   if (runtimeSpaRoutes.length > 0 || runtimeGraphqlCatalogs.length > 0 || runtimeOpenApiOperations.length > 0) {
     storage.event(
@@ -5716,6 +6082,12 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     } catch { /* structured catalog fact persistence is best-effort */ }
   }
 
+  noteTruncation('dynamic_wordlist_paths', 500, dynamicPaths.size)
+  noteTruncation('dynamic_wordlist_params', 250, dynamicParams.size)
+  if (truncations.length > 0) {
+    storage.event(runId, 'phase0.truncation', `Phase-0 hit ${truncations.length} finite discovery cap(s).`, { truncations })
+  }
+
   storage.event(runId, 'phase0.discovery', 'Phase-0 discovery counts.', {
     requestsUsed,
     perOriginCap,
@@ -5729,6 +6101,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     soft404Rejected,
     stoppedReason,
     readPaged: readPagedMetrics,
+    ...(truncations.length > 0 ? { truncations } : {}),
   })
   storage.updateRunPhase0Completed(runId, Date.now())
 
@@ -5741,8 +6114,8 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     techFingerprint: [...techFingerprint],
     ...(paramDiscovery.endpoints.length > 0 ? { paramDiscovery } : {}),
     dynamicWordlist: {
-      paths: [...dynamicPaths].slice(0, 120),
-      params: [...dynamicParams].slice(0, 80),
+      paths: [...dynamicPaths].slice(0, 500),
+      params: [...dynamicParams].slice(0, 250),
     },
     stoppedReason,
     routeMapEndpoints,
@@ -5765,6 +6138,7 @@ export async function runPhase0Recon(params: Phase0ReconParams): Promise<Phase0R
     ...(runtimeSpaRoutes.length > 0 ? { runtimeSpaRoutes } : {}),
     ...(runtimeGraphqlCatalogs.length > 0 ? { runtimeGraphqlCatalogs } : {}),
     ...(runtimeOpenApiOperations.length > 0 ? { runtimeOpenApiOperations } : {}),
+    ...(truncations.length > 0 ? { truncations } : {}),
   }
 }
 
